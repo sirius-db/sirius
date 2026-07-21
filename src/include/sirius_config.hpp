@@ -31,6 +31,9 @@ namespace sirius {
 
 namespace config {
 
+// Default values — these are the fallbacks used when adaptive GPU tuning
+// is not available (e.g. before the GPU is initialized). The actual runtime
+// values are computed by operator_params::init_adaptive() based on VRAM.
 constexpr uint64_t DEFAULT_SCAN_TASK_BATCH_SIZE       = 512ULL * 1024 * 1024;  // 512 MB
 constexpr uint64_t DEFAULT_HASH_PARTITION_BYTES       = 512ULL * 1024 * 1024;  // 512 MB
 constexpr uint64_t DEFAULT_CONCAT_BATCH_BYTES         = 512ULL * 1024 * 1024;  // 512 MB
@@ -119,6 +122,32 @@ struct operator_params {
   /// pin-time statistics capture and the serve-side survivor plan: a table pinned while the flag is
   /// off carries no zone maps and cannot prune until re-pinned with the flag on.
   bool enable_pinned_zone_map_pruning = true;
+
+  /// Per-query GPU memory budget (bytes). 0 = unlimited (no per-query cap).
+  /// When non-zero, the GPU pipeline executor checks the cumulative GPU memory
+  /// consumed by a query's tasks against this budget; exceeding it triggers OOM
+  /// reschedule (the same path as a real OOM) instead of letting one query
+  /// starve concurrent queries or exhaust the RMM pool. Set via
+  /// `SET sirius.per_query_memory_budget = '4GB'`. Useful on multi-tenant or
+  /// shared-GPU deployments; leave 0 for single-query TPC-H.
+  uint64_t per_query_memory_budget = 0;
+
+  /// Initialize tuning parameters adaptively based on the current GPU's VRAM.
+  /// Called once at engine startup. On ROCm, queries hipMemGetInfo; on NVIDIA,
+  /// queries cudaMemGetInfo. All values can still be overridden by the .yaml
+  /// config or DuckDB SET commands after this call.
+  ///
+  /// Scaling rules (for a GPU with V bytes of VRAM):
+  ///   scan_task_batch_size   = clamp(V * 0.10, 128MB, 4GB)
+  ///   hash_partition_bytes   = clamp(V * 0.08, 128MB, 2GB)
+  ///   concat_batch_bytes     = clamp(V * 0.10, 128MB, 4GB)
+  ///   sort_sample_bytes      = clamp(V * 0.05, 64MB, 1GB)
+  ///   max_build_hash_table   = clamp(V * 0.08, 128MB, 2GB)
+  ///   max_sort_partition_fraction = 0.33 (unchanged — already a fraction)
+  ///
+  /// On an 8GB GPU: batch=800MB, hash_part=640MB, build=640MB
+  /// On a 192GB GPU: batch=4GB (capped), hash_part=2GB (capped), build=2GB (capped)
+  void init_adaptive();
 };
 
 struct telemetry_config {

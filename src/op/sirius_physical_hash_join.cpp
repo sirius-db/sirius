@@ -253,7 +253,9 @@ sirius_physical_hash_join::sirius_physical_hash_join(
       if (col_idx < lhs_input_types.size()) {
         lhs_output_columns.col_idxs.emplace_back(static_cast<cudf::size_type>(col_idx));
       } else {
-        printf("WARNING:In sirius_physical_hash_join: left_projection_map index out of range");
+        SIRIUS_LOG_WARN("sirius_physical_hash_join: left_projection_map index {} out of range {}",
+                        col_idx,
+                        lhs_input_types.size());
       }
     }
   }
@@ -276,7 +278,9 @@ sirius_physical_hash_join::sirius_physical_hash_join(
       if (col_idx < rhs_input_types.size()) {
         rhs_output_columns.col_idxs.emplace_back(static_cast<cudf::size_type>(col_idx));
       } else {
-        printf("WARNING:In sirius_physical_hash_join: right_projection_map index out of range");
+        SIRIUS_LOG_WARN("sirius_physical_hash_join: right_projection_map index {} out of range {}",
+                        col_idx,
+                        rhs_input_types.size());
       }
     }
   }
@@ -496,25 +500,38 @@ std::optional<task_creation_hint> sirius_physical_hash_join::get_next_task_hint(
         return task_creation_hint{TaskCreationHint::READY, this};
       } else if (build_size == 0) {
         // No build batch available yet, hint to wait for build input data.
+        if (!build_port->src_pipeline) {
+          throw std::runtime_error("hash_join: null build src_pipeline in WAITING hint");
+        }
         auto* producer = &build_port->src_pipeline->get_operators()[0].get();
         return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, producer};
       } else {
         // Build batch is available but no probe batch yet, hint to wait for probe input data.
+        if (!probe_port->src_pipeline) {
+          throw std::runtime_error("hash_join: null probe src_pipeline in WAITING hint");
+        }
         auto* producer = &probe_port->src_pipeline->get_operators()[0].get();
         return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, producer};
       }
     } else if (_hash_table_build_state == BUILD_HASH_TABLE_STATE::SCHEDULING ||
                _hash_table_build_state == BUILD_HASH_TABLE_STATE::SCHEDULED) {
       // Hash table is currently being built, hint to wait for it to be ready.
+      if (!probe_port->src_pipeline) {
+        throw std::runtime_error("hash_join: null probe src_pipeline in SCHEDULING hint");
+      }
       auto* producer = &probe_port->src_pipeline->get_operators()[0].get();
       return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, producer};
     } else if (_hash_table_build_state == BUILD_HASH_TABLE_STATE::BUILT) {
       // Hash table is built, we can process probe only batches.
-      if (ports["default"]->repo->total_size() > 0) {
+      auto it = ports.find("default");
+      if (it == ports.end() || !it->second->repo || !it->second->src_pipeline) {
+        throw std::runtime_error("hash_join: missing default port");
+      }
+      if (it->second->repo->total_size() > 0) {
         return task_creation_hint{TaskCreationHint::READY, this};
       } else {
         // No probe batch available yet, hint to wait for probe input data.
-        auto* producer = &ports["default"]->src_pipeline->get_operators()[0].get();
+        auto* producer = &it->second->src_pipeline->get_operators()[0].get();
         return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, producer};
       }
     } else {
@@ -616,7 +633,16 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::get_next_task_input_da
     for (size_t i = 0; i < ports["default"]->repo->num_partitions(); i++) {
       left_batch_ids.push_back(ports["default"]->repo->get_batch_ids(i));
       right_batch_ids.push_back(ports["build"]->repo->get_batch_ids(i));
-      num_batches_to_process += left_batch_ids[i].size() * right_batch_ids[i].size();
+      // Overflow-safe accumulation: left * right can overflow size_t when both
+      // sides have many batches. The wrapped total would make
+      // current_partition_index >= num_batches_to_process true prematurely,
+      // silently dropping join output rows. Cap at SIZE_MAX.
+      size_t left_n  = left_batch_ids[i].size();
+      size_t right_n = right_batch_ids[i].size();
+      size_t product = left_n > SIZE_MAX / right_n ? SIZE_MAX : left_n * right_n;
+      num_batches_to_process = num_batches_to_process > SIZE_MAX - product
+                                 ? SIZE_MAX
+                                 : num_batches_to_process + product;
     }
   }
 
@@ -988,6 +1014,7 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
                                                  /*is_left_side=*/false,
                                                  stream);
       cudf::table_view build_keys = build_keys_result.keys;
+
       {
         std::lock_guard<std::mutex> lg(op_state_mutex);
         _built_table_cast_columns = std::move(build_keys_result.owned_cast_columns);
@@ -1471,6 +1498,11 @@ void sirius_physical_hash_join::push_data_batch_partitioned(
     }
   } else {
     // Defense-in-depth for older representations that predate mandatory writer events.
+    // The build batch was produced on a *different* stream than publish_stream (see
+    // comment above), and without a writer event there is no handle to that producing
+    // stream. cudaStreamSynchronize(publish_stream) would therefore NOT wait for the
+    // build's writes and could publish a filter over incomplete data, so a device-wide
+    // sync is the only correct fallback here.
     auto const status = cudaDeviceSynchronize();
     if (status != cudaSuccess) {
       throw std::runtime_error(

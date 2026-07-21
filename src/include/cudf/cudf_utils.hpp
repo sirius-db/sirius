@@ -163,17 +163,26 @@ inline cudf::data_type get_cudf_type(const logical_type& t)
     case type_id::INTEGER: return cudf::data_type(cudf::type_id::INT32);
     case type_id::BIGINT: return cudf::data_type(cudf::type_id::INT64);
     case type_id::HUGEINT:
-      // FIXME: unsafe 128→64-bit narrowing: DuckDB HUGEINT is INT128 but cuDF has no INT128.
-      // Values outside INT64 range are silently corrupted. Matches legacy duckdb::GetCudfType().
-      return cudf::data_type(cudf::type_id::INT64);
+      // cuDF has no INT128 type. Previously this silently narrowed to INT64,
+      // corrupting values outside INT64 range. Now we fail loudly so the
+      // query falls back to DuckDB CPU execution (see sirius_physical_plan_
+      // generator, which rejects unsupported types at plan time for the same
+      // reason). Aggregate results are downcast to BIGINT by
+      // downcast_hugeint_types() in sirius_plan_aggregate.cpp before reaching
+      // here, so this does not break aggregate plans.
+      throw duckdb::InvalidInputException(
+          "sirius::get_cudf_type: HUGEINT (INT128) has no cuDF representation; "
+          "cast the column to BIGINT before GPU execution");
     case type_id::UTINYINT: return cudf::data_type(cudf::type_id::UINT8);
     case type_id::USMALLINT: return cudf::data_type(cudf::type_id::UINT16);
     case type_id::UINTEGER: return cudf::data_type(cudf::type_id::UINT32);
     case type_id::UBIGINT: return cudf::data_type(cudf::type_id::UINT64);
     case type_id::UHUGEINT:
-      // FIXME: unsafe 128→64-bit narrowing: DuckDB UHUGEINT is UINT128 but cuDF has no UINT128.
-      // Values outside UINT64 range are silently corrupted. Matches legacy duckdb::GetCudfType().
-      return cudf::data_type(cudf::type_id::UINT64);
+      // See HUGEINT above: cuDF has no UINT128. Fail loudly rather than
+      // silently truncating to UINT64.
+      throw duckdb::InvalidInputException(
+          "sirius::get_cudf_type: UHUGEINT (UINT128) has no cuDF representation; "
+          "cast the column to UBIGINT before GPU execution");
     case type_id::FLOAT: return cudf::data_type(cudf::type_id::FLOAT32);
     case type_id::DOUBLE: return cudf::data_type(cudf::type_id::FLOAT64);
     case type_id::BOOLEAN: return cudf::data_type(cudf::type_id::BOOL8);
@@ -306,14 +315,24 @@ inline cudf::data_type GetCudfType(const LogicalType& logical_type)
     case LogicalTypeId::SMALLINT: return cudf::data_type(cudf::type_id::INT16);
     case LogicalTypeId::INTEGER: return cudf::data_type(cudf::type_id::INT32);
     case LogicalTypeId::BIGINT:
-    case LogicalTypeId::HUGEINT:  // FIXME: unsafe conversion from duckdb HugeInt to cudf Int64,
-                                  // since cudf does not support Int128.
       return cudf::data_type(cudf::type_id::INT64);
+    case LogicalTypeId::HUGEINT:
+      // cuDF has no INT128. Fail loudly so the query falls back to CPU rather
+      // than silently truncating. Aggregate plans downcast to BIGINT first
+      // (downcast_hugeint_types in sirius_plan_aggregate.cpp).
+      throw InvalidInputException(
+          "duckdb::GetCudfType: HUGEINT (INT128) has no cuDF representation; "
+          "cast to BIGINT before GPU execution");
     case LogicalTypeId::UTINYINT: return cudf::data_type(cudf::type_id::UINT8);
     case LogicalTypeId::USMALLINT: return cudf::data_type(cudf::type_id::UINT16);
     case LogicalTypeId::UINTEGER: return cudf::data_type(cudf::type_id::UINT32);
     case LogicalTypeId::UBIGINT:
-    case LogicalTypeId::UHUGEINT: return cudf::data_type(cudf::type_id::UINT64); ;
+      return cudf::data_type(cudf::type_id::UINT64);
+    case LogicalTypeId::UHUGEINT:
+      // See HUGEINT above: cuDF has no UINT128.
+      throw InvalidInputException(
+          "duckdb::GetCudfType: UHUGEINT (UINT128) has no cuDF representation; "
+          "cast to UBIGINT before GPU execution");
     case LogicalTypeId::FLOAT: return cudf::data_type(cudf::type_id::FLOAT32);
     case LogicalTypeId::DOUBLE: return cudf::data_type(cudf::type_id::FLOAT64);
     case LogicalTypeId::BOOLEAN: return cudf::data_type(cudf::type_id::BOOL8);

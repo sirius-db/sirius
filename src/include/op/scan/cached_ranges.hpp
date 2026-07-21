@@ -20,6 +20,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstdlib>
 #include <cstddef>
 #include <memory>
 #include <optional>
@@ -63,6 +64,16 @@ class cache_ranges {
                std::size_t chunk_sz,
                int device_id = -1,
                int numa_id   = -1);
+
+  // Owns the packed chunk buffers in buffers_; free them on destruction. Copy
+  // and move are deleted because the raw pointers would otherwise be double
+  // freed (copy) or left dangling (move) by the implicit special members.
+  ~cache_ranges() { for (auto* b : buffers_) { std::free(b); } }
+
+  cache_ranges(const cache_ranges&)            = delete;
+  cache_ranges& operator=(const cache_ranges&) = delete;
+  cache_ranges(cache_ranges&&)                 = delete;
+  cache_ranges& operator=(cache_ranges&&)      = delete;
 
   // Returns a list of spans that together cover [query_offset, query_offset+query_size).
   // Each span points directly into one of the underlying chunk buffers.

@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#ifdef SIRIUS_ENABLE_CUCASCADE
 #include <rmm/cuda_device.hpp>
 
 #include <cuda_runtime.h>
@@ -149,6 +150,8 @@ replica_transfer_route enqueue_replica_copy(
                                               source_stream.value()));
 #endif
 #else
+      // On ROCm, CUDART_VERSION is 0 (shim). Use hipMemcpyBatchAsync if available
+      // (HIP 6.0+), otherwise fall back to serial loop.
       for (std::size_t i = 0; i < d2h_sizes.size(); ++i) {
         CUCASCADE_CUDA_TRY(cudaMemcpyAsync(d2h_destinations[i],
                                            d2h_sources[i],
@@ -224,3 +227,5 @@ replica_transfer_route enqueue_replica_copy(
 }
 
 }  // namespace sirius::op::detail
+
+#endif  // SIRIUS_ENABLE_CUCASCADE

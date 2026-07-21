@@ -25,6 +25,7 @@
 #pragma once
 
 #include "cuda/scan/detail/warp.cuh"
+#include "cuda/gpu_config.hpp"
 
 #include <rmm/detail/error.hpp>
 
@@ -99,6 +100,28 @@ constexpr uint32_t MIN_ROWS_PER_CHUNK =
        ///< per chunk -> 8 rows per warp at this minimum.
 constexpr uint32_t MAX_BITPACKING_WIDTH = 32;
 
+/// Returns an optimal kernel block dimension for the current GPU.
+/// On AMD (wavefront=64): 384 (6 wavefronts — good occupancy on MI300's
+/// 8-wavefront-per-CU scheduler, better latency hiding than 256=4 wavefronts).
+/// On NVIDIA (warp=32): 256 (8 warps — unchanged from default).
+/// The returned value is always a multiple of the warp size and >= 64.
+/// Override via SIRIUS_KERNEL_BLOCK_DIM env var.
+inline uint32_t adaptive_block_dim() {
+  // Check env override first
+  if (auto* env = std::getenv("SIRIUS_KERNEL_BLOCK_DIM")) {
+    int v = std::atoi(env);
+    if (v >= 64) return static_cast<uint32_t>(v);
+  }
+  int device = 0;
+  cudaGetDevice(&device);
+  cudaDeviceProp prop;
+  cudaGetDeviceProperties(&prop, device);
+  uint32_t warp = prop.warpSize > 0 ? static_cast<uint32_t>(prop.warpSize) : 64;
+  // On AMD (warp=64): 384 = 6 wavefronts. On NVIDIA (warp=32): 256 = 8 warps.
+  if (warp >= 64) return 384;
+  return 256;
+}
+
 /// Above this, take the exact-total sync rather than trust the host upper
 /// bound — a pathological max_string_length could otherwise force a GB-class
 /// over-allocation.
@@ -127,7 +150,10 @@ struct prepared_fsst {
   std::vector<fsst_chunk_desc> gather_chunks;   ///< pass-1 phase-C + pass-2 (per chunk)
   std::vector<fsst_decoder_compact> decoders;   ///< symbol tables (per segment)
   std::vector<uint32_t> row_starts;             ///< prefix sum of FSST row counts
-  uint32_t total_fsst_row_count = 0;
+  // size_t (not uint32_t): the cross-segment sum of row_count can exceed
+  // UINT32_MAX on large tables, which would wrap and undersize the device
+  // buffers (d_comp_offsets at gpu_decode_strings.cu:203).
+  size_t total_fsst_row_count = 0;
 };
 
 struct prepared_dict_fsst {
@@ -146,20 +172,19 @@ struct prepared_dict_fsst {
 constexpr uint32_t align_up8(uint32_t n) { return (n + 7u) & ~7u; }
 
 //! @brief Target CTA count for chunking segments: two full device waves at
-//! STRINGS_BLOCK_DIM threads. Cached per device.
+//! STRINGS_BLOCK_DIM threads. Delegates to the gpu_config singleton, which
+//! queries hardware capabilities ONCE at startup (cudaGetDeviceProperties) and
+//! derives the CTA count from the number of compute units and per-SM occupancy.
+//! The SIRIUS_TARGET_CTAS env override is applied inside the singleton, so this
+//! function just returns the cached value.
 inline uint32_t get_target_ctas()
 {
-  int device = 0;
-  RMM_CUDA_TRY(cudaGetDevice(&device));
-  static int cached_device = -1;
-  static uint32_t cached   = 0;
-  if (cached_device == device) return cached;
-  cudaDeviceProp prop;
-  RMM_CUDA_TRY(cudaGetDeviceProperties(&prop, device));
-  int occupancy_blocks = prop.maxThreadsPerMultiProcessor / STRINGS_BLOCK_DIM;
-  cached_device        = device;
-  cached               = static_cast<uint32_t>(prop.multiProcessorCount * occupancy_blocks * 2);
-  return cached;
+  // The singleton is thread-safe after initialization (static local in
+  // instance()). It caches the hardware query and the env override, so this
+  // is a plain read — no per-call cudaGetDeviceProperties, no per-call env
+  // parse. The old code did both redundantly on every call (plus its own
+  // device-matched cache, which the singleton supersedes).
+  return sirius::cuda::gpu_config::instance().target_ctas();
 }
 
 //! @brief Expand segment descriptors into smaller chunks.

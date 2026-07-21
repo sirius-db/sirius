@@ -50,6 +50,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <span>
 #include <stdexcept>
@@ -183,6 +184,12 @@ std::unique_ptr<cudf::column> sirius_dynamic_small_in_list_filter::compute_mask(
     cudf::data_type{cudf::type_id::BOOL8}, n, cudf::mask_state::UNALLOCATED, stream, mr);
   auto* const outp = out->mutable_view().data<bool>();
   auto const m     = static_cast<int>(_num_keys);
+  // Invariant: supports() (line 140) gates _num_keys to <= k_max_keys, and
+  // k_max_keys is well below INT_MAX, so this narrowing cast is safe. The
+  // static_assert documents the coupling: if k_max_keys is ever raised above
+  // INT_MAX, this cast silently truncates and the kernel under-iterates.
+  static_assert(k_max_keys <= static_cast<size_t>(std::numeric_limits<int>::max()),
+                "k_max_keys must fit in int for the kernel loop bound");
 
   switch (_key_type.id()) {
     case cudf::type_id::INT32: {

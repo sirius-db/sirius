@@ -39,8 +39,16 @@ sirius_physical_concat::sirius_physical_concat(duckdb::vector<sirius::logical_ty
   // `downstream_join` (the HJ/NLJ this CONCAT feeds — not the tree parent) picks
   // `_concat_all` and is stashed for the legacy converter's destination lookup.
   _downstream_join = downstream_join;
+  if (!downstream_join) {
+    throw std::runtime_error("sirius_physical_concat: downstream_join is null");
+  }
   if (downstream_join->type == SiriusPhysicalOperatorType::HASH_JOIN) {
     auto hash_join = dynamic_cast<sirius_physical_hash_join*>(downstream_join);
+    if (!hash_join) {
+      throw std::runtime_error(
+        "sirius_physical_concat: downstream_join type is HASH_JOIN but "
+        "dynamic_cast<sirius_physical_hash_join*> failed");
+    }
     if (hash_join->join_type == duckdb::JoinType::LEFT ||
         hash_join->join_type == duckdb::JoinType::ANTI ||
         hash_join->join_type == duckdb::JoinType::SEMI) {
@@ -86,7 +94,13 @@ std::optional<task_creation_hint> sirius_physical_concat::get_next_task_hint()
     }
     return std::nullopt;
   } else if (_concat_all) {
-    // if we need to concat all then we need to wait for the pipeline to be finished
+    // if we need to concat all then we need to wait for the pipeline to be finished.
+    // src_pipeline can be null here (not yet wired) — the pipeline_finished
+    // check above guards it in that branch, but this branch deref'd it
+    // unconditionally (null deref crash). Throw a clear error instead.
+    if (!port_ptr->src_pipeline) {
+      throw std::runtime_error("sirius_physical_concat: null src_pipeline in _concat_all WAITING hint");
+    }
     return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA,
                               &(port_ptr->src_pipeline->get_operators()[0].get())};
   }
@@ -100,7 +114,9 @@ std::optional<task_creation_hint> sirius_physical_concat::get_next_task_hint()
     size_t pulled_count     = 0;
     for (auto& batch_id : batch_ids) {
       auto batch_idle = port_ptr->repo->get_data_batch_by_id(batch_id, i);
+      if (!batch_idle) continue;
       auto batch_ro   = batch_idle->to_read_only();
+      if (!batch_ro.get_data()) continue;
       auto batch_size = batch_ro.get_data()->get_size_in_bytes();
       total_batch_size += batch_size;
       if (!_concat_all && total_batch_size > _concat_batch_bytes) {
@@ -141,7 +157,9 @@ std::unique_ptr<operator_data> sirius_physical_concat::get_next_task_input_data(
     size_t total_batch_size = 0;
     for (auto& batch_id : batch_ids) {
       auto batch_idle = port_ptr->repo->get_data_batch_by_id(batch_id, i);
+      if (!batch_idle) continue;
       auto batch_ro   = batch_idle->to_read_only();
+      if (!batch_ro.get_data()) continue;
       auto batch_size = batch_ro.get_data()->get_size_in_bytes();
       total_batch_size += batch_size;
       // Check if the batch size is already exceed the threshold
@@ -205,6 +223,9 @@ void sirius_physical_concat::sink(const operator_data& output_data, rmm::cuda_st
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_concat::sink"};
   auto partitioned_output_data = dynamic_cast<const partitioned_operator_data*>(&output_data);
+  if (partitioned_output_data == nullptr) {
+    throw std::runtime_error("concat sink: expected partitioned data");
+  }
   auto partition_idx           = partitioned_output_data->get_partition_idx();
   for (auto& batch : partitioned_output_data->get_data_batches()) {
     for (auto& next_port_info : next_port_after_sink) {

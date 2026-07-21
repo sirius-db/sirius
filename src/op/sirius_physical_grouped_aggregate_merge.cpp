@@ -140,6 +140,7 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::get_next
   // we need to lock, then pull all the batches from one partition and return them, and increment
   // the partition index
   std::lock_guard<std::mutex> lg(lock);
+  if (ports.empty() || !ports.begin()->second->repo) { return nullptr; }
   if (current_partition_index < ports.begin()->second->repo->num_partitions()) {
     std::vector<::std::shared_ptr<::cucascade::data_batch>> input_batch;
     bool found_batch       = true;

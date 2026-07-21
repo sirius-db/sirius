@@ -197,10 +197,8 @@ struct multiple_blocks_allocation_accessor {
   void advance_as()
   {
     offset_in_block += sizeof(S);
-    if (offset_in_block >= block_size) {
-      ++block_index;
-      offset_in_block = 0;
-    }
+    block_index += offset_in_block / block_size;
+    offset_in_block %= block_size;
   }
 
   /**

@@ -34,6 +34,7 @@
 #include <limits>
 #include <mutex>
 #include <optional>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 
@@ -473,7 +474,28 @@ void task_creator::manager_loop()
       } catch (const std::exception& e) {
         SIRIUS_LOG_ERROR("Task Creator: Exception during task creation: {}", e.what());
         _task_scheduler->terminate_query(std::current_exception());
-        stop();
+        // Signal the manager loop to exit and stop dispatching new tasks, but do
+        // NOT call stop() from here: stop() -> do_stop_thread_pool() calls
+        // _bounded_pool->wait_all(), which blocks until every dispatched task
+        // (including this one) finishes — a self-deadlock.
+        //
+        // The previous fix detached a thread running stop() to avoid the
+        // deadlock, but that thread captures `this` with no synchronization: if
+        // ~task_creator() runs before the detached thread (or if
+        // drain_after_error() -> start_thread_pool() rebuilds the pool first),
+        // the detached thread dereferences a destroyed task_creator
+        // (use-after-free) or tears down the freshly-rebuilt pool. Both are
+        // reachable on normal error paths.
+        //
+        // Instead, just interrupt the queue + pool so manager_loop exits
+        // promptly (its reserve()/pop() unblock and it breaks). _running is
+        // left TRUE on purpose so the external stop_thread_pool() — called by
+        // drain_after_error() (outside the pool, so no self-deadlock) or by
+        // ~task_creator() — sees its CAS succeed and performs the full
+        // join + wait_all + reset. No detached thread, no `this` capture
+        // beyond this task's bounded lifetime.
+        _task_creation_queue.interrupt();
+        if (_bounded_pool) { _bounded_pool->interrupt(); }
       }
     });
   }

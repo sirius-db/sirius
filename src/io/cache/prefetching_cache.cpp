@@ -35,6 +35,7 @@
 #include <array>
 #include <cassert>
 #include <cmath>
+#include <cstdio>
 #include <cstddef>
 #include <exception>
 #include <format>
@@ -45,6 +46,7 @@
 #include <optional>
 #include <shared_mutex>
 #include <span>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -530,7 +532,9 @@ exec::semi_future<std::size_t> prefetching_cache::device_read_async(const sirius
         size_t const overread    = chunk_bytes - (need_hi - need_lo);
         bool const worth_caching = overread * 4 < chunk_bytes;  // over-read < 25% of chunk
         if (worth_caching && c != nullptr && c->state.mark_loading()) {
-          assert(c->data != nullptr);
+          if (c->data == nullptr) {
+            throw std::runtime_error("prefetching_cache: null data in io_segments");
+          }
           io_chunks.push_back(c);  // (2) host-to-device load into the cache buffer
           io_segments.emplace_back(off, chunk_bytes, c->data);
           h2d++;
@@ -562,11 +566,21 @@ exec::semi_future<std::size_t> prefetching_cache::device_read_async(const sirius
     for (cached_chunk* c : cached_chunks) {
       size_t const copy_start = std::max(c->offset, offset);
       size_t const copy_end   = std::min(c->offset + chunk_bytes, offset + size);
-      cudaMemcpyAsync(dst + (copy_start - offset),
-                      c->data + (copy_start - c->offset),
-                      copy_end - copy_start,
-                      cudaMemcpyHostToDevice,
-                      stream);
+      auto err                = cudaMemcpyAsync(dst + (copy_start - offset),
+                                 c->data + (copy_start - c->offset),
+                                 copy_end - copy_start,
+                                 cudaMemcpyHostToDevice,
+                                 stream);
+      if (err != cudaSuccess) {
+        // Propagate the error: the old code only fprintf'd and continued,
+        // returning a successful future reporting `size` bytes. The caller
+        // then read stale/uninitialized device memory (silent data
+        // corruption). Throw so the future resolves with an exception and
+        // the caller's error path fires.
+        throw std::runtime_error(
+          std::string("prefetching_cache: cudaMemcpyAsync (cached chunk H2D) failed: ") +
+          cudaGetErrorString(err));
+      }
     }
 
     auto device_id = rmm::get_current_cuda_device();
@@ -595,21 +609,27 @@ exec::semi_future<std::size_t> prefetching_cache::device_read_async(const sirius
         bool ok = !res.has_exception();
 
         rmm::cuda_set_device_raii guard(device_id);
-        std::unique_ptr<cucascade::cuda::cuda_event> event;
-        if (ok) {
-          event = std::make_unique<cucascade::cuda::cuda_event>();
-          event->record(stream);
-        }
+        // ALWAYS record + sync the stream before releasing read pins, even on
+        // the failure path. The case-(1) cudaMemcpyAsync copies (cached chunk
+        // H2D) were issued on `stream` before the IO future was awaited; if
+        // host_to_device_read_async_io failed, those copies may still be
+        // in-flight. The old code only created/synced the event when `ok`,
+        // so on failure it called release_read() on every read_pinned chunk
+        // while the in-flight memcpy still read from their host buffers —
+        // releasing the read pin makes the chunk evictable, and the evictor
+        // can free the host buffer out from under the in-flight copy
+        // (use-after-free). Sync unconditionally so the copies complete (or
+        // fail) before any pin is released.
+        std::unique_ptr<cucascade::cuda::cuda_event> event = std::make_unique<cucascade::cuda::cuda_event>();
+        event->record(stream);
 
         _io_cb_dispatcher.enqueue([read_pinned = std::move(read_pinned),
                                    loading     = std::move(loading),
                                    event       = std::move(event),
                                    ok          = ok]() mutable {
-          if (event) {
-            SIRIUS_TRY_AND_LOG_EXCEPTION(
-              event->synchronize(),
-              "prefetching_cache: failed to synchronize CUDA stream after host-to-device copies");
-          }
+          SIRIUS_TRY_AND_LOG_EXCEPTION(
+            event->synchronize(),
+            "prefetching_cache: failed to synchronize CUDA stream after host-to-device copies");
 
           std::ranges::for_each(read_pinned, [](cached_chunk* c) { c->state.release_read(); });
           auto transition = ok ? &entry_state::mark_cached : &entry_state::mark_load_failed;
@@ -711,14 +731,15 @@ void prefetching_cache::prepare_loop(const std::stop_token& st)
       if (c->state.mark_queued()) {
         auto* buffer = buffers.back();
         buffers.pop_back();
-        c->data      = reinterpret_cast<uint8_t*>(buffer);
-        c->numa_node = numa_allocated;
         if (!c->state.mark_allocated()) {
           buffers.push_back(buffer);  // return the buffer to the pool
           SIRIUS_LOG_ERROR(
             "prefetching_cache: chunk at offset {} was marked queued but failed to mark "
             "allocated",
             c->offset);
+        } else {
+          c->data      = reinterpret_cast<uint8_t*>(buffer);
+          c->numa_node = numa_allocated;
         }
       }
     }
@@ -760,6 +781,10 @@ void prefetching_cache::prefetch_loop(const std::stop_token& st)
                                           allocated_chunks.end(),
                                           [&](cached_chunk* c) {
                                             if (c->state.mark_loading()) {
+                                              if (c->data == nullptr) {
+                                                std::ignore = c->state.mark_load_failed();
+                                                return true;  // remove: no host buffer to load into
+                                              }
                                               segments.emplace_back(
                                                 c->offset, _chunk_size, c->data);
                                               return false;

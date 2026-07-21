@@ -16,6 +16,7 @@
 
 #include "sirius_config.hpp"
 
+#include "cuda/gpu_config.hpp"
 #include "exec/config.hpp"
 #include "log/logging.hpp"
 #include "yaml_reader.hpp"
@@ -23,6 +24,9 @@
 #include <cucascade/memory/config.hpp>
 #include <cucascade/memory/reservation_manager_configurator.hpp>
 #include <yaml-cpp/yaml.h>
+
+#include <algorithm>
+#include <cstdio>
 
 #include <exception>
 #include <variant>
@@ -189,6 +193,7 @@ static void from_yaml(const YAML::Node& node, operator_params& opt)
              opt.dynamic_filter_domain_coverage_threshold);
   r.optional("dynamic_filter_keep_threshold", opt.dynamic_filter_keep_threshold);
   r.optional("enable_pinned_zone_map_pruning", opt.enable_pinned_zone_map_pruning);
+  r.optional("per_query_memory_budget", yaml::bytes(opt.per_query_memory_budget));
   r.reject_unknown();
 }
 
@@ -371,6 +376,65 @@ void read_yaml_vec(const YAML::Node& node, std::vector<T>& out)
 
 }  // namespace
 
+// ================ operator_params::init_adaptive ================= //
+
+void sirius::operator_params::init_adaptive() {
+  // Delegate hardware detection to the gpu_config singleton — it queries
+  // cudaMemGetInfo + cudaGetDeviceProperties ONCE at first use and caches
+  // the result. The old code called cudaMemGetInfo + cudaGetDeviceProperties
+  // directly here, and get_target_ctas() / determine_num_partitions() made
+  // their own redundant calls. Now all paths read from the singleton.
+  auto const& cfg = sirius::cuda::gpu_config::instance();
+  auto const& hw = cfg.hardware();
+
+  std::size_t const vram = hw.total_vram;
+  if (vram == 0) {
+    // No GPU available or query failed — keep defaults.
+    return;
+  }
+
+  std::size_t const MB = 1024 * 1024;
+  std::size_t const GB = 1024ULL * 1024 * 1024;
+
+  // Helper: clamp a value to [min, max]
+  auto clamp = [](std::size_t v, std::size_t lo, std::size_t hi) {
+    return std::max(std::min(v, hi), lo);
+  };
+
+  // Scan batch: L2-cache-aware sizing. A batch that fits in L2 gets 4x
+  // bandwidth on repeated access (multi-column projection, filter+gather).
+  // Target: min(10% of VRAM, 4x L2 cache). On MI300 (256MB L2): min(19GB,
+  // 1GB) = 1GB. On 8GB consumer (64MB L2): min(800MB, 256MB) = 256MB.
+  // Clamped to [128MB, 4GB].
+  std::size_t l2_cache = hw.l2_cache_size;
+  std::size_t l2_aware_batch = l2_cache > 0 ? l2_cache * 4 : vram / 10;
+  scan_task_batch_size = clamp(std::min(vram / 10, l2_aware_batch), 128 * MB, 4 * GB);
+
+  // Hash partition: 8% of VRAM, clamped to [128MB, 2GB]
+  hash_partition_bytes = clamp(vram / 12, 128 * MB, 2 * GB);
+
+  // Concat batch: 10% of VRAM, clamped to [128MB, 4GB]
+  concat_batch_bytes = clamp(vram / 10, 128 * MB, 4 * GB);
+
+  // Sort sample: 5% of VRAM, clamped to [64MB, 1GB]
+  sort_sample_bytes = clamp(vram / 20, 64 * MB, 1 * GB);
+
+  // Max build hash table: 8% of VRAM, clamped to [128MB, 2GB]
+  max_build_hash_table_bytes = clamp(vram / 12, 128 * MB, 2 * GB);
+
+  // Sort partition fraction stays at 0.33 (already a fraction, not absolute)
+
+  SIRIUS_LOG_INFO(
+    "operator_params::init_adaptive: VRAM={}MB, scan_batch={}MB, "
+    "hash_part={}MB, build_ht={}MB, concat={}MB, sort_sample={}MB",
+    vram / MB,
+    scan_task_batch_size / MB,
+    hash_partition_bytes / MB,
+    max_build_hash_table_bytes / MB,
+    concat_batch_bytes / MB,
+    sort_sample_bytes / MB);
+}
+
 // ================ sirius_config ================= //
 
 sirius_config::sirius_config()
@@ -381,6 +445,11 @@ sirius_config::sirius_config()
 
 void sirius_config::apply_defaults()
 {
+  // Initialize operator tuning parameters adaptively based on GPU VRAM.
+  // This must be called before the YAML config is loaded so that explicit
+  // values in the YAML override the adaptive defaults.
+  _operator_params.init_adaptive();
+
   // Run the configurator with default values to populate memory space configs
   topology topo;
   gpu_mem_config gpu_cfg;

@@ -16,6 +16,8 @@
 
 #include "scan_manager/sirius_scan_manager.hpp"
 
+#include <cctype>
+
 #include "data/data_batch_utils.hpp"
 #include "exec/thread_pool.hpp"
 #include "io/cache/prefetching_cache.hpp"
@@ -174,7 +176,7 @@ scan_filter_view extract_scan_filters(op::scan::ingestible_table_info const& inf
 std::string normalize_path(std::string const& p)
 {
   static constexpr std::string_view kFile = "file://";
-  if (p.size() > kFile.size()) {
+  if (p.size() >= kFile.size()) {
     bool is_file_uri = true;
     for (std::size_t i = 0; i < kFile.size(); ++i) {
       if (std::tolower(static_cast<unsigned char>(p[i])) != static_cast<unsigned char>(kFile[i])) {

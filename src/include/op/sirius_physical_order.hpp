@@ -47,7 +47,7 @@ class sirius_physical_order : public sirius_physical_operator {
   //! Input data
   duckdb::vector<duckdb::BoundOrderByNode> orders;
   duckdb::vector<std::size_t> projections;
-  bool is_index_sort;
+  bool is_index_sort = false;
 
   bool is_source() const override { return true; }
   bool is_sink() const override { return true; }

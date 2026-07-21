@@ -17,6 +17,7 @@
 #include "op/sirius_physical_partition.hpp"
 
 #include "config.hpp"
+#include "cuda/gpu_config.hpp"
 #include "data/data_batch_utils.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
@@ -246,6 +247,7 @@ std::pair<int, uint64_t> sirius_physical_partition::determine_num_partitions()
       std::to_string(this->get_operator_id()));
   }
   auto& repo           = ports.at("default")->repo;
+  if (!ports.at("default")->repo) throw std::runtime_error("partition: null repo");
   auto batch_ids       = repo->get_batch_ids(0);
   uint64_t total_bytes = 0;
   for (auto batch_id : batch_ids) {
@@ -255,9 +257,32 @@ std::pair<int, uint64_t> sirius_physical_partition::determine_num_partitions()
       if (ro.get_data()) { total_bytes += ro.get_data()->get_size_in_bytes(); }
     }
   }
-  int num_partitions = static_cast<int>(std::max(
-    uint64_t{1},
-    total_bytes / s_partition_size + static_cast<uint64_t>(total_bytes % s_partition_size != 0)));
+  int num_partitions = 1;
+  if (s_partition_size > 0) {
+    num_partitions = static_cast<int>(std::max(
+      uint64_t{1},
+      total_bytes / s_partition_size + static_cast<uint64_t>(total_bytes % s_partition_size != 0)));
+  }
+
+  // VRAM-aware partition cap: delegate to the gpu_config singleton, which
+  // queries free VRAM (cudaMemGetInfo) and derives a partition count so each
+  // partition fits in ~30% of available VRAM. On large-VRAM GPUs (MI300), the
+  // data typically fits in 1/3 of VRAM, so this returns 1 and partitions stay
+  // at the s_partition_size-derived count. On small-VRAM GPUs (8GB consumer
+  // cards running TPC-H Q21 with a 3-table join), it increases the partition
+  // count to prevent OOM. The singleton caches the hardware query and applies
+  // the SIRIUS_ENABLE_SPILLING / SIRIUS_HASH_JOIN_MAX_PARTITIONS env overrides.
+  {
+    int vram_partitions = sirius::cuda::gpu_config::instance().hash_join_partitions(total_bytes);
+    num_partitions = std::max(num_partitions, vram_partitions);
+  }
+
+  // Cap at 32 partitions (safety). This applies to ALL partition-count paths
+  // — not just the VRAM branch above — so a pathological s_partition_size or
+  // multi-GPU floor can never blow the partition count past what downstream
+  // operators (hash_join, merge_group_by) can fan out to.
+  num_partitions = std::min(num_partitions, 32);
+
   // Multi-GPU floor: if the input is big enough to justify using the second
   // GPU, force at least num_gpus partitions so partition-based operators
   // (hash_join, merge_group_by) get work on every GPU. Below the small-table
@@ -266,6 +291,9 @@ std::pair<int, uint64_t> sirius_physical_partition::determine_num_partitions()
   if (_min_num_partitions > 1 && total_bytes >= _small_table_bytes) {
     num_partitions = std::max(num_partitions, _min_num_partitions);
   }
+  // Final safety cap after the multi-GPU floor: _min_num_partitions can raise
+  // the count above 32, so clamp once more before returning.
+  num_partitions = std::min(num_partitions, 32);
   return std::make_pair(num_partitions, total_bytes);
 }
 

@@ -211,9 +211,13 @@ class bounded_thread_pool {
         try {
           fn();
         } catch (const std::exception& e) {
-          SIRIUS_LOG_ERROR("Exception in bounded_thread_pool task: {}", e.what());
+          try {
+            SIRIUS_LOG_ERROR("Exception in bounded_thread_pool task: {}", e.what());
+          } catch (...) {}
         } catch (...) {
-          SIRIUS_LOG_ERROR("Unknown exception in bounded_thread_pool task");
+          try {
+            SIRIUS_LOG_ERROR("Unknown exception in bounded_thread_pool task");
+          } catch (...) {}
         }
         // Destroy before slot is released upon lambda exit.
         fn = nullptr;

@@ -46,7 +46,6 @@
 
 #include <nvtx3/nvtx3.hpp>
 
-#include <cstdio>
 #include <span>
 
 namespace sirius {
@@ -281,7 +280,16 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::get_next_task_i
     for (size_t i = 0; i < default_port->repo->num_partitions(); i++) {
       left_batch_ids.push_back(default_port->repo->get_batch_ids(i));
       right_batch_ids.push_back(build_port->repo->get_batch_ids(i));
-      num_batches_to_process += left_batch_ids[i].size() * right_batch_ids[i].size();
+      // Overflow-safe accumulation: left * right can overflow size_t when both
+      // sides have many batches. The wrapped total would make
+      // current_partition_index >= num_batches_to_process true prematurely,
+      // silently dropping join output rows. Cap at SIZE_MAX.
+      size_t left_n  = left_batch_ids[i].size();
+      size_t right_n = right_batch_ids[i].size();
+      size_t product = left_n > SIZE_MAX / right_n ? SIZE_MAX : left_n * right_n;
+      num_batches_to_process = num_batches_to_process > SIZE_MAX - product
+                                 ? SIZE_MAX
+                                 : num_batches_to_process + product;
     }
   }
 
@@ -345,11 +353,14 @@ cudf::ast::ast_operator to_ast_operator(sirius::comparison_type comparison)
 }
 
 /// @brief Left-associative LOGICAL_AND over @p terms; @p chain owns the AND nodes and must be
-/// pre-reserved to terms.size()-1.
+/// pre-reserved to terms.size()-1. Caller must ensure @p terms is non-empty.
 const cudf::ast::expression& fold_logical_and(
   std::span<const std::reference_wrapper<const cudf::ast::expression>> terms,
   std::vector<cudf::ast::operation>& chain)
 {
+  if (terms.empty()) {
+    throw std::runtime_error("sirius_physical_nested_loop_join: fold_logical_and called with no terms");
+  }
   for (size_t i = 1; i < terms.size(); i++) {
     const cudf::ast::expression& lhs = (i == 1) ? terms[0].get() : chain.back();
     chain.emplace_back(cudf::ast::ast_operator::LOGICAL_AND, lhs, terms[i].get());
@@ -646,7 +657,7 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::execute(
     and_chain.reserve(conditions.size() > 1 ? conditions.size() - 1 : 0);
     std::vector<cudf::column_view> left_col_views, right_col_views;
     std::vector<std::unique_ptr<cudf::column>> intermediates_scope_holder;
-    std::vector<std::unique_ptr<cudf::table>> expression_res_scope_hodler;
+    std::vector<std::unique_ptr<cudf::table>> expression_res_scope_holder;
     left_col_views.reserve(left.num_columns());
     right_col_views.reserve(right.num_columns());
 
@@ -680,7 +691,7 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::execute(
             side + " table");
         }
         col_views.push_back(expr_view.column(0));
-        expression_res_scope_hodler.push_back(std::move(expr_result_table));
+        expression_res_scope_holder.push_back(std::move(expr_result_table));
       } else {
         auto target_type = duckdb::GetCudfType(expr.return_type);
 

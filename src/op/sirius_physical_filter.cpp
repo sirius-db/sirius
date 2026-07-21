@@ -70,7 +70,9 @@ std::unique_ptr<operator_data> sirius_physical_filter::execute(const operator_da
   output_batches.reserve(input_batches.size());
 
   for (auto const& batch : input_batches) {
-    auto view = batch.get_data()->cast<cucascade::gpu_table_representation>().get_table_view();
+    auto* data = batch.get_data();
+    if (!data) { continue; }
+    auto view = data->cast<cucascade::gpu_table_representation>().get_table_view();
     auto filtered_table = std::visit(
       [&](const auto& indices) {
         using IndicesType = std::decay_t<decltype(indices)>;

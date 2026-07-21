@@ -31,6 +31,8 @@
 
 // standard library
 #include <algorithm>
+#include <climits>
+#include <stdexcept>
 
 namespace sirius::op::result {
 
@@ -112,7 +114,10 @@ void host_table_chunk_reader::column_reader::copy_validity_range(
   size_t count,
   std::shared_ptr<multiple_blocks_allocation> const& allocation)
 {
-  assert(row_offset + count <= static_cast<size_t>(size));
+  if (row_offset + count > static_cast<size_t>(size)) {
+    throw std::out_of_range("host_table_chunk_reader: out of range");
+  }
+  assert(utils::mod_8(row_offset) == 0);  // Must be byte-aligned start
 
   // Initialize to all-valid; a column with no copied null mask stays all-valid.
   validity.Initialize(count);
@@ -142,7 +147,9 @@ void host_table_chunk_reader::column_reader::copy_fixed_width(
   std::shared_ptr<multiple_blocks_allocation> const& allocation)
 {
   assert(vector.GetType().InternalType() != duckdb::PhysicalType::VARCHAR);
-  assert(row_offset + count <= static_cast<size_t>(size));
+  if (row_offset + count > static_cast<size_t>(size)) {
+    throw std::out_of_range("host_table_chunk_reader: out of range");
+  }
 
   // We are copying into a flat vector
   vector.SetVectorType(duckdb::VectorType::FLAT_VECTOR);
@@ -220,7 +227,9 @@ void host_table_chunk_reader::column_reader::copy_string(
   std::shared_ptr<multiple_blocks_allocation> const& allocation)
 {
   assert(vector.GetType().InternalType() == duckdb::PhysicalType::VARCHAR);
-  assert(row_offset + count <= static_cast<size_t>(size));
+  if (row_offset + count > static_cast<size_t>(size)) {
+    throw std::out_of_range("host_table_chunk_reader: out of range");
+  }
 
   // We are copying into a flat vector
   vector.SetVectorType(duckdb::VectorType::FLAT_VECTOR);
@@ -275,7 +284,9 @@ void host_table_chunk_reader::column_reader::copy_array(
   std::shared_ptr<multiple_blocks_allocation> const& allocation)
 {
   assert(vector.GetType().id() == duckdb::LogicalTypeId::ARRAY);
-  assert(row_offset + count <= static_cast<size_t>(size));
+  if (row_offset + count > static_cast<size_t>(size)) {
+    throw std::out_of_range("host_table_chunk_reader: out of range");
+  }
   vector.SetVectorType(duckdb::VectorType::FLAT_VECTOR);
 
   auto const array_size = static_cast<size_t>(duckdb::ArrayType::GetSize(vector.GetType()));
@@ -349,10 +360,10 @@ host_table_chunk_reader::host_table_chunk_reader(
   _column_readers.reserve(columns.size());
   for (size_t col_idx = 0; col_idx < columns.size(); ++col_idx) {
     if (col_idx == 0) {
-      _total_rows = static_cast<size_t>(columns[col_idx].num_rows);
-      if (_total_rows < 0) {
+      if (columns[col_idx].num_rows < 0) {
         throw std::runtime_error("[host_table_chunk_reader] Negative total rows in first column.");
       }
+      _total_rows = static_cast<size_t>(columns[col_idx].num_rows);
     } else if (static_cast<size_t>(columns[col_idx].num_rows) != _total_rows) {
       throw std::runtime_error(
         "[host_table_chunk_reader] Metadata column size mismatch across columns.");
@@ -366,6 +377,9 @@ host_table_chunk_reader::host_table_chunk_reader(
 /// Used to create temp vectors for type-widening casts.
 static duckdb::LogicalType cudf_type_to_duckdb(cudf::data_type type)
 {
+  int const scale   = type.scale();
+  int abs_scale_int = scale < 0 ? (scale == INT_MIN ? 255 : -scale) : 0;
+  uint8_t abs_scale = static_cast<uint8_t>(std::min(abs_scale_int, 255));
   switch (type.id()) {
     case cudf::type_id::INT8: return duckdb::LogicalType::TINYINT;
     case cudf::type_id::INT16: return duckdb::LogicalType::SMALLINT;
@@ -378,14 +392,11 @@ static duckdb::LogicalType cudf_type_to_duckdb(cudf::data_type type)
     case cudf::type_id::FLOAT32: return duckdb::LogicalType::FLOAT;
     case cudf::type_id::FLOAT64: return duckdb::LogicalType::DOUBLE;
     case cudf::type_id::DECIMAL32:
-      return duckdb::LogicalType::DECIMAL(duckdb::Decimal::MAX_WIDTH_INT32,
-                                          static_cast<uint8_t>(-type.scale()));
+      return duckdb::LogicalType::DECIMAL(duckdb::Decimal::MAX_WIDTH_INT32, abs_scale);
     case cudf::type_id::DECIMAL64:
-      return duckdb::LogicalType::DECIMAL(duckdb::Decimal::MAX_WIDTH_INT64,
-                                          static_cast<uint8_t>(-type.scale()));
+      return duckdb::LogicalType::DECIMAL(duckdb::Decimal::MAX_WIDTH_INT64, abs_scale);
     case cudf::type_id::DECIMAL128:
-      return duckdb::LogicalType::DECIMAL(duckdb::Decimal::MAX_WIDTH_INT128,
-                                          static_cast<uint8_t>(-type.scale()));
+      return duckdb::LogicalType::DECIMAL(duckdb::Decimal::MAX_WIDTH_INT128, abs_scale);
     default: return duckdb::LogicalType::SQLNULL;
   }
 }

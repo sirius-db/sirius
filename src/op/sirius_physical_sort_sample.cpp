@@ -197,7 +197,9 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
   try {
     size_t total_sample_bytes = 0;
     for (auto const& batch : valid_batches) {
-      total_sample_bytes += batch.get_data()->get_size_in_bytes();
+      auto* data = batch.get_data();
+      if (!data) { continue; }
+      total_sample_bytes += data->get_size_in_bytes();
     }
 
     // 2. Build cudf order vectors from BoundOrderByNode
@@ -260,8 +262,18 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
       size_t total_batch_count = valid_batches.size();
       size_t bytes_for_sizing  = total_sample_bytes;
       if (!complete_input) {
-        total_batch_count = (estimated_cardinality + avg_rows_per_batch - 1) / avg_rows_per_batch;
-        bytes_for_sizing  = avg_batch_bytes * total_batch_count;
+        // Overflow-safe ceil-div: (estimated_cardinality + avg_rows_per_batch - 1)
+        // can overflow size_t when estimated_cardinality is near SIZE_MAX.
+        // Use the identity (a + b - 1) / b == 1 + (a - 1) / b (safe when a > 0).
+        total_batch_count = avg_rows_per_batch > 0 && estimated_cardinality > 0
+                              ? 1 + (estimated_cardinality - 1) / avg_rows_per_batch
+                              : 1;
+        // Overflow-safe bytes_for_sizing: avg_batch_bytes * total_batch_count
+        // can overflow. Cap at SIZE_MAX so the partition count derivation below
+        // (which only needs bytes_for_sizing > max_partition_bytes) stays sane.
+        bytes_for_sizing  = total_batch_count > SIZE_MAX / avg_batch_bytes
+                              ? SIZE_MAX
+                              : avg_batch_bytes * total_batch_count;
       }
       size_t available_memory    = space->get_available_memory(stream);
       size_t max_partition_bytes = _max_partition_bytes_override > 0
@@ -302,9 +314,9 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
       std::vector<int32_t> boundary_indices_host;
       boundary_indices_host.reserve(num_boundaries);
       for (size_t i = 1; i <= num_boundaries; i++) {
-        auto idx = static_cast<int32_t>((i * total_rows) / num_parts);
-        if (idx >= static_cast<int32_t>(total_rows)) { idx = static_cast<int32_t>(total_rows) - 1; }
-        boundary_indices_host.push_back(idx);
+        int64_t idx = (static_cast<int64_t>(i) * total_rows) / num_parts;
+        if (idx >= static_cast<int64_t>(total_rows)) { idx = static_cast<int64_t>(total_rows) - 1; }
+        boundary_indices_host.push_back(static_cast<int32_t>(idx));
       }
 
       // Create a device column with the boundary indices

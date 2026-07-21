@@ -16,12 +16,122 @@
 
 cmake_minimum_required(VERSION 3.30.4 FATAL_ERROR)
 
-project(sirius LANGUAGES CXX CUDA)
+# --- GPU backend selection ---------------------------------------------------
+# Sirius targets two GPU backends with a single source tree:
+#
+#   * NVIDIA/CUDA (default)  — the upstream configuration. Depends on cuDF +
+#     RMM (RAPIDS) plus NVIDIA-only libraries that have no ROCm port today:
+#     cuCollections (cuco) and cuCascade (the out-of-core GPU memory-reservation
+#     subsystem the live "Super Sirius" gpu_execution path is built on).
+#
+#   * AMD/ROCm (opt-in via -DENABLE_ROCM=ON) — swaps in the ROCm-DS drop-in
+#     equivalents hipDF and hipMM. Both intentionally keep the upstream package
+#     name (cudf / rmm), namespace (cudf:: / rmm::) and CMake target
+#     (cudf::cudf / rmm::rmm), so the link graph below is identical across
+#     backends. The .cu kernels compile as HIP via hip-clang; hipCUB/rocThrust
+#     expose the cub::/thrust:: namespaces unchanged.
+#
+#     Because no ROCm port of cuco or cuCascade exists yet, ENABLE_ROCM gates
+#     both OFF (see SIRIUS_ENABLE_CUCO / SIRIUS_ENABLE_CUCASCADE below). The
+#     consequence is documented in PORTING.md: on ROCm the live gpu_execution
+#     operators that hard-depend on cuCascade's repository/spilling layer are
+#     not built, and queries reaching them fall back to DuckDB's CPU engine —
+#     Sirius's existing graceful-degradation path. The legacy gpu_processing
+#     in-memory path (cudf+rmm only, ENABLE_LEGACY_SIRIUS) is the subset that
+#     builds end-to-end on AMD today.
+option(ENABLE_ROCM "Build Sirius against the AMD ROCm/HIP backend (hipDF + hipMM) instead of NVIDIA CUDA" OFF)
 
-# Set CUDA architecture
-if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-  set(CMAKE_CUDA_ARCHITECTURES native)
-  message(STATUS "CMAKE_CUDA_ARCHITECTURES not defined. Setting to 'native'.")
+# --- Build speed optimizations ------------------------------------------------
+# ccache: auto-detect and wire as the CXX/HIP compiler launcher. Dramatically
+# speeds up incremental rebuilds (2-3x typical). Install with `apt install
+# ccache`. No-op if ccache is not found.
+option(SIRIUS_ENABLE_CCACHE "Use ccache for faster incremental rebuilds" ON)
+if(SIRIUS_ENABLE_CCACHE)
+  find_program(CCACHE_PROGRAM ccache)
+  if(CCACHE_PROGRAM)
+    message(STATUS "Sirius: ccache found at ${CCACHE_PROGRAM}, enabling as compiler launcher")
+    set(CMAKE_CXX_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
+    set(CMAKE_HIP_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
+  else()
+    message(STATUS "Sirius: ccache not found (install with 'apt install ccache' for faster rebuilds)")
+  endif()
+endif()
+
+# Unity build: concatenates all source files in a target into a single TU before
+# compiling. Reduces redundant header parsing — can cut a cold build by 30-50%.
+# Off by default (can cause subtle ODR issues with anonymous-namespace code);
+# enable via -DSIRIUS_UNITY_BUILD=ON for iterative development.
+option(SIRIUS_UNITY_BUILD "Enable unity builds for faster compilation (may reveal ODR issues)" OFF)
+
+# When ENABLE_ROCM, fetch the cuda2rocm compatibility shims from GitHub
+# instead of vendoring them. This makes cuda2rocm a proper dependency and
+# prevents the two copies from drifting. The shims provide cuda_runtime.h,
+# cub/→hipCUB, CCCL redirects, nvtx3→roctx, cooperative_groups, nvml, etc.
+if(ENABLE_ROCM)
+  include(FetchContent)
+  FetchContent_Declare(
+    cuda2rocm
+    URL https://github.com/hamstergamerszhang-ops/cuda2rocm/archive/2511e5265472f894a883a1bda0d677e4ecbcf059.tar.gz
+    URL_HASH SHA256=aad55f3897f2649f835a3f3587c8bc5bc18350256b277d3bbb66efd53a62d1ec
+  )
+  # We only need the headers, so populate without building
+  FetchContent_GetProperties(cuda2rocm)
+  if(NOT cuda2rocm_POPULATED)
+    FetchContent_Populate(cuda2rocm)
+  endif()
+  set(SIRIUS_ROCM_COMPAT_DIR "${cuda2rocm_SOURCE_DIR}/cuda-compat-shims/include")
+  # cucascade-rocm provides the <cucascade/...> stub headers that 133 sirius
+  # source/header files include. Without this on the include path, every one of
+  # those files fails with 'cucascade/... file not found' under ENABLE_ROCM.
+  # The real cuCascade submodule (cucascade/) is only built when
+  # SIRIUS_ENABLE_CUCASCADE=ON; the stubs provide compile-only fallbacks for
+  # the default ROCm config (gates OFF) so the rest of the engine compiles.
+  set(SIRIUS_ROCM_CUCASCADE_DIR "${cuda2rocm_SOURCE_DIR}/cucascade-rocm/include")
+  message(STATUS "cuda2rocm shims: ${SIRIUS_ROCM_COMPAT_DIR}")
+  message(STATUS "cuda2rocm cucascade stubs: ${SIRIUS_ROCM_CUCASCADE_DIR}")
+endif()
+
+if(ENABLE_ROCM)
+  # hipDF's own project() enables LANGUAGES C CXX HIP; mirror that here so the
+  # .cu sources in CUDA_SOURCES are compiled by hip-clang as HIP. CMAKE_HIP_ARCHITECTURES
+  # accepts the same gfx* identifiers the ROCm toolchain targets (gfx90a / gfx942 /
+  # gfx950 — the Instinct MI series hipDF supports). 'native' is only meaningful on a
+  # host with an AMD GPU, so default to the explicit set for portability.
+  set(SIRIUS_GPU_LANG "HIP")
+  if(NOT DEFINED CMAKE_HIP_ARCHITECTURES)
+    set(CMAKE_HIP_ARCHITECTURES gfx90a;gfx942;gfx950)
+    message(STATUS "CMAKE_HIP_ARCHITECTURES not defined. Setting to 'gfx90a;gfx942;gfx950'.")
+  endif()
+else()
+  set(SIRIUS_GPU_LANG "CUDA")
+endif()
+
+project(sirius LANGUAGES CXX ${SIRIUS_GPU_LANG})
+
+# Under ROCm the CUDA language is not enabled, so CMake's default source-file
+# extension map (which only treats .hip as HIP) would leave the .cu files in
+# CUDA_SOURCES without a language. Tell CMake that .cu is also a HIP source so
+# hip-clang compiles them. (hipDF's own .cu files rely on the same convention.)
+if(ENABLE_ROCM)
+  list(APPEND CMAKE_HIP_SOURCE_FILE_EXTENSIONS cu)
+endif()
+
+# Set GPU architecture (CUDA path only; HIP archs are set before project() above).
+if(NOT ENABLE_ROCM)
+  if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+    set(CMAKE_CUDA_ARCHITECTURES native)
+    message(STATUS "CMAKE_CUDA_ARCHITECTURES not defined. Setting to 'native'.")
+  endif()
+endif()
+
+# cuco (cuCollections) and cuCascade are NVIDIA-only today; no ROCm port exists.
+# Default both ON for the CUDA backend and OFF for ROCm (see PORTING.md).
+if(ENABLE_ROCM)
+  option(SIRIUS_ENABLE_CUCO "Link cuCollections (NVIDIA-only; no ROCm port)" OFF)
+  option(SIRIUS_ENABLE_CUCASCADE "Build the cuCascade submodule (NVIDIA-only; no ROCm port)" OFF)
+else()
+  option(SIRIUS_ENABLE_CUCO "Link cuCollections" ON)
+  option(SIRIUS_ENABLE_CUCASCADE "Build the cuCascade submodule" ON)
 endif()
 
 # Optional features
@@ -47,6 +157,13 @@ if(VCPKG_BUILD)
                        "${CMAKE_CXX_FLAGS}")
   string(REGEX REPLACE "-I[^ ]*/include/cccl" "" CMAKE_CUDA_FLAGS
                        "${CMAKE_CUDA_FLAGS}")
+  # Under ENABLE_ROCM the CUDA language is not enabled (CMAKE_CUDA_FLAGS is
+  # inert); strip the same conda-injected CCCL path from CMAKE_HIP_FLAGS so
+  # hip-clang doesn't see a conflicting CCCL version ahead of hipDF's bundled one.
+  if(ENABLE_ROCM)
+    string(REGEX REPLACE "-I[^ ]*/include/cccl" "" CMAKE_HIP_FLAGS
+                         "${CMAKE_HIP_FLAGS}")
+  endif()
 
   # The loadable extension must not depend on libcudart.so in the vcpkg build.
   # Set the CUDA language default to the static runtime before any CUDA targets
@@ -87,7 +204,21 @@ foreach(_sirius_link_flags CMAKE_EXE_LINKER_FLAGS CMAKE_SHARED_LINKER_FLAGS
 endforeach()
 
 # Dependencies
+# Under ENABLE_ROCM, hipDF/hipMM are built and installed via
+# scripts/build_rocm_deps.sh. They export cudf::cudf / rmm::rmm — the same
+# target names as NVIDIA cuDF/RMM — so the find_package + link lines below
+# are identical across backends. The install prefix must be on
+# CMAKE_PREFIX_PATH (the build script defaults to /opt/rocm).
+if(ENABLE_ROCM)
+  # Ensure /opt/rocm is on the search path even if CMAKE_PREFIX_PATH is unset.
+  list(APPEND CMAKE_PREFIX_PATH "/opt/rocm")
+endif()
 find_package(cudf REQUIRED CONFIG)
+# On NVIDIA, cuDF's cmake config calls find_dependency(rmm) so rmm::rmm is
+# available transitively. On ROCm, hipDF's config may NOT export this
+# transitive dependency (it depends on how hipDF was built — CPM vs install).
+# Explicitly find rmm so rmm::rmm always exists when Sirius links it.
+find_package(rmm REQUIRED CONFIG)
 find_package(spdlog REQUIRED CONFIG)
 find_package(yaml-cpp REQUIRED CONFIG)
 find_package(absl REQUIRED CONFIG)
@@ -95,33 +226,58 @@ find_package(PkgConfig REQUIRED)
 find_package(OpenSSL REQUIRED)
 find_package(ZLIB REQUIRED)
 
+# ROCm: roctx (nvtx3-equivalent profiling-range API). The library is libroctx64,
+# shipped in the roctracer / rocprofiler-developer-tools package. Resolved with
+# find_library (matching rocBLAS) so a non-default ROCm install path is honored.
+# The header is <roctracer/roctx.h>, consumed by the cuda2rocm nvtx3 shim
+# (cuda-compat-shims/include/nvtx3/nvtx3.hpp, via FetchContent).
+# ROCTX_PATH is an optional user override pointing at the ROCm install root.
+if(ENABLE_ROCM)
+  find_path(ROCTX_INCLUDE_DIR NAMES roctracer/roctx.h
+            HINTS ${ROCTX_PATH}/include ${ROCTX_PATH} /opt/rocm/include)
+  find_library(ROCTX_LIBRARY NAMES roctx64
+               HINTS ${ROCTX_PATH}/lib ${ROCTX_PATH} /opt/rocm/lib /opt/rocm)
+  if(NOT ROCTX_INCLUDE_DIR OR NOT ROCTX_LIBRARY)
+    message(FATAL_ERROR "ENABLE_ROCM requires the roctx profiling library (libroctx64 + "
+                        "roctracer/roctx.h), shipped in the roctracer / rocprofiler-developer-tools "
+                        "package. Set -DROCTX_PATH=/path/to/rocm or install the package.")
+  endif()
+endif()
+
 # --- cuCollections (cuco) --- #
 
-# libcudf no longer ships its bundled copy. In the vcpkg build cuco comes from
-# the overlay port (vcpkg_ports/cuco); configure-time downloads are disabled
-# there. Otherwise (pixi build) fetch the same commit cudf is built against
-# (populate sources without add_subdirectory; CCCL comes from cudf). Either way
-# cuco is header-only and exposed as the cuco::cuco target, so both paths
-# consume it identically below.
-if(VCPKG_BUILD)
-  find_package(cuco CONFIG REQUIRED)
-else()
-  include(FetchContent)
-  FetchContent_Declare(
-    cuco
-    URL https://github.com/NVIDIA/cuCollections/archive/f517bbb1277753b1852dfd388993383e401eaa38.tar.gz
-    URL_HASH
-      SHA256=d17e2f6d58cfb2cd473efcbd741c633e7607717102cedc08173a4a69bb2a8ba9
-    SOURCE_SUBDIR do-not-build)
-  FetchContent_MakeAvailable(cuco)
-  # SOURCE_SUBDIR do-not-build populates headers without running cuco's CMake,
-  # so no target is created. Define the same header-only cuco::cuco the vcpkg
-  # port exports (CCCL still comes from cudf) so both build paths consume cuco
-  # identically below.
-  if(NOT TARGET cuco::cuco)
-    add_library(cuco::cuco INTERFACE IMPORTED)
-    set_target_properties(cuco::cuco PROPERTIES INTERFACE_INCLUDE_DIRECTORIES
-                                                "${cuco_SOURCE_DIR}/include")
+# cuco has no ROCm port (see PORTING.md). When SIRIUS_ENABLE_CUCO is OFF the
+# cuco::cuco target is left undefined and the two dynamic-filter .cu translation
+# units that consume it (sirius_dynamic_bloom_filter.cu / sirius_dynamic_in_list_filter.cu)
+# must be excluded from CUDA_SOURCES below — they are conditionally compiled via
+# SIRIUS_ENABLE_CUCO in the sources section.
+if(SIRIUS_ENABLE_CUCO)
+  # libcudf no longer ships its bundled copy. In the vcpkg build cuco comes from
+  # the overlay port (vcpkg_ports/cuco); configure-time downloads are disabled
+  # there. Otherwise (pixi build) fetch the same commit cudf is built against
+  # (populate sources without add_subdirectory; CCCL comes from cudf). Either way
+  # cuco is header-only and exposed as the cuco::cuco target, so both paths
+  # consume it identically below.
+  if(VCPKG_BUILD)
+    find_package(cuco CONFIG REQUIRED)
+  else()
+    include(FetchContent)
+    FetchContent_Declare(
+      cuco
+      URL https://github.com/NVIDIA/cuCollections/archive/f517bbb1277753b1852dfd388993383e401eaa38.tar.gz
+      URL_HASH
+        SHA256=d17e2f6d58cfb2cd473efcbd741c633e7607717102cedc08173a4a69bb2a8ba9
+      SOURCE_SUBDIR do-not-build)
+    FetchContent_MakeAvailable(cuco)
+    # SOURCE_SUBDIR do-not-build populates headers without running cuco's CMake,
+    # so no target is created. Define the same header-only cuco::cuco the vcpkg
+    # port exports (CCCL still comes from cudf) so both build paths consume cuco
+    # identically below.
+    if(NOT TARGET cuco::cuco)
+      add_library(cuco::cuco INTERFACE IMPORTED)
+      set_target_properties(cuco::cuco PROPERTIES INTERFACE_INCLUDE_DIRECTORIES
+                                                  "${cuco_SOURCE_DIR}/include")
+    endif()
   endif()
 endif()
 
@@ -129,7 +285,18 @@ pkg_check_modules(NUMA REQUIRED IMPORTED_TARGET numa)
 pkg_check_modules(LIBURING REQUIRED IMPORTED_TARGET liburing)
 pkg_check_modules(CURL REQUIRED IMPORTED_TARGET libcurl)
 
-# cuCascade - GPU Memory Reservation Library (submodule)
+# cuCascade - GPU Memory Reservation Library (submodule).
+#
+# On ROCm: instead of stubs, we build the REAL cuCascade submodule with the
+# ROCm compatibility shims applied. Per reviewer feedback (sirius-db/sirius#1158),
+# this uses the real implementation and tests as the specification. The staged
+# approach starts with CUCASCADE_TOPOLOGY_ONLY=ON (smallest scope), then
+# expands to CUCASCADE_BUILD_CUDF=ON once hipDF+hipMM are installed.
+#
+# When SIRIUS_ENABLE_CUCASCADE is OFF: the submodule is not built; the stub
+# types in cuda2rocm's cucascade-rocm/include/cucascade/ (via FetchContent)
+# provide compile-only fallbacks (throw at runtime → DuckDB CPU execution).
+if(SIRIUS_ENABLE_CUCASCADE)
 set(BUILD_TESTS
     OFF
     CACHE BOOL "" FORCE)
@@ -156,7 +323,32 @@ set(CUCASCADE_WARNINGS_AS_ERRORS
 set(CUCASCADE_BUILD_IO
     OFF
     CACHE BOOL "" FORCE)
+# On ROCm: set topology-only (staged port), skip cudf/io/tests
+if(ENABLE_ROCM)
+  set(CUCASCADE_TOPOLOGY_ONLY ON CACHE BOOL "" FORCE)
+  set(CUCASCADE_BUILD_CUDF OFF CACHE BOOL "" FORCE)
+  set(CUCASCADE_BUILD_IO OFF CACHE BOOL "" FORCE)
+  set(CUCASCADE_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+  set(CUCASCADE_BUILD_BENCHMARKS OFF CACHE BOOL "" FORCE)
+  message(STATUS "cuCascade: ROCm port — topology-only build (staged)")
+endif()
 add_subdirectory(cucascade "${CMAKE_BINARY_DIR}/cucascade" EXCLUDE_FROM_ALL)
+
+# On ROCm: apply the shim include path to cuCascade targets so cuda_runtime.h,
+# nvml.h, nvtx3, etc. resolve to the compatibility shims.
+if(ENABLE_ROCM)
+  foreach(_cucascade_target
+          cucascade_topology_discovery_objects cucascade_topology_discovery_static
+          cucascade_topology_discovery_shared
+          cucascade_objects cucascade_static cucascade_shared
+          cucascade_cudf_objects cucascade_cudf_static cucascade_cudf_shared)
+    if(TARGET "${_cucascade_target}")
+      target_include_directories("${_cucascade_target}" BEFORE PRIVATE
+        ${SIRIUS_ROCM_COMPAT_DIR})
+    endif()
+  endforeach()
+endif()
+endif()
 
 if(VCPKG_BUILD AND TARGET CUDA::cudart_static)
   function(sirius_prefer_static_cudart target_name)
@@ -191,8 +383,18 @@ if(VCPKG_BUILD AND TARGET CUDA::cudart_static)
   endforeach()
 endif()
 
-# Rust telemetry instrumentation (C++ FFI via Corrosion)
-add_subdirectory(rust/crates/telemetry/bridge)
+# Rust telemetry instrumentation (C++ FFI via Corrosion). Requires a Rust
+# toolchain. Gated like SIRIUS_BUILD_S3_TESTS (which needs Go) so offline /
+# Rust-less / ROCm builds skip it; the extension still builds without telemetry.
+option(SIRIUS_BUILD_TELEMETRY "Build the Rust telemetry bridge (requires Rust toolchain)" ON)
+if(SIRIUS_BUILD_TELEMETRY)
+  add_subdirectory(rust/crates/telemetry/bridge)
+else()
+  # Provide a stub target so the link targets below always resolve.
+  if(NOT TARGET telemetry_bridge)
+    add_library(telemetry_bridge INTERFACE)
+  endif()
+endif()
 
 # Upstream testcontainers-native, fetched + patched at configure time (see
 # cmake/testcontainers_native.cmake), used by the S3 integration test harness to
@@ -356,6 +558,8 @@ set(EXTENSION_SOURCES
     src/sirius_engine.cpp
     src/sirius_extension.cpp
     src/sirius_ffi.cpp
+    src/cuda/gpu_config.cpp
+    src/cuda/persistent_kernel.cu
     src/sirius_interface.cpp
     src/sirius_sql_rewrite.cpp
     src/telemetry/telemetry_context.cpp
@@ -369,12 +573,17 @@ set(EXTENSION_SOURCES
 # Legacy Sirius — all legacy-specific config lives in src/legacy/CMakeLists.txt.
 
 # Deleting src/legacy/ cleanly removes legacy build support.
+#
+# The scan-decode kernels plus crc32_partition_hash are cudf/rmm/cub-only and
+# portable across backends. The 4 dynamic-filter kernels depend on cuCascade
+# (memory_space + replica transfer) and, for the set-backed variants, cuco
+# (bloom_filter / static_set); they are only compiled when their SIRIUS_ENABLE_*
+# gates are ON. On ROCm both gates default OFF, so these TUs are dropped and the
+# dynamic-filter feature is unavailable (queries degrade to the CPU fallback).
+# See PORTING.md.
 set(CUDA_SOURCES
+    # Portable (cudf/rmm/cub only) — compiled on every backend.
     src/op/partition/crc32_partition_hash.cu
-    src/cuda/dynamic_filter_replica_transfer.cu
-    src/cuda/sirius_dynamic_bloom_filter.cu
-    src/cuda/sirius_dynamic_in_list_filter.cu
-    src/cuda/sirius_dynamic_small_in_list_filter.cu
     src/cuda/scan/gpu_decode_alp.cu
     src/cuda/scan/gpu_decode_bitpacking.cu
     src/cuda/scan/gpu_decode_rle.cu
@@ -384,6 +593,17 @@ set(CUDA_SOURCES
     src/cuda/scan/strings/dictionary.cu
     src/cuda/scan/strings/fsst.cu
     src/cuda/scan/strings/uncompressed.cu)
+# cuCascade-dependent, cuco-independent: the replica transfer and the small
+# in-list filter (uses a raw device_buffer, not a cuco set — see its source).
+if(SIRIUS_ENABLE_CUCASCADE)
+  list(APPEND CUDA_SOURCES src/cuda/dynamic_filter_replica_transfer.cu
+         src/cuda/sirius_dynamic_small_in_list_filter.cu)
+endif()
+# cuco-backed set filters: bloom_filter and the (cuco::static_set) in-list.
+if(SIRIUS_ENABLE_CUCO AND SIRIUS_ENABLE_CUCASCADE)
+  list(APPEND CUDA_SOURCES src/cuda/sirius_dynamic_bloom_filter.cu
+         src/cuda/sirius_dynamic_in_list_filter.cu)
+endif()
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/legacy/CMakeLists.txt")
   add_subdirectory(src/legacy)
   list(APPEND EXTENSION_SOURCES ${SIRIUS_LEGACY_SOURCES}
@@ -417,6 +637,17 @@ set_source_files_properties(${SIRIUS_SUBSTRAIT_SOURCES}
                             PROPERTIES COMPILE_OPTIONS "-w")
 list(APPEND EXTENSION_SOURCES ${SIRIUS_SUBSTRAIT_SOURCES})
 
+# When telemetry is OFF, the Rust-generated headers (telemetry-bridge/gen/*.rs.h)
+# don't exist. Exclude the telemetry source files from the build — the stub
+# telemetry_bridge INTERFACE library satisfies the link dependency, and the
+# telemetry functionality is simply absent (no-op).
+if(NOT SIRIUS_BUILD_TELEMETRY)
+  list(REMOVE_ITEM EXTENSION_SOURCES
+       src/telemetry/telemetry_context.cpp
+       src/telemetry/memory_context.cpp)
+  message(STATUS "Telemetry sources excluded: SIRIUS_BUILD_TELEMETRY is OFF")
+endif()
+
 build_static_extension(sirius ${EXTENSION_SOURCES} ${CUDA_SOURCES})
 build_loadable_extension(sirius CPP ${EXTENSION_SOURCES} ${CUDA_SOURCES})
 
@@ -427,19 +658,44 @@ build_loadable_extension(sirius CPP ${EXTENSION_SOURCES} ${CUDA_SOURCES})
 # Harmless for the single-DSO static vcpkg build.
 set_target_properties(sirius_loadable_extension PROPERTIES LINKER_TYPE BFD)
 
-# Shared configuration for both extension targets
+# Shared configuration for both extension targets.
+#
+# The GPU language properties are set per-backend: CUDA_* on NVIDIA, HIP_* on
+# ROCm. hip-clang does not need --expt-extended-lambda (extended lambdas are on
+# by default), so that flag stays gated to CUDA,NVIDIA as before.
 foreach(_target sirius_extension sirius_loadable_extension)
-  set_target_properties(
-    ${_target}
-    PROPERTIES CXX_STANDARD 20
-               CXX_STANDARD_REQUIRED ON
-               CUDA_STANDARD 20
-               CUDA_STANDARD_REQUIRED ON
-               CUDA_SEPARABLE_COMPILATION ON
-               CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+  if(ENABLE_ROCM)
+    set_target_properties(
+      ${_target}
+      PROPERTIES CXX_STANDARD 20
+                 CXX_STANDARD_REQUIRED ON
+                 HIP_STANDARD 20
+                 HIP_STANDARD_REQUIRED ON
+                 HIP_SEPARABLE_COMPILATION ON
+                 HIP_RESOLVE_DEVICE_SYMBOLS ON)
+  else()
+    set_target_properties(
+      ${_target}
+      PROPERTIES CXX_STANDARD 20
+                 CXX_STANDARD_REQUIRED ON
+                 CUDA_STANDARD 20
+                 CUDA_STANDARD_REQUIRED ON
+                 CUDA_SEPARABLE_COMPILATION ON
+                 CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+  endif()
+
+  # Unity build: when SIRIUS_UNITY_BUILD=ON, concatenate all sources in this
+  # target into one TU before compiling. Cuts redundant header parsing on cold
+  # builds. Applied per-target so it can be toggled independently for the
+  # extension vs tests.
+  if(SIRIUS_UNITY_BUILD)
+    set_target_properties(${_target} PROPERTIES UNITY_BUILD ON)
+  endif()
 
   # cuco's device APIs need nvcc's extended device lambda; cuco compiles its own
-  # consumers (tests/benchmarks) with --expt-extended-lambda.
+  # consumers (tests/benchmarks) with --expt-extended-lambda. The generator
+  # expression restricts the flag to the CUDA/NVIDIA compiler, so it is inert
+  # under ROCm (hip-clang enables extended lambdas by default).
   target_compile_options(
     ${_target}
     PRIVATE $<$<COMPILE_LANG_AND_ID:CUDA,NVIDIA>:--expt-extended-lambda>)
@@ -464,6 +720,16 @@ foreach(_target sirius_extension sirius_loadable_extension)
       $<$<BOOL:${SIRIUS_LEGACY_INCLUDE_DIR}>:$<BUILD_INTERFACE:${SIRIUS_LEGACY_INCLUDE_DIR}>>
   )
 
+  # ROCm compatibility shims (cuda_runtime.h, cub/, cucascade/, nvtx3→roctx).
+  # BEFORE so the shim headers shadow any NVIDIA headers that might exist on
+  # the system include path. This is load-bearing: without BEFORE, the compiler
+  # may find a system cuda_runtime.h (e.g. from Triton's NVIDIA backend) ahead
+  # of the shim.
+  if(ENABLE_ROCM)
+    target_include_directories(${_target} BEFORE PRIVATE
+      ${SIRIUS_ROCM_COMPAT_DIR} ${SIRIUS_ROCM_CUCASCADE_DIR})
+  endif()
+
   # Substrait->DuckDB reader headers (from_substrait.hpp) and its bundled
   # protobuf.
   target_include_directories(
@@ -477,20 +743,42 @@ foreach(_target sirius_extension sirius_loadable_extension)
                                PRIVATE ${SIRIUS_LEGACY_COMPILE_DEFINITIONS})
   endif()
 
-  # cuCascade::cucascade_cudf holds the cudf-coupled representations and
-  # converters Sirius uses; it transitively links the cudf-free core
-  # (cuCascade::cucascade) and cudf::cudf.
-
+  # cudf::cudf and rmm::rmm are linked unconditionally: on the ROCm backend
+  # these resolve to hipDF/hipMM, which export the same target names (see the
+  # ENABLE_ROCM block above). cuco::cuco and cuCascade::cucascade[_cudf] are
+  # NVIDIA-only and are omitted when their SIRIUS_ENABLE_* option is OFF; the
+  # translation units that reference them are excluded from CUDA_SOURCES below
+  # and guarded by SIRIUS_ENABLE_CUCO / SIRIUS_ENABLE_CUCASCADE in source.
   target_link_libraries(
     ${_target}
     cudf::cudf
-    cuco::cuco
     rmm::rmm
     spdlog::spdlog
-    cuCascade::cucascade
-    cuCascade::cucascade_cudf
     yaml-cpp::yaml-cpp
     telemetry_bridge)
+
+  if(SIRIUS_ENABLE_CUCO)
+    target_link_libraries(${_target} PRIVATE cuco::cuco)
+    target_compile_definitions(${_target} PRIVATE SIRIUS_ENABLE_CUCO=1)
+  endif()
+  if(SIRIUS_ENABLE_CUCASCADE)
+    # cuCascade::cucascade_cudf holds the cudf-coupled representations and
+    # converters Sirius uses; it transitively links the cudf-free core
+    # (cuCascade::cucascade) and cudf::cudf.
+    target_link_libraries(
+      ${_target}
+      cuCascade::cucascade
+      cuCascade::cucascade_cudf)
+    target_compile_definitions(${_target} PRIVATE SIRIUS_ENABLE_CUCASCADE=1)
+  endif()
+
+  # ROCm: link roctx (the nvtx3-equivalent profiling-range API backed by the
+  # cuda2rocm nvtx3 shim, via FetchContent) and expose the SIRIUS_ROCM define to source.
+  if(ENABLE_ROCM)
+    target_link_libraries(${_target} PRIVATE ${ROCTX_LIBRARY})
+    target_include_directories(${_target} PRIVATE ${ROCTX_INCLUDE_DIR})
+    target_compile_definitions(${_target} PRIVATE SIRIUS_ROCM=1)
+  endif()
 
   add_dependencies(${_target} duckdb_static)
 endforeach()
@@ -524,7 +812,12 @@ target_link_libraries(sirius_loadable_extension PkgConfig::LIBURING
 # libnvidia-ml.so.1 at runtime, matching the working Phase-24 configuration.
 # This bypasses both failure modes (no stub symbols bundled, no dynamic-export
 # conflict).
-if(TARGET CUDA::nvml_static)
+#
+# NVIDIA-only: CUDA::nvml_static is an nvcc/CMake CUDA target. On the ROCm
+# backend the equivalent topology source is rocm-smi / hwloc (see PORTING.md),
+# and this whole block is skipped because both the target and the cuCascade
+# library that pulls it in are absent.
+if(NOT ENABLE_ROCM AND TARGET CUDA::nvml_static)
   get_target_property(_nvml_static_loc CUDA::nvml_static IMPORTED_LOCATION)
   if(_nvml_static_loc AND _nvml_static_loc MATCHES "libnvidia-ml\\.a$")
     string(REGEX REPLACE "libnvidia-ml\\.a$" "libnvidia-ml.so" _nvml_shared_loc
@@ -546,13 +839,22 @@ endif()
 # cucascade_static / telemetry_bridge). cucascade upstream PR #126 split
 # topology_discovery into its own static target, and PR #150 split the
 # cudf-coupled code into cucascade_cudf_static — list both here so the export
-# set covers the full dependency chain.
-install(
-  TARGETS sirius_extension cucascade_static cucascade_cudf_static
-          cucascade_topology_discovery_static telemetry_bridge
-  EXPORT "${DUCKDB_EXPORT_SET}"
-  LIBRARY DESTINATION "${INSTALL_LIB_DIR}"
-  ARCHIVE DESTINATION "${INSTALL_LIB_DIR}")
+# set covers the full dependency chain. Under ROCm cuCascade is absent, so only
+# the always-built sirius_extension + telemetry_bridge are exported.
+if(SIRIUS_ENABLE_CUCASCADE)
+  install(
+    TARGETS sirius_extension cucascade_static cucascade_cudf_static
+            cucascade_topology_discovery_static telemetry_bridge
+    EXPORT "${DUCKDB_EXPORT_SET}"
+    LIBRARY DESTINATION "${INSTALL_LIB_DIR}"
+    ARCHIVE DESTINATION "${INSTALL_LIB_DIR}")
+else()
+  install(
+    TARGETS sirius_extension telemetry_bridge
+    EXPORT "${DUCKDB_EXPORT_SET}"
+    LIBRARY DESTINATION "${INSTALL_LIB_DIR}"
+    ARCHIVE DESTINATION "${INSTALL_LIB_DIR}")
+endif()
 
 if(ENABLE_STREAM_CHECK)
   message(
@@ -762,8 +1064,22 @@ target_include_directories(
     $<$<BOOL:${SIRIUS_LEGACY_INCLUDE_DIR}>:$<BUILD_INTERFACE:${SIRIUS_LEGACY_INCLUDE_DIR}>>
 )
 
+if(ENABLE_ROCM)
+  target_include_directories(sirius_unittest BEFORE PRIVATE
+    ${SIRIUS_ROCM_COMPAT_DIR} ${SIRIUS_ROCM_CUCASCADE_DIR})
+endif()
+
 target_link_libraries(sirius_unittest sirius_extension duckdb_static ZLIB::ZLIB)
 link_extension_libraries(sirius_unittest "")
+
+# ROCm: the nvtx3 shim (on the include path above) #includes <roctracer/roctx.h>,
+# which requires ROCTX_INCLUDE_DIR. The extension targets get this inside the
+# foreach above; sirius_unittest pulls in nvtx3 transitively via sirius_pipeline.hpp
+# / helper.hpp, so it needs the same include dir + link.
+if(ENABLE_ROCM)
+  target_include_directories(sirius_unittest PRIVATE ${ROCTX_INCLUDE_DIR})
+  target_link_libraries(sirius_unittest PRIVATE ${ROCTX_LIBRARY})
+endif()
 
 # S3 container harness: the testcontainers-native bridge plus libcurl for
 # host-side fixture upload (SigV4 signing comes from sirius_extension). Gated so
@@ -811,6 +1127,11 @@ target_include_directories(
   parquet_benchmark
   PRIVATE $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include>)
 
+if(ENABLE_ROCM)
+  target_include_directories(parquet_benchmark BEFORE PRIVATE
+    ${SIRIUS_ROCM_COMPAT_DIR} ${SIRIUS_ROCM_CUCASCADE_DIR})
+endif()
+
 target_link_libraries(
   parquet_benchmark
   sirius_extension
@@ -818,11 +1139,23 @@ target_link_libraries(
   cudf::cudf
   rmm::rmm
   spdlog::spdlog
-  cuCascade::cucascade
-  cuCascade::cucascade_cudf
   PkgConfig::LIBURING
   PkgConfig::NUMA)
+if(SIRIUS_ENABLE_CUCASCADE)
+  target_link_libraries(parquet_benchmark
+                        cuCascade::cucascade cuCascade::cucascade_cudf)
+endif()
+# When SIRIUS_ENABLE_CUCASCADE is OFF, parquet_benchmark.cpp's <cucascade/...>
+# includes resolve to the cuda2rocm cucascade-rocm stub (on ROCm, via
+# FetchContent) or are absent (on CUDA without cuCascade — an unusual config).
+# The stub types make it compile; runtime calls throw.
 link_extension_libraries(parquet_benchmark "")
+
+# ROCm: same roctx include/link as sirius_unittest (nvtx3 shim → roctx.h).
+if(ENABLE_ROCM)
+  target_include_directories(parquet_benchmark PRIVATE ${ROCTX_INCLUDE_DIR})
+  target_link_libraries(parquet_benchmark PRIVATE ${ROCTX_LIBRARY})
+endif()
 
 target_link_options(parquet_benchmark PRIVATE
                     "LINKER:--allow-multiple-definition")

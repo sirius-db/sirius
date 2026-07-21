@@ -36,6 +36,7 @@ filtered_table gpu_ingestible::materialize_table(const op::scan::scan_operator_i
     return materialize_metadata_to_table(split.get_scan_info(), *mem_space, stream);
   } else {
     auto batch  = split.get_cached_batch();
+    if (!batch) { throw std::runtime_error("gpu_ingestible: null cached batch"); }
     auto rbatch = batch->to_read_only();
     auto view   = get_cudf_table_view(rbatch);
     if (split.mvcc_keep_mask.has_mask()) {

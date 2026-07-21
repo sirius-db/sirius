@@ -108,8 +108,12 @@ std::unique_ptr<operator_data> sirius_physical_projection::execute(const operato
   output_batches.reserve(input_batches.size());
 
   for (auto& input_ro : input_batches) {
+    // Null check BEFORE get_cudf_table_view (which throws on null data)
+    if (!input_ro.get_data()) { continue; }
     auto input_view = sirius::get_cudf_table_view(input_ro);
-    auto& mem = *input_ro.get_memory_space();  // owned by the memory manager (outlives input_ro)
+    auto* space = input_ro.get_memory_space();
+    if (!space) { continue; }
+    auto& mem = *space;  // owned by the memory manager (outlives input_ro)
 
     // ---- Path 1: every output column is an evaluated expression ----
     if (all_evaluated) {
@@ -130,6 +134,7 @@ std::unique_ptr<operator_data> sirius_physical_projection::execute(const operato
         referenced_indices.push_back(p.index);
       }
       cudf::table_view out_view(cols);
+      if (!input_ro.get_data()) { continue; }
       std::size_t const referenced_bytes = sirius::estimate_referenced_column_bytes(
         input_view, referenced_indices, input_ro.get_data()->get_size_in_bytes());
       // Owner = the input read-only lock: keeps the source columns alive AND pinned read-only for
@@ -161,6 +166,7 @@ std::unique_ptr<operator_data> sirius_physical_projection::execute(const operato
 
     // Charge the estimated bytes of the referenced passthrough input columns plus the real size of
     // the freshly-evaluated columns we just allocated.
+    if (!input_ro.get_data()) { continue; }
     std::size_t const referenced_bytes =
       sirius::estimate_referenced_column_bytes(
         input_view, passthrough_indices, input_ro.get_data()->get_size_in_bytes()) +

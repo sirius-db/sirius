@@ -117,6 +117,9 @@ static void segfault_handler(int sig)
   if (handling) { _exit(1); }
   handling = 1;
 
+  // Arm watchdog — subsequent calls are not async-signal-safe and may deadlock
+  signal(SIGALRM, SIG_DFL);  // ensure default (terminate) disposition
+  alarm(3);                  // hard deadline for the entire handler
   std::array<void*, kBacktraceMaxFrames> frames{};
   int n = backtrace(frames.data(), kBacktraceMaxFrames);
   if (n <= 0) {
@@ -147,7 +150,7 @@ static void segfault_handler(int sig)
     char* p = buf.data() + buf.size() - 1;
     *p      = '\n';
     unsigned long u =
-      (tid < 0) ? static_cast<unsigned long>(-tid) : static_cast<unsigned long>(tid);
+      (tid < 0) ? (0u - static_cast<unsigned long>(tid)) : static_cast<unsigned long>(tid);
     do {
       *--p = static_cast<char>('0' + (u % 10));
       u /= 10;

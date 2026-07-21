@@ -51,6 +51,14 @@
     {
       "configurePreset": "ci-release",
       "name": "ci-release"
+    },
+    {
+      "configurePreset": "rocm-release",
+      "name": "rocm-release"
+    },
+    {
+      "configurePreset": "rocm-dev",
+      "name": "rocm-dev"
     }
   ],
   "cmakeMinimumRequired": {
@@ -248,6 +256,37 @@
       "displayName": "CI Release (Docker vcpkg + ccache)",
       "inherits": "vcpkg-base",
       "name": "ci-release"
+    },
+    {
+      "binaryDir": "${sourceDir}/../build/rocm-release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_HIP_ARCHITECTURES": "gfx942",
+        "ENABLE_ROCM": "ON",
+        "SIRIUS_BUILD_S3_TESTS": "OFF",
+        "SIRIUS_BUILD_TELEMETRY": "OFF",
+        "SIRIUS_ENABLE_CUCASCADE": "OFF",
+        "SIRIUS_ENABLE_CUCO": "OFF"
+      },
+      "displayName": "ROCm Release (HIP, gfx942)",
+      "inherits": "base",
+      "name": "rocm-release"
+    },
+    {
+      "binaryDir": "${sourceDir}/../build/rocm-dev",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "CMAKE_HIP_ARCHITECTURES": "gfx942",
+        "ENABLE_ROCM": "ON",
+        "SIRIUS_BUILD_S3_TESTS": "OFF",
+        "SIRIUS_BUILD_TELEMETRY": "OFF",
+        "SIRIUS_ENABLE_CUCASCADE": "OFF",
+        "SIRIUS_ENABLE_CUCO": "OFF",
+        "SIRIUS_UNITY_BUILD": "ON"
+      },
+      "displayName": "ROCm Dev (RelWithDebInfo, ccache + unity, gfx942)",
+      "inherits": "base",
+      "name": "rocm-dev"
     }
   ],
   "version": 6

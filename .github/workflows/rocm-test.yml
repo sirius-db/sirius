@@ -1,0 +1,174 @@
+# ROCm CI — compile-test the compatibility shims targeting gfx942.
+#
+# Runs on ubuntu-latest, which has NO real AMD GPU -- hipcc cross-compiles
+# for gfx942 without needing the actual hardware, so compilation is a real
+# check, but anything that RUNS the compiled binary (device allocation,
+# kernel launch) will always fail here regardless of correctness. This
+# workflow does NOT build the full Sirius binary (that needs hipDF+hipMM,
+# which takes hours to build from source) and does NOT execute anything
+# GPU-dependent. Instead it:
+#   1. Fetches the cuda2rocm shims
+#   2. Compiles a test file that exercises every shim component
+#   3. Compiles+links the cuco-rocm tests (bloom_filter, static_set) --
+#      compile-only; real runtime correctness for these was verified
+#      manually on an actual MI300X (see the worklog), not re-run here
+#
+# When a self-hosted ROCm runner is available, this workflow will also
+# attempt a full Sirius build with hipDF+hipMM.
+name: ROCm Compile Test
+
+on:
+  push:
+    branches:
+      - feat/rocm-port
+  pull_request:
+    paths:
+      - 'cmake/**'
+      - 'src/**'
+      - 'CMakeLists.txt'
+      - 'scripts/build_rocm_deps.sh'
+      - 'scripts/hipdf_26.06_api_patch.sh'
+      - '.github/workflows/rocm-test.yml'
+  workflow_dispatch:  # manual trigger
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  shim-compile-test:
+    name: Shim compile test (gfx942)
+    runs-on: ubuntu-latest
+    # When a self-hosted ROCm runner is available, use it instead:
+    # runs-on: [self-hosted, rocm, gfx942]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check if this is a ROCm-related change
+        id: check
+        run: |
+          if grep -q "ENABLE_ROCM" CMakeLists.txt; then
+            echo "has_rocm=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_rocm=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Set up Python
+        if: steps.check.outputs.has_rocm == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install ROCm (apt)
+        if: steps.check.outputs.has_rocm == 'true'
+        run: |
+          # Install ROCm packages for the CI runner.
+          # On a self-hosted runner with ROCm pre-installed, this step is a no-op.
+          if ! command -v hipcc &>/dev/null; then
+            echo "WARNING: hipcc not found. Installing ROCm packages..."
+            wget -qO - https://repo.radeon.com/rocm/rocm.gpg.key | sudo apt-key add -
+            echo "deb [arch=amd64] https://repo.radeon.com/rocm/apt/6.2 noble main" | sudo tee /etc/apt/sources.list.d/rocm.list
+            # Ubuntu's own universe/multiverse repos ship conflicting hipcc/rocminfo/
+            # rocm-cmake packages at versions apt's default comparison ranks HIGHER
+            # (e.g. 5.7.1-3) than the ROCm project's own repo version (e.g.
+            # 1.1.1.60200-66~24.04, which sorts lower despite being the correct package) --
+            # so a plain install silently prefers the wrong source. Pin the radeon repo to
+            # a high priority so apt actually selects its packages.
+            printf 'Package: *\nPin: origin repo.radeon.com\nPin-Priority: 1001\n' | sudo tee /etc/apt/preferences.d/rocm-pin
+            sudo apt-get update
+            sudo apt-get install -y rocm-dev rocm-utils hipblas-dev hipcub-dev rocthrust-dev
+          else
+            echo "hipcc already available: $(hipcc --version | head -1)"
+          fi
+
+      - name: Fetch cuda2rocm shims
+        if: steps.check.outputs.has_rocm == 'true'
+        run: |
+          # Extract the FetchContent URL + hash from CMakeLists.txt
+          URL=$(grep -oP 'URL https://github.com/[^ ]+' CMakeLists.txt | head -1 | cut -d' ' -f2)
+          echo "Fetching: $URL"
+          mkdir -p cmake/rocm_compat
+          curl -sL "$URL" | tar xz --strip-components=2 -C cmake/rocm_compat
+          ls cmake/rocm_compat/
+
+      - name: Compile shim test
+        if: steps.check.outputs.has_rocm == 'true'
+        run: |
+          cat > /tmp/test_shim.cu << 'EOF'
+          #include <cuda_runtime.h>
+          #include <cub/cub.cuh>
+          #include <cuda/std/limits>
+          #include <cuda/functional>
+          #include <cuda/cmath>
+          #include <cooperative_groups.h>
+          __global__ void k(int* o) {
+            int v = cub::ShuffleIndex<64>(1, 0, 0xFFFFFFFFFFFFFFFFull);
+            *o = v + cuda::std::numeric_limits<int>::max() + cuda::ceil_div(100, 64) + cuda::minimum<int>{}(3, 5);
+          }
+          int main() { return 0; }
+          EOF
+          # cuda-compat-shims puts its headers under include/ (verified against the real
+          # cuda2rocm repo layout), and the fetch step above extracts that subproject's
+          # contents directly into cmake/rocm_compat/ -- so the actual header root is
+          # cmake/rocm_compat/include, not cmake/rocm_compat itself.
+          hipcc -c -x hip /tmp/test_shim.cu -o /dev/null \
+            -I cmake/rocm_compat/include --offload-arch=gfx942 2>&1
+          echo "Shim compile: EXIT=$?"
+
+      - name: Compile cuco-rocm tests
+        if: steps.check.outputs.has_rocm == 'true'
+        run: |
+          # Clone cuda2rocm for the test files
+          git clone --depth 1 https://github.com/hamstergamerszhang-ops/cuda2rocm.git /tmp/cuda2rocm
+
+          # Compile only -- ubuntu-latest has no real AMD GPU, so running these binaries
+          # always crashes with "hipMalloc failed" regardless of whether the code/shims
+          # are correct. Runtime correctness for these two tests was already verified
+          # manually on a real MI300X (bloom_filter 7/7, static_set 6/6, see the worklog) --
+          # this step confirms they still compile+link cleanly against the shims on every
+          # push, which is the part that can regress without anyone noticing. Actually
+          # running them needs the self-hosted-runner path in the full-build job below.
+          hipcc -o /tmp/test_bf /tmp/cuda2rocm/cuco-rocm/tests/test_bloom_filter.cu \
+            -I /tmp/cuda2rocm/cuco-rocm/include -I cmake/rocm_compat/include --offload-arch=gfx942 2>&1
+          echo "Bloom filter test compiled OK"
+
+          hipcc -o /tmp/test_ss /tmp/cuda2rocm/cuco-rocm/tests/test_static_set.cu \
+            -I /tmp/cuda2rocm/cuco-rocm/include -I cmake/rocm_compat/include --offload-arch=gfx942 2>&1
+          echo "Static set test compiled OK"
+
+  full-build:
+    name: Full Sirius build (needs self-hosted ROCm runner)
+    # This job only runs on a self-hosted ROCm runner with hipDF+hipMM pre-installed.
+    # It is skipped on GitHub-hosted runners (no AMD GPU).
+    if: false  # Enable when a self-hosted ROCm runner is registered
+    runs-on: [self-hosted, rocm, gfx942]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Build hipDF + hipMM (if not cached)
+        run: |
+          if ! find /opt/rocm -name "cudf-config.cmake" 2>/dev/null | grep -q .; then
+            ./scripts/build_rocm_deps.sh --prefix /opt/rocm
+          fi
+
+      - name: Configure Sirius
+        run: |
+          cmake -B build/rocm -S . \
+            -DENABLE_ROCM=ON \
+            -DSIRIUS_ENABLE_CUCO=OFF \
+            -DSIRIUS_ENABLE_CUCASCADE=OFF \
+            -DSIRIUS_BUILD_S3_TESTS=OFF \
+            -DSIRIUS_BUILD_TELEMETRY=OFF \
+            -DCMAKE_HIP_ARCHITECTURES=gfx942
+
+      - name: Build Sirius
+        run: cmake --build build/rocm -j$(nproc)
+
+      - name: Smoke test — run a query
+        run: |
+          # Load the extension and run a trivial query
+          ./build/rocm/extension/sirius/sirius.duckdb_extension
+          # If DuckDB CLI is available:
+          # echo "LOAD 'build/rocm/extension/sirius/sirius.duckdb_extension'; SELECT 1;" | duckdb

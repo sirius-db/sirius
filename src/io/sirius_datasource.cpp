@@ -196,7 +196,11 @@ void sirius_datasource::fadvise(std::span<const cudf::io::text::byte_range_info>
   // The contract is "one scan, one datasource": a second
   // speculative/immediate fadvise on a datasource that already carries a
   // handle is a caller bug.  Warn loudly; cancel the stale handle so the
-  // worker drops the old request and we don't leak both into the cache.
+  // worker drops the old request, then fall through to insert the newly-
+  // requested ranges.  The old code returned here without cancelling and
+  // without inserting, so the warning said "cancelling the stale request"
+  // while neither cancelling nor prefetching the new ranges — the scan then
+  // ran without the requested ranges prefetched.
   if (_prefetch_handle) {
     if (_prefetch_handle.is_active()) {
       SIRIUS_LOG_WARN(
@@ -204,7 +208,6 @@ void sirius_datasource::fadvise(std::span<const cudf::io::text::byte_range_info>
         "this datasource (path={}); cancelling the stale request.  Each scan "
         "should own a unique datasource.",
         _io_object->object_path());
-      return;
     }
     _prefetch_handle.cancel();
   }

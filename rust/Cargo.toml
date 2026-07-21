@@ -5,7 +5,6 @@ members = [
     "crates/telemetry/model",
     "crates/telemetry/analyzer",
     "crates/telemetry/server",
-    "crates/telemetry/model",
     "crates/sirius-sys",
     "crates/sirius"
 ]

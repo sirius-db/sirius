@@ -908,7 +908,16 @@ void uring_reactor::worker_loop(const std::stop_token& stop_token)
                                          int si         = token.slot_index();
                                          auto& s        = slots[si];
                                          auto ev_status = s.event->query();
-                                         return !(ev_status == query_status::in_progress);
+                                         if (ev_status != query_status::in_progress) {
+                                           // H2D copy completed — credit the chunk now that the
+                                           // device memory is fully written. Deferred from
+                                           // reap_cqes so the chunk is not credited before the
+                                           // async copy finishes (which would let the caller
+                                           // read uninitialized device memory).
+                                           s.on_complete(s.bytes_read);
+                                           return true;
+                                         }
+                                         return false;
                                        }),
                         copying_slots.end());
   };
@@ -1012,6 +1021,11 @@ void uring_reactor::worker_loop(const std::stop_token& stop_token)
         continue;
       } else if (hint == io_slot::h2d_sync_hint::h2d_event_based) {
         copying_slots.push_back(s.release_slot());
+        // The H2D copy is in-flight and is synchronized via the slot's event.
+        // on_complete is deferred until poll_copy_completions observes the
+        // event — crediting the chunk here would let the caller read device
+        // memory before the copy finishes.
+        continue;
       }
       s.on_complete(s.bytes_read);
     }
@@ -1038,6 +1052,20 @@ void uring_reactor::worker_loop(const std::stop_token& stop_token)
   };
 
   auto clean_up_and_shutdown = [&]() {
+    // Drain requests whose (re-)submission was deferred into incomplete_requests.
+    // They are not counted in `inflight` (inflight only tracks SQEs actually
+    // submitted to the ring), so they would otherwise be orphaned by the wait
+    // below and their managers would block forever waiting for a completion.
+    // Report each as canceled and release the slot's hold on the request.
+    for (int si : incomplete_requests) {
+      auto& slot = slots[si];
+      if (slot.req) {
+        slot.req->manager->report_error(std::make_error_code(std::errc::operation_canceled));
+        slot.reset();
+      }
+    }
+    incomplete_requests.clear();
+
     // wait for all in-flight requests to complete so we don't report spurious errors on shutdown
     while (inflight > 0) {
       auto s = ring.wait_for(SHUTDOWN_POLL_MS);
@@ -1054,10 +1082,30 @@ void uring_reactor::worker_loop(const std::stop_token& stop_token)
     std::for_each(copying_slots.begin(), copying_slots.end(), [&](auto& s) {
       int si     = s.slot_index();
       auto& slot = slots[si];
+      bool copy_ok = false;
       if (slot.event) {
-        SIRIUS_TRY_AND_LOG_EXCEPTION(slot.event->synchronize(),
-                                     "uring_reactor: failed to synchronize copy event for slot {}",
-                                     si);
+        try {
+          slot.event->synchronize();
+          copy_ok = true;
+        } catch (std::exception const& e) {
+          SIRIUS_LOG_ERROR("uring_reactor: failed to synchronize copy event for slot {}: {}",
+                           si, e.what());
+        }
+      }
+      if (copy_ok) {
+        // The synchronize above waited for the H2D copy to finish, so the
+        // device memory is now valid — credit the chunk whose completion was
+        // deferred from reap_cqes (poll_copy_completions is not called during
+        // shutdown).
+        slot.on_complete(slot.bytes_read);
+      } else {
+        // The H2D copy failed (synchronize threw) or no event was recorded.
+        // The old code fell through to on_complete regardless, crediting the
+        // chunk as if the copy succeeded — the caller then consumed invalid
+        // device memory (silent data corruption). Report the error instead so
+        // the chunk's manager handles the failure, matching the rest_reactor
+        // shutdown drain path which calls report_error on the same failure.
+        slot.on_error(std::make_error_code(std::errc::io_error));
       }
     });
 

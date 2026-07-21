@@ -221,9 +221,10 @@ inline std::vector<metadata_node> unpack_metadata_to_nodes(
   auto const* raw_ptr     = metadata->data();
 
   // Ensure proper alignment
+  std::vector<detail::serialized_column> aligned;
   detail::serialized_column const* columns = nullptr;
   if (reinterpret_cast<uintptr_t>(raw_ptr) % alignof(detail::serialized_column) != 0) {
-    std::vector<detail::serialized_column> aligned(column_count);
+    aligned.resize(column_count);
     std::memcpy(aligned.data(), raw_ptr, metadata->size());
     columns = aligned.data();
   } else {

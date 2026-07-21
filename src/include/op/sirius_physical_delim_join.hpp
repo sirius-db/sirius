@@ -83,7 +83,7 @@ class sirius_physical_right_delim_join : public sirius_physical_delim_join {
     duckdb::vector<duckdb::const_reference<sirius_physical_operator>> delim_scans,
     std::size_t estimated_cardinality,
     duckdb::optional_idx delim_idx);
-  sirius_physical_partition* partition_join;
+  sirius_physical_partition* partition_join = nullptr;
 
  public:
   void build_pipelines(pipeline::sirius_pipeline& current,
@@ -105,7 +105,7 @@ class sirius_physical_left_delim_join : public sirius_physical_delim_join {
     duckdb::vector<duckdb::const_reference<sirius_physical_operator>> delim_scans,
     std::size_t estimated_cardinality,
     duckdb::optional_idx delim_idx);
-  sirius_physical_column_data_scan* column_data_scan;
+  sirius_physical_column_data_scan* column_data_scan = nullptr;
 
  public:
   void build_pipelines(pipeline::sirius_pipeline& current,

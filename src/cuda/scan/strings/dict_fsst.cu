@@ -54,6 +54,8 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <limits>
+#include <stdexcept>
 #include <vector>
 
 namespace sirius::cuda::scan {
@@ -213,7 +215,9 @@ __global__ __launch_bounds__(STRINGS_BLOCK_DIM) void kernel_build_dict_fsst_data
         uint8_t code = cp[pos++];
         if (code < FSST_ESC) {
           decomp_len += sm_len[code];
-        } else {
+        } else if (pos < comp_len) {
+          // Trailing escape (corrupt input) is dropped — stay in sync with the
+          // length kernel in fsst.cu (kernel_compute_decompressed_lengths_fsst).
           ++pos;
           ++decomp_len;
         }
@@ -358,6 +362,12 @@ __global__ void kernel_gather_dict_fsst(dict_fsst_desc const* __restrict__ descs
   // instantiation (launched over the same array) covers the rest.
   if ((desc.mode == DICT_FSST_MODE_FSST_ONLY) != FsstOnly) return;
 
+  // Guard: stub descriptors (from malformed segments) have dict_count == 0.
+  // Skip the row-copy — the rows were already zero-filled by the caller's
+  // stub handling. Without this guard, the kernel would OOB-read an empty
+  // dict_byte_offsets buffer and produce garbage strings.
+  if (desc.dict_count == 0) return;
+
   uint8_t const* base           = desc.d_bytes;
   uint32_t const* dict_byte_off = d_byte_offsets + desc.seg_dict_offset_base;
 
@@ -380,6 +390,9 @@ __global__ void kernel_gather_dict_fsst(dict_fsst_desc const* __restrict__ descs
       int seg_i = desc.seg_row_start + i;
       int idx   = unpack_value<uint32_t>(d_idx, seg_i, desc.dict_indices_width);
       if (idx == 0) continue;  // NULL — pass-1 emitted length 0
+      // Guard: a corrupt/oversized idx would OOB-read memcpy_off. The length
+      // kernel checks the same bound (kernel_compute_lengths_dict_fsst).
+      if (idx >= desc.dict_count) continue;
       int op          = d_offsets[desc.global_row_start + i];
       int entry_start = memcpy_off[idx];
       int entry_len   = memcpy_off[idx + 1] - entry_start;
@@ -432,6 +445,10 @@ __global__ void kernel_dict_fsst_mark_nulls(dict_fsst_desc const* __restrict__ d
   int seg_idx = blockIdx.x;
   if (seg_idx >= num_segments) return;
   auto const desc = descs[seg_idx];
+  // Stub descriptors (from malformed segments) have dict_count == 0; their
+  // dict_indices_offset is 0, so reading dict indices would dereference the
+  // raw segment bytes and wrongly mark rows null. Match the gather kernel's guard.
+  if (desc.dict_count == 0) return;
   uint32_t const* d_idx =
     reinterpret_cast<uint32_t const*>(desc.d_bytes + desc.dict_indices_offset);
 
@@ -541,7 +558,10 @@ prepared_dict_fsst prepare_dict_fsst(gpu_string_codec_run const& run,
   // Phase 2: validate, compute per-segment region offsets + cumulative
   // base_off into the global byte/decoded_offsets arrays.
   std::vector<dict_fsst_pre_desc> pre(num_segs);
-  uint32_t total_dict_entries = 0;  // sum of (dict_count + 1) for valid segs
+  // Use size_t (not uint32_t) for the cross-segment accumulator: with many
+  // dictionary segments, the uint32_t sum of (dict_count + 1) wraps past
+  // UINT32_MAX, producing undersized device/host buffers and OOB writes.
+  size_t total_dict_entries = 0;
   for (uint32_t i = 0; i < num_segs; ++i) {
     auto const& seg = run.segments[i];
     auto& p         = pre[i];
@@ -567,7 +587,15 @@ prepared_dict_fsst prepare_dict_fsst(gpu_string_codec_run const& run,
     p.dict_count           = hdr.dict_count;
     p.mode                 = hdr.mode;
     p.string_lengths_width = hdr.string_lengths_width;
-    p.base_off             = total_dict_entries;
+    // The device struct (dict_fsst_pre_desc) uses uint32_t base_off, so the
+    // cross-segment cumulative offset must fit in 32 bits. If it doesn't,
+    // the static_cast would silently truncate, making the kernel write at
+    // wrong offsets in the (correctly-sized) buffer. Throw instead.
+    if (total_dict_entries > std::numeric_limits<uint32_t>::max()) {
+      throw std::runtime_error(
+        "dict_fsst: total_dict_entries exceeds UINT32_MAX (device struct base_off is 32-bit)");
+    }
+    p.base_off             = static_cast<uint32_t>(total_dict_entries);
     p.valid                = 1;
     total_dict_entries += hdr.dict_count + 1u;
   }

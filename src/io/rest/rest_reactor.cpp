@@ -75,14 +75,15 @@ size_t write_to_sink(char* ptr, size_t size, size_t nmemb, void* userdata)
   // GET spills from one buffer into the next as each fills.
   while (remaining > 0 && sink->active < sink->buffers.size()) {
     iovec& b = sink->buffers[sink->active];
-    if (b.iov_base == nullptr) { break; }
+    void* base = b.iov_base;
+    if (base == nullptr) { break; }
     if (sink->cursor >= b.iov_len) {
       ++sink->active;
       sink->cursor = 0;
       continue;
     }
     size_t const n = std::min(b.iov_len - sink->cursor, remaining);
-    std::memcpy(static_cast<uint8_t*>(b.iov_base) + sink->cursor, src, n);
+    std::memcpy(static_cast<uint8_t*>(base) + sink->cursor, src, n);
     sink->cursor += n;
     sink->written += n;
     src += n;
@@ -296,9 +297,15 @@ std::optional<size_t> content_range_start(std::string const& cr)
   if (sv.empty() || sv.front() < '0' || sv.front() > '9') { return std::nullopt; }
   size_t value = 0;
   size_t i     = 0;
-  for (; i < sv.size() && sv[i] >= '0' && sv[i] <= '9'; ++i) {
+  // Cap digit count to prevent overflow: a size_t can hold at most ~20 digits
+  // (64-bit). A malicious/malformed Content-Range with more digits would wrap
+  // value, yielding a bogus object size. Cap at 18 digits (safe for any 64-bit
+  // size_t) and treat longer as unparseable.
+  for (; i < sv.size() && sv[i] >= '0' && sv[i] <= '9' && i < 18; ++i) {
     value = value * 10 + static_cast<size_t>(sv[i] - '0');
   }
+  // If there are still digits at i==18, the value is unparseably huge.
+  if (i < sv.size() && sv[i] >= '0' && sv[i] <= '9') { return std::nullopt; }
   // A valid first-byte position is immediately followed by '-' (the range
   // separator); anything else ("*", end of string, ...) is not parseable.
   if (i >= sv.size() || sv[i] != '-') { return std::nullopt; }
@@ -316,14 +323,35 @@ std::chrono::milliseconds compute_backoff(std::size_t attempt,
     try {
       long const secs = std::stol(retry_after);
       if (secs >= 0) {
-        return std::min(std::chrono::milliseconds{secs * 1000}, std::chrono::milliseconds{30'000});
+        // Cap secs BEFORE multiplying by 1000: the old code did
+        // std::min(milliseconds{secs * 1000}, milliseconds{30'000}), but
+        // secs * 1000 is a signed long multiplication that overflows (UB)
+        // when secs > LONG_MAX/1000 — before the min cap can clamp it.
+        // Capping secs to 30 first makes the multiply safe and renders the
+        // outer min redundant (kept for clarity).
+        long const capped_secs = std::min(secs, long{30});
+        return std::min(std::chrono::milliseconds{capped_secs * 1000},
+                        std::chrono::milliseconds{30'000});
       }
     } catch (...) {
       // Non-numeric (HTTP-date) Retry-After: fall through to exponential.
     }
   }
   std::size_t const shift = std::min<std::size_t>(attempt, 16);
-  auto const base         = cfg.retry_backoff_base * (std::size_t{1} << shift);
+  // Overflow-safe backoff: cfg.retry_backoff_base * (1 << shift) can overflow
+  // the chrono rep (int64_t) when base is large and shift is 16. Cap the
+  // multiplier so the product never exceeds a sane maximum (1 hour), preventing
+  // a wrapped-to-negative delay that would cause a retry storm.
+  constexpr int64_t MAX_BACKOFF_MS = 3600LL * 1000;  // 1 hour
+  int64_t const multiplier = static_cast<int64_t>(std::size_t{1} << shift);
+  int64_t const base_ms    = cfg.retry_backoff_base.count();
+  int64_t backoff_ms;
+  if (base_ms > MAX_BACKOFF_MS / multiplier) {
+    backoff_ms = MAX_BACKOFF_MS;  // cap
+  } else {
+    backoff_ms = base_ms * multiplier;
+  }
+  auto const base = std::chrono::milliseconds{backoff_ms};
   std::chrono::milliseconds jitter{0};
   if (cfg.retry_jitter.count() > 0) {
     thread_local std::mt19937 rng{std::random_device{}()};
@@ -415,8 +443,10 @@ std::optional<size_t> content_range_total(std::string const& cr)
   std::string_view const total = sv.substr(slash + 1);
   if (total.empty() || total.front() < '0' || total.front() > '9') { return std::nullopt; }
   size_t value = 0;
+  size_t digit_count = 0;
   for (char const c : total) {
     if (c < '0' || c > '9') { break; }
+    if (++digit_count > 18) { return std::nullopt; }  // overflow guard
     value = value * 10 + static_cast<size_t>(c - '0');
   }
   return value;
@@ -543,7 +573,13 @@ rest_reactor::request_type_ptr rest_reactor::prep_host_rx_request(const reactor_
   // 32-bit read-length bound, so a single very large object never produces an
   // oversized read on either backend.
   constexpr size_t max_piece_bytes = size_t{1} << 31;  // 2 GiB
-  n_chunks = std::max<size_t>(n_chunks, (segment.size + max_piece_bytes - 1) / max_piece_bytes);
+  // Overflow-safe ceil-div: (segment.size + max_piece_bytes - 1) overflows
+  // size_t when segment.size > SIZE_MAX - (2 GiB - 1), yielding n_chunks == 0
+  // and a single oversized ranged GET. Use the identity (a + b - 1) / b ==
+  // 1 + (a - 1) / b (safe when a > 0).
+  if (segment.size > 0) {
+    n_chunks = std::max<size_t>(n_chunks, 1 + (segment.size - 1) / max_piece_bytes);
+  }
 
   auto manager       = std::make_shared<request_manager>(segment.size, n_chunks);
   auto const obj     = file.object_ref();
@@ -1187,6 +1223,7 @@ int rest_socket_cb(CURL* /*easy*/, curl_socket_t s, int what, void* userp, void*
 int rest_timer_cb(CURLM* /*multi*/, long timeout_ms, void* userp)
 {
   auto* ws = static_cast<worker_state*>(userp);
+  if (!ws) { return 0; }
   itimerspec its{};  // all-zero => disarm
   if (timeout_ms == 0) {
     its.it_value.tv_nsec = 1;  // fire essentially immediately

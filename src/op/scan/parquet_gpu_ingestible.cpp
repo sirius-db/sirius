@@ -57,6 +57,7 @@
 // standard library
 #include <algorithm>
 #include <cstdint>
+#include <future>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -451,8 +452,35 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
       }
     }
   }
+  // FLBA-decimal pushdown probe: cudf's row-group stats filter cannot compare a
+  // fixed_point_scalar AST literal against FLBA / BYTE_ARRAY decimal stats, so
+  // reader-side pushdown is disabled when such a decimal is among the columns
+  // this scan reads (the filter still applies post-decode).
+  //
+  // Build the scanned-column-name set BEFORE the footer fetch so it can overlap
+  // with the async footer I/O below (the set depends only on _plan, not on the
+  // footer). On the cache-hit path (footer already present), this is just a
+  // cheap set construction with no I/O to overlap.
+  bool const restrict_to_scanned = _plan->is_projected();
+  std::unordered_set<std::string> scanned_column_names;
+  if (restrict_to_scanned) {
+    auto const names = _plan->data_column_names();
+    scanned_column_names.insert(names.begin(), names.end());
+  }
+
   if (!file_metadata) {
-    auto footer           = cudf::io::parquet::fetch_footer_to_host(*sirius_ds);
+    if (!sirius_ds) {
+      throw std::runtime_error("parquet_gpu_ingestible: null datasource for footer read");
+    }
+    // Footer read: fetches the Parquet footer (~1KB) from the datasource.
+    // Launch the I/O asynchronously — the scanned_column_names construction
+    // above overlaps with the fetch (it depends only on _plan, not the
+    // footer). The future is awaited here, before `metadata` is first
+    // dereferenced. The prior sync version blocked ~0.5-5ms per file
+    // (network/disk RTT) with zero overlapping work.
+    auto footer_future = std::async(std::launch::async,
+      [&sirius_ds]() { return cudf::io::parquet::fetch_footer_to_host(*sirius_ds); });
+    auto footer           = footer_future.get();
     auto const footer_len = footer->size();
     hybrid_scan_reader footer_reader(cudf::host_span<uint8_t const>(footer->data(), footer->size()),
                                      opts);
@@ -465,17 +493,6 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
       sirius_ds->store_metadata(std::make_shared<parquet_metadata>(file_metadata, footer_len));
   }
   auto const& metadata = *file_metadata;
-
-  // FLBA-decimal pushdown probe: cudf's row-group stats filter cannot compare a
-  // fixed_point_scalar AST literal against FLBA / BYTE_ARRAY decimal stats, so
-  // reader-side pushdown is disabled when such a decimal is among the columns
-  // this scan reads (the filter still applies post-decode).
-  bool const restrict_to_scanned = _plan->is_projected();
-  std::unordered_set<std::string> scanned_column_names;
-  if (restrict_to_scanned) {
-    auto const names = _plan->data_column_names();
-    scanned_column_names.insert(names.begin(), names.end());
-  }
   bool disable_filter_pushdown = false;
   for (auto const& elem : metadata.schema) {
     if (restrict_to_scanned && !scanned_column_names.contains(elem.name)) { continue; }

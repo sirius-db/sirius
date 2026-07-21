@@ -144,7 +144,7 @@ struct ExecutorThreadHandleWrapper {
 
   ~ExecutorThreadHandleWrapper()
   {
-    handle->finalizing();
+    try { handle->finalizing(); } catch (...) { /* swallow — cannot throw from noexcept destructor */ }
     handle->exit();
   }
 
@@ -171,7 +171,7 @@ struct TaskManagerLoopThreadHandleWrapper {
 
   ~TaskManagerLoopThreadHandleWrapper()
   {
-    handle->finalizing();
+    try { handle->finalizing(); } catch (...) { /* swallow — cannot throw from noexcept destructor */ }
     handle->exit();
   }
 
@@ -200,13 +200,14 @@ struct TaskQueueHandleWrapper {
 
   ~TaskQueueHandleWrapper()
   {
-    handle->finalizing();
+    try { handle->finalizing(); } catch (...) { /* swallow — cannot throw from noexcept destructor */ }
     handle->exit();
   }
 
   rust::Box<quent::task_queue::TaskQueueHandle> handle;
 };
 
+// CRITICAL: The thread-local handle borrows the quent::Context from telemetry_context. Call reset_thread_telemetry() on all threads before destroying telemetry_context.
 // header-only shared thread-local storage handle: one per thread, shared across translation units
 inline thread_local std::optional<ExecutorThreadHandleWrapper> executor_thread_telemetry_handle{
   std::nullopt};

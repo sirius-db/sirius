@@ -63,10 +63,17 @@ void itask_executor::start()
 {
   bool expected = false;
   if (!_running.compare_exchange_strong(expected, true)) { return; }
-  _bounded_pool = std::make_unique<exec::bounded_thread_pool>(_config.num_threads,
-                                                              _config.thread_name_prefix,
-                                                              _config.cpu_affinity_list,
-                                                              get_per_thread_init());
+  try {
+    _bounded_pool = std::make_unique<exec::bounded_thread_pool>(_config.num_threads,
+                                                                _config.thread_name_prefix,
+                                                                _config.cpu_affinity_list,
+                                                                get_per_thread_init());
+  } catch (...) {
+    // If pool construction throws, roll back _running so stop()/drain don't
+    // null-deref _bounded_pool.
+    _running.store(false);
+    throw;
+  }
   _task_queue.reactivate();
   _manager_thread = std::thread([this] { manager_loop(); });
   on_start();
@@ -132,6 +139,7 @@ void itask_executor::wait_and_validate_empty()
 {
   // Same quiescing as drain_and_wait(): interrupt the pool + queue so the manager
   // exits, join it, and wait for all in-flight thread-pool tasks to finish.
+  if (!_bounded_pool) { return; }  // guard: may be called before start() or after stop()
   _bounded_pool->interrupt();
   _task_queue.interrupt();
   if (_manager_thread.joinable()) { _manager_thread.join(); }

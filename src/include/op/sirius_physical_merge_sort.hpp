@@ -41,9 +41,9 @@ class sirius_physical_merge_sort : public sirius_physical_operator {
   //! Input data
   duckdb::vector<duckdb::BoundOrderByNode> orders;
   duckdb::vector<std::size_t> projections;
-  bool is_index_sort;
+  bool is_index_sort = false;
 
-  sirius_physical_operator* child_op;
+  sirius_physical_operator* child_op = nullptr;
   sirius_physical_operator* get_child_op() const { return child_op; }
 
  public:

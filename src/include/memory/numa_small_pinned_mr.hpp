@@ -25,6 +25,8 @@
 #include <cstddef>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
+#include <string>
 #include <unordered_map>
 
 namespace sirius::memory {
@@ -95,18 +97,20 @@ class numa_small_pinned_mr {
                   std::size_t bytes,
                   std::size_t alignment = alignof(std::max_align_t)) noexcept
   {
-    int node = -1;
-    {
-      std::lock_guard<std::mutex> lock(map_mutex_);
-      if (auto it = ptr_to_node_.find(ptr); it != ptr_to_node_.end()) {
-        node = it->second;
-        ptr_to_node_.erase(it);
+    try {
+      int node = -1;
+      {
+        std::lock_guard<std::mutex> lock(map_mutex_);
+        if (auto it = ptr_to_node_.find(ptr); it != ptr_to_node_.end()) {
+          node = it->second;
+          ptr_to_node_.erase(it);
+        }
       }
-    }
-    if (node < 0) { node = node_for_current_device(); }
-    auto it = pools_.find(node);
-    if (it == pools_.end()) { it = pools_.find(fallback_node_); }
-    if (it != pools_.end()) { it->second->deallocate(stream, ptr, bytes, alignment); }
+      if (node < 0) { node = node_for_current_device(); }
+      auto it = pools_.find(node);
+      if (it == pools_.end()) { it = pools_.find(fallback_node_); }
+      if (it != pools_.end()) { it->second->deallocate(stream, ptr, bytes, alignment); }
+    } catch (...) {}
   }
 
   // PTDS, not the legacy default stream: the pool ignores the stream arg
@@ -142,6 +146,10 @@ class numa_small_pinned_mr {
     int node = node_for_current_device();
     auto it  = pools_.find(node);
     if (it == pools_.end()) { it = pools_.find(fallback_node_); }
+    if (it == pools_.end()) {
+      throw std::runtime_error("numa_small_pinned_mr: no pool for fallback node " +
+                               std::to_string(fallback_node_));
+    }
     return *it->second;
   }
 

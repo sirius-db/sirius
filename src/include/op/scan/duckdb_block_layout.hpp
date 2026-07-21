@@ -57,10 +57,21 @@ inline std::size_t duckdb_block_payload_offset(duckdb::SingleFileBlockManager co
     throw std::invalid_argument("duckdb_block_payload_offset: block_id must be >= 0 (got " +
                                 std::to_string(block_id) + ")");
   }
-  const std::size_t alloc =
-    static_cast<std::size_t>(bm.GetBlockSize()) + static_cast<std::size_t>(bm.GetBlockHeaderSize());
-  return DUCKDB_BLOCK_START + static_cast<std::size_t>(block_id) * alloc +
-         static_cast<std::size_t>(bm.GetBlockHeaderSize());
+  const std::size_t header_size = static_cast<std::size_t>(bm.GetBlockHeaderSize());
+  const std::size_t alloc       = static_cast<std::size_t>(bm.GetBlockSize()) + header_size;
+  if (alloc != 0 && static_cast<uint64_t>(block_id) > SIZE_MAX / alloc) {
+    throw std::overflow_error("block payload offset overflow");
+  }
+  const std::size_t product = static_cast<std::size_t>(block_id) * alloc;
+  // block_id * alloc is already bounded above by SIZE_MAX; guard the two
+  // trailing additions (header_size, then DUCKDB_BLOCK_START) against wraparound.
+  if (product > SIZE_MAX - header_size) {
+    throw std::overflow_error("block payload offset overflow");
+  }
+  if (DUCKDB_BLOCK_START > SIZE_MAX - product - header_size) {
+    throw std::overflow_error("block payload offset overflow");
+  }
+  return DUCKDB_BLOCK_START + product + header_size;
 }
 
 }  // namespace sirius::op::scan

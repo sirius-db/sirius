@@ -124,6 +124,48 @@ pixi = "0.71.*"
 nightly-shell = "scripts/generate_nightly_env.sh && env -u PIXI_ENVIRONMENT_NAME pixi shell --manifest-path envs/nightly/pixi.toml"
 nightly-run = "scripts/generate_nightly_env.sh && env -u PIXI_ENVIRONMENT_NAME pixi run --manifest-path envs/nightly/pixi.toml"
 
+# =============================================================================
+# ROCm / AMD environment
+# =============================================================================
+# Uses ROCm-DS hipDF + hipMM (built via scripts/build_rocm_deps.sh) instead of
+# NVIDIA cuDF + RMM. This environment provides the ROCm toolchain and the
+# non-GPU deps (spdlog, yaml-cpp, etc.) that Sirius needs. hipDF/hipMM are
+# NOT conda-installable — they must be built from source.
+[feature.rocm]
+platforms = ["linux-64", "linux-aarch64"]
+
+[feature.rocm.dependencies]
+cmake = ">=3.30"
+spdlog = "*"
+yaml-cpp = "*"
+abseil = "*"
+numactl = "*"
+liburing = "*"
+openssl = "*"
+curl = "*"
+git = "*"
+pkg-config = "*"
+ccache = "*"
+ninja = "*"
+make = "*"
+cxx-compiler = "*"
+sqlite = "*"
+mold = "*"
+catch-headers = "*"
+flatbuffers = "=24.3.25"
+
+[feature.rocm.activation.env]
+# hipDF/hipMM install to /opt/rocm by default (see scripts/build_rocm_deps.sh)
+ROCM_PATH = "/opt/rocm"
+CMAKE_PREFIX_PATH = "/opt/rocm/lib/cmake:/opt/rocm"
+# AMD Instinct architectures: MI250 (gfx90a), MI300 (gfx942), MI350 (gfx950)
+AMDGPU_TARGETS = "gfx942"
+
+[feature.rocm.tasks]
+build-deps = "$PIXI_PROJECT_ROOT/scripts/build_rocm_deps.sh --prefix /opt/rocm"
+make = "cmake -B build/rocm -S . -DENABLE_ROCM=ON -DSIRIUS_ENABLE_CUCO=OFF -DSIRIUS_ENABLE_CUCASCADE=OFF -DSIRIUS_BUILD_S3_TESTS=OFF -DSIRIUS_BUILD_TELEMETRY=OFF -DCMAKE_HIP_ARCHITECTURES=gfx942 && cmake --build build/rocm -j"
+clean = "rm -rf build/rocm"
+
 [environments]
 default = ["dev-libs", "cuda13"]
 cuda12 = ["dev-libs", "cuda12"]
@@ -131,3 +173,4 @@ duckdb-python = ["duckdb-python"]
 vcpkg = ["vcpkg", "cuda13"]
 vcpkg-cuda12 = ["vcpkg", "cuda12"]
 nightly-runner = { features = ["nightly-runner"], no-default-feature = true }
+rocm = { features = ["rocm"], no-default-feature = true }
