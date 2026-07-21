@@ -48,6 +48,7 @@
 #include <mutex>
 #include <span>
 #include <stdexcept>
+#include <string_view>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -258,6 +259,74 @@ void materialize_pin_batches(op::scan::gpu_ingestible& ingestible,
   }
 }
 
+/// Shared compress step for the host and device pin drivers: compress @p tbl per
+/// @p compression on @p stream, and when the batch qualifies (compression on and
+/// >= the size threshold) AND the compressed footprint saves enough (<=
+/// max_compressed_fraction of the original), invoke @p stage to copy the compressed
+/// buffers into the caller's tier storage. Returns true iff @p stage ran (the batch
+/// was pinned compressed); false means pin uncompressed. Throws on a compression /
+/// encode failure so the caller can latch its per-chunk fallback.
+///
+/// @p stage runs while the compressed_table (which owns the device payload buffers
+/// enumerated in @c buffers) and the compress stream pool are still alive, so it
+/// must copy the buffers out and synchronize @p stream before returning. It is
+/// called as stage(header&&, buffers, payload_bytes, uncompressed_bytes).
+template <typename StageFn>
+bool compress_and_stage_batch(cudf::table const& tbl,
+                              compression_pin_config const& compression,
+                              rmm::cuda_stream_view stream,
+                              std::string_view log_tag,
+                              StageFn&& stage)
+{
+  if (tbl.num_columns() == 0) { return false; }
+  // Total device footprint of the batch (includes string chars/offsets and null
+  // masks), so string columns count toward the threshold.
+  const std::size_t uncompressed_bytes = tbl.alloc_size();
+  if (uncompressed_bytes < compression.min_batch_size_bytes) { return false; }
+
+  // Parallel per-column compress when >1 (capped at the column count). The pool
+  // must outlive `ct` (whose buffers free on the pool streams at teardown), so it
+  // is declared before `ct`.
+  const int n_threads = std::min(compression.column_threads, tbl.num_columns());
+  simpatico::stream_pool comp_pool;
+  const bool parallel = n_threads > 1 && comp_pool.init(static_cast<std::size_t>(n_threads));
+  auto ct             = parallel ? simpatico::compress_with_plan(tbl.view(),
+                                                     compression.plan_dsl,
+                                                     comp_pool,
+                                                     rmm::mr::get_current_device_resource_ref(),
+                                                     compression.column_names)
+                                 : simpatico::compress_with_plan(tbl.view(),
+                                                     compression.plan_dsl,
+                                                     stream,
+                                                     rmm::mr::get_current_device_resource_ref(),
+                                                     compression.column_names);
+
+  // Build the structural header and enumerate the payload buffers (no bytes copied yet).
+  std::vector<std::uint8_t> header;
+  std::vector<simpatico::payload_buffer_ref> buffers;
+  std::uint64_t payload_bytes = 0;
+  const std::string hdr_err =
+    simpatico::build_compressed_table_header(ct, header, buffers, payload_bytes, stream);
+  if (!hdr_err.empty()) { throw std::runtime_error("build_compressed_table_header: " + hdr_err); }
+
+  // Keep the compressed form only if it saves enough: compare the total compressed
+  // footprint (header + payload) against the batch's original device size.
+  const std::size_t compressed_bytes = header.size() + payload_bytes;
+  if (uncompressed_bytes > 0 &&
+      static_cast<double>(compressed_bytes) >
+        compression.max_compressed_fraction * static_cast<double>(uncompressed_bytes)) {
+    SIRIUS_LOG_DEBUG("[{}] compressed {}B > {:.0f}% of {}B original; pinning uncompressed",
+                     log_tag,
+                     compressed_bytes,
+                     compression.max_compressed_fraction * 100.0,
+                     uncompressed_bytes);
+    return false;
+  }
+
+  stage(std::move(header), buffers, payload_bytes, uncompressed_bytes);
+  return true;
+}
+
 }  // namespace
 
 materialized_pin materialize_all_batches(
@@ -313,71 +382,32 @@ host_pin_result materialize_pin_to_host_with_compression(
       out.base_row_count_per_chunk.push_back(static_cast<std::size_t>(tbl->num_rows()));
       if (!chunk_stats.empty()) { out.chunk_stats.emplace_back(std::move(chunk_stats)); }
 
-      if (compression.enabled && !compression_failed && tbl && tbl->num_columns() > 0 &&
-          !compression.plan_dsl.empty()) {
+      if (compression.enabled && !compression_failed && tbl && !compression.plan_dsl.empty()) {
         try {
-          // Total device footprint of the batch (includes string chars/offsets
-          // and null masks), so string columns count toward the threshold.
-          std::size_t uncompressed_bytes = tbl->alloc_size();
-          if (uncompressed_bytes >= compression.min_batch_size_bytes) {
-            // Parallel per-column compress when >1 (capped at the column count).
-            // The pool must outlive `ct` (whose buffers free on the pool streams
-            // at teardown), so it is declared before `ct`.
-            const int n_threads = std::min(compression.column_threads, tbl->num_columns());
-            simpatico::stream_pool comp_pool;
-            const bool parallel =
-              n_threads > 1 && comp_pool.init(static_cast<std::size_t>(n_threads));
-            auto ct = parallel
-                        ? simpatico::compress_with_plan(tbl->view(),
-                                                        compression.plan_dsl,
-                                                        comp_pool,
-                                                        rmm::mr::get_current_device_resource_ref(),
-                                                        compression.column_names)
-                        : simpatico::compress_with_plan(tbl->view(),
-                                                        compression.plan_dsl,
-                                                        stream,
-                                                        rmm::mr::get_current_device_resource_ref(),
-                                                        compression.column_names);
-
-            // Build the structural header and enumerate the payload buffers
-            // (no bytes copied yet).
-            std::vector<std::uint8_t> header;
-            std::vector<simpatico::payload_buffer_ref> buffers;
-            std::uint64_t payload_bytes = 0;
-            const std::string hdr_err =
-              simpatico::build_compressed_table_header(ct, header, buffers, payload_bytes, stream);
-            if (!hdr_err.empty()) {
-              throw std::runtime_error("build_compressed_table_header: " + hdr_err);
-            }
-
-            // Keep the compressed form only if it saves enough: compare the
-            // total compressed footprint (header + payload) against the batch's
-            // original device size. Otherwise discard it and pin uncompressed.
-            const std::size_t original_bytes   = tbl->alloc_size();
-            const std::size_t compressed_bytes = header.size() + payload_bytes;
-            if (original_bytes > 0 &&
-                static_cast<double>(compressed_bytes) >
-                  compression.max_compressed_fraction * static_cast<double>(original_bytes)) {
-              SIRIUS_LOG_DEBUG(
-                "[materialize_pin_to_host_with_compression] compressed {}B > {:.0f}% of {}B "
-                "original; pinning uncompressed",
-                compressed_bytes,
-                compression.max_compressed_fraction * 100.0,
-                original_bytes);
-            } else {
+          compressed_this_chunk = compress_and_stage_batch(
+            *tbl,
+            compression,
+            stream,
+            "materialize_pin_to_host_with_compression",
+            [&](std::vector<std::uint8_t>&& header,
+                std::vector<simpatico::payload_buffer_ref> const& buffers,
+                std::uint64_t payload_bytes,
+                std::size_t uncompressed_bytes) {
               // Allocate the pinned payload from the target host space's chunked
-              // pool (the same tracked pool the uncompressed path uses) and stage
-              // every compressed buffer device->pinned. Sync before `ct` (which
-              // owns the device buffers) leaves scope.
+              // pool (the same tracked pool the uncompressed path uses), reserved
+              // against the host budget so the pinned footprint is accounted, then
+              // stage every compressed buffer device->pinned. Sync before `ct`
+              // (which owns the device buffers) leaves scope.
               auto* host_mr =
                 target_host_space->get_memory_resource_of<cucascade::memory::Tier::HOST>();
               if (host_mr == nullptr) {
                 throw std::runtime_error(
                   "target host space has no fixed_size_host_memory_resource");
               }
-              auto blob           = std::make_shared<sirius::pinned_compressed_blob>();
-              blob->header        = std::move(header);
-              blob->payload       = host_mr->allocate_multiple_blocks(payload_bytes);
+              auto payload_res = target_host_space->make_reservation_or_null(payload_bytes);
+              auto blob        = std::make_shared<sirius::pinned_compressed_blob>();
+              blob->header     = std::move(header);
+              blob->payload = host_mr->allocate_multiple_blocks(payload_bytes, payload_res.get());
               blob->payload_bytes = payload_bytes;
               for (auto const& b : buffers) {
                 if (b.size_bytes > 0 && b.device_ptr != nullptr) {
@@ -397,9 +427,7 @@ host_pin_result materialize_pin_to_host_with_compression(
                 static_cast<std::size_t>(payload_bytes),
                 uncompressed_bytes,
                 static_cast<int64_t>(tbl->num_rows())));
-              compressed_this_chunk = true;
-            }
-          }
+            });
         } catch (const std::exception& e) {
           compression_failed = true;
           SIRIUS_LOG_WARN(
@@ -453,59 +481,23 @@ device_pin_result materialize_pin_to_device_with_compression(
       std::shared_ptr<sirius::compressed_device_representation> compressed_chunk;
       out.base_row_count_per_chunk.push_back(static_cast<std::size_t>(tbl->num_rows()));
 
-      if (compression.enabled && !compression_failed && tbl && tbl->num_columns() > 0 &&
-          !compression.plan_dsl.empty()) {
+      if (compression.enabled && !compression_failed && tbl && !compression.plan_dsl.empty()) {
         try {
-          // Total device footprint of the batch (includes string chars/offsets
-          // and null masks), so string columns count toward the threshold.
-          std::size_t uncompressed_bytes = tbl->alloc_size();
-          if (uncompressed_bytes >= compression.min_batch_size_bytes) {
-            // Parallel per-column compress when >1 (capped at the column count).
-            // The pool must outlive `ct` (whose buffers free on the pool streams
-            // at teardown), so it is declared before `ct`.
-            const int n_threads = std::min(compression.column_threads, tbl->num_columns());
-            simpatico::stream_pool comp_pool;
-            const bool parallel =
-              n_threads > 1 && comp_pool.init(static_cast<std::size_t>(n_threads));
-            auto ct = parallel
-                        ? simpatico::compress_with_plan(tbl->view(),
-                                                        compression.plan_dsl,
-                                                        comp_pool,
-                                                        rmm::mr::get_current_device_resource_ref(),
-                                                        compression.column_names)
-                        : simpatico::compress_with_plan(tbl->view(),
-                                                        compression.plan_dsl,
-                                                        stream,
-                                                        rmm::mr::get_current_device_resource_ref(),
-                                                        compression.column_names);
-
-            std::vector<std::uint8_t> header;
-            std::vector<simpatico::payload_buffer_ref> buffers;
-            std::uint64_t payload_bytes = 0;
-            const std::string hdr_err =
-              simpatico::build_compressed_table_header(ct, header, buffers, payload_bytes, stream);
-            if (!hdr_err.empty()) {
-              throw std::runtime_error("build_compressed_table_header: " + hdr_err);
-            }
-
-            // Keep the compressed form only if it saves enough (header + payload
-            // vs the batch's original device size); otherwise discard and pin
-            // uncompressed.
-            const std::size_t original_bytes   = tbl->alloc_size();
-            const std::size_t compressed_bytes = header.size() + payload_bytes;
-            if (original_bytes > 0 &&
-                static_cast<double>(compressed_bytes) >
-                  compression.max_compressed_fraction * static_cast<double>(original_bytes)) {
-              SIRIUS_LOG_DEBUG(
-                "[materialize_pin_to_device_with_compression] compressed {}B > {:.0f}% of {}B "
-                "original; pinning uncompressed",
-                compressed_bytes,
-                compression.max_compressed_fraction * 100.0,
-                original_bytes);
-            } else {
+          compress_and_stage_batch(
+            *tbl,
+            compression,
+            stream,
+            "materialize_pin_to_device_with_compression",
+            [&](std::vector<std::uint8_t>&& header,
+                std::vector<simpatico::payload_buffer_ref> const& buffers,
+                std::uint64_t payload_bytes,
+                std::size_t uncompressed_bytes) {
               // Keep the compressed payload in one contiguous device buffer on the
-              // source GPU; copy each compressed leaf buffer device->device, then
-              // sync before `ct` (owning the source device buffers) leaves scope.
+              // source GPU (its default allocator is the reservation-aware adaptor,
+              // so the footprint is tracked like any GPU pin — no separate
+              // reservation needed). Copy each compressed leaf buffer
+              // device->device, then sync before `ct` (owning the source device
+              // buffers) leaves scope.
               rmm::device_buffer payload(static_cast<std::size_t>(payload_bytes),
                                          stream,
                                          src_space->get_default_allocator());
@@ -533,8 +525,7 @@ device_pin_result materialize_pin_to_device_with_compression(
                 static_cast<std::size_t>(payload_bytes),
                 uncompressed_bytes,
                 static_cast<int64_t>(tbl->num_rows()));
-            }
-          }
+            });
         } catch (const std::exception& e) {
           compression_failed = true;
           SIRIUS_LOG_WARN(
