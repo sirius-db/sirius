@@ -41,6 +41,7 @@
 #include <mutex>
 #include <set>
 #include <thread>
+#include <tuple>
 #include <vector>
 
 using namespace sirius::exec;
