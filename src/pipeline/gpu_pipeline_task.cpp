@@ -168,19 +168,14 @@ std::unique_ptr<op::operator_data> run_one_operator(
   try {
     operator_output_data = op.execute(operator_input_data, stream);
   } catch (const std::exception& ex) {
-    // Always log which operator threw so we can identify the failing source.
-    // NOTE: Thrust's throw_on_error() calls cudaGetLastError() before throwing to clear
-    // the sticky per-thread error (prevents leaking).  So cudaGetLastError() here will
-    // almost always return cudaSuccess; we log it only when non-zero (rare path).
     auto sticky_err = cudaGetLastError();
     if (sticky_err != cudaSuccess) {
-      SIRIUS_LOG_WARN(
-        "Pipeline {}: {} (id={}) threw + left sticky CUDA error: [{}] {} — clearing",
-        pipeline->get_pipeline_id(),
-        op.get_name(),
-        op.get_operator_id(),
-        static_cast<int>(sticky_err),
-        cudaGetErrorString(sticky_err));
+      SIRIUS_LOG_WARN("Pipeline {}: {} (id={}) threw + left sticky CUDA error: [{}] {} — clearing",
+                      pipeline->get_pipeline_id(),
+                      op.get_name(),
+                      op.get_operator_id(),
+                      static_cast<int>(sticky_err),
+                      cudaGetErrorString(sticky_err));
     }
     SIRIUS_LOG_WARN("Pipeline {}: {} (id={}) threw during execute: {}",
                     pipeline->get_pipeline_id(),
@@ -190,9 +185,6 @@ std::unique_ptr<op::operator_data> run_one_operator(
     throw;
   }
 
-  // Detect and clear any sticky CUDA error silently left after a successful execute()
-  // (e.g. a failed kernel launch that did not throw).  If left it would propagate into
-  // the next operator's CUB dispatch via cudaPeekAtLastError().
   if (auto sticky_err = cudaGetLastError(); sticky_err != cudaSuccess) {
     SIRIUS_LOG_WARN(
       "Pipeline {}: {} (id={}) left a sticky CUDA error after execute: [{}] {} — clearing",
@@ -399,11 +391,6 @@ std::unique_ptr<op::operator_data> gpu_pipeline_task::compute_task(rmm::cuda_str
         i,
         "OOM at operator " + op.get_name() + " (index " + std::to_string(i) + ")");
     } catch (const thrust::system_error& cuda_err) {
-      // Transient CUDA kernel-launch failures (cudaErrorLaunchOutOfResources when PDL
-      // scheduling credits are exhausted by concurrent streams, or cudaErrorInvalidValue
-      // when PDL attributes are rejected) are retryable: reschedule the task at this
-      // operator so it re-runs after the executor's back-off.  All other CUDA errors
-      // (kernel execution faults, invalid pointers, etc.) are not retried.
       auto err = static_cast<cudaError_t>(cuda_err.code().value());
       if (err == cudaErrorLaunchOutOfResources || err == cudaErrorInvalidValue) {
         SIRIUS_LOG_WARN(

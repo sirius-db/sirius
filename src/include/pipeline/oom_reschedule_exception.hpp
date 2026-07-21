@@ -66,22 +66,15 @@ class oom_reschedule_exception : public task_reschedule_exception {
   using task_reschedule_exception::task_reschedule_exception;
 };
 
-/**
- * @brief Reschedule request from a transient CUDA kernel-launch failure.
- *
- * cudaErrorLaunchOutOfResources and cudaErrorInvalidValue can occur when
- * PDL scheduling credits are exhausted by concurrent streams on the same GPU.
- * Rescheduling after a brief back-off lets the competing kernels drain.
- */
+/** @brief Reschedule request from a transient CUDA kernel-launch failure. */
 class cuda_launch_reschedule_exception : public task_reschedule_exception {
  public:
   cuda_launch_reschedule_exception(std::unique_ptr<op::operator_data> intermediate_data,
                                    size_t resume_operator_index,
                                    int cuda_error_code,
                                    std::string message)
-    : task_reschedule_exception(std::move(intermediate_data),
-                                resume_operator_index,
-                                std::move(message)),
+    : task_reschedule_exception(
+        std::move(intermediate_data), resume_operator_index, std::move(message)),
       _cuda_error_code(cuda_error_code)
   {
   }
