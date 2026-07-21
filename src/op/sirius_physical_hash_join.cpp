@@ -616,11 +616,12 @@ partition_strategy sirius_physical_hash_join::get_partition_strategy(
 
   SIRIUS_LOG_DEBUG(
     "sirius_physical_hash_join id {} partition strategy: {} partitions ({} GPUs), build side {} "
-    "bytes. Join Mode: {} {}. build_card_est {} probe_card_est {}",
+    "bytes. Join Type: {}. Join Mode: {} {}. build_card_est {} probe_card_est {}",
     this->get_operator_id(),
     strategy.num_partitions,
     _num_gpus,
     in.total_bytes,
+    duckdb::JoinTypeToString(join_type),
     join_mode_str,
     (strategy.broadcast ? " [broadcast]" : ""),
     build_card_est,
