@@ -155,10 +155,10 @@ the destination is valid.
 
 ## 5. Safety and Failure Semantics
 
-The safety model has two irreversible boundaries. Issuing the
-token-bearing GET creates a possible remote writer to the registered
-arena; enqueuing `cudaMemcpyAsync` creates a possible local GPU writer
-to caller-owned RMM memory. A failure is recoverable only when Sirius
+The safety model has two irreversible boundaries. A token-bearing GET
+that may have reached the gateway creates a possible remote writer to
+the registered arena; the first `cudaMemcpyAsync` call creates a
+possible local GPU writer to caller-owned RMM memory. A failure is recoverable only when Sirius
 can prove the relevant writer has stopped: an uncertain RDMA completion
 therefore fail-stops the transport, and an uncertain copy is
 process-fatal.
@@ -177,24 +177,25 @@ and arena lifetime.
 stateDiagram-v2
   [*] --> PreIssue: chunk claimed / slot leased
 
-  PreIssue --> RequestError: local failure before GET
-  PreIssue --> RDMAInFlight: issue one-shot token-bearing GET
+  PreIssue --> RequestError: non-sticky local failure (GET provably not issued)
+  PreIssue --> ProcessFatal: sticky CUDA error
+  PreIssue --> RDMAInFlight: token-bearing GET may have reached the gateway
 
   RDMAInFlight --> TransportFailStop: completion non-exact or unknown
   RDMAInFlight --> ReadyToDeliver: exact completion (tag + status + expected bytes)
 
-  ReadyToDeliver --> RequestError: non-sticky error before D2D
+  ReadyToDeliver --> RequestError: non-sticky failure before the first cudaMemcpyAsync call
   ReadyToDeliver --> ProcessFatal: sticky CUDA error
-  ReadyToDeliver --> CopyInFlight: flush if required, enqueue D2D + event
+  ReadyToDeliver --> CopyInFlight: flush if required, then the first cudaMemcpyAsync call (the boundary)
 
-  CopyInFlight --> Delivered: event wait == cudaSuccess
-  CopyInFlight --> ProcessFatal: any other outcome
+  CopyInFlight --> Delivered: event wait reports cudaSuccess
+  CopyInFlight --> ProcessFatal: any error from memcpy, record, or wait
 
   Delivered --> [*]: chunk complete / slot reusable
   RequestError --> [*]: request marked failed / slot released
 
   note right of TransportFailStop
-    Future resolves with an error.
+    The request future errors after issued work settles.
     The arena remains allocated.
     Recovery requires process restart.
   end note
@@ -206,7 +207,7 @@ stateDiagram-v2
 ```
 
 The sticky set is CUDA's documented classification, checked against the
-tree's classifier. After the D2D is enqueued, only an event wait
+tree's classifier. After the first `cudaMemcpyAsync` call, only an event wait
 reporting `cudaSuccess` proves the copy has stopped writing; an
 event-destroy failure after that successful wait is logged and does not
 change the delivery outcome.
@@ -214,9 +215,9 @@ change the delivery outcome.
 | Outcome | Action | Future | Arena |
 |---|---|---|---|
 | Exact RDMA completion and confirmed D2D | Complete; resolve after all chunks | Success | Slot reusable |
-| Non-sticky error before the copy is enqueued | Report the error; the reactor continues | Error | Slot released |
+| Non-sticky error before the first `cudaMemcpyAsync` call | Report the error; the reactor continues | Error | Slot released |
 | Non-exact or unknown RDMA outcome | Reactor fail-stop; process restart required | Error | Entire arena non-freeable |
-| Sticky CUDA error, or any failure after the copy is enqueued (event-destroy excepted) | Process-fatal termination | Not resolved | Never freed |
+| Sticky CUDA error, or any error at or after the first `cudaMemcpyAsync` call (event-destroy excepted) | Process-fatal termination | Not resolved | Never freed |
 
 On entering `TransportFailStop`, the ioctx marks the shared admission
 gate terminal and refuses new work; host- and device-plane operations
