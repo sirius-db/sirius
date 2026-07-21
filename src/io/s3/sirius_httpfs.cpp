@@ -333,37 +333,26 @@ duckdb::vector<duckdb::OpenFileInfo> sirius_httpfs::Glob(const std::string& path
 
 namespace {
 
-// True when @p key contains '%' followed by two hex digits. DuckDB decodes hive
-// partition values from the path, so a literal %HH key cannot currently preserve
-// both object identity and partition values; expand_glob rejects it. ('#', '?'
-// and bare-'%' keys round-trip exactly and stay supported.)
-bool key_has_percent_encoded_sequence(std::string_view key)
+// True when @p key has a directory segment (not the final filename) that is a Hive
+// partition (has '=') and also contains a literal '?'. DuckDB's Parse cancels
+// partition candidacy on any '?' in a segment, so such a directory would be
+// silently dropped from partitioning. An escaped '%3F' is safe.
+bool key_has_literal_question_in_hive_segment(std::string_view key)
 {
-  auto const is_hex = [](char c) {
-    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
-  };
-  for (std::size_t i = 0; i + 2 < key.size(); ++i) {
-    if (key[i] == '%' && is_hex(key[i + 1]) && is_hex(key[i + 2])) { return true; }
+  std::size_t seg_start = 0;
+  for (std::size_t i = 0; i < key.size(); ++i) {
+    if (key[i] == '/') {  // close a directory segment; the trailing filename is skipped
+      auto const seg = key.substr(seg_start, i - seg_start);
+      if (seg.find('=') != std::string_view::npos && seg.find('?') != std::string_view::npos) {
+        return true;
+      }
+      seg_start = i + 1;
+    }
   }
   return false;
 }
 
 }  // namespace
-
-std::string escape_s3_key_for_uri(std::string_view key)
-{
-  std::string out;
-  out.reserve(key.size());
-  for (char const c : key) {
-    switch (c) {
-      case '%': out += "%25"; break;
-      case '#': out += "%23"; break;
-      case '?': out += "%3F"; break;
-      default: out += c;
-    }
-  }
-  return out;
-}
 
 duckdb::vector<duckdb::OpenFileInfo> expand_glob(
   std::string const& pattern,
@@ -422,24 +411,22 @@ duckdb::vector<duckdb::OpenFileInfo> expand_glob(
           matched = match_glob_no_crawl(key_segments, pattern_segments);
         }
         if (!matched) { continue; }
-        // Match-scoped fail-loud guard (see key_has_percent_encoded_sequence):
-        // unmatched keys under the same prefix stay harmless.
-        if (key_has_percent_encoded_sequence(entry.key)) {
+        // Fail loud on a literal '?' in a Hive partition segment (see above);
+        // match-scoped, so unmatched keys under the prefix are unaffected.
+        if (key_has_literal_question_in_hive_segment(entry.key)) {
           throw duckdb::IOException(
             "[sirius_httpfs] glob '" + pattern + "' matched S3 key '" + entry.key +
-            "' containing a percent-encoded sequence; hive/filename semantics for such keys are "
-            "not preserved over s3:// yet — rename the object or exclude it from the glob");
+            "' with a literal '?' in a Hive partition segment; percent-encode it (%3F) or exclude "
+            "it from the glob");
         }
         if (matches.size() >= match_cap) {
           throw duckdb::IOException("[sirius_httpfs] glob '" + pattern + "' matched more than " +
                                     std::to_string(match_cap) +
                                     " objects — narrow the glob prefix");
         }
-        // Matching runs on the literal key bytes above; only the URI embedding
-        // escapes them, so the later parse() of this path restores the exact
-        // key (see escape_s3_key_for_uri).
-        duckdb::OpenFileInfo info("s3://" + std::string{bucket} + "/" +
-                                  escape_s3_key_for_uri(entry.key));
+        // Embed the raw LIST key verbatim: the signing layer RFC3986-encodes it and
+        // uri_parser does not decode the s3 key, so the LIST key == the opened key.
+        duckdb::OpenFileInfo info("s3://" + std::string{bucket} + "/" + std::string{entry.key});
         if (entry.size <= static_cast<std::uint64_t>(std::numeric_limits<int64_t>::max())) {
           info.extended_info = duckdb::make_shared_ptr<duckdb::ExtendedOpenFileInfo>();
           info.extended_info->options["file_size"] =

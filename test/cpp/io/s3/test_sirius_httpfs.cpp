@@ -22,8 +22,10 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -112,6 +114,13 @@ std::string thrown_message(Fn&& fn)
     return "<non-std exception>";
   }
   return {};
+}
+
+std::string read_text_file(fs::path const& path)
+{
+  std::ifstream in(path);
+  if (!in) { throw std::runtime_error("cannot open source file: " + path.string()); }
+  return {std::istreambuf_iterator<char>{in}, std::istreambuf_iterator<char>{}};
 }
 
 void load_sirius_extension(duckdb::DuckDB& db)
@@ -290,17 +299,17 @@ class exposed_sirius_httpfs final : public sirius::io::s3::sirius_httpfs {
 
 }  // namespace
 
-TEST_CASE("S3 LIST keys survive the URI embedding escape seam", "[s3][filesystem][glob]")
+TEST_CASE("S3 LIST keys retain literal identity when embedded in object URIs",
+          "[s3][filesystem][glob]")
 {
   for (auto const key : {std::string_view{"a%2Fb.p"},
-                         std::string_view{"x#1.p"},
-                         std::string_view{"y?v.p"},
-                         std::string_view{"100%.p"},
-                         std::string_view{"col=a%20b/p0.p"}}) {
+                         std::string_view{"a%20b.p"},
+                         std::string_view{"a#b.p"},
+                         std::string_view{"a?b.p"},
+                         std::string_view{"100%x.p"}}) {
     DYNAMIC_SECTION("key=" << key)
     {
-      auto const escaped = sirius::io::s3::escape_s3_key_for_uri(key);
-      auto const parsed  = sirius::io::parse("s3://bkt/" + escaped);
+      auto const parsed = sirius::io::parse("s3://bkt/" + std::string{key});
 
       CHECK(parsed.host == "bkt");
       CHECK(parsed.path == key);
@@ -308,14 +317,33 @@ TEST_CASE("S3 LIST keys survive the URI embedding escape seam", "[s3][filesystem
   }
 }
 
-TEST_CASE("S3 LIST key URI escaping preserves ordinary keys byte for byte",
-          "[s3][filesystem][glob]")
+TEST_CASE("S3 object URI parsing preserves ordinary keys byte for byte", "[s3][filesystem][glob]")
 {
   for (auto const key : {std::string_view{"plain.parquet"},
                          std::string_view{"year=2026/part 0.parquet"},
                          std::string_view{"nested/path/file.parquet"}}) {
-    DYNAMIC_SECTION("key=" << key) { CHECK(sirius::io::s3::escape_s3_key_for_uri(key) == key); }
+    DYNAMIC_SECTION("key=" << key)
+    {
+      CHECK(sirius::io::parse("s3://bkt/" + std::string{key}).path == key);
+    }
   }
+}
+
+TEST_CASE("S3 literal-key implementation contains no retired URI escape or percent guard",
+          "[s3][filesystem][glob]")
+{
+  auto const root   = fs::path{SIRIUS_PROJECT_ROOT};
+  auto const source = read_text_file(root / "src" / "io" / "s3" / "sirius_httpfs.cpp");
+  auto const header = read_text_file(root / "src" / "include" / "io" / "s3" / "sirius_httpfs.hpp");
+  auto const implementation = source + header;
+
+  auto const retired_escape  = std::string{"escape_s3_key_"} + "for_uri";
+  auto const retired_guard   = std::string{"key_has_percent_encoded_"} + "sequence";
+  auto const retired_wording = std::string{"containing a percent-"} + "encoded sequence";
+
+  CHECK(implementation.find(retired_escape) == std::string::npos);
+  CHECK(implementation.find(retired_guard) == std::string::npos);
+  CHECK(implementation.find(retired_wording) == std::string::npos);
 }
 
 TEST_CASE("sirius_httpfs claims only valid S3 object paths", "[s3][filesystem]")

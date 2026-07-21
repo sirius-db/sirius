@@ -9,6 +9,7 @@
 #include "io/io_context.hpp"
 #include "io/rest/rest_ioctx.hpp"
 #include "io/s3/s3_object_ref.hpp"
+#include "io/s3/sirius_httpfs.hpp"
 #include "io/s3/sirius_sigv4_authorizer.hpp"
 #include "sirius_context.hpp"
 #include "sirius_extension.hpp"
@@ -2531,7 +2532,7 @@ TEST_CASE("transparent S3 read_parquet expands globbed parquet files",
   sirius::test::require_transparent_execution_delta(before_stats, after_stats, 1, 0, 1);
 }
 
-TEST_CASE("transparent S3 glob rejects a matched percent-encoded key instead of opening its decoy",
+TEST_CASE("transparent S3 glob opens the literal percent key instead of its slash decoy",
           "[s3][integration][sql][gpu_execution][transparent][glob]")
 {
   auto env = load_s3_test_env();
@@ -2541,10 +2542,17 @@ TEST_CASE("transparent S3 glob rejects a matched percent-encoded key instead of 
   set_gpu_execution(fixture.con, true);
   require_s3_keys_listed(fixture, *env, {"glob-enc/a%2Fb.parquet", "glob-enc/a/b.parquet"});
 
-  auto const s3_query = "SELECT count(*) FROM " + s3_parquet_glob_scan(*env, "glob-enc/a*.parquet");
+  auto const s3_scan    = s3_parquet_glob_scan(*env, "glob-enc/a*.parquet");
+  auto const local_scan = local_parquet_glob_scan(*env, "glob-enc/a*.parquet");
+  auto const s3_query =
+    "SELECT n_nationkey, n_name FROM " + s3_scan + " ORDER BY n_nationkey, n_name";
+  auto const local_query =
+    "SELECT n_nationkey, n_name FROM " + local_scan + " ORDER BY n_nationkey, n_name";
 
-  CHECK_THROWS_WITH(query_or_throw_on_error(fixture.con, s3_query),
-                    Catch::Contains("percent-encoded"));
+  compare_transparent_s3_gpu_to_local_cpu(fixture, s3_query, local_query);
+  auto result = require_query_ok(fixture.con, "SELECT count(*) FROM " + s3_scan);
+  REQUIRE(result->RowCount() == 1);
+  CHECK(result->GetValue(0, 0).GetValue<int64_t>() == 25);
 }
 
 TEST_CASE("transparent S3 glob opens keys containing URI fragment and query delimiters",
@@ -2585,7 +2593,7 @@ TEST_CASE("transparent S3 glob opens a key containing a literal percent byte",
   compare_transparent_s3_gpu_to_local_cpu(fixture, s3_query, local_query);
 }
 
-TEST_CASE("transparent S3 glob rejects a matched Hive-style percent-encoded key",
+TEST_CASE("transparent S3 glob decodes a percent-encoded Hive value exactly once",
           "[s3][integration][sql][gpu_execution][transparent][glob]")
 {
   auto env = load_s3_test_env();
@@ -2595,11 +2603,176 @@ TEST_CASE("transparent S3 glob rejects a matched Hive-style percent-encoded key"
   set_gpu_execution(fixture.con, true);
   require_s3_keys_listed(fixture, *env, {"glob-enc/t/col=a%20b/p0.parquet"});
 
-  auto const s3_query =
-    "SELECT count(*) FROM " + s3_parquet_glob_scan(*env, "glob-enc/t/*/*.parquet");
+  auto const options     = std::string_view{", hive_partitioning=true"};
+  auto const s3_scan     = s3_parquet_glob_scan(*env, "glob-enc/t/*/*.parquet", options);
+  auto const local_scan  = local_parquet_glob_scan(*env, "glob-enc/t/*/*.parquet", options);
+  auto const s3_query    = "SELECT col, count(*) FROM " + s3_scan + " GROUP BY col ORDER BY col";
+  auto const local_query = "SELECT col, count(*) FROM " + local_scan + " GROUP BY col ORDER BY col";
 
-  CHECK_THROWS_WITH(query_or_throw_on_error(fixture.con, s3_query),
-                    Catch::Contains("percent-encoded"));
+  compare_transparent_s3_gpu_to_local_cpu(fixture, s3_query, local_query);
+  auto result = require_query_ok(fixture.con, s3_query);
+  REQUIRE(result->RowCount() == 1);
+  CHECK(result->GetValue(0, 0).ToString() == "a b");
+  CHECK(result->GetValue(1, 0).GetValue<int64_t>() == 25);
+}
+
+TEST_CASE("S3 direct and glob routes share the literal object cache identity",
+          "[s3][integration][filesystem][glob]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  s3_sql_fixture fixture(*env);
+  auto& manager          = require_sirius_context(fixture).get_scan_manager();
+  auto const direct_uri  = s3_uri(env->bucket, "glob-enc/a%2Fb.parquet");
+  auto direct_datasource = manager.create_datasource(direct_uri);
+  REQUIRE(direct_datasource != nullptr);
+
+  auto glob_files =
+    sirius::io::s3::expand_glob(s3_uri(env->bucket, "glob-enc/a*.parquet"), manager);
+  REQUIRE(glob_files.size() == 1);
+  auto glob_datasource = manager.create_datasource(glob_files.front().path);
+  REQUIRE(glob_datasource != nullptr);
+
+  CHECK(glob_files.front().path == direct_uri);
+  CHECK(glob_datasource->io_object().object_path() == direct_datasource->io_object().object_path());
+  CHECK(glob_datasource->io_object().raw_file_cache_id() ==
+        direct_datasource->io_object().raw_file_cache_id());
+  CHECK(glob_datasource->io_object().size() == direct_datasource->io_object().size());
+}
+
+TEST_CASE("transparent S3 non-glob reads distinguish literal percent keys from spaces",
+          "[s3][integration][sql][gpu_execution][transparent]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  s3_sql_fixture fixture(*env);
+  set_gpu_execution(fixture.con, true);
+
+  auto const literal_scan =
+    "read_parquet(" + sql_quote(s3_uri(env->bucket, "glob-enc/f%20g.parquet")) + ")";
+  auto const literal_local = local_parquet_glob_scan(*env, "glob-enc/f%20g.parquet");
+  auto const space_scan =
+    "read_parquet(" + sql_quote(s3_uri(env->bucket, "glob-enc/f g.parquet")) + ")";
+  auto const space_local = local_parquet_glob_scan(*env, "glob-enc/f g.parquet");
+
+  compare_transparent_s3_gpu_to_local_cpu(fixture,
+                                          "SELECT count(*) FROM " + literal_scan + " ORDER BY 1",
+                                          "SELECT count(*) FROM " + literal_local + " ORDER BY 1");
+  compare_transparent_s3_gpu_to_local_cpu(fixture,
+                                          "SELECT count(*) FROM " + space_scan + " ORDER BY 1",
+                                          "SELECT count(*) FROM " + space_local + " ORDER BY 1");
+
+  auto literal_result = require_query_ok(fixture.con, "SELECT count(*) FROM " + literal_scan);
+  auto space_result   = require_query_ok(fixture.con, "SELECT count(*) FROM " + space_scan);
+  CHECK(literal_result->GetValue(0, 0).GetValue<int64_t>() == 25);
+  CHECK(space_result->GetValue(0, 0).GetValue<int64_t>() == 5);
+}
+
+TEST_CASE("transparent S3 glob rejects a literal question mark in a Hive partition segment",
+          "[s3][integration][sql][gpu_execution][transparent][glob]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  s3_sql_fixture fixture(*env);
+  set_gpu_execution(fixture.con, true);
+  require_s3_keys_listed(fixture, *env, {"glob-enc/q/col=a?b/p0.parquet"});
+
+  auto const scan =
+    s3_parquet_glob_scan(*env, "glob-enc/q/col=a?b/*.parquet", ", hive_partitioning=true");
+  CHECK_THROWS_WITH(query_or_throw_on_error(fixture.con, "SELECT count(*) FROM " + scan),
+                    Catch::Contains("literal '?'"));
+}
+
+TEST_CASE("transparent S3 glob rejects a question mark before the Hive partition separator",
+          "[s3][integration][sql][gpu_execution][transparent][glob]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  s3_sql_fixture fixture(*env);
+  set_gpu_execution(fixture.con, true);
+  require_s3_keys_listed(fixture, *env, {"glob-enc/guard-before/co?l=value/p0.parquet"});
+
+  auto const scan =
+    s3_parquet_glob_scan(*env, "glob-enc/guard-before/*/*.parquet", ", hive_partitioning=true");
+  CHECK_THROWS_WITH(query_or_throw_on_error(fixture.con, "SELECT count(n_nationkey) FROM " + scan),
+                    Catch::Contains("literal '?'"));
+}
+
+TEST_CASE("transparent S3 glob permits a question mark in the terminal filename",
+          "[s3][integration][sql][gpu_execution][transparent][glob]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  s3_sql_fixture fixture(*env);
+  set_gpu_execution(fixture.con, true);
+  require_s3_keys_listed(fixture, *env, {"glob-enc/guard-filename/report=foo?bar.parquet"});
+
+  auto const options = std::string_view{", hive_partitioning=true"};
+  auto const s3_scan =
+    s3_parquet_glob_scan(*env, "glob-enc/guard-filename/report*.parquet", options);
+  auto const local_scan =
+    local_parquet_glob_scan(*env, "glob-enc/guard-filename/report*.parquet", options);
+  auto const s3_query    = "SELECT count(n_nationkey) FROM " + s3_scan;
+  auto const local_query = "SELECT count(n_nationkey) FROM " + local_scan;
+
+  compare_transparent_s3_gpu_to_local_cpu(fixture, s3_query, local_query);
+  auto result = require_query_ok(fixture.con, s3_query);
+  REQUIRE(result->RowCount() == 1);
+  CHECK(result->GetValue(0, 0).GetValue<int64_t>() == 25);
+}
+
+TEST_CASE("transparent S3 glob supports an encoded question mark in a Hive partition value",
+          "[s3][integration][sql][gpu_execution][transparent][glob]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  s3_sql_fixture fixture(*env);
+  set_gpu_execution(fixture.con, true);
+  require_s3_keys_listed(fixture, *env, {"glob-enc/q/col=a%3Fb/p0.parquet"});
+
+  auto const options     = std::string_view{", hive_partitioning=true"};
+  auto const s3_scan     = s3_parquet_glob_scan(*env, "glob-enc/q/col=a%3F*/*.parquet", options);
+  auto const local_scan  = local_parquet_glob_scan(*env, "glob-enc/q/col=a%3F*/*.parquet", options);
+  auto const s3_query    = "SELECT col, count(*) FROM " + s3_scan + " GROUP BY col ORDER BY col";
+  auto const local_query = "SELECT col, count(*) FROM " + local_scan + " GROUP BY col ORDER BY col";
+
+  compare_transparent_s3_gpu_to_local_cpu(fixture, s3_query, local_query);
+  auto result = require_query_ok(fixture.con, s3_query);
+  REQUIRE(result->RowCount() == 1);
+  CHECK(result->GetValue(0, 0).ToString() == "a?b");
+  CHECK(result->GetValue(1, 0).GetValue<int64_t>() == 25);
+}
+
+TEST_CASE("S3 glob results are sorted by raw literal key bytes",
+          "[s3][integration][filesystem][glob]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  s3_sql_fixture fixture(*env);
+  auto& manager = require_sirius_context(fixture).get_scan_manager();
+  auto files    = sirius::io::s3::expand_glob(s3_uri(env->bucket, "glob-enc/*.parquet"), manager);
+
+  std::vector<std::string> actual;
+  actual.reserve(files.size());
+  for (auto const& file : files) {
+    actual.push_back(file.path);
+  }
+  std::vector<std::string> const expected{
+    s3_uri(env->bucket, "glob-enc/100%.parquet"),
+    s3_uri(env->bucket, "glob-enc/a%2Fb.parquet"),
+    s3_uri(env->bucket, "glob-enc/f g.parquet"),
+    s3_uri(env->bucket, "glob-enc/f%20g.parquet"),
+    s3_uri(env->bucket, "glob-enc/x#1.parquet"),
+    s3_uri(env->bucket, "glob-enc/y?v.parquet"),
+  };
+  CHECK(actual == expected);
 }
 
 TEST_CASE("transparent S3 glob ignores percent-encoded keys outside the match",
