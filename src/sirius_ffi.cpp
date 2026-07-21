@@ -47,6 +47,7 @@ namespace sirius::ffi {
 namespace {
 // ClientContextState key the GPU engine resolves its SiriusContext under.
 constexpr const char* kSiriusStateKey = "sirius_state";
+constexpr const char* kQueryLabel     = "sirius_ffi";
 // Arrow record-batch size for the exported stream; the consumer re-batches as needed.
 constexpr duckdb::idx_t kArrowBatchSize = 1u << 20;
 }  // namespace
@@ -139,7 +140,7 @@ void Context::execute_substrait(const std::string& plan, std::uintptr_t out_stre
   bool query_started = false;
   duckdb::unique_ptr<duckdb::QueryResult> result;
   try {
-    impl_->context->QueryBeginStandalone(client, "starrocks_substrait");
+    impl_->context->QueryBeginStandalone(client, kQueryLabel);
     query_started = true;
 
     // 1. Substrait bytes -> DuckDB Relation. DuckDB is used only for this lowering.
@@ -173,9 +174,9 @@ void Context::execute_substrait(const std::string& plan, std::uintptr_t out_stre
     auto gpu_prepared = duckdb::make_shared_ptr<sirius::sirius_prepared_statement_data>(
       std::move(prepared), std::move(physical_plan));
 
-    sirius::sirius_interface iface(client, std::optional<std::string>("starrocks_substrait"));
+    sirius::sirius_interface iface(client, std::optional<std::string>(kQueryLabel));
     result = iface.sirius_execute_query(
-      client, "starrocks_substrait", gpu_prepared, duckdb::PendingQueryParameters{});
+      client, kQueryLabel, gpu_prepared, duckdb::PendingQueryParameters{});
 
     // This standalone path bypasses DuckDB's normal query entry point, so its
     // ClientContextState callbacks are not invoked automatically. End every
