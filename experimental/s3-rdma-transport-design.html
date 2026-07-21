@@ -22,27 +22,33 @@
 <script type="text/markdown" id="src">
 # S3 RDMA Transport for Sirius — V1 Design
 
-Status: evaluation-prototype design for team review — no production code
-in this PR. Date: 2026-07-17. Author: Sirius Contributors. Benchmark:
+Date: 2026-07-17. Author: Sirius Contributors. Benchmark:
 <https://github.com/sirius-db/s3RDMA-benchmarktool> (~91 Gbps GPU-mode GET
 on CX-6 RoCE).
 
 ## 1. Summary and Scope
 
-V1 adds an opt-in RDMA path (`s3_transport=RDMA`) for exact-key Parquet
-reads on one GPU: `read_parquet('s3://bucket/path/file.parquet')` with the
-complete object key written out, not a glob or a listing. Payload lands
-in a pre-registered GPU arena and is
-copied to caller-owned RMM memory on the caller stream, with zero
-Sirius-side host staging or H2D traffic; metadata and footer reads remain
-on the existing S3 path. There is no automatic probing and no runtime
-fallback to HTTP: when RDMA is selected and cannot serve a request, the
-request fails with an explicit error. GO requires hardware correctness, at
-least 85% of the qualified RDMA link rate for objects of 16 MiB or larger,
-and a zero-failure 100-million-GET soak. For smaller objects the gate
-measures RDMA against HTTP side by side; if RDMA shows no advantage there,
-V1 may add a size-based fallback that routes small objects to the HTTP
-path — a routing choice, distinct from the failure semantics above.
+- V1 adds an opt-in RDMA path (`s3_transport=RDMA`) for exact-key Parquet
+  reads on one GPU: `read_parquet('s3://bucket/path/file.parquet')` with the
+  complete object key written out, not a glob or a listing. The first target
+  workload, TPC-H benchmarking over lakehouse parquet, references every table
+  by exact key, so glob/LIST support is deferred without loss.
+- Payload lands in a pre-registered GPU arena and is copied to caller-owned
+  RMM memory on the caller stream, with zero Sirius-side host staging or H2D
+  traffic. Metadata and footer reads remain on the existing S3 path.
+- No automatic probing and no runtime fallback to HTTP: when RDMA is selected
+  and cannot serve a request, the request fails with an explicit error. Retry
+  and demotion for the RDMA path belong to the scan-manager layer above the
+  transport, and are added there later rather than inside the transport.
+- GO requires hardware correctness, at least 85% of the qualified RDMA link
+  rate for objects of 16 MiB or larger, and a zero-failure 100-million-GET
+  soak.
+- For smaller objects the gate measures RDMA against HTTP side by side; if
+  RDMA shows no advantage there, V1 may add a size-based fallback that routes
+  small objects to the HTTP path — a routing choice, distinct from the
+  failure semantics above.
+- The prefetch cache is off on the RDMA path in V1. Whether V1 grows a cache
+  is decided from the benchmark results, not up front.
 
 ### Decisions Requested
 
