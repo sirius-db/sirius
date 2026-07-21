@@ -294,6 +294,11 @@ class parquet_gpu_ingestible : public gpu_ingestible {
 
   [[nodiscard]] std::vector<std::size_t> materialized_column_order() const override;
 
+  [[nodiscard]] bool has_row_filter() const noexcept override
+  {
+    return _duckdb_filter_expression != nullptr;
+  }
+
  private:
   /// Read one file's footer, prune its row groups against the filter, and record
   /// per-row-group byte accounting. Returns a single @c parquet_file_scan_info.

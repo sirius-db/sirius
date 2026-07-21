@@ -81,6 +81,16 @@ static void from_yaml(const YAML::Node& node, exec::thread_pool_config& opt)
   r.reject_unknown();
 }
 
+static void from_yaml(const YAML::Node& node, creator::task_creator_config& opt)
+{
+  yaml::reader r(node, "task_creator");
+  r.optional("num_threads", opt.thread_pool.num_threads, yaml::greater_than<int>{0});
+  r.optional("thread_name_prefix", opt.thread_pool.thread_name_prefix);
+  r.optional("cpu_affinity", opt.thread_pool.cpu_affinity_list);
+  r.optional("strategy", opt.strategy);
+  r.reject_unknown();
+}
+
 static void from_yaml(const YAML::Node& node, sirius::io::object_store_config& opt)
 {
   yaml::reader r(node, "object_store");
@@ -116,6 +126,8 @@ static void from_yaml(const YAML::Node& node, sirius::io::rest::config& opt)
   r.optional("honor_retry_after", opt.honor_retry_after);
   r.optional("perf_instrumentation", opt.perf_instrumentation);
   r.optional("footer_probe_bytes", yaml::bytes(opt.footer_probe_bytes));
+  r.optional("list_max_matches", opt.list_max_matches);
+  r.optional("list_max_scanned", opt.list_max_scanned);
   r.reject_unknown();
 }
 
@@ -144,7 +156,7 @@ static void from_yaml(const YAML::Node& node, sirius::io::cache::config& opt)
 static void from_yaml(const YAML::Node& node, scan_manager::scan_manager_config& opt)
 {
   yaml::reader r(node, "scan_manager");
-  r.optional("num_threads", opt.thread_pool.num_threads, yaml::greater_than<int>{0});
+  r.optional("num_threads", opt.thread_pool.num_threads, yaml::greater_than<int>{2});
   r.optional("thread_name_prefix", opt.thread_pool.thread_name_prefix);
   r.optional("cpu_affinity", opt.thread_pool.cpu_affinity_list);
   r.optional("use_sirius_datasource", opt.use_sirius_datasource);
@@ -162,7 +174,6 @@ static void from_yaml(const YAML::Node& node, operator_params& opt)
 {
   yaml::reader r(node, "operator_params");
   r.optional("scan_task_batch_size", yaml::bytes(opt.scan_task_batch_size));
-  r.optional("default_scan_task_varchar_size", yaml::bytes(opt.default_scan_task_varchar_size));
   r.optional("max_sort_partition_bytes", yaml::bytes(opt.max_sort_partition_bytes));
   r.optional("max_sort_partition_memory_fraction",
              opt.max_sort_partition_memory_fraction,
@@ -275,7 +286,7 @@ struct gpu_mem_config {
     if (std::holds_alternative<double>(reservation_limit)) {
       builder.set_reservation_fraction_per_gpu(std::get<double>(reservation_limit));
     } else {
-      builder.set_reservation_fraction_per_gpu(std::get<std::uint64_t>(reservation_limit));
+      builder.set_reservation_limit_per_gpu(std::get<std::uint64_t>(reservation_limit));
     }
     builder.set_downgrade_fractions_per_gpu(downgrade_trigger_fraction, downgrade_stop_fraction);
     builder.track_reservation_per_stream(track_per_stream_reservation);
@@ -321,10 +332,17 @@ struct host_mem_config {
     if (std::holds_alternative<double>(reservation_limit)) {
       builder.set_reservation_fraction_per_host(std::get<double>(reservation_limit));
     } else {
-      builder.set_reservation_fraction_per_host(std::get<std::uint64_t>(reservation_limit));
+      builder.set_reservation_limit_per_host(std::get<std::uint64_t>(reservation_limit));
     }
     builder.set_downgrade_fractions_per_host(downgrade_trigger_fraction, downgrade_stop_fraction);
     builder.set_per_host_capacity(numa_region_capacity_bytes);
+    // NOTE on argument order: cucascade's set_host_pool_features has confusingly-named
+    // parameters (chunk_size, block_size, initial_block_count) that it internally remaps onto
+    // host_memory_space_config::{block_size, pool_size, initial_number_pools} (see
+    // reservation_manager_configurator::build()). Passing our {block_size, pool_size,
+    // initial_number_pools} positionally therefore lands each value in the correctly-named
+    // cucascade config field — the names line up with the resulting config struct, not with the
+    // setter's parameter names.
     builder.set_host_pool_features(block_size, pool_size, initial_number_pools);
   }
 };
@@ -430,7 +448,6 @@ void sirius_config::load_from_file(const std::filesystem::path& config_path)
       if (auto n = er.optional_node("scan_manager")) from_yaml(*n, _scan_manager_config);
       if (auto n = er.optional_node("pipeline")) from_yaml(*n, _gpu_pipeline_executor_config);
       if (auto n = er.optional_node("downgrade")) from_yaml(*n, _downgrade_executor_config);
-      er.optional("task_queue_ordering", _task_queue_ordering);
       er.reject_unknown();
     }
 
@@ -525,7 +542,7 @@ const exec::downgrade_executor_config& sirius_config::get_downgrade_executor_con
   return _downgrade_executor_config;
 }
 
-const exec::thread_pool_config& sirius_config::get_task_creator_config() const noexcept
+const creator::task_creator_config& sirius_config::get_task_creator_config() const noexcept
 {
   return _task_creator_config;
 }

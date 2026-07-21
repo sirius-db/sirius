@@ -43,6 +43,7 @@
 
 #include <cstdlib>
 #include <filesystem>
+#include <map>
 #include <memory>
 #include <string>
 
@@ -81,9 +82,8 @@ TEST_CASE("grouped_aggregate_merge - group by with high cardinality distributes 
 {
   if (!require_two_gpus()) return;
 
-  auto tmp     = make_tmp_dir("highcard");
-  auto log_dir = tmp / "log";
-  auto yaml    = tmp / "mgpu.yaml";
+  auto tmp  = make_tmp_dir("highcard");
+  auto yaml = tmp / "mgpu.yaml";
 
   // Independent keys across files: range(0..500000) each — total ~4M rows
   // with ~500k distinct keys. At ~16 B/row that is ~64 MiB input; with
@@ -97,8 +97,6 @@ TEST_CASE("grouped_aggregate_merge - group by with high cardinality distributes 
   write_mgpu_yaml(yaml, make_params());
   REQUIRE(fs::exists(yaml));
 
-  scoped_log_dir logs(log_dir);
-
   auto glob = parquet_glob(tmp);
   auto inner_query =
     "SELECT k, SUM(v) AS sum_v, COUNT(*) AS cnt "
@@ -109,18 +107,24 @@ TEST_CASE("grouped_aggregate_merge - group by with high cardinality distributes 
     "ORDER BY k "
     "LIMIT 50";
 
+  std::map<int, size_t> tasks_per_gpu;
   {
     scoped_mgpu_env env(yaml);
     auto con = std::make_unique<duckdb::Connection>(env.make_connection());
     require_gpu_matches_cpu(*con, inner_query);
-    con.reset();  // flush sinks before parse_audit_log
+    auto& scheduler = env.get_task_scheduler(*con);
+    con.reset();
+    scheduler.visit_executors(
+      [&](int device_id, const sirius::pipeline::gpu_pipeline_executor& exec) {
+        tasks_per_gpu[device_id] = exec.get_metrics().tasks_executed;
+      });
   }
 
-  auto by_gpu = parse_audit_log(log_dir);
-  INFO("gpu0 pipelines=" << by_gpu[0].pipeline_ids.size()
-                         << " gpu1 pipelines=" << by_gpu[1].pipeline_ids.size());
-  REQUIRE(by_gpu[0].pipeline_ids.size() >= 1);
-  REQUIRE(by_gpu[1].pipeline_ids.size() >= 1);
+  INFO("gpu0 tasks=" << tasks_per_gpu[0] << " gpu1 tasks=" << tasks_per_gpu[1]);
+  REQUIRE(tasks_per_gpu.count(0));
+  REQUIRE(tasks_per_gpu.count(1));
+  REQUIRE(tasks_per_gpu.at(0) >= 1);
+  REQUIRE(tasks_per_gpu.at(1) >= 1);
 
   std::error_code ec;
   fs::remove_all(tmp, ec);
@@ -131,9 +135,8 @@ TEST_CASE("grouped_aggregate_merge - group by with single key forces single-GPU 
 {
   if (!require_two_gpus()) return;
 
-  auto tmp     = make_tmp_dir("singlekey");
-  auto log_dir = tmp / "log";
-  auto yaml    = tmp / "mgpu.yaml";
+  auto tmp  = make_tmp_dir("singlekey");
+  auto yaml = tmp / "mgpu.yaml";
 
   // Every row shares k=0 → aggregate result is a single group. Below the
   // small-table-bytes threshold where the num_gpus floor is skipped, so
@@ -146,8 +149,6 @@ TEST_CASE("grouped_aggregate_merge - group by with single key forces single-GPU 
 
   write_mgpu_yaml(yaml, make_params());
   REQUIRE(fs::exists(yaml));
-
-  scoped_log_dir logs(log_dir);
 
   auto glob = parquet_glob(tmp);
   auto inner_query =
@@ -174,9 +175,8 @@ TEST_CASE("grouped_aggregate_merge - count(*)-only aggregate across two GPUs",
 {
   if (!require_two_gpus()) return;
 
-  auto tmp     = make_tmp_dir("countstar");
-  auto log_dir = tmp / "log";
-  auto yaml    = tmp / "mgpu.yaml";
+  auto tmp  = make_tmp_dir("countstar");
+  auto yaml = tmp / "mgpu.yaml";
 
   // Same high-cardinality surface as test #1 so we hit the multi-partition
   // MGPU path, but the aggregate is COUNT(*) only — catches cudf
@@ -189,8 +189,6 @@ TEST_CASE("grouped_aggregate_merge - count(*)-only aggregate across two GPUs",
   write_mgpu_yaml(yaml, make_params());
   REQUIRE(fs::exists(yaml));
 
-  scoped_log_dir logs(log_dir);
-
   auto glob = parquet_glob(tmp);
   auto inner_query =
     "SELECT k, COUNT(*) AS cnt "
@@ -201,18 +199,24 @@ TEST_CASE("grouped_aggregate_merge - count(*)-only aggregate across two GPUs",
     "ORDER BY k "
     "LIMIT 50";
 
+  std::map<int, size_t> tasks_per_gpu;
   {
     scoped_mgpu_env env(yaml);
     auto con = std::make_unique<duckdb::Connection>(env.make_connection());
     require_gpu_matches_cpu(*con, inner_query);
+    auto& scheduler = env.get_task_scheduler(*con);
     con.reset();
+    scheduler.visit_executors(
+      [&](int device_id, const sirius::pipeline::gpu_pipeline_executor& exec) {
+        tasks_per_gpu[device_id] = exec.get_metrics().tasks_executed;
+      });
   }
 
-  auto by_gpu = parse_audit_log(log_dir);
-  INFO("gpu0 pipelines=" << by_gpu[0].pipeline_ids.size()
-                         << " gpu1 pipelines=" << by_gpu[1].pipeline_ids.size());
-  REQUIRE(by_gpu[0].pipeline_ids.size() >= 1);
-  REQUIRE(by_gpu[1].pipeline_ids.size() >= 1);
+  INFO("gpu0 tasks=" << tasks_per_gpu[0] << " gpu1 tasks=" << tasks_per_gpu[1]);
+  REQUIRE(tasks_per_gpu.count(0));
+  REQUIRE(tasks_per_gpu.count(1));
+  REQUIRE(tasks_per_gpu.at(0) >= 1);
+  REQUIRE(tasks_per_gpu.at(1) >= 1);
 
   std::error_code ec;
   fs::remove_all(tmp, ec);

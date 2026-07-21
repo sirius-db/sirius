@@ -103,8 +103,12 @@ std::unique_ptr<cucascade::idata_representation> reconstruct_and_decompress_to_g
   simpatico::compressed_table subset =
     selected_indices.has_value()
       ? simpatico::read_compressed_table_subset_from_memory(
-          header, fetch, *selected_indices, stream,
-          rmm::mr::get_current_device_resource_ref(), &read_error)
+          header,
+          fetch,
+          *selected_indices,
+          stream,
+          rmm::mr::get_current_device_resource_ref(),
+          &read_error)
       : simpatico::read_compressed_table_from_memory(
           header, fetch, stream, rmm::mr::get_current_device_resource_ref(), &read_error);
   if (!read_error.empty()) {
@@ -130,7 +134,8 @@ std::unique_ptr<cucascade::idata_representation> reconstruct_and_decompress_to_g
     decompressed =
       simpatico::decompress(subset, n_threads, rmm::mr::get_current_device_resource_ref());
   } else {
-    decompressed = simpatico::decompress(subset, stream, rmm::mr::get_current_device_resource_ref());
+    decompressed =
+      simpatico::decompress(subset, stream, rmm::mr::get_current_device_resource_ref());
   }
 
   if (n_threads > 1) {
@@ -159,7 +164,8 @@ std::unique_ptr<cucascade::idata_representation> reconstruct_and_decompress_to_g
 std::unique_ptr<cucascade::idata_representation> decompress_host_to_gpu(
   cucascade::idata_representation& source,
   const cucascade::memory::memory_space* target_memory_space,
-  rmm::cuda_stream_view stream)
+  rmm::cuda_stream_view stream,
+  [[maybe_unused]] cucascade::memory::reservation* reservation)
 {
   auto& rep = source.cast<compressed_host_representation>();
 
@@ -179,7 +185,8 @@ std::unique_ptr<cucascade::idata_representation> decompress_host_to_gpu(
 std::unique_ptr<cucascade::idata_representation> decompress_device_to_gpu(
   cucascade::idata_representation& source,
   const cucascade::memory::memory_space* target_memory_space,
-  rmm::cuda_stream_view stream)
+  rmm::cuda_stream_view stream,
+  [[maybe_unused]] cucascade::memory::reservation* reservation)
 {
   auto& rep = source.cast<compressed_device_representation>();
 

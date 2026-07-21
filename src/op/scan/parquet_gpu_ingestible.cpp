@@ -60,10 +60,10 @@
 #include <cstdint>
 #include <filesystem>
 #include <memory>
-#include <system_error>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -80,8 +80,7 @@ std::string strip_file_uri(std::string const& p)
   if (p.size() > kFile.size()) {
     bool is_file_uri = true;
     for (std::size_t i = 0; i < kFile.size(); ++i) {
-      if (std::tolower(static_cast<unsigned char>(p[i])) !=
-          static_cast<unsigned char>(kFile[i])) {
+      if (std::tolower(static_cast<unsigned char>(p[i])) != static_cast<unsigned char>(kFile[i])) {
         is_file_uri = false;
         break;
       }
@@ -233,14 +232,6 @@ class parquet_batch_coalescer : public batch_coalescer {
     split->disable_filter_pushdown = _disable_pushdown;
     split->needs_assembly          = _needs_assembly;
     split->partition_values        = _partition_values;
-    SIRIUS_LOG_DEBUG(
-      "[coalesce-debug] parquet_batch_coalescer emit #{}: {} slice(s), output_bytes={}, "
-      "decode_working_bytes={}, cap={}",
-      ++_emit_count,
-      split->rg_slices.size(),
-      split->estimated_bytes(),
-      split->estimated_working_set_bytes(),
-      _cap);
     _slices.clear();
     _acc_working_bytes = 0;
     _acc_rows          = 0;
@@ -300,7 +291,9 @@ std::string canonical_scan_file_path(std::string const& raw)
 
 void canonicalize_scan_file_paths(std::vector<std::string>& paths)
 {
-  for (auto& p : paths) { p = canonical_scan_file_path(p); }
+  for (auto& p : paths) {
+    p = canonical_scan_file_path(p);
+  }
 }
 
 //===----------------------------------------------------------------------===//
@@ -308,20 +301,17 @@ void canonicalize_scan_file_paths(std::vector<std::string>& paths)
 //===----------------------------------------------------------------------===//
 std::vector<scan_info::fadvise_entry> parquet_file_scan_info::fadvise_entries() const
 {
-  if (!datasource || !file_metadata || !reader_options) { return {}; }
-  std::vector<cudf::size_type> rg_indices;
-  rg_indices.reserve(row_groups.size());
-  for (auto const& rg : row_groups) {
-    rg_indices.push_back(rg.index);
-  }
-  auto ranges = column_chunk_ranges(*file_metadata, *reader_options, rg_indices);
-  if (ranges.empty()) { return {}; }
-  fadvise_entry entry;
-  entry.datasource = datasource;
-  entry.ranges     = std::move(ranges);
-  std::vector<fadvise_entry> out;
-  out.push_back(std::move(entry));
-  return out;
+  if (!file_metadata || !reader_options) { return {}; }
+  std::vector<fadvise_entry> entries;
+  append_fadvise_entry(entries, datasource, [this] {
+    std::vector<cudf::size_type> rg_indices;
+    rg_indices.reserve(row_groups.size());
+    for (auto const& rg : row_groups) {
+      rg_indices.push_back(rg.index);
+    }
+    return column_chunk_ranges(*file_metadata, *reader_options, rg_indices);
+  });
+  return entries;
 }
 
 std::vector<scan_info::fadvise_entry> parquet_split_info::fadvise_entries() const
@@ -330,14 +320,10 @@ std::vector<scan_info::fadvise_entry> parquet_split_info::fadvise_entries() cons
   std::vector<fadvise_entry> entries;
   entries.reserve(rg_slices.size());
   for (auto const& slice : rg_slices) {
-    if (!slice.datasource || !slice.file_metadata) { continue; }
-    auto ranges =
-      column_chunk_ranges(*slice.file_metadata, *reader_options, slice.row_group_indices);
-    if (ranges.empty()) { continue; }
-    fadvise_entry entry;
-    entry.datasource = slice.datasource;
-    entry.ranges     = std::move(ranges);
-    entries.push_back(std::move(entry));
+    if (!slice.file_metadata) { continue; }
+    append_fadvise_entry(entries, slice.datasource, [&slice, this] {
+      return column_chunk_ranges(*slice.file_metadata, *reader_options, slice.row_group_indices);
+    });
   }
   return entries;
 }
@@ -476,9 +462,13 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
   auto stream = cudf::get_default_stream();
 
   // Resolve the file to a sirius_datasource (own io backend, prefetch cache and
-  // cached metadata). Fall back to a plain cudf datasource only for local paths
-  // no sirius backend claims.
-  std::shared_ptr<io::sirius_datasource> sirius_ds = io_ctx->open_datasource(file_path);
+  // cached metadata). The parquet_footer_probe hint collapses the S3 footer read
+  // to one suffix-range GET that resolves the size and stashes the footer, so
+  // cuDF's footer reads are served locally (no HEAD, no separate trailer/body
+  // GETs). Fall back to a plain cudf datasource only for local paths no sirius
+  // backend claims.
+  std::shared_ptr<io::sirius_datasource> sirius_ds =
+    io_ctx->open_datasource(file_path, io::open_hint::parquet_footer_probe);
   if (!sirius_ds && has_uri_scheme(file_path)) {
     throw std::runtime_error("[parquet_gpu_ingestible] no backend supports path: " + file_path);
   }

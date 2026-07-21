@@ -25,12 +25,15 @@
 #include "utils/s3_container.hpp"
 
 #include <cucascade/memory/topology_discovery.hpp>
+#include <duckdb.hpp>
 
 #include <cstdint>
 #include <cstdlib>
+#include <filesystem>
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -41,6 +44,8 @@ using sirius::io::rest::rest_ioctx;
 using sirius::scan_manager::parquet_bind_result;
 using sirius::scan_manager::scan_manager_config;
 using sirius::scan_manager::sirius_scan_manager;
+
+namespace fs = std::filesystem;
 
 std::string env_or(std::string const& name, std::string fallback = {})
 {
@@ -100,6 +105,39 @@ std::string parquet_uri(std::string const& bucket, std::string const& file_name)
   return "s3://" + bucket + "/parquet/" + file_name;
 }
 
+std::string sql_quote(std::string_view value)
+{
+  std::string out{"'"};
+  for (char c : value) {
+    if (c == '\'') { out.push_back('\''); }
+    out.push_back(c);
+  }
+  out.push_back('\'');
+  return out;
+}
+
+fs::path parquet_fixture(std::string_view file_name)
+{
+  return fs::path{SIRIUS_PROJECT_ROOT} / "test" / "cpp" / "integration" / "data" / "parquet" /
+         file_name;
+}
+
+struct duckdb_parquet_bind_shape {
+  duckdb::vector<duckdb::LogicalType> types;
+  duckdb::vector<std::string> names;
+};
+
+duckdb_parquet_bind_shape duckdb_read_parquet_shape(fs::path const& path)
+{
+  duckdb::DuckDB db(nullptr);
+  duckdb::Connection con(db);
+  auto result = con.Query("SELECT * FROM read_parquet(" + sql_quote(path.string()) + ") LIMIT 0");
+  REQUIRE(result);
+  INFO((result->HasError() ? result->GetError() : ""));
+  REQUIRE_FALSE(result->HasError());
+  return duckdb_parquet_bind_shape{result->types, result->names};
+}
+
 std::vector<std::string> bind_names(parquet_bind_result const& result)
 {
   return {result.names.begin(), result.names.end()};
@@ -121,6 +159,18 @@ void require_same_bind_result(parquet_bind_result const& lhs, parquet_bind_resul
   REQUIRE(lhs.total_num_rows == rhs.total_num_rows);
   REQUIRE(bind_names(lhs) == bind_names(rhs));
   REQUIRE(bind_type_strings(lhs) == bind_type_strings(rhs));
+}
+
+void check_bind_shape_matches_duckdb(parquet_bind_result const& actual,
+                                     duckdb_parquet_bind_shape const& expected)
+{
+  REQUIRE(actual.names == expected.names);
+  REQUIRE(actual.return_types.size() == expected.types.size());
+  for (std::size_t i = 0; i < expected.types.size(); ++i) {
+    INFO("column=" << expected.names[i] << " actual=" << actual.return_types[i].ToString()
+                   << " expected=" << expected.types[i].ToString());
+    CHECK(actual.return_types[i] == expected.types[i]);
+  }
 }
 
 rest_ioctx* require_rest_ioctx(std::shared_ptr<sirius::io::sirius_datasource> const& ds)
@@ -206,6 +256,58 @@ TEST_CASE("describe_parquet reports stable row counts for multiple S3 parquet ob
   CHECK(region.total_num_rows == 5);
   CHECK(bind_names(region) == std::vector<std::string>{"r_regionkey", "r_name", "r_comment"});
   CHECK(region.object_size > 0);
+}
+
+TEST_CASE("describe_parquet maps nested local parquet bind shape like DuckDB CPU read_parquet",
+          "[scan_manager][describe_parquet][s3][nested]")
+{
+  scan_manager_fixture fixture;
+  scan_manager_config cfg{};
+  cfg.use_sirius_datasource = true;
+  sirius_scan_manager manager{std::move(cfg), *fixture.memory, fixture.topology};
+
+  for (auto const fixture_name : {"nested_struct.parquet",
+                                  "nested_list.parquet",
+                                  "nested_map.parquet",
+                                  "nested_deep.parquet"}) {
+    auto const path     = parquet_fixture(fixture_name);
+    auto const expected = duckdb_read_parquet_shape(path);
+    auto const uri      = "file://" + path.string();
+
+    auto bind_info = manager.describe_parquet(uri);
+
+    INFO("fixture=" << fixture_name);
+    check_bind_shape_matches_duckdb(bind_info, expected);
+    CHECK(bind_info.total_num_rows > 0);
+    CHECK(bind_info.object_size > 0);
+  }
+}
+
+TEST_CASE("describe_parquet maps nested S3 parquet bind shape like DuckDB CPU read_parquet",
+          "[s3][integration][describe_parquet][nested]")
+{
+  if (!sirius::test::ensure_s3_container_env()) { return; }
+
+  auto const bucket = require_env("SIRIUS_TEST_S3_BUCKET");
+
+  scan_manager_fixture fixture;
+  sirius_scan_manager manager{make_minio_rest_config(), *fixture.memory, fixture.topology};
+
+  for (auto const fixture_name : {"nested_struct.parquet",
+                                  "nested_list.parquet",
+                                  "nested_map.parquet",
+                                  "nested_deep.parquet"}) {
+    auto const local_path = parquet_fixture(fixture_name);
+    auto const expected   = duckdb_read_parquet_shape(local_path);
+    auto const uri        = parquet_uri(bucket, fixture_name);
+
+    auto bind_info = manager.describe_parquet(uri);
+
+    INFO("fixture=" << fixture_name);
+    check_bind_shape_matches_duckdb(bind_info, expected);
+    CHECK(bind_info.total_num_rows > 0);
+    CHECK(bind_info.object_size > 0);
+  }
 }
 
 TEST_CASE("describe_parquet surfaces missing S3 parquet objects from HEAD",

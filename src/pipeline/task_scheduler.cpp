@@ -44,10 +44,9 @@ task_scheduler::task_scheduler(
   const exec::thread_pool_config& gpu_executor_config,
   sirius::memory::sirius_memory_reservation_manager& mem_mgr,
   std::shared_ptr<const telemetry::telemetry_context> telemetry_context,
-  exec::queue_ordering task_queue_ordering,
   const cucascade::memory::system_topology_info* sys_topology,
   const std::vector<std::unique_ptr<sirius::parallel::downgrade_executor>>* downgrade_executors)
-  : _task_queue(task_queue_ordering), _telemetry_context(std::move(telemetry_context))
+  : _telemetry_context(std::move(telemetry_context))
 {
   _task_queue_telemetry = std::make_unique<telemetry::TaskQueueHandleWrapper>(
     *_telemetry_context, "task-scheduler-gpu-queue", _telemetry_context->shared_group_id());
@@ -316,6 +315,10 @@ void task_scheduler::management_eventloop()
       }
     }
 
+    if (_task_queue.is_empty()) {
+      if (_task_creator) { _task_creator->schedule_lookahead(*_ready_devices.begin()); }
+    }
+
     // Matcher: for each ready device, try to find a dispatchable task.
     // A task is dispatchable to device X if:
     //   (a) its preferred_device_id == X (exact match), OR
@@ -371,10 +374,10 @@ void task_scheduler::management_eventloop()
         });
       }
 
-      // Log prefix "[mgpu-audit] pipeline_task dispatched to GPU N" is
-      // load-bearing — verification greps depend on it.
-      SIRIUS_LOG_INFO(
-        "[mgpu-audit] pipeline_task dispatched to GPU {} task_id={}", device_id, task_id);
+      // // Log prefix "[mgpu-audit] pipeline_task dispatched to GPU N" is
+      // // load-bearing — verification greps depend on it.
+      // SIRIUS_LOG_INFO(
+      //   "[mgpu-audit] pipeline_task dispatched to GPU {} task_id={}", device_id, task_id);
       _gpu_executors.at(device_id)->schedule(std::move(task));
       it = _ready_devices.erase(it);
     }

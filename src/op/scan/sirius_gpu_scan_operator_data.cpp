@@ -89,7 +89,25 @@ std::size_t scan_operator_input::get_estimated_working_set_size_in_bytes() const
     return std::get<std::unique_ptr<scan_info>>(materialization_info)
       ->estimated_working_set_bytes();
   }
-  return get_estimated_size_in_bytes();
+  auto const batch_bytes = get_estimated_size_in_bytes();
+  if (mvcc_keep_mask.has_mask()) {
+    // A masked resident chunk is filtered by copy at materialize: the input
+    // batch and the compacted output (up to input-sized) coexist at peak,
+    // alongside the BOOL8 expansion column (1 B/row) and the uploaded bitmask
+    // words. A pending row filter needs no extra headroom: its phase peaks at
+    // mask output + predicate + compacted output, inside the same envelope.
+    return 2 * batch_bytes + mvcc_keep_mask.row_count + mvcc_keep_mask.view().size_bytes();
+  }
+  if (row_filter_pending) {
+    // post_filter_and_project filters by copy: the materialized input and the
+    // compacted output (up to input-sized) coexist at peak. The BOOL8
+    // predicate column (1 B/row) hides inside the 2x conservatism (any
+    // projected column is >= 4 B/row).
+    return 2 * batch_bytes;
+  }
+  // An unmasked, unfiltered chunk serves a zero-copy view whose output copy is
+  // at most batch-sized, so plain batch_bytes stays accurate.
+  return batch_bytes;
 }
 
 }  // namespace sirius::op::scan

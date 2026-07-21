@@ -54,6 +54,10 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator>
 sirius_physical_plan_generator::create_plan(duckdb::LogicalFilter& op)
 {
   D_ASSERT(op.children.size() == 1);
+  // Reject nested filter predicates before planning the child.
+  for (auto const& predicate : op.expressions) {
+    reject_nested_column_operation(*predicate, "a filter predicate");
+  }
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> plan = create_plan(*op.children[0]);
 
   // A filter that carries a projection map drops/reorders columns on its way out. When there is a
