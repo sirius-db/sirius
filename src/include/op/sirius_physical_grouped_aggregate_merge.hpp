@@ -43,7 +43,9 @@ class sirius_physical_grouped_aggregate_merge : public sirius_physical_partition
     SiriusPhysicalOperatorType::MERGE_GROUP_BY;
 
  public:
-  sirius_physical_grouped_aggregate_merge(sirius_physical_grouped_aggregate* grouped_aggregate);
+  sirius_physical_grouped_aggregate_merge(
+    sirius_physical_grouped_aggregate* grouped_aggregate,
+    uint64_t hash_partition_bytes = config::DEFAULT_HASH_PARTITION_BYTES);
 
   sirius_physical_grouped_aggregate_merge(
     duckdb::vector<sirius::logical_type> types,
@@ -124,6 +126,9 @@ class sirius_physical_grouped_aggregate_merge : public sirius_physical_partition
   bool sink_order_dependent() const override { return false; }
 
   std::unique_ptr<operator_data> get_next_task_input_data() override;
+
+  //! Decide the partition count for the upstream PARTITION operator that feeds this merge
+  partition_strategy get_partition_strategy(const partition_sizing_input& in) override;
 
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          rmm::cuda_stream_view stream) override;

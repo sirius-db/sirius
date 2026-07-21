@@ -57,15 +57,13 @@ std::optional<std::size_t> extract_bound_ref_index(const duckdb::Expression& exp
 sirius_physical_partition::sirius_physical_partition(duckdb::vector<sirius::logical_type> types,
                                                      std::size_t estimated_cardinality,
                                                      sirius_physical_operator* key_source,
-                                                     bool is_build,
-                                                     uint64_t hash_partition_bytes)
+                                                     bool is_build)
   : sirius_physical_operator(
       SiriusPhysicalOperatorType::PARTITION, std::move(types), estimated_cardinality)
 {
-  s_partition_size = hash_partition_bytes;
-  _is_build        = is_build;
-  // Capture partition keys/types from `key_source` and discard the pointer — the tree
-  // parent is `_parent_op`, stamped later by `set_parent_ops`.
+  _is_build = is_build;
+  // Capture partition keys/types from `key_source` and, for joins, the downstream sizing consumer.
+  // The tree parent is `_parent_op`, stamped later by `set_parent_ops`.
   get_partition_keys_and_type(key_source, is_build);
   _drives_partition_count = _is_build;
 }
@@ -92,9 +90,10 @@ void sirius_physical_partition::get_partition_keys_and_type(sirius_physical_oper
                                                             bool is_build)
 {
   if (op->type == SiriusPhysicalOperatorType::HASH_JOIN) {
-    _hash_join_op      = op;  // set the hash join operator pointer for later use
-    _partition_type    = PartitionType::HASH;
-    auto& hash_join_op = op->Cast<sirius_physical_hash_join>();
+    // For a join, key_source is the join itself, which is also the downstream sizing consumer.
+    _downstream_consumer_op = op;
+    _partition_type         = PartitionType::HASH;
+    auto& hash_join_op      = op->Cast<sirius_physical_hash_join>();
     for (std::size_t cond_idx = 0; cond_idx < hash_join_op.conditions.size(); cond_idx++) {
       auto& condition = hash_join_op.conditions[cond_idx];
       if (condition.comparison != sirius::comparison_type::equal &&
@@ -126,8 +125,9 @@ void sirius_physical_partition::get_partition_keys_and_type(sirius_physical_oper
       }
     }
   } else if (op->type == SiriusPhysicalOperatorType::NESTED_LOOP_JOIN) {
-    _partition_type = PartitionType::NONE;
-    _num_partitions = 1;
+    // NLJ is the downstream sizing consumer too; it always reports a single partition.
+    _downstream_consumer_op = op;
+    _partition_type         = PartitionType::NONE;
   } else if (op->type == SiriusPhysicalOperatorType::HASH_GROUP_BY) {
     _partition_type            = PartitionType::HASH;
     auto& grouped_aggregate_op = op->Cast<sirius_physical_grouped_aggregate>();
@@ -145,6 +145,8 @@ void sirius_physical_partition::get_partition_keys_and_type(sirius_physical_oper
     //   }
     // }
   } else if (op->type == SiriusPhysicalOperatorType::MERGE_GROUP_BY) {
+    // key_source is the merge itself, which is also the downstream sizing consumer.
+    _downstream_consumer_op          = op;
     _partition_type                  = PartitionType::HASH;
     auto& grouped_aggregate_merge_op = op->Cast<sirius_physical_grouped_aggregate_merge>();
     _partition_keys                  = grouped_aggregate_merge_op.get_output_grouping_indices();
@@ -176,7 +178,10 @@ std::unique_ptr<operator_data> sirius_physical_partition::execute(const operator
   auto const& input_batch_ro = input_batches[0];
   auto* space                = input_batch_ro.get_memory_space();
 
-  if (_num_partitions.value() < 2 || _partition_keys.empty()) {
+  // Broadcast mode never hash-partitions: the build side replicates its (small) batch to every
+  // slot and the probe side streams through unpartitioned. In both cases execute() just forwards
+  // the input batches; the fan-out to slots happens in sink().
+  if (_broadcast || _num_partitions.value() < 2 || _partition_keys.empty()) {
     return std::make_unique<pipelineable_operator_data>(input.get_read_only_batches());
   }
 
@@ -220,29 +225,56 @@ void sirius_physical_partition::sink(const operator_data& input_data, rmm::cuda_
   auto& pipelineable_input  = dynamic_cast<const pipelineable_operator_data&>(input_data);
   const auto& input_batches = pipelineable_input.get_data_batches();
   (void)stream;  // sink does not use stream for push_data_batch_partitioned
-  int partition_id = 0;
-  for (auto& batch : input_batches) {
+
+  auto deposit = [&](const std::shared_ptr<cucascade::data_batch>& batch, std::size_t slot) {
     for (auto& next_port_info : next_port_after_sink) {
-      // the next operator is a partition consumer operator, so we need to push the batch into the
-      // specific partition
+      // the next operator is a partition consumer operator, so we push the batch into the slot
       auto partition_consumer_op =
         dynamic_cast<sirius_physical_partition_consumer_operator*>(next_port_info.next_operator);
-      if (partition_consumer_op) {
-        partition_consumer_op->push_data_batch_partitioned(
-          next_port_info.next_operator_port_name, batch, partition_id);
-      } else {
+      if (!partition_consumer_op) {
         throw std::runtime_error("Next operator is not a partition consumer operator");
       }
+      partition_consumer_op->push_data_batch_partitioned(
+        next_port_info.next_operator_port_name, batch, slot);
     }
+  };
+
+  if (_broadcast) {
+    // Broadcast mode (small build table replicated across GPUs):
+    //  - Build side: deposit each (zero-copy shared_ptr) batch into EVERY slot. The executor
+    //    peer-clones it onto each slot's GPU on demand at build time, non-destructively.
+    //  - Probe side: stream each batch into the slot matching its CURRENT GPU, so the per-GPU
+    //    join task finds its probe data already local (no cross-device copy).
+    auto const slots = static_cast<std::size_t>(_num_partitions.value());
+    for (auto& batch : input_batches) {
+      if (_is_build) {
+        for (std::size_t slot = 0; slot < slots; ++slot) {
+          deposit(batch, slot);
+        }
+      } else {
+        std::size_t slot = 0;
+        auto ro          = batch->to_read_only();
+        if (auto* ms = ro.get_memory_space(); ms != nullptr) {
+          slot = slot_for_device(ms->get_device_id());
+        }
+        deposit(batch, slot);
+      }
+    }
+    return;
+  }
+
+  std::size_t partition_id = 0;
+  for (auto& batch : input_batches) {
+    deposit(batch, partition_id);
     partition_id++;
   }
 }
 
-std::pair<int, uint64_t> sirius_physical_partition::determine_num_partitions()
+uint64_t sirius_physical_partition::compute_total_bytes()
 {
   if (ports.find("default") == ports.end()) {
     throw std::runtime_error(
-      "sirius_physical_partition::determine_num_partitions() did not find default repo for id " +
+      "sirius_physical_partition::compute_total_bytes() did not find default repo for id " +
       std::to_string(this->get_operator_id()));
   }
   auto& repo           = ports.at("default")->repo;
@@ -255,24 +287,24 @@ std::pair<int, uint64_t> sirius_physical_partition::determine_num_partitions()
       if (ro.get_data()) { total_bytes += ro.get_data()->get_size_in_bytes(); }
     }
   }
-  int num_partitions = static_cast<int>(std::max(
-    uint64_t{1},
-    total_bytes / s_partition_size + static_cast<uint64_t>(total_bytes % s_partition_size != 0)));
-  // Multi-GPU floor: if the input is big enough to justify using the second
-  // GPU, force at least num_gpus partitions so partition-based operators
-  // (hash_join, merge_group_by) get work on every GPU. Below the small-table
-  // threshold we keep num_partitions at its natural value — tiny tables run
-  // on a single GPU to avoid cross-device overhead.
-  if (_min_num_partitions > 1 && total_bytes >= _small_table_bytes) {
-    num_partitions = std::max(num_partitions, _min_num_partitions);
-  }
-  return std::make_pair(num_partitions, total_bytes);
+  return total_bytes;
 }
 
 void sirius_physical_partition::set_num_partitions(int num_partitions)
 {
   std::lock_guard<std::mutex> guard(lock);
   _num_partitions = num_partitions;
+}
+
+std::size_t sirius_physical_partition::slot_for_device(int device_id) const
+{
+  for (std::size_t i = 0; i < _active_gpu_ids.size(); ++i) {
+    if (_active_gpu_ids[i] == device_id) { return i; }
+  }
+  SIRIUS_LOG_WARN(
+    "slot_for_device: device_id {} not found in active GPU list, falling back to slot 0",
+    device_id);
+  return 0;
 }
 
 std::optional<task_creation_hint> sirius_physical_partition::get_next_task_hint()
@@ -318,70 +350,97 @@ std::optional<task_creation_hint> sirius_physical_partition::get_next_task_hint(
 
 std::unique_ptr<operator_data> sirius_physical_partition::get_next_task_input_data()
 {
-  // Lock both this and the sibling partition atomically to prevent ABBA deadlock:
-  // without this, two threads entering get_next_task_input_data on sibling partitions
-  // simultaneously would each hold their own lock while trying to acquire the other's.
+  // Detect whether either partition has a build-side CONCAT downstream that can fold the build side
+  // into a single batch. BUILD_PROBE mode requires exactly one build batch at runtime; the only
+  // mechanism that guarantees it is the build-side CONCAT with concat_all enabled. The consumer
+  // needs this fact to decide BUILD_PROBE eligibility, and it is partition-side wiring the consumer
+  // cannot see, so we compute it here and pass it in.
+  auto has_build_concat = [](sirius_physical_operator& part_op) {
+    for (auto& next_port : part_op.get_next_ports_after_sink()) {
+      if (next_port.next_operator->type != SiriusPhysicalOperatorType::CONCAT) { continue; }
+      auto& concat = next_port.next_operator->Cast<sirius_physical_concat>();
+      if (concat.is_build_concat()) { return true; }
+    }
+    return false;
+  };
+  // Once BUILD_PROBE is chosen, the build-side CONCAT must be told to fold all build batches into
+  // one. Either sibling may run the decision first, so both configure the build-side CONCAT.
+  // Returns whether a build-side CONCAT was found, so the caller can enforce the BUILD_PROBE
+  // invariant: BUILD_PROBE needs exactly one folded build batch at runtime, which only a
+  // concat_all'd build-side CONCAT guarantees.
+  auto enable_build_concat_all = [](sirius_physical_operator& part_op) {
+    bool found = false;
+    for (auto& next_port : part_op.get_next_ports_after_sink()) {
+      if (next_port.next_operator->type != SiriusPhysicalOperatorType::CONCAT) { continue; }
+      auto& concat = next_port.next_operator->Cast<sirius_physical_concat>();
+      if (concat.is_build_concat()) {
+        concat.set_concat_all(true);
+        found = true;
+      }
+    }
+    return found;
+  };
+
+  auto* consumer =
+    dynamic_cast<sirius_physical_partition_consumer_operator*>(_downstream_consumer_op);
+  if (consumer == nullptr) {
+    throw std::runtime_error("sirius_physical_partition id " +
+                             std::to_string(this->get_operator_id()) +
+                             " has no downstream partition-sizing consumer set");
+  }
+
+  // Lock both this and the sibling partition atomically to prevent ABBA deadlock: without this, two
+  // threads entering get_next_task_input_data on sibling partitions simultaneously would each hold
+  // their own lock while trying to acquire the other's.
   if (_sibling_partition_op) {
     auto& sibling = _sibling_partition_op->Cast<sirius_physical_partition>();
     std::scoped_lock guard(lock, sibling.lock);
     if (!_num_partitions.has_value()) {
-      auto& sizing_partition        = _drives_partition_count ? *this : sibling;
-      auto [num_parts, total_bytes] = sizing_partition.determine_num_partitions();
-      auto& hash_join               = _hash_join_op->Cast<sirius_physical_hash_join>();
-      // BUILD_PROBE mode requires the build side to deliver exactly one
-      // batch at runtime. The only mechanism that guarantees that is the
-      // build-side CONCAT with concat_all enabled. Detect whether either
-      // partition has a build-side CONCAT downstream BEFORE asking the
-      // join to consider BUILD_PROBE — without this gate, a small build
-      // side with no downstream CONCAT would enter BUILD_PROBE and then
-      // throw at runtime in get_next_task_input_data_for_build_probe when
-      // size(0) != 1.
-      auto has_build_concat = [](sirius_physical_operator& part_op) {
-        for (auto& next_port : part_op.get_next_ports_after_sink()) {
-          if (next_port.next_operator->type != SiriusPhysicalOperatorType::CONCAT) { continue; }
-          auto& concat = next_port.next_operator->Cast<sirius_physical_concat>();
-          if (concat.is_build_concat()) { return true; }
+      auto& sizing_partition = _drives_partition_count ? *this : sibling;
+      partition_sizing_input const in{sizing_partition.compute_total_bytes(),
+                                      sizing_partition._is_build,
+                                      has_build_concat(*this) || has_build_concat(sibling)};
+      // The consumer owns the decision: it computes the count / broadcast flag, updates its own
+      // execution state (e.g. hash-join BUILD_PROBE mode), and pre-sizes its own input repos.
+      auto const strategy = consumer->get_partition_strategy(in);
+      if (strategy.build_probe) {
+        // Configure both siblings' build-side CONCAT (do not short-circuit) and require that at
+        // least one build-side CONCAT exists — BUILD_PROBE cannot run without a concat_all'd build.
+        bool const found_this    = enable_build_concat_all(*this);
+        bool const found_sibling = enable_build_concat_all(sibling);
+        if (!found_this && !found_sibling) {
+          throw std::runtime_error("sirius_physical_partition id " +
+                                   std::to_string(this->get_operator_id()) +
+                                   ": BUILD_PROBE was selected but no build-side CONCAT was found "
+                                   "to fold the build into a "
+                                   "single batch (concat_all)");
         }
-        return false;
-      };
-      bool const build_foldable = has_build_concat(*this) || has_build_concat(sibling);
-      if (sizing_partition._is_build) {
-        hash_join.update_join_exec_mode(num_parts, total_bytes, build_foldable);
       }
-      if (_hash_join_op->type == SiriusPhysicalOperatorType::HASH_JOIN &&
-          hash_join.is_build_probe_mode()) {
-        // Either sibling may run this block first; configure the build-side CONCAT only.
-        auto enable_build_concat_all = [](sirius_physical_operator& part_op) {
-          for (auto& next_port : part_op.get_next_ports_after_sink()) {
-            if (next_port.next_operator->type != SiriusPhysicalOperatorType::CONCAT) { continue; }
-            auto& concat = next_port.next_operator->Cast<sirius_physical_concat>();
-            if (concat.is_build_concat()) { concat.set_concat_all(true); }
-          }
-        };
-        enable_build_concat_all(*this);
-        enable_build_concat_all(sibling);
-      }
-      _num_partitions         = num_parts;
-      sibling._num_partitions = num_parts;
+      _broadcast              = strategy.broadcast;
+      sibling._broadcast      = strategy.broadcast;
+      _num_partitions         = strategy.num_partitions;
+      sibling._num_partitions = strategy.num_partitions;
       SIRIUS_LOG_DEBUG(
-        "sirius_physical_partition id {} determined {} partitions from {} bytes on sizing id {} "
-        "({} side), sibling id {}",
+        "sirius_physical_partition id {} sized {} partitions on sizing id {} ({} side){}, sibling "
+        "id {}",
         this->get_operator_id(),
-        _num_partitions.value(),
-        total_bytes,
+        strategy.num_partitions,
         sizing_partition.get_operator_id(),
         (sizing_partition._is_build ? "build" : "probe"),
+        (strategy.broadcast ? " [broadcast]" : ""),
         _sibling_partition_op->get_operator_id());
     }
   } else {
     std::lock_guard<std::mutex> guard(lock);
     if (!_num_partitions.has_value()) {
-      auto [num_parts, total_bytes] = determine_num_partitions();
-      _num_partitions               = num_parts;
-      SIRIUS_LOG_DEBUG("sirius_physical_partition id {} determined {} partitions from {} bytes",
+      partition_sizing_input const in{compute_total_bytes(),
+                                      _is_build,
+                                      /*build_foldable=*/false};
+      auto const strategy = consumer->get_partition_strategy(in);
+      _num_partitions     = strategy.num_partitions;
+      SIRIUS_LOG_DEBUG("sirius_physical_partition id {} sized {} partitions",
                        this->get_operator_id(),
-                       _num_partitions.value(),
-                       total_bytes);
+                       strategy.num_partitions);
     }
   }
   return sirius_physical_operator::get_next_task_input_data();
