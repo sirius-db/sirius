@@ -16,6 +16,7 @@
 
 #include <catch.hpp>
 #include <duckdb.hpp>
+#include <utils/dynamic_filter_test_utils.hpp>
 #include <utils/sirius_test_env.hpp>
 #include <utils/transparent_execution_test_utils.hpp>
 
@@ -37,6 +38,25 @@ fs::path get_tpch_db_path()
   REQUIRE(fs::exists(db_path));
   return db_path;
 }
+
+//! RAII disable of the domain-coverage gate: a threshold above 1.0 is the gate's explicit
+//! disabled state (the documented rollback lever). The SET mutates the shared SiriusContext, so
+//! restoring the default is mandatory for later tests.
+struct coverage_gate_disable_guard {
+  explicit coverage_gate_disable_guard(duckdb::Connection& c) : con(c)
+  {
+    con.Query("SET dynamic_filter_domain_coverage_threshold = 2.0;");
+  }
+  ~coverage_gate_disable_guard()
+  {
+    con.Query("SET dynamic_filter_domain_coverage_threshold = 0.9;");
+  }
+
+  coverage_gate_disable_guard(const coverage_gate_disable_guard&)            = delete;
+  coverage_gate_disable_guard& operator=(const coverage_gate_disable_guard&) = delete;
+
+  duckdb::Connection& con;
+};
 
 //! RAII toggle for the opt-in zone-map kind (default off). The SET mutates the shared
 //! SiriusContext, so restoring the default is mandatory for later tests.
@@ -151,5 +171,105 @@ TEST_CASE("gpu_execution - dynamic filters over duckdb-native tables",
                        "FROM lineitem l "
                        "JOIN (SELECT o_orderkey FROM orders WHERE o_orderkey / 100 = 50) o "
                        "ON l.l_orderkey = o.o_orderkey");
+  }
+}
+
+//! T3/T4 of the R1b coverage-gate design (issue #1010): the gate fires on a domain-covering
+//! build, stays quiet on a selective one, is provably disabled above threshold 1.0, and never
+//! observes build rows above the domain bound (Invariant N). Both gate queries share one shape:
+//! GROUP BY p_partkey proves the build key unique structurally -- the integration schema declares
+//! no PRIMARY KEYs -- which arms the gate, and the lineage walk resolves the key through the
+//! aggregate to the native part scan, whose row upper bound is the domain.
+//!
+//! Deterministic-policy counters are asserted as exact deltas; `filters_pushed` (opportunistic)
+//! only directionally. The positive `filters_pushed` delta is still deterministic for this
+//! single-join shape: the publisher runs during the build sink, before probe-side task creation,
+//! so the join's own targets cannot have drained.
+TEST_CASE("gpu_execution - dynamic-filter domain-coverage gate",
+          "[integration][gpu_execution][dynamic_filter]")
+{
+  REQUIRE(sirius::test::g_integration_env != nullptr);
+  if (!sirius::test::g_integration_env->is_active()) { sirius::test::g_integration_env->resume(); }
+  auto con = sirius::test::g_integration_env->make_connection();
+
+  auto db_path = get_tpch_db_path();
+  auto r       = con.Query("ATTACH IF NOT EXISTS '" + db_path.string() + "' AS tpch (READ_ONLY);");
+  REQUIRE(r);
+  REQUIRE_FALSE(r->HasError());
+  r = con.Query("USE tpch;");
+  REQUIRE(r);
+  REQUIRE_FALSE(r->HasError());
+
+  // The build predicate retains every part row, so the build covers its whole key domain; the
+  // predicate still lands as a table filter on the part scan, which is what makes DuckDB record
+  // the join-filter hint that wires publication.
+  std::string const covering_query =
+    "SELECT count(*) "
+    "FROM lineitem JOIN (SELECT p_partkey FROM part WHERE p_partkey > 0 GROUP BY p_partkey) p "
+    "ON l_partkey = p_partkey";
+  std::string const selective_query =
+    "SELECT count(*) "
+    "FROM lineitem JOIN (SELECT p_partkey FROM part WHERE p_size = 15 "
+    "AND p_container = 'SM BOX' GROUP BY p_partkey) p "
+    "ON l_partkey = p_partkey";
+
+  SECTION("a domain-covering build publishes nothing")
+  {
+    auto const before = sirius::test::get_dynamic_filter_stats_snapshot(con);
+    compare_gpu_vs_cpu(con, covering_query);
+    auto const after = sirius::test::get_dynamic_filter_stats_snapshot(con);
+
+    REQUIRE(after.keys_with_known_domain > before.keys_with_known_domain);  // the trace resolved
+    REQUIRE(after.keys_skipped_domain_gate > before.keys_skipped_domain_gate);  // the gate fired
+    REQUIRE(after.filters_pushed == before.filters_pushed);  // and nothing was published
+    REQUIRE(after.publications_failed == before.publications_failed);
+    REQUIRE(after.keys_build_exceeded_domain == before.keys_build_exceeded_domain);
+  }
+
+  SECTION("a selective build publishes normally")
+  {
+    auto const before = sirius::test::get_dynamic_filter_stats_snapshot(con);
+    compare_gpu_vs_cpu(con, selective_query);
+    auto const after = sirius::test::get_dynamic_filter_stats_snapshot(con);
+
+    REQUIRE(after.keys_with_known_domain > before.keys_with_known_domain);
+    REQUIRE(after.keys_skipped_domain_gate == before.keys_skipped_domain_gate);
+    REQUIRE(after.filters_pushed > before.filters_pushed);
+    REQUIRE(after.keys_build_exceeded_domain == before.keys_build_exceeded_domain);
+  }
+
+  SECTION("threshold 2.0 disables the gate and restores publish-always behavior")
+  {
+    coverage_gate_disable_guard gate_off(con);
+    auto const before = sirius::test::get_dynamic_filter_stats_snapshot(con);
+    compare_gpu_vs_cpu(con, covering_query);
+    auto const after = sirius::test::get_dynamic_filter_stats_snapshot(con);
+
+    REQUIRE(after.keys_with_known_domain > before.keys_with_known_domain);
+    REQUIRE(after.keys_skipped_domain_gate == before.keys_skipped_domain_gate);
+    REQUIRE(after.filters_pushed > before.filters_pushed);
+  }
+
+  SECTION("Invariant N holds across the suite's join shapes at the default threshold")
+  {
+    // keys_build_exceeded_domain counts build rows above the domain bound regardless of gate
+    // outcome or threshold, so a single increment means the walk accepted an amplifying shape or
+    // the evidence source over-promised -- across whatever plans these queries produce, not just
+    // the shapes T1 enumerates.
+    auto const before = sirius::test::get_dynamic_filter_stats_snapshot(con);
+    compare_gpu_vs_cpu(con, covering_query);
+    compare_gpu_vs_cpu(con, selective_query);
+    compare_gpu_vs_cpu(con,
+                       "SELECT count(*), min(l_orderkey), max(l_orderkey) "
+                       "FROM lineitem JOIN part ON l_partkey = p_partkey "
+                       "WHERE p_size = 15 AND p_container = 'SM BOX'");
+    compare_gpu_vs_cpu(con,
+                       "SELECT count(*), sum(l.l_orderkey) "
+                       "FROM lineitem l "
+                       "JOIN (SELECT o_orderkey FROM orders WHERE o_orderkey / 100 = 50) o "
+                       "ON l.l_orderkey = o.o_orderkey");
+    auto const after = sirius::test::get_dynamic_filter_stats_snapshot(con);
+
+    REQUIRE(after.keys_build_exceeded_domain == before.keys_build_exceeded_domain);
   }
 }

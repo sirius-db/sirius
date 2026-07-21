@@ -157,6 +157,36 @@ TEST_CASE("domain-coverage gate is disabled for an untraceable key domain",
     domain_coverage_gate_fires(1'000'000, 0, /*build_key_proven_unique=*/true, kThreshold));
 }
 
+TEST_CASE("domain-coverage gate fires only for proven-unique keys",
+          "[dynamic_filter][source_policy]")
+{
+  // For a duplicate key the ratio measures row retention, not coverage: 900k build rows out of a
+  // 1M-row table can all carry one key value, and suppressing that one-value membership test
+  // would be the worst possible over-fire. A non-unique key therefore never fires -- at 0.9, at
+  // full retention, or beyond it -- while the same ratios fire for a proven-unique key.
+  REQUIRE_FALSE(domain_coverage_gate_fires(900'000, 1'000'000, false, 0.9));
+  REQUIRE_FALSE(domain_coverage_gate_fires(1'000'000, 1'000'000, false, 0.9));
+  REQUIRE_FALSE(domain_coverage_gate_fires(2'000'000, 1'000'000, false, 0.9));
+  REQUIRE(domain_coverage_gate_fires(900'000, 1'000'000, true, 0.9));
+  // Below threshold nothing fires either way.
+  REQUIRE_FALSE(domain_coverage_gate_fires(100, 1'000'000, true, 0.9));
+}
+
+TEST_CASE("domain-coverage gate treats a threshold above 1.0 as disabled outright",
+          "[dynamic_filter][source_policy]")
+{
+  // The early return is contract, not arithmetic accident: at 2.0 the gate returns false for
+  // EVERY input -- including build rows beyond the domain bound (which under upper-bound evidence
+  // signals a defect counted separately, never a legitimate gate decision) and proven uniqueness
+  // both ways. This is the documented rollback lever.
+  REQUIRE_FALSE(domain_coverage_gate_fires(2'000'000, 1'000'000, true, 2.0));
+  REQUIRE_FALSE(domain_coverage_gate_fires(2'000'000, 1'000'000, false, 2.0));
+  REQUIRE_FALSE(domain_coverage_gate_fires(1'000'000, 1'000'000, true, 1.5));
+  // Exactly 1.0 is NOT disabled: it fires only at full coverage of a proven-unique key.
+  REQUIRE(domain_coverage_gate_fires(100, 100, true, 1.0));
+  REQUIRE_FALSE(domain_coverage_gate_fires(99, 100, true, 1.0));
+}
+
 TEST_CASE("zone-map range gate fires at and above its threshold", "[dynamic_filter][source_policy]")
 {
   // The span is inclusive of both bounds: [10, 59] covers 50 of the 100 domain values, so the

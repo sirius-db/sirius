@@ -138,8 +138,13 @@ struct operator_params {
   /// clustered-keyset joins whose narrow key range is runtime-determined.
   bool enable_dynamic_zone_map_filter = false;
 
-  /// Skip publishing a key's dynamic filters when the build covers at least this fraction of the
-  /// key's domain (rows gate and zone-map range gate). Values >= 1.0 effectively disable the gate.
+  /// Skip publishing a key's membership filter when the build covers at least this fraction of
+  /// the key's unfiltered base-table row bound. The gate fires only for build keys proven unique
+  /// in their base relation, with evidence from DuckDB-native table scans; everywhere else it is
+  /// inert and the key publishes normally. A value above 1.0 is the explicit disabled state (the
+  /// rollback lever); exactly 1.0 fires only at full coverage. The zone-map range gate receives
+  /// no domain -- its activation awaits base-column value-range evidence -- so this setting
+  /// currently governs the membership gate only.
   double dynamic_filter_domain_coverage_threshold = 0.9;
 
   /// Consumer-side scan gate: disable a scan's post-decode dynamic filtering once a measured split
