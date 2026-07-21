@@ -1769,7 +1769,7 @@ static unique_ptr<FunctionData> SiriusVectorJoinBind(ClientContext& context,
   req.corpus_vector_column = input.inputs[3].ToString();
 
   // Optional params' default values
-  req.metric              = "l2sq";
+  req.metric              = "l2";
   req.k                   = 10;
   std::string schema_name = "main";
   std::vector<std::string> probe_out_arg, corpus_out_arg;
@@ -1782,6 +1782,18 @@ static unique_ptr<FunctionData> SiriusVectorJoinBind(ClientContext& context,
       req.k = kv.second.GetValue<int64_t>();
     } else if (key == "metric") {
       req.metric = StringUtil::Lower(kv.second.ToString());
+    } else if (key == "mode") {
+      auto const mode = StringUtil::Lower(kv.second.ToString());
+      if (mode == "global") {
+        req.global = true;
+      } else if (mode == "per_row") {
+        req.global = false;
+      } else {
+        throw BinderException("sirius_knn_join: mode must be 'per_row' or 'global', got '" + mode +
+                              "'");
+      }
+    } else if (key == "threshold") {
+      req.threshold = static_cast<float>(kv.second.GetValue<double>());
     } else if (key == "schema_name") {
       schema_name = kv.second.ToString();
     } else if (key == "probe_output_columns") {
@@ -1795,8 +1807,8 @@ static unique_ptr<FunctionData> SiriusVectorJoinBind(ClientContext& context,
     }
   }
   if (req.k <= 0) { throw BinderException("sirius_knn_join: k must be >= 1"); }
-  if (req.metric != "l2sq" && req.metric != "cosine") {
-    throw BinderException("sirius_knn_join: metric must be one of 'l2sq', 'cosine', got '" +
+  if (req.metric != "l2" && req.metric != "cosine") {
+    throw BinderException("sirius_knn_join: metric must be one of 'l2', 'cosine', got '" +
                           req.metric + "'");
   }
 
@@ -1806,15 +1818,20 @@ static unique_ptr<FunctionData> SiriusVectorJoinBind(ClientContext& context,
   auto resolve_and_emit = [&](const std::string& raw_table,
                               const std::string& vec_col,
                               const std::vector<std::string>& out_arg,
+                              std::string& resolved_catalog,
+                              std::string& resolved_schema,
                               std::string& resolved_name,
                               int64_t& dim,
                               std::vector<std::string>& out_req) {
     auto const qname          = QualifiedName::Parse(raw_table);
     std::string const catalog = qname.catalog;
     std::string const schema  = !qname.schema.empty() ? qname.schema : schema_name;
-    auto& entry = Catalog::GetEntry(context, CatalogType::TABLE_ENTRY, catalog, schema, qname.name)
-                    .Cast<DuckTableEntry>();
-    resolved_name           = entry.name;
+    std::string const& table  = qname.name;
+    auto& entry_base = Catalog::GetEntry(context, CatalogType::TABLE_ENTRY, catalog, schema, table);
+    auto& entry      = entry_base.Cast<DuckTableEntry>();
+    resolved_catalog = entry.ParentCatalog().GetName();
+    resolved_schema  = entry.ParentSchema().name;
+    resolved_name    = entry.name;
     auto const& columns     = entry.GetColumns();
     auto const schema_names = columns.GetColumnNames();
     auto const schema_types = columns.GetColumnTypes();
@@ -1848,12 +1865,16 @@ static unique_ptr<FunctionData> SiriusVectorJoinBind(ClientContext& context,
   resolve_and_emit(req.probe_table,
                    req.probe_vector_column,
                    probe_out_arg,
+                   req.probe_catalog,
+                   req.probe_schema,
                    req.probe_table,
                    probe_dim,
                    req.probe_output_columns);
   resolve_and_emit(req.corpus_table,
                    req.corpus_vector_column,
                    corpus_out_arg,
+                   req.corpus_catalog,
+                   req.corpus_schema,
                    req.corpus_table,
                    corpus_dim,
                    req.corpus_output_columns);
@@ -2013,7 +2034,7 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
   catalog.CreateTableFunction(transaction, vector_search_info);
 
   // sirius_knn_join(probe_table, probe_col, corpus_table, corpus_col, k =>, metric =>,
-  // probe_output_columns =>, corpus_output_columns =>, schema_name =>)
+  //   mode =>, threshold =>, probe_output_columns =>, corpus_output_columns =>, schema_name =>)
   TableFunction vector_join(
     "sirius_knn_join",
     {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
@@ -2022,6 +2043,8 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
     SiriusVectorJoinInit);
   vector_join.named_parameters["k"]                     = LogicalType::BIGINT;
   vector_join.named_parameters["metric"]                = LogicalType::VARCHAR;
+  vector_join.named_parameters["mode"]                  = LogicalType::VARCHAR;
+  vector_join.named_parameters["threshold"]             = LogicalType::DOUBLE;
   vector_join.named_parameters["probe_output_columns"]  = LogicalType::LIST(LogicalType::VARCHAR);
   vector_join.named_parameters["corpus_output_columns"] = LogicalType::LIST(LogicalType::VARCHAR);
   vector_join.named_parameters["schema_name"]           = LogicalType::VARCHAR;

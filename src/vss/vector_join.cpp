@@ -25,11 +25,14 @@
 #include "vss/distance_metric.hpp"
 #include "vss/pinned_column.hpp"
 
+#include <cudf/binaryop.hpp>
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/concatenate.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/filling.hpp>
+#include <cudf/scalar/scalar.hpp>
+#include <cudf/sorting.hpp>
 #include <cudf/stream_compaction.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
@@ -69,7 +72,7 @@ struct join_context {
 };
 
 /// Move a GPU result table to a host_data_representation the table function can stream out.
-std::unique_ptr<cucascade::host_data_representation> join_result_to_host(
+std::unique_ptr<cucascade::host_data_representation> join_result_d2h(
   const join_context& c, std::unique_ptr<cudf::table> table)
 {
   cucascade::gpu_table_representation gpu_repr(std::move(table), c.space, c.stream);
@@ -80,9 +83,9 @@ std::unique_ptr<cucascade::host_data_representation> join_result_to_host(
 }
 
 /// Positions of [vec_col, out_cols...] within the pinned column layout on host.
-std::vector<std::size_t> pinned_column_indices(const scan_manager::pinned_entry& pin,
-                                               const std::string& vec_col,
-                                               const std::vector<std::string>& out_cols)
+std::vector<std::size_t> get_pinned_column_indices(const scan_manager::pinned_entry& pin,
+                                                   const std::string& vec_col,
+                                                   const std::vector<std::string>& out_cols)
 {
   auto const& names = pin.cache_info.column_names();
   auto index_of     = [&](const std::string& name) -> std::size_t {
@@ -225,7 +228,8 @@ std::unique_ptr<cudf::table> assemble_corpus_h2d(const scan_manager::pinned_entr
                                                  ccm::memory_space& gpu_space,
                                                  const join_context& c)
 {
-  // TODO: skip the intermediate and comptue the toal row count upfront, allocate one contiguous target table and upload each chunk directly into it
+  // TODO: skip the intermediate and compute the total row count upfront, allocate one contiguous
+  // target table and upload each chunk directly into it
   std::vector<std::unique_ptr<cudf::table>> uploaded;
   uploaded.reserve(pin.host_chunks.size());
   for (auto const& chunk : pin.host_chunks) {
@@ -242,6 +246,41 @@ std::unique_ptr<cudf::table> assemble_corpus_h2d(const scan_manager::pinned_entr
     views.push_back(t->view());
   }
   return cudf::concatenate(views, c.stream, c.mr);
+}
+
+/// Keep only rows whose trailing distance column is <= @p threshold.
+std::unique_ptr<cudf::table> filter_by_threshold(std::unique_ptr<cudf::table> table,
+                                                 float threshold,
+                                                 const join_context& c)
+{
+  auto const dist = table->view().column(table->num_columns() - 1);
+  cudf::numeric_scalar<float> eps{threshold, true, c.stream};
+  auto mask = cudf::binary_operation(dist,
+                                     eps,
+                                     cudf::binary_operator::LESS_EQUAL,
+                                     cudf::data_type{cudf::type_id::BOOL8},
+                                     c.stream,
+                                     c.mr);
+  return cudf::apply_boolean_mask(table->view(), mask->view(), c.stream, c.mr);
+}
+
+/// Reduce per-row candidates to the @p k pairs with globally smallest distance.
+std::unique_ptr<cudf::table> take_global_top_k(std::unique_ptr<cudf::table> table,
+                                               std::int64_t k,
+                                               const join_context& c)
+{
+  auto const view      = table->view();
+  auto const& dist_col = view.column(view.num_columns() - 1);
+  auto order           = cudf::sorted_order(cudf::table_view{{dist_col}},
+                                            {cudf::order::ASCENDING},
+                                            {cudf::null_order::AFTER},
+                                  c.stream,
+                                  c.mr);
+  auto sorted =
+    cudf::gather(view, order->view(), cudf::out_of_bounds_policy::DONT_CHECK, c.stream, c.mr);
+  auto const n   = static_cast<cudf::size_type>(std::min<std::int64_t>(k, sorted->num_rows()));
+  auto const top = cudf::slice(sorted->view(), {0, n}, c.stream).front();
+  return std::make_unique<cudf::table>(top, c.stream, c.mr);
 }
 
 }  // namespace
@@ -272,8 +311,10 @@ std::unique_ptr<cucascade::host_data_representation> run_vector_join(duckdb::Sir
   // The join reads from pinned tables: the corpus must be GPU-resident; the probe is streamed.
   // GPU-resident: iterated in place
   // HOST-pinned: uploaded chunk by chunk
-  auto const* probe_pin  = ctx.get_scan_manager().find_pinned_entry(req.probe_table);
-  auto const* corpus_pin = ctx.get_scan_manager().find_pinned_entry(req.corpus_table);
+  auto const* probe_pin = ctx.get_scan_manager().find_pinned_entry_for_duckdb_table(
+    req.probe_catalog, req.probe_schema, req.probe_table);
+  auto const* corpus_pin = ctx.get_scan_manager().find_pinned_entry_for_duckdb_table(
+    req.corpus_catalog, req.corpus_schema, req.corpus_table);
   if (probe_pin == nullptr) {
     throw duckdb::InvalidInputException("sirius_knn_join: probe table '" + req.probe_table +
                                         "' must be pinned (pin_table on the GPU or HOST tier)");
@@ -283,7 +324,7 @@ std::unique_ptr<cucascade::host_data_representation> run_vector_join(duckdb::Sir
                                         "' must be pinned (pin_table on the GPU or HOST tier)");
   }
   if (probe_pin->num_rows == 0 || corpus_pin->num_rows == 0) {
-    return join_result_to_host(c, make_empty_join_output(*probe_pin, *corpus_pin, req, c));
+    return join_result_d2h(c, make_empty_join_output(*probe_pin, *corpus_pin, req, c));
   }
 
   // --- Corpus residency (size-driven; the 3-case cascade) ---
@@ -295,7 +336,7 @@ std::unique_ptr<cucascade::host_data_representation> run_vector_join(duckdb::Sir
     corpus = make_corpus_contiguous_on_device(*corpus_pin, req, *space, c);
   } else if (corpus_pin->tier == ccm::Tier::HOST) {
     auto const col_idx =
-      pinned_column_indices(*corpus_pin, req.corpus_vector_column, req.corpus_output_columns);
+      get_pinned_column_indices(*corpus_pin, req.corpus_vector_column, req.corpus_output_columns);
     auto const bytes = host_columns_bytes(*corpus_pin, col_idx);
     auto const avail = space->get_available_memory();
     SIRIUS_LOG_DEBUG("sirius_knn_join: corpus '{}' on HOST; need {} Bytes, GPU available {} Bytes",
@@ -322,7 +363,7 @@ std::unique_ptr<cucascade::host_data_representation> run_vector_join(duckdb::Sir
   }
   auto const corpus_view = corpus->view();
   if (corpus_view.num_rows() == 0) {
-    return join_result_to_host(c, make_empty_join_output(*probe_pin, *corpus_pin, req, c));
+    return join_result_d2h(c, make_empty_join_output(*probe_pin, *corpus_pin, req, c));
   }
   auto const k_eff = std::min<int64_t>(corpus_view.num_rows(), req.k);
 
@@ -377,7 +418,10 @@ std::unique_ptr<cucascade::host_data_representation> run_vector_join(duckdb::Sir
       out_cols.push_back(std::move(col));
     }
     out_cols.push_back(std::move(knn.distances));
-    results.push_back(std::make_unique<cudf::table>(std::move(out_cols)));
+    auto chunk_out = std::make_unique<cudf::table>(std::move(out_cols));
+    if (req.threshold) { chunk_out = filter_by_threshold(std::move(chunk_out), *req.threshold, c); }
+    if (chunk_out->num_rows() == 0) { return; }
+    results.push_back(std::move(chunk_out));
   };
 
   // --- Probe: iterate resident chunks, or stream host chunks up per batch ---
@@ -408,7 +452,7 @@ std::unique_ptr<cucascade::host_data_representation> run_vector_join(duckdb::Sir
     }
   } else if (probe_pin->tier == ccm::Tier::HOST) {
     auto const col_idx =
-      pinned_column_indices(*probe_pin, req.probe_vector_column, req.probe_output_columns);
+      get_pinned_column_indices(*probe_pin, req.probe_vector_column, req.probe_output_columns);
     auto const n_chunks = probe_pin->host_chunks.size();
     SIRIUS_LOG_DEBUG("sirius_knn_join: streaming probe '{}' from HOST ({} chunks, {} rows)",
                      req.probe_table,
@@ -432,16 +476,23 @@ std::unique_ptr<cucascade::host_data_representation> run_vector_join(duckdb::Sir
   }
 
   if (results.empty()) {
-    return join_result_to_host(c, make_empty_join_output(*probe_pin, *corpus_pin, req, c));
+    return join_result_d2h(c, make_empty_join_output(*probe_pin, *corpus_pin, req, c));
   }
-  if (results.size() == 1) { return join_result_to_host(c, std::move(results.front())); }
 
-  std::vector<cudf::table_view> views;
-  views.reserve(results.size());
-  for (auto const& t : results) {
-    views.push_back(t->view());
+  std::unique_ptr<cudf::table> joined;
+  if (results.size() == 1) {
+    joined = std::move(results.front());
+  } else {
+    std::vector<cudf::table_view> views;
+    views.reserve(results.size());
+    for (auto const& t : results) {
+      views.push_back(t->view());
+    }
+    joined = cudf::concatenate(views, stream, mr);
   }
-  return join_result_to_host(c, cudf::concatenate(views, stream, mr));
+
+  if (req.global) { joined = take_global_top_k(std::move(joined), req.k, c); }
+  return join_result_d2h(c, std::move(joined));
 }
 
 }  // namespace sirius::vss

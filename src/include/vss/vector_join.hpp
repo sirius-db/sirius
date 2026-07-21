@@ -18,6 +18,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -34,13 +35,19 @@ namespace sirius::vss {
 /// k-NN (top-k) similarity join: for every row of @c probe_table, find its
 /// @c k nearest rows in @c corpus_table under @c metric on the vector columns.
 struct vector_join_request {
-  std::string probe_table;                         ///< Table being iterated against corpus.
-  std::string probe_vector_column;                 ///< FLOAT[dim] vector column on the probe.
-  std::string corpus_table;                        ///< Table being searched for neighbors.
-  std::string corpus_vector_column;                ///< FLOAT[dim] vector column on the corpus.
-  std::string metric;                              ///< Distance metric.
-  std::int64_t dim{0};                             ///< vector dimensionality.
-  std::int64_t k{10};                              ///< Neighbors per probe row.
+  std::string probe_catalog;         ///< Resolved catalog of the probe table.
+  std::string probe_schema;          ///< Resolved schema of the probe table.
+  std::string probe_table;           ///< Table being iterated against corpus.
+  std::string probe_vector_column;   ///< FLOAT[dim] vector column on the probe.
+  std::string corpus_catalog;        ///< Resolved catalog of the corpus table.
+  std::string corpus_schema;         ///< Resolved schema of the corpus table.
+  std::string corpus_table;          ///< Table being searched for neighbors.
+  std::string corpus_vector_column;  ///< FLOAT[dim] vector column on the corpus.
+  std::string metric;                ///< Distance metric.
+  std::int64_t dim{0};               ///< vector dimensionality.
+  std::int64_t k{10};                ///< Neighbors per probe row, or global cap.
+  bool global{false};                ///< true = global top-k pairs; false = per probe row.
+  std::optional<float> threshold;    ///< If set, drop pairs where distance > threshold.
   std::vector<std::string> probe_output_columns;   ///< Probe columns to emit (in order).
   std::vector<std::string> corpus_output_columns;  ///< Corpus columns to emit (in order).
 };
