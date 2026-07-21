@@ -290,12 +290,20 @@ bool compress_and_stage_batch(cudf::table const& tbl,
   const int n_threads = std::min(compression.column_threads, tbl.num_columns());
   simpatico::stream_pool comp_pool;
   const bool parallel = n_threads > 1 && comp_pool.init(static_cast<std::size_t>(n_threads));
-  auto ct             = parallel ? simpatico::compress_with_plan(tbl.view(),
+  // `tbl` was decoded on `stream` (the caller's materialize stream). The parallel
+  // compress runs each column on its own pool stream, which is NOT ordered after
+  // `stream`, so without a barrier the compress kernels could read the table's
+  // buffers while the decode is still writing them. Synchronize `stream` first so
+  // the table is fully resident before the pool streams read it (mirrors the
+  // parallel decompress path in compression_converters.cpp). The serial branch runs
+  // on `stream` itself, so it is stream-ordered and needs no barrier.
+  if (parallel) { stream.synchronize(); }
+  auto ct = parallel ? simpatico::compress_with_plan(tbl.view(),
                                                      compression.plan_dsl,
                                                      comp_pool,
                                                      rmm::mr::get_current_device_resource_ref(),
                                                      compression.column_names)
-                                 : simpatico::compress_with_plan(tbl.view(),
+                     : simpatico::compress_with_plan(tbl.view(),
                                                      compression.plan_dsl,
                                                      stream,
                                                      rmm::mr::get_current_device_resource_ref(),
