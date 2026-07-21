@@ -17,7 +17,9 @@ use crate::error::{Result, TranslateError};
 use crate::expr_translator::{self, ExprContext, TranslateExpr};
 use crate::scan_paths::ScanFilePaths;
 use crate::type_mapper;
-use crate::{ExtensionRegistry, URN_AGGREGATE, URN_ARITHMETIC, URN_BOOLEAN, URN_COMPARISON};
+use crate::{
+    ExchangeInput, ExtensionRegistry, URN_AGGREGATE, URN_ARITHMETIC, URN_BOOLEAN, URN_COMPARISON,
+};
 
 /// Partially translated relation plus the StarRocks row layout it emits.
 pub(crate) struct TranslatedRel {
@@ -48,6 +50,8 @@ struct PlanContext<'a> {
     /// scan ranges. Scans with paths emit a `local_files` read; path-less scans
     /// fall back to a named-table read.
     scan_paths: &'a ScanFilePaths,
+    /// Materialized same-node inputs keyed by receiver exchange node id.
+    exchange_inputs: &'a std::collections::HashMap<i32, &'a ExchangeInput>,
     /// Substrait extension registry shared across the whole plan.
     registry: &'a mut ExtensionRegistry,
 }
@@ -57,11 +61,13 @@ impl<'a> PlanContext<'a> {
     fn new(
         desc: &'a DescriptorTable,
         scan_paths: &'a ScanFilePaths,
+        exchange_inputs: &'a std::collections::HashMap<i32, &'a ExchangeInput>,
         registry: &'a mut ExtensionRegistry,
     ) -> Self {
         Self {
             desc,
             scan_paths,
+            exchange_inputs,
             registry,
         }
     }
@@ -155,6 +161,7 @@ fn translate_plan_node(
         TPlanNodeType::SORT_NODE => translate_sort(node, children, ctx),
         TPlanNodeType::HASH_JOIN_NODE => translate_hash_join(node, children, ctx),
         TPlanNodeType::NESTLOOP_JOIN_NODE => translate_nestloop_join(node, children, ctx),
+        TPlanNodeType::EXCHANGE_NODE => translate_exchange(node, children, ctx),
         _ => Err(TranslateError::UnsupportedPlanNode {
             node_id: node.node_id,
             node_type: node.node_type,
@@ -176,6 +183,11 @@ fn apply_fetch(input: TranslatedRel, node: &TPlanNode) -> TranslatedRel {
         .sort_node
         .as_ref()
         .and_then(|sort| sort.offset)
+        .or_else(|| {
+            node.exchange_node
+                .as_ref()
+                .and_then(|exchange| exchange.offset)
+        })
         .unwrap_or(0);
     if node.limit < 0 && offset == 0 {
         return input;
@@ -295,10 +307,68 @@ pub(crate) fn translate_plan(
     plan: &TPlan,
     desc: &DescriptorTable,
     scan_paths: &ScanFilePaths,
+    exchange_inputs: &std::collections::HashMap<i32, &ExchangeInput>,
     registry: &mut ExtensionRegistry,
 ) -> Result<TranslatedRel> {
-    let mut ctx = PlanContext::new(desc, scan_paths, registry);
+    let mut ctx = PlanContext::new(desc, scan_paths, exchange_inputs, registry);
     plan.translate(&mut ctx)
+}
+
+/// Replaces a receiver exchange boundary with a read of its fully materialized sender output.
+fn translate_exchange(
+    node: &TPlanNode,
+    children: Vec<TranslatedRel>,
+    ctx: &mut PlanContext<'_>,
+) -> Result<TranslatedRel> {
+    expect_children(node, &children, 0)?;
+    let exchange = node
+        .exchange_node
+        .as_ref()
+        .ok_or(TranslateError::MissingField {
+            context: "EXCHANGE_NODE",
+            field: "exchange_node",
+        })?;
+    if exchange.sort_info.is_some() {
+        return Err(TranslateError::UnsupportedPlanNode {
+            node_id: node.node_id,
+            node_type: node.node_type,
+            reason: "merging exchanges are not supported by sequential execution",
+        });
+    }
+    if exchange.input_row_tuples.is_empty() {
+        return Err(TranslateError::MissingField {
+            context: "TExchangeNode",
+            field: "input_row_tuples",
+        });
+    }
+    let input =
+        ctx.exchange_inputs
+            .get(&node.node_id)
+            .ok_or(TranslateError::UnsupportedPlanNode {
+                node_id: node.node_id,
+                node_type: node.node_type,
+                reason: "exchange node requires a materialized same-node input",
+            })?;
+    if input.paths.is_empty() {
+        return Err(TranslateError::malformed(format!(
+            "exchange node {} has no materialized input files",
+            node.node_id
+        )));
+    }
+    let schema = ctx
+        .desc
+        .named_struct_for_tuples(&exchange.input_row_tuples, Some(&input.names))?;
+    let output_width = schema
+        .r#struct
+        .as_ref()
+        .map(|structure| structure.types.len())
+        .unwrap_or(0);
+    let translated = TranslatedRel {
+        rel: local_files_rel(schema, &input.paths),
+        row_tuples: exchange.input_row_tuples.clone(),
+        output_width,
+    };
+    apply_conjuncts(translated, node, ctx)
 }
 
 /// Translates a one-phase `AGGREGATION_NODE` into a Substrait aggregate relation.
@@ -859,17 +929,7 @@ fn scan_rel(desc: &DescriptorTable, tuple_id: i32, file_paths: &[String]) -> Res
             ..Default::default()
         })
     } else {
-        ReadType::LocalFiles(LocalFiles {
-            items: file_paths
-                .iter()
-                .map(|path| FileOrFiles {
-                    path_type: Some(PathType::UriFile(path.clone())),
-                    file_format: Some(FileFormat::Parquet(ParquetReadOptions {})),
-                    ..Default::default()
-                })
-                .collect(),
-            ..Default::default()
-        })
+        return Ok(local_files_rel(desc.named_struct(tuple_id)?, file_paths));
     };
     Ok(Rel {
         rel_type: Some(rel::RelType::Read(Box::new(ReadRel {
@@ -878,6 +938,27 @@ fn scan_rel(desc: &DescriptorTable, tuple_id: i32, file_paths: &[String]) -> Res
             ..Default::default()
         }))),
     })
+}
+
+/// Builds a local parquet read with an explicit schema.
+fn local_files_rel(schema: substrait::proto::NamedStruct, file_paths: &[String]) -> Rel {
+    Rel {
+        rel_type: Some(rel::RelType::Read(Box::new(ReadRel {
+            base_schema: Some(schema),
+            read_type: Some(ReadType::LocalFiles(LocalFiles {
+                items: file_paths
+                    .iter()
+                    .map(|path| FileOrFiles {
+                        path_type: Some(PathType::UriFile(path.clone())),
+                        file_format: Some(FileFormat::Parquet(ParquetReadOptions {})),
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..Default::default()
+            })),
+            ..Default::default()
+        }))),
+    }
 }
 
 /// Translates a StarRocks project node while preserving descriptor output order.
@@ -937,7 +1018,8 @@ pub(crate) fn project_exprs(
     // Root projections evaluate over already-translated inputs, so there are no
     // scan nodes to resolve file paths for.
     let scan_paths = ScanFilePaths::default();
-    let mut ctx = PlanContext::new(desc, &scan_paths, registry);
+    let exchange_inputs = std::collections::HashMap::new();
+    let mut ctx = PlanContext::new(desc, &scan_paths, &exchange_inputs, registry);
     project_exprs_with_context(input, exprs, &mut ctx)
 }
 
