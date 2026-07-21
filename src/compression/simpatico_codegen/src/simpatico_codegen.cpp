@@ -115,7 +115,7 @@ void run_column_workers(size_t n_items, stream_pool& pool, Body&& body)
 {
   std::atomic<size_t> next{0};
   std::atomic<bool> failed{false};
-  std::string err_msg;
+  std::exception_ptr first_exception;
   std::mutex err_mu;
 
   size_t const n_workers = pool.streams.size();
@@ -139,19 +139,16 @@ void run_column_workers(size_t n_items, stream_pool& pool, Body&& body)
           rmm::cuda_stream_view stream{pool.streams[w % pool.streams.size()]};
           body(i, stream);
         }
-      } catch (std::exception const& e) {
-        std::lock_guard<std::mutex> lock(err_mu);
-        if (!failed.exchange(true)) err_msg = e.what();
       } catch (...) {
         std::lock_guard<std::mutex> lock(err_mu);
-        if (!failed.exchange(true)) err_msg = "column worker failed with an unknown exception";
+        if (!failed.exchange(true)) first_exception = std::current_exception();
       }
     });
   }
   for (auto& t : workers)
     t.join();
   pool.sync_all();
-  if (failed.load()) throw plan_error(err_msg.empty() ? "column worker failed" : err_msg);
+  if (first_exception) std::rethrow_exception(first_exception);
 }
 
 compressed_table compress_columns_parallel(cudf::table_view table,
