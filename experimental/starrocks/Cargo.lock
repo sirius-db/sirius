@@ -1452,6 +1452,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "prettyplease"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2bfe0f4c752e450fc2faf62654f1c134747922825d5b04ca717b8874f41a40c0"
+dependencies = [
+ "proc-macro2",
+ "syn 3.0.2",
+]
+
+[[package]]
 name = "proc-macro2"
 version = "1.0.107"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1481,7 +1491,7 @@ dependencies = [
  "log",
  "multimap",
  "petgraph",
- "prettyplease",
+ "prettyplease 0.2.37",
  "prost",
  "prost-types",
  "regex",
@@ -1890,7 +1900,7 @@ dependencies = [
  "heck",
  "mysql_async",
  "parquet",
- "prettyplease",
+ "prettyplease 0.3.0",
  "proc-macro2",
  "prost",
  "prost-build",
@@ -1899,7 +1909,7 @@ dependencies = [
  "starrocks-plan-translator",
  "starrocks-thrift",
  "substrait",
- "syn 2.0.119",
+ "syn 3.0.2",
  "tempfile",
  "thiserror",
  "thrift",
@@ -1982,7 +1992,7 @@ dependencies = [
  "pbjson",
  "pbjson-build",
  "pbjson-types",
- "prettyplease",
+ "prettyplease 0.2.37",
  "prost",
  "prost-build",
  "prost-types",
