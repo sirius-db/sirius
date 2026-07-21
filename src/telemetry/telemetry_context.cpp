@@ -213,8 +213,6 @@ void emit_plan_telemetry(
                                   .operator_id   = pipeline_uuid,
                                   .instance_name = std::format("{}_receiver", port_id),
                                 });
-          // Map the port's repository to its consumer so batch publishes can
-          // be attributed to this pipeline (quent operator).
           batch_telemetry_registry::instance().register_consumer_port(
             port->repo, pipeline_uuid, port->source_port_uuid);
         }

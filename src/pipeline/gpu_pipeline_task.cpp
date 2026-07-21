@@ -240,8 +240,6 @@ gpu_pipeline_task::gpu_pipeline_task(
   }
   if (auto* pipeline = _global_state->cast<gpu_pipeline_task_global_state>().get_pipeline()) {
     pipeline->mark_task_created();
-    // Claim the input batches for this task: queued -> packaged (or lazy
-    // registration for OOM-reschedule intermediates telemetry never saw).
     auto& registry = telemetry::batch_telemetry_registry::instance();
     for (const auto& weak_batch : _subscribed_batches) {
       if (auto batch = weak_batch.lock()) {
@@ -254,9 +252,6 @@ gpu_pipeline_task::gpu_pipeline_task(
 
 gpu_pipeline_task::~gpu_pipeline_task()
 {
-  // Release this task's claim on its input batches. Placements re-claimed by
-  // a rescheduled task (whose ctor ran before this dtor) carry that task's
-  // uuid and are skipped inside the registry.
   {
     auto& registry       = telemetry::batch_telemetry_registry::instance();
     const auto task_uuid = telemetry_handle().uuid();
@@ -517,9 +512,6 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
   // local_state._input_data. The locks are released when the pipelineable_operator_data
   // is destroyed after the first operator's execute() consumes it.
   {
-    // packaged -> processing; tier re-read to reflect prepare-time upgrades.
-    // Batches already released by prepare (merge/concat inputs are consumed
-    // while materializing) transition by id with their last recorded tier.
     auto& registry       = telemetry::batch_telemetry_registry::instance();
     const auto task_uuid = telemetry_handle().uuid();
     std::unordered_set<uint64_t> live_ids;

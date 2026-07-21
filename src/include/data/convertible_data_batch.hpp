@@ -140,8 +140,6 @@ class convertible_data_batch : public convertible_data {
         default: continue;
       }
 
-      // Report the move while still holding the exclusive lock; the registry
-      // takes plain values here precisely so it never re-locks the batch.
       sirius::telemetry::batch_telemetry_registry::instance().on_tier_change(
         mut.get_batch_id(),
         space->get_tier(),

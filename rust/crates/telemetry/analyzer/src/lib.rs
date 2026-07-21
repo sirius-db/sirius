@@ -68,10 +68,8 @@ pub mod view;
 const TASK_TYPE_NAME: &str = "task";
 const DATA_BATCH_TYPE_NAME: &str = "data_batch";
 const BATCH_TYPE_NAME: &str = "batch";
-/// The Batch FSM's entry state. It is instantaneous bookkeeping (identity
-/// attributes ride the create event; queued/packaged follow microseconds
-/// later), so the analyzer omits it from every aggregated series — it would
-/// only ever render as noise slivers at extreme zoom.
+/// The Batch FSM's entry state: instantaneous bookkeeping (queued/packaged
+/// follow microseconds later), omitted from every aggregated series.
 const BATCH_REGISTERED_STATE: &str = "batch_registered";
 /// Synthetic data-flow series: the processing space (memory reservation) tasks
 /// hold on a tier while preparing/computing, shown beside the batch lifecycle
@@ -334,8 +332,7 @@ impl UiAnalyzer for SiriusUiAnalyzer {
             resource_tree,
             unique_operator_names,
             quantity_specs: [
-                // SI decimal prefixes (kB/MB/GB) rather than the IEC default:
-                // rounder numbers read better on the DAG bars and tooltips.
+                // SI decimal prefixes (kB/MB/GB) read better on the DAG bars.
                 (
                     "capacity_bytes".into(),
                     QuantitySpec {
@@ -1153,9 +1150,7 @@ impl UiAnalyzer for SiriusUiAnalyzer {
         &self,
         request: CategoricalTimelineRequest<QueryFilter>,
     ) -> AnalyzerResult<DataFlowTimelineBinned> {
-        // Datasets recorded before Batch instrumentation existed have no batch
-        // events; report the feature as unsupported (HTTP 501) so the UI hides
-        // the view.
+        // Datasets recorded before Batch instrumentation existed: HTTP 501.
         if self.model.batches.is_empty() {
             return Err(AnalyzerError::Unsupported);
         }
@@ -1164,9 +1159,7 @@ impl UiAnalyzer for SiriusUiAnalyzer {
         let epoch = self.query_engine_model().query_epoch(query_id)?;
         let config = request.config.try_into_binned_span(epoch)?;
 
-        // Which of the declared measures to compute; empty means all. Any
-        // unknown name is an error, even alongside valid ones — silently
-        // ignoring it would hide client typos.
+        // Empty means all measures; unknown names are errors, not ignored.
         if let Some(unknown) = request
             .measures
             .iter()
@@ -1183,9 +1176,7 @@ impl UiAnalyzer for SiriusUiAnalyzer {
 
         let view = self.model.query_view(query_id)?;
 
-        // The dimension of the distribution is the memory tier a batch resides
-        // in: the instance name ("GPU"/"HOST"/"DISK") of the memory_tier-typed
-        // resource its state's tier usage points at.
+        // Dimension keys are the memory_tier resources' instance names.
         let tier_names: HashMap<Uuid, &str> = self
             .model
             .arbitrary_resources
@@ -1195,7 +1186,6 @@ impl UiAnalyzer for SiriusUiAnalyzer {
             .collect();
 
         let mut builder = CategoricalTimelineBuilder::new(config);
-        // The view's batches are already restricted to this query's operators.
         for batch in view.batches() {
             let Some(operator_id) = batch.pipeline_uuid() else {
                 continue;
@@ -1314,9 +1304,8 @@ impl UiAnalyzer for SiriusUiAnalyzer {
             }
         }
 
-        // Pivot the flat aggregation into per-operator nested series. All-zero
-        // series (e.g. from zero-duration states) are omitted; the protocol
-        // treats absent entries as all-zero bins.
+        // Pivot into per-operator series; all-zero series are omitted (the
+        // protocol treats absent entries as all-zero bins).
         let mut operators: StdHashMap<Uuid, CategoricalSeries> = StdHashMap::new();
         for (key, bins) in builder.build().data {
             if bins.iter().all(|v| *v == 0.0) {
@@ -1333,10 +1322,8 @@ impl UiAnalyzer for SiriusUiAnalyzer {
                 .insert(key.dimension.to_owned(), bins);
         }
 
-        // Declare the dimension keys in stable GPU/HOST/DISK stacking order,
-        // restricted to the tiers actually present in this model. Unexpected
-        // tier names (none are recorded today) sort after the known ones so
-        // every pushed dimension stays declared.
+        // Declared dimension keys: tiers present in the model, in stable
+        // GPU-*/HOST/DISK stacking order (unexpected names sort last).
         let present_tiers: HashSet<&str> = tier_names.values().copied().collect();
         let mut ordered_tiers: Vec<&str> = present_tiers.into_iter().collect();
         ordered_tiers.sort_unstable_by_key(|tier| memory_tier_rank(tier));

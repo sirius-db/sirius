@@ -348,9 +348,8 @@ void batch_telemetry_registry::on_packaged(const std::shared_ptr<cucascade::data
   }
 
   if (target == nullptr) {
-    // First telemetry sighting of this batch: intermediates released by an
-    // OOM reschedule (or otherwise outside the port model) enter directly as
-    // packaged.
+    // First sighting (OOM-reschedule intermediates or otherwise outside the
+    // port model): register lazily, then package below.
     auto handle = quent::batch::create(impl_->context->context(),
                                        {
                                          .instance_name = std::format("batch-{}", snap->batch_id),
@@ -370,7 +369,6 @@ void batch_telemetry_registry::on_packaged(const std::shared_ptr<cucascade::data
       .bytes            = snap->bytes,
     });
     target = &placements.back();
-    // Note: entry state is registered; transition to packaged below.
   }
 
   target->task_uuid        = task_uuid;
