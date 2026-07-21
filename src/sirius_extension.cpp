@@ -1280,12 +1280,12 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
   }
 
   if (data.args.tier == "host") {
-    auto host_result = sirius::materialize_pin_to_host_with_compression(*ingestible,
-                                                                        gpu_spaces_mut,
-                                                                        host_space_by_gpu,
-                                                                        *scan_mgr.io_ctx(),
-                                                                        pinned_column_types,
-                                                                        pin_comp);
+    auto host_result = sirius::materialize_pin_to_host(*ingestible,
+                                                       gpu_spaces_mut,
+                                                       host_space_by_gpu,
+                                                       *scan_mgr.io_ctx(),
+                                                       pinned_column_types,
+                                                       pin_comp);
 
     // entry.memory_space is metadata only; each host_chunk carries its own per-GPU
     // NUMA-local memory_space. Pass a representative (the first GPU's host space).
@@ -1309,7 +1309,7 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
     // qualifies, keeping the compressed payload in device memory; batches that do
     // not qualify are pinned uncompressed. Both forms land in one ordered chunk
     // vector, so a table that mixes them pins without special-casing.
-    auto dev_result = sirius::materialize_pin_to_device_with_compression(
+    auto dev_result = sirius::materialize_all_batches_compressed(
       *ingestible, gpu_spaces_mut, *scan_mgr.io_ctx(), pin_comp);
 
     scan_mgr.insert_pinned_entry_device(

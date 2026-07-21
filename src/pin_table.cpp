@@ -155,8 +155,8 @@ using pin_batch_sink =
                      rmm::cuda_stream_view stream,
                      std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>> chunk_stats)>;
 
-/// Shared driver behind @ref materialize_all_batches and the pin_to_host/device_with_compression
-/// drivers: walk the
+/// Shared driver behind @ref materialize_all_batches, @ref materialize_pin_to_host, and
+/// @ref materialize_all_batches_compressed: walk the
 /// ingestible's metadata + batch coalescer to completion, materialize each emitted batch onto a
 /// round-robin GPU, and hand it to @p on_batch. The single-threaded, deterministic round-robin
 /// placement means re-pinning the same source yields identical placement (required by
@@ -323,7 +323,7 @@ bool compress_and_stage_batch(cudf::table const& tbl,
     return false;
   }
 
-  stage(std::move(header), buffers, payload_bytes, uncompressed_bytes);
+  stage(std::move(ct), std::move(header), buffers, payload_bytes, uncompressed_bytes);
   return true;
 }
 
@@ -356,7 +356,7 @@ materialized_pin materialize_all_batches(
   return out;
 }
 
-host_pin_result materialize_pin_to_host_with_compression(
+host_pin_result materialize_pin_to_host(
   op::scan::gpu_ingestible& ingestible,
   std::span<cucascade::memory::memory_space* const> gpu_spaces,
   const std::unordered_map<int, cucascade::memory::memory_space*>& host_space_by_gpu,
@@ -388,8 +388,9 @@ host_pin_result materialize_pin_to_host_with_compression(
             *tbl,
             compression,
             stream,
-            "materialize_pin_to_host_with_compression",
-            [&](std::vector<std::uint8_t>&& header,
+            "materialize_pin_to_host",
+            [&](simpatico::compressed_table&& /*ct*/,
+                std::vector<std::uint8_t>&& header,
                 std::vector<simpatico::payload_buffer_ref> const& buffers,
                 std::uint64_t payload_bytes,
                 std::size_t uncompressed_bytes) {
@@ -431,7 +432,7 @@ host_pin_result materialize_pin_to_host_with_compression(
         } catch (const std::exception& e) {
           compression_failed = true;
           SIRIUS_LOG_WARN(
-            "[materialize_pin_to_host_with_compression] compression failed: {}; "
+            "[materialize_pin_to_host] compression failed: {}; "
             "falling back to uncompressed for this chunk",
             e.what());
         }
@@ -460,7 +461,7 @@ host_pin_result materialize_pin_to_host_with_compression(
   return out;
 }
 
-device_pin_result materialize_pin_to_device_with_compression(
+device_pin_result materialize_all_batches_compressed(
   op::scan::gpu_ingestible& ingestible,
   std::span<cucascade::memory::memory_space* const> gpu_spaces,
   io::sirius_ioctx& io_ctx,
@@ -487,40 +488,15 @@ device_pin_result materialize_pin_to_device_with_compression(
             *tbl,
             compression,
             stream,
-            "materialize_pin_to_device_with_compression",
-            [&](std::vector<std::uint8_t>&& header,
-                std::vector<simpatico::payload_buffer_ref> const& buffers,
+            "materialize_all_batches_compressed",
+            [&](simpatico::compressed_table&& ct,
+                std::vector<std::uint8_t>&& /*header*/,
+                std::vector<simpatico::payload_buffer_ref> const& /*buffers*/,
                 std::uint64_t payload_bytes,
                 std::size_t uncompressed_bytes) {
-              // Keep the compressed payload in one contiguous device buffer on the
-              // source GPU (its default allocator is the reservation-aware adaptor,
-              // so the footprint is tracked like any GPU pin — no separate
-              // reservation needed). Copy each compressed leaf buffer
-              // device->device, then sync before `ct` (owning the source device
-              // buffers) leaves scope.
-              rmm::device_buffer payload(static_cast<std::size_t>(payload_bytes),
-                                         stream,
-                                         src_space->get_default_allocator());
-              for (auto const& b : buffers) {
-                if (b.size_bytes > 0 && b.device_ptr != nullptr) {
-                  CUCASCADE_CUDA_TRY(
-                    cudaMemcpyAsync(static_cast<std::byte*>(payload.data()) + b.offset,
-                                    b.device_ptr,
-                                    static_cast<std::size_t>(b.size_bytes),
-                                    cudaMemcpyDeviceToDevice,
-                                    stream.value()));
-                }
-              }
-              stream.synchronize();
-
-              auto blob           = std::make_shared<sirius::device_compressed_blob>();
-              blob->header        = std::move(header);
-              blob->payload       = std::move(payload);
-              blob->payload_bytes = payload_bytes;
-
               compressed_chunk = std::make_shared<sirius::compressed_device_representation>(
                 *src_space,
-                std::move(blob),
+                std::make_shared<simpatico::compressed_table>(std::move(ct)),
                 compression.column_names,
                 static_cast<std::size_t>(payload_bytes),
                 uncompressed_bytes,
@@ -529,7 +505,7 @@ device_pin_result materialize_pin_to_device_with_compression(
         } catch (const std::exception& e) {
           compression_failed = true;
           SIRIUS_LOG_WARN(
-            "[materialize_pin_to_device_with_compression] compression failed: {}; "
+            "[materialize_all_batches_compressed] compression failed: {}; "
             "falling back to uncompressed for this chunk",
             e.what());
         }

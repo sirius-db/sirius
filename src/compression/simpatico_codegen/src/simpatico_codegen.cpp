@@ -15,6 +15,7 @@
 
 #include <atomic>
 #include <mutex>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -214,6 +215,23 @@ std::unique_ptr<cudf::table> decompress_columns_parallel(compressed_table const&
   return std::make_unique<cudf::table>(std::move(cols));
 }
 
+std::unique_ptr<cudf::table> decompress_columns_parallel(compressed_table const& table,
+                                                         std::span<const std::size_t> selected,
+                                                         stream_pool& pool,
+                                                         rmm::device_async_resource_ref mr)
+{
+  std::vector<std::unique_ptr<cudf::column>> cols(selected.size());
+  run_column_workers(selected.size(), pool, [&](size_t i, rmm::cuda_stream_view stream) {
+    auto const idx = selected[i];
+    if (idx >= table.columns.size()) throw plan_error("selected column index out of range");
+    std::string err;
+    auto col = decompress_column(*table.columns[idx].compound, stream, mr, &err);
+    if (!col) throw plan_error(err.empty() ? "decompress failed" : err);
+    cols[i] = apply_stored_dtype(std::move(col), table.columns[idx].dtype);
+  });
+  return std::make_unique<cudf::table>(std::move(cols));
+}
+
 }  // namespace
 
 // ── compressed_table ─────────────────────────────────────────────────────────
@@ -329,6 +347,42 @@ std::unique_ptr<cudf::table> decompress(const compressed_table& table,
                                         rmm::device_async_resource_ref mr)
 {
   return decompress_columns_parallel(table, pool, mr);
+}
+
+std::unique_ptr<cudf::table> decompress(const compressed_table& table,
+                                        std::span<const std::size_t> selected_columns,
+                                        rmm::cuda_stream_view stream,
+                                        rmm::device_async_resource_ref mr)
+{
+  std::vector<std::unique_ptr<cudf::column>> cols;
+  cols.reserve(selected_columns.size());
+  for (auto const idx : selected_columns) {
+    if (idx >= table.columns.size()) throw plan_error("selected column index out of range");
+    auto const& col = table.columns[idx];
+    if (!col.compound) throw plan_error("compressed_table column missing compound");
+    std::string err;
+    auto c = decompress_column(*col.compound, stream, mr, &err);
+    if (!c) throw plan_error(err.empty() ? "decompress failed" : err);
+    cols.push_back(apply_stored_dtype(std::move(c), col.dtype));
+  }
+  return std::make_unique<cudf::table>(std::move(cols));
+}
+
+std::unique_ptr<cudf::table> decompress(const compressed_table& table,
+                                        std::span<const std::size_t> selected_columns,
+                                        int column_threads,
+                                        rmm::device_async_resource_ref mr)
+{
+  auto pool = make_internal_pool(column_threads);
+  return decompress_columns_parallel(table, selected_columns, pool, mr);
+}
+
+std::unique_ptr<cudf::table> decompress(const compressed_table& table,
+                                        std::span<const std::size_t> selected_columns,
+                                        simpatico::stream_pool& pool,
+                                        rmm::device_async_resource_ref mr)
+{
+  return decompress_columns_parallel(table, selected_columns, pool, mr);
 }
 
 }  // namespace simpatico

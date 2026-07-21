@@ -161,8 +161,8 @@ struct host_pin_result {
   std::vector<std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>>> chunk_stats;
 };
 
-/// Optional compression settings for @ref materialize_pin_to_host_with_compression
-/// and @ref materialize_pin_to_device_with_compression.
+/// Optional compression settings for @ref materialize_pin_to_host
+/// and @ref materialize_all_batches_compressed.
 struct compression_pin_config {
   bool enabled{false};
   std::string plan_dsl;
@@ -211,7 +211,7 @@ struct device_pin_result {
 ///                            which runs on the decode GPU before host conversion /
 ///                            compression (so compressed and uncompressed pins alike get
 ///                            zone maps). Empty skips capture (statless pin).
-host_pin_result materialize_pin_to_host_with_compression(
+host_pin_result materialize_pin_to_host(
   op::scan::gpu_ingestible& ingestible,
   std::span<cucascade::memory::memory_space* const> gpu_spaces,
   const std::unordered_map<int, cucascade::memory::memory_space*>& host_space_by_gpu,
@@ -224,7 +224,7 @@ host_pin_result materialize_pin_to_host_with_compression(
 /// (device) memory. A batch that does not qualify (below the size threshold, or it
 /// fails to compress usefully) is kept as an uncompressed device chunk instead, so
 /// @c device_pin_result::chunks may interleave the two forms in emission order.
-device_pin_result materialize_pin_to_device_with_compression(
+device_pin_result materialize_all_batches_compressed(
   op::scan::gpu_ingestible& ingestible,
   std::span<cucascade::memory::memory_space* const> gpu_spaces,
   io::sirius_ioctx& io_ctx,

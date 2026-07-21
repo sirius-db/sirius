@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -157,6 +158,34 @@ std::unique_ptr<cudf::table> decompress(
 /// @throws std::runtime_error on GPU error.
 std::unique_ptr<cudf::table> decompress(
   const compressed_table& table,
+  simpatico::stream_pool& pool,
+  rmm::device_async_resource_ref mr = rmm::mr::get_current_device_resource_ref());
+
+// ── Selective decompression ───────────────────────────────────────────────────
+//
+// Decompress only a subset of columns from a cached compressed_table, avoiding
+// a full re-fetch when only a projection is needed. The output table contains
+// exactly the requested columns in the order given by @p selected_columns.
+// Out-of-range indices throw std::runtime_error.
+
+/// Decompress a column subset sequentially on a single CUDA stream.
+std::unique_ptr<cudf::table> decompress(
+  const compressed_table& table,
+  std::span<const std::size_t> selected_columns,
+  rmm::cuda_stream_view stream      = cudf::get_default_stream(),
+  rmm::device_async_resource_ref mr = rmm::mr::get_current_device_resource_ref());
+
+/// Decompress a column subset in parallel using @p column_threads worker threads.
+std::unique_ptr<cudf::table> decompress(
+  const compressed_table& table,
+  std::span<const std::size_t> selected_columns,
+  int column_threads,
+  rmm::device_async_resource_ref mr = rmm::mr::get_current_device_resource_ref());
+
+/// Decompress a column subset in parallel using a caller-owned stream pool.
+std::unique_ptr<cudf::table> decompress(
+  const compressed_table& table,
+  std::span<const std::size_t> selected_columns,
   simpatico::stream_pool& pool,
   rmm::device_async_resource_ref mr = rmm::mr::get_current_device_resource_ref());
 

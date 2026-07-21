@@ -31,6 +31,10 @@
 #include <string>
 #include <vector>
 
+namespace simpatico {
+class compressed_table;
+}  // namespace simpatico
+
 namespace sirius {
 
 /// A Simpatico-compressed chunk resident in pinned host memory.
@@ -197,31 +201,20 @@ class compressed_host_representation : public cucascade::idata_representation {
 /// table to the GPU tier compressed keeps its device footprint small; the data
 /// is decompressed on demand when a query materializes it.
 ///
-/// Shared (via shared_ptr) among all representations that alias the same chunk
-/// (e.g. after select_columns() or clone()); the device buffer is freed when the
-/// last owner drops.
-struct device_compressed_blob {
-  std::vector<std::uint8_t> header;
-  rmm::device_buffer payload;
-  std::uint64_t payload_bytes = 0;
-};
-
 /**
- * @brief GPU-tier idata_representation backed by a compressed chunk in device memory.
+ * @brief GPU-tier idata_representation backed by a cached simpatico::compressed_table.
  *
- * Holds a shared @ref device_compressed_blob plus schema metadata and an optional
- * column projection. The converter compressed_device_representation →
- * gpu_table_representation rebuilds the compressed_table from the blob
- * (read_compressed_table_from_memory with a device→device fetch), projects to the
- * selected columns (if any), then decompresses to a cudf::table. It is registered
- * by register_compression_converters() and fired by
- * scan_operator_input::prepare_for_processing when a GPU-tier batch's data is not
- * already a gpu_table_representation.
+ * Holds a shared compressed_table (all columns' leaf buffers resident on device)
+ * plus schema metadata and an optional column projection. The converter
+ * compressed_device_representation → gpu_table_representation calls
+ * simpatico::decompress() directly on the cached table, decompressing only the
+ * selected columns when a projection is set. No D2D re-fetch is needed at query
+ * time — the leaf buffers were already placed on device at pin time.
  */
 class compressed_device_representation : public cucascade::idata_representation {
  public:
   compressed_device_representation(cucascade::memory::memory_space& memory_space,
-                                   std::shared_ptr<device_compressed_blob> blob,
+                                   std::shared_ptr<simpatico::compressed_table> table,
                                    std::vector<std::string> column_names,
                                    std::size_t compressed_bytes,
                                    std::size_t uncompressed_bytes,
@@ -241,20 +234,15 @@ class compressed_device_representation : public cucascade::idata_representation 
     return _uncompressed_bytes;
   }
 
-  /// Clone shares the same backing blob (increments shared ownership).
+  /// Clone shares the same cached table (increments shared ownership).
   [[nodiscard]] std::unique_ptr<cucascade::idata_representation> clone(
     rmm::cuda_stream_view stream) override;
 
-  /// Projection sharing the same backing blob (see compressed_host_representation).
+  /// Projection sharing the same cached table; decompress will skip non-selected columns.
   [[nodiscard]] std::unique_ptr<compressed_device_representation> select_columns(
     std::span<const std::size_t> indices) const;
 
-  /// The structural header bytes (fed to read_compressed_table_from_memory).
-  [[nodiscard]] std::span<const std::uint8_t> header() const noexcept { return _blob->header; }
-
-  /// Base pointer of the contiguous device payload holding every leaf buffer.
-  [[nodiscard]] const void* payload_device_ptr() const noexcept { return _blob->payload.data(); }
-  [[nodiscard]] std::uint64_t payload_bytes() const noexcept { return _blob->payload_bytes; }
+  [[nodiscard]] const simpatico::compressed_table& table() const noexcept { return *_table; }
 
   [[nodiscard]] const std::vector<std::string>& column_names() const noexcept
   {
@@ -269,14 +257,14 @@ class compressed_device_representation : public cucascade::idata_representation 
 
  private:
   compressed_device_representation(cucascade::memory::memory_space& memory_space,
-                                   std::shared_ptr<device_compressed_blob> blob,
+                                   std::shared_ptr<simpatico::compressed_table> table,
                                    std::vector<std::string> column_names,
                                    std::size_t compressed_bytes,
                                    std::size_t uncompressed_bytes,
                                    std::int64_t num_rows,
                                    std::optional<std::vector<std::size_t>> selected_indices);
 
-  std::shared_ptr<device_compressed_blob> _blob;
+  std::shared_ptr<simpatico::compressed_table> _table;
   std::vector<std::string> _column_names;
   std::size_t _compressed_bytes;
   std::size_t _uncompressed_bytes;

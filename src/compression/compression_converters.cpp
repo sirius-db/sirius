@@ -182,25 +182,43 @@ std::unique_ptr<cucascade::idata_representation> decompress_host_to_gpu(
 }
 
 // compressed_device_representation (device memory) → GPU.
+// The compressed_table is already cached on device; decompress directly with no
+// re-fetch. When a column projection is set, only the selected columns are decoded.
 std::unique_ptr<cucascade::idata_representation> decompress_device_to_gpu(
   cucascade::idata_representation& source,
   const cucascade::memory::memory_space* target_memory_space,
   rmm::cuda_stream_view stream,
   [[maybe_unused]] cucascade::memory::reservation* reservation)
 {
-  auto& rep = source.cast<compressed_device_representation>();
+  auto& rep           = source.cast<compressed_device_representation>();
+  auto const& indices = rep.selected_indices();
+  auto const& ct      = rep.table();
+  auto const mr       = rmm::mr::get_current_device_resource_ref();
+  const int n_threads = std::min(decompress_column_threads(),
+                                 static_cast<int>(indices ? indices->size() : ct.num_columns()));
+  std::unique_ptr<cudf::table> decompressed;
+  if (n_threads > 1) {
+    decompressed = indices.has_value() ? simpatico::decompress(ct, *indices, n_threads, mr)
+                                       : simpatico::decompress(ct, n_threads, mr);
+    auto cols    = decompressed->release();
+    for (auto& c : cols)
+      c = rebind_column_stream(std::move(c), stream);
+    decompressed = std::make_unique<cudf::table>(std::move(cols));
+  } else {
+    decompressed = indices.has_value() ? simpatico::decompress(ct, *indices, stream, mr)
+                                       : simpatico::decompress(ct, stream, mr);
+  }
 
-  // The payload is already a single contiguous device buffer — each leaf buffer
-  // is one device→device copy at its offset.
-  const auto* payload_base = static_cast<const std::byte*>(rep.payload_device_ptr());
-  simpatico::payload_fetch_fn fetch =
-    [payload_base](std::uint64_t off, std::size_t sz, void* dst, rmm::cuda_stream_view s) {
-      CUCASCADE_CUDA_TRY(
-        cudaMemcpyAsync(dst, payload_base + off, sz, cudaMemcpyDeviceToDevice, s.value()));
-    };
+  const cucascade::memory::memory_space* space =
+    (target_memory_space != nullptr) ? target_memory_space : &source.get_memory_space();
 
-  return reconstruct_and_decompress_to_gpu(
-    rep.header(), fetch, rep.selected_indices(), source, target_memory_space, stream);
+  SIRIUS_LOG_DEBUG("[compression_converters] decompressed cols={} rows={} → GPU device={}",
+                   decompressed->num_columns(),
+                   decompressed->num_rows(),
+                   space->get_device_id());
+
+  return std::make_unique<cucascade::gpu_table_representation>(
+    std::move(decompressed), *const_cast<cucascade::memory::memory_space*>(space), stream);
 }
 
 }  // namespace

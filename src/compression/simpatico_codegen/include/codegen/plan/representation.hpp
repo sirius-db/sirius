@@ -83,8 +83,7 @@ struct compressed_representation {
   cudf::data_type original_type{cudf::type_id::EMPTY};
   cudf::size_type num_rows{0};
   // Channel columns in registry order (populated by subclass constructors).
-  // Mutable so decompress() implementations that move channels (str_split) can be const.
-  mutable std::vector<std::unique_ptr<cudf::column>> channels_;
+  std::vector<std::unique_ptr<cudf::column>> channels_;
 
   compressed_representation() = default;
   compressed_representation(cudf::data_type t, cudf::size_type n) : original_type(t), num_rows(n) {}
@@ -339,7 +338,7 @@ struct dictionary_compressor : compressor {
 // -----------------------------------------------------------------------------
 // channels_[0] = offsets (INT32 or INT64), channels_[1] = chars (UINT8/UINT32/UINT64),
 // channels_[2] = null_mask (UINT8 bitmask bytes, only present when nullable).
-// decompress() moves channels into make_strings_column (hence channels_ is mutable).
+// decompress() copies channels into make_strings_column; channels_ is left intact.
 struct str_split_compressed_representation : compressed_representation {
   static std::unique_ptr<compressed_representation> from_outputs(
     std::vector<std::string> const& output_names,

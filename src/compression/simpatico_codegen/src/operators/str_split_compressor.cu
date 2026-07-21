@@ -29,9 +29,9 @@ std::unique_ptr<cudf::column> str_split_compressed_representation::decompress(
     return cudf::make_empty_column(cudf::data_type(cudf::type_id::STRING));
   }
 
-  auto chars_contents = chars->release();
-  rmm::device_buffer chars_buf =
-    chars_contents.data ? std::move(*chars_contents.data) : rmm::device_buffer(0, stream, mr);
+  auto const chars_bytes = static_cast<std::size_t>(chars->size()) *
+                           static_cast<std::size_t>(cudf::size_of(chars->type()));
+  rmm::device_buffer chars_buf(chars->view().head<void>(), chars_bytes, stream, mr);
 
   cudf::size_type nc = 0;
   rmm::device_buffer mask_buf(0, stream, mr);
@@ -40,12 +40,13 @@ std::unique_ptr<cudf::column> str_split_compressed_representation::decompress(
       reinterpret_cast<cudf::bitmask_type const*>(null_mask->view().data<std::uint8_t>());
     nc = cudf::null_count(bits, 0, num_rows, stream);
     if (nc > 0) {
-      auto mask_contents = null_mask->release();
-      mask_buf           = std::move(*mask_contents.data);
+      mask_buf = rmm::device_buffer(
+        null_mask->view().head<void>(), static_cast<std::size_t>(null_mask->size()), stream, mr);
     }
   }
+  auto offsets_copy = std::make_unique<cudf::column>(*offsets, stream, mr);
   return cudf::make_strings_column(
-    num_rows, std::move(offsets), std::move(chars_buf), nc, std::move(mask_buf));
+    num_rows, std::move(offsets_copy), std::move(chars_buf), nc, std::move(mask_buf));
 }
 
 std::unique_ptr<compressed_representation> str_split_compressor::compress(
