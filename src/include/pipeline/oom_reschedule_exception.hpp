@@ -26,34 +26,28 @@
 namespace sirius::pipeline {
 
 /**
- * @brief Exception thrown when an OOM occurs during pipeline task execution.
+ * @brief Base exception for pipeline task reschedule requests.
  *
- * This exception carries the intermediate operator data and the index of the
- * operator that failed, allowing the executor to reschedule the task to resume
- * from the point of failure.
+ * Carries the operator input data at the point of failure and the operator
+ * index to resume from, allowing the executor to requeue the task without
+ * falling back to CPU.  Derived types distinguish the failure reason.
  */
-class oom_reschedule_exception : public std::exception {
+class task_reschedule_exception : public std::exception {
  public:
-  oom_reschedule_exception(std::unique_ptr<op::operator_data> intermediate_data,
-                           size_t resume_operator_index,
-                           std::string message)
+  task_reschedule_exception(std::unique_ptr<op::operator_data> intermediate_data,
+                            size_t resume_operator_index,
+                            std::string message)
     : _intermediate_data(std::move(intermediate_data)),
       _resume_operator_index(resume_operator_index),
       _message(std::move(message))
   {
   }
 
-  /**
-   * @brief Release ownership of the intermediate data.
-   */
   std::unique_ptr<op::operator_data> release_intermediate_data()
   {
     return std::move(_intermediate_data);
   }
 
-  /**
-   * @brief Get the operator index to resume from.
-   */
   [[nodiscard]] size_t get_resume_operator_index() const noexcept { return _resume_operator_index; }
 
   [[nodiscard]] const char* what() const noexcept override { return _message.c_str(); }
@@ -62,6 +56,40 @@ class oom_reschedule_exception : public std::exception {
   std::unique_ptr<op::operator_data> _intermediate_data;
   size_t _resume_operator_index;
   std::string _message;
+};
+
+/**
+ * @brief Reschedule request from an out-of-memory failure.
+ */
+class oom_reschedule_exception : public task_reschedule_exception {
+ public:
+  using task_reschedule_exception::task_reschedule_exception;
+};
+
+/**
+ * @brief Reschedule request from a transient CUDA kernel-launch failure.
+ *
+ * cudaErrorLaunchOutOfResources and cudaErrorInvalidValue can occur when
+ * PDL scheduling credits are exhausted by concurrent streams on the same GPU.
+ * Rescheduling after a brief back-off lets the competing kernels drain.
+ */
+class cuda_launch_reschedule_exception : public task_reschedule_exception {
+ public:
+  cuda_launch_reschedule_exception(std::unique_ptr<op::operator_data> intermediate_data,
+                                   size_t resume_operator_index,
+                                   int cuda_error_code,
+                                   std::string message)
+    : task_reschedule_exception(std::move(intermediate_data),
+                                resume_operator_index,
+                                std::move(message)),
+      _cuda_error_code(cuda_error_code)
+  {
+  }
+
+  [[nodiscard]] int get_cuda_error_code() const noexcept { return _cuda_error_code; }
+
+ private:
+  int _cuda_error_code;
 };
 
 }  // namespace sirius::pipeline

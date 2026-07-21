@@ -17,9 +17,12 @@
 #include "op/partition/gpu_partition_impl.hpp"
 
 #include "data/data_batch_utils.hpp"
+#include "log/logging.hpp"
 
 #include <cudf/partitioning.hpp>
 #include <cudf/unary.hpp>
+
+#include <cuda_runtime.h>
 
 namespace sirius {
 namespace op {
@@ -63,6 +66,12 @@ std::vector<std::shared_ptr<cucascade::data_batch>> gpu_partition_impl::hash_par
   }
   cudf::table_view effective_table(all_col_views);
   const int orig_num_cols = input_table.num_columns();
+
+  // Clear any stale per-thread sticky CUDA error before entering cuDF.  A residual error
+  // from a prior call would be caught by CUB's cudaPeekAtLastError() inside the
+  // thrust::exclusive_scan that cudf::hash_partition() calls internally, producing a
+  // misleading error attribution.
+  (void)cudaGetLastError();
 
   auto partition_result = cudf::hash_partition(effective_table,
                                                effective_key_idx,

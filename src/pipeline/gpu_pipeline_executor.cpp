@@ -308,7 +308,7 @@ void gpu_pipeline_executor::manager_loop()
         try {
           task->execute(exc_stream);
           _tasks_executed.fetch_add(1, std::memory_order_relaxed);
-        } catch (oom_reschedule_exception& oom) {
+        } catch (task_reschedule_exception& ex) {
           if (_completion_handler && _completion_handler->has_error()) {
             // If the completion handler is already in an error state, then we can just return and
             // not try to reschedule
@@ -316,10 +316,10 @@ void gpu_pipeline_executor::manager_loop()
           }
           auto* gpu_task = cast_to_gpu_pipeline_task(task.get());
           if (!gpu_task) {
-            SIRIUS_LOG_ERROR("GPU Pipeline Executor: Failed to cast task for OOM reschedule");
+            SIRIUS_LOG_ERROR("GPU Pipeline Executor: Failed to cast task for reschedule");
             if (_completion_handler) {
               _completion_handler->report_error(
-                "GPU Pipeline Executor: Failed to cast task for OOM reschedule");
+                "GPU Pipeline Executor: Failed to cast task for reschedule");
             }
             return;
           }
@@ -345,34 +345,36 @@ void gpu_pipeline_executor::manager_loop()
           // too short. With 100 retries × 50 ms backoff (~5 s) the probe
           // tasks get enough patience to clear the contention window while
           // still bailing out on truly wedged queries.
-          static constexpr uint32_t MAX_OOM_RETRIES = 100;
-          if (next_retry_count > MAX_OOM_RETRIES) {
+          static constexpr uint32_t MAX_RETRIES = 100;
+          if (next_retry_count > MAX_RETRIES) {
             SIRIUS_LOG_ERROR(
-              "GPU Pipeline Executor: task {} (original task {}) exceeded {} OOM retries at "
-              "operator index {} — terminating query",
+              "GPU Pipeline Executor: task {} (original task {}) exceeded {} retries at "
+              "operator index {} — terminating query: {}",
               gpu_task->get_task_id(),
               orig_task_id,
-              MAX_OOM_RETRIES,
-              oom.get_resume_operator_index());
+              MAX_RETRIES,
+              ex.get_resume_operator_index(),
+              ex.what());
             if (_completion_handler) {
               _completion_handler->report_error(std::make_exception_ptr(
-                std::runtime_error("GPU pipeline task exceeded maximum OOM retry limit (" +
-                                   std::to_string(MAX_OOM_RETRIES) + ") for original task " +
-                                   std::to_string(orig_task_id))));
+                std::runtime_error("GPU pipeline task exceeded maximum retry limit (" +
+                                   std::to_string(MAX_RETRIES) + ") for original task " +
+                                   std::to_string(orig_task_id) + ": " + ex.what())));
             }
             return;
           }
 
           SIRIUS_LOG_WARN(
-            "GPU Pipeline Executor: OOM reschedule (retry {}/{}) for task {} (original task {}), "
-            "resuming from operator index {}",
+            "GPU Pipeline Executor: reschedule (retry {}/{}) for task {} (original task {}), "
+            "resuming from operator index {}: {}",
             next_retry_count,
-            MAX_OOM_RETRIES,
+            MAX_RETRIES,
             gpu_task->get_task_id(),
             orig_task_id,
-            oom.get_resume_operator_index());
+            ex.get_resume_operator_index(),
+            ex.what());
 
-          auto intermediate_data = oom.release_intermediate_data();
+          auto intermediate_data = ex.release_intermediate_data();
           if (auto pipelineable_data =
                 dynamic_cast<op::pipelineable_operator_data*>(intermediate_data.get())) {
             // We want to release the read-only lock on the data so that when its added back to the
@@ -382,7 +384,7 @@ void gpu_pipeline_executor::manager_loop()
 
           // Build the rescheduled task via virtual factory (preserves derived type).
           auto new_local_state = std::make_unique<gpu_pipeline_task_local_state>(
-            std::move(intermediate_data), oom.get_resume_operator_index());
+            std::move(intermediate_data), ex.get_resume_operator_index());
           new_local_state->retry_count      = next_retry_count;
           new_local_state->original_task_id = orig_task_id;
 
