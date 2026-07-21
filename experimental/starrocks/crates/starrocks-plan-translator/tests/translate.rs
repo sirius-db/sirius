@@ -2471,7 +2471,7 @@ fn or_pred(left: TExpr, right: TExpr) -> TExpr {
     TExpr::new(nodes)
 }
 
-/// Verifies a cross nested-loop join with a conjunct becomes filter-over-cross-product.
+/// Verifies a cross nested-loop join becomes a filtered constant-key equality join.
 #[test]
 fn nestloop_join_translates_to_filtered_cross_rel() {
     let join = nestloop_join_node(
@@ -2489,11 +2489,20 @@ fn nestloop_join_translates_to_filtered_cross_rel() {
     assert_eq!(root.names, vec!["a", "b"]);
     let rel::RelType::Filter(filter) = root.input.as_ref().unwrap().rel_type.as_ref().unwrap()
     else {
-        panic!("expected filter over cross product");
+        panic!("expected filter over constant-key join");
     };
-    let rel::RelType::Cross(_) = filter.input.as_ref().unwrap().rel_type.as_ref().unwrap() else {
-        panic!("expected cross product under filter");
+    let rel::RelType::Project(project) = filter.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected output projection under filter");
     };
+    let rel::RelType::Join(join) = project.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected constant-key join under projection");
+    };
+    assert_eq!(
+        join.r#type,
+        substrait::proto::join_rel::JoinType::Inner as i32
+    );
 }
 
 /// Verifies a nested-loop join that is not inner or cross is rejected: the translation emits a
@@ -2521,13 +2530,11 @@ fn non_inner_nestloop_join_is_rejected() {
     }
 }
 
-/// Verifies a nested-loop join is rejected unless a conjunct survives as a join condition.
-///
-/// A predicate reading one input is pushed into that input and leaves a bare cross product; a
-/// disjunction reading both is demoted to an any-join. The GPU planner has neither operator, so
-/// either shape would translate here and then fail at execution.
+/// Verifies a nested-loop join still translates when the conjunct would not lift into a
+/// comparison join: the synthetic constant key is the join condition, and the original
+/// predicate stays a filter.
 #[test]
-fn nestloop_join_without_a_liftable_comparison_is_rejected() {
+fn nestloop_join_without_a_liftable_comparison_still_translates() {
     let bigint = || scalar_type(TPrimitiveType::BIGINT);
     let probe_side_only = binary_pred(TExprOpcode::LT, slot_ref(1, 0, bigint()), int_literal(10));
     let disjunction = or_pred(
@@ -2549,13 +2556,24 @@ fn nestloop_join_without_a_liftable_comparison_is_rejected() {
             scan_node(0, 0),
             scan_node(1, 1),
         ]);
-        let err = translate_fragment(&params(Some(plan), Some(join_desc()), None)).unwrap_err();
-        let TranslateError::UnsupportedPlanNode { reason, .. } = err else {
-            panic!("expected an unsupported plan node, got {err:?}");
+        let translated = translate_fragment(&params(Some(plan), Some(join_desc()), None)).unwrap();
+        let root = root(&translated.plan);
+        let rel::RelType::Filter(filter) = root.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+        else {
+            panic!("expected filter over constant-key join");
+        };
+        let rel::RelType::Project(project) =
+            filter.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+        else {
+            panic!("expected output projection under filter");
+        };
+        let rel::RelType::Join(join) = project.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+        else {
+            panic!("expected constant-key join under projection");
         };
         assert_eq!(
-            reason,
-            "nested-loop joins need a comparison between the two inputs"
+            join.r#type,
+            substrait::proto::join_rel::JoinType::Inner as i32
         );
     }
 }
@@ -2969,7 +2987,7 @@ fn sort_tuple_exprs_come_from_sort_info() {
 }
 
 /// Verifies GPU-executor guards: non-constant LIKE patterns, non-constant substring bounds,
-/// bare cross joins, and ungrouped DISTINCT aggregates are rejected.
+/// and ungrouped DISTINCT aggregates are rejected.
 #[test]
 fn gpu_unsupported_shapes_are_rejected() {
     // LIKE with a column pattern (not a literal).
@@ -3018,23 +3036,6 @@ fn gpu_unsupported_shapes_are_rejected() {
     .unwrap_err();
     assert!(
         matches!(err, TranslateError::UnsupportedExpression { .. }),
-        "{err:?}"
-    );
-
-    // Nested-loop join without conjuncts (bare cross product).
-    let mut join = base_plan_node(2, TPlanNodeType::NESTLOOP_JOIN_NODE, 2, vec![0, 1]);
-    join.nestloop_join_node = Some(TNestLoopJoinNode::new(
-        Some(TJoinOp::CROSS_JOIN),
-        None,
-        None,
-        None,
-        None,
-        None,
-    ));
-    let plan = TPlan::new(vec![join, scan_node(0, 0), scan_node(1, 1)]);
-    let err = translate_fragment(&params(Some(plan), Some(join_desc()), None)).unwrap_err();
-    assert!(
-        matches!(err, TranslateError::UnsupportedPlanNode { .. }),
         "{err:?}"
     );
 

@@ -1,4 +1,4 @@
-use starrocks_thrift::exprs::{TExpr, TExprNodeType};
+use starrocks_thrift::exprs::TExpr;
 use starrocks_thrift::opcodes::TExprOpcode;
 use starrocks_thrift::plan_nodes::{TJoinOp, TPlan, TPlanNode, TPlanNodeType, TSortInfo};
 use substrait::proto::read_rel::local_files::FileOrFiles;
@@ -7,9 +7,9 @@ use substrait::proto::read_rel::local_files::file_or_files::{
 };
 use substrait::proto::read_rel::{LocalFiles, NamedTable, ReadType};
 use substrait::proto::{
-    AggregateFunction, AggregateRel, CrossRel, Expression, FetchRel, FilterRel, JoinRel,
-    ProjectRel, ReadRel, Rel, RelCommon, SortField, SortRel, aggregate_rel, fetch_rel,
-    function_argument, join_rel, rel, rel_common, sort_field,
+    AggregateFunction, AggregateRel, Expression, FetchRel, FilterRel, JoinRel, ProjectRel, ReadRel,
+    Rel, RelCommon, SortField, SortRel, aggregate_rel, fetch_rel, function_argument, join_rel, rel,
+    rel_common, sort_field,
 };
 
 use crate::descriptor_table::DescriptorTable;
@@ -719,8 +719,8 @@ fn translate_hash_join(
     apply_conjuncts(joined, node, ctx)
 }
 
-/// Translates a `NESTLOOP_JOIN_NODE` into a Substrait cross product with the join conjuncts as a
-/// filter on top. Only inner/cross nested-loop joins are supported.
+/// Translates an inner/cross `NESTLOOP_JOIN_NODE` into an equality join on synthetic constants.
+/// This preserves Cartesian-product semantics without requiring a GPU cross-product operator.
 fn translate_nestloop_join(
     node: &TPlanNode,
     children: Vec<TranslatedRel>,
@@ -747,83 +747,72 @@ fn translate_nestloop_join(
     let mut children = children.into_iter();
     let left = children.next().unwrap();
     let right = children.next().unwrap();
+    let left_width = left.output_width;
+    let right_width = right.output_width;
     let row_tuples = [left.row_tuples.as_slice(), right.row_tuples.as_slice()].concat();
-    let output_width = left.output_width + right.output_width;
-
-    let conjuncts = join.join_conjuncts.as_deref().unwrap_or_default();
-    let mut conditions = Vec::with_capacity(conjuncts.len());
-    for expr in conjuncts {
-        let mut expr_ctx = ctx.expr_context(&row_tuples);
-        conditions.push(expr.translate(&mut expr_ctx)?);
-    }
-    // A conjunct-free cross product is rejected: the GPU physical planner has no cross-product
-    // operator, so the plan would translate and then fail at execution.
-    let condition = and_conditions(conditions, ctx).ok_or(TranslateError::UnsupportedPlanNode {
-        node_id: node.node_id,
-        node_type: node.node_type,
-        reason: "cross joins without join conjuncts are not supported",
-    })?;
-    if !conjuncts
-        .iter()
-        .any(|conjunct| becomes_join_condition(conjunct, &left.row_tuples, &right.row_tuples))
-    {
-        return Err(TranslateError::UnsupportedPlanNode {
-            node_id: node.node_id,
-            node_type: node.node_type,
-            reason: "nested-loop joins need a comparison between the two inputs",
-        });
-    }
-
-    let cross = Rel {
-        rel_type: Some(rel::RelType::Cross(Box::new(CrossRel {
-            left: Some(Box::new(left.rel)),
-            right: Some(Box::new(right.rel)),
-            ..Default::default()
-        }))),
-    };
-    let filtered = TranslatedRel {
+    let left = append_project(left, i32_literal(1));
+    let right = append_project(right, i32_literal(1));
+    let equal_anchor = ctx.registry.register_function(URN_COMPARISON, "equal");
+    let condition = expr_translator::scalar_function(
+        equal_anchor,
+        vec![
+            field_selection(left_width as i32),
+            field_selection((left.output_width + right_width) as i32),
+        ],
+        crate::type_mapper::bool_type(),
+    );
+    let joined = TranslatedRel {
         rel: Rel {
-            rel_type: Some(rel::RelType::Filter(Box::new(FilterRel {
-                input: Some(Box::new(cross)),
-                condition: Some(Box::new(condition)),
+            rel_type: Some(rel::RelType::Join(Box::new(JoinRel {
+                left: Some(Box::new(left.rel)),
+                right: Some(Box::new(right.rel)),
+                expression: Some(Box::new(condition)),
+                r#type: join_rel::JoinType::Inner as i32,
                 ..Default::default()
             }))),
         },
-        row_tuples,
-        output_width,
+        row_tuples: row_tuples.clone(),
+        output_width: left.output_width + right.output_width,
+    };
+    let mut mapping = (0..left_width as i32).collect::<Vec<_>>();
+    mapping.extend(left.output_width as i32..left.output_width as i32 + right_width as i32);
+    let cross = emit_columns(joined, mapping, row_tuples);
+    let filtered = if let Some(conjuncts) = join
+        .join_conjuncts
+        .as_ref()
+        .filter(|conjuncts| !conjuncts.is_empty())
+    {
+        let mut conditions = Vec::with_capacity(conjuncts.len());
+        for expr in conjuncts {
+            let mut expr_ctx = ctx.expr_context(&cross.row_tuples);
+            conditions.push(expr.translate(&mut expr_ctx)?);
+        }
+        match and_conditions(conditions, ctx) {
+            Some(condition) => {
+                let TranslatedRel {
+                    rel,
+                    row_tuples,
+                    output_width,
+                } = cross;
+                TranslatedRel {
+                    rel: Rel {
+                        rel_type: Some(rel::RelType::Filter(Box::new(FilterRel {
+                            input: Some(Box::new(rel)),
+                            condition: Some(Box::new(condition)),
+                            ..Default::default()
+                        }))),
+                    },
+                    row_tuples,
+                    output_width,
+                }
+            }
+            None => cross,
+        }
+    } else {
+        cross
     };
     // Node conjuncts are post-join predicates over the join's output row.
     apply_conjuncts(filtered, node, ctx)
-}
-
-/// Returns whether DuckDB will lift `conjunct` out of the filter above the cross product and into
-/// a join condition.
-///
-/// `FilterPushdown::PushdownCrossProduct` splits that filter by side: a predicate reading only one
-/// input is pushed into that input, and only predicates reading both become join conditions —
-/// which `ExtractJoinConditions` then keeps as conditions when the predicate is a comparison, and
-/// demotes to an any-join otherwise. With no such predicate the plan lowers to a bare cross
-/// product or an any-join, and the GPU planner implements neither
-/// (`sirius_physical_plan_generator.cpp`), so it would fail at execution instead of here.
-///
-/// This approximates the rule from the one side that matters: a comparison whose own operands each
-/// read both inputs (`a.x + b.y < 10`) also becomes an any-join, and is accepted here.
-fn becomes_join_condition(conjunct: &TExpr, left_tuples: &[i32], right_tuples: &[i32]) -> bool {
-    conjunct
-        .nodes
-        .first()
-        .is_some_and(|root| root.node_type == TExprNodeType::BINARY_PRED)
-        && reads_tuples(conjunct, left_tuples)
-        && reads_tuples(conjunct, right_tuples)
-}
-
-/// Returns whether any slot reference in `expr` belongs to one of `tuples`.
-fn reads_tuples(expr: &TExpr, tuples: &[i32]) -> bool {
-    expr.nodes.iter().any(|node| {
-        node.slot_ref
-            .as_ref()
-            .is_some_and(|slot_ref| tuples.contains(&slot_ref.tuple_id))
-    })
 }
 
 /// Combines boolean conditions with `and`.
@@ -990,6 +979,91 @@ fn project_rel(
         },
         row_tuples,
         output_width,
+    }
+}
+
+/// Appends one expression to a relation while retaining all existing columns.
+fn append_project(input: TranslatedRel, expression: Expression) -> TranslatedRel {
+    let output_width = input.output_width + 1;
+    TranslatedRel {
+        rel: Rel {
+            rel_type: Some(rel::RelType::Project(Box::new(ProjectRel {
+                common: Some(RelCommon {
+                    emit_kind: Some(rel_common::EmitKind::Emit(rel_common::Emit {
+                        output_mapping: (0..output_width as i32).collect(),
+                    })),
+                    ..Default::default()
+                }),
+                input: Some(Box::new(input.rel)),
+                expressions: vec![expression],
+                ..Default::default()
+            }))),
+        },
+        row_tuples: input.row_tuples,
+        output_width,
+    }
+}
+
+/// Emits selected input columns without evaluating new expressions.
+fn emit_columns(
+    input: TranslatedRel,
+    output_mapping: Vec<i32>,
+    row_tuples: Vec<i32>,
+) -> TranslatedRel {
+    let output_width = output_mapping.len();
+    TranslatedRel {
+        rel: Rel {
+            rel_type: Some(rel::RelType::Project(Box::new(ProjectRel {
+                common: Some(RelCommon {
+                    emit_kind: Some(rel_common::EmitKind::Emit(rel_common::Emit {
+                        output_mapping,
+                    })),
+                    ..Default::default()
+                }),
+                input: Some(Box::new(input.rel)),
+                ..Default::default()
+            }))),
+        },
+        row_tuples,
+        output_width,
+    }
+}
+
+/// Builds a direct field selection against the current relation output.
+fn field_selection(field: i32) -> Expression {
+    use substrait::proto::expression::field_reference;
+    use substrait::proto::expression::reference_segment;
+    use substrait::proto::expression::{FieldReference, ReferenceSegment};
+
+    Expression {
+        rex_type: Some(substrait::proto::expression::RexType::Selection(Box::new(
+            FieldReference {
+                reference_type: Some(field_reference::ReferenceType::DirectReference(
+                    ReferenceSegment {
+                        reference_type: Some(reference_segment::ReferenceType::StructField(
+                            Box::new(reference_segment::StructField { field, child: None }),
+                        )),
+                    },
+                )),
+                root_type: Some(field_reference::RootType::RootReference(
+                    field_reference::RootReference {},
+                )),
+            },
+        ))),
+    }
+}
+
+/// Builds an i32 literal used as a synthetic Cartesian-product key.
+fn i32_literal(value: i32) -> Expression {
+    Expression {
+        rex_type: Some(substrait::proto::expression::RexType::Literal(
+            substrait::proto::expression::Literal {
+                literal_type: Some(substrait::proto::expression::literal::LiteralType::I32(
+                    value,
+                )),
+                ..Default::default()
+            },
+        )),
     }
 }
 
