@@ -457,6 +457,10 @@ For both representations, the constructor enqueues creation of an owned source r
 **Routing (new):** Sirius-owned `sirius_sip_route` route key.
 **Coordination:** implicit, where the producer's meta-pipeline is upstream of the consumer's; explicit readiness (Phase 4) otherwise.
 
+**Rollout:** gated by the pre-registered protocol and numeric thresholds in
+[issue-1010-dynamic-filter-sip-benchmark-gates.md](issue-1010-dynamic-filter-sip-benchmark-gates.md),
+recorded before any R2 performance data is examined; thresholds may only be tightened.
+
 This differs from Phase 1 transitive scan pushdown. Today DuckDB may traverse an intervening join
 while locating a base-scan target, but that join does not consume the filter. Phase 2 would apply
 the filter at another join's probe input before its hash-probe work, including shapes where no
