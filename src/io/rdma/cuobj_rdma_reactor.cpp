@@ -579,7 +579,7 @@ void cuobj_rdma_reactor::process_claimed(admission_gate::claimed_chunk claimed_a
     }
     event.created = true;
     // ---- Delivery boundary: the first memcpy_async call (safety contract:
-    // experimental/s3-rdma-transport-design.md, Section 3).  From here the
+    // experimental/s3-rdma-transport-design.md, Section 5).  From here the
     // only returning path is an event wait that reports cudaSuccess; every
     // other outcome (error return or exception from the memcpy, the record,
     // or the wait) is process-fatal through invoke_fatal.  No unwinding

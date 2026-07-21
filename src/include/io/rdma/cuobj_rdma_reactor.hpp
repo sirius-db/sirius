@@ -62,7 +62,7 @@ void default_fatal_hook(const char* what, cudaError_t rc) noexcept;
 
 /// Sticky/context-fatal CUDA codes: the single source of truth for
 /// classifying CUDA errors before the delivery boundary (safety contract:
-/// experimental/s3-rdma-transport-design.md, Section 3).  `is_context_fatal`
+/// experimental/s3-rdma-transport-design.md, Section 5).  `is_context_fatal`
 /// scans this array and the parameterized death tests iterate it, so dropping
 /// a code fails a test.  A code belongs here iff NVIDIA documentation demands
 /// process terminate/relaunch, declares the context/device unusable, or
