@@ -66,10 +66,8 @@ class sirius_interface {
   sirius_interface(duckdb::ClientContext& client_context,
                    std::optional<std::string> query_label = std::nullopt);
 
-  //! Build a telemetry query label from raw SQL text (whitespace-collapsed, truncated) so
-  //! viewers show a recognizable name instead of a placeholder. Shared fallback for every
-  //! path that constructs a sirius_interface without an explicit label. Returns
-  //! std::nullopt for empty SQL.
+  //! Build a telemetry query label from raw SQL text (whitespace-collapsed, truncated);
+  //! the fallback when no explicit label was set. Returns std::nullopt for empty SQL.
   static std::optional<std::string> query_label_from_sql(const std::string& sql);
 
   //! The client context

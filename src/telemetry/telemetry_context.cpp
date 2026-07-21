@@ -261,10 +261,9 @@ void emit_plan_telemetry(
     }
 
     // Derived-plan edges: chain consecutive operators of the pipeline (execution order:
-    // source -> ... -> sink) through synthesized port pairs. The runtime only wires real
-    // ports at pipeline boundaries, so without these edges every interior operator floats:
-    // filters/projections render as sources and joins as sinks. Child pipelines share their
-    // operator prefix with the parent, so dedupe pairs to avoid duplicate edges.
+    // source -> ... -> sink) through synthesized port pairs — the runtime only wires real
+    // ports at pipeline boundaries. Child pipelines share their operator prefix with the
+    // parent, so dedupe pairs to avoid duplicate edges.
     for (std::size_t i = 0; i + 1 < operators.size(); ++i) {
       const auto& upstream   = operators[i].get();
       const auto& downstream = operators[i + 1].get();

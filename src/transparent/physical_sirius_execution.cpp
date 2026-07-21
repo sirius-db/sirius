@@ -130,8 +130,8 @@ duckdb::unique_ptr<duckdb::GlobalSourceState> PhysicalSiriusExecution::GetGlobal
   auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
   auto query_label =
     sirius_ctx ? sirius_ctx->take_pending_query_label() : std::optional<std::string>{};
-  // With no explicit label, fall back to the intercepted SQL text so transparently-executed
-  // queries get a recognizable telemetry name instead of "unnamed_query".
+  // With no explicit label, fall back to the SQL text so telemetry viewers show a
+  // recognizable name.
   if (!query_label) { query_label = sirius::sirius_interface::query_label_from_sql(query_sql_); }
   state->iface = duckdb::make_uniq<sirius::sirius_interface>(context, std::move(query_label));
   state->sirius_context = sirius_ctx.get();
