@@ -298,30 +298,20 @@ any other gate fails — the decision is STOP: restart the process and
 return to `s3_transport=HTTP`. The build flag stays off by default
 throughout.
 
-## 8. Current Status and Remaining Work
+## 8. Open Risks and Preconditions
 
-The transport machinery in the tree is dormant; the real cuObject
-transfer has not run yet, and the rig gates above will be its first
-exercise. Five gaps close, in order, before the gates run:
+The real cuObject path has not yet completed hardware qualification;
+implementation progress is tracked in the implementation PR. The risks
+below are resolved or measured by the Section 7 gates and do not change
+the V1 safety contract.
 
-1. Factory wiring — the factory does not yet construct the control
-   client; reads cannot route through the normal path.
-2. Endpoint pair — configuration has a single endpoint today.
-3. Envelope admission — chunk admission is eager rather than
-   envelope-bounded.
-4. Retry removal — device reads still carry a legacy multi-attempt retry
-   to be reduced to one-shot.
-5. Completion and gateway hardening — completion validation does not yet
-   check the reply-tag and status legs; gateway exact-write enforcement
-   and descriptor capacity checks are outstanding.
-
-| Risk | Nature |
+| Risk | Treatment |
 |---|---|
-| SDK registration scope | If no planned arena layout can absorb the SDK's registration-to-session binding, the phase stops at preflight |
-| Gateway dependency | The data plane requires a controlled cuObject gateway; the evaluation cannot run against plain S3 |
-| GPU/NIC topology | PCIe placement across root complexes can halve bandwidth and would surface at the hardware gate |
-| No-retry reliability | One-shot reads fail the soak at a transient-fault rate above roughly one in twenty-five million GETs; the soak measures this before any retry is considered |
-| Copy-cost estimate | Pre-copy staging and per-chunk D2D cost are estimates until the hardware gate measures them; the copy should be small against wire time at 100 Gbps |
+| SDK registration scope | Preflight selects a supported registration/session layout; if none of the planned arena layouts can absorb the SDK's binding, the evaluation stops there. |
+| Gateway dependency | The data plane requires a controlled cuObject gateway; the evaluation cannot run against a plain S3 endpoint. |
+| GPU/NIC topology | PCIe placement across root complexes can halve bandwidth; hardware qualification records the locality and the performance gate verifies the selected topology. |
+| No-retry reliability | A transient-fault rate above roughly one in twenty-five million GETs fails the soak; the 100-million-GET soak measures this before any retry mechanism is considered. |
+| D2D delivery cost | Staging-window and per-chunk D2D costs are estimates; the performance gate measures delivery end to end into caller-owned RMM, so the copy cost sits inside the 85% bound. |
 
 ## 9. Decisions Requested
 
