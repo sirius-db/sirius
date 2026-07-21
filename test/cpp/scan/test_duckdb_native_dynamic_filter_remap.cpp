@@ -24,8 +24,8 @@
 #include <duckdb/planner/table_filter.hpp>
 #include <duckdb/storage/data_table.hpp>
 #include <duckdb/storage/storage_manager.hpp>
+#include <op/dynamic_filter/sirius_dynamic_filter.hpp>
 #include <op/scan/duckdb_native_gpu_ingestible.hpp>
-#include <op/sirius_dynamic_filter.hpp>
 #include <unistd.h>
 
 #include <cstdlib>

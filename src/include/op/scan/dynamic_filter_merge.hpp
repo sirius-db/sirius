@@ -21,9 +21,9 @@
 
 #include <rmm/cuda_stream_view.hpp>
 
+#include <op/dynamic_filter/sirius_dynamic_filter.hpp>
 #include <op/scan/dynamic_filter_gate.hpp>
 #include <op/scan/scan_plan.hpp>
-#include <op/sirius_dynamic_filter.hpp>
 
 #include <memory>
 

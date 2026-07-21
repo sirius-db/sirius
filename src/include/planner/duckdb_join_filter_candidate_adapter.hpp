@@ -194,9 +194,9 @@ class duckdb_join_filter_candidate final {
  *
  * Consumers receive Sirius-owned structural values and do not retain or dereference DuckDB's
  * `JoinFilterPushdownInfo`. The opaque channel handle is the deliberate exception: it keeps the
- * shared route identity alive without exposing mutation. Planner code that still reads
- * `filter_pushdown` / `dynamic_filters` directly predates the adapter; follow-up units route those
- * reads through it.
+ * shared route identity alive without exposing mutation. `sirius_plan_comparison_join` obtains
+ * producer-side metadata exclusively through @ref extract; the scan planner still reads
+ * `LogicalGet::dynamic_filters` directly for consumer channel keying.
  */
 namespace duckdb_join_filter_candidate_adapter {
 

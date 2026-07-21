@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#include "op/sirius_dynamic_filter.hpp"
+#include "op/dynamic_filter/sirius_dynamic_filter.hpp"
 
 #include <cudf/ast/expressions.hpp>
 #include <cudf/scalar/scalar.hpp>

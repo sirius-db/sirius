@@ -24,6 +24,7 @@
 #include <cucascade/memory/config.hpp>
 #include <cucascade/memory/topology_discovery.hpp>
 
+#include <cmath>
 #include <filesystem>
 #include <string>
 
@@ -54,6 +55,27 @@ constexpr double DEFAULT_MAX_SORT_PARTITION_MEMORY_FRACTION = 0.33;
 /// that the crossover is hardware- and workload-dependent. Recalibrate per GPU; set to 0 to
 /// disable (always use filtered_join).
 constexpr double DEFAULT_MARK_JOIN_BUILD_SWITCH_RATIO = 8.0;
+
+/**
+ * @brief Accepted range for `dynamic_filter_domain_coverage_threshold`
+ *
+ * Every surface that accepts this setting -- the YAML configuration reader and the SQL `SET`
+ * handler -- validates through this one predicate, so the surfaces cannot drift apart. A
+ * non-positive value would make the coverage gate suppress every filter and a NaN would disable
+ * the gate silently, so both are rejected where the value enters rather than where it is used:
+ * the publication plan that transports it is built for every GPU hash join and must not be able
+ * to fail.
+ */
+struct valid_domain_coverage_threshold {
+  [[nodiscard]] bool operator()(double value) const noexcept
+  {
+    return std::isfinite(value) && value > 0.0;
+  }
+  [[nodiscard]] static constexpr char const* description() noexcept
+  {
+    return "must be finite and greater than 0.0";
+  }
+};
 
 }  // namespace config
 

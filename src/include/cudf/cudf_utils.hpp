@@ -65,6 +65,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -209,6 +210,29 @@ inline cudf::data_type get_cudf_type(const logical_type& t)
     default:
       throw duckdb::InvalidInputException("sirius::get_cudf_type: Unsupported type: %s",
                                           t.to_string());
+  }
+}
+
+/**
+ * @brief Map a sirius::logical_type to its cudf::data_type, or nothing when it has no mapping
+ *
+ * For callers to whom an unmapped type is a routine classification rather than an error --
+ * plan-time admission deciding whether a key can carry a GPU filter, for instance. Using @ref
+ * get_cudf_type for that decision forces a `catch` that also swallows unrelated failures such as
+ * `std::bad_alloc`.
+ *
+ * @param[in] t The Sirius type to map
+ * @return The cuDF type, or `std::nullopt` when @p t has no cuDF representation
+ */
+[[nodiscard]] inline std::optional<cudf::data_type> try_get_cudf_type(
+  logical_type const& t) noexcept
+{
+  try {
+    return get_cudf_type(t);
+  } catch (duckdb::InvalidInputException const&) {
+    return std::nullopt;
+  } catch (...) {
+    return std::nullopt;
   }
 }
 

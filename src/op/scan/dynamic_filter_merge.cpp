@@ -22,7 +22,7 @@
 #include <nvtx3/nvtx3.hpp>
 
 #include <log/logging.hpp>
-#include <op/dynamic_filter_device.hpp>
+#include <op/dynamic_filter/dynamic_filter_device.hpp>
 #include <op/scan/dynamic_filter_merge.hpp>
 
 #include <algorithm>

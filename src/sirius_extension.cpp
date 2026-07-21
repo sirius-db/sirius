@@ -1708,8 +1708,9 @@ static void SetDynamicFilterDomainCoverageThreshold(ClientContext& context,
   auto* params = get_operator_params(context);
   if (!params) { return; }
   const double threshold = parameter.GetValue<double>();
-  if (threshold <= 0.0) {
-    throw InvalidInputException("dynamic_filter_domain_coverage_threshold must be > 0.0, got %f",
+  if (!sirius::config::valid_domain_coverage_threshold{}(threshold)) {
+    throw InvalidInputException("dynamic_filter_domain_coverage_threshold %s, got %f",
+                                sirius::config::valid_domain_coverage_threshold::description(),
                                 threshold);
   }
   params->dynamic_filter_domain_coverage_threshold = threshold;

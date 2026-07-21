@@ -96,8 +96,7 @@ mark_join_fixture create_mark_join()
     duckdb::vector<duckdb::idx_t>{},  // left_projection_map (empty = all)
     duckdb::vector<duckdb::idx_t>{},  // right_projection_map (not used by MARK)
     sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{}),  // delim_types
-    1000,
-    nullptr);
+    1000);
 
   return f;
 }

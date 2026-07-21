@@ -34,9 +34,9 @@
 #include <cuda_runtime.h>
 
 #include <catch.hpp>
+#include <op/dynamic_filter/sirius_dynamic_filter.hpp>
 #include <op/scan/dynamic_filter_merge.hpp>
 #include <op/scan/scan_plan.hpp>
-#include <op/sirius_dynamic_filter.hpp>
 
 #include <barrier>
 #include <cstddef>

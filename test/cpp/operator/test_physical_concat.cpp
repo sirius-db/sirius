@@ -102,8 +102,7 @@ hash_join_test_fixture create_test_hash_join(duckdb::JoinType join_type,
     duckdb::vector<duckdb::idx_t>{},  // left_projection_map (empty = all)
     duckdb::vector<duckdb::idx_t>{},  // right_projection_map (empty = all)
     sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{}),  // delim_types
-    1000,                                                            // estimated_cardinality
-    nullptr);                                                        // pushdown_info
+    1000);                                                           // estimated_cardinality
 
   return fixture;
 }

@@ -20,9 +20,12 @@
 
 namespace sirius::op::detail {
 
-/// @brief Resolve a dynamic-filter device argument, treating a negative ID as the current device.
-///
-/// @return The explicit device ID, the current CUDA device, or -1 if CUDA cannot report one.
+/**
+ * @brief Resolve a dynamic-filter device argument, treating a negative ID as the current device
+ *
+ * @param[in] device_id The requested device ID, or a negative value for the current CUDA device
+ * @return The explicit device ID, the current CUDA device, or -1 if CUDA cannot report one
+ */
 [[nodiscard]] inline int resolve_dynamic_filter_device_id(int device_id) noexcept
 {
   if (device_id >= 0) { return device_id; }

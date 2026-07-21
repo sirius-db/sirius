@@ -50,15 +50,6 @@ class sirius_physical_nested_loop_join : public sirius_physical_partition_consum
     SiriusPhysicalOperatorType::NESTED_LOOP_JOIN;
 
  public:
-  sirius_physical_nested_loop_join(
-    duckdb::LogicalOperator& op,
-    duckdb::unique_ptr<sirius_physical_operator> left,
-    duckdb::unique_ptr<sirius_physical_operator> right,
-    duckdb::vector<sirius::join_condition> cond,
-    duckdb::JoinType join_type,
-    std::size_t estimated_cardinality,
-    duckdb::unique_ptr<duckdb::JoinFilterPushdownInfo> pushdown_info_p);
-
   sirius_physical_nested_loop_join(duckdb::LogicalOperator& op,
                                    duckdb::unique_ptr<sirius_physical_operator> left,
                                    duckdb::unique_ptr<sirius_physical_operator> right,
@@ -98,8 +89,6 @@ class sirius_physical_nested_loop_join : public sirius_physical_partition_consum
 
   //! Duplicate eliminated types; only used for delim_joins (i.e. correlated subqueries)
   duckdb::vector<sirius::logical_type> delim_types;
-
-  duckdb::unique_ptr<duckdb::JoinFilterPushdownInfo> filter_pushdown;
 
  protected:
   // CachingOperator Interface

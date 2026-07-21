@@ -33,7 +33,6 @@
 #include "cudf/utilities/memory_resource.hpp"
 #include "cudf/version_config.hpp"
 #include "data/data_batch_utils.hpp"
-#include "duckdb/execution/operator/join/join_filter_pushdown.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
@@ -41,8 +40,8 @@
 #include "expression_evaluator/gpu_expression_translator_internal.hpp"
 #include "helper/type_conversions.hpp"
 #include "log/logging.hpp"
-#include "op/dynamic_filter_publisher.hpp"
-#include "op/sirius_dynamic_filter.hpp"
+#include "op/dynamic_filter/dynamic_filter_publisher.hpp"
+#include "op/dynamic_filter/sirius_dynamic_filter.hpp"
 #include "op/sirius_physical_nested_loop_join.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
@@ -57,6 +56,7 @@
 #include <cucascade/memory/memory_space.hpp>
 
 #include <algorithm>
+#include <cassert>
 #include <cstdint>
 #include <cstdio>
 #include <format>
@@ -173,8 +173,13 @@ bool sirius_physical_hash_join::are_conditions_supported(
   return true;
 }
 
-void reorder_join_conditions(duckdb::vector<sirius::join_condition>& conditions)
+void reorder_join_conditions(duckdb::vector<sirius::join_condition>& conditions,
+                             std::vector<dynamic_filter_condition_shape>& condition_key_shapes)
 {
+  // One permutation applied to both vectors: this call is the single point that establishes the
+  // conditions/shapes index alignment, so the two containers cannot drift. The caller validates
+  // that the shapes vector is empty or already aligned.
+  assert(condition_key_shapes.empty() || condition_key_shapes.size() == conditions.size());
   bool is_ordered     = true;
   bool seen_non_equal = false;
   for (auto& cond : conditions) {
@@ -188,21 +193,30 @@ void reorder_join_conditions(duckdb::vector<sirius::join_condition>& conditions)
     }
   }
   if (is_ordered) { return; }
+  bool const with_shapes = !condition_key_shapes.empty();
   duckdb::vector<sirius::join_condition> equal_conditions;
   duckdb::vector<sirius::join_condition> other_conditions;
-  for (auto& cond : conditions) {
+  std::vector<dynamic_filter_condition_shape> equal_shapes;
+  std::vector<dynamic_filter_condition_shape> other_shapes;
+  for (std::size_t condition_index = 0; condition_index < conditions.size(); ++condition_index) {
+    auto& cond = conditions[condition_index];
     if (is_equality(cond.comparison)) {
       equal_conditions.push_back(std::move(cond));
+      if (with_shapes) { equal_shapes.push_back(condition_key_shapes[condition_index]); }
     } else {
       other_conditions.push_back(std::move(cond));
+      if (with_shapes) { other_shapes.push_back(condition_key_shapes[condition_index]); }
     }
   }
   conditions.clear();
-  for (auto& cond : equal_conditions) {
-    conditions.push_back(std::move(cond));
+  condition_key_shapes.clear();
+  for (std::size_t i = 0; i < equal_conditions.size(); ++i) {
+    conditions.push_back(std::move(equal_conditions[i]));
+    if (with_shapes) { condition_key_shapes.push_back(equal_shapes[i]); }
   }
-  for (auto& cond : other_conditions) {
-    conditions.push_back(std::move(cond));
+  for (std::size_t i = 0; i < other_conditions.size(); ++i) {
+    conditions.push_back(std::move(other_conditions[i]));
+    if (with_shapes) { condition_key_shapes.push_back(other_shapes[i]); }
   }
 }
 
@@ -216,26 +230,25 @@ sirius_physical_hash_join::sirius_physical_hash_join(
   const duckdb::vector<std::size_t>& right_projection_map,
   duckdb::vector<sirius::logical_type> delim_types,
   std::size_t estimated_cardinality,
-  duckdb::unique_ptr<duckdb::JoinFilterPushdownInfo> pushdown_info_p,
   uint64_t max_build_hash_table_bytes,
-  dynamic_filter_publish_plan dynamic_filter_plan)
+  dynamic_filter_publish_plan dynamic_filter_plan,
+  std::vector<dynamic_filter_condition_shape> condition_key_shapes_p)
   : sirius_physical_partition_consumer_operator(SiriusPhysicalOperatorType::HASH_JOIN,
                                                 sirius::from_duckdb_vec(op.types),
                                                 estimated_cardinality),
     conditions(std::move(cond)),
+    condition_key_shapes(std::move(condition_key_shapes_p)),
     join_type(join_type),
     delim_types(std::move(delim_types)),
     _dynamic_filter_plan(std::move(dynamic_filter_plan))
 {
   _max_build_hash_table_bytes = max_build_hash_table_bytes;
-  reorder_join_conditions(conditions);
-
-  filter_pushdown = std::move(pushdown_info_p);
-  if (_dynamic_filter_plan.enabled() && !filter_pushdown) {
+  if (!condition_key_shapes.empty() && condition_key_shapes.size() != conditions.size()) {
     throw std::invalid_argument(
-      "[sirius_physical_hash_join] An enabled dynamic-filter publication plan requires join "
-      "filter-pushdown metadata");
+      "[sirius_physical_hash_join] condition_key_shapes must be empty or aligned one-to-one with "
+      "the join conditions");
   }
+  reorder_join_conditions(conditions, condition_key_shapes);
 
   children.push_back(std::move(left));
   children.push_back(std::move(right));
@@ -368,7 +381,6 @@ sirius_physical_hash_join::sirius_physical_hash_join(
                               {},
                               {},
                               estimated_cardinality,
-                              nullptr,
                               max_build_hash_table_bytes,
                               {})
 {
@@ -1408,10 +1420,21 @@ void sirius_physical_hash_join::publish_dynamic_filters(cudf::table_view const& 
   }
 
   try {
-    if (filter_pushdown && _dynamic_filter_plan.enabled()) {
-      dynamic_filter_publisher{
-        *filter_pushdown, _dynamic_filter_plan, key_casts, right_key_col_indices}
-        .publish(build_view, stream);
+    if (_dynamic_filter_plan.enabled()) {
+      auto const outcome =
+        sirius::op::publish_dynamic_filters(_dynamic_filter_plan, build_view, stream);
+      SIRIUS_LOG_DEBUG(
+        "[sirius_physical_hash_join] dynamic-filter publication: {} key(s) considered, {} skipped "
+        "(domain gate), {} skipped (type mismatch), {} membership + {} zone-map built, {} "
+        "filter(s) "
+        "pushed across {} active target(s).",
+        outcome.keys_considered,
+        outcome.keys_skipped_domain_gate,
+        outcome.keys_skipped_type_mismatch,
+        outcome.membership_filters_built,
+        outcome.zone_map_filters_built,
+        outcome.filters_pushed,
+        outcome.active_targets);
     }
     _dynamic_filter_publication_state.store(dynamic_filter_publication_state::FINISHED,
                                             std::memory_order_release);
@@ -1439,8 +1462,7 @@ void sirius_physical_hash_join::push_data_batch_partitioned(
       std::scoped_lock lg(op_state_mutex);
       claim = _dynamic_filter_publication_state.load(std::memory_order_acquire) ==
                 dynamic_filter_publication_state::OPEN &&
-              _join_mode == HASH_JOIN_MODE::BUILD_PROBE && filter_pushdown &&
-              _dynamic_filter_plan.enabled();
+              _join_mode == HASH_JOIN_MODE::BUILD_PROBE && _dynamic_filter_plan.enabled();
     }
     if (claim) { build_ro.emplace(batch->to_read_only()); }
   }

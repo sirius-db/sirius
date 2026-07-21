@@ -16,9 +16,9 @@
 
 #pragma once
 
+#include <op/dynamic_filter/sirius_dynamic_filter.hpp>
 #include <op/scan/dynamic_filter_gate.hpp>
 #include <op/scan/dynamic_filter_merge.hpp>
-#include <op/sirius_dynamic_filter.hpp>
 #include <op/sirius_physical_operator.hpp>
 
 #include <cstddef>

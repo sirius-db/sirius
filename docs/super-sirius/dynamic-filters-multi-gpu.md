@@ -146,8 +146,8 @@ first queried `cudaDevAttrL2CacheSize`.
 ### 2. Keep publication local and exactly once
 
 `dynamic_filter_publisher` is declared in
-`src/include/op/dynamic_filter_publisher.hpp` and implemented in
-`src/op/dynamic_filter_publisher.cpp`; the physical hash join owns and invokes
+`src/include/op/dynamic_filter/dynamic_filter_publisher.hpp` and implemented in
+`src/op/dynamic_filter/dynamic_filter_publisher.cpp`; the physical hash join owns and invokes
 it. It consumes the immutable plan, the join's key metadata, and one materialized
 build view; it is not a shared scheduler service or a mutable routing registry.
 
@@ -461,17 +461,17 @@ claim. Q19 regresses 1.0%, so the gain is global rather than universal per query
 ## Code map
 
 - Filter API and device-aware ownership:
-  `src/include/op/sirius_dynamic_filter.hpp`
+  `src/include/op/dynamic_filter/sirius_dynamic_filter.hpp`
 - Membership storage replication:
   `src/cuda/sirius_dynamic_small_in_list_filter.cu`,
   `src/cuda/sirius_dynamic_in_list_filter.cu`,
   `src/cuda/sirius_dynamic_bloom_filter.cu`
 - Exact typed zone-map replication:
-  `src/op/sirius_dynamic_filter.cpp`
+  `src/op/dynamic_filter/sirius_dynamic_filter.cpp`
 - Producer device discovery and publication:
   `src/planner/sirius_plan_comparison_join.cpp`,
-  `src/include/op/dynamic_filter_publisher.hpp`,
-  `src/op/dynamic_filter_publisher.cpp`,
+  `src/include/op/dynamic_filter/dynamic_filter_publisher.hpp`,
+  `src/op/dynamic_filter/dynamic_filter_publisher.cpp`,
   `src/op/sirius_physical_hash_join.cpp`
 - Consumer device selection:
   `src/include/op/scan/dynamic_filter_gate.hpp`,
@@ -479,8 +479,8 @@ claim. Q19 regresses 1.0%, so the gain is global rather than universal per query
   `src/op/scan/parquet_gpu_ingestible.cpp`,
   `src/op/scan/sirius_physical_dynamic_filter.cpp`
 - Sirius-owned replica-transfer policy:
-  `src/include/op/dynamic_filter_replica_reservation.hpp`,
-  `src/include/op/dynamic_filter_replica_transfer.hpp`,
+  `src/include/op/dynamic_filter/dynamic_filter_replica_reservation.hpp`,
+  `src/include/op/dynamic_filter/dynamic_filter_replica_transfer.hpp`,
   `src/cuda/dynamic_filter_replica_transfer.cu`
 - Focused regressions:
   `test/cpp/operator/test_dynamic_filter_publisher.cpp`,

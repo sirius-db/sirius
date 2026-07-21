@@ -30,7 +30,7 @@ Anything implemented in Phase 1 is reused unchanged by later phases. We do not r
 The framework has four pieces, all designed to be filter-kind, producer-kind, and consumer-kind agnostic:
 
 1. **`sirius_dynamic_filter`** — polymorphic base class for runtime-computed filters. Each subclass knows how to lower itself to a cuDF AST fragment, to a runtime apply pass, or both.
-2. **`sirius_dynamic_filter_set`** — thread-safe append-only channel that connects producers and consumers. Keyed by the consumer's column index in its output schema.
+2. **`sirius_dynamic_filter_set`** — thread-safe append-only channel that connects producers and consumers. For a scan route, it accepts a position in the target scan's `column_ids` vector, remaps that position once at push time, and stores filters by consumer output position.
 3. **Filter router** — keeps a map of channels keyed by a *route key*, so multiple operators can attach to the same channel during plan construction.
 4. **Producer / consumer roles** — concrete operators that push filters into channels (producers) or read them out (consumers). An operator can be both for different channels.
 
@@ -103,7 +103,7 @@ Properties:
 
 - **Append-only.** `push_filter(col_idx, f)` adds; nothing removes.
 - **Thread-safe.** A mutex guards the underlying map.
-- **Keyed by consumer column index.** Producers push for a column index in the *consumer's* output schema. Multiple producers targeting the same column AND-conjoin at the consumer.
+- **Push and storage coordinates are distinct.** For a scan route, producers push a position in the target scan's `column_ids` vector—not the base-table column ID stored at that position. The channel applies its installed `column_ids`-position to output-position remap exactly once; its stored map and consumer accessors are keyed by output position. Multiple producers targeting the same output column AND-conjoin at the consumer.
 - **N producers, one logical consumer endpoint per channel.** Multiple joins may publish into the
   same channel. Multiple consumers use separate channels; the producer can fan the same immutable
   filter object into each one.
@@ -129,23 +129,61 @@ For Phase 2 (SIP) and Phase 3 (other producers), there is no DuckDB-supplied poi
 
 ### Producer / consumer wiring
 
-*Introduced in Phase 1.1.* A **producer** receives an immutable publication plan. Its per-target entries hold the channel and the column-index translation from the build keys to the consumer:
+*Introduced in Phase 1.1.* The **producer-key admission boundary** (called the producer-key
+admission *seam* in some issue-planning terminology) is the plan-time boundary where DuckDB join
+conditions and join-filter hints become Sirius-owned publication metadata. The runtime publisher
+receives only the immutable result; it does not reinterpret DuckDB metadata.
+
+A **producer** receives an immutable publication plan. It uses a dense admitted-key array for
+filter construction and sparse per-target bindings for fan-out:
 
 ```cpp
 class dynamic_filter_publish_plan {
  public:
+  struct admitted_key {
+    std::size_t condition_index;       // original-condition provenance
+    cudf::size_type build_key_ordinal; // runtime build-table column
+    cudf::data_type storage_type;
+    dynamic_filter_condition_shape key_shape;  // carried pre-materialization classification
+  };
+
+  struct key_binding {
+    std::size_t admitted_key_index;    // dense admitted-key array
+    std::size_t channel_push_ordinal;  // this target channel's push space
+    cudf::data_type probe_storage_type;
+  };
+
   struct probe_target {
     std::shared_ptr<sirius_dynamic_filter_set> filter_set;
-    std::vector<std::size_t> probe_col_idx;       // build-key idx -> consumer col idx
-    std::vector<cudf::data_type> probe_col_type;  // consumer storage type per key
+    dynamic_filter_route_class route_class;
+    bool accepts_zone_map_filters;
+    std::vector<key_binding> key_bindings;
   };
 
  private:
+  std::vector<admitted_key> _admitted_keys;
   std::vector<probe_target> _probe_targets;
-  std::vector<std::size_t> _build_key_domain_cardinalities;  // per key; 0 = gates off
+  std::vector<std::size_t> _build_key_domain_cardinalities;  // admitted-key order
   std::vector<dynamic_filter_replica_space> _replica_spaces;
 };
 ```
+
+Admission keeps four persisted coordinates distinct:
+
+| Coordinate | Meaning |
+|---|---|
+| Original condition index | Provenance in the pre-wrap, pre-reorder join-condition vector; also indexes carried pre-materialization shapes and per-condition domain evidence |
+| Admitted-key index | Dense position after statically illegal keys are removed |
+| Build-key ordinal | Column in the materialized runtime build table |
+| Channel push ordinal | Target-specific publication coordinate: scan `column_ids` space for a scan route, or probe-child output space for a direct route |
+
+Two indexes only align plan-construction vectors. A **target index** selects matching target and
+binding-list entries. A temporary **DuckDB filter ordinal** zips a hinted condition index to that
+condition's push ordinal and probe type for each target; admission consumes it rather than
+persisting it. For example, hints `[2, 0]` and target push ordinals `[12, 7]` pair condition 2
+with ordinal 12 and condition 0 with ordinal 7. Rejecting condition 0 does not shift condition 2
+away from ordinal 12. A scan channel later remaps its `column_ids`-space push ordinal exactly once
+to the consumer's output position. That downstream output position is not an admission coordinate.
 
 The planner freezes routing, placement, and policy into the hash join's `const dynamic_filter_publish_plan`. Each `dynamic_filter_replica_space` pairs one target GPU space with its selected HOST staging space. The build-port hook claims publication as soon as the complete build batch arrives, holding the batch's read-only accessor from before it is routed so the GPU representation cannot be downgraded underneath publication. The producer builds and replicates each filter, then fans it into the accepting channels. Finalization only closes an unclaimed publication window.
 
@@ -458,10 +496,10 @@ An incrementally refined producer/consumer pair, or a consumer that requires a f
 
 ## References
 
-- `src/include/op/sirius_dynamic_filter.hpp`, `src/op/sirius_dynamic_filter.cpp`, `test/cpp/operator/test_sirius_dynamic_filter.cpp` — framework API, zone-map implementation, channel, and focused tests
+- `src/include/op/dynamic_filter/sirius_dynamic_filter.hpp`, `src/op/dynamic_filter/sirius_dynamic_filter.cpp`, `test/cpp/operator/test_sirius_dynamic_filter.cpp` — framework API, zone-map implementation, channel, and focused tests
 - `src/cuda/sirius_dynamic_small_in_list_filter.cu`, `src/cuda/sirius_dynamic_in_list_filter.cu`, `src/cuda/sirius_dynamic_bloom_filter.cu` — raw-needle, hash-set, and Bloom membership filters plus replica construction
 - `src/include/op/scan/dynamic_filter_merge.hpp`, `src/op/scan/dynamic_filter_merge.cpp`, `test/cpp/scan/test_dynamic_filter_merge.cpp` — consumer-side merge/apply helpers (`merge_dynamic_filters_into_ast`, `apply_dynamic_filters_to_view`, `apply_dynamic_filters_gated_view`)
 - `src/planner/sirius_plan_comparison_join.cpp`, `src/planner/sirius_plan_get.cpp`, `test/cpp/planner/test_dynamic_filter_router.cpp` — producer/consumer plan-gen wiring and router
-- `src/op/sirius_physical_concat.cpp`, `src/op/dynamic_filter_publisher.cpp`, `src/op/sirius_physical_hash_join.cpp` — synchronous build-port publication, filter selection/replication, and fan-out
+- `src/op/sirius_physical_concat.cpp`, `src/op/dynamic_filter/dynamic_filter_publisher.cpp`, `src/op/sirius_physical_hash_join.cpp` — synchronous build-port publication, filter selection/replication, and fan-out
 - `src/include/expression_evaluator/gpu_expression_translator_internal.hpp` — existing AST construction patterns (`cudf::ast::tree::emplace`, scalar lifetime)
 - `duckdb/src/include/duckdb/execution/operator/join/join_filter_pushdown.hpp` — `JoinFilterPushdownInfo`, `JoinFilterPushdownFilter` (consumed by Phase 1.1)

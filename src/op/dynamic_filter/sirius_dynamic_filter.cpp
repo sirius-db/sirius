@@ -15,8 +15,8 @@
  */
 
 // sirius
-#include <op/dynamic_filter_device.hpp>
-#include <op/sirius_dynamic_filter.hpp>
+#include <op/dynamic_filter/dynamic_filter_device.hpp>
+#include <op/dynamic_filter/sirius_dynamic_filter.hpp>
 
 // cudf
 #include <cudf/ast/expressions.hpp>
@@ -443,7 +443,7 @@ cudf::ast::expression const& sirius_dynamic_zone_map_filter::to_ast(
 }
 
 //===----------------------------------------------------------------------===//
-// sirius_dynamic_in_list_filter —
+// sirius_dynamic_in_list_filter --
 //   implemented in src/cuda/sirius_dynamic_in_list_filter.cu (the
 //   persistent cuco::static_set is device code, PIMPL'd behind set_impl).
 //===----------------------------------------------------------------------===//

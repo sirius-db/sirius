@@ -28,8 +28,7 @@
 #include "duckdb/planner/operator/logical_join.hpp"
 #include "expression/ast/node.hpp"  // complete sirius::ast::node for join_condition's destructor
 #include "expression/join_condition.hpp"
-#include "op/dynamic_filter_publish_plan.hpp"
-#include "op/dynamic_filter_replica_space.hpp"
+#include "op/dynamic_filter/dynamic_filter_publish_plan.hpp"
 #include "op/sirius_physical_partition_consumer_operator.hpp"
 #include "sirius_config.hpp"
 #include "utils.hpp"
@@ -82,9 +81,9 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
     const duckdb::vector<std::size_t>& right_projection_map,
     duckdb::vector<sirius::logical_type> delim_types,
     std::size_t estimated_cardinality,
-    duckdb::unique_ptr<duckdb::JoinFilterPushdownInfo> pushdown_info,
     uint64_t max_build_hash_table_bytes             = config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES,
-    dynamic_filter_publish_plan dynamic_filter_plan = {});
+    dynamic_filter_publish_plan dynamic_filter_plan = {},
+    std::vector<dynamic_filter_condition_shape> condition_key_shapes = {});
 
   sirius_physical_hash_join(
     duckdb::LogicalOperator& op,
@@ -96,8 +95,16 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
     uint64_t max_build_hash_table_bytes = config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES);
 
   duckdb::vector<sirius::join_condition> conditions;
-  //! Scans where we should push generated filters into (if any)
-  duckdb::unique_ptr<duckdb::JoinFilterPushdownInfo> filter_pushdown;
+  /**
+   * @brief Carried pre-materialization key-shape classification, index-aligned with
+   * `conditions`
+   *
+   * Either empty or `condition_key_shapes[i]` describes `conditions[i]`, an alignment the
+   * constructor preserves by permuting both vectors through one `reorder_join_conditions`
+   * call. Immutable after construction (like `conditions`). Consumed by the plan-time
+   * join-edge placement helper of issue #1010; runtime execution never reads it.
+   */
+  std::vector<dynamic_filter_condition_shape> condition_key_shapes;
 
   //! The types of the join keys
   duckdb::vector<sirius::logical_type> condition_types;
