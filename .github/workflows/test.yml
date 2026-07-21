@@ -111,7 +111,7 @@ jobs:
               run-on-pr: ${{ fromJSON(github.event_name == 'pull_request' && 'false' || 'null') }}
       fail-fast: false
     runs-on: ${{ fromJSON(format('["self-hosted", "{0}", "gpu-2xl4"]', matrix.cuda.runner)) }}
-    timeout-minutes: 60
+    timeout-minutes: 90
     env:
       CUDA_CACHE_PATH: /home/runner/actions-runner/_work/.cuda-cache
       SIRIUS_LOG_LEVEL: trace
@@ -182,6 +182,27 @@ jobs:
           name: tpch-run-${{ github.run_id }}-cuda-${{ matrix.cuda.version }}
           path: ${{ steps.tpch.outputs.run_dir }}
           retention-days: 14
+
+      # S3 integration gate (issue #904).
+      # Requires the Docker daemon to be running on the runner (testcontainers
+      # starts MinIO via the Docker socket). Infra tracks enabling this on the
+      # gpu-2xl4 runners; the diagnostic step below will turn green once done.
+      #
+      # Phase 1: run on this branch's CUDA-13 test-run.
+      # Phase 2 (before merge): gate each step behind
+      #   github.event_name == 'merge_group' &&
+      # so PR CI stays Docker-free and only the merge queue pays the MinIO cost.
+      - name: Check Docker availability
+        if: ${{ matrix.cuda.version == '13' }}
+        run: docker info
+
+      - name: S3 integration tests
+        if: ${{ matrix.cuda.version == '13' }}
+        run: make s3-test
+
+      - name: S3 large SQL-over-S3 tests
+        if: ${{ matrix.cuda.version == '13' }}
+        run: make s3-test-large
 
   test:
     runs-on: ubuntu-slim
