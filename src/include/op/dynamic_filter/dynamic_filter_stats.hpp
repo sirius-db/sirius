@@ -47,7 +47,7 @@ struct dynamic_filter_stats_snapshot {
 };
 
 /**
- * @brief Process-lifetime dynamic-filter publication counters, owned by `SiriusContext`
+ * @brief Connection-lifetime dynamic-filter publication counters, owned by `SiriusContext`
  *
  * `sirius_physical_hash_join` folds each `dynamic_filter_publication_outcome` into this sink
  * through a non-owning pointer handed to it at construction by `sirius_plan_comparison_join`. The
@@ -57,6 +57,8 @@ struct dynamic_filter_stats_snapshot {
  * The fields split into two families, and tests must respect the split. The first family records
  * deterministic policy decisions: for a fixed query, settings, and data they are reproducible
  * run-to-run, and they are the assertion anchors for gate regressions and the rollback evidence.
+ * They move only for attempts that reach per-key processing -- an attempt vetoed earlier (source
+ * not GPU-resident, or every target already drained) moves only its own opportunistic counter.
  * The second family records opportunistic delivery, which races with probe-side draining; assert
  * it only as deltas or directions, never as equality anchors.
  */

@@ -200,12 +200,14 @@ TEST_CASE("gpu_execution - dynamic-filter domain-coverage gate",
   REQUIRE(r);
   REQUIRE_FALSE(r->HasError());
 
-  // The build predicate retains every part row, so the build covers its whole key domain; the
-  // predicate still lands as a table filter on the part scan, which is what makes DuckDB record
-  // the join-filter hint that wires publication.
+  // The build predicate drops exactly one part row (p_partkey = 1), so the build still covers
+  // ~all of its key domain. It must NOT be provably always-true: statistics propagation erases an
+  // always-true table filter (min(p_partkey) = 1 proves `> 0`) before the join-filter optimizer
+  // runs, and an unfiltered build wires no publication at all. `> 1` survives as a table filter
+  // on the part scan, which is what makes DuckDB record the hint that wires publication.
   std::string const covering_query =
     "SELECT count(*) "
-    "FROM lineitem JOIN (SELECT p_partkey FROM part WHERE p_partkey > 0 GROUP BY p_partkey) p "
+    "FROM lineitem JOIN (SELECT p_partkey FROM part WHERE p_partkey > 1 GROUP BY p_partkey) p "
     "ON l_partkey = p_partkey";
   std::string const selective_query =
     "SELECT count(*) "

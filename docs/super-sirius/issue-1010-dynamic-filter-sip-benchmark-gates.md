@@ -7,7 +7,8 @@ specification before R2 performance data is examined."*
 **R4 evaluates these gates. R4 does not tune them.** No threshold in §6 may be changed after any
 measurement covered by this document has been examined, except under §10.
 
-**Related:** [SIP v2 design](issue-1010-dynamic-filter-sip-design-v2.md),
+**Related** (delivered by issue #1010's documentation units and design-review notes; these
+files are not all in-tree yet): [SIP v2 design](issue-1010-dynamic-filter-sip-design-v2.md),
 [v2 delivery plan](issue-1010-github-delivery-plan-v2.md),
 [R1b coverage-gate design](issue-1010-r1b-coverage-gate-design.md).
 

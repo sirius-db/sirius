@@ -515,6 +515,44 @@ TEST_CASE("walk locates join ordinals through non-empty projection maps",
     REQUIRE(resolve_pass_through_scan(*join, 0) != nullptr);
     REQUIRE(resolve_pass_through_scan(*join, 1) == nullptr);  // past the mapped width
   }
+  SECTION("ANTI with a left projection map")
+  {
+    auto get = make_get(/*table_index=*/0, /*width=*/2);
+    duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> expressions;
+    expressions.push_back(make_computed());
+    expressions.push_back(make_ref(0));
+    auto projection = make_projection(std::move(get), std::move(expressions));
+
+    auto join = make_join(duckdb::JoinType::ANTI,
+                          std::move(projection),
+                          make_get(/*table_index=*/1, /*width=*/2),
+                          /*left_projection_map=*/{1});
+    join->ResolveOperatorTypes();
+
+    REQUIRE(join->types.size() == 1);
+    REQUIRE(resolve_pass_through_scan(*join, 0) != nullptr);
+    REQUIRE(resolve_pass_through_scan(*join, 1) == nullptr);
+  }
+  SECTION("SINGLE with a left projection map still refuses the right block")
+  {
+    auto left             = make_get(/*table_index=*/0, /*width=*/3);
+    auto const* left_raw  = left.get();
+    auto right            = make_get(/*table_index=*/1, /*width=*/2);
+    auto const* right_raw = right.get();
+    auto join             = make_join(duckdb::JoinType::SINGLE,
+                          std::move(left),
+                          std::move(right),
+                          /*left_projection_map=*/{2});
+    join->ResolveOperatorTypes();
+
+    REQUIRE(join->types.size() == 3);  // one mapped left column + two right columns
+    REQUIRE(resolve_pass_through_scan(*join, 0) == left_raw);
+    for (auto const ordinal : std::views::iota(std::size_t{1}, std::size_t{3})) {
+      auto const* resolved = resolve_pass_through_scan(*join, ordinal);
+      REQUIRE(resolved == nullptr);
+      REQUIRE(resolved != right_raw);
+    }
+  }
   SECTION("RIGHT_SEMI with a right projection map")
   {
     auto get = make_get(/*table_index=*/1, /*width=*/2);
@@ -617,16 +655,18 @@ TEST_CASE("walk refuses unmodelled operators", "[dynamic_filter][build_key_domai
 namespace {
 
 /// A join over probe GET (table 0, cardinality 1000) and build GET (table 1, cardinality 2000),
-/// with condition build sides supplied by the caller. Probe references are drawn from 90+ and
-/// build references from 40+ so a side swap changes every asserted value.
+/// with condition build sides supplied by the caller. Probe references are drawn from 90+ --
+/// far outside the build child's width of 3 -- so a walk that reads `condition.left` instead of
+/// `condition.right` resolves nothing, structurally, for every condition.
 duckdb::unique_ptr<duckdb::LogicalComparisonJoin> make_traced_join(
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> build_sides)
 {
-  auto join = make_join(duckdb::JoinType::INNER,
+  auto join            = make_join(duckdb::JoinType::INNER,
                         make_get(/*table_index=*/0, /*width=*/1),
                         make_get(/*table_index=*/1, /*width=*/3));
+  std::size_t probe_at = 90;
   for (auto& build_side : build_sides) {
-    join->conditions.push_back(make_condition(make_ref(0), std::move(build_side)));
+    join->conditions.push_back(make_condition(make_ref(probe_at++), std::move(build_side)));
   }
   join->ResolveOperatorTypes();
   return join;
