@@ -10,7 +10,9 @@
 #include <cudf/types.hpp>
 #include <cudf/utilities/traits.hpp>
 
+#include <rmm/mr/cuda_async_memory_resource.hpp>
 #include <rmm/mr/per_device_resource.hpp>
+#include <rmm/resource_ref.hpp>
 
 #include <algorithm>
 #include <cmath>
@@ -110,6 +112,63 @@ compressed_table roundtrip_once(cudf::table_view input,
   }
   verify_plan_tree(ct, label);
   return ct;
+}
+
+// Regression for the internal `int column_threads` overloads: their result
+// buffers are built on leased pool streams and record those streams for the
+// eventual async free. With the old per-call pool (destroyed on return) the
+// returned buffers referenced dangling stream handles, so freeing them was a
+// use-after-free. The process-lifetime stream cache keeps every handle valid for
+// the life of the process.
+//
+// Runs under an async (stream-ordered) memory resource so the deallocs are really
+// enqueued on each buffer's recorded stream, then frees the parallel compress and
+// decompress results after their internal pools are gone. This exercises the exact
+// UAF scenario end to end.
+//
+// NOTE on teeth: a destroyed-stream free is not deterministically observable in a
+// Release build — RMM ignores the cudaFreeAsync return under NDEBUG, and CUDA does
+// not reliably invalidate a destroyed stream handle (cudaStreamQuery on it may
+// still return success), so neither a crash nor a query check bites here. The guard
+// is real under compute-sanitizer or a Debug RMM build, where the invalid-handle
+// free is reported; this case gives those tools the scenario to catch.
+void test_async_mr_free_safety()
+{
+  rmm::mr::cuda_async_memory_resource async_mr{};
+  rmm::device_async_resource_ref prev{rmm::mr::get_current_device_resource_ref()};
+  rmm::mr::set_current_device_resource_ref(async_mr);
+  try {
+    auto t = make_int32_table(3, 8192, 21);
+    std::string dsl =
+      "input -> delta -> differences\n"
+      "delta.differences -> rle -> values, runs\n"
+      "delta.differences.values -> bitpack\n"
+      "delta.differences.runs -> bitpack\n"
+      "---\n"
+      "input -> for -> deltas, references\n"
+      "for.deltas -> bitpack\n"
+      "---\n"
+      "input -> delta -> differences\n"
+      "delta.differences -> bitpack\n";
+    {
+      // Parallel compress (3 threads) → compressed_table; parallel decompress →
+      // cudf::table. Both allocate on leased streams that are returned to the cache
+      // (not destroyed) when these calls return, so both results are safe to free
+      // at the end of this scope.
+      auto ct  = compress_with_plan(t->view(), dsl, 3, rmm::mr::get_current_device_resource_ref());
+      auto out = decompress(ct, 3, rmm::mr::get_current_device_resource_ref());
+      expect(out != nullptr && out->num_columns() == 3, "async_mr: decompress shape");
+      for (int i = 0; i < t->num_columns(); ++i)
+        expect(
+          columns_equal_any(t->view().column(i), out->view().column(i), cudf::get_default_stream()),
+          "async_mr: column data mismatch");
+    }
+    expect(cudaDeviceSynchronize() == cudaSuccess, "async_mr: device sync after async free");
+  } catch (...) {
+    rmm::mr::set_current_device_resource_ref(prev);
+    throw;
+  }
+  rmm::mr::set_current_device_resource_ref(prev);
 }
 
 }  // namespace
@@ -928,6 +987,8 @@ int main()
                      "timestamp_us_delta_bitpack");
       roundtrip_once(tu->view(), "input -> nvcomp_cascaded\n", 1, "timestamp_us_cascaded");
     }
+
+    test_async_mr_free_safety();
 
     std::printf("test_compress_with_plan_roundtrip: PASS\n");
     return 0;

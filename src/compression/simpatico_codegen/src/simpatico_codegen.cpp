@@ -96,15 +96,80 @@ void validate_column_names(std::vector<std::string> const& column_names, size_t 
   }
 }
 
-// Create a stream pool with exactly max(1, column_threads) streams.
-stream_pool make_internal_pool(int column_threads)
-{
-  stream_pool pool;
-  if (!pool.init(static_cast<size_t>(std::max(1, column_threads)))) {
-    throw plan_error("failed to initialize internal stream_pool");
+// Process-lifetime cache of CUDA streams for the internal `int column_threads`
+// overloads. These overloads have no caller-owned pool, yet the objects they
+// return (a cudf::table, or a compressed_table whose leaf buffers live in cudf
+// columns) record the stream they were built on for their eventual async free.
+// If that stream were a per-call stream_pool destroyed on return, freeing the
+// result later would deallocate on a dangling stream handle — a use-after-free
+// with an async memory resource. Leasing from a cache that NEVER destroys its
+// streams keeps every recorded handle valid for the process lifetime, so the
+// result is safe to free by any stream (including the RMM default) with no
+// external rebinding. Streams are recycled between calls, so this also avoids
+// per-call stream create/destroy churn.
+class stream_cache {
+ public:
+  // Hand out n valid streams, reusing recycled ones and creating the rest.
+  std::vector<cudaStream_t> checkout(size_t n)
+  {
+    std::vector<cudaStream_t> out;
+    out.reserve(n);
+    std::lock_guard<std::mutex> lock(mu_);
+    while (out.size() < n && !free_.empty()) {
+      out.push_back(free_.back());
+      free_.pop_back();
+    }
+    while (out.size() < n) {
+      cudaStream_t s{};
+      if (cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking) != cudaSuccess) break;
+      out.push_back(s);
+    }
+    return out;
   }
-  return pool;
+  // Return streams for reuse. They are kept alive (never destroyed): buffers of
+  // previously-returned results may still reference them for their async free.
+  void check_in(std::vector<cudaStream_t>& streams)
+  {
+    std::lock_guard<std::mutex> lock(mu_);
+    free_.insert(free_.end(), streams.begin(), streams.end());
+    streams.clear();
+  }
+
+ private:
+  std::mutex mu_;
+  std::vector<cudaStream_t> free_;
+};
+
+stream_cache& global_stream_cache()
+{
+  static stream_cache cache;
+  return cache;
 }
+
+// RAII lease of max(1, column_threads) cache streams into a stream_pool for the
+// duration of an internal-parallel call. On destruction the streams are returned
+// to the cache (NOT destroyed), so any buffer allocated on them stays valid for
+// its eventual async free even after this pool is gone. Concurrent leases get
+// disjoint streams (checkout is mutex-guarded and pops distinct handles), so each
+// call's sync_all only touches its own streams.
+struct leased_pool {
+  stream_pool pool;
+
+  explicit leased_pool(int column_threads)
+  {
+    pool.streams = global_stream_cache().checkout(static_cast<size_t>(std::max(1, column_threads)));
+    if (pool.streams.empty()) throw plan_error("failed to lease internal streams");
+  }
+  ~leased_pool()
+  {
+    pool.sync_all();
+    global_stream_cache().check_in(
+      pool.streams);  // leaves pool.streams empty; ~stream_pool is a no-op
+  }
+
+  leased_pool(const leased_pool&)            = delete;
+  leased_pool& operator=(const leased_pool&) = delete;
+};
 
 // Run `body(i, stream)` for every column index in [0, n_items) across the pool's
 // worker streams. Threads pull indices atomically; `body` signals failure by
@@ -311,8 +376,8 @@ compressed_table compress_with_plan(cudf::table_view table,
                                     std::vector<std::string> column_names)
 {
   auto plans = split_and_validate_plans(plan_dsl, table, column_names);
-  auto pool  = make_internal_pool(column_threads);
-  return compress_columns_parallel(table, plans, pool, mr, column_names);
+  leased_pool lp(column_threads);
+  return compress_columns_parallel(table, plans, lp.pool, mr, column_names);
 }
 
 compressed_table compress_with_plan(cudf::table_view table,
@@ -347,8 +412,8 @@ std::unique_ptr<cudf::table> decompress(const compressed_table& table,
                                         int column_threads,
                                         rmm::device_async_resource_ref mr)
 {
-  auto pool = make_internal_pool(column_threads);
-  return decompress_columns_parallel(table, pool, mr);
+  leased_pool lp(column_threads);
+  return decompress_columns_parallel(table, lp.pool, mr);
 }
 
 std::unique_ptr<cudf::table> decompress(const compressed_table& table,
@@ -382,8 +447,8 @@ std::unique_ptr<cudf::table> decompress(const compressed_table& table,
                                         int column_threads,
                                         rmm::device_async_resource_ref mr)
 {
-  auto pool = make_internal_pool(column_threads);
-  return decompress_columns_parallel(table, selected_columns, pool, mr);
+  leased_pool lp(column_threads);
+  return decompress_columns_parallel(table, selected_columns, lp.pool, mr);
 }
 
 std::unique_ptr<cudf::table> decompress(const compressed_table& table,

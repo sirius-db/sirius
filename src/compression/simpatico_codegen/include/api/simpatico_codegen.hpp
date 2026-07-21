@@ -91,8 +91,9 @@ compressed_table compress_with_plan(
 
 /// Compress all columns in parallel using @p column_threads worker threads.
 ///
-/// An internal stream_pool of size `max(1, column_threads)` is created for the
-/// lifetime of the call and destroyed on return.
+/// `max(1, column_threads)` streams are leased from a process-lifetime internal
+/// cache (never destroyed), so the returned table's buffers are safe to free on
+/// any stream — including the RMM default — after the call returns.
 ///
 /// @param table          Source table.
 /// @param plan_dsl       Multi-column plan DSL string.

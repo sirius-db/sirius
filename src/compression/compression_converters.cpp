@@ -59,9 +59,10 @@ int decompress_column_threads() noexcept
 namespace {
 
 // Rebind a column's buffers (recursively) to `s` for their eventual async free.
-// The parallel decompress overload allocates on internal pool streams that are
-// destroyed on return; its data is already synced, so re-pointing the free
-// stream to a long-lived one avoids a use-after-free at buffer teardown.
+// The parallel decompress overload allocates on cache-leased internal streams
+// (kept alive process-wide, so this is no longer needed for safety); re-pointing
+// the free stream onto the pipeline stream keeps buffer teardown ordered with the
+// rest of the pipeline's work on `s`, which helps the async pool recycle memory.
 std::unique_ptr<cudf::column> rebind_column_stream(std::unique_ptr<cudf::column> col,
                                                    rmm::cuda_stream_view s)
 {
@@ -139,8 +140,8 @@ std::unique_ptr<cucascade::idata_representation> reconstruct_and_decompress_to_g
   }
 
   if (n_threads > 1) {
-    // Re-point the parallel result's buffers off the (now-destroyed) internal
-    // pool streams onto `stream` before it is used/freed downstream.
+    // Re-point the parallel result's buffers off the internal cache streams onto
+    // `stream` so teardown is ordered with the rest of the pipeline's work.
     auto cols = decompressed->release();
     for (auto& c : cols) {
       c = rebind_column_stream(std::move(c), stream);
