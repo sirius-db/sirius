@@ -2899,28 +2899,30 @@ fn aggregation_conjuncts_become_having_filter() {
     };
 }
 
-/// Verifies anti joins are rejected: the Substrait consumer has no left-anti conversion.
+/// Verifies anti joins are lowered through supported outer/mark join forms.
 #[test]
-fn anti_hash_join_is_rejected() {
-    for join_op in [TJoinOp::LEFT_ANTI_JOIN, TJoinOp::NULL_AWARE_LEFT_ANTI_JOIN] {
+fn anti_hash_joins_are_lowered() {
+    for join_op in [
+        TJoinOp::LEFT_ANTI_JOIN,
+        TJoinOp::RIGHT_ANTI_JOIN,
+        TJoinOp::NULL_AWARE_LEFT_ANTI_JOIN,
+    ] {
         let plan = TPlan::new(vec![
             hash_join_node(join_op),
             scan_node(0, 0),
             scan_node(1, 1),
         ]);
-        let err = translate_fragment(&params(Some(plan), Some(join_desc()), None)).unwrap_err();
-        assert!(
-            matches!(err, TranslateError::UnsupportedPlanNode { .. }),
-            "{join_op:?}: {err:?}"
-        );
+        let translated = translate_fragment(&params(Some(plan), Some(join_desc()), None))
+            .unwrap_or_else(|err| panic!("{join_op:?}: {err:?}"));
+        assert_eq!(root(&translated.plan).names.len(), 1);
     }
 }
 
 /// Verifies an unsupported join op is named as the reason even when the plan also carries no join
-/// conjuncts, which is the shape an anti join arrives in once the FE has folded its predicate away.
+/// conjuncts, which is the shape some join types arrive in once the FE has folded predicates away.
 #[test]
 fn unsupported_join_type_is_reported_before_missing_conjuncts() {
-    let mut join = hash_join_node(TJoinOp::LEFT_ANTI_JOIN);
+    let mut join = hash_join_node(TJoinOp::CROSS_JOIN);
     join.hash_join_node.as_mut().unwrap().eq_join_conjuncts = vec![];
     let plan = TPlan::new(vec![join, scan_node(0, 0), scan_node(1, 1)]);
 

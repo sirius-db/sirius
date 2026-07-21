@@ -708,17 +708,19 @@ fn translate_hash_join(
             context: "HASH_JOIN_NODE",
             field: "hash_join_node",
         })?;
-    // Validated before the conjuncts so an unsupported op is reported as such, rather than as the
-    // missing conjuncts an anti join arrives with once the FE has folded its predicate away.
-    //
-    // Anti joins (from NOT IN / NOT EXISTS rewrites) are not translated: DuckDB's Substrait
-    // consumer has no left-anti conversion, so an emitted plan would fail downstream anyway.
-    let (join_type, semi) = match join.join_op {
-        TJoinOp::INNER_JOIN => (join_rel::JoinType::Inner, false),
-        TJoinOp::LEFT_OUTER_JOIN => (join_rel::JoinType::Left, false),
-        TJoinOp::RIGHT_OUTER_JOIN => (join_rel::JoinType::Right, false),
-        TJoinOp::FULL_OUTER_JOIN => (join_rel::JoinType::Outer, false),
-        TJoinOp::LEFT_SEMI_JOIN => (join_rel::JoinType::LeftSemi, true),
+    // Validated before the conjuncts so an unsupported op is reported as such, rather than as
+    // missing conjuncts, which some join shapes arrive with once the FE has folded predicates away.
+    let (join_type, output) = match join.join_op {
+        TJoinOp::INNER_JOIN => (join_rel::JoinType::Inner, JoinOutput::Both),
+        TJoinOp::LEFT_OUTER_JOIN => (join_rel::JoinType::Left, JoinOutput::Both),
+        TJoinOp::RIGHT_OUTER_JOIN => (join_rel::JoinType::Right, JoinOutput::Both),
+        TJoinOp::FULL_OUTER_JOIN => (join_rel::JoinType::Outer, JoinOutput::Both),
+        TJoinOp::LEFT_SEMI_JOIN => (join_rel::JoinType::LeftSemi, JoinOutput::Left),
+        TJoinOp::LEFT_ANTI_JOIN => (join_rel::JoinType::Left, JoinOutput::LeftAnti),
+        TJoinOp::RIGHT_ANTI_JOIN => (join_rel::JoinType::Right, JoinOutput::RightAnti),
+        TJoinOp::NULL_AWARE_LEFT_ANTI_JOIN => {
+            (join_rel::JoinType::LeftMark, JoinOutput::NullAwareLeftAnti)
+        }
         _ => {
             return Err(TranslateError::UnsupportedPlanNode {
                 node_id: node.node_id,
@@ -734,6 +736,7 @@ fn translate_hash_join(
 
     let combined_tuples = [left.row_tuples.as_slice(), right.row_tuples.as_slice()].concat();
     let mut conditions = Vec::new();
+    let mut first_equality = None;
     for eq in &join.eq_join_conjuncts {
         if let Some(opcode) = eq.opcode
             && opcode != TExprOpcode::EQ
@@ -748,6 +751,9 @@ fn translate_hash_join(
         let left_expr = eq.left.translate(&mut expr_ctx)?;
         let mut expr_ctx = ctx.expr_context(&combined_tuples);
         let right_expr = eq.right.translate(&mut expr_ctx)?;
+        if first_equality.is_none() {
+            first_equality = Some((left_expr.clone(), right_expr.clone()));
+        }
         let anchor = ctx.registry.register_function(URN_COMPARISON, "equal");
         conditions.push(expr_translator::scalar_function(
             anchor,
@@ -765,11 +771,13 @@ fn translate_hash_join(
         reason: "hash join without join conjuncts",
     })?;
 
-    // Semi joins emit only the probe-side row; other joins emit probe then build columns.
-    let (row_tuples, output_width) = if semi {
-        (left.row_tuples.clone(), left.output_width)
-    } else {
-        (combined_tuples, left.output_width + right.output_width)
+    let (row_tuples, output_width) = match output {
+        JoinOutput::Left => (left.row_tuples.clone(), left.output_width),
+        JoinOutput::NullAwareLeftAnti => (left.row_tuples.clone(), left.output_width + 1),
+        _ => (
+            combined_tuples.clone(),
+            left.output_width + right.output_width,
+        ),
     };
 
     let joined = TranslatedRel {
@@ -785,8 +793,53 @@ fn translate_hash_join(
         row_tuples,
         output_width,
     };
+    let joined = match output {
+        JoinOutput::LeftAnti => {
+            let (_, right_key) = first_equality
+                .ok_or_else(|| TranslateError::malformed("left anti join has no equality key"))?;
+            let filtered = filter_is_null(joined, right_key, ctx);
+            emit_columns(
+                filtered.rel,
+                (0..left.output_width as i32).collect(),
+                left.row_tuples,
+            )
+        }
+        JoinOutput::RightAnti => {
+            let (left_key, _) = first_equality
+                .ok_or_else(|| TranslateError::malformed("right anti join has no equality key"))?;
+            let filtered = filter_is_null(joined, left_key, ctx);
+            let start = left.output_width as i32;
+            let end = start + right.output_width as i32;
+            emit_columns(filtered.rel, (start..end).collect(), right.row_tuples)
+        }
+        JoinOutput::NullAwareLeftAnti => {
+            let marker = field_selection(left.output_width as i32);
+            let not_anchor = ctx.registry.register_function(URN_BOOLEAN, "not");
+            let condition = expr_translator::scalar_function(
+                not_anchor,
+                vec![marker],
+                crate::type_mapper::bool_type(),
+            );
+            let filtered = filter_rel(joined, condition);
+            emit_columns(
+                filtered.rel,
+                (0..left.output_width as i32).collect(),
+                left.row_tuples,
+            )
+        }
+        _ => joined,
+    };
     // Node conjuncts are post-join predicates over the join's output row.
     apply_conjuncts(joined, node, ctx)
+}
+
+#[derive(Clone, Copy)]
+enum JoinOutput {
+    Both,
+    Left,
+    LeftAnti,
+    RightAnti,
+    NullAwareLeftAnti,
 }
 
 /// Translates an inner/cross `NESTLOOP_JOIN_NODE` into an equality join on synthetic constants.
@@ -1151,6 +1204,34 @@ fn i32_literal(value: i32) -> Expression {
             },
         )),
     }
+}
+
+/// Wraps a relation in a filter without changing its row layout.
+fn filter_rel(input: TranslatedRel, condition: Expression) -> TranslatedRel {
+    let output_width = input.output_width;
+    TranslatedRel {
+        rel: Rel {
+            rel_type: Some(rel::RelType::Filter(Box::new(FilterRel {
+                input: Some(Box::new(input.rel)),
+                condition: Some(Box::new(condition)),
+                ..Default::default()
+            }))),
+        },
+        row_tuples: input.row_tuples,
+        output_width,
+    }
+}
+
+/// Filters to rows where an equality-key expression is null.
+fn filter_is_null(
+    input: TranslatedRel,
+    key: Expression,
+    ctx: &mut PlanContext<'_>,
+) -> TranslatedRel {
+    let anchor = ctx.registry.register_function(URN_COMPARISON, "is_null");
+    let condition =
+        expr_translator::scalar_function(anchor, vec![key], crate::type_mapper::bool_type());
+    filter_rel(input, condition)
 }
 
 /// Wraps a relation in a Substrait filter when the StarRocks node has conjuncts.
