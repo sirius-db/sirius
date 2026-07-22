@@ -35,6 +35,9 @@
 #include <numeric>
 
 namespace sirius {
+namespace planner {
+class sirius_physical_plan_generator;
+}  // namespace planner
 namespace op {
 
 class sirius_physical_grouped_aggregate_merge : public sirius_physical_partition_consumer_operator {
@@ -125,8 +128,8 @@ class sirius_physical_grouped_aggregate_merge : public sirius_physical_partition
 
   bool sink_order_dependent() const override { return false; }
 
-  //! Allow this merge to join its downstream pipeline.
-  void set_fuse_into_parent(bool fuse) noexcept { _fuse_into_parent = fuse; }
+  //! Whether this merge joins its downstream pipeline. Set only during planning (see the friend
+  //! below); read-only thereafter to honor the no-mutation-after-planning contract.
   [[nodiscard]] bool fuse_into_parent() const noexcept { return _fuse_into_parent; }
 
   void build_pipelines(pipeline::sirius_pipeline& current,
@@ -141,6 +144,10 @@ class sirius_physical_grouped_aggregate_merge : public sirius_physical_partition
                                          rmm::cuda_stream_view stream) override;
 
  private:
+  //! The plan-generator is the sole writer of the fusion flag, and only at plan time.
+  friend class sirius::planner::sirius_physical_plan_generator;
+  void set_fuse_into_parent(bool fuse) noexcept { _fuse_into_parent = fuse; }
+
   bool _fuse_into_parent = false;
 };
 

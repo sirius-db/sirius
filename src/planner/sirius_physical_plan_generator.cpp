@@ -803,7 +803,15 @@ bool merge_downstream_is_streaming_dead_end(const sirius::op::sirius_physical_op
 void sirius_physical_plan_generator::mark_fusable_merge_pipelines(
   sirius::op::sirius_physical_operator& op)
 {
-  const bool fusion_enabled = duckdb::Config::FUSE_MERGE_PIPELINES;
+  // Snapshot the fusion toggle once for the whole traversal. The backing config is a mutable
+  // global that a concurrent connection can flip via `SET`; re-reading it per node would let
+  // such a flip mark some subtrees fused and others not within a single plan.
+  mark_fusable_merge_pipelines(op, duckdb::Config::FUSE_MERGE_PIPELINES);
+}
+
+void sirius_physical_plan_generator::mark_fusable_merge_pipelines(
+  sirius::op::sirius_physical_operator& op, bool fusion_enabled)
+{
   // Ungrouped aggregate merges use a different partial-result handoff.
   if (op.type == sirius::op::SiriusPhysicalOperatorType::MERGE_GROUP_BY) {
     op.Cast<sirius::op::sirius_physical_grouped_aggregate_merge>().set_fuse_into_parent(
@@ -814,17 +822,18 @@ void sirius_physical_plan_generator::mark_fusable_merge_pipelines(
   }
 
   for (auto& child : op.children) {
-    if (child) { mark_fusable_merge_pipelines(*child); }
+    if (child) { mark_fusable_merge_pipelines(*child, fusion_enabled); }
   }
   // Visit subtrees stored outside children[] as well.
   if (op.type == sirius::op::SiriusPhysicalOperatorType::LEFT_DELIM_JOIN ||
       op.type == sirius::op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN) {
     auto& delim = op.Cast<sirius::op::sirius_physical_delim_join>();
-    if (delim.join) { mark_fusable_merge_pipelines(*delim.join); }
-    if (delim.distinct_root) { mark_fusable_merge_pipelines(*delim.distinct_root); }
+    if (delim.join) { mark_fusable_merge_pipelines(*delim.join, fusion_enabled); }
+    if (delim.distinct_root) { mark_fusable_merge_pipelines(*delim.distinct_root, fusion_enabled); }
   }
   if (op.type == sirius::op::SiriusPhysicalOperatorType::RESULT_COLLECTOR) {
-    mark_fusable_merge_pipelines(op.Cast<sirius::op::sirius_physical_result_collector>().plan);
+    mark_fusable_merge_pipelines(op.Cast<sirius::op::sirius_physical_result_collector>().plan,
+                                 fusion_enabled);
   }
 }
 

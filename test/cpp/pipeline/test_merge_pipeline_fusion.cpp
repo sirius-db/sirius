@@ -170,8 +170,11 @@ std::string dump_pipeline_shapes(
   return out;
 }
 
-//! Collect all rows as sorted vectors of stringified values for order-independent comparison.
-std::vector<std::vector<std::string>> collect_rows(duckdb::MaterializedQueryResult& result)
+//! Collect all rows as vectors of stringified values. When `ordered` is false the rows are sorted
+//! for order-independent comparison; when true they are left in emission order so a fusion bug that
+//! scrambles a query's ORDER BY is not masked by re-sorting both sides.
+std::vector<std::vector<std::string>> collect_rows(duckdb::MaterializedQueryResult& result,
+                                                   bool ordered)
 {
   std::vector<std::vector<std::string>> rows;
   for (duckdb::idx_t r = 0; r < result.RowCount(); r++) {
@@ -182,14 +185,18 @@ std::vector<std::vector<std::string>> collect_rows(duckdb::MaterializedQueryResu
     }
     rows.push_back(std::move(row));
   }
-  std::sort(rows.begin(), rows.end());
+  if (!ordered) { std::sort(rows.begin(), rows.end()); }
   return rows;
 }
 
 //! Run `query` on the GPU with fusion enabled and disabled, asserting both ran transparently on
 //! the GPU and returned identical results. Toggling via `SET fuse_merge_pipelines` also exercises
-//! the extension-option wiring end to end.
-void require_fusion_results_match(duckdb::Connection& con, const std::string& query)
+//! the extension-option wiring end to end. Pass `ordered=true` for queries whose output has a
+//! defined total order (e.g. an ORDER BY over a unique key) so the comparison verifies fusion
+//! preserves that order instead of re-sorting both sides and hiding an order regression.
+void require_fusion_results_match(duckdb::Connection& con,
+                                  const std::string& query,
+                                  bool ordered = false)
 {
   con.Query("SET gpu_execution = true;");
 
@@ -218,8 +225,8 @@ void require_fusion_results_match(duckdb::Connection& con, const std::string& qu
 
   auto& fused_mat   = fused->Cast<duckdb::MaterializedQueryResult>();
   auto& unfused_mat = unfused->Cast<duckdb::MaterializedQueryResult>();
-  auto fused_rows   = collect_rows(fused_mat);
-  auto unfused_rows = collect_rows(unfused_mat);
+  auto fused_rows   = collect_rows(fused_mat, ordered);
+  auto unfused_rows = collect_rows(unfused_mat, ordered);
 
   for (std::size_t r = 0; r < fused_rows.size(); r++) {
     for (std::size_t c = 0; c < fused_rows[r].size(); c++) {
@@ -337,6 +344,41 @@ TEST_CASE_METHOD(merge_fusion_fixture,
         REQUIRE(merge != nullptr);
         REQUIRE(join != nullptr);
         CHECK(merge != join);
+      });
+  }
+
+  // Unlike the two sections above -- which are structurally green (MERGE_AGGREGATE is never
+  // marked, and the MERGE_GROUP_BY's walk never reaches the HASH_JOIN) -- this section pins the
+  // T::CTE branch of terminal_sink_supports_fusion: it fails if that case is removed.
+  SECTION("CTE body GROUP BY does not fuse into the CTE sink")
+  {
+    // A GROUP BY inside a materialized CTE body feeds the CTE sink, which has bespoke
+    // consumer-side wiring and is excluded from fusion (terminal_sink_supports_fusion returns
+    // false for T::CTE). The MERGE_GROUP_BY must therefore stay in its own pipeline. MATERIALIZED
+    // keeps the optimizer from inlining the single-reference CTE. Drop the T::CTE case and the
+    // merge folds into the CTE's pipeline, flipping every check below.
+    sirius::test::with_initialized_engine(
+      *con,
+      "WITH t AS MATERIALIZED ("
+      "  SELECT n_regionkey AS k, count(*) AS c FROM nation GROUP BY n_regionkey"
+      ") SELECT k, c FROM t",
+      [&](sirius::sirius_engine& engine) {
+        INFO(dump_pipeline_shapes(engine.new_scheduled));
+
+        const auto* merge =
+          pipeline_containing(engine.new_scheduled, SiriusPhysicalOperatorType::MERGE_GROUP_BY);
+        const auto* cte =
+          pipeline_containing(engine.new_scheduled, SiriusPhysicalOperatorType::CTE);
+        REQUIRE(merge != nullptr);
+        REQUIRE(cte != nullptr);
+
+        // Not fused: the merge keeps its own pipeline and is not folded into the CTE's.
+        CHECK(merge != cte);
+        CHECK_FALSE(pipeline_contains_both(engine.new_scheduled,
+                                           SiriusPhysicalOperatorType::MERGE_GROUP_BY,
+                                           SiriusPhysicalOperatorType::CTE));
+        REQUIRE(merge->get_sink());
+        CHECK(merge->get_sink()->type == SiriusPhysicalOperatorType::MERGE_GROUP_BY);
       });
   }
 }
@@ -479,8 +521,10 @@ TEST_CASE_METHOD(merge_fusion_fixture,
 
   SECTION("terminal TOP_N")
   {
+    // n_nationkey is unique, so the ORDER BY defines a strict total order: compare positionally
+    // to catch a fusion bug that would reorder the emitted rows.
     require_fusion_results_match(
-      *con, "SELECT n_nationkey FROM nation ORDER BY n_nationkey DESC LIMIT 3");
+      *con, "SELECT n_nationkey FROM nation ORDER BY n_nationkey DESC LIMIT 3", /*ordered=*/true);
   }
 
   SECTION("GROUP BY into ORDER BY")

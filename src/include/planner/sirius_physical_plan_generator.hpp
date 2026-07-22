@@ -225,10 +225,16 @@ class sirius_physical_plan_generator {
   static void set_parent_ops(sirius::op::sirius_physical_operator& op,
                              sirius::op::sirius_physical_operator* parent);
 
-  //! Mark eligible merge operators for downstream pipeline fusion.
+  //! Mark eligible merge operators for downstream pipeline fusion. Snapshots the fusion toggle
+  //! once so a concurrent `SET` cannot make the decision inconsistent across the plan tree.
   static void mark_fusable_merge_pipelines(sirius::op::sirius_physical_operator& op);
 
  private:
+  //! Recursive worker for `mark_fusable_merge_pipelines`; carries the snapshotted toggle so every
+  //! node in one traversal sees the same value.
+  static void mark_fusable_merge_pipelines(sirius::op::sirius_physical_operator& op,
+                                           bool fusion_enabled);
+
   //! Walk the plan tree and insert the GPU pipeline operators (PARTITION, CONCAT, sort chain,
   //! merge operators, scan companions, GPU_VALUES) so the tree carries the full execution
   //! structure before the pipeline converter runs.

@@ -57,7 +57,7 @@ void sirius_physical_grouped_aggregate_merge::build_pipelines(
   pipeline::sirius_pipeline& current, pipeline::sirius_meta_pipeline& meta_pipeline)
 {
   // The child sink still creates the upstream pipeline boundary.
-  if (_fuse_into_parent) {
+  if (fuse_into_parent()) {
     D_ASSERT(children.size() == 1);
     meta_pipeline.get_state().add_pipeline_operator(current, *this);
     children[0]->build_pipelines(current, meta_pipeline);
