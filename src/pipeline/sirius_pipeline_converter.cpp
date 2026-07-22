@@ -231,22 +231,6 @@ op::MemoryBarrierType sirius_pipeline_converter::resolve_barrier(
       return op::MemoryBarrierType::PARTIAL;
     }
   }
-  // A probe-side CONCAT feeds the join's default (probe) port directly (CONCAT is the sink of its
-  // own single-op pipeline; its tree parent is the owning join). The probe streams batch-by-batch
-  // into the join → PARTIAL, so the join can start joining before the whole probe input arrives.
-  // The build-side CONCAT stays FULL (the hash table must be fully built first). Same RIGHT-family
-  // exception as the probe PARTITION above: a RIGHT-family hash join sizes from the complete probe
-  // input, so its probe CONCAT stays FULL — unless it is a RIGHT_DELIM_JOIN's internal join, which
-  // bootstraps its probe subtree from build-side distinct data.
-  if (sink.type == T::CONCAT) {
-    auto& concat = sink.Cast<op::sirius_physical_concat>();
-    auto* join   = sink.get_parent_op();  // Tree-parent walk: CONCAT -> owning join.
-    const bool right_family_full =
-      join && join->type == T::HASH_JOIN &&
-      join->Cast<op::sirius_physical_hash_join>().is_right_family() &&
-      !(join->get_parent_op() && join->get_parent_op()->type == T::RIGHT_DELIM_JOIN);
-    if (!concat.is_build_concat() && !right_family_full) { return op::MemoryBarrierType::PARTIAL; }
-  }
   return op::MemoryBarrierType::FULL;
 }
 
@@ -264,7 +248,6 @@ void sirius_pipeline_converter::compute_repository_wiring(sirius_pipeline_build_
 
   // Assign pipeline IDs before emitting wiring descriptors. Runtime materialization
   // uses these to sort `_ports_list` deterministically.
-  std::unordered_set<void*> seen_ops;
   for (size_t i = 0; i < scheduled_.size(); i++) {
     scheduled_[i]->set_pipeline_id(i);
   }

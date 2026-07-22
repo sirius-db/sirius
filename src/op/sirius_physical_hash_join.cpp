@@ -44,7 +44,6 @@
 #include "op/dynamic_filter_publisher.hpp"
 #include "op/sirius_dynamic_filter.hpp"
 #include "op/sirius_physical_nested_loop_join.hpp"
-#include "op/sirius_physical_operator.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "sirius/exception.hpp"
@@ -721,27 +720,6 @@ void sirius_physical_hash_join::discard_build_only_slots_if_probe_complete()
   }
 }
 
-bool sirius_physical_hash_join::all_ports_empty()
-{
-  // BUILD_PROBE uses per-partition slot state, not a cross-product cursor — fall back to the base
-  // class repo check which is correct for that mode.
-  if (_join_mode == HASH_JOIN_MODE::BUILD_PROBE) {
-    return sirius_physical_operator::all_ports_empty();
-  }
-
-  // Standard mode: once the snapshot exists, use the cursor as the authoritative emptiness signal.
-  // The base class checks raw repo total_size() without holding op_state_mutex, which races with
-  // get_next_task_input_data()'s pop operations — two concurrent lambdas can both see non-empty
-  // repos but only one finds a task to create. Reading the cursor here (under op_state_mutex) gives
-  // a consistent view: the repos are logically empty when all cross-product pairs are exhausted.
-  std::lock_guard<std::mutex> lg(op_state_mutex);
-  if (!left_batch_ids.empty() || !right_batch_ids.empty()) {
-    return current_partition_index >= num_batches_to_process;
-  }
-  // Snapshot not yet taken — fall back to repo check so the while-loop can enter and trigger init.
-  return sirius_physical_operator::all_ports_empty();
-}
-
 std::optional<task_creation_hint> sirius_physical_hash_join::get_next_task_hint()
 {
   std::lock_guard<std::mutex> lg(op_state_mutex);
@@ -783,18 +761,6 @@ std::optional<task_creation_hint> sirius_physical_hash_join::get_next_task_hint(
         return std::nullopt;
     }
   } else {
-    // Standard/MIXED mode takes a one-time snapshot of ALL probe batches in
-    // get_next_task_input_data. If the probe port is PARTIAL (probe-side CONCAT feeds the join
-    // incrementally), the base class hint returns READY as soon as any probe data arrives — but
-    // more batches may still be in flight. The snapshot would then miss them, and those batches are
-    // lost after the pipeline finishes. Force-wait for the probe pipeline to be done so the
-    // snapshot sees every probe batch.
-    auto* probe_port = get_port("default");
-    if (probe_port && probe_port->src_pipeline &&
-        !probe_port->src_pipeline->is_pipeline_finished()) {
-      auto* producer = &probe_port->src_pipeline->get_operators()[0].get();
-      return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, producer};
-    }
     return sirius_physical_operator::get_next_task_hint();
   }
 }
@@ -885,70 +851,72 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::get_next_task_input_da
     return get_next_task_input_data_for_build_probe();
   }
 
-  // One-time initialization: flatten all batch IDs from both ports across all partitions.
-  // The old per-partition cross-product (Σ left[i]×right[i]) is wrong when probe is unpartitioned
-  // (all data in partition 0) but build is partitioned: it only creates tasks for the one matching
-  // partition and silently skips the rest. The correct cross-product is total_left × total_right so
-  // every probe batch is joined against every build batch — execute() builds a fresh hash table per
-  // task and does not rely on partition alignment. The build batch's partition drives GPU routing.
+  // One-time initialization: snapshot all batch IDs from both ports.
   if (left_batch_ids.empty() && right_batch_ids.empty()) {
-    size_t const n_parts = ports["default"]->repo->num_partitions();
-    if (n_parts != ports["build"]->repo->num_partitions()) {
+    if (ports["default"]->repo->num_partitions() != ports["build"]->repo->num_partitions()) {
       throw std::runtime_error(
-        "In sirius_physical_hash_join: partition count mismatch between probe and build ports in "
-        "operator " +
+        "In sirius_physical_hash_join:Number of partitions for left and right ports must be the "
+        "same in operator " +
         std::to_string(this->get_operator_id()));
     }
 
-    // Use outer-dim 0 as the flat list (sentinel: left_batch_ids.empty() == false after init).
-    left_batch_ids.resize(1);
-    right_batch_ids.resize(1);
-    for (size_t i = 0; i < n_parts; i++) {
-      for (auto id : ports["default"]->repo->get_batch_ids(i)) {
-        left_batch_ids[0].push_back(id);
-        left_batch_partition_ids.push_back(i);
-      }
-      for (auto id : ports["build"]->repo->get_batch_ids(i)) {
-        right_batch_ids[0].push_back(id);
-        right_batch_partition_ids.push_back(i);
-      }
+    left_batch_ids.reserve(ports["default"]->repo->num_partitions());
+    right_batch_ids.reserve(ports["build"]->repo->num_partitions());
+    for (size_t i = 0; i < ports["default"]->repo->num_partitions(); i++) {
+      left_batch_ids.push_back(ports["default"]->repo->get_batch_ids(i));
+      right_batch_ids.push_back(ports["build"]->repo->get_batch_ids(i));
+      num_batches_to_process += left_batch_ids[i].size() * right_batch_ids[i].size();
     }
-    num_batches_to_process = left_batch_ids[0].size() * right_batch_ids[0].size();
   }
 
   if (current_partition_index >= num_batches_to_process) { return nullptr; }
 
-  size_t const batch_index = current_partition_index++;
-  size_t const n_right     = right_batch_ids[0].size();
-  size_t const left_idx    = batch_index / n_right;
-  size_t const right_idx   = batch_index % n_right;
+  size_t batch_index = current_partition_index++;
 
-  uint64_t const left_batch_id  = left_batch_ids[0][left_idx];
-  uint64_t const right_batch_id = right_batch_ids[0][right_idx];
-  size_t const left_partition   = left_batch_partition_ids[left_idx];
-  size_t const right_partition  = right_batch_partition_ids[right_idx];
-  bool const pop_left           = (right_idx == n_right - 1);
-  bool const pop_right          = (left_idx == left_batch_ids[0].size() - 1);
-
+  // Walk the partition × left × right grid to find the (left, right) pair for this batch_index.
   std::vector<std::shared_ptr<cucascade::data_batch>> input_batch;
   input_batch.reserve(2);
-  if (pop_left) {
-    input_batch.push_back(
-      ports["default"]->repo->pop_data_batch_by_id(left_batch_id, left_partition));
-  } else {
-    input_batch.push_back(
-      ports["default"]->repo->get_data_batch_by_id(left_batch_id, left_partition));
+  size_t counter = 0;
+  for (size_t partition_idx = 0; partition_idx < left_batch_ids.size(); partition_idx++) {
+    size_t left_counter = 0;
+    for (auto& left_batch_id : left_batch_ids[partition_idx]) {
+      size_t right_counter = 0;
+      for (auto& right_batch_id : right_batch_ids[partition_idx]) {
+        if (counter == batch_index) {
+          bool pop_left  = (right_counter == right_batch_ids[partition_idx].size() - 1);
+          bool pop_right = (left_counter == left_batch_ids[partition_idx].size() - 1);
+          if (pop_left) {
+            input_batch.push_back(
+              ports["default"]->repo->pop_data_batch_by_id(left_batch_id, partition_idx));
+          } else {
+            input_batch.push_back(
+              ports["default"]->repo->get_data_batch_by_id(left_batch_id, partition_idx));
+          }
+          if (pop_right) {
+            input_batch.push_back(
+              ports["build"]->repo->pop_data_batch_by_id(right_batch_id, partition_idx));
+          } else {
+            input_batch.push_back(
+              ports["build"]->repo->get_data_batch_by_id(right_batch_id, partition_idx));
+          }
+          // MIXED_JOIN distributes per-partition tasks across GPUs by
+          // partition_idx % num_gpus. Tag with the partition index so the
+          // scheduler can route by partition.
+          return std::make_unique<partitioned_operator_data>(std::move(input_batch), partition_idx);
+        }
+        right_counter++;
+        counter++;
+      }
+      left_counter++;
+    }
   }
-  if (pop_right) {
-    input_batch.push_back(
-      ports["build"]->repo->pop_data_batch_by_id(right_batch_id, right_partition));
+
+  if (input_batch.empty()) {
+    return nullptr;
   } else {
-    input_batch.push_back(
-      ports["build"]->repo->get_data_batch_by_id(right_batch_id, right_partition));
+    throw std::runtime_error("Expected to have returned already or received nothing, but got " +
+                             std::to_string(input_batch.size()) + " input batches for hash join");
   }
-  // Tag with the build batch's partition so the scheduler routes this task to the GPU that
-  // already holds that partition's data.
-  return std::make_unique<partitioned_operator_data>(std::move(input_batch), right_partition);
 }
 
 /// Result of prepare_join_keys for a single join side: the key table view and any cast columns
