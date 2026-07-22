@@ -155,6 +155,32 @@ std::vector<cudf::data_type> scan_physical_schema(duckdb::LogicalGet& op,
     return {};
   }
 
+  // Residency gate: a narrow sidecar is installed only when the pinned cache
+  // will serve this scan with columns that were already narrowed at pin time —
+  // then serving narrow is free (the casts were paid at pin time). Everything
+  // else stays native: an unpinned scan is byte-identical to feature-off
+  // (statistics are never fetched), and a pinned-native column is never
+  // narrowed at serve time as a recurring per-query cost. The probe runs
+  // before the statistics loop so the unpinned case costs one lookup.
+  sirius::scan_manager::pinned_entry const* entry = nullptr;
+  if (op.function.name == "seq_scan") {
+    auto* table_scan_bind = dynamic_cast<duckdb::TableScanBindData*>(op.bind_data.get());
+    if (table_scan_bind == nullptr || !table_scan_bind->table.IsDuckTable()) { return {}; }
+    auto& table = table_scan_bind->table.Cast<duckdb::DuckTableEntry>();
+    entry       = state->get_scan_manager().find_pinned_entry_for_duckdb_table(
+      table.ParentCatalog().GetName(), table.ParentSchema().name, table.name);
+  } else {
+    auto const files =
+      resolve_parquet_scan_file_paths(op.function.name, op.bind_data.get(), op.parameters);
+    if (files.empty()) { return {}; }
+    entry = state->get_scan_manager().find_pinned_entry_for_parquet_files(files);
+  }
+  if (entry == nullptr) { return {}; }
+  // A pin that cannot serve the requested columns means execution reads disk
+  // fresh; a narrow sidecar would reintroduce per-batch verification and casts.
+  auto const projection = entry->cache_info.column_projection_for(ids);
+  if (projection.empty()) { return {}; }
+
   std::vector<cudf::data_type> result;
   result.reserve(op.types.size());
   bool changed = false;
@@ -178,6 +204,10 @@ std::vector<cudf::data_type> scan_physical_schema(duckdb::LogicalGet& op,
     if (!range) { continue; }
     auto target = sirius::choose_narrow_physical_type(logical, *range);
     if (!target) { continue; }
+    if (!sirius::scan_manager::pinned_column_narrowed_in_all_chunks(*entry,
+                                                                    projection[ids_position])) {
+      continue;  // pinned-native (or mixed) column: serve native, never narrow at serve time
+    }
     result.back() = *target;
     changed       = true;
   }
@@ -604,6 +634,11 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
     std::move(op.virtual_columns));
   if (physical_types.size() == node->types.size()) {
     node->set_physical_types(std::move(physical_types));
+    if (auto sirius_state = context.registered_state
+                              ? context.registered_state->Get<duckdb::SiriusContext>("sirius_state")
+                              : nullptr) {
+      sirius_state->record_compressed_materialization_scan_sidecar_installed();
+    }
   }
   node->named_parameters = std::move(op.named_parameters);
   node->dynamic_filters  = op.dynamic_filters;

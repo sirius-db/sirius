@@ -222,7 +222,9 @@ pressure even when the SQL type must remain unchanged.
 
 **Mechanism:** A complete physical-type sidecar records narrower signed, unsigned, or same-scale
 decimal cuDF carriers without changing the logical schema. Source statistics nominate scan-time
-targets and exact per-batch min/max reductions guard every non-null wider-to-narrower cast. `pin_table`
+targets and exact per-batch min/max reductions guard every non-null wider-to-narrower cast. A scan
+keeps a statistics-derived target only when the pinned cache will serve it with columns already
+narrowed at pin time; unpinned scans stay native. `pin_table`
 instead computes exact bounds per materialized cache chunk, so different chunks may use different
 widths. Pure reference payloads can remain narrow; expression references and conservative operator
 boundaries restore the native carrier before arithmetic, comparison, hashing, aggregation, ordering,

@@ -127,6 +127,12 @@ class cache_entry_info {
                                           std::string_view schema,
                                           std::string_view table) const;
 
+  /// Parquet-identity check shared by can_serve_with_columns and the plan-time
+  /// residency gate — one matcher, so the probe and prepare can never drift.
+  /// Same file set irrespective of order (both sides sorted, byte-exact compare).
+  /// False for duckdb entries (empty resolved_file_paths) and for an empty @p files.
+  [[nodiscard]] bool matches_parquet_files(std::span<std::string const> files) const;
+
   /// Column-superset gather over @p requested_ids (requested order): for each
   /// requested column, its position within the cached @c column_ids. Empty
   /// when the cache cannot serve — a requested rowid/virtual/empty/
@@ -208,6 +214,17 @@ struct pinned_entry {
 /// recording the assignment and converts a throw into a disk-read fallback.
 void validate_pinned_entry_for_serving(pinned_entry const& entry,
                                        std::span<std::size_t const> selected_columns);
+
+/// True iff @p entry's narrowing markers show the cached column at
+/// @p entry_position (a position into cache_info.column_ids) narrowed in
+/// EVERY chunk. False for the empty (all-native canonical) matrix, for
+/// zero-chunk entries, and — defensively — for an out-of-range
+/// @p entry_position. Drives the plan-time residency gate: a column that
+/// passes is served narrow with at most a cheap same-family widening per
+/// chunk; a column that fails would pay a recurring per-query exact-range
+/// verification and narrowing cast on its native chunks, so it stays native.
+[[nodiscard]] bool pinned_column_narrowed_in_all_chunks(pinned_entry const& entry,
+                                                        std::size_t entry_position);
 
 /**
  * @brief Cache-serve-time survivor plan for one cached scan.
@@ -423,6 +440,15 @@ class sirius_scan_manager {
   /// plan-time MVCC guards.
   [[nodiscard]] pinned_entry const* find_pinned_entry_for_duckdb_table(
     std::string_view catalog_name, std::string_view schema_name, std::string_view table_name) const;
+
+  /// The pinned entry whose parquet identity matches @p resolved_file_paths
+  /// (cache_entry_info::matches_parquet_files), or nullptr. Non-owning; valid
+  /// only until the next pin/unpin — the same single-threaded query-lifecycle
+  /// discipline as visit_pinned_entries. First match wins if one file set was
+  /// pinned under two names. Read by the plan-time compressed-materialization
+  /// residency gate.
+  [[nodiscard]] pinned_entry const* find_pinned_entry_for_parquet_files(
+    std::span<std::string const> resolved_file_paths) const;
 
   parquet_bind_result describe_parquet(std::string const& uri);
 

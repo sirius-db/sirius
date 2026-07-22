@@ -81,6 +81,10 @@ class SiriusContext : public ClientContextState {
     uint64_t scan_columns_narrowed = 0;
     uint64_t scan_columns_restored = 0;
     uint64_t pin_columns_narrowed  = 0;
+    /// Plan-time count of TABLE_SCAN nodes that received a narrow physical
+    /// sidecar (post-residency-gate, pre-propagation/pruning — a later pass may
+    /// still clear or prune it).
+    uint64_t scan_sidecars_installed = 0;
   };
 
   SiriusContext();
@@ -332,6 +336,9 @@ class SiriusContext : public ClientContextState {
   /// \brief Record columns narrowed while materializing a pinned chunk.
   void record_compressed_materialization_pin_columns_narrowed(uint64_t count = 1) noexcept;
 
+  /// \brief Record a TABLE_SCAN node that received a narrow physical sidecar at plan time.
+  void record_compressed_materialization_scan_sidecar_installed() noexcept;
+
  private:
   void throw_if_not_initialized() const;
   void acquire_query_lifecycle_slot();
@@ -405,6 +412,7 @@ class SiriusContext : public ClientContextState {
   std::atomic<uint64_t> compressed_materialization_scan_columns_narrowed_count_{0};
   std::atomic<uint64_t> compressed_materialization_scan_columns_restored_count_{0};
   std::atomic<uint64_t> compressed_materialization_pin_columns_narrowed_count_{0};
+  std::atomic<uint64_t> compressed_materialization_scan_sidecars_installed_count_{0};
 };
 
 /// Installs the sink selected by `Config::LOG_BACKEND` (with `Config::LOG_*`).

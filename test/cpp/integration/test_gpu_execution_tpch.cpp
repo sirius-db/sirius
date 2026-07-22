@@ -629,7 +629,7 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
 }
 
 TEST_CASE_METHOD(GPUExecutionParquetFixture,
-                 "gpu_execution - narrowed decimal payload survives expression expansion",
+                 "gpu_execution - compressed materialization leaves unpinned scans native",
                  "[integration][gpu_execution][parquet][decimal][numeric_narrowing]")
 {
   struct reset_compressed_materialization {
@@ -647,62 +647,20 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
   }
   REQUIRE_FALSE(enabled->HasError());
 
+  // With no pinned entry, the residency gate installs no sidecar, so a flag-on
+  // fresh scan is byte-identical to feature-off — no verification, no casts, no
+  // restores. The counters below are the runtime proxy for that structural
+  // byte-identity on a decimal-payload-plus-expression-expansion shape that
+  // would narrow if a sidecar were installed.
   auto const before_stats = sirius::test::get_compressed_materialization_stats(*con);
   compare_gpu_vs_cpu(
     "select l_orderkey, l_linenumber, l_extendedprice, "
     "l_extendedprice + cast('0.00' as decimal(3,2)) as price_copy "
     "from lineitem where l_orderkey <= 100 order by l_orderkey, l_linenumber;");
   auto const after_stats = sirius::test::get_compressed_materialization_stats(*con);
-  REQUIRE(after_stats.scan_columns_narrowed > before_stats.scan_columns_narrowed);
-}
-
-TEST_CASE_METHOD(GPUExecutionParquetFixture,
-                 "gpu_execution - zero-benefit narrowing is pruned for aggregate-only scans",
-                 "[integration][gpu_execution][parquet][numeric_narrowing]")
-{
-  struct reset_compressed_materialization {
-    duckdb::Connection& con;
-    ~reset_compressed_materialization()
-    {
-      con.Query("SET enable_compressed_materialization = false;");
-    }
-  } reset{*con};
-
-  auto enabled = con->Query("SET enable_compressed_materialization = true;");
-  REQUIRE(enabled);
-  REQUIRE_FALSE(enabled->HasError());
-
-  // Every scan column feeds the aggregate directly, so the restore projection would sit
-  // immediately above the scan: the planner must prune the narrowing instead of paying a
-  // verification pass plus two carrier casts that never cross an operator boundary narrow.
-  auto const before_stats = sirius::test::get_compressed_materialization_stats(*con);
-  compare_gpu_vs_cpu("select sum(l_extendedprice), sum(l_quantity) from lineitem;");
-  auto const after_stats = sirius::test::get_compressed_materialization_stats(*con);
+  REQUIRE(after_stats.scan_sidecars_installed == before_stats.scan_sidecars_installed);
   REQUIRE(after_stats.scan_columns_narrowed == before_stats.scan_columns_narrowed);
-}
-
-TEST_CASE_METHOD(GPUExecutionParquetFixture,
-                 "gpu_execution - zero-benefit narrowing is pruned for join-key-only scans",
-                 "[integration][gpu_execution][parquet][numeric_narrowing]")
-{
-  struct reset_compressed_materialization {
-    duckdb::Connection& con;
-    ~reset_compressed_materialization()
-    {
-      con.Query("SET enable_compressed_materialization = false;");
-    }
-  } reset{*con};
-
-  auto enabled = con->Query("SET enable_compressed_materialization = true;");
-  REQUIRE(enabled);
-  REQUIRE_FALSE(enabled->HasError());
-
-  // Both scans project only their join key, which the join boundary restores directly above
-  // each scan; the planner must prune the narrowing on both sides.
-  auto const before_stats = sirius::test::get_compressed_materialization_stats(*con);
-  compare_gpu_vs_cpu("select count(*) from lineitem, orders where l_orderkey = o_orderkey;");
-  auto const after_stats = sirius::test::get_compressed_materialization_stats(*con);
-  REQUIRE(after_stats.scan_columns_narrowed == before_stats.scan_columns_narrowed);
+  REQUIRE(after_stats.scan_columns_restored == before_stats.scan_columns_restored);
 }
 
 //===----------------------------------------------------------------------===//

@@ -47,19 +47,51 @@ Decimal bounds are compared as raw unscaled signed integers. cuDF represents SQL
 ## Scan planning and execution
 
 At plan time, Sirius asks the table function for min/max statistics and uses any compatible bounds
-to choose a candidate physical target. Availability depends on the source and scan shape; for
-example, a Parquet footer's writer-declared statistics are advisory rather than proof about the
-decoded values. A scan receives a complete physical sidecar only when its output mapping is
-complete and at least one eligible projected column has usable bounds. Columns that cannot be
-narrowed remain native inside that sidecar.
+to choose a candidate physical target per column. Availability depends on the source and scan
+shape; for example, a Parquet footer's writer-declared statistics are advisory rather than proof
+about the decoded values. Statistics only nominate the candidate carrier — a residency gate decides
+whether the scan receives a sidecar at all. A sidecar is installed only when the scan manager holds
+a pinned entry that (a) matches the scan's identity (same parquet file set or same duckdb
+catalog.schema.table — the same matchers the serve-time cache hit uses), (b) can serve every
+requested column, and (c) narrowed the candidate column in every cached chunk. This yields three
+residency states:
+
+1. **Pinned-narrow** — the pinned entry matches the scan, serves its requested columns, and its
+   narrowing markers show a candidate column narrowed in every chunk: that column keeps its narrow
+   target in the sidecar. Serving narrow is free — the casts were paid at pin time — and the query
+   gets the full downstream benefit.
+2. **Unpinned** — no matching entry, or the entry cannot serve the requested columns: no sidecar.
+   The fresh scan is byte-identical to the feature-off plan — no exact-minmax verification, no cast
+   kernels, no restore projections; statistics are not even consulted.
+3. **Pinned-native** — the entry matches but the column was not narrowed in every chunk (for
+   example, the table was pinned while the flag was off): that column's target stays native, and
+   when no column survives the whole sidecar is dropped. A native resident chunk is never narrowed
+   at serve time as a recurring per-query cost.
+
+A scan receives a complete physical sidecar only when its output mapping is complete and at least
+one eligible projected column has usable bounds and passes the residency gate. Columns that cannot
+be narrowed remain native inside that sidecar. Because installation depends on residency, plan
+shape depends on pin state at plan time (see the staleness note below).
 
 The GPU scan decodes the source at its normal/native width, applies reader and pushed-down filters,
-and projects the output. Before a planned wider-to-narrower conversion of a column containing
-non-null values, it computes exact min/max over the materialized column and verifies that every
-value fits the candidate carrier. A missing, invalid, or out-of-range runtime bound rejects the
-narrowing instead of allowing a truncating cast; empty and all-null columns are vacuously safe. The
-verified output is then cast to the planned physical schema. This placement avoids a separate
-physical stage even though the cuDF reductions and casts remain kernels.
+and projects the output. Verification remains the safety contract for every planned
+wider-to-narrower conversion: before such a conversion of a column containing non-null values, the
+scan computes exact min/max over the materialized column and verifies that every value fits the
+candidate carrier. A missing, invalid, or out-of-range runtime bound rejects the narrowing instead
+of allowing a truncating cast; empty and all-null columns are vacuously safe. The verified output
+is then cast to the planned physical schema. This placement avoids a separate physical stage even
+though the cuDF reductions and casts remain kernels. On the routine paths the verification no
+longer runs — unpinned scans carry no sidecar, and a pinned-narrow serve is either a no-op (the
+stored carrier equals the plan target) or a cheap verified-free widening — but it remains reachable
+as defense for the residual cases: a plan that predicted cache serving whose execution fell back to
+a disk read, and advisory statistics that disagree with the stored carriers.
+
+Plan staleness across pin changes: a prepared statement or cached plan built while a table was
+unpinned stays native after a later pin — correct, but it forgoes the benefit until re-planned. A
+plan built pinned-narrow whose table is later unpinned executes as a fresh disk scan carrying a
+narrow sidecar: correct (verification guards every cast) but it pays the per-batch verification and
+cast cost until re-planned. Pin and unpin are not catalog events, so DuckDB does not invalidate
+such plans; this bounded staleness is accepted and documented rather than mechanized.
 
 Physical schemas propagate through operators that preserve column identity:
 
@@ -96,8 +128,9 @@ narrowing cast, and a widening cast without one narrow batch write in between. T
 becomes native in the scan sidecar, the restore cast collapses to a passthrough reference, and a
 restore projection reduced to a positional identity is removed. Columns whose carrier crosses a
 materializing operator (for example scan → filter → restore) keep their narrowing, and pin-time
-narrowing is unaffected — a pruned sidecar restores resident narrow chunks during scan
-normalization instead of at the restore projection.
+narrowing is unaffected. With the residency gate, the pass operates only on pinned-backed sidecars;
+for such columns its effect is restoring resident narrow chunks during scan normalization instead
+of at a restore projection, plus reclaiming the projection's pipeline stage.
 
 ## Operator boundaries
 
@@ -145,8 +178,9 @@ advertise native output and normalize before the downstream dynamic-filter opera
 The setting is sampled independently when a table is pinned and when a query plan is built. Changing
 it does not rewrite an existing cache entry:
 
-- pinning with the option off stores native carriers; enabling it for a later query can narrow an
-  eligible cached column at scan time when that query has a physical override;
+- pinning with the option off stores native carriers, and a later flag-on query installs no narrow
+  targets for them — cached native columns are never narrowed at serve time; re-pin with the option
+  on to obtain narrowing;
 - pinning with the option on and querying with it off restores cached numeric carriers to the native
   logical schema;
 - a per-resident-input marker records whether the served columns actually use narrower carriers.
@@ -175,10 +209,14 @@ that needs no conversion uses the larger of its stored and working-set sizes.
 ## Validation and measurement
 
 Current boundary tests cover signed, unsigned, and decimal carrier selection, strict no-reduction
-cases, invalid ranges, family mismatches, and decimal scale mismatches. The integration test compares
-GPU and CPU results for a non-key decimal payload used both as a direct projection and in arithmetic.
-It checks semantic compatibility with the feature enabled and asserts that the actual scan-downcast
-counter increases, so the narrowed physical path—not only the feature-on semantics—is exercised.
+cases, invalid ranges, family mismatches, and decimal scale mismatches. Integration tests compare
+GPU and CPU results for a non-key decimal payload used both as a direct projection and in
+arithmetic, and discriminate the residency-gate states through the observability counters: beside
+the serve-time scan-downcast and scan-restore counters there is a plan-time
+`scan_sidecars_installed` counter, counting table scans that received a narrow physical sidecar
+after the residency gate (a later pass may still clear or prune it). After the residency gate,
+unpinned feature-on is expected to be approximately equal to unpinned feature-off — the flag should
+be performance-neutral wherever no pinned narrow data exists.
 
 Performance comparisons must use the same binary and otherwise identical configurations. Run the
 full TPC-H suite with the feature off and on for both unpinned and host-pinned modes; report warm
@@ -214,10 +252,30 @@ SIRIUS_PIN_TIER=host pixi run bash test/tpch_performance/benchmark_and_validate.
   --pinning-mode per-query 50
 ```
 
-### Measured SF50 result (2026-07-21)
+### Measured SF50 result (2026-07-22, with residency gate)
 
 Using the same final binary for control and treatment, the sum of per-query medians for warm
 iterations 2–6 was:
+
+| Mode | Feature off | Feature on | Change |
+|---|---:|---:|---:|
+| Unpinned | 29.602 s | 29.741 s | +0.47% |
+| HOST-pinned | 10.506 s | 9.365 s | -10.86% |
+
+Lower is better. All runs validated 22/22 queries against the same stored DuckDB results. The
+unpinned row pools per-query medians over two off/on run pairs (ten warm iterations per config)
+because same-config run-to-run drift measured +2.25% that day — larger than either individual
+flag delta (+1.50%, +0.22%); the pooled +0.47% is within that noise, as the gate predicts
+(unpinned feature-on plans are structurally identical to feature-off plans). The run
+directories under `runs/` are `2026-07-22_21-54-46`, `2026-07-22_21-57-48`,
+`2026-07-22_22-06-09`, and `2026-07-22_22-09-15` (unpinned off/on, first and repeat pairs) and
+`2026-07-22_22-00-53` / `2026-07-22_22-02-58` (HOST-pinned off/on).
+
+### Measured SF50 result (2026-07-21, pre-residency-gate, historical)
+
+This table was measured **before** the residency gate landed; unpinned feature-on plan shapes
+have since changed, and the table above supersedes it. Using the same final binary for control
+and treatment, the sum of per-query medians for warm iterations 2–6 was:
 
 | Mode | Feature off | Feature on | Change |
 |---|---:|---:|---:|

@@ -697,12 +697,7 @@ std::vector<std::size_t> cache_entry_info::can_serve_with_columns(
   // never serves a scan of the other — the identity check below falls through (a
   // duckdb cache has empty resolved_file_paths; a parquet cache has an empty table_name).
   if (auto const* p = dynamic_cast<op::scan::parquet_ingestible_table_info const*>(&other)) {
-    if (resolved_file_paths.size() != p->resolved_file_paths.size()) { return {}; }
-    auto these_files = resolved_file_paths;
-    auto those_files = p->resolved_file_paths;
-    std::sort(these_files.begin(), these_files.end());
-    std::sort(those_files.begin(), those_files.end());
-    if (these_files != those_files) { return {}; }
+    if (!matches_parquet_files(p->resolved_file_paths)) { return {}; }
     return column_projection_for(p->column_ids);
   }
   if (auto const* d = dynamic_cast<op::scan::duckdb_native_ingestible_table_info const*>(&other)) {
@@ -724,6 +719,17 @@ bool cache_entry_info::matches_duckdb_table(std::string_view catalog,
   // A parquet cache has an empty table_name, so it never matches a duckdb scan.
   if (table_name.empty()) { return false; }
   return catalog_name == catalog && schema_name == schema && table_name == table;
+}
+
+bool cache_entry_info::matches_parquet_files(std::span<std::string const> files) const
+{
+  if (files.empty() || resolved_file_paths.empty()) { return false; }
+  if (files.size() != resolved_file_paths.size()) { return false; }
+  auto these_files = resolved_file_paths;
+  std::vector<std::string> those_files{files.begin(), files.end()};
+  std::ranges::sort(these_files);
+  std::ranges::sort(those_files);
+  return these_files == those_files;
 }
 
 std::vector<std::size_t> cache_entry_info::column_projection_for(
@@ -1067,6 +1073,15 @@ pinned_entry const* sirius_scan_manager::find_pinned_entry_for_duckdb_table(
   return nullptr;
 }
 
+pinned_entry const* sirius_scan_manager::find_pinned_entry_for_parquet_files(
+  std::span<std::string const> resolved_file_paths) const
+{
+  for (auto const& [name, entry] : _pinned_entries) {
+    if (entry.cache_info.matches_parquet_files(resolved_file_paths)) { return &entry; }
+  }
+  return nullptr;
+}
+
 void validate_pinned_entry_for_serving(pinned_entry const& entry,
                                        std::span<std::size_t const> selected_columns)
 {
@@ -1114,6 +1129,14 @@ void validate_pinned_entry_for_serving(pinned_entry const& entry,
   }
 
   throw std::runtime_error("pinned entry has an unsupported tier");
+}
+
+bool pinned_column_narrowed_in_all_chunks(pinned_entry const& entry, std::size_t entry_position)
+{
+  if (entry.narrowed_columns.empty()) { return false; }
+  return std::ranges::all_of(entry.narrowed_columns, [&](std::vector<bool> const& row) {
+    return entry_position < row.size() && row[entry_position];
+  });
 }
 
 std::unique_ptr<databatch_provider> make_provider_for_pinned_entry(

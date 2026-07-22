@@ -513,8 +513,9 @@ These can also be set at load via the `SIRIUS_LOG_BACKEND`, `SIRIUS_LOG_DIR`, an
 | `enable_compressed_materialization` | false | Keep eligible integer and fixed-point DECIMAL values in narrower physical carriers until a native semantic boundary. |
 
 `enable_compressed_materialization` is also accepted in YAML under `sirius.operator_params`.
-Plan-time source statistics nominate scan carriers, exact runtime bounds guard narrowing casts, and
-`pin_table` selects carriers independently for each materialized chunk. Changing the setting does
+Plan-time source statistics nominate scan carriers for scans served from a pinned entry that
+already narrowed those columns; unpinned scans stay native. Exact runtime bounds guard narrowing
+casts, and `pin_table` selects carriers independently for each materialized chunk. Changing the setting does
 not rewrite an existing pinned entry; cached scans normalize its actual stored carriers for the
 current query. See [Compressed Materialization](compressed-materialization.md) for eligibility,
 restoration, and cache-reservation behavior.

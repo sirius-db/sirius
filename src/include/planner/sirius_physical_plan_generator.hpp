@@ -26,6 +26,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <vector>
 
 namespace sirius::op {
 class sirius_physical_table_scan;
@@ -34,7 +35,9 @@ class sirius_physical_table_scan;
 namespace duckdb {
 class ClientContext;
 class Expression;
+class FunctionData;
 class LogicalType;
+class Value;
 class GPUContext;
 class ColumnDataCollection;
 class DynamicTableFilterSet;
@@ -61,6 +64,18 @@ class sirius_dynamic_filter_set;
 }
 
 namespace sirius::planner {
+
+/// Resolved parquet file set identifying a parquet-family scan
+/// ("parquet_scan" / "read_parquet" / "sirius_read_parquet"), derived exactly
+/// as the scan's ingestible_table_info derives it — so a plan-time cache probe
+/// and the prepare-time cache match see the same identity. Returns empty when
+/// the identity cannot be resolved (non-parquet function, missing bind data,
+/// empty file list, or a missing/NULL sirius_read_parquet URI parameter);
+/// callers treat empty as "no identity", never as an error.
+[[nodiscard]] std::vector<std::string> resolve_parquet_scan_file_paths(
+  std::string_view function_name,
+  duckdb::FunctionData const* bind_data,
+  duckdb::vector<duckdb::Value> const& parameters);
 
 //! The physical plan generator generates a physical execution plan from a
 //! logical query plan

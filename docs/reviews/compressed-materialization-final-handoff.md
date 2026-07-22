@@ -1,11 +1,11 @@
 # Compressed Materialization — Final Engineering Handoff
 
-Date: 2026-07-21  
-Repository: `/home/kkristensen/Code/sirius_1`  
-Branch: `dev`  
-Base revision reported by the benchmark harness: `3ee47f8b`  
-Status: implemented, reviewed, built, tested, and benchmarked; changes are not committed or staged  
-Scope: Super Sirius only
+- Date: 2026-07-21
+- Repository: `/home/kkristensen/Code/sirius_1`
+- Branch: `dev`
+- Base revision reported by the benchmark harness: `3ee47f8b`
+- Status: implemented, reviewed, built, tested, and benchmarked; changes are not committed or staged
+- Scope: Super Sirius only
 
 ## Executive summary
 
@@ -299,7 +299,7 @@ not failures. The requested SF50 TPC-H suite ran separately in full.
   `runs/2026-07-20_21-35-46_sf50_6iter/duckdb`
 - Hardware reported by the harness: NVIDIA GB10, 16 CPUs, approximately 125 GB RAM
 
-The harness's built-in “warm” column reports the best warm iteration. This handoff instead uses the
+The harness's built-in "warm" column reports the best warm iteration. This handoff instead uses the
 requested five-run median. For reference, warm-best totals were 28.12 s to 29.39 s unpinned and
 10.31 s to 9.27 s host-pinned, consistent with the median direction.
 
@@ -620,3 +620,94 @@ Follow-up #1 is resolved for comparison/BETWEEN shapes (`IN` remains). Follow-up
 substantially mitigated; the full per-column cost model (expression-use analysis through mixed
 projections, e.g. Q1's arithmetic-only columns) remains open. Follow-ups #3–#9 are unchanged.
 
+
+## Addendum — residency gate (2026-07-22)
+
+### Decision
+
+Scan-time narrowing is now gated on pinned-narrow residency. At plan time, for each supported
+table scan with the flag on, a narrow physical sidecar is installed only when the scan manager
+holds a pinned entry that matches the scan's identity, can serve every requested column, and
+narrowed the candidate column in **every** cached chunk. Three residency states follow:
+pinned-narrow (column keeps its narrow target; serving narrow is free — the casts were paid at
+pin time), unpinned (no sidecar; the fresh scan is byte-identical to feature-off, statistics are
+not even fetched), and pinned-native (native target per failing column; an all-native result
+drops the whole sidecar; a native resident chunk is never narrowed at serve time as a recurring
+per-query cost). Intended contract after this change: **enabling the flag can never regress any
+tier** — unpinned-on ≈ unpinned-off, and the host-pinned win is preserved.
+
+### Mechanism inventory
+
+- `cache_entry_info::matches_parquet_files` — the parquet identity comparison factored out of
+  `can_serve_with_columns` into one shared matcher, so the plan-time probe and the prepare-time
+  cache match can never drift.
+- `sirius_scan_manager::find_pinned_entry_for_parquet_files` — parquet-keyed plan-time finder,
+  mirroring `find_pinned_entry_for_duckdb_table` (which the seq_scan probe reuses).
+- `sirius::scan_manager::pinned_column_narrowed_in_all_chunks` — the all-chunk marker fold over
+  `pinned_entry::narrowed_columns`; false for the empty all-native canonical matrix and for
+  zero-chunk entries.
+- `sirius::planner::resolve_parquet_scan_file_paths` — the parquet scan-identity derivation
+  factored out of `build_parquet_table_info` and shared with the gate, non-throwing (empty means
+  "no identity").
+- The gate itself lives in `scan_physical_schema` (`src/planner/sirius_plan_get.cpp`): the
+  residency probe is hoisted before the statistics loop (state 2 skips statistics entirely), and
+  the marker fold filters each statistics-nominated column ("stats propose, residency
+  disposes"), feeding the existing all-or-none canonicalization.
+- `scan_sidecars_installed` — a plan-time relaxed-atomic counter in
+  `compressed_materialization_stats`, incremented at the sidecar install site in
+  `create_plan(LogicalGet&)`; a later pass may still clear or prune the counted sidecar.
+
+Plan-time cost: one scan-manager lookup per flag-on table scan; state 2 now does strictly less
+work than before (no statistics fetch). Flag-off behavior is bit-for-bit unchanged. Pin-time
+behavior, `normalize_physical_schema` (verification stays as defense-in-depth for the residual
+disk-fallback and lying-statistics cases), `prune_immediate_scan_restores`, the dynamic-filter
+clearing sites, and `no_history_peak_memory_estimate` are all untouched.
+
+### Test rework
+
+- The unpinned positive-narrowing integration test became the state-2 contract
+  (`gpu_execution - compressed materialization leaves unpinned scans native`): same query, same
+  fixture, now asserting all scan counters stay flat.
+- The two unpinned zero-benefit-pruning integration tests were **deleted**: with the gate no
+  sidecar exists on that fixture, so their `scan_columns_narrowed` equality assertions became
+  vacuous — they would pass whether or not pruning works. Their proof moved to
+  `test/cpp/integration/test_compressed_materialization_gate.cpp`, where a pinned-backed sidecar
+  demonstrably exists before pruning (aggregate-only and join-key-only sections assert
+  `scan_sidecars_installed` moved while `scan_columns_narrowed` stayed flat and
+  `scan_columns_restored` increased).
+- The new gate test file also covers the three residency states end to end (GPU and HOST tiers
+  for pinned-narrow, including a flag-off contrast run that proves narrow data flowed through
+  the sidecar) plus the cols-subset serve-ability boundary.
+- New unit tests: `matches_parquet_files` (shared parquet identity matcher) in
+  `test/cpp/scan/test_can_serve_with_columns.cpp` and the marker fold in
+  `test/cpp/scan_manager/test_cached_serving_hardening.cpp`. The parquet finder gets no
+  dedicated unit test (two-line loop over private state; covered end to end).
+
+### Staleness semantics
+
+Plan shape now depends on pin state at plan time. A plan built unpinned stays native after a
+later pin (correct; forgoes benefit until re-plan). A plan built pinned-narrow whose table is
+later unpinned executes as a fresh disk scan carrying a narrow sidecar: correct (verification
+guards every cast) but it pays the pre-gate per-batch cost until re-planned. Pin/unpin are not
+catalog events, so DuckDB does not invalidate such plans; this bounded staleness is accepted and
+documented rather than mechanized.
+
+### Measurement results (post-gate four-way SF50 A/B, 2026-07-22)
+
+Same binary, same six-iteration warm-median method (median of iterations 2–6 per query, summed
+over all 22 queries), validated against the stored DuckDB results
+(`runs/2026-07-20_21-35-46_sf50_6iter`). All six runs (the four-way plus an unpinned repeat
+pair) validated 22/22 with zero errors.
+
+- **HOST-pinned**: off 10.506 s vs on 9.365 s → **−10.86%** (`runs/2026-07-22_22-00-53` /
+  `runs/2026-07-22_22-02-58`). The pre-gate −11.40% win is preserved within noise.
+- **Unpinned**: the first pair read +1.50% (`runs/2026-07-22_21-54-46` /
+  `runs/2026-07-22_21-57-48`), which exceeded the ±0.6% yardstick, so the pair was re-run:
+  the repeat read +0.22% (`runs/2026-07-22_22-06-09` / `runs/2026-07-22_22-09-15`), and the
+  same-config off-vs-off drift between the two sessions measured **+2.25%** — larger than
+  either flag delta. Pooled per-query medians over all ten warm iterations per config give
+  off 29.602 s vs on 29.741 s → **+0.47%**, within the yardstick. The gate delivers the
+  intended flag-on-unpinned ≈ flag-off equivalence; the pre-gate +1.28% unpinned cost is gone.
+
+Acceptance criteria met: 22/22 validation in every run, unpinned on-vs-off within run-to-run
+noise, host-pinned improvement within noise of −11.4%.

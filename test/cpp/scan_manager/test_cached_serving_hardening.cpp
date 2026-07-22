@@ -391,6 +391,35 @@ TEST_CASE("cached provider marks only selected narrow columns", "[cached_serving
   }
 }
 
+TEST_CASE("pinned_column_narrowed_in_all_chunks folds the marker matrix per column",
+          "[cached_serving][scan_manager]")
+{
+  auto& e    = env();
+  auto entry = make_gpu_entry(*e.gpu_space, 3, 4);
+
+  SECTION("empty (all-native canonical) matrix folds false")
+  {
+    entry.narrowed_columns = {};
+    REQUIRE_FALSE(sirius::scan_manager::pinned_column_narrowed_in_all_chunks(entry, 0));
+  }
+
+  SECTION("columns fold independently")
+  {
+    // Column 0 narrowed in every chunk; column 1 mixed (true in one chunk,
+    // false in another); column 2 never narrowed.
+    entry.narrowed_columns = {{true, true, false}, {true, false, false}, {true, true, false}};
+    REQUIRE(sirius::scan_manager::pinned_column_narrowed_in_all_chunks(entry, 0));
+    REQUIRE_FALSE(sirius::scan_manager::pinned_column_narrowed_in_all_chunks(entry, 1));
+    REQUIRE_FALSE(sirius::scan_manager::pinned_column_narrowed_in_all_chunks(entry, 2));
+  }
+
+  SECTION("out-of-range position folds false")
+  {
+    entry.narrowed_columns = {{true, true, true}, {true, true, true}, {true, true, true}};
+    REQUIRE_FALSE(sirius::scan_manager::pinned_column_narrowed_in_all_chunks(entry, 3));
+  }
+}
+
 TEST_CASE("masked and filtered resident splits report the filter-copy working-set peak",
           "[cached_serving][scan_manager]")
 {

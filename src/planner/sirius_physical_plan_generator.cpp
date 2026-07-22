@@ -71,6 +71,34 @@
 
 namespace sirius::planner {
 
+std::vector<std::string> resolve_parquet_scan_file_paths(
+  std::string_view function_name,
+  duckdb::FunctionData const* bind_data,
+  duckdb::vector<duckdb::Value> const& parameters)
+{
+  if (function_name == "sirius_read_parquet") {
+    // Internal S3 rewrite target: its bind_data is SiriusReadParquetBindData, not
+    // MultiFileBindData — the resolved URI travels in parameters[0].
+    if (parameters.empty() || parameters.front().IsNull()) { return {}; }
+    return {parameters.front().GetValue<std::string>()};
+  }
+  if (function_name == "parquet_scan" || function_name == "read_parquet") {
+    // dynamic_cast (never Cast<>, which asserts/throws): an unresolvable
+    // identity must degrade to empty, not fail the caller.
+    auto const* multi_file_bind = dynamic_cast<duckdb::MultiFileBindData const*>(bind_data);
+    if (multi_file_bind == nullptr || !multi_file_bind->file_list ||
+        multi_file_bind->file_list->IsEmpty()) {
+      return {};
+    }
+    std::vector<std::string> file_paths;
+    for (auto const& file : multi_file_bind->file_list->GetAllFiles()) {
+      file_paths.push_back(file.path);
+    }
+    return file_paths;
+  }
+  return {};
+}
+
 namespace {
 bool is_nested_logical_type(duckdb::LogicalType const& type)
 {
@@ -116,32 +144,28 @@ void wrap_above(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot,
 std::unique_ptr<sirius::op::scan::parquet_ingestible_table_info> build_parquet_table_info(
   sirius::op::sirius_physical_table_scan& scan_op, const sirius::operator_params& op_params)
 {
-  auto info            = std::make_unique<sirius::op::scan::parquet_ingestible_table_info>();
-  info->returned_types = scan_op.returned_types;
-  info->column_ids     = scan_op.column_ids;
-  info->projection_ids = scan_op.projection_ids;
-  info->names          = scan_op.names;
-  info->table_filters  = std::move(scan_op.table_filters);
+  auto info                = std::make_unique<sirius::op::scan::parquet_ingestible_table_info>();
+  info->returned_types     = scan_op.returned_types;
+  info->column_ids         = scan_op.column_ids;
+  info->projection_ids     = scan_op.projection_ids;
+  info->names              = scan_op.names;
+  info->table_filters      = std::move(scan_op.table_filters);
+  auto resolved_file_paths = resolve_parquet_scan_file_paths(
+    scan_op.function.name, scan_op.bind_data.get(), scan_op.parameters);
   if (scan_op.function.name == "sirius_read_parquet") {
-    // Internal S3 rewrite target: its bind_data is SiriusReadParquetBindData, not
-    // MultiFileBindData — the resolved URI travels in parameters[0].
-    if (scan_op.parameters.empty() || scan_op.parameters.front().IsNull()) {
+    if (resolved_file_paths.empty()) {
       throw std::runtime_error(
         "[sirius_physical_plan_generator::build_parquet_table_info] sirius_read_parquet scan "
         "has no URI parameter");
     }
-    info->resolved_file_paths = {scan_op.parameters.front().GetValue<std::string>()};
+    info->resolved_file_paths = std::move(resolved_file_paths);
   } else {
-    auto const& bind_data = scan_op.bind_data->Cast<duckdb::MultiFileBindData>();
-    if (!bind_data.file_list || bind_data.file_list->IsEmpty()) {
+    if (resolved_file_paths.empty()) {
       throw std::runtime_error(
         "[sirius_physical_plan_generator::build_parquet_table_info] No input files to scan");
     }
-    std::vector<std::string> file_paths;
-    for (auto const& file : bind_data.file_list->GetAllFiles()) {
-      file_paths.push_back(file.path);
-    }
-    info->resolved_file_paths = std::move(file_paths);
+    info->resolved_file_paths = std::move(resolved_file_paths);
+    auto const& bind_data     = scan_op.bind_data->Cast<duckdb::MultiFileBindData>();
     info->partition_indices   = bind_data.reader_bind.hive_partitioning_indexes;
   }
   // `scan_output_arity` drives the provider's expected column count — without it the runtime
