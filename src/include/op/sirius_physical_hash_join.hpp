@@ -254,7 +254,6 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   void discard_build_only_slots_if_probe_complete();
 
   std::optional<task_creation_hint> get_next_task_hint() override;
-  [[nodiscard]] bool all_ports_empty() override;
 
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          rmm::cuda_stream_view stream) override;
@@ -269,14 +268,8 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   std::mutex op_state_mutex;
   std::size_t current_partition_index = 0;
   std::size_t num_batches_to_process  = 0;
-  // Flat batch lists across all partitions (populated by standard-mode get_next_task_input_data).
-  // Using the outer vector's size > 0 as the "snapshot taken" sentinel (see all_ports_empty).
   std::vector<std::vector<uint64_t>> left_batch_ids;
   std::vector<std::vector<uint64_t>> right_batch_ids;
-  std::vector<std::size_t>
-    left_batch_partition_ids;  // partition_idx per entry in left_batch_ids[0]
-  std::vector<std::size_t>
-    right_batch_partition_ids;  // partition_idx per entry in right_batch_ids[0]
 
   bool is_all_inequality_join = true;
 
