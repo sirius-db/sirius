@@ -27,6 +27,7 @@
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/query_profiler.hpp"
 #include "duckdb/main/settings.hpp"
+#include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/planner/operator/list.hpp"
 #include "duckdb/planner/operator/logical_extension_operator.hpp"
 #include "duckdb/planner/table_filter.hpp"
@@ -65,6 +66,13 @@
 namespace sirius::planner {
 
 namespace {
+bool is_nested_logical_type(duckdb::LogicalType const& type)
+{
+  auto const id = type.id();
+  return id == duckdb::LogicalTypeId::STRUCT || id == duckdb::LogicalTypeId::LIST ||
+         id == duckdb::LogicalTypeId::MAP;
+}
+
 /// Read the dynamic-filter-pushdown enable flag from the active SiriusContext config. Defaults to
 /// disabled when the state is unavailable (no config to consult outside a configured query).
 bool dynamic_filter_pushdown_enabled(duckdb::ClientContext& context)
@@ -357,12 +365,15 @@ void wrap_hash_group_by(duckdb::unique_ptr<sirius::op::sirius_physical_operator>
       duckdb::make_uniq<sirius::op::sirius_physical_partition>(hgb_ptr->types,
                                                                hgb_ptr->estimated_cardinality,
                                                                /*key_source=*/hgb_ptr,
-                                                               /*is_build=*/false,
-                                                               op_params.hash_partition_bytes);
+                                                               /*is_build=*/false);
+    auto* partition_ptr = partition.get();
     partition->children.push_back(std::move(hgb_op));
 
     auto merge = duckdb::make_uniq<sirius::op::sirius_physical_grouped_aggregate_merge>(
-      &hgb_ptr->Cast<sirius::op::sirius_physical_grouped_aggregate>());
+      &hgb_ptr->Cast<sirius::op::sirius_physical_grouped_aggregate>(),
+      op_params.hash_partition_bytes);
+    // The partition's downstream sizing consumer is the merge (key_source hgb only supplies keys).
+    partition_ptr->set_downstream_consumer_op(merge.get());
     merge->children.push_back(std::move(partition));
     return merge;
   });
@@ -483,8 +494,7 @@ void wrap_join_child(sirius::op::sirius_physical_operator& join_op,
         duckdb::make_uniq<sirius::op::sirius_physical_partition>(std::move(child_types),
                                                                  est_card,
                                                                  /*key_source=*/join_op_ptr,
-                                                                 is_build,
-                                                                 op_params.hash_partition_bytes);
+                                                                 is_build);
       partition->children.push_back(std::move(child_orig));
       concat->children.push_back(std::move(partition));
       return concat;
@@ -526,12 +536,14 @@ void wrap_delim_distinct(sirius::op::sirius_physical_delim_join& delim_base,
     duckdb::make_uniq<sirius::op::sirius_physical_partition>(original->types,
                                                              original->estimated_cardinality,
                                                              /*key_source=*/original.get(),
-                                                             /*is_build=*/false,
-                                                             op_params.hash_partition_bytes);
+                                                             /*is_build=*/false);
+  auto* partition_ptr = partition.get();
   partition->children.push_back(std::move(original));
 
-  auto merge =
-    duckdb::make_uniq<sirius::op::sirius_physical_grouped_aggregate_merge>(original_agg_ptr);
+  auto merge = duckdb::make_uniq<sirius::op::sirius_physical_grouped_aggregate_merge>(
+    original_agg_ptr, op_params.hash_partition_bytes);
+  // The partition's downstream sizing consumer is the merge (key_source only supplies keys).
+  partition_ptr->set_downstream_consumer_op(merge.get());
   merge->children.push_back(std::move(partition));
 
   // Tag the chain top with the owning DELIM_JOIN so the tree-parent wiring redirects its
@@ -644,6 +656,49 @@ void insert_gpu_pipeline_operators_recursive(
 }
 
 }  // namespace
+
+void sirius_physical_plan_generator::reject_nested_column_operation(duckdb::Expression const& expr,
+                                                                    std::string_view operation)
+{
+  // A nested-typed BOUND_REF names the offending column directly.
+  if (is_nested_logical_type(expr.return_type) &&
+      expr.GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) {
+    auto name = expr.GetName();
+    if (name.empty()) { name = expr.ToString(); }
+    throw std::runtime_error("nested column operation on column '" + name + "' (" +
+                             expr.return_type.ToString() + ") is unsupported in " +
+                             std::string(operation) +
+                             ": Sirius reads and projects nested columns but cannot operate on "
+                             "them yet");
+  }
+
+  // Recurse first so a column reference wins over a constructed nested value.
+  duckdb::ExpressionIterator::EnumerateChildren(expr,
+                                                [&operation](duckdb::Expression const& child) {
+                                                  reject_nested_column_operation(child, operation);
+                                                });
+
+  // Constructed nested values (struct_pack, list constructors, ...) cannot run
+  // on the GPU path either.
+  if (is_nested_logical_type(expr.return_type)) {
+    throw std::runtime_error("nested column operation on '" + expr.ToString() + "' (" +
+                             expr.return_type.ToString() + ") is unsupported in " +
+                             std::string(operation));
+  }
+}
+
+void sirius_physical_plan_generator::reject_nested_column_type(duckdb::LogicalType const& type,
+                                                               std::string_view column_name,
+                                                               std::string_view operation)
+{
+  if (is_nested_logical_type(type)) {
+    throw std::runtime_error("nested column operation on column '" + std::string(column_name) +
+                             "' (" + type.ToString() + ") is unsupported in " +
+                             std::string(operation) +
+                             ": Sirius reads and projects nested columns but cannot operate on "
+                             "them yet");
+  }
+}
 
 sirius_physical_plan_generator::sirius_physical_plan_generator(duckdb::ClientContext& context)
   : context(context)

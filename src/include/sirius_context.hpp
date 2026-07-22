@@ -86,6 +86,9 @@ class SiriusContext : public ClientContextState {
   /// \param context The client context.
   void QueryBegin(ClientContext& context) final;
 
+  /// \brief Starts a query for execution paths that bypass DuckDB's active-query state.
+  void QueryBeginStandalone(ClientContext& context, std::string_view query_label);
+
   /// \brief Called at the end of a query execution.
   void QueryEnd() final;
 
@@ -380,6 +383,14 @@ class SiriusContext : public ClientContextState {
   std::atomic<uint64_t> transparent_execution_count_{0};
   std::atomic<uint64_t> transparent_runtime_fallback_count_{0};
 };
+
+/// Installs the sink selected by `Config::LOG_BACKEND` (with `Config::LOG_*`).
+///
+/// `spdlog` and `noop` install unconditionally; `duckdb` needs `db` and, given a
+/// null `db`, defers (leaves the current sink) so a caller without one yet can
+/// still select it. An unknown backend throws only when `db` is non-null, so the
+/// null (best-effort) path never throws.
+void install_configured_log_sink(DatabaseInstance* db);
 
 /// todo(amin): when duckdb is updated, we need to enable OnExtensionLoaded to support sirius
 /// extensions

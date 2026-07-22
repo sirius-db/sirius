@@ -62,16 +62,15 @@ struct Config {
 
   // For duckdb scan task:
   //  - the default batch size
-  //  - the default varchar size for estimating rows per batch
-  // TODO: probably want to use sirius config for these two values
+  // TODO: probably want to use sirius config for this value
   static uint64_t DEFAULT_SCAN_TASK_BATCH_SIZE;
-  static uint64_t DEFAULT_SCAN_TASK_VARCHAR_SIZE;
 
   // For sort partitioning:
   //  - max bytes per sort partition (0 = auto based on 33% GPU memory)
   static uint64_t MAX_SORT_PARTITION_BYTES;
 
   // Logging configuration
+  static std::string LOG_BACKEND;
   static std::string LOG_LEVEL;
   static std::string LOG_DIR;
   static int LOG_FLUSH_SECONDS;

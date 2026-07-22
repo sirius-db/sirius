@@ -467,6 +467,13 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
 {
   // now visit the children
   D_ASSERT(op.children.size() == 2);
+
+  // Reject nested join keys before planning either child.
+  for (auto const& condition : op.conditions) {
+    reject_nested_column_operation(*condition.left, "a join condition");
+    reject_nested_column_operation(*condition.right, "a join condition");
+  }
+
   std::size_t lhs_cardinality = op.children[0]->EstimateCardinality(context);
   std::size_t rhs_cardinality = op.children[1]->EstimateCardinality(context);
 
@@ -626,7 +633,9 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
       op.estimated_cardinality,
       std::move(op.filter_pushdown),
       op_params.max_build_hash_table_bytes,
-      std::move(filter_plan));
+      std::move(filter_plan),
+      op_params.hash_partition_bytes,
+      op_params.max_broadcast_join_size);
     auto& hj                        = join->Cast<sirius::op::sirius_physical_hash_join>();
     hj.join_stats                   = std::move(op.join_stats);
     hj.mark_join_build_switch_ratio = op_params.mark_join_build_switch_ratio;

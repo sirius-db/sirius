@@ -42,6 +42,7 @@
 #include <nvtx3/nvtx3.hpp>
 
 #include <cucascade/data/data_repository_manager.hpp>
+#include <cucascade/memory/memory_space.hpp>
 
 #include <algorithm>
 #include <memory>
@@ -189,11 +190,24 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
 
   sirius_physical_plan = &plan;
 
+  // Sorted, deduped active GPU device ids — built the same way task_creator builds its
+  // `_active_gpu_ids` (from the memory manager's GPU spaces) so partition→GPU routing and the
+  // broadcast probe device→slot mapping stay inverse to each other.
+  std::vector<int> active_gpu_ids;
+  for (auto const* space : sirius_ctx_ptr->get_memory_manager().get_memory_spaces_for_tier(
+         cucascade::memory::Tier::GPU)) {
+    if (space != nullptr) { active_gpu_ids.push_back(space->get_device_id()); }
+  }
+  std::sort(active_gpu_ids.begin(), active_gpu_ids.end());
+  active_gpu_ids.erase(std::unique(active_gpu_ids.begin(), active_gpu_ids.end()),
+                       active_gpu_ids.end());
+
   // Create plan-time build context (decoupled from engine)
   const pipeline::pipeline_build_context build_ctx{
     sirius_ctx_ptr->get_telemetry_context(),
     duckdb::Settings::Get<duckdb::PreserveInsertionOrderSetting>(context),
-    static_cast<int>(sirius_ctx_ptr->get_config().get_hw_topology().gpus.size())};
+    static_cast<int>(sirius_ctx_ptr->get_config().get_hw_topology().gpus.size()),
+    std::move(active_gpu_ids)};
 
   // The RESULT_COLLECTOR wrap is added after the plan generator's own `set_parent_ops` ran;
   // re-walk so the wrapped child's `_parent_op` points at RESULT_COLLECTOR (the tree-parent

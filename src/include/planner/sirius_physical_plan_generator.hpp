@@ -24,6 +24,7 @@
 
 #include <memory>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 
 namespace sirius::op {
@@ -32,6 +33,8 @@ class sirius_physical_table_scan;
 
 namespace duckdb {
 class ClientContext;
+class Expression;
+class LogicalType;
 class GPUContext;
 class ColumnDataCollection;
 class DynamicTableFilterSet;
@@ -189,6 +192,19 @@ class sirius_physical_plan_generator {
     duckdb::LogicalComparisonJoin& op);
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> plan_delim_join(
     duckdb::LogicalComparisonJoin& op);
+
+  // Sirius reads and projects nested (STRUCT/LIST/MAP) columns but cannot operate
+  // on them yet: WHERE / GROUP BY / JOIN ON over a nested column must fail with a
+  // clear error naming the column instead of crashing or returning wrong results.
+  // @p operation names the context, e.g. "a filter predicate".
+  static void reject_nested_column_operation(duckdb::Expression const& expr,
+                                             std::string_view operation);
+
+  // Same check when only a column type + name are available (e.g. a predicate
+  // pushed into LogicalGet::table_filters).
+  static void reject_nested_column_type(duckdb::LogicalType const& type,
+                                        std::string_view column_name,
+                                        std::string_view operation);
 
   // private:
   bool preserve_insertion_order(sirius::op::sirius_physical_operator& plan);

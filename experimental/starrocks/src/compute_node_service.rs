@@ -1,4 +1,5 @@
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use crate::fragment_executor::FragmentExecutor;
 #[cfg(test)]
@@ -13,6 +14,7 @@ use crate::result_store::{FragmentInstanceId, ResultStore};
 use starrocks_plan_translator::{PlanTranslator, TranslatedPlan};
 use starrocks_thrift::{
     data_sinks::{TDataSinkType, TResultSinkType},
+    descriptors::TDescriptorTable,
     internal_service::{
         TExecBatchPlanFragmentsParams, TExecPlanFragmentParams, TGetFileSchemaRequest,
     },
@@ -39,6 +41,8 @@ pub(crate) struct SiriusComputeNodeService {
     /// Buffers executed-fragment results for FE `fetch_data` collection. Shared across BRPC
     /// connections so a `fetch_data` poll sees what an `exec_plan_fragment` buffered.
     results: Arc<ResultStore>,
+    /// Descriptor tables retained for StarRocks's per-query cache protocol.
+    descriptor_tables: Arc<Mutex<HashMap<FragmentInstanceId, TDescriptorTable>>>,
 }
 
 impl SiriusComputeNodeService {
@@ -56,6 +60,7 @@ impl SiriusComputeNodeService {
             translator: PlanTranslator::new(),
             executor,
             results: Arc::new(ResultStore::default()),
+            descriptor_tables: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -198,17 +203,55 @@ impl SiriusComputeNodeService {
         &self,
         params: &TExecPlanFragmentParams,
     ) -> std::result::Result<(), String> {
-        let dump_seq = Self::dump_fragment(params);
+        let params = self.resolve_descriptor_table(params)?;
+        let dump_seq = Self::dump_fragment(&params);
         // Survey mode: accept every fragment so the FE dispatches (and we dump) the whole
         // plan even when translation fails. Queries still fail at fetch_data.
         if std::env::var_os("SIRIUS_CN_TRANSLATE_ONLY").is_some() {
-            if let Err(err) = self.translate_fragment_logged(params, dump_seq) {
+            if let Err(err) = self.translate_fragment_logged(&params, dump_seq) {
                 tracing::warn!(error = %err, "translate-only mode: accepting untranslatable fragment");
             }
             return Ok(());
         }
-        let translated = self.translate_fragment_logged(params, dump_seq)?;
-        self.execute_and_buffer(params, &translated)
+        let translated = self.translate_fragment_logged(&params, dump_seq)?;
+        self.execute_and_buffer(&params, &translated)
+    }
+
+    /// Restores descriptor tables omitted by StarRocks's per-query cache protocol.
+    fn resolve_descriptor_table(
+        &self,
+        params: &TExecPlanFragmentParams,
+    ) -> std::result::Result<TExecPlanFragmentParams, String> {
+        let mut resolved = params.clone();
+        let Some(query_id) = params
+            .params
+            .as_ref()
+            .map(|exec| FragmentInstanceId::from(&exec.query_id))
+        else {
+            return Ok(resolved);
+        };
+        let Some(desc) = params.desc_tbl.as_ref() else {
+            return Ok(resolved);
+        };
+        let is_cached_reference = desc.is_cached == Some(true)
+            && desc.slot_descriptors.as_ref().is_none_or(Vec::is_empty)
+            && desc.tuple_descriptors.is_empty()
+            && desc.table_descriptors.as_ref().is_none_or(Vec::is_empty);
+        let mut cache = self
+            .descriptor_tables
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if is_cached_reference {
+            resolved.desc_tbl = Some(
+                cache
+                    .get(&query_id)
+                    .cloned()
+                    .ok_or_else(|| format!("descriptor table cache miss for query {query_id}"))?,
+            );
+        } else {
+            cache.insert(query_id, desc.clone());
+        }
+        Ok(resolved)
     }
 
     /// Writes the received fragment params to `$SIRIUS_CN_DUMP_FRAGMENTS/fragment-<seq>.txt`
@@ -691,6 +734,41 @@ mod tests {
             SiriusComputeNodeService::deserialize_binary::<TResultBatch>(&fetched.attachment)
                 .unwrap();
         assert_eq!(result_batch.rows.len(), 1);
+    }
+
+    #[test]
+    fn cached_descriptor_reference_reuses_query_descriptor_table() {
+        let service = SiriusComputeNodeService::new();
+        let query_id = TUniqueId::new(4, 2);
+
+        let mut initial = fragment_params(None, Some(desc_table()));
+        initial.params = Some(exec_params(query_id.clone(), TUniqueId::new(4, 3)));
+        service
+            .resolve_descriptor_table(&initial)
+            .expect("cache initial descriptor table");
+
+        let cached = TDescriptorTable::new(None, Vec::new(), None, Some(true));
+        let mut reference = fragment_params(None, Some(cached));
+        reference.params = Some(exec_params(query_id, TUniqueId::new(4, 4)));
+        let resolved = service
+            .resolve_descriptor_table(&reference)
+            .expect("resolve cached descriptor table");
+
+        let desc = resolved.desc_tbl.expect("resolved descriptor table");
+        assert_eq!(desc.slot_descriptors.unwrap().len(), 2);
+        assert_eq!(desc.tuple_descriptors.len(), 1);
+        assert_eq!(desc.table_descriptors.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn cached_descriptor_reference_requires_prior_query_table() {
+        let service = SiriusComputeNodeService::new();
+        let cached = TDescriptorTable::new(None, Vec::new(), None, Some(true));
+        let mut reference = fragment_params(None, Some(cached));
+        reference.params = Some(exec_params(TUniqueId::new(7, 1), TUniqueId::new(7, 2)));
+
+        let err = service.resolve_descriptor_table(&reference).unwrap_err();
+        assert!(err.contains("descriptor table cache miss"), "{err}");
     }
 
     #[test]
