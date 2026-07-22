@@ -33,7 +33,7 @@ on CX-6 RoCE).
 | Supported in v1 | Not in v1 |
 |---|---|
 | Exact-key `read_parquet('s3://…')` | Wildcard glob and S3 LIST (explicit error at glob expansion) |
-| Split endpoints: host plane + RDMA data plane | Single-endpoint deployment (later option) |
+| Two logical endpoints — host plane + RDMA data plane; the configured addresses may be identical | A single shared endpoint configuration (no separate data-plane settings) |
 | Fixed per-GPU registered arena | Multi-GPU enablement (structure ships, gate covers one GPU) |
 | Basic byte/request/failure metrics | Full metric parity with the REST backend |
 | One-shot device reads | Automatic RDMA retry (a single pre-approved retry exists as a response to a soak failure, Section 5) |
@@ -55,14 +55,14 @@ flowchart LR
     arena -->|"D2D on the caller stream"| rmm["RMM destination<br/>(caller-owned, not registered)"]
   end
   ctl -->|"HEAD / footer / range GET"| s3["s3_endpoint<br/>(any S3 service)"]
-  w -->|"token-bearing signed GET"| gw["s3_rdma_endpoint<br/>(cuObject gateway, direct connect)"]
+  w -->|"token-bearing signed GET"| gw["s3_rdma_data.endpoint<br/>(cuObject gateway, direct connect)"]
   gw -->|"RDMA write"| arena
   s3 --- store[("same backing store,<br/>immutable keys")]
   gw --- store
 ```
 
 The host plane (`s3_endpoint`) is any S3 service, speaking standard
-SigV4 HEAD, footer, and range GETs. The data plane (`s3_rdma_endpoint`)
+SigV4 HEAD, footer, and range GETs. The data plane (`s3_rdma_data.endpoint`)
 is a direct-connect cuObject gateway carrying token-bearing GETs plus the
 publisher HEAD of the visibility barrier below; both front the same
 backing store and bucket namespace.
@@ -83,6 +83,12 @@ publisher completes a visibility barrier: HEAD succeeds at both endpoints
 with matching sizes, and content identity is confirmed by a trusted ETag
 or the publishing manifest's object hash. The query path does not send
 HEAD to the gateway.
+
+For split addresses, the publisher visibility barrier above applies. If
+the two configured addresses are identical and one service serves both
+planes, cross-endpoint checks reduce to that service's native S3
+consistency; immutable keys remain required, and reads do not revalidate
+object versions.
 
 ## 4. Read Lifecycle
 
@@ -200,7 +206,8 @@ change the delivery outcome.
 On entering `TransportFailStop`, the ioctx marks the shared admission
 gate terminal and refuses new work; host- and device-plane operations
 alike surface the same terminal error. An operation already past its
-side-effect point (a control call started, a transfer issued) settles;
+side-effect point — holding the permit acquired when its control call
+starts or its transfer is issued — settles;
 queued envelopes and their ungenerated chunks error-complete; work
 claimed but not issued aborts and releases its slot; blocked submitters
 wake. Shutdown completes when the last in-flight permit releases, so the
@@ -228,7 +235,7 @@ life of the process.
 |---|---|---|
 | `s3_transport` | `HTTP` or `RDMA`; explicit opt-in | `HTTP` |
 | `s3_endpoint` | Host plane: any S3 service | existing setting |
-| `s3_rdma_endpoint` | Data plane: cuObject gateway; required in RDMA mode — initialization fails when unset | none |
+| `s3_rdma_data.endpoint` | Data plane: cuObject gateway; required in RDMA mode — initialization fails when unset. The `s3_rdma_data` block also carries region, credentials, signing mode, and TLS for the data plane; when its access key is unset, host-plane credentials are inherited as a whole | none |
 | `s3_rdma_queue_cap` | Per-ioctx bound on pending request envelopes | not yet defined — set when the bounded queue lands |
 | `SIRIUS_ENABLE_S3_RDMA` | Build flag for the cuObject data plane | off |
 
@@ -297,8 +304,9 @@ The positions are the ones this document describes; the team is asked:
 
 1. GPU destination (Section 3): is the extra GPU-local copy acceptable,
    rather than registering arbitrary RMM allocations?
-2. Endpoint topology (Section 3): is split deployment, with the publisher
-   visibility barrier, acceptable?
+2. Endpoint topology (Section 3): is the two-plane configuration
+   acceptable — the full publisher barrier for split addresses, native S3
+   consistency plus immutable keys for same-address deployments?
 3. Failure policy (Section 5): is restart-based recovery acceptable for
    V1 — no fallback after an RDMA request is selected or fails?
 4. CUDA boundary (Section 5): when delivery cannot be proven, is
