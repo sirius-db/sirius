@@ -48,7 +48,7 @@ def log(msg):
 
 MODES = ("grouped", "sequential", "isolated", "nsys-profile")
 ENGINE_CHOICES = ("gpu", "cpu", "both")
-PIN_CHOICES = ("none", "gpu", "host")
+PIN_CHOICES = ("none", "gpu", "host", "parquet")
 DATA_SOURCE_CHOICES = ("parquet", "duckdb")
 TPCH_TABLES = (
     "customer",

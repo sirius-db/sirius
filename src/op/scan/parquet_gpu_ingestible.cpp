@@ -21,6 +21,7 @@
 #include <expression/ast/from_duckdb.hpp>
 #include <expression_evaluator/expression_evaluator.hpp>
 #include <expression_evaluator/gpu_expression_translator_internal.hpp>
+#include <io/cached_range_datasource.hpp>
 #include <io/io_context.hpp>
 #include <io/sirius_datasource.hpp>
 #include <log/logging.hpp>
@@ -144,7 +145,9 @@ class parquet_batch_coalescer : public batch_coalescer {
                            cur_working,
                            cur_comp,
                            std::move(slice_ds));
-      _produced_any = true;
+      // Parquet-tier pin: the whole file's cache_ranges serves every slice of it.
+      _slices.back().cached_ranges = file->cached_ranges;
+      _produced_any                = true;
       _acc_working_bytes += cur_working;
       _acc_rows += cur_rows;
       cur_rgs.clear();
@@ -285,6 +288,9 @@ std::vector<scan_info::fadvise_entry> parquet_split_info::fadvise_entries() cons
   entries.reserve(rg_slices.size());
   for (auto const& slice : rg_slices) {
     if (!slice.file_metadata) { continue; }
+    // Parquet-tier pin: the read is served from pinned memory, so there is no
+    // disk prefetch to hint.
+    if (slice.cached_ranges) { continue; }
     append_fadvise_entry(entries, slice.datasource, [&slice, this] {
       return column_chunk_ranges(*slice.file_metadata, *reader_options, slice.row_group_indices);
     });
@@ -652,6 +658,12 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
   out->datasource              = std::move(sirius_ds);
   out->reader_options          = _reader_options;
   out->disable_filter_pushdown = disable_filter_pushdown;
+  // Parquet-tier pin: serve this file's column-chunk reads from the pinned byte
+  // ranges (materialize_table wraps out->datasource as the disk fallback).
+  if (_pinned_cache) {
+    auto it = _pinned_cache->find(file_path);
+    if (it != _pinned_cache->end()) { out->cached_ranges = it->second; }
+  }
   out->row_groups.reserve(row_group_indices.size());
   for (auto const rg_idx : row_group_indices) {
     auto const estimate = rg_contribution(metadata.row_groups[rg_idx]);
@@ -676,6 +688,92 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
 }
 
 //===----------------------------------------------------------------------===//
+// pin_parquet_ranges — pin-time read of column-chunk bytes into pinned memory
+//===----------------------------------------------------------------------===//
+parquet_pinned_ranges parquet_gpu_ingestible::pin_parquet_ranges(
+  io::sirius_ioctx& io_ctx,
+  cucascade::memory::fixed_size_host_memory_resource& host_mr,
+  int device_id,
+  int numa_id)
+{
+  parquet_pinned_ranges result;
+  auto const block_size = host_mr.get_block_size();
+
+  for (auto const& file_path : _file_paths) {
+    auto ds = io_ctx.open_datasource(file_path, io::open_hint::parquet_footer_probe);
+    if (!ds) {
+      throw std::runtime_error("[parquet_gpu_ingestible] pin: no backend supports path: " +
+                               file_path);
+    }
+    // _reader_options carries the pinned column projection (set in the ctor), so
+    // the byte ranges below cover only the pinned columns' chunks.
+    auto opts = *_reader_options;
+
+    // Footer metadata — from the datasource's cached parse when present, else fetch + parse.
+    std::shared_ptr<cudf::io::parquet::FileMetaData const> file_metadata;
+    if (auto cached = ds->metadata()) {
+      if (auto pm = std::dynamic_pointer_cast<parquet_metadata>(std::move(cached))) {
+        file_metadata = pm->file_metadata();
+      }
+    }
+    if (!file_metadata) {
+      auto footer           = cudf::io::parquet::fetch_footer_to_host(*ds);
+      auto const footer_len = footer->size();
+      hybrid_scan_reader footer_reader(
+        cudf::host_span<uint8_t const>(footer->data(), footer->size()), opts);
+      file_metadata =
+        std::make_shared<cudf::io::parquet::FileMetaData const>(footer_reader.parquet_metadata());
+      [[maybe_unused]] auto const stored =
+        ds->store_metadata(std::make_shared<parquet_metadata>(file_metadata, footer_len));
+    }
+
+    // Column-chunk byte ranges for the pinned columns across every row group.
+    hybrid_scan_reader reader(*file_metadata, opts);
+    auto row_groups = reader.all_row_groups(opts);
+    auto ranges     = reader.all_column_chunks_byte_ranges(
+      cudf::host_span<cudf::size_type const>(row_groups.data(), row_groups.size()), opts);
+    if (ranges.empty()) { continue; }
+
+    // cache_ranges requires sorted, non-overlapping ranges; column chunks never
+    // overlap, so sorting by offset is enough.
+    std::sort(ranges.begin(), ranges.end(), [](auto const& a, auto const& b) {
+      return a.offset() < b.offset();
+    });
+    std::size_t total_bytes = 0;
+    for (auto const& r : ranges) {
+      total_bytes += static_cast<std::size_t>(r.size());
+    }
+
+    // Allocate pinned 1MB blocks and fill them with the range payloads packed
+    // contiguously — the flat layout cache_ranges::get_ranges expects.
+    auto alloc             = host_mr.allocate_multiple_blocks(total_bytes);
+    auto const blocks      = alloc->get_blocks();
+    std::size_t packed_pos = 0;
+    for (auto const& r : ranges) {
+      auto const off   = static_cast<std::size_t>(r.offset());
+      auto const sz    = static_cast<std::size_t>(r.size());
+      std::size_t done = 0;
+      while (done < sz) {
+        std::size_t const chunk_idx   = packed_pos / block_size;
+        std::size_t const chunk_local = packed_pos % block_size;
+        std::size_t const take        = std::min(sz - done, block_size - chunk_local);
+        ds->host_read(
+          off + done, take, reinterpret_cast<uint8_t*>(blocks[chunk_idx]) + chunk_local);
+        done += take;
+        packed_pos += take;
+      }
+    }
+
+    std::vector<std::byte*> buffers(blocks.begin(), blocks.end());
+    auto cr = std::make_shared<cache_ranges>(
+      std::move(ranges), std::move(buffers), block_size, device_id, numa_id);
+    result.ranges_by_file.emplace(file_path, std::move(cr));
+    result.allocations.push_back(std::move(alloc));
+  }
+  return result;
+}
+
+//===----------------------------------------------------------------------===//
 // materialize_table — ports read_table_from_metadata
 //===----------------------------------------------------------------------===//
 filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
@@ -692,8 +790,16 @@ filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
   metadatas.reserve(split.rg_slices.size());
   rg_per_src.reserve(split.rg_slices.size());
 
+  // Parquet-tier pin: reads for a cached slice go through a cached_range_datasource
+  // (pinned host memory, its sirius_datasource as the disk fallback). These wrappers
+  // must outlive the read_parquet call below, so keep them owned here.
+  std::vector<std::unique_ptr<io::cached_range_datasource>> cached_sources;
   for (auto const& slice : split.rg_slices) {
-    if (slice.datasource) {
+    if (slice.cached_ranges && slice.datasource) {
+      cached_sources.push_back(
+        std::make_unique<io::cached_range_datasource>(slice.cached_ranges, slice.datasource));
+      sources.push_back(cudf::io::datasource::create(cached_sources.back().get()));
+    } else if (slice.datasource) {
       sources.push_back(cudf::io::datasource::create(slice.datasource.get()));
     } else {
       sources.push_back(cudf::io::datasource::create(slice.file_path));

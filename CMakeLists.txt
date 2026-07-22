@@ -235,6 +235,7 @@ set(EXTENSION_SOURCES
     # Execution primitives (slot-based backpressure / completion tracking)
     src/exec/admission_control.cpp
     # I/O adapters (Phase 19 — io_uring + sirius_datasource)
+    src/io/cached_range_datasource.cpp
     src/io/datasource_factory.cpp
     src/io/io_context.cpp
     src/io/parquet_helpers.cpp

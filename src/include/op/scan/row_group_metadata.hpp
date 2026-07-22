@@ -18,6 +18,7 @@
 
 // sirius
 #include <io/sirius_datasource.hpp>
+#include <op/scan/cached_ranges.hpp>
 // cudf
 
 #include <cudf/io/experimental/hybrid_scan.hpp>
@@ -71,6 +72,12 @@ struct row_group_slice {
   /// and reused by materialize_table. When null, materialize_table falls
   /// back to cudf::io::datasource::create(file_path).
   std::shared_ptr<io::sirius_datasource> datasource;
+  /// Pinned column-chunk byte ranges for this file, when the scan is served
+  /// from a parquet-tier pin. When set, materialize_table reads through a
+  /// cached_range_datasource (pinned memory, @c datasource as disk fallback);
+  /// null for an ordinary disk scan. Set after construction by the coalescer
+  /// from @c parquet_file_scan_info::cached_ranges.
+  std::shared_ptr<cache_ranges> cached_ranges;
 };
 
 //===----------------------------------------------------------------------===//

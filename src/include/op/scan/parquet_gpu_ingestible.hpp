@@ -31,6 +31,9 @@
 #include <duckdb/planner/expression.hpp>
 #include <duckdb/planner/table_filter.hpp>
 
+// cucascade
+#include <cucascade/memory/fixed_size_host_memory_resource.hpp>
+
 // cudf
 #include <cudf/io/parquet.hpp>
 
@@ -42,6 +45,7 @@
 #include <memory>
 #include <span>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace sirius::scan_manager {
@@ -199,6 +203,10 @@ class parquet_file_scan_info : public scan_info {
   /// Pre-built datasource for this file, reused by @c materialize_table. May be
   /// null for local paths no sirius backend claims.
   std::shared_ptr<io::sirius_datasource> datasource;
+  /// Pinned column-chunk byte ranges for this file when the scan is served from
+  /// a parquet-tier pin (null otherwise). Attached by @c build_file_scan_info
+  /// from the ingestible's pinned cache and propagated onto each row_group_slice.
+  std::shared_ptr<cache_ranges> cached_ranges;
   /// Pruned row groups for this file, in file order, with byte accounting.
   std::vector<row_group_entry> row_groups;
   /// Shared reader options (column projection), used to compute the column-chunk
@@ -236,6 +244,22 @@ class parquet_file_scan_info : public scan_info {
   /// @c hybrid_scan_reader::all_column_chunks_byte_ranges, honoring the
   /// reader_options column projection).
   [[nodiscard]] std::vector<fadvise_entry> fadvise_entries() const override;
+};
+
+//===----------------------------------------------------------------------===//
+// parquet_pinned_ranges
+//===----------------------------------------------------------------------===//
+/**
+ * @brief Pin-time result of @ref parquet_gpu_ingestible::pin_parquet_ranges.
+ *
+ * @c ranges_by_file maps each resolved file path to the pinned column-chunk
+ * byte ranges the serve path attaches to that file's slices. @c allocations
+ * owns the pinned host blocks the ranges' buffers point into — it must outlive
+ * @c ranges_by_file (@c cache_ranges holds non-owning pointers).
+ */
+struct parquet_pinned_ranges {
+  std::unordered_map<std::string, std::shared_ptr<cache_ranges>> ranges_by_file;
+  std::vector<cucascade::memory::fixed_multiple_blocks_allocation> allocations;
 };
 
 //===----------------------------------------------------------------------===//
@@ -289,6 +313,28 @@ class parquet_gpu_ingestible : public gpu_ingestible {
     return _duckdb_filter_expression != nullptr;
   }
 
+  /// Read the pinned columns' column-chunk byte ranges for every resolved file
+  /// into pinned host memory (1MB blocks from @p host_mr) and pack them into a
+  /// per-file @c cache_ranges. Drives the parquet pin tier. The reader options
+  /// carry the pinned column projection (set in the constructor), so only the
+  /// pinned columns' chunks are read. @p device_id / @p numa_id are stored on
+  /// each @c cache_ranges as copy-placement hints.
+  parquet_pinned_ranges pin_parquet_ranges(
+    io::sirius_ioctx& io_ctx,
+    cucascade::memory::fixed_size_host_memory_resource& host_mr,
+    int device_id,
+    int numa_id);
+
+  /// Point the serve-time read at a parquet pin's cached byte ranges (keyed by
+  /// file path). @c build_file_scan_info attaches the matching entry to each
+  /// file's slices; an absent entry reads from disk as usual. Non-owning — the
+  /// map (owned by the pinned_entry) must outlive this ingestible's scan.
+  void set_pinned_parquet_cache(
+    const std::unordered_map<std::string, std::shared_ptr<cache_ranges>>* cache)
+  {
+    _pinned_cache = cache;
+  }
+
  private:
   /// Read one file's footer, prune its row groups against the filter, and record
   /// per-row-group byte accounting. Returns a single @c parquet_file_scan_info.
@@ -319,6 +365,11 @@ class parquet_gpu_ingestible : public gpu_ingestible {
   // AST-capable filters are ANDed into the parquet reader filter; membership filtering happens in
   // the downstream dynamic-filter operator.
   std::shared_ptr<sirius::op::sirius_dynamic_filter_set> _sirius_dynamic_filters;
+
+  // Parquet-tier pin cache (file path -> pinned column-chunk byte ranges), or
+  // null for an ordinary disk scan. Set by the scan manager in prepare_for_query
+  // when a parquet pin can serve this scan; consulted by build_file_scan_info.
+  const std::unordered_map<std::string, std::shared_ptr<cache_ranges>>* _pinned_cache{nullptr};
 };
 
 std::shared_ptr<parquet_gpu_ingestible> make_ingestible(

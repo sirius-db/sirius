@@ -367,6 +367,24 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
       _scan_op_order.push_back(op);
       continue;
     }
+    // Parquet-tier pin: point this scan's ingestible at the cached byte ranges
+    // when a parquet pin can serve it. The scan still uses the ordinary disk
+    // split_provider below — each row_group_slice's reads are answered from
+    // pinned memory (cached_range_datasource), falling back to the file for any
+    // uncached read.
+    for (auto const& [pinned_name, entry] : _pinned_entries) {
+      if (entry.parquet_ranges_by_file.empty()) { continue; }
+      if (entry.cache_info.can_serve_with_columns(op->get_ingestible().table_info()).empty()) {
+        continue;
+      }
+      if (auto* pq = dynamic_cast<op::scan::parquet_gpu_ingestible*>(&op->get_ingestible())) {
+        pq->set_pinned_parquet_cache(&entry.parquet_ranges_by_file);
+        SIRIUS_LOG_INFO("[sirius_scan_manager] serving operator '{}' from parquet pin '{}'",
+                        op->get_operator_id(),
+                        pinned_name);
+      }
+      break;
+    }
     auto provider = std::make_unique<split_provider>(
       op->get_ingestible(),
       [this](std::string_view file_path) -> std::shared_ptr<io::sirius_ioctx> {
@@ -953,6 +971,22 @@ void sirius_scan_manager::insert_pinned_entry_host(
   _pinned_entries[name] = std::move(entry);
 }
 
+void sirius_scan_manager::insert_pinned_entry_parquet(
+  const std::string& name,
+  cache_entry_info cache_info,
+  std::unordered_map<std::string, std::shared_ptr<op::scan::cache_ranges>> ranges_by_file,
+  std::vector<cucascade::memory::fixed_multiple_blocks_allocation> allocations)
+{
+  // Parquet-tier pins hold raw column-chunk bytes, not decoded chunks, and are
+  // served through the ordinary decode path (see prepare_for_query). Always
+  // replace: re-pinning re-reads the files.
+  pinned_entry entry;
+  entry.cache_info             = std::move(cache_info);
+  entry.parquet_ranges_by_file = std::move(ranges_by_file);
+  entry.parquet_allocations    = std::move(allocations);
+  _pinned_entries[name]        = std::move(entry);
+}
+
 void sirius_scan_manager::attach_mvcc_metadata(const std::string& name,
                                                duckdb_mvcc_metadata metadata)
 {
@@ -1123,6 +1157,10 @@ std::optional<sirius_scan_manager::cached_assignment> sirius_scan_manager::try_m
   const auto& table_info = op->get_ingestible().table_info();
 
   for (auto const& [pinned_name, entry] : _pinned_entries) {
+    // Parquet-tier pins are not served resident: they run the ordinary decode
+    // path with reads answered from pinned byte ranges, wired in
+    // prepare_for_query. Skip them here.
+    if (!entry.parquet_ranges_by_file.empty()) { continue; }
     // Identity + serviceability gate: empty when this cache cannot serve the scan
     // (wrong format / file-set / table, or missing a requested column).
     if (entry.cache_info.can_serve_with_columns(table_info).empty()) { continue; }

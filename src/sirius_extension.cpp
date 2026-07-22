@@ -1004,9 +1004,9 @@ unique_ptr<FunctionData> SiriusExtension::PinTableBind(ClientContext& context,
     throw BinderException("pin_table requires a 'tier' named parameter");
   }
   result->args.tier = tier_it->second.ToString();
-  if (result->args.tier != "gpu" && result->args.tier != "host") {
+  if (result->args.tier != "gpu" && result->args.tier != "host" && result->args.tier != "parquet") {
     throw NotImplementedException("pin_table tier='" + result->args.tier +
-                                  "' is not supported (only 'gpu' and 'host')");
+                                  "' is not supported (only 'gpu', 'host', and 'parquet')");
   }
 
   auto name_it = input.named_parameters.find("name");
@@ -1105,7 +1105,7 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
   // memory_space whose NUMA node matches the GPU. Fall back to host_spaces[0]
   // when the GPU's NUMA node is unknown or no matching host space exists.
   std::unordered_map<int, cucascade::memory::memory_space*> host_space_by_gpu;
-  if (data.args.tier == "host") {
+  if (data.args.tier == "host" || data.args.tier == "parquet") {
     auto host_spaces = memory_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
     if (host_spaces.empty()) {
       throw InvalidInputException("pin_table: no HOST memory space available");
@@ -1216,6 +1216,32 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
       mvcc.base_row_count_per_chunk = std::move(mat.base_row_count_per_chunk);
       scan_mgr.attach_mvcc_metadata(data.args.name, std::move(mvcc));
     }
+  } else if (data.args.tier == "parquet") {
+    // Parquet tier: read the pinned columns' raw column-chunk bytes once into
+    // pinned host memory (1MB blocks) and cache them as per-file byte ranges. A
+    // later scan runs the ordinary parquet decode path with its reads served
+    // from these pinned buffers instead of the disk.
+    auto* pq = dynamic_cast<sirius::op::scan::parquet_gpu_ingestible*>(ingestible.get());
+    if (pq == nullptr) {
+      // build_parquet_pin_info always yields a parquet ingestible; a null here
+      // means a duckdb source, which has no on-disk column-chunk layout to pin.
+      throw NotImplementedException(
+        "pin_table tier='parquet' is only supported for parquet sources");
+    }
+    int const first_gpu_id = gpu_spaces_mut[0]->get_device_id();
+    auto* host_space       = host_space_by_gpu.at(first_gpu_id);
+    auto* host_mr =
+      host_space->get_memory_resource_as<cucascade::memory::fixed_size_host_memory_resource>();
+    if (host_mr == nullptr) {
+      throw InvalidInputException(
+        "pin_table: host memory space has no fixed-size block allocator for the parquet tier");
+    }
+    auto pinned = pq->pin_parquet_ranges(
+      *scan_mgr.io_ctx(), *host_mr, first_gpu_id, host_space->get_device_id());
+    scan_mgr.insert_pinned_entry_parquet(data.args.name,
+                                         std::move(cache_info),
+                                         std::move(pinned.ranges_by_file),
+                                         std::move(pinned.allocations));
   } else {
     // GPU tier: materialize every batch as a GPU-resident cudf::table (with its GPU
     // placement) and pin them in place.

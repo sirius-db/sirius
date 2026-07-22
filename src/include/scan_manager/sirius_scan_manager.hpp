@@ -22,6 +22,7 @@
 #include "io/datasource_factory.hpp"
 #include "io/s3/s3_list_parser.hpp"
 #include "io/sirius_datasource.hpp"
+#include "op/scan/cached_ranges.hpp"
 #include "op/scan/gpu_ingestible_types.hpp"
 #include "scan_manager/config.hpp"
 #include "scan_manager/duckdb_mvcc_metadata.hpp"
@@ -36,6 +37,7 @@
 #include <cudf/table/table.hpp>
 
 #include <cucascade/cudf/host_data_representation.hpp>
+#include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/memory_space.hpp>
 #include <duckdb/common/column_index.hpp>
 #include <duckdb/common/types.hpp>
@@ -166,6 +168,16 @@ struct pinned_entry {
   /// pinned columns. The cached_split_provider slices these by column index when
   /// serving a particular scan. Populated by @ref insert_pinned_entry_host.
   std::vector<std::shared_ptr<cucascade::host_data_representation>> host_chunks;
+  /// PARQUET-tier storage: file path -> pinned column-chunk byte ranges. Non-empty
+  /// ONLY for parquet-tier pins, which are served differently from GPU/HOST: the
+  /// scan runs the ordinary parquet decode path with reads answered from these
+  /// pinned buffers (see @ref parquet_gpu_ingestible::set_pinned_parquet_cache),
+  /// not as resident data_batches. Its non-emptiness is the parquet-tier
+  /// discriminator — such entries are skipped by @ref try_match_cached_entry.
+  std::unordered_map<std::string, std::shared_ptr<op::scan::cache_ranges>> parquet_ranges_by_file;
+  /// Owns the pinned host blocks the ranges in @c parquet_ranges_by_file point
+  /// into (@c cache_ranges holds non-owning pointers). Held for the entry's life.
+  std::vector<cucascade::memory::fixed_multiple_blocks_allocation> parquet_allocations;
   /// Tier the pinned data resides in. Drives which storage member above is used
   /// and which cached_split_provider variant @ref create_provider_for builds.
   cucascade::memory::Tier tier{cucascade::memory::Tier::GPU};
@@ -390,6 +402,28 @@ class sirius_scan_manager {
     cucascade::memory::memory_space& memory_space,
     duckdb::vector<duckdb::LogicalType> column_types                                 = {},
     std::vector<std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>>> chunk_stats = {});
+
+  /// \brief Pin the parquet-tier entry for a table.
+  ///
+  /// Unlike the GPU/HOST tiers (which store decoded columns and serve them
+  /// resident), this stores raw parquet column-chunk bytes in pinned host
+  /// memory as per-file @c cache_ranges. A matching scan runs the ordinary
+  /// parquet decode path with each @c row_group_slice's reads answered from the
+  /// pinned buffers (@ref parquet_gpu_ingestible::set_pinned_parquet_cache),
+  /// falling back to the file for any uncached read. Always REPLACES any
+  /// existing entry for @p name.
+  ///
+  /// \param name           Table name key.
+  /// \param cache_info     Cache identity (parquet file set) + cached columns;
+  ///                       drives cache-hit matching.
+  /// \param ranges_by_file File path -> pinned column-chunk byte ranges.
+  /// \param allocations    Owns the pinned host blocks the ranges point into;
+  ///                       moved into the entry so the buffers stay alive.
+  void insert_pinned_entry_parquet(
+    const std::string& name,
+    cache_entry_info cache_info,
+    std::unordered_map<std::string, std::shared_ptr<op::scan::cache_ranges>> ranges_by_file,
+    std::vector<cucascade::memory::fixed_multiple_blocks_allocation> allocations);
 
   /// \brief Attach MVCC snapshot metadata to the pinned entry for @p name.
   ///
