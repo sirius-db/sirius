@@ -725,7 +725,9 @@ bool sirius_physical_hash_join::all_ports_empty()
 {
   // BUILD_PROBE uses per-partition slot state, not a cross-product cursor — fall back to the base
   // class repo check which is correct for that mode.
-  if (_join_mode == HASH_JOIN_MODE::BUILD_PROBE) { return sirius_physical_operator::all_ports_empty(); }
+  if (_join_mode == HASH_JOIN_MODE::BUILD_PROBE) {
+    return sirius_physical_operator::all_ports_empty();
+  }
 
   // Standard mode: once the snapshot exists, use the cursor as the authoritative emptiness signal.
   // The base class checks raw repo total_size() without holding op_state_mutex, which races with
@@ -921,12 +923,12 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::get_next_task_input_da
   size_t const left_idx    = batch_index / n_right;
   size_t const right_idx   = batch_index % n_right;
 
-  uint64_t const left_batch_id    = left_batch_ids[0][left_idx];
-  uint64_t const right_batch_id   = right_batch_ids[0][right_idx];
-  size_t const left_partition     = left_batch_partition_ids[left_idx];
-  size_t const right_partition    = right_batch_partition_ids[right_idx];
-  bool const pop_left             = (right_idx == n_right - 1);
-  bool const pop_right            = (left_idx == left_batch_ids[0].size() - 1);
+  uint64_t const left_batch_id  = left_batch_ids[0][left_idx];
+  uint64_t const right_batch_id = right_batch_ids[0][right_idx];
+  size_t const left_partition   = left_batch_partition_ids[left_idx];
+  size_t const right_partition  = right_batch_partition_ids[right_idx];
+  bool const pop_left           = (right_idx == n_right - 1);
+  bool const pop_right          = (left_idx == left_batch_ids[0].size() - 1);
 
   std::vector<std::shared_ptr<cucascade::data_batch>> input_batch;
   input_batch.reserve(2);
