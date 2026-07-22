@@ -156,6 +156,26 @@ class GpuExecutionFixture {
     compare_gpu_vs_cpu_impl(query, true);
   }
 
+  /// Asserts the query does NOT run purely on the GPU: it triggers a runtime
+  /// fallback to DuckDB CPU (which still produces the correct result). Use for
+  /// operations that are unsupported on-device -- this is a coverage fact, not a
+  /// result divergence, so it is a normal passing assertion rather than a
+  /// [!shouldfail] case.
+  void expect_gpu_fallback(const std::string& query)
+  {
+    con->Query("SET gpu_execution = true;");
+    auto before = sirius::test::get_transparent_execution_stats(*con);
+    auto result = con->Query(query);
+    auto after  = sirius::test::get_transparent_execution_stats(*con);
+    REQUIRE(result);
+    if (result->HasError()) { UNSCOPED_INFO("execution error: " << result->GetError()); }
+    REQUIRE_FALSE(result->HasError());
+    if (after.runtime_fallbacks <= before.runtime_fallbacks) {
+      UNSCOPED_INFO("expected a runtime fallback to CPU, but none occurred");
+    }
+    REQUIRE(after.runtime_fallbacks > before.runtime_fallbacks);
+  }
+
  private:
   void compare_gpu_vs_cpu_impl(const std::string& query, bool ordered)
   {

@@ -129,7 +129,7 @@ TEST_CASE_METHOD(NullDataFixture,
   compare_gpu_vs_cpu("SELECT id, (NOT (i = 10)) AS r FROM nt");
 }
 
-// KNOWN GPU DIVERGENCE (issue #1095 follow-up -- please file):
+// KNOWN GPU DIVERGENCE (issue #1218):
 // SQL three-valued logic says `TRUE OR UNKNOWN = TRUE`, but Sirius's GPU OR
 // naively propagates NULL (`TRUE OR NULL -> NULL`), so a row where one branch is
 // TRUE and the other is NULL is wrongly filtered out. Each divergent query is its
@@ -205,7 +205,7 @@ TEST_CASE_METHOD(NullDataFixture,
   compare_gpu_vs_cpu("SELECT id, substring(s, 1, 2) AS r FROM nt");
 }
 
-// KNOWN GPU DIVERGENCE (issue #1095 follow-up -- please file):
+// KNOWN GPU DIVERGENCE (issue #1218):
 // DuckDB's concat() ignores NULL arguments (concat(NULL, '_x') = '_x'), but
 // Sirius's GPU concat propagates NULL (returns NULL) -- it behaves like the `||`
 // operator instead. Tagged [!shouldfail] so it documents the bug without failing
