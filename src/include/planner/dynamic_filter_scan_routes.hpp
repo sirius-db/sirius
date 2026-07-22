@@ -104,6 +104,9 @@ struct resolved_scan_routes {
    * @brief The filter-ordinal to condition-index mapping DuckDB recorded, or empty when it recorded
    * none
    *
+   * Read the vector as that mapping: `hinted_condition_indexes[f]` is the position, in the join's
+   * original condition vector, of the condition DuckDB derived its filter ordinal `f` from.
+   *
    * Non-empty for every admitted candidate, including those that stop short of wiring: DuckDB's
    * naming of a condition set restricts admission whether or not this producer ends up with a
    * target. `duckdb_join_filter_candidate_adapter::extract` never admits a candidate with an empty

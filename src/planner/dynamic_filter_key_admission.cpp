@@ -156,6 +156,13 @@ std::vector<op::dynamic_filter_condition_shape> classify_join_key_shapes(
   return shapes;
 }
 
+// Which space each input is indexed in, in parameter order:
+//   conditions                      condition index
+//   condition_shapes                condition index
+//   hinted_condition_indexes        filter ordinal -> condition index
+//   scan_targets                    target index; each target's `columns` is by filter ordinal
+//   condition_domain_cardinalities  condition index
+//   build_side_unique_column        a build-child output ordinal, not a condition index
 key_admission_result admit_dynamic_filter_keys(
   duckdb::vector<sirius::join_condition> const& conditions,
   std::vector<op::dynamic_filter_condition_shape> const& condition_shapes,
@@ -204,8 +211,8 @@ key_admission_result admit_dynamic_filter_keys(
 
   // Admit in a single deterministic pass. When DuckDB named a condition set, admission is
   // restricted to it so publication constructs exactly the filters the runtime publisher
-  // constructed before producer-key admission moved to plan time; otherwise every
-  // legality-passing condition is admitted.
+  // constructed before producer-key admission moved to plan time (legacy dynamic filters);
+  // otherwise every legality-passing condition is admitted.
   std::unordered_map<std::size_t, std::size_t> admitted_index_by_condition;
   auto admit_condition = [&](std::size_t condition_index) {
     if (admitted_index_by_condition.contains(condition_index)) { return; }

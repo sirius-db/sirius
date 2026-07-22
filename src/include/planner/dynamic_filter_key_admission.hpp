@@ -136,7 +136,7 @@ struct key_admission_result {
   /**
    * @brief Statically admitted build keys, in admitted order
    *
-   * Positions in this vector are the admitted-key index space.
+   * Positions in this vector are the admitted-key index space (admitted index -> condition index).
    */
   std::vector<op::dynamic_filter_publish_plan::admitted_key> admitted_keys;
   /**

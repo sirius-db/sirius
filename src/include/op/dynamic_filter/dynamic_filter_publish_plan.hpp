@@ -236,6 +236,9 @@ class dynamic_filter_publish_plan final {
     /**
      * @brief Sparse key bindings
      *
+     * Sparse means that an admitted key need not be bound in every target: this vector lists only
+     * the admitted keys that reach this one.
+     *
      * May be empty: a producer whose keys are all inadmissible still mints its targets so
      * consumer-side operator wrapping and the publication state trajectory are unchanged.
      */

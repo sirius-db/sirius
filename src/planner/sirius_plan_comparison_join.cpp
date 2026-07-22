@@ -466,10 +466,10 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
     auto sirius_context   = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
     const auto& op_params = sirius_context->get_config().get_operator_params();
 
-    // Resolve scan endpoints from that snapshot and build the Sirius-owned
-    // admitted-key publication plan before constructing the physical join. Routing and device
-    // placement are plan-time decisions; runtime code only consumes the resulting
-    // dynamic_filter_publish_plan value and never reads DuckDB metadata.
+    // Resolve scan endpoints from that snapshot and build the Sirius-owned admitted-key publication
+    // plan before constructing the physical join. Routing and device placement are *currently*
+    // plan-time decisions; runtime code only consumes the resulting dynamic_filter_publish_plan
+    // value and never reads DuckDB metadata.
     //
     // The memory-space lookup stays here and is answered before resolve_scan_routes mints
     // anything: a producer must not register on channels it would then abandon for want of a

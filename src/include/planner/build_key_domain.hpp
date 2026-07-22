@@ -36,7 +36,7 @@
  *  - **Policy** -- a @ref base_table_cardinality_source that turns a resolved scan into a row
  *    count. The production source, @ref duckdb_base_table_cardinality, answers only for
  *    DuckDB-native table scans, where the figure is a true upper bound; everything else is
- *    refused. Tests substitute a stub source, which is why the seam is a concept.
+ *    refused. Tests substitute a stub source.
  *
  * The gate's safety rests on the source's contract: the returned count must never under-state the
  * domain, because an under-stated denominator inflates the coverage ratio and suppresses a filter
