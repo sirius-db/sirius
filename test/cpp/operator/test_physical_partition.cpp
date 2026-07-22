@@ -127,7 +127,7 @@ TEMPLATE_TEST_CASE("sirius_physical_partition partitions data_batch with single 
                                                              estimated_cardinality);
 
   sirius_physical_partition partitioner(
-    partitioner_types, estimated_cardinality, &grouped_aggregator, false, partition_size);
+    partitioner_types, estimated_cardinality, &grouped_aggregator, false);
 
   // Compute num_partitions from estimated bytes: cardinality * bytes_per_row / partition_size
   // col0 is Traits::type, col1 is int32_t
@@ -251,7 +251,7 @@ TEMPLATE_TEST_CASE("sirius_physical_partition partitions data_batch with two par
                                                              estimated_cardinality);
 
   sirius_physical_partition partitioner(
-    partitioner_types, estimated_cardinality, &grouped_aggregator, false, partition_size);
+    partitioner_types, estimated_cardinality, &grouped_aggregator, false);
 
   // Compute num_partitions from estimated bytes: cardinality * bytes_per_row / partition_size
   // col0 is Traits::type, col1 and col2 are int32_t

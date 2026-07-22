@@ -216,6 +216,25 @@ void SiriusContext::QueryBegin(ClientContext& context)
   }
 }
 
+void SiriusContext::QueryBeginStandalone(ClientContext& context, std::string_view query_label)
+{
+  if (is_internal_query_active()) { return; }
+
+  acquire_query_lifecycle_slot();
+
+  try {
+    log_pool_stats("QueryBegin");
+    captured_logical_plan_.reset();
+    sirius::op::sirius_physical_operator::next_operator_id.store(0);
+    SIRIUS_LOG_INFO("QueryBegin: {}", query_label);
+    task_creator_->reset();
+    task_creator_->set_client_context(context);
+  } catch (...) {
+    release_query_lifecycle_slot();
+    throw;
+  }
+}
+
 void SiriusContext::QueryEnd()
 {
   // Suppress state mutations triggered by internal connections (e.g. internal metadata lookups).
