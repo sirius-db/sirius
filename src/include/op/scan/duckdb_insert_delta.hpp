@@ -19,7 +19,6 @@
 #include <duckdb/common/enums/compression_type.hpp>
 #include <duckdb/common/typedefs.hpp>
 #include <duckdb/common/types.hpp>
-#include <duckdb/function/partition_stats.hpp>
 #include <duckdb/transaction/transaction_data.hpp>
 #include <helper/logical_type.hpp>
 #include <op/scan/duckdb_native_metadata.hpp>
@@ -58,6 +57,10 @@ struct insert_delta_segment {
   duckdb::ColumnSegment* segment{nullptr};  ///< Pin target for the transient copy task
   bool is_transient{false};
   bool is_validity{false};
+  bool all_null{false};  ///< CONSTANT validity marked all-NULL by its stats; blockless
+  /// CONSTANT data segments: capture-time snapshot of the segment's own stats
+  /// (the constant value); see duckdb_segment_descriptor::segment_stats.
+  std::shared_ptr<duckdb::BaseStatistics> segment_stats;
   duckdb::block_id_t block_id{-1};                    ///< persistent only
   std::vector<duckdb::block_id_t> additional_blocks;  ///< persistent only (overflow blocks)
   duckdb::idx_t block_offset{0};                      ///< persistent only
@@ -112,9 +115,6 @@ struct insert_delta_plan {
   std::size_t n_cache{0};
   std::size_t n_total{0};  ///< GetTotalRows() snapshot; all walks clamp to it
   std::vector<insert_delta_row_group> row_groups;
-  /// Capture-time partition stats, carried onto delta splits so CONSTANT
-  /// segment decode never calls GetPartitionStats off the query thread.
-  std::shared_ptr<duckdb::vector<duckdb::PartitionStatistics>> partition_stats;
 
   [[nodiscard]] bool empty() const { return row_groups.empty(); }
   [[nodiscard]] std::size_t delta_rows() const { return n_total - n_cache; }

@@ -177,6 +177,105 @@ TEST_CASE_METHOD(PinMvccInsertFixture,
 }
 
 TEST_CASE_METHOD(PinMvccInsertFixture,
+                 "mvcc insert: bulk constant inserts decode from blockless CONSTANT segments",
+                 "[integration][gpu_execution][pin_table_mvcc_insert]")
+{
+  run_ok("CREATE TABLE t AS SELECT range::INTEGER AS k, range::INTEGER AS v FROM range(20000);");
+  run_ok("CHECKPOINT;");
+  run_ok("CALL pin_table(format='duckdb', name='t', tier='gpu');");
+
+  // A full-row-group commit of a projected literal: MergeStorage flushes the
+  // constant column as blockless persistent CONSTANT segments, decoded from
+  // stats rather than the file.
+  run_ok("INSERT INTO t SELECT range::INTEGER + 20000, 7 FROM range(130000);");
+
+  compare_gpu_vs_cpu("SELECT count(*), sum(k), sum(v), min(v), max(v) FROM t;");
+  compare_gpu_vs_cpu("SELECT k, v FROM t WHERE k >= 149995 ORDER BY k;");
+  // Constant-column-only projection: the persistent delta splits become
+  // blockless-only (no file reads, no datasource) and must still serve.
+  compare_gpu_vs_cpu("SELECT sum(v), min(v), max(v) FROM t;");
+  run_ok("CALL unpin_table('t');");
+}
+
+TEST_CASE_METHOD(PinMvccInsertFixture,
+                 "mvcc insert: appends into an indexed tail row group keep per-segment constants",
+                 "[integration][gpu_execution][pin_table_mvcc_insert]")
+{
+  // With a PRIMARY KEY, DuckDB appends into the existing tail row group
+  // instead of opening a fresh one, so the bulk-flushed CONSTANT segment's
+  // row group later gains rows with a different value: the row-group-level
+  // stats drift (min drops to 7) while the segment's own constant stays 9.
+  run_ok("CREATE TABLE t (k INTEGER PRIMARY KEY, v INTEGER);");
+  run_ok("INSERT INTO t SELECT range::INTEGER, range::INTEGER FROM range(20000);");
+  run_ok("CHECKPOINT;");
+  run_ok("CALL pin_table(format='duckdb', name='t', tier='gpu');");
+
+  run_ok("INSERT INTO t SELECT range::INTEGER + 20000, 9 FROM range(130000);");
+  run_ok("INSERT INTO t VALUES (150001, 7);");
+
+  compare_gpu_vs_cpu("SELECT count(*), sum(v), min(v), max(v) FROM t;");
+  compare_gpu_vs_cpu("SELECT k, v FROM t WHERE k >= 149998 ORDER BY k;");
+  run_ok("CALL unpin_table('t');");
+}
+
+TEST_CASE_METHOD(PinMvccInsertFixture,
+                 "mvcc insert: bulk all-NULL inserts keep their NULLs",
+                 "[integration][gpu_execution][pin_table_mvcc_insert]")
+{
+  // The base carries an all-NULL column too, so the cached read exercises the
+  // same CONSTANT-validity decode as the delta.
+  run_ok("CREATE TABLE t AS SELECT range::INTEGER AS k, NULL::INTEGER AS v FROM range(20000);");
+  run_ok("CHECKPOINT;");
+  run_ok("CALL pin_table(format='duckdb', name='t', tier='gpu');");
+
+  // Bulk all-NULL column: the flushed data segments are CONSTANT sentinels and
+  // the NULL-ness lives only in the CONSTANT validity segments' stats.
+  run_ok("INSERT INTO t SELECT range::INTEGER + 20000, NULL::INTEGER FROM range(130000);");
+
+  compare_gpu_vs_cpu("SELECT count(*), count(v), sum(k) FROM t;");
+  compare_gpu_vs_cpu("SELECT k, v FROM t WHERE k >= 149995 ORDER BY k;");
+  // All-NULL-column-only projection: blockless-only splits, no datasource.
+  compare_gpu_vs_cpu("SELECT count(v) FROM t;");
+  run_ok("CALL unpin_table('t');");
+}
+
+TEST_CASE_METHOD(PinMvccInsertFixture,
+                 "mvcc insert: bulk all-NULL varchar keeps its NULLs",
+                 "[integration][gpu_execution][pin_table_mvcc_insert]")
+{
+  // All-NULL VARCHAR flushes dictionary data with CONSTANT all-null validity
+  // (varchar data itself never compresses CONSTANT), exercising the varchar
+  // decoder's synthesized-validity path through both the base and the delta.
+  run_ok("CREATE TABLE t AS SELECT range::INTEGER AS k, NULL::VARCHAR AS s FROM range(20000);");
+  run_ok("CHECKPOINT;");
+  run_ok("CALL pin_table(format='duckdb', name='t', tier='gpu');");
+
+  run_ok("INSERT INTO t SELECT range::INTEGER + 20000, NULL::VARCHAR FROM range(130000);");
+
+  compare_gpu_vs_cpu("SELECT count(*), count(s) FROM t;");
+  compare_gpu_vs_cpu("SELECT k, s FROM t WHERE k >= 149995 ORDER BY k;");
+  run_ok("CALL unpin_table('t');");
+}
+
+TEST_CASE_METHOD(PinMvccInsertFixture,
+                 "mvcc insert: an unaligned all-NULL row group does not bleed nulls forward",
+                 "[integration][gpu_execution][pin_table_mvcc_insert]")
+{
+  // 10001 all-NULL rows end mid-byte. When the next row group's valid rows
+  // decode in the same coalesced split, the synthesized validity's trailing
+  // padding bits must not null the following rows.
+  run_ok("CREATE TABLE t AS SELECT range::INTEGER AS k, NULL::INTEGER AS v FROM range(10001);");
+  run_ok("CHECKPOINT;");
+  run_ok("INSERT INTO t SELECT range::INTEGER + 10001, range::INTEGER FROM range(5000);");
+  run_ok("CHECKPOINT;");
+  run_ok("CALL pin_table(format='duckdb', name='t', tier='gpu');");
+
+  compare_gpu_vs_cpu("SELECT count(*), count(v), sum(v) FROM t;");
+  compare_gpu_vs_cpu("SELECT k, v FROM t WHERE k BETWEEN 9998 AND 10008 ORDER BY k;");
+  run_ok("CALL unpin_table('t');");
+}
+
+TEST_CASE_METHOD(PinMvccInsertFixture,
                  "mvcc insert: varchar and NULLs decode through the delta",
                  "[integration][gpu_execution][pin_table_mvcc_insert]")
 {

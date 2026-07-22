@@ -28,6 +28,7 @@
 #include <duckdb/main/client_context.hpp>
 #include <duckdb/planner/table_filter.hpp>
 #include <duckdb/storage/data_table.hpp>
+#include <duckdb/storage/statistics/base_statistics.hpp>
 #include <duckdb/storage/storage_index.hpp>
 
 #include <cstddef>
@@ -68,6 +69,15 @@ struct duckdb_segment_descriptor {
   /// bytes' owner is the enclosing scan_info's staging keep-alive, never this
   /// descriptor.
   std::uint8_t const* host_ptr = nullptr;
+  /// Validity segments only: a CONSTANT run whose stats mark it all-NULL.
+  /// Blockless — no bytes exist anywhere; the decoder synthesizes zero
+  /// validity bits for the covered rows.
+  bool all_null = false;
+  /// CONSTANT data segments: snapshot of the segment's own statistics, taken
+  /// while the segment is in hand. The decoder must take the constant value
+  /// from here — row-group-level stats merge later appends into the same row
+  /// group and can drift away from this segment's value.
+  std::shared_ptr<duckdb::BaseStatistics> segment_stats;
 };
 
 /// Side note of metadata for ARRAY type

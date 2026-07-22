@@ -58,6 +58,33 @@ TEST_CASE_METHOD(ArrayFixture,
 }
 
 TEST_CASE_METHOD(ArrayFixture,
+                 "gpu_execution array - fully NULL array column",
+                 "[integration][gpu_execution][array][scan]")
+{
+  // Whole-column NULLs checkpoint to CONSTANT all-null array-level validity;
+  // the decoder must synthesize the null mask rather than treat it as valid.
+  run_ok("CREATE TABLE arr_allnull (id INTEGER, a INTEGER[3]);");
+  run_ok("INSERT INTO arr_allnull SELECT range::INTEGER, NULL::INTEGER[3] FROM range(3000);");
+  run_ok("CHECKPOINT;");
+  compare_gpu_vs_cpu("SELECT id, a FROM arr_allnull ORDER BY id;");
+  compare_gpu_vs_cpu("SELECT count(*), count(a) FROM arr_allnull;");
+}
+
+TEST_CASE_METHOD(ArrayFixture,
+                 "gpu_execution array - arrays of all-NULL elements",
+                 "[integration][gpu_execution][array][scan]")
+{
+  // Present arrays whose elements are all NULL: CONSTANT all-null child
+  // validity, decoded via the synthesized zero-bit path.
+  run_ok("CREATE TABLE arr_nullelems (id INTEGER, a INTEGER[3]);");
+  run_ok(
+    "INSERT INTO arr_nullelems SELECT range::INTEGER, "
+    "[NULL, NULL, NULL]::INTEGER[3] FROM range(3000);");
+  run_ok("CHECKPOINT;");
+  compare_gpu_vs_cpu("SELECT id, a FROM arr_nullelems ORDER BY id;");
+}
+
+TEST_CASE_METHOD(ArrayFixture,
                  "gpu_execution array - element types DOUBLE and BIGINT",
                  "[integration][gpu_execution][array][scan]")
 {

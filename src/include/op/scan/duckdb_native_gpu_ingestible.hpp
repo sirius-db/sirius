@@ -117,13 +117,10 @@ class duckdb_native_scan_info : public op::scan::scan_info {
   /// into. Shared by the per-operator splits cut from one delta capture;
   /// must outlive this split's decode.
   std::vector<std::shared_ptr<void>> staging_keepalive;
-  /// True when every descriptor is host-backed: the split stages no file
-  /// reads and may carry a null datasource.
+  /// True when no descriptor reads the .db file (host-backed or blockless
+  /// stats-backed only): the split stages no file reads and may carry a null
+  /// datasource.
   bool host_backed_only = false;
-  /// Capture-time partition stats for CONSTANT segment decode; used instead
-  /// of DataTable::GetPartitionStats, which touches ClientContext and is not
-  /// safe off the query thread.
-  std::shared_ptr<duckdb::vector<duckdb::PartitionStatistics>> carried_partition_stats;
 
   /// On-disk byte ranges this unit reads, derived from @ref row_groups so they always match the row
   /// groups currently held. The scan sequencer fadvises these to prefetch.

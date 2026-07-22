@@ -326,15 +326,6 @@ TEST_CASE("host-backed decode matches SQL with zero file reads",
       decode_duckdb_native_split(md, info, /*datasource=*/nullptr, *gpu_space, stream.view());
     require_matches_expected(*table, exp, stream.view());
   }
-
-  SECTION("carried partition stats replace the ClientContext fetch")
-  {
-    host_back_segments(*env.con->context, storage, md, keepalive, /*clear_block_ids=*/true);
-    duckdb::vector<duckdb::PartitionStatistics> carried;  // no CONSTANT segments -> never consulted
-    auto table = decode_duckdb_native_split(
-      md, info, /*datasource=*/nullptr, *gpu_space, stream.view(), &carried);
-    require_matches_expected(*table, exp, stream.view());
-  }
 }
 
 TEST_CASE("file reads staged without a datasource throw loudly",

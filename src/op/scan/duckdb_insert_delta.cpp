@@ -94,16 +94,28 @@ void walk_delta_tree(duckdb::ColumnSegmentTree& tree,
     if (hi <= lo) { continue; }
 
     auto const compression = segment.GetCompressionFunction().type;
-    if (is_validity && is_constant_or_empty_validity(compression)) { continue; }
+    // CONSTANT validity is uniform, with the direction in the segment stats:
+    // all-valid runs (like EMPTY, a no-op mask) decode to nothing, but an
+    // all-NULL run must reach the decoder so it synthesizes zero validity
+    // bits.
+    bool const all_null_validity = is_validity &&
+                                   compression == duckdb::CompressionType::COMPRESSION_CONSTANT &&
+                                   segment.stats.statistics.CanHaveNull();
+    if (is_validity && !all_null_validity && is_constant_or_empty_validity(compression)) {
+      continue;
+    }
 
     insert_delta_segment out_seg;
     out_seg.segment       = &segment;
     out_seg.is_validity   = is_validity;
+    out_seg.all_null      = all_null_validity;
     out_seg.segment_start = lo - k;
     out_seg.segment_count = hi - lo;
     out_seg.compression   = compression;
 
-    if (segment.segment_type == duckdb::ColumnSegmentType::TRANSIENT) {
+    if (all_null_validity) {
+      // Nothing to stage or read; the marker alone drives the decode.
+    } else if (segment.segment_type == duckdb::ColumnSegmentType::TRANSIENT) {
       // DuckDB compresses transient segments only at checkpoint, and
       // checkpoints are suppressed while pinned; a compressed one here means
       // a checkpoint ran anyway.
@@ -158,14 +170,24 @@ void walk_delta_tree(duckdb::ColumnSegmentTree& tree,
                       " row group " + std::to_string(rg_index) + ": unsupported compression " +
                       duckdb::CompressionTypeToString(compression));
       }
-      out_seg.block_id     = segment.GetBlockId();
-      out_seg.block_offset = segment.GetBlockOffset();
-      out_seg.bytes_size   = static_cast<std::size_t>(segment.GetBlockSize()) -
-                           static_cast<std::size_t>(out_seg.block_offset);
-      auto const& cf = segment.GetCompressionFunction();
-      if (segment.GetSegmentState() && cf.visit_block_ids) {
-        collect_block_ids visitor(out_seg.additional_blocks);
-        cf.visit_block_ids(segment, visitor);
+      if (compression == duckdb::CompressionType::COMPRESSION_CONSTANT) {
+        // CONSTANT segments have no backing block (GetBlockSize() would
+        // null-deref); the block/byte fields stay unset. Snapshot the
+        // segment's own stats for the decoder: the constant value lives
+        // here, and row-group-level stats drift as later appends (e.g. into
+        // an indexed table's tail row group) merge into them.
+        out_seg.segment_stats =
+          std::make_shared<duckdb::BaseStatistics>(segment.stats.statistics.Copy());
+      } else {
+        out_seg.block_id     = segment.GetBlockId();
+        out_seg.block_offset = segment.GetBlockOffset();
+        out_seg.bytes_size   = static_cast<std::size_t>(segment.GetBlockSize()) -
+                             static_cast<std::size_t>(out_seg.block_offset);
+        auto const& cf = segment.GetCompressionFunction();
+        if (segment.GetSegmentState() && cf.visit_block_ids) {
+          collect_block_ids visitor(out_seg.additional_blocks);
+          cf.visit_block_ids(segment, visitor);
+        }
       }
     }
 
@@ -210,12 +232,6 @@ insert_delta_plan capture_insert_delta_plan(
   plan.n_cache        = n_cache;
   plan.n_total        = static_cast<std::size_t>(storage.GetTotalRows());
   if (plan.n_total <= n_cache) { return plan; }
-
-  // CONSTANT persistent segments decode their value from partition stats, and
-  // GetPartitionStats needs the ClientContext; capture the stats now rather
-  // than on a decode task thread.
-  plan.partition_stats = std::make_shared<duckdb::vector<duckdb::PartitionStatistics>>(
-    storage.GetPartitionStats(context));
 
   auto tree = storage.GetRowGroupCollection()->GetRowGroups();
   for (duckdb::idx_t rg_index = 0;; ++rg_index) {

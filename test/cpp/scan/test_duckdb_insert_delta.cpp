@@ -135,7 +135,6 @@ TEST_CASE("insert delta: capture boundary math and transient segment lanes",
   REQUIRE(plan.n_total == kBase + kDelta);
   REQUIRE(plan.delta_rows() == kDelta);
   REQUIRE(plan.buffer_manager != nullptr);
-  REQUIRE(plan.partition_stats != nullptr);
   REQUIRE(plan.transaction.transaction_id != 0);
 
   REQUIRE(plan.row_groups.size() == 1);
@@ -320,6 +319,80 @@ TEST_CASE("insert delta: bulk-flushed appends keep persistent block references",
   }
   REQUIRE(saw_persistent);
   REQUIRE(saw_transient);
+  exec_ok(*env.con, "ROLLBACK");
+}
+
+TEST_CASE("insert delta: bulk constant inserts capture blockless CONSTANT segments",
+          "[duckdb_insert_delta][scan]")
+{
+  delta_test_db env;
+  exec_ok(*env.con, "CREATE TABLE t AS SELECT range::INTEGER AS k FROM range(10000)");
+  exec_ok(*env.con, "CHECKPOINT");
+  // A full-row-group commit of a projected literal: every flushed segment's
+  // stats are constant, so DuckDB rewrites them as blockless CONSTANT
+  // segments (no backing block to read metadata from).
+  exec_ok(*env.con, "INSERT INTO t SELECT 7 FROM range(130000)");
+
+  exec_ok(*env.con, "BEGIN TRANSACTION");
+  auto& storage = resolve_storage(*env.con, "t");
+  std::vector<duckdb::storage_t> const cols{0};
+  std::vector<sirius::logical_type> types{sirius::logical_type::make(sirius::type_id::INTEGER)};
+  auto plan = capture_insert_delta_plan(storage, *env.con->context, 10000, cols, types);
+
+  REQUIRE(plan.n_total == 140000);
+  bool saw_constant = false;
+  for (auto const& rg : plan.row_groups) {
+    std::size_t covered = 0;
+    for (auto const& s : rg.columns[0].data_segments) {
+      covered += s.segment_count;
+      if (s.compression != duckdb::CompressionType::COMPRESSION_CONSTANT) { continue; }
+      saw_constant = true;
+      REQUIRE_FALSE(s.is_transient);
+      REQUIRE(s.block_id < 0);
+      REQUIRE(s.bytes_size == 0);
+      REQUIRE(s.additional_blocks.empty());
+      // The constant value decodes from the capture-time stats snapshot.
+      REQUIRE(s.segment_stats != nullptr);
+    }
+    REQUIRE(covered == rg.row_count);  // CONSTANT segments still tile the slice
+  }
+  REQUIRE(saw_constant);
+  exec_ok(*env.con, "ROLLBACK");
+}
+
+TEST_CASE("insert delta: all-NULL constant validity is captured, not skipped",
+          "[duckdb_insert_delta][scan]")
+{
+  delta_test_db env;
+  exec_ok(*env.con,
+          "CREATE TABLE t AS SELECT range::INTEGER AS k, range::INTEGER AS v FROM range(10000)");
+  exec_ok(*env.con, "CHECKPOINT");
+  // Bulk all-NULL column: the flushed data segment is CONSTANT at a sentinel
+  // value and the NULL-ness lives only in the CONSTANT validity segment's
+  // stats. Skipping it would serve the sentinels as valid rows.
+  exec_ok(*env.con,
+          "INSERT INTO t SELECT (10000+range)::INTEGER, NULL::INTEGER FROM range(130000)");
+
+  exec_ok(*env.con, "BEGIN TRANSACTION");
+  auto& storage = resolve_storage(*env.con, "t");
+  std::vector<duckdb::storage_t> const cols{0, 1};
+  std::vector<sirius::logical_type> types{sirius::logical_type::make(sirius::type_id::INTEGER),
+                                          sirius::logical_type::make(sirius::type_id::INTEGER)};
+  auto plan = capture_insert_delta_plan(storage, *env.con->context, 10000, cols, types);
+
+  bool saw_all_null = false;
+  for (auto const& rg : plan.row_groups) {
+    for (auto const& s : rg.columns[1].validity_segments) {
+      if (!s.all_null) { continue; }
+      saw_all_null = true;
+      REQUIRE(s.is_validity);
+      REQUIRE(s.compression == duckdb::CompressionType::COMPRESSION_CONSTANT);
+      REQUIRE_FALSE(s.is_transient);
+      REQUIRE(s.block_id < 0);
+      REQUIRE(s.bytes_size == 0);
+    }
+  }
+  REQUIRE(saw_all_null);
   exec_ok(*env.con, "ROLLBACK");
 }
 

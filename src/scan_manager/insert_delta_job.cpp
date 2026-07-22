@@ -304,6 +304,8 @@ std::vector<insert_delta_split> cut_delta_splits_for_op(
       d.compression       = s.compression;
       d.max_string_length = s.max_string_length;
       d.bytes_size        = s.bytes_size;
+      d.all_null          = s.all_null;
+      d.segment_stats     = s.segment_stats;
       if (s.is_transient) {
         d.block_id     = -1;
         d.block_offset = 0;
@@ -312,7 +314,9 @@ std::vector<insert_delta_split> cut_delta_splits_for_op(
         d.block_id          = s.block_id;
         d.block_offset      = s.block_offset;
         d.additional_blocks = s.additional_blocks;
-        any_file_read       = true;
+        // Blockless persistent segments (CONSTANT data, all-NULL validity)
+        // decode from stats or synthesis and read no file.
+        if (d.block_id >= 0) { any_file_read = true; }
       }
       return d;
     };
@@ -320,10 +324,9 @@ std::vector<insert_delta_split> cut_delta_splits_for_op(
   std::vector<insert_delta_split> out;
   out.reserve(request.bundles.size());
   for (auto const& bundle : request.bundles) {
-    auto info                     = std::make_unique<op::scan::duckdb_native_scan_info>();
-    info->datasource              = datasource;
-    info->block_manager           = block_manager;
-    info->carried_partition_stats = request.plan.partition_stats;
+    auto info           = std::make_unique<op::scan::duckdb_native_scan_info>();
+    info->datasource    = datasource;
+    info->block_manager = block_manager;
     if (bundle.staging) { info->staging_keepalive.push_back(bundle.staging); }
 
     bool any_file_read = false;

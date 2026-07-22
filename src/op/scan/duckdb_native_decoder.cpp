@@ -50,7 +50,6 @@
 #include <cucascade/memory/memory_space.hpp>
 #include <duckdb/common/types/validity_mask.hpp>
 #include <duckdb/common/types/vector.hpp>
-#include <duckdb/function/partition_stats.hpp>
 #include <duckdb/main/attached_database.hpp>
 #include <duckdb/main/database.hpp>
 #include <duckdb/storage/block_manager.hpp>
@@ -58,7 +57,6 @@
 #include <duckdb/storage/buffer_manager.hpp>
 #include <duckdb/storage/compression/roaring/roaring.hpp>
 #include <duckdb/storage/single_file_block_manager.hpp>
-#include <duckdb/storage/statistics/array_stats.hpp>
 #include <duckdb/storage/statistics/base_statistics.hpp>
 #include <duckdb/storage/statistics/numeric_stats.hpp>
 #include <duckdb/storage/statistics/string_stats.hpp>
@@ -128,6 +126,7 @@ bool is_supported_varchar_codec(duckdb::CompressionType c)
 bool column_has_real_nulls(duckdb_column_metadata const& col)
 {
   for (auto const& v : col.validity_segments) {
+    if (v.all_null) { return true; }
     auto c = v.compression;
     if (c == duckdb::CompressionType::COMPRESSION_UNCOMPRESSED ||
         c == duckdb::CompressionType::COMPRESSION_ROARING) {
@@ -152,9 +151,9 @@ struct pinned_segment_bytes {
 //===----------------------------------------------------------------------===//
 // CONSTANT extraction.
 //
-// CONSTANT segments have block_id == -1; the constant value lives in
-// per-(rg, col) statistics. We pull stats from PartitionRowGroup at scan
-// time and copy the value into an owned buffer the kernel can read.
+// CONSTANT segments have block_id == -1; the constant value lives in the
+// segment's own statistics, snapshotted onto the descriptor by the walker.
+// Copy the value into an owned buffer the kernel can read.
 //===----------------------------------------------------------------------===//
 
 template <typename T>
@@ -238,6 +237,23 @@ pinned_segment_bytes decode_roaring_validity(duckdb::DatabaseInstance& db,
     }
   }
 
+  out.host_ptr = out.owned_bytes.data();
+  out.bytes    = out.owned_bytes.size();
+  return out;
+}
+
+// All-NULL constant runs carry no bytes anywhere; ship zeroed validity bits.
+pinned_segment_bytes make_all_null_validity_bytes(duckdb::idx_t row_count)
+{
+  pinned_segment_bytes out;
+  out.owned_bytes.assign((static_cast<std::size_t>(row_count) + 7) / 8, 0x00);
+  if (row_count % 8 != 0) {
+    // The GPU overlays validity runs by whole-byte copy onto an all-valid
+    // mask, so the padding bits of a trailing partial byte must stay 1 or
+    // they would null the next segment's leading rows. Every other validity
+    // source (DuckDB buffers, the ROARING decode above) keeps them set.
+    out.owned_bytes.back() = static_cast<uint8_t>(0xFFu << (row_count % 8));
+  }
   out.host_ptr = out.owned_bytes.data();
   out.bytes    = out.owned_bytes.size();
   return out;
@@ -372,39 +388,27 @@ void stage_device_read(staging_state& s,
   }
 }
 
-duckdb::BaseStatistics const& constant_stats_for(
-  std::vector<duckdb::PartitionStatistics> const& partition_stats,
-  duckdb::idx_t rg_idx,
-  duckdb::idx_t storage_idx,
-  std::vector<std::unique_ptr<duckdb::BaseStatistics>>& owned_stats_cache)
+// The walker guarantees CONSTANT descriptors carry their segment's stats.
+duckdb::BaseStatistics const& constant_segment_stats(duckdb_segment_descriptor const& seg,
+                                                     duckdb::idx_t column_id)
 {
-  if (rg_idx >= partition_stats.size() || !partition_stats[rg_idx].partition_row_group) {
+  if (!seg.segment_stats) {
     throw std::runtime_error(std::string(kTag) +
-                             " no PartitionRowGroup for CONSTANT lookup on rg " +
-                             std::to_string(rg_idx));
+                             " CONSTANT segment without carried segment stats (column " +
+                             std::to_string(column_id) + ")");
   }
-  auto stats = partition_stats[rg_idx].partition_row_group->GetColumnStatistics(
-    duckdb::StorageIndex(storage_idx));
-  if (!stats) {
-    throw std::runtime_error(std::string(kTag) +
-                             " PartitionRowGroup returned null stats for CONSTANT lookup");
-  }
-  owned_stats_cache.push_back(std::move(stats));
-  return *owned_stats_cache.back();
+  return *seg.segment_stats;
 }
 
 /// @brief Stage the data and validity segments for a fixed-width column, returning the staged
 /// segments and metadata for the scan kernel. Throws if an unsupported codec is encountered.
-staged_column stage_one_fixed_width_column(
-  staging_state& s,
-  duckdb::DatabaseInstance& db,
-  duckdb::BlockManager& block_manager,
-  duckdb::SingleFileBlockManager const& sf_bm,
-  std::vector<duckdb::PartitionStatistics> const& partition_stats,
-  std::vector<std::unique_ptr<duckdb::BaseStatistics>>& owned_stats_cache,
-  std::vector<duckdb_row_group_metadata> const& row_groups,
-  std::size_t projected_col_idx,
-  sirius::logical_type const& projected_type)
+staged_column stage_one_fixed_width_column(staging_state& s,
+                                           duckdb::DatabaseInstance& db,
+                                           duckdb::BlockManager& block_manager,
+                                           duckdb::SingleFileBlockManager const& sf_bm,
+                                           std::vector<duckdb_row_group_metadata> const& row_groups,
+                                           std::size_t projected_col_idx,
+                                           sirius::logical_type const& projected_type)
 {
   staged_column out;
 
@@ -429,8 +433,7 @@ staged_column stage_one_fixed_width_column(
         // enclosing scan_info, so stage a host copy instead of a file read.
         stage_host_copy(s, {{}, seg.host_ptr, seg.bytes_size}, ss);
       } else if (seg.compression == duckdb::CompressionType::COMPRESSION_CONSTANT) {
-        auto const& stats = constant_stats_for(
-          partition_stats, rg.row_group_index, col_md.column_id, owned_stats_cache);
+        auto const& stats = constant_segment_stats(seg, col_md.column_id);
         stage_host_copy(s, extract_constant_bytes(stats, projected_type), ss);
       } else {
         stage_device_read(s, sf_bm, seg, ss);
@@ -441,7 +444,7 @@ staged_column stage_one_fixed_width_column(
     //===----------Validity Segments----------===//
     if (column_has_real_nulls(col_md)) { out.has_nulls = true; }
     for (auto const& vseg : col_md.validity_segments) {
-      if (is_constant_or_empty_validity(vseg.compression)) { continue; }
+      if (is_constant_or_empty_validity(vseg.compression) && !vseg.all_null) { continue; }
       staged_segment vs;
       vs.row_offset = row_cursor + static_cast<uint32_t>(vseg.segment_start);
       vs.row_count  = static_cast<uint32_t>(vseg.segment_count);
@@ -449,7 +452,9 @@ staged_column stage_one_fixed_width_column(
       // we ship as UNCOMPRESSED — even when source was ROARING.
       vs.compression = duckdb::CompressionType::COMPRESSION_UNCOMPRESSED;
 
-      if (vseg.host_ptr != nullptr) {
+      if (vseg.all_null) {
+        stage_host_copy(s, make_all_null_validity_bytes(vseg.segment_count), vs);
+      } else if (vseg.host_ptr != nullptr) {
         stage_host_copy(s, {{}, vseg.host_ptr, vseg.bytes_size}, vs);
       } else if (vseg.compression == duckdb::CompressionType::COMPRESSION_ROARING) {
         // ROARING stays on BufferManager: CreatePersistentSegment drives
@@ -514,13 +519,15 @@ staged_column stage_one_varchar_column(staging_state& s,
     //===----------Validity Segments----------===//
     if (column_has_real_nulls(col_md)) { out.has_nulls = true; }
     for (auto const& vseg : col_md.validity_segments) {
-      if (is_constant_or_empty_validity(vseg.compression)) { continue; }
+      if (is_constant_or_empty_validity(vseg.compression) && !vseg.all_null) { continue; }
       staged_segment vs;
       vs.row_offset  = row_cursor + static_cast<uint32_t>(vseg.segment_start);
       vs.row_count   = static_cast<uint32_t>(vseg.segment_count);
       vs.compression = duckdb::CompressionType::COMPRESSION_UNCOMPRESSED;
 
-      if (vseg.host_ptr != nullptr) {
+      if (vseg.all_null) {
+        stage_host_copy(s, make_all_null_validity_bytes(vseg.segment_count), vs);
+      } else if (vseg.host_ptr != nullptr) {
         stage_host_copy(s, {{}, vseg.host_ptr, vseg.bytes_size}, vs);
       } else if (vseg.compression == duckdb::CompressionType::COMPRESSION_ROARING) {
         stage_host_copy(s, decode_roaring_validity(db, block_manager, vseg), vs);
@@ -545,16 +552,13 @@ staged_column stage_one_varchar_column(staging_state& s,
 /// + optional child validity (path [col,1,0]). The child segments are in element-units and
 /// DuckDB already emits child segment_start/segment_count in element units, so they drop
 /// straight into staged_segment.
-staged_column stage_one_array_column(
-  staging_state& s,
-  duckdb::DatabaseInstance& db,
-  duckdb::BlockManager& block_manager,
-  duckdb::SingleFileBlockManager const& sf_bm,
-  std::vector<duckdb::PartitionStatistics> const& partition_stats,
-  std::vector<std::unique_ptr<duckdb::BaseStatistics>>& owned_stats_cache,
-  std::vector<duckdb_row_group_metadata> const& row_groups,
-  std::size_t projected_col_idx,
-  sirius::logical_type const& projected_type)
+staged_column stage_one_array_column(staging_state& s,
+                                     duckdb::DatabaseInstance& db,
+                                     duckdb::BlockManager& block_manager,
+                                     duckdb::SingleFileBlockManager const& sf_bm,
+                                     std::vector<duckdb_row_group_metadata> const& row_groups,
+                                     std::size_t projected_col_idx,
+                                     sirius::logical_type const& projected_type)
 {
   staged_column out;
   out.is_array = true;
@@ -573,14 +577,16 @@ staged_column stage_one_array_column(
     // columns, so validity_segments (what column_has_real_nulls inspects) is
     // empty. Detect real nulls from the validity codec here.
     for (auto const& vseg : col_md.data_segments) {
-      if (is_constant_or_empty_validity(vseg.compression)) { continue; }
+      if (is_constant_or_empty_validity(vseg.compression) && !vseg.all_null) { continue; }
       out.has_nulls = true;
       staged_segment vs;
       vs.row_offset  = row_cursor + static_cast<uint32_t>(vseg.segment_start);
       vs.row_count   = static_cast<uint32_t>(vseg.segment_count);
       vs.compression = duckdb::CompressionType::COMPRESSION_UNCOMPRESSED;
 
-      if (vseg.compression == duckdb::CompressionType::COMPRESSION_ROARING) {
+      if (vseg.all_null) {
+        stage_host_copy(s, make_all_null_validity_bytes(vseg.segment_count), vs);
+      } else if (vseg.compression == duckdb::CompressionType::COMPRESSION_ROARING) {
         stage_host_copy(s, decode_roaring_validity(db, block_manager, vseg), vs);
       } else if (vseg.compression == duckdb::CompressionType::COMPRESSION_UNCOMPRESSED) {
         stage_device_read(s, sf_bm, vseg, vs);
@@ -605,12 +611,9 @@ staged_column stage_one_array_column(
       ss.compression = seg.compression;
 
       if (seg.compression == duckdb::CompressionType::COMPRESSION_CONSTANT) {
-        // GetColumnStatistics on an ARRAY column returns ArrayStats; the child's
-        // numeric min/max (what the CONSTANT value is derived from) lives in the
-        // nested child stats, so unwrap before extracting.
-        auto const& array_stats = constant_stats_for(
-          partition_stats, rg.row_group_index, col_md.column_id, owned_stats_cache);
-        auto const& child_stats = duckdb::ArrayStats::GetChildStats(array_stats);
+        // The child segment's own stats are child-typed numeric stats, so
+        // they extract directly — no ArrayStats unwrap.
+        auto const& child_stats = constant_segment_stats(seg, col_md.column_id);
         stage_host_copy(s, extract_constant_bytes(child_stats, child_type), ss);
       } else {
         stage_device_read(s, sf_bm, seg, ss);
@@ -620,14 +623,16 @@ staged_column stage_one_array_column(
 
     //===----------Child Validity (path [col, 1, 0])----------===//
     for (auto const& vseg : col_md.array_child_validity_segments) {
-      if (is_constant_or_empty_validity(vseg.compression)) { continue; }
+      if (is_constant_or_empty_validity(vseg.compression) && !vseg.all_null) { continue; }
       out.child_has_nulls = true;
       staged_segment vs;
       vs.row_offset  = child_elem_cursor + static_cast<uint32_t>(vseg.segment_start);
       vs.row_count   = static_cast<uint32_t>(vseg.segment_count);
       vs.compression = duckdb::CompressionType::COMPRESSION_UNCOMPRESSED;
 
-      if (vseg.compression == duckdb::CompressionType::COMPRESSION_ROARING) {
+      if (vseg.all_null) {
+        stage_host_copy(s, make_all_null_validity_bytes(vseg.segment_count), vs);
+      } else if (vseg.compression == duckdb::CompressionType::COMPRESSION_ROARING) {
         stage_host_copy(s, decode_roaring_validity(db, block_manager, vseg), vs);
       } else if (vseg.compression == duckdb::CompressionType::COMPRESSION_UNCOMPRESSED) {
         stage_device_read(s, sf_bm, vseg, vs);
@@ -969,8 +974,7 @@ std::unique_ptr<cudf::table> decode_duckdb_native_split(
   duckdb_native_ingestible_table_info const& table_info,
   sirius::io::sirius_datasource* datasource,
   cucascade::memory::memory_space& mem_space,
-  rmm::cuda_stream_view stream,
-  duckdb::vector<duckdb::PartitionStatistics> const* carried_partition_stats)
+  rmm::cuda_stream_view stream)
 {
   if (row_groups.empty()) {
     // Empty / fully-pruned split: emit a schema-correct 0-row table (one empty
@@ -1003,19 +1007,6 @@ std::unique_ptr<cudf::table> decode_duckdb_native_split(
       " missing io_ctx, io_obj, or SingleFileBlockManager for duckdb_native_scan");
   }
 
-  // PartitionRowGroup lookup needed for CONSTANT segments + held alive for the
-  // duration of the decode (its destructor releases an internal reference).
-  // Insert-delta splits carry capture-time stats instead: GetPartitionStats
-  // touches ClientContext / LocalStorage, which are not safe off the query
-  // thread, and delta decodes run on task threads.
-  duckdb::vector<duckdb::PartitionStatistics> fetched_partition_stats;
-  if (carried_partition_stats == nullptr) {
-    fetched_partition_stats = storage.GetPartitionStats(context);
-  }
-  auto const& partition_stats =
-    carried_partition_stats != nullptr ? *carried_partition_stats : fetched_partition_stats;
-  std::vector<std::unique_ptr<duckdb::BaseStatistics>> owned_stats_cache;
-
   auto mr_ref = mem_space.get_default_allocator();
 
   auto const num_cols = scan_info.projected_cols.size();
@@ -1046,25 +1037,11 @@ std::unique_ptr<cudf::table> decode_duckdb_native_split(
       staged_cols.push_back(
         stage_one_varchar_column(staging, db, block_manager, *sf_bm, row_groups, ci));
     } else if (scan_info.projected_types[ci].is_array()) {
-      staged_cols.push_back(stage_one_array_column(staging,
-                                                   db,
-                                                   block_manager,
-                                                   *sf_bm,
-                                                   partition_stats,
-                                                   owned_stats_cache,
-                                                   row_groups,
-                                                   ci,
-                                                   scan_info.projected_types[ci]));
+      staged_cols.push_back(stage_one_array_column(
+        staging, db, block_manager, *sf_bm, row_groups, ci, scan_info.projected_types[ci]));
     } else {
-      staged_cols.push_back(stage_one_fixed_width_column(staging,
-                                                         db,
-                                                         block_manager,
-                                                         *sf_bm,
-                                                         partition_stats,
-                                                         owned_stats_cache,
-                                                         row_groups,
-                                                         ci,
-                                                         scan_info.projected_types[ci]));
+      staged_cols.push_back(stage_one_fixed_width_column(
+        staging, db, block_manager, *sf_bm, row_groups, ci, scan_info.projected_types[ci]));
     }
   }
 
