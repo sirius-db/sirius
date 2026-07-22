@@ -93,8 +93,7 @@ TEST_CASE_METHOD(AggNullFixture,
                  "[integration][gpu_execution][aggregate][nulls]")
 {
   // The NULL group key forms its own group; the all-NULL group (g=3) yields
-  // COUNT(v)=0 and SUM/AVG/MIN/MAX = NULL. Grouped AVG uses the correct non-null
-  // denominator (unlike ungrouped AVG -- see the [!shouldfail] case below).
+  // COUNT(v)=0 and SUM/AVG/MIN/MAX = NULL.
   compare_gpu_vs_cpu(
     "SELECT g, COUNT(*), COUNT(v), SUM(v), AVG(v), MIN(v), MAX(v) FROM agg_n GROUP BY g");
 }
@@ -115,12 +114,21 @@ TEST_CASE_METHOD(AggNullFixture,
   compare_gpu_vs_cpu("SELECT g, COUNT(DISTINCT v) FROM agg_n GROUP BY g");
 }
 
+TEST_CASE_METHOD(AggNullFixture,
+                 "gpu_execution ungrouped AVG skips NULLs (non-null denominator)",
+                 "[integration][gpu_execution][aggregate][nulls]")
+{
+  // AVG divides SUM by the count of non-null values, not the row count, so AVG
+  // over a NULL-containing column matches DuckDB: AVG(v) = 335/5 = 67.
+  compare_gpu_vs_cpu("SELECT AVG(v), AVG(d), AVG(f) FROM agg_n");
+}
+
 //===----------------------------------------------------------------------===//
 // Known GPU divergences (quarantined) -- each tracked in its own issue; remove
 // the [!shouldfail] tag when the underlying bug is fixed.
 //===----------------------------------------------------------------------===//
 
-// KNOWN GPU DIVERGENCE (issue #1095 follow-up -- please file):
+// KNOWN GPU DIVERGENCE (issue #1218):
 // A column that is entirely NULL loses its validity mask in the GPU native scan
 // and is read as sentinel values (INT_MAX), so aggregates over it see fake data:
 // SUM(allnull) returns 8*INT_MAX and COUNT(allnull) returns the row count (8)
@@ -143,19 +151,7 @@ TEST_CASE_METHOD(AggNullFixture,
   compare_gpu_vs_cpu("SELECT g, SUM(allnull), COUNT(allnull) FROM agg_n GROUP BY g");
 }
 
-// KNOWN GPU DIVERGENCE (issue #1095 follow-up -- please file):
-// Ungrouped AVG divides SUM by the total row count instead of the non-null
-// count, so AVG over a column containing NULLs is wrong: AVG(v) returns
-// 335/8 = 41.875 instead of 335/5 = 67. SUM and COUNT are individually correct,
-// and grouped AVG is correct -- the bug is isolated to the ungrouped aggregate.
-TEST_CASE_METHOD(AggNullFixture,
-                 "gpu_execution ungrouped AVG denominator counts NULL rows [known divergence]",
-                 "[integration][gpu_execution][aggregate][nulls][!shouldfail]")
-{
-  compare_gpu_vs_cpu("SELECT AVG(v), AVG(d), AVG(f) FROM agg_n");
-}
-
-// KNOWN GPU DIVERGENCE (issue #1095 follow-up -- please file):
+// KNOWN GPU DIVERGENCE (issue #1218):
 // Ungrouped COUNT(DISTINCT ...) errors on the GPU and falls back to DuckDB CPU at
 // runtime (runtime_fallbacks increments), so it does not execute on the GPU. The
 // result is correct via fallback, but the operation is unsupported on-device.
