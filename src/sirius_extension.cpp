@@ -937,7 +937,21 @@ std::unique_ptr<sirius::op::scan::duckdb_native_ingestible_table_info> build_duc
   auto schema_names   = columns.GetColumnNames();  // logical order
   auto schema_types   = columns.GetColumnTypes();  // logical order
 
-  auto keep            = resolve_pin_kept_indices(schema_names, cols);
+  auto keep = resolve_pin_kept_indices(schema_names, cols);
+  // ARRAY pins are unsupported: appended ARRAY rows live in the array-validity
+  // and child segment trees, which the uncheckpointed-append guard below does
+  // not walk, so a committed post-pin append would slip past the pin contract
+  // and only fail later, deep in metadata decoding. Refuse up front, before
+  // checkpoint suppression or any other pin side effect.
+  for (auto col : keep) {
+    if (schema_types[col].id() == LogicalTypeId::ARRAY) {
+      throw InvalidInputException(
+        "pin_table: column '%s' of table '%s' has ARRAY type, which duckdb-native pins do not "
+        "support; pin a column subset without it (cols=[...])",
+        schema_names[col],
+        table_ref);
+    }
+  }
   auto const canonical = storage.GetAttached().GetStorageManager().GetDBPath();
 
   // Update chains version values in place, invisibly to the DELETE

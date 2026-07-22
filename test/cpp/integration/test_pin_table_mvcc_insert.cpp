@@ -426,6 +426,29 @@ TEST_CASE_METHOD(PinMvccInsertFixture,
 }
 
 TEST_CASE_METHOD(PinMvccInsertFixture,
+                 "mvcc guards: pinning an ARRAY column is refused",
+                 "[integration][gpu_execution][pin_table_mvcc_insert]")
+{
+  run_ok(
+    "CREATE TABLE t AS SELECT range::INTEGER AS k, "
+    "CAST([range::INTEGER, 1, 2] AS INTEGER[3]) AS a FROM range(1000);");
+  run_ok("CHECKPOINT;");
+
+  // Appended ARRAY rows hide in the array-validity/child segment trees the
+  // uncheckpointed-append guard cannot see, so ARRAY pins are refused outright
+  // — checkpoint-clean ones included.
+  auto refused = con->Query("CALL pin_table(format='duckdb', name='t', tier='gpu');");
+  REQUIRE(refused);
+  REQUIRE(refused->HasError());
+  REQUIRE_THAT(refused->GetError(), Catch::Contains("ARRAY"));
+
+  // A subset pin that leaves the ARRAY column out still works.
+  run_ok("CALL pin_table(format='duckdb', name='t', tier='gpu', cols=['k']);");
+  compare_gpu_vs_cpu("SELECT count(*), sum(k) FROM t;");
+  run_ok("CALL unpin_table('t');");
+}
+
+TEST_CASE_METHOD(PinMvccInsertFixture,
                  "mvcc guards: ARRAY projections decline while a delta exists",
                  "[integration][gpu_execution][pin_table_mvcc_insert]")
 {
@@ -433,14 +456,15 @@ TEST_CASE_METHOD(PinMvccInsertFixture,
     "CREATE TABLE t AS SELECT range::INTEGER AS k, "
     "CAST([range::INTEGER, 1, 2] AS INTEGER[3]) AS a FROM range(20000);");
   run_ok("CHECKPOINT;");
-  run_ok("CALL pin_table(format='duckdb', name='t', tier='gpu');");
+  // ARRAY columns cannot be pinned, so pin the scalar subset.
+  run_ok("CALL pin_table(format='duckdb', name='t', tier='gpu', cols=['k']);");
 
   run_ok("INSERT INTO t VALUES (20000, CAST([9, 9, 9] AS INTEGER[3]));");
 
-  // Projecting the ARRAY column with delta rows present declines; the fallback
-  // must still return correct rows.
+  // Projecting the unpinned ARRAY column declines; the fallback must still
+  // return correct rows.
   expect_fallback_matches_cpu(*this, "SELECT k, a FROM t WHERE k >= 19998 ORDER BY k;");
-  // Projecting only the scalar column serves from cache + delta as usual.
+  // Projecting only the pinned scalar column serves from cache + delta.
   compare_gpu_vs_cpu("SELECT count(*), sum(k) FROM t;");
   run_ok("CALL unpin_table('t');");
 }
