@@ -73,6 +73,16 @@ class SiriusContext : public ClientContextState {
     uint64_t runtime_fallbacks = 0;
   };
 
+  /// Monotonic counters describing compressed-materialization activity.
+  ///
+  /// These counters intentionally describe columns rather than queries: a
+  /// single scan or pinned chunk can narrow or restore several columns.
+  struct compressed_materialization_stats {
+    uint64_t scan_columns_narrowed = 0;
+    uint64_t scan_columns_restored = 0;
+    uint64_t pin_columns_narrowed  = 0;
+  };
+
   SiriusContext();
   ~SiriusContext() noexcept override;
 
@@ -309,6 +319,19 @@ class SiriusContext : public ClientContextState {
   /// via DuckDB CPU fallback (same transaction).
   void record_transparent_runtime_fallback() noexcept;
 
+  /// \brief Snapshot counters for compressed-materialization observability.
+  [[nodiscard]] compressed_materialization_stats get_compressed_materialization_stats()
+    const noexcept;
+
+  /// \brief Record columns narrowed while materializing a scan batch.
+  void record_compressed_materialization_scan_columns_narrowed(uint64_t count = 1) noexcept;
+
+  /// \brief Record columns restored to their native type at a scan boundary.
+  void record_compressed_materialization_scan_columns_restored(uint64_t count = 1) noexcept;
+
+  /// \brief Record columns narrowed while materializing a pinned chunk.
+  void record_compressed_materialization_pin_columns_narrowed(uint64_t count = 1) noexcept;
+
  private:
   void throw_if_not_initialized() const;
   void acquire_query_lifecycle_slot();
@@ -379,6 +402,9 @@ class SiriusContext : public ClientContextState {
   std::atomic<uint64_t> transparent_fallback_count_{0};
   std::atomic<uint64_t> transparent_execution_count_{0};
   std::atomic<uint64_t> transparent_runtime_fallback_count_{0};
+  std::atomic<uint64_t> compressed_materialization_scan_columns_narrowed_count_{0};
+  std::atomic<uint64_t> compressed_materialization_scan_columns_restored_count_{0};
+  std::atomic<uint64_t> compressed_materialization_pin_columns_narrowed_count_{0};
 };
 
 /// Installs the sink selected by `Config::LOG_BACKEND` (with `Config::LOG_*`).

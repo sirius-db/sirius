@@ -36,7 +36,10 @@
 #include <rmm/resource_ref.hpp>
 
 // standard library
+#include <cstdint>
+#include <initializer_list>
 #include <memory>
+#include <optional>
 #include <span>
 #include <variant>
 #include <vector>
@@ -385,6 +388,21 @@ class expression_evaluator {
   evaluate_result evaluate(sirius::ast::node const& expr,
                            evaluation_mode mode = evaluation_mode::AST);
 
+  /// Number of numeric restoration casts issued by the most recent top-level evaluation.
+  /// Exposed so tests can verify repeated references share one cached restoration.
+  [[nodiscard]] std::size_t restored_reference_cast_count_for_testing() const noexcept
+  {
+    return _restored_reference_cast_count;
+  }
+
+  /// Number of comparison/BETWEEN nodes the most recent top-level evaluation executed directly on
+  /// a narrowed carrier (no restoration cast). Exposed so tests can verify the narrow-domain path
+  /// engaged instead of merely producing correct results through a restore.
+  [[nodiscard]] std::size_t narrow_domain_comparison_count_for_testing() const noexcept
+  {
+    return _narrow_domain_comparison_count;
+  }
+
  private:
   std::vector<sirius::ast::node const*> _ast_expressions;  ///< The AST expressions to evaluate
   expression_evaluator_strategy _strategy;  ///< The strategy to use for expression evaluation
@@ -406,6 +424,19 @@ class expression_evaluator {
     _temp_columns;  ///< The temporary columns that need to be kept alive for the AST nodes in
                     ///< _ast_tree.
 
+  struct restored_reference_cache_entry {
+    std::uint32_t column_index;
+    cudf::data_type target_type;
+    std::size_t temp_column_index;
+  };
+
+  // Numeric reference restorations live in _temp_columns so AST references use the existing
+  // combined-table layout. Cache AST results deliberately do not advertise these indices to
+  // release_temporaries: a restoration remains alive for the complete top-level evaluation.
+  std::vector<restored_reference_cache_entry> _restored_reference_cache;
+  std::size_t _restored_reference_cast_count{0};
+  std::size_t _narrow_domain_comparison_count{0};
+
   // Evaluate the executor's single boolean predicate over @p input and return the resulting
   // mask column (the sole column of evaluate()'s output). Shared by both select() overloads.
   std::unique_ptr<cudf::column> compute_mask(cudf::table_view input);
@@ -423,6 +454,40 @@ class expression_evaluator {
    * column_reference pointing to the temp column's index in the combined table.
    */
   evaluate_result materialize_as_ast_column(std::unique_ptr<cudf::column> column);
+
+  // Return a cached strict numeric restoration for one input reference. MATERIALIZE mode receives
+  // a non-owning view; AST mode receives a reference to the cache-owned _temp_columns entry.
+  evaluate_result get_or_create_restored_reference(std::uint32_t column_index,
+                                                   cudf::data_type target_type,
+                                                   evaluation_mode mode);
+
+  // Narrow-domain comparison support (compressed materialization). Narrowing is value-preserving
+  // (same values, same family, same DECIMAL scale — no offset), so a comparison between a
+  // narrowed reference and constants exactly representable in its carrier yields identical
+  // results computed at the narrow width. These helpers let comparison/BETWEEN skip the
+  // full-column restoration cast for that shape; every ineligible shape falls back to the
+  // restore path.
+  //
+  // Returns the narrowed input carrier when @p column_operand is a reference whose materialized
+  // carrier is a strict narrowing of its declared native type AND every entry of
+  // @p constant_operands is a constant exactly representable in that carrier (typed NULLs always
+  // are). Returns nullopt otherwise.
+  [[nodiscard]] std::optional<cudf::data_type> narrow_domain_carrier(
+    sirius::ast::node const& column_operand,
+    std::initializer_list<sirius::ast::node const*> constant_operands) const;
+
+  // Evaluate a reference as its raw input column, bypassing restoration.
+  evaluate_result evaluate_reference_passthrough(sirius::ast::reference const& expr,
+                                                 evaluation_mode mode);
+
+  // Evaluate a numeric constant as a scalar of @p carrier (a narrowed integer or fixed-point
+  // carrier). Callers must have validated representability via narrow_domain_carrier.
+  evaluate_result evaluate_constant_in_carrier(sirius::ast::constant const& expr,
+                                               cudf::data_type carrier,
+                                               evaluation_mode mode);
+
+  // Drop cache-owned temporary columns and reset per-call instrumentation.
+  void reset_restored_reference_cache();
 
   // Release memory for the temporary scalars and columns with the given indices.
   void release_temporaries(std::vector<std::size_t> const& scalar_indices,

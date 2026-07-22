@@ -50,6 +50,7 @@ bool IsFixedWidth(cudf::data_type const& type)
   return id != cudf::type_id::STRING && id != cudf::type_id::LIST && id != cudf::type_id::STRUCT &&
          id != cudf::type_id::DICTIONARY32 && id != cudf::type_id::EMPTY;
 }
+
 }  // namespace
 
 namespace sirius {
@@ -236,6 +237,18 @@ evaluate_result expression_evaluator::materialize_as_ast_column(
   return evaluate_result(ast_result(col_ref, std::vector<std::size_t>{}, {temp_column_idx}));
 }
 
+void expression_evaluator::reset_restored_reference_cache()
+{
+  for (auto const& entry : _restored_reference_cache) {
+    if (entry.temp_column_index < _temp_columns.size()) {
+      _temp_columns[entry.temp_column_index].reset();
+    }
+  }
+  _restored_reference_cache.clear();
+  _restored_reference_cast_count  = 0;
+  _narrow_domain_comparison_count = 0;
+}
+
 void expression_evaluator::release_temporaries(std::vector<std::size_t> const& scalar_indices,
                                                std::vector<std::size_t> const& column_indices)
 {
@@ -270,6 +283,7 @@ std::unique_ptr<cudf::table> expression_evaluator::evaluate(cudf::table_view inp
 
   // Reset AST state from any previous invocation so that the tree, temp scalars, and temp columns
   // do not accumulate stale nodes across calls.
+  reset_restored_reference_cache();
   _ast_tree = cudf::ast::tree{};
   _temp_scalars.clear();
   _temp_columns.clear();
@@ -281,9 +295,14 @@ std::unique_ptr<cudf::table> expression_evaluator::evaluate(cudf::table_view inp
   // natively from the Sirius AST (no DuckDB round-trip).
   auto post_process = [this](sirius::ast::node const& expr, evaluate_result result) {
     if (expr.holds<sirius::ast::reference>()) {
-      // Bound reference: pass column through without type check
-      _output_columns.push_back(
-        std::make_unique<cudf::column>(result.get_column_view(), _stream, _mr));
+      // A narrowed reference is restored by the reference specialization and owns its result.
+      // An unchanged reference remains a zero-copy view until this output copy.
+      if (result.is_owned_column()) {
+        _output_columns.push_back(result.release_column());
+      } else {
+        _output_columns.push_back(
+          std::make_unique<cudf::column>(result.get_column_view(), _stream, _mr));
+      }
     } else {
       // Cast the `result` from libcudf to the node's return type if `result` has a different
       // type. E.g., `extract(year from col)` from libcudf returns int16_t but the SQL type is
@@ -299,7 +318,7 @@ std::unique_ptr<cudf::table> expression_evaluator::evaluate(cudf::table_view inp
       } else {
         result_column = result.release_column();
       }
-      if (result_column->type().id() != cudf_return_type.id()) {
+      if (result_column->type() != cudf_return_type) {
         // Cast is only valid for fixed-width types (no STRING/LIST/STRUCT/etc.).
         if (IsFixedWidth(result_column->type()) && IsFixedWidth(cudf_return_type)) {
           result_column = cudf::cast(result_column->view(), cudf_return_type, _stream, _mr);

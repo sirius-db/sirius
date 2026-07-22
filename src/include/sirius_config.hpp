@@ -119,6 +119,12 @@ struct operator_params {
   /// pin-time statistics capture and the serve-side survivor plan: a table pinned while the flag is
   /// off carries no zone maps and cannot prune until re-pinned with the flag on.
   bool enable_pinned_zone_map_pruning = true;
+
+  /// Materialize integer and fixed-point DECIMAL scan columns in the narrowest exact physical
+  /// cuDF carrier proven by source min/max statistics, restoring the declared SQL type only at
+  /// expression and result boundaries. This is opt-in while the cost model and source coverage
+  /// are being validated.
+  bool enable_compressed_materialization = false;
 };
 
 struct telemetry_config {

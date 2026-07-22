@@ -166,6 +166,12 @@ struct pinned_entry {
   /// pinned columns. The cached_split_provider slices these by column index when
   /// serving a particular scan. Populated by @ref insert_pinned_entry_host.
   std::vector<std::shared_ptr<cucascade::host_data_representation>> host_chunks;
+  /// Chunk-major physical-narrowing metadata, positional with the cached data:
+  /// narrowed_columns[c][i] is true when cached column i in chunk c has a
+  /// narrower carrier than its pin-time logical type. An empty matrix is the
+  /// backward-compatible all-native representation; insertion canonicalizes
+  /// production entries to a complete matrix.
+  std::vector<std::vector<bool>> narrowed_columns;
   /// Tier the pinned data resides in. Drives which storage member above is used
   /// and which cached_split_provider variant @ref create_provider_for builds.
   cucascade::memory::Tier tier{cucascade::memory::Tier::GPU};
@@ -359,7 +365,8 @@ class sirius_scan_manager {
     std::vector<std::unique_ptr<cudf::table>> data_tables,
     std::vector<cucascade::memory::memory_space*> chunk_memory_spaces,
     duckdb::vector<duckdb::LogicalType> column_types                                 = {},
-    std::vector<std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>>> chunk_stats = {});
+    std::vector<std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>>> chunk_stats = {},
+    std::vector<std::vector<bool>> narrowed_columns                                  = {});
 
   /// \brief Pin the host-tier entry for a table.
   ///
@@ -389,7 +396,8 @@ class sirius_scan_manager {
     std::vector<std::shared_ptr<cucascade::host_data_representation>> host_chunks,
     cucascade::memory::memory_space& memory_space,
     duckdb::vector<duckdb::LogicalType> column_types                                 = {},
-    std::vector<std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>>> chunk_stats = {});
+    std::vector<std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>>> chunk_stats = {},
+    std::vector<std::vector<bool>> narrowed_columns                                  = {});
 
   /// \brief Attach MVCC snapshot metadata to the pinned entry for @p name.
   ///

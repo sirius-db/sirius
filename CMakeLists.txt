@@ -206,6 +206,7 @@ endif()
 # cmake-format: off
 set(EXTENSION_SOURCES
     src/config.cpp
+    src/helper/numeric_narrowing.cpp
     src/helper/type_conversions.cpp
     src/debug_utils.cpp
     src/creator/task_creator.cpp
@@ -230,6 +231,7 @@ set(EXTENSION_SOURCES
     src/expression_evaluator/specializations/conjunction.cpp
     src/expression_evaluator/specializations/constant.cpp
     src/expression_evaluator/specializations/function.cpp
+    src/expression_evaluator/specializations/narrow_domain.cpp
     src/expression_evaluator/specializations/operator.cpp
     src/expression_evaluator/specializations/reference.cpp
     # Execution primitives (slot-based backpressure / completion tracking)
@@ -595,6 +597,7 @@ set(TEST_SOURCES
     test/cpp/expression_evaluator/test_nonduckdb_frontend_proof.cpp
     test/cpp/helper/test_cudf_utils.cpp
     test/cpp/helper/test_logical_type.cpp
+    test/cpp/helper/test_numeric_narrowing.cpp
     test/cpp/helper/test_transaction_utils.cpp
     test/cpp/integration/test_gpu_execution_array.cpp
     test/cpp/integration/test_gpu_execution_dynamic_filter_native.cpp

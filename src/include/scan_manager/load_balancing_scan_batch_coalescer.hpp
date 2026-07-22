@@ -42,6 +42,9 @@ struct databatch_provider {
   struct batch {
     std::shared_ptr<cucascade::data_batch> data;
     mvcc_chunk_mask mvcc_keep_mask;  ///< default = all rows visible
+    /// True when at least one selected column in this cached chunk uses a
+    /// carrier narrower than its logical type.
+    bool contains_narrowed_columns{false};
   };
 
   virtual ~databatch_provider()  = default;

@@ -22,8 +22,12 @@
 #include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_partition.hpp"
 
+#include <cudf/types.hpp>
+
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
 #include <duckdb/planner/operator/logical_comparison_join.hpp>
+
+#include <limits>
 
 using namespace sirius::op;
 
@@ -185,7 +189,7 @@ TEST_CASE("partition no_history_peak_memory_estimate: many partitions returns by
   REQUIRE(part.no_history_peak_memory_estimate({5, 4096}) == 8192);
 }
 
-TEST_CASE("GPU scan adds filter-only decode bytes to its no-history estimate",
+TEST_CASE("GPU scan preserves fresh-read expansion and filter-only accounting",
           "[no_history_peak_memory_estimate][gpu_scan]")
 {
   scan::sirius_gpu_scan_operator scan{/*types=*/{}, /*estimated_cardinality=*/0, /*ingestible=*/{}};
@@ -196,10 +200,57 @@ TEST_CASE("GPU scan adds filter-only decode bytes to its no-history estimate",
         1400);
   CHECK(scan.no_history_peak_memory_estimate({1, 0, operator_data_type::GPU_SCAN, false, 600}) ==
         600);
-  // Resident chunks skip the 8x fresh-read heuristic but still cover their
-  // mask/filter copy peak, which flows in through the working-set estimate.
-  CHECK(scan.no_history_peak_memory_estimate({1, 100, operator_data_type::GPU_SCAN, true, 700}) ==
-        700);
-  CHECK(scan.no_history_peak_memory_estimate({1, 800, operator_data_type::GPU_SCAN, true, 700}) ==
-        800);
+}
+
+TEST_CASE("GPU scan resident estimate follows actual carrier conversion",
+          "[no_history_peak_memory_estimate][gpu_scan]")
+{
+  scan::sirius_gpu_scan_operator native_scan{
+    /*types=*/{}, /*estimated_cardinality=*/0, /*ingestible=*/{}};
+
+  // Five-field aggregate initialization remains source-compatible: the fifth
+  // value is working_set_bytes and the trailing narrowing marker defaults off.
+  input_stats legacy_native{1, 100, operator_data_type::GPU_SCAN, true, 700};
+  CHECK(legacy_native.working_set_bytes == 700);
+  CHECK_FALSE(legacy_native.contains_narrowed_columns);
+  CHECK(native_scan.no_history_peak_memory_estimate(legacy_native) == 700);
+  CHECK(native_scan.no_history_peak_memory_estimate(
+          {1, 800, operator_data_type::GPU_SCAN, true, 700}) == 800);
+
+  // Pin-on/query-off has no plan sidecar, but the cache marker still requires
+  // native restoration: resident working set + maximum-width destination.
+  CHECK(native_scan.no_history_peak_memory_estimate(
+          {1, 100, operator_data_type::GPU_SCAN, true, 100, true}) == 900);
+  CHECK(native_scan.no_history_peak_memory_estimate(
+          {1, 100, operator_data_type::GPU_SCAN, true, 700, true}) == 1500);
+
+  scan::sirius_gpu_scan_operator sidecar_scan{
+    sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::BIGINT}),
+    /*estimated_cardinality=*/0,
+    /*ingestible=*/{}};
+  sidecar_scan.set_physical_types({cudf::data_type{cudf::type_id::INT8}});
+
+  // A native cached carrier must be narrowed to the explicit plan sidecar even
+  // when the cache marker is false. Fresh reads retain the legacy estimate too.
+  CHECK(sidecar_scan.no_history_peak_memory_estimate(
+          {1, 100, operator_data_type::GPU_SCAN, true, 100}) == 900);
+  CHECK(sidecar_scan.no_history_peak_memory_estimate(
+          {1, 100, operator_data_type::GPU_SCAN, false, 700}) == 1400);
+}
+
+TEST_CASE("GPU scan no-history estimates saturate instead of wrapping",
+          "[no_history_peak_memory_estimate][gpu_scan]")
+{
+  scan::sirius_gpu_scan_operator scan{/*types=*/{}, /*estimated_cardinality=*/0, /*ingestible=*/{}};
+  auto const max                     = std::numeric_limits<std::size_t>::max();
+  auto const multiplication_overflow = max / 8 + 1;
+
+  CHECK(
+    scan.no_history_peak_memory_estimate(
+      {1, multiplication_overflow, operator_data_type::GPU_SCAN, false, multiplication_overflow}) ==
+    max);
+  CHECK(scan.no_history_peak_memory_estimate(
+          {1, multiplication_overflow, operator_data_type::GPU_SCAN, true, 1, true}) == max);
+  CHECK(scan.no_history_peak_memory_estimate(
+          {1, 1, operator_data_type::GPU_SCAN, true, max, true}) == max);
 }

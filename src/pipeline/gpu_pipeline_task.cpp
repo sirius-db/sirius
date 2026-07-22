@@ -49,6 +49,7 @@ void validate_operator_output_types(const op::operator_data* data,
   auto* pipelineable_data = dynamic_cast<const op::pipelineable_operator_data*>(data);
   if (pipelineable_data == nullptr) { return; }
   const auto& expected_types = op.get_types();
+  const auto& physical_types = op.get_physical_types();
   const auto& batches        = pipelineable_data->get_data_batches();
   for (size_t batch_index = 0; batch_index < batches.size(); batch_index++) {
     const auto& batch = batches[batch_index];
@@ -68,7 +69,9 @@ void validate_operator_output_types(const op::operator_data* data,
       return;
     }
     for (cudf::size_type c = 0; c < tbl.num_columns(); c++) {
-      cudf::data_type expected_cudf = sirius::get_cudf_type(expected_types[c]);
+      cudf::data_type expected_cudf = physical_types.empty()
+                                        ? sirius::get_cudf_type(expected_types[c])
+                                        : physical_types[static_cast<std::size_t>(c)];
       cudf::data_type actual        = tbl.column(c).type();
       if (actual != expected_cudf) {
         SIRIUS_LOG_WARN(
@@ -555,7 +558,12 @@ pipeline::reservation_size_info gpu_pipeline_task::get_estimated_reservation_siz
   const auto input_type =
     ls._input_data ? ls._input_data->get_type() : op::operator_data_type::BASE;
   const bool input_resident = ls._input_data && ls._input_data->is_resident();
-  auto working_set_bytes    = input_basis;
+  auto const* scan_input =
+    ls._input_data ? dynamic_cast<const op::scan::scan_operator_input*>(ls._input_data.get())
+                   : nullptr;
+  const bool input_contains_narrowed_columns =
+    scan_input != nullptr && scan_input->contains_narrowed_columns;
+  auto working_set_bytes = input_basis;
   // Resident (cached) scan inputs report mask/filter copy peaks through their
   // working-set estimate too — it seeds the cold-start guess below via
   // input_stats, so do not gate this on residency.
@@ -582,8 +590,12 @@ pipeline::reservation_size_info gpu_pipeline_task::get_estimated_reservation_siz
     if (auto* pd = dynamic_cast<const op::pipelineable_operator_data*>(ls._input_data.get())) {
       num_batches = pd->get_data_batches().size();
     }
-    const op::input_stats stats{
-      num_batches, input_basis, input_type, input_resident, working_set_bytes};
+    const op::input_stats stats{num_batches,
+                                input_basis,
+                                input_type,
+                                input_resident,
+                                working_set_bytes,
+                                input_contains_narrowed_columns};
 
     std::size_t max_estimate = 0;
     if (auto* pipeline = gs.get_pipeline()) {

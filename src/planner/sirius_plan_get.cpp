@@ -14,7 +14,9 @@
  * limitations under the License.
  */
 
+#include "cudf/cudf_utils.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
+#include "duckdb/common/hugeint.hpp"
 #include "duckdb/function/table/table_scan.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
@@ -24,12 +26,14 @@
 #include "duckdb/storage/data_table.hpp"
 #include "duckdb/storage/segment/uncompressed.hpp"
 #include "duckdb/storage/statistics/base_statistics.hpp"
+#include "duckdb/storage/statistics/numeric_stats.hpp"
 #include "duckdb/storage/statistics/string_stats.hpp"
 #include "duckdb/storage/storage_manager.hpp"
 #include "duckdb/transaction/duck_transaction.hpp"
 #include "duckdb/transaction/local_storage.hpp"
 #include "expression/ast/from_duckdb.hpp"
 #include "expression/ast/node.hpp"
+#include "helper/numeric_narrowing.hpp"
 #include "helper/type_conversions.hpp"
 #include "log/logging.hpp"
 #include "op/scan/duckdb_mvcc_visibility.hpp"
@@ -41,6 +45,7 @@
 #include "sirius_context.hpp"
 
 #include <memory>
+#include <optional>
 #include <unordered_set>
 
 namespace sirius::planner {
@@ -60,6 +65,123 @@ duckdb::vector<std::unique_ptr<sirius::ast::node>> translate_expressions(
     out.push_back(e ? sirius::ast::from_duckdb(*e) : nullptr);
   }
   return out;
+}
+
+__int128_t to_int128(duckdb::hugeint_t value)
+{
+  constexpr auto two_to_64 = static_cast<__int128_t>(1) << 64;
+  return static_cast<__int128_t>(value.upper) * two_to_64 + value.lower;
+}
+
+std::optional<cudf::data_type> try_native_physical_type(const sirius::logical_type& logical)
+{
+  try {
+    return sirius::get_cudf_type(logical);
+  } catch (duckdb::InvalidInputException const&) {
+    return std::nullopt;
+  }
+}
+
+std::optional<sirius::numeric_range> range_from_statistics(const sirius::logical_type& type,
+                                                           const duckdb::BaseStatistics& stats)
+{
+  if (stats.GetStatsType() != duckdb::StatisticsType::NUMERIC_STATS ||
+      sirius::from_duckdb(stats.GetType()) != type || !duckdb::NumericStats::HasMinMax(stats)) {
+    return std::nullopt;
+  }
+
+  auto const minimum = duckdb::NumericStats::Min(stats);
+  auto const maximum = duckdb::NumericStats::Max(stats);
+  switch (type.id()) {
+    case sirius::type_id::SMALLINT:
+      return sirius::signed_integer_range(minimum.GetValueUnsafe<int16_t>(),
+                                          maximum.GetValueUnsafe<int16_t>());
+    case sirius::type_id::INTEGER:
+      return sirius::signed_integer_range(minimum.GetValueUnsafe<int32_t>(),
+                                          maximum.GetValueUnsafe<int32_t>());
+    case sirius::type_id::BIGINT:
+      return sirius::signed_integer_range(minimum.GetValueUnsafe<int64_t>(),
+                                          maximum.GetValueUnsafe<int64_t>());
+    case sirius::type_id::USMALLINT:
+      return sirius::unsigned_integer_range(minimum.GetValueUnsafe<uint16_t>(),
+                                            maximum.GetValueUnsafe<uint16_t>());
+    case sirius::type_id::UINTEGER:
+      return sirius::unsigned_integer_range(minimum.GetValueUnsafe<uint32_t>(),
+                                            maximum.GetValueUnsafe<uint32_t>());
+    case sirius::type_id::UBIGINT:
+      return sirius::unsigned_integer_range(minimum.GetValueUnsafe<uint64_t>(),
+                                            maximum.GetValueUnsafe<uint64_t>());
+    case sirius::type_id::DECIMAL: {
+      auto const precision = type.decimal_precision();
+      if (precision <= sirius::logical_type::decimal_max_precision_int64) {
+        return sirius::decimal_range(minimum.GetValueUnsafe<int64_t>(),
+                                     maximum.GetValueUnsafe<int64_t>(),
+                                     type.decimal_scale());
+      }
+      return sirius::decimal_range(to_int128(minimum.GetValueUnsafe<duckdb::hugeint_t>()),
+                                   to_int128(maximum.GetValueUnsafe<duckdb::hugeint_t>()),
+                                   type.decimal_scale());
+    }
+    default: return std::nullopt;
+  }
+}
+
+std::unique_ptr<duckdb::BaseStatistics> get_column_statistics(duckdb::LogicalGet& op,
+                                                              duckdb::ClientContext& context,
+                                                              const duckdb::ColumnIndex& column)
+{
+  if (!column.HasPrimaryIndex() || column.IsRowIdColumn() || column.IsVirtualColumn() ||
+      column.IsEmptyColumn()) {
+    return nullptr;
+  }
+  if (op.function.statistics_extended) {
+    duckdb::TableFunctionGetStatisticsInput input(op.bind_data.get(), column);
+    return op.function.statistics_extended(context, input);
+  }
+  if (op.function.statistics) {
+    return op.function.statistics(context, op.bind_data.get(), column.GetPrimaryIndex());
+  }
+  return nullptr;
+}
+
+std::vector<cudf::data_type> scan_physical_schema(duckdb::LogicalGet& op,
+                                                  duckdb::ClientContext& context,
+                                                  const duckdb::vector<duckdb::ColumnIndex>& ids)
+{
+  auto state = context.registered_state
+                 ? context.registered_state->Get<duckdb::SiriusContext>("sirius_state")
+                 : nullptr;
+  if (!state || !state->get_config().get_operator_params().enable_compressed_materialization) {
+    return {};
+  }
+
+  std::vector<cudf::data_type> result;
+  result.reserve(op.types.size());
+  bool changed = false;
+  for (std::size_t output_idx = 0; output_idx < op.types.size(); output_idx++) {
+    auto logical = sirius::from_duckdb(op.types[output_idx]);
+    auto native  = try_native_physical_type(logical);
+    if (!native) { return {}; }
+    result.push_back(*native);
+    if (!sirius::is_narrowable_numeric_type(logical)) { continue; }
+
+    std::size_t ids_position = output_idx;
+    if (!op.projection_ids.empty()) {
+      if (output_idx >= op.projection_ids.size()) { continue; }
+      ids_position = op.projection_ids[output_idx];
+    }
+    if (ids_position >= ids.size()) { continue; }
+
+    auto stats = get_column_statistics(op, context, ids[ids_position]);
+    if (!stats) { continue; }
+    auto range = range_from_statistics(logical, *stats);
+    if (!range) { continue; }
+    auto target = sirius::choose_narrow_physical_type(logical, *range);
+    if (!target) { continue; }
+    result.back() = *target;
+    changed       = true;
+  }
+  return changed ? result : std::vector<cudf::data_type>{};
 }
 
 }  // namespace
@@ -99,6 +221,8 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
     throw duckdb::NotImplementedException("Table function '{}' is not supported in Sirius",
                                           op.function.name);
   }
+
+  auto physical_types = scan_physical_schema(op, context, column_ids);
 
   if (!op.children.empty()) {
     throw duckdb::NotImplementedException("Table Input Output functions are not supported yet");
@@ -478,6 +602,9 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
     std::move(op.extra_info),
     std::move(op.parameters),
     std::move(op.virtual_columns));
+  if (physical_types.size() == node->types.size()) {
+    node->set_physical_types(std::move(physical_types));
+  }
   node->named_parameters = std::move(op.named_parameters);
   node->dynamic_filters  = op.dynamic_filters;
   if (op.dynamic_filters) {

@@ -24,6 +24,8 @@
 #include "sirius/exception.hpp"
 #include "telemetry-bridge/gen/uuid.rs.h"
 
+#include <cudf/types.hpp>
+
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/data/data_repository.hpp>
 
@@ -365,6 +367,8 @@ struct input_stats {
   /// Transient working set needed to materialize the input. Defaults to zero
   /// for callers that only provide the historical byte basis.
   std::size_t working_set_bytes = 0;
+  /// Whether a resident scan input has a selected physically narrow column.
+  bool contains_narrowed_columns = false;
 };
 
 //! sirius_physical_operator is the base class of the physical operators present in the
@@ -396,6 +400,11 @@ class sirius_physical_operator {
   duckdb::vector<duckdb::unique_ptr<sirius_physical_operator>> children;
   //! The types returned by this physical operator
   duckdb::vector<sirius::logical_type> types;
+  //! Optional physical cuDF carrier schema for this operator's output. SQL semantics always use
+  //! `types`; an empty vector means every column uses its native carrier. This sidecar lets scan
+  //! materialization keep bounded integer and fixed-point DECIMAL values narrow without lying
+  //! about their logical type.
+  std::vector<cudf::data_type> physical_types;
   //! The estimated cardinality of this physical operator
   std::size_t estimated_cardinality;
   //! The unique ID of this operator (auto-incremented at creation)
@@ -417,6 +426,25 @@ class sirius_physical_operator {
 
   //! Return a vector of the types that will be returned by this operator
   const duckdb::vector<sirius::logical_type>& get_types() const { return types; }
+
+  //! Return the optional physical output schema. Empty means the native schema derived from
+  //! get_types().
+  [[nodiscard]] const std::vector<cudf::data_type>& get_physical_types() const noexcept
+  {
+    return physical_types;
+  }
+
+  [[nodiscard]] bool has_physical_overrides() const noexcept { return !physical_types.empty(); }
+
+  //! Install a complete physical output schema. Callers must supply one entry per logical column;
+  //! keeping this invariant local prevents a partial sidecar from silently shifting columns.
+  void set_physical_types(std::vector<cudf::data_type> schema)
+  {
+    if (!schema.empty() && schema.size() != types.size()) {
+      throw std::invalid_argument("physical schema width does not match logical schema width");
+    }
+    physical_types = std::move(schema);
+  }
 
   //! Get the unique operator ID
   size_t get_operator_id() const { return operator_id; }

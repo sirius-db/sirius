@@ -66,6 +66,51 @@ namespace sirius::scan_manager {
 
 namespace {
 
+using narrowing_matrix = std::vector<std::vector<bool>>;
+
+void validate_narrowing_matrix_shape(narrowing_matrix const& matrix,
+                                     std::size_t expected_chunks,
+                                     std::size_t expected_columns,
+                                     std::string_view context)
+{
+  // Empty is the compatibility representation for an all-native entry.
+  if (matrix.empty()) { return; }
+  if (matrix.size() != expected_chunks) {
+    throw std::invalid_argument(std::string{context} + ": narrowed_columns has " +
+                                std::to_string(matrix.size()) + " chunks; expected " +
+                                std::to_string(expected_chunks));
+  }
+  for (std::size_t chunk_idx = 0; chunk_idx < matrix.size(); ++chunk_idx) {
+    if (matrix[chunk_idx].size() != expected_columns) {
+      throw std::invalid_argument(std::string{context} + ": narrowed_columns[" +
+                                  std::to_string(chunk_idx) + "] has " +
+                                  std::to_string(matrix[chunk_idx].size()) + " columns; expected " +
+                                  std::to_string(expected_columns));
+    }
+  }
+}
+
+void canonicalize_narrowing_matrix(narrowing_matrix& matrix,
+                                   std::size_t expected_chunks,
+                                   std::size_t expected_columns,
+                                   std::string_view context)
+{
+  validate_narrowing_matrix_shape(matrix, expected_chunks, expected_columns, context);
+  if (matrix.empty() && expected_chunks != 0) {
+    matrix.assign(expected_chunks, std::vector<bool>(expected_columns, false));
+  }
+}
+
+bool selected_columns_contain_narrowing(narrowing_matrix const& matrix,
+                                        std::size_t chunk_index,
+                                        std::span<std::size_t const> selected_columns)
+{
+  if (matrix.empty()) { return false; }
+  auto const& chunk = matrix.at(chunk_index);
+  return std::ranges::any_of(selected_columns,
+                             [&chunk](std::size_t column) { return chunk.at(column); });
+}
+
 struct cached_databatch_provider : public databatch_provider {
   cached_databatch_provider(pinned_entry const& entry,
                             std::span<std::size_t const> selected_columns,
@@ -98,7 +143,9 @@ struct cached_databatch_provider : public databatch_provider {
     }
     if (!data) { return {}; }
     auto mask = index < _mvcc_masks.size() ? _mvcc_masks[index] : mvcc_chunk_mask{};
-    return {std::move(data), std::move(mask)};
+    auto const contains_narrowed_columns =
+      selected_columns_contain_narrowing(_entry.narrowed_columns, index, _column_indices);
+    return {std::move(data), std::move(mask), contains_narrowed_columns};
   }
 
  private:
@@ -699,7 +746,8 @@ void sirius_scan_manager::insert_pinned_entry(
   std::vector<std::unique_ptr<cudf::table>> data_tables,
   std::vector<cucascade::memory::memory_space*> chunk_memory_spaces,
   duckdb::vector<duckdb::LogicalType> column_types,
-  std::vector<std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>>> chunk_stats)
+  std::vector<std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>>> chunk_stats,
+  std::vector<std::vector<bool>> narrowed_columns)
 {
   // chunk_memory_spaces is parallel to data_tables — the caller
   // (PinTableFunction) emits one memory_space* per
@@ -735,6 +783,11 @@ void sirius_scan_manager::insert_pinned_entry(
       std::to_string(column_names.size()) + ")");
   }
 
+  canonicalize_narrowing_matrix(narrowed_columns,
+                                data_tables.size(),
+                                column_names.size(),
+                                "[sirius_scan_manager::insert_pinned_entry]");
+
   // Normalize the optional zone-map capture.
   bool const stats_supplied = !column_types.empty() && !chunk_stats.empty();
   auto pin_zone_maps        = pinned_zone_maps::from_capture(std::move(column_types),
@@ -763,6 +816,11 @@ void sirius_scan_manager::insert_pinned_entry(
       // identical chunk_memory_spaces vectors. Reject any mismatch loudly
       // rather than silently aliasing.
       auto& entry = existing_it->second;
+      canonicalize_narrowing_matrix(entry.narrowed_columns,
+                                    entry.chunk_memory_spaces.size(),
+                                    entry.cache_info.column_ids.size(),
+                                    "[sirius_scan_manager::insert_pinned_entry existing entry]");
+
       if (entry.chunk_memory_spaces.size() != chunk_memory_spaces.size()) {
         throw std::runtime_error(
           "[sirius_scan_manager::insert_pinned_entry] merge mismatch — "
@@ -845,6 +903,9 @@ void sirius_scan_manager::insert_pinned_entry(
       for (std::size_t i = 0; i < is_new_col.size(); ++i) {
         if (!is_new_col[i]) { continue; }
         if (!entry.data_batches_by_column.contains(column_names[i])) { continue; }
+        for (std::size_t chunk_idx = 0; chunk_idx < entry.narrowed_columns.size(); ++chunk_idx) {
+          entry.narrowed_columns[chunk_idx].push_back(narrowed_columns[chunk_idx][i]);
+        }
         entry.cache_info.column_ids.push_back(cache_info.column_ids[i]);
         entry.cache_info.names.push_back(column_names[i]);
         entry.zone_maps.append_column_from(pin_zone_maps, i);
@@ -888,6 +949,7 @@ void sirius_scan_manager::insert_pinned_entry(
   entry.cache_info          = std::move(cache_info);
   entry.chunk_memory_spaces = std::move(chunk_memory_spaces);
   entry.tier                = cucascade::memory::Tier::GPU;
+  entry.narrowed_columns    = std::move(narrowed_columns);
   entry.num_rows            = new_num_rows;
   entry.zone_maps           = std::move(pin_zone_maps);
 
@@ -913,7 +975,8 @@ void sirius_scan_manager::insert_pinned_entry_host(
   std::vector<std::shared_ptr<cucascade::host_data_representation>> host_chunks,
   cucascade::memory::memory_space& memory_space,
   duckdb::vector<duckdb::LogicalType> column_types,
-  std::vector<std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>>> chunk_stats)
+  std::vector<std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>>> chunk_stats,
+  std::vector<std::vector<bool>> narrowed_columns)
 {
   // The host-tier path captures one chunk per emitted batch; each chunk holds every
   // pinned column. Re-insert always replaces — there is no per-column merge analog
@@ -927,6 +990,22 @@ void sirius_scan_manager::insert_pinned_entry_host(
     }
   }
 
+  auto const column_count = cache_info.column_names().size();
+  if (cache_info.column_ids.size() != column_count) {
+    throw std::invalid_argument(
+      "[sirius_scan_manager::insert_pinned_entry_host] cache_info column shape mismatch");
+  }
+  canonicalize_narrowing_matrix(narrowed_columns,
+                                host_chunks.size(),
+                                column_count,
+                                "[sirius_scan_manager::insert_pinned_entry_host]");
+  for (auto const& chunk : host_chunks) {
+    if (chunk && chunk->get_host_table() &&
+        chunk->get_host_table()->columns.size() != column_count) {
+      throw std::invalid_argument(
+        "[sirius_scan_manager::insert_pinned_entry_host] host chunk column shape mismatch");
+    }
+  }
   // Normalize the optional zone-map capture
   bool const stats_supplied = !column_types.empty() && !chunk_stats.empty();
   auto pin_zone_maps        = pinned_zone_maps::from_capture(std::move(column_types),
@@ -943,12 +1022,13 @@ void sirius_scan_manager::insert_pinned_entry_host(
   }
 
   pinned_entry entry;
-  entry.cache_info   = std::move(cache_info);
-  entry.tier         = cucascade::memory::Tier::HOST;
-  entry.memory_space = &memory_space;
-  entry.num_rows     = new_num_rows;
-  entry.host_chunks  = std::move(host_chunks);
-  entry.zone_maps    = std::move(pin_zone_maps);
+  entry.cache_info       = std::move(cache_info);
+  entry.tier             = cucascade::memory::Tier::HOST;
+  entry.memory_space     = &memory_space;
+  entry.num_rows         = new_num_rows;
+  entry.host_chunks      = std::move(host_chunks);
+  entry.narrowed_columns = std::move(narrowed_columns);
+  entry.zone_maps        = std::move(pin_zone_maps);
 
   _pinned_entries[name] = std::move(entry);
 }
@@ -993,8 +1073,14 @@ void validate_pinned_entry_for_serving(pinned_entry const& entry,
   auto const& entry_column_names = entry.cache_info.column_names();
 
   if (entry.tier == cucascade::memory::Tier::GPU) {
-    if (entry.data_batches_by_column.empty()) { return; }  // legitimate zero-chunk entry
+    if (entry.data_batches_by_column.empty()) {
+      validate_narrowing_matrix_shape(
+        entry.narrowed_columns, 0, entry_column_names.size(), "pinned GPU entry");
+      return;  // legitimate zero-chunk entry
+    }
     auto const n_chunks = entry.data_batches_by_column.begin()->second.size();
+    validate_narrowing_matrix_shape(
+      entry.narrowed_columns, n_chunks, entry_column_names.size(), "pinned GPU entry");
     if (entry.chunk_memory_spaces.size() != n_chunks) {
       throw std::runtime_error(
         "pinned entry's chunk_memory_spaces does not cover every chunk of the entry");
@@ -1018,6 +1104,10 @@ void validate_pinned_entry_for_serving(pinned_entry const& entry,
 
   if (entry.tier == cucascade::memory::Tier::HOST) {
     for (auto const& chunk : entry.host_chunks) {
+      validate_narrowing_matrix_shape(entry.narrowed_columns,
+                                      entry.host_chunks.size(),
+                                      entry_column_names.size(),
+                                      "pinned HOST entry");
       if (!chunk) { throw std::runtime_error("pinned entry has a null host chunk"); }
     }
     return;

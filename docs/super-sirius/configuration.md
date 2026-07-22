@@ -342,6 +342,7 @@ Four optional nested sub-configs tune the individual backends and caches:
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `scan_task_batch_size` | 512 MB | Target batch size for DuckDB scan tasks |
+| `enable_compressed_materialization` | false | Use statistics-guided, runtime-verified narrower integer and fixed-point DECIMAL carriers for eligible scan outputs and pinned chunks; restore the declared SQL carrier at semantic boundaries. |
 | `max_sort_partition_bytes` | 0 (auto) | Max bytes per sort partition. Auto = 33% of GPU memory. |
 | `hash_partition_bytes` | 512 MB | Target partition size for hash joins and group-bys |
 | `concat_batch_bytes` | 512 MB | Target output batch size for CONCAT operator |
@@ -509,6 +510,18 @@ These can also be set at load via the `SIRIUS_LOG_BACKEND`, `SIRIUS_LOG_DIR`, an
 | `opt_table_scan_num_streams` | - | Number of CUDA streams for optimized scan |
 | `opt_table_scan_memcpy_size` | - | Memcpy size for optimized scan |
 | `scan_task_batch_size` | 512 MB | Target scan batch size |
+| `enable_compressed_materialization` | false | Keep eligible integer and fixed-point DECIMAL values in narrower physical carriers until a native semantic boundary. |
+
+`enable_compressed_materialization` is also accepted in YAML under `sirius.operator_params`.
+Plan-time source statistics nominate scan carriers, exact runtime bounds guard narrowing casts, and
+`pin_table` selects carriers independently for each materialized chunk. Changing the setting does
+not rewrite an existing pinned entry; cached scans normalize its actual stored carriers for the
+current query. See [Compressed Materialization](compressed-materialization.md) for eligibility,
+restoration, and cache-reservation behavior.
+
+```sql
+SET enable_compressed_materialization = true;
+```
 
 ### Pipeline / Operator
 

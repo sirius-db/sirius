@@ -19,16 +19,21 @@
 
 #include <data/data_batch_utils.hpp>
 #include <data/sirius_converter_registry.hpp>
+#include <helper/numeric_narrowing.hpp>
 #include <log/logging.hpp>
 #include <op/scan/gpu_ingestible.hpp>
 #include <op/scan/sirius_gpu_scan_operator.hpp>
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
 #include <op/sirius_physical_operator.hpp>
 #include <scan_manager/split_connector.hpp>
+#include <sirius/exception.hpp>
+#include <sirius_context.hpp>
 
 // cudf
+#include <cudf/cudf_utils.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
+#include <cudf/unary.hpp>
 #include <cudf/utilities/memory_resource.hpp>
 
 // cucascade
@@ -36,24 +41,125 @@
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/memory/memory_space.hpp>
 
+// duckdb
+#include <duckdb/common/exception.hpp>
+
 // standard library
 #include <algorithm>
+#include <limits>
 #include <memory>
+#include <optional>
 #include <utility>
 #include <vector>
 
 namespace sirius::op::scan {
+namespace {
+constexpr std::size_t kMaxNumericCarrierExpansion = 8;
+
+constexpr std::size_t saturating_add(std::size_t lhs, std::size_t rhs) noexcept
+{
+  auto const max = std::numeric_limits<std::size_t>::max();
+  return rhs > max - lhs ? max : lhs + rhs;
+}
+
+constexpr std::size_t saturating_mul(std::size_t value, std::size_t factor) noexcept
+{
+  auto const max = std::numeric_limits<std::size_t>::max();
+  if (value == 0 || factor == 0) { return 0; }
+  return value > max / factor ? max : value * factor;
+}
+
+std::unique_ptr<cudf::table> normalize_physical_schema(std::unique_ptr<cudf::table> table,
+                                                       const std::vector<cudf::data_type>& targets,
+                                                       bool has_explicit_physical_schema,
+                                                       duckdb::SiriusContext* observer,
+                                                       rmm::cuda_stream_view stream,
+                                                       rmm::device_async_resource_ref mr)
+{
+  if (targets.empty()) { return table; }
+
+  auto const actual_width = static_cast<std::size_t>(table->num_columns());
+  if (actual_width != targets.size()) {
+    if (!has_explicit_physical_schema) { return table; }
+    throw internal_exception(
+      "[sirius_gpu_scan_operator] compressed schema width mismatch: materialized {} columns, "
+      "planned {}",
+      actual_width,
+      targets.size());
+  }
+
+  // Preflight the entire batch while every source column remains owned. Resident batches without a
+  // sidecar may only restore a narrow cache carrier to its native width. An explicit sidecar may
+  // additionally narrow a freshly decoded/native carrier, but only after exact materialized bounds
+  // confirm the statistics-derived target.
+  auto const table_view = table->view();
+  for (std::size_t column_idx = 0; column_idx < targets.size(); column_idx++) {
+    auto const column = table_view.column(column_idx);
+    auto const actual = column.type();
+    auto const target = targets[column_idx];
+    if (actual == target || can_restore_to(actual, target)) { continue; }
+
+    if (!has_explicit_physical_schema) { continue; }
+    if (!can_narrow_to(actual, target)) {
+      throw internal_exception(
+        "[sirius_gpu_scan_operator] invalid compressed carrier for column {}: materialized {}, "
+        "planned {}",
+        column_idx,
+        cudf::type_to_name(actual),
+        cudf::type_to_name(target));
+    }
+
+    bool const has_values = column.size() != 0 && column.null_count() != column.size();
+    auto const exact = has_values ? compute_exact_numeric_range(column, stream, mr) : std::nullopt;
+    if (has_values && (!exact || !numeric_range_fits(target, *exact))) {
+      throw internal_exception(
+        "[sirius_gpu_scan_operator] compressed-materialization metadata invariant violated for "
+        "column {}: exact values from {} do not fit planned {}",
+        column_idx,
+        cudf::type_to_name(actual),
+        cudf::type_to_name(target));
+    }
+  }
+
+  auto columns = table->release();
+  for (std::size_t column_idx = 0; column_idx < columns.size(); column_idx++) {
+    auto const target    = targets[column_idx];
+    auto const actual    = columns[column_idx]->type();
+    auto const restoring = can_restore_to(actual, target);
+    auto const narrowing = has_explicit_physical_schema && can_narrow_to(actual, target);
+    if (actual == target || (!restoring && !narrowing)) { continue; }
+    columns[column_idx] = cudf::cast(columns[column_idx]->view(), target, stream, mr);
+    if (observer != nullptr) {
+      if (narrowing) {
+        observer->record_compressed_materialization_scan_columns_narrowed();
+      } else {
+        observer->record_compressed_materialization_scan_columns_restored();
+      }
+    }
+    SIRIUS_LOG_DEBUG("[compressed_materialization] scan column {} {}: {} -> {}",
+                     column_idx,
+                     narrowing ? "narrowed" : "restored",
+                     cudf::type_to_name(actual),
+                     cudf::type_to_name(target));
+  }
+  return std::make_unique<cudf::table>(std::move(columns));
+}
+
+}  // namespace
 
 //===----------------------------------------------------------------------===//
 // sirius_gpu_scan_operator
 //===----------------------------------------------------------------------===//
-sirius_gpu_scan_operator::sirius_gpu_scan_operator(duckdb::vector<sirius::logical_type> types,
-                                                   duckdb::idx_t estimated_cardinality,
-                                                   std::shared_ptr<gpu_ingestible> ingestible)
+sirius_gpu_scan_operator::sirius_gpu_scan_operator(
+  duckdb::vector<sirius::logical_type> types,
+  duckdb::idx_t estimated_cardinality,
+  std::shared_ptr<gpu_ingestible> ingestible,
+  duckdb::SiriusContext* compressed_materialization_observer)
   : sirius_physical_operator(
       SiriusPhysicalOperatorType::GPU_SCAN, std::move(types), estimated_cardinality),
     _ingestible(std::move(ingestible)),
-    _split_connector(std::make_shared<scan_manager::split_connector>())
+    _split_connector(std::make_shared<scan_manager::split_connector>()),
+    _compressed_materialization_observer(compressed_materialization_observer)
 {
 }
 
@@ -118,6 +224,29 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::execute(
     output_table = materialized_table.table.release(stream, mem_space->get_default_allocator());
   }
 
+  auto const has_explicit_physical_schema = has_physical_overrides();
+  if (has_explicit_physical_schema || scan_input->is_resident()) {
+    std::vector<cudf::data_type> target_types;
+    if (has_explicit_physical_schema) {
+      target_types = get_physical_types();
+    } else {
+      target_types.reserve(types.size());
+      try {
+        for (auto const& type : types) {
+          target_types.push_back(sirius::get_cudf_type(type));
+        }
+      } catch (duckdb::InvalidInputException const&) {
+        // Preserve legacy resident-scan pass-through when its logical schema has no cuDF mapping.
+        target_types.clear();
+      }
+    }
+    output_table = normalize_physical_schema(std::move(output_table),
+                                             target_types,
+                                             has_explicit_physical_schema,
+                                             _compressed_materialization_observer,
+                                             stream,
+                                             mem_space->get_default_allocator());
+  }
   auto batch =
     sirius::make_data_batch(std::move(output_table), *mem_space, stream, batch_telemetry());
   std::vector<std::shared_ptr<::cucascade::data_batch>> batches{std::move(batch)};
@@ -127,15 +256,24 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::execute(
 std::size_t sirius_gpu_scan_operator::no_history_peak_memory_estimate(
   const op::input_stats& stats) const
 {
-  // Match the legacy 8x fresh-read heuristic for projected data, then add any
-  // filter-only columns that must also be decoded. Keeping the latter additive
-  // avoids applying the expansion factor twice to the transient working set.
-  // Resident (cached) chunks surface their mask/filter copy peaks through the
-  // split's working-set estimate; a plain chunk reports it equal to bytes.
-  if (stats.resident) { return std::max(stats.bytes, stats.working_set_bytes); }
+  auto const expanded_bytes = saturating_mul(stats.bytes, kMaxNumericCarrierExpansion);
+  if (stats.resident) {
+    // A resident cached chunk may need a carrier conversion for either reason: its selected
+    // stored columns are physically narrow (including pin-on/query-off), or this scan has an
+    // explicit plan sidecar that narrows a native cached carrier. The destination coexists with
+    // the resident input/filter working set at peak.
+    if (stats.contains_narrowed_columns || has_physical_overrides()) {
+      return saturating_add(stats.working_set_bytes, expanded_bytes);
+    }
+    return std::max(stats.bytes, stats.working_set_bytes);
+  }
+
+  // Preserve the maximum-width fresh-read heuristic for projected data, then add filter-only
+  // columns without expanding the transient working set twice. Explicit physical sidecars retain
+  // this conservative estimate because native decoded columns coexist with their narrow result.
   auto const filter_only_bytes =
     stats.working_set_bytes > stats.bytes ? stats.working_set_bytes - stats.bytes : 0;
-  return stats.bytes * 8 + filter_only_bytes;
+  return saturating_add(expanded_bytes, filter_only_bytes);
 }
 
 }  // namespace sirius::op::scan

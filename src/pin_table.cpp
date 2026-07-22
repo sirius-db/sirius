@@ -17,6 +17,8 @@
 #include "pin_table.hpp"
 
 #include "data/sirius_converter_registry.hpp"
+#include "helper/numeric_narrowing.hpp"
+#include "helper/type_conversions.hpp"
 #include "io/io_context.hpp"
 #include "op/scan/duckdb_native_gpu_ingestible.hpp"
 #include "op/scan/gpu_ingestible.hpp"
@@ -24,6 +26,7 @@
 #include "scan_manager/round_robin_strategy.hpp"
 
 #include <cudf/table/table.hpp>
+#include <cudf/unary.hpp>
 
 #include <rmm/cuda_device.hpp>
 #include <rmm/cuda_stream_view.hpp>
@@ -141,7 +144,43 @@ using pin_batch_sink =
   std::function<void(std::unique_ptr<cudf::table>,
                      cucascade::memory::memory_space* target,
                      rmm::cuda_stream_view stream,
+                     std::vector<bool> narrowed_columns,
                      std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>> chunk_stats)>;
+
+struct narrowed_pin_chunk {
+  std::unique_ptr<cudf::table> table;
+  std::vector<bool> columns;
+};
+
+narrowed_pin_chunk narrow_pin_chunk(std::unique_ptr<cudf::table> table,
+                                    duckdb::vector<duckdb::LogicalType> const& column_types,
+                                    rmm::cuda_stream_view stream,
+                                    rmm::device_async_resource_ref mr)
+{
+  if (column_types.size() != static_cast<std::size_t>(table->num_columns())) {
+    throw std::invalid_argument(
+      "[pin_table] compressed materialization requires one logical type per cached column");
+  }
+
+  std::vector<bool> narrowed_columns(static_cast<std::size_t>(table->num_columns()), false);
+  auto columns = table->release();
+  for (std::size_t column_idx = 0; column_idx < columns.size(); ++column_idx) {
+    auto const logical = sirius::from_duckdb(column_types[column_idx]);
+    auto const range =
+      compute_exact_numeric_range(columns[column_idx]->view(), logical, stream, mr);
+    if (!range) { continue; }
+    auto const target = choose_narrow_physical_type(logical, *range);
+    if (!target || columns[column_idx]->type() == *target) { continue; }
+    auto const actual            = columns[column_idx]->type();
+    columns[column_idx]          = cudf::cast(columns[column_idx]->view(), *target, stream, mr);
+    narrowed_columns[column_idx] = true;
+    SIRIUS_LOG_DEBUG("[compressed_materialization] pin column {} narrowed: {} -> {}",
+                     column_idx,
+                     cudf::type_to_name(actual),
+                     cudf::type_to_name(*target));
+  }
+  return {std::make_unique<cudf::table>(std::move(columns)), std::move(narrowed_columns)};
+}
 
 /// Shared driver behind @ref materialize_all_batches and @ref materialize_pin_to_host: walk the
 /// ingestible's metadata + batch coalescer to completion, materialize each emitted batch onto a
@@ -153,6 +192,8 @@ void materialize_pin_batches(op::scan::gpu_ingestible& ingestible,
                              std::span<cucascade::memory::memory_space* const> gpu_spaces,
                              io::sirius_ioctx& io_ctx,
                              duckdb::vector<duckdb::LogicalType> const& pinned_column_types,
+                             bool capture_chunk_stats,
+                             bool enable_compressed_materialization,
                              const pin_batch_sink& on_batch)
 {
   if (gpu_spaces.empty()) {
@@ -224,11 +265,18 @@ void materialize_pin_batches(op::scan::gpu_ingestible& ingestible,
     // unsupported-metadata cases degrade to null cells inside; CUDA errors
     // propagate and abort the pin like any other pin-time CUDA failure.
     std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>> chunk_stats;
-    if (!pinned_column_types.empty()) {
+    std::vector<bool> narrowed_columns(static_cast<std::size_t>(tbl->num_columns()), false);
+    if (capture_chunk_stats && !pinned_column_types.empty()) {
       chunk_stats = scan_manager::compute_pinned_chunk_stats(
         tbl->view(), pinned_column_types, stream, target->get_default_allocator());
     }
-    on_batch(std::move(tbl), target, stream, std::move(chunk_stats));
+    if (enable_compressed_materialization) {
+      auto narrowed = narrow_pin_chunk(
+        std::move(tbl), pinned_column_types, stream, target->get_default_allocator());
+      tbl              = std::move(narrowed.table);
+      narrowed_columns = std::move(narrowed.columns);
+    }
+    on_batch(std::move(tbl), target, stream, std::move(narrowed_columns), std::move(chunk_stats));
   };
 
   while (!ingestible.has_processed_all_metadata()) {
@@ -252,7 +300,9 @@ materialized_pin materialize_all_batches(
   op::scan::gpu_ingestible& ingestible,
   std::span<cucascade::memory::memory_space* const> gpu_spaces,
   io::sirius_ioctx& io_ctx,
-  duckdb::vector<duckdb::LogicalType> const& pinned_column_types)
+  duckdb::vector<duckdb::LogicalType> const& pinned_column_types,
+  bool capture_chunk_stats,
+  bool enable_compressed_materialization)
 {
   materialized_pin out;
   materialize_pin_batches(
@@ -260,9 +310,12 @@ materialized_pin materialize_all_batches(
     gpu_spaces,
     io_ctx,
     pinned_column_types,
+    capture_chunk_stats,
+    enable_compressed_materialization,
     [&](std::unique_ptr<cudf::table> tbl,
         cucascade::memory::memory_space* target,
         rmm::cuda_stream_view stream,
+        std::vector<bool> narrowed_columns,
         std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>> chunk_stats) {
       // Cached GPU batches are stored with a null writer stream, so the data
       // must be fully resident before it can be served or host-converted.
@@ -270,6 +323,7 @@ materialized_pin materialize_all_batches(
       out.base_row_count_per_chunk.push_back(static_cast<std::size_t>(tbl->num_rows()));
       out.tables.emplace_back(std::move(tbl));
       out.chunk_memory_spaces.push_back(target);
+      out.narrowed_columns.emplace_back(std::move(narrowed_columns));
       if (!chunk_stats.empty()) { out.chunk_stats.emplace_back(std::move(chunk_stats)); }
     });
   return out;
@@ -280,7 +334,9 @@ materialized_host_pin materialize_pin_to_host(
   std::span<cucascade::memory::memory_space* const> gpu_spaces,
   const std::unordered_map<int, cucascade::memory::memory_space*>& host_space_by_gpu,
   io::sirius_ioctx& io_ctx,
-  duckdb::vector<duckdb::LogicalType> const& pinned_column_types)
+  duckdb::vector<duckdb::LogicalType> const& pinned_column_types,
+  bool capture_chunk_stats,
+  bool enable_compressed_materialization)
 {
   auto& registry = converter_registry::get();
   materialized_host_pin out;
@@ -290,9 +346,12 @@ materialized_host_pin materialize_pin_to_host(
     gpu_spaces,
     io_ctx,
     pinned_column_types,
+    capture_chunk_stats,
+    enable_compressed_materialization,
     [&](std::unique_ptr<cudf::table> tbl,
         cucascade::memory::memory_space* src_space,
         rmm::cuda_stream_view stream,
+        std::vector<bool> narrowed_columns,
         std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>> chunk_stats) {
       // Stream this freshly-materialized batch straight to pinned host memory and let the GPU
       // table free before the next batch is materialized — so peak GPU residency stays at ~one
@@ -304,6 +363,7 @@ materialized_host_pin materialize_pin_to_host(
       // belt-and-suspenders before gpu_repr (which owns the GPU table's buffers) leaves scope.
       auto* target_host_space = host_space_by_gpu.at(src_space->get_device_id());
       out.base_row_count_per_chunk.push_back(static_cast<std::size_t>(tbl->num_rows()));
+      out.narrowed_columns.emplace_back(std::move(narrowed_columns));
       if (!chunk_stats.empty()) { out.chunk_stats.emplace_back(std::move(chunk_stats)); }
       cucascade::gpu_table_representation gpu_repr(std::move(tbl), *src_space, stream);
       auto host_reservation =

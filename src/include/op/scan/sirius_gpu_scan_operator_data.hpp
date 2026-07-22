@@ -146,6 +146,9 @@ class scan_operator_input : public op::operator_data {
   /// copy). Stamped by drain_cached_provider on resident splits; scan_info
   /// splits fold filter costs into their own estimates instead.
   bool row_filter_pending{false};
+  /// True when a resident cached split includes at least one selected column
+  /// whose physical carrier is narrower than its logical type.
+  bool contains_narrowed_columns{false};
 };
 
 }  // namespace sirius::op::scan

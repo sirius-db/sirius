@@ -90,6 +90,10 @@ class sirius_ioctx;
 struct materialized_pin {
   std::vector<std::unique_ptr<cudf::table>> tables;
   std::vector<cucascade::memory::memory_space*> chunk_memory_spaces;
+  /// Chunk-major physical-narrowing markers. @c narrowed_columns[c][i] is true
+  /// exactly when column i of chunk c is stored in a carrier narrower than its
+  /// pin-time logical type. Parallel to @c tables and their columns.
+  std::vector<std::vector<bool>> narrowed_columns;
   /// Row count of each materialized chunk (parallel to @c tables). For duckdb-native
   /// pins these become @c duckdb_mvcc_metadata::base_row_count_per_chunk — the
   /// positional chunk→rowid-range map query-time MVCC merge relies on.
@@ -106,6 +110,9 @@ struct materialized_pin {
 /// alongside (parallel to @c host_chunks), mirroring @ref materialized_pin.
 struct materialized_host_pin {
   std::vector<std::shared_ptr<cucascade::host_data_representation>> host_chunks;
+  /// Chunk-major physical-narrowing markers, captured before the GPU table is
+  /// converted to host storage. Parallel to @c host_chunks and their columns.
+  std::vector<std::vector<bool>> narrowed_columns;
   std::vector<std::size_t> base_row_count_per_chunk;
   /// Per-chunk zone-map capture (taken on the GPU before the host conversion);
   /// chunk_stats[c][i] = stats of batch column i of chunk c (null = none).
@@ -143,7 +150,9 @@ materialized_pin materialize_all_batches(
   op::scan::gpu_ingestible& ingestible,
   std::span<cucascade::memory::memory_space* const> gpu_spaces,
   io::sirius_ioctx& io_ctx,
-  duckdb::vector<duckdb::LogicalType> const& pinned_column_types);
+  duckdb::vector<duckdb::LogicalType> const& pinned_column_types,
+  bool capture_chunk_stats               = true,
+  bool enable_compressed_materialization = false);
 
 /// Drive @p ingestible to completion like @ref materialize_all_batches, but stream each
 /// emitted batch straight to pinned host memory instead of collecting GPU-resident tables:
@@ -170,6 +179,8 @@ materialized_host_pin materialize_pin_to_host(
   std::span<cucascade::memory::memory_space* const> gpu_spaces,
   const std::unordered_map<int, cucascade::memory::memory_space*>& host_space_by_gpu,
   io::sirius_ioctx& io_ctx,
-  duckdb::vector<duckdb::LogicalType> const& pinned_column_types);
+  duckdb::vector<duckdb::LogicalType> const& pinned_column_types,
+  bool capture_chunk_stats               = true,
+  bool enable_compressed_materialization = false);
 
 }  // namespace sirius

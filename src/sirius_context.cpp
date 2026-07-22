@@ -786,6 +786,37 @@ void SiriusContext::record_transparent_runtime_fallback() noexcept
   transparent_runtime_fallback_count_.fetch_add(1, std::memory_order_relaxed);
 }
 
+SiriusContext::compressed_materialization_stats
+SiriusContext::get_compressed_materialization_stats() const noexcept
+{
+  return compressed_materialization_stats{
+    .scan_columns_narrowed =
+      compressed_materialization_scan_columns_narrowed_count_.load(std::memory_order_relaxed),
+    .scan_columns_restored =
+      compressed_materialization_scan_columns_restored_count_.load(std::memory_order_relaxed),
+    .pin_columns_narrowed =
+      compressed_materialization_pin_columns_narrowed_count_.load(std::memory_order_relaxed),
+  };
+}
+
+void SiriusContext::record_compressed_materialization_scan_columns_narrowed(uint64_t count) noexcept
+{
+  compressed_materialization_scan_columns_narrowed_count_.fetch_add(count,
+                                                                    std::memory_order_relaxed);
+}
+
+void SiriusContext::record_compressed_materialization_scan_columns_restored(uint64_t count) noexcept
+{
+  compressed_materialization_scan_columns_restored_count_.fetch_add(count,
+                                                                    std::memory_order_relaxed);
+}
+
+void SiriusContext::record_compressed_materialization_pin_columns_narrowed(uint64_t count) noexcept
+{
+  compressed_materialization_pin_columns_narrowed_count_.fetch_add(count,
+                                                                   std::memory_order_relaxed);
+}
+
 namespace {
 
 bool logical_plan_reads_s3(duckdb::LogicalOperator const& op)

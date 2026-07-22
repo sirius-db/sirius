@@ -97,6 +97,7 @@ void write_config(fs::path const& yaml_path)
        "      num_threads: 1\n"
        "      monitor_period: 10ms\n"
        "  operator_params:\n"
+       "    enable_compressed_materialization: true\n"
        "    scan_task_batch_size: 100000000\n"
        "    max_sort_partition_bytes: 0\n"
        "    hash_partition_bytes: 100000000\n"
@@ -146,6 +147,10 @@ TEST_CASE("pin_table - same-row-count merge extends cache_info to the column uni
     REQUIRE(fb);
     REQUIRE_FALSE(fb->HasError());
 
+    auto sirius_ctx = con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+    REQUIRE(sirius_ctx != nullptr);
+    auto const stats_before = sirius_ctx->get_compressed_materialization_stats();
+
     // First pin: columns [k, v].
     auto pin1 = con.Query("CALL pin_table('" + parquet_path.string() +
                           "', tier='gpu', name='merge_pin', cols=['k', 'v']);");
@@ -160,9 +165,9 @@ TEST_CASE("pin_table - same-row-count merge extends cache_info to the column uni
     REQUIRE(pin2);
     if (pin2->HasError()) { UNSCOPED_INFO("pin_table 2 error: " << pin2->GetError()); }
     REQUIRE_FALSE(pin2->HasError());
+    auto const stats_after = sirius_ctx->get_compressed_materialization_stats();
+    REQUIRE(stats_after.pin_columns_narrowed > stats_before.pin_columns_narrowed);
 
-    auto sirius_ctx = con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
-    REQUIRE(sirius_ctx != nullptr);
     auto const& mgr = sirius_ctx->get_scan_manager();
 
     bool found                                    = false;
@@ -192,6 +197,17 @@ TEST_CASE("pin_table - same-row-count merge extends cache_info to the column uni
       INFO("col_name=" << col_name);
       REQUIRE(it != entry.data_batches_by_column.end());
       REQUIRE_FALSE(it->second.empty());
+    }
+
+    // The chunk-major narrowing sidecar must merge in the same column order as
+    // cache_info. All fixture values fit INT32 while the logical columns are
+    // BIGINT, so every cached column in every chunk is physically narrow.
+    REQUIRE(entry.narrowed_columns.size() == entry.chunk_memory_spaces.size());
+    for (auto const& chunk : entry.narrowed_columns) {
+      REQUIRE(chunk.size() == names.size());
+      for (bool narrowed : chunk) {
+        REQUIRE(narrowed);
+      }
     }
 
     // Serving check: a scan requesting the newly merged column 'w' must now be

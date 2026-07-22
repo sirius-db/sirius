@@ -214,6 +214,32 @@ Data is moved from GPU to HOST tier via converter registry.
 
 ## Scan Optimizations
 
+### Compressed Materialization (unreleased)
+
+**Motivation:** Integer and fixed-point DECIMAL columns often use only a fraction of their declared
+range. Carrying their native width through every GPU batch increases memory traffic and cache
+pressure even when the SQL type must remain unchanged.
+
+**Mechanism:** A complete physical-type sidecar records narrower signed, unsigned, or same-scale
+decimal cuDF carriers without changing the logical schema. Source statistics nominate scan-time
+targets and exact per-batch min/max reductions guard every non-null wider-to-narrower cast. `pin_table`
+instead computes exact bounds per materialized cache chunk, so different chunks may use different
+widths. Pure reference payloads can remain narrow; expression references and conservative operator
+boundaries restore the native carrier before arithmetic, comparison, hashing, aggregation, ordering,
+or result materialization.
+
+**Code path:**
+- `src/helper/numeric_narrowing.cpp` — exact range extraction and carrier selection
+- `src/planner/sirius_plan_get.cpp` — statistics-guided scan sidecars
+- `src/planner/sirius_physical_plan_generator.cpp` — sidecar propagation and restore projections
+- `src/op/scan/sirius_gpu_scan_operator.cpp` — runtime verification and schema normalization
+- `src/pin_table.cpp` — exact batch-granular pin narrowing
+- `src/expression_evaluator/specializations/reference.cpp` — semantic reference restoration
+
+**Config:** `enable_compressed_materialization` (default: `false`), settable through YAML under
+`sirius.operator_params` and the DuckDB SET option. See
+[Compressed Materialization](compressed-materialization.md).
+
 ### Row Group Pruning with Filter Pushdown (PR #363)
 
 **Motivation:** Scanning all row groups wastes I/O bandwidth when filter predicates can eliminate entire groups.

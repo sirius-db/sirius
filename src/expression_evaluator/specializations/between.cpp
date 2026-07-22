@@ -30,6 +30,23 @@ using evaluate_result = expression_evaluator::evaluate_result;
 evaluate_result expression_evaluator::evaluate(sirius::ast::between const& alt,
                                                evaluation_mode mode)
 {
+  // Compressed materialization: BETWEEN over a narrowed reference with both bounds representable
+  // in its carrier compares directly at the narrow width, skipping the restoration cast (see the
+  // comparison specialization for the value-preservation argument).
+  auto const narrow_carrier = narrow_domain_carrier(*alt.input, {alt.lower.get(), alt.upper.get()});
+  if (narrow_carrier) { ++_narrow_domain_comparison_count; }
+  auto eval_operand = [&](sirius::ast::node const& operand,
+                          evaluation_mode operand_mode) -> evaluate_result {
+    if (narrow_carrier) {
+      if (operand.holds<sirius::ast::reference>()) {
+        return evaluate_reference_passthrough(operand.get<sirius::ast::reference>(), operand_mode);
+      }
+      return evaluate_constant_in_carrier(
+        operand.get<sirius::ast::constant>(), *narrow_carrier, operand_mode);
+    }
+    return evaluate(operand, operand_mode);
+  };
+
   auto const ast_op_count = alt.cudf_ast_op_count();
 
   if (_strategy != expression_evaluator_strategy::MATERIALIZE &&
@@ -39,10 +56,10 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::between const& alt,
     auto const upper_ast_op =
       alt.upper_inclusive ? cudf::ast::ast_operator::LESS_EQUAL : cudf::ast::ast_operator::LESS;
 
-    auto input = evaluate(*alt.input, evaluation_mode::AST);
+    auto input = eval_operand(*alt.input, evaluation_mode::AST);
     D_ASSERT(!input.is_scalar());
-    auto lower = evaluate(*alt.lower, evaluation_mode::AST);
-    auto upper = evaluate(*alt.upper, evaluation_mode::AST);
+    auto lower = eval_operand(*alt.lower, evaluation_mode::AST);
+    auto upper = eval_operand(*alt.upper, evaluation_mode::AST);
 
     auto const& lower_expr =
       _ast_tree.emplace<cudf::ast::operation>(lower_ast_op, input.get_expr(), lower.get_expr());
@@ -79,9 +96,9 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::between const& alt,
   auto const upper_bin_op =
     alt.upper_inclusive ? cudf::binary_operator::LESS_EQUAL : cudf::binary_operator::LESS;
 
-  auto input = evaluate(*alt.input, evaluation_mode::MATERIALIZE);
-  auto lower = evaluate(*alt.lower, evaluation_mode::MATERIALIZE);
-  auto upper = evaluate(*alt.upper, evaluation_mode::MATERIALIZE);
+  auto input = eval_operand(*alt.input, evaluation_mode::MATERIALIZE);
+  auto lower = eval_operand(*alt.lower, evaluation_mode::MATERIALIZE);
+  auto upper = eval_operand(*alt.upper, evaluation_mode::MATERIALIZE);
   // BETWEEN always returns BOOLEAN.
   auto const output_type = cudf::data_type{cudf::type_id::BOOL8};
 

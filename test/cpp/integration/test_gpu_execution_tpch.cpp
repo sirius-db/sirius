@@ -628,6 +628,83 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
   compare_gpu_vs_cpu("select avg(l_quantity), avg(l_discount) from lineitem;");
 }
 
+TEST_CASE_METHOD(GPUExecutionParquetFixture,
+                 "gpu_execution - narrowed decimal payload survives expression expansion",
+                 "[integration][gpu_execution][parquet][decimal][numeric_narrowing]")
+{
+  struct reset_compressed_materialization {
+    duckdb::Connection& con;
+    ~reset_compressed_materialization()
+    {
+      con.Query("SET enable_compressed_materialization = false;");
+    }
+  } reset{*con};
+
+  auto enabled = con->Query("SET enable_compressed_materialization = true;");
+  REQUIRE(enabled);
+  if (enabled->HasError()) {
+    UNSCOPED_INFO("failed to enable compressed materialization: " << enabled->GetError());
+  }
+  REQUIRE_FALSE(enabled->HasError());
+
+  auto const before_stats = sirius::test::get_compressed_materialization_stats(*con);
+  compare_gpu_vs_cpu(
+    "select l_orderkey, l_linenumber, l_extendedprice, "
+    "l_extendedprice + cast('0.00' as decimal(3,2)) as price_copy "
+    "from lineitem where l_orderkey <= 100 order by l_orderkey, l_linenumber;");
+  auto const after_stats = sirius::test::get_compressed_materialization_stats(*con);
+  REQUIRE(after_stats.scan_columns_narrowed > before_stats.scan_columns_narrowed);
+}
+
+TEST_CASE_METHOD(GPUExecutionParquetFixture,
+                 "gpu_execution - zero-benefit narrowing is pruned for aggregate-only scans",
+                 "[integration][gpu_execution][parquet][numeric_narrowing]")
+{
+  struct reset_compressed_materialization {
+    duckdb::Connection& con;
+    ~reset_compressed_materialization()
+    {
+      con.Query("SET enable_compressed_materialization = false;");
+    }
+  } reset{*con};
+
+  auto enabled = con->Query("SET enable_compressed_materialization = true;");
+  REQUIRE(enabled);
+  REQUIRE_FALSE(enabled->HasError());
+
+  // Every scan column feeds the aggregate directly, so the restore projection would sit
+  // immediately above the scan: the planner must prune the narrowing instead of paying a
+  // verification pass plus two carrier casts that never cross an operator boundary narrow.
+  auto const before_stats = sirius::test::get_compressed_materialization_stats(*con);
+  compare_gpu_vs_cpu("select sum(l_extendedprice), sum(l_quantity) from lineitem;");
+  auto const after_stats = sirius::test::get_compressed_materialization_stats(*con);
+  REQUIRE(after_stats.scan_columns_narrowed == before_stats.scan_columns_narrowed);
+}
+
+TEST_CASE_METHOD(GPUExecutionParquetFixture,
+                 "gpu_execution - zero-benefit narrowing is pruned for join-key-only scans",
+                 "[integration][gpu_execution][parquet][numeric_narrowing]")
+{
+  struct reset_compressed_materialization {
+    duckdb::Connection& con;
+    ~reset_compressed_materialization()
+    {
+      con.Query("SET enable_compressed_materialization = false;");
+    }
+  } reset{*con};
+
+  auto enabled = con->Query("SET enable_compressed_materialization = true;");
+  REQUIRE(enabled);
+  REQUIRE_FALSE(enabled->HasError());
+
+  // Both scans project only their join key, which the join boundary restores directly above
+  // each scan; the planner must prune the narrowing on both sides.
+  auto const before_stats = sirius::test::get_compressed_materialization_stats(*con);
+  compare_gpu_vs_cpu("select count(*) from lineitem, orders where l_orderkey = o_orderkey;");
+  auto const after_stats = sirius::test::get_compressed_materialization_stats(*con);
+  REQUIRE(after_stats.scan_columns_narrowed == before_stats.scan_columns_narrowed);
+}
+
 //===----------------------------------------------------------------------===//
 // Grouped aggregate tests
 //===----------------------------------------------------------------------===//
@@ -3952,11 +4029,16 @@ TEST_CASE("gpu_execution - empty parquet count identity",
                    "COPY (SELECT 1 AS i WHERE false) TO " +
                      sql_string_literal(parquet_path.string()) + " (FORMAT PARQUET);");
   require_query_ok(*fixture.con, "SET gpu_execution = true;");
-  auto result = compare_gpu_vs_cpu_with_watchdog(
+  require_query_ok(*fixture.con, "SET enable_compressed_materialization = false;");
+  auto const before_stats = sirius::test::get_compressed_materialization_stats(*fixture.con);
+  auto result             = compare_gpu_vs_cpu_with_watchdog(
     *fixture.con,
     "select count(*) as c from read_parquet(" + sql_string_literal(parquet_path.string()) + ");",
     std::chrono::seconds{30},
     [&fixture] { fixture.leak_after_timeout(); });
+  auto const after_stats = sirius::test::get_compressed_materialization_stats(*fixture.con);
+  REQUIRE(after_stats.scan_columns_narrowed == before_stats.scan_columns_narrowed);
+  REQUIRE(after_stats.scan_columns_restored == before_stats.scan_columns_restored);
   REQUIRE(result.row_count == 1);
   REQUIRE(result.column_count == 1);
   CHECK(result.rows == std::vector<std::vector<std::string>>{{"0"}});

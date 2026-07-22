@@ -207,6 +207,7 @@ sirius::scan_manager::mvcc_chunk_mask make_test_mask(std::size_t rows)
 struct scripted_provider final : databatch_provider {
   std::vector<std::shared_ptr<cucascade::data_batch>> batches;
   std::vector<sirius::scan_manager::mvcc_chunk_mask> masks;
+  std::vector<bool> narrowed;
   std::size_t served{0};
   bool throw_when_exhausted{false};
 
@@ -215,7 +216,8 @@ struct scripted_provider final : databatch_provider {
     if (served < batches.size()) {
       auto idx = served++;
       return {batches[idx],
-              idx < masks.size() ? masks[idx] : sirius::scan_manager::mvcc_chunk_mask{}};
+              idx < masks.size() ? masks[idx] : sirius::scan_manager::mvcc_chunk_mask{},
+              idx < narrowed.size() && narrowed[idx]};
     }
     if (throw_when_exhausted) { throw std::runtime_error("provider blew up mid-stream"); }
     return {};
@@ -279,8 +281,9 @@ TEST_CASE("drain_cached_provider forwards the mvcc keep-mask and filter flag ont
   auto& e    = env();
   auto mask0 = make_test_mask(4);
   scripted_provider provider;
-  provider.batches = {make_test_batch(e, 4), make_test_batch(e, 4)};
-  provider.masks   = {mask0};  // second batch deliberately mask-less
+  provider.batches  = {make_test_batch(e, 4), make_test_batch(e, 4)};
+  provider.masks    = {mask0};  // second batch deliberately mask-less
+  provider.narrowed = {true, false};
 
   split_connector connector;
   std::stop_source stop;
@@ -295,6 +298,7 @@ TEST_CASE("drain_cached_provider forwards the mvcc keep-mask and filter flag ont
   REQUIRE(in0->mvcc_keep_mask.words == mask0.words);
   REQUIRE(in0->mvcc_keep_mask.row_count == mask0.row_count);
   REQUIRE(in0->row_filter_pending);
+  REQUIRE(in0->contains_narrowed_columns);
 
   auto second = connector.get_next_split();
   REQUIRE(second.has_value());
@@ -302,6 +306,7 @@ TEST_CASE("drain_cached_provider forwards the mvcc keep-mask and filter flag ont
   REQUIRE(in1 != nullptr);
   REQUIRE_FALSE(in1->mvcc_keep_mask.has_mask());
   REQUIRE(in1->row_filter_pending);  // per-op flag: stamped on every split
+  REQUIRE_FALSE(in1->contains_narrowed_columns);
 
   REQUIRE_FALSE(connector.get_next_split().has_value());
 }
@@ -350,6 +355,39 @@ TEST_CASE("cached provider pairs chunk i with mask-set slot i", "[cached_serving
       REQUIRE_FALSE(b.mvcc_keep_mask.has_mask());
     }
     REQUIRE_FALSE(provider->get_next_batch().data);
+  }
+}
+
+TEST_CASE("cached provider marks only selected narrow columns", "[cached_serving][scan_manager]")
+{
+  auto& e                = env();
+  auto entry             = make_gpu_entry(*e.gpu_space, 3, 4);
+  entry.narrowed_columns = {{false, true, false}, {true, false, false}, {false, false, false}};
+
+  SECTION("a selected narrow column marks only its chunk")
+  {
+    std::vector<std::size_t> selected{1};
+    sirius::scan_manager::cached_scan_plan plan{.survivor_chunk_indices = {0, 1, 2}};
+    auto provider = sirius::scan_manager::make_provider_for_pinned_entry(
+      entry, selected, std::move(plan), sirius::telemetry::batch_telemetry_info{});
+
+    REQUIRE(provider->get_next_batch().contains_narrowed_columns);
+    REQUIRE_FALSE(provider->get_next_batch().contains_narrowed_columns);
+    REQUIRE_FALSE(provider->get_next_batch().contains_narrowed_columns);
+  }
+
+  SECTION("narrow unselected columns do not mark the served batch")
+  {
+    std::vector<std::size_t> selected{2};
+    sirius::scan_manager::cached_scan_plan plan{.survivor_chunk_indices = {0, 1, 2}};
+    auto provider = sirius::scan_manager::make_provider_for_pinned_entry(
+      entry, selected, std::move(plan), sirius::telemetry::batch_telemetry_info{});
+
+    for (int i = 0; i < 3; ++i) {
+      auto batch = provider->get_next_batch();
+      REQUIRE(batch.data);
+      REQUIRE_FALSE(batch.contains_narrowed_columns);
+    }
   }
 }
 
@@ -474,6 +512,30 @@ TEST_CASE("validate_pinned_entry_for_serving refuses malformed entries",
     entry.data_batches_by_column["k"][1] = nullptr;
     REQUIRE_THROWS_AS(validate_pinned_entry_for_serving(entry, std::vector<std::size_t>{0}),
                       std::runtime_error);
+  }
+
+  SECTION("narrowing matrix chunk count disagrees")
+  {
+    auto entry             = make_gpu_entry(*e.gpu_space, 2, 4);
+    entry.narrowed_columns = {{true, false, false}};
+    REQUIRE_THROWS_AS(validate_pinned_entry_for_serving(entry, std::vector<std::size_t>{0}),
+                      std::invalid_argument);
+  }
+
+  SECTION("narrowing matrix column count disagrees")
+  {
+    auto entry             = make_gpu_entry(*e.gpu_space, 2, 4);
+    entry.narrowed_columns = {{true, false}, {false, false}};
+    REQUIRE_THROWS_AS(validate_pinned_entry_for_serving(entry, std::vector<std::size_t>{0}),
+                      std::invalid_argument);
+  }
+
+  SECTION("host narrowing matrix shape disagrees")
+  {
+    auto entry             = make_host_entry(e, 2, 4);
+    entry.narrowed_columns = {{true, false}};
+    REQUIRE_THROWS_AS(validate_pinned_entry_for_serving(entry, std::vector<std::size_t>{0}),
+                      std::invalid_argument);
   }
 
   SECTION("null host chunk")

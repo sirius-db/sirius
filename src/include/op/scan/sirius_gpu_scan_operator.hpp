@@ -30,6 +30,10 @@ class split_connector;
 class sirius_scan_manager;
 }  // namespace sirius::scan_manager
 
+namespace duckdb {
+class SiriusContext;
+}  // namespace duckdb
+
 namespace sirius::op::scan {
 
 //===----------------------------------------------------------------------===//
@@ -75,7 +79,8 @@ class sirius_gpu_scan_operator : public sirius_physical_operator {
    */
   sirius_gpu_scan_operator(duckdb::vector<sirius::logical_type> types,
                            duckdb::idx_t estimated_cardinality,
-                           std::shared_ptr<gpu_ingestible> ingestible);
+                           std::shared_ptr<gpu_ingestible> ingestible,
+                           duckdb::SiriusContext* compressed_materialization_observer = nullptr);
 
   ~sirius_gpu_scan_operator() override;
 
@@ -128,6 +133,9 @@ class sirius_gpu_scan_operator : public sirius_physical_operator {
  private:
   std::shared_ptr<gpu_ingestible> _ingestible;
   std::shared_ptr<scan_manager::split_connector> _split_connector;
+  /// Non-owning observer. The registered-state shared_ptr owns the context for
+  /// at least as long as the query plan; unit-test operators may leave it null.
+  duckdb::SiriusContext* _compressed_materialization_observer;
 };
 
 }  // namespace sirius::op::scan
