@@ -56,11 +56,17 @@ def segment(lines: List[str]) -> List[QuerySegment]:
         begin_idx = i
         begin_ts = _extract_ts(line)
 
-        # The SQL line is expected to be the next non-empty line. In practice
-        # it is the immediate next line; we tolerate up to a few blank lines.
+        # The `QueryBegin: SQL: <sql>` line is emitted right after the block of
+        # per-HOST / per-GPU memory-pool boundary lines. That block has one line
+        # per HOST node plus one per GPU, so on multi-GPU systems it spans a
+        # dozen-plus lines — a fixed small lookahead window would miss the SQL
+        # line (and parse zero queries). Skip forward over the contiguous
+        # pool-boundary (and blank) block, then expect the SQL line. Stop at the
+        # first other content line so a QueryBegin not followed by a SQL emission
+        # doesn't swallow unrelated lines; a hard cap bounds the scan defensively.
         sql = ""
         sql_idx = None
-        for j in range(i + 1, min(i + 5, n)):
+        for j in range(i + 1, min(i + 64, n)):
             cand = lines[j]
             if patterns.QUERY_SQL_ANCHOR in cand:
                 m = patterns.QUERY_SQL_RE.match(cand)
@@ -68,6 +74,8 @@ def segment(lines: List[str]) -> List[QuerySegment]:
                     m.group("sql") if m else cand.split(patterns.QUERY_SQL_ANCHOR, 1)[1]
                 )
                 sql_idx = j
+                break
+            if cand.strip() and not patterns.is_pool_boundary_line(cand):
                 break
 
         if sql_idx is None or not _is_analytical(sql):
