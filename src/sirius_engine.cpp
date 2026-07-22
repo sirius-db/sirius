@@ -213,7 +213,7 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
   sirius::planner::sirius_physical_plan_generator::set_parent_ops(*sirius_physical_plan,
                                                                   /*parent=*/nullptr);
   sirius::planner::sirius_physical_plan_generator::mark_fusable_merge_pipelines(
-    *sirius_physical_plan);
+    context, *sirius_physical_plan);
 
   // Build meta-pipeline tree from operator plan
   pipeline::sirius_pipeline_build_state state;

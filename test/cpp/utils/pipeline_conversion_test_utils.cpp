@@ -148,7 +148,8 @@ void with_conversion_result(
     // Unlike production this path adds no RESULT_COLLECTOR wrap, so a merge that is itself the
     // plan root has no downstream sink and stays unfused; structural-sink fusion (merge folded
     // into an ORDER_BY / TOP_N / outer GROUP BY sink) is captured.
-    sirius::planner::sirius_physical_plan_generator::mark_fusable_merge_pipelines(*sirius_plan);
+    sirius::planner::sirius_physical_plan_generator::mark_fusable_merge_pipelines(context,
+                                                                                  *sirius_plan);
 
     auto sirius_ctx_ptr = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
     if (!sirius_ctx_ptr) {

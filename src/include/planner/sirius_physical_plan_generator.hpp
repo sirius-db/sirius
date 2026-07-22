@@ -225,9 +225,11 @@ class sirius_physical_plan_generator {
   static void set_parent_ops(sirius::op::sirius_physical_operator& op,
                              sirius::op::sirius_physical_operator* parent);
 
-  //! Mark eligible merge operators for downstream pipeline fusion. Snapshots the fusion toggle
-  //! once so a concurrent `SET` cannot make the decision inconsistent across the plan tree.
-  static void mark_fusable_merge_pipelines(sirius::op::sirius_physical_operator& op);
+  //! Mark eligible merge operators for downstream pipeline fusion. Reads the per-connection
+  //! `fuse_merge_pipelines` setting from `context` once, so the decision is consistent across the
+  //! plan tree and scoped to this connection (no process-global to race or leak).
+  static void mark_fusable_merge_pipelines(duckdb::ClientContext& context,
+                                           sirius::op::sirius_physical_operator& op);
 
  private:
   //! Recursive worker for `mark_fusable_merge_pipelines`; carries the snapshotted toggle so every

@@ -1548,10 +1548,14 @@ static void SetModifiedPipeline(ClientContext& context, SetScope scope, Value& p
   SIRIUS_LOG_DEBUG("Updated config MODIFIED_PIPELINE to {}", Config::MODIFIED_PIPELINE);
 }
 
-static void SetFuseMergePipelines(ClientContext& context, SetScope scope, Value& parameter)
+static void SetFuseMergePipelines(ClientContext& /*context*/,
+                                  SetScope /*scope*/,
+                                  Value& /*parameter*/)
 {
-  Config::FUSE_MERGE_PIPELINES = BooleanValue::Get(parameter);
-  SIRIUS_LOG_DEBUG("Updated config FUSE_MERGE_PIPELINES to {}", Config::FUSE_MERGE_PIPELINES);
+  // No process-global mirror is kept. DuckDB stores the value per-context and it is read via
+  // ClientContext::TryGetCurrentSetting during planning (mark_fusable_merge_pipelines), so
+  // `SET fuse_merge_pipelines = ...` on one connection stays scoped to that connection instead
+  // of leaking into every other connection (and, across the test binary, into later test cases).
 }
 
 static sirius::operator_params* get_operator_params(ClientContext& context)
@@ -1868,7 +1872,10 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
   config.AddExtensionOption("fuse_merge_pipelines",
                             "Fuse eligible GROUP BY and TOP_N merges into downstream pipelines",
                             LogicalType::BOOLEAN,
-                            Value::BOOLEAN(Config::FUSE_MERGE_PIPELINES),
+                            Value::BOOLEAN(true),  // literal default: never seed from a
+                                                   // process-global a prior connection's SET may
+                                                   // have mutated (that leaked the policy into
+                                                   // every freshly-created database).
                             SetFuseMergePipelines);
 
   // Add in config options for duckdb scan task

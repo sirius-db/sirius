@@ -801,12 +801,18 @@ bool merge_downstream_is_streaming_dead_end(const sirius::op::sirius_physical_op
 }  // namespace
 
 void sirius_physical_plan_generator::mark_fusable_merge_pipelines(
-  sirius::op::sirius_physical_operator& op)
+  duckdb::ClientContext& context, sirius::op::sirius_physical_operator& op)
 {
-  // Snapshot the fusion toggle once for the whole traversal. The backing config is a mutable
-  // global that a concurrent connection can flip via `SET`; re-reading it per node would let
-  // such a flip mark some subtrees fused and others not within a single plan.
-  mark_fusable_merge_pipelines(op, duckdb::Config::FUSE_MERGE_PIPELINES);
+  // Read the per-connection `fuse_merge_pipelines` setting once for the whole traversal. It is a
+  // real DuckDB ClientContext setting (not a process-global), so this read cannot race a
+  // concurrent connection's `SET` and cannot inherit another connection's policy. Snapshotting
+  // once also keeps the decision consistent across every node in this plan.
+  duckdb::Value setting;
+  bool fusion_enabled = true;  // matches the registered default
+  if (context.TryGetCurrentSetting("fuse_merge_pipelines", setting) && !setting.IsNull()) {
+    fusion_enabled = setting.GetValue<bool>();
+  }
+  mark_fusable_merge_pipelines(op, fusion_enabled);
 }
 
 void sirius_physical_plan_generator::mark_fusable_merge_pipelines(

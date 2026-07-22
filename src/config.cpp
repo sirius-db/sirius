@@ -43,8 +43,6 @@ bool Config::MODIFIED_PIPELINE = false;
 
 uint64_t Config::DEFAULT_SCAN_TASK_BATCH_SIZE = 512ULL * 1024 * 1024;  ///< 50 MB
 
-bool Config::FUSE_MERGE_PIPELINES = true;
-
 uint64_t Config::MAX_SORT_PARTITION_BYTES = 0;  ///< 0 = auto (33% of available GPU memory)
 
 std::string Config::LOG_BACKEND = "spdlog";

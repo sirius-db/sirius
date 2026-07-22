@@ -19,7 +19,6 @@
  * @brief Pipeline-shape tests for merge fusion.
  */
 
-#include "config.hpp"
 #include "op/sirius_physical_operator_type.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "sirius_engine.hpp"
@@ -53,20 +52,22 @@ fs::path integration_db_path()
 #endif
 }
 
+// `fuse_merge_pipelines` is a per-connection DuckDB setting (no process-global), so the toggle is
+// driven with `SET`/`RESET` on the connection the plan is generated on.
 class fusion_flag_guard {
  public:
-  explicit fusion_flag_guard(bool enabled) : original_(duckdb::Config::FUSE_MERGE_PIPELINES)
+  fusion_flag_guard(duckdb::Connection& con, bool enabled) : con_(con)
   {
-    duckdb::Config::FUSE_MERGE_PIPELINES = enabled;
+    con_.Query(std::string("SET fuse_merge_pipelines = ") + (enabled ? "true" : "false") + ";");
   }
 
-  ~fusion_flag_guard() { duckdb::Config::FUSE_MERGE_PIPELINES = original_; }
+  ~fusion_flag_guard() { con_.Query("RESET fuse_merge_pipelines;"); }
 
   fusion_flag_guard(const fusion_flag_guard&)            = delete;
   fusion_flag_guard& operator=(const fusion_flag_guard&) = delete;
 
  private:
-  bool original_;
+  duckdb::Connection& con_;
 };
 
 const sirius_pipeline* pipeline_containing(
@@ -245,7 +246,7 @@ TEST_CASE_METHOD(merge_fusion_fixture,
                  "merge pipeline fusion folds terminal GROUP BY and TOP_N into the collector",
                  "[integration][pipeline][merge_fusion]")
 {
-  fusion_flag_guard guard(/*enabled=*/true);
+  fusion_flag_guard guard(*con, /*enabled=*/true);
 
   SECTION("GROUP BY")
   {
@@ -286,7 +287,7 @@ TEST_CASE_METHOD(merge_fusion_fixture,
                  "merge pipeline fusion flag restores the merge boundary",
                  "[integration][pipeline][merge_fusion]")
 {
-  fusion_flag_guard guard(/*enabled=*/false);
+  fusion_flag_guard guard(*con, /*enabled=*/false);
 
   SECTION("GROUP BY")
   {
@@ -309,11 +310,49 @@ TEST_CASE_METHOD(merge_fusion_fixture,
   }
 }
 
+TEST_CASE_METHOD(
+  merge_fusion_fixture,
+  "merge pipeline fusion setting is scoped per-connection (no cross-connection leak)",
+  "[integration][pipeline][merge_fusion]")
+{
+  // `fuse_merge_pipelines` must be a per-connection setting, not a process-global: a SET on one
+  // connection must not change another connection's plans. A second connection to the same
+  // database keeps the default (fusion enabled).
+  auto con2 =
+    std::make_unique<duckdb::Connection>(sirius::test::g_integration_env->make_connection());
+  auto db_path = integration_db_path();
+  auto attach = con2->Query("ATTACH IF NOT EXISTS '" + db_path.string() + "' AS tpch (READ_ONLY);");
+  REQUIRE(attach);
+  REQUIRE_FALSE(attach->HasError());
+  auto use = con2->Query("USE tpch;");
+  REQUIRE(use);
+  REQUIRE_FALSE(use->HasError());
+
+  // Disable fusion on the fixture connection only; con2 never touches the setting.
+  con->Query("SET fuse_merge_pipelines = false;");
+
+  const std::string query = "SELECT n_regionkey, count(*) FROM nation GROUP BY n_regionkey";
+
+  // con: fusion disabled -> the terminal MERGE_GROUP_BY keeps its own pipeline.
+  sirius::test::with_initialized_engine(*con, query, [&](sirius::sirius_engine& engine) {
+    require_unfused_terminal_shape(engine, SiriusPhysicalOperatorType::MERGE_GROUP_BY);
+  });
+
+  // con2: still at the default -> the merge fuses into the collector. If the setting leaked
+  // through a process-global (the pre-fix bug), con's SET above would have disabled fusion here
+  // too and this would instead observe an unfused shape.
+  sirius::test::with_initialized_engine(*con2, query, [&](sirius::sirius_engine& engine) {
+    require_fused_terminal_shape(engine, SiriusPhysicalOperatorType::MERGE_GROUP_BY);
+  });
+
+  con->Query("RESET fuse_merge_pipelines;");
+}
+
 TEST_CASE_METHOD(merge_fusion_fixture,
                  "merge pipeline fusion excludes ungrouped aggregate and join terminals",
                  "[integration][pipeline][merge_fusion]")
 {
-  fusion_flag_guard guard(/*enabled=*/true);
+  fusion_flag_guard guard(*con, /*enabled=*/true);
 
   SECTION("UNGROUPED_AGGREGATE")
   {
@@ -387,7 +426,7 @@ TEST_CASE_METHOD(merge_fusion_fixture,
                  "merge pipeline fusion into structural sinks (ORDER_BY / TOP_N / nested GROUP BY)",
                  "[integration][pipeline][merge_fusion][structural_sinks]")
 {
-  fusion_flag_guard guard(/*enabled=*/true);
+  fusion_flag_guard guard(*con, /*enabled=*/true);
 
   // A merge whose downstream chain is a unary streaming path ending in a total-input sink
   // (ORDER_BY, TOP_N, an outer GROUP BY) fuses into that sink's pipeline. These sinks already
@@ -511,7 +550,7 @@ TEST_CASE_METHOD(merge_fusion_fixture,
                  "[integration][pipeline][merge_fusion][correctness]")
 {
   // Guard restores the global default even if a query below fails mid-comparison.
-  fusion_flag_guard guard(/*enabled=*/true);
+  fusion_flag_guard guard(*con, /*enabled=*/true);
 
   SECTION("terminal GROUP BY")
   {
