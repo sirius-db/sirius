@@ -45,7 +45,7 @@ downgrade_executor::downgrade_executor(
   cucascade::memory::memory_space_id space_id,
   cucascade::memory::memory_space* memory_space,
   sirius::memory::sirius_memory_reservation_manager& reservation_manager,
-  sirius::exec::inspectable_mpsc<sirius::parallel::itask>* pipeline_task_queue)
+  sirius::exec::inspectable_priority_queue<sirius::parallel::itask>* pipeline_task_queue)
   : _config(std::move(config)),
     _data_repo_mgr(data_repo_mgr),
     _space_id(space_id),
@@ -486,7 +486,7 @@ void downgrade_executor::cancel_pending_requests()
 }
 
 void downgrade_executor::set_pipeline_task_queue(
-  sirius::exec::inspectable_mpsc<sirius::parallel::itask>* pipeline_task_queue)
+  sirius::exec::inspectable_priority_queue<sirius::parallel::itask>* pipeline_task_queue)
 {
   _pipeline_task_queue = pipeline_task_queue;
 }

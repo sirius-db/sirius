@@ -19,6 +19,8 @@
 #include "config.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "exec/bounded_thread_pool.hpp"
+#include "exec/config.hpp"
+#include "exec/inspectable_priority_queue.hpp"
 #include "exec/interruptible_mpmc.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
@@ -147,6 +149,21 @@ class task_creator {
    * @return uint64_t The next task id.
    */
   uint64_t get_next_task_id();
+
+  /**
+   * @brief Compute a scheduling priority for every pipeline in the query.
+   *
+   * Partitions the pipeline DAG into branches (via query_index) and assigns each pipeline a
+   * priority so that earlier (closer-to-scan) branches get lower values and run first (priority
+   * ascends with execution order), honoring the configured priority_order within each branch.
+   * Exposed for unit testing.
+   *
+   * @param query The query whose pipelines are prioritized.
+   * @return Map from pipeline to its scheduling priority (pipelines absent from the map keep the
+   *         default priority of 0).
+   */
+  [[nodiscard]] std::unordered_map<const pipeline::sirius_pipeline*, exec::queue_priority>
+  compute_pipeline_priorities(const sirius::planner::query& query) const;
 
  protected:
   /**

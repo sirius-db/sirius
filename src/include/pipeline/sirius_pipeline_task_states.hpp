@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "exec/inspectable_priority_queue.hpp"
 #include "parallel/task.hpp"
 #include "pipeline/pipeline_memory_history.hpp"
 #include "pipeline/sirius_pipeline.hpp"
@@ -117,10 +118,24 @@ class sirius_pipeline_task_global_state : public sirius::parallel::itask_global_
    */
   [[nodiscard]] std::optional<int> get_preferred_device_id() const { return _preferred_device_id; }
 
+  /**
+   * @brief Set the scheduling priority shared by all tasks of this pipeline.
+   *
+   * Lower values are scheduled first by the pipeline-level priority queue. Assigned once per
+   * query by task_creator::prepare_for_query() based on the pipeline's position in the plan.
+   */
+  void set_priority(exec::queue_priority priority) { _priority = priority; }
+
+  /**
+   * @brief Get the scheduling priority for this pipeline's tasks (default 0).
+   */
+  [[nodiscard]] exec::queue_priority get_priority() const { return _priority; }
+
  private:
   duckdb::shared_ptr<sirius_pipeline> _pipeline;  ///< Shared pointer to the GPU pipeline to execute
   pipeline_memory_history _memory_history;        ///< Historical memory metrics for estimation
   std::optional<int> _preferred_device_id;        ///< Pipeline-level preferred GPU device
+  exec::queue_priority _priority{0};              ///< Pipeline-level scheduling priority
   std::shared_ptr<const telemetry::telemetry_context>
     _telemetry_context;  ///< SiriusContext telemetry
 };

@@ -353,7 +353,7 @@ void sirius_pipeline::notify_downstream_pipelines(bool original_pipeline)
   // whose FULL-barrier ports are now unblocked will get tasks created.
   // If this is the original pipeline, we dont want to schedule tasks for its consumers, that will
   // be done later.
-  if (_task_creator && !original_pipeline) {
+  if (_task_creator) {
     for (auto* consumer : get_output_consumers()) {
       // If is possible to have a race condition here where one task finished and here it does to
       // schedule a task right when the last task finished and marks the operator as finalized. That

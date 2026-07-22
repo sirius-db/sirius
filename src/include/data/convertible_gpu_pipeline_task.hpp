@@ -19,7 +19,7 @@
 #include "data/convertible_data.hpp"
 #include "data/convertible_data_batch.hpp"
 #include "data/sirius_converter_registry.hpp"
-#include "exec/inspectable_mpsc.hpp"
+#include "exec/inspectable_priority_queue.hpp"
 #include "log/logging.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "parallel/task.hpp"
@@ -63,8 +63,9 @@ class convertible_gpu_pipeline_task : public convertible_data {
    * @param task The task to wrap (exclusive ownership taken).
    * @param queue The originating task queue (task is returned here on destruction).
    */
-  convertible_gpu_pipeline_task(std::unique_ptr<sirius::parallel::itask> task,
-                                sirius::exec::inspectable_mpsc<sirius::parallel::itask>& queue)
+  convertible_gpu_pipeline_task(
+    std::unique_ptr<sirius::parallel::itask> task,
+    sirius::exec::inspectable_priority_queue<sirius::parallel::itask>& queue)
     : _task(std::move(task)), _queue(queue)
   {
   }
@@ -208,7 +209,7 @@ class convertible_gpu_pipeline_task : public convertible_data {
   }
 
   std::unique_ptr<sirius::parallel::itask> _task;
-  sirius::exec::inspectable_mpsc<sirius::parallel::itask>& _queue;
+  sirius::exec::inspectable_priority_queue<sirius::parallel::itask>& _queue;
 };
 
 /**
@@ -227,7 +228,7 @@ class convertible_gpu_pipeline_task_provider : public convertible_data_provider 
    * @param queue The task queue to search (non-owning reference).
    */
   explicit convertible_gpu_pipeline_task_provider(
-    sirius::exec::inspectable_mpsc<sirius::parallel::itask>& queue)
+    sirius::exec::inspectable_priority_queue<sirius::parallel::itask>& queue)
     : _queue(queue)
   {
   }
@@ -316,7 +317,7 @@ class convertible_gpu_pipeline_task_provider : public convertible_data_provider 
     return false;
   }
 
-  sirius::exec::inspectable_mpsc<sirius::parallel::itask>& _queue;
+  sirius::exec::inspectable_priority_queue<sirius::parallel::itask>& _queue;
 };
 
 }  // namespace sirius

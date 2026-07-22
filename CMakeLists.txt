@@ -325,6 +325,7 @@ set(EXTENSION_SOURCES
     src/pipeline/task_request.cpp
     src/planner/duckdb_join_filter_candidate_adapter.cpp
     src/planner/query.cpp
+    src/planner/query_index.cpp
     src/planner/sirius_physical_plan_generator.cpp
     src/planner/sirius_plan_aggregate.cpp
     src/planner/sirius_plan_column_data_get.cpp
@@ -578,6 +579,7 @@ set(TEST_SOURCES
     test/cpp/exec/test_bounded_thread_pool.cpp
     test/cpp/exec/test_exchange_channel.cpp
     test/cpp/exec/test_inspectable_mpsc.cpp
+    test/cpp/exec/test_inspectable_priority_queue.cpp
     test/cpp/exec/test_interruptible_mpmc.cpp
     test/cpp/exec/test_semi_future.cpp
     test/cpp/expression/test_ast_aggregate.cpp
@@ -666,6 +668,7 @@ set(TEST_SOURCES
     test/cpp/planner/test_plan_tree_shape.cpp
     test/cpp/planner/test_projection_fold.cpp
     test/cpp/planner/test_sirius_read_parquet_scan.cpp
+    test/cpp/planner/test_query_index.cpp
     test/cpp/pipeline/test_batch_lock_utils.cpp
     test/cpp/pipeline/test_gpu_pipeline_executor.cpp
     test/cpp/pipeline/test_oom_reschedule.cpp
