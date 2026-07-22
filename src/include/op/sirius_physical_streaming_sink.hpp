@@ -28,7 +28,7 @@
 
 namespace sirius::op {
 
-/// Boundary operator (source + sink) that marks the top of a pipeline fragment. Pops batches
+/// Port-fed terminal sink that marks the top of a pipeline fragment. Pops batches
 /// from its input port, registers each in the output repository (making it idle and spillable),
 /// and pushes a lightweight handle into the exchange channel.
 ///
@@ -57,10 +57,11 @@ class sirius_physical_streaming_sink : public sirius_physical_operator {
     std::shared_ptr<exec::exchange_channel> output_channel,
     std::shared_ptr<cucascade::shared_data_repository> output_repository);
 
-  // Port-fed terminal operator (RESULT_COLLECTOR-style): heads the single-operator pipeline it
-  // also terminates. Head placement is what lets get_next_task_hint() gate task creation on
-  // channel capacity; a pipeline head must report is_source() (see sirius_pipeline::reset_source).
-  bool is_source() const override { return true; }
+  // Heads the single-operator pipeline it also terminates; head placement is structural
+  // (pipeline operators[0], not this flag) and is what lets get_next_task_hint() gate task
+  // creation on channel capacity. No runtime code reads is_source() — the dormant head check
+  // (sirius_pipeline::reset_source) and the #839 session wiring must key on structure instead.
+  bool is_source() const override { return false; }
   bool is_sink() const override { return true; }
   bool sink_order_dependent() const override { return false; }
 

@@ -109,11 +109,13 @@ Key design invariants:
 - **Zero-copy emission**: the batch is registered in the output repository first, then only a
   lightweight handle (batch-id + size) is pushed to the channel — no host clone, no
   `ColumnDataCollection` materialization.
-- **CONCAT shape**: `is_source() && is_sink()` are both `true`. The operator heads its own
-  single-operator pipeline fed via an `"input"` port; the upstream pipeline pushes batches into
-  that port's repository via the base-class `sink()` → `push_data_batch()` path. Being the head,
-  it is simultaneously the *final* operator of that pipeline (`publish_output()` calls its
-  `sink()`) — the same head-and-terminal shape as `RESULT_COLLECTOR` and `MERGE_GROUP_BY`.
+- **Head-and-terminal shape**: `is_sink()` is `true`, `is_source()` is `false` — head placement
+  is structural (`operators[0]`), not flag-driven, and no runtime code reads the flag. The
+  operator heads its own single-operator pipeline fed via an `"input"` port; the upstream
+  pipeline pushes batches into that port's repository via the base-class `sink()` →
+  `push_data_batch()` path. Being the head, it is simultaneously the *final* operator of that
+  pipeline (`publish_output()` calls its `sink()`) — the same head-and-terminal shape as
+  `RESULT_COLLECTOR` and `MERGE_GROUP_BY` (which still report `is_source() == true`).
 - **Backpressure as admission control**: if the channel is full or `_pending` is non-empty,
   `get_next_task_hint()` and `get_next_task_input_data()` return `WAITING{nullptr}` / `nullptr`
   respectively, preventing new tasks from being created. Worker threads never block.
@@ -396,7 +398,7 @@ After pipeline finalization, `source` and `sink` are just aliases for the first 
 |----------|----------|-----------|
 | GPU_SCAN | Scan | Unified GPU scan source served by `sirius_scan_manager` via a per-format `gpu_ingestible` |
 | STREAMING_SOURCE | Scan | Exchange-input source; pulls batch handles from `exchange_channel`, resolves via `shared_data_repository` |
-| STREAMING_SINK | Result | Exchange-output sink (CONCAT shape); registers batches in `shared_data_repository`, pushes handles to `exchange_channel` with backpressure |
+| STREAMING_SINK | Result | Exchange-output sink heading its own single-operator pipeline; registers batches in `shared_data_repository`, pushes handles to `exchange_channel` with backpressure |
 | DUMMY_SCAN | Scan | Generates 1 row |
 | COLUMN_DATA_SCAN | Scan | Reads ColumnDataCollection |
 | FILTER | Relational | `expression_evaluator::select()` |
