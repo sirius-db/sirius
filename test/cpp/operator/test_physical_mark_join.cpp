@@ -511,6 +511,54 @@ TEST_CASE("sirius_physical_hash_join mark join - right NULL key on build-on-left
   REQUIRE(copy_validity_to_host(mark) == std::vector<bool>{false, true, false, true});
 }
 
+// A MARK join must run in BUILD_PROBE mode, which is mutually exclusive with MIXED_JOIN. A MARK
+// join carrying both an equality and an inequality condition (the shape that would otherwise select
+// MIXED_JOIN) is therefore rejected at construction rather than silently mis-executed. No GPU is
+// needed: the constructor makes the mode decision from the conditions alone.
+TEST_CASE("sirius_physical_hash_join mark join - mixed conditions are unsupported",
+          "[physical_mark_join]")
+{
+  auto logical_join   = duckdb::make_uniq<duckdb::LogicalComparisonJoin>(duckdb::JoinType::MARK);
+  logical_join->types = {
+    duckdb::LogicalType::INTEGER, duckdb::LogicalType::INTEGER, duckdb::LogicalType::BOOLEAN};
+
+  auto left_child = duckdb::make_uniq<sirius_physical_operator>(
+    SiriusPhysicalOperatorType::PROJECTION,
+    sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER,
+                                                                duckdb::LogicalType::INTEGER}),
+    0);
+  auto right_child = duckdb::make_uniq<sirius_physical_operator>(
+    SiriusPhysicalOperatorType::PROJECTION,
+    sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER}),
+    0);
+
+  // Equality (left.col0 = right.col0) + inequality (left.col1 < right.col0) => mixed shape.
+  duckdb::vector<duckdb::JoinCondition> conditions;
+  duckdb::JoinCondition eq;
+  eq.left       = duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0);
+  eq.right      = duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0);
+  eq.comparison = duckdb::ExpressionType::COMPARE_EQUAL;
+  conditions.push_back(std::move(eq));
+  duckdb::JoinCondition lt;
+  lt.left       = duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 1);
+  lt.right      = duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0);
+  lt.comparison = duckdb::ExpressionType::COMPARE_LESSTHAN;
+  conditions.push_back(std::move(lt));
+
+  REQUIRE_THROWS_AS(duckdb::make_uniq<sirius_physical_hash_join>(
+                      *logical_join,
+                      std::move(left_child),
+                      std::move(right_child),
+                      sirius::wrap_join_conditions(std::move(conditions)),
+                      duckdb::JoinType::MARK,
+                      duckdb::vector<duckdb::idx_t>{},
+                      duckdb::vector<duckdb::idx_t>{},
+                      sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{}),
+                      1000,
+                      nullptr),
+                    std::runtime_error);
+}
+
 //===----------------------------------------------------------------------===//
 // Nested-loop join projection-map regression tests
 //===----------------------------------------------------------------------===//

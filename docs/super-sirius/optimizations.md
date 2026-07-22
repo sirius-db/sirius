@@ -60,12 +60,15 @@ num_partitions = max(1, ceil(total_bytes / hash_partition_bytes))
 **Motivation:** For small build-side datasets, building the hash table once and probing many times is more efficient than the standard multi-partition Cartesian product approach.
 
 **Mechanism:** `update_join_exec_mode()` switches to BUILD_PROBE mode when:
-- Only 1 partition
-- Build-side data < `max_build_hash_table_bytes`
+- `num_partitions <= num_gpus` (one hash table per partition, at most one partition per GPU; reduces to a single partition when `num_gpus == 1`)
+- per-partition average build side < `max_build_hash_table_bytes`, foldable to a single batch per partition
+- the join is neither RIGHT-family nor `MIXED_JOIN`
 
-In BUILD_PROBE mode, the first task builds a `cudf::hash_join` hash table and caches it. Subsequent tasks only probe.
+In BUILD_PROBE mode, each partition's first task builds a `cudf::hash_join` hash table and caches it; subsequent tasks for that partition only probe.
 
-**Code path:** `src/op/sirius_physical_hash_join.cpp` — `update_join_exec_mode()`
+**Broadcast small build tables (multi-GPU):** when the build side is small (`< small_table_bytes`), the PARTITION operator replicates it to every GPU (proposes `num_gpus` partitions, `_broadcast` flag) instead of funneling the build to one GPU, so every GPU builds its own hash table and probes locally. Build-only slots are discarded once the probe side finishes. Pure decision: `make_broadcast_partition_decision()`.
+
+**Code path:** `src/op/sirius_physical_hash_join.cpp` — `update_join_exec_mode()`, `build_probe_mode_eligible()`; `src/op/sirius_physical_partition.cpp` — `make_broadcast_partition_decision()`
 
 **Config:** `max_build_hash_table_bytes` (default: 500 MB)
 

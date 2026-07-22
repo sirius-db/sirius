@@ -63,6 +63,22 @@ GPU_POOL_RE = re.compile(
     r"reserved=(?P<reserved_bytes>\d+) bytes"
 )
 
+
+def is_pool_boundary_line(line: str) -> bool:
+    """True for the per-HOST / per-GPU memory-pool stat lines emitted at query
+    boundaries (both QueryBegin and QueryEnd).
+
+    These lines sit between the `[host_pool] QueryBegin` anchor and the
+    `QueryBegin: SQL:` line. There is one per HOST node and one per GPU, so on
+    multi-GPU systems the block spans many lines — the segmenter skips over it
+    to find the SQL line rather than assuming a fixed lookahead. The SQL line
+    itself is not matched here (it carries neither pool tag).
+    """
+    return ("[host_pool]" in line or "[gpu_pool]" in line) and (
+        "QueryBegin " in line or "QueryEnd " in line
+    )
+
+
 # Example: "[2026-06-11 ...] [info] [sirius_context.cpp:246] QueryBegin: SQL: select ..."
 # "SQL: " was added to distinguish the SQL line from the pool-stat lines that
 # also begin with "QueryBegin" (e.g. "[host_pool] HOST:-1 QueryBegin allocated=").

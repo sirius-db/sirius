@@ -236,16 +236,22 @@ mod tests {
             vec!["id".to_string(), "name".to_string()],
         );
 
-        // Drop the context before inspecting the result to prove the returned
-        // batches own their data independently of the engine context.
-        let batches = {
+        // Execute twice on one context to verify standalone query state is reset,
+        // then drop it before inspecting the returned owned batches.
+        let results = {
             let mut ctx = SiriusContext::new().expect("bring up sirius context");
-            ctx.execute_substrait(&plan)
-                .expect("execute substrait plan")
+            vec![
+                ctx.execute_substrait(&plan)
+                    .expect("execute first substrait plan"),
+                ctx.execute_substrait(&plan)
+                    .expect("execute second substrait plan"),
+            ]
         };
 
-        let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
-        assert_eq!(total_rows, 3, "expected 3 rows from the parquet fixture");
+        for batches in results {
+            let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+            assert_eq!(total_rows, 3, "expected 3 rows from the parquet fixture");
+        }
     }
 
     /// A missing config file is rejected before any GPU work (`load_from_file`
