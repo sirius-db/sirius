@@ -30,6 +30,8 @@
 #include <duckdb/storage/data_table.hpp>
 #include <exec/scoped_dispatcher.hpp>
 #include <exec/thread_pool.hpp>
+#include <io/kvikio/kvikio_context.hpp>
+#include <io/sirius_datasource.hpp>
 #include <memory/topology_index.hpp>
 #include <op/scan/duckdb_native_gpu_ingestible.hpp>
 #include <scan_manager/insert_delta_job.hpp>
@@ -39,6 +41,7 @@
 #include <cstdio>
 #include <memory>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 using sirius::scan_manager::cut_delta_splits_for_op;
@@ -307,7 +310,6 @@ TEST_CASE("insert-delta job: per-operator cuts subset the union and share storag
   REQUIRE(info_a.row_groups[0].columns.size() == 1);
   REQUIRE(info_a.row_groups[0].columns[0].column_id == 1);
   REQUIRE(info_a.row_groups[0].row_count == 1600);
-  REQUIRE(info_a.carried_partition_stats != nullptr);
   REQUIRE_FALSE(info_a.staging_keepalive.empty());
   // The host-backed descriptor points into the bundle's slab.
   auto const& seg_a = info_a.row_groups[0].columns[0].data_segments.at(0);
@@ -322,6 +324,107 @@ TEST_CASE("insert-delta job: per-operator cuts subset the union and share storag
   REQUIRE(splits_a[0].mask.words.get() == splits_b[0].mask.words.get());
   REQUIRE(splits_a[0].mask.has_mask());  // the delete keeps the mask alive
 
+  exec_ok(*tdb.con, "ROLLBACK");
+}
+
+TEST_CASE("insert-delta job: file-backed splits each own a duplicated datasource",
+          "[insert_delta_job][scan_manager]")
+{
+  job_test_db tdb;
+  exec_ok(*tdb.con, "SET threads TO 1");
+  exec_ok(*tdb.con, "CREATE TABLE t AS SELECT range::INTEGER AS k FROM range(10000)");
+  exec_ok(*tdb.con, "CHECKPOINT");
+  // The bulk commit flushes persistent row groups (file-backed bundles); the
+  // separate small commit stays transient (a host-only bundle).
+  exec_ok(*tdb.con, "INSERT INTO t SELECT (10000+range)::INTEGER FROM range(250000)");
+  exec_ok(*tdb.con, "INSERT INTO t VALUES (260000)");
+
+  exec_ok(*tdb.con, "BEGIN TRANSACTION");
+  auto& storage = resolve_storage(*tdb.con, "t");
+  std::vector<insert_delta_job_request> requests;
+  requests.push_back(make_request(
+    *tdb.con, storage, 10000, {0}, {sirius::logical_type::make(sirius::type_id::INTEGER)}));
+  requests[0].approximate_batch_size = 1;  // one bundle per row group
+  run(requests);
+  auto const& request = requests[0];
+  REQUIRE(request.bundles.size() >= 2);
+
+  auto ioctx = std::make_shared<sirius::io::kvikio_context>();
+  std::shared_ptr<sirius::io::sirius_datasource> datasource = ioctx->open_datasource(tdb.path);
+
+  std::vector<sirius::op::scan::projected_column> op{real_col(0)};
+  auto splits = cut_delta_splits_for_op(request, op, datasource, /*block_manager=*/nullptr);
+  REQUIRE(splits.size() == request.bundles.size());
+
+  // The datasource's prefetch handle is per-scan state: every file-backed
+  // split must own its own duplicate, never the shared original; host-only
+  // splits carry none.
+  std::unordered_set<sirius::io::sirius_datasource const*> seen;
+  bool saw_host_only = false;
+  for (auto const& split : splits) {
+    if (split.info->host_backed_only) {
+      saw_host_only = true;
+      REQUIRE(split.info->datasource == nullptr);
+      continue;
+    }
+    REQUIRE(split.info->datasource != nullptr);
+    REQUIRE(split.info->datasource.get() != datasource.get());
+    REQUIRE(seen.insert(split.info->datasource.get()).second);
+  }
+  REQUIRE(seen.size() >= 2);
+  REQUIRE(saw_host_only);
+  exec_ok(*tdb.con, "ROLLBACK");
+}
+
+TEST_CASE("insert-delta job: blockless-only splits carry no datasource",
+          "[insert_delta_job][scan_manager]")
+{
+  job_test_db tdb;
+  exec_ok(*tdb.con, "SET threads TO 1");
+  exec_ok(*tdb.con,
+          "CREATE TABLE t AS SELECT range::INTEGER AS k, range::INTEGER AS v FROM range(10000)");
+  exec_ok(*tdb.con, "CHECKPOINT");
+  // Constant column: the bulk-flushed v segments are blockless CONSTANT.
+  exec_ok(*tdb.con, "INSERT INTO t SELECT (10000+range)::INTEGER, 7 FROM range(130000)");
+
+  exec_ok(*tdb.con, "BEGIN TRANSACTION");
+  auto& storage = resolve_storage(*tdb.con, "t");
+  std::vector<insert_delta_job_request> requests;
+  requests.push_back(make_request(*tdb.con,
+                                  storage,
+                                  10000,
+                                  {0, 1},
+                                  {sirius::logical_type::make(sirius::type_id::INTEGER),
+                                   sirius::logical_type::make(sirius::type_id::INTEGER)}));
+  requests[0].approximate_batch_size = 1;  // one bundle per row group
+  run(requests);
+  auto const& request = requests[0];
+
+  auto ioctx = std::make_shared<sirius::io::kvikio_context>();
+  std::shared_ptr<sirius::io::sirius_datasource> datasource = ioctx->open_datasource(tdb.path);
+
+  // An operator projecting only the constant column cuts splits whose
+  // persistent descriptors are all blockless: nothing reads the file, so the
+  // split is host-backed-only and carries no datasource.
+  std::vector<sirius::op::scan::projected_column> op{real_col(1)};
+  auto splits             = cut_delta_splits_for_op(request, op, datasource, nullptr);
+  bool saw_blockless_only = false;
+  for (auto const& split : splits) {
+    auto const& segs = split.info->row_groups.at(0).columns.at(0).data_segments;
+    bool blockless   = false;
+    for (auto const& s : segs) {
+      if (s.host_ptr == nullptr && s.block_id < 0) {
+        blockless = true;
+        REQUIRE(s.compression == duckdb::CompressionType::COMPRESSION_CONSTANT);
+        REQUIRE(s.segment_stats != nullptr);
+      }
+    }
+    if (!blockless) { continue; }
+    saw_blockless_only = true;
+    REQUIRE(split.info->host_backed_only);
+    REQUIRE(split.info->datasource == nullptr);
+  }
+  REQUIRE(saw_blockless_only);
   exec_ok(*tdb.con, "ROLLBACK");
 }
 

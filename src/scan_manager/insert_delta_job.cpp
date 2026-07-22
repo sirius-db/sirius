@@ -325,7 +325,6 @@ std::vector<insert_delta_split> cut_delta_splits_for_op(
   out.reserve(request.bundles.size());
   for (auto const& bundle : request.bundles) {
     auto info           = std::make_unique<op::scan::duckdb_native_scan_info>();
-    info->datasource    = datasource;
     info->block_manager = block_manager;
     if (bundle.staging) { info->staging_keepalive.push_back(bundle.staging); }
 
@@ -360,6 +359,10 @@ std::vector<insert_delta_split> cut_delta_splits_for_op(
       info->row_groups.push_back(std::move(md));
     }
     info->host_backed_only = !any_file_read;
+    // The prefetch handle inside a datasource is per-scan mutable state, so
+    // every file-backed split owns a fresh duplicate (matching the native-scan
+    // coalescer); splits that read no file carry none.
+    if (any_file_read && datasource) { info->datasource = datasource->duplicate(); }
 
     out.push_back({std::move(info), bundle.mask, bundle.preferred_device});
   }
