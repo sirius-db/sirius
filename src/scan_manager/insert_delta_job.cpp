@@ -63,6 +63,7 @@ std::size_t numa_node_for_device(int device, sirius::memory::topology_index cons
 
 insert_delta_workset prepare_insert_delta_tasks(
   std::span<insert_delta_job_request> requests,
+  exec::scoped_dispatcher& dispatcher,
   cucascade::memory::memory_reservation_manager& reservation_manager,
   sirius::memory::topology_index const& topology,
   std::span<int const> gpu_ids)
@@ -82,27 +83,71 @@ insert_delta_workset prepare_insert_delta_tasks(
   }
   auto const block_size = probe_fsmr->get_block_size();
 
-  std::size_t next_device = 0;
-
+  // Capture phase 1, serial: the ClientContext-touching transaction/buffer-
+  // manager capture and row-group skeleton enumeration.
   for (auto& request : requests) {
     if (!request.storage || !request.context) {
       throw std::runtime_error(
         "[prepare_insert_delta_tasks] malformed delta request for pinned entry '" +
         request.entry_name + "'");
     }
-
-    // Captures run serially on this thread; ClientContext is not thread-safe.
     try {
-      request.plan = op::scan::capture_insert_delta_plan(*request.storage,
-                                                         *request.context,
-                                                         request.n_cache,
-                                                         request.union_cols,
-                                                         request.union_types);
+      request.plan =
+        op::scan::prepare_insert_delta_capture(*request.storage, *request.context, request.n_cache);
     } catch (std::exception const& e) {
       throw std::runtime_error("[prepare_insert_delta_tasks] pinned entry '" + request.entry_name +
                                "': " + e.what());
     }
     request.bundles.clear();
+  }
+
+  // Capture phase 2, parallel: the column segment-tree walks, in row-group
+  // ranges of the shared metadata parse granularity. Each task fills its own
+  // output; the merge below reassembles row-group order deterministically.
+  {
+    struct capture_range_work {
+      insert_delta_job_request* request{nullptr};
+      std::size_t rg_begin{0};
+      std::size_t rg_end{0};
+      std::vector<op::scan::insert_delta_row_group> out;
+    };
+    std::vector<std::unique_ptr<capture_range_work>> range_works;
+    auto const parse_chunk = op::scan::metadata_parse_chunk();
+    for (auto& request : requests) {
+      auto const n_rgs = request.plan.row_groups.size();
+      for (std::size_t begin = 0; begin < n_rgs; begin += parse_chunk) {
+        auto work      = std::make_unique<capture_range_work>();
+        work->request  = &request;
+        work->rg_begin = begin;
+        work->rg_end   = std::min(begin + parse_chunk, n_rgs);
+        range_works.push_back(std::move(work));
+      }
+    }
+    std::vector<absl::AnyInvocable<void()>> range_tasks;
+    range_tasks.reserve(range_works.size());
+    for (auto& work : range_works) {
+      range_tasks.push_back([work_ptr = work.get()] {
+        auto* req = work_ptr->request;
+        try {
+          work_ptr->out = op::scan::capture_insert_delta_row_group_range(
+            req->plan, work_ptr->rg_begin, work_ptr->rg_end, req->union_cols, req->union_types);
+        } catch (std::exception const& e) {
+          throw std::runtime_error("[prepare_insert_delta_tasks] pinned entry '" + req->entry_name +
+                                   "': " + e.what());
+        }
+      });
+    }
+    fan_out_and_join(dispatcher, std::move(range_tasks), "insert-delta capture");
+    for (auto& work : range_works) {
+      for (std::size_t i = 0; i < work->out.size(); ++i) {
+        work->request->plan.row_groups[work->rg_begin + i] = std::move(work->out[i]);
+      }
+    }
+  }
+
+  std::size_t next_device = 0;
+
+  for (auto& request : requests) {
     if (request.plan.empty()) { continue; }
 
     // Close a bundle on the byte budget, the cudf int32 varchar threshold, or
@@ -263,7 +308,8 @@ void run_insert_delta_jobs(std::span<insert_delta_job_request> requests,
                            sirius::memory::topology_index const& topology,
                            std::span<int const> gpu_ids)
 {
-  auto workset = prepare_insert_delta_tasks(requests, reservation_manager, topology, gpu_ids);
+  auto workset =
+    prepare_insert_delta_tasks(requests, dispatcher, reservation_manager, topology, gpu_ids);
   if (workset.fill_tasks.empty()) { return; }
   SIRIUS_LOG_DEBUG("[run_insert_delta_jobs] {} bundle(s) across {} request(s)",
                    workset.works.size(),

@@ -212,19 +212,106 @@ void walk_delta_tree(duckdb::ColumnSegmentTree& tree,
   }
 }
 
-}  // namespace
-
-insert_delta_plan capture_insert_delta_plan(
-  duckdb::DataTable& storage,
-  duckdb::ClientContext& context,
-  std::size_t n_cache,
+/// Fill one skeleton row group: walk its column segment trees into columns,
+/// assign staging slab offsets, and compute the byte budgets. Task-safe.
+insert_delta_row_group complete_delta_row_group(
+  insert_delta_row_group const& skeleton,
   std::span<duckdb::storage_t const> storage_column_indices,
   std::span<sirius::logical_type const> column_types)
 {
-  if (storage_column_indices.size() != column_types.size()) {
-    throw_capture("column index / type lists are not parallel");
+  insert_delta_row_group rg_plan = skeleton;
+  auto& rg                       = *rg_plan.row_group;
+  auto const rg_index            = rg_plan.row_group_index;
+
+  std::size_t slab   = 0;
+  std::size_t budget = 0;
+  rg_plan.varchar_bytes_per_col.assign(storage_column_indices.size(), 0);
+
+  for (std::size_t ci = 0; ci < storage_column_indices.size(); ++ci) {
+    auto const col   = storage_column_indices[ci];
+    auto& col_data   = rg.GetRawColumnData(col);
+    auto const& type = column_types[ci];
+
+    if (type.is_array() || dynamic_cast<duckdb::ArrayColumnData*>(&col_data) != nullptr) {
+      // ARRAY deltas are declined at plan time; hitting this means the
+      // delta appeared between plan and prepare.
+      throw_capture("ARRAY column " + std::to_string(col) +
+                    " in the insert delta is not supported");
+    }
+    auto* std_col = dynamic_cast<duckdb::StandardColumnData*>(&col_data);
+    if (std_col == nullptr) {
+      throw_capture("column " + std::to_string(col) + " storage for type " + type.to_string() +
+                    " is not StandardColumnData (nested/unsupported)");
+    }
+
+    insert_delta_column col_plan;
+    col_plan.column_id  = col;
+    col_plan.is_varchar = type.is_varchar();
+    walk_delta_tree(std_col->GetSegmentTree(),
+                    /*is_validity=*/false,
+                    col_plan.is_varchar,
+                    type,
+                    col,
+                    rg_index,
+                    rg_plan.k_offset,
+                    rg_plan.row_count,
+                    col_plan.data_segments);
+    walk_delta_tree(std_col->GetValidityData().GetSegmentTree(),
+                    /*is_validity=*/true,
+                    /*is_varchar=*/false,
+                    type,
+                    col,
+                    rg_index,
+                    rg_plan.k_offset,
+                    rg_plan.row_count,
+                    col_plan.validity_segments);
+
+    // The data segments must tile the delta slice exactly; a gap would
+    // decode garbage rows the mask never drops.
+    std::size_t data_rows = 0;
+    for (auto const& s : col_plan.data_segments) {
+      data_rows += s.segment_count;
+    }
+    if (data_rows != rg_plan.row_count) {
+      throw_capture("column " + std::to_string(col) + " row group " + std::to_string(rg_index) +
+                    ": delta segments cover " + std::to_string(data_rows) + " of " +
+                    std::to_string(rg_plan.row_count) + " rows");
+    }
+
+    for (auto* segs : {&col_plan.data_segments, &col_plan.validity_segments}) {
+      for (auto& s : *segs) {
+        if (!s.is_transient) { continue; }
+        slab          = (slab + 7) / 8 * 8;  // 8-byte align within the slab
+        s.slab_offset = slab;
+        slab += s.bytes_size;
+      }
+    }
+    if (col_plan.is_varchar) {
+      std::size_t varchar_bytes = 0;
+      for (auto const& s : col_plan.data_segments) {
+        varchar_bytes +=
+          s.segment_count * (s.max_string_length.has_value() ? *s.max_string_length : 0);
+      }
+      rg_plan.varchar_bytes_per_col[ci] = varchar_bytes;
+      budget += rg_plan.row_count * sizeof(std::uint32_t) + varchar_bytes;
+    } else {
+      budget += rg_plan.row_count * type.fixed_width_byte_size();
+    }
+
+    rg_plan.columns.push_back(std::move(col_plan));
   }
 
+  rg_plan.transient_staging_bytes = slab;
+  rg_plan.decoded_bytes_budget    = budget;
+  return rg_plan;
+}
+
+}  // namespace
+
+insert_delta_plan prepare_insert_delta_capture(duckdb::DataTable& storage,
+                                               duckdb::ClientContext& context,
+                                               std::size_t n_cache)
+{
   insert_delta_plan plan;
   auto& txn           = duckdb::DuckTransaction::Get(context, storage.GetAttached());
   plan.transaction    = duckdb::TransactionData(txn);
@@ -254,88 +341,45 @@ insert_delta_plan capture_insert_delta_plan(
     rg_plan.has_version_state =
       duckdb::RowGroup::GetPartitionStats(*node).count_type == duckdb::CountType::COUNT_APPROXIMATE;
 
-    std::size_t slab   = 0;
-    std::size_t budget = 0;
-    rg_plan.varchar_bytes_per_col.assign(storage_column_indices.size(), 0);
-
-    for (std::size_t ci = 0; ci < storage_column_indices.size(); ++ci) {
-      auto const col   = storage_column_indices[ci];
-      auto& col_data   = rg.GetRawColumnData(col);
-      auto const& type = column_types[ci];
-
-      if (type.is_array() || dynamic_cast<duckdb::ArrayColumnData*>(&col_data) != nullptr) {
-        // ARRAY deltas are declined at plan time; hitting this means the
-        // delta appeared between plan and prepare.
-        throw_capture("ARRAY column " + std::to_string(col) +
-                      " in the insert delta is not supported");
-      }
-      auto* std_col = dynamic_cast<duckdb::StandardColumnData*>(&col_data);
-      if (std_col == nullptr) {
-        throw_capture("column " + std::to_string(col) + " storage for type " + type.to_string() +
-                      " is not StandardColumnData (nested/unsupported)");
-      }
-
-      insert_delta_column col_plan;
-      col_plan.column_id  = col;
-      col_plan.is_varchar = type.is_varchar();
-      walk_delta_tree(std_col->GetSegmentTree(),
-                      /*is_validity=*/false,
-                      col_plan.is_varchar,
-                      type,
-                      col,
-                      rg_index,
-                      rg_plan.k_offset,
-                      rg_plan.row_count,
-                      col_plan.data_segments);
-      walk_delta_tree(std_col->GetValidityData().GetSegmentTree(),
-                      /*is_validity=*/true,
-                      /*is_varchar=*/false,
-                      type,
-                      col,
-                      rg_index,
-                      rg_plan.k_offset,
-                      rg_plan.row_count,
-                      col_plan.validity_segments);
-
-      // The data segments must tile the delta slice exactly; a gap would
-      // decode garbage rows the mask never drops.
-      std::size_t data_rows = 0;
-      for (auto const& s : col_plan.data_segments) {
-        data_rows += s.segment_count;
-      }
-      if (data_rows != rg_plan.row_count) {
-        throw_capture("column " + std::to_string(col) + " row group " + std::to_string(rg_index) +
-                      ": delta segments cover " + std::to_string(data_rows) + " of " +
-                      std::to_string(rg_plan.row_count) + " rows");
-      }
-
-      for (auto* segs : {&col_plan.data_segments, &col_plan.validity_segments}) {
-        for (auto& s : *segs) {
-          if (!s.is_transient) { continue; }
-          slab          = (slab + 7) / 8 * 8;  // 8-byte align within the slab
-          s.slab_offset = slab;
-          slab += s.bytes_size;
-        }
-      }
-      if (col_plan.is_varchar) {
-        std::size_t varchar_bytes = 0;
-        for (auto const& s : col_plan.data_segments) {
-          varchar_bytes +=
-            s.segment_count * (s.max_string_length.has_value() ? *s.max_string_length : 0);
-        }
-        rg_plan.varchar_bytes_per_col[ci] = varchar_bytes;
-        budget += rg_plan.row_count * sizeof(std::uint32_t) + varchar_bytes;
-      } else {
-        budget += rg_plan.row_count * type.fixed_width_byte_size();
-      }
-
-      rg_plan.columns.push_back(std::move(col_plan));
-    }
-
-    rg_plan.transient_staging_bytes = slab;
-    rg_plan.decoded_bytes_budget    = budget;
     plan.row_groups.push_back(std::move(rg_plan));
   }
+  return plan;
+}
+
+std::vector<insert_delta_row_group> capture_insert_delta_row_group_range(
+  insert_delta_plan const& plan,
+  std::size_t rg_begin,
+  std::size_t rg_end,
+  std::span<duckdb::storage_t const> storage_column_indices,
+  std::span<sirius::logical_type const> column_types)
+{
+  if (storage_column_indices.size() != column_types.size()) {
+    throw_capture("column index / type lists are not parallel");
+  }
+
+  rg_end = std::min(rg_end, plan.row_groups.size());
+  std::vector<insert_delta_row_group> out;
+  if (rg_begin >= rg_end) { return out; }
+  out.reserve(rg_end - rg_begin);
+  for (std::size_t i = rg_begin; i < rg_end; ++i) {
+    out.push_back(
+      complete_delta_row_group(plan.row_groups[i], storage_column_indices, column_types));
+  }
+  return out;
+}
+
+insert_delta_plan capture_insert_delta_plan(
+  duckdb::DataTable& storage,
+  duckdb::ClientContext& context,
+  std::size_t n_cache,
+  std::span<duckdb::storage_t const> storage_column_indices,
+  std::span<sirius::logical_type const> column_types)
+{
+  auto plan = prepare_insert_delta_capture(storage, context, n_cache);
+  // Run the range walk even on an empty plan so the parallel-lists check
+  // fires the same way in both call shapes.
+  plan.row_groups = capture_insert_delta_row_group_range(
+    plan, 0, plan.row_groups.size(), storage_column_indices, column_types);
   return plan;
 }
 

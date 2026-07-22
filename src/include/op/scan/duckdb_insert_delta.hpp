@@ -121,19 +121,43 @@ struct insert_delta_plan {
 };
 
 /**
- * Build the insert-delta plan for one pinned duckdb table. Serial: call from
- * the prepare/query thread only, since it uses the ClientContext and takes
- * segment tree locks.
+ * Capture phase 1 (serial; prepare/query thread only — the only phase that
+ * touches the ClientContext). Captures the transaction, buffer manager, and
+ * n_total snapshot, then enumerates skeleton row groups overlapping
+ * [n_cache, n_total): pointers, indices, boundaries (clamped to the
+ * snapshot), and version-state flags. Columns, staging offsets, and budgets
+ * stay empty until capture_insert_delta_row_group_range fills them.
+ */
+insert_delta_plan prepare_insert_delta_capture(duckdb::DataTable& storage,
+                                               duckdb::ClientContext& context,
+                                               std::size_t n_cache);
+
+/**
+ * Capture phase 2: walk the column segment trees for skeleton row groups
+ * [rg_begin, min(rg_end, size)) of @p plan and return the completed row
+ * groups in order. Task-safe — touches only the row-group column trees
+ * (under their segment-tree locks), never the ClientContext or LocalStorage;
+ * disjoint ranges of one plan may run concurrently.
  *
- * Walks the row groups overlapping [n_cache, GetTotalRows()). Throws on
- * states the plan-time guards should have excluded or that break the pin
- * contract: a compressed transient segment, a varchar segment at the
+ * Throws on states the plan-time guards should have excluded or that break
+ * the pin contract: a compressed transient segment, a varchar segment at the
  * overflow-block limit, an unsupported persistent codec, an ARRAY column, or
  * non-StandardColumnData storage.
  *
  * @param storage_column_indices Union of the querying operators' storage
  *        columns; per-operator splits are cut from it later.
  * @param column_types Parallel to storage_column_indices.
+ */
+std::vector<insert_delta_row_group> capture_insert_delta_row_group_range(
+  insert_delta_plan const& plan,
+  std::size_t rg_begin,
+  std::size_t rg_end,
+  std::span<duckdb::storage_t const> storage_column_indices,
+  std::span<sirius::logical_type const> column_types);
+
+/**
+ * Serial convenience: prepare_insert_delta_capture plus one full-plan
+ * capture_insert_delta_row_group_range on the calling thread.
  */
 insert_delta_plan capture_insert_delta_plan(
   duckdb::DataTable& storage,

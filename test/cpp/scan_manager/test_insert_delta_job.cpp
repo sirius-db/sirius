@@ -39,6 +39,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <memory>
 #include <string>
 #include <unordered_set>
@@ -425,6 +426,55 @@ TEST_CASE("insert-delta job: blockless-only splits carry no datasource",
     REQUIRE(split.info->datasource == nullptr);
   }
   REQUIRE(saw_blockless_only);
+  exec_ok(*tdb.con, "ROLLBACK");
+}
+
+TEST_CASE("insert-delta job: a delta spanning multiple capture ranges merges in order",
+          "[insert_delta_job][scan_manager]")
+{
+  // One row group per capture range so the delta below spans several
+  // dispatcher tasks.
+  setenv("SIRIUS_METADATA_PARSE_CHUNK", "1", 1);
+  struct chunk_env_restore {
+    ~chunk_env_restore() { unsetenv("SIRIUS_METADATA_PARSE_CHUNK"); }
+  } restore;
+
+  job_test_db tdb;
+  exec_ok(*tdb.con, "SET threads TO 1");
+  exec_ok(*tdb.con, "CREATE TABLE t AS SELECT range::INTEGER AS k FROM range(10000)");
+  exec_ok(*tdb.con, "CHECKPOINT");
+  exec_ok(*tdb.con, "INSERT INTO t SELECT (10000+range)::INTEGER FROM range(250000)");
+  exec_ok(*tdb.con, "INSERT INTO t VALUES (260000)");
+
+  exec_ok(*tdb.con, "BEGIN TRANSACTION");
+  auto& storage = resolve_storage(*tdb.con, "t");
+  std::vector<insert_delta_job_request> requests;
+  requests.push_back(make_request(
+    *tdb.con, storage, 10000, {0}, {sirius::logical_type::make(sirius::type_id::INTEGER)}));
+  run(requests);
+
+  auto const& request = requests[0];
+  REQUIRE(request.plan.row_groups.size() >= 3);
+
+  // Row-group order, contiguous boundaries, and filled columns survive the
+  // parallel merge.
+  std::size_t expected_start = 10000;
+  std::size_t plan_rows      = 0;
+  for (auto const& rg : request.plan.row_groups) {
+    REQUIRE(rg.row_group_start == expected_start);
+    REQUIRE(rg.k_offset == 0);
+    REQUIRE_FALSE(rg.columns.empty());
+    REQUIRE(rg.decoded_bytes_budget == rg.row_count * sizeof(int32_t));
+    expected_start += rg.row_count;
+    plan_rows += rg.row_count;
+  }
+  REQUIRE(plan_rows == 250001);
+
+  std::size_t bundle_rows = 0;
+  for (auto const& b : request.bundles) {
+    bundle_rows += b.total_rows;
+  }
+  REQUIRE(bundle_rows == 250001);
   exec_ok(*tdb.con, "ROLLBACK");
 }
 

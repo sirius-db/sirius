@@ -112,9 +112,12 @@ struct insert_delta_workset {
 };
 
 /**
- * Build the workset for every pending request: capture serially (ClientContext
- * is not thread-safe), plan bundles, carve staging and masks, build fill
- * tasks. Nothing is dispatched here.
+ * Build the workset for every pending request: capture, plan bundles, carve
+ * staging and masks, build fill tasks. The capture is two-phase — a serial
+ * prepare does the ClientContext-touching work (transaction, buffer manager,
+ * row-group skeletons), then the column segment-tree walks fan out over
+ * @p dispatcher in metadata_parse_chunk()-sized row-group ranges and merge
+ * back in row-group order. The fill tasks themselves are not dispatched here.
  *
  * A bundle closes when the next row group would exceed the
  * approximate_batch_size byte budget, push a varchar column past the cudf
@@ -126,10 +129,12 @@ struct insert_delta_workset {
  * bytes fit, else pageable memory. Mask words start zeroed; fill tasks set
  * visible bits only.
  *
- * @throws std::runtime_error on capture, validation, or reservation failure.
+ * @throws std::runtime_error on capture, validation, or reservation failure;
+ *         capture-range worker exceptions propagate through fan_out_and_join.
  */
 [[nodiscard]] insert_delta_workset prepare_insert_delta_tasks(
   std::span<insert_delta_job_request> requests,
+  exec::scoped_dispatcher& dispatcher,
   cucascade::memory::memory_reservation_manager& reservation_manager,
   sirius::memory::topology_index const& topology,
   std::span<int const> gpu_ids);

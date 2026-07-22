@@ -396,6 +396,91 @@ TEST_CASE("insert delta: all-NULL constant validity is captured, not skipped",
   exec_ok(*env.con, "ROLLBACK");
 }
 
+TEST_CASE("insert delta: range capture merges to the serial plan", "[duckdb_insert_delta][scan]")
+{
+  delta_test_db env;
+  exec_ok(*env.con, "SET threads TO 1");
+  exec_ok(*env.con,
+          "CREATE TABLE t AS SELECT range::INTEGER AS k, 'row_'||range AS s FROM range(10000)");
+  exec_ok(*env.con, "CHECKPOINT");
+  // Four delta row groups: three persistent from the bulk flush plus the
+  // transient tail append.
+  exec_ok(*env.con,
+          "INSERT INTO t SELECT (10000+range)::INTEGER, 'row_'||(10000+range) FROM range(250000)");
+  exec_ok(*env.con, "INSERT INTO t VALUES (260000, 'tail')");
+
+  exec_ok(*env.con, "BEGIN TRANSACTION");
+  auto& storage = resolve_storage(*env.con, "t");
+  std::vector<duckdb::storage_t> const cols{0, 1};
+  std::vector<sirius::logical_type> types{sirius::logical_type::make(sirius::type_id::INTEGER),
+                                          sirius::logical_type::make(sirius::type_id::VARCHAR)};
+
+  auto serial = capture_insert_delta_plan(storage, *env.con->context, 10000, cols, types);
+  REQUIRE(serial.row_groups.size() >= 3);
+
+  auto plan = prepare_insert_delta_capture(storage, *env.con->context, 10000);
+  REQUIRE(plan.row_groups.size() == serial.row_groups.size());
+  for (auto const& rg : plan.row_groups) {
+    REQUIRE(rg.columns.empty());  // skeletons carry boundaries only
+  }
+
+  // Step-3 ranges leave a short tail range, and an oversized rg_end clamps.
+  std::vector<insert_delta_row_group> merged;
+  for (std::size_t begin = 0; begin < plan.row_groups.size(); begin += 3) {
+    auto part = capture_insert_delta_row_group_range(plan, begin, begin + 3, cols, types);
+    for (auto& rg : part) {
+      merged.push_back(std::move(rg));
+    }
+  }
+  REQUIRE(merged.size() == serial.row_groups.size());
+  REQUIRE(capture_insert_delta_row_group_range(
+            plan, plan.row_groups.size(), plan.row_groups.size() + 5, cols, types)
+            .empty());
+
+  auto require_same_segments = [](std::vector<insert_delta_segment> const& a,
+                                  std::vector<insert_delta_segment> const& b) {
+    REQUIRE(a.size() == b.size());
+    for (std::size_t i = 0; i < a.size(); ++i) {
+      REQUIRE(a[i].segment == b[i].segment);
+      REQUIRE(a[i].is_transient == b[i].is_transient);
+      REQUIRE(a[i].is_validity == b[i].is_validity);
+      REQUIRE(a[i].all_null == b[i].all_null);
+      REQUIRE((a[i].segment_stats != nullptr) == (b[i].segment_stats != nullptr));
+      REQUIRE(a[i].block_id == b[i].block_id);
+      REQUIRE(a[i].additional_blocks == b[i].additional_blocks);
+      REQUIRE(a[i].block_offset == b[i].block_offset);
+      REQUIRE(a[i].segment_start == b[i].segment_start);
+      REQUIRE(a[i].segment_count == b[i].segment_count);
+      REQUIRE(a[i].compression == b[i].compression);
+      REQUIRE(a[i].max_string_length == b[i].max_string_length);
+      REQUIRE(a[i].bytes_size == b[i].bytes_size);
+      REQUIRE(a[i].copy_src_offset == b[i].copy_src_offset);
+      REQUIRE(a[i].slab_offset == b[i].slab_offset);
+    }
+  };
+  for (std::size_t r = 0; r < merged.size(); ++r) {
+    auto const& a = merged[r];
+    auto const& b = serial.row_groups[r];
+    REQUIRE(a.row_group == b.row_group);
+    REQUIRE(a.row_group_index == b.row_group_index);
+    REQUIRE(a.row_group_start == b.row_group_start);
+    REQUIRE(a.k_offset == b.k_offset);
+    REQUIRE(a.row_count == b.row_count);
+    REQUIRE(a.has_version_state == b.has_version_state);
+    REQUIRE(a.transient_staging_bytes == b.transient_staging_bytes);
+    REQUIRE(a.decoded_bytes_budget == b.decoded_bytes_budget);
+    REQUIRE(a.varchar_bytes_per_col == b.varchar_bytes_per_col);
+    REQUIRE(a.columns.size() == b.columns.size());
+    for (std::size_t c = 0; c < a.columns.size(); ++c) {
+      REQUIRE(a.columns[c].column_id == b.columns[c].column_id);
+      REQUIRE(a.columns[c].is_varchar == b.columns[c].is_varchar);
+      require_same_segments(a.columns[c].data_segments, b.columns[c].data_segments);
+      require_same_segments(a.columns[c].validity_segments, b.columns[c].validity_segments);
+    }
+  }
+  exec_ok(*env.con, "ROLLBACK");
+}
+
 TEST_CASE("insert delta: no delta means an empty plan", "[duckdb_insert_delta][scan]")
 {
   delta_test_db env;
