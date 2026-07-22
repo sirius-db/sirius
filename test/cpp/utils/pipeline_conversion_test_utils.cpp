@@ -142,12 +142,7 @@ void with_conversion_result(
     sirius::planner::sirius_physical_plan_generator physical_planner(context);
     auto sirius_plan = physical_planner.create_plan(std::move(logical_plan));
 
-    // Mirror the engine's initialize path so these conversion dumps reflect merge fusion when it
-    // is enabled (the default). `create_plan` already ran `set_parent_ops` and nothing rewrites
-    // the tree afterward, so the parent pointers `mark_fusable_merge_pipelines` walks are valid.
-    // Unlike production this path adds no RESULT_COLLECTOR wrap, so a merge that is itself the
-    // plan root has no downstream sink and stays unfused; structural-sink fusion (merge folded
-    // into an ORDER_BY / TOP_N / outer GROUP BY sink) is captured.
+    // Apply fusion before conversion; this path has no RESULT_COLLECTOR wrapper.
     sirius::planner::sirius_physical_plan_generator::mark_fusable_merge_pipelines(context,
                                                                                   *sirius_plan);
 

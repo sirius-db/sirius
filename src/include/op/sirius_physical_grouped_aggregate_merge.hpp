@@ -128,8 +128,7 @@ class sirius_physical_grouped_aggregate_merge : public sirius_physical_partition
 
   bool sink_order_dependent() const override { return false; }
 
-  //! Whether this merge joins its downstream pipeline. Set only during planning (see the friend
-  //! below); read-only thereafter to honor the no-mutation-after-planning contract.
+  //! Whether this merge joins its downstream pipeline.
   [[nodiscard]] bool fuse_into_parent() const noexcept { return _fuse_into_parent; }
 
   void build_pipelines(pipeline::sirius_pipeline& current,
@@ -144,7 +143,6 @@ class sirius_physical_grouped_aggregate_merge : public sirius_physical_partition
                                          rmm::cuda_stream_view stream) override;
 
  private:
-  //! The plan-generator is the sole writer of the fusion flag, and only at plan time.
   friend class sirius::planner::sirius_physical_plan_generator;
   void set_fuse_into_parent(bool fuse) noexcept { _fuse_into_parent = fuse; }
 

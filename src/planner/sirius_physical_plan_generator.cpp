@@ -803,10 +803,7 @@ bool merge_downstream_is_streaming_dead_end(const sirius::op::sirius_physical_op
 void sirius_physical_plan_generator::mark_fusable_merge_pipelines(
   duckdb::ClientContext& context, sirius::op::sirius_physical_operator& op)
 {
-  // Read the per-connection `fuse_merge_pipelines` setting once for the whole traversal. It is a
-  // real DuckDB ClientContext setting (not a process-global), so this read cannot race a
-  // concurrent connection's `SET` and cannot inherit another connection's policy. Snapshotting
-  // once also keeps the decision consistent across every node in this plan.
+  // Keep the fusion decision consistent throughout this plan traversal.
   duckdb::Value setting;
   bool fusion_enabled = true;  // matches the registered default
   if (context.TryGetCurrentSetting("fuse_merge_pipelines", setting) && !setting.IsNull()) {

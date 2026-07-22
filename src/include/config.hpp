@@ -60,10 +60,6 @@ struct Config {
   // Whether to use modified pipeline for the new execution model
   static bool MODIFIED_PIPELINE;
 
-  // NOTE: `fuse_merge_pipelines` is intentionally NOT a Config static. It is a per-connection
-  // DuckDB setting read via ClientContext::TryGetCurrentSetting during planning, so it cannot
-  // race or leak across connections. See SetFuseMergePipelines / mark_fusable_merge_pipelines.
-
   // For duckdb scan task:
   //  - the default batch size
   // TODO: probably want to use sirius config for this value

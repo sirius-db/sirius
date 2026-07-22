@@ -171,9 +171,7 @@ std::string dump_pipeline_shapes(
   return out;
 }
 
-//! Collect all rows as vectors of stringified values. When `ordered` is false the rows are sorted
-//! for order-independent comparison; when true they are left in emission order so a fusion bug that
-//! scrambles a query's ORDER BY is not masked by re-sorting both sides.
+//! Collect rows, sorting them unless emission order is significant.
 std::vector<std::vector<std::string>> collect_rows(duckdb::MaterializedQueryResult& result,
                                                    bool ordered)
 {
@@ -190,11 +188,7 @@ std::vector<std::vector<std::string>> collect_rows(duckdb::MaterializedQueryResu
   return rows;
 }
 
-//! Run `query` on the GPU with fusion enabled and disabled, asserting both ran transparently on
-//! the GPU and returned identical results. Toggling via `SET fuse_merge_pipelines` also exercises
-//! the extension-option wiring end to end. Pass `ordered=true` for queries whose output has a
-//! defined total order (e.g. an ORDER BY over a unique key) so the comparison verifies fusion
-//! preserves that order instead of re-sorting both sides and hiding an order regression.
+//! Compare GPU results with fusion enabled and disabled.
 void require_fusion_results_match(duckdb::Connection& con,
                                   const std::string& query,
                                   bool ordered = false)
@@ -315,9 +309,6 @@ TEST_CASE_METHOD(
   "merge pipeline fusion setting is scoped per-connection (no cross-connection leak)",
   "[integration][pipeline][merge_fusion]")
 {
-  // `fuse_merge_pipelines` must be a per-connection setting, not a process-global: a SET on one
-  // connection must not change another connection's plans. A second connection to the same
-  // database keeps the default (fusion enabled).
   auto con2 =
     std::make_unique<duckdb::Connection>(sirius::test::g_integration_env->make_connection());
   auto db_path = integration_db_path();
@@ -338,9 +329,7 @@ TEST_CASE_METHOD(
     require_unfused_terminal_shape(engine, SiriusPhysicalOperatorType::MERGE_GROUP_BY);
   });
 
-  // con2: still at the default -> the merge fuses into the collector. If the setting leaked
-  // through a process-global (the pre-fix bug), con's SET above would have disabled fusion here
-  // too and this would instead observe an unfused shape.
+  // con2 retains the default enabled setting.
   sirius::test::with_initialized_engine(*con2, query, [&](sirius::sirius_engine& engine) {
     require_fused_terminal_shape(engine, SiriusPhysicalOperatorType::MERGE_GROUP_BY);
   });
@@ -386,16 +375,9 @@ TEST_CASE_METHOD(merge_fusion_fixture,
       });
   }
 
-  // Unlike the two sections above -- which are structurally green (MERGE_AGGREGATE is never
-  // marked, and the MERGE_GROUP_BY's walk never reaches the HASH_JOIN) -- this section pins the
-  // T::CTE branch of terminal_sink_supports_fusion: it fails if that case is removed.
   SECTION("CTE body GROUP BY does not fuse into the CTE sink")
   {
-    // A GROUP BY inside a materialized CTE body feeds the CTE sink, which has bespoke
-    // consumer-side wiring and is excluded from fusion (terminal_sink_supports_fusion returns
-    // false for T::CTE). The MERGE_GROUP_BY must therefore stay in its own pipeline. MATERIALIZED
-    // keeps the optimizer from inlining the single-reference CTE. Drop the T::CTE case and the
-    // merge folds into the CTE's pipeline, flipping every check below.
+    // MATERIALIZED prevents inlining; the CTE's bespoke wiring requires a separate merge pipeline.
     sirius::test::with_initialized_engine(
       *con,
       "WITH t AS MATERIALIZED ("
@@ -411,7 +393,6 @@ TEST_CASE_METHOD(merge_fusion_fixture,
         REQUIRE(merge != nullptr);
         REQUIRE(cte != nullptr);
 
-        // Not fused: the merge keeps its own pipeline and is not folded into the CTE's.
         CHECK(merge != cte);
         CHECK_FALSE(pipeline_contains_both(engine.new_scheduled,
                                            SiriusPhysicalOperatorType::MERGE_GROUP_BY,
@@ -428,10 +409,7 @@ TEST_CASE_METHOD(merge_fusion_fixture,
 {
   fusion_flag_guard guard(*con, /*enabled=*/true);
 
-  // A merge whose downstream chain is a unary streaming path ending in a total-input sink
-  // (ORDER_BY, TOP_N, an outer GROUP BY) fuses into that sink's pipeline. These sinks already
-  // buffer their full input, so folding the merge in removes a task launch and a repository
-  // round-trip without changing when the sink observes complete data.
+  // Total-input sinks can accept fusion because they already buffer their input.
   SECTION("ORDER BY after GROUP BY fuses MERGE_GROUP_BY into ORDER_BY")
   {
     sirius::test::with_initialized_engine(
@@ -549,7 +527,6 @@ TEST_CASE_METHOD(merge_fusion_fixture,
                  "merge pipeline fusion preserves query results",
                  "[integration][pipeline][merge_fusion][correctness]")
 {
-  // Guard restores the global default even if a query below fails mid-comparison.
   fusion_flag_guard guard(*con, /*enabled=*/true);
 
   SECTION("terminal GROUP BY")
@@ -560,8 +537,7 @@ TEST_CASE_METHOD(merge_fusion_fixture,
 
   SECTION("terminal TOP_N")
   {
-    // n_nationkey is unique, so the ORDER BY defines a strict total order: compare positionally
-    // to catch a fusion bug that would reorder the emitted rows.
+    // The unique sort key makes positional comparison deterministic.
     require_fusion_results_match(
       *con, "SELECT n_nationkey FROM nation ORDER BY n_nationkey DESC LIMIT 3", /*ordered=*/true);
   }
