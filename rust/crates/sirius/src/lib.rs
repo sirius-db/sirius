@@ -236,19 +236,25 @@ mod tests {
             vec!["id".to_string(), "name".to_string()],
         );
 
-        // Drop the context before inspecting the result to prove the returned
-        // batches own their data independently of the engine context.
-        let result = {
+        // Execute twice on one context to verify standalone query state is reset,
+        // then drop it before inspecting the returned owned results.
+        let results = {
             let mut ctx = SiriusContext::new().expect("bring up sirius context");
-            ctx.execute_substrait_result(&plan)
-                .expect("execute substrait plan")
+            vec![
+                ctx.execute_substrait_result(&plan)
+                    .expect("execute first substrait plan"),
+                ctx.execute_substrait_result(&plan)
+                    .expect("execute second substrait plan"),
+            ]
         };
 
-        assert_eq!(result.schema.fields().len(), 2);
-        assert_eq!(result.schema.field(0).name(), "id");
-        assert_eq!(result.schema.field(1).name(), "name");
-        let total_rows: usize = result.batches.iter().map(RecordBatch::num_rows).sum();
-        assert_eq!(total_rows, 3, "expected 3 rows from the parquet fixture");
+        for result in results {
+            assert_eq!(result.schema.fields().len(), 2);
+            assert_eq!(result.schema.field(0).name(), "id");
+            assert_eq!(result.schema.field(1).name(), "name");
+            let total_rows: usize = result.batches.iter().map(RecordBatch::num_rows).sum();
+            assert_eq!(total_rows, 3, "expected 3 rows from the parquet fixture");
+        }
     }
 
     /// A missing config file is rejected before any GPU work (`load_from_file`
