@@ -18,7 +18,7 @@
 
 #include "exec/bounded_thread_pool.hpp"
 #include "exec/config.hpp"
-#include "exec/inspectable_mpsc.hpp"
+#include "exec/inspectable_priority_queue.hpp"
 #include "exec/interruptible_mpmc.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "parallel/task.hpp"
@@ -88,7 +88,8 @@ class downgrade_executor {
     cucascade::memory::memory_space_id space_id,
     cucascade::memory::memory_space* memory_space,
     sirius::memory::sirius_memory_reservation_manager& reservation_manager,
-    sirius::exec::inspectable_mpsc<sirius::parallel::itask>* pipeline_task_queue = nullptr);
+    sirius::exec::inspectable_priority_queue<sirius::parallel::itask>* pipeline_task_queue =
+      nullptr);
 
   ~downgrade_executor();
 
@@ -137,7 +138,7 @@ class downgrade_executor {
    * @param pipeline_task_queue Pointer to the task_scheduler's task queue
    */
   void set_pipeline_task_queue(
-    sirius::exec::inspectable_mpsc<sirius::parallel::itask>* pipeline_task_queue);
+    sirius::exec::inspectable_priority_queue<sirius::parallel::itask>* pipeline_task_queue);
 
   /**
    * @brief Asynchronously request a predicate-driven downgrade.
@@ -203,7 +204,7 @@ class downgrade_executor {
   cucascade::memory::memory_space* _memory_space;
   std::string _source_label;
   sirius::memory::sirius_memory_reservation_manager& _reservation_manager;
-  sirius::exec::inspectable_mpsc<sirius::parallel::itask>* _pipeline_task_queue{nullptr};
+  sirius::exec::inspectable_priority_queue<sirius::parallel::itask>* _pipeline_task_queue{nullptr};
 };
 
 }  // namespace parallel

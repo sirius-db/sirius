@@ -31,6 +31,7 @@
 #include <cucascade/memory/memory_space.hpp>
 
 #include <algorithm>
+#include <limits>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -46,7 +47,16 @@ task_scheduler::task_scheduler(
   std::shared_ptr<const telemetry::telemetry_context> telemetry_context,
   const cucascade::memory::system_topology_info* sys_topology,
   const std::vector<std::unique_ptr<sirius::parallel::downgrade_executor>>* downgrade_executors)
-  : _telemetry_context(std::move(telemetry_context))
+  : _task_queue([](const sirius::parallel::itask& task) -> exec::queue_priority {
+      // Order the pipeline-level queue by per-task priority (lower value = dispatched first).
+      // Non-pipeline tasks fall back to the maximum priority so they sort last, behind every
+      // pipeline task that was assigned an explicit (lower) priority.
+      if (const auto* gpu_task = dynamic_cast<const pipeline::gpu_pipeline_task*>(&task)) {
+        return gpu_task->get_priority();
+      }
+      return std::numeric_limits<exec::queue_priority>::max();
+    }),
+    _telemetry_context(std::move(telemetry_context))
 {
   _task_queue_telemetry = std::make_unique<telemetry::TaskQueueHandleWrapper>(
     *_telemetry_context, "task-scheduler-gpu-queue", _telemetry_context->shared_group_id());
