@@ -1212,13 +1212,14 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
     // GPU table before materializing the next. Peak GPU residency stays at ~one batch, so the
     // whole table never needs to fit in GPU memory. On multi-GPU the chunks land round-robin
     // across NUMA nodes; the cached-serve path then reads each chunk back on a NUMA-local GPU.
-    auto mat = sirius::materialize_pin_to_host(*ingestible,
-                                               gpu_spaces_mut,
-                                               host_space_by_gpu,
-                                               *scan_mgr.io_ctx(),
-                                               pinned_column_types,
-                                               capture_chunk_stats,
-                                               compressed_pin);
+    auto mat =
+      sirius::materialize_pin_to_host(*ingestible,
+                                      gpu_spaces_mut,
+                                      host_space_by_gpu,
+                                      *scan_mgr.io_ctx(),
+                                      pinned_column_types,
+                                      {.capture_chunk_stats               = capture_chunk_stats,
+                                       .enable_compressed_materialization = compressed_pin});
     sirius_ctx->record_compressed_materialization_pin_columns_narrowed(
       count_narrowed_columns(mat.narrowed_columns));
     // entry.memory_space is metadata only; each host_chunk carries its own per-GPU
@@ -1241,12 +1242,13 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
   } else {
     // GPU tier: materialize every batch as a GPU-resident cudf::table (with its GPU
     // placement) and pin them in place.
-    auto mat = sirius::materialize_all_batches(*ingestible,
-                                               gpu_spaces_mut,
-                                               *scan_mgr.io_ctx(),
-                                               pinned_column_types,
-                                               capture_chunk_stats,
-                                               compressed_pin);
+    auto mat =
+      sirius::materialize_all_batches(*ingestible,
+                                      gpu_spaces_mut,
+                                      *scan_mgr.io_ctx(),
+                                      pinned_column_types,
+                                      {.capture_chunk_stats               = capture_chunk_stats,
+                                       .enable_compressed_materialization = compressed_pin});
     sirius_ctx->record_compressed_materialization_pin_columns_narrowed(
       count_narrowed_columns(mat.narrowed_columns));
     auto base_row_count_per_chunk = std::move(mat.base_row_count_per_chunk);

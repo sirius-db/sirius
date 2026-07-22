@@ -50,7 +50,18 @@ void validate_operator_output_types(const op::operator_data* data,
   if (pipelineable_data == nullptr) { return; }
   const auto& expected_types = op.get_types();
   const auto& physical_types = op.get_physical_types();
-  const auto& batches        = pipelineable_data->get_data_batches();
+  // A diagnostic must be robust against the invariant breach it detects: a malformed
+  // (partial) sidecar would otherwise be indexed out of bounds below.
+  if (!physical_types.empty() && physical_types.size() != expected_types.size()) {
+    SIRIUS_LOG_WARN(
+      "gpu_pipeline_task: operator '{}' (id={}) physical sidecar width {} != logical width {}",
+      op.get_name(),
+      op.get_operator_id(),
+      physical_types.size(),
+      expected_types.size());
+    return;
+  }
+  const auto& batches = pipelineable_data->get_data_batches();
   for (size_t batch_index = 0; batch_index < batches.size(); batch_index++) {
     const auto& batch = batches[batch_index];
     if (!batch) { continue; }
@@ -590,12 +601,12 @@ pipeline::reservation_size_info gpu_pipeline_task::get_estimated_reservation_siz
     if (auto* pd = dynamic_cast<const op::pipelineable_operator_data*>(ls._input_data.get())) {
       num_batches = pd->get_data_batches().size();
     }
-    const op::input_stats stats{num_batches,
-                                input_basis,
-                                input_type,
-                                input_resident,
-                                working_set_bytes,
-                                input_contains_narrowed_columns};
+    const op::input_stats stats{.num_batches               = num_batches,
+                                .bytes                     = input_basis,
+                                .type                      = input_type,
+                                .resident                  = input_resident,
+                                .working_set_bytes         = working_set_bytes,
+                                .contains_narrowed_columns = input_contains_narrowed_columns};
 
     std::size_t max_estimate = 0;
     if (auto* pipeline = gs.get_pipeline()) {

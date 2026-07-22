@@ -1103,11 +1103,11 @@ void validate_pinned_entry_for_serving(pinned_entry const& entry,
   }
 
   if (entry.tier == cucascade::memory::Tier::HOST) {
+    validate_narrowing_matrix_shape(entry.narrowed_columns,
+                                    entry.host_chunks.size(),
+                                    entry_column_names.size(),
+                                    "pinned HOST entry");
     for (auto const& chunk : entry.host_chunks) {
-      validate_narrowing_matrix_shape(entry.narrowed_columns,
-                                      entry.host_chunks.size(),
-                                      entry_column_names.size(),
-                                      "pinned HOST entry");
       if (!chunk) { throw std::runtime_error("pinned entry has a null host chunk"); }
     }
     return;

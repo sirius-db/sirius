@@ -133,6 +133,12 @@ void validate_duckdb_pin_chunk(const op::scan::scan_info& batch,
                                std::size_t chunk_rows,
                                std::size_t rows_before_chunk);
 
+/// Per-pin materialization behavior, sampled from config at pin time.
+struct pin_materialization_options {
+  bool capture_chunk_stats               = true;   ///< capture zone-map statistics per chunk
+  bool enable_compressed_materialization = false;  ///< narrow eligible numeric carriers per chunk
+};
+
 /// Drive @p ingestible 's metadata walk + batch coalescer to completion on @p io_ctx,
 /// materializing every emitted batch into a GPU-resident cudf::table and round-robining
 /// placement across @p gpu_spaces. Single-threaded with deterministic placement, so
@@ -146,13 +152,14 @@ void validate_duckdb_pin_chunk(const op::scan::scan_info& batch,
 /// \param pinned_column_types Pin-time DuckDB type of each batch column, in batch-column
 ///                            (column_ids) order — drives the per-chunk zone-map capture
 ///                            (compute_pinned_chunk_stats). Empty skips capture (statless pin).
+/// \param options             Per-pin materialization behavior (zone-map capture, carrier
+///                            narrowing).
 materialized_pin materialize_all_batches(
   op::scan::gpu_ingestible& ingestible,
   std::span<cucascade::memory::memory_space* const> gpu_spaces,
   io::sirius_ioctx& io_ctx,
   duckdb::vector<duckdb::LogicalType> const& pinned_column_types,
-  bool capture_chunk_stats               = true,
-  bool enable_compressed_materialization = false);
+  pin_materialization_options options = {});
 
 /// Drive @p ingestible to completion like @ref materialize_all_batches, but stream each
 /// emitted batch straight to pinned host memory instead of collecting GPU-resident tables:
@@ -172,6 +179,8 @@ materialized_pin materialize_all_batches(
 ///                            (column_ids) order — drives the per-chunk zone-map capture, which
 ///                            runs on the decode GPU before the host conversion. Empty skips
 ///                            capture (statless pin).
+/// \param options             Per-pin materialization behavior (zone-map capture, carrier
+///                            narrowing).
 /// \return The pinned host chunks in materialization (round-robin) order — one per emitted
 ///         batch — plus their per-chunk row counts and zone-map captures.
 materialized_host_pin materialize_pin_to_host(
@@ -180,7 +189,6 @@ materialized_host_pin materialize_pin_to_host(
   const std::unordered_map<int, cucascade::memory::memory_space*>& host_space_by_gpu,
   io::sirius_ioctx& io_ctx,
   duckdb::vector<duckdb::LogicalType> const& pinned_column_types,
-  bool capture_chunk_stats               = true,
-  bool enable_compressed_materialization = false);
+  pin_materialization_options options = {});
 
 }  // namespace sirius

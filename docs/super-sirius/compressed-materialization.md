@@ -161,16 +161,16 @@ that needs no conversion uses the larger of its stored and working-set sizes.
 
 ## Correctness invariants
 
-1. SQL logical types, decimal precision, and decimal scale never change.
-2. Plan-time source statistics propose a target; exact per-batch runtime bounds verify every
-   scan-time narrowing cast whose materialized column contains a non-null value.
-3. Pin-time targets come directly from exact min/max reductions over each materialized chunk.
-4. Integer conversions never cross signed and unsigned families.
-5. Decimal conversions never change scale.
-6. Join and dynamic-filter key representations are restored before hashing or comparison.
-7. A physical sidecar describes the complete output schema; an empty sidecar preserves the
-   feature-off native contract.
-8. Every result column is native before DuckDB host materialization.
+1. SQL logical types never change.
+2. DECIMAL scale never changes during a physical carrier conversion.
+3. Signed and unsigned integer families never cross.
+4. A downcast is allowed only when the target is strictly narrower and every materialized value fits.
+5. A restore is allowed only when it is a same-family widening with matching DECIMAL scale.
+6. Planner/source statistics are advisory; exact materialized min/max verifies each scan downcast.
+7. Pin-time narrowing is selected from exact per-chunk cuDF min/max results.
+8. Join keys, dynamic-filter keys, unsupported boundaries, and final results are native.
+9. A nonempty physical sidecar describes the complete output schema.
+10. Feature-off fresh scans without a sidecar retain their legacy path.
 
 ## Validation and measurement
 

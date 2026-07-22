@@ -400,11 +400,6 @@ class sirius_physical_operator {
   duckdb::vector<duckdb::unique_ptr<sirius_physical_operator>> children;
   //! The types returned by this physical operator
   duckdb::vector<sirius::logical_type> types;
-  //! Optional physical cuDF carrier schema for this operator's output. SQL semantics always use
-  //! `types`; an empty vector means every column uses its native carrier. This sidecar lets scan
-  //! materialization keep bounded integer and fixed-point DECIMAL values narrow without lying
-  //! about their logical type.
-  std::vector<cudf::data_type> physical_types;
   //! The estimated cardinality of this physical operator
   std::size_t estimated_cardinality;
   //! The unique ID of this operator (auto-incremented at creation)
@@ -431,19 +426,21 @@ class sirius_physical_operator {
   //! get_types().
   [[nodiscard]] const std::vector<cudf::data_type>& get_physical_types() const noexcept
   {
-    return physical_types;
+    return _physical_types;
   }
 
-  [[nodiscard]] bool has_physical_overrides() const noexcept { return !physical_types.empty(); }
+  [[nodiscard]] bool has_physical_overrides() const noexcept { return !_physical_types.empty(); }
 
   //! Install a complete physical output schema. Callers must supply one entry per logical column;
   //! keeping this invariant local prevents a partial sidecar from silently shifting columns.
   void set_physical_types(std::vector<cudf::data_type> schema)
   {
     if (!schema.empty() && schema.size() != types.size()) {
-      throw std::invalid_argument("physical schema width does not match logical schema width");
+      throw internal_exception("physical schema width {} does not match logical schema width {}",
+                               schema.size(),
+                               types.size());
     }
-    physical_types = std::move(schema);
+    _physical_types = std::move(schema);
   }
 
   //! Get the unique operator ID
@@ -679,6 +676,13 @@ class sirius_physical_operator {
   sirius_physical_delim_join* _owning_delim_join = nullptr;
 
  private:
+  //! Optional physical cuDF carrier schema for this operator's output. SQL semantics always use
+  //! `types`; an empty vector means every column uses its native carrier. This sidecar lets scan
+  //! materialization keep bounded integer and fixed-point DECIMAL values narrow without lying
+  //! about their logical type. Private so the complete-or-absent invariant enforced by
+  //! set_physical_types() cannot be bypassed by direct assignment.
+  std::vector<cudf::data_type> _physical_types;
+
   //! Restricted to the plan generator so parent pointers stay immutable post-plan-gen.
   void set_parent_op(sirius_physical_operator* parent_op) noexcept { _parent_op = parent_op; }
 

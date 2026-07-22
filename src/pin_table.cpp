@@ -192,8 +192,7 @@ void materialize_pin_batches(op::scan::gpu_ingestible& ingestible,
                              std::span<cucascade::memory::memory_space* const> gpu_spaces,
                              io::sirius_ioctx& io_ctx,
                              duckdb::vector<duckdb::LogicalType> const& pinned_column_types,
-                             bool capture_chunk_stats,
-                             bool enable_compressed_materialization,
+                             pin_materialization_options options,
                              const pin_batch_sink& on_batch)
 {
   if (gpu_spaces.empty()) {
@@ -266,11 +265,11 @@ void materialize_pin_batches(op::scan::gpu_ingestible& ingestible,
     // propagate and abort the pin like any other pin-time CUDA failure.
     std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>> chunk_stats;
     std::vector<bool> narrowed_columns(static_cast<std::size_t>(tbl->num_columns()), false);
-    if (capture_chunk_stats && !pinned_column_types.empty()) {
+    if (options.capture_chunk_stats && !pinned_column_types.empty()) {
       chunk_stats = scan_manager::compute_pinned_chunk_stats(
         tbl->view(), pinned_column_types, stream, target->get_default_allocator());
     }
-    if (enable_compressed_materialization) {
+    if (options.enable_compressed_materialization) {
       auto narrowed = narrow_pin_chunk(
         std::move(tbl), pinned_column_types, stream, target->get_default_allocator());
       tbl              = std::move(narrowed.table);
@@ -301,8 +300,7 @@ materialized_pin materialize_all_batches(
   std::span<cucascade::memory::memory_space* const> gpu_spaces,
   io::sirius_ioctx& io_ctx,
   duckdb::vector<duckdb::LogicalType> const& pinned_column_types,
-  bool capture_chunk_stats,
-  bool enable_compressed_materialization)
+  pin_materialization_options options)
 {
   materialized_pin out;
   materialize_pin_batches(
@@ -310,8 +308,7 @@ materialized_pin materialize_all_batches(
     gpu_spaces,
     io_ctx,
     pinned_column_types,
-    capture_chunk_stats,
-    enable_compressed_materialization,
+    options,
     [&](std::unique_ptr<cudf::table> tbl,
         cucascade::memory::memory_space* target,
         rmm::cuda_stream_view stream,
@@ -335,8 +332,7 @@ materialized_host_pin materialize_pin_to_host(
   const std::unordered_map<int, cucascade::memory::memory_space*>& host_space_by_gpu,
   io::sirius_ioctx& io_ctx,
   duckdb::vector<duckdb::LogicalType> const& pinned_column_types,
-  bool capture_chunk_stats,
-  bool enable_compressed_materialization)
+  pin_materialization_options options)
 {
   auto& registry = converter_registry::get();
   materialized_host_pin out;
@@ -346,8 +342,7 @@ materialized_host_pin materialize_pin_to_host(
     gpu_spaces,
     io_ctx,
     pinned_column_types,
-    capture_chunk_stats,
-    enable_compressed_materialization,
+    options,
     [&](std::unique_ptr<cudf::table> tbl,
         cucascade::memory::memory_space* src_space,
         rmm::cuda_stream_view stream,
