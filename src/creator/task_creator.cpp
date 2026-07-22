@@ -197,9 +197,15 @@ task_creator::compute_pipeline_priorities(const sirius::planner::query& query) c
     sorted.push_back(priority);
   }
   std::sort(sorted.begin(), sorted.end());
+  // Inject the query id into the high 32 bits so tasks are ordered by query first, then by the
+  // within-query pipeline rank in the low 32 bits. The priority queue picks the LOWEST value first,
+  // so an earlier query (smaller id) always runs before a later one, and within a query the dense
+  // 0..N-1 rank preserves pipeline execution order.
+  const exec::queue_priority query_bits = static_cast<exec::queue_priority>(query.get_query_id())
+                                          << 32;
   for (auto& [pipeline, priority] : priorities) {
     const auto rank = std::lower_bound(sorted.begin(), sorted.end(), priority) - sorted.begin();
-    priority        = static_cast<exec::queue_priority>(rank);
+    priority        = query_bits | static_cast<exec::queue_priority>(rank);
   }
   return priorities;
 }
