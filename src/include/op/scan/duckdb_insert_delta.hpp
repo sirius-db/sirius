@@ -95,6 +95,11 @@ struct insert_delta_row_group {
   std::size_t k_offset{0};
   std::size_t row_count{0};  ///< delta rows covered (tail-clamped to the n_total snapshot)
   bool has_version_state{false};
+  /// Cannot receive further appends: not the table's last row group, or a
+  /// sealed persistent (bulk-flushed) tail. Only closed row groups promote —
+  /// an open tail would strand the next append mid-row-group (k_offset > 0 on
+  /// the following query).
+  bool closed{false};
   std::vector<insert_delta_column> columns;  ///< parallel to the capture's column list
   std::size_t decoded_bytes_budget{0};
   std::vector<std::size_t> varchar_bytes_per_col;  ///< parallel to columns; 0 for non-varchar
@@ -115,6 +120,10 @@ struct insert_delta_plan {
   std::size_t n_cache{0};
   std::size_t n_total{0};  ///< GetTotalRows() snapshot; all walks clamp to it
   std::vector<insert_delta_row_group> row_groups;
+  /// Delta starts on a row-group boundary (first delta row group k_offset == 0).
+  /// Indexed tables append into the boundary row group, so their delta starts
+  /// mid-row-group and cannot promote without an interior chunk seam.
+  bool promotion_eligible{false};
 
   [[nodiscard]] bool empty() const { return row_groups.empty(); }
   [[nodiscard]] std::size_t delta_rows() const { return n_total - n_cache; }

@@ -21,6 +21,7 @@
 #include <duckdb/common/enums/scan_options.hpp>
 #include <duckdb/common/types/selection_vector.hpp>
 #include <duckdb/common/vector_size.hpp>
+#include <duckdb/execution/index/art/art.hpp>
 #include <duckdb/function/compression_function.hpp>
 #include <duckdb/function/partition_stats.hpp>
 #include <duckdb/main/attached_database.hpp>
@@ -33,11 +34,13 @@
 #include <duckdb/storage/table/array_column_data.hpp>
 #include <duckdb/storage/table/column_data.hpp>
 #include <duckdb/storage/table/column_segment.hpp>
+#include <duckdb/storage/table/data_table_info.hpp>
 #include <duckdb/storage/table/row_group.hpp>
 #include <duckdb/storage/table/row_group_collection.hpp>
 #include <duckdb/storage/table/row_group_segment_tree.hpp>
 #include <duckdb/storage/table/segment_tree.hpp>
 #include <duckdb/storage/table/standard_column_data.hpp>
+#include <duckdb/storage/table/table_index_list.hpp>
 #include <duckdb/transaction/duck_transaction.hpp>
 
 #include <algorithm>
@@ -68,6 +71,22 @@ bool is_constant_or_empty_validity(duckdb::CompressionType c)
 {
   return c == duckdb::CompressionType::COMPRESSION_CONSTANT ||
          c == duckdb::CompressionType::COMPRESSION_EMPTY;
+}
+
+// True when a persistent tail row group will not receive further appends,
+// because DuckDB honors SUGGEST_NEW and opens a fresh row group instead. Mirrors
+// RowGroupCollection::InitializeAppend's index check (CanRebuildExistingIndexes-
+// AfterVacuum); keep in sync with duckdb/src/storage/table/row_group_collection.cpp.
+bool tail_seal_allowed(duckdb::DataTable& storage)
+{
+  auto& indexes = storage.GetDataTableInfo()->GetIndexes();
+  if (indexes.Empty()) { return true; }
+  if (indexes.HasUnbound()) { return false; }
+  auto const threshold  = storage.GetAttached().GetVacuumRebuildIndexThreshold();
+  auto const total_rows = static_cast<duckdb::idx_t>(storage.GetTotalRows());
+  if (threshold == 0 || total_rows > threshold) { return false; }
+  auto const index_types = indexes.DistinctIndexTypes();
+  return index_types.size() == 1 && index_types.count(duckdb::ART::TYPE_NAME) > 0;
 }
 
 /// Walk one column tree over the delta slice [k, k + row_count), in
@@ -320,8 +339,9 @@ insert_delta_plan prepare_insert_delta_capture(duckdb::DataTable& storage,
   plan.n_total        = static_cast<std::size_t>(storage.GetTotalRows());
   if (plan.n_total <= n_cache) { return plan; }
 
-  auto tree = storage.GetRowGroupCollection()->GetRowGroups();
-  auto lock = tree->Lock();
+  auto tree               = storage.GetRowGroupCollection()->GetRowGroups();
+  auto lock               = tree->Lock();
+  auto const seal_allowed = tail_seal_allowed(storage);
   // Row groups are contiguous and tail-append-only, so nothing below the row
   // group holding the last cached row can contain delta rows: binary-search
   // that boundary instead of scanning the cached prefix. The boundary row
@@ -348,9 +368,18 @@ insert_delta_plan prepare_insert_delta_capture(duckdb::DataTable& storage,
     rg_plan.row_group_start = rg_start + rg_plan.k_offset;
     rg_plan.has_version_state =
       duckdb::RowGroup::GetPartitionStats(*node).count_type == duckdb::CountType::COUNT_APPROXIMATE;
+    // Closed = cannot take further appends. Any row group with a successor is
+    // closed; the table's last row group is closed only if it is a sealed
+    // persistent (bulk-flushed) tail. Mis-marking an open tail is a promotion
+    // foot-gun (k_offset > 0 next query disables the entry), never a
+    // correctness issue.
+    auto const is_last_rg =
+      tree->GetSegmentByIndex(lock, static_cast<int64_t>(rg_index + 1)) == nullptr;
+    rg_plan.closed = !is_last_rg || (seal_allowed && rg.IsPersistent());
 
     plan.row_groups.push_back(std::move(rg_plan));
   }
+  plan.promotion_eligible = plan.row_groups.empty() || plan.row_groups.front().k_offset == 0;
   return plan;
 }
 

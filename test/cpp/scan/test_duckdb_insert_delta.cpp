@@ -144,6 +144,8 @@ TEST_CASE("insert delta: capture boundary math and transient segment lanes",
   REQUIRE(rg.row_count == kDelta);
   REQUIRE(rg.row_group_start == kBase);
   REQUIRE(rg.columns.size() == 3);
+  REQUIRE(plan.promotion_eligible);  // delta starts on a row-group boundary
+  REQUIRE_FALSE(rg.closed);          // the lone append row group is still the open tail
 
   // Fixed-width columns: one transient data segment, rebased to slice start,
   // sized exactly rows * type_size.
@@ -424,6 +426,66 @@ TEST_CASE("insert delta: appends into the boundary row group are captured",
   REQUIRE(rg.row_count == 2);
   REQUIRE(rg.row_group_start == 10000);
   REQUIRE(rg.columns.size() == 2);
+  REQUIRE_FALSE(plan.promotion_eligible);  // mid-row-group delta cannot promote
+  exec_ok(*env.con, "ROLLBACK");
+}
+
+TEST_CASE("insert delta: closed flags track row-group sealing", "[duckdb_insert_delta][scan]")
+{
+  delta_test_db env;
+  build_appended_table(*env.con);  // base 130000, delta = one 5000-row append (open tail)
+  auto types = all_types();
+
+  exec_ok(*env.con, "BEGIN TRANSACTION");
+  {
+    auto& storage = resolve_storage(*env.con, "t");
+    auto plan     = capture_insert_delta_plan(storage, *env.con->context, kBase, kAllCols, types);
+    REQUIRE(plan.row_groups.size() == 1);
+    REQUIRE_FALSE(plan.row_groups[0].closed);  // the append row group is the open tail
+    REQUIRE(plan.promotion_eligible);
+  }
+  exec_ok(*env.con, "ROLLBACK");
+
+  // Fill the append row group past capacity: it seals and a fresh tail opens.
+  exec_ok(*env.con,
+          "INSERT INTO t SELECT (135000+range)::INTEGER, 0::BIGINT, 'x' FROM range(120000)");
+
+  exec_ok(*env.con, "BEGIN TRANSACTION");
+  {
+    auto& storage = resolve_storage(*env.con, "t");
+    auto plan     = capture_insert_delta_plan(storage, *env.con->context, kBase, kAllCols, types);
+    REQUIRE(plan.row_groups.size() == 2);
+    REQUIRE(plan.row_groups[0].closed);        // sealed by the row group behind it
+    REQUIRE_FALSE(plan.row_groups[1].closed);  // the new open tail
+    REQUIRE(plan.promotion_eligible);
+  }
+  exec_ok(*env.con, "ROLLBACK");
+}
+
+TEST_CASE("insert delta: a bulk-flushed half-empty tail is sealed closed",
+          "[duckdb_insert_delta][scan]")
+{
+  delta_test_db env;
+  exec_ok(*env.con, "CREATE TABLE t AS SELECT range::INTEGER AS k FROM range(10000)");
+  exec_ok(*env.con, "CHECKPOINT");
+  // One bulk commit of 130000 = 122880 + 7120: MergeStorage flushes two
+  // persistent row groups, the last half-empty. With no indexes DuckDB honors
+  // SUGGEST_NEW, so that tail never grows — the seal refinement marks it closed.
+  exec_ok(*env.con, "INSERT INTO t SELECT (10000+range)::INTEGER FROM range(130000)");
+
+  exec_ok(*env.con, "BEGIN TRANSACTION");
+  auto& storage = resolve_storage(*env.con, "t");
+  std::vector<duckdb::storage_t> const cols{0};
+  std::vector<sirius::logical_type> types{sirius::logical_type::make(sirius::type_id::INTEGER)};
+  auto plan = capture_insert_delta_plan(storage, *env.con->context, 10000, cols, types);
+
+  REQUIRE(plan.n_total == 140000);
+  REQUIRE(plan.row_groups.size() == 2);
+  REQUIRE(plan.promotion_eligible);
+  REQUIRE(plan.row_groups[0].closed);  // not the last row group
+  auto const& tail = plan.row_groups.back();
+  REQUIRE(tail.row_count < 122880);  // half-empty...
+  REQUIRE(tail.closed);              // ...yet sealed: persistent bulk tail, no indexes
   exec_ok(*env.con, "ROLLBACK");
 }
 
