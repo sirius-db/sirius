@@ -271,9 +271,12 @@ and rejects a presigned-mode authorizer at initialization; the host
 endpoint keeps its configured mode. Descriptor tokens are redacted from
 logs and traces in every profile.
 
-Fault-injection hooks exist only in test builds: release artifacts
-contain none, a production-mode start refuses to run with hooks enabled,
-and hooks cannot be reached through request headers.
+Request-level fault-injection hooks exist only in test builds: release
+artifacts contain none, a production-mode start refuses to run with hooks
+enabled, and hooks cannot be reached through request headers. CUDA
+delivery calls are injectable at construction time for tests.
+Configuration and request headers cannot reach that seam; release builds
+construct with the real CUDA entry points.
 
 The rig may run an unsigned gateway and a non-TLS control plane, but not
 with production data or credentials, and not on an uncontrolled network.
