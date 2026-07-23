@@ -398,8 +398,14 @@ class sirius_physical_operator {
   duckdb::vector<sirius::logical_type> types;
   //! The estimated cardinality of this physical operator
   std::size_t estimated_cardinality;
-  //! The unique ID of this operator (auto-incremented at creation)
+  //! The unique ID of this operator (auto-incremented at creation). NOTE: this counter is reset
+  //! to 0 at the start of each query (see sirius_context), so it is a per-query human-readable
+  //! label, NOT a globally-unique id. Use `operator_uuid` when a stable entity id is required.
   size_t operator_id;
+
+  //! A globally-unique, lifetime-stable id for this operator, used as the operator's quent
+  //! entity id; unlike `operator_id` it does not reset per query.
+  uuid::UUID operator_uuid{uuid::now_v7()};
 
   //! Lock for concurrent access to operator state
   std::mutex lock;
@@ -420,6 +426,9 @@ class sirius_physical_operator {
 
   //! Get the unique operator ID
   size_t get_operator_id() const { return operator_id; }
+
+  //! Get this operator's stable, globally-unique UUID.
+  const uuid::UUID& get_operator_uuid() const { return operator_uuid; }
 
   //! Bundle this operator's telemetry attribution (context + producing pipeline)
   //! for passing to the data_batch factories. Returns {nullptr, nil-UUID} if this

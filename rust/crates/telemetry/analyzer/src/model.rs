@@ -35,7 +35,7 @@ use tracing::warn;
 use uuid::Uuid;
 
 use crate::{
-    data_batch::{DataBatch, DataBatchBuilder, DataBatchExt},
+    data_batch::{DataBatch, DataBatchBuilder},
     task::{Task, TaskBuilder, TaskExt},
     view::SiriusModelQueryView,
 };
@@ -576,14 +576,15 @@ impl SiriusModelBuilder {
                     set.insert(task.type_name().to_owned());
                 }
             }
-            if let Some(operator_id) = task.pipeline_uuid() // Sirius Pipeline Uuid is Quent Operator Id
-                && let Some(task_span) = task.active_span()
-                && let Some(operator) = query_engine.operators.get_mut(&operator_id)
-            {
-                operator.active_span = Some(match operator.active_span() {
-                    None => task_span,
-                    Some(existing) => existing.extend(&task_span),
-                });
+            // A task computes its operators sequentially, so its span splits into one
+            // activity span per operator (keyed by the operator's stable UUID).
+            for (operator_uuid, span) in task.operator_active_spans() {
+                if let Some(operator) = query_engine.operators.get_mut(&operator_uuid) {
+                    operator.active_span = Some(match operator.active_span() {
+                        None => span,
+                        Some(existing) => existing.extend(&span),
+                    });
+                }
             }
 
             tasks.insert(task_id, task);
@@ -607,16 +608,8 @@ impl SiriusModelBuilder {
                             set.insert(data_batch.type_name().to_owned());
                         }
                     }
-                    if let Some(operator_id) = data_batch.producer_pipeline_uuid() // Sirius Pipeline Uuid is Quent Operator Id
-                        && let Some(data_batch_span) = data_batch.active_span()
-                        && let Some(operator) = query_engine.operators.get_mut(&operator_id)
-                    {
-                        operator.active_span = Some(match operator.active_span() {
-                            None => data_batch_span,
-                            Some(existing) => existing.extend(&data_batch_span),
-                        });
-                    }
-
+                    // `producer_pipeline_uuid` is a pipeline id, not an operator entity id, so
+                    // batches are intentionally not folded into operator activity here.
                     data_batches.insert(data_batch_id, data_batch);
                 }
                 Err(e) => warn!("Invalid data_batch encountered {e}"),

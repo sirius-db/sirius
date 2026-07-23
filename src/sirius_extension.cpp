@@ -104,6 +104,8 @@ extern "C" int cudaProfilerStop();
 #include "io/types.hpp"                // sirius::io::sirius_ioctx
 #include "io/uring/uring_reactor.hpp"  // sirius::io::uring_io_object
 
+#include <algorithm>
+#include <cctype>
 #include <cstdlib>
 #include <unordered_map>
 
@@ -554,6 +556,11 @@ unique_ptr<FunctionData> SiriusExtension::GPUExecutionBind(ClientContext& contex
   if (auto it = input.named_parameters.find(QUERY_LABEL_PARAM_KEY);
       it != input.named_parameters.end() && not it->second.IsNull()) {
     query_label = it->second.ToString();
+  }
+  // With no explicit label, fall back to the SQL text so telemetry viewers show a
+  // recognizable name instead of a placeholder.
+  if (not query_label) {
+    query_label = ::sirius::sirius_interface::query_label_from_sql(result->query);
   }
 
   result->sirius_iface = make_uniq<::sirius::sirius_interface>(context, std::move(query_label));

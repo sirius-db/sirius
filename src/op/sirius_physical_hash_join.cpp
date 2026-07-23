@@ -33,11 +33,13 @@
 #include "cudf/utilities/memory_resource.hpp"
 #include "cudf/version_config.hpp"
 #include "data/data_batch_utils.hpp"
+#include "duckdb/common/enums/join_type.hpp"
 #include "duckdb/execution/operator/join/join_filter_pushdown.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
 #include "expression/ast/to_duckdb.hpp"
+#include "expression/join_condition.hpp"
 #include "expression_evaluator/gpu_expression_translator_internal.hpp"
 #include "helper/type_conversions.hpp"
 #include "log/logging.hpp"
@@ -1819,6 +1821,11 @@ void sirius_physical_hash_join::on_finalize_operator()
       slot.build_state.store(BUILD_HASH_TABLE_STATE::DESTROYED, std::memory_order_release);
     }
   }
+}
+
+std::string sirius_physical_hash_join::params_to_string() const
+{
+  return duckdb::JoinTypeToString(join_type) + ": " + sirius::to_string(conditions);
 }
 
 }  // namespace op

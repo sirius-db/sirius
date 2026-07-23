@@ -134,7 +134,11 @@ std::string sirius_physical_operator::get_name() const
   return SiriusPhysicalOperatorToString(type);
 }
 
-std::string sirius_physical_operator::to_string() const { return get_name() + params_to_string(); }
+std::string sirius_physical_operator::to_string() const
+{
+  auto params = params_to_string();
+  return params.empty() ? get_name() : get_name() + " [" + params + "]";
+}
 
 void sirius_physical_operator::print() const { std::cout << to_string() << std::endl; }
 
@@ -381,8 +385,8 @@ void sirius_physical_operator::set_pipeline(duckdb::shared_ptr<pipeline::sirius_
 
 telemetry::batch_telemetry_info sirius_physical_operator::batch_telemetry() const
 {
-  if (not _pipeline) { return {nullptr, uuid::UUID{}}; }
-  return {_pipeline->get_telemetry_context(), _pipeline->pipeline_uuid()};
+  if (not _pipeline) { return {nullptr, uuid::UUID{}, uuid::UUID{}}; }
+  return {_pipeline->get_telemetry_context(), _pipeline->pipeline_uuid(), operator_uuid};
 }
 
 // implement get_all_ports

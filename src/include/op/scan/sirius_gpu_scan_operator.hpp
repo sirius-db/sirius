@@ -111,6 +111,7 @@ class sirius_gpu_scan_operator : public sirius_physical_operator {
 
   [[nodiscard]] std::size_t no_history_peak_memory_estimate(
     const op::input_stats& stats) const override;
+  std::string params_to_string() const override;
 
   /**
    * @brief Const accessor for the parked table_info. Used by

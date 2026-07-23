@@ -305,10 +305,8 @@ impl UiAnalyzer for SiriusUiAnalyzer {
             .transpose()?;
         let operator_filter = entry.application;
 
-        // Restrict candidates to the requested query: an entity belongs to a
-        // query iff its (producer) pipeline is one of that query's operators.
-        // Without this, entities from a different query sharing a resource and
-        // overlapping the window would leak in.
+        // Restrict candidates to the requested query's operators; otherwise entities from
+        // another query sharing a resource and overlapping the window would leak in.
         let query_operators: HashSet<Uuid> = self
             .model
             .query_view(query_id)?
@@ -333,7 +331,7 @@ impl UiAnalyzer for SiriusUiAnalyzer {
                 &DataBatchCollection(&self.model.data_batches),
                 |data_batch| {
                     data_batch
-                        .producer_pipeline_uuid()
+                        .producer_operator_uuid()
                         .is_some_and(|op| query_operators.contains(&op))
                         && data_batch.matches_filter(&operator_filter)
                 },
@@ -342,8 +340,8 @@ impl UiAnalyzer for SiriusUiAnalyzer {
             _ => entities::list_entities(
                 &TaskCollection(&self.model.tasks),
                 |task| {
-                    task.pipeline_uuid()
-                        .is_some_and(|op| query_operators.contains(&op))
+                    task.computed_operator_uuids()
+                        .any(|op| query_operators.contains(&op))
                         && task.matches_filter(&operator_filter)
                 },
                 query,
@@ -1079,11 +1077,21 @@ impl SiriusUiAnalyzer {
             .iter()
             .filter_map(|&id| {
                 if let Some(task) = self.model.tasks.get(&id) {
-                    let pipeline_name = task
-                        .pipeline_uuid()
-                        .and_then(|id| self.model.query_engine.operators.get(&id))
-                        .map(|operator| operator.instance_name());
-                    Some(task.try_to_ui_fsm(epoch, pipeline_name))
+                    // The task's pipeline_uuid is no longer an entity id, so its label is
+                    // rebuilt from the chain of operators it computed.
+                    let mut names: Vec<&str> = vec![];
+                    for operator_uuid in task.computed_operator_uuids() {
+                        if let Some(operator) =
+                            self.model.query_engine.operators.get(&operator_uuid)
+                        {
+                            let name = operator.instance_name();
+                            if names.last() != Some(&name) {
+                                names.push(name);
+                            }
+                        }
+                    }
+                    let pipeline_name = (!names.is_empty()).then(|| names.join(" -> "));
+                    Some(task.try_to_ui_fsm(epoch, pipeline_name.as_deref()))
                 } else {
                     self.model
                         .data_batches

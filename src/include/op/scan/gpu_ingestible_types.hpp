@@ -20,6 +20,7 @@
 
 #include <memory>
 #include <span>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -56,6 +57,10 @@ class ingestible_table_info {
    * must remain valid for the lifetime of @c *this.
    */
   [[nodiscard]] virtual std::span<std::string const> file_paths() const = 0;
+
+  /// One-line source + pushed-down-filter description for the scan operator's
+  /// params_to_string (telemetry display).
+  [[nodiscard]] virtual std::string params_to_string() const { return ""; }
 
  protected:
   ingestible_table_info() = default;

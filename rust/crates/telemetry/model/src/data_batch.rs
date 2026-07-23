@@ -6,6 +6,10 @@ state! {
         attributes: {
             data_batch_id: u64,
             producer_pipeline_uuid: Uuid,
+            // Stable id of the physical operator that produced this batch. Operator entities are
+            // declared per-operator (not per-pipeline), so per-operator attribution and filtering
+            // key off this rather than `producer_pipeline_uuid`.
+            producer_operator_uuid: Uuid,
         },
     }
 }

@@ -27,12 +27,25 @@
 
 #include <unistd.h>
 
+#include <cstdint>
 #include <format>
 #include <memory>
-#include <ranges>
 #include <string>
+#include <unordered_set>
 
 namespace sirius::telemetry {
+
+namespace {
+//! Hasher for `uuid::UUID` (the cxx-generated type provides `operator==` but no `std::hash`),
+//! so operator UUIDs can be deduplicated in an `unordered_set` while declaring the plan.
+struct uuid_hash {
+  std::size_t operator()(const uuid::UUID& id) const noexcept
+  {
+    return std::hash<std::uint64_t>{}(id.high_bits) ^
+           (std::hash<std::uint64_t>{}(id.low_bits) << 1);
+  }
+};
+}  // namespace
 
 std::shared_ptr<const telemetry_context> telemetry_context::create(
   const sirius::telemetry_config& config,
@@ -72,7 +85,9 @@ telemetry_context::telemetry_context(const sirius::telemetry_config& config,
                            .instance_name    = std::format("worker-{}", getpid()),
                          });
 
-  memory_context_ = std::make_shared<memory_context>(engine_uuid_, *context_, manager);
+  // Memory spaces and transfer channels are owned by this worker process, so they render
+  // under the worker row alongside the gpu-N / shared execution groups.
+  memory_context_ = std::make_shared<memory_context>(worker_uuid_, *context_, manager);
 
   // One session-scoped query group under this engine; every query in this context is reported
   // under it, so a whole run shows up as a single group rather than one group per query.
@@ -84,15 +99,19 @@ telemetry_context::telemetry_context(const sirius::telemetry_config& config,
     });
 
   // Per-GPU device groups plus per-thread-type buckets underneath, so the
-  // viewer renders threads as an engine -> gpu-N -> thread-type tree instead
+  // viewer renders threads as a worker -> gpu-N -> thread-type tree instead
   // of a flat sibling list. Threads with no single GPU go under `shared`.
+  // These groups parent to the WORKER (not the engine): the query page's
+  // resource tree prunes empty groups, so the worker row — which the quent UI
+  // needs in order to inject the per-operator "Operator timeline" lane — only
+  // renders if the execution groups hang beneath it.
   auto gpu_device_observer   = quent::gpu_device::create_observer(*context_);
   auto thread_group_observer = quent::thread_group::create_observer(*context_);
 
   thread_group_observer->declaration(shared_group_uuid_,
                                      quent::thread_group::Declaration{
                                        .instance_name   = "shared",
-                                       .parent_group_id = engine_uuid_,
+                                       .parent_group_id = worker_uuid_,
                                      });
 
   for (const int device_id : gpu_device_ids) {
@@ -104,7 +123,7 @@ telemetry_context::telemetry_context(const sirius::telemetry_config& config,
     gpu_device_observer->declaration(ids.device,
                                      quent::gpu_device::Declaration{
                                        .instance_name   = std::format("gpu-{}", device_id),
-                                       .parent_group_id = engine_uuid_,
+                                       .parent_group_id = worker_uuid_,
                                        .ordinal         = static_cast<uint32_t>(device_id),
                                      });
     thread_group_observer->declaration(ids.executor_threads,
@@ -172,30 +191,40 @@ void emit_plan_telemetry(
   auto port_obs     = quent::port::create_observer(context);
   auto plan_obs     = quent::plan::create_observer(context);
 
-  // Collect edges while iterating
-  rust::Vec<quent::plan::Edges> edges;
+  // Two plan views (see rapidsai/quent docs/domains/query_engine#plan): `plan_id` stays the
+  // root plan and keeps the original pipeline-level DAG (one quent Operator per pipeline,
+  // real ports, edges only at pipeline boundaries). A derived ("lowered") plan carries the
+  // physical-operator DAG that the per-operator activity timeline attaches to, so both views
+  // live side by side.
+  const uuid::UUID operator_plan_id = uuid::now_v7();
+
+  rust::Vec<quent::plan::Edges> pipeline_edges;
+  rust::Vec<quent::plan::Edges> operator_edges;
+
+  // An operator can appear in more than one pipeline (a join is one pipeline's sink and the
+  // next one's source); declare each operator_uuid at most once.
+  std::unordered_set<uuid::UUID, uuid_hash> declared_operators;
+
+  // (upstream_id << 32 | downstream_id) pairs already linked by an intra-pipeline chain edge.
+  std::unordered_set<uint64_t> chained_operator_pairs;
 
   for (const auto& pipeline : pipelines) {
-    const auto pipeline_uuid         = pipeline->pipeline_uuid();
-    const auto operators             = pipeline->get_operators();
+    const auto pipeline_uuid = pipeline->pipeline_uuid();
+    const auto operators     = pipeline->get_operators();
+
+    // Root-plan entity: one quent Operator per pipeline, labeled with its operator chain.
     const std::string operator_chain = [&operators]() {
       std::string chain{};
-      for (const auto& name : operators | std::views::transform([](const auto& op) {
-                                return std::format(
-                                  "{}({})", op.get().get_name(), op.get().operator_id);
-                              })) {
-        if (chain.empty()) {
-          chain = name;
-          continue;
-        }
-        chain = std::format("{} -> {}", chain, name);
+      for (const auto& op_ref : operators) {
+        const auto& op = op_ref.get();
+        if (!chain.empty()) { chain += " -> "; }
+        chain += std::format("{}({})", op.get_name(), op.get_operator_id());
       }
       return chain;
     }();
-
     operator_obs->declaration(
       pipeline_uuid,
-      quent::operator_::Declaration{
+      {
         .plan_id             = plan_id,
         .parent_operator_ids = {},
         .instance_name       = operator_chain,
@@ -203,7 +232,56 @@ void emit_plan_telemetry(
         .custom_attributes   = {},
       });
 
-    // Receiver ports on pipeline source operators.
+    // Derived-plan entities: one quent Operator per physical operator (one timeline bar
+    // each); the operator DAG is conveyed via the derived plan's edges, so
+    // parent_operator_ids stays empty.
+    for (const auto& op_ref : operators) {
+      const auto& op = op_ref.get();
+      if (!declared_operators.insert(op.get_operator_uuid()).second) { continue; }
+      operator_obs->declaration(
+        op.get_operator_uuid(),
+        {
+          .plan_id             = operator_plan_id,
+          .parent_operator_ids = {},
+          .instance_name       = std::format("{}-{}", op.get_name(), op.get_operator_id()),
+          .type_name           = op.get_name(),
+          .custom_attributes   = {},
+        });
+
+      quent::CustomAttributes stats{};
+      stats.i64_attrs = {
+        {.key = "operator_id", .value = static_cast<int64_t>(op.get_operator_id())},
+        {.key = "pipeline_id", .value = static_cast<int64_t>(pipeline->get_pipeline_id())},
+        {.key = "estimated_cardinality", .value = static_cast<int64_t>(op.estimated_cardinality)},
+      };
+      if (auto params = op.params_to_string(); !params.empty()) {
+        stats.string_attrs.push_back({.key = "params", .value = std::move(params)});
+      }
+      operator_obs->statistics(op.get_operator_uuid(), {.custom_attributes = std::move(stats)});
+    }
+
+    // Derived-plan edges: chain consecutive operators of the pipeline (execution order:
+    // source -> ... -> sink) through synthesized port pairs — the runtime only wires real
+    // ports at pipeline boundaries. Child pipelines share their operator prefix with the
+    // parent, so dedupe pairs to avoid duplicate edges.
+    for (std::size_t i = 0; i + 1 < operators.size(); ++i) {
+      const auto& upstream   = operators[i].get();
+      const auto& downstream = operators[i + 1].get();
+      const auto pair_key    = (static_cast<uint64_t>(upstream.get_operator_id()) << 32) |
+                            static_cast<uint64_t>(downstream.get_operator_id());
+      if (!chained_operator_pairs.insert(pair_key).second) { continue; }
+
+      const auto out_port = uuid::now_v7();
+      const auto in_port  = uuid::now_v7();
+      port_obs->declaration(out_port,
+                            {.operator_id = upstream.get_operator_uuid(), .instance_name = "out"});
+      port_obs->declaration(in_port,
+                            {.operator_id = downstream.get_operator_uuid(), .instance_name = "in"});
+      operator_edges.push_back({.source = out_port, .target = in_port});
+    }
+
+    // Root-plan ports: real receiver ports on the pipeline's source operator, attributed to
+    // the pipeline entity so the pipeline DAG resolves its edges.
     if (auto source = pipeline->get_source()) {
       for (std::string_view port_id : source->get_port_ids()) {
         if (const op::sirius_physical_operator::port* port = source->get_port(port_id)) {
@@ -216,36 +294,63 @@ void emit_plan_telemetry(
       }
     }
 
-    // Sender ports on pipeline sink(last) operators.
+    // Pipeline-boundary handoffs: one edge per view.
+    const auto sink = pipeline->get_sink();
     for (const auto& [next_operator, next_operator_port_name, pseudo_sink_port_uuid] :
          pipeline->get_next_ports_after_sink()) {
-      // Declare the pseudo-sink port
+      // Root-plan edge: pseudo-sink sender port (owned by the pipeline entity) into the
+      // downstream pipeline's real receiver port.
       port_obs->declaration(pseudo_sink_port_uuid,
                             quent::port::Declaration{
                               .operator_id   = pipeline_uuid,
                               .instance_name = std::format("{}_sender", next_operator_port_name),
                             });
-
-      // Find the target port on the downstream operator
       if (const op::sirius_physical_operator::port* target_port =
             next_operator->get_port(next_operator_port_name)) {
-        edges.push_back(quent::plan::Edges{
+        pipeline_edges.push_back({
           .source = pseudo_sink_port_uuid,
           .target = target_port->source_port_uuid,
         });
       }
+
+      // Derived-plan edge: synthesized port pair between the physical sink and the receiving
+      // physical operator. A sink can push into a port it owns itself (a join is one
+      // pipeline's sink and the next one's source); the intra-pipeline chain already links
+      // it, so skip the self-edge.
+      if (!sink || next_operator->get_operator_uuid() == sink->get_operator_uuid()) { continue; }
+      const auto out_port = uuid::now_v7();
+      const auto in_port  = uuid::now_v7();
+      port_obs->declaration(out_port,
+                            {.operator_id = sink->get_operator_uuid(), .instance_name = "out"});
+      port_obs->declaration(
+        in_port, {.operator_id = next_operator->get_operator_uuid(), .instance_name = "in"});
+      operator_edges.push_back({.source = out_port, .target = in_port});
     }
   }
 
+  // Root: the pipeline-level plan, parented to the query.
   plan_obs->declaration(plan_id,
                         quent::plan::Declaration{
                           .parent =
                             quent::plan::Parent{
                               .query_id = telemetry_info.query_id,
-                              .plan_id  = uuid::new_nil(),  // no parent plan
+                              .plan_id  = uuid::new_nil(),  // root plan
                             },
                           .instance_name = "pipeline_plan",
-                          .edges         = std::move(edges),
+                          .edges         = std::move(pipeline_edges),
+                          .worker_id     = telemetry_info.worker_id,
+                        });
+
+  // Derived: the physical-operator plan, lowered from the pipeline plan.
+  plan_obs->declaration(operator_plan_id,
+                        quent::plan::Declaration{
+                          .parent =
+                            quent::plan::Parent{
+                              .query_id = uuid::new_nil(),
+                              .plan_id  = plan_id,
+                            },
+                          .instance_name = "operator_plan",
+                          .edges         = std::move(operator_edges),
                           .worker_id     = telemetry_info.worker_id,
                         });
 }

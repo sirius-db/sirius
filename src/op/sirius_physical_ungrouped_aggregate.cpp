@@ -22,6 +22,7 @@
 #include "expression/ast/aggregate.hpp"
 #include "expression/ast/node.hpp"
 #include "expression/ast/reference.hpp"
+#include "expression/ast/to_string.hpp"
 #include "expression/ast/utils.hpp"
 #include "helper/type_conversions.hpp"
 #include "op/merge/gpu_merge_impl.hpp"
@@ -536,6 +537,31 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate_merge::get_ne
   }
   if (input_batch.empty()) { return nullptr; }
   return std::make_unique<pipelineable_operator_data>(input_batch);
+}
+
+namespace {
+
+std::string aggregate_list_to_string(
+  const duckdb::vector<std::unique_ptr<sirius::ast::node>>& aggregates)
+{
+  std::string result;
+  for (const auto& agg : aggregates) {
+    if (!result.empty()) { result += ", "; }
+    result += agg ? sirius::ast::to_string(*agg) : "?";
+  }
+  return result;
+}
+
+}  // namespace
+
+std::string sirius_physical_ungrouped_aggregate::params_to_string() const
+{
+  return aggregate_list_to_string(aggregates);
+}
+
+std::string sirius_physical_ungrouped_aggregate_merge::params_to_string() const
+{
+  return aggregate_list_to_string(aggregates);
 }
 
 }  // namespace op

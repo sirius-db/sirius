@@ -321,5 +321,28 @@ std::unique_ptr<operator_data> sirius_physical_top_n_merge::get_next_task_input_
   return std::make_unique<pipelineable_operator_data>(input_batch);
 }
 
+namespace {
+
+std::string top_n_params_to_string(const duckdb::vector<duckdb::BoundOrderByNode>& orders,
+                                   std::size_t limit,
+                                   std::size_t offset)
+{
+  std::string result = orders_to_string(orders) + " LIMIT " + std::to_string(limit);
+  if (offset != 0) { result += " OFFSET " + std::to_string(offset); }
+  return result;
+}
+
+}  // namespace
+
+std::string sirius_physical_top_n::params_to_string() const
+{
+  return top_n_params_to_string(orders, limit, offset);
+}
+
+std::string sirius_physical_top_n_merge::params_to_string() const
+{
+  return top_n_params_to_string(orders, limit, offset);
+}
+
 }  // namespace op
 }  // namespace sirius

@@ -22,6 +22,8 @@
 // standard library
 #include <cstdint>
 #include <memory>
+#include <string>
+#include <string_view>
 #include <vector>
 
 namespace duckdb {
@@ -83,6 +85,13 @@ comparison_type from_duckdb(duckdb::ExpressionType t);
  * @brief Maps a sirius::comparison_type back to the corresponding duckdb::ExpressionType.
  */
 duckdb::ExpressionType to_duckdb(comparison_type c);
+
+/// SQL spelling of a comparison operator ("=", "<=", "IS DISTINCT FROM", ...).
+std::string_view to_string(comparison_type c);
+
+/// Render a condition list as one line ("#0 = #1 AND #2 < #3"); left sides are
+/// probe-side column references, right sides build-side.
+std::string to_string(const duckdb::vector<join_condition>& conditions);
 
 /**
  * @brief Wraps a vector of duckdb::JoinCondition into sirius::join_condition.

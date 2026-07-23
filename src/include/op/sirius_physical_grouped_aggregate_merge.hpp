@@ -132,6 +132,7 @@ class sirius_physical_grouped_aggregate_merge : public sirius_physical_partition
 
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          rmm::cuda_stream_view stream) override;
+  std::string params_to_string() const override;
 };
 
 }  // namespace op

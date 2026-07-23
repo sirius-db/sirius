@@ -93,5 +93,16 @@ CudfAggregateDefinitions convert_duckdb_aggregates_to_cudf(
   const duckdb::vector<std::unique_ptr<sirius::ast::node>>& groups_p,
   const duckdb::vector<std::unique_ptr<sirius::ast::node>>& expressions);
 
+/**
+ * @brief Render group-by definitions as one line ("keys: #0; aggs: sum(#1), count(*)")
+ * for params_to_string. AVG / COUNT DISTINCT slots are re-collapsed to their SQL spelling.
+ */
+std::string cudf_aggregate_definitions_to_string(
+  const std::vector<int>& group_idx,
+  const std::vector<cudf::aggregation::Kind>& cudf_aggregates,
+  const std::vector<int>& cudf_aggregate_idx,
+  const std::vector<std::vector<int>>& cudf_aggregate_struct_col_indices,
+  const std::vector<AggregateSlot>& aggregate_slots);
+
 }  // namespace op
 }  // namespace sirius

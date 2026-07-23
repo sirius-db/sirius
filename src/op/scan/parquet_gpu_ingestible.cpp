@@ -855,4 +855,18 @@ std::vector<std::size_t> parquet_gpu_ingestible::materialized_column_order() con
   return order;
 }
 
+std::string parquet_ingestible_table_info::params_to_string() const
+{
+  std::string result = resolved_file_paths.empty() ? "parquet" : resolved_file_paths.front();
+  if (resolved_file_paths.size() > 1) {
+    result += " (+" + std::to_string(resolved_file_paths.size() - 1) + " files)";
+  }
+  if (table_filters && !table_filters->filters.empty()) {
+    auto filters = table_filters_to_string(
+      *table_filters, column_ids, std::span<const std::string>(names.data(), names.size()));
+    if (!filters.empty()) { result += ", filters: " + filters; }
+  }
+  return result;
+}
+
 }  // namespace sirius::op::scan

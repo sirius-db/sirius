@@ -34,6 +34,17 @@ inline duckdb::vector<duckdb::BoundOrderByNode> copy_orders(
   return result;
 }
 
+//! Render sort keys as one line ("#0 ASC, #1 DESC") for params_to_string.
+inline std::string orders_to_string(const duckdb::vector<duckdb::BoundOrderByNode>& orders)
+{
+  std::string result;
+  for (const auto& order : orders) {
+    if (!result.empty()) { result += ", "; }
+    result += order.ToString();
+  }
+  return result;
+}
+
 class sirius_physical_order : public sirius_physical_operator {
  public:
   static constexpr const SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::ORDER_BY;
@@ -60,6 +71,7 @@ class sirius_physical_order : public sirius_physical_operator {
 
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          rmm::cuda_stream_view stream) override;
+  std::string params_to_string() const override { return orders_to_string(orders); }
 };
 
 }  // namespace op

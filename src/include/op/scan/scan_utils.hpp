@@ -26,6 +26,8 @@
 
 // standard library
 #include <optional>
+#include <span>
+#include <string>
 #include <unordered_set>
 
 namespace sirius::op {
@@ -90,5 +92,14 @@ translate_duckdb_expression_with_names(
   gpu_expression_translator& translator,
   duckdb::Expression const& expr,
   gpu_expression_translator::column_name_resolver_fxn resolver);
+
+/**
+ * @brief Render pushed-down table filters as one line ("l_shipdate<='1998-09-02' AND ...")
+ * for params_to_string. Filter keys index into @p column_ids; unresolvable names render
+ * as `#<primary index>`.
+ */
+std::string table_filters_to_string(const duckdb::TableFilterSet& filters,
+                                    const duckdb::vector<duckdb::ColumnIndex>& column_ids,
+                                    std::span<const std::string> names);
 
 }  // namespace sirius::op

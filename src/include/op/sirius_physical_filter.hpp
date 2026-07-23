@@ -62,6 +62,7 @@ class sirius_physical_filter : public sirius_physical_operator {
   /// @brief Execute the filter operator on the given input data.
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          rmm::cuda_stream_view stream) override;
+  std::string params_to_string() const override;
 };
 
 }  // namespace op

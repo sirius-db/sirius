@@ -35,6 +35,7 @@ class sirius_physical_projection : public sirius_physical_operator {
 
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          rmm::cuda_stream_view stream) override;
+  std::string params_to_string() const override;
 
   duckdb::vector<std::unique_ptr<sirius::ast::node>> select_list;
 };

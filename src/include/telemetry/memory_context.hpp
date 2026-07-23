@@ -49,7 +49,9 @@ struct channel_key_hash {
 
 class memory_context {
  public:
-  explicit memory_context(uuid::UUID engine_uuid,
+  //! @param parent_group_id Resource group the memory spaces and channels are declared under
+  //! (the worker: each worker process owns its GPU/host pools and the channels between them).
+  explicit memory_context(uuid::UUID parent_group_id,
                           const quent::Context& context,
                           const cucascade::memory::memory_reservation_manager* manager);
   ~memory_context();
