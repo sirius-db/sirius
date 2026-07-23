@@ -121,9 +121,12 @@ if [ "$SKIP_BUILD" -eq 0 ]; then
   git submodule init duckdb substrait 2>/dev/null || true
   git submodule update --depth 1 duckdb substrait 2>/dev/null || true
 
+  # Auto-detect GPU architecture (works on any AMD GPU)
+  source "$REPO_DIR/scripts/detect_gpu_arch.sh"
+
   # Configure
-  echo "  Configuring..."
-  env ROCM_AMDGPU_TARGETS=gfx942 GPU_TARGETS=gfx942 \
+  echo "  Configuring (GPU arch: $GPU_ARCH)..."
+  env ROCM_AMDGPU_TARGETS="$GPU_ARCH" GPU_TARGETS="$GPU_ARCH" \
   cmake -B "$BUILD_DIR" -S . \
     -DENABLE_ROCM=ON \
     -DSIRIUS_ENABLE_CUCO=OFF \
@@ -132,7 +135,7 @@ if [ "$SKIP_BUILD" -eq 0 ]; then
     -DSIRIUS_BUILD_TELEMETRY=OFF \
     -DEXTENSION_STATIC_BUILD=ON \
     -DCMAKE_PREFIX_PATH=/opt/rocm \
-    -DCMAKE_HIP_ARCHITECTURES=gfx942 \
+    -DCMAKE_HIP_ARCHITECTURES="$GPU_ARCH" \
     -DCMAKE_CXX_COMPILER=hipcc \
     -DCMAKE_C_COMPILER=hipcc \
     -DCMAKE_BUILD_TYPE=Release \
@@ -140,7 +143,7 @@ if [ "$SKIP_BUILD" -eq 0 ]; then
 
   # Build (just the extension + duckdb shell, not tests)
   echo "  Building sirius_extension + duckdb shell..."
-  env ROCM_AMDGPU_TARGETS=gfx942 GPU_TARGETS=gfx942 \
+  env ROCM_AMDGPU_TARGETS="$GPU_ARCH" GPU_TARGETS="$GPU_ARCH" \
   cmake --build "$BUILD_DIR" -j"$JOBS" --target duckdb sirius_extension 2>&1 | tail -50
 
   if [ ! -f "$SIRIUS_LIB" ]; then

@@ -80,14 +80,14 @@ fi
 echo "Using compiler: $HIPCC"
 
 # -----------------------------------------------------------------------------
-# Critical: set ROCM_AMDGPU_TARGETS to match CMAKE_HIP_ARCHITECTURES.
-# rapids_cmake's rapids_hip_set_architectures checks that these match;
-# a mismatch is a fatal error ("mismatch between CMAKE_HIP_ARCH_ARCHITECTURES
-# and AMDGPU_TARGETS").
+# Auto-detect the GPU architecture instead of hardcoding gfx942. This makes
+# the build work on ANY AMD GPU (MI300 gfx942, MI250 gfx90a, RDNA3 gfx1100,
+# etc.). The detection script honors a pre-set GPU_ARCH env var, then tries
+# rocm_agent_enumerator / rocminfo / sysfs, and falls back to gfx942 only
+# when no GPU is detected (CI / build-only containers).
 # -----------------------------------------------------------------------------
-export ROCM_AMDGPU_TARGETS="gfx942"
-export GPU_TARGETS="gfx942"
-HIP_ARCH="gfx942"
+source "$SCRIPT_DIR/detect_gpu_arch.sh"
+HIP_ARCH="$GPU_ARCH"
 
 mkdir -p "$BUILD_DIR"
 cd "$BUILD_DIR"
@@ -153,6 +153,143 @@ for dir in "$DEPS_CACHE"/*-src; do
   FETCH_ARGS="$FETCH_ARGS -DFETCHCONTENT_SOURCE_DIR_${upper}=${dir}"
 done
 echo "  Pre-cloned deps: $(ls -d "$DEPS_CACHE"/*-src 2>/dev/null | wc -l)"
+echo ""
+
+# -----------------------------------------------------------------------------
+# Step 0.5: Patch cuco (hipCollections) API compatibility
+# -----------------------------------------------------------------------------
+# hipDF's release/rocmds-26.03 uses NVIDIA cuco APIs that don't exist in the
+# hipCollections fork: valid_extent, make_valid_extent, bucket_storage_ref,
+# static_set_ref with 6 template params. We provide real implementations of
+# these in rocm-cuda-compat/cuco-rocm/include/cuco/ and copy them into the
+# CPM-fetched hipCollections cuco directory so hipDF compiles unmodified.
+echo "=== Step 0.5: Patching cuco (hipCollections) API compatibility ==="
+
+# Find the cuco source dir (CPM downloads it with a hash suffix)
+CUCO_SRC=$(find "$DEPS_CACHE" -maxdepth 1 -type d -name "cuco*" -path "*/cuco*" 2>/dev/null | head -1)
+if [ -z "$CUCO_SRC" ]; then
+  CUCO_SRC=$(find "$DEPS_CACHE" -maxdepth 2 -type d -name "include" -path "*/cuco*" 2>/dev/null | head -1)
+  CUCO_SRC=$(dirname "$(dirname "$CUCO_SRC")")
+fi
+if [ -z "$CUCO_SRC" ] && [ -d "$DEPS_CACHE/cuco-src" ]; then
+  CUCO_SRC="$DEPS_CACHE/cuco-src"
+fi
+
+# The cuco-rocm compat headers from cuda2rocm provide the missing APIs.
+CUCO_COMPAT_DIR="$SCRIPT_DIR/../cuda-compat-shims"  # not available in sirius-only clone
+# In a standalone sirius clone, cuda2rocm is fetched via FetchContent. The
+# compat headers are at $CUCO_COMPAT_DIR/cuco-rocm/include/cuco/. If not
+# found (cuda2rocm not yet fetched), we apply inline patches instead.
+
+if [ -n "$CUCO_SRC" ] && [ -d "$CUCO_SRC/include/cuco" ]; then
+  CUCO_INC="$CUCO_SRC/include/cuco"
+  echo "  cuco include dir: $CUCO_INC"
+
+  # Try to use the compat headers from cuda2rocm if available
+  CUCO_ROCM_DIR=""
+  if [ -d "$REPO_DIR/cuda-compat-shims/cuco-rocm/include/cuco" ]; then
+    CUCO_ROCM_DIR="$REPO_DIR/cuda-compat-shims/cuco-rocm/include/cuco"
+  elif [ -d "/tmp/cuda2rocm/cuco-rocm/include/cuco" ]; then
+    CUCO_ROCM_DIR="/tmp/cuda2rocm/cuco-rocm/include/cuco"
+  fi
+
+  if [ -n "$CUCO_ROCM_DIR" ] && [ -f "$CUCO_ROCM_DIR/extent.cuh" ]; then
+    echo "  Copying cuco compat headers from cuda2rocm"
+    cp "$CUCO_ROCM_DIR/extent.cuh" "$CUCO_INC/extent.cuh"
+    cp "$CUCO_ROCM_DIR/static_set.cuh" "$CUCO_INC/static_set.cuh"
+  else
+    # Inline patch: add valid_extent, make_valid_extent, bucket_storage_ref,
+    # dynamic_extent, bucket_extent, make_bucket_extent to extent.cuh.
+    EXTENT_FILE="$CUCO_INC/extent.cuh"
+    if [ -f "$EXTENT_FILE" ] && ! grep -q "valid_extent" "$EXTENT_FILE"; then
+      echo "  Patching extent.cuh: adding valid_extent + make_valid_extent + bucket_storage_ref"
+      cat >> "$EXTENT_FILE" << 'CUCO_PATCH'
+
+// --- NVIDIA cuco API compatibility (added by build_rocm_deps.sh) ---
+// These types are used by hipDF's groupby/hash helpers.cuh.
+namespace cuco {
+inline constexpr std::size_t dynamic_extent = static_cast<std::size_t>(-1);
+template <typename SizeType, std::size_t Extent = dynamic_extent>
+using valid_extent = extent<SizeType>;
+template <typename SizeType>
+constexpr auto make_valid_extent(SizeType size) { return extent<SizeType>(size); }
+template <typename SizeType, std::size_t Extent = dynamic_extent>
+using bucket_extent = extent<SizeType>;
+template <int32_t CGSize, int32_t BucketSize, typename SizeType, std::size_t N = dynamic_extent>
+constexpr auto make_bucket_extent(extent<SizeType, N> const& ext) { return extent<SizeType>(ext); }
+template <typename KeyT, int32_t BucketSize, typename ExtentT = extent<std::size_t>>
+class bucket_storage_ref {
+ public:
+  using key_type = KeyT;
+  using size_type = typename ExtentT::value_type;
+  __host__ __device__ bucket_storage_ref(KeyT* d, ExtentT e) : data_(d), extent_(e) {}
+  __host__ __device__ KeyT* data() const noexcept { return data_; }
+  __host__ __device__ size_type size() const noexcept { return extent_; }
+  __host__ __device__ KeyT& operator[](std::size_t i) const { return data_[i]; }
+ private:
+  KeyT* data_; ExtentT extent_;
+};
+}  // namespace cuco
+CUCO_PATCH
+    else
+      echo "  extent.cuh: already patched (or valid_extent exists)"
+    fi
+
+    # Inline patch: add 6-param static_set_ref to static_set.cuh
+    SET_FILE="$CUCO_INC/static_set.cuh"
+    if [ -f "$SET_FILE" ] && ! grep -q "struct static_set_ref" "$SET_FILE"; then
+      echo "  Patching static_set.cuh: adding 6-param static_set_ref"
+      # Insert before the static_set class definition
+      sed -i '/^\/\/\/ GPU open-addressing hash set/i\
+// --- NVIDIA cuco static_set_ref compatibility (added by build_rocm_deps.sh) ---\
+// hipDF uses cuco::static_set_ref<KeyT, Scope, Comparator, ProbingScheme, Storage, Op>.\
+// We accept 6 params but delegate to the 2-param set_ref (extra params ignored).\
+template <typename KeyT, int Scope = 0, typename Comparator = void,\
+          typename ProbingScheme = void, typename Storage = void, typename Op = void>\
+struct static_set_ref : set_ref<KeyT, double_hashing<1, default_hash_function<KeyT>>> {\
+  using base_type = set_ref<KeyT, double_hashing<1, default_hash_function<KeyT>>>;\
+  using base_type::base_type;\
+  using base_type::operator();\
+  using base_type::contains;\
+};\
+' "$SET_FILE"
+    else
+      echo "  static_set.cuh: already patched (or static_set_ref exists)"
+    fi
+  fi
+
+  # Patch 2: Add <span> includes to hipDF files that use std::span without including it
+  HIPDF_SRC="$BUILD_DIR/hipDF/cpp"
+  for f in src/jit/row_ir.hpp src/jit/row_ir.cpp src/io/parquet/experimental/hybrid_scan.cpp \
+           include/cudf/io/experimental/hybrid_scan.hpp include/cudf/utilities/span.hpp \
+           include/cudf/detail/jit/span.cuh; do
+    full="$HIPDF_SRC/$f"
+    if [ -f "$full" ] && ! grep -q '#include.*<span>' "$full"; then
+      echo "  Patching $f: adding #include <span>"
+      sed -i '1i #include <span>' "$full"
+    fi
+  done
+
+  # Patch 3: Fix ZSTD_STATIC_LINKING_ONLY=0N typo (should be =0)
+  ZSTD_CMAKE="$HIPDF_SRC/cmake/thirdparty/get_zstd.cmake"
+  if [ -f "$ZSTD_CMAKE" ] && grep -q "ZSTD_STATIC_LINKING_ONLY=0N" "$ZSTD_CMAKE"; then
+    echo "  Patching get_zstd.cmake: fixing ZSTD_STATIC_LINKING_ONLY=0N -> =0"
+    sed -i 's/ZSTD_STATIC_LINKING_ONLY=0N/ZSTD_STATIC_LINKING_ONLY=0/' "$ZSTD_CMAKE"
+  fi
+
+  # Patch 4: Fix CPM.cmake empty file issue
+  CPM_FILE="$DEPS_CACHE/cpm/CPM_0.40.0.cmake"
+  CPM_REAL="$DEPS_CACHE/cpm/CPM.cmake"
+  if [ -f "$CPM_REAL" ] && [ ! -s "$CPM_FILE" ]; then
+    echo "  Fixing CPM_0.40.0.cmake (was empty)"
+    cp "$CPM_REAL" "$CPM_FILE"
+    mkdir -p "$DEPS_CACHE/cmake"
+    cp "$CPM_FILE" "$DEPS_CACHE/cmake/"
+  fi
+else
+  echo "  WARNING: cuco source not found in deps cache — cuco API patch skipped"
+  echo "  hipDF build may fail with 'no template named valid_extent'"
+fi
 echo ""
 
 # =============================================================================
