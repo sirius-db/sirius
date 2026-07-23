@@ -1037,10 +1037,10 @@ TEST_CASE("per-filter gate measures marginal keep and skips a useless filter on 
 
   // First split measured both marginals: the domain-covering filter is now skippable, the
   // selective one is not.
-  auto useless_kept = gate.filter_keep_ratio(useless.get());
+  auto useless_kept = gate.filter_keep_ratio(useless.get(), filters.filter_count());
   REQUIRE(useless_kept.has_value());
   REQUIRE(sirius::op::scan::dynamic_filter_gate::filter_skippable(*useless_kept));
-  auto selective_kept = gate.filter_keep_ratio(selective.get());
+  auto selective_kept = gate.filter_keep_ratio(selective.get(), filters.filter_count());
   REQUIRE(selective_kept.has_value());
   REQUIRE_FALSE(sirius::op::scan::dynamic_filter_gate::filter_skippable(*selective_kept));
 
@@ -1050,4 +1050,32 @@ TEST_CASE("per-filter gate measures marginal keep and skips a useless filter on 
   stream.synchronize();
   REQUIRE(out2 != nullptr);
   REQUIRE(out2->num_rows() == 2);
+}
+
+TEST_CASE("per-filter gate re-measures a stale verdict after the channel grows",
+          "[dynamic_filter][scan_merge]")
+{
+  auto stream = cudf::get_default_stream();
+  sirius::op::scan::dynamic_filter_gate gate;
+
+  auto useless = make_in_list_prefix(10, stream);  // covers the whole domain -- keep 1.0
+  sirius_dynamic_filter_set filters;
+  filters.push_filter(0, useless);
+
+  auto table = make_int64_sequence_table(10, stream);
+  auto out   = sirius::op::scan::apply_dynamic_filters_gated_view(
+    table->view(), filters, gate, stream, dynamic_filter_apply_mode::include_ast_row_masks);
+  stream.synchronize();
+  REQUIRE(out != nullptr);
+
+  // Measured against a one-filter cascade and found skippable.
+  auto const measured = gate.filter_keep_ratio(useless.get(), filters.filter_count());
+  REQUIRE(measured.has_value());
+  REQUIRE(sirius::op::scan::dynamic_filter_gate::filter_skippable(*measured));
+
+  // The channel grows, so that verdict describes a cascade that no longer exists. It must not be
+  // carried forward: the filter is re-measured against the new cascade rather than staying skipped
+  // on a reading that predates the arrival.
+  filters.push_filter(0, make_in_list_prefix(2, stream));
+  REQUIRE_FALSE(gate.filter_keep_ratio(useless.get(), filters.filter_count()).has_value());
 }

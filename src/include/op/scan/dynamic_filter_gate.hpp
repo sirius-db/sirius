@@ -75,17 +75,24 @@ class dynamic_filter_gate {
   // The scan-level gate above decides whether applying anything is worth it; these decide whether
   // one filter still earns its mask. The apply cascades filters most-selective-first and records
   // each filter's marginal keep ratio (its drop on the rows surviving the filters before it). A
-  // filter whose marginal keep exceeds the skip threshold is dropped from later splits. Skipping is
-  // safe: the join is authoritative.
+  // filter whose marginal keep exceeds the skip threshold is dropped from later splits, until the
+  // channel grows and the verdict is re-measured. Skipping is safe: the join is authoritative.
 
-  /// Marginal keep ratio recorded for @p filter, or nullopt while unmeasured.
+  /// Marginal keep ratio recorded for @p filter, or nullopt while unmeasured or when the reading
+  /// predates the current channel size. A marginal describes this filter only relative to the
+  /// filters that ran ahead of it, so a reading taken against a smaller append-only channel
+  /// describes a cascade that no longer exists and can be wrong in either direction: it is
+  /// re-measured rather than trusted.
   [[nodiscard]] std::optional<double> filter_keep_ratio(
-    sirius::op::sirius_dynamic_filter const* filter) const;
+    sirius::op::sirius_dynamic_filter const* filter, std::size_t observed_filter_count) const;
 
-  /// Record @p filter's marginal keep ratio. First measurement wins; later calls are no-ops
-  /// (later splits see survivor sets whose composition depends on cascade order — the first
-  /// measurement is the stable one).
-  void record_filter_keep_ratio(sirius::op::sirius_dynamic_filter const* filter, double kept);
+  /// Record @p filter's marginal keep ratio, measured against a channel of @p observed_filter_count
+  /// filters. Within one channel size the first measurement wins (later splits see survivor sets
+  /// whose composition depends on cascade order — the first reading is the stable one); a
+  /// measurement against a larger channel supersedes an earlier, now-stale one.
+  void record_filter_keep_ratio(sirius::op::sirius_dynamic_filter const* filter,
+                                double kept,
+                                std::size_t observed_filter_count);
 
   /// True when @p kept marks a filter as not worth its per-split mask kernel.
   [[nodiscard]] static constexpr bool filter_skippable(double kept) noexcept
@@ -114,10 +121,19 @@ class dynamic_filter_gate {
   /// contract when batches from different filter generations finish concurrently.
   std::mutex _decision_mu;
 
-  /// First-measured marginal keep ratio per filter. Mutex-guarded: touched once per (split,
-  /// filter) on the apply slow path, never on the zero-copy fast path.
+  /// One filter's marginal keep ratio and the channel size it was measured against. The size is
+  /// carried so channel growth can invalidate the reading — see @ref filter_keep_ratio.
+  struct filter_measurement {
+    double kept                       = 1.0;
+    std::size_t observed_filter_count = 0;
+  };
+
+  /// Marginal keep ratio per filter, each with the channel size it was measured against.
+  /// Mutex-guarded: touched once per (split, filter) on the apply slow path, never on the
+  /// zero-copy fast path.
   mutable std::mutex _filter_ratios_mu;
-  std::unordered_map<sirius::op::sirius_dynamic_filter const*, double> _filter_keep_ratios;
+  std::unordered_map<sirius::op::sirius_dynamic_filter const*, filter_measurement>
+    _filter_keep_ratios;
 };
 
 }  // namespace sirius::op::scan

@@ -128,6 +128,9 @@ std::unique_ptr<cudf::table> apply_dynamic_filters_to_view(
     sirius::op::sirius_dynamic_filter const* identity;
     std::optional<double> recorded;
   };
+  // Snapshot the channel size once: it scopes every per-filter ratio read and written below, so a
+  // reading is trusted only until the append-only channel grows past the size it was taken at.
+  auto const observed_filter_count = filters.filter_count();
   std::vector<membership_entry> entries;
   for (auto const col_idx : filters.filtered_columns()) {
     if (col_idx >= num_cols) { continue; }
@@ -135,7 +138,7 @@ std::unique_ptr<cudf::table> apply_dynamic_filters_to_view(
       if (!f->is_available_on_device(device_id)) { continue; }
       auto const* applicable = dynamic_cast<sirius::op::sirius_mask_applicable const*>(f.get());
       if (!applicable) { continue; }
-      auto recorded = gate ? gate->filter_keep_ratio(f.get()) : std::nullopt;
+      auto recorded = gate ? gate->filter_keep_ratio(f.get(), observed_filter_count) : std::nullopt;
       if (recorded && dynamic_filter_gate::filter_skippable(*recorded)) { continue; }
       entries.push_back({col_idx, applicable, f.get(), recorded});
     }
@@ -148,7 +151,9 @@ std::unique_ptr<cudf::table> apply_dynamic_filters_to_view(
     if (current.num_rows() == 0) { break; }
     auto const& probe = current.column(static_cast<cudf::size_type>(e.col_idx));
     auto const kept   = cascade_step(e.filter->compute_mask(probe, device_id, stream, mr));
-    if (gate && !e.recorded) { gate->record_filter_keep_ratio(e.identity, kept); }
+    if (gate && !e.recorded) {
+      gate->record_filter_keep_ratio(e.identity, kept, observed_filter_count);
+    }
   }
 
   if (!owned) { return nullptr; }
@@ -164,23 +169,37 @@ std::unique_ptr<cudf::table> apply_dynamic_filters_to_view(
 }
 
 std::optional<double> dynamic_filter_gate::filter_keep_ratio(
-  sirius::op::sirius_dynamic_filter const* filter) const
+  sirius::op::sirius_dynamic_filter const* filter, std::size_t observed_filter_count) const
 {
   std::scoped_lock lock(_filter_ratios_mu);
   auto it = _filter_keep_ratios.find(filter);
-  return it != _filter_keep_ratios.end() ? std::optional<double>{it->second} : std::nullopt;
+  if (it == _filter_keep_ratios.end()) { return std::nullopt; }
+  // A marginal is only meaningful against the filters that ran ahead of it. The channel is
+  // append-only, so a reading taken against fewer filters describes a cascade that no longer
+  // exists -- a filter skipped on it may now prune usefully, and one kept on it may now be
+  // redundant. Re-measure rather than carry the stale verdict for the rest of the query.
+  if (it->second.observed_filter_count < observed_filter_count) { return std::nullopt; }
+  return it->second.kept;
 }
 
 void dynamic_filter_gate::record_filter_keep_ratio(sirius::op::sirius_dynamic_filter const* filter,
-                                                   double kept)
+                                                   double kept,
+                                                   std::size_t observed_filter_count)
 {
   std::scoped_lock lock(_filter_ratios_mu);
-  auto const [it, inserted] = _filter_keep_ratios.emplace(filter, kept);
-  if (inserted && filter_skippable(kept)) {
+  auto const it = _filter_keep_ratios.find(filter);
+  if (it != _filter_keep_ratios.end() &&
+      it->second.observed_filter_count >= observed_filter_count) {
+    return;  // already measured against at least this many filters -- no new information
+  }
+  _filter_keep_ratios.insert_or_assign(
+    filter, filter_measurement{.kept = kept, .observed_filter_count = observed_filter_count});
+  if (filter_skippable(kept)) {
     SIRIUS_LOG_DEBUG(
-      "[apply_dynamic_filters] per-filter gate: marginal kept {:.3f} -> SKIP filter for the rest "
-      "of this scan.",
-      kept);
+      "[apply_dynamic_filters] per-filter gate: marginal kept {:.3f} against {} filters -> SKIP "
+      "filter until the channel grows.",
+      kept,
+      observed_filter_count);
   }
 }
 
