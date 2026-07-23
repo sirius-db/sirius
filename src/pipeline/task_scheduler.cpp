@@ -19,6 +19,7 @@
 #include "creator/task_creator.hpp"
 #include "downgrade/downgrade_executor.hpp"
 #include "exec/config.hpp"
+#include "exec/multi_index_priority_queue.hpp"
 #include "log/logging.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "op/sirius_physical_operator.hpp"
@@ -371,19 +372,9 @@ void task_scheduler::management_eventloop()
       // (lowest value) task preferring exactly this device.
       task = _task_queue.try_pop_from(exec::gpu_index{device_id}).value_or(nullptr);
       if (!task) {
-        // Fallback: take the first task (in priority order) with NO preference, or
-        // whose preferred device does not exist in _gpu_executors (a stale
-        // preference from a different env / config is meaningless — treat as
-        // unpreferred). Non-pipeline tasks are also dispatchable to any device.
-        task = _task_queue
-                 .try_pop_if([this](const sirius::parallel::itask& t) -> bool {
-                   const auto* gpu_task = dynamic_cast<const pipeline::gpu_pipeline_task*>(&t);
-                   if (!gpu_task) { return true; }
-                   auto pref = gpu_task->get_preferred_device_id();
-                   if (!pref.has_value()) { return true; }
-                   return _gpu_executors.count(pref.value()) == 0;
-                 })
-                 .value_or(nullptr);
+        // pick a task with no preference (any device will do). The round-robin counter
+        task =
+          _task_queue.try_pop_from(exec::gpu_index{exec::no_preferred_device}).value_or(nullptr);
       }
       if (!task) {
         // No dispatchable task for this device. Leave device in _ready_devices
