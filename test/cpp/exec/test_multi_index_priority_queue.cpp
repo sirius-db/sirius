@@ -499,13 +499,17 @@ TEST_CASE("multi_index interrupt wakes a blocked pop with nullptr", "[multi_inde
   REQUIRE(got_null);
   REQUIRE_FALSE(q.is_open());
 
-  // After interrupt, blocking pop drains existing items but does not wait.
-  q.push(task(7, keys_of(1)));
-  REQUIRE(q.pop()->id == 7);
-  REQUIRE(q.pop() == nullptr);
+  // While interrupted, push drops the task instead of enqueuing it (the shutdown
+  // contract the downgrade/RAII return path relies on).
+  q.push(task(99, keys_of(1)));
+  REQUIRE(q.empty());
+  REQUIRE(q.pop() == nullptr);  // still interrupted and empty
 
+  // reactivate() restores normal push/pop.
   q.reactivate();
   REQUIRE(q.is_open());
+  q.push(task(7, keys_of(1)));
+  REQUIRE(q.pop()->id == 7);
 }
 
 TEST_CASE("multi_index drain drops all tasks and clears every index",

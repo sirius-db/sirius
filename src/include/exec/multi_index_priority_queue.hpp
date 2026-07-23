@@ -176,8 +176,9 @@ class multi_index_priority_queue {
   ~multi_index_priority_queue()                                            = default;
 
   /// Inserts a task, computing its priority and secondary-index keys once, then
-  /// wakes one thread blocked in pop()/pop_back(). push() always enqueues, even
-  /// while the queue is interrupted (interrupt() only affects blocking pops).
+  /// wakes one thread blocked in pop()/pop_back(). If the queue is interrupted
+  /// (i.e. shutting down) the task is dropped rather than enqueued, matching the
+  /// teardown contract callers rely on (e.g. returning a task to a closed queue).
   /// Strongly exception-safe: if any allocation throws, the queue is left as it
   /// was (the task is destroyed) and nothing is enqueued.
   void push(task_ptr task)
@@ -186,6 +187,8 @@ class multi_index_priority_queue {
     const index_keys keys = _extract(*task);
     {
       std::lock_guard<std::mutex> lock(_mutex);
+      // Interrupted (shutdown): drop the task instead of enqueuing it.
+      if (!_active) { return; }
 
       auto lit             = _levels.find(keys.priority);
       const bool new_level = (lit == _levels.end());

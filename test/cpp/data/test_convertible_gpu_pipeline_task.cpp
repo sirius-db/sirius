@@ -360,7 +360,7 @@ TEST_CASE("RAII on interrupted queue does not crash", "[convertible_gpu_pipeline
 
     // Interrupt the queue before destroying the wrapper
     queue.interrupt();
-    // cd destroyed here — push() returns false, task is destroyed, SIRIUS_LOG_WARN fires
+    // cd destroyed here — push() drops the task (queue interrupted), task is destroyed
   }
 
   // Queue is interrupted and empty — task was destroyed, not pushed
