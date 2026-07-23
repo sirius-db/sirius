@@ -16,9 +16,10 @@
 
 #include "compressed_representation.hpp"
 
+#include "device_compressed_blob.hpp"
+
 #include <cuda_runtime.h>
 
-#include <api/simpatico_codegen.hpp>
 #include <cucascade/error.hpp>
 
 #include <algorithm>
@@ -209,13 +210,13 @@ std::vector<std::size_t> resolve_absolute_indices(
 
 compressed_device_representation::compressed_device_representation(
   cucascade::memory::memory_space& memory_space,
-  std::shared_ptr<simpatico::compressed_table> table,
+  std::shared_ptr<compressed_device_blob> blob,
   std::vector<std::string> column_names,
   std::size_t compressed_bytes,
   std::size_t uncompressed_bytes,
   std::int64_t num_rows)
   : cucascade::idata_representation(memory_space),
-    _table(std::move(table)),
+    _blob(std::move(blob)),
     _column_names(std::move(column_names)),
     _compressed_bytes(compressed_bytes),
     _uncompressed_bytes(uncompressed_bytes),
@@ -225,14 +226,14 @@ compressed_device_representation::compressed_device_representation(
 
 compressed_device_representation::compressed_device_representation(
   cucascade::memory::memory_space& memory_space,
-  std::shared_ptr<simpatico::compressed_table> table,
+  std::shared_ptr<compressed_device_blob> blob,
   std::vector<std::string> column_names,
   std::size_t compressed_bytes,
   std::size_t uncompressed_bytes,
   std::int64_t num_rows,
   std::optional<std::vector<std::size_t>> selected_indices)
   : cucascade::idata_representation(memory_space),
-    _table(std::move(table)),
+    _blob(std::move(blob)),
     _column_names(std::move(column_names)),
     _compressed_bytes(compressed_bytes),
     _uncompressed_bytes(uncompressed_bytes),
@@ -241,13 +242,18 @@ compressed_device_representation::compressed_device_representation(
 {
 }
 
+const simpatico::compressed_table& compressed_device_representation::table() const noexcept
+{
+  return _blob->table;
+}
+
 std::unique_ptr<cucascade::idata_representation> compressed_device_representation::clone(
   rmm::cuda_stream_view /*stream*/)
 {
-  // Share the same cached table — no byte copy needed.
+  // Share the same cached blob — no byte copy needed.
   return std::unique_ptr<compressed_device_representation>(
     new compressed_device_representation(get_memory_space(),
-                                         _table,
+                                         _blob,
                                          _column_names,
                                          _compressed_bytes,
                                          _uncompressed_bytes,
@@ -261,11 +267,11 @@ std::unique_ptr<compressed_device_representation> compressed_device_representati
   auto absolute = resolve_absolute_indices(indices, _selected_indices, _column_names.size());
 
   // const_cast is safe: select_columns is logically const (it creates a
-  // projection sharing the same table) but the base-class constructor requires
+  // projection sharing the same blob) but the base-class constructor requires
   // a non-const memory_space& — the underlying object is non-const.
   return std::unique_ptr<compressed_device_representation>(new compressed_device_representation(
     const_cast<cucascade::memory::memory_space&>(get_memory_space()),
-    _table,
+    _blob,
     _column_names,
     _compressed_bytes,
     _uncompressed_bytes,

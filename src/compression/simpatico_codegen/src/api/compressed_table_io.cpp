@@ -19,9 +19,9 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <array>
 #include <bit>
-#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
@@ -225,16 +225,40 @@ static bool read_meta(Reader& r, leaf_meta_v& out)
 using leaf_buffer_fill =
   std::function<void(std::size_t i, void* dst_device, std::size_t size, rmm::cuda_stream_view)>;
 
+// Bytes make_col allocates from leaf_mr for one enumerated buffer: the leaf column
+// is sized to the DECODED element count (num_rows) times the element width, plus the
+// bitpack gather slop for "packed" buffers — NOT the compressed byte count. Must stay
+// in lockstep with make_col below; build_compressed_table_header records this so a slab
+// caller reserves the right slice size (a decode kernel reaches the whole column).
+static std::uint64_t leaf_alloc_bytes(std::string_view name,
+                                      std::uint8_t type_tag,
+                                      std::uint64_t num_rows)
+{
+  cudf::data_type const dt = tag_to_dtype(type_tag);
+  auto const width         = static_cast<std::uint64_t>(cudf::size_of(dt));
+  auto const elem          = std::max<std::uint64_t>(width, 1);
+  std::uint64_t pad_elems  = 0;
+  if (name == "packed") {
+    constexpr std::uint64_t kBitpackGatherSlopBytes = 2 * sizeof(std::uint32_t);
+    pad_elems                                       = (kBitpackGatherSlopBytes + elem - 1) / elem;
+  }
+  return (num_rows + pad_elems) * width;
+}
+
 static std::unique_ptr<compressed_representation> rep_from_leaf_desc(
   leaf_desc const& ld,
   leaf_buffer_fill const& fill,
   rmm::cuda_stream_view stream,
   rmm::device_async_resource_ref mr,
+  rmm::device_async_resource_ref leaf_mr,
   std::string* err)
 {
   auto const& bufs = ld.buffers;
 
-  // Helper: allocate a device column and fill it from the i-th payload buffer.
+  // Helper: allocate a device column (from @p leaf_mr — the enumerated leaf
+  // buffers, which a caller may want placed in a dedicated arena/slab) and fill it
+  // from the i-th payload buffer. Any codec decode scratch allocated below the
+  // leaf level goes through @p mr instead, so leaf placement stays exact.
   auto make_col = [&](std::size_t i) -> std::unique_ptr<cudf::column> {
     auto const& bd     = bufs[i];
     cudf::data_type dt = tag_to_dtype(bd.type_tag);
@@ -246,7 +270,8 @@ static std::unique_ptr<compressed_representation> rep_from_leaf_desc(
     // (uninitialized) contents never affect the result; only its addressability
     // matters. Without it the OOB read faults the context and cascades into
     // unrelated decode-kernel launch failures on concurrent streams.
-    constexpr cudf::size_type kBitpackGatherSlopBytes = 2 * static_cast<cudf::size_type>(sizeof(std::uint32_t));
+    constexpr cudf::size_type kBitpackGatherSlopBytes =
+      2 * static_cast<cudf::size_type>(sizeof(std::uint32_t));
     cudf::size_type pad_elems = 0;
     if (bd.name == "packed") {
       auto const elem = std::max<std::size_t>(cudf::size_of(dt), 1);
@@ -256,7 +281,7 @@ static std::unique_ptr<compressed_representation> rep_from_leaf_desc(
                                          static_cast<cudf::size_type>(bd.num_rows) + pad_elems,
                                          cudf::mask_state::UNALLOCATED,
                                          stream,
-                                         mr);
+                                         leaf_mr);
     if (bd.size_bytes > 0) {
       fill(i, col->mutable_view().head<void>(), static_cast<std::size_t>(bd.size_bytes), stream);
     }
@@ -491,6 +516,7 @@ static compressed_table reconstruct_from_records(std::vector<ColRecord>& recs,
                                                  payload_fetch_fn const& fetch,
                                                  rmm::cuda_stream_view stream,
                                                  rmm::device_async_resource_ref mr,
+                                                 rmm::device_async_resource_ref leaf_mr,
                                                  std::string* err)
 {
   auto fail = [&](std::string const& m) -> compressed_table {
@@ -530,7 +556,7 @@ static compressed_table reconstruct_from_records(std::vector<ColRecord>& recs,
       };
 
       std::string rep_err;
-      auto rep = rep_from_leaf_desc(ld, fill, stream, mr, &rep_err);
+      auto rep = rep_from_leaf_desc(ld, fill, stream, mr, leaf_mr, &rep_err);
       if (!rep) return fail("rep_from_leaf_desc (col " + std::to_string(ci) + "): " + rep_err);
 
       PlanNode& node = nodes[ld.node_index];
@@ -633,7 +659,7 @@ compressed_table read_compressed_table(std::string const& path,
       cudaMemcpyAsync(dst, payload_base + off, sz, cudaMemcpyHostToDevice, s.value());
     };
 
-  return reconstruct_from_records(col_records, fetch, stream, mr, error_out);
+  return reconstruct_from_records(col_records, fetch, stream, mr, /*leaf_mr=*/mr, error_out);
 }
 
 // ---------------------------------------------------------------------------
@@ -766,7 +792,11 @@ std::string build_compressed_table_header(compressed_table const& table,
 
         // Record the buffer for the caller to stage out of device memory; no
         // bytes are copied here.
-        out_buffers.push_back(payload_buffer_ref{payload_offset, bd.device_ptr, bd.size_bytes});
+        out_buffers.push_back(
+          payload_buffer_ref{payload_offset,
+                             bd.device_ptr,
+                             bd.size_bytes,
+                             leaf_alloc_bytes(bd.name, bd.type_tag, bd.num_rows)});
         payload_offset += bd.size_bytes;
       }
     }
@@ -776,16 +806,20 @@ std::string build_compressed_table_header(compressed_table const& table,
   return {};
 }
 
-compressed_table read_compressed_table_from_memory(std::span<const std::uint8_t> header,
-                                                   payload_fetch_fn const& fetch,
-                                                   rmm::cuda_stream_view stream,
-                                                   rmm::device_async_resource_ref mr,
-                                                   std::string* error_out)
+compressed_table read_compressed_table_from_memory(
+  std::span<const std::uint8_t> header,
+  payload_fetch_fn const& fetch,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr,
+  std::string* error_out,
+  std::optional<rmm::device_async_resource_ref> leaf_mr)
 {
   Reader r{header.data(), header.size()};
   std::vector<ColRecord> col_records;
   if (!parse_hpln_header(r, col_records, error_out)) return {};
-  return reconstruct_from_records(col_records, fetch, stream, mr, error_out);
+  // Leaf (enumerated) buffers come from leaf_mr when supplied, so a caller can place
+  // them in a dedicated slab/arena; codec decode scratch always comes from mr.
+  return reconstruct_from_records(col_records, fetch, stream, mr, leaf_mr.value_or(mr), error_out);
 }
 
 compressed_table read_compressed_table_subset_from_memory(
@@ -814,7 +848,7 @@ compressed_table read_compressed_table_subset_from_memory(
     }
     selected.push_back(std::move(col_records[idx]));
   }
-  return reconstruct_from_records(selected, fetch, stream, mr, error_out);
+  return reconstruct_from_records(selected, fetch, stream, mr, /*leaf_mr=*/mr, error_out);
 }
 
 }  // namespace simpatico

@@ -46,6 +46,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
@@ -81,6 +82,12 @@ struct payload_buffer_ref {
   std::uint64_t offset     = 0;        ///< byte offset assigned within the payload region
   const void* device_ptr   = nullptr;  ///< source device bytes
   std::uint64_t size_bytes = 0;
+  /// Bytes the leaf column occupies once reconstructed (decoded element count times
+  /// element width, plus bitpack gather slop) — always >= size_bytes. A caller that
+  /// places reconstructed leaves in its own contiguous slab must reserve this many
+  /// bytes per leaf, not size_bytes: a decode kernel reads/writes the full column,
+  /// so a slice sized only to the compressed bytes would run past its end.
+  std::uint64_t alloc_bytes = 0;
 };
 
 /// Build the .hpln header for @p table into @p out_header and enumerate every
@@ -106,12 +113,18 @@ using payload_fetch_fn = std::function<void(
 /// tree from @p header and pulls each leaf buffer's bytes into device memory via
 /// @p fetch. On failure writes an error to @p error_out (if non-null) and returns
 /// an empty compressed_table.
+/// @p leaf_mr, when set, allocates the enumerated leaf buffers (the columns whose
+/// bytes @p fetch fills) — letting the caller place them in a dedicated arena/slab
+/// (e.g. one contiguous device buffer per pinned chunk). Codec decode scratch is
+/// always allocated from @p mr, so it never disturbs leaf placement. Defaults to
+/// @p mr (leaves and scratch share one resource, the original behavior).
 compressed_table read_compressed_table_from_memory(
   std::span<const std::uint8_t> header,
   payload_fetch_fn const& fetch,
   rmm::cuda_stream_view stream      = cudf::get_default_stream(),
   rmm::device_async_resource_ref mr = rmm::mr::get_current_device_resource_ref(),
-  std::string* error_out            = nullptr);
+  std::string* error_out            = nullptr,
+  std::optional<rmm::device_async_resource_ref> leaf_mr = std::nullopt);
 
 /// Like @ref read_compressed_table_from_memory but reconstructs only the columns
 /// in @p selected_columns (indices into the full table's column order, in the

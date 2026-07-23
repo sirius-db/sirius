@@ -17,6 +17,7 @@
 #include "compression_converters.hpp"
 
 #include "compressed_representation.hpp"
+#include "device_compressed_blob.hpp"
 
 #include <cudf/column/column.hpp>
 #include <cudf/table/table.hpp>
