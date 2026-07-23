@@ -84,7 +84,9 @@ insert_delta_workset prepare_insert_delta_tasks(
   auto const block_size = probe_fsmr->get_block_size();
 
   // Capture phase 1, serial: the ClientContext-touching transaction/buffer-
-  // manager capture and row-group skeleton enumeration.
+  // manager capture plus the delta row-group skeleton walk, which starts at
+  // the binary-searched boundary row group rather than scanning the cached
+  // prefix.
   for (auto& request : requests) {
     if (!request.storage || !request.context) {
       throw std::runtime_error(

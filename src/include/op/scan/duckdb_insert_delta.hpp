@@ -83,11 +83,11 @@ struct insert_delta_column {
 
 /// One row group's slice of the insert delta.
 ///
-/// k_offset counts this row group's rows below n_cache. It is always 0 today:
-/// pins start checkpoint-clean and post-checkpoint appends open a fresh row
-/// group (RowGroupAppendMode::REQUIRE_NEW), so n_cache lands on a row-group
-/// boundary. The k > 0 handling stays in case an append path ever grows an
-/// existing row group's tail.
+/// k_offset counts this row group's rows below n_cache. Index-free tables
+/// keep it 0: post-checkpoint appends open a fresh row group, so n_cache
+/// lands on a row-group boundary. Indexed tables (e.g. a PRIMARY KEY) append
+/// into the existing tail row group instead, so the delta's first rows sit
+/// inside the boundary row group and k_offset > 0.
 struct insert_delta_row_group {
   duckdb::RowGroup* row_group{nullptr};  ///< tree-owned; stable while pinned (no checkpoints)
   duckdb::idx_t row_group_index{0};
@@ -125,7 +125,9 @@ struct insert_delta_plan {
  * touches the ClientContext). Captures the transaction, buffer manager, and
  * n_total snapshot, then enumerates skeleton row groups overlapping
  * [n_cache, n_total): pointers, indices, boundaries (clamped to the
- * snapshot), and version-state flags. Columns, staging offsets, and budgets
+ * snapshot), and version-state flags. The walk binary-searches the row group
+ * holding the last cached row and starts there, so its cost scales with the
+ * delta rather than the cached prefix. Columns, staging offsets, and budgets
  * stay empty until capture_insert_delta_row_group_range fills them.
  */
 insert_delta_plan prepare_insert_delta_capture(duckdb::DataTable& storage,

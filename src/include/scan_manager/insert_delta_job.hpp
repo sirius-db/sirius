@@ -146,9 +146,10 @@ struct insert_delta_workset {
 void finalize_insert_delta_jobs(insert_delta_workset& workset);
 
 /**
- * Compute every pending request's delta bundles: prepare_insert_delta_tasks,
- * fan_out_and_join, then finalize_insert_delta_jobs. Blocks so serving starts
- * with finished staging and masks.
+ * Compute every pending request's delta bundles: prepare_insert_delta_tasks
+ * (which fans the capture's column walks out over the dispatcher itself),
+ * fan_out_and_join over the fill tasks, then finalize_insert_delta_jobs.
+ * Blocks so serving starts with finished staging and masks.
  *
  * @throws std::runtime_error on failure; the plan-time CPU fallback gate has
  *         already passed, as in run_mvcc_mask_jobs.
