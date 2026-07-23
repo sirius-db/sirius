@@ -17,8 +17,11 @@
 #pragma once
 
 #include "catch.hpp"
+#include "io/object_store_config.hpp"
 #include "io/rdma/cuobj_rdma_reactor.hpp"
 #include "io/rdma/mock_rdma_client.hpp"
+#include "io/s3/s3_rdma_ioctx.hpp"
+#include "io/sirius_datasource.hpp"
 #include "log/sink.hpp"
 
 #include <rmm/cuda_stream.hpp>
@@ -41,6 +44,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <exception>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -57,14 +61,18 @@ extern char** environ;
 namespace s3_rdma_f01b_tests {
 
 using sirius::exec::semi_future;
+using sirius::io::object_store_config;
 using sirius::io::rdma::cuda_delivery_ops;
 using sirius::io::rdma::cuobj_rdma_io_object;
 using sirius::io::rdma::cuobj_rdma_reactor;
 using sirius::io::rdma::data_get_result;
 using sirius::io::rdma::mock_rdma_data_session_factory;
+using sirius::io::rdma::mock_s3_control_client;
 using sirius::io::rdma::rdma_data_session;
 using sirius::io::rdma::rdma_data_session_factory;
+using sirius::io::rdma::rdma_transport_clients;
 using sirius::io::rdma::rx_route;
+using sirius::io::s3::s3_rdma_ioctx;
 using namespace std::chrono_literals;
 
 constexpr std::size_t k_slot_size               = 64UL << 10;
@@ -292,6 +300,17 @@ cuobj_rdma_reactor::config reactor_config()
   return cfg;
 }
 
+object_store_config ioctx_config()
+{
+  object_store_config cfg;
+  cfg.endpoint                = "http://control.example.invalid";
+  cfg.s3_rdma_data.endpoint   = "http://data.example.invalid";
+  cfg.s3_rdma_max_inflight    = 1;
+  cfg.s3_rdma_arena_slot_size = k_slot_size;
+  cfg.s3_rdma_data.tls_verify = false;
+  return cfg;
+}
+
 std::vector<std::uint8_t> payload_bytes(std::uint8_t salt = 53)
 {
   std::vector<std::uint8_t> bytes(k_slot_size);
@@ -392,7 +411,9 @@ enum class death_scenario {
   sticky_capture,
   sticky_malloc,
   sticky_set_device,
+  sticky_restore_device,
   sticky_free_device,
+  dispatch_sticky_after_fail_stop,
   hook_return,
   hook_throw,
   full_stderr_default_hook
@@ -475,11 +496,21 @@ cuda_delivery_ops death_ops(death_scenario scenario,
       ops.set_device  = [code](int) { return code; };
       break;
     }
+    case death_scenario::sticky_restore_device: {
+      auto const code  = sticky_code.value_or(cudaErrorIllegalAddress);
+      auto const calls = std::make_shared<std::atomic<int>>(0);
+      ops.set_device   = [code, calls](int device) {
+        if (calls->fetch_add(1, std::memory_order_relaxed) == 0) { return cudaSetDevice(device); }
+        return code;
+      };
+      break;
+    }
     case death_scenario::sticky_free_device: {
       auto const code = sticky_code.value_or(cudaErrorIllegalAddress);
       ops.free_device = [code](void*) { return code; };
       break;
     }
+    case death_scenario::dispatch_sticky_after_fail_stop: break;
     case death_scenario::full_stderr_default_hook:
       ops.event_record = [](auto&&...) { return cudaErrorInvalidValue; };
       break;
@@ -507,6 +538,53 @@ std::optional<cudaError_t> selected_sticky_code()
   return static_cast<cudaError_t>(raw);
 }
 
+void run_dispatch_sticky_after_fail_stop_child(cudaError_t sticky_code)
+{
+  auto const payload = payload_bytes();
+  auto control       = std::make_shared<mock_s3_control_client>();
+  auto data          = std::make_shared<mock_rdma_data_session_factory>();
+  control->put_object(std::string{k_bucket}, std::string{k_key}, payload);
+  data->put_object(std::string{k_bucket}, std::string{k_key}, payload);
+  data->throw_gets("injected throwing GET before dispatch probe");
+
+  auto ops         = death_ops(death_scenario::dispatch_sticky_after_fail_stop, sticky_code);
+  auto probe_calls = std::make_shared<std::atomic<int>>(0);
+  ops.get_device   = [probe_calls, sticky_code](int* device) {
+    if (probe_calls->fetch_add(1, std::memory_order_relaxed) == 0) { return cudaGetDevice(device); }
+    return sticky_code;
+  };
+
+  auto ctx = std::make_shared<s3_rdma_ioctx>(
+    ioctx_config(), rdma_transport_clients{control, data}, std::move(ops));
+  ctx->start();
+  auto datasource =
+    ctx->open_datasource("s3://" + std::string{k_bucket} + "/" + std::string{k_key});
+  rmm::cuda_stream stream;
+  rmm::device_buffer first(k_slot_size, stream);
+  rmm::device_buffer second(k_slot_size, stream);
+
+  auto issue = [&](rmm::device_buffer& destination) {
+    return datasource->device_read_async(
+      0, destination.size(), static_cast<std::uint8_t*>(destination.data()), stream);
+  };
+
+  try {
+    (void)issue(first).get();
+  } catch (...) {
+  }
+
+  // The first read fail-stopped the gate. The second submission throws the
+  // terminal error inside templated_ioctx, whose RDMA policy hook performs
+  // the second get_device call and must terminate on the injected sticky code.
+  try {
+    (void)issue(second).get();
+  } catch (...) {
+  }
+  emit_marker(k_future_mark);
+  ctx->shutdown();
+  emit_marker(k_teardown_mark);
+}
+
 void run_death_child(death_scenario scenario, std::optional<cudaError_t> sticky_code = std::nullopt)
 {
   int count = 0;
@@ -529,6 +607,11 @@ void run_death_child(death_scenario scenario, std::optional<cudaError_t> sticky_
     });
   }
 
+  if (scenario == death_scenario::dispatch_sticky_after_fail_stop) {
+    run_dispatch_sticky_after_fail_stop_child(sticky_code.value_or(cudaErrorIllegalAddress));
+    return;
+  }
+
   {
     auto ops               = death_ops(scenario, sticky_code);
     bool const needs_flush = scenario == death_scenario::sticky_flush;
@@ -543,6 +626,12 @@ void run_death_child(death_scenario scenario, std::optional<cudaError_t> sticky_
     if (scenario == death_scenario::sticky_free_device) {
       try {
         if (std::move(future).get(5s) == k_slot_size) { emit_marker(k_future_mark); }
+      } catch (...) {
+      }
+      fixture.shutdown();
+    } else if (scenario == death_scenario::sticky_restore_device) {
+      try {
+        (void)std::move(future).get(5s);
       } catch (...) {
       }
       fixture.shutdown();
@@ -709,6 +798,20 @@ void require_teardown_process_fatal(std::string const& child_name)
   CHECK(result.output.find(k_future_mark) != std::string::npos);
   CHECK(result.output.find(k_arena_mark) != std::string::npos);
   CHECK(result.output.find(k_teardown_mark) == std::string::npos);
+  CHECK((result.signal == SIGABRT || (result.exited && result.exit_code != 0)));
+}
+
+void require_restore_process_fatal(std::string const& child_name)
+{
+  if (!cuda_device_available()) { return; }
+
+  auto const result = spawn_child(child_name);
+  INFO("restore death-child output:\n" << result.output);
+  REQUIRE_FALSE(result.timed_out);
+  CHECK(result.output.find(k_hook_mark) != std::string::npos);
+  CHECK(result.output.find(k_unwind_mark) != std::string::npos);
+  CHECK(result.output.find(k_teardown_mark) == std::string::npos);
+  CHECK(result.output.find(k_arena_mark) == std::string::npos);
   CHECK((result.signal == SIGABRT || (result.exited && result.exit_code != 0)));
 }
 
@@ -970,6 +1073,33 @@ TEST_CASE("s3_rdma death child sticky device selection", "[.][rdma-death-child]"
   using namespace s3_rdma_f01b_tests;
   if (child_enabled("s3_rdma death child sticky device selection")) {
     run_death_child(death_scenario::sticky_set_device, selected_sticky_code());
+  }
+}
+
+TEST_CASE("s3_rdma sticky dispatch probe after fail-stop is process-fatal", "[s3][rdma][fatal]")
+{
+  s3_rdma_f01b_tests::require_process_fatal(
+    "s3_rdma death child sticky dispatch probe after fail-stop");
+}
+
+TEST_CASE("s3_rdma death child sticky dispatch probe after fail-stop", "[.][rdma-death-child]")
+{
+  using namespace s3_rdma_f01b_tests;
+  if (child_enabled("s3_rdma death child sticky dispatch probe after fail-stop")) {
+    run_death_child(death_scenario::dispatch_sticky_after_fail_stop, selected_sticky_code());
+  }
+}
+
+TEST_CASE("s3_rdma sticky device restore code is process-fatal", "[s3][rdma][fatal]")
+{
+  s3_rdma_f01b_tests::require_restore_process_fatal("s3_rdma death child sticky device restore");
+}
+
+TEST_CASE("s3_rdma death child sticky device restore", "[.][rdma-death-child]")
+{
+  using namespace s3_rdma_f01b_tests;
+  if (child_enabled("s3_rdma death child sticky device restore")) {
+    run_death_child(death_scenario::sticky_restore_device, selected_sticky_code());
   }
 }
 

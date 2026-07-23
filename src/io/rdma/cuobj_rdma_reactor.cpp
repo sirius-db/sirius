@@ -28,6 +28,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cctype>
 #include <chrono>
 #include <cstdlib>
 #include <exception>
@@ -40,6 +41,44 @@
 namespace sirius::io::rdma {
 
 namespace {
+
+/// Strict Content-Range parse: "bytes <start>-<end>/<total|*>", digits only
+/// (strtoull's sign/whitespace leniency is exactly the fail-open the
+/// response-identity check must not have), no trailing bytes, overflow
+/// rejected, end >= start.  Returns the start on success.
+bool parse_content_range_start(const std::string& cr, unsigned long long& start_out)
+{
+  if (cr.compare(0, 6, "bytes ") != 0) { return false; }
+  const char* p = cr.c_str() + 6;
+  auto read_num = [&p](unsigned long long& v) -> bool {
+    if (std::isdigit(static_cast<unsigned char>(*p)) == 0) { return false; }
+    v = 0;
+    for (; std::isdigit(static_cast<unsigned char>(*p)) != 0; ++p) {
+      const unsigned digit = static_cast<unsigned>(*p - '0');
+      if (v > (std::numeric_limits<unsigned long long>::max() - digit) / 10) { return false; }
+      v = v * 10 + digit;
+    }
+    return true;
+  };
+  unsigned long long first = 0;
+  unsigned long long last  = 0;
+  unsigned long long total = 0;
+  if (!read_num(first)) { return false; }
+  if (*p != '-') { return false; }
+  ++p;
+  if (!read_num(last)) { return false; }
+  if (*p != '/') { return false; }
+  ++p;
+  if (*p == '*') {
+    ++p;
+  } else if (!read_num(total)) {
+    return false;
+  }
+  if (*p != '\0') { return false; }
+  if (last < first) { return false; }
+  start_out = first;
+  return true;
+}
 
 std::runtime_error short_read_error(size_t got, size_t expected)
 {
@@ -60,17 +99,6 @@ size_t clipped_size(const cuobj_rdma_io_object& file, size_t offset, size_t size
   const size_t file_size = file.size();
   if (offset >= file_size) { return 0; }
   return std::min(size, file_size - offset);
-}
-
-/// Sticky/context-fatal classification, driven by the single table
-/// @c k_sticky_context_fatal_codes.  Consulted before the delivery boundary
-/// only; past the boundary every failure is fatal regardless.
-bool is_context_fatal(cudaError_t rc) noexcept
-{
-  for (const cudaError_t code : k_sticky_context_fatal_codes) {
-    if (rc == code) { return true; }
-  }
-  return false;
 }
 
 /// RAII owner of the delivery completion event: destroy runs only when
@@ -131,6 +159,14 @@ void update_peak(std::atomic<uint64_t>& peak, uint64_t value) noexcept
 }
 
 }  // namespace
+
+bool is_context_fatal(cudaError_t rc) noexcept
+{
+  for (const cudaError_t code : k_sticky_context_fatal_codes) {
+    if (rc == code) { return true; }
+  }
+  return false;
+}
 
 void default_fatal_hook(const char* what, cudaError_t rc) noexcept
 {
@@ -400,14 +436,13 @@ size_t cuobj_rdma_reactor::control_transfer(const cuobj_chunked_rx_request& chun
       // full-body responses legitimately omit it).
       const std::string& cr = result.content_range;
       if (!cr.empty()) {
-        // Fail closed: a NON-EMPTY header must parse as "bytes <start>-…"
-        // and start at the requested offset; anything else is a response-
-        // identity error.  Only an ABSENT header skips the check.
-        char* end                 = nullptr;
+        // Fail closed: a NON-EMPTY header must parse as the FULL grammar
+        // "bytes <start>-<end>/<total|*>" — digits only (no signs), no
+        // trailing bytes, no numeric overflow, end >= start — and start at
+        // the requested offset; anything else is a response-identity error.
+        // Only an ABSENT header skips the check.
         unsigned long long begin_ = 0;
-        const bool parsed =
-          cr.size() > 6 && cr.compare(0, 6, "bytes ") == 0 &&
-          (begin_ = std::strtoull(cr.c_str() + 6, &end, 10), end != cr.c_str() + 6 && *end == '-');
+        const bool parsed         = parse_content_range_start(cr, begin_);
         if (!parsed) {
           throw std::runtime_error("cuobj_rdma_reactor: control-plane Content-Range '" + cr +
                                    "' is not parseable (response identity mismatch)");
@@ -841,9 +876,14 @@ void cuobj_rdma_reactor::enqueue(request_type_ptr req)
     }
   }
   if (failure) {
+    // Latch the request error before propagation (split chunks already in
+    // flight share this manager; the future completes when the manager
+    // drains), then rethrow so the ioctx dispatch catch — the backend
+    // policy point — observes the failure.
     for (auto& descriptor : chunks) {
       if (descriptor && descriptor->manager) { descriptor->manager->report_error(failure); }
     }
+    std::rethrow_exception(failure);
   }
 }
 

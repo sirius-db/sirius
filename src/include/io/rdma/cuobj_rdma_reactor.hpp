@@ -142,6 +142,11 @@ struct cuda_delivery_ops {
   std::function<void(const char*, cudaError_t)> fatal_hook = default_fatal_hook;
 };
 
+/// Sticky/context-fatal classification over the frozen
+/// @c k_sticky_context_fatal_codes set.  Exposed for backend policy hooks
+/// (device-dispatch health probes) as well as the reactor's own legs.
+[[nodiscard]] bool is_context_fatal(cudaError_t rc) noexcept;
+
 /// The only entry to the fatal hook: noexcept and non-returning.  It invokes
 /// the hook, swallows anything the hook throws, and calls std::terminate().
 /// No stack unwinding, no slot release, and no future resolution can follow.

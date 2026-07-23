@@ -82,6 +82,11 @@ class s3_rdma_ioctx final : public templated_ioctx<rdma::cuobj_rdma_reactor> {
   /// (missing object) throws.
   std::shared_ptr<sirius_io_object> create_io_object(std::string path) override;
 
+  /// Contract §5.2 (context health at any phase): a device-dispatch failure
+  /// is probed for a poisoned context — a sticky code terminates instead of
+  /// softening into an error future.
+  void on_device_dispatch_failure() noexcept override;
+
  private:
   /// Retained so the ioctx reaches the admission gate (control permits, the
   /// terminal error) and the transport bundle through the same context the

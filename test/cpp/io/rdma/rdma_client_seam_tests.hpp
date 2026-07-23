@@ -435,6 +435,7 @@ void require_rejected_content_range(std::string_view key, std::string content_ra
     thrown_error([&] { (void)ds->host_read(0, destination.size(), destination.data()); });
   REQUIRE_FALSE(error.empty());
   CHECK(error.find("Content-Range") != std::string::npos);
+  CHECK(error.find("not parseable") != std::string::npos);
   CHECK(transport->control->range_gets_issued() == calls_before + 1);
   auto snapshot = ctx->perf_snapshot();
   CHECK(snapshot.fail_stop_total == 0);
@@ -1451,6 +1452,43 @@ TEST_CASE("s3_rdma host read rejects a malformed Content-Range interval", "[s3][
 {
   s3_rdma_client_seam_tests::require_rejected_content_range("content-range-invalid",
                                                             "bytes invalid");
+}
+
+TEST_CASE("s3_rdma host read rejects a Content-Range missing its end", "[s3][rdma][client-seam]")
+{
+  s3_rdma_client_seam_tests::require_rejected_content_range("content-range-missing-end",
+                                                            "bytes 0-");
+}
+
+TEST_CASE("s3_rdma host read rejects trailing garbage in Content-Range", "[s3][rdma][client-seam]")
+{
+  s3_rdma_client_seam_tests::require_rejected_content_range("content-range-trailing-garbage",
+                                                            "bytes 0-garbage");
+}
+
+TEST_CASE("s3_rdma host read rejects a signed Content-Range start", "[s3][rdma][client-seam]")
+{
+  s3_rdma_client_seam_tests::require_rejected_content_range("content-range-signed-start",
+                                                            "bytes +0-4095/4096");
+}
+
+TEST_CASE("s3_rdma host read accepts an unknown Content-Range total", "[s3][rdma][client-seam]")
+{
+  using namespace s3_rdma_client_seam_tests;
+
+  auto payload = pattern_bytes(4096);
+  auto transport =
+    seeded_mock_transport(std::string{k_bucket}, "content-range-unknown-total", payload);
+  auto ctx = make_started_ioctx(transport);
+  auto ds  = open_ds(ctx, "content-range-unknown-total");
+  std::array<std::uint8_t, 4096> destination{};
+  transport->control->override_content_range("bytes 0-4095/*");
+
+  CHECK(ds->host_read(0, destination.size(), destination.data()) == destination.size());
+  CHECK(std::equal(destination.begin(), destination.end(), payload.begin()));
+  auto const snapshot = ctx->perf_snapshot();
+  CHECK(snapshot.fail_stop_total == 0);
+  CHECK(snapshot.retries_total == 0);
 }
 
 TEST_CASE("s3_rdma host read accepts a response without Content-Range", "[s3][rdma][client-seam]")

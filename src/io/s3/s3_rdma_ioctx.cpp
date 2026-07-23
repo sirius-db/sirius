@@ -139,4 +139,18 @@ std::shared_ptr<sirius_io_object> s3_rdma_ioctx::create_io_object(std::string pa
     std::move(path), std::move(parsed.host), std::move(parsed.path), result.object_size);
 }
 
+void s3_rdma_ioctx::on_device_dispatch_failure() noexcept
+{
+  // The dispatch exception itself carries no cudaError_t; on a poisoned
+  // context every CUDA call returns the sticky code, so a cheap probe
+  // recovers it.  Sticky => terminate (contract: any phase); anything else
+  // keeps the framework's plain error-future behavior.
+  int device           = -1;
+  const cudaError_t rc = _reactor_ctx->delivery_ops().get_device(&device);
+  if (rc != cudaSuccess && rdma::is_context_fatal(rc)) {
+    rdma::invoke_fatal(
+      _reactor_ctx->delivery_ops(), "device dispatch failed on a poisoned context", rc);
+  }
+}
+
 }  // namespace sirius::io::s3

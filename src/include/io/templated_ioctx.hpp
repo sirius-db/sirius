@@ -380,6 +380,11 @@ class templated_ioctx : public sirius_ioctx {
           [&reactors, i = 0](auto&& r) mutable { reactors[i++]->enqueue(std::move(r)); });
         return semi;
       } catch (...) {
+        // Backend policy point: a backend whose contract makes a poisoned
+        // CUDA context process-fatal probes context health here before the
+        // failure is softened into an error future.  The default keeps the
+        // plain error-future behavior for every other backend.
+        on_device_dispatch_failure();
         return exec::make_semi_future<size_t>(std::current_exception());
       }
     } else {
@@ -388,6 +393,11 @@ class templated_ioctx : public sirius_ioctx {
     }
   }
 
+ protected:
+  /// See the dispatch catch above; must not throw (dispatch is noexcept).
+  virtual void on_device_dispatch_failure() noexcept {}
+
+ public:
   exec::semi_future<size_t> host_to_device_read_async_io(
     const sirius_io_object& obj,
     std::span<io_object_segment> slices,
