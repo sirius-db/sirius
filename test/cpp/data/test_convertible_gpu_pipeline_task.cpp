@@ -79,7 +79,7 @@ sirius::exec::multi_index_priority_queue<sirius::parallel::itask>::key_extractor
 {
   return [](const sirius::parallel::itask&) {
     return sirius::exec::index_keys{
-      0, sirius::op::SiriusPhysicalOperatorType::INVALID, 0, 0, sirius::exec::no_preferred_device};
+      0, sirius::op::SiriusPhysicalOperatorType::INVALID, 0, sirius::exec::no_preferred_device};
   };
 }
 

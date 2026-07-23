@@ -33,21 +33,15 @@ struct payload {
   index_keys keys;
 };
 
-// The queue assumes priority <-> pipeline is 1:1, so tests derive the pipeline id
-// from the priority. Same-priority tasks therefore share a pipeline (and must also
-// share an operator, which the scheduler guarantees); different priorities are
-// different pipelines. Device may vary freely within a pipeline.
-pipeline_key pipe_of(queue_priority priority)
-{
-  return static_cast<pipeline_key>(priority + 1000);  // keep positive for test priorities
-}
-
+// A level == one priority == one pipeline. Same-priority tasks therefore share a
+// pipeline (and must also share an operator, which the scheduler guarantees);
+// different priorities are different pipelines. Device may vary within a level.
 index_keys keys_of(queue_priority priority,
                    SiriusPhysicalOperatorType op = SiriusPhysicalOperatorType::FILTER,
                    query_key query               = 0,
                    device_key device             = no_preferred_device)
 {
-  return index_keys{priority, op, pipe_of(priority), query, device};
+  return index_keys{priority, op, query, device};
 }
 
 std::unique_ptr<payload> task(int id, const index_keys& keys)
@@ -130,7 +124,6 @@ TEST_CASE("multi_index try_pop variants return nullopt when empty", "[multi_inde
   REQUIRE_FALSE(q.try_pop().has_value());
   REQUIRE_FALSE(q.try_pop_back().has_value());
   REQUIRE_FALSE(q.try_pop_from(operator_index{SiriusPhysicalOperatorType::FILTER}).has_value());
-  REQUIRE_FALSE(q.try_pop_from(pipeline_index{0}).has_value());
   REQUIRE_FALSE(q.try_pop_from(query_index{0}).has_value());
   REQUIRE_FALSE(q.try_pop_from(gpu_index{0}).has_value());
   REQUIRE(q.empty());
@@ -150,7 +143,6 @@ TEST_CASE("multi_index reports per-bucket task counts", "[multi_index_priority_q
   q.push(task(3, keys_of(3, SiriusPhysicalOperatorType::PROJECTION, /*query=*/100)));
 
   REQUIRE(q.operator_bucket_count() == 2);  // FILTER (2 levels), PROJECTION (1)
-  REQUIRE(q.pipeline_bucket_count() == 3);  // three distinct pipelines
   REQUIRE(q.query_bucket_count() == 2);     // 100 (2 levels), 200 (1)
   REQUIRE(q.device_bucket_count() == 1);    // all no-preference (-1)
 
@@ -162,12 +154,9 @@ TEST_CASE("multi_index reports per-bucket task counts", "[multi_index_priority_q
   REQUIRE(query_sizes.at(100) == 2);
   REQUIRE(query_sizes.at(200) == 1);
 
-  REQUIRE(q.pipeline_bucket_sizes().at(pipe_of(1)) == 1);
-
   // Draining the PROJECTION pipeline (priority 3) prunes it from every dimension.
   REQUIRE(q.try_pop_from(operator_index{SiriusPhysicalOperatorType::PROJECTION}).has_value());
   REQUIRE(q.operator_bucket_count() == 1);
-  REQUIRE(q.pipeline_bucket_count() == 2);
   REQUIRE(q.query_bucket_sizes().at(100) == 1);  // only the priority-1 pipeline left in query 100
   REQUIRE(q.operator_bucket_sizes().count(SiriusPhysicalOperatorType::PROJECTION) == 0);
 }
@@ -208,29 +197,25 @@ TEST_CASE("multi_index try_pop_from returns nullopt for an absent operator",
 }
 
 // =============================================================================
-// Pipeline- and query-index popping
+// Query-index popping (a query spans several priority levels)
 // =============================================================================
 
-TEST_CASE("multi_index pipeline and query indexes pop independently",
-          "[multi_index_priority_queue]")
+TEST_CASE("multi_index query index spans its levels", "[multi_index_priority_queue]")
 {
   multi_index_priority_queue<payload> q(by_keys());
-  // Query 7 spans two pipelines: priority 5 (ids 1, 4 -- FIFO) and priority 9 (id 3).
-  // Query 8 is one pipeline at priority 2 (id 2).
+  // Query 7 spans two levels: priority 5 (ids 1, 4 -- FIFO) and priority 9 (id 3).
+  // Query 8 is one level at priority 2 (id 2).
   q.push(task(1, keys_of(5, SiriusPhysicalOperatorType::FILTER, /*query=*/7)));
   q.push(task(4, keys_of(5, SiriusPhysicalOperatorType::FILTER, /*query=*/7)));
   q.push(task(3, keys_of(9, SiriusPhysicalOperatorType::FILTER, /*query=*/7)));
   q.push(task(2, keys_of(2, SiriusPhysicalOperatorType::PROJECTION, /*query=*/8)));
 
-  REQUIRE(q.size(pipeline_index{pipe_of(5)}) == 2);
   REQUIRE(q.size(query_index{7}) == 3);
   REQUIRE(q.size(query_index{8}) == 1);
 
-  // Pipeline at priority 5: FIFO front is id 1.
-  REQUIRE(q.try_pop_from(pipeline_index{pipe_of(5)}).value()->id == 1);
-  REQUIRE(q.size(pipeline_index{pipe_of(5)}) == 1);
-
-  // Query 7: lowest level is priority 5 (now just id 4); highest is priority 9 (id 3).
+  // Query 7 scans its levels in priority order: priority 5 first (FIFO id 1, then
+  // id 4), and the back is the highest level, priority 9 (id 3).
+  REQUIRE(q.try_pop_from(query_index{7}).value()->id == 1);
   REQUIRE(q.try_pop_from(query_index{7}).value()->id == 4);
   REQUIRE(q.try_pop_back_from(query_index{7}).value()->id == 3);
 
@@ -249,11 +234,10 @@ TEST_CASE("multi_index removal keeps every index consistent", "[multi_index_prio
   q.push(task(1, keys_of(3, SiriusPhysicalOperatorType::FILTER, /*query=*/7, /*device=*/0)));
   q.push(task(2, keys_of(3, SiriusPhysicalOperatorType::FILTER, /*query=*/7, /*device=*/1)));
 
-  // Pop id 1 via the device index; it must vanish from level/operator/pipeline/query too.
+  // Pop id 1 via the device index; it must vanish from level/operator/query too.
   REQUIRE(q.try_pop_from(gpu_index{0}).value()->id == 1);
   REQUIRE(q.size() == 1);
   REQUIRE(q.size(operator_index{SiriusPhysicalOperatorType::FILTER}) == 1);
-  REQUIRE(q.size(pipeline_index{pipe_of(3)}) == 1);
   REQUIRE(q.size(query_index{7}) == 1);
   REQUIRE(q.size(gpu_index{0}) == 0);
   REQUIRE(q.size(gpu_index{1}) == 1);
@@ -262,7 +246,6 @@ TEST_CASE("multi_index removal keeps every index consistent", "[multi_index_prio
   REQUIRE(q.try_pop_back().value()->id == 2);
   REQUIRE(q.empty());
   REQUIRE(q.operator_bucket_count() == 0);
-  REQUIRE(q.pipeline_bucket_count() == 0);
   REQUIRE(q.query_bucket_count() == 0);
   REQUIRE(q.device_bucket_count() == 0);
 }
@@ -275,7 +258,7 @@ TEST_CASE("multi_index refills a level after it drains to empty", "[multi_index_
   q.push(task(1, keys_of(1, SiriusPhysicalOperatorType::FILTER)));
   REQUIRE(q.try_pop_from(filter).has_value());
   REQUIRE(q.size(filter) == 0);
-  REQUIRE(q.pipeline_bucket_count() == 0);  // the level was pruned
+  REQUIRE(q.operator_bucket_count() == 0);  // the level was pruned
 
   // Re-pushing the same priority recreates the pruned level cleanly.
   q.push(task(2, keys_of(1, SiriusPhysicalOperatorType::FILTER)));
@@ -525,7 +508,6 @@ TEST_CASE("multi_index drain drops all tasks and clears every index",
   REQUIRE(q.empty());
   REQUIRE(q.size() == 0);
   REQUIRE(q.operator_bucket_count() == 0);
-  REQUIRE(q.pipeline_bucket_count() == 0);
   REQUIRE(q.query_bucket_count() == 0);
   REQUIRE(q.device_bucket_count() == 0);
   REQUIRE_FALSE(q.try_pop().has_value());

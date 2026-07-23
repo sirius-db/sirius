@@ -54,8 +54,8 @@ task_scheduler::task_scheduler(
   : _task_queue([](const sirius::parallel::itask& task) -> exec::index_keys {
       // Derive the multi-index keys from the task. The queue orders by priority
       // (lower value = dispatched first) and additionally indexes by operator type,
-      // pipeline id, query id, and preferred device. Non-pipeline tasks fall back to
-      // the maximum priority so they sort last, with sentinel index keys.
+      // query id, and preferred device. Non-pipeline tasks fall back to the maximum
+      // priority so they sort last, with sentinel index keys.
       if (const auto* gpu_task = dynamic_cast<const pipeline::gpu_pipeline_task*>(&task)) {
         const exec::queue_priority priority = gpu_task->get_priority();
         // The scheduling priority packs query_id in its high 32 bits and the
@@ -64,21 +64,17 @@ task_scheduler::task_scheduler(
         const exec::query_key query_id =
           static_cast<exec::query_key>(static_cast<std::uint64_t>(priority) >> 32);
         exec::operator_key operator_type = op::SiriusPhysicalOperatorType::INVALID;
-        exec::pipeline_key pipeline_id   = 0;
         if (const auto* pipe = gpu_task->get_pipeline()) {
-          pipeline_id = pipe->get_pipeline_id();
           if (auto source = pipe->get_source()) { operator_type = source->type; }
         }
         const auto pref = gpu_task->get_preferred_device_id();
         return exec::index_keys{priority,
                                 operator_type,
-                                pipeline_id,
                                 query_id,
                                 pref.has_value() ? pref.value() : exec::no_preferred_device};
       }
       return exec::index_keys{std::numeric_limits<exec::queue_priority>::max(),
                               op::SiriusPhysicalOperatorType::INVALID,
-                              0,
                               0,
                               exec::no_preferred_device};
     }),

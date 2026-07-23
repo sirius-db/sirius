@@ -40,7 +40,6 @@ namespace sirius::exec {
 // =============================================================================
 
 using operator_key = op::SiriusPhysicalOperatorType;
-using pipeline_key = std::size_t;
 using query_key    = std::uint32_t;
 using device_key   = int;
 
@@ -54,9 +53,6 @@ inline constexpr device_key no_preferred_device = -1;
 /// *type* selects which index dimension to query, its value selects the bucket.
 struct operator_index {
   operator_key value;
-};
-struct pipeline_index {
-  pipeline_key value;
 };
 struct query_index {
   query_key value;
@@ -78,7 +74,6 @@ struct gpu_index {
 struct index_keys {
   queue_priority priority;
   operator_key operator_type;
-  pipeline_key pipeline_id;
   query_key query_id;
   device_key device_id;
 };
@@ -89,19 +84,17 @@ struct index_keys {
 
 /**
  * @brief A priority queue whose elements are additionally reachable by operator
- *        type, pipeline id, query id, and preferred GPU device.
+ *        type, query id, and preferred GPU device.
  *
  * The structure exploits the scheduler's priority encoding (see index_keys) rather
- * than sorting every task four times over. Its spine is a single ordered map of
+ * than sorting every task three times over. Its spine is a single ordered map of
  * priority *levels*:
  *   - each level holds the equal-priority tasks of one pipeline in FIFO order;
  *   - the map orders levels by priority, so the global order falls out for free.
- * Because priority, pipeline, query, and operator are all functions of the same
- * axis, three of the four secondary indexes are just *lookups onto levels* — no
- * per-task sorting:
- *   - pipeline id -> its single level;
- *   - query id    -> the (contiguous) set of its levels;
- *   - operator    -> the set of levels carrying that operator.
+ * Because priority, query, and operator are all functions of the same axis, two of
+ * the three secondary indexes are just *lookups onto levels* — no per-task sorting:
+ *   - query id -> the (contiguous) set of its levels;
+ *   - operator -> the set of levels carrying that operator.
  * Preferred device is the only genuinely task-granular axis (tasks within a level
  * may prefer different GPUs), so it keeps a real side index, priority-bucketed and
  * FIFO within a (device, priority) group. Tasks with no preferred device share the
@@ -117,7 +110,7 @@ struct index_keys {
  * non-blocking consumers (try_pop, try_pop_back, and the secondary-index
  * try_pop_from / try_pop_back_from) return std::nullopt when empty; the
  * secondary-index pops never block, since "wait for a task of this
- * operator/pipeline/query/device" has no well-defined completion.
+ * operator/query/device" has no well-defined completion.
  *
  * interrupt() wakes every thread blocked in pop()/pop_back(); reactivate() resumes.
  * drain() drops all tasks; drain(query_index) drops one query's tasks.
@@ -140,9 +133,8 @@ class multi_index_priority_queue {
 
   /// One priority level: the equal-priority tasks of a single pipeline, in FIFO
   /// (insertion) order. Since priority <-> pipeline is 1:1, a level also names its
-  /// (query, operator), which is all constant within the pipeline.
+  /// (query, operator), which is constant within the pipeline.
   struct level {
-    pipeline_key pid{};
     query_key qid{};
     operator_key op{};
     std::list<node> tasks;
@@ -193,9 +185,7 @@ class multi_index_priority_queue {
       auto lit             = _levels.find(keys.priority);
       const bool new_level = (lit == _levels.end());
       if (new_level) {
-        lit =
-          _levels.emplace(keys.priority, level{keys.pipeline_id, keys.query_id, keys.operator_type})
-            .first;
+        lit = _levels.emplace(keys.priority, level{keys.query_id, keys.operator_type}).first;
       }
       level& lv = lit->second;
 
@@ -204,7 +194,6 @@ class multi_index_priority_queue {
       typename std::list<node*>::iterator dev_it;
       try {
         if (new_level) {
-          _pipeline_level.emplace(keys.pipeline_id, keys.priority);
           _operator_levels[keys.operator_type].insert(keys.priority);
           _query_levels[keys.query_id].insert(keys.priority);
         }
@@ -231,7 +220,6 @@ class multi_index_priority_queue {
         }
         if (node_added) { lv.tasks.pop_back(); }
         if (new_level) {
-          _pipeline_level.erase(keys.pipeline_id);
           unset_level(_operator_levels, keys.operator_type, keys.priority);
           unset_level(_query_levels, keys.query_id, keys.priority);
           _levels.erase(lit);
@@ -285,11 +273,6 @@ class multi_index_priority_queue {
     std::lock_guard<std::mutex> lock(_mutex);
     return pop_from_levels(_operator_levels, idx.value, /*front=*/true);
   }
-  [[nodiscard]] std::optional<task_ptr> try_pop_from(const pipeline_index& idx)
-  {
-    std::lock_guard<std::mutex> lock(_mutex);
-    return pop_from_pipeline(idx.value, /*front=*/true);
-  }
   [[nodiscard]] std::optional<task_ptr> try_pop_from(const query_index& idx)
   {
     std::lock_guard<std::mutex> lock(_mutex);
@@ -308,11 +291,6 @@ class multi_index_priority_queue {
   {
     std::lock_guard<std::mutex> lock(_mutex);
     return pop_from_levels(_operator_levels, idx.value, /*front=*/false);
-  }
-  [[nodiscard]] std::optional<task_ptr> try_pop_back_from(const pipeline_index& idx)
-  {
-    std::lock_guard<std::mutex> lock(_mutex);
-    return pop_from_pipeline(idx.value, /*front=*/false);
   }
   [[nodiscard]] std::optional<task_ptr> try_pop_back_from(const query_index& idx)
   {
@@ -353,15 +331,6 @@ class multi_index_priority_queue {
   {
     std::lock_guard<std::mutex> lock(_mutex);
     return pop_if_in_levels(_query_levels, idx.value, pred);
-  }
-  template <typename Pred>
-  [[nodiscard]] std::optional<task_ptr> try_pop_if(const pipeline_index& idx, Pred pred)
-  {
-    std::lock_guard<std::mutex> lock(_mutex);
-    const auto it = _pipeline_level.find(idx.value);
-    if (it == _pipeline_level.end()) { return std::nullopt; }
-    if (node* n = find_in_list(_levels.at(it->second).tasks, pred)) { return extract_node(n); }
-    return std::nullopt;
   }
   template <typename Pred>
   [[nodiscard]] std::optional<task_ptr> try_pop_if(const gpu_index& idx, Pred pred)
@@ -430,7 +399,6 @@ class multi_index_priority_queue {
   {
     std::lock_guard<std::mutex> lock(_mutex);
     _levels.clear();
-    _pipeline_level.clear();
     _query_levels.clear();
     _operator_levels.clear();
     _by_device.clear();
@@ -474,12 +442,6 @@ class multi_index_priority_queue {
     const auto it = _operator_levels.find(idx.value);
     return it == _operator_levels.end() ? 0 : sum_levels(it->second);
   }
-  [[nodiscard]] std::size_t size(const pipeline_index& idx) const
-  {
-    std::lock_guard<std::mutex> lock(_mutex);
-    const auto it = _pipeline_level.find(idx.value);
-    return it == _pipeline_level.end() ? 0 : _levels.at(it->second).tasks.size();
-  }
   [[nodiscard]] std::size_t size(const query_index& idx) const
   {
     std::lock_guard<std::mutex> lock(_mutex);
@@ -504,11 +466,6 @@ class multi_index_priority_queue {
     std::lock_guard<std::mutex> lock(_mutex);
     return _operator_levels.size();
   }
-  [[nodiscard]] std::size_t pipeline_bucket_count() const
-  {
-    std::lock_guard<std::mutex> lock(_mutex);
-    return _pipeline_level.size();
-  }
   [[nodiscard]] std::size_t query_bucket_count() const
   {
     std::lock_guard<std::mutex> lock(_mutex);
@@ -529,16 +486,6 @@ class multi_index_priority_queue {
     sizes.reserve(_operator_levels.size());
     for (const auto& [key, levels] : _operator_levels) {
       sizes.emplace(key, sum_levels(levels));
-    }
-    return sizes;
-  }
-  [[nodiscard]] std::unordered_map<pipeline_key, std::size_t> pipeline_bucket_sizes() const
-  {
-    std::lock_guard<std::mutex> lock(_mutex);
-    std::unordered_map<pipeline_key, std::size_t> sizes;
-    sizes.reserve(_pipeline_level.size());
-    for (const auto& [pid, prio] : _pipeline_level) {
-      sizes.emplace(pid, _levels.at(prio).tasks.size());
     }
     return sizes;
   }
@@ -623,14 +570,6 @@ class multi_index_priority_queue {
     return std::nullopt;
   }
 
-  /// Pops the front/back task of a pipeline's single level.
-  std::optional<task_ptr> pop_from_pipeline(pipeline_key pid, bool front)
-  {
-    const auto it = _pipeline_level.find(pid);
-    if (it == _pipeline_level.end()) { return std::nullopt; }
-    return extract_node(level_end_node(it->second, front));
-  }
-
   /// Pops the front (lowest-priority bucket) or back task preferring a device.
   std::optional<task_ptr> pop_from_device(device_key dev, bool front)
   {
@@ -648,11 +587,10 @@ class multi_index_priority_queue {
     return front ? &lv.tasks.front() : &lv.tasks.back();
   }
 
-  /// Erases the whole (now-empty) level and its pipeline/query/operator lookups.
+  /// Erases the whole (now-empty) level and its query/operator lookups.
   void remove_level(typename level_map::iterator lit)
   {
     const level& lv = lit->second;
-    _pipeline_level.erase(lv.pid);
     unset_level(_operator_levels, lv.op, lit->first);
     unset_level(_query_levels, lv.qid, lit->first);
     _levels.erase(lit);
@@ -721,8 +659,7 @@ class multi_index_priority_queue {
   std::condition_variable _cv;
   bool _active{true};  ///< false after interrupt(): blocked pops stop waiting.
 
-  level_map _levels;                                                 ///< Spine: priority -> level.
-  std::unordered_map<pipeline_key, queue_priority> _pipeline_level;  ///< pipeline -> its level.
+  level_map _levels;  ///< Spine: priority -> level.
   std::unordered_map<query_key, std::set<queue_priority>> _query_levels;  ///< query -> its levels.
   std::unordered_map<operator_key, std::set<queue_priority>>
     _operator_levels;           ///< operator -> its levels.
