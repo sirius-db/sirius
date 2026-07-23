@@ -374,6 +374,13 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
     }
   }
 
+  // Build the single GPU<->NUMA topology index now that the memory manager's
+  // GPU/HOST spaces exist. Every NUMA-aware component below (small-pinned
+  // allocator, downgrade executors, task_creator, scan_manager) shares this one
+  // index by shared_ptr copy instead of rebuilding its own device<->NUMA map.
+  topology_index_ = std::make_shared<const sirius::memory::topology_index>(
+    config_.get_hw_topology(), *memory_manager_);
+
   // Enable P2P peer access for every available GPU pair.
   // cucascade::convert_gpu_to_gpu calls cudaMemcpyPeerAsync on every GPU->GPU
   // conversion. For that call to bypass host staging, peer access must be
@@ -442,26 +449,18 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
         auto* fsmr =
           host_space->get_memory_resource_as<cucascade::memory::fixed_size_host_memory_resource>();
         if (fsmr == nullptr) { continue; }
-        int raw_numa = host_space->get_device_id();
-        int node     = (raw_numa < 0) ? 0 : raw_numa;
+        // Key each pool by the host space's NUMA node verbatim (-1 is the
+        // "unknown" sentinel), matching topology_index::numa_node_of() so the
+        // allocator's device->node lookups resolve to the right pool.
+        int node = host_space->get_device_id();
         if (fallback_node < 0) { fallback_node = node; }
         per_node_pools.emplace(
           node, std::make_unique<cucascade::memory::small_pinned_host_memory_resource>(*fsmr));
       }
       if (!per_node_pools.empty()) {
         if (fallback_node < 0) { fallback_node = per_node_pools.begin()->first; }
-        std::unordered_map<int, int> device_to_numa_copy;
-        for (auto const* gpu_space :
-             memory_manager_->get_memory_spaces_for_tier(cucascade::memory::Tier::GPU)) {
-          int const dev = gpu_space->get_device_id();
-          int raw_numa  = -1;
-          if (dev >= 0 && static_cast<unsigned>(dev) < topo.gpus.size()) {
-            raw_numa = topo.gpus[dev].numa_node;
-          }
-          device_to_numa_copy[dev] = (raw_numa < 0) ? 0 : raw_numa;
-        }
         small_pinned_allocator_ = std::make_unique<sirius::memory::numa_small_pinned_mr>(
-          std::move(per_node_pools), std::move(device_to_numa_copy), fallback_node);
+          std::move(per_node_pools), topology_index_, fallback_node);
         small_pinned_allocator_view_.emplace(
           sirius::memory::make_host_device_resource_view_checked(small_pinned_allocator_.get()));
         prev_pinned_threshold_ = cudf::get_allocate_host_as_pinned_threshold();
@@ -498,16 +497,14 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
   auto create_executors_for_tier = [&](cucascade::memory::Tier tier) {
     auto spaces          = memory_manager_->get_memory_spaces_for_tier(tier);
     auto const& base_cfg = config_.get_downgrade_executor_config();
-    auto const& topo     = config_.get_hw_topology();
     for (auto* space : spaces) {
       // Copy the base downgrade_executor_config so we can attach a per-GPU NUMA preference
       // without mutating the shared config owned by sirius_config.
       sirius::exec::downgrade_executor_config dg_cfg = base_cfg;
       if (tier == cucascade::memory::Tier::GPU) {
-        auto dev_id = space->get_device_id();
-        if (dev_id >= 0 && static_cast<unsigned>(dev_id) < topo.gpus.size()) {
-          dg_cfg.preferred_numa_node = topo.gpus[dev_id].numa_node;
-        }
+        // NUMA-local host space to prefer for GPU->HOST downgrade. -1 ("unknown",
+        // e.g. single-NUMA hosts) selects the host space with device_id -1.
+        dg_cfg.preferred_numa_node = topology_index_->numa_node_of(space->get_device_id());
       }
       auto executor = std::make_unique<sirius::parallel::downgrade_executor>(
         dg_cfg,
@@ -531,14 +528,12 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
                                                        &downgrade_executors_);
 
   task_creator_ = std::make_unique<sirius::creator::task_creator>(
-    config_.get_task_creator_config(), *memory_manager_, &config_.get_hw_topology());
+    config_.get_task_creator_config(), *memory_manager_, topology_index_);
   task_creator_->set_task_scheduler(*task_scheduler_);
   task_scheduler_->set_task_creator(*task_creator_);
 
-  auto hw_topology_index = std::make_shared<const sirius::memory::topology_index>(
-    config_.get_hw_topology(), *memory_manager_);
   scan_manager_ = std::make_unique<sirius::scan_manager::sirius_scan_manager>(
-    config_.get_scan_manager_config(), *memory_manager_, std::move(hw_topology_index));
+    config_.get_scan_manager_config(), *memory_manager_, topology_index_);
 
   // Wire the pipeline task queue into downgrade executors now that task_scheduler_
   // has been constructed.
@@ -603,6 +598,10 @@ void SiriusContext::terminate()
 
   memory_manager_->shutdown();
   memory_manager_.reset();
+
+  // Owns only a topology copy (no device resources); drop after the components
+  // that held shared_ptr copies of it are gone.
+  topology_index_.reset();
 
   is_initialized_ = false;
 }

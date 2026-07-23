@@ -17,6 +17,7 @@
 #include "creator/task_creator.hpp"
 
 #include "log/logging.hpp"
+#include "memory/topology_index.hpp"
 #include "op/scan/sirius_gpu_scan_operator_data.hpp"
 #include "op/sirius_physical_delim_join.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
@@ -45,36 +46,28 @@ namespace sirius::creator {
 
 task_creator::task_creator(task_creator_config config,
                            sirius::memory::sirius_memory_reservation_manager& mem_res_mgr,
-                           const cucascade::memory::system_topology_info* sys_topology)
+                           std::shared_ptr<const sirius::memory::topology_index> topology_index)
   : _running(false),
     _config(std::move(config)),
     _mem_res_mgr(mem_res_mgr),
-    _sys_topology(sys_topology)
+    _topology_index(std::move(topology_index))
 {
-  // Normalize numa_node=-1 (Linux convention for non-NUMA / single-NUMA
-  // hosts) to 0 so it matches the host memory space, which is built with
-  // numa_id=0 on those hosts. Without normalization, host-sourced tasks on
-  // single-NUMA boxes fall through to the default GPU.
+  // NUMA-aware GPU routing (HOST-data locality via gpus_of(numa)) is served by
+  // the shared topology_index; no ad-hoc device<->NUMA maps are built here.
+  // numa_node -1 ("unknown", per the Linux /sys/bus/pci/devices/*/numa_node
+  // convention on non-NUMA / single-NUMA hosts) is the index's grouping key and
+  // is queried verbatim at routing time.
   //
-  // Record every GPU under its NUMA key (not just the first) so the
-  // round-robin walk spreads work across all GPUs sharing a NUMA node.
-  if (_sys_topology) {
-    for (size_t i = 0; i < _sys_topology->gpus.size(); ++i) {
-      auto raw_numa       = _sys_topology->gpus[i].numa_node;
-      int normalized_numa = (raw_numa < 0) ? 0 : raw_numa;
-      _numa_to_gpu[normalized_numa].push_back(static_cast<int>(_sys_topology->gpus[i].id));
-    }
+  // Materialize the active executor set sorted+deduped (topology_index preserves
+  // manager order, not sorted order) so partition affinity below stays inverse
+  // to sirius_physical_partition's device->slot mapping.
+  if (_topology_index) {
+    auto ids        = _topology_index->gpu_ids();
+    _active_gpu_ids = std::vector<int>(ids.begin(), ids.end());
+    std::sort(_active_gpu_ids.begin(), _active_gpu_ids.end());
+    _active_gpu_ids.erase(std::unique(_active_gpu_ids.begin(), _active_gpu_ids.end()),
+                          _active_gpu_ids.end());
   }
-
-  // Device ids that actually have a GPU executor (memory-manager GPU spaces);
-  // partition affinity indexes this, not the physical topology, so the pin
-  // resolves to a real executor when num_gpus < physical GPU count.
-  for (auto const* space : _mem_res_mgr.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU)) {
-    if (space) { _active_gpu_ids.push_back(space->get_device_id()); }
-  }
-  std::sort(_active_gpu_ids.begin(), _active_gpu_ids.end());
-  _active_gpu_ids.erase(std::unique(_active_gpu_ids.begin(), _active_gpu_ids.end()),
-                        _active_gpu_ids.end());
 }
 
 task_creator::~task_creator() { stop(); }
@@ -363,16 +356,11 @@ void task_creator::manager_loop()
                 if (space->get_tier() == cucascade::memory::Tier::GPU) {
                   gpu_bytes[space->get_device_id()] += size;
                 } else if (space->get_tier() == cucascade::memory::Tier::HOST) {
-                  // Normalize numa_id=-1 (non-NUMA / single-NUMA hosts, per
-                  // the Linux /sys/bus/pci/devices/*/numa_node convention)
-                  // to 0 so the NUMA-affinity lookup matches the normalized
-                  // `_numa_to_gpu` map key. Without this, host_bytes[-1]
-                  // never hits `_numa_to_gpu[0]`, preferred_device_id stays
-                  // nullopt, and every host-sourced pipeline task falls
-                  // back to `_gpu_executors.begin()->first`.
-                  int host_key = space->get_device_id();
-                  if (host_key < 0) host_key = 0;
-                  host_bytes[host_key] += size;
+                  // Key by the host space's NUMA node verbatim; topology_index
+                  // groups GPUs under that same key (including the -1 "unknown"
+                  // sentinel for non-NUMA / single-NUMA hosts), so gpus_of()
+                  // resolves without any normalization.
+                  host_bytes[space->get_device_id()] += size;
                 }
               }
               if (!gpu_bytes.empty()) {
@@ -382,7 +370,7 @@ void task_creator::manager_loop()
                                    gpu_bytes.end(),
                                    [](const auto& a, const auto& b) { return a.second < b.second; })
                     ->first;
-              } else if (!host_bytes.empty() && !_numa_to_gpu.empty()) {
+              } else if (!host_bytes.empty() && _topology_index) {
                 // NUMA-affinity: no GPU data, route to a GPU on the same
                 // NUMA as the host data. When that NUMA hosts multiple
                 // GPUs, pick round-robin across them — pinning every
@@ -393,10 +381,10 @@ void task_creator::manager_loop()
                                    host_bytes.end(),
                                    [](const auto& a, const auto& b) { return a.second < b.second; })
                     ->first;
-                auto it = _numa_to_gpu.find(top_host);
-                if (it != _numa_to_gpu.end() && !it->second.empty()) {
-                  auto idx            = _numa_to_gpu_rr.fetch_add(1) % it->second.size();
-                  preferred_device_id = it->second[idx];
+                auto gpus = _topology_index->gpus_of(top_host);
+                if (!gpus.empty()) {
+                  auto idx            = _numa_affinity_rr.fetch_add(1) % gpus.size();
+                  preferred_device_id = gpus[idx];
                 }
               }
               SIRIUS_LOG_DEBUG(
@@ -425,18 +413,16 @@ void task_creator::manager_loop()
                     if (space->get_tier() == cucascade::memory::Tier::GPU) {
                       preferred_device_id = space->get_device_id();
                     } else if (space->get_tier() == cucascade::memory::Tier::HOST &&
-                               !_numa_to_gpu.empty()) {
+                               _topology_index) {
                       // tier='host' pinned chunks carry a NUMA-local host
-                      // memory_space; map back through _numa_to_gpu to pick
-                      // a GPU on the same NUMA. Normalize numa_id=-1 to 0
-                      // to match the convention used by the pipelineable
-                      // locality block above.
-                      int host_key = space->get_device_id();
-                      if (host_key < 0) host_key = 0;
-                      auto it = _numa_to_gpu.find(host_key);
-                      if (it != _numa_to_gpu.end() && !it->second.empty()) {
-                        auto idx            = _numa_to_gpu_rr.fetch_add(1) % it->second.size();
-                        preferred_device_id = it->second[idx];
+                      // memory_space; map back through the topology index to
+                      // pick a GPU on the same NUMA. The host space's device id
+                      // is the NUMA key verbatim (-1 = "unknown"), matching the
+                      // pipelineable locality block above.
+                      auto gpus = _topology_index->gpus_of(space->get_device_id());
+                      if (!gpus.empty()) {
+                        auto idx            = _numa_affinity_rr.fetch_add(1) % gpus.size();
+                        preferred_device_id = gpus[idx];
                       }
                     }
                     SIRIUS_LOG_DEBUG(
