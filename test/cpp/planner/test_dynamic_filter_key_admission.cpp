@@ -17,7 +17,6 @@
 #include "expression/join_condition.hpp"
 #include "helper/type_conversions.hpp"
 #include "op/dynamic_filter/dynamic_filter_publish_plan.hpp"
-#include "op/sirius_physical_hash_join.hpp"
 #include "planner/dynamic_filter_key_admission.hpp"
 
 #include <catch.hpp>
@@ -25,7 +24,6 @@
 #include <duckdb/planner/expression/bound_constant_expression.hpp>
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
 #include <duckdb/planner/joinside.hpp>
-#include <duckdb/planner/operator/logical_comparison_join.hpp>
 
 #include <cstddef>
 #include <limits>
@@ -547,97 +545,4 @@ TEST_CASE("publish plan rejects inconsistent admitted-key metadata",
     vary_proven_unique.build_key_proven_unique = true;
     REQUIRE_FALSE(base == vary_proven_unique);
   }
-}
-
-//===----------------------------------------------------------------------===//
-// Carried shapes stay aligned through the physical join's condition reorder
-//===----------------------------------------------------------------------===//
-
-namespace {
-
-/// Minimal logical/physical join pair; the logical join must outlive the physical join because
-/// the physical join stores op.types by reference.
-struct hash_join_shapes_fixture {
-  duckdb::unique_ptr<duckdb::LogicalComparisonJoin> logical_join;
-  duckdb::unique_ptr<sirius::op::sirius_physical_hash_join> hash_join;
-};
-
-hash_join_shapes_fixture make_hash_join_with_shapes(
-  duckdb::vector<duckdb::JoinCondition> conditions,
-  std::vector<dynamic_filter_condition_shape> shapes)
-{
-  hash_join_shapes_fixture fixture;
-  fixture.logical_join = duckdb::make_uniq<duckdb::LogicalComparisonJoin>(duckdb::JoinType::INNER);
-  fixture.logical_join->types = duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER};
-
-  auto make_child = [] {
-    return duckdb::make_uniq<sirius::op::sirius_physical_operator>(
-      sirius::op::SiriusPhysicalOperatorType::PROJECTION,
-      sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER,
-                                                                  duckdb::LogicalType::INTEGER}),
-      0);
-  };
-  fixture.hash_join = duckdb::make_uniq<sirius::op::sirius_physical_hash_join>(
-    *fixture.logical_join,
-    make_child(),
-    make_child(),
-    sirius::wrap_join_conditions(std::move(conditions)),
-    duckdb::JoinType::INNER,
-    duckdb::vector<duckdb::idx_t>{},
-    duckdb::vector<duckdb::idx_t>{},
-    sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{}),
-    /*estimated_cardinality=*/1000,
-    sirius::config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES,
-    sirius::op::dynamic_filter_publish_plan{},
-    sirius::config::DEFAULT_HASH_PARTITION_BYTES,
-    sirius::config::DEFAULT_MAX_BROADCAST_JOIN_SIZE,
-    std::move(shapes));
-  return fixture;
-}
-
-}  // namespace
-
-TEST_CASE("condition_key_shapes[i] describes conditions[i] after equality-first reordering",
-          "[dynamic_filter][key_admission]")
-{
-  // Conditions in original order: eq(0), gt(0), eq(1) -- the reorder moves the inequality last.
-  duckdb::vector<duckdb::JoinCondition> conditions;
-  conditions.push_back(make_condition(make_ref(0), make_ref(0)));
-  conditions.push_back(
-    make_condition(make_ref(0), make_ref(0), duckdb::ExpressionType::COMPARE_GREATERTHAN));
-  conditions.push_back(make_condition(make_ref(1), make_ref(1)));
-
-  // Per-condition-unique shapes so any misalignment is observable.
-  auto const shape_a = kDirectDirect;
-  auto const shape_b = dynamic_filter_condition_shape{.probe = dynamic_filter_key_shape::cast,
-                                                      .build = dynamic_filter_key_shape::cast};
-  auto const shape_c = dynamic_filter_condition_shape{.probe = dynamic_filter_key_shape::computed,
-                                                      .build = dynamic_filter_key_shape::direct};
-
-  auto const fixture =
-    make_hash_join_with_shapes(std::move(conditions), {shape_a, shape_b, shape_c});
-  auto const& join = *fixture.hash_join;
-
-  REQUIRE(join.conditions.size() == 3);
-  REQUIRE(join.has_condition_key_shapes());
-  // Reordered condition order is [eq(0), eq(1), gt(0)]; the shapes must have followed.
-  REQUIRE(join.conditions[0].comparison == sirius::comparison_type::equal);
-  REQUIRE(join.conditions[1].comparison == sirius::comparison_type::equal);
-  REQUIRE(join.conditions[2].comparison == sirius::comparison_type::gt);
-  REQUIRE(join.key_shape_of_condition(0) == shape_a);
-  REQUIRE(join.key_shape_of_condition(1) == shape_c);
-  REQUIRE(join.key_shape_of_condition(2) == shape_b);
-  // Out of range yields the default shape rather than reading past the end.
-  REQUIRE(join.key_shape_of_condition(3) == dynamic_filter_condition_shape{});
-}
-
-TEST_CASE("the physical join rejects misaligned condition_key_shapes",
-          "[dynamic_filter][key_admission]")
-{
-  duckdb::vector<duckdb::JoinCondition> conditions;
-  conditions.push_back(make_condition(make_ref(0), make_ref(0)));
-
-  REQUIRE_THROWS_AS(
-    make_hash_join_with_shapes(std::move(conditions), {kDirectDirect, kDirectDirect}),
-    std::invalid_argument);
 }

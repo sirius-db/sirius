@@ -590,7 +590,6 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
       std::move(filter_plan),
       op_params.hash_partition_bytes,
       op_params.max_broadcast_join_size,
-      std::move(condition_key_shapes),
       &sirius_context->get_dynamic_filter_stats());
     auto& hj                        = join->Cast<sirius::op::sirius_physical_hash_join>();
     hj.join_stats                   = std::move(op.join_stats);

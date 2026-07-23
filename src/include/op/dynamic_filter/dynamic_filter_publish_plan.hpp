@@ -138,8 +138,8 @@ class dynamic_filter_publish_plan final {
      *
      * Provenance and uniqueness only. This index is in the planner's original condition order;
      * anything the physical join derives from its own `conditions` vector -- `key_casts`,
-     * `right_key_col_indices`, `condition_key_shapes` -- is in reordered equality-ordinal space
-     * and must never be subscripted with a value from this space.
+     * `right_key_col_indices` -- is in reordered equality-ordinal space and must never be
+     * subscripted with a value from this space.
      */
     std::size_t planner_condition_index = 0;
     /**

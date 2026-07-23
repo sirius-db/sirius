@@ -175,13 +175,8 @@ bool sirius_physical_hash_join::are_conditions_supported(
 
 namespace {
 
-/// Move equality conditions ahead of the rest, permuting the carried key shapes identically.
-///
-/// This call is the single point that establishes the conditions/shapes index alignment, so the
-/// two containers cannot drift apart. Precondition: `condition_key_shapes` is either empty or
-/// already aligned with `conditions`; the constructor rejects anything else before calling.
-void reorder_join_conditions(duckdb::vector<sirius::join_condition>& conditions,
-                             std::vector<dynamic_filter_condition_shape>& condition_key_shapes)
+/// Move equality conditions ahead of the rest.
+void reorder_join_conditions(duckdb::vector<sirius::join_condition>& conditions)
 {
   bool is_ordered     = true;
   bool seen_non_equal = false;
@@ -196,30 +191,21 @@ void reorder_join_conditions(duckdb::vector<sirius::join_condition>& conditions,
     }
   }
   if (is_ordered) { return; }
-  bool const with_shapes = !condition_key_shapes.empty();
   duckdb::vector<sirius::join_condition> equal_conditions;
   duckdb::vector<sirius::join_condition> other_conditions;
-  std::vector<dynamic_filter_condition_shape> equal_shapes;
-  std::vector<dynamic_filter_condition_shape> other_shapes;
-  for (std::size_t condition_index = 0; condition_index < conditions.size(); ++condition_index) {
-    auto& cond = conditions[condition_index];
+  for (auto& cond : conditions) {
     if (is_equality(cond.comparison)) {
       equal_conditions.push_back(std::move(cond));
-      if (with_shapes) { equal_shapes.push_back(condition_key_shapes[condition_index]); }
     } else {
       other_conditions.push_back(std::move(cond));
-      if (with_shapes) { other_shapes.push_back(condition_key_shapes[condition_index]); }
     }
   }
   conditions.clear();
-  condition_key_shapes.clear();
-  for (std::size_t i = 0; i < equal_conditions.size(); ++i) {
-    conditions.push_back(std::move(equal_conditions[i]));
-    if (with_shapes) { condition_key_shapes.push_back(equal_shapes[i]); }
+  for (auto& cond : equal_conditions) {
+    conditions.push_back(std::move(cond));
   }
-  for (std::size_t i = 0; i < other_conditions.size(); ++i) {
-    conditions.push_back(std::move(other_conditions[i]));
-    if (with_shapes) { condition_key_shapes.push_back(other_shapes[i]); }
+  for (auto& cond : other_conditions) {
+    conditions.push_back(std::move(cond));
   }
 }
 
@@ -239,7 +225,6 @@ sirius_physical_hash_join::sirius_physical_hash_join(
   dynamic_filter_publish_plan dynamic_filter_plan,
   uint64_t hash_partition_bytes,
   uint64_t max_broadcast_join_size,
-  std::vector<dynamic_filter_condition_shape> condition_key_shapes_p,
   dynamic_filter_stats* dynamic_filter_stats_sink)
   : sirius_physical_partition_consumer_operator(SiriusPhysicalOperatorType::HASH_JOIN,
                                                 sirius::from_duckdb_vec(op.types),
@@ -252,13 +237,7 @@ sirius_physical_hash_join::sirius_physical_hash_join(
   _max_build_hash_table_bytes = max_build_hash_table_bytes;
   _hash_partition_bytes       = hash_partition_bytes;
   _max_broadcast_join_size    = max_broadcast_join_size;
-  _condition_key_shapes       = std::move(condition_key_shapes_p);
-  if (!_condition_key_shapes.empty() && _condition_key_shapes.size() != conditions.size()) {
-    throw std::invalid_argument(
-      "[sirius_physical_hash_join] condition_key_shapes must be empty or aligned one-to-one with "
-      "the join conditions");
-  }
-  reorder_join_conditions(conditions, _condition_key_shapes);
+  reorder_join_conditions(conditions);
 
   _dynamic_filter_stats = dynamic_filter_stats_sink;
   if (_dynamic_filter_stats != nullptr && _dynamic_filter_plan.enabled()) {
