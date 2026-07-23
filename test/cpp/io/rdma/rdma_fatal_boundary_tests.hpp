@@ -79,7 +79,11 @@ constexpr std::size_t k_slot_size               = 64UL << 10;
 constexpr std::string_view k_bucket             = "bucket";
 constexpr std::string_view k_key                = "fatal-boundary";
 constexpr std::string_view k_child_env          = "SIRIUS_RDMA_DEATH_CHILD";
+constexpr std::string_view k_scenario_env       = "SIRIUS_RDMA_DEATH_SCENARIO";
 constexpr std::string_view k_sticky_env         = "SIRIUS_RDMA_STICKY_CODE";
+constexpr std::string_view k_generic_child_name = "s3_rdma generic death child";
+constexpr std::string_view k_scenario_mark      = "DEATH_SCENARIO=";
+constexpr std::string_view k_unknown_mark       = "UNKNOWN_DEATH_SCENARIO\n";
 constexpr std::string_view k_hook_mark          = "FATAL_HOOK_CALLED\n";
 constexpr std::string_view k_term_mark          = "TERMINATE_CALLED\n";
 constexpr std::string_view k_future_mark        = "FUTURE_RESOLVED\n";
@@ -651,6 +655,57 @@ void run_death_child(death_scenario scenario, std::optional<cudaError_t> sticky_
   if (stalled_reader != -1) { (void)::close(stalled_reader); }
 }
 
+using death_body_fn = void (*)(std::optional<cudaError_t>);
+
+template <death_scenario Scenario>
+void run_registered_death(std::optional<cudaError_t> sticky_code)
+{
+  run_death_child(Scenario, sticky_code);
+}
+
+struct death_scenario_entry {
+  std::string_view key;
+  death_body_fn run;
+};
+
+inline constexpr auto k_death_scenarios = std::to_array<death_scenario_entry>({
+  {"delivery/memcpy/error-return", run_registered_death<death_scenario::memcpy_error>},
+  {"delivery/memcpy/throw", run_registered_death<death_scenario::memcpy_throw>},
+  {"delivery/event-record/error-return", run_registered_death<death_scenario::record_error>},
+  {"delivery/event-record/throw", run_registered_death<death_scenario::record_throw>},
+  {"delivery/event-wait/error-return", run_registered_death<death_scenario::wait_error>},
+  {"delivery/event-wait/throw", run_registered_death<death_scenario::wait_throw>},
+  {"sticky/event-create", run_registered_death<death_scenario::sticky_create>},
+  {"sticky/flush", run_registered_death<death_scenario::sticky_flush>},
+  {"sticky/capture-query", run_registered_death<death_scenario::sticky_capture>},
+  {"sticky/arena-malloc", run_registered_death<death_scenario::sticky_malloc>},
+  {"sticky/device-set", run_registered_death<death_scenario::sticky_set_device>},
+  {"sticky/dispatch-probe", run_registered_death<death_scenario::dispatch_sticky_after_fail_stop>},
+  {"sticky/device-restore", run_registered_death<death_scenario::sticky_restore_device>},
+  {"sticky/arena-free", run_registered_death<death_scenario::sticky_free_device>},
+  {"fatal-hook/return", run_registered_death<death_scenario::hook_return>},
+  {"fatal-hook/throw", run_registered_death<death_scenario::hook_throw>},
+});
+
+void run_selected_death_scenario()
+{
+  auto const* selected       = std::getenv(k_scenario_env.data());
+  std::string_view const key = selected != nullptr ? std::string_view{selected} : "<missing>";
+  std::string echo{k_scenario_mark};
+  echo.append(key);
+  echo.push_back('\n');
+  emit_marker(echo);
+
+  auto const entry = std::find_if(k_death_scenarios.begin(),
+                                  k_death_scenarios.end(),
+                                  [key](auto const& candidate) { return candidate.key == key; });
+  if (selected == nullptr || entry == k_death_scenarios.end()) {
+    emit_marker(k_unknown_mark);
+    std::_Exit(96);
+  }
+  entry->run(selected_sticky_code());
+}
+
 struct child_result {
   bool timed_out{false};
   bool exited{false};
@@ -661,17 +716,21 @@ struct child_result {
 
 std::vector<char*> child_environment(std::string const& child_name,
                                      std::optional<cudaError_t> sticky_code,
+                                     std::optional<std::string_view> scenario_key,
                                      std::vector<std::string>& storage)
 {
-  auto const prefix        = std::string{k_child_env} + "=";
-  auto const sticky_prefix = std::string{k_sticky_env} + "=";
+  auto const prefix          = std::string{k_child_env} + "=";
+  auto const sticky_prefix   = std::string{k_sticky_env} + "=";
+  auto const scenario_prefix = std::string{k_scenario_env} + "=";
   for (char** entry = environ; entry != nullptr && *entry != nullptr; ++entry) {
     std::string_view value{*entry};
-    if (!value.starts_with(prefix) && !value.starts_with(sticky_prefix)) {
+    if (!value.starts_with(prefix) && !value.starts_with(sticky_prefix) &&
+        !value.starts_with(scenario_prefix)) {
       storage.emplace_back(value);
     }
   }
   storage.push_back(prefix + child_name);
+  if (scenario_key) { storage.push_back(scenario_prefix + std::string{*scenario_key}); }
   if (sticky_code) {
     storage.push_back(sticky_prefix + std::to_string(static_cast<int>(*sticky_code)));
   }
@@ -686,7 +745,8 @@ std::vector<char*> child_environment(std::string const& child_name,
 }
 
 child_result spawn_child(std::string const& child_name,
-                         std::optional<cudaError_t> sticky_code = std::nullopt)
+                         std::optional<cudaError_t> sticky_code       = std::nullopt,
+                         std::optional<std::string_view> scenario_key = std::nullopt)
 {
   int pipe_fds[2];
   if (::pipe(pipe_fds) != 0) { throw std::system_error(errno, std::generic_category(), "pipe"); }
@@ -706,7 +766,7 @@ child_result spawn_child(std::string const& child_name,
   }
 
   std::vector<std::string> environment_storage;
-  auto environment = child_environment(child_name, sticky_code, environment_storage);
+  auto environment = child_environment(child_name, sticky_code, scenario_key, environment_storage);
   std::string executable{"/proc/self/exe"};
   std::string argv_zero{"sirius_unittest"};
   std::vector<char*> argv{argv_zero.data(), const_cast<char*>(child_name.c_str()), nullptr};
@@ -769,14 +829,24 @@ child_result spawn_child(std::string const& child_name,
   return result;
 }
 
-void require_process_fatal(std::string const& child_name,
+void require_scenario_echo(child_result const& result, std::string_view scenario_key)
+{
+  std::string expected{k_scenario_mark};
+  expected.append(scenario_key);
+  expected.push_back('\n');
+  REQUIRE(result.output.find(expected) != std::string::npos);
+  REQUIRE(result.output.find(k_unknown_mark) == std::string::npos);
+}
+
+void require_process_fatal(std::string_view scenario_key,
                            bool wrapper_must_terminate            = false,
                            std::optional<cudaError_t> sticky_code = std::nullopt)
 {
   if (!cuda_device_available()) { return; }
 
-  auto const result = spawn_child(child_name, sticky_code);
+  auto const result = spawn_child(std::string{k_generic_child_name}, sticky_code, scenario_key);
   INFO("death-child output:\n" << result.output);
+  require_scenario_echo(result, scenario_key);
   REQUIRE_FALSE(result.timed_out);
   CHECK(result.output.find(k_hook_mark) != std::string::npos);
   if (wrapper_must_terminate) { CHECK(result.output.find(k_term_mark) != std::string::npos); }
@@ -787,12 +857,13 @@ void require_process_fatal(std::string const& child_name,
   CHECK((result.signal == SIGABRT || (result.exited && result.exit_code != 0)));
 }
 
-void require_teardown_process_fatal(std::string const& child_name)
+void require_teardown_process_fatal(std::string_view scenario_key)
 {
   if (!cuda_device_available()) { return; }
 
-  auto const result = spawn_child(child_name);
+  auto const result = spawn_child(std::string{k_generic_child_name}, std::nullopt, scenario_key);
   INFO("teardown death-child output:\n" << result.output);
+  require_scenario_echo(result, scenario_key);
   REQUIRE_FALSE(result.timed_out);
   CHECK(result.output.find(k_hook_mark) != std::string::npos);
   CHECK(result.output.find(k_future_mark) != std::string::npos);
@@ -801,12 +872,13 @@ void require_teardown_process_fatal(std::string const& child_name)
   CHECK((result.signal == SIGABRT || (result.exited && result.exit_code != 0)));
 }
 
-void require_restore_process_fatal(std::string const& child_name)
+void require_restore_process_fatal(std::string_view scenario_key)
 {
   if (!cuda_device_available()) { return; }
 
-  auto const result = spawn_child(child_name);
+  auto const result = spawn_child(std::string{k_generic_child_name}, std::nullopt, scenario_key);
   INFO("restore death-child output:\n" << result.output);
+  require_scenario_echo(result, scenario_key);
   REQUIRE_FALSE(result.timed_out);
   CHECK(result.output.find(k_hook_mark) != std::string::npos);
   CHECK(result.output.find(k_unwind_mark) != std::string::npos);
@@ -829,81 +901,25 @@ void require_default_hook_exits_with_full_stderr(std::string const& child_name)
 
 }  // namespace s3_rdma_f01b_tests
 
-TEST_CASE("s3_rdma memcpy error return is process-fatal", "[s3][rdma][fatal]")
-{
-  s3_rdma_f01b_tests::require_process_fatal("s3_rdma death child memcpy error return");
-}
-
-TEST_CASE("s3_rdma death child memcpy error return", "[.][rdma-death-child]")
+TEST_CASE("s3_rdma generic death child", "[.][rdma-death-child]")
 {
   using namespace s3_rdma_f01b_tests;
-  if (child_enabled("s3_rdma death child memcpy error return")) {
-    run_death_child(death_scenario::memcpy_error);
-  }
+  if (child_enabled(k_generic_child_name)) { run_selected_death_scenario(); }
 }
 
-TEST_CASE("s3_rdma memcpy throw is process-fatal", "[s3][rdma][fatal]")
-{
-  s3_rdma_f01b_tests::require_process_fatal("s3_rdma death child memcpy throw");
-}
-
-TEST_CASE("s3_rdma death child memcpy throw", "[.][rdma-death-child]")
+TEST_CASE("s3_rdma delivery boundary fatal matrix", "[s3][rdma][fatal]")
 {
   using namespace s3_rdma_f01b_tests;
-  if (child_enabled("s3_rdma death child memcpy throw")) {
-    run_death_child(death_scenario::memcpy_throw);
-  }
-}
-
-TEST_CASE("s3_rdma event record error return is process-fatal", "[s3][rdma][fatal]")
-{
-  s3_rdma_f01b_tests::require_process_fatal("s3_rdma death child event record error return");
-}
-
-TEST_CASE("s3_rdma death child event record error return", "[.][rdma-death-child]")
-{
-  using namespace s3_rdma_f01b_tests;
-  if (child_enabled("s3_rdma death child event record error return")) {
-    run_death_child(death_scenario::record_error);
-  }
-}
-
-TEST_CASE("s3_rdma event record throw is process-fatal", "[s3][rdma][fatal]")
-{
-  s3_rdma_f01b_tests::require_process_fatal("s3_rdma death child event record throw");
-}
-
-TEST_CASE("s3_rdma death child event record throw", "[.][rdma-death-child]")
-{
-  using namespace s3_rdma_f01b_tests;
-  if (child_enabled("s3_rdma death child event record throw")) {
-    run_death_child(death_scenario::record_throw);
-  }
-}
-
-TEST_CASE("s3_rdma event wait error return is process-fatal", "[s3][rdma][fatal]")
-{
-  s3_rdma_f01b_tests::require_process_fatal("s3_rdma death child event wait error return");
-}
-
-TEST_CASE("s3_rdma death child event wait error return", "[.][rdma-death-child]")
-{
-  using namespace s3_rdma_f01b_tests;
-  if (child_enabled("s3_rdma death child event wait error return")) {
-    run_death_child(death_scenario::wait_error);
-  }
-}
-
-TEST_CASE("s3_rdma event wait throw is process-fatal", "[s3][rdma][fatal]")
-{
-  s3_rdma_f01b_tests::require_process_fatal("s3_rdma death child event wait throw");
-}
-
-TEST_CASE("s3_rdma death child event wait throw", "[.][rdma-death-child]")
-{
-  using namespace s3_rdma_f01b_tests;
-  if (child_enabled("s3_rdma death child event wait throw")) {
-    run_death_child(death_scenario::wait_throw);
+  constexpr std::array<std::string_view, 6> rows = {
+    "delivery/memcpy/error-return",
+    "delivery/memcpy/throw",
+    "delivery/event-record/error-return",
+    "delivery/event-record/throw",
+    "delivery/event-wait/error-return",
+    "delivery/event-wait/throw",
+  };
+  for (auto const key : rows) {
+    DYNAMIC_SECTION(key) { require_process_fatal(key); }
   }
 }
 
@@ -1011,134 +1027,45 @@ TEST_CASE("s3_rdma captured-stream rejection recovers before the GET", "[s3][rdm
   CHECK(fixture.client->get_count() == 1);
 }
 
-TEST_CASE("s3_rdma sticky event create code is process-fatal", "[s3][rdma][fatal]")
-{
-  s3_rdma_f01b_tests::require_process_fatal("s3_rdma death child sticky event create");
-}
-
-TEST_CASE("s3_rdma death child sticky event create", "[.][rdma-death-child]")
+TEST_CASE("s3_rdma sticky position fatal matrix", "[s3][rdma][fatal]")
 {
   using namespace s3_rdma_f01b_tests;
-  if (child_enabled("s3_rdma death child sticky event create")) {
-    run_death_child(death_scenario::sticky_create, selected_sticky_code());
+  enum class assertion_kind { process, restore, teardown };
+  struct row {
+    std::string_view key;
+    assertion_kind assertion;
+  };
+  constexpr std::array<row, 8> rows = {
+    row{"sticky/event-create", assertion_kind::process},
+    row{"sticky/flush", assertion_kind::process},
+    row{"sticky/capture-query", assertion_kind::process},
+    row{"sticky/arena-malloc", assertion_kind::process},
+    row{"sticky/device-set", assertion_kind::process},
+    row{"sticky/dispatch-probe", assertion_kind::process},
+    row{"sticky/device-restore", assertion_kind::restore},
+    row{"sticky/arena-free", assertion_kind::teardown},
+  };
+  for (auto const& current : rows) {
+    DYNAMIC_SECTION(current.key)
+    {
+      switch (current.assertion) {
+        case assertion_kind::process: require_process_fatal(current.key); break;
+        case assertion_kind::restore: require_restore_process_fatal(current.key); break;
+        case assertion_kind::teardown: require_teardown_process_fatal(current.key); break;
+      }
+    }
   }
 }
 
-TEST_CASE("s3_rdma sticky flush code is process-fatal", "[s3][rdma][fatal]")
-{
-  s3_rdma_f01b_tests::require_process_fatal("s3_rdma death child sticky flush");
-}
-
-TEST_CASE("s3_rdma death child sticky flush", "[.][rdma-death-child]")
+TEST_CASE("s3_rdma fatal hook wrapper matrix", "[s3][rdma][fatal]")
 {
   using namespace s3_rdma_f01b_tests;
-  if (child_enabled("s3_rdma death child sticky flush")) {
-    run_death_child(death_scenario::sticky_flush, selected_sticky_code());
-  }
-}
-
-TEST_CASE("s3_rdma sticky capture query code is process-fatal", "[s3][rdma][fatal]")
-{
-  s3_rdma_f01b_tests::require_process_fatal("s3_rdma death child sticky capture query");
-}
-
-TEST_CASE("s3_rdma death child sticky capture query", "[.][rdma-death-child]")
-{
-  using namespace s3_rdma_f01b_tests;
-  if (child_enabled("s3_rdma death child sticky capture query")) {
-    run_death_child(death_scenario::sticky_capture, selected_sticky_code());
-  }
-}
-
-TEST_CASE("s3_rdma sticky arena allocation code is process-fatal", "[s3][rdma][fatal]")
-{
-  s3_rdma_f01b_tests::require_process_fatal("s3_rdma death child sticky arena allocation");
-}
-
-TEST_CASE("s3_rdma death child sticky arena allocation", "[.][rdma-death-child]")
-{
-  using namespace s3_rdma_f01b_tests;
-  if (child_enabled("s3_rdma death child sticky arena allocation")) {
-    run_death_child(death_scenario::sticky_malloc, selected_sticky_code());
-  }
-}
-
-TEST_CASE("s3_rdma sticky device selection code is process-fatal", "[s3][rdma][fatal]")
-{
-  s3_rdma_f01b_tests::require_process_fatal("s3_rdma death child sticky device selection");
-}
-
-TEST_CASE("s3_rdma death child sticky device selection", "[.][rdma-death-child]")
-{
-  using namespace s3_rdma_f01b_tests;
-  if (child_enabled("s3_rdma death child sticky device selection")) {
-    run_death_child(death_scenario::sticky_set_device, selected_sticky_code());
-  }
-}
-
-TEST_CASE("s3_rdma sticky dispatch probe after fail-stop is process-fatal", "[s3][rdma][fatal]")
-{
-  s3_rdma_f01b_tests::require_process_fatal(
-    "s3_rdma death child sticky dispatch probe after fail-stop");
-}
-
-TEST_CASE("s3_rdma death child sticky dispatch probe after fail-stop", "[.][rdma-death-child]")
-{
-  using namespace s3_rdma_f01b_tests;
-  if (child_enabled("s3_rdma death child sticky dispatch probe after fail-stop")) {
-    run_death_child(death_scenario::dispatch_sticky_after_fail_stop, selected_sticky_code());
-  }
-}
-
-TEST_CASE("s3_rdma sticky device restore code is process-fatal", "[s3][rdma][fatal]")
-{
-  s3_rdma_f01b_tests::require_restore_process_fatal("s3_rdma death child sticky device restore");
-}
-
-TEST_CASE("s3_rdma death child sticky device restore", "[.][rdma-death-child]")
-{
-  using namespace s3_rdma_f01b_tests;
-  if (child_enabled("s3_rdma death child sticky device restore")) {
-    run_death_child(death_scenario::sticky_restore_device, selected_sticky_code());
-  }
-}
-
-TEST_CASE("s3_rdma sticky arena free code is process-fatal during teardown", "[s3][rdma][fatal]")
-{
-  s3_rdma_f01b_tests::require_teardown_process_fatal("s3_rdma death child sticky arena free");
-}
-
-TEST_CASE("s3_rdma death child sticky arena free", "[.][rdma-death-child]")
-{
-  using namespace s3_rdma_f01b_tests;
-  if (child_enabled("s3_rdma death child sticky arena free")) {
-    run_death_child(death_scenario::sticky_free_device, selected_sticky_code());
-  }
-}
-
-TEST_CASE("s3_rdma fatal hook returning terminates", "[s3][rdma][fatal]")
-{
-  s3_rdma_f01b_tests::require_process_fatal("s3_rdma death child fatal hook returns", true);
-}
-
-TEST_CASE("s3_rdma death child fatal hook returns", "[.][rdma-death-child]")
-{
-  using namespace s3_rdma_f01b_tests;
-  if (child_enabled("s3_rdma death child fatal hook returns")) {
-    run_death_child(death_scenario::hook_return);
-  }
-}
-
-TEST_CASE("s3_rdma fatal hook throwing terminates", "[s3][rdma][fatal]")
-{
-  s3_rdma_f01b_tests::require_process_fatal("s3_rdma death child fatal hook throws", true);
-}
-
-TEST_CASE("s3_rdma death child fatal hook throws", "[.][rdma-death-child]")
-{
-  using namespace s3_rdma_f01b_tests;
-  if (child_enabled("s3_rdma death child fatal hook throws")) {
-    run_death_child(death_scenario::hook_throw);
+  constexpr std::array<std::string_view, 2> rows = {
+    "fatal-hook/return",
+    "fatal-hook/throw",
+  };
+  for (auto const key : rows) {
+    DYNAMIC_SECTION(key) { require_process_fatal(key, true); }
   }
 }
 
@@ -1217,14 +1144,14 @@ TEST_CASE("s3_rdma every frozen sticky code is process-fatal", "[s3][rdma][fatal
                      k_expected_sticky_codes.begin(),
                      k_expected_sticky_codes.end()));
 
-  constexpr std::array<std::string_view, 3> children = {
-    "s3_rdma death child sticky event create",
-    "s3_rdma death child sticky flush",
-    "s3_rdma death child sticky capture query",
+  constexpr std::array<std::string_view, 3> scenarios = {
+    "sticky/event-create",
+    "sticky/flush",
+    "sticky/capture-query",
   };
   for (std::size_t i = 0; i < k_sticky_context_fatal_codes.size(); ++i) {
     auto const code = k_sticky_context_fatal_codes[i];
-    INFO("sticky code " << static_cast<int>(code) << " via leg " << (i % children.size()));
-    require_process_fatal(std::string{children[i % children.size()]}, false, code);
+    INFO("sticky code " << static_cast<int>(code) << " via leg " << (i % scenarios.size()));
+    require_process_fatal(scenarios[i % scenarios.size()], false, code);
   }
 }
