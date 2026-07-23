@@ -397,22 +397,34 @@ The scan manager builds one ioctx for the run: `uring_ioctx` when `use_sirius_da
 
 ### S3 / Object-Store Backend
 
-**Files:** `src/include/io/rest/{rest_ioctx,rest_reactor,curl_handle,config,types}.hpp`, `src/io/rest/*.cpp`, `src/include/io/s3/{s3_request_authorizer,sirius_sigv4_authorizer,s3_object_ref,static_credentials}.hpp`, `src/include/io/object_store_config.hpp`
+**Files:** `src/include/io/rest/`, `src/io/rest/`, `src/include/io/s3/`, `src/io/s3/`, `src/io/datasource_factory.cpp`, `src/op/scan/parquet_gpu_ingestible.cpp`
 
-Reads of `s3://bucket/key` parquet files go through the REST backend, `rest_ioctx = templated_ioctx<rest_reactor>`. Each `rest_reactor` owns one worker thread driving a libcurl multi handle over an epoll event loop (`curl_multi_socket_action`), a pool of reusable easy handles, optional pinned bounce slots for device staging, and a timerfd + min-heap retry scheduler. `create_io_object` parses the URL, issues a one-time HEAD for the object size, and builds a `rest_io_object` (path / bucket / key / size). Because S3 has no native device-read path, device reads stage through a pinned host bounce slot followed by `cudaMemcpyAsync`.
+`rest_ioctx = templated_ioctx<rest_reactor>` handles `s3://` paths for AWS S3 and compatible stores such as MinIO. The `gs://` and `azure://` schemes parsed by `uri_parser` have no registered backend. DuckDB uses the read-only `sirius_httpfs` to bind transparent `read_parquet('s3://...')` queries, while scan-manager callers can open the same path directly through the datasource registry. S3 scans require GPU execution and have no DuckDB CPU fallback.
 
-**Request unit.** Each ranged GET is one `rest_chunked_rx_request` carrying the object ref, the file range and its destination buffer(s), and an attempt counter. The reactor's libcurl write callback scatters the response body across the chunk's destination iovecs, so a single ranged GET can fuse several file-adjacent segments. A 206's `Content-Range` is validated against the request, and a server that ignores the Range header (returns the whole object) is detected via the received-byte count.
+**Opening objects.** A generic open issues a blocking HEAD to obtain the object size. A `parquet_footer_probe` open uses a suffix-range GET to obtain both the size and the footer bytes; those bytes stay on the resulting `rest_io_object` and serve the binder's footer reads. If the suffix response cannot be used, the open falls back to HEAD. Parsed footer metadata is stored separately in the ioctx's `metadata_store`.
 
-**Authorization.** Auth is delegated to a pluggable `s3_request_authorizer` (the credential/signer seam), called inline once per request attempt (presigned URLs are short-lived, so they are minted per attempt, never at task-creation time). `authorize(object, method, ttl)` returns the URL to fetch plus headers to attach:
+**Reads.** Each `rest_reactor` runs a libcurl multi handle on one epoll worker thread and reuses a pool of easy handles. Ranged GETs are asynchronous and can scatter one response across adjacent destination segments. The response's `Content-Range` and byte count are checked before the request completes. HEAD, LIST, and footer-probe requests use blocking easy handles on the caller thread; they share DNS and TLS-session caches with the workers.
+
+S3 has no direct-to-device transport in this backend. Reads into arbitrary device memory use pinned bounce buffers followed by `cudaMemcpyAsync`; reads that already target pinned host memory can use a scatter GET directly. Host reads remain available when no bounce pool is configured, but device reads do not.
+
+**LIST and glob expansion.** `sirius_httpfs` expands S3 globs with paginated `ListObjectsV2` requests. It sends the longest static directory prefix to S3, then applies the remaining pattern locally. `*`, `?`, and `[...]` match within one path segment; a segment equal to `**` can cross directories. Bucket wildcards are rejected.
+
+Pages are processed as they arrive, so listing memory is bounded by one page plus the matches retained for DuckDB. `list_max_scanned` limits inspected objects and `list_max_matches` limits retained matches. Reaching either limit raises an error instead of returning an incomplete file list. Results are sorted by URI, and LIST metadata lets globbed parquet files use the footer-probe open without a separate HEAD.
+
+**Authorization.** `s3_request_authorizer` signs each request attempt and returns the request URL and headers. LIST uses the separate `authorize_list` entry point, which custom authorizers must implement if they support glob expansion.
 
 | Authorizer | Mechanism |
 |------------|-----------|
-| `sirius_sigv4_presigned_authorizer` | Hand-rolled SigV4 presigned URL (auth in the query string), empty headers. Default. |
-| `sirius_sigv4_header_authorizer` | Plain URL plus signed `Authorization` / `x-amz-*` headers; supports STS session tokens via `X-Amz-Security-Token`. For gateways that prefer header auth. |
+| `sirius_sigv4_presigned_authorizer` | SigV4 credentials in the query string. This is the default. |
+| `sirius_sigv4_header_authorizer` | A plain URL with signed `Authorization` and `x-amz-*` headers. |
 
-Both share `sirius_sigv4_authorizer_base` (SigV4 over `static_credentials`, no `aws-sdk-cpp`). Downstream projects can ship their own authorizer (IMDS/STS chain, SSO, broker-issued URLs) — the seam is a single `authorize()` call, so implementations without raw key material compose cleanly.
+Both authorizers use path-style URLs and support temporary credentials. The session token is signed as a header in header mode and as a query parameter in presigned mode. Custom authorizers can use another credential source or return broker-issued URLs.
 
-**Configuration.** `object_store_config` (file-settable) carries the endpoint, region, credentials, optional STS session token, signing mode (`presigned` / `header`), and TLS settings (CA bundle, verify). The REST factory (`make_rest_ioctx_factory`) builds the authorizer from it and returns a null ioctx when the store is not configured (empty endpoint / credentials / region). The reactor's own tunables live in `rest::config`: per-request timeout, max concurrent connections per reactor, target bytes per ranged GET (`chunk_size`), how a contiguous host read is split into parallel GETs (`max_read_split`), idle-connection keepalive (`upkeep_interval` / `conn_max_age`), and the retry policy (general 5xx/curl retries plus a small bounded retry for HTTP 403, since an expired presigned URL re-authorizes on retry).
+**Configuration.** `object_store_config` supplies the endpoint, region, static credentials, optional session token, signing mode, and TLS settings. The built-in factory does not search environment variables, AWS profiles, or IMDS. A custom authorizer can implement those sources. If the endpoint, region, or static keys are missing, the factory returns no REST ioctx and the S3 read fails.
+
+Connection limits, request sizing, footer-probe size, retry budgets, keepalive, and LIST caps live in `rest::config`; the defaults are defined in `io/rest/config.hpp`. `request_timeout_s` is also used as the lifetime of a presigned URL. Async data requests retry transient curl and HTTP failures, with a separate bounded retry for HTTP 403. Control requests treat HTTP 403 as terminal.
+
+`rest_ioctx::perf_snapshot()` reports aggregate request, retry, byte, queue-wait, and H2D metrics across its reactors. Detailed timing is enabled with `perf_instrumentation`.
 
 ### Cache Seam
 
