@@ -64,16 +64,17 @@ input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
 input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
 
 ---
-# column: l_shipinstruct  dtype: str  ratio: 61.823x  depth: 3
-# comp: 218.92 GB/s  decomp: 286.94 GB/s
-input -> dictionary -> keys_offsets, keys_chars, indices
-dictionary.keys_offsets -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
-dictionary.indices -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+# column: l_shipinstruct  dtype: str
+# chars -> fsst (FSST-GPU CompactionV5T); offsets -> bitpack
+input -> str_split -> offsets, chars
+str_split.chars -> fsst
+str_split.offsets -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
 
 ---
-# column: l_shipmode  dtype: str  ratio: 1.700x  depth: 2
-# comp: 330.83 GB/s  decomp: 822.91 GB/s
+# column: l_shipmode  dtype: str
+# chars -> fsst (FSST-GPU CompactionV5T); offsets -> bitpack
 input -> str_split -> offsets, chars
+str_split.chars -> fsst
 str_split.offsets -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
 
 ---
