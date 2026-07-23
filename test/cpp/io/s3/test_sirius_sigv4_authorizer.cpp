@@ -782,6 +782,7 @@ TEST_CASE("S3 RDMA Range and token headers are included in SigV4 SignedHeaders",
 }
 
 #include "../rdma/rdma_client_seam_tests.hpp"
+#include "../rdma/rdma_endpoint_topology_tests.hpp"
 #include "../rdma/rdma_real_client_tests.hpp"
 #include "../rdma/rdma_retries_metrics_tests.hpp"
 #include "../rdma/rdma_slot_lifetime_tests.hpp"

@@ -17,8 +17,11 @@
 #include "io/s3/s3_rdma_ioctx.hpp"
 
 #include "io/uri_parser.hpp"
+#include "log/logging.hpp"
 
 #include <algorithm>
+#include <cctype>
+#include <cstddef>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -43,7 +46,81 @@ rdma::cuobj_rdma_reactor::config reactor_config_from(const object_store_config& 
   return reactor_cfg;
 }
 
+/// Normalized endpoint components for the same-address judgment: scheme and
+/// host lowercased, the default port expanded from the scheme, ONE trailing
+/// slash stripped from the path (paths stay case-sensitive).  Purely
+/// syntactic — no DNS resolution.
+struct normalized_endpoint {
+  std::string scheme;
+  std::string host;
+  std::string port;
+  std::string path;
+};
+
+std::string lowered(std::string_view s)
+{
+  std::string out;
+  out.reserve(s.size());
+  for (char c : s) {
+    out.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+  }
+  return out;
+}
+
+normalized_endpoint normalize_endpoint(std::string_view ep)
+{
+  normalized_endpoint out;
+  const auto scheme_end = ep.find("://");
+  std::string_view rest = ep;
+  if (scheme_end != std::string_view::npos) {
+    out.scheme = lowered(ep.substr(0, scheme_end));
+    rest       = ep.substr(scheme_end + 3);
+  }
+  const auto path_begin      = rest.find('/');
+  std::string_view authority = rest.substr(0, path_begin);
+  if (path_begin != std::string_view::npos) {
+    std::string_view path = rest.substr(path_begin);
+    if (!path.empty() && path.back() == '/') { path.remove_suffix(1); }
+    out.path.assign(path);
+  }
+  // Bracketed IPv6 keeps the whole authority as the host (no port split
+  // heuristics); otherwise split on the last ':' when the suffix is digits.
+  if (!authority.empty() && authority.front() == '[') {
+    out.host = lowered(authority);
+  } else {
+    const auto colon    = authority.rfind(':');
+    const bool has_port = colon != std::string_view::npos && colon + 1 < authority.size() &&
+                          std::all_of(authority.begin() + static_cast<std::ptrdiff_t>(colon) + 1,
+                                      authority.end(),
+                                      [](unsigned char c) { return std::isdigit(c) != 0; });
+    if (has_port) {
+      out.host = lowered(authority.substr(0, colon));
+      out.port.assign(authority.substr(colon + 1));
+    } else {
+      out.host = lowered(authority);
+    }
+  }
+  if (out.port.empty()) {
+    if (out.scheme == "http") { out.port = "80"; }
+    if (out.scheme == "https") { out.port = "443"; }
+  }
+  return out;
+}
+
 }  // namespace
+
+endpoint_topology detect_endpoint_topology(std::string_view host_endpoint,
+                                           std::string_view data_endpoint)
+{
+  const auto host_side = normalize_endpoint(host_endpoint);
+  const auto data_side = normalize_endpoint(data_endpoint);
+  // Only a provably equal pair is same_address; a missing host on either
+  // side (including two empty endpoints) can never prove anything.
+  if (host_side.host.empty() || data_side.host.empty()) { return endpoint_topology::split; }
+  const bool equal = host_side.scheme == data_side.scheme && host_side.host == data_side.host &&
+                     host_side.port == data_side.port && host_side.path == data_side.path;
+  return equal ? endpoint_topology::same_address : endpoint_topology::split;
+}
 
 s3_rdma_ioctx::s3_rdma_ioctx(object_store_config cfg,
                              rdma::rdma_transport_clients clients,
@@ -51,6 +128,13 @@ s3_rdma_ioctx::s3_rdma_ioctx(object_store_config cfg,
   : s3_rdma_ioctx(std::make_shared<rdma::cuobj_rdma_reactor::reactor_context>(
       reactor_config_from(cfg), std::move(clients), std::move(delivery)))
 {
+  _topology = detect_endpoint_topology(cfg.endpoint, cfg.s3_rdma_data.endpoint);
+  // An explicit data-plane key that differs from the host plane is judged
+  // here (config is not retained); the start() log decides whether it is
+  // worth a warning — only under same_address, where two credential sets
+  // against one service is usually a misconfiguration.
+  _credentials_differ =
+    !cfg.s3_rdma_data.access_key.empty() && cfg.s3_rdma_data.access_key != cfg.access_key;
 }
 
 s3_rdma_ioctx::s3_rdma_ioctx(std::shared_ptr<rdma::cuobj_rdma_reactor::reactor_context> reactor_ctx)
@@ -69,6 +153,21 @@ void s3_rdma_ioctx::start()
                                                    : "the completion-tag predicate";
     throw std::runtime_error(std::string("s3_rdma_ioctx: RDMA transport initialization failed: ") +
                              missing + " capability is missing");
+  }
+  if (_topology == endpoint_topology::same_address) {
+    SIRIUS_LOG_INFO(
+      "s3_rdma_ioctx: endpoint topology same_address — one service serves both planes; "
+      "cross-endpoint checks reduce to its native consistency and immutable keys are the "
+      "operative rule");
+    if (_credentials_differ) {
+      SIRIUS_LOG_WARN(
+        "s3_rdma_ioctx: same-address deployment but the data-plane credentials differ from the "
+        "host plane; two credential sets against one service is usually a misconfiguration");
+    }
+  } else {
+    SIRIUS_LOG_INFO(
+      "s3_rdma_ioctx: endpoint topology split — the full publisher visibility barrier contract "
+      "applies");
   }
   templated_ioctx<rdma::cuobj_rdma_reactor>::start();
 }

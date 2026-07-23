@@ -23,6 +23,25 @@
 
 namespace sirius::io::s3 {
 
+/// Deployment topology of the host-plane / RDMA-data-plane endpoint pair,
+/// judged once at construction and immutable afterwards.  @c same_address
+/// means the two configured addresses provably name one service after
+/// normalization — the cross-endpoint visibility barrier then reduces to
+/// that service's native read-after-write consistency and immutable keys
+/// remain the operative rule.  Transfer semantics are IDENTICAL in both
+/// modes; the value only drives the startup log line and diagnostics.
+enum class endpoint_topology { split, same_address };
+
+/// Conservative same-address judgment over the two configured endpoints:
+/// scheme + host lowercased, default ports expanded (http:80 / https:443),
+/// one trailing slash stripped; NO DNS resolution.  Only a provably equal
+/// pair yields @c same_address — any ambiguity (including a CNAME alias of
+/// the same service) stays @c split, because misjudging same-address as
+/// split merely keeps three trivially-satisfied deployment locks, while the
+/// reverse would wrongly announce a relaxed contract.
+[[nodiscard]] endpoint_topology detect_endpoint_topology(std::string_view host_endpoint,
+                                                         std::string_view data_endpoint);
+
 /**
  * @brief S3-over-RDMA ioctx. Specialisation of
  *        @c templated_ioctx<rdma::cuobj_rdma_reactor>.
@@ -62,6 +81,10 @@ class s3_rdma_ioctx final : public templated_ioctx<rdma::cuobj_rdma_reactor> {
   /// pool ever grows).
   [[nodiscard]] rdma::rdma_perf_snapshot perf_snapshot() const noexcept;
 
+  /// Endpoint-pair topology, judged at construction from the configured
+  /// host-plane and data-plane endpoints; immutable for the ioctx lifetime.
+  [[nodiscard]] endpoint_topology topology() const noexcept { return _topology; }
+
   /// The two staged paths are structurally unsupported for this backend; keep
   /// the transport-selection error shape ("RDMA ... not implemented") instead
   /// of the generic unsupported-operation message.
@@ -94,6 +117,8 @@ class s3_rdma_ioctx final : public templated_ioctx<rdma::cuobj_rdma_reactor> {
   explicit s3_rdma_ioctx(std::shared_ptr<rdma::cuobj_rdma_reactor::reactor_context> reactor_ctx);
 
   std::shared_ptr<rdma::cuobj_rdma_reactor::reactor_context> _reactor_ctx;
+  endpoint_topology _topology{endpoint_topology::split};
+  bool _credentials_differ{false};
 };
 
 }  // namespace sirius::io::s3
