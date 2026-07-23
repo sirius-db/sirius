@@ -724,71 +724,67 @@ TEST_CASE("s3_rdma AC7 data headers are signed and accepted on the wire",
 
 #endif
 
-TEST_CASE("s3_rdma AC4 not-sent data errors do not poison the transport",
+TEST_CASE("s3_rdma AC4 completion outcomes preserve commit-state semantics",
           "[s3][rdma][client-seam][gpu]")
 {
   using namespace s3_rdma_client_seam_tests;
   if (!cuda_device_available()) { return; }
 
-  auto payload   = pattern_bytes(k_slot_size);
-  auto transport = seeded_mock_transport(std::string{k_bucket}, "not-sent", payload);
-  transport->data->script_result(
-    data_get_result{data_commit_state::not_sent, 0, 0, {}, "request not sent"});
-  auto ctx = make_started_ioctx(transport);
-  auto ds  = open_ds(ctx, "not-sent");
-  rmm::cuda_stream stream;
-  rmm::device_buffer first(payload.size(), stream);
+  SECTION("outcome/not-sent")
+  {
+    auto payload   = pattern_bytes(k_slot_size);
+    auto transport = seeded_mock_transport(std::string{k_bucket}, "not-sent", payload);
+    transport->data->script_result(
+      data_get_result{data_commit_state::not_sent, 0, 0, {}, "request not sent"});
+    auto ctx = make_started_ioctx(transport);
+    auto ds  = open_ds(ctx, "not-sent");
+    rmm::cuda_stream stream;
+    rmm::device_buffer first(payload.size(), stream);
 
-  auto failed = issue_device_read(*ds, first, stream);
-  CHECK(ready_error(failed).find("not sent") != std::string::npos);
-  CHECK(ctx->perf_snapshot().fail_stop_total == 0);
-  CHECK(ctx->perf_snapshot().arena_leak_total == 0);
+    auto failed = issue_device_read(*ds, first, stream);
+    CHECK(ready_error(failed).find("not sent") != std::string::npos);
+    CHECK(ctx->perf_snapshot().fail_stop_total == 0);
+    CHECK(ctx->perf_snapshot().arena_leak_total == 0);
 
-  rmm::device_buffer follow_up(payload.size(), stream);
-  auto succeeded = issue_device_read(*ds, follow_up, stream);
-  REQUIRE(succeeded.wait_for(5s) == std::future_status::ready);
-  CHECK(succeeded.get() == payload.size());
-}
+    rmm::device_buffer follow_up(payload.size(), stream);
+    auto succeeded = issue_device_read(*ds, follow_up, stream);
+    REQUIRE(succeeded.wait_for(5s) == std::future_status::ready);
+    CHECK(succeeded.get() == payload.size());
+  }
 
-TEST_CASE("s3_rdma AC4 sent-unknown data errors fail-stop", "[s3][rdma][client-seam][gpu]")
-{
-  using namespace s3_rdma_client_seam_tests;
-  if (!cuda_device_available()) { return; }
+  SECTION("outcome/sent-unknown")
+  {
+    auto payload   = pattern_bytes(k_slot_size);
+    auto transport = seeded_mock_transport(std::string{k_bucket}, "sent-unknown", payload);
+    transport->data->script_result(
+      data_get_result{data_commit_state::sent_unknown, 0, 0, {}, "completion unknown"});
+    auto ctx = make_started_ioctx(transport);
+    auto ds  = open_ds(ctx, "sent-unknown");
+    rmm::cuda_stream stream;
+    rmm::device_buffer destination(payload.size(), stream);
 
-  auto payload   = pattern_bytes(k_slot_size);
-  auto transport = seeded_mock_transport(std::string{k_bucket}, "sent-unknown", payload);
-  transport->data->script_result(
-    data_get_result{data_commit_state::sent_unknown, 0, 0, {}, "completion unknown"});
-  auto ctx = make_started_ioctx(transport);
-  auto ds  = open_ds(ctx, "sent-unknown");
-  rmm::cuda_stream stream;
-  rmm::device_buffer destination(payload.size(), stream);
+    auto failed = issue_device_read(*ds, destination, stream);
+    CHECK(ready_error(failed).find("completion unknown") != std::string::npos);
+    CHECK(ctx->perf_snapshot().fail_stop_total == 1);
+    CHECK(ctx->perf_snapshot().arena_leak_total == 1);
+  }
 
-  auto failed = issue_device_read(*ds, destination, stream);
-  CHECK(ready_error(failed).find("completion unknown") != std::string::npos);
-  CHECK(ctx->perf_snapshot().fail_stop_total == 1);
-  CHECK(ctx->perf_snapshot().arena_leak_total == 1);
-}
+  SECTION("outcome/completed")
+  {
+    auto payload   = pattern_bytes(k_slot_size);
+    auto transport = seeded_mock_transport(std::string{k_bucket}, "completed", payload);
+    transport->data->script_result(
+      data_get_result{data_commit_state::completed, payload.size(), 200, "accepted-test-tag", {}});
+    auto ctx = make_started_ioctx(transport, mock_config(), &accepts_test_tag);
+    auto ds  = open_ds(ctx, "completed");
+    rmm::cuda_stream stream;
+    rmm::device_buffer destination(payload.size(), stream);
 
-TEST_CASE("s3_rdma AC4 completed data succeeds only with all authority legs",
-          "[s3][rdma][client-seam][gpu]")
-{
-  using namespace s3_rdma_client_seam_tests;
-  if (!cuda_device_available()) { return; }
-
-  auto payload   = pattern_bytes(k_slot_size);
-  auto transport = seeded_mock_transport(std::string{k_bucket}, "completed", payload);
-  transport->data->script_result(
-    data_get_result{data_commit_state::completed, payload.size(), 200, "accepted-test-tag", {}});
-  auto ctx = make_started_ioctx(transport, mock_config(), &accepts_test_tag);
-  auto ds  = open_ds(ctx, "completed");
-  rmm::cuda_stream stream;
-  rmm::device_buffer destination(payload.size(), stream);
-
-  auto succeeded = issue_device_read(*ds, destination, stream);
-  REQUIRE(succeeded.wait_for(5s) == std::future_status::ready);
-  CHECK(succeeded.get() == payload.size());
-  CHECK(ctx->perf_snapshot().fail_stop_total == 0);
+    auto succeeded = issue_device_read(*ds, destination, stream);
+    REQUIRE(succeeded.wait_for(5s) == std::future_status::ready);
+    CHECK(succeeded.get() == payload.size());
+    CHECK(ctx->perf_snapshot().fail_stop_total == 0);
+  }
 }
 
 TEST_CASE("s3_rdma AC5 completion authority validates tag bytes and status",
@@ -1273,70 +1269,68 @@ TEST_CASE("s3_rdma rejects arena byte-size overflow at construction",
   CHECK(overflow_error_message.find("arena") != std::string::npos);
 }
 
-TEST_CASE("s3_rdma injected completion status set is authoritative", "[s3][rdma][client-seam][gpu]")
+TEST_CASE("s3_rdma completion status policy honors injected and default sets",
+          "[s3][rdma][client-seam][gpu]")
 {
   using namespace s3_rdma_client_seam_tests;
   if (!cuda_device_available()) { return; }
 
-  auto payload   = pattern_bytes(k_slot_size);
-  auto transport = seeded_mock_transport(std::string{k_bucket}, "status-418-accepted", payload);
-  transport->data->script_result(
-    data_get_result{data_commit_state::completed, payload.size(), 418, "accepted-test-tag", {}});
-  auto clients              = transport->clients(&accepts_test_tag);
-  clients.accepted_statuses = {418};
-  auto ctx =
-    std::make_shared<s3_rdma_ioctx>(mock_config(), std::move(clients), cuda_delivery_ops{});
-  ctx->start();
-  auto ds = open_ds(ctx, "status-418-accepted");
-  rmm::cuda_stream stream;
-  rmm::device_buffer destination(payload.size(), stream);
+  SECTION("status/injected-418-authoritative")
+  {
+    auto payload   = pattern_bytes(k_slot_size);
+    auto transport = seeded_mock_transport(std::string{k_bucket}, "status-418-accepted", payload);
+    transport->data->script_result(
+      data_get_result{data_commit_state::completed, payload.size(), 418, "accepted-test-tag", {}});
+    auto clients              = transport->clients(&accepts_test_tag);
+    clients.accepted_statuses = {418};
+    auto ctx =
+      std::make_shared<s3_rdma_ioctx>(mock_config(), std::move(clients), cuda_delivery_ops{});
+    ctx->start();
+    auto ds = open_ds(ctx, "status-418-accepted");
+    rmm::cuda_stream stream;
+    rmm::device_buffer destination(payload.size(), stream);
 
-  auto completed = issue_device_read(*ds, destination, stream);
-  REQUIRE(completed.wait_for(5s) == std::future_status::ready);
-  CHECK(completed.get() == payload.size());
-  CHECK(ctx->perf_snapshot().fail_stop_total == 0);
-}
+    auto completed = issue_device_read(*ds, destination, stream);
+    REQUIRE(completed.wait_for(5s) == std::future_status::ready);
+    CHECK(completed.get() == payload.size());
+    CHECK(ctx->perf_snapshot().fail_stop_total == 0);
+  }
 
-TEST_CASE("s3_rdma default completion status set accepts 206", "[s3][rdma][client-seam][gpu]")
-{
-  using namespace s3_rdma_client_seam_tests;
-  if (!cuda_device_available()) { return; }
+  SECTION("status/default-accepts-206")
+  {
+    auto payload   = pattern_bytes(k_slot_size);
+    auto transport = seeded_mock_transport(std::string{k_bucket}, "status-206", payload);
+    transport->data->script_result(
+      data_get_result{data_commit_state::completed, payload.size(), 206, "reply-tag", {}});
+    auto ctx = make_started_ioctx(transport);
+    auto ds  = open_ds(ctx, "status-206");
+    rmm::cuda_stream stream;
+    rmm::device_buffer destination(payload.size(), stream);
 
-  auto payload   = pattern_bytes(k_slot_size);
-  auto transport = seeded_mock_transport(std::string{k_bucket}, "status-206", payload);
-  transport->data->script_result(
-    data_get_result{data_commit_state::completed, payload.size(), 206, "reply-tag", {}});
-  auto ctx = make_started_ioctx(transport);
-  auto ds  = open_ds(ctx, "status-206");
-  rmm::cuda_stream stream;
-  rmm::device_buffer destination(payload.size(), stream);
+    auto completed = issue_device_read(*ds, destination, stream);
+    REQUIRE(completed.wait_for(5s) == std::future_status::ready);
+    CHECK(completed.get() == payload.size());
+    CHECK(ctx->perf_snapshot().fail_stop_total == 0);
+  }
 
-  auto completed = issue_device_read(*ds, destination, stream);
-  REQUIRE(completed.wait_for(5s) == std::future_status::ready);
-  CHECK(completed.get() == payload.size());
-  CHECK(ctx->perf_snapshot().fail_stop_total == 0);
-}
+  SECTION("status/default-rejects-418")
+  {
+    auto payload   = pattern_bytes(k_slot_size);
+    auto transport = seeded_mock_transport(std::string{k_bucket}, "status-418-rejected", payload);
+    transport->data->script_result(
+      data_get_result{data_commit_state::completed, payload.size(), 418, "reply-tag", {}});
+    auto ctx = make_started_ioctx(transport);
+    auto ds  = open_ds(ctx, "status-418-rejected");
+    rmm::cuda_stream stream;
+    rmm::device_buffer destination(payload.size(), stream);
 
-TEST_CASE("s3_rdma default completion status set rejects 418", "[s3][rdma][client-seam][gpu]")
-{
-  using namespace s3_rdma_client_seam_tests;
-  if (!cuda_device_available()) { return; }
-
-  auto payload   = pattern_bytes(k_slot_size);
-  auto transport = seeded_mock_transport(std::string{k_bucket}, "status-418-rejected", payload);
-  transport->data->script_result(
-    data_get_result{data_commit_state::completed, payload.size(), 418, "reply-tag", {}});
-  auto ctx = make_started_ioctx(transport);
-  auto ds  = open_ds(ctx, "status-418-rejected");
-  rmm::cuda_stream stream;
-  rmm::device_buffer destination(payload.size(), stream);
-
-  auto failed = issue_device_read(*ds, destination, stream);
-  CHECK(ready_error(failed).find("418") != std::string::npos);
-  auto const snapshot = ctx->perf_snapshot();
-  CHECK(snapshot.fail_stop_total == 1);
-  CHECK(snapshot.arena_leak_total >= 1);
-  CHECK(snapshot.retries_total == 0);
+    auto failed = issue_device_read(*ds, destination, stream);
+    CHECK(ready_error(failed).find("418") != std::string::npos);
+    auto const snapshot = ctx->perf_snapshot();
+    CHECK(snapshot.fail_stop_total == 1);
+    CHECK(snapshot.arena_leak_total >= 1);
+    CHECK(snapshot.retries_total == 0);
+  }
 }
 
 TEST_CASE("s3_rdma non-sticky arena allocation error is per-chunk and recoverable",
@@ -1409,104 +1403,120 @@ TEST_CASE("s3_rdma token redaction removes the complete header value",
   }
 }
 
-TEST_CASE("s3_rdma host read rejects a mismatched Content-Range without poisoning",
-          "[s3][rdma][client-seam]")
+TEST_CASE("s3_rdma host read rejects invalid Content-Range responses", "[s3][rdma][client-seam]")
 {
   using namespace s3_rdma_client_seam_tests;
 
-  auto payload   = pattern_bytes(4096);
-  auto transport = seeded_mock_transport(std::string{k_bucket}, "content-range-mismatch", payload);
-  auto ctx       = make_started_ioctx(transport);
-  auto ds        = open_ds(ctx, "content-range-mismatch");
-  std::array<std::uint8_t, 32> destination{};
-  transport->control->override_content_range("bytes 999-1998/4096");
+  enum class assertion_set { mismatched_start, parse_reject };
+  struct row {
+    std::string_view name;
+    std::string_view key;
+    std::string_view content_range;
+    assertion_set assertions;
+  };
+  constexpr std::array rows{
+    row{"content-range/mismatched-start",
+        "content-range-mismatch",
+        "bytes 999-1998/4096",
+        assertion_set::mismatched_start},
+    row{"content-range/unstructured",
+        "content-range-garbage",
+        "garbage",
+        assertion_set::parse_reject},
+    row{"content-range/case-mismatched-unit",
+        "content-range-case",
+        "Bytes 0-99/4096",
+        assertion_set::parse_reject},
+    row{"content-range/malformed-interval",
+        "content-range-invalid",
+        "bytes invalid",
+        assertion_set::parse_reject},
+    row{"content-range/missing-end",
+        "content-range-missing-end",
+        "bytes 0-",
+        assertion_set::parse_reject},
+    row{"content-range/garbage-end",
+        "content-range-garbage-end",
+        "bytes 0-garbage",
+        assertion_set::parse_reject},
+    row{"content-range/trailing-garbage",
+        "content-range-trailing-garbage",
+        "bytes 0-4095/4096garbage",
+        assertion_set::parse_reject},
+    row{"content-range/signed-start",
+        "content-range-signed-start",
+        "bytes +0-4095/4096",
+        assertion_set::parse_reject},
+  };
 
-  auto const error =
-    thrown_error([&] { (void)ds->host_read(0, destination.size(), destination.data()); });
-  CHECK_FALSE(error.empty());
-  CHECK(error.find("Content-Range") != std::string::npos);
-  auto snapshot = ctx->perf_snapshot();
-  CHECK(snapshot.fail_stop_total == 0);
-  CHECK(snapshot.retries_total == 0);
+  for (auto const& test : rows) {
+    DYNAMIC_SECTION(test.name)
+    {
+      if (test.assertions == assertion_set::parse_reject) {
+        require_rejected_content_range(test.key, std::string{test.content_range});
+        continue;
+      }
 
-  CHECK(ds->host_read(0, destination.size(), destination.data()) == destination.size());
-  CHECK(std::equal(destination.begin(), destination.end(), payload.begin()));
-  snapshot = ctx->perf_snapshot();
-  CHECK(snapshot.fail_stop_total == 0);
-  CHECK(snapshot.retries_total == 0);
+      auto payload   = pattern_bytes(4096);
+      auto transport = seeded_mock_transport(std::string{k_bucket}, std::string{test.key}, payload);
+      auto ctx       = make_started_ioctx(transport);
+      auto ds        = open_ds(ctx, test.key);
+      std::array<std::uint8_t, 32> destination{};
+      transport->control->override_content_range(std::string{test.content_range});
+
+      auto const error =
+        thrown_error([&] { (void)ds->host_read(0, destination.size(), destination.data()); });
+      CHECK_FALSE(error.empty());
+      CHECK(error.find("Content-Range") != std::string::npos);
+      auto snapshot = ctx->perf_snapshot();
+      CHECK(snapshot.fail_stop_total == 0);
+      CHECK(snapshot.retries_total == 0);
+
+      CHECK(ds->host_read(0, destination.size(), destination.data()) == destination.size());
+      CHECK(std::equal(destination.begin(), destination.end(), payload.begin()));
+      snapshot = ctx->perf_snapshot();
+      CHECK(snapshot.fail_stop_total == 0);
+      CHECK(snapshot.retries_total == 0);
+    }
+  }
 }
 
-TEST_CASE("s3_rdma host read rejects an unstructured Content-Range", "[s3][rdma][client-seam]")
-{
-  s3_rdma_client_seam_tests::require_rejected_content_range("content-range-garbage", "garbage");
-}
-
-TEST_CASE("s3_rdma host read rejects a case-mismatched Content-Range unit",
-          "[s3][rdma][client-seam]")
-{
-  s3_rdma_client_seam_tests::require_rejected_content_range("content-range-case",
-                                                            "Bytes 0-99/4096");
-}
-
-TEST_CASE("s3_rdma host read rejects a malformed Content-Range interval", "[s3][rdma][client-seam]")
-{
-  s3_rdma_client_seam_tests::require_rejected_content_range("content-range-invalid",
-                                                            "bytes invalid");
-}
-
-TEST_CASE("s3_rdma host read rejects a Content-Range missing its end", "[s3][rdma][client-seam]")
-{
-  s3_rdma_client_seam_tests::require_rejected_content_range("content-range-missing-end",
-                                                            "bytes 0-");
-}
-
-TEST_CASE("s3_rdma host read rejects trailing garbage in Content-Range", "[s3][rdma][client-seam]")
-{
-  s3_rdma_client_seam_tests::require_rejected_content_range("content-range-trailing-garbage",
-                                                            "bytes 0-garbage");
-}
-
-TEST_CASE("s3_rdma host read rejects a signed Content-Range start", "[s3][rdma][client-seam]")
-{
-  s3_rdma_client_seam_tests::require_rejected_content_range("content-range-signed-start",
-                                                            "bytes +0-4095/4096");
-}
-
-TEST_CASE("s3_rdma host read accepts an unknown Content-Range total", "[s3][rdma][client-seam]")
-{
-  using namespace s3_rdma_client_seam_tests;
-
-  auto payload = pattern_bytes(4096);
-  auto transport =
-    seeded_mock_transport(std::string{k_bucket}, "content-range-unknown-total", payload);
-  auto ctx = make_started_ioctx(transport);
-  auto ds  = open_ds(ctx, "content-range-unknown-total");
-  std::array<std::uint8_t, 4096> destination{};
-  transport->control->override_content_range("bytes 0-4095/*");
-
-  CHECK(ds->host_read(0, destination.size(), destination.data()) == destination.size());
-  CHECK(std::equal(destination.begin(), destination.end(), payload.begin()));
-  auto const snapshot = ctx->perf_snapshot();
-  CHECK(snapshot.fail_stop_total == 0);
-  CHECK(snapshot.retries_total == 0);
-}
-
-TEST_CASE("s3_rdma host read accepts a response without Content-Range", "[s3][rdma][client-seam]")
+TEST_CASE("s3_rdma host read accepts compatible Content-Range responses", "[s3][rdma][client-seam]")
 {
   using namespace s3_rdma_client_seam_tests;
 
-  auto payload   = pattern_bytes(256);
-  auto transport = seeded_mock_transport(std::string{k_bucket}, "content-range-absent", payload);
-  auto ctx       = make_started_ioctx(transport);
-  auto ds        = open_ds(ctx, "content-range-absent");
-  std::array<std::uint8_t, 32> destination{};
-  transport->control->override_content_range("");
+  SECTION("compat/total-star")
+  {
+    auto payload = pattern_bytes(4096);
+    auto transport =
+      seeded_mock_transport(std::string{k_bucket}, "content-range-unknown-total", payload);
+    auto ctx = make_started_ioctx(transport);
+    auto ds  = open_ds(ctx, "content-range-unknown-total");
+    std::array<std::uint8_t, 4096> destination{};
+    transport->control->override_content_range("bytes 0-4095/*");
 
-  CHECK(ds->host_read(0, destination.size(), destination.data()) == destination.size());
-  CHECK(std::equal(destination.begin(), destination.end(), payload.begin()));
-  auto const snapshot = ctx->perf_snapshot();
-  CHECK(snapshot.fail_stop_total == 0);
-  CHECK(snapshot.retries_total == 0);
+    CHECK(ds->host_read(0, destination.size(), destination.data()) == destination.size());
+    CHECK(std::equal(destination.begin(), destination.end(), payload.begin()));
+    auto const snapshot = ctx->perf_snapshot();
+    CHECK(snapshot.fail_stop_total == 0);
+    CHECK(snapshot.retries_total == 0);
+  }
+
+  SECTION("compat/header-absent")
+  {
+    auto payload   = pattern_bytes(256);
+    auto transport = seeded_mock_transport(std::string{k_bucket}, "content-range-absent", payload);
+    auto ctx       = make_started_ioctx(transport);
+    auto ds        = open_ds(ctx, "content-range-absent");
+    std::array<std::uint8_t, 32> destination{};
+    transport->control->override_content_range("");
+
+    CHECK(ds->host_read(0, destination.size(), destination.data()) == destination.size());
+    CHECK(std::equal(destination.begin(), destination.end(), payload.begin()));
+    auto const snapshot = ctx->perf_snapshot();
+    CHECK(snapshot.fail_stop_total == 0);
+    CHECK(snapshot.retries_total == 0);
+  }
 }
 
 TEST_CASE("s3_rdma HEAD 200 without Content-Length cannot create a size-zero object",
