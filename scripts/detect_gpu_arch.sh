@@ -77,12 +77,26 @@ detect_gpu_arch() {
     echo "[detect_gpu_arch] No AMD GPU detected via rocminfo, rocm_agent_enumerator," >&2
     echo "[detect_gpu_arch] or /sys/class/kfd. This may be a build-only container." >&2
     echo "" >&2
-    echo "  Common AMD GPU architectures:" >&2
-    echo "    gfx942  — MI300X / MI300A (Instinct)" >&2
-    echo "    gfx90a  — MI250X / MI250 (Instinct)" >&2
-    echo "    gfx908  — MI100 (Instinct)" >&2
-    echo "    gfx1100 — RX 7900 XT/XTX (RDNA3 consumer)" >&2
-    echo "    gfx1030 — RX 6800/6900 (RDNA2 consumer)" >&2
+    echo "  All AMD GPU architectures:" >&2
+    echo "    gfx950  — MI350 (Instinct, CDNA4)" >&2
+    echo "    gfx942  — MI300X / MI300A (Instinct, CDNA3)" >&2
+    echo "    gfx940  — MI300 (Instinct, CDNA3 pre-production)" >&2
+    echo "    gfx90a  — MI250X / MI250 (Instinct, CDNA2)" >&2
+    echo "    gfx908  — MI100 (Instinct, CDNA1)" >&2
+    echo "    gfx906  — Fiji / FirePro S9300 x2 (GCN 3rd)" >&2
+    echo "    gfx803  — Polaris 10/11 (RX 470/480/570/580, GCN 4th)" >&2
+    echo "    gfx900  — Vega 10 (Radeon Vega FE / RX Vega 64, GCN 5th)" >&2
+    echo "    gfx906  — Vega 20 (Radeon VII, GCN 5th)" >&2
+    echo "    gfx1010 — RDNA1 (RX 5000 series)" >&2
+    echo "    gfx1030 — RDNA2 (RX 6800/6900 series)" >&2
+    echo "    gfx1031 — RDNA2 (RX 6600/6700 series)" >&2
+    echo "    gfx1032 — RDNA2 (RX 6400/6500 series)" >&2
+    echo "    gfx1100 — RDNA3 (RX 7900 XT/XTX)" >&2
+    echo "    gfx1101 — RDNA3 (RX 7700/7800 series)" >&2
+    echo "    gfx1102 — RDNA3 (RX 7600 series)" >&2
+    echo "    gfx1103 — RDNA3 (RX 7400/7900M series)" >&2
+    echo "    gfx1150 — RDNA3.5 (Ryzen 800M APU integrated)" >&2
+    echo "    gfx1200 — RDNA4 (RX 9000 series)" >&2
     echo "" >&2
     read -p "[detect_gpu_arch] Enter GPU architecture (or press Enter for gfx942): " user_arch >&2
     if [ -n "$user_arch" ]; then
