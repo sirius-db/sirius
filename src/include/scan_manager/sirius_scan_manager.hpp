@@ -25,6 +25,7 @@
 #include "op/scan/gpu_ingestible_types.hpp"
 #include "scan_manager/config.hpp"
 #include "scan_manager/duckdb_mvcc_metadata.hpp"
+#include "scan_manager/insert_delta_job.hpp"
 #include "scan_manager/load_balancing_scan_batch_coalescer.hpp"
 #include "scan_manager/mvcc_mask_job.hpp"
 #include "scan_manager/pinned_chunk_stats.hpp"
@@ -225,7 +226,8 @@ std::unique_ptr<databatch_provider> make_provider_for_pinned_entry(
   std::span<std::size_t const> selected_columns,
   cached_scan_plan plan,
   const telemetry::batch_telemetry_info& telemetry_info,
-  mvcc_chunk_mask_set mvcc_masks = {});
+  mvcc_chunk_mask_set mvcc_masks               = {},
+  std::vector<insert_delta_split> delta_splits = {});
 
 /**
  * @brief Build the survivor plan for serving @p entry to a scan into @p requiested_column_ids with
@@ -507,6 +509,12 @@ class sirius_scan_manager {
   /// copies each completed set out and the vector is cleared (also cleared in
   /// reset() for the prepare-threw case).
   std::vector<mvcc_mask_job_request> _pending_mvcc_mask_jobs;
+
+  /// One insert-delta job per distinct pinned entry matched this query, with
+  /// the same dedup and lifecycle as the mask jobs above. Later operators
+  /// union their columns into the pending request. The job no-ops when the
+  /// table has no rows beyond the pinned prefix.
+  std::vector<insert_delta_job_request> _pending_insert_delta_jobs;
 
   /// Per-query sequencer for opportunistic fadvise calls.  Built fresh
   /// in @ref prepare_for_query, gets one @c pipeline_slot per non-cached

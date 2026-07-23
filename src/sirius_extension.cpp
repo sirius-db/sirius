@@ -937,13 +937,27 @@ std::unique_ptr<sirius::op::scan::duckdb_native_ingestible_table_info> build_duc
   auto schema_names   = columns.GetColumnNames();  // logical order
   auto schema_types   = columns.GetColumnTypes();  // logical order
 
-  auto keep            = resolve_pin_kept_indices(schema_names, cols);
+  auto keep = resolve_pin_kept_indices(schema_names, cols);
+  // ARRAY pins are unsupported: appended ARRAY rows live in the array-validity
+  // and child segment trees, which the uncheckpointed-append guard below does
+  // not walk, so a committed post-pin append would slip past the pin contract
+  // and only fail later, deep in metadata decoding. Refuse up front, before
+  // checkpoint suppression or any other pin side effect.
+  for (auto col : keep) {
+    if (schema_types[col].id() == LogicalTypeId::ARRAY) {
+      throw InvalidInputException(
+        "pin_table: column '%s' of table '%s' has ARRAY type, which duckdb-native pins do not "
+        "support; pin a column subset without it (cols=[...])",
+        schema_names[col],
+        table_ref);
+    }
+  }
   auto const canonical = storage.GetAttached().GetStorageManager().GetDBPath();
 
   // Update chains version values in place, invisibly to the DELETE
   // keep-masks — a pin would serve stale values to every query until the
-  // chains are folded away. Refuse loudly (the transient-rows case already
-  // fails the same way); CHECKPOINT folds the chains into the base data.
+  // chains are folded away. Refuse; CHECKPOINT folds the chains into the
+  // base data.
   {
     std::vector<duckdb::storage_t> pinned_storage_cols(keep.begin(), keep.end());
     if (sirius::op::scan::any_update_chains(
@@ -952,6 +966,15 @@ std::unique_ptr<sirius::op::scan::duckdb_native_ingestible_table_info> build_duc
         "pin_table: table '%s' has in-memory update chains on a pinned column; run CHECKPOINT "
         "before pinning",
         table_ref);
+    }
+    // Committed-but-uncheckpointed appends live in transient (in-memory)
+    // segments the pin's disk-image walk cannot stage; without this check the
+    // failure would surface as a decoder byte-size error deep in the pin.
+    // Bulk-flushed appends (>= row-group-sized inserts) are checkpoint-shaped
+    // and not detectable here.
+    if (sirius::op::scan::any_uncheckpointed_appends(storage, pinned_storage_cols)) {
+      throw InvalidInputException(
+        "pin_table: table '%s' has uncheckpointed rows; run CHECKPOINT before pinning", table_ref);
     }
   }
 

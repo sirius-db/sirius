@@ -267,6 +267,7 @@ set(EXTENSION_SOURCES
     src/op/partition/gpu_partition_impl.cpp
     src/op/result/host_table_chunk_reader.cpp
     src/op/scan/cached_ranges.cpp
+    src/op/scan/duckdb_insert_delta.cpp
     src/op/scan/duckdb_mvcc_visibility.cpp
     src/op/scan/duckdb_native_metadata.cpp
     src/op/scan/duckdb_native_decoder.cpp
@@ -345,6 +346,7 @@ set(EXTENSION_SOURCES
     src/planner/sirius_plan_top_n.cpp
     src/pin_table.cpp
     src/scan_manager/load_balancing_scan_batch_coalescer.cpp
+    src/scan_manager/insert_delta_job.cpp
     src/scan_manager/mvcc_mask_job.cpp
     src/scan_manager/pinned_chunk_stats.cpp
     src/scan_manager/round_robin_strategy.cpp
@@ -611,6 +613,7 @@ set(TEST_SOURCES
     test/cpp/integration/test_pin_table_column_order.cpp
     test/cpp/integration/test_pin_table_mvcc_delete.cpp
     test/cpp/integration/test_pin_table_mvcc_foundation.cpp
+    test/cpp/integration/test_pin_table_mvcc_insert.cpp
     test/cpp/integration/test_pin_table_zone_map_pruning.cpp
     test/cpp/integration/test_table_gpu_cache_warm_mgpu.cpp
     test/cpp/integration/test_transparent_runtime_fallback.cpp
@@ -627,6 +630,7 @@ set(TEST_SOURCES
     test/cpp/scan_manager/test_s3_routing_cutover.cpp
     test/cpp/scan_manager/test_pin_table_multi_gpu.cpp
     test/cpp/scan_manager/test_cached_serving_hardening.cpp
+    test/cpp/scan_manager/test_insert_delta_job.cpp
     test/cpp/scan_manager/test_mvcc_mask_job.cpp
     test/cpp/scan_manager/test_pinned_chunk_stats.cpp
     test/cpp/operator/test_physical_grouped_aggregate_merge_mgpu.cpp
@@ -686,9 +690,11 @@ set(TEST_SOURCES
     test/cpp/scan/bench_decode_codecs.cpp
     test/cpp/scan/test_can_serve_with_columns.cpp
     test/cpp/scan/test_duckdb_block_layout.cpp
+    test/cpp/scan/test_duckdb_insert_delta.cpp
     test/cpp/scan/test_duckdb_mvcc_visibility.cpp
     test/cpp/scan/test_duckdb_native_batch_coalescer.cpp
     test/cpp/scan/test_duckdb_native_dynamic_filter_remap.cpp
+    test/cpp/scan/test_duckdb_native_host_backed_decode.cpp
     test/cpp/scan/test_duckdb_native_walker.cpp
     test/cpp/scan/test_dynamic_filter_merge.cpp
     test/cpp/scan/test_gpu_decode_alp.cpp
