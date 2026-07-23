@@ -6,6 +6,7 @@ edition = "2024"
 [workspace]
 members = [
     "crates/starrocks-plan-translator",
+    "crates/starrocks-test-harness",
     "crates/starrocks-thrift",
 ]
 resolver = "2"
@@ -18,6 +19,7 @@ arrow-array = "59"
 arrow-schema = "59"
 backon = { version = "1", default-features = false, features = ["tokio-sleep"] }
 clap = { version = "4", features = ["derive", "env"] }
+libc = "0.2"
 mysql_async = { version = "0.37", default-features = false, features = ["minimal-rust"] }
 # Keep this stack aligned so `substrait-explain` can format the same protobuf
 # types emitted by `substrait`, and so generated messages share one `prost`
@@ -32,6 +34,7 @@ quote = "1"
 syn = { version = "3", features = ["full", "parsing"] }
 substrait = "0.63.0"
 substrait-explain = "0.7.0"
+tempfile = "3"
 thiserror = "2"
 thrift = "0.24"
 tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "time"] }
@@ -82,5 +85,6 @@ syn.workspace = true
 
 [dev-dependencies]
 # The engine integration test builds a local_files Substrait plan + a parquet fixture.
+starrocks-test-harness = { path = "crates/starrocks-test-harness" }
 substrait.workspace = true
 tempfile = "3"

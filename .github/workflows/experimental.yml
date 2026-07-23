@@ -50,22 +50,29 @@ jobs:
           cache: false
           pixi-version: v0.71.1
           manifest-path: experimental/starrocks/pixi.toml
-          environments: cn
+          # `cn` runs the Rust-only fmt/clippy; `default` (= fe + cn) provides the Java/Maven
+          # toolchain the FE↔CN integration tests build and boot a real StarRocks FE with.
+          environments: |
+            cn
+            default
 
       # Scope by package: `--all` would also reach the sibling rust/ workspace via the
       # `sirius` path dep. Mirrors check.yml's scoped rust/ fmt check.
       - name: fmt
-        run: pixi run -e cn cargo fmt --package sirius-starrocks-cn --package starrocks-plan-translator --package starrocks-thrift -- --check
+        run: pixi run -e cn cargo fmt --package sirius-starrocks-cn --package starrocks-plan-translator --package starrocks-test-harness --package starrocks-thrift -- --check
 
       # The CN's `sirius-engine` feature is on by default but links a Sirius build
       # tree (C++ toolchain + RAPIDS/CUDA) that this CI env does not have, so build
       # the pure-Rust path here. The engine path is exercised on a GPU box via
       # `pixi run cn-build` / `cn-test`.
       - name: clippy
-        run: pixi run -e cn cargo clippy --all-targets --no-default-features -- -D warnings
+        run: pixi run -e cn cargo clippy --workspace --all-targets --no-default-features -- -D warnings
 
+      # Runs unit tests plus the FE↔CN integration tests in tests/integration.rs. The harness
+      # builds the StarRocks FE on demand (via `pixi run fe-build`) on the first run, so this step
+      # is heavyweight (Maven FE build + booting the JVM). The `default` env supplies Java + Maven.
       - name: test
-        run: pixi run -e cn cargo test --workspace --no-default-features
+        run: pixi run -e default cargo test --workspace --no-default-features
 
   experimental:
     name: experimental
