@@ -14,6 +14,9 @@
  * limitations under the License.
  */
 
+// `join_condition` only forward-declares `sirius::ast::node`, so destroying a
+// `vector<join_condition>` needs the definition in this translation unit.
+#include "expression/ast/node.hpp"
 #include "expression/join_condition.hpp"
 #include "helper/type_conversions.hpp"
 #include "op/dynamic_filter/dynamic_filter_publish_plan.hpp"
