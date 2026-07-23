@@ -346,6 +346,7 @@ set(EXTENSION_SOURCES
     src/planner/sirius_plan_top_n.cpp
     src/pin_table.cpp
     src/scan_manager/load_balancing_scan_batch_coalescer.cpp
+    src/scan_manager/delta_promotion.cpp
     src/scan_manager/insert_delta_job.cpp
     src/scan_manager/mvcc_mask_job.cpp
     src/scan_manager/pinned_chunk_stats.cpp
@@ -630,6 +631,7 @@ set(TEST_SOURCES
     test/cpp/scan_manager/test_s3_routing_cutover.cpp
     test/cpp/scan_manager/test_pin_table_multi_gpu.cpp
     test/cpp/scan_manager/test_cached_serving_hardening.cpp
+    test/cpp/scan_manager/test_delta_promotion.cpp
     test/cpp/scan_manager/test_insert_delta_job.cpp
     test/cpp/scan_manager/test_mvcc_mask_job.cpp
     test/cpp/scan_manager/test_pinned_chunk_stats.cpp

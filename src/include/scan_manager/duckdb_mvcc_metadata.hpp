@@ -20,9 +20,22 @@
 
 #include <cstddef>
 #include <numeric>
+#include <string>
 #include <vector>
 
 namespace sirius::scan_manager {
+
+/// Delta-promotion accounting for a duckdb pin, surfaced by sirius_pinned_tables().
+/// Updated at QueryEnd apply (lifecycle-serialized); capture-side skip reasons
+/// route through the promotion_sink and fold in at apply.
+struct promotion_stats {
+  std::size_t promoted_chunks{0};    ///< chunks appended into the base by promotion
+  std::size_t promoted_rows{0};      ///< rows appended (n_cache grew by this much)
+  std::size_t promotion_queries{0};  ///< queries that applied >= 1 chunk
+  std::size_t dropped_slices{0};     ///< captured slices not applied (ratchet / reservation)
+  std::string last_skip_reason;      ///< most recent reason a promotion was skipped
+  std::string disabled_reason;       ///< sticky: promotion permanently off for this entry
+};
 
 /// MVCC snapshot metadata captured when a duckdb-native table is pinned, composed
 /// onto @ref pinned_entry (absent for parquet pins, whose sources are immutable).
@@ -60,6 +73,11 @@ struct duckdb_mvcc_metadata {
     return std::accumulate(
       base_row_count_per_chunk.begin(), base_row_count_per_chunk.end(), std::size_t{0});
   }
+
+  /// Delta-promotion counters, mutated only under the query-lifecycle serialization
+  /// (pin/unpin/query). Reset by construction on re-pin (attach_mvcc_metadata builds
+  /// a fresh metadata object).
+  promotion_stats promotion;
 };
 
 }  // namespace sirius::scan_manager
