@@ -16,7 +16,7 @@
 
 #pragma once
 
-#include "exec/inspectable_priority_queue.hpp"
+#include "exec/queue_priority.hpp"
 #include "parallel/task.hpp"
 #include "pipeline/pipeline_memory_history.hpp"
 #include "pipeline/sirius_pipeline.hpp"

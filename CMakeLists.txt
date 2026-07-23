@@ -579,7 +579,6 @@ set(TEST_SOURCES
     test/cpp/exec/test_bounded_thread_pool.cpp
     test/cpp/exec/test_exchange_channel.cpp
     test/cpp/exec/test_inspectable_mpsc.cpp
-    test/cpp/exec/test_inspectable_priority_queue.cpp
     test/cpp/exec/test_interruptible_mpmc.cpp
     test/cpp/exec/test_multi_index_priority_queue.cpp
     test/cpp/exec/test_semi_future.cpp

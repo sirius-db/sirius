@@ -16,7 +16,7 @@
 
 #pragma once
 
-#include "exec/inspectable_priority_queue.hpp"  // queue_priority
+#include "exec/queue_priority.hpp"
 #include "op/sirius_physical_operator_type.hpp"
 
 #include <cassert>
