@@ -9,8 +9,10 @@
 //
 // Both modes have access to CCCL's `<cuda/std/cstdint>` though:
 //   - nvcc auto-adds the CUDA Toolkit's CCCL include path.
-//   - nvrtc gets it via the conda CCCL include path passed by the JIT
-//     driver (`CODEGEN_JIT_CCCL_INCLUDE`, set from CMake).
+//   - nvrtc gets it via a CCCL include path the JIT driver resolves from the
+//     runtime CUDA environment (see cccl_include_dir() in nvrtc_compiler.cpp;
+//     override with SIMPATICO_JIT_CCCL_INCLUDE). This header itself is embedded
+//     into the binary and fed to nvrtc as an in-memory header.
 //
 // So: include this shim *instead of* `<cstdint>` in every header.  It
 // dispatches and pulls the fixed-width typedefs into the global

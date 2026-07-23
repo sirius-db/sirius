@@ -182,10 +182,27 @@ GPU, or a toolchain upgrade can never produce a false hit.
 Lookup order per shape: in-memory → on-disk → NVRTC compile (a fresh compile then populates
 both levels).
 
+### Self-contained JIT (no header tree at runtime)
+
+NVRTC compiles source *at runtime*, so it needs the headers the generated kernels `#include`.
+Rather than require a CUDA toolkit / CCCL header install on the deployment machine, every
+header NVRTC needs is **embedded into the binary** and handed to NVRTC as named in-memory
+headers (`nvrtcCreateProgram`):
+
+- the two project headers (`codegen/decode/rle_block.cuh`, `codegen/stdint_shim.hpp`), embedded
+  by `cmake/embed_jit_headers.cmake`;
+- the CCCL closure (`<cuda/std/...>`, `<cub/...>`) — the transitive `#include` set reachable from
+  the kernel preludes, scanned at build time and embedded by `cmake/embed_cccl_headers.cmake`
+  (so it tracks the CCCL version the extension is built against).
+
+As a result the runtime JIT needs **no CCCL/CUDA headers on disk** — only the driver and the
+`libnvrtc` runtime (which the Sirius vcpkg build links statically via the `nvrtc` overlay port).
+
 ### Environment variables
 
 | Variable | Effect |
 | --- | --- |
+| `SIMPATICO_JIT_CCCL_INCLUDE` | Optional escape hatch. The CCCL headers are embedded in the binary, so this is normally unset. If a future renderer change needs a header the embedded closure lacks, set this to a CCCL dir (containing `cuda/std/cstdint`) and it is passed to NVRTC as an extra `-I`. |
 | `SIMPATICO_JIT_CACHE_DIR` | On-disk cache location. Default: `${XDG_CACHE_HOME:-$HOME/.cache}/simpatico/jit`. Set to `off`, `0`, or empty to disable the on-disk cache (in-memory only). |
 | `SIMPATICO_JIT_STATS` | If set, prints `compiles / mem_hits / disk_hits / compile_ms` per process at exit. |
 | `CODEGEN_JIT_DUMP_CUBIN` | Debug: if set to a path, writes the compiled cubin there. |

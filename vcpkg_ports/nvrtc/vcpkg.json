@@ -1,0 +1,8 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
+  "description": "NVIDIA Runtime Compilation library (NVRTC), static redistributable. Lets Sirius statically link the runtime CUDA-C++ JIT compiler so the distributed extension does not depend on libnvrtc.so at load time.",
+  "license": "LicenseRef-Proprietary",
+  "name": "nvrtc",
+  "supports": "linux",
+  "version": "13.2.51"
+}

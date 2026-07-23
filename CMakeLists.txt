@@ -95,6 +95,20 @@ find_package(PkgConfig REQUIRED)
 find_package(OpenSSL REQUIRED)
 find_package(ZLIB REQUIRED)
 
+# Static NVRTC (vcpkg overlay port). Statically linking the runtime JIT compiler
+# keeps libnvrtc.so out of the distributed extension's runtime dependencies.
+# Only available in the vcpkg build; the pixi build links the conda libnvrtc.so.
+# When the nvrtc::nvrtc_static target exists, simpatico links it instead of the
+# bare 'nvrtc' library name (see
+# src/compression/simpatico_codegen/CMakeLists.txt). Toggle off to link the
+# shared libnvrtc.so instead (smaller binary, adds a runtime dependency).
+option(SIRIUS_STATIC_NVRTC
+       "Statically link NVRTC so the extension has no libnvrtc.so runtime dep"
+       ON)
+if(VCPKG_BUILD AND SIRIUS_STATIC_NVRTC)
+  find_package(nvrtc CONFIG REQUIRED)
+endif()
+
 # --- cuCollections (cuco) --- #
 
 # libcudf no longer ships its bundled copy. In the vcpkg build cuco comes from

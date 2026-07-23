@@ -42,8 +42,49 @@ add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
 add_link_options(-Wl,--enable-new-dtags)
 link_directories("${CONDA_PREFIX}/lib")
 
+# Embed the project headers the runtime NVRTC JIT #includes as raw-string
+# literals, so a binary distribution needs no simpatico source tree on disk.
+# Regenerated whenever either header or the generator script changes.
+set(EMBED_JIT_HEADERS_OUT
+    "${CMAKE_CURRENT_BINARY_DIR}/generated/codegen/jit/embedded_headers.h")
+add_custom_command(
+  OUTPUT "${EMBED_JIT_HEADERS_OUT}"
+  COMMAND
+    ${CMAKE_COMMAND}
+    "-DIN_STDINT=${CMAKE_CURRENT_SOURCE_DIR}/include/codegen/stdint_shim.hpp"
+    "-DIN_RLE=${CMAKE_CURRENT_SOURCE_DIR}/include/codegen/decode/rle_block.cuh"
+    "-DOUT=${EMBED_JIT_HEADERS_OUT}" -P
+    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_jit_headers.cmake"
+  DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/include/codegen/stdint_shim.hpp"
+          "${CMAKE_CURRENT_SOURCE_DIR}/include/codegen/decode/rle_block.cuh"
+          "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_jit_headers.cmake"
+  COMMENT "Embedding JIT project headers into ${EMBED_JIT_HEADERS_OUT}"
+  VERBATIM)
+add_custom_target(simpatico_embedded_headers DEPENDS "${EMBED_JIT_HEADERS_OUT}")
+
+# Embed the CCCL (<cuda/std/...>, <cub/...>) header closure the runtime NVRTC
+# JIT compiles against. Scanned transitively at build time from the kernel
+# prelude roots (so it tracks the CCCL version), and fed to NVRTC as in-memory
+# headers -- the JIT then needs no CCCL tree on disk, only the driver + the
+# nvrtc runtime the extension already links.
+set(EMBED_CCCL_HEADERS_OUT
+    "${CMAKE_CURRENT_BINARY_DIR}/generated/codegen/jit/cccl_embedded_headers.cpp"
+)
+add_custom_command(
+  OUTPUT "${EMBED_CCCL_HEADERS_OUT}"
+  COMMAND
+    ${CMAKE_COMMAND} "-DCCCL_DIR=${CUDA_CCCL_INCLUDE}"
+    "-DOUT=${EMBED_CCCL_HEADERS_OUT}" -P
+    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_cccl_headers.cmake"
+  DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_cccl_headers.cmake"
+  COMMENT
+    "Scanning + embedding CCCL JIT header closure into ${EMBED_CCCL_HEADERS_OUT}"
+  VERBATIM)
+
 add_library(
   simpatico STATIC
+  # Generated: CCCL header closure embedded for the runtime JIT.
+  "${EMBED_CCCL_HEADERS_OUT}"
   # CUDA kernels: operators + offsets
   src/bridge/offsets_cumsum.cu
   src/operators/alp_compressor.cu
@@ -81,22 +122,29 @@ add_library(
   src/explore/compression_explorer.cpp)
 set_target_properties(simpatico PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_compile_features(simpatico PUBLIC cxx_std_20)
+# nvrtc_compiler.cpp #includes the generated embedded_headers.h from here.
+add_dependencies(simpatico simpatico_embedded_headers)
 target_include_directories(
   simpatico
   PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/include
-          "${CUDA_TOOLKIT_INCLUDE}" "${CUDA_CCCL_INCLUDE}")
-target_compile_definitions(
-  simpatico
-  PRIVATE "CODEGEN_JIT_CUDA_INCLUDE=\"${CUDA_TOOLKIT_INCLUDE}\""
-          "CODEGEN_JIT_CCCL_INCLUDE=\"${CUDA_CCCL_INCLUDE}\""
-          "CODEGEN_JIT_PROJECT_INCLUDE=\"${CMAKE_CURRENT_SOURCE_DIR}/include\"")
+          "${CMAKE_CURRENT_BINARY_DIR}/generated" "${CUDA_TOOLKIT_INCLUDE}"
+          "${CUDA_CCCL_INCLUDE}")
+# In the Sirius vcpkg build the overlay nvrtc port provides a static NVRTC
+# (nvrtc::nvrtc_static) so the extension carries no libnvrtc.so runtime dep.
+# Standalone / pixi builds fall back to the conda shared 'nvrtc'.
+if(TARGET nvrtc::nvrtc_static)
+  set(SIMPATICO_NVRTC_LIB nvrtc::nvrtc_static)
+else()
+  set(SIMPATICO_NVRTC_LIB nvrtc)
+endif()
+
 target_link_libraries(
   simpatico
   PUBLIC cudf
          rmm
          cudart
          nvcomp
-         nvrtc
+         ${SIMPATICO_NVRTC_LIB}
          cuda
          dl)
 
@@ -110,7 +158,7 @@ function(add_codegen_host_test name)
             rmm
             cudart
             nvcomp
-            nvrtc
+            ${SIMPATICO_NVRTC_LIB}
             cuda
             dl)
   target_link_options(${name} PRIVATE "-Wl,-rpath,${CONDA_PREFIX}/lib")
@@ -139,7 +187,7 @@ target_link_libraries(
           rmm
           cudart
           nvcomp
-          nvrtc
+          ${SIMPATICO_NVRTC_LIB}
           cuda
           dl)
 target_link_options(simpatico_cli PRIVATE "-Wl,-rpath,${CONDA_PREFIX}/lib")

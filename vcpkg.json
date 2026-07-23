@@ -12,6 +12,7 @@
   "dependencies": [
     "cudf",
     "cuco",
+    "nvrtc",
     "yaml-cpp",
     "abseil",
     "numactl",

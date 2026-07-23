@@ -12,19 +12,32 @@
 #include <utility>
 #include <vector>
 
-// NVRTC -I paths: set by CMake via target_compile_definitions on the simpatico
-// target (conda CUDA toolkit / CCCL include + project include).
-#ifndef CODEGEN_JIT_CUDA_INCLUDE
-#error "CODEGEN_JIT_CUDA_INCLUDE must be set by CMake (conda CUDA toolkit include)"
-#endif
-#ifndef CODEGEN_JIT_CCCL_INCLUDE
-#error "CODEGEN_JIT_CCCL_INCLUDE must be set by CMake (conda CCCL include)"
-#endif
-#ifndef CODEGEN_JIT_PROJECT_INCLUDE
-#error "CODEGEN_JIT_PROJECT_INCLUDE must be set by CMake (project include)"
-#endif
+// The headers the rendered kernels #include are baked into the binary as named
+// in-memory headers and fed to NVRTC at compile time, so the JIT needs no
+// header tree on disk:
+//   - project headers (codegen/decode/rle_block.cuh, codegen/stdint_shim.hpp),
+//     embedded by cmake/embed_jit_headers.cmake
+//   - the CCCL closure (<cuda/std/...>, <cub/...>), embedded by
+//     cmake/embed_cccl_headers.cmake
+// This lets a binary distribution JIT-compile with only the driver and the
+// nvrtc runtime the extension already links -- no CUDA toolkit headers on disk.
+#include "codegen/jit/cccl_embedded_headers.h"
+#include "codegen/jit/embedded_headers.h"
 
 namespace codegen::jit {
+
+namespace {
+
+// Optional escape hatch: if the embedded CCCL closure ever lacks a header a
+// future renderer needs, SIMPATICO_JIT_CCCL_INCLUDE may point NVRTC at a real
+// CCCL dir as an extra -I. Unset by default; not required for correctness.
+const char* cccl_include_override()
+{
+  const char* e = std::getenv("SIMPATICO_JIT_CCCL_INCLUDE");
+  return (e != nullptr && *e != '\0') ? e : nullptr;
+}
+
+}  // namespace
 
 int arch_cc_for_current_device()
 {
@@ -147,28 +160,49 @@ CompiledKernel compile_plain_kernel(const std::string& source,
     throw std::runtime_error("compile_plain_kernel: empty entry_symbol");
   }
 
+  // All headers the rendered kernels #include are supplied to NVRTC as named
+  // in-memory headers (embedded in the binary): the project headers plus the
+  // full CCCL closure (<cuda/std/...>, <cub/...>). So no header tree is needed
+  // on disk at runtime. The include NAMES must match the `#include` strings
+  // seen by NVRTC (the renderers' `"codegen/..."` and CCCL's `<...>`).
+  std::vector<const char*> hdr_sources;
+  std::vector<const char*> hdr_names;
+  hdr_sources.reserve(static_cast<std::size_t>(kEmbeddedJitHeaderCount + kCcclEmbeddedHeaderCount));
+  hdr_names.reserve(static_cast<std::size_t>(kEmbeddedJitHeaderCount + kCcclEmbeddedHeaderCount));
+  for (int i = 0; i < kEmbeddedJitHeaderCount; ++i) {
+    hdr_sources.push_back(kEmbeddedJitHeaders[i].source);
+    hdr_names.push_back(kEmbeddedJitHeaders[i].name);
+  }
+  for (int i = 0; i < kCcclEmbeddedHeaderCount; ++i) {
+    hdr_sources.push_back(kCcclEmbeddedHeaders[i].source);
+    hdr_names.push_back(kCcclEmbeddedHeaders[i].name);
+  }
+
   nvrtcProgram prog = nullptr;
-  NVRTC_OR_THROW(nvrtcCreateProgram(&prog, source.c_str(), "codegen_jit.cu", 0, nullptr, nullptr));
+  NVRTC_OR_THROW(nvrtcCreateProgram(&prog,
+                                    source.c_str(),
+                                    "codegen_jit.cu",
+                                    static_cast<int>(hdr_names.size()),
+                                    hdr_sources.data(),
+                                    hdr_names.data()));
 
-  // Plain CUDA by default — no -default-device, no _CODEGEN_CODEGEN_JIT.
-  // The rendered kernels include a small set of CUDA headers directly
-  // (cstdint, climits, cuda_runtime.h) — we still pass the same -I set so
-  // they can pull in cuda/std/* if a future helper wants to.
+  // Plain CUDA by default — no -default-device. Some rendered sources include
+  // shared headers that use c++20 and unannotated constexpr accessors; those
+  // opt into -default-device + c++20 via opts.default_device. The leaner path
+  // keeps the c++17/no-default-device setup.
   const std::string arch_opt = "-arch=sm_" + std::to_string(opts.arch_cc);
-  const std::string cuda_inc = std::string("-I") + CODEGEN_JIT_CUDA_INCLUDE;
-  const std::string cccl_inc = std::string("-I") + CODEGEN_JIT_CCCL_INCLUDE;
-  const std::string proj_inc = std::string("-I") + CODEGEN_JIT_PROJECT_INCLUDE;
 
-  // Some rendered sources include shared headers that use c++20 and unannotated
-  // constexpr accessors; those opt into -default-device + c++20 via
-  // opts.default_device. The leaner path keeps the c++17/no-default-device setup.
   std::vector<const char*> nvrtc_opts = {
     opts.default_device ? "-std=c++20" : "-std=c++17",
     arch_opt.c_str(),
-    cuda_inc.c_str(),
-    cccl_inc.c_str(),
-    proj_inc.c_str(),
   };
+  // No -I is required (headers are embedded); the env override, when set, adds
+  // one as a fallback for a hypothetical embedded-closure gap.
+  std::string cccl_inc;
+  if (const char* ov = cccl_include_override()) {
+    cccl_inc = std::string("-I") + ov;
+    nvrtc_opts.push_back(cccl_inc.c_str());
+  }
   if (opts.default_device) { nvrtc_opts.push_back("-default-device"); }
 
   nvrtcResult compile_result =
