@@ -23,6 +23,7 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace sirius::io::rdma {
 
@@ -80,7 +81,11 @@ struct data_get_result {
 /// session operations (connection/handle state is session ownership).
 class rdma_data_session {
  public:
-  virtual ~rdma_data_session()                           = default;
+  virtual ~rdma_data_session() = default;
+  /// CONTRACT: a throw means the registration did NOT take effect.  An
+  /// implementation that registered with its SDK and then fails locally
+  /// must deregister before throwing — the caller frees unregistered
+  /// memory on this path and must never free NIC-registered memory.
   virtual void register_memory(void* base, size_t bytes) = 0;
   virtual void deregister_memory(void* base) noexcept    = 0;
   /// One token GET into a REGISTERED device destination.  Never throws for
@@ -113,6 +118,10 @@ struct rdma_transport_clients {
   std::shared_ptr<s3_control_client> control;
   std::shared_ptr<rdma_data_session_factory> data_sessions;
   reply_tag_predicate tag_predicate = &non_empty_reply_tag;
+  /// Accepted HTTP statuses for an exact data completion.  Like the reply-tag
+  /// predicate, the concrete set is frozen from gateway observation at
+  /// preflight; until then the default mirrors the benchmark prior.
+  std::vector<long> accepted_statuses{200, 206};
 };
 
 /// Scrub any `x-amz-rdma-token`-labeled value from diagnostic text.  Applied

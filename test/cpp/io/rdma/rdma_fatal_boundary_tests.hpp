@@ -342,6 +342,8 @@ class reactor_fixture {
 
   void shutdown() { reactor.shutdown(); }
 
+  [[nodiscard]] auto perf_snapshot() const noexcept { return reactor.perf_snapshot(); }
+
   std::shared_ptr<recording_session_factory> client;
 
  private:
@@ -388,6 +390,9 @@ enum class death_scenario {
   sticky_create,
   sticky_flush,
   sticky_capture,
+  sticky_malloc,
+  sticky_set_device,
+  sticky_free_device,
   hook_return,
   hook_throw,
   full_stderr_default_hook
@@ -460,6 +465,21 @@ cuda_delivery_ops death_ops(death_scenario scenario,
       ops.stream_capture_query = [code](auto&&...) { return code; };
       break;
     }
+    case death_scenario::sticky_malloc: {
+      auto const code   = sticky_code.value_or(cudaErrorIllegalAddress);
+      ops.malloc_device = [code](void**, std::size_t) { return code; };
+      break;
+    }
+    case death_scenario::sticky_set_device: {
+      auto const code = sticky_code.value_or(cudaErrorIllegalAddress);
+      ops.set_device  = [code](int) { return code; };
+      break;
+    }
+    case death_scenario::sticky_free_device: {
+      auto const code = sticky_code.value_or(cudaErrorIllegalAddress);
+      ops.free_device = [code](void*) { return code; };
+      break;
+    }
     case death_scenario::full_stderr_default_hook:
       ops.event_record = [](auto&&...) { return cudaErrorInvalidValue; };
       break;
@@ -509,23 +529,36 @@ void run_death_child(death_scenario scenario, std::optional<cudaError_t> sticky_
     });
   }
 
-  auto ops               = death_ops(scenario, sticky_code);
-  bool const needs_flush = scenario == death_scenario::sticky_flush;
-  reactor_fixture fixture(std::move(ops), needs_flush, true);
-  rmm::cuda_stream stream;
-  rmm::device_buffer device(k_slot_size, stream);
-  if (scenario == death_scenario::full_stderr_default_hook) {
-    emit_marker_to(STDOUT_FILENO, k_fatal_trigger_mark);
-  }
-  auto future = fixture.issue(device.data(), stream);
+  {
+    auto ops               = death_ops(scenario, sticky_code);
+    bool const needs_flush = scenario == death_scenario::sticky_flush;
+    reactor_fixture fixture(std::move(ops), needs_flush, true);
+    rmm::cuda_stream stream;
+    rmm::device_buffer device(k_slot_size, stream);
+    if (scenario == death_scenario::full_stderr_default_hook) {
+      emit_marker_to(STDOUT_FILENO, k_fatal_trigger_mark);
+    }
+    auto future = fixture.issue(device.data(), stream);
 
-  try {
-    (void)std::move(future).get(5s);
-  } catch (...) {
+    if (scenario == death_scenario::sticky_free_device) {
+      try {
+        if (std::move(future).get(5s) == k_slot_size) { emit_marker(k_future_mark); }
+      } catch (...) {
+      }
+      fixture.shutdown();
+    } else {
+      try {
+        (void)std::move(future).get(5s);
+      } catch (...) {
+      }
+      emit_marker(k_future_mark);
+      emit_marker(k_teardown_mark);
+      fixture.shutdown();
+      if (stalled_reader != -1) { (void)::close(stalled_reader); }
+      return;
+    }
   }
-  emit_marker(k_future_mark);
   emit_marker(k_teardown_mark);
-  fixture.shutdown();
   if (stalled_reader != -1) { (void)::close(stalled_reader); }
 }
 
@@ -665,6 +698,20 @@ void require_process_fatal(std::string const& child_name,
   CHECK((result.signal == SIGABRT || (result.exited && result.exit_code != 0)));
 }
 
+void require_teardown_process_fatal(std::string const& child_name)
+{
+  if (!cuda_device_available()) { return; }
+
+  auto const result = spawn_child(child_name);
+  INFO("teardown death-child output:\n" << result.output);
+  REQUIRE_FALSE(result.timed_out);
+  CHECK(result.output.find(k_hook_mark) != std::string::npos);
+  CHECK(result.output.find(k_future_mark) != std::string::npos);
+  CHECK(result.output.find(k_arena_mark) != std::string::npos);
+  CHECK(result.output.find(k_teardown_mark) == std::string::npos);
+  CHECK((result.signal == SIGABRT || (result.exited && result.exit_code != 0)));
+}
+
 void require_default_hook_exits_with_full_stderr(std::string const& child_name)
 {
   if (!cuda_device_available()) { return; }
@@ -782,6 +829,34 @@ TEST_CASE("s3_rdma non-sticky flush failure recovers and continues", "[s3][rdma]
   CHECK(fixture.client->get_destination(1) == released_slot);
 }
 
+TEST_CASE("s3_rdma non-sticky device selection failure recovers before the GET",
+          "[s3][rdma][fatal]")
+{
+  using namespace s3_rdma_f01b_tests;
+  if (!cuda_device_available()) { return; }
+
+  auto calls = std::make_shared<std::atomic<int>>(0);
+  cuda_delivery_ops ops;
+  ops.set_device = [calls](int device) {
+    if (calls->fetch_add(1, std::memory_order_relaxed) == 0) { return cudaErrorInvalidDevice; }
+    return cudaSetDevice(device);
+  };
+  reactor_fixture fixture(std::move(ops));
+  rmm::cuda_stream stream;
+  rmm::device_buffer first(k_slot_size, stream);
+  rmm::device_buffer follow_up(k_slot_size, stream);
+
+  auto const error = resolved_error(fixture.issue(first.data(), stream));
+  REQUIRE_FALSE(error.empty());
+  CHECK(error.find("device selection failed") != std::string::npos);
+  CHECK(fixture.client->get_count() == 0);
+  CHECK(fixture.perf_snapshot().fail_stop_total == 0);
+
+  require_success(fixture.issue(follow_up.data(), stream));
+  CHECK(fixture.client->get_count() == 1);
+  CHECK(fixture.perf_snapshot().fail_stop_total == 0);
+}
+
 TEST_CASE("s3_rdma event create throw recovers and continues", "[s3][rdma][fatal]")
 {
   using namespace s3_rdma_f01b_tests;
@@ -869,6 +944,45 @@ TEST_CASE("s3_rdma death child sticky capture query", "[.][rdma-death-child]")
   using namespace s3_rdma_f01b_tests;
   if (child_enabled("s3_rdma death child sticky capture query")) {
     run_death_child(death_scenario::sticky_capture, selected_sticky_code());
+  }
+}
+
+TEST_CASE("s3_rdma sticky arena allocation code is process-fatal", "[s3][rdma][fatal]")
+{
+  s3_rdma_f01b_tests::require_process_fatal("s3_rdma death child sticky arena allocation");
+}
+
+TEST_CASE("s3_rdma death child sticky arena allocation", "[.][rdma-death-child]")
+{
+  using namespace s3_rdma_f01b_tests;
+  if (child_enabled("s3_rdma death child sticky arena allocation")) {
+    run_death_child(death_scenario::sticky_malloc, selected_sticky_code());
+  }
+}
+
+TEST_CASE("s3_rdma sticky device selection code is process-fatal", "[s3][rdma][fatal]")
+{
+  s3_rdma_f01b_tests::require_process_fatal("s3_rdma death child sticky device selection");
+}
+
+TEST_CASE("s3_rdma death child sticky device selection", "[.][rdma-death-child]")
+{
+  using namespace s3_rdma_f01b_tests;
+  if (child_enabled("s3_rdma death child sticky device selection")) {
+    run_death_child(death_scenario::sticky_set_device, selected_sticky_code());
+  }
+}
+
+TEST_CASE("s3_rdma sticky arena free code is process-fatal during teardown", "[s3][rdma][fatal]")
+{
+  s3_rdma_f01b_tests::require_teardown_process_fatal("s3_rdma death child sticky arena free");
+}
+
+TEST_CASE("s3_rdma death child sticky arena free", "[.][rdma-death-child]")
+{
+  using namespace s3_rdma_f01b_tests;
+  if (child_enabled("s3_rdma death child sticky arena free")) {
+    run_death_child(death_scenario::sticky_free_device, selected_sticky_code());
   }
 }
 

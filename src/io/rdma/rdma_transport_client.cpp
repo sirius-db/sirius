@@ -26,14 +26,6 @@ namespace {
 
 constexpr std::string_view k_token_label = "x-amz-rdma-token";
 
-bool is_token_value_char(char c) noexcept
-{
-  // Base64/URL-safe token alphabet; a value ends at whitespace, separators,
-  // or quotes so surrounding diagnostic text survives.
-  return (std::isalnum(static_cast<unsigned char>(c)) != 0) || c == '+' || c == '/' || c == '=' ||
-         c == '-' || c == '_';
-}
-
 bool label_matches(std::string_view text, size_t at) noexcept
 {
   if (at + k_token_label.size() > text.size()) { return false; }
@@ -61,13 +53,18 @@ std::string redact_rdma_tokens(std::string_view text)
     // Keep the label itself (diagnostics stay attributable), drop the value.
     out.append(k_token_label);
     i += k_token_label.size();
-    // Copy the separator run (": ", "=", quotes, whitespace) verbatim.
-    while (i < text.size() && !is_token_value_char(text[i])) {
+    // Copy the immediate separator run (": ", "=", quotes, whitespace)
+    // verbatim, then drop EVERYTHING up to the header-value boundary (CR/LF
+    // or end of text).  Token formats are opaque, so no value-alphabet
+    // guessing: over-redacting same-line text is the accepted trade against
+    // leaking any token fragment.
+    while (i < text.size() && (text[i] == ':' || text[i] == '=' || text[i] == ' ' ||
+                               text[i] == '\t' || text[i] == '"' || text[i] == '\'')) {
       out.push_back(text[i]);
       ++i;
     }
     const size_t value_begin = i;
-    while (i < text.size() && is_token_value_char(text[i])) {
+    while (i < text.size() && text[i] != '\r' && text[i] != '\n') {
       ++i;
     }
     if (i > value_begin) { out.append("[REDACTED]"); }

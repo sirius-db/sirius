@@ -976,11 +976,12 @@ TEST_CASE("s3_rdma AC13 queue cap is sanitized after max inflight", "[s3][rdma][
     CHECK_THROWS_AS((void)admission_gate{*sanitized.queue_cap}, std::overflow_error);
   }
 
-  SECTION("a derived cap cannot wrap ring storage bytes")
+  SECTION("the arena guard precedes the ring guard for a derived cap")
   {
     cuobj_rdma_reactor::config cfg;
-    cfg.max_inflight     = std::numeric_limits<std::size_t>::max() / 4;
-    auto const sanitized = sirius::io::rdma::sanitized(cfg);
-    CHECK_THROWS_AS((void)admission_gate{*sanitized.queue_cap}, std::overflow_error);
+    cfg.max_inflight = std::numeric_limits<std::size_t>::max() / 4;
+    // A derived cap large enough to wrap ring storage first overflows the arena
+    // byte count. The explicit-cap section above still covers the ring guard.
+    CHECK_THROWS_AS(sirius::io::rdma::sanitized(cfg), std::overflow_error);
   }
 }

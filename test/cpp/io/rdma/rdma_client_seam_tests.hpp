@@ -34,6 +34,12 @@
 
 #include <cuda_runtime.h>
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <poll.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
 #ifdef SIRIUS_HAVE_TESTCONTAINERS
 #include "utils/s3_container.hpp"
 
@@ -44,15 +50,18 @@
 #include <array>
 #include <atomic>
 #include <cctype>
+#include <cerrno>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <future>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <set>
@@ -61,6 +70,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -68,6 +78,8 @@
 namespace s3_rdma_client_seam_tests {
 
 using sirius::io::object_store_config;
+using sirius::io::rdma::cuda_delivery_ops;
+using sirius::io::rdma::cuobj_rdma_reactor;
 using sirius::io::rdma::curl_s3_control_client;
 using sirius::io::rdma::data_commit_state;
 using sirius::io::rdma::data_get_result;
@@ -251,6 +263,189 @@ void require_no_long_fragment(std::string_view text, std::string_view secret)
   for (std::size_t begin = 0; begin + 9 <= secret.size(); ++begin) {
     CHECK(text.find(secret.substr(begin, 9)) == std::string_view::npos);
   }
+}
+
+class head_without_length_server {
+ public:
+  head_without_length_server()
+  {
+    _listen_fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (_listen_fd < 0) { throw_errno("socket"); }
+
+    try {
+      int one = 1;
+      if (::setsockopt(_listen_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)) != 0) {
+        throw_errno("setsockopt");
+      }
+
+      sockaddr_in address{};
+      address.sin_family      = AF_INET;
+      address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+      address.sin_port        = 0;
+      if (::bind(_listen_fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0) {
+        throw_errno("bind");
+      }
+      if (::listen(_listen_fd, 1) != 0) { throw_errno("listen"); }
+
+      socklen_t length = sizeof(address);
+      if (::getsockname(_listen_fd, reinterpret_cast<sockaddr*>(&address), &length) != 0) {
+        throw_errno("getsockname");
+      }
+      _port            = ntohs(address.sin_port);
+      int const socket = _listen_fd;
+      _thread          = std::thread([this, socket] { serve_one(socket); });
+    } catch (...) {
+      close_listener();
+      throw;
+    }
+  }
+
+  ~head_without_length_server()
+  {
+    _stopping.store(true, std::memory_order_relaxed);
+    close_listener();
+    if (_thread.joinable()) { _thread.join(); }
+  }
+
+  head_without_length_server(head_without_length_server const&)            = delete;
+  head_without_length_server& operator=(head_without_length_server const&) = delete;
+
+  [[nodiscard]] std::string endpoint() const { return "http://127.0.0.1:" + std::to_string(_port); }
+
+  void wait()
+  {
+    if (_thread.joinable()) { _thread.join(); }
+    close_listener();
+    if (_error) { std::rethrow_exception(_error); }
+  }
+
+ private:
+  [[noreturn]] static void throw_errno(char const* operation)
+  {
+    throw std::system_error(errno, std::generic_category(), operation);
+  }
+
+  void close_listener() noexcept
+  {
+    int const socket = std::exchange(_listen_fd, -1);
+    if (socket >= 0) {
+      (void)::shutdown(socket, SHUT_RDWR);
+      (void)::close(socket);
+    }
+  }
+
+  static void send_all(int socket, std::string_view response)
+  {
+    std::size_t sent = 0;
+    while (sent < response.size()) {
+      auto const bytes =
+        ::send(socket, response.data() + sent, response.size() - sent, MSG_NOSIGNAL);
+      if (bytes > 0) {
+        sent += static_cast<std::size_t>(bytes);
+      } else if (bytes < 0 && errno == EINTR) {
+        continue;
+      } else {
+        throw_errno("send");
+      }
+    }
+  }
+
+  void serve_one(int listen_socket) noexcept
+  {
+    int client = -1;
+    try {
+      pollfd ready{listen_socket, POLLIN, 0};
+      int polled = 0;
+      do {
+        polled = ::poll(&ready, 1, 5000);
+      } while (polled < 0 && errno == EINTR);
+      if (polled == 0) {
+        throw std::runtime_error("HEAD test server timed out waiting for a client");
+      }
+      if (polled < 0) { throw_errno("poll"); }
+
+      client = ::accept(listen_socket, nullptr, nullptr);
+      if (client < 0) { throw_errno("accept"); }
+
+      timeval timeout{};
+      timeout.tv_sec = 5;
+      if (::setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) != 0) {
+        throw_errno("setsockopt receive timeout");
+      }
+
+      std::string request;
+      std::array<char, 4096> buffer{};
+      while (request.find("\r\n\r\n") == std::string::npos) {
+        auto const bytes = ::recv(client, buffer.data(), buffer.size(), 0);
+        if (bytes > 0) {
+          request.append(buffer.data(), static_cast<std::size_t>(bytes));
+        } else if (bytes < 0 && errno == EINTR) {
+          continue;
+        } else if (bytes == 0) {
+          throw std::runtime_error("HEAD test client closed before sending all headers");
+        } else {
+          throw_errno("recv");
+        }
+        if (request.size() > 64UL << 10) {
+          throw std::runtime_error("HEAD test request exceeded 64 KiB");
+        }
+      }
+      if (!request.starts_with("HEAD ")) {
+        throw std::runtime_error("HEAD test server received a non-HEAD request");
+      }
+
+      send_all(client, "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n");
+    } catch (...) {
+      if (!_stopping.load(std::memory_order_relaxed)) { _error = std::current_exception(); }
+    }
+    if (client >= 0) {
+      (void)::shutdown(client, SHUT_RDWR);
+      (void)::close(client);
+    }
+  }
+
+  int _listen_fd{-1};
+  std::uint16_t _port{0};
+  std::thread _thread;
+  std::atomic<bool> _stopping{false};
+  std::exception_ptr _error;
+};
+
+std::shared_ptr<sirius::io::s3::sirius_sigv4_header_authorizer> make_loopback_authorizer(
+  std::string endpoint)
+{
+  sirius::io::s3::static_credentials credentials;
+  credentials.access_key_id     = "test-access-key";
+  credentials.secret_access_key = "test-secret-key";
+  return std::make_shared<sirius::io::s3::sirius_sigv4_header_authorizer>(
+    std::move(credentials), "us-east-1", std::move(endpoint));
+}
+
+void require_rejected_content_range(std::string_view key, std::string content_range)
+{
+  auto payload   = pattern_bytes(4096);
+  auto transport = seeded_mock_transport(std::string{k_bucket}, std::string{key}, payload);
+  auto ctx       = make_started_ioctx(transport);
+  auto ds        = open_ds(ctx, key);
+  std::array<std::uint8_t, 32> destination{};
+  auto const calls_before = transport->control->range_gets_issued();
+  transport->control->override_content_range(std::move(content_range));
+
+  auto const error =
+    thrown_error([&] { (void)ds->host_read(0, destination.size(), destination.data()); });
+  REQUIRE_FALSE(error.empty());
+  CHECK(error.find("Content-Range") != std::string::npos);
+  CHECK(transport->control->range_gets_issued() == calls_before + 1);
+  auto snapshot = ctx->perf_snapshot();
+  CHECK(snapshot.fail_stop_total == 0);
+  CHECK(snapshot.retries_total == 0);
+
+  CHECK(ds->host_read(0, destination.size(), destination.data()) == destination.size());
+  CHECK(std::equal(destination.begin(), destination.end(), payload.begin()));
+  CHECK(transport->control->range_gets_issued() == calls_before + 2);
+  snapshot = ctx->perf_snapshot();
+  CHECK(snapshot.fail_stop_total == 0);
+  CHECK(snapshot.retries_total == 0);
 }
 
 #ifdef SIRIUS_HAVE_TESTCONTAINERS
@@ -963,4 +1158,376 @@ TEST_CASE("s3_rdma AC13 start acquires exactly one data session per worker",
   std::set<std::thread::id> unique_threads(threads.begin(), threads.end());
   CHECK(unique_threads.size() == workers);
   ctx->shutdown();
+}
+
+TEST_CASE("s3_rdma thrown data GET conservatively fail-stops both planes",
+          "[s3][rdma][client-seam][gpu]")
+{
+  using namespace s3_rdma_client_seam_tests;
+  if (!cuda_device_available()) { return; }
+
+  auto payload   = pattern_bytes(k_slot_size);
+  auto transport = seeded_mock_transport(std::string{k_bucket}, "throwing-get", payload);
+  transport->data->throw_gets("injected throwing GET");
+  auto ctx = make_started_ioctx(transport);
+  auto ds  = open_ds(ctx, "throwing-get");
+  rmm::cuda_stream stream;
+  rmm::device_buffer first(payload.size(), stream);
+  rmm::device_buffer second(payload.size(), stream);
+
+  auto failed               = issue_device_read(*ds, first, stream);
+  auto const terminal_error = ready_error(failed);
+  REQUIRE_FALSE(terminal_error.empty());
+  auto snapshot = ctx->perf_snapshot();
+  CHECK(snapshot.fail_stop_total == 1);
+  CHECK(snapshot.arena_leak_total >= 1);
+  CHECK(snapshot.retries_total == 0);
+
+  auto const control_calls = transport->control->range_gets_issued();
+  std::array<std::uint8_t, 16> host_destination{};
+  auto const host_error =
+    thrown_error([&] { (void)ds->host_read(0, host_destination.size(), host_destination.data()); });
+  CHECK(host_error == terminal_error);
+  CHECK(transport->control->range_gets_issued() == control_calls);
+
+  auto const data_calls = transport->data->gets_issued();
+  auto rejected         = issue_device_read(*ds, second, stream);
+  CHECK(ready_error(rejected) == terminal_error);
+  CHECK(transport->data->gets_issued() == data_calls);
+  CHECK(ctx->perf_snapshot().retries_total == 0);
+}
+
+TEST_CASE("s3_rdma thrown data GET redacts its token before fail-stop publication",
+          "[s3][rdma][client-seam][gpu][security]")
+{
+  using namespace s3_rdma_client_seam_tests;
+  if (!cuda_device_available()) { return; }
+
+  constexpr std::string_view sentinel = "aaa.bbb.ccc-sentinel";
+  constexpr std::string_view label    = "x-amz-rdma-token";
+  auto payload                        = pattern_bytes(k_slot_size);
+  auto transport = seeded_mock_transport(std::string{k_bucket}, "throwing-get-token", payload);
+  transport->data->throw_gets("boom x-amz-rdma-token: " + std::string{sentinel});
+  sirius::test::scoped_recording_log_sink logs{"trace"};
+  auto ctx = make_started_ioctx(transport);
+  auto ds  = open_ds(ctx, "throwing-get-token");
+  rmm::cuda_stream stream;
+  rmm::device_buffer first(payload.size(), stream);
+  rmm::device_buffer second(payload.size(), stream);
+
+  auto failed               = issue_device_read(*ds, first, stream);
+  auto const terminal_error = ready_error(failed);
+  CHECK(terminal_error.find(label) != std::string::npos);
+  require_no_long_fragment(terminal_error, sentinel);
+  auto const snapshot = ctx->perf_snapshot();
+  CHECK(snapshot.fail_stop_total == 1);
+  CHECK(snapshot.retries_total == 0);
+
+  auto const control_calls = transport->control->range_gets_issued();
+  std::array<std::uint8_t, 16> host_destination{};
+  auto const host_error =
+    thrown_error([&] { (void)ds->host_read(0, host_destination.size(), host_destination.data()); });
+  CHECK(host_error == terminal_error);
+  CHECK(host_error.find(label) != std::string::npos);
+  require_no_long_fragment(host_error, sentinel);
+  CHECK(transport->control->range_gets_issued() == control_calls);
+
+  auto const data_calls   = transport->data->gets_issued();
+  auto rejected           = issue_device_read(*ds, second, stream);
+  auto const device_error = ready_error(rejected);
+  CHECK(device_error == terminal_error);
+  CHECK(device_error.find(label) != std::string::npos);
+  require_no_long_fragment(device_error, sentinel);
+  CHECK(transport->data->gets_issued() == data_calls);
+
+  auto const records = logs.records();
+  REQUIRE(std::any_of(records.begin(), records.end(), [label](auto const& record) {
+    return record.message.find(label) != std::string::npos;
+  }));
+  for (auto const& record : records) {
+    require_no_long_fragment(record.message, sentinel);
+  }
+}
+
+TEST_CASE("s3_rdma rejects arena byte-size overflow at construction",
+          "[s3][rdma][client-seam][config]")
+{
+  using namespace s3_rdma_client_seam_tests;
+
+  auto cfg                    = mock_config(/*max_inflight=*/8);
+  cfg.s3_rdma_arena_slot_size = std::numeric_limits<std::size_t>::max() / 4;
+  auto transport              = std::make_shared<mock_transport_fixture>();
+  bool caught_expected_type   = false;
+  std::string overflow_error_message;
+  try {
+    auto ctx =
+      std::make_shared<s3_rdma_ioctx>(std::move(cfg), transport->clients(), cuda_delivery_ops{});
+    (void)ctx;
+  } catch (std::overflow_error const& error) {
+    caught_expected_type   = true;
+    overflow_error_message = error.what();
+  }
+
+  REQUIRE(caught_expected_type);
+  CHECK(overflow_error_message.find("arena") != std::string::npos);
+}
+
+TEST_CASE("s3_rdma injected completion status set is authoritative", "[s3][rdma][client-seam][gpu]")
+{
+  using namespace s3_rdma_client_seam_tests;
+  if (!cuda_device_available()) { return; }
+
+  auto payload   = pattern_bytes(k_slot_size);
+  auto transport = seeded_mock_transport(std::string{k_bucket}, "status-418-accepted", payload);
+  transport->data->script_result(
+    data_get_result{data_commit_state::completed, payload.size(), 418, "accepted-test-tag", {}});
+  auto clients              = transport->clients(&accepts_test_tag);
+  clients.accepted_statuses = {418};
+  auto ctx =
+    std::make_shared<s3_rdma_ioctx>(mock_config(), std::move(clients), cuda_delivery_ops{});
+  ctx->start();
+  auto ds = open_ds(ctx, "status-418-accepted");
+  rmm::cuda_stream stream;
+  rmm::device_buffer destination(payload.size(), stream);
+
+  auto completed = issue_device_read(*ds, destination, stream);
+  REQUIRE(completed.wait_for(5s) == std::future_status::ready);
+  CHECK(completed.get() == payload.size());
+  CHECK(ctx->perf_snapshot().fail_stop_total == 0);
+}
+
+TEST_CASE("s3_rdma default completion status set accepts 206", "[s3][rdma][client-seam][gpu]")
+{
+  using namespace s3_rdma_client_seam_tests;
+  if (!cuda_device_available()) { return; }
+
+  auto payload   = pattern_bytes(k_slot_size);
+  auto transport = seeded_mock_transport(std::string{k_bucket}, "status-206", payload);
+  transport->data->script_result(
+    data_get_result{data_commit_state::completed, payload.size(), 206, "reply-tag", {}});
+  auto ctx = make_started_ioctx(transport);
+  auto ds  = open_ds(ctx, "status-206");
+  rmm::cuda_stream stream;
+  rmm::device_buffer destination(payload.size(), stream);
+
+  auto completed = issue_device_read(*ds, destination, stream);
+  REQUIRE(completed.wait_for(5s) == std::future_status::ready);
+  CHECK(completed.get() == payload.size());
+  CHECK(ctx->perf_snapshot().fail_stop_total == 0);
+}
+
+TEST_CASE("s3_rdma default completion status set rejects 418", "[s3][rdma][client-seam][gpu]")
+{
+  using namespace s3_rdma_client_seam_tests;
+  if (!cuda_device_available()) { return; }
+
+  auto payload   = pattern_bytes(k_slot_size);
+  auto transport = seeded_mock_transport(std::string{k_bucket}, "status-418-rejected", payload);
+  transport->data->script_result(
+    data_get_result{data_commit_state::completed, payload.size(), 418, "reply-tag", {}});
+  auto ctx = make_started_ioctx(transport);
+  auto ds  = open_ds(ctx, "status-418-rejected");
+  rmm::cuda_stream stream;
+  rmm::device_buffer destination(payload.size(), stream);
+
+  auto failed = issue_device_read(*ds, destination, stream);
+  CHECK(ready_error(failed).find("418") != std::string::npos);
+  auto const snapshot = ctx->perf_snapshot();
+  CHECK(snapshot.fail_stop_total == 1);
+  CHECK(snapshot.arena_leak_total >= 1);
+  CHECK(snapshot.retries_total == 0);
+}
+
+TEST_CASE("s3_rdma non-sticky arena allocation error is per-chunk and recoverable",
+          "[s3][rdma][client-seam][gpu]")
+{
+  using namespace s3_rdma_client_seam_tests;
+  if (!cuda_device_available()) { return; }
+
+  auto payload   = pattern_bytes(k_slot_size);
+  auto transport = seeded_mock_transport(std::string{k_bucket}, "malloc-recovery", payload);
+  auto calls     = std::make_shared<std::atomic<int>>(0);
+  cuda_delivery_ops ops;
+  ops.malloc_device = [calls](void** ptr, std::size_t bytes) {
+    if (calls->fetch_add(1, std::memory_order_relaxed) == 0) { return cudaErrorMemoryAllocation; }
+    return cudaMalloc(ptr, bytes);
+  };
+  auto ctx = std::make_shared<s3_rdma_ioctx>(mock_config(), transport->clients(), std::move(ops));
+  ctx->start();
+  auto ds = open_ds(ctx, "malloc-recovery");
+  rmm::cuda_stream stream;
+  rmm::device_buffer first(payload.size(), stream);
+  rmm::device_buffer second(payload.size(), stream);
+
+  auto failed = issue_device_read(*ds, first, stream);
+  REQUIRE(failed.wait_for(5s) == std::future_status::ready);
+  auto const error = thrown_error([&] { (void)failed.get(); });
+  CHECK_FALSE(error.empty());
+  CHECK(ctx->perf_snapshot().fail_stop_total == 0);
+  CHECK(ctx->perf_snapshot().arena_leak_total == 0);
+  CHECK(transport->data->gets_issued() == 0);
+
+  auto completed = issue_device_read(*ds, second, stream);
+  REQUIRE(completed.wait_for(5s) == std::future_status::ready);
+  CHECK(completed.get() == payload.size());
+  CHECK(calls->load(std::memory_order_relaxed) == 2);
+  CHECK(transport->data->gets_issued() == 1);
+  CHECK(ctx->perf_snapshot().fail_stop_total == 0);
+}
+
+TEST_CASE("s3_rdma token redaction removes the complete header value",
+          "[s3][rdma][client-seam][security]")
+{
+  using sirius::io::rdma::redact_rdma_tokens;
+
+  SECTION("JWT-style value")
+  {
+    auto const redacted = redact_rdma_tokens("x-amz-rdma-token: aaa.bbb.ccc\r\nnext: v");
+    CHECK(redacted.find("x-amz-rdma-token") != std::string::npos);
+    CHECK(redacted.find("[REDACTED]") != std::string::npos);
+    CHECK(redacted.find("aaa") == std::string::npos);
+    CHECK(redacted.find("bbb") == std::string::npos);
+    CHECK(redacted.find("ccc") == std::string::npos);
+    CHECK(redacted.find("next: v") != std::string::npos);
+  }
+
+  SECTION("value at end of string")
+  {
+    auto const redacted = redact_rdma_tokens("x-amz-rdma-token=YWJjZA==");
+    CHECK(redacted.find("x-amz-rdma-token") != std::string::npos);
+    CHECK(redacted.find("YWJjZA==") == std::string::npos);
+    CHECK(redacted.find("[REDACTED]") != std::string::npos);
+  }
+
+  SECTION("base64-style value")
+  {
+    auto const redacted = redact_rdma_tokens("x-amz-rdma-token: YWJjZC8rXw==\nnext");
+    CHECK(redacted.find("YWJjZC8rXw==") == std::string::npos);
+    CHECK(redacted.find("[REDACTED]") != std::string::npos);
+    CHECK(redacted.find("\nnext") != std::string::npos);
+  }
+}
+
+TEST_CASE("s3_rdma host read rejects a mismatched Content-Range without poisoning",
+          "[s3][rdma][client-seam]")
+{
+  using namespace s3_rdma_client_seam_tests;
+
+  auto payload   = pattern_bytes(4096);
+  auto transport = seeded_mock_transport(std::string{k_bucket}, "content-range-mismatch", payload);
+  auto ctx       = make_started_ioctx(transport);
+  auto ds        = open_ds(ctx, "content-range-mismatch");
+  std::array<std::uint8_t, 32> destination{};
+  transport->control->override_content_range("bytes 999-1998/4096");
+
+  auto const error =
+    thrown_error([&] { (void)ds->host_read(0, destination.size(), destination.data()); });
+  CHECK_FALSE(error.empty());
+  CHECK(error.find("Content-Range") != std::string::npos);
+  auto snapshot = ctx->perf_snapshot();
+  CHECK(snapshot.fail_stop_total == 0);
+  CHECK(snapshot.retries_total == 0);
+
+  CHECK(ds->host_read(0, destination.size(), destination.data()) == destination.size());
+  CHECK(std::equal(destination.begin(), destination.end(), payload.begin()));
+  snapshot = ctx->perf_snapshot();
+  CHECK(snapshot.fail_stop_total == 0);
+  CHECK(snapshot.retries_total == 0);
+}
+
+TEST_CASE("s3_rdma host read rejects an unstructured Content-Range", "[s3][rdma][client-seam]")
+{
+  s3_rdma_client_seam_tests::require_rejected_content_range("content-range-garbage", "garbage");
+}
+
+TEST_CASE("s3_rdma host read rejects a case-mismatched Content-Range unit",
+          "[s3][rdma][client-seam]")
+{
+  s3_rdma_client_seam_tests::require_rejected_content_range("content-range-case",
+                                                            "Bytes 0-99/4096");
+}
+
+TEST_CASE("s3_rdma host read rejects a malformed Content-Range interval", "[s3][rdma][client-seam]")
+{
+  s3_rdma_client_seam_tests::require_rejected_content_range("content-range-invalid",
+                                                            "bytes invalid");
+}
+
+TEST_CASE("s3_rdma host read accepts a response without Content-Range", "[s3][rdma][client-seam]")
+{
+  using namespace s3_rdma_client_seam_tests;
+
+  auto payload   = pattern_bytes(256);
+  auto transport = seeded_mock_transport(std::string{k_bucket}, "content-range-absent", payload);
+  auto ctx       = make_started_ioctx(transport);
+  auto ds        = open_ds(ctx, "content-range-absent");
+  std::array<std::uint8_t, 32> destination{};
+  transport->control->override_content_range("");
+
+  CHECK(ds->host_read(0, destination.size(), destination.data()) == destination.size());
+  CHECK(std::equal(destination.begin(), destination.end(), payload.begin()));
+  auto const snapshot = ctx->perf_snapshot();
+  CHECK(snapshot.fail_stop_total == 0);
+  CHECK(snapshot.retries_total == 0);
+}
+
+TEST_CASE("s3_rdma HEAD 200 without Content-Length cannot create a size-zero object",
+          "[s3][rdma][client-seam]")
+{
+  using namespace s3_rdma_client_seam_tests;
+
+  SECTION("the control client reports the missing length as a transport error")
+  {
+    head_without_length_server server;
+    curl_s3_control_client client{make_loopback_authorizer(server.endpoint()), "", false};
+
+    auto const result = client.head(rx_route{std::string{k_bucket}, "missing-content-length"});
+    server.wait();
+
+    CHECK(result.outcome.http_status == 200);
+    CHECK_FALSE(result.outcome.transport_ok());
+    CHECK(result.outcome.transport_error.find("Content-Length") != std::string::npos);
+    CHECK(result.object_size == 0);
+  }
+
+  SECTION("the RDMA ioctx refuses to open the object")
+  {
+    head_without_length_server server;
+    auto control = std::make_shared<curl_s3_control_client>(
+      make_loopback_authorizer(server.endpoint()), "", false);
+    auto transport = std::make_shared<mock_transport_fixture>();
+    sirius::io::rdma::rdma_transport_clients clients{control, transport->data};
+    auto ctx = std::make_shared<s3_rdma_ioctx>(
+      mock_config(), std::move(clients), sirius::io::rdma::cuda_delivery_ops{});
+    ctx->start();
+
+    auto const error =
+      thrown_error([&] { (void)ctx->open_datasource("s3://bucket/missing-content-length"); });
+    server.wait();
+
+    REQUIRE_FALSE(error.empty());
+    CHECK(error.find("Content-Length") != std::string::npos);
+    CHECK(control->attempts_total() == 1);
+    ctx->shutdown();
+  }
+}
+
+TEST_CASE("s3_rdma flush policy is immutable after reactor start", "[s3][rdma][client-seam]")
+{
+  using namespace s3_rdma_client_seam_tests;
+
+  cuobj_rdma_reactor::config cfg;
+  cfg.max_inflight    = 1;
+  cfg.arena_slot_size = k_slot_size;
+  auto transport      = std::make_shared<mock_transport_fixture>();
+  auto context        = std::make_shared<cuobj_rdma_reactor::reactor_context>(
+    cfg, transport->clients(), cuda_delivery_ops{});
+  context->set_flush_before_copy(true);
+  CHECK(context->flush_before_copy());
+
+  cuobj_rdma_reactor reactor{context};
+  reactor.start();
+  CHECK_THROWS_AS(context->set_flush_before_copy(false), std::logic_error);
+  CHECK(context->flush_before_copy());
+  reactor.shutdown();
 }

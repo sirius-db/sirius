@@ -113,6 +113,17 @@ struct cuda_delivery_ops {
       [](void* dst, const void* src, size_t count, cudaMemcpyKind kind, cudaStream_t stream) {
         return cudaMemcpyAsync(dst, src, count, kind, stream);
       };
+  /// Arena allocation leg (device memory for the landing arena) — injected
+  /// by tests to drive sticky-error classification on the arena path.
+  std::function<cudaError_t(void**, size_t)> malloc_device = [](void** ptr, size_t bytes) {
+    return cudaMalloc(ptr, bytes);
+  };
+  /// Arena release leg (teardown) — classified like every other CUDA call.
+  std::function<cudaError_t(void*)> free_device = [](void* ptr) { return cudaFree(ptr); };
+  /// Device query/selection legs for the per-chunk device scope — sticky
+  /// classification applies at any phase, device selection included.
+  std::function<cudaError_t(int*)> get_device = [](int* d) { return cudaGetDevice(d); };
+  std::function<cudaError_t(int)> set_device  = [](int d) { return cudaSetDevice(d); };
   /// GPUDirect write-visibility flush (pre-boundary leg; one call per exact
   /// completion when the platform's ordering attribute requires it).
   std::function<cudaError_t()> flush = [] {
@@ -236,7 +247,15 @@ class cuobj_rdma_reactor {
     /// set at init from the device's writes-ordering attribute
     /// (see @c flush_required) once the real data path is enabled.
     [[nodiscard]] bool flush_before_copy() const noexcept { return _flush_before_copy; }
-    void set_flush_before_copy(bool value) noexcept { _flush_before_copy = value; }
+    void set_flush_before_copy(bool value)
+    {
+      if (_tuning_frozen) {
+        throw std::logic_error("cuobj_rdma_reactor: flush_before_copy cannot change after start");
+      }
+      _flush_before_copy = value;
+    }
+    /// Called by the reactor's start(): tuning is frozen for the lifetime.
+    void freeze_tuning() noexcept { _tuning_frozen = true; }
 
    private:
     config _config;
@@ -244,6 +263,7 @@ class cuobj_rdma_reactor {
     cuda_delivery_ops _delivery;
     admission_gate _gate;
     bool _flush_before_copy{false};
+    bool _tuning_frozen{false};
   };
 
   using io_object_type       = cuobj_rdma_io_object;
@@ -298,6 +318,7 @@ class cuobj_rdma_reactor {
   struct arena {
     uint8_t* base{nullptr};
     std::unique_ptr<slot_pool> pool;
+    const cuda_delivery_ops* ops{nullptr};         ///< non-owning; outlives the arena
     std::unique_ptr<rdma_data_session> registrar;  // its own session; deregisters on teardown
     bool registered{false};  // base successfully registered with @c registrar; the destructor
                              // only deregisters when true (a registration that threw must not be

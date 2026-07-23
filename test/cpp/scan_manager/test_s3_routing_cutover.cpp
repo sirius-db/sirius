@@ -1004,6 +1004,21 @@ TEST_CASE("rdma transport fails loudly on datasource creation instead of falling
         io_context_type::rdma);
 }
 
+TEST_CASE("s3_rdma v1 scopes unsupported LIST and glob errors", "[s3][rdma][routing][scan_manager]")
+{
+  scan_manager_fixture fixture;
+  sirius_scan_manager manager{make_rdma_scan_config(), *fixture.memory, fixture.topology};
+
+  require_exception(
+    [&] {
+      manager.list_objects_paged(
+        "s3://routing-bucket/prefix", 100, [](auto const&) { return true; });
+    },
+    {"S3-RDMA", "v1"});
+  require_exception([&] { (void)manager.s3_list_max_matches("s3://routing-bucket/prefix"); },
+                    {"S3-RDMA", "v1"});
+}
+
 TEST_CASE("s3_transport parsed from sirius_config reaches registry selection",
           "[s3][rdma][routing][config]")
 {

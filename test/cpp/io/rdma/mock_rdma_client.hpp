@@ -53,6 +53,11 @@ class mock_s3_control_client final : public s3_control_client {
   /// exercises retry-then-succeed, count >= max-attempts exercises
   /// retry-exhaustion.
   void fail_next_n_range_gets(std::size_t count, long http_status);
+  /// One-shot: the next SERVED range_get reports this raw Content-Range
+  /// value instead of the computed one (empty string = header absent) —
+  /// drives the response-identity validation (offset mismatch / missing
+  /// header cases).
+  void override_content_range(std::string value);
 
   /// While closed, range_get() blocks (after being counted) until open_gate().
   void close_gate();
@@ -77,6 +82,7 @@ class mock_s3_control_client final : public s3_control_client {
   std::optional<long> _next_status;
   std::size_t _fail_next_range_gets{0};
   long _fail_next_status{0};
+  std::optional<std::string> _content_range_override;
   bool _gate_closed{false};
   size_t _heads_issued{0};
   size_t _range_gets_issued{0};
@@ -109,6 +115,10 @@ class mock_rdma_data_session_factory final
   void short_write(size_t bytes);
   /// Subsequent acquire() calls throw std::runtime_error(what).
   void fail_acquire(std::string what);
+  /// Subsequent get() calls THROW std::runtime_error(what) after being
+  /// counted — drives the conservative exception default (an exception out
+  /// of get() must fail-stop, never take the benign not_sent path).
+  void throw_gets(std::string what);
   /// The first @p count acquire() calls succeed; every later one returns
   /// nullptr — count 0 fails the first worker's acquire, count = worker
   /// count leaves the workers whole and fails the arena registrar's acquire.
@@ -142,6 +152,7 @@ class mock_rdma_data_session_factory final
   std::map<std::pair<std::string, std::string>, std::vector<std::uint8_t>> _objects;
   std::deque<data_get_result> _scripted;
   std::optional<std::string> _fail_message;
+  std::optional<std::string> _throw_message;
   std::optional<size_t> _short_write;
   std::optional<std::string> _fail_acquire;
   std::optional<size_t> _null_acquire_after;

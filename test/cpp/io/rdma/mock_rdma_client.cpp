@@ -81,6 +81,12 @@ void mock_s3_control_client::fail_next_n_range_gets(std::size_t count, long http
   _fail_next_status     = http_status;
 }
 
+void mock_s3_control_client::override_content_range(std::string value)
+{
+  std::lock_guard lk{_mtx};
+  _content_range_override = std::move(value);
+}
+
 void mock_s3_control_client::close_gate()
 {
   std::lock_guard lk{_mtx};
@@ -192,8 +198,13 @@ range_get_result mock_s3_control_client::range_get(const rx_route& route,
   std::memcpy(dst, bytes.data() + offset, n);
   result.outcome.http_status = 206;
   result.delivered_bytes     = n;
-  result.content_range = "bytes " + std::to_string(offset) + "-" + std::to_string(offset + n - 1) +
-                         "/" + std::to_string(bytes.size());
+  if (_content_range_override) {
+    result.content_range = std::move(*_content_range_override);
+    _content_range_override.reset();
+  } else {
+    result.content_range = "bytes " + std::to_string(offset) + "-" +
+                           std::to_string(offset + n - 1) + "/" + std::to_string(bytes.size());
+  }
   return result;
 }
 
@@ -253,6 +264,12 @@ void mock_rdma_data_session_factory::fail_gets(std::string transport_error)
 {
   std::lock_guard lk{_mtx};
   _fail_message = std::move(transport_error);
+}
+
+void mock_rdma_data_session_factory::throw_gets(std::string what)
+{
+  std::lock_guard lk{_mtx};
+  _throw_message = std::move(what);
 }
 
 void mock_rdma_data_session_factory::short_write(size_t bytes)
@@ -374,6 +391,7 @@ data_get_result mock_rdma_data_session_factory::serve_get(const rx_route& route,
     ++_gets_issued;
     _gate_cv.wait(lk, [&] { return !_gate_closed; });
 
+    if (_throw_message) { throw std::runtime_error(*_throw_message); }
     if (!_scripted.empty()) {
       result = std::move(_scripted.front());
       _scripted.pop_front();

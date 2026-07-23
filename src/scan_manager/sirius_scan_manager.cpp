@@ -736,6 +736,11 @@ void sirius_scan_manager::list_objects_paged(
   auto io_ctx = ioctx_for_path(route_probe);
   auto* rest  = dynamic_cast<sirius::io::rest::rest_ioctx*>(io_ctx.get());
   if (rest == nullptr) {
+    if (io_ctx && io_ctx->type() == sirius::io::io_context_type::rdma) {
+      throw std::runtime_error(
+        "sirius_scan_manager::list_objects_paged: wildcard glob and S3 LIST are unsupported "
+        "under the S3-RDMA transport in v1; use an explicit object key");
+    }
     throw std::runtime_error("sirius_scan_manager::list_objects_paged: '" + s3_prefix_uri +
                              "' does not route to an object-store backend that supports LIST");
   }
@@ -761,6 +766,11 @@ std::size_t sirius_scan_manager::s3_list_max_matches(std::string const& s3_uri)
   auto io_ctx = ioctx_for_path(route_probe);
   auto* rest  = dynamic_cast<sirius::io::rest::rest_ioctx*>(io_ctx.get());
   if (rest == nullptr) {
+    if (io_ctx && io_ctx->type() == sirius::io::io_context_type::rdma) {
+      throw std::runtime_error(
+        "sirius_scan_manager::s3_list_max_matches: wildcard glob and S3 LIST are unsupported "
+        "under the S3-RDMA transport in v1; use an explicit object key");
+    }
     throw std::runtime_error("sirius_scan_manager::s3_list_max_matches: '" + s3_uri +
                              "' does not route to an object-store backend that supports LIST");
   }

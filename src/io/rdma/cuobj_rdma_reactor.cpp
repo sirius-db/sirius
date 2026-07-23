@@ -29,6 +29,7 @@
 #include <algorithm>
 #include <cassert>
 #include <chrono>
+#include <cstdlib>
 #include <exception>
 #include <limits>
 #include <stdexcept>
@@ -171,7 +172,8 @@ void default_fatal_hook(const char* what, cudaError_t rc) noexcept
 void validate(const cuda_delivery_ops& ops)
 {
   const bool complete = ops.event_create && ops.event_record && ops.event_synchronize &&
-                        ops.event_destroy && ops.memcpy_async && ops.flush &&
+                        ops.event_destroy && ops.memcpy_async && ops.malloc_device &&
+                        ops.free_device && ops.get_device && ops.set_device && ops.flush &&
                         ops.stream_capture_query && ops.fatal_hook;
   if (!complete) {
     throw std::invalid_argument(
@@ -184,6 +186,10 @@ cuobj_rdma_reactor::config sanitized(cuobj_rdma_reactor::config cfg)
 {
   if (cfg.max_inflight == 0) { cfg.max_inflight = 1; }
   if (cfg.arena_slot_size == 0) { cfg.arena_slot_size = 64UL << 10; }
+  if (cfg.max_inflight > std::numeric_limits<size_t>::max() / cfg.arena_slot_size) {
+    throw std::overflow_error(
+      "cuobj_rdma_reactor: the arena size (max_inflight x arena_slot_size) overflows");
+  }
   if (cfg.queue_cap.has_value()) {
     if (*cfg.queue_cap == 0) {
       throw std::invalid_argument("cuobj_rdma_reactor: queue_cap must be positive");
@@ -222,7 +228,10 @@ cuobj_rdma_reactor::arena::~arena()
   }
   if (base == nullptr) { return; }
   if (registered && registrar) { registrar->deregister_memory(base); }
-  (void)cudaFree(base);
+  const cudaError_t rc = ops != nullptr ? ops->free_device(base) : cudaFree(base);
+  if (rc != cudaSuccess && ops != nullptr && is_context_fatal(rc)) {
+    invoke_fatal(*ops, "arena free failed", rc);
+  }
 }
 
 cuobj_rdma_reactor::cuobj_rdma_reactor(std::shared_ptr<reactor_context> ctx)
@@ -255,6 +264,7 @@ void cuobj_rdma_reactor::mark_arenas_non_freeable(void* opaque) noexcept
 
 void cuobj_rdma_reactor::start()
 {
+  _ctx->freeze_tuning();
   std::unique_lock lk{_lifecycle_mtx};
   if (_started) { return; }
   _started = true;
@@ -384,6 +394,30 @@ size_t cuobj_rdma_reactor::control_transfer(const cuobj_chunked_rx_request& chun
                    std::to_string(chunk.size) + " bytes";
       retriable = true;
     } else {
+      // Response identity: when Content-Range is present its start must be
+      // the requested offset — a right-sized body from the wrong offset must
+      // not pass as success.  An absent header skips the check (200
+      // full-body responses legitimately omit it).
+      const std::string& cr = result.content_range;
+      if (!cr.empty()) {
+        // Fail closed: a NON-EMPTY header must parse as "bytes <start>-…"
+        // and start at the requested offset; anything else is a response-
+        // identity error.  Only an ABSENT header skips the check.
+        char* end                 = nullptr;
+        unsigned long long begin_ = 0;
+        const bool parsed =
+          cr.size() > 6 && cr.compare(0, 6, "bytes ") == 0 &&
+          (begin_ = std::strtoull(cr.c_str() + 6, &end, 10), end != cr.c_str() + 6 && *end == '-');
+        if (!parsed) {
+          throw std::runtime_error("cuobj_rdma_reactor: control-plane Content-Range '" + cr +
+                                   "' is not parseable (response identity mismatch)");
+        }
+        if (begin_ != chunk.offset) {
+          throw std::runtime_error("cuobj_rdma_reactor: control-plane Content-Range starts at " +
+                                   std::to_string(begin_) + ", expected offset " +
+                                   std::to_string(chunk.offset) + " (response identity mismatch)");
+        }
+      }
       return result.delivered_bytes;  // exact success
     }
     // Do not keep retrying (or sleeping) once admission is closed — a
@@ -401,7 +435,23 @@ size_t cuobj_rdma_reactor::data_transfer(const cuobj_chunked_rx_request& chunk,
                                          void* dst,
                                          bool& fail_stop_failure)
 {
-  auto result = session.get(*chunk.route, chunk.offset, chunk.size, dst);
+  data_get_result result;
+  try {
+    result = session.get(*chunk.route, chunk.offset, chunk.size, dst);
+  } catch (const std::exception& e) {
+    // An exception out of get() cannot prove the request never left the
+    // process, so it must never take the benign not_sent path: fail-stop
+    // conservatively.  not_sent comes only from the RESULT classification.
+    // Re-thrown REDACTED: this text reaches the terminal-error latch, the
+    // fail-stop log, and every future — a raw SDK message may carry the
+    // descriptor token.
+    fail_stop_failure = true;
+    throw std::runtime_error(
+      redact_rdma_tokens(std::string("cuobj_rdma_reactor: data GET failed: ") + e.what()));
+  } catch (...) {
+    fail_stop_failure = true;
+    throw std::runtime_error("cuobj_rdma_reactor: data GET failed with a non-standard exception");
+  }
   switch (result.commit) {
     case data_commit_state::not_sent:
       // Provably never left the process: this chunk fails, the transport
@@ -424,7 +474,8 @@ size_t cuobj_rdma_reactor::data_transfer(const cuobj_chunked_rx_request& chunk,
                                ? "cuobj_rdma_reactor: data completion reply tag missing"
                                : "cuobj_rdma_reactor: data completion reply tag rejected");
   }
-  if (result.http_status != 200 && result.http_status != 206) {
+  const auto& accepted = _ctx->clients().accepted_statuses;
+  if (std::find(accepted.begin(), accepted.end(), result.http_status) == accepted.end()) {
     throw std::runtime_error(redact_rdma_tokens(
       "cuobj_rdma_reactor: data completion HTTP status " + std::to_string(result.http_status) +
       (result.transport_error.empty() ? "" : ": " + result.transport_error)));
@@ -504,9 +555,30 @@ void cuobj_rdma_reactor::process_claimed(admission_gate::claimed_chunk claimed_a
       return;
     }
 
-    const int device =
-      chunk.device_id >= 0 ? chunk.device_id : rmm::get_current_cuda_device().value();
-    rmm::cuda_set_device_raii device_scope{rmm::cuda_device_id{device}};
+    const auto& dev_ops = _ctx->delivery_ops();
+    const auto classify = [&dev_ops](cudaError_t rc, const char* what) {
+      if (rc == cudaSuccess) { return; }
+      if (is_context_fatal(rc)) { invoke_fatal(dev_ops, what, rc); }
+      throw_on_cuda_error(rc, what);
+    };
+    int previous = 0;
+    classify(dev_ops.get_device(&previous), "device query failed");
+    const int device = chunk.device_id >= 0 ? chunk.device_id : previous;
+    classify(dev_ops.set_device(device), "device selection failed");
+    // Restore on scope exit: a sticky failure terminates (contract: any
+    // phase); a non-sticky restore failure is swallowed — the next chunk
+    // re-selects its device explicitly.
+    struct device_scope_guard {
+      const cuda_delivery_ops* ops;
+      int previous;
+      ~device_scope_guard()
+      {
+        const cudaError_t rc = ops->set_device(previous);
+        if (rc != cudaSuccess && is_context_fatal(rc)) {
+          invoke_fatal(*ops, "device restore failed", rc);
+        }
+      }
+    } device_scope{&dev_ops, previous};
     auto& ar = arena_for_device(device);
     int slot = ar.pool->try_acquire();
     if (slot == slot_pool::no_slot) {
@@ -578,6 +650,14 @@ void cuobj_rdma_reactor::process_claimed(admission_gate::claimed_chunk claimed_a
       throw_on_cuda_error(create_rc, "completion event create failed");
     }
     event.created = true;
+    // dst is stream-ordered (RMM / cudaMallocAsync) memory: this copy is
+    // ordered after dst's allocation ONLY because it runs on the allocating
+    // (caller) stream.  Moving it to any other stream — e.g. a per-worker
+    // copy stream — REQUIRES the dispatch-time fence: record event A on the
+    // caller stream STRICTLY BEFORE publishing chunk work (a wait on a
+    // never-recorded event is a silent no-op, i.e. a deleted fence), make
+    // the copy stream cudaStreamWaitEvent(A) before this D2D, record E
+    // after it, make the caller stream wait E, and recycle the slot on E.
     // ---- Delivery boundary: the first memcpy_async call (safety contract:
     // experimental/s3-rdma-transport-design.md, Section 5).  From here the
     // only returning path is an event wait that reports cudaSuccess; every
@@ -646,9 +726,21 @@ cuobj_rdma_reactor::arena& cuobj_rdma_reactor::arena_for_device(int device_id)
   if (auto it = _arenas.find(device_id); it != _arenas.end()) { return *it->second; }
 
   auto ar = std::make_unique<arena>();
-  throw_on_cuda_error(
-    cudaMalloc(reinterpret_cast<void**>(&ar->base), _config.max_inflight * _config.arena_slot_size),
-    "landing arena allocation failed");
+  ar->ops = &_ctx->delivery_ops();
+  {
+    void* base_ptr = nullptr;
+    const cudaError_t alloc =
+      _ctx->delivery_ops().malloc_device(&base_ptr, _config.max_inflight * _config.arena_slot_size);
+    if (alloc != cudaSuccess) {
+      // A sticky code here means the context is already poisoned: terminating
+      // is the contract at any phase, not only past the delivery boundary.
+      if (is_context_fatal(alloc)) {
+        invoke_fatal(_ctx->delivery_ops(), "landing arena allocation failed", alloc);
+      }
+      throw_on_cuda_error(alloc, "landing arena allocation failed");
+    }
+    ar->base = static_cast<uint8_t*>(base_ptr);
+  }
   ar->pool = std::make_unique<slot_pool>(_config.max_inflight);
   // The arena owns a dedicated session for its registration lifetime:
   // worker sessions die when workers exit, but deregistration happens at

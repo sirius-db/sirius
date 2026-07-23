@@ -197,7 +197,13 @@ head_result curl_s3_control_client::head(const rx_route& route)
     if (status == 200) {
       curl_off_t content_length = -1;
       curl_easy_getinfo(h, CURLINFO_CONTENT_LENGTH_DOWNLOAD_T, &content_length);
-      if (content_length >= 0) { result.object_size = static_cast<size_t>(content_length); }
+      if (content_length >= 0) {
+        result.object_size = static_cast<size_t>(content_length);
+      } else if (rc == CURLE_OK) {
+        // A 200 with no usable length cannot seed the read plan: report it
+        // instead of minting a size-0 object.
+        result.outcome.transport_error = "HEAD returned 200 without a valid Content-Length";
+      }
     }
     if (rc != CURLE_OK) { result.outcome.transport_error = curl_easy_strerror(rc); }
     return result;

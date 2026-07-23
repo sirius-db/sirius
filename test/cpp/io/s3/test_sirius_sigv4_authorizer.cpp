@@ -759,6 +759,28 @@ TEST_CASE("mock_request_authorizer can force credential errors", "[s3][authorize
   CHECK(request.headers.empty());
 }
 
+TEST_CASE("S3 RDMA Range and token headers are included in SigV4 SignedHeaders",
+          "[s3][rdma][authorizer]")
+{
+  sirius_sigv4_header_authorizer provider(
+    example_static_credentials(), "us-east-1", "https://s3.us-east-1.amazonaws.com");
+  std::vector<std::pair<std::string, std::string>> extra_headers{
+    {"Range", "bytes=0-65535"}, {"x-amz-rdma-token", "opaque-test-token"}};
+
+  auto request = provider.authorize_with_headers(
+    {"examplebucket", "data.parquet"}, s3_request_method::GET, k_presign_timeout, extra_headers);
+  auto const authorization = header_value(request.headers, "Authorization");
+  auto const signed_begin  = authorization.find("SignedHeaders=");
+  auto const signed_end    = authorization.find(", Signature=", signed_begin);
+
+  REQUIRE(signed_begin != std::string::npos);
+  REQUIRE(signed_end != std::string::npos);
+  auto const signed_headers = authorization.substr(signed_begin, signed_end - signed_begin);
+  CHECK(contains(signed_headers, "host"));
+  CHECK(contains(signed_headers, "range"));
+  CHECK(contains(signed_headers, "x-amz-rdma-token"));
+}
+
 #include "../rdma/rdma_client_seam_tests.hpp"
 #include "../rdma/rdma_real_client_tests.hpp"
 #include "../rdma/rdma_retries_metrics_tests.hpp"
