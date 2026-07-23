@@ -129,25 +129,19 @@ TEST_CASE_METHOD(NullDataFixture,
   compare_gpu_vs_cpu("SELECT id, (NOT (i = 10)) AS r FROM nt");
 }
 
-// KNOWN GPU DIVERGENCE (issue #1218):
-// SQL three-valued logic says `TRUE OR UNKNOWN = TRUE`, but Sirius's GPU OR
-// naively propagates NULL (`TRUE OR NULL -> NULL`), so a row where one branch is
-// TRUE and the other is NULL is wrongly filtered out. Each divergent query is its
-// own case: Catch2 aborts a test case at the first REQUIRE failure, so bundling
-// them would leave the later queries unexercised. Tagged [!shouldfail] so they
-// document the bug without failing CI; remove the tag when the GPU predicate
-// evaluator implements 3-valued OR correctly.
+// SQL three-valued logic: TRUE OR UNKNOWN = TRUE, so a row where one branch is
+// TRUE and the other is NULL is kept.
 TEST_CASE_METHOD(NullDataFixture,
-                 "gpu_execution three-valued OR, TRUE-OR-NULL branch [known divergence]",
-                 "[integration][gpu_execution][filter][nulls][!shouldfail]")
+                 "gpu_execution three-valued OR, TRUE-OR-NULL branch",
+                 "[integration][gpu_execution][filter][nulls]")
 {
-  // Row (i=10, b=NULL) satisfies `i = 10` yet GPU drops it because `b = 200` is NULL.
+  // Row (i=10, b=NULL) satisfies `i = 10`, so it is kept even though `b = 200` is NULL.
   compare_gpu_vs_cpu("SELECT id FROM nt WHERE i = 10 OR b = 200");
 }
 
 TEST_CASE_METHOD(NullDataFixture,
-                 "gpu_execution three-valued OR, IS-NULL-OR-match branch [known divergence]",
-                 "[integration][gpu_execution][filter][nulls][!shouldfail]")
+                 "gpu_execution three-valued OR, IS-NULL-OR-match branch",
+                 "[integration][gpu_execution][filter][nulls]")
 {
   compare_gpu_vs_cpu("SELECT id FROM nt WHERE (i IS NULL) OR (b = 100)");
 }
