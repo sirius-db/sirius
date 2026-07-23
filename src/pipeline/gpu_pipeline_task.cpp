@@ -24,6 +24,7 @@
 #include "telemetry/telemetry_context.hpp"
 
 #include <nvtx3/nvtx3.hpp>
+#include <thrust/system/system_error.h>
 
 #include <absl/cleanup/cleanup.h>
 #include <cucascade/data/data_repository.hpp>
@@ -162,8 +163,38 @@ std::unique_ptr<op::operator_data> run_one_operator(
   auto nvtx_label = std::format(
     "Pipeline {}: {} (id={})", pipeline->get_pipeline_id(), op.get_name(), op.get_operator_id());
   nvtx3::scoped_range nvtx_range{nvtx_label.c_str()};
-  auto start                = std::chrono::high_resolution_clock::now();
-  auto operator_output_data = op.execute(operator_input_data, stream);
+  auto start = std::chrono::high_resolution_clock::now();
+  std::unique_ptr<op::operator_data> operator_output_data;
+  try {
+    operator_output_data = op.execute(operator_input_data, stream);
+  } catch (const std::exception& ex) {
+    auto sticky_err = cudaGetLastError();
+    if (sticky_err != cudaSuccess) {
+      SIRIUS_LOG_WARN("Pipeline {}: {} (id={}) threw + left sticky CUDA error: [{}] {} — clearing",
+                      pipeline->get_pipeline_id(),
+                      op.get_name(),
+                      op.get_operator_id(),
+                      static_cast<int>(sticky_err),
+                      cudaGetErrorString(sticky_err));
+    }
+    SIRIUS_LOG_WARN("Pipeline {}: {} (id={}) threw during execute: {}",
+                    pipeline->get_pipeline_id(),
+                    op.get_name(),
+                    op.get_operator_id(),
+                    ex.what());
+    throw;
+  }
+
+  if (auto sticky_err = cudaGetLastError(); sticky_err != cudaSuccess) {
+    SIRIUS_LOG_WARN(
+      "Pipeline {}: {} (id={}) left a sticky CUDA error after execute: [{}] {} — clearing",
+      pipeline->get_pipeline_id(),
+      op.get_name(),
+      op.get_operator_id(),
+      static_cast<int>(sticky_err),
+      cudaGetErrorString(sticky_err));
+  }
+
   stream.synchronize();
   auto end      = std::chrono::high_resolution_clock::now();
   auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
@@ -359,6 +390,31 @@ std::unique_ptr<op::operator_data> gpu_pipeline_task::compute_task(rmm::cuda_str
         std::move(operator_input_output_data),
         i,
         "OOM at operator " + op.get_name() + " (index " + std::to_string(i) + ")");
+    } catch (const thrust::system_error& cuda_err) {
+      auto err = static_cast<cudaError_t>(cuda_err.code().value());
+      if (err == cudaErrorLaunchOutOfResources || err == cudaErrorInvalidValue) {
+        SIRIUS_LOG_WARN(
+          "Pipeline {}: CUDA launch error [{}] {} at operator {} (id={}, index {}/{}), "
+          "rescheduling task {}",
+          pipeline->get_pipeline_id(),
+          static_cast<int>(err),
+          cudaGetErrorString(err),
+          op.get_name(),
+          op.get_operator_id(),
+          i,
+          operators.size(),
+          _task_id);
+        throw cuda_launch_reschedule_exception(
+          std::move(operator_input_output_data),
+          i,
+          static_cast<int>(err),
+          std::format("CUDA launch error [{}] {} at operator {} (index {})",
+                      static_cast<int>(err),
+                      cudaGetErrorString(err),
+                      op.get_name(),
+                      i));
+      }
+      throw;
     }
   }
 
