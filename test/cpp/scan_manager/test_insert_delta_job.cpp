@@ -274,6 +274,104 @@ TEST_CASE("insert-delta job: a tiny byte budget splits bundles per row group",
   exec_ok(*tdb.con, "ROLLBACK");
 }
 
+TEST_CASE("insert-delta job: the open tail bundle never shares with closed row groups",
+          "[insert_delta_job][scan_manager]")
+{
+  job_test_db tdb;
+  exec_ok(*tdb.con, "SET threads TO 1");
+  exec_ok(*tdb.con, "CREATE TABLE t AS SELECT range::INTEGER AS k FROM range(10000)");
+  exec_ok(*tdb.con, "CHECKPOINT");
+  // Bulk commit: two persistent, closed row groups (the last sealed half-empty).
+  exec_ok(*tdb.con, "INSERT INTO t SELECT (10000+range)::INTEGER FROM range(130000)");
+  // A tiny transient append opens a fresh, still-open tail row group.
+  exec_ok(*tdb.con, "INSERT INTO t VALUES (200000)");
+
+  exec_ok(*tdb.con, "BEGIN TRANSACTION");
+  auto& storage = resolve_storage(*tdb.con, "t");
+  std::vector<insert_delta_job_request> requests;
+  requests.push_back(make_request(
+    *tdb.con, storage, 10000, {0}, {sirius::logical_type::make(sirius::type_id::INTEGER)}));
+  run(requests);  // default byte budget would pack the tail with the sealed row group
+
+  auto const& request = requests[0];
+  REQUIRE(request.plan.promotion_eligible);
+  REQUIRE(request.bundles.size() >= 2);
+  // The force-close splits the open tail off on its own; every other bundle is
+  // a promotable run of closed row groups.
+  auto const& tail = request.bundles.back();
+  REQUIRE_FALSE(tail.promotable);
+  REQUIRE(tail.total_rows == 1);  // just the VALUES row
+  for (std::size_t i = 0; i + 1 < request.bundles.size(); ++i) {
+    REQUIRE(request.bundles[i].promotable);
+  }
+  exec_ok(*tdb.con, "ROLLBACK");
+}
+
+TEST_CASE("insert-delta job: a partially visible bundle is not promotable",
+          "[insert_delta_job][scan_manager]")
+{
+  job_test_db tdb;
+  exec_ok(*tdb.con, "SET threads TO 1");
+  exec_ok(*tdb.con, "CREATE TABLE t AS SELECT range::INTEGER AS k FROM range(10000)");
+  exec_ok(*tdb.con, "CHECKPOINT");
+  // Bulk: a full closed row group plus a sealed half-empty one.
+  exec_ok(*tdb.con, "INSERT INTO t SELECT (10000+range)::INTEGER FROM range(130000)");
+  // Delete a row inside the first bulk row group: its bundle is only partly visible.
+  exec_ok(*tdb.con, "DELETE FROM t WHERE k = 50000");
+
+  exec_ok(*tdb.con, "BEGIN TRANSACTION");
+  auto& storage = resolve_storage(*tdb.con, "t");
+  std::vector<insert_delta_job_request> requests;
+  requests.push_back(make_request(
+    *tdb.con, storage, 10000, {0}, {sirius::logical_type::make(sirius::type_id::INTEGER)}));
+  requests[0].approximate_batch_size = 1;  // one bundle per row group
+  run(requests);
+
+  auto const& request = requests[0];
+  REQUIRE(request.bundles.size() == request.plan.row_groups.size());
+  // The masked (deleted-row) bundle cannot promote; the intact sealed row group can.
+  bool saw_masked_not_promotable = false;
+  bool saw_unmasked_promotable   = false;
+  for (auto const& b : request.bundles) {
+    if (b.mask.has_mask()) {
+      REQUIRE_FALSE(b.promotable);
+      saw_masked_not_promotable = true;
+    } else {
+      REQUIRE(b.promotable);
+      saw_unmasked_promotable = true;
+    }
+  }
+  REQUIRE(saw_masked_not_promotable);
+  REQUIRE(saw_unmasked_promotable);
+  exec_ok(*tdb.con, "ROLLBACK");
+}
+
+TEST_CASE("insert-delta job: an ineligible plan marks no bundle promotable",
+          "[insert_delta_job][scan_manager]")
+{
+  job_test_db tdb;
+  exec_ok(*tdb.con, "CREATE TABLE t (k INTEGER PRIMARY KEY)");
+  exec_ok(*tdb.con, "INSERT INTO t SELECT range FROM range(10000)");
+  exec_ok(*tdb.con, "CHECKPOINT");
+  // A PRIMARY KEY makes appends land in the boundary row group (k_offset > 0),
+  // so the delta starts mid-row-group and the plan is ineligible; bundling is
+  // otherwise unchanged (one delta row group, one bundle).
+  exec_ok(*tdb.con, "INSERT INTO t VALUES (10000), (10001)");
+
+  exec_ok(*tdb.con, "BEGIN TRANSACTION");
+  auto& storage = resolve_storage(*tdb.con, "t");
+  std::vector<insert_delta_job_request> requests;
+  requests.push_back(make_request(
+    *tdb.con, storage, 10000, {0}, {sirius::logical_type::make(sirius::type_id::INTEGER)}));
+  run(requests);
+
+  auto const& request = requests[0];
+  REQUIRE_FALSE(request.plan.promotion_eligible);
+  REQUIRE(request.bundles.size() == 1);
+  REQUIRE_FALSE(request.bundles[0].promotable);
+  exec_ok(*tdb.con, "ROLLBACK");
+}
+
 TEST_CASE("insert-delta job: per-operator cuts subset the union and share storage",
           "[insert_delta_job][scan_manager]")
 {

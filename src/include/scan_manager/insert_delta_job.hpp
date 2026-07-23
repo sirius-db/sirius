@@ -70,6 +70,11 @@ struct insert_delta_bundle {
   std::vector<std::size_t> rg_slab_base;   ///< parallel to rg_indices
   std::vector<std::size_t> rg_bit_offset;  ///< parallel to rg_indices (mask bits)
   int preferred_device{-1};                ///< round-robin GPU for this bundle
+  /// Every row group in this bundle is closed and the plan is promotion-eligible,
+  /// so its decoded rows can be promoted into the cache as base chunks. Refined
+  /// to all-visible-only by finalize_insert_delta_jobs. Bundles are promotable-
+  /// pure: the bundler never mixes promotable and non-promotable row groups.
+  bool promotable{false};
 };
 
 /**

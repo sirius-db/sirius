@@ -59,6 +59,15 @@ std::size_t numa_node_for_device(int device, sirius::memory::topology_index cons
   return numa < 0 ? 0 : static_cast<std::size_t>(numa);
 }
 
+// A row group can be promoted into the cache only when the delta starts on a
+// row-group boundary (eligible plan) and the row group is closed to further
+// appends. Non-promotable row groups are the open tail (a contiguous suffix),
+// so grouping by this predicate splits a request's row groups at most once.
+bool rg_promotable(op::scan::insert_delta_plan const& plan, std::size_t i)
+{
+  return plan.promotion_eligible && plan.row_groups[i].closed;
+}
+
 }  // namespace
 
 insert_delta_workset prepare_insert_delta_tasks(
@@ -181,6 +190,12 @@ insert_delta_workset prepare_insert_delta_tasks(
             }
           }
         }
+        // Keep each bundle promotable-pure so a promotable bundle's decoded
+        // table can be adopted into the cache wholesale.
+        if (!exceed && !cur.empty() &&
+            rg_promotable(request.plan, i) != rg_promotable(request.plan, cur.front())) {
+          exceed = true;
+        }
         if (exceed) { flush(); }
         cur.push_back(i);
         cur_budget += rgs[i].decoded_bytes_budget;
@@ -199,6 +214,9 @@ insert_delta_workset prepare_insert_delta_tasks(
     for (auto& rg_list : bundles_rgs) {
       insert_delta_bundle bundle;
       bundle.rg_indices = std::move(rg_list);
+      // Bundles are promotable-pure (see the bundler force-close), so the first
+      // row group's promotability speaks for the whole bundle.
+      bundle.promotable = rg_promotable(request.plan, bundle.rg_indices.front());
 
       std::size_t slab_bytes = 0;
       for (auto rg_idx : bundle.rg_indices) {
@@ -290,12 +308,16 @@ void finalize_insert_delta_jobs(insert_delta_workset& workset)
   for (auto& work : workset.works) {
     auto& bundle = work->request->bundles[work->bundle_index];
     if (work->visible == bundle.total_rows) {
-      // Every row visible: serve unmasked.
+      // Every row visible: serve unmasked. A promotable bundle stays promotable.
       bundle.mask = mvcc_chunk_mask{};
     } else if (work->visible == 0) {
       // Nothing visible under this snapshot: mark empty so the sweep below
       // drops the bundle.
       bundle.total_rows = 0;
+    } else {
+      // Partially visible: some rows are invisible and may still be
+      // uncommitted, so caching these bytes is unsafe. Serve masked, no promote.
+      bundle.promotable = false;
     }
     touched.insert(work->request);
   }
