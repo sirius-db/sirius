@@ -113,9 +113,14 @@ if(ENABLE_ROCM)
       set(CMAKE_HIP_ARCHITECTURES native)
       message(STATUS "CMAKE_HIP_ARCHITECTURES: auto-detected via rocminfo (native)")
     else()
+      # No GPU detected — build for all MI-series archs (multi-arch fatbinary).
+      # This is slower (3× codegen) but produces binaries that run on any MI GPU.
+      # For consumer GPUs (gfx1100 etc.) or to speed up the build, pass
+      # -DCMAKE_HIP_ARCHITECTURES=gfx1100 explicitly.
       set(CMAKE_HIP_ARCHITECTURES gfx90a;gfx942;gfx950)
-      message(STATUS "CMAKE_HIP_ARCHITECTURES: no GPU detected (rocminfo unavailable), "
-                     "defaulting to 'gfx90a;gfx942;gfx950'")
+      message(WARNING "CMAKE_HIP_ARCHITECTURES: no AMD GPU detected (rocminfo unavailable). "
+                      "Building for all MI-series archs (gfx90a;gfx942;gfx950) — this is slower. "
+                      "For a specific arch, pass -DCMAKE_HIP_ARCHITECTURES=gfx1100 (or your arch).")
     endif()
   endif()
 else()
