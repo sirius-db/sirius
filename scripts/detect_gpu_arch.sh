@@ -68,9 +68,34 @@ detect_gpu_arch() {
     fi
   fi
 
-  # 5. Fallback: gfx942 (MI300, the primary target — safe default for
-  # build-only boxes without a GPU, since the binaries won't run anyway)
-  echo "gfx942"
+  # 5. No GPU detected — ask the user instead of silently defaulting to gfx942.
+  # Falling back to gfx942 on a non-MI300 box produces wrong-fatbinaries that
+  # fail at runtime with confusing errors. Prompting forces an explicit choice.
+  if [ -t 0 ]; then
+    # Interactive shell — prompt the user
+    echo "" >&2
+    echo "[detect_gpu_arch] No AMD GPU detected via rocminfo, rocm_agent_enumerator," >&2
+    echo "[detect_gpu_arch] or /sys/class/kfd. This may be a build-only container." >&2
+    echo "" >&2
+    echo "  Common AMD GPU architectures:" >&2
+    echo "    gfx942  — MI300X / MI300A (Instinct)" >&2
+    echo "    gfx90a  — MI250X / MI250 (Instinct)" >&2
+    echo "    gfx908  — MI100 (Instinct)" >&2
+    echo "    gfx1100 — RX 7900 XT/XTX (RDNA3 consumer)" >&2
+    echo "    gfx1030 — RX 6800/6900 (RDNA2 consumer)" >&2
+    echo "" >&2
+    read -p "[detect_gpu_arch] Enter GPU architecture (or press Enter for gfx942): " user_arch >&2
+    if [ -n "$user_arch" ]; then
+      echo "$user_arch"
+    else
+      echo "gfx942"
+    fi
+  else
+    # Non-interactive (piped, CI, etc.) — can't prompt, default to gfx942
+    echo "[detect_gpu_arch] WARNING: No GPU detected and stdin is not a TTY." >&2
+    echo "[detect_gpu_arch] Defaulting to gfx942 (MI300). Override with GPU_ARCH=<arch>" >&2
+    echo "gfx942"
+  fi
 }
 
 # If sourced, set the variables. If executed directly, just print the arch.
@@ -82,5 +107,5 @@ else
   GPU_ARCH=$(detect_gpu_arch)
   export ROCM_AMDGPU_TARGETS="$GPU_ARCH"
   export GPU_TARGETS="$GPU_ARCH"
-  echo "[detect_gpu_arch] Detected GPU architecture: $GPU_ARCH"
+  echo "[detect_gpu_arch] GPU architecture: $GPU_ARCH"
 fi
