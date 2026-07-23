@@ -16,18 +16,21 @@
 
 #include "planner/sirius_plan_compressed_schema.hpp"
 
+#include "duckdb/common/assert.hpp"
 #include "duckdb/common/exception.hpp"
 #include "expression/ast/node.hpp"
 #include "expression/ast/utils.hpp"
 #include "op/sirius_dynamic_filter.hpp"
 #include "op/sirius_physical_delim_join.hpp"
 #include "op/sirius_physical_filter.hpp"
+#include "op/sirius_physical_grouped_aggregate.hpp"
 #include "op/sirius_physical_hash_join.hpp"
 #include "op/sirius_physical_projection.hpp"
 #include "op/sirius_physical_table_scan.hpp"
 
 #include <cudf/cudf_utils.hpp>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -223,14 +226,34 @@ void propagate_compressed_schema(duckdb::unique_ptr<sirius::op::sirius_physical_
 
   switch (slot->type) {
     case sirius::op::SiriusPhysicalOperatorType::TABLE_SCAN: {
-      // The scan planner installed the statistics-derived physical schema.
-      // A dynamic-filter wrapper runs before any join-input restore projection and its published
-      // literals use the producer's native key type. Mark the scan native before parents derive
-      // their physical schemas, keeping the plan sidecar consistent with make_gpu_scan_leaf.
+      // The scan planner installed the residency-gated physical schema. A dynamic-filter producer
+      // publishes literals in the key's native carrier and the filter runs before any join-input
+      // restore projection, so every planned target column advertises native output here; unrelated
+      // payload columns keep their carriers. A producer that declared no targets is conservative by
+      // construction: every column is a potential target, so the whole sidecar goes native.
       auto& scan = slot->Cast<sirius::op::sirius_physical_table_scan>();
-      if (scan.sirius_dynamic_filters && scan.sirius_dynamic_filters->has_producers()) {
+      if (!scan.sirius_dynamic_filters || !scan.sirius_dynamic_filters->has_producers()) { return; }
+      if (!slot->has_physical_overrides()) { return; }
+      if (scan.sirius_dynamic_filters->has_unscoped_producer()) {
         slot->set_physical_types({});
+        return;
       }
+      // Translate each planned target column (column_ids space) to its scan output position:
+      // output i reads column_ids position `projection_ids.empty() ? i : projection_ids[i]`, the
+      // same convention scan_physical_schema uses. A planned target with no output position marks
+      // nothing (such a filter is rejected by the consumer remap at publish time).
+      auto const targets = scan.sirius_dynamic_filters->planned_target_columns();
+      auto const native  = native_physical_schema(*slot);
+      auto physical      = slot->get_physical_types();
+      for (std::size_t output_idx = 0; output_idx < physical.size(); ++output_idx) {
+        if (!scan.projection_ids.empty() && output_idx >= scan.projection_ids.size()) { continue; }
+        auto const ids_position =
+          scan.projection_ids.empty() ? output_idx : scan.projection_ids[output_idx];
+        if (std::ranges::find(targets, ids_position) != targets.end()) {
+          physical[output_idx] = native[output_idx];
+        }
+      }
+      install_physical_schema(*slot, std::move(physical));
       return;
     }
 
@@ -333,8 +356,96 @@ void propagate_compressed_schema(duckdb::unique_ptr<sirius::op::sirius_physical_
       return;
     }
 
+    case sirius::op::SiriusPhysicalOperatorType::HASH_GROUP_BY: {
+      // Bare-reference group keys may stay narrow: cudf::groupby receives them as raw views and
+      // grouping is pure equality, which narrowing preserves (same values, family, and decimal
+      // scale). Aggregate inputs must be native — the aggregation kernels accumulate at the input
+      // width, so a narrow carrier could overflow where the native type would not. Any shape the
+      // simplified key extraction does not cover (multiple grouping sets, grouping functions, an
+      // AVG/count-distinct partial layout wider than the declared output) falls through to the
+      // native boundary below.
+      if (slot->children.size() != 1) { break; }
+      auto& aggregate = slot->Cast<sirius::op::sirius_physical_grouped_aggregate>();
+      if (aggregate.grouping_sets.size() > 1) { break; }
+      // AVG decomposes into SUM + COUNT_VALID partial columns and COUNT(DISTINCT) keeps a LIST
+      // partial column, so the partial batch layout deviates from the declared `types` shape a
+      // sidecar describes; those shapes keep the native boundary.
+      if (aggregate.has_avg || aggregate.has_count_distinct) { break; }
+      // Grouping functions append output columns the operator does not compute through group_idx /
+      // aggregate_slots; the arity check rejects that shape along with any other layout drift.
+      if (slot->types.size() != aggregate.group_idx.size() + aggregate.aggregate_slots.size()) {
+        break;
+      }
+      auto const child_width = slot->children[0]->types.size();
+      bool consistent        = true;
+      for (auto const key_idx : aggregate.group_idx) {
+        if (key_idx < 0 || static_cast<std::size_t>(key_idx) >= child_width) {
+          consistent = false;
+          break;
+        }
+      }
+      if (!consistent) { break; }
+
+      // Every child column referenced as an aggregate input must be native. COUNT_ALL carries a
+      // placeholder input index and reads no values, so it constrains nothing.
+      std::unordered_set<std::size_t> aggregate_inputs;
+      for (std::size_t i = 0; i < aggregate.cudf_aggregates.size(); ++i) {
+        if (aggregate.cudf_aggregates[i] == cudf::aggregation::Kind::COUNT_ALL) { continue; }
+        if (i < aggregate.cudf_aggregate_struct_col_indices.size() &&
+            !aggregate.cudf_aggregate_struct_col_indices[i].empty()) {
+          for (auto const struct_idx : aggregate.cudf_aggregate_struct_col_indices[i]) {
+            if (struct_idx >= 0) { aggregate_inputs.insert(static_cast<std::size_t>(struct_idx)); }
+          }
+          continue;
+        }
+        if (i < aggregate.cudf_aggregate_idx.size() && aggregate.cudf_aggregate_idx[i] >= 0) {
+          aggregate_inputs.insert(static_cast<std::size_t>(aggregate.cudf_aggregate_idx[i]));
+        }
+      }
+
+      std::unordered_set<std::size_t> eligible_keys;
+      for (auto const key_idx : aggregate.group_idx) {
+        auto const key = static_cast<std::size_t>(key_idx);
+        if (!aggregate_inputs.contains(key)) { eligible_keys.insert(key); }
+      }
+
+      std::unordered_set<std::size_t> columns_to_restore;
+      for (std::size_t column_idx = 0; column_idx < child_width; ++column_idx) {
+        if (!eligible_keys.contains(column_idx)) { columns_to_restore.insert(column_idx); }
+      }
+      restore_native_columns(slot->children[0], columns_to_restore);
+
+      // Output prefix 0..group_idx.size()-1 holds the keys (get_output_grouping_indices is the
+      // iota over it) and mirrors the child key carriers; aggregate outputs are cast to their
+      // declared return types by the aggregation implementation and stay native. No restore is
+      // inserted above: downstream boundaries widen the keys on the small grouped output.
+      auto const child_schema = output_physical_schema(*slot->children[0]);
+      auto schema             = native_physical_schema(*slot);
+      for (std::size_t key_pos = 0; key_pos < aggregate.group_idx.size(); ++key_pos) {
+        if (key_pos >= schema.size()) { break; }
+        auto const child_idx = static_cast<std::size_t>(aggregate.group_idx[key_pos]);
+        if (child_idx < child_schema.size()) { schema[key_pos] = child_schema[child_idx]; }
+      }
+      install_physical_schema(*slot, std::move(schema));
+      return;
+    }
+
     default: break;
   }
+
+  // Pipeline wrapper operators (PARTITION, CONCAT, MERGE_*, SORT_PARTITION, SORT_SAMPLE,
+  // GPU_SCAN, DYNAMIC_FILTER) are inserted by insert_gpu_pipeline_operators after these passes
+  // run; their carrier contracts are established at wrap time from the finished sidecars.
+  D_ASSERT(slot->type != sirius::op::SiriusPhysicalOperatorType::PARTITION &&
+           slot->type != sirius::op::SiriusPhysicalOperatorType::CONCAT &&
+           slot->type != sirius::op::SiriusPhysicalOperatorType::MERGE_SORT &&
+           slot->type != sirius::op::SiriusPhysicalOperatorType::MERGE_GROUP_BY &&
+           slot->type != sirius::op::SiriusPhysicalOperatorType::MERGE_TOP_N &&
+           slot->type != sirius::op::SiriusPhysicalOperatorType::MERGE_AGGREGATE &&
+           slot->type != sirius::op::SiriusPhysicalOperatorType::SORT_PARTITION &&
+           slot->type != sirius::op::SiriusPhysicalOperatorType::SORT_SAMPLE &&
+           slot->type != sirius::op::SiriusPhysicalOperatorType::GPU_SCAN &&
+           slot->type != sirius::op::SiriusPhysicalOperatorType::DYNAMIC_FILTER);
 
   // Joins, aggregates, ordering, and all other operators retain their existing native-type
   // contracts. Restore any narrowed child immediately before crossing that boundary.

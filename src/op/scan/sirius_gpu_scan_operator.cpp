@@ -262,8 +262,19 @@ std::size_t sirius_gpu_scan_operator::no_history_peak_memory_estimate(
     // stored columns are physically narrow (including pin-on/query-off), or this scan has an
     // explicit plan sidecar that narrows a native cached carrier. The destination coexists with
     // the resident input/filter working set at peak.
-    if (stats.contains_narrowed_columns || has_physical_overrides()) {
+    if (stats.contains_narrowed_columns) {
+      // The serve site computed the exact per-column native-width destination when it could;
+      // native width upper-bounds a serve to a narrower plan target. A zero means the
+      // destination is unknown, so the maximum-expansion bound stays.
+      if (stats.restore_destination_bytes > 0) {
+        return saturating_add(stats.working_set_bytes, stats.restore_destination_bytes);
+      }
       return saturating_add(stats.working_set_bytes, expanded_bytes);
+    }
+    if (has_physical_overrides()) {
+      // A native cached carrier converting to a narrow plan target: the destination is at most
+      // as large as the stored source.
+      return saturating_add(stats.working_set_bytes, stats.bytes);
     }
     return std::max(stats.bytes, stats.working_set_bytes);
   }

@@ -563,7 +563,15 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
           for (auto const& pi : op.filter_pushdown->probe_info) {
             auto channel = get_or_create_dynamic_filter_channel(pi.dynamic_filters.get());
             if (!channel) { continue; }
-            channel->register_producer();
+            // Declare this producer's planned target columns: the same probe_column_index values
+            // that become the publish plan's probe_col_idx below, so the planned set is exhaustive
+            // for every push_filter this producer can ever issue.
+            std::vector<std::size_t> planned_columns;
+            planned_columns.reserve(pi.columns.size());
+            for (auto const& col : pi.columns) {
+              planned_columns.push_back(col.probe_column_index.column_index);
+            }
+            channel->register_producer(std::move(planned_columns));
             sirius::op::dynamic_filter_publish_plan::probe_target target{std::move(channel), {}};
             target.probe_col_idx.reserve(pi.columns.size());
             target.probe_col_type.reserve(pi.columns.size());

@@ -369,6 +369,11 @@ struct input_stats {
   std::size_t working_set_bytes = 0;
   /// Whether a resident scan input has a selected physically narrow column.
   bool contains_narrowed_columns = false;
+  /// Exact bytes of the native-width destinations that restoring the resident
+  /// input's narrowed columns would allocate (see
+  /// scan_operator_input::restore_destination_bytes). Zero means unknown; the
+  /// scan estimate then keeps its conservative maximum-expansion bound.
+  std::size_t restore_destination_bytes = 0;
 };
 
 //! sirius_physical_operator is the base class of the physical operators present in the

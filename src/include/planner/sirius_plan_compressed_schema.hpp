@@ -41,10 +41,20 @@ namespace sirius::planner {
  *
  * FILTER, PROJECTION, LIMIT, and HASH_JOIN forward child carriers through their output-column maps;
  * a HASH_JOIN first restores its key columns to native on both inputs. A TABLE_SCAN keeps the
- * sidecar installed by `sirius_plan_get` unless it is wired to runtime dynamic-filter producers, in
- * which case it is marked native. Every other operator type restores all of its children to native
- * and clears its own sidecar; the `join` and `distinct_root` sub-trees of a DELIM_JOIN are likewise
- * forced native.
+ * sidecar installed by `sirius_plan_get`; when the scan is wired to runtime dynamic-filter
+ * producers, each producer's planned target columns are forced native in that sidecar (published
+ * filter literals use the native key carrier) while unrelated payload columns keep their carriers,
+ * and a producer that declared no targets forces the whole sidecar native. HASH_GROUP_BY keeps
+ * bare-reference group keys narrow through the aggregation (grouping is equality-only) while
+ * restoring aggregate-input columns on its child; shapes outside its preconditions (multiple
+ * grouping sets, grouping functions, AVG or COUNT(DISTINCT) partial layouts) fall through to the
+ * native boundary. Every other operator type restores all of its children to native and clears its
+ * own sidecar; the `join` and `distinct_root` sub-trees of a DELIM_JOIN are likewise forced native.
+ *
+ * This pass runs on the pre-wrap tree only: pipeline wrapper operators (PARTITION, CONCAT,
+ * MERGE_*, SORT_PARTITION, SORT_SAMPLE, GPU_SCAN, DYNAMIC_FILTER) are inserted afterwards by
+ * `sirius_physical_plan_generator::insert_gpu_pipeline_operators`, which copies the finished
+ * sidecars onto the wrappers.
  */
 void propagate_compressed_schema(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot);
 

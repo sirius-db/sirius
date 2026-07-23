@@ -25,6 +25,8 @@
  *        aliased-duplicate guard), and the unmappable-type full clear.
  */
 
+#include "expression/aggregate_id.hpp"
+#include "expression/ast/aggregate.hpp"
 #include "expression/ast/cast.hpp"
 #include "expression/ast/constant.hpp"
 #include "expression/ast/node.hpp"
@@ -35,6 +37,7 @@
 #include "op/sirius_dynamic_filter.hpp"
 #include "op/sirius_physical_delim_join.hpp"
 #include "op/sirius_physical_filter.hpp"
+#include "op/sirius_physical_grouped_aggregate.hpp"
 #include "op/sirius_physical_hash_join.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_projection.hpp"
@@ -47,6 +50,7 @@
 #include <catch.hpp>
 #include <duckdb/planner/operator/logical_dummy_scan.hpp>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -62,6 +66,7 @@ namespace {
 constexpr cudf::data_type k_int8{cudf::type_id::INT8};
 constexpr cudf::data_type k_int16{cudf::type_id::INT16};
 constexpr cudf::data_type k_int32{cudf::type_id::INT32};
+constexpr cudf::data_type k_int64{cudf::type_id::INT64};
 constexpr cudf::data_type k_bool8{cudf::type_id::BOOL8};
 
 sirius::logical_type integer_type() { return sirius::logical_type::make(sirius::type_id::INTEGER); }
@@ -92,16 +97,28 @@ std::unique_ptr<sirius::ast::node> make_restore_cast(uint32_t column_index)
 }
 
 /// A TABLE_SCAN leaf over INTEGER columns with @p physical installed as its sidecar (one entry
-/// per column, or empty for native).
+/// per column, or empty for native). @p projection_ids overrides the identity output mapping:
+/// output i then reads column_ids position projection_ids[i], and column_ids covers enough
+/// positions for the largest one.
 duckdb::unique_ptr<sirius::op::sirius_physical_table_scan> make_scan(
-  std::size_t column_count, std::vector<cudf::data_type> physical = {})
+  std::size_t column_count,
+  std::vector<cudf::data_type> physical      = {},
+  duckdb::vector<std::size_t> projection_ids = {})
 {
+  if (projection_ids.empty()) {
+    for (std::size_t i = 0; i < column_count; i++) {
+      projection_ids.push_back(i);
+    }
+  }
+  REQUIRE(projection_ids.size() == column_count);
+  std::size_t ids_count = 0;
+  for (auto const ids_position : projection_ids) {
+    ids_count = std::max(ids_count, ids_position + 1);
+  }
   duckdb::vector<duckdb::ColumnIndex> column_ids;
-  duckdb::vector<std::size_t> projection_ids;
   duckdb::vector<std::string> names;
-  for (std::size_t i = 0; i < column_count; i++) {
+  for (std::size_t i = 0; i < ids_count; i++) {
     column_ids.emplace_back(i);
-    projection_ids.push_back(i);
     names.push_back("c" + std::to_string(i));
   }
   duckdb::TableFunction function("test_scan", {}, nullptr, nullptr);
@@ -109,7 +126,7 @@ duckdb::unique_ptr<sirius::op::sirius_physical_table_scan> make_scan(
     integer_types(column_count),
     std::move(function),
     /*bind_data=*/nullptr,
-    integer_types(column_count),
+    integer_types(ids_count),
     std::move(column_ids),
     std::move(projection_ids),
     std::move(names),
@@ -167,6 +184,50 @@ duckdb::vector<duckdb::LogicalType> duckdb_integer_types(std::size_t count)
     types.push_back(duckdb::LogicalType::INTEGER);
   }
   return types;
+}
+
+/// A SUM aggregate expression over child column @p input_idx with a BIGINT return type.
+std::unique_ptr<sirius::ast::node> make_sum_aggregate(uint32_t input_idx)
+{
+  std::vector<std::unique_ptr<sirius::ast::node>> arguments;
+  arguments.push_back(make_reference(input_idx));
+  return std::make_unique<sirius::ast::node>(
+    sirius::ast::aggregate{sirius::aggregate_id::sum,
+                           std::move(arguments),
+                           sirius::logical_type::make(sirius::type_id::BIGINT),
+                           /*distinct=*/false});
+}
+
+/// A HASH_GROUP_BY over @p child grouping on @p group_columns with one SUM per entry of
+/// @p sum_input_columns; output layout is [keys..., sums...] with INTEGER keys and BIGINT sums.
+duckdb::unique_ptr<sirius::op::sirius_physical_grouped_aggregate> make_grouped_aggregate(
+  std::vector<uint32_t> group_columns,
+  std::vector<uint32_t> sum_input_columns,
+  duckdb::unique_ptr<sirius_physical_operator> child,
+  duckdb::vector<duckdb::GroupingSet> grouping_sets = {})
+{
+  duckdb::vector<sirius::logical_type> output_types;
+  duckdb::vector<std::unique_ptr<sirius::ast::node>> groups;
+  for (auto const group_idx : group_columns) {
+    output_types.push_back(integer_type());
+    groups.push_back(make_reference(group_idx));
+  }
+  duckdb::vector<std::unique_ptr<sirius::ast::node>> expressions;
+  for (auto const input_idx : sum_input_columns) {
+    output_types.push_back(sirius::logical_type::make(sirius::type_id::BIGINT));
+    expressions.push_back(make_sum_aggregate(input_idx));
+  }
+  auto aggregate = duckdb::make_uniq<sirius::op::sirius_physical_grouped_aggregate>(
+    std::move(output_types),
+    std::move(expressions),
+    std::move(groups),
+    std::move(grouping_sets),
+    duckdb::vector<duckdb::unsafe_vector<std::size_t>>{},
+    /*estimated_cardinality=*/1,
+    duckdb::TupleDataValidityType::CAN_HAVE_NULL_VALUES,
+    duckdb::TupleDataValidityType::CAN_HAVE_NULL_VALUES);
+  aggregate->children.push_back(std::move(child));
+  return aggregate;
 }
 
 /// Assert @p slot is a restore projection over the key column: a cast at output 0, bare
@@ -263,13 +324,39 @@ TEST_CASE("compressed_schema_propagation - hash join restores keys and maps payl
     require_key_restore_projection(*plan->children[1], restored_right);
     REQUIRE(plan->get_physical_types() == std::vector<cudf::data_type>{k_int32, k_int16});
   }
+
+  SECTION("a dynamic-filter-target key needs no restore projection")
+  {
+    // The dynamic-filter guard already forced the probe key native at the scan, so the join's key
+    // restore finds nothing to cast there and inserts no projection; the probe payload maps
+    // through narrow.
+    auto probe                    = make_scan(2, {k_int8, k_int8});
+    probe->sirius_dynamic_filters = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
+    probe->sirius_dynamic_filters->register_producer({0});
+    duckdb::unique_ptr<sirius_physical_operator> plan =
+      make_hash_join(duckdb::JoinType::INNER,
+                     std::move(probe),
+                     make_scan(2, {k_int8, k_int16}),
+                     duckdb_integer_types(4));
+
+    sirius::planner::propagate_compressed_schema(plan);
+
+    REQUIRE(plan->children[0]->type == SiriusPhysicalOperatorType::TABLE_SCAN);
+    REQUIRE(plan->children[0]->get_physical_types() ==
+            std::vector<cudf::data_type>{k_int32, k_int8});
+    require_key_restore_projection(*plan->children[1], restored_right);
+    REQUIRE(plan->get_physical_types() ==
+            std::vector<cudf::data_type>{k_int32, k_int8, k_int32, k_int16});
+  }
 }
 
 TEST_CASE("compressed_schema_propagation - native boundaries restore children fully",
           "[compressed_schema_propagation]")
 {
+  // HASH_GROUP_BY is absent here: it has a dedicated propagation case (narrow group keys) whose
+  // fallback-to-native shapes are covered by the grouped-aggregation test below with the real
+  // operator class.
   auto const boundary_type = GENERATE(SiriusPhysicalOperatorType::NESTED_LOOP_JOIN,
-                                      SiriusPhysicalOperatorType::HASH_GROUP_BY,
                                       SiriusPhysicalOperatorType::ORDER_BY,
                                       SiriusPhysicalOperatorType::TOP_N);
 
@@ -290,14 +377,107 @@ TEST_CASE("compressed_schema_propagation - native boundaries restore children fu
   REQUIRE(restored.children[0]->type == SiriusPhysicalOperatorType::TABLE_SCAN);
 }
 
-TEST_CASE("compressed_schema_propagation - dynamic-filter scan sidecar is cleared",
+TEST_CASE("compressed_schema_propagation - grouped aggregation keeps narrow group keys",
           "[compressed_schema_propagation]")
 {
-  SECTION("a scan with wired producers is marked native")
+  SECTION("group keys stay narrow, aggregate inputs are restored")
+  {
+    duckdb::unique_ptr<sirius_physical_operator> plan =
+      make_grouped_aggregate({0}, {1}, make_scan(2, {k_int8, k_int8}));
+
+    sirius::planner::propagate_compressed_schema(plan);
+
+    // The child restore casts only the SUM input (column 1); the key keeps a bare reference.
+    auto const& restored = *plan->children[0];
+    REQUIRE(restored.type == SiriusPhysicalOperatorType::PROJECTION);
+    auto const& projection = restored.Cast<sirius::op::sirius_physical_projection>();
+    REQUIRE(projection.select_list[0]->holds<sirius::ast::reference>());
+    REQUIRE(projection.select_list[1]->holds<sirius::ast::cast>());
+    REQUIRE(restored.get_physical_types() == std::vector<cudf::data_type>{k_int8, k_int32});
+    // The aggregate output keeps the narrow key carrier; the SUM output is native.
+    REQUIRE(plan->get_physical_types() == std::vector<cudf::data_type>{k_int8, k_int64});
+  }
+
+  SECTION("a column that is both key and aggregate input goes native")
+  {
+    duckdb::unique_ptr<sirius_physical_operator> plan =
+      make_grouped_aggregate({0}, {0}, make_scan(1, {k_int8}));
+
+    sirius::planner::propagate_compressed_schema(plan);
+
+    auto const& restored = *plan->children[0];
+    REQUIRE(restored.type == SiriusPhysicalOperatorType::PROJECTION);
+    REQUIRE(restored.Cast<sirius::op::sirius_physical_projection>()
+              .select_list[0]
+              ->holds<sirius::ast::cast>());
+    REQUIRE(!restored.has_physical_overrides());
+    REQUIRE(!plan->has_physical_overrides());
+  }
+
+  SECTION("grouping sets or grouping functions fall back to the native boundary")
+  {
+    duckdb::vector<duckdb::GroupingSet> grouping_sets;
+    grouping_sets.push_back(duckdb::GroupingSet{0});
+    grouping_sets.push_back(duckdb::GroupingSet{});
+    duckdb::unique_ptr<sirius_physical_operator> plan =
+      make_grouped_aggregate({0}, {1}, make_scan(2, {k_int8, k_int8}), std::move(grouping_sets));
+
+    sirius::planner::propagate_compressed_schema(plan);
+
+    auto const& restored = *plan->children[0];
+    REQUIRE(restored.type == SiriusPhysicalOperatorType::PROJECTION);
+    auto const& projection = restored.Cast<sirius::op::sirius_physical_projection>();
+    REQUIRE(projection.select_list[0]->holds<sirius::ast::cast>());
+    REQUIRE(projection.select_list[1]->holds<sirius::ast::cast>());
+    REQUIRE(!restored.has_physical_overrides());
+    REQUIRE(!plan->has_physical_overrides());
+  }
+
+  SECTION("native group keys leave no sidecar")
+  {
+    duckdb::unique_ptr<sirius_physical_operator> plan =
+      make_grouped_aggregate({0}, {1}, make_scan(2));
+
+    sirius::planner::propagate_compressed_schema(plan);
+
+    REQUIRE(plan->children[0]->type == SiriusPhysicalOperatorType::TABLE_SCAN);
+    REQUIRE(!plan->children[0]->has_physical_overrides());
+    REQUIRE(!plan->has_physical_overrides());
+  }
+}
+
+TEST_CASE("compressed_schema_propagation - dynamic-filter targets clear only their columns",
+          "[compressed_schema_propagation]")
+{
+  SECTION("a scoped producer marks only target columns native")
   {
     auto scan                    = make_scan(2, {k_int8, k_int8});
     scan->sirius_dynamic_filters = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
-    scan->sirius_dynamic_filters->register_producer();
+    scan->sirius_dynamic_filters->register_producer({0});
+    duckdb::unique_ptr<sirius_physical_operator> plan = std::move(scan);
+
+    sirius::planner::propagate_compressed_schema(plan);
+
+    REQUIRE(plan->get_physical_types() == std::vector<cudf::data_type>{k_int32, k_int8});
+  }
+
+  SECTION("targets covering every narrow column drop the sidecar")
+  {
+    auto scan                    = make_scan(2, {k_int8, k_int8});
+    scan->sirius_dynamic_filters = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
+    scan->sirius_dynamic_filters->register_producer({0, 1});
+    duckdb::unique_ptr<sirius_physical_operator> plan = std::move(scan);
+
+    sirius::planner::propagate_compressed_schema(plan);
+
+    REQUIRE(!plan->has_physical_overrides());
+  }
+
+  SECTION("an unscoped producer clears the whole sidecar")
+  {
+    auto scan                    = make_scan(2, {k_int8, k_int8});
+    scan->sirius_dynamic_filters = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
+    scan->sirius_dynamic_filters->register_producer({});
     duckdb::unique_ptr<sirius_physical_operator> plan = std::move(scan);
 
     sirius::planner::propagate_compressed_schema(plan);
@@ -314,6 +494,21 @@ TEST_CASE("compressed_schema_propagation - dynamic-filter scan sidecar is cleare
     sirius::planner::propagate_compressed_schema(plan);
 
     REQUIRE(plan->get_physical_types() == std::vector<cudf::data_type>{k_int8, k_int8});
+  }
+
+  SECTION("projection_ids indirection maps targets to output positions")
+  {
+    // Output 0 reads column_ids position 2 and output 1 reads position 0; the target is given in
+    // column_ids space, so targeting position 2 must flip OUTPUT 0 native and leave output 1
+    // narrow.
+    auto scan = make_scan(2, {k_int8, k_int8}, duckdb::vector<std::size_t>{2, 0});
+    scan->sirius_dynamic_filters = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
+    scan->sirius_dynamic_filters->register_producer({2});
+    duckdb::unique_ptr<sirius_physical_operator> plan = std::move(scan);
+
+    sirius::planner::propagate_compressed_schema(plan);
+
+    REQUIRE(plan->get_physical_types() == std::vector<cudf::data_type>{k_int32, k_int8});
   }
 }
 

@@ -217,12 +217,20 @@ TEST_CASE("GPU scan resident estimate follows actual carrier conversion",
   CHECK(native_scan.no_history_peak_memory_estimate(
           {1, 800, operator_data_type::GPU_SCAN, true, 700}) == 800);
 
-  // Pin-on/query-off has no plan sidecar, but the cache marker still requires
-  // native restoration: resident working set + maximum-width destination.
+  // Pin-on/query-off has no plan sidecar, but the cache marker still requires native
+  // restoration. A missing serve-time destination (restore_destination_bytes == 0) keeps the
+  // conservative bound: resident working set + maximum-width destination.
   CHECK(native_scan.no_history_peak_memory_estimate(
           {1, 100, operator_data_type::GPU_SCAN, true, 100, true}) == 900);
   CHECK(native_scan.no_history_peak_memory_estimate(
           {1, 100, operator_data_type::GPU_SCAN, true, 700, true}) == 1500);
+
+  // The serve site computed the exact per-column destination: the reservation becomes working
+  // set + that destination, independent of the 8x bound.
+  CHECK(native_scan.no_history_peak_memory_estimate(
+          {1, 100, operator_data_type::GPU_SCAN, true, 100, true, 250}) == 350);
+  CHECK(native_scan.no_history_peak_memory_estimate(
+          {1, 100, operator_data_type::GPU_SCAN, true, 700, true, 800}) == 1500);
 
   scan::sirius_gpu_scan_operator sidecar_scan{
     sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::BIGINT}),
@@ -230,10 +238,11 @@ TEST_CASE("GPU scan resident estimate follows actual carrier conversion",
     /*ingestible=*/{}};
   sidecar_scan.set_physical_types({cudf::data_type{cudf::type_id::INT8}});
 
-  // A native cached carrier must be narrowed to the explicit plan sidecar even
-  // when the cache marker is false. Fresh reads retain the legacy estimate too.
+  // A native cached carrier converting to a narrow plan sidecar (no narrowed marker): the
+  // destination is bounded by the stored source, so working set + source bytes. Fresh reads
+  // retain the legacy maximum-width estimate.
   CHECK(sidecar_scan.no_history_peak_memory_estimate(
-          {1, 100, operator_data_type::GPU_SCAN, true, 100}) == 900);
+          {1, 100, operator_data_type::GPU_SCAN, true, 100}) == 200);
   CHECK(sidecar_scan.no_history_peak_memory_estimate(
           {1, 100, operator_data_type::GPU_SCAN, false, 700}) == 1400);
 }
@@ -253,4 +262,6 @@ TEST_CASE("GPU scan no-history estimates saturate instead of wrapping",
           {1, multiplication_overflow, operator_data_type::GPU_SCAN, true, 1, true}) == max);
   CHECK(scan.no_history_peak_memory_estimate(
           {1, 1, operator_data_type::GPU_SCAN, true, max, true}) == max);
+  CHECK(scan.no_history_peak_memory_estimate(
+          {1, 1, operator_data_type::GPU_SCAN, true, max, true, max}) == max);
 }

@@ -37,6 +37,7 @@
 
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
+#include <cudf/null_mask.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
 
@@ -121,6 +122,34 @@ std::shared_ptr<cudf::column> make_gpu_column(cucascade::memory::memory_space& s
              sizeof(int32_t) * values.size(),
              cudaMemcpyHostToDevice);
   return std::shared_ptr<cudf::column>(std::move(col));
+}
+
+/// Zero-initialized numeric GPU column of an arbitrary carrier type — the serve-site
+/// restore-destination computation reads only types, row counts, and mask presence.
+std::shared_ptr<cudf::column> make_typed_gpu_column(cucascade::memory::memory_space& space,
+                                                    cudf::data_type type,
+                                                    std::size_t rows,
+                                                    cudf::mask_state mask_state)
+{
+  auto mr     = sirius::test::operator_utils::get_resource_ref(space);
+  auto stream = sirius::test::operator_utils::default_stream();
+  auto col =
+    cudf::make_numeric_column(type, static_cast<cudf::size_type>(rows), mask_state, stream, mr);
+  return std::shared_ptr<cudf::column>(std::move(col));
+}
+
+/// Zone-map sidecar carrying pin-time types only (every stats cell null) — the shape the
+/// restore-destination computation needs from the entry.
+sirius::scan_manager::pinned_zone_maps make_type_only_zone_maps(
+  duckdb::vector<duckdb::LogicalType> types, std::size_t n_chunks)
+{
+  auto const n_columns = types.size();
+  std::vector<std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>>> stats(n_chunks);
+  for (auto& chunk : stats) {
+    chunk.resize(n_columns);
+  }
+  return sirius::scan_manager::pinned_zone_maps::from_capture(
+    std::move(types), std::move(stats), n_columns, n_chunks);
 }
 
 /// GPU-tier pinned entry with columns {k, v, w} x @p n_chunks chunks of
@@ -388,6 +417,116 @@ TEST_CASE("cached provider marks only selected narrow columns", "[cached_serving
       REQUIRE(batch.data);
       REQUIRE_FALSE(batch.contains_narrowed_columns);
     }
+  }
+}
+
+TEST_CASE("cached provider computes exact restore-destination bytes per chunk",
+          "[cached_serving][scan_manager]")
+{
+  auto& e = env();
+  constexpr std::size_t rows{100};
+
+  // Columns {k: INT8-stored BIGINT, v: INT32-stored BIGINT, w: native INT32}, one chunk;
+  // k and v are marked narrowed, w is native.
+  auto make_mixed_entry = [&](cudf::mask_state k_mask_state) {
+    pinned_entry entry;
+    entry.cache_info.names = {"k", "v", "w"};
+    entry.tier             = cucascade::memory::Tier::GPU;
+    entry.memory_space     = e.gpu_space;
+    entry.chunk_memory_spaces.push_back(e.gpu_space);
+    entry.data_batches_by_column["k"].push_back(make_typed_gpu_column(
+      *e.gpu_space, cudf::data_type{cudf::type_id::INT8}, rows, k_mask_state));
+    entry.data_batches_by_column["v"].push_back(make_typed_gpu_column(
+      *e.gpu_space, cudf::data_type{cudf::type_id::INT32}, rows, cudf::mask_state::UNALLOCATED));
+    entry.data_batches_by_column["w"].push_back(make_typed_gpu_column(
+      *e.gpu_space, cudf::data_type{cudf::type_id::INT32}, rows, cudf::mask_state::UNALLOCATED));
+    entry.narrowed_columns = {{true, true, false}};
+    entry.num_rows         = rows;
+    entry.zone_maps        = make_type_only_zone_maps(
+      {duckdb::LogicalType::BIGINT, duckdb::LogicalType::BIGINT, duckdb::LogicalType::INTEGER},
+      /*n_chunks=*/1);
+    return entry;
+  };
+
+  SECTION("per-column exact destination for INT8->INT64 / INT32->INT64 mixed batches")
+  {
+    auto entry = make_mixed_entry(cudf::mask_state::UNALLOCATED);
+    std::vector<std::size_t> selected{0, 1, 2};
+    sirius::scan_manager::cached_scan_plan plan{.survivor_chunk_indices = {0}};
+    auto provider = sirius::scan_manager::make_provider_for_pinned_entry(
+      entry, selected, std::move(plan), sirius::telemetry::batch_telemetry_info{});
+
+    auto batch = provider->get_next_batch();
+    REQUIRE(batch.data);
+    REQUIRE(batch.contains_narrowed_columns);
+    // Both narrowed columns restore to INT64: 2 x rows x 8 bytes; native w contributes nothing.
+    REQUIRE(batch.restore_destination_bytes == 2 * rows * sizeof(std::int64_t));
+  }
+
+  SECTION("a stored validity mask adds the destination mask bytes")
+  {
+    auto entry = make_mixed_entry(cudf::mask_state::ALL_VALID);
+    std::vector<std::size_t> selected{0};
+    sirius::scan_manager::cached_scan_plan plan{.survivor_chunk_indices = {0}};
+    auto provider = sirius::scan_manager::make_provider_for_pinned_entry(
+      entry, selected, std::move(plan), sirius::telemetry::batch_telemetry_info{});
+
+    auto batch = provider->get_next_batch();
+    REQUIRE(batch.data);
+    REQUIRE(batch.restore_destination_bytes ==
+            rows * sizeof(std::int64_t) +
+              cudf::bitmask_allocation_size_bytes(static_cast<cudf::size_type>(rows)));
+  }
+
+  SECTION("non-converting selections report zero destination bytes")
+  {
+    auto entry = make_mixed_entry(cudf::mask_state::UNALLOCATED);
+    std::vector<std::size_t> selected{2};
+    sirius::scan_manager::cached_scan_plan plan{.survivor_chunk_indices = {0}};
+    auto provider = sirius::scan_manager::make_provider_for_pinned_entry(
+      entry, selected, std::move(plan), sirius::telemetry::batch_telemetry_info{});
+
+    auto batch = provider->get_next_batch();
+    REQUIRE(batch.data);
+    REQUIRE_FALSE(batch.contains_narrowed_columns);
+    REQUIRE(batch.restore_destination_bytes == 0);
+  }
+
+  SECTION("missing pin-time types leave the destination unknown")
+  {
+    auto entry      = make_mixed_entry(cudf::mask_state::UNALLOCATED);
+    entry.zone_maps = {};  // statless pin: no type sidecar to derive destinations from
+    std::vector<std::size_t> selected{0, 1, 2};
+    sirius::scan_manager::cached_scan_plan plan{.survivor_chunk_indices = {0}};
+    auto provider = sirius::scan_manager::make_provider_for_pinned_entry(
+      entry, selected, std::move(plan), sirius::telemetry::batch_telemetry_info{});
+
+    auto batch = provider->get_next_batch();
+    REQUIRE(batch.data);
+    REQUIRE(batch.contains_narrowed_columns);
+    REQUIRE(batch.restore_destination_bytes == 0);  // caller keeps the conservative bound
+  }
+
+  SECTION("host-tier chunks compute from the host column metadata")
+  {
+    auto entry             = make_host_entry(e, /*n_chunks=*/2, /*rows=*/4);
+    entry.narrowed_columns = {{true, false}, {false, false}};
+    entry.zone_maps        = make_type_only_zone_maps(
+      {duckdb::LogicalType::BIGINT, duckdb::LogicalType::INTEGER}, /*n_chunks=*/2);
+    std::vector<std::size_t> selected{0, 1};
+    sirius::scan_manager::cached_scan_plan plan{.survivor_chunk_indices = {0, 1}};
+    auto provider = sirius::scan_manager::make_provider_for_pinned_entry(
+      entry, selected, std::move(plan), sirius::telemetry::batch_telemetry_info{});
+
+    auto first = provider->get_next_batch();
+    REQUIRE(first.data);
+    REQUIRE(first.contains_narrowed_columns);
+    REQUIRE(first.restore_destination_bytes == 4 * sizeof(std::int64_t));
+
+    auto second = provider->get_next_batch();
+    REQUIRE(second.data);
+    REQUIRE_FALSE(second.contains_narrowed_columns);
+    REQUIRE(second.restore_destination_bytes == 0);
   }
 }
 

@@ -284,12 +284,10 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> make_gpu_scan_leaf(
       scan.estimated_cardinality,
       std::move(ingestible),
       compressed_materialization_observer);
-  // A dynamic filter is published with the producing join key's native carrier and runs before
-  // the join-input restore projection. Until the channel exposes its target columns at plan time,
-  // keep participating scans native so filter probes and literals always have identical types.
-  if (!dynamic_filters && scan.has_physical_overrides()) {
-    leaf->set_physical_types(scan.get_physical_types());
-  }
+  // The propagation pass already forced every planned dynamic-filter target column native in the
+  // scan sidecar, so the leaf advertises the scan's actual output carriers: scan normalization
+  // reads them to decide per-chunk casts, and execution validation compares batches against them.
+  if (scan.has_physical_overrides()) { leaf->set_physical_types(scan.get_physical_types()); }
 
   if (dynamic_filters) {
     // Under a PARTITION parent this emits the [GPU_SCAN, DYNAMIC_FILTER] pipeline (filter as
@@ -300,6 +298,10 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> make_gpu_scan_leaf(
       std::move(dynamic_filters),
       op_params.dynamic_filter_keep_threshold,
       mode);
+    // The filter only drops rows of the scan output, so its column carriers are the scan's.
+    if (scan.has_physical_overrides()) {
+      dynamic_filter_op->set_physical_types(scan.get_physical_types());
+    }
     dynamic_filter_op->children.push_back(std::move(leaf));
     leaf = std::move(dynamic_filter_op);
   }
@@ -400,8 +402,12 @@ void replace_with_gpu_values(duckdb::unique_ptr<sirius::op::sirius_physical_oper
 
 //! Replace a HASH_GROUP_BY slot with `GROUPED_AGGREGATE_MERGE → PARTITION → HASH_GROUP_BY →
 //! original_input`: the original stays the per-thread sink, PARTITION buckets for the merge.
+//! The aggregate's physical sidecar (narrow group keys, native aggregate outputs) is copied onto
+//! both wrappers: PARTITION forwards the partial-aggregate batches unchanged, and the merge
+//! re-groups with raw key views so its output carriers equal the aggregate's.
 void wrap_hash_group_by(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot,
-                        const sirius::operator_params& op_params)
+                        const sirius::operator_params& op_params,
+                        duckdb::SiriusContext* compressed_materialization_observer)
 {
   wrap_above(slot, [&](duckdb::unique_ptr<sirius::op::sirius_physical_operator> hgb_op) {
     auto* hgb_ptr = hgb_op.get();
@@ -411,11 +417,18 @@ void wrap_hash_group_by(duckdb::unique_ptr<sirius::op::sirius_physical_operator>
                                                                hgb_ptr->estimated_cardinality,
                                                                /*key_source=*/hgb_ptr,
                                                                /*is_build=*/false,
-                                                               op_params.hash_partition_bytes);
+                                                               op_params.hash_partition_bytes,
+                                                               compressed_materialization_observer);
+    if (hgb_ptr->has_physical_overrides()) {
+      partition->set_physical_types(hgb_ptr->get_physical_types());
+    }
     partition->children.push_back(std::move(hgb_op));
 
     auto merge = duckdb::make_uniq<sirius::op::sirius_physical_grouped_aggregate_merge>(
       &hgb_ptr->Cast<sirius::op::sirius_physical_grouped_aggregate>());
+    if (hgb_ptr->has_physical_overrides()) {
+      merge->set_physical_types(hgb_ptr->get_physical_types());
+    }
     merge->children.push_back(std::move(partition));
     return merge;
   });
@@ -515,7 +528,8 @@ void wrap_order_by(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slo
 void wrap_join_child(sirius::op::sirius_physical_operator& join_op,
                      std::size_t child_idx,
                      bool is_build,
-                     const sirius::operator_params& op_params)
+                     const sirius::operator_params& op_params,
+                     duckdb::SiriusContext* compressed_materialization_observer)
 {
   D_ASSERT(join_op.type == sirius::op::SiriusPhysicalOperatorType::HASH_JOIN ||
            join_op.type == sirius::op::SiriusPhysicalOperatorType::NESTED_LOOP_JOIN);
@@ -534,12 +548,13 @@ void wrap_join_child(sirius::op::sirius_physical_operator& join_op,
                                                               /*downstream_join=*/join_op_ptr,
                                                               is_build,
                                                               op_params.concat_batch_bytes);
-      auto partition =
-        duckdb::make_uniq<sirius::op::sirius_physical_partition>(std::move(child_types),
-                                                                 est_card,
-                                                                 /*key_source=*/join_op_ptr,
-                                                                 is_build,
-                                                                 op_params.hash_partition_bytes);
+      auto partition = duckdb::make_uniq<sirius::op::sirius_physical_partition>(
+        std::move(child_types),
+        est_card,
+        /*key_source=*/join_op_ptr,
+        is_build,
+        op_params.hash_partition_bytes,
+        compressed_materialization_observer);
       if (!child_physical.empty()) {
         partition->set_physical_types(child_physical);
         concat->set_physical_types(std::move(child_physical));
@@ -553,13 +568,16 @@ void wrap_join_child(sirius::op::sirius_physical_operator& join_op,
 //! Wrap both children of a HASH_JOIN / NESTED_LOOP_JOIN with the CONCAT/PARTITION feeder
 //! chain: probe = children[0], build = children[1]. A missing side is skipped.
 void wrap_join(sirius::op::sirius_physical_operator& join_op,
-               const sirius::operator_params& op_params)
+               const sirius::operator_params& op_params,
+               duckdb::SiriusContext* compressed_materialization_observer)
 {
   if (join_op.children.size() >= 1) {
-    wrap_join_child(join_op, /*child_idx=*/0, /*is_build=*/false, op_params);
+    wrap_join_child(
+      join_op, /*child_idx=*/0, /*is_build=*/false, op_params, compressed_materialization_observer);
   }
   if (join_op.children.size() >= 2) {
-    wrap_join_child(join_op, /*child_idx=*/1, /*is_build=*/true, op_params);
+    wrap_join_child(
+      join_op, /*child_idx=*/1, /*is_build=*/true, op_params, compressed_materialization_observer);
   }
 }
 
@@ -568,13 +586,18 @@ void wrap_join(sirius::op::sirius_physical_operator& join_op,
 void insert_gpu_pipeline_operators_recursive(
   duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot,
   const sirius::operator_params& op_params,
-  duckdb::ClientContext& context);
+  duckdb::ClientContext& context,
+  duckdb::SiriusContext* compressed_materialization_observer);
 
 //! Replace a DELIM JOIN's `distinct_root` (the bare DISTINCT) with `DISTINCT_MERGE ->
 //! PARTITION_DISTINCT -> original DISTINCT`. The non-owning `delim_base.distinct` borrow stays
 //! valid — moving a unique_ptr never relocates the object — and the fan-out wiring uses it.
+//! The propagation pass restores `distinct_root` in place, so this chain never carries a
+//! physical sidecar; the observer is passed only for signature uniformity and its counter
+//! stays zero here.
 void wrap_delim_distinct(sirius::op::sirius_physical_delim_join& delim_base,
-                         const sirius::operator_params& op_params)
+                         const sirius::operator_params& op_params,
+                         duckdb::SiriusContext* compressed_materialization_observer)
 {
   if (!delim_base.distinct_root) { return; }
 
@@ -586,7 +609,8 @@ void wrap_delim_distinct(sirius::op::sirius_physical_delim_join& delim_base,
                                                              original->estimated_cardinality,
                                                              /*key_source=*/original.get(),
                                                              /*is_build=*/false,
-                                                             op_params.hash_partition_bytes);
+                                                             op_params.hash_partition_bytes,
+                                                             compressed_materialization_observer);
   partition->children.push_back(std::move(original));
 
   auto merge =
@@ -609,19 +633,22 @@ void wrap_delim_distinct(sirius::op::sirius_physical_delim_join& delim_base,
 //!   - RIGHT_DELIM_JOIN: point `partition_join` at the freshly-inserted build-side PARTITION.
 void wrap_delim_join(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot,
                      const sirius::operator_params& op_params,
-                     duckdb::ClientContext& context)
+                     duckdb::ClientContext& context,
+                     duckdb::SiriusContext* compressed_materialization_observer)
 {
   auto& delim_base = slot->Cast<sirius::op::sirius_physical_delim_join>();
 
   if (delim_base.join) {
-    insert_gpu_pipeline_operators_recursive(delim_base.join, op_params, context);
+    insert_gpu_pipeline_operators_recursive(
+      delim_base.join, op_params, context, compressed_materialization_observer);
   }
   if (delim_base.distinct_root) {
     // `distinct_root` still holds the bare DISTINCT: wrap below it first, then above.
     for (auto& child_slot : delim_base.distinct_root->children) {
-      insert_gpu_pipeline_operators_recursive(child_slot, op_params, context);
+      insert_gpu_pipeline_operators_recursive(
+        child_slot, op_params, context, compressed_materialization_observer);
     }
-    wrap_delim_distinct(delim_base, op_params);
+    wrap_delim_distinct(delim_base, op_params, compressed_materialization_observer);
   }
 
   if (slot->type == sirius::op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN) {
@@ -650,12 +677,14 @@ void wrap_delim_join(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& s
 void insert_gpu_pipeline_operators_recursive(
   duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot,
   const sirius::operator_params& op_params,
-  duckdb::ClientContext& context)
+  duckdb::ClientContext& context,
+  duckdb::SiriusContext* compressed_materialization_observer)
 {
   if (!slot) { return; }
 
   for (auto& child_slot : slot->children) {
-    insert_gpu_pipeline_operators_recursive(child_slot, op_params, context);
+    insert_gpu_pipeline_operators_recursive(
+      child_slot, op_params, context, compressed_materialization_observer);
   }
 
   switch (slot->type) {
@@ -683,7 +712,7 @@ void insert_gpu_pipeline_operators_recursive(
       break;
     }
     case sirius::op::SiriusPhysicalOperatorType::HASH_GROUP_BY:
-      wrap_hash_group_by(slot, op_params);
+      wrap_hash_group_by(slot, op_params, compressed_materialization_observer);
       break;
     case sirius::op::SiriusPhysicalOperatorType::UNGROUPED_AGGREGATE:
       wrap_ungrouped_aggregate(slot);
@@ -692,11 +721,11 @@ void insert_gpu_pipeline_operators_recursive(
     case sirius::op::SiriusPhysicalOperatorType::TOP_N: wrap_top_n(slot); break;
     case sirius::op::SiriusPhysicalOperatorType::HASH_JOIN:
     case sirius::op::SiriusPhysicalOperatorType::NESTED_LOOP_JOIN:
-      wrap_join(*slot, op_params);
+      wrap_join(*slot, op_params, compressed_materialization_observer);
       break;
     case sirius::op::SiriusPhysicalOperatorType::LEFT_DELIM_JOIN:
     case sirius::op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN:
-      wrap_delim_join(slot, op_params, context);
+      wrap_delim_join(slot, op_params, context, compressed_materialization_observer);
       break;
     default: break;
   }
@@ -818,12 +847,14 @@ void sirius_physical_plan_generator::insert_gpu_pipeline_operators(
   duckdb::unique_ptr<sirius::op::sirius_physical_operator>& plan)
 {
   // Sink wraps need the sizing params from SiriusContext. If it's missing, default-constructed
-  // op_params make the wraps fall back to the operators' own constructor defaults.
+  // op_params make the wraps fall back to the operators' own constructor defaults. The same
+  // context doubles as the compressed-materialization counter observer for the PARTITION wraps.
   sirius::operator_params op_params;
-  if (auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state")) {
-    op_params = sirius_ctx->get_config().get_operator_params();
-  }
-  insert_gpu_pipeline_operators_recursive(plan, op_params, context);
+  auto sirius_ctx = context.registered_state
+                      ? context.registered_state->Get<duckdb::SiriusContext>("sirius_state")
+                      : nullptr;
+  if (sirius_ctx) { op_params = sirius_ctx->get_config().get_operator_params(); }
+  insert_gpu_pipeline_operators_recursive(plan, op_params, context, sirius_ctx.get());
 }
 
 sirius::OrderPreservationType sirius_physical_plan_generator::order_preservation_recursive(

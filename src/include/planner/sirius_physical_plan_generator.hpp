@@ -240,10 +240,11 @@ class sirius_physical_plan_generator {
   static void set_parent_ops(sirius::op::sirius_physical_operator& op,
                              sirius::op::sirius_physical_operator* parent);
 
- private:
   //! Walk the plan tree and insert the GPU pipeline operators (PARTITION, CONCAT, sort chain,
   //! merge operators, scan companions, GPU_VALUES) so the tree carries the full execution
-  //! structure before the pipeline converter runs.
+  //! structure before the pipeline converter runs. Public so wrap-contract tests can drive the
+  //! rewrite over hand-built operator trees and assert the wrapper shapes and physical-sidecar
+  //! copies directly.
   void insert_gpu_pipeline_operators(
     duckdb::unique_ptr<sirius::op::sirius_physical_operator>& plan);
 };

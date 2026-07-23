@@ -574,6 +574,8 @@ pipeline::reservation_size_info gpu_pipeline_task::get_estimated_reservation_siz
                    : nullptr;
   const bool input_contains_narrowed_columns =
     scan_input != nullptr && scan_input->contains_narrowed_columns;
+  const std::size_t input_restore_destination_bytes =
+    scan_input != nullptr ? scan_input->restore_destination_bytes : 0;
   auto working_set_bytes = input_basis;
   // Resident (cached) scan inputs report mask/filter copy peaks through their
   // working-set estimate too — it seeds the cold-start guess below via
@@ -606,7 +608,8 @@ pipeline::reservation_size_info gpu_pipeline_task::get_estimated_reservation_siz
                                 .type                      = input_type,
                                 .resident                  = input_resident,
                                 .working_set_bytes         = working_set_bytes,
-                                .contains_narrowed_columns = input_contains_narrowed_columns};
+                                .contains_narrowed_columns = input_contains_narrowed_columns,
+                                .restore_destination_bytes = input_restore_destination_bytes};
 
     std::size_t max_estimate = 0;
     if (auto* pipeline = gs.get_pipeline()) {

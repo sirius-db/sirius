@@ -16,8 +16,10 @@
 
 #include "scan_manager/sirius_scan_manager.hpp"
 
+#include "cudf/cudf_utils.hpp"
 #include "data/data_batch_utils.hpp"
 #include "exec/thread_pool.hpp"
+#include "helper/type_conversions.hpp"
 #include "io/cache/prefetching_cache.hpp"
 #include "io/io_context.hpp"
 #include "io/parquet_helpers.hpp"
@@ -41,10 +43,13 @@
 #include <cudf/io/parquet.hpp>
 #include <cudf/io/parquet_io_utils.hpp>
 #include <cudf/io/parquet_schema.hpp>
+#include <cudf/null_mask.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
 #include <cudf/types.hpp>
 #include <cudf/utilities/span.hpp>
+#include <cudf/utilities/traits.hpp>
+#include <cudf/utilities/type_dispatcher.hpp>
 
 #include <rmm/cuda_device.hpp>
 
@@ -127,6 +132,21 @@ struct cached_databatch_provider : public databatch_provider {
       _column_names.emplace_back(entry_column_names[idx]);
       _column_indices.push_back(idx);
     });
+    // Native cuDF destination of each selected column, from the entry's pin-time DuckDB types
+    // (the zone-map sidecar). nullopt when the sidecar is absent or the type has no cuDF
+    // mapping; a narrowed column without a destination keeps the caller's conservative bound.
+    _native_types.reserve(_column_indices.size());
+    for (auto const idx : _column_indices) {
+      std::optional<cudf::data_type> native;
+      if (_entry.zone_maps.has_stats() && idx < _entry.zone_maps.column_count()) {
+        try {
+          native = sirius::get_cudf_type(sirius::from_duckdb(_entry.zone_maps.column_type(idx)));
+        } catch (std::exception const&) {
+          native = std::nullopt;
+        }
+      }
+      _native_types.push_back(native);
+    }
   }
 
   databatch_provider::batch get_next_batch() override
@@ -145,7 +165,9 @@ struct cached_databatch_provider : public databatch_provider {
     auto mask = index < _mvcc_masks.size() ? _mvcc_masks[index] : mvcc_chunk_mask{};
     auto const contains_narrowed_columns =
       selected_columns_contain_narrowing(_entry.narrowed_columns, index, _column_indices);
-    return {std::move(data), std::move(mask), contains_narrowed_columns};
+    auto const restore_destination_bytes =
+      contains_narrowed_columns ? restore_destination_bytes_for_chunk(index) : 0;
+    return {std::move(data), std::move(mask), contains_narrowed_columns, restore_destination_bytes};
   }
 
  private:
@@ -187,9 +209,53 @@ struct cached_databatch_provider : public databatch_provider {
       telemetry::quent_data_batch_probe::create(_telemetry_info, batch_id));
   }
 
+  /// Exact bytes of the native-width destinations (data plus validity mask) that restoring chunk
+  /// @p index 's narrowed selected columns would allocate. Zero — the caller then keeps its
+  /// conservative maximum-expansion bound — whenever any narrowed column's destination is
+  /// unknowable: no pin-time type sidecar, a non-fixed-width mapping, or malformed storage.
+  [[nodiscard]] std::size_t restore_destination_bytes_for_chunk(std::size_t index) const
+  {
+    auto const& matrix = _entry.narrowed_columns;
+    if (matrix.empty() || index >= matrix.size()) { return 0; }
+    auto const& chunk_markers = matrix[index];
+    std::size_t total         = 0;
+    for (std::size_t sel = 0; sel < _column_indices.size(); ++sel) {
+      auto const entry_pos = _column_indices[sel];
+      if (entry_pos >= chunk_markers.size() || !chunk_markers[entry_pos]) { continue; }
+      auto const& native = _native_types[sel];
+      if (!native || !cudf::is_fixed_width(*native)) { return 0; }
+      std::size_t rows   = 0;
+      bool has_null_mask = false;
+      if (_entry.tier == cucascade::memory::Tier::GPU) {
+        auto const it = _entry.data_batches_by_column.find(_column_names[sel]);
+        if (it == _entry.data_batches_by_column.end() || index >= it->second.size() ||
+            !it->second[index]) {
+          return 0;
+        }
+        auto const& column = *it->second[index];
+        rows               = static_cast<std::size_t>(column.size());
+        has_null_mask      = column.nullable();
+      } else {
+        if (index >= _entry.host_chunks.size() || !_entry.host_chunks[index]) { return 0; }
+        auto const& host_columns = _entry.host_chunks[index]->get_host_table()->columns;
+        if (entry_pos >= host_columns.size()) { return 0; }
+        rows          = static_cast<std::size_t>(host_columns[entry_pos].num_rows);
+        has_null_mask = host_columns[entry_pos].has_null_mask;
+      }
+      total += rows * cudf::size_of(*native);
+      if (has_null_mask) {
+        total += cudf::bitmask_allocation_size_bytes(static_cast<cudf::size_type>(rows));
+      }
+    }
+    return total;
+  }
+
   cached_scan_plan _plan;
   std::vector<std::string> _column_names;
   std::vector<size_t> _column_indices;
+  /// Native cuDF type of each selected column (parallel to @c _column_indices), resolved from the
+  /// entry's pin-time DuckDB types at construction; nullopt when unavailable.
+  std::vector<std::optional<cudf::data_type>> _native_types;
   const pinned_entry& _entry;
   telemetry::batch_telemetry_info _telemetry_info;
   /// This provider's own copy of the entry's per-chunk keep-masks (empty for

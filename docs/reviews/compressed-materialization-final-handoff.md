@@ -711,3 +711,160 @@ pair) validated 22/22 with zero errors.
 
 Acceptance criteria met: 22/22 validation in every run, unpinned on-vs-off within run-to-run
 noise, host-pinned improvement within noise of −11.4%.
+
+
+## Addendum — partitioned-exchange pass-through and the dynamic-filter guard (2026-07-23)
+
+### Investigation verdict
+
+The task that opened this pass hypothesized that the propagation pass's default case restores
+every narrowed column to native below each PARTITION, truncating the narrow region at the
+exchange. That is false, for two verified reasons: (1) pass ordering — `create_plan` runs
+`apply_compressed_schema_passes` before `insert_gpu_pipeline_operators`, so PARTITION, CONCAT,
+MERGE_*, SORT_PARTITION, SORT_SAMPLE, GPU_SCAN, and DYNAMIC_FILTER do not exist while
+propagation runs and never hit the default case (now pinned by a debug assertion); and (2) the
+join-feeder exchange already passes narrow payloads with native keys — `wrap_join_child` copies
+the join child's sidecar onto both CONCAT and PARTITION, byte-verified at 10 B/row feature-on vs
+16 B/row feature-off for a BIGINT key + INT16-pinned BIGINT payload on a forced 5-way partition.
+
+The real truncation was the dynamic-filter whole-sidecar clear: `enable_dynamic_filter_pushdown`
+defaults to true, and every join-dense TPC-H query wires a producer into its fact scan, which
+cleared the scan's ENTIRE sidecar and forced every payload column native through the whole plan,
+exchanges included. This also explains the 4xGB200 SF300 observation pattern (join-dense wins
+collapse at 4 GPUs while filter-free queries keep single-GPU-sized wins): host-pinned narrow
+storage still shrinks uploads even when the scan advertises native, so single-GPU upload-dominated
+wins survive the clear, but the GPU-resident phase — all-native for filtered fact scans — dominates
+once the upload is quartered across GPUs.
+
+### Guard mechanism inventory
+
+- `sirius_dynamic_filter_set::register_producer(planned_target_columns)` — each producing join
+  declares the columns its publish plan can ever push filters for (the same
+  `probe_column_index.column_index` values that become `probe_target::probe_col_idx`), unioned
+  across producers; an empty declaration registers an unscoped producer, and consumers then treat
+  every column as a target (the pre-change conservative behavior, reproduced by construction).
+  Accessors: `planned_target_columns()`, `has_unscoped_producer()`.
+- Column-granular guard in `propagate_compressed_schema`'s TABLE_SCAN case: planned target
+  columns (translated from column_ids space to scan output positions through `projection_ids`)
+  are forced native in the scan sidecar; payload columns keep their carriers. Invariant 8
+  ("dynamic-filter keys are native") holds verbatim, and the join-side key restore becomes a
+  no-op for filtered-probe keys — one fewer pipeline stage.
+- `make_gpu_scan_leaf` stamps the GPU_SCAN leaf and the DYNAMIC_FILTER wrapper with the scan's
+  finished sidecar, so scan normalization restores exactly the target columns and execution
+  validation compares batches against actual carriers.
+- Pass-ordering assertion (debug builds) in the propagation default case, turning a future
+  pass-reorder — which would silently recreate the truncation — into a loud failure.
+- `partition_narrow_columns` counter: `sirius_physical_partition::execute` (hash path, engaged
+  partitions, sidecar present) counts input-batch columns whose actual cuDF type is narrower than
+  the native mapping, reported through the same `SiriusContext` observer the GPU scan uses. It is
+  derived from actual batch types, so a regression anywhere in the chain (sidecar copy, scan
+  normalization, guard) drops it to zero and fails the integration test.
+- Narrow group keys through grouped aggregation: a HASH_GROUP_BY propagation case keeps
+  bare-reference group keys narrow (grouping is equality-only; cudf::groupby takes raw key views)
+  while restoring aggregate-input columns below the aggregate; `wrap_hash_group_by` copies the
+  aggregate's sidecar onto its PARTITION and MERGE_GROUP_BY, so group keys cross the aggregate
+  exchange narrow and widen on the small grouped output at the next boundary. Sound by
+  single-producer uniformity (every thread/GPU runs the same plan node with the same targets).
+  Implementation-gate outcome (trace-run on the partition fixture, 2026-07-23): the AVG partial
+  layout emits one extra column (SUM + COUNT decomposition; "column count mismatch: got 3,
+  expected 2" on HASH_GROUP_BY and PARTITION) and the COUNT(DISTINCT) partial column is a LIST
+  ("datatype mismatch: got cudf::list_view, expected int64_t"), so `has_avg` and
+  `has_count_distinct` shapes are excluded from key narrowing, alongside multiple grouping sets
+  and grouping functions (rejected through the output-arity precondition). The plain
+  COUNT(*)/SUM narrow-key query and the join fixture query trace-run with zero width/datatype
+  warnings on HASH_GROUP_BY, PARTITION, and MERGE_GROUP_BY.
+- Exact converting-resident reservation: the cached serve site computes the per-column
+  native-width restore destination (data + validity-mask bytes) from the entry's narrowing
+  markers, actual chunk carriers, and pin-time types (the zone-map sidecar), threads it through
+  `scan_operator_input` and `input_stats`, and `no_history_peak_memory_estimate` reserves working
+  set + exact destination. `kMaxNumericCarrierExpansion` (8) remains only the fallback for pins
+  without the type sidecar; a narrow plan sidecar over a native cache reserves working set +
+  stored bytes (destination bounded by source).
+
+### Behavioral notes
+
+- BUILD_PROBE-mode drift: `update_join_exec_mode` compares actual (narrow) build bytes against
+  `max_build_hash_table_bytes`, so flag-on can keep a join in BUILD_PROBE that flag-off would
+  partition. Pre-existing (payloads already crossed the exchange narrow when no filter was
+  wired), flag-gated, and benign; the guard widens its reach to filtered-probe joins.
+- Downgrade / CPU fallback: the downgrade executor converts idle batches between memory spaces
+  through representation-level, schema-preserving converters — host representations retain each
+  column's carrier and decimal scale — so a narrow batch in a partition repo spills fewer bytes
+  and returns with its carriers intact. There is no CPU re-execution of in-flight narrow batches:
+  DuckDB fallback is a whole-query plan-level decision made before any narrow batch exists. No
+  changes required.
+- Runtime dynamic-filter application on mismatched carriers stays safe by existing contracts:
+  membership filters skip on probe-type mismatch (`compute_mask` returns nullptr; the filter is
+  semijoin-redundant), the pinned pre-normalization apply already skips on narrow stored keys,
+  and the AST row-mask path is reachable only behind two non-default gates and by construction
+  never sees a narrow probe (targets are native-forced).
+
+### Cursor report disposition (2026-07-23)
+
+An independent implementation report (4xGB200, at 4a57cc5d — pre-residency-gate, unpushed) was
+evaluated item by item; its diff was design input only, and every integrated item was re-derived
+from HEAD.
+
+1. Prepare-time cache widening: REJECTED. Widening the shared pinned cache to a plan's native
+   targets destroys the host-pinned upload savings the feature's wins live on (the per-query cost
+   it removes is one sub-millisecond GPU widening kernel per chunk; the cost it adds is recurring
+   native-width uploads on the slower host link), poisons `narrowed_columns` markers so the first
+   native-demanding query permanently strips a column's narrowing for all later payload uses
+   under the residency gate, grows post-pin footprint against pin-time budgets with unresolved
+   concurrency against in-flight serves, and its Q22 evidence was bundled with two other fixes.
+   If profiling ever elevates the serve-time widen kernel, the levers are a prune refinement or
+   consumer-side narrow acceptance — never mutating shared cache from one query's plan shape.
+2. Narrow group keys through grouped aggregation: REDESIGNED AND INTEGRATED. The idea is sound,
+   but their claimed shape (widen on the local output, keep the merge native) is structurally
+   impossible here: any restore the propagation pass inserts above HASH_GROUP_BY lands above the
+   merge after the wrap, and PARTITION's build contract requires its child to be a sink, so no
+   projection can sit between aggregate and PARTITION. Group-key narrowing therefore necessarily
+   crosses PARTITION and MERGE_GROUP_BY, which is sound by single-producer uniformity and is
+   itself the exchange-byte win.
+3. Restore-only resident memory estimate: REDESIGNED. Their blanket 2x replacement under-reserves
+   4x/8x restores (INT8-stored BIGINT restores at 8x) and risks OOM-retry/downgrade thrash; the
+   integrated design computes the exact per-column destination at the serve site and keeps the 8x
+   bound only where carriers are genuinely unknown.
+4. Interleaved measurement methodology: ADOPTED. OFF/ON rounds interleaved (at least 2 rounds x
+   12 iterations per config; per-query median within each round, then median across rounds), with
+   same-config drift recorded alongside the deltas — the GB10 measured +2.25% same-config drift
+   on 2026-07-22, larger than either individual flag delta. Their focused Q16/Q22 numbers were
+   measured pre-gate with all three fixes bundled and no full-matrix rerun; they establish
+   direction only and are not comparison baselines.
+
+### Follow-up list delta
+
+Follow-up #5 ("Dynamic filters ... deliberately native") is resolved for payload columns: only
+the planned target keys stay native. The remaining JOIN-exchange lever is narrowing the
+exchange's key bytes via co-narrowed equivalence classes (already follow-up #4); group-by
+exchange key bytes are resolved by the narrow-group-key case. The Q16-style expression-use cost
+model for arithmetic-only consumers remains a separate follow-up: the group-key mechanism
+addresses Q16's key component but does not retire it.
+
+### Measured SF50 result (four-way A/B, interleaved OFF/ON, 2026-07-23)
+
+Protocol actually used: interleaved OFF/ON rounds per mode (OFF-r1, ON-r1, OFF-r2, ON-r2;
+strictly sequential), 12 iterations per leg, per-query warm medians over iterations 2-12 within
+each round, then the median across the two rounds, summed over all 22 queries. Same binary for
+every leg; validation against the stored DuckDB results (`runs/2026-07-20_21-35-46_sf50_6iter`).
+All eight legs validated 22/22 with zero errors. Run directories: `runs/2026-07-23_17-39-47`
+through `runs/2026-07-23_18-13-10` in leg order.
+
+| Mode | Feature off | Feature on | Change |
+|---|---:|---:|---:|
+| Unpinned | 29.684 s | 29.660 s | -0.08% |
+| HOST-pinned | 10.544 s | 8.921 s | **-15.39%** |
+
+- **Unpinned**: per-round deltas +0.38% / -0.54%, same-config off drift +0.76% — parity within
+  noise, as the residency gate guarantees (unpinned flag-on plans are sidecar-free).
+- **HOST-pinned**: per-round deltas -15.47% / -15.31% with same-config off drift of only
+  -0.19% — a stable 4.5-point improvement over the standing -10.86%. The movers are the
+  predicted join-dense queries: Q5 -31.0%, Q14 -29.2%, Q8 -28.7%, Q20 -27.1%, Q7 -26.1%,
+  Q3 -24.3%, Q15 -23.1%, Q9 -22.4%, Q6 -22.3%, Q17 -19.9%, Q19 -19.4%, Q18 -11.6%,
+  Q21 -7.0%. Q16 joined the movers at -6.3% via the group-key path. 21 of 22 queries improved
+  or held; the only positive delta is Q1 +3.0% (arithmetic-only consumer residual, the known
+  separate follow-up).
+
+The 4xGB200 SF300 interleaved A/B (1-GPU and 4-GPU configs) remains a user-run obligation at
+the final commit; `partition_narrow_columns` is the confirmation that narrow bytes crossed the
+inter-GPU exchange.

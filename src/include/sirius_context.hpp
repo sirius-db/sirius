@@ -85,6 +85,11 @@ class SiriusContext : public ClientContextState {
     /// sidecar (post-residency-gate, pre-propagation/pruning — a later pass may
     /// still clear or prune it).
     uint64_t scan_sidecars_installed = 0;
+    /// Runtime count of input-batch columns that crossed an engaged hash
+    /// PARTITION with a carrier narrower than their native mapping. Derived
+    /// from actual batch types, so a regression anywhere in the narrow-carrier
+    /// chain drops it to zero.
+    uint64_t partition_narrow_columns = 0;
   };
 
   SiriusContext();
@@ -339,6 +344,9 @@ class SiriusContext : public ClientContextState {
   /// \brief Record a TABLE_SCAN node that received a narrow physical sidecar at plan time.
   void record_compressed_materialization_scan_sidecar_installed() noexcept;
 
+  /// \brief Record narrow-carrier columns crossing an engaged hash PARTITION.
+  void record_compressed_materialization_partition_narrow_columns(uint64_t count = 1) noexcept;
+
  private:
   void throw_if_not_initialized() const;
   void acquire_query_lifecycle_slot();
@@ -413,6 +421,7 @@ class SiriusContext : public ClientContextState {
   std::atomic<uint64_t> compressed_materialization_scan_columns_restored_count_{0};
   std::atomic<uint64_t> compressed_materialization_pin_columns_narrowed_count_{0};
   std::atomic<uint64_t> compressed_materialization_scan_sidecars_installed_count_{0};
+  std::atomic<uint64_t> compressed_materialization_partition_narrow_columns_count_{0};
 };
 
 /// Installs the sink selected by `Config::LOG_BACKEND` (with `Config::LOG_*`).

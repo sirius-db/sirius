@@ -148,10 +148,48 @@ Restoring join keys avoids representation-dependent hash differences between ind
 narrowed inputs. Later versions may choose a common narrow carrier for an equality equivalence
 class, but that is a cost-model refinement rather than part of the correctness contract.
 
-Dynamic-filter channels publish native key literals. A scan with a wired dynamic-filter producer
-therefore advertises native output to the query pipeline. Its pinned cache may still use narrow
-storage internally, but the GPU scan restores that data before the dynamic-filter operator. This
-conservative rule keeps dynamic filters correct without disabling pin-cache width savings.
+Dynamic-filter channels publish native key literals. Each producing join registers its planned
+target columns on the channel at plan time — the same columns its publish plan can ever push
+filters for — and the propagation pass forces exactly those columns native at the scan output, so
+filter probes and literals always meet at identical native types. Other columns keep their
+carriers: a payload that no filter probes stays narrow through the scan, the DYNAMIC_FILTER
+operator, and every downstream pass-through. A producer that registers without declaring targets
+is treated as targeting every column, which forces the whole scan output native. The GPU scan leaf
+and its DYNAMIC_FILTER wrapper are stamped with the scan's finished sidecar, so scan
+normalization restores the target columns (pinned-narrow storage still transfers narrow) and
+execution validation compares batches against the actual carriers.
+
+### Partitioned exchange
+
+The pipeline wrapper operators are inserted after the propagation passes finish, and they inherit
+the finished sidecars at wrap time rather than through a propagation case:
+
+- The hash-join feeder chain copies the join child's physical schema onto both CONCAT and
+  PARTITION. Keys are native below the partition (murmur3 hashes representation-dependently, so
+  independently narrowed sides would mis-co-partition), while payloads pass through narrow:
+  `cudf::hash_partition` hashes only the key columns and gathers payload columns
+  type-agnostically.
+- Grouped aggregation keeps bare-reference group keys narrow through the partial aggregate, its
+  PARTITION, and MERGE_GROUP_BY, restoring them on the small grouped output at the next
+  boundary. This is sound because the aggregate exchange has a single logical producer — every
+  thread and GPU runs the same plan node with the same per-plan carrier targets, so equal narrow
+  keys route identically — and the merge re-groups with raw key views exactly like the local
+  aggregate. Aggregate inputs and states stay native (state arithmetic needs native width), a
+  column that is both group key and aggregate input goes native, and shapes whose partial batch
+  layout deviates from the declared output — multiple grouping sets, grouping functions, AVG
+  (SUM + COUNT decomposition adds a partial column), COUNT(DISTINCT) (LIST partial column) —
+  keep the native boundary.
+- Distinct- and sort-side exchanges are native because their inputs are restored at the
+  boundary.
+
+| Operator | Inserted by | Carrier disposition |
+|---|---|---|
+| PARTITION / CONCAT (hash-join feeder) | `wrap_join_child` | Keys native, payloads narrow (sidecar copied from the join child) |
+| PARTITION (NLJ feeder) | `wrap_join_child` | Native (NLJ children are restored at the boundary) |
+| PARTITION / MERGE_GROUP_BY (grouped aggregate) | `wrap_hash_group_by` | Group keys narrow, aggregate states native (sidecar copied from the aggregate) |
+| PARTITION (DELIM distinct) | `wrap_delim_distinct` | Native (`distinct_root` is restored in place) |
+| MERGE_AGGREGATE / TOP_N chain / sort chain | other wraps | Native boundaries |
+| GPU_SCAN + DYNAMIC_FILTER leaf pair | `wrap_table_scan_source` | Planned dynamic-filter targets native, payloads narrow (both stamped with the scan sidecar) |
 
 ## Pin-time narrowing
 
@@ -173,7 +211,8 @@ metadata and transfer that reduced representation back to the GPU before normali
 Filter safety depends on the path. Fresh reads apply reader or post-decode static filters before
 scan-time narrowing. A cached chunk may already be narrow, so the expression executor restores
 referenced carriers before a static comparison. Scans wired to a runtime dynamic-filter producer
-advertise native output and normalize before the downstream dynamic-filter operator.
+normalize their planned target columns to native before the downstream dynamic-filter operator;
+their other columns keep the plan carriers.
 
 The setting is sampled independently when a table is pinned and when a query plan is built. Changing
 it does not rewrite an existing cache entry:
@@ -186,12 +225,17 @@ it does not rewrite an existing cache entry:
 - a per-resident-input marker records whether the served columns actually use narrower carriers.
   It survives setting changes and drives reservation independently of the current flag.
 
-A converting resident input reserves its working-set bytes plus the stored bytes multiplied by the
-named maximum numeric carrier expansion (`kMaxNumericCarrierExpansion`, currently 8), using
-saturating arithmetic. Thus an unfiltered `INT8` to `INT64` restore accounts for both the stored
-source and destination (9 times the stored bytes), rather than claiming that an 8-times factor
-covers the whole peak. Filter masks and other working-set allocations are additive. A resident input
-that needs no conversion uses the larger of its stored and working-set sizes.
+A converting resident input reserves its working-set bytes plus the exact restore destination when
+the carriers are known: the cached serve site sums, over the selected stored columns whose carrier
+differs from the native mapping of their pin-time logical type, the native-width data bytes plus
+validity-mask bytes, and threads that figure through the split into the reservation estimate. When
+the destination is unknowable (a pin without the type sidecar), the estimate falls back to the
+stored bytes multiplied by the named maximum numeric carrier expansion
+(`kMaxNumericCarrierExpansion`, currently 8) — the constant is the fallback bound, never the
+primary estimate. A narrow plan sidecar over a native cache reserves the working set plus the
+stored bytes (a narrowing destination is bounded by its source). All arithmetic saturates. Filter
+masks and other working-set allocations are additive, and a resident input that needs no
+conversion uses the larger of its stored and working-set sizes.
 
 ## Correctness invariants
 
@@ -214,7 +258,11 @@ GPU and CPU results for a non-key decimal payload used both as a direct projecti
 arithmetic, and discriminate the residency-gate states through the observability counters: beside
 the serve-time scan-downcast and scan-restore counters there is a plan-time
 `scan_sidecars_installed` counter, counting table scans that received a narrow physical sidecar
-after the residency gate (a later pass may still clear or prune it). After the residency gate,
+after the residency gate (a later pass may still clear or prune it), and a runtime
+`partition_narrow_columns` counter, counting input-batch columns that crossed an engaged hash
+PARTITION with a carrier narrower than native — the single observable for the exchange
+pass-through, derived from actual batch types so any regression in the narrow-carrier chain drops
+it to zero. After the residency gate,
 unpinned feature-on is expected to be approximately equal to unpinned feature-off — the flag should
 be performance-neutral wherever no pinned narrow data exists.
 
@@ -252,10 +300,29 @@ SIRIUS_PIN_TIER=host pixi run bash test/tpch_performance/benchmark_and_validate.
   --pinning-mode per-query 50
 ```
 
-### Measured SF50 result (2026-07-22, with residency gate)
+### Measured SF50 result (2026-07-23, with the column-granular dynamic-filter guard)
 
-Using the same final binary for control and treatment, the sum of per-query medians for warm
-iterations 2–6 was:
+Interleaved OFF/ON rounds per mode (two rounds, 12 iterations per leg; per-query warm medians
+over iterations 2-12 within each round, median across rounds, summed over all 22 queries), same
+binary for every leg:
+
+| Mode | Feature off | Feature on | Change |
+|---|---:|---:|---:|
+| Unpinned | 29.684 s | 29.660 s | -0.08% |
+| HOST-pinned | 10.544 s | 8.921 s | -15.39% |
+
+Lower is better. All eight legs validated 22/22 queries against the stored DuckDB results.
+Per-round host-pinned deltas were -15.47% / -15.31% with same-config off drift of -0.19%;
+unpinned rounds read +0.38% / -0.54% against +0.76% drift (parity, as the residency gate
+guarantees). The join-dense queries drive the improvement over the pre-guard -10.86% (Q5
+-31.0%, Q8 -28.7%, Q7 -26.1%, Q3 -24.3%, Q9 -22.4%); Q16 moves -6.3% via the group-key path.
+Run directories: `runs/2026-07-23_17-39-47` through `runs/2026-07-23_18-13-10`.
+
+### Measured SF50 result (2026-07-22, with residency gate, historical)
+
+This table predates the column-granular dynamic-filter guard and the group-key narrowing; the
+table above supersedes it. Using the same final binary for control and treatment, the sum of
+per-query medians for warm iterations 2–6 was:
 
 | Mode | Feature off | Feature on | Change |
 |---|---:|---:|---:|

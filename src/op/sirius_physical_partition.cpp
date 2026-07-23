@@ -17,6 +17,7 @@
 #include "op/sirius_physical_partition.hpp"
 
 #include "config.hpp"
+#include "cudf/cudf_utils.hpp"
 #include "data/data_batch_utils.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
@@ -28,9 +29,11 @@
 #include "op/sirius_physical_hash_join.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
+#include "sirius_context.hpp"
 
 #include <nvtx3/nvtx3.hpp>
 
+#include <algorithm>
 #include <mutex>
 
 namespace sirius {
@@ -54,13 +57,16 @@ std::optional<std::size_t> extract_bound_ref_index(const duckdb::Expression& exp
 
 }  // namespace
 
-sirius_physical_partition::sirius_physical_partition(duckdb::vector<sirius::logical_type> types,
-                                                     std::size_t estimated_cardinality,
-                                                     sirius_physical_operator* key_source,
-                                                     bool is_build,
-                                                     uint64_t hash_partition_bytes)
+sirius_physical_partition::sirius_physical_partition(
+  duckdb::vector<sirius::logical_type> types,
+  std::size_t estimated_cardinality,
+  sirius_physical_operator* key_source,
+  bool is_build,
+  uint64_t hash_partition_bytes,
+  duckdb::SiriusContext* compressed_materialization_observer)
   : sirius_physical_operator(
-      SiriusPhysicalOperatorType::PARTITION, std::move(types), estimated_cardinality)
+      SiriusPhysicalOperatorType::PARTITION, std::move(types), estimated_cardinality),
+    _compressed_materialization_observer(compressed_materialization_observer)
 {
   s_partition_size = hash_partition_bytes;
   _is_build        = is_build;
@@ -183,6 +189,25 @@ std::unique_ptr<operator_data> sirius_physical_partition::execute(const operator
   std::vector<std::shared_ptr<cucascade::data_batch>> partitioned_results;
   switch (_partition_type) {
     case PartitionType::HASH:
+      // Narrow-passthrough observability: count input columns whose actual carrier is narrower
+      // than the native mapping of this operator's logical schema. The counter reads actual batch
+      // types, so a regression anywhere in the narrow-carrier chain drops it to zero.
+      if (has_physical_overrides() && _compressed_materialization_observer != nullptr) {
+        auto const view = get_cudf_table_view(input_batch_ro);
+        auto const width =
+          std::min<std::size_t>(static_cast<std::size_t>(view.num_columns()), types.size());
+        uint64_t narrow_columns = 0;
+        for (std::size_t column_idx = 0; column_idx < width; ++column_idx) {
+          if (view.column(static_cast<cudf::size_type>(column_idx)).type() !=
+              sirius::get_cudf_type(types[column_idx])) {
+            ++narrow_columns;
+          }
+        }
+        if (narrow_columns > 0) {
+          _compressed_materialization_observer
+            ->record_compressed_materialization_partition_narrow_columns(narrow_columns);
+        }
+      }
       partitioned_results = gpu_partition_impl::hash_partition(input_batch_ro,
                                                                _partition_keys,
                                                                _partition_key_cast_types,

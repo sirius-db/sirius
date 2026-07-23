@@ -45,6 +45,12 @@ struct databatch_provider {
     /// True when at least one selected column in this cached chunk uses a
     /// carrier narrower than its logical type.
     bool contains_narrowed_columns{false};
+    /// Exact bytes of the native-width destination columns (data plus validity
+    /// mask) a full restore of this chunk's narrowed selected columns would
+    /// allocate. Zero when nothing narrowed or when the pin-time logical types
+    /// are unavailable; the scan memory estimate then falls back to its
+    /// conservative maximum-expansion bound.
+    std::size_t restore_destination_bytes{0};
   };
 
   virtual ~databatch_provider()  = default;

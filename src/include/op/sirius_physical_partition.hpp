@@ -25,6 +25,10 @@
 #include "op/sirius_physical_top_n.hpp"
 #include "sirius_config.hpp"
 
+namespace duckdb {
+class SiriusContext;
+}  // namespace duckdb
+
 namespace sirius {
 namespace op {
 
@@ -55,7 +59,8 @@ class sirius_physical_partition : public sirius_physical_operator {
     std::size_t estimated_cardinality,
     sirius_physical_operator* key_source,
     bool is_build                 = false,
-    uint64_t hash_partition_bytes = sirius::config::DEFAULT_HASH_PARTITION_BYTES);
+    uint64_t hash_partition_bytes = sirius::config::DEFAULT_HASH_PARTITION_BYTES,
+    duckdb::SiriusContext* compressed_materialization_observer = nullptr);
 
   std::string get_name() const override;
 
@@ -133,6 +138,9 @@ class sirius_physical_partition : public sirius_physical_operator {
   uint64_t s_partition_size;
   int _min_num_partitions{1};
   uint64_t _small_table_bytes{0};
+  /// Non-owning observer for the narrow-passthrough counter. The registered-state shared_ptr owns
+  /// the context for at least as long as the query plan; unit-test operators may leave it null.
+  duckdb::SiriusContext* _compressed_materialization_observer = nullptr;
 };
 
 }  // namespace op
