@@ -396,6 +396,37 @@ TEST_CASE("insert delta: all-NULL constant validity is captured, not skipped",
   exec_ok(*env.con, "ROLLBACK");
 }
 
+TEST_CASE("insert delta: appends into the boundary row group are captured",
+          "[duckdb_insert_delta][scan]")
+{
+  delta_test_db env;
+  // A PRIMARY KEY makes DuckDB append into the existing tail row group
+  // instead of opening a fresh one, so the delta begins inside the last
+  // cached row group (k_offset > 0). The skeleton walk starts at that
+  // boundary row group and must not skip past it.
+  exec_ok(*env.con, "CREATE TABLE t (k INTEGER PRIMARY KEY, v INTEGER)");
+  exec_ok(*env.con, "INSERT INTO t SELECT range, range FROM range(10000)");
+  exec_ok(*env.con, "CHECKPOINT");
+  exec_ok(*env.con, "INSERT INTO t VALUES (10000, 7), (10001, 8)");
+
+  exec_ok(*env.con, "BEGIN TRANSACTION");
+  auto& storage = resolve_storage(*env.con, "t");
+  std::vector<duckdb::storage_t> const cols{0, 1};
+  std::vector<sirius::logical_type> types{sirius::logical_type::make(sirius::type_id::INTEGER),
+                                          sirius::logical_type::make(sirius::type_id::INTEGER)};
+  auto plan = capture_insert_delta_plan(storage, *env.con->context, 10000, cols, types);
+
+  REQUIRE(plan.n_total == 10002);
+  REQUIRE(plan.row_groups.size() == 1);
+  auto const& rg = plan.row_groups[0];
+  REQUIRE(rg.row_group_index == 0);  // the boundary row group itself
+  REQUIRE(rg.k_offset == 10000);
+  REQUIRE(rg.row_count == 2);
+  REQUIRE(rg.row_group_start == 10000);
+  REQUIRE(rg.columns.size() == 2);
+  exec_ok(*env.con, "ROLLBACK");
+}
+
 TEST_CASE("insert delta: range capture merges to the serial plan", "[duckdb_insert_delta][scan]")
 {
   delta_test_db env;

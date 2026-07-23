@@ -321,8 +321,16 @@ insert_delta_plan prepare_insert_delta_capture(duckdb::DataTable& storage,
   if (plan.n_total <= n_cache) { return plan; }
 
   auto tree = storage.GetRowGroupCollection()->GetRowGroups();
-  for (duckdb::idx_t rg_index = 0;; ++rg_index) {
-    auto node = tree->GetSegmentByIndex(static_cast<int64_t>(rg_index));
+  auto lock = tree->Lock();
+  // Row groups are contiguous and tail-append-only, so nothing below the row
+  // group holding the last cached row can contain delta rows: binary-search
+  // that boundary instead of scanning the cached prefix. The boundary row
+  // group itself stays in the walk — an indexed table's appends grow its tail
+  // (the k_offset > 0 case) — and an unchanged one costs a single iteration.
+  auto const boundary_rg =
+    n_cache == 0 ? 0 : tree->GetSegmentIndex(lock, static_cast<duckdb::idx_t>(n_cache - 1));
+  for (duckdb::idx_t rg_index = boundary_rg;; ++rg_index) {
+    auto node = tree->GetSegmentByIndex(lock, static_cast<int64_t>(rg_index));
     if (!node) { break; }
     auto& rg            = node->GetNode();
     auto const rg_start = static_cast<std::size_t>(node->GetRowStart());
