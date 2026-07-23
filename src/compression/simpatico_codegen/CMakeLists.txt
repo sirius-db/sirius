@@ -117,12 +117,68 @@ add_custom_command(
     "Scanning + embedding CCCL JIT header closure into ${EMBED_CCCL_HEADERS_OUT}"
   VERBATIM)
 
+# fsst_gpu: the external FSST-GPU (CompactionV5T) codec, compiled here as a
+# static library with device symbols resolved internally (it needs relocatable
+# device code; simpatico itself does not). Only the library sources are built —
+# not fsst-gpu's own executable/tests. Sources come from one pinned commit of
+# the fork: the vcpkg build consumes the fsst-gpu overlay port (no
+# configure-time downloads there), other builds fetch the same commit directly
+# (like cuco). Compiling in simpatico keeps a single CUDA compile site, so
+# CMAKE_CUDA_ARCHITECTURES and GTSST_SPLIT_COUNT apply uniformly.
+set(GTSST_SPLIT_COUNT
+    512
+    CACHE STRING "fsst-gpu splits (tiles) per block")
+if(VCPKG_BUILD)
+  # Provides FSST_GPU_ROOT (see vcpkg_ports/fsst-gpu).
+  find_package(fsst-gpu CONFIG REQUIRED)
+else()
+  include(FetchContent)
+  FetchContent_Declare(
+    fsst_gpu_src
+    URL https://github.com/joosthooz/fsst-gpu/archive/1958667a5709d15b4b50c0592fb7c05fc6cbc572.tar.gz
+    URL_HASH
+      SHA256=3bb54b353c6556b921eb81e17d56fd28ed3997e1fae2b039a3182f6f7ee79bdf
+    SOURCE_SUBDIR do-not-build)
+  FetchContent_MakeAvailable(fsst_gpu_src)
+  set(FSST_GPU_ROOT "${fsst_gpu_src_SOURCE_DIR}")
+endif()
+add_library(
+  fsst_gpu STATIC
+  ${FSST_GPU_ROOT}/src/fsst/fsst-lib.cu
+  ${FSST_GPU_ROOT}/src/fsst/gtsst-fsst.cu
+  ${FSST_GPU_ROOT}/src/compressors/shared.cu
+  ${FSST_GPU_ROOT}/src/compressors/compactionv5t/compaction-compressor.cu
+  ${FSST_GPU_ROOT}/src/compressors/compactionv5t/compaction-encode.cu
+  ${FSST_GPU_ROOT}/src/compressors/compactionv5t/compaction-decompress.cu)
+set_target_properties(
+  fsst_gpu
+  PROPERTIES POSITION_INDEPENDENT_CODE ON
+             CUDA_SEPARABLE_COMPILATION ON
+             CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+# BUILD_INTERFACE: fsst_gpu joins DuckDB's install/export set (as simpatico's
+# PUBLIC dep), and exported targets may not carry raw build-dir include paths.
+# Nothing consumes the headers post-install.
+target_include_directories(fsst_gpu
+                           PUBLIC $<BUILD_INTERFACE:${FSST_GPU_ROOT}/include>)
+target_compile_definitions(fsst_gpu
+                           PUBLIC GTSST_SPLIT_COUNT=${GTSST_SPLIT_COUNT})
+target_compile_options(
+  fsst_gpu PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--default-stream per-thread
+                   --expt-relaxed-constexpr --expt-extended-lambda>)
+find_package(Threads REQUIRED)
+if(VCPKG_BUILD)
+  target_link_libraries(fsst_gpu PUBLIC CUDA::cudart_static Threads::Threads)
+else()
+  target_link_libraries(fsst_gpu PUBLIC cudart Threads::Threads)
+endif()
+
 add_library(
   simpatico STATIC
   # Generated: CCCL header closure embedded for the runtime JIT.
   "${EMBED_CCCL_HEADERS_OUT}"
   # CUDA kernels: operators + offsets
   src/bridge/offsets_cumsum.cu
+  src/operators/fsst_compressor.cu
   src/operators/alp_compressor.cu
   src/operators/alp_rd_compressor.cu
   src/operators/ans_compressor.cu
@@ -180,8 +236,14 @@ if(VCPKG_BUILD)
   # directory-scoped so -lcudf etc. don't resolve in consuming targets. nvcomp
   # comes in transitively from cudf::cudf; cuda_driver is the driver stub.
   target_link_libraries(
-    simpatico PUBLIC cudf::cudf rmm::rmm CUDA::cudart_static
-                     ${SIMPATICO_NVRTC_LIB} CUDA::cuda_driver dl)
+    simpatico
+    PUBLIC cudf::cudf
+           rmm::rmm
+           CUDA::cudart_static
+           ${SIMPATICO_NVRTC_LIB}
+           CUDA::cuda_driver
+           dl
+           fsst_gpu)
 else()
   target_link_libraries(
     simpatico
@@ -191,7 +253,8 @@ else()
            nvcomp
            ${SIMPATICO_NVRTC_LIB}
            cuda
-           dl)
+           dl
+           fsst_gpu)
 endif()
 
 function(add_codegen_host_test name)

@@ -650,6 +650,20 @@ struct snappy_compressor : compressor {
                                                       rmm::device_async_resource_ref mr) override;
 };
 
+// FSST-GPU (CompactionV5T) string codec. Opaque, self-describing payload — same
+// representation shape as snappy; reconstructed generically via nvcomp_simple_from_outputs.
+struct fsst_compressed_representation : nvcomp_simple_rep_base<OpId::Fsst, leaf_meta::fsst> {
+  using nvcomp_simple_rep_base::nvcomp_simple_rep_base;
+  std::unique_ptr<cudf::column> decompress(rmm::cuda_stream_view stream,
+                                           rmm::device_async_resource_ref mr) const override;
+};
+
+struct fsst_compressor : compressor {
+  std::unique_ptr<compressed_representation> compress(cudf::column_view column_to_compress,
+                                                      rmm::cuda_stream_view stream,
+                                                      rmm::device_async_resource_ref mr) override;
+};
+
 struct lz4_compressor : compressor {
   std::unique_ptr<compressed_representation> compress(cudf::column_view column_to_compress,
                                                       rmm::cuda_stream_view stream,

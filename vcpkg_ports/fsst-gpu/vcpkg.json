@@ -1,0 +1,8 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
+  "homepage": "https://github.com/joosthooz/fsst-gpu",
+  "license": "Apache-2.0",
+  "name": "fsst-gpu",
+  "supports": "linux",
+  "version-string": "1958667"
+}

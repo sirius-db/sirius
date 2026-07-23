@@ -600,6 +600,9 @@ std::unique_ptr<compressed_representation> reconstruct_representation(
     case OpId::Snappy:
       return nvcomp_simple_from_outputs<snappy_compressed_representation, leaf_meta::snappy>(
         "snappy", output_names, std::move(outputs), stream, mr, error_out, meta);
+    case OpId::Fsst:
+      return nvcomp_simple_from_outputs<fsst_compressed_representation, leaf_meta::fsst>(
+        "fsst", output_names, std::move(outputs), stream, mr, error_out, meta);
     case OpId::Lz4:
       return nvcomp_simple_from_outputs<lz4_compressed_representation, leaf_meta::lz4>(
         "lz4", output_names, std::move(outputs), stream, mr, error_out, meta);

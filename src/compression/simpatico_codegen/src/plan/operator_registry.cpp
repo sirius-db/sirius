@@ -53,6 +53,7 @@ std::vector<OperatorInfo> const& operator_registry()
     {OpId::Snappy,         "snappy",          {"output"},                                                             true,  true,  false, false},
     {OpId::Deflate,        "deflate",         {"output"},                                                             true,  true,  false, false},
     {OpId::Lz4,            "lz4",             {"output"},                                                             true,  true,  false, false},
+    {OpId::Fsst,           "fsst",            {"output"},                                                             true,  true,  false, false},
     {OpId::Bitextract,     "bitextract",      {},                                                                     true,  false, true,  false},
     {OpId::Identity,       "identity",        {"data"},                                                               false, false, false, false},
     {OpId::NvcompCascaded, "nvcomp_cascaded", {"output"},                                                             false, false, false, false},
@@ -159,6 +160,7 @@ std::unique_ptr<compressor> make_compressor(std::string const& name)
     case OpId::AlpRd: return std::make_unique<alp_rd_compressor>();
     case OpId::Ans: return std::make_unique<ans_compressor>();
     case OpId::Snappy: return std::make_unique<snappy_compressor>();
+    case OpId::Fsst: return std::make_unique<fsst_compressor>();
     case OpId::Lz4: return std::make_unique<lz4_compressor>();
     case OpId::Deflate: return std::make_unique<deflate_compressor>();
     case OpId::Bitextract: {

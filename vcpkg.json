@@ -12,6 +12,7 @@
   "dependencies": [
     "cudf",
     "cuco",
+    "fsst-gpu",
     "nvrtc",
     "yaml-cpp",
     "abseil",
