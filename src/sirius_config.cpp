@@ -88,6 +88,7 @@ static void from_yaml(const YAML::Node& node, creator::task_creator_config& opt)
   r.optional("thread_name_prefix", opt.thread_pool.thread_name_prefix);
   r.optional("cpu_affinity", opt.thread_pool.cpu_affinity_list);
   r.optional("strategy", opt.strategy);
+  r.optional("priority_order", opt.priority);
   r.reject_unknown();
 }
 

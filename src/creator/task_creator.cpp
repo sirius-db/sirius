@@ -23,6 +23,7 @@
 #include "pipeline/gpu_pipeline_task.hpp"
 #include "pipeline/task_scheduler.hpp"
 #include "planner/query.hpp"
+#include "planner/query_index.hpp"
 #include "sirius_context.hpp"
 
 #include <cucascade/cudf/gpu_data_representation.hpp>
@@ -100,6 +101,8 @@ void task_creator::prepare_for_query(const sirius::planner::query& query)
   std::shared_ptr<const telemetry::telemetry_context> telemetry_context =
     sirius_ctx->get_telemetry_context();
 
+  auto pipeline_priorities = compute_pipeline_priorities(query);
+
   for (const auto& pipeline : pipelines) {
     pipeline->set_task_creator(this);
     auto source_operator = pipeline->get_source();
@@ -110,6 +113,9 @@ void task_creator::prepare_for_query(const sirius::planner::query& query)
     size_t operator_id = source_operator->get_operator_id();
     auto gs =
       std::make_shared<pipeline::gpu_pipeline_task_global_state>(pipeline, telemetry_context);
+    if (auto it = pipeline_priorities.find(pipeline.get()); it != pipeline_priorities.end()) {
+      gs->set_priority(it->second);
+    }
     _gpu_operator_global_state_map.emplace(operator_id, std::move(gs));
   }
 
@@ -123,6 +129,78 @@ void task_creator::prepare_for_query(const sirius::planner::query& query)
       _lookahead_queue.push_back(*it);
     }
   }
+}
+
+std::unordered_map<const pipeline::sirius_pipeline*, exec::queue_priority>
+task_creator::compute_pipeline_priorities(const sirius::planner::query& query) const
+{
+  // Partition the pipeline DAG into branches (linear chains between branch points) and give each
+  // pipeline a scheduling priority. LOWER priority values are dispatched first by the pipeline-
+  // level priority queue, so a pipeline's priority ascends with its execution order. The final
+  // priorities are compacted to a dense, contiguous 0..N-1 range (N = number of pipelines) so the
+  // assignment is easy to read off against the plan. The rules (see query_index for the branch
+  // definition):
+  //   - Branches are ordered by plan order; an earlier branch is ALWAYS strictly lower (runs
+  //     first) than a later one (guaranteed by a per-branch stride larger than any branch length).
+  //   - Within a branch, source ranks the head (closest to the scan) lowest; sink reverses it.
+  //   - A pipeline shared by several branches (a join/merge endpoint) takes the MIN priority of
+  //     the branches that reach it, so it runs as soon as its earliest-needed branch wants it.
+  std::unordered_map<const pipeline::sirius_pipeline*, exec::queue_priority> priorities;
+
+  auto options  = planner::build_index_options{.branch_order = planner::build_probe{}};
+  auto index    = planner::query_index::build_index(query, options);
+  auto branches = index->get_branches();
+  if (branches.empty()) { return priorities; }
+
+  const bool sink_first = _config.priority == priority_order::sink;
+
+  // Stride larger than any branch length keeps cross-branch ordering strictly dominant over the
+  // within-branch offset.
+  std::size_t max_branch_len = 0;
+  for (const auto& chain : branches) {
+    max_branch_len = std::max(max_branch_len, chain.size());
+  }
+  const exec::queue_priority stride = static_cast<exec::queue_priority>(max_branch_len) + 1;
+
+  const std::size_t num_branches = branches.size();
+  for (std::size_t b = 0; b < num_branches; ++b) {
+    const auto& chain               = branches[b];
+    const auto len                  = chain.size();
+    const exec::queue_priority base = static_cast<exec::queue_priority>(b) * stride;
+    for (std::size_t pos = 0; pos < len; ++pos) {
+      // source: head (pos 0) gets the smallest offset so it runs first; sink reverses
+      // within-branch.
+      const exec::queue_priority within   = sink_first
+                                              ? static_cast<exec::queue_priority>(len - 1 - pos)
+                                              : static_cast<exec::queue_priority>(pos);
+      const exec::queue_priority priority = base + within;
+      auto [it, inserted]                 = priorities.try_emplace(chain[pos], priority);
+      if (!inserted) { it->second = std::min(it->second, priority); }
+    }
+  }
+
+  // The strided values above are correct in relative order but sparse (short branches leave gaps).
+  // Compact them to a dense 0..N-1 range by ranking the assigned priorities: each branch occupies a
+  // disjoint value range and a shared endpoint's min comes from a single branch's range, so every
+  // pipeline's raw priority is distinct and the rank is a clean bijection preserving execution
+  // order.
+  std::vector<exec::queue_priority> sorted;
+  sorted.reserve(priorities.size());
+  for (const auto& [pipeline, priority] : priorities) {
+    sorted.push_back(priority);
+  }
+  std::sort(sorted.begin(), sorted.end());
+  // Inject the query id into the high 32 bits so tasks are ordered by query first, then by the
+  // within-query pipeline rank in the low 32 bits. The priority queue picks the LOWEST value first,
+  // so an earlier query (smaller id) always runs before a later one, and within a query the dense
+  // 0..N-1 rank preserves pipeline execution order.
+  const exec::queue_priority query_bits = static_cast<exec::queue_priority>(query.get_query_id())
+                                          << 32;
+  for (auto& [pipeline, priority] : priorities) {
+    const auto rank = std::lower_bound(sorted.begin(), sorted.end(), priority) - sorted.begin();
+    priority        = query_bits | static_cast<exec::queue_priority>(rank);
+  }
+  return priorities;
 }
 
 void task_creator::drain_pending_tasks()
@@ -188,7 +266,6 @@ op::sirius_physical_operator* task_creator::get_operator_for_next_task(
 
 void task_creator::stop()
 {
-  std::lock_guard<std::mutex> lock(_global_state_mutex);
   _task_creation_queue.interrupt();
   do_stop_thread_pool();
 }
@@ -279,8 +356,7 @@ void task_creator::manager_loop()
     auto request_kind = request->type;
     if (node == nullptr) { continue; }
 
-    auto* source = node;
-    node         = get_operator_for_next_task(node);
+    node = get_operator_for_next_task(node);
 
     if (node == nullptr) { continue; }
 
@@ -447,6 +523,7 @@ void task_creator::manager_loop()
                                                                     gpu_pipeline_task_global_state);
           task_lock.unlock();
           _task_scheduler->schedule(std::move(task));
+
           if (request_kind == request_type::lookahead) { break; }
         }
         // Unconditional re-evaluation at every creation exit: with the

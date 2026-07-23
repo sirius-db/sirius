@@ -22,6 +22,9 @@
 #include "telemetry-bridge/gen/uuid.rs.h"
 #include "telemetry/telemetry_context.hpp"
 
+#include <atomic>
+#include <cstdint>
+
 namespace sirius {
 class sirius_engine;
 }  // namespace sirius
@@ -81,10 +84,22 @@ class query {
   [[nodiscard]] const duckdb::vector<duckdb::shared_ptr<pipeline::sirius_pipeline>>& get_pipelines()
     const;
 
+  /**
+   * @brief Monotonic id assigned at construction; earlier queries get a lower id.
+   *
+   * Used as the high 32 bits of a task's scheduling priority so all tasks of an earlier query are
+   * dispatched before those of a later one (the priority queue picks the lowest value first).
+   */
+  [[nodiscard]] uint32_t get_query_id() const { return _query_id; }
+
  private:
   //! Builds the internal data structures from the pipelines
   void build_indices();
 
+  //! Process-wide monotonic counter; each query claims the next value as its id at construction.
+  static std::atomic<uint32_t> _query_counter;
+  //! This query's id (lower = created earlier = scheduled first).
+  uint32_t _query_id;
   //! Unique ID for this plan
   uuid::UUID _plan_id;
   //! Pipelines and the order in which they must be executed in order to successfully complete the
