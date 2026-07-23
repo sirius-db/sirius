@@ -106,6 +106,13 @@ TEST_CASE("uri_encode follows RFC3986 rules needed by SigV4", "[s3][sigv4]")
   CHECK(uri_encode("~!@#$", true) == "~%21%40%23%24");
 }
 
+TEST_CASE("uri_encode canonicalizes literal S3 keys exactly once", "[s3][sigv4]")
+{
+  CHECK(uri_encode("path with space.parquet", false) == "path%20with%20space.parquet");
+  CHECK(uri_encode("100%.parquet", false) == "100%25.parquet");
+  CHECK(uri_encode("a%2Fb.parquet", false) == "a%252Fb.parquet");
+}
+
 TEST_CASE("sign_request rejects incomplete signer config", "[s3][sigv4]")
 {
   auto creds = aws_example_creds();

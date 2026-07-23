@@ -92,8 +92,9 @@ class sirius_httpfs : public duckdb::FileSystem {
   /// expands via one paginated S3 LIST (see @ref expand_glob) under four
   /// contracts: it is gated like @ref OpenFile (resolvable @c ClientContext,
   /// @c gpu_execution on, no CPU-fallback replay); each match carries its
-  /// LIST-provided size so the open needs no HEAD; a matched key containing a
-  /// percent-encoded sequence (@c % + two hex digits) throws; and zero matches
+  /// LIST-provided size so the open needs no HEAD; matched keys are embedded
+  /// literally, except a key with a literal @c '?' in a Hive partition segment
+  /// throws (it would be silently dropped from partitioning); and zero matches
   /// yield an empty vector.
   duckdb::vector<duckdb::OpenFileInfo> Glob(const std::string& path,
                                             duckdb::FileOpener* opener = nullptr) override;
@@ -108,17 +109,6 @@ class sirius_httpfs : public duckdb::FileSystem {
  protected:
   bool SupportsOpenFileExtended() const override { return true; }
 };
-
-/// Escape a literal S3 object key for embedding into an @c s3:// URI so the
-/// later @c sirius::io::parse() of that URI restores the exact key bytes.
-/// LIST returns keys as literal bytes, but the open path treats the produced
-/// string as a URI — @c '#' starts a fragment, @c '?' starts a query, and
-/// @c %xx percent-decodes — so exactly those three bytes are escaped
-/// (@c '%'→"%25" first, then @c '#'→"%23", @c '?'→"%3F"). Every other byte,
-/// including @c '/', @c '=' and space, stays literal: hive-partition path
-/// text (@c col=a b/) must survive unchanged. Identity for keys without
-/// @c %/#/?, i.e. every plain key round-trips byte-identically.
-std::string escape_s3_key_for_uri(std::string_view key);
 
 /// Expand an @c s3:// glob @p pattern into concrete object URIs via one
 /// paginated ListObjectsV2 sweep, streamed page-by-page (peak memory = one

@@ -227,13 +227,19 @@ void create_special_key_fixtures(fs::path const& fixture_dir)
 
   auto const root = fixture_dir / "glob-enc";
   fs::remove_all(root);
-  std::array<std::pair<fs::path, fs::path>, 6> const fixtures{{
+  std::array<std::pair<fs::path, fs::path>, 12> const fixtures{{
     {nation, root / "a%2Fb.parquet"},
     {region, root / "a" / "b.parquet"},
     {nation, root / "x#1.parquet"},
     {nation, root / "y?v.parquet"},
     {nation, root / "100%.parquet"},
     {nation, root / "t" / "col=a%20b" / "p0.parquet"},
+    {nation, root / "q" / "col=a%3Fb" / "p0.parquet"},
+    {nation, root / "q" / "col=a?b" / "p0.parquet"},
+    {nation, root / "f%20g.parquet"},
+    {region, root / "f g.parquet"},
+    {nation, root / "guard-before" / "co?l=value" / "p0.parquet"},
+    {nation, root / "guard-filename" / "report=foo?bar.parquet"},
   }};
   for (auto const& [source, destination] : fixtures) {
     fs::create_directories(destination.parent_path());
