@@ -1571,6 +1571,13 @@ static void SetModifiedPipeline(ClientContext& context, SetScope scope, Value& p
   SIRIUS_LOG_DEBUG("Updated config MODIFIED_PIPELINE to {}", Config::MODIFIED_PIPELINE);
 }
 
+static void SetFuseMergePipelines(ClientContext& /*context*/,
+                                  SetScope /*scope*/,
+                                  Value& /*parameter*/)
+{
+  // DuckDB stores this setting in the client context.
+}
+
 static sirius::operator_params* get_operator_params(ClientContext& context)
 {
   auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
@@ -1881,6 +1888,12 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
                             LogicalType::BOOLEAN,
                             Value::BOOLEAN(Config::MODIFIED_PIPELINE),
                             SetModifiedPipeline);
+
+  config.AddExtensionOption("fuse_merge_pipelines",
+                            "Fuse eligible GROUP BY and TOP_N merges into downstream pipelines",
+                            LogicalType::BOOLEAN,
+                            Value::BOOLEAN(true),
+                            SetFuseMergePipelines);
 
   // Add in config options for duckdb scan task
   // Default batch size

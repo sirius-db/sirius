@@ -760,6 +760,86 @@ void sirius_physical_plan_generator::set_parent_ops(sirius::op::sirius_physical_
   }
 }
 
+namespace {
+
+//! Whether a sink's input semantics permit merge fusion.
+//!
+//! Only sinks with special multi-input wiring are excluded. Everything else -- including
+//! total-input structural sinks such as ORDER_BY, TOP_N, and an outer GROUP BY -- is fusable:
+//! those sinks already buffer their full input, so folding the merge into their pipeline does
+//! not change when they observe complete data, it only removes a task launch and a repository
+//! round-trip.
+bool terminal_sink_supports_fusion(const sirius::op::sirius_physical_operator& sink)
+{
+  using T = sirius::op::SiriusPhysicalOperatorType;
+  switch (sink.type) {
+    // Joins and CTE/delim terminals have multiple inputs or bespoke sink wiring.
+    case T::CTE:
+    case T::LEFT_DELIM_JOIN:
+    case T::RIGHT_DELIM_JOIN:
+    case T::HASH_JOIN:
+    case T::NESTED_LOOP_JOIN: return false;
+    // Partition sinks require complete upstream input in a single task.
+    case T::PARTITION:
+    case T::SORT_PARTITION: return false;
+    default: return true;
+  }
+}
+
+//! Whether the path to the first downstream sink is unary, streaming, and safe to fuse.
+bool merge_downstream_is_streaming_dead_end(const sirius::op::sirius_physical_operator& merge)
+{
+  // Delim-owned merges require sink wiring.
+  if (merge.owning_delim_join() != nullptr) { return false; }
+  for (auto* cur = merge.get_parent_op(); cur != nullptr; cur = cur->get_parent_op()) {
+    if (cur->is_sink()) { return terminal_sink_supports_fusion(*cur); }
+    if (cur->is_source() || cur->children.size() != 1) { return false; }
+  }
+  return false;
+}
+
+}  // namespace
+
+void sirius_physical_plan_generator::mark_fusable_merge_pipelines(
+  duckdb::ClientContext& context, sirius::op::sirius_physical_operator& op)
+{
+  // Keep the fusion decision consistent throughout this plan traversal.
+  duckdb::Value setting;
+  bool fusion_enabled = true;  // matches the registered default
+  if (context.TryGetCurrentSetting("fuse_merge_pipelines", setting) && !setting.IsNull()) {
+    fusion_enabled = setting.GetValue<bool>();
+  }
+  mark_fusable_merge_pipelines(op, fusion_enabled);
+}
+
+void sirius_physical_plan_generator::mark_fusable_merge_pipelines(
+  sirius::op::sirius_physical_operator& op, bool fusion_enabled)
+{
+  // Ungrouped aggregate merges use a different partial-result handoff.
+  if (op.type == sirius::op::SiriusPhysicalOperatorType::MERGE_GROUP_BY) {
+    op.Cast<sirius::op::sirius_physical_grouped_aggregate_merge>().set_fuse_into_parent(
+      fusion_enabled && merge_downstream_is_streaming_dead_end(op));
+  } else if (op.type == sirius::op::SiriusPhysicalOperatorType::MERGE_TOP_N) {
+    op.Cast<sirius::op::sirius_physical_top_n_merge>().set_fuse_into_parent(
+      fusion_enabled && merge_downstream_is_streaming_dead_end(op));
+  }
+
+  for (auto& child : op.children) {
+    if (child) { mark_fusable_merge_pipelines(*child, fusion_enabled); }
+  }
+  // Visit subtrees stored outside children[] as well.
+  if (op.type == sirius::op::SiriusPhysicalOperatorType::LEFT_DELIM_JOIN ||
+      op.type == sirius::op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN) {
+    auto& delim = op.Cast<sirius::op::sirius_physical_delim_join>();
+    if (delim.join) { mark_fusable_merge_pipelines(*delim.join, fusion_enabled); }
+    if (delim.distinct_root) { mark_fusable_merge_pipelines(*delim.distinct_root, fusion_enabled); }
+  }
+  if (op.type == sirius::op::SiriusPhysicalOperatorType::RESULT_COLLECTOR) {
+    mark_fusable_merge_pipelines(op.Cast<sirius::op::sirius_physical_result_collector>().plan,
+                                 fusion_enabled);
+  }
+}
+
 void sirius_physical_plan_generator::insert_gpu_pipeline_operators(
   duckdb::unique_ptr<sirius::op::sirius_physical_operator>& plan)
 {
