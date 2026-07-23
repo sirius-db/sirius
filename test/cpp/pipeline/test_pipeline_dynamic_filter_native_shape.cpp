@@ -16,6 +16,12 @@
 
 #include <catch.hpp>
 #include <duckdb.hpp>
+// Reaching a join operator through the pipeline headers instantiates
+// `vector<join_condition>`'s destructor, which needs the AST node definition.
+#include <expression/ast/node.hpp>
+#include <op/sirius_physical_operator.hpp>
+#include <pipeline/sirius_pipeline.hpp>
+#include <pipeline/sirius_pipeline_converter.hpp>
 #include <sirius_config.hpp>
 #include <sirius_context.hpp>
 #include <utils/pipeline_conversion_test_utils.hpp>
@@ -23,6 +29,7 @@
 
 #include <filesystem>
 #include <string>
+#include <unordered_set>
 
 namespace fs = std::filesystem;
 
@@ -107,4 +114,60 @@ TEST_CASE("duckdb-native scans consume dynamic filters", "[integration][pipeline
     pushdown_switch_guard off(con, /*enabled=*/false);
     REQUIRE_FALSE(contains(sirius::test::convert_query_to_dump(con, join_query), "DYNAMIC_FILTER"));
   }
+}
+
+//! The endpoint applies its mask to a plain batch, so it must be fed pipelineable data -- never the
+//! partitioned data a PARTITION produces. `wrap_join_child` wraps whatever occupies a join's child
+//! slot as `CONCAT -> PARTITION -> <that child>`, so an endpoint already sitting in that slot lands
+//! on the source side of the PARTITION. Issue #1010's SIP placement depends on that holding for an
+//! endpoint inserted anywhere in a join's subtree, including on a build input, so pin it here: if
+//! the wrapper passes are ever reordered, this fails loudly instead of silently mis-shaping the
+//! plan. Conversion only -- no GPU execution.
+TEST_CASE("the dynamic-filter endpoint is never fed partitioned data",
+          "[integration][pipeline][dynamic_filter]")
+{
+  REQUIRE(sirius::test::g_integration_env != nullptr);
+  if (!sirius::test::g_integration_env->is_active()) { sirius::test::g_integration_env->resume(); }
+  auto con = sirius::test::g_integration_env->make_connection();
+
+  auto db_path = integration_db_path();
+  REQUIRE(fs::exists(db_path));
+  auto r = con.Query("ATTACH IF NOT EXISTS '" + db_path.string() + "' AS tpch (READ_ONLY);");
+  REQUIRE(r);
+  REQUIRE_FALSE(r->HasError());
+  r = con.Query("USE tpch;");
+  REQUIRE(r);
+  REQUIRE_FALSE(r->HasError());
+
+  const std::string join_query =
+    "SELECT count(*) FROM lineitem, part WHERE l_partkey = p_partkey AND p_size = 15";
+
+  std::size_t endpoints_checked = 0;
+  sirius::test::with_conversion_result(
+    con, join_query, [&](sirius::pipeline::pipeline_conversion_result& result) {
+      std::unordered_set<const sirius::op::sirius_physical_operator*> seen;
+
+      auto check = [&](sirius::op::sirius_physical_operator* op) {
+        if (op == nullptr || op->type != sirius::op::SiriusPhysicalOperatorType::DYNAMIC_FILTER) {
+          return;
+        }
+        if (!seen.insert(op).second) { return; }
+        ++endpoints_checked;
+        REQUIRE(op->children.size() == 1);
+        INFO("endpoint child is " << sirius::op::SiriusPhysicalOperatorToString(
+               op->children[0]->type));
+        CHECK(op->children[0]->type != sirius::op::SiriusPhysicalOperatorType::PARTITION);
+      };
+
+      for (auto const& pipeline : result.scheduled_pipelines) {
+        check(pipeline->get_source().get());
+        check(pipeline->get_sink().get());
+        for (auto& op_ref : pipeline->get_operators()) {
+          check(&op_ref.get());
+        }
+      }
+    });
+
+  // Guard against a vacuous pass: this query must actually wire an endpoint.
+  REQUIRE(endpoints_checked > 0);
 }
