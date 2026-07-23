@@ -95,12 +95,28 @@ if(ENABLE_ROCM)
   # hipDF's own project() enables LANGUAGES C CXX HIP; mirror that here so the
   # .cu sources in CUDA_SOURCES are compiled by hip-clang as HIP. CMAKE_HIP_ARCHITECTURES
   # accepts the same gfx* identifiers the ROCm toolchain targets (gfx90a / gfx942 /
-  # gfx950 — the Instinct MI series hipDF supports). 'native' is only meaningful on a
-  # host with an AMD GPU, so default to the explicit set for portability.
+  # gfx950 — the Instinct MI series hipDF supports), plus consumer GPUs (gfx1100
+  # etc.). Use 'native' (CMake ≥ 3.30) to auto-detect the installed GPU, falling
+  # back to the explicit MI-series list when no AMD GPU is present (CI/build-only).
   set(SIRIUS_GPU_LANG "HIP")
   if(NOT DEFINED CMAKE_HIP_ARCHITECTURES)
-    set(CMAKE_HIP_ARCHITECTURES gfx90a;gfx942;gfx950)
-    message(STATUS "CMAKE_HIP_ARCHITECTURES not defined. Setting to 'gfx90a;gfx942;gfx950'.")
+    # Try 'native' first — CMake queries rocminfo and targets the installed GPU(s).
+    # This makes the build work on ANY AMD GPU (MI300, MI250, RDNA3, etc.) without
+    # hardcoding an arch. If rocminfo is unavailable (CI containers), fall back to
+    # the MI-series list (the primary supported targets).
+    execute_process(
+      COMMAND rocminfo
+      OUTPUT_VARIABLE _rocminfo_output
+      ERROR_QUIET
+      RESULT_VARIABLE _rocminfo_result)
+    if(_rocminfo_result EQUAL 0 AND _rocminfo_output MATCHES "gfx[0-9]+[a-z]?[0-9]*")
+      set(CMAKE_HIP_ARCHITECTURES native)
+      message(STATUS "CMAKE_HIP_ARCHITECTURES: auto-detected via rocminfo (native)")
+    else()
+      set(CMAKE_HIP_ARCHITECTURES gfx90a;gfx942;gfx950)
+      message(STATUS "CMAKE_HIP_ARCHITECTURES: no GPU detected (rocminfo unavailable), "
+                     "defaulting to 'gfx90a;gfx942;gfx950'")
+    endif()
   endif()
 else()
   set(SIRIUS_GPU_LANG "CUDA")
