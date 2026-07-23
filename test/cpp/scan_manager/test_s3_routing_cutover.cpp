@@ -863,44 +863,45 @@ TEST_CASE("s3_rdma_ioctx factory builds the configured RDMA capability profile",
   CHECK(aligned[1].size() == ranges[1].size());
 }
 
-TEST_CASE("explicit RDMA rejects incomplete endpoint configuration", "[s3][rdma][routing]")
+TEST_CASE("s3_rdma registry rejects invalid RDMA configuration", "[s3][rdma][routing][config]")
 {
-  scan_manager_fixture fixture;
-  require_exception(
-    [&] { io_context_registry registry{make_unconfigured_rdma_scan_config(), *fixture.memory}; },
-    {"RDMA", "endpoint"});
-}
+  SECTION("config/incomplete-endpoint")
+  {
+    scan_manager_fixture fixture;
+    require_exception(
+      [&] { io_context_registry registry{make_unconfigured_rdma_scan_config(), *fixture.memory}; },
+      {"RDMA", "endpoint"});
+  }
 
-TEST_CASE("s3_rdma AC8 rejects presigned signing on the data plane", "[s3][rdma][routing][config]")
-{
-  scan_manager_fixture fixture;
-  auto cfg                                      = make_rdma_scan_config();
-  cfg.object_store.s3_rdma_data.s3_signing_mode = object_store_config::signing_mode::presigned;
+  SECTION("config/presigned-data-plane")
+  {
+    scan_manager_fixture fixture;
+    auto cfg                                      = make_rdma_scan_config();
+    cfg.object_store.s3_rdma_data.s3_signing_mode = object_store_config::signing_mode::presigned;
 
-  require_exception([&] { io_context_registry registry{std::move(cfg), *fixture.memory}; },
-                    {"data", "presigned"});
-}
+    require_exception([&] { io_context_registry registry{std::move(cfg), *fixture.memory}; },
+                      {"data", "presigned"});
+  }
 
-TEST_CASE("s3_rdma rejects an explicit zero queue cap during registry construction",
-          "[s3][rdma][routing][config]")
-{
-  scan_manager_fixture fixture;
-  auto cfg                           = make_rdma_scan_config();
-  cfg.object_store.s3_rdma_queue_cap = 0;
+  SECTION("config/zero-queue-cap")
+  {
+    scan_manager_fixture fixture;
+    auto cfg                           = make_rdma_scan_config();
+    cfg.object_store.s3_rdma_queue_cap = 0;
 
-  require_exception([&] { io_context_registry registry{std::move(cfg), *fixture.memory}; },
-                    {"queue_cap", "positive"});
-}
+    require_exception([&] { io_context_registry registry{std::move(cfg), *fixture.memory}; },
+                      {"queue_cap", "positive"});
+  }
 
-TEST_CASE("s3_rdma AC9 rejects a missing data endpoint during registry construction",
-          "[s3][rdma][routing][config]")
-{
-  scan_manager_fixture fixture;
-  auto cfg = make_rdma_scan_config();
-  cfg.object_store.s3_rdma_data.endpoint.clear();
+  SECTION("config/missing-data-endpoint")
+  {
+    scan_manager_fixture fixture;
+    auto cfg = make_rdma_scan_config();
+    cfg.object_store.s3_rdma_data.endpoint.clear();
 
-  require_exception([&] { io_context_registry registry{std::move(cfg), *fixture.memory}; },
-                    {"data", "endpoint"});
+    require_exception([&] { io_context_registry registry{std::move(cfg), *fixture.memory}; },
+                      {"data", "endpoint"});
+  }
 }
 
 TEST_CASE("s3_rdma AC9 propagates data-session capability errors through ioctx_for_path",

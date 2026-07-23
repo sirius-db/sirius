@@ -240,36 +240,37 @@ std::future<std::size_t> issue_device_read(sirius::io::sirius_datasource& ds,
 
 }  // namespace s3_rdma_p4a_tests
 
-TEST_CASE("s3_rdma retry metrics start at zero on a fresh ioctx", "[s3][rdma][metrics]")
+TEST_CASE("s3_rdma fresh ioctx exposes the expected performance snapshot", "[s3][rdma][metrics]")
 {
   using namespace s3_rdma_p4a_tests;
 
-  auto ctx = make_started_ioctx(std::make_shared<mock_transport_fixture>());
-  require_zero_snapshot(ctx->perf_snapshot());
-}
+  SECTION("snapshot/fresh-zero")
+  {
+    auto ctx = make_started_ioctx(std::make_shared<mock_transport_fixture>());
+    require_zero_snapshot(ctx->perf_snapshot());
+  }
 
-TEST_CASE("s3_rdma ioctx perf snapshot is the single reactor aggregate", "[s3][rdma][metrics]")
-{
-  using namespace s3_rdma_p4a_tests;
+  SECTION("snapshot/single-reactor-aggregate")
+  {
+    auto payload = pattern_bytes(2048);
 
-  auto payload = pattern_bytes(2048);
+    auto direct_transport = seeded_transport("direct", payload);
+    auto direct_reactor   = make_started_reactor(direct_transport);
+    cuobj_rdma_io_object direct_obj("s3://bucket/direct", "bucket", "direct", payload.size());
+    std::vector<std::uint8_t> direct_got(payload.size());
+    REQUIRE(direct_reactor->host_read(direct_obj, 0, direct_got.size(), direct_got.data()) ==
+            direct_got.size());
+    require_bytes_equal(direct_got, payload);
 
-  auto direct_transport = seeded_transport("direct", payload);
-  auto direct_reactor   = make_started_reactor(direct_transport);
-  cuobj_rdma_io_object direct_obj("s3://bucket/direct", "bucket", "direct", payload.size());
-  std::vector<std::uint8_t> direct_got(payload.size());
-  REQUIRE(direct_reactor->host_read(direct_obj, 0, direct_got.size(), direct_got.data()) ==
-          direct_got.size());
-  require_bytes_equal(direct_got, payload);
+    auto ioctx_transport = seeded_transport("via-ioctx", payload);
+    auto ctx             = make_started_ioctx(ioctx_transport);
+    auto ds              = open_ds(ctx, "via-ioctx");
+    std::vector<std::uint8_t> ioctx_got(payload.size());
+    REQUIRE(ds->host_read(0, ioctx_got.size(), ioctx_got.data()) == ioctx_got.size());
+    require_bytes_equal(ioctx_got, payload);
 
-  auto ioctx_transport = seeded_transport("via-ioctx", payload);
-  auto ctx             = make_started_ioctx(ioctx_transport);
-  auto ds              = open_ds(ctx, "via-ioctx");
-  std::vector<std::uint8_t> ioctx_got(payload.size());
-  REQUIRE(ds->host_read(0, ioctx_got.size(), ioctx_got.data()) == ioctx_got.size());
-  require_bytes_equal(ioctx_got, payload);
-
-  require_snapshots_equal(ctx->perf_snapshot(), direct_reactor->perf_snapshot());
+    require_snapshots_equal(ctx->perf_snapshot(), direct_reactor->perf_snapshot());
+  }
 }
 
 TEST_CASE("s3_rdma clean device read metrics count logical requests and bytes",
