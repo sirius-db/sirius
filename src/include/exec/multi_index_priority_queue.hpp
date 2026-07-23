@@ -323,6 +323,84 @@ class multi_index_priority_queue {
     return pop_from_device(idx.id, /*front=*/false);
   }
 
+  /// Removes and returns the first task -- in pop order (lowest priority, then
+  /// FIFO) -- for which `pred(const Task&)` is true, or nullopt if none matches.
+  /// Non-blocking. `pred` is called under the lock, so it must not touch the queue.
+  template <typename Pred>
+  [[nodiscard]] std::optional<task_ptr> try_pop_if(Pred pred)
+  {
+    std::lock_guard<std::mutex> lock(_mutex);
+    for (auto& [prio, lv] : _levels) {
+      if (node* n = find_in_list(lv.tasks, pred)) { return extract_node(n); }
+    }
+    return std::nullopt;
+  }
+
+  /// Like try_pop_if(pred), but restricted to one secondary-index bucket, scanned
+  /// in the same pop order. gpu_index{no_preferred_device} (-1) selects tasks with
+  /// no preferred device.
+  template <typename Pred>
+  [[nodiscard]] std::optional<task_ptr> try_pop_if(const operator_index& idx, Pred pred)
+  {
+    std::lock_guard<std::mutex> lock(_mutex);
+    return pop_if_in_levels(_operator_levels, idx.value, pred);
+  }
+  template <typename Pred>
+  [[nodiscard]] std::optional<task_ptr> try_pop_if(const query_index& idx, Pred pred)
+  {
+    std::lock_guard<std::mutex> lock(_mutex);
+    return pop_if_in_levels(_query_levels, idx.value, pred);
+  }
+  template <typename Pred>
+  [[nodiscard]] std::optional<task_ptr> try_pop_if(const pipeline_index& idx, Pred pred)
+  {
+    std::lock_guard<std::mutex> lock(_mutex);
+    const auto it = _pipeline_level.find(idx.value);
+    if (it == _pipeline_level.end()) { return std::nullopt; }
+    if (node* n = find_in_list(_levels.at(it->second).tasks, pred)) { return extract_node(n); }
+    return std::nullopt;
+  }
+  template <typename Pred>
+  [[nodiscard]] std::optional<task_ptr> try_pop_if(const gpu_index& idx, Pred pred)
+  {
+    std::lock_guard<std::mutex> lock(_mutex);
+    const auto it = _by_device.find(idx.id);
+    if (it == _by_device.end()) { return std::nullopt; }
+    for (auto& [prio, bucket] : it->second) {
+      for (node* n : bucket) {
+        if (pred(static_cast<const Task&>(*n->task))) { return extract_node(n); }
+      }
+    }
+    return std::nullopt;
+  }
+
+  /// Removes and returns the first task satisfying `pred`, scanning the whole
+  /// queue front-to-back (lowest priority first, FIFO within a level) when
+  /// `front_to_back` is true, or back-to-front (highest priority first, most
+  /// recent within a level) when false. Unlike try_pop_if, `pred` receives a
+  /// *mutable* `Task&`. nullopt if none matches. Non-blocking; `pred` runs under
+  /// the lock and must not touch the queue.
+  template <typename Pred>
+  [[nodiscard]] std::optional<task_ptr> mutable_pop_if(Pred pred, bool front_to_back)
+  {
+    std::lock_guard<std::mutex> lock(_mutex);
+    if (front_to_back) {
+      for (auto& [prio, lv] : _levels) {
+        for (node& n : lv.tasks) {
+          if (pred(*n.task)) { return extract_node(&n); }
+        }
+      }
+    } else {
+      for (auto lit = _levels.rbegin(); lit != _levels.rend(); ++lit) {
+        auto& tasks = lit->second.tasks;
+        for (auto nit = tasks.rbegin(); nit != tasks.rend(); ++nit) {
+          if (pred(*nit->task)) { return extract_node(&(*nit)); }
+        }
+      }
+    }
+    return std::nullopt;
+  }
+
   /// Wakes every thread blocked in pop()/pop_back(); while interrupted they return
   /// nullptr once the queue is empty. Idempotent.
   void interrupt()
@@ -517,6 +595,29 @@ class multi_index_priority_queue {
     if (it == map.end() || it->second.empty()) { return std::nullopt; }
     const queue_priority prio = front ? *it->second.begin() : *it->second.rbegin();
     return extract_node(level_end_node(prio, front));
+  }
+
+  /// Returns the first node in `tasks` (FIFO order) satisfying `pred`, or nullptr.
+  template <typename Pred>
+  node* find_in_list(std::list<node>& tasks, Pred& pred)
+  {
+    for (node& n : tasks) {
+      if (pred(static_cast<const Task&>(*n.task))) { return &n; }
+    }
+    return nullptr;
+  }
+
+  /// Scans a level-set index's levels in ascending-priority order and pops the
+  /// first (FIFO within a level) task satisfying `pred`.
+  template <typename Map, typename Key, typename Pred>
+  std::optional<task_ptr> pop_if_in_levels(Map& map, const Key& key, Pred& pred)
+  {
+    const auto it = map.find(key);
+    if (it == map.end()) { return std::nullopt; }
+    for (const queue_priority prio : it->second) {
+      if (node* n = find_in_list(_levels.at(prio).tasks, pred)) { return extract_node(n); }
+    }
+    return std::nullopt;
   }
 
   /// Pops the front/back task of a pipeline's single level.

@@ -18,7 +18,7 @@
 
 #include "exec/channel.hpp"
 #include "exec/config.hpp"
-#include "exec/inspectable_priority_queue.hpp"
+#include "exec/multi_index_priority_queue.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "parallel/task.hpp"
 #include "pipeline/completion_handler.hpp"
@@ -125,7 +125,7 @@ class task_scheduler {
   /**
    * @brief Get a pointer to the pipeline-level task queue.
    */
-  [[nodiscard]] exec::inspectable_priority_queue<sirius::parallel::itask>*
+  [[nodiscard]] exec::multi_index_priority_queue<sirius::parallel::itask>*
   get_pipeline_task_queue() noexcept
   {
     return &_task_queue;
@@ -219,7 +219,7 @@ class task_scheduler {
   duckdb::shared_ptr<planner::query> _query;
 
   /// Pipeline-level task queue, ordered by task priority (highest dispatched first).
-  exec::inspectable_priority_queue<sirius::parallel::itask> _task_queue;
+  exec::multi_index_priority_queue<sirius::parallel::itask> _task_queue;
   exec::channel<std::unique_ptr<task_request>> _task_request_channel;
   /// Publisher used by schedule() to wake the management event loop when a new
   /// task is pushed into _task_queue. The event loop blocks on _task_request_channel

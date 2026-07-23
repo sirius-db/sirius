@@ -23,7 +23,7 @@
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/memory_space.hpp>
 #include <data/convertible_gpu_pipeline_task.hpp>
-#include <exec/inspectable_priority_queue.hpp>
+#include <exec/multi_index_priority_queue.hpp>
 #include <op/sirius_physical_operator.hpp>
 #include <parallel/task.hpp>
 #include <pipeline/gpu_pipeline_task.hpp>
@@ -72,6 +72,17 @@ class dummy_task : public sirius::parallel::itask {
   void execute(rmm::cuda_stream_view /*stream*/) override {}
 };
 
+/// Trivial index-keys extractor: puts every task in one priority level, which
+/// reproduces the plain-FIFO behavior of the old default queue. These tests
+/// exercise RAII return + predicate filtering, not priority/index ordering.
+sirius::exec::multi_index_priority_queue<sirius::parallel::itask>::key_extractor test_extractor()
+{
+  return [](const sirius::parallel::itask&) {
+    return sirius::exec::index_keys{
+      0, sirius::op::SiriusPhysicalOperatorType::INVALID, 0, 0, sirius::exec::no_preferred_device};
+  };
+}
+
 /// Helper: create a gpu_pipeline_task with the given data batches.
 /// Batches remain in idle state (the new cucascade API default).
 std::unique_ptr<sirius::pipeline::gpu_pipeline_task> make_test_gpu_task(
@@ -110,18 +121,18 @@ TEST_CASE("RAII returns task to queue on destruction", "[convertible_gpu_pipelin
 {
   auto& e = env();
 
-  sirius::exec::inspectable_priority_queue<sirius::parallel::itask> queue;
+  sirius::exec::multi_index_priority_queue<sirius::parallel::itask> queue(test_extractor());
   auto batch = sirius::test::operator_utils::make_numeric_batch(
     *e.gpu_space, std::vector<int32_t>{1, 2, 3}, cudf::type_id::INT32);
   auto task = make_test_gpu_task(1, {batch});
-  REQUIRE(queue.push(std::move(task)));
+  queue.push(std::move(task));
   REQUIRE(queue.size() == 1);
 
   {
     sirius::convertible_gpu_pipeline_task_provider provider(queue);
     auto cd = provider.get_next_convertible(e.gpu_space, false);
     REQUIRE(cd != nullptr);
-    REQUIRE(queue.is_empty());
+    REQUIRE(queue.empty());
     // cd destroyed here, task returned to queue via RAII
   }
 
@@ -132,11 +143,11 @@ TEST_CASE("RAII returns task after successful convert", "[convertible_gpu_pipeli
 {
   auto& e = env();
 
-  sirius::exec::inspectable_priority_queue<sirius::parallel::itask> queue;
+  sirius::exec::multi_index_priority_queue<sirius::parallel::itask> queue(test_extractor());
   auto batch = sirius::test::operator_utils::make_numeric_batch(
     *e.gpu_space, std::vector<int32_t>{10, 20, 30}, cudf::type_id::INT32);
   auto task = make_test_gpu_task(1, {batch});
-  REQUIRE(queue.push(std::move(task)));
+  queue.push(std::move(task));
 
   {
     sirius::convertible_gpu_pipeline_task_provider provider(queue);
@@ -152,8 +163,8 @@ TEST_CASE("RAII returns task after successful convert", "[convertible_gpu_pipeli
 
   // Verify the batch is now in HOST tier
   auto returned_task = queue.try_pop();
-  REQUIRE(returned_task != nullptr);
-  auto* gpt = dynamic_cast<sirius::pipeline::gpu_pipeline_task*>(returned_task.get());
+  REQUIRE(returned_task.has_value());
+  auto* gpt = dynamic_cast<sirius::pipeline::gpu_pipeline_task*>(returned_task->get());
   REQUIRE(gpt != nullptr);
   auto* ls = dynamic_cast<sirius::pipeline::gpu_pipeline_task_local_state*>(gpt->local_state());
   REQUIRE(ls != nullptr);
@@ -167,17 +178,17 @@ TEST_CASE("RAII returns task on exception", "[convertible_gpu_pipeline_task]")
 {
   auto& e = env();
 
-  sirius::exec::inspectable_priority_queue<sirius::parallel::itask> queue;
+  sirius::exec::multi_index_priority_queue<sirius::parallel::itask> queue(test_extractor());
   auto batch = sirius::test::operator_utils::make_numeric_batch(
     *e.gpu_space, std::vector<int32_t>{4, 5, 6}, cudf::type_id::INT32);
   auto task = make_test_gpu_task(1, {batch});
-  REQUIRE(queue.push(std::move(task)));
+  queue.push(std::move(task));
 
   {
     sirius::convertible_gpu_pipeline_task_provider provider(queue);
     auto cd = provider.get_next_convertible(e.gpu_space, false);
     REQUIRE(cd != nullptr);
-    REQUIRE(queue.is_empty());
+    REQUIRE(queue.empty());
 
     try {
       throw std::runtime_error("test exception");
@@ -194,8 +205,8 @@ TEST_CASE("non-gpu_pipeline_task skipped by predicate", "[convertible_gpu_pipeli
 {
   auto& e = env();
 
-  sirius::exec::inspectable_priority_queue<sirius::parallel::itask> queue;
-  REQUIRE(queue.push(std::make_unique<dummy_task>()));
+  sirius::exec::multi_index_priority_queue<sirius::parallel::itask> queue(test_extractor());
+  queue.push(std::make_unique<dummy_task>());
   REQUIRE(queue.size() == 1);
 
   sirius::convertible_gpu_pipeline_task_provider provider(queue);
@@ -208,12 +219,12 @@ TEST_CASE("wrong memory_space skipped by predicate", "[convertible_gpu_pipeline_
 {
   auto& e = env();
 
-  sirius::exec::inspectable_priority_queue<sirius::parallel::itask> queue;
+  sirius::exec::multi_index_priority_queue<sirius::parallel::itask> queue(test_extractor());
   // Create GPU task with batch in gpu_space
   auto batch = sirius::test::operator_utils::make_numeric_batch(
     *e.gpu_space, std::vector<int32_t>{1, 2, 3}, cudf::type_id::INT32);
   auto task = make_test_gpu_task(1, {batch});
-  REQUIRE(queue.push(std::move(task)));
+  queue.push(std::move(task));
 
   sirius::convertible_gpu_pipeline_task_provider provider(queue);
   // Search for tasks in host_space — should find nothing (batch is in gpu_space)
@@ -226,12 +237,12 @@ TEST_CASE("non-idle batch skipped by predicate", "[convertible_gpu_pipeline_task
 {
   auto& e = env();
 
-  sirius::exec::inspectable_priority_queue<sirius::parallel::itask> queue;
+  sirius::exec::multi_index_priority_queue<sirius::parallel::itask> queue(test_extractor());
   auto batch = sirius::test::operator_utils::make_numeric_batch(
     *e.gpu_space, std::vector<int32_t>{7, 8, 9}, cudf::type_id::INT32);
 
   auto task = make_test_gpu_task(1, {batch});
-  REQUIRE(queue.push(std::move(task)));
+  queue.push(std::move(task));
 
   // Hold an exclusive lock so batch is not idle — provider should skip it
   auto exclusive_lock = batch->to_mutable();
@@ -251,27 +262,27 @@ TEST_CASE("matching task selected by predicate", "[convertible_gpu_pipeline_task
 {
   auto& e = env();
 
-  sirius::exec::inspectable_priority_queue<sirius::parallel::itask> queue;
+  sirius::exec::multi_index_priority_queue<sirius::parallel::itask> queue(test_extractor());
   auto batch = sirius::test::operator_utils::make_numeric_batch(
     *e.gpu_space, std::vector<int32_t>{1, 2, 3}, cudf::type_id::INT32);
   auto task = make_test_gpu_task(1, {batch});  // batch is idle
-  REQUIRE(queue.push(std::move(task)));
+  queue.push(std::move(task));
 
   sirius::convertible_gpu_pipeline_task_provider provider(queue);
   auto cd = provider.get_next_convertible(e.gpu_space, false);
   REQUIRE(cd != nullptr);
-  REQUIRE(queue.is_empty());
+  REQUIRE(queue.empty());
 }
 
 TEST_CASE("convert GPU task to HOST", "[convertible_gpu_pipeline_task]")
 {
   auto& e = env();
 
-  sirius::exec::inspectable_priority_queue<sirius::parallel::itask> queue;
+  sirius::exec::multi_index_priority_queue<sirius::parallel::itask> queue(test_extractor());
   auto batch = sirius::test::operator_utils::make_numeric_batch(
     *e.gpu_space, std::vector<int32_t>{100, 200, 300}, cudf::type_id::INT32);
   auto task = make_test_gpu_task(1, {batch});
-  REQUIRE(queue.push(std::move(task)));
+  queue.push(std::move(task));
 
   sirius::convertible_gpu_pipeline_task_provider provider(queue);
   auto cd = provider.get_next_convertible(e.gpu_space, false);
@@ -287,7 +298,7 @@ TEST_CASE("bytes_in_space returns correct size", "[convertible_gpu_pipeline_task
 {
   auto& e = env();
 
-  sirius::exec::inspectable_priority_queue<sirius::parallel::itask> queue;
+  sirius::exec::multi_index_priority_queue<sirius::parallel::itask> queue(test_extractor());
   auto batch1 = sirius::test::operator_utils::make_numeric_batch(
     *e.gpu_space, std::vector<int32_t>{1, 2, 3}, cudf::type_id::INT32);
   auto batch2 = sirius::test::operator_utils::make_numeric_batch(
@@ -297,7 +308,7 @@ TEST_CASE("bytes_in_space returns correct size", "[convertible_gpu_pipeline_task
   auto batch2_size = get_batch_size(*batch2);
 
   auto task = make_test_gpu_task(1, {batch1, batch2});
-  REQUIRE(queue.push(std::move(task)));
+  queue.push(std::move(task));
 
   sirius::convertible_gpu_pipeline_task_provider provider(queue);
   auto cd = provider.get_next_convertible(e.gpu_space, false);
@@ -311,20 +322,20 @@ TEST_CASE("get_all_convertible extracts all matching tasks", "[convertible_gpu_p
 {
   auto& e = env();
 
-  sirius::exec::inspectable_priority_queue<sirius::parallel::itask> queue;
+  sirius::exec::multi_index_priority_queue<sirius::parallel::itask> queue(test_extractor());
 
   for (uint64_t i = 0; i < 3; ++i) {
     auto batch = sirius::test::operator_utils::make_numeric_batch(
       *e.gpu_space, std::vector<int32_t>{1, 2, 3}, cudf::type_id::INT32);
     auto task = make_test_gpu_task(i + 1, {batch});
-    REQUIRE(queue.push(std::move(task)));
+    queue.push(std::move(task));
   }
   REQUIRE(queue.size() == 3);
 
   sirius::convertible_gpu_pipeline_task_provider provider(queue);
   auto all = provider.get_all_convertible(e.gpu_space, false);
   REQUIRE(all.size() == 3);
-  REQUIRE(queue.is_empty());
+  REQUIRE(queue.empty());
 
   // Destroy all wrappers — tasks should return to queue
   all.clear();
@@ -335,17 +346,17 @@ TEST_CASE("RAII on interrupted queue does not crash", "[convertible_gpu_pipeline
 {
   auto& e = env();
 
-  sirius::exec::inspectable_priority_queue<sirius::parallel::itask> queue;
+  sirius::exec::multi_index_priority_queue<sirius::parallel::itask> queue(test_extractor());
   auto batch = sirius::test::operator_utils::make_numeric_batch(
     *e.gpu_space, std::vector<int32_t>{1, 2, 3}, cudf::type_id::INT32);
   auto task = make_test_gpu_task(1, {batch});
-  REQUIRE(queue.push(std::move(task)));
+  queue.push(std::move(task));
 
   {
     sirius::convertible_gpu_pipeline_task_provider provider(queue);
     auto cd = provider.get_next_convertible(e.gpu_space, false);
     REQUIRE(cd != nullptr);
-    REQUIRE(queue.is_empty());
+    REQUIRE(queue.empty());
 
     // Interrupt the queue before destroying the wrapper
     queue.interrupt();
@@ -353,5 +364,5 @@ TEST_CASE("RAII on interrupted queue does not crash", "[convertible_gpu_pipeline
   }
 
   // Queue is interrupted and empty — task was destroyed, not pushed
-  REQUIRE(queue.is_empty());
+  REQUIRE(queue.empty());
 }

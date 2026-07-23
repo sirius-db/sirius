@@ -345,6 +345,121 @@ TEST_CASE("multi_index device index stays consistent across other-index pops",
 }
 
 // =============================================================================
+// try_pop_if -- predicate-filtered pops in pop order
+// =============================================================================
+
+TEST_CASE("multi_index try_pop_if pops the lowest-priority match globally",
+          "[multi_index_priority_queue]")
+{
+  multi_index_priority_queue<payload> q(by_keys());
+  q.push(task(1, keys_of(1)));  // odd id, priority 1
+  q.push(task(2, keys_of(2)));  // even id, priority 2
+  q.push(task(4, keys_of(3)));  // even id, priority 3
+
+  // Scans in pop order (priority 1, 2, 3); first even id is 2 (at priority 2),
+  // even though id 1 sits ahead globally.
+  auto match = q.try_pop_if([](const payload& p) { return p.id % 2 == 0; });
+  REQUIRE(match.has_value());
+  REQUIRE((*match)->id == 2);
+  REQUIRE(q.size() == 2);
+
+  REQUIRE_FALSE(q.try_pop_if([](const payload&) { return false; }).has_value());
+  REQUIRE(q.size() == 2);
+}
+
+TEST_CASE("multi_index try_pop_if honors FIFO within a level", "[multi_index_priority_queue]")
+{
+  multi_index_priority_queue<payload> q(by_keys());
+  q.push(task(1, keys_of(5)));  // one pipeline (priority 5), three FIFO tasks
+  q.push(task(2, keys_of(5)));
+  q.push(task(3, keys_of(5)));
+
+  auto match = q.try_pop_if([](const payload& p) { return p.id >= 2; });
+  REQUIRE(match.has_value());
+  REQUIRE((*match)->id == 2);  // FIFO: id 2 before id 3
+  REQUIRE(q.size() == 2);
+}
+
+TEST_CASE("multi_index try_pop_if scoped to an operator bucket", "[multi_index_priority_queue]")
+{
+  multi_index_priority_queue<payload> q(by_keys());
+  q.push(task(10, keys_of(1, SiriusPhysicalOperatorType::FILTER)));
+  q.push(task(20, keys_of(2, SiriusPhysicalOperatorType::HASH_JOIN)));
+  q.push(task(12, keys_of(3, SiriusPhysicalOperatorType::FILTER)));
+
+  // Only FILTER levels are scanned (ascending priority); the HASH_JOIN task is
+  // never considered even though it matches the predicate.
+  auto match = q.try_pop_if(operator_index{SiriusPhysicalOperatorType::FILTER},
+                            [](const payload& p) { return p.id != 10; });
+  REQUIRE(match.has_value());
+  REQUIRE((*match)->id == 12);
+  REQUIRE(q.size(operator_index{SiriusPhysicalOperatorType::HASH_JOIN}) == 1);
+
+  // No FILTER task matches -> nullopt, nothing removed.
+  REQUIRE_FALSE(q.try_pop_if(operator_index{SiriusPhysicalOperatorType::FILTER},
+                             [](const payload& p) { return p.id == 999; })
+                  .has_value());
+  REQUIRE(q.size() == 2);
+}
+
+TEST_CASE("multi_index try_pop_if scoped to a device bucket", "[multi_index_priority_queue]")
+{
+  multi_index_priority_queue<payload> q(by_keys());
+  // Device 0 preferred at priorities 1 (id 2) and 5 (id 1); device 1 at priority 2.
+  q.push(task(2, keys_of(1, SiriusPhysicalOperatorType::FILTER, 0, /*device=*/0)));
+  q.push(task(1, keys_of(5, SiriusPhysicalOperatorType::FILTER, 0, /*device=*/0)));
+  q.push(task(9, keys_of(2, SiriusPhysicalOperatorType::FILTER, 0, /*device=*/1)));
+
+  // Scans device-0 buckets ascending (priority 1 then 5); id 2 fails, id 1 matches.
+  auto match = q.try_pop_if(gpu_index{0}, [](const payload& p) { return p.id == 1; });
+  REQUIRE(match.has_value());
+  REQUIRE((*match)->id == 1);
+  REQUIRE(q.size(gpu_index{0}) == 1);  // id 2 remains
+  REQUIRE(q.size(gpu_index{1}) == 1);  // device 1 untouched
+
+  REQUIRE_FALSE(q.try_pop_if(gpu_index{7}, [](const payload&) { return true; }).has_value());
+}
+
+// =============================================================================
+// mutable_pop_if -- mutable predicate, directional scan (used by the downgrade path)
+// =============================================================================
+
+TEST_CASE("multi_index mutable_pop_if scans in the requested direction",
+          "[multi_index_priority_queue]")
+{
+  multi_index_priority_queue<payload> q(by_keys());
+  q.push(task(1, keys_of(1)));
+  q.push(task(2, keys_of(2)));
+  q.push(task(3, keys_of(3)));
+
+  // front_to_back: lowest priority first -> first id >= 2 is id 2 (priority 2).
+  auto front = q.mutable_pop_if([](payload& p) { return p.id >= 2; }, /*front_to_back=*/true);
+  REQUIRE(front.has_value());
+  REQUIRE((*front)->id == 2);
+
+  // back_to_front over {1, 3}: highest priority first -> first match is id 3 (priority 3).
+  auto back = q.mutable_pop_if([](payload& p) { return p.id >= 1; }, /*front_to_back=*/false);
+  REQUIRE(back.has_value());
+  REQUIRE((*back)->id == 3);
+
+  REQUIRE(q.size() == 1);
+  REQUIRE_FALSE(q.mutable_pop_if([](payload&) { return false; }, true).has_value());
+}
+
+TEST_CASE("multi_index mutable_pop_if honors direction within a level",
+          "[multi_index_priority_queue]")
+{
+  multi_index_priority_queue<payload> q(by_keys());
+  for (int i = 1; i <= 3; ++i) {
+    q.push(task(i, keys_of(5)));  // one level (priority 5), FIFO: 1, 2, 3
+  }
+  REQUIRE(q.mutable_pop_if([](payload&) { return true; }, /*front_to_back=*/true).value()->id == 1);
+  REQUIRE(q.mutable_pop_if([](payload&) { return true; }, /*front_to_back=*/false).value()->id ==
+          3);
+  REQUIRE(q.pop()->id == 2);
+}
+
+// =============================================================================
 // Thread-safety: blocking pop, interrupt, drain
 // =============================================================================
 
