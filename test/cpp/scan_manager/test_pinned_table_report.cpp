@@ -221,3 +221,34 @@ TEST_CASE("pinned table report: live delta counts match the table's state",
   REQUIRE(report.dirty_chunks == 1);
   exec_ok(*env.con, "ROLLBACK");
 }
+
+TEST_CASE("pinned table report: stale flips when the table's DataTable is replaced",
+          "[pinned_table_report][scan_manager]")
+{
+  report_test_db env;
+  auto* space = mem_mgr()->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  REQUIRE(space != nullptr);
+
+  exec_ok(*env.con, "CREATE TABLE t AS SELECT range::INTEGER AS k FROM range(1000)");
+  exec_ok(*env.con, "CHECKPOINT");
+
+  exec_ok(*env.con, "BEGIN TRANSACTION");
+  auto& storage = resolve_storage(*env.con, "t");
+  auto v_base   = duckdb::DuckTransaction::Get(*env.con->context, storage.GetAttached()).start_time;
+  auto entry    = make_duckdb_entry("t", /*base_rows=*/1000, v_base, *space);
+  entry.mvcc->pin_storage = storage.shared_from_this();
+  {
+    auto report = make_pinned_table_report("t", entry, *env.con->context);
+    REQUIRE(report.stale == false);  // same DataTable
+  }
+  exec_ok(*env.con, "ROLLBACK");
+
+  // A structural ALTER replaces the table's DataTable object.
+  exec_ok(*env.con, "ALTER TABLE t ADD COLUMN x INTEGER");
+  exec_ok(*env.con, "BEGIN TRANSACTION");
+  {
+    auto report = make_pinned_table_report("t", entry, *env.con->context);
+    REQUIRE(report.stale == true);
+  }
+  exec_ok(*env.con, "ROLLBACK");
+}

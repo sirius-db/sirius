@@ -15,6 +15,7 @@
  */
 
 #include "duckdb/main/database.hpp"
+#include "duckdb/storage/data_table.hpp"
 #define DUCKDB_EXTENSION_MAIN
 
 #include "config.hpp"
@@ -1177,6 +1178,11 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
   // The pin transaction's MVCC fence on the pinned table's own AttachedDatabase;
   // meaningful only for format == "duckdb" (see duckdb_mvcc_metadata::v_base).
   transaction_t duckdb_pin_v_base = 0;
+  // The DataTable pinned over, for the plan-time schema-drift guard. A structural
+  // ALTER / DROP replaces the DataTable, so a later scan of a different object is
+  // reading a table that drifted since the pin. duckdb::weak_ptr matches
+  // DataTable::shared_from_this().
+  duckdb::weak_ptr<duckdb::DataTable> duckdb_pin_storage;
 
   if (data.args.format == "duckdb") {
     auto info = build_duckdb_pin_info(
@@ -1190,7 +1196,8 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
     // DuckTransaction.
     auto& pinned_catalog = Catalog::GetCatalog(context, info->catalog_name);
     duckdb_pin_v_base    = DuckTransaction::Get(context, pinned_catalog).start_time;
-    ingestible           = sirius::op::scan::make_ingestible(std::move(info));
+    if (info->storage != nullptr) { duckdb_pin_storage = info->storage->shared_from_this(); }
+    ingestible = sirius::op::scan::make_ingestible(std::move(info));
   } else {  // parquet
     auto& fs   = FileSystem::GetFileSystem(context);
     auto files = fs.GlobFiles(data.args.path);
@@ -1237,6 +1244,7 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
     if (data.args.format == "duckdb") {
       sirius::scan_manager::duckdb_mvcc_metadata mvcc;
       mvcc.v_base                   = duckdb_pin_v_base;
+      mvcc.pin_storage              = duckdb_pin_storage;
       mvcc.base_row_count_per_chunk = std::move(mat.base_row_count_per_chunk);
       scan_mgr.attach_mvcc_metadata(data.args.name, std::move(mvcc));
     }
@@ -1255,6 +1263,7 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
     if (data.args.format == "duckdb") {
       sirius::scan_manager::duckdb_mvcc_metadata mvcc;
       mvcc.v_base                   = duckdb_pin_v_base;
+      mvcc.pin_storage              = duckdb_pin_storage;
       mvcc.base_row_count_per_chunk = std::move(base_row_count_per_chunk);
       scan_mgr.attach_mvcc_metadata(data.args.name, std::move(mvcc));
     }
@@ -1336,6 +1345,7 @@ static unique_ptr<FunctionData> SiriusPinnedTablesBind(ClientContext& context,
   add("delta_insert_rows", LogicalType::UBIGINT);
   add("delta_delete_rows", LogicalType::UBIGINT);
   add("dirty_chunks", LogicalType::UBIGINT);
+  add("stale", LogicalType::BOOLEAN);
   return make_uniq<TableFunctionData>();
 }
 
@@ -1386,6 +1396,7 @@ static void SiriusPinnedTablesFunction(ClientContext& context,
     output.SetValue(14, rows, opt_u(r.delta_insert_rows));
     output.SetValue(15, rows, opt_u(r.delta_delete_rows));
     output.SetValue(16, rows, opt_u(r.dirty_chunks));
+    output.SetValue(17, rows, r.stale ? Value::BOOLEAN(*r.stale) : Value(LogicalType::BOOLEAN));
     ++rows;
   }
   output.SetCardinality(rows);

@@ -170,6 +170,20 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
         // disk-native path is MVCC-blind, and the pin's checkpoint suppression
         // makes its snapshot increasingly stale — so scans the pin cannot serve
         // never fall through to it.
+
+        // (0) schema drift: every structural ALTER / DROP replaces the table's
+        // DataTable object, so a live storage that differs from the pinned one
+        // means the cache is over a stale schema (a RENAME reuses the object and
+        // keeps serving). Decline to CPU rather than serve positionally-wrong
+        // data. An empty weak_ptr (pin predates the field, or the table was
+        // dropped) also declines.
+        auto const pinned_storage = entry->mvcc->pin_storage.lock();
+        if (!pinned_storage || pinned_storage.get() != &storage || !storage.IsMainTable()) {
+          throw duckdb::NotImplementedException(
+            "duckdb-native scan: table '%s' was altered since it was pinned (schema drift); "
+            "serving from DuckDB. Re-pin to cache the new schema",
+            table.name);
+        }
         auto const n_cache = entry->mvcc->n_cache();
         // (a) snapshot-too-old: this transaction opened before the pin, so
         // the cache's base image is from its future.

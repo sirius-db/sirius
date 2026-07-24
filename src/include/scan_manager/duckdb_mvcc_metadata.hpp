@@ -16,12 +16,17 @@
 
 #pragma once
 
+#include <duckdb/common/shared_ptr.hpp>
 #include <duckdb/common/typedefs.hpp>
 
 #include <cstddef>
 #include <numeric>
 #include <string>
 #include <vector>
+
+namespace duckdb {
+class DataTable;
+}  // namespace duckdb
 
 namespace sirius::scan_manager {
 
@@ -57,6 +62,16 @@ struct duckdb_mvcc_metadata {
   /// see rows the last checkpoint compacted out of the disk image, so it cannot
   /// be served from this cache.
   duckdb::transaction_t v_base{0};
+
+  /// The DataTable this cache was pinned over. Every structural ALTER (add /
+  /// drop / retype a column) and DROP replaces the table's DataTable object,
+  /// so a query whose live DataTable differs from this one is scanning a table
+  /// that drifted since the pin: the positional cache is stale and the plan
+  /// must decline (a RENAME reuses the DataTable, so it keeps serving). Weak so
+  /// it never keeps a dropped table alive; empty for pins captured before this
+  /// field existed (treated as drifted). duckdb::weak_ptr matches the type
+  /// DataTable::shared_from_this() returns.
+  duckdb::weak_ptr<duckdb::DataTable> pin_storage;
 
   /// Physical row count of each pinned chunk, in materialization order — parallel
   /// to pinned_entry::chunk_memory_spaces (GPU tier) / host_chunks (HOST tier).

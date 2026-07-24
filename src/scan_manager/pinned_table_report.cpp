@@ -49,6 +49,11 @@ void fill_live_table_state(pinned_table_report& report,
                                                  report.table_name);
     auto& storage    = entry_base.Cast<duckdb::DuckTableEntry>().GetStorage();
 
+    // Schema drift: the live DataTable differs from the pinned one (structural
+    // ALTER / DROP replaces it) — the same check the plan-time guard makes.
+    auto const pinned_storage = entry.mvcc->pin_storage.lock();
+    report.stale = !pinned_storage || pinned_storage.get() != &storage || !storage.IsMainTable();
+
     auto const n_cache       = entry.mvcc->n_cache();
     auto const n_total       = static_cast<std::size_t>(storage.GetTotalRows());
     report.delta_insert_rows = n_total > n_cache ? n_total - n_cache : 0;

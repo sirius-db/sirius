@@ -63,6 +63,10 @@ struct pinned_table_report {
   std::optional<std::size_t> delta_insert_rows;  ///< rows above the cached prefix
   std::optional<std::size_t> delta_delete_rows;  ///< invisible rows inside the prefix
   std::optional<std::size_t> dirty_chunks;       ///< chunks needing a mask this snapshot
+  /// True when the pinned DataTable no longer matches the live one (a structural
+  /// ALTER / DROP): the cache is over a stale schema and scans decline to CPU.
+  /// Absent for parquet pins and when the table no longer resolves.
+  std::optional<bool> stale;
 };
 
 /// Build one report row for @p entry. Live-table fields resolve through
