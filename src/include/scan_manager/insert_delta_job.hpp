@@ -18,6 +18,7 @@
 
 #include "op/scan/duckdb_insert_delta.hpp"
 #include "op/scan/duckdb_native_gpu_ingestible.hpp"
+#include "scan_manager/delta_promotion.hpp"
 #include "scan_manager/mvcc_chunk_mask.hpp"
 #include "sirius_config.hpp"
 
@@ -46,6 +47,10 @@ class scoped_dispatcher;
 namespace sirius::io {
 class sirius_datasource;
 }  // namespace sirius::io
+
+namespace sirius::op::scan {
+class sirius_gpu_scan_operator;
+}  // namespace sirius::op::scan
 
 namespace sirius::memory {
 class topology_index;
@@ -92,6 +97,19 @@ struct insert_delta_job_request {
   std::vector<sirius::logical_type> union_types;  ///< parallel to union_cols
   std::size_t approximate_batch_size{sirius::config::DEFAULT_SCAN_TASK_BATCH_SIZE};
   std::string entry_name;
+
+  /// Delta promotion: the first qualifying matched operator (recorded by
+  /// try_match_cached_entry) decodes every cached column so promoted chunks
+  /// are full-width. The scan manager widens union_cols from
+  /// promotion_entry_cols just before the job runs (snapshotting the
+  /// pre-widen union for the disarm-and-retry fallback), and the handoff
+  /// widens the carrier's decode layout and attaches capture tickets.
+  op::scan::sirius_gpu_scan_operator* promotion_carrier{nullptr};
+  bool promotion_armed{false};
+  std::vector<duckdb::storage_t> promotion_entry_cols;      ///< all cached columns, entry order
+  std::vector<sirius::logical_type> promotion_entry_types;  ///< parallel to promotion_entry_cols
+  std::vector<duckdb::storage_t> pre_widen_union_cols;
+  std::vector<sirius::logical_type> pre_widen_union_types;
 
   /// Filled by the job. The plan owns the segment refs the bundles index into.
   op::scan::insert_delta_plan plan;
@@ -181,11 +199,17 @@ struct insert_delta_split {
  * those at plan time. Splits share the bundles' staging and mask storage.
  * @p datasource and @p block_manager serve the persistent segments' file
  * reads.
+ *
+ * @p promotion_plan (carrier op only): attach a promotion_capture ticket to
+ * each PROMOTABLE bundle's split so the decode hook photocopies it into the
+ * plan's sink. Null cuts exactly as before — no tickets. The caller must have
+ * widened @p op_projected_cols to the plan's decoded layout first.
  */
 std::vector<insert_delta_split> cut_delta_splits_for_op(
   insert_delta_job_request const& request,
   std::span<op::scan::projected_column const> op_projected_cols,
   std::shared_ptr<sirius::io::sirius_datasource> datasource,
-  duckdb::SingleFileBlockManager const* block_manager);
+  duckdb::SingleFileBlockManager const* block_manager,
+  std::shared_ptr<promotion_capture_plan const> promotion_plan = nullptr);
 
 }  // namespace sirius::scan_manager

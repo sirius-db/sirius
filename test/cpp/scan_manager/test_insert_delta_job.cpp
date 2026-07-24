@@ -346,6 +346,61 @@ TEST_CASE("insert-delta job: a partially visible bundle is not promotable",
   exec_ok(*tdb.con, "ROLLBACK");
 }
 
+TEST_CASE("insert-delta job: the carrier cut attaches tickets to promotable bundles only",
+          "[insert_delta_job][scan_manager]")
+{
+  job_test_db tdb;
+  exec_ok(*tdb.con, "SET threads TO 1");
+  exec_ok(*tdb.con, "CREATE TABLE t AS SELECT range::INTEGER AS k FROM range(10000)");
+  exec_ok(*tdb.con, "CHECKPOINT");
+  // Two closed persistent row groups (bulk) + an open transient tail.
+  exec_ok(*tdb.con, "INSERT INTO t SELECT (10000+range)::INTEGER FROM range(130000)");
+  exec_ok(*tdb.con, "INSERT INTO t VALUES (200000)");
+
+  exec_ok(*tdb.con, "BEGIN TRANSACTION");
+  auto& storage = resolve_storage(*tdb.con, "t");
+  std::vector<insert_delta_job_request> requests;
+  requests.push_back(make_request(
+    *tdb.con, storage, 10000, {0}, {sirius::logical_type::make(sirius::type_id::INTEGER)}));
+  requests[0].approximate_batch_size = 1;  // one bundle per row group
+  run(requests);
+  auto const& request = requests[0];
+  REQUIRE(request.bundles.size() == 3);  // two promotable + the open tail
+
+  auto plan                      = std::make_shared<sirius::scan_manager::promotion_capture_plan>();
+  plan->entry_name               = "t";
+  plan->column_names             = {"k"};
+  plan->entry_pos_by_decoded_pos = {0};
+  plan->sink                     = std::make_shared<sirius::scan_manager::promotion_sink>();
+
+  std::vector<sirius::op::scan::projected_column> op_cols{real_col(0)};
+  auto splits = cut_delta_splits_for_op(request, op_cols, nullptr, nullptr, plan);
+  REQUIRE(splits.size() == 3);
+  for (std::size_t i = 0; i < splits.size(); ++i) {
+    auto const& bundle = request.bundles[i];
+    auto const& ticket = splits[i].info->promotion;
+    if (bundle.promotable) {
+      REQUIRE(ticket != nullptr);
+      REQUIRE(ticket->plan == plan);
+      REQUIRE(ticket->row_count == bundle.total_rows);
+      REQUIRE(ticket->first_rowid ==
+              request.plan.row_groups[bundle.rg_indices.front()].row_group_start);
+      REQUIRE(ticket->row_group_indices.size() == bundle.rg_indices.size());
+      REQUIRE(ticket->reserve_bytes > 0);
+    } else {
+      REQUIRE(ticket == nullptr);  // the open tail never carries a ticket
+    }
+  }
+  REQUIRE(splits.back().info->promotion == nullptr);
+
+  // No plan (non-carrier op / promotion off): no split carries a ticket.
+  auto plain = cut_delta_splits_for_op(request, op_cols, nullptr, nullptr);
+  for (auto const& split : plain) {
+    REQUIRE(split.info->promotion == nullptr);
+  }
+  exec_ok(*tdb.con, "ROLLBACK");
+}
+
 TEST_CASE("insert-delta job: an ineligible plan marks no bundle promotable",
           "[insert_delta_job][scan_manager]")
 {

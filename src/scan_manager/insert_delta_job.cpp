@@ -346,7 +346,8 @@ std::vector<insert_delta_split> cut_delta_splits_for_op(
   insert_delta_job_request const& request,
   std::span<op::scan::projected_column const> op_projected_cols,
   std::shared_ptr<sirius::io::sirius_datasource> datasource,
-  duckdb::SingleFileBlockManager const* block_manager)
+  duckdb::SingleFileBlockManager const* block_manager,
+  std::shared_ptr<promotion_capture_plan const> promotion_plan)
 {
   std::vector<std::size_t> union_idx;
   union_idx.reserve(op_projected_cols.size());
@@ -433,6 +434,22 @@ std::vector<insert_delta_split> cut_delta_splits_for_op(
     // every file-backed split owns a fresh duplicate (matching the native-scan
     // coalescer); splits that read no file carry none.
     if (any_file_read && datasource) { info->datasource = datasource->duplicate(); }
+
+    // Carrier op: promotable bundles get a capture ticket so the decode hook
+    // photocopies the decoded table into the promotion sink. Never on
+    // non-promotable bundles (the open tail, masked bundles).
+    if (promotion_plan && bundle.promotable) {
+      auto ticket         = std::make_shared<promotion_capture>();
+      ticket->plan        = promotion_plan;
+      ticket->first_rowid = request.plan.row_groups[bundle.rg_indices.front()].row_group_start;
+      ticket->row_count   = bundle.total_rows;
+      ticket->row_group_indices.reserve(bundle.rg_indices.size());
+      for (auto rg_idx : bundle.rg_indices) {
+        ticket->row_group_indices.push_back(request.plan.row_groups[rg_idx].row_group_index);
+        ticket->reserve_bytes += request.plan.row_groups[rg_idx].decoded_bytes_budget;
+      }
+      info->promotion = std::move(ticket);
+    }
 
     out.push_back({std::move(info), bundle.mask, bundle.preferred_device});
   }

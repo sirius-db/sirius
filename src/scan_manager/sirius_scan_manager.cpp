@@ -207,6 +207,125 @@ std::string normalize_path(std::string const& p)
   return p;
 }
 
+/// Build the carrier's promotion plan and widen its decode layout. Called at
+/// handoff, after run_insert_delta_jobs, only when the request is armed, the
+/// plan is promotion-eligible, and at least one bundle is promotable. Returns
+/// nullptr (recording the reason on the entry's stats) on any structural
+/// surprise — the cut then proceeds narrow with no tickets, exactly the
+/// non-promoting path. append_promotion_columns runs LAST, only once
+/// everything else has succeeded, so a nullptr return leaves the decode
+/// layout untouched.
+std::shared_ptr<promotion_capture_plan const> arm_promotion_carrier(
+  insert_delta_job_request const& request,
+  pinned_entry& entry,
+  std::string const& entry_name,
+  op::scan::sirius_gpu_scan_operator& op,
+  op::scan::duckdb_native_ingestible_table_info const& duckdb_info,
+  std::shared_ptr<promotion_sink> sink,
+  cucascade::memory::memory_reservation_manager& reservation_manager,
+  sirius::memory::topology_index const& topology)
+{
+  auto& stats = entry.mvcc->promotion;
+  try {
+    auto* native = dynamic_cast<op::scan::duckdb_native_gpu_ingestible*>(&op.get_ingestible());
+    if (native == nullptr) {
+      stats.last_skip_reason = "carrier-not-duckdb-native";
+      return nullptr;
+    }
+
+    // Entry position by primary index (entry order == promotion_entry_cols order).
+    std::unordered_map<duckdb::storage_t, std::size_t> entry_pos_by_primary;
+    for (std::size_t i = 0; i < request.promotion_entry_cols.size(); ++i) {
+      entry_pos_by_primary.emplace(request.promotion_entry_cols[i], i);
+    }
+
+    // Widened decoded layout = [op's projection][cached columns not projected].
+    std::vector<op::scan::projected_column> extras;
+    std::vector<sirius::logical_type> extra_types;
+    std::vector<std::size_t> entry_pos_by_decoded_pos;
+    entry_pos_by_decoded_pos.reserve(request.promotion_entry_cols.size());
+    std::unordered_set<duckdb::storage_t> projected;
+    for (auto const& pc : duckdb_info.projected_cols) {
+      if (pc.is_rowid) {
+        stats.last_skip_reason = "carrier-projects-rowid";
+        return nullptr;
+      }
+      auto const primary = pc.storage_idx.GetPrimaryIndex();
+      projected.insert(primary);
+      auto const pos_it = entry_pos_by_primary.find(primary);
+      entry_pos_by_decoded_pos.push_back(pos_it == entry_pos_by_primary.end() ? kDropDecodedColumn
+                                                                              : pos_it->second);
+    }
+    for (std::size_t i = 0; i < request.promotion_entry_cols.size(); ++i) {
+      auto const primary = request.promotion_entry_cols[i];
+      if (projected.contains(primary)) { continue; }
+      op::scan::projected_column pc;
+      pc.storage_idx = duckdb::StorageIndex(primary);
+      pc.is_rowid    = false;
+      extras.push_back(pc);
+      extra_types.push_back(request.promotion_entry_types[i]);
+      entry_pos_by_decoded_pos.push_back(i);
+    }
+
+    // Every entry position must be covered exactly once, or a promoted chunk
+    // would violate the all-columns-per-chunk serving invariant.
+    {
+      std::vector<bool> covered(request.promotion_entry_cols.size(), false);
+      for (auto pos : entry_pos_by_decoded_pos) {
+        if (pos == kDropDecodedColumn) { continue; }
+        if (covered[pos]) {
+          stats.last_skip_reason = "carrier-duplicate-column";
+          return nullptr;
+        }
+        covered[pos] = true;
+      }
+      if (std::find(covered.begin(), covered.end(), false) != covered.end()) {
+        stats.last_skip_reason = "carrier-columns-incomplete";
+        return nullptr;
+      }
+    }
+
+    auto plan                      = std::make_shared<promotion_capture_plan>();
+    plan->entry_name               = entry_name;
+    plan->tier                     = entry.tier;
+    plan->column_names             = entry.cache_info.column_names();
+    plan->entry_pos_by_decoded_pos = std::move(entry_pos_by_decoded_pos);
+    plan->sink                     = std::move(sink);
+    if (entry.tier == cucascade::memory::Tier::HOST) {
+      // NUMA-local pinned host target per decoding GPU, the mask-job pattern:
+      // HOST spaces are keyed by NUMA node; GPUs map to nodes via topology.
+      auto host_spaces =
+        reservation_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
+      auto gpu_spaces =
+        reservation_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
+      if (host_spaces.empty()) {
+        stats.last_skip_reason = "no-host-space-for-gpu";
+        return nullptr;
+      }
+      // const_cast mirrors the pin path (sirius_extension's host_space_by_gpu):
+      // the tier span is const-qualified, but reservation/allocation on a space
+      // is mutating by design.
+      for (auto const* gpu : gpu_spaces) {
+        int const numa = topology.numa_node_of(gpu->get_device_id());
+        auto* pick     = const_cast<cucascade::memory::memory_space*>(host_spaces.front());
+        for (auto const* host : host_spaces) {
+          if (host->get_device_id() == (numa < 0 ? 0 : numa)) {
+            pick = const_cast<cucascade::memory::memory_space*>(host);
+            break;
+          }
+        }
+        plan->host_space_by_gpu.emplace(gpu->get_device_id(), pick);
+      }
+    }
+
+    native->append_promotion_columns(std::move(extras), std::move(extra_types));
+    return plan;
+  } catch (std::exception const& e) {
+    stats.last_skip_reason = std::string("carrier-arming-failed: ") + e.what();
+    return nullptr;
+  }
+}
+
 }  // namespace
 
 sirius_scan_manager::sirius_scan_manager(
@@ -434,11 +553,60 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
   // table has rows beyond its prefix.
   if (!_pending_insert_delta_jobs.empty()) {
     std::vector<int> const delta_gpu_ids(gpu_ids.begin(), gpu_ids.end());
-    run_insert_delta_jobs(_pending_insert_delta_jobs,
-                          *_dispatcher,
-                          _reservation_manager,
-                          *_topology_index,
-                          delta_gpu_ids);
+    // Delta promotion: widen each carrier request's union to every cached
+    // column so the capture stages the full width, snapshotting the true
+    // all-ops union first for the disarm-retry below.
+    for (auto& request : _pending_insert_delta_jobs) {
+      if (request.promotion_carrier == nullptr) { continue; }
+      request.pre_widen_union_cols  = request.union_cols;
+      request.pre_widen_union_types = request.union_types;
+      for (std::size_t i = 0; i < request.promotion_entry_cols.size(); ++i) {
+        auto const sidx = request.promotion_entry_cols[i];
+        if (std::find(request.union_cols.begin(), request.union_cols.end(), sidx) ==
+            request.union_cols.end()) {
+          request.union_cols.push_back(sidx);
+          request.union_types.push_back(request.promotion_entry_types[i]);
+        }
+      }
+      request.promotion_armed = true;
+    }
+    try {
+      run_insert_delta_jobs(_pending_insert_delta_jobs,
+                            *_dispatcher,
+                            _reservation_manager,
+                            *_topology_index,
+                            delta_gpu_ids);
+    } catch (std::exception const& e) {
+      bool const any_armed = std::ranges::any_of(_pending_insert_delta_jobs,
+                                                 [](auto const& r) { return r.promotion_armed; });
+      if (!any_armed) { throw; }
+      // Widening pulls unqueried cached columns into the capture; a column the
+      // query never touched (e.g. an overflow-limit varchar) can throw where
+      // the narrow capture would not. Disarm, disable promotion for those
+      // entries (sticky — the state persists until unpin), and retry once so
+      // the QUERY never pays for the widening gamble.
+      SIRIUS_LOG_WARN(
+        "[delta_promotion] delta capture failed with promotion widening ({}); retrying without "
+        "promotion",
+        e.what());
+      for (auto& request : _pending_insert_delta_jobs) {
+        if (!request.promotion_armed) { continue; }
+        request.union_cols        = std::move(request.pre_widen_union_cols);
+        request.union_types       = std::move(request.pre_widen_union_types);
+        request.promotion_armed   = false;
+        request.promotion_carrier = nullptr;
+        if (auto it = _pinned_entries.find(request.entry_name);
+            it != _pinned_entries.end() && it->second.mvcc != nullptr) {
+          it->second.mvcc->promotion.disabled_reason =
+            std::string("carrier-capture-failed: ") + e.what();
+        }
+      }
+      run_insert_delta_jobs(_pending_insert_delta_jobs,
+                            *_dispatcher,
+                            _reservation_manager,
+                            *_topology_index,
+                            delta_gpu_ids);
+    }
   }
 
   // Provider handoff, deferred to behind the mask run so ownership is a
@@ -484,17 +652,49 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
         }
         auto const* sf_bm = dynamic_cast<duckdb::SingleFileBlockManager const*>(
           &duckdb_info->storage->GetAttached().GetStorageManager().GetBlockManager());
+
+        // Delta promotion, carrier op only: widen the decode layout and build
+        // the capture plan the tickets reference. Ineligible plans (the delta
+        // starts mid-row-group: indexed tables) disable the entry stickily so
+        // later queries skip the widening cost outright.
+        std::shared_ptr<promotion_capture_plan const> promotion_plan;
+        if (delta_request->promotion_armed && delta_request->promotion_carrier == assignment.op) {
+          auto entry_it = _pinned_entries.find(assignment.entry_name);
+          if (entry_it != _pinned_entries.end() && entry_it->second.mvcc != nullptr) {
+            auto& entry = entry_it->second;
+            if (!delta_request->plan.promotion_eligible) {
+              entry.mvcc->promotion.disabled_reason = "delta-starts-mid-row-group";
+              SIRIUS_LOG_INFO(
+                "[delta_promotion] pinned entry '{}': delta starts mid-row-group (indexed "
+                "table); promotion disabled for this pin",
+                assignment.entry_name);
+            } else if (std::ranges::any_of(delta_request->bundles,
+                                           [](auto const& b) { return b.promotable; })) {
+              promotion_plan = arm_promotion_carrier(*delta_request,
+                                                     entry,
+                                                     assignment.entry_name,
+                                                     *assignment.op,
+                                                     *duckdb_info,
+                                                     _promotion_sink,
+                                                     _reservation_manager,
+                                                     *_topology_index);
+            }
+          }
+        }
+
         delta_splits = cut_delta_splits_for_op(*delta_request,
                                                duckdb_info->projected_cols,
                                                io_ctx->open_datasource(duckdb_info->db_path),
-                                               sf_bm);
+                                               sf_bm,
+                                               promotion_plan);
         SIRIUS_LOG_INFO(
           "[sirius_scan_manager] operator '{}' serves {} insert-delta split(s) of pinned entry "
-          "'{}' ({} delta row(s))",
+          "'{}' ({} delta row(s){})",
           assignment.op->get_operator_id(),
           delta_splits.size(),
           assignment.entry_name,
-          delta_request->plan.delta_rows());
+          delta_request->plan.delta_rows(),
+          promotion_plan ? ", promotion armed" : "");
       }
     }
     auto provider = make_provider_for_pinned_entry(*assignment.entry,
@@ -1467,6 +1667,53 @@ std::optional<sirius_scan_manager::cached_assignment> sirius_scan_manager::try_m
               delta_request->union_cols.end()) {
             delta_request->union_cols.push_back(sidx);
             delta_request->union_types.push_back(duckdb_info->projected_types[ci]);
+          }
+        }
+
+        // Delta promotion: the first qualifying op becomes the carrier — its
+        // delta splits later decode every cached column so promoted chunks are
+        // full-width. Zero-output-arity ops (count(*)) never carry: their
+        // post_filter keeps all columns, so extras would leak into the result.
+        // The union widening itself happens once all ops have matched, right
+        // before the job runs.
+        if (_promotion_enabled && delta_request->promotion_carrier == nullptr &&
+            entry.mvcc->promotion.disabled_reason.empty()) {
+          if (duckdb_info->output_types.empty()) {
+            SIRIUS_LOG_DEBUG(
+              "[delta_promotion] operator '{}' cannot carry for pinned entry '{}': zero output "
+              "arity (its post_filter keeps all decoded columns)",
+              op->get_operator_id(),
+              pinned_name);
+          } else {
+            bool types_cover_entry = true;
+            delta_request->promotion_entry_cols.clear();
+            delta_request->promotion_entry_types.clear();
+            for (auto const& cid : entry.cache_info.column_ids) {
+              auto const primary = cid.GetPrimaryIndex();
+              if (primary >= duckdb_info->returned_types.size()) {
+                types_cover_entry = false;
+                break;
+              }
+              delta_request->promotion_entry_cols.push_back(primary);
+              delta_request->promotion_entry_types.push_back(duckdb_info->returned_types[primary]);
+            }
+            if (types_cover_entry) {
+              delta_request->promotion_carrier = op;
+              SIRIUS_LOG_DEBUG(
+                "[delta_promotion] operator '{}' is the promotion carrier for "
+                "pinned entry '{}'",
+                op->get_operator_id(),
+                pinned_name);
+            } else {
+              delta_request->promotion_entry_cols.clear();
+              delta_request->promotion_entry_types.clear();
+              SIRIUS_LOG_DEBUG(
+                "[delta_promotion] operator '{}' cannot carry for pinned entry '{}': bind-time "
+                "returned_types ({}) do not cover the cached columns",
+                op->get_operator_id(),
+                pinned_name,
+                duckdb_info->returned_types.size());
+            }
           }
         }
       }
