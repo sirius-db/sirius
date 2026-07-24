@@ -272,7 +272,14 @@ void SiriusContext::QueryEnd()
     // returning to the pool even after unpin_table runs. Repositories are
     // already cleared above, so downstream data_batches that referenced
     // sliced host_data_representation are gone before we drop the providers.
-    if (scan_manager_) { scan_manager_->reset(); }
+    if (scan_manager_) {
+      scan_manager_->reset();
+      // Delta promotion: fold this query's captured delta slices into their
+      // pinned entries. Must run after reset() (providers destroyed, so no
+      // reader can observe the entry mutating) and inside the query-lifecycle
+      // slot (nothing else — query, pin, unpin — can interleave). noexcept.
+      scan_manager_->apply_pending_promotions();
+    }
 
     log_pool_stats("QueryEnd");
   } catch (...) {
@@ -711,7 +718,8 @@ void SiriusContext::create_query(
   task_scheduler_->prepare_for_query(query_);
   task_creator_->prepare_for_query(*query_);
   scan_manager_->prepare_for_query(*query_,
-                                   config_.get_operator_params().enable_pinned_zone_map_pruning);
+                                   config_.get_operator_params().enable_pinned_zone_map_pruning,
+                                   config_.get_operator_params().enable_delta_promotion);
 }
 
 duckdb::shared_ptr<sirius::planner::query> SiriusContext::get_query()

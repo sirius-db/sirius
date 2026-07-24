@@ -344,10 +344,22 @@ parquet_bind_result sirius_scan_manager::describe_parquet(std::string const& uri
 }
 
 void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
-                                            bool enable_pinned_zone_map_pruning)
+                                            bool enable_pinned_zone_map_pruning,
+                                            bool enable_delta_promotion)
 {
-  _pruning_enabled = enable_pinned_zone_map_pruning;
+  _pruning_enabled   = enable_pinned_zone_map_pruning;
+  _promotion_enabled = enable_delta_promotion;
   reset();
+  // Defensive: the sink drains at QueryEnd (apply_pending_promotions); leftover
+  // slices here mean that call was skipped. Drop them rather than applying
+  // stale captures against entries a pin/unpin may have replaced since.
+  if (_promotion_sink && !_promotion_sink->empty()) {
+    auto stale = _promotion_sink->take_all();
+    SIRIUS_LOG_WARN(
+      "[sirius_scan_manager] dropping stale promotion captures for {} entry(ies) left over from "
+      "a prior query (QueryEnd apply was skipped)",
+      stale.size());
+  }
 
   if (_io_ctx && _io_ctx->cache()) {
     SIRIUS_LOG_INFO("[sirius_scan_manager] cache summary: {}", _io_ctx->cache()->summary());
@@ -1033,6 +1045,37 @@ void sirius_scan_manager::attach_mvcc_metadata(const std::string& name,
   it->second.mvcc = std::make_unique<duckdb_mvcc_metadata>(std::move(metadata));
 }
 
+void sirius_scan_manager::apply_pending_promotions() noexcept
+{
+  try {
+    if (!_promotion_sink || _promotion_sink->empty()) { return; }
+    auto captures = _promotion_sink->take_all();
+    for (auto& [name, capture] : captures) {
+      auto it = _pinned_entries.find(name);
+      if (it == _pinned_entries.end() || it->second.mvcc == nullptr) {
+        // Unpinned (or re-pinned as non-mvcc) since capture: drop the slices —
+        // their column refs and admission reservations release right here.
+        SIRIUS_LOG_INFO(
+          "[delta_promotion] pinned entry '{}' is gone or not mvcc; dropping {} captured "
+          "promotion slice(s)",
+          name,
+          capture.slices.size());
+        continue;
+      }
+      apply_promotion_to_entry(it->second, std::move(capture), name);
+    }
+  } catch (std::exception const& e) {
+    SIRIUS_LOG_WARN(
+      "[delta_promotion] apply_pending_promotions failed ({}); captured slices "
+      "dropped, cache unchanged",
+      e.what());
+  } catch (...) {
+    SIRIUS_LOG_WARN(
+      "[delta_promotion] apply_pending_promotions failed (unknown); captured slices "
+      "dropped, cache unchanged");
+  }
+}
+
 void sirius_scan_manager::remove_pinned_entry(const std::string& name)
 {
   _pinned_entries.erase(name);
@@ -1094,6 +1137,114 @@ void validate_pinned_entry_for_serving(pinned_entry const& entry,
   }
 
   throw std::runtime_error("pinned entry has an unsupported tier");
+}
+
+void apply_promotion_to_entry(pinned_entry& entry,
+                              promotion_sink::entry_capture capture,
+                              std::string_view entry_name) noexcept
+{
+  try {
+    auto& stats = entry.mvcc->promotion;
+    if (!capture.last_skip_reason.empty()) { stats.last_skip_reason = capture.last_skip_reason; }
+    if (capture.slices.empty()) { return; }
+
+    // Contiguity ratchet: only the run extending unbroken from the current
+    // n_cache applies; the rest re-decode (and re-capture) on a later query.
+    std::vector<promotion_captured_slice> dropped;
+    auto selected =
+      select_promotion_prefix(std::move(capture.slices), entry.mvcc->n_cache(), dropped);
+    if (!dropped.empty()) {
+      stats.dropped_slices += dropped.size();
+      stats.last_skip_reason = "not-contiguous";
+      dropped.clear();  // frees columns / host chunks and releases reservations
+    }
+    if (selected.empty()) { return; }
+
+    // Pre-validate every selected slice against the entry layout, and reserve
+    // all target capacity, BEFORE mutating anything: the commit loop below must
+    // not be able to throw halfway through a lock-step append.
+    auto const& names   = entry.cache_info.column_names();
+    bool const gpu_tier = entry.tier == cucascade::memory::Tier::GPU;
+    for (auto const& slice : selected) {
+      bool ok = slice.row_count > 0;
+      if (gpu_tier) {
+        ok = ok && slice.space != nullptr && slice.column_names == names &&
+             slice.columns.size() == names.size() &&
+             std::all_of(slice.columns.begin(), slice.columns.end(), [](auto const& c) {
+               return c != nullptr;
+             });
+      } else {
+        ok = ok && slice.host_chunk != nullptr;
+      }
+      if (!ok) {
+        stats.dropped_slices += selected.size();
+        stats.last_skip_reason = "entry-layout-mismatch";
+        SIRIUS_LOG_WARN(
+          "[delta_promotion] pinned entry '{}': captured slices do not match the entry's tier or "
+          "column layout; dropping {} slice(s)",
+          entry_name,
+          selected.size());
+        return;
+      }
+    }
+    if (gpu_tier) {
+      for (auto const& name : names) {
+        auto it = entry.data_batches_by_column.find(name);
+        if (it == entry.data_batches_by_column.end()) {
+          stats.dropped_slices += selected.size();
+          stats.last_skip_reason = "entry-layout-mismatch";
+          return;
+        }
+        it->second.reserve(it->second.size() + selected.size());
+      }
+      entry.chunk_memory_spaces.reserve(entry.chunk_memory_spaces.size() + selected.size());
+    } else {
+      entry.host_chunks.reserve(entry.host_chunks.size() + selected.size());
+    }
+    entry.mvcc->base_row_count_per_chunk.reserve(entry.mvcc->base_row_count_per_chunk.size() +
+                                                 selected.size());
+
+    // No-throw commit: every push_back below lands in reserved capacity.
+    std::size_t applied_rows = 0;
+    for (auto& slice : selected) {
+      if (gpu_tier) {
+        for (std::size_t i = 0; i < names.size(); ++i) {
+          entry.data_batches_by_column.find(names[i])->second.push_back(
+            std::move(slice.columns[i]));
+        }
+        entry.chunk_memory_spaces.push_back(slice.space);
+      } else {
+        entry.host_chunks.push_back(std::move(slice.host_chunk));
+      }
+      entry.mvcc->base_row_count_per_chunk.push_back(slice.row_count);
+      entry.num_rows += slice.row_count;
+      applied_rows += slice.row_count;
+      // The admission claim converts to a plain tracked allocation, exactly how
+      // pin-time chunk memory is held.
+      slice.reservation.reset();
+      ++stats.promoted_chunks;
+      stats.promoted_rows += slice.row_count;
+    }
+    ++stats.promotion_queries;
+    SIRIUS_LOG_INFO(
+      "[delta_promotion] promoted {} chunk(s) / {} row(s) into pinned entry '{}'; the base now "
+      "covers {} row(s)",
+      selected.size(),
+      applied_rows,
+      entry_name,
+      entry.mvcc->n_cache());
+  } catch (std::exception const& e) {
+    SIRIUS_LOG_WARN(
+      "[delta_promotion] applying promotions to pinned entry '{}' failed ({}); remaining slices "
+      "dropped",
+      entry_name,
+      e.what());
+  } catch (...) {
+    SIRIUS_LOG_WARN(
+      "[delta_promotion] applying promotions to pinned entry '{}' failed (unknown); remaining "
+      "slices dropped",
+      entry_name);
+  }
 }
 
 std::unique_ptr<databatch_provider> make_provider_for_pinned_entry(

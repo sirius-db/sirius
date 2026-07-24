@@ -24,6 +24,7 @@
 #include "io/sirius_datasource.hpp"
 #include "op/scan/gpu_ingestible_types.hpp"
 #include "scan_manager/config.hpp"
+#include "scan_manager/delta_promotion.hpp"
 #include "scan_manager/duckdb_mvcc_metadata.hpp"
 #include "scan_manager/insert_delta_job.hpp"
 #include "scan_manager/load_balancing_scan_batch_coalescer.hpp"
@@ -204,6 +205,26 @@ struct pinned_entry {
 void validate_pinned_entry_for_serving(pinned_entry const& entry,
                                        std::span<std::size_t const> selected_columns);
 
+/// Apply one query's captured promotion slices to @p entry: run the contiguity
+/// ratchet from the entry's current n_cache(), pre-validate every selected
+/// slice against the entry's tier and column layout, then append chunks +
+/// chunk_memory_spaces / host_chunks + base_row_count_per_chunk + num_rows in
+/// lock-step (capacity reserved up front so the commit loop cannot throw
+/// midway). Dropped or rejected slices free their columns and release their
+/// admission reservations here; applied slices release the reservation while
+/// the allocation persists, tracked like pin memory. Updates
+/// entry.mvcc->promotion counters. Never throws — promotion is an
+/// optimization; any failure degrades to the per-query delta path.
+///
+/// Free function over pinned_entry (like validate_pinned_entry_for_serving)
+/// so tests drive it against hand-built entries without a manager. Callers
+/// must hold the query-lifecycle serialization: this MUTATES the entry, which
+/// is only safe when no providers are alive (sirius_scan_manager calls it from
+/// apply_pending_promotions, after reset() destroyed the query's providers).
+void apply_promotion_to_entry(pinned_entry& entry,
+                              promotion_sink::entry_capture capture,
+                              std::string_view entry_name) noexcept;
+
 /**
  * @brief Cache-serve-time survivor plan for one cached scan.
  */
@@ -304,7 +325,29 @@ class sirius_scan_manager {
   ///                                        changes must be forwarded per query by the caller).
   ///                                        Consulted by try_assign_cached_entries when building
   ///                                        the survivor plan.
-  void prepare_for_query(const sirius::planner::query& query, bool enable_pinned_zone_map_pruning);
+  /// @param enable_delta_promotion          Per-query snapshot of the delta-promotion flag (same
+  ///                                        forwarding rule). Gates the arming step only: OFF means
+  ///                                        no ticket is ever attached, so this query behaves as if
+  ///                                        promotion did not exist; already-promoted chunks stay.
+  void prepare_for_query(const sirius::planner::query& query,
+                         bool enable_pinned_zone_map_pruning,
+                         bool enable_delta_promotion = true);
+
+  /// \brief Apply the promotion slices captured during the finished query to
+  ///        their pinned entries, then clear the sink. Call at QueryEnd, after
+  ///        reset() has destroyed the query's providers (no readers remain) and
+  ///        while the query-lifecycle serialization is still held. Runs on
+  ///        failed queries too — captured slices are all-visible committed rows,
+  ///        correct regardless of the query's fate. noexcept: promotion must
+  ///        never turn QueryEnd into an error path.
+  void apply_pending_promotions() noexcept;
+
+  /// The promotion side channel shared with capture tickets. Stable for the
+  /// manager's lifetime.
+  [[nodiscard]] std::shared_ptr<promotion_sink> const& get_promotion_sink() const
+  {
+    return _promotion_sink;
+  }
 
   /// \brief Clear the providers map and join the driver thread if it is
   ///        still running.
@@ -502,6 +545,12 @@ class sirius_scan_manager {
   std::vector<op::scan::sirius_gpu_scan_operator*> _scan_op_order;
   std::unordered_map<std::string, pinned_entry> _pinned_entries;
   bool _pruning_enabled{true};
+  /// Per-query snapshot of the delta-promotion flag (set in prepare_for_query;
+  /// consulted by the arming step in try_match_cached_entry).
+  bool _promotion_enabled{true};
+  /// Side channel between the concurrent decode hooks and apply_pending_promotions.
+  /// Created once; capture plans hold shared_ptr copies. Survives reset().
+  std::shared_ptr<promotion_sink> _promotion_sink = std::make_shared<promotion_sink>();
 
   /// One mask computation per distinct pinned entry matched this query
   /// (recorded by try_match_cached_entry, deduped by entry name); executed

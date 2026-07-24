@@ -1771,6 +1771,14 @@ static void SetEnablePinnedZoneMapPruning(ClientContext& context, SetScope scope
                    params->enable_pinned_zone_map_pruning);
 }
 
+static void SetEnableDeltaPromotion(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  params->enable_delta_promotion = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config ENABLE_DELTA_PROMOTION to {}", params->enable_delta_promotion);
+}
+
 void SiriusExtension::InitialGPUConfigs(DBConfig& config)
 {
   // Add in config option for gpu buffer manager
@@ -2019,6 +2027,16 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
     LogicalType::BOOLEAN,
     Value::BOOLEAN(sirius::operator_params{}.enable_pinned_zone_map_pruning),
     SetEnablePinnedZoneMapPruning);
+
+  config.AddExtensionOption(
+    "enable_delta_promotion",
+    "Cache the decoded insert delta of a duckdb-format pinned table into the pin at query end "
+    "(whole closed row groups only), so later queries serve those rows from the cache instead of "
+    "re-decoding them. Turning it off stops new absorption immediately; already-promoted chunks "
+    "stay resident until unpin",
+    LogicalType::BOOLEAN,
+    Value::BOOLEAN(sirius::operator_params{}.enable_delta_promotion),
+    SetEnableDeltaPromotion);
 }
 
 static void LoadInternal(ExtensionLoader& loader)

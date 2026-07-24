@@ -130,6 +130,14 @@ struct operator_params {
   /// pin-time statistics capture and the serve-side survivor plan: a table pinned while the flag is
   /// off carries no zone maps and cannot prune until re-pinned with the flag on.
   bool enable_pinned_zone_map_pruning = true;
+
+  /// Delta promotion for duckdb-format pins: cache the decoded insert delta (whole closed row
+  /// groups) into the pinned entry at query end, so later queries serve those rows from the cache
+  /// instead of re-staging and re-decoding them. Gates the per-query arming step only: turning it
+  /// off stops new absorption immediately but keeps already-promoted chunks resident (they are
+  /// correct base data); a full reset is unpin + re-pin. Turn off for low-reuse or memory-tight
+  /// workloads where retaining the delta is not worth the one-time capture cost.
+  bool enable_delta_promotion = true;
 };
 
 struct telemetry_config {
