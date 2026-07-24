@@ -144,8 +144,9 @@ contract favors simple, auditable restoration boundaries:
 - every hash-join predicate/key column is native before partitioning and joining;
 - unrelated hash-join payloads retain their narrow carriers and are mapped through the join output
   projection maps;
-- aggregate inputs, ordering inputs, unsupported joins, and other unsupported boundaries are
-  restored to native;
+- value-sensitive aggregate inputs are restored to native; `COUNT_ALL`/`COUNT_VALID` inputs and
+  child columns unused by the aggregate do not constrain their value carriers;
+- ordering inputs, unsupported joins, and other unsupported boundaries are restored to native;
 - the query root is always restored before DuckDB result materialization.
 
 Restoring join keys avoids representation-dependent hash differences between independently
@@ -178,11 +179,13 @@ the finished sidecars at wrap time rather than through a propagation case:
   boundary. This is sound because the aggregate exchange has a single logical producer — every
   thread and GPU runs the same plan node with the same per-plan carrier targets, so equal narrow
   keys route identically — and the merge re-groups with raw key views exactly like the local
-  aggregate. Aggregate inputs and states stay native (state arithmetic needs native width), a
-  column that is both group key and aggregate input goes native, and shapes whose partial batch
-  layout deviates from the declared output — multiple grouping sets, grouping functions, AVG
-  (SUM + COUNT decomposition adds a partial column), COUNT(DISTINCT) (LIST partial column) —
-  keep the native boundary.
+  aggregate. Value-sensitive aggregate inputs and states stay native (state arithmetic needs native
+  width), while `COUNT_ALL` and `COUNT_VALID` do not inspect input values and therefore do not
+  constrain their carriers. A column that is both group key and a value-sensitive aggregate input
+  goes native; unused child columns may remain narrow until the aggregate discards them. Shapes whose
+  partial batch layout deviates from the declared output — multiple grouping sets, grouping
+  functions, AVG (SUM + COUNT decomposition adds a partial column), COUNT(DISTINCT) (LIST partial
+  column) — keep the native boundary.
 - Distinct- and sort-side exchanges are native because their inputs are restored at the
   boundary.
 

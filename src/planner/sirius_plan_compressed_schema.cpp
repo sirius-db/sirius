@@ -34,6 +34,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <ranges>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -61,15 +62,26 @@ std::vector<cudf::data_type> native_physical_schema(sirius::op::sirius_physical_
   return schema ? std::move(*schema) : std::vector<cudf::data_type>{};
 }
 
+bool native_physical_schema_is_mappable(sirius::op::sirius_physical_operator const& op)
+{
+  return std::ranges::all_of(
+    op.types, [](auto const& type) { return sirius::try_get_cudf_type(type).has_value(); });
+}
+
+bool is_delim_join(sirius::op::sirius_physical_operator const& op) noexcept
+{
+  return op.type == sirius::op::SiriusPhysicalOperatorType::LEFT_DELIM_JOIN ||
+         op.type == sirius::op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN;
+}
+
 bool compressed_schema_tree_is_mappable(sirius::op::sirius_physical_operator const& op)
 {
-  if (!try_native_physical_schema(op)) { return false; }
+  if (!native_physical_schema_is_mappable(op)) { return false; }
   for (auto const& child : op.children) {
     if (child && !compressed_schema_tree_is_mappable(*child)) { return false; }
   }
 
-  if (op.type == sirius::op::SiriusPhysicalOperatorType::LEFT_DELIM_JOIN ||
-      op.type == sirius::op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN) {
+  if (is_delim_join(op)) {
     auto const& delim = op.Cast<sirius::op::sirius_physical_delim_join>();
     if (delim.join && !compressed_schema_tree_is_mappable(*delim.join)) { return false; }
     if (delim.distinct_root && !compressed_schema_tree_is_mappable(*delim.distinct_root)) {
@@ -77,6 +89,23 @@ bool compressed_schema_tree_is_mappable(sirius::op::sirius_physical_operator con
     }
   }
   return true;
+}
+
+bool compressed_schema_tree_has_overrides(sirius::op::sirius_physical_operator const& op)
+{
+  if (op.has_physical_overrides()) { return true; }
+  for (auto const& child : op.children) {
+    if (child && compressed_schema_tree_has_overrides(*child)) { return true; }
+  }
+
+  if (is_delim_join(op)) {
+    auto const& delim = op.Cast<sirius::op::sirius_physical_delim_join>();
+    if (delim.join && compressed_schema_tree_has_overrides(*delim.join)) { return true; }
+    if (delim.distinct_root && compressed_schema_tree_has_overrides(*delim.distinct_root)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 void clear_compressed_schema_tree(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot)
@@ -87,8 +116,7 @@ void clear_compressed_schema_tree(duckdb::unique_ptr<sirius::op::sirius_physical
     clear_compressed_schema_tree(child);
   }
 
-  if (slot->type == sirius::op::SiriusPhysicalOperatorType::LEFT_DELIM_JOIN ||
-      slot->type == sirius::op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN) {
+  if (is_delim_join(*slot)) {
     auto& delim = slot->Cast<sirius::op::sirius_physical_delim_join>();
     clear_compressed_schema_tree(delim.join);
     clear_compressed_schema_tree(delim.distinct_root);
@@ -101,25 +129,32 @@ std::vector<cudf::data_type> output_physical_schema(sirius::op::sirius_physical_
 }
 
 void install_physical_schema(sirius::op::sirius_physical_operator& op,
-                             std::vector<cudf::data_type> schema)
+                             std::vector<cudf::data_type> schema,
+                             std::vector<cudf::data_type> const& native)
 {
-  auto const native = native_physical_schema(op);
   op.set_physical_types(schema == native ? std::vector<cudf::data_type>{} : std::move(schema));
 }
 
-//! Wrap @p slot in a projection that casts every column selected by @p should_restore whose
-//! carrier differs from native back to its logical type, forwarding all other columns as bare
-//! references. The projection's output sidecar keeps the unselected columns' carriers (an
-//! all-native result normalizes to the empty sidecar); a no-op when no selected column differs.
+void install_physical_schema(sirius::op::sirius_physical_operator& op,
+                             std::vector<cudf::data_type> schema)
+{
+  auto const native = native_physical_schema(op);
+  install_physical_schema(op, std::move(schema), native);
+}
+
+/// Wrap @p slot in a projection that casts every column selected by @p should_restore whose
+/// carrier differs from native back to its logical type, forwarding all other columns as bare
+/// references. The projection's output sidecar keeps the unselected columns' carriers (an
+/// all-native result normalizes to the empty sidecar); a no-op when no selected column differs.
 template <typename ShouldRestore>
 void restore_columns_matching(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot,
                               ShouldRestore const& should_restore)
 {
   if (!slot || !slot->has_physical_overrides()) { return; }
 
-  auto const physical = output_physical_schema(*slot);
-  auto const native   = native_physical_schema(*slot);
-  bool needs_restore  = false;
+  auto const& physical = slot->get_physical_types();
+  auto const native    = native_physical_schema(*slot);
+  bool needs_restore   = false;
   for (std::size_t column_idx = 0; column_idx < physical.size(); ++column_idx) {
     if (should_restore(column_idx) && physical[column_idx] != native[column_idx]) {
       needs_restore = true;
@@ -148,13 +183,14 @@ void restore_columns_matching(duckdb::unique_ptr<sirius::op::sirius_physical_ope
   auto projection = duckdb::make_uniq<sirius::op::sirius_physical_projection>(
     input->types, std::move(expressions), input->estimated_cardinality);
   projection->children.push_back(std::move(input));
-  install_physical_schema(*projection, std::move(output_schema));
+  install_physical_schema(*projection, std::move(output_schema), native);
   slot = std::move(projection);
 }
 
 void restore_native_columns(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot,
                             std::unordered_set<std::size_t> const& columns)
 {
+  if (columns.empty()) { return; }
   restore_columns_matching(
     slot, [&columns](std::size_t column_idx) { return columns.contains(column_idx); });
 }
@@ -168,26 +204,34 @@ void restore_native_output_in_place(duckdb::unique_ptr<sirius::op::sirius_physic
   slot->set_physical_types({});
 }
 
-//! Derive @p op 's output sidecar from @p child_schema: a bare-reference output forwards the
-//! referenced child carrier, every other output keeps its native carrier. Callers guarantee the
-//! projection's select_list arity matches its native output schema.
+/// Derive @p op 's output sidecar from @p child_schema: a bare-reference output forwards the
+/// referenced child carrier, every other output keeps its native carrier. Callers guarantee the
+/// projection's select_list arity matches its native output schema.
 void derive_projection_sidecar(sirius::op::sirius_physical_operator& op,
-                               std::vector<cudf::data_type> const& child_schema)
+                               std::vector<cudf::data_type> const& child_schema,
+                               std::vector<cudf::data_type> const& native)
 {
   auto const& projection = op.Cast<sirius::op::sirius_physical_projection>();
-  auto schema            = native_physical_schema(op);
+  auto schema            = native;
   for (std::size_t output_idx = 0; output_idx < projection.select_list.size(); ++output_idx) {
     auto const& expression = projection.select_list[output_idx];
     if (!expression || !expression->holds<sirius::ast::reference>()) { continue; }
     auto const input_idx = expression->get<sirius::ast::reference>().column_index;
     if (input_idx < child_schema.size()) { schema[output_idx] = child_schema[input_idx]; }
   }
-  install_physical_schema(op, std::move(schema));
+  install_physical_schema(op, std::move(schema), native);
 }
 
-//! Return whether @p op is a projection consisting solely of bare column references. Such a
-//! projection forwards column views without materializing a batch, so a narrow carrier crossing
-//! it saves no bandwidth.
+void derive_projection_sidecar(sirius::op::sirius_physical_operator& op,
+                               std::vector<cudf::data_type> const& child_schema)
+{
+  auto const native = native_physical_schema(op);
+  derive_projection_sidecar(op, child_schema, native);
+}
+
+/// Return whether @p op is a projection consisting solely of bare column references. Such a
+/// projection forwards column views without materializing a batch, so a narrow carrier crossing
+/// it saves no bandwidth.
 bool is_pure_reference_projection(sirius::op::sirius_physical_operator const& op)
 {
   if (op.type != sirius::op::SiriusPhysicalOperatorType::PROJECTION) { return false; }
@@ -213,8 +257,7 @@ void propagate_compressed_schema(duckdb::unique_ptr<sirius::op::sirius_physical_
     propagate_compressed_schema(child);
   }
 
-  if (slot->type == sirius::op::SiriusPhysicalOperatorType::LEFT_DELIM_JOIN ||
-      slot->type == sirius::op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN) {
+  if (is_delim_join(*slot)) {
     auto& delim = slot->Cast<sirius::op::sirius_physical_delim_join>();
     if (delim.join) {
       propagate_compressed_schema(delim.join);
@@ -228,11 +271,6 @@ void propagate_compressed_schema(duckdb::unique_ptr<sirius::op::sirius_physical_
 
   switch (slot->type) {
     case sirius::op::SiriusPhysicalOperatorType::TABLE_SCAN: {
-      // The scan planner installed the residency-gated physical schema. A dynamic-filter producer
-      // publishes literals in the key's native carrier and the filter runs before any join-input
-      // restore projection, so every planned target column advertises native output here; unrelated
-      // payload columns keep their carriers. A producer that declared no targets is conservative by
-      // construction: every column is a potential target, so the whole sidecar goes native.
       auto& scan = slot->Cast<sirius::op::sirius_physical_table_scan>();
       if (!scan.sirius_dynamic_filters || !scan.sirius_dynamic_filters->has_producers()) { return; }
       if (!slot->has_physical_overrides()) { return; }
@@ -251,22 +289,23 @@ void propagate_compressed_schema(duckdb::unique_ptr<sirius::op::sirius_physical_
         if (!scan.projection_ids.empty() && output_idx >= scan.projection_ids.size()) { continue; }
         auto const ids_position =
           scan.projection_ids.empty() ? output_idx : scan.projection_ids[output_idx];
-        if (std::ranges::find(targets, ids_position) != targets.end()) {
+        if (std::ranges::binary_search(targets, ids_position)) {
           physical[output_idx] = native[output_idx];
         }
       }
-      install_physical_schema(*slot, std::move(physical));
+      install_physical_schema(*slot, std::move(physical), native);
       return;
     }
 
     case sirius::op::SiriusPhysicalOperatorType::FILTER: {
       if (slot->children.size() != 1) { break; }
-      auto const child_schema = output_physical_schema(*slot->children[0]);
-      auto const& filter      = slot->Cast<sirius::op::sirius_physical_filter>();
+      auto child_schema  = output_physical_schema(*slot->children[0]);
+      auto const& filter = slot->Cast<sirius::op::sirius_physical_filter>();
       std::vector<cudf::data_type> schema;
       if (std::holds_alternative<sirius::op::passthrough>(filter.output_columns)) {
         if (child_schema.size() != slot->types.size()) { break; }
-        schema = child_schema;
+        install_physical_schema(*slot, std::move(child_schema));
+        return;
       } else {
         auto const& output_indices = std::get<std::vector<cudf::size_type>>(filter.output_columns);
         if (output_indices.size() != slot->types.size()) { break; }
@@ -287,8 +326,9 @@ void propagate_compressed_schema(duckdb::unique_ptr<sirius::op::sirius_physical_
     case sirius::op::SiriusPhysicalOperatorType::PROJECTION: {
       if (slot->children.size() != 1) { break; }
       auto const& projection = slot->Cast<sirius::op::sirius_physical_projection>();
-      if (projection.select_list.size() != native_physical_schema(*slot).size()) { break; }
-      derive_projection_sidecar(*slot, output_physical_schema(*slot->children[0]));
+      auto const native      = native_physical_schema(*slot);
+      if (projection.select_list.size() != native.size()) { break; }
+      derive_projection_sidecar(*slot, output_physical_schema(*slot->children[0]), native);
       return;
     }
 
@@ -321,7 +361,8 @@ void propagate_compressed_schema(duckdb::unique_ptr<sirius::op::sirius_physical_
 
       auto const left_schema  = output_physical_schema(*slot->children[0]);
       auto const right_schema = output_physical_schema(*slot->children[1]);
-      auto schema             = native_physical_schema(*slot);
+      auto const native       = native_physical_schema(*slot);
+      auto schema             = native;
       std::size_t output_idx  = 0;
       bool const collect_left = join.join_type != duckdb::JoinType::RIGHT_SEMI &&
                                 join.join_type != duckdb::JoinType::RIGHT_ANTI;
@@ -346,18 +387,17 @@ void propagate_compressed_schema(duckdb::unique_ptr<sirius::op::sirius_physical_
           ++output_idx;
         }
       }
-      install_physical_schema(*slot, std::move(schema));
+      install_physical_schema(*slot, std::move(schema), native);
       return;
     }
 
     case sirius::op::SiriusPhysicalOperatorType::HASH_GROUP_BY: {
       // Bare-reference group keys may stay narrow: cudf::groupby receives them as raw views and
       // grouping is pure equality, which narrowing preserves (same values, family, and decimal
-      // scale). Aggregate inputs must be native — the aggregation kernels accumulate at the input
-      // width, so a narrow carrier could overflow where the native type would not. Any shape the
-      // simplified key extraction does not cover (multiple grouping sets, grouping functions, an
-      // AVG/count-distinct partial layout wider than the declared output) falls through to the
-      // native boundary below.
+      // scale). Value-sensitive aggregate inputs must be native so their kernels retain the native
+      // accumulation/result width. Any shape the simplified key extraction does not cover
+      // (multiple grouping sets, grouping functions, an AVG/count-distinct partial layout wider
+      // than the declared output) falls through to the native boundary below.
       if (slot->children.size() != 1) { break; }
       auto& aggregate = slot->Cast<sirius::op::sirius_physical_grouped_aggregate>();
       if (aggregate.grouping_sets.size() > 1) { break; }
@@ -380,11 +420,15 @@ void propagate_compressed_schema(duckdb::unique_ptr<sirius::op::sirius_physical_
       }
       if (!consistent) { break; }
 
-      // Every child column referenced as an aggregate input must be native. COUNT_ALL carries a
-      // placeholder input index and reads no values, so it constrains nothing.
+      // Every child column read by a value-sensitive aggregate must be native. COUNT_ALL carries a
+      // placeholder input index and COUNT_VALID reads only the validity mask, so neither constrains
+      // its input's value carrier.
       std::unordered_set<std::size_t> aggregate_inputs;
       for (std::size_t i = 0; i < aggregate.cudf_aggregates.size(); ++i) {
-        if (aggregate.cudf_aggregates[i] == cudf::aggregation::Kind::COUNT_ALL) { continue; }
+        if (aggregate.cudf_aggregates[i] == cudf::aggregation::Kind::COUNT_ALL ||
+            aggregate.cudf_aggregates[i] == cudf::aggregation::Kind::COUNT_VALID) {
+          continue;
+        }
         if (i < aggregate.cudf_aggregate_struct_col_indices.size() &&
             !aggregate.cudf_aggregate_struct_col_indices[i].empty()) {
           for (auto const struct_idx : aggregate.cudf_aggregate_struct_col_indices[i]) {
@@ -397,30 +441,22 @@ void propagate_compressed_schema(duckdb::unique_ptr<sirius::op::sirius_physical_
         }
       }
 
-      std::unordered_set<std::size_t> eligible_keys;
-      for (auto const key_idx : aggregate.group_idx) {
-        auto const key = static_cast<std::size_t>(key_idx);
-        if (!aggregate_inputs.contains(key)) { eligible_keys.insert(key); }
-      }
-
-      std::unordered_set<std::size_t> columns_to_restore;
-      for (std::size_t column_idx = 0; column_idx < child_width; ++column_idx) {
-        if (!eligible_keys.contains(column_idx)) { columns_to_restore.insert(column_idx); }
-      }
-      restore_native_columns(slot->children[0], columns_to_restore);
+      // Columns unused by the aggregate are not read and may retain their narrow carriers.
+      restore_native_columns(slot->children[0], aggregate_inputs);
 
       // Output prefix 0..group_idx.size()-1 holds the keys (get_output_grouping_indices is the
       // iota over it) and mirrors the child key carriers; aggregate outputs are cast to their
       // declared return types by the aggregation implementation and stay native. No restore is
       // inserted above: downstream boundaries widen the keys on the small grouped output.
       auto const child_schema = output_physical_schema(*slot->children[0]);
-      auto schema             = native_physical_schema(*slot);
+      auto const native       = native_physical_schema(*slot);
+      auto schema             = native;
       for (std::size_t key_pos = 0; key_pos < aggregate.group_idx.size(); ++key_pos) {
         if (key_pos >= schema.size()) { break; }
         auto const child_idx = static_cast<std::size_t>(aggregate.group_idx[key_pos]);
         if (child_idx < child_schema.size()) { schema[key_pos] = child_schema[child_idx]; }
       }
-      install_physical_schema(*slot, std::move(schema));
+      install_physical_schema(*slot, std::move(schema), native);
       return;
     }
 
@@ -452,8 +488,7 @@ void prune_immediate_scan_restores(duckdb::unique_ptr<sirius::op::sirius_physica
   for (auto& child : slot->children) {
     prune_immediate_scan_restores(child);
   }
-  if (slot->type == sirius::op::SiriusPhysicalOperatorType::LEFT_DELIM_JOIN ||
-      slot->type == sirius::op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN) {
+  if (is_delim_join(*slot)) {
     auto& delim = slot->Cast<sirius::op::sirius_physical_delim_join>();
     prune_immediate_scan_restores(delim.join);
     prune_immediate_scan_restores(delim.distinct_root);
@@ -529,14 +564,14 @@ void prune_immediate_scan_restores(duckdb::unique_ptr<sirius::op::sirius_physica
   }
   if (!pruned_any) { return; }
 
-  install_physical_schema(*scan, std::move(physical));
+  install_physical_schema(*scan, std::move(physical), native);
 
   // Re-derive the sidecar of each chain projection bottom-up, then of the restore projection
   // itself, through the same derivation the PROJECTION propagation case uses.
   auto child_schema = output_physical_schema(*scan);
-  for (auto it = chain.rbegin(); it != chain.rend(); ++it) {
-    derive_projection_sidecar(**it, child_schema);
-    child_schema = output_physical_schema(**it);
+  for (auto& it : std::views::reverse(chain)) {
+    derive_projection_sidecar(*it, child_schema);
+    child_schema = output_physical_schema(*it);
   }
 
   auto& restore_child = *slot->children[0];
@@ -559,6 +594,7 @@ void prune_immediate_scan_restores(duckdb::unique_ptr<sirius::op::sirius_physica
 
 void apply_compressed_schema_passes(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& plan)
 {
+  if (!plan || !compressed_schema_tree_has_overrides(*plan)) { return; }
   if (compressed_schema_tree_is_mappable(*plan)) {
     propagate_compressed_schema(plan);
     restore_native_schema(plan);

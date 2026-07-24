@@ -91,9 +91,9 @@ std::unique_ptr<cudf::table> normalize_physical_schema(std::unique_ptr<cudf::tab
   // confirm the statistics-derived target.
   auto const table_view = table->view();
   for (std::size_t column_idx = 0; column_idx < targets.size(); column_idx++) {
-    auto const column = table_view.column(column_idx);
-    auto const actual = column.type();
-    auto const target = targets[column_idx];
+    auto const& column = table_view.column(column_idx);
+    auto const actual  = column.type();
+    auto const target  = targets[column_idx];
     if (actual == target || can_restore_to(actual, target)) { continue; }
 
     if (!has_explicit_physical_schema) { continue; }
@@ -226,8 +226,10 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::execute(
     output_table = materialized_table.table.release(stream, mem_space->get_default_allocator());
   }
 
+  // Narrow/expand the physical types
   auto const has_explicit_physical_schema = has_physical_overrides();
   if (has_explicit_physical_schema || scan_input->is_resident()) {
+    // In case the flag has been turned off after a narrowing pin, restore to native
     auto const& target_types =
       has_explicit_physical_schema ? get_physical_types() : _native_physical_types;
     output_table = normalize_physical_schema(std::move(output_table),

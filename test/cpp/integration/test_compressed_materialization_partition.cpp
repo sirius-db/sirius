@@ -82,6 +82,8 @@ constexpr char const* kJoinQuery =
 
 constexpr char const* kGroupByQuery =
   "SELECT k, COUNT(*) AS c, SUM(v) AS sv FROM t GROUP BY k ORDER BY k LIMIT 10;";
+constexpr char const* kCountValidGroupByQuery =
+  "SELECT k, COUNT(k) AS c FROM t GROUP BY k ORDER BY k LIMIT 10;";
 
 // Small exchange sizes force multi-way hash partitioning on the fixture's data volumes.
 constexpr config_values kConfigValues{.scan_batch_bytes     = kScanBatchBytes,
@@ -392,6 +394,14 @@ TEST_CASE("gpu_execution - narrow group keys cross the aggregate exchange",
     auto const after = sirius::test::get_compressed_materialization_stats(con);
     REQUIRE(after.scan_sidecars_installed > before.scan_sidecars_installed);
     REQUIRE(after.partition_narrow_columns > before.partition_narrow_columns);
+
+    // COUNT_VALID reads only k's validity mask, so counting the group key must not force its value
+    // carrier native before the aggregate-side exchange.
+    auto const count_before = sirius::test::get_compressed_materialization_stats(con);
+    compare_gpu_vs_cpu(con, kCountValidGroupByQuery);
+    auto const count_after = sirius::test::get_compressed_materialization_stats(con);
+    REQUIRE(count_after.scan_sidecars_installed > count_before.scan_sidecars_installed);
+    REQUIRE(count_after.partition_narrow_columns > count_before.partition_narrow_columns);
 
     // Flag-off contrast: everything restores at the scan; the exchange sees native batches.
     require_ok(con.Query("SET enable_compressed_materialization = false;"), "disable flag");

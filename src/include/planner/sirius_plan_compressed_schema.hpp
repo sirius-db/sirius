@@ -46,7 +46,8 @@ namespace sirius::planner {
  * filter literals use the native key carrier) while unrelated payload columns keep their carriers,
  * and a producer that declared no targets forces the whole sidecar native. HASH_GROUP_BY keeps
  * bare-reference group keys narrow through the aggregation (grouping is equality-only) while
- * restoring aggregate-input columns on its child; shapes outside its preconditions (multiple
+ * restoring only value-sensitive aggregate inputs on its child. COUNT inputs and columns unused by
+ * the aggregate do not constrain their value carriers. Shapes outside its preconditions (multiple
  * grouping sets, grouping functions, AVG or COUNT(DISTINCT) partial layouts) fall through to the
  * native boundary. Every other operator type restores all of its children to native and clears its
  * own sidecar; the `join` and `distinct_root` sub-trees of a DELIM_JOIN are likewise forced native.
@@ -87,9 +88,10 @@ void prune_immediate_scan_restores(duckdb::unique_ptr<sirius::op::sirius_physica
 /**
  * @brief Run the compressed-materialization pass pipeline over a complete plan.
  *
- * When every logical type in the tree (including DELIM_JOIN sub-trees) maps to a cuDF carrier, runs
- * `propagate_compressed_schema`, `restore_native_schema`, and `prune_immediate_scan_restores` in
- * that order; otherwise clears every sidecar in the tree so the plan is entirely native.
+ * A tree with no physical sidecars returns immediately. Otherwise, when every logical type in the
+ * tree (including DELIM_JOIN sub-trees) maps to a cuDF carrier, runs `propagate_compressed_schema`,
+ * `restore_native_schema`, and `prune_immediate_scan_restores` in that order; an unmappable tree
+ * instead clears every sidecar so the plan is entirely native.
  */
 void apply_compressed_schema_passes(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& plan);
 
