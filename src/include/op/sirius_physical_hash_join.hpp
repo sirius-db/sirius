@@ -199,8 +199,32 @@ struct cross_schedule_pair {
 [[nodiscard]] cross_schedule_pair next_cross_schedule_pair(
   std::vector<partition_cross_schedule>& cross, bool probe_finished, bool build_finished);
 
-/// Non-mutating classification for get_next_task_hint: READY (emit_pair), WAITING (wait_build /
-/// wait_probe), or complete (done).
+/// A surviving batch of a partition whose OPPOSITE side finished with zero batches (empty table).
+/// It is emitted as a single-side "orphan" task so execute() can produce the correct NULL-padded /
+/// passthrough output, and popping it drains the repository so the pipeline can complete.
+struct cross_schedule_orphan {
+  bool found            = false;
+  std::size_t partition = 0;
+  bool present_is_build = false;  ///< the surviving side is the build side (opposite probe empty)
+  uint64_t batch_id     = 0;
+};
+
+/// Find and claim (mark popped) the next surviving batch whose opposite side finished empty, once
+/// BOTH producers are finished. Returns `{found=false}` when no such batch remains. Only fires when
+/// the opposite side truly has zero batches, so it never races the normal pair scheduler (which
+/// covers partitions with data on both sides). Pure over `cross`.
+[[nodiscard]] cross_schedule_orphan next_cross_schedule_orphan(
+  std::vector<partition_cross_schedule>& cross, bool probe_finished, bool build_finished);
+
+/// True when a partition has a surviving batch whose opposite side finished empty and that batch
+/// has not yet been emitted/popped. Used by peek_cross_schedule_kind and by get_next_task_hint.
+/// Pure.
+[[nodiscard]] bool has_pending_cross_orphan(std::vector<partition_cross_schedule> const& cross,
+                                            bool probe_finished,
+                                            bool build_finished);
+
+/// Non-mutating classification for get_next_task_hint: READY (emit_pair, including pending orphan
+/// work), WAITING (wait_build / wait_probe), or complete (done).
 [[nodiscard]] cross_schedule_kind peek_cross_schedule_kind(
   std::vector<partition_cross_schedule> const& cross, bool probe_finished, bool build_finished);
 

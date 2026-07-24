@@ -38,6 +38,9 @@
 using sirius::op::collect_cross_schedule_discards;
 using sirius::op::cross_schedule_discard;
 using sirius::op::cross_schedule_kind;
+using sirius::op::cross_schedule_orphan;
+using sirius::op::has_pending_cross_orphan;
+using sirius::op::next_cross_schedule_orphan;
 using sirius::op::next_cross_schedule_pair;
 using sirius::op::partition_cross_schedule;
 using sirius::op::peek_cross_schedule_kind;
@@ -213,12 +216,65 @@ TEST_CASE("discards never free a batch while the opposite producer is still open
   REQUIRE_FALSE(has_discard(d, 0, /*is_build=*/false, 10));
 }
 
-TEST_CASE("discards skip the empty-opposite-side case (legacy draining behavior)",
+TEST_CASE("discards skip the empty-opposite-side case (handled by the orphan path)",
           "[cross_schedule]")
 {
-  // A probe batch with no build batches at all: no pair exists, and it is never freed by the sweep
-  // (matches the legacy grid, which likewise could not pair or pop it).
+  // A probe batch with no build batches at all: no pair exists, so the discard sweep does not free
+  // it; the empty-opposite case is drained by the orphan path instead (tested below).
   std::vector<partition_cross_schedule> cross{make_partition({10}, {})};
-  REQUIRE(next_cross_schedule_pair(cross, true, true).kind == cross_schedule_kind::done);
   REQUIRE(collect_cross_schedule_discards(cross, true, true).empty());
+}
+
+//===----------------------------------------------------------------------===//
+// Empty-opposite-side terminal handling (orphan path)
+//===----------------------------------------------------------------------===//
+
+TEST_CASE("orphan path claims surviving probe batches when the build side is empty",
+          "[cross_schedule]")
+{
+  // Empty build (0 batches), probe streamed 2 batches. next_cross_schedule_pair yields no pair.
+  std::vector<partition_cross_schedule> cross{make_partition({10, 11}, {})};
+  REQUIRE(next_cross_schedule_pair(cross, true, true).kind == cross_schedule_kind::done);
+
+  // Not terminal until BOTH producers finished.
+  REQUIRE_FALSE(has_pending_cross_orphan(cross, /*probe_finished=*/true, /*build_finished=*/false));
+  REQUIRE_FALSE(next_cross_schedule_orphan(cross, true, false).found);
+
+  REQUIRE(has_pending_cross_orphan(cross, true, true));
+  auto o1 = next_cross_schedule_orphan(cross, true, true);
+  REQUIRE(o1.found);
+  REQUIRE(o1.partition == 0);
+  REQUIRE_FALSE(o1.present_is_build);  // the surviving side is the probe side
+  auto o2 = next_cross_schedule_orphan(cross, true, true);
+  REQUIRE(o2.found);
+  REQUIRE(o2.batch_id != o1.batch_id);
+  REQUIRE((o1.batch_id == 10 || o1.batch_id == 11));
+  REQUIRE((o2.batch_id == 10 || o2.batch_id == 11));
+  // Both survivors claimed → nothing pending, and peek reports done.
+  REQUIRE_FALSE(next_cross_schedule_orphan(cross, true, true).found);
+  REQUIRE_FALSE(has_pending_cross_orphan(cross, true, true));
+  REQUIRE(peek_cross_schedule_kind(cross, true, true) == cross_schedule_kind::done);
+}
+
+TEST_CASE("orphan path claims surviving build batches when the probe side is empty",
+          "[cross_schedule]")
+{
+  // Empty probe, build streamed 2 batches (e.g. RIGHT-family with an empty probe side).
+  std::vector<partition_cross_schedule> cross{make_partition({}, {20, 21})};
+  REQUIRE(has_pending_cross_orphan(cross, true, true));
+  // While pending, peek asks for a task (emit_pair) rather than declaring done.
+  REQUIRE(peek_cross_schedule_kind(cross, true, true) == cross_schedule_kind::emit_pair);
+  auto o = next_cross_schedule_orphan(cross, true, true);
+  REQUIRE(o.found);
+  REQUIRE(o.present_is_build);  // the surviving side is the build side
+  REQUIRE(next_cross_schedule_orphan(cross, true, true).found);
+  REQUIRE_FALSE(has_pending_cross_orphan(cross, true, true));
+}
+
+TEST_CASE("orphan path does nothing when both sides are empty", "[cross_schedule]")
+{
+  std::vector<partition_cross_schedule> cross{make_partition({}, {})};
+  REQUIRE_FALSE(has_pending_cross_orphan(cross, true, true));
+  REQUIRE_FALSE(next_cross_schedule_orphan(cross, true, true).found);
+  REQUIRE(peek_cross_schedule_kind(cross, true, true) == cross_schedule_kind::done);
 }

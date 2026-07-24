@@ -322,12 +322,22 @@ class pipelineable_operator_data : public operator_data {
  * Extends pipelineable_operator_data to include partition index information,
  * used by partition-aware operators (partition, concat, etc.).
  */
+/// For hash-join STANDARD/MIXED_JOIN "orphan" tasks: the opposite join side finished with ZERO
+/// batches (e.g. an empty table), so the task carries only the surviving side. Tells the hash
+/// join's execute() which side the single batch is, so it can synthesize an empty opposite batch
+/// and still emit the correct NULL-padded / passthrough output. `none` for every normal (two-batch)
+/// task.
+enum class join_present_side : std::uint8_t { none, probe, build };
+
 class partitioned_operator_data : public pipelineable_operator_data {
  public:
   partitioned_operator_data() = default;
   partitioned_operator_data(std::vector<std::shared_ptr<::cucascade::data_batch>> data_batches,
-                            std::size_t partition_idx)
-    : pipelineable_operator_data(std::move(data_batches)), _partition_idx(partition_idx)
+                            std::size_t partition_idx,
+                            join_present_side present_side = join_present_side::none)
+    : pipelineable_operator_data(std::move(data_batches)),
+      _partition_idx(partition_idx),
+      _present_side(present_side)
   {
   }
 
@@ -342,8 +352,12 @@ class partitioned_operator_data : public pipelineable_operator_data {
    */
   [[nodiscard]] std::size_t get_partition_idx() const { return _partition_idx; }
 
+  /// The surviving side of an empty-opposite "orphan" task, or `none` for a normal two-batch task.
+  [[nodiscard]] join_present_side get_present_side() const { return _present_side; }
+
  private:
-  std::size_t _partition_idx = 0;
+  std::size_t _partition_idx      = 0;
+  join_present_side _present_side = join_present_side::none;
 };
 
 /**

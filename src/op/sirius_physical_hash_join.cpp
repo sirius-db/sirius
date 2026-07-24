@@ -554,6 +554,54 @@ cross_schedule_pair next_cross_schedule_pair(std::vector<partition_cross_schedul
   return {cross_schedule_kind::done, 0, 0, 0};
 }
 
+bool has_pending_cross_orphan(std::vector<partition_cross_schedule> const& cross,
+                              bool probe_finished,
+                              bool build_finished)
+{
+  // Only a terminal state: an empty opposite side is only known-final once both producers finished.
+  if (!(probe_finished && build_finished)) { return false; }
+  for (auto const& c : cross) {
+    // Surviving probe batches whose build side is empty.
+    if (c.build_ids.empty()) {
+      for (uint64_t id : c.probe_ids) {
+        if (!c.probe_popped.count(id)) { return true; }
+      }
+    }
+    // Surviving build batches whose probe side is empty.
+    if (c.probe_ids.empty()) {
+      for (uint64_t id : c.build_ids) {
+        if (!c.build_popped.count(id)) { return true; }
+      }
+    }
+  }
+  return false;
+}
+
+cross_schedule_orphan next_cross_schedule_orphan(std::vector<partition_cross_schedule>& cross,
+                                                 bool probe_finished,
+                                                 bool build_finished)
+{
+  if (!(probe_finished && build_finished)) { return {}; }
+  for (std::size_t p = 0; p < cross.size(); ++p) {
+    auto& c = cross[p];
+    if (c.build_ids.empty()) {  // empty build → each surviving probe batch is an orphan
+      for (uint64_t id : c.probe_ids) {
+        if (c.probe_popped.insert(id).second) {
+          return {/*found=*/true, p, /*present_is_build=*/false, id};
+        }
+      }
+    }
+    if (c.probe_ids.empty()) {  // empty probe → each surviving build batch is an orphan
+      for (uint64_t id : c.build_ids) {
+        if (c.build_popped.insert(id).second) {
+          return {/*found=*/true, p, /*present_is_build=*/true, id};
+        }
+      }
+    }
+  }
+  return {};
+}
+
 cross_schedule_kind peek_cross_schedule_kind(std::vector<partition_cross_schedule> const& cross,
                                              bool probe_finished,
                                              bool build_finished)
@@ -562,6 +610,10 @@ cross_schedule_kind peek_cross_schedule_kind(std::vector<partition_cross_schedul
     if (c.scheduled_pairs.size() < c.probe_ids.size() * c.build_ids.size()) {
       return cross_schedule_kind::emit_pair;
     }
+  }
+  // Terminal empty-opposite batches still need a single-side task before the operator is done.
+  if (has_pending_cross_orphan(cross, probe_finished, build_finished)) {
+    return cross_schedule_kind::emit_pair;
   }
   if (!build_finished) { return cross_schedule_kind::wait_build; }
   if (!probe_finished) { return cross_schedule_kind::wait_probe; }
@@ -1043,29 +1095,48 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::get_next_task_input_da
 
   auto const finished = refresh_cross_schedule();
   auto const step     = next_cross_schedule_pair(_cross, finished.first, finished.second);
-  if (step.kind != cross_schedule_kind::emit_pair) { return nullptr; }
+  if (step.kind == cross_schedule_kind::emit_pair) {
+    auto& c                 = _cross[step.partition];
+    uint64_t const probe_id = c.probe_ids[step.probe_idx];
+    uint64_t const build_id = c.build_ids[step.build_idx];
 
-  auto& c                 = _cross[step.partition];
-  uint64_t const probe_id = c.probe_ids[step.probe_idx];
-  uint64_t const build_id = c.build_ids[step.build_idx];
+    // Always borrow (get, not pop): freeing is handled centrally by refresh_cross_schedule's
+    // discard sweep once a batch has been paired with every batch of a finished opposite side.
+    auto probe_batch = probe_port->repo->get_data_batch_by_id(probe_id, step.partition);
+    auto build_batch = build_port->repo->get_data_batch_by_id(build_id, step.partition);
+    if (!probe_batch || !build_batch) {
+      throw std::runtime_error(
+        "In sirius_physical_hash_join:get_next_task_input_data: expected resident probe and build "
+        "batches for a newly-scheduled pair in partition " +
+        std::to_string(step.partition) + " of operator " + std::to_string(this->get_operator_id()));
+    }
 
-  // Always borrow (get, not pop): freeing is handled centrally by refresh_cross_schedule's discard
-  // sweep once a batch has been paired with every batch of a finished opposite side.
-  auto probe_batch = probe_port->repo->get_data_batch_by_id(probe_id, step.partition);
-  auto build_batch = build_port->repo->get_data_batch_by_id(build_id, step.partition);
-  if (!probe_batch || !build_batch) {
-    throw std::runtime_error(
-      "In sirius_physical_hash_join:get_next_task_input_data: expected resident probe and build "
-      "batches for a newly-scheduled pair in partition " +
-      std::to_string(step.partition) + " of operator " + std::to_string(this->get_operator_id()));
+    std::vector<std::shared_ptr<cucascade::data_batch>> input_batch;
+    input_batch.reserve(2);
+    input_batch.push_back(std::move(probe_batch));  // [0] = probe / "default" / left
+    input_batch.push_back(std::move(build_batch));  // [1] = build / "build" / right
+
+    return std::make_unique<partitioned_operator_data>(std::move(input_batch), step.partition);
   }
 
-  std::vector<std::shared_ptr<cucascade::data_batch>> input_batch;
-  input_batch.reserve(2);
-  input_batch.push_back(std::move(probe_batch));  // [0] = probe / "default" / left
-  input_batch.push_back(std::move(build_batch));  // [1] = build / "build" / right
+  // No normal pair. If both producers finished, a partition may have batches on one side and an
+  // empty opposite side (e.g. a join against an empty table). Those survivors are never paired, so
+  // emit each as a single-side "orphan" task: this both drains the batch (so the pipeline can
+  // complete) and lets execute() emit the correct NULL-padded / passthrough rows for the join type.
+  auto const orphan = next_cross_schedule_orphan(_cross, finished.first, finished.second);
+  if (orphan.found) {
+    auto* port = orphan.present_is_build ? build_port : probe_port;
+    auto batch = port->repo->pop_data_batch_by_id(orphan.batch_id, orphan.partition);
+    if (!batch) { return nullptr; }  // already drained by a concurrent caller
+    std::vector<std::shared_ptr<cucascade::data_batch>> input_batch;
+    input_batch.push_back(std::move(batch));
+    return std::make_unique<partitioned_operator_data>(
+      std::move(input_batch),
+      orphan.partition,
+      orphan.present_is_build ? join_present_side::build : join_present_side::probe);
+  }
 
-  return std::make_unique<partitioned_operator_data>(std::move(input_batch), step.partition);
+  return nullptr;
 }
 
 /// Result of prepare_join_keys for a single join side: the key table view and any cast columns
@@ -1374,17 +1445,69 @@ static std::unique_ptr<operator_data> resolve_mark_join_result(
       std::move(output_cudf_table), *left_batch.get_memory_space(), stream, telemetry_info)});
 }
 
+/// Build a 0-row cudf table with one column per logical type — the full schema of a join side. Used
+/// to synthesize the missing side of an "orphan" task (the opposite side finished empty).
+static std::unique_ptr<cudf::table> make_empty_join_side_table(
+  const duckdb::vector<sirius::logical_type>& types)
+{
+  std::vector<std::unique_ptr<cudf::column>> cols;
+  cols.reserve(types.size());
+  for (auto const& t : types) {
+    cols.push_back(cudf::make_empty_column(sirius::get_cudf_type(t)));
+  }
+  return std::make_unique<cudf::table>(std::move(cols));
+}
+
 std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator_data& input_data,
                                                                   rmm::cuda_stream_view stream)
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_hash_join::execute"};
-  auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
-  const auto& input_batches = input.get_read_only_batches();
+  auto& input = dynamic_cast<const pipelineable_operator_data&>(input_data);
+  // By value (get_read_only_batches returns a fresh vector): an orphan task mutates it below to
+  // reinstate the empty opposite side.
+  auto input_batches = input.get_read_only_batches();
 
   if (is_all_inequality_join) {
     throw std::runtime_error(
       "Error sirius_physical_hash_join being asked to do all inequality join of type: " +
       duckdb::JoinTypeToString(join_type));
+  }
+
+  // Orphan task (STANDARD/MIXED_JOIN): the opposite join side finished with zero batches (e.g. a
+  // join against an empty table), so this task carries only the surviving side. Synthesize an empty
+  // opposite batch on the surviving batch's memory space and slot it into [probe, build] order, so
+  // the normal two-batch dispatch below runs unchanged and emits the correct output — cuDF joins
+  // handle an empty side (LEFT/RIGHT/OUTER/ANTI NULL-pad the survivor; INNER/SEMI yield zero rows).
+  std::shared_ptr<cucascade::data_batch> synthesized_opposite;  // keeps the inserted lock alive
+  if (auto const* partitioned = dynamic_cast<const partitioned_operator_data*>(&input_data);
+      partitioned && partitioned->get_present_side() != join_present_side::none) {
+    if (input_batches.size() != 1) {
+      throw std::runtime_error(
+        "In sirius_physical_hash_join::execute: orphan (empty-opposite) task expects exactly 1 "
+        "batch, got " +
+        std::to_string(input_batches.size()) + " in operator " +
+        std::to_string(this->get_operator_id()));
+    }
+    bool const present_is_build = partitioned->get_present_side() == join_present_side::build;
+    auto* ms                    = input_batches[0].get_memory_space();
+    if (!ms) {
+      throw std::runtime_error(
+        "In sirius_physical_hash_join::execute: orphan task batch has no memory space in "
+        "operator " +
+        std::to_string(this->get_operator_id()));
+    }
+    // The absent side's full schema is its child's output types (children[0]=probe, children[1]=
+    // build).
+    auto const& opp_types = present_is_build ? children[0]->get_types()   // absent probe
+                                             : children[1]->get_types();  // absent build
+    synthesized_opposite =
+      make_data_batch(make_empty_join_side_table(opp_types), *ms, stream, batch_telemetry());
+    if (present_is_build) {
+      input_batches.insert(input_batches.begin(),
+                           synthesized_opposite->to_read_only());  // [0]=probe
+    } else {
+      input_batches.push_back(synthesized_opposite->to_read_only());  // [1] = empty build
+    }
   }
 
   cudf::table_view left_full, right_full;
