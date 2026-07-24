@@ -404,6 +404,53 @@ TEST_CASE("drain_cached_provider honors a pre-stopped token", "[cached_serving][
 // validate_pinned_entry_for_serving gates
 //===----------------------------------------------------------------------===//
 
+TEST_CASE("pin_gpu_merge_compatible gates the same-row-count merge on chunk shape",
+          "[cached_serving][scan_manager]")
+{
+  auto& e = env();
+
+  auto tables_like = [&](std::size_t n_chunks, std::size_t rows) {
+    std::vector<std::unique_ptr<cudf::table>> tables;
+    for (std::size_t c = 0; c < n_chunks; ++c) {
+      std::vector<std::unique_ptr<cudf::column>> cols;
+      auto shared = make_gpu_column(*e.gpu_space, std::vector<int32_t>(rows, 1));
+      cols.push_back(std::make_unique<cudf::column>(
+        shared->view(), e.stream(), e.gpu_space->get_default_allocator()));
+      tables.push_back(std::make_unique<cudf::table>(std::move(cols)));
+    }
+    return tables;
+  };
+  std::vector<cucascade::memory::memory_space*> const spaces3(3, e.gpu_space);
+
+  SECTION("identical chunk shape merges")
+  {
+    auto entry = make_gpu_entry(*e.gpu_space, 3, 4);
+    REQUIRE(pin_gpu_merge_compatible(entry, spaces3, tables_like(3, 4), "t"));
+  }
+
+  SECTION("same total rows but a different chunk count does not merge (replace)")
+  {
+    auto entry = make_gpu_entry(*e.gpu_space, 3, 4);  // 12 rows in 3 chunks
+    std::vector<cucascade::memory::memory_space*> const spaces2(2, e.gpu_space);
+    REQUIRE_FALSE(pin_gpu_merge_compatible(entry, spaces2, tables_like(2, 6), "t"));  // 12 in 2
+  }
+
+  SECTION("same chunk count but different per-chunk boundaries does not merge")
+  {
+    auto entry  = make_gpu_entry(*e.gpu_space, 2, 6);  // chunks of 6, 6
+    auto tables = tables_like(2, 6);
+    tables[0]   = std::make_unique<cudf::table>([&] {
+      std::vector<std::unique_ptr<cudf::column>> cols;
+      auto shared = make_gpu_column(*e.gpu_space, std::vector<int32_t>(4, 1));  // 4, not 6
+      cols.push_back(std::make_unique<cudf::column>(
+        shared->view(), e.stream(), e.gpu_space->get_default_allocator()));
+      return cols;
+    }());
+    std::vector<cucascade::memory::memory_space*> const spaces2(2, e.gpu_space);
+    REQUIRE_FALSE(pin_gpu_merge_compatible(entry, spaces2, std::move(tables), "t"));
+  }
+}
+
 TEST_CASE("validate_pinned_entry_for_serving accepts well-formed and zero-chunk entries",
           "[cached_serving][scan_manager]")
 {

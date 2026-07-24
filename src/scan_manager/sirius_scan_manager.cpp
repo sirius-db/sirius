@@ -975,6 +975,60 @@ std::vector<std::size_t> cache_entry_info::column_projection_for(
   return column_superset_projection(column_ids, requested_ids);
 }
 
+// Declared in the header (like validate_pinned_entry_for_serving) so the
+// merge-vs-replace decision is unit-testable against hand-built entries.
+bool pin_gpu_merge_compatible(pinned_entry const& entry,
+                              std::vector<cucascade::memory::memory_space*> const& new_spaces,
+                              std::vector<std::unique_ptr<cudf::table>> const& new_tables,
+                              std::string const& name)
+{
+  if (entry.chunk_memory_spaces.size() != new_spaces.size()) {
+    SIRIUS_LOG_INFO(
+      "[sirius_scan_manager] re-pin of '{}' has {} chunk placement(s) vs the cached "
+      "{}; replacing the entry instead of merging",
+      name,
+      new_spaces.size(),
+      entry.chunk_memory_spaces.size());
+    return false;
+  }
+  for (std::size_t i = 0; i < new_spaces.size(); ++i) {
+    if (entry.chunk_memory_spaces[i] != new_spaces[i]) {
+      SIRIUS_LOG_INFO(
+        "[sirius_scan_manager] re-pin of '{}' chunk {} lands on a different memory "
+        "space; replacing the entry",
+        name,
+        i);
+      return false;
+    }
+  }
+  if (!entry.data_batches_by_column.empty()) {
+    auto const& existing_chunks = entry.data_batches_by_column.begin()->second;
+    if (existing_chunks.size() != new_tables.size()) {
+      SIRIUS_LOG_INFO(
+        "[sirius_scan_manager] re-pin of '{}' has {} chunk(s) but the cache holds {}; "
+        "replacing the entry",
+        name,
+        new_tables.size(),
+        existing_chunks.size());
+      return false;
+    }
+    for (std::size_t i = 0; i < new_tables.size(); ++i) {
+      if (!new_tables[i]) { continue; }
+      if (existing_chunks[i]->size() != new_tables[i]->num_rows()) {
+        SIRIUS_LOG_INFO(
+          "[sirius_scan_manager] re-pin of '{}' chunk {} has different row boundaries "
+          "({} vs {}); replacing the entry",
+          name,
+          i,
+          new_tables[i]->num_rows(),
+          existing_chunks[i]->size());
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
 void sirius_scan_manager::insert_pinned_entry(
   const std::string& name,
   cache_entry_info cache_info,
@@ -1032,62 +1086,16 @@ void sirius_scan_manager::insert_pinned_entry(
 
   auto existing_it = _pinned_entries.find(name);
   if (existing_it != _pinned_entries.end()) {
-    // Same-row-count merge only applies when the completeness contracts match.
-    // Mixing a full pin with a partial pin produces an entry whose columns came
-    // from different row coverage — drop and rebuild instead.
-    if (existing_it->second.num_rows == new_num_rows) {
-      // Same-row-count merge MUST preserve per-chunk memory_space alignment
-      // between existing and new entry. The round-robin counter restarts at
-      // chunk 0 → GPU 0 per pin_table call, and chunks at index i across all
-      // columns share a memory_space because they came from the same
-      // chunked_parquet_reader::read_chunk() call. Two pin_table calls of the
-      // same file_paths with the same chunk_read_limit MUST therefore produce
-      // identical chunk_memory_spaces vectors. Reject any mismatch loudly
-      // rather than silently aliasing.
-      auto& entry = existing_it->second;
-      if (entry.chunk_memory_spaces.size() != chunk_memory_spaces.size()) {
-        throw std::runtime_error(
-          "[sirius_scan_manager::insert_pinned_entry] merge mismatch — "
-          "existing.chunk_memory_spaces.size() (" +
-          std::to_string(entry.chunk_memory_spaces.size()) +
-          ") != new chunk_memory_spaces.size() (" + std::to_string(chunk_memory_spaces.size()) +
-          ")");
-      }
-      for (std::size_t i = 0; i < chunk_memory_spaces.size(); ++i) {
-        if (entry.chunk_memory_spaces[i] != chunk_memory_spaces[i]) {
-          throw std::runtime_error(
-            "[sirius_scan_manager::insert_pinned_entry] merge mismatch — "
-            "chunk_memory_spaces[" +
-            std::to_string(i) + "] differs between existing and new entry");
-        }
-      }
-      // Per-chunk ROW counts must match too: the byte-budget coalescer can slice
-      // the same table at different row-group boundaries for a different column
-      // set (varchar byte budgets are data-dependent), which still yields equal
-      // chunk counts and — because round-robin placement is a function of chunk
-      // index alone — identical memory_spaces. Merging such chunks would corrupt
-      // the entry positionally (columns disagreeing on chunk boundaries) and
-      // silently invalidate the per-chunk MVCC row-count map a duckdb pin stamps
-      // via attach_mvcc_metadata. Reject loudly instead.
-      if (!entry.data_batches_by_column.empty()) {
-        auto const& existing_chunks = entry.data_batches_by_column.begin()->second;
-        if (existing_chunks.size() != data_tables.size()) {
-          throw std::runtime_error(
-            "[sirius_scan_manager::insert_pinned_entry] merge mismatch — existing entry has " +
-            std::to_string(existing_chunks.size()) + " chunks but the new materialization has " +
-            std::to_string(data_tables.size()));
-        }
-        for (std::size_t i = 0; i < data_tables.size(); ++i) {
-          if (!data_tables[i]) { continue; }
-          if (existing_chunks[i]->size() != data_tables[i]->num_rows()) {
-            throw std::runtime_error(
-              "[sirius_scan_manager::insert_pinned_entry] merge mismatch — chunk " +
-              std::to_string(i) + " has " + std::to_string(existing_chunks[i]->size()) +
-              " rows in the existing entry but " + std::to_string(data_tables[i]->num_rows()) +
-              " in the new materialization (same total, different chunk boundaries)");
-          }
-        }
-      }
+    auto& entry = existing_it->second;
+    // Merge unique columns into the existing entry only when BOTH the row count
+    // and the chunk shape match. A same-total re-pin whose chunk placement or
+    // per-chunk boundaries differ (a re-pin after delta promotion grew the
+    // entry, or after a checkpoint re-chunked the disk image, or a different
+    // column set the byte-budget coalescer sliced differently) cannot be merged
+    // positionally — drop and rebuild below instead of failing the pin. Mixing
+    // a full pin with a partial pin (different row coverage) also falls through.
+    if (existing_it->second.num_rows == new_num_rows &&
+        pin_gpu_merge_compatible(entry, chunk_memory_spaces, data_tables, name)) {
       // Same row count → merge unique columns into the existing entry.
       // Decide which column INDICES are new BEFORE iterating chunks. Doing
       // the contains() check per-chunk would let chunk 0 install a new

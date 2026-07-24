@@ -205,6 +205,19 @@ struct pinned_entry {
 void validate_pinned_entry_for_serving(pinned_entry const& entry,
                                        std::span<std::size_t const> selected_columns);
 
+/// True when a same-row-count GPU re-pin can positionally merge into @p entry:
+/// the new materialization must share the entry's per-chunk memory-space
+/// placement (@p new_spaces) and per-chunk row boundaries (@p new_tables). A
+/// mismatch — a re-pin after delta promotion grew the entry, or after a
+/// checkpoint re-chunked the disk image — means the columns cannot be merged,
+/// and insert_pinned_entry drops + rebuilds instead of failing the pin. Logs
+/// the reason at INFO. @p name is for the log only.
+[[nodiscard]] bool pin_gpu_merge_compatible(
+  pinned_entry const& entry,
+  std::vector<cucascade::memory::memory_space*> const& new_spaces,
+  std::vector<std::unique_ptr<cudf::table>> const& new_tables,
+  std::string const& name);
+
 /// Apply one query's captured promotion slices to @p entry: run the contiguity
 /// ratchet from the entry's current n_cache(), pre-validate every selected
 /// slice against the entry's tier and column layout, then append chunks +
