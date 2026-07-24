@@ -30,8 +30,9 @@ state! {
     //   placements/re-packagings of one physical batch.
     // pipeline_uuid: the consumer pipeline (== quent Operator id).
     // port_uuid: the consumer pipeline's source port receiving the batch.
-    // origin: "operator_output" | "partition_output" | "cpu_source" |
-    //   "reschedule_intermediate" | "pinned_cache".
+    // origin: "operator_output" | "partition_output" |
+    //   "reschedule_intermediate" — the C++ `batch_origin` enum
+    //   (batch_telemetry.hpp) is the closed set's source of truth.
     BatchRegistered {
         attributes: {
             batch_id: u64,
@@ -81,7 +82,9 @@ state! {
 }
 
 state! {
-    // reason: "processed" | "task_failed" | "query_end".
+    // reason: "processed" | "task_failed" | "query_end" — the C++
+    //   `batch_consumed_reason` enum (batch_telemetry.hpp) is the closed
+    //   set's source of truth.
     BatchConsumed {
         attributes: {
             reason: String,

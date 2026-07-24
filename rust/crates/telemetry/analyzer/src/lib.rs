@@ -32,7 +32,10 @@ use tracing::debug;
 
 use quent_analyzer::{
     AnalyzerError, AnalyzerResult, Entity, Model, Span,
-    fsm::{FsmTypeDeclaration, FsmUsages, Transition, collection::FsmCollection},
+    fsm::{
+        FsmTypeDeclaration, FsmUsages, Transition, collection::FsmCollection,
+        events::TransitionEvent,
+    },
     resource::{
         ResourceGroup, ResourceTypeDecl, Usage, Using, collection::ResourceCollection,
         tree::ResourceTreeNode,
@@ -80,6 +83,73 @@ const TASK_WORKING_SPACE_STATE: &str = "task_working_space";
 const MEASURE_COUNT: &str = "count";
 /// Data-flow measure summing batch bytes held in each (state, tier) cell.
 const MEASURE_BYTES: &str = "bytes";
+
+/// Push one entity's tier residency into the data-flow aggregation: state `i`
+/// spans transition `i` to `i + 1`, keyed by the memory tier its usage points
+/// at. Walks raw transitions rather than `usages_with_state_names` so a tier
+/// change (self-transition with a different tier usage) splits the state's
+/// residency across both dimension keys. `state_for` labels each span (`None`
+/// skips it); spans without a tier usage hold no residency and are skipped.
+fn push_tier_state_spans<'a, T>(
+    builder: &mut CategoricalTimelineBuilder<Uuid, &'a str, &'a str, &'a str>,
+    tier_names: &HashMap<Uuid, &'a str>,
+    operator_id: Uuid,
+    transitions: &'a [TransitionEvent<T>],
+    state_for: impl Fn(&'a TransitionEvent<T>) -> Option<&'a str>,
+    want_count: bool,
+    want_bytes: bool,
+) -> AnalyzerResult<()> {
+    for pair in transitions.windows(2) {
+        let (from, to) = (&pair[0], &pair[1]);
+        let Ok(span) = SpanNanoSec::try_new(from.timestamp(), to.timestamp()) else {
+            continue;
+        };
+        let Some(state) = state_for(from) else {
+            continue;
+        };
+        let Some(tier_usage) = from
+            .usages
+            .iter()
+            .find(|u| tier_names.contains_key(&u.resource_id))
+        else {
+            continue;
+        };
+        let dimension = tier_names[&tier_usage.resource_id];
+        if want_count {
+            builder.try_push(
+                CategoricalKey {
+                    series: operator_id,
+                    measure: MEASURE_COUNT,
+                    state,
+                    dimension,
+                },
+                span,
+                1.0,
+            )?;
+        }
+        if want_bytes {
+            let bytes: u64 = tier_usage
+                .capacities
+                .iter()
+                .filter(|c| c.name == crate::model::MEMORY_TIER_BYTES_CAPACITY_NAME)
+                .filter_map(|c| c.value)
+                .sum();
+            if bytes > 0 {
+                builder.try_push(
+                    CategoricalKey {
+                        series: operator_id,
+                        measure: MEASURE_BYTES,
+                        state,
+                        dimension,
+                    },
+                    span,
+                    bytes as f64,
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
 /// The memory tiers in stable stacking/legend order.
 /// Stable dimension-key order: GPU tiers first (per-device "GPU-0",
 /// "GPU-1", ... or the legacy aggregate "GPU"), then HOST, then DISK, then
@@ -334,7 +404,7 @@ impl UiAnalyzer for SiriusUiAnalyzer {
             quantity_specs: [
                 // SI decimal prefixes (kB/MB/GB) read better on the DAG bars.
                 (
-                    "capacity_bytes".into(),
+                    crate::model::MEMORY_TIER_BYTES_CAPACITY_NAME.into(),
                     QuantitySpec {
                         occupancy_prefix: quent_ui::quantity::PrefixSystem::Si,
                         ..QuantitySpec::bytes()
@@ -1152,11 +1222,6 @@ impl UiAnalyzer for SiriusUiAnalyzer {
         &self,
         request: CategoricalTimelineRequest<QueryFilter>,
     ) -> AnalyzerResult<DataFlowTimelineBinned> {
-        // Datasets recorded before BatchPlacement instrumentation existed: HTTP 501.
-        if self.model.batch_placements.is_empty() {
-            return Err(AnalyzerError::Unsupported);
-        }
-
         let query_id = request.app_params.query_id;
         let epoch = self.query_engine_model().query_epoch(query_id)?;
         let config = request.config.try_into_binned_span(epoch)?;
@@ -1178,7 +1243,10 @@ impl UiAnalyzer for SiriusUiAnalyzer {
 
         let view = self.model.query_view(query_id)?;
 
-        // Dimension keys are the memory_tier resources' instance names.
+        // Dimension keys are the memory_tier resources' instance names. The
+        // tier resources exist iff batch-placement telemetry was enabled when
+        // recording, so their absence means the whole view is unsupported
+        // (HTTP 501) rather than merely empty.
         let tier_names: HashMap<Uuid, &str> = self
             .model
             .arbitrary_resources
@@ -1186,124 +1254,42 @@ impl UiAnalyzer for SiriusUiAnalyzer {
             .filter(|r| r.type_name() == MEMORY_TIER_TYPE_NAME)
             .map(|r| (r.id(), r.instance_name()))
             .collect();
+        if tier_names.is_empty() {
+            return Err(AnalyzerError::Unsupported);
+        }
 
         let mut builder = CategoricalTimelineBuilder::new(config);
+        // Batch placements: every lifecycle state's tier residency, except the
+        // instantaneous bookkeeping entry state.
         for batch in view.batch_placements() {
             let Some(operator_id) = batch.pipeline_uuid() else {
                 continue;
             };
-            // Walk state spans: state `i` spans transition `i` to `i + 1`. Use
-            // raw transitions rather than `usages_with_state_names` so a tier
-            // change (self-transition with a different tier usage) splits the
-            // state's residency across both dimension keys.
-            for pair in batch.transitions().windows(2) {
-                let (from, to) = (&pair[0], &pair[1]);
-                let Ok(span) = SpanNanoSec::try_new(from.timestamp(), to.timestamp()) else {
-                    continue;
-                };
-                let state = from.name();
-                if state == BATCH_REGISTERED_STATE {
-                    continue;
-                }
-                // States without a tier usage (terminal batch_consumed) hold no
-                // residency and contribute to no dimension key.
-                let Some(tier_usage) = from
-                    .usages
-                    .iter()
-                    .find(|u| tier_names.contains_key(&u.resource_id))
-                else {
-                    continue;
-                };
-                let dimension = tier_names[&tier_usage.resource_id];
-                if want_count {
-                    builder.try_push(
-                        CategoricalKey {
-                            series: operator_id,
-                            measure: MEASURE_COUNT,
-                            state,
-                            dimension,
-                        },
-                        span,
-                        1.0,
-                    )?;
-                }
-                if want_bytes {
-                    let bytes: u64 = tier_usage
-                        .capacities
-                        .iter()
-                        .filter(|c| c.name == crate::model::MEMORY_TIER_BYTES_CAPACITY_NAME)
-                        .filter_map(|c| c.value)
-                        .sum();
-                    if bytes > 0 {
-                        builder.try_push(
-                            CategoricalKey {
-                                series: operator_id,
-                                measure: MEASURE_BYTES,
-                                state,
-                                dimension,
-                            },
-                            span,
-                            bytes as f64,
-                        )?;
-                    }
-                }
-            }
+            push_tier_state_spans(
+                &mut builder,
+                &tier_names,
+                operator_id,
+                batch.transitions(),
+                |t| Some(t.name()).filter(|state| *state != BATCH_REGISTERED_STATE),
+                want_count,
+                want_bytes,
+            )?;
         }
-
-        // Task processing space: tasks report their memory reservation as a
-        // tier usage while preparing/computing. Surface it as one synthetic
-        // series per operator so the DAG shows working space beside the batch
-        // lifecycle states (count = tasks holding space, bytes = reservation).
+        // Task processing space: the memory reservation tasks hold while
+        // preparing/computing, as one synthetic series per operator.
         for task in view.tasks() {
             let Some(operator_id) = task.pipeline_uuid() else {
                 continue;
             };
-            for pair in task.transitions().windows(2) {
-                let (from, to) = (&pair[0], &pair[1]);
-                let Ok(span) = SpanNanoSec::try_new(from.timestamp(), to.timestamp()) else {
-                    continue;
-                };
-                let Some(tier_usage) = from
-                    .usages
-                    .iter()
-                    .find(|u| tier_names.contains_key(&u.resource_id))
-                else {
-                    continue;
-                };
-                let dimension = tier_names[&tier_usage.resource_id];
-                if want_count {
-                    builder.try_push(
-                        CategoricalKey {
-                            series: operator_id,
-                            measure: MEASURE_COUNT,
-                            state: TASK_WORKING_SPACE_STATE,
-                            dimension,
-                        },
-                        span,
-                        1.0,
-                    )?;
-                }
-                if want_bytes {
-                    let bytes: u64 = tier_usage
-                        .capacities
-                        .iter()
-                        .filter(|c| c.name == crate::model::MEMORY_TIER_BYTES_CAPACITY_NAME)
-                        .filter_map(|c| c.value)
-                        .sum();
-                    if bytes > 0 {
-                        builder.try_push(
-                            CategoricalKey {
-                                series: operator_id,
-                                measure: MEASURE_BYTES,
-                                state: TASK_WORKING_SPACE_STATE,
-                                dimension,
-                            },
-                            span,
-                            bytes as f64,
-                        )?;
-                    }
-                }
-            }
+            push_tier_state_spans(
+                &mut builder,
+                &tier_names,
+                operator_id,
+                task.transitions(),
+                |_| Some(TASK_WORKING_SPACE_STATE),
+                want_count,
+                want_bytes,
+            )?;
         }
 
         // Pivot into per-operator series; all-zero series are omitted (the
@@ -1349,8 +1335,8 @@ impl UiAnalyzer for SiriusUiAnalyzer {
         if want_bytes {
             measures.push(MeasureDecl {
                 name: MEASURE_BYTES.to_owned(),
-                display_name: "BatchPlacement bytes".to_owned(),
-                quantity: "capacity_bytes".to_owned(),
+                display_name: "Batch bytes".to_owned(),
+                quantity: crate::model::MEMORY_TIER_BYTES_CAPACITY_NAME.to_owned(),
                 kind: CapacityKind::Occupancy,
             });
         }

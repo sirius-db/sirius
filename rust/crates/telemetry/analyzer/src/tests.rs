@@ -434,7 +434,7 @@ fn ingests_batches_and_memory_tiers() {
     let batch_a = &model.batch_placements[&fixture.batch_a_id];
     assert_eq!(batch_a.batch_id(), Some(7));
     assert_eq!(batch_a.pipeline_uuid(), Some(fixture.op1_id));
-    assert_eq!(batch_a.task_uuid(), Some(fixture.task_1_id));
+    assert_eq!(batch_a.last_task_uuid(), Some(fixture.task_1_id));
 
     // The memory tiers are modeled as resources of type "memory_tier" with
     // their tier name as instance name, marked as used by batches.
@@ -576,16 +576,33 @@ fn data_flow_timeline_task_working_space() {
 }
 
 #[test]
-fn data_flow_timeline_unsupported_without_batches() {
+fn data_flow_timeline_unsupported_without_memory_tiers() {
+    // A recording made with batch telemetry disabled has no memory_tier
+    // resources: the feature is unsupported (HTTP 501) and the UI hides it.
     let mut fixture = fixture(false);
+    fixture
+        .events
+        .retain(|e| !matches!(e.data, SiriusEvent::MemoryTier(_)));
     let analyzer = analyzer(&mut fixture);
 
-    // No batch telemetry: the endpoint reports the feature as unsupported
-    // via an error (the server maps it to HTTP 501).
     let error = analyzer
         .data_flow_timeline(request(fixture.query_id, &[]))
         .expect_err("data flow is unsupported without batch telemetry");
     assert!(matches!(error, AnalyzerError::Unsupported));
+}
+
+#[test]
+fn data_flow_timeline_empty_query_is_supported() {
+    // Tier resources present but no placements (e.g. `select 1;`): the view
+    // is supported and empty, not an error.
+    let mut fixture = fixture(false);
+    let analyzer = analyzer(&mut fixture);
+
+    let binned = analyzer
+        .data_flow_timeline(request(fixture.query_id, &[]))
+        .expect("empty data flow is a valid response");
+    assert!(binned.operators.is_empty());
+    assert!(!binned.decl.dimension_keys.is_empty());
 }
 
 #[test]

@@ -38,6 +38,48 @@ namespace sirius::telemetry {
 
 class telemetry_context;
 
+/// How a batch placement entered the port/task model, recorded on the
+/// placement's registration event.
+enum class batch_origin : uint8_t {
+  /// A producing operator pushed the batch into a consumer port's repository.
+  operator_output,
+  /// A partition consumer operator received one partitioned piece.
+  partition_output,
+  /// First seen when a task claimed it: an intermediate released by an OOM
+  /// reschedule (or otherwise outside the port model), registered lazily.
+  reschedule_intermediate,
+};
+
+constexpr std::string_view to_string_view(batch_origin origin)
+{
+  switch (origin) {
+    case batch_origin::operator_output: return "operator_output";
+    case batch_origin::partition_output: return "partition_output";
+    case batch_origin::reschedule_intermediate: return "reschedule_intermediate";
+  }
+  return "unknown";
+}
+
+/// Why a batch placement left the model, recorded on the consumed event.
+enum class batch_consumed_reason : uint8_t {
+  /// The claiming task computed on the batch and released it.
+  processed,
+  /// The claiming task was destroyed before computing (error paths).
+  task_failed,
+  /// Query-end drain of placements still sitting in repositories.
+  query_end,
+};
+
+constexpr std::string_view to_string_view(batch_consumed_reason reason)
+{
+  switch (reason) {
+    case batch_consumed_reason::processed: return "processed";
+    case batch_consumed_reason::task_failed: return "task_failed";
+    case batch_consumed_reason::query_end: return "query_end";
+  }
+  return "unknown";
+}
+
 /// Process-global registry emitting Batch placement telemetry.
 ///
 /// A *placement* is one physical data batch published to one consuming
@@ -84,7 +126,7 @@ class batch_telemetry_registry {
   /// is added to the repository so `queued` always precedes `packaged`.
   void on_published(const std::shared_ptr<cucascade::data_batch>& batch,
                     const cucascade::shared_data_repository* repo,
-                    std::string_view origin);
+                    batch_origin origin);
 
   /// A task claimed `batch` as input: queued -> packaged on the matching
   /// placement. Re-claims after an OOM reschedule re-emit packaged with the

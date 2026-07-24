@@ -169,11 +169,11 @@ struct batch_telemetry_registry::impl {
     }
   }
 
-  void consume(placement& p, std::string_view reason)
+  void consume(placement& p, batch_consumed_reason reason)
   {
     p.handle->batch_consumed({
       .instance_name = "",
-      .reason        = std::string(reason),
+      .reason        = std::string(to_string_view(reason)),
     });
     p.handle->exit();
   }
@@ -242,7 +242,7 @@ void batch_telemetry_registry::uninstall()
     std::lock_guard lock(shard.mutex);
     for (auto& [batch_id, placements] : shard.placements) {
       for (auto& p : placements) {
-        impl_->consume(p, "query_end");
+        impl_->consume(p, batch_consumed_reason::query_end);
       }
     }
     shard.placements.clear();
@@ -271,7 +271,7 @@ void batch_telemetry_registry::register_consumer_port(const cucascade::shared_da
 
 void batch_telemetry_registry::on_published(const std::shared_ptr<cucascade::data_batch>& batch,
                                             const cucascade::shared_data_repository* repo,
-                                            std::string_view origin)
+                                            const batch_origin origin)
 {
   if (!impl_->enabled.load(std::memory_order_acquire)) { return; }
 
@@ -299,7 +299,7 @@ void batch_telemetry_registry::on_published(const std::shared_ptr<cucascade::dat
                                      .batch_id            = snap->batch_id,
                                      .pipeline_uuid       = port.pipeline_uuid,
                                      .port_uuid           = port.port_uuid,
-                                     .origin              = std::string(origin),
+                                     .origin              = std::string(to_string_view(origin)),
                                      .tier_resource_id    = tier_resource_id,
                                      .tier_capacity_bytes = snap->bytes,
                                    });
@@ -351,17 +351,17 @@ void batch_telemetry_registry::on_packaged(const std::shared_ptr<cucascade::data
   if (target == nullptr) {
     // First sighting (OOM-reschedule intermediates or otherwise outside the
     // port model): register lazily, then package below.
-    auto handle =
-      quent::batch_placement::create(impl_->context->context(),
-                                     {
-                                       .instance_name    = std::format("batch-{}", snap->batch_id),
-                                       .batch_id         = snap->batch_id,
-                                       .pipeline_uuid    = consumer_pipeline_uuid,
-                                       .port_uuid        = uuid::new_nil(),
-                                       .origin           = "reschedule_intermediate",
-                                       .tier_resource_id = tier_resource_id,
-                                       .tier_capacity_bytes = snap->bytes,
-                                     });
+    auto handle = quent::batch_placement::create(
+      impl_->context->context(),
+      {
+        .instance_name       = std::format("batch-{}", snap->batch_id),
+        .batch_id            = snap->batch_id,
+        .pipeline_uuid       = consumer_pipeline_uuid,
+        .port_uuid           = uuid::new_nil(),
+        .origin              = std::string(to_string_view(batch_origin::reschedule_intermediate)),
+        .tier_resource_id    = tier_resource_id,
+        .tier_capacity_bytes = snap->bytes,
+      });
     placements.push_back(impl::placement{
       .handle           = std::move(handle),
       .pipeline_uuid    = consumer_pipeline_uuid,
@@ -447,7 +447,9 @@ void batch_telemetry_registry::on_consumed(uint64_t batch_id, uuid::UUID task_uu
     // rescheduled task carries that task's uuid and is left alone.
     if (p->task_uuid == task_uuid && p->state != impl::placement_state::queued) {
       impl_->consume(*p,
-                     p->state == impl::placement_state::processing ? "processed" : "task_failed");
+                     p->state == impl::placement_state::processing
+                       ? batch_consumed_reason::processed
+                       : batch_consumed_reason::task_failed);
       p = placements.erase(p);
     } else {
       ++p;
@@ -492,7 +494,7 @@ void batch_telemetry_registry::on_query_end()
     std::lock_guard lock(shard.mutex);
     for (auto& [batch_id, placements] : shard.placements) {
       for (auto& p : placements) {
-        impl_->consume(p, "query_end");
+        impl_->consume(p, batch_consumed_reason::query_end);
         ++drained;
       }
     }

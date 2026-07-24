@@ -35,7 +35,7 @@ pub trait BatchPlacementExt {
     /// The consuming pipeline (== quent Operator id), from the registration.
     fn pipeline_uuid(&self) -> Option<Uuid>;
     /// The most recent task this batch was packaged into or processed by.
-    fn task_uuid(&self) -> Option<Uuid>;
+    fn last_task_uuid(&self) -> Option<Uuid>;
     fn matches_filter(&self, filter: &OperatorFilter) -> bool;
     fn active_span(&self) -> Option<SpanUnixNanoSec>;
     fn try_to_ui_fsm(&self, epoch: TimeUnixNanoSec) -> AnalyzerResult<FiniteStateMachine>;
@@ -56,7 +56,7 @@ impl BatchPlacementExt for BatchPlacement {
         })
     }
 
-    fn task_uuid(&self) -> Option<Uuid> {
+    fn last_task_uuid(&self) -> Option<Uuid> {
         self.transitions()
             .iter()
             .rev()

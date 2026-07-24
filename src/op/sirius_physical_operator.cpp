@@ -269,7 +269,8 @@ void sirius_physical_operator::push_data_batch(std::string_view port_id,
   auto* p = get_port(port_id);
   if (p && p->repo) {
     // Emit before the batch becomes poppable so `queued` precedes `packaged`.
-    telemetry::batch_telemetry_registry::instance().on_published(batch, p->repo, "operator_output");
+    telemetry::batch_telemetry_registry::instance().on_published(
+      batch, p->repo, telemetry::batch_origin::operator_output);
     p->repo->add_data_batch(std::move(batch));
   }
 }
