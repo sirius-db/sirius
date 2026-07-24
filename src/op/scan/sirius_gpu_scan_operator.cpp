@@ -41,9 +41,6 @@
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/memory/memory_space.hpp>
 
-// duckdb
-#include <duckdb/common/exception.hpp>
-
 // standard library
 #include <algorithm>
 #include <limits>
@@ -161,6 +158,16 @@ sirius_gpu_scan_operator::sirius_gpu_scan_operator(
     _split_connector(std::make_shared<scan_manager::split_connector>()),
     _compressed_materialization_observer(compressed_materialization_observer)
 {
+  // `this->types` reads the base-class member; the constructor argument was consumed above.
+  _native_physical_types.reserve(this->types.size());
+  for (auto const& type : this->types) {
+    auto const native = sirius::try_get_cudf_type(type);
+    if (!native) {
+      _native_physical_types.clear();
+      break;
+    }
+    _native_physical_types.push_back(*native);
+  }
 }
 
 sirius_gpu_scan_operator::~sirius_gpu_scan_operator() = default;
@@ -226,20 +233,8 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::execute(
 
   auto const has_explicit_physical_schema = has_physical_overrides();
   if (has_explicit_physical_schema || scan_input->is_resident()) {
-    std::vector<cudf::data_type> target_types;
-    if (has_explicit_physical_schema) {
-      target_types = get_physical_types();
-    } else {
-      target_types.reserve(types.size());
-      try {
-        for (auto const& type : types) {
-          target_types.push_back(sirius::get_cudf_type(type));
-        }
-      } catch (duckdb::InvalidInputException const&) {
-        // Preserve legacy resident-scan pass-through when its logical schema has no cuDF mapping.
-        target_types.clear();
-      }
-    }
+    auto const& target_types =
+      has_explicit_physical_schema ? get_physical_types() : _native_physical_types;
     output_table = normalize_physical_schema(std::move(output_table),
                                              target_types,
                                              has_explicit_physical_schema,

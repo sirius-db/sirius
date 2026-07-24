@@ -21,9 +21,13 @@
 #include <op/sirius_physical_operator.hpp>
 #include <op/sirius_physical_operator_type.hpp>
 
+// cudf
+#include <cudf/types.hpp>
+
 // standard library
 #include <memory>
 #include <optional>
+#include <vector>
 
 namespace sirius::scan_manager {
 class split_connector;
@@ -136,6 +140,9 @@ class sirius_gpu_scan_operator : public sirius_physical_operator {
   /// Non-owning observer. The registered-state shared_ptr owns the context for
   /// at least as long as the query plan; unit-test operators may leave it null.
   duckdb::SiriusContext* _compressed_materialization_observer;
+  /// Native cuDF mapping of `types`, computed once at construction; empty when any output type
+  /// has no cuDF mapping. Immutable afterwards, so concurrent execute() calls read it safely.
+  std::vector<cudf::data_type> _native_physical_types;
 };
 
 }  // namespace sirius::op::scan
