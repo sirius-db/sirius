@@ -39,6 +39,7 @@
 #include <op/scan/duckdb_native_gpu_ingestible.hpp>
 #include <op/scan/duckdb_native_metadata.hpp>
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
+#include <scan_manager/delta_promotion.hpp>
 #include <scan_manager/mvcc_chunk_mask.hpp>
 #include <unistd.h>
 
@@ -440,4 +441,365 @@ TEST_CASE("materialize_table applies the mvcc keep-mask to metadata splits",
 
     REQUIRE_THROWS(ingestible->materialize_table(input, stream.view()));
   }
+}
+
+namespace {
+
+/// Ticket + plan wired to a fresh sink, mapping decoded columns to entry
+/// positions. @p entry_pos_by_decoded_pos uses scan_manager::kDropDecodedColumn
+/// for decoded columns the entry does not cache.
+struct promotion_test_rig {
+  std::shared_ptr<sirius::scan_manager::promotion_sink> sink;
+  std::shared_ptr<sirius::scan_manager::promotion_capture> ticket;
+
+  promotion_test_rig(std::vector<std::string> column_names,
+                     std::vector<std::size_t> entry_pos_by_decoded_pos,
+                     std::size_t row_count,
+                     std::size_t reserve_bytes,
+                     cucascade::memory::Tier tier = cucascade::memory::Tier::GPU,
+                     std::unordered_map<int, cucascade::memory::memory_space*> host_by_gpu = {})
+  {
+    sink               = std::make_shared<sirius::scan_manager::promotion_sink>();
+    auto plan          = std::make_shared<sirius::scan_manager::promotion_capture_plan>();
+    plan->entry_name   = "t";
+    plan->tier         = tier;
+    plan->column_names = std::move(column_names);
+    plan->entry_pos_by_decoded_pos = std::move(entry_pos_by_decoded_pos);
+    plan->host_space_by_gpu        = std::move(host_by_gpu);
+    plan->sink                     = sink;
+
+    ticket                    = std::make_shared<sirius::scan_manager::promotion_capture>();
+    ticket->plan              = plan;
+    ticket->first_rowid       = 0;
+    ticket->row_count         = row_count;
+    ticket->row_group_indices = {0, 1};
+    ticket->reserve_bytes     = reserve_bytes;
+  }
+};
+
+}  // namespace
+
+TEST_CASE("promotion hook photocopies the decoded split and leaves the query untouched",
+          "[scan][duckdb_native_host_backed][delta_promotion]")
+{
+  host_backed_test_db env;
+  build_table(*env.con);
+  exec_ok(*env.con, "BEGIN TRANSACTION");
+  auto& storage = resolve_storage(*env.con, "t");
+
+  auto cols         = all_cols();
+  auto types        = all_types();
+  auto md           = walk_all(storage, *env.con->context, cols, types);
+  auto exp          = fetch_expected(*env.con);
+  auto const n_rows = exp.id.size();
+
+  auto mem_mgr    = initialize_memory_manager();
+  auto* gpu_space = sirius::scan_test_utils::get_space(*mem_mgr, cucascade::memory::Tier::GPU);
+  REQUIRE(gpu_space != nullptr);
+  rmm::cuda_stream stream;
+
+  std::vector<std::shared_ptr<void>> keepalive;
+  host_back_segments(*env.con->context, storage, md, keepalive, /*clear_block_ids=*/true);
+
+  auto info             = std::make_unique<duckdb_native_ingestible_table_info>();
+  info->storage         = &storage;
+  info->context         = env.con->context.get();
+  info->projected_cols  = cols;
+  info->projected_types = types;
+  auto ingestible       = make_ingestible(std::move(info));
+
+  promotion_test_rig rig({"id", "value", "price", "name", "opt"},
+                         {0, 1, 2, 3, 4},
+                         n_rows,
+                         /*reserve_bytes=*/64ull << 20);
+
+  auto sinfo               = std::make_unique<duckdb_native_scan_info>();
+  sinfo->row_groups        = std::move(md);
+  sinfo->host_backed_only  = true;
+  sinfo->staging_keepalive = keepalive;
+  sinfo->promotion         = rig.ticket;
+  scan_operator_input input(std::unique_ptr<scan_info>(std::move(sinfo)));
+  input.gpu_memory_space = gpu_space;
+
+  auto result = ingestible->materialize_table(input, stream.view());
+
+  // The query's own result is byte-for-byte what it would be without the hook.
+  auto owned = result.table.release(stream.view(), gpu_space->get_default_allocator());
+  require_matches_expected(*owned, exp, stream.view());
+
+  auto drained = rig.sink->take_all();
+  REQUIRE(drained.size() == 1);
+  auto& capture = drained.at("t");
+  REQUIRE(capture.slices.size() == 1);
+  auto const& slice = capture.slices[0];
+  REQUIRE(slice.row_count == n_rows);
+  REQUIRE(slice.columns.size() == 5);
+  REQUIRE(slice.column_names == std::vector<std::string>{"id", "value", "price", "name", "opt"});
+  REQUIRE(slice.space == gpu_space);
+  REQUIRE(slice.reservation != nullptr);
+  REQUIRE(slice.host_chunk == nullptr);
+
+  // Photocopy, not a view: distinct device storage carrying equal values.
+  REQUIRE(slice.columns[0]->view().data<int32_t>() != owned->get_column(0).view().data<int32_t>());
+  auto copied_ids =
+    download<int32_t>(slice.columns[0]->view().data<int32_t>(), n_rows, stream.view());
+  REQUIRE(copied_ids == exp.id);
+  REQUIRE(static_cast<std::size_t>(slice.columns[4]->null_count()) ==
+          static_cast<std::size_t>(owned->get_column(4).null_count()));
+}
+
+TEST_CASE("promotion capture skips cleanly on reservation failure and self-join dedup",
+          "[scan][duckdb_native_host_backed][delta_promotion]")
+{
+  host_backed_test_db env;
+  build_table(*env.con);
+  exec_ok(*env.con, "BEGIN TRANSACTION");
+  auto& storage = resolve_storage(*env.con, "t");
+
+  auto cols         = all_cols();
+  auto types        = all_types();
+  auto md           = walk_all(storage, *env.con->context, cols, types);
+  auto exp          = fetch_expected(*env.con);
+  auto const n_rows = exp.id.size();
+
+  auto mem_mgr    = initialize_memory_manager();
+  auto* gpu_space = sirius::scan_test_utils::get_space(*mem_mgr, cucascade::memory::Tier::GPU);
+  REQUIRE(gpu_space != nullptr);
+  rmm::cuda_stream stream;
+
+  std::vector<std::shared_ptr<void>> keepalive;
+  host_back_segments(*env.con->context, storage, md, keepalive, /*clear_block_ids=*/true);
+
+  auto info             = std::make_unique<duckdb_native_ingestible_table_info>();
+  info->storage         = &storage;
+  info->context         = env.con->context.get();
+  info->projected_cols  = cols;
+  info->projected_types = types;
+  auto ingestible       = make_ingestible(std::move(info));
+
+  SECTION("reservation failure records a skip; the query result is intact")
+  {
+    // Far beyond the test GPU space's capacity: make_reservation_or_null fails.
+    promotion_test_rig rig({"id", "value", "price", "name", "opt"},
+                           {0, 1, 2, 3, 4},
+                           n_rows,
+                           /*reserve_bytes=*/1ull << 40);
+
+    auto sinfo               = std::make_unique<duckdb_native_scan_info>();
+    sinfo->row_groups        = std::move(md);
+    sinfo->host_backed_only  = true;
+    sinfo->staging_keepalive = keepalive;
+    sinfo->promotion         = rig.ticket;
+    scan_operator_input input(std::unique_ptr<scan_info>(std::move(sinfo)));
+    input.gpu_memory_space = gpu_space;
+
+    auto result = ingestible->materialize_table(input, stream.view());
+    auto owned  = result.table.release(stream.view(), gpu_space->get_default_allocator());
+    require_matches_expected(*owned, exp, stream.view());
+
+    auto drained = rig.sink->take_all();
+    REQUIRE(drained.at("t").slices.empty());
+    REQUIRE(drained.at("t").last_skip_reason == "reservation-failed");
+  }
+
+  SECTION("a second decode of the same row groups is deduped (self-join)")
+  {
+    promotion_test_rig rig({"id", "value", "price", "name", "opt"},
+                           {0, 1, 2, 3, 4},
+                           n_rows,
+                           /*reserve_bytes=*/64ull << 20);
+
+    for (int pass = 0; pass < 2; ++pass) {
+      auto md_pass = walk_all(storage, *env.con->context, cols, types);
+      host_back_segments(*env.con->context, storage, md_pass, keepalive, true);
+      auto sinfo               = std::make_unique<duckdb_native_scan_info>();
+      sinfo->row_groups        = std::move(md_pass);
+      sinfo->host_backed_only  = true;
+      sinfo->staging_keepalive = keepalive;
+      sinfo->promotion         = rig.ticket;
+      scan_operator_input input(std::unique_ptr<scan_info>(std::move(sinfo)));
+      input.gpu_memory_space = gpu_space;
+      auto result            = ingestible->materialize_table(input, stream.view());
+      REQUIRE(result.table.view().num_rows() == static_cast<cudf::size_type>(n_rows));
+    }
+
+    auto drained = rig.sink->take_all();
+    REQUIRE(drained.at("t").slices.size() == 1);  // first op won; second was a no-op
+  }
+}
+
+TEST_CASE("promotion capture reorders decoded columns into entry order and drops extras",
+          "[scan][duckdb_native_host_backed][delta_promotion]")
+{
+  host_backed_test_db env;
+  build_table(*env.con);
+  exec_ok(*env.con, "BEGIN TRANSACTION");
+  auto& storage = resolve_storage(*env.con, "t");
+
+  auto cols         = all_cols();
+  auto types        = all_types();
+  auto md           = walk_all(storage, *env.con->context, cols, types);
+  auto exp          = fetch_expected(*env.con);
+  auto const n_rows = exp.id.size();
+
+  auto mem_mgr    = initialize_memory_manager();
+  auto* gpu_space = sirius::scan_test_utils::get_space(*mem_mgr, cucascade::memory::Tier::GPU);
+  REQUIRE(gpu_space != nullptr);
+  rmm::cuda_stream stream;
+
+  std::vector<std::shared_ptr<void>> keepalive;
+  host_back_segments(*env.con->context, storage, md, keepalive, /*clear_block_ids=*/true);
+
+  auto info             = std::make_unique<duckdb_native_ingestible_table_info>();
+  info->storage         = &storage;
+  info->context         = env.con->context.get();
+  info->projected_cols  = cols;
+  info->projected_types = types;
+  auto ingestible       = make_ingestible(std::move(info));
+
+  // Entry caches {value, id} in that order; decoded layout is [id value price name opt].
+  auto const kDrop = sirius::scan_manager::kDropDecodedColumn;
+  promotion_test_rig rig({"value", "id"},
+                         {1, 0, kDrop, kDrop, kDrop},
+                         n_rows,
+                         /*reserve_bytes=*/64ull << 20);
+
+  auto sinfo               = std::make_unique<duckdb_native_scan_info>();
+  sinfo->row_groups        = std::move(md);
+  sinfo->host_backed_only  = true;
+  sinfo->staging_keepalive = keepalive;
+  sinfo->promotion         = rig.ticket;
+  scan_operator_input input(std::unique_ptr<scan_info>(std::move(sinfo)));
+  input.gpu_memory_space = gpu_space;
+
+  auto result = ingestible->materialize_table(input, stream.view());
+  REQUIRE(result.table.view().num_rows() == static_cast<cudf::size_type>(n_rows));
+
+  auto drained      = rig.sink->take_all();
+  auto const& slice = drained.at("t").slices.at(0);
+  REQUIRE(slice.columns.size() == 2);
+  auto copied_values =
+    download<int64_t>(slice.columns[0]->view().data<int64_t>(), n_rows, stream.view());
+  REQUIRE(copied_values == exp.value);  // entry position 0 = value
+  auto copied_ids =
+    download<int32_t>(slice.columns[1]->view().data<int32_t>(), n_rows, stream.view());
+  REQUIRE(copied_ids == exp.id);  // entry position 1 = id
+}
+
+TEST_CASE("promotion capture converts to a host chunk for HOST-tier entries",
+          "[scan][duckdb_native_host_backed][delta_promotion]")
+{
+  host_backed_test_db env;
+  build_table(*env.con);
+  exec_ok(*env.con, "BEGIN TRANSACTION");
+  auto& storage = resolve_storage(*env.con, "t");
+
+  auto cols         = all_cols();
+  auto types        = all_types();
+  auto md           = walk_all(storage, *env.con->context, cols, types);
+  auto exp          = fetch_expected(*env.con);
+  auto const n_rows = exp.id.size();
+
+  auto mem_mgr     = initialize_memory_manager();
+  auto* gpu_space  = sirius::scan_test_utils::get_space(*mem_mgr, cucascade::memory::Tier::GPU);
+  auto* host_space = sirius::scan_test_utils::get_space(*mem_mgr, cucascade::memory::Tier::HOST);
+  REQUIRE(gpu_space != nullptr);
+  REQUIRE(host_space != nullptr);
+  rmm::cuda_stream stream;
+
+  std::vector<std::shared_ptr<void>> keepalive;
+  host_back_segments(*env.con->context, storage, md, keepalive, /*clear_block_ids=*/true);
+
+  auto info             = std::make_unique<duckdb_native_ingestible_table_info>();
+  info->storage         = &storage;
+  info->context         = env.con->context.get();
+  info->projected_cols  = cols;
+  info->projected_types = types;
+  auto ingestible       = make_ingestible(std::move(info));
+
+  promotion_test_rig rig({"id", "value", "price", "name", "opt"},
+                         {0, 1, 2, 3, 4},
+                         n_rows,
+                         /*reserve_bytes=*/64ull << 20,
+                         cucascade::memory::Tier::HOST,
+                         {{gpu_space->get_device_id(), host_space}});
+
+  auto sinfo               = std::make_unique<duckdb_native_scan_info>();
+  sinfo->row_groups        = std::move(md);
+  sinfo->host_backed_only  = true;
+  sinfo->staging_keepalive = keepalive;
+  sinfo->promotion         = rig.ticket;
+  scan_operator_input input(std::unique_ptr<scan_info>(std::move(sinfo)));
+  input.gpu_memory_space = gpu_space;
+
+  auto result = ingestible->materialize_table(input, stream.view());
+  auto owned  = result.table.release(stream.view(), gpu_space->get_default_allocator());
+  require_matches_expected(*owned, exp, stream.view());
+
+  auto drained      = rig.sink->take_all();
+  auto const& slice = drained.at("t").slices.at(0);
+  REQUIRE(slice.columns.empty());
+  REQUIRE(slice.host_chunk != nullptr);
+  REQUIRE(slice.host_chunk->get_size_in_bytes() > 0);
+  REQUIRE(slice.reservation != nullptr);
+}
+
+TEST_CASE("widened carrier decode trims promotion extras from the query output",
+          "[scan][duckdb_native_host_backed][delta_promotion]")
+{
+  host_backed_test_db env;
+  build_table(*env.con);
+  exec_ok(*env.con, "BEGIN TRANSACTION");
+  auto& storage = resolve_storage(*env.con, "t");
+
+  auto exp          = fetch_expected(*env.con);
+  auto const n_rows = exp.id.size();
+
+  auto mem_mgr    = initialize_memory_manager();
+  auto* gpu_space = sirius::scan_test_utils::get_space(*mem_mgr, cucascade::memory::Tier::GPU);
+  REQUIRE(gpu_space != nullptr);
+  rmm::cuda_stream stream;
+
+  // The query projects {id, value}; the entry caches all five columns.
+  auto info             = std::make_unique<duckdb_native_ingestible_table_info>();
+  info->storage         = &storage;
+  info->context         = env.con->context.get();
+  info->projected_cols  = {real_col(0), real_col(1)};
+  info->projected_types = {sirius::logical_type::make(sirius::type_id::INTEGER),
+                           sirius::logical_type::make(sirius::type_id::BIGINT)};
+  info->output_types.push_back(sirius::logical_type::make(sirius::type_id::INTEGER));
+  info->output_types.push_back(sirius::logical_type::make(sirius::type_id::BIGINT));
+  auto ingestible = make_ingestible(std::move(info));
+
+  ingestible->append_promotion_columns({real_col(2), real_col(3), real_col(4)},
+                                       {sirius::logical_type::make(sirius::type_id::DOUBLE),
+                                        sirius::logical_type::make(sirius::type_id::VARCHAR),
+                                        sirius::logical_type::make(sirius::type_id::INTEGER)});
+
+  // Walk in the widened layout order so the split's per-row-group column
+  // descriptors line up with the widened projected_cols.
+  auto widened_cols  = all_cols();
+  auto widened_types = all_types();
+  auto md            = walk_all(storage, *env.con->context, widened_cols, widened_types);
+  std::vector<std::shared_ptr<void>> keepalive;
+  host_back_segments(*env.con->context, storage, md, keepalive, /*clear_block_ids=*/true);
+
+  auto sinfo               = std::make_unique<duckdb_native_scan_info>();
+  sinfo->row_groups        = std::move(md);
+  sinfo->host_backed_only  = true;
+  sinfo->staging_keepalive = keepalive;
+  scan_operator_input input(std::unique_ptr<scan_info>(std::move(sinfo)));
+  input.gpu_memory_space = gpu_space;
+
+  auto materialized = ingestible->materialize_table(input, stream.view());
+  REQUIRE(materialized.table.n_columns() == 5);  // decoded wide...
+
+  auto projected =
+    ingestible->post_filter_and_project(std::move(materialized), *gpu_space, stream.view());
+  REQUIRE(projected->num_columns() == 2);  // ...but the query sees its own arity
+  REQUIRE(static_cast<std::size_t>(projected->num_rows()) == n_rows);
+  REQUIRE(download<int32_t>(
+            projected->get_column(0).view().data<int32_t>(), n_rows, stream.view()) == exp.id);
+  REQUIRE(download<int64_t>(
+            projected->get_column(1).view().data<int64_t>(), n_rows, stream.view()) == exp.value);
 }

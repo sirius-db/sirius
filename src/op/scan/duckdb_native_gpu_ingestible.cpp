@@ -346,8 +346,12 @@ std::unique_ptr<cudf::table> duckdb_native_gpu_ingestible::post_filter_and_proje
   rmm::cuda_stream_view stream)
 {
   auto const output_arity = _info->output_types.size();
-  auto const decoded_cols =
-    _info->projection_ids.empty() ? _info->column_ids.size() : _info->projection_ids.size();
+  // Key on the table actually in hand, not the bind-time column count: one
+  // operator can see mixed widths in a single query (narrow cached base
+  // chunks alongside promotion-widened delta splits), and each batch must
+  // decide its own trim. Identical to the bind-time computation whenever the
+  // decode wasn't widened.
+  auto const decoded_cols        = input.table.n_columns();
   auto const projection_required = (output_arity > 0) && (decoded_cols > output_arity);
 
   rmm::device_async_resource_ref mr_ref(mem_space.get_default_allocator());
@@ -409,6 +413,33 @@ std::vector<std::size_t> duckdb_native_gpu_ingestible::materialized_column_order
     }
   }
   return order;
+}
+
+//===----------------------------------------------------------------------===//
+// append_promotion_columns
+//===----------------------------------------------------------------------===//
+void duckdb_native_gpu_ingestible::append_promotion_columns(
+  std::vector<op::scan::projected_column> extra_cols, std::vector<sirius::logical_type> extra_types)
+{
+  if (extra_cols.size() != extra_types.size()) {
+    throw std::runtime_error(
+      "[duckdb_native_gpu_ingestible::append_promotion_columns] extra column/type count mismatch");
+  }
+  for (auto const& pcol : extra_cols) {
+    if (pcol.is_rowid) {
+      throw std::runtime_error(
+        "[duckdb_native_gpu_ingestible::append_promotion_columns] rowid is never cached");
+    }
+  }
+  // Trailing only: the decoded layout stays [query projection][promotion extras],
+  // so the folded filter gather and the [0..output_arity) projection in
+  // post_filter_and_project keep binding to the same leading columns.
+  _info->projected_cols.insert(_info->projected_cols.end(),
+                               std::make_move_iterator(extra_cols.begin()),
+                               std::make_move_iterator(extra_cols.end()));
+  _info->projected_types.insert(_info->projected_types.end(),
+                                std::make_move_iterator(extra_types.begin()),
+                                std::make_move_iterator(extra_types.end()));
 }
 
 std::shared_ptr<duckdb_native_gpu_ingestible> make_ingestible(

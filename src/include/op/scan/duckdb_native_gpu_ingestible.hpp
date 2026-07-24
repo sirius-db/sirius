@@ -184,6 +184,17 @@ class duckdb_native_gpu_ingestible : public op::scan::gpu_ingestible {
     return _filter_expression != nullptr;
   }
 
+  /**
+   * Delta promotion (carrier op only): widen the decode layout with TRAILING
+   * extra columns so promotable delta splits decode every pinned column, not
+   * just the query's projection. post_filter_and_project drops the extras from
+   * the query's own output (its trim keys on the actual table width). Call at
+   * scan-manager handoff, before delta splits are cut — materialized_column_order
+   * and the walk coalescer snapshot the narrow layout earlier and never re-read.
+   */
+  void append_promotion_columns(std::vector<op::scan::projected_column> extra_cols,
+                                std::vector<sirius::logical_type> extra_types);
+
  private:
   std::unique_ptr<op::scan::duckdb_native_ingestible_table_info> _info;
   duckdb_native_walk_plan _plan;

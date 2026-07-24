@@ -25,6 +25,10 @@
 
 #pragma once
 
+namespace sirius::scan_manager {
+struct promotion_capture;
+}  // namespace sirius::scan_manager
+
 namespace sirius::op::scan {
 
 //===----------------------------------------------------------------------===//
@@ -83,6 +87,12 @@ class scan_info : public std::enable_shared_from_this<scan_info> {
   };
 
   virtual ~scan_info() = default;
+
+  /// Delta-promotion ticket. Non-null only on promotable insert-delta splits of
+  /// a duckdb pin's carrier operator; the decode hook in
+  /// gpu_ingestible::materialize_table photocopies the decoded table into the
+  /// ticket's sink. Rides the existing split -> batch -> operator-input path.
+  std::shared_ptr<scan_manager::promotion_capture> promotion;
 
   virtual std::vector<fadvise_entry> fadvise_entries() const { return {}; }
 

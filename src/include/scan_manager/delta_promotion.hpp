@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include <rmm/cuda_stream_view.hpp>
+
 #include <cucascade/memory/common.hpp>
 #include <duckdb/common/typedefs.hpp>
 
@@ -38,6 +40,10 @@ namespace memory {
 class memory_space;
 }  // namespace memory
 }  // namespace cucascade
+
+namespace sirius::op::scan {
+struct filtered_table;
+}  // namespace sirius::op::scan
 
 namespace sirius::scan_manager {
 
@@ -124,7 +130,26 @@ struct promotion_capture {
   std::size_t first_rowid{0};
   std::size_t row_count{0};
   std::vector<duckdb::idx_t> row_group_indices;  ///< dedup key = front(); logging
+  /// GPU-tier admission size (the bundle's decoded-bytes budget). The host tier
+  /// reserves from the converted representation's exact size instead.
+  std::size_t reserve_bytes{0};
 };
+
+/**
+ * The decode hook: photocopy the just-decoded, unmasked delta table into a
+ * promotion_captured_slice and stash it in the ticket's sink. @p materialized
+ * is read, never mutated — the query serves it exactly as if promotion were
+ * off. Reserve-or-skip: any failure (dedup loss, shape mismatch, reservation
+ * denied, copy error) records a skip and returns; promotion is an optimization
+ * and must never fail the query, hence noexcept.
+ *
+ * Runs on concurrent GPU pipeline-executor workers. Synchronizes @p stream
+ * before publishing so the copied bytes are complete once visible to apply.
+ */
+void capture_promoted_slice(promotion_capture const& ticket,
+                            op::scan::filtered_table const& materialized,
+                            cucascade::memory::memory_space& space,
+                            rmm::cuda_stream_view stream) noexcept;
 
 /// Contiguity ratchet (pure, unit-testable, no GPU). Returns the maximal run of
 /// @p slices that extends contiguously from @p n_cache, in rowid order; every

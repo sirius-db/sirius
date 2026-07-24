@@ -20,6 +20,7 @@
 #include <op/scan/gpu_ingestible.hpp>
 #include <op/scan/host_keep_mask.hpp>
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
+#include <scan_manager/delta_promotion.hpp>
 
 #include <stdexcept>
 #include <string>
@@ -34,6 +35,13 @@ filtered_table gpu_ingestible::materialize_table(const op::scan::scan_operator_i
   if (split.has_scan_metadata()) [[likely]] {
     split.prefetch(io::cache::prefetching_stage::disposable);
     auto materialized = materialize_metadata_to_table(split.get_scan_info(), *mem_space, stream);
+    // Delta promotion: photocopy the just-decoded table into the pin cache's
+    // sink. Only promotable insert-delta splits carry a ticket, and those are
+    // always unmasked (all rows visible) — the mask guard is belt-and-braces.
+    if (auto const& ticket = split.get_scan_info().promotion;
+        ticket && !split.mvcc_keep_mask.has_mask()) {
+      scan_manager::capture_promoted_slice(*ticket, materialized, *mem_space, stream);
+    }
     if (split.mvcc_keep_mask.has_mask()) {
       // Only insert-delta splits carry a visibility mask here; disk-walk
       // splits never do. Sync before returning for the same reason as the
