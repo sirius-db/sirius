@@ -97,15 +97,11 @@ find_package(ZLIB REQUIRED)
 
 # Static NVRTC (vcpkg overlay port). Statically linking the runtime JIT compiler
 # keeps libnvrtc.so out of the distributed extension's runtime dependencies.
-# Only available in the vcpkg build; the pixi build links the conda libnvrtc.so.
-# When the nvrtc::nvrtc_static target exists, simpatico links it instead of the
-# bare 'nvrtc' library name (see
-# src/compression/simpatico_codegen/CMakeLists.txt). Toggle off to link the
-# shared libnvrtc.so instead (smaller binary, adds a runtime dependency).
-option(SIRIUS_STATIC_NVRTC
-       "Statically link NVRTC so the extension has no libnvrtc.so runtime dep"
-       ON)
-if(VCPKG_BUILD AND SIRIUS_STATIC_NVRTC)
+# Like cuco/nvcomp, this is gated on the vcpkg build: the overlay port provides
+# the nvrtc::nvrtc_static target, which simpatico links instead of the bare
+# 'nvrtc' library name (see src/compression/simpatico_codegen/CMakeLists.txt).
+# The pixi build has no such target and links the conda shared libnvrtc.so.
+if(VCPKG_BUILD)
   find_package(nvrtc CONFIG REQUIRED)
 endif()
 
