@@ -35,6 +35,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <stdexcept>
 #include <type_traits>
 
@@ -243,11 +244,25 @@ void alp_upload_constants(rmm::cuda_stream_view stream)
   cudaStreamSynchronize(s);
 }
 
-// Thread-safe one-shot init: safe under concurrent multi-stream compression.
+// Thread-safe init: uploads the constant tables once PER DEVICE. The __constant__
+// symbols are device-local (cudaMemcpyToSymbol targets the current device), so a
+// process that touches more than one GPU -- e.g. a chunk encoded on GPU 0 and
+// host-staged, then decoded on GPU 1 -- must upload to each device separately. A
+// single process-wide once_flag would leave every device but the first with
+// uninitialized constants, silently decoding garbage.
 void ensure_constants_initialized(rmm::cuda_stream_view stream)
 {
-  static std::once_flag flag;
-  std::call_once(flag, alp_upload_constants, stream);
+  int device = 0;
+  throw_if_cuda_error(cudaGetDevice(&device), "alp: cudaGetDevice");
+
+  // Keyed on the current device; the uploads below target its constant memory.
+  static std::mutex mtx;
+  static std::set<int> initialized_devices;
+
+  std::lock_guard<std::mutex> const lock(mtx);
+  if (initialized_devices.count(device) > 0) return;
+  alp_upload_constants(stream);
+  initialized_devices.insert(device);
 }
 
 // -----------------------------------------------------------------------------

@@ -666,9 +666,14 @@ cache_entry_info cache_entry_info::from(const op::scan::ingestible_table_info& i
 {
   cache_entry_info ci;
   if (auto const* p = dynamic_cast<op::scan::parquet_ingestible_table_info const*>(&info)) {
+    // Cache identity is spelling-independent, so canonicalize here — at the
+    // identity boundary — rather than in the bind info, whose resolved_file_paths
+    // stay as bound so Hive partition parsing sees the original (un-symlink-
+    // resolved) path.
     ci.resolved_file_paths = p->resolved_file_paths;
-    ci.column_ids          = p->column_ids;
-    ci.names               = aligned_column_names(p->names, p->column_ids);
+    op::scan::canonicalize_scan_file_paths(ci.resolved_file_paths);
+    ci.column_ids = p->column_ids;
+    ci.names      = aligned_column_names(p->names, p->column_ids);
   } else if (auto const* d =
                dynamic_cast<op::scan::duckdb_native_ingestible_table_info const*>(&info)) {
     ci.catalog_name = d->catalog_name;
@@ -689,8 +694,12 @@ std::vector<std::size_t> cache_entry_info::can_serve_with_columns(
   // duckdb cache has empty resolved_file_paths; a parquet cache has an empty table_name).
   if (auto const* p = dynamic_cast<op::scan::parquet_ingestible_table_info const*>(&other)) {
     if (resolved_file_paths.size() != p->resolved_file_paths.size()) { return {}; }
+    // `this` is a stored entry (already canonical via cache_entry_info::from);
+    // `other` is a fresh bind whose paths are still as-bound, so canonicalize the
+    // comparison copy to match.
     auto these_files = resolved_file_paths;
     auto those_files = p->resolved_file_paths;
+    op::scan::canonicalize_scan_file_paths(those_files);
     std::sort(these_files.begin(), these_files.end());
     std::sort(those_files.begin(), those_files.end());
     if (these_files != those_files) { return {}; }
@@ -1282,12 +1291,22 @@ std::optional<sirius_scan_manager::cached_assignment> sirius_scan_manager::try_m
             duckdb_info->context == nullptr) {
           throw std::runtime_error("mvcc-pinned entry matched a scan without duckdb table state");
         }
-        auto const n_chunks      = entry.mvcc->base_row_count_per_chunk.size();
-        auto const stored_chunks = entry.tier == cucascade::memory::Tier::GPU
-                                     ? (entry.data_batches_by_column.empty()
-                                          ? 0
-                                          : entry.data_batches_by_column.begin()->second.size())
-                                     : entry.host_chunks.size();
+        auto const n_chunks = entry.mvcc->base_row_count_per_chunk.size();
+        // A compression-enabled DuckDB GPU pin stores its chunks in
+        // device_chunks (one entry per batch); the older column-major GPU path
+        // uses data_batches_by_column. Derive the count from whichever backs this
+        // entry, mirroring get_device_databatch's dispatch — otherwise a
+        // device_chunks pin reads as 0 chunks and fails validation below.
+        std::size_t stored_chunks = 0;
+        if (entry.tier == cucascade::memory::Tier::GPU) {
+          if (!entry.device_chunks.empty()) {
+            stored_chunks = entry.device_chunks.size();
+          } else if (!entry.data_batches_by_column.empty()) {
+            stored_chunks = entry.data_batches_by_column.begin()->second.size();
+          }
+        } else {
+          stored_chunks = entry.host_chunks.size();
+        }
         if (stored_chunks != n_chunks) {
           // Pin-time metadata and entry chunks are kept in lock-step (the
           // insert merge-path guard); a mismatch means masks would bind to
@@ -1314,11 +1333,25 @@ std::optional<sirius_scan_manager::cached_assignment> sirius_scan_manager::try_m
           request.metadata = *entry.mvcc;
           request.storage  = duckdb_info->storage;
           request.context  = duckdb_info->context;
-          request.chunk_spaces =
-            entry.tier == cucascade::memory::Tier::GPU
-              ? entry.chunk_memory_spaces
-              : std::vector<cucascade::memory::memory_space*>(n_chunks, entry.memory_space);
-          request.entry_name = pinned_name;
+          // Per-chunk memory spaces, sourced from the same storage that backs
+          // the chunk count above so device_chunks pins get real spaces instead
+          // of an empty vector.
+          std::vector<cucascade::memory::memory_space*> chunk_spaces;
+          if (entry.tier == cucascade::memory::Tier::GPU) {
+            if (!entry.device_chunks.empty()) {
+              chunk_spaces.reserve(entry.device_chunks.size());
+              for (auto const& chunk : entry.device_chunks) {
+                chunk_spaces.push_back(chunk.memory_space ? chunk.memory_space
+                                                          : entry.memory_space);
+              }
+            } else {
+              chunk_spaces = entry.chunk_memory_spaces;
+            }
+          } else {
+            chunk_spaces.assign(n_chunks, entry.memory_space);
+          }
+          request.chunk_spaces = std::move(chunk_spaces);
+          request.entry_name   = pinned_name;
           _pending_mvcc_mask_jobs.push_back(std::move(request));
         }
       }

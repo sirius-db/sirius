@@ -875,9 +875,8 @@ std::unique_ptr<sirius::op::scan::parquet_ingestible_table_info> build_parquet_p
 
   auto info                 = std::make_unique<parquet_ingestible_table_info>();
   info->resolved_file_paths = file_paths;
-  sirius::op::scan::canonicalize_scan_file_paths(info->resolved_file_paths);
-  info->returned_types = sirius::from_duckdb_vec(desc.return_types);  // full schema
-  info->names          = desc.names;                                  // full schema
+  info->returned_types      = sirius::from_duckdb_vec(desc.return_types);  // full schema
+  info->names               = desc.names;                                  // full schema
   for (auto idx : keep) {
     info->column_ids.emplace_back(duckdb::ColumnIndex(static_cast<duckdb::idx_t>(idx)));
     // Pin-time DuckDB type of each pinned column, in column_ids (batch-column)

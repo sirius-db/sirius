@@ -97,7 +97,10 @@ class parquet_ingestible_table_info : public ingestible_table_info {
 /// (@ref cache_entry_info::can_serve_with_columns, a raw set-equality on
 /// resolved_file_paths) is independent of spelling: relative vs absolute,
 /// redundant '/', './..', 'file://', and symlinks all collapse. Remote URIs
-/// (scheme://) pass through. Apply wherever resolved_file_paths is populated.
+/// (scheme://) pass through. Apply ONLY at the cache-identity boundary
+/// (cache_entry_info): resolved_file_paths on the bind info stay as bound, so
+/// Hive partition parsing reads the original path and is not confused by a
+/// symlink-resolved 'key=value' directory segment.
 [[nodiscard]] std::string canonical_scan_file_path(std::string const& raw);
 
 /// In-place @ref canonical_scan_file_path over a resolved-file-path vector.

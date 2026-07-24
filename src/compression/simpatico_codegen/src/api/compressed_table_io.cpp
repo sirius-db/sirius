@@ -648,7 +648,12 @@ compressed_table read_compressed_table(std::string const& path,
     for (std::size_t li = 0; li < cr.leaf_descs.size(); ++li) {
       for (std::size_t bi = 0; bi < cr.leaf_descs[li].buffers.size(); ++bi) {
         std::size_t sz = static_cast<std::size_t>(cr.leaf_descs[li].buffers[bi].size_bytes);
-        if (sz > 0 && cr.buf_offsets[li][bi] + sz > payload_total)
+        std::uint64_t const off = cr.buf_offsets[li][bi];
+        // Subtraction form: `off + sz` could overflow for a corrupt/hostile
+        // file's huge declared offset and wrap below payload_total, passing the
+        // check and then faulting in fetch(). Compare against the remaining space
+        // instead so it can never overflow.
+        if (sz > 0 && (off > payload_total || sz > payload_total - off))
           return fail("payload out of bounds");
       }
     }
