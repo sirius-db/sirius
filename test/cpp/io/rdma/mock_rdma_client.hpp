@@ -65,12 +65,21 @@ class mock_s3_control_client final : public s3_control_client {
 
   [[nodiscard]] size_t heads_issued() const;
   [[nodiscard]] size_t range_gets_issued() const;
+  [[nodiscard]] size_t list_pages_issued() const;
 
   [[nodiscard]] head_result head(const rx_route& route) override;
   [[nodiscard]] range_get_result range_get(const rx_route& route,
                                            size_t offset,
                                            size_t size,
                                            uint8_t* dst) override;
+  /// Serves REAL pages from the seeded objects: keys in @p bucket matching
+  /// @p prefix, map order, paginated by the clamped @p page_size with a
+  /// last-key continuation token.  The one-shot fail_transport /
+  /// respond_status knobs apply to list calls exactly as to head/range_get.
+  [[nodiscard]] list_page_result list_page(std::string_view bucket,
+                                           std::string_view prefix,
+                                           std::size_t page_size,
+                                           std::string_view continuation_token) override;
   [[nodiscard]] uint64_t attempts_total() const noexcept override;
   [[nodiscard]] uint64_t connections_total() const noexcept override;
 
@@ -86,6 +95,7 @@ class mock_s3_control_client final : public s3_control_client {
   bool _gate_closed{false};
   size_t _heads_issued{0};
   size_t _range_gets_issued{0};
+  size_t _list_pages_issued{0};
   bool _connected{false};  // the first attempt "opens" the connection; reuse adds 0
   uint64_t _connections_total{0};
 };

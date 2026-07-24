@@ -122,6 +122,75 @@ endpoint_topology detect_endpoint_topology(std::string_view host_endpoint,
   return equal ? endpoint_topology::same_address : endpoint_topology::split;
 }
 
+void s3_rdma_ioctx::list_objects_paged(
+  std::string_view bucket,
+  std::string_view prefix,
+  std::size_t page_size,
+  std::function<bool(s3::list_objects_v2_page const&)> const& sink,
+  std::optional<std::size_t> max_scanned)
+{
+  auto const& control = _reactor_ctx->clients().control;
+  if (!control) {
+    throw std::runtime_error("s3_rdma_ioctx::list_objects_paged: no control-plane client");
+  }
+  const std::size_t clamped     = (page_size == 0 || page_size > 1000) ? 1000 : page_size;
+  const std::size_t scanned_cap = max_scanned.value_or(s3::default_max_scanned_objects);
+  const std::string where       = "s3://" + std::string(bucket) + "/" + std::string(prefix);
+
+  std::size_t scanned = 0;
+  std::string token;
+  bool truncated = false;
+  do {
+    // One control permit per page, scoped to the client call ONLY (the gate
+    // contract: a permit covers one control call).  Validation and the sink
+    // run after release — a sink that closes the ioctx must not deadlock
+    // against its own page's permit.  A terminal gate refuses the next page
+    // with the single terminal error (first_fatal when latched, else the
+    // stable closed error).
+    rdma::list_page_result page;
+    {
+      auto permit = _reactor_ctx->gate().acquire_control();
+      page        = control->list_page(bucket, prefix, clamped, token);
+    }
+    if (!page.outcome.transport_ok()) {
+      throw std::runtime_error(
+        "s3_rdma_ioctx::list_objects_paged: " + page.outcome.transport_error + " for " + where);
+    }
+    if (page.outcome.http_status != 200) {
+      throw std::runtime_error("s3_rdma_ioctx::list_objects_paged: HTTP " +
+                               std::to_string(page.outcome.http_status) + " for " + where);
+    }
+    scanned += page.page.entries.size();
+    if (scanned > scanned_cap) {
+      throw std::runtime_error("s3_rdma_ioctx::list_objects_paged: scanned more than " +
+                               std::to_string(scanned_cap) + " objects under " + where +
+                               " — narrow the glob prefix");
+    }
+    if (page.page.is_truncated && page.page.next_continuation_token.empty()) {
+      throw std::runtime_error(
+        "s3_rdma_ioctx::list_objects_paged: truncated ListObjectsV2 page without a continuation "
+        "token for " +
+        where);
+    }
+    if (page.page.is_truncated && page.page.entries.empty()) {
+      throw std::runtime_error(
+        "s3_rdma_ioctx::list_objects_paged: truncated ListObjectsV2 page with no entries for " +
+        where);
+    }
+    if (page.page.is_truncated && page.page.next_continuation_token == token) {
+      throw std::runtime_error(
+        "s3_rdma_ioctx::list_objects_paged: ListObjectsV2 continuation token did not advance "
+        "for " +
+        where);
+    }
+    truncated = page.page.is_truncated;
+    token     = page.page.next_continuation_token;
+    if (!sink(page.page)) { return; }
+  } while (truncated);
+}
+
+std::size_t s3_rdma_ioctx::list_max_matches() const { return s3::default_max_list_objects; }
+
 s3_rdma_ioctx::s3_rdma_ioctx(object_store_config cfg,
                              rdma::rdma_transport_clients clients,
                              rdma::cuda_delivery_ops delivery)

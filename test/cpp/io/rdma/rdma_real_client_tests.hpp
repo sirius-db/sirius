@@ -305,6 +305,80 @@ TEST_CASE("s3_rdma_ioctx uses the real client for host reads through MinIO",
   }
 }
 
+TEST_CASE("curl S3 control client lists MinIO objects with pagination",
+          "[s3][rdma][client][integration][list]")
+{
+  using namespace s3_rdma_p3a_tests;
+  if (!ensure_minio_env()) { return; }
+
+  auto const env = read_minio_env();
+
+  for (auto signing : {signing_case::presigned, signing_case::header}) {
+    DYNAMIC_SECTION(signing_name(signing))
+    {
+      auto client = make_real_client(object_store_cfg(env, signing));
+
+      auto const first = client->list_page(env.bucket, "parquet/", 1, "");
+      REQUIRE(first.outcome.http_status == 200);
+      REQUIRE(first.outcome.transport_error.empty());
+      REQUIRE(first.page.entries.size() == 1);
+      REQUIRE(first.page.is_truncated);
+      REQUIRE_FALSE(first.page.next_continuation_token.empty());
+
+      auto const second =
+        client->list_page(env.bucket, "parquet/", 1, first.page.next_continuation_token);
+      REQUIRE(second.outcome.http_status == 200);
+      REQUIRE(second.outcome.transport_error.empty());
+      REQUIRE(second.page.entries.size() == 1);
+      CHECK(second.page.entries.front().key > first.page.entries.front().key);
+
+      auto const clamped = client->list_page(env.bucket, "parquet/", 0, "");
+      REQUIRE(clamped.outcome.http_status == 200);
+      REQUIRE(clamped.outcome.transport_error.empty());
+      CHECK(clamped.page.entries.size() > 1);
+      CHECK(clamped.page.entries.size() <= 1000);
+    }
+  }
+}
+
+TEST_CASE("s3_rdma_ioctx lists MinIO objects through the real control plane",
+          "[s3][rdma][client][integration][list]")
+{
+  using namespace s3_rdma_p3a_tests;
+  if (!ensure_minio_env()) { return; }
+
+  auto const env = read_minio_env();
+
+  for (auto signing : {signing_case::presigned, signing_case::header}) {
+    DYNAMIC_SECTION(signing_name(signing))
+    {
+      auto cfg = object_store_cfg(env, signing);
+      auto ctx = std::make_shared<s3_rdma_ioctx>(cfg, make_transport_clients(cfg));
+      ctx->start();
+
+      std::vector<sirius::io::s3::list_entry> entries;
+      std::size_t pages = 0;
+      ctx->list_objects_paged(
+        env.bucket, "parquet/", 1, [&](sirius::io::s3::list_objects_v2_page const& page) {
+          ++pages;
+          entries.insert(entries.end(), page.entries.begin(), page.entries.end());
+          return true;
+        });
+
+      REQUIRE(pages >= 2);
+      REQUIRE(entries.size() >= 2);
+      CHECK(std::is_sorted(entries.begin(), entries.end(), [](auto const& lhs, auto const& rhs) {
+        return lhs.key < rhs.key;
+      }));
+      CHECK(std::all_of(entries.begin(), entries.end(), [](auto const& entry) {
+        return entry.key.starts_with("parquet/");
+      }));
+
+      ctx->shutdown();
+    }
+  }
+}
+
 TEST_CASE("curl S3 control client reports MinIO authentication failures",
           "[s3][rdma][client][integration]")
 {

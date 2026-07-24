@@ -17,6 +17,7 @@
 #pragma once
 
 #include "io/object_store_config.hpp"
+#include "io/object_store_listing.hpp"
 #include "io/rdma/cuobj_rdma_reactor.hpp"
 #include "io/rdma/rdma_transport_client.hpp"
 #include "io/templated_ioctx.hpp"
@@ -59,7 +60,8 @@ enum class endpoint_topology { split, same_address };
  * device chunks the per-worker data sessions (mocks in tests, the
  * curl/cuObject-backed clients in production).
  */
-class s3_rdma_ioctx final : public templated_ioctx<rdma::cuobj_rdma_reactor> {
+class s3_rdma_ioctx final : public templated_ioctx<rdma::cuobj_rdma_reactor>,
+                            public object_store_listing {
  public:
   /// @p clients is the split transport bundle (control client + data-session
   /// factory + tag predicate); @p delivery is the CUDA delivery seam.  Both
@@ -84,6 +86,19 @@ class s3_rdma_ioctx final : public templated_ioctx<rdma::cuobj_rdma_reactor> {
   /// Endpoint-pair topology, judged at construction from the configured
   /// host-plane and data-plane endpoints; immutable for the ioctx lifetime.
   [[nodiscard]] endpoint_topology topology() const noexcept { return _topology; }
+
+  /// LIST rides the host control plane (one ListObjectsV2 page per control
+  /// attempt, a control permit per page); the data plane stays exact-key.
+  /// v1 limitation: the scan caps are the built-in defaults — the shared
+  /// S3-control settings migration is v1.1 (contract §1), so a configured
+  /// REST-side cap does NOT apply to this backend yet.
+  void list_objects_paged(std::string_view bucket,
+                          std::string_view prefix,
+                          std::size_t page_size,
+                          std::function<bool(s3::list_objects_v2_page const&)> const& sink,
+                          std::optional<std::size_t> max_scanned = std::nullopt) override;
+
+  [[nodiscard]] std::size_t list_max_matches() const override;
 
   /// The two staged paths are structurally unsupported for this backend; keep
   /// the transport-selection error shape ("RDMA ... not implemented") instead

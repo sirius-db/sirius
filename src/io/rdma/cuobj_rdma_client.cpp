@@ -17,7 +17,9 @@
 #include "io/rdma/cuobj_rdma_client.hpp"
 
 #include "io/rest/curl_handle.hpp"
+#include "io/s3/s3_list_parser.hpp"
 #include "io/s3/s3_object_ref.hpp"
+#include "io/s3/sigv4.hpp"
 
 #include <cctype>
 #include <chrono>
@@ -59,6 +61,13 @@ size_t write_to_sink(char* ptr, size_t size, size_t nmemb, void* userdata)
   std::memcpy(sink->dst + sink->written, ptr, bytes);
   sink->written += bytes;
   return bytes;
+}
+
+size_t write_string(char* ptr, size_t size, size_t nmemb, void* userdata)
+{
+  auto* out = static_cast<std::string*>(userdata);
+  out->append(ptr, size * nmemb);
+  return size * nmemb;
 }
 
 size_t write_discard(char* /*ptr*/, size_t size, size_t nmemb, void* /*userdata*/)
@@ -156,6 +165,70 @@ void* curl_s3_control_client::ensure_handle()
   // connection cache — the whole point of the persistent handle); the shared
   // DNS/TLS-session context and defaults are re-applied below per call.
   return _handle;
+}
+
+list_page_result curl_s3_control_client::list_page(std::string_view bucket,
+                                                   std::string_view prefix,
+                                                   std::size_t page_size,
+                                                   std::string_view continuation_token)
+{
+  std::lock_guard lk{_mtx};
+  _attempts_total.fetch_add(1, std::memory_order_relaxed);
+  list_page_result result;
+
+  try {
+    const std::size_t clamped = (page_size == 0 || page_size > 1000) ? 1000 : page_size;
+    // SigV4 canonical order = byte order of the encoded keys:
+    // continuation-token < list-type < max-keys < prefix.
+    std::string query;
+    if (!continuation_token.empty()) {
+      query += "continuation-token=";
+      query += s3::uri_encode(continuation_token, /*encode_slash=*/true);
+      query += '&';
+    }
+    query += "list-type=2&max-keys=";
+    query += std::to_string(clamped);
+    query += "&prefix=";
+    query += s3::uri_encode(prefix, /*encode_slash=*/true);
+    auto const authd = _authorizer->authorize_list(bucket, query, k_presign_ttl);
+
+    auto* h = static_cast<CURL*>(ensure_handle());
+    SIRIUS_CURL_CHECK(curl_easy_setopt(h, CURLOPT_TIMEOUT, k_request_timeout_s));
+    SIRIUS_CURL_CHECK(curl_easy_setopt(h, CURLOPT_SSL_VERIFYPEER, _tls_verify ? 1L : 0L));
+    SIRIUS_CURL_CHECK(curl_easy_setopt(h, CURLOPT_SSL_VERIFYHOST, _tls_verify ? 2L : 0L));
+    if (!_ca_bundle_path.empty()) {
+      SIRIUS_CURL_CHECK(curl_easy_setopt(h, CURLOPT_CAINFO, _ca_bundle_path.c_str()));
+    }
+    std::string body;
+    auto hdrs = build_headers(authd.headers);
+    SIRIUS_CURL_CHECK(curl_easy_setopt(h, CURLOPT_URL, authd.url.c_str()));
+    SIRIUS_CURL_CHECK(curl_easy_setopt(h, CURLOPT_HTTPGET, 1L));
+    SIRIUS_CURL_CHECK(curl_easy_setopt(h, CURLOPT_HTTPHEADER, hdrs.get()));
+    SIRIUS_CURL_CHECK(curl_easy_setopt(h, CURLOPT_WRITEFUNCTION, &write_string));
+    SIRIUS_CURL_CHECK(curl_easy_setopt(h, CURLOPT_WRITEDATA, &body));
+    SIRIUS_CURL_CHECK(curl_easy_setopt(h, CURLOPT_HEADERFUNCTION, nullptr));
+    SIRIUS_CURL_CHECK(curl_easy_setopt(h, CURLOPT_HEADERDATA, nullptr));
+
+    CURLcode const rc = curl_easy_perform(h);
+    long connects     = 0;
+    if (curl_easy_getinfo(h, CURLINFO_NUM_CONNECTS, &connects) == CURLE_OK && connects > 0) {
+      _connections_total.fetch_add(static_cast<uint64_t>(connects), std::memory_order_relaxed);
+    }
+    long status = 0;
+    curl_easy_getinfo(h, CURLINFO_RESPONSE_CODE, &status);
+    result.outcome.http_status = status;
+    if (rc != CURLE_OK) {
+      result.outcome.transport_error = curl_easy_strerror(rc);
+    } else if (status == 200) {
+      result.page = s3::parse_list_objects_v2(body);
+    }
+    return result;
+  } catch (std::exception const& e) {
+    // Authorization/setup/parse failure: an unusable page, reported as a
+    // transport-level outcome (one attempt, no retry here).
+    result.outcome.transport_error = e.what();
+    return result;
+  }
 }
 
 head_result curl_s3_control_client::head(const rx_route& route)

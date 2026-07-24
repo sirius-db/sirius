@@ -1005,19 +1005,58 @@ TEST_CASE("rdma transport fails loudly on datasource creation instead of falling
         io_context_type::rdma);
 }
 
-TEST_CASE("s3_rdma v1 scopes unsupported LIST and glob errors", "[s3][rdma][routing][scan_manager]")
+TEST_CASE("scan_manager routes S3 LIST through the RDMA control plane",
+          "[s3][rdma][routing][scan_manager][list]")
 {
   scan_manager_fixture fixture;
-  sirius_scan_manager manager{make_rdma_scan_config(), *fixture.memory, fixture.topology};
+  auto cfg = make_rdma_scan_config();
+  sirius_scan_manager manager{cfg, *fixture.memory, fixture.topology};
+  auto control  = std::make_shared<sirius::io::rdma::mock_s3_control_client>();
+  auto sessions = std::make_shared<sirius::io::rdma::mock_rdma_data_session_factory>();
+  control->put_object("routing-bucket", "prefix/a.parquet", std::vector<std::uint8_t>(11));
+  control->put_object("routing-bucket", "prefix/b.parquet", std::vector<std::uint8_t>(22));
+  control->put_object("routing-bucket", "other.parquet", std::vector<std::uint8_t>(33));
+  sirius::io::rdma::rdma_transport_clients clients{control, std::move(sessions)};
+  manager._ioctx_registry.register_ioctx(
+    io_context_type::rdma,
+    [](std::string_view path) { return path.starts_with("s3://"); },
+    [clients = std::move(clients)](scan_manager_config const& manager_cfg) {
+      return std::make_shared<s3_rdma_ioctx>(manager_cfg.object_store, clients);
+    });
+  std::vector<sirius::io::s3::list_entry> entries;
 
-  require_exception(
-    [&] {
-      manager.list_objects_paged(
-        "s3://routing-bucket/prefix", 100, [](auto const&) { return true; });
-    },
-    {"S3-RDMA", "v1"});
-  require_exception([&] { (void)manager.s3_list_max_matches("s3://routing-bucket/prefix"); },
-                    {"S3-RDMA", "v1"});
+  manager.list_objects_paged("s3://routing-bucket/prefix/", 1, [&](auto const& page) {
+    entries.insert(entries.end(), page.entries.begin(), page.entries.end());
+    return true;
+  });
+
+  REQUIRE(entries.size() == 2);
+  CHECK(entries[0].key == "prefix/a.parquet");
+  CHECK(entries[0].size == 11);
+  CHECK(entries[1].key == "prefix/b.parquet");
+  CHECK(entries[1].size == 22);
+  CHECK(control->list_pages_issued() == 2);
+}
+
+TEST_CASE("scan_manager exposes the RDMA backend LIST match cap",
+          "[s3][rdma][routing][scan_manager][list]")
+{
+  scan_manager_fixture fixture;
+  auto cfg = make_rdma_scan_config();
+  sirius_scan_manager manager{cfg, *fixture.memory, fixture.topology};
+  auto control  = std::make_shared<sirius::io::rdma::mock_s3_control_client>();
+  auto sessions = std::make_shared<sirius::io::rdma::mock_rdma_data_session_factory>();
+  sirius::io::rdma::rdma_transport_clients clients{std::move(control), std::move(sessions)};
+  manager._ioctx_registry.register_ioctx(
+    io_context_type::rdma,
+    [](std::string_view path) { return path.starts_with("s3://"); },
+    [clients = std::move(clients)](scan_manager_config const& manager_cfg) {
+      return std::make_shared<s3_rdma_ioctx>(manager_cfg.object_store, clients);
+    });
+  rest_ioctx rest_default{0, nullptr};
+
+  CHECK(manager.s3_list_max_matches("s3://routing-bucket/prefix/") ==
+        rest_default.list_max_matches());
 }
 
 TEST_CASE("s3_transport parsed from sirius_config reaches registry selection",

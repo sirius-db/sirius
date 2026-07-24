@@ -114,10 +114,56 @@ size_t mock_s3_control_client::range_gets_issued() const
   return _range_gets_issued;
 }
 
+size_t mock_s3_control_client::list_pages_issued() const
+{
+  std::lock_guard lk{_mtx};
+  return _list_pages_issued;
+}
+
+list_page_result mock_s3_control_client::list_page(std::string_view bucket,
+                                                   std::string_view prefix,
+                                                   std::size_t page_size,
+                                                   std::string_view continuation_token)
+{
+  std::lock_guard lk{_mtx};
+  ++_list_pages_issued;
+  if (!_connected) {
+    _connected = true;
+    ++_connections_total;
+  }
+  list_page_result out;
+  if (_next_transport_error) {
+    out.outcome.transport_error = *_next_transport_error;
+    _next_transport_error.reset();
+    return out;
+  }
+  if (_next_status) {
+    out.outcome.http_status = *_next_status;
+    _next_status.reset();
+    return out;
+  }
+  const std::size_t clamped = (page_size == 0 || page_size > 1000) ? 1000 : page_size;
+  out.outcome.http_status   = 200;
+  for (auto const& [where, bytes] : _objects) {
+    if (where.first != bucket) { continue; }
+    if (where.second.compare(0, prefix.size(), prefix) != 0) { continue; }
+    if (!continuation_token.empty() && std::string_view{where.second} <= continuation_token) {
+      continue;
+    }
+    if (out.page.entries.size() == clamped) {
+      out.page.is_truncated            = true;
+      out.page.next_continuation_token = out.page.entries.back().key;
+      break;
+    }
+    out.page.entries.push_back({where.second, bytes.size()});
+  }
+  return out;
+}
+
 uint64_t mock_s3_control_client::attempts_total() const noexcept
 {
   std::lock_guard lk{_mtx};
-  return static_cast<uint64_t>(_heads_issued + _range_gets_issued);
+  return static_cast<uint64_t>(_heads_issued + _range_gets_issued + _list_pages_issued);
 }
 
 uint64_t mock_s3_control_client::connections_total() const noexcept

@@ -48,6 +48,12 @@ class curl_s3_control_client final : public s3_control_client {
                                            size_t offset,
                                            size_t size,
                                            uint8_t* dst) override;
+  /// One signed ListObjectsV2 page (authorize_list + GET); one attempt, no
+  /// retry — pagination and policy live in the ioctx above.
+  [[nodiscard]] list_page_result list_page(std::string_view bucket,
+                                           std::string_view prefix,
+                                           std::size_t page_size,
+                                           std::string_view continuation_token) override;
   [[nodiscard]] uint64_t attempts_total() const noexcept override
   {
     return _attempts_total.load(std::memory_order_relaxed);

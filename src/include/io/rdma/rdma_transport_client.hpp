@@ -17,6 +17,7 @@
 #pragma once
 
 #include "io/rdma/rdma_admission_gate.hpp"
+#include "io/s3/s3_list_parser.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -46,6 +47,11 @@ struct range_get_result {
   std::string content_range;  ///< raw Content-Range response header; empty if absent
 };
 
+struct list_page_result {
+  control_outcome outcome;
+  s3::list_objects_v2_page page;  ///< valid only when outcome.http_status == 200
+};
+
 /// Narrow IOCTX-level control-plane seam.  EXACTLY one HTTP attempt per
 /// call; never throws for HTTP-level failure (that is a result), only for
 /// programming errors.  No retry, no validation, no timing policy inside.
@@ -57,7 +63,23 @@ class s3_control_client {
                                                    size_t offset,
                                                    size_t size,
                                                    uint8_t* dst) = 0;  // HOST memory, by type
-  /// One increment per head/range_get call, including failures.
+  /// One ListObjectsV2 page under @p prefix (continuation via @p token,
+  /// empty = first page).  Default: unsupported — a transport error result,
+  /// so pre-listing clients and mocks keep compiling until they opt in.
+  [[nodiscard]] virtual list_page_result list_page(std::string_view bucket,
+                                                   std::string_view prefix,
+                                                   std::size_t page_size,
+                                                   std::string_view continuation_token)
+  {
+    (void)bucket;
+    (void)prefix;
+    (void)page_size;
+    (void)continuation_token;
+    list_page_result out;
+    out.outcome.transport_error = "s3_control_client: LIST is not supported by this client";
+    return out;
+  }
+  /// One increment per head/range_get/list_page call, including failures.
   [[nodiscard]] virtual uint64_t attempts_total() const noexcept = 0;
   /// Sum of per-transfer new-connection counts (CURLINFO_NUM_CONNECTS in the
   /// production client): a reused connection contributes 0.
