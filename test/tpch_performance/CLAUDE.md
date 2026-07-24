@@ -271,9 +271,14 @@ The shell runners (`benchmark_and_validate.sh`, `run_tpch_parquet.sh`, `run_tpch
   `orders.tbl.u1` and `lineitem.tbl.u1` rows) → the 22 queries in spec stream-0 order (timed,
   feeding Power@Size) → RF2 (`DELETE` the `delete.1` order keys) → a timed post-RF2 pass with the
   delete mask active.
-- **Throughput run** (fresh database copy): N concurrent query streams (spec permutations 1..N,
-  from `tpch_stream_permutations.py`) plus one refresh stream running N RF1/RF2 pairs (update
-  sets 2..N+1). N defaults to the spec minimum for the SF (SF1→2, SF10→3, ...).
+- **Throughput run** (update sets 2..N+1): N concurrent query streams (spec permutations 1..N,
+  from `tpch_stream_permutations.py`) plus one refresh stream running N RF1/RF2 pairs. N defaults
+  to the spec minimum for the SF (SF1→2, SF10→3, ...).
+
+`--mode` runs `power`, `throughput`, or `both`. In `both`, the throughput run continues on the
+same pinned database right after the power run, with no unpin/repin, so it sees the update-set-1
+rows the power run left behind. This matches the spec's continuous sequence and skips a second
+copy and pin. The single modes each pin a fresh copy of the input.
 
 Metrics (TPC-H spec 5.4): `Power@Size = 3600·SF / geomean(22 stream-0 query times + T_RF1 +
 T_RF2)`, `Throughput@Size = N·22·3600 / measurement_interval · SF`, `QphH@Size =
@@ -282,8 +287,8 @@ sqrt(Power · Throughput)`.
 ### How it maps onto Sirius
 
 - The input must be a file-backed `.duckdb` with native TPC-H tables (e.g.
-  `test_datasets/tpch_sf1.duckdb`). The runner copies it per phase and mutates the copy, never
-  the original. All 8 tables are pinned with `CALL pin_table(format='duckdb', ...)` after a
+  `test_datasets/tpch_sf1.duckdb`). The runner copies it and mutates the copy, never the
+  original. All 8 tables are pinned with `CALL pin_table(format='duckdb', ...)` after a
   `CHECKPOINT`. Pinning `lineitem`/`orders` activates the MVCC insert-delta/delete-mask path that
   serves the refreshed rows on the GPU. Parquet inputs are read-only views with no MVCC metadata,
   so they cannot be used.

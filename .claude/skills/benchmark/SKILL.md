@@ -205,16 +205,16 @@ run, QphH, refresh functions, or a "TPC-H official"/"spec" benchmark.
 
 - **Power run** (single stream, update set 1): optional clean pass → RF1 → 22 queries in spec
   stream-0 order (timed; feeds Power@Size) → RF2 → timed post-RF2 pass (delete mask active).
-- **Throughput run** (fresh DB copy): N concurrent query streams (spec permutations 1..N) + one
-  refresh stream running N RF1/RF2 pairs (update sets 2..N+1).
+- **Throughput run** (update sets 2..N+1): N concurrent query streams (spec permutations 1..N) +
+  one refresh stream running N RF1/RF2 pairs.
 - `Power@Size = 3600·SF / geomean(22 query times + T_RF1 + T_RF2)`,
   `Throughput@Size = N·22·3600 / interval · SF`, `QphH@Size = sqrt(Power·Throughput)`.
 
 **Hard requirements:**
 - Data source is a file-backed `.duckdb` with native TPC-H tables, never parquet. The MVCC
   insert-delta/delete-mask path that makes RF1/RF2 visible on the GPU only works on pinned
-  duckdb-native tables. `--input` is that `.duckdb` file; the runner copies it per phase and
-  mutates the copy, never the original.
+  duckdb-native tables. `--input` is that `.duckdb` file; the runner copies it and mutates the
+  copy, never the original.
 - Always pinned. The runner pins all 8 tables; the user only chooses the tier (`gpu` or `host`).
   An unpinned run would not show the refreshes on the GPU.
 - Refresh sets come from `generate_tpch_refresh.sh` (classic dbgen `-U`): `orders.tbl.u*`,
@@ -300,7 +300,8 @@ option) and ask for the rest. Mark sensible defaults "(Recommended)".
 4. **Scale factor** (`--sf`): the SF of the dataset (also the metric's Size).
 
 **Round 2 — run shape**
-1. **Mode** (`--mode`): `power`, `throughput`, or `both` (default `both`).
+1. **Mode** (`--mode`): `power`, `throughput`, or `both` (default `both`). In `both` the
+   throughput run continues on the same pinned DB right after the power run, with no unpin/repin.
 2. **Pin tier** (`--pin`): `gpu` or `host`. This run is always pinned; the only choice is the
    tier. Prefer `host` at large SF, since pinning all 8 tables to GPU can OOM and disk spill is
    off by default.

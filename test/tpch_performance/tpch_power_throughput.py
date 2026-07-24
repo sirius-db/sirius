@@ -14,14 +14,19 @@
 
 """TPC-H power and throughput runs for Sirius with the RF1/RF2 refresh functions.
 
-Power run (single session, update set 1):
+Power run (update set 1):
     [clean pass]  RF1  ->  22-query stream 0 (timed; feeds Power@Size)  ->  RF2
                   ->  post-RF2 pass (timed; delete mask active)
 
-Throughput run (fresh database copy, update sets 2..N+1):
+Throughput run (update sets 2..N+1):
     N concurrent query streams (spec permutations 1..N) + 1 refresh stream running
     N RF1/RF2 pairs. Sirius serializes all queries on one engine-wide lock, so this
     measures throughput of concurrent submission, not overlapped execution.
+
+--mode selects power, throughput, or both. In both mode the throughput run
+continues on the same pinned database right after the power run, with no unpin or
+repin, so it sees the update-set-1 rows the power run left behind. The single
+modes each pin a fresh copy of the input.
 
 Metrics (TPC-H spec 5.4):
     Power@Size      = 3600 * SF / geomean(22 stream-0 query times + T_RF1 + T_RF2)
@@ -41,6 +46,7 @@ Example:
 """
 
 import argparse
+import contextlib
 import csv
 import json
 import math
@@ -240,6 +246,23 @@ def close_benchmark_db(con, pin_tier):
         con.close()
 
 
+@contextlib.contextmanager
+def benchmark_db(args, run_dir, filename):
+    """Copy the base DB into run_dir, open it with the TPC-H tables pinned, and
+    unpin/close/delete the copy on exit."""
+    scratch = os.path.join(run_dir, filename)
+    copy_database(args.input, scratch)
+    con = open_benchmark_db(scratch, args.pin)
+    try:
+        yield con
+    finally:
+        close_benchmark_db(con, args.pin)
+        if not args.keep_scratch_db:
+            for f in (scratch, scratch + ".wal"):
+                if os.path.exists(f):
+                    os.remove(f)
+
+
 # ---------------------------------------------------------------------------
 # Power run
 # ---------------------------------------------------------------------------
@@ -249,17 +272,14 @@ def geomean(values):
     return math.exp(sum(math.log(max(v, 1e-9)) for v in values) / len(values))
 
 
-def power_run(args, run_dir, writer):
-    scratch = os.path.join(run_dir, "bench_power.duckdb")
-    copy_database(args.input, scratch)
-    con = open_benchmark_db(scratch, args.pin)
+def power_run(con, args, run_dir, writer):
     perm = stream_order(0)
+    gpu = con.cursor()
+    cpu = con.cursor()
+    rf = con.cursor()
     try:
-        gpu = con.cursor()
         sql(gpu, "SET gpu_execution = true")
-        cpu = con.cursor()
         sql(cpu, "SET gpu_execution = false")
-        rf = con.cursor()
         sql(rf, "SET gpu_execution = false")
 
         def timed_pass(phase, result_name):
@@ -347,11 +367,8 @@ def power_run(args, run_dir, writer):
             "validation": validation,
         }
     finally:
-        close_benchmark_db(con, args.pin)
-        if not args.keep_scratch_db:
-            for f in (scratch, scratch + ".wal"):
-                if os.path.exists(f):
-                    os.remove(f)
+        for c in (gpu, cpu, rf):
+            c.close()
 
 
 # ---------------------------------------------------------------------------
@@ -359,101 +376,89 @@ def power_run(args, run_dir, writer):
 # ---------------------------------------------------------------------------
 
 
-def throughput_run(args, run_dir, writer, streams):
-    scratch = os.path.join(run_dir, "bench_throughput.duckdb")
-    copy_database(args.input, scratch)
-    con = open_benchmark_db(scratch, args.pin)
-    try:
-        barrier = threading.Barrier(streams + 2)  # N query + 1 refresh + main
-        errors = []
-        stream_times = {i: {} for i in range(1, streams + 1)}
-        stream_elapsed = {}
-        refresh_times = []
+def throughput_run(con, args, run_dir, writer, streams):
+    barrier = threading.Barrier(streams + 2)  # N query + 1 refresh + main
+    errors = []
+    stream_times = {i: {} for i in range(1, streams + 1)}
+    stream_elapsed = {}
+    refresh_times = []
 
-        def query_stream(i):
-            cur = con.cursor()
-            sql(cur, "SET gpu_execution = true")
-            try:
-                barrier.wait()
-                start = time.perf_counter()
-                for q in stream_order(i):
-                    elapsed, _ = timed_query(cur, q, args.query_timeout)
-                    stream_times[i][f"q{q}"] = elapsed
-                    with _write_lock:
-                        writer.writerow(["throughput", i, f"q{q}", f"{elapsed:.6f}"])
-                    log(f"  [stream {i}] q{q}: {elapsed:.4f}s")
-                stream_elapsed[i] = time.perf_counter() - start
-            except Exception as e:  # noqa: BLE001 - reported after join
-                errors.append(f"query stream {i}: {e}")
-                log(f"  [stream {i}] FAILED: {e}")
-            finally:
-                cur.close()
+    def query_stream(i):
+        cur = con.cursor()
+        sql(cur, "SET gpu_execution = true")
+        try:
+            barrier.wait()
+            start = time.perf_counter()
+            for q in stream_order(i):
+                elapsed, _ = timed_query(cur, q, args.query_timeout)
+                stream_times[i][f"q{q}"] = elapsed
+                with _write_lock:
+                    writer.writerow(["throughput", i, f"q{q}", f"{elapsed:.6f}"])
+                log(f"  [stream {i}] q{q}: {elapsed:.4f}s")
+            stream_elapsed[i] = time.perf_counter() - start
+        except Exception as e:  # noqa: BLE001 - reported after join
+            errors.append(f"query stream {i}: {e}")
+            log(f"  [stream {i}] FAILED: {e}")
+        finally:
+            cur.close()
 
-        def refresh_stream():
-            cur = con.cursor()
-            sql(cur, "SET gpu_execution = false")
-            try:
-                barrier.wait()
-                for pair in range(1, streams + 1):
-                    n = pair + 1  # set 1 belongs to the power run
-                    t1 = run_refresh(
-                        cur, rf1_statements(args.refresh_dir, n), f"RF1(set {n})"
+    def refresh_stream():
+        cur = con.cursor()
+        sql(cur, "SET gpu_execution = false")
+        try:
+            barrier.wait()
+            for pair in range(1, streams + 1):
+                n = pair + 1  # set 1 belongs to the power run
+                t1 = run_refresh(
+                    cur, rf1_statements(args.refresh_dir, n), f"RF1(set {n})"
+                )
+                t2 = run_refresh(
+                    cur, rf2_statements(args.refresh_dir, n), f"RF2(set {n})"
+                )
+                refresh_times.append({"set": n, "rf1": t1, "rf2": t2})
+                with _write_lock:
+                    writer.writerow(
+                        ["throughput", "refresh", f"rf1_set{n}", f"{t1:.6f}"]
                     )
-                    t2 = run_refresh(
-                        cur, rf2_statements(args.refresh_dir, n), f"RF2(set {n})"
+                    writer.writerow(
+                        ["throughput", "refresh", f"rf2_set{n}", f"{t2:.6f}"]
                     )
-                    refresh_times.append({"set": n, "rf1": t1, "rf2": t2})
-                    with _write_lock:
-                        writer.writerow(
-                            ["throughput", "refresh", f"rf1_set{n}", f"{t1:.6f}"]
-                        )
-                        writer.writerow(
-                            ["throughput", "refresh", f"rf2_set{n}", f"{t2:.6f}"]
-                        )
-            except Exception as e:  # noqa: BLE001 - reported after join
-                errors.append(f"refresh stream: {e}")
-                log(f"  [refresh] FAILED: {e}")
-            finally:
-                cur.close()
+        except Exception as e:  # noqa: BLE001 - reported after join
+            errors.append(f"refresh stream: {e}")
+            log(f"  [refresh] FAILED: {e}")
+        finally:
+            cur.close()
 
-        threads = [
-            threading.Thread(target=query_stream, args=(i,), name=f"stream-{i}")
-            for i in range(1, streams + 1)
-        ]
-        threads.append(threading.Thread(target=refresh_stream, name="refresh"))
-        log(f"=== Throughput: {streams} query streams + 1 refresh stream ===")
-        for t in threads:
-            t.start()
-        barrier.wait()
-        start = time.perf_counter()
-        for t in threads:
-            t.join()
-        interval = time.perf_counter() - start
+    threads = [
+        threading.Thread(target=query_stream, args=(i,), name=f"stream-{i}")
+        for i in range(1, streams + 1)
+    ]
+    threads.append(threading.Thread(target=refresh_stream, name="refresh"))
+    log(f"=== Throughput: {streams} query streams + 1 refresh stream ===")
+    for t in threads:
+        t.start()
+    barrier.wait()
+    start = time.perf_counter()
+    for t in threads:
+        t.join()
+    interval = time.perf_counter() - start
 
-        if errors:
-            raise RuntimeError("throughput run failed:\n  " + "\n  ".join(errors))
+    if errors:
+        raise RuntimeError("throughput run failed:\n  " + "\n  ".join(errors))
 
-        throughput_at_size = streams * 22 * 3600.0 / interval * args.sf
-        log(
-            f"Throughput@Size = {throughput_at_size:.2f} "
-            f"(measurement interval {interval:.2f}s)"
-        )
-        return {
-            "throughput_at_size": throughput_at_size,
-            "streams": streams,
-            "measurement_interval_s": interval,
-            "per_stream_times": {str(i): stream_times[i] for i in stream_times},
-            "per_stream_elapsed_s": {
-                str(i): stream_elapsed.get(i) for i in stream_times
-            },
-            "refresh_times": refresh_times,
-        }
-    finally:
-        close_benchmark_db(con, args.pin)
-        if not args.keep_scratch_db:
-            for f in (scratch, scratch + ".wal"):
-                if os.path.exists(f):
-                    os.remove(f)
+    throughput_at_size = streams * 22 * 3600.0 / interval * args.sf
+    log(
+        f"Throughput@Size = {throughput_at_size:.2f} "
+        f"(measurement interval {interval:.2f}s)"
+    )
+    return {
+        "throughput_at_size": throughput_at_size,
+        "streams": streams,
+        "measurement_interval_s": interval,
+        "per_stream_times": {str(i): stream_times[i] for i in stream_times},
+        "per_stream_elapsed_s": {str(i): stream_elapsed.get(i) for i in stream_times},
+        "refresh_times": refresh_times,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -682,11 +687,19 @@ def main():
     with open(os.path.join(run_dir, "timings.csv"), "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(["phase", "stream", "element", "seconds"])
-        if args.mode in ("power", "both"):
-            power = power_run(args, run_dir, writer)
-            f.flush()
-        if args.mode in ("throughput", "both"):
-            throughput = throughput_run(args, run_dir, writer, streams)
+        if args.mode == "both":
+            # One pinned database for both phases: throughput continues on the
+            # post-power state (update set 1 applied), with no unpin/repin.
+            with benchmark_db(args, run_dir, "bench.duckdb") as con:
+                power = power_run(con, args, run_dir, writer)
+                f.flush()
+                throughput = throughput_run(con, args, run_dir, writer, streams)
+        elif args.mode == "power":
+            with benchmark_db(args, run_dir, "bench_power.duckdb") as con:
+                power = power_run(con, args, run_dir, writer)
+        elif args.mode == "throughput":
+            with benchmark_db(args, run_dir, "bench_throughput.duckdb") as con:
+                throughput = throughput_run(con, args, run_dir, writer, streams)
 
     qphh = None
     if power and throughput:
