@@ -43,16 +43,17 @@ sirius_physical_concat::sirius_physical_concat(duckdb::vector<sirius::logical_ty
     auto hash_join = dynamic_cast<sirius_physical_hash_join*>(downstream_join);
     if (hash_join->join_type == duckdb::JoinType::LEFT ||
         hash_join->join_type == duckdb::JoinType::ANTI ||
-        hash_join->join_type == duckdb::JoinType::SEMI) {
-      // if the join type is left or anti, then we need to concat all the batches into one batch for
-      // the build side
+        hash_join->join_type == duckdb::JoinType::SEMI ||
+        hash_join->join_type == duckdb::JoinType::MARK) {
+      // LEFT/ANTI/SEMI need the complete build side to preserve their global join semantics.
+      // MARK also emits every probe row once with one existence result across the entire build
+      // relation; processing separate build batches would emit the probe rows once per batch.
       _concat_all = is_build;
     } else if (hash_join->is_right_family()) {
       // if the join type is right or right anti, then we need to concat all the batches into one
       // batch for the probe side
       _concat_all = !is_build;
-    } else if (hash_join->join_type == duckdb::JoinType::INNER ||
-               hash_join->join_type == duckdb::JoinType::MARK) {
+    } else if (hash_join->join_type == duckdb::JoinType::INNER) {
       _concat_all = false;
     } else if (hash_join->join_type == duckdb::JoinType::OUTER) {
       _concat_all = true;
@@ -173,13 +174,20 @@ std::unique_ptr<operator_data> sirius_physical_concat::execute(const operator_da
                                                                rmm::cuda_stream_view stream)
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_concat::execute"};
-  auto partitioned_input_data = dynamic_cast<const partitioned_operator_data*>(&input_data);
-  if (partitioned_input_data == nullptr) {
+  // Normal path: input is a partitioned_operator_data produced by an upstream PARTITION. The
+  // small-query bypass (issue #990) omits PARTITION, so CONCAT streams the producer's batches
+  // directly (a single scan batch, guaranteed by the gate's single-batch clamp). Accept any
+  // pipelineable_operator_data and treat unpartitioned input as partition 0, matching the hash
+  // join's "unpartitioned pushes land in partition 0 on both sides" contract.
+  auto pipelineable_input_data = dynamic_cast<const pipelineable_operator_data*>(&input_data);
+  if (pipelineable_input_data == nullptr) {
     throw std::runtime_error(
-      "sirius_physical_concat: input_data is not a partitioned_operator_data");
+      "sirius_physical_concat: input_data is not a pipelineable_operator_data");
   }
-  const auto& input_batches = partitioned_input_data->get_read_only_batches();
-  auto partition_idx        = partitioned_input_data->get_partition_idx();
+  auto partitioned_input_data = dynamic_cast<const partitioned_operator_data*>(&input_data);
+  const auto& input_batches   = pipelineable_input_data->get_read_only_batches();
+  const std::size_t partition_idx =
+    partitioned_input_data != nullptr ? partitioned_input_data->get_partition_idx() : 0;
   if (input_batches.empty()) {
     return std::make_unique<partitioned_operator_data>(
       std::vector<std::shared_ptr<cucascade::data_batch>>{}, partition_idx);

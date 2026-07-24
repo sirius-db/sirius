@@ -853,6 +853,10 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::get_next_task_input_da
 
   // One-time initialization: snapshot all batch IDs from both ports.
   if (left_batch_ids.empty() && right_batch_ids.empty()) {
+    // Both ports must agree on partition count. This holds with PARTITION stages (siblings
+    // negotiate one count) and in the small-query bypass (unpartitioned pushes land in
+    // partition 0 on both sides). A repository never drops below its default of 1 partition, so
+    // an empty side reports 1 (not 0) and still matches a non-empty side that also stayed at 1.
     if (ports["default"]->repo->num_partitions() != ports["build"]->repo->num_partitions()) {
       throw std::runtime_error(
         "In sirius_physical_hash_join:Number of partitions for left and right ports must be the "

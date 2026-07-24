@@ -1657,6 +1657,15 @@ static void SetLogBackend(ClientContext& context, SetScope scope, Value& paramet
   SIRIUS_LOG_DEBUG("Updated config LOG_BACKEND to {}", Config::LOG_BACKEND);
 }
 
+static void SetSmallQueryBytesThreshold(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  params->small_query_bytes_threshold = UBigIntValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config SMALL_QUERY_BYTES_THRESHOLD to {}",
+                   params->small_query_bytes_threshold);
+}
+
 static void SetLogLevel(ClientContext& context, SetScope scope, Value& parameter)
 {
   Config::LOG_LEVEL = StringValue::Get(parameter);
@@ -1956,6 +1965,15 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
                             LogicalType::UBIGINT,
                             Value::UBIGINT(sirius::operator_params{}.sort_sample_bytes),
                             SetSortSampleBytes);
+
+  config.AddExtensionOption(
+    "small_query_bytes_threshold",
+    "Skip PARTITION / SORT_SAMPLE / SORT_PARTITION when summed estimated base-scan bytes "
+    "are below this threshold (default 256 MiB; 0 = disabled). CTE/delim plans are ineligible; "
+    "bypass uses STANDARD joins (no BUILD_PROBE / dynamic filters)",
+    LogicalType::UBIGINT,
+    Value::UBIGINT(sirius::operator_params{}.small_query_bytes_threshold),
+    SetSmallQueryBytesThreshold);
 
   config.AddExtensionOption("max_build_hash_table_bytes",
                             "Maximum size a build-side table can be where it will create a "
