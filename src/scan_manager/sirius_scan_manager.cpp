@@ -19,6 +19,7 @@
 #include "cudf/cudf_utils.hpp"
 #include "data/data_batch_utils.hpp"
 #include "exec/thread_pool.hpp"
+#include "helper/numeric_narrowing.hpp"
 #include "helper/type_conversions.hpp"
 #include "io/cache/prefetching_cache.hpp"
 #include "io/io_context.hpp"
@@ -1203,6 +1204,56 @@ bool pinned_column_narrowed_in_all_chunks(pinned_entry const& entry, std::size_t
   return std::ranges::all_of(entry.narrowed_columns, [&](std::vector<bool> const& row) {
     return entry_position < row.size() && row[entry_position];
   });
+}
+
+std::optional<cudf::data_type> pinned_column_narrow_carrier(pinned_entry const& entry,
+                                                            std::size_t entry_position,
+                                                            cudf::data_type native_type)
+{
+  if (!pinned_column_narrowed_in_all_chunks(entry, entry_position)) { return std::nullopt; }
+
+  // Read the stored carrier of the column in every chunk. Host-side metadata only:
+  // cudf::column::type() on the GPU tier, the host column_metadata on the HOST tier — no GPU work,
+  // no stream.
+  std::vector<cudf::data_type> carriers;
+  if (entry.tier == cucascade::memory::Tier::GPU) {
+    if (entry_position >= entry.cache_info.names.size()) { return std::nullopt; }
+    auto const it = entry.data_batches_by_column.find(entry.cache_info.names[entry_position]);
+    if (it == entry.data_batches_by_column.end()) { return std::nullopt; }
+    carriers.reserve(it->second.size());
+    for (auto const& chunk : it->second) {
+      if (!chunk) { return std::nullopt; }
+      carriers.push_back(chunk->type());
+    }
+  } else if (entry.tier == cucascade::memory::Tier::HOST) {
+    carriers.reserve(entry.host_chunks.size());
+    for (auto const& chunk : entry.host_chunks) {
+      if (!chunk) { return std::nullopt; }
+      auto const& host_table = chunk->get_host_table();
+      if (!host_table || entry_position >= host_table->columns.size()) { return std::nullopt; }
+      auto const& meta = host_table->columns[entry_position];
+      auto const id    = static_cast<cudf::type_id>(meta.type_id);
+      // Fixed-point reconstruction is keyed on the DECIMAL type ids, not on a nonzero scale: a
+      // DECIMAL(p,0) column has cudf scale 0 and must still take the two-argument fixed-point
+      // constructor.
+      auto const is_decimal = id == cudf::type_id::DECIMAL32 || id == cudf::type_id::DECIMAL64 ||
+                              id == cudf::type_id::DECIMAL128;
+      carriers.push_back(is_decimal ? cudf::data_type{id, meta.scale} : cudf::data_type{id});
+    }
+  } else {
+    return std::nullopt;
+  }
+
+  // Defense against a marker matrix that contradicts storage or a logical-type drift between pin
+  // time and plan time: every chunk carrier must be a strict same-family narrowing of the native
+  // carrier. All passing carriers share one family and (for decimals) one scale, so the widest by
+  // size is well-defined.
+  std::optional<cudf::data_type> widest;
+  for (auto const carrier : carriers) {
+    if (!sirius::can_narrow_to(native_type, carrier)) { return std::nullopt; }
+    if (!widest || cudf::size_of(carrier) > cudf::size_of(*widest)) { widest = carrier; }
+  }
+  return widest;
 }
 
 std::unique_ptr<databatch_provider> make_provider_for_pinned_entry(

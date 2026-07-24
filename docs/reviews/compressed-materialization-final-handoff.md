@@ -868,3 +868,42 @@ through `runs/2026-07-23_18-13-10` in leg order.
 The 4xGB200 SF300 interleaved A/B (1-GPU and 4-GPU configs) remains a user-run obligation at
 the final commit; `partition_narrow_columns` is the confirmation that narrow bytes crossed the
 inter-GPU exchange.
+
+## Addendum — residency-derived plan targets (2026-07-23)
+
+**Root cause of dead multi-file narrowing.** DuckDB returns no plan-time column statistics for
+multi-file parquet scans: `MultiFileFunction::MultiFileScanStats` returns `nullptr` whenever the
+file list expands to `FileExpandResult::MULTIPLE_FILES` with `union_by_name` off
+(duckdb/src/include/duckdb/common/multi_file/multi_file_function.hpp:695-698, verified in the
+submodule). A statistics-nominated scan target therefore never materialized for a multi-file
+pin: no sidecar was installed, and every query paid per-chunk widening of the narrow resident
+chunks during scan normalization ("scan column ... restored" per chunk), with native bytes
+flowing through dynamic filters, exchanges, and joins. Observed at SF300 on 4xGB200 (18-part
+lineitem/orders): 4-GPU aggregate only -5.49% and 1-GPU stuck at -16%, versus the single-file
+SF50 host-pinned -15.39%.
+
+**In-tree repro.** `test/cpp/integration/test_compressed_materialization_gate.cpp`, TEST_CASE
+"gpu_execution - multi-file pinned-narrow serve installs the residency sidecar": a two-part
+parquet fixture pinned narrow on both tiers. At c0df9fba the regression assertion
+(`scan_sidecars_installed` grows across the pinned-narrow serve) fails on both tiers with
+`0 > 0`, and `scan_columns_restored` grows instead.
+
+**Contract now in force.** Plan targets derive from the pinned entry's ACTUAL stored chunk
+carriers: `pinned_column_narrow_carrier` (scan manager) composes the
+`pinned_column_narrowed_in_all_chunks` marker fold, reads every chunk's carrier (GPU-tier column
+chunks, HOST-tier column metadata with type-id-keyed fixed-point reconstruction), defensively
+validates each as a strict same-family narrowing of the native carrier (`can_narrow_to`), and
+returns the widest carrier across the chunks; chunks narrower than the target widen at serve
+through the existing verified restore. Source statistics are not consulted at plan time; the
+statistics plumbing (`get_column_statistics`, `range_from_statistics`, `to_int128`) is removed
+from `sirius_plan_get.cpp`. The carrier-derived target is always equal to or narrower than a
+statistics-derived one (the widest chunk carrier covers the table's exact range; a footer or
+catalog range is a superset), so serve-time conversions can only decrease. The residency gate's
+three states, flag-off bit-for-bit neutrality, and the exact-min/max verification on the
+disk-fallback path are unchanged.
+
+**Measurement obligations.** SF50 sanity A/B expected unchanged within noise (pool at least two
+off/on pairs per mode; same-config drift has reached +2.25%). The decisive validation is the
+user's SF300 multi-file rerun: fact-scan narrowing engages (sidecars on lineitem/orders scans),
+4-GPU join-dense queries recover, 1-GPU improves beyond -16%; `partition_narrow_columns`
+confirms narrow bytes crossing the exchange.

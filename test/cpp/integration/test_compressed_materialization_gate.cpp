@@ -20,8 +20,11 @@
 // The three residency states (pinned-narrow, unpinned, pinned-native) plus the
 // cols-subset serve-ability boundary are each discriminated through the
 // plan-time scan_sidecars_installed counter and the serve-time
-// scan_columns_narrowed / scan_columns_restored counters; a second test proves
-// zero-benefit pruning stays observable on pinned-backed sidecars.
+// scan_columns_narrowed / scan_columns_restored counters; a multi-file test
+// proves the gate engages identically when the parquet identity spans several
+// files (plan targets derive from the pinned entry's stored chunk carriers,
+// never from source statistics); a further test proves zero-benefit pruning
+// stays observable on pinned-backed sidecars.
 
 #include "sirius_context.hpp"
 
@@ -63,6 +66,9 @@ constexpr std::size_t kBatchBytes = 16u << 10;
 // and at plan time; d's unscaled values stay under 29000, picking DECIMAL32
 // everywhere. Chunk carrier == plan target for all chunks, so a pinned-narrow
 // serve performs zero casts and the restored counter can be asserted flat.
+// The periods divide the 2048-row chunk size many times over, so ANY 2048-row
+// slice of the recipe — in particular every chunk of every part of a
+// multi-part fixture — picks the same carriers (INT16, INT16, DECIMAL32).
 constexpr char const* kPayloadQuery =
   "SELECT k, v, d, d + CAST('0.00' AS DECIMAL(3,2)) AS d_copy "
   "FROM t WHERE k <= 150 ORDER BY k, v;";
@@ -74,7 +80,10 @@ void require_ok(duckdb::unique_ptr<duckdb::MaterializedQueryResult> const& r, ch
   REQUIRE_FALSE(r->HasError());
 }
 
-void generate_fact_parquet(fs::path const& path)
+// Write the fact rows [first, first + count) — one slice of the single value
+// recipe — so single-file and multi-part fixtures share byte-identical values
+// over the same row range.
+void generate_fact_parquet_part(fs::path const& path, std::int64_t first, std::int64_t count)
 {
   setenv("SIRIUS_DISABLE", "1", 1);
   {
@@ -84,13 +93,15 @@ void generate_fact_parquet(fs::path const& path)
       "COPY (SELECT (range * 7) % 301 AS k, (range * 11) % 297 AS v, "
       "CAST(((range * 13) % 29000) / 100.0 AS DECIMAL(18,2)) AS d "
       "FROM range(" +
-      std::to_string(kFactRows) + ")) TO '" + path.string() +
+      std::to_string(first) + ", " + std::to_string(first + count) + ")) TO '" + path.string() +
       "' (FORMAT PARQUET, ROW_GROUP_SIZE 2048);");
     REQUIRE(r);
     REQUIRE_FALSE(r->HasError());
   }
   unsetenv("SIRIUS_DISABLE");
 }
+
+void generate_fact_parquet(fs::path const& path) { generate_fact_parquet_part(path, 0, kFactRows); }
 
 void generate_dim_parquet(fs::path const& path)
 {
@@ -360,6 +371,86 @@ TEST_CASE("gpu_execution - compressed materialization residency gate states end 
       REQUIRE(after.scan_columns_narrowed == mid.scan_columns_narrowed);
 
       require_ok(con.Query("CALL unpin_table('t');"), "unpin");
+    }
+  }
+
+  fs::remove_all(tmp, ec);
+}
+
+TEST_CASE("gpu_execution - multi-file pinned-narrow serve installs the residency sidecar",
+          "[gpu_execution][parquet][compressed_materialization_gate]")
+{
+  pause_shared_envs();
+
+  auto tmp = fs::temp_directory_path() / ("sirius-compmat-multi-" + std::to_string(::getpid()));
+  std::error_code ec;
+  fs::remove_all(tmp, ec);
+  fs::create_directories(tmp / "multi");
+
+  // Two-part fixture: the parquet identity is MULTIPLE_FILES, the shape whose
+  // sidecar installation must not depend on source-statistics availability.
+  generate_fact_parquet_part(tmp / "multi" / "part0.parquet", 0, kFactRows / 2);
+  generate_fact_parquet_part(tmp / "multi" / "part1.parquet", kFactRows / 2, kFactRows / 2);
+
+  auto yaml_path = tmp / "compmat_multi.yaml";
+  write_config(yaml_path);
+  REQUIRE(fs::exists(yaml_path));
+
+  {
+    sirius::test::shared_test_env local_env(yaml_path);
+    auto con = local_env.make_connection();
+
+    auto const glob = (tmp / "multi" / "*.parquet").string();
+    require_ok(con.Query("SET enable_duckdb_fallback = false;"), "disable fallback");
+    require_ok(con.Query("CREATE VIEW t AS SELECT * FROM read_parquet('" + glob + "');"),
+               "create view");
+
+    auto sirius_ctx = con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+    REQUIRE(sirius_ctx);
+
+    for (auto const* tier : {"gpu", "host"}) {
+      DYNAMIC_SECTION("tier = " << tier)
+      {
+        require_ok(con.Query("SET enable_compressed_materialization = true;"), "enable flag");
+        auto const pin_before = sirius::test::get_compressed_materialization_stats(con);
+        auto pin =
+          con.Query("CALL pin_table('" + glob + "', tier='" + std::string(tier) + "', name='t');");
+        require_ok(pin, "pin_table");
+        auto const pin_after = sirius::test::get_compressed_materialization_stats(con);
+        REQUIRE(pin_after.pin_columns_narrowed > pin_before.pin_columns_narrowed);
+
+        // Pin the repro shape against fixture edits: two resolved files with
+        // at least two pin chunks per file side.
+        auto const* entry_ptr = find_entry(*sirius_ctx, "t");
+        REQUIRE(entry_ptr != nullptr);
+        REQUIRE(entry_ptr->cache_info.resolved_file_paths.size() == 2);
+        REQUIRE(entry_chunk_count(*entry_ptr) >= 4);
+
+        // The gate installs a sidecar (targets derive from the entry's stored
+        // chunk carriers) and the serve is cast-free: the chunk carriers
+        // already equal the plan targets, so nothing narrows or restores
+        // during scan normalization.
+        auto const before = sirius::test::get_compressed_materialization_stats(con);
+        compare_gpu_vs_cpu(con, kPayloadQuery);
+        auto const after = sirius::test::get_compressed_materialization_stats(con);
+        REQUIRE(after.scan_sidecars_installed > before.scan_sidecars_installed);
+        REQUIRE(after.scan_columns_narrowed == before.scan_columns_narrowed);
+        REQUIRE(after.scan_columns_restored == before.scan_columns_restored);
+
+        // Flag-off contrast — the discriminator that narrow data actually
+        // resides and flowed through the sidecar above: with the flag off no
+        // sidecar exists, so the same narrow resident chunks restore to
+        // native during scan normalization.
+        require_ok(con.Query("SET enable_compressed_materialization = false;"), "disable flag");
+        auto const off_before = sirius::test::get_compressed_materialization_stats(con);
+        compare_gpu_vs_cpu(con, kPayloadQuery);
+        auto const off_after = sirius::test::get_compressed_materialization_stats(con);
+        REQUIRE(off_after.scan_sidecars_installed == off_before.scan_sidecars_installed);
+        REQUIRE(off_after.scan_columns_restored > off_before.scan_columns_restored);
+        require_ok(con.Query("SET enable_compressed_materialization = true;"), "restore flag");
+
+        require_ok(con.Query("CALL unpin_table('t');"), "unpin");
+      }
     }
   }
 

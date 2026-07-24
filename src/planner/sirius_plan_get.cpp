@@ -16,7 +16,6 @@
 
 #include "cudf/cudf_utils.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
-#include "duckdb/common/hugeint.hpp"
 #include "duckdb/function/table/table_scan.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
@@ -26,7 +25,6 @@
 #include "duckdb/storage/data_table.hpp"
 #include "duckdb/storage/segment/uncompressed.hpp"
 #include "duckdb/storage/statistics/base_statistics.hpp"
-#include "duckdb/storage/statistics/numeric_stats.hpp"
 #include "duckdb/storage/statistics/string_stats.hpp"
 #include "duckdb/storage/storage_manager.hpp"
 #include "duckdb/transaction/duck_transaction.hpp"
@@ -67,12 +65,6 @@ duckdb::vector<std::unique_ptr<sirius::ast::node>> translate_expressions(
   return out;
 }
 
-__int128_t to_int128(duckdb::hugeint_t value)
-{
-  constexpr auto two_to_64 = static_cast<__int128_t>(1) << 64;
-  return static_cast<__int128_t>(value.upper) * two_to_64 + value.lower;
-}
-
 std::optional<cudf::data_type> try_native_physical_type(const sirius::logical_type& logical)
 {
   try {
@@ -80,68 +72,6 @@ std::optional<cudf::data_type> try_native_physical_type(const sirius::logical_ty
   } catch (duckdb::InvalidInputException const&) {
     return std::nullopt;
   }
-}
-
-std::optional<sirius::numeric_range> range_from_statistics(const sirius::logical_type& type,
-                                                           const duckdb::BaseStatistics& stats)
-{
-  if (stats.GetStatsType() != duckdb::StatisticsType::NUMERIC_STATS ||
-      sirius::from_duckdb(stats.GetType()) != type || !duckdb::NumericStats::HasMinMax(stats)) {
-    return std::nullopt;
-  }
-
-  auto const minimum = duckdb::NumericStats::Min(stats);
-  auto const maximum = duckdb::NumericStats::Max(stats);
-  switch (type.id()) {
-    case sirius::type_id::SMALLINT:
-      return sirius::signed_integer_range(minimum.GetValueUnsafe<int16_t>(),
-                                          maximum.GetValueUnsafe<int16_t>());
-    case sirius::type_id::INTEGER:
-      return sirius::signed_integer_range(minimum.GetValueUnsafe<int32_t>(),
-                                          maximum.GetValueUnsafe<int32_t>());
-    case sirius::type_id::BIGINT:
-      return sirius::signed_integer_range(minimum.GetValueUnsafe<int64_t>(),
-                                          maximum.GetValueUnsafe<int64_t>());
-    case sirius::type_id::USMALLINT:
-      return sirius::unsigned_integer_range(minimum.GetValueUnsafe<uint16_t>(),
-                                            maximum.GetValueUnsafe<uint16_t>());
-    case sirius::type_id::UINTEGER:
-      return sirius::unsigned_integer_range(minimum.GetValueUnsafe<uint32_t>(),
-                                            maximum.GetValueUnsafe<uint32_t>());
-    case sirius::type_id::UBIGINT:
-      return sirius::unsigned_integer_range(minimum.GetValueUnsafe<uint64_t>(),
-                                            maximum.GetValueUnsafe<uint64_t>());
-    case sirius::type_id::DECIMAL: {
-      auto const precision = type.decimal_precision();
-      if (precision <= sirius::logical_type::decimal_max_precision_int64) {
-        return sirius::decimal_range(minimum.GetValueUnsafe<int64_t>(),
-                                     maximum.GetValueUnsafe<int64_t>(),
-                                     type.decimal_scale());
-      }
-      return sirius::decimal_range(to_int128(minimum.GetValueUnsafe<duckdb::hugeint_t>()),
-                                   to_int128(maximum.GetValueUnsafe<duckdb::hugeint_t>()),
-                                   type.decimal_scale());
-    }
-    default: return std::nullopt;
-  }
-}
-
-std::unique_ptr<duckdb::BaseStatistics> get_column_statistics(duckdb::LogicalGet& op,
-                                                              duckdb::ClientContext& context,
-                                                              const duckdb::ColumnIndex& column)
-{
-  if (!column.HasPrimaryIndex() || column.IsRowIdColumn() || column.IsVirtualColumn() ||
-      column.IsEmptyColumn()) {
-    return nullptr;
-  }
-  if (op.function.statistics_extended) {
-    duckdb::TableFunctionGetStatisticsInput input(op.bind_data.get(), column);
-    return op.function.statistics_extended(context, input);
-  }
-  if (op.function.statistics) {
-    return op.function.statistics(context, op.bind_data.get(), column.GetPrimaryIndex());
-  }
-  return nullptr;
 }
 
 std::vector<cudf::data_type> scan_physical_schema(duckdb::LogicalGet& op,
@@ -155,13 +85,13 @@ std::vector<cudf::data_type> scan_physical_schema(duckdb::LogicalGet& op,
     return {};
   }
 
-  // Residency gate: a narrow sidecar is installed only when the pinned cache
-  // will serve this scan with columns that were already narrowed at pin time —
-  // then serving narrow is free (the casts were paid at pin time). Everything
-  // else stays native: an unpinned scan is byte-identical to feature-off
-  // (statistics are never fetched), and a pinned-native column is never
-  // narrowed at serve time as a recurring per-query cost. The probe runs
-  // before the statistics loop so the unpinned case costs one lookup.
+  // Residency gate: a narrow sidecar is installed only when the pinned cache will serve this scan,
+  // and each column's plan target is derived from the pinned entry's ACTUAL stored chunk carriers —
+  // pin-time narrowing computed exact per-chunk min/max on materialized data, so the carriers are
+  // ground truth and serving narrow is free (the casts were paid at pin time). Everything else
+  // stays native: an unpinned scan returns before any derivation and is byte-identical to
+  // feature-off, and a pinned-native column is never narrowed at serve time as a recurring
+  // per-query cost.
   sirius::scan_manager::pinned_entry const* entry = nullptr;
   if (op.function.name == "seq_scan") {
     auto* table_scan_bind = dynamic_cast<duckdb::TableScanBindData*>(op.bind_data.get());
@@ -198,16 +128,9 @@ std::vector<cudf::data_type> scan_physical_schema(duckdb::LogicalGet& op,
     }
     if (ids_position >= ids.size()) { continue; }
 
-    auto stats = get_column_statistics(op, context, ids[ids_position]);
-    if (!stats) { continue; }
-    auto range = range_from_statistics(logical, *stats);
-    if (!range) { continue; }
-    auto target = sirius::choose_narrow_physical_type(logical, *range);
+    auto const target =
+      sirius::scan_manager::pinned_column_narrow_carrier(*entry, projection[ids_position], *native);
     if (!target) { continue; }
-    if (!sirius::scan_manager::pinned_column_narrowed_in_all_chunks(*entry,
-                                                                    projection[ids_position])) {
-      continue;  // pinned-native (or mixed) column: serve native, never narrow at serve time
-    }
     result.back() = *target;
     changed       = true;
   }

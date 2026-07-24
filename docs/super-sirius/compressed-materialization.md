@@ -38,7 +38,7 @@ Narrowing is exact and preserves signedness and decimal scale.
 | `DECIMAL128(scale)` | narrowest fitting `DECIMAL32` or `DECIMAL64`, same scale |
 
 Already-minimal types, booleans, floating-point values, temporal values, strings, and 128-bit
-integers are not candidates. Missing, all-null, malformed, or incompatible statistics leave the
+integers are not candidates. Missing, all-null, malformed, or incompatible bounds leave the
 column native.
 
 Decimal bounds are compared as raw unscaled signed integers. cuDF represents SQL scale `s` as
@@ -46,32 +46,36 @@ Decimal bounds are compared as raw unscaled signed integers. cuDF represents SQL
 
 ## Scan planning and execution
 
-At plan time, Sirius asks the table function for min/max statistics and uses any compatible bounds
-to choose a candidate physical target per column. Availability depends on the source and scan
-shape; for example, a Parquet footer's writer-declared statistics are advisory rather than proof
-about the decoded values. Statistics only nominate the candidate carrier — a residency gate decides
-whether the scan receives a sidecar at all. A sidecar is installed only when the scan manager holds
-a pinned entry that (a) matches the scan's identity (same parquet file set or same duckdb
-catalog.schema.table — the same matchers the serve-time cache hit uses), (b) can serve every
-requested column, and (c) narrowed the candidate column in every cached chunk. This yields three
-residency states:
+At plan time, a residency gate decides whether the scan receives a sidecar and derives every
+target carrier in it. The gate probes the scan manager for the pinned entry that will serve this
+scan — same identity as the serve-time cache hit (same parquet file set or same duckdb
+catalog.schema.table, through the same matchers) and able to serve every requested column. Each
+narrowable column's plan target then comes from that entry's ACTUAL stored chunk carriers
+(`pinned_column_narrow_carrier`): the column's narrowing markers must show it narrowed in every
+chunk, every chunk carrier is defensively validated as a strict same-family narrowing of the
+native carrier, and the target is the widest carrier across the chunks — chunks stored narrower
+than the target widen at serve through the verified same-family restore. Pin-time narrowing chose
+each carrier from exact per-chunk min/max over materialized data, so the stored carriers are
+ground truth for the values the cache serves. Source statistics are not consulted at plan time,
+so sidecar availability does not depend on footer or catalog statistics: multi-file parquet scans
+gate identically to single-file scans. This yields three residency states:
 
 1. **Pinned-narrow** — the pinned entry matches the scan, serves its requested columns, and its
-   narrowing markers show a candidate column narrowed in every chunk: that column keeps its narrow
-   target in the sidecar. Serving narrow is free — the casts were paid at pin time — and the query
-   gets the full downstream benefit.
+   narrowing markers show a column narrowed in every chunk: that column's sidecar target is the
+   widest carrier across the entry's chunks. Serving narrow is free — the casts were paid at pin
+   time — and the query gets the full downstream benefit.
 2. **Unpinned** — no matching entry, or the entry cannot serve the requested columns: no sidecar.
    The fresh scan is byte-identical to the feature-off plan — no exact-minmax verification, no cast
-   kernels, no restore projections; statistics are not even consulted.
+   kernels, no restore projections; the probe costs one lookup.
 3. **Pinned-native** — the entry matches but the column was not narrowed in every chunk (for
    example, the table was pinned while the flag was off): that column's target stays native, and
    when no column survives the whole sidecar is dropped. A native resident chunk is never narrowed
    at serve time as a recurring per-query cost.
 
 A scan receives a complete physical sidecar only when its output mapping is complete and at least
-one eligible projected column has usable bounds and passes the residency gate. Columns that cannot
-be narrowed remain native inside that sidecar. Because installation depends on residency, plan
-shape depends on pin state at plan time (see the staleness note below).
+one eligible projected column passes the residency derivation. Columns that cannot be narrowed
+remain native inside that sidecar. Because installation depends on residency, plan shape depends
+on pin state at plan time (see the staleness note below).
 
 The GPU scan decodes the source at its normal/native width, applies reader and pushed-down filters,
 and projects the output. Verification remains the safety contract for every planned
@@ -80,11 +84,11 @@ scan computes exact min/max over the materialized column and verifies that every
 candidate carrier. A missing, invalid, or out-of-range runtime bound rejects the narrowing instead
 of allowing a truncating cast; empty and all-null columns are vacuously safe. The verified output
 is then cast to the planned physical schema. This placement avoids a separate physical stage even
-though the cuDF reductions and casts remain kernels. On the routine paths the verification no
-longer runs — unpinned scans carry no sidecar, and a pinned-narrow serve is either a no-op (the
+though the cuDF reductions and casts remain kernels. On the routine paths the verification does
+not run — unpinned scans carry no sidecar, and a pinned-narrow serve is either a no-op (the
 stored carrier equals the plan target) or a cheap verified-free widening — but it remains reachable
-as defense for the residual cases: a plan that predicted cache serving whose execution fell back to
-a disk read, and advisory statistics that disagree with the stored carriers.
+as defense for the residual case: a plan that predicted cache serving whose execution fell back to
+a disk read.
 
 Plan staleness across pin changes: a prepared statement or cached plan built while a table was
 unpinned stays native after a later pin — correct, but it forgoes the benefit until re-planned. A
@@ -244,7 +248,8 @@ conversion uses the larger of its stored and working-set sizes.
 3. Signed and unsigned integer families never cross.
 4. A downcast is allowed only when the target is strictly narrower and every materialized value fits.
 5. A restore is allowed only when it is a same-family widening with matching DECIMAL scale.
-6. Planner/source statistics are advisory; exact materialized min/max verifies each scan downcast.
+6. Plan targets derive from pin-time exact carriers; exact materialized min/max still verifies any
+   scan downcast (disk-fallback defense).
 7. Pin-time narrowing is selected from exact per-chunk cuDF min/max results.
 8. Join keys, dynamic-filter keys, unsupported boundaries, and final results are native.
 9. A nonempty physical sidecar describes the complete output schema.
@@ -262,7 +267,9 @@ after the residency gate (a later pass may still clear or prune it), and a runti
 `partition_narrow_columns` counter, counting input-batch columns that crossed an engaged hash
 PARTITION with a carrier narrower than native — the single observable for the exchange
 pass-through, derived from actual batch types so any regression in the narrow-carrier chain drops
-it to zero. After the residency gate,
+it to zero. A multi-file parquet gate test pins that sidecar installation is independent of
+source-statistics availability: a two-part pinned-narrow table installs the sidecar and serves
+cast-free on both tiers. After the residency gate,
 unpinned feature-on is expected to be approximately equal to unpinned feature-off — the flag should
 be performance-neutral wherever no pinned narrow data exists.
 

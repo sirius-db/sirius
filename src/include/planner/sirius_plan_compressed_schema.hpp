@@ -27,7 +27,7 @@ namespace sirius::planner {
  * Each operator carries an optional physical sidecar
  * (`sirius_physical_operator::set_physical_types`) describing narrower cuDF carriers for its output
  * columns; an empty sidecar means every column uses its native carrier. The passes here derive,
- * restore, and prune those sidecars after `sirius_plan_get` installs the statistics-driven scan
+ * restore, and prune those sidecars after `sirius_plan_get` installs the residency-derived scan
  * sidecars. `sirius_physical_plan_generator::create_plan` invokes them through
  * `apply_compressed_schema_passes` when `enable_compressed_materialization` is on; the individual
  * passes are exposed so planner contract tests can drive each one over a hand-built operator tree.
