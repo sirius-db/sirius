@@ -17,11 +17,6 @@
 
 namespace {
 
-void expect(bool cond, char const* msg)
-{
-  if (!cond) throw std::runtime_error(msg);
-}
-
 simpatico::compressed_representation const* find_bitpack_leaf(simpatico::PlanTree const& tree)
 {
   for (auto const& node : tree.nodes) {

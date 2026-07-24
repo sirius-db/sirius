@@ -768,6 +768,11 @@ std::string build_compressed_table_header(compressed_table const& table,
     auto const& descs = all_descs[ci];
 
     push_str16(hdr, col.name.value_or(std::string{}));
+    if (dtype_to_tag(col.dtype) == 255) {
+      return "write: column '" + col.name.value_or(std::to_string(ci)) +
+             "' has an unsupported dtype (id " + std::to_string(static_cast<int>(col.dtype.id())) +
+             ") with no serialization tag";
+    }
     push_le(hdr, dtype_to_tag(col.dtype));
     push_le(hdr, col.dtype.scale());  // fixed-point scale (0 for non-decimal)
     push_le(hdr, col.num_rows);
@@ -781,6 +786,10 @@ std::string build_compressed_table_header(compressed_table const& table,
 
     push_le(hdr, static_cast<std::uint16_t>(descs.size()));
     for (auto const& ld : descs) {
+      if (ld.type_tag == 255) {
+        return "write: leaf node " + std::to_string(ld.node_index) +
+               " has an unsupported dtype with no serialization tag";
+      }
       push_le(hdr, ld.node_index);
       push_le(hdr, ld.slot);
       push_le(hdr, static_cast<std::uint8_t>(ld.kind));
@@ -790,6 +799,10 @@ std::string build_compressed_table_header(compressed_table const& table,
       push_le(hdr, static_cast<std::uint8_t>(ld.buffers.size()));
 
       for (auto const& bd : ld.buffers) {
+        if (bd.type_tag == 255) {
+          return "write: leaf buffer '" + bd.name +
+                 "' has an unsupported dtype with no serialization tag";
+        }
         push_str16(hdr, bd.name);
         push_le(hdr, bd.type_tag);
         push_le(hdr, bd.size_bytes);

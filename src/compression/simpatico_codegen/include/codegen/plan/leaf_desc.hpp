@@ -146,6 +146,7 @@ inline constexpr std::pair<cudf::type_id, std::uint8_t> kTypeTags[] = {
   {cudf::type_id::DURATION_MILLISECONDS, 21},
   {cudf::type_id::DURATION_MICROSECONDS, 22},
   {cudf::type_id::DURATION_NANOSECONDS, 23},
+  {cudf::type_id::BOOL8, 24},
 };
 
 inline std::uint8_t dtype_to_tag(cudf::data_type dt) noexcept

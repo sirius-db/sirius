@@ -1085,9 +1085,7 @@ void Walker::emit_bitpack(const ::codegen::jit::FusedTree& node, LaneInput in, b
         << ");\n"
         << "        if (" << bp_len << " <= 0) {\n"
         << "            if (tid == 0) { " << p_min << "[chunk_id] = " << in.elem_type << "{0}; "
-        << p_cnt << "[chunk_id] = 0; " << p_bits << "[chunk_id] = 1;\n"
-        << "                atomicAdd(" << p_lws
-        << " + (static_cast<uint32_t>(chunk_id) & 15u) * 32u, 1u); }\n"
+        << p_cnt << "[chunk_id] = 0; " << p_bits << "[chunk_id] = 1; }\n"
         << "            break;\n"
         << "        }\n"
         // Pass 1: combined min+max in a single grid-stride loop.
@@ -1110,8 +1108,8 @@ void Walker::emit_bitpack(const ::codegen::jit::FusedTree& node, LaneInput in, b
         << ").Reduce(_lmax, SimpaticoMax()); if (tid == 0) " << sh_max << "_b = _m; }\n"
         << "        __syncthreads();\n"
         << "        const " << in.elem_type << " " << cmin << " = " << sh_min << "_b;\n"
-        << "        const uint64_t " << max_r << " = static_cast<uint64_t>(static_cast<int64_t>("
-        << sh_max << "_b) - static_cast<int64_t>(" << cmin << "));\n"
+        << "        const uint64_t " << max_r << " = static_cast<uint64_t>(" << sh_max
+        << "_b) - static_cast<uint64_t>(" << cmin << ");\n"
         << "        const int32_t " << bits_v << " = simpatico_bit_width_u64("
         << "static_cast<unsigned long long>(" << max_r << "));\n"
         << "        if (tid == 0) {\n"
@@ -1141,8 +1139,8 @@ void Walker::emit_bitpack(const ::codegen::jit::FusedTree& node, LaneInput in, b
           << "        __syncthreads();\n"
           // Pack into smem (SM-local atomicOr, no L2 cache contention).
           << "        for (int32_t i = tid; i < " << bp_len << "; i += 128) {\n"
-          << "            uint64_t _rv = static_cast<uint64_t>(static_cast<int64_t>("
-          << at_lane(in.read_expr, "i") << ") - static_cast<int64_t>(" << cmin << "));\n"
+          << "            uint64_t _rv = static_cast<uint64_t>(" << at_lane(in.read_expr, "i")
+          << ") - static_cast<uint64_t>(" << cmin << ");\n"
           << "            const int32_t _ibits = i * static_cast<int32_t>(" << bits_v << ");\n"
           << "            int32_t _tw = _ibits >> 5;\n"
           << "            int32_t _tb = _ibits & 31;\n"
@@ -1168,8 +1166,8 @@ void Walker::emit_bitpack(const ::codegen::jit::FusedTree& node, LaneInput in, b
     // One 32-bit IMAD (_ibits) shared for both _tw and _tb replaces
     // the original two independent 64-bit multiplies (~4 vs ~8 cycles).
     body_ << "        for (int32_t i = tid; i < " << bp_len << "; i += 128) {\n"
-          << "            uint64_t _rv = static_cast<uint64_t>(static_cast<int64_t>("
-          << at_lane(in.read_expr, "i") << ") - static_cast<int64_t>(" << cmin << "));\n"
+          << "            uint64_t _rv = static_cast<uint64_t>(" << at_lane(in.read_expr, "i")
+          << ") - static_cast<uint64_t>(" << cmin << ");\n"
           << "            const int32_t _ibits = i * static_cast<int32_t>(" << bits_v << ");\n"
           << "            int32_t _tw = _ibits >> 5;\n"
           << "            int32_t _tb = _ibits & 31;\n"
