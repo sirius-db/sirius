@@ -261,6 +261,80 @@ Results are saved to `benchmark_results_thread_sweep/` as CSV files per configur
 
 The shell runners (`benchmark_and_validate.sh`, `run_tpch_parquet.sh`, `run_tpch_parquet_duckdb.sh`, `run_tpch_legacy.sh`, `profile_tpch_nsys.sh`) remain in the tree for backward compatibility with CI (`.github/workflows/test.yml`) and `.ai-helper/commands.yaml`, but are superseded by `performance_test.py`. New work — and the `benchmark` / `profile-analyzer` / `optimization-advisor` skills — should use the Python runner.
 
+## Power & Throughput Run (TPC-H refresh functions)
+
+`tpch_power_throughput.py` implements the TPC-H **power test** and **throughput test** in the
+style of [duckdb-tpch-power-test](https://github.com/duckdb/duckdb-tpch-power-test), adding the
+RF1 (insert) / RF2 (delete) refresh functions to the query workload:
+
+- **Power run** (single session, update set 1): optional clean pass → **RF1** (`COPY` the
+  `orders.tbl.u1` + `lineitem.tbl.u1` rows in) → the 22 queries in spec stream-0 order (timed —
+  these feed Power@Size) → **RF2** (`DELETE` the `delete.1` order keys) → a timed post-RF2 pass
+  with the delete mask active.
+- **Throughput run** (fresh database copy): N concurrent query streams (spec permutations 1..N,
+  from `tpch_stream_permutations.py`) plus one refresh stream running N RF1/RF2 pairs (update
+  sets 2..N+1). N defaults to the spec minimum for the SF (SF1→2, SF10→3, ...).
+
+Metrics (TPC-H spec 5.4): `Power@Size = 3600·SF / geomean(22 stream-0 query times + T_RF1 +
+T_RF2)`, `Throughput@Size = N·22·3600 / measurement_interval · SF`, `QphH@Size =
+sqrt(Power · Throughput)`.
+
+### How it maps onto Sirius
+
+- The input must be a **file-backed `.duckdb` with native TPC-H tables** (e.g.
+  `test_datasets/tpch_sf1.duckdb`). The runner copies it per phase and mutates the copy — the
+  original is never touched. All 8 tables are pinned (`CALL pin_table(format='duckdb', ...)`)
+  after a `CHECKPOINT`; pinning `lineitem`/`orders` is what activates the MVCC insert-delta /
+  delete-mask serving path for the refreshed data. Parquet inputs cannot work here (read-only
+  views, no MVCC metadata).
+- RF1/RF2 are plain DuckDB CPU DML (the GPU does not execute INSERT/DELETE); the GPU serves the
+  *subsequent* queries from `pinned base + insert delta − delete mask`, with **no CHECKPOINT**
+  between a refresh and the queries that observe it. The delta is re-decoded and the mask
+  re-applied per query, so the post-RF passes measure a stable recurring cost.
+- The summary reports per-query `clean` / `post-RF1` / `post-RF2` times plus derived
+  `delta overhead` (post-RF1 − clean) and `mask overhead` (post-RF2 − post-RF1) columns —
+  Power@Size itself uses only the canonical post-RF1 stream.
+- **Validation** (default on, power run only): after RF1 and again after RF2, every
+  refresh-affected query's GPU rows are diffed against a DuckDB CPU cursor **in the same
+  process** (a separate process would read the stale pre-refresh disk image, since refreshes are
+  committed but not checkpointed). q2/q11/q16 touch neither lineitem nor orders and are skipped.
+  Row-count movement across RF1/RF2 is also asserted. Mismatches make the run exit non-zero.
+- **Concurrency caveat**: the engine serializes all queries across all connections on one
+  query-lifecycle lock, so the throughput run measures aggregate throughput of concurrent
+  *submission* on one GPU, not overlapped execution. Every result is fully materialized before
+  the next query — an open cursor would hold the lock and stall every stream.
+
+### Usage
+
+```bash
+# One-time per SF: generate refresh sets with classic dbgen -U (needs >= streams+1 sets)
+./test/tpch_performance/generate_tpch_refresh.sh 1 5     # -> test_datasets/tpch_refresh_sf1/
+
+export SIRIUS_CONFIG_FILE=$(pwd)/test/cpp/integration/integration.yaml
+
+# Power + throughput (defaults: --mode both, --pin gpu, validation on, spec-minimum streams)
+pixi run python test/tpch_performance/tpch_power_throughput.py --sf 1
+
+# Explicit paths / bigger run
+pixi run python test/tpch_performance/tpch_power_throughput.py \
+    --sf 10 --input test_datasets/tpch_sf10.duckdb \
+    --refresh-dir test_datasets/tpch_refresh_sf10 --streams 4 --pin host
+
+# Power run only, no clean pass, timing only
+pixi run python test/tpch_performance/tpch_power_throughput.py \
+    --sf 1 --mode power --no-baseline-pass --no-validation
+```
+
+Key flags: `--mode power|throughput|both`, `--streams N`, `--pin gpu|host|none` (`none` disables
+pinning and thereby GPU serving of refreshed tables — debug only), `--validation/--no-validation`,
+`--baseline-pass/--no-baseline-pass`, `--query-timeout <s>`, `--keep-scratch-db`, `--output`.
+
+Output (under `test/tpch_performance/output/tpch_power_<ts>_sf<SF>_s<N>/`): `metrics.json`
+(all metrics + per-query/per-stream times + validation verdicts), `timings.csv`
+(`phase,stream,element,seconds`), `summary.txt` (per-query clean/post-RF1/post-RF2 table +
+metrics), `run_info.txt`, `config.yml`, `power/q<N>/result_{clean,postrf1,postrf2}.txt`, and
+`log_dir/` (Sirius logs).
+
 ## Profiling with Nsight Systems
 
 A suite of scripts for GPU performance profiling and analysis using NVIDIA Nsight Systems (nsys).
@@ -358,6 +432,9 @@ Output: `reports/<label>_<YYYYMMDD_HHMMSS>/` containing `report.md`, `summary.js
 | `performance_test.py` | Python-based benchmark with result verification |
 | `queries.py` | TPC-H query definitions (base SQL) |
 | `tpch_pin_columns.py` | Per-query and union column → table mapping for `--pinning-mode per-query` / `pinned-hot` (union helpers also used by `performance_test.py --mode sequential`); emits `CALL pin_table(...)` / `CALL unpin_table(...)` SQL |
+| `tpch_power_throughput.py` | TPC-H power & throughput runs with RF1/RF2 refresh functions; Power@Size / Throughput@Size / QphH@Size + delta/mask overhead breakdown |
+| `tpch_stream_permutations.py` | Spec Appendix A query-stream orderings (streams 0–40) + spec-minimum stream counts |
+| `generate_tpch_refresh.sh` | Generate RF1/RF2 refresh sets (`orders.tbl.u*`, `lineitem.tbl.u*`, `delete.*`) via classic dbgen `-U` |
 | `generate_test_data.py` | Generate test data via dbgen |
 | `generate_test_data_tpchgen-rs.py` | Generate test data via tpchgen-rs Python wrapper + query files |
 | `pixi.toml` | Python environment with cudf, pyarrow, rust for tooling |
