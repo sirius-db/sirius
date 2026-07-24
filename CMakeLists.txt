@@ -361,6 +361,7 @@ set(EXTENSION_SOURCES
     src/sirius_ffi.cpp
     src/sirius_interface.cpp
     src/sirius_sql_rewrite.cpp
+    src/telemetry/batch_telemetry.cpp
     src/telemetry/telemetry_context.cpp
     src/telemetry/memory_context.cpp
     src/transparent/physical_sirius_execution.cpp

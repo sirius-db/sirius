@@ -21,6 +21,7 @@
 #include "memory/defragmenter_oom_policy.hpp"
 #include "op/scan/sirius_gpu_scan_operator_data.hpp"
 #include "pipeline/oom_reschedule_exception.hpp"
+#include "telemetry/batch_telemetry.hpp"
 #include "telemetry/telemetry_context.hpp"
 
 #include <nvtx3/nvtx3.hpp>
@@ -37,6 +38,7 @@
 #include <format>
 #include <optional>
 #include <string>
+#include <unordered_set>
 
 namespace sirius {
 namespace pipeline {
@@ -269,11 +271,26 @@ gpu_pipeline_task::gpu_pipeline_task(
   }
   if (auto* pipeline = _global_state->cast<gpu_pipeline_task_global_state>().get_pipeline()) {
     pipeline->mark_task_created();
+    auto& registry = telemetry::batch_telemetry_registry::instance();
+    for (const auto& weak_batch : _subscribed_batches) {
+      if (auto batch = weak_batch.lock()) {
+        registry.on_packaged(batch, pipeline->pipeline_uuid(), telemetry_handle().uuid());
+        _claimed_batch_ids.push_back(batch->get_batch_id());
+      }
+    }
   }
 }
 
 gpu_pipeline_task::~gpu_pipeline_task()
 {
+  {
+    auto& registry       = telemetry::batch_telemetry_registry::instance();
+    const auto task_uuid = telemetry_handle().uuid();
+    for (const auto batch_id : _claimed_batch_ids) {
+      registry.on_consumed(batch_id, task_uuid);
+    }
+  }
+
   for (const auto& weak_batch : _subscribed_batches) {
     auto batch = weak_batch.lock();
     if (!batch) { continue; }
@@ -330,8 +347,11 @@ std::unique_ptr<op::operator_data> gpu_pipeline_task::compute_task(rmm::cuda_str
         .instance_name       = std::format("{}({})", op.get_name(), op.get_operator_id()),
         .current_operator_id = static_cast<uint32_t>(
           op.get_operator_id()),  // TODO(dhruv9vats): look into possible overflow
-        .input_bytes                 = operator_input_output_data->get_estimated_size_in_bytes(),
+        .input_bytes          = operator_input_output_data->get_estimated_size_in_bytes(),
+        .peak_allocated_bytes = _allocator ? _allocator->get_peak_allocated_bytes(stream) : 0,
         .executor_thread_resource_id = executor_thread_resource_id,
+        .reservation_resource_id     = _reservation_tier_resource_id,
+        .reservation_capacity_bytes  = _reservation_bytes,
       });
       operator_input_output_data = run_one_operator(
         op, *operator_input_output_data, stream, pipeline, _task_id, operators.size(), _allocator);
@@ -490,12 +510,19 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
     SIRIUS_LOG_ERROR(
       "gpu_pipeline_task::execute: executor thread telemetry handle is not initialized");
   }
+  _reservation_bytes = reservation_bytes;
+  if (requested_memory_space != nullptr) {
+    _reservation_tier_resource_id = telemetry::batch_telemetry_registry::instance().tier_resource(
+      requested_memory_space->get_tier(), requested_memory_space->get_id().device_id);
+  }
   telemetry_handle().preparing({
     .instance_name               = "",
     .origin_tier                 = local_state._input_data->get_origin_tiers(),
     .target_tier                 = "GPU",
     .input_bytes                 = local_state._input_data->get_estimated_size_in_bytes(),
     .executor_thread_resource_id = executor_thread_resource_id,
+    .reservation_resource_id     = _reservation_tier_resource_id,
+    .reservation_capacity_bytes  = _reservation_bytes,
   });
   try {
     local_state._input_data->prepare_for_processing(requested_memory_space, stream);
@@ -540,6 +567,20 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
   // All input batches are now locked for reading via _read_only_data_batches inside
   // local_state._input_data. The locks are released when the pipelineable_operator_data
   // is destroyed after the first operator's execute() consumes it.
+  {
+    auto& registry       = telemetry::batch_telemetry_registry::instance();
+    const auto task_uuid = telemetry_handle().uuid();
+    std::unordered_set<uint64_t> live_ids;
+    for (const auto& weak_batch : _subscribed_batches) {
+      if (auto batch = weak_batch.lock()) {
+        live_ids.insert(batch->get_batch_id());
+        registry.on_processing(batch, task_uuid);
+      }
+    }
+    for (const auto batch_id : _claimed_batch_ids) {
+      if (!live_ids.contains(batch_id)) { registry.on_processing_by_id(batch_id, task_uuid); }
+    }
+  }
 
   // 2. Set reservation_aware_memory_resource_ref as the default cudf allocator
   // 3. Execute cudf operators on the pipeline

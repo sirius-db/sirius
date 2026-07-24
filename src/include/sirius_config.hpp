@@ -134,6 +134,9 @@ struct operator_params {
 
 struct telemetry_config {
   bool enable_quent{true};
+  /// Emit per-batch placement telemetry (Batch FSM + MemoryTier usages).
+  /// Roughly doubles telemetry volume; no-op when enable_quent is false.
+  bool enable_batch_events{true};
   std::string output_directory{"telemetry_data"};
   std::string engine_name{"siriusDB"};
 };

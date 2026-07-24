@@ -198,6 +198,7 @@ static void from_yaml(const YAML::Node& node, telemetry_config& opt)
 {
   yaml::reader r(node, "telemetry");
   r.optional("enable_quent", opt.enable_quent);
+  r.optional("enable_batch_events", opt.enable_batch_events);
   r.optional("output_directory", opt.output_directory);
   r.optional("engine_name", opt.engine_name);
   r.reject_unknown();
