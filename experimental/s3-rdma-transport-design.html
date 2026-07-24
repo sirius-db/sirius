@@ -28,11 +28,13 @@ on CX-6 RoCE).
 
 ## 1. Summary
 
-- V1 adds an opt-in RDMA path (`s3_transport=RDMA`) for exact-key Parquet
-  reads on one GPU: `read_parquet('s3://bucket/path/file.parquet')` with the
-  complete object key written out, not a glob or a listing. The first target
-  workload, TPC-H benchmarking over lakehouse parquet, references every table
-  by exact key, so glob/LIST support is deferred without loss.
+- V1 adds an opt-in RDMA path (`s3_transport=RDMA`) for Parquet reads on
+  one GPU, by exact key (`read_parquet('s3://bucket/path/file.parquet')`)
+  or by glob (`read_parquet('s3://bucket/path/*.parquet')`). A glob is
+  resolved on the host control plane with ordinary signed S3 requests
+  (HTTP or HTTPS, following the configured host endpoint and its TLS
+  settings); every matched object is then read by its exact key. The
+  data plane never lists; it only ever serves exact-key reads.
 - Payload lands in a pre-registered GPU arena and is copied to caller-owned
   RMM memory on the caller stream, with zero Sirius-side host staging or H2D
   traffic. Metadata and footer reads remain on the existing S3 path.
@@ -54,15 +56,15 @@ on CX-6 RoCE).
 
 | Supported in v1 | Not in v1 |
 |---|---|
-| Exact-key `read_parquet('s3://…')` | Wildcard glob and S3 LIST (explicit error at glob expansion) |
+| Exact-key data reads; wildcard glob and S3 LIST resolved on the host control plane | Merging the two listing HTTP legs into one implementation (the signer, parser, and listing interface are already shared); the per-object footer stash at open (RDMA opens with a plain HEAD); custom LIST caps (RDMA uses the built-in limits for now) |
 | Two logical endpoints — host plane + RDMA data plane; the configured addresses may be identical | A single shared endpoint configuration (no separate data-plane settings) |
 | Fixed per-GPU registered arena | Multi-GPU enablement (structure ships, gate covers one GPU) |
 | Basic byte/request/failure metrics | Full metric parity with the REST backend |
 | One-shot device reads | Automatic RDMA retry (a single pre-approved retry exists as a response to a soak failure, Section 5) |
 | Restart-based recovery | Hot recovery of a failed transport context |
 
-Footer caching and known-size open are also out of scope; footer and
-metadata reads are plain HEAD and range GET on the host plane.
+Known-size open is also out of scope; footer and metadata reads are
+plain HEAD and range GET on the host plane.
 
 ## 3. Architecture and Ownership
 
