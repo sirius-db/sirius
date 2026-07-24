@@ -165,6 +165,10 @@ mvcc_mask_workset prepare_mvcc_mask_tasks(
   }
   if (!any_dirty) {
     // Every mask slot stays default — the unmasked fast path.
+    SIRIUS_LOG_DEBUG(
+      "[prepare_mvcc_mask_tasks] every pinned entry is clean under this snapshot: serving "
+      "unmasked ({} request(s))",
+      requests.size());
     workset.plans.clear();
     return workset;
   }

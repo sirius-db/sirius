@@ -350,6 +350,7 @@ set(EXTENSION_SOURCES
     src/scan_manager/insert_delta_job.cpp
     src/scan_manager/mvcc_mask_job.cpp
     src/scan_manager/pinned_chunk_stats.cpp
+    src/scan_manager/pinned_table_report.cpp
     src/scan_manager/round_robin_strategy.cpp
     src/scan_manager/sirius_scan_manager.cpp
     src/scan_manager/split_connector.cpp
@@ -634,6 +635,7 @@ set(TEST_SOURCES
     test/cpp/scan_manager/test_delta_promotion.cpp
     test/cpp/scan_manager/test_insert_delta_job.cpp
     test/cpp/scan_manager/test_mvcc_mask_job.cpp
+    test/cpp/scan_manager/test_pinned_table_report.cpp
     test/cpp/scan_manager/test_pinned_chunk_stats.cpp
     test/cpp/operator/test_physical_grouped_aggregate_merge_mgpu.cpp
     test/cpp/operator/test_physical_hash_join_mgpu.cpp

@@ -125,6 +125,16 @@ bool fill_keep_mask_for_row_groups(std::span<mvcc_row_group_slice const> slices,
  * cached base (and the on-disk image) would serve stale data. SERIAL — may
  * lazily load column data.
  */
+/**
+ * Count the pinned prefix's rows that are INVISIBLE under @p plan's snapshot
+ * (pre-pin tombstones + post-pin deletes + not-yet-visible promoted inserts).
+ * The observability walk behind sirius_pinned_tables()'s delta_delete_rows:
+ * the same per-vector GetSelVector visit the mask fill does, counting instead
+ * of writing bits. Clean slices contribute zero without touching version
+ * locks. SERIAL — call on the query thread with a plan captured there.
+ */
+std::size_t count_invisible_pinned_rows(mvcc_visibility_plan const& plan);
+
 bool any_update_chains(duckdb::DataTable& storage,
                        std::span<duckdb::storage_t const> storage_column_indices,
                        std::size_t row_prefix);

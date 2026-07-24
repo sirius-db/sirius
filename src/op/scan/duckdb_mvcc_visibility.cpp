@@ -223,6 +223,28 @@ bool fill_keep_mask_for_row_groups(std::span<mvcc_row_group_slice const> slices,
   return any_dropped;
 }
 
+std::size_t count_invisible_pinned_rows(mvcc_visibility_plan const& plan)
+{
+  std::size_t invisible = 0;
+  duckdb::SelectionVector sel(STANDARD_VECTOR_SIZE);
+  duckdb::ScanOptions const options{plan.transaction};
+
+  for (auto const& chunk_slices : plan.mvcc_row_groups) {
+    for (auto const& slice : chunk_slices) {
+      if (!slice.has_version_state) { continue; }  // every covered row visible
+      auto const vectors = (slice.row_count + STANDARD_VECTOR_SIZE - 1) / STANDARD_VECTOR_SIZE;
+      for (std::size_t v = 0; v < vectors; ++v) {
+        auto const max_count =
+          std::min<std::size_t>(STANDARD_VECTOR_SIZE, slice.row_count - v * STANDARD_VECTOR_SIZE);
+        auto const count = static_cast<std::size_t>(slice.row_group->GetSelVector(
+          options, static_cast<duckdb::idx_t>(v), sel, static_cast<duckdb::idx_t>(max_count)));
+        invisible += max_count - count;
+      }
+    }
+  }
+  return invisible;
+}
+
 bool any_update_chains(duckdb::DataTable& storage,
                        std::span<duckdb::storage_t const> storage_column_indices,
                        std::size_t row_prefix)

@@ -22,6 +22,7 @@
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/open_file_info.hpp"
 #include "expression_evaluator/expression_evaluator_strategy.hpp"
+#include "scan_manager/pinned_table_report.hpp"
 
 #include <cudf/io/parquet.hpp>
 #include <cudf/io/types.hpp>
@@ -1304,6 +1305,92 @@ void SiriusExtension::UnpinTableFunction(ClientContext& context,
   data.finished = true;
 }
 
+struct PinnedTablesFunctionData : public GlobalTableFunctionState {
+  std::vector<sirius::scan_manager::pinned_table_report> reports;
+  idx_t cursor = 0;
+};
+
+static unique_ptr<FunctionData> SiriusPinnedTablesBind(ClientContext& context,
+                                                       TableFunctionBindInput& input,
+                                                       vector<LogicalType>& return_types,
+                                                       vector<string>& names)
+{
+  auto add = [&](char const* name, LogicalType type) {
+    names.emplace_back(name);
+    return_types.push_back(std::move(type));
+  };
+  add("name", LogicalType::VARCHAR);
+  add("format", LogicalType::VARCHAR);
+  add("database_name", LogicalType::VARCHAR);
+  add("schema_name", LogicalType::VARCHAR);
+  add("table_name", LogicalType::VARCHAR);
+  add("tier", LogicalType::VARCHAR);
+  add("column_count", LogicalType::UBIGINT);
+  add("chunk_count", LogicalType::UBIGINT);
+  add("base_rows", LogicalType::UBIGINT);
+  add("is_valid", LogicalType::BOOLEAN);
+  add("v_base", LogicalType::UBIGINT);
+  add("promoted_chunks", LogicalType::UBIGINT);
+  add("promoted_rows", LogicalType::UBIGINT);
+  add("promotion_status", LogicalType::VARCHAR);
+  add("delta_insert_rows", LogicalType::UBIGINT);
+  add("delta_delete_rows", LogicalType::UBIGINT);
+  add("dirty_chunks", LogicalType::UBIGINT);
+  return make_uniq<TableFunctionData>();
+}
+
+static unique_ptr<GlobalTableFunctionState> SiriusPinnedTablesInit(ClientContext& context,
+                                                                   TableFunctionInitInput& input)
+{
+  auto state = make_uniq<PinnedTablesFunctionData>();
+  // Best-effort: without an initialized Sirius context there are no pins —
+  // return zero rows rather than erroring an introspection query.
+  try {
+    auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+    if (sirius_ctx) {
+      state->reports =
+        sirius::scan_manager::collect_pinned_table_reports(sirius_ctx->get_scan_manager(), context);
+    }
+  } catch (std::exception const& e) {
+    SIRIUS_LOG_DEBUG("sirius_pinned_tables: no reports available ({})", e.what());
+  }
+  return std::move(state);
+}
+
+static void SiriusPinnedTablesFunction(ClientContext& context,
+                                       TableFunctionInput& data_p,
+                                       DataChunk& output)
+{
+  auto& state = data_p.global_state->Cast<PinnedTablesFunctionData>();
+  auto opt_u  = [](std::optional<std::size_t> const& v) {
+    return v ? Value::UBIGINT(static_cast<uint64_t>(*v)) : Value(LogicalType::UBIGINT);
+  };
+  idx_t rows = 0;
+  while (state.cursor < state.reports.size() && rows < STANDARD_VECTOR_SIZE) {
+    auto const& r = state.reports[state.cursor++];
+    output.SetValue(0, rows, Value(r.name));
+    output.SetValue(1, rows, Value(r.format));
+    output.SetValue(2, rows, Value(r.database_name));
+    output.SetValue(3, rows, Value(r.schema_name));
+    output.SetValue(4, rows, Value(r.table_name));
+    output.SetValue(5, rows, Value(r.tier));
+    output.SetValue(6, rows, Value::UBIGINT(r.column_count));
+    output.SetValue(7, rows, Value::UBIGINT(r.chunk_count));
+    output.SetValue(8, rows, Value::UBIGINT(r.base_rows));
+    output.SetValue(9, rows, Value::BOOLEAN(r.is_valid));
+    output.SetValue(10, rows, r.v_base ? Value::UBIGINT(*r.v_base) : Value(LogicalType::UBIGINT));
+    output.SetValue(11, rows, opt_u(r.promoted_chunks));
+    output.SetValue(12, rows, opt_u(r.promoted_rows));
+    output.SetValue(
+      13, rows, r.promotion_status ? Value(*r.promotion_status) : Value(LogicalType::VARCHAR));
+    output.SetValue(14, rows, opt_u(r.delta_insert_rows));
+    output.SetValue(15, rows, opt_u(r.delta_delete_rows));
+    output.SetValue(16, rows, opt_u(r.dirty_chunks));
+    ++rows;
+  }
+  output.SetCardinality(rows);
+}
+
 struct ProfilerFunctionData : public GlobalTableFunctionState {
   bool finished = false;
 };
@@ -1457,6 +1544,14 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
     "unpin_table", {LogicalType::VARCHAR}, UnpinTableFunction, UnpinTableBind);
   CreateTableFunctionInfo unpin_table_info(unpin_table);
   catalog.CreateTableFunction(transaction, unpin_table_info);
+
+  TableFunction pinned_tables("sirius_pinned_tables",
+                              {},
+                              SiriusPinnedTablesFunction,
+                              SiriusPinnedTablesBind,
+                              SiriusPinnedTablesInit);
+  CreateTableFunctionInfo pinned_tables_info(pinned_tables);
+  catalog.CreateTableFunction(transaction, pinned_tables_info);
 }
 
 static void SetUsePinMemory(ClientContext& context, SetScope scope, Value& parameter)

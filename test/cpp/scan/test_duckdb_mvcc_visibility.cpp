@@ -653,3 +653,46 @@ TEST_CASE("mvcc visibility: fused native-read check tracks foreign commits and u
           native_read_mvcc_state::exact);
   exec_ok(*env.con, "ROLLBACK");
 }
+
+TEST_CASE("count_invisible_pinned_rows matches the deleted-row count",
+          "[duckdb_mvcc_visibility][scan]")
+{
+  vis_test_db env;
+  exec_ok(*env.con, "CREATE TABLE t AS SELECT range::INTEGER AS k FROM range(300000)");
+  exec_ok(*env.con, "CHECKPOINT");
+
+  SECTION("a clean prefix has zero invisible rows without touching version locks")
+  {
+    exec_ok(*env.con, "BEGIN TRANSACTION");
+    auto& storage = resolve_storage(*env.con, "t");
+    auto metadata = make_metadata(*env.con, storage, /*rgs_per_chunk=*/1);
+    auto plan     = capture_mvcc_visibility_plan(storage, *env.con->context, metadata);
+    REQUIRE(count_invisible_pinned_rows(plan) == 0);
+    exec_ok(*env.con, "ROLLBACK");
+  }
+
+  SECTION("deletes inside the prefix are counted exactly")
+  {
+    exec_ok(*env.con, "DELETE FROM t WHERE k IN (0, 5, 122880, 200000, 299999)");
+    exec_ok(*env.con, "BEGIN TRANSACTION");
+    auto& storage = resolve_storage(*env.con, "t");
+    auto metadata = make_metadata(*env.con, storage, /*rgs_per_chunk=*/2);
+    auto plan     = capture_mvcc_visibility_plan(storage, *env.con->context, metadata);
+    REQUIRE(count_invisible_pinned_rows(plan) == 5);
+
+    // The count equals the mask-fill's dropped bits over the same plan.
+    std::size_t dropped     = 0;
+    std::size_t chunk_start = 0;
+    for (std::size_t c = 0; c < plan.mvcc_row_groups.size(); ++c) {
+      auto const rows = metadata.base_row_count_per_chunk[c];
+      std::vector<std::uint32_t> words((rows + 31) / 32, 0u);
+      fill_keep_mask_for_row_groups(plan.mvcc_row_groups[c], plan.transaction, words);
+      for (std::size_t r = 0; r < rows; ++r) {
+        if (!bit_at(words, r)) { ++dropped; }
+      }
+      chunk_start += rows;
+    }
+    REQUIRE(dropped == 5);
+    exec_ok(*env.con, "ROLLBACK");
+  }
+}
