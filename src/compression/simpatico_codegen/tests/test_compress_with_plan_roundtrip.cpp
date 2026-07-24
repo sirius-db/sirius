@@ -6,6 +6,7 @@
 #include "test_utils.hpp"
 
 #include <cudf/copying.hpp>
+#include <cudf/null_mask.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/types.hpp>
 #include <cudf/utilities/traits.hpp>
@@ -733,7 +734,7 @@ int main()
     }
 
     {
-      // Phase-2 fused->fused: for.references -> bitpack.
+      // Fused->fused: for.references -> bitpack.
       // FOR fuses deltas with bitpack inline (one kernel); the per-chunk
       // reference minimums are bitpacked separately in a second kernel.
       // int32, int64.
@@ -762,7 +763,7 @@ int main()
     }
 
     {
-      // Phase-2 fused->fused: delta -> for -> references -> bitpack.
+      // Fused->fused: delta -> for -> references -> bitpack.
       // Delta fuses with FOR fuses with bitpack (deltas) inline; FOR's
       // reference channel is bitpacked by a second independent kernel.
       auto t32 = make_int32_table(2, 2048, 257);
@@ -874,8 +875,11 @@ int main()
     }
 
     {
-      // Sliced STRING views: str_split must normalize a head slice (whose
-      // offsets child still spans the parent) and a non-zero-offset slice.
+      // Sliced STRING views. A head slice has offset 0, so it compresses like a
+      // normal (truncated) column and must roundtrip. A non-zero-offset slice is
+      // rejected up front by the API guard — leaf operators read through
+      // column_view::head() (offset-unaware), so an offset view would compress
+      // the wrong elements; the caller must compact first.
       auto stream = cudf::get_default_stream();
       auto full   = make_strings_column({"aa", "bb", "cc", "dd", "ee", "ff", "gg", "hh"},
                                         {true, false, true, true, true, true, true, false},
@@ -883,9 +887,17 @@ int main()
       auto head   = cudf::slice(full->view(), {0, 5});
       roundtrip_once(
         cudf::table_view({head[0]}), "input -> str_split\n", 1, "str_split_head_slice");
-      auto tail = cudf::slice(full->view(), {3, 8});
-      roundtrip_once(
-        cudf::table_view({tail[0]}), "input -> str_split\n", 1, "str_split_offset_slice");
+      auto tail  = cudf::slice(full->view(), {3, 8});
+      bool threw = false;
+      try {
+        compress_with_plan(cudf::table_view({tail[0]}),
+                           "input -> str_split\n",
+                           stream,
+                           rmm::mr::get_current_device_resource_ref());
+      } catch (std::exception const&) {
+        threw = true;
+      }
+      expect(threw, "non-zero-offset slice must be rejected by the API guard");
     }
 
     {
@@ -912,6 +924,42 @@ int main()
         threw = true;
       }
       expect(threw, "nullable decomposed dictionary without null_mask must throw");
+    }
+
+    {
+      // Nullable NUMERIC input through a non-null-aware op must be REJECTED,
+      // not silently stripped of validity. No numeric op carries a null_mask
+      // channel, so both the fused codegen path (delta -> bitpack) and the
+      // generic byte codecs (ans) must fail closed rather than decode garbage
+      // under the null slots.
+      auto stream = cudf::get_default_stream();
+      auto mr     = rmm::mr::get_current_device_resource_ref();
+      // Build a nullable INT32 column (offset 0, one null at row 5) directly so
+      // the input carries a real validity bitmask.
+      auto col = cudf::make_numeric_column(
+        cudf::data_type{cudf::type_id::INT32}, 64, cudf::mask_state::ALL_VALID, stream, mr);
+      std::vector<std::int32_t> host(64);
+      for (int r = 0; r < 64; ++r)
+        host[static_cast<std::size_t>(r)] = static_cast<std::int32_t>((r * 17 + 11) % 1000);
+      if (cudaMemcpy(col->mutable_view().head<std::int32_t>(),
+                     host.data(),
+                     host.size() * sizeof(std::int32_t),
+                     cudaMemcpyHostToDevice) != cudaSuccess)
+        throw std::runtime_error("nullable numeric guard: cudaMemcpy failed");
+      cudf::set_null_mask(col->mutable_view().null_mask(), 5, 6, /*valid=*/false, stream);
+      col->set_null_count(1);
+      cudf::table_view nullable_tbl({col->view()});
+      expect(col->null_count() == 1, "nullable numeric guard: input has one null");
+      for (char const* plan :
+           {"input -> delta -> differences\n", "input -> ans\n", "input -> bitpack\n"}) {
+        bool threw = false;
+        try {
+          compress_with_plan(nullable_tbl, plan, stream, mr);
+        } catch (std::exception const&) {
+          threw = true;
+        }
+        expect(threw, "nullable numeric input through a non-null-aware op must throw");
+      }
     }
 
     {

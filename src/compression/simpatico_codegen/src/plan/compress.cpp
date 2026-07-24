@@ -106,6 +106,14 @@ bool is_keys_chars_path(std::string const& path)
   return path.find("keys_chars") != std::string::npos;
 }
 
+// Ops that carry a nullable input's validity through to decode (via a null_mask
+// channel their representation marks required(), see representation.hpp). Every
+// other compressor operates on the packed data buffer only and would silently
+// drop the validity bitmask, surfacing garbage under the null slots on decode.
+// The walk fails closed for those (see emit_path) until numeric ops learn to
+// route validity themselves.
+bool op_handles_nulls(std::string const& op) { return op == "str_split" || op == "dictionary"; }
+
 std::unique_ptr<cudf::column> copy_identity_leaf(cudf::column_view const& view,
                                                  std::string const& path,
                                                  rmm::cuda_stream_view stream,
@@ -228,6 +236,23 @@ void CompressWalk::emit_path(ValueId v)
     if (columns.find(src) == columns.end()) return;
   }
   visited[n] = true;
+
+  // Fail closed on nullable input to an op that can't carry validity, rather
+  // than silently dropping the null mask. Intermediate channels are null-free by
+  // construction, so checking each op's input view is sufficient; only the root
+  // leaf column can legitimately carry nulls.
+  if (!op_handles_nulls(node.op)) {
+    for (auto const& src : node.input_sources) {
+      auto const src_it = columns.find(src);
+      if (src_it != columns.end() && src_it->second.null_count() > 0) {
+        set_error("compressor '" + node.op +
+                  "' does not support nullable input (validity would be dropped); "
+                  "route the column through a null-aware op (str_split/dictionary) "
+                  "or drop nulls upstream");
+        return;
+      }
+    }
+  }
 
   if (node.input_sources.size() > 1) {
     emit_bitjoin_node(n);

@@ -61,7 +61,7 @@ class plan_register {
    */
   [[nodiscard]] std::optional<std::string> resolve_table_plan(const std::string& table_name) const;
 
-  // ── Per-column entries (used by Phase 4 explore / manual overrides) ─────
+  // ── Per-column entries (used by explore / manual overrides) ─────
 
   /// Register (or overwrite) a single-column plan for a specific (table, column) pair.
   void set_plan(const std::string& table_name,

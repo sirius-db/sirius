@@ -2,6 +2,7 @@
 #include "codegen/jit/nvrtc_compiler.hpp"
 #include "codegen/plan/leaf_desc.hpp"
 #include "codegen/plan/representation.hpp"
+#include "test_utils.hpp"
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/table/table.hpp>
@@ -43,18 +44,9 @@ int main()
   }
   try {
     constexpr int num_rows = 4096;
-    std::vector<int32_t> host(num_rows);
-    for (int i = 0; i < num_rows; ++i)
-      host[i] = static_cast<int32_t>(i % 1000);
-    auto col = cudf::make_numeric_column(
-      cudf::data_type{cudf::type_id::INT32}, num_rows, cudf::mask_state::UNALLOCATED);
-    cudaMemcpy(col->mutable_view().head<int32_t>(),
-               host.data(),
-               host.size() * sizeof(int32_t),
-               cudaMemcpyHostToDevice);
-    std::vector<std::unique_ptr<cudf::column>> cols;
-    cols.push_back(std::move(col));
-    auto table = std::make_unique<cudf::table>(std::move(cols));
+    // Single INT32 column of small-range values (shared factory); the leaf
+    // structure asserted below is independent of the exact payload.
+    auto table = make_int32_table(/*num_cols=*/1, num_rows, /*seed=*/0);
 
     std::string dsl =
       "input -> delta -> differences\n"

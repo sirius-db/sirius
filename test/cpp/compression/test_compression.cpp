@@ -206,6 +206,53 @@ fs::path make_comp_tmp(const std::string& tag)
   return fs::temp_directory_path() / ("sirius-comp-test-" + tag + "-" + std::to_string(::getpid()));
 }
 
+// Skip guard shared by every GPU test: emits the standard warning and returns
+// true when no GPU is present, so callers can write `if (no_gpu()) return;`.
+bool no_gpu()
+{
+  if (has_gpu()) { return false; }
+  WARN("Compression test requires a GPU — skipping");
+  return true;
+}
+
+// A fresh, empty tmp dir tagged @p tag with a single-GPU compression yaml
+// written into it. The caller owns cleanup (fs::remove_all(dir)).
+struct comp_env_paths {
+  fs::path dir;
+  fs::path yaml;
+};
+
+comp_env_paths make_comp_env(const std::string& tag)
+{
+  auto dir = make_comp_tmp(tag);
+  fs::remove_all(dir);
+  fs::create_directories(dir);
+  auto yaml = dir / "comp.yaml";
+  write_compression_yaml(yaml);
+  return {dir, yaml};
+}
+
+// Assert that a completed query @p res succeeded, attaching the DuckDB error to
+// the failing assertion on error.
+void require_ok(const duckdb::unique_ptr<duckdb::MaterializedQueryResult>& res,
+                const std::string& what)
+{
+  REQUIRE(res);
+  if (res->HasError()) { UNSCOPED_INFO(what << " error: " << res->GetError()); }
+  REQUIRE_FALSE(res->HasError());
+}
+
+// Run @p sql on @p con, assert it succeeded, and return the result for
+// inspection.
+duckdb::unique_ptr<duckdb::MaterializedQueryResult> run_ok(duckdb::Connection& con,
+                                                           const std::string& sql,
+                                                           const std::string& what)
+{
+  auto res = con.Query(sql);
+  require_ok(res, what);
+  return res;
+}
+
 }  // namespace
 
 namespace {
@@ -225,16 +272,9 @@ void write_plan_file(const fs::path& plan_dir,
 TEST_CASE("pin_table compression - result equality vs uncompressed pin",
           "[compression][pin_table][isolated_context]")
 {
-  if (!has_gpu()) {
-    WARN("Compression test requires a GPU — skipping");
-    return;
-  }
+  if (no_gpu()) { return; }
 
-  auto tmp = make_comp_tmp("eq");
-  fs::remove_all(tmp);
-  fs::create_directories(tmp);
-  auto yaml_path = tmp / "comp.yaml";
-  write_compression_yaml(yaml_path);
+  auto [tmp, yaml_path] = make_comp_env("eq");
 
   // SELECT range AS k, range * 3 AS v FROM range(10000):
   //   SUM(k) = 9999*10000/2 = 49995000
@@ -247,33 +287,28 @@ TEST_CASE("pin_table compression - result equality vs uncompressed pin",
 
   auto glob = sirius::test::mgpu::parquet_glob(tmp);
 
-  REQUIRE_FALSE(con.Query("SET pin_table_compression = true;")->HasError());
-  REQUIRE_FALSE(con.Query("SET pin_table_compression_min_batch_size_bytes = 0;")->HasError());
+  run_ok(con, "SET pin_table_compression = true;", "set compression");
+  run_ok(con, "SET pin_table_compression_min_batch_size_bytes = 0;", "set min_batch");
 
   // Write a plan file for the table that matches the parquet glob name
   auto plan_dir = tmp / "plans";
   write_plan_file(
     plan_dir, "t_comp", "input -> delta -> differences\n---\ninput -> delta -> differences\n");
-  REQUIRE_FALSE(
-    con.Query("SET pin_table_input_compression_plan_dir = '" + plan_dir.string() + "';")
-      ->HasError());
+  run_ok(
+    con, "SET pin_table_input_compression_plan_dir = '" + plan_dir.string() + "';", "set plan_dir");
 
   auto pin_comp = con.Query("CALL pin_table('" + glob + "', tier='host', name='t_comp');");
-  REQUIRE(pin_comp);
-  if (pin_comp->HasError()) { UNSCOPED_INFO("pin_comp error: " << pin_comp->GetError()); }
-  REQUIRE_FALSE(pin_comp->HasError());
+  require_ok(pin_comp, "pin");
 
   // Query via gpu_execution so Sirius serves the result from the compressed cache.
   const std::string select_sql = "SELECT SUM(k), SUM(v) FROM read_parquet('" + glob + "')";
   auto sum_comp                = con.Query("CALL gpu_execution(\"" + select_sql + "\");");
-  REQUIRE(sum_comp);
-  if (sum_comp->HasError()) { UNSCOPED_INFO("sum_comp error: " << sum_comp->GetError()); }
-  REQUIRE_FALSE(sum_comp->HasError());
+  require_ok(sum_comp, "select");
   REQUIRE(sum_comp->RowCount() == 1);
   REQUIRE(sum_comp->GetValue(0, 0) == duckdb::Value::BIGINT(49995000LL));
   REQUIRE(sum_comp->GetValue(1, 0) == duckdb::Value::BIGINT(149985000LL));
 
-  REQUIRE_FALSE(con.Query("CALL unpin_table('t_comp');")->HasError());
+  run_ok(con, "CALL unpin_table('t_comp');", "unpin");
 
   fs::remove_all(tmp);
 }
@@ -281,16 +316,9 @@ TEST_CASE("pin_table compression - result equality vs uncompressed pin",
 TEST_CASE("pin_table compression - device tier result equality vs uncompressed pin",
           "[compression][pin_table][isolated_context]")
 {
-  if (!has_gpu()) {
-    WARN("Compression test requires a GPU — skipping");
-    return;
-  }
+  if (no_gpu()) { return; }
 
-  auto tmp = make_comp_tmp("eqdev");
-  fs::remove_all(tmp);
-  fs::create_directories(tmp);
-  auto yaml_path = tmp / "comp.yaml";
-  write_compression_yaml(yaml_path);
+  auto [tmp, yaml_path] = make_comp_env("eqdev");
 
   // Same surface as the host case: SUM(k)=49995000, SUM(v)=149985000.
   sirius::test::mgpu::generate_parquet_surface(
@@ -301,32 +329,27 @@ TEST_CASE("pin_table compression - device tier result equality vs uncompressed p
 
   auto glob = sirius::test::mgpu::parquet_glob(tmp);
 
-  REQUIRE_FALSE(con.Query("SET pin_table_compression = true;")->HasError());
-  REQUIRE_FALSE(con.Query("SET pin_table_compression_min_batch_size_bytes = 0;")->HasError());
+  run_ok(con, "SET pin_table_compression = true;", "set compression");
+  run_ok(con, "SET pin_table_compression_min_batch_size_bytes = 0;", "set min_batch");
 
   auto plan_dir = tmp / "plans";
   write_plan_file(
     plan_dir, "t_comp_dev", "input -> delta -> differences\n---\ninput -> delta -> differences\n");
-  REQUIRE_FALSE(
-    con.Query("SET pin_table_input_compression_plan_dir = '" + plan_dir.string() + "';")
-      ->HasError());
+  run_ok(
+    con, "SET pin_table_input_compression_plan_dir = '" + plan_dir.string() + "';", "set plan_dir");
 
   // tier='gpu' → compressed payload kept in device memory, decompressed on query.
   auto pin_comp = con.Query("CALL pin_table('" + glob + "', tier='gpu', name='t_comp_dev');");
-  REQUIRE(pin_comp);
-  if (pin_comp->HasError()) { UNSCOPED_INFO("pin_comp error: " << pin_comp->GetError()); }
-  REQUIRE_FALSE(pin_comp->HasError());
+  require_ok(pin_comp, "pin");
 
   const std::string select_sql = "SELECT SUM(k), SUM(v) FROM read_parquet('" + glob + "')";
   auto sum_comp                = con.Query("CALL gpu_execution(\"" + select_sql + "\");");
-  REQUIRE(sum_comp);
-  if (sum_comp->HasError()) { UNSCOPED_INFO("sum_comp error: " << sum_comp->GetError()); }
-  REQUIRE_FALSE(sum_comp->HasError());
+  require_ok(sum_comp, "select");
   REQUIRE(sum_comp->RowCount() == 1);
   REQUIRE(sum_comp->GetValue(0, 0) == duckdb::Value::BIGINT(49995000LL));
   REQUIRE(sum_comp->GetValue(1, 0) == duckdb::Value::BIGINT(149985000LL));
 
-  REQUIRE_FALSE(con.Query("CALL unpin_table('t_comp_dev');")->HasError());
+  run_ok(con, "CALL unpin_table('t_comp_dev');", "unpin");
 
   fs::remove_all(tmp);
 }
@@ -334,16 +357,9 @@ TEST_CASE("pin_table compression - device tier result equality vs uncompressed p
 TEST_CASE("pin_table compression - device tier column-subset projection correctness",
           "[compression][pin_table][isolated_context]")
 {
-  if (!has_gpu()) {
-    WARN("Compression test requires a GPU — skipping");
-    return;
-  }
+  if (no_gpu()) { return; }
 
-  auto tmp = make_comp_tmp("projdev");
-  fs::remove_all(tmp);
-  fs::create_directories(tmp);
-  auto yaml_path = tmp / "comp.yaml";
-  write_compression_yaml(yaml_path);
+  auto [tmp, yaml_path] = make_comp_env("projdev");
 
   // SUM(b) = 2*(0+1+...+4999) = 24995000.
   sirius::test::mgpu::generate_parquet_surface(
@@ -354,32 +370,27 @@ TEST_CASE("pin_table compression - device tier column-subset projection correctn
 
   auto glob = sirius::test::mgpu::parquet_glob(tmp);
 
-  REQUIRE_FALSE(con.Query("SET pin_table_compression = true;")->HasError());
-  REQUIRE_FALSE(con.Query("SET pin_table_compression_min_batch_size_bytes = 0;")->HasError());
+  run_ok(con, "SET pin_table_compression = true;", "set compression");
+  run_ok(con, "SET pin_table_compression_min_batch_size_bytes = 0;", "set min_batch");
 
   auto plan_dir = tmp / "plans";
   write_plan_file(plan_dir,
                   "t_proj_dev",
                   "input -> delta -> differences\n---\ninput -> delta -> differences\n---\ninput "
                   "-> delta -> differences\n");
-  REQUIRE_FALSE(
-    con.Query("SET pin_table_input_compression_plan_dir = '" + plan_dir.string() + "';")
-      ->HasError());
+  run_ok(
+    con, "SET pin_table_input_compression_plan_dir = '" + plan_dir.string() + "';", "set plan_dir");
 
   auto pin = con.Query("CALL pin_table('" + glob + "', tier='gpu', name='t_proj_dev');");
-  REQUIRE(pin);
-  if (pin->HasError()) { UNSCOPED_INFO("pin error: " << pin->GetError()); }
-  REQUIRE_FALSE(pin->HasError());
+  require_ok(pin, "pin");
 
   const std::string select_sql = "SELECT SUM(b) FROM read_parquet('" + glob + "')";
   auto res                     = con.Query("CALL gpu_execution(\"" + select_sql + "\");");
-  REQUIRE(res);
-  if (res->HasError()) { UNSCOPED_INFO("select error: " << res->GetError()); }
-  REQUIRE_FALSE(res->HasError());
+  require_ok(res, "select");
   REQUIRE(res->RowCount() == 1);
   REQUIRE(res->GetValue(0, 0) == duckdb::Value::BIGINT(24995000LL));
 
-  REQUIRE_FALSE(con.Query("CALL unpin_table('t_proj_dev');")->HasError());
+  run_ok(con, "CALL unpin_table('t_proj_dev');", "unpin");
 
   fs::remove_all(tmp);
 }
@@ -387,16 +398,9 @@ TEST_CASE("pin_table compression - device tier column-subset projection correctn
 TEST_CASE("pin_table compression - column-subset projection correctness",
           "[compression][pin_table][isolated_context]")
 {
-  if (!has_gpu()) {
-    WARN("Compression test requires a GPU — skipping");
-    return;
-  }
+  if (no_gpu()) { return; }
 
-  auto tmp = make_comp_tmp("proj");
-  fs::remove_all(tmp);
-  fs::create_directories(tmp);
-  auto yaml_path = tmp / "comp.yaml";
-  write_compression_yaml(yaml_path);
+  auto [tmp, yaml_path] = make_comp_env("proj");
 
   // SELECT range AS a, range * 2 AS b, range * 3 AS c FROM range(5000):
   //   SUM(b) = 2 * (0+1+...+4999) = 2 * 4999*5000/2 = 24995000
@@ -408,34 +412,29 @@ TEST_CASE("pin_table compression - column-subset projection correctness",
 
   auto glob = sirius::test::mgpu::parquet_glob(tmp);
 
-  REQUIRE_FALSE(con.Query("SET pin_table_compression = true;")->HasError());
-  REQUIRE_FALSE(con.Query("SET pin_table_compression_min_batch_size_bytes = 0;")->HasError());
+  run_ok(con, "SET pin_table_compression = true;", "set compression");
+  run_ok(con, "SET pin_table_compression_min_batch_size_bytes = 0;", "set min_batch");
 
   auto plan_dir = tmp / "plans";
   write_plan_file(plan_dir,
                   "t_proj",
                   "input -> delta -> differences\n---\ninput -> delta -> differences\n---\ninput "
                   "-> delta -> differences\n");
-  REQUIRE_FALSE(
-    con.Query("SET pin_table_input_compression_plan_dir = '" + plan_dir.string() + "';")
-      ->HasError());
+  run_ok(
+    con, "SET pin_table_input_compression_plan_dir = '" + plan_dir.string() + "';", "set plan_dir");
 
   auto pin = con.Query("CALL pin_table('" + glob + "', tier='host', name='t_proj');");
-  REQUIRE(pin);
-  if (pin->HasError()) { UNSCOPED_INFO("pin error: " << pin->GetError()); }
-  REQUIRE_FALSE(pin->HasError());
+  require_ok(pin, "pin");
 
   // Project only column b; Sirius must decompress only that column.
   // SUM(b) = 2*(0+1+...+4999) = 2*4999*5000/2 = 24995000
   const std::string select_sql = "SELECT SUM(b) FROM read_parquet('" + glob + "')";
   auto res                     = con.Query("CALL gpu_execution(\"" + select_sql + "\");");
-  REQUIRE(res);
-  if (res->HasError()) { UNSCOPED_INFO("select error: " << res->GetError()); }
-  REQUIRE_FALSE(res->HasError());
+  require_ok(res, "select");
   REQUIRE(res->RowCount() == 1);
   REQUIRE(res->GetValue(0, 0) == duckdb::Value::BIGINT(24995000LL));
 
-  REQUIRE_FALSE(con.Query("CALL unpin_table('t_proj');")->HasError());
+  run_ok(con, "CALL unpin_table('t_proj');", "unpin");
 
   fs::remove_all(tmp);
 }
@@ -443,16 +442,9 @@ TEST_CASE("pin_table compression - column-subset projection correctness",
 TEST_CASE("pin_table compression - pinned column subset selects matching plan blocks",
           "[compression][pin_table][isolated_context]")
 {
-  if (!has_gpu()) {
-    WARN("Compression test requires a GPU — skipping");
-    return;
-  }
+  if (no_gpu()) { return; }
 
-  auto tmp = make_comp_tmp("subset");
-  fs::remove_all(tmp);
-  fs::create_directories(tmp);
-  auto yaml_path = tmp / "comp.yaml";
-  write_compression_yaml(yaml_path);
+  auto [tmp, yaml_path] = make_comp_env("subset");
 
   // Four full-table columns; the plan file has one block per column (schema order).
   //   SUM(a) = 0+1+...+4999               = 12497500
@@ -465,8 +457,8 @@ TEST_CASE("pin_table compression - pinned column subset selects matching plan bl
 
   auto glob = sirius::test::mgpu::parquet_glob(tmp);
 
-  REQUIRE_FALSE(con.Query("SET pin_table_compression = true;")->HasError());
-  REQUIRE_FALSE(con.Query("SET pin_table_compression_min_batch_size_bytes = 0;")->HasError());
+  run_ok(con, "SET pin_table_compression = true;", "set compression");
+  run_ok(con, "SET pin_table_compression_min_batch_size_bytes = 0;", "set min_batch");
 
   // Distinct op per column so a wrong block↔column mapping would compress with the
   // wrong plan; all ops are valid for INT64 so a correct mapping round-trips cleanly.
@@ -477,28 +469,23 @@ TEST_CASE("pin_table compression - pinned column subset selects matching plan bl
                   "input -> rle -> runs, values\n---\n"
                   "input -> delta -> differences\n---\n"
                   "input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n");
-  REQUIRE_FALSE(
-    con.Query("SET pin_table_input_compression_plan_dir = '" + plan_dir.string() + "';")
-      ->HasError());
+  run_ok(
+    con, "SET pin_table_input_compression_plan_dir = '" + plan_dir.string() + "';", "set plan_dir");
 
   // Pin a reordered subset [c, a] (full-table indices 2, 0) — exercises per-column
   // block selection (blocks 2 and 0, in that order).
   auto pin =
     con.Query("CALL pin_table('" + glob + "', tier='host', name='t_sub', cols=['c','a']);");
-  REQUIRE(pin);
-  if (pin->HasError()) { UNSCOPED_INFO("pin error: " << pin->GetError()); }
-  REQUIRE_FALSE(pin->HasError());
+  require_ok(pin, "pin");
 
   const std::string select_sql = "SELECT SUM(c), SUM(a) FROM read_parquet('" + glob + "')";
   auto res                     = con.Query("CALL gpu_execution(\"" + select_sql + "\");");
-  REQUIRE(res);
-  if (res->HasError()) { UNSCOPED_INFO("select error: " << res->GetError()); }
-  REQUIRE_FALSE(res->HasError());
+  require_ok(res, "select");
   REQUIRE(res->RowCount() == 1);
   REQUIRE(res->GetValue(0, 0) == duckdb::Value::BIGINT(37492500LL));
   REQUIRE(res->GetValue(1, 0) == duckdb::Value::BIGINT(12497500LL));
 
-  REQUIRE_FALSE(con.Query("CALL unpin_table('t_sub');")->HasError());
+  run_ok(con, "CALL unpin_table('t_sub');", "unpin");
 
   fs::remove_all(tmp);
 }
@@ -506,16 +493,9 @@ TEST_CASE("pin_table compression - pinned column subset selects matching plan bl
 TEST_CASE("pin_table compression - decimal columns round-trip with scale restored",
           "[compression][pin_table][isolated_context]")
 {
-  if (!has_gpu()) {
-    WARN("Compression test requires a GPU — skipping");
-    return;
-  }
+  if (no_gpu()) { return; }
 
-  auto tmp = make_comp_tmp("decimal");
-  fs::remove_all(tmp);
-  fs::create_directories(tmp);
-  auto yaml_path = tmp / "comp.yaml";
-  write_compression_yaml(yaml_path);
+  auto [tmp, yaml_path] = make_comp_env("decimal");
 
   // A DECIMAL(15,2) column is physically INT64 (unscaled) + scale; the integer
   // codecs compress that storage losslessly and the scale is restored on decode.
@@ -529,8 +509,8 @@ TEST_CASE("pin_table compression - decimal columns round-trip with scale restore
 
   auto glob = sirius::test::mgpu::parquet_glob(tmp);
 
-  REQUIRE_FALSE(con.Query("SET pin_table_compression = true;")->HasError());
-  REQUIRE_FALSE(con.Query("SET pin_table_compression_min_batch_size_bytes = 0;")->HasError());
+  run_ok(con, "SET pin_table_compression = true;", "set compression");
+  run_ok(con, "SET pin_table_compression_min_batch_size_bytes = 0;", "set min_batch");
 
   // Integer codegen ops — valid for INT64 and, via storage reinterpret, for DECIMAL64.
   auto plan_dir = tmp / "plans";
@@ -538,26 +518,21 @@ TEST_CASE("pin_table compression - decimal columns round-trip with scale restore
                   "t_dec",
                   "input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n---\n"
                   "input -> delta -> differences\n");
-  REQUIRE_FALSE(
-    con.Query("SET pin_table_input_compression_plan_dir = '" + plan_dir.string() + "';")
-      ->HasError());
+  run_ok(
+    con, "SET pin_table_input_compression_plan_dir = '" + plan_dir.string() + "';", "set plan_dir");
 
   auto pin = con.Query("CALL pin_table('" + glob + "', tier='host', name='t_dec');");
-  REQUIRE(pin);
-  if (pin->HasError()) { UNSCOPED_INFO("pin error: " << pin->GetError()); }
-  REQUIRE_FALSE(pin->HasError());
+  require_ok(pin, "pin");
 
   const std::string select_sql = "SELECT SUM(k), SUM(d) FROM read_parquet('" + glob + "')";
   auto res                     = con.Query("CALL gpu_execution(\"" + select_sql + "\");");
-  REQUIRE(res);
-  if (res->HasError()) { UNSCOPED_INFO("select error: " << res->GetError()); }
-  REQUIRE_FALSE(res->HasError());
+  require_ok(res, "select");
   REQUIRE(res->RowCount() == 1);
   REQUIRE(res->GetValue(0, 0) == duckdb::Value::BIGINT(12497500LL));
   // The decimal sum must come back with the correct scale (61875.00, not 6187500).
   REQUIRE(res->GetValue(1, 0).ToString() == "61875.00");
 
-  REQUIRE_FALSE(con.Query("CALL unpin_table('t_dec');")->HasError());
+  run_ok(con, "CALL unpin_table('t_dec');", "unpin");
 
   fs::remove_all(tmp);
 }
@@ -565,16 +540,9 @@ TEST_CASE("pin_table compression - decimal columns round-trip with scale restore
 TEST_CASE("pin_table compression - fallback when no plan file for table",
           "[compression][pin_table][isolated_context]")
 {
-  if (!has_gpu()) {
-    WARN("Compression test requires a GPU — skipping");
-    return;
-  }
+  if (no_gpu()) { return; }
 
-  auto tmp = make_comp_tmp("noplan");
-  fs::remove_all(tmp);
-  fs::create_directories(tmp);
-  auto yaml_path = tmp / "comp.yaml";
-  write_compression_yaml(yaml_path);
+  auto [tmp, yaml_path] = make_comp_env("noplan");
 
   // Plan dir exists but has no file matching 't_noplan' — must pin uncompressed.
   // SUM(k) = 0+1+...+999 = 999*1000/2 = 499500
@@ -588,25 +556,20 @@ TEST_CASE("pin_table compression - fallback when no plan file for table",
 
   auto glob = sirius::test::mgpu::parquet_glob(tmp);
 
-  REQUIRE_FALSE(con.Query("SET pin_table_compression = true;")->HasError());
-  REQUIRE_FALSE(
-    con.Query("SET pin_table_input_compression_plan_dir = '" + plan_dir.string() + "';")
-      ->HasError());
+  run_ok(con, "SET pin_table_compression = true;", "set compression");
+  run_ok(
+    con, "SET pin_table_input_compression_plan_dir = '" + plan_dir.string() + "';", "set plan_dir");
 
   auto pin = con.Query("CALL pin_table('" + glob + "', tier='host', name='t_noplan');");
-  REQUIRE(pin);
-  if (pin->HasError()) { UNSCOPED_INFO("pin error: " << pin->GetError()); }
-  REQUIRE_FALSE(pin->HasError());
+  require_ok(pin, "pin");
 
   // Must still scan correctly via fallback raw host rep
   const std::string select_sql = "SELECT SUM(k) FROM read_parquet('" + glob + "')";
   auto res                     = con.Query("CALL gpu_execution(\"" + select_sql + "\");");
-  REQUIRE(res);
-  if (res->HasError()) { UNSCOPED_INFO("select error: " << res->GetError()); }
-  REQUIRE_FALSE(res->HasError());
+  require_ok(res, "select");
   REQUIRE(res->GetValue(0, 0) == duckdb::Value::BIGINT(499500LL));
 
-  REQUIRE_FALSE(con.Query("CALL unpin_table('t_noplan');")->HasError());
+  run_ok(con, "CALL unpin_table('t_noplan');", "unpin");
 
   fs::remove_all(tmp);
 }
@@ -614,16 +577,9 @@ TEST_CASE("pin_table compression - fallback when no plan file for table",
 TEST_CASE("pin_table compression - fallback when batch is below min_batch_size_bytes threshold",
           "[compression][pin_table][isolated_context]")
 {
-  if (!has_gpu()) {
-    WARN("Compression test requires a GPU — skipping");
-    return;
-  }
+  if (no_gpu()) { return; }
 
-  auto tmp = make_comp_tmp("threshold");
-  fs::remove_all(tmp);
-  fs::create_directories(tmp);
-  auto yaml_path = tmp / "comp.yaml";
-  write_compression_yaml(yaml_path);
+  auto [tmp, yaml_path] = make_comp_env("threshold");
 
   // Plan file exists but threshold is far above the tiny chunk size — forces
   // fallback to uncompressed host rep.
@@ -639,27 +595,21 @@ TEST_CASE("pin_table compression - fallback when batch is below min_batch_size_b
 
   auto glob = sirius::test::mgpu::parquet_glob(tmp);
 
-  REQUIRE_FALSE(con.Query("SET pin_table_compression = true;")->HasError());
-  REQUIRE_FALSE(
-    con.Query("SET pin_table_input_compression_plan_dir = '" + plan_dir.string() + "';")
-      ->HasError());
+  run_ok(con, "SET pin_table_compression = true;", "set compression");
+  run_ok(
+    con, "SET pin_table_input_compression_plan_dir = '" + plan_dir.string() + "';", "set plan_dir");
   // Threshold (1 GiB) far above the tiny chunk (~800 B) — forces fallback
-  REQUIRE_FALSE(
-    con.Query("SET pin_table_compression_min_batch_size_bytes = 1000000000;")->HasError());
+  run_ok(con, "SET pin_table_compression_min_batch_size_bytes = 1000000000;", "set min_batch");
 
   auto pin = con.Query("CALL pin_table('" + glob + "', tier='host', name='t_threshold');");
-  REQUIRE(pin);
-  if (pin->HasError()) { UNSCOPED_INFO("pin error: " << pin->GetError()); }
-  REQUIRE_FALSE(pin->HasError());
+  require_ok(pin, "pin");
 
   const std::string select_sql = "SELECT SUM(k) FROM read_parquet('" + glob + "')";
   auto res                     = con.Query("CALL gpu_execution(\"" + select_sql + "\");");
-  REQUIRE(res);
-  if (res->HasError()) { UNSCOPED_INFO("select error: " << res->GetError()); }
-  REQUIRE_FALSE(res->HasError());
+  require_ok(res, "select");
   REQUIRE(res->GetValue(0, 0) == duckdb::Value::BIGINT(4950LL));
 
-  REQUIRE_FALSE(con.Query("CALL unpin_table('t_threshold');")->HasError());
+  run_ok(con, "CALL unpin_table('t_threshold');", "unpin");
 
   fs::remove_all(tmp);
 }
@@ -667,16 +617,9 @@ TEST_CASE("pin_table compression - fallback when batch is below min_batch_size_b
 TEST_CASE("pin_table compression - fallback when compression saves too little",
           "[compression][pin_table][isolated_context]")
 {
-  if (!has_gpu()) {
-    WARN("Compression test requires a GPU — skipping");
-    return;
-  }
+  if (no_gpu()) { return; }
 
-  auto tmp = make_comp_tmp("ratio");
-  fs::remove_all(tmp);
-  fs::create_directories(tmp);
-  auto yaml_path = tmp / "comp.yaml";
-  write_compression_yaml(yaml_path);
+  auto [tmp, yaml_path] = make_comp_env("ratio");
 
   // A well-compressing plan on well-compressing data, but an impossibly strict
   // max-compressed-fraction (1%) forces the compressed form to be discarded and
@@ -692,28 +635,23 @@ TEST_CASE("pin_table compression - fallback when compression saves too little",
 
   auto glob = sirius::test::mgpu::parquet_glob(tmp);
 
-  REQUIRE_FALSE(con.Query("SET pin_table_compression = true;")->HasError());
-  REQUIRE_FALSE(con.Query("SET pin_table_compression_min_batch_size_bytes = 0;")->HasError());
-  REQUIRE_FALSE(
-    con.Query("SET pin_table_input_compression_plan_dir = '" + plan_dir.string() + "';")
-      ->HasError());
+  run_ok(con, "SET pin_table_compression = true;", "set compression");
+  run_ok(con, "SET pin_table_compression_min_batch_size_bytes = 0;", "set min_batch");
+  run_ok(
+    con, "SET pin_table_input_compression_plan_dir = '" + plan_dir.string() + "';", "set plan_dir");
   // Require a 99% saving — no realistic plan meets this, so the compressed form
   // is discarded and the batch is pinned uncompressed.
-  REQUIRE_FALSE(con.Query("SET pin_table_compression_max_compressed_fraction = 0.01;")->HasError());
+  run_ok(con, "SET pin_table_compression_max_compressed_fraction = 0.01;", "set max_fraction");
 
   auto pin = con.Query("CALL pin_table('" + glob + "', tier='host', name='t_ratio');");
-  REQUIRE(pin);
-  if (pin->HasError()) { UNSCOPED_INFO("pin error: " << pin->GetError()); }
-  REQUIRE_FALSE(pin->HasError());
+  require_ok(pin, "pin");
 
   const std::string select_sql = "SELECT SUM(k) FROM read_parquet('" + glob + "')";
   auto res                     = con.Query("CALL gpu_execution(\"" + select_sql + "\");");
-  REQUIRE(res);
-  if (res->HasError()) { UNSCOPED_INFO("select error: " << res->GetError()); }
-  REQUIRE_FALSE(res->HasError());
+  require_ok(res, "select");
   REQUIRE(res->GetValue(0, 0) == duckdb::Value::BIGINT(499500LL));
 
-  REQUIRE_FALSE(con.Query("CALL unpin_table('t_ratio');")->HasError());
+  run_ok(con, "CALL unpin_table('t_ratio');", "unpin");
 
   fs::remove_all(tmp);
 }
