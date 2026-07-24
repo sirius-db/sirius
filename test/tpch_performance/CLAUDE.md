@@ -325,9 +325,11 @@ pixi run python test/tpch_performance/tpch_power_throughput.py \
     --sf 1 --mode power --no-baseline-pass --no-validation
 ```
 
-Key flags: `--mode power|throughput|both`, `--streams N`, `--pin gpu|host|none` (`none` disables
-pinning and thereby GPU serving of refreshed tables — debug only), `--validation/--no-validation`,
-`--baseline-pass/--no-baseline-pass`, `--query-timeout <s>`, `--keep-scratch-db`, `--output`.
+Key flags: `--config <yaml>` (**required** unless `SIRIUS_CONFIG_FILE` is set — the runner refuses
+to start without an explicit config; there is no default path), `--mode power|throughput|both`,
+`--streams N`, `--pin gpu|host|none` (`none` disables pinning and thereby GPU serving of refreshed
+tables — debug only), `--validation/--no-validation`, `--baseline-pass/--no-baseline-pass`,
+`--query-timeout <s>`, `--keep-scratch-db`, `--output`.
 
 Output (under `test/tpch_performance/output/tpch_power_<ts>_sf<SF>_s<N>/`): `metrics.json`
 (all metrics + per-query/per-stream times + validation verdicts), `timings.csv`

@@ -602,8 +602,8 @@ def parse_args():
         "--config",
         type=str,
         default=os.environ.get("SIRIUS_CONFIG_FILE", ""),
-        help="Sirius config YAML (default: $SIRIUS_CONFIG_FILE, else "
-        "test/cpp/integration/integration.yaml)",
+        help="Sirius config YAML (required; taken from $SIRIUS_CONFIG_FILE when "
+        "set — there is no built-in default path)",
     )
     p.add_argument("--output", type=str, default=None, help="Output root directory")
     p.add_argument(
@@ -657,9 +657,14 @@ def main():
         rf1_statements(args.refresh_dir, n)
         rf2_statements(args.refresh_dir, n)
 
-    config = (args.config or "").strip() or os.path.join(
-        REPO_ROOT, "test/cpp/integration/integration.yaml"
-    )
+    # No silent default: the config decides GPU/host memory sizing, so it must
+    # be an explicit choice (a stale config can fail extension init outright).
+    config = (args.config or "").strip()
+    if not config:
+        raise SystemExit(
+            "No Sirius config given: pass --config <yaml> or set SIRIUS_CONFIG_FILE "
+            "(e.g. test/cpp/integration/integration.yaml)."
+        )
     if not os.path.isfile(config):
         raise SystemExit(f"Sirius config not found: {config}")
     os.environ["SIRIUS_CONFIG_FILE"] = config

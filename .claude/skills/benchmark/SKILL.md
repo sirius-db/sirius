@@ -294,8 +294,10 @@ option) and ask for the rest. Mark sensible defaults "(Recommended)".
    `delete.*` sets. **ALWAYS ask where it lives before generating anything.** Only after the user
    confirms it doesn't exist, generate it with `generate_tpch_refresh.sh <SF> <num_sets>` (needs
    `num_sets >= streams + 1`). Confirm the directory holds at least `streams + 1` sets.
-3. **Config** (`--config` / `SIRIUS_CONFIG_FILE`) — the Sirius config YAML (required). Confirm the
-   path; do not guess.
+3. **Config** (`--config` / `SIRIUS_CONFIG_FILE`) — the Sirius config YAML. **Required — the
+   runner refuses to start without one (no default path). ALWAYS ask the user where the config
+   file lives**: never assume a path, and never treat an already-set `SIRIUS_CONFIG_FILE` env var
+   as the user's answer — present it as the recommended option and confirm it.
 4. **Scale factor** (`--sf`) — the SF of the dataset (also the metric's Size).
 
 **Round 2 — run shape**
