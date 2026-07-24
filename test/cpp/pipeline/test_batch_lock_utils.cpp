@@ -335,7 +335,6 @@ TEST_CASE("lock_or_prepare_batch cross-GPU does not block on concurrent readers"
 
 TEST_CASE("lock_or_prepare_batch host to GPU keeps move semantics", "[batch_lock_utils]")
 {
-  REQUIRE(false); // CI test: remove me
   batch_lock_utils_fixture f;
   REQUIRE(f.setup(1));
 
