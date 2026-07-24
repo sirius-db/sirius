@@ -26,6 +26,7 @@
 // never from source statistics); a further test proves zero-benefit pruning
 // stays observable on pinned-backed sidecars.
 
+#include "compressed_materialization_test_common.hpp"
 #include "sirius_context.hpp"
 
 #include <catch.hpp>
@@ -36,18 +37,16 @@
 #include <utils/sirius_test_env.hpp>
 #include <utils/transparent_execution_test_utils.hpp>
 
-#include <algorithm>
 #include <cstddef>
 #include <cstdint>
-#include <cstdlib>
 #include <filesystem>
-#include <fstream>
 #include <string>
 #include <string_view>
 #include <system_error>
-#include <vector>
 
 namespace fs = std::filesystem;
+
+using namespace sirius::test::compmat;
 
 namespace {
 
@@ -73,97 +72,31 @@ constexpr char const* kPayloadQuery =
   "SELECT k, v, d, d + CAST('0.00' AS DECIMAL(3,2)) AS d_copy "
   "FROM t WHERE k <= 150 ORDER BY k, v;";
 
-void require_ok(duckdb::unique_ptr<duckdb::MaterializedQueryResult> const& r, char const* what)
-{
-  REQUIRE(r);
-  if (r->HasError()) { UNSCOPED_INFO(what << " error: " << r->GetError()); }
-  REQUIRE_FALSE(r->HasError());
-}
+// Both exchange-related sizes stay large so this fixture never partitions; only the scan batch
+// size is small enough to split the file into per-row-group pin chunks.
+constexpr config_values kConfigValues{.scan_batch_bytes     = kBatchBytes,
+                                      .hash_partition_bytes = 100000000,
+                                      .concat_batch_bytes   = 100000000};
 
 // Write the fact rows [first, first + count) — one slice of the single value
 // recipe — so single-file and multi-part fixtures share byte-identical values
 // over the same row range.
 void generate_fact_parquet_part(fs::path const& path, std::int64_t first, std::int64_t count)
 {
-  setenv("SIRIUS_DISABLE", "1", 1);
-  {
-    duckdb::DuckDB gen_db(nullptr);
-    duckdb::Connection gen(gen_db);
-    auto r = gen.Query(
-      "COPY (SELECT (range * 7) % 301 AS k, (range * 11) % 297 AS v, "
-      "CAST(((range * 13) % 29000) / 100.0 AS DECIMAL(18,2)) AS d "
-      "FROM range(" +
-      std::to_string(first) + ", " + std::to_string(first + count) + ")) TO '" + path.string() +
-      "' (FORMAT PARQUET, ROW_GROUP_SIZE 2048);");
-    REQUIRE(r);
-    REQUIRE_FALSE(r->HasError());
-  }
-  unsetenv("SIRIUS_DISABLE");
+  generate_parquet(path,
+                   "SELECT (range * 7) % 301 AS k, (range * 11) % 297 AS v, "
+                   "CAST(((range * 13) % 29000) / 100.0 AS DECIMAL(18,2)) AS d "
+                   "FROM range(" +
+                     std::to_string(first) + ", " + std::to_string(first + count) + ")",
+                   2048);
 }
 
 void generate_fact_parquet(fs::path const& path) { generate_fact_parquet_part(path, 0, kFactRows); }
 
 void generate_dim_parquet(fs::path const& path)
 {
-  setenv("SIRIUS_DISABLE", "1", 1);
-  {
-    duckdb::DuckDB gen_db(nullptr);
-    duckdb::Connection gen(gen_db);
-    auto r =
-      gen.Query("COPY (SELECT (range * 7) % 301 AS k FROM range(" + std::to_string(kDimRows) +
-                ")) TO '" + path.string() + "' (FORMAT PARQUET, ROW_GROUP_SIZE 400);");
-    REQUIRE(r);
-    REQUIRE_FALSE(r->HasError());
-  }
-  unsetenv("SIRIUS_DISABLE");
-}
-
-void write_config(fs::path const& yaml_path)
-{
-  std::ofstream f(yaml_path);
-  f << "sirius:\n"
-       "  topology:\n"
-       "    num_gpus: 1\n"
-       "  memory:\n"
-       "    gpu:\n"
-       "      usage_limit_bytes: "
-    << (2ull << 30)
-    << "\n"
-       "      reservation_limit_fraction: 1.0\n"
-       "    host:\n"
-       "      capacity_bytes: 32000000000\n"
-       "      initial_number_pools: 10\n"
-       "      pool_size: 512\n"
-       "      block_size: 1048576\n"
-       "  executor:\n"
-       "    pipeline:\n"
-       "      num_threads: 4\n"
-       "    task_creator:\n"
-       "      num_threads: 2\n"
-       "    downgrade:\n"
-       "      num_threads: 1\n"
-       "      monitor_period: 10ms\n"
-       "  operator_params:\n"
-       "    scan_task_batch_size: "
-    << kBatchBytes
-    << "\n"
-       "    max_sort_partition_bytes: 0\n"
-       "    hash_partition_bytes: 100000000\n"
-       "    concat_batch_bytes: 100000000\n"
-       "    max_build_hash_table_bytes: 90000000\n";
-}
-
-void pause_shared_envs()
-{
-  if (sirius::test::g_shared_env && sirius::test::g_shared_env->is_active()) {
-    sirius::test::g_shared_env->pause();
-  }
-  if (sirius::test::g_integration_env && sirius::test::g_integration_env->is_active()) {
-    sirius::test::g_integration_env->pause();
-  }
-  if (sirius::test::g_integration_env_2gpu && sirius::test::g_integration_env_2gpu->is_active()) {
-    sirius::test::g_integration_env_2gpu->pause();
-  }
+  generate_parquet(
+    path, "SELECT (range * 7) % 301 AS k FROM range(" + std::to_string(kDimRows) + ")", 400);
 }
 
 sirius::scan_manager::pinned_entry const* find_entry(duckdb::SiriusContext& sirius_ctx,
@@ -187,48 +120,6 @@ std::size_t entry_chunk_count(sirius::scan_manager::pinned_entry const& e)
   return e.data_batches_by_column.empty() ? 0 : e.data_batches_by_column.begin()->second.size();
 }
 
-/// Run @p query on the GPU (a failure surfaces loudly: duckdb fallback is
-/// disabled by every test below), then on the CPU, and compare the two result
-/// sets as sorted stringified rows (the payload's ORDER BY has ties).
-void compare_gpu_vs_cpu(duckdb::Connection& con, std::string const& query)
-{
-  auto gpu_result = con.Query(query);
-  require_ok(gpu_result, "gpu query");
-
-  require_ok(con.Query("SET gpu_execution = false;"), "disable gpu");
-  auto cpu_result = con.Query(query);
-  require_ok(cpu_result, "cpu query");
-  require_ok(con.Query("SET gpu_execution = true;"), "re-enable gpu");
-
-  REQUIRE(gpu_result->ColumnCount() == cpu_result->ColumnCount());
-  REQUIRE(gpu_result->RowCount() == cpu_result->RowCount());
-
-  auto collect_rows = [](duckdb::MaterializedQueryResult& result) {
-    std::vector<std::vector<std::string>> rows;
-    for (duckdb::idx_t r = 0; r < result.RowCount(); r++) {
-      std::vector<std::string> row;
-      row.reserve(result.ColumnCount());
-      for (duckdb::idx_t c = 0; c < result.ColumnCount(); c++) {
-        row.push_back(result.GetValue(c, r).ToString());
-      }
-      rows.push_back(std::move(row));
-    }
-    std::sort(rows.begin(), rows.end());
-    return rows;
-  };
-  auto gpu_rows = collect_rows(*gpu_result);
-  auto cpu_rows = collect_rows(*cpu_result);
-  for (std::size_t r = 0; r < gpu_rows.size(); r++) {
-    for (std::size_t c = 0; c < gpu_rows[r].size(); c++) {
-      if (gpu_rows[r][c] != cpu_rows[r][c]) {
-        UNSCOPED_INFO("Row " << r << " Col " << c << " mismatch: GPU=[" << gpu_rows[r][c]
-                             << "] CPU=[" << cpu_rows[r][c] << "]");
-      }
-      REQUIRE(gpu_rows[r][c] == cpu_rows[r][c]);
-    }
-  }
-}
-
 }  // namespace
 
 // NB: no [integration]/[shared_context] tag — this TEST_CASE builds its own
@@ -248,7 +139,7 @@ TEST_CASE("gpu_execution - compressed materialization residency gate states end 
   generate_fact_parquet(parquet_path);
 
   auto yaml_path = tmp / "compmat_gate.yaml";
-  write_config(yaml_path);
+  write_config(yaml_path, kConfigValues);
   REQUIRE(fs::exists(yaml_path));
 
   {
@@ -393,7 +284,7 @@ TEST_CASE("gpu_execution - multi-file pinned-narrow serve installs the residency
   generate_fact_parquet_part(tmp / "multi" / "part1.parquet", kFactRows / 2, kFactRows / 2);
 
   auto yaml_path = tmp / "compmat_multi.yaml";
-  write_config(yaml_path);
+  write_config(yaml_path, kConfigValues);
   REQUIRE(fs::exists(yaml_path));
 
   {
@@ -473,7 +364,7 @@ TEST_CASE("gpu_execution - zero-benefit pruning stays discriminating on pinned-b
   generate_dim_parquet(dim_path);
 
   auto yaml_path = tmp / "compmat_prune.yaml";
-  write_config(yaml_path);
+  write_config(yaml_path, kConfigValues);
   REQUIRE(fs::exists(yaml_path));
 
   {

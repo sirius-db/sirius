@@ -65,6 +65,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -209,6 +210,22 @@ inline cudf::data_type get_cudf_type(const logical_type& t)
     default:
       throw duckdb::InvalidInputException("sirius::get_cudf_type: Unsupported type: %s",
                                           t.to_string());
+  }
+}
+
+/**
+ * @brief Native cuDF mapping of @p t, or nullopt when the logical type has no cuDF carrier.
+ *
+ * The optional-returning counterpart of `get_cudf_type` for callers that treat an unmappable type
+ * as a fallback signal rather than an error.
+ */
+[[nodiscard]] inline std::optional<cudf::data_type> try_get_cudf_type(
+  const logical_type& t) noexcept
+{
+  try {
+    return get_cudf_type(t);
+  } catch (duckdb::InvalidInputException const&) {
+    return std::nullopt;
   }
 }
 

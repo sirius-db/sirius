@@ -17,6 +17,8 @@
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/utilities/traits.hpp>
 
+#include <array>
+#include <cstddef>
 #include <limits>
 
 namespace sirius {
@@ -29,57 +31,16 @@ bool fits(__int128_t minimum, __int128_t maximum)
          maximum <= static_cast<__int128_t>(std::numeric_limits<T>::max());
 }
 
-std::optional<cudf::data_type> choose_signed(type_id id, const numeric_range& range)
+/// True when @p source and @p target are supported numeric carriers in the same family: integral
+/// carriers preserving signedness, or fixed-point carriers preserving their cuDF scale.
+bool same_numeric_carrier_family(cudf::data_type source, cudf::data_type target)
 {
-  if (range.domain != numeric_range_domain::SIGNED_INTEGER || range.minimum > range.maximum) {
-    return std::nullopt;
+  if (cudf::is_integral_not_bool(source) && cudf::is_integral_not_bool(target)) {
+    return (cudf::is_signed(source) && cudf::is_signed(target)) ||
+           (cudf::is_unsigned(source) && cudf::is_unsigned(target));
   }
-  if (fits<int8_t>(range.minimum, range.maximum)) { return cudf::data_type{cudf::type_id::INT8}; }
-  if ((id == type_id::INTEGER || id == type_id::BIGINT) &&
-      fits<int16_t>(range.minimum, range.maximum)) {
-    return cudf::data_type{cudf::type_id::INT16};
-  }
-  if (id == type_id::BIGINT && fits<int32_t>(range.minimum, range.maximum)) {
-    return cudf::data_type{cudf::type_id::INT32};
-  }
-  return std::nullopt;
-}
-
-std::optional<cudf::data_type> choose_unsigned(type_id id, const numeric_range& range)
-{
-  if (range.domain != numeric_range_domain::UNSIGNED_INTEGER || range.minimum < 0 ||
-      range.minimum > range.maximum) {
-    return std::nullopt;
-  }
-  if (fits<uint8_t>(range.minimum, range.maximum)) { return cudf::data_type{cudf::type_id::UINT8}; }
-  if ((id == type_id::UINTEGER || id == type_id::UBIGINT) &&
-      fits<uint16_t>(range.minimum, range.maximum)) {
-    return cudf::data_type{cudf::type_id::UINT16};
-  }
-  if (id == type_id::UBIGINT && fits<uint32_t>(range.minimum, range.maximum)) {
-    return cudf::data_type{cudf::type_id::UINT32};
-  }
-  return std::nullopt;
-}
-
-std::optional<cudf::data_type> choose_decimal(const logical_type& type, const numeric_range& range)
-{
-  if (range.domain != numeric_range_domain::DECIMAL || range.minimum > range.maximum ||
-      range.decimal_scale != type.decimal_scale()) {
-    return std::nullopt;
-  }
-
-  auto const precision = type.decimal_precision();
-  auto const scale     = -static_cast<int32_t>(type.decimal_scale());
-  if (precision > logical_type::decimal_max_precision_int32 &&
-      fits<int32_t>(range.minimum, range.maximum)) {
-    return cudf::data_type{cudf::type_id::DECIMAL32, scale};
-  }
-  if (precision > logical_type::decimal_max_precision_int64 &&
-      fits<int64_t>(range.minimum, range.maximum)) {
-    return cudf::data_type{cudf::type_id::DECIMAL64, scale};
-  }
-  return std::nullopt;
+  return cudf::is_fixed_point(source) && cudf::is_fixed_point(target) &&
+         source.scale() == target.scale();
 }
 
 template <typename T>
@@ -179,16 +140,6 @@ bool is_narrowable_numeric_type(const logical_type& type) noexcept
   }
 }
 
-bool same_numeric_carrier_family(cudf::data_type source, cudf::data_type target)
-{
-  if (cudf::is_integral_not_bool(source) && cudf::is_integral_not_bool(target)) {
-    return (cudf::is_signed(source) && cudf::is_signed(target)) ||
-           (cudf::is_unsigned(source) && cudf::is_unsigned(target));
-  }
-  return cudf::is_fixed_point(source) && cudf::is_fixed_point(target) &&
-         source.scale() == target.scale();
-}
-
 bool can_narrow_to(cudf::data_type source, cudf::data_type target)
 {
   return same_numeric_carrier_family(source, target) &&
@@ -249,16 +200,35 @@ std::optional<cudf::data_type> choose_narrow_physical_type(const logical_type& t
                                                            const numeric_range& range) noexcept
 {
   if (!is_narrowable_numeric_type(type)) { return std::nullopt; }
-  switch (type.id()) {
-    case type_id::SMALLINT:
-    case type_id::INTEGER:
-    case type_id::BIGINT: return choose_signed(type.id(), range);
-    case type_id::USMALLINT:
-    case type_id::UINTEGER:
-    case type_id::UBIGINT: return choose_unsigned(type.id(), range);
-    case type_id::DECIMAL: return choose_decimal(type, range);
-    default: return std::nullopt;
+  auto const native = try_get_cudf_type(type);
+  if (!native) { return std::nullopt; }
+
+  // Narrowest-first candidate carriers of the native carrier's family; `can_narrow_to` keeps only
+  // the strictly narrower ones and `numeric_range_fits` picks the first that holds the bounds.
+  std::array<cudf::data_type, 3> candidates;
+  std::size_t candidate_count = 0;
+  if (cudf::is_fixed_point(*native)) {
+    candidates      = {cudf::data_type{cudf::type_id::DECIMAL32, native->scale()},
+                       cudf::data_type{cudf::type_id::DECIMAL64, native->scale()}};
+    candidate_count = 2;
+  } else if (cudf::is_signed(*native)) {
+    candidates      = {cudf::data_type{cudf::type_id::INT8},
+                       cudf::data_type{cudf::type_id::INT16},
+                       cudf::data_type{cudf::type_id::INT32}};
+    candidate_count = 3;
+  } else {
+    candidates      = {cudf::data_type{cudf::type_id::UINT8},
+                       cudf::data_type{cudf::type_id::UINT16},
+                       cudf::data_type{cudf::type_id::UINT32}};
+    candidate_count = 3;
   }
+
+  for (std::size_t i = 0; i < candidate_count; ++i) {
+    if (can_narrow_to(*native, candidates[i]) && numeric_range_fits(candidates[i], range)) {
+      return candidates[i];
+    }
+  }
+  return std::nullopt;
 }
 
 std::optional<numeric_range> compute_exact_numeric_range(cudf::column_view const& column,

@@ -236,7 +236,10 @@ validity-mask bytes, and threads that figure through the split into the reservat
 the destination is unknowable (a pin without the type sidecar), the estimate falls back to the
 stored bytes multiplied by the named maximum numeric carrier expansion
 (`kMaxNumericCarrierExpansion`, currently 8) — the constant is the fallback bound, never the
-primary estimate. A narrow plan sidecar over a native cache reserves the working set plus the
+primary estimate. Known limitation: a table pinned with `enable_pinned_zone_map_pruning = false`
+drops the pin-time type sidecar, so its narrowed serves always take this fallback bound — a
+conservative degradation (over-reservation, never under) reachable only off the default
+configuration. A narrow plan sidecar over a native cache reserves the working set plus the
 stored bytes (a narrowing destination is bounded by its source). All arithmetic saturates. Filter
 masks and other working-set allocations are additive, and a resident input that needs no
 conversion uses the larger of its stored and working-set sizes.
@@ -325,45 +328,5 @@ guarantees). The join-dense queries drive the improvement over the pre-guard -10
 -31.0%, Q8 -28.7%, Q7 -26.1%, Q3 -24.3%, Q9 -22.4%); Q16 moves -6.3% via the group-key path.
 Run directories: `runs/2026-07-23_17-39-47` through `runs/2026-07-23_18-13-10`.
 
-### Measured SF50 result (2026-07-22, with residency gate, historical)
-
-This table predates the column-granular dynamic-filter guard and the group-key narrowing; the
-table above supersedes it. Using the same final binary for control and treatment, the sum of
-per-query medians for warm iterations 2–6 was:
-
-| Mode | Feature off | Feature on | Change |
-|---|---:|---:|---:|
-| Unpinned | 29.602 s | 29.741 s | +0.47% |
-| HOST-pinned | 10.506 s | 9.365 s | -10.86% |
-
-Lower is better. All runs validated 22/22 queries against the same stored DuckDB results. The
-unpinned row pools per-query medians over two off/on run pairs (ten warm iterations per config)
-because same-config run-to-run drift measured +2.25% that day — larger than either individual
-flag delta (+1.50%, +0.22%); the pooled +0.47% is within that noise, as the gate predicts
-(unpinned feature-on plans are structurally identical to feature-off plans). The run
-directories under `runs/` are `2026-07-22_21-54-46`, `2026-07-22_21-57-48`,
-`2026-07-22_22-06-09`, and `2026-07-22_22-09-15` (unpinned off/on, first and repeat pairs) and
-`2026-07-22_22-00-53` / `2026-07-22_22-02-58` (HOST-pinned off/on).
-
-### Measured SF50 result (2026-07-21, pre-residency-gate, historical)
-
-This table was measured **before** the residency gate landed; unpinned feature-on plan shapes
-have since changed, and the table above supersedes it. Using the same final binary for control
-and treatment, the sum of per-query medians for warm iterations 2–6 was:
-
-| Mode | Feature off | Feature on | Change |
-|---|---:|---:|---:|
-| Unpinned | 29.714 s | 30.604 s | +3.00% |
-| HOST-pinned | 10.465 s | 9.404 s | -10.14% |
-
-Lower is better. All four runs validated 22/22 queries against the same stored DuckDB results.
-The run directories are `2026-07-21_20-39-00_sf50_6iter`,
-`2026-07-21_20-44-05_sf50_6iter`, `2026-07-21_20-51-53_sf50_6iter`, and
-`2026-07-21_20-59-53_sf50_6iter` under `runs/`, in table order.
-
-## Historical prototype notes
-
-The repo-root [compressed-materialization-notes.md](../../compressed-materialization-notes.md) is
-historical input from a superseded offset-based prototype. Its offset transforms, key-equivalence
-design, code pointers, benchmark numbers, and validation claims do not describe or validate the
-carrier-width implementation documented here.
+Earlier measurement rounds (with their tables and run directories) are recorded in
+[docs/reviews/compressed-materialization-final-handoff.md](../reviews/compressed-materialization-final-handoff.md).

@@ -56,9 +56,8 @@ struct numeric_range {
 
 [[nodiscard]] bool is_narrowable_numeric_type(const logical_type& type) noexcept;
 
-/// Return true when @p source and @p target are supported numeric carriers in the same family.
-/// Integral carriers must preserve signedness; fixed-point carriers must preserve their cuDF scale.
-[[nodiscard]] bool same_numeric_carrier_family(cudf::data_type source, cudf::data_type target);
+// A carrier family is a set of supported numeric carriers whose conversions preserve integral
+// signedness or fixed-point cuDF scale; narrowing and restoring never cross families.
 
 /// Return true when converting @p source to @p target is a strict same-family width reduction.
 [[nodiscard]] bool can_narrow_to(cudf::data_type source, cudf::data_type target);
@@ -67,7 +66,8 @@ struct numeric_range {
 [[nodiscard]] bool can_restore_to(cudf::data_type source, cudf::data_type target);
 
 /// Return whether the exact bounds fit in @p target without changing numeric family or decimal
-/// scale. This is used to verify statistics-derived narrowing decisions against materialized data.
+/// scale. This is the single fitting authority: `choose_narrow_physical_type` selects carriers
+/// with it and the scan verifies planned downcasts against materialized data with it.
 [[nodiscard]] bool numeric_range_fits(cudf::data_type target, const numeric_range& range) noexcept;
 
 /// Return the narrowest exact cuDF carrier that is strictly smaller than the logical type's native

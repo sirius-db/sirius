@@ -65,22 +65,10 @@ duckdb::vector<std::unique_ptr<sirius::ast::node>> translate_expressions(
   return out;
 }
 
-std::optional<cudf::data_type> try_native_physical_type(const sirius::logical_type& logical)
-{
-  try {
-    return sirius::get_cudf_type(logical);
-  } catch (duckdb::InvalidInputException const&) {
-    return std::nullopt;
-  }
-}
-
 std::vector<cudf::data_type> scan_physical_schema(duckdb::LogicalGet& op,
-                                                  duckdb::ClientContext& context,
+                                                  duckdb::SiriusContext* state,
                                                   const duckdb::vector<duckdb::ColumnIndex>& ids)
 {
-  auto state = context.registered_state
-                 ? context.registered_state->Get<duckdb::SiriusContext>("sirius_state")
-                 : nullptr;
   if (!state || !state->get_config().get_operator_params().enable_compressed_materialization) {
     return {};
   }
@@ -116,7 +104,7 @@ std::vector<cudf::data_type> scan_physical_schema(duckdb::LogicalGet& op,
   bool changed = false;
   for (std::size_t output_idx = 0; output_idx < op.types.size(); output_idx++) {
     auto logical = sirius::from_duckdb(op.types[output_idx]);
-    auto native  = try_native_physical_type(logical);
+    auto native  = sirius::try_get_cudf_type(logical);
     if (!native) { return {}; }
     result.push_back(*native);
     if (!sirius::is_narrowable_numeric_type(logical)) { continue; }
@@ -175,7 +163,11 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
                                           op.function.name);
   }
 
-  auto physical_types = scan_physical_schema(op, context, column_ids);
+  auto sirius_state = context.registered_state
+                        ? context.registered_state->Get<duckdb::SiriusContext>("sirius_state")
+                        : nullptr;
+
+  auto physical_types = scan_physical_schema(op, sirius_state.get(), column_ids);
 
   if (!op.children.empty()) {
     throw duckdb::NotImplementedException("Table Input Output functions are not supported yet");
@@ -233,12 +225,9 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
       }
 
       sirius::scan_manager::pinned_entry const* entry = nullptr;
-      if (context.registered_state) {
-        if (auto sirius_state =
-              context.registered_state->Get<duckdb::SiriusContext>("sirius_state")) {
-          entry = sirius_state->get_scan_manager().find_pinned_entry_for_duckdb_table(
-            table.ParentCatalog().GetName(), table.ParentSchema().name, table.name);
-        }
+      if (sirius_state) {
+        entry = sirius_state->get_scan_manager().find_pinned_entry_for_duckdb_table(
+          table.ParentCatalog().GetName(), table.ParentSchema().name, table.name);
       }
       if (entry != nullptr && entry->mvcc != nullptr) {
         // Cache-or-CPU guards: while this table is MVCC-pinned, a GPU plan
@@ -557,11 +546,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
     std::move(op.virtual_columns));
   if (physical_types.size() == node->types.size()) {
     node->set_physical_types(std::move(physical_types));
-    if (auto sirius_state = context.registered_state
-                              ? context.registered_state->Get<duckdb::SiriusContext>("sirius_state")
-                              : nullptr) {
-      sirius_state->record_compressed_materialization_scan_sidecar_installed();
-    }
+    if (sirius_state) { sirius_state->record_compressed_materialization_scan_sidecar_installed(); }
   }
   node->named_parameters = std::move(op.named_parameters);
   node->dynamic_filters  = op.dynamic_filters;

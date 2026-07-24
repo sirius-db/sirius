@@ -24,6 +24,7 @@
 // stamps on the DYNAMIC_FILTER / GPU_SCAN leaf pair and the wrap-time copies, and a grouped
 // aggregation case proves narrow group keys cross the aggregate-side exchange.
 
+#include "compressed_materialization_test_common.hpp"
 #include "op/scan/sirius_physical_dynamic_filter.hpp"
 #include "op/sirius_physical_concat.hpp"
 #include "op/sirius_physical_operator.hpp"
@@ -47,9 +48,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
-#include <cstdlib>
 #include <filesystem>
-#include <fstream>
 #include <string>
 #include <vector>
 
@@ -57,6 +56,8 @@ namespace fs = std::filesystem;
 
 using sirius::op::sirius_physical_operator;
 using sirius::op::SiriusPhysicalOperatorType;
+
+using namespace sirius::test::compmat;
 
 namespace {
 
@@ -82,135 +83,27 @@ constexpr char const* kJoinQuery =
 constexpr char const* kGroupByQuery =
   "SELECT k, COUNT(*) AS c, SUM(v) AS sv FROM t GROUP BY k ORDER BY k LIMIT 10;";
 
-void require_ok(duckdb::unique_ptr<duckdb::MaterializedQueryResult> const& r, char const* what)
-{
-  REQUIRE(r);
-  if (r->HasError()) { UNSCOPED_INFO(what << " error: " << r->GetError()); }
-  REQUIRE_FALSE(r->HasError());
-}
+// Small exchange sizes force multi-way hash partitioning on the fixture's data volumes.
+constexpr config_values kConfigValues{.scan_batch_bytes     = kScanBatchBytes,
+                                      .hash_partition_bytes = kHashPartitionBytes,
+                                      .concat_batch_bytes   = 262144};
 
 void generate_fact_parquet(fs::path const& path)
 {
-  setenv("SIRIUS_DISABLE", "1", 1);
-  {
-    duckdb::DuckDB gen_db(nullptr);
-    duckdb::Connection gen(gen_db);
-    auto r = gen.Query(
-      "COPY (SELECT range % 50000 AS k, (range * 11) % 297 AS v, "
-      "CAST(((range * 13) % 29000) / 100.0 AS DECIMAL(18,2)) AS d "
-      "FROM range(" +
-      std::to_string(kFactRows) + ")) TO '" + path.string() +
-      "' (FORMAT PARQUET, ROW_GROUP_SIZE 30720);");
-    REQUIRE(r);
-    REQUIRE_FALSE(r->HasError());
-  }
-  unsetenv("SIRIUS_DISABLE");
+  generate_parquet(path,
+                   "SELECT range % 50000 AS k, (range * 11) % 297 AS v, "
+                   "CAST(((range * 13) % 29000) / 100.0 AS DECIMAL(18,2)) AS d "
+                   "FROM range(" +
+                     std::to_string(kFactRows) + ")",
+                   30720);
 }
 
 void generate_dim_parquet(fs::path const& path)
 {
-  setenv("SIRIUS_DISABLE", "1", 1);
-  {
-    duckdb::DuckDB gen_db(nullptr);
-    duckdb::Connection gen(gen_db);
-    auto r =
-      gen.Query("COPY (SELECT range AS k, range % 100 AS x FROM range(" + std::to_string(kDimRows) +
-                ")) TO '" + path.string() + "' (FORMAT PARQUET, ROW_GROUP_SIZE 10240);");
-    REQUIRE(r);
-    REQUIRE_FALSE(r->HasError());
-  }
-  unsetenv("SIRIUS_DISABLE");
-}
-
-void write_config(fs::path const& yaml_path)
-{
-  std::ofstream f(yaml_path);
-  f << "sirius:\n"
-       "  topology:\n"
-       "    num_gpus: 1\n"
-       "  memory:\n"
-       "    gpu:\n"
-       "      usage_limit_bytes: "
-    << (2ull << 30)
-    << "\n"
-       "      reservation_limit_fraction: 1.0\n"
-       "    host:\n"
-       "      capacity_bytes: 32000000000\n"
-       "      initial_number_pools: 10\n"
-       "      pool_size: 512\n"
-       "      block_size: 1048576\n"
-       "  executor:\n"
-       "    pipeline:\n"
-       "      num_threads: 4\n"
-       "    task_creator:\n"
-       "      num_threads: 2\n"
-       "    downgrade:\n"
-       "      num_threads: 1\n"
-       "      monitor_period: 10ms\n"
-       "  operator_params:\n"
-       "    scan_task_batch_size: "
-    << kScanBatchBytes
-    << "\n"
-       "    max_sort_partition_bytes: 0\n"
-       "    hash_partition_bytes: "
-    << kHashPartitionBytes
-    << "\n"
-       "    concat_batch_bytes: 262144\n"
-       "    max_build_hash_table_bytes: 90000000\n";
-}
-
-void pause_shared_envs()
-{
-  if (sirius::test::g_shared_env && sirius::test::g_shared_env->is_active()) {
-    sirius::test::g_shared_env->pause();
-  }
-  if (sirius::test::g_integration_env && sirius::test::g_integration_env->is_active()) {
-    sirius::test::g_integration_env->pause();
-  }
-  if (sirius::test::g_integration_env_2gpu && sirius::test::g_integration_env_2gpu->is_active()) {
-    sirius::test::g_integration_env_2gpu->pause();
-  }
-}
-
-/// Run @p query on the GPU (a failure surfaces loudly: duckdb fallback is disabled by every
-/// test below), then on the CPU, and compare the two result sets as sorted stringified rows.
-void compare_gpu_vs_cpu(duckdb::Connection& con, std::string const& query)
-{
-  auto gpu_result = con.Query(query);
-  require_ok(gpu_result, "gpu query");
-
-  require_ok(con.Query("SET gpu_execution = false;"), "disable gpu");
-  auto cpu_result = con.Query(query);
-  require_ok(cpu_result, "cpu query");
-  require_ok(con.Query("SET gpu_execution = true;"), "re-enable gpu");
-
-  REQUIRE(gpu_result->ColumnCount() == cpu_result->ColumnCount());
-  REQUIRE(gpu_result->RowCount() == cpu_result->RowCount());
-
-  auto collect_rows = [](duckdb::MaterializedQueryResult& result) {
-    std::vector<std::vector<std::string>> rows;
-    for (duckdb::idx_t r = 0; r < result.RowCount(); r++) {
-      std::vector<std::string> row;
-      row.reserve(result.ColumnCount());
-      for (duckdb::idx_t c = 0; c < result.ColumnCount(); c++) {
-        row.push_back(result.GetValue(c, r).ToString());
-      }
-      rows.push_back(std::move(row));
-    }
-    std::sort(rows.begin(), rows.end());
-    return rows;
-  };
-  auto gpu_rows = collect_rows(*gpu_result);
-  auto cpu_rows = collect_rows(*cpu_result);
-  for (std::size_t r = 0; r < gpu_rows.size(); r++) {
-    for (std::size_t c = 0; c < gpu_rows[r].size(); c++) {
-      if (gpu_rows[r][c] != cpu_rows[r][c]) {
-        UNSCOPED_INFO("Row " << r << " Col " << c << " mismatch: GPU=[" << gpu_rows[r][c]
-                             << "] CPU=[" << cpu_rows[r][c] << "]");
-      }
-      REQUIRE(gpu_rows[r][c] == cpu_rows[r][c]);
-    }
-  }
+  generate_parquet(
+    path,
+    "SELECT range AS k, range % 100 AS x FROM range(" + std::to_string(kDimRows) + ")",
+    10240);
 }
 
 /// Build the Sirius physical plan for @p query exactly as the transparent path does
@@ -320,7 +213,7 @@ TEST_CASE(
   generate_dim_parquet(dim_path);
 
   auto yaml_path = tmp / "compmat_partition.yaml";
-  write_config(yaml_path);
+  write_config(yaml_path, kConfigValues);
   REQUIRE(fs::exists(yaml_path));
 
   {
@@ -396,7 +289,7 @@ TEST_CASE("plan shape - dynamic-filter-wired scan keeps narrow payload carriers"
   generate_dim_parquet(dim_path);
 
   auto yaml_path = tmp / "compmat_shape.yaml";
-  write_config(yaml_path);
+  write_config(yaml_path, kConfigValues);
   REQUIRE(fs::exists(yaml_path));
 
   {
@@ -475,7 +368,7 @@ TEST_CASE("gpu_execution - narrow group keys cross the aggregate exchange",
   generate_fact_parquet(fact_path);
 
   auto yaml_path = tmp / "compmat_groupby.yaml";
-  write_config(yaml_path);
+  write_config(yaml_path, kConfigValues);
   REQUIRE(fs::exists(yaml_path));
 
   {

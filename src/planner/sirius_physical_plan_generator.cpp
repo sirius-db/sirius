@@ -593,11 +593,9 @@ void insert_gpu_pipeline_operators_recursive(
 //! PARTITION_DISTINCT -> original DISTINCT`. The non-owning `delim_base.distinct` borrow stays
 //! valid — moving a unique_ptr never relocates the object — and the fan-out wiring uses it.
 //! The propagation pass restores `distinct_root` in place, so this chain never carries a
-//! physical sidecar; the observer is passed only for signature uniformity and its counter
-//! stays zero here.
+//! physical sidecar and its PARTITION needs no compressed-materialization observer.
 void wrap_delim_distinct(sirius::op::sirius_physical_delim_join& delim_base,
-                         const sirius::operator_params& op_params,
-                         duckdb::SiriusContext* compressed_materialization_observer)
+                         const sirius::operator_params& op_params)
 {
   if (!delim_base.distinct_root) { return; }
 
@@ -609,8 +607,7 @@ void wrap_delim_distinct(sirius::op::sirius_physical_delim_join& delim_base,
                                                              original->estimated_cardinality,
                                                              /*key_source=*/original.get(),
                                                              /*is_build=*/false,
-                                                             op_params.hash_partition_bytes,
-                                                             compressed_materialization_observer);
+                                                             op_params.hash_partition_bytes);
   partition->children.push_back(std::move(original));
 
   auto merge =
@@ -648,7 +645,7 @@ void wrap_delim_join(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& s
       insert_gpu_pipeline_operators_recursive(
         child_slot, op_params, context, compressed_materialization_observer);
     }
-    wrap_delim_distinct(delim_base, op_params, compressed_materialization_observer);
+    wrap_delim_distinct(delim_base, op_params);
   }
 
   if (slot->type == sirius::op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN) {

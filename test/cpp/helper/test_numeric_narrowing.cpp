@@ -304,20 +304,31 @@ TEST_CASE("numeric carrier conversions are family, scale, and direction explicit
   auto const int64 = cudf::data_type{cudf::type_id::INT64};
   auto const uint8 = cudf::data_type{cudf::type_id::UINT8};
 
-  REQUIRE(sirius::same_numeric_carrier_family(int8, int64));
   REQUIRE(sirius::can_narrow_to(int64, int8));
   REQUIRE(sirius::can_restore_to(int8, int64));
   REQUIRE_FALSE(sirius::can_narrow_to(int8, int64));
   REQUIRE_FALSE(sirius::can_restore_to(int64, int8));
   REQUIRE_FALSE(sirius::can_narrow_to(int64, int64));
-  REQUIRE_FALSE(sirius::same_numeric_carrier_family(int8, uint8));
+  // Crossing the signedness family forbids conversion in either direction, even at otherwise
+  // valid widths.
+  auto const uint64 = cudf::data_type{cudf::type_id::UINT64};
+  REQUIRE_FALSE(sirius::can_narrow_to(int64, uint8));
+  REQUIRE_FALSE(sirius::can_narrow_to(uint64, int8));
+  REQUIRE_FALSE(sirius::can_restore_to(int8, uint64));
+  REQUIRE_FALSE(sirius::can_restore_to(uint8, int64));
 
   auto const decimal32_scale2 = cudf::data_type{cudf::type_id::DECIMAL32, -2};
   auto const decimal64_scale2 = cudf::data_type{cudf::type_id::DECIMAL64, -2};
   auto const decimal64_scale3 = cudf::data_type{cudf::type_id::DECIMAL64, -3};
   REQUIRE(sirius::can_narrow_to(decimal64_scale2, decimal32_scale2));
   REQUIRE(sirius::can_restore_to(decimal32_scale2, decimal64_scale2));
-  REQUIRE_FALSE(sirius::same_numeric_carrier_family(decimal32_scale2, decimal64_scale3));
+  // Crossing the fixed-point scale family forbids conversion in either direction.
+  REQUIRE_FALSE(sirius::can_narrow_to(decimal64_scale3, decimal32_scale2));
+  REQUIRE_FALSE(
+    sirius::can_narrow_to(decimal64_scale2, cudf::data_type{cudf::type_id::DECIMAL32, -3}));
+  REQUIRE_FALSE(sirius::can_restore_to(decimal32_scale2, decimal64_scale3));
+  REQUIRE_FALSE(
+    sirius::can_restore_to(cudf::data_type{cudf::type_id::DECIMAL32, -3}, decimal64_scale2));
   REQUIRE_FALSE(sirius::can_narrow_to(cudf::data_type{cudf::type_id::FLOAT64},
                                       cudf::data_type{cudf::type_id::FLOAT32}));
 
