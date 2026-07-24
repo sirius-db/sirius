@@ -1073,6 +1073,20 @@ std::pair<bool, bool> sirius_physical_hash_join::refresh_cross_schedule()
   return {probe_finished, build_finished};
 }
 
+/// Build a 0-row cudf table with one column per logical type — the full schema of a join side. Used
+/// to synthesize the missing (empty-opposite) side when a partition survives against an empty
+/// table.
+static std::unique_ptr<cudf::table> make_empty_join_side_table(
+  const duckdb::vector<sirius::logical_type>& types)
+{
+  std::vector<std::unique_ptr<cudf::column>> cols;
+  cols.reserve(types.size());
+  for (auto const& t : types) {
+    cols.push_back(cudf::make_empty_column(sirius::get_cudf_type(t)));
+  }
+  return std::make_unique<cudf::table>(std::move(cols));
+}
+
 std::unique_ptr<operator_data> sirius_physical_hash_join::get_next_task_input_data()
 {
   // Hold the mutex for the entire operation to prevent concurrent pop/get races. A pop on one
@@ -1120,20 +1134,49 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::get_next_task_input_da
   }
 
   // No normal pair. If both producers finished, a partition may have batches on one side and an
-  // empty opposite side (e.g. a join against an empty table). Those survivors are never paired, so
-  // emit each as a single-side "orphan" task: this both drains the batch (so the pipeline can
-  // complete) and lets execute() emit the correct NULL-padded / passthrough rows for the join type.
+  // empty opposite side (e.g. a join against an empty table): those survivors are never paired.
+  // Emit each survivor as an ordinary two-batch task by SYNTHESIZING the empty opposite batch here,
+  // so execute() runs the normal join dispatch unchanged — cuDF NULL-pads the survivor for LEFT /
+  // RIGHT / OUTER / ANTI and yields zero rows for INNER / SEMI. Popping the survivor also drains
+  // the repo so the pipeline can complete.
   auto const orphan = next_cross_schedule_orphan(_cross, finished.first, finished.second);
   if (orphan.found) {
-    auto* port = orphan.present_is_build ? build_port : probe_port;
-    auto batch = port->repo->pop_data_batch_by_id(orphan.batch_id, orphan.partition);
-    if (!batch) { return nullptr; }  // already drained by a concurrent caller
+    auto* present_port = orphan.present_is_build ? build_port : probe_port;
+    auto present_batch =
+      present_port->repo->pop_data_batch_by_id(orphan.batch_id, orphan.partition);
+    if (!present_batch) { return nullptr; }  // already drained by a concurrent caller
+
+    // Synthesize the empty opposite side from the absent child's output schema (children[0] =
+    // probe/left, children[1] = build/right), on the surviving batch's device. The batch's memory
+    // space is only reachable through a read-only accessor; take one transiently (shared lock) and
+    // release it before handing the idle batch to the task.
+    cucascade::memory::memory_space* ms = nullptr;
+    {
+      auto present_ro = present_batch->to_read_only();
+      ms              = present_ro.get_memory_space();
+    }
+    if (!ms) {
+      throw std::runtime_error(
+        "In sirius_physical_hash_join:get_next_task_input_data: surviving orphan batch has no "
+        "memory space in operator " +
+        std::to_string(this->get_operator_id()));
+    }
+    auto const& opp_types = orphan.present_is_build ? children[0]->get_types()   // absent probe
+                                                    : children[1]->get_types();  // absent build
+    rmm::cuda_set_device_raii const device_guard{rmm::cuda_device_id{ms->get_device_id()}};
+    auto empty_batch = make_data_batch(
+      make_empty_join_side_table(opp_types), *ms, cudf::get_default_stream(), batch_telemetry());
+
     std::vector<std::shared_ptr<cucascade::data_batch>> input_batch;
-    input_batch.push_back(std::move(batch));
-    return std::make_unique<partitioned_operator_data>(
-      std::move(input_batch),
-      orphan.partition,
-      orphan.present_is_build ? join_present_side::build : join_present_side::probe);
+    input_batch.reserve(2);
+    if (orphan.present_is_build) {
+      input_batch.push_back(std::move(empty_batch));    // [0] = empty probe / "default" / left
+      input_batch.push_back(std::move(present_batch));  // [1] = build / "build" / right
+    } else {
+      input_batch.push_back(std::move(present_batch));  // [0] = probe / "default" / left
+      input_batch.push_back(std::move(empty_batch));    // [1] = empty build / "build" / right
+    }
+    return std::make_unique<partitioned_operator_data>(std::move(input_batch), orphan.partition);
   }
 
   return nullptr;
@@ -1445,69 +1488,17 @@ static std::unique_ptr<operator_data> resolve_mark_join_result(
       std::move(output_cudf_table), *left_batch.get_memory_space(), stream, telemetry_info)});
 }
 
-/// Build a 0-row cudf table with one column per logical type — the full schema of a join side. Used
-/// to synthesize the missing side of an "orphan" task (the opposite side finished empty).
-static std::unique_ptr<cudf::table> make_empty_join_side_table(
-  const duckdb::vector<sirius::logical_type>& types)
-{
-  std::vector<std::unique_ptr<cudf::column>> cols;
-  cols.reserve(types.size());
-  for (auto const& t : types) {
-    cols.push_back(cudf::make_empty_column(sirius::get_cudf_type(t)));
-  }
-  return std::make_unique<cudf::table>(std::move(cols));
-}
-
 std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator_data& input_data,
                                                                   rmm::cuda_stream_view stream)
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_hash_join::execute"};
-  auto& input = dynamic_cast<const pipelineable_operator_data&>(input_data);
-  // By value (get_read_only_batches returns a fresh vector): an orphan task mutates it below to
-  // reinstate the empty opposite side.
-  auto input_batches = input.get_read_only_batches();
+  auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
+  const auto& input_batches = input.get_read_only_batches();
 
   if (is_all_inequality_join) {
     throw std::runtime_error(
       "Error sirius_physical_hash_join being asked to do all inequality join of type: " +
       duckdb::JoinTypeToString(join_type));
-  }
-
-  // Orphan task (STANDARD/MIXED_JOIN): the opposite join side finished with zero batches (e.g. a
-  // join against an empty table), so this task carries only the surviving side. Synthesize an empty
-  // opposite batch on the surviving batch's memory space and slot it into [probe, build] order, so
-  // the normal two-batch dispatch below runs unchanged and emits the correct output — cuDF joins
-  // handle an empty side (LEFT/RIGHT/OUTER/ANTI NULL-pad the survivor; INNER/SEMI yield zero rows).
-  std::shared_ptr<cucascade::data_batch> synthesized_opposite;  // keeps the inserted lock alive
-  if (auto const* partitioned = dynamic_cast<const partitioned_operator_data*>(&input_data);
-      partitioned && partitioned->get_present_side() != join_present_side::none) {
-    if (input_batches.size() != 1) {
-      throw std::runtime_error(
-        "In sirius_physical_hash_join::execute: orphan (empty-opposite) task expects exactly 1 "
-        "batch, got " +
-        std::to_string(input_batches.size()) + " in operator " +
-        std::to_string(this->get_operator_id()));
-    }
-    bool const present_is_build = partitioned->get_present_side() == join_present_side::build;
-    auto* ms                    = input_batches[0].get_memory_space();
-    if (!ms) {
-      throw std::runtime_error(
-        "In sirius_physical_hash_join::execute: orphan task batch has no memory space in "
-        "operator " +
-        std::to_string(this->get_operator_id()));
-    }
-    // The absent side's full schema is its child's output types (children[0]=probe, children[1]=
-    // build).
-    auto const& opp_types = present_is_build ? children[0]->get_types()   // absent probe
-                                             : children[1]->get_types();  // absent build
-    synthesized_opposite =
-      make_data_batch(make_empty_join_side_table(opp_types), *ms, stream, batch_telemetry());
-    if (present_is_build) {
-      input_batches.insert(input_batches.begin(),
-                           synthesized_opposite->to_read_only());  // [0]=probe
-    } else {
-      input_batches.push_back(synthesized_opposite->to_read_only());  // [1] = empty build
-    }
   }
 
   cudf::table_view left_full, right_full;
