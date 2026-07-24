@@ -263,14 +263,14 @@ The shell runners (`benchmark_and_validate.sh`, `run_tpch_parquet.sh`, `run_tpch
 
 ## Power & Throughput Run (TPC-H refresh functions)
 
-`tpch_power_throughput.py` implements the TPC-H **power test** and **throughput test** in the
-style of [duckdb-tpch-power-test](https://github.com/duckdb/duckdb-tpch-power-test), adding the
-RF1 (insert) / RF2 (delete) refresh functions to the query workload:
+`tpch_power_throughput.py` runs the TPC-H power and throughput tests, modeled on
+[duckdb-tpch-power-test](https://github.com/duckdb/duckdb-tpch-power-test). It adds the RF1
+(insert) and RF2 (delete) refresh functions to the query workload:
 
-- **Power run** (single session, update set 1): optional clean pass → **RF1** (`COPY` the
-  `orders.tbl.u1` + `lineitem.tbl.u1` rows in) → the 22 queries in spec stream-0 order (timed —
-  these feed Power@Size) → **RF2** (`DELETE` the `delete.1` order keys) → a timed post-RF2 pass
-  with the delete mask active.
+- **Power run** (single session, update set 1): optional clean pass → RF1 (`COPY` in the
+  `orders.tbl.u1` and `lineitem.tbl.u1` rows) → the 22 queries in spec stream-0 order (timed,
+  feeding Power@Size) → RF2 (`DELETE` the `delete.1` order keys) → a timed post-RF2 pass with the
+  delete mask active.
 - **Throughput run** (fresh database copy): N concurrent query streams (spec permutations 1..N,
   from `tpch_stream_permutations.py`) plus one refresh stream running N RF1/RF2 pairs (update
   sets 2..N+1). N defaults to the spec minimum for the SF (SF1→2, SF10→3, ...).
@@ -281,28 +281,28 @@ sqrt(Power · Throughput)`.
 
 ### How it maps onto Sirius
 
-- The input must be a **file-backed `.duckdb` with native TPC-H tables** (e.g.
-  `test_datasets/tpch_sf1.duckdb`). The runner copies it per phase and mutates the copy — the
-  original is never touched. All 8 tables are pinned (`CALL pin_table(format='duckdb', ...)`)
-  after a `CHECKPOINT`; pinning `lineitem`/`orders` is what activates the MVCC insert-delta /
-  delete-mask serving path for the refreshed data. Parquet inputs cannot work here (read-only
-  views, no MVCC metadata).
-- RF1/RF2 are plain DuckDB CPU DML (the GPU does not execute INSERT/DELETE); the GPU serves the
-  *subsequent* queries from `pinned base + insert delta − delete mask`, with **no CHECKPOINT**
-  between a refresh and the queries that observe it. The delta is re-decoded and the mask
-  re-applied per query, so the post-RF passes measure a stable recurring cost.
-- The summary reports per-query `clean` / `post-RF1` / `post-RF2` times plus derived
-  `delta overhead` (post-RF1 − clean) and `mask overhead` (post-RF2 − post-RF1) columns —
-  Power@Size itself uses only the canonical post-RF1 stream.
-- **Validation** (default on, power run only): after RF1 and again after RF2, every
-  refresh-affected query's GPU rows are diffed against a DuckDB CPU cursor **in the same
-  process** (a separate process would read the stale pre-refresh disk image, since refreshes are
-  committed but not checkpointed). q2/q11/q16 touch neither lineitem nor orders and are skipped.
-  Row-count movement across RF1/RF2 is also asserted. Mismatches make the run exit non-zero.
-- **Concurrency caveat**: the engine serializes all queries across all connections on one
-  query-lifecycle lock, so the throughput run measures aggregate throughput of concurrent
-  *submission* on one GPU, not overlapped execution. Every result is fully materialized before
-  the next query — an open cursor would hold the lock and stall every stream.
+- The input must be a file-backed `.duckdb` with native TPC-H tables (e.g.
+  `test_datasets/tpch_sf1.duckdb`). The runner copies it per phase and mutates the copy, never
+  the original. All 8 tables are pinned with `CALL pin_table(format='duckdb', ...)` after a
+  `CHECKPOINT`. Pinning `lineitem`/`orders` activates the MVCC insert-delta/delete-mask path that
+  serves the refreshed rows on the GPU. Parquet inputs are read-only views with no MVCC metadata,
+  so they cannot be used.
+- RF1/RF2 run as plain DuckDB CPU DML; the GPU does not execute INSERT/DELETE. The GPU serves the
+  following queries from `pinned base + insert delta − delete mask`, with no CHECKPOINT between a
+  refresh and the queries that observe it. The delta is re-decoded and the mask re-applied per
+  query, so the post-refresh passes measure a stable recurring cost.
+- The summary reports per-query `clean`, `post-RF1`, and `post-RF2` times, plus `delta overhead`
+  (post-RF1 − clean) and `mask overhead` (post-RF2 − post-RF1). Power@Size itself uses only the
+  post-RF1 stream.
+- Validation (default on, power run only): after RF1 and after RF2, each refresh-affected query's
+  GPU rows are diffed against a DuckDB CPU cursor in the same process. A separate process would
+  read the stale pre-refresh disk image, since refreshes are committed but not checkpointed.
+  q2/q11/q16 touch neither table and are skipped. Row-count movement across RF1/RF2 is also
+  checked. Any mismatch exits non-zero.
+- Concurrency caveat: the engine serializes queries across all connections on one query-lifecycle
+  lock, so the throughput run measures throughput of concurrent submission on one GPU, not
+  overlapped execution. Every result is fetched fully before the next query; an open cursor would
+  hold the lock and stall every stream.
 
 ### Usage
 

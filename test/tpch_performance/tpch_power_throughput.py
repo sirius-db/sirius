@@ -12,26 +12,26 @@
 # the License.
 # =============================================================================
 
-"""TPC-H power & throughput runs for Sirius, in the style of duckdb-tpch-power-test.
+"""TPC-H power and throughput runs for Sirius with the RF1/RF2 refresh functions.
 
 Power run (single session, update set 1):
     [clean pass]  RF1  ->  22-query stream 0 (timed; feeds Power@Size)  ->  RF2
-                  ->  post-RF2 pass (timed; queries with the delete mask active)
+                  ->  post-RF2 pass (timed; delete mask active)
 
 Throughput run (fresh database copy, update sets 2..N+1):
     N concurrent query streams (spec permutations 1..N) + 1 refresh stream running
     N RF1/RF2 pairs. Sirius serializes all queries on one engine-wide lock, so this
-    measures aggregate throughput of concurrent submission, not overlapped execution.
+    measures throughput of concurrent submission, not overlapped execution.
 
 Metrics (TPC-H spec 5.4):
     Power@Size      = 3600 * SF / geomean(22 stream-0 query times + T_RF1 + T_RF2)
     Throughput@Size = (N * 22 * 3600 / measurement_interval) * SF
     QphH@Size       = sqrt(Power@Size * Throughput@Size)
 
-The base database must be a file-backed .duckdb with native TPC-H tables (the
-MVCC insert-delta/delete-mask path serves only pinned duckdb-native tables); the
-input file is copied per phase and the copy is mutated, never the original.
-Refresh files come from generate_tpch_refresh.sh (dbgen -U).
+The input must be a file-backed .duckdb with native TPC-H tables. Only pinned
+duckdb-native tables get the MVCC insert-delta/delete-mask path that makes RF1/RF2
+visible on the GPU. Each phase copies the input and mutates the copy, never the
+original. Refresh files come from generate_tpch_refresh.sh.
 
 Example:
     export SIRIUS_CONFIG_FILE=$(pwd)/test/cpp/integration/integration.yaml
@@ -66,8 +66,8 @@ from tpch_stream_permutations import default_streams, stream_order
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# Queries that read neither lineitem nor orders are invariant under RF1/RF2 and
-# skipped during refresh validation (their read-only path is covered elsewhere).
+# Queries that touch neither lineitem nor orders are unchanged by RF1/RF2, so
+# refresh validation skips them.
 REFRESH_INVARIANT_QUERIES = frozenset(
     q
     for q, tables in QUERY_COLUMNS.items()
@@ -78,11 +78,10 @@ _write_lock = threading.Lock()
 
 
 def sql(cur, stmt):
-    """Execute one statement and fully materialize its result.
+    """Execute a statement and fetch all rows.
 
-    Mandatory for EVERY statement in this script: a partially-fetched DuckDB
-    result stays open and keeps holding Sirius's engine-wide query-lifecycle
-    lock, deadlocking the next query from any other cursor.
+    Fetching fully matters: an open DuckDB result holds Sirius's engine-wide
+    query lock and blocks the next query on any cursor.
     """
     return cur.execute(stmt).fetchall()
 
@@ -144,12 +143,7 @@ def run_refresh(cur, statements, label):
 
 
 def timed_query(cur, qnum, timeout_s):
-    """Execute q<qnum>, fully materialize it, and return (elapsed_s, rows).
-
-    Full materialization is mandatory: the engine-wide query lifecycle lock is
-    released only when the result is consumed, so an open cursor would block
-    every other stream.
-    """
+    """Run q<qnum>, fetch all rows, and return (elapsed_s, rows)."""
     timer = None
     if timeout_s:
         timer = threading.Timer(timeout_s, cur.interrupt)
@@ -657,8 +651,8 @@ def main():
         rf1_statements(args.refresh_dir, n)
         rf2_statements(args.refresh_dir, n)
 
-    # No silent default: the config decides GPU/host memory sizing, so it must
-    # be an explicit choice (a stale config can fail extension init outright).
+    # Require an explicit config; it sets GPU/host memory sizing and a stale one
+    # can fail extension init.
     config = (args.config or "").strip()
     if not config:
         raise SystemExit(

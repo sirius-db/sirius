@@ -16,18 +16,18 @@ You are running SQL benchmarks for Sirius, a GPU-accelerated SQL query engine bu
 
 Currently this skill covers **TPC-H only**. TPC-DS support has been removed from this skill for now and will be added back later.
 
-## Step 0 — Choose the Benchmark Type (ask FIRST, always)
+## Step 0 — Choose the Benchmark Type (ask first)
 
 Before anything else, ask the user (via `AskUserQuestion`) which benchmark they want:
 
-- **Regular benchmark** — the per-query timing + GPU-vs-CPU validation runner
-  (`performance_test.py`): the 22 TPC-H queries × N iterations against a parquet or `.duckdb`
-  dataset, optionally pinned. → follow **Workflow H-B** and complete **"Before Running the Regular
-  Benchmark"**.
-- **TPC-H official (power + throughput run)** — the spec-style refresh-function benchmark
-  (`tpch_power_throughput.py`) that interleaves the **RF1 (insert)** and **RF2 (delete)** refresh
-  functions with the query streams and reports **Power@Size / Throughput@Size / QphH@Size**. →
-  follow **Workflow H-C** and complete **"Before Running the Official Run"**.
+- **Regular benchmark**: the per-query timing + GPU-vs-CPU validation runner
+  (`performance_test.py`), running the 22 TPC-H queries × N iterations against a parquet or
+  `.duckdb` dataset, optionally pinned. Follow **Workflow H-B** and complete "Before Running the
+  Regular Benchmark".
+- **TPC-H official (power + throughput run)**: the spec-style refresh-function benchmark
+  (`tpch_power_throughput.py`) that interleaves the RF1 (insert) and RF2 (delete) refresh
+  functions with the query streams and reports Power@Size / Throughput@Size / QphH@Size. Follow
+  **Workflow H-C** and complete "Before Running the Official Run".
 
 The "Two Engines", "GPU-Compatible Queries", and "Identifying GPU Fallback and Errors" sections
 below apply to both. Do not start either run before completing that path's confirmation gate.
@@ -199,9 +199,9 @@ A timestamped benchmark dir `<output>/tpch_<ts>_<mode>_<engine>_iter<N>/` (or `<
 
 ## Workflow H-C: `tpch_power_throughput.py`
 
-The official run adds the TPC-H **refresh functions** (RF1 insert, RF2 delete) to the query
-workload and reports the spec composite metrics. Use it whenever the user asks for a power run,
-throughput run, QphH, refresh functions, or a "TPC-H official"/"spec" benchmark.
+The official run adds the TPC-H refresh functions (RF1 insert, RF2 delete) to the query workload
+and reports the spec composite metrics. Use it whenever the user asks for a power run, throughput
+run, QphH, refresh functions, or a "TPC-H official"/"spec" benchmark.
 
 - **Power run** (single stream, update set 1): optional clean pass → RF1 → 22 queries in spec
   stream-0 order (timed; feeds Power@Size) → RF2 → timed post-RF2 pass (delete mask active).
@@ -210,15 +210,14 @@ throughput run, QphH, refresh functions, or a "TPC-H official"/"spec" benchmark.
 - `Power@Size = 3600·SF / geomean(22 query times + T_RF1 + T_RF2)`,
   `Throughput@Size = N·22·3600 / interval · SF`, `QphH@Size = sqrt(Power·Throughput)`.
 
-**Hard requirements — enforce these:**
-- **Data source is a file-backed `.duckdb` with native TPC-H tables — never parquet.** The MVCC
-  insert-delta / delete-mask path that makes RF1/RF2 visible on the GPU only works on pinned
+**Hard requirements:**
+- Data source is a file-backed `.duckdb` with native TPC-H tables, never parquet. The MVCC
+  insert-delta/delete-mask path that makes RF1/RF2 visible on the GPU only works on pinned
   duckdb-native tables. `--input` is that `.duckdb` file; the runner copies it per phase and
   mutates the copy, never the original.
-- **Always pinned.** The runner pins all 8 tables; the user only chooses the **tier** (`gpu` or
-  `host`). There is no unpinned official run — unpinned means the refreshes wouldn't be visible on
-  the GPU.
-- **Refresh sets** come from `generate_tpch_refresh.sh` (classic dbgen `-U`): `orders.tbl.u*`,
+- Always pinned. The runner pins all 8 tables; the user only chooses the tier (`gpu` or `host`).
+  An unpinned run would not show the refreshes on the GPU.
+- Refresh sets come from `generate_tpch_refresh.sh` (classic dbgen `-U`): `orders.tbl.u*`,
   `lineitem.tbl.u*`, `delete.*` under `test_datasets/tpch_refresh_sf<SF>/`. Need at least
   `streams + 1` sets (set 1 = power run; sets 2..N+1 = throughput streams).
 
@@ -278,43 +277,43 @@ After confirming, echo the final `performance_test.py` command back to the user 
 
 # Before Running the Official Run (`tpch_power_throughput.py`) — ALWAYS Confirm Every Parameter First
 
-**Mandatory — do not skip.** Confirm **every** parameter with `AskUserQuestion` before invoking
+**Mandatory — do not skip.** Confirm every parameter with `AskUserQuestion` before invoking
 `tpch_power_throughput.py`. Pre-fill anything the user already gave (present it as the recommended
 option) and ask for the rest. Mark sensible defaults "(Recommended)".
 
-**Round 1 — data (ask the paths FIRST; never generate before asking)**
-1. **Base dataset** (`--input`) — the file-backed **`.duckdb`** file with native TPC-H tables
-   (**parquet is not allowed** for this run). **ALWAYS ask the user where it lives** — never assume
-   a path, and never treat a missing path as "must generate": these datasets are usually shared
-   (e.g. the main checkout's `test_datasets/tpch_sf<SF>.duckdb`, not the current worktree's), so it
-   may already exist somewhere you haven't checked. Only after the user confirms none exists, offer
-   to generate a **duckdb** dataset via `/dataset-manager` (or `generate_tpch_data.sh --format
-   duckdb`) — generation is slow/large at scale, so **never auto-generate**.
-2. **Refresh data** (`--refresh-dir`) — the directory of `orders.tbl.u*` / `lineitem.tbl.u*` /
-   `delete.*` sets. **ALWAYS ask where it lives before generating anything.** Only after the user
+**Round 1 — data (ask for the paths first; never generate before asking)**
+1. **Base dataset** (`--input`): the file-backed `.duckdb` file with native TPC-H tables (parquet
+   is not allowed here). Always ask the user where it lives. Never assume a path, and never treat a
+   missing path as "must generate" — these datasets are usually shared (e.g. the main checkout's
+   `test_datasets/tpch_sf<SF>.duckdb`, not the current worktree's), so one may already exist. Only
+   after the user confirms none exists, offer to generate a duckdb dataset via `/dataset-manager`
+   (or `generate_tpch_data.sh --format duckdb`); generation is slow and large at scale, so never
+   auto-generate.
+2. **Refresh data** (`--refresh-dir`): the directory of `orders.tbl.u*` / `lineitem.tbl.u*` /
+   `delete.*` sets. Always ask where it lives before generating anything. Only after the user
    confirms it doesn't exist, generate it with `generate_tpch_refresh.sh <SF> <num_sets>` (needs
    `num_sets >= streams + 1`). Confirm the directory holds at least `streams + 1` sets.
-3. **Config** (`--config` / `SIRIUS_CONFIG_FILE`) — the Sirius config YAML. **Required — the
-   runner refuses to start without one (no default path). ALWAYS ask the user where the config
-   file lives**: never assume a path, and never treat an already-set `SIRIUS_CONFIG_FILE` env var
-   as the user's answer — present it as the recommended option and confirm it.
-4. **Scale factor** (`--sf`) — the SF of the dataset (also the metric's Size).
+3. **Config** (`--config` / `SIRIUS_CONFIG_FILE`): the Sirius config YAML, required (the runner
+   refuses to start without one and has no default path). Always ask the user where the config
+   lives. Don't treat an already-set `SIRIUS_CONFIG_FILE` as the answer; present it as the
+   recommended option and confirm it.
+4. **Scale factor** (`--sf`): the SF of the dataset (also the metric's Size).
 
 **Round 2 — run shape**
-1. **Mode** (`--mode`) — `power`, `throughput`, or `both` (default `both`).
-2. **Pin tier** (`--pin`) — `gpu` or `host`. **This run is ALWAYS pinned; the only choice is the
-   tier** (there is no unpinned option). Prefer `host` at large SF — pinning all 8 tables to GPU
-   can OOM, and disk spill is off by default.
-3. **Streams** (`--streams`) — throughput query-stream count (default: TPC-H spec minimum for the
+1. **Mode** (`--mode`): `power`, `throughput`, or `both` (default `both`).
+2. **Pin tier** (`--pin`): `gpu` or `host`. This run is always pinned; the only choice is the
+   tier. Prefer `host` at large SF, since pinning all 8 tables to GPU can OOM and disk spill is
+   off by default.
+3. **Streams** (`--streams`): throughput query-stream count (default: TPC-H spec minimum for the
    SF). Ensure the refresh dir has `streams + 1` sets.
-4. **Validation** (`--validation`, default on) — after RF1 and RF2, diff GPU vs a same-process
+4. **Validation** (`--validation`, default on): after RF1 and RF2, diff GPU vs a same-process
    DuckDB CPU cursor. Keep on unless the user wants timings only.
 
-(`--baseline-pass` — clean pre-refresh pass, default on — and `--query-timeout` can take defaults
-unless the user asks otherwise.)
+`--baseline-pass` (clean pre-refresh pass, default on) and `--query-timeout` can take defaults
+unless the user asks otherwise.
 
-After confirming, echo the final command(s) — including any `generate_tpch_refresh.sh` call, and
-only if generation was confirmed — before running.
+After confirming, echo the final command(s), including any `generate_tpch_refresh.sh` call (only
+if generation was confirmed), before running.
 
 **Environment prerequisites** (verify yourself; not user questions):
 - Sirius extension built (`build/release/extension/sirius/sirius.duckdb_extension`).
