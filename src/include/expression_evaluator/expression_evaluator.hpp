@@ -486,6 +486,23 @@ class expression_evaluator {
                                                cudf::data_type carrier,
                                                evaluation_mode mode);
 
+  // Evaluate one comparison/BETWEEN operand: under an engaged @p narrow_carrier, a reference
+  // passes through at its materialized narrow width and a constant materializes in the carrier;
+  // without one, the operand takes the ordinary dispatch.
+  evaluate_result evaluate_narrow_domain_operand(sirius::ast::node const& operand,
+                                                 std::optional<cudf::data_type> narrow_carrier,
+                                                 evaluation_mode mode)
+  {
+    if (narrow_carrier) {
+      if (operand.holds<sirius::ast::reference>()) {
+        return evaluate_reference_passthrough(operand.get<sirius::ast::reference>(), mode);
+      }
+      return evaluate_constant_in_carrier(
+        operand.get<sirius::ast::constant>(), *narrow_carrier, mode);
+    }
+    return evaluate(operand, mode);
+  }
+
   // Drop cache-owned temporary columns and reset per-call instrumentation.
   void reset_restored_reference_cache();
 

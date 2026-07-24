@@ -86,23 +86,12 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::comparison const& al
   auto narrow_carrier = narrow_domain_carrier(*alt.left, {alt.right.get()});
   if (!narrow_carrier) { narrow_carrier = narrow_domain_carrier(*alt.right, {alt.left.get()}); }
   if (narrow_carrier) { ++_narrow_domain_comparison_count; }
-  auto eval_operand = [&](sirius::ast::node const& operand,
-                          evaluation_mode operand_mode) -> evaluate_result {
-    if (narrow_carrier) {
-      if (operand.holds<sirius::ast::reference>()) {
-        return evaluate_reference_passthrough(operand.get<sirius::ast::reference>(), operand_mode);
-      }
-      return evaluate_constant_in_carrier(
-        operand.get<sirius::ast::constant>(), *narrow_carrier, operand_mode);
-    }
-    return evaluate(operand, operand_mode);
-  };
 
   auto const ast_op_count = alt.cudf_ast_op_count();
   if (_strategy != expression_evaluator_strategy::MATERIALIZE &&
       (mode == evaluation_mode::AST || ast_op_count >= _min_ast_size)) {
-    auto left             = eval_operand(*alt.left, evaluation_mode::AST);
-    auto right            = eval_operand(*alt.right, evaluation_mode::AST);
+    auto left  = evaluate_narrow_domain_operand(*alt.left, narrow_carrier, evaluation_mode::AST);
+    auto right = evaluate_narrow_domain_operand(*alt.right, narrow_carrier, evaluation_mode::AST);
     auto const& comp_expr = _ast_tree.emplace<cudf::ast::operation>(
       comparison_op_to_ast(alt.op), left.get_expr(), right.get_expr());
     // DISTINCT_FROM is semantically equivalent to NOT(NULL_EQUAL())
@@ -133,8 +122,10 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::comparison const& al
     return materialize_as_ast_column(result.release_column());
   }
 
-  auto left  = eval_operand(*alt.left, evaluation_mode::MATERIALIZE);
-  auto right = eval_operand(*alt.right, evaluation_mode::MATERIALIZE);
+  auto left =
+    evaluate_narrow_domain_operand(*alt.left, narrow_carrier, evaluation_mode::MATERIALIZE);
+  auto right =
+    evaluate_narrow_domain_operand(*alt.right, narrow_carrier, evaluation_mode::MATERIALIZE);
   // Comparison ops always return BOOLEAN — no logical_type on the AST node, so use BOOL8 directly.
   auto const output_type = cudf::data_type{cudf::type_id::BOOL8};
   auto const binary_op   = comparison_op_to_binary(alt.op);
