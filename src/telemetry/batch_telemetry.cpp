@@ -55,8 +55,7 @@ constexpr std::array<cucascade::memory::Tier, 3> kTiers = {
   cucascade::memory::Tier::DISK,
 };
 
-/// Read tier + size without assumptions about the batch's representation.
-/// Returns nullopt for batches with no data (e.g. empty results).
+/// Read tier + size; nullopt for batches with no data.
 struct batch_snapshot {
   uint64_t batch_id;
   cucascade::memory::Tier tier;
@@ -105,12 +104,10 @@ struct batch_telemetry_registry::impl {
 
   std::atomic<bool> enabled{false};
 
-  // Set at install() and immutable until uninstall(); the enabled flag
-  // (checked on every entry point) orders access.
+  // Immutable between install() and uninstall(); ordered by `enabled`.
   std::shared_ptr<const telemetry_context> context;
   std::vector<rust::Box<quent::memory_tier::MemoryTierHandle>> tier_handles;
-  // (tier, device) -> MemoryTier resource. GPU tiers are per-device
-  // ("GPU-0", "GPU-1", ...); HOST/DISK are engine-wide (device key 0).
+  // (tier, device) -> MemoryTier resource; HOST/DISK use device key 0.
   std::unordered_map<int64_t, uuid::UUID> tier_resources;
 
   static int64_t tier_key(cucascade::memory::Tier tier, int32_t device_id)
@@ -131,16 +128,14 @@ struct batch_telemetry_registry::impl {
     if (auto it = tier_resources.find(tier_key(tier, device_id)); it != tier_resources.end()) {
       return it->second;
     }
-    // Unknown device (e.g. a batch with no memory space): fall back to any
-    // resource of the tier so the usage still lands on the right tier.
+    // Unknown device: fall back to any resource of the tier.
     for (const auto& [key, id] : tier_resources) {
       if (static_cast<cucascade::memory::Tier>(key >> 32) == tier) { return id; }
     }
     return uuid::new_nil();
   }
 
-  /// Re-emit a placement's current state (used for tier changes and
-  /// re-packaging); assumes the owning shard mutex is held.
+  /// Re-emit a placement's current state; the shard mutex must be held.
   void reemit_state(placement& p)
   {
     switch (p.state) {
@@ -212,7 +207,6 @@ void batch_telemetry_registry::install(
       impl_->tier_handles.push_back(std::move(handle));
     };
 
-  // One tier resource per GPU device; HOST and DISK are engine-wide.
   for (const auto* space :
        memory_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU)) {
     const auto device_id = space->get_id().device_id;
@@ -237,7 +231,6 @@ void batch_telemetry_registry::uninstall()
 {
   if (!impl_->enabled.exchange(false, std::memory_order_acq_rel)) { return; }
 
-  // Drain anything a query left behind (normally on_query_end already did).
   for (auto& shard : impl_->shards) {
     std::lock_guard lock(shard.mutex);
     for (auto& [batch_id, placements] : shard.placements) {
@@ -279,10 +272,7 @@ void batch_telemetry_registry::on_published(const std::shared_ptr<cucascade::dat
   {
     std::shared_lock lock(impl_->ports_mutex);
     auto it = impl_->ports.find(repo);
-    if (it == impl_->ports.end()) {
-      // Repositories outside the plan's port model (if any) are not tracked.
-      return;
-    }
+    if (it == impl_->ports.end()) { return; }
     port = it->second;
   }
 
@@ -330,8 +320,7 @@ void batch_telemetry_registry::on_packaged(const std::shared_ptr<cucascade::data
   std::lock_guard lock(shard.mutex);
   auto& placements = shard.placements[snap->batch_id];
 
-  // Prefer the queued placement on this consumer; fall back to a previously
-  // packaged one (re-claim after an OOM reschedule).
+  // Prefer this consumer's queued placement; else a packaged one (re-claim).
   impl::placement* target = nullptr;
   for (auto& p : placements) {
     if (p.pipeline_uuid == consumer_pipeline_uuid && p.state == impl::placement_state::queued) {
@@ -349,8 +338,7 @@ void batch_telemetry_registry::on_packaged(const std::shared_ptr<cucascade::data
   }
 
   if (target == nullptr) {
-    // First sighting (OOM-reschedule intermediates or otherwise outside the
-    // port model): register lazily, then package below.
+    // First sighting: register lazily, then package below.
     auto handle = quent::batch_placement::create(
       impl_->context->context(),
       {
@@ -443,8 +431,7 @@ void batch_telemetry_registry::on_consumed(uint64_t batch_id, uuid::UUID task_uu
   if (it == shard.placements.end()) { return; }
   auto& placements = it->second;
   for (auto p = placements.begin(); p != placements.end();) {
-    // Only the currently claiming task consumes; a placement re-claimed by a
-    // rescheduled task carries that task's uuid and is left alone.
+    // Only the currently claiming task consumes; re-claims are left alone.
     if (p->task_uuid == task_uuid && p->state != impl::placement_state::queued) {
       impl_->consume(*p,
                      p->state == impl::placement_state::processing

@@ -38,16 +38,11 @@ namespace sirius::telemetry {
 
 class telemetry_context;
 
-/// How a batch placement entered the port/task model, recorded on the
-/// placement's registration event.
+/// How a batch placement entered the port/task model.
 enum class batch_origin : uint8_t {
-  /// A producing operator pushed the batch into a consumer port's repository.
-  operator_output,
-  /// A partition consumer operator received one partitioned piece.
-  partition_output,
-  /// First seen when a task claimed it: an intermediate released by an OOM
-  /// reschedule (or otherwise outside the port model), registered lazily.
-  reschedule_intermediate,
+  operator_output,          ///< pushed into a consumer port's repository
+  partition_output,         ///< received by a partition consumer operator
+  reschedule_intermediate,  ///< lazily registered at task claim
 };
 
 constexpr std::string_view to_string_view(batch_origin origin)
@@ -60,14 +55,11 @@ constexpr std::string_view to_string_view(batch_origin origin)
   return "unknown";
 }
 
-/// Why a batch placement left the model, recorded on the consumed event.
+/// Why a batch placement left the model.
 enum class batch_consumed_reason : uint8_t {
-  /// The claiming task computed on the batch and released it.
-  processed,
-  /// The claiming task was destroyed before computing (error paths).
-  task_failed,
-  /// Query-end drain of placements still sitting in repositories.
-  query_end,
+  processed,    ///< the claiming task computed on the batch
+  task_failed,  ///< the claiming task died before computing
+  query_end,    ///< drained at query end
 };
 
 constexpr std::string_view to_string_view(batch_consumed_reason reason)
@@ -80,91 +72,63 @@ constexpr std::string_view to_string_view(batch_consumed_reason reason)
   return "unknown";
 }
 
-/// Process-global registry emitting Batch placement telemetry.
+/// Process-global registry emitting BatchPlacement telemetry. A placement is
+/// one physical data batch published to one consuming pipeline's input port;
+/// fan-out yields one placement per consumer.
 ///
-/// A *placement* is one physical data batch published to one consuming
-/// pipeline's input port repository. Fan-out (the same batch pushed to several
-/// consumer ports) yields one placement per consumer; all placements of a
-/// batch share the engine's process-unique batch id. Placements advance
-/// through the Batch FSM (registered -> queued -> packaged -> processing ->
-/// consumed) with memory-tier usages, and tier changes (downgrade/spill or
-/// prepare-time upgrade) re-emit the current state with the new tier.
-///
-/// Thread safety: placements are sharded by batch id; consumer-port mappings
-/// use a shared mutex. Methods that read a batch (`on_published`,
-/// `on_packaged`, `on_processing`) take the batch's shared read lock
-/// themselves *before* touching registry state — never call them with the
-/// same batch exclusively (mutably) locked. `on_tier_change` takes plain
-/// values for exactly that reason: it is called from conversion paths that
-/// hold the exclusive lock.
-///
-/// Every method no-ops when the registry is not installed (telemetry or batch
-/// events disabled).
+/// Methods taking a batch acquire its shared read lock — never call them with
+/// the batch exclusively locked (`on_tier_change` takes plain values for such
+/// callers). Every method no-ops when the registry is not installed.
 class batch_telemetry_registry {
  public:
   static batch_telemetry_registry& instance();
 
-  /// Enable batch telemetry: creates the "GPU"/"HOST"/"DISK" MemoryTier
-  /// resources (capacity = total configured bytes per tier) and retains the
-  /// telemetry context. Called once at SiriusContext initialization.
+  /// Enable batch telemetry: create the per-tier MemoryTier resources and
+  /// retain the telemetry context.
   void install(std::shared_ptr<const telemetry_context> context,
                sirius::memory::sirius_memory_reservation_manager& memory_manager);
 
-  /// Drain any leftover placements, drop the MemoryTier resources, release the
-  /// telemetry context, and disable. Called at SiriusContext teardown.
+  /// Drain leftover placements, drop the MemoryTier resources, and disable.
   void uninstall();
 
-  /// Associate a consumer port's data repository with its pipeline (== quent
-  /// operator id) and receiving-port uuid. Called from emit_plan_telemetry
-  /// during query construction; mappings are cleared by on_query_end.
+  /// Associate a consumer port's data repository with its pipeline and port.
   void register_consumer_port(const cucascade::shared_data_repository* repo,
                               uuid::UUID pipeline_uuid,
                               uuid::UUID port_uuid);
 
-  /// A producer published `batch` into `repo`: emits registered -> queued for
-  /// a new placement on the repo's consumer pipeline. Call *before* the batch
-  /// is added to the repository so `queued` always precedes `packaged`.
+  /// A producer published `batch` into `repo`: registered -> queued. Call
+  /// before the batch is added to the repository.
   void on_published(const std::shared_ptr<cucascade::data_batch>& batch,
                     const cucascade::shared_data_repository* repo,
                     batch_origin origin);
 
-  /// A task claimed `batch` as input: queued -> packaged on the matching
-  /// placement. Re-claims after an OOM reschedule re-emit packaged with the
-  /// new task; batches never seen before (reschedule intermediates) are
-  /// lazily registered.
+  /// A task claimed `batch` as input: queued -> packaged (re-claims re-emit
+  /// packaged; unseen batches are lazily registered).
   void on_packaged(const std::shared_ptr<cucascade::data_batch>& batch,
                    uuid::UUID consumer_pipeline_uuid,
                    uuid::UUID task_uuid);
 
-  /// The claiming task finished preparing and started computing:
-  /// packaged -> processing (tier re-read to capture prepare-time upgrades).
+  /// The claiming task started computing: packaged -> processing.
   void on_processing(const std::shared_ptr<cucascade::data_batch>& batch, uuid::UUID task_uuid);
 
-  /// Same as on_processing for batches already released by prepare (merge/
-  /// concat inputs are consumed while materializing): transitions the
-  /// placement with its last recorded tier/bytes instead of re-reading.
+  /// on_processing for batches already released by prepare, using the last
+  /// recorded tier/bytes.
   void on_processing_by_id(uint64_t batch_id, uuid::UUID task_uuid);
 
-  /// The claiming task is done with the batch: -> consumed + exit. Placements
-  /// re-claimed by another task (OOM reschedule) are left untouched.
+  /// The claiming task is done with the batch: -> consumed + exit.
   void on_consumed(uint64_t batch_id, uuid::UUID task_uuid);
 
-  /// The batch's data moved to another memory tier: re-emit every live
-  /// placement's current state with the new tier usage. Takes values, not the
-  /// batch — callers hold the batch's exclusive lock. `device_id` selects the
-  /// per-device GPU tier resource; it is ignored for HOST/DISK.
+  /// The batch's data moved to another tier: re-emit every live placement's
+  /// state with the new tier usage. Callers may hold the batch's lock.
   void on_tier_change(uint64_t batch_id,
                       cucascade::memory::Tier tier,
                       int32_t device_id,
                       uint64_t bytes);
 
-  /// Drain all remaining placements as consumed{"query_end"} and clear the
-  /// consumer-port mappings. Called from SiriusContext::QueryEnd.
+  /// Drain all remaining placements and clear the consumer-port mappings.
   void on_query_end();
 
-  /// The MemoryTier resource for (tier, device), e.g. for task states that
-  /// report their processing-space reservation on the same tier resources
-  /// batches use. Nil when the registry is not installed.
+  /// The MemoryTier resource for (tier, device); nil when not installed.
   [[nodiscard]] uuid::UUID tier_resource(cucascade::memory::Tier tier, int32_t device_id) const;
 
   batch_telemetry_registry(const batch_telemetry_registry&)            = delete;

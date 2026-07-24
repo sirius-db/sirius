@@ -99,8 +99,7 @@ fn memory_tier_events(id: Uuid, parent: Uuid, name: &str, bytes: u64) -> Vec<Eve
 ///
 /// Batch A (pipeline op1, batch_id 7, 1000 bytes), timestamps relative to the
 /// query epoch:
-/// - t=0    registered on GPU (100ns span: pins the analyzer's explicit
-///          omission of the bookkeeping entry state from aggregates)
+/// - t=0    registered on GPU
 /// - t=100  queued on GPU
 /// - t=300  queued on HOST (tier-change self-transition: spill)
 /// - t=500  packaged (task 1) on HOST
@@ -324,13 +323,9 @@ fn fixture(with_batches: bool) -> Fixture {
     }
 }
 
-/// Append one task on the op1 pipeline holding a GPU working-space
-/// reservation, following a legal Task FSM path (created → queued → reserving
-/// → preparing → computing → finalizing → exit). Only preparing/computing
-/// carry the `reservation` tier usage (2048 bytes on GPU); every other usage
-/// is absent, as the model permits.
-///
-/// Timestamps relative to the query epoch:
+/// Append one task on the op1 pipeline; only preparing/computing carry the
+/// `reservation` tier usage (2048 bytes on GPU). Timestamps relative to the
+/// query epoch:
 /// - t=0    created
 /// - t=100  queued (no reservation: contributes nothing to working space)
 /// - t=200  reserving (no reservation usage yet)
@@ -436,8 +431,6 @@ fn ingests_batches_and_memory_tiers() {
     assert_eq!(batch_a.pipeline_uuid(), Some(fixture.op1_id));
     assert_eq!(batch_a.last_task_uuid(), Some(fixture.task_1_id));
 
-    // The memory tiers are modeled as resources of type "memory_tier" with
-    // their tier name as instance name, marked as used by batches.
     for (id, name) in [
         (fixture.gpu_id, "GPU"),
         (fixture.host_id, "HOST"),
@@ -480,8 +473,7 @@ fn data_flow_timeline_bins() {
         .collect();
     assert_eq!(measures, ["count", "bytes"]);
 
-    // Only op1 has batches within the query; the foreign-pipeline batch is
-    // excluded, and op2 never appears since absent series mean all-zero.
+    // Only op1 has placements in the query; absent series mean all-zero.
     assert_eq!(binned.operators.len(), 1);
     assert!(!binned.operators.contains_key(&fixture.op2_id));
     let series = &binned.operators[&fixture.op1_id];
@@ -505,13 +497,10 @@ fn data_flow_timeline_bins() {
         count["batch_processing"]["GPU"],
         [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0]
     );
-    // batch_registered spans a real 100ns in this fixture but is explicitly
-    // omitted by the analyzer (bookkeeping entry state); batch_consumed holds
-    // no tier residency.
+    // batch_registered is omitted; batch_consumed holds no tier residency.
     assert!(!count.contains_key("batch_registered"));
     assert!(!count.contains_key("batch_consumed"));
-    // No task in this fixture holds a working-space reservation, so the
-    // synthetic task series is absent.
+    // No task holds a reservation, so the synthetic series is absent.
     assert!(!count.contains_key("task_working_space"));
 
     let bytes = &series.values["bytes"];
@@ -539,10 +528,8 @@ fn data_flow_timeline_task_working_space() {
     assert_eq!(binned.operators.len(), 1);
     let series = &binned.operators[&fixture.op1_id];
 
-    // The synthetic working-space series covers exactly the reservation-
-    // holding state spans: preparing [400, 700) + computing [700, 900).
-    // created/queued/reserving ([0, 400)) and finalizing ([900, 1000)) carry
-    // no tier usage and contribute nothing.
+    // Only the reservation-holding spans contribute: preparing [400, 700)
+    // + computing [700, 900).
     let count = &series.values["count"];
     assert_eq!(
         count["task_working_space"]["GPU"],

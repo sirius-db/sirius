@@ -1,11 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! BatchPlacement FSM analysis types.
-//!
-//! Mirrors `task.rs`: with `FsmEvents<T>` providing all generic trait impls
-//! (`Entity`, `Fsm`, `FsmUsages`, `Using`, `FsmTypeDeclaration`), the batch
-//! analyzer is just type aliases plus application-specific helper methods.
+//! BatchPlacement FSM analysis types, mirroring `task.rs`.
 
 use instrumentation_model::batch::BatchPlacementTransition as ModelBatchPlacementTransition;
 use quent_analyzer::{
@@ -29,8 +25,7 @@ pub type BatchPlacementBuilder = FsmEventsBuilder<ModelBatchPlacementTransition>
 
 /// Application-specific methods on the BatchPlacement FSM.
 pub trait BatchPlacementExt {
-    /// The engine's process-unique batch id, shared by all placements and
-    /// re-packagings of one physical batch.
+    /// The engine's process-unique batch id, shared by all placements.
     fn batch_id(&self) -> Option<u64>;
     /// The consuming pipeline (== quent Operator id), from the registration.
     fn pipeline_uuid(&self) -> Option<Uuid>;
@@ -99,8 +94,6 @@ impl BatchPlacementExt for BatchPlacement {
                         })
                         .collect(),
                     timestamp: to_secs_relative(transition.timestamp(), epoch),
-                    // The transition's typed data (batch_id, pipeline_uuid,
-                    // origin, task_uuid, reason, ...) rendered by the model.
                     attributes: transition.attributes(),
                     derived_attributes: vec![],
                 })

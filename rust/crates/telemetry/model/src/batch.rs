@@ -1,38 +1,23 @@
-//! Batch placement telemetry.
-//!
-//! A BatchPlacement entity tracks one *placement* of a physical data batch
-//! (a `data_batch` entity, keyed by the shared `batch_id` attribute): the
-//! lifecycle of a batch published to one consuming pipeline's input port.
-//! Fan-out (the same physical batch pushed to multiple consumer ports)
-//! produces one placement per consumer; all placements share the engine's
-//! process-unique `batch_id` attribute. Re-packaging after an OOM reschedule
-//! keeps the same placement entity (a `packaged => packaged` self-transition
-//! with a new `task_uuid`).
-//!
-//! Every non-terminal state carries a `tier` usage on one of the MemoryTier
-//! resources ("GPU", "HOST", "DISK") with `bytes` = the batch's data size, so
-//! a tier change (downgrade/spill or prepare-time upgrade) is a self-
-//! transition with a different tier usage.
+//! Batch placement telemetry: one placement per (physical batch x consuming
+//! pipeline input port), fan-out producing one placement per consumer. Every
+//! non-terminal state carries a `tier` usage with `bytes` = the batch's data
+//! size; a tier change is a self-transition with a different tier usage.
 
 use quent_model::{fsm, resource, state};
 use uuid::Uuid;
 
 resource! {
-    /// A memory tier data batches can reside in. One instance per tier:
-    /// "GPU", "HOST", "DISK".
+    /// A memory tier data batches can reside in ("GPU-<n>", "HOST", "DISK").
     MemoryTier {
         capacity: { bytes: Option<u64> },
     }
 }
 
 state! {
-    // batch_id: the engine's process-unique batch id, shared by all
-    //   placements/re-packagings of one physical batch.
+    // batch_id: process-unique, shared by all placements of one batch.
     // pipeline_uuid: the consumer pipeline (== quent Operator id).
-    // port_uuid: the consumer pipeline's source port receiving the batch.
-    // origin: "operator_output" | "partition_output" |
-    //   "reschedule_intermediate" — the C++ `batch_origin` enum
-    //   (batch_telemetry.hpp) is the closed set's source of truth.
+    // port_uuid: the consumer's receiving port.
+    // origin: a C++ `batch_origin` value (batch_telemetry.hpp).
     BatchRegistered {
         attributes: {
             batch_id: u64,
@@ -47,8 +32,7 @@ state! {
 }
 
 state! {
-    // Waiting in the consumer port's shared data repository for the scheduler
-    // to package it into a task.
+    // Waiting in the consumer port's data repository.
     BatchQueued {
         usages: {
             tier: MemoryTier,
@@ -57,8 +41,7 @@ state! {
 }
 
 state! {
-    // Bound to a task as input data; the task is queued/routing/reserving/
-    // preparing.
+    // Bound to a task that has not started computing yet.
     BatchPackaged {
         attributes: {
             task_uuid: Uuid,
@@ -82,9 +65,7 @@ state! {
 }
 
 state! {
-    // reason: "processed" | "task_failed" | "query_end" — the C++
-    //   `batch_consumed_reason` enum (batch_telemetry.hpp) is the closed
-    //   set's source of truth.
+    // reason: a C++ `batch_consumed_reason` value (batch_telemetry.hpp).
     BatchConsumed {
         attributes: {
             reason: String,
@@ -104,37 +85,16 @@ fsm! {
         entry: batch_registered,
         exit_from: { batch_consumed },
         transitions: {
-            // Normal publish: the producing operator pushed the batch into the
-            // consumer port's shared data repository.
-            batch_registered => batch_queued,
-            // Lazy registration: the batch first became visible to telemetry
-            // when a task claimed it (OOM-reschedule intermediates, pinned
-            // cache inputs).
-            batch_registered => batch_packaged,
-
-            // Tier change (downgrade/spill or upgrade) while idle in a repo.
-            batch_queued => batch_queued,
-
-            // A task popped the batch from the repo as part of its input data.
-            batch_queued => batch_packaged,
-
-            // Tier change while bound to a queued task, or re-packaged into a
-            // rescheduled task (new task_uuid) after the original task died.
-            batch_packaged => batch_packaged,
-
-            // The task finished preparing and started computing on the batch;
-            // the tier usage reflects post-upgrade residency.
-            batch_packaged => batch_processing,
-
-            // Defensive: tier change mid-compute.
-            batch_processing => batch_processing,
-
-            // The task holding the batch finished with it.
-            batch_processing => batch_consumed,
-            // The task was destroyed before compute (error paths).
-            batch_packaged => batch_consumed,
-            // Query-end drain of batches still sitting in repos.
-            batch_queued => batch_consumed,
+            batch_registered => batch_queued,    // published to a repo
+            batch_registered => batch_packaged,  // lazy registration at claim
+            batch_queued => batch_queued,        // tier change in repo
+            batch_queued => batch_packaged,      // claimed by a task
+            batch_packaged => batch_packaged,    // tier change or re-claim
+            batch_packaged => batch_processing,  // task started computing
+            batch_processing => batch_processing, // tier change mid-compute
+            batch_processing => batch_consumed,  // processed
+            batch_packaged => batch_consumed,    // task died before compute
+            batch_queued => batch_consumed,      // query-end drain
         },
     }
 }

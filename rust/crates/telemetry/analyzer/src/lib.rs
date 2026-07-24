@@ -71,25 +71,19 @@ pub mod view;
 const TASK_TYPE_NAME: &str = "task";
 const DATA_BATCH_TYPE_NAME: &str = "data_batch";
 const BATCH_PLACEMENT_TYPE_NAME: &str = "batch_placement";
-/// The BatchPlacement FSM's entry state: instantaneous bookkeeping (queued/packaged
-/// follow microseconds later), omitted from every aggregated series.
+/// The BatchPlacement FSM's instantaneous entry state, omitted from aggregates.
 const BATCH_REGISTERED_STATE: &str = "batch_registered";
-/// Synthetic data-flow series: the processing space (memory reservation) tasks
-/// hold on a tier while preparing/computing, shown beside the batch lifecycle
-/// states in the DAG view. Note the reservation includes room to materialize
-/// the task's inputs, so it can overlap the input batches' resident bytes.
+/// Synthetic series: the memory reservation tasks hold while
+/// preparing/computing (may overlap the input batches' resident bytes).
 const TASK_WORKING_SPACE_STATE: &str = "task_working_space";
 /// Data-flow measure counting batches residing in each (state, tier) cell.
 const MEASURE_COUNT: &str = "count";
 /// Data-flow measure summing batch bytes held in each (state, tier) cell.
 const MEASURE_BYTES: &str = "bytes";
 
-/// Push one entity's tier residency into the data-flow aggregation: state `i`
-/// spans transition `i` to `i + 1`, keyed by the memory tier its usage points
-/// at. Walks raw transitions rather than `usages_with_state_names` so a tier
-/// change (self-transition with a different tier usage) splits the state's
-/// residency across both dimension keys. `state_for` labels each span (`None`
-/// skips it); spans without a tier usage hold no residency and are skipped.
+/// Push one entity's per-state tier residency into the data-flow aggregation.
+/// `state_for` labels each transition span (`None` skips it); a tier-change
+/// self-transition splits a state's residency across both dimension keys.
 fn push_tier_state_spans<'a, T>(
     builder: &mut CategoricalTimelineBuilder<Uuid, &'a str, &'a str, &'a str>,
     tier_names: &HashMap<Uuid, &'a str>,
@@ -150,10 +144,8 @@ fn push_tier_state_spans<'a, T>(
     }
     Ok(())
 }
-/// The memory tiers in stable stacking/legend order.
-/// Stable dimension-key order: GPU tiers first (per-device "GPU-0",
-/// "GPU-1", ... or the legacy aggregate "GPU"), then HOST, then DISK, then
-/// anything unexpected sorted by name.
+
+/// Stable dimension-key order: GPU tiers, HOST, DISK, then unknown by name.
 fn memory_tier_rank(name: &str) -> (u8, &str) {
     if name == "GPU" || name.starts_with("GPU-") {
         (0, name)
@@ -1226,7 +1218,7 @@ impl UiAnalyzer for SiriusUiAnalyzer {
         let epoch = self.query_engine_model().query_epoch(query_id)?;
         let config = request.config.try_into_binned_span(epoch)?;
 
-        // Empty means all measures; unknown names are errors, not ignored.
+        // Empty means all measures; unknown names are errors.
         if let Some(unknown) = request
             .measures
             .iter()
@@ -1243,10 +1235,8 @@ impl UiAnalyzer for SiriusUiAnalyzer {
 
         let view = self.model.query_view(query_id)?;
 
-        // Dimension keys are the memory_tier resources' instance names. The
-        // tier resources exist iff batch-placement telemetry was enabled when
-        // recording, so their absence means the whole view is unsupported
-        // (HTTP 501) rather than merely empty.
+        // The memory_tier resources exist iff batch telemetry was enabled
+        // when recording; without them the view is unsupported (HTTP 501).
         let tier_names: HashMap<Uuid, &str> = self
             .model
             .arbitrary_resources
@@ -1259,8 +1249,6 @@ impl UiAnalyzer for SiriusUiAnalyzer {
         }
 
         let mut builder = CategoricalTimelineBuilder::new(config);
-        // Batch placements: every lifecycle state's tier residency, except the
-        // instantaneous bookkeeping entry state.
         for batch in view.batch_placements() {
             let Some(operator_id) = batch.pipeline_uuid() else {
                 continue;
@@ -1275,8 +1263,6 @@ impl UiAnalyzer for SiriusUiAnalyzer {
                 want_bytes,
             )?;
         }
-        // Task processing space: the memory reservation tasks hold while
-        // preparing/computing, as one synthetic series per operator.
         for task in view.tasks() {
             let Some(operator_id) = task.pipeline_uuid() else {
                 continue;
@@ -1292,8 +1278,7 @@ impl UiAnalyzer for SiriusUiAnalyzer {
             )?;
         }
 
-        // Pivot into per-operator series; all-zero series are omitted (the
-        // protocol treats absent entries as all-zero bins).
+        // Pivot into per-operator series; all-zero series are omitted.
         let mut operators: StdHashMap<Uuid, CategoricalSeries> = StdHashMap::new();
         for (key, bins) in builder.build().data {
             if bins.iter().all(|v| *v == 0.0) {
@@ -1310,8 +1295,6 @@ impl UiAnalyzer for SiriusUiAnalyzer {
                 .insert(key.dimension.to_owned(), bins);
         }
 
-        // Declared dimension keys: tiers present in the model, in stable
-        // GPU-*/HOST/DISK stacking order (unexpected names sort last).
         let present_tiers: HashSet<&str> = tier_names.values().copied().collect();
         let mut ordered_tiers: Vec<&str> = present_tiers.into_iter().collect();
         ordered_tiers.sort_unstable_by_key(|tier| memory_tier_rank(tier));
