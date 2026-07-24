@@ -67,9 +67,11 @@ duckdb::vector<std::unique_ptr<sirius::ast::node>> translate_expressions(
 
 std::vector<cudf::data_type> scan_physical_schema(duckdb::LogicalGet& op,
                                                   duckdb::SiriusContext* state,
-                                                  const duckdb::vector<duckdb::ColumnIndex>& ids)
+                                                  const duckdb::vector<duckdb::ColumnIndex>& ids,
+                                                  sirius::scan_manager::pinned_entry const* entry)
 {
-  if (!state || !state->get_config().get_operator_params().enable_compressed_materialization) {
+  if (!state || !state->get_config().get_operator_params().enable_compressed_materialization ||
+      entry == nullptr) {
     return {};
   }
 
@@ -77,23 +79,9 @@ std::vector<cudf::data_type> scan_physical_schema(duckdb::LogicalGet& op,
   // and each column's plan target is derived from the pinned entry's ACTUAL stored chunk carriers —
   // pin-time narrowing computed exact per-chunk min/max on materialized data, so the carriers are
   // ground truth and serving narrow is free (the casts were paid at pin time). Everything else
-  // stays native: an unpinned scan returns before any derivation and is byte-identical to
-  // feature-off, and a pinned-native column is never narrowed at serve time as a recurring
-  // per-query cost.
-  sirius::scan_manager::pinned_entry const* entry = nullptr;
-  if (op.function.name == "seq_scan") {
-    auto* table_scan_bind = dynamic_cast<duckdb::TableScanBindData*>(op.bind_data.get());
-    if (table_scan_bind == nullptr || !table_scan_bind->table.IsDuckTable()) { return {}; }
-    auto& table = table_scan_bind->table.Cast<duckdb::DuckTableEntry>();
-    entry       = state->get_scan_manager().find_pinned_entry_for_duckdb_table(
-      table.ParentCatalog().GetName(), table.ParentSchema().name, table.name);
-  } else {
-    auto const files =
-      resolve_parquet_scan_file_paths(op.function.name, op.bind_data.get(), op.parameters);
-    if (files.empty()) { return {}; }
-    entry = state->get_scan_manager().find_pinned_entry_for_parquet_files(files);
-  }
-  if (entry == nullptr) { return {}; }
+  // stays native: an unpinned scan (null @p entry) returns before any derivation and is
+  // byte-identical to feature-off, and a pinned-native column is never narrowed at serve time as a
+  // recurring per-query cost.
   // A pin that cannot serve the requested columns means execution reads disk
   // fresh; a narrow sidecar would reintroduce per-batch verification and casts.
   auto const projection = entry->cache_info.column_projection_for(ids);
@@ -167,7 +155,27 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
                         ? context.registered_state->Get<duckdb::SiriusContext>("sirius_state")
                         : nullptr;
 
-  auto physical_types = scan_physical_schema(op, sirius_state.get(), column_ids);
+  // One pinned-entry probe per scan: the compressed-materialization residency gate and
+  // the seq_scan MVCC cache-or-CPU guard below share the result. The parquet identity
+  // feeds only the gate, so its file resolution runs only when the feature is on.
+  sirius::scan_manager::pinned_entry const* pinned = nullptr;
+  if (sirius_state && op.function.name == "seq_scan") {
+    auto* bind = dynamic_cast<duckdb::TableScanBindData*>(op.bind_data.get());
+    if (bind != nullptr && bind->table.IsDuckTable()) {
+      auto& table = bind->table.Cast<duckdb::DuckTableEntry>();
+      pinned      = sirius_state->get_scan_manager().find_pinned_entry_for_duckdb_table(
+        table.ParentCatalog().GetName(), table.ParentSchema().name, table.name);
+    }
+  } else if (sirius_state &&
+             sirius_state->get_config().get_operator_params().enable_compressed_materialization) {
+    auto const files =
+      resolve_parquet_scan_file_paths(op.function.name, op.bind_data.get(), op.parameters);
+    if (!files.empty()) {
+      pinned = sirius_state->get_scan_manager().find_pinned_entry_for_parquet_files(files);
+    }
+  }
+
+  auto physical_types = scan_physical_schema(op, sirius_state.get(), column_ids, pinned);
 
   if (!op.children.empty()) {
     throw duckdb::NotImplementedException("Table Input Output functions are not supported yet");
@@ -224,29 +232,24 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
         }
       }
 
-      sirius::scan_manager::pinned_entry const* entry = nullptr;
-      if (sirius_state) {
-        entry = sirius_state->get_scan_manager().find_pinned_entry_for_duckdb_table(
-          table.ParentCatalog().GetName(), table.ParentSchema().name, table.name);
-      }
-      if (entry != nullptr && entry->mvcc != nullptr) {
+      if (pinned != nullptr && pinned->mvcc != nullptr) {
         // Cache-or-CPU guards: while this table is MVCC-pinned, a GPU plan
         // either serves exactly from the pinned cache (DELETE keep-masks) or is
         // refused HERE, where the throw still becomes a clean CPU fallback. The
         // disk-native path is MVCC-blind, and the pin's checkpoint suppression
         // makes its snapshot increasingly stale — so scans the pin cannot serve
         // never fall through to it.
-        auto const n_cache = entry->mvcc->n_cache();
+        auto const n_cache = pinned->mvcc->n_cache();
         // (a) snapshot-too-old: this transaction opened before the pin, so
         // the cache's base image is from its future.
         auto const start_time =
           duckdb::DuckTransaction::Get(context, table.ParentCatalog()).start_time;
-        if (start_time < entry->mvcc->v_base) {
+        if (start_time < pinned->mvcc->v_base) {
           throw duckdb::NotImplementedException(
             "duckdb-native scan: transaction snapshot (%llu) predates the pinned cache "
             "snapshot (%llu) for table '%s'",
             static_cast<unsigned long long>(start_time),
-            static_cast<unsigned long long>(entry->mvcc->v_base),
+            static_cast<unsigned long long>(pinned->mvcc->v_base),
             table.name);
         }
         // (b) insert-present: committed rows beyond the pinned prefix, or
@@ -268,7 +271,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
         }
         bool pin_serves = !has_unservable_column;
         if (pin_serves && !column_ids.empty()) {
-          pin_serves = !entry->cache_info.column_projection_for(column_ids).empty();
+          pin_serves = !pinned->cache_info.column_projection_for(column_ids).empty();
         }
         if (!pin_serves) {
           // (d) column-mismatch: the scan would fall through to the MVCC-blind
@@ -328,7 +331,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
       // unpinned table is MVCC-blind (#1143): uncheckpointed deletes and
       // update chains are served silently, and committed-but-uncheckpointed
       // inserts fail loudly at execution.
-      if (entry == nullptr || entry->mvcc == nullptr) {
+      if (pinned == nullptr || pinned->mvcc == nullptr) {
         // No MVCC-pinned cache for this table: the plan is the disk-native
         // read, which applies no visibility filtering — refuse any state it
         // would misread HERE, where the throw still becomes a clean CPU

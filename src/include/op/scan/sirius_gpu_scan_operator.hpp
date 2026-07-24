@@ -54,32 +54,29 @@ namespace sirius::op::scan {
  * downstream pipeline.
  *
  * Lifecycle:
- *   1. Pipeline converter constructs the operator with the per-table
- *      @c ingestible_table_info (parquet or duckdb-native today).
- *   2. @c sirius_scan_manager::prepare_for_query peeks the table_info to
- *      match pinned-cache entries. On match: builds the cached ingestible
- *      from the stolen table_info. On miss: calls
- *      @c make_gpu_ingestible(take_table_info(), mgr, gpu_ioctxs).
- *      Either way, scan_manager calls @ref install_ingestible to hand
- *      the operator its source.
- *   3. The scan_manager also installs a fresh @c split_connector and
- *      drives a @c scan_manager::split_provider that composes the same
- *      ingestible — the provider populates the connector with splits
- *      that the operator pulls via @ref get_next_task_input_data.
- *   4. @ref execute dispatches each split through the installed
- *      ingestible's @c materialize_table and (conditionally)
- *      @c post_filter_and_project.
+ *   1. The pipeline converter constructs the operator with its
+ *      @c gpu_ingestible (parquet or duckdb-native today).
+ *   2. @c sirius_scan_manager::prepare_for_query matches the ingestible's
+ *      @c table_info against pinned-cache entries to decide cached-vs-fresh
+ *      serving, installs a fresh @c split_connector, and drives a
+ *      @c scan_manager::split_provider composing the same ingestible — the
+ *      provider populates the connector with splits that the operator
+ *      pulls via @ref get_next_task_input_data.
+ *   3. @ref execute dispatches each split through the ingestible's
+ *      @c materialize_table and (conditionally) @c post_filter_and_project.
  */
 class sirius_gpu_scan_operator : public sirius_physical_operator {
  public:
   static constexpr SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::GPU_SCAN;
 
-  /**gp
+  /**
    * @param types                  Output column types in plan order.
    * @param estimated_cardinality  Planner-estimated row count.
-   * @param table_info             Per-table bind data; consumed by
-   *                               @c sirius_scan_manager during
-   *                               @c prepare_for_query.
+   * @param ingestible             Source this scan materializes through; its
+   *                               @c table_info identifies the scan to the
+   *                               scan_manager.
+   * @param compressed_materialization_observer  Plan-time counter sink for
+   *                               narrowing observability; may be null.
    */
   sirius_gpu_scan_operator(duckdb::vector<sirius::logical_type> types,
                            duckdb::idx_t estimated_cardinality,
@@ -120,15 +117,6 @@ class sirius_gpu_scan_operator : public sirius_physical_operator {
 
   [[nodiscard]] std::size_t no_history_peak_memory_estimate(
     const op::input_stats& stats) const override;
-
-  /**
-   * @brief Const accessor for the parked table_info. Used by
-   *        @c sirius_scan_manager::try_make_cached_ingestible to match
-   *        the operator's file paths against pinned entries.
-   *
-   * @pre @c take_table_info has not been called yet.
-   */
-  [[nodiscard]] const ingestible_table_info& peek_table_info() const;
 
   [[nodiscard]] gpu_ingestible& get_ingestible() const;
 
