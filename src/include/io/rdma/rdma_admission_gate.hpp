@@ -63,32 +63,26 @@ struct cuobj_chunked_rx_request {
  *        (safety contract: experimental/s3-rdma-transport-design.md,
  *        Section 5).
  *
- * The gate OWNS the bounded envelope queue — one envelope per LOGICAL read
- * request; @c claim materializes one chunk at a time from the front envelope,
- * so chunk generation stays lazy and the cap bounds logical requests.  Its
- * terminal state is three orthogonal fields under one mutex:
- * `admission_closed` (monotonic), `first_fatal` (latched at most once, legally
- * AFTER closing — an already-issued GET may still fail during shutdown and
- * must win), and the close-completion inputs (permits, outstanding data work,
- * drained).  The error authority is the single `exception_ptr`: every
- * admission call after the terminal point reports `first_fatal` when set,
- * else one stable "transport closed" error — a fatal never degrades to a
- * shutdown error.
+ * The gate owns the bounded queue of one envelope per logical read request;
+ * @c claim materializes one chunk at a time from the front envelope, so the
+ * cap bounds logical requests. Terminal state is three fields under one mutex:
+ * `admission_closed` (monotonic), `first_fatal` (latched at most once, and
+ * legally after closing, since an already-issued GET can still fail during
+ * shutdown and must win), and the close-completion inputs (permits,
+ * outstanding data work, drained). Error authority is the single
+ * `exception_ptr`: after the terminal point every admission call reports
+ * `first_fatal` when set, otherwise one stable "transport closed" error. A
+ * fatal never degrades to a shutdown error.
  *
- * The queue storage is a ring of empty slots pre-allocated at construction
- * (the only queue-storage allocation; the constructor may throw, the queue
- * machinery never allocates afterwards — the envelope-only submit overload
- * additionally derives a route before taking the lock).  A
- * submit commit is a placement move-construction into an empty slot — after
- * the terminal check and cap reservation succeed there is no remaining throw
- * point, so no partial-commit or rollback path exists.  A transition detaches
- * the whole ring backing into the returned @c drain_batch in O(1) with no
- * allocation, which is what lets @c fail_stop / @c begin_close be honestly
- * noexcept.
+ * The queue is a ring of empty slots preallocated in the constructor, the
+ * only queue-storage allocation; the ring operations and transitions do not
+ * allocate. A transition detaches the whole ring into the returned
+ * @c drain_batch in O(1) with no allocation, which is what makes @c fail_stop
+ * and @c begin_close noexcept.
  */
 class admission_gate {
  public:
-  /// ONE envelope = ONE logical read request, never one per chunk:
+  /// Each envelope represents one logical read request, never one per chunk:
   /// @c queue_cap and @c requests_total count logical requests, and chunks
   /// are generated lazily at claim time using @c slot_bytes as the grain.
   struct envelope {
@@ -111,7 +105,7 @@ class admission_gate {
     std::shared_ptr<const rx_route> route;
     envelope env;
   };
-  // The ring placement-constructs and destroys THIS type; the public
+  // The ring placement-constructs and destroys this type; the public
   // envelope asserts below are necessary but not sufficient.
   static_assert(std::is_nothrow_move_constructible_v<queued_request>);
   static_assert(std::is_nothrow_destructible_v<queued_request>);
@@ -129,7 +123,7 @@ class admission_gate {
     envelope_ring& operator=(const envelope_ring&) = delete;
     ~envelope_ring();
 
-    // The exception specification is DERIVED from the stored type's trait,
+    // The exception specification is derived from the stored type's trait,
     // so the commit-expression noexcept assert in submit() proves the real
     // property instead of echoing an unconditional declaration.
     void emplace(queued_request&& request) noexcept(
@@ -171,7 +165,7 @@ class admission_gate {
     {
       return _chunk.manager;
     }
-    /// Error-completes exactly THIS chunk via its manager (first error wins
+    /// Error-completes exactly this chunk via its manager (first error wins
     /// at the request level).  Call before dropping the guard on any abort.
     void report_error(std::exception_ptr error) noexcept;
 
@@ -289,7 +283,7 @@ class admission_gate {
   ~admission_gate();
 
   /// Whole-arena marker, bound at most once before the owning reactor is
-  /// externally visible.  The transition calls it while HOLDING the gate
+  /// externally visible.  The transition calls it while holding the gate
   /// mutex; the marker itself takes the arena mutex (lock order gate →
   /// arena), so the gate never needs a reference to that mutex.  The
   /// function-pointer type is structurally noexcept: the marker cannot throw.
@@ -311,7 +305,7 @@ class admission_gate {
   ///
   /// The route-taking overload is the production intake: the route is built
   /// once per request (at request preparation, on the caller's thread) and
-  /// travels by pointer, so the gate allocates NOTHING on this path.  The
+  /// travels by pointer, so the gate allocates nothing on this path.  The
   /// envelope-only overload is the convenience form (the test surface):
   /// it derives the route from the envelope's bucket/key before taking the
   /// lock — its one allocation precedes the terminal check and reservation,
@@ -328,7 +322,7 @@ class admission_gate {
 
   /// Takes the get permit immediately before the client GET, atomically
   /// transferring the claim guard into it.  Throws the terminal error
-  /// WITHOUT consuming @p c — on the abort path the caller still owns the
+  /// without consuming @p c — on the abort path the caller still owns the
   /// claimed chunk and must report its error before dropping it.
   [[nodiscard]] admission_permit acquire_get(claimed_chunk&& c);
 

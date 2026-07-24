@@ -131,7 +131,7 @@ struct cuda_delivery_ops {
                                               cudaFlushGPUDirectRDMAWritesToOwner);
   };
   /// Stream-capture probe (pre-boundary leg; runs BEFORE the RDMA GET so a
-  /// doomed request makes no remote side effect).
+  /// rejected request makes no remote side effect).
   std::function<cudaError_t(cudaStream_t, cudaStreamCaptureStatus*)> stream_capture_query =
     [](cudaStream_t stream, cudaStreamCaptureStatus* status) {
       return cudaStreamIsCapturing(stream, status);

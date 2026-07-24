@@ -24,22 +24,21 @@
 
 namespace sirius::io::s3 {
 
-/// Deployment topology of the host-plane / RDMA-data-plane endpoint pair,
-/// judged once at construction and immutable afterwards.  @c same_address
-/// means the two configured addresses provably name one service after
-/// normalization — the cross-endpoint visibility barrier then reduces to
-/// that service's native read-after-write consistency and immutable keys
-/// remain the operative rule.  Transfer semantics are IDENTICAL in both
-/// modes; the value only drives the startup log line and diagnostics.
+/// Topology of the host-plane / RDMA-data-plane endpoint pair, judged at
+/// construction and fixed for the ioctx lifetime.  @c same_address means the
+/// two configured addresses name one service, so the cross-endpoint
+/// visibility barrier reduces to that service's read-after-write consistency.
+/// Transfer semantics are the same in both modes; the value only drives the
+/// startup log line and diagnostics.
 enum class endpoint_topology { split, same_address };
 
-/// Conservative same-address judgment over the two configured endpoints:
-/// scheme + host lowercased, default ports expanded (http:80 / https:443),
-/// one trailing slash stripped; NO DNS resolution.  Only a provably equal
-/// pair yields @c same_address — any ambiguity (including a CNAME alias of
-/// the same service) stays @c split, because misjudging same-address as
-/// split merely keeps three trivially-satisfied deployment locks, while the
-/// reverse would wrongly announce a relaxed contract.
+/// Same-address judgment over the two endpoints: scheme and host lowercased,
+/// default ports expanded (http:80 / https:443), one trailing slash stripped,
+/// no DNS resolution.  Only a provably equal pair is @c same_address; any
+/// ambiguity, including a CNAME alias of the same service, stays @c split.
+/// The bias is deliberate: a false @c split preserves the stricter
+/// split-address requirements, while a false @c same_address would wrongly
+/// relax the contract.
 [[nodiscard]] endpoint_topology detect_endpoint_topology(std::string_view host_endpoint,
                                                          std::string_view data_endpoint);
 
@@ -55,8 +54,9 @@ enum class endpoint_topology { split, same_address };
  * deliberately omits the staged host-to-device and vector host-read paths, so
  * the prefetch cache is never built for this backend.
  *
- * A missing transport capability fails loudly at @c start() rather than
- * falling back to another transport; host chunks ride the control plane and
+ * A missing transport capability makes @c start() return an initialization
+ * error rather than falling back to another transport; host chunks ride the
+ * control plane and
  * device chunks the per-worker data sessions (mocks in tests, the
  * curl/cuObject-backed clients in production).
  */
@@ -66,8 +66,8 @@ class s3_rdma_ioctx final : public templated_ioctx<rdma::cuobj_rdma_reactor>,
   /// @p clients is the split transport bundle (control client + data-session
   /// factory + tag predicate); @p delivery is the CUDA delivery seam.  Both
   /// bind at construction only.  Construction never validates capabilities —
-  /// @c start() does, so a misconfigured transport fails loudly on the
-  /// routing path instead of at build time.
+  /// @c start() does, so a misconfigured transport is rejected on the
+  /// routing path, not at build time.
   s3_rdma_ioctx(object_store_config cfg,
                 rdma::rdma_transport_clients clients,
                 rdma::cuda_delivery_ops delivery = {});
@@ -87,11 +87,10 @@ class s3_rdma_ioctx final : public templated_ioctx<rdma::cuobj_rdma_reactor>,
   /// host-plane and data-plane endpoints; immutable for the ioctx lifetime.
   [[nodiscard]] endpoint_topology topology() const noexcept { return _topology; }
 
-  /// LIST rides the host control plane (one ListObjectsV2 page per control
-  /// attempt, a control permit per page); the data plane stays exact-key.
-  /// v1 limitation: the scan caps are the built-in defaults — the shared
-  /// S3-control settings migration is v1.1 (contract §1), so a configured
-  /// REST-side cap does NOT apply to this backend yet.
+  /// LIST runs on the host control plane: one ListObjectsV2 page per control
+  /// attempt, one control permit per page.  The data plane stays exact-key.
+  /// Scan caps are the built-in defaults; a REST-side configured cap does not
+  /// apply here yet.
   void list_objects_paged(std::string_view bucket,
                           std::string_view prefix,
                           std::size_t page_size,

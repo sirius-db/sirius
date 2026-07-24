@@ -25,10 +25,9 @@
 namespace sirius::io {
 
 /// Listing capability of an object-store backend.  The scan manager's glob
-/// and LIST layers route through this interface instead of a concrete ioctx
-/// type, so any backend whose host/control plane speaks S3 can serve LIST —
-/// listing is prefix resolution on the control plane; what the DATA plane
-/// does with the resolved exact keys is the backend's own business.
+/// and LIST paths depend on this interface, not a concrete ioctx type.
+/// Listing is prefix resolution on the control plane; it is independent of
+/// how the data plane reads the resolved keys.
 class object_store_listing {
  public:
   virtual ~object_store_listing() = default;

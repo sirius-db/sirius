@@ -499,7 +499,7 @@ size_t cuobj_rdma_reactor::data_transfer(const cuobj_chunked_rx_request& chunk,
                                                   result.transport_error));
     case data_commit_state::completed: break;
   }
-  // Completion authority: ALL three legs must hold before the size report.
+  // Completion requires all three checks to hold before the size report.
   // Status is checked before the byte count so a completed-but-error-status
   // result is reported as its HTTP status rather than misattributed as a
   // short read (and its short-read counter left untouched).
@@ -630,7 +630,7 @@ void cuobj_rdma_reactor::process_claimed(admission_gate::claimed_chunk claimed_a
     const auto& ops = _ctx->delivery_ops();
 
     // Captured-stream validation runs before the RDMA GET, in release builds
-    // too, so a doomed request makes no remote side effect.  A sticky probe
+    // too, so a rejected request makes no remote side effect.  A sticky probe
     // result is context health, not slot lifetime: process-fatal even though
     // nothing is in flight.
     {
@@ -685,14 +685,11 @@ void cuobj_rdma_reactor::process_claimed(admission_gate::claimed_chunk claimed_a
       throw_on_cuda_error(create_rc, "completion event create failed");
     }
     event.created = true;
-    // dst is stream-ordered (RMM / cudaMallocAsync) memory: this copy is
-    // ordered after dst's allocation ONLY because it runs on the allocating
-    // (caller) stream.  Moving it to any other stream — e.g. a per-worker
-    // copy stream — REQUIRES the dispatch-time fence: record event A on the
-    // caller stream STRICTLY BEFORE publishing chunk work (a wait on a
-    // never-recorded event is a silent no-op, i.e. a deleted fence), make
-    // the copy stream cudaStreamWaitEvent(A) before this D2D, record E
-    // after it, make the caller stream wait E, and recycle the slot on E.
+    // dst is stream-ordered (RMM / cudaMallocAsync) memory. This copy is
+    // ordered after dst's allocation only because it runs on the caller
+    // stream. Moving it to another stream would need an explicit event fence:
+    // the fence event must be recorded on the caller stream before any chunk
+    // work is published, or the wait becomes a silent no-op.
     // ---- Delivery boundary: the first memcpy_async call (safety contract:
     // experimental/s3-rdma-transport-design.md, Section 5).  From here the
     // only returning path is an event wait that reports cudaSuccess; every
