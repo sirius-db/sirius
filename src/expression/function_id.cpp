@@ -52,8 +52,8 @@ constexpr std::array<std::pair<std::string_view, function_id>, 35> kForwardTable
   {"strlen", function_id::strlen},
   {"length", function_id::length},
   {"regexp_replace", function_id::regexp_replace},
-  {"concat", function_id::concat},  // canonical name (concat() function call)
-  {"||", function_id::concat},      // alias (DuckDB's || operator → ConcatOperatorFun)
+  {"concat", function_id::concat},       // concat() call — ignores NULL args
+  {"||", function_id::concat_operator},  // || operator (ConcatOperatorFun) — propagates NULL
   {"year", function_id::year},
   {"month", function_id::month},
   {"day", function_id::day},
@@ -70,18 +70,18 @@ constexpr std::array<std::pair<std::string_view, function_id>, 35> kForwardTable
 
 // Reverse table: Sirius function id -> canonical DuckDB function name.
 // Indexed directly by enum value; never searched.
-constexpr std::array<std::string_view, 28> kReverseTable = {
-  "+",      "-",           "*",           "/",           "//",
-  "%",      "substring",   "~~",          "!~~",         "contains",
-  "prefix", "suffix",      "strlen",      "length",      "regexp_replace",
-  "concat", "year",        "month",       "day",         "hour",
-  "minute", "second",      "millisecond", "microsecond", "date_trunc",
-  "row",    "struct_pack", "error",
+constexpr std::array<std::string_view, 29> kReverseTable = {
+  "+",          "-",         "*",           "/",           "//",
+  "%",          "substring", "~~",          "!~~",         "contains",
+  "prefix",     "suffix",    "strlen",      "length",      "regexp_replace",
+  "concat",     "||",        "year",        "month",       "day",
+  "hour",       "minute",    "second",      "millisecond", "microsecond",
+  "date_trunc", "row",       "struct_pack", "error",
 };
 
-static_assert(static_cast<std::size_t>(function_id::error) + 1 == 28,
-              "function_id::error must be the last entry; cardinality locked at 28.");
-static_assert(kReverseTable.size() == 28,
+static_assert(static_cast<std::size_t>(function_id::error) + 1 == 29,
+              "function_id::error must be the last entry; cardinality locked at 29.");
+static_assert(kReverseTable.size() == 29,
               "kReverseTable must have one slot per function_id value.");
 static_assert(kForwardTable.size() == 35,
               "kForwardTable includes SQL and Substrait aliases for supported function ids.");

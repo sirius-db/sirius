@@ -199,16 +199,23 @@ TEST_CASE_METHOD(NullDataFixture,
   compare_gpu_vs_cpu("SELECT id, substring(s, 1, 2) AS r FROM nt");
 }
 
-// KNOWN GPU DIVERGENCE (issue #1218):
-// DuckDB's concat() ignores NULL arguments (concat(NULL, '_x') = '_x'), but
-// Sirius's GPU concat propagates NULL (returns NULL) -- it behaves like the `||`
-// operator instead. Tagged [!shouldfail] so it documents the bug without failing
-// CI; remove the tag once GPU concat matches DuckDB's NULL-as-empty semantics.
+// DuckDB's concat() ignores NULL arguments (concat(NULL, '_x') = '_x'), whereas
+// the || operator propagates NULL ('a' || NULL = NULL). The two map to distinct
+// function ids with the corresponding narep, so both must match DuckDB.
 TEST_CASE_METHOD(NullDataFixture,
-                 "gpu_execution concat NULL-handling [known divergence]",
-                 "[integration][gpu_execution][projection][nulls][!shouldfail]")
+                 "gpu_execution concat() ignores NULL arguments",
+                 "[integration][gpu_execution][projection][nulls]")
 {
   compare_gpu_vs_cpu("SELECT id, concat(s, '_x') AS r FROM nt");
+  compare_gpu_vs_cpu("SELECT id, concat(s, s) AS r FROM nt");
+}
+
+TEST_CASE_METHOD(NullDataFixture,
+                 "gpu_execution || operator propagates NULL",
+                 "[integration][gpu_execution][projection][nulls]")
+{
+  compare_gpu_vs_cpu("SELECT id, s || '_x' AS r FROM nt");
+  compare_gpu_vs_cpu("SELECT id, s || s AS r FROM nt");
 }
 
 TEST_CASE_METHOD(NullDataFixture,
