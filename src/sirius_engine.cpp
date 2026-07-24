@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#error "CI test: remove me"
 #include "sirius_engine.hpp"
 
 #include "duckdb/execution/execution_context.hpp"
