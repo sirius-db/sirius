@@ -42,6 +42,7 @@
 #include <memory>
 #include <optional>
 #include <string_view>
+#include <unordered_set>
 #include <vector>
 
 namespace sirius {
@@ -137,6 +138,71 @@ struct build_probe_decision {
 /// discard_build_only_slots_if_probe_complete.
 [[nodiscard]] std::vector<std::size_t> broadcast_slots_to_discard(
   std::vector<build_probe_slot_view> const& slots, bool probe_finished);
+
+//===----------------------------------------------------------------------===//
+// STANDARD / MIXED_JOIN partial-barrier scheduling helpers.
+//
+// Under a partial barrier the build and probe batches for a partition arrive progressively. For a
+// partition we must join every build batch against every probe batch. The upstream concat operator
+// folds whichever side must be seen whole (LEFT/SEMI/ANTI -> build; RIGHT-family -> probe; OUTER ->
+// both) down to a single batch, so this per-partition cross product is correct for every join type
+// (see docs/super-sirius/operators.md). This structure tracks, per partition, the batch IDs
+// discovered on each side and which (probe,build) pairs have already been scheduled, so scheduling
+// tolerates the ID lists growing across calls and each batch is freed once it can no longer be
+// needed. probe = "default"/left, build = "build"/right.
+//===----------------------------------------------------------------------===//
+struct partition_cross_schedule {
+  std::vector<uint64_t> probe_ids;               ///< probe batch IDs, first-seen order
+  std::vector<uint64_t> build_ids;               ///< build batch IDs, first-seen order
+  std::unordered_set<uint64_t> probe_id_seen;    ///< dedup guard while re-polling
+  std::unordered_set<uint64_t> build_id_seen;    ///< dedup guard while re-polling
+  std::unordered_set<uint64_t> scheduled_pairs;  ///< key = (probe_idx << 32) | build_idx
+  std::vector<uint32_t> probe_paired_count;      ///< parallel to probe_ids: #build batches paired
+  std::vector<uint32_t> build_paired_count;      ///< parallel to build_ids: #probe batches paired
+  std::unordered_set<uint64_t> probe_popped;     ///< probe IDs already freed from the repo
+  std::unordered_set<uint64_t> build_popped;     ///< build IDs already freed from the repo
+};
+
+/// A fully-consumed batch that can be freed from its repository.
+struct cross_schedule_discard {
+  std::size_t partition = 0;
+  bool is_build         = false;  ///< true: "build" port; false: "default"/probe port
+  uint64_t batch_id     = 0;
+};
+
+enum class cross_schedule_kind : std::uint8_t { emit_pair, wait_build, wait_probe, done };
+
+/// The next (probe,build) pair to schedule, or why none is schedulable.
+struct cross_schedule_pair {
+  cross_schedule_kind kind = cross_schedule_kind::done;
+  std::size_t partition    = 0;  ///< valid iff kind == emit_pair
+  std::size_t probe_idx    = 0;  ///< index into partition's probe_ids; valid iff emit_pair
+  std::size_t build_idx    = 0;  ///< index into partition's build_ids; valid iff emit_pair
+};
+
+/// Encode / decode a (probe_idx, build_idx) pair into the `scheduled_pairs` key. Per-partition
+/// batch counts are far below 2^32, so a single uint64_t key is safe.
+[[nodiscard]] inline uint64_t encode_cross_pair(std::size_t probe_idx, std::size_t build_idx)
+{
+  return (static_cast<uint64_t>(probe_idx) << 32) | static_cast<uint64_t>(build_idx);
+}
+
+/// Collect (and mark popped) every batch that is now fully consumed: a probe batch once the build
+/// producer is finished and the batch has been paired with every known build batch (build side has
+/// >= 1 batch), and symmetrically for build batches. Idempotent.
+[[nodiscard]] std::vector<cross_schedule_discard> collect_cross_schedule_discards(
+  std::vector<partition_cross_schedule>& cross, bool probe_finished, bool build_finished);
+
+/// Find and claim the next unscheduled (probe,build) pair across partitions, marking it scheduled
+/// and bumping the paired counts. If none is schedulable now, reports whether to wait on the build
+/// or probe producer, or that the operator is done. Pure over `cross`.
+[[nodiscard]] cross_schedule_pair next_cross_schedule_pair(
+  std::vector<partition_cross_schedule>& cross, bool probe_finished, bool build_finished);
+
+/// Non-mutating classification for get_next_task_hint: READY (emit_pair), WAITING (wait_build /
+/// wait_probe), or complete (done).
+[[nodiscard]] cross_schedule_kind peek_cross_schedule_kind(
+  std::vector<partition_cross_schedule> const& cross, bool probe_finished, bool build_finished);
 
 class sirius_physical_hash_join : public sirius_physical_partition_consumer_operator {
  public:
@@ -243,6 +309,13 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   std::unique_ptr<operator_data> get_next_task_input_data_for_build_probe();
   std::unique_ptr<operator_data> get_next_task_input_data() override;
 
+  /// STANDARD / MIXED_JOIN only. Re-poll both input ports for newly-arrived batch IDs, extend
+  /// `_cross`, enforce the non-INNER whole-side invariant (the must-be-whole side stays a single
+  /// concat-folded batch), and free every fully-consumed batch from its repository. Must be called
+  /// with op_state_mutex held. Returns the (probe_finished, build_finished) producer state so the
+  /// caller can reuse it without re-querying.
+  std::pair<bool, bool> refresh_cross_schedule();
+
   /// Snapshot each partition's build state and per-partition data availability for the BUILD_PROBE
   /// scheduler (`select_build_probe_action`). Must be called with `op_state_mutex` held.
   std::vector<build_probe_slot_view> snapshot_build_probe_slots();
@@ -266,10 +339,9 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   bool is_source() const override { return true; }
 
   std::mutex op_state_mutex;
-  std::size_t current_partition_index = 0;
-  std::size_t num_batches_to_process  = 0;
-  std::vector<std::vector<uint64_t>> left_batch_ids;
-  std::vector<std::vector<uint64_t>> right_batch_ids;
+  // STANDARD / MIXED_JOIN partial-barrier schedule: one growable cross-product tracker per
+  // partition. Lazily sized to num_partitions on first use. Guarded by op_state_mutex.
+  std::vector<partition_cross_schedule> _cross;
 
   bool is_all_inequality_join = true;
 

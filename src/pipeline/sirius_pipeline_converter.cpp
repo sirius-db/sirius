@@ -231,6 +231,18 @@ op::MemoryBarrierType sirius_pipeline_converter::resolve_barrier(
       return op::MemoryBarrierType::PARTIAL;
     }
   }
+  // A CONCAT feeding a HASH_JOIN drives the join's own "build"/"default" input ports. Make those
+  // ports PARTIAL so the join consumes build and probe batches progressively (partial barrier)
+  // rather than waiting (via the base FULL-barrier hint) for both upstream pipelines to finish. The
+  // hash join's overridden get_next_task_hint / get_next_task_input_data schedule per-partition
+  // build x probe pairs as batches arrive; the concat still folds whichever side must be seen whole
+  // (LEFT/SEMI/ANTI -> build, RIGHT-family -> probe, OUTER -> both) to a single batch, so results
+  // stay correct for every join type. BUILD_PROBE mode is unaffected (it overrides its hint
+  // regardless of the port barrier). See docs/super-sirius/operators.md.
+  if (sink.type == T::CONCAT && sink.get_parent_op() &&
+      sink.get_parent_op()->type == T::HASH_JOIN) {
+    return op::MemoryBarrierType::PARTIAL;
+  }
   return op::MemoryBarrierType::FULL;
 }
 
