@@ -102,6 +102,33 @@ relieves memory pressure. Sirius has no upward "stop producing" signal today (hi
 `READY` / `WAITING` / nothing), so the intended lever is per-fragment priority, not a bounded
 queue — see [Streaming Sessions](streaming-sessions.md#why-no-backpressure).
 
+### `sirius_physical_streaming_sink` — `STREAMING_SINK`
+**File:** `src/include/op/sirius_physical_streaming_sink.hpp`
+
+The mirror of `STREAMING_SOURCE`: a pipeline-terminal operator that marks the top boundary of a
+streaming plan fragment. `sink()` publishes each output batch into a
+`cucascade::shared_data_repository` via `stream_lifecycle::admit()`; an external consumer takes
+them with `pull(i)` / `wait(i)` / `drained(i)`. See
+[Streaming Sessions](streaming-sessions.md) for the full design.
+
+- Batches leave **natively**, in their current tier — no Arrow, no forced GPU upgrade, no copy —
+  and stay spillable in the repository until pulled.
+- `on_finalize_operator()` (the existing pipeline-finish hook) marks the pipeline done. The
+  pipeline is the stream's single expected sender, so finishing it *is* end-of-stream — until
+  then an empty output repository means `WAITING`, never EOS.
+- **Partition fan-out:** with N destinations the sink GPU-hash-partitions each batch by its
+  `partition_spec` (reusing `gpu_partition_impl::hash_partition`) and pushes slice *i* into
+  repository *i*, so a slow receiver backs up in its own repository instead of head-of-line
+  blocking the others. Output stream id, partition index, and repository correspond
+  positionally. N = 1 is the degenerate no-partition case.
+- One `stream_lifecycle` is shared across all N destinations (one sender feeds them all), but
+  `drained(i)` / `availability(i)` AND that terminal flag with repository *i*'s own emptiness,
+  so an undrained partition stays distinguishable from EOS.
+- Unlike the source it registers **no re-arm waker** — its consumer is an external thread in
+  `wait()`, not an engine task.
+- It overrides only `sink()`, `on_finalize_operator()`, and
+  `no_history_peak_memory_estimate() → stats.bytes`.
+
 ### `sirius_physical_dummy_scan` — `DUMMY_SCAN`
 **File:** `src/include/op/sirius_physical_dummy_scan.hpp`
 
@@ -378,6 +405,7 @@ After pipeline finalization, `source` and `sink` are just aliases for the first 
 |----------|----------|-----------|
 | GPU_SCAN | Scan | Unified GPU scan source served by `sirius_scan_manager` via a per-format `gpu_ingestible` |
 | STREAMING_SOURCE | Scan | Exchange-input source; drains a `shared_data_repository` fed by `push()`, with a sender-aware `stream_lifecycle` |
+| STREAMING_SINK | Sink | Exchange-output sink; publishes native batches into N per-destination `shared_data_repository`s, GPU-hash-partitioned when N > 1 |
 | DUMMY_SCAN | Scan | Generates 1 row |
 | COLUMN_DATA_SCAN | Scan | Reads ColumnDataCollection |
 | FILTER | Relational | `expression_evaluator::select()` |
