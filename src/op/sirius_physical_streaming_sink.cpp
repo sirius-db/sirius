@@ -1,0 +1,109 @@
+/*
+ * Copyright 2025, Sirius Contributors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include "op/sirius_physical_streaming_sink.hpp"
+
+#include "sirius/exception.hpp"
+
+#include <cucascade/data/data_batch.hpp>
+
+#include <string>
+#include <utility>
+
+namespace sirius::op {
+
+sirius_physical_streaming_sink::sirius_physical_streaming_sink(
+  duckdb::vector<sirius::logical_type> types,
+  std::size_t estimated_cardinality,
+  std::shared_ptr<cucascade::shared_data_repository> output_repository)
+  : sirius_physical_operator(
+      SiriusPhysicalOperatorType::STREAMING_SINK, std::move(types), estimated_cardinality),
+    _lifecycle(std::set<exec::sender_id_t>{PIPELINE_SENDER})
+{
+  if (!output_repository) {
+    throw sirius::invalid_input_exception(
+      "sirius_physical_streaming_sink: output_repository must not be null");
+  }
+  _output_repositories.push_back(std::move(output_repository));
+}
+
+void sirius_physical_streaming_sink::sink(const operator_data& input_data,
+                                          rmm::cuda_stream_view /*stream*/)
+{
+  const auto& input = dynamic_cast<const pipelineable_operator_data&>(input_data);
+
+  // Pushed in their current tier: no Arrow, no forced GPU upgrade, no copy. The batch stays
+  // spillable in the repository until a consumer pulls it.
+  for (const auto& batch : input.get_data_batches()) {
+    _lifecycle.admit([&] { _output_repositories[0]->add_data_batch(batch); });
+  }
+}
+
+std::size_t sirius_physical_streaming_sink::no_history_peak_memory_estimate(
+  const input_stats& stats) const
+{
+  // Pushing a handle into the output repository allocates nothing new.
+  return stats.bytes;
+}
+
+void sirius_physical_streaming_sink::on_finalize_operator()
+{
+  // The pipeline is this stream's single sender, so its completion *is* end-of-stream. Until
+  // this point a consumer that finds the repository empty must be told WAITING, never EOS.
+  _lifecycle.mark_sender_done(PIPELINE_SENDER);
+}
+
+void sirius_physical_streaming_sink::validate_index(std::size_t index) const
+{
+  if (index >= _output_repositories.size()) {
+    throw sirius::invalid_input_exception(
+      "sirius_physical_streaming_sink: output stream index " + std::to_string(index) +
+      " out of range (" + std::to_string(_output_repositories.size()) + " streams)");
+  }
+}
+
+std::optional<std::shared_ptr<cucascade::data_batch>> sirius_physical_streaming_sink::pull(
+  std::size_t index)
+{
+  validate_index(index);
+  auto batch = _output_repositories[index]->pop_next_data_batch();
+  if (!batch) { return std::nullopt; }
+  return batch;
+}
+
+void sirius_physical_streaming_sink::wait(std::size_t index)
+{
+  validate_index(index);
+  auto* repo = _output_repositories[index].get();
+  _lifecycle.wait([repo] { return repo->all_empty(); });
+}
+
+bool sirius_physical_streaming_sink::drained(std::size_t index) const
+{
+  validate_index(index);
+  // ANDed with *this* stream's emptiness: the terminal flag is shared across destinations, so a
+  // partition with a backlog must not read as drained just because its siblings are.
+  return _lifecycle.drained(_output_repositories[index]->all_empty());
+}
+
+exec::stream_lifecycle::availability sirius_physical_streaming_sink::availability(
+  std::size_t index) const
+{
+  validate_index(index);
+  return _lifecycle.classify(_output_repositories[index]->all_empty());
+}
+
+}  // namespace sirius::op
