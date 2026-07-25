@@ -38,7 +38,19 @@ cn_pid="$!"
 
 wait -n "${fe_pid}" "${cn_pid}"
 '
-""",cwd = ".",depends-on = ["fe-build","cn-build"],description = "Run the local StarRocks FE and Rust CN in the foreground with logs"}
+""",cwd = ".",depends-on = ["fe-check","cn-build"],description = "Run the local StarRocks FE and Rust CN in the foreground with logs",env = {LD_LIBRARY_PATH = "../../build/release/extension/sirius"}}
+
+# This demo project ships the StarRocks FE pre-packaged under starrocks/output/fe, so `cluster`
+# does not depend on `fe-build` (a multi-hour Maven build of the whole front end). Assert the
+# package is there and point at `fe-build` if it is not.
+fe-check = {cmd = """
+bash -lc 'test -x starrocks/output/fe/bin/start_fe.sh || {
+    echo "No packaged FE at starrocks/output/fe." >&2
+    echo "Run: git submodule update --init --recursive experimental/starrocks/starrocks" >&2
+    echo "then: pixi run fe-build   (long — builds the StarRocks front end from source)" >&2
+    exit 1
+}'
+""",cwd = ".",description = "Assert the packaged StarRocks FE is present"}
 
 [feature.client.dependencies]
 # Provides the `mysql` CLI that speaks the FE's MySQL wire protocol on query_port.
@@ -61,8 +73,8 @@ engine-build = {cmd = "pixi run --manifest-path pixi.toml make",cwd = "../..",de
 # Engine-linked CN (default `sirius-engine` feature); needs the engine artifact and
 # the `engine` feature's toolchain/libs (in the default env).
 cn-build = {cmd = "cargo build --release -p sirius-starrocks-cn",depends-on = ["engine-build"],description = "Build the engine-linked StarRocks CN release binary"}
-cn-test = {cmd = "cargo test -p sirius-starrocks-cn",depends-on = ["engine-build"],description = "Run engine-linked StarRocks CN tests"}
-cn-run = {cmd = "cargo run -p sirius-starrocks-cn --",depends-on = ["engine-build"],description = "Run the engine-linked StarRocks CN with local FE defaults"}
+cn-test = {cmd = "cargo test -p sirius-starrocks-cn",depends-on = ["engine-build"],description = "Run engine-linked StarRocks CN tests",env = {LD_LIBRARY_PATH = "../../build/release/extension/sirius"}}
+cn-run = {cmd = "cargo run -p sirius-starrocks-cn --",depends-on = ["engine-build"],description = "Run the engine-linked StarRocks CN with local FE defaults",env = {LD_LIBRARY_PATH = "../../build/release/extension/sirius"}}
 
 # Pure-Rust path (no engine, build tree, or GPU). What CI runs.
 cn-test-no-engine = {cmd = "cargo test -p sirius-starrocks-cn --no-default-features",description = "Run Rust StarRocks CN tests without the embedded Sirius engine"}

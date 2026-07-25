@@ -1,15 +1,16 @@
 use std::collections::BTreeMap;
 
 use starrocks_plan_translator::{
-    ExtensionRegistry, PlanTranslator, TranslateError, URN_BOOLEAN, URN_COMPARISON,
+    ExchangeInput, ExtensionRegistry, PlanTranslator, TranslateError, URN_BOOLEAN, URN_COMPARISON,
     translate_fragment,
 };
 use starrocks_thrift::descriptors::{
     TDescriptorTable, TSlotDescriptor, TTableDescriptor, TTupleDescriptor,
 };
 use starrocks_thrift::exprs::{
-    TBoolLiteral, TCaseExpr, TDateLiteral, TDecimalLiteral, TExpr, TExprNode, TExprNodeType,
-    TFloatLiteral, TInPredicate, TIntLiteral, TIsNullPredicate, TSlotRef, TStringLiteral,
+    TAggregateExpr, TBoolLiteral, TCaseExpr, TDateLiteral, TDecimalLiteral, TExpr, TExprNode,
+    TExprNodeType, TFloatLiteral, TInPredicate, TIntLiteral, TIsNullPredicate, TSlotRef,
+    TStringLiteral,
 };
 use starrocks_thrift::internal_service::{
     InternalServiceVersion, TExecPlanFragmentParams, TPlanFragmentExecParams, TScanRangeParams,
@@ -17,8 +18,10 @@ use starrocks_thrift::internal_service::{
 use starrocks_thrift::opcodes::TExprOpcode;
 use starrocks_thrift::partitions::{TDataPartition, TPartitionType};
 use starrocks_thrift::plan_nodes::{
-    TBrokerRangeDesc, TBrokerScanRange, TBrokerScanRangeParams, TFileFormatType, TFileScanNode,
-    TFileScanType, TPlan, TPlanNode, TPlanNodeType, TProjectNode, TScanRange, TSelectNode,
+    TAggregationNode, TBrokerRangeDesc, TBrokerScanRange, TBrokerScanRangeParams, TEqJoinCondition,
+    TExchangeNode, TFileFormatType, TFileScanNode, TFileScanType, THashJoinNode, TJoinOp,
+    TNestLoopJoinNode, TPlan, TPlanNode, TPlanNodeType, TProjectNode, TScanRange, TSelectNode,
+    TSortInfo, TSortNode,
 };
 use starrocks_thrift::planner::TPlanFragment;
 use starrocks_thrift::types::{
@@ -663,6 +666,46 @@ fn split_broker_range_is_unsupported() {
     }
 }
 
+/// Verifies complete byte-range splits are collapsed to one whole-file local read.
+#[test]
+fn complete_split_broker_ranges_produce_one_local_file() {
+    let path = "file:///data/users.parquet";
+    let mut fragment = params_with_scan_range(
+        TPlan::new(vec![scan_node(0, 0)]),
+        base_desc(),
+        0,
+        broker_scan_range(path, TFileFormatType::FORMAT_PARQUET, 0, 512, Some(1024)),
+    );
+    fragment
+        .params
+        .as_mut()
+        .unwrap()
+        .per_node_scan_ranges
+        .get_mut(&0)
+        .unwrap()
+        .push(TScanRangeParams::new(
+            broker_scan_range(path, TFileFormatType::FORMAT_PARQUET, 512, 512, Some(1024)),
+            None,
+            None,
+            None,
+        ));
+    let translated = PlanTranslator::new().translate_fragment(&fragment).unwrap();
+    let rel::RelType::Read(read) = root(&translated.plan)
+        .input
+        .as_ref()
+        .unwrap()
+        .rel_type
+        .as_ref()
+        .unwrap()
+    else {
+        panic!("expected local read");
+    };
+    let Some(read_rel::ReadType::LocalFiles(files)) = read.read_type.as_ref() else {
+        panic!("expected local files");
+    };
+    assert_eq!(files.items.len(), 1);
+}
+
 /// Verifies a scan range delivered via the pipeline per-driver-sequence map is
 /// collected too (not just `per_node_scan_ranges`).
 #[test]
@@ -1107,6 +1150,64 @@ fn scan_project_preserves_descriptor_output_order() {
     }
 }
 
+/// Verifies hidden project expressions are appended in key order and can be
+/// referenced by visible expressions without descriptor-table slots.
+#[test]
+fn project_common_slots_are_materialized_before_visible_expressions() {
+    let mut common_slot_map = BTreeMap::new();
+    common_slot_map.insert(5, slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT)));
+    let mut slot_map = BTreeMap::new();
+    slot_map.insert(3, slot_ref(5, 1, scalar_type(TPrimitiveType::BIGINT)));
+
+    let mut project = base_plan_node(1, TPlanNodeType::PROJECT_NODE, 1, vec![1]);
+    project.project_node = Some(TProjectNode::new(Some(slot_map), Some(common_slot_map)));
+    let desc = desc_table(
+        vec![(0, Some(100)), (1, None)],
+        vec![
+            slot(1, 0, 0, "id", scalar_type(TPrimitiveType::BIGINT)),
+            slot(2, 0, 1, "name", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(3, 1, 0, "id", scalar_type(TPrimitiveType::BIGINT)),
+        ],
+    );
+
+    let translated = translate_fragment(&params(
+        Some(TPlan::new(vec![project, scan_node(0, 0)])),
+        Some(desc),
+        None,
+    ))
+    .unwrap();
+    let rel::RelType::Project(visible) = root(&translated.plan)
+        .input
+        .as_ref()
+        .unwrap()
+        .rel_type
+        .as_ref()
+        .unwrap()
+    else {
+        panic!("expected visible project");
+    };
+    let expression::RexType::Selection(selection) =
+        visible.expressions[0].rex_type.as_ref().unwrap()
+    else {
+        panic!("expected common-slot selection");
+    };
+    let expression::field_reference::ReferenceType::DirectReference(segment) =
+        selection.reference_type.as_ref().unwrap()
+    else {
+        panic!("expected direct field reference");
+    };
+    let expression::reference_segment::ReferenceType::StructField(field) =
+        segment.reference_type.as_ref().unwrap()
+    else {
+        panic!("expected struct field");
+    };
+    assert_eq!(field.field, 2);
+    assert!(matches!(
+        visible.input.as_ref().unwrap().rel_type.as_ref().unwrap(),
+        rel::RelType::Project(_)
+    ));
+}
+
 /// Verifies fragment output expressions add the final root projection.
 #[test]
 fn fragment_output_exprs_add_root_projection() {
@@ -1134,10 +1235,10 @@ fn fragment_output_exprs_add_root_projection() {
     }
 }
 
-/// Verifies unsupported joins return a structured unsupported-plan-node error.
+/// Verifies unsupported plan nodes return a structured unsupported-plan-node error.
 #[test]
-fn unsupported_hash_join_is_structured_error() {
-    let join = base_plan_node(9, TPlanNodeType::HASH_JOIN_NODE, 0, vec![0]);
+fn unsupported_merge_join_is_structured_error() {
+    let join = base_plan_node(9, TPlanNodeType::MERGE_JOIN_NODE, 0, vec![0]);
     let err = translate_fragment(&params(
         Some(TPlan::new(vec![join])),
         Some(base_desc()),
@@ -1150,7 +1251,7 @@ fn unsupported_hash_join_is_structured_error() {
             node_id: 9,
             node_type,
             ..
-        } if node_type == TPlanNodeType::HASH_JOIN_NODE
+        } if node_type == TPlanNodeType::MERGE_JOIN_NODE
     ));
 }
 
@@ -1999,11 +2100,424 @@ fn builtin_function(name: &str, ret_type: TTypeDesc) -> TFunction {
     )
 }
 
-/// Verifies an exchange node is still rejected: fragments are translated in isolation and
-/// multi-fragment plans are a later milestone.
+/// Builds an aggregate-function expression (`fn(child)`) in flat preorder form.
+fn aggregate_expr(name: &str, ret_type: TTypeDesc, child: Option<TExpr>) -> TExpr {
+    let num_children = child.as_ref().map(|_| 1).unwrap_or(0);
+    let mut node = base_expr_node(TExprNodeType::AGG_EXPR, ret_type.clone(), num_children);
+    node.agg_expr = Some(TAggregateExpr::new(false));
+    node.fn_ = Some(builtin_function(name, ret_type));
+    let mut nodes = vec![node];
+    if let Some(child) = child {
+        nodes.extend(child.nodes);
+    }
+    TExpr::new(nodes)
+}
+
+/// Builds a one-phase aggregation node over `output_tuple` with the given keys and aggregates.
+fn aggregation_node(
+    node_id: i32,
+    output_tuple: i32,
+    grouping: Vec<TExpr>,
+    aggregates: Vec<TExpr>,
+) -> TPlanNode {
+    let mut node = base_plan_node(
+        node_id,
+        TPlanNodeType::AGGREGATION_NODE,
+        1,
+        vec![output_tuple],
+    );
+    node.agg_node = Some(TAggregationNode::new(
+        Some(grouping),
+        aggregates,
+        output_tuple,
+        output_tuple,
+        true,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    ));
+    node
+}
+
+/// Descriptor with a scan tuple 0 (`id` BIGINT, `name` VARCHAR) and an aggregation output
+/// tuple 1 (`name` key, `total` BIGINT).
+fn agg_desc() -> TDescriptorTable {
+    desc_table(
+        vec![(0, Some(100)), (1, None)],
+        vec![
+            slot(1, 0, 0, "id", scalar_type(TPrimitiveType::BIGINT)),
+            slot(2, 0, 1, "name", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(1, 1, 0, "name", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(2, 1, 1, "total", scalar_type(TPrimitiveType::BIGINT)),
+        ],
+    )
+}
+
+/// Verifies one-phase group-by aggregation becomes an `AggregateRel` with the grouping key and
+/// a `sum` measure, and that the output row layout switches to the aggregation output tuple.
+#[test]
+fn aggregation_translates_to_aggregate_rel() {
+    let agg = aggregation_node(
+        1,
+        1,
+        vec![slot_ref(2, 0, scalar_type(TPrimitiveType::VARCHAR))],
+        vec![aggregate_expr(
+            "sum",
+            scalar_type(TPrimitiveType::BIGINT),
+            Some(slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT))),
+        )],
+    );
+    let translated = translate_fragment(&params(
+        Some(TPlan::new(vec![agg, scan_node(0, 0)])),
+        Some(agg_desc()),
+        None,
+    ))
+    .unwrap();
+
+    let root = root(&translated.plan);
+    assert_eq!(root.names, vec!["name", "total"]);
+    let rel::RelType::Aggregate(aggregate) =
+        root.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected aggregate relation");
+    };
+    assert_eq!(aggregate.grouping_expressions.len(), 1);
+    assert_eq!(aggregate.groupings.len(), 1);
+    assert_eq!(aggregate.groupings[0].expression_references, vec![0]);
+    assert_eq!(aggregate.measures.len(), 1);
+    let measure = aggregate.measures[0].measure.as_ref().unwrap();
+    assert_eq!(measure.arguments.len(), 1);
+    assert_eq!(
+        measure.invocation,
+        substrait::proto::aggregate_function::AggregationInvocation::All as i32
+    );
+    let names: Vec<_> = extension_function_names(&translated.plan);
+    assert!(names.contains(&"sum".to_string()), "{names:?}");
+}
+
+/// Verifies a distinct aggregate (StarRocks `multi_distinct_count`) becomes a distinct `count`.
+#[test]
+fn multi_distinct_count_translates_to_distinct_count() {
+    let agg = aggregation_node(
+        1,
+        1,
+        vec![slot_ref(2, 0, scalar_type(TPrimitiveType::VARCHAR))],
+        vec![aggregate_expr(
+            "multi_distinct_count",
+            scalar_type(TPrimitiveType::BIGINT),
+            Some(slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT))),
+        )],
+    );
+    let translated = translate_fragment(&params(
+        Some(TPlan::new(vec![agg, scan_node(0, 0)])),
+        Some(agg_desc()),
+        None,
+    ))
+    .unwrap();
+
+    let root = root(&translated.plan);
+    let rel::RelType::Aggregate(aggregate) =
+        root.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected aggregate relation");
+    };
+    let measure = aggregate.measures[0].measure.as_ref().unwrap();
+    assert_eq!(
+        measure.invocation,
+        substrait::proto::aggregate_function::AggregationInvocation::Distinct as i32
+    );
+    let names = extension_function_names(&translated.plan);
+    assert!(names.contains(&"count".to_string()), "{names:?}");
+}
+
+/// Verifies a merge-phase aggregate (two-phase aggregation) is rejected.
+#[test]
+fn merge_aggregation_is_rejected() {
+    let mut aggregate = aggregate_expr(
+        "sum",
+        scalar_type(TPrimitiveType::BIGINT),
+        Some(slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT))),
+    );
+    aggregate.nodes[0].agg_expr = Some(TAggregateExpr::new(true));
+    let agg = aggregation_node(1, 1, Vec::new(), vec![aggregate]);
+    // Output tuple 1 has two slots but no grouping keys, so use a dedicated descriptor with a
+    // single aggregate output slot.
+    let desc = desc_table(
+        vec![(0, Some(100)), (1, None)],
+        vec![
+            slot(1, 0, 0, "id", scalar_type(TPrimitiveType::BIGINT)),
+            slot(2, 0, 1, "name", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(1, 1, 0, "total", scalar_type(TPrimitiveType::BIGINT)),
+        ],
+    );
+    let err = translate_fragment(&params(
+        Some(TPlan::new(vec![agg, scan_node(0, 0)])),
+        Some(desc),
+        None,
+    ))
+    .unwrap_err();
+    assert!(matches!(err, TranslateError::UnsupportedExpression { .. }));
+}
+
+/// Verifies a top-N sort becomes project (sort tuple) + sort + fetch with the node limit.
+#[test]
+fn sort_with_limit_becomes_project_sort_fetch() {
+    let sort_info = TSortInfo::new(
+        vec![slot_ref(1, 1, scalar_type(TPrimitiveType::BIGINT))],
+        vec![true],
+        vec![false],
+        None,
+    );
+    let mut sort = base_plan_node(1, TPlanNodeType::SORT_NODE, 1, vec![1]);
+    sort.limit = 5;
+    sort.sort_node = Some(TSortNode::new(
+        sort_info,
+        true,
+        Some(0),
+        None,
+        None,
+        None,
+        None,
+        Some(vec![slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT))]),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    ));
+    // Sort tuple 1 materializes only the ordering column.
+    let desc = desc_table(
+        vec![(0, Some(100)), (1, None)],
+        vec![
+            slot(1, 0, 0, "id", scalar_type(TPrimitiveType::BIGINT)),
+            slot(2, 0, 1, "name", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(1, 1, 0, "id", scalar_type(TPrimitiveType::BIGINT)),
+        ],
+    );
+    let translated = translate_fragment(&params(
+        Some(TPlan::new(vec![sort, scan_node(0, 0)])),
+        Some(desc),
+        None,
+    ))
+    .unwrap();
+
+    let root = root(&translated.plan);
+    let rel::RelType::Fetch(fetch) = root.input.as_ref().unwrap().rel_type.as_ref().unwrap() else {
+        panic!("expected fetch relation");
+    };
+    #[allow(deprecated)]
+    {
+        assert_eq!(
+            fetch.count_mode,
+            Some(substrait::proto::fetch_rel::CountMode::Count(5))
+        );
+        assert_eq!(fetch.offset_mode, None);
+    }
+    let rel::RelType::Sort(sort) = fetch.input.as_ref().unwrap().rel_type.as_ref().unwrap() else {
+        panic!("expected sort under fetch");
+    };
+    assert_eq!(sort.sorts.len(), 1);
+    assert_eq!(
+        sort.sorts[0].sort_kind,
+        Some(substrait::proto::sort_field::SortKind::Direction(
+            substrait::proto::sort_field::SortDirection::AscNullsLast as i32
+        ))
+    );
+    let rel::RelType::Project(_) = sort.input.as_ref().unwrap().rel_type.as_ref().unwrap() else {
+        panic!("expected sort-tuple projection under sort");
+    };
+}
+
+/// Two-table descriptor for join tests: tuple 0 = users(`a`), tuple 1 = orders(`b`).
+fn join_desc() -> TDescriptorTable {
+    desc_table(
+        vec![(0, Some(100)), (1, Some(100))],
+        vec![
+            slot(1, 0, 0, "a", scalar_type(TPrimitiveType::BIGINT)),
+            slot(1, 1, 0, "b", scalar_type(TPrimitiveType::BIGINT)),
+        ],
+    )
+}
+
+/// Builds a hash-join plan node with one `left = right` equality conjunct.
+fn hash_join_node(join_op: TJoinOp) -> TPlanNode {
+    let mut join = base_plan_node(2, TPlanNodeType::HASH_JOIN_NODE, 2, vec![0, 1]);
+    join.hash_join_node = Some(THashJoinNode::new(
+        join_op,
+        vec![TEqJoinCondition::new(
+            slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT)),
+            slot_ref(1, 1, scalar_type(TPrimitiveType::BIGINT)),
+            Some(TExprOpcode::EQ),
+        )],
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    ));
+    join
+}
+
+/// Extracts the field index from a direct struct-field reference.
+fn field_index(expr: &substrait::proto::Expression) -> i32 {
+    let expression::RexType::Selection(selection) = expr.rex_type.as_ref().unwrap() else {
+        panic!("expected field reference");
+    };
+    let expression::field_reference::ReferenceType::DirectReference(segment) =
+        selection.reference_type.as_ref().unwrap()
+    else {
+        panic!("expected direct reference");
+    };
+    let expression::reference_segment::ReferenceType::StructField(field) =
+        segment.reference_type.as_ref().unwrap()
+    else {
+        panic!("expected struct field");
+    };
+    field.field
+}
+
+/// Verifies an inner hash join becomes a Substrait join whose equality condition references the
+/// concatenated left-then-right row (right side offset by the left width).
+#[test]
+fn inner_hash_join_translates_to_join_rel() {
+    let plan = TPlan::new(vec![
+        hash_join_node(TJoinOp::INNER_JOIN),
+        scan_node(0, 0),
+        scan_node(1, 1),
+    ]);
+    let translated = translate_fragment(&params(Some(plan), Some(join_desc()), None)).unwrap();
+
+    let root = root(&translated.plan);
+    assert_eq!(root.names, vec!["a", "b"]);
+    let rel::RelType::Join(join) = root.input.as_ref().unwrap().rel_type.as_ref().unwrap() else {
+        panic!("expected join relation");
+    };
+    assert_eq!(
+        join.r#type,
+        substrait::proto::join_rel::JoinType::Inner as i32
+    );
+    let expression::RexType::ScalarFunction(equal) =
+        join.expression.as_ref().unwrap().rex_type.as_ref().unwrap()
+    else {
+        panic!("expected scalar function join condition");
+    };
+    let args: Vec<_> = equal
+        .arguments
+        .iter()
+        .map(|argument| match argument.arg_type.as_ref().unwrap() {
+            substrait::proto::function_argument::ArgType::Value(value) => field_index(value),
+            other => panic!("unexpected argument {other:?}"),
+        })
+        .collect();
+    assert_eq!(args, vec![0, 1]);
+}
+
+/// Verifies a left semi join keeps only the probe-side row layout.
+#[test]
+fn left_semi_join_keeps_probe_layout() {
+    let plan = TPlan::new(vec![
+        hash_join_node(TJoinOp::LEFT_SEMI_JOIN),
+        scan_node(0, 0),
+        scan_node(1, 1),
+    ]);
+    let translated = translate_fragment(&params(Some(plan), Some(join_desc()), None)).unwrap();
+
+    let root = root(&translated.plan);
+    assert_eq!(root.names, vec!["a"]);
+    let rel::RelType::Join(join) = root.input.as_ref().unwrap().rel_type.as_ref().unwrap() else {
+        panic!("expected join relation");
+    };
+    assert_eq!(
+        join.r#type,
+        substrait::proto::join_rel::JoinType::LeftSemi as i32
+    );
+}
+
+/// Verifies a cross nested-loop join becomes a filtered constant-key equality join.
+#[test]
+fn nestloop_join_translates_to_filtered_cross_rel() {
+    let mut join = base_plan_node(2, TPlanNodeType::NESTLOOP_JOIN_NODE, 2, vec![0, 1]);
+    join.nestloop_join_node = Some(TNestLoopJoinNode::new(
+        Some(TJoinOp::CROSS_JOIN),
+        None,
+        Some(vec![binary_pred(
+            TExprOpcode::LT,
+            slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT)),
+            slot_ref(1, 1, scalar_type(TPrimitiveType::BIGINT)),
+        )]),
+        None,
+        None,
+        None,
+    ));
+    let plan = TPlan::new(vec![join, scan_node(0, 0), scan_node(1, 1)]);
+    let translated = translate_fragment(&params(Some(plan), Some(join_desc()), None)).unwrap();
+
+    let root = root(&translated.plan);
+    assert_eq!(root.names, vec!["a", "b"]);
+    let rel::RelType::Filter(filter) = root.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected filter over constant-key join");
+    };
+    let rel::RelType::Project(project) = filter.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected output projection under filter");
+    };
+    let rel::RelType::Join(join) = project.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected constant-key join under projection");
+    };
+    assert_eq!(
+        join.r#type,
+        substrait::proto::join_rel::JoinType::Inner as i32
+    );
+}
+
+/// Verifies an exchange node without a materialized input is rejected.
 #[test]
 fn exchange_node_is_rejected() {
-    let exchange = base_plan_node(1, TPlanNodeType::EXCHANGE_NODE, 0, vec![0]);
+    let mut exchange = base_plan_node(1, TPlanNodeType::EXCHANGE_NODE, 0, vec![0]);
+    exchange.exchange_node = Some(TExchangeNode::new(
+        vec![0],
+        None,
+        None,
+        Some(TPartitionType::UNPARTITIONED),
+        Some(true),
+        None,
+    ));
     let err = translate_fragment(&params(
         Some(TPlan::new(vec![exchange])),
         Some(base_desc()),
@@ -2017,6 +2531,99 @@ fn exchange_node_is_rejected() {
             ..
         }
     ));
+}
+
+/// Verifies a materialized exchange becomes the read below the receiver aggregate.
+#[test]
+fn materialized_exchange_feeds_aggregate() {
+    let mut exchange = base_plan_node(7, TPlanNodeType::EXCHANGE_NODE, 0, vec![0]);
+    exchange.exchange_node = Some(TExchangeNode::new(
+        vec![0],
+        None,
+        None,
+        Some(TPartitionType::UNPARTITIONED),
+        Some(true),
+        None,
+    ));
+    let aggregate = aggregation_node(
+        8,
+        1,
+        vec![slot_ref(2, 0, scalar_type(TPrimitiveType::VARCHAR))],
+        vec![aggregate_expr(
+            "sum",
+            scalar_type(TPrimitiveType::BIGINT),
+            Some(slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT))),
+        )],
+    );
+    let translated = PlanTranslator::new()
+        .translate_fragment_with_exchange_inputs(
+            &params(
+                Some(TPlan::new(vec![aggregate, exchange])),
+                Some(agg_desc()),
+                None,
+            ),
+            &[ExchangeInput {
+                node_id: 7,
+                paths: vec!["/tmp/materialized-exchange.parquet".to_string()],
+                names: vec!["id".to_string(), "name".to_string()],
+            }],
+        )
+        .unwrap();
+
+    let root = root(&translated.plan);
+    let rel::RelType::Aggregate(aggregate) =
+        root.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected aggregate receiver");
+    };
+    let rel::RelType::Read(read) = aggregate.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected materialized exchange read");
+    };
+    let Some(read_rel::ReadType::LocalFiles(files)) = read.read_type.as_ref() else {
+        panic!("expected local_files exchange input");
+    };
+    assert_eq!(files.items.len(), 1);
+    assert_eq!(read.base_schema.as_ref().unwrap().names, vec!["id", "name"]);
+}
+
+/// Verifies a merging exchange globally sorts the materialized local sender output.
+#[test]
+fn materialized_merging_exchange_becomes_sort_over_read() {
+    let sort_info = TSortInfo::new(
+        vec![slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT))],
+        vec![false],
+        vec![false],
+        None,
+    );
+    let mut exchange = base_plan_node(7, TPlanNodeType::EXCHANGE_NODE, 0, vec![0]);
+    exchange.exchange_node = Some(TExchangeNode::new(
+        vec![0],
+        Some(sort_info),
+        Some(0),
+        Some(TPartitionType::UNPARTITIONED),
+        Some(true),
+        None,
+    ));
+    let translated = PlanTranslator::new()
+        .translate_fragment_with_exchange_inputs(
+            &params(Some(TPlan::new(vec![exchange])), Some(base_desc()), None),
+            &[ExchangeInput {
+                node_id: 7,
+                paths: vec!["/tmp/materialized-exchange.parquet".to_string()],
+                names: vec!["id".to_string(), "name".to_string()],
+            }],
+        )
+        .unwrap();
+
+    let root = root(&translated.plan);
+    let rel::RelType::Sort(sort) = root.input.as_ref().unwrap().rel_type.as_ref().unwrap() else {
+        panic!("expected merging exchange sort");
+    };
+    let rel::RelType::Read(_) = sort.input.as_ref().unwrap().rel_type.as_ref().unwrap() else {
+        panic!("expected materialized exchange read under sort");
+    };
+    assert_eq!(sort.sorts.len(), 1);
 }
 
 /// Returns every extension function name declared by the plan.
@@ -2203,9 +2810,65 @@ fn case_expression_translates_to_if_then() {
     );
 }
 
-/// Verifies decimal-typed arithmetic is rejected (it crashes the engine's GPU projection).
+/// Verifies aggregation-node conjuncts (HAVING) become a filter over the aggregate output.
 #[test]
-fn decimal_arithmetic_is_rejected() {
+fn aggregation_conjuncts_become_having_filter() {
+    let mut agg = aggregation_node(
+        1,
+        1,
+        vec![slot_ref(2, 0, scalar_type(TPrimitiveType::VARCHAR))],
+        vec![aggregate_expr(
+            "sum",
+            scalar_type(TPrimitiveType::BIGINT),
+            Some(slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT))),
+        )],
+    );
+    // HAVING total > 10, referencing the aggregation output tuple.
+    agg.conjuncts = Some(vec![binary_pred(
+        TExprOpcode::GT,
+        slot_ref(2, 1, scalar_type(TPrimitiveType::BIGINT)),
+        int_literal(10),
+    )]);
+    let translated = translate_fragment(&params(
+        Some(TPlan::new(vec![agg, scan_node(0, 0)])),
+        Some(agg_desc()),
+        None,
+    ))
+    .unwrap();
+
+    let root = root(&translated.plan);
+    let rel::RelType::Filter(filter) = root.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected HAVING filter over the aggregate");
+    };
+    let rel::RelType::Aggregate(_) = filter.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected aggregate under the HAVING filter");
+    };
+}
+
+/// Verifies anti joins are lowered through supported outer/mark join forms.
+#[test]
+fn anti_hash_joins_are_lowered() {
+    for join_op in [
+        TJoinOp::LEFT_ANTI_JOIN,
+        TJoinOp::RIGHT_ANTI_JOIN,
+        TJoinOp::NULL_AWARE_LEFT_ANTI_JOIN,
+    ] {
+        let plan = TPlan::new(vec![
+            hash_join_node(join_op),
+            scan_node(0, 0),
+            scan_node(1, 1),
+        ]);
+        let translated = translate_fragment(&params(Some(plan), Some(join_desc()), None))
+            .unwrap_or_else(|err| panic!("{join_op:?}: {err:?}"));
+        assert_eq!(root(&translated.plan).names.len(), 1);
+    }
+}
+
+/// Verifies decimal arithmetic is lowered to FP64 casts for the GPU expression evaluator.
+#[test]
+fn decimal_arithmetic_is_lowered_to_fp64() {
     let decimal = scalar_type_with(TPrimitiveType::DECIMAL128, None, Some(31), Some(4));
     let mut arith = base_expr_node(TExprNodeType::ARITHMETIC_EXPR, decimal.clone(), 2);
     arith.opcode = Some(TExprOpcode::MULTIPLY);
@@ -2213,17 +2876,123 @@ fn decimal_arithmetic_is_rejected() {
     nodes.extend(slot_ref(1, 0, decimal.clone()).nodes);
     nodes.extend(slot_ref(1, 0, decimal).nodes);
 
-    let err = translate_fragment(&params(
+    let translated = translate_fragment(&params(
         Some(TPlan::new(vec![scan_node(0, 0)])),
         Some(base_desc()),
         Some(vec![TExpr::new(nodes)]),
+    ))
+    .unwrap();
+    let rel::RelType::Project(project) = root(&translated.plan)
+        .input
+        .as_ref()
+        .unwrap()
+        .rel_type
+        .as_ref()
+        .unwrap()
+    else {
+        panic!("expected output project");
+    };
+    let expression::RexType::ScalarFunction(function) =
+        project.expressions[0].rex_type.as_ref().unwrap()
+    else {
+        panic!("expected arithmetic function");
+    };
+    assert!(function.arguments.iter().all(|argument| matches!(
+        argument.arg_type.as_ref().unwrap(),
+        substrait::proto::function_argument::ArgType::Value(substrait::proto::Expression {
+            rex_type: Some(expression::RexType::Cast(_)),
+        })
+    )));
+    assert!(matches!(
+        function
+            .output_type
+            .as_ref()
+            .unwrap()
+            .kind
+            .as_ref()
+            .unwrap(),
+        substrait::proto::r#type::Kind::Fp64(_)
+    ));
+}
+
+/// Verifies decimal AVG arguments are lowered to FP64 for GPU execution.
+#[test]
+fn decimal_avg_is_lowered_to_fp64() {
+    let decimal = scalar_type_with(TPrimitiveType::DECIMAL128, None, Some(38), Some(8));
+    let agg = aggregation_node(
+        1,
+        1,
+        vec![slot_ref(2, 0, scalar_type(TPrimitiveType::VARCHAR))],
+        vec![aggregate_expr(
+            "avg",
+            decimal,
+            Some(slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT))),
+        )],
+    );
+    let translated = translate_fragment(&params(
+        Some(TPlan::new(vec![agg, scan_node(0, 0)])),
+        Some(agg_desc()),
+        None,
+    ))
+    .unwrap();
+    let rel::RelType::Aggregate(aggregate) = root(&translated.plan)
+        .input
+        .as_ref()
+        .unwrap()
+        .rel_type
+        .as_ref()
+        .unwrap()
+    else {
+        panic!("expected aggregate");
+    };
+    let argument = aggregate.measures[0].measure.as_ref().unwrap().arguments[0]
+        .arg_type
+        .as_ref()
+        .unwrap();
+    assert!(matches!(
+        argument,
+        substrait::proto::function_argument::ArgType::Value(substrait::proto::Expression {
+            rex_type: Some(expression::RexType::Cast(_)),
+        })
+    ));
+}
+
+/// Verifies partitioned top-N sorts are rejected rather than run as a global sort.
+#[test]
+fn partitioned_topn_sort_is_rejected() {
+    let sort_info = TSortInfo::new(
+        vec![slot_ref(1, 1, scalar_type(TPrimitiveType::BIGINT))],
+        vec![true],
+        vec![false],
+        Some(vec![slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT))]),
+    );
+    let mut sort = base_plan_node(1, TPlanNodeType::SORT_NODE, 1, vec![1]);
+    let mut sort_node = TSortNode::new(
+        sort_info, true, None, None, None, None, None, None, None, None, None, None, None, None,
+        None, None, None, None, None, None, None, None, None, None, None,
+    );
+    sort_node.partition_exprs = Some(vec![slot_ref(2, 0, scalar_type(TPrimitiveType::VARCHAR))]);
+    sort_node.partition_limit = Some(3);
+    sort.sort_node = Some(sort_node);
+    let desc = desc_table(
+        vec![(0, Some(100)), (1, None)],
+        vec![
+            slot(1, 0, 0, "id", scalar_type(TPrimitiveType::BIGINT)),
+            slot(2, 0, 1, "name", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(1, 1, 0, "id", scalar_type(TPrimitiveType::BIGINT)),
+        ],
+    );
+    let err = translate_fragment(&params(
+        Some(TPlan::new(vec![sort, scan_node(0, 0)])),
+        Some(desc),
+        None,
     ))
     .unwrap_err();
     assert!(
         matches!(
             err,
-            TranslateError::UnsupportedExpression {
-                node_type: TExprNodeType::ARITHMETIC_EXPR,
+            TranslateError::UnsupportedPlanNode {
+                node_type: TPlanNodeType::SORT_NODE,
                 ..
             }
         ),
@@ -2231,8 +3000,46 @@ fn decimal_arithmetic_is_rejected() {
     );
 }
 
-/// Verifies GPU-executor guards: non-constant LIKE patterns and non-constant substring
-/// bounds are rejected.
+/// Verifies the sort-tuple materialization is read from `TSortInfo` (the resolved field), not
+/// only from the deprecated node-level duplicate.
+#[test]
+fn sort_tuple_exprs_come_from_sort_info() {
+    let sort_info = TSortInfo::new(
+        vec![slot_ref(1, 1, scalar_type(TPrimitiveType::BIGINT))],
+        vec![true],
+        vec![false],
+        Some(vec![slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT))]),
+    );
+    let mut sort = base_plan_node(1, TPlanNodeType::SORT_NODE, 1, vec![1]);
+    sort.sort_node = Some(TSortNode::new(
+        sort_info, false, None, None, None, None, None, None, None, None, None, None, None, None,
+        None, None, None, None, None, None, None, None, None, None, None,
+    ));
+    let desc = desc_table(
+        vec![(0, Some(100)), (1, None)],
+        vec![
+            slot(1, 0, 0, "id", scalar_type(TPrimitiveType::BIGINT)),
+            slot(2, 0, 1, "name", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(1, 1, 0, "id", scalar_type(TPrimitiveType::BIGINT)),
+        ],
+    );
+    let translated = translate_fragment(&params(
+        Some(TPlan::new(vec![sort, scan_node(0, 0)])),
+        Some(desc),
+        None,
+    ))
+    .unwrap();
+    let root = root(&translated.plan);
+    let rel::RelType::Sort(sort) = root.input.as_ref().unwrap().rel_type.as_ref().unwrap() else {
+        panic!("expected sort relation");
+    };
+    let rel::RelType::Project(_) = sort.input.as_ref().unwrap().rel_type.as_ref().unwrap() else {
+        panic!("expected sort-tuple projection from TSortInfo exprs");
+    };
+}
+
+/// Verifies GPU-executor guards: non-constant LIKE patterns, non-constant substring bounds,
+/// bare cross joins, and ungrouped DISTINCT aggregates are rejected.
 #[test]
 fn gpu_unsupported_shapes_are_rejected() {
     // LIKE with a column pattern (not a literal).
@@ -2281,6 +3088,36 @@ fn gpu_unsupported_shapes_are_rejected() {
     .unwrap_err();
     assert!(
         matches!(err, TranslateError::UnsupportedExpression { .. }),
+        "{err:?}"
+    );
+
+    // DISTINCT aggregate without grouping keys.
+    let agg = aggregation_node(
+        1,
+        1,
+        Vec::new(),
+        vec![aggregate_expr(
+            "multi_distinct_count",
+            scalar_type(TPrimitiveType::BIGINT),
+            Some(slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT))),
+        )],
+    );
+    let desc = desc_table(
+        vec![(0, Some(100)), (1, None)],
+        vec![
+            slot(1, 0, 0, "id", scalar_type(TPrimitiveType::BIGINT)),
+            slot(2, 0, 1, "name", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(1, 1, 0, "cnt", scalar_type(TPrimitiveType::BIGINT)),
+        ],
+    );
+    let err = translate_fragment(&params(
+        Some(TPlan::new(vec![agg, scan_node(0, 0)])),
+        Some(desc),
+        None,
+    ))
+    .unwrap_err();
+    assert!(
+        matches!(err, TranslateError::UnsupportedPlanNode { .. }),
         "{err:?}"
     );
 }

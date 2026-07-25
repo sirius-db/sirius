@@ -50,6 +50,8 @@ impl fmt::Display for FragmentInstanceId {
 /// One buffered fragment result and where the FE `fetch_data` poll is in draining it.
 #[derive(Debug)]
 enum FragmentState {
+    /// Result fragment accepted but waiting for its exchange input.
+    Waiting,
     /// Rows produced, not yet delivered.
     Pending(TResultBatch),
     /// Rows delivered; the next poll reports end-of-stream.
@@ -78,6 +80,11 @@ pub(crate) struct ResultStore {
 }
 
 impl ResultStore {
+    /// Marks an accepted result fragment whose execution is waiting on an exchange sender.
+    pub(crate) fn reserve(&self, id: FragmentInstanceId) {
+        self.lock().entry(id).or_insert(FragmentState::Waiting);
+    }
+
     /// Buffers an executed fragment's result for later `fetch_data` collection.
     pub(crate) fn insert(&self, id: FragmentInstanceId, batch: TResultBatch) {
         self.lock().insert(id, FragmentState::Pending(batch));
@@ -97,6 +104,11 @@ impl ResultStore {
         let mut guard = self.lock();
         match guard.get_mut(&id) {
             None => None,
+            Some(FragmentState::Waiting) => Some(FetchOutcome {
+                batch: None,
+                packet_seq: 0,
+                eos: false,
+            }),
             Some(state @ FragmentState::Pending(_)) => {
                 let FragmentState::Pending(batch) =
                     std::mem::replace(state, FragmentState::Drained)
@@ -165,5 +177,21 @@ mod tests {
                 .take_next(FragmentInstanceId::from_halves(9, 9))
                 .is_none()
         );
+    }
+
+    #[test]
+    fn reserved_fragment_reports_not_ready_until_rows_arrive() {
+        let store = ResultStore::default();
+        let id = FragmentInstanceId::from_halves(4, 2);
+        store.reserve(id);
+
+        let waiting = store.take_next(id).expect("reserved fragment is known");
+        assert!(!waiting.eos);
+        assert!(waiting.batch.is_none());
+
+        store.insert(id, batch(&["ready"]));
+        let ready = store.take_next(id).expect("completed fragment is known");
+        assert!(!ready.eos);
+        assert_eq!(ready.batch.unwrap().rows.len(), 1);
     }
 }
