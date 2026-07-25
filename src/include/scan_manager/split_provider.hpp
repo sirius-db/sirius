@@ -35,7 +35,7 @@ namespace sirius::scan_manager {
 /**
  * @brief Driver of splits for a scan operator.
  *
- * Composes an @c io::gpu_ingestible and delegates the per-format work to it.
+ * Borrows a @c gpu_ingestible and delegates the per-format work to it.
  * Exposes two thread-safe primitives:
  *   - @ref has_more_splits — snapshot check for remaining work.
  *   - @ref next_split_provider — atomically claim the next batch and return a
@@ -43,19 +43,13 @@ namespace sirius::scan_manager {
  *
  * Splitting the claim from the work lets @ref run() enqueue one task per
  * batch on the driver thread without serialising metadata processing
- * behind a chain of "claim-then-run" tasks. The connector is closed in the
- * shared @c worker_state's destructor, which fires when the last enqueued
- * task releases its @c shared_ptr; any captured exception
- * (first-writer-wins via atomic CAS) is forwarded so consumers see the
- * failure through @ref split_connector::get_next_split.
+ * behind a chain of "claim-then-run" tasks. Each enqueued task holds a
+ * token from an @c exec::completion_controller; when the last token is
+ * released the controller pushes an empty split, which closes the
+ * connector. A task that throws forwards the exception through the same
+ * callback, so consumers see it via @ref split_connector::get_next_split.
  *
- * Historical note: this class was abstract pre-gpu_ingestible refactor.
- * Legacy subclasses (parquet_split_provider, duckdb_native_split_provider,
- * cached_split_provider) override @ref has_more_splits and
- * @ref next_split_provider; they are scheduled for deletion in step 10 of
- * the refactor. The default (concrete) construction path takes a
- * @c shared_ptr<io::gpu_ingestible> and uses the base's default
- * implementations to delegate to it.
+ * Pinned scans are served by @c cached_databatch_provider instead.
  */
 class split_provider {
  public:
@@ -94,9 +88,7 @@ class split_provider {
   /**
    * @brief Snapshot check for remaining work. Thread-safe.
    *
-   * Default impl delegates to the composed @c io::gpu_ingestible. Legacy
-   * subclasses override and ignore @c _ingestible (which is null on the
-   * default-ctor path they use).
+   * Delegates to the borrowed @c gpu_ingestible.
    */
   [[nodiscard]] virtual bool has_more_splits() const;
 
@@ -104,7 +96,7 @@ class split_provider {
    * @brief Atomically claim the next batch and return a callable that
    *        produces its splits. Thread-safe.
    *
-   * Default impl delegates to the composed @c io::gpu_ingestible. Returns
+   * Delegates to the borrowed @c gpu_ingestible. Returns
    * a null @c std::function when no batch is available — callers that
    * already checked @ref has_more_splits() will normally not hit this
    * path, but the null fallback keeps the contract simple under concurrent
@@ -112,16 +104,15 @@ class split_provider {
    */
   virtual std::function<std::unique_ptr<op::scan::scan_info>()> next_split_provider();
 
-  /// Accessor for the composed ingestible. Undefined behavior on the legacy
-  /// default-ctor path (which never calls this). Callers that need a
+  /// Accessor for the borrowed ingestible. Callers that need a
   /// @c shared_ptr<gpu_ingestible> can promote via
   /// `provider.get_ingestible().shared_from_this()`.
   [[nodiscard]] op::scan::gpu_ingestible& get_ingestible() const noexcept { return *_ingestible; }
 
  private:
-  /// Non-owning pointer to the composed ingestible (null on the legacy
-  /// default-ctor path). The operator owns the lifetime; the provider is
-  /// always destroyed first via @c sirius_scan_manager::reset.
+  /// Non-owning pointer to the borrowed ingestible. The operator owns the
+  /// lifetime; the provider is always destroyed first via
+  /// @c sirius_scan_manager::reset.
   op::scan::gpu_ingestible* _ingestible{nullptr};
 
   /// Resolves each file's ioctx by path (s3:// -> rest, local -> uring/kvikio),

@@ -341,8 +341,7 @@ class SiriusContext : public ClientContextState {
   // succeeded in initialize(). Populated under rmm::cuda_set_device_raii, one
   // call per pair. Consumed by is_peer_access_enabled() and any Sirius-side
   // converter override. Holds no CUDA resources — just a set of int pairs —
-  // so destruction order relative to memory_manager_ is unconstrained;
-  // placed adjacent to gpu_ioctxs_ for multi-GPU state locality.
+  // so destruction order relative to memory_manager_ is unconstrained.
   struct peer_pair_hash {
     size_t operator()(std::pair<int, int> const& p) const noexcept
     {

@@ -28,10 +28,10 @@ namespace sirius::scan_manager {
 /**
  * @brief Configuration for the scan_manager.
  *
- * @c use_sirius_datasource controls whether the manager builds a
- * @c sirius_ioctx and routes parquet reads through @c sirius_datasource.
- * Set to @c false to fall back to @c cudf::io::datasource::create() at
- * every read site (e.g. when the sirius IO path is misbehaving).
+ * @c use_sirius_datasource selects the backend for local paths: @c uring_ioctx
+ * when true, @c kvikio_context when false. Reads go through
+ * @c sirius_datasource either way; the kvikio backend delegates to
+ * @c cudf::io::datasource::create(). Multi-GPU forces this to true.
  *
  * Sub-configs:
  *  - @c local   — uring reactor tunables (local-disk IO path).

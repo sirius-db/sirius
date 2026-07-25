@@ -75,13 +75,12 @@ class io_context_registry {
   using factory_type        = std::function<std::shared_ptr<io::sirius_ioctx>(const config_type&)>;
 
   /**
-   * @brief Register an ioctx for a scheme. Replaces any prior registration
-   *        for the same scheme.
+   * @brief Register an ioctx backend. Replaces any prior registration for the
+   *        same type.
    *
-   * The scheme is lowercased before storage; subsequent @c lookup calls
-   * with any casing of the same scheme resolve to this entry.
-   * @param type    Opaque identifier for the ioctx type. Used by the engine to
-   *                identify the backend.
+   * @param type    Backend identifier (uring / restful / kvikio).
+   * @param checker Decides whether this backend claims a given path.
+   * @param factory Constructs the backend's ioctx; invoked by @c make_ioctx.
    */
   void register_ioctx(io_context_type type, scheme_checker_type checker, factory_type factory);
 
