@@ -37,6 +37,7 @@ SELECT l_returnflag, SUM(l_quantity) FROM lineitem GROUP BY l_returnflag;
 | [Scan](scan.md) | Scan subsystem: unified GPU scan operator, `gpu_ingestible` (parquet + DuckDB-native), scan manager, pinned tables, DuckDB-native decode, row-group pruning, Sirius IO layer (uring/REST/kvikio + prefetching cache) |
 | [Memory Management](memory-management.md) | cuCascade tiers, reservations, downgrade executor |
 | [Data Management](data-management.md) | Data batches, repositories, ports, barrier semantics |
+| [Streaming Sessions](streaming-sessions.md) | How a plan fragment's input and output boundaries work: `STREAMING_SOURCE` / `STREAMING_SINK`, `stream_lifecycle`, partition fan-out, the id-addressed `stream_session` |
 | [Configuration](configuration.md) | sirius_config, operator_params, SET variables |
 | [Optimizations](optimizations.md) | Performance optimizations with PRs, code paths, configs |
 | [Multi-GPU Architecture](multi-gpu-architecture.md) | How Sirius executes SQL across every GPU on a node — tiers, pin tables, SCHED-RR, cross-GPU transfers, downgrade, concurrency invariants |
@@ -56,7 +57,8 @@ SELECT l_returnflag, SUM(l_quantity) FROM lineitem GROUP BY l_returnflag;
 8. **Scan** — how data enters the system from storage
 9. **Memory Management** — GPU memory tiers, reservations, spilling
 10. **Data Management** — data batch lifecycle and port wiring
-11. **Configuration** — tuning knobs and runtime settings
-12. **Optimizations** — performance improvements and their mechanisms
+11. **Streaming Sessions** — how a fragment's data enters and leaves when the query spans nodes
+12. **Configuration** — tuning knobs and runtime settings
+13. **Optimizations** — performance improvements and their mechanisms
 
 <!-- last-updated-commit: 84543810a303c81c891b2adbae222157a4e17204 -->
