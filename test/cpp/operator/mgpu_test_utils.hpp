@@ -130,7 +130,11 @@ inline void write_mgpu_yaml(std::filesystem::path const& yaml_path,
     << params.concat_batch_bytes
     << "\n"
        "    max_build_hash_table_bytes: "
-    << params.max_build_hash_table_bytes << "\n";
+    << params.max_build_hash_table_bytes
+    << "\n"
+       // Disable the small-query bypass so these tests still take the partitioned multi-GPU path
+       // over their small fixtures (issue #990).
+       "    small_query_bytes_threshold: 0\n";
 }
 
 /**

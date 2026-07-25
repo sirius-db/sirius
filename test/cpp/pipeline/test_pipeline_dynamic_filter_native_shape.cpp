@@ -87,6 +87,10 @@ TEST_CASE("duckdb-native scans consume dynamic filters", "[integration][pipeline
   r = con.Query("USE tpch;");
   REQUIRE(r);
   REQUIRE_FALSE(r->HasError());
+  // Dynamic-filter publication requires the partitioned BUILD_PROBE path.
+  r = con.Query("SET small_query_bytes_threshold = 0;");
+  REQUIRE(r);
+  REQUIRE_FALSE(r->HasError());
 
   const std::string join_query =
     "SELECT count(*) FROM lineitem, part WHERE l_partkey = p_partkey AND p_size = 15";
