@@ -74,7 +74,14 @@ WHERE l_shipdate >= date '1997-01-01'
   AND l_quantity < 24;
 ```
 
-Point `path` at whatever TPC-H `lineitem` parquet you have.
+Point `path` at whatever TPC-H `lineitem` parquet you have. On TPC-H SF1 that query returns
+
+```
+revenue
+61567694.95019999
+```
+
+which matches DuckDB on CPU over the same file (`61567694.9502`).
 
 ## The pre-packaged front end
 
