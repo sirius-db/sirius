@@ -229,7 +229,7 @@ sirius_scan_manager::sirius_scan_manager(
 
   // scan_manager always owns an io_ctx: sirius_datasource (uring) on the
   // fast path, kvikio_context as the universal fallback so the rest of the
-  // scan path (parquet_split_provider, scan tasks) always has an ioctx to
+  // scan path (split_provider, scan tasks) always has an ioctx to
   // talk to.  kvikio_context wraps cudf::io::datasource so the read path
   // is identical from the caller's point of view.  Both are built by the
   // ioctx registry, which sources the reactor staging resource from the
@@ -772,8 +772,8 @@ void sirius_scan_manager::insert_pinned_entry(
   std::vector<std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>>> chunk_stats)
 {
   // chunk_memory_spaces is parallel to data_tables — the caller
-  // (PinTableFunction) emits one memory_space* per
-  // chunked_parquet_reader::read_chunk() result, and there is exactly one
+  // (PinTableFunction) emits one memory_space* per coalesced batch, and
+  // there is exactly one
   // cudf::table per chunk in data_tables. Reject any misalignment loudly
   // rather than silently aliasing chunks to the wrong GPU.
   if (chunk_memory_spaces.size() != data_tables.size()) {
@@ -824,14 +824,13 @@ void sirius_scan_manager::insert_pinned_entry(
     // Mixing a full pin with a partial pin produces an entry whose columns came
     // from different row coverage — drop and rebuild instead.
     if (existing_it->second.num_rows == new_num_rows) {
-      // Same-row-count merge MUST preserve per-chunk memory_space alignment
-      // between existing and new entry. The round-robin counter restarts at
-      // chunk 0 → GPU 0 per pin_table call, and chunks at index i across all
-      // columns share a memory_space because they came from the same
-      // chunked_parquet_reader::read_chunk() call. Two pin_table calls of the
-      // same file_paths with the same chunk_read_limit MUST therefore produce
-      // identical chunk_memory_spaces vectors. Reject any mismatch loudly
-      // rather than silently aliasing.
+      // A merge is only valid when the new pin reproduces the existing batch
+      // boundaries and placement. The round-robin counter restarts at chunk 0
+      // per pin_table call, and chunks at index i across all columns share a
+      // memory_space because they came from the same coalesced batch. Batch
+      // boundaries depend on the projected column set, so a re-pin can slice
+      // the same files differently. Reject any mismatch loudly rather than
+      // silently aliasing.
       auto& entry = existing_it->second;
       if (entry.chunk_memory_spaces.size() != chunk_memory_spaces.size()) {
         throw std::runtime_error(
@@ -880,8 +879,8 @@ void sirius_scan_manager::insert_pinned_entry(
       // Decide which column INDICES are new BEFORE iterating chunks. Doing
       // the contains() check per-chunk would let chunk 0 install a new
       // column and then chunks 1..N-1 see contains()==true and skip — leaving
-      // the new column with only chunk 0 and tripping cached_split_provider's
-      // "mismatched chunk count across requested columns" invariant.
+      // the new column with only chunk 0; the cached provider would then read
+      // the short column vector as end-of-stream and silently truncate the scan.
       std::vector<bool> is_new_col(column_names.size(), false);
       for (std::size_t i = 0; i < column_names.size(); ++i) {
         is_new_col[i] = !entry.data_batches_by_column.contains(column_names[i]);

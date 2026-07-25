@@ -513,8 +513,8 @@ std::string dump_barrier_name(op::MemoryBarrierType b)
 //! Scan identity: serialize what the ingestible will scan, so a conversion that drops
 //! identity fields (e.g. the duckdb-native pin-cache qualified name, or a parquet file
 //! list) fails the dump byte-diff instead of passing on an identical operator-type chain.
-//! Conversion-time only: table_info is still parked on the operator (scan_manager takes it
-//! at prepare_for_query).
+//! The operator owns its ingestible for the whole query, so this reads the same table_info
+//! the scan manager later matches against pinned entries.
 void dump_scan_identity(std::ostringstream& out, const op::sirius_physical_operator& op)
 {
   if (op.type != op::SiriusPhysicalOperatorType::GPU_SCAN) { return; }

@@ -203,7 +203,7 @@ In the diagrams below, `[A, B, C]` denotes a pipeline where A is `operators[0]` 
 
 ### TABLE_SCAN Rewrite
 
-During plan generation, a `TABLE_SCAN` whose source is a supported format is rewritten in place into a single `GPU_SCAN` operator (`sirius_gpu_scan_operator`) that inherits the TABLE_SCAN's tree position and stays the source-leaf of the same pipeline — no separate scan pipeline is created. `GPU_SCAN` is format-agnostic: it owns a pluggable `io::gpu_ingestible` that knows how to enumerate splits and materialize each split into a `cudf::table`. `wrap_table_scan_source()` (`src/planner/sirius_physical_plan_generator.cpp`) dispatches on the bound table function name:
+During plan generation, a `TABLE_SCAN` whose source is a supported format is rewritten in place into a single `GPU_SCAN` operator (`sirius_gpu_scan_operator`) that inherits the TABLE_SCAN's tree position and stays the source-leaf of the same pipeline — no separate scan pipeline is created. `GPU_SCAN` is format-agnostic: it owns a pluggable `gpu_ingestible` that knows how to enumerate splits and materialize each split into a `cudf::table`. `wrap_table_scan_source()` (`src/planner/sirius_physical_plan_generator.cpp`) dispatches on the bound table function name:
 
 **Parquet (`parquet_scan` / `read_parquet` / `sirius_read_parquet`, including `s3://` paths):** `build_parquet_table_info()` captures the DuckDB bind data (resolved file paths, hive-partition indices, returned/column/projection ids, table filters) into a `parquet_ingestible_table_info`, builds a parquet ingestible via `make_ingestible()`, and constructs the `GPU_SCAN` operator around it.
 
@@ -211,7 +211,7 @@ During plan generation, a `TABLE_SCAN` whose source is a supported format is rew
 
 Any other scan function falls back to CPU: `create_plan(LogicalGet&)` declines it before plan generation reaches the wrap.
 
-During `prepare_for_query`, `sirius_scan_manager` takes the ingestible off each `GPU_SCAN` operator, peeks its file paths for a pinned-cache match (substituting a cached ingestible on a hit), and binds a `split_connector` to the operator. The operator pulls splits from the connector inside `get_next_task_input_data()` (see [Scan — Scan Manager](scan.md#scan-manager)).
+During `prepare_for_query`, `sirius_scan_manager` inspects each `GPU_SCAN` operator's ingestible for a pinned-cache match. A cache miss uses `split_provider`; a cache hit uses `cached_databatch_provider`. The operator keeps its ingestible in both cases. Providers push splits into the connector the operator created at plan time. The operator pulls splits from the connector inside `get_next_task_input_data()` (see [Scan — Scan Manager](scan.md#scan-manager)).
 
 ### HASH_JOIN Probe Side
 

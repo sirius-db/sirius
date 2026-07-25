@@ -469,7 +469,7 @@ void task_creator::manager_loop()
                 host_bytes.size(),
                 preferred_device_id.value_or(-1));
             }
-            // Cached-scan locality: scan_operator_with_pinned_table_input is
+            // Cached-scan locality: a resident scan_operator_input is
             // NOT a pipelineable_operator_data (see
             // sirius_gpu_scan_operator_data.hpp), so the data-locality block
             // above skipped it wholesale. Without this branch, every
@@ -477,7 +477,7 @@ void task_creator::manager_loop()
             // scheduler and triggers a peer DMA or host staging when the
             // consumer GPU differs from the chunk's home GPU. The pinned
             // chunk's GPU residency is preserved on the batch
-            // (cached_parquet_gpu_ingestible pins each chunk_memory_space
+            // (the cached provider pins each chunk_memory_space
             // into the gpu_table_representation), so we just read it here.
             if (!preferred_device_id.has_value()) {
               if (auto* cached =
