@@ -90,6 +90,7 @@ sirius:
     hash_partition_bytes:       805306368   # 768 MiB
     concat_batch_bytes:         805306368   # 768 MiB
     max_build_hash_table_bytes: 805306368   # 768 MiB
+    small_query_bytes_threshold: 256MiB      # default; 0 disables
     enable_dynamic_filter_pushdown: true    # BUILD_PROBE raw/hash IN-list or Bloom filters
     enable_dynamic_zone_map_filter: false  # optional parquet-read/native-post-decode min/max
     dynamic_filter_domain_coverage_threshold: 0.9  # skip keys the build's domain coverage exceeds
@@ -351,11 +352,33 @@ Four optional nested sub-configs tune the individual backends and caches:
 | `max_broadcast_join_size` | 256 MB | Max build-side size eligible for a broadcast join. A build below this size is replicated to every GPU (instead of hash-partitioned) when it is tiny, or when the DuckDB-estimated probe-to-build row ratio is at least `num_gpus * 1.25`. |
 | `max_sort_partition_memory_fraction` | 0.33 | Fraction of GPU memory per sort partition when `max_sort_partition_bytes` is 0 |
 | `mark_join_build_switch_ratio` | 8.0 | For STANDARD MARK joins, build on the smaller (left) side when `right_rows >= ratio * left_rows` (0 disables) |
+| `small_query_bytes_threshold` | 256 MiB | Skip partition and sort-sampling stages when the summed estimated base-scan bytes are below the effective threshold; 0 disables. |
 | `enable_dynamic_filter_pushdown` | true | Master switch for dynamic table-filter pushdown. An eligible `BUILD_PROBE` hash-join build selects a raw exact IN-list for 1–12 supported build rows, otherwise a hash IN-list if it fits the smallest probe-GPU L2 or a Bloom, for post-decode application by the probe scan. |
 | `enable_dynamic_zone_map_filter` | false | Additionally publish build-key min/max bounds. Parquet scans use them for read-time row-group pruning; duckdb-native scans apply them row-wise post-decode. Requires `enable_dynamic_filter_pushdown`; intended for clustered-keyset workloads. |
 | `dynamic_filter_domain_coverage_threshold` | 0.9 | Skip publishing a key's dynamic filters when the build covers at least this fraction of the key's domain; ≥ 1.0 effectively disables the gate. |
 | `dynamic_filter_keep_threshold` | 0.9 | Disable a probe scan's post-decode dynamic filtering once a measured split keeps more than this fraction of its rows; in [0, 1], 1.0 keeps filtering always on. |
 | `enable_pinned_zone_map_pruning` | true | Capture per-chunk min/max statistics while pinning and use them to skip cached chunks that cannot match a scan filter. |
+
+`small_query_bytes_threshold` is enabled by default. Its effective value is clamped to
+`scan_task_batch_size`, and bypass activates only when the estimate is strictly below that value.
+The estimate sums each base scan's `cardinality × projected row width`: fixed-width columns use
+their exact byte size, VARCHAR columns use the maximum string length from column statistics (and
+the query is ineligible when that statistic is unavailable, rather than assuming a flat width), and
+`COLUMN_DATA_SCAN` sources (e.g. `VALUES`) are measured from their materialized size. CTE,
+delim-join, recursive, nested-type, and overflowing estimates are ineligible. When more than one
+GPU is configured, any plan containing a hash or nested-loop join is also ineligible: the bypass
+runs the whole query on a single partition (GPU 0), so a join that amplifies its output is kept on
+the partitioned path, which spreads that output across GPUs and keeps each cuDF gather under the
+per-column row limit. The bypass removes `PARTITION`, `SORT_SAMPLE`, and `SORT_PARTITION`, but
+retains CONCAT and merge operators for correctness. Bypassed joins remain in STANDARD mode, so
+BUILD_PROBE selection and dynamic-filter publication do not run.
+
+The gate bounds only base-scan *input* bytes; it does not model join or aggregate *output* fan-out.
+The multi-GPU join exclusion above removes the case where the bypass would concentrate an amplified
+join result onto one GPU that the partitioned path would have distributed. A single-GPU run has no
+such distributed alternative, so there an amplifying join (or a materialized side folded by
+`concat_all`) carries the same per-gather memory / cuDF row limits as the normal path — raise the
+threshold with that in mind.
 
 **Note:** `max_build_hash_table_bytes` can be larger than `concat_batch_bytes`. When it is, the partition operator configures CONCAT to concatenate all batches, enabling the more efficient BUILD_PROBE join mode for larger build sides. Other joins (STANDARD, MIXED) still use `concat_batch_bytes` as the batch size threshold.
 
@@ -526,6 +549,15 @@ These can also be set at load via the `SIRIUS_LOG_BACKEND`, `SIRIUS_LOG_DIR`, an
 | `max_build_hash_table_bytes` | 500 MB | Max build-side hash table bytes |
 | `max_broadcast_join_size` | 256 MB | Max build-side size eligible for a broadcast join |
 | `mark_join_build_switch_ratio` | 8.0 | STANDARD MARK join build-side switch ratio (0 disables) |
+| `small_query_bytes_threshold` | 256 MiB | Whole-query base-scan byte threshold for skipping partition and sort-sampling stages; clamped to `scan_task_batch_size`; 0 disables. |
+
+```sql
+-- The bypass is enabled at 256 MiB by default. Change the threshold if needed.
+SET small_query_bytes_threshold = 134217728; -- 128 MiB
+
+-- Disable the bypass.
+SET small_query_bytes_threshold = 0;
+```
 
 ### Dynamic Filters
 
