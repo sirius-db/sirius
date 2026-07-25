@@ -100,8 +100,9 @@ class sirius_physical_streaming_sink : public sirius_physical_operator {
   /// rather than landing behind a consumer that already saw EOS.
   void sink(const operator_data& input_data, rmm::cuda_stream_view stream) override;
 
-  /// Pass-through: pushing a batch allocates nothing, so report the input bytes instead of the
-  /// default 2× heuristic (matches the streaming source).
+  /// Report the input bytes rather than the default 2× heuristic (matching the streaming
+  /// source). With one destination the push allocates nothing at all; with N the partition
+  /// produces about one input's worth of new device memory. Neither warrants 2×.
   [[nodiscard]] std::size_t no_history_peak_memory_estimate(
     const input_stats& stats) const override;
 

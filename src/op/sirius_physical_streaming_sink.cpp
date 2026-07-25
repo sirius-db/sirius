@@ -115,7 +115,8 @@ void sirius_physical_streaming_sink::sink(const operator_data& input_data,
 std::size_t sirius_physical_streaming_sink::no_history_peak_memory_estimate(
   const input_stats& stats) const
 {
-  // Pushing a handle into the output repository allocates nothing new.
+  // A single-destination push allocates nothing; a partitioned one rewrites the input into N
+  // slices, i.e. roughly one input's worth. Both are well under the 2× default.
   return stats.bytes;
 }
 
