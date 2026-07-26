@@ -243,6 +243,59 @@ void with_initialized_engine(duckdb::Connection& con,
   }
 }
 
+void with_initialized_streaming_fragment(
+  duckdb::Connection& con,
+  const std::string& query,
+  std::vector<std::shared_ptr<cucascade::shared_data_repository>> output_repos,
+  std::optional<op::partition_spec> spec,
+  const std::function<void(sirius_engine&, op::sirius_physical_streaming_sink&)>& consume)
+{
+  auto& context = *con.context;
+
+  // Stands in for the execution window this helper never opens: registers this plan's
+  // repository manager and drops it (with its repositories) on the way out.
+  scoped_test_query test_query(context);
+
+  con.BeginTransaction();
+  try {
+    extracted_plan extracted;
+    {
+      optimizer_disable_guard guard(context);
+      extracted = extract_logical_plan_sirius_order(context, query);
+    }
+
+    sirius::planner::sirius_physical_plan_generator physical_planner(context);
+    auto sirius_plan = physical_planner.create_plan(std::move(extracted.logical_plan));
+
+    // A STREAMING_SINK is a normal unary operator, unlike the RESULT_COLLECTOR, which keeps its
+    // child outside `children[]` and needs special descent in the plan generator. Attaching the
+    // subtree as children[0] is what keeps that special-casing unnecessary.
+    auto types       = sirius_plan->types;
+    auto cardinality = sirius_plan->estimated_cardinality;
+    duckdb::unique_ptr<op::sirius_physical_streaming_sink> sink;
+    if (spec.has_value()) {
+      sink = duckdb::make_uniq<op::sirius_physical_streaming_sink>(
+        std::move(types), cardinality, std::move(output_repos), std::move(*spec));
+    } else {
+      sink = duckdb::make_uniq<op::sirius_physical_streaming_sink>(
+        std::move(types), cardinality, output_repos.front());
+    }
+    sink->children.push_back(std::move(sirius_plan));
+
+    sirius_interface iface(context);
+    sirius_engine engine(context, iface, test_query.query_id());
+    // The fragment owns the plan; the engine borrows it. initialize() would take ownership and
+    // destroy the sink with the engine, leaving nothing to pull from afterwards.
+    engine.initialize_internal(*sink);
+    consume(engine, *sink);
+
+    con.Rollback();
+  } catch (...) {
+    con.Rollback();
+    throw;
+  }
+}
+
 std::string convert_query_to_dump(duckdb::Connection& con, const std::string& query)
 {
   std::string dump;
