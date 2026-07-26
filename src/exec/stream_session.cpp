@@ -29,32 +29,26 @@ std::string id_str(stream_id_t id) { return std::to_string(id); }
 
 }  // namespace
 
-void stream_session::add_source(stream_id_t id,
-                                std::shared_ptr<op::sirius_physical_streaming_source> source)
+void stream_session::add_source(stream_id_t id, op::sirius_physical_streaming_source& source)
 {
-  if (!source) {
-    throw sirius::invalid_input_exception("stream_session: source for input stream " + id_str(id) +
-                                          " must not be null");
-  }
-  if (!_sources.emplace(id, std::move(source)).second) {
+  if (!_sources.emplace(id, &source).second) {
     throw sirius::invalid_input_exception("stream_session: input stream " + id_str(id) +
                                           " is already registered");
   }
 }
 
 void stream_session::add_sink(std::vector<stream_id_t> ids,
-                              std::shared_ptr<op::sirius_physical_streaming_sink> sink)
+                              op::sirius_physical_streaming_sink& sink)
 {
-  if (!sink) { throw sirius::invalid_input_exception("stream_session: sink must not be null"); }
-  if (ids.size() != sink->num_output_streams()) {
+  if (ids.size() != sink.num_output_streams()) {
     throw sirius::invalid_input_exception(
-      "stream_session: sink exposes " + std::to_string(sink->num_output_streams()) +
+      "stream_session: sink exposes " + std::to_string(sink.num_output_streams()) +
       " output streams but " + std::to_string(ids.size()) + " ids were given");
   }
 
   // Positional by contract: ids[i] ↔ sink partition i ↔ output repository i.
   for (std::size_t partition = 0; partition < ids.size(); ++partition) {
-    if (!_sinks.emplace(ids[partition], sink_output{sink, partition}).second) {
+    if (!_sinks.emplace(ids[partition], sink_output{&sink, partition}).second) {
       throw sirius::invalid_input_exception("stream_session: output stream " +
                                             id_str(ids[partition]) + " is already registered");
     }
