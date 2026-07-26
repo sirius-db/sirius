@@ -85,7 +85,7 @@ streaming_fragment::~streaming_fragment()
   }
 }
 
-void streaming_fragment::build()
+void streaming_fragment::build(sirius::query_id_t query_id)
 {
   if (_built) { throw sirius::invalid_input_exception("streaming_fragment: already built"); }
 
@@ -134,7 +134,7 @@ void streaming_fragment::build()
   // takes. The fragment owns the engine, so the sink still outlives run() and stays pullable.
   _iface = std::make_unique<sirius::sirius_interface>(
     _context, std::optional<std::string>(kFragmentQueryLabel));
-  _engine = std::make_unique<sirius::sirius_engine>(_context, *_iface);
+  _engine = std::make_unique<sirius::sirius_engine>(_context, *_iface, query_id);
   _engine->initialize(std::move(sink));
 
   auto& sink_ref = _engine->sirius_physical_plan->Cast<op::sirius_physical_streaming_sink>();
@@ -161,11 +161,11 @@ void streaming_fragment::run()
     throw sirius::invalid_input_exception("streaming_fragment: build() must run before run()");
   }
 
-  // The query lifecycle is the CALLER's, not the fragment's. QueryBeginStandalone resets the
-  // task creator and the operator-id counter, and QueryEnd resets the scan manager -- all of
-  // which build() has already populated. Taking the slot here would discard those plan-time
-  // registrations, and the fragment would run zero tasks and return an empty output silently.
-  // The caller brackets build() and run() together, as Context::execute_substrait does.
+  // The query lifecycle is the CALLER's, not the fragment's. A new StandaloneQueryScope resets
+  // the task creator and the operator-id counter, and finish() resets the scan manager -- all of
+  // which build() has already populated. Taking a second window here would discard those
+  // plan-time registrations, and the fragment would run zero tasks and return an empty output
+  // silently. The caller brackets build() and run() together in one window.
   _engine->execute();
 }
 

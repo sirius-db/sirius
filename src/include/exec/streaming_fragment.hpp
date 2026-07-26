@@ -19,6 +19,7 @@
 #include "exec/stream_bind_catalog.hpp"
 #include "exec/stream_session.hpp"
 #include "op/sirius_physical_streaming_sink.hpp"
+#include "query_id.hpp"
 
 #include <duckdb/main/client_context.hpp>
 #include <duckdb/planner/logical_operator.hpp>
@@ -84,14 +85,17 @@ class streaming_fragment {
   /// Build the plan: declare the inputs, lower them to STREAMING_SOURCEs, root the tree in a
   /// STREAMING_SINK, and register both ends with the session. Separate from `run()` so a caller
   /// can push into the inputs before execution starts.
-  void build();
+  ///
+  /// `query_id` is the caller's open `StandaloneQueryScope` window — the engine wires operators
+  /// into that query's repository manager. Do not open a second window between `build` and `run`.
+  void build(sirius::query_id_t query_id);
 
   /// Submit and block until the fragment's pipelines finish.
   ///
   /// The caller owns the query lifecycle and must bracket `build()` and `run()` together in one
-  /// `QueryBeginStandalone` / `QueryEnd` pair. Beginning a query between them resets the task
-  /// creator and scan manager that `build()` populated, and the fragment then runs zero tasks
-  /// and produces an empty output with no error.
+  /// `StandaloneQueryScope`. Beginning a new window between them resets the task creator and
+  /// scan manager that `build()` populated, and the fragment then runs zero tasks and produces
+  /// an empty output with no error.
   /// @throws if `build()` has not run.
   void run();
 

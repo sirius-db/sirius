@@ -96,45 +96,11 @@ struct fragment_fixture {
   duckdb::shared_ptr<stream_bind_catalog> catalog;
 };
 
-//! RAII for a standalone query lifecycle.
-//!
-//! `QueryBeginStandalone` takes the context's query-lifecycle mutex and `QueryEnd` releases it.
-//! Every statement on the connection -- including the `Rollback` in a test's exception path --
-//! takes that same non-recursive mutex on this same thread. A `REQUIRE` that fails inside a
-//! hand-bracketed lifecycle therefore self-deadlocks in the rollback: the test reports nothing
-//! and hangs forever, which is indistinguishable from an engine hang. The guard closes the
-//! bracket while the stack unwinds, so a failing assertion fails.
-struct query_lifecycle {
-  query_lifecycle(duckdb::SiriusContext& ctx,
-                  duckdb::ClientContext& context,
-                  const std::string& label)
-    : _ctx(ctx)
-  {
-    _ctx.QueryBeginStandalone(context, label);
-  }
-  query_lifecycle(const query_lifecycle&)            = delete;
-  query_lifecycle& operator=(const query_lifecycle&) = delete;
-
-  ~query_lifecycle()
-  {
-    try {
-      end();
-    } catch (...) {  // NOLINT(bugprone-empty-catch) -- a throwing destructor would terminate
-    }
-  }
-
-  //! Ends the lifecycle at a chosen point, for tests that assert on post-QueryEnd state.
-  //! Idempotent, so the destructor is a no-op afterwards.
-  void end()
-  {
-    if (!_open) { return; }
-    _open = false;
-    _ctx.QueryEnd();
-  }
-
-  duckdb::SiriusContext& _ctx;
-  bool _open = true;
-};
+//! The execution window a fragment's build/run must sit inside. RAII matters here: a `REQUIRE`
+//! that fails inside a hand-bracketed window would leave the slot held and self-deadlock in the
+//! test's `Rollback`, so the scope's destructor backstop is what lets a failing assertion fail.
+//! Tests that assert on post-cleanup state call `finish()` explicitly.
+using query_window = duckdb::SiriusContext::StandaloneQueryScope;
 
 //! Every INTEGER value sitting in an output stream, draining it. Row counts alone would not
 //! catch a hop that corrupted, dropped or duplicated values.
@@ -167,7 +133,7 @@ std::size_t drain_row_count(streaming_fragment& fragment, stream_id_t id)
 // ============================================================================
 
 TEST_CASE_METHOD(fragment_fixture,
-                 "FRAG-1: a leaf fragment runs and its output survives QueryEnd",
+                 "FRAG-1: a leaf fragment runs and its output survives the window cleanup",
                  "[integration][streaming_fragment]")
 {
   fragment_spec spec;
@@ -181,13 +147,12 @@ TEST_CASE_METHOD(fragment_fixture,
   try {
     streaming_fragment fragment(*con->context, std::move(spec));
 
-    // One lifecycle spanning build + run: QueryBeginStandalone resets the task creator, so
-    // beginning it after build() would discard the plan-time registrations.
-    query_lifecycle lifecycle(*sirius_ctx, *con->context, "frag_1");
-    fragment.build();
+    // One window spanning build + run (shared query window).
+    query_window window(*sirius_ctx, *con->context, "frag_1");
+    fragment.build(window.query_id());
     // The whole point of change 2: without the completion gate this call never returns.
     fragment.run();
-    lifecycle.end();
+    window.finish();
 
     // Diagnostic: separate "the source never produced a task" from "tasks ran but the sink got
     // nothing". Without this the empty-output failure has two very different causes.
@@ -202,7 +167,7 @@ TEST_CASE_METHOD(fragment_fixture,
     REQUIRE(created > 0);
 
     // Invariant 2 -- the output repository is session-owned, outside data_repository_manager_,
-    // so QueryEnd()'s clear_all_repositories() cannot touch it. The batches are still here.
+    // so the window cleanup's clear_all_repositories() cannot touch it. The batches are still here.
     REQUIRE(fragment.output_repository(0)->total_size() > 0);
     REQUIRE(drain_row_count(fragment, 0) == kLeafRows);
 
@@ -248,17 +213,17 @@ TEST_CASE_METHOD(fragment_fixture,
     receiver_spec.outputs = {1};
     streaming_fragment receiver(*con->context, std::move(receiver_spec));
 
-    // Each fragment gets its own query lifecycle, spanning its build and run. The sender's
-    // output repository is session-owned, so it survives the sender's QueryEnd and is still
-    // there for the relay.
+    // Each fragment gets its own query window, spanning its build and run. The sender's
+    // output repository is session-owned, so it survives the sender's window cleanup and is
+    // still there for the relay.
     {
-      query_lifecycle sender_lifecycle(*sirius_ctx, *con->context, "frag_sender");
-      sender.build();
+      query_window sender_window(*sirius_ctx, *con->context, "frag_sender");
+      sender.build(sender_window.query_id());
       sender.run();
     }
 
-    query_lifecycle receiver_lifecycle(*sirius_ctx, *con->context, "frag_receiver");
-    receiver.build();
+    query_window receiver_window(*sirius_ctx, *con->context, "frag_receiver");
+    receiver.build(receiver_window.query_id());
 
     // The relay the compute node will perform: pull from the sender's output stream and push
     // into the receiver's input stream, as native batches. No Arrow, no disk.
@@ -271,7 +236,7 @@ TEST_CASE_METHOD(fragment_fixture,
     receiver.session().close_input(0, 0);
 
     receiver.run();
-    receiver_lifecycle.end();
+    receiver_window.finish();
 
     // Values, not just a count: the chain must deliver exactly what the sender produced.
     auto const received = drain_values(receiver, 1);
@@ -338,8 +303,8 @@ TEST_CASE_METHOD(fragment_fixture,
     con->BeginTransaction();
     streaming_fragment fragment(*con->context, std::move(spec));
     {
-      query_lifecycle lifecycle(*sirius_ctx, *con->context, "frag_3");
-      REQUIRE_THROWS_AS(fragment.build(), sirius::invalid_input_exception);
+      query_window window(*sirius_ctx, *con->context, "frag_3");
+      REQUIRE_THROWS_AS(fragment.build(window.query_id()), sirius::invalid_input_exception);
     }
     con->Rollback();
   }
@@ -437,13 +402,13 @@ TEST_CASE_METHOD(fragment_fixture,
     streaming_fragment receiver(*con->context, std::move(receiver_spec));
 
     {
-      query_lifecycle sender_lifecycle(*sirius_ctx, *con->context, "frag4_sender");
-      sender.build();
+      query_window sender_window(*sirius_ctx, *con->context, "frag4_sender");
+      sender.build(sender_window.query_id());
       sender.run();
     }
 
-    query_lifecycle receiver_lifecycle(*sirius_ctx, *con->context, "frag4_receiver");
-    receiver.build();
+    query_window receiver_window(*sirius_ctx, *con->context, "frag4_receiver");
+    receiver.build(receiver_window.query_id());
 
     std::size_t relayed_batches = 0;
     std::size_t relayed_rows    = 0;
@@ -458,7 +423,7 @@ TEST_CASE_METHOD(fragment_fixture,
     receiver.session().close_input(0, 0);
 
     receiver.run();
-    receiver_lifecycle.end();
+    receiver_window.finish();
 
     REQUIRE(drain_row_count(receiver, 1) == expected_rows);
 
@@ -516,13 +481,13 @@ TEST_CASE_METHOD(fragment_fixture,
     streaming_fragment receiver(*con->context, std::move(receiver_spec));
 
     for (auto* sender : {first.get(), second.get()}) {
-      query_lifecycle sender_lifecycle(*sirius_ctx, *con->context, "frag5_sender");
-      sender->build();
+      query_window sender_window(*sirius_ctx, *con->context, "frag5_sender");
+      sender->build(sender_window.query_id());
       sender->run();
     }
 
-    query_lifecycle receiver_lifecycle(*sirius_ctx, *con->context, "frag5_receiver");
-    receiver.build();
+    query_window receiver_window(*sirius_ctx, *con->context, "frag5_receiver");
+    receiver.build(receiver_window.query_id());
 
     std::size_t relayed_batches = 0;
     for (auto* sender : {first.get(), second.get()}) {
@@ -537,7 +502,7 @@ TEST_CASE_METHOD(fragment_fixture,
     receiver.session().close_input(0, 0);
 
     receiver.run();
-    receiver_lifecycle.end();
+    receiver_window.finish();
 
     // Diagnostic, not a contract: the source hands out one batch per task, so a healthy drain of
     // N batches runs N tasks. Reported rather than asserted because coalescing batches into one
