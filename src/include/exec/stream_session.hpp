@@ -44,6 +44,11 @@ using stream_id_t = std::uint64_t;
 /// live re-arm is wired through its pipeline, not through here — so adding the session on top
 /// changes no behaviour, only addressing.
 ///
+/// **The session does not own the operators it routes to.** A plan tree owns its operators
+/// uniquely (`sirius_physical_operator::children` is a vector of `duckdb::unique_ptr`), so an
+/// operator inside a plan can never be handed out as an owning pointer. Whatever owns the plan
+/// must outlive the session.
+///
 /// Not thread-safe for registration: `add_source` / `add_sink` run at build time, before any
 /// producer or consumer thread touches the session. The forwarded calls themselves are as
 /// thread-safe as the operators they reach (the lifecycle and the repository both lock).
@@ -59,17 +64,17 @@ class stream_session {
   // Registration (build time)
   // -----------------------------------------------------------------------
 
-  /// Register a streaming source under the input stream id `id`.
-  /// @throws sirius::invalid_input_exception on a null source or a duplicate input id.
-  void add_source(stream_id_t id, std::shared_ptr<op::sirius_physical_streaming_source> source);
+  /// Register a streaming source under the input stream id `id`. The session does not take
+  /// ownership; `source` must outlive it.
+  /// @throws sirius::invalid_input_exception on a duplicate input id.
+  void add_source(stream_id_t id, op::sirius_physical_streaming_source& source);
 
   /// Register a streaming sink under `ids`, one id per output stream: `ids[i]` addresses the
   /// sink's partition `i`, which is its output repository `i`. A single-destination sink takes
-  /// exactly one id.
-  /// @throws sirius::invalid_input_exception on a null sink, a duplicate output id, or an
-  ///         `ids` size that does not match the sink's output stream count.
-  void add_sink(std::vector<stream_id_t> ids,
-                std::shared_ptr<op::sirius_physical_streaming_sink> sink);
+  /// exactly one id. The session does not take ownership; `sink` must outlive it.
+  /// @throws sirius::invalid_input_exception on a duplicate output id, or an `ids` size that
+  ///         does not match the sink's output stream count.
+  void add_sink(std::vector<stream_id_t> ids, op::sirius_physical_streaming_sink& sink);
 
   /// Registered input stream ids, ascending. Empty for a leaf fragment, which produces but
   /// never receives.
@@ -111,9 +116,9 @@ class stream_session {
   [[nodiscard]] bool drained(stream_id_t id) const;
 
  private:
-  /// An output id resolves to one sink *and* the partition within it.
+  /// An output id resolves to one sink *and* the partition within it. Non-owning.
   struct sink_output {
-    std::shared_ptr<op::sirius_physical_streaming_sink> sink;
+    op::sirius_physical_streaming_sink* sink;
     std::size_t partition;
   };
 
@@ -122,7 +127,7 @@ class stream_session {
   /// @throws sirius::invalid_input_exception when `id` is not a registered output stream.
   [[nodiscard]] const sink_output& resolve_sink(stream_id_t id) const;
 
-  std::map<stream_id_t, std::shared_ptr<op::sirius_physical_streaming_source>> _sources;
+  std::map<stream_id_t, op::sirius_physical_streaming_source*> _sources;
   std::map<stream_id_t, sink_output> _sinks;
 };
 

@@ -106,8 +106,8 @@ TEST_CASE("stream_session SESS-1: input and output ids are separate namespaces",
 
   stream_session session;
   // Deliberately the same numeric id on both sides: direction, not the number, disambiguates.
-  session.add_source(7, in.source);
-  session.add_sink({7}, out.sink);
+  session.add_source(7, *in.source);
+  session.add_sink({7}, *out.sink);
 
   REQUIRE(session.input_streams() == std::vector<stream_id_t>{7});
   REQUIRE(session.output_streams() == std::vector<stream_id_t>{7});
@@ -127,8 +127,8 @@ TEST_CASE("stream_session SESS-2: push reaches only the addressed source", "[str
   auto b = make_source();
 
   stream_session session;
-  session.add_source(10, a.source);
-  session.add_source(20, b.source);
+  session.add_source(10, *a.source);
+  session.add_source(20, *b.source);
 
   REQUIRE(session.push(10, make_numeric_batch<int32_t>(*gpu_space, {1}, cudf::type_id::INT32)));
   REQUIRE(a.repo->total_size() == 1);
@@ -150,8 +150,8 @@ TEST_CASE("stream_session SESS-3: close_input is scoped to its stream and sender
   auto b = make_source({0});
 
   stream_session session;
-  session.add_source(10, a.source);
-  session.add_source(20, b.source);
+  session.add_source(10, *a.source);
+  session.add_source(20, *b.source);
 
   session.close_input(10, 0);
   REQUIRE(a.source->lifecycle().sender_closed(0));
@@ -177,8 +177,8 @@ TEST_CASE("stream_session SESS-4: output calls resolve to one sink partition", "
   auto b = make_sink();
 
   stream_session session;
-  session.add_sink({100}, a.sink);
-  session.add_sink({200}, b.sink);
+  session.add_sink({100}, *a.sink);
+  session.add_sink({200}, *b.sink);
 
   auto batch    = make_numeric_batch<int32_t>(*gpu_space, {42}, cudf::type_id::INT32);
   auto batch_id = batch->get_batch_id();
@@ -209,7 +209,7 @@ TEST_CASE("stream_session SESS-5: each sink partition gets its own stream id", "
 
   stream_session session;
   const std::vector<stream_id_t> ids{300, 301, 302};
-  session.add_sink(ids, out.sink);
+  session.add_sink(ids, *out.sink);
   REQUIRE(session.output_streams() == ids);
 
   std::vector<int64_t> keys;
@@ -240,8 +240,8 @@ TEST_CASE("stream_session SESS-6: unknown ids are rejected", "[stream_session]")
   auto out = make_sink();
 
   stream_session session;
-  session.add_source(1, in.source);
-  session.add_sink({2}, out.sink);
+  session.add_source(1, *in.source);
+  session.add_sink({2}, *out.sink);
 
   REQUIRE_THROWS_AS(session.push(99, nullptr), sirius::invalid_input_exception);
   REQUIRE_THROWS_AS(session.close_input(99, 0), sirius::invalid_input_exception);
@@ -259,23 +259,25 @@ TEST_CASE("stream_session SESS-6: unknown ids are rejected", "[stream_session]")
 
 TEST_CASE("stream_session SESS-7: registration is validated", "[stream_session]")
 {
-  auto in  = make_source();
-  auto out = make_partitioned_sink(2);
+  auto in    = make_source();
+  auto other = make_source();
+  auto out   = make_partitioned_sink(2);
+  auto spare = make_sink();
 
   stream_session session;
-  session.add_source(1, in.source);
+  session.add_source(1, *in.source);
 
-  REQUIRE_THROWS_AS(session.add_source(2, nullptr), sirius::invalid_input_exception);
-  REQUIRE_THROWS_AS(session.add_source(1, make_source().source), sirius::invalid_input_exception);
-  REQUIRE_THROWS_AS(session.add_sink({1}, nullptr), sirius::invalid_input_exception);
+  // A duplicate id must be rejected rather than silently rebinding the stream to another
+  // operator. (Registration takes a reference, so a null operator is not expressible.)
+  REQUIRE_THROWS_AS(session.add_source(1, *other.source), sirius::invalid_input_exception);
 
   // One id per destination — an id list that does not match the sink's fan-out would silently
   // leave a partition unaddressable.
-  REQUIRE_THROWS_AS(session.add_sink({10}, out.sink), sirius::invalid_input_exception);
-  REQUIRE_THROWS_AS(session.add_sink({10, 11, 12}, out.sink), sirius::invalid_input_exception);
+  REQUIRE_THROWS_AS(session.add_sink({10}, *out.sink), sirius::invalid_input_exception);
+  REQUIRE_THROWS_AS(session.add_sink({10, 11, 12}, *out.sink), sirius::invalid_input_exception);
 
-  session.add_sink({10, 11}, out.sink);
-  REQUIRE_THROWS_AS(session.add_sink({11}, make_sink().sink), sirius::invalid_input_exception);
+  session.add_sink({10, 11}, *out.sink);
+  REQUIRE_THROWS_AS(session.add_sink({11}, *spare.sink), sirius::invalid_input_exception);
 }
 
 // ============================================================================
@@ -293,8 +295,8 @@ TEST_CASE("stream_session SESS-8: a fragment round-trips native batches by id", 
   auto out    = make_sink();
 
   stream_session session;
-  session.add_source(1, in.source);
-  session.add_sink({2}, out.sink);
+  session.add_source(1, *in.source);
+  session.add_sink({2}, *out.sink);
 
   constexpr int K = 3;
   std::vector<uint64_t> pushed_ids;
@@ -343,7 +345,7 @@ TEST_CASE("stream_session SESS-9: a leaf fragment registers only output streams"
 
   stream_session session;
   const std::vector<stream_id_t> ids{500, 501};
-  session.add_sink(ids, out.sink);
+  session.add_sink(ids, *out.sink);
 
   REQUIRE(session.input_streams().empty());
   REQUIRE(session.output_streams() == ids);
@@ -394,8 +396,8 @@ TEST_CASE("stream_session SESS-10: a root fragment ends only after every sender 
   auto out    = make_sink();
 
   stream_session session;
-  session.add_source(600, in.source);
-  session.add_sink({601}, out.sink);
+  session.add_source(600, *in.source);
+  session.add_sink({601}, *out.sink);
 
   // Sender 0 delivers and closes; sender 1 is still going.
   REQUIRE(session.push(600, make_numeric_batch<int32_t>(*gpu_space, {1}, cudf::type_id::INT32)));
@@ -447,7 +449,7 @@ TEST_CASE("stream_session SESS-11: a moved session still routes", "[stream_sessi
   auto in = make_source();
 
   stream_session original;
-  original.add_source(1, in.source);
+  original.add_source(1, *in.source);
 
   stream_session moved{std::move(original)};
   REQUIRE(moved.input_streams() == std::vector<stream_id_t>{1});
