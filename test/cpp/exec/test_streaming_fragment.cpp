@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "../operator/operator_test_utils.hpp"
 #include "exec/streaming_fragment.hpp"
 #include "helper/type_conversions.hpp"
 #include "sirius/exception.hpp"
@@ -28,6 +29,8 @@
 #include <utils/pipeline_conversion_test_utils.hpp>
 #include <utils/sirius_test_env.hpp>
 
+#include <algorithm>
+#include <cstdint>
 #include <filesystem>
 #include <memory>
 #include <vector>
@@ -82,6 +85,20 @@ struct fragment_fixture {
   std::unique_ptr<duckdb::Connection> con;
   duckdb::shared_ptr<stream_bind_catalog> catalog;
 };
+
+//! Every INTEGER value sitting in an output stream, draining it. Row counts alone would not
+//! catch a hop that corrupted, dropped or duplicated values.
+std::vector<std::int32_t> drain_values(streaming_fragment& fragment, stream_id_t id)
+{
+  std::vector<std::int32_t> values;
+  while (auto batch = fragment.session().pull(id)) {
+    auto view = sirius::get_cudf_table_view(**batch);
+    auto col  = sirius::test::operator_utils::copy_column_to_host<std::int32_t>(view.column(0));
+    values.insert(values.end(), col.begin(), col.end());
+  }
+  std::sort(values.begin(), values.end());
+  return values;
+}
 
 //! Total rows sitting in an output stream, draining it.
 std::size_t drain_row_count(streaming_fragment& fragment, stream_id_t id)
@@ -205,7 +222,10 @@ TEST_CASE_METHOD(fragment_fixture,
     receiver.run();
     sirius_ctx->QueryEnd();
 
-    REQUIRE(drain_row_count(receiver, 1) == static_cast<std::size_t>(expected_rows));
+    // Values, not just a count: the chain must deliver exactly what the sender produced.
+    auto const received = drain_values(receiver, 1);
+    REQUIRE(received.size() == static_cast<std::size_t>(expected_rows));
+    REQUIRE(received == std::vector<std::int32_t>{1, 2, 3, 4, 5});
 
     con->Rollback();
   } catch (...) {
