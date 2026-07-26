@@ -84,6 +84,10 @@ void register_stream_source_function(duckdb::DatabaseInstance& instance)
   // Projection pushdown is deliberately off: a streaming source hands over whole batches in the
   // tier they already sit in, so there is no per-column read to prune.
   duckdb::CreateTableFunctionInfo info(stream_source);
+  // Idempotent: the extension callback registers Sirius functions on every DuckDB instance in
+  // the process, and a caller (the FFI, a test) may also register explicitly. A duplicate is
+  // not an error.
+  info.on_conflict = duckdb::OnCreateConflict::IGNORE_ON_CONFLICT;
   catalog.CreateTableFunction(transaction, info);
 }
 
