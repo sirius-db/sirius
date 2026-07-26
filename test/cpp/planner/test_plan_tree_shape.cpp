@@ -287,6 +287,9 @@ struct plan_tree_shape_fixture {
     db = std::make_unique<DuckDB>(_db_path.path());
     setenv("SIRIUS_DISABLE", "1", 1);
     con = std::make_unique<Connection>(*db);
+    // This suite asserts the full partitioned tree shape, so opt out of the
+    // production-default small-query bypass for its tiny fixture tables.
+    con->Query("SET small_query_bytes_threshold = 0");
 
     // big_left is larger so the optimizer keeps small_right as the build side.
     con->Query("CREATE TABLE big_left (id INTEGER, val INTEGER)");

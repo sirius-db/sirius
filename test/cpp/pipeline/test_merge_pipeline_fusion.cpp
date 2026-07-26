@@ -100,6 +100,13 @@ struct merge_fusion_fixture {
     result = con->Query("USE tpch;");
     REQUIRE(result);
     REQUIRE_FALSE(result->HasError());
+    // These tests assert the partitioned fusion shape (a PARTITION pipeline must exist). The
+    // small-query bypass is on by default (256 MiB) and would drop PARTITION for these tiny
+    // TPC-H tables; disable it so fusion is exercised on the partitioned path. Fusion composed
+    // with the bypass is covered separately in test_small_query_bypass_converter.cpp.
+    result = con->Query("SET small_query_bytes_threshold = 0;");
+    REQUIRE(result);
+    REQUIRE_FALSE(result->HasError());
   }
 
   std::unique_ptr<duckdb::Connection> con;

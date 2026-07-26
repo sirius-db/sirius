@@ -31,6 +31,8 @@
 #include "duckdb/planner/operator/list.hpp"
 #include "duckdb/planner/operator/logical_extension_operator.hpp"
 #include "duckdb/planner/table_filter.hpp"
+#include "duckdb/storage/statistics/base_statistics.hpp"
+#include "duckdb/storage/statistics/string_stats.hpp"
 #include "duckdb/storage/storage_manager.hpp"
 #include "log/logging.hpp"
 #include "op/scan/duckdb_native_gpu_ingestible.hpp"
@@ -60,12 +62,31 @@
 #include "sirius_config.hpp"
 #include "sirius_context.hpp"
 
+#include <algorithm>
+#include <limits>
 #include <numeric>
+#include <optional>
 #include <utility>
 
 namespace sirius::planner {
 
 namespace {
+
+constexpr bool uint64_add_overflows(uint64_t lhs, uint64_t rhs)
+{
+  return rhs > std::numeric_limits<uint64_t>::max() - lhs;
+}
+
+constexpr bool uint64_multiply_overflows(uint64_t lhs, uint64_t rhs)
+{
+  return lhs != 0 && rhs > std::numeric_limits<uint64_t>::max() / lhs;
+}
+
+static_assert(uint64_add_overflows(std::numeric_limits<uint64_t>::max(), 1));
+static_assert(!uint64_add_overflows(std::numeric_limits<uint64_t>::max() - 1, 1));
+static_assert(uint64_multiply_overflows(uint64_t{1} << 63, 2));
+static_assert(!uint64_multiply_overflows(std::numeric_limits<uint64_t>::max(), 1));
+
 bool is_nested_logical_type(duckdb::LogicalType const& type)
 {
   auto const id = type.id();
@@ -80,6 +101,165 @@ bool dynamic_filter_pushdown_enabled(duckdb::ClientContext& context)
   auto state = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
   if (!state) { return false; }
   return state->get_config().get_operator_params().enable_dynamic_filter_pushdown;
+}
+
+/// The effective single-batch size cap. `scan_task_batch_size == 0` is the "use the default"
+/// sentinel elsewhere in this pass (replace_with_gpu_values, scan-source wiring), so the
+/// small-query gate honors it too — otherwise setting it to 0 would make every scan compare
+/// `>= 0` (always ineligible) and zero the threshold, silently disabling the bypass.
+uint64_t effective_scan_task_batch_size(const sirius::operator_params& op_params)
+{
+  return op_params.scan_task_batch_size == 0 ? sirius::config::DEFAULT_SCAN_TASK_BATCH_SIZE
+                                             : op_params.scan_task_batch_size;
+}
+
+/// Conservative per-row byte width of a scan's VARCHAR column `col`, derived from its table
+/// statistics' maximum string length (which is >= the average, so this never under-counts).
+/// Returns nullopt when no reliable bound is available so the caller can fail closed rather than
+/// fall back to a flat estimate that under-counts wide-text columns (issue #990). Handles both the
+/// plain `statistics` callback (parquet: column_t index) and `statistics_extended` (duck tables:
+/// ColumnIndex).
+std::optional<uint64_t> scan_varchar_max_bytes(op::sirius_physical_table_scan& scan_op,
+                                               duckdb::ClientContext& context,
+                                               const duckdb::ColumnIndex& col)
+{
+  if (!scan_op.bind_data || !col.HasPrimaryIndex()) { return std::nullopt; }
+  duckdb::unique_ptr<duckdb::BaseStatistics> stats;
+  if (scan_op.function.statistics_extended) {
+    duckdb::TableFunctionGetStatisticsInput input(scan_op.bind_data.get(), col);
+    stats = scan_op.function.statistics_extended(context, input);
+  } else if (scan_op.function.statistics) {
+    stats = scan_op.function.statistics(context, scan_op.bind_data.get(), col.GetPrimaryIndex());
+  }
+  if (!stats || !duckdb::StringStats::HasMaxStringLength(*stats)) { return std::nullopt; }
+  return static_cast<uint64_t>(duckdb::StringStats::MaxStringLength(*stats));
+}
+
+/// Sums estimated output bytes of every base scan (TABLE_SCAN metadata estimate +
+/// COLUMN_DATA_SCAN exact materialized size) for the whole-query small-data gate (issue #990).
+/// Returns nullopt when the query is ineligible: delim joins / CTEs (data recirculation is not
+/// bounded by scan metadata), scans with non-fixed-width non-VARCHAR columns, any single scan
+/// whose estimate reaches scan_task_batch_size, or any other unmeasured leaf source (a childless
+/// operator other than the data-free EMPTY_RESULT / DUMMY_SCAN).
+std::optional<uint64_t> estimate_base_scan_bytes(op::sirius_physical_operator& plan,
+                                                 duckdb::ClientContext& context,
+                                                 const sirius::operator_params& op_params)
+{
+  using op::SiriusPhysicalOperatorType;
+  switch (plan.type) {
+    case SiriusPhysicalOperatorType::LEFT_DELIM_JOIN:
+    case SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN:
+    case SiriusPhysicalOperatorType::RECURSIVE_CTE:
+    case SiriusPhysicalOperatorType::RECURSIVE_KEY_CTE:
+    case SiriusPhysicalOperatorType::CTE:
+    case SiriusPhysicalOperatorType::RECURSIVE_CTE_SCAN:
+    case SiriusPhysicalOperatorType::RECURSIVE_RECURRING_CTE_SCAN:
+    case SiriusPhysicalOperatorType::CTE_SCAN:
+    case SiriusPhysicalOperatorType::DELIM_SCAN: return std::nullopt;
+    case SiriusPhysicalOperatorType::RESULT_COLLECTOR:
+      return estimate_base_scan_bytes(
+        plan.Cast<op::sirius_physical_result_collector>().plan, context, op_params);
+    case SiriusPhysicalOperatorType::TABLE_SCAN: {
+      auto& scan_op = plan.Cast<op::sirius_physical_table_scan>();
+      // Prefer the table function's own estimate: exact for parquet (footer counts) and duck
+      // tables, and pre-filter (a filtered scan can only produce less).
+      uint64_t rows = scan_op.estimated_cardinality;
+      if (scan_op.function.cardinality && scan_op.bind_data) {
+        auto stats = scan_op.function.cardinality(context, scan_op.bind_data.get());
+        if (stats && stats->has_estimated_cardinality) { rows = stats->estimated_cardinality; }
+      }
+      uint64_t row_width = 0;
+      for (std::size_t i = 0; i < scan_op.types.size(); ++i) {
+        const auto& type = scan_op.types[i];
+        uint64_t column_width;
+        if (type.id() == sirius::type_id::VARCHAR) {
+          // Map the projected output column to its table ColumnIndex, then take the stats-derived
+          // max width. A flat estimate would under-count wide-text columns and break the
+          // single-batch invariant, so fail closed when a reliable bound is unavailable.
+          std::size_t col_ids_idx = i;
+          if (!scan_op.projection_ids.empty()) {
+            if (i >= scan_op.projection_ids.size()) { return std::nullopt; }
+            col_ids_idx = scan_op.projection_ids[i];
+          }
+          if (col_ids_idx >= scan_op.column_ids.size()) { return std::nullopt; }
+          auto max_bytes =
+            scan_varchar_max_bytes(scan_op, context, scan_op.column_ids[col_ids_idx]);
+          if (!max_bytes) { return std::nullopt; }
+          column_width = *max_bytes;
+        } else if (type.is_fixed_width()) {
+          column_width = type.fixed_width_byte_size();
+        } else {
+          return std::nullopt;  // nested / unknown-width column: ineligible
+        }
+        if (uint64_add_overflows(row_width, column_width)) { return std::nullopt; }
+        row_width += column_width;
+      }
+      if (uint64_multiply_overflows(row_width, rows)) { return std::nullopt; }
+      // Floor at one cardinality-sentinel byte per row so a zero-column projection (e.g. a bare
+      // COUNT(*) scan, row_width == 0) is not scored as 0 bytes at any cardinality -- mirroring the
+      // COLUMN_DATA_SCAN case below. For row_width >= 1 this is a no-op (rows * row_width >= rows).
+      const uint64_t bytes = std::max<uint64_t>(rows * row_width, rows);
+      // Each scan must stay single-batch for the bypass reasoning to hold.
+      if (bytes >= effective_scan_task_batch_size(op_params)) { return std::nullopt; }
+      return bytes;
+    }
+    case SiriusPhysicalOperatorType::COLUMN_DATA_SCAN: {
+      auto& col_scan = plan.Cast<op::sirius_physical_column_data_scan>();
+      // A null collection is the LEFT_DELIM_JOIN cached chunk / CTE scan (data filled at
+      // runtime, not bounded by metadata) — ineligible. Otherwise the collection is fully
+      // materialized, so measure it exactly with the same metric the GPU source-size gate
+      // uses (throw_if_collection_too_large): a zero-column collection still needs one
+      // cardinality-sentinel byte per row on the GPU.
+      if (!col_scan.collection) { return std::nullopt; }
+      const auto& coll    = *col_scan.collection;
+      const uint64_t rows = coll.Count();
+      const uint64_t bytes =
+        coll.Types().empty() ? std::max<uint64_t>(coll.SizeInBytes(), rows) : coll.SizeInBytes();
+      // Single-batch invariant, matching the TABLE_SCAN branch.
+      if (bytes >= effective_scan_task_batch_size(op_params)) { return std::nullopt; }
+      return bytes;
+    }
+    default: {
+      // A childless operator is a leaf source. Data-carrying leaves are measured by their own case
+      // above (TABLE_SCAN, COLUMN_DATA_SCAN — the latter also backs VALUES / EXPRESSION_SCAN). Only
+      // the data-free EMPTY_RESULT / DUMMY_SCAN score 0 here; any other unrecognized leaf is
+      // fail-closed to ineligible rather than silently scored as 0, which would break the gate.
+      if (plan.children.empty()) {
+        switch (plan.type) {
+          case SiriusPhysicalOperatorType::EMPTY_RESULT:
+          case SiriusPhysicalOperatorType::DUMMY_SCAN: return uint64_t{0};
+          default: return std::nullopt;
+        }
+      }
+      uint64_t total = 0;
+      for (auto& child : plan.children) {
+        auto child_bytes = estimate_base_scan_bytes(*child, context, op_params);
+        if (!child_bytes) { return std::nullopt; }
+        if (uint64_add_overflows(total, *child_bytes)) { return std::nullopt; }
+        total += *child_bytes;
+      }
+      return total;
+    }
+  }
+}
+
+/// Whether the plan tree contains a hash join or nested-loop join. Only the bypass-eligible spine
+/// is walked (children[] + the result collector's plan); delim/CTE plans are already excluded by
+/// estimate_base_scan_bytes, so their out-of-children[] subtrees need not be visited here.
+bool plan_contains_join(const op::sirius_physical_operator& plan)
+{
+  using op::SiriusPhysicalOperatorType;
+  if (plan.type == SiriusPhysicalOperatorType::HASH_JOIN ||
+      plan.type == SiriusPhysicalOperatorType::NESTED_LOOP_JOIN) {
+    return true;
+  }
+  if (plan.type == SiriusPhysicalOperatorType::RESULT_COLLECTOR) {
+    return plan_contains_join(plan.Cast<op::sirius_physical_result_collector>().plan);
+  }
+  for (const auto& child : plan.children) {
+    if (child && plan_contains_join(*child)) { return true; }
+  }
+  return false;
 }
 
 //! Insert `factory(std::move(parent.children[i]))` between `parent` and its i-th child. The
@@ -355,26 +535,34 @@ void replace_with_gpu_values(duckdb::unique_ptr<sirius::op::sirius_physical_oper
 
 //! Replace a HASH_GROUP_BY slot with `GROUPED_AGGREGATE_MERGE → PARTITION → HASH_GROUP_BY →
 //! original_input`: the original stays the per-thread sink, PARTITION buckets for the merge.
+//! Small-query bypass skips PARTITION and wires MERGE → HASH_GROUP_BY directly (same shape as
+//! UNGROUPED_AGGREGATE).
 void wrap_hash_group_by(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot,
-                        const sirius::operator_params& op_params)
+                        const sirius::operator_params& op_params,
+                        bool small_query_bypass)
 {
   wrap_above(slot, [&](duckdb::unique_ptr<sirius::op::sirius_physical_operator> hgb_op) {
     auto* hgb_ptr = hgb_op.get();
 
-    auto partition =
-      duckdb::make_uniq<sirius::op::sirius_physical_partition>(hgb_ptr->types,
-                                                               hgb_ptr->estimated_cardinality,
-                                                               /*key_source=*/hgb_ptr,
-                                                               /*is_build=*/false);
-    auto* partition_ptr = partition.get();
-    partition->children.push_back(std::move(hgb_op));
-
     auto merge = duckdb::make_uniq<sirius::op::sirius_physical_grouped_aggregate_merge>(
       &hgb_ptr->Cast<sirius::op::sirius_physical_grouped_aggregate>(),
       op_params.hash_partition_bytes);
-    // The partition's downstream sizing consumer is the merge (key_source hgb only supplies keys).
-    partition_ptr->set_downstream_consumer_op(merge.get());
-    merge->children.push_back(std::move(partition));
+
+    if (small_query_bypass) {
+      merge->children.push_back(std::move(hgb_op));
+    } else {
+      auto partition =
+        duckdb::make_uniq<sirius::op::sirius_physical_partition>(hgb_ptr->types,
+                                                                 hgb_ptr->estimated_cardinality,
+                                                                 /*key_source=*/hgb_ptr,
+                                                                 /*is_build=*/false);
+      auto* partition_ptr = partition.get();
+      partition->children.push_back(std::move(hgb_op));
+      // The partition's downstream sizing consumer is the merge (key_source hgb only supplies
+      // keys).
+      partition_ptr->set_downstream_consumer_op(merge.get());
+      merge->children.push_back(std::move(partition));
+    }
     return merge;
   });
 }
@@ -409,8 +597,10 @@ void wrap_top_n(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot)
 //! column stays visible to SORT_SAMPLE / SORT_PARTITION; a non-identity original projection is
 //! restored on MERGE_SORT via `set_final_projections`. SORT_SAMPLE is a non-sink, so it lands
 //! in `operators[]` of the SORT_PARTITION pipeline (3-pipeline shape, matching legacy).
+//! Small-query bypass skips SORT_SAMPLE/SORT_PARTITION and wires MERGE_SORT → ORDER_BY.
 void wrap_order_by(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot,
-                   const sirius::operator_params& op_params)
+                   const sirius::operator_params& op_params,
+                   bool small_query_bypass)
 {
   wrap_above(slot, [&](duckdb::unique_ptr<sirius::op::sirius_physical_operator> order_op) {
     auto* order_ptr = &order_op->Cast<sirius::op::sirius_physical_order>();
@@ -429,18 +619,6 @@ void wrap_order_by(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slo
     }
     order_ptr->projections = std::move(identity_proj);
     order_ptr->types       = child_types;
-
-    auto sample = duckdb::make_uniq<sirius::op::sirius_physical_sort_sample>(
-      order_ptr,
-      op_params.sort_sample_bytes,
-      op_params.max_sort_partition_bytes,
-      op_params.max_sort_partition_memory_fraction);
-    auto* sample_ptr = sample.get();
-    sample->children.push_back(std::move(order_op));
-
-    auto partition = duckdb::make_uniq<sirius::op::sirius_physical_sort_partition>(order_ptr);
-    partition->set_sample_op(sample_ptr);
-    partition->children.push_back(std::move(sample));
 
     auto merge = duckdb::make_uniq<sirius::op::sirius_physical_merge_sort>(order_ptr);
 
@@ -462,7 +640,23 @@ void wrap_order_by(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slo
       merge->set_final_projections(std::move(original_projections), std::move(output_types));
     }
 
-    merge->children.push_back(std::move(partition));
+    if (small_query_bypass) {
+      merge->children.push_back(std::move(order_op));
+    } else {
+      auto sample = duckdb::make_uniq<sirius::op::sirius_physical_sort_sample>(
+        order_ptr,
+        op_params.sort_sample_bytes,
+        op_params.max_sort_partition_bytes,
+        op_params.max_sort_partition_memory_fraction);
+      auto* sample_ptr = sample.get();
+      sample->children.push_back(std::move(order_op));
+
+      auto partition = duckdb::make_uniq<sirius::op::sirius_physical_sort_partition>(order_ptr);
+      partition->set_sample_op(sample_ptr);
+      partition->children.push_back(std::move(sample));
+
+      merge->children.push_back(std::move(partition));
+    }
     return merge;
   });
 }
@@ -470,10 +664,13 @@ void wrap_order_by(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slo
 //! Wrap `join_op.children[child_idx]` with `CONCAT → PARTITION → original_child`. `is_build`
 //! flips build/probe semantics in both wrappers; `join_op` is PARTITION's `key_source`
 //! (determines partition keys) and CONCAT's `downstream_join` (picks the coalescing mode).
+//! Small-query bypass keeps CONCAT (fold-to-one-batch / estimate-miss absorption) but skips
+//! PARTITION: `CONCAT → original_child`.
 void wrap_join_child(sirius::op::sirius_physical_operator& join_op,
                      std::size_t child_idx,
                      bool is_build,
-                     const sirius::operator_params& op_params)
+                     const sirius::operator_params& op_params,
+                     bool small_query_bypass)
 {
   D_ASSERT(join_op.type == sirius::op::SiriusPhysicalOperatorType::HASH_JOIN ||
            join_op.type == sirius::op::SiriusPhysicalOperatorType::NESTED_LOOP_JOIN);
@@ -490,13 +687,17 @@ void wrap_join_child(sirius::op::sirius_physical_operator& join_op,
                                                               /*downstream_join=*/join_op_ptr,
                                                               is_build,
                                                               op_params.concat_batch_bytes);
-      auto partition =
-        duckdb::make_uniq<sirius::op::sirius_physical_partition>(std::move(child_types),
-                                                                 est_card,
-                                                                 /*key_source=*/join_op_ptr,
-                                                                 is_build);
-      partition->children.push_back(std::move(child_orig));
-      concat->children.push_back(std::move(partition));
+      if (small_query_bypass) {
+        concat->children.push_back(std::move(child_orig));
+      } else {
+        auto partition =
+          duckdb::make_uniq<sirius::op::sirius_physical_partition>(std::move(child_types),
+                                                                   est_card,
+                                                                   /*key_source=*/join_op_ptr,
+                                                                   is_build);
+        partition->children.push_back(std::move(child_orig));
+        concat->children.push_back(std::move(partition));
+      }
       return concat;
     });
 }
@@ -504,13 +705,14 @@ void wrap_join_child(sirius::op::sirius_physical_operator& join_op,
 //! Wrap both children of a HASH_JOIN / NESTED_LOOP_JOIN with the CONCAT/PARTITION feeder
 //! chain: probe = children[0], build = children[1]. A missing side is skipped.
 void wrap_join(sirius::op::sirius_physical_operator& join_op,
-               const sirius::operator_params& op_params)
+               const sirius::operator_params& op_params,
+               bool small_query_bypass)
 {
   if (join_op.children.size() >= 1) {
-    wrap_join_child(join_op, /*child_idx=*/0, /*is_build=*/false, op_params);
+    wrap_join_child(join_op, /*child_idx=*/0, /*is_build=*/false, op_params, small_query_bypass);
   }
   if (join_op.children.size() >= 2) {
-    wrap_join_child(join_op, /*child_idx=*/1, /*is_build=*/true, op_params);
+    wrap_join_child(join_op, /*child_idx=*/1, /*is_build=*/true, op_params, small_query_bypass);
   }
 }
 
@@ -519,7 +721,8 @@ void wrap_join(sirius::op::sirius_physical_operator& join_op,
 void insert_gpu_pipeline_operators_recursive(
   duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot,
   const sirius::operator_params& op_params,
-  duckdb::ClientContext& context);
+  duckdb::ClientContext& context,
+  bool small_query_bypass);
 
 //! Replace a DELIM JOIN's `distinct_root` (the bare DISTINCT) with `DISTINCT_MERGE ->
 //! PARTITION_DISTINCT -> original DISTINCT`. The non-owning `delim_base.distinct` borrow stays
@@ -562,17 +765,23 @@ void wrap_delim_distinct(sirius::op::sirius_physical_delim_join& delim_base,
 //!   - RIGHT_DELIM_JOIN: point `partition_join` at the freshly-inserted build-side PARTITION.
 void wrap_delim_join(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot,
                      const sirius::operator_params& op_params,
-                     duckdb::ClientContext& context)
+                     duckdb::ClientContext& context,
+                     bool small_query_bypass)
 {
+  // estimate_base_scan_bytes returns nullopt for any delim plan, so bypass is never true
+  // here. RIGHT_DELIM_JOIN::partition_join wiring below assumes a build-side PARTITION.
+  D_ASSERT(!small_query_bypass);
+
   auto& delim_base = slot->Cast<sirius::op::sirius_physical_delim_join>();
 
   if (delim_base.join) {
-    insert_gpu_pipeline_operators_recursive(delim_base.join, op_params, context);
+    insert_gpu_pipeline_operators_recursive(
+      delim_base.join, op_params, context, small_query_bypass);
   }
   if (delim_base.distinct_root) {
     // `distinct_root` still holds the bare DISTINCT: wrap below it first, then above.
     for (auto& child_slot : delim_base.distinct_root->children) {
-      insert_gpu_pipeline_operators_recursive(child_slot, op_params, context);
+      insert_gpu_pipeline_operators_recursive(child_slot, op_params, context, small_query_bypass);
     }
     wrap_delim_distinct(delim_base, op_params);
   }
@@ -603,12 +812,13 @@ void wrap_delim_join(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& s
 void insert_gpu_pipeline_operators_recursive(
   duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot,
   const sirius::operator_params& op_params,
-  duckdb::ClientContext& context)
+  duckdb::ClientContext& context,
+  bool small_query_bypass)
 {
   if (!slot) { return; }
 
   for (auto& child_slot : slot->children) {
-    insert_gpu_pipeline_operators_recursive(child_slot, op_params, context);
+    insert_gpu_pipeline_operators_recursive(child_slot, op_params, context, small_query_bypass);
   }
 
   switch (slot->type) {
@@ -636,20 +846,22 @@ void insert_gpu_pipeline_operators_recursive(
       break;
     }
     case sirius::op::SiriusPhysicalOperatorType::HASH_GROUP_BY:
-      wrap_hash_group_by(slot, op_params);
+      wrap_hash_group_by(slot, op_params, small_query_bypass);
       break;
     case sirius::op::SiriusPhysicalOperatorType::UNGROUPED_AGGREGATE:
       wrap_ungrouped_aggregate(slot);
       break;
-    case sirius::op::SiriusPhysicalOperatorType::ORDER_BY: wrap_order_by(slot, op_params); break;
+    case sirius::op::SiriusPhysicalOperatorType::ORDER_BY:
+      wrap_order_by(slot, op_params, small_query_bypass);
+      break;
     case sirius::op::SiriusPhysicalOperatorType::TOP_N: wrap_top_n(slot); break;
     case sirius::op::SiriusPhysicalOperatorType::HASH_JOIN:
     case sirius::op::SiriusPhysicalOperatorType::NESTED_LOOP_JOIN:
-      wrap_join(*slot, op_params);
+      wrap_join(*slot, op_params, small_query_bypass);
       break;
     case sirius::op::SiriusPhysicalOperatorType::LEFT_DELIM_JOIN:
     case sirius::op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN:
-      wrap_delim_join(slot, op_params, context);
+      wrap_delim_join(slot, op_params, context, small_query_bypass);
       break;
     default: break;
   }
@@ -846,10 +1058,46 @@ void sirius_physical_plan_generator::insert_gpu_pipeline_operators(
   // Sink wraps need the sizing params from SiriusContext. If it's missing, default-constructed
   // op_params make the wraps fall back to the operators' own constructor defaults.
   sirius::operator_params op_params;
+  int num_gpus = 1;
   if (auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state")) {
     op_params = sirius_ctx->get_config().get_operator_params();
+    num_gpus  = static_cast<int>(sirius_ctx->get_config().get_hw_topology().gpus.size());
   }
-  insert_gpu_pipeline_operators_recursive(plan, op_params, context);
+
+  // Whole-query small-data gate (issue #990): decide before wrapping so PARTITION /
+  // SORT_SAMPLE / SORT_PARTITION stages are omitted from the tree. Clamped to
+  // scan_task_batch_size so each scan is guaranteed single-batch; retained CONCAT/MERGE
+  // operators absorb estimate misses. See operator_params::small_query_bytes_threshold
+  // for eligibility limits (CTE/delim excluded; leaf-scan estimate only; no BUILD_PROBE).
+  bool small_query_bypass = false;
+  if (op_params.small_query_bytes_threshold > 0) {
+    auto scan_bytes = estimate_base_scan_bytes(*plan, context, op_params);
+    const uint64_t effective_threshold =
+      std::min(op_params.small_query_bytes_threshold, effective_scan_task_batch_size(op_params));
+    if (scan_bytes && *scan_bytes < effective_threshold) {
+      // Multi-GPU join guard: the bypass emits no PARTITION, so set_num_gpus is never called and
+      // the whole query runs on one partition / GPU 0. A join can amplify its output far past its
+      // (sub-threshold) inputs; the partitioned path would hash-partition that blow-up across GPUs
+      // (each cudf gather under the 2^31-row limit), whereas the bypass would materialize one
+      // oversized gather on GPU 0 and crash. Keep join-bearing plans on the partitioned path when
+      // more than one GPU is available; single-GPU has no such distributed alternative to give up.
+      if (num_gpus > 1 && plan_contains_join(*plan)) {
+        SIRIUS_LOG_INFO(
+          "[sirius_physical_plan_generator] small-query bypass declined: plan has a join on {} "
+          "GPUs; keeping the partitioned path for output fan-out safety",
+          num_gpus);
+      } else {
+        small_query_bypass = true;
+        SIRIUS_LOG_INFO(
+          "[sirius_physical_plan_generator] small-query bypass active: estimated base scan bytes "
+          "{} < threshold {}; skipping partition stages",
+          *scan_bytes,
+          effective_threshold);
+      }
+    }
+  }
+
+  insert_gpu_pipeline_operators_recursive(plan, op_params, context, small_query_bypass);
 }
 
 sirius::OrderPreservationType sirius_physical_plan_generator::order_preservation_recursive(

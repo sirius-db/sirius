@@ -61,6 +61,10 @@ constexpr double DEFAULT_MAX_SORT_PARTITION_MEMORY_FRACTION = 0.33;
 /// disable (always use filtered_join).
 constexpr double DEFAULT_MARK_JOIN_BUILD_SWITCH_RATIO = 8.0;
 
+/// Default for operator_params::small_query_bytes_threshold (issue #990): enabled at 256 MiB,
+/// set to 0 to disable.
+constexpr uint64_t DEFAULT_SMALL_QUERY_BYTES_THRESHOLD = 256ULL * 1024 * 1024;
+
 }  // namespace config
 
 /// Parameters controlling operator-level resource sizing.
@@ -130,6 +134,16 @@ struct operator_params {
   /// pin-time statistics capture and the serve-side survivor plan: a table pinned while the flag is
   /// off carries no zone maps and cannot prune until re-pinned with the flag on.
   bool enable_pinned_zone_map_pruning = true;
+
+  /// Whole-query small-data gate (issue #990): when the summed estimated bytes across all base
+  /// scans is below this threshold (clamped to scan_task_batch_size so every scan is single-batch),
+  /// the plan generator skips PARTITION / SORT_SAMPLE / SORT_PARTITION and wires producers into the
+  /// terminal CONCAT / MERGE operators (kept for AVG / COUNT(DISTINCT) / OFFSET finalization and to
+  /// absorb estimate misses). 0 disables. Ineligible: CTE / delim / recursive plans, VARCHAR scans
+  /// without a max-length statistic, and — on multi-GPU — any plan with a join. Bypassed joins stay
+  /// STANDARD (no BUILD_PROBE / dynamic filters). The estimate models leaf-scan input only, not
+  /// join / aggregate output fan-out.
+  uint64_t small_query_bytes_threshold = config::DEFAULT_SMALL_QUERY_BYTES_THRESHOLD;
 };
 
 struct telemetry_config {

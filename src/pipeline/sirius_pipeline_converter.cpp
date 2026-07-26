@@ -199,7 +199,14 @@ op::MemoryBarrierType sirius_pipeline_converter::resolve_barrier(
   // Sort sinks process batches as they arrive. GPU_SCAN is intentionally excluded
   // (legacy gives it FULL/PARTIAL, not PIPELINE); SORT_SAMPLE is never a pipeline
   // sink (it runs as an intermediate in the SORT_PARTITION pipeline).
-  if (sink.type == T::ORDER_BY) { return op::MemoryBarrierType::PIPELINE; }
+  // Small-query bypass (issue #990): ORDER_BY's tree parent is MERGE_SORT directly
+  // (no SORT_SAMPLE/SORT_PARTITION) — merge must wait for ALL local sorts (FULL).
+  if (sink.type == T::ORDER_BY) {
+    if (dest.get_sink() && dest.get_sink()->type == T::MERGE_SORT) {
+      return op::MemoryBarrierType::FULL;
+    }
+    return op::MemoryBarrierType::PIPELINE;
+  }
   // Producers that feed CONCAT can drain incrementally (PARTIAL); otherwise wait
   // for the upstream pipeline to finish (FULL).
   if (sink.type == T::PARTITION || sink.type == T::UNGROUPED_AGGREGATE || sink.type == T::TOP_N ||
@@ -422,10 +429,27 @@ void sirius_pipeline_converter::link_join_partition_siblings()
     // both can stream the probe, so the upstream→probe-partition edge is PARTIAL for both.
     if (pipeline->source->type == op::SiriusPhysicalOperatorType::HASH_JOIN ||
         pipeline->source->type == op::SiriusPhysicalOperatorType::NESTED_LOOP_JOIN) {
-      auto build_concat_pipeline    = pipeline->dependencies[0];
+      D_ASSERT(pipeline->dependencies.size() >= 2);
+      if (pipeline->dependencies.size() < 2) { continue; }
+
+      auto build_concat_pipeline = pipeline->dependencies[0];
+      auto probe_concat_pipeline = pipeline->dependencies[1];
+      // Small-query bypass (issue #990): no PARTITION stages — concat pipelines hang
+      // directly off the raw producers. A producer that fits in the CONCAT pipeline leaves
+      // that pipeline with no dependencies, so check before looking for its PARTITION parent.
+      if (build_concat_pipeline->dependencies.empty() ||
+          probe_concat_pipeline->dependencies.empty()) {
+        continue;
+      }
+
       auto build_partition_pipeline = build_concat_pipeline->dependencies[0];
-      auto probe_concat_pipeline    = pipeline->dependencies[1];
       auto probe_partition_pipeline = probe_concat_pipeline->dependencies[0];
+      using T                       = op::SiriusPhysicalOperatorType;
+      const bool build_has_partition =
+        build_partition_pipeline->get_sink()->type == T::PARTITION ||
+        build_partition_pipeline->get_sink()->type == T::RIGHT_DELIM_JOIN;
+      const bool probe_has_partition = probe_partition_pipeline->get_sink()->type == T::PARTITION;
+      if (!build_has_partition || !probe_has_partition) { continue; }
       // Positional roles are guaranteed by finalize_pipeline_structure() (tree path) /
       // emission order (legacy). A swap here mislinks sibling partitions and, for
       // right-family joins, drives_partition_count.

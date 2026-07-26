@@ -529,6 +529,45 @@ TEST_CASE("sirius_physical_concat with concat_all=true ignores threshold", "[phy
   REQUIRE(result2 == nullptr);
 }
 
+TEST_CASE("sirius_physical_concat folds the complete MARK build side", "[physical_concat]")
+{
+  auto* space = get_shared_mem_space();
+  REQUIRE(space != nullptr);
+
+  constexpr uint64_t threshold = 1;
+  auto fixture = create_test_hash_join(duckdb::JoinType::MARK, {duckdb::LogicalType::INTEGER});
+  sirius_physical_concat concat_op(
+    sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER}),
+    1000,
+    fixture.hash_join.get(),
+    /*is_build=*/true,
+    threshold);
+
+  auto repo                 = std::make_unique<cucascade::shared_data_repository>();
+  constexpr int num_batches = 3;
+  for (int b = 0; b < num_batches; ++b) {
+    std::vector<int32_t> values = {b};
+    auto batch                  = make_numeric_batch<int32_t>(*space, values, cudf::type_id::INT32);
+    repo->add_data_batch(std::move(batch), 0);
+  }
+
+  auto port           = std::make_unique<sirius_physical_operator::port>();
+  port->type          = MemoryBarrierType::FULL;
+  port->repo          = repo.get();
+  port->src_pipeline  = nullptr;
+  port->dest_pipeline = nullptr;
+  concat_op.add_port("input", std::move(port));
+
+  // MARK must evaluate one existence result against the complete build relation.
+  // Even though every batch exceeds the threshold, all build batches are returned together.
+  auto result = concat_op.get_next_task_input_data();
+  REQUIRE(result != nullptr);
+  REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*result).get_data_batches().size() ==
+          static_cast<std::size_t>(num_batches));
+  auto result2 = concat_op.get_next_task_input_data();
+  REQUIRE(result2 == nullptr);
+}
+
 //===----------------------------------------------------------------------===//
 // 3. Constructor tests
 //===----------------------------------------------------------------------===//

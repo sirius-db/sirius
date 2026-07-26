@@ -138,6 +138,9 @@ struct partition_build_fixture {
     r = con->Query("USE tpch;");
     REQUIRE(r);
     REQUIRE_FALSE(r->HasError());
+    r = con->Query("SET small_query_bytes_threshold = 0;");
+    REQUIRE(r);
+    REQUIRE_FALSE(r->HasError());
   }
 
   std::unique_ptr<duckdb::Connection> con;
