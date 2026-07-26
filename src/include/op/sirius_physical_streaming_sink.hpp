@@ -87,6 +87,13 @@ class sirius_physical_streaming_sink : public sirius_physical_operator {
 
   bool is_sink() const override { return true; }
 
+  //! Mirrors sirius_physical_result_collector: the sink is appended to `current` (landing at
+  //! operators[0] post-reverse) *and* pre-populated as the sink of its own child meta pipeline.
+  //! The base sink path skips the append, which leaves the terminal operator out of the root
+  //! pipeline and the source with nothing driving data into it.
+  void build_pipelines(pipeline::sirius_pipeline& current,
+                       pipeline::sirius_meta_pipeline& meta_pipeline) override;
+
   // -----------------------------------------------------------------------
   // Producer side (engine)
   // -----------------------------------------------------------------------
@@ -98,6 +105,13 @@ class sirius_physical_streaming_sink : public sirius_physical_operator {
   /// partition spec and slice *i* goes into repository *i*; empty slices are skipped rather
   /// than published as zero-row batches. A push after end-of-stream is dropped by the lifecycle
   /// rather than landing behind a consumer that already saw EOS.
+  //! Pass-through. The executor runs every operator in the pipeline chain, terminal sink
+  //! included, and feeds the chain's result back into sink(). Without this override the base
+  //! implementation returns an empty batch list, so the sink silently receives nothing --
+  //! the pipeline "succeeds" and the output stream stays empty.
+  std::unique_ptr<operator_data> execute(const operator_data& input_data,
+                                         rmm::cuda_stream_view stream) override;
+
   void sink(const operator_data& input_data, rmm::cuda_stream_view stream) override;
 
   /// Pass-through: pushing a batch allocates nothing, so report the input bytes instead of the

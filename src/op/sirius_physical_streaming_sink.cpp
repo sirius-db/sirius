@@ -19,6 +19,10 @@
 #include "data/data_batch_utils.hpp"
 #include "op/partition/gpu_partition_impl.hpp"
 #include "sirius/exception.hpp"
+#include <log/logging.hpp>
+
+#include "pipeline/sirius_meta_pipeline.hpp"
+#include "pipeline/sirius_pipeline.hpp"
 
 #include <cucascade/data/data_batch.hpp>
 
@@ -70,16 +74,31 @@ sirius_physical_streaming_sink::sirius_physical_streaming_sink(
   }
 }
 
+std::unique_ptr<operator_data> sirius_physical_streaming_sink::execute(
+  const operator_data& input_data, rmm::cuda_stream_view /*stream*/)
+{
+  // Mirrors sirius_physical_result_collector::execute: hand the chain's batches straight back so
+  // publish_output() can deliver them to sink(). The base implementation would drop them.
+  return std::make_unique<pipelineable_operator_data>(
+    dynamic_cast<const pipelineable_operator_data&>(input_data).get_read_only_batches());
+}
+
 void sirius_physical_streaming_sink::sink(const operator_data& input_data,
                                           rmm::cuda_stream_view stream)
 {
   const auto& input = dynamic_cast<const pipelineable_operator_data&>(input_data);
 
   if (_output_repositories.size() == 1) {
+    const auto& batches = input.get_data_batches();
     // Pushed in their current tier: no Arrow, no forced GPU upgrade, no copy. The batch stays
     // spillable in the repository until a consumer pulls it.
-    for (const auto& batch : input.get_data_batches()) {
-      _lifecycle.admit([&] { _output_repositories[0]->add_data_batch(batch); });
+    for (const auto& batch : batches) {
+      // admit() refuses once the stream is terminal. Ignoring that return silently drops the
+      // batch, which surfaces as a fragment that "succeeds" with an empty output.
+      if (!_lifecycle.admit([&] { _output_repositories[0]->add_data_batch(batch); })) {
+        SIRIUS_LOG_WARN(
+          "sirius_physical_streaming_sink: batch refused after end-of-stream and dropped");
+      }
     }
     return;
   }
@@ -117,6 +136,23 @@ std::size_t sirius_physical_streaming_sink::no_history_peak_memory_estimate(
 {
   // Pushing a handle into the output repository allocates nothing new.
   return stats.bytes;
+}
+
+void sirius_physical_streaming_sink::build_pipelines(pipeline::sirius_pipeline& current,
+                                                     pipeline::sirius_meta_pipeline& meta_pipeline)
+{
+  if (children.size() != 1) {
+    throw sirius::internal_exception(
+      "sirius_physical_streaming_sink: expects exactly one child subtree");
+  }
+
+  // Same shape as the RESULT_COLLECTOR: append to `current` so the terminal operator is part of
+  // the root pipeline, then start the real pipeline from the child.
+  auto& state = meta_pipeline.get_state();
+  state.add_pipeline_operator(current, *this);
+
+  auto& child_meta_pipeline = meta_pipeline.create_child_meta_pipeline(current, *this);
+  child_meta_pipeline.build(*children[0]);
 }
 
 void sirius_physical_streaming_sink::on_finalize_operator()
