@@ -13,6 +13,7 @@
 //! single process-global context serializes fragment execution — both lifted by the streaming
 //! evolution.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::sync::mpsc::{Receiver, Sender, channel};
@@ -21,17 +22,31 @@ use std::thread::JoinHandle;
 #[cfg(test)]
 use arrow_array::RecordBatch;
 use sirius::SiriusContext;
-use starrocks_plan_translator::TranslatedPlan;
+use starrocks_plan_translator::StreamInputSchema;
 use tracing::info;
 
-use crate::fragment_executor::{FragmentExecutor, FragmentResult};
+use crate::fragment_executor::{FragmentExecutor, FragmentResult, FragmentRun, SenderSlot};
 
-/// One execution request handed to the engine thread.
+/// Output stream id an intermediate fragment sinks into. One per fragment: a gather exchange has
+/// a single destination, and fan-out needs the partitioned sink (#838), not more ids here.
+const SENDER_OUTPUT_STREAM: u64 = 0;
+
+/// One fragment execution handed to the engine thread.
+///
+/// Owned data only: the `sirius::Fragment`s themselves never leave that thread, so what crosses
+/// the channel is the plan, the schema of each declared stream, and the slots naming which parked
+/// sender outputs to relay in.
 struct ExecuteRequest {
     /// Serialized Substrait plan bytes.
     plan: Vec<u8>,
+    /// Schema of every exchange this plan reads as a stream.
+    stream_inputs: Vec<StreamInputSchema>,
+    /// Parked sender outputs to relay in, keyed by receiver exchange node id.
+    inputs: Vec<(i32, Vec<SenderSlot>)>,
+    /// Set for a sender fragment: park the output under this slot instead of returning rows.
+    output: Option<SenderSlot>,
     /// Channel the engine thread sends the result (or a flattened error) back on.
-    respond: Sender<Result<FragmentResult, String>>,
+    respond: Sender<Result<Option<FragmentResult>, String>>,
 }
 
 /// GPU-backed [`FragmentExecutor`] running plans on an embedded Sirius engine.
@@ -116,7 +131,7 @@ fn engine_thread(
     requests: Receiver<ExecuteRequest>,
     ready: Sender<Result<(), String>>,
 ) {
-    let mut context = match build_context(config) {
+    let context = match build_context(config) {
         Ok(context) => {
             // A send error means the caller is already gone; nothing to serve.
             if ready.send(Ok(())).is_err() {
@@ -129,21 +144,138 @@ fn engine_thread(
             return;
         }
     };
+
+    // Sender fragments whose output is parked on the GPU, waiting for their receiver to be
+    // dispatched. Declared after `context` so it is dropped *first*: a fragment borrows the
+    // engine it runs on, and the borrow checker enforces the order the C++ side depends on.
+    let mut parked: HashMap<SenderSlot, sirius::Fragment<'_>> = HashMap::new();
+
     info!("sirius-engine thread ready");
     // One query at a time until the handle (and its sender) is dropped.
     while let Ok(request) = requests.recv() {
-        // `execute_substrait` drains the Arrow stream and drops the context-referencing wrapper
-        // here, on the engine thread, returning owned batches whose buffers are released via their
-        // own Arrow C release callbacks — independent of the context. So the batches are safe to
-        // send to, and drop on, the caller's thread.
-        let result = context
-            .execute_substrait_result(&request.plan)
-            .map(|result| FragmentResult::with_schema(result.schema, result.batches))
-            .map_err(|err| err.to_string());
+        let result = run_fragment(&context, &mut parked, &request);
+        if result.is_err() {
+            // A failed query leaves its parked senders unreachable — the receiver that would have
+            // consumed them is the thing that just failed. Dropping them releases the GPU memory
+            // their batches hold rather than leaking it for the process's lifetime.
+            parked.clear();
+        }
         // Ignore a send error: the waiting fragment may have been dropped/cancelled.
         let _ = request.respond.send(result);
     }
+    // Fragments must be gone before the context they borrow.
+    drop(parked);
     info!("sirius-engine thread shutting down");
+}
+
+/// Runs one fragment on the engine thread: declare its input streams, relay every parked sender
+/// into them as native batches, execute, then either park the output or return the rows.
+fn run_fragment<'ctx>(
+    context: &'ctx SiriusContext,
+    parked: &mut HashMap<SenderSlot, sirius::Fragment<'ctx>>,
+    request: &ExecuteRequest,
+) -> Result<Option<FragmentResult>, String> {
+    let mut fragment = context
+        .fragment()
+        .map_err(|err| format!("failed to create fragment: {err}"))?;
+
+    for schema in &request.stream_inputs {
+        let stream_id = stream_id_of(schema.node_id)?;
+        for column in &schema.columns {
+            fragment
+                .declare_input_column(stream_id, &column.name, &column.ty)
+                .map_err(|err| {
+                    format!(
+                        "failed to declare column {} of stream {stream_id}: {err}",
+                        column.name
+                    )
+                })?;
+        }
+        let senders = request
+            .inputs
+            .iter()
+            .find(|(node_id, _)| *node_id == schema.node_id)
+            .map(|(_, senders)| senders.as_slice())
+            .unwrap_or_default();
+        if senders.is_empty() {
+            return Err(format!(
+                "exchange node {} is read as a stream but no sender output is parked for it",
+                schema.node_id
+            ));
+        }
+        for slot in senders {
+            let sender_id = u32::try_from(slot.sender_id)
+                .map_err(|_| format!("negative sender id {}", slot.sender_id))?;
+            fragment
+                .declare_input_sender(stream_id, sender_id)
+                .map_err(|err| format!("failed to declare sender on stream {stream_id}: {err}"))?;
+        }
+    }
+
+    // An intermediate fragment sinks into its own output stream 0; a result fragment declares no
+    // output stream at all and produces Arrow instead.
+    if request.output.is_some() {
+        fragment
+            .declare_output(SENDER_OUTPUT_STREAM)
+            .map_err(|err| format!("failed to declare the fragment output stream: {err}"))?;
+    }
+
+    fragment
+        .build(&request.plan)
+        .map_err(|err| format!("failed to plan fragment: {err}"))?;
+
+    // The fragment boundary itself: each sender's batches move into this fragment's input stream
+    // as native handles. Nothing is converted, written, or copied.
+    for schema in &request.stream_inputs {
+        let stream_id = stream_id_of(schema.node_id)?;
+        let senders = request
+            .inputs
+            .iter()
+            .find(|(node_id, _)| *node_id == schema.node_id)
+            .map(|(_, senders)| senders.as_slice())
+            .unwrap_or_default();
+        for slot in senders {
+            let mut sender = parked
+                .remove(slot)
+                .ok_or_else(|| format!("no parked sender output for {slot:?}"))?;
+            let sender_id = u32::try_from(slot.sender_id)
+                .map_err(|_| format!("negative sender id {}", slot.sender_id))?;
+            let moved = fragment
+                .relay_from(&mut sender, SENDER_OUTPUT_STREAM, stream_id, sender_id)
+                .map_err(|err| format!("failed to relay sender {sender_id}: {err}"))?;
+            info!(
+                stream_id,
+                sender_id,
+                batches = moved,
+                "relayed native batches across a fragment boundary"
+            );
+        }
+    }
+
+    fragment
+        .run()
+        .map_err(|err| format!("failed to execute fragment: {err}"))?;
+
+    match request.output {
+        Some(slot) => {
+            parked.insert(slot, fragment);
+            Ok(None)
+        }
+        // `into_arrow` drains the stream and drops the context-referencing wrapper here, on the
+        // engine thread, returning owned batches whose buffers are released via their own Arrow C
+        // release callbacks — independent of the context. So they are safe to send to, and drop
+        // on, the caller's thread.
+        None => fragment
+            .into_arrow()
+            .map(|result| Some(FragmentResult::new(result.batches)))
+            .map_err(|err| err.to_string()),
+    }
+}
+
+/// Engine-side stream id for a receiver exchange node. The node id addresses the stream, so the
+/// two sides of a boundary agree without a separate allocation table.
+fn stream_id_of(node_id: i32) -> Result<u64, String> {
+    u64::try_from(node_id).map_err(|_| format!("negative exchange node id {node_id}"))
 }
 
 /// Brings up a [`SiriusContext`] from an optional config path (built-in defaults when `None`).
@@ -158,10 +290,13 @@ fn build_context(config: Option<PathBuf>) -> Result<SiriusContext, String> {
 }
 
 impl FragmentExecutor for SiriusEngine {
-    fn execute(&self, translated: &TranslatedPlan) -> Result<FragmentResult, String> {
+    fn run(&self, run: FragmentRun<'_>) -> Result<Option<FragmentResult>, String> {
         let (respond_tx, respond_rx) = channel();
         let request = ExecuteRequest {
-            plan: translated.to_substrait_bytes(),
+            plan: run.plan.to_substrait_bytes(),
+            stream_inputs: run.plan.stream_inputs.clone(),
+            inputs: run.inputs,
+            output: run.output,
             respond: respond_tx,
         };
         self.requests
@@ -205,8 +340,10 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
     use parquet::arrow::ArrowWriter;
 
+    use starrocks_plan_translator::TranslatedPlan;
+
     use super::*;
-    use crate::local_exchange::{ExchangeFile, ExchangeOutput};
+    use crate::result_store::FragmentInstanceId;
 
     /// Builds a single-file `local_files` parquet read plan with `names` as the root output
     /// names — the shape DuckDB's Substrait reader resolves to `parquet_scan(<path>)`.
@@ -243,7 +380,90 @@ mod tests {
         TranslatedPlan {
             plan,
             output_names: names,
+            stream_inputs: Vec::new(),
         }
+    }
+
+    /// A plan that reads one input stream through the engine's stream view, plus the declaration
+    /// the engine needs for it. `columns` is `(name, is_string)` in output order.
+    fn stream_plan(node_id: i32, columns: &[(&str, bool)]) -> TranslatedPlan {
+        use starrocks_plan_translator::{StreamInputColumn, StreamInputSchema};
+        use substrait::proto::read_rel::{NamedTable, ReadType};
+        use substrait::proto::{
+            NamedStruct, Plan, PlanRel, ReadRel, Rel, RelRoot, Type, plan_rel, rel, r#type,
+        };
+
+        let view = sirius::stream_view_name(node_id as u64);
+        let names: Vec<String> = columns.iter().map(|(name, _)| name.to_string()).collect();
+        let types: Vec<Type> = columns
+            .iter()
+            .map(|(_, is_string)| {
+                let kind = if *is_string {
+                    r#type::Kind::String(r#type::String {
+                        type_variation_reference: 0,
+                        nullability: r#type::Nullability::Nullable as i32,
+                    })
+                } else {
+                    r#type::Kind::I64(r#type::I64 {
+                        type_variation_reference: 0,
+                        nullability: r#type::Nullability::Nullable as i32,
+                    })
+                };
+                Type { kind: Some(kind) }
+            })
+            .collect();
+        let read = Rel {
+            rel_type: Some(rel::RelType::Read(Box::new(ReadRel {
+                base_schema: Some(NamedStruct {
+                    names: names.clone(),
+                    r#struct: Some(r#type::Struct {
+                        types,
+                        type_variation_reference: 0,
+                        nullability: r#type::Nullability::Required as i32,
+                    }),
+                }),
+                read_type: Some(ReadType::NamedTable(NamedTable {
+                    names: vec![view.clone()],
+                    ..Default::default()
+                })),
+                ..Default::default()
+            }))),
+        };
+        TranslatedPlan {
+            plan: Plan {
+                relations: vec![PlanRel {
+                    rel_type: Some(plan_rel::RelType::Root(RelRoot {
+                        input: Some(read),
+                        names: names.clone(),
+                    })),
+                }],
+                ..Default::default()
+            },
+            output_names: names.clone(),
+            stream_inputs: vec![StreamInputSchema {
+                node_id,
+                stream_view: view,
+                columns: columns
+                    .iter()
+                    .map(|(name, is_string)| StreamInputColumn {
+                        name: name.to_string(),
+                        ty: if *is_string { "VARCHAR" } else { "BIGINT" }.to_string(),
+                    })
+                    .collect(),
+            }],
+        }
+    }
+
+    /// Runs a result fragment (no output slot) and returns its rows.
+    fn run_result(engine: &SiriusEngine, plan: &TranslatedPlan) -> FragmentResult {
+        engine
+            .run(FragmentRun {
+                plan,
+                inputs: Vec::new(),
+                output: None,
+            })
+            .expect("execute fragment on GPU")
+            .expect("a result fragment returns rows")
     }
 
     /// Like [`local_files_plan`] but declares a `base_schema` (names + types) on the read — the
@@ -311,6 +531,7 @@ mod tests {
         TranslatedPlan {
             plan,
             output_names: names,
+            stream_inputs: Vec::new(),
         }
     }
 
@@ -332,13 +553,17 @@ mod tests {
             .unwrap()
             .send(ExecuteRequest {
                 plan,
+                stream_inputs: Vec::new(),
+                inputs: Vec::new(),
+                output: None,
                 respond: respond_tx,
             })
             .unwrap();
         let result = respond_rx
             .recv()
             .expect("engine response")
-            .expect("execute");
+            .expect("execute")
+            .expect("a result fragment returns rows");
         let rows: usize = result.batches.iter().map(RecordBatch::num_rows).sum();
         eprintln!("plan {path} returned {rows} row(s)");
         for batch in &result.batches {
@@ -386,31 +611,50 @@ mod tests {
         );
 
         let engine = SiriusEngine::start(None).expect("bring up sirius engine");
-        let result = engine.execute(&plan).expect("execute fragment on GPU");
+        let result = run_result(&engine, &plan);
         let total_rows: usize = result.batches.iter().map(RecordBatch::num_rows).sum();
         assert_eq!(total_rows, 3, "expected 3 rows from the parquet fixture");
 
-        // Run the same rows through the sequential exchange path: fragment one completed above,
-        // its Arrow result is materialized, and fragment two reads that file in a new single-shot
-        // GPU execution.
-        let exchange = ExchangeFile::materialize(&[ExchangeOutput {
-            names: plan.output_names.clone(),
-            result,
-        }])
-        .expect("materialize local exchange");
-        let exchanged = local_files_plan_with_base_schema(
-            exchange.path().to_str().unwrap(),
-            &[("id", false), ("name", true)],
+        // The fragment boundary, over native batches: the sender's rows park on the GPU under
+        // `slot`, and the receiver reads them through its input stream. Nothing is written to
+        // disk and nothing becomes Arrow in between -- the only Arrow here is the receiver's own
+        // result, at the very end.
+        const EXCHANGE_NODE: i32 = 7;
+        let slot = SenderSlot {
+            fragment_instance_id: FragmentInstanceId::from_halves(1, 2),
+            node_id: EXCHANGE_NODE,
+            sender_id: 0,
+        };
+        assert!(
+            engine
+                .run(FragmentRun {
+                    plan: &plan,
+                    inputs: Vec::new(),
+                    output: Some(slot),
+                })
+                .expect("run the sender fragment")
+                .is_none(),
+            "a sender fragment parks its output instead of returning rows"
         );
+
+        let receiver = stream_plan(EXCHANGE_NODE, &[("id", false), ("name", true)]);
         let exchanged_result = engine
-            .execute(&exchanged)
-            .expect("execute exchange receiver on GPU");
+            .run(FragmentRun {
+                plan: &receiver,
+                inputs: vec![(EXCHANGE_NODE, vec![slot])],
+                output: None,
+            })
+            .expect("execute exchange receiver on GPU")
+            .expect("a result fragment returns rows");
         let exchanged_rows: usize = exchanged_result
             .batches
             .iter()
             .map(RecordBatch::num_rows)
             .sum();
-        assert_eq!(exchanged_rows, 3, "exchange preserved all fragment rows");
+        assert_eq!(
+            exchanged_rows, 3,
+            "the fragment boundary preserved every row"
+        );
 
         // A `base_schema` that prunes and reorders the file's columns must bind by name, not by
         // file position (exercises the Substrait reader's `local_files` projection). The fixture
@@ -442,9 +686,7 @@ mod tests {
             cols_path.to_str().unwrap(),
             &[("name", true), ("id", false)],
         );
-        let result = engine
-            .execute(&pruned)
-            .expect("execute pruned fragment on GPU");
+        let result = run_result(&engine, &pruned);
         let batch = result
             .batches
             .iter()

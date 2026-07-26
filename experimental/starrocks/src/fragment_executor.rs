@@ -7,14 +7,17 @@
 use std::sync::Arc;
 
 use arrow_array::{ArrayRef, RecordBatch, StringArray};
-use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use arrow_schema::{DataType, Field, Schema};
 use starrocks_plan_translator::TranslatedPlan;
 
+use crate::result_store::FragmentInstanceId;
+
 /// Output of executing one plan fragment: Arrow batches matching the fragment output schema.
+///
+/// Only a *result* fragment produces one. An intermediate fragment's output never becomes Arrow —
+/// it stays on the GPU as native batches for the fragment that consumes it.
 #[derive(Clone, Debug)]
 pub struct FragmentResult {
-    /// Output schema, retained even when execution produces no batches.
-    pub(crate) schema: SchemaRef,
     /// Result batches in fragment output order. Empty for a fragment with no output columns.
     pub(crate) batches: Vec<RecordBatch>,
 }
@@ -22,16 +25,7 @@ pub struct FragmentResult {
 impl FragmentResult {
     /// Builds a result from its output batches (in fragment output order).
     pub fn new(batches: Vec<RecordBatch>) -> Self {
-        let schema = batches
-            .first()
-            .map(RecordBatch::schema)
-            .unwrap_or_else(|| Arc::new(Schema::empty()));
-        Self { schema, batches }
-    }
-
-    /// Builds a result with an explicit schema, including for empty results.
-    pub fn with_schema(schema: SchemaRef, batches: Vec<RecordBatch>) -> Self {
-        Self { schema, batches }
+        Self { batches }
     }
 
     /// The result batches in fragment output order.
@@ -40,20 +34,44 @@ impl FragmentResult {
     }
 }
 
-/// Runs a translated fragment and returns its result batches.
+/// Where one sender fragment's output is parked until its receiver runs.
 ///
-/// This is intentionally a synchronous, fully-materializing seam for single-shot execution.
-/// Each fragment runs to completion, and a local exchange can sequence one fragment's output into
-/// the next before `fetch_data` drains the final buffered rows.
+/// Keyed by the *receiver* it feeds, because that is what the rendezvous looks it up by: a sender
+/// is addressed by the exchange it produces into, not by its own identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct SenderSlot {
+    /// Receiver fragment instance the output is destined for.
+    pub fragment_instance_id: FragmentInstanceId,
+    /// Receiver `EXCHANGE_NODE` id, which is also the engine-side stream id.
+    pub node_id: i32,
+    /// Sender ordinal within that exchange's sender set.
+    pub sender_id: i32,
+}
+
+/// One fragment to run: the plan, where its exchange inputs come from, and where its output goes.
+#[derive(Debug)]
+pub struct FragmentRun<'a> {
+    /// Translated plan, including the schema of every exchange lowered to a stream read.
+    pub plan: &'a TranslatedPlan,
+    /// Parked sender outputs to relay into this fragment, keyed by receiver exchange node id.
+    pub inputs: Vec<(i32, Vec<SenderSlot>)>,
+    /// Set for a sender fragment: its output parks under this slot instead of returning rows.
+    pub output: Option<SenderSlot>,
+}
+
+/// Runs a translated fragment, either parking its output for a downstream fragment or returning
+/// its rows.
 ///
-/// TODO(starrocks-execute): a real GPU executor should not block dispatch on full materialization.
-/// Evolve this into a streaming contract — dispatch registers a running fragment and returns after
-/// startup, the executor pushes Arrow batches (e.g. via an Arrow C stream) into a bounded channel
-/// the `ResultStore` drains, and execution is cancellable from `cancel_plan_fragment`. Large/slow
-/// result queries then stream through `fetch_data` instead of risking dispatch-time timeout/OOM.
+/// The seam is synchronous and one fragment at a time: the engine serializes queries, and a
+/// sender's output is parked on the GPU — as native batches, not Arrow — until its receiver is
+/// dispatched. A sender's rows therefore never leave the device between fragments.
+///
+/// TODO(starrocks-execute): dispatch still blocks until a fragment completes. Concurrency needs
+/// per-query lifecycle isolation in the engine; until then `run` is called from a blocking worker
+/// so the BRPC runtime stays responsive.
 pub trait FragmentExecutor: std::fmt::Debug + Send + Sync {
-    /// Executes `translated` and returns its Arrow result batches.
-    fn execute(&self, translated: &TranslatedPlan) -> Result<FragmentResult, String>;
+    /// Runs `run`. Returns rows only for a fragment with no `output` slot — a result fragment.
+    fn run(&self, run: FragmentRun<'_>) -> Result<Option<FragmentResult>, String>;
 }
 
 /// Placeholder executor that fabricates one row so the result path works without a GPU.
@@ -61,6 +79,17 @@ pub trait FragmentExecutor: std::fmt::Debug + Send + Sync {
 pub struct StubExecutor;
 
 impl FragmentExecutor for StubExecutor {
+    fn run(&self, run: FragmentRun<'_>) -> Result<Option<FragmentResult>, String> {
+        // A stub sender parks nothing; the rendezvous only needs it to succeed.
+        if run.output.is_some() {
+            return Ok(None);
+        }
+        self.execute(run.plan).map(Some)
+    }
+}
+
+impl StubExecutor {
+    /// One placeholder row per output column, so the FE→client path works without a GPU.
     fn execute(&self, translated: &TranslatedPlan) -> Result<FragmentResult, String> {
         // TODO(starrocks-execute): replace with a SiriusExecutor that hands
         // `translated.to_substrait_bytes()` to the embedded Sirius engine, executes it on the
@@ -70,7 +99,6 @@ impl FragmentExecutor for StubExecutor {
         let names = &translated.output_names;
         if names.is_empty() {
             return Ok(FragmentResult {
-                schema: Arc::new(Schema::empty()),
                 batches: Vec::new(),
             });
         }
@@ -85,7 +113,6 @@ impl FragmentExecutor for StubExecutor {
         let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
             .map_err(|err| format!("failed to build stub result batch: {err}"))?;
         Ok(FragmentResult {
-            schema: batch.schema(),
             batches: vec![batch],
         })
     }
@@ -99,6 +126,7 @@ mod tests {
         TranslatedPlan {
             plan: Default::default(),
             output_names: names.iter().map(|name| name.to_string()).collect(),
+            stream_inputs: Vec::new(),
         }
     }
 

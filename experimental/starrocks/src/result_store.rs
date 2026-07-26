@@ -20,7 +20,7 @@ use crate::proto::starrocks::PUniqueId;
 /// `fetch_data`). It is held here as a [`Uuid`] so the two wire forms compare
 /// equal and logs render the canonical hyphenated form instead of `hi-lo`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub(crate) struct FragmentInstanceId(Uuid);
+pub struct FragmentInstanceId(Uuid);
 
 impl FragmentInstanceId {
     /// Packs the `hi`/`lo` 64-bit halves of a StarRocks unique id into a [`Uuid`].
