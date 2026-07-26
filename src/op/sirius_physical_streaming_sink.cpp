@@ -18,13 +18,12 @@
 
 #include "data/data_batch_utils.hpp"
 #include "op/partition/gpu_partition_impl.hpp"
-#include "sirius/exception.hpp"
-#include <log/logging.hpp>
-
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
+#include "sirius/exception.hpp"
 
 #include <cucascade/data/data_batch.hpp>
+#include <log/logging.hpp>
 
 #include <string>
 #include <utility>
