@@ -271,6 +271,8 @@ set(EXTENSION_SOURCES
     src/exec/admission_control.cpp
     src/exec/stream_lifecycle.cpp
     src/exec/stream_session.cpp
+    src/exec/stream_bind_catalog.cpp
+    src/exec/stream_plan_bindings.cpp
     # I/O adapters (Phase 19 — io_uring + sirius_datasource)
     src/io/datasource_factory.cpp
     src/io/io_context.cpp
@@ -639,6 +641,7 @@ set(TEST_SOURCES
     test/cpp/exec/test_semi_future.cpp
     test/cpp/exec/test_stream_lifecycle.cpp
     test/cpp/exec/test_stream_session.cpp
+    test/cpp/exec/test_stream_bind_catalog.cpp
     test/cpp/expression/test_ast_aggregate.cpp
     test/cpp/expression/test_ast_clone.cpp
     test/cpp/expression/test_ast_substitute.cpp
