@@ -1,12 +1,10 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use crate::fragment_executor::FragmentExecutor;
 #[cfg(test)]
 use crate::fragment_executor::StubExecutor;
-use crate::local_exchange::{
-    ExchangeFile, ExchangeKey, ExchangeOutput, LocalExchange, ReadyFragment,
-};
+use crate::fragment_executor::{FragmentExecutor, FragmentRun, SenderSlot};
+use crate::local_exchange::{ExchangeKey, LocalExchange, ReadyFragment, SenderOutput};
 use crate::proto::starrocks::{
     PExecBatchPlanFragmentsRequest, PExecBatchPlanFragmentsResult, PExecPlanFragmentRequest,
     PExecPlanFragmentResult, PFetchDataRequest, PFetchDataResult, PGetFileSchemaRequest,
@@ -29,6 +27,23 @@ use thrift::{
     transport::TBufferChannel,
 };
 use tracing::{info, instrument};
+
+/// Name of the engine view an exchange's input stream is read through.
+///
+/// With the engine linked this is the engine's own definition, so the name the plan reads and the
+/// name the engine creates cannot drift. The no-engine build — a translation-only test path where
+/// no view is ever created — mirrors the format, and `stream_view_name_matches_the_engine` pins
+/// the two together whenever the engine is present.
+fn sirius_stream_view_name(stream_id: u64) -> String {
+    #[cfg(feature = "sirius-engine")]
+    {
+        sirius::stream_view_name(stream_id)
+    }
+    #[cfg(not(feature = "sirius-engine"))]
+    {
+        format!("sirius_stream_{stream_id}")
+    }
+}
 
 /// Sirius compute-node implementation of StarRocks PInternalService.
 ///
@@ -291,17 +306,35 @@ impl SiriusComputeNodeService {
         }
     }
 
-    /// Executes a result fragment or materializes a data-stream sender for its local receiver.
+    /// Executes a fragment that reads no exchange input.
     fn execute_fragment(
         &self,
         params: &TExecPlanFragmentParams,
         translated: TranslatedPlan,
     ) -> std::result::Result<(), String> {
+        self.execute_fragment_with_inputs(params, translated, Vec::new())
+    }
+
+    /// Executes a result fragment, or runs a data-stream sender and parks its output on the GPU
+    /// for its local receiver. `inputs` names the parked sender outputs this fragment consumes.
+    fn execute_fragment_with_inputs(
+        &self,
+        params: &TExecPlanFragmentParams,
+        translated: TranslatedPlan,
+        inputs: Vec<(i32, Vec<SenderSlot>)>,
+    ) -> std::result::Result<(), String> {
         if Self::is_mysql_result_sink(params)? {
             let id = Self::fragment_instance_id(params).ok_or_else(|| {
                 "RESULT_SINK fragment is missing a fragment_instance_id".to_string()
             })?;
-            let result = self.executor.execute(&translated)?;
+            let result = self
+                .executor
+                .run(FragmentRun {
+                    plan: &translated,
+                    inputs: inputs.clone(),
+                    output: None,
+                })?
+                .ok_or_else(|| "result fragment returned no rows".to_string())?;
             let batch = result_encoder::MysqlResultEncoder::encode(&result.batches, 0)?;
             self.results.insert(id, batch);
             return Ok(());
@@ -342,60 +375,86 @@ impl SiriusComputeNodeService {
             .filter(|destinations| !destinations.is_empty())
             .ok_or_else(|| "DATA_STREAM_SINK fragment has no destinations".to_string())?;
         let sender_id = exec.sender_id.unwrap_or(0);
-        let result = self.executor.execute(&translated)?;
-        let output = ExchangeOutput {
-            names: translated.output_names,
-            result,
-        };
-        let mut ready_fragments = Vec::new();
-        for destination in destinations {
-            let ready = self.exchanges.push_sender(
-                ExchangeKey {
-                    fragment_instance_id: FragmentInstanceId::from(
-                        &destination.fragment_instance_id,
-                    ),
-                    node_id: stream_sink.dest_node_id,
-                },
-                sender_id,
-                output.clone(),
-            )?;
-            if let Some(ready) = ready {
-                ready_fragments.push(ready);
-            }
+        // One destination only: relaying a stream to N receivers means each batch is claimed by
+        // one of them, so a broadcast needs the partitioned sink (#838), not a loop here. Refusing
+        // is the honest answer — the alternative silently gives every receiver but one no rows.
+        if destinations.len() > 1 {
+            return Err(format!(
+                "a data stream sink with {} destinations needs partitioned streaming",
+                destinations.len()
+            ));
         }
-        for ready in ready_fragments {
+        let destination = &destinations[0];
+        let slot = SenderSlot {
+            fragment_instance_id: FragmentInstanceId::from(&destination.fragment_instance_id),
+            node_id: stream_sink.dest_node_id,
+            sender_id,
+        };
+
+        // The sender's rows stay on the GPU, parked under `slot` as native batches; only the
+        // rendezvous bookkeeping — which sender produced, and its output names — comes back here.
+        self.executor.run(FragmentRun {
+            plan: &translated,
+            inputs,
+            output: Some(slot),
+        })?;
+
+        let ready = self.exchanges.push_sender(
+            ExchangeKey {
+                fragment_instance_id: slot.fragment_instance_id,
+                node_id: slot.node_id,
+            },
+            sender_id,
+            SenderOutput {
+                names: translated.output_names,
+                slot,
+            },
+        )?;
+        if let Some(ready) = ready {
             self.execute_ready_fragment(ready)?;
         }
         Ok(())
     }
 
-    /// Materializes all complete sender sets and executes the receiver as one single-shot plan.
+    /// Translates a receiver whose sender set is complete, binding each exchange to the input
+    /// stream its senders parked into, and runs it.
     fn execute_ready_fragment(&self, ready: ReadyFragment) -> std::result::Result<(), String> {
-        let files = ready
-            .inputs
-            .iter()
-            .map(|input| ExchangeFile::materialize(&input.outputs))
-            .collect::<Result<Vec<_>, _>>()?;
         let exchange_inputs = ready
             .inputs
             .iter()
-            .zip(&files)
-            .map(|(input, file)| {
-                let path = file
-                    .path()
-                    .to_str()
-                    .ok_or_else(|| "exchange file path is not valid UTF-8".to_string())?
-                    .to_string();
+            .map(|input| {
+                let names = input
+                    .outputs
+                    .first()
+                    .map(|output| output.names.clone())
+                    .ok_or_else(|| {
+                        format!("exchange node {} has no sender output", input.node_id)
+                    })?;
+                if input.outputs.iter().any(|output| output.names != names) {
+                    return Err("exchange senders produced different output names".to_string());
+                }
+                let stream_id = u64::try_from(input.node_id)
+                    .map_err(|_| format!("negative exchange node id {}", input.node_id))?;
                 Ok(ExchangeInput {
                     node_id: input.node_id,
-                    paths: vec![path],
-                    names: file.names.clone(),
+                    stream_view: sirius_stream_view_name(stream_id),
+                    names,
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
+        let inputs = ready
+            .inputs
+            .iter()
+            .map(|input| {
+                (
+                    input.node_id,
+                    input.outputs.iter().map(|output| output.slot).collect(),
+                )
+            })
+            .collect();
         let translated =
             self.translate_fragment_logged_with_inputs(&ready.params, &exchange_inputs)?;
-        self.execute_fragment(&ready.params, translated)
+        self.execute_fragment_with_inputs(&ready.params, translated, inputs)
     }
 
     /// Finds every exchange receiver in a fragment and each expected sender count.
@@ -691,9 +750,23 @@ mod tests {
     }
 
     impl FragmentExecutor for CountingExecutor {
-        fn execute(&self, translated: &TranslatedPlan) -> Result<FragmentResult, String> {
+        fn run(&self, run: FragmentRun<'_>) -> Result<Option<FragmentResult>, String> {
             self.calls.fetch_add(1, Ordering::Relaxed);
-            StubExecutor.execute(translated)
+            StubExecutor.run(run)
+        }
+    }
+
+    /// The plan names the view; the engine creates it. If the two ever disagree the receiver's
+    /// read binds to nothing and the query fails at plan time, so pin them together here rather
+    /// than discovering it in a cluster run.
+    #[cfg(feature = "sirius-engine")]
+    #[test]
+    fn stream_view_name_matches_the_engine() {
+        for stream_id in [0, 1, 7, 4096] {
+            assert_eq!(
+                sirius_stream_view_name(stream_id),
+                sirius::stream_view_name(stream_id)
+            );
         }
     }
 

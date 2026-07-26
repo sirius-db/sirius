@@ -122,17 +122,40 @@ pub struct TranslatedPlan {
     pub plan: Plan,
     /// Root output names as emitted in the Substrait plan.
     pub output_names: Vec<String>,
+    /// One entry per exchange node lowered to a stream read. The caller declares these on the
+    /// engine before handing it the plan — a stream has no file to infer a schema from.
+    pub stream_inputs: Vec<StreamInputSchema>,
 }
 
-/// A fully materialized same-node input for one StarRocks exchange node.
+/// A same-node input stream bound to one StarRocks exchange node.
 #[derive(Clone, Debug)]
 pub struct ExchangeInput {
     /// Receiver `EXCHANGE_NODE` id.
     pub node_id: i32,
-    /// Local parquet files containing the sender fragment output.
-    pub paths: Vec<String>,
-    /// Sender output names as written to those parquet files.
+    /// Name of the engine view this exchange's input stream is read through.
+    pub stream_view: String,
+    /// Sender output names, which become the stream's column names.
     pub names: Vec<String>,
+}
+
+/// The schema one exchange's input stream must be declared with, as the plan reads it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StreamInputSchema {
+    /// Receiver `EXCHANGE_NODE` id, which is also the engine-side stream id.
+    pub node_id: i32,
+    /// Name of the engine view the plan reads this stream through.
+    pub stream_view: String,
+    /// Columns in plan order.
+    pub columns: Vec<StreamInputColumn>,
+}
+
+/// One column of a declared input stream.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StreamInputColumn {
+    /// Column name, matching the read's base schema.
+    pub name: String,
+    /// DuckDB type name the engine parses when declaring the stream.
+    pub ty: String,
 }
 
 impl TranslatedPlan {
@@ -241,7 +264,7 @@ impl PlanTranslator {
             .map(|input| (input.node_id, input))
             .collect::<HashMap<_, _>>();
         let mut registry = ExtensionRegistry::new();
-        let mut translated = node_translator::translate_plan(
+        let (mut translated, stream_inputs) = node_translator::translate_plan(
             plan,
             &desc,
             &scan_paths,
@@ -291,6 +314,7 @@ impl PlanTranslator {
         Ok(TranslatedPlan {
             plan: substrait_plan,
             output_names,
+            stream_inputs,
         })
     }
 }

@@ -17,7 +17,8 @@ use crate::error::{Result, TranslateError};
 use crate::expr_translator::{self, ExprContext, TranslateExpr};
 use crate::scan_paths::ScanFilePaths;
 use crate::{
-    ExchangeInput, ExtensionRegistry, URN_AGGREGATE, URN_ARITHMETIC, URN_BOOLEAN, URN_COMPARISON,
+    ExchangeInput, ExtensionRegistry, StreamInputColumn, StreamInputSchema, URN_AGGREGATE,
+    URN_ARITHMETIC, URN_BOOLEAN, URN_COMPARISON,
 };
 
 /// Partially translated relation plus the StarRocks row layout it emits.
@@ -49,10 +50,13 @@ struct PlanContext<'a> {
     /// scan ranges. Scans with paths emit a `local_files` read; path-less scans
     /// fall back to a named-table read.
     scan_paths: &'a ScanFilePaths,
-    /// Materialized same-node inputs keyed by receiver exchange node id.
+    /// Same-node input streams keyed by receiver exchange node id.
     exchange_inputs: &'a std::collections::HashMap<i32, &'a ExchangeInput>,
     /// Substrait extension registry shared across the whole plan.
     registry: &'a mut ExtensionRegistry,
+    /// Schema of every exchange lowered to a stream read, in translation order. The caller has to
+    /// declare these on the engine before the plan can bind.
+    stream_inputs: Vec<StreamInputSchema>,
 }
 
 impl<'a> PlanContext<'a> {
@@ -68,6 +72,7 @@ impl<'a> PlanContext<'a> {
             scan_paths,
             exchange_inputs,
             registry,
+            stream_inputs: Vec::new(),
         }
     }
 
@@ -317,12 +322,19 @@ pub(crate) fn translate_plan(
     scan_paths: &ScanFilePaths,
     exchange_inputs: &std::collections::HashMap<i32, &ExchangeInput>,
     registry: &mut ExtensionRegistry,
-) -> Result<TranslatedRel> {
+) -> Result<(TranslatedRel, Vec<StreamInputSchema>)> {
     let mut ctx = PlanContext::new(desc, scan_paths, exchange_inputs, registry);
-    plan.translate(&mut ctx)
+    let translated = plan.translate(&mut ctx)?;
+    Ok((translated, std::mem::take(&mut ctx.stream_inputs)))
 }
 
-/// Replaces a receiver exchange boundary with a read of its fully materialized sender output.
+/// Replaces a receiver exchange boundary with a read of the sender's output **stream**.
+///
+/// The sender's rows are already on the GPU, parked in the engine as native batches. So the read
+/// resolves to the engine's stream view rather than to a file: nothing is materialized, nothing
+/// is re-parsed, and the boundary costs a pointer move. The schema the read declares is also
+/// recorded on the context, because the engine has no file to infer it from and the fragment must
+/// declare the same one.
 fn translate_exchange(
     node: &TPlanNode,
     children: Vec<TranslatedRel>,
@@ -348,14 +360,8 @@ fn translate_exchange(
             .ok_or(TranslateError::UnsupportedPlanNode {
                 node_id: node.node_id,
                 node_type: node.node_type,
-                reason: "exchange node requires a materialized same-node input",
+                reason: "exchange node requires a bound same-node input stream",
             })?;
-    if input.paths.is_empty() {
-        return Err(TranslateError::malformed(format!(
-            "exchange node {} has no materialized input files",
-            node.node_id
-        )));
-    }
     let schema = ctx
         .desc
         .named_struct_for_tuples(&exchange.input_row_tuples, Some(&input.names))?;
@@ -364,8 +370,33 @@ fn translate_exchange(
         .as_ref()
         .map(|structure| structure.types.len())
         .unwrap_or(0);
+
+    let columns = schema
+        .names
+        .iter()
+        .cloned()
+        .zip(
+            schema
+                .r#struct
+                .as_ref()
+                .map(|structure| structure.types.as_slice())
+                .unwrap_or_default(),
+        )
+        .map(|(name, ty)| {
+            Ok(StreamInputColumn {
+                name,
+                ty: crate::type_mapper::duckdb_type_name(ty)?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    ctx.stream_inputs.push(StreamInputSchema {
+        node_id: node.node_id,
+        stream_view: input.stream_view.clone(),
+        columns,
+    });
+
     let mut translated = TranslatedRel {
-        rel: local_files_rel(schema, &input.paths),
+        rel: stream_read_rel(schema, &input.stream_view),
         row_tuples: exchange.input_row_tuples.clone(),
         output_width,
     };
@@ -919,6 +950,23 @@ fn scan_rel(desc: &DescriptorTable, tuple_id: i32, file_paths: &[String]) -> Res
             ..Default::default()
         }))),
     })
+}
+
+/// Builds a read of an engine stream view with an explicit schema.
+///
+/// The view is a named table as far as Substrait is concerned; the engine defines it as a read of
+/// the corresponding input stream, so the plan never names a file.
+fn stream_read_rel(schema: substrait::proto::NamedStruct, stream_view: &str) -> Rel {
+    Rel {
+        rel_type: Some(rel::RelType::Read(Box::new(ReadRel {
+            base_schema: Some(schema),
+            read_type: Some(ReadType::NamedTable(NamedTable {
+                names: vec![stream_view.to_string()],
+                ..Default::default()
+            })),
+            ..Default::default()
+        }))),
+    }
 }
 
 /// Builds a local parquet read with an explicit schema.
