@@ -327,16 +327,27 @@ This runner follows the spec instead:
 
 | Area | duckdb-tpch-power-test | Here |
 |------|------------------------|------|
-| Power run stream | stream 1, reused as a throughput stream | stream 0, which the power test is defined to use |
-| Throughput refresh pairs | `max(SF/10, 1)`, unrelated to stream count | one RF1/RF2 pair per query stream |
+| Power run stream | stream 1, reused as a throughput stream | stream 0, the power test's ordering number O(00) (clause 5.3.5.2) |
+| Throughput refresh pairs | `max(SF/10, 1)`, unrelated to stream count | one RF1/RF2 pair per query stream (clause 5.3.7.7) |
 | Row limits (`:n`) | dropped — the `where rownum <= N` chunk fails its `'select' in q` filter, so q2/q3/q10/q18/q21 run unlimited | folded into a `LIMIT` on the query |
 | q15 | `create view ... as select` is timed as a separate query, `drop view` is skipped, so 23 timings feed a 24th-root | the three statements are one query, one timing |
-| Power@Size | 24th root over those 23 timings | geometric mean of exactly 22 query times + T_RF1 + T_RF2 |
+| Power@Size | 24th root over those 23 timings | geometric mean of exactly 22 query times + T_RF1 + T_RF2 (clause 5.4.1) |
 
 Two things are inherited as-is: query text comes from `qgen`, and each query runs in its own
-transaction. Note the checked-in `dbgen` is 2.14.0 while that repo vendors 3.0.1; the only
-difference that reaches the SQL is q1's ANSI `day (3)` interval qualifier, which
-`tpch_query_streams.py` strips (it is a no-op for the 60..120 day values q1 draws).
+transaction.
+
+The checked-in `dbgen` is 2.14.0 while that repo vendors 3.0.1, and the older tool draws two
+substitution parameters outside the ranges the spec defines. `dbgen_bootstrap.sh` applies TPC's
+own 3.0.1 fixes before building `qgen`:
+
+- **q4** month offset `UnifInt(1,58)` → `UnifInt(0,57)`, so the date lands in 1993-01 … 1997-10
+  as clause 2.4.4.3 requires, rather than 1993-02 … 1997-11.
+- **q22** country codes `{10..34} + 10` → `{0..24} + 10`. Codes are the nation index plus 10
+  (clause 4.2.2.9), so only 10..34 exist; 2.14.0 emits 20..44, and everything above 34 matches no
+  rows. `tpch_query_streams.py` rejects stream files still carrying out-of-range codes.
+
+Separately, 2.14.0's q1 template keeps the ANSI `day (3)` interval qualifier that 3.0.1 dropped
+and DuckDB cannot parse; the loader strips it (a no-op for q1's 60..120 day values).
 
 ### Usage
 

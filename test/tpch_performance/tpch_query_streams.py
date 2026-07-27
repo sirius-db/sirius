@@ -36,6 +36,30 @@ _ROWCOUNT = re.compile(r"^\s*where\s+rownum\s*<=\s*(-?\d+)\s*$", re.IGNORECASE)
 # for the 60..120 day values q1 draws.
 _DAY_PRECISION = re.compile(r"\bday\s*\(\s*\d+\s*\)", re.IGNORECASE)
 
+_Q22_CODES = re.compile(
+    r"substring\(c_phone from 1 for 2\) in\s*\(([^)]*)\)", re.IGNORECASE
+)
+
+
+def _check_q22_codes(path, statements):
+    """Country codes are nation index + 10, so only 10..34 exist.
+
+    dbgen before 3.0.1 draws them from the wrong table and emits 20..44, which
+    silently matches no rows for half the values. dbgen_bootstrap.sh patches
+    that before building qgen; catch stream files generated before the fix.
+    """
+    found = _Q22_CODES.search(" ".join(statements))
+    if not found:
+        return
+    codes = [int(c.strip().strip("'")) for c in found.group(1).split(",")]
+    outside = sorted(c for c in codes if not 10 <= c <= 34)
+    if outside:
+        raise SystemExit(
+            f"{path}: q22 country codes {outside} fall outside 10..34. "
+            "Regenerate with generate_tpch_queries.sh, which patches the "
+            "bundled dbgen to the 3.0.1 substitution ranges."
+        )
+
 
 def _statements(block):
     """The SQL statements in one query block, comments stripped."""
@@ -85,7 +109,10 @@ def load_stream(query_dir, stream):
         statements = _statements(text[tag.end() : end])
         if not statements:
             raise SystemExit(f"{path}: query Q{tag.group(1)} has no statements")
-        plan.append((int(tag.group(1)), statements))
+        qnum = int(tag.group(1))
+        if qnum == 22:
+            _check_q22_codes(path, statements)
+        plan.append((qnum, statements))
 
     if sorted(q for q, _ in plan) != list(range(1, 23)):
         raise SystemExit(
