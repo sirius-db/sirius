@@ -2,7 +2,8 @@
 //
 // Structural tests for the shared PlanTree -> jit::FusedTree builder
 // (bridge/fused_tree_build.{hpp,cpp}). Host-only (no GPU): asserts tree shape,
-// DFS-preorder node-id ordering, and the rle raw passthrough leaf.
+// DFS-preorder node-id ordering, every fusable op, Raw passthrough origins, and
+// invalid-root rejection.
 
 #include "codegen/bridge/fused_tree_build.hpp"
 #include "codegen/jit/fused_tree.hpp"
@@ -104,7 +105,9 @@ void test_rle_raw_values_passthrough()
   // Preorder: rle, bitpack(runs), raw(values).
   expect(built->preorder.size() == 3, "3 preorder nodes");
   expect(built->preorder[2].is_raw_passthrough, "preorder[2] is raw passthrough");
-  expect(built->preorder[2].parent_rle == rle, "raw passthrough parent is rle");
+  expect(built->preorder[2].parent_node == rle, "raw passthrough parent is rle");
+  expect(built->preorder[2].parent_op == "rle", "raw passthrough parent op is rle");
+  expect(built->preorder[2].parent_channel == "values", "raw passthrough channel is 'values'");
 }
 
 // delta with a non-fusable (ans) child on the differences channel now builds
@@ -129,9 +132,93 @@ void test_delta_raw_differences_passthrough()
   expect(built->preorder.size() == 2, "2 preorder nodes");
   expect(!built->preorder[0].is_raw_passthrough, "preorder[0] is real Delta node");
   expect(built->preorder[1].is_raw_passthrough, "preorder[1] is raw passthrough");
-  expect(built->preorder[1].parent_rle == delta, "raw passthrough parent is delta");
+  expect(built->preorder[1].parent_node == delta, "raw passthrough parent is delta");
+  expect(built->preorder[1].parent_op == "delta", "raw passthrough parent op is delta");
   expect(built->preorder[1].parent_channel == "differences",
          "raw passthrough channel is 'differences'");
+}
+
+void test_for_fused_and_raw_modes()
+{
+  {
+    auto t = build_tree(
+      "input -> for -> deltas, references\n"
+      "for.deltas -> bitpack\n");
+    simpatico::NodeId for_node = node_for_op(t, "for");
+    simpatico::NodeId bitpack  = node_for_op(t, "bitpack");
+    auto built                 = simpatico::build_fused_tree(t, for_node);
+    expect(built.has_value(), "for+bitpack builds");
+
+    auto const& root = *built->tree;
+    expect(root.op == OpKind::For, "root is For");
+    expect(root.children.size() == 1 && root.children.count("deltas") == 1,
+           "For has one deltas child");
+    expect(root.children.at("deltas")->op == OpKind::Bitpack, "For deltas child is Bitpack");
+    expect(built->preorder.size() == 2, "For+Bitpack has 2 preorder nodes");
+    expect(built->preorder[0].plan_node == for_node, "For preorder origin");
+    expect(built->preorder[1].plan_node == bitpack, "Bitpack preorder origin");
+    expect(!built->preorder[1].is_raw_passthrough, "Bitpack child is a real node");
+  }
+
+  {
+    auto t = build_tree(
+      "input -> for -> deltas, references\n"
+      "for.deltas -> ans\n");
+    simpatico::NodeId for_node = node_for_op(t, "for");
+    auto built                 = simpatico::build_fused_tree(t, for_node);
+    expect(built.has_value(), "for+raw-deltas builds");
+
+    auto const& raw = *built->tree->children.at("deltas");
+    expect(raw.op == OpKind::Raw && raw.is_leaf(), "For deltas child is Raw");
+    expect(built->preorder.size() == 2, "For+Raw has 2 preorder nodes");
+    auto const& origin = built->preorder[1];
+    expect(origin.is_raw_passthrough, "For Raw origin is passthrough");
+    expect(origin.parent_node == for_node, "For Raw parent node");
+    expect(origin.parent_op == "for", "For Raw parent op");
+    expect(origin.parent_channel == "deltas", "For Raw parent channel");
+  }
+}
+
+void test_zigzag_leaf_and_fused_child()
+{
+  {
+    auto t                   = build_tree("input -> zigzag -> zigzag\n");
+    simpatico::NodeId zigzag = node_for_op(t, "zigzag");
+    auto built               = simpatico::build_fused_tree(t, zigzag);
+    expect(built.has_value(), "leaf Zigzag builds");
+    expect(built->tree->op == OpKind::Zigzag, "root is Zigzag");
+    expect(built->tree->is_leaf(), "terminal Zigzag has no child");
+    expect(built->preorder.size() == 1, "leaf Zigzag has one preorder node");
+    expect(built->preorder[0].plan_node == zigzag, "leaf Zigzag preorder origin");
+  }
+
+  {
+    auto t = build_tree(
+      "input -> zigzag -> zigzag\n"
+      "zigzag.zigzag -> bitpack\n");
+    simpatico::NodeId zigzag  = node_for_op(t, "zigzag");
+    simpatico::NodeId bitpack = node_for_op(t, "bitpack");
+    auto built                = simpatico::build_fused_tree(t, zigzag);
+    expect(built.has_value(), "zigzag+bitpack builds");
+
+    auto const& root = *built->tree;
+    expect(root.children.size() == 1 && root.children.count("zigzag") == 1,
+           "Zigzag has one zigzag child");
+    expect(root.children.at("zigzag")->op == OpKind::Bitpack, "Zigzag child is Bitpack");
+    expect(built->preorder.size() == 2, "Zigzag+Bitpack has 2 preorder nodes");
+    expect(built->preorder[0].plan_node == zigzag, "Zigzag preorder origin");
+    expect(built->preorder[1].plan_node == bitpack, "Zigzag child preorder origin");
+  }
+}
+
+void test_invalid_roots()
+{
+  auto t                = build_tree("input -> ans\n");
+  simpatico::NodeId ans = node_for_op(t, "ans");
+  expect(!simpatico::build_fused_tree(t, ans).has_value(), "non-fusable root is rejected");
+  expect(
+    !simpatico::build_fused_tree(t, static_cast<simpatico::NodeId>(t.nodes.size())).has_value(),
+    "out-of-range root is rejected");
 }
 
 }  // namespace
@@ -143,6 +230,9 @@ int main()
     test_lone_bitpack();
     test_rle_raw_values_passthrough();
     test_delta_raw_differences_passthrough();
+    test_for_fused_and_raw_modes();
+    test_zigzag_leaf_and_fused_child();
+    test_invalid_roots();
     std::printf("test_fused_tree_build: PASS\n");
     return 0;
   } catch (std::exception const& e) {

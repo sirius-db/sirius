@@ -1,19 +1,20 @@
-// Fused-operator sweep: encode -> decode -> equality across every
-// decode-supported FusedTree shape up to a small depth bound. (Companion to
+// Fused-operator sweep: encode -> decode -> equality across a systematic,
+// depth-bounded FusedTree shape family spanning every fused op. (Companion to
 // test_operator_sweep, which sweeps the full operator catalog x dtypes via the
-// plan DSL; this one exhaustively sweeps the *fused* IR's tree shapes.)
+// plan DSL; this one stresses composition in the fused IR directly.)
 //
 // Why this exists
 // ---------------
-// The decode side supports {Bitpack, Delta, Rle, Raw (as Rle.runs)}
-// composed freely; the GPU encode kernel (`gpu_encode_tree`) walks the
-// same FusedTree IR.  Per-shape ctests cover hand-picked compositions
-// but only those — adding a new op to one side without the other (or
-// silently breaking composability for a particular nesting depth)
-// goes unnoticed until a downstream user trips it.
+// The encode and decode sides support {Bitpack, Delta, Rle, For, Zigzag,
+// Raw passthrough} composed through the FusedTree IR.  The GPU encode kernel
+// (`gpu_encode_tree`) and JIT decode kernel walk the same tree.  Per-shape
+// ctests cover hand-picked compositions but only those — adding a new op to
+// one side without the other (or silently breaking composability for a
+// particular nesting depth) goes unnoticed until a downstream user trips it.
 //
-// This test enumerates EVERY shape the IR can express up to a given
-// depth and runs the full pipeline on each:
+// This test enumerates the recursive grammar below up to a given depth, adds
+// the non-recursive boundary forms separately, and runs the full pipeline on
+// each:
 //
 //     FusedTree -> gpu_encode_tree -> jit_decode_tree -> equality
 //
@@ -28,17 +29,18 @@
 // root-to-leaf path.  Build by induction on d:
 //
 //   * d = 1: {Bitpack}
-//   * d > 1: for every shape c of depth d-1, add Delta(values=c),
+//   * d > 1: for every shape c of depth d-1, add Delta(differences=c),
+//            For(deltas=c), Zigzag(zigzag=c),
 //            Rle(runs=Bitpack, values=c), Rle(runs=Raw, values=c).
 //
-// Counts up to d = 4: 1 + 3 + 9 + 27 = 40 shapes.  At ~400 ms cold
-// JIT compile per shape, full sweep is ~15-20 s.  Set the env var
-// SIMPATICO_FUSED_SWEEP_DEPTH to override (default 4).
+// Counts up to d = 4: 1 + 5 + 25 + 125 = 156 recursively generated
+// shapes, plus boundary cases for leaf/passthrough forms and RLE nesting in
+// the runs branch. Set SIMPATICO_FUSED_SWEEP_DEPTH to override (default 4).
 //
 // Fixture
 // -------
 // int32_t throughout (matches the existing JIT-roundtrip tests).
-// Two synthetic columns: `synth_data` (generic, depth-no-Rle), and
+// Two synthetic columns: `synth_data` (generic, no-RLE shapes), and
 // `synth_rle_data` (chunk-varied RLE patterns).  Shapes containing
 // any Rle node use the RLE-friendly fixture.
 
@@ -153,9 +155,11 @@ std::string tag(const jit::FusedTree& t)
   auto short_name = [](OpKind k) -> const char* {
     switch (k) {
       case OpKind::Bitpack: return "Bp";
+      case OpKind::For: return "For";
       case OpKind::Delta: return "Delta";
       case OpKind::Rle: return "Rle";
       case OpKind::Raw: return "Raw";
+      case OpKind::Zigzag: return "Zigzag";
       default: return "?";
     }
   };
@@ -164,6 +168,12 @@ std::string tag(const jit::FusedTree& t)
   os << short_name(t.op);
   if (t.op == OpKind::Delta) {
     auto it = t.children.find("differences");
+    os << "(" << (it != t.children.end() ? tag(*it->second) : "?") << ")";
+  } else if (t.op == OpKind::For) {
+    auto it = t.children.find("deltas");
+    os << "(" << (it != t.children.end() ? tag(*it->second) : "?") << ")";
+  } else if (t.op == OpKind::Zigzag) {
+    auto it = t.children.find("zigzag");
     os << "(" << (it != t.children.end() ? tag(*it->second) : "?") << ")";
   } else if (t.op == OpKind::Rle) {
     auto r = t.children.find("runs");
@@ -177,17 +187,26 @@ std::string tag(const jit::FusedTree& t)
 }
 
 // Build a tree of exact `depth` from a list of depth-(d-1) children.
-// Each child becomes 3 new trees: Delta(c), Rle(Bp, c), Rle(Raw, c).
-// Raw is only legal as a Rle.runs leaf; Bp is the other allowed runs
-// child (other shapes go in values).
+// Each child becomes 5 new trees: Delta(c), For(c), Zigzag(c),
+// Rle(Bp, c), and Rle(Raw, c).
+// Raw terminal/passthrough forms are boundary cases below rather than recursive
+// inputs, so this grammar remains bounded and every recursive child is decoded.
 std::vector<Tree> compose_layer(const std::vector<Tree>& prev)
 {
   std::vector<Tree> out;
-  out.reserve(prev.size() * 3);
+  out.reserve(prev.size() * 5);
   for (const auto& c : prev) {
     out.push_back(jit::FusedTree::make(OpKind::Delta,
                                        {
                                          {"differences", c},
+                                       }));
+    out.push_back(jit::FusedTree::make(OpKind::For,
+                                       {
+                                         {"deltas", c},
+                                       }));
+    out.push_back(jit::FusedTree::make(OpKind::Zigzag,
+                                       {
+                                         {"zigzag", c},
                                        }));
     out.push_back(jit::FusedTree::make(OpKind::Rle,
                                        {
@@ -218,12 +237,27 @@ std::vector<Tree> enumerate_shapes(int max_depth)
   return flat;
 }
 
-// Shapes the combinatorial sweep does not generate: it only nests in the
-// `values` position with `runs` fixed to Bitpack/Raw. These cover an Rle nested
-// in the `runs` position, the one composition outside that scheme.
+// Shapes the recursive grammar does not generate:
+//   * Zigzag may terminate as a leaf store.
+//   * Delta and For may terminate through a Raw passthrough child.
+//   * Rle may have Raw values, and may nest another Rle in its runs branch.
 std::vector<Tree> extra_shapes()
 {
   return {
+    jit::FusedTree::make(OpKind::Zigzag),
+    jit::FusedTree::make(OpKind::Delta,
+                         {
+                           {"differences", jit::FusedTree::make(OpKind::Raw)},
+                         }),
+    jit::FusedTree::make(OpKind::For,
+                         {
+                           {"deltas", jit::FusedTree::make(OpKind::Raw)},
+                         }),
+    jit::FusedTree::make(OpKind::Rle,
+                         {
+                           {"runs", jit::FusedTree::make(OpKind::Raw)},
+                           {"values", jit::FusedTree::make(OpKind::Raw)},
+                         }),
     jit::FusedTree::make(
       OpKind::Rle,
       {

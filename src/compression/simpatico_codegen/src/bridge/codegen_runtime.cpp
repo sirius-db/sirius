@@ -855,7 +855,7 @@ static int encode_subtree_impl(const simpatico::CodegenHead& head,
 
     // Walk nodes in preorder (index == jit node_id).  For each real op,
     // builder->leaves is keyed by the PlanTree NodeId; for Raw passthrough
-    // nodes the rep lands in builder->raw_passthrough_leaves (parent_rle key).
+    // nodes the rep lands in builder->raw_passthrough_leaves (parent_node key).
     for (std::int32_t node_id = 0; node_id < static_cast<std::int32_t>(head.preorder.size());
          ++node_id) {
       const simpatico::FusedNodeOrigin& origin = head.preorder[node_id];
@@ -1104,8 +1104,8 @@ static int encode_subtree_impl(const simpatico::CodegenHead& head,
         case cc::OpKind::Raw: {
           // Synthesized Raw passthrough leaf (is_raw_passthrough == true).
           // No PlanTree op node of its own.  The rep is keyed by
-          // origin.parent_rle in builder->raw_passthrough_leaves; the compress
-          // driver parks it in tree.nodes[parent_rle].channels under the
+          // origin.parent_node in builder->raw_passthrough_leaves; the compress
+          // driver parks it in tree.nodes[parent_node].channels under the
           // output path for origin.parent_channel.
           //
           // Two layout families, selected by parent_op:
@@ -1164,7 +1164,7 @@ static int encode_subtree_impl(const simpatico::CodegenHead& head,
             rep->buffers.emplace_back("data", std::move(data_col));
             rep->buffers.emplace_back("offsets", std::move(offs_col));
             builder->raw_passthrough_leaves.push_back(
-              {origin.parent_rle, origin.parent_channel, std::move(rep)});
+              {origin.parent_node, origin.parent_channel, std::move(rep)});
             break;
           }
 
@@ -1179,7 +1179,7 @@ static int encode_subtree_impl(const simpatico::CodegenHead& head,
             for (std::int32_t j = node_id - 1; j >= 0; --j) {
               const simpatico::FusedNodeOrigin& o = head.preorder[j];
               if (!o.is_raw_passthrough && o.node->op == cc::OpKind::Rle &&
-                  o.plan_node == origin.parent_rle) {
+                  o.plan_node == origin.parent_node) {
                 rle_node_id = j;
                 break;
               }
@@ -1187,9 +1187,9 @@ static int encode_subtree_impl(const simpatico::CodegenHead& head,
             if (rle_node_id < 0) {
               std::fprintf(stderr,
                            "simpatico::codegen: encode bridge: BUG - cannot find parent RLE "
-                           "node in preorder (nid=%d parent_rle=%u); preorder may be malformed\n",
+                           "node in preorder (nid=%d parent_node=%u); preorder may be malformed\n",
                            node_id,
-                           static_cast<unsigned>(origin.parent_rle));
+                           static_cast<unsigned>(origin.parent_node));
               return -1;
             }
             const auto i_rle_off = find_buffer_idx(spec.buffers, rle_node_id, "rle_runs_offsets");
@@ -1262,7 +1262,7 @@ static int encode_subtree_impl(const simpatico::CodegenHead& head,
             rep->buffers.emplace_back("data", std::move(data_col));
             rep->buffers.emplace_back("offsets", std::move(offs_col));
             builder->raw_passthrough_leaves.push_back(
-              {origin.parent_rle, origin.parent_channel, std::move(rep)});
+              {origin.parent_node, origin.parent_channel, std::move(rep)});
           }
           break;
         }

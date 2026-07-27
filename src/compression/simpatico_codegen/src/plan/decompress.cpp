@@ -103,11 +103,6 @@ struct DecodeMemo {
   std::vector<std::unique_ptr<compressed_representation>> kept;
 };
 
-std::uint64_t value_key(ValueId v)
-{
-  return (static_cast<std::uint64_t>(v.node) << 16) | v.channel;
-}
-
 std::string value_label(ValueId v)
 {
   return "(" + std::to_string(v.node) + "," + std::to_string(v.channel) + ")";
@@ -123,7 +118,7 @@ std::unique_ptr<cudf::column> consume_memo_value(ValueId value,
                                                  rmm::device_async_resource_ref mr,
                                                  std::string* error_out)
 {
-  auto const key = value_key(value);
+  auto const key = value_id_key(value);
   auto value_it  = memo.values.find(key);
   if (value_it == memo.values.end()) {
     if (error_out) *error_out = "decode: unresolved memo value " + value_label(value);
@@ -438,7 +433,7 @@ std::shared_ptr<codegen::jit::FusedTree> bind_fused_subtree(NodeId root_nid,
     }
     if (origin.is_raw_passthrough) {
       if (!bind_raw_passthrough_buffers(node_id,
-                                        origin.parent_rle,
+                                        origin.parent_node,
                                         origin.parent_op,
                                         origin.parent_channel,
                                         tree,
@@ -608,14 +603,14 @@ bool decode_bitjoin(NodeId nid,
   std::unordered_map<std::uint64_t, std::vector<field_ref>> by_src;
   std::vector<ValueId> order;
   for (size_t fi = 0; fi < node.input_sources.size(); ++fi) {
-    std::uint64_t const k = value_key(node.input_sources[fi]);
+    std::uint64_t const k = value_id_key(node.input_sources[fi]);
     auto& vec             = by_src[k];
     if (vec.empty()) order.push_back(node.input_sources[fi]);
     vec.push_back({layout.widths[fi], layout.src_los[fi], layout.dst_los[fi]});
   }
 
   for (auto const& src : order) {
-    auto const& refs     = by_src.at(value_key(src));
+    auto const& refs     = by_src.at(value_id_key(src));
     uint32_t max_src_top = 0;
     for (auto const& r : refs) {
       uint32_t top = r.src_lo + r.width;
@@ -643,7 +638,7 @@ bool decode_bitjoin(NodeId nid,
                            r.width,
                            stream.value());
     }
-    memo.values[value_key(src)] = std::move(field_col);
+    memo.values[value_id_key(src)] = std::move(field_col);
   }
   cudaStreamSynchronize(stream.value());
   return true;
@@ -662,7 +657,7 @@ cudf::column const* materialize(NodeId nid,
 {
   PlanNode const& node  = tree.nodes[nid];
   ValueId const primary = node.input_sources.empty() ? ValueId{nid, 0} : node.input_sources.front();
-  std::uint64_t const pk = value_key(primary);
+  std::uint64_t const pk = value_id_key(primary);
   if (auto it = memo.values.find(pk); it != memo.values.end()) {
     if (!it->second) {
       if (error_out) {
@@ -702,7 +697,7 @@ cudf::column const* materialize(NodeId nid,
       if (child_it != node.children.end()) {
         ValueId const output_value{nid, static_cast<ChannelId>(i)};
         // Recurse only when the value isn't yet in the memo
-        if (!memo.values.count(value_key(output_value))) {
+        if (!memo.values.count(value_id_key(output_value))) {
           if (!materialize(child_it->child, tree, memo, stream, mr, error_out)) return nullptr;
         }
         auto output = consume_memo_value(output_value, memo, stream, mr, error_out);
@@ -755,11 +750,11 @@ std::unique_ptr<cudf::column> decompress_column(PlanTree const& tree,
   DecodeMemo memo;
   for (auto const& node : tree.nodes) {
     for (auto const& src : node.input_sources) {
-      auto const key = value_key(src);
+      auto const key = value_id_key(src);
       ++memo.remaining_consumers[key];
     }
   }
-  std::uint64_t const input_key = value_key(ValueId{0, 0});
+  std::uint64_t const input_key = value_id_key(ValueId{0, 0});
   for (auto const& e : tree.nodes[0].children) {
     if (memo.values.count(input_key)) break;
     if (!materialize(e.child, tree, memo, stream, mr, error_out)) return nullptr;

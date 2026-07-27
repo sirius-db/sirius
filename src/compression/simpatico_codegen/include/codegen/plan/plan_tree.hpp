@@ -34,7 +34,7 @@ inline bool operator!=(ValueId a, ValueId b) { return !(a == b); }
 
 // Pack a ValueId into a unique 64-bit key (channel is a uint8, so node<<8 leaves
 // no room for collision). Shared by the decode memo and the compress walk maps.
-inline std::uint64_t value_id_key(ValueId v)
+inline constexpr std::uint64_t value_id_key(ValueId v) noexcept
 {
   return (static_cast<std::uint64_t>(v.node) << 8) | v.channel;
 }

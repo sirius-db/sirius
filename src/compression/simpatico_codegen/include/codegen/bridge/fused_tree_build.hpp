@@ -40,14 +40,14 @@ namespace simpatico {
 // One built FusedTree node mapped back to its PlanTree origin, in DFS-preorder
 // (index == jit node_id). For a real op node `plan_node` is the PlanTree node
 // id. For a synthesized Raw passthrough leaf, `is_raw_passthrough` is true,
-// `parent_rle` is the owning parent node, `parent_op` is the parent's op name
+// `parent_node` is the owning parent node, `parent_op` is the parent's op name
 // ("rle", "for", "delta") and `parent_channel` is the exact DSL channel name
 // being materialized ("values", "runs", "deltas", "differences").
 struct FusedNodeOrigin {
   codegen::jit::FusedTree* node = nullptr;
   NodeId plan_node              = 0;
   bool is_raw_passthrough       = false;
-  NodeId parent_rle             = 0;  // owning parent's PlanTree NodeId
+  NodeId parent_node            = 0;  // owning parent's PlanTree NodeId
   std::string parent_op;              // owning parent's op name
   std::string parent_channel;         // channel being materialized by this Raw leaf
 };

@@ -1,6 +1,7 @@
 #include "codegen/plan/operator_registry.hpp"
 #include "codegen/plan/plan_tree.hpp"
 
+#include <cstdint>
 #include <cstdio>
 #include <optional>
 #include <stdexcept>
@@ -124,6 +125,27 @@ void test_channel_order_canonicalization()
          "rle canonical order is runs, values");
 }
 
+void test_value_id_key_contract()
+{
+  using simpatico::ChannelId;
+  using simpatico::value_id_key;
+  using simpatico::ValueId;
+
+  // NodeId is 32-bit while ChannelId is 8-bit: the canonical key reserves the
+  // low byte for the channel and preserves every node bit above it. Keep a node
+  // well above 255 here so a reintroduced 16-bit local packing scheme cannot
+  // silently become the decode memo's competing contract.
+  constexpr ValueId large{0x12345678u, ChannelId{0xAB}};
+  constexpr std::uint64_t expected = 0x12345678ABULL;
+  static_assert(value_id_key(large) == expected);
+
+  expect(value_id_key(large) == expected, "large ValueId uses canonical node<<8 packing");
+  expect(value_id_key(ValueId{0x100u, ChannelId{0}}) != value_id_key(ValueId{0u, ChannelId{0}}),
+         "node ids above 255 remain distinct");
+  expect(value_id_key(ValueId{7u, ChannelId{1}}) != value_id_key(ValueId{7u, ChannelId{2}}),
+         "channels on one node remain distinct");
+}
+
 // The operator registry is the single source of truth: name resolution
 // (incl. parameterised suffix forms), classification flags, and canonical
 // channel order / index all derive from one table.
@@ -220,6 +242,7 @@ int main()
     test_bitjoin_attrs();
     test_path_map();
     test_channel_order_canonicalization();
+    test_value_id_key_contract();
     test_operator_registry();
     test_render_plan_tree();
     std::printf("test_plan_tree: PASS\n");

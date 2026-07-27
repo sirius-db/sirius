@@ -25,7 +25,7 @@ namespace simpatico {
 ///
 /// `raw_passthrough_leaves` holds entries for synthesised Raw passthrough leaves
 /// that have no PlanTree op of their own.  Each entry carries:
-///   - `parent_id`   : the parent node's PlanTree NodeId (was "parent_rle")
+///   - `parent_id`   : the parent node's PlanTree NodeId
 ///   - `channel_name`: the output channel name under which the rep is stored
 ///                     ("values" for RLE parents, "deltas" for FOR parents)
 ///   - `rep`         : the codegen_fused_representation holding the raw buffers
