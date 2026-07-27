@@ -60,6 +60,19 @@ there is no blob yet.
 **DISK→GPU** decompression: `simpatico::read_compressed_table(path, stream, mr)` then
 `simpatico::decompress()`.
 
+## Status
+
+Items 1–8 are implemented (commits `36af3db0`, `b5c8ed50`); the build is green and
+the 21 existing compression tests pass. Item 9 (tests) is the remaining work.
+
+One design point resolved during implementation: cuCascade's converter signature
+(`source, target_space, stream, reservation`) cannot carry the repo pointer, so the
+key is passed via a thread-local `spill_context` installed by
+`convertible_data_batch::convert()` for the duration of the `convert_to<>` call —
+see `src/compression/spill_context.hpp`. Doing the compression inline with
+`set_data()` instead was rejected: it would bypass `convert_to`'s probe/telemetry
+events and its sync-before-destroying-the-old-representation barrier.
+
 ## Work items
 
 ### 1. `plan_register` — spill plan storage (keyed by repo pointer)
@@ -150,6 +163,16 @@ Port and rewrite `test/cpp/compression/test_spill_compression.cpp` from `compres
 - Column-count-mismatch fallback (explore produces wrong-width plan → uncompressed).
 
 ## Future / deferred
+
+### Reservation sizing on the compressed path
+
+The reservation handed to the compress converter was sized for the *uncompressed*
+batch (`convert()` reserves `data_size` before picking a target representation). The
+compressed payload is smaller, so the reservation is safe but oversized — the host
+budget is over-charged for every compressed spill until the reservation is resized
+to the actual compressed footprint. Fixing this needs either a two-phase reserve
+(compress, then reserve the real size) or a reservation-shrink API on cuCascade.
+
 
 ### Binary plan storage (avoid DSL roundtrip)
 
