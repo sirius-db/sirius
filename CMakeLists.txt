@@ -221,9 +221,11 @@ endif()
 
 # cmake-format: off
 set(EXTENSION_SOURCES
+    src/compression/compressed_disk_representation.cpp
     src/compression/compressed_representation.cpp
     src/compression/compression_converters.cpp
     src/compression/plan_register.cpp
+    src/compression/simpatico_bridge.cpp
     src/config.cpp
     src/helper/type_conversions.cpp
     src/debug_utils.cpp

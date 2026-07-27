@@ -54,10 +54,15 @@ class convertible_data_batch : public convertible_data {
  public:
   /**
    * @brief Construct from a shared_ptr to a cucascade data_batch.
-   * @param batch The data batch to wrap (shared ownership retained).
+   *
+   * @param batch       The data batch to wrap (shared ownership retained).
+   * @param source_repo The repository this batch came from. Used to key the
+   *                    spill-plan register so the compressor can learn a plan per
+   *                    operator output edge. May be null (e.g. in tests).
    */
-  explicit convertible_data_batch(std::shared_ptr<cucascade::data_batch> batch)
-    : _batch(std::move(batch))
+  explicit convertible_data_batch(std::shared_ptr<cucascade::data_batch> batch,
+                                  const cucascade::shared_data_repository* source_repo = nullptr)
+    : _batch(std::move(batch)), _source_repo(source_repo)
   {
   }
 
@@ -174,6 +179,7 @@ class convertible_data_batch : public convertible_data {
 
  private:
   std::shared_ptr<cucascade::data_batch> _batch;
+  const cucascade::shared_data_repository* _source_repo{nullptr};
 };
 
 /**
@@ -333,7 +339,7 @@ class convertible_data_batch_provider : public convertible_data_provider {
     auto ro = batch->try_to_read_only();
     if (!ro) { return nullptr; }
     if (ro->get_memory_space() == space) {
-      return std::make_unique<convertible_data_batch>(std::move(batch));
+      return std::make_unique<convertible_data_batch>(std::move(batch), _repo);
     }
 
     return nullptr;

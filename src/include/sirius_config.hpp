@@ -175,6 +175,24 @@ struct compression_config {
   /// call. Applies to both the pin-time compress path and the scan-time
   /// decompress converters.
   int column_threads{4};
+
+  // ── Spill-path compression (Phase 3) ──────────────────────────────────────
+
+  /// When true, GPU→HOST and GPU→DISK downgrades compress the batch with
+  /// Simpatico before writing to host/disk memory. Falls back to uncompressed
+  /// on any compression failure.
+  bool enable_spill_compression{false};
+
+  /// Beam width for the per-column explorer that runs on first spill from a
+  /// given operator output. Smaller values are faster but find less optimal
+  /// plans. Default 20 is a fast-path setting; the full default (100) is
+  /// better for offline profiling.
+  uint32_t spill_explore_beam_width{20};
+
+  /// Per-column byte cap for the spill-path explorer. Columns larger than this
+  /// are explored on a trimmed prefix so that the beam search stays within
+  /// device memory. Default 256 MiB.
+  std::size_t spill_explore_max_bytes{256ULL * 1024 * 1024};
 };
 
 struct sirius_config {

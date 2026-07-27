@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include <cucascade/data/data_repository.hpp>
+
 #include <cstddef>
 #include <optional>
 #include <shared_mutex>
@@ -71,15 +73,35 @@ class plan_register {
   /// Remove the per-(table, column) plan override if present.
   void clear_plan(const std::string& table_name, const std::string& column_name);
 
+  // ── Spill-path plan entries (keyed by shared_data_repository*) ──────────
+  //
+  // One plan per query-graph edge (operator output port). The repo pointer is
+  // stable for the lifetime of a query and uniquely identifies the output schema
+  // + data distribution. Plans are discovered lazily on first spill via
+  // simpatico::explore_column_compression and stored here for reuse on
+  // subsequent batches from the same repo.
+
+  /// Store the multi-column spill plan DSL for @p repo. Overwrites any previous entry.
+  void set_spill_plan(const cucascade::shared_data_repository* repo, std::string plan_dsl);
+
+  /// Remove the spill plan for @p repo.
+  void clear_spill_plan(const cucascade::shared_data_repository* repo);
+
+  /// Return the spill plan DSL for @p repo, or nullopt if none.
+  [[nodiscard]] std::optional<std::string> resolve_spill_plan(
+    const cucascade::shared_data_repository* repo) const;
+
   // ── Lifecycle ────────────────────────────────────────────────────────────
 
-  /// Remove all entries (table-level and per-column).
+  /// Remove all entries (table-level, per-column, and spill-path).
   void clear_all();
 
  private:
   mutable std::shared_mutex _mutex;
   std::unordered_map<std::string, std::string> _table_plans;  // table_name → full multi-col DSL
   std::unordered_map<std::string, std::string> _col_plans;    // "table::column" → single-col DSL
+  // repo* → multi-col spill DSL; keyed by pointer (stable within a query)
+  std::unordered_map<const cucascade::shared_data_repository*, std::string> _spill_plans;
 };
 
 /**

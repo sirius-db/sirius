@@ -64,11 +64,34 @@ void plan_register::clear_plan(const std::string& table_name, const std::string&
   _col_plans.erase(table_name + "::" + column_name);
 }
 
+void plan_register::set_spill_plan(const cucascade::shared_data_repository* repo,
+                                   std::string plan_dsl)
+{
+  std::unique_lock lock(_mutex);
+  _spill_plans[repo] = std::move(plan_dsl);
+}
+
+void plan_register::clear_spill_plan(const cucascade::shared_data_repository* repo)
+{
+  std::unique_lock lock(_mutex);
+  _spill_plans.erase(repo);
+}
+
+std::optional<std::string> plan_register::resolve_spill_plan(
+  const cucascade::shared_data_repository* repo) const
+{
+  std::shared_lock lock(_mutex);
+  auto it = _spill_plans.find(repo);
+  if (it != _spill_plans.end() && !it->second.empty()) { return it->second; }
+  return std::nullopt;
+}
+
 void plan_register::clear_all()
 {
   std::unique_lock lock(_mutex);
   _table_plans.clear();
   _col_plans.clear();
+  _spill_plans.clear();
 }
 
 std::optional<std::string> select_plan_blocks(const std::string& full_plan_dsl,
