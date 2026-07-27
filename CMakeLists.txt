@@ -597,6 +597,7 @@ endif()
 # cmake-format: off
 set(TEST_SOURCES
     test/cpp/compression/test_compression.cpp
+    test/cpp/compression/test_spill_compression.cpp
     test/cpp/config/test_config.cpp
     test/cpp/config/test_context.cpp
     test/cpp/config/test_object_store_config.cpp
