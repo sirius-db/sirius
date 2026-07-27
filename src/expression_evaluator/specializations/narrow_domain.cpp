@@ -106,21 +106,6 @@ __int128_t constant_host_value(sirius::ast::constant const& expr)
   return range->minimum;
 }
 
-template <typename T>
-evaluate_result finish_scalar(cudf::ast::tree& ast_tree,
-                              std::vector<std::unique_ptr<cudf::scalar>>& temp_scalars,
-                              T device_scalar,
-                              evaluation_mode mode)
-{
-  if (mode == evaluation_mode::AST) {
-    auto const& expr_ref       = ast_tree.emplace<cudf::ast::literal>(*device_scalar);
-    auto const temp_scalar_idx = temp_scalars.size();
-    temp_scalars.push_back(std::move(device_scalar));
-    return evaluate_result(ast_result(expr_ref, {temp_scalar_idx}, std::vector<std::size_t>{}));
-  }
-  return evaluate_result(std::move(device_scalar));
-}
-
 }  // namespace
 
 std::optional<cudf::data_type> expression_evaluator::narrow_domain_carrier(
@@ -148,14 +133,22 @@ std::optional<cudf::data_type> expression_evaluator::narrow_domain_carrier(
   return carrier;
 }
 
-evaluate_result expression_evaluator::evaluate_reference_passthrough(
-  sirius::ast::reference const& expr, evaluation_mode mode)
+evaluate_result expression_evaluator::evaluate_narrow_domain_operand(
+  sirius::ast::node const& operand,
+  std::optional<cudf::data_type> narrow_carrier,
+  evaluation_mode mode)
 {
-  if (mode == evaluation_mode::AST) {
-    auto const& col_expr = _ast_tree.emplace<cudf::ast::column_reference>(expr.column_index);
-    return evaluate_result(ast_result(col_expr));
+  if (!narrow_carrier) { return evaluate(operand, mode); }
+  if (operand.holds<sirius::ast::reference>()) {
+    // The reference passes through as its raw input column, bypassing restoration.
+    auto const& ref = operand.get<sirius::ast::reference>();
+    if (mode == evaluation_mode::AST) {
+      auto const& col_expr = _ast_tree.emplace<cudf::ast::column_reference>(ref.column_index);
+      return evaluate_result(ast_result(col_expr));
+    }
+    return evaluate_result(_input_table.column(ref.column_index));
   }
-  return evaluate_result(_input_table.column(expr.column_index));
+  return evaluate_constant_in_carrier(operand.get<sirius::ast::constant>(), *narrow_carrier, mode);
 }
 
 evaluate_result expression_evaluator::evaluate_constant_in_carrier(
@@ -168,42 +161,42 @@ evaluate_result expression_evaluator::evaluate_constant_in_carrier(
     case cudf::type_id::INT8: {
       auto scalar = std::make_unique<cudf::numeric_scalar<int8_t>>(
         static_cast<int8_t>(value), is_valid, _stream, _mr);
-      return finish_scalar(_ast_tree, _temp_scalars, std::move(scalar), mode);
+      return finish_scalar(std::move(scalar), mode);
     }
     case cudf::type_id::INT16: {
       auto scalar = std::make_unique<cudf::numeric_scalar<int16_t>>(
         static_cast<int16_t>(value), is_valid, _stream, _mr);
-      return finish_scalar(_ast_tree, _temp_scalars, std::move(scalar), mode);
+      return finish_scalar(std::move(scalar), mode);
     }
     case cudf::type_id::INT32: {
       auto scalar = std::make_unique<cudf::numeric_scalar<int32_t>>(
         static_cast<int32_t>(value), is_valid, _stream, _mr);
-      return finish_scalar(_ast_tree, _temp_scalars, std::move(scalar), mode);
+      return finish_scalar(std::move(scalar), mode);
     }
     case cudf::type_id::UINT8: {
       auto scalar = std::make_unique<cudf::numeric_scalar<uint8_t>>(
         static_cast<uint8_t>(value), is_valid, _stream, _mr);
-      return finish_scalar(_ast_tree, _temp_scalars, std::move(scalar), mode);
+      return finish_scalar(std::move(scalar), mode);
     }
     case cudf::type_id::UINT16: {
       auto scalar = std::make_unique<cudf::numeric_scalar<uint16_t>>(
         static_cast<uint16_t>(value), is_valid, _stream, _mr);
-      return finish_scalar(_ast_tree, _temp_scalars, std::move(scalar), mode);
+      return finish_scalar(std::move(scalar), mode);
     }
     case cudf::type_id::UINT32: {
       auto scalar = std::make_unique<cudf::numeric_scalar<uint32_t>>(
         static_cast<uint32_t>(value), is_valid, _stream, _mr);
-      return finish_scalar(_ast_tree, _temp_scalars, std::move(scalar), mode);
+      return finish_scalar(std::move(scalar), mode);
     }
     case cudf::type_id::DECIMAL32: {
       auto scalar = std::make_unique<cudf::fixed_point_scalar<numeric::decimal32>>(
         static_cast<int32_t>(value), numeric::scale_type{carrier.scale()}, is_valid, _stream, _mr);
-      return finish_scalar(_ast_tree, _temp_scalars, std::move(scalar), mode);
+      return finish_scalar(std::move(scalar), mode);
     }
     case cudf::type_id::DECIMAL64: {
       auto scalar = std::make_unique<cudf::fixed_point_scalar<numeric::decimal64>>(
         static_cast<int64_t>(value), numeric::scale_type{carrier.scale()}, is_valid, _stream, _mr);
-      return finish_scalar(_ast_tree, _temp_scalars, std::move(scalar), mode);
+      return finish_scalar(std::move(scalar), mode);
     }
     default:
       // narrow_domain_carrier only yields strict narrowings, so INT64/UINT64/DECIMAL128 (and any

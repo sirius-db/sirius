@@ -22,10 +22,6 @@
 #include <expression_evaluator/expression_evaluator.hpp>
 #include <sirius/exception.hpp>
 
-// cucascade
-#include <cucascade/cudf/gpu_data_representation.hpp>
-#include <data/data_batch_utils.hpp>
-
 // cudf
 #include <cudf/column/column_factories.hpp>
 #include <cudf/stream_compaction.hpp>
@@ -54,7 +50,6 @@ bool IsFixedWidth(cudf::data_type const& type)
 }  // namespace
 
 namespace sirius {
-using data_batch      = cucascade::data_batch;
 using evaluate_result = expression_evaluator::evaluate_result;
 using ast_result      = expression_evaluator::ast_result;
 
@@ -62,34 +57,31 @@ using ast_result      = expression_evaluator::ast_result;
 // ast_result
 //===----------------------------------------------------------------------===//
 
-expression_evaluator::ast_result::ast_result(expr_ref e,
-                                             std::vector<std::vector<std::size_t>> scalar_indices,
-                                             std::vector<std::vector<std::size_t>> column_indices)
-  : expr(e)
+ast_result expression_evaluator::compose(expr_ref e,
+                                         std::initializer_list<evaluate_result const*> children)
 {
-  auto const total_scalars = std::accumulate(
-    scalar_indices.begin(),
-    scalar_indices.end(),
-    std::size_t(0),
-    [](std::size_t sum, const std::vector<std::size_t>& vec) { return sum + vec.size(); });
-  temp_scalar_indices.reserve(total_scalars);
-  for (auto& vec : scalar_indices) {
-    temp_scalar_indices.insert(temp_scalar_indices.end(),
-                               std::make_move_iterator(vec.begin()),
-                               std::make_move_iterator(vec.end()));
+  ast_result result{e};
+  std::size_t total_scalars = 0;
+  std::size_t total_columns = 0;
+  for (auto const* child : children) {
+    if (!child->is_ast()) { continue; }
+    auto const& ast = std::get<ast_result>(child->payload);
+    total_scalars += ast.temp_scalar_indices.size();
+    total_columns += ast.temp_column_indices.size();
   }
-
-  auto const total_columns = std::accumulate(
-    column_indices.begin(),
-    column_indices.end(),
-    std::size_t(0),
-    [](std::size_t sum, const std::vector<std::size_t>& vec) { return sum + vec.size(); });
-  temp_column_indices.reserve(total_columns);
-  for (auto& vec : column_indices) {
-    temp_column_indices.insert(temp_column_indices.end(),
-                               std::make_move_iterator(vec.begin()),
-                               std::make_move_iterator(vec.end()));
+  result.temp_scalar_indices.reserve(total_scalars);
+  result.temp_column_indices.reserve(total_columns);
+  for (auto const* child : children) {
+    if (!child->is_ast()) { continue; }
+    auto const& ast = std::get<ast_result>(child->payload);
+    result.temp_scalar_indices.insert(result.temp_scalar_indices.end(),
+                                      ast.temp_scalar_indices.begin(),
+                                      ast.temp_scalar_indices.end());
+    result.temp_column_indices.insert(result.temp_column_indices.end(),
+                                      ast.temp_column_indices.begin(),
+                                      ast.temp_column_indices.end());
   }
+  return result;
 }
 
 //===----------------------------------------------------------------------===//
@@ -103,18 +95,6 @@ expression_evaluator::evaluate_result::get_expr() const
     throw std::runtime_error("[evaluate_result] Attempted to get expr from materialized result");
   }
   return std::get<ast_result>(payload).expr;
-}
-
-std::vector<std::size_t> expression_evaluator::evaluate_result::get_temp_scalar_indices() const
-{
-  if (is_ast()) { return std::get<ast_result>(payload).temp_scalar_indices; }
-  return {};
-}
-
-std::vector<std::size_t> expression_evaluator::evaluate_result::get_temp_column_indices() const
-{
-  if (is_ast()) { return std::get<ast_result>(payload).temp_column_indices; }
-  return {};
 }
 
 cudf::scalar const& expression_evaluator::evaluate_result::get_scalar() const
@@ -237,40 +217,16 @@ evaluate_result expression_evaluator::materialize_as_ast_column(
   return evaluate_result(ast_result(col_ref, std::vector<std::size_t>{}, {temp_column_idx}));
 }
 
-void expression_evaluator::reset_restored_reference_cache()
-{
-  for (auto const& entry : _restored_reference_cache) {
-    if (entry.temp_column_index < _temp_columns.size()) {
-      _temp_columns[entry.temp_column_index].reset();
-    }
-  }
-  _restored_reference_cache.clear();
-  _restored_reference_cast_count  = 0;
-  _narrow_domain_comparison_count = 0;
-}
-
-void expression_evaluator::release_temporaries(std::vector<std::size_t> const& scalar_indices,
-                                               std::vector<std::size_t> const& column_indices)
-{
-  for (auto const idx : scalar_indices) {
-    _temp_scalars[idx].reset();
-  }
-  for (auto const idx : column_indices) {
-    _temp_columns[idx].reset();
-  }
-}
-
 void expression_evaluator::release_temporaries(
-  std::vector<std::vector<std::size_t>> const& scalar_indices,
-  std::vector<std::vector<std::size_t>> const& column_indices)
+  std::initializer_list<evaluate_result const*> children)
 {
-  for (auto const& vec : scalar_indices) {
-    for (auto const idx : vec) {
+  for (auto const* child : children) {
+    if (!child->is_ast()) { continue; }
+    auto const& ast = std::get<ast_result>(child->payload);
+    for (auto const idx : ast.temp_scalar_indices) {
       _temp_scalars[idx].reset();
     }
-  }
-  for (auto const& vec : column_indices) {
-    for (auto const idx : vec) {
+    for (auto const idx : ast.temp_column_indices) {
       _temp_columns[idx].reset();
     }
   }
@@ -281,10 +237,13 @@ std::unique_ptr<cudf::table> expression_evaluator::evaluate(cudf::table_view inp
   _output_columns.clear();
   _output_columns.reserve(_ast_expressions.size());
 
-  // Reset AST state from any previous invocation so that the tree, temp scalars, and temp columns
-  // do not accumulate stale nodes across calls.
-  reset_restored_reference_cache();
-  _ast_tree = cudf::ast::tree{};
+  // Reset AST state from any previous invocation so that the tree, temp scalars, temp columns,
+  // the restored-reference cache over them, and the per-call instrumentation do not carry stale
+  // state across calls.
+  _restored_reference_cache.clear();
+  _restored_reference_cast_count  = 0;
+  _narrow_domain_comparison_count = 0;
+  _ast_tree                       = cudf::ast::tree{};
   _temp_scalars.clear();
   _temp_columns.clear();
 

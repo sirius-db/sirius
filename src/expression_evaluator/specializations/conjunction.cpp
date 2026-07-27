@@ -76,10 +76,7 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::conjunction const& a
       auto child = evaluate(*alt.children[i], evaluation_mode::AST);
       auto const& output_expr =
         _ast_tree.emplace<cudf::ast::operation>(ast_op, output.get_expr(), child.get_expr());
-      output = evaluate_result(
-        ast_result(output_expr,
-                   {output.get_temp_scalar_indices(), child.get_temp_scalar_indices()},
-                   {output.get_temp_column_indices(), child.get_temp_column_indices()}));
+      output = evaluate_result(compose(output_expr, {&output, &child}));
     }
 
     if (mode == evaluation_mode::AST) {
@@ -89,7 +86,7 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::conjunction const& a
     //===----------2: MATERIALIZE Mode, evaluate node with AST----------===//
     auto result_column = evaluate_ast(output.get_expr());
 
-    release_temporaries(output.get_temp_scalar_indices(), output.get_temp_column_indices());
+    release_temporaries({&output});
     return evaluate_result(std::move(result_column));
   }
 

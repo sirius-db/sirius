@@ -22,7 +22,6 @@
 // cudf
 #include <cudf/binaryop.hpp>
 #include <cudf/cudf_utils.hpp>
-#include <cudf/transform.hpp>
 
 namespace sirius {
 using evaluate_result = expression_evaluator::evaluate_result;
@@ -59,23 +58,12 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::between const& alt,
 
     //===----------1: AST Mode----------===//
     if (mode == evaluation_mode::AST) {
-      return evaluate_result(ast_result(between_expr,
-                                        {input.get_temp_scalar_indices(),
-                                         lower.get_temp_scalar_indices(),
-                                         upper.get_temp_scalar_indices()},
-                                        {input.get_temp_column_indices(),
-                                         lower.get_temp_column_indices(),
-                                         upper.get_temp_column_indices()}));
+      return evaluate_result(compose(between_expr, {&input, &lower, &upper}));
     }
 
     //===----------2: MATERIALIZE Mode, evaluate node with AST----------===//
     auto result_column = evaluate_ast(between_expr);
-    release_temporaries({input.get_temp_scalar_indices(),
-                         lower.get_temp_scalar_indices(),
-                         upper.get_temp_scalar_indices()},
-                        {input.get_temp_column_indices(),
-                         lower.get_temp_column_indices(),
-                         upper.get_temp_column_indices()});
+    release_temporaries({&input, &lower, &upper});
     return evaluate_result(std::move(result_column));
   }
 
@@ -116,6 +104,7 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::between const& alt,
                                               output_type,
                                               _stream,
                                               _mr);
+  if (mode == evaluation_mode::AST) { return materialize_as_ast_column(std::move(result_column)); }
   return evaluate_result(std::move(result_column));
 }
 

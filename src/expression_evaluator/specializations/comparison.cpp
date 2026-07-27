@@ -20,15 +20,10 @@
 #include <expression_evaluator/expression_evaluator.hpp>
 #include <sirius/exception.hpp>
 
-// duckdb
-#include <duckdb/common/exception.hpp>
-
 // cudf
 #include <cudf/ast/ast_operator.hpp>
 #include <cudf/binaryop.hpp>
-#include <cudf/cudf_utils.hpp>
 #include <cudf/scalar/scalar.hpp>
-#include <cudf/transform.hpp>
 
 // standard library
 #include <memory>
@@ -102,26 +97,17 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::comparison const& al
 
     //===----------1: AST Mode----------===//
     if (mode == evaluation_mode::AST) {
-      return evaluate_result(
-        ast_result(final_comp_expr,
-                   {left.get_temp_scalar_indices(), right.get_temp_scalar_indices()},
-                   {left.get_temp_column_indices(), right.get_temp_column_indices()}));
+      return evaluate_result(compose(final_comp_expr, {&left, &right}));
     }
 
     //===----------2: MATERIALIZE Mode, evaluate node with AST----------===//
     auto result_column = evaluate_ast(final_comp_expr);
 
-    release_temporaries({left.get_temp_scalar_indices(), right.get_temp_scalar_indices()},
-                        {left.get_temp_column_indices(), right.get_temp_column_indices()});
+    release_temporaries({&left, &right});
     return evaluate_result(std::move(result_column));
   }
 
   //===----------3: MATERIALIZE Mode, evaluate node with unary/binary ops----------===//
-  if (mode == evaluation_mode::AST) {
-    auto result = evaluate(alt, evaluation_mode::MATERIALIZE);
-    return materialize_as_ast_column(result.release_column());
-  }
-
   auto left =
     evaluate_narrow_domain_operand(*alt.left, narrow_carrier, evaluation_mode::MATERIALIZE);
   auto right =
@@ -141,6 +127,7 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::comparison const& al
     result_column = cudf::binary_operation(
       left.get_column_view(), right.get_column_view(), binary_op, output_type, _stream, _mr);
   }
+  if (mode == evaluation_mode::AST) { return materialize_as_ast_column(std::move(result_column)); }
   return evaluate_result(std::move(result_column));
 }
 }  // namespace sirius
