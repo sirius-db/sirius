@@ -121,6 +121,75 @@ slot_watchdog_result read_result(fs::path const& path)
   return result;
 }
 
+// ---------------------------------------------------------------------------
+// Concurrent-planning wrong-results repro (issue #1294, problem 2).
+//
+// The transparent capture is a single un-owned slot on the shared
+// SiriusContext, and plain Prepare() runs outside the query-lifecycle lock, so
+// two connections planning at the same time can interleave set/take and one
+// connection's prepared statement executes the OTHER connection's plan. Each
+// worker below prepares and executes queries whose scalar results are unique
+// to its own table and expression, so a cross-consumed plan shows up as a
+// wrong value (some runs surface the same interleaving as a lock-ordering
+// stall instead, which the parent's deadline catches).
+// ---------------------------------------------------------------------------
+std::uint64_t range_sum(std::uint64_t count)
+{
+  return count % 2 == 0 ? (count / 2) * (count - 1) : count * ((count - 1) / 2);
+}
+
+struct concurrent_worker_result {
+  std::string error;
+};
+
+void run_prepared_loop(duckdb::Connection& connection,
+                       std::string const& table_name,
+                       std::uint64_t base_sum,
+                       std::uint64_t multiplier,
+                       std::uint64_t offset,
+                       std::atomic<bool>& start,
+                       std::atomic<bool>& abort_flag,
+                       concurrent_worker_result& out)
+{
+  while (!start.load(std::memory_order_acquire)) {
+    std::this_thread::yield();
+  }
+  try {
+    for (std::uint64_t iteration = 0; iteration < 8; ++iteration) {
+      if (abort_flag.load(std::memory_order_acquire)) { break; }
+      auto const sql = "SELECT sum(i * " + std::to_string(multiplier) + ") + " +
+                       std::to_string(offset + iteration) + " FROM " + table_name + ";";
+      auto prepared = connection.Prepare(sql);
+      if (!prepared || prepared->HasError()) {
+        out.error = "Prepare failed: " + (prepared ? prepared->GetError() : "null result");
+        break;
+      }
+      duckdb::vector<duckdb::Value> parameters;
+      auto result = prepared->Execute(parameters, /*allow_stream_result=*/false);
+      if (!result || result->HasError()) {
+        out.error = "Execute failed: " + (result ? result->GetError() : "null result");
+        break;
+      }
+      auto chunk = result->Fetch();
+      if (!chunk || chunk->size() != 1 || chunk->ColumnCount() != 1) {
+        out.error = sql + " did not return exactly one scalar row";
+        break;
+      }
+      auto const expected = std::to_string(base_sum * multiplier + offset + iteration);
+      auto const actual   = chunk->GetValue(0, 0).ToString();
+      if (actual != expected) {
+        out.error = sql + " returned " + actual + ", expected " + expected;
+        break;
+      }
+    }
+  } catch (std::exception const& e) {
+    out.error = e.what();
+  } catch (...) {
+    out.error = "worker threw an unknown exception";
+  }
+  if (!out.error.empty()) { abort_flag.store(true, std::memory_order_release); }
+}
+
 // The A/B scenario for one variant. Runs inside the child process. Connection A
 // leaves a result unconsumed; connection B then issues a follow-up query that, on
 // the unfixed engine, waits (so this function does not return and the parent's
@@ -216,6 +285,62 @@ slot_watchdog_result run_scenario(std::string const& variant,
         out.error = "cached second Execute produced no first chunk";
         return out;
       }
+    } else if (variant == "concurrent_planning") {
+      if (!require_success(
+            a.Query("SET gpu_execution=true;").get(), "connection A SET gpu_execution=true", out)) {
+        return out;
+      }
+      if (!require_success(
+            b.Query("SET gpu_execution=true;").get(), "connection B SET gpu_execution=true", out)) {
+        return out;
+      }
+      constexpr std::uint64_t kCountA = 10000;
+      constexpr std::uint64_t kCountB = 12000;
+      if (!require_success(a.Query("CREATE TABLE plan_a AS SELECT range AS i FROM range(" +
+                                   std::to_string(kCountA) + ");")
+                             .get(),
+                           "CREATE plan_a",
+                           out)) {
+        return out;
+      }
+      if (!require_success(a.Query("CREATE TABLE plan_b AS SELECT range AS i FROM range(" +
+                                   std::to_string(kCountB) + ");")
+                             .get(),
+                           "CREATE plan_b",
+                           out)) {
+        return out;
+      }
+      if (!require_success(a.Query("CHECKPOINT;").get(), "CHECKPOINT plan tables", out)) {
+        return out;
+      }
+
+      out.b_started = true;
+      write_result(output_path, out);
+
+      std::atomic<bool> start{false};
+      std::atomic<bool> abort_flag{false};
+      concurrent_worker_result result_a;
+      concurrent_worker_result result_b;
+      std::thread thread_a([&]() {
+        run_prepared_loop(a, "plan_a", range_sum(kCountA), 1, 0, start, abort_flag, result_a);
+      });
+      std::thread thread_b([&]() {
+        run_prepared_loop(b, "plan_b", range_sum(kCountB), 2, 100, start, abort_flag, result_b);
+      });
+      start.store(true, std::memory_order_release);
+      thread_a.join();
+      thread_b.join();
+
+      if (!result_a.error.empty()) {
+        out.error = "connection A worker: " + result_a.error;
+        return out;
+      }
+      if (!result_b.error.empty()) {
+        out.error = "connection B worker: " + result_b.error;
+        return out;
+      }
+      out.b_completed = true;
+      return out;
     } else {
       out.error = "unknown variant: " + variant;
       return out;
@@ -359,4 +484,11 @@ TEST_CASE_METHOD(QueryLifecycleSlotFixture,
   SECTION("unconsumed streaming result (cross-connection)") { require_b_completes("stream"); }
   SECTION("unexecuted pending result") { require_b_completes("pending"); }
   SECTION("cached prepared, no rebind") { require_b_completes("cached_no_rebind"); }
+}
+
+TEST_CASE_METHOD(QueryLifecycleSlotFixture,
+                 "concurrent prepared planning returns each connection's own result",
+                 "[.][query_lifecycle][slot_leak]")
+{
+  require_b_completes("concurrent_planning");
 }
