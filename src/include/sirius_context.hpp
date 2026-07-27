@@ -90,6 +90,12 @@ class SiriusContext : public ClientContextState {
     /// from actual batch types, so a regression anywhere in the narrow-carrier
     /// chain drops it to zero.
     uint64_t partition_narrow_columns = 0;
+    /// Plan-time count of narrow scan sidecar targets the tier narrowing
+    /// policy flipped back to native: columns of a GPU-tier-backed scan with
+    /// no transport benefit whose uses reach a restoration (a column engaging
+    /// a narrow comparison still retracts when another use meets a boundary
+    /// restore; a column with no uses at all stays narrow and is not counted).
+    uint64_t scan_narrow_targets_retracted = 0;
   };
 
   SiriusContext();
@@ -347,6 +353,9 @@ class SiriusContext : public ClientContextState {
   /// \brief Record narrow-carrier columns crossing an engaged hash PARTITION.
   void record_compressed_materialization_partition_narrow_columns(uint64_t count = 1) noexcept;
 
+  /// \brief Record narrow scan targets flipped back to native by the tier narrowing policy.
+  void record_compressed_materialization_scan_narrow_targets_retracted(uint64_t count = 1) noexcept;
+
  private:
   void throw_if_not_initialized() const;
   void acquire_query_lifecycle_slot();
@@ -422,6 +431,7 @@ class SiriusContext : public ClientContextState {
   std::atomic<uint64_t> compressed_materialization_pin_columns_narrowed_count_{0};
   std::atomic<uint64_t> compressed_materialization_scan_sidecars_installed_count_{0};
   std::atomic<uint64_t> compressed_materialization_partition_narrow_columns_count_{0};
+  std::atomic<uint64_t> compressed_materialization_scan_narrow_targets_retracted_count_{0};
 };
 
 /// Installs the sink selected by `Config::LOG_BACKEND` (with `Config::LOG_*`).

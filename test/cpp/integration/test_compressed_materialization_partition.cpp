@@ -17,10 +17,12 @@
 // End-to-end coverage of narrow payload carriers crossing an engaged partitioned exchange.
 // The fixture forces multi-way hash partitioning on one GPU (tiny hash_partition_bytes) and
 // wires a dynamic filter onto the probe scan's join key (filtered build side), so it exercises
-// the column-granular dynamic-filter guard: the planned target key goes native at the scan
-// while the payload columns stay narrow through scan -> DYNAMIC_FILTER -> CONCAT -> PARTITION
-// -> hash join. The partition_narrow_columns counter — derived from actual batch types inside
-// the hash-partition path — is the engagement proof; a plan-shape case pins down the sidecar
+// the column-granular dynamic-filter guard and the tier narrowing policy together: the join-key
+// column goes native at the scan (on GPU tier the policy retracts it as a boundary restore, and
+// it is independently a guard target) while the payload columns — join-payload transport the
+// policy keeps — stay narrow through scan -> DYNAMIC_FILTER -> CONCAT -> PARTITION -> hash
+// join. The partition_narrow_columns counter — derived from actual batch types inside the
+// hash-partition path — is the engagement proof; a plan-shape case pins down the sidecar
 // stamps on the DYNAMIC_FILTER / GPU_SCAN leaf pair and the wrap-time copies, and a grouped
 // aggregation case proves narrow group keys cross the aggregate-side exchange.
 
@@ -50,6 +52,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -244,17 +247,24 @@ TEST_CASE(
         auto const pin_after = sirius::test::get_compressed_materialization_stats(con);
         REQUIRE(pin_after.pin_columns_narrowed > pin_before.pin_columns_narrowed);
 
-        // Flag-on: the guard keeps a (partially native) sidecar — the planned target key k is
-        // native, the payloads v and d stay narrow — and narrow payload columns cross the
-        // engaged probe-side hash partition. The pinned-narrow serve is cast-free (narrowed
-        // counter flat) while k restores to native during scan normalization.
-        auto const before = sirius::test::get_compressed_materialization_stats(con);
+        // Flag-on: the join keys are native at the scans (retracted by the tier policy on GPU
+        // tier, and t.k independently forced by the guard) while the payloads v and d — join
+        // transport the policy keeps on both tiers — stay narrow and cross the engaged
+        // probe-side hash partition. The pinned-narrow serve is cast-free (narrowed counter
+        // flat) while the keys restore to native during scan normalization.
+        bool const gpu_tier = std::string_view(tier) == "gpu";
+        auto const before   = sirius::test::get_compressed_materialization_stats(con);
         compare_gpu_vs_cpu(con, kJoinQuery);
         auto const after = sirius::test::get_compressed_materialization_stats(con);
         REQUIRE(after.scan_sidecars_installed > before.scan_sidecars_installed);
         REQUIRE(after.partition_narrow_columns > before.partition_narrow_columns);
         REQUIRE(after.scan_columns_narrowed == before.scan_columns_narrowed);
         REQUIRE(after.scan_columns_restored > before.scan_columns_restored);
+        if (gpu_tier) {
+          REQUIRE(after.scan_narrow_targets_retracted > before.scan_narrow_targets_retracted);
+        } else {
+          REQUIRE(after.scan_narrow_targets_retracted == before.scan_narrow_targets_retracted);
+        }
 
         // Flag-off contrast: no sidecars exist, so the narrow cache restores fully at the scan
         // and nothing narrow reaches the exchange.
@@ -385,23 +395,29 @@ TEST_CASE("gpu_execution - narrow group keys cross the aggregate exchange",
     require_ok(con.Query("CALL pin_table('" + fact_path.string() + "', tier='gpu', name='t');"),
                "pin fact");
 
-    // Flag-on: the narrow INT32 group key k crosses the engaged aggregate-side partition (50000
-    // groups of partial output against the small hash_partition_bytes). This fails if the
-    // HASH_GROUP_BY propagation case falls back to the native boundary or the aggregate wrap
-    // drops the sidecar. v is an aggregate input and restores below the aggregate.
+    // Flag-on: the narrow INT32 group key k earns group-key transport (the tier policy keeps it
+    // on this GPU-tier pin) and crosses the engaged aggregate-side partition (50000 groups of
+    // partial output against the small hash_partition_bytes). This fails if the HASH_GROUP_BY
+    // propagation case falls back to the native boundary or the aggregate wrap drops the
+    // sidecar. v is an aggregate input — a boundary restore the policy retracts — so it emits
+    // native at the scan.
     auto const before = sirius::test::get_compressed_materialization_stats(con);
     compare_gpu_vs_cpu(con, kGroupByQuery);
     auto const after = sirius::test::get_compressed_materialization_stats(con);
     REQUIRE(after.scan_sidecars_installed > before.scan_sidecars_installed);
     REQUIRE(after.partition_narrow_columns > before.partition_narrow_columns);
+    REQUIRE(after.scan_narrow_targets_retracted > before.scan_narrow_targets_retracted);
 
     // COUNT_VALID reads only k's validity mask, so counting the group key must not force its value
-    // carrier native before the aggregate-side exchange.
+    // carrier native before the aggregate-side exchange; with k the only scanned column and kept
+    // narrow, the tier policy retracts nothing.
     auto const count_before = sirius::test::get_compressed_materialization_stats(con);
     compare_gpu_vs_cpu(con, kCountValidGroupByQuery);
     auto const count_after = sirius::test::get_compressed_materialization_stats(con);
     REQUIRE(count_after.scan_sidecars_installed > count_before.scan_sidecars_installed);
     REQUIRE(count_after.partition_narrow_columns > count_before.partition_narrow_columns);
+    REQUIRE(count_after.scan_narrow_targets_retracted ==
+            count_before.scan_narrow_targets_retracted);
 
     // Flag-off contrast: everything restores at the scan; the exchange sees native batches.
     require_ok(con.Query("SET enable_compressed_materialization = false;"), "disable flag");

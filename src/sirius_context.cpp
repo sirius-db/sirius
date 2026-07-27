@@ -800,6 +800,9 @@ SiriusContext::get_compressed_materialization_stats() const noexcept
       compressed_materialization_scan_sidecars_installed_count_.load(std::memory_order_relaxed),
     .partition_narrow_columns =
       compressed_materialization_partition_narrow_columns_count_.load(std::memory_order_relaxed),
+    .scan_narrow_targets_retracted =
+      compressed_materialization_scan_narrow_targets_retracted_count_.load(
+        std::memory_order_relaxed),
   };
 }
 
@@ -831,6 +834,13 @@ void SiriusContext::record_compressed_materialization_partition_narrow_columns(
 {
   compressed_materialization_partition_narrow_columns_count_.fetch_add(count,
                                                                        std::memory_order_relaxed);
+}
+
+void SiriusContext::record_compressed_materialization_scan_narrow_targets_retracted(
+  uint64_t count) noexcept
+{
+  compressed_materialization_scan_narrow_targets_retracted_count_.fetch_add(
+    count, std::memory_order_relaxed);
 }
 
 namespace {

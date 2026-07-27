@@ -547,8 +547,10 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
     std::move(op.extra_info),
     std::move(op.parameters),
     std::move(op.virtual_columns));
-  if (physical_types.size() == node->types.size()) {
+  if (!physical_types.empty() && physical_types.size() == node->types.size()) {
     node->set_physical_types(std::move(physical_types));
+    node->sidecar_from_gpu_tier_pin =
+      pinned != nullptr && pinned->tier == cucascade::memory::Tier::GPU;
     if (sirius_state) { sirius_state->record_compressed_materialization_scan_sidecar_installed(); }
   }
   node->named_parameters = std::move(op.named_parameters);

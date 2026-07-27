@@ -97,6 +97,52 @@ narrow sidecar: correct (verification guards every cast) but it pays the per-bat
 cast cost until re-planned. Pin and unpin are not catalog events, so DuckDB does not invalidate
 such plans; this bounded staleness is accepted and documented rather than mechanized.
 
+### Tier-aware narrowing policy
+
+The residency gate is the mechanism deciding what CAN be narrow; `apply_tier_narrowing_policy` —
+the first pass of `apply_compressed_schema_passes` — is the policy deciding what SHOULD stay
+narrow for this query on this tier. A HOST-tier serve pays a host→GPU upload per batch that
+narrowing always shrinks, so host-tier-backed sidecars are never touched: only scans stamped
+`sidecar_from_gpu_tier_pin` at sidecar install time seed the analysis, making unpinned,
+pinned-native, and host-tier scans structurally invisible to the pass. A GPU-tier serve has no
+upload term, so each narrow column must justify itself through the plan.
+
+The pass walks the physical tree bottom-up with the same traversal and per-operator column maps
+the propagation pass uses (including DELIM_JOIN sub-trees), tracing each candidate column's
+carrier from its scan upward and accumulating four use flags:
+
+- **transport** — the carrier survives into a hash-join payload output (the feeder
+  CONCAT/PARTITION and the join gather move narrow bytes) or into a group-key output of an
+  eligible grouped aggregate (the exact preconditions of the HASH_GROUP_BY propagation case, so
+  the aggregate exchange moves narrow key bytes);
+- **narrow comparison** — a comparison or `BETWEEN` whose other operands are constants
+  representable in the planned carrier: the same eligibility the evaluator's narrow-domain path
+  applies, decided by the shared `constant_representable_in_carrier` predicate so the two cannot
+  drift;
+- **evaluator restore** — any other reference occurrence inside an evaluated expression, which
+  the evaluator restores unconditionally;
+- **boundary restore** — the carrier dies where propagation inserts a restore projection: join
+  keys, value-sensitive aggregate inputs, ineligible aggregates, unmodeled operators, entry into
+  a DELIM_JOIN sub-root (propagation restores the sub-root's children in place, so sub-root
+  operators award no transport), or survival to the plan root.
+
+The verdict per column is: keep narrow iff transport, or (no boundary restore and (narrow
+comparison or no evaluator restore)). Every other column's sidecar entry is flipped back to
+native through the normal sidecar install (an all-native result drops the sidecar) before
+propagation runs, so downstream passes never see the retracted targets. Retraction never
+re-narrows and never touches logical types; its entire residual cost is one widening cast per
+column per batch during scan normalization of the pinned-narrow chunks (counted by
+`scan_columns_restored`). Columns with no surviving use stay narrow — they are never
+materialized wide. An operator the classifier does not model is by construction one propagation
+restores at, so the default under uncertainty is native. Retractions are counted by the
+plan-time `scan_narrow_targets_retracted` counter.
+
+The policy commutes with the dynamic-filter guard in the propagation pass — both only ever flip
+narrow → native, so a guard target the policy already retracted is a no-op for the guard, and
+payload columns that no dynamic filter targets keep their transport verdicts — and it strictly
+reduces the work of zero-benefit pruning, which remains load-bearing for host-tier pins and for
+kept columns.
+
 Physical schemas propagate through operators that preserve column identity:
 
 - filters;
@@ -269,7 +315,10 @@ GPU and CPU results for a non-key decimal payload used both as a direct projecti
 arithmetic, and discriminate the residency-gate states through the observability counters: beside
 the serve-time scan-downcast and scan-restore counters there is a plan-time
 `scan_sidecars_installed` counter, counting table scans that received a narrow physical sidecar
-after the residency gate (a later pass may still clear or prune it), and a runtime
+after the residency gate (a later pass may still clear or prune it), a plan-time
+`scan_narrow_targets_retracted` counter, counting sidecar columns the tier narrowing policy
+flipped back to native (flat across host-tier pins, the observable proof the policy is inert
+there), and a runtime
 `partition_narrow_columns` counter, counting input-batch columns that crossed an engaged hash
 PARTITION with a carrier narrower than native — the single observable for the exchange
 pass-through, derived from actual batch types so any regression in the narrow-carrier chain drops

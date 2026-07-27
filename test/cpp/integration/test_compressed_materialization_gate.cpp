@@ -24,7 +24,11 @@
 // proves the gate engages identically when the parquet identity spans several
 // files (plan targets derive from the pinned entry's stored chunk carriers,
 // never from source statistics); a further test proves zero-benefit pruning
-// stays observable on pinned-backed sidecars.
+// stays observable on pinned-backed sidecars. GPU-tier pins additionally
+// engage the tier narrowing policy — columns whose only uses are restorations
+// retract to native at plan time (scan_narrow_targets_retracted) and widen
+// during scan normalization instead — while HOST-tier pins are structurally
+// invisible to that pass, so their serves stay cast-free.
 
 #include "compressed_materialization_test_common.hpp"
 #include "sirius_context.hpp"
@@ -155,7 +159,7 @@ TEST_CASE("gpu_execution - compressed materialization residency gate states end 
     auto sirius_ctx = con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
     REQUIRE(sirius_ctx);
 
-    SECTION("pinned-narrow serves narrow without serve-time casts")
+    SECTION("pinned-narrow serve is cast-free wherever the plan stays narrow")
     {
       for (auto const* tier : {"gpu", "host"}) {
         DYNAMIC_SECTION("tier = " << tier)
@@ -173,15 +177,26 @@ TEST_CASE("gpu_execution - compressed materialization residency gate states end 
           REQUIRE(entry_chunk_count(*entry_ptr) >= 3);
 
           // The gate installs a sidecar (the pin serves every column, narrowed
-          // in every chunk) and the serve is cast-free: the chunk carriers
-          // already equal the plan targets, so nothing narrows or restores
-          // during scan normalization.
-          auto const before = sirius::test::get_compressed_materialization_stats(con);
+          // in every chunk). The serve outcome is then tier-dependent: this
+          // query's narrow columns all die at the ORDER_BY boundary, so on
+          // GPU tier the narrowing policy retracts every target (no upload
+          // means no benefit without transport) and the narrow resident
+          // chunks widen during scan normalization, while on HOST tier the
+          // policy is inert and the serve is cast-free — the chunk carriers
+          // already equal the plan targets, so nothing narrows or restores.
+          bool const gpu_tier = std::string_view(tier) == "gpu";
+          auto const before   = sirius::test::get_compressed_materialization_stats(con);
           compare_gpu_vs_cpu(con, kPayloadQuery);
           auto const after = sirius::test::get_compressed_materialization_stats(con);
           REQUIRE(after.scan_sidecars_installed > before.scan_sidecars_installed);
           REQUIRE(after.scan_columns_narrowed == before.scan_columns_narrowed);
-          REQUIRE(after.scan_columns_restored == before.scan_columns_restored);
+          if (gpu_tier) {
+            REQUIRE(after.scan_narrow_targets_retracted > before.scan_narrow_targets_retracted);
+            REQUIRE(after.scan_columns_restored > before.scan_columns_restored);
+          } else {
+            REQUIRE(after.scan_narrow_targets_retracted == before.scan_narrow_targets_retracted);
+            REQUIRE(after.scan_columns_restored == before.scan_columns_restored);
+          }
 
           // Flag-off contrast — the discriminator that narrow data actually
           // flowed through the sidecar above: with the flag off no sidecar
@@ -253,13 +268,15 @@ TEST_CASE("gpu_execution - compressed materialization residency gate states end 
       REQUIRE(mid.scan_columns_narrowed == before.scan_columns_narrowed);
       REQUIRE(mid.scan_columns_restored == before.scan_columns_restored);
 
-      // A k-only scan is served from the pin, so the gate installs; the serve
-      // stays cast-free. (No restored assertion: k is filter+order-only here,
-      // so zero-benefit pruning legitimately restores it at the scan.)
+      // A k-only scan is served from the pin, so the gate installs; nothing
+      // ever narrows at serve time. k is filter+order-only on a GPU-tier pin,
+      // so the tier policy retracts its target at plan time (no restored
+      // assertion: the resident narrow chunks legitimately widen at the scan).
       compare_gpu_vs_cpu(con, "SELECT k FROM t WHERE k <= 150 ORDER BY k;");
       auto const after = sirius::test::get_compressed_materialization_stats(con);
       REQUIRE(after.scan_sidecars_installed > mid.scan_sidecars_installed);
       REQUIRE(after.scan_columns_narrowed == mid.scan_columns_narrowed);
+      REQUIRE(after.scan_narrow_targets_retracted > mid.scan_narrow_targets_retracted);
 
       require_ok(con.Query("CALL unpin_table('t');"), "unpin");
     }
@@ -318,15 +335,23 @@ TEST_CASE("gpu_execution - multi-file pinned-narrow serve installs the residency
         REQUIRE(entry_chunk_count(*entry_ptr) >= 4);
 
         // The gate installs a sidecar (targets derive from the entry's stored
-        // chunk carriers) and the serve is cast-free: the chunk carriers
-        // already equal the plan targets, so nothing narrows or restores
-        // during scan normalization.
-        auto const before = sirius::test::get_compressed_materialization_stats(con);
+        // chunk carriers) regardless of source-statistics availability. As in
+        // the single-file test, the query's narrow columns die at the
+        // ORDER_BY boundary, so GPU-tier pins retract them (normalization
+        // widens the resident chunks) while HOST-tier serves stay cast-free.
+        bool const gpu_tier = std::string_view(tier) == "gpu";
+        auto const before   = sirius::test::get_compressed_materialization_stats(con);
         compare_gpu_vs_cpu(con, kPayloadQuery);
         auto const after = sirius::test::get_compressed_materialization_stats(con);
         REQUIRE(after.scan_sidecars_installed > before.scan_sidecars_installed);
         REQUIRE(after.scan_columns_narrowed == before.scan_columns_narrowed);
-        REQUIRE(after.scan_columns_restored == before.scan_columns_restored);
+        if (gpu_tier) {
+          REQUIRE(after.scan_narrow_targets_retracted > before.scan_narrow_targets_retracted);
+          REQUIRE(after.scan_columns_restored > before.scan_columns_restored);
+        } else {
+          REQUIRE(after.scan_narrow_targets_retracted == before.scan_narrow_targets_retracted);
+          REQUIRE(after.scan_columns_restored == before.scan_columns_restored);
+        }
 
         // Flag-off contrast — the discriminator that narrow data actually
         // resides and flowed through the sidecar above: with the flag off no
@@ -339,6 +364,73 @@ TEST_CASE("gpu_execution - multi-file pinned-narrow serve installs the residency
         REQUIRE(off_after.scan_sidecars_installed == off_before.scan_sidecars_installed);
         REQUIRE(off_after.scan_columns_restored > off_before.scan_columns_restored);
         require_ok(con.Query("SET enable_compressed_materialization = true;"), "restore flag");
+
+        require_ok(con.Query("CALL unpin_table('t');"), "unpin");
+      }
+    }
+  }
+
+  fs::remove_all(tmp, ec);
+}
+
+TEST_CASE("gpu_execution - tier policy retracts restore-only columns on GPU tier only",
+          "[gpu_execution][parquet][compressed_materialization_gate]")
+{
+  pause_shared_envs();
+
+  auto tmp = fs::temp_directory_path() / ("sirius-compmat-tier-" + std::to_string(::getpid()));
+  std::error_code ec;
+  fs::remove_all(tmp, ec);
+  fs::create_directories(tmp);
+
+  auto parquet_path = tmp / "gate.parquet";
+  generate_fact_parquet(parquet_path);
+
+  auto yaml_path = tmp / "compmat_tier.yaml";
+  write_config(yaml_path, kConfigValues);
+  REQUIRE(fs::exists(yaml_path));
+
+  {
+    sirius::test::shared_test_env local_env(yaml_path);
+    auto con = local_env.make_connection();
+
+    require_ok(con.Query("SET enable_duckdb_fallback = false;"), "disable fallback");
+    require_ok(
+      con.Query("CREATE VIEW t AS SELECT * FROM read_parquet('" + parquet_path.string() + "');"),
+      "create view");
+    require_ok(con.Query("SET enable_compressed_materialization = true;"), "enable flag");
+
+    // Q1 shape: no transport and no narrow-domain comparison anywhere — k feeds modulo
+    // arithmetic, v feeds arithmetic and aggregates, d is an input of the AVG-ineligible
+    // aggregate — so every narrow-carrier use is a restoration.
+    constexpr char const* kQ1ShapeQuery =
+      "SELECT sum(v * 2) AS sv, avg(v) AS av, sum(d) AS sd FROM t WHERE (k % 2) = 0;";
+
+    for (auto const* tier : {"gpu", "host"}) {
+      DYNAMIC_SECTION("tier = " << tier)
+      {
+        require_ok(con.Query("CALL pin_table('" + parquet_path.string() + "', tier='" +
+                             std::string(tier) + "', name='t');"),
+                   "pin_table");
+
+        // Both tiers install the sidecar and never narrow at serve time. On GPU tier the
+        // narrowing policy retracts every column (a restoration-only plan is pure cost when the
+        // serve pays no upload), so the resident narrow chunks widen during scan normalization;
+        // on HOST tier the plan keeps every narrow target and the serve is cast-free — the
+        // restorations run downstream, in the evaluator and at the aggregate boundary.
+        bool const gpu_tier = std::string_view(tier) == "gpu";
+        auto const before   = sirius::test::get_compressed_materialization_stats(con);
+        compare_gpu_vs_cpu(con, kQ1ShapeQuery);
+        auto const after = sirius::test::get_compressed_materialization_stats(con);
+        REQUIRE(after.scan_sidecars_installed > before.scan_sidecars_installed);
+        REQUIRE(after.scan_columns_narrowed == before.scan_columns_narrowed);
+        if (gpu_tier) {
+          REQUIRE(after.scan_narrow_targets_retracted > before.scan_narrow_targets_retracted);
+          REQUIRE(after.scan_columns_restored > before.scan_columns_restored);
+        } else {
+          REQUIRE(after.scan_narrow_targets_retracted == before.scan_narrow_targets_retracted);
+          REQUIRE(after.scan_columns_restored == before.scan_columns_restored);
+        }
 
         require_ok(con.Query("CALL unpin_table('t');"), "unpin");
       }
@@ -386,13 +478,15 @@ TEST_CASE("gpu_execution - zero-benefit pruning stays discriminating on pinned-b
     // contract: a narrow-eligible pinned scan whose only uses are zero-benefit
     // emits native at the scan (resident narrow chunks restore during scan
     // normalization), while the residency-gate test's payload shape stays
-    // narrow. WHICH pass produces the native sidecar is pinned down by the
-    // planner unit tests in
+    // narrow. HOST-tier pins keep the tier narrowing policy structurally
+    // inert (asserted through the flat retraction counter), so the native
+    // sidecar here is pruning's own work; WHICH pass produces it is pinned
+    // down by the planner unit tests in
     // test/cpp/planner/test_compressed_schema_propagation.cpp ("pruning
     // removes only zero-benefit restores").
     SECTION("aggregate-only pinned scan ends native at the scan")
     {
-      auto pin = con.Query("CALL pin_table('" + fact_path.string() + "', tier='gpu', name='t');");
+      auto pin = con.Query("CALL pin_table('" + fact_path.string() + "', tier='host', name='t');");
       require_ok(pin, "pin_table");
 
       auto const before = sirius::test::get_compressed_materialization_stats(con);
@@ -401,6 +495,7 @@ TEST_CASE("gpu_execution - zero-benefit pruning stays discriminating on pinned-b
       REQUIRE(after.scan_sidecars_installed > before.scan_sidecars_installed);
       REQUIRE(after.scan_columns_narrowed == before.scan_columns_narrowed);
       REQUIRE(after.scan_columns_restored > before.scan_columns_restored);
+      REQUIRE(after.scan_narrow_targets_retracted == before.scan_narrow_targets_retracted);
 
       require_ok(con.Query("CALL unpin_table('t');"), "unpin");
     }
@@ -408,10 +503,10 @@ TEST_CASE("gpu_execution - zero-benefit pruning stays discriminating on pinned-b
     SECTION("join-key-only pinned scans end native at both scans")
     {
       auto pin_fact =
-        con.Query("CALL pin_table('" + fact_path.string() + "', tier='gpu', name='t');");
+        con.Query("CALL pin_table('" + fact_path.string() + "', tier='host', name='t');");
       require_ok(pin_fact, "pin fact");
       auto pin_dim =
-        con.Query("CALL pin_table('" + dim_path.string() + "', tier='gpu', name='o');");
+        con.Query("CALL pin_table('" + dim_path.string() + "', tier='host', name='o');");
       require_ok(pin_dim, "pin dim");
 
       auto const before = sirius::test::get_compressed_materialization_stats(con);
@@ -420,6 +515,7 @@ TEST_CASE("gpu_execution - zero-benefit pruning stays discriminating on pinned-b
       REQUIRE(after.scan_sidecars_installed >= before.scan_sidecars_installed + 2);
       REQUIRE(after.scan_columns_narrowed == before.scan_columns_narrowed);
       REQUIRE(after.scan_columns_restored > before.scan_columns_restored);
+      REQUIRE(after.scan_narrow_targets_retracted == before.scan_narrow_targets_retracted);
 
       require_ok(con.Query("CALL unpin_table('o');"), "unpin dim");
       require_ok(con.Query("CALL unpin_table('t');"), "unpin fact");

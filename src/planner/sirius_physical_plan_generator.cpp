@@ -923,7 +923,15 @@ sirius_physical_plan_generator::create_plan(duckdb::unique_ptr<duckdb::LogicalOp
   profiler.EndPhase();
 
   plan = fold_adjacent_projections(std::move(plan));
-  if (compressed_materialization_enabled(context)) { apply_compressed_schema_passes(plan); }
+  if (compressed_materialization_enabled(context)) {
+    auto const retracted = apply_compressed_schema_passes(plan);
+    if (retracted > 0) {
+      auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+      if (sirius_ctx) {
+        sirius_ctx->record_compressed_materialization_scan_narrow_targets_retracted(retracted);
+      }
+    }
+  }
   plan->verify();
 
   // Rewrite the plan tree to contain the GPU pipeline operators so the converter becomes a

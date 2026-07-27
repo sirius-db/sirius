@@ -18,6 +18,14 @@
 
 #include "op/sirius_physical_operator.hpp"
 
+#include <cudf/types.hpp>
+
+#include <vector>
+
+namespace duckdb {
+class SiriusContext;
+}  // namespace duckdb
+
 namespace sirius::planner {
 
 /**
@@ -26,15 +34,60 @@ namespace sirius::planner {
  *
  * Each operator carries an optional physical sidecar
  * (`sirius_physical_operator::set_physical_types`) describing narrower cuDF carriers for its output
- * columns; an empty sidecar means every column uses its native carrier. The passes here derive,
- * restore, and prune those sidecars after `sirius_plan_get` installs the residency-derived scan
- * sidecars. `sirius_physical_plan_generator::create_plan` invokes them through
+ * columns; an empty sidecar means every column uses its native carrier. The passes here decide,
+ * derive, restore, and prune those sidecars after `sirius_plan_get` installs the residency-derived
+ * scan sidecars, in the order `apply_tier_narrowing_policy`, `propagate_compressed_schema`,
+ * `restore_native_schema`, `prune_immediate_scan_restores`.
+ * `sirius_physical_plan_generator::create_plan` invokes them through
  * `apply_compressed_schema_passes` when `enable_compressed_materialization` is on; the individual
  * passes are exposed so planner contract tests can drive each one over a hand-built operator tree.
  *
- * Every pass takes the owning `duckdb::unique_ptr` slot by reference because restoration may
- * replace the slot's operator with a projection wrapping it.
+ * Every restoring pass takes the owning `duckdb::unique_ptr` slot by reference because restoration
+ * may replace the slot's operator with a projection wrapping it; `apply_tier_narrowing_policy`
+ * takes the operator directly because it only edits scan sidecars in place.
  */
+
+// Implementation details shared between the compressed-schema passes and the tier narrowing
+// policy; not part of the pass contract.
+
+/**
+ * @brief The native cuDF carrier of each of @p op 's logical output columns, or an empty vector
+ * when any column has no cuDF mapping. An empty result is indistinguishable from a legitimate
+ * zero-column schema, so callers guard by comparing sizes against the schema they pair it with;
+ * `apply_compressed_schema_passes` additionally rejects unmappable trees up front.
+ */
+std::vector<cudf::data_type> native_physical_schema(sirius::op::sirius_physical_operator const& op);
+
+/**
+ * @brief Install @p schema as @p op 's physical sidecar, normalizing an all-native schema to the
+ * empty sidecar so a nonempty sidecar always describes at least one narrowed column.
+ */
+void install_physical_schema(sirius::op::sirius_physical_operator& op,
+                             std::vector<cudf::data_type> schema);
+
+/**
+ * @brief Retract narrow scan targets that show no plan benefit for a GPU-resident pin.
+ *
+ * The residency gate is the mechanism deciding what CAN be narrow (carriers stored in the pinned
+ * cache); this pass is the policy deciding what SHOULD stay narrow for this query on this tier. A
+ * GPU-tier serve pays no host-to-GPU upload, so a narrow column earns its keep only through the
+ * plan itself: the pass walks the tree bottom-up with the same operator column maps
+ * `propagate_compressed_schema` uses (including DELIM_JOIN sub-trees) and classifies every use of
+ * each candidate column of a scan marked `sidecar_from_gpu_tier_pin`. A column keeps its narrow
+ * target iff it survives into a hash-join payload output or an eligible grouped-aggregate key
+ * output (transport benefit), or it engages a narrow-domain comparison/BETWEEN (representable
+ * constants against the planned carrier, the evaluator's `narrow_domain_carrier` shape) and no use
+ * would insert a boundary restore projection. Every other use -- evaluator restores in
+ * expressions, join keys, value-sensitive aggregate inputs, unmodeled operators, survival to the
+ * plan root -- costs a restoration, so the column's sidecar entry is flipped back to native through
+ * `install_physical_schema` (an all-native result drops the sidecar) and the pinned-narrow chunk
+ * instead widens once per batch during scan normalization. The verdict composes: a column that
+ * engages a narrow comparison still retracts when another use reaches a boundary restore, and a
+ * column with no uses at all keeps its narrow target. Host-tier-backed and sidecar-less scans are
+ * never visited: narrow always wins when serving shrinks the upload. Returns the number of
+ * retracted targets.
+ */
+std::size_t apply_tier_narrowing_policy(sirius::op::sirius_physical_operator& plan);
 
 /**
  * @brief Derive each operator's physical output sidecar bottom-up from its children.
@@ -89,10 +142,12 @@ void prune_immediate_scan_restores(duckdb::unique_ptr<sirius::op::sirius_physica
  * @brief Run the compressed-materialization pass pipeline over a complete plan.
  *
  * A tree with no physical sidecars returns immediately. Otherwise, when every logical type in the
- * tree (including DELIM_JOIN sub-trees) maps to a cuDF carrier, runs `propagate_compressed_schema`,
- * `restore_native_schema`, and `prune_immediate_scan_restores` in that order; an unmappable tree
- * instead clears every sidecar so the plan is entirely native.
+ * tree (including DELIM_JOIN sub-trees) maps to a cuDF carrier, runs `apply_tier_narrowing_policy`,
+ * `propagate_compressed_schema`, `restore_native_schema`, and `prune_immediate_scan_restores` in
+ * that order; an unmappable tree instead clears every sidecar so the plan is entirely native.
+ * Returns the number of narrow targets the tier policy retracted, for the caller to record.
  */
-void apply_compressed_schema_passes(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& plan);
+std::size_t apply_compressed_schema_passes(
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator>& plan);
 
 }  // namespace sirius::planner

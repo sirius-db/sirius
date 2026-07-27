@@ -134,6 +134,13 @@ class sirius_physical_table_scan : public sirius_physical_operator {
   //! The composite filter expression from the table filter set, if any
   std::unique_ptr<sirius::ast::node> filter_expr;
 
+  //! Persistent provenance: the physical sidecar `sirius_plan_get` installed on this scan came
+  //! from a GPU-resident pinned entry, so serving pays no host-to-GPU upload. Stamped once at
+  //! install time and never cleared, even when a later pass empties the sidecar — consumers (the
+  //! planner's `apply_tier_narrowing_policy`) additionally check `has_physical_overrides()`.
+  //! Host-tier-backed and never-sidecared scans leave it false.
+  bool sidecar_from_gpu_tier_pin = false;
+
   std::unique_ptr<operator_data> get_next_task_input_data() override;
 
   std::unique_ptr<operator_data> execute(const operator_data& input_data,

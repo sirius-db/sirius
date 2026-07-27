@@ -212,6 +212,7 @@ set(EXTENSION_SOURCES
     src/creator/task_creator.cpp
     src/downgrade/downgrade_executor.cpp
     src/expression/aggregate_id.cpp
+    src/expression/ast/constant_range.cpp
     src/expression/ast/node.cpp
     src/expression/ast/utils.cpp
     src/expression/from_duckdb.cpp
@@ -341,6 +342,7 @@ set(EXTENSION_SOURCES
     src/planner/sirius_plan_filter.cpp
     src/planner/sirius_plan_get.cpp
     src/planner/sirius_plan_limit.cpp
+    src/planner/sirius_plan_narrowing_policy.cpp
     src/planner/sirius_plan_order.cpp
     src/planner/sirius_plan_projection.cpp
     src/planner/sirius_plan_projection_utils.cpp
@@ -672,6 +674,7 @@ set(TEST_SOURCES
     test/cpp/planner/test_plan_tree_shape.cpp
     test/cpp/planner/test_projection_fold.cpp
     test/cpp/planner/test_sirius_read_parquet_scan.cpp
+    test/cpp/planner/test_tier_narrowing_policy.cpp
     test/cpp/pipeline/test_batch_lock_utils.cpp
     test/cpp/pipeline/test_gpu_pipeline_executor.cpp
     test/cpp/pipeline/test_oom_reschedule.cpp

@@ -56,12 +56,6 @@ std::optional<std::vector<cudf::data_type>> try_native_physical_schema(
   return schema;
 }
 
-std::vector<cudf::data_type> native_physical_schema(sirius::op::sirius_physical_operator const& op)
-{
-  auto schema = try_native_physical_schema(op);
-  return schema ? std::move(*schema) : std::vector<cudf::data_type>{};
-}
-
 bool native_physical_schema_is_mappable(sirius::op::sirius_physical_operator const& op)
 {
   return std::ranges::all_of(
@@ -133,13 +127,6 @@ void install_physical_schema(sirius::op::sirius_physical_operator& op,
                              std::vector<cudf::data_type> const& native)
 {
   op.set_physical_types(schema == native ? std::vector<cudf::data_type>{} : std::move(schema));
-}
-
-void install_physical_schema(sirius::op::sirius_physical_operator& op,
-                             std::vector<cudf::data_type> schema)
-{
-  auto const native = native_physical_schema(op);
-  install_physical_schema(op, std::move(schema), native);
 }
 
 /// Wrap @p slot in a projection that casts every column selected by @p should_restore whose
@@ -244,6 +231,19 @@ bool is_pure_reference_projection(sirius::op::sirius_physical_operator const& op
 }
 
 }  // namespace
+
+std::vector<cudf::data_type> native_physical_schema(sirius::op::sirius_physical_operator const& op)
+{
+  auto schema = try_native_physical_schema(op);
+  return schema ? std::move(*schema) : std::vector<cudf::data_type>{};
+}
+
+void install_physical_schema(sirius::op::sirius_physical_operator& op,
+                             std::vector<cudf::data_type> schema)
+{
+  auto const native = native_physical_schema(op);
+  install_physical_schema(op, std::move(schema), native);
+}
 
 void restore_native_schema(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot)
 {
@@ -592,16 +592,19 @@ void prune_immediate_scan_restores(duckdb::unique_ptr<sirius::op::sirius_physica
   }
 }
 
-void apply_compressed_schema_passes(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& plan)
+std::size_t apply_compressed_schema_passes(
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator>& plan)
 {
-  if (!plan || !compressed_schema_tree_has_overrides(*plan)) { return; }
-  if (compressed_schema_tree_is_mappable(*plan)) {
-    propagate_compressed_schema(plan);
-    restore_native_schema(plan);
-    prune_immediate_scan_restores(plan);
-  } else {
+  if (!plan || !compressed_schema_tree_has_overrides(*plan)) { return 0; }
+  if (!compressed_schema_tree_is_mappable(*plan)) {
     clear_compressed_schema_tree(plan);
+    return 0;
   }
+  auto const retracted = apply_tier_narrowing_policy(*plan);
+  propagate_compressed_schema(plan);
+  restore_native_schema(plan);
+  prune_immediate_scan_restores(plan);
+  return retracted;
 }
 
 }  // namespace sirius::planner
