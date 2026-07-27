@@ -472,7 +472,7 @@ class scoped_blocking_window_log_sink {
     }
   }
 
-  scoped_blocking_window_log_sink(scoped_blocking_window_log_sink const&) = delete;
+  scoped_blocking_window_log_sink(scoped_blocking_window_log_sink const&)            = delete;
   scoped_blocking_window_log_sink& operator=(scoped_blocking_window_log_sink const&) = delete;
 
   void arm() { sink_->arm(); }
@@ -900,12 +900,12 @@ bool run_ac3_attempt(duckdb::Connection& a,
                                "AC-3 large GPU aggregate",
                                std::ref(gpu_result));
 
-  auto const blocked = workers.wait_until_blocked(std::chrono::seconds{30});
-  auto const stats_at_block = sirius_context->get_transparent_execution_stats();
-  auto const gpu_execution_started =
-    blocked && stats_at_block.executions == stats_before.executions + 1 &&
-    sirius_context->is_query_lifecycle_active() &&
-    !gpu_result.completed.load(std::memory_order_acquire);
+  auto const blocked               = workers.wait_until_blocked(std::chrono::seconds{30});
+  auto const stats_at_block        = sirius_context->get_transparent_execution_stats();
+  auto const gpu_execution_started = blocked &&
+                                     stats_at_block.executions == stats_before.executions + 1 &&
+                                     sirius_context->is_query_lifecycle_active() &&
+                                     !gpu_result.completed.load(std::memory_order_acquire);
 
   if (!gpu_execution_started) {
     auto const hold_timed_out = workers.timed_out();
@@ -939,7 +939,7 @@ bool run_ac3_attempt(duckdb::Connection& a,
   } catch (...) {
     cpu_error = "AC-3 CPU probe threw an unknown exception";
   }
-  auto const gpu_completed_before_release = gpu_result.completed.load(std::memory_order_acquire);
+  auto const gpu_completed_before_release  = gpu_result.completed.load(std::memory_order_acquire);
   auto const hold_timed_out_before_release = workers.timed_out();
   workers.release();
   workers.join_all();
@@ -1404,9 +1404,8 @@ void run_ac8_worker_pressure(duckdb::DuckDB& db,
   }
   if (!wait_until(
         [&]() {
-          return workers.timed_out() ||
-                 context->get_transparent_execution_stats().executions ==
-                   stats_before.executions + 5;
+          return workers.timed_out() || context->get_transparent_execution_stats().executions ==
+                                          stats_before.executions + 5;
         },
         std::chrono::seconds{30})) {
     out.error = "AC-8 did not observe five execution attempts within 30s";
@@ -1561,10 +1560,9 @@ void run_ac9_cancelled_waiter(duckdb::Connection& holder_connection,
   if (!wait_until(
         [&]() {
           auto const stats = context->get_transparent_execution_stats();
-          return workers.timed_out() ||
-                 (stats.executions == stats_before.executions + 2 &&
-                  !holder_result.completed.load(std::memory_order_acquire) &&
-                  !waiter_result.completed.load(std::memory_order_acquire));
+          return workers.timed_out() || (stats.executions == stats_before.executions + 2 &&
+                                         !holder_result.completed.load(std::memory_order_acquire) &&
+                                         !waiter_result.completed.load(std::memory_order_acquire));
         },
         std::chrono::seconds{30})) {
     out.error = "AC-9 waiter did not enter the pre-acquire path within 30s";
@@ -1996,8 +1994,7 @@ void run_ac13_concurrent_logging(duckdb::Connection& a,
     if (!read_variant_log_lines(log_lines, out.error)) { return; }
     b_query_observed = std::any_of(log_lines.begin(), log_lines.end(), [](auto const& line) {
       return line.find("QueryBegin: instance=") != std::string::npos &&
-             line.find("+ 201") != std::string::npos &&
-             line.find("ac13_b") != std::string::npos;
+             line.find("+ 201") != std::string::npos && line.find("ac13_b") != std::string::npos;
     });
     if (b_query_observed && !result_a.completed.load(std::memory_order_acquire) &&
         !result_b.completed.load(std::memory_order_acquire)) {
