@@ -134,6 +134,37 @@ def rf2_statements(refresh_dir, n):
     ]
 
 
+def check_refresh_matches_base(cur, refresh_dir, n):
+    """Fail early if update set `n` does not belong to the input database.
+
+    The base tables and the refresh sets come from different generators, so a
+    set from the wrong scale factor still parses and inserts cleanly. Comparing
+    keys is not enough to catch it: orderkeys are 75% sparse and delete sets
+    start at the low end, so a larger set's keys all exist in a smaller
+    database too. Sizes do catch it, since each set covers 0.1% of ORDERS.
+    """
+    keys = (
+        f"SELECT column0 FROM read_csv("
+        f"'{refresh_file(refresh_dir, f'delete.{n}')}', delim='|', header=false)"
+    )
+    rows = sql(cur, f"SELECT count(*) FROM ({keys}) t")[0][0]
+    base = sql(cur, "SELECT count(*) FROM orders")[0][0]
+    expected = base / 1000.0
+    if not 0.5 * expected <= rows <= 2.0 * expected:
+        raise SystemExit(
+            f"Update set {n} does not match --input: delete.{n} holds {rows} "
+            f"keys, but ORDERS has {base} rows and each set should cover about "
+            f"{expected:.0f}. Check that the database and --refresh-dir are the "
+            "same scale factor."
+        )
+    found = sql(cur, f"SELECT count(*) FROM orders WHERE o_orderkey IN ({keys})")[0][0]
+    if found != rows:
+        raise SystemExit(
+            f"Update set {n} does not match --input: {found} of {rows} "
+            f"delete.{n} keys exist in ORDERS."
+        )
+
+
 def run_refresh(cur, statements, label):
     """Run one refresh function as a single transaction and return its wall time."""
     start = time.perf_counter()
@@ -355,6 +386,7 @@ def power_run(con, args, run_dir, writer):
                 log(f"  q{q}: {elapsed:.4f}s ({len(rows)} rows)")
             return times, rows_by_q
 
+        check_refresh_matches_base(cpu, args.refresh_dir, 1)
         counts_base = table_counts(cpu)
         log(f"Base counts: {counts_base}")
 
@@ -448,6 +480,13 @@ def power_run(con, args, run_dir, writer):
 
 
 def throughput_run(con, args, run_dir, writer, streams):
+    check_cur = con.cursor()
+    sql(check_cur, "SET gpu_execution = false")
+    try:
+        check_refresh_matches_base(check_cur, args.refresh_dir, 2)
+    finally:
+        check_cur.close()
+
     barrier = threading.Barrier(streams + 2)  # N query + 1 refresh + main
     errors = []
     stream_times = {i: {} for i in range(1, streams + 1)}
