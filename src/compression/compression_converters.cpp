@@ -26,6 +26,7 @@
 #include <rmm/mr/per_device_resource.hpp>
 
 #include <cuda_runtime.h>
+#include <nvtx3/nvtx3.hpp>
 
 #include <api/compressed_table_io.hpp>
 #include <api/simpatico_codegen.hpp>
@@ -169,6 +170,7 @@ std::unique_ptr<cucascade::idata_representation> decompress_host_to_gpu(
   rmm::cuda_stream_view stream,
   [[maybe_unused]] cucascade::memory::reservation* reservation)
 {
+  nvtx3::scoped_range nvtx_range{"sirius::compression::host_to_gpu"};
   auto& rep = source.cast<compressed_host_representation>();
 
   // Pull each compressed leaf buffer straight from the pinned host payload into
@@ -192,6 +194,7 @@ std::unique_ptr<cucascade::idata_representation> decompress_device_to_gpu(
   rmm::cuda_stream_view stream,
   [[maybe_unused]] cucascade::memory::reservation* reservation)
 {
+  nvtx3::scoped_range nvtx_range{"sirius::compression::device_to_gpu"};
   auto& rep           = source.cast<compressed_device_representation>();
   auto const& indices = rep.selected_indices();
   auto const& ct      = rep.table();

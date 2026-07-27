@@ -35,6 +35,7 @@
 #include <rmm/mr/per_device_resource.hpp>
 
 #include <cuda_runtime.h>
+#include <nvtx3/nvtx3.hpp>
 
 #include <api/compressed_table_io.hpp>
 #include <api/simpatico_codegen.hpp>
@@ -280,6 +281,7 @@ bool compress_and_stage_batch(cudf::table const& tbl,
                               std::string_view log_tag,
                               StageFn&& stage)
 {
+  nvtx3::scoped_range nvtx_range{"sirius::pin::compress_and_stage"};
   if (tbl.num_columns() == 0) { return false; }
   // Total device footprint of the batch (includes string chars/offsets and null
   // masks), so string columns count toward the threshold.
@@ -333,7 +335,10 @@ bool compress_and_stage_batch(cudf::table const& tbl,
     return false;
   }
 
-  stage(std::move(ct), std::move(header), buffers, payload_bytes, uncompressed_bytes);
+  {
+    nvtx3::scoped_range stage_range{"sirius::compression::stage_payload"};
+    stage(std::move(ct), std::move(header), buffers, payload_bytes, uncompressed_bytes);
+  }
   return true;
 }
 

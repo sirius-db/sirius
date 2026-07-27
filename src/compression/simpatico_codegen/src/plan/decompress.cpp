@@ -794,7 +794,7 @@ std::unique_ptr<cudf::column> decompress_column(PlanTree const& tree,
                                                 rmm::device_async_resource_ref mr,
                                                 std::string* error_out)
 {
-  nvtx3::scoped_range r_decompress{"decompress_column"};
+  nvtx3::scoped_range nvtx_range{"simpatico::decompress_column"};
 
   if (tree.nodes.empty() || tree.nodes[0].op != "input") {
     if (error_out) *error_out = "decompress: tree missing input root";
