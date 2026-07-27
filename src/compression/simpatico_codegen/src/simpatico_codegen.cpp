@@ -226,13 +226,13 @@ compressed_table compress_columns_parallel(cudf::table_view table,
   out.columns.resize(plans.size());
   run_column_workers(plans.size(), pool, [&](size_t i, rmm::cuda_stream_view stream) {
     std::string err;
-    auto compound =
+    auto plan_tree =
       compress_column(table.column(static_cast<cudf::size_type>(i)), plans[i], stream, mr, &err);
-    if (!compound) throw plan_error(err.empty() ? "compress failed" : err);
+    if (!plan_tree) throw plan_error(err.empty() ? "compress failed" : err);
     compressed_column col;
-    col.dtype    = table.column(static_cast<cudf::size_type>(i)).type();
-    col.num_rows = table.num_rows();
-    col.compound = std::move(compound);
+    col.dtype     = table.column(static_cast<cudf::size_type>(i)).type();
+    col.num_rows  = table.num_rows();
+    col.plan_tree = std::move(plan_tree);
     if (!column_names.empty()) col.name = column_names[i];
     out.columns[i] = std::move(col);
   });
@@ -270,7 +270,7 @@ std::unique_ptr<cudf::table> decompress_columns_parallel(compressed_table const&
   run_column_workers(
     static_cast<size_t>(table.num_columns()), pool, [&](size_t i, rmm::cuda_stream_view stream) {
       std::string err;
-      auto col = decompress_column(*table.columns[i].compound, stream, mr, &err);
+      auto col = decompress_column(*table.columns[i].plan_tree, stream, mr, &err);
       if (!col) throw plan_error(err.empty() ? "decompress failed" : err);
       cols[i] = apply_stored_dtype(std::move(col), table.columns[i].dtype);
     });
@@ -287,7 +287,7 @@ std::unique_ptr<cudf::table> decompress_columns_parallel(compressed_table const&
     auto const idx = selected[i];
     if (idx >= table.columns.size()) throw plan_error("selected column index out of range");
     std::string err;
-    auto col = decompress_column(*table.columns[idx].compound, stream, mr, &err);
+    auto col = decompress_column(*table.columns[idx].plan_tree, stream, mr, &err);
     if (!col) throw plan_error(err.empty() ? "decompress failed" : err);
     cols[i] = apply_stored_dtype(std::move(col), table.columns[idx].dtype);
   });
@@ -356,13 +356,13 @@ compressed_table compress_with_plan(cudf::table_view table,
   out.columns.reserve(plans.size());
   for (size_t i = 0; i < plans.size(); ++i) {
     std::string err;
-    auto compound =
+    auto plan_tree =
       compress_column(table.column(static_cast<cudf::size_type>(i)), plans[i], stream, mr, &err);
-    if (!compound) throw plan_error(err.empty() ? "compress failed" : err);
+    if (!plan_tree) throw plan_error(err.empty() ? "compress failed" : err);
     compressed_column col;
-    col.dtype    = table.column(static_cast<cudf::size_type>(i)).type();
-    col.num_rows = table.num_rows();
-    col.compound = std::move(compound);
+    col.dtype     = table.column(static_cast<cudf::size_type>(i)).type();
+    col.num_rows  = table.num_rows();
+    col.plan_tree = std::move(plan_tree);
     if (!column_names.empty()) col.name = column_names[i];
     out.columns.push_back(std::move(col));
   }
@@ -399,9 +399,9 @@ std::unique_ptr<cudf::table> decompress(const compressed_table& table,
   std::vector<std::unique_ptr<cudf::column>> cols;
   cols.reserve(table.num_columns());
   for (auto const& col : table.columns) {
-    if (!col.compound) throw plan_error("compressed_table column missing compound");
+    if (!col.plan_tree) throw plan_error("compressed_table column missing plan_tree");
     std::string err;
-    auto c = decompress_column(*col.compound, stream, mr, &err);
+    auto c = decompress_column(*col.plan_tree, stream, mr, &err);
     if (!c) throw plan_error(err.empty() ? "decompress failed" : err);
     cols.push_back(apply_stored_dtype(std::move(c), col.dtype));
   }
@@ -433,9 +433,9 @@ std::unique_ptr<cudf::table> decompress(const compressed_table& table,
   for (auto const idx : selected_columns) {
     if (idx >= table.columns.size()) throw plan_error("selected column index out of range");
     auto const& col = table.columns[idx];
-    if (!col.compound) throw plan_error("compressed_table column missing compound");
+    if (!col.plan_tree) throw plan_error("compressed_table column missing plan_tree");
     std::string err;
-    auto c = decompress_column(*col.compound, stream, mr, &err);
+    auto c = decompress_column(*col.plan_tree, stream, mr, &err);
     if (!c) throw plan_error(err.empty() ? "decompress failed" : err);
     cols.push_back(apply_stored_dtype(std::move(c), col.dtype));
   }

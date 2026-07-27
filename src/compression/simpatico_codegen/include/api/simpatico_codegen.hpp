@@ -19,7 +19,7 @@
 
 namespace simpatico {
 
-/// A single column after compression: metadata plus the compressed plan compound.
+/// A single column after compression: metadata plus the compressed plan tree.
 struct compressed_column {
   /// Optional name copied from the source table (populated when column names are
   /// passed to compress_with_plan).
@@ -29,7 +29,7 @@ struct compressed_column {
   /// Number of logical rows in the original column.
   std::int64_t num_rows = 0;
   /// Plan tree describing the compression layout; owns every compressed rep.
-  std::unique_ptr<PlanTree> compound;
+  std::unique_ptr<PlanTree> plan_tree;
 };
 
 /// Compressed representation of a cuDF table: one compressed_column per source

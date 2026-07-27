@@ -51,9 +51,9 @@ int main()
 
     auto ct = simpatico::compress_with_plan(table->view(), dsl);
     expect(ct.columns.size() == 1, "one compressed column");
-    expect(ct.columns[0].compound != nullptr, "compound present");
+    expect(ct.columns[0].plan_tree != nullptr, "plan_tree present");
 
-    auto const* rep = find_bitpack_leaf(*ct.columns[0].compound);
+    auto const* rep = find_bitpack_leaf(*ct.columns[0].plan_tree);
     expect(rep != nullptr, "bitpack leaf found");
     expect(rep->kind() == simpatico::OpId::Bitpack, "bitpack kind");
     expect(rep->decoded_type().id() == cudf::type_id::INT32, "decoded type");

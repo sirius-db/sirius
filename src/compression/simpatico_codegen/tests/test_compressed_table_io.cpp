@@ -103,9 +103,9 @@ void io_roundtrip(char const* label,
            (std::string(label) + ": num_rows col " + std::to_string(i)).c_str());
     expect(c1.name == c2.name, (std::string(label) + ": name col " + std::to_string(i)).c_str());
     // The plan is persisted structurally (node array), not as DSL text, so the
-    // compound's presence round-trips even though plan_dsl is not restored.
-    expect((c1.compound != nullptr) == (c2.compound != nullptr),
-           (std::string(label) + ": compound presence col " + std::to_string(i)).c_str());
+    // plan_tree's presence round-trips even though plan_dsl is not restored.
+    expect((c1.plan_tree != nullptr) == (c2.plan_tree != nullptr),
+           (std::string(label) + ": plan_tree presence col " + std::to_string(i)).c_str());
   }
 
   // Leaf structure survives (same kinds and buffer names).
@@ -352,7 +352,7 @@ void test_selective_decompression()
 
   // If an implementation accidentally decompresses every column before
   // projecting, this deliberately invalid unselected column makes that visible.
-  ct.columns[1].compound.reset();
+  ct.columns[1].plan_tree.reset();
 
   std::vector<std::size_t> reordered_with_duplicate{2, 0, 2};
   auto sequential = simpatico::decompress(ct, reordered_with_duplicate, stream, mr);

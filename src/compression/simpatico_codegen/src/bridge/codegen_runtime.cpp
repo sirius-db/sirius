@@ -757,7 +757,7 @@ static int encode_subtree_impl(const simpatico::CodegenHead& head,
                                const char* cxx_dtype,
                                std::int64_t num_rows,
                                std::uintptr_t data_ptr,
-                               simpatico::plan_compound_builder* builder,
+                               simpatico::fused_leaf_builder* builder,
                                rmm::cuda_stream_view stream,
                                rmm::device_async_resource_ref mr)
 {
@@ -1299,7 +1299,7 @@ bool encode_fused_subtree(PlanTree const& tree,
                           cudf::column_view input_col,
                           rmm::cuda_stream_view stream,
                           rmm::device_async_resource_ref mr,
-                          plan_compound_builder& builder,
+                          fused_leaf_builder& builder,
                           std::string* error_out,
                           CodegenHead* head_out)
 {

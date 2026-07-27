@@ -89,7 +89,7 @@ void place_rep_on_node(PlanTree& tree,
 
 // Move each NodeId-keyed leaf rep produced by an encode_fused_subtree() call onto
 // its owning PlanTree node.
-void place_fused_leaves(PlanTree& tree, plan_compound_builder& builder)
+void place_fused_leaves(PlanTree& tree, fused_leaf_builder& builder)
 {
   for (auto& [nodeid, rep] : builder.leaves) {
     auto& node = tree.nodes[nodeid];
@@ -340,7 +340,7 @@ bool CompressWalk::emit_fused_node(NodeId n, cudf::column_view col)
 {
   PlanNode const& root   = tree.nodes[n];
   ValueId const head_val = root.input_sources[0];
-  plan_compound_builder builder;
+  fused_leaf_builder builder;
   std::string jit_err;
   CodegenHead head;
   if (!encode_fused_subtree(tree, n, col, stream, mr, builder, &jit_err, &head)) {
@@ -604,13 +604,13 @@ std::unique_ptr<PlanTree> compress_column(cudf::column_view input,
   // parallelism is the caller's job (one column per worker thread, each on its
   // own stream). Intermediate device buffers are freed eagerly by the walk.
 
-  auto compound = std::make_unique<PlanTree>();
+  auto plan_tree = std::make_unique<PlanTree>();
   {
     auto tree = plan_tree_from_dsl(plan_dsl, error_out);
     if (!tree) return nullptr;
-    *compound = std::move(*tree);
+    *plan_tree = std::move(*tree);
   }
-  PlanTree& tree = *compound;
+  PlanTree& tree = *plan_tree;
 
   // consumer_by_input[V] = the node that consumes the value produced at V,
   // derived structurally from each node's input_sources (the (node, port) each
@@ -659,7 +659,7 @@ std::unique_ptr<PlanTree> compress_column(cudf::column_view input,
   }
 
   if (error_out) error_out->clear();
-  return compound;
+  return plan_tree;
 }
 
 namespace {
@@ -684,10 +684,10 @@ fused_op_channels canonical_fused_channels(std::string const& op)
 
 // Trial result for a single fused op: exposes the op's canonical output channels
 // by their DSL names (so the explorer/sweep emit valid cascades and chain onto
-// the real transformed streams) while owning the whole compound so the channel
+// the real transformed streams) while owning the whole plan tree so the channel
 // views stay valid and byte accounting stays complete.
 struct single_op_representation : compressed_representation {
-  std::unique_ptr<PlanTree> compound;
+  std::unique_ptr<PlanTree> plan_tree;
   std::vector<compressible_output> chans;
 
   single_op_representation(cudf::data_type t, cudf::size_type n) : compressed_representation(t, n)
@@ -704,8 +704,8 @@ struct single_op_representation : compressed_representation {
   size_t compressed_size_bytes(rmm::cuda_stream_view stream) const override
   {
     size_t total = 0;
-    if (!compound) return total;
-    for (auto const& node : compound->nodes) {
+    if (!plan_tree) return total;
+    for (auto const& node : plan_tree->nodes) {
       if (node.rep) total += node.rep->compressed_size_bytes(stream);
       for (auto const& [path, rep] : node.channels) {
         if (rep) total += rep->compressed_size_bytes(stream);
@@ -770,15 +770,15 @@ std::unique_ptr<compressed_representation> compress_single_op(std::string const&
       dsl += "\n" + op_name + "." + c + " -> identity";
   }
 
-  auto compound = compress_column(input, dsl, stream, mr, error_out);
-  if (!compound) return nullptr;
+  auto plan_tree = compress_column(input, dsl, stream, mr, error_out);
+  if (!plan_tree) return nullptr;
 
   // Locate the op node (index 1 for a single-step plan).
   PlanNode* op_node  = nullptr;
   NodeId op_node_idx = 0;
-  for (std::size_t i = 1; i < compound->nodes.size(); ++i) {
-    if (compound->nodes[i].op == op_name) {
-      op_node     = &compound->nodes[i];
+  for (std::size_t i = 1; i < plan_tree->nodes.size(); ++i) {
+    if (plan_tree->nodes[i].op == op_name) {
+      op_node     = &plan_tree->nodes[i];
       op_node_idx = static_cast<NodeId>(i);
       break;
     }
@@ -815,8 +815,8 @@ std::unique_ptr<compressed_representation> compress_single_op(std::string const&
 
     bool found = false;
 
-    for (std::size_t j = 1; j < compound->nodes.size() && !found; ++j) {
-      auto& nj = compound->nodes[j];
+    for (std::size_t j = 1; j < plan_tree->nodes.size() && !found; ++j) {
+      auto& nj = plan_tree->nodes[j];
       if (nj.op != "identity" || nj.input_sources.empty()) continue;
       if (nj.input_sources[0] != chan_val || !nj.rep) continue;
       auto leaf_chans = nj.rep->named_channels(stream);
@@ -855,7 +855,7 @@ std::unique_ptr<compressed_representation> compress_single_op(std::string const&
     }
   }
 
-  result->compound = std::move(compound);
+  result->plan_tree = std::move(plan_tree);
   return result;
 }
 

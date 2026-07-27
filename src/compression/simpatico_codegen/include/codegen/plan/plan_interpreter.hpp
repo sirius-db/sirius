@@ -38,7 +38,7 @@ struct RawPassthroughLeaf {
   std::unique_ptr<compressed_representation> rep;
 };
 
-struct plan_compound_builder {
+struct fused_leaf_builder {
   std::unordered_map<NodeId, std::unique_ptr<compressed_representation>> leaves;
   std::vector<RawPassthroughLeaf> raw_passthrough_leaves;
 };
@@ -78,7 +78,7 @@ std::unique_ptr<compressed_representation> compress_single_op(std::string const&
                                                               rmm::device_async_resource_ref mr,
                                                               std::string* error_out);
 
-/// Decompress a compound produced by compress_column.  A single post-order
+/// Decompress a plan tree produced by compress_column.  A single post-order
 /// walk over the plan tree: each codegen-fused subtree root is inverted by one
 /// JIT-compiled kernel (``dispatch_codegen_subtree``) and every other step by
 /// its rep's own decompress().  Runs entirely on ``stream``.

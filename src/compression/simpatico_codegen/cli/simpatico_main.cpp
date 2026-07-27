@@ -17,7 +17,7 @@
 
 #include "api/compressed_table_io.hpp"
 #include "api/simpatico_codegen.hpp"
-#include "codegen/plan/plan_interpreter.hpp"  // plan_compound, render_plan_tree
+#include "codegen/plan/plan_interpreter.hpp"  // fused_leaf_builder, render_plan_tree
 #include "codegen/util/stream_pool.hpp"
 #include "explore/compression_explorer.hpp"
 
@@ -436,8 +436,8 @@ std::size_t rep_bytes(simpatico::compressed_representation const* rep,
   return rep ? rep->compressed_size_bytes(stream) : 0;
 }
 
-std::size_t compound_compressed_bytes(simpatico::PlanTree const& tree,
-                                      rmm::cuda_stream_view stream = cudf::get_default_stream())
+std::size_t plan_tree_compressed_bytes(simpatico::PlanTree const& tree,
+                                       rmm::cuda_stream_view stream = cudf::get_default_stream())
 {
   std::size_t total = 0;
   for (auto const& node : tree.nodes) {
@@ -453,7 +453,7 @@ std::size_t compressed_table_bytes(simpatico::compressed_table const& ct,
 {
   std::size_t total = 0;
   for (auto const& col : ct.columns)
-    if (col.compound) total += compound_compressed_bytes(*col.compound, stream);
+    if (col.plan_tree) total += plan_tree_compressed_bytes(*col.plan_tree, stream);
   return total;
 }
 
@@ -1068,7 +1068,7 @@ int run_compress(int argc, char** argv)
   std::size_t input_b = table_input_bytes(loaded.table->view(), stream);
   std::size_t comp_b  = 0;
   for (auto const& col : ct.columns)
-    if (col.compound) comp_b += compound_compressed_bytes(*col.compound, stream);
+    if (col.plan_tree) comp_b += plan_tree_compressed_bytes(*col.plan_tree, stream);
 
   std::printf("compressed %zu -> %zu bytes (%.3fx)  -> %s\n",
               input_b,
@@ -1230,7 +1230,7 @@ int run_plan(int argc, char** argv)
     if (ci > 0) std::printf("---\n");
     auto const& col = ct.columns[ci];
     std::printf("# column %zu: %s\n", ci, col.name.value_or("").c_str());
-    if (col.compound) std::printf("%s", simpatico::render_plan_tree(*col.compound).c_str());
+    if (col.plan_tree) std::printf("%s", simpatico::render_plan_tree(*col.plan_tree).c_str());
   }
   return 0;
 }

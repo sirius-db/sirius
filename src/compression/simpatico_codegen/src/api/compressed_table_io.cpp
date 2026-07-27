@@ -541,9 +541,9 @@ static compressed_table reconstruct_from_records(std::vector<ColRecord>& recs,
 
     if (cr.tree.nodes.empty()) continue;  // column stored without a plan
 
-    auto compound = std::make_unique<PlanTree>();
-    *compound     = std::move(cr.tree);
-    auto& nodes   = compound->nodes;
+    auto plan_tree = std::make_unique<PlanTree>();
+    *plan_tree     = std::move(cr.tree);
+    auto& nodes    = plan_tree->nodes;
 
     for (std::size_t li = 0; li < cr.leaf_descs.size(); ++li) {
       auto const& ld    = cr.leaf_descs[li];
@@ -570,8 +570,8 @@ static compressed_table reconstruct_from_records(std::vector<ColRecord>& recs,
       }
     }
 
-    compute_input_sources(*compound);
-    out_col.compound = std::move(compound);
+    compute_input_sources(*plan_tree);
+    out_col.plan_tree = std::move(plan_tree);
   }
 
   return result;
@@ -716,11 +716,11 @@ std::vector<std::vector<leaf_desc>> compressed_table::describe(rmm::cuda_stream_
   result.reserve(columns.size());
   for (auto const& col : columns) {
     std::vector<leaf_desc> descs;
-    if (!col.compound) {
+    if (!col.plan_tree) {
       result.push_back({});
       continue;
     }
-    auto const& nodes = col.compound->nodes;
+    auto const& nodes = col.plan_tree->nodes;
     for (std::uint32_t ni = 0; ni < nodes.size(); ++ni) {
       auto const& node = nodes[ni];
       if (node.rep) {
@@ -779,7 +779,7 @@ std::string build_compressed_table_header(compressed_table const& table,
 
     // Structural plan tree (identical layout to the file header, so the same
     // parser reconstructs it): the node array is the source of truth on read.
-    PlanTree const& tree = col.compound ? *col.compound : kEmptyTree;
+    PlanTree const& tree = col.plan_tree ? *col.plan_tree : kEmptyTree;
     push_le(hdr, static_cast<std::uint16_t>(tree.nodes.size()));
     for (auto const& node : tree.nodes)
       push_node(hdr, node);

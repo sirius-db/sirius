@@ -40,8 +40,8 @@ using simpatico::split_plan_dsl;
 void verify_plan_tree(compressed_table const& ct, char const* label)
 {
   for (auto const& col : ct.columns) {
-    expect(col.compound != nullptr, (std::string(label) + ": null compound").c_str());
-    auto const& tree = *col.compound;
+    expect(col.plan_tree != nullptr, (std::string(label) + ": null plan_tree").c_str());
+    auto const& tree = *col.plan_tree;
     expect(tree.nodes.size() >= 2,
            (std::string(label) + ": PlanTree not built (need >= 2 nodes)").c_str());
     expect(tree.nodes[0].op == "input",
@@ -268,7 +268,7 @@ int main()
       auto ct = roundtrip_once(t->view(), dsl, 1, "for_bitpack");
       expect(ct.columns.size() == 2, "for_bitpack: column count");
       for (auto const& col : ct.columns) {
-        expect(col.compound != nullptr, "for_bitpack: compound");
+        expect(col.plan_tree != nullptr, "for_bitpack: plan_tree");
       }
       roundtrip_once(t->view(), dsl, 2, "for_bitpack_mt");
     }
@@ -330,7 +330,7 @@ int main()
         "-> bitjoin_f32 -> rejoined\n";
       auto ct = compress_with_plan(
         t->view(), dsl, cudf::get_default_stream(), rmm::mr::get_current_device_resource_ref());
-      auto& tree   = *ct.columns[0].compound;
+      auto& tree   = *ct.columns[0].plan_tree;
       auto bitjoin = std::find_if(tree.nodes.begin(), tree.nodes.end(), [](auto const& node) {
         return node.op == "bitjoin_f32";
       });

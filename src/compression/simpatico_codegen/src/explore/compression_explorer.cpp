@@ -131,8 +131,8 @@ struct ranked_candidate {
 // ---------------------------------------------------------------------------
 
 // Sum of every stored leaf's compressed bytes — the same accounting
-// `benchmark`'s `compound_compressed_bytes` uses, so the two never drift.
-size_t compound_compressed_bytes(PlanTree const& tree, rmm::cuda_stream_view stream)
+// `benchmark`'s `plan_tree_compressed_bytes` uses, so the two never drift.
+size_t plan_tree_compressed_bytes(PlanTree const& tree, rmm::cuda_stream_view stream)
 {
   size_t total = 0;
   for (auto const& node : tree.nodes) {
@@ -168,12 +168,12 @@ bool measure_compressed_bytes(cudf::column_view input,
                               std::string* err_out)
 {
   std::string err;
-  auto compound = compress_column(input, plan_dsl, stream, mr, &err);
-  if (!compound) {
+  auto plan_tree = compress_column(input, plan_dsl, stream, mr, &err);
+  if (!plan_tree) {
     if (err_out) *err_out = "compress_column: " + err;
     return false;
   }
-  compressed_bytes_out = compound_compressed_bytes(*compound, stream);
+  compressed_bytes_out = plan_tree_compressed_bytes(*plan_tree, stream);
   return true;
 }
 
@@ -186,19 +186,19 @@ bool round_trip_time_rr(cudf::column_view input,
                         size_t& compressed_bytes_out,
                         std::string* err_out)
 {
-  std::unique_ptr<PlanTree> compound;
+  std::unique_ptr<PlanTree> plan_tree;
   std::string err;
   compress_ms_out = time_cuda_ms(
-    stream.value(), [&] { compound = compress_column(input, plan_dsl, stream, mr, &err); });
-  if (!compound) {
+    stream.value(), [&] { plan_tree = compress_column(input, plan_dsl, stream, mr, &err); });
+  if (!plan_tree) {
     if (err_out) *err_out = "compress_column: " + err;
     return false;
   }
-  compressed_bytes_out = compound_compressed_bytes(*compound, stream);
+  compressed_bytes_out = plan_tree_compressed_bytes(*plan_tree, stream);
 
   std::unique_ptr<cudf::column> decompressed;
   decompress_ms_out = time_cuda_ms(
-    stream.value(), [&] { decompressed = decompress_column(*compound, stream, mr, &err); });
+    stream.value(), [&] { decompressed = decompress_column(*plan_tree, stream, mr, &err); });
   if (!decompressed) {
     if (err_out) *err_out = "decompress_column: " + err;
     return false;

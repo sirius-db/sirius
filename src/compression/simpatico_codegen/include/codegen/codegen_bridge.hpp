@@ -45,7 +45,7 @@ bool encode_fused_subtree(PlanTree const& tree,
                           cudf::column_view input_col,
                           rmm::cuda_stream_view stream,
                           rmm::device_async_resource_ref mr,
-                          plan_compound_builder& builder,
+                          fused_leaf_builder& builder,
                           std::string* error_out,
                           CodegenHead* head_out = nullptr);
 
