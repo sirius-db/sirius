@@ -220,21 +220,26 @@ run, QphH, refresh functions, or a "TPC-H official"/"spec" benchmark.
 - Refresh sets come from `generate_tpch_refresh.sh` (classic dbgen `-U`): `orders.tbl.u*`,
   `lineitem.tbl.u*`, `delete.*` under `test_datasets/tpch_refresh_sf<SF>/`. Need at least
   `streams + 1` sets (set 1 = power run; sets 2..N+1 = throughput streams).
+- With varied predicates, per-stream query sets come from `generate_tpch_queries.sh` (`qgen`):
+  `stream<N>.sql` under `test_datasets/tpch_queries_sf<SF>/`, streams 0..N (0 = power run).
 
 ```bash
 # One-time per SF: generate refresh sets (num_sets >= streams + 1)
 ./test/tpch_performance/generate_tpch_refresh.sh <SF> <num_sets>   # -> test_datasets/tpch_refresh_sf<SF>/
 
+# Only for varied predicates: per-stream query sets from qgen (streams 0..N)
+./test/tpch_performance/generate_tpch_queries.sh <SF> <streams>    # -> test_datasets/tpch_queries_sf<SF>/
+
 export SIRIUS_CONFIG_FILE=/path/to/config.yaml
 pixi run python test/tpch_performance/tpch_power_throughput.py \
     --sf <SF> --input <base.duckdb> --refresh-dir <refresh_dir> \
-    --mode both --pin gpu|host [--streams N]
+    --mode both --pin gpu|host [--streams N] [--vary-predicates --query-dir <dir>]
 ```
 
 **Flags** (full reference in `test/tpch_performance/CLAUDE.md`): `--mode power|throughput|both`
 (default `both`), `--streams N` (default: spec minimum for SF — SF1→2, SF10→3, SF30→4, SF100→5),
 `--pin gpu|host` (always one of these), `--vary-predicates/--no-vary-predicates` (default fixed;
-varied draws per-stream substitution parameters and rejects `--validation`), `--param-seed N`,
+varied runs per-stream qgen parameters and rejects `--validation`), `--query-dir <dir>`,
 `--validation/--no-validation` (fixed predicates only, default on; the power run diffs GPU vs a
 same-process DuckDB CPU cursor after RF1 and after RF2), `--baseline-pass/--no-baseline-pass`
 (default on; adds the clean pre-refresh timing pass so delta/mask overhead is attributable),
@@ -305,8 +310,11 @@ option) and ask for the rest. Mark sensible defaults "(Recommended)".
 1. **Mode** (`--mode`): `power`, `throughput`, or `both` (default `both`). In `both` the
    throughput run continues on the same pinned DB right after the power run, with no unpin/repin.
 2. **Predicates** (`--vary-predicates`): fixed for every stream (Recommended; required for
-   validation) or varied per stream (spec-style draws like qgen, seeded via `--param-seed`;
-   validation not supported). Always ask this — it decides whether validation is even possible.
+   validation) or varied per stream (each stream's own qgen parameters — what an official run
+   requires; validation not supported). Always ask this — it decides whether validation is even
+   possible. Varied also needs a `--query-dir` of `stream<N>.sql` files: ask where it lives, and
+   only generate with `generate_tpch_queries.sh <SF> <num_streams>` once the user confirms none
+   exists.
 3. **Pin tier** (`--pin`): `gpu` or `host`. This run is always pinned; the only choice is the
    tier. Prefer `host` at large SF, since pinning all 8 tables to GPU can OOM and disk spill is
    off by default.
@@ -324,5 +332,5 @@ if generation was confirmed), before running.
 
 **Environment prerequisites** (verify yourself; not user questions):
 - Sirius extension built (`build/release/extension/sirius/sirius.duckdb_extension`).
-- `tpch-dbgen` available for refresh generation (`test_datasets/tpch-dbgen/dbgen`; the script
-  auto-unzips it from `test_datasets/tpch-dbgen.zip` if missing).
+- `tpch-dbgen` available for refresh and query generation (`test_datasets/tpch-dbgen/`; both
+  scripts auto-unzip and build `dbgen`/`qgen` from `test_datasets/tpch-dbgen.zip` if missing).

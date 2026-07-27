@@ -66,7 +66,16 @@ STREAM_PERMUTATIONS = {
 }
 
 # TPC-H spec table 5.3.4: minimum number of throughput query streams per scale factor.
-MIN_STREAMS_BY_SF = ((1, 2), (10, 3), (30, 4), (100, 5), (300, 6), (1000, 7))
+MIN_STREAMS_BY_SF = (
+    (1, 2),
+    (10, 3),
+    (30, 4),
+    (100, 5),
+    (300, 6),
+    (1000, 7),
+    (3000, 8),
+    (10000, 9),
+)
 
 
 def stream_order(stream: int) -> tuple:

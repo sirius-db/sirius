@@ -30,8 +30,9 @@ modes each pin a fresh copy of the input.
 
 Every stream runs the same fixed substitution parameters by default, which keeps
 validation and the clean/post-RF1/post-RF2 comparison meaningful.
---vary-predicates instead draws spec parameters per stream (seeded via
---param-seed); validation is not supported in that mode.
+--vary-predicates instead runs each stream's own qgen-generated parameters from
+--query-dir (see generate_tpch_queries.sh), as an official run requires;
+validation is not supported there.
 
 Metrics (TPC-H spec 5.4):
     Power@Size      = 3600 * SF / geomean(22 stream-0 query times + T_RF1 + T_RF2)
@@ -71,10 +72,10 @@ from performance_test import (
     get_git_info,
     log,
 )
-from queries import QUERIES, render
+from queries import QUERIES
 from tpch_pin_columns import QUERY_COLUMNS
+from tpch_query_streams import load_stream, stream_file
 from tpch_stream_permutations import default_streams, stream_order
-from tpch_substitutions import stream_params
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -154,8 +155,24 @@ def run_refresh(cur, statements, label):
 # ---------------------------------------------------------------------------
 
 
-def timed_query(cur, qnum, timeout_s, queries):
-    """Run q<qnum> from `queries`, fetch all rows, and return (elapsed_s, rows)."""
+def _is_select(stmt):
+    return stmt.lstrip().lower().startswith("select")
+
+
+def timed_query(cur, statements, timeout_s):
+    """Run one query as a single transaction; return (elapsed_s, rows).
+
+    A query is timed end to end including its transaction, matching the
+    reference harness. q15 is three statements (create view, select, drop
+    view) and needs a writable transaction; the other 21 run read-only.
+    Results are fetched in full because an open result holds Sirius's
+    engine-wide query lock and would stall every other stream.
+    """
+    begin = (
+        "BEGIN TRANSACTION READ ONLY"
+        if all(_is_select(s) for s in statements)
+        else "BEGIN TRANSACTION"
+    )
     timer = None
     if timeout_s:
         timer = threading.Timer(timeout_s, cur.interrupt)
@@ -163,19 +180,35 @@ def timed_query(cur, qnum, timeout_s, queries):
         timer.start()
     start = time.perf_counter()
     try:
-        rows = cur.execute(queries[f"q{qnum}"]).fetchall()
+        cur.execute(begin).fetchall()
+        rows = []
+        for stmt in statements:
+            result = cur.execute(stmt).fetchall()
+            if _is_select(stmt):
+                rows = result
+        cur.execute("COMMIT").fetchall()
+    except Exception:
+        try:
+            cur.execute("ROLLBACK").fetchall()
+        except Exception:  # noqa: BLE001 - the original error is what matters
+            pass
+        raise
     finally:
         if timer is not None:
             timer.cancel()
     return time.perf_counter() - start, rows
 
 
-def queries_for_stream(stream, args):
-    """The stream's 22 queries: fixed literals unless --vary-predicates."""
-    if not args.vary_predicates:
-        return QUERIES
-    params = stream_params(stream, args.param_seed, args.sf)
-    return {q: render(q, p) for q, p in params.items()}
+def stream_queries(stream, args):
+    """[(qnum, [statements]), ...] in this stream's execution order.
+
+    With fixed predicates every stream runs the same built-in SQL, permuted per
+    the spec. With --vary-predicates the stream's qgen file supplies both the
+    order and that stream's own substitution parameters.
+    """
+    if args.vary_predicates:
+        return load_stream(args.query_dir, stream)
+    return [(q, [QUERIES[f"q{q}"]]) for q in stream_order(stream)]
 
 
 def compare_rows(cpu_rows, gpu_rows):
@@ -190,13 +223,13 @@ def compare_rows(cpu_rows, gpu_rows):
     return None
 
 
-def validate_pass(cpu, gpu_rows_by_q, perm, label, timeout_s, queries):
+def validate_pass(cpu, gpu_rows_by_q, plan, label, timeout_s):
     """Diff stored GPU rows against fresh DuckDB CPU runs on the current state."""
     failures = {}
-    for q in perm:
+    for q, statements in plan:
         if q in REFRESH_INVARIANT_QUERIES:
             continue
-        _, cpu_rows = timed_query(cpu, q, timeout_s, queries)
+        _, cpu_rows = timed_query(cpu, statements, timeout_s)
         msg = compare_rows(cpu_rows, gpu_rows_by_q[q])
         if msg is None:
             log(f"  [{label}] q{q}: OK")
@@ -287,8 +320,7 @@ def geomean(values):
 
 
 def power_run(con, args, run_dir, writer):
-    perm = stream_order(0)
-    queries = queries_for_stream(0, args)
+    plan = stream_queries(0, args)
     gpu = con.cursor()
     cpu = con.cursor()
     rf = con.cursor()
@@ -299,8 +331,8 @@ def power_run(con, args, run_dir, writer):
 
         def timed_pass(phase, result_name):
             times, rows_by_q = {}, {}
-            for q in perm:
-                elapsed, rows = timed_query(gpu, q, args.query_timeout, queries)
+            for q, statements in plan:
+                elapsed, rows = timed_query(gpu, statements, args.query_timeout)
                 times[q], rows_by_q[q] = elapsed, rows
                 with _write_lock:
                     writer.writerow([phase, 0, f"q{q}", f"{elapsed:.6f}"])
@@ -339,7 +371,7 @@ def power_run(con, args, run_dir, writer):
         if args.validation:
             log("=== Power: validating post-RF1 state vs DuckDB CPU (untimed) ===")
             validation["after_rf1"] = validate_pass(
-                cpu, rows_p0, perm, "after RF1", args.query_timeout, queries
+                cpu, rows_p0, plan, "after RF1", args.query_timeout
             )
 
         log("=== Power: RF2 (delete update set 1) ===")
@@ -362,7 +394,7 @@ def power_run(con, args, run_dir, writer):
         if args.validation:
             log("=== Power: validating post-RF2 state vs DuckDB CPU (untimed) ===")
             validation["after_rf2"] = validate_pass(
-                cpu, rows_p2, perm, "after RF2", args.query_timeout, queries
+                cpu, rows_p2, plan, "after RF2", args.query_timeout
             )
 
         power_at_size = 3600.0 * args.sf / geomean(list(t_p0.values()) + [t_rf1, t_rf2])
@@ -401,12 +433,12 @@ def throughput_run(con, args, run_dir, writer, streams):
     def query_stream(i):
         cur = con.cursor()
         sql(cur, "SET gpu_execution = true")
-        queries = queries_for_stream(i, args)
+        plan = stream_queries(i, args)
         try:
             barrier.wait()
             start = time.perf_counter()
-            for q in stream_order(i):
-                elapsed, _ = timed_query(cur, q, args.query_timeout, queries)
+            for q, statements in plan:
+                elapsed, _ = timed_query(cur, statements, args.query_timeout)
                 stream_times[i][f"q{q}"] = elapsed
                 with _write_lock:
                     writer.writerow(["throughput", i, f"q{q}", f"{elapsed:.6f}"])
@@ -486,7 +518,7 @@ def write_summary(run_dir, args, streams, power, throughput, qphh):
     lines = []
     out = lines.append
     out("=" * 72)
-    predicates = "varied" if args.vary_predicates else "fixed"
+    predicates = "qgen" if args.vary_predicates else "fixed"
     out(
         f"  TPC-H Power / Throughput — Sirius   "
         f"(SF{args.sf:g}, pin={args.pin}, predicates={predicates})"
@@ -567,7 +599,7 @@ def write_run_info(run_dir, args, streams):
         f"pin: {args.pin}",
         f"mode: {args.mode}",
         f"vary_predicates: {args.vary_predicates}",
-        f"param_seed: {args.param_seed}",
+        f"query_dir: {args.query_dir if args.vary_predicates else '(fixed)'}",
         f"validation: {args.validation}",
         f"config: {os.environ.get('SIRIUS_CONFIG_FILE', '(default)')}",
     ]
@@ -623,14 +655,16 @@ def parse_args():
         "--vary-predicates",
         action=argparse.BooleanOptionalAction,
         default=False,
-        help="Draw per-stream substitution parameters (spec 2.4) instead of the "
-        "fixed literals; not compatible with --validation",
+        help="Run each stream's own qgen substitution parameters from "
+        "--query-dir instead of the fixed built-in literals; not compatible "
+        "with --validation",
     )
     p.add_argument(
-        "--param-seed",
-        type=int,
-        default=1,
-        help="Seed for --vary-predicates draws (default: 1)",
+        "--query-dir",
+        type=str,
+        default=None,
+        help="Directory of qgen stream<N>.sql files for --vary-predicates "
+        "(default test_datasets/tpch_queries_sf<SF>)",
     )
     p.add_argument(
         "--config",
@@ -679,6 +713,10 @@ def main():
         args.refresh_dir = os.path.join(
             REPO_ROOT, f"test_datasets/tpch_refresh_sf{sf_label}"
         )
+    if args.query_dir is None:
+        args.query_dir = os.path.join(
+            REPO_ROOT, f"test_datasets/tpch_queries_sf{sf_label}"
+        )
 
     streams = args.streams if args.streams is not None else default_streams(args.sf)
 
@@ -688,7 +726,7 @@ def main():
     if args.validation is None:
         args.validation = not args.vary_predicates
 
-    # Fail fast if any needed refresh set is missing.
+    # Fail fast if any needed refresh set or query stream is missing.
     needed = []
     if args.mode in ("power", "both"):
         needed.append(1)
@@ -697,6 +735,12 @@ def main():
     for n in needed:
         rf1_statements(args.refresh_dir, n)
         rf2_statements(args.refresh_dir, n)
+    if args.vary_predicates:
+        wanted = [0] if args.mode in ("power", "both") else []
+        if args.mode in ("throughput", "both"):
+            wanted.extend(range(1, streams + 1))
+        for n in wanted:
+            stream_file(args.query_dir, n)
 
     # Require an explicit config; it sets GPU/host memory sizing and a stale one
     # can fail extension init.
@@ -724,8 +768,9 @@ def main():
     log(f"Refresh dir:   {args.refresh_dir}")
     log(f"Streams:       {streams}")
     log(f"Config:        {config}")
-    predicates = f"varied (seed={args.param_seed})" if args.vary_predicates else "fixed"
-    log(f"Predicates:    {predicates}")
+    log(f"Predicates:    {'qgen per stream' if args.vary_predicates else 'fixed'}")
+    if args.vary_predicates:
+        log(f"Query dir:     {args.query_dir}")
 
     power = throughput = None
     with open(os.path.join(run_dir, "timings.csv"), "w", newline="") as f:
@@ -756,7 +801,7 @@ def main():
         "streams": streams,
         "pin": args.pin,
         "vary_predicates": args.vary_predicates,
-        "param_seed": args.param_seed,
+        "query_dir": args.query_dir if args.vary_predicates else None,
         "input": args.input,
         "refresh_dir": args.refresh_dir,
         "commit": commit,

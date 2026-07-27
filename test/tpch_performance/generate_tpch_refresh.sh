@@ -20,6 +20,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
+# shellcheck source=dbgen_bootstrap.sh
+. "$SCRIPT_DIR/dbgen_bootstrap.sh"
 
 DBGEN_DIR=""
 OUTPUT_DIR=""
@@ -45,21 +47,7 @@ NUM_SETS="$2"
 DBGEN_DIR="${DBGEN_DIR:-$PROJECT_DIR/test_datasets/tpch-dbgen}"
 OUTPUT_DIR="${OUTPUT_DIR:-$PROJECT_DIR/test_datasets/tpch_refresh_sf${SF}}"
 
-# Bootstrap dbgen from the checked-in zip if needed (mirrors setup_test_datasets.sh).
-if [ ! -x "$DBGEN_DIR/dbgen" ]; then
-    if [ ! -d "$DBGEN_DIR" ] && [ -f "$PROJECT_DIR/test_datasets/tpch-dbgen.zip" ]; then
-        echo "dbgen not found; unzipping test_datasets/tpch-dbgen.zip"
-        (cd "$PROJECT_DIR/test_datasets" && unzip -nq tpch-dbgen.zip)
-    fi
-    if [ -f "$DBGEN_DIR/makefile" ] && [ ! -x "$DBGEN_DIR/dbgen" ]; then
-        echo "Building dbgen in $DBGEN_DIR"
-        make -C "$DBGEN_DIR" >/dev/null
-    fi
-fi
-if [ ! -x "$DBGEN_DIR/dbgen" ]; then
-    echo "ERROR: dbgen binary not found or not executable at $DBGEN_DIR/dbgen"
-    exit 1
-fi
+ensure_tpch_tools "$DBGEN_DIR" "$PROJECT_DIR" dbgen
 
 mkdir -p "$OUTPUT_DIR"
 OUTPUT_DIR="$(cd "$OUTPUT_DIR" && pwd)"

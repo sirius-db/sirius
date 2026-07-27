@@ -282,10 +282,14 @@ copy and pin. The single modes each pin a fresh copy of the input.
 
 Substitution parameters are fixed by default: every stream runs the same literals from
 `queries.py`, so passes stay comparable and validation can diff GPU vs CPU. `--vary-predicates`
-instead draws each stream's parameters from the spec 2.4 distributions
-(`tpch_substitutions.py`), like qgen does per stream; draws are deterministic per
-(`--param-seed`, stream), and the power run's three passes share the stream-0 draw. Validation
-is not supported with varied predicates — the runner rejects `--validation`.
+instead runs the per-stream query sets that `generate_tpch_queries.sh` builds with `qgen`, the
+reference parameter generator, which is what an official run requires. The power run always uses
+stream 0, so its three passes share one parameter set. Validation is not supported with varied
+predicates — the runner rejects `--validation`.
+
+Each query runs as its own transaction, `READ ONLY` except for q15, which creates and drops a
+view and so needs a writable one. qgen writes q15's view as `revenue<stream>`, so concurrent
+throughput streams cannot collide.
 
 Metrics (TPC-H spec 5.4): `Power@Size = 3600·SF / geomean(22 stream-0 query times + T_RF1 +
 T_RF2)`, `Throughput@Size = N·22·3600 / measurement_interval · SF`, `QphH@Size =
@@ -316,11 +320,32 @@ sqrt(Power · Throughput)`.
   overlapped execution. Every result is fetched fully before the next query; an open cursor would
   hold the lock and stall every stream.
 
+### Where this differs from duckdb-tpch-power-test
+
+The methodology follows that harness, but it takes a few shortcuts that the spec does not allow.
+This runner follows the spec instead:
+
+| Area | duckdb-tpch-power-test | Here |
+|------|------------------------|------|
+| Power run stream | stream 1, reused as a throughput stream | stream 0, as clause 5.3.3 requires |
+| Throughput refresh pairs | `max(SF/10, 1)`, unrelated to stream count | one RF1/RF2 pair per query stream |
+| Row limits (`:n`) | dropped — the `where rownum <= N` chunk fails its `'select' in q` filter, so q2/q3/q10/q18/q21 run unlimited | folded into a `LIMIT` on the query |
+| q15 | `create view ... as select` is timed as a separate query, `drop view` is skipped, so 23 timings feed a 24th-root | the three statements are one query, one timing |
+| Power@Size | 24th root over those 23 timings | geometric mean of exactly 22 query times + T_RF1 + T_RF2 |
+
+Two things are inherited as-is: query text comes from `qgen`, and each query runs in its own
+transaction. Note the checked-in `dbgen` is 2.14.0 while that repo vendors 3.0.1; the only
+difference that reaches the SQL is q1's ANSI `day (3)` interval qualifier, which
+`tpch_query_streams.py` strips (it is a no-op for the 60..120 day values q1 draws).
+
 ### Usage
 
 ```bash
 # One-time per SF: generate refresh sets with classic dbgen -U (needs >= streams+1 sets)
 ./test/tpch_performance/generate_tpch_refresh.sh 1 5     # -> test_datasets/tpch_refresh_sf1/
+
+# Only for --vary-predicates: per-stream query sets from qgen (streams 0..N)
+./test/tpch_performance/generate_tpch_queries.sh 1 4     # -> test_datasets/tpch_queries_sf1/
 
 export SIRIUS_CONFIG_FILE=$(pwd)/test/cpp/integration/integration.yaml
 
@@ -340,8 +365,8 @@ pixi run python test/tpch_performance/tpch_power_throughput.py \
 Key flags: `--config <yaml>` (**required** unless `SIRIUS_CONFIG_FILE` is set — the runner refuses
 to start without an explicit config; there is no default path), `--mode power|throughput|both`,
 `--streams N`, `--pin gpu|host|none` (`none` disables pinning and thereby GPU serving of refreshed
-tables — debug only), `--vary-predicates/--no-vary-predicates` (per-stream spec parameter draws;
-rejects `--validation`), `--param-seed <n>`, `--validation/--no-validation` (fixed predicates
+tables — debug only), `--vary-predicates/--no-vary-predicates` (per-stream qgen parameters;
+rejects `--validation`), `--query-dir <dir>`, `--validation/--no-validation` (fixed predicates
 only), `--baseline-pass/--no-baseline-pass`, `--query-timeout <s>`, `--keep-scratch-db`,
 `--output`.
 
@@ -447,7 +472,9 @@ Output: `reports/<label>_<YYYYMMDD_HHMMSS>/` containing `report.md`, `summary.js
 | `rewrite_parquet.py` | Rewrite parquet with GPU-optimized row groups (cudf or pyarrow fallback) |
 | `performance_test.py` | Python-based benchmark with result verification |
 | `queries.py` | TPC-H query templates (`{PLACEHOLDER}` substitution parameters) + the fixed default rendering `QUERIES` |
-| `tpch_substitutions.py` | Per-stream substitution parameter draws (spec 2.4 distributions), seeded and deterministic |
+| `tpch_query_streams.py` | Load the qgen stream files: split on `(Q<n>)` tags, fold the `:n` row limit into a `LIMIT` |
+| `generate_tpch_queries.sh` | Generate per-stream query sets (`stream<N>.sql`) with `qgen` |
+| `dbgen_bootstrap.sh` | Shared unzip/build of the classic `dbgen` / `qgen` tools |
 | `tpch_pin_columns.py` | Per-query and union column → table mapping for `--pinning-mode per-query` / `pinned-hot` (union helpers also used by `performance_test.py --mode sequential`); emits `CALL pin_table(...)` / `CALL unpin_table(...)` SQL |
 | `tpch_power_throughput.py` | TPC-H power & throughput runs with RF1/RF2 refresh functions; Power@Size / Throughput@Size / QphH@Size + delta/mask overhead breakdown |
 | `tpch_stream_permutations.py` | Spec Appendix A query-stream orderings (streams 0–40) + spec-minimum stream counts |
