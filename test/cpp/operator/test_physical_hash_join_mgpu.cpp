@@ -43,6 +43,7 @@
 //   3. Repeated back-to-back invocations of BUILD_PROBE don't wedge on the
 //      leftover hash table state from the prior query (DESTROYED → NOT_BUILT).
 
+#include "log/logging.hpp"
 #include "mgpu_test_utils.hpp"
 
 #include <cuda_runtime.h>
@@ -118,6 +119,7 @@ void generate_large_probe_side(fs::path const& dir)
  */
 bool log_dir_contains(fs::path const& log_dir, std::string const& needle)
 {
+  (void)sirius::log::get_sink()->flush();
   std::error_code ec;
   for (auto const& entry : fs::recursive_directory_iterator(log_dir, ec)) {
     if (!entry.is_regular_file()) { continue; }
