@@ -154,8 +154,23 @@ set(CUCASCADE_WARNINGS_AS_ERRORS
     OFF
     CACHE BOOL "" FORCE)
 set(CUCASCADE_BUILD_IO
-    OFF
+    ON
     CACHE BOOL "" FORCE)
+# cucascade-io's callable and lock-free queues are swappable so they can reuse
+# the copies sirius already links, instead of an in-tree callable and a fetched
+# concurrentqueue: absl::AnyInvocable backs cucascade::exec::invocable, and
+# duckdb's vendored concurrentqueue (namespace duckdb_moodycamel, already on the
+# include path via duckdb) backs the queues. absl::any_invocable is resolved by
+# the find_package(absl) above, so cucascade reuses that target.
+set(CUCASCADE_USE_ABSEIL_INVOCABLE
+    ON
+    CACHE BOOL "" FORCE)
+set(CUCASCADE_MOODYCAMEL_INCLUDE_DIR
+    "${CMAKE_CURRENT_SOURCE_DIR}/duckdb/third_party/concurrentqueue"
+    CACHE PATH "" FORCE)
+set(CUCASCADE_MOODYCAMEL_NAMESPACE
+    "duckdb_moodycamel"
+    CACHE STRING "" FORCE)
 add_subdirectory(cucascade "${CMAKE_BINARY_DIR}/cucascade" EXCLUDE_FROM_ALL)
 
 if(VCPKG_BUILD AND TARGET CUDA::cudart_static)
@@ -182,9 +197,17 @@ if(VCPKG_BUILD AND TARGET CUDA::cudart_static)
                                                       Static)
   endfunction()
 
-  foreach(_target
-          cucascade_objects cucascade_static cucascade_shared
-          cucascade_cudf_objects cucascade_cudf_static cucascade_cudf_shared)
+  foreach(
+    _target
+    cucascade_objects
+    cucascade_static
+    cucascade_shared
+    cucascade_cudf_objects
+    cucascade_cudf_static
+    cucascade_cudf_shared
+    cucascade_io_objects
+    cucascade_io_static
+    cucascade_io_shared)
     if(TARGET "${_target}")
       sirius_prefer_static_cudart("${_target}")
     endif()
@@ -550,10 +573,20 @@ endif()
 # cucascade_static / telemetry_bridge). cucascade upstream PR #126 split
 # topology_discovery into its own static target, and PR #150 split the
 # cudf-coupled code into cucascade_cudf_static — list both here so the export
-# set covers the full dependency chain.
+# set covers the full dependency chain. With CUCASCADE_BUILD_IO=ON,
+# cucascade_cudf_static also PUBLIC-links cucascade_io_static (which links the
+# cucascade_io_thirdparty interface target); add both so this export set stays
+# self-contained instead of referencing them from cucascade's own
+# cuCascadeTargets export, mirroring why the cucascade_* targets are listed here
+# rather than resolved via find_package.
 install(
-  TARGETS sirius_extension cucascade_static cucascade_cudf_static
-          cucascade_topology_discovery_static telemetry_bridge
+  TARGETS sirius_extension
+          cucascade_static
+          cucascade_cudf_static
+          cucascade_io_static
+          cucascade_io_thirdparty
+          cucascade_topology_discovery_static
+          telemetry_bridge
   EXPORT "${DUCKDB_EXPORT_SET}"
   LIBRARY DESTINATION "${INSTALL_LIB_DIR}"
   ARCHIVE DESTINATION "${INSTALL_LIB_DIR}")
