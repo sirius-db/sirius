@@ -90,11 +90,8 @@ class SiriusContext : public ClientContextState {
     /// from actual batch types, so a regression anywhere in the narrow-carrier
     /// chain drops it to zero.
     uint64_t partition_narrow_columns = 0;
-    /// Plan-time count of narrow scan sidecar targets the tier narrowing
-    /// policy flipped back to native: columns of a GPU-tier-backed scan with
-    /// no transport benefit whose uses reach a restoration (a column engaging
-    /// a narrow comparison still retracts when another use meets a boundary
-    /// restore; a column with no uses at all stays narrow and is not counted).
+    /// Plan-time count of narrow scan sidecar targets flipped back to native; the keep/retract rule
+    /// is `apply_tier_narrowing_policy`'s.
     uint64_t scan_narrow_targets_retracted = 0;
   };
 

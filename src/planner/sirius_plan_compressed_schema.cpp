@@ -395,9 +395,7 @@ void propagate_compressed_schema(duckdb::unique_ptr<sirius::op::sirius_physical_
       // Bare-reference group keys may stay narrow: cudf::groupby receives them as raw views and
       // grouping is pure equality, which narrowing preserves (same values, family, and decimal
       // scale). Value-sensitive aggregate inputs must be native so their kernels retain the native
-      // accumulation/result width. Any shape the simplified key extraction does not cover
-      // (multiple grouping sets, grouping functions, an AVG/count-distinct partial layout wider
-      // than the declared output) falls through to the native boundary below.
+      // accumulation/result width. Each ineligible shape breaks to the native boundary below.
       if (slot->children.size() != 1) { break; }
       auto& aggregate = slot->Cast<sirius::op::sirius_physical_grouped_aggregate>();
       if (aggregate.grouping_sets.size() > 1) { break; }

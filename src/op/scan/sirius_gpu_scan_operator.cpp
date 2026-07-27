@@ -226,10 +226,11 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::execute(
     output_table = materialized_table.table.release(stream, mem_space->get_default_allocator());
   }
 
-  // Narrow/expand the physical types
+  // Cast each batch column to its planned carrier. A resident chunk is normalized even without a
+  // sidecar: it may be stored narrow (pinned with the feature on, queried with it off) and must
+  // then restore to native.
   auto const has_explicit_physical_schema = has_physical_overrides();
   if (has_explicit_physical_schema || scan_input->is_resident()) {
-    // In case the flag has been turned off after a narrowing pin, restore to native
     auto const& target_types =
       has_explicit_physical_schema ? get_physical_types() : _native_physical_types;
     output_table = normalize_physical_schema(std::move(output_table),

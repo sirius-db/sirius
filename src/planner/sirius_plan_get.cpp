@@ -75,15 +75,13 @@ std::vector<cudf::data_type> scan_physical_schema(duckdb::LogicalGet& op,
     return {};
   }
 
-  // Residency gate: a narrow sidecar is installed only when the pinned cache will serve this scan,
-  // and each column's plan target is derived from the pinned entry's ACTUAL stored chunk carriers —
-  // pin-time narrowing computed exact per-chunk min/max on materialized data, so the carriers are
-  // ground truth and serving narrow is free (the casts were paid at pin time). Everything else
-  // stays native: an unpinned scan (null @p entry) returns before any derivation and is
-  // byte-identical to feature-off, and a pinned-native column is never narrowed at serve time as a
-  // recurring per-query cost.
-  // A pin that cannot serve the requested columns means execution reads disk
-  // fresh; a narrow sidecar would reintroduce per-batch verification and casts.
+  // Residency gate: install a narrow sidecar only when the pinned cache will serve this scan, with
+  // each column's plan target derived from the entry's ACTUAL stored chunk carriers — pin-time
+  // narrowing verified exact min/max on materialized data and already paid the casts, so serving
+  // narrow is free. Everything else stays native: an unpinned scan is byte-identical to
+  // feature-off, and a pinned-native column is never narrowed at serve time (a recurring per-query
+  // cost). A pin that cannot serve the requested columns reads disk fresh, where a narrow sidecar
+  // would reintroduce per-batch verification and casts.
   auto const projection = entry->cache_info.column_projection_for(ids);
   if (projection.empty()) { return {}; }
 
@@ -91,8 +89,8 @@ std::vector<cudf::data_type> scan_physical_schema(duckdb::LogicalGet& op,
   result.reserve(op.types.size());
   bool changed = false;
   for (std::size_t output_idx = 0; output_idx < op.types.size(); output_idx++) {
-    auto logical = sirius::from_duckdb(op.types[output_idx]);
-    auto native  = sirius::try_get_cudf_type(logical);
+    auto const logical = sirius::from_duckdb(op.types[output_idx]);
+    auto const native  = sirius::try_get_cudf_type(logical);
     if (!native) { return {}; }
     result.push_back(*native);
     if (!sirius::is_narrowable_numeric_type(logical)) { continue; }

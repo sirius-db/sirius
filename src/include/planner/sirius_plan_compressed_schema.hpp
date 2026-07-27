@@ -56,7 +56,8 @@ namespace sirius::planner {
  * zero-column schema, so callers guard by comparing sizes against the schema they pair it with;
  * `apply_compressed_schema_passes` additionally rejects unmappable trees up front.
  */
-std::vector<cudf::data_type> native_physical_schema(sirius::op::sirius_physical_operator const& op);
+[[nodiscard]] std::vector<cudf::data_type> native_physical_schema(
+  sirius::op::sirius_physical_operator const& op);
 
 /**
  * @brief Install @p schema as @p op 's physical sidecar, normalizing an all-native schema to the
@@ -68,23 +69,20 @@ void install_physical_schema(sirius::op::sirius_physical_operator& op,
 /**
  * @brief Retract narrow scan targets that show no plan benefit for a GPU-resident pin.
  *
- * The residency gate is the mechanism deciding what CAN be narrow (carriers stored in the pinned
- * cache); this pass is the policy deciding what SHOULD stay narrow for this query on this tier. A
- * GPU-tier serve pays no host-to-GPU upload, so a narrow column earns its keep only through the
- * plan itself: the pass walks the tree bottom-up with the same operator column maps
- * `propagate_compressed_schema` uses (including DELIM_JOIN sub-trees) and classifies every use of
- * each candidate column of a scan marked `sidecar_from_gpu_tier_pin`. A column keeps its narrow
- * target iff it survives into a hash-join payload output or an eligible grouped-aggregate key
- * output (transport benefit), or it engages a narrow-domain comparison/BETWEEN (representable
- * constants against the planned carrier, the evaluator's `narrow_domain_carrier` shape) and no use
- * would insert a boundary restore projection. Every other use -- evaluator restores in
- * expressions, join keys, value-sensitive aggregate inputs, unmodeled operators, survival to the
- * plan root -- costs a restoration, so the column's sidecar entry is flipped back to native through
- * `install_physical_schema` (an all-native result drops the sidecar) and the pinned-narrow chunk
- * instead widens once per batch during scan normalization. The verdict composes: a column that
- * engages a narrow comparison still retracts when another use reaches a boundary restore, and a
- * column with no uses at all keeps its narrow target. Host-tier-backed and sidecar-less scans are
- * never visited: narrow always wins when serving shrinks the upload. Returns the number of
+ * The residency gate decides what CAN be narrow (the carriers stored in the pinned cache); this
+ * pass decides what SHOULD stay narrow for this query. A GPU-tier serve pays no host-to-GPU upload,
+ * so a narrow column must earn its keep inside the plan: the pass walks the tree bottom-up with the
+ * same operator column maps `propagate_compressed_schema` uses (including DELIM_JOIN sub-trees) and
+ * classifies every use of each candidate column of a scan marked `sidecar_from_gpu_tier_pin`. A
+ * column stays narrow iff it survives into a hash-join payload output or an eligible
+ * grouped-aggregate key output (transport benefit), or it engages a narrow-domain
+ * comparison/BETWEEN (the evaluator's `narrow_domain_carrier` shape, probed against the planned
+ * carrier) while no use meets a boundary restore projection. Every other use -- an evaluator
+ * restore inside an expression, a join key, a value-sensitive aggregate input, an unmodeled
+ * operator, survival to the plan root -- costs a restoration, so the column's sidecar entry flips
+ * back to native and its pinned-narrow chunks instead widen once per batch during scan
+ * normalization. A column with no uses at all stays narrow. Host-tier-backed and sidecar-less scans
+ * are never visited: narrow always wins when serving shrinks the upload. Returns the number of
  * retracted targets.
  */
 std::size_t apply_tier_narrowing_policy(sirius::op::sirius_physical_operator& plan);

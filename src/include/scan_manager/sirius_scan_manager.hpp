@@ -215,15 +215,12 @@ struct pinned_entry {
 void validate_pinned_entry_for_serving(pinned_entry const& entry,
                                        std::span<std::size_t const> selected_columns);
 
-/// True iff @p entry's narrowing markers show the cached column at
-/// @p entry_position (a position into cache_info.column_ids) narrowed in
-/// EVERY chunk. False for the empty (all-native canonical) matrix, for
-/// zero-chunk entries, and — defensively — for an out-of-range
-/// @p entry_position. Drives the plan-time residency gate (composed by
-/// pinned_column_narrow_carrier): a column that passes is served narrow with
-/// at most a cheap same-family widening per chunk; a column that fails would
-/// pay a recurring per-query exact-range verification and narrowing cast on
-/// its native chunks, so it stays native.
+/// True iff @p entry's narrowing markers show the cached column at @p entry_position (a position
+/// into cache_info.column_ids) narrowed in EVERY chunk. False for the empty (all-native canonical)
+/// matrix, for zero-chunk entries, and for an out-of-range @p entry_position. Composed by
+/// pinned_column_narrow_carrier into the plan-time residency gate: a passing column serves narrow
+/// with at most a cheap same-family widening per chunk, while a failing one would pay a per-query
+/// exact-range verification and narrowing cast on its native chunks, so it stays native.
 [[nodiscard]] bool pinned_column_narrowed_in_all_chunks(pinned_entry const& entry,
                                                         std::size_t entry_position);
 
@@ -232,7 +229,7 @@ void validate_pinned_entry_for_serving(pinned_entry const& entry,
 /// carrier across all chunks. nullopt — the column stays native — unless
 /// pinned_column_narrowed_in_all_chunks passes AND every chunk carrier is readable AND every
 /// carrier is a strict same-family narrowing of @p native_type (can_narrow_to). Chunks narrower
-/// than the returned target widen at serve through the existing verified same-family restore.
+/// than the returned target widen at serve through the verified same-family restore.
 /// Non-owning read of the entry; same single-threaded query-lifecycle discipline as
 /// visit_pinned_entries.
 [[nodiscard]] std::optional<cudf::data_type> pinned_column_narrow_carrier(

@@ -149,11 +149,9 @@ class scan_operator_input : public op::operator_data {
   /// True when a resident cached split includes at least one selected column
   /// whose physical carrier is narrower than its logical type.
   bool contains_narrowed_columns{false};
-  /// Exact bytes of the native-width destination columns (data plus validity
-  /// mask) a full restore of this split's narrowed selected columns would
-  /// allocate, computed at the cached serve site. Zero when nothing is
-  /// narrowed or the destination widths are unknown; the scan memory estimate
-  /// then keeps its conservative maximum-expansion bound.
+  /// Stamped by drain_cached_provider from databatch_provider::batch::restore_destination_bytes,
+  /// which owns the definition. Zero means unknown; the scan memory estimate then keeps its
+  /// conservative maximum-expansion bound.
   std::size_t restore_destination_bytes{0};
 };
 

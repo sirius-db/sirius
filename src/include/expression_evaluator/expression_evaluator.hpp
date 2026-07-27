@@ -379,9 +379,10 @@ class expression_evaluator {
     _temp_columns;  ///< The temporary columns that need to be kept alive for the AST nodes in
                     ///< _ast_tree.
 
-  // Numeric reference restorations live in _temp_columns so AST references reuse the existing
-  // combined-table layout. Cache AST results deliberately do not advertise these indices to
-  // release_temporaries: a restoration remains alive for the complete top-level evaluation.
+  // Numeric reference restorations live in _temp_columns so AST references address them through the
+  // combined-table layout. AST results built over these cache entries deliberately advertise no
+  // releasable indices to release_temporaries: a restoration stays alive for the whole top-level
+  // evaluation.
   struct restored_reference_cache_entry {
     std::uint32_t column_index;     ///< The index of the input column in the original table
     cudf::data_type target_type;    ///< The target type for the numeric restoration

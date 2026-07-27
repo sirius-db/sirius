@@ -254,10 +254,9 @@ std::unique_ptr<cudf::table> expression_evaluator::evaluate(cudf::table_view inp
   // natively from the Sirius AST (no DuckDB round-trip).
   auto post_process = [this](sirius::ast::node const& expr, evaluate_result result) {
     if (expr.holds<sirius::ast::reference>()) {
-      // A narrowed reference is restored by the reference specialization as a view of a column
-      // owned by the per-evaluation restoration cache; an unchanged reference remains a zero-copy
-      // view of the input. Either way, the copy below (or the owned fast path, should a result ever
-      // own its column) guarantees the output table owns independent columns.
+      // A narrowed reference restores as a view of a column owned by the per-evaluation restoration
+      // cache; an unchanged reference stays a zero-copy view of the input. Copying the view (or
+      // releasing an owned column) gives the output table independent columns.
       if (result.is_owned_column()) {
         _output_columns.push_back(result.release_column());
       } else {
