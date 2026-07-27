@@ -16,8 +16,12 @@
 
 #include "compression_converters.hpp"
 
+#include "compressed_disk_representation.hpp"
 #include "compressed_representation.hpp"
 #include "device_compressed_blob.hpp"
+#include "plan_register.hpp"
+#include "simpatico_bridge.hpp"
+#include "spill_context.hpp"
 
 #include <cudf/column/column.hpp>
 #include <cudf/table/table.hpp>
@@ -33,13 +37,17 @@
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/data/representation_converter.hpp>
 #include <cucascade/memory/memory_space.hpp>
+#include <explore/compression_explorer.hpp>
 #include <log/logging.hpp>
 
 #include <algorithm>
 #include <atomic>
 #include <cstddef>
+#include <filesystem>
+#include <fstream>
 #include <optional>
 #include <stdexcept>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -226,6 +234,330 @@ std::unique_ptr<cucascade::idata_representation> decompress_device_to_gpu(
     std::move(decompressed), *const_cast<cucascade::memory::memory_space*>(space), stream);
 }
 
+// ── Spill-path (compress) helpers ────────────────────────────────────────────
+
+// Placeholder column names for a spilled batch. A pipeline batch carries no
+// schema names (cudf tables have none), and the spill path always restores the
+// whole batch, so names are never used for projection here — they only need to
+// match the column count that compressed_*_representation records.
+std::vector<std::string> synthetic_column_names(int n)
+{
+  std::vector<std::string> names;
+  names.reserve(static_cast<std::size_t>(n));
+  for (int i = 0; i < n; ++i) {
+    names.push_back("col_" + std::to_string(i));
+  }
+  return names;
+}
+
+// Resolve the spill plan for this query-graph edge, running Simpatico's
+// beam-search explorer once (on the first batch to spill from this edge) and
+// caching the result in the plan register for every later batch.
+std::string resolve_or_explore_spill_plan(cudf::table_view table,
+                                          const compression::spill_context& ctx,
+                                          rmm::cuda_stream_view stream)
+{
+  auto& reg = compression::plan_register::global();
+  if (auto existing = reg.resolve_spill_plan(ctx.repo); existing.has_value()) { return *existing; }
+
+  nvtx3::scoped_range nvtx_range{"sirius::compression::explore_spill_plan"};
+
+  simpatico::exploration_config ecfg;
+  ecfg.beam_width        = ctx.explore_beam_width;
+  ecfg.max_explore_bytes = ctx.explore_max_bytes;
+
+  std::string dsl;
+  for (cudf::size_type i = 0; i < table.num_columns(); ++i) {
+    auto result = simpatico::explore_column_compression(
+      table.column(i), ecfg, stream, rmm::mr::get_current_device_resource_ref());
+    if (i != 0) { dsl += "\n---\n"; }
+    dsl += result.plan_dsl;
+  }
+
+  SIRIUS_LOG_DEBUG("[compression_converters] explored spill plan for repo={} cols={}",
+                   static_cast<const void*>(ctx.repo),
+                   table.num_columns());
+
+  reg.set_spill_plan(ctx.repo, dsl);
+  return dsl;
+}
+
+// The spill context must be installed by convertible_data_batch::convert().
+const compression::spill_context& require_spill_context()
+{
+  const auto* ctx = compression::current_spill_context();
+  if (ctx == nullptr || ctx->repo == nullptr) {
+    throw std::runtime_error("[compression_converters] no spill context installed");
+  }
+  return *ctx;
+}
+
+// Compress `table` with this edge's plan and build the .hpln header + payload
+// buffer list. Throws when the compressed form does not save enough (the caller
+// then falls back to an uncompressed spill).
+struct staged_compression {
+  simpatico::compressed_table table;
+  std::vector<std::uint8_t> header;
+  std::vector<simpatico::payload_buffer_ref> buffers;
+  std::uint64_t payload_bytes = 0;
+};
+
+staged_compression compress_for_spill(cudf::table_view view,
+                                      const compression::spill_context& ctx,
+                                      std::size_t uncompressed_bytes,
+                                      rmm::cuda_stream_view stream)
+{
+  const std::string plan = resolve_or_explore_spill_plan(view, ctx, stream);
+
+  staged_compression out;
+  out.table = simpatico::compress_with_plan(view,
+                                            plan,
+                                            stream,
+                                            rmm::mr::get_current_device_resource_ref(),
+                                            synthetic_column_names(view.num_columns()));
+
+  const std::string hdr_err = simpatico::build_compressed_table_header(
+    out.table, out.header, out.buffers, out.payload_bytes, stream);
+  if (!hdr_err.empty()) {
+    throw std::runtime_error("[compression_converters] build_compressed_table_header: " + hdr_err);
+  }
+
+  // Reject a compressed form that saves too little; throwing here makes the
+  // caller spill uncompressed instead.
+  const std::size_t compressed_bytes = out.header.size() + out.payload_bytes;
+  if (uncompressed_bytes > 0 &&
+      static_cast<double>(compressed_bytes) >
+        ctx.max_compressed_fraction * static_cast<double>(uncompressed_bytes)) {
+    throw std::runtime_error("[compression_converters] compressed " +
+                             std::to_string(compressed_bytes) + "B of " +
+                             std::to_string(uncompressed_bytes) + "B original: below threshold");
+  }
+  return out;
+}
+
+// Resolve the memory space a converter should place its result in.
+const cucascade::memory::memory_space* resolve_target_space(
+  cucascade::idata_representation& source,
+  const cucascade::memory::memory_space* target_memory_space,
+  cucascade::memory::reservation* reservation)
+{
+  if (target_memory_space != nullptr) { return target_memory_space; }
+  if (reservation != nullptr) { return &reservation->get_memory_space(); }
+  return &source.get_memory_space();
+}
+
+// Write a .hpln file: the structural header followed by the payload bytes.
+// This is exactly the on-disk layout build_compressed_table_header produces, so
+// a pinned blob (header + payload) can be flushed verbatim with no re-compression.
+void write_hpln_file(
+  const std::string& path,
+  std::span<const std::uint8_t> header,
+  const cucascade::memory::fixed_size_host_memory_resource::multiple_blocks_allocation& payload,
+  std::uint64_t payload_bytes)
+{
+  std::ofstream out(path, std::ios::binary | std::ios::trunc);
+  if (!out) { throw std::runtime_error("[compression_converters] cannot open for write: " + path); }
+  out.write(reinterpret_cast<const char*>(header.data()),
+            static_cast<std::streamsize>(header.size()));
+
+  const std::size_t bs  = payload.block_size();
+  std::uint64_t written = 0;
+  while (written < payload_bytes) {
+    const std::size_t idx = static_cast<std::size_t>(written / bs);
+    const std::size_t off = static_cast<std::size_t>(written % bs);
+    const std::size_t chunk =
+      static_cast<std::size_t>(std::min<std::uint64_t>(payload_bytes - written, bs - off));
+    out.write(reinterpret_cast<const char*>(payload.at(idx).data() + off),
+              static_cast<std::streamsize>(chunk));
+    written += chunk;
+  }
+  out.close();
+  if (!out) { throw std::runtime_error("[compression_converters] write failed: " + path); }
+}
+
+// gpu_table_representation → compressed_host_representation (compress on spill).
+std::unique_ptr<cucascade::idata_representation> compress_gpu_to_host(
+  cucascade::idata_representation& source,
+  const cucascade::memory::memory_space* target_memory_space,
+  rmm::cuda_stream_view stream,
+  cucascade::memory::reservation* reservation)
+{
+  nvtx3::scoped_range nvtx_range{"sirius::compression::gpu_to_host_compress"};
+  const auto& ctx = require_spill_context();
+  auto& rep       = source.cast<cucascade::gpu_table_representation>();
+  auto view       = rep.get_table_view();
+
+  const std::size_t uncompressed_bytes = source.get_size_in_bytes();
+  auto staged                          = compress_for_spill(view, ctx, uncompressed_bytes, stream);
+
+  const auto* space = resolve_target_space(source, target_memory_space, reservation);
+  auto* space_mut   = const_cast<cucascade::memory::memory_space*>(space);
+  auto* host_mr     = space_mut->get_memory_resource_of<cucascade::memory::Tier::HOST>();
+  if (host_mr == nullptr) {
+    throw std::runtime_error(
+      "[compression_converters] spill target has no fixed_size_host_memory_resource");
+  }
+
+  // Stage the compressed bytes into pinned host blocks. The reservation passed in
+  // was sized for the uncompressed batch, so it comfortably covers the (smaller)
+  // compressed payload.
+  auto blob           = std::make_shared<pinned_compressed_blob>();
+  blob->header        = std::move(staged.header);
+  blob->payload       = host_mr->allocate_multiple_blocks(staged.payload_bytes, reservation);
+  blob->payload_bytes = staged.payload_bytes;
+  for (auto const& b : staged.buffers) {
+    if (b.size_bytes > 0 && b.device_ptr != nullptr) {
+      copy_device_to_pinned_blocks(
+        b.device_ptr, *blob->payload, b.offset, static_cast<std::size_t>(b.size_bytes), stream);
+    }
+  }
+  // `staged.table` owns the device buffers being read above; sync before it dies.
+  stream.synchronize();
+
+  SIRIUS_LOG_DEBUG("[compression_converters] spilled {}B → {}B compressed host (cols={} rows={})",
+                   uncompressed_bytes,
+                   staged.payload_bytes,
+                   view.num_columns(),
+                   view.num_rows());
+
+  return std::make_unique<compressed_host_representation>(
+    *space_mut,
+    std::move(blob),
+    synthetic_column_names(view.num_columns()),
+    static_cast<std::size_t>(staged.payload_bytes),
+    uncompressed_bytes,
+    static_cast<std::int64_t>(view.num_rows()));
+}
+
+// gpu_table_representation → compressed_disk_representation (compress on spill).
+std::unique_ptr<cucascade::idata_representation> compress_gpu_to_disk(
+  cucascade::idata_representation& source,
+  const cucascade::memory::memory_space* target_memory_space,
+  rmm::cuda_stream_view stream,
+  cucascade::memory::reservation* reservation)
+{
+  nvtx3::scoped_range nvtx_range{"sirius::compression::gpu_to_disk_compress"};
+  const auto& ctx = require_spill_context();
+  auto& rep       = source.cast<cucascade::gpu_table_representation>();
+  auto view       = rep.get_table_view();
+
+  const std::size_t uncompressed_bytes = source.get_size_in_bytes();
+  auto staged                          = compress_for_spill(view, ctx, uncompressed_bytes, stream);
+
+  const auto* space = resolve_target_space(source, target_memory_space, reservation);
+  auto* space_mut   = const_cast<cucascade::memory::memory_space*>(space);
+
+  const std::string path =
+    compression::make_compressed_temp_path(std::string(space_mut->get_disk_mount_path()));
+  const std::string err = simpatico::write_compressed_table(staged.table, path, stream);
+  if (!err.empty()) {
+    throw std::runtime_error("[compression_converters] write_compressed_table: " + err);
+  }
+
+  std::error_code ec;
+  const auto file_size = std::filesystem::file_size(path, ec);
+  const std::size_t compressed_bytes =
+    ec ? static_cast<std::size_t>(staged.header.size() + staged.payload_bytes)
+       : static_cast<std::size_t>(file_size);
+
+  SIRIUS_LOG_DEBUG("[compression_converters] spilled {}B → {}B compressed disk {}",
+                   uncompressed_bytes,
+                   compressed_bytes,
+                   path);
+
+  return std::make_unique<compressed_disk_representation>(
+    *space_mut,
+    path,
+    compressed_bytes,
+    uncompressed_bytes,
+    static_cast<std::int64_t>(view.num_rows()),
+    synthetic_column_names(view.num_columns()));
+}
+
+// compressed_host_representation → compressed_disk_representation (spill cascade).
+// The pinned blob is already in .hpln layout, so this is a straight file flush —
+// no decompress/re-compress round trip.
+std::unique_ptr<cucascade::idata_representation> flush_host_to_disk(
+  cucascade::idata_representation& source,
+  const cucascade::memory::memory_space* target_memory_space,
+  [[maybe_unused]] rmm::cuda_stream_view stream,
+  cucascade::memory::reservation* reservation)
+{
+  nvtx3::scoped_range nvtx_range{"sirius::compression::host_to_disk_flush"};
+  auto& rep = source.cast<compressed_host_representation>();
+
+  const auto* space = resolve_target_space(source, target_memory_space, reservation);
+  auto* space_mut   = const_cast<cucascade::memory::memory_space*>(space);
+
+  const std::string path =
+    compression::make_compressed_temp_path(std::string(space_mut->get_disk_mount_path()));
+  write_hpln_file(path, rep.header(), rep.payload(), rep.payload_bytes());
+
+  const std::size_t compressed_bytes = rep.header().size() + rep.payload_bytes();
+
+  SIRIUS_LOG_DEBUG(
+    "[compression_converters] flushed compressed host chunk → {} ({}B)", path, compressed_bytes);
+
+  return std::make_unique<compressed_disk_representation>(*space_mut,
+                                                          path,
+                                                          compressed_bytes,
+                                                          rep.get_uncompressed_data_size_in_bytes(),
+                                                          rep.num_rows(),
+                                                          rep.column_names());
+}
+
+// compressed_disk_representation → GPU (decompress on restore).
+std::unique_ptr<cucascade::idata_representation> decompress_disk_to_gpu(
+  cucascade::idata_representation& source,
+  const cucascade::memory::memory_space* target_memory_space,
+  rmm::cuda_stream_view stream,
+  [[maybe_unused]] cucascade::memory::reservation* reservation)
+{
+  nvtx3::scoped_range nvtx_range{"sirius::compression::disk_to_gpu"};
+  auto& rep     = source.cast<compressed_disk_representation>();
+  auto const mr = rmm::mr::get_current_device_resource_ref();
+
+  std::string read_error;
+  simpatico::compressed_table ct =
+    simpatico::read_compressed_table(rep.path(), stream, mr, &read_error);
+  if (!read_error.empty()) {
+    throw std::runtime_error("[compression_converters] read_compressed_table failed: " +
+                             read_error);
+  }
+
+  auto const& indices = rep.selected_indices();
+  const int n_threads = std::min(decompress_column_threads(),
+                                 static_cast<int>(indices ? indices->size() : ct.num_columns()));
+  std::unique_ptr<cudf::table> decompressed;
+  if (n_threads > 1) {
+    // The read above filled device buffers on `stream`; the parallel decode runs
+    // on its own pool streams, which are not ordered after it. Barrier first
+    // (mirrors reconstruct_and_decompress_to_gpu).
+    stream.synchronize();
+    decompressed = indices.has_value() ? simpatico::decompress(ct, *indices, n_threads, mr)
+                                       : simpatico::decompress(ct, n_threads, mr);
+    auto cols    = decompressed->release();
+    for (auto& c : cols) {
+      c = rebind_column_stream(std::move(c), stream);
+    }
+    decompressed = std::make_unique<cudf::table>(std::move(cols));
+  } else {
+    decompressed = indices.has_value() ? simpatico::decompress(ct, *indices, stream, mr)
+                                       : simpatico::decompress(ct, stream, mr);
+  }
+
+  const cucascade::memory::memory_space* space =
+    (target_memory_space != nullptr) ? target_memory_space : &source.get_memory_space();
+
+  SIRIUS_LOG_DEBUG("[compression_converters] decompressed from disk cols={} rows={} → GPU {}",
+                   decompressed->num_columns(),
+                   decompressed->num_rows(),
+                   space->get_device_id());
+
+  return std::make_unique<cucascade::gpu_table_representation>(
+    std::move(decompressed), *const_cast<cucascade::memory::memory_space*>(space), stream);
+}
+
 }  // namespace
 
 void register_compression_converters(cucascade::representation_converter_registry& registry)
@@ -242,6 +574,32 @@ void register_compression_converters(cucascade::representation_converter_registr
     registry
       .register_converter<compressed_device_representation, cucascade::gpu_table_representation>(
         decompress_device_to_gpu);
+  }
+  if (!registry
+         .has_converter<compressed_disk_representation, cucascade::gpu_table_representation>()) {
+    registry
+      .register_converter<compressed_disk_representation, cucascade::gpu_table_representation>(
+        decompress_disk_to_gpu);
+  }
+
+  // Spill (compress) paths. These require a spill_context installed by
+  // convertible_data_batch::convert(); without one they throw and the caller
+  // falls back to an uncompressed spill.
+  if (!registry
+         .has_converter<cucascade::gpu_table_representation, compressed_host_representation>()) {
+    registry
+      .register_converter<cucascade::gpu_table_representation, compressed_host_representation>(
+        compress_gpu_to_host);
+  }
+  if (!registry
+         .has_converter<cucascade::gpu_table_representation, compressed_disk_representation>()) {
+    registry
+      .register_converter<cucascade::gpu_table_representation, compressed_disk_representation>(
+        compress_gpu_to_disk);
+  }
+  if (!registry.has_converter<compressed_host_representation, compressed_disk_representation>()) {
+    registry.register_converter<compressed_host_representation, compressed_disk_representation>(
+      flush_host_to_disk);
   }
 }
 

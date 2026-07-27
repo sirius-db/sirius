@@ -41,6 +41,8 @@ extern "C" int cudaProfilerStop();
 #include "compression/compressed_representation.hpp"
 #include "compression/compression_converters.hpp"
 #include "compression/plan_register.hpp"
+#include "compression/simpatico_bridge.hpp"
+#include "compression/spill_context.hpp"
 #include "data/sirius_converter_registry.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
@@ -1990,6 +1992,39 @@ static void SetCompressionColumnThreads(ClientContext& context, SetScope scope, 
   SIRIUS_LOG_DEBUG("Updated compression_column_threads to {}", n);
 }
 
+// Mirror the spill-compression config into the process-global state the
+// cuCascade converters read (they have no access to a SiriusContext).
+static void PushSpillCompressionSettings(const sirius::compression_config& cfg)
+{
+  sirius::compression::set_spill_compression_settings(cfg.enable_spill_compression,
+                                                      cfg.spill_explore_beam_width,
+                                                      cfg.spill_explore_max_bytes,
+                                                      cfg.max_compressed_fraction);
+}
+
+static void SetSpillCompression(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  if (!sirius_ctx) { return; }
+  auto& cfg                    = sirius_ctx->get_config().get_compression_config();
+  cfg.enable_spill_compression = BooleanValue::Get(parameter);
+  PushSpillCompressionSettings(cfg);
+  SIRIUS_LOG_DEBUG("Updated spill_compression to {}", cfg.enable_spill_compression);
+}
+
+static void SetSpillCompressionExploreBeamWidth(ClientContext& context,
+                                                SetScope scope,
+                                                Value& parameter)
+{
+  auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  if (!sirius_ctx) { return; }
+  auto& cfg                    = sirius_ctx->get_config().get_compression_config();
+  cfg.spill_explore_beam_width = static_cast<uint32_t>(BigIntValue::Get(parameter));
+  PushSpillCompressionSettings(cfg);
+  SIRIUS_LOG_DEBUG("Updated spill_compression_explore_beam_width to {}",
+                   cfg.spill_explore_beam_width);
+}
+
 static void SetEnableDynamicFilterPushdown(ClientContext& context, SetScope scope, Value& parameter)
 {
   auto* params = get_operator_params(context);
@@ -2300,6 +2335,25 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
     LogicalType::BIGINT,
     Value::BIGINT(4),
     SetCompressionColumnThreads);
+
+  config.AddExtensionOption(
+    "spill_compression",
+    "Compress data batches with Simpatico when they are spilled off the GPU (GPU->HOST and "
+    "GPU->DISK downgrades). The compression plan is discovered once per operator output edge by "
+    "Simpatico's beam-search explorer on the first batch to spill from that edge, then reused. "
+    "Falls back to an uncompressed spill whenever compression fails or saves too little",
+    LogicalType::BOOLEAN,
+    Value::BOOLEAN(false),
+    SetSpillCompression);
+
+  config.AddExtensionOption(
+    "spill_compression_explore_beam_width",
+    "Beam width for the per-column explorer that runs on the first spill from each operator "
+    "output edge. Smaller values pick a plan faster but compress less well; the spill path "
+    "defaults well below the offline default (100) since it runs under memory pressure",
+    LogicalType::BIGINT,
+    Value::BIGINT(20),
+    SetSpillCompressionExploreBeamWidth);
 
   config.AddExtensionOption(
     "enable_dynamic_filter_pushdown",

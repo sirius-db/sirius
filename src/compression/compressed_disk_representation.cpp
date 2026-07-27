@@ -77,28 +77,32 @@ std::unique_ptr<cucascade::idata_representation> compressed_disk_representation:
   rmm::cuda_stream_view /*stream*/)
 {
   auto& ms = const_cast<cucascade::memory::memory_space&>(get_memory_space());
-  return std::make_unique<compressed_disk_representation>(ms,
-                                                          _path,
-                                                          _owns_file,
-                                                          _compressed_bytes,
-                                                          _uncompressed_bytes,
-                                                          _num_rows,
-                                                          _column_names,
-                                                          _selected_indices);
+  // Private (projection/clone) constructor: wrap `new` directly since
+  // make_unique cannot reach it.
+  return std::unique_ptr<compressed_disk_representation>(
+    new compressed_disk_representation(ms,
+                                       _path,
+                                       _owns_file,
+                                       _compressed_bytes,
+                                       _uncompressed_bytes,
+                                       _num_rows,
+                                       _column_names,
+                                       _selected_indices));
 }
 
 std::unique_ptr<compressed_disk_representation> compressed_disk_representation::select_columns(
   const std::vector<std::size_t>& indices) const
 {
   auto& ms = const_cast<cucascade::memory::memory_space&>(get_memory_space());
-  return std::make_unique<compressed_disk_representation>(ms,
-                                                          _path,
-                                                          _owns_file,
-                                                          _compressed_bytes,
-                                                          _uncompressed_bytes,
-                                                          _num_rows,
-                                                          _column_names,
-                                                          indices);
+  return std::unique_ptr<compressed_disk_representation>(
+    new compressed_disk_representation(ms,
+                                       _path,
+                                       _owns_file,
+                                       _compressed_bytes,
+                                       _uncompressed_bytes,
+                                       _num_rows,
+                                       _column_names,
+                                       indices));
 }
 
 }  // namespace sirius

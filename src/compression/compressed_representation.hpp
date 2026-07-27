@@ -164,6 +164,10 @@ class compressed_host_representation : public cucascade::idata_representation {
     return *_blob->payload;
   }
 
+  /// Logical byte length of the payload (the pinned allocation may be longer,
+  /// since it is rounded up to whole blocks).
+  [[nodiscard]] std::uint64_t payload_bytes() const noexcept { return _blob->payload_bytes; }
+
   [[nodiscard]] const std::vector<std::string>& column_names() const noexcept
   {
     return _column_names;

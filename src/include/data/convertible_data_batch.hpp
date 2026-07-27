@@ -16,6 +16,9 @@
 
 #pragma once
 
+#include "compression/compressed_disk_representation.hpp"
+#include "compression/compressed_representation.hpp"
+#include "compression/spill_context.hpp"
 #include "data/convertible_data.hpp"
 #include "data/sirius_converter_registry.hpp"
 #include "log/logging.hpp"
@@ -135,12 +138,18 @@ class convertible_data_batch : public convertible_data {
             converter_registry, *reservation, stream);
           break;
         case cucascade::memory::Tier::HOST:
-          mut.convert_to<cucascade::host_data_representation>(
-            converter_registry, *reservation, stream);
+          if (!try_convert_compressed<compressed_host_representation>(
+                mut, converter_registry, *reservation, stream)) {
+            mut.convert_to<cucascade::host_data_representation>(
+              converter_registry, *reservation, stream);
+          }
           break;
         case cucascade::memory::Tier::DISK:
-          mut.convert_to<cucascade::disk_data_representation>(
-            converter_registry, *reservation, stream);
+          if (!try_convert_compressed<compressed_disk_representation>(
+                mut, converter_registry, *reservation, stream)) {
+            mut.convert_to<cucascade::disk_data_representation>(
+              converter_registry, *reservation, stream);
+          }
           break;
         default: continue;
       }
@@ -178,6 +187,40 @@ class convertible_data_batch : public convertible_data {
   }
 
  private:
+  /**
+   * @brief Attempt a Simpatico-compressed spill into @p CompressedRep.
+   *
+   * Installs the spill context (so the converter can resolve — or, on the first
+   * spill from this edge, explore and cache — a plan keyed by the source
+   * repository), then converts. Returns false when compression is disabled, the
+   * batch has no known source edge, or the conversion throws; the caller then
+   * spills uncompressed.
+   *
+   * A throwing conversion leaves the batch untouched: convert_to() only installs
+   * the new representation after the converter returns, so falling through to the
+   * uncompressed path is safe.
+   */
+  template <typename CompressedRep>
+  bool try_convert_compressed(cucascade::mutable_data_batch& mut,
+                              cucascade::representation_converter_registry& converter_registry,
+                              cucascade::memory::reservation& reservation,
+                              rmm::cuda_stream_view stream)
+  {
+    if (!compression::spill_compression_enabled() || _source_repo == nullptr) { return false; }
+    try {
+      const auto ctx = compression::make_spill_context(_source_repo);
+      compression::scoped_spill_context guard(ctx);
+      mut.convert_to<CompressedRep>(converter_registry, reservation, stream);
+      return true;
+    } catch (const std::exception& e) {
+      SIRIUS_LOG_DEBUG(
+        "[convertible_data_batch] compressed spill declined ({}); "
+        "falling back to uncompressed",
+        e.what());
+      return false;
+    }
+  }
+
   std::shared_ptr<cucascade::data_batch> _batch;
   const cucascade::shared_data_repository* _source_repo{nullptr};
 };
