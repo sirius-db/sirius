@@ -533,8 +533,8 @@ bool run_ok(duckdb::Connection& con, std::string const& sql)
 }
 }  // namespace
 
-// v6 rewrite of "Internal query guard preserves transparent execution state":
-// the capture now lives on per-connection state with a planning generation, so
+// Successor of "Internal query guard preserves transparent execution state":
+// the capture lives on per-connection state with a planning generation, so
 // the properties to pin are (a) an internal query's lifecycle on ANOTHER
 // connection cannot disturb this connection's capture, and (b) a new planning
 // attempt on THIS connection structurally invalidates a leftover capture.

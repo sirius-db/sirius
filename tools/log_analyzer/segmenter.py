@@ -1,6 +1,6 @@
 """Split a log file into analytical-SQL query segments.
 
-v6 (SHAPE 1.7) keyed protocol: the AUTHORITATIVE segment boundary is the
+SHAPE 1.7 keyed protocol: the authoritative segment boundary is the
 `[window] begin ... end` line pair — exactly one of each per execution window,
 keyed by `(instance, connection, window)` (unlike the pool-stat lines, which
 repeat per HOST NUMA node / per GPU and therefore cannot delimit a window).
@@ -10,8 +10,8 @@ segment's lines run from its window-begin line through its window-end line, so
 time spent WAITING for the slot (before window begin) is never attributed to
 the window.
 
-Pre-v6 logs (no `[window]` lines; keyless pool lines; SQL emitted after the
-pool block) still parse via the legacy positional fallback on pool boundaries.
+Keyless logs (no `[window]` lines; SQL emitted after the pool block) still
+parse via the legacy positional fallback on pool boundaries.
 
 We keep only queries whose SQL (case-insensitive) starts with `select ` or
 `with `. If a window begin has no matching end (log truncated, crash), the
@@ -44,12 +44,14 @@ class QuerySegment:
     sql: str  # SQL text as it appears in the log (whitespace collapsed by the emitter)
     status: str  # "complete" | "incomplete"
     lines: List[str] = field(default_factory=list)  # raw lines covering this segment
-    # v6 correlation key (None on legacy keyless logs)
+    # correlation key (None on legacy keyless logs)
     instance: Optional[str] = None
     connection_id: Optional[int] = None
     window_id: Optional[int] = None
     query_id: Optional[int] = None
-    outcome: Optional[str] = None  # window-end outcome (ok / unwind / cleanup_failed)
+    outcome: Optional[str] = (
+        None  # window-end outcome (ok / unwind / cleanup_failed / begin_failed)
+    )
 
 
 def _extract_ts(line: str) -> Optional[str]:
@@ -93,7 +95,7 @@ def segment(lines: List[str]) -> List[QuerySegment]:
 def _segment_by_windows(
     lines: List[str], sql_by_key: Dict[Tuple[str, int, int], str]
 ) -> List[QuerySegment]:
-    """v6 path: `[window] begin/end` pairs are the authoritative boundaries."""
+    """Keyed path: `[window] begin/end` pairs are the authoritative boundaries."""
     segments: List[QuerySegment] = []
     for i, line in enumerate(lines):
         if not patterns.is_window_line(line):
@@ -162,7 +164,7 @@ def _segment_by_windows(
 
 
 def _segment_legacy_all(lines: List[str]) -> List[QuerySegment]:
-    """Pre-v6 positional pairing over pool boundaries (kept for old logs)."""
+    """Keyless positional pairing over pool boundaries (kept for old logs)."""
     segments: List[QuerySegment] = []
     i = 0
     n = len(lines)
