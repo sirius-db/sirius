@@ -14,7 +14,7 @@ that consumes this data can detect mismatched parser versions.
 
 import re
 
-SHAPE_VERSION = "1.6"
+SHAPE_VERSION = "1.7"
 
 # Timestamp at the start of every log line, e.g. "[2026-05-20 14:25:02.368]"
 TS_RE = re.compile(r"\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d+)\]")
@@ -31,10 +31,15 @@ DEBUG_TAG = "[debug]"
 #
 # Strict regex to extract stats from the host-pool boundary lines.
 # HOST:{device_id} group is optional so older logs (pre-e863fd4c) still parse.
+# v6 (SHAPE 1.7): execution-window pool lines carry a window key after the
+# tag: "QueryBegin instance=0x... connection=N window=W query=Q allocated=...".
+# The key group is optional so pre-v6 logs still parse.
 HOST_POOL_RE = re.compile(
     r"\[(?P<ts>[\d\-: .]+)\] \[info\] \[[^\]]+\] \[host_pool\] "
     r"(?:HOST:(?P<host_device_id>-?\d+) )?"
-    r"(?P<tag>QueryBegin|QueryEnd) "
+    r"(?P<tag>QueryBegin|QueryEnd)"
+    r"(?: instance=(?P<instance>\S+) connection=(?P<connection_id>\d+)"
+    r" window=(?P<window_id>\d+) query=(?P<query_id>\d+))? "
     r"allocated=(?P<allocated_bytes>\d+) bytes "
     r"peak=(?P<peak_bytes>\d+) bytes "
     r"free_blocks=(?P<free_blocks>\d+)"
@@ -44,20 +49,25 @@ HOST_POOL_RE = re.compile(
 # Predicates used by segmenter.py and parse_logs.py to detect query-boundary
 # lines without hardcoding the HOST device_id.
 def is_query_begin_line(line: str) -> bool:
-    return "[host_pool]" in line and "QueryBegin allocated=" in line
+    # v6 pool lines interpose the window key between the tag and "allocated=".
+    return "[host_pool]" in line and "QueryBegin" in line and "allocated=" in line
 
 
 def is_query_end_line(line: str) -> bool:
-    return "[host_pool]" in line and "QueryEnd allocated=" in line
+    return "[host_pool]" in line and "QueryEnd" in line and "allocated=" in line
 
 
 # --- GPU device memory pool stats at query boundaries (info-level) -----------
 # Example: "[2026-06-10 10:00:00.000] [info] [:] [gpu_pool] GPU:0 QueryBegin allocated=1234567890 bytes peak=1234567890 bytes reserved=1234567890 bytes"
 # One line per configured GPU; tag is QueryBegin or QueryEnd.
-GPU_POOL_ANCHOR = "[info] [:] [gpu_pool]"
+# Loose anchor only — real lines carry a "[file:line]" tag, not "[:]", so the
+# anchor must not hardcode the source-location field.
+GPU_POOL_ANCHOR = "[gpu_pool]"
 GPU_POOL_RE = re.compile(
     r"\[(?P<ts>[\d\-: .]+)\] \[info\] \[[^\]]+\] \[gpu_pool\] "
-    r"GPU:(?P<gpu_id>\d+) (?P<tag>QueryBegin|QueryEnd) "
+    r"GPU:(?P<gpu_id>\d+) (?P<tag>QueryBegin|QueryEnd)"
+    r"(?: instance=(?P<instance>\S+) connection=(?P<connection_id>\d+)"
+    r" window=(?P<window_id>\d+) query=(?P<query_id>\d+))? "
     r"allocated=(?P<allocated_bytes>\d+) bytes "
     r"peak=(?P<peak_bytes>\d+) bytes "
     r"reserved=(?P<reserved_bytes>\d+) bytes"
@@ -82,10 +92,40 @@ def is_pool_boundary_line(line: str) -> bool:
 # Example: "[2026-06-11 ...] [info] [sirius_context.cpp:246] QueryBegin: SQL: select ..."
 # "SQL: " was added to distinguish the SQL line from the pool-stat lines that
 # also begin with "QueryBegin" (e.g. "[host_pool] HOST:-1 QueryBegin allocated=").
-QUERY_SQL_ANCHOR = "QueryBegin: SQL: "
+# v6 (SHAPE 1.7): the SQL line carries the correlation key on the SAME line
+# ("QueryBegin: instance=0x... connection=N query=Q SQL: <sql>"); the keyless
+# pre-v6 form is still accepted.
+QUERY_SQL_ANCHOR = "SQL: "
+
+
+def is_query_sql_line(line: str) -> bool:
+    return "QueryBegin: " in line and QUERY_SQL_ANCHOR in line
+
+
 QUERY_SQL_RE = re.compile(
-    r"\[(?P<ts>[\d\-: .]+)\] \[info\] \[[^\]]+\] QueryBegin: SQL: (?P<sql>.*)$"
+    r"\[(?P<ts>[\d\-: .]+)\] \[info\] \[[^\]]+\] QueryBegin: "
+    r"(?:instance=(?P<instance>\S+) connection=(?P<connection_id>\d+)"
+    r" query=(?P<query_id>\d+) )?"
+    r"SQL: (?P<sql>.*)$"
 )
+
+# --- v6 execution-window boundary (authoritative for keyed segmentation) -----
+# "[ts] [info] [sirius_context.cpp:N] [window] begin instance=0x... connection=1 window=3 query=5 outcome=-"
+# "[ts] [info] [sirius_context.cpp:N] [window] end instance=0x... connection=1 window=3 query=5 outcome=ok"
+# Exactly ONE begin and one end line per execution window (unlike the pool
+# lines, which repeat per HOST NUMA node / per GPU), so these are the
+# authoritative segment boundaries for v6 logs.
+WINDOW_ANCHOR = "[window] "
+WINDOW_RE = re.compile(
+    r"\[(?P<ts>[\d\-: .]+)\] \[info\] \[[^\]]+\] \[window\] "
+    r"(?P<event>begin|end) instance=(?P<instance>\S+) connection=(?P<connection_id>\d+)"
+    r" window=(?P<window_id>\d+) query=(?P<query_id>\d+) outcome=(?P<outcome>\S+)"
+)
+
+
+def is_window_line(line: str) -> bool:
+    return WINDOW_ANCHOR in line
+
 
 # --- Pipeline Overview block -------------------------------------------------
 PIPELINE_OVERVIEW_HEADER = "=== Pipeline Overview ==="

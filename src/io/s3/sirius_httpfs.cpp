@@ -86,6 +86,19 @@ duckdb::shared_ptr<duckdb::SiriusContext> resolve_gated_sirius_context(
     throw std::runtime_error(std::string("[sirius_httpfs] no ClientContext while ") + verb + " '" +
                              path + "'; S3 reads require a Sirius-enabled connection");
   }
+  auto sirius_ctx = client->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  if (!sirius_ctx) {
+    throw std::runtime_error(std::string("[sirius_httpfs] Sirius is not initialized on this "
+                                         "connection while ") +
+                             verb + " '" + path + "'");
+  }
+  // Unavailable surface matrix: checked FIRST so an unavailable runtime always
+  // surfaces the stable unavailable error (a gpu_execution=false session must
+  // not mask it with the gpu-off message), and the untrusted scan manager is
+  // never consulted.
+  if (sirius_ctx->get_runtime_health() == duckdb::SiriusContext::runtime_health::UNAVAILABLE) {
+    sirius_ctx->throw_runtime_unavailable();
+  }
   // Transparent S3 is GPU-only. If gpu_execution is off there is no GPU
   // consumer, so serving here would be a CPU read of s3:// — which Sirius does
   // not support. Refuse with a clear message instead of silently serving a CPU
@@ -101,19 +114,16 @@ duckdb::shared_ptr<duckdb::SiriusContext> resolve_gated_sirius_context(
                                 "fallback; SET gpu_execution=true");
     }
   }
-  auto sirius_ctx = client->registered_state->Get<duckdb::SiriusContext>("sirius_state");
-  if (!sirius_ctx) {
-    throw std::runtime_error(std::string("[sirius_httpfs] Sirius is not initialized on this "
-                                         "connection while ") +
-                             verb + " '" + path + "'");
-  }
   // No S3 CPU fallback. A CPU-fallback replay active here means the GPU plan
-  // failed and we are replaying on CPU (run_internal_cpu_fallback_query wraps
-  // the replay in a CpuFallbackGuard). Refuse so s3:// data is never served to
-  // a CPU plan, even when reached indirectly through a view. Uses the narrow
+  // failed and we are replaying on CPU (the replay is wrapped in a
+  // CpuFallbackGuard). Refuse so s3:// data is never served to a CPU plan,
+  // even when reached indirectly through a view. Uses the narrow
   // CpuFallbackGuard flag (not the broad is_internal_query_active), so a
-  // legitimate internal s3:// read is not blocked.
-  if (sirius_ctx->is_cpu_fallback_active()) {
+  // legitimate internal s3:// read is not blocked. Since v6 the flag is
+  // per-connection (this connection's replay), so an unrelated connection's
+  // fallback no longer blocks this one's S3 access.
+  auto conn_state = duckdb::get_sirius_connection_state(*client);
+  if (conn_state && conn_state->is_cpu_fallback_active()) {
     throw duckdb::IOException(std::string("[sirius_httpfs] ") + verb + " '" + path +
                               "' on a CPU execution path: S3 CPU fallback is not supported (S3 is "
                               "GPU-only); Sirius has no CPU fallback for S3 data sources");
