@@ -92,9 +92,9 @@ bool is_preprocessing_compressor(std::string const& name);
 /// the name is unknown. The fused ops (delta / rle / bitpack / for / zigzag) are
 /// not here — they go through the JIT codegen encoder, not a compressor factory.
 ///
-/// Recognised names (incl. parameterised suffix forms):
-///   identity, dictionary, for, alp, alp_rd, ans,
-///   bitcomp[_default|_sparse], bitextract_<spec>.
+/// Factory-created names (including parameterised suffix forms):
+///   identity, dictionary, str_split, alp, alp_rd, ans, snappy, lz4, deflate,
+///   bitcomp[_default|_sparse], nvcomp_cascaded[_<opts>], bitextract_<spec>.
 std::unique_ptr<compressor> make_compressor(std::string const& name);
 
 }  // namespace simpatico

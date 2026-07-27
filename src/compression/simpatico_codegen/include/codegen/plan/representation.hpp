@@ -119,9 +119,9 @@ struct compressed_representation {
   /// compressors create new data during compression, and the original user
   /// input (column_view) is never stored in a representation.
 
-  /// Wire size in bytes (tight Compact layout). Default sums each dense
-  /// named_channels channel; override when actual size is tracked out-of-band
-  /// (e.g. sparse BITPACK OverAllocate buffers).
+  /// Wire size in bytes. Default sums each stored named channel. Fused Bitpack
+  /// reps are already Compact when published; encode-only OverAllocate scratch
+  /// and decode-only allocation slack are not exposed through named_channels().
   virtual size_t compressed_size_bytes(rmm::cuda_stream_view stream) const
   {
     size_t total = 0;
@@ -851,15 +851,15 @@ struct bitextract_compressor : compressor {
 
 // -----------------------------------------------------------------------------
 // Codegen-fused representations — produced only by the JIT encoder.
-// decompress() is unsupported; reconstruction goes through the decode kernels.
+// Storage-only: reconstruction goes through the PlanTree decode bridge.
 // -----------------------------------------------------------------------------
 
 // Holds a codegen-fused subtree node (Delta, Rle, Bitpack, ...). Buffers are
 // tagged with their manifest field name ("delta_first", "rle_runs_offsets", ...),
 // which differs from the registry's logical channel names — so this rep keeps its
 // own named-buffer storage and named_channels() rather than the registry-driven
-// generic path. decompress() throws; reconstruction goes through the decode
-// kernels. The tree structure and tail-routing are recovered from the plan DSL.
+// generic path. The tree structure and tail-routing are recovered from PlanTree;
+// DecodeWalk reconstructs it through the generated inverse kernels.
 struct codegen_fused_representation : compressed_representation {
   OpId op_id_;
   // Buffers in manifest order, each tagged with its manifest field name.

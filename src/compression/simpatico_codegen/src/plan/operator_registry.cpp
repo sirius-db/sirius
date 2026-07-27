@@ -32,7 +32,10 @@ std::optional<std::string_view> after_prefix(std::string const& name, std::strin
 std::vector<OperatorInfo> const& operator_registry()
 {
   // Catalog order: all_compressor_names() emits explorable ops in this order.
-  // channels mirror each rep's named_channels(); {} = variable-arity.
+  // channels are canonical DSL output ports used for plan routing; {} =
+  // variable-arity. Generic reps usually expose the same names through
+  // named_channels(), while fused reps persist separate manifest buffers.
+  // Decode-only transients such as Bitpack bp_offsets are never registry ports.
   // clang-format off
   // One row per operator; kept on a single line each (formatting disabled).
   //  id               name              channels                                                                 expl   term   pre    cg
@@ -132,6 +135,14 @@ bool is_preprocessing_compressor(std::string const& name)
   return id && op_info(*id).preprocessing;
 }
 
+// A node is codegen-fusable iff its OperatorInfo (registry table above) carries
+// the `codegen` flag.
+bool is_codegen_compressor(std::string const& op)
+{
+  auto id = op_id_from_name(op);
+  return id && op_info(*id).codegen;
+}
+
 // Resolve a DSL compressor name to a compressor instance, or nullptr if the
 // name is unknown or its parameters are malformed. The fused ops
 // (delta/rle/bitpack/for/zigzag) return nullptr here — they go through the JIT
@@ -187,14 +198,6 @@ std::unique_ptr<compressor> make_compressor(std::string const& name)
     case OpId::Zigzag: return nullptr;
   }
   return nullptr;
-}
-
-// A node is codegen-fusable iff its OperatorInfo (registry table above) carries
-// the `codegen` flag.
-bool is_codegen_compressor(std::string const& op)
-{
-  auto id = op_id_from_name(op);
-  return id && op_info(*id).codegen;
 }
 
 }  // namespace simpatico

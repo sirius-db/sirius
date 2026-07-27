@@ -32,8 +32,9 @@
 // fields per node:
 //   * Bitpack : chunk_min, chunk_bits, packed, bp_offsets (decode is
 //               Compact-only, so bp_offsets — synthesized on-device — is
-//               always present; chunk_count is unused at decode and
-//               intentionally omitted from the signature)
+//               always present). Persisted chunk_count is consumed by the
+//               bridge to synthesize bp_offsets, but is intentionally omitted
+//               from the generated kernel signature.
 //   * Delta   : delta_first
 //   * Rle     : rle_runs_offsets
 //   * For     : references (one per chunk)
