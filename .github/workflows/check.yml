@@ -37,7 +37,17 @@ jobs:
           global-environments: |
             pre-commit
 
-      - run: pre-commit run --show-diff-on-failure --all-files
+      - run: |
+          set -o pipefail
+          pre-commit run --show-diff-on-failure --all-files 2>&1 | tee /tmp/lint.log
+
+      - name: Surface lint errors
+        if: failure()
+        run: |
+          echo '## Lint errors' >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          grep -E '(Failed$|^- hook id:|^- exit code:|^- files were modified)' /tmp/lint.log | head -40 >> "$GITHUB_STEP_SUMMARY" || true
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
 
   build:
     env:
