@@ -131,12 +131,14 @@ struct operator_params {
   /// off carries no zone maps and cannot prune until re-pinned with the flag on.
   bool enable_pinned_zone_map_pruning = true;
 
-  /// Enable cuDF hardware (on-GPU) decompression for compressed parquet scans. When on, and the
-  /// installed CUDA driver supports hardware decompression on every GPU, SiriusContext exports
-  /// LIBCUDF_HW_DECOMPRESSION=ON for the lifetime of the context so cuDF's parquet reader routes
-  /// supported codecs through the hardware decompression engine. If any GPU lacks support the
-  /// export is skipped and cuDF falls back to software decompression.
-  bool use_hw_decompression = true;
+  /// Enable cuDF hardware (on-GPU) decompression for compressed parquet scans. Off by default:
+  /// opt-in because rmm::detail::hwdecompress::is_supported() only gates on the CUDA driver
+  /// version, not on whether the GPU actually has a decompression engine (e.g. it returns true on
+  /// Turing/T4, where the hardware path fails at runtime). When explicitly enabled, and the driver
+  /// reports support on every GPU, SiriusContext exports LIBCUDF_HW_DECOMPRESSION=ON for the
+  /// lifetime of the context so cuDF's parquet reader routes supported codecs through the hardware
+  /// decompression engine. Only enable it on GPUs known to support hardware decompression.
+  bool use_hw_decompression = false;
 };
 
 struct telemetry_config {
