@@ -3939,6 +3939,39 @@ TEST_CASE("gpu_execution - empty native table left join pads survivor rows",
   REQUIRE(result.column_count == 2);
 }
 
+// FULL OUTER and RIGHT joins are excluded from BUILD_PROBE and always run the STANDARD partial-
+// barrier path. When one side is a genuinely empty native table it delivers ZERO batches (its
+// concat emits nothing), so the STANDARD scheduler must still (a) drain the surviving side and (b)
+// emit its rows NULL-padded. These reproduce the empty-opposite-side terminal case for that path in
+// both directions.
+TEST_CASE("gpu_execution - empty native table full outer join pads survivor rows (empty build)",
+          "[integration][gpu_execution][empty_result][empty-table]")
+{
+  empty_native_table_fixture fixture;
+  auto result = compare_gpu_vs_cpu_with_watchdog(
+    *fixture.con,
+    "select n.n_nationkey, e.i from tpch.nation n full outer join e on n.n_nationkey = e.i "
+    "order by n.n_nationkey;",
+    std::chrono::seconds{30},
+    [&fixture] { fixture.leak_after_timeout(); });
+  REQUIRE(result.row_count == 25);
+  REQUIRE(result.column_count == 2);
+}
+
+TEST_CASE("gpu_execution - empty native table full outer join pads survivor rows (empty probe)",
+          "[integration][gpu_execution][empty_result][empty-table]")
+{
+  empty_native_table_fixture fixture;
+  auto result = compare_gpu_vs_cpu_with_watchdog(
+    *fixture.con,
+    "select n.n_nationkey, e.i from e full outer join tpch.nation n on e.i = n.n_nationkey "
+    "order by n.n_nationkey;",
+    std::chrono::seconds{30},
+    [&fixture] { fixture.leak_after_timeout(); });
+  REQUIRE(result.row_count == 25);
+  REQUIRE(result.column_count == 2);
+}
+
 TEST_CASE("gpu_execution - empty parquet count identity",
           "[integration][gpu_execution][parquet][empty_result][empty-table]")
 {
