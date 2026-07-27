@@ -81,6 +81,33 @@ def _statements(block):
     return statements
 
 
+_Q11_FRACTION = re.compile(
+    r"sum\(\s*ps_supplycost\s*\*\s*ps_availqty\s*\)\s*\*\s*([0-9]*\.[0-9]+)",
+    re.IGNORECASE,
+)
+
+
+def _check_q11_fraction(path, statements, sf):
+    """q11's fraction is 0.0001/SF, the only parameter that depends on scale.
+
+    A stream set built for another scale factor is still valid SQL, so the
+    mismatch changes q11's result instead of failing: too high a fraction
+    returns nothing, too low returns far more rows than the query should.
+    """
+    found = _Q11_FRACTION.search(" ".join(statements))
+    if not found:
+        return
+    actual = float(found.group(1))
+    expected = 0.0001 / sf
+    if actual <= 0 or abs(actual - expected) > expected * 0.01:
+        implied = 0.0001 / actual if actual > 0 else float("inf")
+        raise SystemExit(
+            f"{path}: q11 fraction {actual:.10f} implies SF{implied:g}, but this "
+            f"run is SF{sf:g}. Regenerate with generate_tpch_queries.sh "
+            f"{sf:g} <num_streams>."
+        )
+
+
 def stream_file(query_dir, stream):
     path = os.path.join(query_dir, f"stream{stream}.sql")
     if not os.path.isfile(path) or os.path.getsize(path) == 0:
@@ -92,8 +119,11 @@ def stream_file(query_dir, stream):
     return path
 
 
-def load_stream(query_dir, stream):
-    """Return [(qnum, [statements]), ...] in this stream's execution order."""
+def load_stream(query_dir, stream, sf=None):
+    """Return [(qnum, [statements]), ...] in this stream's execution order.
+
+    Pass `sf` to confirm the set was generated for this run's scale factor.
+    """
     path = stream_file(query_dir, stream)
     with open(path) as f:
         text = f.read()
@@ -108,6 +138,8 @@ def load_stream(query_dir, stream):
         qnum = int(tag.group(1))
         if qnum == 22:
             _check_q22_codes(path, statements)
+        if qnum == 11 and sf is not None:
+            _check_q11_fraction(path, statements, sf)
         plan.append((qnum, statements))
 
     if sorted(q for q, _ in plan) != list(range(1, 23)):

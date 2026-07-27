@@ -74,7 +74,7 @@ from performance_test import (
 )
 from queries import QUERIES
 from tpch_pin_columns import QUERY_COLUMNS
-from tpch_query_streams import load_stream, stream_file
+from tpch_query_streams import load_stream
 from tpch_stream_permutations import default_streams, stream_order
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -238,7 +238,7 @@ def stream_queries(stream, args):
     order and that stream's own substitution parameters.
     """
     if args.vary_predicates:
-        return load_stream(args.query_dir, stream)
+        return load_stream(args.query_dir, stream, args.sf)
     return [(q, [QUERIES[f"q{q}"]]) for q in stream_order(stream)]
 
 
@@ -808,7 +808,7 @@ def main():
         if args.mode in ("throughput", "both"):
             wanted.extend(range(1, streams + 1))
         for n in wanted:
-            stream_file(args.query_dir, n)
+            load_stream(args.query_dir, n, args.sf)
 
     # Require an explicit config; it sets GPU/host memory sizing and a stale one
     # can fail extension init.
