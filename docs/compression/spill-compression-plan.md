@@ -62,8 +62,13 @@ there is no blob yet.
 
 ## Status
 
-Items 1–8 are implemented (commits `36af3db0`, `b5c8ed50`); the build is green and
-the 21 existing compression tests pass. Item 9 (tests) is the remaining work.
+**All work items (1–9) are implemented.** The full C++ suite passes (2178 cases);
+the compression suite is 32 cases, of which 8 are the new spill tests.
+
+Remaining before this is production-ready: the reservation-oversizing item under
+"Future / deferred" below, and an end-to-end run under real memory pressure (the
+unit tests drive `convert()` directly rather than going through the downgrade
+executor).
 
 One design point resolved during implementation: cuCascade's converter signature
 (`source, target_space, stream, reservation`) cannot carry the repo pointer, so the
