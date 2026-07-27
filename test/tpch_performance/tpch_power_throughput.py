@@ -493,11 +493,24 @@ def throughput_run(con, args, run_dir, writer, streams):
     stream_elapsed = {}
     refresh_times = []
 
+    def fail(label, e):
+        """Record a worker failure and release everyone waiting on the barrier.
+
+        Setup runs inside the guard because a worker that dies before
+        barrier.wait() never arrives, and a no-show does not break a barrier:
+        the remaining parties would wait forever. Catch BaseException because
+        stream_queries raises SystemExit, which is not an Exception.
+        """
+        errors.append(f"{label}: {e}")
+        log(f"  [{label}] FAILED: {e}")
+        barrier.abort()
+
     def query_stream(i):
-        cur = con.cursor()
-        sql(cur, "SET gpu_execution = true")
-        plan = stream_queries(i, args)
+        cur = None
         try:
+            cur = con.cursor()
+            sql(cur, "SET gpu_execution = true")
+            plan = stream_queries(i, args)
             barrier.wait()
             start = time.perf_counter()
             for q, statements in plan:
@@ -507,16 +520,19 @@ def throughput_run(con, args, run_dir, writer, streams):
                     writer.writerow(["throughput", i, f"q{q}", f"{elapsed:.6f}"])
                 log(f"  [stream {i}] q{q}: {elapsed:.4f}s")
             stream_elapsed[i] = time.perf_counter() - start
-        except Exception as e:  # noqa: BLE001 - reported after join
-            errors.append(f"query stream {i}: {e}")
-            log(f"  [stream {i}] FAILED: {e}")
+        except threading.BrokenBarrierError:
+            pass  # another worker failed and reported the cause
+        except BaseException as e:  # noqa: BLE001 - reported after join
+            fail(f"query stream {i}", e)
         finally:
-            cur.close()
+            if cur is not None:
+                cur.close()
 
     def refresh_stream():
-        cur = con.cursor()
-        sql(cur, "SET gpu_execution = false")
+        cur = None
         try:
+            cur = con.cursor()
+            sql(cur, "SET gpu_execution = false")
             barrier.wait()
             for pair in range(1, streams + 1):
                 n = pair + 1  # set 1 belongs to the power run
@@ -534,11 +550,13 @@ def throughput_run(con, args, run_dir, writer, streams):
                     writer.writerow(
                         ["throughput", "refresh", f"rf2_set{n}", f"{t2:.6f}"]
                     )
-        except Exception as e:  # noqa: BLE001 - reported after join
-            errors.append(f"refresh stream: {e}")
-            log(f"  [refresh] FAILED: {e}")
+        except threading.BrokenBarrierError:
+            pass  # another worker failed and reported the cause
+        except BaseException as e:  # noqa: BLE001 - reported after join
+            fail("refresh stream", e)
         finally:
-            cur.close()
+            if cur is not None:
+                cur.close()
 
     threads = [
         threading.Thread(target=query_stream, args=(i,), name=f"stream-{i}")
@@ -548,7 +566,10 @@ def throughput_run(con, args, run_dir, writer, streams):
     log(f"=== Throughput: {streams} query streams + 1 refresh stream ===")
     for t in threads:
         t.start()
-    barrier.wait()
+    try:
+        barrier.wait()
+    except threading.BrokenBarrierError:
+        pass  # a worker failed before starting; the error is raised after join
     start = time.perf_counter()
     for t in threads:
         t.join()
