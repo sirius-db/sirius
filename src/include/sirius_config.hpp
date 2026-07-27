@@ -130,6 +130,13 @@ struct operator_params {
   /// pin-time statistics capture and the serve-side survivor plan: a table pinned while the flag is
   /// off carries no zone maps and cannot prune until re-pinned with the flag on.
   bool enable_pinned_zone_map_pruning = true;
+
+  /// Enable cuDF hardware (on-GPU) decompression for compressed parquet scans. When on, and the
+  /// installed CUDA driver supports hardware decompression on every GPU, SiriusContext exports
+  /// LIBCUDF_HW_DECOMPRESSION=ON for the lifetime of the context so cuDF's parquet reader routes
+  /// supported codecs through the hardware decompression engine. If any GPU lacks support the
+  /// export is skipped and cuDF falls back to software decompression.
+  bool use_hw_decompression = true;
 };
 
 struct telemetry_config {

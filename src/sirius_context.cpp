@@ -42,6 +42,7 @@
 #include <cudf/utilities/pinned_memory.hpp>
 
 #include <rmm/cuda_device.hpp>
+#include <rmm/detail/runtime_capabilities.hpp>
 
 #include <cuda_runtime_api.h>
 
@@ -444,6 +445,34 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
     }
   }
 
+  // Enable cuDF hardware (on-GPU) decompression when requested and supported by every GPU.
+  // rmm::detail::hwdecompress::is_supported() gates on the installed CUDA driver version; we probe
+  // it under each GPU's device context so a mixed fleet (any GPU without support) disables the
+  // feature. When supported everywhere we export LIBCUDF_HW_DECOMPRESSION=ON via an RAII env_guard
+  // held for the context lifetime, so cuDF's parquet reader routes supported codecs through the
+  // hardware decompression engine. get_hw_topology() is the only authorised GPU enumeration source.
+  if (config_.get_operator_params().use_hw_decompression) {
+    bool supported_on_all = topo.num_gpus > 0;
+    for (auto const& gpu : topo.gpus) {
+      rmm::cuda_set_device_raii dev_guard{rmm::cuda_device_id{static_cast<int>(gpu.id)}};
+      if (!rmm::detail::hwdecompress::is_supported()) {
+        supported_on_all = false;
+        SIRIUS_LOG_INFO(
+          "SiriusContext: GPU {} does not support hardware decompression; "
+          "LIBCUDF_HW_DECOMPRESSION will not be enabled",
+          gpu.id);
+        break;
+      }
+    }
+    if (supported_on_all) {
+      hw_decompression_env_guard_.emplace("LIBCUDF_HW_DECOMPRESSION", "ON");
+      SIRIUS_LOG_INFO(
+        "SiriusContext: hardware decompression supported on all {} GPU(s); "
+        "exported LIBCUDF_HW_DECOMPRESSION=ON",
+        topo.num_gpus);
+    }
+  }
+
   // Configure cuDF to use our pinned slab allocator for small internal host buffers
   // (e.g. column_device_view metadata arrays in cudf::concatenate).  This eliminates
   // the pageable H2D transfers that cuDF issues by default.
@@ -563,6 +592,11 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
 void SiriusContext::terminate()
 {
   throw_if_not_initialized();
+
+  // Restore LIBCUDF_HW_DECOMPRESSION to its prior state (unset it if we exported it). Paired with
+  // the emplace in initialize(); the RAII env_guard would also restore on destruction, but reset
+  // here keeps the variable scoped to the initialized lifetime so a re-initialize starts clean.
+  hw_decompression_env_guard_.reset();
 
   task_scheduler_->stop();
   task_scheduler_.reset();

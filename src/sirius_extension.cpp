@@ -1778,6 +1778,14 @@ static void SetEnablePinnedZoneMapPruning(ClientContext& context, SetScope scope
                    params->enable_pinned_zone_map_pruning);
 }
 
+static void SetUseHwDecompression(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  params->use_hw_decompression = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config USE_HW_DECOMPRESSION to {}", params->use_hw_decompression);
+}
+
 void SiriusExtension::InitialGPUConfigs(DBConfig& config)
 {
   // Add in config option for gpu buffer manager
@@ -2032,6 +2040,15 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
     LogicalType::BOOLEAN,
     Value::BOOLEAN(sirius::operator_params{}.enable_pinned_zone_map_pruning),
     SetEnablePinnedZoneMapPruning);
+
+  config.AddExtensionOption(
+    "use_hw_decompression",
+    "Enable cuDF hardware (on-GPU) decompression for compressed parquet scans. Takes effect only "
+    "when the CUDA driver supports hardware decompression on every GPU, in which case Sirius "
+    "exports LIBCUDF_HW_DECOMPRESSION=ON for the lifetime of the context",
+    LogicalType::BOOLEAN,
+    Value::BOOLEAN(sirius::operator_params{}.use_hw_decompression),
+    SetUseHwDecompression);
 }
 
 static void LoadInternal(ExtensionLoader& loader)

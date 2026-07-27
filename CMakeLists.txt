@@ -367,7 +367,8 @@ set(EXTENSION_SOURCES
     src/transparent/physical_sirius_execution.cpp
     src/transparent/sirius_optimizer_extension.cpp
     src/util/stream_check_wrapper.cpp
-    src/util/segfault_backtrace_handler.cpp)
+    src/util/segfault_backtrace_handler.cpp
+    src/util/env_guard.cpp)
 # cmake-format: on
 
 # Legacy Sirius — all legacy-specific config lives in src/legacy/CMakeLists.txt.

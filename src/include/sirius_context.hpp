@@ -26,6 +26,7 @@
 #include "scan_manager/sirius_scan_manager.hpp"
 #include "sirius_config.hpp"
 #include "telemetry/telemetry_context.hpp"
+#include "util/env_guard.hpp"
 
 #include <rmm/resource_ref.hpp>
 
@@ -329,6 +330,11 @@ class SiriusContext : public ClientContextState {
   std::atomic<bool> query_lifecycle_held_{false};
   bool is_initialized_ = false;
   sirius::sirius_config config_;
+  // Holds LIBCUDF_HW_DECOMPRESSION=ON while the context is initialized, when
+  // operator_params.use_hw_decompression is set and every GPU's CUDA driver
+  // supports hardware decompression. Emplaced in initialize(), reset in
+  // terminate(); RAII restores the variable's prior state on destruction.
+  std::optional<sirius::util::env_guard> hw_decompression_env_guard_;
   std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> memory_manager_;
   // Single source of truth for the GPU<->NUMA hardware topology, scoped to the
   // memory manager's reserved GPU/HOST spaces. Shared by shared_ptr copy with
