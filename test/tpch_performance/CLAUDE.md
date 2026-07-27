@@ -69,6 +69,12 @@ grep -oE 'stats-pruned [0-9]+ row groups' /tmp/cluster_verify/sirius_*.log
 
 ### From DuckDB's built-in TPC-H generator
 
+> **Prefer `generate_tpch_data.sh`.** DuckDB's `tpch` extension emits the same keys, numbers and
+> names as the classic tools, but a different synthetic comment pool, so q13 and q16 — which
+> filter on `o_comment` and `s_comment` — return different results. `generate_tpch_data.sh` runs
+> the classic `dbgen` for both formats, matching the refresh sets, the query streams, and
+> tpchgen-rs.
+
 ```bash
 # From project root - generates parquet files with DuckDB's default row groups (122K rows)
 ./build/release/duckdb -c "INSTALL tpch; LOAD tpch; CALL dbgen(sf=100); EXPORT DATABASE 'test_datasets/tpch_parquet_sf100' (FORMAT PARQUET);"
@@ -475,7 +481,8 @@ Output: `reports/<label>_<YYYYMMDD_HHMMSS>/` containing `report.md`, `summary.js
 | `run_tpch_parquet.sh` | Unified query runner for both engines (sirius/duckdb), single-session with cold+warm |
 | `run_tpch_duckdb.sh` | Query runner over a `.duckdb` file (native tables); `--duckdb-file`; `--gpu-native-scan` is a no-op alias |
 | `run_tpch_parquet_duckdb.sh` | DuckDB-only baseline runner |
-| `generate_tpch_data.sh` | Generate TPC-H parquet or duckdb data via tpchgen-rs / dbgen (`--format duckdb`) |
+| `generate_tpch_data.sh` | Generate TPC-H parquet (tpchgen-rs) or duckdb (`--format duckdb`, classic dbgen + `tpch_schema.sql`) data |
+| `tpch_schema.sql` | TPC-H DDL for loading dbgen `.tbl` output, typed to match what DuckDB's tpch extension creates |
 | `sweep_threads.sh` | Thread configuration sweep (Sirius-only) |
 | `profile_tpch_nsys.sh` | Profile queries with nsys, producing .nsys-rep and .sqlite per query |
 | `nsys_analyze.sh` | Analyze nsys SQLite profiles (kernels, memory, NVTX, I/O) |

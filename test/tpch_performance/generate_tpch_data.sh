@@ -66,6 +66,42 @@ CLUSTER_KEYS="lineitem:l_shipdate,orders:o_orderdate"
 # Fixed TPC-H table set (used by the clustered duckdb build).
 TPCH_TABLES="nation region part supplier partsupp customer orders lineitem"
 
+# shellcheck source=dbgen_bootstrap.sh
+. "$SCRIPT_DIR/dbgen_bootstrap.sh"
+
+# Build a .duckdb from the classic dbgen, the same generator that produces the
+# refresh sets and query streams. The .tbl files are staged next to the output
+# and removed afterwards; dbgen writes them into DSS_PATH but resolves dists.dss
+# relative to its own directory.
+build_duckdb_from_dbgen() {
+    local out="$1" sf="$2"
+    local dbgen_dir="$PROJECT_DIR/test_datasets/tpch-dbgen"
+    local stage="${out%.duckdb}.tbl_stage"
+
+    ensure_tpch_tools "$dbgen_dir" "$PROJECT_DIR" dbgen
+    mkdir -p "$stage"
+    stage="$(cd "$stage" && pwd)"
+    # shellcheck disable=SC2064
+    trap "rm -rf '$stage'" EXIT
+
+    echo "Running dbgen at SF${sf} ..."
+    (cd "$dbgen_dir" && DSS_PATH="$stage" ./dbgen -f -q -s "$sf")
+
+    rm -f "$out" "$out".wal
+    local load_sql
+    load_sql="$(cat "$SCRIPT_DIR/tpch_schema.sql")"
+    local t
+    for t in $TPCH_TABLES; do
+        load_sql+=" COPY $t FROM '$stage/$t.tbl' (HEADER false, DELIMITER '|');"
+    done
+    # Loading needs no GPU, and a stale Sirius config would otherwise block it.
+    echo "Loading .tbl files into $out ..."
+    SIRIUS_DISABLE=1 "$DUCKDB" "$out" -c "$load_sql"
+
+    rm -rf "$stage"
+    trap - EXIT
+}
+
 while [ $# -gt 0 ]; do
     case "$1" in
         --format)
@@ -184,7 +220,8 @@ elif [ "$FORMAT" = "duckdb" ]; then
         trap 'rm -f "$STAGING" "$STAGING".wal' EXIT
 
         echo "Generating TPC-H SF${SF} (staging) ..."
-        "$DUCKDB" "$STAGING" -c "INSTALL tpch; LOAD tpch; CALL dbgen(sf=${SF}); CHECKPOINT;"
+        build_duckdb_from_dbgen "$STAGING" "$SF"
+        SIRIUS_DISABLE=1 "$DUCKDB" "$STAGING" -c "CHECKPOINT;"
 
         # Parse --cluster-keys "table:col,table:col" into a lookup.
         declare -A SORT_COL
@@ -213,7 +250,7 @@ elif [ "$FORMAT" = "duckdb" ]; then
         BUILD_SQL+=" CHECKPOINT;"
 
         echo "Writing sorted database into $OUTPUT ..."
-        "$DUCKDB" "$OUTPUT" -c "$BUILD_SQL"
+        SIRIUS_DISABLE=1 "$DUCKDB" "$OUTPUT" -c "$BUILD_SQL"
 
         rm -f "$STAGING" "$STAGING".wal
         trap - EXIT
@@ -223,7 +260,7 @@ elif [ "$FORMAT" = "duckdb" ]; then
         fi
 
         echo "Generating TPC-H SF${SF} data into $OUTPUT ..."
-        "$DUCKDB" "$OUTPUT" -c "INSTALL tpch; LOAD tpch; CALL dbgen(sf=${SF});"
+        build_duckdb_from_dbgen "$OUTPUT" "$SF"
     fi
 fi
 
