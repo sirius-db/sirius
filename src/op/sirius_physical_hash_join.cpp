@@ -1073,20 +1073,6 @@ std::pair<bool, bool> sirius_physical_hash_join::refresh_cross_schedule()
   return {probe_finished, build_finished};
 }
 
-/// Build a 0-row cudf table with one column per logical type — the full schema of a join side. Used
-/// to synthesize the missing (empty-opposite) side when a partition survives against an empty
-/// table.
-static std::unique_ptr<cudf::table> make_empty_join_side_table(
-  const duckdb::vector<sirius::logical_type>& types)
-{
-  std::vector<std::unique_ptr<cudf::column>> cols;
-  cols.reserve(types.size());
-  for (auto const& t : types) {
-    cols.push_back(cudf::make_empty_column(sirius::get_cudf_type(t)));
-  }
-  return std::make_unique<cudf::table>(std::move(cols));
-}
-
 std::unique_ptr<operator_data> sirius_physical_hash_join::get_next_task_input_data()
 {
   // Hold the mutex for the entire operation to prevent concurrent pop/get races. A pop on one
@@ -1165,7 +1151,7 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::get_next_task_input_da
                                                     : children[1]->get_types();  // absent build
     rmm::cuda_set_device_raii const device_guard{rmm::cuda_device_id{ms->get_device_id()}};
     auto empty_batch = make_data_batch(
-      make_empty_join_side_table(opp_types), *ms, cudf::get_default_stream(), batch_telemetry());
+      sirius::make_empty_table(opp_types), *ms, cudf::get_default_stream(), batch_telemetry());
 
     std::vector<std::shared_ptr<cucascade::data_batch>> input_batch;
     input_batch.reserve(2);
