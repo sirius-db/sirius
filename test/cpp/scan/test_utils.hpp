@@ -21,6 +21,7 @@
 
 // sirius
 #include "memory/sirius_memory_reservation_manager.hpp"
+#include "memory/topology_index.hpp"
 
 // data representations
 #include <data/data_batch_utils.hpp>
@@ -30,6 +31,7 @@
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/data/data_repository.hpp>
 #include <cucascade/memory/reservation_manager_configurator.hpp>
+#include <cucascade/memory/topology_discovery.hpp>
 #include <data/sirius_converter_registry.hpp>
 #include <helper/helper.hpp>
 
@@ -87,6 +89,15 @@ inline std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> initia
   // Initialize converters used by data representations
   sirius::converter_registry::initialize();
   return manager;
+}
+
+inline std::shared_ptr<const sirius::memory::topology_index> discover_topology_index(
+  const sirius::memory::sirius_memory_reservation_manager& manager)
+{
+  cucascade::memory::system_topology_info topology;
+  cucascade::memory::topology_discovery discovery;
+  if (discovery.discover()) { topology = discovery.get_topology(); }
+  return std::make_shared<sirius::memory::topology_index>(std::move(topology), manager);
 }
 
 namespace sirius::scan_test_utils {

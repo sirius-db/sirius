@@ -18,7 +18,6 @@
 #include "utils/s3_container.hpp"
 
 #include <arpa/inet.h>
-#include <cucascade/memory/topology_discovery.hpp>
 #include <duckdb.hpp>
 #include <duckdb/common/file_system.hpp>
 #include <duckdb/common/open_file_info.hpp>
@@ -310,27 +309,10 @@ class exposed_sirius_httpfs final : public sirius::io::s3::sirius_httpfs {
   using sirius::io::s3::sirius_httpfs::SupportsOpenFileExtended;
 };
 
-cucascade::memory::system_topology_info single_gpu_topology()
-{
-  cucascade::memory::system_topology_info topology;
-  topology.num_gpus = 1;
-  cucascade::memory::gpu_topology_info gpu;
-  gpu.id        = 0;
-  gpu.numa_node = 0;
-  topology.gpus.push_back(std::move(gpu));
-  return topology;
-}
-
-std::shared_ptr<const sirius::memory::topology_index> single_gpu_index()
-{
-  return std::make_shared<sirius::memory::topology_index>(single_gpu_topology(),
-                                                          std::vector<int>{0});
-}
-
 struct glob_scan_manager_fixture {
   std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> memory =
     initialize_memory_manager(1);
-  std::shared_ptr<const sirius::memory::topology_index> topology = single_gpu_index();
+  std::shared_ptr<const sirius::memory::topology_index> topology = discover_topology_index(*memory);
 };
 
 sirius::scan_manager::scan_manager_config make_fake_list_config(std::string endpoint)

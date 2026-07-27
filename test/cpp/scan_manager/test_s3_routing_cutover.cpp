@@ -38,7 +38,6 @@
 #include <rmm/device_buffer.hpp>
 
 #include <arpa/inet.h>
-#include <cucascade/memory/topology_discovery.hpp>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/time.h>
@@ -151,23 +150,6 @@ bool is_local_backend(std::optional<io_context_type> type)
   return type.has_value() && (*type == io_context_type::uring || *type == io_context_type::kvikio);
 }
 
-cucascade::memory::system_topology_info single_gpu_topology()
-{
-  cucascade::memory::system_topology_info topology;
-  topology.num_gpus = 1;
-  cucascade::memory::gpu_topology_info gpu;
-  gpu.id        = 0;
-  gpu.numa_node = 0;
-  topology.gpus.push_back(std::move(gpu));
-  return topology;
-}
-
-std::shared_ptr<const sirius::memory::topology_index> single_gpu_index()
-{
-  return std::make_shared<sirius::memory::topology_index>(single_gpu_topology(),
-                                                          std::vector<int>{0});
-}
-
 scan_manager_config make_s3_scan_config(std::string endpoint, bool use_sirius_datasource)
 {
   scan_manager_config cfg{};
@@ -194,7 +176,7 @@ scan_manager_config make_s3_scan_config(std::string endpoint, bool use_sirius_da
 struct scan_manager_fixture {
   std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> memory =
     initialize_memory_manager(1);
-  std::shared_ptr<const sirius::memory::topology_index> topology = single_gpu_index();
+  std::shared_ptr<const sirius::memory::topology_index> topology = discover_topology_index(*memory);
 };
 
 std::unique_ptr<sirius::op::scan::parquet_ingestible_table_info> make_nation_table_info(
