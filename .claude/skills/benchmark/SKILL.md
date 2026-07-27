@@ -233,8 +233,10 @@ pixi run python test/tpch_performance/tpch_power_throughput.py \
 
 **Flags** (full reference in `test/tpch_performance/CLAUDE.md`): `--mode power|throughput|both`
 (default `both`), `--streams N` (default: spec minimum for SF — SF1→2, SF10→3, SF30→4, SF100→5),
-`--pin gpu|host` (always one of these), `--validation/--no-validation` (default on; the power run
-diffs GPU vs a same-process DuckDB CPU cursor after RF1 and after RF2), `--baseline-pass/--no-baseline-pass`
+`--pin gpu|host` (always one of these), `--vary-predicates/--no-vary-predicates` (default fixed;
+varied draws per-stream substitution parameters and rejects `--validation`), `--param-seed N`,
+`--validation/--no-validation` (fixed predicates only, default on; the power run diffs GPU vs a
+same-process DuckDB CPU cursor after RF1 and after RF2), `--baseline-pass/--no-baseline-pass`
 (default on; adds the clean pre-refresh timing pass so delta/mask overhead is attributable),
 `--query-timeout`, `--output`, `--keep-scratch-db`.
 
@@ -302,13 +304,17 @@ option) and ask for the rest. Mark sensible defaults "(Recommended)".
 **Round 2 — run shape**
 1. **Mode** (`--mode`): `power`, `throughput`, or `both` (default `both`). In `both` the
    throughput run continues on the same pinned DB right after the power run, with no unpin/repin.
-2. **Pin tier** (`--pin`): `gpu` or `host`. This run is always pinned; the only choice is the
+2. **Predicates** (`--vary-predicates`): fixed for every stream (Recommended; required for
+   validation) or varied per stream (spec-style draws like qgen, seeded via `--param-seed`;
+   validation not supported). Always ask this — it decides whether validation is even possible.
+3. **Pin tier** (`--pin`): `gpu` or `host`. This run is always pinned; the only choice is the
    tier. Prefer `host` at large SF, since pinning all 8 tables to GPU can OOM and disk spill is
    off by default.
-3. **Streams** (`--streams`): throughput query-stream count (default: TPC-H spec minimum for the
+4. **Streams** (`--streams`): throughput query-stream count (default: TPC-H spec minimum for the
    SF). Ensure the refresh dir has `streams + 1` sets.
-4. **Validation** (`--validation`, default on): after RF1 and RF2, diff GPU vs a same-process
-   DuckDB CPU cursor. Keep on unless the user wants timings only.
+5. **Validation** (`--validation`): only ask with fixed predicates (default on there): after RF1
+   and RF2, diff GPU vs a same-process DuckDB CPU cursor. With varied predicates skip the
+   question — the runner rejects `--validation` — and tell the user the run is timing-only.
 
 `--baseline-pass` (clean pre-refresh pass, default on) and `--query-timeout` can take defaults
 unless the user asks otherwise.

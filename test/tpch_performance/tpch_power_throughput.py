@@ -28,6 +28,11 @@ continues on the same pinned database right after the power run, with no unpin o
 repin, so it sees the update-set-1 rows the power run left behind. The single
 modes each pin a fresh copy of the input.
 
+Every stream runs the same fixed substitution parameters by default, which keeps
+validation and the clean/post-RF1/post-RF2 comparison meaningful.
+--vary-predicates instead draws spec parameters per stream (seeded via
+--param-seed); validation is not supported in that mode.
+
 Metrics (TPC-H spec 5.4):
     Power@Size      = 3600 * SF / geomean(22 stream-0 query times + T_RF1 + T_RF2)
     Throughput@Size = (N * 22 * 3600 / measurement_interval) * SF
@@ -66,9 +71,10 @@ from performance_test import (
     get_git_info,
     log,
 )
-from queries import QUERIES
+from queries import QUERIES, render
 from tpch_pin_columns import QUERY_COLUMNS
 from tpch_stream_permutations import default_streams, stream_order
+from tpch_substitutions import stream_params
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -148,8 +154,8 @@ def run_refresh(cur, statements, label):
 # ---------------------------------------------------------------------------
 
 
-def timed_query(cur, qnum, timeout_s):
-    """Run q<qnum>, fetch all rows, and return (elapsed_s, rows)."""
+def timed_query(cur, qnum, timeout_s, queries):
+    """Run q<qnum> from `queries`, fetch all rows, and return (elapsed_s, rows)."""
     timer = None
     if timeout_s:
         timer = threading.Timer(timeout_s, cur.interrupt)
@@ -157,11 +163,19 @@ def timed_query(cur, qnum, timeout_s):
         timer.start()
     start = time.perf_counter()
     try:
-        rows = cur.execute(QUERIES[f"q{qnum}"]).fetchall()
+        rows = cur.execute(queries[f"q{qnum}"]).fetchall()
     finally:
         if timer is not None:
             timer.cancel()
     return time.perf_counter() - start, rows
+
+
+def queries_for_stream(stream, args):
+    """The stream's 22 queries: fixed literals unless --vary-predicates."""
+    if not args.vary_predicates:
+        return QUERIES
+    params = stream_params(stream, args.param_seed, args.sf)
+    return {q: render(q, p) for q, p in params.items()}
 
 
 def compare_rows(cpu_rows, gpu_rows):
@@ -176,13 +190,13 @@ def compare_rows(cpu_rows, gpu_rows):
     return None
 
 
-def validate_pass(cpu, gpu_rows_by_q, perm, label, timeout_s):
+def validate_pass(cpu, gpu_rows_by_q, perm, label, timeout_s, queries):
     """Diff stored GPU rows against fresh DuckDB CPU runs on the current state."""
     failures = {}
     for q in perm:
         if q in REFRESH_INVARIANT_QUERIES:
             continue
-        _, cpu_rows = timed_query(cpu, q, timeout_s)
+        _, cpu_rows = timed_query(cpu, q, timeout_s, queries)
         msg = compare_rows(cpu_rows, gpu_rows_by_q[q])
         if msg is None:
             log(f"  [{label}] q{q}: OK")
@@ -274,6 +288,7 @@ def geomean(values):
 
 def power_run(con, args, run_dir, writer):
     perm = stream_order(0)
+    queries = queries_for_stream(0, args)
     gpu = con.cursor()
     cpu = con.cursor()
     rf = con.cursor()
@@ -285,7 +300,7 @@ def power_run(con, args, run_dir, writer):
         def timed_pass(phase, result_name):
             times, rows_by_q = {}, {}
             for q in perm:
-                elapsed, rows = timed_query(gpu, q, args.query_timeout)
+                elapsed, rows = timed_query(gpu, q, args.query_timeout, queries)
                 times[q], rows_by_q[q] = elapsed, rows
                 with _write_lock:
                     writer.writerow([phase, 0, f"q{q}", f"{elapsed:.6f}"])
@@ -324,7 +339,7 @@ def power_run(con, args, run_dir, writer):
         if args.validation:
             log("=== Power: validating post-RF1 state vs DuckDB CPU (untimed) ===")
             validation["after_rf1"] = validate_pass(
-                cpu, rows_p0, perm, "after RF1", args.query_timeout
+                cpu, rows_p0, perm, "after RF1", args.query_timeout, queries
             )
 
         log("=== Power: RF2 (delete update set 1) ===")
@@ -347,7 +362,7 @@ def power_run(con, args, run_dir, writer):
         if args.validation:
             log("=== Power: validating post-RF2 state vs DuckDB CPU (untimed) ===")
             validation["after_rf2"] = validate_pass(
-                cpu, rows_p2, perm, "after RF2", args.query_timeout
+                cpu, rows_p2, perm, "after RF2", args.query_timeout, queries
             )
 
         power_at_size = 3600.0 * args.sf / geomean(list(t_p0.values()) + [t_rf1, t_rf2])
@@ -386,11 +401,12 @@ def throughput_run(con, args, run_dir, writer, streams):
     def query_stream(i):
         cur = con.cursor()
         sql(cur, "SET gpu_execution = true")
+        queries = queries_for_stream(i, args)
         try:
             barrier.wait()
             start = time.perf_counter()
             for q in stream_order(i):
-                elapsed, _ = timed_query(cur, q, args.query_timeout)
+                elapsed, _ = timed_query(cur, q, args.query_timeout, queries)
                 stream_times[i][f"q{q}"] = elapsed
                 with _write_lock:
                     writer.writerow(["throughput", i, f"q{q}", f"{elapsed:.6f}"])
@@ -470,7 +486,11 @@ def write_summary(run_dir, args, streams, power, throughput, qphh):
     lines = []
     out = lines.append
     out("=" * 72)
-    out(f"  TPC-H Power / Throughput — Sirius   (SF{args.sf:g}, pin={args.pin})")
+    predicates = "varied" if args.vary_predicates else "fixed"
+    out(
+        f"  TPC-H Power / Throughput — Sirius   "
+        f"(SF{args.sf:g}, pin={args.pin}, predicates={predicates})"
+    )
     out("=" * 72)
     if power:
         out("")
@@ -546,6 +566,8 @@ def write_run_info(run_dir, args, streams):
         f"streams: {streams}",
         f"pin: {args.pin}",
         f"mode: {args.mode}",
+        f"vary_predicates: {args.vary_predicates}",
+        f"param_seed: {args.param_seed}",
         f"validation: {args.validation}",
         f"config: {os.environ.get('SIRIUS_CONFIG_FILE', '(default)')}",
     ]
@@ -598,6 +620,19 @@ def parse_args():
         "also disables GPU serving of refreshed tables (debug only).",
     )
     p.add_argument(
+        "--vary-predicates",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Draw per-stream substitution parameters (spec 2.4) instead of the "
+        "fixed literals; not compatible with --validation",
+    )
+    p.add_argument(
+        "--param-seed",
+        type=int,
+        default=1,
+        help="Seed for --vary-predicates draws (default: 1)",
+    )
+    p.add_argument(
         "--config",
         type=str,
         default=os.environ.get("SIRIUS_CONFIG_FILE", ""),
@@ -614,8 +649,9 @@ def parse_args():
     p.add_argument(
         "--validation",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Diff GPU vs DuckDB CPU results after RF1 and RF2 (power run)",
+        default=None,
+        help="Diff GPU vs DuckDB CPU results after RF1 and RF2 (power run; "
+        "default: on unless --vary-predicates)",
     )
     p.add_argument(
         "--baseline-pass",
@@ -645,6 +681,12 @@ def main():
         )
 
     streams = args.streams if args.streams is not None else default_streams(args.sf)
+
+    # Validation diffs GPU vs CPU rows, so it needs the fixed default predicates.
+    if args.vary_predicates and args.validation:
+        raise SystemExit("--vary-predicates does not support --validation")
+    if args.validation is None:
+        args.validation = not args.vary_predicates
 
     # Fail fast if any needed refresh set is missing.
     needed = []
@@ -682,6 +724,8 @@ def main():
     log(f"Refresh dir:   {args.refresh_dir}")
     log(f"Streams:       {streams}")
     log(f"Config:        {config}")
+    predicates = f"varied (seed={args.param_seed})" if args.vary_predicates else "fixed"
+    log(f"Predicates:    {predicates}")
 
     power = throughput = None
     with open(os.path.join(run_dir, "timings.csv"), "w", newline="") as f:
@@ -711,6 +755,8 @@ def main():
         "sf": args.sf,
         "streams": streams,
         "pin": args.pin,
+        "vary_predicates": args.vary_predicates,
+        "param_seed": args.param_seed,
         "input": args.input,
         "refresh_dir": args.refresh_dir,
         "commit": commit,

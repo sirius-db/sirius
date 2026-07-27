@@ -280,6 +280,13 @@ same pinned database right after the power run, with no unpin/repin, so it sees 
 rows the power run left behind. This matches the spec's continuous sequence and skips a second
 copy and pin. The single modes each pin a fresh copy of the input.
 
+Substitution parameters are fixed by default: every stream runs the same literals from
+`queries.py`, so passes stay comparable and validation can diff GPU vs CPU. `--vary-predicates`
+instead draws each stream's parameters from the spec 2.4 distributions
+(`tpch_substitutions.py`), like qgen does per stream; draws are deterministic per
+(`--param-seed`, stream), and the power run's three passes share the stream-0 draw. Validation
+is not supported with varied predicates — the runner rejects `--validation`.
+
 Metrics (TPC-H spec 5.4): `Power@Size = 3600·SF / geomean(22 stream-0 query times + T_RF1 +
 T_RF2)`, `Throughput@Size = N·22·3600 / measurement_interval · SF`, `QphH@Size =
 sqrt(Power · Throughput)`.
@@ -299,8 +306,8 @@ sqrt(Power · Throughput)`.
 - The summary reports per-query `clean`, `post-RF1`, and `post-RF2` times, plus `delta overhead`
   (post-RF1 − clean) and `mask overhead` (post-RF2 − post-RF1). Power@Size itself uses only the
   post-RF1 stream.
-- Validation (default on, power run only): after RF1 and after RF2, each refresh-affected query's
-  GPU rows are diffed against a DuckDB CPU cursor in the same process. A separate process would
+- Validation (default on with fixed predicates, power run only): after RF1 and after RF2, each
+  refresh-affected query's GPU rows are diffed against a DuckDB CPU cursor in the same process. A separate process would
   read the stale pre-refresh disk image, since refreshes are committed but not checkpointed.
   q2/q11/q16 touch neither table and are skipped. Row-count movement across RF1/RF2 is also
   checked. Any mismatch exits non-zero.
@@ -333,8 +340,10 @@ pixi run python test/tpch_performance/tpch_power_throughput.py \
 Key flags: `--config <yaml>` (**required** unless `SIRIUS_CONFIG_FILE` is set — the runner refuses
 to start without an explicit config; there is no default path), `--mode power|throughput|both`,
 `--streams N`, `--pin gpu|host|none` (`none` disables pinning and thereby GPU serving of refreshed
-tables — debug only), `--validation/--no-validation`, `--baseline-pass/--no-baseline-pass`,
-`--query-timeout <s>`, `--keep-scratch-db`, `--output`.
+tables — debug only), `--vary-predicates/--no-vary-predicates` (per-stream spec parameter draws;
+rejects `--validation`), `--param-seed <n>`, `--validation/--no-validation` (fixed predicates
+only), `--baseline-pass/--no-baseline-pass`, `--query-timeout <s>`, `--keep-scratch-db`,
+`--output`.
 
 Output (under `test/tpch_performance/output/tpch_power_<ts>_sf<SF>_s<N>/`): `metrics.json`
 (all metrics + per-query/per-stream times + validation verdicts), `timings.csv`
@@ -437,7 +446,8 @@ Output: `reports/<label>_<YYYYMMDD_HHMMSS>/` containing `report.md`, `summary.js
 | `nsys_report.sh` | Orchestrate profiling + analysis into a self-contained report |
 | `rewrite_parquet.py` | Rewrite parquet with GPU-optimized row groups (cudf or pyarrow fallback) |
 | `performance_test.py` | Python-based benchmark with result verification |
-| `queries.py` | TPC-H query definitions (base SQL) |
+| `queries.py` | TPC-H query templates (`{PLACEHOLDER}` substitution parameters) + the fixed default rendering `QUERIES` |
+| `tpch_substitutions.py` | Per-stream substitution parameter draws (spec 2.4 distributions), seeded and deterministic |
 | `tpch_pin_columns.py` | Per-query and union column → table mapping for `--pinning-mode per-query` / `pinned-hot` (union helpers also used by `performance_test.py --mode sequential`); emits `CALL pin_table(...)` / `CALL unpin_table(...)` SQL |
 | `tpch_power_throughput.py` | TPC-H power & throughput runs with RF1/RF2 refresh functions; Power@Size / Throughput@Size / QphH@Size + delta/mask overhead breakdown |
 | `tpch_stream_permutations.py` | Spec Appendix A query-stream orderings (streams 0–40) + spec-minimum stream counts |

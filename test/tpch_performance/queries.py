@@ -12,9 +12,14 @@
 # the License.
 # =============================================================================
 
-"""TPC-H query definitions (base SQL without gpu_processing wrapper)."""
+"""TPC-H query definitions (base SQL without gpu_processing wrapper).
 
-QUERIES = {
+QUERY_TEMPLATES holds the 22 queries with {PLACEHOLDER} substitution
+parameters. QUERIES renders them with DEFAULT_PARAMS, one fixed draw shared
+by every stream; tpch_substitutions.stream_params draws per-stream values.
+"""
+
+QUERY_TEMPLATES = {
     "q1": """select
     l_returnflag,
     l_linestatus,
@@ -29,7 +34,7 @@ QUERIES = {
 from
     lineitem
 where
-    l_shipdate <= date '1995-08-19'
+    l_shipdate <= date '{DATE}'
 group by
     l_returnflag,
     l_linestatus
@@ -54,11 +59,11 @@ from
 where
   p.p_partkey = ps.ps_partkey
   and s.s_suppkey = ps.ps_suppkey
-  and p.p_size = 41
-  and p.p_type like '%NICKEL'
+  and p.p_size = {SIZE}
+  and p.p_type like '%{TYPE}'
   and s.s_nationkey = n.n_nationkey
   and n.n_regionkey = r.r_regionkey
-  and r.r_name = 'EUROPE'
+  and r.r_name = '{REGION}'
   and ps.ps_supplycost = (
     select
       min(ps.ps_supplycost)
@@ -72,7 +77,7 @@ where
       and s.s_suppkey = ps.ps_suppkey
       and s.s_nationkey = n.n_nationkey
       and n.n_regionkey = r.r_regionkey
-      and r.r_name = 'EUROPE'
+      and r.r_name = '{REGION}'
   )
 order by
   s.s_acctbal desc,
@@ -90,11 +95,11 @@ from
   orders o,
   lineitem l
 where
-  c.c_mktsegment = 'HOUSEHOLD'
+  c.c_mktsegment = '{SEGMENT}'
   and c.c_custkey = o.o_custkey
   and l.l_orderkey = o.o_orderkey
-  and o.o_orderdate < date '1995-03-25'
-  and l.l_shipdate > date '1995-03-25'
+  and o.o_orderdate < date '{DATE}'
+  and l.l_shipdate > date '{DATE}'
 group by
   l.l_orderkey,
   o.o_orderdate,
@@ -109,8 +114,8 @@ limit 10""",
 from
   orders o
 where
-  o.o_orderdate >= date '1996-10-01'
-  and o.o_orderdate < date '1997-01-01'
+  o.o_orderdate >= date '{DATE}'
+  and o.o_orderdate < date '{DATE_END}'
   and
   exists (
     select
@@ -142,9 +147,9 @@ where
   and c.c_nationkey = s.s_nationkey
   and s.s_nationkey = n.n_nationkey
   and n.n_regionkey = r.r_regionkey
-  and r.r_name = 'EUROPE'
-  and o.o_orderdate >= date '1997-01-01'
-  and o.o_orderdate < date '1998-01-01'
+  and r.r_name = '{REGION}'
+  and o.o_orderdate >= date '{DATE}'
+  and o.o_orderdate < date '{DATE_END}'
 group by
   n.n_name
 order by
@@ -154,10 +159,10 @@ order by
 from
   lineitem
 where
-  l_shipdate >= date '1997-01-01'
-  and l_shipdate < date '1998-01-01'
-  and l_discount between 0.03 - 0.01 and 0.03 + 0.01
-  and l_quantity < 24""",
+  l_shipdate >= date '{DATE}'
+  and l_shipdate < date '{DATE_END}'
+  and l_discount between {DISCOUNT} - 0.01 and {DISCOUNT} + 0.01
+  and l_quantity < {QUANTITY}""",
     "q7": """select
   supp_nation,
   cust_nation,
@@ -184,8 +189,8 @@ from
       and s.s_nationkey = n1.n_nationkey
       and c.c_nationkey = n2.n_nationkey
       and (
-        (n1.n_name = 'EGYPT' and n2.n_name = 'UNITED STATES')
-        or (n1.n_name = 'UNITED STATES' and n2.n_name = 'EGYPT')
+        (n1.n_name = '{NATION1}' and n2.n_name = '{NATION2}')
+        or (n1.n_name = '{NATION2}' and n2.n_name = '{NATION1}')
       )
       and l.l_shipdate between date '1995-01-01' and date '1996-12-31'
   ) as shipping
@@ -200,7 +205,7 @@ order by
     "q8": """select
   o_year,
   sum(case
-    when nation = 'EGYPT' then volume
+    when nation = '{NATION}' then volume
     else 0
   end) / sum(volume) as mkt_share
 from
@@ -225,10 +230,10 @@ from
       and o.o_custkey = c.c_custkey
       and c.c_nationkey = n1.n_nationkey
       and n1.n_regionkey = r.r_regionkey
-      and r.r_name = 'MIDDLE EAST'
+      and r.r_name = '{REGION}'
       and s.s_nationkey = n2.n_nationkey
       and o.o_orderdate between date '1995-01-01' and date '1996-12-31'
-      and p.p_type = 'PROMO BRUSHED COPPER'
+      and p.p_type = '{TYPE}'
   ) as all_nations
 group by
   o_year
@@ -258,7 +263,7 @@ from
       and p.p_partkey = l.l_partkey
       and o.o_orderkey = l.l_orderkey
       and s.s_nationkey = n.n_nationkey
-      and p.p_name like '%yellow%'
+      and p.p_name like '%{COLOR}%'
   ) as profit
 group by
   nation,
@@ -283,8 +288,8 @@ from
 where
   c.c_custkey = o.o_custkey
   and l.l_orderkey = o.o_orderkey
-  and o.o_orderdate >= date '1994-03-01'
-  and o.o_orderdate < date '1994-06-01'
+  and o.o_orderdate >= date '{DATE}'
+  and o.o_orderdate < date '{DATE_END}'
   and l.l_returnflag = 'R'
   and c.c_nationkey = n.n_nationkey
 group by
@@ -308,12 +313,12 @@ from
 where
   ps.ps_suppkey = s.s_suppkey
   and s.s_nationkey = n.n_nationkey
-  and n.n_name = 'GERMANY'
+  and n.n_name = '{NATION}'
 group by
   ps.ps_partkey having
     sum(ps.ps_supplycost * ps.ps_availqty) > (
       select
-        sum(ps.ps_supplycost * ps.ps_availqty) * 0.0001000000
+        sum(ps.ps_supplycost * ps.ps_availqty) * {FRACTION}
       from
         partsupp ps,
         supplier s,
@@ -321,7 +326,7 @@ group by
       where
         ps.ps_suppkey = s.s_suppkey
         and s.s_nationkey = n.n_nationkey
-        and n.n_name = 'GERMANY'
+        and n.n_name = '{NATION}'
     )
 order by
   value desc""",
@@ -344,11 +349,11 @@ from
   lineitem l
 where
   o.o_orderkey = l.l_orderkey
-  and l.l_shipmode in ('TRUCK', 'REG AIR')
+  and l.l_shipmode in ('{SHIPMODE1}', '{SHIPMODE2}')
   and l.l_commitdate < l.l_receiptdate
   and l.l_shipdate < l.l_commitdate
-  and l.l_receiptdate >= date '1994-01-01'
-  and l.l_receiptdate < date '1995-01-01'
+  and l.l_receiptdate >= date '{DATE}'
+  and l.l_receiptdate < date '{DATE_END}'
 group by
   l.l_shipmode
 order by
@@ -365,7 +370,7 @@ from
       customer c
       left outer join orders o
         on c.c_custkey = o.o_custkey
-        and o.o_comment not like '%special%requests%'
+        and o.o_comment not like '%{WORD1}%{WORD2}%'
     group by
       c.c_custkey
   ) as orders (c_custkey, c_count)
@@ -385,8 +390,8 @@ from
   part p
 where
   l.l_partkey = p.p_partkey
-  and l.l_shipdate >= date '1994-08-01'
-  and l.l_shipdate < date '1994-09-01'""",
+  and l.l_shipdate >= date '{DATE}'
+  and l.l_shipdate < date '{DATE_END}'""",
     "q15": """with revenue_view as (
   select
     l_suppkey as supplier_no,
@@ -394,8 +399,8 @@ where
   from
     lineitem
   where
-    l_shipdate >= date '1993-05-01'
-    and l_shipdate < date '1993-08-01'
+    l_shipdate >= date '{DATE}'
+    and l_shipdate < date '{DATE_END}'
   group by
     l_suppkey
 )
@@ -429,9 +434,9 @@ from
   part p
 where
   p.p_partkey = ps.ps_partkey
-  and p.p_brand <> 'Brand#21'
-  and p.p_type not like 'MEDIUM PLATED%'
-  and p.p_size in (38, 2, 8, 31, 44, 5, 14, 24)
+  and p.p_brand <> 'Brand#{BRAND}'
+  and p.p_type not like '{TYPE}%'
+  and p.p_size in ({SIZES})
   and ps.ps_suppkey not in (
     select
       s.s_suppkey
@@ -456,8 +461,8 @@ from
   part p
 where
   p.p_partkey = l.l_partkey
-  and p.p_brand = 'Brand#13'
-  and p.p_container = 'JUMBO CAN'
+  and p.p_brand = 'Brand#{BRAND}'
+  and p.p_container = '{CONTAINER}'
   and l.l_quantity < (
     select
       0.2 * avg(l2.l_quantity)
@@ -485,7 +490,7 @@ where
       lineitem
     group by
       l_orderkey having
-        sum(l_quantity) > 300
+        sum(l_quantity) > {QUANTITY}
   )
   and c.c_custkey = o.o_custkey
   and o.o_orderkey = l.l_orderkey
@@ -507,9 +512,9 @@ from
 where
   (
     p.p_partkey = l.l_partkey
-    and p.p_brand = 'Brand#41'
+    and p.p_brand = 'Brand#{BRAND1}'
     and p.p_container in ('SM CASE', 'SM BOX', 'SM PACK', 'SM PKG')
-    and l.l_quantity >= 2 and l.l_quantity <= 2 + 10
+    and l.l_quantity >= {QTY1} and l.l_quantity <= {QTY1} + 10
     and p.p_size between 1 and 5
     and l.l_shipmode in ('AIR', 'AIR REG')
     and l.l_shipinstruct = 'DELIVER IN PERSON'
@@ -517,9 +522,9 @@ where
   or
   (
     p.p_partkey = l.l_partkey
-    and p.p_brand = 'Brand#13'
+    and p.p_brand = 'Brand#{BRAND2}'
     and p.p_container in ('MED BAG', 'MED BOX', 'MED PKG', 'MED PACK')
-    and l.l_quantity >= 14 and l.l_quantity <= 14 + 10
+    and l.l_quantity >= {QTY2} and l.l_quantity <= {QTY2} + 10
     and p.p_size between 1 and 10
     and l.l_shipmode in ('AIR', 'AIR REG')
     and l.l_shipinstruct = 'DELIVER IN PERSON'
@@ -527,9 +532,9 @@ where
   or
   (
     p.p_partkey = l.l_partkey
-    and p.p_brand = 'Brand#55'
+    and p.p_brand = 'Brand#{BRAND3}'
     and p.p_container in ('LG CASE', 'LG BOX', 'LG PACK', 'LG PKG')
-    and l.l_quantity >= 23 and l.l_quantity <= 23 + 10
+    and l.l_quantity >= {QTY3} and l.l_quantity <= {QTY3} + 10
     and p.p_size between 1 and 15
     and l.l_shipmode in ('AIR', 'AIR REG')
     and l.l_shipinstruct = 'DELIVER IN PERSON'
@@ -553,7 +558,7 @@ where
         from
           part p
         where
-          p.p_name like 'antique%'
+          p.p_name like '{COLOR}%'
       )
       and ps.ps_availqty > (
         select
@@ -563,12 +568,12 @@ where
         where
           l.l_partkey = ps.ps_partkey
           and l.l_suppkey = ps.ps_suppkey
-          and l.l_shipdate >= date '1993-01-01'
-          and l.l_shipdate < date '1994-01-01'
+          and l.l_shipdate >= date '{DATE}'
+          and l.l_shipdate < date '{DATE_END}'
       )
   )
   and s.s_nationkey = n.n_nationkey
-  and n.n_name = 'KENYA'
+  and n.n_name = '{NATION}'
 order by
   s.s_name""",
     "q21": """select
@@ -604,7 +609,7 @@ where
       and l3.l_receiptdate > l3.l_commitdate
   )
   and s.s_nationkey = n.n_nationkey
-  and n.n_name = 'BRAZIL'
+  and n.n_name = '{NATION}'
 group by
   s.s_name
 order by
@@ -624,7 +629,7 @@ from
       customer c
     where
       substring(c_phone from 1 for 2) in
-        ('24', '31', '11', '16', '21', '20', '34')
+        ({CODES})
       and c_acctbal > (
         select
           avg(c_acctbal)
@@ -633,7 +638,7 @@ from
         where
           c_acctbal > 0.00
           and substring(c_phone from 1 for 2) in
-            ('24', '31', '11', '16', '21', '20', '34')
+            ({CODES})
       )
       and not exists (
         select
@@ -649,3 +654,64 @@ group by
 order by
   cntrycode""",
 }
+
+DEFAULT_PARAMS = {
+    "q1": {"DATE": "1995-08-19"},
+    "q2": {"SIZE": 41, "TYPE": "NICKEL", "REGION": "EUROPE"},
+    "q3": {"SEGMENT": "HOUSEHOLD", "DATE": "1995-03-25"},
+    "q4": {"DATE": "1996-10-01", "DATE_END": "1997-01-01"},
+    "q5": {"REGION": "EUROPE", "DATE": "1997-01-01", "DATE_END": "1998-01-01"},
+    "q6": {
+        "DATE": "1997-01-01",
+        "DATE_END": "1998-01-01",
+        "DISCOUNT": "0.03",
+        "QUANTITY": 24,
+    },
+    "q7": {"NATION1": "EGYPT", "NATION2": "UNITED STATES"},
+    "q8": {"NATION": "EGYPT", "REGION": "MIDDLE EAST", "TYPE": "PROMO BRUSHED COPPER"},
+    "q9": {"COLOR": "yellow"},
+    "q10": {"DATE": "1994-03-01", "DATE_END": "1994-06-01"},
+    "q11": {"NATION": "GERMANY", "FRACTION": "0.0001000000"},
+    "q12": {
+        "SHIPMODE1": "TRUCK",
+        "SHIPMODE2": "REG AIR",
+        "DATE": "1994-01-01",
+        "DATE_END": "1995-01-01",
+    },
+    "q13": {"WORD1": "special", "WORD2": "requests"},
+    "q14": {"DATE": "1994-08-01", "DATE_END": "1994-09-01"},
+    "q15": {"DATE": "1993-05-01", "DATE_END": "1993-08-01"},
+    "q16": {
+        "BRAND": "21",
+        "TYPE": "MEDIUM PLATED",
+        "SIZES": "38, 2, 8, 31, 44, 5, 14, 24",
+    },
+    "q17": {"BRAND": "13", "CONTAINER": "JUMBO CAN"},
+    "q18": {"QUANTITY": 300},
+    "q19": {
+        "BRAND1": "41",
+        "QTY1": 2,
+        "BRAND2": "13",
+        "QTY2": 14,
+        "BRAND3": "55",
+        "QTY3": 23,
+    },
+    "q20": {
+        "COLOR": "antique",
+        "DATE": "1993-01-01",
+        "DATE_END": "1994-01-01",
+        "NATION": "KENYA",
+    },
+    "q21": {"NATION": "BRAZIL"},
+    "q22": {"CODES": "'24', '31', '11', '16', '21', '20', '34'"},
+}
+
+
+def render(name, params):
+    """Fill one query template with substitution parameter values."""
+    return QUERY_TEMPLATES[name].format(**params)
+
+
+# The fixed default rendering, shared by every stream unless a runner opts
+# into per-stream parameters (tpch_substitutions.stream_params).
+QUERIES = {name: render(name, DEFAULT_PARAMS[name]) for name in QUERY_TEMPLATES}
