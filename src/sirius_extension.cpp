@@ -3142,6 +3142,14 @@ static void SetEnablePinnedZoneMapPruning(ClientContext& context, SetScope scope
                    params->enable_pinned_zone_map_pruning);
 }
 
+static void SetUseHwDecompression(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  params->use_hw_decompression = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config USE_HW_DECOMPRESSION to {}", params->use_hw_decompression);
+}
+
 static void SetAdmissionBytesPerGpu(ClientContext& context, SetScope scope, Value& parameter)
 {
   auto const bytes = UBigIntValue::Get(parameter);
@@ -3554,6 +3562,15 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config, const sirius::siriu
     LogicalType::BOOLEAN,
     Value::BOOLEAN(operator_defaults.enable_compressed_materialization),
     SetEnableCompressedMaterialization);
+
+  config.AddExtensionOption(
+    "use_hw_decompression",
+    "Enable cuDF hardware (on-GPU) decompression for compressed parquet scans. Takes effect only "
+    "when every GPU reports hardware-decompression support in cucascade topology, in which case "
+    "Sirius exports LIBCUDF_HW_DECOMPRESSION=ON for the lifetime of the context",
+    LogicalType::BOOLEAN,
+    Value::BOOLEAN(operator_defaults.use_hw_decompression),
+    SetUseHwDecompression);
 
   config.AddExtensionOption(
     "admission_bytes_per_gpu",

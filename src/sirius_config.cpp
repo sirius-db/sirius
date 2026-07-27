@@ -359,6 +359,7 @@ static void from_yaml(const YAML::Node& node, operator_params& opt)
       "'operator_params.avg_variable_column_bytes': must be greater than zero");
   }
   r.optional("enable_runtime_size_estimation", opt.enable_runtime_size_estimation);
+  r.optional("use_hw_decompression", opt.use_hw_decompression);
   r.reject_unknown();
 }
 

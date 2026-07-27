@@ -194,6 +194,14 @@ struct operator_params {
   /// off carries no zone maps and cannot prune until re-pinned with the flag on.
   bool enable_pinned_zone_map_pruning = true;
 
+  /// Enable cuDF hardware (on-GPU) decompression for compressed parquet scans. Off by default:
+  /// opt-in because the driver-only support probe returns true on GPUs (e.g. Turing/T4) whose
+  /// runtime path actually fails. When explicitly enabled, and every GPU reports support via
+  /// cucascade topology's runtime_properties, SiriusContext exports LIBCUDF_HW_DECOMPRESSION=ON
+  /// for the lifetime of the context so cuDF's parquet reader routes supported codecs through
+  /// the hardware decompression engine.
+  bool use_hw_decompression = false;
+
   /// Store eligible integer and fixed-point DECIMAL columns in carriers selected from exact
   /// per-chunk bounds during pinning. Matching pinned scans derive targets from recorded storage
   /// metadata; other scans use native carriers. Logical types remain unchanged, and type-sensitive
