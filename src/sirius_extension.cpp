@@ -3565,9 +3565,10 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config, const sirius::siriu
 
   config.AddExtensionOption(
     "use_hw_decompression",
-    "Enable cuDF hardware (on-GPU) decompression for compressed parquet scans. Takes effect only "
-    "when every GPU reports hardware-decompression support in cucascade topology, in which case "
-    "Sirius exports LIBCUDF_HW_DECOMPRESSION=ON for the lifetime of the context",
+    "Enable cuDF hardware (on-GPU) decompression for compressed parquet scans. Off by default "
+    "(opt-in). When enabled and every GPU reports hardware-decompression support in cucascade "
+    "topology, Sirius exports LIBCUDF_HW_DECOMPRESSION=ON for the lifetime of the context. Only "
+    "enable this on GPUs known to support hardware decompression",
     LogicalType::BOOLEAN,
     Value::BOOLEAN(operator_defaults.use_hw_decompression),
     SetUseHwDecompression);
