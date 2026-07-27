@@ -655,3 +655,317 @@ TEST_CASE("pin_table compression - fallback when compression saves too little",
 
   fs::remove_all(tmp);
 }
+
+// ─── Per-operator sweeps ──────────────────────────────────────────────────────
+//
+// Each group pins the same parquet surface repeatedly, once per operator, and
+// verifies aggregate correctness after decompression.  Codegen (fused JIT) ops
+// require explicit output-channel declarations in the plan DSL so the fused
+// region materialises transformed streams into recoverable leaf buffers.
+// Terminal nvCOMP ops need no output declaration.
+//
+// Operators intentionally excluded from these sweeps:
+//   identity       — excluded from all_compressor_names() (explorable=false)
+//   nvcomp_cascaded— excluded from all_compressor_names() (explorable=false)
+//   bitextract_f32/f64 — require a float column and a bitfield spec; covered
+//                    by test_operator_sweep in the simpatico unit suite
+//   str_split      — structural op requiring channel routing; see the
+//                    dedicated str_split cascade test below
+
+TEST_CASE("pin_table compression - single-op sweep over all INT64 operators",
+          "[compression][pin_table][isolated_context]")
+{
+  if (no_gpu()) { return; }
+
+  auto [tmp, yaml_path] = make_comp_env("sweep_i64");
+
+  // SUM(k) = 0+1+...+4999 = 12497500
+  sirius::test::mgpu::generate_parquet_surface(tmp, "SELECT range AS k FROM range(5000)", 1);
+
+  sirius::test::mgpu::scoped_mgpu_env env(yaml_path);
+  auto con  = env.make_connection();
+  auto glob = sirius::test::mgpu::parquet_glob(tmp);
+
+  run_ok(con, "SET pin_table_compression = true;", "set compression");
+  run_ok(con, "SET pin_table_compression_min_batch_size_bytes = 0;", "set min_batch");
+
+  auto plan_dir = tmp / "plans";
+  run_ok(
+    con, "SET pin_table_input_compression_plan_dir = '" + plan_dir.string() + "';", "set plan_dir");
+
+  struct op_case {
+    const char* tag;
+    const char* plan;
+  };
+  static const op_case kOps[] = {
+    {"delta", "input -> delta -> differences"},
+    {"rle", "input -> rle -> runs, values"},
+    {"bitpack", "input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed"},
+    {"for", "input -> for -> deltas, references"},
+    {"zigzag", "input -> zigzag -> zigzag"},
+    {"lz4", "input -> lz4"},
+    {"snappy", "input -> snappy"},
+    {"deflate", "input -> deflate"},
+    {"ans", "input -> ans"},
+    {"bitcomp", "input -> bitcomp"},
+  };
+
+  const std::string select_sql = "SELECT SUM(k) FROM read_parquet('" + glob + "')";
+
+  for (auto const& tc : kOps) {
+    CAPTURE(tc.tag);
+    std::string tname = std::string("t_sw_") + tc.tag;
+    write_plan_file(plan_dir, tname, tc.plan);
+
+    auto pin = con.Query("CALL pin_table('" + glob + "', tier='host', name='" + tname + "');");
+    require_ok(pin, std::string("pin:") + tc.tag);
+
+    auto res = con.Query("CALL gpu_execution(\"" + select_sql + "\");");
+    require_ok(res, std::string("select:") + tc.tag);
+    REQUIRE(res->RowCount() == 1);
+    REQUIRE(res->GetValue(0, 0) == duckdb::Value::BIGINT(12497500LL));
+
+    run_ok(con, "CALL unpin_table('" + tname + "');", std::string("unpin:") + tc.tag);
+  }
+
+  fs::remove_all(tmp);
+}
+
+TEST_CASE("pin_table compression - single-op sweep over float operators (ALP / ALP-RD)",
+          "[compression][pin_table][isolated_context]")
+{
+  if (no_gpu()) { return; }
+
+  auto [tmp, yaml_path] = make_comp_env("sweep_float");
+
+  // DOUBLE col d: integer-valued doubles — ideal for ALP (exact representation,
+  //   no exceptions).  SUM(d) = 12497500.0 exactly (< 2^53).
+  // FLOAT col f: same values cast to FLOAT32.  ALP-RD targets FLOAT32.
+  //   12497500 < 2^24 so it is exactly representable; SUM is exact.
+  sirius::test::mgpu::generate_parquet_surface(
+    tmp, "SELECT CAST(range AS DOUBLE) AS d, CAST(range AS FLOAT) AS f FROM range(5000)", 1);
+
+  sirius::test::mgpu::scoped_mgpu_env env(yaml_path);
+  auto con  = env.make_connection();
+  auto glob = sirius::test::mgpu::parquet_glob(tmp);
+
+  run_ok(con, "SET pin_table_compression = true;", "set compression");
+  run_ok(con, "SET pin_table_compression_min_batch_size_bytes = 0;", "set min_batch");
+
+  auto plan_dir = tmp / "plans";
+  run_ok(
+    con, "SET pin_table_input_compression_plan_dir = '" + plan_dir.string() + "';", "set plan_dir");
+
+  // Column block 0 (d, DOUBLE) → alp; block 1 (f, FLOAT) → alp_rd.
+  // Bare forms: all sub-channels become terminal leaves inside the rep.
+  write_plan_file(plan_dir, "t_sw_float", "input -> alp\n---\ninput -> alp_rd\n");
+
+  auto pin = con.Query("CALL pin_table('" + glob + "', tier='host', name='t_sw_float');");
+  require_ok(pin, "pin float");
+
+  const std::string select_sql = "SELECT SUM(d), SUM(f) FROM read_parquet('" + glob + "')";
+  auto res                     = con.Query("CALL gpu_execution(\"" + select_sql + "\");");
+  require_ok(res, "select float");
+  REQUIRE(res->RowCount() == 1);
+  REQUIRE(res->GetValue(0, 0) == duckdb::Value::DOUBLE(12497500.0));
+  REQUIRE(res->GetValue(1, 0) == duckdb::Value::FLOAT(12497500.0f));
+
+  run_ok(con, "CALL unpin_table('t_sw_float');", "unpin float");
+
+  fs::remove_all(tmp);
+}
+
+TEST_CASE("pin_table compression - single-op sweep over string operators (dictionary)",
+          "[compression][pin_table][isolated_context]")
+{
+  if (no_gpu()) { return; }
+
+  auto [tmp, yaml_path] = make_comp_env("sweep_str");
+
+  // 10-char zero-padded strings: '0000000000'..'0000004999'.
+  // MAX(s) = '0000004999' (lexicographic max of zero-padded decimal).
+  sirius::test::mgpu::generate_parquet_surface(
+    tmp, "SELECT printf('%010d', range) AS s FROM range(5000)", 1);
+
+  sirius::test::mgpu::scoped_mgpu_env env(yaml_path);
+  auto con  = env.make_connection();
+  auto glob = sirius::test::mgpu::parquet_glob(tmp);
+
+  run_ok(con, "SET pin_table_compression = true;", "set compression");
+  run_ok(con, "SET pin_table_compression_min_batch_size_bytes = 0;", "set min_batch");
+
+  auto plan_dir = tmp / "plans";
+  run_ok(
+    con, "SET pin_table_input_compression_plan_dir = '" + plan_dir.string() + "';", "set plan_dir");
+
+  write_plan_file(plan_dir, "t_sw_dict", "input -> dictionary\n");
+
+  auto pin = con.Query("CALL pin_table('" + glob + "', tier='host', name='t_sw_dict');");
+  require_ok(pin, "pin dict");
+
+  const std::string select_sql = "SELECT COUNT(*), MAX(s) FROM read_parquet('" + glob + "')";
+  auto res                     = con.Query("CALL gpu_execution(\"" + select_sql + "\");");
+  require_ok(res, "select dict");
+  REQUIRE(res->RowCount() == 1);
+  REQUIRE(res->GetValue(0, 0) == duckdb::Value::BIGINT(5000LL));
+  REQUIRE(res->GetValue(1, 0).ToString() == "0000004999");
+
+  run_ok(con, "CALL unpin_table('t_sw_dict');", "unpin dict");
+
+  fs::remove_all(tmp);
+}
+
+// ─── Fused cascade + entropy tail ────────────────────────────────────────────
+//
+// These tests exercise the fused-region entropy-tail code path: the JIT fused
+// region (delta → rle → bitpack) emits `packed` as a raw passthrough channel,
+// which the compress walk detects as having a downstream non-fused consumer
+// (bitcomp / ans).  The RawFused leaf strips its `data` buffer and hands it to
+// the entropy codec; on decode the entropy codec decompresses first, then the
+// JIT inverse kernel reconstructs the original values using the stored offsets.
+//
+// `rle.runs` and `bitpack.{chunk_min,chunk_count,chunk_bits}` are terminal
+// within the fused region and stored in the fused rep's internal buffers;
+// they do not require explicit routing lines in the plan.
+
+TEST_CASE("pin_table compression - fused delta->rle->bitpack with bitcomp entropy tail",
+          "[compression][pin_table][isolated_context]")
+{
+  if (no_gpu()) { return; }
+
+  auto [tmp, yaml_path] = make_comp_env("fused_bitcomp");
+
+  // SUM(k) = 12497500
+  sirius::test::mgpu::generate_parquet_surface(tmp, "SELECT range AS k FROM range(5000)", 1);
+
+  sirius::test::mgpu::scoped_mgpu_env env(yaml_path);
+  auto con  = env.make_connection();
+  auto glob = sirius::test::mgpu::parquet_glob(tmp);
+
+  run_ok(con, "SET pin_table_compression = true;", "set compression");
+  run_ok(con, "SET pin_table_compression_min_batch_size_bytes = 0;", "set min_batch");
+
+  auto plan_dir = tmp / "plans";
+  run_ok(
+    con, "SET pin_table_input_compression_plan_dir = '" + plan_dir.string() + "';", "set plan_dir");
+
+  write_plan_file(plan_dir,
+                  "t_fused_bitcomp",
+                  "input -> delta -> differences\n"
+                  "delta.differences -> rle -> runs, values\n"
+                  "rle.values -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n"
+                  "bitpack.packed -> bitcomp\n");
+
+  auto pin = con.Query("CALL pin_table('" + glob + "', tier='host', name='t_fused_bitcomp');");
+  require_ok(pin, "pin");
+
+  const std::string select_sql = "SELECT SUM(k) FROM read_parquet('" + glob + "')";
+  auto res                     = con.Query("CALL gpu_execution(\"" + select_sql + "\");");
+  require_ok(res, "select");
+  REQUIRE(res->RowCount() == 1);
+  REQUIRE(res->GetValue(0, 0) == duckdb::Value::BIGINT(12497500LL));
+
+  run_ok(con, "CALL unpin_table('t_fused_bitcomp');", "unpin");
+
+  fs::remove_all(tmp);
+}
+
+TEST_CASE("pin_table compression - fused delta->rle->bitpack with ANS entropy tail",
+          "[compression][pin_table][isolated_context]")
+{
+  if (no_gpu()) { return; }
+
+  auto [tmp, yaml_path] = make_comp_env("fused_ans");
+
+  // SUM(k) = 12497500
+  sirius::test::mgpu::generate_parquet_surface(tmp, "SELECT range AS k FROM range(5000)", 1);
+
+  sirius::test::mgpu::scoped_mgpu_env env(yaml_path);
+  auto con  = env.make_connection();
+  auto glob = sirius::test::mgpu::parquet_glob(tmp);
+
+  run_ok(con, "SET pin_table_compression = true;", "set compression");
+  run_ok(con, "SET pin_table_compression_min_batch_size_bytes = 0;", "set min_batch");
+
+  auto plan_dir = tmp / "plans";
+  run_ok(
+    con, "SET pin_table_input_compression_plan_dir = '" + plan_dir.string() + "';", "set plan_dir");
+
+  write_plan_file(plan_dir,
+                  "t_fused_ans",
+                  "input -> delta -> differences\n"
+                  "delta.differences -> rle -> runs, values\n"
+                  "rle.values -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n"
+                  "bitpack.packed -> ans\n");
+
+  auto pin = con.Query("CALL pin_table('" + glob + "', tier='host', name='t_fused_ans');");
+  require_ok(pin, "pin");
+
+  const std::string select_sql = "SELECT SUM(k) FROM read_parquet('" + glob + "')";
+  auto res                     = con.Query("CALL gpu_execution(\"" + select_sql + "\");");
+  require_ok(res, "select");
+  REQUIRE(res->RowCount() == 1);
+  REQUIRE(res->GetValue(0, 0) == duckdb::Value::BIGINT(12497500LL));
+
+  run_ok(con, "CALL unpin_table('t_fused_ans');", "unpin");
+
+  fs::remove_all(tmp);
+}
+
+// ─── str_split cascade ────────────────────────────────────────────────────────
+//
+// str_split decomposes a STRING column into {offsets (INT32), chars (UINT8)}.
+// The offsets sub-plan uses a fused codegen cascade (delta → rle → bitpack):
+// for fixed-length-10 strings, all offsets differ by exactly 10, so delta
+// produces a constant-10 differences stream, RLE collapses it to one run, and
+// bitpack packs the tiny values into minimal bits.  The chars sub-plan uses
+// snappy (byte-oriented entropy codec).  Together they exercise the "structural
+// op with heterogeneous child plans" codepath.
+
+TEST_CASE("pin_table compression - str_split cascade (snappy chars, delta->rle->bitpack offsets)",
+          "[compression][pin_table][isolated_context]")
+{
+  if (no_gpu()) { return; }
+
+  auto [tmp, yaml_path] = make_comp_env("strsplit");
+
+  // Fixed-length 10-char strings: '0000000000'..'0000004999'.
+  // COUNT(*) = 5000, MAX(s) = '0000004999'.
+  sirius::test::mgpu::generate_parquet_surface(
+    tmp, "SELECT printf('%010d', range) AS s FROM range(5000)", 1);
+
+  sirius::test::mgpu::scoped_mgpu_env env(yaml_path);
+  auto con  = env.make_connection();
+  auto glob = sirius::test::mgpu::parquet_glob(tmp);
+
+  run_ok(con, "SET pin_table_compression = true;", "set compression");
+  run_ok(con, "SET pin_table_compression_min_batch_size_bytes = 0;", "set min_batch");
+
+  auto plan_dir = tmp / "plans";
+  run_ok(
+    con, "SET pin_table_input_compression_plan_dir = '" + plan_dir.string() + "';", "set plan_dir");
+
+  // offsets: 0,10,20,...,50000 — constant delta=10, one RLE run, 4-bit bitpack.
+  // chars:   raw ASCII bytes    — snappy on the UINT8 byte stream.
+  write_plan_file(plan_dir,
+                  "t_strsplit",
+                  "input -> str_split -> offsets, chars\n"
+                  "str_split.offsets -> delta -> differences\n"
+                  "delta.differences -> rle -> runs, values\n"
+                  "rle.values -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n"
+                  "str_split.chars -> snappy\n");
+
+  auto pin = con.Query("CALL pin_table('" + glob + "', tier='host', name='t_strsplit');");
+  require_ok(pin, "pin");
+
+  const std::string select_sql = "SELECT COUNT(*), MAX(s) FROM read_parquet('" + glob + "')";
+  auto res                     = con.Query("CALL gpu_execution(\"" + select_sql + "\");");
+  require_ok(res, "select");
+  REQUIRE(res->RowCount() == 1);
+  REQUIRE(res->GetValue(0, 0) == duckdb::Value::BIGINT(5000LL));
+  REQUIRE(res->GetValue(1, 0).ToString() == "0000004999");
+
+  run_ok(con, "CALL unpin_table('t_strsplit');", "unpin");
+
+  fs::remove_all(tmp);
+}
