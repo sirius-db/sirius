@@ -163,10 +163,10 @@ def timed_query(cur, statements, timeout_s):
     """Run one query as a single transaction; return (elapsed_s, rows).
 
     A query is timed end to end including its transaction, matching the
-    reference harness. q15 is three statements (create view, select, drop
-    view) and needs a writable transaction; the other 21 run read-only.
-    Results are fetched in full because an open result holds Sirius's
-    engine-wide query lock and would stall every other stream.
+    reference harness. Read-only queries take a READ ONLY transaction; older
+    template sets write q15 as a view create/select/drop trio, which needs a
+    writable one. Results are fetched in full because an open result holds
+    Sirius's engine-wide query lock and would stall every other stream.
     """
     begin = (
         "BEGIN TRANSACTION READ ONLY"

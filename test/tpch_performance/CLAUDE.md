@@ -287,9 +287,8 @@ reference parameter generator, which is what an official run requires. The power
 stream 0, so its three passes share one parameter set. Validation is not supported with varied
 predicates — the runner rejects `--validation`.
 
-Each query runs as its own transaction, `READ ONLY` except for q15, which creates and drops a
-view and so needs a writable one. qgen writes q15's view as `revenue<stream>`, so concurrent
-throughput streams cannot collide.
+Each query runs as its own `READ ONLY` transaction. q15 is a CTE in the 3.0.1 templates, so no
+query creates a view and nothing is shared between concurrent streams.
 
 Metrics: `Power@Size = 3600·SF / geomean(22 stream-0 query times + T_RF1 +
 T_RF2)`, `Throughput@Size = N·22·3600 / measurement_interval · SF`, `QphH@Size =
@@ -329,25 +328,23 @@ This runner follows the spec instead:
 |------|------------------------|------|
 | Power run stream | stream 1, reused as a throughput stream | stream 0, the power test's ordering number O(00) (clause 5.3.5.2) |
 | Throughput refresh pairs | `max(SF/10, 1)`, unrelated to stream count | one RF1/RF2 pair per query stream (clause 5.3.7.7) |
+| RF1/RF2 in the throughput run | merged into one transaction | separate transactions, RF1 committing before RF2 (clause 5.3.7.8) |
 | Row limits (`:n`) | dropped — the `where rownum <= N` chunk fails its `'select' in q` filter, so q2/q3/q10/q18/q21 run unlimited | folded into a `LIMIT` on the query |
-| q15 | `create view ... as select` is timed as a separate query, `drop view` is skipped, so 23 timings feed a 24th-root | the three statements are one query, one timing |
-| Power@Size | 24th root over those 23 timings | geometric mean of exactly 22 query times + T_RF1 + T_RF2 (clause 5.4.1) |
 
-Two things are inherited as-is: query text comes from `qgen`, and each query runs in its own
-transaction.
+Inherited as-is: query text comes from `qgen`, each query runs in its own transaction, and
+Power@Size is the geometric mean over the 22 query times plus T_RF1 and T_RF2 (clause 5.4.1).
 
-The checked-in `dbgen` is 2.14.0 while that repo vendors 3.0.1, and the older tool draws two
-substitution parameters outside the ranges the spec defines. `dbgen_bootstrap.sh` applies TPC's
-own 3.0.1 fixes before building `qgen`:
+`test_datasets/tpch-dbgen.zip` bundles TPC tools 3.0.1, the same version that repo vendors, so
+query text matches between the two. The bundle carries the TPC EULA and ships no compiled
+binaries; `dbgen_bootstrap.sh` builds `dbgen` and `qgen` on demand and refreshes an older
+extraction in place, leaving any generated `.tbl` data beside it untouched.
 
-- **q4** month offset `UnifInt(1,58)` → `UnifInt(0,57)`, so the date lands in 1993-01 … 1997-10
-  as clause 2.4.4.3 requires, rather than 1993-02 … 1997-11.
-- **q22** country codes `{10..34} + 10` → `{0..24} + 10`. Codes are the nation index plus 10
-  (clause 4.2.2.9), so only 10..34 exist; 2.14.0 emits 20..44, and everything above 34 matches no
-  rows. `tpch_query_streams.py` rejects stream files still carrying out-of-range codes.
-
-Separately, 2.14.0's q1 template keeps the ANSI `day (3)` interval qualifier that 3.0.1 dropped
-and DuckDB cannot parse; the loader strips it (a no-op for q1's 60..120 day values).
+Two details of that bundle matter when reading generated SQL. `generate_tpch_queries.sh` points
+`DSS_QUERY` at the dbgen root, whose templates are the corrected ones — the `queries/` subdirectory
+holds older variants where q15 builds a view and q1 carries the ANSI `day (3)` qualifier. And the
+makefile is configured `DATABASE=ORACLE`, which is what renders the `:n` row limit as
+`where rownum <= N`; no `DATABASE` setting emits a standard `LIMIT`, so that translation is the
+loader's job regardless of version.
 
 ### Usage
 

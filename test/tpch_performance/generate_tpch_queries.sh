@@ -64,7 +64,9 @@ for ((n = 0; n <= NUM_STREAMS; n++)); do
         args+=(-r "$((SEED + n))")
     fi
     # qgen reads dists.dss from the cwd and the query templates from DSS_QUERY.
-    (cd "$DBGEN_DIR" && DSS_QUERY=queries ./qgen "${args[@]}") \
+    # The templates in the dbgen root are the corrected ones; queries/ holds the
+    # older variants (view-based q15, ANSI "day (3)" in q1).
+    (cd "$DBGEN_DIR" && DSS_QUERY=. ./qgen "${args[@]}") \
         > "$OUTPUT_DIR/stream${n}.sql"
 done
 

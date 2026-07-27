@@ -16,8 +16,9 @@
 
 qgen tags each query with a (Q<n>) comment and emits them in the stream's
 permutation order, so the tags split a stream file back into its 22 queries.
-A query can be several statements: q15 creates a view, selects from it, and
-drops it, and all three belong to that one query's execution.
+A query is usually one statement. Older template sets write q15 as a view
+create/select/drop trio, so a query is modelled as a list of statements that
+run together.
 
 qgen renders the templates' `:n` row limit as a trailing Oracle-style
 `where rownum <= N` statement. That N is the spec's row limit (q2 100, q3 10,
@@ -30,11 +31,6 @@ import re
 
 _TAG = re.compile(r"\(Q(\d+)\)")
 _ROWCOUNT = re.compile(r"^\s*where\s+rownum\s*<=\s*(-?\d+)\s*$", re.IGNORECASE)
-
-# dbgen 2.14.0's q1 template carries the ANSI interval precision qualifier
-# ("day (3)"), which TPC dropped in 3.0.1 and DuckDB cannot parse. It is a no-op
-# for the 60..120 day values q1 draws.
-_DAY_PRECISION = re.compile(r"\bday\s*\(\s*\d+\s*\)", re.IGNORECASE)
 
 _Q22_CODES = re.compile(
     r"substring\(c_phone from 1 for 2\) in\s*\(([^)]*)\)", re.IGNORECASE
@@ -68,7 +64,7 @@ def _statements(block):
 
     statements = []
     for raw in text.split(";"):
-        stmt = _DAY_PRECISION.sub("day", raw.strip())
+        stmt = raw.strip()
         if not stmt:
             continue
         limit = _ROWCOUNT.match(stmt)
