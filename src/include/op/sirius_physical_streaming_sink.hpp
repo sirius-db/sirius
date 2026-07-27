@@ -19,13 +19,29 @@
 #include "exec/stream_lifecycle.hpp"
 #include "op/sirius_physical_operator.hpp"
 
+#include <cudf/types.hpp>
+
 #include <cucascade/data/data_repository.hpp>
 
 #include <cstddef>
 #include <memory>
 #include <optional>
+#include <vector>
 
 namespace sirius::op {
+
+/// How a partitioned sink routes rows across its output streams.
+///
+/// Only the *function* lives here. Which compute node each partition ships to is the wrapper's
+/// routing table, and N is `output_repositories.size()` — the sink stays oblivious to both.
+struct partition_spec {
+  /// Column indices hashed to pick a destination. Must be non-empty for a partitioned sink.
+  std::vector<int> key_columns;
+
+  /// Per-key cast applied before hashing, so keys that differ only in representation (INT32 vs
+  /// INT64) still land together. Empty means "hash every key as-is".
+  std::vector<cudf::data_type> key_cast_types;
+};
 
 /// Terminal operator of a streaming fragment: every batch its pipeline produces is pushed into
 /// an output `cucascade::shared_data_repository`, where an external consumer pulls it.
@@ -43,13 +59,26 @@ class sirius_physical_streaming_sink : public sirius_physical_operator {
   /// The pipeline feeding this sink is its one and only sender.
   static constexpr exec::sender_id_t PIPELINE_SENDER = 0;
 
-  /// Single-destination sink: one output stream, no partitioning.
+  /// Single-destination sink: one output stream, no partitioning. The N = 1 case of the
+  /// constructor below.
   ///
   /// @throws sirius::invalid_input_exception when `output_repository` is null.
   sirius_physical_streaming_sink(
     duckdb::vector<sirius::logical_type> types,
     std::size_t estimated_cardinality,
     std::shared_ptr<cucascade::shared_data_repository> output_repository);
+
+  /// Partitioned sink: N output streams, one per destination, each with its own repository.
+  /// Every batch is GPU-hash-partitioned by `spec` and slice *i* is pushed into
+  /// `output_repositories[i]`.
+  ///
+  /// @throws sirius::invalid_input_exception when `output_repositories` is empty or contains a
+  ///         null entry, or when N > 1 and `spec.key_columns` is empty (nothing to route by).
+  sirius_physical_streaming_sink(
+    duckdb::vector<sirius::logical_type> types,
+    std::size_t estimated_cardinality,
+    std::vector<std::shared_ptr<cucascade::shared_data_repository>> output_repositories,
+    partition_spec spec);
 
   bool is_sink() const override { return true; }
 
@@ -70,13 +99,18 @@ class sirius_physical_streaming_sink : public sirius_physical_operator {
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          rmm::cuda_stream_view stream) override;
 
-  /// Push this task's output batches into the output repository, natively — no Arrow, no GPU
-  /// upgrade, no copy. A push after end-of-stream is dropped by the lifecycle rather than
-  /// landing behind a consumer that already saw EOS.
+  /// Publish this task's output batches.
+  ///
+  /// With one destination the batches go straight into the output repository, natively — no
+  /// Arrow, no GPU upgrade, no copy. With N > 1 each batch is GPU-hash-partitioned by the
+  /// partition spec and slice *i* goes into repository *i*; empty slices are skipped rather
+  /// than published as zero-row batches. A push after end-of-stream is dropped by the lifecycle
+  /// rather than landing behind a consumer that already saw EOS.
   void sink(const operator_data& input_data, rmm::cuda_stream_view stream) override;
 
-  /// Pass-through: pushing a batch allocates nothing, so report the input bytes instead of the
-  /// default 2× heuristic (matches the streaming source).
+  /// Report the input bytes rather than the default 2× heuristic (matching the streaming
+  /// source). With one destination the push allocates nothing at all; with N the partition
+  /// produces about one input's worth of new device memory. Neither warrants 2×.
   [[nodiscard]] std::size_t no_history_peak_memory_estimate(
     const input_stats& stats) const override;
 
@@ -114,6 +148,9 @@ class sirius_physical_streaming_sink : public sirius_physical_operator {
   /// One repository per destination. Output stream id, partition index and repository
   /// correspond positionally.
   std::vector<std::shared_ptr<cucascade::shared_data_repository>> _output_repositories;
+
+  /// Empty `key_columns` means "not partitioned" — only valid when there is one destination.
+  partition_spec _spec;
 
   /// Shared by every output stream — the pipeline is one sender feeding all of them, so they
   /// reach end-of-stream together. Per-stream `drained()` / `wait()` still AND this terminal
