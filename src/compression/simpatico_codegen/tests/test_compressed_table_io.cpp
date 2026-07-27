@@ -22,6 +22,8 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -172,6 +174,22 @@ void memory_roundtrip(char const* label, cudf::table_view input, std::string con
            (std::string(label) + ": data mismatch col " + std::to_string(i)).c_str());
 }
 
+void expect_selected_columns(char const* label,
+                             cudf::table const& output,
+                             cudf::table_view const& input,
+                             std::span<const std::size_t> selected,
+                             rmm::cuda_stream_view stream)
+{
+  expect(output.num_columns() == static_cast<cudf::size_type>(selected.size()),
+         (std::string(label) + ": output column count").c_str());
+  for (std::size_t i = 0; i < selected.size(); ++i) {
+    expect(columns_equal_any(input.column(static_cast<cudf::size_type>(selected[i])),
+                             output.view().column(static_cast<cudf::size_type>(i)),
+                             stream),
+           (std::string(label) + ": data mismatch at output column " + std::to_string(i)).c_str());
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -312,6 +330,164 @@ void test_multi_column()
                "for.deltas -> bitpack\n"
                "---\n"
                "input -> for -> deltas, references\n");
+}
+
+// Selective decompression preserves requested order and duplicates, accepts an
+// empty projection, rejects invalid indices, and never touches an unselected
+// column. Exercise all three overload families.
+void test_selective_decompression()
+{
+  auto stream = cudf::get_default_stream();
+  auto mr     = rmm::mr::get_current_device_resource_ref();
+  auto t      = make_int32_table(3, 2048, 29);
+  auto ct     = simpatico::compress_with_plan(t->view(),
+                                          "input -> for -> deltas, references\n"
+                                              "---\n"
+                                              "input -> delta -> differences\n"
+                                              "delta.differences -> bitpack\n"
+                                              "---\n"
+                                              "input -> bitpack\n",
+                                          stream,
+                                          mr);
+
+  // If an implementation accidentally decompresses every column before
+  // projecting, this deliberately invalid unselected column makes that visible.
+  ct.columns[1].compound.reset();
+
+  std::vector<std::size_t> reordered_with_duplicate{2, 0, 2};
+  auto sequential = simpatico::decompress(ct, reordered_with_duplicate, stream, mr);
+  expect(sequential != nullptr, "selective sequential: decompress returned null");
+  expect_selected_columns(
+    "selective sequential", *sequential, t->view(), reordered_with_duplicate, stream);
+
+  std::vector<std::size_t> reordered{2, 0};
+  auto threaded = simpatico::decompress(ct, reordered, 2, mr);
+  expect(threaded != nullptr, "selective threaded: decompress returned null");
+  expect_selected_columns("selective threaded", *threaded, t->view(), reordered, stream);
+
+  simpatico::stream_pool pool;
+  expect(pool.init(2), "selective stream_pool: init failed");
+  auto pooled = simpatico::decompress(ct, reordered, pool, mr);
+  pool.sync_all();
+  expect(pooled != nullptr, "selective stream_pool: decompress returned null");
+  expect_selected_columns("selective stream_pool", *pooled, t->view(), reordered, stream);
+
+  std::vector<std::size_t> empty_selection;
+  auto empty = simpatico::decompress(ct, empty_selection, stream, mr);
+  expect(empty != nullptr && empty->num_columns() == 0, "selective empty: expected an empty table");
+
+  std::vector<std::size_t> invalid{0, 3};
+  bool threw = false;
+  try {
+    (void)simpatico::decompress(ct, invalid, stream, mr);
+  } catch (std::runtime_error const&) {
+    threw = true;
+  }
+  expect(threw, "selective invalid: expected out-of-range exception");
+}
+
+// The subset in-memory reader must reconstruct only requested columns. Its
+// payload callback is instrumented so this test checks I/O exclusion directly,
+// in addition to metadata, order, duplicate, empty, and error behavior.
+void test_memory_subset_read()
+{
+  auto stream = cudf::get_default_stream();
+  auto mr     = rmm::mr::get_current_device_resource_ref();
+  auto t      = make_int32_table(3, 2048, 37);
+  auto ct     = simpatico::compress_with_plan(t->view(),
+                                          "input -> for -> deltas, references\n"
+                                              "---\n"
+                                              "input -> delta -> differences\n"
+                                              "delta.differences -> bitpack\n"
+                                              "---\n"
+                                              "input -> bitpack\n",
+                                          stream,
+                                          mr,
+                                              {"first", "second", "third"});
+
+  std::vector<std::uint8_t> header;
+  std::vector<simpatico::payload_buffer_ref> buffers;
+  std::uint64_t payload_bytes = 0;
+  auto const herr =
+    simpatico::build_compressed_table_header(ct, header, buffers, payload_bytes, stream);
+  expect(herr.empty(), ("memory subset: header error: " + herr).c_str());
+
+  std::vector<std::uint8_t> payload(payload_bytes);
+  stream.synchronize();
+  for (auto const& b : buffers) {
+    if (b.size_bytes == 0 || b.device_ptr == nullptr) continue;
+    expect(cudaMemcpy(payload.data() + b.offset,
+                      b.device_ptr,
+                      static_cast<std::size_t>(b.size_bytes),
+                      cudaMemcpyDeviceToHost) == cudaSuccess,
+           "memory subset: payload staging copy failed");
+  }
+
+  auto const descriptions = ct.describe(stream);
+  std::vector<std::size_t> buffer_owner;
+  for (std::size_t ci = 0; ci < ct.num_columns(); ++ci) {
+    for (auto const& leaf : descriptions[ci]) {
+      for (std::size_t bi = 0; bi < leaf.buffers.size(); ++bi)
+        buffer_owner.push_back(ci);
+    }
+  }
+  expect(buffer_owner.size() == buffers.size(), "memory subset: buffer owner map mismatch");
+
+  bool fetched_first      = false;
+  bool fetched_third      = false;
+  std::size_t fetch_count = 0;
+  simpatico::payload_fetch_fn fetch =
+    [&](std::uint64_t off, std::size_t sz, void* dst, rmm::cuda_stream_view s) {
+      ++fetch_count;
+      auto const it = std::find_if(buffers.begin(), buffers.end(), [&](auto const& b) {
+        return b.offset == off && b.size_bytes == sz;
+      });
+      expect(it != buffers.end(), "memory subset: fetched unknown payload range");
+      auto const bi    = static_cast<std::size_t>(std::distance(buffers.begin(), it));
+      auto const owner = buffer_owner[bi];
+      expect(owner != 1, "memory subset: fetched unselected second column");
+      fetched_first = fetched_first || owner == 0;
+      fetched_third = fetched_third || owner == 2;
+      if (cudaMemcpyAsync(dst, payload.data() + off, sz, cudaMemcpyHostToDevice, s.value()) !=
+          cudaSuccess)
+        throw std::runtime_error("memory subset: fetch copy failed");
+    };
+
+  std::vector<std::size_t> selected{2, 0, 2};
+  std::string rerr;
+  auto subset =
+    simpatico::read_compressed_table_subset_from_memory(header, fetch, selected, stream, mr, &rerr);
+  expect(rerr.empty(), ("memory subset: read error: " + rerr).c_str());
+  expect(subset.num_columns() == selected.size(), "memory subset: compressed column count");
+  expect(subset.columns[0].name == std::optional<std::string>{"third"} &&
+           subset.columns[1].name == std::optional<std::string>{"first"} &&
+           subset.columns[2].name == std::optional<std::string>{"third"},
+         "memory subset: names do not preserve selection order and duplicates");
+  expect(fetch_count > 0 && fetched_first && fetched_third,
+         "memory subset: selected payloads were not fetched");
+
+  auto out = simpatico::decompress(subset, stream, mr);
+  expect(out != nullptr, "memory subset: decompress returned null");
+  expect_selected_columns("memory subset", *out, t->view(), selected, stream);
+
+  std::size_t empty_fetch_count = 0;
+  simpatico::payload_fetch_fn empty_fetch =
+    [&](std::uint64_t, std::size_t, void*, rmm::cuda_stream_view) { ++empty_fetch_count; };
+  std::vector<std::size_t> empty_selection;
+  rerr.clear();
+  auto empty = simpatico::read_compressed_table_subset_from_memory(
+    header, empty_fetch, empty_selection, stream, mr, &rerr);
+  expect(rerr.empty(), "memory subset empty: unexpected read error");
+  expect(empty.num_columns() == 0, "memory subset empty: expected zero columns");
+  expect(empty_fetch_count == 0, "memory subset empty: payload callback was invoked");
+
+  std::vector<std::size_t> invalid{0, 3};
+  rerr.clear();
+  auto invalid_result = simpatico::read_compressed_table_subset_from_memory(
+    header, empty_fetch, invalid, stream, mr, &rerr);
+  expect(!rerr.empty(), "memory subset invalid: expected an error");
+  expect(invalid_result.num_columns() == 0, "memory subset invalid: expected empty result");
+  expect(empty_fetch_count == 0, "memory subset invalid: payload callback was invoked");
 }
 
 // 6. Column names survive write→read.
@@ -488,6 +664,8 @@ int main()
     {"alp_rd_f64", test_alp_rd_f64},
     {"dictionary", test_dictionary},
     {"multi_column", test_multi_column},
+    {"selective_decompression", test_selective_decompression},
+    {"memory_subset_read", test_memory_subset_read},
     {"column_names_survive", test_column_names_survive},
     {"zero_rows", test_zero_rows},
     {"error_not_found", test_error_not_found},

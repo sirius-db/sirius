@@ -857,6 +857,7 @@ compressed_table read_compressed_table_subset_from_memory(
   // absolute, so dropping columns does not disturb the survivors' fetches).
   std::vector<ColRecord> selected;
   selected.reserve(selected_columns.size());
+  std::vector<bool> consumed(col_records.size(), false);
   for (auto idx : selected_columns) {
     if (idx >= col_records.size()) {
       if (error_out) {
@@ -864,7 +865,19 @@ compressed_table read_compressed_table_subset_from_memory(
       }
       return {};
     }
-    selected.push_back(std::move(col_records[idx]));
+    if (!consumed[idx]) {
+      selected.push_back(std::move(col_records[idx]));
+      consumed[idx] = true;
+      continue;
+    }
+
+    // ColRecord owns a PlanTree and is intentionally move-only. Reparse the
+    // header for a repeated selection so each output column gets independent
+    // ownership while retaining the same absolute payload offsets.
+    Reader duplicate_reader{header.data(), header.size()};
+    std::vector<ColRecord> duplicate_records;
+    if (!parse_hpln_header(duplicate_reader, duplicate_records, error_out)) return {};
+    selected.push_back(std::move(duplicate_records[idx]));
   }
   return reconstruct_from_records(selected, fetch, stream, mr, /*leaf_mr=*/mr, error_out);
 }
