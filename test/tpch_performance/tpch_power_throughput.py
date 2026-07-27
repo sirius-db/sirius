@@ -34,7 +34,7 @@ validation and the clean/post-RF1/post-RF2 comparison meaningful.
 --query-dir (see generate_tpch_queries.sh), as an official run requires;
 validation is not supported there.
 
-Metrics (TPC-H spec 5.4):
+Metrics:
     Power@Size      = 3600 * SF / geomean(22 stream-0 query times + T_RF1 + T_RF2)
     Throughput@Size = (N * 22 * 3600 / measurement_interval) * SF
     QphH@Size       = sqrt(Power@Size * Throughput@Size)

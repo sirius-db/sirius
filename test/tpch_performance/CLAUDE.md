@@ -291,7 +291,7 @@ Each query runs as its own transaction, `READ ONLY` except for q15, which create
 view and so needs a writable one. qgen writes q15's view as `revenue<stream>`, so concurrent
 throughput streams cannot collide.
 
-Metrics (TPC-H spec 5.4): `Power@Size = 3600·SF / geomean(22 stream-0 query times + T_RF1 +
+Metrics: `Power@Size = 3600·SF / geomean(22 stream-0 query times + T_RF1 +
 T_RF2)`, `Throughput@Size = N·22·3600 / measurement_interval · SF`, `QphH@Size =
 sqrt(Power · Throughput)`.
 
@@ -327,7 +327,7 @@ This runner follows the spec instead:
 
 | Area | duckdb-tpch-power-test | Here |
 |------|------------------------|------|
-| Power run stream | stream 1, reused as a throughput stream | stream 0, as clause 5.3.3 requires |
+| Power run stream | stream 1, reused as a throughput stream | stream 0, which the power test is defined to use |
 | Throughput refresh pairs | `max(SF/10, 1)`, unrelated to stream count | one RF1/RF2 pair per query stream |
 | Row limits (`:n`) | dropped — the `where rownum <= N` chunk fails its `'select' in q` filter, so q2/q3/q10/q18/q21 run unlimited | folded into a `LIMIT` on the query |
 | q15 | `create view ... as select` is timed as a separate query, `drop view` is skipped, so 23 timings feed a 24th-root | the three statements are one query, one timing |

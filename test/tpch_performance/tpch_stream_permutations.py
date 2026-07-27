@@ -65,7 +65,9 @@ STREAM_PERMUTATIONS = {
     40: (13, 15, 17, 1, 22, 11, 3, 4, 7, 20, 14, 21, 9, 8, 2, 18, 16, 6, 10, 12, 5, 19),
 }
 
-# TPC-H spec table 5.3.4: minimum number of throughput query streams per scale factor.
+# Minimum number of throughput query streams per scale factor. Running more than
+# the minimum is allowed; running fewer is not, so scale factors above the last
+# entry have no default and must pass --streams.
 MIN_STREAMS_BY_SF = (
     (1, 2),
     (10, 3),
@@ -84,7 +86,15 @@ def stream_order(stream: int) -> tuple:
 
 
 def default_streams(sf: float) -> int:
-    """Spec-minimum throughput stream count for scale factor `sf`."""
+    """Minimum throughput stream count for scale factor `sf`."""
+    largest_sf, largest_streams = MIN_STREAMS_BY_SF[-1]
+    if sf > largest_sf:
+        raise SystemExit(
+            f"No default stream count for SF{sf:g}: the table stops at "
+            f"SF{largest_sf} ({largest_streams} streams). Pass --streams "
+            "explicitly, since defaulting lower would run fewer streams than "
+            "the minimum."
+        )
     streams = 2
     for bound, n in MIN_STREAMS_BY_SF:
         if sf >= bound:
