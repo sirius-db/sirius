@@ -305,12 +305,12 @@ filtered_table duckdb_native_gpu_ingestible::materialize_metadata_to_table(
   rmm::cuda_stream_view stream)
 {
   auto const& split = static_cast<duckdb_native_scan_info const&>(info);
-  if (!split.datasource) {
+  if (!split.datasource && !split.host_backed_only) {
     throw std::runtime_error("[duckdb_native_gpu_ingestible] scan_info has no datasource");
   }
   auto& mem_space_mut = const_cast<::cucascade::memory::memory_space&>(mem_space);
-  auto table =
-    decode_duckdb_native_split(split.row_groups, *_info, *split.datasource, mem_space_mut, stream);
+  auto table          = decode_duckdb_native_split(
+    split.row_groups, *_info, split.datasource.get(), mem_space_mut, stream);
   SIRIUS_LOG_DEBUG(
     "[duckdb_native_gpu_ingestible::materialize_table] decoded split: row_groups={} rows={} "
     "cols={}",

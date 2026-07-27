@@ -2154,18 +2154,24 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
     "from nation n join region r on n.n_regionkey = r.r_regionkey;");
 }
 
+// Regression test: n_nationkey (INT32) and c_custkey (INT64) were hashed with different physical
+// types, so cuDF murmur3 sent the same integer to different partitions and matching keys were
+// missed. The bug is deterministic per key value, so restricting the build side to c_custkey <= 25
+// still triggers it (INT32/INT64 misfit + partitioning both preserved) while keeping the anti-join
+// result identical — only n_nationkey=0 is unmatched, since keys 1..24 match customers 1..25.
+// The subset also avoids partitioning the full 150k-row customer table (hash_partition_bytes=1
+// makes num_partitions grow with row count), which is what made this test slow.
+constexpr const char* kMisfitAntiJoin =
+  "select n.n_nationkey, n.n_regionkey from nation n "
+  "anti join (select c_custkey from customer where c_custkey <= 25) c "
+  "on n.n_nationkey = c.c_custkey;";
+
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - partitioned anti join (misfit key)",
                  "[integration][gpu_execution][antijoin][partitioned_join]")
 {
-  // n_nationkey = 0..24; c_custkey = 1..150000. Only n_nationkey=0 has no match.
-  // Regression test for the bug where n_nationkey (INT32) and c_custkey (INT64) were hashed
-  // using different physical types: cuDF murmur3 produces different hash values for the same
-  // integer in INT32 vs INT64, so matching keys landed in different partitions.
   partition_size_guard guard(*con, 1);
-  compare_gpu_vs_cpu(
-    "select n.n_nationkey, n.n_regionkey from nation n "
-    "anti join customer c on n.n_nationkey = c.c_custkey;");
+  compare_gpu_vs_cpu(kMisfitAntiJoin);
 }
 
 TEST_CASE_METHOD(GPUExecutionParquetFixture,
@@ -2173,9 +2179,7 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "[integration][gpu_execution][antijoin][partitioned_join]")
 {
   partition_size_guard guard(*con, 1);
-  compare_gpu_vs_cpu(
-    "select n.n_nationkey, n.n_regionkey from nation n "
-    "anti join customer c on n.n_nationkey = c.c_custkey;");
+  compare_gpu_vs_cpu(kMisfitAntiJoin);
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
@@ -3928,6 +3932,39 @@ TEST_CASE("gpu_execution - empty native table left join pads survivor rows",
   auto result = compare_gpu_vs_cpu_with_watchdog(
     *fixture.con,
     "select n.n_nationkey, e.i from tpch.nation n left join e on n.n_nationkey = e.i "
+    "order by n.n_nationkey;",
+    std::chrono::seconds{30},
+    [&fixture] { fixture.leak_after_timeout(); });
+  REQUIRE(result.row_count == 25);
+  REQUIRE(result.column_count == 2);
+}
+
+// FULL OUTER and RIGHT joins are excluded from BUILD_PROBE and always run the STANDARD partial-
+// barrier path. When one side is a genuinely empty native table it delivers ZERO batches (its
+// concat emits nothing), so the STANDARD scheduler must still (a) drain the surviving side and (b)
+// emit its rows NULL-padded. These reproduce the empty-opposite-side terminal case for that path in
+// both directions.
+TEST_CASE("gpu_execution - empty native table full outer join pads survivor rows (empty build)",
+          "[integration][gpu_execution][empty_result][empty-table]")
+{
+  empty_native_table_fixture fixture;
+  auto result = compare_gpu_vs_cpu_with_watchdog(
+    *fixture.con,
+    "select n.n_nationkey, e.i from tpch.nation n full outer join e on n.n_nationkey = e.i "
+    "order by n.n_nationkey;",
+    std::chrono::seconds{30},
+    [&fixture] { fixture.leak_after_timeout(); });
+  REQUIRE(result.row_count == 25);
+  REQUIRE(result.column_count == 2);
+}
+
+TEST_CASE("gpu_execution - empty native table full outer join pads survivor rows (empty probe)",
+          "[integration][gpu_execution][empty_result][empty-table]")
+{
+  empty_native_table_fixture fixture;
+  auto result = compare_gpu_vs_cpu_with_watchdog(
+    *fixture.con,
+    "select n.n_nationkey, e.i from e full outer join tpch.nation n on e.i = n.n_nationkey "
     "order by n.n_nationkey;",
     std::chrono::seconds{30},
     [&fixture] { fixture.leak_after_timeout(); });

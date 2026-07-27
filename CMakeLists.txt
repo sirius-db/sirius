@@ -286,6 +286,7 @@ set(EXTENSION_SOURCES
     src/op/partition/gpu_partition_impl.cpp
     src/op/result/host_table_chunk_reader.cpp
     src/op/scan/cached_ranges.cpp
+    src/op/scan/duckdb_insert_delta.cpp
     src/op/scan/duckdb_mvcc_visibility.cpp
     src/op/scan/duckdb_native_metadata.cpp
     src/op/scan/duckdb_native_decoder.cpp
@@ -344,6 +345,7 @@ set(EXTENSION_SOURCES
     src/pipeline/task_request.cpp
     src/planner/duckdb_join_filter_candidate_adapter.cpp
     src/planner/query.cpp
+    src/planner/query_index.cpp
     src/planner/sirius_physical_plan_generator.cpp
     src/planner/sirius_plan_aggregate.cpp
     src/planner/sirius_plan_column_data_get.cpp
@@ -364,6 +366,7 @@ set(EXTENSION_SOURCES
     src/planner/sirius_plan_top_n.cpp
     src/pin_table.cpp
     src/scan_manager/load_balancing_scan_batch_coalescer.cpp
+    src/scan_manager/insert_delta_job.cpp
     src/scan_manager/mvcc_mask_job.cpp
     src/scan_manager/pinned_chunk_stats.cpp
     src/scan_manager/round_robin_strategy.cpp
@@ -377,6 +380,7 @@ set(EXTENSION_SOURCES
     src/sirius_ffi.cpp
     src/sirius_interface.cpp
     src/sirius_sql_rewrite.cpp
+    src/telemetry/batch_telemetry.cpp
     src/telemetry/telemetry_context.cpp
     src/telemetry/memory_context.cpp
     src/transparent/physical_sirius_execution.cpp
@@ -602,6 +606,7 @@ set(TEST_SOURCES
     test/cpp/exec/test_exchange_channel.cpp
     test/cpp/exec/test_inspectable_mpsc.cpp
     test/cpp/exec/test_interruptible_mpmc.cpp
+    test/cpp/exec/test_multi_index_priority_queue.cpp
     test/cpp/exec/test_semi_future.cpp
     test/cpp/expression/test_ast_aggregate.cpp
     test/cpp/expression/test_ast_clone.cpp
@@ -619,10 +624,15 @@ set(TEST_SOURCES
     test/cpp/helper/test_cudf_utils.cpp
     test/cpp/helper/test_logical_type.cpp
     test/cpp/helper/test_transaction_utils.cpp
+    test/cpp/integration/test_gpu_execution_aggregate_nulls.cpp
+    test/cpp/integration/test_gpu_execution_allnull_scan.cpp
     test/cpp/integration/test_gpu_execution_array.cpp
     test/cpp/integration/test_gpu_execution_dynamic_filter_native.cpp
+    test/cpp/integration/test_gpu_execution_filter_nulls.cpp
+    test/cpp/integration/test_gpu_execution_join_nulls.cpp
     test/cpp/integration/test_gpu_execution_locality.cpp
     test/cpp/integration/test_gpu_execution_multi_format.cpp
+    test/cpp/integration/test_gpu_execution_order_nulls.cpp
     test/cpp/integration/test_gpu_execution_tpch.cpp
     test/cpp/integration/test_gpu_execution_tpch_mgpu_audit.cpp
     test/cpp/integration/test_pin_table_host_streaming.cpp
@@ -630,6 +640,7 @@ set(TEST_SOURCES
     test/cpp/integration/test_pin_table_column_order.cpp
     test/cpp/integration/test_pin_table_mvcc_delete.cpp
     test/cpp/integration/test_pin_table_mvcc_foundation.cpp
+    test/cpp/integration/test_pin_table_mvcc_insert.cpp
     test/cpp/integration/test_pin_table_zone_map_pruning.cpp
     test/cpp/integration/test_table_gpu_cache_warm_mgpu.cpp
     test/cpp/integration/test_transparent_runtime_fallback.cpp
@@ -646,6 +657,7 @@ set(TEST_SOURCES
     test/cpp/scan_manager/test_s3_routing_cutover.cpp
     test/cpp/scan_manager/test_pin_table_multi_gpu.cpp
     test/cpp/scan_manager/test_cached_serving_hardening.cpp
+    test/cpp/scan_manager/test_insert_delta_job.cpp
     test/cpp/scan_manager/test_mvcc_mask_job.cpp
     test/cpp/scan_manager/test_pinned_chunk_stats.cpp
     test/cpp/operator/test_physical_grouped_aggregate_merge_mgpu.cpp
@@ -655,6 +667,8 @@ set(TEST_SOURCES
     test/cpp/operator/test_partition_memspace_mgpu.cpp
     test/cpp/memory/test_multiple_blocks_allocation_accessor.cpp
     test/cpp/memory/test_topology_index.cpp
+    test/cpp/operator/test_build_probe_scheduling.cpp
+    test/cpp/operator/test_cross_schedule.cpp
     test/cpp/operator/aggregate/test_gpu_merge_impl.cpp
     test/cpp/operator/aggregate/test_physical_grouped_aggregate.cpp
     test/cpp/operator/aggregate/test_physical_grouped_aggregate_count_distinct.cpp
@@ -688,6 +702,7 @@ set(TEST_SOURCES
     test/cpp/planner/test_plan_tree_shape.cpp
     test/cpp/planner/test_projection_fold.cpp
     test/cpp/planner/test_sirius_read_parquet_scan.cpp
+    test/cpp/planner/test_query_index.cpp
     test/cpp/pipeline/test_batch_lock_utils.cpp
     test/cpp/pipeline/test_gpu_pipeline_executor.cpp
     test/cpp/pipeline/test_oom_reschedule.cpp
@@ -695,6 +710,7 @@ set(TEST_SOURCES
     test/cpp/pipeline/test_gpu_pipeline_task_history.cpp
     test/cpp/pipeline/test_gpu_pipeline_disk_readback.cpp
     test/cpp/pipeline/test_get_next_ports_after_sink.cpp
+    test/cpp/pipeline/test_merge_pipeline_fusion.cpp
     test/cpp/pipeline/test_partition_build_pipelines.cpp
     test/cpp/pipeline/test_pipeline_dynamic_filter_native_shape.cpp
     test/cpp/pipeline/test_pipeline_schedule_canonical.cpp
@@ -704,9 +720,11 @@ set(TEST_SOURCES
     test/cpp/scan/bench_decode_codecs.cpp
     test/cpp/scan/test_can_serve_with_columns.cpp
     test/cpp/scan/test_duckdb_block_layout.cpp
+    test/cpp/scan/test_duckdb_insert_delta.cpp
     test/cpp/scan/test_duckdb_mvcc_visibility.cpp
     test/cpp/scan/test_duckdb_native_batch_coalescer.cpp
     test/cpp/scan/test_duckdb_native_dynamic_filter_remap.cpp
+    test/cpp/scan/test_duckdb_native_host_backed_decode.cpp
     test/cpp/scan/test_duckdb_native_walker.cpp
     test/cpp/scan/test_dynamic_filter_merge.cpp
     test/cpp/scan/test_gpu_decode_alp.cpp

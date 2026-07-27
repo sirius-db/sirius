@@ -33,10 +33,9 @@ namespace sirius::op::scan {
 /**
  * @brief Per-table bind data carrier; polymorphic factory for gpu_ingestible.
  *
- * Built by the pipeline converter when it lowers a DuckDB scan binding,
- * parked on the gpu scan operator until prepare_for_query, then handed to
- * @ref make_gpu_ingestible (or directly to a cached gpu_ingestible when a
- * pinned-cache match wins). Implementations: parquet_ingestible_table_info,
+ * Built from a scan binding by the plan generator or by pin_table, then passed
+ * to make_ingestible. prepare_for_query reads it back to match pinned entries.
+ * Implementations: parquet_ingestible_table_info,
  * duckdb_native_ingestible_table_info.
  */
 class ingestible_table_info {
@@ -52,7 +51,7 @@ class ingestible_table_info {
    * @brief Resolved file paths captured at bind time.
    *
    * Used by sirius_scan_manager to match an incoming scan against pinned
-   * entries before falling back to @ref make_ingestible. Returned span
+   * entries. Returned span
    * must remain valid for the lifetime of @c *this.
    */
   [[nodiscard]] virtual std::span<std::string const> file_paths() const = 0;

@@ -171,6 +171,70 @@ TEST_CASE("walker accepts varchar below the overflow limit",
   REQUIRE_FALSE(md.row_groups.empty());
 }
 
+TEST_CASE("walker marks all-NULL constant validity and snapshots constant stats",
+          "[scan][duckdb_native_walker]")
+{
+  auto [db_owner, con] = sirius::make_test_db_and_connection();
+  exec_ok(con, "CREATE TABLE t(k INTEGER, v INTEGER)");
+  exec_ok(con, "INSERT INTO t SELECT range, NULL FROM range(3000)");
+  exec_ok(con, "CHECKPOINT");
+  auto& storage = get_storage(con, "t");
+
+  std::vector<projected_column> cols   = {real_col(0), real_col(1)};
+  std::vector<sirius::logical_type> ts = {sirius::logical_type::make(sirius::type_id::INTEGER),
+                                          sirius::logical_type::make(sirius::type_id::INTEGER)};
+  auto md                              = walk_all(storage, *con.context, cols, ts);
+  REQUIRE(md.viable);
+  REQUIRE(md.row_groups.size() == 1);
+
+  // k never holds NULLs, so no validity segment carries the marker.
+  for (const auto& s : md.row_groups[0].columns[0].validity_segments) {
+    REQUIRE_FALSE(s.all_null);
+  }
+  // v is all-NULL: CONSTANT validity with the all-null marker, and the
+  // CONSTANT data segment snapshots its own stats for the value decode.
+  bool saw_all_null = false;
+  for (const auto& s : md.row_groups[0].columns[1].validity_segments) {
+    if (!s.all_null) { continue; }
+    saw_all_null = true;
+    REQUIRE(s.compression == duckdb::CompressionType::COMPRESSION_CONSTANT);
+  }
+  REQUIRE(saw_all_null);
+  bool saw_constant = false;
+  for (const auto& s : md.row_groups[0].columns[1].data_segments) {
+    if (s.compression != duckdb::CompressionType::COMPRESSION_CONSTANT) { continue; }
+    saw_constant = true;
+    REQUIRE(s.segment_stats != nullptr);
+  }
+  REQUIRE(saw_constant);
+}
+
+TEST_CASE("walker marks all-NULL constant validity on ARRAY trees", "[scan][duckdb_native_walker]")
+{
+  auto [db_owner, con] = sirius::make_test_db_and_connection();
+  exec_ok(con, "CREATE TABLE t(a INTEGER[3])");
+  exec_ok(con, "INSERT INTO t SELECT NULL::INTEGER[3] FROM range(3000)");
+  exec_ok(con, "CHECKPOINT");
+  auto& storage = get_storage(con, "t");
+
+  std::vector<projected_column> cols   = {real_col(0)};
+  std::vector<sirius::logical_type> ts = {
+    sirius::logical_type::make_array(sirius::logical_type::make(sirius::type_id::INTEGER), 3)};
+  auto md = walk_all(storage, *con.context, cols, ts);
+  REQUIRE(md.viable);
+  REQUIRE_FALSE(md.row_groups.empty());
+
+  // Array-level validity (routed into data_segments) carries the marker for
+  // a fully-NULL ARRAY column.
+  bool saw_all_null = false;
+  for (const auto& rg : md.row_groups) {
+    for (const auto& s : rg.columns[0].data_segments) {
+      if (s.all_null) { saw_all_null = true; }
+    }
+  }
+  REQUIRE(saw_all_null);
+}
+
 // TEMPORARILY DISABLED: these cases call the removed monolithic walk_duckdb_native_metadata().
 // TODO: migrate to prepare_duckdb_native_walk() + walk_duckdb_native_row_group_range() and
 // re-enable — the duckdb_native_row_group_range result exposes the same .viable / .row_groups /

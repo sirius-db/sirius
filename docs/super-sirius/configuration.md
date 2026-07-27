@@ -251,6 +251,7 @@ Thread pool (default `num_threads: 2`, prefix `task_creator`) plus:
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `strategy` | enum: `active`, `lookahead` | `active` | Most speculative request type the task creator may use. `active` is demand-driven only; `lookahead` additionally warms up not-yet-activated scans one task at a time. Values are lowercase. |
+| `priority_order` | enum: `source`, `sink` | `source` | Order in which the task creator prioritizes tasks within a duckdb pipeline. `source` closer to source has higher priority; `sink` closer to sink has higher priority. Values are lowercase. |
 
 ### `sirius.executor.pipeline`
 
@@ -347,6 +348,7 @@ Four optional nested sub-configs tune the individual backends and caches:
 | `concat_batch_bytes` | 512 MB | Target output batch size for CONCAT operator |
 | `sort_sample_bytes` | 512 MB | Bytes sampled before computing sort partition boundaries |
 | `max_build_hash_table_bytes` | 500 MB | Max build-side size for BUILD_PROBE join mode |
+| `max_broadcast_join_size` | 256 MB | Max build-side size eligible for a broadcast join. A build below this size is replicated to every GPU (instead of hash-partitioned) when it is tiny, or when the DuckDB-estimated probe-to-build row ratio is at least `num_gpus * 1.25`. |
 | `max_sort_partition_memory_fraction` | 0.33 | Fraction of GPU memory per sort partition when `max_sort_partition_bytes` is 0 |
 | `mark_join_build_switch_ratio` | 8.0 | For STANDARD MARK joins, build on the smaller (left) side when `right_rows >= ratio * left_rows` (0 disables) |
 | `enable_dynamic_filter_pushdown` | true | Master switch for dynamic table-filter pushdown. An eligible `BUILD_PROBE` hash-join build selects a raw exact IN-list for 1–12 supported build rows, otherwise a hash IN-list if it fits the smallest probe-GPU L2 or a Bloom, for post-decode application by the probe scan. |
@@ -515,12 +517,14 @@ These can also be set at load via the `SIRIUS_LOG_BACKEND`, `SIRIUS_LOG_DIR`, an
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `modified_pipeline` | - | Enable modified pipeline execution |
+| `fuse_merge_pipelines` | true | Fuse eligible GROUP BY / TOP_N merges into their downstream pipeline instead of cutting a boundary (see [physical-plan-generation.md](physical-plan-generation.md) → Merge fusion) |
 | `max_sort_partition_bytes` | 0 (auto) | Max sort partition bytes |
 | `max_sort_partition_memory_fraction` | 0.33 | Auto sort-partition fraction when `max_sort_partition_bytes` is 0 |
 | `hash_partition_bytes` | 512 MB | Hash partition target size |
 | `concat_batch_bytes` | 512 MB | CONCAT output batch size |
 | `sort_sample_bytes` | 512 MB | Bytes sampled before computing sort boundaries |
 | `max_build_hash_table_bytes` | 500 MB | Max build-side hash table bytes |
+| `max_broadcast_join_size` | 256 MB | Max build-side size eligible for a broadcast join |
 | `mark_join_build_switch_ratio` | 8.0 | STANDARD MARK join build-side switch ratio (0 disables) |
 
 ### Dynamic Filters

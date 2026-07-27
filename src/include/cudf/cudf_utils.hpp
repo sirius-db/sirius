@@ -288,6 +288,23 @@ inline std::unique_ptr<cudf::scalar> value_to_cudf_scalar(duckdb::Value const& v
   }
 }
 
+/**
+ * @brief Build a 0-row cudf table with one column per logical type.
+ *
+ * Column order and types mirror @p types (each via get_cudf_type). Used wherever an empty but
+ * schema-bearing table is needed — e.g. an all-pruned GPU-values source, or the synthesized missing
+ * side of a join against an empty table.
+ */
+inline std::unique_ptr<cudf::table> make_empty_table(const duckdb::vector<logical_type>& types)
+{
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.reserve(types.size());
+  for (auto const& t : types) {
+    columns.push_back(cudf::make_empty_column(get_cudf_type(t)));
+  }
+  return std::make_unique<cudf::table>(std::move(columns));
+}
+
 }  // namespace sirius
 
 namespace duckdb {

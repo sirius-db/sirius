@@ -8,8 +8,8 @@ use starrocks_thrift::descriptors::{
     TDescriptorTable, TSlotDescriptor, TTableDescriptor, TTupleDescriptor,
 };
 use starrocks_thrift::exprs::{
-    TBoolLiteral, TDecimalLiteral, TExpr, TExprNode, TExprNodeType, TFloatLiteral, TIntLiteral,
-    TIsNullPredicate, TSlotRef, TStringLiteral,
+    TBoolLiteral, TCaseExpr, TDateLiteral, TDecimalLiteral, TExpr, TExprNode, TExprNodeType,
+    TFloatLiteral, TInPredicate, TIntLiteral, TIsNullPredicate, TSlotRef, TStringLiteral,
 };
 use starrocks_thrift::internal_service::{
     InternalServiceVersion, TExecPlanFragmentParams, TPlanFragmentExecParams, TScanRangeParams,
@@ -22,8 +22,8 @@ use starrocks_thrift::plan_nodes::{
 };
 use starrocks_thrift::planner::TPlanFragment;
 use starrocks_thrift::types::{
-    TFileType, TPrimitiveType, TScalarType, TTableType, TTypeDesc, TTypeNode, TTypeNodeType,
-    TUniqueId,
+    TFileType, TFunction, TFunctionBinaryType, TFunctionName, TPrimitiveType, TScalarType,
+    TTableType, TTypeDesc, TTypeNode, TTypeNodeType, TUniqueId,
 };
 use substrait::proto::{expression, plan_rel, read_rel, rel};
 
@@ -1160,7 +1160,7 @@ fn unsupported_expression_is_structured_error() {
     let mut select = base_plan_node(1, TPlanNodeType::SELECT_NODE, 1, vec![0]);
     select.select_node = Some(TSelectNode::new(None));
     select.conjuncts = Some(vec![TExpr::new(vec![base_expr_node(
-        TExprNodeType::FUNCTION_CALL,
+        TExprNodeType::LAMBDA_FUNCTION_EXPR,
         scalar_type(TPrimitiveType::BOOLEAN),
         0,
     )])]);
@@ -1176,7 +1176,7 @@ fn unsupported_expression_is_structured_error() {
         TranslateError::UnsupportedExpression {
             node_type,
             ..
-        } if node_type == TExprNodeType::FUNCTION_CALL
+        } if node_type == TExprNodeType::LAMBDA_FUNCTION_EXPR
     ));
 }
 
@@ -1966,4 +1966,321 @@ fn expression_missing_child_node_is_error() {
     ))
     .unwrap_err();
     assert!(matches!(err, TranslateError::MalformedPlan(_)));
+}
+
+// ---------------------------------------------------------------------------
+// Aggregation, sort, join, and expression coverage for the TPC-H slice.
+// ---------------------------------------------------------------------------
+
+/// Builds a builtin StarRocks function payload with the given name and return type.
+fn builtin_function(name: &str, ret_type: TTypeDesc) -> TFunction {
+    TFunction::new(
+        TFunctionName::new(None, name.to_string()),
+        TFunctionBinaryType::BUILTIN,
+        Vec::new(),
+        ret_type,
+        false,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+}
+
+/// Verifies an exchange node is still rejected: fragments are translated in isolation and
+/// multi-fragment plans are a later milestone.
+#[test]
+fn exchange_node_is_rejected() {
+    let exchange = base_plan_node(1, TPlanNodeType::EXCHANGE_NODE, 0, vec![0]);
+    let err = translate_fragment(&params(
+        Some(TPlan::new(vec![exchange])),
+        Some(base_desc()),
+        None,
+    ))
+    .unwrap_err();
+    assert!(matches!(
+        err,
+        TranslateError::UnsupportedPlanNode {
+            node_type: TPlanNodeType::EXCHANGE_NODE,
+            ..
+        }
+    ));
+}
+
+/// Returns every extension function name declared by the plan.
+fn extension_function_names(plan: &substrait::proto::Plan) -> Vec<String> {
+    use substrait::proto::extensions::simple_extension_declaration::MappingType;
+    plan.extensions
+        .iter()
+        .filter_map(|declaration| match declaration.mapping_type.as_ref() {
+            Some(MappingType::ExtensionFunction(function)) => Some(function.name.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Builds a select node filtering the scan with `conjunct`.
+fn filtered_scan(conjunct: TExpr) -> TPlan {
+    let mut select = base_plan_node(1, TPlanNodeType::SELECT_NODE, 1, vec![0]);
+    select.select_node = Some(TSelectNode::new(None));
+    select.conjuncts = Some(vec![conjunct]);
+    TPlan::new(vec![select, scan_node(0, 0)])
+}
+
+/// Verifies arithmetic expressions become Substrait arithmetic functions.
+#[test]
+fn arithmetic_expression_translates() {
+    let mut arith = base_expr_node(
+        TExprNodeType::ARITHMETIC_EXPR,
+        scalar_type(TPrimitiveType::BIGINT),
+        2,
+    );
+    arith.opcode = Some(TExprOpcode::MULTIPLY);
+    let mut nodes = vec![arith];
+    nodes.extend(slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT)).nodes);
+    nodes.extend(int_literal(2).nodes);
+    let product = TExpr::new(nodes);
+
+    let mut pred = base_expr_node(
+        TExprNodeType::BINARY_PRED,
+        scalar_type(TPrimitiveType::BOOLEAN),
+        2,
+    );
+    pred.opcode = Some(TExprOpcode::GT);
+    let mut nodes = vec![pred];
+    nodes.extend(product.nodes);
+    nodes.extend(int_literal(10).nodes);
+
+    let translated = translate_fragment(&params(
+        Some(filtered_scan(TExpr::new(nodes))),
+        Some(base_desc()),
+        None,
+    ))
+    .unwrap();
+    let names = extension_function_names(&translated.plan);
+    assert!(names.contains(&"multiply".to_string()), "{names:?}");
+}
+
+/// Verifies a DATE literal becomes a Substrait date literal in days since the epoch.
+#[test]
+fn date_literal_translates_to_epoch_days() {
+    let mut date = base_expr_node(
+        TExprNodeType::DATE_LITERAL,
+        scalar_type(TPrimitiveType::DATE),
+        0,
+    );
+    date.date_literal = Some(TDateLiteral::new("1998-09-02".to_string()));
+
+    let mut pred = base_expr_node(
+        TExprNodeType::BINARY_PRED,
+        scalar_type(TPrimitiveType::BOOLEAN),
+        2,
+    );
+    pred.opcode = Some(TExprOpcode::LE);
+    let mut nodes = vec![pred];
+    nodes.extend(slot_ref(1, 0, scalar_type(TPrimitiveType::DATE)).nodes);
+    nodes.push(date);
+
+    let translated = translate_fragment(&params(
+        Some(filtered_scan(TExpr::new(nodes))),
+        Some(desc_table(
+            vec![(0, Some(100))],
+            vec![slot(1, 0, 0, "d", scalar_type(TPrimitiveType::DATE))],
+        )),
+        None,
+    ))
+    .unwrap();
+    let condition = filter_condition(&translated.plan);
+    let literal = literal_type(scalar_arg(condition, 1));
+    assert_eq!(literal, &expression::literal::LiteralType::Date(10471));
+}
+
+/// Verifies `IN` predicates become singular-or-list expressions.
+#[test]
+fn in_predicate_translates_to_singular_or_list() {
+    let mut in_pred = base_expr_node(
+        TExprNodeType::IN_PRED,
+        scalar_type(TPrimitiveType::BOOLEAN),
+        3,
+    );
+    in_pred.in_predicate = Some(TInPredicate::new(false));
+    let mut nodes = vec![in_pred];
+    nodes.extend(slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT)).nodes);
+    nodes.extend(int_literal(1).nodes);
+    nodes.extend(int_literal(2).nodes);
+
+    let translated = translate_fragment(&params(
+        Some(filtered_scan(TExpr::new(nodes))),
+        Some(base_desc()),
+        None,
+    ))
+    .unwrap();
+    let condition = filter_condition(&translated.plan);
+    let expression::RexType::SingularOrList(list) = condition.rex_type.as_ref().unwrap() else {
+        panic!("expected singular-or-list");
+    };
+    assert_eq!(list.options.len(), 2);
+}
+
+/// Verifies allowlisted function calls translate and unknown builtins are rejected.
+#[test]
+fn function_calls_use_allowlist() {
+    let build = |name: &str| {
+        let mut call = base_expr_node(
+            TExprNodeType::FUNCTION_CALL,
+            scalar_type(TPrimitiveType::BOOLEAN),
+            2,
+        );
+        call.fn_ = Some(builtin_function(name, scalar_type(TPrimitiveType::BOOLEAN)));
+        let mut nodes = vec![call];
+        nodes.extend(slot_ref(2, 0, scalar_type(TPrimitiveType::VARCHAR)).nodes);
+        nodes.extend(string_literal("%x%").nodes);
+        TExpr::new(nodes)
+    };
+
+    let translated = translate_fragment(&params(
+        Some(filtered_scan(build("like"))),
+        Some(base_desc()),
+        None,
+    ))
+    .unwrap();
+    let names = extension_function_names(&translated.plan);
+    assert!(names.contains(&"like".to_string()), "{names:?}");
+
+    let err = translate_fragment(&params(
+        Some(filtered_scan(build("hll_cardinality"))),
+        Some(base_desc()),
+        None,
+    ))
+    .unwrap_err();
+    assert!(matches!(err, TranslateError::MalformedPlan(_)));
+}
+
+/// Verifies CASE WHEN chains become Substrait if-then expressions with a null default.
+#[test]
+fn case_expression_translates_to_if_then() {
+    let mut case = base_expr_node(
+        TExprNodeType::CASE_EXPR,
+        scalar_type(TPrimitiveType::BIGINT),
+        2,
+    );
+    case.case_expr = Some(TCaseExpr::new(false, false));
+    let mut nodes = vec![case];
+    nodes.extend(bool_literal(true).nodes);
+    nodes.extend(int_literal(1).nodes);
+
+    let translated = translate_fragment(&params(
+        Some(TPlan::new(vec![scan_node(0, 0)])),
+        Some(base_desc()),
+        Some(vec![TExpr::new(nodes)]),
+    ))
+    .unwrap();
+    let root = root(&translated.plan);
+    let rel::RelType::Project(project) = root.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected projection");
+    };
+    let expression::RexType::IfThen(if_then) = project.expressions[0].rex_type.as_ref().unwrap()
+    else {
+        panic!("expected if-then expression");
+    };
+    assert_eq!(if_then.ifs.len(), 1);
+    assert!(
+        if_then.r#else.is_some(),
+        "CASE without else defaults to null"
+    );
+}
+
+/// Verifies decimal-typed arithmetic is rejected (it crashes the engine's GPU projection).
+#[test]
+fn decimal_arithmetic_is_rejected() {
+    let decimal = scalar_type_with(TPrimitiveType::DECIMAL128, None, Some(31), Some(4));
+    let mut arith = base_expr_node(TExprNodeType::ARITHMETIC_EXPR, decimal.clone(), 2);
+    arith.opcode = Some(TExprOpcode::MULTIPLY);
+    let mut nodes = vec![arith];
+    nodes.extend(slot_ref(1, 0, decimal.clone()).nodes);
+    nodes.extend(slot_ref(1, 0, decimal).nodes);
+
+    let err = translate_fragment(&params(
+        Some(TPlan::new(vec![scan_node(0, 0)])),
+        Some(base_desc()),
+        Some(vec![TExpr::new(nodes)]),
+    ))
+    .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            TranslateError::UnsupportedExpression {
+                node_type: TExprNodeType::ARITHMETIC_EXPR,
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+}
+
+/// Verifies GPU-executor guards: non-constant LIKE patterns and non-constant substring
+/// bounds are rejected.
+#[test]
+fn gpu_unsupported_shapes_are_rejected() {
+    // LIKE with a column pattern (not a literal).
+    let mut like = base_expr_node(
+        TExprNodeType::FUNCTION_CALL,
+        scalar_type(TPrimitiveType::BOOLEAN),
+        2,
+    );
+    like.fn_ = Some(builtin_function(
+        "like",
+        scalar_type(TPrimitiveType::BOOLEAN),
+    ));
+    let mut nodes = vec![like];
+    nodes.extend(slot_ref(2, 0, scalar_type(TPrimitiveType::VARCHAR)).nodes);
+    nodes.extend(slot_ref(2, 0, scalar_type(TPrimitiveType::VARCHAR)).nodes);
+    let err = translate_fragment(&params(
+        Some(filtered_scan(TExpr::new(nodes))),
+        Some(base_desc()),
+        None,
+    ))
+    .unwrap_err();
+    assert!(
+        matches!(err, TranslateError::UnsupportedExpression { .. }),
+        "{err:?}"
+    );
+
+    // substring with a non-constant start.
+    let mut substr = base_expr_node(
+        TExprNodeType::FUNCTION_CALL,
+        scalar_type(TPrimitiveType::VARCHAR),
+        3,
+    );
+    substr.fn_ = Some(builtin_function(
+        "substring",
+        scalar_type(TPrimitiveType::VARCHAR),
+    ));
+    let mut nodes = vec![substr];
+    nodes.extend(slot_ref(2, 0, scalar_type(TPrimitiveType::VARCHAR)).nodes);
+    nodes.extend(slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT)).nodes);
+    nodes.extend(int_literal(2).nodes);
+    let err = translate_fragment(&params(
+        Some(TPlan::new(vec![scan_node(0, 0)])),
+        Some(base_desc()),
+        Some(vec![TExpr::new(nodes)]),
+    ))
+    .unwrap_err();
+    assert!(
+        matches!(err, TranslateError::UnsupportedExpression { .. }),
+        "{err:?}"
+    );
 }

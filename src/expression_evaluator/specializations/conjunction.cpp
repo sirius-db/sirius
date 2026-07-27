@@ -33,9 +33,11 @@ namespace {
 
 cudf::ast::ast_operator conjunction_op_to_ast(sirius::ast::conjunction::kind op)
 {
+  // SQL AND/OR use Kleene three-valued logic (e.g. TRUE OR NULL = TRUE), so use
+  // cuDF's NULL_LOGICAL_* operators rather than the null-propagating LOGICAL_*.
   switch (op) {
-    case sirius::ast::conjunction::kind::op_and: return cudf::ast::ast_operator::LOGICAL_AND;
-    case sirius::ast::conjunction::kind::op_or: return cudf::ast::ast_operator::LOGICAL_OR;
+    case sirius::ast::conjunction::kind::op_and: return cudf::ast::ast_operator::NULL_LOGICAL_AND;
+    case sirius::ast::conjunction::kind::op_or: return cudf::ast::ast_operator::NULL_LOGICAL_OR;
     default:
       throw invalid_input_exception(
         "[expression_evaluator:conjunction] unrecognized conjunction type {}",
@@ -45,9 +47,10 @@ cudf::ast::ast_operator conjunction_op_to_ast(sirius::ast::conjunction::kind op)
 
 cudf::binary_operator conjunction_op_to_binary(sirius::ast::conjunction::kind op)
 {
+  // Kleene three-valued logic (SQL semantics); see conjunction_op_to_ast.
   switch (op) {
-    case sirius::ast::conjunction::kind::op_and: return cudf::binary_operator::LOGICAL_AND;
-    case sirius::ast::conjunction::kind::op_or: return cudf::binary_operator::LOGICAL_OR;
+    case sirius::ast::conjunction::kind::op_and: return cudf::binary_operator::NULL_LOGICAL_AND;
+    case sirius::ast::conjunction::kind::op_or: return cudf::binary_operator::NULL_LOGICAL_OR;
     default:
       throw invalid_input_exception(
         "[expression_evaluator:conjunction] unrecognized conjunction type {}",

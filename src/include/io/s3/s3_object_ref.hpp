@@ -24,12 +24,13 @@ namespace sirius::io::s3 {
  * @brief Object reference passed to the credential / authorizer seam.
  *
  * @c bucket carries the object-store bucket name (no scheme, no trailing
- * slashes). @c key carries the object key, RFC3986-decoded — the
- * provider / authorizer re-encodes for canonical URI construction.
+ * slashes). @c key carries the RAW, literal object key bytes (a `%`, `?` or
+ * `#` in the key is a literal byte, not an escape) — the provider / authorizer
+ * RFC3986-encodes it once for canonical URI construction, so a literal `%`
+ * becomes `%25` on the wire.
  *
- * Shared by both @c credential_provider (the legacy presign-only seam) and
- * @c s3_request_authorizer (the newer presigned/header seam) so the two
- * interfaces agree on the object-identity type.
+ * Used by @c s3_request_authorizer (the presigned/header signing seam) as the
+ * object-identity type.
  */
 struct s3_object_ref {
   std::string bucket;

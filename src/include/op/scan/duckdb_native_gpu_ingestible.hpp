@@ -113,6 +113,14 @@ class duckdb_native_scan_info : public op::scan::scan_info {
   std::shared_ptr<sirius::io::sirius_datasource> datasource;
   /// Resolves block ids to file offsets when deriving the on-disk ranges below.
   duckdb::SingleFileBlockManager const* block_manager = nullptr;
+  /// Owners of the bytes that host-backed descriptors (`host_ptr`) point
+  /// into. Shared by the per-operator splits cut from one delta capture;
+  /// must outlive this split's decode.
+  std::vector<std::shared_ptr<void>> staging_keepalive;
+  /// True when no descriptor reads the .db file (host-backed or blockless
+  /// stats-backed only): the split stages no file reads and may carry a null
+  /// datasource.
+  bool host_backed_only = false;
 
   /// On-disk byte ranges this unit reads, derived from @ref row_groups so they always match the row
   /// groups currently held. The scan sequencer fadvises these to prefetch.

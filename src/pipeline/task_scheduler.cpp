@@ -19,9 +19,13 @@
 #include "creator/task_creator.hpp"
 #include "downgrade/downgrade_executor.hpp"
 #include "exec/config.hpp"
+#include "exec/multi_index_priority_queue.hpp"
 #include "log/logging.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
+#include "op/sirius_physical_operator.hpp"
 #include "pipeline/gpu_pipeline_executor.hpp"
+#include "pipeline/gpu_pipeline_task.hpp"
+#include "pipeline/sirius_pipeline.hpp"
 #include "pipeline/sirius_pipeline_itask.hpp"
 #include "planner/query.hpp"
 #include "telemetry/telemetry_context.hpp"
@@ -31,6 +35,7 @@
 #include <cucascade/memory/memory_space.hpp>
 
 #include <algorithm>
+#include <limits>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -46,7 +51,34 @@ task_scheduler::task_scheduler(
   std::shared_ptr<const telemetry::telemetry_context> telemetry_context,
   const cucascade::memory::system_topology_info* sys_topology,
   const std::vector<std::unique_ptr<sirius::parallel::downgrade_executor>>* downgrade_executors)
-  : _telemetry_context(std::move(telemetry_context))
+  : _task_queue([](const sirius::parallel::itask& task) -> exec::index_keys {
+      // Derive the multi-index keys from the task. The queue orders by priority
+      // (lower value = dispatched first) and additionally indexes by operator type,
+      // query id, and preferred device. Non-pipeline tasks fall back to the maximum
+      // priority so they sort last, with sentinel index keys.
+      if (const auto* gpu_task = dynamic_cast<const pipeline::gpu_pipeline_task*>(&task)) {
+        const exec::queue_priority priority = gpu_task->get_priority();
+        // The scheduling priority packs query_id in its high 32 bits and the
+        // within-query pipeline rank in the low 32 (see task_creator), so the query
+        // id is recoverable here without extra plumbing.
+        const exec::query_key query_id =
+          static_cast<exec::query_key>(static_cast<std::uint64_t>(priority) >> 32);
+        exec::operator_key operator_type = op::SiriusPhysicalOperatorType::INVALID;
+        if (const auto* pipe = gpu_task->get_pipeline()) {
+          if (auto source = pipe->get_source()) { operator_type = source->type; }
+        }
+        const auto pref = gpu_task->get_preferred_device_id();
+        return exec::index_keys{priority,
+                                operator_type,
+                                query_id,
+                                pref.has_value() ? pref.value() : exec::no_preferred_device};
+      }
+      return exec::index_keys{std::numeric_limits<exec::queue_priority>::max(),
+                              op::SiriusPhysicalOperatorType::INVALID,
+                              0,
+                              exec::no_preferred_device};
+    }),
+    _telemetry_context(std::move(telemetry_context))
 {
   _task_queue_telemetry = std::make_unique<telemetry::TaskQueueHandleWrapper>(
     *_telemetry_context, "task-scheduler-gpu-queue", _telemetry_context->shared_group_id());
@@ -102,7 +134,7 @@ void task_scheduler::schedule(std::unique_ptr<sirius::parallel::itask> task)
       .queue_capacity_entries = 1,
     });
   }
-  [[maybe_unused]] auto _ = _task_queue.push(std::move(task));
+  _task_queue.push(std::move(task));
   if (_self_publisher) {
     auto wake                 = std::make_unique<task_request>();
     wake->kind                = task_request_kind::task_available;
@@ -315,7 +347,7 @@ void task_scheduler::management_eventloop()
       }
     }
 
-    if (_task_queue.is_empty()) {
+    if (_task_queue.empty()) {
       if (_task_creator) { _task_creator->schedule_lookahead(*_ready_devices.begin()); }
     }
 
@@ -332,28 +364,13 @@ void task_scheduler::management_eventloop()
       const int device_id = *it;
       std::unique_ptr<sirius::parallel::itask> task;
 
-      // Exact preference match.
-      task = _task_queue.pop_if(
-        [device_id](const sirius::parallel::itask& t) -> bool {
-          const auto* gpu_task = dynamic_cast<const pipeline::gpu_pipeline_task*>(&t);
-          if (!gpu_task) { return false; }
-          auto pref = gpu_task->get_preferred_device_id();
-          return pref.has_value() && pref.value() == device_id;
-        },
-        /*front_to_back=*/true);
+      // Exact preference match: the device index returns the highest-priority
+      // (lowest value) task preferring exactly this device.
+      task = _task_queue.try_pop_from(exec::gpu_index{device_id}).value_or(nullptr);
       if (!task) {
-        // Fallback: take the first task with NO preference, or whose preferred
-        // device does not exist in _gpu_executors (a stale preference from a
-        // different env / config is meaningless — treat as unpreferred).
-        task = _task_queue.pop_if(
-          [this](const sirius::parallel::itask& t) -> bool {
-            const auto* gpu_task = dynamic_cast<const pipeline::gpu_pipeline_task*>(&t);
-            if (!gpu_task) { return true; }
-            auto pref = gpu_task->get_preferred_device_id();
-            if (!pref.has_value()) { return true; }
-            return _gpu_executors.count(pref.value()) == 0;
-          },
-          /*front_to_back=*/true);
+        // pick a task with no preference (any device will do). The round-robin counter
+        task =
+          _task_queue.try_pop_from(exec::gpu_index{exec::no_preferred_device}).value_or(nullptr);
       }
       if (!task) {
         // No dispatchable task for this device. Leave device in _ready_devices

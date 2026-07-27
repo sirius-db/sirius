@@ -26,13 +26,12 @@
 #include "pin_table.hpp"
 #include "scan_manager/config.hpp"
 #include "scan_manager/duckdb_mvcc_metadata.hpp"
+#include "scan_manager/insert_delta_job.hpp"
 #include "scan_manager/load_balancing_scan_batch_coalescer.hpp"
 #include "scan_manager/mvcc_mask_job.hpp"
 #include "scan_manager/pinned_chunk_stats.hpp"
 #include "scan_manager/split_provider.hpp"
 
-// Forward-declare sirius_ioctx via <io/types.hpp> for the gpu_ioctxs map type
-// used by prepare_for_query / create_provider_for.
 #include <cudf/column/column.hpp>
 #include <cudf/table/table.hpp>
 
@@ -162,7 +161,7 @@ struct pinned_entry {
   /// data_batches_by_column: chunk_memory_spaces[i] is the memory_space*
   /// for every column's chunk at index i. All columns at chunk index i
   /// share the same memory_space because they came from the same
-  /// chunked_parquet_reader::read_chunk() call.
+  /// coalesced batch.
   std::vector<cucascade::memory::memory_space*> chunk_memory_spaces;
   /// HOST-tier storage: one chunk per emitted batch in emission order, each
   /// holding all pinned columns. Every element is either a
@@ -183,10 +182,10 @@ struct pinned_entry {
   /// (the plain, non-compression GPU pin path) when non-empty.
   std::vector<sirius::device_pin_chunk> device_chunks;
   /// Tier the pinned data resides in. Drives which storage member above is used
-  /// and which cached_split_provider variant @ref create_provider_for builds.
+  /// and which fetch path the cached provider takes.
   cucascade::memory::Tier tier{cucascade::memory::Tier::GPU};
-  /// Memory space the pinned data resides in. Captured at pin time so the
-  /// cached_split_provider can wrap copied tables as data_batch instances.
+  /// Representative memory space of a HOST-tier entry; the MVCC path expands
+  /// it into a per-chunk vector. GPU-tier entries leave it null.
   cucascade::memory::memory_space* memory_space{nullptr};
   /// Total number of rows across all pinned chunks. Used by insert_pinned_entry
   /// to decide whether a re-insert merges into the existing entry (same row
@@ -241,7 +240,8 @@ std::unique_ptr<databatch_provider> make_provider_for_pinned_entry(
   std::span<std::size_t const> selected_columns,
   cached_scan_plan plan,
   const telemetry::batch_telemetry_info& telemetry_info,
-  mvcc_chunk_mask_set mvcc_masks = {});
+  mvcc_chunk_mask_set mvcc_masks               = {},
+  std::vector<insert_delta_split> delta_splits = {});
 
 /**
  * @brief Build the survivor plan for serving @p entry to a scan into @p requiested_column_ids with
@@ -459,8 +459,8 @@ class sirius_scan_manager {
   parquet_bind_result describe_parquet(std::string const& uri);
 
   /// \brief Process-wide ioctx used to mint @c sirius_datasource instances.
-  ///        Returns nullptr when the manager was configured with
-  ///        @c use_sirius_datasource=false.
+  ///        Holds a @c uring_ioctx, or a @c kvikio_context when the manager
+  ///        was configured with @c use_sirius_datasource=false.
   [[nodiscard]] sirius::io::sirius_ioctx* io_ctx() const noexcept { return _io_ctx.get(); }
 
   [[nodiscard]] std::shared_ptr<sirius::io::sirius_datasource> create_datasource(
@@ -548,10 +548,16 @@ class sirius_scan_manager {
   /// reset() for the prepare-threw case).
   std::vector<mvcc_mask_job_request> _pending_mvcc_mask_jobs;
 
+  /// One insert-delta job per distinct pinned entry matched this query, with
+  /// the same dedup and lifecycle as the mask jobs above. Later operators
+  /// union their columns into the pending request. The job no-ops when the
+  /// table has no rows beyond the pinned prefix.
+  std::vector<insert_delta_job_request> _pending_insert_delta_jobs;
+
   /// Per-query sequencer for opportunistic fadvise calls.  Built fresh
-  /// in @ref prepare_for_query, gets one @c pipeline_slot per non-cached
-  /// parquet scan (allocated by @ref create_provider_for when it builds
-  /// a parquet_split_provider).  The sequencer task is enqueued on the
+  /// in @ref prepare_for_query, gets one @c pipeline_slot per scan,
+  /// registered before the pinned-cache match.  The
+  /// sequencer task is enqueued on the
   /// per-query @c _dispatcher, which injects its own stop_token; the
   /// dispatcher's @c request_stop() in @ref reset() therefore tears the
   /// sequencer down without an extra side-channel.

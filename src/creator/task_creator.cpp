@@ -17,11 +17,13 @@
 #include "creator/task_creator.hpp"
 
 #include "log/logging.hpp"
+#include "memory/topology_index.hpp"
 #include "op/scan/sirius_gpu_scan_operator_data.hpp"
 #include "op/sirius_physical_delim_join.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
 #include "pipeline/task_scheduler.hpp"
 #include "planner/query.hpp"
+#include "planner/query_index.hpp"
 #include "sirius_context.hpp"
 
 #include <cucascade/cudf/gpu_data_representation.hpp>
@@ -45,36 +47,28 @@ namespace sirius::creator {
 
 task_creator::task_creator(task_creator_config config,
                            sirius::memory::sirius_memory_reservation_manager& mem_res_mgr,
-                           const cucascade::memory::system_topology_info* sys_topology)
+                           std::shared_ptr<const sirius::memory::topology_index> topology_index)
   : _running(false),
     _config(std::move(config)),
     _mem_res_mgr(mem_res_mgr),
-    _sys_topology(sys_topology)
+    _topology_index(std::move(topology_index))
 {
-  // Normalize numa_node=-1 (Linux convention for non-NUMA / single-NUMA
-  // hosts) to 0 so it matches the host memory space, which is built with
-  // numa_id=0 on those hosts. Without normalization, host-sourced tasks on
-  // single-NUMA boxes fall through to the default GPU.
+  // NUMA-aware GPU routing (HOST-data locality via gpus_of(numa)) is served by
+  // the shared topology_index; no ad-hoc device<->NUMA maps are built here.
+  // numa_node -1 ("unknown", per the Linux /sys/bus/pci/devices/*/numa_node
+  // convention on non-NUMA / single-NUMA hosts) is the index's grouping key and
+  // is queried verbatim at routing time.
   //
-  // Record every GPU under its NUMA key (not just the first) so the
-  // round-robin walk spreads work across all GPUs sharing a NUMA node.
-  if (_sys_topology) {
-    for (size_t i = 0; i < _sys_topology->gpus.size(); ++i) {
-      auto raw_numa       = _sys_topology->gpus[i].numa_node;
-      int normalized_numa = (raw_numa < 0) ? 0 : raw_numa;
-      _numa_to_gpu[normalized_numa].push_back(static_cast<int>(_sys_topology->gpus[i].id));
-    }
+  // Materialize the active executor set sorted+deduped (topology_index preserves
+  // manager order, not sorted order) so partition affinity below stays inverse
+  // to sirius_physical_partition's device->slot mapping.
+  if (_topology_index) {
+    auto ids        = _topology_index->gpu_ids();
+    _active_gpu_ids = std::vector<int>(ids.begin(), ids.end());
+    std::sort(_active_gpu_ids.begin(), _active_gpu_ids.end());
+    _active_gpu_ids.erase(std::unique(_active_gpu_ids.begin(), _active_gpu_ids.end()),
+                          _active_gpu_ids.end());
   }
-
-  // Device ids that actually have a GPU executor (memory-manager GPU spaces);
-  // partition affinity indexes this, not the physical topology, so the pin
-  // resolves to a real executor when num_gpus < physical GPU count.
-  for (auto const* space : _mem_res_mgr.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU)) {
-    if (space) { _active_gpu_ids.push_back(space->get_device_id()); }
-  }
-  std::sort(_active_gpu_ids.begin(), _active_gpu_ids.end());
-  _active_gpu_ids.erase(std::unique(_active_gpu_ids.begin(), _active_gpu_ids.end()),
-                        _active_gpu_ids.end());
 }
 
 task_creator::~task_creator() { stop(); }
@@ -107,6 +101,8 @@ void task_creator::prepare_for_query(const sirius::planner::query& query)
   std::shared_ptr<const telemetry::telemetry_context> telemetry_context =
     sirius_ctx->get_telemetry_context();
 
+  auto pipeline_priorities = compute_pipeline_priorities(query);
+
   for (const auto& pipeline : pipelines) {
     pipeline->set_task_creator(this);
     auto source_operator = pipeline->get_source();
@@ -117,6 +113,9 @@ void task_creator::prepare_for_query(const sirius::planner::query& query)
     size_t operator_id = source_operator->get_operator_id();
     auto gs =
       std::make_shared<pipeline::gpu_pipeline_task_global_state>(pipeline, telemetry_context);
+    if (auto it = pipeline_priorities.find(pipeline.get()); it != pipeline_priorities.end()) {
+      gs->set_priority(it->second);
+    }
     _gpu_operator_global_state_map.emplace(operator_id, std::move(gs));
   }
 
@@ -130,6 +129,78 @@ void task_creator::prepare_for_query(const sirius::planner::query& query)
       _lookahead_queue.push_back(*it);
     }
   }
+}
+
+std::unordered_map<const pipeline::sirius_pipeline*, exec::queue_priority>
+task_creator::compute_pipeline_priorities(const sirius::planner::query& query) const
+{
+  // Partition the pipeline DAG into branches (linear chains between branch points) and give each
+  // pipeline a scheduling priority. LOWER priority values are dispatched first by the pipeline-
+  // level priority queue, so a pipeline's priority ascends with its execution order. The final
+  // priorities are compacted to a dense, contiguous 0..N-1 range (N = number of pipelines) so the
+  // assignment is easy to read off against the plan. The rules (see query_index for the branch
+  // definition):
+  //   - Branches are ordered by plan order; an earlier branch is ALWAYS strictly lower (runs
+  //     first) than a later one (guaranteed by a per-branch stride larger than any branch length).
+  //   - Within a branch, source ranks the head (closest to the scan) lowest; sink reverses it.
+  //   - A pipeline shared by several branches (a join/merge endpoint) takes the MIN priority of
+  //     the branches that reach it, so it runs as soon as its earliest-needed branch wants it.
+  std::unordered_map<const pipeline::sirius_pipeline*, exec::queue_priority> priorities;
+
+  auto options  = planner::build_index_options{.branch_order = planner::build_probe{}};
+  auto index    = planner::query_index::build_index(query, options);
+  auto branches = index->get_branches();
+  if (branches.empty()) { return priorities; }
+
+  const bool sink_first = _config.priority == priority_order::sink;
+
+  // Stride larger than any branch length keeps cross-branch ordering strictly dominant over the
+  // within-branch offset.
+  std::size_t max_branch_len = 0;
+  for (const auto& chain : branches) {
+    max_branch_len = std::max(max_branch_len, chain.size());
+  }
+  const exec::queue_priority stride = static_cast<exec::queue_priority>(max_branch_len) + 1;
+
+  const std::size_t num_branches = branches.size();
+  for (std::size_t b = 0; b < num_branches; ++b) {
+    const auto& chain               = branches[b];
+    const auto len                  = chain.size();
+    const exec::queue_priority base = static_cast<exec::queue_priority>(b) * stride;
+    for (std::size_t pos = 0; pos < len; ++pos) {
+      // source: head (pos 0) gets the smallest offset so it runs first; sink reverses
+      // within-branch.
+      const exec::queue_priority within   = sink_first
+                                              ? static_cast<exec::queue_priority>(len - 1 - pos)
+                                              : static_cast<exec::queue_priority>(pos);
+      const exec::queue_priority priority = base + within;
+      auto [it, inserted]                 = priorities.try_emplace(chain[pos], priority);
+      if (!inserted) { it->second = std::min(it->second, priority); }
+    }
+  }
+
+  // The strided values above are correct in relative order but sparse (short branches leave gaps).
+  // Compact them to a dense 0..N-1 range by ranking the assigned priorities: each branch occupies a
+  // disjoint value range and a shared endpoint's min comes from a single branch's range, so every
+  // pipeline's raw priority is distinct and the rank is a clean bijection preserving execution
+  // order.
+  std::vector<exec::queue_priority> sorted;
+  sorted.reserve(priorities.size());
+  for (const auto& [pipeline, priority] : priorities) {
+    sorted.push_back(priority);
+  }
+  std::sort(sorted.begin(), sorted.end());
+  // Inject the query id into the high 32 bits so tasks are ordered by query first, then by the
+  // within-query pipeline rank in the low 32 bits. The priority queue picks the LOWEST value first,
+  // so an earlier query (smaller id) always runs before a later one, and within a query the dense
+  // 0..N-1 rank preserves pipeline execution order.
+  const exec::queue_priority query_bits = static_cast<exec::queue_priority>(query.get_query_id())
+                                          << 32;
+  for (auto& [pipeline, priority] : priorities) {
+    const auto rank = std::lower_bound(sorted.begin(), sorted.end(), priority) - sorted.begin();
+    priority        = query_bits | static_cast<exec::queue_priority>(rank);
+  }
+  return priorities;
 }
 
 void task_creator::drain_pending_tasks()
@@ -195,7 +266,6 @@ op::sirius_physical_operator* task_creator::get_operator_for_next_task(
 
 void task_creator::stop()
 {
-  std::lock_guard<std::mutex> lock(_global_state_mutex);
   _task_creation_queue.interrupt();
   do_stop_thread_pool();
 }
@@ -286,8 +356,7 @@ void task_creator::manager_loop()
     auto request_kind = request->type;
     if (node == nullptr) { continue; }
 
-    auto* source = node;
-    node         = get_operator_for_next_task(node);
+    node = get_operator_for_next_task(node);
 
     if (node == nullptr) { continue; }
 
@@ -363,16 +432,11 @@ void task_creator::manager_loop()
                 if (space->get_tier() == cucascade::memory::Tier::GPU) {
                   gpu_bytes[space->get_device_id()] += size;
                 } else if (space->get_tier() == cucascade::memory::Tier::HOST) {
-                  // Normalize numa_id=-1 (non-NUMA / single-NUMA hosts, per
-                  // the Linux /sys/bus/pci/devices/*/numa_node convention)
-                  // to 0 so the NUMA-affinity lookup matches the normalized
-                  // `_numa_to_gpu` map key. Without this, host_bytes[-1]
-                  // never hits `_numa_to_gpu[0]`, preferred_device_id stays
-                  // nullopt, and every host-sourced pipeline task falls
-                  // back to `_gpu_executors.begin()->first`.
-                  int host_key = space->get_device_id();
-                  if (host_key < 0) host_key = 0;
-                  host_bytes[host_key] += size;
+                  // Key by the host space's NUMA node verbatim; topology_index
+                  // groups GPUs under that same key (including the -1 "unknown"
+                  // sentinel for non-NUMA / single-NUMA hosts), so gpus_of()
+                  // resolves without any normalization.
+                  host_bytes[space->get_device_id()] += size;
                 }
               }
               if (!gpu_bytes.empty()) {
@@ -382,7 +446,7 @@ void task_creator::manager_loop()
                                    gpu_bytes.end(),
                                    [](const auto& a, const auto& b) { return a.second < b.second; })
                     ->first;
-              } else if (!host_bytes.empty() && !_numa_to_gpu.empty()) {
+              } else if (!host_bytes.empty() && _topology_index) {
                 // NUMA-affinity: no GPU data, route to a GPU on the same
                 // NUMA as the host data. When that NUMA hosts multiple
                 // GPUs, pick round-robin across them — pinning every
@@ -393,10 +457,10 @@ void task_creator::manager_loop()
                                    host_bytes.end(),
                                    [](const auto& a, const auto& b) { return a.second < b.second; })
                     ->first;
-                auto it = _numa_to_gpu.find(top_host);
-                if (it != _numa_to_gpu.end() && !it->second.empty()) {
-                  auto idx            = _numa_to_gpu_rr.fetch_add(1) % it->second.size();
-                  preferred_device_id = it->second[idx];
+                auto gpus = _topology_index->gpus_of(top_host);
+                if (!gpus.empty()) {
+                  auto idx            = _numa_affinity_rr.fetch_add(1) % gpus.size();
+                  preferred_device_id = gpus[idx];
                 }
               }
               SIRIUS_LOG_DEBUG(
@@ -405,7 +469,7 @@ void task_creator::manager_loop()
                 host_bytes.size(),
                 preferred_device_id.value_or(-1));
             }
-            // Cached-scan locality: scan_operator_with_pinned_table_input is
+            // Cached-scan locality: a resident scan_operator_input is
             // NOT a pipelineable_operator_data (see
             // sirius_gpu_scan_operator_data.hpp), so the data-locality block
             // above skipped it wholesale. Without this branch, every
@@ -413,7 +477,7 @@ void task_creator::manager_loop()
             // scheduler and triggers a peer DMA or host staging when the
             // consumer GPU differs from the chunk's home GPU. The pinned
             // chunk's GPU residency is preserved on the batch
-            // (cached_parquet_gpu_ingestible pins each chunk_memory_space
+            // (the cached provider pins each chunk_memory_space
             // into the gpu_table_representation), so we just read it here.
             if (!preferred_device_id.has_value()) {
               if (auto* cached =
@@ -425,18 +489,16 @@ void task_creator::manager_loop()
                     if (space->get_tier() == cucascade::memory::Tier::GPU) {
                       preferred_device_id = space->get_device_id();
                     } else if (space->get_tier() == cucascade::memory::Tier::HOST &&
-                               !_numa_to_gpu.empty()) {
+                               _topology_index) {
                       // tier='host' pinned chunks carry a NUMA-local host
-                      // memory_space; map back through _numa_to_gpu to pick
-                      // a GPU on the same NUMA. Normalize numa_id=-1 to 0
-                      // to match the convention used by the pipelineable
-                      // locality block above.
-                      int host_key = space->get_device_id();
-                      if (host_key < 0) host_key = 0;
-                      auto it = _numa_to_gpu.find(host_key);
-                      if (it != _numa_to_gpu.end() && !it->second.empty()) {
-                        auto idx            = _numa_to_gpu_rr.fetch_add(1) % it->second.size();
-                        preferred_device_id = it->second[idx];
+                      // memory_space; map back through the topology index to
+                      // pick a GPU on the same NUMA. The host space's device id
+                      // is the NUMA key verbatim (-1 = "unknown"), matching the
+                      // pipelineable locality block above.
+                      auto gpus = _topology_index->gpus_of(space->get_device_id());
+                      if (!gpus.empty()) {
+                        auto idx            = _numa_affinity_rr.fetch_add(1) % gpus.size();
+                        preferred_device_id = gpus[idx];
                       }
                     }
                     SIRIUS_LOG_DEBUG(
@@ -461,6 +523,7 @@ void task_creator::manager_loop()
                                                                     gpu_pipeline_task_global_state);
           task_lock.unlock();
           _task_scheduler->schedule(std::move(task));
+
           if (request_kind == request_type::lookahead) { break; }
         }
         // Unconditional re-evaluation at every creation exit: with the

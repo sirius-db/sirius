@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use instrumentation_model::{SiriusEvent, channel, gpu_device, memory, task, thread_group};
+use instrumentation_model::{SiriusEvent, batch, channel, gpu_device, memory, task, thread_group};
 use quent_time::TimeUnixNanoSec;
 use rustc_hash::FxHashMap as HashMap;
 
@@ -35,6 +35,7 @@ use tracing::warn;
 use uuid::Uuid;
 
 use crate::{
+    batch_placement::{BatchPlacement, BatchPlacementBuilder},
     data_batch::{DataBatch, DataBatchBuilder, DataBatchExt},
     task::{Task, TaskBuilder, TaskExt},
     view::SiriusModelQueryView,
@@ -50,6 +51,10 @@ const MEMORY_TYPE_NAME: &str = "memory";
 const CHANNEL_TYPE_NAME: &str = "channel";
 const MEMORY_BYTES_CAPACITY_NAME: &str = "capacity_bytes";
 const CHANNEL_BYTES_CAPACITY_NAME: &str = "capacity_bytes";
+/// Type name of the MemoryTier resources as recorded by the model.
+pub(crate) const MEMORY_TIER_TYPE_NAME: &str = "memory_tier";
+/// Capacity name of the MemoryTier `bytes` capacity as recorded by the model.
+pub(crate) const MEMORY_TIER_BYTES_CAPACITY_NAME: &str = "capacity_bytes";
 
 fn validate_resource_type(actual: &str, expected: &str, id: Uuid) -> AnalyzerResult<()> {
     if actual == expected {
@@ -91,6 +96,13 @@ fn insert_sirius_specific_resource_types(resources: &mut InMemoryResources) {
             [CapacityDecl::new_occupancy(CHANNEL_BYTES_CAPACITY_NAME)],
         ),
     );
+    resources.resource_types.insert(
+        MEMORY_TIER_TYPE_NAME.to_string(),
+        ResourceTypeDecl::new(
+            MEMORY_TIER_TYPE_NAME,
+            [CapacityDecl::new_occupancy(MEMORY_TIER_BYTES_CAPACITY_NAME)],
+        ),
+    );
 }
 
 /// A model of the simulator engine
@@ -99,6 +111,7 @@ pub struct SiriusModel {
     pub(crate) arbitrary_resources: InMemoryResources,
     pub(crate) tasks: HashMap<Uuid, Task>,
     pub(crate) data_batches: HashMap<Uuid, DataBatch>,
+    pub(crate) batch_placements: HashMap<Uuid, BatchPlacement>,
     pub(crate) resource_group_types: HashMap<String, ResourceGroupTypeDecl>,
 }
 
@@ -269,6 +282,7 @@ pub struct SiriusModelBuilder {
     arbitrary_resources: InMemoryResourcesBuilder,
     tasks: HashMap<Uuid, TaskBuilder>,
     data_batches: HashMap<Uuid, DataBatchBuilder>,
+    batch_placements: HashMap<Uuid, BatchPlacementBuilder>,
 }
 
 impl SiriusModelBuilder {
@@ -278,6 +292,7 @@ impl SiriusModelBuilder {
             arbitrary_resources: InMemoryResourcesBuilder::default(),
             tasks: HashMap::default(),
             data_batches: HashMap::default(),
+            batch_placements: HashMap::default(),
         })
     }
 
@@ -360,7 +375,54 @@ impl SiriusModelBuilder {
                 data_batch_builder.push(Event::new(id, timestamp, d));
                 Ok(())
             }
+            SiriusEvent::BatchPlacement(b) => {
+                let batch_builder = self
+                    .batch_placements
+                    .entry(id)
+                    .or_insert_with(|| BatchPlacementBuilder::try_new(id).unwrap());
+                batch_builder.push(Event::new(id, timestamp, b));
+                Ok(())
+            }
+            SiriusEvent::MemoryTier(e) => self.push_memory_tier(id, timestamp, e),
         }
+    }
+
+    fn push_memory_tier(
+        &mut self,
+        id: Uuid,
+        timestamp: TimeUnixNanoSec,
+        event: batch::MemoryTierEvent,
+    ) -> AnalyzerResult<()> {
+        use batch::MemoryTierTransition;
+        match event.state {
+            MemoryTierTransition::MemoryTierInitializing(init) => {
+                validate_resource_type(&init.resource_type_name, MEMORY_TIER_TYPE_NAME, id)?;
+                let builder = self.arbitrary_resources.try_builder(id)?;
+                builder.push(RtResourceTransition::Init(timestamp));
+                builder.set_type_name(init.resource_type_name);
+                builder.set_instance_name(Some(init.instance_name));
+                builder.set_parent_group_id(init.parent_group_id);
+            }
+            MemoryTierTransition::MemoryTierOperating(operating) => {
+                let builder = self.arbitrary_resources.try_builder(id)?;
+                builder.push(RtResourceTransition::Operating(
+                    timestamp,
+                    ResourceCapacities(vec![CapacityValue::new(
+                        MEMORY_TIER_BYTES_CAPACITY_NAME,
+                        operating.capacity_bytes.value.unwrap_or(0),
+                    )]),
+                ));
+            }
+            MemoryTierTransition::MemoryTierFinalizing(_) => {
+                let builder = self.arbitrary_resources.try_builder(id)?;
+                builder.push(RtResourceTransition::Finalizing(timestamp));
+            }
+            MemoryTierTransition::Exit => {
+                let builder = self.arbitrary_resources.try_builder(id)?;
+                builder.push(RtResourceTransition::Exit(timestamp));
+            }
+        }
+        Ok(())
     }
 
     fn push_memory(
@@ -623,6 +685,26 @@ impl SiriusModelBuilder {
             }
         }
 
+        let mut batch_placements = HashMap::default();
+        for (batch_id, batch_builder) in self.batch_placements.into_iter() {
+            let batch = batch_builder.try_build()?;
+            for usage in batch.usages() {
+                let resource_type_name = resources
+                    .resource(usage.resource_id())?
+                    .type_name()
+                    .to_owned();
+                let set = &mut resources
+                    .resource_types
+                    .get_mut(&resource_type_name)
+                    .unwrap()
+                    .used_by;
+                if !set.contains(batch.type_name()) {
+                    set.insert(batch.type_name().to_owned());
+                }
+            }
+            batch_placements.insert(batch_id, batch);
+        }
+
         // Construct the model without group type decls being populated yet, we
         // will populate it based on the resource tree.
         let temp_model = SiriusModel {
@@ -630,6 +712,7 @@ impl SiriusModelBuilder {
             arbitrary_resources: resources,
             tasks,
             data_batches,
+            batch_placements,
             resource_group_types: HashMap::default(),
         };
         let mut resource_group_types = derive_resource_group_types(&temp_model)?;
@@ -654,6 +737,7 @@ impl SiriusModelBuilder {
             arbitrary_resources: temp_model.arbitrary_resources,
             tasks: temp_model.tasks,
             data_batches: temp_model.data_batches,
+            batch_placements: temp_model.batch_placements,
             resource_group_types,
         })
     }

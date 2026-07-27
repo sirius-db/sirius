@@ -225,7 +225,14 @@ class sirius_physical_plan_generator {
   static void set_parent_ops(sirius::op::sirius_physical_operator& op,
                              sirius::op::sirius_physical_operator* parent);
 
+  //! Mark eligible merge operators for downstream pipeline fusion.
+  static void mark_fusable_merge_pipelines(duckdb::ClientContext& context,
+                                           sirius::op::sirius_physical_operator& op);
+
  private:
+  static void mark_fusable_merge_pipelines(sirius::op::sirius_physical_operator& op,
+                                           bool fusion_enabled);
+
   //! Walk the plan tree and insert the GPU pipeline operators (PARTITION, CONCAT, sort chain,
   //! merge operators, scan companions, GPU_VALUES) so the tree carries the full execution
   //! structure before the pipeline converter runs.

@@ -52,6 +52,10 @@
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
 #include <cucascade/memory/memory_space.hpp>
+#include <duckdb/main/attached_database.hpp>
+#include <duckdb/storage/data_table.hpp>
+#include <duckdb/storage/single_file_block_manager.hpp>
+#include <duckdb/storage/storage_manager.hpp>
 
 #include <algorithm>
 #include <cstdint>
@@ -71,11 +75,13 @@ struct cached_databatch_provider : public databatch_provider {
                             std::span<std::size_t const> selected_columns,
                             cached_scan_plan plan,
                             const telemetry::batch_telemetry_info& telemetry_info,
-                            mvcc_chunk_mask_set mvcc_masks)
+                            mvcc_chunk_mask_set mvcc_masks,
+                            std::vector<insert_delta_split> delta_splits)
     : _plan(std::move(plan)),
       _entry(entry),
       _telemetry_info(telemetry_info),
-      _mvcc_masks(std::move(mvcc_masks))
+      _mvcc_masks(std::move(mvcc_masks)),
+      _delta_splits(std::move(delta_splits))
   {
     auto const& entry_column_names = _entry.cache_info.column_names();
     std::ranges::for_each(selected_columns, [this, &entry_column_names](size_t idx) {
@@ -86,9 +92,20 @@ struct cached_databatch_provider : public databatch_provider {
 
   databatch_provider::batch get_next_batch() override
   {
-    // The atomic cursor walks survivor positions, each mapping to a chunk index.
+    // The atomic cursor walks survivor positions, each mapping to a chunk
+    // index; positions past the survivors yield the insert-delta splits.
+    // The cursor hands out unique positions, so each split is moved out once.
     auto const cursor = _index.fetch_add(1);
-    if (cursor >= _plan.survivor_chunk_indices.size()) { return {}; }
+    if (cursor >= _plan.survivor_chunk_indices.size()) {
+      auto const delta_idx = cursor - _plan.survivor_chunk_indices.size();
+      if (delta_idx >= _delta_splits.size()) { return {}; }
+      auto& delta = _delta_splits[delta_idx];
+      databatch_provider::batch out;
+      out.mvcc_keep_mask   = std::move(delta.mask);
+      out.scan_info        = std::move(delta.info);
+      out.preferred_device = delta.preferred_device;
+      return out;
+    }
     auto const index = _plan.survivor_chunk_indices[cursor];
     std::shared_ptr<cucascade::data_batch> data;
     if (_entry.tier == cucascade::memory::Tier::GPU) {
@@ -186,6 +203,9 @@ struct cached_databatch_provider : public databatch_provider {
   /// This provider's own copy of the entry's per-chunk keep-masks (empty for
   /// parquet pins); word storage is shared through each mask's owning pointer.
   mvcc_chunk_mask_set _mvcc_masks;
+  /// This operator's insert-delta splits, yielded after the resident chunks
+  /// (staging and mask words shared with sibling operators' cuts).
+  std::vector<insert_delta_split> _delta_splits;
   std::atomic<std::size_t> _index{0};
 };
 
@@ -247,7 +267,7 @@ sirius_scan_manager::sirius_scan_manager(
 
   // scan_manager always owns an io_ctx: sirius_datasource (uring) on the
   // fast path, kvikio_context as the universal fallback so the rest of the
-  // scan path (parquet_split_provider, scan tasks) always has an ioctx to
+  // scan path (split_provider, scan tasks) always has an ioctx to
   // talk to.  kvikio_context wraps cudf::io::datasource so the read path
   // is identical from the caller's point of view.  Both are built by the
   // ioctx registry, which sources the reactor staging resource from the
@@ -435,6 +455,17 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
     run_mvcc_mask_jobs(
       _pending_mvcc_mask_jobs, *_dispatcher, _reservation_manager, *_topology_index);
   }
+  // Insert-delta jobs block in prepare for the same reason: staging and
+  // masks must be finished before serving starts. No-op when no pinned
+  // table has rows beyond its prefix.
+  if (!_pending_insert_delta_jobs.empty()) {
+    std::vector<int> const delta_gpu_ids(gpu_ids.begin(), gpu_ids.end());
+    run_insert_delta_jobs(_pending_insert_delta_jobs,
+                          *_dispatcher,
+                          _reservation_manager,
+                          *_topology_index,
+                          delta_gpu_ids);
+  }
 
   // Provider handoff, deferred to behind the mask run so ownership is a
   // sequential handoff instead of sharing: each matched op's provider takes
@@ -444,6 +475,7 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
   // serving still starts with finished masks.
   for (auto& assignment : cached_assignments) {
     mvcc_chunk_mask_set masks;  // stays empty for parquet pins
+    std::vector<insert_delta_split> delta_splits;
     if (assignment.entry->mvcc != nullptr) {
       auto request = std::ranges::find_if(
         _pending_mvcc_mask_jobs,
@@ -455,15 +487,52 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
           assignment.entry_name + "'");
       }
       masks = request->masks;
+
+      auto delta_request = std::ranges::find_if(
+        _pending_insert_delta_jobs,
+        [&](insert_delta_job_request const& r) { return r.entry_name == assignment.entry_name; });
+      if (delta_request != _pending_insert_delta_jobs.end() && !delta_request->bundles.empty()) {
+        auto const* duckdb_info =
+          dynamic_cast<op::scan::duckdb_native_ingestible_table_info const*>(
+            &assignment.op->get_ingestible().table_info());
+        if (duckdb_info == nullptr) {
+          throw std::runtime_error(
+            "[sirius_scan_manager::prepare_for_query] delta bundles pending for a non-duckdb "
+            "scan of entry '" +
+            assignment.entry_name + "'");
+        }
+        auto io_ctx = ioctx_for_path(duckdb_info->db_path);
+        if (!io_ctx) {
+          throw std::runtime_error(
+            "[sirius_scan_manager::prepare_for_query] no io backend supports the pinned "
+            "database path '" +
+            duckdb_info->db_path + "'");
+        }
+        auto const* sf_bm = dynamic_cast<duckdb::SingleFileBlockManager const*>(
+          &duckdb_info->storage->GetAttached().GetStorageManager().GetBlockManager());
+        delta_splits = cut_delta_splits_for_op(*delta_request,
+                                               duckdb_info->projected_cols,
+                                               io_ctx->open_datasource(duckdb_info->db_path),
+                                               sf_bm);
+        SIRIUS_LOG_INFO(
+          "[sirius_scan_manager] operator '{}' serves {} insert-delta split(s) of pinned entry "
+          "'{}' ({} delta row(s))",
+          assignment.op->get_operator_id(),
+          delta_splits.size(),
+          assignment.entry_name,
+          delta_request->plan.delta_rows());
+      }
     }
     auto provider = make_provider_for_pinned_entry(*assignment.entry,
                                                    assignment.columns,
                                                    std::move(assignment.plan),
                                                    assignment.op->batch_telemetry(),
-                                                   std::move(masks));
+                                                   std::move(masks),
+                                                   std::move(delta_splits));
     _metadata_processor->use_cached_entries_for_pipeline(assignment.op, std::move(provider));
   }
   _pending_mvcc_mask_jobs.clear();
+  _pending_insert_delta_jobs.clear();
 
   start_metadata_processing();
 }
@@ -595,6 +664,7 @@ void sirius_scan_manager::reset()
   _scan_op_order.clear();
   _providers_by_op.clear();
   _pending_mvcc_mask_jobs.clear();
+  _pending_insert_delta_jobs.clear();
   _metadata_processor.reset();
   _dispatcher = std::make_unique<exec::scoped_dispatcher>(_thread_pool, _thread_pool.num_threads());
 }
@@ -749,8 +819,8 @@ void sirius_scan_manager::insert_pinned_entry(
   std::vector<std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>>> chunk_stats)
 {
   // chunk_memory_spaces is parallel to data_tables — the caller
-  // (PinTableFunction) emits one memory_space* per
-  // chunked_parquet_reader::read_chunk() result, and there is exactly one
+  // (PinTableFunction) emits one memory_space* per coalesced batch, and
+  // there is exactly one
   // cudf::table per chunk in data_tables. Reject any misalignment loudly
   // rather than silently aliasing chunks to the wrong GPU.
   if (chunk_memory_spaces.size() != data_tables.size()) {
@@ -801,14 +871,13 @@ void sirius_scan_manager::insert_pinned_entry(
     // Mixing a full pin with a partial pin produces an entry whose columns came
     // from different row coverage — drop and rebuild instead.
     if (existing_it->second.num_rows == new_num_rows) {
-      // Same-row-count merge MUST preserve per-chunk memory_space alignment
-      // between existing and new entry. The round-robin counter restarts at
-      // chunk 0 → GPU 0 per pin_table call, and chunks at index i across all
-      // columns share a memory_space because they came from the same
-      // chunked_parquet_reader::read_chunk() call. Two pin_table calls of the
-      // same file_paths with the same chunk_read_limit MUST therefore produce
-      // identical chunk_memory_spaces vectors. Reject any mismatch loudly
-      // rather than silently aliasing.
+      // A merge is only valid when the new pin reproduces the existing batch
+      // boundaries and placement. The round-robin counter restarts at chunk 0
+      // per pin_table call, and chunks at index i across all columns share a
+      // memory_space because they came from the same coalesced batch. Batch
+      // boundaries depend on the projected column set, so a re-pin can slice
+      // the same files differently. Reject any mismatch loudly rather than
+      // silently aliasing.
       auto& entry = existing_it->second;
       if (entry.chunk_memory_spaces.size() != chunk_memory_spaces.size()) {
         throw std::runtime_error(
@@ -857,8 +926,8 @@ void sirius_scan_manager::insert_pinned_entry(
       // Decide which column INDICES are new BEFORE iterating chunks. Doing
       // the contains() check per-chunk would let chunk 0 install a new
       // column and then chunks 1..N-1 see contains()==true and skip — leaving
-      // the new column with only chunk 0 and tripping cached_split_provider's
-      // "mismatched chunk count across requested columns" invariant.
+      // the new column with only chunk 0; the cached provider would then read
+      // the short column vector as end-of-stream and silently truncate the scan.
       std::vector<bool> is_new_col(column_names.size(), false);
       for (std::size_t i = 0; i < column_names.size(); ++i) {
         is_new_col[i] = !entry.data_batches_by_column.contains(column_names[i]);
@@ -1140,10 +1209,15 @@ std::unique_ptr<databatch_provider> make_provider_for_pinned_entry(
   std::span<std::size_t const> selected_columns,
   cached_scan_plan plan,
   const telemetry::batch_telemetry_info& telemetry_info,
-  mvcc_chunk_mask_set mvcc_masks)
+  mvcc_chunk_mask_set mvcc_masks,
+  std::vector<insert_delta_split> delta_splits)
 {
-  return std::make_unique<cached_databatch_provider>(
-    entry, selected_columns, std::move(plan), telemetry_info, std::move(mvcc_masks));
+  return std::make_unique<cached_databatch_provider>(entry,
+                                                     selected_columns,
+                                                     std::move(plan),
+                                                     telemetry_info,
+                                                     std::move(mvcc_masks),
+                                                     std::move(delta_splits));
 }
 
 cached_scan_plan build_cached_scan_plan(pinned_entry const& entry,
@@ -1353,6 +1427,35 @@ std::optional<sirius_scan_manager::cached_assignment> sirius_scan_manager::try_m
           request.chunk_spaces = std::move(chunk_spaces);
           request.entry_name   = pinned_name;
           _pending_mvcc_mask_jobs.push_back(std::move(request));
+        }
+
+        // One insert-delta job per entry per query, deduped like the mask
+        // jobs. The job no-ops when no rows are beyond the pinned prefix, so
+        // queuing unconditionally is safe. Later operators union their
+        // columns in so the staging covers every requester; per-operator
+        // splits are cut at handoff.
+        auto delta_request = std::ranges::find_if(
+          _pending_insert_delta_jobs,
+          [&](insert_delta_job_request const& r) { return r.entry_name == pinned_name; });
+        if (delta_request == _pending_insert_delta_jobs.end()) {
+          insert_delta_job_request request;
+          request.storage                = duckdb_info->storage;
+          request.context                = duckdb_info->context;
+          request.n_cache                = entry.mvcc->n_cache();
+          request.approximate_batch_size = duckdb_info->approximate_batch_size;
+          request.entry_name             = pinned_name;
+          _pending_insert_delta_jobs.push_back(std::move(request));
+          delta_request = std::prev(_pending_insert_delta_jobs.end());
+        }
+        for (std::size_t ci = 0; ci < duckdb_info->projected_cols.size(); ++ci) {
+          auto const& pc = duckdb_info->projected_cols[ci];
+          if (pc.is_rowid) { continue; }
+          auto const sidx = pc.storage_idx.GetPrimaryIndex();
+          if (std::find(delta_request->union_cols.begin(), delta_request->union_cols.end(), sidx) ==
+              delta_request->union_cols.end()) {
+            delta_request->union_cols.push_back(sidx);
+            delta_request->union_types.push_back(duckdb_info->projected_types[ci]);
+          }
         }
       }
 
