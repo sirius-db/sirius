@@ -173,6 +173,7 @@ add_codegen_host_test(test_jit_kernel_cache_plain)
 add_codegen_host_test(test_jit_kernel_cache)
 add_codegen_host_test(test_fused_operator_sweep)
 add_codegen_host_test(test_operator_sweep)
+add_codegen_host_test(test_representation_contract)
 
 # Multi-mode CLI. Target is simpatico_cli to avoid clashing with the lib target;
 # the installed binary is named 'simpatico'.
@@ -203,3 +204,4 @@ add_test(NAME jit_kernel_cache_plain COMMAND test_jit_kernel_cache_plain)
 add_test(NAME jit_kernel_cache COMMAND test_jit_kernel_cache)
 add_test(NAME fused_operator_sweep COMMAND test_fused_operator_sweep)
 add_test(NAME operator_sweep COMMAND test_operator_sweep)
+add_test(NAME representation_contract COMMAND test_representation_contract)

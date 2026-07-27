@@ -713,14 +713,6 @@ struct single_op_representation : compressed_representation {
     }
     return total;
   }
-
-  std::unique_ptr<cudf::column> decompress(rmm::cuda_stream_view,
-                                           rmm::device_async_resource_ref) const override
-  {
-    // Not a standalone decodable leaf; callers use named_channels() /
-    // compressed_size_bytes() only.
-    return nullptr;
-  }
 };
 
 }  // namespace

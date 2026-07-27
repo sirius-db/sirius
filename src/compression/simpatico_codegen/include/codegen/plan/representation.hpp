@@ -77,7 +77,14 @@ struct compressible_output {
   cudf::column_view view;
 };
 
-/// Opaque compressed data; decompress(stream, mr) reconstructs the original column.
+/// Storage/metadata base for all compressed representations.
+///
+/// Every rep stored in a PlanNode carries type, row count, serializable channel
+/// buffers, and leaf descriptor hooks. Only representations that can be decoded
+/// without PlanTree context (generic codecs) derive from
+/// standalone_compressed_representation below. codegen_fused_representation
+/// stores data that requires the JIT decode bridge and therefore derives only
+/// from this base.
 struct compressed_representation {
   // Reconstructed column's type and row count, carried uniformly by every rep.
   cudf::data_type original_type{cudf::type_id::EMPTY};
@@ -89,8 +96,6 @@ struct compressed_representation {
   compressed_representation(cudf::data_type t, cudf::size_type n) : original_type(t), num_rows(n) {}
 
   virtual ~compressed_representation() = default;
-  virtual std::unique_ptr<cudf::column> decompress(rmm::cuda_stream_view stream,
-                                                   rmm::device_async_resource_ref mr) const = 0;
 
   /// Canonical channel enumeration: this rep's named output channels, in manifest/wire order.
   /// Generic implementation: driven by channels_ + op_info(kind()).channels from the registry.
@@ -133,9 +138,24 @@ struct compressed_representation {
   virtual leaf_meta_v describe_meta() const { return leaf_meta::none{}; }
 };
 
+/// Independently decodable representation. All generic codec representations
+/// (identity, dictionary, nvCOMP, ALP, bitextract, str_split) derive from this
+/// subtype, which guarantees that decompress(stream, mr) reconstructs the
+/// original column without any PlanTree or JIT-bridge context.
+///
+/// codegen_fused_representation does NOT derive from this type; use the
+/// checked decompress_standalone_representation() helper or DecodeWalk to
+/// decide which path to take at runtime.
+struct standalone_compressed_representation : compressed_representation {
+  using compressed_representation::compressed_representation;
+
+  virtual std::unique_ptr<cudf::column> decompress(rmm::cuda_stream_view stream,
+                                                   rmm::device_async_resource_ref mr) const = 0;
+};
+
 /// Identity / passthrough: stores a column as-is (e.g. keys_chars "stored as-is" in plan).
 /// Used for outputs that are not further compressed; decompress() returns a copy.
-struct identity_compressed_representation : compressed_representation {
+struct identity_compressed_representation : standalone_compressed_representation {
   static std::unique_ptr<compressed_representation> from_outputs(
     std::vector<std::string> const& output_names,
     std::vector<std::unique_ptr<cudf::column>> outputs,
@@ -144,8 +164,8 @@ struct identity_compressed_representation : compressed_representation {
     std::string* error_out);
 
   explicit identity_compressed_representation(std::unique_ptr<cudf::column> c)
-    : compressed_representation(c ? c->type() : cudf::data_type{cudf::type_id::EMPTY},
-                                c ? c->size() : 0)
+    : standalone_compressed_representation(c ? c->type() : cudf::data_type{cudf::type_id::EMPTY},
+                                           c ? c->size() : 0)
   {
     channels_.push_back(std::move(c));
   }
@@ -181,7 +201,7 @@ struct identity_compressor : compressor {
 
 /// Dictionary format: stores the encoded dictionary column and a copy of keys chars.
 /// In modern cuDF, chars are not accessible as a column_view, so we copy them into a UINT8 column.
-struct dictionary_compressed_representation : compressed_representation {
+struct dictionary_compressed_representation : standalone_compressed_representation {
   // Accepts the (keys_offsets, keys_chars, indices[, null_mask]) form.
   static std::unique_ptr<compressed_representation> from_outputs(
     std::vector<std::string> const& output_names,
@@ -339,7 +359,7 @@ struct dictionary_compressor : compressor {
 // channels_[0] = offsets (INT32 or INT64), channels_[1] = chars (UINT8/UINT32/UINT64),
 // channels_[2] = null_mask (UINT8 bitmask bytes, only present when nullable).
 // decompress() copies channels into make_strings_column; channels_ is left intact.
-struct str_split_compressed_representation : compressed_representation {
+struct str_split_compressed_representation : standalone_compressed_representation {
   static std::unique_ptr<compressed_representation> from_outputs(
     std::vector<std::string> const& output_names,
     std::vector<std::unique_ptr<cudf::column>> outputs,
@@ -351,7 +371,7 @@ struct str_split_compressed_representation : compressed_representation {
                                       std::unique_ptr<cudf::column> offsets,
                                       std::unique_ptr<cudf::column> chars,
                                       std::unique_ptr<cudf::column> null_mask)
-    : compressed_representation(cudf::data_type{cudf::type_id::STRING}, n_rows)
+    : standalone_compressed_representation(cudf::data_type{cudf::type_id::STRING}, n_rows)
   {
     channels_.push_back(std::move(offsets));
     channels_.push_back(std::move(chars));
@@ -398,7 +418,7 @@ inline std::unique_ptr<compressed_representation> identity_compressor::compress(
 // stores the same thing: an opaque compressed byte payload held as a single
 // UINT8 channel (channels_[0], size = actual compressed bytes). Concrete reps
 // add codec-specific metadata fields and supply kind()/describe_meta()/decompress().
-struct nvcomp_payload_rep : compressed_representation {
+struct nvcomp_payload_rep : standalone_compressed_representation {
   size_t uncompressed_size = 0;
 
   // Takes ownership of the worst-case-sized device_buffer and wraps it as a
@@ -409,7 +429,7 @@ struct nvcomp_payload_rep : compressed_representation {
                      std::unique_ptr<rmm::device_buffer> data,
                      size_t comp_sz,
                      size_t uncomp_sz)
-    : compressed_representation(t, n), uncompressed_size(uncomp_sz)
+    : standalone_compressed_representation(t, n), uncompressed_size(uncomp_sz)
   {
     channels_.push_back(
       std::make_unique<cudf::column>(cudf::data_type{cudf::type_id::UINT8},
@@ -647,7 +667,7 @@ struct deflate_compressor : compressor {
 // See SIGMOD '24 (Afroozeh) + G-ALP DaMoN '25.
 // channels_[0]=integers (INT32/INT64), [1]=exceptions (FLOAT32/FLOAT64),
 // [2]=exception_positions (INT32), [3]=metadata (UINT16, one per 1024-vector).
-struct alp_compressed_representation : compressed_representation {
+struct alp_compressed_representation : standalone_compressed_representation {
   static std::unique_ptr<compressed_representation> from_outputs(
     std::vector<std::string> const& output_names,
     std::vector<std::unique_ptr<cudf::column>> outputs,
@@ -701,7 +721,7 @@ struct alp_compressor : compressor {
 // channels_[0]=right_parts (UINT32/UINT64), [1]=dict_indices (UINT8),
 // [2]=dict (UINT16, 8 entries), [3]=metadata (UINT8, 1 entry: right_bw),
 // [4]=exceptions (UINT16), [5]=exception_positions (INT32).
-struct alp_rd_compressed_representation : compressed_representation {
+struct alp_rd_compressed_representation : standalone_compressed_representation {
   static std::unique_ptr<compressed_representation> from_outputs(
     std::vector<std::string> const& output_names,
     std::vector<std::unique_ptr<cudf::column>> outputs,
@@ -781,7 +801,7 @@ void launch_check_truncation(cudf::column_view const& input_col,
                              uint32_t flag_bit,
                              cudaStream_t stream);
 
-struct bitextract_compressed_representation : compressed_representation {
+struct bitextract_compressed_representation : standalone_compressed_representation {
   static std::unique_ptr<compressed_representation> from_outputs(
     bitextract_spec_result spec,
     std::vector<std::string> const& output_names,
@@ -850,14 +870,6 @@ struct codegen_fused_representation : compressed_representation {
   {
   }
 
-  std::unique_ptr<cudf::column> decompress(rmm::cuda_stream_view,
-                                           rmm::device_async_resource_ref) const override
-  {
-    throw std::runtime_error(
-      "codegen_fused_representation: reconstruct via the codegen "
-      "decode path, not C++ decompress()");
-  }
-
   std::vector<compressible_output> named_channels(rmm::cuda_stream_view) const override
   {
     std::vector<compressible_output> out;
@@ -870,5 +882,17 @@ struct codegen_fused_representation : compressed_representation {
 
   OpId kind() const override { return op_id_; }
 };
+
+/// Safely decompress a representation that must be standalone-decodable.
+///
+/// Downcasts to standalone_compressed_representation; calls decompress() on
+/// success. Returns nullptr and writes a deterministic message to error_out
+/// when rep is a storage-only type such as codegen_fused_representation.
+/// Callers should use this instead of calling rep->decompress() directly.
+std::unique_ptr<cudf::column> decompress_standalone_representation(
+  compressed_representation const* rep,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr,
+  std::string* error_out);
 
 }  // namespace simpatico

@@ -525,7 +525,7 @@ alp_rd_compressed_representation::alp_rd_compressed_representation(
   std::unique_ptr<cudf::column> metadata_in,
   std::unique_ptr<cudf::column> exceptions_in,
   std::unique_ptr<cudf::column> exception_positions_in)
-  : compressed_representation(type, n_rows), right_bw(right_bw_in)
+  : standalone_compressed_representation(type, n_rows), right_bw(right_bw_in)
 {
   channels_.push_back(std::move(right_parts_in));
   channels_.push_back(std::move(dict_indices_in));

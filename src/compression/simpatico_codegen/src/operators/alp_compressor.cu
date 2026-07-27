@@ -652,7 +652,7 @@ alp_compressed_representation::alp_compressed_representation(
   std::unique_ptr<cudf::column> exceptions_in,
   std::unique_ptr<cudf::column> exception_positions_in,
   std::unique_ptr<cudf::column> metadata_in)
-  : compressed_representation(type, n_rows), num_vectors(n_vectors)
+  : standalone_compressed_representation(type, n_rows), num_vectors(n_vectors)
 {
   channels_.push_back(std::move(integers_in));
   channels_.push_back(std::move(exceptions_in));
