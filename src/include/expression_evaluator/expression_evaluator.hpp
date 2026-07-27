@@ -424,18 +424,17 @@ class expression_evaluator {
     _temp_columns;  ///< The temporary columns that need to be kept alive for the AST nodes in
                     ///< _ast_tree.
 
-  struct restored_reference_cache_entry {
-    std::uint32_t column_index;
-    cudf::data_type target_type;
-    std::size_t temp_column_index;
-  };
-
-  // Numeric reference restorations live in _temp_columns so AST references use the existing
+  // Numeric reference restorations live in _temp_columns so AST references reuse the existing
   // combined-table layout. Cache AST results deliberately do not advertise these indices to
   // release_temporaries: a restoration remains alive for the complete top-level evaluation.
+  struct restored_reference_cache_entry {
+    std::uint32_t column_index;     ///< The index of the input column in the original table
+    cudf::data_type target_type;    ///< The target type for the numeric restoration
+    std::size_t temp_column_index;  ///< The index of the CAST temporary column in _temp_columns
+  };
   std::vector<restored_reference_cache_entry> _restored_reference_cache;
-  std::size_t _restored_reference_cast_count{0};
-  std::size_t _narrow_domain_comparison_count{0};
+  std::size_t _restored_reference_cast_count{0};   ///< For observability/testing
+  std::size_t _narrow_domain_comparison_count{0};  ///< For observability/testing
 
   // Evaluate the executor's single boolean predicate over @p input and return the resulting
   // mask column (the sole column of evaluate()'s output). Shared by both select() overloads.
@@ -469,9 +468,9 @@ class expression_evaluator {
   // restore path.
   //
   // Returns the narrowed input carrier when @p column_operand is a reference whose materialized
-  // carrier is a strict narrowing of its declared native type AND every entry of
-  // @p constant_operands is a constant exactly representable in that carrier (typed NULLs always
-  // are). Returns nullopt otherwise.
+  // carrier is a strict narrowing of its declared native type AND every entry of @p
+  // constant_operands is a constant exactly representable in that carrier (typed NULLs always are).
+  // Returns nullopt otherwise.
   [[nodiscard]] std::optional<cudf::data_type> narrow_domain_carrier(
     sirius::ast::node const& column_operand,
     std::initializer_list<sirius::ast::node const*> constant_operands) const;

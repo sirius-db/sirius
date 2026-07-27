@@ -128,8 +128,8 @@ std::optional<cudf::data_type> expression_evaluator::narrow_domain_carrier(
   std::initializer_list<sirius::ast::node const*> constant_operands) const
 {
   if (!column_operand.holds<sirius::ast::reference>()) { return std::nullopt; }
-  auto const& ref    = column_operand.get<sirius::ast::reference>();
-  auto const logical = ref.return_type();
+  auto const& ref     = column_operand.get<sirius::ast::reference>();
+  auto const& logical = ref.return_type();
   if (!is_narrowable_numeric_type(logical)) { return std::nullopt; }
   if (ref.column_index >= static_cast<std::uint32_t>(_input_table.num_columns())) {
     return std::nullopt;

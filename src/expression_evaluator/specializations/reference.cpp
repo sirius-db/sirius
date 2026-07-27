@@ -73,8 +73,8 @@ evaluate_result expression_evaluator::get_or_create_restored_reference(std::uint
 evaluate_result expression_evaluator::evaluate(sirius::ast::reference const& alt,
                                                evaluation_mode mode)
 {
-  auto const source  = _input_table.column(alt.column_index);
-  auto const logical = alt.return_type();
+  auto const source   = _input_table.column(alt.column_index);
+  auto const& logical = alt.return_type();
   if (is_narrowable_numeric_type(logical)) {
     auto const native = get_cudf_type(logical);
     if (can_restore_to(source.type(), native)) {
