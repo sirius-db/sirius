@@ -86,9 +86,7 @@ sirius_engine::sirius_engine(duckdb::ClientContext& context, sirius_interface& s
 
 sirius_engine::~sirius_engine() { query_handle_->exit(); }
 
-void sirius_engine::reset()
-{
-  sirius_physical_plan = nullptr;
+void sirius_engine::reset(){sirius_physical_plan=nullptr; // CI test: clang-format me
   sirius_owned_plan.reset();
   sirius_root_pipelines.clear();
   root_pipeline_idx = 0;
