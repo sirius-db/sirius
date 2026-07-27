@@ -341,9 +341,18 @@ This runner follows the spec instead:
 | Throughput refresh pairs | `max(SF/10, 1)`, unrelated to stream count | one RF1/RF2 pair per query stream (clause 5.3.7.7) |
 | RF1/RF2 in the throughput run | merged into one transaction | separate transactions, RF1 committing before RF2 (clause 5.3.7.8) |
 | Row limits (`:n`) | dropped — the `where rownum <= N` chunk fails its `'select' in q` filter, so q2/q3/q10/q18/q21 run unlimited | folded into a `LIMIT` on the query |
+| Power@Size spread limit | not applied | query times below `slowest/1000` raised to that floor (clause 5.4.1.4) |
+| Measurement interval start | timer starts before the threads spawn, so it covers thread and connection setup | barrier, so it starts once every stream is ready to submit (clause 5.3.6.1) |
+| Streams above SF1000 | stream table lists SF3000/SF10000 but only 7 query files are generated, so those runs die on a missing file | full Table 11 to SF100000; refuses to default past it |
 
-Inherited as-is: query text comes from `qgen`, each query runs in its own transaction, and
-Power@Size is the geometric mean over the 22 query times plus T_RF1 and T_RF2 (clause 5.4.1).
+Inherited as-is: query text comes from `qgen`, each query runs in its own transaction, the power
+run is RF1 → 22 queries → RF2, and Power@Size, Throughput@Size and QphH@Size use the same
+formulas — including the geometric mean over the 22 query times plus T_RF1 and T_RF2 (clause
+5.4.1). Both also run the throughput test on the same connection straight after the power test.
+
+Beyond the spec, this runner adds GPU-vs-CPU validation, the optional clean pre-refresh pass and
+post-RF2 pass, cache pinning, and pre-flight checks that the refresh sets and query streams belong
+to the input database. That harness has none of these; it measures timings only.
 
 `test_datasets/tpch-dbgen.zip` bundles TPC tools 3.0.1, the same version that repo vendors, so
 query text matches between the two. The bundle carries the TPC EULA and ships no compiled
