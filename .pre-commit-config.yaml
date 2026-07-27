@@ -23,7 +23,8 @@ repos:
     rev: v6.0.0
     hooks:
       - id: check-added-large-files
-        exclude: 'test/cpp/integration/integration\.duckdb'
+        # Vendored TPC-H / TPC-DS test databases live here and are intentionally large.
+        exclude: 'test/cpp/integration/data/duckdb/.*\.duckdb'
       - id: check-case-conflict
       - id: check-json
       - id: check-merge-conflict

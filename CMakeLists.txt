@@ -610,6 +610,7 @@ set(TEST_SOURCES
     test/cpp/integration/test_gpu_execution_locality.cpp
     test/cpp/integration/test_gpu_execution_multi_format.cpp
     test/cpp/integration/test_gpu_execution_order_nulls.cpp
+    test/cpp/integration/test_gpu_execution_tpcds_nulls.cpp
     test/cpp/integration/test_gpu_execution_tpch.cpp
     test/cpp/integration/test_gpu_execution_tpch_mgpu_audit.cpp
     test/cpp/integration/test_pin_table_host_streaming.cpp
@@ -719,6 +720,7 @@ set(TEST_SOURCES
     test/cpp/unittest.cpp
     test/cpp/utils/pipeline_conversion_test_utils.cpp
     test/cpp/utils/sirius_test_env.cpp
+    test/cpp/utils/test_gpu_execution_comparator.cpp
     test/cpp/utils/utils.cpp)
 # cmake-format: on
 
@@ -746,24 +748,6 @@ endif()
 # test/cpp/orphan_test_allowlist.txt.
 
 add_executable(sirius_unittest ${TEST_SOURCES})
-
-# TPC-DS integration test fixture, generated at build time (opt-in target). The
-# database is not committed; run `cmake --build . --target tpcds-fixture` once
-# before the TPC-DS integration tests. Requires the duckdb CLI (or python3 with
-# the duckdb module) on PATH; both are provided by the pixi environment.
-set(TPCDS_FIXTURE_DIR ${CMAKE_BINARY_DIR}/test-fixtures)
-set(TPCDS_FIXTURE ${TPCDS_FIXTURE_DIR}/tpcds.duckdb)
-set(TPCDS_FIXTURE_SCRIPT
-    ${CMAKE_CURRENT_SOURCE_DIR}/test/cpp/integration/data/duckdb/generate_tpcds_duckdb.sh
-)
-add_custom_command(
-  OUTPUT ${TPCDS_FIXTURE}
-  COMMAND ${CMAKE_COMMAND} -E make_directory ${TPCDS_FIXTURE_DIR}
-  COMMAND bash ${TPCDS_FIXTURE_SCRIPT} ${TPCDS_FIXTURE}
-  DEPENDS ${TPCDS_FIXTURE_SCRIPT}
-  COMMENT "Generating TPC-DS test fixture (SF 0.01) at ${TPCDS_FIXTURE}"
-  VERBATIM)
-add_custom_target(tpcds-fixture DEPENDS ${TPCDS_FIXTURE})
 
 if(VCPKG_BUILD)
   set_target_properties(sirius_unittest PROPERTIES NO_SYSTEM_FROM_IMPORTED ON)
