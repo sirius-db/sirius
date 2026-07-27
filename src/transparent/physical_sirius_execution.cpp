@@ -162,9 +162,9 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
     duckdb::ErrorData gpu_error;
     bool gpu_failed                = false;
     bool runtime_unavailable_error = false;
-    // The v6 execution window: begin mutations + slot acquire in one scope on
-    // this thread; finished (mandatory cleanup + release) below, BEFORE the
-    // first Fetch exposes the result — an abandoned result then holds nothing.
+    // The execution window: begin mutations and slot acquire in one scope on
+    // this thread; finished (mandatory cleanup and release) below, before the
+    // first Fetch exposes the result, so an abandoned result holds nothing.
     std::optional<duckdb::SiriusContext::StandaloneQueryScope> window;
     try {
       if (state.sirius_context) {
@@ -250,8 +250,8 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
       throw;
     } catch (duckdb::SiriusRuntimeUnavailableException& e) {
       // Pre-existing unavailability (this query never touched the runtime):
-      // a LOCAL query may CPU-fall-back per the matrix, but the S3 branch
-      // below must not rewrite the stable error.
+      // a local query may fall back to CPU, but the S3 branch below must not
+      // rewrite the stable error.
       gpu_error                 = duckdb::ErrorData(e);
       gpu_failed                = true;
       runtime_unavailable_error = true;
@@ -261,10 +261,11 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
     }
 
     // Mandatory per-query cleanup + slot release, BEFORE any of the throwing
-    // exits below and before the result is exposed. This covers all four
-    // gpu_failed exits (interrupt rethrow, s3 no-fallback, sanitized
-    // INTERNAL/FATAL, generic no-fallback Throw) — none may skip cleanup — and
-    // moves the CPU fallback outside the held slot. finish() may itself throw
+    // exits below and before the result is exposed. This covers every
+    // gpu_failed exit (interrupt rethrow, unavailable-s3 rethrow, s3
+    // no-fallback, sanitized INTERNAL/FATAL, generic no-fallback Throw) —
+    // none may skip cleanup — and moves the CPU fallback outside the held
+    // slot. finish() may itself throw
     // (mandatory-cleanup failure ⇒ runtime latched unavailable); a non-std
     // exception escaping the try above is handled by the window's destructor
     // backstop instead.

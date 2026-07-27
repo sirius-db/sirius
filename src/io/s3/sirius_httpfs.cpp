@@ -92,10 +92,10 @@ duckdb::shared_ptr<duckdb::SiriusContext> resolve_gated_sirius_context(
                                          "connection while ") +
                              verb + " '" + path + "'");
   }
-  // Unavailable surface matrix: checked FIRST so an unavailable runtime always
-  // surfaces the stable unavailable error (a gpu_execution=false session must
-  // not mask it with the gpu-off message), and the untrusted scan manager is
-  // never consulted.
+  // Health is checked first so an unavailable runtime always surfaces the
+  // stable unavailable error (a gpu_execution=false session must not mask it
+  // with the gpu-off message), and the untrusted scan manager is never
+  // consulted.
   if (sirius_ctx->get_runtime_health() == duckdb::SiriusContext::runtime_health::UNAVAILABLE) {
     sirius_ctx->throw_runtime_unavailable();
   }
@@ -119,9 +119,9 @@ duckdb::shared_ptr<duckdb::SiriusContext> resolve_gated_sirius_context(
   // CpuFallbackGuard). Refuse so s3:// data is never served to a CPU plan,
   // even when reached indirectly through a view. Uses the narrow
   // CpuFallbackGuard flag (not the broad is_internal_query_active), so a
-  // legitimate internal s3:// read is not blocked. Since v6 the flag is
-  // per-connection (this connection's replay), so an unrelated connection's
-  // fallback no longer blocks this one's S3 access.
+  // legitimate internal s3:// read is not blocked. The flag is per-connection
+  // (this connection's replay), so an unrelated connection's fallback does
+  // not block this one's S3 access.
   auto conn_state = duckdb::get_sirius_connection_state(*client);
   if (conn_state && conn_state->is_cpu_fallback_active()) {
     throw duckdb::IOException(std::string("[sirius_httpfs] ") + verb + " '" + path +

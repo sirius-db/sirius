@@ -42,7 +42,6 @@
 #include <optional>
 #include <set>
 #include <string_view>
-#include <thread>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -182,11 +181,10 @@ class SiriusConnectionState : public ClientContextState {
 /// not registered on this connection.
 shared_ptr<SiriusConnectionState> get_sirius_connection_state(ClientContext& context);
 
-/// \brief Thrown by the fast-fail/locked health check when the Sirius runtime
-/// has been latched unavailable BEFORE this query touched it. IS-A
-/// ExecutorException (non-invalidating); entry points may CPU-fall-back a
-/// LOCAL query on it per the unavailable surface matrix, but must never let
-/// the S3 branch rewrite it.
+/// \brief Thrown by the health check when the Sirius runtime was latched
+/// unavailable before this query touched it. An ExecutorException
+/// (non-invalidating); entry points may fall a local query back to CPU on it,
+/// but must never let the S3 branch rewrite it.
 class SiriusRuntimeUnavailableException : public ExecutorException {
  public:
   explicit SiriusRuntimeUnavailableException(const string& msg) : ExecutorException(msg) {}
@@ -224,14 +222,14 @@ class SiriusContext : public ClientContextState {
   SiriusContext(SiriusContext&&)                 = delete;
   SiriusContext& operator=(SiriusContext&&)      = delete;
 
-  /// \brief Called at the beginning of a query execution. Since v6 this holds
-  /// NO lock and performs NO shared mutations (those moved inside the
-  /// execution windows); it only logs the SQL for log-analysis correlation.
+  /// \brief Called at the beginning of a query execution. Holds no lock and
+  /// performs no shared mutations (those run inside the execution windows);
+  /// it only logs the SQL for log-analysis correlation.
   /// \param context The client context.
   void QueryBegin(ClientContext& context) final;
 
-  /// \brief Called at the end of a query execution. Since v6 this releases
-  /// nothing — slot ownership is scope-bound (StandaloneQueryScope/SlotGuard).
+  /// \brief Called at the end of a query execution. Releases nothing; slot
+  /// ownership is scope-bound (StandaloneQueryScope/SlotGuard).
   void QueryEnd() final;
 
   /// \brief Called at the end of a query execution with context.
@@ -368,10 +366,9 @@ class SiriusContext : public ClientContextState {
    * finish() did not complete — it attempts the cleanup once, marks the
    * runtime UNAVAILABLE if that fails, and always releases the slot.
    *
-   * This is the v6 "scope-bound" core: every acquire/release pair lives in one
-   * C++ scope on one thread, so release is exactly-once by construction and
-   * DuckDB's QueryEnd delivery (unreliable for abandoned results) no longer
-   * participates in slot ownership.
+   * Every acquire/release pair lives in one C++ scope on one thread, so
+   * release is exactly-once by construction and DuckDB's QueryEnd delivery
+   * (unreliable for abandoned results) plays no part in slot ownership.
    */
   class StandaloneQueryScope {
    public:
@@ -389,8 +386,6 @@ class SiriusContext : public ClientContextState {
     /// slot nor poison the runtime.
     void finish();
 
-    [[nodiscard]] uint64_t window_id() const noexcept { return window_id_; }
-
    private:
     enum class scope_state : uint8_t { ACTIVE, FINISHED, FAILED };
     /// Best-effort window begin/end log line — never throws.
@@ -399,44 +394,15 @@ class SiriusContext : public ClientContextState {
     uint64_t window_id_;
     uint64_t connection_id_;
     uint64_t query_ordinal_;
-    /// Pool-stat tags carrying the full window key (R3-2), rendered into
-    /// FIXED buffers BEFORE the slot is acquired: nothing after acquire may
-    /// allocate, so no path between acquire and release can throw for a
-    /// reason unrelated to the window body (IB: a post-acquire allocation
-    /// failure must never skip release, mis-poison the runtime, or terminate
-    /// inside the noexcept destructor).
+    /// Pool-stat tags carrying the full window key, rendered into fixed
+    /// buffers before the slot is acquired so the logging paths between
+    /// acquire and release do not depend on allocation. Release itself is
+    /// guaranteed by the try/catch structure and the noexcept backstops, not
+    /// by an absence of allocation in the window body.
     char begin_tag_[192] = {};
     char end_tag_[192]   = {};
     scope_state state_   = scope_state::ACTIVE;
   };
-
-  /// \brief Number of threads currently waiting to acquire the slot
-  /// (diagnostic; used by the worker-pressure gate to confirm waiter arrival).
-  [[nodiscard]] uint64_t pending_slot_acquirers() const noexcept
-  {
-    return pending_acquirers_.load(std::memory_order_acquire);
-  }
-
-  /// \brief TEST-ONLY seams for the deterministic worker-pressure and
-  /// cleanup-fault scenarios. Production never sets these.
-  ///
-  /// The window hold is a ONE-SHOT gate, not a timed sleep: arm it, submit the
-  /// holder query (the next window to begin parks itself), confirm waiter
-  /// arrival via pending_slot_acquirers(), then release. A 30 s safety cap
-  /// unparks a forgotten holder so a broken test cannot wedge the suite.
-  void arm_test_window_hold() noexcept
-  {
-    test_window_hold_release_.store(false, std::memory_order_release);
-    test_window_hold_armed_.store(true, std::memory_order_release);
-  }
-  void release_test_window_hold() noexcept
-  {
-    test_window_hold_release_.store(true, std::memory_order_release);
-  }
-  void set_test_inject_cleanup_fault(bool fault) noexcept
-  {
-    test_inject_cleanup_fault_.store(fault, std::memory_order_release);
-  }
 
   /// \brief Terminate the Sirius context, releasing all resources.
   void terminate();
@@ -561,13 +527,17 @@ class SiriusContext : public ClientContextState {
   /// attempt; on failure marks the runtime UNAVAILABLE.
   void run_mandatory_cleanup_backstop(std::string_view end_tag) noexcept;
 
+  /// \brief Best-effort task_creator reset for latched-unavailable paths,
+  /// where no later window will ever run the in-cleanup reset.
+  void drop_task_creator_state_best_effort() noexcept;
+
   mutable std::mutex mutex_;
-  // The current Super Sirius runtime is shared across connections, so plan
-  // generation and engine execution must be serialized (single-flight). Since
-  // v6 the slot is scope-bound: it is held only inside StandaloneQueryScope /
-  // SlotGuard windows (acquire and release in the same scope on the same
-  // thread), never across DuckDB's user-visible result lifetime — an abandoned
-  // stream/pending result holds nothing.
+  // The Super Sirius runtime is shared across connections, so plan generation
+  // and engine execution must be serialized (single-flight). The slot is
+  // scope-bound: held only inside StandaloneQueryScope / SlotGuard windows
+  // (acquire and release in the same scope on the same thread), never across
+  // DuckDB's user-visible result lifetime, so an abandoned stream or pending
+  // result holds nothing.
   std::mutex query_lifecycle_mutex_;
   std::atomic<bool> query_lifecycle_held_{false};
   // Hash of the holder's thread id, written under the gate while held, 0 when
@@ -579,14 +549,6 @@ class SiriusContext : public ClientContextState {
   std::atomic<bool> runtime_unavailable_{false};
   // Monotonic execution-window id for window-keyed logging.
   std::atomic<uint64_t> next_window_id_{0};
-  // Diagnostic: threads currently blocked in acquire (worker-pressure gate).
-  std::atomic<uint64_t> pending_acquirers_{0};
-  // TEST-ONLY seams (see the public setters): the armed/release pair forms a
-  // one-shot gate parking the NEXT window after its begin mutations; the fault
-  // flag makes the next mandatory cleanup throw.
-  std::atomic<bool> test_window_hold_armed_{false};
-  std::atomic<bool> test_window_hold_release_{false};
-  std::atomic<bool> test_inject_cleanup_fault_{false};
   bool is_initialized_ = false;
   sirius::sirius_config config_;
   std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> memory_manager_;

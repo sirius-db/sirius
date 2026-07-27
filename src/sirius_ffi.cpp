@@ -169,12 +169,11 @@ void Context::execute_substrait(const std::string& plan, std::uintptr_t out_stre
     resolver.VisitOperator(*logical_plan);
 
     // 3. DuckDB LogicalOperator -> Sirius GPU physical plan -> execute directly
-    // on the engine, inside a v6 execution window: begin mutations + slot
-    // acquire in the constructor, mandatory cleanup + release in finish() —
-    // exactly once, on this thread. This standalone path bypasses DuckDB's
-    // normal query entry point, so nothing else would ever clean up for it.
-    // (The old manual QueryBegin/QueryEnd pairing could call QueryEnd twice
-    // when the first cleanup threw — the scope removes that path entirely.)
+    // on the engine, inside an execution window: begin mutations and slot
+    // acquire in the constructor, mandatory cleanup and release in finish().
+    // This standalone path bypasses DuckDB's normal query entry point, so
+    // nothing else would clean up for it. (The old manual QueryBegin/QueryEnd
+    // pairing could call QueryEnd twice when the first cleanup threw.)
     {
       duckdb::SiriusContext::StandaloneQueryScope window(*impl_->context, client, kQueryLabel);
       auto physical_plan = sirius::planner::sirius_physical_plan_generator(client).create_plan(

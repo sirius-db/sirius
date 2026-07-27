@@ -168,8 +168,8 @@ unique_ptr<FunctionData> SiriusReadParquetBind(ClientContext& context,
   if (!sirius_ctx) {
     throw std::runtime_error("sirius_read_parquet: Sirius is not initialized on this connection");
   }
-  // Unavailable surface matrix: this bind reads the shared scan manager, which
-  // must not be consulted after the runtime is latched unavailable.
+  // This bind reads the shared scan manager, which must not be consulted
+  // after the runtime is latched unavailable.
   if (sirius_ctx->get_runtime_health() == duckdb::SiriusContext::runtime_health::UNAVAILABLE) {
     sirius_ctx->throw_runtime_unavailable();
   }
@@ -239,11 +239,10 @@ struct SiriusTableFunctionData : public TableFunctionData {
     // The user might want to disable the optimizer of the new connection.
     // (connection-local ClientConfig — safe to toggle per execution)
     context.config.enable_optimizer = enable_optimizer;
-    // NOTE (v6): the old per-query DBConfig::disabled_optimizers
-    // save/modify/restore is GONE. That set is DB-global and read locklessly by
-    // every connection's optimizer, so per-query mutation was an unprotected
-    // concurrent write. IN_CLAUSE / COMPRESSED_MATERIALIZATION (and
-    // LATE_MATERIALIZATION) are now published ONCE at extension load
+    // The old per-query DBConfig::disabled_optimizers save/modify/restore is
+    // gone: that set is DB-global and read locklessly by every connection's
+    // optimizer, so per-query mutation was an unprotected concurrent write.
+    // The mask is published once at extension load
     // (publish_transparent_optimizer_mask); shapes previously avoided by the
     // DEBUG-only COLUMN_LIFETIME disable fall back to CPU via create_plan
     // rejection instead.
@@ -620,10 +619,10 @@ void SiriusExtension::GPUExecutionFunction(ClientContext& context,
     bool gpu_failed                = false;
     bool runtime_unavailable_error = false;
 
-    // The v6 execution window: fresh plan extraction, Sirius physical plan
+    // The execution window: fresh plan extraction, Sirius physical plan
     // generation, execution and mandatory cleanup all happen inside one scope
     // on this thread; released before the first Fetch. The CPU fallback below
-    // runs OUTSIDE the window.
+    // runs outside the window.
     {
       std::optional<duckdb::SiriusContext::StandaloneQueryScope> window;
       try {
@@ -1158,11 +1157,11 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
     throw InvalidInputException("pin_table requires the Sirius context to be initialized");
   }
 
-  // Pin materialization mutates the shared scan-manager registry and drives the
-  // shared GPU runtime, so it runs inside its own v6 execution window (it used
-  // to ride the per-query slot that QueryBegin held). finish() at the end of
-  // this body quiesces any transient per-query state the materialization
-  // created; the pinned entries themselves persist across windows.
+  // Pin materialization mutates the shared scan-manager registry and drives
+  // the shared GPU runtime, so it runs inside its own execution window.
+  // finish() at the end of this body quiesces any transient per-query state
+  // the materialization created; the pinned entries themselves persist across
+  // windows.
   duckdb::SiriusContext::StandaloneQueryScope window(*sirius_ctx, context, "pin_table");
 
   // The read is driven by sirius::materialize_all_batches (pin_table.cpp), which
@@ -1519,11 +1518,11 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
   catalog.CreateTableFunction(transaction, unpin_table_info);
 }
 
-// v6 unavailable surface matrix: process-global Config writes are refused once
-// the Sirius runtime is latched unavailable (stable, session-preserving error);
-// connection-local settings (gpu_execution, enable_duckdb_fallback) and
-// instance-runtime operator_params setters are NOT gated here (the latter
-// serialize via lock_operator_params_slot instead).
+// Process-global Config writes are refused once the Sirius runtime is
+// latched unavailable (stable, session-preserving error). Connection-local
+// settings (gpu_execution, enable_duckdb_fallback) and operator_params
+// setters are not gated here; the latter serialize via
+// lock_operator_params_slot instead.
 static void throw_if_sirius_runtime_unavailable(ClientContext& context)
 {
   if (auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
@@ -1677,12 +1676,12 @@ static sirius::operator_params* get_operator_params(ClientContext& context)
   return &sirius_ctx->get_config().get_operator_params();
 }
 
-// v6 SET/RESET classification: operator_params are instance-runtime state,
-// read by plan generation and the engine INSIDE held execution windows, so
-// each setter serializes its write by holding the slot for its single callback
-// body. The guard is taken HERE in the setters — deliberately NOT inside
-// get_operator_params(), which is also safe to call from code already inside a
-// window (a helper-held lock would self-deadlock-assert there).
+// operator_params are read by plan generation and the engine inside held
+// execution windows, so each setter serializes its write by holding the slot
+// for its single callback body. The guard is taken here in the setters,
+// deliberately not inside get_operator_params(), which is also safe to call
+// from code already inside a window (a helper-held lock would trip the
+// same-thread reacquire check there).
 static duckdb::unique_ptr<duckdb::SiriusContext::SlotGuard> lock_operator_params_slot(
   ClientContext& context)
 {
@@ -2155,15 +2154,16 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
     SetEnablePinnedZoneMapPruning);
 }
 
-// v6 (M6): publish the transparent optimizer mask ONCE at extension load,
-// UNIONed into any user-preset entries. DBConfig::options.disabled_optimizers
-// is DB-global and read locklessly by every connection's optimizer, so the old
-// per-query save/modify/restore was an unprotected concurrent write. Supported
-// precondition: LOAD runs under DB-instance quiescent initialization (existing
-// connections may exist, but no concurrent queries/optimizer runs/config
-// changes during LOAD); a later user SET replacing the set is a serial,
-// quiescent user-owned override (transparent execution then CPU-falls-back on
-// the affected plan shapes instead of re-inserting).
+// Publish the transparent optimizer mask once at extension load, unioned
+// into any user-preset entries. DBConfig::options.disabled_optimizers is
+// DB-global and read locklessly by every connection's optimizer, so the old
+// per-query save/modify/restore was an unprotected concurrent write.
+// Supported precondition: LOAD runs while the DatabaseInstance is quiescent
+// (existing connections may exist, but no concurrent queries, optimizer runs
+// or config changes). A later user SET replacing the set is likewise a
+// serial, quiescent override — concurrent optimizer runs while it changes
+// are unsupported; transparent execution then falls back to CPU on the
+// affected plan shapes instead of re-inserting.
 static void publish_transparent_optimizer_mask(DBConfig& config)
 {
   auto& live = config.options.disabled_optimizers;
@@ -2215,11 +2215,13 @@ static void LoadInternal(ExtensionLoader& loader)
   // "S3 CPU fallback is not supported" error; local reads fall back to CPU).
   db.GetFileSystem().RegisterSubSystem(make_uniq<sirius::io::s3::sirius_httpfs>());
 
-  // Register optimizer extension for transparent GPU execution.
-  // Pre-hook disables incompatible optimizers; post-hook captures the plan.
+  // Register optimizer extension for transparent GPU execution. Only the
+  // post-hook remains (plan capture); the optimizer mask a pre-hook used to
+  // write per query is published once at load (see
+  // publish_transparent_optimizer_mask above), and DuckDB skips a null
+  // pre_optimize_function.
   OptimizerExtension opt_ext;
-  opt_ext.pre_optimize_function = sirius::transparent::sirius_pre_optimizer_hook;
-  opt_ext.optimize_function     = sirius::transparent::sirius_optimizer_hook;
+  opt_ext.optimize_function = sirius::transparent::sirius_optimizer_hook;
   OptimizerExtension::Register(config, std::move(opt_ext));
 
   // Register SiriusContext on connections that were opened before the extension
@@ -2228,10 +2230,10 @@ static void LoadInternal(ExtensionLoader& loader)
     callback_ptr->OnConnectionOpened(*ctx);
   }
 
-  // Publish the optimizer mask LAST, only after every initialization step
-  // above succeeded — a failed load must not leave the mask behind (M6
-  // rollback rule). SIRIUS_DISABLE means: no Sirius runtime initialization and
-  // no mask publication (the extension binary itself may still be loaded).
+  // Publish the optimizer mask last, only after every initialization step
+  // above succeeded, so a failed load leaves no mask behind. SIRIUS_DISABLE
+  // means no Sirius runtime initialization and no mask publication (the
+  // extension binary itself may still be loaded).
   bool const sirius_disabled = [] {
     auto* val = std::getenv("SIRIUS_DISABLE");
     return val != nullptr && std::string(val) != "0";

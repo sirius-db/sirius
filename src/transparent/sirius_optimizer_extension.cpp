@@ -49,19 +49,6 @@ duckdb::unique_ptr<duckdb::LogicalOperator> copy_logical_plan(duckdb::LogicalOpe
   return copy;
 }
 
-void sirius_pre_optimizer_hook(duckdb::OptimizerExtensionInput& input,
-                               duckdb::unique_ptr<duckdb::LogicalOperator>& plan)
-{
-  // Since v6 the transparent optimizer mask (IN_CLAUSE /
-  // COMPRESSED_MATERIALIZATION / LATE_MATERIALIZATION) is published ONCE at
-  // extension load (publish_transparent_optimizer_mask in sirius_extension.cpp)
-  // instead of being written per query: DuckDB core reads
-  // DBConfig::options.disabled_optimizers locklessly on every connection's
-  // every optimizer pass, so the old per-query copy/modify/restore was an
-  // unprotected concurrent write (reachable from plain Prepare() even before
-  // v6). Nothing per-query remains to do here.
-}
-
 void sirius_optimizer_hook(duckdb::OptimizerExtensionInput& input,
                            duckdb::unique_ptr<duckdb::LogicalOperator>& plan)
 {
