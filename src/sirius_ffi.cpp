@@ -34,7 +34,9 @@
 #include "duckdb/optimizer/optimizer.hpp"                  // duckdb::Optimizer
 #include "duckdb/parser/statement/relation_statement.hpp"  // duckdb::RelationStatement
 #include "duckdb/planner/planner.hpp"                      // duckdb::Planner
-#include "from_substrait.hpp"  // duckdb::SubstraitToDuckDB (compiled into libsirius)
+#include "exec/stream_bind_catalog.hpp"                    // sirius::exec::stream_bind_catalog
+#include "exec/stream_plan_bindings.hpp"  // sirius::exec::register_stream_source_function
+#include "from_substrait.hpp"             // duckdb::SubstraitToDuckDB (compiled into libsirius)
 #include "planner/sirius_physical_plan_generator.hpp"  // sirius::planner::sirius_physical_plan_generator
 #include "sirius_config.hpp"                           // sirius::sirius_config
 #include "sirius_context.hpp"                          // duckdb::SiriusContext
@@ -58,6 +60,9 @@ struct Context::Impl {
   duckdb::shared_ptr<duckdb::SiriusContext> context;
   duckdb::unique_ptr<duckdb::DuckDB> db;
   duckdb::unique_ptr<duckdb::Connection> conn;
+  //! Input streams declared for the fragment currently being planned. Held here as well as on the
+  //! connection so a fragment can populate it without re-resolving it out of registered_state.
+  duckdb::shared_ptr<sirius::exec::stream_bind_catalog> stream_catalog;
 
   void bring_up(sirius::sirius_config& config)
   {
@@ -95,6 +100,15 @@ struct Context::Impl {
     // IN_CLAUSE and COMPRESSED_MATERIALIZATION here; this path remains more conservative.
     auto& client = *conn->context;
     client.registered_state->Insert(kSiriusStateKey, context);
+
+    // A fragment reads each of its exchange inputs through sirius_stream_source(id). The
+    // function has to exist on this DuckDB before any fragment plan binds, and its bind needs
+    // somewhere to look up a schema for a stream that has no file behind it — the catalog,
+    // reached the same way the engine reaches its SiriusContext.
+    stream_catalog = duckdb::make_shared_ptr<sirius::exec::stream_bind_catalog>();
+    client.registered_state->Insert(sirius::exec::stream_bind_catalog::kStateKey, stream_catalog);
+    sirius::exec::register_stream_source_function(*db->instance);
+
     client.config.enable_optimizer = true;
     auto& disabled = duckdb::DBConfig::GetConfig(client).options.disabled_optimizers;
     disabled.insert(duckdb::OptimizerType::IN_CLAUSE);

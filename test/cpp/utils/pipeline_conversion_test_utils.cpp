@@ -213,6 +213,15 @@ void with_initialized_engine(duckdb::Connection& con,
   }
 }
 
+exec::logical_plan_source sql_plan_source(const std::string& query)
+{
+  return [query](duckdb::ClientContext& context) {
+    optimizer_disable_guard guard(context);
+    auto extracted = extract_logical_plan_sirius_order(context, query);
+    return std::move(extracted.logical_plan);
+  };
+}
+
 void with_initialized_streaming_fragment(
   duckdb::Connection& con,
   const std::string& query,
