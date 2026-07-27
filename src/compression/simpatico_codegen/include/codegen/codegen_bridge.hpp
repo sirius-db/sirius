@@ -5,14 +5,15 @@
 #include "codegen/plan/plan_interpreter.hpp"
 #include "codegen/plan/plan_tree.hpp"
 
+#include <cudf/column/column.hpp>
 #include <cudf/column/column_view.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/mr/per_device_resource.hpp>
 
 #include <cstdint>
+#include <functional>
 #include <memory>
-#include <optional>
 #include <string>
 #include <vector>
 
@@ -25,7 +26,7 @@ struct CodegenHead {
   // region's boundary outputs (child edges leaving the covered set).
   std::vector<NodeId> covered_nodes;
   // Full DFS-preorder origins (index == jit node_id), including synthesised Raw
-  // passthrough leaves. Used by encode_subtree_impl to key reps by NodeId.
+  // passthrough leaves. Used by launch_encode_fused_tree to key reps by NodeId.
   std::vector<FusedNodeOrigin> preorder;
 };
 
@@ -49,19 +50,40 @@ bool encode_fused_subtree(PlanTree const& tree,
                           std::string* error_out,
                           CodegenHead* head_out = nullptr);
 
-/// Decode one codegen-fused subtree (C++-native). The caller passes a
-/// fully-built ``FusedTree`` and a ``LabeledBuffers`` of the real device buffers keyed by
-/// DFS-preorder ``buffer_key(node_id, field)``. This adds the decode-only
-/// transients (Compact ``bp_offsets`` scan, RLE scratch) into ``labeled``,
-/// compiles/launches the rendered kernel, and writes ``num_rows`` decoded
-/// elements to ``out`` on ``stream``. Returns true on success.
+/// Launch an already-built encode head for ``input_col`` and assemble its
+/// compressed leaves in ``builder``.
+bool launch_encode_fused_tree(CodegenHead const& head,
+                              cudf::column_view const& input_col,
+                              rmm::cuda_stream_view stream,
+                              rmm::device_async_resource_ref const& mr,
+                              fused_leaf_builder& builder,
+                              std::string* error_out);
+
+/// Callback used by the high-level decode bridge to materialize an entropy-tail
+/// child while binding a fused subtree.
+using decode_materialize_fn = std::function<cudf::column const*(NodeId)>;
+
+/// JIT-decode the maximal fused subtree rooted at ``start_node``. Builds the
+/// shared FusedTree once, resolves metadata, binds persisted buffers (using
+/// ``materialize`` for entropy tails), allocates the output, and launches the
+/// inverse kernel. Returns nullptr and sets ``error_out`` on failure.
 ///
 /// Mirror of ``encode_fused_subtree`` above.
-bool decode_fused_subtree(codegen::jit::FusedTree const& tree,
-                          codegen::jit::LabeledBuffers& labeled,
-                          char const* dtype,
-                          std::int64_t num_rows,
-                          void* out,
-                          rmm::cuda_stream_view stream);
+std::unique_ptr<cudf::column> decode_fused_subtree(PlanTree const& tree,
+                                                   NodeId start_node,
+                                                   decode_materialize_fn const& materialize,
+                                                   rmm::cuda_stream_view stream,
+                                                   rmm::device_async_resource_ref const& mr,
+                                                   std::string* error_out);
+
+/// Launch an already-prepared fused decode tree. ``labeled`` must contain all
+/// persisted buffers; this adds decode-only transients, renders/compiles, and
+/// launches the kernel into ``out``.
+bool launch_decode_fused_tree(codegen::jit::FusedTree const& tree,
+                              codegen::jit::LabeledBuffers& labeled,
+                              char const* dtype,
+                              std::int64_t num_rows,
+                              void* out,
+                              rmm::cuda_stream_view stream);
 
 }  // namespace simpatico

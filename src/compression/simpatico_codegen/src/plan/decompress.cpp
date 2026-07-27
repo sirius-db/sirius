@@ -18,10 +18,9 @@
 #include <cstdio>
 #include <stdexcept>
 
-// The C++-native JIT codegen decode entry point (``simpatico::decode_fused_subtree``,
-// defined in codegen_runtime.cpp) is declared in codegen_bridge.hpp above. One
-// call does the whole pipeline: build tree → compile → bind buffers → launch →
-// sync.
+// The high-level JIT decode bridge is defined here alongside DecodeWalk because
+// buffer binding may recursively materialize entropy tails. Its low-level
+// launch_decode_fused_tree counterpart lives in codegen_runtime.cpp.
 
 namespace simpatico {
 // The compress driver (the recursive CompressWalk, compress_column) lives
@@ -101,6 +100,29 @@ struct DecodeMemo {
   std::unordered_map<std::uint64_t, std::unique_ptr<cudf::column>> values;
   std::unordered_map<std::uint64_t, std::size_t> remaining_consumers;
   std::vector<std::unique_ptr<compressed_representation>> kept;
+};
+
+// Reverse plan traversal. CompressWalk emits values forward into consumers;
+// DecodeWalk materializes producer inputs backward from stored representations.
+// The memo and all temporary reconstructed reps live for the full walk.
+class DecodeWalk {
+ public:
+  DecodeWalk(PlanTree const& tree,
+             rmm::cuda_stream_view stream,
+             rmm::device_async_resource_ref const& mr,
+             std::string* error_out);
+
+  cudf::column const* materialize(NodeId nid);
+  std::unique_ptr<cudf::column> run();
+
+ private:
+  std::unique_ptr<cudf::column> materialize_fused_node(NodeId nid);
+
+  PlanTree const& tree;
+  rmm::cuda_stream_view stream;
+  rmm::device_async_resource_ref mr;
+  std::string* error_out;
+  DecodeMemo memo;
 };
 
 std::string value_label(ValueId v)
@@ -188,16 +210,6 @@ std::unordered_map<std::string, cudf::column_view> channels_by_name(
   return by_name;
 }
 
-// Reconstructs node `nid`'s produced value into the shared memo and returns a
-// non-owning view the memo keeps alive. One resolver serves the top-level walk
-// and fused-region tail binding, so both share a single memo. Defined below.
-cudf::column const* materialize(NodeId nid,
-                                PlanTree const& tree,
-                                DecodeMemo& memo,
-                                rmm::cuda_stream_view stream,
-                                rmm::device_async_resource_ref mr,
-                                std::string* error_out);
-
 // Bind the ``data``/``offsets`` slots of a synthesized Raw passthrough leaf
 // at preorder *node_id*. The Raw leaf has no PlanTree op of its own; its
 // bytes live in a RawFused rep parked on the parent node's ``channels``.
@@ -226,7 +238,7 @@ bool bind_raw_passthrough_buffers(std::int32_t node_id,
                                   rmm::cuda_stream_view stream,
                                   rmm::device_async_resource_ref mr,
                                   codegen::jit::LabeledBuffers& labeled,
-                                  DecodeMemo& decompressed,
+                                  decode_materialize_fn const& materialize,
                                   std::string* error_out)
 {
   // The fused-tree builder always records the materialized channel name on the
@@ -282,8 +294,7 @@ bool bind_raw_passthrough_buffers(std::int32_t node_id,
                        std::to_string(parent_id) + " for entropy-tail resolve";
         return false;
       }
-      cudf::column const* resolved =
-        materialize(child_id, tree, decompressed, stream, mr, error_out);
+      cudf::column const* resolved = materialize(child_id);
       if (!resolved) {
         if (error_out && error_out->empty())
           *error_out = "codegen decode: entropy-tail resolve failed for RawFused channel '" +
@@ -327,7 +338,7 @@ bool bind_real_node_buffers(std::int32_t node_id,
                             rmm::cuda_stream_view stream,
                             rmm::device_async_resource_ref mr,
                             codegen::jit::LabeledBuffers& labeled,
-                            DecodeMemo& decompressed,
+                            decode_materialize_fn const& materialize,
                             std::string* error_out)
 {
   PlanNode const& node                  = tree.nodes[plan_node];
@@ -375,7 +386,7 @@ bool bind_real_node_buffers(std::int32_t node_id,
       // shared memo, which owns it through the synchronous launch. One path for
       // both, no empty-map special case (e.g. …bitpack -> chunk_min -> zigzag
       // resolves the nested codegen tail through the same memo).
-      cudf::column const* col = materialize(eit->second, tree, decompressed, stream, mr, error_out);
+      cudf::column const* col = materialize(eit->second);
       if (!col) {
         if (error_out && error_out->empty())
           *error_out = "codegen decode: failed to resolve tail slot '" + slot + "' at node " +
@@ -397,33 +408,23 @@ bool bind_real_node_buffers(std::int32_t node_id,
   return true;
 }
 
-// Build the fused subtree rooted at *root_nid* via the shared structural
-// builder (``build_fused_tree``), then bind every node's device buffers in the
+// Bind every node's device buffers from an already-built fused subtree in the
 // builder's DFS-preorder (preorder index == rendered kernel node_id). The
 // structural shape (op kinds, children, node-id order) is the builder's
 // responsibility — shared with the encode bridge — so this binder only sources
 // the per-node reps/buffers. Decode is Compact-only.
-//
-// Returns the built tree, or nullptr + *error_out on failure.
-std::shared_ptr<codegen::jit::FusedTree> bind_fused_subtree(NodeId root_nid,
-                                                            PlanTree const& tree,
-                                                            std::size_t element_size,
-                                                            rmm::cuda_stream_view stream,
-                                                            rmm::device_async_resource_ref mr,
-                                                            codegen::jit::LabeledBuffers& labeled,
-                                                            DecodeMemo& decompressed,
-                                                            std::string* error_out)
+bool bind_fused_subtree(BuiltFusedTree const& built,
+                        PlanTree const& tree,
+                        std::size_t element_size,
+                        rmm::cuda_stream_view stream,
+                        rmm::device_async_resource_ref mr,
+                        codegen::jit::LabeledBuffers& labeled,
+                        decode_materialize_fn const& materialize,
+                        std::string* error_out)
 {
-  auto built = build_fused_tree(tree, root_nid);
-  if (!built) {
-    if (error_out)
-      *error_out =
-        "codegen decode: no valid fusable region rooted at node " + std::to_string(root_nid);
-    return nullptr;
-  }
-  for (std::int32_t node_id = 0; node_id < static_cast<std::int32_t>(built->preorder.size());
+  for (std::int32_t node_id = 0; node_id < static_cast<std::int32_t>(built.preorder.size());
        ++node_id) {
-    auto const& origin = built->preorder[node_id];
+    auto const& origin = built.preorder[node_id];
     // Transformer-mode ZigZag stores nothing (it rewrites the lane value
     // inline and recurses); the decode renderer emits no params for it, so
     // there is no buffer to bind. Skip it — the child binds its own buffers.
@@ -441,9 +442,9 @@ std::shared_ptr<codegen::jit::FusedTree> bind_fused_subtree(NodeId root_nid,
                                         stream,
                                         mr,
                                         labeled,
-                                        decompressed,
+                                        materialize,
                                         error_out)) {
-        return nullptr;
+        return false;
       }
     } else {
       if (!bind_real_node_buffers(node_id,
@@ -453,45 +454,48 @@ std::shared_ptr<codegen::jit::FusedTree> bind_fused_subtree(NodeId root_nid,
                                   stream,
                                   mr,
                                   labeled,
-                                  decompressed,
+                                  materialize,
                                   error_out)) {
-        return nullptr;
+        return false;
       }
     }
   }
-  return built->tree;
+  return true;
 }
 
-// Build the codegen-fused subtree rooted at tree node *root_nid* + bind its
-// buffers, then launch the codegen decode kernel into a fresh output column and
-// return it.  The launch is synchronous (``decode_fused_subtree`` syncs the
-// stream before returning) so there is no cross-call state to cache — every
-// call re-binds the reps and re-launches; the JIT compile is cached
-// process-wide in KernelCache.
+// High-level decode bridge implementation: build one codegen-fused subtree,
+// resolve its metadata, bind its buffers, and launch into a fresh output column.
+// The launch is synchronous, so there is no cross-call binding state to cache;
+// the JIT compile itself is cached process-wide in KernelCache.
 //
 // Some intermediate fuse nodes store nothing and own no rep;
 // their children own the reps. In that case, the first non-null rep in the
 // fused preorder provides the decoded type and num_rows.
 //
 // Returns nullptr + *error_out on failure.
-std::unique_ptr<cudf::column> dispatch_codegen_subtree(NodeId root_nid,
-                                                       PlanTree const& tree,
-                                                       rmm::cuda_stream_view stream,
-                                                       rmm::device_async_resource_ref mr,
-                                                       DecodeMemo& decompressed,
-                                                       std::string* error_out)
+std::unique_ptr<cudf::column> decode_fused_subtree_impl(PlanTree const& tree,
+                                                        NodeId root_nid,
+                                                        decode_materialize_fn const& materialize,
+                                                        rmm::cuda_stream_view stream,
+                                                        rmm::device_async_resource_ref const& mr,
+                                                        std::string* error_out)
 {
+  auto built = build_fused_tree(tree, root_nid);
+  if (!built) {
+    if (error_out)
+      *error_out =
+        "codegen decode: no valid fusable region rooted at node " + std::to_string(root_nid);
+    return nullptr;
+  }
+
   compressed_representation const* root_repr = node_rep(root_nid, tree);
   if (root_repr == nullptr) {
     // Transformer-mode root (e.g. ZigZag with a codegen child) stores no rep;
-    // find the first non-null rep in the fused preorder for metadata.
-    auto maybe_built = build_fused_tree(tree, root_nid);
-    if (maybe_built) {
-      for (auto const& origin : maybe_built->preorder) {
-        if (!origin.is_raw_passthrough && origin.plan_node < tree.nodes.size()) {
-          root_repr = node_rep(origin.plan_node, tree);
-          if (root_repr) break;
-        }
+    // find the first non-null rep in the already-built preorder for metadata.
+    for (auto const& origin : built->preorder) {
+      if (!origin.is_raw_passthrough && origin.plan_node < tree.nodes.size()) {
+        root_repr = node_rep(origin.plan_node, tree);
+        if (root_repr) break;
       }
     }
     if (root_repr == nullptr) {
@@ -515,9 +519,8 @@ std::unique_ptr<cudf::column> dispatch_codegen_subtree(NodeId root_nid,
   codegen::jit::LabeledBuffers labeled;
   const std::size_t element_size = static_cast<std::size_t>(cudf::size_of(root_type));
   std::string bind_err;
-  auto fused =
-    bind_fused_subtree(root_nid, tree, element_size, stream, mr, labeled, decompressed, &bind_err);
-  if (!fused) {
+  if (!bind_fused_subtree(
+        *built, tree, element_size, stream, mr, labeled, materialize, &bind_err)) {
     if (error_out) {
       *error_out = bind_err.empty() ? "codegen decompress: incomplete fused subtree" : bind_err;
     }
@@ -530,12 +533,12 @@ std::unique_ptr<cudf::column> dispatch_codegen_subtree(NodeId root_nid,
     if (error_out) *error_out = "codegen decompress: output column alloc failed";
     return nullptr;
   }
-  bool ok = decode_fused_subtree(*fused,
-                                 labeled,
-                                 dtype,
-                                 static_cast<std::int64_t>(num_rows),
-                                 out_col->mutable_view().head<void>(),
-                                 stream);
+  bool ok = launch_decode_fused_tree(*built->tree,
+                                     labeled,
+                                     dtype,
+                                     static_cast<std::int64_t>(num_rows),
+                                     out_col->mutable_view().head<void>(),
+                                     stream);
   if (!ok) {
     if (error_out) *error_out = "codegen decompress: decode failed";
     return nullptr;
@@ -576,7 +579,7 @@ bool decode_bitjoin(NodeId nid,
     if (error_out) *error_out = "bitjoin decode: missing packed rep at node " + std::to_string(nid);
     return false;
   }
-  auto packed = repr->decompress(stream, mr);
+  auto packed = decompress_standalone_representation(repr, stream, mr, error_out);
   if (!packed) {
     if (error_out) *error_out = "bitjoin decode: failed to decompress packed leaf";
     return false;
@@ -644,16 +647,17 @@ bool decode_bitjoin(NodeId nid,
   return true;
 }
 
+std::unique_ptr<cudf::column> DecodeWalk::materialize_fused_node(NodeId nid)
+{
+  decode_materialize_fn resolve = [this](NodeId dependency) { return materialize(dependency); };
+  return decode_fused_subtree(tree, nid, resolve, stream, mr, error_out);
+}
+
 // The single decode resolver. Reconstructs and memoises the value(s) node `nid`
 // produces on decode — its input_source(s) — and returns the primary one, keyed
 // by structural (node, port) identity so every consumer and the codegen tail
 // binders share one memo without matching path strings.
-cudf::column const* materialize(NodeId nid,
-                                PlanTree const& tree,
-                                DecodeMemo& memo,
-                                rmm::cuda_stream_view stream,
-                                rmm::device_async_resource_ref mr,
-                                std::string* error_out)
+cudf::column const* DecodeWalk::materialize(NodeId nid)
 {
   PlanNode const& node  = tree.nodes[nid];
   ValueId const primary = node.input_sources.empty() ? ValueId{nid, 0} : node.input_sources.front();
@@ -678,10 +682,10 @@ cudf::column const* materialize(NodeId nid,
   std::unique_ptr<cudf::column> col;
   if (is_codegen_compressor(node.op)) {
     // Fused op (bitpack/delta/rle/for/zigzag): one JIT kernel inverts the whole
-    // region (its rep's decompress() throws); tail slots resolve via materialize.
-    col = dispatch_codegen_subtree(nid, tree, stream, mr, memo, error_out);
+    // region; tail slots resolve via materialize.
+    col = materialize_fused_node(nid);
   } else if (node.rep) {
-    col = node.rep->decompress(stream, mr);
+    col = decompress_standalone_representation(node.rep.get(), stream, mr, error_out);
   } else {
     // Multi-output non-codegen op (alp/alp_rd/dictionary/bitextract): gather its
     // outputs in port order (reconstruct matches by name). An output routed to a
@@ -698,7 +702,7 @@ cudf::column const* materialize(NodeId nid,
         ValueId const output_value{nid, static_cast<ChannelId>(i)};
         // Recurse only when the value isn't yet in the memo
         if (!memo.values.count(value_id_key(output_value))) {
-          if (!materialize(child_it->child, tree, memo, stream, mr, error_out)) return nullptr;
+          if (!materialize(child_it->child)) return nullptr;
         }
         auto output = consume_memo_value(output_value, memo, stream, mr, error_out);
         if (!output) return nullptr;
@@ -709,7 +713,7 @@ cudf::column const* materialize(NodeId nid,
       auto ch_it = node.channels.find(node.output_paths[i]);
       if (ch_it == node.channels.end()) continue;  // not produced here
       if (!ch_it->second) return nullptr;
-      auto c = ch_it->second->decompress(stream, mr);
+      auto c = decompress_standalone_representation(ch_it->second.get(), stream, mr, error_out);
       if (!c) return nullptr;
       names.push_back(name);
       outputs.push_back(std::move(c));
@@ -721,7 +725,7 @@ cudf::column const* materialize(NodeId nid,
       if (error_out) *error_out = err;
       return nullptr;
     }
-    col = rep->decompress(stream, mr);
+    col = decompress_standalone_representation(rep.get(), stream, mr, error_out);
     memo.kept.push_back(std::move(rep));
   }
   if (!col) return nullptr;
@@ -730,7 +734,60 @@ cudf::column const* materialize(NodeId nid,
   return it->second.get();
 }
 
+DecodeWalk::DecodeWalk(PlanTree const& tree,
+                       rmm::cuda_stream_view stream,
+                       rmm::device_async_resource_ref const& mr,
+                       std::string* error_out)
+  : tree(tree), stream(stream), mr(mr), error_out(error_out)
+{
+  for (auto const& node : tree.nodes) {
+    for (auto const& src : node.input_sources) {
+      ++memo.remaining_consumers[value_id_key(src)];
+    }
+  }
+}
+
+std::unique_ptr<cudf::column> DecodeWalk::run()
+{
+  // The result is the input value (node 0, port 0), produced by whichever op(s)
+  // consume it. Materialize those; fall back to a scan when the root carries no
+  // structural edges (a rep-only tree).
+  std::uint64_t const input_key = value_id_key(ValueId{0, 0});
+  for (auto const& e : tree.nodes[0].children) {
+    if (memo.values.count(input_key)) break;
+    if (!materialize(e.child)) return nullptr;
+  }
+  if (!memo.values.count(input_key)) {
+    for (NodeId nid = 1; nid < tree.nodes.size() && !memo.values.count(input_key); ++nid) {
+      bool consumes_input = false;
+      for (auto const& src : tree.nodes[nid].input_sources)
+        if (src.node == 0 && src.channel == 0) consumes_input = true;
+      if (consumes_input && !materialize(nid)) return nullptr;
+    }
+  }
+
+  auto root_it = memo.values.find(input_key);
+  if (root_it == memo.values.end() || !root_it->second) {
+    if (error_out) *error_out = "decompression completed but 'input' column not reconstructed";
+    return nullptr;
+  }
+  cudaStreamSynchronize(stream.value());
+  auto result = std::move(root_it->second);
+  if (error_out) error_out->clear();
+  return result;
+}
+
 }  // namespace
+
+std::unique_ptr<cudf::column> decode_fused_subtree(PlanTree const& tree,
+                                                   NodeId start_node,
+                                                   decode_materialize_fn const& materialize,
+                                                   rmm::cuda_stream_view stream,
+                                                   rmm::device_async_resource_ref const& mr,
+                                                   std::string* error_out)
+{
+  return decode_fused_subtree_impl(tree, start_node, materialize, stream, mr, error_out);
+}
 
 std::unique_ptr<cudf::column> decompress_column(PlanTree const& tree,
                                                 rmm::cuda_stream_view stream,
@@ -744,39 +801,8 @@ std::unique_ptr<cudf::column> decompress_column(PlanTree const& tree,
     return nullptr;
   }
 
-  // The result is the input value (node 0, port 0), produced by whichever op(s)
-  // consume it. Materialize those; fall back to a scan when the root carries no
-  // structural edges (a rep-only tree).
-  DecodeMemo memo;
-  for (auto const& node : tree.nodes) {
-    for (auto const& src : node.input_sources) {
-      auto const key = value_id_key(src);
-      ++memo.remaining_consumers[key];
-    }
-  }
-  std::uint64_t const input_key = value_id_key(ValueId{0, 0});
-  for (auto const& e : tree.nodes[0].children) {
-    if (memo.values.count(input_key)) break;
-    if (!materialize(e.child, tree, memo, stream, mr, error_out)) return nullptr;
-  }
-  if (!memo.values.count(input_key)) {
-    for (NodeId nid = 1; nid < tree.nodes.size() && !memo.values.count(input_key); ++nid) {
-      bool consumes_input = false;
-      for (auto const& src : tree.nodes[nid].input_sources)
-        if (src.node == 0 && src.channel == 0) consumes_input = true;
-      if (consumes_input && !materialize(nid, tree, memo, stream, mr, error_out)) return nullptr;
-    }
-  }
-
-  auto root_it = memo.values.find(input_key);
-  if (root_it == memo.values.end() || !root_it->second) {
-    if (error_out) *error_out = "decompression completed but 'input' column not reconstructed";
-    return nullptr;
-  }
-  cudaStreamSynchronize(stream.value());
-  auto result = std::move(root_it->second);
-  if (error_out) error_out->clear();
-  return result;
+  DecodeWalk walk{tree, stream, mr, error_out};
+  return walk.run();
 }
 
 }  // namespace simpatico

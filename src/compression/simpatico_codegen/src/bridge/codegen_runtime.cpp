@@ -6,7 +6,7 @@
 //
 // Decode pipeline: decompress.cpp builds the runtime jit::FusedTree and a
 // jit::LabeledBuffers of the real device buffers from the stored reps, keyed by
-// buffer_key(node_id, field). decode_fused_subtree then:
+// buffer_key(node_id, field). launch_decode_fused_tree then:
 //   1. synthesize_decode_transients adds decode-only buffers the encoder does
 //      not store: Bitpack's bp_offsets cumsum (CUB ExclusiveSum + 1-thread tail
 //      patch, see offsets_cumsum.cu) and RLE scratch, into RMM-pool transients.
@@ -554,7 +554,8 @@ int run_rendered_decode(const jit::FusedTree& tree,
 
 namespace simpatico {
 
-// Decode one codegen-fused subtree. The caller (``dispatch_codegen_subtree``)
+// Launch one prepared codegen-fused decode tree. The high-level
+// ``decode_fused_subtree`` caller
 // already holds the subtree structurally: it passes a fully-built ``FusedTree``
 // (decode is Compact-only) and a
 // ``LabeledBuffers`` of the real device buffers, keyed by DFS-preorder
@@ -567,12 +568,12 @@ namespace simpatico {
 // returns. ``labeled`` is mutated in place (transients are added).
 //
 // Returns 1 on success, -1 on any failure (logged to stderr).
-bool decode_fused_subtree(codegen::jit::FusedTree const& tree,
-                          codegen::jit::LabeledBuffers& labeled,
-                          char const* dtype,
-                          std::int64_t num_rows,
-                          void* out,
-                          rmm::cuda_stream_view stream)
+bool launch_decode_fused_tree(codegen::jit::FusedTree const& tree,
+                              codegen::jit::LabeledBuffers& labeled,
+                              char const* dtype,
+                              std::int64_t num_rows,
+                              void* out,
+                              rmm::cuda_stream_view stream)
 {
   try {
     const bool _timing = std::getenv("SIMPATICO_DECODE_TIMING") != nullptr;
@@ -590,7 +591,7 @@ bool decode_fused_subtree(codegen::jit::FusedTree const& tree,
     const char* cxx_dtype = dtype_to_cxx(dtype);
     if (cxx_dtype == nullptr) {
       std::fprintf(stderr,
-                   "simpatico::codegen: decode_fused_subtree: unsupported dtype '%s'\n",
+                   "simpatico::codegen: launch_decode_fused_tree: unsupported dtype '%s'\n",
                    dtype ? dtype : "(null)");
       return false;
     }
@@ -611,7 +612,7 @@ bool decode_fused_subtree(codegen::jit::FusedTree const& tree,
     std::string err;
     if (!synthesize_decode_transients(tree, elem_size, alloc, stream.value(), labeled, &err)) {
       std::fprintf(stderr,
-                   "simpatico::codegen: decode_fused_subtree: transient synth failed: %s\n",
+                   "simpatico::codegen: launch_decode_fused_tree: transient synth failed: %s\n",
                    err.c_str());
       return false;
     }
@@ -628,16 +629,17 @@ bool decode_fused_subtree(codegen::jit::FusedTree const& tree,
                                reinterpret_cast<std::uintptr_t>(stream.value()),
                                [&](const char* what) { _lap(what); }) == 1;
   } catch (const jit::CompileError& e) {
-    std::fprintf(stderr,
-                 "simpatico::codegen: decode_fused_subtree: CompileError: %s\n--- log ---\n%s\n",
-                 e.what(),
-                 e.log.c_str());
+    std::fprintf(
+      stderr,
+      "simpatico::codegen: launch_decode_fused_tree: CompileError: %s\n--- log ---\n%s\n",
+      e.what(),
+      e.log.c_str());
     return false;
   } catch (const std::exception& e) {
-    std::fprintf(stderr, "simpatico::codegen: decode_fused_subtree: %s\n", e.what());
+    std::fprintf(stderr, "simpatico::codegen: launch_decode_fused_tree: %s\n", e.what());
     return false;
   } catch (...) {
-    std::fprintf(stderr, "simpatico::codegen: decode_fused_subtree: unknown exception\n");
+    std::fprintf(stderr, "simpatico::codegen: launch_decode_fused_tree: unknown exception\n");
     return false;
   }
 }
@@ -681,7 +683,8 @@ bool decode_fused_subtree(codegen::jit::FusedTree const& tree,
 // Extract the maximal fusable region rooted at ``start_node`` into a
 // CodegenHead. Encode-internal helper (mirrors the decode binder's use of the
 // shared build_fused_tree in plan/decompress.cpp); folded into the file so the
-// encode/decode bridge exposes just the encode_fused_subtree / decode_fused_subtree
+// encode/decode bridge exposes the high-level subtree operations and separate
+// low-level launch operations
 // pair. Not part of the public header.
 static std::optional<simpatico::CodegenHead> extract_fusable_subtree(
   simpatico::PlanTree const& tree, simpatico::NodeId start_node, std::string* err)
@@ -716,7 +719,7 @@ static std::optional<simpatico::CodegenHead> extract_fusable_subtree(
   for (auto const& origin : built->preorder) {
     if (!origin.is_raw_passthrough) head.covered_nodes.push_back(origin.plan_node);
   }
-  // Full preorder origins (including raw passthroughs) for encode_subtree_impl
+  // Full preorder origins (including raw passthroughs) for the encode launcher
   // to map jit node_id → PlanTree NodeId when keying reps.
   head.preorder = built->preorder;
   return head;
@@ -752,14 +755,14 @@ std::size_t find_buffer_idx(const std::vector<cje::EncodeBufferSpec>& bufs,
 // reps can be keyed by NodeId rather than DSL path.
 // ``stream``/``mr`` may be null/default — callers pass explicit values for
 // multi-stream column workers.
-static int encode_subtree_impl(const simpatico::CodegenHead& head,
-                               cudf::data_type original_type,
-                               const char* cxx_dtype,
-                               std::int64_t num_rows,
-                               std::uintptr_t data_ptr,
-                               simpatico::fused_leaf_builder* builder,
-                               rmm::cuda_stream_view stream,
-                               rmm::device_async_resource_ref mr)
+static int launch_encode_fused_tree_impl(const simpatico::CodegenHead& head,
+                                         cudf::data_type original_type,
+                                         const char* cxx_dtype,
+                                         std::int64_t num_rows,
+                                         std::uintptr_t data_ptr,
+                                         simpatico::fused_leaf_builder* builder,
+                                         rmm::cuda_stream_view stream,
+                                         rmm::device_async_resource_ref mr)
 {
   if (builder == nullptr || cxx_dtype == nullptr) { return -1; }
 
@@ -1294,14 +1297,12 @@ static int encode_subtree_impl(const simpatico::CodegenHead& head,
 
 namespace simpatico {
 
-bool encode_fused_subtree(PlanTree const& tree,
-                          NodeId start_node,
-                          cudf::column_view input_col,
-                          rmm::cuda_stream_view stream,
-                          rmm::device_async_resource_ref mr,
-                          fused_leaf_builder& builder,
-                          std::string* error_out,
-                          CodegenHead* head_out)
+bool launch_encode_fused_tree(CodegenHead const& head,
+                              cudf::column_view const& input_col,
+                              rmm::cuda_stream_view stream,
+                              rmm::device_async_resource_ref const& mr,
+                              fused_leaf_builder& builder,
+                              std::string* error_out)
 {
   // Fixed-point columns are physically their storage integer (DECIMAL32 -> INT32,
   // DECIMAL64 -> INT64); the codecs run losslessly on those bits. We encode/decode
@@ -1356,28 +1357,42 @@ bool encode_fused_subtree(PlanTree const& tree,
   if (cxx_dtype == nullptr) return false;  // shouldn't happen, but guard
   const cudf::data_type original_type{storage_type_id};
 
-  if (start_node >= tree.nodes.size()) return false;
-
-  std::string err;
-  auto head_opt = extract_fusable_subtree(tree, start_node, &err);
-  if (!head_opt.has_value()) {
-    if (error_out) *error_out = err;
-    return false;  // non-fusable node: caller runs the generic path
-  }
-  if (head_out) *head_out = *head_opt;
-
   std::uintptr_t data_ptr = reinterpret_cast<std::uintptr_t>(
     input_col.head<uint8_t>() + static_cast<std::size_t>(input_col.offset()) *
                                   static_cast<std::size_t>(cudf::size_of(input_col.type())));
 
-  int rc = encode_subtree_impl(
-    *head_opt, original_type, cxx_dtype, input_col.size(), data_ptr, &builder, stream, mr);
+  int rc = launch_encode_fused_tree_impl(
+    head, original_type, cxx_dtype, input_col.size(), data_ptr, &builder, stream, mr);
   if (rc == 1) return true;
   if (rc == 0) {
     if (error_out) *error_out = "encode declined (non-fusable subtree shape)";
     return false;
   }
-  if (error_out) *error_out = err.empty() ? "encode_fused_subtree failed" : err;
+  if (error_out) *error_out = "launch_encode_fused_tree failed";
+  return false;
+}
+
+bool encode_fused_subtree(PlanTree const& tree,
+                          NodeId start_node,
+                          cudf::column_view input_col,
+                          rmm::cuda_stream_view stream,
+                          rmm::device_async_resource_ref mr,
+                          fused_leaf_builder& builder,
+                          std::string* error_out,
+                          CodegenHead* head_out)
+{
+  if (start_node >= tree.nodes.size()) return false;
+
+  std::string err;
+  auto head = extract_fusable_subtree(tree, start_node, &err);
+  if (!head.has_value()) {
+    if (error_out) *error_out = err;
+    return false;  // non-fusable node: caller runs the generic path
+  }
+  if (head_out) *head_out = *head;
+
+  if (launch_encode_fused_tree(*head, input_col, stream, mr, builder, error_out)) return true;
+  if (error_out && error_out->empty()) *error_out = "encode_fused_subtree failed";
   return false;
 }
 

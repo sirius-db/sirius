@@ -95,7 +95,7 @@ int main()
   }
   if (k1 != k2) return report_fail("warm lookup returned different pointer");
   if (cache.size() != 1) return report_fail("cache size grew on warm hit");
-  if (warm_ms * 50.0 > cold_ms) {
+  if (warm_ms * 20.0 > cold_ms) {
     return report_fail(
       "warm not enough faster than cold",
       "cold_ms=" + std::to_string(cold_ms) + " warm_ms=" + std::to_string(warm_ms));

@@ -78,10 +78,10 @@ std::unique_ptr<compressed_representation> compress_single_op(std::string const&
                                                               rmm::device_async_resource_ref mr,
                                                               std::string* error_out);
 
-/// Decompress a plan tree produced by compress_column.  A single post-order
-/// walk over the plan tree: each codegen-fused subtree root is inverted by one
-/// JIT-compiled kernel (``dispatch_codegen_subtree``) and every other step by
-/// its rep's own decompress().  Runs entirely on ``stream``.
+/// Decompress a plan tree produced by compress_column. DecodeWalk performs a
+/// single reverse walk: each codegen-fused subtree root is inverted by one
+/// high-level ``decode_fused_subtree`` call and every other step by its rep's
+/// own decompress(). Runs entirely on ``stream``.
 std::unique_ptr<cudf::column> decompress_column(PlanTree const& tree,
                                                 rmm::cuda_stream_view stream,
                                                 rmm::device_async_resource_ref mr,
