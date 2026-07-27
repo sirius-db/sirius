@@ -113,4 +113,16 @@ dynamic_filter_publish_plan::dynamic_filter_publish_plan(
   }
 }
 
+dynamic_filter_publish_plan dynamic_filter_publish_plan::with_appended_probe_targets(
+  std::vector<probe_target> additional_probe_targets) const
+{
+  std::vector<probe_target> combined_targets = _probe_targets;
+  combined_targets.reserve(combined_targets.size() + additional_probe_targets.size());
+  for (auto& target : additional_probe_targets) {
+    combined_targets.push_back(std::move(target));
+  }
+  return dynamic_filter_publish_plan{
+    _admitted_keys, std::move(combined_targets), _replica_spaces, _policy};
+}
+
 }  // namespace sirius::op

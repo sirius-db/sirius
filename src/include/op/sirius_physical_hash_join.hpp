@@ -353,8 +353,10 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
     CLOSED       ///< Finalization closed the window before the hook claimed it.
   };
 
-  /// Complete plan-time routing, policy, and replica-space description; immutable at runtime.
-  dynamic_filter_publish_plan const _dynamic_filter_plan;
+  /// Complete plan-time routing, policy, and replica-space description. Extended at most once, before execution, by `finalize_dynamic_filter_targets`; immutable once execution begins.
+  dynamic_filter_publish_plan _dynamic_filter_plan;
+  /// Guards `finalize_dynamic_filter_targets` to a single call: a second is a placement double-run.
+  bool _dynamic_filter_targets_finalized = false;
   /**
    * @brief Non-owning publication-counter sink, owned by `SiriusContext`
    *
@@ -369,6 +371,19 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   //===----------------------------------------------------------------------===//
 
  public:
+  /**
+   * @brief Append join-edge probe targets to this join's publish plan, exactly once, at plan time
+   *
+   * Issue #1010 placement runs post-fold in `sirius_physical_plan_generator`, discovers direct-route endpoints DuckDB did not, and hands them here before task construction. This replaces `_dynamic_filter_plan` with `dynamic_filter_publish_plan::with_appended_probe_targets`, so the appended targets are revalidated as a whole and the plan stays an immutable value between and after calls. The join owns this transition, so the settable-once guard lives here rather than on the plan value: a second call is a placement double-run -- an in-process invariant violation, not a recoverable input error.
+   *
+   * @throw std::logic_error if called more than once on this join
+   * @throw std::invalid_argument under every condition `with_appended_probe_targets` documents
+   *
+   * @param[in] direct_targets Join-edge (`dynamic_filter_route_class::direct`) endpoints to append
+   */
+  void finalize_dynamic_filter_targets(
+    std::vector<dynamic_filter_publish_plan::probe_target> direct_targets);
+
   /// @brief Route a partitioned batch and publish dynamic filters from an eligible build batch.
   ///
   /// For the @c build port of a wired @c BUILD_PROBE join, the single concat-folded batch is the

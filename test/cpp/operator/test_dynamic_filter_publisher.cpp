@@ -710,6 +710,65 @@ TEST_CASE("dynamic-filter publish plan rejects invalid targets and bindings",
   }
 }
 
+TEST_CASE("dynamic-filter publish plan appends probe targets as a new validated value",
+          "[dynamic_filter][publisher]")
+{
+  publisher_fixture fixture;
+  auto scan_channel   = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
+  auto direct_channel = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
+
+  std::vector<dynamic_filter_publish_plan::probe_target> scan_targets;
+  scan_targets.push_back(
+    {.filter_set               = scan_channel,
+     .route_class              = dynamic_filter_route_class::scan,
+     .accepts_zone_map_filters = true,
+     .key_bindings             = {
+       {.admitted_key_index = 0, .channel_push_ordinal = 3, .probe_storage_type = kInt64}}});
+  dynamic_filter_publish_plan const base{
+    {make_int64_key(0, 0)}, std::move(scan_targets), std::move(fixture.replica_spaces)};
+
+  // A membership-only join-edge target, valid unless a caller opts it into zone maps or binds a
+  // key the base plan does not carry.
+  auto direct_target = [&direct_channel](bool accepts_zone_maps, std::size_t admitted_key_index) {
+    std::vector<dynamic_filter_publish_plan::probe_target> targets;
+    targets.push_back({.filter_set               = direct_channel,
+                       .route_class              = dynamic_filter_route_class::direct,
+                       .accepts_zone_map_filters = accepts_zone_maps,
+                       .key_bindings             = {{.admitted_key_index   = admitted_key_index,
+                                                     .channel_push_ordinal = 9,
+                                                     .probe_storage_type   = kInt64}}});
+    return targets;
+  };
+
+  SECTION("a membership-only direct target yields the union of targets, leaving the source intact")
+  {
+    auto const extended = base.with_appended_probe_targets(direct_target(false, 0));
+
+    REQUIRE(extended.enabled());
+    REQUIRE(extended.admitted_keys().size() == base.admitted_keys().size());
+    REQUIRE(extended.probe_targets().size() == 2);
+    // The existing scan target keeps its index; the appended direct target follows it.
+    REQUIRE(extended.probe_targets()[0].filter_set == scan_channel);
+    REQUIRE(extended.probe_targets()[0].route_class == dynamic_filter_route_class::scan);
+    REQUIRE(extended.probe_targets()[1].filter_set == direct_channel);
+    REQUIRE(extended.probe_targets()[1].route_class == dynamic_filter_route_class::direct);
+    // The source is a value: appending did not mutate it.
+    REQUIRE(base.probe_targets().size() == 1);
+  }
+
+  SECTION("a direct target that accepts zone maps is rejected by revalidation")
+  {
+    REQUIRE_THROWS_AS(base.with_appended_probe_targets(direct_target(true, 0)),
+                      std::invalid_argument);
+  }
+
+  SECTION("an appended binding to a nonexistent admitted key is rejected by revalidation")
+  {
+    REQUIRE_THROWS_AS(base.with_appended_probe_targets(direct_target(false, 1)),
+                      std::invalid_argument);
+  }
+}
+
 TEST_CASE("dynamic-filter publish plan rejects unusable replica placements",
           "[dynamic_filter][publisher]")
 {

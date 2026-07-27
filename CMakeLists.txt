@@ -325,6 +325,7 @@ set(EXTENSION_SOURCES
     src/pipeline/task_request.cpp
     src/planner/duckdb_join_filter_candidate_adapter.cpp
     src/planner/build_key_domain.cpp
+    src/planner/dynamic_filter_endpoint_placement.cpp
     src/planner/dynamic_filter_key_admission.cpp
     src/planner/dynamic_filter_scan_routes.cpp
     src/planner/query.cpp
@@ -666,6 +667,7 @@ set(TEST_SOURCES
     test/cpp/planner/test_distinct_hash_join_detection.cpp
     test/cpp/planner/test_duckdb_join_filter_candidate_adapter.cpp
     test/cpp/planner/test_build_key_domain.cpp
+    test/cpp/planner/test_dynamic_filter_endpoint_placement.cpp
     test/cpp/planner/test_dynamic_filter_key_admission.cpp
     test/cpp/planner/test_dynamic_filter_router.cpp
     test/cpp/planner/test_dynamic_filter_scan_routes.cpp

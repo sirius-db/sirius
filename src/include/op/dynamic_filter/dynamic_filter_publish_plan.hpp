@@ -68,6 +68,8 @@ struct dynamic_filter_condition_shape {
  * installs no remap, so its push ordinals are the producing join's probe-child output ordinals,
  * stored unchanged. Pushing an output ordinal through a scan channel would remap twice and can
  * silently filter a same-typed wrong column.
+ * KEVIN: the reason this distinction exists is because the scan route is duckdb-owned, and the
+ * direct rout is sirius-owned.
  */
 enum class dynamic_filter_route_class : std::uint8_t {
   scan,   ///< Endpoint on a DYNAMIC_FILTER-wrapped table scan; `column_ids`-space push ordinals
@@ -147,6 +149,19 @@ class dynamic_filter_publish_plan final {
      * publisher receives
      */
     cudf::size_type build_key_ordinal = 0;
+    /**
+     * @brief Probe-child output column holding the probe-side key values
+     *
+     * Recorded at admission because a planner-order condition is the only place the probe reference
+     * can be read: join-edge placement runs after the physical join has reordered its own
+     * conditions, and `planner_condition_index` does not subscript that reordered vector. This is
+     * the same coordinate space a `dynamic_filter_route_class::direct` endpoint's push ordinals
+     * use. 0 when the probe side carries no bound reference -- exactly the
+     * `dynamic_filter_key_shape::cast` shape; only a `direct` probe is eligible for the join-edge
+     * route (`planner::direct_route_admissible`) and a `direct` probe always carries a reference,
+     * so no consumer has to tell a recorded 0 from an absent one.
+     */
+    cudf::size_type probe_key_ordinal = 0;
     /**
      * @brief Build key storage type recorded at plan time
      *
@@ -294,6 +309,19 @@ class dynamic_filter_publish_plan final {
                               std::vector<probe_target> probe_targets,
                               std::vector<dynamic_filter_replica_space> replica_spaces,
                               dynamic_filter_publication_policy policy = {});
+
+  /**
+   * @brief Derive a new plan with additional probe targets appended, revalidated as a whole
+   *
+   * Placement (issue #1010) discovers join-edge (`dynamic_filter_route_class::direct`) endpoints after this plan is already constructed and must extend it without weakening any invariant. Rather than mutate in place, this returns a new value: the same admitted keys, this plan's probe targets followed by @p additional_probe_targets, and the same replica spaces and policy, all re-run through the validating constructor above. The appended targets therefore face every check a constructor-time target faces, and this plan is left unchanged. Targets keep their positions: the appended targets take the highest target indexes, after the existing ones.
+   *
+   * @throw std::invalid_argument under every condition the validating constructor documents
+   *
+   * @param[in] additional_probe_targets Endpoint channels to append, with their sparse key bindings
+   * @return A new validated plan carrying the union of probe targets
+   */
+  [[nodiscard]] dynamic_filter_publish_plan with_appended_probe_targets(
+    std::vector<probe_target> additional_probe_targets) const;
 
   /**
    * @brief Whether this producer publishes at all

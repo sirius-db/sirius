@@ -95,12 +95,14 @@ duckdb::vector<sirius::join_condition> make_wrapped_equalities(std::size_t count
   return sirius::wrap_join_conditions(std::move(conditions));
 }
 
+/// The expected key for condition @p condition_index of `make_wrapped_equalities`, whose condition index, build ordinal, and probe ordinal all coincide by construction. Use `make_wrapped_equalities_at` where those three coordinates must differ.
 dynamic_filter_publish_plan::admitted_key expected_key(
   std::size_t condition_index, dynamic_filter_condition_shape shape = kDirectDirect)
 {
   return dynamic_filter_publish_plan::admitted_key{
     .planner_condition_index = condition_index,
     .build_key_ordinal       = static_cast<cudf::size_type>(condition_index),
+    .probe_key_ordinal       = static_cast<cudf::size_type>(condition_index),
     .storage_type            = kInt32,
     .key_shape               = shape};
 }
@@ -111,7 +113,7 @@ dynamic_filter_publish_plan::admitted_key expected_key(
 // Coordinate-space separation
 //===----------------------------------------------------------------------===//
 
-TEST_CASE("admission reads the build ordinal from the build side, not the condition index",
+TEST_CASE("admission reads build and probe ordinals from their own sides, not the condition index",
           "[dynamic_filter][key_admission]")
 {
   // Probe ordinals 9 and 3, build ordinals 4 and 7, hinted in reverse. Every coordinate differs
@@ -131,6 +133,10 @@ TEST_CASE("admission reads the build ordinal from the build side, not the condit
   REQUIRE(result.admitted_keys[0].build_key_ordinal == 7);
   REQUIRE(result.admitted_keys[1].planner_condition_index == 0);
   REQUIRE(result.admitted_keys[1].build_key_ordinal == 4);
+  // The probe ordinal is read from the probe (left) side, never the build side: keys[0] is
+  // condition 1 (probe 3), keys[1] is condition 0 (probe 9).
+  REQUIRE(result.admitted_keys[0].probe_key_ordinal == 3);
+  REQUIRE(result.admitted_keys[1].probe_key_ordinal == 9);
   REQUIRE(result.per_target_key_bindings[0] ==
           std::vector<dynamic_filter_publish_plan::key_binding>{
             {.admitted_key_index = 0, .channel_push_ordinal = 21, .probe_storage_type = kInt32},
@@ -510,12 +516,14 @@ TEST_CASE("publish plan rejects inconsistent admitted-key metadata",
     // so the check cannot silently fall behind the struct.
     auto const& [planner_condition_index,
                  build_key_ordinal,
+                 probe_key_ordinal,
                  storage_type,
                  key_shape,
                  domain,
                  unique] = expected_key(3);
     (void)planner_condition_index;
     (void)build_key_ordinal;
+    (void)probe_key_ordinal;
     (void)storage_type;
     (void)key_shape;
     (void)domain;
@@ -531,6 +539,10 @@ TEST_CASE("publish plan rejects inconsistent admitted-key metadata",
     auto vary_build_key_ordinal              = base;
     vary_build_key_ordinal.build_key_ordinal = 9;
     REQUIRE_FALSE(base == vary_build_key_ordinal);
+
+    auto vary_probe_key_ordinal              = base;
+    vary_probe_key_ordinal.probe_key_ordinal = 9;
+    REQUIRE_FALSE(base == vary_probe_key_ordinal);
 
     auto vary_storage_type         = base;
     vary_storage_type.storage_type = kInt64;

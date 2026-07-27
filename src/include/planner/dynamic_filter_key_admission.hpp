@@ -20,10 +20,9 @@
  *
  * `sirius_plan_comparison_join` calls these helpers at the **producer-key admission boundary**:
  * the plan-time boundary where DuckDB join conditions and optimizer hints become the Sirius-owned
- * metadata that `dynamic_filter_publish_plan` carries and the runtime publisher consumes. Runtime
- * publication receives the finished plan and does not reinterpret DuckDB metadata.
+ * metadata that `dynamic_filter_publish_plan` carries and the runtime publisher consumes.
  *
- * Admission translates four persisted coordinates, which are never interchangeable:
+ * Admission translates five persisted coordinates, which are never interchangeable:
  *
  *  - **condition index** -- position in the planner's original (pre-`wrap_join_conditions`,
  *    pre-reorder) condition vector; `classify_join_key_shapes` results and
@@ -32,28 +31,26 @@
  *    `key_binding::admitted_key_index` lives in this space;
  *  - **build-key ordinal** -- position of the materialized key column in the runtime build table;
  *    `admitted_key::build_key_ordinal` lives in this space;
+ *  - **probe-key ordinal** -- position of the probe-side key column in the producing join's
+ *    probe-child output, which is also the push space of a `direct` endpoint;
+ *    `admitted_key::probe_key_ordinal` lives in this space;
  *  - **channel push ordinal** -- a coordinate in one target channel's push space (see
  *    @ref sirius::op::dynamic_filter_route_class); `dynamic_filter_scan_target_input` push
  *    ordinals and `key_binding::channel_push_ordinal` live in this space.
  *
  * Two vector indexes align the inputs but are not key-coordinate spaces:
  *
- *  - **target index** selects corresponding entries in `scan_targets`,
+ *  - **target index** (t) selects corresponding entries in `scan_targets`,
  *    `probe_targets`, and `per_target_key_bindings`;
- *  - **DuckDB filter ordinal** temporarily zips `hinted_condition_indexes[f]` to
+ *  - **DuckDB filter ordinal** (f) temporarily zips `hinted_condition_indexes[f]` to
  *    `scan_targets[t].channel_push_ordinals[f]` and
- *    `scan_targets[t].probe_storage_types[f]`. It is not persisted in the result.
+ *    `scan_targets[t].probe_storage_types[f]`.
  *
  * For example, hints `[2, 0]` and one target's push ordinals `[12, 7]` pair condition 2 with
  * channel ordinal 12 and condition 0 with channel ordinal 7. If condition 0 is rejected, condition
  * 2 keeps ordinal 12 even though the admitted-key array is compacted. For a scan route, the channel
  * later remaps that `column_ids`-space ordinal once into the consumer's output-position space;
  * that downstream output position is not an admission coordinate.
- *
- * Every function here is a pure function of its arguments: no globals, no mutation of inputs.
- * Channel creation and producer registration are side effects and stay in
- * `sirius_physical_plan_generator`; the admission helpers receive already-resolved target
- * descriptors.
  */
 
 #pragma once

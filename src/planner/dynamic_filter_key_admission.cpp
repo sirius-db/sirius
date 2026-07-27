@@ -54,22 +54,22 @@ bool side_blocks_scan_route(op::dynamic_filter_key_shape shape) noexcept
 }
 
 /**
- * @brief Convert an AST reference column ordinal to a build-table cuDF column ordinal
+ * @brief Convert an AST reference column ordinal to a cuDF column ordinal
  *
- * This is the single checked conversion point between the two index spaces; they meet nowhere else.
+ * This is the single checked conversion point between the two index spaces; they meet nowhere else. Both of a condition's key ordinals pass through it, so neither side can acquire a weaker range check than the other.
  *
  * @throw std::invalid_argument if the index exceeds the cuDF column ordinal range
  *
- * @param[in] bound_reference_index The build side's AST reference column ordinal
+ * @param[in] bound_reference_index One key side's AST reference column ordinal
  * @return The equivalent cudf column ordinal
  */
-cudf::size_type to_build_key_ordinal(std::uint32_t bound_reference_index)
+cudf::size_type to_key_column_ordinal(std::uint32_t bound_reference_index)
 {
   constexpr auto k_max_ordinal =
     static_cast<std::uint32_t>(std::numeric_limits<cudf::size_type>::max());
   if (bound_reference_index > k_max_ordinal) {
     throw std::invalid_argument(
-      "[dynamic_filter_key_admission] A build-side reference ordinal exceeds the cuDF column "
+      "[dynamic_filter_key_admission] A join-key reference ordinal exceeds the cuDF column "
       "ordinal range");
   }
   return static_cast<cudf::size_type>(bound_reference_index);
@@ -116,10 +116,19 @@ std::optional<op::dynamic_filter_publish_plan::admitted_key> admit_scan_route_ke
   auto const storage_type = sirius::try_get_cudf_type(build_ref.return_type());
   if (!storage_type.has_value()) { return std::nullopt; }
 
-  auto const build_key_ordinal = to_build_key_ordinal(build_ref.column_index);
+  auto const build_key_ordinal = to_key_column_ordinal(build_ref.column_index);
+
+  // The probe ordinal is legible only from a planner-order condition: join-edge placement runs
+  // after the physical join has reordered its conditions, where no planner-order index applies.
+  auto const& probe_side = *condition.left;
+  auto const probe_key_ordinal =
+    probe_side.is_reference() ? to_key_column_ordinal(probe_side.as_reference().column_index)
+                              : cudf::size_type{0};
+
   return op::dynamic_filter_publish_plan::admitted_key{
     .planner_condition_index      = condition_index,
     .build_key_ordinal            = build_key_ordinal,
+    .probe_key_ordinal            = probe_key_ordinal,
     .storage_type                 = *storage_type,
     .key_shape                    = shape,
     .build_key_domain_cardinality = domain_cardinality,

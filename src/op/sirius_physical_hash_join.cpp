@@ -391,6 +391,18 @@ sirius_physical_hash_join::sirius_physical_hash_join(
 {
 }
 
+void sirius_physical_hash_join::finalize_dynamic_filter_targets(
+  std::vector<dynamic_filter_publish_plan::probe_target> direct_targets)
+{
+  if (_dynamic_filter_targets_finalized) {
+    throw std::logic_error(
+      "[sirius_physical_hash_join] finalize_dynamic_filter_targets called more than once; "
+      "dynamic-filter placement must run at most once per producing join");
+  }
+  _dynamic_filter_targets_finalized = true;
+  _dynamic_filter_plan = _dynamic_filter_plan.with_appended_probe_targets(std::move(direct_targets));
+}
+
 //===--------------------------------------------------------------------===//
 // Pipeline Construction
 //===--------------------------------------------------------------------===//
