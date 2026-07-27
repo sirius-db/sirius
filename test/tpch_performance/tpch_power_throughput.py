@@ -319,6 +319,21 @@ def geomean(values):
     return math.exp(sum(math.log(max(v, 1e-9)) for v in values) / len(values))
 
 
+def clamp_query_times(query_times):
+    """Raise query times below slowest/1000 up to that floor (clause 5.4.1.4).
+
+    Power@Size is a geometric mean, so one very fast query would otherwise pull
+    it up without bound. The spec caps the spread at 1000:1. Returns the
+    adjusted times and how many changed; below a 1000:1 spread nothing does.
+    """
+    if not query_times:
+        return query_times, 0
+    floor = max(query_times.values()) / 1000.0
+    adjusted = {q: max(t, floor) for q, t in query_times.items()}
+    changed = sum(1 for q, t in query_times.items() if adjusted[q] != t)
+    return adjusted, changed
+
+
 def power_run(con, args, run_dir, writer):
     plan = stream_queries(0, args)
     gpu = con.cursor()
@@ -397,10 +412,19 @@ def power_run(con, args, run_dir, writer):
                 cpu, rows_p2, plan, "after RF2", args.query_timeout
             )
 
-        power_at_size = 3600.0 * args.sf / geomean(list(t_p0.values()) + [t_rf1, t_rf2])
+        metric_times, clamped = clamp_query_times(t_p0)
+        if clamped:
+            log(
+                f"Clamped {clamped} query time(s) up to "
+                f"{max(t_p0.values()) / 1000.0:.6f}s (1000:1 spread limit)"
+            )
+        power_at_size = (
+            3600.0 * args.sf / geomean(list(metric_times.values()) + [t_rf1, t_rf2])
+        )
         log(f"Power@Size = {power_at_size:.2f}")
         return {
             "power_at_size": power_at_size,
+            "clamped_query_times": clamped,
             "t_rf1": t_rf1,
             "t_rf2": t_rf2,
             "query_times_stream0": {f"q{q}": t for q, t in t_p0.items()},
@@ -569,6 +593,11 @@ def write_summary(run_dir, args, streams, power, throughput, qphh):
                     f"({skipped} skipped: refresh-invariant)"
                 )
         out("")
+        if power.get("clamped_query_times"):
+            out(
+                f"Note: {power['clamped_query_times']} query time(s) raised to the "
+                "1000:1 spread floor before Power@Size"
+            )
         out(f"Power@Size       = {power['power_at_size']:.2f}")
     if throughput:
         out(

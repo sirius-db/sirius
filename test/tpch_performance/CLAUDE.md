@@ -290,6 +290,11 @@ predicates — the runner rejects `--validation`.
 Each query runs as its own `READ ONLY` transaction. q15 is a CTE in the 3.0.1 templates, so no
 query creates a view and nothing is shared between concurrent streams.
 
+Power@Size is a geometric mean, so one very fast query would otherwise pull it up without bound;
+clause 5.4.1.4 caps the spread at 1000:1, and the runner raises any query time below
+`slowest/1000` to that floor before computing the metric (reported in `summary.txt` and
+`metrics.json` when it fires).
+
 Metrics: `Power@Size = 3600·SF / geomean(22 stream-0 query times + T_RF1 +
 T_RF2)`, `Throughput@Size = N·22·3600 / measurement_interval · SF`, `QphH@Size =
 sqrt(Power · Throughput)`.
