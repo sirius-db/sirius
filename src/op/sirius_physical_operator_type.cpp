@@ -115,6 +115,7 @@ std::string SiriusPhysicalOperatorToString(SiriusPhysicalOperatorType type)
     case SiriusPhysicalOperatorType::GPU_SCAN: return "GPU_SCAN";
     case SiriusPhysicalOperatorType::DYNAMIC_FILTER: return "DYNAMIC_FILTER";
     case SiriusPhysicalOperatorType::STREAMING_SOURCE: return "STREAMING_SOURCE";
+    case SiriusPhysicalOperatorType::STREAMING_SINK: return "STREAMING_SINK";
     case SiriusPhysicalOperatorType::INVALID: break;
   }
   return "INVALID";
