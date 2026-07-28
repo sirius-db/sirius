@@ -16,6 +16,8 @@
 
 #include "sirius_context.hpp"
 
+#include "compression/compression_converters.hpp"
+#include "compression/spill_context.hpp"
 #include "config.hpp"
 #include "cucascade/memory/memory_reservation_manager.hpp"
 #include "duckdb/common/helper.hpp"
@@ -549,6 +551,19 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
   for (auto const& gpu : topo.gpus) {
     SIRIUS_LOG_INFO(
       "  GPU {}: {} (numa={}, pci={})", gpu.id, gpu.name, gpu.numa_node, gpu.pci_bus_id);
+  }
+
+  // Mirror the compression settings the cuCascade converters read. They run
+  // without a SiriusContext, so anything they need must be pushed to process
+  // globals here — otherwise a YAML-configured deployment never reaches them
+  // (the DuckDB SET handlers push on change, but only after startup).
+  {
+    auto const& comp = config_.get_compression_config();
+    sirius::compression::set_spill_compression_settings(comp.enable_spill_compression,
+                                                        comp.spill_explore_beam_width,
+                                                        comp.spill_explore_max_bytes,
+                                                        comp.max_compressed_fraction);
+    sirius::set_decompress_column_threads(comp.column_threads);
   }
 
   memory_manager_ = std::make_unique<sirius::memory::sirius_memory_reservation_manager>(

@@ -641,7 +641,7 @@ TEST_CASE("pin_table compression - fallback when compression saves too little",
     con, "SET pin_table_input_compression_plan_dir = '" + plan_dir.string() + "';", "set plan_dir");
   // Require a 99% saving — no realistic plan meets this, so the compressed form
   // is discarded and the batch is pinned uncompressed.
-  run_ok(con, "SET pin_table_compression_max_compressed_fraction = 0.01;", "set max_fraction");
+  run_ok(con, "SET compression_max_compressed_fraction = 0.01;", "set max_fraction");
 
   auto pin = con.Query("CALL pin_table('" + glob + "', tier='host', name='t_ratio');");
   require_ok(pin, "pin");

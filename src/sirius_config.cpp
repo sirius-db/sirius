@@ -212,6 +212,10 @@ static void from_yaml(const YAML::Node& node, compression_config& opt)
   r.optional("max_compressed_fraction", opt.max_compressed_fraction);
   r.optional("input_plan_dir", opt.input_plan_dir);
   r.optional("column_threads", opt.column_threads, yaml::greater_than<int>{0});
+  r.optional("enable_spill_compression", opt.enable_spill_compression);
+  r.optional(
+    "spill_explore_beam_width", opt.spill_explore_beam_width, yaml::greater_than<uint32_t>{0});
+  r.optional("spill_explore_max_bytes", yaml::bytes(opt.spill_explore_max_bytes));
   r.reject_unknown();
 }
 

@@ -1971,15 +1971,29 @@ static void SetPinTableCompressionMinBatchSizeBytes(ClientContext& context,
   SIRIUS_LOG_DEBUG("Updated pin_table_compression_min_batch_size_bytes");
 }
 
-static void SetPinTableCompressionMaxCompressedFraction(ClientContext& context,
-                                                        SetScope scope,
-                                                        Value& parameter)
+// Mirror the spill-compression config into the process-global state the
+// cuCascade converters read (they have no access to a SiriusContext).
+// SiriusContext::initialize() performs the same push at startup.
+static void PushSpillCompressionSettings(const sirius::compression_config& cfg)
+{
+  sirius::compression::set_spill_compression_settings(cfg.enable_spill_compression,
+                                                      cfg.spill_explore_beam_width,
+                                                      cfg.spill_explore_max_bytes,
+                                                      cfg.max_compressed_fraction);
+}
+
+static void SetCompressionMaxCompressedFraction(ClientContext& context,
+                                                SetScope scope,
+                                                Value& parameter)
 {
   auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
   if (!sirius_ctx) { return; }
-  sirius_ctx->get_config().get_compression_config().max_compressed_fraction =
-    DoubleValue::Get(parameter);
-  SIRIUS_LOG_DEBUG("Updated pin_table_compression_max_compressed_fraction");
+  auto& cfg                   = sirius_ctx->get_config().get_compression_config();
+  cfg.max_compressed_fraction = DoubleValue::Get(parameter);
+  // Shared with the spill path, whose converters read a process global.
+  PushSpillCompressionSettings(cfg);
+  SIRIUS_LOG_DEBUG("Updated compression_max_compressed_fraction to {}",
+                   cfg.max_compressed_fraction);
 }
 
 static void SetCompressionColumnThreads(ClientContext& context, SetScope scope, Value& parameter)
@@ -1990,16 +2004,6 @@ static void SetCompressionColumnThreads(ClientContext& context, SetScope scope, 
   sirius_ctx->get_config().get_compression_config().column_threads = n;
   sirius::set_decompress_column_threads(n);
   SIRIUS_LOG_DEBUG("Updated compression_column_threads to {}", n);
-}
-
-// Mirror the spill-compression config into the process-global state the
-// cuCascade converters read (they have no access to a SiriusContext).
-static void PushSpillCompressionSettings(const sirius::compression_config& cfg)
-{
-  sirius::compression::set_spill_compression_settings(cfg.enable_spill_compression,
-                                                      cfg.spill_explore_beam_width,
-                                                      cfg.spill_explore_max_bytes,
-                                                      cfg.max_compressed_fraction);
 }
 
 static void SetSpillCompression(ClientContext& context, SetScope scope, Value& parameter)
@@ -2320,12 +2324,14 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
     SetPinTableCompressionMinBatchSizeBytes);
 
   config.AddExtensionOption(
-    "pin_table_compression_max_compressed_fraction",
-    "Discard the compressed form and pin uncompressed when the compressed size exceeds this "
-    "fraction of the batch's original size (i.e. compression saved too little)",
+    "compression_max_compressed_fraction",
+    "Discard the compressed form when the compressed size exceeds this fraction of the batch's "
+    "original size (i.e. compression saved too little). Applies to both the pin-time compress "
+    "path (the chunk is pinned uncompressed) and the spill path (the batch is downgraded "
+    "uncompressed)",
     LogicalType::DOUBLE,
     Value::DOUBLE(0.95),
-    SetPinTableCompressionMaxCompressedFraction);
+    SetCompressionMaxCompressedFraction);
 
   config.AddExtensionOption(
     "compression_column_threads",

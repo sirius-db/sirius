@@ -141,17 +141,25 @@ struct telemetry_config {
   std::string engine_name{"siriusDB"};
 };
 
-/// Parameters controlling Simpatico compression for pin_table(tier=>'host').
-/// These settings apply exclusively to cached input-table pinning and have no
-/// effect on spill-path compression (Phase 3).
+/// Parameters controlling Simpatico compression.
+///
+/// Two independent paths are configured here:
+///   - **pin** — caching an input table via pin_table(), gated by
+///     `enable_pin_table_compression`
+///   - **spill** — compressing batches downgraded off the GPU, gated by
+///     `enable_spill_compression`
+///
+/// Fields named `pin_*` / `spill_*` affect only that path; the rest
+/// (`max_compressed_fraction`, `column_threads`) apply to both.
 struct compression_config {
   /// When true, pin_table(tier=>'host') attempts to compress each chunk with
   /// Simpatico before storing it in host memory. Falls back to uncompressed
   /// host storage when no plan file is found for a table or compression fails.
   bool enable_pin_table_compression{false};
 
-  /// Minimum chunk size (uncompressed bytes) below which compression is
+  /// Minimum chunk size (uncompressed bytes) below which pin compression is
   /// skipped and the chunk is stored uncompressed.  0 = no threshold.
+  /// Pin path only — the spill path compresses regardless of batch size.
   std::size_t min_batch_size_bytes{1ULL * 1024 * 1024};  // 1 MiB
 
   /// Maximum compressed footprint, as a fraction of the batch's original device
@@ -159,6 +167,9 @@ struct compression_config {
   /// payload exceeds this fraction of the original (i.e. compression saved too
   /// little), the compressed data is discarded and the uncompressed batch is used.
   //  Default 0.75 (that coincides with a 1.33x compression ratio).
+  ///
+  /// Applies to BOTH paths: a pin chunk is stored uncompressed, and a spilled
+  /// batch is downgraded uncompressed, when it fails this test.
   double max_compressed_fraction{0.75};
 
   /// Directory containing per-table Simpatico plan files for input-table
