@@ -274,8 +274,7 @@ void SiriusContext::begin_execution_window(ClientContext& context,
                                            std::string_view pool_tag)
 {
   // Runs inside the held slot, after acquire and the health check and before
-  // the final create_plan. Operator ids restart at 0 per query; u32 telemetry,
-  // hash-join partition tags and GPU placement key off them.
+  // the final create_plan.
   // Logging around the mutations is best-effort: a logging failure must never
   // leave the runtime half-begun (the mutations themselves are the only
   // throwing steps that matter; a throw here is handled by the scope ctor's
@@ -285,7 +284,6 @@ void SiriusContext::begin_execution_window(ClientContext& context,
     SIRIUS_LOG_INFO("QueryBegin: {}", window_label);
   } catch (...) {  // best-effort observability
   }
-  sirius::op::sirius_physical_operator::next_operator_id.store(0);
   task_creator_->reset();
   task_creator_->set_client_context(context);
 }

@@ -48,6 +48,16 @@ struct mark_join_fixture {
   duckdb::unique_ptr<sirius_physical_hash_join> hash_join;
 };
 
+//! Depth-first, root-first numbering of a bare operator tree, standing in for
+//! pipeline::assign_operator_ids in fixtures that never build pipelines.
+void number_operator_tree(sirius::op::sirius_physical_operator& op, size_t& next_id)
+{
+  op.operator_id = next_id++;
+  for (auto& child : op.children) {
+    if (child) { number_operator_tree(*child, next_id); }
+  }
+}
+
 struct nlj_projection_fixture {
   duckdb::unique_ptr<duckdb::LogicalComparisonJoin> logical_join;
   duckdb::unique_ptr<sirius_physical_nested_loop_join> nlj;
@@ -98,6 +108,11 @@ mark_join_fixture create_mark_join()
     sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{}),  // delim_types
     1000,
     nullptr);
+
+  // No pipelines exist in this fixture, so the converter's assign_operator_ids never runs.
+  // Number the tree here — operator code reads get_operator_id(), which rejects the sentinel.
+  size_t next_id = 0;
+  number_operator_tree(*f.hash_join, next_id);
 
   return f;
 }

@@ -118,6 +118,32 @@ extracted_plan extract_logical_plan_sirius_order(duckdb::ClientContext& context,
   return {std::move(plan), std::move(prepared)};
 }
 
+//! Clears the SiriusContext-wide data repositories on construction and destruction.
+//! No-op when Sirius is not registered on the connection.
+class scoped_repository_reset {
+ public:
+  explicit scoped_repository_reset(duckdb::ClientContext& context)
+    : ctx_(context.registered_state->Get<duckdb::SiriusContext>("sirius_state"))
+  {
+    clear();
+  }
+  ~scoped_repository_reset() { clear(); }
+  scoped_repository_reset(const scoped_repository_reset&)            = delete;
+  scoped_repository_reset& operator=(const scoped_repository_reset&) = delete;
+
+ private:
+  void clear() noexcept
+  {
+    if (!ctx_ || !ctx_->is_initialized()) { return; }
+    try {
+      ctx_->get_data_repository_manager().clear_all_repositories();
+    } catch (...) {  // best-effort: never throw out of a test-scaffolding destructor
+    }
+  }
+
+  duckdb::shared_ptr<duckdb::SiriusContext> ctx_;
+};
+
 }  // namespace
 
 void with_conversion_result(
@@ -184,6 +210,14 @@ void with_initialized_engine(duckdb::Connection& con,
                              const std::function<void(sirius_engine&)>& consume)
 {
   auto& context = *con.context;
+
+  // This helper builds a plan and wires its repositories into the SiriusContext-wide manager
+  // without opening an execution window, so nothing runs the per-query cleanup that production
+  // gets from SiriusContext::run_mandatory_cleanup. Operator ids restart at 0 for every plan,
+  // so leftover repositories would collide on {operator_id, port_id} with the next plan built
+  // here — or with the next real GPU query in the same process. Clear on both entry and exit so
+  // the helper leaves the manager as it found it.
+  scoped_repository_reset repo_reset(context);
 
   con.BeginTransaction();
   try {

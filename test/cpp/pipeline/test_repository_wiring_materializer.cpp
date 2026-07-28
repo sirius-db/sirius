@@ -51,10 +51,18 @@ class wiring_test_env {
 
   duckdb::shared_ptr<sirius_pipeline> make_pipeline()
   {
-    return duckdb::make_shared_ptr<sirius_pipeline>(build_ctx);
+    auto pipeline = duckdb::make_shared_ptr<sirius_pipeline>(build_ctx);
+    pipelines.push_back(pipeline);
+    return pipeline;
   }
 
+  // Number every operator built so far, exactly as sirius_engine does between pipeline
+  // conversion and repository wiring. materialize_repository_wiring reads operator ids,
+  // so this must run first.
+  void assign_ids() { sirius::pipeline::assign_operator_ids(pipelines); }
+
   sirius::pipeline::pipeline_build_context build_ctx{nullptr};
+  duckdb::vector<duckdb::shared_ptr<sirius_pipeline>> pipelines;
 };
 
 // Build a pipeline with the given sink and operator list. `operators` may be
@@ -98,6 +106,8 @@ TEST_CASE("materialize: basic 4-arg-style wiring attaches port and records sink 
                                              src_pipeline,
                                              dest_pipeline}};
 
+  env.assign_ids();
+
   materialize_repository_wiring(wirings, mgr);
 
   // Port should land on dest_first_op (operators[0]), not on dest_sink.
@@ -137,6 +147,8 @@ TEST_CASE("materialize: empty operators routes port onto destination sink",
                                              src_pipeline,
                                              dest_pipeline}};
 
+  env.assign_ids();
+
   materialize_repository_wiring(wirings, mgr);
 
   auto* port = dest_sink.get_port("scan");
@@ -171,6 +183,8 @@ TEST_CASE("materialize: explicit source op (5-arg-style) records fanout on the s
                                              &sub_emitter,  // explicit source op
                                              src_pipeline,
                                              dest_pipeline}};
+
+  env.assign_ids();
 
   materialize_repository_wiring(wirings, mgr);
 
@@ -212,6 +226,8 @@ TEST_CASE("materialize: multiple wirings to the same destination attach distinct
      build_pipeline_handle,
      dest_pipeline},
   };
+
+  env.assign_ids();
 
   materialize_repository_wiring(wirings, mgr);
 
@@ -274,6 +290,7 @@ TEST_CASE("materialize: delim join destinations use the generic path with no sib
 
   // Must not throw (the LEFT-delim "should never be a source" invariant is gone), and the port
   // lands only on the destination's operators[0].
+  env.assign_ids();
   REQUIRE_NOTHROW(materialize_repository_wiring(wirings, mgr));
 
   auto* delim_port = right_delim->get_port("build");

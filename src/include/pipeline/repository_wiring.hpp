@@ -68,5 +68,28 @@ struct repository_wiring {
 void materialize_repository_wiring(const std::vector<repository_wiring>& wirings,
                                    cucascade::shared_data_repository_manager& data_repo_manager);
 
+/**
+ * @brief Stamp every operator in @p pipelines with a dense, 0-based id for this query.
+ *
+ * Operators are constructed with `sirius_physical_operator::invalid_operator_id` so that plan
+ * construction carries no cross-query state and two queries can be planned concurrently. This
+ * pass runs once, after the pipeline converter has produced the final pipeline set and before
+ * anything reads an operator id — `materialize_repository_wiring` above is the first consumer,
+ * since it keys each repository on the destination operator's id.
+ *
+ * Ids are assigned in pipeline-scheduling order and, within a pipeline, in
+ * source -> operators -> sink order. Each operator is numbered on first visit, so an operator
+ * appearing in several pipelines keeps one stable id. The resulting ids are `0..N-1`, no gaps.
+ *
+ * The pipeline set — not the plan tree — is the traversal root on purpose:
+ * `sirius_physical_delim_join` owns its `join` and `distinct_root` subtrees outside `children`
+ * and does not override `get_children()`, so a tree walk would miss them. Every operator that
+ * executes belongs to a pipeline.
+ *
+ * @param pipelines The query's pipelines, in scheduling order.
+ * @return The number of operators numbered (i.e. one past the highest id assigned).
+ */
+size_t assign_operator_ids(const duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>& pipelines);
+
 }  // namespace pipeline
 }  // namespace sirius

@@ -16,6 +16,7 @@
 
 #include "catch.hpp"
 #include "pipeline/pipeline_build_context.hpp"
+#include "pipeline/repository_wiring.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "planner/query_index.hpp"
 
@@ -94,8 +95,12 @@ class dag_builder {
       sirius_physical_operator::next_port_info{consumer_op, name, uuid::now_v7()});
   }
 
-  const duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>& pipelines() const
+  // Numbers the DAG before handing it out, mirroring sirius_engine: query_index keys its
+  // branch map on operator ids, so they must be stamped first. Idempotent — operators
+  // already numbered keep their id.
+  const duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>& pipelines()
   {
+    sirius::pipeline::assign_operator_ids(_pipelines);
     return _pipelines;
   }
 

@@ -183,7 +183,7 @@ void emit_plan_telemetry(
       std::string chain{};
       for (const auto& name : operators | std::views::transform([](const auto& op) {
                                 return std::format(
-                                  "{}({})", op.get().get_name(), op.get().operator_id);
+                                  "{}({})", op.get().get_name(), op.get().get_operator_id());
                               })) {
         if (chain.empty()) {
           chain = name;

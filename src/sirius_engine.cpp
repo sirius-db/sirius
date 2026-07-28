@@ -228,16 +228,14 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
   pipeline::sirius_pipeline_converter converter(build_ctx, op_params);
   auto result = converter.convert(*root_pipeline);
 
+  // Operator ids were stamped by the converter (see assign_operator_ids); repository wiring
+  // below is the first consumer of them.
   // Materialize plan-time wiring descriptors into runtime repositories and ports.
   pipeline::materialize_repository_wiring(result.repository_wirings,
                                           sirius_ctx_ptr->get_data_repository_manager());
 
   new_scheduled   = std::move(result.scheduled_pipelines);
   total_pipelines = result.meta_pipeline_count;
-
-  // NOTE: dead code preserved for operator ID numbering stability
-  auto invalid_op = make_uniq<op::sirius_physical_operator>(
-    op::SiriusPhysicalOperatorType::INVALID, duckdb::vector<sirius::logical_type>{}, 0);
 
   // Collect all pipelines for progress tracking
   root_pipeline->get_pipelines(sirius_pipelines, true);
