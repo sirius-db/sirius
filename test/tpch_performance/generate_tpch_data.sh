@@ -180,6 +180,24 @@ if [ -z "$OUTPUT" ]; then
     fi
 fi
 
+# The duckdb build deletes its target before writing, and the backward-compatible
+# positional [output] [jobs] arguments accept any string, so a misplaced path
+# lands here as the destination. Refuse to remove anything that is not already a
+# DuckDB database; those start with "DUCK" at byte 8.
+if [ "$FORMAT" = "duckdb" ] && [ -e "$OUTPUT" ]; then
+    if [ -d "$OUTPUT" ]; then
+        echo "ERROR: --format duckdb writes a file, but '$OUTPUT' is a directory."
+        exit 1
+    fi
+    if [ "$(od -An -c -j8 -N4 "$OUTPUT" 2>/dev/null | tr -d ' \n')" != "DUCK" ]; then
+        echo "ERROR: refusing to overwrite '$OUTPUT' - it is not a DuckDB database."
+        echo "       The positional [output] [jobs] arguments take any path, so this is"
+        echo "       usually a stray or mistyped argument. To overwrite it anyway, delete"
+        echo "       it first, or pass an explicit --output <file>.duckdb."
+        exit 1
+    fi
+fi
+
 # --- Generate data ---
 if [ "$FORMAT" = "parquet" ]; then
     # Use tpchgen-rs for optimized parquet output
