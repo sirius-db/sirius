@@ -150,13 +150,14 @@ cucascade::shared_data_repository& repo_b()
 
 /// Reset spill state: clear every cached plan and enable spill compression with
 /// a small explorer budget (the explore case is the only one that runs it).
-void reset_spill_state(bool enabled = true)
+void reset_spill_state(bool enabled = true, std::uint64_t replan_after_uses = 0)
 {
   sirius::compression::plan_register::global().clear_all();
   sirius::compression::set_spill_compression_settings(enabled,
                                                       /*explore_beam_width=*/4,
                                                       /*explore_max_bytes=*/8ull << 20,
-                                                      /*max_compressed_fraction=*/0.95);
+                                                      /*max_compressed_fraction=*/0.95,
+                                                      replan_after_uses);
 }
 
 /// Create a 1-column INT32 GPU batch with a known pattern [0, 1, 2, ..., n-1].
@@ -369,7 +370,8 @@ TEST_CASE("spill compression: first spill from an edge explores and caches a pla
   // The explored plan is now cached for this edge and non-empty.
   auto discovered = reg.resolve_spill_plan(&repo_b());
   REQUIRE(discovered.has_value());
-  REQUIRE_FALSE(discovered->empty());
+  REQUIRE_FALSE(discovered->dsl.empty());
+  REQUIRE(discovered->viable);
 
   // A different edge is unaffected — plans are per-edge, not global.
   REQUIRE_FALSE(reg.resolve_spill_plan(&repo_a()).has_value());
@@ -377,11 +379,16 @@ TEST_CASE("spill compression: first spill from an edge explores and caches a pla
   // The data survives the roundtrip under the discovered plan.
   require_restores_to(batch, &repo_b(), expected_sum_of(n));
 
-  // A second batch from the same edge reuses the cached plan (unchanged).
+  // A second batch from the same edge reuses the cached plan (unchanged DSL).
   auto batch2 = make_int32_gpu_batch(n);
   spill_to(batch2, e.host_space, &repo_b());
   REQUIRE(is_compressed_host(*batch2));
-  REQUIRE(reg.resolve_spill_plan(&repo_b()) == discovered);
+
+  auto after = reg.resolve_spill_plan(&repo_b());
+  REQUIRE(after.has_value());
+  REQUIRE(after->dsl == discovered->dsl);
+  // ...and each spill attempt is counted against the entry.
+  REQUIRE(after->uses > discovered->uses);
 
   reset_spill_state(false);
 }
@@ -472,7 +479,8 @@ TEST_CASE("spill compression: poor compression ratio falls back to uncompressed"
   sirius::compression::set_spill_compression_settings(true,
                                                       /*explore_beam_width=*/4,
                                                       /*explore_max_bytes=*/8ull << 20,
-                                                      /*max_compressed_fraction=*/0.75);
+                                                      /*max_compressed_fraction=*/0.75,
+                                                      /*replan_after_uses=*/0);
   // A plan whose output is the same width as its input cannot reach 0.75.
   sirius::compression::plan_register::global().set_spill_plan(&repo_a(), kNonCompressingDsl);
 
@@ -485,7 +493,148 @@ TEST_CASE("spill compression: poor compression ratio falls back to uncompressed"
   reset_spill_state(false);
 }
 
+// ── Unviable-edge memoization and re-explore ─────────────────────────────────
+
+TEST_CASE("spill compression: a rejected edge is marked and later batches skip compression",
+          "[compression][spill][isolated_context]")
+{
+  if (!has_gpu()) {
+    SUCCEED("No GPU available — skipping spill compression tests");
+    return;
+  }
+
+  auto& e   = env();
+  auto& reg = sirius::compression::plan_register::global();
+  reg.clear_all();
+  sirius::compression::set_spill_compression_settings(true,
+                                                      /*explore_beam_width=*/4,
+                                                      /*explore_max_bytes=*/8ull << 20,
+                                                      /*max_compressed_fraction=*/0.75,
+                                                      /*replan_after_uses=*/0);  // never expire
+  reg.set_spill_plan(&repo_a(), kNonCompressingDsl);
+
+  // First batch: compression runs, misses the threshold, and the edge is marked.
+  auto batch = make_int32_gpu_batch(1000);
+  spill_to(batch, e.host_space, &repo_a());
+  REQUIRE_FALSE(is_compressed_host(*batch));
+
+  auto state = reg.resolve_spill_plan(&repo_a());
+  REQUIRE(state.has_value());
+  REQUIRE_FALSE(state->viable);
+
+  // With the entry marked unviable, the spill path must now decide to skip
+  // rather than compress again.
+  const auto decision = reg.decide_spill_plan(&repo_a(), /*replan_after_uses=*/0);
+  REQUIRE(decision.verdict == sirius::compression::plan_register::spill_plan_verdict::skip);
+
+  // A second batch still spills, uncompressed, and stays skipped.
+  auto batch2 = make_int32_gpu_batch(1000);
+  spill_to(batch2, e.host_space, &repo_a());
+  REQUIRE_FALSE(is_compressed_host(*batch2));
+  REQUIRE_FALSE(reg.resolve_spill_plan(&repo_a())->viable);
+
+  reset_spill_state(false);
+}
+
+TEST_CASE("spill compression: an unviable edge is re-explored once its entry expires",
+          "[compression][spill][isolated_context]")
+{
+  if (!has_gpu()) {
+    SUCCEED("No GPU available — skipping spill compression tests");
+    return;
+  }
+
+  auto& e   = env();
+  auto& reg = sirius::compression::plan_register::global();
+  reg.clear_all();
+  // Expire after a single use so the retry is observable in one extra spill.
+  sirius::compression::set_spill_compression_settings(true,
+                                                      /*explore_beam_width=*/4,
+                                                      /*explore_max_bytes=*/8ull << 20,
+                                                      /*max_compressed_fraction=*/0.75,
+                                                      /*replan_after_uses=*/1);
+  reg.set_spill_plan(&repo_a(), kNonCompressingDsl);
+
+  // First batch: rejected, edge marked unviable, one use recorded.
+  auto batch = make_int32_gpu_batch(5000);
+  spill_to(batch, e.host_space, &repo_a());
+  REQUIRE_FALSE(is_compressed_host(*batch));
+  REQUIRE_FALSE(reg.resolve_spill_plan(&repo_a())->viable);
+
+  // The entry has now expired, so the verdict is explore rather than skip —
+  // a previously written-off edge gets another chance.
+  REQUIRE(reg.decide_spill_plan(&repo_a(), /*replan_after_uses=*/1).verdict ==
+          sirius::compression::plan_register::spill_plan_verdict::explore);
+
+  // The next batch re-explores and finds a plan that does compress, so the edge
+  // recovers instead of staying disabled for the rest of the query.
+  auto batch2 = make_int32_gpu_batch(5000);
+  spill_to(batch2, e.host_space, &repo_a());
+  REQUIRE(is_compressed_host(*batch2));
+
+  auto recovered = reg.resolve_spill_plan(&repo_a());
+  REQUIRE(recovered.has_value());
+  REQUIRE(recovered->viable);
+  REQUIRE(recovered->dsl != kNonCompressingDsl);
+
+  require_restores_to(batch2, &repo_a(), expected_sum_of(5000));
+
+  reset_spill_state(false);
+}
+
 // ── plan_register spill-plan API ─────────────────────────────────────────────
+
+TEST_CASE("plan_register: decide_spill_plan verdicts", "[compression][plan_register]")
+{
+  using verdict = sirius::compression::plan_register::spill_plan_verdict;
+  auto& reg     = sirius::compression::plan_register::global();
+  reg.clear_all();
+
+  // No entry at all.
+  REQUIRE(reg.decide_spill_plan(&repo_a(), 0).verdict == verdict::explore);
+
+  reg.set_spill_plan(&repo_a(), "some dsl");
+  auto d = reg.decide_spill_plan(&repo_a(), 0);
+  REQUIRE(d.verdict == verdict::use);
+  REQUIRE(d.dsl == "some dsl");
+
+  // Marked unviable -> skip, but the DSL and use count are retained so the
+  // entry still ages toward expiry.
+  reg.mark_spill_plan_unviable(&repo_a());
+  REQUIRE(reg.decide_spill_plan(&repo_a(), 0).verdict == verdict::skip);
+  REQUIRE(reg.resolve_spill_plan(&repo_a())->dsl == "some dsl");
+
+  // Expiry overrides both use and skip.
+  reg.note_spill_plan_use(&repo_a());
+  REQUIRE(reg.resolve_spill_plan(&repo_a())->uses == 1);
+  REQUIRE(reg.decide_spill_plan(&repo_a(), /*replan_after_uses=*/1).verdict == verdict::explore);
+  // ...but 0 means "never expire", so the skip verdict stands.
+  REQUIRE(reg.decide_spill_plan(&repo_a(), /*replan_after_uses=*/0).verdict == verdict::skip);
+
+  // Re-installing a plan clears the verdict and resets the counter.
+  reg.set_spill_plan(&repo_a(), "fresh dsl");
+  auto fresh = reg.resolve_spill_plan(&repo_a());
+  REQUIRE(fresh->viable);
+  REQUIRE(fresh->uses == 0);
+
+  reg.clear_all();
+}
+
+TEST_CASE("plan_register: note_spill_plan_use on an absent edge is a no-op",
+          "[compression][plan_register]")
+{
+  auto& reg = sirius::compression::plan_register::global();
+  reg.clear_all();
+
+  // Must not create an entry — a use recorded before any plan exists would
+  // otherwise age a plan that has not been installed yet.
+  reg.note_spill_plan_use(&repo_a());
+  REQUIRE_FALSE(reg.resolve_spill_plan(&repo_a()).has_value());
+  reg.mark_spill_plan_unviable(&repo_a());
+  REQUIRE_FALSE(reg.resolve_spill_plan(&repo_a()).has_value());
+
+  reg.clear_all();
+}
 
 TEST_CASE("plan_register: spill plan round-trips per repository", "[compression][plan_register]")
 {
@@ -499,7 +648,9 @@ TEST_CASE("plan_register: spill plan round-trips per repository", "[compression]
 
   auto result = reg.resolve_spill_plan(&repo_a());
   REQUIRE(result.has_value());
-  REQUIRE(*result == dsl);
+  REQUIRE(result->dsl == dsl);
+  REQUIRE(result->viable);
+  REQUIRE(result->uses == 0);
 
   // Plans are per-edge: another repository is unaffected.
   REQUIRE_FALSE(reg.resolve_spill_plan(&repo_b()).has_value());

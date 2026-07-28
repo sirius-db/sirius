@@ -19,6 +19,7 @@
 #include <cucascade/data/data_repository.hpp>
 
 #include <cstddef>
+#include <cstdint>
 #include <optional>
 #include <shared_mutex>
 #include <string>
@@ -75,20 +76,69 @@ class plan_register {
 
   // ── Spill-path plan entries (keyed by shared_data_repository*) ──────────
   //
-  // One plan per query-graph edge (operator output port). The repo pointer is
+  // One entry per query-graph edge (operator output port). The repo pointer is
   // stable for the lifetime of a query and uniquely identifies the output schema
   // + data distribution. Plans are discovered lazily on first spill via
-  // simpatico::explore_column_compression and stored here for reuse on
-  // subsequent batches from the same repo.
+  // simpatico::explore_column_compression and reused for later batches.
+  //
+  // An entry also remembers whether compression turned out to be *worth it* for
+  // that edge. When a compressed batch misses the size threshold the entry is
+  // marked unviable, so later batches skip the (futile) compress attempt
+  // entirely instead of paying for it and discarding the result every time.
+  // The verdict is not permanent: after `replan_after_uses` batches the entry
+  // expires and the edge is explored afresh, which also re-tests an edge that
+  // was previously marked unviable.
 
-  /// Store the multi-column spill plan DSL for @p repo. Overwrites any previous entry.
+  /// Cached spill-compression state for one query-graph edge.
+  struct spill_plan_state {
+    std::string dsl;        ///< multi-column plan DSL for this edge
+    bool viable{true};      ///< false once compression was judged not worth it
+    std::uint64_t uses{0};  ///< spill attempts since this entry was installed
+  };
+
+  /// What the spill path should do for an edge.
+  enum class spill_plan_verdict {
+    explore,  ///< no usable entry (absent or expired) — run the explorer
+    use,      ///< compress with the returned DSL
+    skip,     ///< compression is not worth it here — spill uncompressed
+  };
+
+  struct spill_plan_decision {
+    spill_plan_verdict verdict{spill_plan_verdict::explore};
+    std::string dsl;  ///< set when verdict == use
+  };
+
+  /**
+   * @brief Decide what the spill path should do for @p repo.
+   *
+   * @param replan_after_uses  Expire the entry once it has been used this many
+   *                           times, forcing a fresh explore (0 = never expire).
+   *
+   * An expired entry yields `explore` regardless of its previous verdict, so a
+   * plan that stopped paying off — or an edge wrongly judged unviable from an
+   * unrepresentative early batch — is reconsidered.
+   */
+  [[nodiscard]] spill_plan_decision decide_spill_plan(const cucascade::shared_data_repository* repo,
+                                                      std::uint64_t replan_after_uses) const;
+
+  /// Install a freshly explored plan for @p repo (resets viability and use count).
   void set_spill_plan(const cucascade::shared_data_repository* repo, std::string plan_dsl);
 
-  /// Remove the spill plan for @p repo.
+  /// Record that compression is not worth it for @p repo. Keeps the DSL and the
+  /// use count, so the entry still expires on schedule and gets re-explored.
+  void mark_spill_plan_unviable(const cucascade::shared_data_repository* repo);
+
+  /// Count one spill attempt against @p repo's entry. Call exactly once per
+  /// attempt, including attempts that were skipped or that failed — otherwise a
+  /// skipped edge would never accumulate uses and never be re-explored.
+  void note_spill_plan_use(const cucascade::shared_data_repository* repo);
+
+  /// Remove the spill entry for @p repo.
   void clear_spill_plan(const cucascade::shared_data_repository* repo);
 
-  /// Return the spill plan DSL for @p repo, or nullopt if none.
-  [[nodiscard]] std::optional<std::string> resolve_spill_plan(
+  /// Return the raw spill state for @p repo, or nullopt if none. Mainly for tests
+  /// and diagnostics; the spill path itself uses decide_spill_plan().
+  [[nodiscard]] std::optional<spill_plan_state> resolve_spill_plan(
     const cucascade::shared_data_repository* repo) const;
 
   // ── Lifecycle ────────────────────────────────────────────────────────────
@@ -100,8 +150,8 @@ class plan_register {
   mutable std::shared_mutex _mutex;
   std::unordered_map<std::string, std::string> _table_plans;  // table_name → full multi-col DSL
   std::unordered_map<std::string, std::string> _col_plans;    // "table::column" → single-col DSL
-  // repo* → multi-col spill DSL; keyed by pointer (stable within a query)
-  std::unordered_map<const cucascade::shared_data_repository*, std::string> _spill_plans;
+  // repo* → per-edge spill state; keyed by pointer (stable within a query)
+  std::unordered_map<const cucascade::shared_data_repository*, spill_plan_state> _spill_plans;
 };
 
 /**

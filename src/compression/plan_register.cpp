@@ -64,11 +64,44 @@ void plan_register::clear_plan(const std::string& table_name, const std::string&
   _col_plans.erase(table_name + "::" + column_name);
 }
 
+plan_register::spill_plan_decision plan_register::decide_spill_plan(
+  const cucascade::shared_data_repository* repo, std::uint64_t replan_after_uses) const
+{
+  std::shared_lock lock(_mutex);
+  auto it = _spill_plans.find(repo);
+  if (it == _spill_plans.end() || it->second.dsl.empty()) {
+    return {spill_plan_verdict::explore, {}};
+  }
+
+  // An expired entry is re-explored whatever its verdict was, so a stale plan or
+  // a premature "not worth it" ruling does not stick for the rest of the query.
+  const auto& state = it->second;
+  if (replan_after_uses > 0 && state.uses >= replan_after_uses) {
+    return {spill_plan_verdict::explore, {}};
+  }
+  if (!state.viable) { return {spill_plan_verdict::skip, {}}; }
+  return {spill_plan_verdict::use, state.dsl};
+}
+
 void plan_register::set_spill_plan(const cucascade::shared_data_repository* repo,
                                    std::string plan_dsl)
 {
   std::unique_lock lock(_mutex);
-  _spill_plans[repo] = std::move(plan_dsl);
+  _spill_plans[repo] = spill_plan_state{std::move(plan_dsl), /*viable=*/true, /*uses=*/0};
+}
+
+void plan_register::mark_spill_plan_unviable(const cucascade::shared_data_repository* repo)
+{
+  std::unique_lock lock(_mutex);
+  auto it = _spill_plans.find(repo);
+  if (it != _spill_plans.end()) { it->second.viable = false; }
+}
+
+void plan_register::note_spill_plan_use(const cucascade::shared_data_repository* repo)
+{
+  std::unique_lock lock(_mutex);
+  auto it = _spill_plans.find(repo);
+  if (it != _spill_plans.end()) { ++it->second.uses; }
 }
 
 void plan_register::clear_spill_plan(const cucascade::shared_data_repository* repo)
@@ -77,12 +110,12 @@ void plan_register::clear_spill_plan(const cucascade::shared_data_repository* re
   _spill_plans.erase(repo);
 }
 
-std::optional<std::string> plan_register::resolve_spill_plan(
+std::optional<plan_register::spill_plan_state> plan_register::resolve_spill_plan(
   const cucascade::shared_data_repository* repo) const
 {
   std::shared_lock lock(_mutex);
   auto it = _spill_plans.find(repo);
-  if (it != _spill_plans.end() && !it->second.empty()) { return it->second; }
+  if (it != _spill_plans.end() && !it->second.dsl.empty()) { return it->second; }
   return std::nullopt;
 }
 

@@ -52,6 +52,10 @@ struct spill_context {
   /// Discard the compressed form when it exceeds this fraction of the original
   /// device footprint (the batch is then spilled uncompressed).
   double max_compressed_fraction{0.75};
+
+  /// Re-explore this edge once its cached plan has been used this many times
+  /// (0 = never). Also re-tests an edge previously judged not worth compressing.
+  std::uint64_t replan_after_uses{128};
 };
 
 /// The calling thread's active spill context, or nullptr when none is installed.
@@ -68,7 +72,8 @@ struct spill_context {
 void set_spill_compression_settings(bool enabled,
                                     std::uint32_t explore_beam_width,
                                     std::size_t explore_max_bytes,
-                                    double max_compressed_fraction) noexcept;
+                                    double max_compressed_fraction,
+                                    std::uint64_t replan_after_uses) noexcept;
 
 /// Whether spill compression is enabled process-wide.
 [[nodiscard]] bool spill_compression_enabled() noexcept;

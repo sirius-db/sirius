@@ -18,6 +18,7 @@
 
 #include "compression/compressed_disk_representation.hpp"
 #include "compression/compressed_representation.hpp"
+#include "compression/plan_register.hpp"
 #include "compression/spill_context.hpp"
 #include "data/convertible_data.hpp"
 #include "data/sirius_converter_registry.hpp"
@@ -207,8 +208,29 @@ class convertible_data_batch : public convertible_data {
                               rmm::cuda_stream_view stream)
   {
     if (!compression::spill_compression_enabled() || _source_repo == nullptr) { return false; }
+
+    auto& reg      = compression::plan_register::global();
+    const auto ctx = compression::make_spill_context(_source_repo);
+
+    // Count this attempt however it turns out. A skipped edge must still
+    // accumulate uses, otherwise its entry never expires and the "not worth
+    // compressing" verdict would stick for the rest of the query. Runs after
+    // convert_to, so an explore inside the converter (which resets the count)
+    // is followed by this increment rather than clobbered by it.
+    struct use_noter {
+      compression::plan_register& reg;
+      const cucascade::shared_data_repository* repo;
+      ~use_noter() { reg.note_spill_plan_use(repo); }
+    } noter{reg, _source_repo};
+
+    const auto decision = reg.decide_spill_plan(_source_repo, ctx.replan_after_uses);
+    if (decision.verdict == compression::plan_register::spill_plan_verdict::skip) {
+      // Compression already proved not worth it for this edge: skip the
+      // conversion entirely rather than compressing and discarding it again.
+      return false;
+    }
+
     try {
-      const auto ctx = compression::make_spill_context(_source_repo);
       compression::scoped_spill_context guard(ctx);
       mut.convert_to<CompressedRep>(converter_registry, reservation, stream);
       return true;

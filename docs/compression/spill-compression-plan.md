@@ -30,6 +30,25 @@ Simpatico plan. The natural key is the `shared_data_repository*`:
 Thread the repo pointer into `convertible_data_batch` at construction, then pass it to
 the plan register in `convert()`.
 
+### Per-edge plan lifecycle
+
+Each edge's register entry carries the plan DSL plus two pieces of state:
+
+- **`viable`** — cleared when a compressed batch misses `max_compressed_fraction`.
+  Later batches from that edge then skip the compress attempt entirely instead of
+  paying for it and discarding the result every time. Without this, a plan that
+  fails the threshold stays cached and every subsequent batch repeats the full
+  compress → reject cycle for the rest of the query.
+- **`uses`** — spill attempts since the entry was installed. Once it reaches
+  `spill_replan_after_uses` the entry expires and the edge is explored afresh.
+
+Expiry deliberately overrides *both* verdicts. It re-plans data whose distribution
+has drifted, and it re-tests an edge written off as unviable — otherwise one
+unrepresentative early batch could disable compression for that edge permanently.
+
+`uses` is counted once per spill attempt including skipped ones, so a skipped edge
+still ages toward its retry.
+
 ### On-first-spill explore
 
 When `convert()` fires and no spill plan exists for the source repo:
@@ -168,6 +187,15 @@ Port and rewrite `test/cpp/compression/test_spill_compression.cpp` from `compres
 - Column-count-mismatch fallback (explore produces wrong-width plan → uncompressed).
 
 ## Future / deferred
+
+### Test the config → converter-global plumbing
+
+The spill tests call `set_spill_compression_settings()` directly, so they exercise
+the converters while proving nothing about whether real configuration reaches them.
+That gap hid two live bugs (YAML never pushed at init; `SET
+compression_max_compressed_fraction` not propagated). Worth a test that sets the
+DuckDB setting and asserts observable spill behaviour changes — best folded into the
+end-to-end memory-pressure run rather than added as a narrow unit test.
 
 ### Reservation sizing on the compressed path
 

@@ -1979,7 +1979,8 @@ static void PushSpillCompressionSettings(const sirius::compression_config& cfg)
   sirius::compression::set_spill_compression_settings(cfg.enable_spill_compression,
                                                       cfg.spill_explore_beam_width,
                                                       cfg.spill_explore_max_bytes,
-                                                      cfg.max_compressed_fraction);
+                                                      cfg.max_compressed_fraction,
+                                                      cfg.spill_replan_after_uses);
 }
 
 static void SetCompressionMaxCompressedFraction(ClientContext& context,
@@ -2027,6 +2028,19 @@ static void SetSpillCompressionExploreBeamWidth(ClientContext& context,
   PushSpillCompressionSettings(cfg);
   SIRIUS_LOG_DEBUG("Updated spill_compression_explore_beam_width to {}",
                    cfg.spill_explore_beam_width);
+}
+
+static void SetSpillCompressionReplanAfterUses(ClientContext& context,
+                                               SetScope scope,
+                                               Value& parameter)
+{
+  auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  if (!sirius_ctx) { return; }
+  auto& cfg                   = sirius_ctx->get_config().get_compression_config();
+  cfg.spill_replan_after_uses = static_cast<uint64_t>(UBigIntValue::Get(parameter));
+  PushSpillCompressionSettings(cfg);
+  SIRIUS_LOG_DEBUG("Updated spill_compression_replan_after_uses to {}",
+                   cfg.spill_replan_after_uses);
 }
 
 static void SetEnableDynamicFilterPushdown(ClientContext& context, SetScope scope, Value& parameter)
@@ -2360,6 +2374,16 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
     LogicalType::BIGINT,
     Value::BIGINT(20),
     SetSpillCompressionExploreBeamWidth);
+
+  config.AddExtensionOption(
+    "spill_compression_replan_after_uses",
+    "Re-run the explorer for an operator output edge after its cached plan has been used this "
+    "many times (0 = never re-explore). This also expires the 'compression is not worth it here' "
+    "verdict recorded when a batch misses compression_max_compressed_fraction, so an edge is "
+    "periodically re-tested rather than being written off for the whole query",
+    LogicalType::UBIGINT,
+    Value::UBIGINT(128),
+    SetSpillCompressionReplanAfterUses);
 
   config.AddExtensionOption(
     "enable_dynamic_filter_pushdown",

@@ -257,8 +257,17 @@ std::string resolve_or_explore_spill_plan(cudf::table_view table,
                                           const compression::spill_context& ctx,
                                           rmm::cuda_stream_view stream)
 {
-  auto& reg = compression::plan_register::global();
-  if (auto existing = reg.resolve_spill_plan(ctx.repo); existing.has_value()) { return *existing; }
+  using verdict = compression::plan_register::spill_plan_verdict;
+
+  auto& reg           = compression::plan_register::global();
+  const auto decision = reg.decide_spill_plan(ctx.repo, ctx.replan_after_uses);
+  if (decision.verdict == verdict::use) { return decision.dsl; }
+  if (decision.verdict == verdict::skip) {
+    // Compression was already judged not worth it for this edge. convertible_data_batch
+    // normally checks this before entering the converter, so reaching here means the
+    // entry changed underneath us; bail out cheaply to the uncompressed path.
+    throw std::runtime_error("[compression_converters] edge marked not worth compressing");
+  }
 
   nvtx3::scoped_range nvtx_range{"sirius::compression::explore_spill_plan"};
 
@@ -323,11 +332,21 @@ staged_compression compress_for_spill(cudf::table_view view,
   }
 
   // Reject a compressed form that saves too little; throwing here makes the
-  // caller spill uncompressed instead.
+  // caller spill uncompressed instead. Record the verdict against the edge so
+  // later batches skip the compress attempt altogether rather than repeating
+  // this work and discarding the result every time — until the entry expires
+  // and the edge is explored afresh.
   const std::size_t compressed_bytes = out.header.size() + out.payload_bytes;
   if (uncompressed_bytes > 0 &&
       static_cast<double>(compressed_bytes) >
         ctx.max_compressed_fraction * static_cast<double>(uncompressed_bytes)) {
+    compression::plan_register::global().mark_spill_plan_unviable(ctx.repo);
+    SIRIUS_LOG_DEBUG(
+      "[compression_converters] repo={} compressed {}B of {}B: below threshold; "
+      "marking edge not worth compressing",
+      static_cast<const void*>(ctx.repo),
+      compressed_bytes,
+      uncompressed_bytes);
     throw std::runtime_error("[compression_converters] compressed " +
                              std::to_string(compressed_bytes) + "B of " +
                              std::to_string(uncompressed_bytes) + "B original: below threshold");

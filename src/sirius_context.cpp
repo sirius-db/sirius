@@ -562,7 +562,8 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
     sirius::compression::set_spill_compression_settings(comp.enable_spill_compression,
                                                         comp.spill_explore_beam_width,
                                                         comp.spill_explore_max_bytes,
-                                                        comp.max_compressed_fraction);
+                                                        comp.max_compressed_fraction,
+                                                        comp.spill_replan_after_uses);
     sirius::set_decompress_column_threads(comp.column_threads);
   }
 

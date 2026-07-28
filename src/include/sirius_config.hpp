@@ -204,6 +204,19 @@ struct compression_config {
   /// are explored on a trimmed prefix so that the beam search stays within
   /// device memory. Default 256 MiB.
   std::size_t spill_explore_max_bytes{256ULL * 1024 * 1024};
+
+  /// Re-run the explorer for an operator output edge after its cached plan has
+  /// been used this many times. 0 = never re-explore (cache the first plan for
+  /// the rest of the query).
+  ///
+  /// Two things expire on this schedule: a plan that no longer suits the data
+  /// (distributions drift as a query progresses), and the "compression is not
+  /// worth it here" verdict recorded when a batch misses
+  /// `max_compressed_fraction`. Without expiry that verdict is permanent, so an
+  /// unrepresentative first batch could disable compression for an edge for the
+  /// whole query. The default amortizes one explore over many batches, which is
+  /// a small fraction of spill cost while still self-correcting.
+  std::uint64_t spill_replan_after_uses{128};
 };
 
 struct sirius_config {
