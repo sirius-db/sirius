@@ -94,6 +94,16 @@ class plan_register {
     std::string dsl;        ///< multi-column plan DSL for this edge
     bool viable{true};      ///< false once compression was judged not worth it
     std::uint64_t uses{0};  ///< spill attempts since this entry was installed
+
+    /// Effective re-explore interval for this edge. 0 = follow the configured
+    /// `spill_replan_after_uses`; non-zero once adaptive backoff has moved it.
+    std::uint64_t replan_interval{0};
+
+    // Bookkeeping describing the re-explore that installed this entry, consumed
+    // by conclude_spill_attempt() to decide whether to back off.
+    bool from_replan{false};   ///< this entry replaced an earlier one
+    bool plan_changed{false};  ///< ...and its DSL differs from that one's
+    bool prev_viable{true};    ///< ...and that one's viability
   };
 
   /// What the spill path should do for an edge.
@@ -113,6 +123,9 @@ class plan_register {
    *
    * @param replan_after_uses  Expire the entry once it has been used this many
    *                           times, forcing a fresh explore (0 = never expire).
+   *                           Used only while the entry is on the configured
+   *                           schedule; once adaptive backoff has moved the
+   *                           entry's own interval, that takes precedence.
    *
    * An expired entry yields `explore` regardless of its previous verdict, so a
    * plan that stopped paying off — or an edge wrongly judged unviable from an
@@ -122,11 +135,36 @@ class plan_register {
                                                       std::uint64_t replan_after_uses) const;
 
   /// Install a freshly explored plan for @p repo (resets viability and use count).
+  /// When this replaces an existing entry it records how the new plan compares to
+  /// the old one, for conclude_spill_attempt() to act on.
   void set_spill_plan(const cucascade::shared_data_repository* repo, std::string plan_dsl);
 
-  /// Record that compression is not worth it for @p repo. Keeps the DSL and the
-  /// use count, so the entry still expires on schedule and gets re-explored.
-  void mark_spill_plan_unviable(const cucascade::shared_data_repository* repo);
+  /**
+   * @brief Record how a spill attempt for @p repo turned out.
+   *
+   * @param compressed_ok  true when the compressed form was kept; false when it
+   *                       missed the size threshold or compression failed outright.
+   * @param base_interval  the configured `spill_replan_after_uses`.
+   *
+   * Sets viability — a false outcome is what makes later batches skip this edge.
+   *
+   * When the attempt followed a re-explore, this also adapts the edge's replan
+   * interval. Re-exploring costs a beam search per column, so it should only stay
+   * frequent while it is paying off:
+   *
+   *   - the cycle produced a *working change* (new plan, or viability recovered,
+   *     and the result compresses) → reset the interval to @p base_interval and
+   *     keep checking on schedule;
+   *   - anything else — the explorer returned the same plan, or the result still
+   *     misses the threshold → double the interval, so a stable or stubbornly
+   *     incompressible edge stops paying for explores it learns nothing from.
+   *
+   * Call exactly once per attempt that actually tried to compress (not for a
+   * skipped edge, which made no attempt to judge).
+   */
+  void conclude_spill_attempt(const cucascade::shared_data_repository* repo,
+                              bool compressed_ok,
+                              std::uint64_t base_interval);
 
   /// Count one spill attempt against @p repo's entry. Call exactly once per
   /// attempt, including attempts that were skipped or that failed — otherwise a

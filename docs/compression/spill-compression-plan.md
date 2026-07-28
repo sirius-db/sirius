@@ -49,6 +49,30 @@ unrepresentative early batch could disable compression for that edge permanently
 `uses` is counted once per spill attempt including skipped ones, so a skipped edge
 still ages toward its retry.
 
+### Adaptive replan backoff
+
+Re-exploring costs a beam search per column, so the interval is only worth holding
+at its configured value while re-exploring keeps paying off. Each entry carries its
+own `replan_interval`, seeded from `spill_replan_after_uses` and adapted after every
+re-explore cycle:
+
+| Re-explore outcome | Interval |
+| --- | --- |
+| Same plan, still compressing | doubled |
+| Same plan, still failing the threshold | doubled |
+| Different plan, still failing the threshold | doubled |
+| Different plan that compresses | reset to configured |
+| Same plan, but viability recovered | reset to configured |
+
+The rule is: reset only when the cycle produced a change that *actually compresses*;
+otherwise back off. A stable good plan and a stubbornly incompressible edge both stop
+paying for explores they learn nothing from, while an edge that is genuinely moving
+stays on the frequent schedule. Doubling saturates rather than wrapping.
+
+A hard compression failure (e.g. a plan that no longer fits the table) counts as a
+failed attempt for both viability and backoff — otherwise every later batch would
+repeat it and throw.
+
 ### On-first-spill explore
 
 When `convert()` fires and no spill plan exists for the source repo:

@@ -598,9 +598,9 @@ TEST_CASE("plan_register: decide_spill_plan verdicts", "[compression][plan_regis
   REQUIRE(d.verdict == verdict::use);
   REQUIRE(d.dsl == "some dsl");
 
-  // Marked unviable -> skip, but the DSL and use count are retained so the
+  // A failed attempt -> skip, but the DSL and use count are retained so the
   // entry still ages toward expiry.
-  reg.mark_spill_plan_unviable(&repo_a());
+  reg.conclude_spill_attempt(&repo_a(), /*compressed_ok=*/false, /*base_interval=*/0);
   REQUIRE(reg.decide_spill_plan(&repo_a(), 0).verdict == verdict::skip);
   REQUIRE(reg.resolve_spill_plan(&repo_a())->dsl == "some dsl");
 
@@ -620,6 +620,103 @@ TEST_CASE("plan_register: decide_spill_plan verdicts", "[compression][plan_regis
   reg.clear_all();
 }
 
+TEST_CASE("plan_register: replan interval backs off when a re-explore learns nothing",
+          "[compression][plan_register]")
+{
+  auto& reg                     = sirius::compression::plan_register::global();
+  constexpr std::uint64_t kBase = 8;
+  const std::string kPlan       = "plan one";
+  const std::string kOtherPlan  = "plan two";
+
+  auto interval_of = [&](const cucascade::shared_data_repository* r) {
+    return reg.resolve_spill_plan(r)->replan_interval;
+  };
+
+  SECTION("same plan, still working -> double")
+  {
+    reg.clear_all();
+    reg.set_spill_plan(&repo_a(), kPlan);
+    reg.conclude_spill_attempt(&repo_a(), true, kBase);  // first install: no backoff
+    REQUIRE(interval_of(&repo_a()) == 0);                // still on the configured schedule
+
+    reg.set_spill_plan(&repo_a(), kPlan);  // re-explore returned the same plan
+    reg.conclude_spill_attempt(&repo_a(), true, kBase);
+    REQUIRE(interval_of(&repo_a()) == kBase * 2);
+
+    reg.set_spill_plan(&repo_a(), kPlan);
+    reg.conclude_spill_attempt(&repo_a(), true, kBase);
+    REQUIRE(interval_of(&repo_a()) == kBase * 4);
+  }
+
+  SECTION("different plan that still fails the threshold -> double")
+  {
+    reg.clear_all();
+    reg.set_spill_plan(&repo_a(), kPlan);
+    reg.conclude_spill_attempt(&repo_a(), false, kBase);
+
+    reg.set_spill_plan(&repo_a(), kOtherPlan);            // explorer found something else...
+    reg.conclude_spill_attempt(&repo_a(), false, kBase);  // ...that still does not compress
+    REQUIRE(interval_of(&repo_a()) == kBase * 2);
+  }
+
+  SECTION("different plan that works -> reset to the configured interval")
+  {
+    reg.clear_all();
+    reg.set_spill_plan(&repo_a(), kPlan);
+    reg.conclude_spill_attempt(&repo_a(), true, kBase);
+    // Stretch the interval out first.
+    reg.set_spill_plan(&repo_a(), kPlan);
+    reg.conclude_spill_attempt(&repo_a(), true, kBase);
+    REQUIRE(interval_of(&repo_a()) == kBase * 2);
+
+    reg.set_spill_plan(&repo_a(), kOtherPlan);
+    reg.conclude_spill_attempt(&repo_a(), true, kBase);
+    REQUIRE(interval_of(&repo_a()) == kBase);
+  }
+
+  SECTION("viability recovering on the same plan -> reset")
+  {
+    reg.clear_all();
+    reg.set_spill_plan(&repo_a(), kPlan);
+    reg.conclude_spill_attempt(&repo_a(), false, kBase);  // not worth compressing
+    reg.set_spill_plan(&repo_a(), kPlan);
+    reg.conclude_spill_attempt(&repo_a(), false, kBase);  // still not — back off
+    REQUIRE(interval_of(&repo_a()) == kBase * 2);
+
+    // Same plan, but it now compresses: the edge recovered, so resume checking
+    // on schedule.
+    reg.set_spill_plan(&repo_a(), kPlan);
+    reg.conclude_spill_attempt(&repo_a(), true, kBase);
+    REQUIRE(interval_of(&repo_a()) == kBase);
+    REQUIRE(reg.resolve_spill_plan(&repo_a())->viable);
+  }
+
+  SECTION("a stretched interval overrides the configured one when deciding")
+  {
+    using verdict = sirius::compression::plan_register::spill_plan_verdict;
+    reg.clear_all();
+    reg.set_spill_plan(&repo_a(), kPlan);
+    reg.conclude_spill_attempt(&repo_a(), true, kBase);
+    reg.set_spill_plan(&repo_a(), kPlan);
+    reg.conclude_spill_attempt(&repo_a(), true, kBase);
+    REQUIRE(interval_of(&repo_a()) == kBase * 2);
+
+    for (std::uint64_t i = 0; i < kBase; ++i) {
+      reg.note_spill_plan_use(&repo_a());
+    }
+    // At the configured interval the entry would expire, but its own stretched
+    // interval has not elapsed yet.
+    REQUIRE(reg.decide_spill_plan(&repo_a(), kBase).verdict == verdict::use);
+
+    for (std::uint64_t i = 0; i < kBase; ++i) {
+      reg.note_spill_plan_use(&repo_a());
+    }
+    REQUIRE(reg.decide_spill_plan(&repo_a(), kBase).verdict == verdict::explore);
+  }
+
+  reg.clear_all();
+}
+
 TEST_CASE("plan_register: note_spill_plan_use on an absent edge is a no-op",
           "[compression][plan_register]")
 {
@@ -630,7 +727,7 @@ TEST_CASE("plan_register: note_spill_plan_use on an absent edge is a no-op",
   // otherwise age a plan that has not been installed yet.
   reg.note_spill_plan_use(&repo_a());
   REQUIRE_FALSE(reg.resolve_spill_plan(&repo_a()).has_value());
-  reg.mark_spill_plan_unviable(&repo_a());
+  reg.conclude_spill_attempt(&repo_a(), /*compressed_ok=*/false, /*base_interval=*/8);
   REQUIRE_FALSE(reg.resolve_spill_plan(&repo_a()).has_value());
 
   reg.clear_all();
