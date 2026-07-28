@@ -48,7 +48,6 @@
 #include <cudf/utilities/pinned_memory.hpp>
 
 #include <rmm/cuda_device.hpp>
-#include <rmm/detail/runtime_capabilities.hpp>
 
 #include <cuda_runtime_api.h>
 
@@ -816,32 +815,20 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
     }
   }
 
-  // Enable cuDF hardware (on-GPU) decompression when requested and supported by every GPU.
-  // rmm::detail::hwdecompress::is_supported() gates on the installed CUDA driver version; we probe
-  // it under each GPU's device context so a mixed fleet (any GPU without support) disables the
-  // feature. When supported everywhere we export LIBCUDF_HW_DECOMPRESSION=ON via an RAII env_guard
-  // held for the context lifetime, so cuDF's parquet reader routes supported codecs through the
-  // hardware decompression engine. get_hw_topology() is the only authorised GPU enumeration source.
-  if (config_.get_operator_params().use_hw_decompression) {
-    bool supported_on_all = topo.num_gpus > 0;
-    for (auto const& gpu : topo.gpus) {
-      rmm::cuda_set_device_raii dev_guard{rmm::cuda_device_id{static_cast<int>(gpu.id)}};
-      if (!rmm::detail::hwdecompress::is_supported()) {
-        supported_on_all = false;
-        SIRIUS_LOG_INFO(
-          "SiriusContext: GPU {} does not support hardware decompression; "
-          "LIBCUDF_HW_DECOMPRESSION will not be enabled",
-          gpu.id);
-        break;
-      }
-    }
-    if (supported_on_all) {
-      hw_decompression_env_guard_.emplace("LIBCUDF_HW_DECOMPRESSION", "ON");
-      SIRIUS_LOG_INFO(
-        "SiriusContext: hardware decompression supported on all {} GPU(s); "
-        "exported LIBCUDF_HW_DECOMPRESSION=ON",
-        topo.num_gpus);
-    }
+  // cucascade topology exposes hw-decompression availability as a runtime attribute populated
+  // only when discovery is asked to touch the CUDA driver. sirius_config seeds topology with
+  // with_runtime_attributes=true, so an unpopulated optional here is a real "not supported".
+  auto enable_hw_decompression =
+    config_.get_operator_params().use_hw_decompression && topo.num_gpus > 0 &&
+    std::all_of(topo.gpus.begin(), topo.gpus.end(), [](auto const& gpu) {
+      return gpu.runtime_attributes.has_value() && gpu.runtime_attributes->hw_decomp;
+    });
+  if (enable_hw_decompression) {
+    hw_decompression_env_guard_.emplace("LIBCUDF_HW_DECOMPRESSION", "ON");
+    SIRIUS_LOG_INFO(
+      "SiriusContext: hardware decompression supported on all {} GPU(s); "
+      "exported LIBCUDF_HW_DECOMPRESSION=ON",
+      topo.num_gpus);
   }
 
   // Configure cuDF to use our pinned slab allocator for small internal host buffers
