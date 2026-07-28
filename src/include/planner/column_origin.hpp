@@ -76,9 +76,16 @@ class column_origin_resolver {
   /// Resolve a single binding, or nullopt when it is not a base column.
   [[nodiscard]] std::optional<column_origin> lookup(const duckdb::ColumnBinding& b) const;
 
-  /// Follow an expression to a base column when it is a bare column reference.
+  /// Output bindings of @p op's first child, against which positional
+  /// (`BOUND_REF`) expressions are resolved.
+  [[nodiscard]] static std::vector<duckdb::ColumnBinding> child_output_bindings(
+    duckdb::LogicalOperator& op);
+
+  /// Follow an expression to a base column when it merely forwards one, whether
+  /// it does so by name (`BOUND_COLUMN_REF`) or by position (`BOUND_REF`, which
+  /// is what the already-resolved plans reaching Sirius actually contain).
   [[nodiscard]] std::optional<column_origin> resolve_expression(
-    const duckdb::Expression& expr) const;
+    const duckdb::Expression& expr, const std::vector<duckdb::ColumnBinding>& child_bindings) const;
 
   struct binding_hash {
     std::size_t operator()(const duckdb::ColumnBinding& b) const noexcept

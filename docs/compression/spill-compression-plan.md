@@ -349,29 +349,34 @@ holding the files (`<root>/lineitem/part.0.parquet` → `lineitem`) — the same
 useless and actively dangerous here: every file is `part.N.parquet`, and `part` is
 itself a TPC-H table.
 
-**Coverage is still far too low to build on.** Measured at SF100:
+**Coverage is now good.** Measured after fixing the two failures below:
 
 | Query | Columns at spilling edges | Resolved |
 | --- | --- | --- |
-| q21 | 47 | 2 (`lineitem.0`, `lineitem.2` — correct) |
-| `lineitem JOIN orders`, 3 projected columns | 3 | 0 |
+| `lineitem JOIN orders`, 3 projected columns | 15 | 15 (100%) |
+| q21 | 64 | 59 (92%) |
 
-The two q21 hits confirm `record_get` and the name derivation work end to end. What
-does not work is everything downstream: most edges report `cols=0`, meaning their
-source operator has an *empty* origins vector, and the ones that do carry a vector
-(e.g. the final 3-column projection above) have every entry nullopt.
+Two bugs had to be fixed to get there, both worth recording because neither was
+where the symptom pointed:
 
-So there are two separate failures still to diagnose, and both need doing before any
-of this is worth consuming:
+1. **The GPU scan dropped the lineage.** `insert_gpu_pipeline_operators` replaces the
+   table scan with a `sirius_gpu_scan_operator` built from scratch, which did not copy
+   `column_origins`. Since the scan is a *leaf*, `propagate_column_origins()` had
+   nothing to inherit from — so the loss at the leaf silently emptied the entire plan.
+   The symptom looked like propagation failing; the cause was one missing assignment
+   at the point where every origin enters the tree.
 
-1. `cols=0` edges — `wiring.source_op` is a pipeline sink inserted by the rewrites.
-   `propagate_column_origins()` is supposed to give it the child's origins but
-   evidently is not firing. Suspect the arity gate (`child->column_origins.size() ==
-   op.types.size()`) or that the sink's child is itself empty.
-2. `cols=N resolved=0` edges — the operator went through the dispatcher but none of
-   its bindings were in the map. Suspect a mismatch between the bindings recorded
-   during `resolve()` (pre-`ColumnBindingResolver`) and those returned by
-   `GetColumnBindings()` during `create_plan` (post-resolution).
+2. **Expressions arrive already binding-resolved.** The plan Sirius receives has been
+   through `ColumnBindingResolver` *upstream*, so a pass-through projection column is a
+   positional `BOUND_REF` into the child's output, not a named `BOUND_COLUMN_REF`.
+   Moving our walk earlier in `create_plan` (as an earlier revision of this document
+   advised) does not help and was based on a wrong assumption. `resolve_expression`
+   now handles both forms, mapping a position back through the child's bindings.
+   `LogicalGet` had masked this: it reads `column_ids` directly and never looks at an
+   expression, so scans resolved while everything above them missed.
+
+The remaining ~8% on q21 are genuinely computed columns — aggregate results and
+expressions — which have no single base column by definition.
 
 Only once coverage is real does the rest follow: seed `plan_register` from the origins
 (and decouple `input_plan_dir` loading from `enable_pin_table_compression`, which

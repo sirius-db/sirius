@@ -250,6 +250,12 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> make_gpu_scan_leaf(
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> leaf =
     duckdb::make_uniq<sirius::op::scan::sirius_gpu_scan_operator>(
       scan.types, scan.estimated_cardinality, std::move(ingestible));
+  // The GPU scan replaces the table scan wholesale, so it must carry over the
+  // base-table lineage the plan generator resolved. This is where every origin
+  // enters the tree — the scan is a leaf, so propagate_column_origins() has
+  // nothing to inherit from if it is dropped here, and the whole plan resolves
+  // to nothing.
+  leaf->column_origins = scan.column_origins;
 
   if (dynamic_filters) {
     // Under a PARTITION parent this emits the [GPU_SCAN, DYNAMIC_FILTER] pipeline (filter as
@@ -260,6 +266,7 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> make_gpu_scan_leaf(
       std::move(dynamic_filters),
       op_params.dynamic_filter_keep_threshold,
       mode);
+    dynamic_filter_op->column_origins = scan.column_origins;
     dynamic_filter_op->children.push_back(std::move(leaf));
     leaf = std::move(dynamic_filter_op);
   }

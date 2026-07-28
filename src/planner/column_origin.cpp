@@ -19,6 +19,7 @@
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/common/multi_file/multi_file_states.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
+#include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
@@ -106,11 +107,12 @@ void column_origin_resolver::record_get(duckdb::LogicalOperator& op)
 
 void column_origin_resolver::record_projection(duckdb::LogicalOperator& op)
 {
-  auto& proj = op.Cast<duckdb::LogicalProjection>();
+  auto& proj                = op.Cast<duckdb::LogicalProjection>();
+  const auto child_bindings = child_output_bindings(op);
   for (duckdb::idx_t i = 0; i < proj.expressions.size(); ++i) {
     // A projection that merely forwards a column keeps its origin; anything
     // computed (arithmetic, a cast, a function) does not have one.
-    if (auto origin = resolve_expression(*proj.expressions[i])) {
+    if (auto origin = resolve_expression(*proj.expressions[i], child_bindings)) {
       _origins[duckdb::ColumnBinding(proj.table_index, i)] = *origin;
     }
   }
@@ -122,18 +124,42 @@ void column_origin_resolver::record_aggregate(duckdb::LogicalOperator& op)
   // Group keys are usually plain column references and keep their origin. The
   // aggregate results (sums, counts) are new values with no base column, so they
   // are simply left unrecorded.
+  const auto child_bindings = child_output_bindings(op);
   for (duckdb::idx_t i = 0; i < agg.groups.size(); ++i) {
-    if (auto origin = resolve_expression(*agg.groups[i])) {
+    if (auto origin = resolve_expression(*agg.groups[i], child_bindings)) {
       _origins[duckdb::ColumnBinding(agg.group_index, i)] = *origin;
     }
   }
 }
 
-std::optional<column_origin> column_origin_resolver::resolve_expression(
-  const duckdb::Expression& expr) const
+std::vector<duckdb::ColumnBinding> column_origin_resolver::child_output_bindings(
+  duckdb::LogicalOperator& op)
 {
-  if (expr.GetExpressionType() != duckdb::ExpressionType::BOUND_COLUMN_REF) { return std::nullopt; }
-  return lookup(expr.Cast<duckdb::BoundColumnRefExpression>().binding);
+  if (op.children.empty() || !op.children[0]) { return {}; }
+  return op.children[0]->GetColumnBindings();
+}
+
+std::optional<column_origin> column_origin_resolver::resolve_expression(
+  const duckdb::Expression& expr, const std::vector<duckdb::ColumnBinding>& child_bindings) const
+{
+  switch (expr.GetExpressionType()) {
+    case duckdb::ExpressionType::BOUND_COLUMN_REF:
+      return lookup(expr.Cast<duckdb::BoundColumnRefExpression>().binding);
+
+    case duckdb::ExpressionType::BOUND_REF: {
+      // The plan reaching Sirius has already been binding-resolved, so a
+      // pass-through column arrives as a *positional* reference into the child's
+      // output rather than as a named binding. Map the position back through the
+      // child's bindings to reach the base column.
+      const auto index = expr.Cast<duckdb::BoundReferenceExpression>().index;
+      if (index >= child_bindings.size()) { return std::nullopt; }
+      return lookup(child_bindings[index]);
+    }
+
+    default:
+      // Computed: arithmetic, cast, function call. No single base column.
+      return std::nullopt;
+  }
 }
 
 std::optional<column_origin> column_origin_resolver::lookup(const duckdb::ColumnBinding& b) const
