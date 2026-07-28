@@ -449,7 +449,7 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
   auto enable_hw_decompression =
     config_.get_operator_params().use_hw_decompression &&
     std::all_of(topo.gpus.begin(), topo.gpus.end(), [](auto const& gpu) {
-      return gpu.hw_decompression_supported;
+      return gpu.hw_decompression_available;
     });
   if (enable_hw_decompression) {
     hw_decompression_env_guard_.emplace("LIBCUDF_HW_DECOMPRESSION", "ON");
