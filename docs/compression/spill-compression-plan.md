@@ -250,6 +250,83 @@ Port and rewrite `test/cpp/compression/test_spill_compression.cpp` from `compres
 
 ## Future / deferred
 
+### MEASURED: exploration dominates, and spill compression is a large net loss
+
+First benchmark, TPC-H q21 at SF100 on a 12 GB card with `usage_limit_fraction: 0.5`
+(configs: `test/tpch_performance/spill_compression_{on,off}.yaml`, driver:
+`run_spill_ab.sh`):
+
+| Arm | Wall clock (2 iterations) |
+| --- | --- |
+| spill compression off | **14.7 s** |
+| spill compression on | **68.3 s** (4.6x slower) |
+
+nsys on the same query (1 iteration) attributes it unambiguously:
+
+| NVTX range | Total | Instances | Share of query |
+| --- | --- | --- | --- |
+| `sirius::query` | 23.45 s | 1 | — |
+| `compression::gpu_to_host_compress` | 18.0685 s | 14 | 77% |
+| ↳ `compression::explore_spill_plan` | 18.0682 s | 14 | 77% |
+| `simpatico::compress_column` | 4.87 s | 59,739 | (inside explore) |
+
+**Exploration is 99.998% of the compress path** — of 18.0685 s spent in the converter,
+actual compression is 0.35 ms. Average explore is 1.29 s per invocation, worst 3.34 s.
+The 59,739 `compress_column` calls are the beam search's internal trials.
+
+Two distinct problems, both needing a fix before this feature is worth enabling:
+
+**1. The explorer needs GPU memory exactly when the GPU is full.** The run logged 2,430
+`simpatico::codegen: cpp encode: exception: std::bad_alloc` — the beam search allocating
+for trial encodes during a downgrade, i.e. while the GPU is by definition out of memory.
+Of 42 spill attempts, 1 produced a compressed batch and 41 fell back. We paid full
+exploration cost for almost no compression. Plausible directions: explore on a small
+sampled copy taken before pressure, explore off the critical path (background, or at
+first-touch rather than first-spill), reserve a scratch arena for exploration, or drop
+the in-query explorer in favour of pre-generated per-schema plans.
+
+**2. A failed exploration is not memoized, so every spill repeats it.**
+`resolve_or_explore_spill_plan` throws when the explorer fails, and it throws *before*
+`set_spill_plan` has created the register entry. `conclude_spill_attempt` then finds no
+entry and returns early, so no error streak accumulates and the edge is never written
+off — the `outcome_guard` is not even constructed yet. Every subsequent spill from that
+edge re-runs the full beam search and fails again: 41 times in this query alone. The
+existing memoization covers a failing *compression* but not a failing *exploration*,
+which is the far more expensive case. Fix: record the attempt against the edge before
+exploring, or install a placeholder entry so failures have somewhere to accumulate.
+
+Until both are addressed, `spill_compression` should stay off by default (it is).
+
+### Tune the explorer for use during query execution
+
+The explorer's defaults were chosen for offline plan generation, where a long beam
+search is amortized over every future query. On the spill path it runs *inside* a
+query, under memory pressure, on the downgrade thread — a completely different cost
+model. The current spill defaults (`beam_width` 20 vs the offline 100,
+`max_explore_bytes` 256 MiB) are a guess, not a measurement.
+
+What needs establishing, from a TPC-H sweep at a scale factor that forces spilling:
+
+- **What does exploration actually cost?** Wall-clock per column, and as a share of
+  total query time. `explore_spill_plan` is already an NVTX range, so nsys can
+  attribute it directly.
+- **How does beam width trade off?** Narrower is faster but finds worse plans; the
+  right point is where the compression it gives up costs more spill bandwidth than
+  the search saves.
+- **Is `max_explore_bytes` doing useful work?** It trims large columns to a prefix.
+  Too small and the plan is chosen from unrepresentative data (the explorer's own
+  docs warn that prefix sampling misleads badly on sorted columns); too large and
+  the search allocates heavily at the worst possible moment.
+- **Does `sample_rows` help here?** Unused so far. It is the explorer's cheaper
+  approximation, with the same caveat about sorted/monotonic columns.
+- **Are the defaults for `spill_replan_after_uses` (128) and
+  `spill_replan_change_threshold` (0.20) sane?** Both were reasoned about rather
+  than measured. The replan interval only matters if exploration is expensive
+  enough to be worth amortizing — which the same profile answers.
+
+The end state is defaults backed by numbers, and a note in this document on which
+workload shapes they suit.
+
 ### Test the config → converter-global plumbing
 
 The spill tests call `set_spill_compression_settings()` directly, so they exercise

@@ -1,0 +1,35 @@
+sirius:
+  topology:
+    num_gpus: 1
+  memory:
+    gpu:
+      # Deliberately small so SF100 forces the downgrade executor to spill.
+      usage_limit_fraction: 0.5
+      reservation_limit_fraction: 1.0
+    host:
+      capacity_bytes: 32000000000
+      initial_number_pools: 10
+      pool_size: 512
+      block_size: 1048576
+  executor:
+    pipeline:
+      num_threads: 4
+    task_creator:
+      num_threads: 2
+    downgrade:
+      num_threads: 1
+      monitor_period: 10ms
+  operator_params:
+    scan_task_batch_size: 100000000
+    max_sort_partition_bytes: 0
+    hash_partition_bytes: 100000000
+    concat_batch_bytes: 100000000
+    max_build_hash_table_bytes: 90000000
+  compression:
+    # Pin-table compression is a separate feature; off in BOTH arms so the
+    # comparison isolates the spill path.
+    enable_pin_table_compression: false
+    min_batch_size_bytes: 0
+    max_compressed_fraction: 0.75
+    column_threads: 4
+    enable_spill_compression: false
