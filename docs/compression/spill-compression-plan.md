@@ -342,21 +342,41 @@ Two ordering constraints, both learned the hard way:
   and lets a pass-through operator inherit its child's origins, gated on matching
   output arity.
 
-**Not yet working for parquet scans.** `LogicalGet::GetTable()` returns null for
-`read_parquet`, which is a table function rather than a catalog table, so nothing
-seeds and every column resolves to nullopt. Verified on TPC-H q21 at SF100: 47
-columns reach the spilling edges, 0 resolved. The base-table (`seq_scan`) path
-should work, but was not exercised — there is no SF100 `.duckdb` dataset locally.
+**Parquet scans are now named**, via `table_name_from_files()`: `read_parquet` is a
+table function with no catalog entry, so the table identity comes from the directory
+holding the files (`<root>/lineitem/part.0.parquet` → `lineitem`) — the same layout
+`pin_table(name=…)` is given, and the key the pin plans use. Note the *file* stem is
+useless and actively dangerous here: every file is `part.N.parquet`, and `part` is
+itself a TPC-H table.
 
-Next step is to give the parquet path a table identity. The pin path already solves
-the same problem: `pin_table(..., name=<table>)` names the table explicitly, and
-`build_parquet_table_info` pulls `resolved_file_paths` out of `MultiFileBindData`.
-Deriving the name from the file path (`.../lineitem/*.parquet` → `lineitem`) matches
-the convention the pin plans are keyed by.
+**Coverage is still far too low to build on.** Measured at SF100:
 
-Still to do after that: seed `plan_register` from the origins (and decouple
-`input_plan_dir` loading from `enable_pin_table_compression`, which currently gates
-it), then stagger exploration so at most one column is explored per spill.
+| Query | Columns at spilling edges | Resolved |
+| --- | --- | --- |
+| q21 | 47 | 2 (`lineitem.0`, `lineitem.2` — correct) |
+| `lineitem JOIN orders`, 3 projected columns | 3 | 0 |
+
+The two q21 hits confirm `record_get` and the name derivation work end to end. What
+does not work is everything downstream: most edges report `cols=0`, meaning their
+source operator has an *empty* origins vector, and the ones that do carry a vector
+(e.g. the final 3-column projection above) have every entry nullopt.
+
+So there are two separate failures still to diagnose, and both need doing before any
+of this is worth consuming:
+
+1. `cols=0` edges — `wiring.source_op` is a pipeline sink inserted by the rewrites.
+   `propagate_column_origins()` is supposed to give it the child's origins but
+   evidently is not firing. Suspect the arity gate (`child->column_origins.size() ==
+   op.types.size()`) or that the sink's child is itself empty.
+2. `cols=N resolved=0` edges — the operator went through the dispatcher but none of
+   its bindings were in the map. Suspect a mismatch between the bindings recorded
+   during `resolve()` (pre-`ColumnBindingResolver`) and those returned by
+   `GetColumnBindings()` during `create_plan` (post-resolution).
+
+Only once coverage is real does the rest follow: seed `plan_register` from the origins
+(and decouple `input_plan_dir` loading from `enable_pin_table_compression`, which
+currently gates it), then stagger exploration so at most one column is explored per
+spill.
 
 ### Tune the explorer for use during query execution
 
