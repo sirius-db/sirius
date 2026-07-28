@@ -23,9 +23,10 @@
 
 #include "sirius_context.hpp"
 
+#include <cudf/types.hpp>
+
 #include <catch.hpp>
 #include <compression/compressed_representation.hpp>
-#include <cudf/types.hpp>
 #include <duckdb.hpp>
 #include <scan_manager/sirius_scan_manager.hpp>
 #include <utils/transparent_execution_test_utils.hpp>
