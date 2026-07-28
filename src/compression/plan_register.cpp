@@ -71,7 +71,7 @@ plan_register::spill_plan_decision plan_register::decide_spill_plan(
 {
   std::shared_lock lock(_mutex);
   auto it = _spill_plans.find(repo);
-  if (it == _spill_plans.end() || it->second.dsl.empty()) {
+  if (it == _spill_plans.end() || it->second.columns.empty()) {
     return {spill_plan_verdict::explore, {}};
   }
 
@@ -83,66 +83,91 @@ plan_register::spill_plan_decision plan_register::decide_spill_plan(
   const std::uint64_t period =
     state.replan_interval != 0 ? state.replan_interval : replan_after_uses;
   if (period > 0 && state.uses >= period) { return {spill_plan_verdict::explore, {}}; }
-  if (!state.viable) { return {spill_plan_verdict::skip, {}}; }
-  return {spill_plan_verdict::use, state.dsl};
+
+  // Nothing here compresses, so there is no point paying to find out again.
+  // A partially viable edge still proceeds: its viable columns are compressed and
+  // the rest stored raw.
+  if (state.viable_count() == 0) { return {spill_plan_verdict::skip, {}}; }
+  return {spill_plan_verdict::use, state.columns};
 }
 
 void plan_register::set_spill_plan(const cucascade::shared_data_repository* repo,
-                                   std::string plan_dsl)
+                                   std::vector<std::string> per_column_dsl)
 {
   std::unique_lock lock(_mutex);
 
   spill_plan_state fresh;
-  fresh.dsl = std::move(plan_dsl);
+  fresh.columns.reserve(per_column_dsl.size());
+  for (auto& dsl : per_column_dsl) {
+    fresh.columns.push_back(column_plan_state{std::move(dsl), /*viable=*/true, /*errors=*/0});
+  }
 
   // Replacing an entry means this is a re-explore: carry the current backoff
   // interval and remember what we are replacing, so conclude_spill_attempt can
   // tell whether the explore actually changed anything.
   if (auto it = _spill_plans.find(repo); it != _spill_plans.end()) {
-    fresh.from_replan     = true;
-    fresh.plan_changed    = it->second.dsl != fresh.dsl;
-    fresh.prev_viable     = it->second.viable;
-    fresh.replan_interval = it->second.replan_interval;
+    const auto& prev   = it->second;
+    fresh.from_replan  = true;
+    fresh.plan_changed = prev.columns.size() != fresh.columns.size() ||
+                         !std::equal(prev.columns.begin(),
+                                     prev.columns.end(),
+                                     fresh.columns.begin(),
+                                     [](const column_plan_state& a, const column_plan_state& b) {
+                                       return a.dsl == b.dsl;
+                                     });
+    fresh.prev_viable_count = prev.viable_count();
+    fresh.replan_interval   = prev.replan_interval;
   }
 
   _spill_plans[repo] = std::move(fresh);
 }
 
 void plan_register::conclude_spill_attempt(const cucascade::shared_data_repository* repo,
-                                           spill_attempt_outcome outcome,
+                                           std::span<const spill_attempt_outcome> per_column,
                                            std::uint64_t base_interval,
                                            std::uint32_t error_tolerance)
 {
   // Saturate rather than wrap when doubling; at this point the edge is
   // effectively never re-explored again, which is the intent.
   constexpr std::uint64_t max_interval = std::numeric_limits<std::uint64_t>::max() / 2;
+  const std::uint32_t tolerance        = std::max<std::uint32_t>(error_tolerance, 1);
 
   std::unique_lock lock(_mutex);
   auto it = _spill_plans.find(repo);
   if (it == _spill_plans.end()) { return; }
   auto& state = it->second;
 
-  if (outcome == spill_attempt_outcome::failed) {
-    // An exception is not evidence about the data — spilling runs under memory
-    // pressure, so this may well be a transient allocation failure. Absorb it
-    // and leave viability, the replan interval and any pending replan
-    // comparison alone until the failures prove durable.
-    ++state.consecutive_errors;
-    if (state.consecutive_errors < std::max<std::uint32_t>(error_tolerance, 1)) { return; }
+  // An empty span means the attempt died before any column could be judged;
+  // treat every column as having errored.
+  bool any_measured = false;
+  for (std::size_t i = 0; i < state.columns.size(); ++i) {
+    auto& col          = state.columns[i];
+    const auto outcome = i < per_column.size() ? per_column[i] : spill_attempt_outcome::failed;
+
+    if (outcome == spill_attempt_outcome::failed) {
+      // Not evidence about this column's data — absorb it until it proves durable.
+      ++col.consecutive_errors;
+      if (col.consecutive_errors < tolerance) { continue; }
+      col.viable = false;
+    } else {
+      col.viable   = outcome == spill_attempt_outcome::compressed;
+      any_measured = true;
+    }
+    col.consecutive_errors = 0;
   }
 
-  const bool compressed_ok = outcome == spill_attempt_outcome::compressed;
-  state.consecutive_errors = 0;
-
-  if (state.from_replan) {
+  // Only conclude a pending re-explore once something was actually measured;
+  // an all-errors attempt has not judged the new plans yet.
+  if (state.from_replan && any_measured) {
     const std::uint64_t current =
       state.replan_interval != 0 ? state.replan_interval : base_interval;
+    const std::size_t now_viable = state.viable_count();
 
-    // Only a change that actually compresses is worth staying on schedule for.
-    // Same plan, or a new plan that still misses the threshold, teaches us
-    // nothing — back off so we stop paying for fruitless explores.
-    const bool changed = state.plan_changed || (compressed_ok != state.prev_viable);
-    if (changed && compressed_ok) {
+    // Only a change that actually compresses something is worth staying on
+    // schedule for. The same plans, or plans that still compress nothing, teach
+    // us nothing — back off so we stop paying for fruitless explores.
+    const bool changed = state.plan_changed || now_viable != state.prev_viable_count;
+    if (changed && now_viable > 0) {
       state.replan_interval = base_interval;
     } else if (current > 0) {
       state.replan_interval = current > max_interval / 2 ? max_interval : current * 2;
@@ -151,8 +176,6 @@ void plan_register::conclude_spill_attempt(const cucascade::shared_data_reposito
     state.from_replan  = false;
     state.plan_changed = false;
   }
-
-  state.viable = compressed_ok;
 }
 
 void plan_register::note_spill_plan_use(const cucascade::shared_data_repository* repo)
@@ -173,7 +196,7 @@ std::optional<plan_register::spill_plan_state> plan_register::resolve_spill_plan
 {
   std::shared_lock lock(_mutex);
   auto it = _spill_plans.find(repo);
-  if (it != _spill_plans.end() && !it->second.dsl.empty()) { return it->second; }
+  if (it != _spill_plans.end() && !it->second.columns.empty()) { return it->second; }
   return std::nullopt;
 }
 

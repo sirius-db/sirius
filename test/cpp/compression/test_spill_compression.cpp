@@ -148,6 +148,37 @@ cucascade::shared_data_repository& repo_b()
   return r;
 }
 
+// ── Single-column shorthands ─────────────────────────────────────────────────
+//
+// The register tracks plans and verdicts per column; every batch these tests
+// build has exactly one column, so these wrap the vector/span API.
+
+void set_plan_1col(const cucascade::shared_data_repository* repo, std::string dsl)
+{
+  sirius::compression::plan_register::global().set_spill_plan(
+    repo, std::vector<std::string>{std::move(dsl)});
+}
+
+void conclude_1col(const cucascade::shared_data_repository* repo,
+                   sirius::compression::plan_register::spill_attempt_outcome outcome,
+                   std::uint64_t base_interval,
+                   std::uint32_t error_tolerance)
+{
+  const std::array outcomes{outcome};
+  sirius::compression::plan_register::global().conclude_spill_attempt(
+    repo, outcomes, base_interval, error_tolerance);
+}
+
+/// The first (only) column's cached state.
+sirius::compression::plan_register::column_plan_state col0_of(
+  const cucascade::shared_data_repository* repo)
+{
+  auto state = sirius::compression::plan_register::global().resolve_spill_plan(repo);
+  REQUIRE(state.has_value());
+  REQUIRE_FALSE(state->columns.empty());
+  return state->columns[0];
+}
+
 /// Reset spill state: clear every cached plan and enable spill compression with
 /// a small explorer budget (the explore case is the only one that runs it).
 void reset_spill_state(bool enabled = true, std::uint64_t replan_after_uses = 0)
@@ -170,6 +201,36 @@ std::shared_ptr<cucascade::data_batch> make_int32_gpu_batch(std::size_t n = 1000
   std::iota(vals.begin(), vals.end(), 0);
   return sirius::test::operator_utils::make_numeric_batch(
     *env().gpu_space, vals, cudf::type_id::INT32);
+}
+
+/// Create a 2-column INT32 GPU batch, both columns holding [0, 1, ..., n-1].
+/// Used to check that per-column verdicts are independent: the columns carry the
+/// same data, so any difference in outcome comes from their differing plans.
+std::shared_ptr<cucascade::data_batch> make_int32_gpu_batch_2col(std::size_t n)
+{
+  auto& space     = *env().gpu_space;
+  auto mr         = sirius::test::operator_utils::get_resource_ref(space);
+  auto stream     = sirius::test::operator_utils::default_stream();
+  const auto size = static_cast<cudf::size_type>(n);
+
+  std::vector<int32_t> vals(n);
+  std::iota(vals.begin(), vals.end(), 0);
+
+  std::vector<std::unique_ptr<cudf::column>> cols;
+  for (int c = 0; c < 2; ++c) {
+    auto col = cudf::make_numeric_column(
+      cudf::data_type{cudf::type_id::INT32}, size, cudf::mask_state::UNALLOCATED, stream, mr);
+    cudaMemcpy(col->mutable_view().data<int32_t>(),
+               vals.data(),
+               sizeof(int32_t) * vals.size(),
+               cudaMemcpyHostToDevice);
+    cols.push_back(std::move(col));
+  }
+
+  auto table = std::make_unique<cudf::table>(std::move(cols));
+  auto repr =
+    std::make_unique<cucascade::gpu_table_representation>(std::move(table), space, stream);
+  return cucascade::data_batch::make(sirius::get_next_batch_id(), std::move(repr));
 }
 
 /// Sum the first column of a gpu_table_representation as int64.
@@ -244,7 +305,7 @@ TEST_CASE("spill compression: GPU->compressed_host roundtrip",
 
   auto& e = env();
   reset_spill_state();
-  sirius::compression::plan_register::global().set_spill_plan(&repo_a(), kOneColDsl);
+  set_plan_1col(&repo_a(), kOneColDsl);
 
   const std::size_t n = 5000;
   auto batch          = make_int32_gpu_batch(n);
@@ -273,7 +334,7 @@ TEST_CASE("spill compression: GPU->compressed_disk roundtrip",
   }
 
   reset_spill_state();
-  sirius::compression::plan_register::global().set_spill_plan(&repo_a(), kOneColDsl);
+  set_plan_1col(&repo_a(), kOneColDsl);
 
   const std::size_t n = 5000;
   auto batch          = make_int32_gpu_batch(n);
@@ -310,7 +371,7 @@ TEST_CASE("spill compression: compressed_host->compressed_disk blob flush",
   }
 
   reset_spill_state();
-  sirius::compression::plan_register::global().set_spill_plan(&repo_a(), kOneColDsl);
+  set_plan_1col(&repo_a(), kOneColDsl);
 
   const std::size_t n = 5000;
   auto batch          = make_int32_gpu_batch(n);
@@ -368,11 +429,12 @@ TEST_CASE("spill compression: first spill from an edge explores and caches a pla
   spill_to(batch, e.host_space, &repo_b());
   REQUIRE(is_compressed_host(*batch));
 
-  // The explored plan is now cached for this edge and non-empty.
+  // The explored plan is now cached for this edge, one entry per column.
   auto discovered = reg.resolve_spill_plan(&repo_b());
   REQUIRE(discovered.has_value());
-  REQUIRE_FALSE(discovered->dsl.empty());
-  REQUIRE(discovered->viable);
+  REQUIRE(discovered->columns.size() == 1);
+  REQUIRE_FALSE(discovered->columns[0].dsl.empty());
+  REQUIRE(discovered->columns[0].viable);
 
   // A different edge is unaffected — plans are per-edge, not global.
   REQUIRE_FALSE(reg.resolve_spill_plan(&repo_a()).has_value());
@@ -387,7 +449,7 @@ TEST_CASE("spill compression: first spill from an edge explores and caches a pla
 
   auto after = reg.resolve_spill_plan(&repo_b());
   REQUIRE(after.has_value());
-  REQUIRE(after->dsl == discovered->dsl);
+  REQUIRE(after->columns[0].dsl == discovered->columns[0].dsl);
   // ...and each spill attempt is counted against the entry.
   REQUIRE(after->uses > discovered->uses);
 
@@ -407,7 +469,7 @@ TEST_CASE("spill compression: disabled setting spills uncompressed",
   auto& e = env();
   reset_spill_state(/*enabled=*/false);
   // A plan exists for the edge, but the feature is off.
-  sirius::compression::plan_register::global().set_spill_plan(&repo_a(), kOneColDsl);
+  set_plan_1col(&repo_a(), kOneColDsl);
 
   auto batch = make_int32_gpu_batch(1000);
 
@@ -442,7 +504,39 @@ TEST_CASE("spill compression: batch with no source edge spills uncompressed",
   reset_spill_state(false);
 }
 
-TEST_CASE("spill compression: column-count mismatch falls back without throwing",
+TEST_CASE("spill compression: a cached plan for a different column count is re-explored",
+          "[compression][spill][isolated_context]")
+{
+  if (!has_gpu()) {
+    SUCCEED("No GPU available — skipping spill compression tests");
+    return;
+  }
+
+  auto& e   = env();
+  auto& reg = sirius::compression::plan_register::global();
+  reset_spill_state();
+  // Two per-column plans cached against a 1-column batch: the entry describes a
+  // different schema, so it must be discarded and the edge explored afresh
+  // rather than applied blindly (which would throw inside Simpatico).
+  reg.set_spill_plan(&repo_a(), std::vector<std::string>{kOneColDsl, kOneColDsl});
+
+  const std::size_t n = 5000;
+  auto batch          = make_int32_gpu_batch(n);
+
+  sirius::convertible_data_batch w(batch, &repo_a());
+  REQUIRE_NOTHROW(w.convert({e.host_space}, e.stream(), *e.mgr, true));
+
+  // The stale entry was replaced by one matching this schema, and the batch
+  // compressed under the fresh plan.
+  REQUIRE(is_compressed_host(*batch));
+  REQUIRE(reg.resolve_spill_plan(&repo_a())->columns.size() == 1);
+
+  require_restores_to(batch, &repo_a(), expected_sum_of(n));
+
+  reset_spill_state(false);
+}
+
+TEST_CASE("spill compression: a plan that fails to compress falls back without throwing",
           "[compression][spill][isolated_context]")
 {
   if (!has_gpu()) {
@@ -452,9 +546,9 @@ TEST_CASE("spill compression: column-count mismatch falls back without throwing"
 
   auto& e = env();
   reset_spill_state();
-  // 2-column plan against a 1-column batch: Simpatico throws inside the
-  // converter, which must not escape convert().
-  sirius::compression::plan_register::global().set_spill_plan(&repo_a(), kTwoColDsl);
+  // Right column count, but the plan names an operator that does not exist, so
+  // compress_column fails. The exception must not escape convert().
+  set_plan_1col(&repo_a(), "input -> no_such_operator\n");
 
   auto batch = make_int32_gpu_batch(1000);
 
@@ -463,6 +557,10 @@ TEST_CASE("spill compression: column-count mismatch falls back without throwing"
 
   REQUIRE_FALSE(is_compressed_host(*batch));
   REQUIRE(get_tier(*batch) == cucascade::memory::Tier::HOST);
+
+  // With error_tolerance 1 the failure is durable, so the column is written off
+  // and the next batch skips compression instead of failing again.
+  REQUIRE_FALSE(col0_of(&repo_a()).viable);
 
   reset_spill_state(false);
 }
@@ -484,13 +582,63 @@ TEST_CASE("spill compression: poor compression ratio falls back to uncompressed"
                                                       /*replan_after_uses=*/0,
                                                       /*error_tolerance=*/1);
   // A plan whose output is the same width as its input cannot reach 0.75.
-  sirius::compression::plan_register::global().set_spill_plan(&repo_a(), kNonCompressingDsl);
+  set_plan_1col(&repo_a(), kNonCompressingDsl);
 
   auto batch = make_int32_gpu_batch(1000);
 
   spill_to(batch, e.host_space, &repo_a());
   REQUIRE_FALSE(is_compressed_host(*batch));
   REQUIRE(get_tier(*batch) == cucascade::memory::Tier::HOST);
+
+  reset_spill_state(false);
+}
+
+// ── Per-column verdicts ──────────────────────────────────────────────────────
+
+TEST_CASE("spill compression: one incompressible column does not disable its neighbours",
+          "[compression][spill][isolated_context]")
+{
+  if (!has_gpu()) {
+    SUCCEED("No GPU available — skipping spill compression tests");
+    return;
+  }
+
+  auto& e   = env();
+  auto& reg = sirius::compression::plan_register::global();
+  reg.clear_all();
+  sirius::compression::set_spill_compression_settings(true,
+                                                      /*explore_beam_width=*/4,
+                                                      /*explore_max_bytes=*/8ull << 20,
+                                                      /*max_compressed_fraction=*/0.75,
+                                                      /*replan_after_uses=*/0,
+                                                      /*error_tolerance=*/1);
+
+  // Two identical columns: one bitpacks well, the other is given a plan that
+  // cannot shrink it. Same data, so the outcome difference is purely the plan.
+  const std::size_t n = 5000;
+  auto batch          = make_int32_gpu_batch_2col(n);
+  reg.set_spill_plan(&repo_a(), std::vector<std::string>{kOneColDsl, kNonCompressingDsl});
+
+  spill_to(batch, e.host_space, &repo_a());
+  REQUIRE(is_compressed_host(*batch));
+
+  // Each column is judged on its own bytes: the bitpacked one stays viable, the
+  // other is written off. Previously either verdict would have applied to both.
+  auto state = reg.resolve_spill_plan(&repo_a());
+  REQUIRE(state->columns.size() == 2);
+  REQUIRE(state->columns[0].viable);
+  REQUIRE_FALSE(state->columns[1].viable);
+
+  // The edge is still worth compressing overall, so it is not skipped.
+  REQUIRE(reg.decide_spill_plan(&repo_a(), 0).verdict ==
+          sirius::compression::plan_register::spill_plan_verdict::use);
+
+  // The next batch compresses column 0 and stores column 1 raw; the data still
+  // round-trips intact.
+  auto batch2 = make_int32_gpu_batch_2col(n);
+  spill_to(batch2, e.host_space, &repo_a());
+  REQUIRE(is_compressed_host(*batch2));
+  require_restores_to(batch2, &repo_a(), expected_sum_of(n));
 
   reset_spill_state(false);
 }
@@ -514,18 +662,16 @@ TEST_CASE("spill compression: a rejected edge is marked and later batches skip c
                                                       /*max_compressed_fraction=*/0.75,
                                                       /*replan_after_uses=*/0,
                                                       /*error_tolerance=*/1);  // never expire
-  reg.set_spill_plan(&repo_a(), kNonCompressingDsl);
+  set_plan_1col(&repo_a(), kNonCompressingDsl);
 
   // First batch: compression runs, misses the threshold, and the edge is marked.
   auto batch = make_int32_gpu_batch(1000);
   spill_to(batch, e.host_space, &repo_a());
   REQUIRE_FALSE(is_compressed_host(*batch));
 
-  auto state = reg.resolve_spill_plan(&repo_a());
-  REQUIRE(state.has_value());
-  REQUIRE_FALSE(state->viable);
+  REQUIRE_FALSE(col0_of(&repo_a()).viable);
 
-  // With the entry marked unviable, the spill path must now decide to skip
+  // With every column marked unviable, the spill path must now decide to skip
   // rather than compress again.
   const auto decision = reg.decide_spill_plan(&repo_a(), /*replan_after_uses=*/0);
   REQUIRE(decision.verdict == sirius::compression::plan_register::spill_plan_verdict::skip);
@@ -534,7 +680,7 @@ TEST_CASE("spill compression: a rejected edge is marked and later batches skip c
   auto batch2 = make_int32_gpu_batch(1000);
   spill_to(batch2, e.host_space, &repo_a());
   REQUIRE_FALSE(is_compressed_host(*batch2));
-  REQUIRE_FALSE(reg.resolve_spill_plan(&repo_a())->viable);
+  REQUIRE_FALSE(col0_of(&repo_a()).viable);
 
   reset_spill_state(false);
 }
@@ -557,13 +703,13 @@ TEST_CASE("spill compression: an unviable edge is re-explored once its entry exp
                                                       /*max_compressed_fraction=*/0.75,
                                                       /*replan_after_uses=*/1,
                                                       /*error_tolerance=*/1);
-  reg.set_spill_plan(&repo_a(), kNonCompressingDsl);
+  set_plan_1col(&repo_a(), kNonCompressingDsl);
 
   // First batch: rejected, edge marked unviable, one use recorded.
   auto batch = make_int32_gpu_batch(5000);
   spill_to(batch, e.host_space, &repo_a());
   REQUIRE_FALSE(is_compressed_host(*batch));
-  REQUIRE_FALSE(reg.resolve_spill_plan(&repo_a())->viable);
+  REQUIRE_FALSE(col0_of(&repo_a()).viable);
 
   // The entry has now expired, so the verdict is explore rather than skip —
   // a previously written-off edge gets another chance.
@@ -576,10 +722,9 @@ TEST_CASE("spill compression: an unviable edge is re-explored once its entry exp
   spill_to(batch2, e.host_space, &repo_a());
   REQUIRE(is_compressed_host(*batch2));
 
-  auto recovered = reg.resolve_spill_plan(&repo_a());
-  REQUIRE(recovered.has_value());
-  REQUIRE(recovered->viable);
-  REQUIRE(recovered->dsl != kNonCompressingDsl);
+  const auto recovered = col0_of(&repo_a());
+  REQUIRE(recovered.viable);
+  REQUIRE(recovered.dsl != kNonCompressingDsl);
 
   require_restores_to(batch2, &repo_a(), expected_sum_of(5000));
 
@@ -597,20 +742,20 @@ TEST_CASE("plan_register: decide_spill_plan verdicts", "[compression][plan_regis
   // No entry at all.
   REQUIRE(reg.decide_spill_plan(&repo_a(), 0).verdict == verdict::explore);
 
-  reg.set_spill_plan(&repo_a(), "some dsl");
+  set_plan_1col(&repo_a(), "some dsl");
   auto d = reg.decide_spill_plan(&repo_a(), 0);
   REQUIRE(d.verdict == verdict::use);
-  REQUIRE(d.dsl == "some dsl");
+  REQUIRE(d.columns.size() == 1);
+  REQUIRE(d.columns[0].dsl == "some dsl");
 
-  // A failed attempt -> skip, but the DSL and use count are retained so the
-  // entry still ages toward expiry.
-  reg.conclude_spill_attempt(
-    &repo_a(),
-    sirius::compression::plan_register::spill_attempt_outcome::not_worth_it,
-    /*base_interval=*/0,
-    /*error_tolerance=*/1);
+  // The only column measured as not worth it -> skip, but its DSL and the use
+  // count are retained so the entry still ages toward expiry.
+  conclude_1col(&repo_a(),
+                sirius::compression::plan_register::spill_attempt_outcome::not_worth_it,
+                /*base_interval=*/0,
+                /*error_tolerance=*/1);
   REQUIRE(reg.decide_spill_plan(&repo_a(), 0).verdict == verdict::skip);
-  REQUIRE(reg.resolve_spill_plan(&repo_a())->dsl == "some dsl");
+  REQUIRE(col0_of(&repo_a()).dsl == "some dsl");
 
   // Expiry overrides both use and skip.
   reg.note_spill_plan_use(&repo_a());
@@ -619,10 +764,10 @@ TEST_CASE("plan_register: decide_spill_plan verdicts", "[compression][plan_regis
   // ...but 0 means "never expire", so the skip verdict stands.
   REQUIRE(reg.decide_spill_plan(&repo_a(), /*replan_after_uses=*/0).verdict == verdict::skip);
 
-  // Re-installing a plan clears the verdict and resets the counter.
-  reg.set_spill_plan(&repo_a(), "fresh dsl");
+  // Re-installing plans clears the verdicts and resets the counter.
+  set_plan_1col(&repo_a(), "fresh dsl");
   auto fresh = reg.resolve_spill_plan(&repo_a());
-  REQUIRE(fresh->viable);
+  REQUIRE(fresh->columns[0].viable);
   REQUIRE(fresh->uses == 0);
 
   reg.clear_all();
@@ -648,71 +793,70 @@ TEST_CASE("plan_register: replan interval backs off when a re-explore learns not
   SECTION("same plan, still working -> double")
   {
     reg.clear_all();
-    reg.set_spill_plan(&repo_a(), kPlan);
-    reg.conclude_spill_attempt(&repo_a(), kCompressed, kBase, kTol);  // first install: no backoff
-    REQUIRE(interval_of(&repo_a()) == 0);  // still on the configured schedule
+    set_plan_1col(&repo_a(), kPlan);
+    conclude_1col(&repo_a(), kCompressed, kBase, kTol);  // first install: no backoff
+    REQUIRE(interval_of(&repo_a()) == 0);                // still on the configured schedule
 
-    reg.set_spill_plan(&repo_a(), kPlan);  // re-explore returned the same plan
-    reg.conclude_spill_attempt(&repo_a(), kCompressed, kBase, kTol);
+    set_plan_1col(&repo_a(), kPlan);  // re-explore returned the same plan
+    conclude_1col(&repo_a(), kCompressed, kBase, kTol);
     REQUIRE(interval_of(&repo_a()) == kBase * 2);
 
-    reg.set_spill_plan(&repo_a(), kPlan);
-    reg.conclude_spill_attempt(&repo_a(), kCompressed, kBase, kTol);
+    set_plan_1col(&repo_a(), kPlan);
+    conclude_1col(&repo_a(), kCompressed, kBase, kTol);
     REQUIRE(interval_of(&repo_a()) == kBase * 4);
   }
 
   SECTION("different plan that still fails the threshold -> double")
   {
     reg.clear_all();
-    reg.set_spill_plan(&repo_a(), kPlan);
-    reg.conclude_spill_attempt(&repo_a(), kNotWorthIt, kBase, kTol);
+    set_plan_1col(&repo_a(), kPlan);
+    conclude_1col(&repo_a(), kNotWorthIt, kBase, kTol);
 
-    reg.set_spill_plan(&repo_a(), kOtherPlan);  // explorer found something else...
-    reg.conclude_spill_attempt(
-      &repo_a(), kNotWorthIt, kBase, kTol);  // ...that still does not compress
+    set_plan_1col(&repo_a(), kOtherPlan);                // explorer found something else...
+    conclude_1col(&repo_a(), kNotWorthIt, kBase, kTol);  // ...that still does not compress
     REQUIRE(interval_of(&repo_a()) == kBase * 2);
   }
 
   SECTION("different plan that works -> reset to the configured interval")
   {
     reg.clear_all();
-    reg.set_spill_plan(&repo_a(), kPlan);
-    reg.conclude_spill_attempt(&repo_a(), kCompressed, kBase, kTol);
+    set_plan_1col(&repo_a(), kPlan);
+    conclude_1col(&repo_a(), kCompressed, kBase, kTol);
     // Stretch the interval out first.
-    reg.set_spill_plan(&repo_a(), kPlan);
-    reg.conclude_spill_attempt(&repo_a(), kCompressed, kBase, kTol);
+    set_plan_1col(&repo_a(), kPlan);
+    conclude_1col(&repo_a(), kCompressed, kBase, kTol);
     REQUIRE(interval_of(&repo_a()) == kBase * 2);
 
-    reg.set_spill_plan(&repo_a(), kOtherPlan);
-    reg.conclude_spill_attempt(&repo_a(), kCompressed, kBase, kTol);
+    set_plan_1col(&repo_a(), kOtherPlan);
+    conclude_1col(&repo_a(), kCompressed, kBase, kTol);
     REQUIRE(interval_of(&repo_a()) == kBase);
   }
 
   SECTION("viability recovering on the same plan -> reset")
   {
     reg.clear_all();
-    reg.set_spill_plan(&repo_a(), kPlan);
-    reg.conclude_spill_attempt(&repo_a(), kNotWorthIt, kBase, kTol);  // not worth compressing
-    reg.set_spill_plan(&repo_a(), kPlan);
-    reg.conclude_spill_attempt(&repo_a(), kNotWorthIt, kBase, kTol);  // still not — back off
+    set_plan_1col(&repo_a(), kPlan);
+    conclude_1col(&repo_a(), kNotWorthIt, kBase, kTol);  // not worth compressing
+    set_plan_1col(&repo_a(), kPlan);
+    conclude_1col(&repo_a(), kNotWorthIt, kBase, kTol);  // still not — back off
     REQUIRE(interval_of(&repo_a()) == kBase * 2);
 
     // Same plan, but it now compresses: the edge recovered, so resume checking
     // on schedule.
-    reg.set_spill_plan(&repo_a(), kPlan);
-    reg.conclude_spill_attempt(&repo_a(), kCompressed, kBase, kTol);
+    set_plan_1col(&repo_a(), kPlan);
+    conclude_1col(&repo_a(), kCompressed, kBase, kTol);
     REQUIRE(interval_of(&repo_a()) == kBase);
-    REQUIRE(reg.resolve_spill_plan(&repo_a())->viable);
+    REQUIRE(col0_of(&repo_a()).viable);
   }
 
   SECTION("a stretched interval overrides the configured one when deciding")
   {
     using verdict = sirius::compression::plan_register::spill_plan_verdict;
     reg.clear_all();
-    reg.set_spill_plan(&repo_a(), kPlan);
-    reg.conclude_spill_attempt(&repo_a(), kCompressed, kBase, kTol);
-    reg.set_spill_plan(&repo_a(), kPlan);
-    reg.conclude_spill_attempt(&repo_a(), kCompressed, kBase, kTol);
+    set_plan_1col(&repo_a(), kPlan);
+    conclude_1col(&repo_a(), kCompressed, kBase, kTol);
+    set_plan_1col(&repo_a(), kPlan);
+    conclude_1col(&repo_a(), kCompressed, kBase, kTol);
     REQUIRE(interval_of(&repo_a()) == kBase * 2);
 
     for (std::uint64_t i = 0; i < kBase; ++i) {
@@ -744,59 +888,59 @@ TEST_CASE("plan_register: transient compression errors do not write off an edge"
   SECTION("errors below the tolerance leave the edge usable")
   {
     reg.clear_all();
-    reg.set_spill_plan(&repo_a(), "plan");
+    set_plan_1col(&repo_a(), "plan");
 
     // Two failures with a tolerance of three: the edge stays viable, so spilling
     // keeps compressing rather than being disabled by a passing blip.
-    reg.conclude_spill_attempt(&repo_a(), outcome::failed, kBase, kTol);
+    conclude_1col(&repo_a(), outcome::failed, kBase, kTol);
     REQUIRE(reg.decide_spill_plan(&repo_a(), kBase).verdict == verdict::use);
-    reg.conclude_spill_attempt(&repo_a(), outcome::failed, kBase, kTol);
+    conclude_1col(&repo_a(), outcome::failed, kBase, kTol);
     REQUIRE(reg.decide_spill_plan(&repo_a(), kBase).verdict == verdict::use);
-    REQUIRE(reg.resolve_spill_plan(&repo_a())->viable);
+    REQUIRE(col0_of(&repo_a()).viable);
 
     // The third makes it durable.
-    reg.conclude_spill_attempt(&repo_a(), outcome::failed, kBase, kTol);
+    conclude_1col(&repo_a(), outcome::failed, kBase, kTol);
     REQUIRE(reg.decide_spill_plan(&repo_a(), kBase).verdict == verdict::skip);
   }
 
   SECTION("a success resets the error streak")
   {
     reg.clear_all();
-    reg.set_spill_plan(&repo_a(), "plan");
+    set_plan_1col(&repo_a(), "plan");
 
-    reg.conclude_spill_attempt(&repo_a(), outcome::failed, kBase, kTol);
-    reg.conclude_spill_attempt(&repo_a(), outcome::failed, kBase, kTol);
-    reg.conclude_spill_attempt(&repo_a(), outcome::compressed, kBase, kTol);
-    REQUIRE(reg.resolve_spill_plan(&repo_a())->consecutive_errors == 0);
+    conclude_1col(&repo_a(), outcome::failed, kBase, kTol);
+    conclude_1col(&repo_a(), outcome::failed, kBase, kTol);
+    conclude_1col(&repo_a(), outcome::compressed, kBase, kTol);
+    REQUIRE(col0_of(&repo_a()).consecutive_errors == 0);
 
     // Two more failures must not tip it over — the streak restarted.
-    reg.conclude_spill_attempt(&repo_a(), outcome::failed, kBase, kTol);
-    reg.conclude_spill_attempt(&repo_a(), outcome::failed, kBase, kTol);
+    conclude_1col(&repo_a(), outcome::failed, kBase, kTol);
+    conclude_1col(&repo_a(), outcome::failed, kBase, kTol);
     REQUIRE(reg.decide_spill_plan(&repo_a(), kBase).verdict == verdict::use);
   }
 
   SECTION("a tolerated error does not disturb a pending replan comparison")
   {
     reg.clear_all();
-    reg.set_spill_plan(&repo_a(), "plan");
-    reg.conclude_spill_attempt(&repo_a(), outcome::compressed, kBase, kTol);
+    set_plan_1col(&repo_a(), "plan");
+    conclude_1col(&repo_a(), outcome::compressed, kBase, kTol);
 
     // Re-explore returns the same plan, but the attempt errors transiently. The
     // interval must not move: the cycle has not been judged yet.
-    reg.set_spill_plan(&repo_a(), "plan");
-    reg.conclude_spill_attempt(&repo_a(), outcome::failed, kBase, kTol);
+    set_plan_1col(&repo_a(), "plan");
+    conclude_1col(&repo_a(), outcome::failed, kBase, kTol);
     REQUIRE(reg.resolve_spill_plan(&repo_a())->replan_interval == 0);
 
     // The next real outcome concludes it — same plan, so back off.
-    reg.conclude_spill_attempt(&repo_a(), outcome::compressed, kBase, kTol);
+    conclude_1col(&repo_a(), outcome::compressed, kBase, kTol);
     REQUIRE(reg.resolve_spill_plan(&repo_a())->replan_interval == kBase * 2);
   }
 
   SECTION("a tolerance of one writes off on the first error")
   {
     reg.clear_all();
-    reg.set_spill_plan(&repo_a(), "plan");
-    reg.conclude_spill_attempt(&repo_a(), outcome::failed, kBase, /*error_tolerance=*/1);
+    set_plan_1col(&repo_a(), "plan");
+    conclude_1col(&repo_a(), outcome::failed, kBase, /*error_tolerance=*/1);
     REQUIRE(reg.decide_spill_plan(&repo_a(), kBase).verdict == verdict::skip);
   }
 
@@ -813,11 +957,10 @@ TEST_CASE("plan_register: note_spill_plan_use on an absent edge is a no-op",
   // otherwise age a plan that has not been installed yet.
   reg.note_spill_plan_use(&repo_a());
   REQUIRE_FALSE(reg.resolve_spill_plan(&repo_a()).has_value());
-  reg.conclude_spill_attempt(
-    &repo_a(),
-    sirius::compression::plan_register::spill_attempt_outcome::not_worth_it,
-    /*base_interval=*/8,
-    /*error_tolerance=*/1);
+  conclude_1col(&repo_a(),
+                sirius::compression::plan_register::spill_attempt_outcome::not_worth_it,
+                /*base_interval=*/8,
+                /*error_tolerance=*/1);
   REQUIRE_FALSE(reg.resolve_spill_plan(&repo_a()).has_value());
 
   reg.clear_all();
@@ -831,20 +974,28 @@ TEST_CASE("plan_register: spill plan round-trips per repository", "[compression]
   REQUIRE_FALSE(reg.resolve_spill_plan(&repo_a()).has_value());
 
   const std::string dsl = "input -> delta -> differences\n";
-  reg.set_spill_plan(&repo_a(), dsl);
+  set_plan_1col(&repo_a(), dsl);
 
   auto result = reg.resolve_spill_plan(&repo_a());
   REQUIRE(result.has_value());
-  REQUIRE(result->dsl == dsl);
-  REQUIRE(result->viable);
+  REQUIRE(result->columns.size() == 1);
+  REQUIRE(result->columns[0].dsl == dsl);
+  REQUIRE(result->columns[0].viable);
   REQUIRE(result->uses == 0);
 
   // Plans are per-edge: another repository is unaffected.
   REQUIRE_FALSE(reg.resolve_spill_plan(&repo_b()).has_value());
 
-  // An empty plan reads back as "no plan".
+  // Storing no columns reads back as "no plan".
   reg.set_spill_plan(&repo_a(), {});
   REQUIRE_FALSE(reg.resolve_spill_plan(&repo_a()).has_value());
+
+  // A multi-column edge keeps one entry per column, in schema order.
+  reg.set_spill_plan(&repo_a(), std::vector<std::string>{"plan a", "plan b", "plan c"});
+  auto multi = reg.resolve_spill_plan(&repo_a());
+  REQUIRE(multi->columns.size() == 3);
+  REQUIRE(multi->columns[1].dsl == "plan b");
+  REQUIRE(multi->viable_count() == 3);
 
   reg.clear_all();
 }
@@ -855,8 +1006,8 @@ TEST_CASE("plan_register: clear_spill_plan removes only the named edge",
   auto& reg = sirius::compression::plan_register::global();
   reg.clear_all();
 
-  reg.set_spill_plan(&repo_a(), "plan a");
-  reg.set_spill_plan(&repo_b(), "plan b");
+  set_plan_1col(&repo_a(), "plan a");
+  set_plan_1col(&repo_b(), "plan b");
 
   reg.clear_spill_plan(&repo_a());
   REQUIRE_FALSE(reg.resolve_spill_plan(&repo_a()).has_value());
@@ -870,7 +1021,7 @@ TEST_CASE("plan_register: clear_all removes spill plans", "[compression][plan_re
   auto& reg = sirius::compression::plan_register::global();
   reg.clear_all();
 
-  reg.set_spill_plan(&repo_a(), "some dsl");
+  set_plan_1col(&repo_a(), "some dsl");
   REQUIRE(reg.resolve_spill_plan(&repo_a()).has_value());
 
   reg.clear_all();

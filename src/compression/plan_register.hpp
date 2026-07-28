@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <optional>
 #include <shared_mutex>
+#include <span>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -89,38 +90,65 @@ class plan_register {
   // expires and the edge is explored afresh, which also re-tests an edge that
   // was previously marked unviable.
 
+  /// Cached spill-compression state for a single column of one edge.
+  ///
+  /// Compressibility is a property of a column, not of a batch: a wide output
+  /// commonly mixes columns that shrink 10x with ones that do not compress at
+  /// all. Verdicts are therefore tracked per column, so one incompressible
+  /// column neither disables its well-compressing neighbours nor keeps costing
+  /// a compress attempt on every batch.
+  struct column_plan_state {
+    std::string dsl;    ///< single-column plan DSL for this column
+    bool viable{true};  ///< false once this column proved not worth compressing
+
+    /// Consecutive hard failures since this column's last real verdict. As at
+    /// edge level, an error is not evidence about the data, so a column is only
+    /// written off once the failures prove durable.
+    std::uint32_t consecutive_errors{0};
+  };
+
   /// Cached spill-compression state for one query-graph edge.
   struct spill_plan_state {
-    std::string dsl;        ///< multi-column plan DSL for this edge
-    bool viable{true};      ///< false once compression was judged not worth it
+    /// One entry per source column, in schema order.
+    std::vector<column_plan_state> columns;
+
     std::uint64_t uses{0};  ///< spill attempts since this entry was installed
 
     /// Effective re-explore interval for this edge. 0 = follow the configured
     /// `spill_replan_after_uses`; non-zero once adaptive backoff has moved it.
+    /// The schedule is per edge — batches arrive per edge, so all its columns
+    /// are re-explored together.
     std::uint64_t replan_interval{0};
-
-    /// Consecutive hard failures (exceptions) since the last real verdict.
-    /// Compression is only written off once this reaches the configured
-    /// tolerance, so a transient error does not disable the edge.
-    std::uint32_t consecutive_errors{0};
 
     // Bookkeeping describing the re-explore that installed this entry, consumed
     // by conclude_spill_attempt() to decide whether to back off.
-    bool from_replan{false};   ///< this entry replaced an earlier one
-    bool plan_changed{false};  ///< ...and its DSL differs from that one's
-    bool prev_viable{true};    ///< ...and that one's viability
+    bool from_replan{false};           ///< this entry replaced an earlier one
+    bool plan_changed{false};          ///< ...and at least one column's DSL differs
+    std::size_t prev_viable_count{0};  ///< ...and how many of its columns were viable
+
+    /// Columns currently worth compressing.
+    [[nodiscard]] std::size_t viable_count() const
+    {
+      std::size_t n = 0;
+      for (auto const& c : columns) {
+        if (c.viable) { ++n; }
+      }
+      return n;
+    }
   };
 
   /// What the spill path should do for an edge.
   enum class spill_plan_verdict {
     explore,  ///< no usable entry (absent or expired) — run the explorer
-    use,      ///< compress with the returned DSL
-    skip,     ///< compression is not worth it here — spill uncompressed
+    use,      ///< compress the columns in `columns` that are still viable
+    skip,     ///< no column is worth compressing — spill uncompressed
   };
 
   struct spill_plan_decision {
     spill_plan_verdict verdict{spill_plan_verdict::explore};
-    std::string dsl;  ///< set when verdict == use
+    /// Per-column state, set when verdict == use. Columns whose `viable` is
+    /// false should be stored with a passthrough plan rather than compressed.
+    std::vector<column_plan_state> columns;
   };
 
   /**
@@ -139,10 +167,12 @@ class plan_register {
   [[nodiscard]] spill_plan_decision decide_spill_plan(const cucascade::shared_data_repository* repo,
                                                       std::uint64_t replan_after_uses) const;
 
-  /// Install a freshly explored plan for @p repo (resets viability and use count).
-  /// When this replaces an existing entry it records how the new plan compares to
-  /// the old one, for conclude_spill_attempt() to act on.
-  void set_spill_plan(const cucascade::shared_data_repository* repo, std::string plan_dsl);
+  /// Install freshly explored per-column plans for @p repo (one DSL per source
+  /// column, in schema order; all columns start viable and the use count resets).
+  /// When this replaces an existing entry it records how the new plans compare to
+  /// the old ones, for conclude_spill_attempt() to act on.
+  void set_spill_plan(const cucascade::shared_data_repository* repo,
+                      std::vector<std::string> per_column_dsl);
 
   /// How a spill attempt ended.
   enum class spill_attempt_outcome {
@@ -152,40 +182,41 @@ class plan_register {
   };
 
   /**
-   * @brief Record how a spill attempt for @p repo turned out.
+   * @brief Record how a spill attempt for @p repo turned out, per column.
    *
-   * @param outcome          how the attempt ended.
+   * @param per_column       one outcome per column, in schema order. Empty means
+   *                         the attempt died before any column could be judged,
+   *                         and is treated as `failed` for every column.
    * @param base_interval    the configured `spill_replan_after_uses`.
    * @param error_tolerance  consecutive `failed` outcomes to absorb before
-   *                         writing the edge off (minimum 1).
+   *                         writing a column off (minimum 1).
    *
    * `compressed` and `not_worth_it` are *measurements* and take effect at once:
-   * they set viability, clear the error streak, and conclude any pending replan.
+   * they set that column's viability and clear its error streak.
    *
    * `failed` is not a measurement — compression runs under memory pressure, so an
    * exception is as likely to be a transient allocation failure as a real verdict
-   * on the data. It only increments the error streak, leaving viability, the
-   * replan interval and any pending replan comparison untouched, until
-   * @p error_tolerance consecutive failures make it durable; only then is the edge
-   * written off. Without this a single transient OOM would disable compression for
-   * a whole replan interval and stretch that interval further.
+   * on the data. It only increments that column's error streak, leaving viability
+   * untouched, until @p error_tolerance consecutive failures make it durable.
+   * Without this a single transient OOM would disable compression for a whole
+   * replan interval and stretch that interval further.
    *
-   * When a measurement concludes a re-explore, this also adapts the edge's replan
+   * When at least one column was measured, this also adapts the edge's replan
    * interval. Re-exploring costs a beam search per column, so it should only stay
    * frequent while it is paying off:
    *
-   *   - the cycle produced a *working change* (new plan, or viability recovered,
-   *     and the result compresses) → reset the interval to @p base_interval and
-   *     keep checking on schedule;
-   *   - anything else — the explorer returned the same plan, or the result still
-   *     misses the threshold → double the interval, so a stable or stubbornly
+   *   - the cycle produced a *working change* (plans changed, or more columns are
+   *     viable than before, and at least one column compresses) → reset the
+   *     interval to @p base_interval and keep checking on schedule;
+   *   - anything else — the explorer returned the same plans, or nothing
+   *     compresses → double the interval, so a stable or stubbornly
    *     incompressible edge stops paying for explores it learns nothing from.
    *
    * Call exactly once per attempt that actually tried to compress (not for a
    * skipped edge, which made no attempt to judge).
    */
   void conclude_spill_attempt(const cucascade::shared_data_repository* repo,
-                              spill_attempt_outcome outcome,
+                              std::span<const spill_attempt_outcome> per_column,
                               std::uint64_t base_interval,
                               std::uint32_t error_tolerance);
 

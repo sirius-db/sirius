@@ -250,23 +250,38 @@ std::vector<std::string> synthetic_column_names(int n)
   return names;
 }
 
-// Resolve the spill plan for this query-graph edge, running Simpatico's
-// beam-search explorer once (on the first batch to spill from this edge) and
-// caching the result in the plan register for every later batch.
-std::string resolve_or_explore_spill_plan(cudf::table_view table,
-                                          const compression::spill_context& ctx,
-                                          rmm::cuda_stream_view stream)
+/// Plan that stores a column as-is. Used for a column that has proved not worth
+/// compressing: the compressed table must still carry every column for the batch
+/// to round-trip, but there is no point running a codec that does not shrink it.
+/// Safe for every dtype — identity on STRING decomposes via str_split and
+/// round-trips through both the in-memory and the file path.
+constexpr auto kPassthroughDsl = "input -> identity\n";
+
+using column_state = compression::plan_register::column_plan_state;
+
+// Resolve this edge's per-column plans, running Simpatico's beam-search explorer
+// once (on the first batch to spill from this edge) and caching the result in the
+// plan register for every later batch.
+std::vector<column_state> resolve_or_explore_spill_plan(cudf::table_view table,
+                                                        const compression::spill_context& ctx,
+                                                        rmm::cuda_stream_view stream)
 {
   using verdict = compression::plan_register::spill_plan_verdict;
 
   auto& reg           = compression::plan_register::global();
   const auto decision = reg.decide_spill_plan(ctx.repo, ctx.replan_after_uses);
-  if (decision.verdict == verdict::use) { return decision.dsl; }
+
+  // A cached entry only applies if it still describes this schema; a differing
+  // column count means the plans were explored for other data, so explore again.
+  if (decision.verdict == verdict::use &&
+      decision.columns.size() == static_cast<std::size_t>(table.num_columns())) {
+    return decision.columns;
+  }
   if (decision.verdict == verdict::skip) {
-    // Compression was already judged not worth it for this edge. convertible_data_batch
-    // normally checks this before entering the converter, so reaching here means the
-    // entry changed underneath us; bail out cheaply to the uncompressed path.
-    throw std::runtime_error("[compression_converters] edge marked not worth compressing");
+    // No column here compresses. convertible_data_batch normally checks this
+    // before entering the converter, so reaching here means the entry changed
+    // underneath us; bail out cheaply to the uncompressed path.
+    throw std::runtime_error("[compression_converters] no column worth compressing");
   }
 
   nvtx3::scoped_range nvtx_range{"sirius::compression::explore_spill_plan"};
@@ -275,20 +290,28 @@ std::string resolve_or_explore_spill_plan(cudf::table_view table,
   ecfg.beam_width        = ctx.explore_beam_width;
   ecfg.max_explore_bytes = ctx.explore_max_bytes;
 
-  std::string dsl;
+  // The explorer already works one column at a time, so keep its results per
+  // column rather than flattening them into a single "---"-joined plan.
+  std::vector<std::string> per_column;
+  per_column.reserve(static_cast<std::size_t>(table.num_columns()));
   for (cudf::size_type i = 0; i < table.num_columns(); ++i) {
     auto result = simpatico::explore_column_compression(
       table.column(i), ecfg, stream, rmm::mr::get_current_device_resource_ref());
-    if (i != 0) { dsl += "\n---\n"; }
-    dsl += result.plan_dsl;
+    per_column.push_back(std::move(result.plan_dsl));
   }
 
-  SIRIUS_LOG_DEBUG("[compression_converters] explored spill plan for repo={} cols={}",
+  SIRIUS_LOG_DEBUG("[compression_converters] explored spill plans for repo={} cols={}",
                    static_cast<const void*>(ctx.repo),
                    table.num_columns());
 
-  reg.set_spill_plan(ctx.repo, dsl);
-  return dsl;
+  reg.set_spill_plan(ctx.repo, per_column);
+
+  std::vector<column_state> states;
+  states.reserve(per_column.size());
+  for (auto& dsl : per_column) {
+    states.push_back(column_state{std::move(dsl), /*viable=*/true, /*consecutive_errors=*/0});
+  }
+  return states;
 }
 
 // The spill context must be installed by convertible_data_batch::convert().
@@ -316,32 +339,57 @@ staged_compression compress_for_spill(cudf::table_view view,
                                       std::size_t uncompressed_bytes,
                                       rmm::cuda_stream_view stream)
 {
-  const std::string plan = resolve_or_explore_spill_plan(view, ctx, stream);
+  using outcome_kind      = compression::plan_register::spill_attempt_outcome;
+  const auto column_plans = resolve_or_explore_spill_plan(view, ctx, stream);
+  const auto num_columns  = static_cast<std::size_t>(view.num_columns());
+  auto const mr           = rmm::mr::get_current_device_resource_ref();
 
-  // Report the outcome exactly once, on every exit path. The default is `failed`,
-  // so an exception anywhere below is reported as an error rather than as a
-  // verdict on the data: the register absorbs a few of those before writing the
-  // edge off, since compression runs under memory pressure and a throw is as
-  // likely to be a transient allocation failure as a real signal.
-  using outcome_kind = compression::plan_register::spill_attempt_outcome;
+  // Report per-column outcomes exactly once, on every exit path. Everything
+  // defaults to `failed`, so an exception anywhere below is reported as an error
+  // rather than as a verdict on the data: the register absorbs a few of those
+  // before writing a column off, since compression runs under memory pressure and
+  // a throw is as likely to be a transient allocation failure as a real signal.
   struct outcome_guard {
     const cucascade::shared_data_repository* repo;
     std::uint64_t base_interval;
     std::uint32_t error_tolerance;
-    outcome_kind result{outcome_kind::failed};
+    std::vector<outcome_kind> per_column;
     ~outcome_guard()
     {
       compression::plan_register::global().conclude_spill_attempt(
-        repo, result, base_interval, error_tolerance);
+        repo, per_column, base_interval, error_tolerance);
     }
-  } outcome{ctx.repo, ctx.replan_after_uses, ctx.error_tolerance};
+  } outcome{ctx.repo,
+            ctx.replan_after_uses,
+            ctx.error_tolerance,
+            std::vector<outcome_kind>(num_columns, outcome_kind::failed)};
 
+  // Compress column by column so each can use its own plan. A column already
+  // judged not worth compressing is stored raw instead: the compressed table must
+  // still carry it for the batch to round-trip, but running a codec that does not
+  // shrink it would be pure cost.
   staged_compression out;
-  out.table = simpatico::compress_with_plan(view,
-                                            plan,
-                                            stream,
-                                            rmm::mr::get_current_device_resource_ref(),
-                                            synthetic_column_names(view.num_columns()));
+  out.table.columns.reserve(num_columns);
+  auto names = synthetic_column_names(view.num_columns());
+  for (std::size_t i = 0; i < num_columns; ++i) {
+    const auto col      = view.column(static_cast<cudf::size_type>(i));
+    const bool compress = column_plans[i].viable;
+
+    std::string err;
+    auto tree = simpatico::compress_column(
+      col, compress ? column_plans[i].dsl : kPassthroughDsl, stream, mr, &err);
+    if (!tree) {
+      throw std::runtime_error("[compression_converters] compress_column " + std::to_string(i) +
+                               ": " + (err.empty() ? "failed" : err));
+    }
+
+    simpatico::compressed_column out_col;
+    out_col.dtype     = col.type();
+    out_col.num_rows  = view.num_rows();
+    out_col.name      = names[i];
+    out_col.plan_tree = std::move(tree);
+    out.table.columns.push_back(std::move(out_col));
+  }
 
   const std::string hdr_err = simpatico::build_compressed_table_header(
     out.table, out.header, out.buffers, out.payload_bytes, stream);
@@ -349,21 +397,42 @@ staged_compression compress_for_spill(cudf::table_view view,
     throw std::runtime_error("[compression_converters] build_compressed_table_header: " + hdr_err);
   }
 
-  // Reject a compressed form that saves too little; throwing here makes the
-  // caller spill uncompressed instead. Record the verdict against the edge so
-  // later batches skip the compress attempt altogether rather than repeating
-  // this work and discarding the result every time — until the entry expires
-  // and the edge is explored afresh.
+  // Judge each column on its own bytes. Compressibility is a per-column property,
+  // so a single incompressible column must not disqualify its neighbours — nor
+  // keep costing a compress attempt on every later batch.
+  const auto descs = out.table.describe(stream);
+  for (std::size_t i = 0; i < num_columns && i < descs.size(); ++i) {
+    std::uint64_t col_compressed = 0;
+    for (auto const& leaf : descs[i]) {
+      for (auto const& buf : leaf.buffers) {
+        col_compressed += buf.size_bytes;
+      }
+    }
+    const auto col_original =
+      simpatico::column_size_bytes_ex(view.column(static_cast<cudf::size_type>(i)), stream);
+
+    const bool worth_it =
+      col_original == 0 || static_cast<double>(col_compressed) <=
+                             ctx.max_compressed_fraction * static_cast<double>(col_original);
+    // A measurement, not an error: real evidence about this column's data, so it
+    // applies immediately. A column stored raw this time is measured too, and
+    // simply stays not-worth-it until the edge is re-explored.
+    outcome.per_column[i] = worth_it ? outcome_kind::compressed : outcome_kind::not_worth_it;
+  }
+
+  // Final whole-batch check. With non-paying columns stored raw the total is
+  // normally at or below the original, but the first batch from an edge compresses
+  // every column speculatively and can come out worse; decline it rather than
+  // store a compressed form that costs more to keep and to read back. The
+  // per-column verdicts above are still recorded, so the next batch stores the
+  // columns that did not pay raw — or skips the edge entirely if none of them did.
   const std::size_t compressed_bytes = out.header.size() + out.payload_bytes;
   if (uncompressed_bytes > 0 &&
       static_cast<double>(compressed_bytes) >
         ctx.max_compressed_fraction * static_cast<double>(uncompressed_bytes)) {
-    // A measurement, not an error: this is real evidence the data does not
-    // compress here, so it takes effect immediately.
-    outcome.result = outcome_kind::not_worth_it;
     SIRIUS_LOG_DEBUG(
       "[compression_converters] repo={} compressed {}B of {}B: below threshold; "
-      "marking edge not worth compressing",
+      "spilling uncompressed",
       static_cast<const void*>(ctx.repo),
       compressed_bytes,
       uncompressed_bytes);
@@ -372,7 +441,6 @@ staged_compression compress_for_spill(cudf::table_view view,
                              std::to_string(uncompressed_bytes) + "B original: below threshold");
   }
 
-  outcome.result = outcome_kind::compressed;
   return out;
 }
 

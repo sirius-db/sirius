@@ -30,15 +30,36 @@ Simpatico plan. The natural key is the `shared_data_repository*`:
 Thread the repo pointer into `convertible_data_batch` at construction, then pass it to
 the plan register in `convert()`.
 
+### Per-column plans and verdicts
+
+Compressibility is a property of a column, not of a batch: a wide operator output
+routinely mixes columns that shrink 10x with ones that do not compress at all. The
+explorer already works one column at a time, so its per-column results are stored
+per column rather than flattened into one `---`-joined plan.
+
+Compression therefore runs column by column (`simpatico::compress_column`, the same
+loop `compress_with_plan` performs internally), assembling the `compressed_table`
+directly. Each column is measured against its *own* original bytes, so:
+
+- one incompressible column no longer disqualifies its well-compressing neighbours;
+- a column that does not pay is stored with a passthrough plan (`input -> identity`)
+  on later batches instead of being re-compressed and discarded every time.
+
+`identity` is safe for every dtype — on STRING it decomposes via `str_split` and
+round-trips through both the in-memory and the file path.
+
+A cached entry whose column count does not match the batch describes a different
+schema, so it is discarded and the edge explored afresh.
+
 ### Per-edge plan lifecycle
 
-Each edge's register entry carries the plan DSL plus two pieces of state:
+The schedule stays per edge — batches arrive per edge, so all its columns are
+re-explored together. Each entry carries, alongside its per-column plans:
 
-- **`viable`** — cleared when a compressed batch misses `max_compressed_fraction`.
-  Later batches from that edge then skip the compress attempt entirely instead of
-  paying for it and discarding the result every time. Without this, a plan that
-  fails the threshold stays cached and every subsequent batch repeats the full
-  compress → reject cycle for the rest of the query.
+- **`viable`** (per column) — cleared when that column misses
+  `max_compressed_fraction`. Later batches store it raw instead of paying to
+  compress and discard it every time. When *no* column is viable the edge is
+  skipped outright, with no conversion attempted at all.
 - **`uses`** — spill attempts since the entry was installed. Once it reaches
   `spill_replan_after_uses` the entry expires and the edge is explored afresh.
 
