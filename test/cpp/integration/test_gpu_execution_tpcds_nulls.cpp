@@ -308,61 +308,15 @@ TEST_CASE_METHOD(TpcdsNullFixture,
     "WHERE ss_store_sk NOT IN (SELECT ss_addr_sk FROM store_sales)");
 }
 
-// KNOWN GPU DIVERGENCE (quarantined; tracked in sirius-db/sirius#1291): a join
-// keyed on IS NOT DISTINCT FROM must be null-safe -- NULL matches NULL -- but the
-// GPU lowers it to a plain `=` and drops the NULL-to-NULL matches, so it silently
-// undercounts (observed GPU=148018 vs CPU=280213 at sf=0.01). It runs on the GPU
-// (asserted below: exactly one execution, no fallback) and returns a wrong result.
-// We can't use Catch2's [!shouldfail] tag here: it conflicts with the WARN+skip
-// path when the tpcds extension is unavailable (a skip registers as an unexpected
-// pass). Instead assert the divergence directly -- this stays green while the bug
-// exists, skips cleanly, and flips to a failure (prompting un-quarantine) once the
-// fix (sirius-db/sirius#1291) lands and the counts agree.
 TEST_CASE_METHOD(TpcdsNullFixture,
-                 "gpu_execution tpcds null-safe join (IS NOT DISTINCT FROM) [known divergence]",
+                 "gpu_execution tpcds null-safe join (IS NOT DISTINCT FROM)",
                  "[integration][gpu_execution][tpcds][nulls]")
-{  // Both ss_addr_sk and sr_addr_sk are nullable, so a null-safe join matches their
-  // NULL rows to each other; a plain `=` drops them.
-  const std::string query =
+{
+  // Both ss_addr_sk and sr_addr_sk are nullable, so a null-safe join matches their
+  // NULL rows to each other -- a plain `=` would drop them (fixed in #1291).
+  compare_gpu_vs_cpu(
     "SELECT count(*) FROM store_sales ss JOIN store_returns sr "
-    "ON ss.ss_addr_sk IS NOT DISTINCT FROM sr.sr_addr_sk";
-
-  // Assert the query actually ran on the GPU with no fallback, so this stays a
-  // "silent GPU wrong answer" and not an unnoticed CPU fallback.
-  con->Query("SET gpu_execution = true;");
-  auto before = sirius::test::get_transparent_execution_stats(*con);
-  auto gpu    = con->Query(query);
-  auto after  = sirius::test::get_transparent_execution_stats(*con);
-  REQUIRE(gpu);
-  REQUIRE_FALSE(gpu->HasError());
-  sirius::test::require_transparent_execution_delta(before, after, 1, 0, 1);
-
-  con->Query("SET gpu_execution = false;");
-  auto cpu = con->Query(query);
-  con->Query("SET gpu_execution = true;");
-  REQUIRE(cpu);
-  REQUIRE_FALSE(cpu->HasError());
-
-  auto const gpu_n = gpu->GetValue(0, 0).GetValue<int64_t>();
-  auto const cpu_n = cpu->GetValue(0, 0).GetValue<int64_t>();
-
-  // The bug makes the GPU treat IS NOT DISTINCT FROM as a plain `=` (NULL never
-  // matches NULL), so its count equals the `=` join and is strictly below the
-  // correct null-safe CPU count. Assert that specific shape -- a bare
-  // gpu_n != cpu_n would accept any wrong GPU value.
-  con->Query("SET gpu_execution = false;");
-  auto eq_result = con->Query(
-    "SELECT count(*) FROM store_sales ss JOIN store_returns sr "
-    "ON ss.ss_addr_sk = sr.sr_addr_sk");
-  con->Query("SET gpu_execution = true;");
-  REQUIRE(eq_result);
-  REQUIRE_FALSE(eq_result->HasError());
-  auto const eq_n = eq_result->GetValue(0, 0).GetValue<int64_t>();
-
-  UNSCOPED_INFO("null-safe join known divergence (sirius#1291): GPU="
-                << gpu_n << " CPU=" << cpu_n << " ('=' join=" << eq_n << ")");
-  REQUIRE(cpu_n > eq_n);   // NULL=NULL matches genuinely exist at this scale
-  REQUIRE(gpu_n == eq_n);  // GPU computes the plain '=' join; flips red when the fix lands
+    "ON ss.ss_addr_sk IS NOT DISTINCT FROM sr.sr_addr_sk");
 }
 
 TEST_CASE_METHOD(TpcdsNullFixture,
