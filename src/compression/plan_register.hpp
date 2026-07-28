@@ -90,6 +90,40 @@ class plan_register {
   // expires and the edge is explored afresh, which also re-tests an edge that
   // was previously marked unviable.
 
+  /// Where a spilled column came from in the base tables, as resolved by the
+  /// planner. Deliberately a plain string/index pair rather than
+  /// `sirius::planner::column_origin`, so the compression layer does not pull in
+  /// DuckDB planner headers; the wiring site converts.
+  struct spill_column_origin {
+    std::string table_name;
+    std::size_t table_column_index{0};
+  };
+
+  /// Per-column origins for an edge, nullopt where the column is computed.
+  using spill_column_origins = std::vector<std::optional<spill_column_origin>>;
+
+  /// Record where @p repo's columns came from. Called once at plan-wiring time.
+  void set_spill_column_origins(const cucascade::shared_data_repository* repo,
+                                spill_column_origins origins);
+
+  /// Origins for @p repo, or nullopt when none were resolved.
+  [[nodiscard]] std::optional<spill_column_origins> resolve_spill_column_origins(
+    const cucascade::shared_data_repository* repo) const;
+
+  /**
+   * @brief Per-column plans for @p repo taken from the offline table plans.
+   *
+   * For each column with a known origin, looks up that table's plan and extracts
+   * the block for its column index. Columns with no origin, or whose table has no
+   * plan loaded, come back as nullopt for the caller to handle (store raw, or
+   * explore).
+   *
+   * Returns nullopt when nothing at all could be seeded, so the caller can fall
+   * back to exploring rather than compressing everything as passthrough.
+   */
+  [[nodiscard]] std::optional<std::vector<std::optional<std::string>>> seed_plans_from_lineage(
+    const cucascade::shared_data_repository* repo, std::size_t expected_columns) const;
+
   /// Cached spill-compression state for a single column of one edge.
   ///
   /// Compressibility is a property of a column, not of a batch: a wide output
@@ -307,6 +341,8 @@ class plan_register {
   std::unordered_map<std::string, std::string> _col_plans;    // "table::column" → single-col DSL
   // repo* → per-edge spill state; keyed by pointer (stable within a query)
   std::unordered_map<const cucascade::shared_data_repository*, spill_plan_state> _spill_plans;
+  // repo* → per-column base-table origins, recorded once at plan-wiring time.
+  std::unordered_map<const cucascade::shared_data_repository*, spill_column_origins> _spill_origins;
 };
 
 /**

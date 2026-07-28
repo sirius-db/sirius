@@ -245,6 +245,49 @@ void plan_register::conclude_spill_attempt(const cucascade::shared_data_reposito
   }
 }
 
+void plan_register::set_spill_column_origins(const cucascade::shared_data_repository* repo,
+                                             spill_column_origins origins)
+{
+  std::unique_lock lock(_mutex);
+  _spill_origins[repo] = std::move(origins);
+}
+
+std::optional<plan_register::spill_column_origins> plan_register::resolve_spill_column_origins(
+  const cucascade::shared_data_repository* repo) const
+{
+  std::shared_lock lock(_mutex);
+  auto it = _spill_origins.find(repo);
+  if (it == _spill_origins.end() || it->second.empty()) { return std::nullopt; }
+  return it->second;
+}
+
+std::optional<std::vector<std::optional<std::string>>> plan_register::seed_plans_from_lineage(
+  const cucascade::shared_data_repository* repo, std::size_t expected_columns) const
+{
+  std::shared_lock lock(_mutex);
+  auto it = _spill_origins.find(repo);
+  if (it == _spill_origins.end() || it->second.size() != expected_columns) { return std::nullopt; }
+
+  std::vector<std::optional<std::string>> seeds(expected_columns);
+  bool any = false;
+  for (std::size_t i = 0; i < expected_columns; ++i) {
+    auto const& origin = it->second[i];
+    if (!origin.has_value()) { continue; }  // computed column: no base plan
+
+    auto plan_it = _table_plans.find(origin->table_name);
+    if (plan_it == _table_plans.end() || plan_it->second.empty()) { continue; }
+
+    // The table plan has one block per full-table column in schema order, which is
+    // exactly the index space table_column_index lives in.
+    auto block = select_plan_blocks(plan_it->second, {origin->table_column_index});
+    if (!block.has_value()) { continue; }
+    seeds[i] = std::move(*block);
+    any      = true;
+  }
+  if (!any) { return std::nullopt; }
+  return seeds;
+}
+
 void plan_register::note_spill_explore_failure(const cucascade::shared_data_repository* repo,
                                                std::uint32_t error_tolerance)
 {
@@ -287,6 +330,7 @@ void plan_register::clear_all()
   _table_plans.clear();
   _col_plans.clear();
   _spill_plans.clear();
+  _spill_origins.clear();
 }
 
 std::optional<std::string> select_plan_blocks(const std::string& full_plan_dsl,

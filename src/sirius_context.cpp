@@ -17,6 +17,7 @@
 #include "sirius_context.hpp"
 
 #include "compression/compression_converters.hpp"
+#include "compression/plan_register.hpp"
 #include "compression/spill_context.hpp"
 #include "config.hpp"
 #include "cucascade/memory/memory_reservation_manager.hpp"
@@ -64,6 +65,7 @@
 #include <cstdio>   // for fprintf/fileno (fallback banner)
 #include <cstdlib>  // for std::getenv
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -568,6 +570,32 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
                                                         comp.spill_replan_change_threshold,
                                                         comp.spill_explore_sample_rows);
     sirius::set_decompress_column_threads(comp.column_threads);
+
+    // Load every offline table plan up front. These used to be read lazily inside
+    // pin_table()'s bind, one table at a time — so a query that never pinned
+    // anything never loaded them, and the spill path (which reaches them through
+    // column lineage, not through pinning) found nothing.
+    if (!comp.input_plan_dir.empty()) {
+      namespace fs = std::filesystem;
+      std::error_code ec;
+      std::size_t loaded = 0;
+      for (auto const& entry : fs::directory_iterator(comp.input_plan_dir, ec)) {
+        if (!entry.is_regular_file()) { continue; }
+        std::ifstream f(entry.path());
+        std::string dsl((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        if (dsl.empty()) { continue; }
+        sirius::compression::plan_register::global().set_table_plan(entry.path().stem().string(),
+                                                                    std::move(dsl));
+        ++loaded;
+      }
+      if (ec) {
+        SIRIUS_LOG_WARN(
+          "[compression] cannot scan plan dir '{}': {}", comp.input_plan_dir, ec.message());
+      } else {
+        SIRIUS_LOG_INFO(
+          "[compression] loaded {} table plan(s) from '{}'", loaded, comp.input_plan_dir);
+      }
+    }
   }
 
   memory_manager_ = std::make_unique<sirius::memory::sirius_memory_reservation_manager>(

@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "compression/plan_register.hpp"
 #include "log/logging.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_operator_type.hpp"
@@ -76,26 +77,31 @@ void materialize_repository_wiring(const std::vector<repository_wiring>& wirings
                         wiring.barrier_type, repo, wiring.source_pipeline, dest_pipeline));
     wiring.source_op->add_next_port_after_sink({next_op, wiring.port_id});
 
-    // Report the lineage resolved for this edge's columns. The spill compressor
-    // uses it to reuse a column's offline plan instead of searching for one
-    // mid-query; logging it here makes coverage visible per query.
+    // Hand this edge's base-table lineage to the compressor, which uses it to
+    // reuse a column's offline plan instead of searching for one mid-query.
     {
       auto const& origins = wiring.source_op->column_origins;
-      std::size_t known   = 0;
-      std::string detail;
-      for (std::size_t i = 0; i < origins.size(); ++i) {
-        if (!origins[i].has_value()) { continue; }
-        ++known;
-        if (!detail.empty()) { detail += ", "; }
-        detail += std::to_string(i) + "->" + origins[i]->table_name + "." +
-                  std::to_string(origins[i]->table_column_index);
+      sirius::compression::plan_register::spill_column_origins mapped;
+      mapped.reserve(origins.size());
+      std::size_t known = 0;
+      for (auto const& o : origins) {
+        if (o.has_value()) {
+          ++known;
+          mapped.push_back(sirius::compression::plan_register::spill_column_origin{
+            o->table_name, o->table_column_index});
+        } else {
+          mapped.push_back(std::nullopt);
+        }
       }
-      SIRIUS_LOG_DEBUG("[lineage] repo op={} port={} cols={} resolved={} [{}]",
+      if (known > 0) {
+        sirius::compression::plan_register::global().set_spill_column_origins(repo,
+                                                                              std::move(mapped));
+      }
+      SIRIUS_LOG_DEBUG("[lineage] repo op={} port={} cols={} resolved={}",
                        op_id,
                        wiring.port_id,
                        origins.size(),
-                       known,
-                       detail);
+                       known);
     }
   }
 }

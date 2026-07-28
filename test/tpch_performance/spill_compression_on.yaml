@@ -32,6 +32,9 @@ sirius:
     min_batch_size_bytes: 0
     max_compressed_fraction: 0.75
     column_threads: 4
+    # Offline per-table plans. Loaded regardless of pin compression: the spill
+    # path reaches them through column lineage.
+    input_plan_dir: /home/jhoozemans/workspace/sirius/sirius/src/compression/simpatico_codegen/plans/tpch_sf1000
     # The arm under test. Explorer settings are the current (unmeasured)
     # defaults — establishing better ones is what this benchmark feeds.
     enable_spill_compression: true

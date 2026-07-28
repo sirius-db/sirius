@@ -383,6 +383,48 @@ Only once coverage is real does the rest follow: seed `plan_register` from the o
 currently gates it), then stagger exploration so at most one column is explored per
 spill.
 
+### MEASURED: lineage seeding removes exploration, but compression itself OOMs
+
+With plans seeded from lineage (q21, SF100, same configs as above):
+
+| | Wall (on) | vs off | explores | spills compressed | declines |
+| --- | --- | --- | --- | --- | --- |
+| in-query explorer, tuned | 36.4 s | 2.3x | 3 | 18 | 12 |
+| lineage-seeded | 31.3 s | 2.4x (off fell to 12.9 s) | **0** | 0 | 20 |
+
+Exploration is gone — the thing that was 81% of query time no longer runs at all, and
+seeding resolves cleanly where lineage reaches (`seeded 2/2 columns`). Two fixes were
+needed to get there beyond the lineage work itself:
+
+- `input_plan_dir` was read **lazily inside `pin_table()`'s bind**, one table at a
+  time. A query that never pinned anything never loaded any plan, so the spill path —
+  which reaches them through lineage, not through pinning — found nothing. Plans are
+  now loaded once at `SiriusContext::initialize()`. Decoupling the load from
+  `enable_pin_table_compression` was necessary but not sufficient; the real problem
+  was *where* the load lived.
+
+But the wall clock barely moved, because the cost simply relocated: every one of the
+20 declines is now `std::bad_alloc: out_of_memory` from `compress_column` itself.
+
+**This is the architectural problem, now isolated.** Compression on the spill path
+needs to allocate GPU memory at exactly the moment the GPU has none — that is what
+triggered the spill. Exploration made it far worse (hundreds of trial encodes) and
+removing it was worth doing, but the residual is inherent to compressing *on the
+device being evacuated*. Tuning cannot fix it.
+
+Plausible directions, roughly in order of appeal:
+
+1. Reserve a small device arena for spill compression up front, outside the pool the
+   query allocates from, so a spill always has room to work in.
+2. Compress in chunks sized to fit whatever headroom exists, rather than whole columns.
+3. Stage to host uncompressed first and compress there (moves the cost off the GPU
+   entirely, at the price of host bandwidth and CPU codecs).
+4. Accept it: spill compression only pays when the GPU is *near* full rather than
+   completely full, which argues for triggering the downgrade earlier.
+
+A profile of the current state (0 explores, 20 failed compressions) is the next
+diagnostic step — the ~18 s of remaining overhead is not yet attributed.
+
 ### Tune the explorer for use during query execution
 
 The explorer's defaults were chosen for offline plan generation, where a long beam

@@ -284,6 +284,37 @@ std::vector<column_state> resolve_or_explore_spill_plan(cudf::table_view table,
     throw std::runtime_error("[compression_converters] no column worth compressing");
   }
 
+  const auto num_cols = static_cast<std::size_t>(table.num_columns());
+
+  // Prefer the plans already explored offline for these columns' base tables.
+  // Exploring in-query costs a beam search on the downgrade thread — ~81% of query
+  // time in the SF100 benchmark — so a plan that is merely good and free beats one
+  // that is optimal and expensive. Columns with no lineage (aggregate results,
+  // computed expressions) or whose table has no plan loaded are stored raw until
+  // the edge's next scheduled replan.
+  if (auto seeds = reg.seed_plans_from_lineage(ctx.repo, num_cols)) {
+    nvtx3::scoped_range seed_range{"sirius::compression::seed_spill_plan"};
+    std::vector<compression::plan_register::column_plan_candidate> seeded;
+    seeded.reserve(num_cols);
+    std::size_t hits = 0;
+    for (auto& seed : *seeds) {
+      if (seed.has_value()) {
+        ++hits;
+        seeded.push_back({std::move(*seed), /*ratio=*/1.0, /*c=*/0.0, /*d=*/0.0});
+      } else {
+        seeded.push_back({kPassthroughDsl, 1.0, 0.0, 0.0});
+      }
+    }
+    SIRIUS_LOG_DEBUG("[compression_converters] repo={} seeded {}/{} columns from table plans",
+                     static_cast<const void*>(ctx.repo),
+                     hits,
+                     num_cols);
+
+    reg.set_spill_plan(ctx.repo, std::move(seeded), ctx.replan_change_threshold);
+    const auto settled = reg.decide_spill_plan(ctx.repo, /*replan_after_uses=*/0);
+    if (settled.verdict != verdict::skip) { return settled.columns; }
+  }
+
   nvtx3::scoped_range nvtx_range{"sirius::compression::explore_spill_plan"};
 
   simpatico::exploration_config ecfg;

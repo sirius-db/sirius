@@ -1286,9 +1286,8 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
   // Compression config (tier-agnostic): load the per-table plan DSL from the plan
   // directory (if configured), then resolve it into a compression_pin_config. Both
   // the host and GPU pin paths compress with this when enabled.
-  const auto& comp_cfg = sirius_ctx->get_config().get_compression_config();
-  const bool comp_globally_enabled =
-    comp_cfg.enable_pin_table_compression && !comp_cfg.input_plan_dir.empty();
+  const auto& comp_cfg             = sirius_ctx->get_config().get_compression_config();
+  const bool comp_globally_enabled = !comp_cfg.input_plan_dir.empty();
   if (comp_globally_enabled) {
     namespace fs     = std::filesystem;
     const auto& name = data.args.name;
