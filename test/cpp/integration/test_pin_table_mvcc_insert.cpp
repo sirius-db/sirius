@@ -22,11 +22,17 @@
 #include <catch.hpp>
 #include <duckdb.hpp>
 #include <utils/gpu_execution_fixture.hpp>
+#include <utils/pinned_entry_census.hpp>
 #include <utils/sirius_test_env.hpp>
 #include <utils/transparent_execution_test_utils.hpp>
 
+#include <filesystem>
+#include <fstream>
 #include <memory>
+#include <random>
 #include <string>
+#include <system_error>
+#include <vector>
 
 using PinMvccInsertFixture = sirius::test::GpuExecutionFixture;
 
@@ -467,4 +473,67 @@ TEST_CASE_METHOD(PinMvccInsertFixture,
   // Projecting only the pinned scalar column serves from cache + delta.
   compare_gpu_vs_cpu("SELECT count(*), sum(k) FROM t;");
   run_ok("CALL unpin_table('t');");
+}
+
+TEST_CASE_METHOD(PinMvccInsertFixture,
+                 "mvcc insert: the residency gate installs no narrow sidecar when deltas serve",
+                 "[integration][gpu_execution][pin_table_mvcc_insert][compression]")
+{
+  namespace fs = std::filesystem;
+
+  // Narrow-eligible values: they fit INT16, so the compression-enabled pin
+  // stores floored INT32 carriers inside compressed chunks.
+  run_ok("CREATE TABLE t_delta_comp AS SELECT (range % 1000)::BIGINT AS k FROM range(50000);");
+  run_ok("CHECKPOINT;");
+
+  // Random suffix rather than a fixed name: the suite is routinely run from several sessions at
+  // once, and two of them must not share one plan directory.
+  std::random_device entropy;
+  auto plan_dir =
+    fs::temp_directory_path() /
+    ("sirius-delta-comp-plan-" + std::to_string(entropy()) + "-" + std::to_string(entropy()));
+  fs::create_directories(plan_dir);
+  {
+    std::ofstream plan(plan_dir / "t_delta_comp.txt");
+    plan << "input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n";
+  }
+  run_ok("SET pin_table_compression = true;");
+  run_ok("SET pin_table_compression_min_batch_size_bytes = 0;");
+  run_ok("SET enable_compressed_materialization = true;");
+  run_ok("SET pin_table_input_compression_plan_dir = '" + plan_dir.string() + "';");
+
+  auto const pin_before = sirius::test::get_compressed_materialization_stats(*con);
+  run_ok("CALL pin_table(format='duckdb', name='t_delta_comp', tier='host');");
+  auto const pin_after = sirius::test::get_compressed_materialization_stats(*con);
+  REQUIRE(pin_after.pin_columns_narrowed > pin_before.pin_columns_narrowed);
+
+  // Census the entry before the INSERT: the sidecar counter alone would read identically if the
+  // pin had silently failed to compress or to narrow, which is exactly what this case must have
+  // in place before the delta interaction means anything.
+  auto const census = sirius::test::census_entry(*con, "t_delta_comp");
+  REQUIRE(census.compressed_chunks == census.chunks);
+  REQUIRE(census.all_columns_narrowed);
+  REQUIRE(census.first_chunk_carriers ==
+          std::vector<cudf::data_type>{cudf::data_type{cudf::type_id::INT32}});
+
+  // Rows beyond the pinned prefix — one of them representable by no narrow
+  // carrier. Delta splits decode fresh at native width, so the gate must
+  // install no narrow sidecar for this scan (a sidecar would force per-batch
+  // verification onto the delta and the 3000000000 row would fail it).
+  run_ok("INSERT INTO t_delta_comp VALUES (3000000000), (7);");
+
+  // The decline observable is the flat sidecar counter; the pinned narrow
+  // chunks legitimately restore to native at the scan (no sidecar, so the
+  // narrow cache carriers widen), and delta rows arrive native and unverified.
+  auto const before = sirius::test::get_compressed_materialization_stats(*con);
+  compare_gpu_vs_cpu("SELECT count(*), max(k), sum(k) FROM t_delta_comp;");
+  auto const after = sirius::test::get_compressed_materialization_stats(*con);
+  REQUIRE(after.scan_sidecars_installed == before.scan_sidecars_installed);
+  REQUIRE(after.scan_columns_narrowed == before.scan_columns_narrowed);
+
+  run_ok("CALL unpin_table('t_delta_comp');");
+  run_ok("SET pin_table_compression = false;");
+  run_ok("SET enable_compressed_materialization = false;");
+  std::error_code ec;
+  fs::remove_all(plan_dir, ec);
 }

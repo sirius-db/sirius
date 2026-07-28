@@ -16,6 +16,7 @@
 
 #include "catch.hpp"
 #include "helper/numeric_narrowing.hpp"
+#include "pin_table.hpp"
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/null_mask.hpp>
@@ -458,5 +459,81 @@ TEST_CASE("exact numeric minmax handles nulls and wide decimals", "[numeric_narr
     REQUIRE(range->decimal_scale == 7);
     REQUIRE(range->minimum == minimum);
     REQUIRE(range->maximum == maximum);
+  }
+}
+
+TEST_CASE("carrier floor for compression widens 16-bit selections only", "[carrier_floor]")
+{
+  using sirius::floor_carrier_for_compression;
+  auto const floored = [](cudf::type_id id) {
+    return floor_carrier_for_compression(cudf::data_type{id}).id();
+  };
+
+  SECTION("INT16 and UINT16 floor to their 32-bit same-family widening")
+  {
+    REQUIRE(floored(cudf::type_id::INT16) == cudf::type_id::INT32);
+    REQUIRE(floored(cudf::type_id::UINT16) == cudf::type_id::UINT32);
+  }
+
+  SECTION("every other carrier passes through unchanged")
+  {
+    for (auto const id : {cudf::type_id::INT8,
+                          cudf::type_id::UINT8,
+                          cudf::type_id::INT32,
+                          cudf::type_id::UINT32,
+                          cudf::type_id::INT64,
+                          cudf::type_id::UINT64}) {
+      REQUIRE(floored(id) == id);
+    }
+    auto const decimal32_s2 = cudf::data_type{cudf::type_id::DECIMAL32, -2};
+    auto const decimal64_s2 = cudf::data_type{cudf::type_id::DECIMAL64, -2};
+    REQUIRE(floor_carrier_for_compression(decimal32_s2) == decimal32_s2);
+    REQUIRE(floor_carrier_for_compression(decimal64_s2) == decimal64_s2);
+  }
+
+  SECTION("composed with the chooser at the pin driver's call site")
+  {
+    using sirius::logical_type;
+    using sirius::signed_integer_range;
+    using sirius::type_id;
+    using sirius::unsigned_integer_range;
+
+    // An INT16-fitting BIGINT selects INT16 without compression and stores
+    // INT32 (still narrower than native) when compression will run.
+    auto const bigint = logical_type::make(type_id::BIGINT);
+    auto const chosen = sirius::choose_narrow_physical_type(bigint, signed_integer_range(0, 30000));
+    REQUIRE(chosen.has_value());
+    REQUIRE(chosen->id() == cudf::type_id::INT16);
+    REQUIRE(floor_carrier_for_compression(*chosen).id() == cudf::type_id::INT32);
+
+    auto const ubigint = logical_type::make(type_id::UBIGINT);
+    auto const chosen_unsigned =
+      sirius::choose_narrow_physical_type(ubigint, unsigned_integer_range(0, 60000));
+    REQUIRE(chosen_unsigned.has_value());
+    REQUIRE(chosen_unsigned->id() == cudf::type_id::UINT16);
+    REQUIRE(floor_carrier_for_compression(*chosen_unsigned).id() == cudf::type_id::UINT32);
+
+    // An INTEGER whose values fit INT16 floors back to the native width; the
+    // call site's no-op check then keeps the column native, unnarrowed.
+    auto const integer = logical_type::make(type_id::INTEGER);
+    auto const chosen_int32 =
+      sirius::choose_narrow_physical_type(integer, signed_integer_range(0, 30000));
+    REQUIRE(chosen_int32.has_value());
+    REQUIRE(chosen_int32->id() == cudf::type_id::INT16);
+    REQUIRE(floor_carrier_for_compression(*chosen_int32).id() == cudf::type_id::INT32);
+
+    // INT8-fitting values keep their INT8 selection under the floor.
+    auto const chosen_int8 =
+      sirius::choose_narrow_physical_type(bigint, signed_integer_range(0, 100));
+    REQUIRE(chosen_int8.has_value());
+    REQUIRE(floor_carrier_for_compression(*chosen_int8).id() == cudf::type_id::INT8);
+
+    // Decimal selections are unaffected by the floor.
+    auto const decimal = logical_type::make_decimal(18, 2);
+    auto const chosen_decimal =
+      sirius::choose_narrow_physical_type(decimal, sirius::decimal_range(-12345, 99999, 2));
+    REQUIRE(chosen_decimal.has_value());
+    REQUIRE(chosen_decimal->id() == cudf::type_id::DECIMAL32);
+    REQUIRE(floor_carrier_for_compression(*chosen_decimal) == *chosen_decimal);
   }
 }

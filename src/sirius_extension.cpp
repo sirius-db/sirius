@@ -134,12 +134,12 @@ constexpr std::string QUERY_LABEL_PARAM_KEY = "query_label";
 namespace {
 
 std::uint64_t count_narrowed_columns(
-  const std::vector<std::vector<bool>>& narrowed_columns) noexcept
+  sirius::pinned_column_storage_matrix const& column_storage) noexcept
 {
   std::uint64_t count = 0;
-  for (auto const& chunk : narrowed_columns) {
-    for (bool const narrowed : chunk) {
-      count += narrowed ? 1 : 0;
+  for (auto const& chunk : column_storage) {
+    for (auto const& column : chunk) {
+      count += column.narrowed ? 1 : 0;
     }
   }
   return count;
@@ -1332,7 +1332,7 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
                                       {.capture_chunk_stats               = capture_chunk_stats,
                                        .enable_compressed_materialization = compressed_pin});
     sirius_ctx->record_compressed_materialization_pin_columns_narrowed(
-      count_narrowed_columns(host_result.narrowed_columns));
+      count_narrowed_columns(host_result.column_storage));
     // entry.memory_space is metadata only; each host_chunk carries its own per-GPU
     // NUMA-local memory_space. Pass a representative (the first GPU's host space).
     int const first_gpu_id          = gpu_spaces_mut[0]->get_device_id();
@@ -1344,7 +1344,7 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
                                       *representative_host_space,
                                       std::move(pinned_column_types),
                                       std::move(host_result.chunk_stats),
-                                      std::move(host_result.narrowed_columns));
+                                      std::move(host_result.column_storage));
     if (data.args.format == "duckdb") {
       sirius::scan_manager::duckdb_mvcc_metadata mvcc;
       mvcc.v_base                   = duckdb_pin_v_base;
@@ -1352,15 +1352,25 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
       scan_mgr.attach_mvcc_metadata(data.args.name, std::move(mvcc));
     }
   } else if (pin_comp.enabled) {
-    // GPU tier, compression enabled: materialize each batch and compress it when it
-    // qualifies, keeping the compressed payload in device memory; batches that do
-    // not qualify are pinned uncompressed. Both forms land in one ordered chunk
-    // vector, so a table that mixes them pins without special-casing.
+    // GPU tier, compression enabled: narrow each materialized batch (when narrowing is
+    // on), then compress it when it qualifies, keeping the compressed payload in device
+    // memory; batches that do not qualify are pinned uncompressed. Both forms land in
+    // one ordered chunk vector, so a table that mixes them pins without special-casing.
     auto dev_result = sirius::materialize_all_batches_compressed(
-      *ingestible, gpu_spaces_mut, *scan_mgr.io_ctx(), pin_comp);
+      *ingestible,
+      gpu_spaces_mut,
+      *scan_mgr.io_ctx(),
+      pinned_column_types,
+      pin_comp,
+      {.capture_chunk_stats = false, .enable_compressed_materialization = compressed_pin});
+    sirius_ctx->record_compressed_materialization_pin_columns_narrowed(
+      count_narrowed_columns(dev_result.column_storage));
 
-    scan_mgr.insert_pinned_entry_device(
-      data.args.name, std::move(cache_info), std::move(dev_result.chunks), *gpu_spaces_mut[0]);
+    scan_mgr.insert_pinned_entry_device(data.args.name,
+                                        std::move(cache_info),
+                                        std::move(dev_result.chunks),
+                                        *gpu_spaces_mut[0],
+                                        std::move(dev_result.column_storage));
     if (data.args.format == "duckdb") {
       sirius::scan_manager::duckdb_mvcc_metadata mvcc;
       mvcc.v_base                   = duckdb_pin_v_base;
@@ -1378,7 +1388,7 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
                                       {.capture_chunk_stats               = capture_chunk_stats,
                                        .enable_compressed_materialization = compressed_pin});
     sirius_ctx->record_compressed_materialization_pin_columns_narrowed(
-      count_narrowed_columns(mat.narrowed_columns));
+      count_narrowed_columns(mat.column_storage));
     auto base_row_count_per_chunk = std::move(mat.base_row_count_per_chunk);
     scan_mgr.insert_pinned_entry(data.args.name,
                                  std::move(cache_info),
@@ -1386,7 +1396,7 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
                                  std::move(mat.chunk_memory_spaces),
                                  std::move(pinned_column_types),
                                  std::move(mat.chunk_stats),
-                                 std::move(mat.narrowed_columns));
+                                 std::move(mat.column_storage));
     if (data.args.format == "duckdb") {
       sirius::scan_manager::duckdb_mvcc_metadata mvcc;
       mvcc.v_base                   = duckdb_pin_v_base;

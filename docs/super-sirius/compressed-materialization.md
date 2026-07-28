@@ -66,12 +66,14 @@ At plan time, a residency gate decides whether the scan receives a sidecar and d
 target carrier in it. The gate probes the scan manager for the pinned entry that will serve this
 scan — same identity as the serve-time cache hit (same parquet file set or same duckdb
 catalog.schema.table, through the same matchers) and able to serve every requested column. Each
-narrowable column's plan target then comes from that entry's ACTUAL stored chunk carriers
-(`pinned_column_narrow_carrier`): the column's narrowing markers must show it narrowed in every
-chunk, every chunk carrier is defensively validated as a strict same-family narrowing of the
-native carrier, and the target is the widest carrier across the chunks — chunks stored narrower
-than the target widen at serve through the verified same-family restore. Pin-time narrowing chose
-each carrier from exact per-chunk min/max over materialized data, so the stored carriers are
+narrowable column's plan target then comes from the entry's recorded stored-column metadata
+(`pinned_column_narrow_carrier`, a pure fold over the `column_storage` matrix the pin driver
+recorded at the moment of storage): the metadata must show the column narrowed in every chunk,
+every recorded carrier is defensively validated as a strict same-family narrowing of the native
+carrier, and the target is the widest carrier across the chunks — chunks stored narrower than the
+target widen at serve through the verified same-family restore. The fold never opens storage, so
+compressed and uncompressed chunks on either tier answer identically. Pin-time narrowing chose
+each carrier from exact per-chunk min/max over materialized data, so the recorded carriers are
 ground truth for the values the cache serves. Source statistics are not consulted at plan time,
 so sidecar availability does not depend on footer or catalog statistics: multi-file parquet scans
 gate identically to single-file scans. This yields three residency states:
@@ -87,6 +89,16 @@ gate identically to single-file scans. This yields three residency states:
    example, the table was pinned while the flag was off): that column's target stays native, and
    when no column survives the whole sidecar is dropped. A native resident chunk is never narrowed
    at serve time as a recurring per-query cost.
+
+For duckdb-native entries one further condition applies: when rows exist beyond the pinned prefix
+(the same `GetTotalRows() > n_cache` check the MVCC guards make against the entry's snapshot
+metadata), the query serves those rows as insert-delta splits decoded fresh at native width, and
+the gate installs no narrow sidecar for the scan. A narrow sidecar would put every delta batch
+through per-batch exact-range verification, and an inserted value outside the narrow carrier would
+fail the query over to the CPU fallback. Entry chunks and their recorded metadata are untouched by
+deltas. Residual race, accepted like the plan-staleness note below: an INSERT landing between this
+check and the delta capture serves native delta batches under a narrow sidecar — the per-batch
+verified cast then either passes or fails loudly to the fallback.
 
 A scan receives a complete physical sidecar only when its output mapping is complete and at least
 one eligible projected column passes the residency derivation. Columns that cannot be narrowed
@@ -267,8 +279,13 @@ the finished sidecars at wrap time rather than through a propagation case:
 1. Decode one cache chunk at the native type.
 2. Capture zone-map statistics from that native table when zone-map pruning is enabled.
 3. Compute exact numeric min/max for each eligible column.
-4. Cast to the narrowest exact carrier.
-5. Store the resulting GPU table or convert it to pinned host memory.
+4. Cast to the narrowest exact carrier (floored per the Simpatico interplay below when compression
+   will run).
+5. Record the chunk's stored-column metadata: each column's actual carrier plus whether it is
+   narrower than the native mapping (`pinned_column_storage_meta`).
+6. Hand the chunk to the tier sink, which compresses it with Simpatico when the pin resolved a
+   compression plan and the batch qualifies, and otherwise stores the GPU table or converts it to
+   pinned host memory.
 
 Different cached chunks may choose different widths. Cache metadata does not reinterpret their
 buffers; each cuDF representation retains its actual type. The cached provider emits one cached
@@ -291,23 +308,163 @@ it does not rewrite an existing cache entry:
   on to obtain narrowing;
 - pinning with the option on and querying with it off restores cached numeric carriers to the native
   logical schema;
-- a per-resident-input marker records whether the served columns actually use narrower carriers.
-  It survives setting changes and drives reservation independently of the current flag.
+- a per-resident-input marker records whether scan normalization will actually cast the served
+  columns. It survives setting changes and drives reservation independently of the current flag.
 
-A converting resident input reserves its working-set bytes plus the exact restore destination when
-the carriers are known: the cached serve site sums, over the selected stored columns whose carrier
-differs from the native mapping of their pin-time logical type, the native-width data bytes plus
-validity-mask bytes, and threads that figure through the split into the reservation estimate. When
-the destination is unknowable (a pin without the type sidecar), the estimate falls back to the
-stored bytes multiplied by the named maximum numeric carrier expansion
-(`kMaxNumericCarrierExpansion`, currently 8) — the constant is the fallback bound, never the
-primary estimate. Known limitation: a table pinned with `enable_pinned_zone_map_pruning = false`
-drops the pin-time type sidecar, so its narrowed serves always take this fallback bound — a
-conservative degradation (over-reservation, never under) reachable only off the default
-configuration. A narrow plan sidecar over a native cache reserves the working set plus the
-stored bytes (a narrowing destination is bounded by its source). All arithmetic saturates. Filter
-masks and other working-set allocations are additive, and a resident input that needs no
-conversion uses the larger of its stored and working-set sizes.
+The reservation charges the conversion that actually happens. The cached serve site knows both
+halves of the comparison normalization will make: each served column's recorded stored carrier,
+and the carrier the scan plans for it — `sirius_gpu_scan_operator::normalization_targets`, which
+is the plan sidecar when one is installed and the native mapping of the output logical types
+otherwise. `sirius_scan_manager::prepare_for_query` hands that vector to the provider as is: a
+cached chunk is served in the ingestible's materialized order, and both ingestibles materialize
+the output columns first (in output order) with any pure-filter columns after them, so served
+slot k is output column k and a slot past the end of the vector is a pure-filter column, which
+`post_filter_and_project` drops before normalization sees it. Only a hive-partition output column
+could decouple the two, and a scan requesting one cannot serve from a pin. A column is charged
+only when its (stored carrier, target) pair satisfies the same predicate
+`normalize_physical_schema` applies — a same-family widening, or a same-family narrowing under an
+explicit sidecar — and it is charged `rows x size_of(target)` plus validity-mask bytes, the width
+`cudf::cast` allocates.
+
+Two consequences are worth stating plainly. A chunk pinned narrow and queried at that same narrow
+target — the stacking happy path — issues no cast and is charged no conversion destination, where
+charging by "storage is narrow" would have reserved a full native destination for a conversion
+that never runs. And the estimate no longer consults the zone-map sidecar at all, so a table
+pinned with `enable_pinned_zone_map_pruning = false`, or a GPU-tier compression-enabled pin (which
+stores no sidecar), is sized as precisely as any other pin. The former 8x-bound limitation on
+those pins is gone.
+
+Rows come from whichever form stores the chunk — a Simpatico-compressed chunk reports its row
+count from the representation and always contributes the validity-mask term, since per-column
+nullability inside a blob is opaque (a small over-approximation, never under). When a converting
+chunk's destination is unknowable the estimate falls back to the stored bytes multiplied by the
+named maximum numeric carrier expansion (`kMaxNumericCarrierExpansion`, currently 8); any chunk
+well-formed enough to serve reports its rows, so that constant is a defensive bound rather than a
+path production takes. A scan carrying a plan sidecar keeps a source-bounded floor on top of that
+— working set plus stored bytes — even on chunks the serve site reported cast-free, so a
+pinned-narrow scan under a sidecar reserves that floor rather than its bare working set. All
+arithmetic saturates. Filter masks and other working-set allocations are additive, and a resident
+input with neither a conversion nor a sidecar uses the larger of its stored and working-set sizes.
+
+## Simpatico interplay
+
+Pin-table compression (Simpatico, `pin_table_compression`) and compressed materialization stack:
+a pinned chunk is narrowed first, then compressed, and at serve time decompression reproduces the
+narrow carrier directly from the blob. The two features shrink different things — compression
+shrinks resident bytes and the host-to-GPU transfer (the converter uploads compressed leaves and
+decompresses on the serving GPU), while narrowing shrinks the decompressed working set and every
+downstream byte: evaluator inputs, join payloads, group keys, and the multi-GPU exchange.
+
+### Ordering: narrow, then compress
+
+The pin materialization driver narrows each batch before the per-tier sinks compress it, so
+`compress_with_plan` receives the narrow table and the blob records the narrow dtypes. Simpatico's
+round-trip contract decompresses to exactly the types it was given, so the cached provider hands
+out the compressed representation, the converter registry decompresses it on the serving GPU, and
+scan normalization sees actual == target — the pinned-narrow serve stays cast-free with no decode
+changes and no redundant native round trip. Compression ratio on a value-preserving narrow column
+is approximately preserved (byte codecs were already compressing away the constant high bytes;
+bitpack and FOR derive widths from the data), and encode/decode touch fewer bytes. Per-chunk width
+heterogeneity is naturally supported: each chunk's blob records its own dtypes, and a chunk
+narrower than the plan target widens right after decode through the verified same-family restore.
+
+### Carrier floor while compression runs
+
+Simpatico's fused-codegen ops (delta/rle/bitpack/for/zigzag — the ops integer plan blocks use)
+encode element widths 8/32/64 (unsigned and float reinterpreted at the same width) but not 16, and
+an unencodable element type fails the whole batch's compression and latches compression off for
+the rest of the pin. When compression will actually run — the pin resolved a compression plan and
+compression is enabled; a table with no plan file keeps 16-bit carriers — the pin driver therefore
+never selects INT16/UINT16: the floored carrier is the 32-bit same-family widening
+(`floor_carrier_for_compression`, composed at the chooser's call site in `narrow_pin_chunk`; the
+chooser itself stays pure). INT8/UINT8 and DECIMAL32/64 remain selectable: codegen maps DECIMAL32
+onto its 4-byte and DECIMAL64 onto its 8-byte element type directly, both inside the renderer's
+supported width set. Narrowing a decimal is in fact the one direction that can make a column
+*more* encodable — DECIMAL128 has no codegen element type at all, so a DECIMAL128 column that
+narrows to DECIMAL64 becomes encodable where the native carrier was not. A floored column is
+still marked narrowed when the floored carrier is narrower than native; a selection floored back
+to the native width leaves the column native. The floor expires with issue #1310, which extends
+Simpatico's dtype tables with int16/uint16 and adds a per-block encodability predicate so the
+policy can become precise instead of conservative.
+
+The floor is a per-pin decision, taken from whether compression *will run*, and both compression
+gates (`min_batch_size_bytes` and `max_compressed_fraction`) are evaluated on the already-narrowed
+table. A batch that later falls out of a gate — or arrives after a failure has latched compression
+off — is therefore stored uncompressed at a floored 32-bit carrier where 16 bits would have held
+it. That is a benefit loss only (a wider carrier is always value-preserving, and markers, folds
+and serve-time normalization are unaffected); deciding the floor from the gate outcome would be
+circular, so the precise version needs the same per-block predicate as #1310.
+
+Known residual: a plan block with a width-explicit packed op (a `bitextract`/`bitjoin` field spec
+of a fixed total width) on an integer column narrowed to a different width still fails that
+batch's compression, which latches compression off for the remainder of the pin — the pin falls
+back to uncompressed narrow chunks from that batch onward, markers intact and results correct. The
+WARN names the columns this pin narrowed before compression and states that whole-pin blast
+radius. Shipped TPC-H plans use bitextract only for float columns, which never narrow.
+
+### Stored-column metadata, not storage introspection
+
+Every pin records a chunk-major `column_storage` matrix (`pinned_column_storage_meta` = carrier +
+narrowed flag) at the moment of storage: for an uncompressed chunk the carrier is the stored
+column's actual cuDF type, for a compressed chunk it is the type `compress_with_plan` received —
+by the round-trip contract also the type decompression reproduces. The plan-time folds
+(`pinned_column_narrowed_in_all_chunks`, `pinned_column_narrow_carrier`) and the serve-time
+restore sizing are pure reads of this matrix; no consumer opens storage, so compressed blobs need
+no introspection API and every storage form on both tiers answers identically. Insertion requires
+the matrix: every pin path is driven by the pin driver, which records the metadata as it stores
+each chunk, so a matrix that does not cover every chunk and column is a recorder bug and throws.
+One validator, `validate_recorded_column_storage`, serves all three inserts; each supplies a
+callable answering "the stored type at (chunk, column), or nothing when the form is opaque", which
+collapses the per-form differences to a single rule — a cell storage can report must equal the
+recorded carrier, a cell it cannot report is trusted. A matrix whose shape disagrees with the
+storage throws at serving validation, which still accepts the empty matrix because a zero-chunk
+entry legitimately records nothing.
+
+### Trust boundary
+
+The recorded carrier of a compressed chunk is trusted as the type decompression reproduces. That
+is Simpatico's documented round-trip contract, but Simpatico does not enforce it on its retag
+path: when a decoded column's width cannot be retagged to the recorded dtype, `apply_stored_dtype`
+returns the decoder's result rather than reporting the contradiction (issue filed upstream).
+
+Sirius does not add a second check, because the only place one could run is after decompression in
+the scan operator — which is exactly where `normalize_physical_schema` already checks, before any
+cast. With a sidecar installed, a decompressed carrier that is neither a same-family widening of
+nor a verified narrowing to the plan target throws `internal_exception`, surfaced per engine
+policy as CPU fallback. A width surprise cannot slip through as a silent reinterpretation, because
+normalization compares `cudf::data_type`s and never buffers.
+
+### Accounting per chunk form
+
+The task-size basis composes per chunk form: an uncompressed chunk's basis is its stored (native
+or narrow) bytes; a compressed chunk's is max(compressed, uncompressed) — the compression-side
+estimate, in which "uncompressed" is the narrow footprint when the chunk was narrowed. The
+additive restore-destination term and its per-form row/nullability reads are described with the
+reservation contract above; the working-set multipliers (MVCC mask, row filter) scale the same
+basis unchanged.
+
+### Configurations
+
+- Compression on, narrowing off: native blobs, all-native metadata, no sidecars — compression-only
+  behavior unchanged.
+- Narrowing on, compression off (no plan file, plan does not cover the pinned columns, or the
+  feature disabled): narrowing-only behavior exactly, narrow carriers on uncompressed storage —
+  including 16-bit carriers, since the floor is keyed to compression actually running.
+- Both on: narrow, then compress; the gate reads the recorded carriers and the serve decompresses
+  straight into them — the cast-free happy path plus the full downstream benefit.
+- Both on, a chunk skips compression (minimum batch size, compressed-fraction reject, or the
+  failure latch): that chunk is stored uncompressed narrow in the same entry; the provider
+  dispatches per chunk and the recorded metadata is identical either way.
+- Both on, the GPU-tier narrowing policy retracts a target: the plan target is native, decode
+  still yields the narrow carrier, and scan normalization restores it (counted by
+  `scan_columns_restored`). Pin-on/query-off behaves the same way. An entry's tier, not its
+  compression, decides `sidecar_from_gpu_tier_pin`.
+- INSERT deltas: the residency gate installs no narrow sidecar when deltas will serve (see the
+  residency states above); entry chunks and their metadata are untouched by deltas.
+- Disk fallback (plan built pinned-narrow, entry gone at execution): unchanged — the fresh decode
+  is native and exact-bounds verification guards every planned downcast.
+- Host-tier round trip: compressed leaves upload host-to-GPU and decompress on the serving GPU;
+  narrowing shrinks the decompressed result, not the upload.
 
 ## Correctness invariants
 

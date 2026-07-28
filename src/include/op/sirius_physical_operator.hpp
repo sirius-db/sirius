@@ -368,13 +368,12 @@ struct input_stats {
   /// Transient working set needed to materialize the input. Defaults to zero
   /// for callers that only provide the historical byte basis.
   std::size_t working_set_bytes = 0;
-  /// Whether a resident scan input has a selected physically narrow column.
-  bool contains_narrowed_columns = false;
-  /// Exact bytes of the native-width destinations that restoring the resident
-  /// input's narrowed columns would allocate (see
-  /// scan_operator_input::restore_destination_bytes). Zero means unknown; the
-  /// scan estimate then keeps its conservative maximum-expansion bound.
-  std::size_t restore_destination_bytes = 0;
+  /// Whether scan normalization will cast a selected column of the resident scan input.
+  bool needs_carrier_conversion = false;
+  /// Exact bytes of the destinations those casts allocate (see
+  /// scan_operator_input::conversion_destination_bytes). Zero means unknown; the scan estimate
+  /// then keeps its conservative maximum-expansion bound.
+  std::size_t conversion_destination_bytes = 0;
 };
 
 //! sirius_physical_operator is the base class of the physical operators present in the

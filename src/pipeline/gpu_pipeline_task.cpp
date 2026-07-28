@@ -669,10 +669,10 @@ pipeline::reservation_size_info gpu_pipeline_task::get_estimated_reservation_siz
   auto const* scan_input =
     ls._input_data ? dynamic_cast<const op::scan::scan_operator_input*>(ls._input_data.get())
                    : nullptr;
-  const bool input_contains_narrowed_columns =
-    scan_input != nullptr && scan_input->contains_narrowed_columns;
-  const std::size_t input_restore_destination_bytes =
-    scan_input != nullptr ? scan_input->restore_destination_bytes : 0;
+  const bool input_needs_carrier_conversion =
+    scan_input != nullptr && scan_input->needs_carrier_conversion;
+  const std::size_t input_conversion_destination_bytes =
+    scan_input != nullptr ? scan_input->conversion_destination_bytes : 0;
   auto working_set_bytes = input_basis;
   // Resident (cached) scan inputs report mask/filter copy peaks through their
   // working-set estimate too — it seeds the cold-start guess below via
@@ -700,13 +700,13 @@ pipeline::reservation_size_info gpu_pipeline_task::get_estimated_reservation_siz
     if (auto* pd = dynamic_cast<const op::pipelineable_operator_data*>(ls._input_data.get())) {
       num_batches = pd->get_data_batches().size();
     }
-    const op::input_stats stats{.num_batches               = num_batches,
-                                .bytes                     = input_basis,
-                                .type                      = input_type,
-                                .resident                  = input_resident,
-                                .working_set_bytes         = working_set_bytes,
-                                .contains_narrowed_columns = input_contains_narrowed_columns,
-                                .restore_destination_bytes = input_restore_destination_bytes};
+    const op::input_stats stats{.num_batches                  = num_batches,
+                                .bytes                        = input_basis,
+                                .type                         = input_type,
+                                .resident                     = input_resident,
+                                .working_set_bytes            = working_set_bytes,
+                                .needs_carrier_conversion     = input_needs_carrier_conversion,
+                                .conversion_destination_bytes = input_conversion_destination_bytes};
 
     std::size_t max_estimate = 0;
     if (auto* pipeline = gs.get_pipeline()) {

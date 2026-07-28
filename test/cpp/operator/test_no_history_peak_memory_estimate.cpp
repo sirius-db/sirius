@@ -209,17 +209,19 @@ TEST_CASE("GPU scan resident estimate follows actual carrier conversion",
     /*types=*/{}, /*estimated_cardinality=*/0, /*ingestible=*/{}};
 
   // Five-field aggregate initialization remains source-compatible: the fifth
-  // value is working_set_bytes and the trailing narrowing marker defaults off.
-  input_stats legacy_native{1, 100, operator_data_type::GPU_SCAN, true, 700};
-  CHECK(legacy_native.working_set_bytes == 700);
-  CHECK_FALSE(legacy_native.contains_narrowed_columns);
-  CHECK(native_scan.no_history_peak_memory_estimate(legacy_native) == 700);
+  // value is working_set_bytes and the trailing conversion marker defaults off. A resident chunk
+  // the serve site reports as cast-free -- the stacking happy path, where the stored carrier
+  // already equals the plan target -- is charged no destination at all.
+  input_stats cast_free{1, 100, operator_data_type::GPU_SCAN, true, 700};
+  CHECK(cast_free.working_set_bytes == 700);
+  CHECK_FALSE(cast_free.needs_carrier_conversion);
+  CHECK(native_scan.no_history_peak_memory_estimate(cast_free) == 700);
   CHECK(native_scan.no_history_peak_memory_estimate(
           {1, 800, operator_data_type::GPU_SCAN, true, 700}) == 800);
 
-  // Pin-on/query-off has no plan sidecar, but the cache marker still requires native
-  // restoration. A missing serve-time destination (restore_destination_bytes == 0) keeps the
-  // conservative bound: resident working set + maximum-width destination.
+  // A converting chunk whose row count the serve site could not read
+  // (conversion_destination_bytes == 0) keeps the conservative bound: resident working set +
+  // maximum-width destination.
   CHECK(native_scan.no_history_peak_memory_estimate(
           {1, 100, operator_data_type::GPU_SCAN, true, 100, true}) == 900);
   CHECK(native_scan.no_history_peak_memory_estimate(
@@ -238,7 +240,7 @@ TEST_CASE("GPU scan resident estimate follows actual carrier conversion",
     /*ingestible=*/{}};
   sidecar_scan.set_physical_types({cudf::data_type{cudf::type_id::INT8}});
 
-  // A native cached carrier converting to a narrow plan sidecar (no narrowed marker): the
+  // A native cached carrier converting to a narrow plan sidecar the serve site did not size: the
   // destination is bounded by the stored source, so working set + source bytes. Fresh reads
   // retain the legacy maximum-width estimate.
   CHECK(sidecar_scan.no_history_peak_memory_estimate(

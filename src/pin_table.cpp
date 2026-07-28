@@ -151,7 +151,8 @@ void validate_duckdb_pin_chunk(const op::scan::scan_info& batch,
 namespace {
 
 /// Per-materialized-batch sink: receives one GPU-resident table, its GPU placement, the
-/// stream it was decoded on, and the chunk's zone-map capture (empty when capture is off).
+/// stream it was decoded on, the chunk's stored-column metadata, and the chunk's zone-map
+/// capture (empty when capture is off).
 /// The driver does NOT synchronize — the sink owns the sync, because the host-streaming path
 /// must synchronize while the GPU table (and the gpu_table_representation wrapping it) is
 /// still alive, after the D2H conversion has been enqueued on the same stream.
@@ -159,7 +160,7 @@ using pin_batch_sink =
   std::function<void(std::unique_ptr<cudf::table>,
                      cucascade::memory::memory_space* target,
                      rmm::cuda_stream_view stream,
-                     std::vector<bool> narrowed_columns,
+                     std::vector<pinned_column_storage_meta> column_storage,
                      std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>> chunk_stats)>;
 
 struct narrowed_pin_chunk {
@@ -169,6 +170,7 @@ struct narrowed_pin_chunk {
 
 narrowed_pin_chunk narrow_pin_chunk(std::unique_ptr<cudf::table> table,
                                     duckdb::vector<duckdb::LogicalType> const& column_types,
+                                    bool compression_will_run,
                                     rmm::cuda_stream_view stream,
                                     rmm::device_async_resource_ref mr)
 {
@@ -184,7 +186,13 @@ narrowed_pin_chunk narrow_pin_chunk(std::unique_ptr<cudf::table> table,
     auto const range =
       compute_exact_numeric_range(columns[column_idx]->view(), logical, stream, mr);
     if (!range) { continue; }
-    auto const target = choose_narrow_physical_type(logical, *range);
+    auto target = choose_narrow_physical_type(logical, *range);
+    // The chooser stays pure; the floor composes here. compression_will_run means this pin
+    // resolved a compression plan and compression is enabled (compression_pin_config::enabled),
+    // so the sinks will hand this chunk to Simpatico — keep the selected carrier inside
+    // Simpatico's encodable widths. A floored carrier equal to the native width falls out of the
+    // no-op check below and the column stays native, unnarrowed.
+    if (target && compression_will_run) { target = floor_carrier_for_compression(*target); }
     if (!target || columns[column_idx]->type() == *target) { continue; }
     auto const actual            = columns[column_idx]->type();
     columns[column_idx]          = cudf::cast(columns[column_idx]->view(), *target, stream, mr);
@@ -209,6 +217,7 @@ void materialize_pin_batches(op::scan::gpu_ingestible& ingestible,
                              io::sirius_ioctx& io_ctx,
                              duckdb::vector<duckdb::LogicalType> const& pinned_column_types,
                              pin_materialization_options options,
+                             bool compression_will_run,
                              const pin_batch_sink& on_batch)
 {
   if (gpu_spaces.empty()) {
@@ -286,12 +295,24 @@ void materialize_pin_batches(op::scan::gpu_ingestible& ingestible,
         tbl->view(), pinned_column_types, stream, target->get_default_allocator());
     }
     if (options.enable_compressed_materialization) {
-      auto narrowed = narrow_pin_chunk(
-        std::move(tbl), pinned_column_types, stream, target->get_default_allocator());
+      auto narrowed    = narrow_pin_chunk(std::move(tbl),
+                                       pinned_column_types,
+                                       compression_will_run,
+                                       stream,
+                                       target->get_default_allocator());
       tbl              = std::move(narrowed.table);
       narrowed_columns = std::move(narrowed.columns);
     }
-    on_batch(std::move(tbl), target, stream, std::move(narrowed_columns), std::move(chunk_stats));
+    // Record the chunk's stored-column metadata from the exact table the sink stores — for a
+    // chunk the sink compresses, these are the types compress_with_plan receives and
+    // decompression reproduces.
+    std::vector<pinned_column_storage_meta> column_storage;
+    column_storage.reserve(static_cast<std::size_t>(tbl->num_columns()));
+    for (cudf::size_type i = 0; i < tbl->num_columns(); ++i) {
+      column_storage.push_back(
+        {tbl->get_column(i).type(), narrowed_columns[static_cast<std::size_t>(i)]});
+    }
+    on_batch(std::move(tbl), target, stream, std::move(column_storage), std::move(chunk_stats));
   };
 
   while (!ingestible.has_processed_all_metadata()) {
@@ -307,6 +328,39 @@ void materialize_pin_batches(op::scan::gpu_ingestible& ingestible,
   for (auto& b : coalescer->flush()) {
     handle_batch(std::move(b));
   }
+}
+
+/// Diagnostic for a compression failure inside a pin sink, shared by both drivers. Reports the
+/// real blast radius -- the sink latches compression off for every remaining chunk of the pin,
+/// not just the chunk that failed -- and, when this chunk narrowed carriers before compression,
+/// names the narrowed columns: a plan block with a width-explicit op (@c bitextract / @c bitjoin
+/// packs a fixed total field width) is authored against the native element width and cannot
+/// encode a narrowed column, which is the one failure mode narrowing itself can cause. Issue
+/// #1310 tracks the per-block encodability predicate that would let the pin decline narrowing
+/// per column instead.
+std::string compression_failure_warning(std::string_view what,
+                                        compression_pin_config const& compression,
+                                        std::span<pinned_column_storage_meta const> chunk_storage)
+{
+  std::string message{"compression failed: "};
+  message += what;
+  message +=
+    "; pinning the remainder of this table uncompressed (the failure latches compression "
+    "off for every later chunk)";
+
+  std::string narrowed;
+  for (std::size_t i = 0; i < chunk_storage.size(); ++i) {
+    if (!chunk_storage[i].narrowed) { continue; }
+    if (!narrowed.empty()) { narrowed += ", "; }
+    narrowed +=
+      i < compression.column_names.size() ? compression.column_names[i] : std::to_string(i);
+  }
+  if (!narrowed.empty()) {
+    message += ". This pin narrowed carriers before compression (" + narrowed +
+               "); a plan block with a width-explicit op (bitextract/bitjoin) is authored against "
+               "the native element width and cannot encode a narrowed column -- see issue #1310";
+  }
+  return message;
 }
 
 /// Shared compress step for the host and device pin drivers: compress @p tbl per
@@ -391,6 +445,15 @@ bool compress_and_stage_batch(cudf::table const& tbl,
 
 }  // namespace
 
+cudf::data_type floor_carrier_for_compression(cudf::data_type carrier) noexcept
+{
+  switch (carrier.id()) {
+    case cudf::type_id::INT16: return cudf::data_type{cudf::type_id::INT32};
+    case cudf::type_id::UINT16: return cudf::data_type{cudf::type_id::UINT32};
+    default: return carrier;
+  }
+}
+
 materialized_pin materialize_all_batches(
   op::scan::gpu_ingestible& ingestible,
   std::span<cucascade::memory::memory_space* const> gpu_spaces,
@@ -405,10 +468,12 @@ materialized_pin materialize_all_batches(
     io_ctx,
     pinned_column_types,
     options,
+    // This driver has no compression sink, so the carrier floor never engages.
+    /*compression_will_run=*/false,
     [&](std::unique_ptr<cudf::table> tbl,
         cucascade::memory::memory_space* target,
         rmm::cuda_stream_view stream,
-        std::vector<bool> narrowed_columns,
+        std::vector<pinned_column_storage_meta> column_storage,
         std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>> chunk_stats) {
       // Cached GPU batches are stored with a null writer stream, so the data
       // must be fully resident before it can be served or host-converted.
@@ -416,7 +481,7 @@ materialized_pin materialize_all_batches(
       out.base_row_count_per_chunk.push_back(static_cast<std::size_t>(tbl->num_rows()));
       out.tables.emplace_back(std::move(tbl));
       out.chunk_memory_spaces.push_back(target);
-      out.narrowed_columns.emplace_back(std::move(narrowed_columns));
+      out.column_storage.emplace_back(std::move(column_storage));
       if (!chunk_stats.empty()) { out.chunk_stats.emplace_back(std::move(chunk_stats)); }
     });
   return out;
@@ -431,22 +496,12 @@ host_pin_result materialize_pin_to_host(
   compression_pin_config const& compression,
   pin_materialization_options options)
 {
-  // Narrowing does not compose with compression yet: the plan-time carrier
-  // derivation reads stored carriers from uncompressed chunk forms only, so a
-  // narrow compressed chunk would strand its markers (no sidecar installs, and
-  // mixed pins would pay per-batch restores at serve). Decline narrowing for the
-  // whole pin when compression will run; the pin materializes at native width and
-  // upstream compression semantics apply unchanged.
-  if (compression.enabled && options.enable_compressed_materialization) {
-    SIRIUS_LOG_INFO(
-      "[materialize_pin_to_host] compression is enabled for this pin; declining carrier "
-      "narrowing (compressed chunks store native-width columns)");
-    options.enable_compressed_materialization = false;
-  }
-
   auto& registry = converter_registry::get();
   host_pin_result out;
   bool compression_failed = false;
+  // Per-pin floor predicate: this table resolved a compression plan and compression is enabled,
+  // so the sinks will compress qualifying chunks. Mirrors the sinks' own engage condition.
+  bool const compression_will_run = compression.enabled && !compression.plan_dsl.empty();
 
   materialize_pin_batches(
     ingestible,
@@ -454,15 +509,16 @@ host_pin_result materialize_pin_to_host(
     io_ctx,
     pinned_column_types,
     options,
+    compression_will_run,
     [&](std::unique_ptr<cudf::table> tbl,
         cucascade::memory::memory_space* src_space,
         rmm::cuda_stream_view stream,
-        std::vector<bool> narrowed_columns,
+        std::vector<pinned_column_storage_meta> column_storage,
         std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>> chunk_stats) {
       auto* target_host_space    = host_space_by_gpu.at(src_space->get_device_id());
       bool compressed_this_chunk = false;
       out.base_row_count_per_chunk.push_back(static_cast<std::size_t>(tbl->num_rows()));
-      out.narrowed_columns.emplace_back(std::move(narrowed_columns));
+      out.column_storage.emplace_back(std::move(column_storage));
       if (!chunk_stats.empty()) { out.chunk_stats.emplace_back(std::move(chunk_stats)); }
 
       if (compression.enabled && !compression_failed && tbl && !compression.plan_dsl.empty()) {
@@ -515,9 +571,8 @@ host_pin_result materialize_pin_to_host(
         } catch (const std::exception& e) {
           compression_failed = true;
           SIRIUS_LOG_WARN(
-            "[materialize_pin_to_host] compression failed: {}; "
-            "falling back to uncompressed for this chunk",
-            e.what());
+            "[materialize_pin_to_host] {}",
+            compression_failure_warning(e.what(), compression, out.column_storage.back()));
         }
       }
 
@@ -548,30 +603,35 @@ device_pin_result materialize_all_batches_compressed(
   op::scan::gpu_ingestible& ingestible,
   std::span<cucascade::memory::memory_space* const> gpu_spaces,
   io::sirius_ioctx& io_ctx,
-  compression_pin_config const& compression)
+  duckdb::vector<duckdb::LogicalType> const& pinned_column_types,
+  compression_pin_config const& compression,
+  pin_materialization_options options)
 {
   device_pin_result out;
   bool compression_failed = false;
+  // Per-pin floor predicate, same derivation as materialize_pin_to_host.
+  bool const compression_will_run = compression.enabled && !compression.plan_dsl.empty();
 
-  // No pin-time column types reach this driver, so zone-map capture stays off, and
-  // narrowing is declined on every compression-enabled pin (see
-  // materialize_pin_to_host): every chunk stores native-width columns and the sink's
-  // narrowing markers are always all-false.
+  // The device insert path stores no statistics sidecar (device_pin_result carries none), so a
+  // capture would be computed and dropped — force it off.
+  options.capture_chunk_stats = false;
+
   materialize_pin_batches(
     ingestible,
     gpu_spaces,
     io_ctx,
-    /*pinned_column_types=*/{},
-    pin_materialization_options{.capture_chunk_stats               = false,
-                                .enable_compressed_materialization = false},
+    pinned_column_types,
+    options,
+    compression_will_run,
     [&](std::unique_ptr<cudf::table> tbl,
         cucascade::memory::memory_space* src_space,
         rmm::cuda_stream_view stream,
-        std::vector<bool> /*narrowed_columns*/,
+        std::vector<pinned_column_storage_meta> column_storage,
         std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>> /*chunk_stats*/) {
       std::shared_ptr<sirius::compressed_device_representation> compressed_chunk;
       const std::int64_t chunk_rows = tbl->num_rows();
       out.base_row_count_per_chunk.push_back(static_cast<std::size_t>(chunk_rows));
+      out.column_storage.emplace_back(std::move(column_storage));
 
       if (compression.enabled && !compression_failed && tbl && !compression.plan_dsl.empty()) {
         try {
@@ -682,9 +742,8 @@ device_pin_result materialize_all_batches_compressed(
           if (!tbl) { throw; }  // source released inside callback — no fallback possible
           compression_failed = true;
           SIRIUS_LOG_WARN(
-            "[materialize_all_batches_compressed] compression failed: {}; "
-            "falling back to uncompressed for this chunk",
-            e.what());
+            "[materialize_all_batches_compressed] {}",
+            compression_failure_warning(e.what(), compression, out.column_storage.back()));
         }
       }
 

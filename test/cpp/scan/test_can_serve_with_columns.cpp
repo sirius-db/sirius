@@ -241,6 +241,32 @@ TEST_CASE("cache_entry_info: matches_parquet_files is the shared parquet identit
   REQUIRE_FALSE(cache.matches_parquet_files(std::vector<std::string>{}));
 }
 
+TEST_CASE("cache_entry_info: matches_parquet_files canonicalizes the probe's spellings",
+          "[scan][can_serve]")
+{
+  // Stored identities are canonical (cache_entry_info::from canonicalizes at
+  // construction); probes arrive as bound and are canonicalized inside the
+  // matcher, so a plan-time gate probe and a serve-time cache-hit probe with
+  // non-canonical spellings of the same files both hit. The prefix is chosen to
+  // not exist so canonicalization is purely lexical (no symlink resolution).
+  std::string const base = "/sirius-canon-test-nonexistent";
+  auto cache             = parquet_cache({base + "/a.parquet", base + "/sub/b.parquet"}, {0});
+
+  std::vector<std::string> const dot_segment{base + "/./a.parquet", base + "/sub/b.parquet"};
+  REQUIRE(cache.matches_parquet_files(dot_segment));
+
+  std::vector<std::string> const parent_segment{base + "/a.parquet",
+                                                base + "/other/../sub/b.parquet"};
+  REQUIRE(cache.matches_parquet_files(parent_segment));
+
+  std::vector<std::string> const file_uri{"file://" + base + "/a.parquet", base + "/sub/b.parquet"};
+  REQUIRE(cache.matches_parquet_files(file_uri));
+
+  // Canonicalization never conflates genuinely different paths.
+  std::vector<std::string> const different{base + "/a.parquet", base + "/sub/../b.parquet"};
+  REQUIRE_FALSE(cache.matches_parquet_files(different));
+}
+
 TEST_CASE("cache_entry_info: column_projection_for misses on sentinel columns", "[scan][can_serve]")
 {
   auto cache = duckdb_cache("db", "main", "t", {0, 1, 2});

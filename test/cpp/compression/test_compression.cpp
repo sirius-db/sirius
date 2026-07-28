@@ -155,6 +155,7 @@ TEST_CASE("select_plan_blocks - picks blocks by full-table index in pinned order
 #include <duckdb.hpp>
 #include <scan_manager/sirius_scan_manager.hpp>
 #include <unistd.h>
+#include <utils/pinned_entry_census.hpp>
 #include <utils/transparent_execution_test_utils.hpp>
 
 #include <cstdlib>
@@ -165,8 +166,10 @@ namespace fs = std::filesystem;
 
 namespace {
 
-// Build a minimal single-GPU Sirius YAML with compression enabled.
-void write_compression_yaml(const fs::path& yaml_path)
+// Build a minimal single-GPU Sirius YAML with compression enabled. The scan
+// batch size is parameterized so fixtures that need one pin chunk per parquet
+// row group can shrink it.
+void write_compression_yaml(const fs::path& yaml_path, std::size_t scan_batch_bytes = 100000000)
 {
   std::ofstream f(yaml_path);
   f << "sirius:\n"
@@ -190,7 +193,9 @@ void write_compression_yaml(const fs::path& yaml_path)
        "      num_threads: 1\n"
        "      monitor_period: 10ms\n"
        "  operator_params:\n"
-       "    scan_task_batch_size: 100000000\n"
+       "    scan_task_batch_size: "
+    << scan_batch_bytes
+    << "\n"
        "    max_sort_partition_bytes: 0\n"
        "    hash_partition_bytes: 100000000\n"
        "    concat_batch_bytes: 100000000\n"
@@ -225,13 +230,13 @@ struct comp_env_paths {
   fs::path yaml;
 };
 
-comp_env_paths make_comp_env(const std::string& tag)
+comp_env_paths make_comp_env(const std::string& tag, std::size_t scan_batch_bytes = 100000000)
 {
   auto dir = make_comp_tmp(tag);
   fs::remove_all(dir);
   fs::create_directories(dir);
   auto yaml = dir / "comp.yaml";
-  write_compression_yaml(yaml);
+  write_compression_yaml(yaml, scan_batch_bytes);
   return {dir, yaml};
 }
 
@@ -979,60 +984,34 @@ TEST_CASE("pin_table compression - str_split cascade (snappy chars, delta->rle->
 
 namespace {
 
-// Form census of the pinned host entry named @p name: chunk count, how many
-// chunks are compressed representations, total stored bytes, and whether any
-// narrowing marker is set.
-struct pinned_entry_census {
-  std::size_t chunks{0};
-  std::size_t compressed_chunks{0};
-  std::size_t stored_bytes{0};
-  bool any_marker_true{false};
-};
-
-pinned_entry_census census_host_entry(duckdb::Connection& con, const std::string& name)
-{
-  pinned_entry_census out;
-  auto ctx = sirius::test::get_registered_sirius_context(con);
-  REQUIRE(ctx);
-  ctx->get_scan_manager().visit_pinned_entries(
-    [&](std::string_view entry_name, sirius::scan_manager::pinned_entry const& entry) {
-      if (entry_name != name) { return true; }
-      out.chunks = entry.host_chunks.size();
-      for (auto const& row : entry.narrowed_columns) {
-        for (bool const marked : row) {
-          out.any_marker_true = out.any_marker_true || marked;
-        }
-      }
-      for (auto const& chunk : entry.host_chunks) {
-        REQUIRE(chunk);
-        out.stored_bytes += chunk->get_size_in_bytes();
-        if (dynamic_cast<sirius::compressed_host_representation const*>(chunk.get())) {
-          ++out.compressed_chunks;
-        }
-      }
-      return false;
-    });
-  REQUIRE(out.chunks > 0);
-  return out;
-}
+// The two-column bitpack plan shared by the stacking fixtures: bitpack genuinely
+// shrinks small-range columns, so chunks pass the max_compressed_fraction gate
+// and pin in the compressed form (a plan whose output stays input-sized would
+// fall back to uncompressed storage instead).
+const std::string kBitpackTwoColumnPlan =
+  "input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n---\n"
+  "input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n";
 
 }  // namespace
 
-// Interim composition contract: a compression-enabled pin declines carrier narrowing at
-// the pin driver, so enabling both features behaves exactly like compression alone --
-// native-width columns inside compressed chunks, an empty marker matrix, no plan-time
-// sidecars, correct results, and the same stored bytes as a compression-only pin.
-TEST_CASE("pin_table compression - narrowing declines quietly when both features are on",
-          "[compression][pin_table][isolated_context]")
+// Stacking contract: narrowing runs in the pin driver before compression, so a
+// compression-enabled pin stores NARROW compressed chunks and Simpatico's
+// round-trip contract makes decompression reproduce the narrow carriers
+// directly. The residency gate reads the recorded storage metadata, installs a
+// narrow sidecar, and the serve is cast-free — scan_columns_restored stays flat
+// while the chunks are compressed representations. Because compression will run,
+// the 16-bit carrier selections are floored to 32-bit (Simpatico's fused-codegen
+// ops encode widths 8/32/64 but not 16).
+TEST_CASE("pin_table compression - narrowing stacks with compression (decompress to narrow)",
+          "[compression][pin_table][isolated_context][carrier_floor]")
 {
   if (no_gpu()) { return; }
 
   auto [tmp, yaml_path] = make_comp_env("bothflags");
 
-  // k = range % 1000 and v = (range * 3) % 2000 both fit INT16, so a
-  // narrowing-only pin would narrow them; the decline must keep them native.
-  //   SUM(k) = 10 * (999*1000/2)  = 4995000
-  //   SUM(v) = 5 * (1999*2000/2)  = 9995000
+  // k = range % 1000 and v = (range * 3) % 2000 both fit INT16 but not INT8, so
+  // the floor turns their INT16 selections into INT32 carriers. k takes 1000
+  // distinct values, ten rows each.
   sirius::test::mgpu::generate_parquet_surface(
     tmp, "SELECT range % 1000 AS k, (range * 3) % 2000 AS v FROM range(10000)", 1);
 
@@ -1045,14 +1024,7 @@ TEST_CASE("pin_table compression - narrowing declines quietly when both features
   run_ok(con, "SET enable_compressed_materialization = true;", "set narrowing");
 
   auto plan_dir = tmp / "plans";
-  // Bitpack genuinely shrinks these small-range columns, so the chunk passes the
-  // max_compressed_fraction gate and pins in the compressed form (a plan whose
-  // output stays input-sized would fall back to uncompressed storage instead).
-  const std::string dsl =
-    "input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n---\n"
-    "input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n";
-  write_plan_file(plan_dir, "t_both", dsl);
-  write_plan_file(plan_dir, "t_only", dsl);
+  write_plan_file(plan_dir, "t_both", kBitpackTwoColumnPlan);
   run_ok(
     con, "SET pin_table_input_compression_plan_dir = '" + plan_dir.string() + "';", "set plan_dir");
 
@@ -1060,40 +1032,407 @@ TEST_CASE("pin_table compression - narrowing declines quietly when both features
   auto pin              = con.Query("CALL pin_table('" + glob + "', tier='host', name='t_both');");
   require_ok(pin, "pin both-on");
   auto const pin_after = sirius::test::get_compressed_materialization_stats(con);
-  // Quiet decline: nothing narrowed at pin time.
-  REQUIRE(pin_after.pin_columns_narrowed == pin_before.pin_columns_narrowed);
+  REQUIRE(pin_after.pin_columns_narrowed > pin_before.pin_columns_narrowed);
 
-  auto const both = census_host_entry(con, "t_both");
+  // Narrowed AND compressed: every chunk is a compressed representation and the
+  // recorded metadata shows every column narrowed to the floored INT32 carrier.
+  auto const both = sirius::test::census_entry(con, "t_both");
   REQUIRE(both.compressed_chunks == both.chunks);
-  REQUIRE_FALSE(both.any_marker_true);
+  REQUIRE(both.all_columns_narrowed);
+  for (auto const carrier : both.first_chunk_carriers) {
+    REQUIRE(carrier == cudf::data_type{cudf::type_id::INT32});
+  }
 
-  // The residency gate sees an all-native entry, so no sidecar installs and the
-  // served results equal DuckDB.
+  // The gate reads the recorded carriers and installs the sidecar; the serve
+  // decompresses straight into the narrow carriers, so nothing narrows or
+  // restores at scan time (the cast-free happy path) and results match DuckDB.
+  // Grouping by k gives the carrier a transport use (group keys stay narrow
+  // through the aggregate), so no restore lands at the scan — bare aggregate
+  // inputs like SUM(k) would be zero-benefit-pruned back to native at plan time
+  // and widen at the scan instead (a legitimate, separately tested path).
   auto const before = sirius::test::get_compressed_materialization_stats(con);
   const std::string select_sql =
-    "SELECT SUM(k), SUM(v), COUNT(*) FROM read_parquet('" + glob + "')";
+    "SELECT COUNT(*), MIN(cnt), MAX(cnt) FROM (SELECT k, COUNT(*) AS cnt FROM read_parquet('" +
+    glob + "') GROUP BY k)";
   auto res = con.Query("CALL gpu_execution(\"" + select_sql + "\");");
   require_ok(res, "select");
   REQUIRE(res->RowCount() == 1);
-  REQUIRE(res->GetValue(0, 0) == duckdb::Value::BIGINT(4995000LL));
-  REQUIRE(res->GetValue(1, 0) == duckdb::Value::BIGINT(9995000LL));
-  REQUIRE(res->GetValue(2, 0) == duckdb::Value::BIGINT(10000LL));
+  REQUIRE(res->GetValue(0, 0) == duckdb::Value::BIGINT(1000LL));
+  REQUIRE(res->GetValue(1, 0) == duckdb::Value::BIGINT(10LL));
+  REQUIRE(res->GetValue(2, 0) == duckdb::Value::BIGINT(10LL));
+  auto const after = sirius::test::get_compressed_materialization_stats(con);
+  REQUIRE(after.scan_sidecars_installed > before.scan_sidecars_installed);
+  REQUIRE(after.scan_columns_narrowed == before.scan_columns_narrowed);
+  REQUIRE(after.scan_columns_restored == before.scan_columns_restored);
+
+  run_ok(con, "CALL unpin_table('t_both');", "unpin both");
+
+  fs::remove_all(tmp);
+}
+
+// The compression-only contrast to the stacking case above: with narrowing off, a
+// compression-enabled pin stores NATIVE carriers inside its compressed chunks, and a later
+// narrowing-on query installs no sidecar over them (cached native columns are never narrowed at
+// serve time). The discriminating fact is the recorded carriers, not the stored bytes: bitpack
+// derives its width from the data, so a narrow and a native input compress to near-identical
+// payloads.
+TEST_CASE("pin_table compression - compression without narrowing stores native carriers",
+          "[compression][pin_table][isolated_context]")
+{
+  if (no_gpu()) { return; }
+
+  auto [tmp, yaml_path] = make_comp_env("componly");
+  sirius::test::mgpu::generate_parquet_surface(
+    tmp, "SELECT range % 1000 AS k, (range * 3) % 2000 AS v FROM range(10000)", 1);
+
+  sirius::test::mgpu::scoped_mgpu_env env(yaml_path);
+  auto con  = env.make_connection();
+  auto glob = sirius::test::mgpu::parquet_glob(tmp);
+
+  run_ok(con, "SET pin_table_compression = true;", "set compression");
+  run_ok(con, "SET pin_table_compression_min_batch_size_bytes = 0;", "set min_batch");
+  run_ok(con, "SET enable_compressed_materialization = false;", "narrowing off");
+  auto plan_dir = tmp / "plans";
+  write_plan_file(plan_dir, "t_only", kBitpackTwoColumnPlan);
+  run_ok(
+    con, "SET pin_table_input_compression_plan_dir = '" + plan_dir.string() + "';", "set plan_dir");
+
+  auto pin_only = con.Query("CALL pin_table('" + glob + "', tier='host', name='t_only');");
+  require_ok(pin_only, "pin compression-only");
+
+  auto const only = sirius::test::census_entry(con, "t_only");
+  REQUIRE(only.compressed_chunks == only.chunks);
+  REQUIRE_FALSE(only.any_marker_true);
+  REQUIRE_FALSE(only.all_columns_narrowed);
+  // The columns are BIGINT in the parquet surface, so native means INT64 everywhere.
+  for (auto const carrier : only.first_chunk_carriers) {
+    REQUIRE(carrier == cudf::data_type{cudf::type_id::INT64});
+  }
+
+  run_ok(con, "SET enable_compressed_materialization = true;", "narrowing on");
+  auto const before = sirius::test::get_compressed_materialization_stats(con);
+  const std::string select_sql =
+    "SELECT COUNT(*), MIN(cnt), MAX(cnt) FROM (SELECT k, COUNT(*) AS cnt FROM read_parquet('" +
+    glob + "') GROUP BY k)";
+  auto res = con.Query("CALL gpu_execution(\"" + select_sql + "\");");
+  require_ok(res, "select compression-only");
+  REQUIRE(res->GetValue(0, 0) == duckdb::Value::BIGINT(1000LL));
   auto const after = sirius::test::get_compressed_materialization_stats(con);
   REQUIRE(after.scan_sidecars_installed == before.scan_sidecars_installed);
   REQUIRE(after.scan_columns_narrowed == before.scan_columns_narrowed);
 
-  // A compression-only pin of the same data stores byte-identical chunks: the
-  // both-on pin composed as compression alone.
-  run_ok(con, "SET enable_compressed_materialization = false;", "narrowing off");
-  auto pin_only = con.Query("CALL pin_table('" + glob + "', tier='host', name='t_only');");
-  require_ok(pin_only, "pin compression-only");
-  auto const only = census_host_entry(con, "t_only");
-  REQUIRE(only.compressed_chunks == only.chunks);
-  REQUIRE(both.chunks == only.chunks);
-  REQUIRE(both.stored_bytes == only.stored_bytes);
-
-  run_ok(con, "CALL unpin_table('t_both');", "unpin both");
   run_ok(con, "CALL unpin_table('t_only');", "unpin only");
 
+  fs::remove_all(tmp);
+}
+
+// GPU-tier stacking: the compressed payload stays in device memory, the recorded
+// metadata still drives the gate, and the tier narrowing policy now applies
+// (sidecar_from_gpu_tier_pin). A group-key column has a transport use and serves
+// cast-free from the compressed chunk; a filter-and-order-only column retracts
+// at plan time and widens during scan normalization.
+TEST_CASE("pin_table compression - narrowing stacks on the GPU tier and tier policy retracts",
+          "[compression][pin_table][isolated_context]")
+{
+  if (no_gpu()) { return; }
+
+  auto [tmp, yaml_path] = make_comp_env("bothflags-gpu");
+  sirius::test::mgpu::generate_parquet_surface(
+    tmp, "SELECT range % 1000 AS k, (range * 3) % 2000 AS v FROM range(10000)", 1);
+
+  sirius::test::mgpu::scoped_mgpu_env env(yaml_path);
+  auto con  = env.make_connection();
+  auto glob = sirius::test::mgpu::parquet_glob(tmp);
+
+  run_ok(con, "SET pin_table_compression = true;", "set compression");
+  run_ok(con, "SET pin_table_compression_min_batch_size_bytes = 0;", "set min_batch");
+  run_ok(con, "SET enable_compressed_materialization = true;", "set narrowing");
+  auto plan_dir = tmp / "plans";
+  write_plan_file(plan_dir, "t_gpu", kBitpackTwoColumnPlan);
+  run_ok(
+    con, "SET pin_table_input_compression_plan_dir = '" + plan_dir.string() + "';", "set plan_dir");
+
+  auto const pin_before = sirius::test::get_compressed_materialization_stats(con);
+  auto pin              = con.Query("CALL pin_table('" + glob + "', tier='gpu', name='t_gpu');");
+  require_ok(pin, "pin gpu both-on");
+  auto const pin_after = sirius::test::get_compressed_materialization_stats(con);
+  REQUIRE(pin_after.pin_columns_narrowed > pin_before.pin_columns_narrowed);
+
+  auto const census = sirius::test::census_entry(con, "t_gpu");
+  REQUIRE(census.compressed_chunks == census.chunks);
+  REQUIRE(census.all_columns_narrowed);
+  for (auto const carrier : census.first_chunk_carriers) {
+    REQUIRE(carrier == cudf::data_type{cudf::type_id::INT32});
+  }
+
+  // Group keys are a transport use, so k stays narrow through the aggregate on
+  // GPU tier too, and the compressed chunk decompresses straight to the narrow
+  // carrier — cast-free.
+  {
+    auto const before = sirius::test::get_compressed_materialization_stats(con);
+    auto res          = con.Query(
+      "CALL gpu_execution(\"SELECT COUNT(*), MIN(cnt), MAX(cnt) FROM (SELECT k, COUNT(*) AS cnt "
+               "FROM read_parquet('" +
+      glob + "') GROUP BY k)\");");
+    require_ok(res, "narrow-kept select");
+    REQUIRE(res->GetValue(0, 0) == duckdb::Value::BIGINT(1000LL));
+    REQUIRE(res->GetValue(1, 0) == duckdb::Value::BIGINT(10LL));
+    REQUIRE(res->GetValue(2, 0) == duckdb::Value::BIGINT(10LL));
+    auto const after = sirius::test::get_compressed_materialization_stats(con);
+    REQUIRE(after.scan_sidecars_installed > before.scan_sidecars_installed);
+    REQUIRE(after.scan_narrow_targets_retracted == before.scan_narrow_targets_retracted);
+    REQUIRE(after.scan_columns_narrowed == before.scan_columns_narrowed);
+    REQUIRE(after.scan_columns_restored == before.scan_columns_restored);
+  }
+
+  // A filter-and-order-only k has no transport use, so the GPU-tier policy
+  // retracts the target at plan time and the decompressed narrow chunk widens
+  // during scan normalization.
+  {
+    auto const before = sirius::test::get_compressed_materialization_stats(con);
+    auto res          = con.Query("CALL gpu_execution(\"SELECT k FROM read_parquet('" + glob +
+                         "') WHERE k < 5 ORDER BY k\");");
+    require_ok(res, "retracted select");
+    REQUIRE(res->RowCount() == 50);
+    REQUIRE(res->GetValue(0, 0) == duckdb::Value::BIGINT(0LL));
+    REQUIRE(res->GetValue(0, 49) == duckdb::Value::BIGINT(4LL));
+    auto const after = sirius::test::get_compressed_materialization_stats(con);
+    REQUIRE(after.scan_sidecars_installed > before.scan_sidecars_installed);
+    REQUIRE(after.scan_narrow_targets_retracted > before.scan_narrow_targets_retracted);
+    REQUIRE(after.scan_columns_restored > before.scan_columns_restored);
+  }
+
+  // Pin-on / query-off over compressed chunks: the entry keeps its narrow carriers, the query
+  // installs no sidecar at all, and the chunk that decompresses narrow is restored to native by
+  // scan normalization. Same restore path the retraction leg takes, reached without any sidecar.
+  {
+    run_ok(con, "SET enable_compressed_materialization = false;", "narrowing off");
+    auto const before = sirius::test::get_compressed_materialization_stats(con);
+    auto res          = con.Query(
+      "CALL gpu_execution(\"SELECT COUNT(*), MIN(cnt), MAX(cnt) FROM (SELECT k, COUNT(*) AS cnt "
+               "FROM read_parquet('" +
+      glob + "') GROUP BY k)\");");
+    require_ok(res, "pin-on/query-off select");
+    REQUIRE(res->GetValue(0, 0) == duckdb::Value::BIGINT(1000LL));
+    REQUIRE(res->GetValue(1, 0) == duckdb::Value::BIGINT(10LL));
+    REQUIRE(res->GetValue(2, 0) == duckdb::Value::BIGINT(10LL));
+    auto const after = sirius::test::get_compressed_materialization_stats(con);
+    REQUIRE(after.scan_sidecars_installed == before.scan_sidecars_installed);
+    REQUIRE(after.scan_columns_narrowed == before.scan_columns_narrowed);
+    REQUIRE(after.scan_columns_restored > before.scan_columns_restored);
+    run_ok(con, "SET enable_compressed_materialization = true;", "narrowing back on");
+  }
+
+  run_ok(con, "CALL unpin_table('t_gpu');", "unpin");
+  fs::remove_all(tmp);
+}
+
+namespace {
+
+// Write @p select_sql to @p file as parquet with @p row_group_size rows per row
+// group (Sirius disabled so generation never touches the GPU under test).
+void generate_parquet_row_groups(const fs::path& file,
+                                 const std::string& select_sql,
+                                 std::size_t row_group_size)
+{
+  fs::create_directories(file.parent_path());
+  setenv("SIRIUS_DISABLE", "1", 1);
+  {
+    duckdb::DuckDB gen_db(nullptr);
+    duckdb::Connection gen(gen_db);
+    auto r =
+      gen.Query("COPY (" + select_sql + ") TO '" + file.string() +
+                "' (FORMAT PARQUET, ROW_GROUP_SIZE " + std::to_string(row_group_size) + ");");
+    REQUIRE(r);
+    REQUIRE_FALSE(r->HasError());
+  }
+  unsetenv("SIRIUS_DISABLE");
+}
+
+}  // namespace
+
+// Heterogeneous chunk widths under compression: each chunk's blob records its
+// own carriers, the plan target is the widest across chunks, and a chunk stored
+// narrower widens right after decode (scan_columns_restored counts it).
+TEST_CASE("pin_table compression - heterogeneous narrow widths widen post-decode",
+          "[compression][pin_table][isolated_context]")
+{
+  if (no_gpu()) { return; }
+
+  // 8 KiB scan batches (under one 2048-row BIGINT row group's 16 KiB) make each
+  // row group its own pin chunk.
+  auto [tmp, yaml_path] = make_comp_env("hetero", /*scan_batch_bytes=*/8u << 10);
+
+  // Chunk 0 (rows < 2048) fits INT8; the remaining chunks need INT32 (values
+  // over 32767 keep INT16 out of the picture even without the floor). The plan
+  // target is the widest carrier, INT32, so chunk 0 widens after decode.
+  generate_parquet_row_groups(tmp / "hetero.parquet",
+                              "SELECT CASE WHEN range < 2048 THEN range % 100 "
+                              "ELSE 40000 + range % 1000 END AS k FROM range(8192)",
+                              2048);
+
+  sirius::test::mgpu::scoped_mgpu_env env(yaml_path);
+  auto con        = env.make_connection();
+  auto const file = (tmp / "hetero.parquet").string();
+
+  run_ok(con, "SET pin_table_compression = true;", "set compression");
+  run_ok(con, "SET pin_table_compression_min_batch_size_bytes = 0;", "set min_batch");
+  // The INT8 chunk's 7-bit values barely compress, so let it keep the
+  // compressed form anyway: this fixture is about heterogeneous widths inside
+  // compressed chunks, not the fraction gate (the fail-soft test covers mixed
+  // storage forms).
+  run_ok(con, "SET pin_table_compression_max_compressed_fraction = 1.5;", "set fraction");
+  run_ok(con, "SET enable_compressed_materialization = true;", "set narrowing");
+  auto plan_dir = tmp / "plans";
+  write_plan_file(
+    plan_dir, "t_hetero", "input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n");
+  run_ok(
+    con, "SET pin_table_input_compression_plan_dir = '" + plan_dir.string() + "';", "set plan_dir");
+
+  auto pin = con.Query("CALL pin_table('" + file + "', tier='host', name='t_hetero');");
+  require_ok(pin, "pin hetero");
+
+  auto const census = sirius::test::census_entry(con, "t_hetero");
+  REQUIRE(census.chunks >= 2);
+  REQUIRE(census.compressed_chunks == census.chunks);
+  REQUIRE(census.all_columns_narrowed);
+  REQUIRE(census.first_chunk_carriers ==
+          std::vector<cudf::data_type>{cudf::data_type{cudf::type_id::INT8}});
+
+  // Grouping by k gives the carrier a transport use, so the plan target stays
+  // the widest recorded carrier (INT32) instead of being zero-benefit-pruned
+  // back to native. 1100 distinct values (100 small + 1000 large); the small
+  // ones appear 20-21 times (2048 rows) and the large ones 6-7 times (6144).
+  auto const before = sirius::test::get_compressed_materialization_stats(con);
+  auto res          = con.Query(
+    "CALL gpu_execution(\"SELECT COUNT(*), MIN(cnt), MAX(cnt) FROM (SELECT k, COUNT(*) AS cnt "
+             "FROM read_parquet('" +
+    file + "') GROUP BY k)\");");
+  require_ok(res, "select hetero");
+  REQUIRE(res->GetValue(0, 0) == duckdb::Value::BIGINT(1100LL));
+  REQUIRE(res->GetValue(1, 0) == duckdb::Value::BIGINT(6LL));
+  REQUIRE(res->GetValue(2, 0) == duckdb::Value::BIGINT(21LL));
+  auto const after = sirius::test::get_compressed_materialization_stats(con);
+  REQUIRE(after.scan_sidecars_installed > before.scan_sidecars_installed);
+  // Only the chunks stored narrower than the INT32 target widen post-decode:
+  // more than zero restores, but strictly fewer than one per chunk (which is
+  // what an all-native plan target would produce).
+  auto const restored = after.scan_columns_restored - before.scan_columns_restored;
+  REQUIRE(restored > 0);
+  REQUIRE(restored < census.chunks);
+  REQUIRE(after.scan_columns_narrowed == before.scan_columns_narrowed);
+
+  run_ok(con, "CALL unpin_table('t_hetero');", "unpin");
+  fs::remove_all(tmp);
+}
+
+// The carrier floor's negative direction. The floor is keyed to compression actually running --
+// the pin resolved a plan AND compression is enabled -- not to the setting alone. With
+// pin_table_compression on but no plan file covering the table, nothing will hand this pin to
+// Simpatico, so the 16-bit carrier must be selected and no chunk may end up compressed. Keying
+// the floor to the setting alone would silently widen every such pin to INT32.
+TEST_CASE("pin_table compression - no plan file keeps the 16-bit carrier",
+          "[compression][pin_table][isolated_context][carrier_floor]")
+{
+  if (no_gpu()) { return; }
+
+  auto [tmp, yaml_path] = make_comp_env("noplan");
+  // k fits INT16 but not INT8; 1000 distinct values, ten rows each.
+  sirius::test::mgpu::generate_parquet_surface(
+    tmp, "SELECT range % 1000 AS k FROM range(10000)", 1);
+
+  sirius::test::mgpu::scoped_mgpu_env env(yaml_path);
+  auto con  = env.make_connection();
+  auto glob = sirius::test::mgpu::parquet_glob(tmp);
+
+  run_ok(con, "SET pin_table_compression = true;", "set compression");
+  run_ok(con, "SET pin_table_compression_min_batch_size_bytes = 0;", "set min_batch");
+  run_ok(con, "SET enable_compressed_materialization = true;", "set narrowing");
+  // A plan directory holding a plan for some OTHER table: the resolver finds no plan for this
+  // one, so compression never engages.
+  auto plan_dir = tmp / "plans";
+  write_plan_file(plan_dir, "some_other_table", kBitpackTwoColumnPlan);
+  run_ok(
+    con, "SET pin_table_input_compression_plan_dir = '" + plan_dir.string() + "';", "set plan_dir");
+
+  auto pin = con.Query("CALL pin_table('" + glob + "', tier='host', name='t_noplan');");
+  require_ok(pin, "pin no-plan");
+
+  auto const census = sirius::test::census_entry(con, "t_noplan");
+  REQUIRE(census.compressed_chunks == 0);
+  REQUIRE(census.all_columns_narrowed);
+  REQUIRE(census.first_chunk_carriers ==
+          std::vector<cudf::data_type>{cudf::data_type{cudf::type_id::INT16}});
+
+  // The INT16 carrier serves correctly end to end.
+  auto res = con.Query(
+    "CALL gpu_execution(\"SELECT COUNT(*), MIN(cnt), MAX(cnt) FROM (SELECT k, COUNT(*) AS cnt "
+    "FROM read_parquet('" +
+    glob + "') GROUP BY k)\");");
+  require_ok(res, "select no-plan");
+  REQUIRE(res->GetValue(0, 0) == duckdb::Value::BIGINT(1000LL));
+  REQUIRE(res->GetValue(1, 0) == duckdb::Value::BIGINT(10LL));
+
+  run_ok(con, "CALL unpin_table('t_noplan');", "unpin");
+  fs::remove_all(tmp);
+}
+
+// A width-explicit packed op (bitextract with a 64-bit field spec) cannot encode
+// a column narrowed to 32 bits: that batch's compression fails, pin_table warns
+// and latches compression off, and the pin falls back to UNCOMPRESSED NARROW
+// chunks — markers intact, results correct.
+TEST_CASE("pin_table compression - width-explicit op on a narrowed column fails soft",
+          "[compression][pin_table][isolated_context]")
+{
+  if (no_gpu()) { return; }
+
+  auto [tmp, yaml_path] = make_comp_env("widthop");
+  // k fits INT16, floored to INT32 because compression will run; 1000 distinct
+  // values, five rows each.
+  sirius::test::mgpu::generate_parquet_surface(tmp, "SELECT range % 1000 AS k FROM range(5000)", 1);
+
+  sirius::test::mgpu::scoped_mgpu_env env(yaml_path);
+  auto con  = env.make_connection();
+  auto glob = sirius::test::mgpu::parquet_glob(tmp);
+
+  run_ok(con, "SET pin_table_compression = true;", "set compression");
+  run_ok(con, "SET pin_table_compression_min_batch_size_bytes = 0;", "set min_batch");
+  run_ok(con, "SET enable_compressed_materialization = true;", "set narrowing");
+  auto plan_dir = tmp / "plans";
+  // Valid against the native INT64 column (32 + 32 field bits), unencodable
+  // against the INT32 carrier the narrowing stores.
+  write_plan_file(plan_dir, "t_widthop", "input -> bitextract_32hi_32lo -> hi, lo\n");
+  run_ok(
+    con, "SET pin_table_input_compression_plan_dir = '" + plan_dir.string() + "';", "set plan_dir");
+
+  auto const pin_before = sirius::test::get_compressed_materialization_stats(con);
+  auto pin = con.Query("CALL pin_table('" + glob + "', tier='host', name='t_widthop');");
+  require_ok(pin, "pin widthop");
+  auto const pin_after = sirius::test::get_compressed_materialization_stats(con);
+  REQUIRE(pin_after.pin_columns_narrowed > pin_before.pin_columns_narrowed);
+
+  // Fail-soft outcome: no compressed chunks, but the narrowing survived.
+  auto const census = sirius::test::census_entry(con, "t_widthop");
+  REQUIRE(census.compressed_chunks == 0);
+  REQUIRE(census.all_columns_narrowed);
+  REQUIRE(census.first_chunk_carriers ==
+          std::vector<cudf::data_type>{cudf::data_type{cudf::type_id::INT32}});
+
+  // Grouping by k keeps the carrier narrow (transport use, see the stacking
+  // test), so the uncompressed-narrow serve is cast-free.
+  auto const before = sirius::test::get_compressed_materialization_stats(con);
+  auto res          = con.Query(
+    "CALL gpu_execution(\"SELECT COUNT(*), MIN(cnt), MAX(cnt) FROM (SELECT k, COUNT(*) AS cnt "
+             "FROM read_parquet('" +
+    glob + "') GROUP BY k)\");");
+  require_ok(res, "select widthop");
+  REQUIRE(res->GetValue(0, 0) == duckdb::Value::BIGINT(1000LL));
+  REQUIRE(res->GetValue(1, 0) == duckdb::Value::BIGINT(5LL));
+  REQUIRE(res->GetValue(2, 0) == duckdb::Value::BIGINT(5LL));
+  auto const after = sirius::test::get_compressed_materialization_stats(con);
+  REQUIRE(after.scan_sidecars_installed > before.scan_sidecars_installed);
+  REQUIRE(after.scan_columns_restored == before.scan_columns_restored);
+
+  run_ok(con, "CALL unpin_table('t_widthop');", "unpin");
   fs::remove_all(tmp);
 }

@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include <cudf/types.hpp>
+
 #include <duckdb/common/types.hpp>
 #include <duckdb/common/vector.hpp>
 #include <duckdb/storage/statistics/base_statistics.hpp>
@@ -89,6 +91,20 @@ namespace io {
 class sirius_ioctx;
 }  // namespace io
 
+/// Stored-column metadata for one cached column of one pinned chunk, recorded by the pin
+/// materialization driver at the moment of storage. For a chunk stored uncompressed the carrier is
+/// the stored column's actual cuDF type; for a Simpatico-compressed chunk it is the type
+/// compress_with_plan received -- by Simpatico's round-trip contract also the type decompression
+/// reproduces. The plan-time residency gate and the serve-time restore sizing read this metadata
+/// instead of introspecting storage, so compressed and uncompressed chunks answer identically.
+struct pinned_column_storage_meta {
+  cudf::data_type carrier{cudf::type_id::EMPTY};  ///< actual stored / compress-input cuDF type
+  bool narrowed{false};  ///< carrier is narrower than the pin-time native mapping
+};
+
+/// Chunk-major stored-column metadata: element [c][i] describes cached column i of chunk c.
+using pinned_column_storage_matrix = std::vector<std::vector<pinned_column_storage_meta>>;
+
 /// GPU-resident tables produced by driving a @c gpu_ingestible to completion, with
 /// each table's GPU placement recorded in @c chunk_memory_spaces (parallel to
 /// @c tables). Consumed by the pin_table path: fed directly into
@@ -97,10 +113,8 @@ class sirius_ioctx;
 struct materialized_pin {
   std::vector<std::unique_ptr<cudf::table>> tables;
   std::vector<cucascade::memory::memory_space*> chunk_memory_spaces;
-  /// Chunk-major physical-narrowing markers. @c narrowed_columns[c][i] is true
-  /// exactly when column i of chunk c is stored in a carrier narrower than its
-  /// pin-time logical type. Parallel to @c tables and their columns.
-  std::vector<std::vector<bool>> narrowed_columns;
+  /// Chunk-major stored-column metadata, parallel to @c tables and their columns.
+  pinned_column_storage_matrix column_storage;
   /// Row count of each materialized chunk (parallel to @c tables). For duckdb-native
   /// pins these become @c duckdb_mvcc_metadata::base_row_count_per_chunk — the
   /// positional chunk→rowid-range map query-time MVCC merge relies on.
@@ -130,6 +144,15 @@ struct pin_materialization_options {
   bool capture_chunk_stats               = true;   ///< capture zone-map statistics per chunk
   bool enable_compressed_materialization = false;  ///< narrow eligible numeric carriers per chunk
 };
+
+/// The carrier a compression-enabled pin stores when narrowing selected @p carrier: INT16/UINT16
+/// widen to INT32/UINT32, every other carrier is returned unchanged. Simpatico's fused-codegen ops
+/// (the ops integer plan blocks use) encode element widths 8/32/64 but not 16, and an unencodable
+/// element type fails the whole batch's compression and latches compression off for the rest of the
+/// pin, so the pin driver floors 16-bit selections instead of selecting them. Applied at
+/// narrow_pin_chunk's chooser call site only when the pin resolved a compression plan and
+/// compression is enabled; a pin without a plan keeps 16-bit carriers.
+[[nodiscard]] cudf::data_type floor_carrier_for_compression(cudf::data_type carrier) noexcept;
 
 /// Drive @p ingestible 's metadata walk + batch coalescer to completion on @p io_ctx,
 /// materializing every emitted batch into a GPU-resident cudf::table and round-robining
@@ -162,11 +185,9 @@ materialized_pin materialize_all_batches(
 /// compressed_host_representation; both derive from @c cucascade::idata_representation.
 struct host_pin_result {
   std::vector<std::shared_ptr<cucascade::idata_representation>> chunks;
-  /// Chunk-major physical-narrowing markers, captured before each GPU table is
-  /// converted to host storage (or compressed). Parallel to @c chunks and their
-  /// columns. All-false whenever compression is enabled for the pin — narrowing
-  /// declines on compression-enabled pins (see materialize_pin_to_host).
-  std::vector<std::vector<bool>> narrowed_columns;
+  /// Chunk-major stored-column metadata, recorded from each GPU table right before it is
+  /// compressed or converted to host storage. Parallel to @c chunks and their columns.
+  pinned_column_storage_matrix column_storage;
   /// Row count of each materialized batch, in emission order (covers compressed
   /// and uncompressed chunks alike); becomes duckdb_mvcc_metadata::
   /// base_row_count_per_chunk for duckdb-format pins.
@@ -215,6 +236,9 @@ struct device_pin_chunk {
 /// chunks may be interleaved within a single pin.
 struct device_pin_result {
   std::vector<device_pin_chunk> chunks;
+  /// Chunk-major stored-column metadata, recorded from each GPU table right before it is
+  /// compressed or split into device columns. Parallel to @c chunks and their columns.
+  pinned_column_storage_matrix column_storage;
   /// Row count of each materialized batch, in emission order (covers compressed
   /// and uncompressed chunks alike); becomes duckdb_mvcc_metadata::
   /// base_row_count_per_chunk for duckdb-format pins.
@@ -232,12 +256,13 @@ struct device_pin_result {
 /// \param compression         Per-table Simpatico settings; disabled pins every chunk
 ///                            uncompressed.
 /// \param options             Per-pin materialization behavior (zone-map capture, carrier
-///                            narrowing). Narrowing is declined for the whole pin when
-///                            compression is enabled: the plan-time carrier derivation
-///                            reads stored carriers from uncompressed chunk forms only,
-///                            so a narrow compressed chunk would strand its markers.
+///                            narrowing). Narrowing runs before compression, so a compressed
+///                            chunk stores narrow columns and decompresses straight back to
+///                            them; when compression will run, 16-bit carriers are floored
+///                            (see floor_carrier_for_compression).
 /// \return The pinned host chunks in materialization (round-robin) order — one per emitted
-///         batch — plus their per-chunk row counts, narrowing markers, and zone-map captures.
+///         batch — plus their per-chunk row counts, stored-column metadata, and zone-map
+///         captures.
 host_pin_result materialize_pin_to_host(
   op::scan::gpu_ingestible& ingestible,
   std::span<cucascade::memory::memory_space* const> gpu_spaces,
@@ -252,13 +277,23 @@ host_pin_result materialize_pin_to_host(
 /// (device) memory. A batch that does not qualify (below the size threshold, or it
 /// fails to compress usefully) is kept as an uncompressed device chunk instead, so
 /// @c device_pin_result::chunks may interleave the two forms in emission order.
-/// Device compressed pins carry no zone maps (no pin-time column types reach this
-/// driver) and never narrow (see @ref materialize_pin_to_host); every chunk stores
-/// native-width columns.
+/// Carrier narrowing runs before compression exactly as in @ref materialize_pin_to_host
+/// (including the 16-bit carrier floor). Zone-map capture is forced off:
+/// @c device_pin_result carries no statistics and @c insert_pinned_entry_device stores
+/// none, so device pins keep the statless-pin serving behavior.
+///
+/// \param pinned_column_types Pin-time DuckDB type of each batch column, in batch-column
+///                            (column_ids) order — drives the carrier narrowing. Empty is
+///                            valid only when narrowing is off.
+/// \param compression         Per-table Simpatico settings; disabled pins every chunk
+///                            uncompressed.
+/// \param options             Per-pin materialization behavior (carrier narrowing).
 device_pin_result materialize_all_batches_compressed(
   op::scan::gpu_ingestible& ingestible,
   std::span<cucascade::memory::memory_space* const> gpu_spaces,
   io::sirius_ioctx& io_ctx,
-  compression_pin_config const& compression);
+  duckdb::vector<duckdb::LogicalType> const& pinned_column_types,
+  compression_pin_config const& compression,
+  pin_materialization_options options = {});
 
 }  // namespace sirius

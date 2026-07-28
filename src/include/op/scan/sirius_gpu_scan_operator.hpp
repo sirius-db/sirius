@@ -112,6 +112,18 @@ class sirius_gpu_scan_operator : public sirius_physical_operator {
   [[nodiscard]] std::size_t no_history_peak_memory_estimate(
     const op::input_stats& stats) const override;
 
+  /// The carrier targets scan normalization holds this operator's output table to: the explicit
+  /// plan sidecar when one is installed, otherwise the native mapping of the output logical types.
+  /// Empty when no normalization runs at all (an output type with no cuDF mapping), in which case
+  /// normalize_physical_schema returns its input untouched. Read both by execute() and by
+  /// sirius_scan_manager::prepare_for_query, which resolves the pinned-cache provider's
+  /// per-column conversion targets from it, so the cast and its memory reservation cannot
+  /// disagree about which vector is authoritative.
+  [[nodiscard]] std::vector<cudf::data_type> const& normalization_targets() const noexcept
+  {
+    return has_physical_overrides() ? get_physical_types() : _native_physical_types;
+  }
+
   [[nodiscard]] gpu_ingestible& get_ingestible() const;
 
   scan_manager::split_connector& get_split_connector();

@@ -76,12 +76,13 @@ std::vector<cudf::data_type> scan_physical_schema(duckdb::LogicalGet& op,
   }
 
   // Residency gate: install a narrow sidecar only when the pinned cache will serve this scan, with
-  // each column's plan target derived from the entry's ACTUAL stored chunk carriers — pin-time
-  // narrowing verified exact min/max on materialized data and already paid the casts, so serving
-  // narrow is free. Everything else stays native: an unpinned scan is byte-identical to
-  // feature-off, and a pinned-native column is never narrowed at serve time (a recurring per-query
-  // cost). A pin that cannot serve the requested columns reads disk fresh, where a narrow sidecar
-  // would reintroduce per-batch verification and casts.
+  // each column's plan target derived from the entry's recorded stored-column metadata (compressed
+  // and uncompressed chunks answer identically) — pin-time narrowing verified exact min/max on
+  // materialized data and already paid the casts, so serving narrow is free. Everything else stays
+  // native: an unpinned scan is byte-identical to feature-off, and a pinned-native column is never
+  // narrowed at serve time (a recurring per-query cost). A pin that cannot serve the requested
+  // columns reads disk fresh, where a narrow sidecar would reintroduce per-batch verification and
+  // casts.
   auto const projection = entry->cache_info.column_projection_for(ids);
   if (projection.empty()) { return {}; }
 
@@ -157,12 +158,22 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
   // the seq_scan MVCC cache-or-CPU guard below share the result. The parquet identity
   // feeds only the gate, so its file resolution runs only when the feature is on.
   sirius::scan_manager::pinned_entry const* pinned = nullptr;
+  bool serves_insert_deltas                        = false;
   if (sirius_state && op.function.name == "seq_scan") {
     auto* bind = dynamic_cast<duckdb::TableScanBindData*>(op.bind_data.get());
     if (bind != nullptr && bind->table.IsDuckTable()) {
       auto& table = bind->table.Cast<duckdb::DuckTableEntry>();
       pinned      = sirius_state->get_scan_manager().find_pinned_entry_for_duckdb_table(
         table.ParentCatalog().GetName(), table.ParentSchema().name, table.name);
+      // Rows beyond the pinned prefix serve as insert-delta splits, decoded fresh at native
+      // width. A narrow sidecar over them would pay per-batch exact-range verification and, on
+      // an out-of-range inserted value, fail the query over to the CPU fallback — so the
+      // residency gate below installs no narrow targets for a delta-serving scan. Entry chunks
+      // and their storage metadata are untouched by deltas.
+      if (pinned != nullptr && pinned->mvcc != nullptr &&
+          static_cast<std::size_t>(table.GetStorage().GetTotalRows()) > pinned->mvcc->n_cache()) {
+        serves_insert_deltas = true;
+      }
     }
   } else if (sirius_state &&
              sirius_state->get_config().get_operator_params().enable_compressed_materialization) {
@@ -173,7 +184,8 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
     }
   }
 
-  auto physical_types = scan_physical_schema(op, sirius_state.get(), column_ids, pinned);
+  auto physical_types = scan_physical_schema(
+    op, sirius_state.get(), column_ids, serves_insert_deltas ? nullptr : pinned);
 
   if (!op.children.empty()) {
     throw duckdb::NotImplementedException("Table Input Output functions are not supported yet");

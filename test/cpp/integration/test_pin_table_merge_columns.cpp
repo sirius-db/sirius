@@ -199,14 +199,16 @@ TEST_CASE("pin_table - same-row-count merge extends cache_info to the column uni
       REQUIRE_FALSE(it->second.empty());
     }
 
-    // The chunk-major narrowing sidecar must merge in the same column order as
+    // The chunk-major storage metadata must merge in the same column order as
     // cache_info. All fixture values fit INT32 while the logical columns are
-    // BIGINT, so every cached column in every chunk is physically narrow.
-    REQUIRE(entry.narrowed_columns.size() == entry.chunk_memory_spaces.size());
-    for (auto const& chunk : entry.narrowed_columns) {
+    // BIGINT, so every cached column in every chunk is physically narrow and its
+    // recorded carrier is the stored INT32.
+    REQUIRE(entry.column_storage.size() == entry.chunk_memory_spaces.size());
+    for (auto const& chunk : entry.column_storage) {
       REQUIRE(chunk.size() == names.size());
-      for (bool narrowed : chunk) {
-        REQUIRE(narrowed);
+      for (auto const& column : chunk) {
+        REQUIRE(column.narrowed);
+        REQUIRE(column.carrier == cudf::data_type{cudf::type_id::INT32});
       }
     }
 
@@ -219,6 +221,28 @@ TEST_CASE("pin_table - same-row-count merge extends cache_info to the column uni
     if (sum_w->HasError()) { UNSCOPED_INFO("sum(w) error: " << sum_w->GetError()); }
     REQUIRE_FALSE(sum_w->HasError());
     REQUIRE(sum_w->GetValue(0, 0).ToString() == std::to_string(expected_w_sum));
+
+    // A re-pin whose chunk shape disagrees with the existing entry must report the merge
+    // mismatch itself. A host pin holds no chunk_memory_spaces, so re-pinning the same name on
+    // the GPU tier fails the very first merge guard; the storage-matrix shape check runs after
+    // the guards, so the diagnosis names the boundary disagreement and not a matrix shape.
+    auto host_pin = con.Query("CALL pin_table('" + parquet_path.string() +
+                              "', tier='host', name='tier_swap', cols=['k']);");
+    REQUIRE(host_pin);
+    if (host_pin->HasError()) { UNSCOPED_INFO("host pin error: " << host_pin->GetError()); }
+    REQUIRE_FALSE(host_pin->HasError());
+
+    auto gpu_repin = con.Query("CALL pin_table('" + parquet_path.string() +
+                               "', tier='gpu', name='tier_swap', cols=['k']);");
+    REQUIRE(gpu_repin);
+    REQUIRE(gpu_repin->HasError());
+    UNSCOPED_INFO("re-pin error: " << gpu_repin->GetError());
+    REQUIRE(gpu_repin->GetError().find("merge mismatch") != std::string::npos);
+    REQUIRE(gpu_repin->GetError().find("column_storage") == std::string::npos);
+
+    auto unpin_swap = con.Query("CALL unpin_table('tier_swap');");
+    REQUIRE(unpin_swap);
+    REQUIRE_FALSE(unpin_swap->HasError());
 
     auto unpin = con.Query("CALL unpin_table('merge_pin');");
     REQUIRE(unpin);

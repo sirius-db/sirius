@@ -44,15 +44,13 @@ struct databatch_provider {
   struct batch {
     std::shared_ptr<cucascade::data_batch> data;
     mvcc_chunk_mask mvcc_keep_mask;  ///< default = all rows visible
-    /// True when at least one selected column in this cached chunk uses a
-    /// carrier narrower than its logical type.
-    bool contains_narrowed_columns{false};
-    /// Exact bytes of the native-width destination columns (data plus validity
-    /// mask) a full restore of this chunk's narrowed selected columns would
-    /// allocate. Zero when nothing narrowed or when the pin-time logical types
-    /// are unavailable; the scan memory estimate then falls back to its
-    /// conservative maximum-expansion bound.
-    std::size_t restore_destination_bytes{0};
+    /// True when scan normalization will cast at least one selected column of this cached chunk:
+    /// its recorded carrier differs from the carrier the scan plans for that column.
+    bool needs_carrier_conversion{false};
+    /// Exact bytes of the destination columns (data plus validity mask) those casts allocate.
+    /// Zero when nothing converts or when a converting chunk's row count is unreadable; the scan
+    /// memory estimate then falls back to its conservative maximum-expansion bound.
+    std::size_t conversion_destination_bytes{0};
     std::unique_ptr<op::scan::scan_info> scan_info;
     int preferred_device{-1};  ///< placement for scan_info splits (-1 = none)
   };

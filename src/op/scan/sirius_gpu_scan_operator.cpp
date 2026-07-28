@@ -231,10 +231,8 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::execute(
   // then restore to native.
   auto const has_explicit_physical_schema = has_physical_overrides();
   if (has_explicit_physical_schema || scan_input->is_resident()) {
-    auto const& target_types =
-      has_explicit_physical_schema ? get_physical_types() : _native_physical_types;
     output_table = normalize_physical_schema(std::move(output_table),
-                                             target_types,
+                                             normalization_targets(),
                                              has_explicit_physical_schema,
                                              _compressed_materialization_observer,
                                              stream,
@@ -251,22 +249,23 @@ std::size_t sirius_gpu_scan_operator::no_history_peak_memory_estimate(
 {
   auto const expanded_bytes = saturating_mul(stats.bytes, kMaxNumericCarrierExpansion);
   if (stats.resident) {
-    // A resident cached chunk may need a carrier conversion for either reason: its selected
-    // stored columns are physically narrow (including pin-on/query-off), or this scan has an
-    // explicit plan sidecar that narrows a native cached carrier. The destination coexists with
-    // the resident input/filter working set at peak.
-    if (stats.contains_narrowed_columns) {
-      // The serve site computed the exact per-column native-width destination when it could;
-      // native width upper-bounds a serve to a narrower plan target. A zero means the
-      // destination is unknown, so the maximum-expansion bound stays.
-      if (stats.restore_destination_bytes > 0) {
-        return saturating_add(stats.working_set_bytes, stats.restore_destination_bytes);
+    // The serve site compared each selected column's recorded carrier against the carrier this
+    // scan plans for it, so a chunk reports a conversion only when normalize_physical_schema
+    // will actually cast one. The cast destination coexists with the resident input/filter
+    // working set at peak.
+    if (stats.needs_carrier_conversion) {
+      // The exact per-column destination, in the target widths cudf::cast allocates. A zero
+      // means a converting chunk's row count was unreadable, so the maximum-expansion bound
+      // stays.
+      if (stats.conversion_destination_bytes > 0) {
+        return saturating_add(stats.working_set_bytes, stats.conversion_destination_bytes);
       }
       return saturating_add(stats.working_set_bytes, expanded_bytes);
     }
     if (has_physical_overrides()) {
-      // A native cached carrier converting to a narrow plan target: the destination is at most
-      // as large as the stored source.
+      // The serve site reported no cast, but this scan carries a plan sidecar. Keep a
+      // conversion-sized headroom anyway, bounded by the stored source: a sidecar only ever
+      // narrows a resident carrier, so any cast still reachable here fits in the source's bytes.
       return saturating_add(stats.working_set_bytes, stats.bytes);
     }
     return std::max(stats.bytes, stats.working_set_bytes);
