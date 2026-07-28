@@ -49,6 +49,7 @@
 #include <cuda_runtime.h>
 
 #include <catch.hpp>
+#include <compression/compressed_representation.hpp>
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
@@ -71,6 +72,7 @@
 #include <string>
 #include <vector>
 
+using sirius::scan_manager::build_cached_scan_plan;
 using sirius::scan_manager::databatch_provider;
 using sirius::scan_manager::load_balancing_scan_batch_coalescer;
 using sirius::scan_manager::pinned_entry;
@@ -176,6 +178,33 @@ pinned_entry make_gpu_entry(cucascade::memory::memory_space& space,
       entry.data_batches_by_column[entry.cache_info.names[col]].push_back(
         make_gpu_column(space, values));
     }
+  }
+  entry.num_rows = n_chunks * rows;
+  return entry;
+}
+
+/// GPU-tier compression-enabled pinned entry with columns {k, v, w} x
+/// @p n_chunks chunks, stored as UNCOMPRESSED device_pin_chunks (per-column
+/// device columns) — the interleave-capable serving path a mixed pin uses.
+pinned_entry make_device_chunks_entry(cucascade::memory::memory_space& space,
+                                      std::size_t n_chunks,
+                                      std::size_t rows)
+{
+  pinned_entry entry;
+  entry.cache_info.names = {"k", "v", "w"};
+  entry.tier             = cucascade::memory::Tier::GPU;
+  entry.memory_space     = &space;
+  for (std::size_t c = 0; c < n_chunks; ++c) {
+    sirius::device_pin_chunk chunk;
+    chunk.memory_space = &space;
+    for (std::size_t col = 0; col < entry.cache_info.names.size(); ++col) {
+      std::vector<int32_t> values(rows);
+      for (std::size_t r = 0; r < rows; ++r) {
+        values[r] = cell(c, col, r);
+      }
+      chunk.columns.push_back(make_gpu_column(space, values));
+    }
+    entry.device_chunks.push_back(std::move(chunk));
   }
   entry.num_rows = n_chunks * rows;
   return entry;
@@ -816,6 +845,24 @@ TEST_CASE("validate_pinned_entry_for_serving accepts well-formed and zero-chunk 
     auto entry = make_host_entry(e, 2, 4);
     REQUIRE_NOTHROW(validate_pinned_entry_for_serving(entry, std::vector<std::size_t>{0, 1}));
   }
+
+  SECTION("well-formed compression-enabled GPU entry (device_chunks)")
+  {
+    auto entry = make_device_chunks_entry(*e.gpu_space, 3, 4);
+    REQUIRE_NOTHROW(validate_pinned_entry_for_serving(entry, std::vector<std::size_t>{0, 1, 2}));
+  }
+}
+
+// A compression-enabled GPU pin serves from device_chunks, not the column-major
+// data_batches_by_column. build_cached_scan_plan must count device_chunks or the
+// scan serves zero chunks and the pipeline hangs (regression guard).
+TEST_CASE("build_cached_scan_plan counts device_chunks for a compression-enabled GPU pin",
+          "[cached_serving][scan_manager]")
+{
+  auto& e    = env();
+  auto entry = make_device_chunks_entry(*e.gpu_space, 5, 4);
+  auto plan  = build_cached_scan_plan(entry, /*table_filters=*/nullptr, /*column_ids=*/nullptr);
+  REQUIRE(plan.survivor_chunk_indices.size() == 5);
 }
 
 TEST_CASE("validate_pinned_entry_for_serving refuses malformed entries",
@@ -893,5 +940,106 @@ TEST_CASE("validate_pinned_entry_for_serving refuses malformed entries",
     entry.host_chunks[1] = nullptr;
     REQUIRE_THROWS_AS(validate_pinned_entry_for_serving(entry, std::vector<std::size_t>{0}),
                       std::runtime_error);
+  }
+
+  SECTION("device_chunk missing a selected uncompressed column")
+  {
+    auto entry = make_device_chunks_entry(*e.gpu_space, 2, 4);
+    entry.device_chunks[1].columns.pop_back();  // chunk 1 now lacks column w (index 2)
+    REQUIRE_THROWS_AS(validate_pinned_entry_for_serving(entry, std::vector<std::size_t>{2}),
+                      std::runtime_error);
+  }
+
+  SECTION("device_chunk has a null uncompressed column")
+  {
+    auto entry                        = make_device_chunks_entry(*e.gpu_space, 2, 4);
+    entry.device_chunks[0].columns[0] = nullptr;
+    REQUIRE_THROWS_AS(validate_pinned_entry_for_serving(entry, std::vector<std::size_t>{0}),
+                      std::runtime_error);
+  }
+}
+
+// The plan-time carrier fold and the serve-time restore sizing introspect stored chunk
+// carriers, which only the uncompressed storage forms expose. Compression-enabled pins
+// decline narrowing (their marker matrices stay empty), so a marker matrix that
+// contradicts that invariant must degrade to "column stays native" / "conservative
+// estimator bound" -- never a crash or a misread carrier.
+TEST_CASE("pinned_column_narrow_carrier declines on a compression-enabled device entry",
+          "[cached_serving][scan_manager][compression]")
+{
+  auto& e    = env();
+  auto entry = make_device_chunks_entry(*e.gpu_space, /*n_chunks=*/2, /*rows=*/4);
+  // Hand-set markers claiming every column narrowed: device_pin_chunk carriers are
+  // opaque to introspection, so the fold must still bail to native.
+  entry.narrowed_columns.assign(2, std::vector<bool>(3, true));
+  REQUIRE_FALSE(sirius::scan_manager::pinned_column_narrow_carrier(
+                  entry, /*entry_position=*/0, cudf::data_type{cudf::type_id::INT64})
+                  .has_value());
+}
+
+TEST_CASE("host carrier introspection is total over non-uncompressed chunk forms",
+          "[cached_serving][scan_manager][compression]")
+{
+  auto& e = env();
+  // HOST entry whose single chunk is a compressed representation (empty blob --
+  // nothing here decompresses); markers hand-set to contradict the decline.
+  pinned_entry entry;
+  entry.tier             = cucascade::memory::Tier::HOST;
+  entry.memory_space     = e.host_space;
+  entry.cache_info.names = {"k"};
+  entry.host_chunks.emplace_back(std::make_shared<sirius::compressed_host_representation>(
+    *e.host_space,
+    std::make_shared<sirius::pinned_compressed_blob>(),
+    std::vector<std::string>{"k"},
+    /*compressed_bytes=*/64,
+    /*uncompressed_bytes=*/256,
+    /*num_rows=*/4));
+  entry.num_rows         = 4;
+  entry.narrowed_columns = {{true}};
+  entry.zone_maps        = make_type_only_zone_maps({duckdb::LogicalType::BIGINT}, /*n_chunks=*/1);
+
+  SECTION("carrier fold declines (column stays native)")
+  {
+    REQUIRE_FALSE(sirius::scan_manager::pinned_column_narrow_carrier(
+                    entry, /*entry_position=*/0, cudf::data_type{cudf::type_id::INT64})
+                    .has_value());
+  }
+
+  SECTION("restore sizing keeps the conservative bound")
+  {
+    std::vector<std::size_t> selected{0};
+    sirius::scan_manager::cached_scan_plan plan{.survivor_chunk_indices = {0}};
+    auto provider = sirius::scan_manager::make_provider_for_pinned_entry(
+      entry, selected, std::move(plan), sirius::telemetry::batch_telemetry_info{});
+    auto batch = provider->get_next_batch();
+    REQUIRE(batch.data);
+    REQUIRE(batch.contains_narrowed_columns);
+    REQUIRE(batch.restore_destination_bytes == 0);
+  }
+}
+
+TEST_CASE("validate_pinned_entry_for_serving checks the device-entry matrix shape",
+          "[cached_serving][scan_manager][compression]")
+{
+  auto& e    = env();
+  auto entry = make_device_chunks_entry(*e.gpu_space, /*n_chunks=*/2, /*rows=*/4);
+
+  SECTION("empty matrix (canonical all-native) passes")
+  {
+    REQUIRE_NOTHROW(validate_pinned_entry_for_serving(entry, std::vector<std::size_t>{0, 1, 2}));
+  }
+
+  SECTION("matrix with the wrong chunk count throws")
+  {
+    entry.narrowed_columns.assign(1, std::vector<bool>(3, false));
+    REQUIRE_THROWS_AS(validate_pinned_entry_for_serving(entry, std::vector<std::size_t>{0, 1, 2}),
+                      std::invalid_argument);
+  }
+
+  SECTION("matrix with the wrong column count throws")
+  {
+    entry.narrowed_columns.assign(2, std::vector<bool>(2, false));
+    REQUIRE_THROWS_AS(validate_pinned_entry_for_serving(entry, std::vector<std::size_t>{0, 1, 2}),
+                      std::invalid_argument);
   }
 }

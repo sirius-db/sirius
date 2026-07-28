@@ -205,6 +205,17 @@ static void from_yaml(const YAML::Node& node, telemetry_config& opt)
   r.reject_unknown();
 }
 
+static void from_yaml(const YAML::Node& node, compression_config& opt)
+{
+  yaml::reader r(node, "compression");
+  r.optional("enable_pin_table_compression", opt.enable_pin_table_compression);
+  r.optional("min_batch_size_bytes", yaml::bytes(opt.min_batch_size_bytes));
+  r.optional("max_compressed_fraction", opt.max_compressed_fraction);
+  r.optional("input_plan_dir", opt.input_plan_dir);
+  r.optional("column_threads", opt.column_threads, yaml::greater_than<int>{0});
+  r.reject_unknown();
+}
+
 static void from_yaml(const YAML::Node& node, exec::downgrade_executor_config& opt)
 {
   yaml::reader r(node, "downgrade");
@@ -449,6 +460,9 @@ void sirius_config::load_from_file(const std::filesystem::path& config_path)
 
     // Telemetry
     if (auto n = r.optional_node("telemetry")) { sirius::from_yaml(*n, _telemetry_config); }
+
+    // Compression
+    if (auto n = r.optional_node("compression")) { sirius::from_yaml(*n, _compression_config); }
 
     // Explicit space configs (low-level API)
     std::vector<cucascade::memory::gpu_memory_space_config> gpu_space_configs;
