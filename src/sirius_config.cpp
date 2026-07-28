@@ -219,6 +219,7 @@ static void from_yaml(const YAML::Node& node, compression_config& opt)
   r.optional("spill_replan_after_uses", opt.spill_replan_after_uses);
   r.optional("spill_error_tolerance", opt.spill_error_tolerance, yaml::greater_than<uint32_t>{0});
   r.optional("spill_replan_change_threshold", opt.spill_replan_change_threshold);
+  r.optional("spill_explore_sample_rows", yaml::bytes(opt.spill_explore_sample_rows));
   r.reject_unknown();
 }
 

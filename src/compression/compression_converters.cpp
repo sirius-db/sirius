@@ -289,6 +289,13 @@ std::vector<column_state> resolve_or_explore_spill_plan(cudf::table_view table,
   simpatico::exploration_config ecfg;
   ecfg.beam_width        = ctx.explore_beam_width;
   ecfg.max_explore_bytes = ctx.explore_max_bytes;
+  // Explore a row prefix rather than the whole column. The beam search allocates
+  // for hundreds of trial encodes, and the spill path runs it exactly when the
+  // GPU is out of memory — on full columns it mostly throws bad_alloc. Sampling
+  // cuts both the allocation and the search time by orders of magnitude.
+  // Caveat from the explorer's own docs: a prefix misleads on sorted/monotonic
+  // columns, whose best cascade exploits global structure. Set to 0 to disable.
+  ecfg.sample_rows = ctx.explore_sample_rows;
 
   // The explorer already works one column at a time, so keep its results per
   // column rather than flattening them into a single "---"-joined plan. Its
@@ -296,13 +303,25 @@ std::vector<column_state> resolve_or_explore_spill_plan(cudf::table_view table,
   // better plan from one that merely reads differently.
   std::vector<compression::plan_register::column_plan_candidate> candidates;
   candidates.reserve(static_cast<std::size_t>(table.num_columns()));
-  for (cudf::size_type i = 0; i < table.num_columns(); ++i) {
-    auto result = simpatico::explore_column_compression(
-      table.column(i), ecfg, stream, rmm::mr::get_current_device_resource_ref());
-    candidates.push_back({std::move(result.plan_dsl),
-                          result.compression_ratio,
-                          result.compress_throughput_gbps,
-                          result.decompress_throughput_gbps});
+  try {
+    for (cudf::size_type i = 0; i < table.num_columns(); ++i) {
+      auto result = simpatico::explore_column_compression(
+        table.column(i), ecfg, stream, rmm::mr::get_current_device_resource_ref());
+      candidates.push_back({std::move(result.plan_dsl),
+                            result.compression_ratio,
+                            result.compress_throughput_gbps,
+                            result.decompress_throughput_gbps});
+    }
+  } catch (...) {
+    // Record the failure against the edge before it propagates. Exploration
+    // fails before any per-column state exists, so the outcome_guard in
+    // compress_for_spill has not been constructed and conclude_spill_attempt
+    // would find nothing to record — leaving every later spill to repeat this
+    // beam search.
+    reg.note_spill_explore_failure(ctx.repo, ctx.error_tolerance);
+    SIRIUS_LOG_DEBUG("[compression_converters] repo={} exploration failed",
+                     static_cast<const void*>(ctx.repo));
+    throw;
   }
 
   SIRIUS_LOG_DEBUG("[compression_converters] explored spill plans for repo={} cols={}",

@@ -297,6 +297,28 @@ exploring, or install a placeholder entry so failures have somewhere to accumula
 
 Until both are addressed, `spill_compression` should stay off by default (it is).
 
+#### After fixing both (same query, same configs)
+
+| | Wall (on) | vs off | encode OOMs | explores OK | spills compressed |
+| --- | --- | --- | --- | --- | --- |
+| original | 68.3 s | 4.6x | 2,430 | 0 | 1 |
+| + memoize explore failures, `sample_rows` 65536 | 49.1 s | 3.2x | 54 | 0 | 0 |
+| + `max_explore_bytes` 8 MiB, `beam_width` 8 | **36.4 s** | **2.3x** | **0** | **3** | **18** |
+
+Compression now actually functions rather than just burning time. Two lessons:
+
+**`sample_rows` alone made exploration *slower* per call** (1.29 s → 2.13 s), despite
+cutting OOMs 45x. It only trims the beam *ranking*; finalists are still re-measured on
+the full column. The OOMs had been acting as an accidental cost limiter — removing them
+let more candidates survive to the expensive rerank. `max_explore_bytes` is the knob
+that bounds both phases, and dropping it to 8 MiB is what eliminated the OOMs outright
+and let exploration finally succeed.
+
+**It is still a 2.3x regression.** What remains is the irreducible cost of running a
+beam search inside a query on the downgrade thread — nsys still attributes ~81% of query
+time to `explore_spill_plan`. No amount of tuning removes that; it needs the plan to
+come from somewhere other than an in-query search. Hence lineage seeding below.
+
 ### Tune the explorer for use during query execution
 
 The explorer's defaults were chosen for offline plan generation, where a long beam

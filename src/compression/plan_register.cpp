@@ -71,7 +71,18 @@ plan_register::spill_plan_decision plan_register::decide_spill_plan(
 {
   std::shared_lock lock(_mutex);
   auto it = _spill_plans.find(repo);
-  if (it == _spill_plans.end() || it->second.columns.empty()) {
+  if (it == _spill_plans.end()) { return {spill_plan_verdict::explore, {}}; }
+
+  if (it->second.columns.empty()) {
+    // No plans yet — only a record of failed explorations. Keep asking for one
+    // until they prove durable, then stop: re-running a beam search that has
+    // repeatedly failed costs far more than spilling uncompressed. The entry
+    // still ages, so the edge is retried on the normal replan schedule.
+    const auto& state = it->second;
+    const std::uint64_t period =
+      state.replan_interval != 0 ? state.replan_interval : replan_after_uses;
+    const bool expired = period > 0 && state.uses >= period;
+    if (!expired && state.explore_exhausted) { return {spill_plan_verdict::skip, {}}; }
     return {spill_plan_verdict::explore, {}};
   }
 
@@ -134,8 +145,11 @@ void plan_register::set_spill_plan(const cucascade::shared_data_repository* repo
 {
   std::unique_lock lock(_mutex);
 
-  auto it           = _spill_plans.find(repo);
-  const bool replan = it != _spill_plans.end();
+  auto it = _spill_plans.find(repo);
+  // An entry holding only a failed-exploration streak is not a previous plan, so
+  // this is a first success rather than a replan — and installing it clears the
+  // streak, since `fresh` starts with the counters at zero.
+  const bool replan = it != _spill_plans.end() && !it->second.columns.empty();
 
   spill_plan_state fresh;
   fresh.columns.reserve(candidates.size());
@@ -228,6 +242,20 @@ void plan_register::conclude_spill_attempt(const cucascade::shared_data_reposito
 
     state.from_replan  = false;
     state.plan_changed = false;
+  }
+}
+
+void plan_register::note_spill_explore_failure(const cucascade::shared_data_repository* repo,
+                                               std::uint32_t error_tolerance)
+{
+  std::unique_lock lock(_mutex);
+  // Creates the entry when absent: exploration fails before any per-column state
+  // exists, so without this there is nothing to record the streak against and
+  // every later spill from this edge re-runs the whole beam search.
+  auto& state = _spill_plans[repo];
+  ++state.explore_failures;
+  if (state.explore_failures >= std::max<std::uint32_t>(error_tolerance, 1)) {
+    state.explore_exhausted = true;
   }
 }
 

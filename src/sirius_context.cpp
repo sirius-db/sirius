@@ -565,7 +565,8 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
                                                         comp.max_compressed_fraction,
                                                         comp.spill_replan_after_uses,
                                                         comp.spill_error_tolerance,
-                                                        comp.spill_replan_change_threshold);
+                                                        comp.spill_replan_change_threshold,
+                                                        comp.spill_explore_sample_rows);
     sirius::set_decompress_column_threads(comp.column_threads);
   }
 

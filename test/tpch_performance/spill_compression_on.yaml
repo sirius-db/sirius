@@ -35,8 +35,8 @@ sirius:
     # The arm under test. Explorer settings are the current (unmeasured)
     # defaults — establishing better ones is what this benchmark feeds.
     enable_spill_compression: true
-    spill_explore_beam_width: 20
-    spill_explore_max_bytes: 268435456
+    spill_explore_beam_width: 8
+    spill_explore_max_bytes: 8388608
     spill_replan_after_uses: 128
     spill_error_tolerance: 3
     spill_replan_change_threshold: 0.20

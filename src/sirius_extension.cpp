@@ -1982,7 +1982,8 @@ static void PushSpillCompressionSettings(const sirius::compression_config& cfg)
                                                       cfg.max_compressed_fraction,
                                                       cfg.spill_replan_after_uses,
                                                       cfg.spill_error_tolerance,
-                                                      cfg.spill_replan_change_threshold);
+                                                      cfg.spill_replan_change_threshold,
+                                                      cfg.spill_explore_sample_rows);
 }
 
 static void SetCompressionMaxCompressedFraction(ClientContext& context,
@@ -2068,6 +2069,19 @@ static void SetSpillCompressionReplanChangeThreshold(ClientContext& context,
   PushSpillCompressionSettings(cfg);
   SIRIUS_LOG_DEBUG("Updated spill_compression_replan_change_threshold to {}",
                    cfg.spill_replan_change_threshold);
+}
+
+static void SetSpillCompressionExploreSampleRows(ClientContext& context,
+                                                 SetScope scope,
+                                                 Value& parameter)
+{
+  auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  if (!sirius_ctx) { return; }
+  auto& cfg                     = sirius_ctx->get_config().get_compression_config();
+  cfg.spill_explore_sample_rows = static_cast<std::size_t>(UBigIntValue::Get(parameter));
+  PushSpillCompressionSettings(cfg);
+  SIRIUS_LOG_DEBUG("Updated spill_compression_explore_sample_rows to {}",
+                   cfg.spill_explore_sample_rows);
 }
 
 static void SetEnableDynamicFilterPushdown(ClientContext& context, SetScope scope, Value& parameter)
@@ -2432,6 +2446,16 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
     LogicalType::DOUBLE,
     Value::DOUBLE(0.20),
     SetSpillCompressionReplanChangeThreshold);
+
+  config.AddExtensionOption(
+    "spill_compression_explore_sample_rows",
+    "Row prefix the spill-path explorer runs on (0 = the whole column). The beam search "
+    "allocates for hundreds of trial encodes, and on the spill path it runs exactly when the GPU "
+    "is out of memory, so on full columns it mostly fails. Sampling bounds allocation and search "
+    "time, but picks markedly worse plans for sorted/monotonic columns",
+    LogicalType::UBIGINT,
+    Value::UBIGINT(65536),
+    SetSpillCompressionExploreSampleRows);
 
   config.AddExtensionOption(
     "enable_dynamic_filter_pushdown",

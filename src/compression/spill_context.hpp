@@ -64,6 +64,11 @@ struct spill_context {
   /// Relative change in a column's ratio or throughputs below which a
   /// re-explored plan is treated as equivalent and the cached plan kept.
   double replan_change_threshold{0.20};
+
+  /// Row prefix the explorer runs on (0 = whole column). Bounds the beam
+  /// search's allocation, which otherwise fails under the memory pressure that
+  /// caused the spill in the first place.
+  std::size_t explore_sample_rows{65536};
 };
 
 /// The calling thread's active spill context, or nullptr when none is installed.
@@ -83,7 +88,8 @@ void set_spill_compression_settings(bool enabled,
                                     double max_compressed_fraction,
                                     std::uint64_t replan_after_uses,
                                     std::uint32_t error_tolerance,
-                                    double replan_change_threshold) noexcept;
+                                    double replan_change_threshold,
+                                    std::size_t explore_sample_rows) noexcept;
 
 /// Whether spill compression is enabled process-wide.
 [[nodiscard]] bool spill_compression_enabled() noexcept;

@@ -219,7 +219,8 @@ void reset_spill_state(bool enabled = true, std::uint64_t replan_after_uses = 0)
                                                       /*max_compressed_fraction=*/0.95,
                                                       replan_after_uses,
                                                       /*error_tolerance=*/1,
-                                                      /*replan_change_threshold=*/0.20);
+                                                      /*replan_change_threshold=*/0.20,
+                                                      /*explore_sample_rows=*/0);
 }
 
 /// Create a 1-column INT32 GPU batch with a known pattern [0, 1, 2, ..., n-1].
@@ -611,7 +612,8 @@ TEST_CASE("spill compression: poor compression ratio falls back to uncompressed"
                                                       /*max_compressed_fraction=*/0.75,
                                                       /*replan_after_uses=*/0,
                                                       /*error_tolerance=*/1,
-                                                      /*replan_change_threshold=*/0.20);
+                                                      /*replan_change_threshold=*/0.20,
+                                                      /*explore_sample_rows=*/0);
   // A plan whose output is the same width as its input cannot reach 0.75.
   set_plan_1col(&repo_a(), kNonCompressingDsl);
 
@@ -643,7 +645,8 @@ TEST_CASE("spill compression: one incompressible column does not disable its nei
                                                       /*max_compressed_fraction=*/0.75,
                                                       /*replan_after_uses=*/0,
                                                       /*error_tolerance=*/1,
-                                                      /*replan_change_threshold=*/0.20);
+                                                      /*replan_change_threshold=*/0.20,
+                                                      /*explore_sample_rows=*/0);
 
   // Two identical columns: one bitpacks well, the other is given a plan that
   // cannot shrink it. Same data, so the outcome difference is purely the plan.
@@ -688,14 +691,14 @@ TEST_CASE("spill compression: a rejected edge is marked and later batches skip c
   auto& e   = env();
   auto& reg = sirius::compression::plan_register::global();
   reg.clear_all();
-  sirius::compression::set_spill_compression_settings(
-    true,
-    /*explore_beam_width=*/4,
-    /*explore_max_bytes=*/8ull << 20,
-    /*max_compressed_fraction=*/0.75,
-    /*replan_after_uses=*/0,
-    /*error_tolerance=*/1,
-    /*replan_change_threshold=*/0.20);  // never expire
+  sirius::compression::set_spill_compression_settings(true,
+                                                      /*explore_beam_width=*/4,
+                                                      /*explore_max_bytes=*/8ull << 20,
+                                                      /*max_compressed_fraction=*/0.75,
+                                                      /*replan_after_uses=*/0,
+                                                      /*error_tolerance=*/1,
+                                                      /*replan_change_threshold=*/0.20,
+                                                      /*explore_sample_rows=*/0);  // never expire
   set_plan_1col(&repo_a(), kNonCompressingDsl);
 
   // First batch: compression runs, misses the threshold, and the edge is marked.
@@ -737,7 +740,8 @@ TEST_CASE("spill compression: an unviable edge is re-explored once its entry exp
                                                       /*max_compressed_fraction=*/0.75,
                                                       /*replan_after_uses=*/1,
                                                       /*error_tolerance=*/1,
-                                                      /*replan_change_threshold=*/0.20);
+                                                      /*replan_change_threshold=*/0.20,
+                                                      /*explore_sample_rows=*/0);
   set_plan_1col(&repo_a(), kNonCompressingDsl);
 
   // First batch: rejected, edge marked unviable, one use recorded.

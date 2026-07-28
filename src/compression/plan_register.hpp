@@ -126,8 +126,22 @@ class plan_register {
 
   /// Cached spill-compression state for one query-graph edge.
   struct spill_plan_state {
-    /// One entry per source column, in schema order.
+    /// One entry per source column, in schema order. Empty when no exploration
+    /// has yet succeeded for this edge.
     std::vector<column_plan_state> columns;
+
+    /// Consecutive failed *explorations* for this edge.
+    ///
+    /// Exploration allocates on the GPU, and the spill path runs it precisely
+    /// when the GPU is full, so it can fail repeatedly. It fails before any
+    /// per-column state exists, so the streak lives here rather than on a
+    /// column: without it there is nothing to record against and every later
+    /// spill re-runs the whole beam search.
+    std::uint32_t explore_failures{0};
+
+    /// Set once `explore_failures` reaches the configured tolerance: stop asking
+    /// for an exploration until this entry expires.
+    bool explore_exhausted{false};
 
     std::uint64_t uses{0};  ///< spill attempts since this entry was installed
 
@@ -256,6 +270,18 @@ class plan_register {
                               std::span<const spill_attempt_outcome> per_column,
                               std::uint64_t base_interval,
                               std::uint32_t error_tolerance);
+
+  /**
+   * @brief Record that exploring @p repo's columns failed.
+   *
+   * Creates the entry if there is none, so the streak has somewhere to live —
+   * exploration fails before any per-column state exists. Once
+   * @p error_tolerance consecutive explorations have failed, decide_spill_plan()
+   * returns `skip` for the edge instead of asking for another one, until the
+   * entry expires and the edge is retried on the normal replan schedule.
+   */
+  void note_spill_explore_failure(const cucascade::shared_data_repository* repo,
+                                  std::uint32_t error_tolerance);
 
   /// Count one spill attempt against @p repo's entry. Call exactly once per
   /// attempt, including attempts that were skipped or that failed — otherwise a

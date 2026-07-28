@@ -238,6 +238,16 @@ struct compression_config {
   /// and locks the edge into re-exploring for the rest of the query. Set to 0 to
   /// adopt every re-explored plan.
   double spill_replan_change_threshold{0.20};
+
+  /// Row prefix the spill-path explorer runs on (0 = the whole column).
+  ///
+  /// The beam search allocates for hundreds of trial encodes, and on the spill
+  /// path it runs exactly when the GPU is out of memory — on full columns it
+  /// mostly throws bad_alloc, costing the full search and yielding no plan.
+  /// Sampling bounds both allocation and search time. Note the explorer's own
+  /// caveat: a row prefix picks markedly worse plans for sorted/monotonic
+  /// columns, whose best cascade exploits global structure.
+  std::size_t spill_explore_sample_rows{65536};
 };
 
 struct sirius_config {
