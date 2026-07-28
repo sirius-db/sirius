@@ -174,15 +174,25 @@ else()
   set(SIMPATICO_NVRTC_LIB nvrtc)
 endif()
 
-target_link_libraries(
-  simpatico
-  PUBLIC cudf
-         rmm
-         cudart
-         nvcomp
-         ${SIMPATICO_NVRTC_LIB}
-         cuda
-         dl)
+if(VCPKG_BUILD)
+  # In the vcpkg build, use CMake imported targets (link by full path) — no
+  # shared .so files exist for cudf/rmm/cudart/cuda, and link_directories() is
+  # directory-scoped so -lcudf etc. don't resolve in consuming targets. nvcomp
+  # comes in transitively from cudf::cudf; cuda_driver is the driver stub.
+  target_link_libraries(
+    simpatico PUBLIC cudf::cudf rmm::rmm CUDA::cudart_static
+                     ${SIMPATICO_NVRTC_LIB} CUDA::cuda_driver dl)
+else()
+  target_link_libraries(
+    simpatico
+    PUBLIC cudf
+           rmm
+           cudart
+           nvcomp
+           ${SIMPATICO_NVRTC_LIB}
+           cuda
+           dl)
+endif()
 
 function(add_codegen_host_test name)
   add_executable(${name} tests/${name}.cpp)
