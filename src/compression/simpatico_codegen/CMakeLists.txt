@@ -15,32 +15,53 @@ if(DEFINED ENV{CONDA_PREFIX})
   set(CONDA_PREFIX
       "$ENV{CONDA_PREFIX}"
       CACHE PATH "Conda/pixi prefix")
-else()
-  message(FATAL_ERROR "CONDA_PREFIX must be set (run inside pixi shell)")
 endif()
-
-set(CMAKE_CUDA_COMPILER
-    "${CONDA_PREFIX}/bin/nvcc"
-    CACHE FILEPATH "Conda nvcc")
 
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
   set(CUDA_TARGET_TRIPLE "sbsa-linux")
 else()
   set(CUDA_TARGET_TRIPLE "x86_64-linux")
 endif()
-set(CUDA_TOOLKIT_INCLUDE
-    "${CONDA_PREFIX}/targets/${CUDA_TARGET_TRIPLE}/include")
-set(CUDA_CCCL_INCLUDE "${CUDA_TOOLKIT_INCLUDE}/cccl")
 
-include_directories(
-  ${CMAKE_CURRENT_SOURCE_DIR}/include "${CONDA_PREFIX}/include"
-  "${CONDA_PREFIX}/include/rapids" "${CUDA_TOOLKIT_INCLUDE}")
+if(CONDA_PREFIX)
+  set(CMAKE_CUDA_COMPILER
+      "${CONDA_PREFIX}/bin/nvcc"
+      CACHE FILEPATH "nvcc from prefix")
+  set(CUDA_TOOLKIT_INCLUDE
+      "${CONDA_PREFIX}/targets/${CUDA_TARGET_TRIPLE}/include")
+  set(CUDA_CCCL_INCLUDE "${CUDA_TOOLKIT_INCLUDE}/cccl")
+  set(_SIMPATICO_INCLUDE_DIRS
+      "${CONDA_PREFIX}/include" "${CONDA_PREFIX}/include/rapids"
+      "${CUDA_TOOLKIT_INCLUDE}")
+  set(_SIMPATICO_LIB_DIR "${CONDA_PREFIX}/lib")
+else()
+  # Docker / system install: discover the CUDA toolkit via CMake and fall back
+  # to standard system paths for cudf/rmm/rapids headers.
+  find_package(CUDAToolkit REQUIRED)
+  list(GET CUDAToolkit_INCLUDE_DIRS 0 _cuda_inc0)
+  set(CUDA_TOOLKIT_INCLUDE "${_cuda_inc0}")
+  if(EXISTS "${_cuda_inc0}/cccl")
+    set(CUDA_CCCL_INCLUDE "${_cuda_inc0}/cccl")
+  else()
+    set(CUDA_CCCL_INCLUDE "${_cuda_inc0}")
+  endif()
+  set(_SIMPATICO_INCLUDE_DIRS "/usr/include" "/usr/include/rapids"
+                              "${CUDA_TOOLKIT_INCLUDE}")
+  set(_SIMPATICO_LIB_DIR "/usr/lib")
+  message(
+    STATUS
+      "CONDA_PREFIX not set — using system CUDA toolkit and /usr for rapids headers"
+  )
+endif()
+
+include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include
+                    ${_SIMPATICO_INCLUDE_DIRS})
 
 add_compile_definitions(LIBCUDACXX_ENABLE_EXPERIMENTAL_MEMORY_RESOURCE)
 add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>)
 add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
 add_link_options(-Wl,--enable-new-dtags)
-link_directories("${CONDA_PREFIX}/lib")
+link_directories("${_SIMPATICO_LIB_DIR}")
 
 # Embed the project headers the runtime NVRTC JIT #includes as raw-string
 # literals, so a binary distribution needs no simpatico source tree on disk.
@@ -161,7 +182,7 @@ function(add_codegen_host_test name)
             ${SIMPATICO_NVRTC_LIB}
             cuda
             dl)
-  target_link_options(${name} PRIVATE "-Wl,-rpath,${CONDA_PREFIX}/lib")
+  target_link_options(${name} PRIVATE "-Wl,-rpath,${_SIMPATICO_LIB_DIR}")
 endfunction()
 
 add_codegen_host_test(test_compress_with_plan_roundtrip)
@@ -192,7 +213,7 @@ target_link_libraries(
           ${SIMPATICO_NVRTC_LIB}
           cuda
           dl)
-target_link_options(simpatico_cli PRIVATE "-Wl,-rpath,${CONDA_PREFIX}/lib")
+target_link_options(simpatico_cli PRIVATE "-Wl,-rpath,${_SIMPATICO_LIB_DIR}")
 
 enable_testing()
 add_test(NAME compress_with_plan_roundtrip
