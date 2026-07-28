@@ -1980,7 +1980,8 @@ static void PushSpillCompressionSettings(const sirius::compression_config& cfg)
                                                       cfg.spill_explore_beam_width,
                                                       cfg.spill_explore_max_bytes,
                                                       cfg.max_compressed_fraction,
-                                                      cfg.spill_replan_after_uses);
+                                                      cfg.spill_replan_after_uses,
+                                                      cfg.spill_error_tolerance);
 }
 
 static void SetCompressionMaxCompressedFraction(ClientContext& context,
@@ -2041,6 +2042,18 @@ static void SetSpillCompressionReplanAfterUses(ClientContext& context,
   PushSpillCompressionSettings(cfg);
   SIRIUS_LOG_DEBUG("Updated spill_compression_replan_after_uses to {}",
                    cfg.spill_replan_after_uses);
+}
+
+static void SetSpillCompressionErrorTolerance(ClientContext& context,
+                                              SetScope scope,
+                                              Value& parameter)
+{
+  auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  if (!sirius_ctx) { return; }
+  auto& cfg                 = sirius_ctx->get_config().get_compression_config();
+  cfg.spill_error_tolerance = static_cast<uint32_t>(BigIntValue::Get(parameter));
+  PushSpillCompressionSettings(cfg);
+  SIRIUS_LOG_DEBUG("Updated spill_compression_error_tolerance to {}", cfg.spill_error_tolerance);
 }
 
 static void SetEnableDynamicFilterPushdown(ClientContext& context, SetScope scope, Value& parameter)
@@ -2384,6 +2397,16 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
     LogicalType::UBIGINT,
     Value::UBIGINT(128),
     SetSpillCompressionReplanAfterUses);
+
+  config.AddExtensionOption(
+    "spill_compression_error_tolerance",
+    "Consecutive compression errors on one operator output edge to absorb before treating that "
+    "edge as not worth compressing (minimum 1). Compression runs under memory pressure, so an "
+    "exception is as likely to be a transient allocation failure as a real signal about the data; "
+    "missing compression_max_compressed_fraction is a measurement and still applies immediately",
+    LogicalType::BIGINT,
+    Value::BIGINT(3),
+    SetSpillCompressionErrorTolerance);
 
   config.AddExtensionOption(
     "enable_dynamic_filter_pushdown",

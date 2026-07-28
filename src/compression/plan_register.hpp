@@ -99,6 +99,11 @@ class plan_register {
     /// `spill_replan_after_uses`; non-zero once adaptive backoff has moved it.
     std::uint64_t replan_interval{0};
 
+    /// Consecutive hard failures (exceptions) since the last real verdict.
+    /// Compression is only written off once this reaches the configured
+    /// tolerance, so a transient error does not disable the edge.
+    std::uint32_t consecutive_errors{0};
+
     // Bookkeeping describing the re-explore that installed this entry, consumed
     // by conclude_spill_attempt() to decide whether to back off.
     bool from_replan{false};   ///< this entry replaced an earlier one
@@ -139,16 +144,33 @@ class plan_register {
   /// the old one, for conclude_spill_attempt() to act on.
   void set_spill_plan(const cucascade::shared_data_repository* repo, std::string plan_dsl);
 
+  /// How a spill attempt ended.
+  enum class spill_attempt_outcome {
+    compressed,    ///< the compressed form was kept
+    not_worth_it,  ///< measured: compressed size missed the threshold
+    failed,        ///< errored out — possibly transient (e.g. OOM under pressure)
+  };
+
   /**
    * @brief Record how a spill attempt for @p repo turned out.
    *
-   * @param compressed_ok  true when the compressed form was kept; false when it
-   *                       missed the size threshold or compression failed outright.
-   * @param base_interval  the configured `spill_replan_after_uses`.
+   * @param outcome          how the attempt ended.
+   * @param base_interval    the configured `spill_replan_after_uses`.
+   * @param error_tolerance  consecutive `failed` outcomes to absorb before
+   *                         writing the edge off (minimum 1).
    *
-   * Sets viability — a false outcome is what makes later batches skip this edge.
+   * `compressed` and `not_worth_it` are *measurements* and take effect at once:
+   * they set viability, clear the error streak, and conclude any pending replan.
    *
-   * When the attempt followed a re-explore, this also adapts the edge's replan
+   * `failed` is not a measurement — compression runs under memory pressure, so an
+   * exception is as likely to be a transient allocation failure as a real verdict
+   * on the data. It only increments the error streak, leaving viability, the
+   * replan interval and any pending replan comparison untouched, until
+   * @p error_tolerance consecutive failures make it durable; only then is the edge
+   * written off. Without this a single transient OOM would disable compression for
+   * a whole replan interval and stretch that interval further.
+   *
+   * When a measurement concludes a re-explore, this also adapts the edge's replan
    * interval. Re-exploring costs a beam search per column, so it should only stay
    * frequent while it is paying off:
    *
@@ -163,8 +185,9 @@ class plan_register {
    * skipped edge, which made no attempt to judge).
    */
   void conclude_spill_attempt(const cucascade::shared_data_repository* repo,
-                              bool compressed_ok,
-                              std::uint64_t base_interval);
+                              spill_attempt_outcome outcome,
+                              std::uint64_t base_interval,
+                              std::uint32_t error_tolerance);
 
   /// Count one spill attempt against @p repo's entry. Call exactly once per
   /// attempt, including attempts that were skipped or that failed — otherwise a

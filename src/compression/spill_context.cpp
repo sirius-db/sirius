@@ -28,6 +28,7 @@ std::atomic<std::uint32_t> g_explore_beam_width{20};
 std::atomic<std::size_t> g_explore_max_bytes{256ULL * 1024 * 1024};
 std::atomic<double> g_max_compressed_fraction{0.75};
 std::atomic<std::uint64_t> g_replan_after_uses{128};
+std::atomic<std::uint32_t> g_error_tolerance{3};
 }  // namespace
 
 const spill_context* current_spill_context() noexcept { return t_current_spill_context; }
@@ -36,13 +37,15 @@ void set_spill_compression_settings(bool enabled,
                                     std::uint32_t explore_beam_width,
                                     std::size_t explore_max_bytes,
                                     double max_compressed_fraction,
-                                    std::uint64_t replan_after_uses) noexcept
+                                    std::uint64_t replan_after_uses,
+                                    std::uint32_t error_tolerance) noexcept
 {
   g_spill_enabled.store(enabled, std::memory_order_relaxed);
   g_explore_beam_width.store(explore_beam_width, std::memory_order_relaxed);
   g_explore_max_bytes.store(explore_max_bytes, std::memory_order_relaxed);
   g_max_compressed_fraction.store(max_compressed_fraction, std::memory_order_relaxed);
   g_replan_after_uses.store(replan_after_uses, std::memory_order_relaxed);
+  g_error_tolerance.store(error_tolerance, std::memory_order_relaxed);
 }
 
 bool spill_compression_enabled() noexcept
@@ -58,6 +61,7 @@ spill_context make_spill_context(const cucascade::shared_data_repository* repo) 
     .explore_max_bytes       = g_explore_max_bytes.load(std::memory_order_relaxed),
     .max_compressed_fraction = g_max_compressed_fraction.load(std::memory_order_relaxed),
     .replan_after_uses       = g_replan_after_uses.load(std::memory_order_relaxed),
+    .error_tolerance         = g_error_tolerance.load(std::memory_order_relaxed),
   };
 }
 

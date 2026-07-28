@@ -318,19 +318,23 @@ staged_compression compress_for_spill(cudf::table_view view,
 {
   const std::string plan = resolve_or_explore_spill_plan(view, ctx, stream);
 
-  // Report the outcome exactly once, on every exit path. This drives both the
-  // "not worth compressing" verdict and the adaptive replan backoff, so a hard
-  // compression failure (e.g. a plan that does not fit the table) counts as a
-  // failed attempt too — otherwise every later batch would repeat it and throw.
+  // Report the outcome exactly once, on every exit path. The default is `failed`,
+  // so an exception anywhere below is reported as an error rather than as a
+  // verdict on the data: the register absorbs a few of those before writing the
+  // edge off, since compression runs under memory pressure and a throw is as
+  // likely to be a transient allocation failure as a real signal.
+  using outcome_kind = compression::plan_register::spill_attempt_outcome;
   struct outcome_guard {
     const cucascade::shared_data_repository* repo;
     std::uint64_t base_interval;
-    bool ok{false};
+    std::uint32_t error_tolerance;
+    outcome_kind result{outcome_kind::failed};
     ~outcome_guard()
     {
-      compression::plan_register::global().conclude_spill_attempt(repo, ok, base_interval);
+      compression::plan_register::global().conclude_spill_attempt(
+        repo, result, base_interval, error_tolerance);
     }
-  } outcome{ctx.repo, ctx.replan_after_uses};
+  } outcome{ctx.repo, ctx.replan_after_uses, ctx.error_tolerance};
 
   staged_compression out;
   out.table = simpatico::compress_with_plan(view,
@@ -354,6 +358,9 @@ staged_compression compress_for_spill(cudf::table_view view,
   if (uncompressed_bytes > 0 &&
       static_cast<double>(compressed_bytes) >
         ctx.max_compressed_fraction * static_cast<double>(uncompressed_bytes)) {
+    // A measurement, not an error: this is real evidence the data does not
+    // compress here, so it takes effect immediately.
+    outcome.result = outcome_kind::not_worth_it;
     SIRIUS_LOG_DEBUG(
       "[compression_converters] repo={} compressed {}B of {}B: below threshold; "
       "marking edge not worth compressing",
@@ -365,7 +372,7 @@ staged_compression compress_for_spill(cudf::table_view view,
                              std::to_string(uncompressed_bytes) + "B original: below threshold");
   }
 
-  outcome.ok = true;
+  outcome.result = outcome_kind::compressed;
   return out;
 }
 

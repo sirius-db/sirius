@@ -18,6 +18,7 @@
 
 #include <api/simpatico_codegen.hpp>
 
+#include <algorithm>
 #include <limits>
 #include <mutex>
 #include <shared_mutex>
@@ -108,8 +109,9 @@ void plan_register::set_spill_plan(const cucascade::shared_data_repository* repo
 }
 
 void plan_register::conclude_spill_attempt(const cucascade::shared_data_repository* repo,
-                                           bool compressed_ok,
-                                           std::uint64_t base_interval)
+                                           spill_attempt_outcome outcome,
+                                           std::uint64_t base_interval,
+                                           std::uint32_t error_tolerance)
 {
   // Saturate rather than wrap when doubling; at this point the edge is
   // effectively never re-explored again, which is the intent.
@@ -119,6 +121,18 @@ void plan_register::conclude_spill_attempt(const cucascade::shared_data_reposito
   auto it = _spill_plans.find(repo);
   if (it == _spill_plans.end()) { return; }
   auto& state = it->second;
+
+  if (outcome == spill_attempt_outcome::failed) {
+    // An exception is not evidence about the data — spilling runs under memory
+    // pressure, so this may well be a transient allocation failure. Absorb it
+    // and leave viability, the replan interval and any pending replan
+    // comparison alone until the failures prove durable.
+    ++state.consecutive_errors;
+    if (state.consecutive_errors < std::max<std::uint32_t>(error_tolerance, 1)) { return; }
+  }
+
+  const bool compressed_ok = outcome == spill_attempt_outcome::compressed;
+  state.consecutive_errors = 0;
 
   if (state.from_replan) {
     const std::uint64_t current =

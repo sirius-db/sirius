@@ -157,7 +157,8 @@ void reset_spill_state(bool enabled = true, std::uint64_t replan_after_uses = 0)
                                                       /*explore_beam_width=*/4,
                                                       /*explore_max_bytes=*/8ull << 20,
                                                       /*max_compressed_fraction=*/0.95,
-                                                      replan_after_uses);
+                                                      replan_after_uses,
+                                                      /*error_tolerance=*/1);
 }
 
 /// Create a 1-column INT32 GPU batch with a known pattern [0, 1, 2, ..., n-1].
@@ -480,7 +481,8 @@ TEST_CASE("spill compression: poor compression ratio falls back to uncompressed"
                                                       /*explore_beam_width=*/4,
                                                       /*explore_max_bytes=*/8ull << 20,
                                                       /*max_compressed_fraction=*/0.75,
-                                                      /*replan_after_uses=*/0);
+                                                      /*replan_after_uses=*/0,
+                                                      /*error_tolerance=*/1);
   // A plan whose output is the same width as its input cannot reach 0.75.
   sirius::compression::plan_register::global().set_spill_plan(&repo_a(), kNonCompressingDsl);
 
@@ -510,7 +512,8 @@ TEST_CASE("spill compression: a rejected edge is marked and later batches skip c
                                                       /*explore_beam_width=*/4,
                                                       /*explore_max_bytes=*/8ull << 20,
                                                       /*max_compressed_fraction=*/0.75,
-                                                      /*replan_after_uses=*/0);  // never expire
+                                                      /*replan_after_uses=*/0,
+                                                      /*error_tolerance=*/1);  // never expire
   reg.set_spill_plan(&repo_a(), kNonCompressingDsl);
 
   // First batch: compression runs, misses the threshold, and the edge is marked.
@@ -552,7 +555,8 @@ TEST_CASE("spill compression: an unviable edge is re-explored once its entry exp
                                                       /*explore_beam_width=*/4,
                                                       /*explore_max_bytes=*/8ull << 20,
                                                       /*max_compressed_fraction=*/0.75,
-                                                      /*replan_after_uses=*/1);
+                                                      /*replan_after_uses=*/1,
+                                                      /*error_tolerance=*/1);
   reg.set_spill_plan(&repo_a(), kNonCompressingDsl);
 
   // First batch: rejected, edge marked unviable, one use recorded.
@@ -600,7 +604,11 @@ TEST_CASE("plan_register: decide_spill_plan verdicts", "[compression][plan_regis
 
   // A failed attempt -> skip, but the DSL and use count are retained so the
   // entry still ages toward expiry.
-  reg.conclude_spill_attempt(&repo_a(), /*compressed_ok=*/false, /*base_interval=*/0);
+  reg.conclude_spill_attempt(
+    &repo_a(),
+    sirius::compression::plan_register::spill_attempt_outcome::not_worth_it,
+    /*base_interval=*/0,
+    /*error_tolerance=*/1);
   REQUIRE(reg.decide_spill_plan(&repo_a(), 0).verdict == verdict::skip);
   REQUIRE(reg.resolve_spill_plan(&repo_a())->dsl == "some dsl");
 
@@ -623,8 +631,13 @@ TEST_CASE("plan_register: decide_spill_plan verdicts", "[compression][plan_regis
 TEST_CASE("plan_register: replan interval backs off when a re-explore learns nothing",
           "[compression][plan_register]")
 {
+  using outcome = sirius::compression::plan_register::spill_attempt_outcome;
+
   auto& reg                     = sirius::compression::plan_register::global();
   constexpr std::uint64_t kBase = 8;
+  constexpr std::uint32_t kTol  = 1;
+  constexpr auto kCompressed    = outcome::compressed;
+  constexpr auto kNotWorthIt    = outcome::not_worth_it;
   const std::string kPlan       = "plan one";
   const std::string kOtherPlan  = "plan two";
 
@@ -636,15 +649,15 @@ TEST_CASE("plan_register: replan interval backs off when a re-explore learns not
   {
     reg.clear_all();
     reg.set_spill_plan(&repo_a(), kPlan);
-    reg.conclude_spill_attempt(&repo_a(), true, kBase);  // first install: no backoff
-    REQUIRE(interval_of(&repo_a()) == 0);                // still on the configured schedule
+    reg.conclude_spill_attempt(&repo_a(), kCompressed, kBase, kTol);  // first install: no backoff
+    REQUIRE(interval_of(&repo_a()) == 0);  // still on the configured schedule
 
     reg.set_spill_plan(&repo_a(), kPlan);  // re-explore returned the same plan
-    reg.conclude_spill_attempt(&repo_a(), true, kBase);
+    reg.conclude_spill_attempt(&repo_a(), kCompressed, kBase, kTol);
     REQUIRE(interval_of(&repo_a()) == kBase * 2);
 
     reg.set_spill_plan(&repo_a(), kPlan);
-    reg.conclude_spill_attempt(&repo_a(), true, kBase);
+    reg.conclude_spill_attempt(&repo_a(), kCompressed, kBase, kTol);
     REQUIRE(interval_of(&repo_a()) == kBase * 4);
   }
 
@@ -652,10 +665,11 @@ TEST_CASE("plan_register: replan interval backs off when a re-explore learns not
   {
     reg.clear_all();
     reg.set_spill_plan(&repo_a(), kPlan);
-    reg.conclude_spill_attempt(&repo_a(), false, kBase);
+    reg.conclude_spill_attempt(&repo_a(), kNotWorthIt, kBase, kTol);
 
-    reg.set_spill_plan(&repo_a(), kOtherPlan);            // explorer found something else...
-    reg.conclude_spill_attempt(&repo_a(), false, kBase);  // ...that still does not compress
+    reg.set_spill_plan(&repo_a(), kOtherPlan);  // explorer found something else...
+    reg.conclude_spill_attempt(
+      &repo_a(), kNotWorthIt, kBase, kTol);  // ...that still does not compress
     REQUIRE(interval_of(&repo_a()) == kBase * 2);
   }
 
@@ -663,14 +677,14 @@ TEST_CASE("plan_register: replan interval backs off when a re-explore learns not
   {
     reg.clear_all();
     reg.set_spill_plan(&repo_a(), kPlan);
-    reg.conclude_spill_attempt(&repo_a(), true, kBase);
+    reg.conclude_spill_attempt(&repo_a(), kCompressed, kBase, kTol);
     // Stretch the interval out first.
     reg.set_spill_plan(&repo_a(), kPlan);
-    reg.conclude_spill_attempt(&repo_a(), true, kBase);
+    reg.conclude_spill_attempt(&repo_a(), kCompressed, kBase, kTol);
     REQUIRE(interval_of(&repo_a()) == kBase * 2);
 
     reg.set_spill_plan(&repo_a(), kOtherPlan);
-    reg.conclude_spill_attempt(&repo_a(), true, kBase);
+    reg.conclude_spill_attempt(&repo_a(), kCompressed, kBase, kTol);
     REQUIRE(interval_of(&repo_a()) == kBase);
   }
 
@@ -678,15 +692,15 @@ TEST_CASE("plan_register: replan interval backs off when a re-explore learns not
   {
     reg.clear_all();
     reg.set_spill_plan(&repo_a(), kPlan);
-    reg.conclude_spill_attempt(&repo_a(), false, kBase);  // not worth compressing
+    reg.conclude_spill_attempt(&repo_a(), kNotWorthIt, kBase, kTol);  // not worth compressing
     reg.set_spill_plan(&repo_a(), kPlan);
-    reg.conclude_spill_attempt(&repo_a(), false, kBase);  // still not — back off
+    reg.conclude_spill_attempt(&repo_a(), kNotWorthIt, kBase, kTol);  // still not — back off
     REQUIRE(interval_of(&repo_a()) == kBase * 2);
 
     // Same plan, but it now compresses: the edge recovered, so resume checking
     // on schedule.
     reg.set_spill_plan(&repo_a(), kPlan);
-    reg.conclude_spill_attempt(&repo_a(), true, kBase);
+    reg.conclude_spill_attempt(&repo_a(), kCompressed, kBase, kTol);
     REQUIRE(interval_of(&repo_a()) == kBase);
     REQUIRE(reg.resolve_spill_plan(&repo_a())->viable);
   }
@@ -696,9 +710,9 @@ TEST_CASE("plan_register: replan interval backs off when a re-explore learns not
     using verdict = sirius::compression::plan_register::spill_plan_verdict;
     reg.clear_all();
     reg.set_spill_plan(&repo_a(), kPlan);
-    reg.conclude_spill_attempt(&repo_a(), true, kBase);
+    reg.conclude_spill_attempt(&repo_a(), kCompressed, kBase, kTol);
     reg.set_spill_plan(&repo_a(), kPlan);
-    reg.conclude_spill_attempt(&repo_a(), true, kBase);
+    reg.conclude_spill_attempt(&repo_a(), kCompressed, kBase, kTol);
     REQUIRE(interval_of(&repo_a()) == kBase * 2);
 
     for (std::uint64_t i = 0; i < kBase; ++i) {
@@ -717,6 +731,78 @@ TEST_CASE("plan_register: replan interval backs off when a re-explore learns not
   reg.clear_all();
 }
 
+TEST_CASE("plan_register: transient compression errors do not write off an edge",
+          "[compression][plan_register]")
+{
+  using outcome = sirius::compression::plan_register::spill_attempt_outcome;
+  using verdict = sirius::compression::plan_register::spill_plan_verdict;
+
+  auto& reg                     = sirius::compression::plan_register::global();
+  constexpr std::uint64_t kBase = 8;
+  constexpr std::uint32_t kTol  = 3;
+
+  SECTION("errors below the tolerance leave the edge usable")
+  {
+    reg.clear_all();
+    reg.set_spill_plan(&repo_a(), "plan");
+
+    // Two failures with a tolerance of three: the edge stays viable, so spilling
+    // keeps compressing rather than being disabled by a passing blip.
+    reg.conclude_spill_attempt(&repo_a(), outcome::failed, kBase, kTol);
+    REQUIRE(reg.decide_spill_plan(&repo_a(), kBase).verdict == verdict::use);
+    reg.conclude_spill_attempt(&repo_a(), outcome::failed, kBase, kTol);
+    REQUIRE(reg.decide_spill_plan(&repo_a(), kBase).verdict == verdict::use);
+    REQUIRE(reg.resolve_spill_plan(&repo_a())->viable);
+
+    // The third makes it durable.
+    reg.conclude_spill_attempt(&repo_a(), outcome::failed, kBase, kTol);
+    REQUIRE(reg.decide_spill_plan(&repo_a(), kBase).verdict == verdict::skip);
+  }
+
+  SECTION("a success resets the error streak")
+  {
+    reg.clear_all();
+    reg.set_spill_plan(&repo_a(), "plan");
+
+    reg.conclude_spill_attempt(&repo_a(), outcome::failed, kBase, kTol);
+    reg.conclude_spill_attempt(&repo_a(), outcome::failed, kBase, kTol);
+    reg.conclude_spill_attempt(&repo_a(), outcome::compressed, kBase, kTol);
+    REQUIRE(reg.resolve_spill_plan(&repo_a())->consecutive_errors == 0);
+
+    // Two more failures must not tip it over — the streak restarted.
+    reg.conclude_spill_attempt(&repo_a(), outcome::failed, kBase, kTol);
+    reg.conclude_spill_attempt(&repo_a(), outcome::failed, kBase, kTol);
+    REQUIRE(reg.decide_spill_plan(&repo_a(), kBase).verdict == verdict::use);
+  }
+
+  SECTION("a tolerated error does not disturb a pending replan comparison")
+  {
+    reg.clear_all();
+    reg.set_spill_plan(&repo_a(), "plan");
+    reg.conclude_spill_attempt(&repo_a(), outcome::compressed, kBase, kTol);
+
+    // Re-explore returns the same plan, but the attempt errors transiently. The
+    // interval must not move: the cycle has not been judged yet.
+    reg.set_spill_plan(&repo_a(), "plan");
+    reg.conclude_spill_attempt(&repo_a(), outcome::failed, kBase, kTol);
+    REQUIRE(reg.resolve_spill_plan(&repo_a())->replan_interval == 0);
+
+    // The next real outcome concludes it — same plan, so back off.
+    reg.conclude_spill_attempt(&repo_a(), outcome::compressed, kBase, kTol);
+    REQUIRE(reg.resolve_spill_plan(&repo_a())->replan_interval == kBase * 2);
+  }
+
+  SECTION("a tolerance of one writes off on the first error")
+  {
+    reg.clear_all();
+    reg.set_spill_plan(&repo_a(), "plan");
+    reg.conclude_spill_attempt(&repo_a(), outcome::failed, kBase, /*error_tolerance=*/1);
+    REQUIRE(reg.decide_spill_plan(&repo_a(), kBase).verdict == verdict::skip);
+  }
+
+  reg.clear_all();
+}
+
 TEST_CASE("plan_register: note_spill_plan_use on an absent edge is a no-op",
           "[compression][plan_register]")
 {
@@ -727,7 +813,11 @@ TEST_CASE("plan_register: note_spill_plan_use on an absent edge is a no-op",
   // otherwise age a plan that has not been installed yet.
   reg.note_spill_plan_use(&repo_a());
   REQUIRE_FALSE(reg.resolve_spill_plan(&repo_a()).has_value());
-  reg.conclude_spill_attempt(&repo_a(), /*compressed_ok=*/false, /*base_interval=*/8);
+  reg.conclude_spill_attempt(
+    &repo_a(),
+    sirius::compression::plan_register::spill_attempt_outcome::not_worth_it,
+    /*base_interval=*/8,
+    /*error_tolerance=*/1);
   REQUIRE_FALSE(reg.resolve_spill_plan(&repo_a()).has_value());
 
   reg.clear_all();

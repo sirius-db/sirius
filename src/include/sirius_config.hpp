@@ -217,6 +217,16 @@ struct compression_config {
   /// whole query. The default amortizes one explore over many batches, which is
   /// a small fraction of spill cost while still self-correcting.
   std::uint64_t spill_replan_after_uses{128};
+
+  /// Consecutive compression *errors* on one edge to absorb before treating the
+  /// edge as not worth compressing. Minimum 1 (write off on the first error).
+  ///
+  /// Distinct from `max_compressed_fraction`, which is a measurement and applies
+  /// immediately. Compression runs under memory pressure, so an exception is as
+  /// likely to be a transient allocation failure as a real signal about the data;
+  /// writing the edge off on the first one would disable compression for a whole
+  /// replan interval — and stretch that interval — over a passing blip.
+  std::uint32_t spill_error_tolerance{3};
 };
 
 struct sirius_config {

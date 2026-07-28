@@ -217,6 +217,7 @@ static void from_yaml(const YAML::Node& node, compression_config& opt)
     "spill_explore_beam_width", opt.spill_explore_beam_width, yaml::greater_than<uint32_t>{0});
   r.optional("spill_explore_max_bytes", yaml::bytes(opt.spill_explore_max_bytes));
   r.optional("spill_replan_after_uses", opt.spill_replan_after_uses);
+  r.optional("spill_error_tolerance", opt.spill_error_tolerance, yaml::greater_than<uint32_t>{0});
   r.reject_unknown();
 }
 
