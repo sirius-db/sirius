@@ -71,17 +71,22 @@ grep -oE 'stats-pruned [0-9]+ row groups' /tmp/cluster_verify/sirius_*.log
 
 > **Prefer `generate_tpch_data.sh`.** DuckDB's `tpch` extension emits the same keys, numbers and
 > names as the classic tools, but a different synthetic comment pool, so q13 and q16 — which
-> filter on `o_comment` and `s_comment` — return different results. `generate_tpch_data.sh` runs
-> the classic `dbgen` for both formats, matching the refresh sets, the query streams, and
-> tpchgen-rs.
+> filter on `o_comment` and `s_comment` — return different results. `generate_tpch_data.sh`
+> produces the TPC-H reference data for both formats, matching the refresh sets and the query
+> streams.
 
-The `--format duckdb` path generates one table at a time with `dbgen -T`, loads it, and deletes
-the `.tbl` before moving on, so peak disk is the largest single table plus the database instead of
-the whole raw dataset alongside it. Tables go largest first, so lineitem is staged while the
-database is still empty. At SF1 that holds the staging directory to 725 MB against roughly 1 GB
-for the raw set; at SF1000 it is the difference between about 890 GiB and 1.3 TB, which is what
-makes that scale factor reachable at all. The trade is a second pass over the order generator,
-since `-T O` and `-T L` each walk it.
+The `--format duckdb` path generates one table at a time, loads it, and deletes the `.tbl` before
+moving on, so peak disk is the largest single table plus the database instead of the whole raw
+dataset alongside it. Tables go largest first, so lineitem is staged while the database is still
+empty. At SF1 that holds the staging directory to 725 MB against roughly 1 GB for the raw set; at
+SF1000 it is the difference between about 890 GiB and 1.3 TB, which is what makes that scale
+factor reachable at all.
+
+Generation prefers `tpchgen-rs`, which emits byte-identical `.tbl` output to the classic `dbgen`
+but generates in parallel: SF1 takes 1.2s against dbgen's 10.3s. `dbgen` is the fallback when it
+cannot be built, and it pays a second pass over the order generator since `-T O` and `-T L` each
+walk it. Refresh sets and query streams still come from `dbgen -U` and `qgen` — tpchgen-rs has no
+equivalent — which is sound precisely because the base data is byte-identical either way.
 
 ```bash
 # From project root - generates parquet files with DuckDB's default row groups (122K rows)

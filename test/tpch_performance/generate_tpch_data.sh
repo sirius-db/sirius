@@ -73,9 +73,28 @@ TPCH_TABLES="nation region part supplier partsupp customer orders lineitem"
 # while -T L is lineitem. Each of these flags writes exactly one .tbl.
 TPCH_TABLE_FLAGS="lineitem:L orders:O partsupp:S customer:c part:P supplier:s nation:n region:r"
 
-# Build a .duckdb from the classic dbgen, the same generator that produces the
-# refresh sets and query streams. dbgen writes into DSS_PATH but resolves
-# dists.dss relative to its own directory, hence the subshell.
+# Clone and build tpchgen-cli if it is not already there. Returns non-zero when
+# that is not possible, so callers can fall back to dbgen.
+ensure_tpchgen_cli() {
+    TPCHGEN_DIR="$PROJECT_DIR/test_datasets/tpchgen-rs"
+    TPCHGEN_CLI="$TPCHGEN_DIR/target/release/tpchgen-cli"
+
+    [ -x "$TPCHGEN_CLI" ] && return 0
+    command -v cargo >/dev/null 2>&1 || return 1
+    if [ ! -d "$TPCHGEN_DIR" ]; then
+        echo "Cloning sirius-db/tpchgen-rs..."
+        git clone https://github.com/sirius-db/tpchgen-rs.git "$TPCHGEN_DIR" || return 1
+    fi
+    echo "Building tpchgen-cli with native CPU optimizations..."
+    (cd "$TPCHGEN_DIR" && RUSTFLAGS="-C target-cpu=native" cargo build --release -p tpchgen-cli) || return 1
+    [ -x "$TPCHGEN_CLI" ]
+}
+
+# Build a .duckdb from the same TPC-H data the refresh sets and query streams
+# are built from. tpchgen-rs emits byte-identical .tbl output to the classic
+# dbgen but generates in parallel, so it is preferred and dbgen is the fallback
+# when cargo or the network is unavailable. dbgen writes into DSS_PATH but
+# resolves dists.dss relative to its own directory, hence the subshell.
 #
 # Tables are generated one at a time and each .tbl is deleted once loaded, so
 # peak disk is the largest single table plus the database rather than the whole
@@ -84,15 +103,20 @@ TPCH_TABLE_FLAGS="lineitem:L orders:O partsupp:S customer:c part:P supplier:s na
 # the other seven tables are already there. At SF1000 that is the difference
 # between roughly 890 GiB and 970 GiB.
 #
-# The cost is that -T O and -T L each walk the order generator, so orders and
-# lineitem take two passes instead of one. Disk is the scarcer resource at the
-# scale factors where this matters.
-build_duckdb_from_dbgen() {
+# On the dbgen fallback this costs a second pass over the order generator, since
+# -T O and -T L each walk it. tpchgen-rs has no such penalty.
+build_duckdb_dataset() {
     local out="$1" sf="$2"
     local dbgen_dir="$PROJECT_DIR/test_datasets/tpch-dbgen"
     local stage="${out%.duckdb}.tbl_stage"
 
-    ensure_tpch_tools "$dbgen_dir" "$PROJECT_DIR" dbgen
+    local generator="tpchgen-rs"
+    if ! ensure_tpchgen_cli; then
+        generator="dbgen"
+        ensure_tpch_tools "$dbgen_dir" "$PROJECT_DIR" dbgen
+    fi
+    echo "Generating TPC-H SF${sf} with ${generator} ..."
+
     mkdir -p "$stage"
     stage="$(cd "$stage" && pwd)"
     # shellcheck disable=SC2064
@@ -106,8 +130,12 @@ build_duckdb_from_dbgen() {
     for spec in $TPCH_TABLE_FLAGS; do
         table="${spec%%:*}"
         flag="${spec##*:}"
-        echo "  ${table}: dbgen -T ${flag} ..."
-        (cd "$dbgen_dir" && DSS_PATH="$stage" ./dbgen -f -q -s "$sf" -T "$flag")
+        echo "  ${table}: generating ..."
+        if [ "$generator" = "tpchgen-rs" ]; then
+            "$TPCHGEN_CLI" -s "$sf" --format=tbl --tables="$table" --output-dir="$stage"
+        else
+            (cd "$dbgen_dir" && DSS_PATH="$stage" ./dbgen -f -q -s "$sf" -T "$flag")
+        fi
         echo "  ${table}: loading $(du -h "$stage/$table.tbl" | cut -f1) ..."
         SIRIUS_DISABLE=1 "$DUCKDB" "$out" \
             -c "COPY $table FROM '$stage/$table.tbl' (HEADER false, DELIMITER '|');"
@@ -254,7 +282,7 @@ elif [ "$FORMAT" = "duckdb" ]; then
         trap 'rm -f "$STAGING" "$STAGING".wal' EXIT
 
         echo "Generating TPC-H SF${SF} (staging) ..."
-        build_duckdb_from_dbgen "$STAGING" "$SF"
+        build_duckdb_dataset "$STAGING" "$SF"
         SIRIUS_DISABLE=1 "$DUCKDB" "$STAGING" -c "CHECKPOINT;"
 
         # Parse --cluster-keys "table:col,table:col" into a lookup.
@@ -294,7 +322,7 @@ elif [ "$FORMAT" = "duckdb" ]; then
         fi
 
         echo "Generating TPC-H SF${SF} data into $OUTPUT ..."
-        build_duckdb_from_dbgen "$OUTPUT" "$SF"
+        build_duckdb_dataset "$OUTPUT" "$SF"
     fi
 fi
 
