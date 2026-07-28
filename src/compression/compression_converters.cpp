@@ -291,27 +291,34 @@ std::vector<column_state> resolve_or_explore_spill_plan(cudf::table_view table,
   ecfg.max_explore_bytes = ctx.explore_max_bytes;
 
   // The explorer already works one column at a time, so keep its results per
-  // column rather than flattening them into a single "---"-joined plan.
-  std::vector<std::string> per_column;
-  per_column.reserve(static_cast<std::size_t>(table.num_columns()));
+  // column rather than flattening them into a single "---"-joined plan. Its
+  // measurements come along too: the register uses them to tell a genuinely
+  // better plan from one that merely reads differently.
+  std::vector<compression::plan_register::column_plan_candidate> candidates;
+  candidates.reserve(static_cast<std::size_t>(table.num_columns()));
   for (cudf::size_type i = 0; i < table.num_columns(); ++i) {
     auto result = simpatico::explore_column_compression(
       table.column(i), ecfg, stream, rmm::mr::get_current_device_resource_ref());
-    per_column.push_back(std::move(result.plan_dsl));
+    candidates.push_back({std::move(result.plan_dsl),
+                          result.compression_ratio,
+                          result.compress_throughput_gbps,
+                          result.decompress_throughput_gbps});
   }
 
   SIRIUS_LOG_DEBUG("[compression_converters] explored spill plans for repo={} cols={}",
                    static_cast<const void*>(ctx.repo),
                    table.num_columns());
 
-  reg.set_spill_plan(ctx.repo, per_column);
-
-  std::vector<column_state> states;
-  states.reserve(per_column.size());
-  for (auto& dsl : per_column) {
-    states.push_back(column_state{std::move(dsl), /*viable=*/true, /*consecutive_errors=*/0});
+  // The register may keep a cached plan over an equivalent candidate, so read
+  // back what it actually settled on rather than assuming the candidates won.
+  reg.set_spill_plan(ctx.repo, std::move(candidates), ctx.replan_change_threshold);
+  const auto settled = reg.decide_spill_plan(ctx.repo, /*replan_after_uses=*/0);
+  if (settled.verdict == verdict::skip) {
+    // Every column kept a cached "not worth it" verdict, because nothing the
+    // explorer found this time performs materially differently.
+    throw std::runtime_error("[compression_converters] no column worth compressing");
   }
-  return states;
+  return settled.columns;
 }
 
 // The spill context must be installed by convertible_data_batch::convert().

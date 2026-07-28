@@ -105,6 +105,23 @@ class plan_register {
     /// edge level, an error is not evidence about the data, so a column is only
     /// written off once the failures prove durable.
     std::uint32_t consecutive_errors{0};
+
+    // Explorer-reported characteristics of `dsl` when it was adopted. Compared
+    // against a later exploration to decide whether the new plan is materially
+    // different — see set_spill_plan.
+    double compression_ratio{1.0};
+    double compress_gbps{0.0};
+    double decompress_gbps{0.0};
+  };
+
+  /// A plan the explorer produced for one column, with the measurements that
+  /// justify it. Offered to set_spill_plan, which decides whether adopting it
+  /// over the cached plan is worthwhile.
+  struct column_plan_candidate {
+    std::string dsl;
+    double compression_ratio{1.0};
+    double compress_gbps{0.0};
+    double decompress_gbps{0.0};
   };
 
   /// Cached spill-compression state for one query-graph edge.
@@ -167,12 +184,32 @@ class plan_register {
   [[nodiscard]] spill_plan_decision decide_spill_plan(const cucascade::shared_data_repository* repo,
                                                       std::uint64_t replan_after_uses) const;
 
-  /// Install freshly explored per-column plans for @p repo (one DSL per source
-  /// column, in schema order; all columns start viable and the use count resets).
-  /// When this replaces an existing entry it records how the new plans compare to
-  /// the old ones, for conclude_spill_attempt() to act on.
+  /**
+   * @brief Offer freshly explored per-column plans for @p repo (schema order).
+   *
+   * @param change_threshold  relative change in compression ratio or in either
+   *                          throughput below which a candidate is considered
+   *                          equivalent to the cached plan (e.g. 0.2 = 20%).
+   *
+   * With no cached entry every candidate is adopted, viable, with the use count
+   * at zero.
+   *
+   * Replacing an entry, each column is decided on its own. The explorer is a
+   * beam search over a large space and readily returns a *differently spelled*
+   * plan that performs the same; adopting those would churn the cache and — worse
+   * — register as a change, resetting the replan backoff and locking the edge
+   * into re-exploring forever. So a candidate is only adopted when its ratio or
+   * one of its throughputs differs from the cached plan's by more than
+   * @p change_threshold. An adopted column resets to viable with a clear error
+   * streak; a column that keeps its cached plan keeps its verdict too, since an
+   * equivalent plan will not compress any better than the one already judged.
+   *
+   * Only genuinely adopted columns mark the entry as changed for
+   * conclude_spill_attempt(), so an all-equivalent re-explore backs off.
+   */
   void set_spill_plan(const cucascade::shared_data_repository* repo,
-                      std::vector<std::string> per_column_dsl);
+                      std::vector<column_plan_candidate> candidates,
+                      double change_threshold);
 
   /// How a spill attempt ended.
   enum class spill_attempt_outcome {

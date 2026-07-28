@@ -227,6 +227,17 @@ struct compression_config {
   /// writing the edge off on the first one would disable compression for a whole
   /// replan interval — and stretch that interval — over a passing blip.
   std::uint32_t spill_error_tolerance{3};
+
+  /// Relative change in a column's compression ratio or in either of its
+  /// throughputs below which a re-explored plan counts as equivalent to the
+  /// cached one, and the cached plan is kept. 0.2 = 20%.
+  ///
+  /// The explorer is a beam search over a large space and readily returns a
+  /// differently spelled plan that performs the same. Adopting those churns the
+  /// cache and, worse, registers as a change — which resets the replan backoff
+  /// and locks the edge into re-exploring for the rest of the query. Set to 0 to
+  /// adopt every re-explored plan.
+  double spill_replan_change_threshold{0.20};
 };
 
 struct sirius_config {

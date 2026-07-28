@@ -1981,7 +1981,8 @@ static void PushSpillCompressionSettings(const sirius::compression_config& cfg)
                                                       cfg.spill_explore_max_bytes,
                                                       cfg.max_compressed_fraction,
                                                       cfg.spill_replan_after_uses,
-                                                      cfg.spill_error_tolerance);
+                                                      cfg.spill_error_tolerance,
+                                                      cfg.spill_replan_change_threshold);
 }
 
 static void SetCompressionMaxCompressedFraction(ClientContext& context,
@@ -2054,6 +2055,19 @@ static void SetSpillCompressionErrorTolerance(ClientContext& context,
   cfg.spill_error_tolerance = static_cast<uint32_t>(BigIntValue::Get(parameter));
   PushSpillCompressionSettings(cfg);
   SIRIUS_LOG_DEBUG("Updated spill_compression_error_tolerance to {}", cfg.spill_error_tolerance);
+}
+
+static void SetSpillCompressionReplanChangeThreshold(ClientContext& context,
+                                                     SetScope scope,
+                                                     Value& parameter)
+{
+  auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  if (!sirius_ctx) { return; }
+  auto& cfg                         = sirius_ctx->get_config().get_compression_config();
+  cfg.spill_replan_change_threshold = DoubleValue::Get(parameter);
+  PushSpillCompressionSettings(cfg);
+  SIRIUS_LOG_DEBUG("Updated spill_compression_replan_change_threshold to {}",
+                   cfg.spill_replan_change_threshold);
 }
 
 static void SetEnableDynamicFilterPushdown(ClientContext& context, SetScope scope, Value& parameter)
@@ -2407,6 +2421,17 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
     LogicalType::BIGINT,
     Value::BIGINT(3),
     SetSpillCompressionErrorTolerance);
+
+  config.AddExtensionOption(
+    "spill_compression_replan_change_threshold",
+    "Relative change in a column's compression ratio or in either of its throughputs below which "
+    "a re-explored plan counts as equivalent to the cached one, and the cached plan is kept "
+    "(0.2 = 20%). The explorer readily returns a differently spelled plan that performs the same; "
+    "adopting those churns the cache and registers as a change, which resets the replan backoff "
+    "and locks the edge into re-exploring. 0 adopts every re-explored plan",
+    LogicalType::DOUBLE,
+    Value::DOUBLE(0.20),
+    SetSpillCompressionReplanChangeThreshold);
 
   config.AddExtensionOption(
     "enable_dynamic_filter_pushdown",

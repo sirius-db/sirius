@@ -60,6 +60,10 @@ struct spill_context {
   /// Consecutive compression errors to absorb before writing an edge off, so a
   /// transient failure under memory pressure is not mistaken for a verdict.
   std::uint32_t error_tolerance{3};
+
+  /// Relative change in a column's ratio or throughputs below which a
+  /// re-explored plan is treated as equivalent and the cached plan kept.
+  double replan_change_threshold{0.20};
 };
 
 /// The calling thread's active spill context, or nullptr when none is installed.
@@ -78,7 +82,8 @@ void set_spill_compression_settings(bool enabled,
                                     std::size_t explore_max_bytes,
                                     double max_compressed_fraction,
                                     std::uint64_t replan_after_uses,
-                                    std::uint32_t error_tolerance) noexcept;
+                                    std::uint32_t error_tolerance,
+                                    double replan_change_threshold) noexcept;
 
 /// Whether spill compression is enabled process-wide.
 [[nodiscard]] bool spill_compression_enabled() noexcept;

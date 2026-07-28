@@ -153,10 +153,39 @@ cucascade::shared_data_repository& repo_b()
 // The register tracks plans and verdicts per column; every batch these tests
 // build has exactly one column, so these wrap the vector/span API.
 
-void set_plan_1col(const cucascade::shared_data_repository* repo, std::string dsl)
+/// Change threshold used throughout these tests (20%, the production default).
+constexpr double kTestChangeThreshold = 0.20;
+
+/// Install a single-column plan as if freshly explored.
+///
+/// @p ratio and the throughputs are what the explorer reported. They matter on a
+/// re-install: the register keeps the cached plan unless a candidate performs
+/// materially differently, so a test meaning to replace a plan must offer
+/// distinct measurements, not merely a different DSL string.
+void set_plan_1col(const cucascade::shared_data_repository* repo,
+                   std::string dsl,
+                   double ratio           = 2.0,
+                   double compress_gbps   = 10.0,
+                   double decompress_gbps = 20.0)
 {
+  std::vector<sirius::compression::plan_register::column_plan_candidate> candidates;
+  candidates.push_back({std::move(dsl), ratio, compress_gbps, decompress_gbps});
   sirius::compression::plan_register::global().set_spill_plan(
-    repo, std::vector<std::string>{std::move(dsl)});
+    repo, std::move(candidates), kTestChangeThreshold);
+}
+
+/// Install per-column plans, all reporting the same measurements.
+void set_plans(const cucascade::shared_data_repository* repo,
+               std::vector<std::string> dsls,
+               double ratio = 2.0)
+{
+  std::vector<sirius::compression::plan_register::column_plan_candidate> candidates;
+  candidates.reserve(dsls.size());
+  for (auto& dsl : dsls) {
+    candidates.push_back({std::move(dsl), ratio, 10.0, 20.0});
+  }
+  sirius::compression::plan_register::global().set_spill_plan(
+    repo, std::move(candidates), kTestChangeThreshold);
 }
 
 void conclude_1col(const cucascade::shared_data_repository* repo,
@@ -189,7 +218,8 @@ void reset_spill_state(bool enabled = true, std::uint64_t replan_after_uses = 0)
                                                       /*explore_max_bytes=*/8ull << 20,
                                                       /*max_compressed_fraction=*/0.95,
                                                       replan_after_uses,
-                                                      /*error_tolerance=*/1);
+                                                      /*error_tolerance=*/1,
+                                                      /*replan_change_threshold=*/0.20);
 }
 
 /// Create a 1-column INT32 GPU batch with a known pattern [0, 1, 2, ..., n-1].
@@ -518,7 +548,7 @@ TEST_CASE("spill compression: a cached plan for a different column count is re-e
   // Two per-column plans cached against a 1-column batch: the entry describes a
   // different schema, so it must be discarded and the edge explored afresh
   // rather than applied blindly (which would throw inside Simpatico).
-  reg.set_spill_plan(&repo_a(), std::vector<std::string>{kOneColDsl, kOneColDsl});
+  set_plans(&repo_a(), {kOneColDsl, kOneColDsl});
 
   const std::size_t n = 5000;
   auto batch          = make_int32_gpu_batch(n);
@@ -580,7 +610,8 @@ TEST_CASE("spill compression: poor compression ratio falls back to uncompressed"
                                                       /*explore_max_bytes=*/8ull << 20,
                                                       /*max_compressed_fraction=*/0.75,
                                                       /*replan_after_uses=*/0,
-                                                      /*error_tolerance=*/1);
+                                                      /*error_tolerance=*/1,
+                                                      /*replan_change_threshold=*/0.20);
   // A plan whose output is the same width as its input cannot reach 0.75.
   set_plan_1col(&repo_a(), kNonCompressingDsl);
 
@@ -611,13 +642,14 @@ TEST_CASE("spill compression: one incompressible column does not disable its nei
                                                       /*explore_max_bytes=*/8ull << 20,
                                                       /*max_compressed_fraction=*/0.75,
                                                       /*replan_after_uses=*/0,
-                                                      /*error_tolerance=*/1);
+                                                      /*error_tolerance=*/1,
+                                                      /*replan_change_threshold=*/0.20);
 
   // Two identical columns: one bitpacks well, the other is given a plan that
   // cannot shrink it. Same data, so the outcome difference is purely the plan.
   const std::size_t n = 5000;
   auto batch          = make_int32_gpu_batch_2col(n);
-  reg.set_spill_plan(&repo_a(), std::vector<std::string>{kOneColDsl, kNonCompressingDsl});
+  set_plans(&repo_a(), {kOneColDsl, kNonCompressingDsl});
 
   spill_to(batch, e.host_space, &repo_a());
   REQUIRE(is_compressed_host(*batch));
@@ -656,12 +688,14 @@ TEST_CASE("spill compression: a rejected edge is marked and later batches skip c
   auto& e   = env();
   auto& reg = sirius::compression::plan_register::global();
   reg.clear_all();
-  sirius::compression::set_spill_compression_settings(true,
-                                                      /*explore_beam_width=*/4,
-                                                      /*explore_max_bytes=*/8ull << 20,
-                                                      /*max_compressed_fraction=*/0.75,
-                                                      /*replan_after_uses=*/0,
-                                                      /*error_tolerance=*/1);  // never expire
+  sirius::compression::set_spill_compression_settings(
+    true,
+    /*explore_beam_width=*/4,
+    /*explore_max_bytes=*/8ull << 20,
+    /*max_compressed_fraction=*/0.75,
+    /*replan_after_uses=*/0,
+    /*error_tolerance=*/1,
+    /*replan_change_threshold=*/0.20);  // never expire
   set_plan_1col(&repo_a(), kNonCompressingDsl);
 
   // First batch: compression runs, misses the threshold, and the edge is marked.
@@ -702,7 +736,8 @@ TEST_CASE("spill compression: an unviable edge is re-explored once its entry exp
                                                       /*explore_max_bytes=*/8ull << 20,
                                                       /*max_compressed_fraction=*/0.75,
                                                       /*replan_after_uses=*/1,
-                                                      /*error_tolerance=*/1);
+                                                      /*error_tolerance=*/1,
+                                                      /*replan_change_threshold=*/0.20);
   set_plan_1col(&repo_a(), kNonCompressingDsl);
 
   // First batch: rejected, edge marked unviable, one use recorded.
@@ -764,8 +799,8 @@ TEST_CASE("plan_register: decide_spill_plan verdicts", "[compression][plan_regis
   // ...but 0 means "never expire", so the skip verdict stands.
   REQUIRE(reg.decide_spill_plan(&repo_a(), /*replan_after_uses=*/0).verdict == verdict::skip);
 
-  // Re-installing plans clears the verdicts and resets the counter.
-  set_plan_1col(&repo_a(), "fresh dsl");
+  // Adopting a materially better plan clears the verdicts and resets the counter.
+  set_plan_1col(&repo_a(), "fresh dsl", /*ratio=*/8.0);
   auto fresh = reg.resolve_spill_plan(&repo_a());
   REQUIRE(fresh->columns[0].viable);
   REQUIRE(fresh->uses == 0);
@@ -785,6 +820,9 @@ TEST_CASE("plan_register: replan interval backs off when a re-explore learns not
   constexpr auto kNotWorthIt    = outcome::not_worth_it;
   const std::string kPlan       = "plan one";
   const std::string kOtherPlan  = "plan two";
+  // A plan is only adopted when it measures materially differently, so the
+  // "different plan" cases must report a different ratio, not just other text.
+  constexpr double kOtherRatio = 5.0;
 
   auto interval_of = [&](const cucascade::shared_data_repository* r) {
     return reg.resolve_spill_plan(r)->replan_interval;
@@ -812,7 +850,7 @@ TEST_CASE("plan_register: replan interval backs off when a re-explore learns not
     set_plan_1col(&repo_a(), kPlan);
     conclude_1col(&repo_a(), kNotWorthIt, kBase, kTol);
 
-    set_plan_1col(&repo_a(), kOtherPlan);                // explorer found something else...
+    set_plan_1col(&repo_a(), kOtherPlan, kOtherRatio);   // explorer found something else...
     conclude_1col(&repo_a(), kNotWorthIt, kBase, kTol);  // ...that still does not compress
     REQUIRE(interval_of(&repo_a()) == kBase * 2);
   }
@@ -827,7 +865,7 @@ TEST_CASE("plan_register: replan interval backs off when a re-explore learns not
     conclude_1col(&repo_a(), kCompressed, kBase, kTol);
     REQUIRE(interval_of(&repo_a()) == kBase * 2);
 
-    set_plan_1col(&repo_a(), kOtherPlan);
+    set_plan_1col(&repo_a(), kOtherPlan, kOtherRatio);
     conclude_1col(&repo_a(), kCompressed, kBase, kTol);
     REQUIRE(interval_of(&repo_a()) == kBase);
   }
@@ -947,6 +985,109 @@ TEST_CASE("plan_register: transient compression errors do not write off an edge"
   reg.clear_all();
 }
 
+TEST_CASE("plan_register: a re-explored plan is only adopted when it performs differently",
+          "[compression][plan_register]")
+{
+  using outcome = sirius::compression::plan_register::spill_attempt_outcome;
+  auto& reg     = sirius::compression::plan_register::global();
+
+  constexpr double kEps         = 0.20;
+  constexpr std::uint64_t kBase = 8;
+  constexpr std::uint32_t kTol  = 1;
+
+  SECTION("a differently spelled plan with the same measurements is not adopted")
+  {
+    reg.clear_all();
+    set_plan_1col(&repo_a(), "cached", /*ratio=*/2.0, /*c=*/10.0, /*d=*/20.0);
+    conclude_1col(&repo_a(), outcome::compressed, kBase, kTol);
+
+    // Same numbers, different text: the explorer found an equivalent cascade.
+    set_plan_1col(&repo_a(), "rewritten", /*ratio=*/2.0, /*c=*/10.0, /*d=*/20.0);
+    REQUIRE(col0_of(&repo_a()).dsl == "cached");
+
+    // ...and because nothing was adopted, the cycle counts as no change, so the
+    // replan interval backs off rather than resetting.
+    conclude_1col(&repo_a(), outcome::compressed, kBase, kTol);
+    REQUIRE(reg.resolve_spill_plan(&repo_a())->replan_interval == kBase * 2);
+  }
+
+  SECTION("within the threshold on every metric is not adopted")
+  {
+    reg.clear_all();
+    set_plan_1col(&repo_a(), "cached", 2.0, 10.0, 20.0);
+    // +19% ratio, -15% compress, +10% decompress: all inside 20%.
+    set_plan_1col(&repo_a(), "marginal", 2.38, 8.5, 22.0);
+    REQUIRE(col0_of(&repo_a()).dsl == "cached");
+    REQUIRE(col0_of(&repo_a()).compression_ratio == 2.0);
+  }
+
+  SECTION("a materially better ratio is adopted")
+  {
+    reg.clear_all();
+    set_plan_1col(&repo_a(), "cached", 2.0, 10.0, 20.0);
+    set_plan_1col(&repo_a(), "better", /*ratio=*/4.0, 10.0, 20.0);
+    REQUIRE(col0_of(&repo_a()).dsl == "better");
+    REQUIRE(col0_of(&repo_a()).compression_ratio == 4.0);
+  }
+
+  SECTION("a materially different throughput alone is enough")
+  {
+    reg.clear_all();
+    set_plan_1col(&repo_a(), "cached", 2.0, 10.0, 20.0);
+    // Same ratio and compress speed, but decompresses far faster.
+    set_plan_1col(&repo_a(), "faster_decode", 2.0, 10.0, /*d=*/40.0);
+    REQUIRE(col0_of(&repo_a()).dsl == "faster_decode");
+  }
+
+  SECTION("keeping a cached plan keeps its verdict, so a written-off column stays skipped")
+  {
+    reg.clear_all();
+    set_plan_1col(&repo_a(), "cached", 2.0, 10.0, 20.0);
+    conclude_1col(&repo_a(), outcome::not_worth_it, kBase, kTol);
+    REQUIRE_FALSE(col0_of(&repo_a()).viable);
+
+    // An equivalent re-explore must not resurrect the column: it will not
+    // compress any better than the plan already judged.
+    set_plan_1col(&repo_a(), "rewritten", 2.0, 10.0, 20.0);
+    REQUIRE_FALSE(col0_of(&repo_a()).viable);
+
+    // A materially different plan does earn a fresh chance.
+    set_plan_1col(&repo_a(), "better", 4.0, 10.0, 20.0);
+    REQUIRE(col0_of(&repo_a()).viable);
+  }
+
+  SECTION("adoption is decided per column")
+  {
+    reg.clear_all();
+    std::vector<sirius::compression::plan_register::column_plan_candidate> first{
+      {"a0", 2.0, 10.0, 20.0}, {"b0", 2.0, 10.0, 20.0}};
+    reg.set_spill_plan(&repo_a(), first, kEps);
+
+    // Column 0 is equivalent; column 1 is materially better.
+    std::vector<sirius::compression::plan_register::column_plan_candidate> second{
+      {"a1", 2.0, 10.0, 20.0}, {"b1", 5.0, 10.0, 20.0}};
+    reg.set_spill_plan(&repo_a(), second, kEps);
+
+    auto state = reg.resolve_spill_plan(&repo_a());
+    REQUIRE(state->columns[0].dsl == "a0");
+    REQUIRE(state->columns[1].dsl == "b1");
+  }
+
+  SECTION("a threshold of zero adopts anything that measured differently at all")
+  {
+    reg.clear_all();
+    std::vector<sirius::compression::plan_register::column_plan_candidate> a{
+      {"cached", 2.0, 10.0, 20.0}};
+    reg.set_spill_plan(&repo_a(), a, /*change_threshold=*/0.0);
+    std::vector<sirius::compression::plan_register::column_plan_candidate> b{
+      {"tiny_delta", 2.0001, 10.0, 20.0}};
+    reg.set_spill_plan(&repo_a(), b, /*change_threshold=*/0.0);
+    REQUIRE(col0_of(&repo_a()).dsl == "tiny_delta");
+  }
+
+  reg.clear_all();
+}
+
 TEST_CASE("plan_register: note_spill_plan_use on an absent edge is a no-op",
           "[compression][plan_register]")
 {
@@ -987,11 +1128,11 @@ TEST_CASE("plan_register: spill plan round-trips per repository", "[compression]
   REQUIRE_FALSE(reg.resolve_spill_plan(&repo_b()).has_value());
 
   // Storing no columns reads back as "no plan".
-  reg.set_spill_plan(&repo_a(), {});
+  set_plans(&repo_a(), {});
   REQUIRE_FALSE(reg.resolve_spill_plan(&repo_a()).has_value());
 
   // A multi-column edge keeps one entry per column, in schema order.
-  reg.set_spill_plan(&repo_a(), std::vector<std::string>{"plan a", "plan b", "plan c"});
+  set_plans(&repo_a(), {"plan a", "plan b", "plan c"});
   auto multi = reg.resolve_spill_plan(&repo_a());
   REQUIRE(multi->columns.size() == 3);
   REQUIRE(multi->columns[1].dsl == "plan b");

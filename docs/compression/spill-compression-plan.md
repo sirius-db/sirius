@@ -70,6 +70,23 @@ unrepresentative early batch could disable compression for that edge permanently
 `uses` is counted once per spill attempt including skipped ones, so a skipped edge
 still ages toward its retry.
 
+### Adopting a re-explored plan
+
+The explorer is a beam search over a large space and readily returns a *differently
+spelled* plan that performs identically. Adopting those churns the cache and — worse
+— registers as a change, which resets the backoff below and locks the edge into
+re-exploring for the rest of the query.
+
+So a candidate is adopted only when its compression ratio or one of its throughputs
+differs from the cached plan's by more than `spill_replan_change_threshold`
+(default 20%, relative to the larger of the two values). The explorer already reports
+all three metrics, so no extra measurement is needed.
+
+Adoption is decided per column. An adopted column resets to viable with a clear error
+streak; a column that keeps its cached plan keeps its verdict too — an equivalent plan
+will not compress any better than the one already judged, so a written-off column is
+not resurrected by a cosmetic re-explore.
+
 ### Adaptive replan backoff
 
 Re-exploring costs a beam search per column, so the interval is only worth holding

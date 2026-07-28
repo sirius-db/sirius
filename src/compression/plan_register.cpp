@@ -91,33 +91,86 @@ plan_register::spill_plan_decision plan_register::decide_spill_plan(
   return {spill_plan_verdict::use, state.columns};
 }
 
+namespace {
+
+/// True when @p a and @p b differ by more than @p threshold, relative to the
+/// larger of the two. Using the larger as the denominator keeps the test
+/// symmetric and handles a previously unmeasured (zero) value: anything against
+/// zero reads as a full change, while zero against zero reads as none.
+bool differs_materially(double a, double b, double threshold)
+{
+  const double scale = std::max(std::abs(a), std::abs(b));
+  if (scale <= 0.0) { return false; }
+  return std::abs(a - b) / scale > threshold;
+}
+
+/// True when @p candidate performs materially differently from @p cached.
+bool worth_adopting(const plan_register::column_plan_state& cached,
+                    const plan_register::column_plan_candidate& candidate,
+                    double threshold)
+{
+  return differs_materially(cached.compression_ratio, candidate.compression_ratio, threshold) ||
+         differs_materially(cached.compress_gbps, candidate.compress_gbps, threshold) ||
+         differs_materially(cached.decompress_gbps, candidate.decompress_gbps, threshold);
+}
+
+plan_register::column_plan_state adopt(plan_register::column_plan_candidate&& candidate)
+{
+  plan_register::column_plan_state state;
+  state.dsl                = std::move(candidate.dsl);
+  state.viable             = true;
+  state.consecutive_errors = 0;
+  state.compression_ratio  = candidate.compression_ratio;
+  state.compress_gbps      = candidate.compress_gbps;
+  state.decompress_gbps    = candidate.decompress_gbps;
+  return state;
+}
+
+}  // namespace
+
 void plan_register::set_spill_plan(const cucascade::shared_data_repository* repo,
-                                   std::vector<std::string> per_column_dsl)
+                                   std::vector<column_plan_candidate> candidates,
+                                   double change_threshold)
 {
   std::unique_lock lock(_mutex);
 
+  auto it           = _spill_plans.find(repo);
+  const bool replan = it != _spill_plans.end();
+
   spill_plan_state fresh;
-  fresh.columns.reserve(per_column_dsl.size());
-  for (auto& dsl : per_column_dsl) {
-    fresh.columns.push_back(column_plan_state{std::move(dsl), /*viable=*/true, /*errors=*/0});
+  fresh.columns.reserve(candidates.size());
+
+  if (!replan) {
+    for (auto& candidate : candidates) {
+      fresh.columns.push_back(adopt(std::move(candidate)));
+    }
+    _spill_plans[repo] = std::move(fresh);
+    return;
   }
 
-  // Replacing an entry means this is a re-explore: carry the current backoff
-  // interval and remember what we are replacing, so conclude_spill_attempt can
-  // tell whether the explore actually changed anything.
-  if (auto it = _spill_plans.find(repo); it != _spill_plans.end()) {
-    const auto& prev   = it->second;
-    fresh.from_replan  = true;
-    fresh.plan_changed = prev.columns.size() != fresh.columns.size() ||
-                         !std::equal(prev.columns.begin(),
-                                     prev.columns.end(),
-                                     fresh.columns.begin(),
-                                     [](const column_plan_state& a, const column_plan_state& b) {
-                                       return a.dsl == b.dsl;
-                                     });
-    fresh.prev_viable_count = prev.viable_count();
-    fresh.replan_interval   = prev.replan_interval;
+  // Re-explore: decide each column on its own. A candidate that performs like the
+  // cached plan is dropped — the explorer readily returns a differently spelled
+  // plan with the same characteristics, and adopting those would churn the cache
+  // and register as a change, resetting the backoff and re-exploring forever.
+  const auto& prev = it->second;
+  bool adopted_any = prev.columns.size() != candidates.size();
+
+  for (std::size_t i = 0; i < candidates.size(); ++i) {
+    if (i < prev.columns.size() &&
+        !worth_adopting(prev.columns[i], candidates[i], change_threshold)) {
+      // Keep the cached plan *and* its verdict: an equivalent plan will not
+      // compress any better than the one already judged.
+      fresh.columns.push_back(prev.columns[i]);
+      continue;
+    }
+    fresh.columns.push_back(adopt(std::move(candidates[i])));
+    adopted_any = true;
   }
+
+  fresh.from_replan       = true;
+  fresh.plan_changed      = adopted_any;
+  fresh.prev_viable_count = prev.viable_count();
+  fresh.replan_interval   = prev.replan_interval;
 
   _spill_plans[repo] = std::move(fresh);
 }
