@@ -23,7 +23,22 @@ else()
   set(CUDA_TARGET_TRIPLE "x86_64-linux")
 endif()
 
-if(CONDA_PREFIX)
+if(VCPKG_BUILD)
+  # vcpkg ships CCCL 3.4 next to rmm/cudf; the CUDA toolkit (and any active
+  # conda env) ship older ones, so vcpkg's include dir has to be searched first
+  # or RMM's "requires CCCL 3.3 or newer" guard fires. Checked before
+  # CONDA_PREFIX so a vcpkg build started from a pixi shell still picks vcpkg.
+  find_package(CUDAToolkit REQUIRED)
+  list(GET CUDAToolkit_INCLUDE_DIRS 0 _cuda_inc0)
+  set(CUDA_TOOLKIT_INCLUDE "${_cuda_inc0}")
+  set(_SIMPATICO_VCPKG_INC
+      "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/include")
+  # cccl installs cub/, thrust/ and libcudacxx straight into <prefix>/include.
+  set(CUDA_CCCL_INCLUDE "${_SIMPATICO_VCPKG_INC}")
+  set(_SIMPATICO_INCLUDE_DIRS "${_SIMPATICO_VCPKG_INC}"
+                              "${CUDA_TOOLKIT_INCLUDE}")
+  set(_SIMPATICO_LIB_DIR "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/lib")
+elseif(CONDA_PREFIX)
   set(CMAKE_CUDA_COMPILER
       "${CONDA_PREFIX}/bin/nvcc"
       CACHE FILEPATH "nvcc from prefix")
