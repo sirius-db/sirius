@@ -319,6 +319,45 @@ beam search inside a query on the downgrade thread — nsys still attributes ~81
 time to `explore_spill_plan`. No amount of tuning removes that; it needs the plan to
 come from somewhere other than an in-query search. Hence lineage seeding below.
 
+### Column lineage (in progress)
+
+`src/planner/column_origin.{hpp,cpp}` resolves each operator output column back to
+a base table column, so the spill compressor can reuse the plan already explored
+offline for that column instead of searching for one mid-query.
+
+DuckDB's `ColumnBinding`s already are the lineage graph. The resolver walks the plan
+once, seeding at each `LogicalGet` and propagating through the operators that
+introduce their own `table_index` (projections keep an origin for a bare column
+reference, aggregates for their group keys). Everything else — filter, join, order,
+partition — re-exposes its children's bindings unchanged.
+
+Two ordering constraints, both learned the hard way:
+
+- The walk must run **before** `ColumnBindingResolver`. That pass rewrites
+  `BoundColumnRefExpression` into positional `BoundReferenceExpression`, erasing the
+  bindings the walk follows.
+- Operators inserted by the later rewrites (GPU pipeline wrappers, partitions,
+  merges) never pass through the `create_plan` dispatcher, so they start with no
+  lineage. `propagate_column_origins()` runs after `insert_gpu_pipeline_operators`
+  and lets a pass-through operator inherit its child's origins, gated on matching
+  output arity.
+
+**Not yet working for parquet scans.** `LogicalGet::GetTable()` returns null for
+`read_parquet`, which is a table function rather than a catalog table, so nothing
+seeds and every column resolves to nullopt. Verified on TPC-H q21 at SF100: 47
+columns reach the spilling edges, 0 resolved. The base-table (`seq_scan`) path
+should work, but was not exercised — there is no SF100 `.duckdb` dataset locally.
+
+Next step is to give the parquet path a table identity. The pin path already solves
+the same problem: `pin_table(..., name=<table>)` names the table explicitly, and
+`build_parquet_table_info` pulls `resolved_file_paths` out of `MultiFileBindData`.
+Deriving the name from the file path (`.../lineitem/*.parquet` → `lineitem`) matches
+the convention the pin plans are keyed by.
+
+Still to do after that: seed `plan_register` from the origins (and decouple
+`input_plan_dir` loading from `enable_pin_table_compression`, which currently gates
+it), then stagger exploration so at most one column is explored per spill.
+
 ### Tune the explorer for use during query execution
 
 The explorer's defaults were chosen for offline plan generation, where a long beam

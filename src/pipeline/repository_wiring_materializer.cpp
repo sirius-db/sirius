@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "log/logging.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_operator_type.hpp"
 #include "pipeline/repository_wiring.hpp"
@@ -74,6 +75,28 @@ void materialize_repository_wiring(const std::vector<repository_wiring>& wirings
                       std::make_unique<op::sirius_physical_operator::port>(
                         wiring.barrier_type, repo, wiring.source_pipeline, dest_pipeline));
     wiring.source_op->add_next_port_after_sink({next_op, wiring.port_id});
+
+    // Report the lineage resolved for this edge's columns. The spill compressor
+    // uses it to reuse a column's offline plan instead of searching for one
+    // mid-query; logging it here makes coverage visible per query.
+    {
+      auto const& origins = wiring.source_op->column_origins;
+      std::size_t known   = 0;
+      std::string detail;
+      for (std::size_t i = 0; i < origins.size(); ++i) {
+        if (!origins[i].has_value()) { continue; }
+        ++known;
+        if (!detail.empty()) { detail += ", "; }
+        detail += std::to_string(i) + "->" + origins[i]->table_name + "." +
+                  std::to_string(origins[i]->table_column_index);
+      }
+      SIRIUS_LOG_DEBUG("[lineage] repo op={} port={} cols={} resolved={} [{}]",
+                       op_id,
+                       wiring.port_id,
+                       origins.size(),
+                       known,
+                       detail);
+    }
   }
 }
 

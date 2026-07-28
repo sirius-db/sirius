@@ -227,6 +227,7 @@ set(EXTENSION_SOURCES
     src/compression/plan_register.cpp
     src/compression/simpatico_bridge.cpp
     src/compression/spill_context.cpp
+    src/planner/column_origin.cpp
     src/config.cpp
     src/helper/type_conversions.cpp
     src/debug_utils.cpp

@@ -21,6 +21,7 @@
 #include "duckdb/common/unordered_map.hpp"
 #include "duckdb/common/unordered_set.hpp"
 #include "op/sirius_physical_operator.hpp"
+#include "planner/column_origin.hpp"
 
 #include <memory>
 #include <string>
@@ -214,6 +215,11 @@ class sirius_physical_plan_generator {
 
  public:
   duckdb::ClientContext& context;
+
+  //! Base-table lineage for every logical operator's output columns. Populated
+  //! once per plan (after column-binding resolution) and copied onto each
+  //! physical operator as it is created.
+  sirius::planner::column_origin_resolver _column_origins;
   // duckdb::GPUContext& gpu_context;
 
  public:

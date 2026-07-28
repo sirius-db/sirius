@@ -21,6 +21,7 @@
 #include "helper/logical_type.hpp"
 #include "helper/types.hpp"
 #include "op/sirius_physical_operator_type.hpp"
+#include "planner/column_origin.hpp"
 #include "sirius/exception.hpp"
 #include "telemetry-bridge/gen/uuid.rs.h"
 
@@ -397,6 +398,12 @@ class sirius_physical_operator {
   duckdb::vector<duckdb::unique_ptr<sirius_physical_operator>> children;
   //! The types returned by this physical operator
   duckdb::vector<sirius::logical_type> types;
+
+  //! Where each output column came from in the base tables, in output order.
+  //! Empty when lineage was not resolved; entries are nullopt for computed
+  //! columns. Carried alongside `types` so plan rewrites that wrap or move an
+  //! operator keep it, and inserted operators can inherit it from their child.
+  sirius::planner::column_origins column_origins;
   //! The estimated cardinality of this physical operator
   std::size_t estimated_cardinality;
   //! The unique ID of this operator within its query. Stamped by

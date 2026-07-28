@@ -516,6 +516,27 @@ void wrap_join(sirius::op::sirius_physical_operator& join_op,
 
 // Forward declaration: wrap_delim_join recurses into a DELIM JOIN's internal `join`/`distinct`
 // subtrees, which live outside `children[]`.
+//! Give operators inserted by the plan rewrites (GPU pipeline wrappers, partitions,
+//! merges) the lineage of the child they pass through. Those are constructed after
+//! `create_plan` has run, so they never went through the dispatcher that sets
+//! `column_origins`. An operator inherits only when its output arity matches the
+//! child's, which is exactly the pass-through case; anything reshaping its columns
+//! keeps an empty (unknown) lineage.
+void propagate_column_origins(sirius::op::sirius_physical_operator& op)
+{
+  for (auto& child : op.children) {
+    if (child) { propagate_column_origins(*child); }
+  }
+  if (!op.column_origins.empty()) { return; }
+  for (auto& child : op.children) {
+    if (child && !child->column_origins.empty() &&
+        child->column_origins.size() == op.types.size()) {
+      op.column_origins = child->column_origins;
+      return;
+    }
+  }
+}
+
 void insert_gpu_pipeline_operators_recursive(
   duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot,
   const sirius::operator_params& op_params,
@@ -909,6 +930,13 @@ sirius_physical_plan_generator::create_plan(duckdb::unique_ptr<duckdb::LogicalOp
   op->ResolveOperatorTypes();
   profiler.EndPhase();
 
+  // Resolve base-table lineage for every output column, so the spill compressor
+  // can reuse a column's offline plan instead of searching for one mid-query.
+  // Must run BEFORE ColumnBindingResolver: that pass rewrites
+  // BoundColumnRefExpression into positional BoundReferenceExpression, erasing
+  // the bindings this walk follows.
+  _column_origins.resolve(*op);
+
   // Resolve the column references.
   profiler.StartPhase(duckdb::MetricType::PHYSICAL_PLANNER_COLUMN_BINDING);
   duckdb::ColumnBindingResolver resolver;
@@ -927,6 +955,7 @@ sirius_physical_plan_generator::create_plan(duckdb::unique_ptr<duckdb::LogicalOp
   // pure topology pass over `build_pipelines` virtuals; `set_parent_ops` then derives every
   // `_parent_op` from the final tree for the tree-parent-lookup wiring.
   insert_gpu_pipeline_operators(plan);
+  propagate_column_origins(*plan);
   set_parent_ops(*plan, /*parent=*/nullptr);
 
   return plan;
@@ -1146,6 +1175,10 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalOperator& op)
   if (!plan) { throw duckdb::InternalException("Physical plan generator - no plan generated"); }
 
   plan->estimated_cardinality = op.estimated_cardinality;
+  // Carry base-table lineage onto the physical operator. Done here, in the one
+  // dispatcher that sees both the logical operator (which owns the bindings) and
+  // the physical operator built from it, rather than in each per-type overload.
+  plan->column_origins = _column_origins.origins_of(op);
 #ifdef DUCKDB_VERIFY_VECTOR_OPERATOR
   auto verify = duckdb::make_uniq<duckdb::PhysicalVerifyVector>(std::move(plan));
   plan        = std::move(verify);
