@@ -75,6 +75,14 @@ grep -oE 'stats-pruned [0-9]+ row groups' /tmp/cluster_verify/sirius_*.log
 > the classic `dbgen` for both formats, matching the refresh sets, the query streams, and
 > tpchgen-rs.
 
+The `--format duckdb` path generates one table at a time with `dbgen -T`, loads it, and deletes
+the `.tbl` before moving on, so peak disk is the largest single table plus the database instead of
+the whole raw dataset alongside it. Tables go largest first, so lineitem is staged while the
+database is still empty. At SF1 that holds the staging directory to 725 MB against roughly 1 GB
+for the raw set; at SF1000 it is the difference between about 890 GiB and 1.3 TB, which is what
+makes that scale factor reachable at all. The trade is a second pass over the order generator,
+since `-T O` and `-T L` each walk it.
+
 ```bash
 # From project root - generates parquet files with DuckDB's default row groups (122K rows)
 ./build/release/duckdb -c "INSTALL tpch; LOAD tpch; CALL dbgen(sf=100); EXPORT DATABASE 'test_datasets/tpch_parquet_sf100' (FORMAT PARQUET);"

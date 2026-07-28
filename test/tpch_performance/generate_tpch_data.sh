@@ -69,10 +69,24 @@ TPCH_TABLES="nation region part supplier partsupp customer orders lineitem"
 # shellcheck source=dbgen_bootstrap.sh
 . "$SCRIPT_DIR/dbgen_bootstrap.sh"
 
+# table:dbgen-flag, largest table first. Case matters: -T l is nation/region
+# while -T L is lineitem. Each of these flags writes exactly one .tbl.
+TPCH_TABLE_FLAGS="lineitem:L orders:O partsupp:S customer:c part:P supplier:s nation:n region:r"
+
 # Build a .duckdb from the classic dbgen, the same generator that produces the
-# refresh sets and query streams. The .tbl files are staged next to the output
-# and removed afterwards; dbgen writes them into DSS_PATH but resolves dists.dss
-# relative to its own directory.
+# refresh sets and query streams. dbgen writes into DSS_PATH but resolves
+# dists.dss relative to its own directory, hence the subshell.
+#
+# Tables are generated one at a time and each .tbl is deleted once loaded, so
+# peak disk is the largest single table plus the database rather than the whole
+# raw dataset alongside it. Largest first matters: staging lineitem while the
+# database is still empty sets a lower high-water mark than doing it last, when
+# the other seven tables are already there. At SF1000 that is the difference
+# between roughly 890 GiB and 970 GiB.
+#
+# The cost is that -T O and -T L each walk the order generator, so orders and
+# lineitem take two passes instead of one. Disk is the scarcer resource at the
+# scale factors where this matters.
 build_duckdb_from_dbgen() {
     local out="$1" sf="$2"
     local dbgen_dir="$PROJECT_DIR/test_datasets/tpch-dbgen"
@@ -84,19 +98,21 @@ build_duckdb_from_dbgen() {
     # shellcheck disable=SC2064
     trap "rm -rf '$stage'" EXIT
 
-    echo "Running dbgen at SF${sf} ..."
-    (cd "$dbgen_dir" && DSS_PATH="$stage" ./dbgen -f -q -s "$sf")
-
     rm -f "$out" "$out".wal
-    local load_sql
-    load_sql="$(cat "$SCRIPT_DIR/tpch_schema.sql")"
-    local t
-    for t in $TPCH_TABLES; do
-        load_sql+=" COPY $t FROM '$stage/$t.tbl' (HEADER false, DELIMITER '|');"
-    done
     # Loading needs no GPU, and a stale Sirius config would otherwise block it.
-    echo "Loading .tbl files into $out ..."
-    SIRIUS_DISABLE=1 "$DUCKDB" "$out" -c "$load_sql"
+    SIRIUS_DISABLE=1 "$DUCKDB" "$out" -c "$(cat "$SCRIPT_DIR/tpch_schema.sql")"
+
+    local spec table flag
+    for spec in $TPCH_TABLE_FLAGS; do
+        table="${spec%%:*}"
+        flag="${spec##*:}"
+        echo "  ${table}: dbgen -T ${flag} ..."
+        (cd "$dbgen_dir" && DSS_PATH="$stage" ./dbgen -f -q -s "$sf" -T "$flag")
+        echo "  ${table}: loading $(du -h "$stage/$table.tbl" | cut -f1) ..."
+        SIRIUS_DISABLE=1 "$DUCKDB" "$out" \
+            -c "COPY $table FROM '$stage/$table.tbl' (HEADER false, DELIMITER '|');"
+        rm -f "$stage/$table.tbl"
+    done
 
     rm -rf "$stage"
     trap - EXIT
