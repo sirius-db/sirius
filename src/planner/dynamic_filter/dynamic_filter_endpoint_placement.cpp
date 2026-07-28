@@ -21,7 +21,7 @@
 #include <op/sirius_physical_operator.hpp>
 #include <op/sirius_physical_operator_type.hpp>
 #include <op/sirius_physical_projection.hpp>
-#include <planner/dynamic_filter_endpoint_placement.hpp>
+#include <planner/dynamic_filter/dynamic_filter_endpoint_placement.hpp>
 
 namespace sirius::planner {
 

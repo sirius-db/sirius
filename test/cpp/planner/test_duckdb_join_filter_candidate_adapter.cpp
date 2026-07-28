@@ -25,7 +25,7 @@
  * the positional key-to-column pairing depends on.
  */
 
-#include "planner/duckdb_join_filter_candidate_adapter.hpp"
+#include "planner/dynamic_filter/duckdb_join_filter_candidate_adapter.hpp"
 
 #include <catch.hpp>
 #include <duckdb/common/typedefs.hpp>

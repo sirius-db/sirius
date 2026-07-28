@@ -37,7 +37,7 @@
  *  7. accepting a `LOGICAL_GET` with non-empty `projected_input`.
  */
 
-#include "planner/build_key_domain.hpp"
+#include "planner/dynamic_filter/build_key_domain.hpp"
 
 #include <catch.hpp>
 #include <duckdb/planner/bound_result_modifier.hpp>

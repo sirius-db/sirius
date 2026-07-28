@@ -323,11 +323,11 @@ set(EXTENSION_SOURCES
     src/pipeline/repository_wiring_materializer.cpp
     src/pipeline/sirius_plan_printer.cpp
     src/pipeline/task_request.cpp
-    src/planner/duckdb_join_filter_candidate_adapter.cpp
-    src/planner/build_key_domain.cpp
-    src/planner/dynamic_filter_endpoint_placement.cpp
-    src/planner/dynamic_filter_key_admission.cpp
-    src/planner/dynamic_filter_scan_routes.cpp
+    src/planner/dynamic_filter/build_key_domain.cpp
+    src/planner/dynamic_filter/duckdb_join_filter_candidate_adapter.cpp
+    src/planner/dynamic_filter/dynamic_filter_endpoint_placement.cpp
+    src/planner/dynamic_filter/dynamic_filter_key_admission.cpp
+    src/planner/dynamic_filter/dynamic_filter_scan_routes.cpp
     src/planner/query.cpp
     src/planner/sirius_physical_plan_generator.cpp
     src/planner/sirius_plan_aggregate.cpp

@@ -28,7 +28,7 @@
  * identity that downstream wiring (Phase 1.1 of dynamic filter pushdown) relies on.
  */
 
-#include "planner/duckdb_join_filter_candidate_adapter.hpp"
+#include "planner/dynamic_filter/duckdb_join_filter_candidate_adapter.hpp"
 #include "transparent/sirius_optimizer_extension.hpp"
 
 #include <catch.hpp>

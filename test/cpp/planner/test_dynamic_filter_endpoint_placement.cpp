@@ -16,7 +16,7 @@
 
 /*
  * Unit tests for the join-edge dynamic-filter placement trace
- * (`planner/dynamic_filter_endpoint_placement.hpp`).
+ * (`planner/dynamic_filter/dynamic_filter_endpoint_placement.hpp`).
  *
  * The three descent rules -- projection_reference_input, group_by_key_input, and
  * join_block_descent -- are pure functions of plain arguments, so they are exercised
@@ -40,10 +40,11 @@
 #include "helper/logical_type.hpp"
 #include "op/sirius_physical_dummy_scan.hpp"
 #include "op/sirius_physical_projection.hpp"
-#include "planner/dynamic_filter_endpoint_placement.hpp"
+#include "planner/dynamic_filter/dynamic_filter_endpoint_placement.hpp"
+
+#include <cudf/types.hpp>
 
 #include <catch.hpp>
-#include <cudf/types.hpp>
 #include <duckdb/common/enums/join_type.hpp>
 
 #include <cstddef>
@@ -135,11 +136,13 @@ TEST_CASE("group_by_key_input maps a grouping-key output to its input column",
 
   SECTION("a grouping-key output maps to its input column")
   {
-    auto const first = group_by_key_input(group_idx, /*grouping_set_count=*/1, /*output_ordinal=*/0);
+    auto const first =
+      group_by_key_input(group_idx, /*grouping_set_count=*/1, /*output_ordinal=*/0);
     REQUIRE(first.has_value());
     REQUIRE(*first == 4);
 
-    auto const third = group_by_key_input(group_idx, /*grouping_set_count=*/1, /*output_ordinal=*/2);
+    auto const third =
+      group_by_key_input(group_idx, /*grouping_set_count=*/1, /*output_ordinal=*/2);
     REQUIRE(third.has_value());
     REQUIRE(*third == 9);
   }
@@ -200,8 +203,9 @@ TEST_CASE("join_block_descent maps a probe-block output into the probe child",
   }
 }
 
-TEST_CASE("join_block_descent maps a build-block output into the build child for INNER and LEFT only",
-          "[dynamic_filter][placement]")
+TEST_CASE(
+  "join_block_descent maps a build-block output into the build child for INNER and LEFT only",
+  "[dynamic_filter][placement]")
 {
   std::vector<cudf::size_type> const probe_cols{5, 6, 7};  // probe block size 3
   std::vector<cudf::size_type> const build_cols{1, 2};
@@ -302,8 +306,8 @@ TEST_CASE("resolve_endpoint_site descends a projection chain, remapping the ordi
   auto scan       = make_scan(/*width=*/8);
   auto* scan_node = scan.get();
 
-  auto proj_mid = make_projection(make_select_list(
-    make_reference(0), make_reference(0), make_reference(0), make_reference(7)));
+  auto proj_mid = make_projection(
+    make_select_list(make_reference(0), make_reference(0), make_reference(0), make_reference(7)));
   proj_mid->children.push_back(std::move(scan));
 
   auto proj_top = make_projection(make_select_list(make_reference(3)));

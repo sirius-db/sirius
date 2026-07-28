@@ -16,7 +16,7 @@
 
 #include "transparent/sirius_optimizer_extension.hpp"
 
-#include "planner/duckdb_join_filter_candidate_adapter.hpp"
+#include "planner/dynamic_filter/duckdb_join_filter_candidate_adapter.hpp"
 #include "sirius_context.hpp"
 
 #include <duckdb/common/enums/optimizer_type.hpp>

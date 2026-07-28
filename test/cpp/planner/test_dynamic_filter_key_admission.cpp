@@ -20,7 +20,7 @@
 #include "expression/join_condition.hpp"
 #include "helper/type_conversions.hpp"
 #include "op/dynamic_filter/dynamic_filter_publish_plan.hpp"
-#include "planner/dynamic_filter_key_admission.hpp"
+#include "planner/dynamic_filter/dynamic_filter_key_admission.hpp"
 
 #include <catch.hpp>
 #include <duckdb/planner/expression/bound_cast_expression.hpp>
@@ -95,7 +95,9 @@ duckdb::vector<sirius::join_condition> make_wrapped_equalities(std::size_t count
   return sirius::wrap_join_conditions(std::move(conditions));
 }
 
-/// The expected key for condition @p condition_index of `make_wrapped_equalities`, whose condition index, build ordinal, and probe ordinal all coincide by construction. Use `make_wrapped_equalities_at` where those three coordinates must differ.
+/// The expected key for condition @p condition_index of `make_wrapped_equalities`, whose condition
+/// index, build ordinal, and probe ordinal all coincide by construction. Use
+/// `make_wrapped_equalities_at` where those three coordinates must differ.
 dynamic_filter_publish_plan::admitted_key expected_key(
   std::size_t condition_index, dynamic_filter_condition_shape shape = kDirectDirect)
 {

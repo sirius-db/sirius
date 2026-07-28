@@ -81,10 +81,10 @@ enum class dynamic_filter_route_class : std::uint8_t {
  *
  * The planner owns admission, routing, and placement: `sirius_plan_comparison_join` classifies key
  * shapes, resolves endpoint channels, and builds this value through the admission helper in
- * `planner/dynamic_filter_key_admission.hpp`. The runtime publisher (`publish_dynamic_filters` in
- * `op/dynamic_filter_publisher.hpp`) consumes it but cannot mutate its keys, targets, policy, or
- * device set after operator construction, and it is the publisher's only key/target input --
- * runtime publication does not read DuckDB metadata.
+ * `planner/dynamic_filter/dynamic_filter_key_admission.hpp`. The runtime publisher
+ * (`publish_dynamic_filters` in `op/dynamic_filter_publisher.hpp`) consumes it but cannot mutate
+ * its keys, targets, policy, or device set after operator construction, and it is the publisher's
+ * only key/target input -- runtime publication does not read DuckDB metadata.
  *
  * The representation is a dense admitted-key array with sparse per-target bindings: admitted keys
  * carry everything filter construction needs (build ordinal, storage type, carried shape), while
@@ -180,7 +180,7 @@ class dynamic_filter_publish_plan final {
      * 0 when untraceable, which disables the membership coverage gate for this key. Carried per
      * key rather than in a parallel array so a cardinality cannot become misaligned with its key.
      * The value is a true upper bound, never an estimate; see
-     * `planner/build_key_domain.hpp` for the evidence contract.
+     * `planner/dynamic_filter/build_key_domain.hpp` for the evidence contract.
      */
     std::size_t build_key_domain_cardinality = 0;
     /**
@@ -313,7 +313,13 @@ class dynamic_filter_publish_plan final {
   /**
    * @brief Derive a new plan with additional probe targets appended, revalidated as a whole
    *
-   * Placement (issue #1010) discovers join-edge (`dynamic_filter_route_class::direct`) endpoints after this plan is already constructed and must extend it without weakening any invariant. Rather than mutate in place, this returns a new value: the same admitted keys, this plan's probe targets followed by @p additional_probe_targets, and the same replica spaces and policy, all re-run through the validating constructor above. The appended targets therefore face every check a constructor-time target faces, and this plan is left unchanged. Targets keep their positions: the appended targets take the highest target indexes, after the existing ones.
+   * Placement (issue #1010) discovers join-edge (`dynamic_filter_route_class::direct`) endpoints
+   * after this plan is already constructed and must extend it without weakening any invariant.
+   * Rather than mutate in place, this returns a new value: the same admitted keys, this plan's
+   * probe targets followed by @p additional_probe_targets, and the same replica spaces and policy,
+   * all re-run through the validating constructor above. The appended targets therefore face every
+   * check a constructor-time target faces, and this plan is left unchanged. Targets keep their
+   * positions: the appended targets take the highest target indexes, after the existing ones.
    *
    * @throw std::invalid_argument under every condition the validating constructor documents
    *

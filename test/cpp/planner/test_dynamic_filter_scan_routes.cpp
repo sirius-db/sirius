@@ -31,8 +31,8 @@
  */
 
 #include "op/dynamic_filter/sirius_dynamic_filter.hpp"
-#include "planner/duckdb_join_filter_candidate_adapter.hpp"
-#include "planner/dynamic_filter_scan_routes.hpp"
+#include "planner/dynamic_filter/duckdb_join_filter_candidate_adapter.hpp"
+#include "planner/dynamic_filter/dynamic_filter_scan_routes.hpp"
 
 #include <cudf/types.hpp>
 

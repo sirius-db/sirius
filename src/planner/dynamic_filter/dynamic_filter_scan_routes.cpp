@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#include "planner/dynamic_filter_scan_routes.hpp"
+#include "planner/dynamic_filter/dynamic_filter_scan_routes.hpp"
 
 #include "cudf/cudf_utils.hpp"
 #include "helper/type_conversions.hpp"

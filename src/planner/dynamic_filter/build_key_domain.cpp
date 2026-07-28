@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#include "planner/build_key_domain.hpp"
+#include "planner/dynamic_filter/build_key_domain.hpp"
 
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"

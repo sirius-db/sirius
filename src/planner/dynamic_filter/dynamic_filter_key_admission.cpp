@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#include "planner/dynamic_filter_key_admission.hpp"
+#include "planner/dynamic_filter/dynamic_filter_key_admission.hpp"
 
 #include "cudf/cudf_utils.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
@@ -56,7 +56,9 @@ bool side_blocks_scan_route(op::dynamic_filter_key_shape shape) noexcept
 /**
  * @brief Convert an AST reference column ordinal to a cuDF column ordinal
  *
- * This is the single checked conversion point between the two index spaces; they meet nowhere else. Both of a condition's key ordinals pass through it, so neither side can acquire a weaker range check than the other.
+ * This is the single checked conversion point between the two index spaces; they meet nowhere else.
+ * Both of a condition's key ordinals pass through it, so neither side can acquire a weaker range
+ * check than the other.
  *
  * @throw std::invalid_argument if the index exceeds the cuDF column ordinal range
  *
@@ -120,10 +122,10 @@ std::optional<op::dynamic_filter_publish_plan::admitted_key> admit_scan_route_ke
 
   // The probe ordinal is legible only from a planner-order condition: join-edge placement runs
   // after the physical join has reordered its conditions, where no planner-order index applies.
-  auto const& probe_side = *condition.left;
-  auto const probe_key_ordinal =
-    probe_side.is_reference() ? to_key_column_ordinal(probe_side.as_reference().column_index)
-                              : cudf::size_type{0};
+  auto const& probe_side       = *condition.left;
+  auto const probe_key_ordinal = probe_side.is_reference()
+                                   ? to_key_column_ordinal(probe_side.as_reference().column_index)
+                                   : cudf::size_type{0};
 
   return op::dynamic_filter_publish_plan::admitted_key{
     .planner_condition_index      = condition_index,

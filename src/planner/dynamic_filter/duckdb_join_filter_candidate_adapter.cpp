@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#include "planner/duckdb_join_filter_candidate_adapter.hpp"
+#include "planner/dynamic_filter/duckdb_join_filter_candidate_adapter.hpp"
 
 #include <duckdb/common/helper.hpp>
 #include <duckdb/common/typedefs.hpp>
