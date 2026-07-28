@@ -44,6 +44,22 @@ column native.
 Decimal bounds are compared as raw unscaled signed integers. cuDF represents SQL scale `s` as
 `-s`; a narrowing conversion never changes it.
 
+### Alternatives considered: frame-of-reference
+
+Storing `value - min` at the width of the range (frame-of-reference) was considered and rejected
+in favor of value-preserving carriers:
+
+- Chunk-local offsets put batches of one column in different coordinate systems, while CONCAT,
+  the inter-GPU exchange, and co-partition hashing all need one representation across batches. A
+  table-global offset keeps one coordinate system but adds nothing at byte granularity when
+  column minima sit near zero.
+- Value-preserving carriers are a refinement: every existing kernel computes correctly on them,
+  and a forgotten path fails loudly on a type mismatch. Offset encodings need offset-aware decode
+  at every consumer and fail silently wrong when one is missed.
+- The byte-quantized ratio gain over value-preserving narrowing on such data is nil, and
+  Simpatico's own FOR/bitpack already provides frame-of-reference where it belongs — inside the
+  operator-private compressed blob.
+
 ## Scan planning and execution
 
 At plan time, a residency gate decides whether the scan receives a sidecar and derives every
