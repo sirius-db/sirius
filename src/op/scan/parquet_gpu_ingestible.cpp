@@ -57,11 +57,14 @@
 
 // standard library
 #include <algorithm>
+#include <cctype>
 #include <cstdint>
+#include <filesystem>
 #include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -70,6 +73,23 @@ namespace sirius::op::scan {
 namespace {
 
 bool has_uri_scheme(std::string const& p) { return p.find("://") != std::string::npos; }
+
+// Strip a leading, case-insensitive "file://" scheme, if present.
+std::string strip_file_uri(std::string const& p)
+{
+  static constexpr std::string_view kFile = "file://";
+  if (p.size() > kFile.size()) {
+    bool is_file_uri = true;
+    for (std::size_t i = 0; i < kFile.size(); ++i) {
+      if (std::tolower(static_cast<unsigned char>(p[i])) != static_cast<unsigned char>(kFile[i])) {
+        is_file_uri = false;
+        break;
+      }
+    }
+    if (is_file_uri) { return p.substr(kFile.size()); }
+  }
+  return p;
+}
 
 //===----------------------------------------------------------------------===//
 // parquet_batch_coalescer
@@ -260,6 +280,22 @@ std::vector<cudf::io::text::byte_range_info> column_chunk_ranges(
 }
 
 }  // namespace
+
+std::string canonical_scan_file_path(std::string const& raw)
+{
+  std::string p = strip_file_uri(raw);
+  if (has_uri_scheme(p)) { return p; }  // s3://, gs://, http(s):// — local canon N/A
+  std::error_code ec;
+  auto c = std::filesystem::weakly_canonical(std::filesystem::path(p), ec);
+  return ec ? std::filesystem::path(p).lexically_normal().string() : c.string();
+}
+
+void canonicalize_scan_file_paths(std::vector<std::string>& paths)
+{
+  for (auto& p : paths) {
+    p = canonical_scan_file_path(p);
+  }
+}
 
 //===----------------------------------------------------------------------===//
 // scan_info fadvise_entries — prefetch byte ranges

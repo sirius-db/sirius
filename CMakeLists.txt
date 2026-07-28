@@ -95,6 +95,16 @@ find_package(PkgConfig REQUIRED)
 find_package(OpenSSL REQUIRED)
 find_package(ZLIB REQUIRED)
 
+# Static NVRTC (vcpkg overlay port). Statically linking the runtime JIT compiler
+# keeps libnvrtc.so out of the distributed extension's runtime dependencies.
+# Like cuco/nvcomp, this is gated on the vcpkg build: the overlay port provides
+# the nvrtc::nvrtc_static target, which simpatico links instead of the bare
+# 'nvrtc' library name (see src/compression/simpatico_codegen/CMakeLists.txt).
+# The pixi build has no such target and links the conda shared libnvrtc.so.
+if(VCPKG_BUILD)
+  find_package(nvrtc CONFIG REQUIRED)
+endif()
+
 # --- cuCollections (cuco) --- #
 
 # libcudf no longer ships its bundled copy. In the vcpkg build cuco comes from
@@ -158,6 +168,12 @@ set(CUCASCADE_BUILD_IO
     CACHE BOOL "" FORCE)
 add_subdirectory(cucascade "${CMAKE_BINARY_DIR}/cucascade" EXCLUDE_FROM_ALL)
 
+# Simpatico GPU compression engine Tests disabled here — run them via the
+# standalone simpatico_codegen build. Benchmark harness
+# (compress_with_plan_benchmark) is built by default.
+add_subdirectory(src/compression/simpatico_codegen
+                 "${CMAKE_BINARY_DIR}/simpatico_codegen" EXCLUDE_FROM_ALL)
+
 if(VCPKG_BUILD AND TARGET CUDA::cudart_static)
   function(sirius_prefer_static_cudart target_name)
     foreach(_prop LINK_LIBRARIES INTERFACE_LINK_LIBRARIES)
@@ -205,6 +221,9 @@ endif()
 
 # cmake-format: off
 set(EXTENSION_SOURCES
+    src/compression/compressed_representation.cpp
+    src/compression/compression_converters.cpp
+    src/compression/plan_register.cpp
     src/config.cpp
     src/helper/type_conversions.cpp
     src/debug_utils.cpp
@@ -465,6 +484,8 @@ foreach(_target sirius_extension sirius_loadable_extension)
     ${_target}
     PRIVATE
       $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include>
+      $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
+      $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/compression/simpatico_codegen/include>
       $<$<BOOL:${SIRIUS_LEGACY_INCLUDE_DIR}>:$<BUILD_INTERFACE:${SIRIUS_LEGACY_INCLUDE_DIR}>>
   )
 
@@ -494,7 +515,8 @@ foreach(_target sirius_extension sirius_loadable_extension)
     cuCascade::cucascade
     cuCascade::cucascade_cudf
     yaml-cpp::yaml-cpp
-    telemetry_bridge)
+    telemetry_bridge
+    simpatico)
 
   add_dependencies(${_target} duckdb_static)
 endforeach()
@@ -553,7 +575,7 @@ endif()
 # set covers the full dependency chain.
 install(
   TARGETS sirius_extension cucascade_static cucascade_cudf_static
-          cucascade_topology_discovery_static telemetry_bridge
+          cucascade_topology_discovery_static telemetry_bridge simpatico
   EXPORT "${DUCKDB_EXPORT_SET}"
   LIBRARY DESTINATION "${INSTALL_LIB_DIR}"
   ARCHIVE DESTINATION "${INSTALL_LIB_DIR}")
@@ -571,6 +593,7 @@ endif()
 
 # cmake-format: off
 set(TEST_SOURCES
+    test/cpp/compression/test_compression.cpp
     test/cpp/config/test_config.cpp
     test/cpp/config/test_context.cpp
     test/cpp/config/test_object_store_config.cpp
@@ -611,6 +634,7 @@ set(TEST_SOURCES
     test/cpp/integration/test_gpu_execution_multi_format.cpp
     test/cpp/integration/test_gpu_execution_order_nulls.cpp
     test/cpp/integration/test_query_lifecycle_slot.cpp
+    test/cpp/integration/test_gpu_execution_tpcds_nulls.cpp
     test/cpp/integration/test_gpu_execution_tpch.cpp
     test/cpp/integration/test_gpu_execution_tpch_mgpu_audit.cpp
     test/cpp/integration/test_pin_table_host_streaming.cpp
@@ -646,6 +670,7 @@ set(TEST_SOURCES
     test/cpp/memory/test_multiple_blocks_allocation_accessor.cpp
     test/cpp/memory/test_topology_index.cpp
     test/cpp/operator/test_build_probe_scheduling.cpp
+    test/cpp/operator/test_cross_schedule.cpp
     test/cpp/operator/aggregate/test_gpu_merge_impl.cpp
     test/cpp/operator/aggregate/test_physical_grouped_aggregate.cpp
     test/cpp/operator/aggregate/test_physical_grouped_aggregate_count_distinct.cpp
@@ -720,6 +745,7 @@ set(TEST_SOURCES
     test/cpp/unittest.cpp
     test/cpp/utils/pipeline_conversion_test_utils.cpp
     test/cpp/utils/sirius_test_env.cpp
+    test/cpp/utils/test_gpu_execution_comparator.cpp
     test/cpp/utils/utils.cpp)
 # cmake-format: on
 
@@ -748,24 +774,6 @@ endif()
 
 add_executable(sirius_unittest ${TEST_SOURCES})
 
-# TPC-DS integration test fixture, generated at build time (opt-in target). The
-# database is not committed; run `cmake --build . --target tpcds-fixture` once
-# before the TPC-DS integration tests. Requires the duckdb CLI (or python3 with
-# the duckdb module) on PATH; both are provided by the pixi environment.
-set(TPCDS_FIXTURE_DIR ${CMAKE_BINARY_DIR}/test-fixtures)
-set(TPCDS_FIXTURE ${TPCDS_FIXTURE_DIR}/tpcds.duckdb)
-set(TPCDS_FIXTURE_SCRIPT
-    ${CMAKE_CURRENT_SOURCE_DIR}/test/cpp/integration/data/duckdb/generate_tpcds_duckdb.sh
-)
-add_custom_command(
-  OUTPUT ${TPCDS_FIXTURE}
-  COMMAND ${CMAKE_COMMAND} -E make_directory ${TPCDS_FIXTURE_DIR}
-  COMMAND bash ${TPCDS_FIXTURE_SCRIPT} ${TPCDS_FIXTURE}
-  DEPENDS ${TPCDS_FIXTURE_SCRIPT}
-  COMMENT "Generating TPC-DS test fixture (SF 0.01) at ${TPCDS_FIXTURE}"
-  VERBATIM)
-add_custom_target(tpcds-fixture DEPENDS ${TPCDS_FIXTURE})
-
 if(VCPKG_BUILD)
   set_target_properties(sirius_unittest PROPERTIES NO_SYSTEM_FROM_IMPORTED ON)
   target_include_directories(sirius_unittest BEFORE PRIVATE ${_VCPKG_INC})
@@ -777,6 +785,7 @@ target_include_directories(
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/duckdb/third_party/catch>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/test/cpp>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
     $<$<BOOL:${SIRIUS_LEGACY_INCLUDE_DIR}>:$<BUILD_INTERFACE:${SIRIUS_LEGACY_INCLUDE_DIR}>>
 )
 

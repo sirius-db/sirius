@@ -38,6 +38,9 @@
 // Forward-declare CUDA profiler API functions (linked via libcudart).
 extern "C" int cudaProfilerStart();
 extern "C" int cudaProfilerStop();
+#include "compression/compressed_representation.hpp"
+#include "compression/compression_converters.hpp"
+#include "compression/plan_register.hpp"
 #include "data/sirius_converter_registry.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
@@ -67,6 +70,17 @@ extern "C" int cudaProfilerStop();
 #include "duckdb/transaction/duck_transaction.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "transparent/sirius_optimizer_extension.hpp"
+
+#include <cudf/types.hpp>
+#include <cudf/utilities/traits.hpp>
+
+#include <rmm/mr/per_device_resource.hpp>
+
+#include <api/compressed_table_io.hpp>
+#include <api/simpatico_codegen.hpp>
+
+#include <filesystem>
+#include <fstream>
 // #include "from_substrait.hpp"
 #ifdef SIRIUS_ENABLE_LEGACY
 #include "gpu_buffer_manager.hpp"
@@ -1267,33 +1281,122 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
   // ingestible_table_info and drives later cache-hit matching + the gather.
   auto cache_info = sirius::scan_manager::cache_entry_info::from(ingestible->table_info());
 
+  // Compression config (tier-agnostic): load the per-table plan DSL from the plan
+  // directory (if configured), then resolve it into a compression_pin_config. Both
+  // the host and GPU pin paths compress with this when enabled.
+  const auto& comp_cfg = sirius_ctx->get_config().get_compression_config();
+  const bool comp_globally_enabled =
+    comp_cfg.enable_pin_table_compression && !comp_cfg.input_plan_dir.empty();
+  if (comp_globally_enabled) {
+    namespace fs     = std::filesystem;
+    const auto& name = data.args.name;
+    if (!sirius::compression::plan_register::global().resolve_table_plan(name).has_value()) {
+      std::error_code ec;
+      for (auto const& entry : fs::directory_iterator(comp_cfg.input_plan_dir, ec)) {
+        if (!entry.is_regular_file()) { continue; }
+        if (entry.path().stem() == name) {
+          std::ifstream f(entry.path());
+          std::string dsl((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+          if (!dsl.empty()) {
+            sirius::compression::plan_register::global().set_table_plan(name, std::move(dsl));
+          }
+          break;
+        }
+      }
+      if (ec) {
+        SIRIUS_LOG_WARN("[pin_table] cannot scan plan dir '{}': {}; skipping compression",
+                        comp_cfg.input_plan_dir,
+                        ec.message());
+      }
+    }
+  }
+
+  sirius::compression_pin_config pin_comp{};
+  if (comp_globally_enabled) {
+    if (auto plan_dsl =
+          sirius::compression::plan_register::global().resolve_table_plan(data.args.name);
+        plan_dsl.has_value()) {
+      // The plan file carries one block per full-table column (schema order). A pin
+      // may cache only a subset, so select the blocks for the pinned columns by their
+      // full-table index (cache_info.column_ids, in pinned order) — the result lines
+      // up 1:1 with the pinned table that compress_with_plan sees.
+      std::vector<std::size_t> col_indices;
+      col_indices.reserve(cache_info.column_ids.size());
+      for (auto const& cid : cache_info.column_ids) {
+        col_indices.push_back(static_cast<std::size_t>(cid.GetPrimaryIndex()));
+      }
+      auto selected = sirius::compression::select_plan_blocks(*plan_dsl, col_indices);
+      if (selected.has_value()) {
+        pin_comp.enabled                 = true;
+        pin_comp.plan_dsl                = std::move(*selected);
+        pin_comp.min_batch_size_bytes    = comp_cfg.min_batch_size_bytes;
+        pin_comp.max_compressed_fraction = comp_cfg.max_compressed_fraction;
+        pin_comp.column_names            = cache_info.column_names();
+        pin_comp.column_threads          = comp_cfg.column_threads;
+        // Mirror into the decompress converters (no per-context config there).
+        sirius::set_decompress_column_threads(comp_cfg.column_threads);
+        SIRIUS_LOG_INFO("[pin_table] '{}' tier={}: compressing with plan for {} column(s)",
+                        data.args.name,
+                        data.args.tier,
+                        pin_comp.column_names.size());
+      } else {
+        SIRIUS_LOG_WARN(
+          "[pin_table] '{}': plan file does not cover all pinned columns; pinning uncompressed",
+          data.args.name);
+      }
+    } else {
+      SIRIUS_LOG_WARN(
+        "[pin_table] '{}': pin_table_compression is enabled but no plan file was found in '{}'; "
+        "pinning uncompressed",
+        data.args.name,
+        comp_cfg.input_plan_dir);
+    }
+  }
+
   if (data.args.tier == "host") {
-    // Stream each batch GPU->host: materialize one batch on its round-robin GPU, convert it
-    // to a pinned host_data_representation on that GPU's NUMA-local host space, then free the
-    // GPU table before materializing the next. Peak GPU residency stays at ~one batch, so the
-    // whole table never needs to fit in GPU memory. On multi-GPU the chunks land round-robin
-    // across NUMA nodes; the cached-serve path then reads each chunk back on a NUMA-local GPU.
-    auto mat = sirius::materialize_pin_to_host(
-      *ingestible, gpu_spaces_mut, host_space_by_gpu, *scan_mgr.io_ctx(), pinned_column_types);
+    auto host_result = sirius::materialize_pin_to_host(*ingestible,
+                                                       gpu_spaces_mut,
+                                                       host_space_by_gpu,
+                                                       *scan_mgr.io_ctx(),
+                                                       pinned_column_types,
+                                                       pin_comp);
+
     // entry.memory_space is metadata only; each host_chunk carries its own per-GPU
     // NUMA-local memory_space. Pass a representative (the first GPU's host space).
     int const first_gpu_id          = gpu_spaces_mut[0]->get_device_id();
     auto* representative_host_space = host_space_by_gpu.at(first_gpu_id);
+
     scan_mgr.insert_pinned_entry_host(data.args.name,
                                       std::move(cache_info),
-                                      std::move(mat.host_chunks),
+                                      std::move(host_result.chunks),
                                       *representative_host_space,
                                       std::move(pinned_column_types),
-                                      std::move(mat.chunk_stats));
+                                      std::move(host_result.chunk_stats));
     if (data.args.format == "duckdb") {
       sirius::scan_manager::duckdb_mvcc_metadata mvcc;
       mvcc.v_base                   = duckdb_pin_v_base;
-      mvcc.base_row_count_per_chunk = std::move(mat.base_row_count_per_chunk);
+      mvcc.base_row_count_per_chunk = std::move(host_result.base_row_count_per_chunk);
+      scan_mgr.attach_mvcc_metadata(data.args.name, std::move(mvcc));
+    }
+  } else if (pin_comp.enabled) {
+    // GPU tier, compression enabled: materialize each batch and compress it when it
+    // qualifies, keeping the compressed payload in device memory; batches that do
+    // not qualify are pinned uncompressed. Both forms land in one ordered chunk
+    // vector, so a table that mixes them pins without special-casing.
+    auto dev_result = sirius::materialize_all_batches_compressed(
+      *ingestible, gpu_spaces_mut, *scan_mgr.io_ctx(), pin_comp);
+
+    scan_mgr.insert_pinned_entry_device(
+      data.args.name, std::move(cache_info), std::move(dev_result.chunks), *gpu_spaces_mut[0]);
+    if (data.args.format == "duckdb") {
+      sirius::scan_manager::duckdb_mvcc_metadata mvcc;
+      mvcc.v_base                   = duckdb_pin_v_base;
+      mvcc.base_row_count_per_chunk = std::move(dev_result.base_row_count_per_chunk);
       scan_mgr.attach_mvcc_metadata(data.args.name, std::move(mvcc));
     }
   } else {
-    // GPU tier: materialize every batch as a GPU-resident cudf::table (with its GPU
-    // placement) and pin them in place.
+    // GPU tier, uncompressed: materialize every batch as a GPU-resident cudf::table
+    // (with its GPU placement) and pin them in place.
     auto mat = sirius::materialize_all_batches(
       *ingestible, gpu_spaces_mut, *scan_mgr.io_ctx(), pinned_column_types);
     auto base_row_count_per_chunk = std::move(mat.base_row_count_per_chunk);
@@ -1836,6 +1939,57 @@ static void SetEnableGpuExecution(ClientContext& context, SetScope scope, Value&
   SIRIUS_LOG_DEBUG("Updated gpu_execution to {}", BooleanValue::Get(parameter));
 }
 
+static void SetEnablePinTableCompression(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  if (!sirius_ctx) { return; }
+  sirius_ctx->get_config().get_compression_config().enable_pin_table_compression =
+    BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated pin_table_compression to {}", BooleanValue::Get(parameter));
+}
+
+static void SetPinTableInputCompressionPlanDir(ClientContext& context,
+                                               SetScope scope,
+                                               Value& parameter)
+{
+  auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  if (!sirius_ctx) { return; }
+  sirius_ctx->get_config().get_compression_config().input_plan_dir = StringValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated pin_table_input_compression_plan_dir");
+}
+
+static void SetPinTableCompressionMinBatchSizeBytes(ClientContext& context,
+                                                    SetScope scope,
+                                                    Value& parameter)
+{
+  auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  if (!sirius_ctx) { return; }
+  sirius_ctx->get_config().get_compression_config().min_batch_size_bytes =
+    static_cast<std::size_t>(UBigIntValue::Get(parameter));
+  SIRIUS_LOG_DEBUG("Updated pin_table_compression_min_batch_size_bytes");
+}
+
+static void SetPinTableCompressionMaxCompressedFraction(ClientContext& context,
+                                                        SetScope scope,
+                                                        Value& parameter)
+{
+  auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  if (!sirius_ctx) { return; }
+  sirius_ctx->get_config().get_compression_config().max_compressed_fraction =
+    DoubleValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated pin_table_compression_max_compressed_fraction");
+}
+
+static void SetCompressionColumnThreads(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  if (!sirius_ctx) { return; }
+  const auto n = static_cast<int>(BigIntValue::Get(parameter));
+  sirius_ctx->get_config().get_compression_config().column_threads = n;
+  sirius::set_decompress_column_threads(n);
+  SIRIUS_LOG_DEBUG("Updated compression_column_threads to {}", n);
+}
+
 static void SetEnableDynamicFilterPushdown(ClientContext& context, SetScope scope, Value& parameter)
 {
   auto* params = get_operator_params(context);
@@ -2107,6 +2261,45 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
     LogicalType::BOOLEAN,
     Value::BOOLEAN(true),
     SetEnableGpuExecution);
+
+  config.AddExtensionOption("pin_table_compression",
+                            "Enable Simpatico compression for pin_table(tier=>'host') chunks",
+                            LogicalType::BOOLEAN,
+                            Value::BOOLEAN(false),
+                            SetEnablePinTableCompression);
+
+  config.AddExtensionOption(
+    "pin_table_input_compression_plan_dir",
+    "Directory containing per-table Simpatico plan files for pin_table(tier=>'host') compression. "
+    "Files are named '<table_name>.<ext>'; their contents are the multi-column plan DSL. "
+    "Tables with no matching file are pinned uncompressed. No effect on spill compression.",
+    LogicalType::VARCHAR,
+    Value(std::string{}),
+    SetPinTableInputCompressionPlanDir);
+
+  config.AddExtensionOption(
+    "pin_table_compression_min_batch_size_bytes",
+    "Minimum uncompressed batch size in bytes below which pin_table compression is skipped",
+    LogicalType::UBIGINT,
+    Value::UBIGINT(1ULL * 1024 * 1024),
+    SetPinTableCompressionMinBatchSizeBytes);
+
+  config.AddExtensionOption(
+    "pin_table_compression_max_compressed_fraction",
+    "Discard the compressed form and pin uncompressed when the compressed size exceeds this "
+    "fraction of the batch's original size (i.e. compression saved too little)",
+    LogicalType::DOUBLE,
+    Value::DOUBLE(0.95),
+    SetPinTableCompressionMaxCompressedFraction);
+
+  config.AddExtensionOption(
+    "compression_column_threads",
+    "Column-parallelism degree for Simpatico (de)compression: fan a table's columns across this "
+    "many worker threads/streams (one column per stream). <=1 = sequential. Capped at the column "
+    "count. Applies to both the pin-time compress path and the scan-time decompress converters",
+    LogicalType::BIGINT,
+    Value::BIGINT(4),
+    SetCompressionColumnThreads);
 
   config.AddExtensionOption(
     "enable_dynamic_filter_pushdown",

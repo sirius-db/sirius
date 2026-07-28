@@ -37,6 +37,7 @@ pkg-config = "*"
 mold = "*"
 libprotobuf = "*"
 rust = "*"
+cuda-nvrtc-dev = "*"
 
 [feature.dev-libs.dependencies]
 librmm = "*"
