@@ -176,13 +176,38 @@ void load_balancing_scan_batch_coalescer::drain_cached_provider(databatch_provid
   try {
     while (!stop.stop_requested()) {
       auto next = provider.get_next_batch();
-      if (!next.data) { break; }
-      auto split            = std::make_unique<op::scan::scan_operator_input>(std::move(next.data));
-      split->mvcc_keep_mask = std::move(next.mvcc_keep_mask);
-      split->contains_narrowed_columns = next.contains_narrowed_columns;
-      split->restore_destination_bytes = next.restore_destination_bytes;
-      split->row_filter_pending        = row_filter_pending;
-      connector.push_split(std::move(split));
+      if (next.data) {
+        auto split = std::make_unique<op::scan::scan_operator_input>(std::move(next.data));
+        split->mvcc_keep_mask            = std::move(next.mvcc_keep_mask);
+        split->contains_narrowed_columns = next.contains_narrowed_columns;
+        split->restore_destination_bytes = next.restore_destination_bytes;
+        split->row_filter_pending        = row_filter_pending;
+        connector.push_split(std::move(split));
+        continue;
+      }
+      if (next.scan_info) {
+        // Insert-delta split. row_filter_pending stays false: scan_info
+        // splits fold filter costs into their own estimates. Same fadvise +
+        // opportunistic prefetch as the walk path; host-backed splits have
+        // no file ranges, so the hints no-op.
+        auto split = std::make_unique<op::scan::scan_operator_input>(std::move(next.scan_info));
+        split->mvcc_keep_mask = std::move(next.mvcc_keep_mask);
+        std::optional<int> device;
+        if (next.preferred_device >= 0) {
+          device = next.preferred_device;
+          split->set_preferred_device_id(next.preferred_device);
+        }
+        auto fadvise_hints = split->get_fadvise_hints();
+        for (auto& hint : fadvise_hints) {
+          if (hint.datasource && !hint.ranges.empty()) {
+            hint.datasource->fadvise(hint.ranges, device);
+          }
+        }
+        split->prefetch(io::cache::prefetching_stage::opportunistic);
+        connector.push_split(std::move(split));
+        continue;
+      }
+      break;  // end-of-stream
     }
     connector.close();
   } catch (...) {

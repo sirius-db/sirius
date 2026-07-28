@@ -72,6 +72,10 @@ struct config_values {
   std::size_t scan_batch_bytes;
   std::size_t hash_partition_bytes;
   std::size_t concat_batch_bytes;
+  /// Per-partition build-bytes cap for hash-join BUILD_PROBE eligibility. A build side at or over
+  /// this stays on the STANDARD partitioned join path; fixtures that must observe an engaged hash
+  /// partition set it below their build size so a small build cannot elect BUILD_PROBE/broadcast.
+  std::size_t max_build_hash_table_bytes = 90000000;
 };
 
 inline void write_config(std::filesystem::path const& yaml_path, config_values const& values)
@@ -110,7 +114,8 @@ inline void write_config(std::filesystem::path const& yaml_path, config_values c
        "    concat_batch_bytes: "
     << values.concat_batch_bytes
     << "\n"
-       "    max_build_hash_table_bytes: 90000000\n";
+       "    max_build_hash_table_bytes: "
+    << values.max_build_hash_table_bytes << "\n";
 }
 
 /// Pause whichever shared test environments are active so a test-local SiriusContext owns the

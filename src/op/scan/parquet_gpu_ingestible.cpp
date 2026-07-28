@@ -50,8 +50,9 @@
 // duckdb
 #include <duckdb/common/hive_partitioning.hpp>
 
-// uring_reactor MUST be included last among sirius headers — see
-// parquet_split_provider.cpp for the BLOCK_SIZE macro-collision rationale.
+// uring_reactor MUST be included last among sirius headers: liburing.h,
+// pulled in transitively, defines a BLOCK_SIZE macro that collides with the
+// BLOCK_SIZE static member in <blockingconcurrentqueue.h>.
 #include <io/uring/uring_reactor.hpp>
 
 // standard library
@@ -312,8 +313,6 @@ parquet_gpu_ingestible::parquet_gpu_ingestible(std::unique_ptr<parquet_ingestibl
   // Any non-trivial scan shape — reader-side projection (incl. a pruned/reordered
   // column_ids with empty projection_ids, the no-pushdown sirius_read_parquet
   // case), filter pushdown, or hive-partition injection — needs column names.
-  // Matches parquet_split_provider's ctor invariant and build_scan_plan's
-  // needs_reader_projection trigger.
   bool const needs_names = !bind.projection_ids.empty() ||
                            (bind.table_filters && !bind.table_filters->filters.empty()) ||
                            !bind.partition_indices.empty() ||

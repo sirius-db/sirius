@@ -54,16 +54,15 @@ namespace sirius::op::scan {
  * downstream pipeline.
  *
  * Lifecycle:
- *   1. The pipeline converter constructs the operator with its
- *      @c gpu_ingestible (parquet or duckdb-native today).
- *   2. @c sirius_scan_manager::prepare_for_query matches the ingestible's
- *      @c table_info against pinned-cache entries to decide cached-vs-fresh
- *      serving, installs a fresh @c split_connector, and drives a
- *      @c scan_manager::split_provider composing the same ingestible — the
- *      provider populates the connector with splits that the operator
- *      pulls via @ref get_next_task_input_data.
- *   3. @ref execute dispatches each split through the ingestible's
- *      @c materialize_table and (conditionally) @c post_filter_and_project.
+ * 1. The plan generator creates the ingestible and the scan operator.
+ * 2. prepare_for_query checks whether a pinned entry can serve the scan.
+ * 3. A cache miss uses split_provider. A cache hit uses cached_databatch_provider.
+ * 4. Both providers send inputs through the operator's split connector.
+ * 5. execute() runs each split through materialize_table, then
+ *    post_filter_and_project unless the result is already
+ *    row-filtered and projected.
+ *
+ * The operator retains the ingestible created by the plan generator.
  */
 class sirius_gpu_scan_operator : public sirius_physical_operator {
  public:
@@ -72,9 +71,7 @@ class sirius_gpu_scan_operator : public sirius_physical_operator {
   /**
    * @param types                  Output column types in plan order.
    * @param estimated_cardinality  Planner-estimated row count.
-   * @param ingestible             Source this scan materializes through; its
-   *                               @c table_info identifies the scan to the
-   *                               scan_manager.
+   * @param ingestible             Per-table source built by the plan generator.
    * @param compressed_materialization_observer  Plan-time counter sink for
    *                               narrowing observability; may be null.
    */
@@ -100,17 +97,14 @@ class sirius_gpu_scan_operator : public sirius_physical_operator {
   /**
    * @brief Produce a data batch for one split.
    *
-   * Two input shapes are supported:
-   *   - @c scan_operator_input — fresh read; calls
-   *     @c gpu_ingestible::materialize_table and (when filter info is
-   *     present) @c gpu_ingestible::post_filter_and_project.
-   *   - @c scan_operator_with_pinned_table_input — pinned-cache hit;
-   *     forwards the batch when no filter info is set, otherwise calls
-   *     @c gpu_ingestible::post_filter_and_project on the cached view.
+   * The input is a @c scan_operator_input holding either scan metadata
+   * (fresh read) or a resident batch (pinned-cache hit). Both go through
+   * @c gpu_ingestible::materialize_table; @c post_filter_and_project runs
+   * afterwards unless materialize returned
+   * @c filter_state::ROW_FILTERED_AND_PROJECTED.
    *
-   * Throws when the input is neither type (programmer error: the only
-   * operator_data types pushed into the operator's connector are the two
-   * above).
+   * Throws on any other operator_data type (programmer error: the connector
+   * carries only @c scan_operator_input).
    */
   std::unique_ptr<op::operator_data> execute(const op::operator_data& input_data,
                                              rmm::cuda_stream_view stream) override;

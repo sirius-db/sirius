@@ -37,8 +37,10 @@
 namespace sirius::scan_manager {
 
 struct databatch_provider {
-  /// One cached chunk plus its (optional) per-query MVCC keep-mask.
-  /// A default-constructed batch (null @ref data) means end-of-stream.
+  /// One cached chunk or one insert-delta split, plus its (optional)
+  /// per-query MVCC keep-mask. A batch carries either @ref data (resident
+  /// cached chunk) or @ref scan_info (delta split, yielded after the
+  /// resident chunks); both null means end-of-stream.
   struct batch {
     std::shared_ptr<cucascade::data_batch> data;
     mvcc_chunk_mask mvcc_keep_mask;  ///< default = all rows visible
@@ -51,6 +53,8 @@ struct databatch_provider {
     /// are unavailable; the scan memory estimate then falls back to its
     /// conservative maximum-expansion bound.
     std::size_t restore_destination_bytes{0};
+    std::unique_ptr<op::scan::scan_info> scan_info;
+    int preferred_device{-1};  ///< placement for scan_info splits (-1 = none)
   };
 
   virtual ~databatch_provider()  = default;

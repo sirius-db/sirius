@@ -74,11 +74,14 @@ constexpr std::int64_t kFactRows = 200000;
 constexpr std::int64_t kDimRows = 50000;
 
 // The filtered build side (~25000 rows of one BIGINT key ~ 200 KB) exceeds
-// hash_partition_bytes several times over, so the join partitions >= 2 ways and never enters
-// BUILD_PROBE mode; the aggregate-side partial output (50000 groups) engages the aggregate
-// partition the same way.
-constexpr std::size_t kScanBatchBytes     = 262144;
-constexpr std::size_t kHashPartitionBytes = 65536;
+// hash_partition_bytes several times over, so the join's natural partition count is >= 2; the
+// aggregate-side partial output (50000 groups) engages the aggregate partition the same way.
+// kMaxBuildHashTableBytes sits below the build bytes so the small build cannot elect
+// BUILD_PROBE/broadcast, which would stream the probe through its PARTITION unpartitioned and
+// bypass the hash-partition path the partition_narrow_columns counter observes.
+constexpr std::size_t kScanBatchBytes         = 262144;
+constexpr std::size_t kHashPartitionBytes     = 65536;
+constexpr std::size_t kMaxBuildHashTableBytes = 1024;
 
 constexpr char const* kJoinQuery =
   "SELECT SUM(t.v) AS sv, SUM(t.d) AS sd FROM t JOIN dm ON t.k = dm.k WHERE dm.x < 50;";
@@ -89,9 +92,10 @@ constexpr char const* kCountValidGroupByQuery =
   "SELECT k, COUNT(k) AS c FROM t GROUP BY k ORDER BY k LIMIT 10;";
 
 // Small exchange sizes force multi-way hash partitioning on the fixture's data volumes.
-constexpr config_values kConfigValues{.scan_batch_bytes     = kScanBatchBytes,
-                                      .hash_partition_bytes = kHashPartitionBytes,
-                                      .concat_batch_bytes   = 262144};
+constexpr config_values kConfigValues{.scan_batch_bytes           = kScanBatchBytes,
+                                      .hash_partition_bytes       = kHashPartitionBytes,
+                                      .concat_batch_bytes         = 262144,
+                                      .max_build_hash_table_bytes = kMaxBuildHashTableBytes};
 
 void generate_fact_parquet(fs::path const& path)
 {

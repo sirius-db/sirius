@@ -23,6 +23,7 @@
 #include <duckdb/function/partition_stats.hpp>
 #include <duckdb/storage/data_table.hpp>
 #include <duckdb/storage/table/column_data.hpp>
+#include <duckdb/storage/table/column_segment.hpp>
 #include <duckdb/storage/table/row_group.hpp>
 #include <duckdb/storage/table/row_group_collection.hpp>
 #include <duckdb/storage/table/row_group_segment_tree.hpp>
@@ -40,34 +41,40 @@ namespace {
 constexpr std::size_t kWordBits = 32;
 
 // The host fill writes uint32 words that mask_to_bools reads as
-// cudf::bitmask_type, and vectors are the intra-slice write unit — both must
-// be whole numbers of mask words. (The row-group size — the cross-TASK slice
-// unit — is per-database configuration, so capture checks it at runtime via
-// the chunk_offset % 32 assert instead.)
+// cudf::bitmask_type.
 static_assert(sizeof(std::uint32_t) == sizeof(cudf::bitmask_type),
               "bit-packed keep-masks assume cudf::bitmask_type is 32-bit");
-static_assert(STANDARD_VECTOR_SIZE % kWordBits == 0,
-              "vector-granular mask writes assume whole words per vector");
 
-/// Set or clear bits [begin, begin + count) of @p words. @p begin must be
-/// 32-aligned (vector offsets within 32-aligned slices always are). Writes
-/// whole words, including the padding bits of a trailing partial word — safe
-/// because a partial range is always the last write in its word (a partial
-/// vector ends its slice; a partial slice ends the table) and padding bits
-/// past the covered range are don't-care to mask_to_bools.
-void write_aligned_bit_range(std::span<std::uint32_t> words,
-                             std::size_t begin,
-                             std::size_t count,
-                             bool value)
+/// Set or clear bits [begin, begin + count) of @p words: read-modify-write on
+/// partial edge words, whole-word fills between, so any begin/count is legal.
+/// Caller contract: no concurrent writer shares an edge word (the mask job
+/// slices parallel tasks only on word-aligned offsets), and the words start
+/// zeroed so edge reads never see indeterminate memory.
+void write_bit_range(std::span<std::uint32_t> words,
+                     std::size_t begin,
+                     std::size_t count,
+                     bool value)
 {
   if (count == 0) { return; }
-  auto const word       = begin / kWordBits;
-  auto const full_words = count / kWordBits;
-  std::fill_n(words.data() + word, full_words, value ? 0xFFFFFFFFu : 0u);
-  if (auto const rem = count % kWordBits) {
-    auto const tail          = cudf::set_least_significant_bits(static_cast<cudf::size_type>(rem));
-    words[word + full_words] = value ? tail : 0u;
+  auto const end       = begin + count;
+  auto const first     = begin / kWordBits;
+  auto const last      = (end - 1) / kWordBits;
+  auto const head_bits = begin % kWordBits;
+  auto const tail_bits = end % kWordBits;  // 0 => the last word is fully covered
+
+  std::uint32_t const head_mask = ~0u << head_bits;
+  std::uint32_t const tail_mask = tail_bits ? ~(~0u << tail_bits) : ~0u;
+
+  if (first == last) {
+    std::uint32_t const m = head_mask & tail_mask;
+    words[first]          = value ? (words[first] | m) : (words[first] & ~m);
+    return;
   }
+  words[first] = value ? (words[first] | head_mask) : (words[first] & ~head_mask);
+  std::fill(words.begin() + static_cast<std::ptrdiff_t>(first) + 1,
+            words.begin() + static_cast<std::ptrdiff_t>(last),
+            value ? 0xFFFFFFFFu : 0u);
+  words[last] = value ? (words[last] | tail_mask) : (words[last] & ~tail_mask);
 }
 
 /// Non-loading per-row-group version-state probe (see header docs for why
@@ -160,15 +167,10 @@ mvcc_visibility_plan capture_mvcc_visibility_plan(
         ", " + std::to_string(expected_start + covered) + "))");
     }
 
+    // Checkpoint-grown tables have row groups of arbitrary sizes, so this
+    // offset may be unaligned; the fill writer handles word edges and the
+    // mask job serializes unaligned chunks into a single fill task.
     auto const chunk_offset = expected_start - chunk_start;
-    if (chunk_offset % kWordBits != 0) {
-      // Lock-free bit-packed fill invariant: task ranges slice on row-group
-      // boundaries, so every slice start must be 32-row aligned or parallel
-      // tasks could share a mask word.
-      throw std::runtime_error(
-        "[capture_mvcc_visibility_plan] slice offset " + std::to_string(chunk_offset) +
-        " within its chunk is not 32-row aligned (row-group size not a multiple of 32?)");
-    }
 
     bool const dirty = row_group_has_version_state(*node);
     plan.mvcc_row_groups[chunk_idx].push_back(
@@ -193,7 +195,7 @@ bool fill_keep_mask_for_row_groups(std::span<mvcc_row_group_slice const> slices,
     if (!slice.has_version_state) {
       // No version state at capture: every covered row is visible. No
       // GetVersionInfo, no GetSelVector, no version lock.
-      write_aligned_bit_range(chunk_mask_words, slice.chunk_offset, slice.row_count, true);
+      write_bit_range(chunk_mask_words, slice.chunk_offset, slice.row_count, true);
       continue;
     }
 
@@ -207,11 +209,11 @@ bool fill_keep_mask_for_row_groups(std::span<mvcc_row_group_slice const> slices,
 
       if (count == max_count) {
         // All visible — sel may be UNFILLED on this fast path; never read it.
-        write_aligned_bit_range(chunk_mask_words, off, max_count, true);
+        write_bit_range(chunk_mask_words, off, max_count, true);
         continue;
       }
       any_dropped = true;
-      write_aligned_bit_range(chunk_mask_words, off, max_count, false);
+      write_bit_range(chunk_mask_words, off, max_count, false);
       for (std::size_t i = 0; i < count; ++i) {
         cudf::set_bit_unsafe(chunk_mask_words.data(),
                              static_cast<cudf::size_type>(off + sel.get_index(i)));
@@ -239,6 +241,25 @@ bool any_update_chains(duckdb::DataTable& storage,
       static_cast<std::size_t>(node->GetRowStart()) + static_cast<std::size_t>(rg.count.load());
   }
   return false;
+}
+
+bool any_uncheckpointed_appends(duckdb::DataTable& storage,
+                                std::span<duckdb::storage_t const> storage_column_indices)
+{
+  if (storage_column_indices.empty()) { return false; }
+  auto tree = storage.GetRowGroupCollection()->GetRowGroups();
+  for (duckdb::idx_t rg_index = 0;; ++rg_index) {
+    auto node = tree->GetSegmentByIndex(static_cast<int64_t>(rg_index));
+    if (!node) { return false; }
+    auto& rg = node->GetNode();
+    for (auto col : storage_column_indices) {
+      for (auto& seg_node : rg.GetRawColumnData(col).GetSegmentTree().SegmentNodes()) {
+        if (seg_node.GetNode().segment_type == duckdb::ColumnSegmentType::TRANSIENT) {
+          return true;
+        }
+      }
+    }
+  }
 }
 
 native_read_mvcc_state check_native_read_mvcc_state(

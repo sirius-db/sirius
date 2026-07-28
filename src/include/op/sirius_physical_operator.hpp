@@ -126,7 +126,8 @@ class operator_data {
    *
    * Used by memory estimation in sirius_gpu_scan_operator to distinguish a
    * pass-through over an already-resident batch from a fresh decode that
-   * still needs allocation. Overridden by scan_operator_with_pinned_table_input.
+   * still needs allocation. Overridden by @c scan_operator_input, which reports
+   * true when it holds a resident batch.
    */
   [[nodiscard]] virtual bool is_resident() const noexcept { return false; }
 

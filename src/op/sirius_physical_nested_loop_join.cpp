@@ -215,6 +215,14 @@ bool sirius_physical_nested_loop_join::is_supported(
   return true;
 }
 
+partition_strategy sirius_physical_nested_loop_join::get_partition_strategy(
+  const partition_sizing_input& /*in*/)
+{
+  // A nested-loop join is never hash-partitioned: it runs on a single partition and streams both
+  // sides through the cross-product, so it never broadcasts or enters build-probe.
+  return {/*num_partitions=*/1, /*broadcast=*/false, /*build_probe=*/false};
+}
+
 duckdb::vector<sirius::logical_type> sirius_physical_nested_loop_join::get_join_types() const
 {
   duckdb::vector<sirius::logical_type> result;

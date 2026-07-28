@@ -69,8 +69,17 @@ std::size_t scan_operator_input::get_estimated_size_in_bytes() const
 std::size_t scan_operator_input::get_estimated_working_set_size_in_bytes() const
 {
   if (std::holds_alternative<std::unique_ptr<scan_info>>(materialization_info)) {
-    return std::get<std::unique_ptr<scan_info>>(materialization_info)
-      ->estimated_working_set_bytes();
+    auto const decode_bytes =
+      std::get<std::unique_ptr<scan_info>>(materialization_info)->estimated_working_set_bytes();
+    if (mvcc_keep_mask.has_mask()) {
+      // A partially visible insert-delta split is mask-filtered right after
+      // decode: the decoded input and the compacted output (up to input-sized)
+      // coexist at peak, alongside the BOOL8 expansion column (1 B/row) and
+      // the uploaded bitmask words — the same envelope as the cached branch
+      // below.
+      return 2 * decode_bytes + mvcc_keep_mask.row_count + mvcc_keep_mask.view().size_bytes();
+    }
+    return decode_bytes;
   }
   auto const batch_bytes = get_estimated_size_in_bytes();
   if (mvcc_keep_mask.has_mask()) {

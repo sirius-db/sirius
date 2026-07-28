@@ -53,7 +53,7 @@ jobs:
     runs-on: ${{ fromJSON(format('["self-hosted", "{0}", "cpu-xl"]', matrix.cuda.runner)) }}
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Init build submodules
         run: git submodule update --init --depth=1 --jobs 3 duckdb substrait cucascade
@@ -78,7 +78,7 @@ jobs:
 
       - name: Build
         env:
-          CUDAARCHS: "89" # 75 for T4 capability; 89 for L4 capability
+          CUDAARCHS: "75" # 75 for T4 capability; 89 for L4 capability
         run: make -j$(nproc)
 
       - name: Package build artifacts
@@ -110,13 +110,13 @@ jobs:
           - cuda:
               run-on-pr: ${{ fromJSON(github.event_name == 'pull_request' && 'false' || 'null') }}
       fail-fast: false
-    runs-on: ${{ fromJSON(format('["self-hosted", "{0}", "gpu-2xl4"]', matrix.cuda.runner)) }}
+    runs-on: ${{ fromJSON(format('["self-hosted", "{0}", "gpu-2xt4"]', matrix.cuda.runner)) }}
     timeout-minutes: 60
     env:
       CUDA_CACHE_PATH: /home/runner/actions-runner/_work/.cuda-cache
       SIRIUS_LOG_LEVEL: trace
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - uses: prefix-dev/setup-pixi@a09b6247153796b190642a2b53fac4241043cf6f # v0.10.0
         with:

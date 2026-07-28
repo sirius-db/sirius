@@ -26,6 +26,10 @@ namespace sirius::pipeline {
 struct pipeline_conversion_result;
 }  // namespace sirius::pipeline
 
+namespace sirius {
+class sirius_engine;
+}
+
 namespace sirius::test {
 
 //! Drive the full sirius planner + meta_pipeline + converter flow on `query` (with the
@@ -46,6 +50,11 @@ void with_conversion_result(
   duckdb::Connection& con,
   const std::string& query,
   const std::function<void(pipeline::pipeline_conversion_result&)>& consume);
+
+//! Initialize an engine for `query` and invoke `consume` while its plan is alive.
+void with_initialized_engine(duckdb::Connection& con,
+                             const std::string& query,
+                             const std::function<void(sirius_engine&)>& consume);
 
 //! Path to the canonical TPC-H queries (`test/tpch_performance/tpch_queries/orig/`).
 std::filesystem::path tpch_queries_dir();

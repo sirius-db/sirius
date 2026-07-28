@@ -24,6 +24,7 @@
 #include "telemetry-bridge/gen/operator.rs.h"
 #include "telemetry-bridge/gen/plan.rs.h"
 #include "telemetry-bridge/gen/port.rs.h"
+#include "telemetry/batch_telemetry.hpp"
 
 #include <unistd.h>
 
@@ -212,6 +213,8 @@ void emit_plan_telemetry(
                                   .operator_id   = pipeline_uuid,
                                   .instance_name = std::format("{}_receiver", port_id),
                                 });
+          batch_telemetry_registry::instance().register_consumer_port(
+            port->repo, pipeline_uuid, port->source_port_uuid);
         }
       }
     }

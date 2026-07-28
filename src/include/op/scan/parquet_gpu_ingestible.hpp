@@ -124,8 +124,7 @@ class parquet_split_info : public scan_info {
   /// filter still applies post-decode via @c expression_evaluator.
   bool disable_filter_pushdown = false;
   /// Hive partition values for this split, in @c scan_plan::partition_columns
-  /// order. Empty when the plan has no partition columns. Duplicated here
-  /// (also lives on @c parquet_post_filter_and_projection_info) so
+  /// order. Empty when the plan has no partition columns. Kept on the split so
   /// @ref materialize_table can call @c assemble_scan_output inline on the
   /// reader-side pushdown path and emit @c filter_state::ROW_FILTERED_AND_PROJECTED.
   std::vector<std::string> partition_values;
@@ -242,7 +241,7 @@ class parquet_file_scan_info : public scan_info {
 // parquet_gpu_ingestible
 //===----------------------------------------------------------------------===//
 /**
- * @brief Concrete @c io::gpu_ingestible for parquet sources.
+ * @brief Concrete @c gpu_ingestible for parquet sources.
  *
  * Owns the shared scan plan, reader options, and coalesced filter expression.
  * @ref next_split_provider hands out one file at a time: each metadata-scan task

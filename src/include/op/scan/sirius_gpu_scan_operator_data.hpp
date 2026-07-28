@@ -44,7 +44,7 @@ namespace sirius::op::scan {
  *
  * Carries the per-split scan descriptor and (optional) post-decode
  * filter/projection description. The materialize step delegates to the
- * operator's installed @c io::gpu_ingestible — the operator does not see
+ * operator's installed @c gpu_ingestible — the operator does not see
  * the source format directly.
  *
  * Source operator data: holds no upstream batches that need locking, so

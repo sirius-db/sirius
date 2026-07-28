@@ -46,6 +46,7 @@ bool env_set(char const* name)
 #include "io/s3/sigv4.hpp"
 
 #include <curl/curl.h>
+#include <duckdb.hpp>
 
 extern "C" {
 #include <testcontainers-c/container.h>
@@ -227,17 +228,88 @@ void create_special_key_fixtures(fs::path const& fixture_dir)
 
   auto const root = fixture_dir / "glob-enc";
   fs::remove_all(root);
-  std::array<std::pair<fs::path, fs::path>, 6> const fixtures{{
+  std::array<std::pair<fs::path, fs::path>, 12> const fixtures{{
     {nation, root / "a%2Fb.parquet"},
     {region, root / "a" / "b.parquet"},
     {nation, root / "x#1.parquet"},
     {nation, root / "y?v.parquet"},
     {nation, root / "100%.parquet"},
     {nation, root / "t" / "col=a%20b" / "p0.parquet"},
+    {nation, root / "q" / "col=a%3Fb" / "p0.parquet"},
+    {nation, root / "q" / "col=a?b" / "p0.parquet"},
+    {nation, root / "f%20g.parquet"},
+    {region, root / "f g.parquet"},
+    {nation, root / "guard-before" / "co?l=value" / "p0.parquet"},
+    {nation, root / "guard-filename" / "report=foo?bar.parquet"},
   }};
   for (auto const& [source, destination] : fixtures) {
     fs::create_directories(destination.parent_path());
     fs::copy_file(source, destination, fs::copy_options::overwrite_existing);
+  }
+}
+
+void create_edge_types_fixture(fs::path const& fixture_dir)
+{
+  auto const output = fixture_dir / "parquet" / "edge_types.parquet";
+  auto temporary    = output;
+  temporary += ".tmp";
+
+  fs::create_directories(output.parent_path());
+  std::error_code ec;
+  fs::remove(temporary, ec);
+  if (ec) { throw std::runtime_error("cannot remove stale edge-types fixture: " + ec.message()); }
+
+  auto sql_quote = [](std::string_view value) {
+    std::string quoted{"'"};
+    for (auto const c : value) {
+      if (c == '\'') quoted.push_back('\'');
+      quoted.push_back(c);
+    }
+    quoted.push_back('\'');
+    return quoted;
+  };
+
+  duckdb::DuckDB db(nullptr);
+  duckdb::Connection con(db);
+  auto result = con.Query(
+    "COPY ("
+    "SELECT CAST(id AS INTEGER) AS id, CAST(n AS INTEGER) AS n, "
+    "CAST(d AS DECIMAL(18,4)) AS d, CAST(ts AS TIMESTAMP) AS ts "
+    "FROM (VALUES "
+    "(1, CAST(NULL AS INTEGER), '0.0000', '1970-01-01 00:00:00'), "
+    "(2, 0, '-0.0001', '1970-01-01 00:00:00.000001'), "
+    "(3, -1, '0.0001', '1985-07-13 12:34:56.123456'), "
+    "(4, CAST(NULL AS INTEGER), '99999999999999.9999', '1999-12-31 23:59:59.999999'), "
+    "(5, 1, '-99999999999999.9999', '2000-02-29 12:00:00'), "
+    "(6, 2147483647, '12345678901234.5678', '2001-09-09 01:46:40'), "
+    "(7, CAST(NULL AS INTEGER), '-12345678901234.5678', '2010-01-01 00:00:00'), "
+    "(8, -2147483648, '42.4242', '2016-02-29 08:15:30'), "
+    "(9, 42, '-42.4242', '2020-02-29 23:59:59'), "
+    "(10, CAST(NULL AS INTEGER), '1.0000', '2024-07-24 03:01:01'), "
+    "(11, -42, '-1.0000', '2038-01-19 03:14:07'), "
+    "(12, 7, '9876543210.4321', '2050-06-30 10:20:30.4005'), "
+    "(13, CAST(NULL AS INTEGER), '-9876543210.4321', '2099-12-31 23:59:59.999999'), "
+    "(14, 8, '3141592653.5897', '2100-03-01 00:00:00'), "
+    "(15, 9, '-2718281828.4590', '1969-12-31 23:59:59.999999'), "
+    "(16, CAST(NULL AS INTEGER), '10000000000000.0000', '1900-01-01 00:00:00'), "
+    "(17, 10, '-10000000000000.0000', '2199-12-31 23:59:59'), "
+    "(18, 11, '0.0100', '2200-01-01 00:00:00'), "
+    "(19, CAST(NULL AS INTEGER), '-0.0100', '2262-04-11 23:47:16'), "
+    "(20, 12, '77777777777777.7777', '2200-12-31 23:59:59.123456')"
+    ") AS edge(id, n, d, ts)"
+    ") TO " +
+    sql_quote(temporary.string()) + " (FORMAT PARQUET)");
+  if (!result || result->HasError()) {
+    auto const error = result ? result->GetError() : std::string{"no query result"};
+    fs::remove(temporary, ec);
+    throw std::runtime_error("failed to generate edge-types parquet fixture: " + error);
+  }
+
+  fs::rename(temporary, output, ec);
+  if (ec) {
+    auto const error = ec.message();
+    fs::remove(temporary, ec);
+    throw std::runtime_error("failed to finalize edge-types parquet fixture: " + error);
   }
 }
 
@@ -581,6 +653,7 @@ bool bring_up()
   fs::path ca_bundle = generate_self_signed_cert(certs_dir);
   generate_fixtures(fixture_dir);
   create_special_key_fixtures(fixture_dir);
+  create_edge_types_fixture(fixture_dir);
 
   // HTTP instance: testcontainers' HTTP wait makes it ready before run returns.
   int http_req = make_minio_request();
