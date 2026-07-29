@@ -270,7 +270,7 @@ Ask in ~3 grouped rounds (`AskUserQuestion` allows up to 4 questions per call). 
 **Round 2 — execution shape**
 1. **Mode** (`--mode`) — `grouped` (default, hot cache), `sequential` (round-robin), `isolated` (true cold-start; needs the sudo setup below), or `nsys-profile` (GPU-only; owned by the `profile-analyzer` skill).
 2. **Pin** (`--pin`) — `none` (from disk), `gpu`, or `host` (pinned cache tier; rejected with `--engine cpu`). This is how "from disk vs pinned" is chosen, for either source.
-3. **Pin compression** (`--pin-compression`) — only ask when Pin is `gpu` or `host`; skip it entirely for `none` (the runner rejects the combination). Off (Recommended) or Simpatico-compressed pins; the plan dir (`--compression-plan-dir`) defaults to the shipped `plans/tpch_sf1000`, so only ask for a path if the user has their own plans.
+3. **Pin compression** (`--pin-compression`) — only ask when Pin is `gpu` or `host`; skip it entirely for `none` (the runner rejects the combination). Off (Recommended) or Simpatico-compressed pins. When compression is chosen, always ask which plan directory to use — the shipped `src/compression/simpatico_codegen/plans/tpch_sf1000` (Recommended) or a user-supplied `--compression-plan-dir` path; never assume the default without confirming it.
 4. **Iterations** (`--iterations`) — per-query iteration count (default `1`).
 5. **Queries** (`--queries`) — all 22 (default) or a subset like `1,3,6-10`.
 
@@ -323,10 +323,11 @@ option) and ask for the rest. Mark sensible defaults "(Recommended)".
    tier. Prefer `host` at large SF, since pinning all 8 tables to GPU can OOM and disk spill is
    off by default.
 4. **Pin compression** (`--pin-compression`): off (Recommended) or Simpatico-compressed pins.
-   Compression happens at pin time, so it needs the pinned tier from the previous question. The
-   plan dir (`--compression-plan-dir`) defaults to the shipped
-   `src/compression/simpatico_codegen/plans/tpch_sf1000` (covers 6 of 8 tables); only ask for a
-   path if the user says they have their own plans.
+   Compression happens at pin time, so it needs the pinned tier from the previous question. When
+   compression is chosen, always ask which plan directory to use — present the shipped
+   `src/compression/simpatico_codegen/plans/tpch_sf1000` as the recommended option (covers 6 of
+   8 tables) against a user-supplied `--compression-plan-dir` path; never assume the default
+   without confirming it.
 5. **Streams** (`--streams`): throughput query-stream count (default: TPC-H spec minimum for the
    SF). Ensure the refresh dir has `streams + 1` sets.
 6. **Validation** (`--validation`): only ask with fixed predicates (default on there): after RF1
