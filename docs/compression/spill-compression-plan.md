@@ -576,6 +576,31 @@ one. What is solid is the shape: deferring exploration removes the short-query
 regressions outright (q22 18.0x → 1.0x), and a cheap default keeps the
 heavily-spilling case fast.
 
+### Spill state is per-query and is cleared at query end
+
+`_spill_plans` and `_spill_origins` are keyed by `shared_data_repository*`, and
+`SiriusContext::QueryEnd` destroys every repository. Without clearing, those maps
+grew without bound holding entries keyed by freed pointers, and a repository later
+allocated at a recycled address would inherit plans and verdicts belonging to an
+unrelated edge. `clear_spill_state()` now runs at query end, just before
+`clear_all_repositories()`.
+
+Nothing is carried across queries by design. The offline table plans
+(`input_plan_dir`) survive — they come from startup, not from a query — so the next
+query re-seeds through column lineage from the same source. Explored plans are
+**not** written back to the per-column store: an exploration is evidence about one
+spilling edge's data, not about the base column in general, and promoting it would
+let one query's intermediate distribution silently redirect every later query's
+plans for that column.
+
+The consequence is worth stating plainly: **`spill_replan_after_uses` counts uses
+within a single query.** Few edges reach 128, so exploration rarely fires and the
+adaptive machinery around it (backoff, the 20% adoption threshold, explore-failure
+memoization) is mostly dormant in practice. What actually carries the work is
+lineage seeding plus the fixed default. That is a deliberate trade — bounded,
+predictable per-query behaviour over cross-query learning — but it means the
+replan tuning knobs matter far less than their presence suggests.
+
 ### Tune the explorer for use during query execution
 
 The explorer's defaults were chosen for offline plan generation, where a long beam

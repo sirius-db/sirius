@@ -327,6 +327,20 @@ void SiriusContext::run_mandatory_cleanup(sirius::query_id_t query_id, std::stri
   } catch (...) {
   }
 
+  // Drop every per-query spill-compression entry. These are keyed by
+  // shared_data_repository*, and this query's repositories are erased just below, so
+  // holding them any longer both leaks and risks a later repository at a recycled
+  // address picking up an unrelated edge's plans and verdicts. Nothing is carried
+  // across queries: the next one re-seeds from the offline table plans via lineage.
+  //
+  // NOTE: this clears the register globally, while #1327 made repositories per-query.
+  // With two queries in flight, one finishing drops the other's learned plans and
+  // verdicts mid-query. That costs re-seeding, not correctness — the maps are a memo,
+  // and a missing entry re-derives from the table plans — but the register should be
+  // keyed by query_id to match the registry. Left as-is here because scoping it is a
+  // design change, not a rebase resolution.
+  sirius::compression::plan_register::global().clear_spill_state();
+
   // Drop THIS query's data repositories, leaving any other in-flight query's untouched.
   // Any batches still present are leaked — operators should have popped everything.
   // Safe to clear here because the downgrade executors were drained above, so nothing still

@@ -1161,6 +1161,37 @@ TEST_CASE("plan_register: clear_spill_plan removes only the named edge",
   reg.clear_all();
 }
 
+TEST_CASE("plan_register: clear_spill_state drops per-query state but keeps table plans",
+          "[compression][plan_register]")
+{
+  auto& reg = sirius::compression::plan_register::global();
+  reg.clear_all();
+
+  // Offline plans come from input_plan_dir at startup, not from a query.
+  reg.set_table_plan("lineitem", "input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed");
+  set_plan_1col(&repo_a(), "explored dsl");
+  reg.set_spill_column_origins(
+    &repo_a(), {sirius::compression::plan_register::spill_column_origin{"lineitem", 0}});
+
+  REQUIRE(reg.resolve_spill_plan(&repo_a()).has_value());
+  REQUIRE(reg.resolve_spill_column_origins(&repo_a()).has_value());
+
+  // Query end: everything keyed by a repository pointer must go, because those
+  // repositories are destroyed and their addresses can be recycled by the next
+  // query's repositories.
+  reg.clear_spill_state();
+
+  REQUIRE_FALSE(reg.resolve_spill_plan(&repo_a()).has_value());
+  REQUIRE_FALSE(reg.resolve_spill_column_origins(&repo_a()).has_value());
+  REQUIRE(reg.decide_spill_plan(&repo_a(), /*replan_after_uses=*/0).verdict ==
+          sirius::compression::plan_register::spill_plan_verdict::explore);
+
+  // ...but the offline table plans survive: the next query re-seeds from them.
+  REQUIRE(reg.resolve_table_plan("lineitem").has_value());
+
+  reg.clear_all();
+}
+
 TEST_CASE("plan_register: clear_all removes spill plans", "[compression][plan_register]")
 {
   auto& reg = sirius::compression::plan_register::global();

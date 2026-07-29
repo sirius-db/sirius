@@ -332,6 +332,21 @@ class plan_register {
 
   // ── Lifecycle ────────────────────────────────────────────────────────────
 
+  /**
+   * @brief Drop every per-query spill entry: cached plans, verdicts and origins.
+   *
+   * Must run at query end. Spill state is keyed by `shared_data_repository*`, and
+   * those repositories are destroyed between queries — so without this the maps
+   * grow without bound holding entries keyed by freed pointers, and a repository
+   * later allocated at a recycled address inherits state belonging to an
+   * unrelated edge.
+   *
+   * Leaves the offline table plans (`set_table_plan`) alone: those come from
+   * `input_plan_dir` at startup rather than from a query, and are what the
+   * lineage seeding reads.
+   */
+  void clear_spill_state();
+
   /// Remove all entries (table-level, per-column, and spill-path).
   void clear_all();
 

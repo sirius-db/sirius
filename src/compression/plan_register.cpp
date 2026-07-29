@@ -324,6 +324,13 @@ std::optional<plan_register::spill_plan_state> plan_register::resolve_spill_plan
   return std::nullopt;
 }
 
+void plan_register::clear_spill_state()
+{
+  std::unique_lock lock(_mutex);
+  _spill_plans.clear();
+  _spill_origins.clear();
+}
+
 void plan_register::clear_all()
 {
   std::unique_lock lock(_mutex);
