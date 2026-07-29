@@ -183,7 +183,7 @@ std::unique_ptr<cudf::table> make_uint16_table(int num_rows, int seed)
 // index into this list, so a shorter list silently drops the trailing fixtures
 // from the sweep.
 constexpr std::array<char const*, 11> kFixtureNames = {
-  "i16", "u16", "i32", "i64", "u32", "u64", "f32", "f64", "u8_binary", "date", "string"};
+  "i16", "i32", "i64", "u16", "u32", "u64", "f32", "f64", "u8_binary", "date", "string"};
 
 struct fixture {
   std::string name;
@@ -203,9 +203,9 @@ std::vector<fixture> build_fixtures(rmm::cuda_stream_view stream, int n)
     fixtures.push_back(std::move(f));
   };
   add_numeric("i16", make_int16_table(n, 9));
-  add_numeric("u16", make_uint16_table(n, 10));
   add_numeric("i32", make_int32_table(1, n, 1));
   add_numeric("i64", make_int64_table(1, n, 2));
+  add_numeric("u16", make_uint16_table(n, 10));
   add_numeric("u32", make_uint32_table(1, n, 7));
   add_numeric("u64", make_uint64_table(1, n, 8));
   add_numeric("f32", make_f32_table(1, n, 3));
