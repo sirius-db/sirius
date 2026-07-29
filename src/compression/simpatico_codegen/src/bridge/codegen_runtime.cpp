@@ -921,6 +921,7 @@ static int launch_encode_fused_tree_impl(const simpatico::CodegenHead& head,
           // be INT32 regardless of the column dtype.
           const cudf::data_type bp_elem_type =
             (spec.buffers[i_min].elem_size == 8)   ? cudf::data_type(cudf::type_id::INT64)
+            : (spec.buffers[i_min].elem_size == 2) ? cudf::data_type(cudf::type_id::INT16)
             : (spec.buffers[i_min].elem_size == 1) ? cudf::data_type(cudf::type_id::UINT8)
                                                    : cudf::data_type(cudf::type_id::INT32);
           auto mins_col = std::make_unique<cudf::column>(bp_elem_type,
