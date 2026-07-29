@@ -17,6 +17,7 @@
 #pragma once
 
 #include "creator/task_creator.hpp"
+#include "data/data_repository_manager_registry.hpp"
 #include "downgrade/downgrade_executor.hpp"
 #include "memory/resource_ref_utils.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
@@ -386,12 +387,18 @@ class SiriusContext : public ClientContextState {
     /// slot nor poison the runtime.
     void finish();
 
+    /// \brief This window's query id — the key its data repositories are registered under.
+    /// Pass it to the execution path (sirius_execute_query) so operators wire into this
+    /// query's manager rather than a shared one.
+    [[nodiscard]] sirius::query_id_t query_id() const noexcept { return window_id_; }
+
    private:
     enum class scope_state : uint8_t { ACTIVE, FINISHED, FAILED };
     /// Best-effort window begin/end log line — never throws.
     void log_window_event(char const* event, char const* outcome) const noexcept;
     SiriusContext& ctx_;
-    uint64_t window_id_;
+    /// This window's query id; see sirius::query_id_t.
+    sirius::query_id_t window_id_;
     uint64_t connection_id_;
     uint64_t query_ordinal_;
     /// Pool-stat tags carrying the full window key, rendered into fixed
@@ -421,9 +428,18 @@ class SiriusContext : public ClientContextState {
   [[nodiscard]] sirius::memory::sirius_memory_reservation_manager& get_memory_manager();
   [[nodiscard]] const sirius::memory::sirius_memory_reservation_manager& get_memory_manager() const;
 
-  [[nodiscard]] cucascade::shared_data_repository_manager& get_data_repository_manager();
-  [[nodiscard]] const cucascade::shared_data_repository_manager& get_data_repository_manager()
-    const;
+  /// \brief The data repository manager owned by @p query_id's execution window.
+  /// \return The manager, or nullptr when no window is registered under that id.
+  [[nodiscard]] sirius::data::data_repository_manager_registry::manager_ptr
+  get_data_repository_manager(sirius::query_id_t query_id) const;
+
+  /// \brief Snapshot of every in-flight query's manager, ascending by query id.
+  /// Memory pressure is a global condition, so the downgrade executors sweep across all of them.
+  [[nodiscard]] std::vector<sirius::data::data_repository_manager_registry::manager_ptr>
+  get_data_repository_managers() const;
+
+  /// \brief The registry itself, for subsystems that hold a long-lived binding to it.
+  [[nodiscard]] sirius::data::data_repository_manager_registry& get_data_repository_registry();
 
   [[nodiscard]] sirius::pipeline::task_scheduler& get_task_scheduler();
   [[nodiscard]] const sirius::pipeline::task_scheduler& get_task_scheduler() const;
@@ -468,6 +484,7 @@ class SiriusContext : public ClientContextState {
   /// \param pipelines The ordered pipelines for the query.
   /// \param telemetry_info Info useful for emitting identifiable telemetry.
   void create_query(duckdb::vector<duckdb::shared_ptr<sirius::pipeline::sirius_pipeline>> pipelines,
+                    sirius::query_id_t query_id,
                     sirius::telemetry::query_telemetry_info telemetry_info);
 
   /// \brief Get the current query.
@@ -511,21 +528,24 @@ class SiriusContext : public ClientContextState {
   /// window (it releases and throws instead of running any shared mutation).
   void acquire_query_lifecycle_slot(ClientContext* context);
   void release_query_lifecycle_slot() noexcept;
-  /// The begin-of-window shared mutations (operator-id reset, task_creator
-  /// reset/bind) — runs INSIDE the held slot, per the frozen "after acquire +
-  /// health check, before final create_plan" placement.
+  /// The begin-of-window shared mutations (repository-manager registration,
+  /// task_creator reset/bind) — runs INSIDE the held slot, per the frozen
+  /// "after acquire + health check, before final create_plan" placement.
   void begin_execution_window(ClientContext& context,
+                              sirius::query_id_t query_id,
                               std::string_view window_label,
                               std::string_view pool_tag);
   /// The mandatory per-query cleanup (the former QueryEnd body, order
   /// preserved). Runs INSIDE the held slot; may throw. Only the mandatory
   /// steps (query/drain/repositories/scan/task resets) can throw out of it —
   /// telemetry and logging inside are best-effort and never abort the
-  /// remaining steps. @p end_tag keys the pool-stats log line to the window.
-  void run_mandatory_cleanup(std::string_view end_tag);
+  /// remaining steps. @p query_id selects which query's repositories to drop;
+  /// @p end_tag keys the pool-stats log line to the window.
+  void run_mandatory_cleanup(sirius::query_id_t query_id, std::string_view end_tag);
   /// noexcept variant for the StandaloneQueryScope destructor backstop: one
   /// attempt; on failure marks the runtime UNAVAILABLE.
-  void run_mandatory_cleanup_backstop(std::string_view end_tag) noexcept;
+  void run_mandatory_cleanup_backstop(sirius::query_id_t query_id,
+                                      std::string_view end_tag) noexcept;
 
   /// \brief Best-effort task_creator reset for latched-unavailable paths,
   /// where no later window will ever run the in-cleanup reset.
@@ -548,7 +568,9 @@ class SiriusContext : public ClientContextState {
   // See runtime_health: latched when a mandatory cleanup step fails.
   std::atomic<bool> runtime_unavailable_{false};
   // Monotonic execution-window id for window-keyed logging.
-  std::atomic<uint64_t> next_window_id_{0};
+  /// 32-bit to match sirius::query_id_t, which task_creator packs into the scheduling
+  /// priority. The first window gets id 1, so 0 is never a live query id.
+  std::atomic<std::uint32_t> next_window_id_{0};
   bool is_initialized_ = false;
   sirius::sirius_config config_;
   std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> memory_manager_;
@@ -588,7 +610,12 @@ class SiriusContext : public ClientContextState {
   std::optional<rmm::host_device_async_resource_ref> prev_pinned_mr_{};
   std::size_t prev_pinned_threshold_{0};
   std::shared_ptr<const sirius::telemetry::telemetry_context> telemetry_context_;
-  std::unique_ptr<cucascade::shared_data_repository_manager> data_repository_manager_;
+  /// One data repository manager per in-flight query, keyed by execution-window id.
+  /// Replaces the former single SiriusContext-wide manager so query end drops only its own
+  /// repositories. Declared here (not as a unique_ptr) because the registry itself holds no
+  /// GPU resources — the managers it owns do, and those are dropped in terminate() before the
+  /// memory manager goes away.
+  sirius::data::data_repository_manager_registry data_repository_registry_;
   std::unique_ptr<sirius::pipeline::task_scheduler> task_scheduler_;
   std::vector<std::unique_ptr<sirius::parallel::downgrade_executor>> downgrade_executors_;
   std::unique_ptr<sirius::creator::task_creator> task_creator_;

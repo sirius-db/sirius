@@ -41,13 +41,13 @@ static std::string tier_to_string(cucascade::memory::Tier tier)
 
 downgrade_executor::downgrade_executor(
   exec::downgrade_executor_config config,
-  cucascade::shared_data_repository_manager& data_repo_mgr,
+  sirius::data::data_repository_manager_registry& data_repo_registry,
   cucascade::memory::memory_space_id space_id,
   cucascade::memory::memory_space* memory_space,
   sirius::memory::sirius_memory_reservation_manager& reservation_manager,
   sirius::exec::multi_index_priority_queue<sirius::parallel::itask>* pipeline_task_queue)
   : _config(std::move(config)),
-    _data_repo_mgr(data_repo_mgr),
+    _data_repo_registry(data_repo_registry),
     _space_id(space_id),
     _memory_space(memory_space),
     _source_label(tier_to_string(space_id.tier) + ":" + std::to_string(space_id.device_id)),
@@ -200,74 +200,83 @@ void downgrade_executor::processing_loop()
     }
 
     // === TIER 1: Data repositories ===
-    // Visited in get_repositories() order — ascending {operator_id, port_id} — with early
-    // stop once the reservation is satisfied, so operator-ID numbering (a global
-    // construction counter assigned during plan generation) decides which batches spill
-    // first. get_all_convertible() snapshots eligible batches once per repo so a batch
-    // isn't re-scanned before leaving idle.
+    // Memory pressure is a global condition, so candidates are drawn from EVERY in-flight
+    // query: outer loop ascending by query id, inner loop in get_repositories() order —
+    // ascending {operator_id, port_id} — with early stop once the reservation is satisfied.
+    // Operator ids restart at 0 per query, so ordering is (query id, operator id) rather than
+    // a single global counter. This inherits "lowest query id spills first", which is
+    // arbitrary across concurrent queries; a deliberate fairness policy is still owed here.
+    // get_all_convertible() snapshots eligible batches once per repo so a batch isn't
+    // re-scanned before leaving idle. Managers are held by shared_ptr for the duration of the
+    // sweep, so a query ending concurrently cannot pull one out from under this loop.
     bool pool_interrupted = false;
-    auto repos            = _data_repo_mgr.get_repositories();
-    for (auto* repo : repos) {
-      if (req->satisfied.load()) break;
-
-      convertible_data_batch_provider provider(repo);
-      auto candidates = provider.get_all_convertible(
-        source_space, /*front_to_back=*/false, /*ignore_subscribed=*/true);
-      for (auto& candidate : candidates) {
+    for (auto const& manager : _data_repo_registry.get_all()) {
+      if (req->satisfied.load() || pool_interrupted) break;
+      auto repos = manager->get_repositories();
+      for (auto* repo : repos) {
         if (req->satisfied.load()) break;
 
-        auto candidate_bytes = candidate->bytes_in_space(source_space);
+        convertible_data_batch_provider provider(repo);
+        auto candidates = provider.get_all_convertible(
+          source_space, /*front_to_back=*/false, /*ignore_subscribed=*/true);
+        for (auto& candidate : candidates) {
+          if (req->satisfied.load()) break;
 
-        auto slot = _pool->reserve();
-        if (!slot) {
-          pool_interrupted = true;
-          break;
-        }
+          auto candidate_bytes = candidate->bytes_in_space(source_space);
 
-        // Re-check after reserve() returns -- the previous candidate's worker may
-        // have set satisfied while we were blocked waiting for a thread slot.
-        if (req->satisfied.load()) break;
+          auto slot = _pool->reserve();
+          if (!slot) {
+            pool_interrupted = true;
+            break;
+          }
 
-        auto exc_stream = _stream_pool->acquire_stream(
-          cucascade::memory::exclusive_stream_pool::stream_acquire_policy::GROW);
+          // Re-check after reserve() returns -- the previous candidate's worker may
+          // have set satisfied while we were blocked waiting for a thread slot.
+          if (req->satisfied.load()) break;
 
-        _pool->dispatch(
-          std::move(slot),
-          [cand       = std::move(candidate),
-           req_ptr    = req.get(),
-           &res_mgr   = _reservation_manager,
-           &targets   = target_spaces,
-           exc_stream = std::move(exc_stream),
-           candidate_bytes,
-           host_end_idx,
-           &repo_stats,
-           &host_target_stats,
-           &disk_target_stats]() mutable {
-            try {
-              auto result = cand->convert(targets, exc_stream, res_mgr, false);
-              if (result) {
-                req_ptr->bytes_freed.fetch_add(candidate_bytes, std::memory_order_relaxed);
-                req_ptr->batches_downgraded.fetch_add(1, std::memory_order_relaxed);
-                repo_stats.batches.fetch_add(1, std::memory_order_relaxed);
-                repo_stats.bytes.fetch_add(candidate_bytes, std::memory_order_relaxed);
-                for (size_t i = 0; i < result->size(); ++i) {
-                  if ((*result)[i] == 0) continue;
-                  if (i < host_end_idx) {
-                    host_target_stats.batches.fetch_add(1, std::memory_order_relaxed);
-                    host_target_stats.bytes.fetch_add((*result)[i], std::memory_order_relaxed);
-                  } else {
-                    disk_target_stats.batches.fetch_add(1, std::memory_order_relaxed);
-                    disk_target_stats.bytes.fetch_add((*result)[i], std::memory_order_relaxed);
+          auto exc_stream = _stream_pool->acquire_stream(
+            cucascade::memory::exclusive_stream_pool::stream_acquire_policy::GROW);
+
+          _pool->dispatch(
+            std::move(slot),
+            [cand       = std::move(candidate),
+             req_ptr    = req.get(),
+             &res_mgr   = _reservation_manager,
+             &targets   = target_spaces,
+             exc_stream = std::move(exc_stream),
+             candidate_bytes,
+             host_end_idx,
+             &repo_stats,
+             &host_target_stats,
+             &disk_target_stats]() mutable {
+              try {
+                auto result = cand->convert(targets, exc_stream, res_mgr, false);
+                if (result) {
+                  req_ptr->bytes_freed.fetch_add(candidate_bytes, std::memory_order_relaxed);
+                  req_ptr->batches_downgraded.fetch_add(1, std::memory_order_relaxed);
+                  repo_stats.batches.fetch_add(1, std::memory_order_relaxed);
+                  repo_stats.bytes.fetch_add(candidate_bytes, std::memory_order_relaxed);
+                  for (size_t i = 0; i < result->size(); ++i) {
+                    if ((*result)[i] == 0) continue;
+                    if (i < host_end_idx) {
+                      host_target_stats.batches.fetch_add(1, std::memory_order_relaxed);
+                      host_target_stats.bytes.fetch_add((*result)[i], std::memory_order_relaxed);
+                    } else {
+                      disk_target_stats.batches.fetch_add(1, std::memory_order_relaxed);
+                      disk_target_stats.bytes.fetch_add((*result)[i], std::memory_order_relaxed);
+                    }
+                  }
+                  if (req_ptr->predicate && req_ptr->predicate()) {
+                    req_ptr->satisfied.store(true);
                   }
                 }
-                if (req_ptr->predicate && req_ptr->predicate()) { req_ptr->satisfied.store(true); }
+              } catch (const std::exception& e) {
+                SIRIUS_LOG_ERROR("[downgrade] convert failed from data repository: {}", e.what());
               }
-            } catch (const std::exception& e) {
-              SIRIUS_LOG_ERROR("[downgrade] convert failed from data repository: {}", e.what());
-            }
-          });
+            });
+        }
+        if (pool_interrupted) break;
       }
-      if (pool_interrupted) break;
     }
 
     // === TIER 2: task_scheduler task queue ===

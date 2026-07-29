@@ -270,6 +270,7 @@ void SiriusContext::throw_runtime_unavailable() const
 }
 
 void SiriusContext::begin_execution_window(ClientContext& context,
+                                           sirius::query_id_t query_id,
                                            std::string_view window_label,
                                            std::string_view pool_tag)
 {
@@ -284,11 +285,15 @@ void SiriusContext::begin_execution_window(ClientContext& context,
     SIRIUS_LOG_INFO("QueryBegin: {}", window_label);
   } catch (...) {  // best-effort observability
   }
+  // Register this window's repository manager up front so "inside a window implies a manager
+  // exists" holds for every path. Windows that never wire repositories (pin_table, the FFI
+  // entry point) just carry an empty one; run_mandatory_cleanup erases it either way.
+  data_repository_registry_.create_for_query(query_id);
   task_creator_->reset();
   task_creator_->set_client_context(context);
 }
 
-void SiriusContext::run_mandatory_cleanup(std::string_view end_tag)
+void SiriusContext::run_mandatory_cleanup(sirius::query_id_t query_id, std::string_view end_tag)
 {
   // Observability inside the cleanup is best-effort: only the mandatory steps
   // (query/drain/repository/scan/task resets) may throw out of this function
@@ -320,15 +325,18 @@ void SiriusContext::run_mandatory_cleanup(std::string_view end_tag)
   } catch (...) {
   }
 
-  // Clear all data repositories between queries.
+  // Drop THIS query's data repositories, leaving any other in-flight query's untouched.
   // Any batches still present are leaked — operators should have popped everything.
-  if (data_repository_manager_) {
-    auto leaked = data_repository_manager_->clear_all_repositories();
+  // Safe to clear here because the downgrade executors were drained above, so nothing still
+  // holds a raw data_repository* borrowed from this query's manager.
+  {
+    auto leaked = data_repository_registry_.erase(query_id);
     try {
       for (auto const& info : leaked) {
         SIRIUS_LOG_WARN(
-          "SiriusContext::run_mandatory_cleanup: operator {} port '{}' still had {} un-consumed "
-          "data batch(es) (memory leak).",
+          "SiriusContext::run_mandatory_cleanup: query {} operator {} port '{}' still had {} "
+          "un-consumed data batch(es) (memory leak).",
+          query_id,
           info.operator_id,
           info.port_id,
           info.count);
@@ -357,10 +365,11 @@ void SiriusContext::run_mandatory_cleanup(std::string_view end_tag)
   }
 }
 
-void SiriusContext::run_mandatory_cleanup_backstop(std::string_view end_tag) noexcept
+void SiriusContext::run_mandatory_cleanup_backstop(sirius::query_id_t query_id,
+                                                   std::string_view end_tag) noexcept
 {
   try {
-    run_mandatory_cleanup(end_tag);
+    run_mandatory_cleanup(query_id, end_tag);
   } catch (std::exception& e) {
     mark_runtime_unavailable();
     drop_task_creator_state_best_effort();
@@ -420,7 +429,7 @@ void SiriusContext::StandaloneQueryScope::log_window_event(char const* event,
 SiriusContext::StandaloneQueryScope::StandaloneQueryScope(SiriusContext& ctx,
                                                           ClientContext& context,
                                                           std::string_view window_label)
-  : ctx_(ctx), window_id_(0), connection_id_(0), query_ordinal_(0)
+  : ctx_(ctx), window_id_(sirius::make_query_id(0)), connection_id_(0), query_ordinal_(0)
 {
   if (auto conn_state = get_sirius_connection_state(context)) {
     connection_id_ = conn_state->connection_id();
@@ -429,26 +438,27 @@ SiriusContext::StandaloneQueryScope::StandaloneQueryScope(SiriusContext& ctx,
   // Window id + keyed tags are prepared BEFORE the slot is acquired: after
   // acquire, no statement on any path allocates, so release cannot be skipped
   // (and the noexcept destructor cannot terminate) for an allocation reason.
-  window_id_ = ctx_.next_window_id_.fetch_add(1, std::memory_order_relaxed) + 1;
+  window_id_ =
+    sirius::make_query_id(ctx_.next_window_id_.fetch_add(1, std::memory_order_relaxed) + 1);
   std::snprintf(begin_tag_,
                 sizeof(begin_tag_),
                 "QueryBegin instance=%p connection=%llu window=%llu query=%llu",
                 static_cast<const void*>(&ctx_),
                 static_cast<unsigned long long>(connection_id_),
-                static_cast<unsigned long long>(window_id_),
+                static_cast<unsigned long long>(sirius::value_of(window_id_)),
                 static_cast<unsigned long long>(query_ordinal_));
   std::snprintf(end_tag_,
                 sizeof(end_tag_),
                 "QueryEnd instance=%p connection=%llu window=%llu query=%llu",
                 static_cast<const void*>(&ctx_),
                 static_cast<unsigned long long>(connection_id_),
-                static_cast<unsigned long long>(window_id_),
+                static_cast<unsigned long long>(sirius::value_of(window_id_)),
                 static_cast<unsigned long long>(query_ordinal_));
 
   ctx_.acquire_query_lifecycle_slot(&context);
   log_window_event("begin", "-");
   try {
-    ctx_.begin_execution_window(context, window_label, begin_tag_);
+    ctx_.begin_execution_window(context, window_id_, window_label, begin_tag_);
   } catch (std::exception& e) {
     // A failed begin may have left the shared runtime part-mutated. This must
     // NEVER be classified as an ordinary GPU failure (which entry points would
@@ -457,7 +467,7 @@ SiriusContext::StandaloneQueryScope::StandaloneQueryScope(SiriusContext& ctx,
     // catch blocks rethrow it as-is instead of falling back.
     state_ = scope_state::FAILED;
     ctx_.mark_runtime_unavailable();
-    ctx_.run_mandatory_cleanup_backstop(end_tag_);
+    ctx_.run_mandatory_cleanup_backstop(window_id_, end_tag_);
     log_window_event("end", "begin_failed");
     ctx_.release_query_lifecycle_slot();
     throw SiriusBeginWindowFailureException(
@@ -466,7 +476,7 @@ SiriusContext::StandaloneQueryScope::StandaloneQueryScope(SiriusContext& ctx,
   } catch (...) {
     state_ = scope_state::FAILED;
     ctx_.mark_runtime_unavailable();
-    ctx_.run_mandatory_cleanup_backstop(end_tag_);
+    ctx_.run_mandatory_cleanup_backstop(window_id_, end_tag_);
     log_window_event("end", "begin_failed");
     ctx_.release_query_lifecycle_slot();
     throw SiriusBeginWindowFailureException(
@@ -487,7 +497,7 @@ void SiriusContext::StandaloneQueryScope::finish()
   } releaser{ctx_};
 
   try {
-    ctx_.run_mandatory_cleanup(end_tag_);
+    ctx_.run_mandatory_cleanup(window_id_, end_tag_);
   } catch (...) {
     // A mandatory-cleanup failure means the shared runtime can no longer be
     // trusted; the destructor must NOT run a second pass over half-cleaned
@@ -513,7 +523,7 @@ SiriusContext::StandaloneQueryScope::~StandaloneQueryScope() noexcept
   // One backstop cleanup attempt; on failure the runtime is latched
   // unavailable. The slot is released exactly once either way; logging is
   // noexcept-wrapped so the destructor can never terminate.
-  ctx_.run_mandatory_cleanup_backstop(end_tag_);
+  ctx_.run_mandatory_cleanup_backstop(window_id_, end_tag_);
   log_window_event("end", "unwind");
   ctx_.release_query_lifecycle_slot();
   state_ = scope_state::FAILED;
@@ -704,7 +714,8 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
     }
   }
 
-  data_repository_manager_ = std::make_unique<cucascade::shared_data_repository_manager>();
+  // Managers are created per execution window (begin_execution_window), not here; the registry
+  // starts empty and only ever holds entries for in-flight queries.
 
   // Create one downgrade executor per GPU memory space BEFORE task_scheduler,
   // so pointers are available for injection into gpu_pipeline_executors.
@@ -730,7 +741,7 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
       }
       auto executor = std::make_unique<sirius::parallel::downgrade_executor>(
         dg_cfg,
-        *data_repository_manager_,
+        data_repository_registry_,
         space->get_id(),
         const_cast<cucascade::memory::memory_space*>(space),
         *memory_manager_);
@@ -803,8 +814,10 @@ void SiriusContext::terminate()
 
   scan_manager_.reset();
 
-  // Drop any remaining repositories while the memory manager is still alive.
-  data_repository_manager_.reset();
+  // Drop any remaining per-query repositories while the memory manager is still alive. The
+  // downgrade executors (the only other holders of a manager reference) were stopped above, so
+  // no borrower can outlive this.
+  data_repository_registry_.clear();
 
   // Restore the previous cuDF pinned memory resource and threshold before destroying the
   // slab allocator — cuDF holds a non-owning reference and would dangle after reset().
@@ -841,16 +854,24 @@ const sirius::memory::sirius_memory_reservation_manager& SiriusContext::get_memo
   return *memory_manager_;
 }
 
-cucascade::shared_data_repository_manager& SiriusContext::get_data_repository_manager()
+sirius::data::data_repository_manager_registry::manager_ptr
+SiriusContext::get_data_repository_manager(sirius::query_id_t query_id) const
 {
   throw_if_not_initialized();
-  return *data_repository_manager_;
+  return data_repository_registry_.get(query_id);
 }
 
-const cucascade::shared_data_repository_manager& SiriusContext::get_data_repository_manager() const
+std::vector<sirius::data::data_repository_manager_registry::manager_ptr>
+SiriusContext::get_data_repository_managers() const
 {
   throw_if_not_initialized();
-  return *data_repository_manager_;
+  return data_repository_registry_.get_all();
+}
+
+sirius::data::data_repository_manager_registry& SiriusContext::get_data_repository_registry()
+{
+  throw_if_not_initialized();
+  return data_repository_registry_;
 }
 
 sirius::pipeline::task_scheduler& SiriusContext::get_task_scheduler()
@@ -925,11 +946,12 @@ std::shared_ptr<const sirius::telemetry::telemetry_context> SiriusContext::get_t
 
 void SiriusContext::create_query(
   duckdb::vector<duckdb::shared_ptr<sirius::pipeline::sirius_pipeline>> pipelines,
+  sirius::query_id_t query_id,
   sirius::telemetry::query_telemetry_info telemetry_info)
 {
   throw_if_not_initialized();
   query_ = duckdb::make_shared_ptr<sirius::planner::query>(
-    std::move(pipelines), telemetry_context_->context(), telemetry_info);
+    std::move(pipelines), telemetry_context_->context(), query_id, telemetry_info);
   task_scheduler_->prepare_for_query(query_);
   task_creator_->prepare_for_query(*query_);
   scan_manager_->prepare_for_query(*query_,

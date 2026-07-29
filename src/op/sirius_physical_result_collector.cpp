@@ -162,9 +162,12 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
           return a->get_available_memory() < b->get_available_memory();
         });
 
-      auto& registry      = sirius::converter_registry::get();
-      auto& data_repo_mgr = sirius_ctx->get_data_repository_manager();
-      auto next_batch_id  = data_repo_mgr.get_next_data_batch_id();
+      auto& registry = sirius::converter_registry::get();
+      // Use the process-wide batch-id counter that every other producer uses
+      // (sirius::get_next_batch_id, data_batch_utils.hpp) rather than a repository manager's
+      // own counter: managers are now per-query, so a manager-local counter would restart at 0
+      // for each query and collide with ids already present in a repository.
+      auto next_batch_id = sirius::get_next_batch_id();
 
       auto host_reservation =
         const_cast<cucascade::memory::memory_space*>(mem_space)->make_reservation_or_null(
