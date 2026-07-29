@@ -242,12 +242,12 @@ std::unique_ptr<cudf::column> compact_bitpack_packed(cudf::column const& chunk_c
 
   // The decode bit-unpack gather (simpatico_bitunpack_one) loads three
   // consecutive uint32 words unconditionally, so decoding the last element of
-  // the last chunk touches up to two uint32 words past the live packed bytes.
-  // Allocate that much readable trailing slack (masked out of every decoded
-  // value); without it the gather over-reads the dense allocation — a real OOB
-  // caught by compute-sanitizer. The column's logical size stays ``live`` so
-  // serialization remains tight.
-  constexpr std::size_t kDecodeGatherSlackBytes = 2 * sizeof(std::uint32_t);
+  // simpatico_bitunpack_one unconditionally loads three consecutive uint32 words
+  // (w0, w1, w2) starting at word_in, so the last valid element can touch up to
+  // two words past the last live word.  Allocate three words of trailing slack
+  // (zero-initialised) so all three loads are always within the allocation.
+  // The column's logical size stays ``live`` so serialization remains tight.
+  constexpr std::size_t kDecodeGatherSlackBytes = 3 * sizeof(std::uint32_t);
 
   rmm::device_buffer dense(live + kDecodeGatherSlackBytes, stream, mr);
   if (live > 0) {
