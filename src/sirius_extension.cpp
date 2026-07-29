@@ -2101,6 +2101,7 @@ static void SetEnableCompressedMaterialization(ClientContext& context,
 {
   auto* params = get_operator_params(context);
   if (!params) { return; }
+  auto slot                                 = lock_operator_params_slot(context);
   params->enable_compressed_materialization = BooleanValue::Get(parameter);
   SIRIUS_LOG_DEBUG("Updated config ENABLE_COMPRESSED_MATERIALIZATION to {}",
                    params->enable_compressed_materialization);

@@ -217,10 +217,11 @@ inline cudf::data_type get_cudf_type(const logical_type& t)
  * @brief Native cuDF mapping of @p t, or nullopt when the logical type has no cuDF carrier.
  *
  * The optional-returning counterpart of `get_cudf_type` for callers that treat an unmappable type
- * as a fallback signal rather than an error.
+ * as a fallback signal rather than an error. Only that signal is absorbed: `get_cudf_type` builds
+ * its message by formatting the type name, so an allocation failure there still propagates rather
+ * than being reported as an unmappable type.
  */
-[[nodiscard]] inline std::optional<cudf::data_type> try_get_cudf_type(
-  const logical_type& t) noexcept
+[[nodiscard]] inline std::optional<cudf::data_type> try_get_cudf_type(const logical_type& t)
 {
   try {
     return get_cudf_type(t);

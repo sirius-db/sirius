@@ -304,8 +304,8 @@ void validate_recorded_column_storage(sirius::pinned_column_storage_matrix const
 /// pinned_column_narrowed_in_all_chunks passes AND every recorded carrier is a strict same-family
 /// narrowing of @p native_type (can_narrow_to, the defense against metadata that contradicts the
 /// pin-time logical type). Chunks narrower than the returned target widen at serve through the
-/// verified same-family restore. Non-owning read of the entry; same single-threaded
-/// query-lifecycle discipline as visit_pinned_entries.
+/// verified same-family restore. Non-owning read of @p entry: obtain and read it inside one
+/// slot-scoped window, and never hold it across a pin or unpin.
 [[nodiscard]] std::optional<cudf::data_type> pinned_column_narrow_carrier(
   pinned_entry const& entry, std::size_t entry_position, cudf::data_type native_type);
 
@@ -570,11 +570,10 @@ class sirius_scan_manager {
     std::string_view catalog_name, std::string_view schema_name, std::string_view table_name) const;
 
   /// The pinned entry whose parquet identity matches @p resolved_file_paths
-  /// (cache_entry_info::matches_parquet_files), or nullptr. Non-owning; valid
-  /// only until the next pin/unpin — the same single-threaded query-lifecycle
-  /// discipline as visit_pinned_entries. First match wins if one file set was
-  /// pinned under two names. Read by the plan-time compressed-materialization
-  /// residency gate.
+  /// (cache_entry_info::matches_parquet_files), or nullptr. Non-owning; obtain
+  /// and read it inside one slot-scoped window, and never hold it across a pin
+  /// or unpin. First match wins if one file set was pinned under two names.
+  /// Read by the plan-time compressed-materialization residency gate.
   [[nodiscard]] pinned_entry const* find_pinned_entry_for_parquet_files(
     std::span<std::string const> resolved_file_paths) const;
 

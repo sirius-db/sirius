@@ -234,6 +234,16 @@ duckdb::unique_ptr<duckdb::QueryResult> sirius_interface::sirius_execute_query(
     SIRIUS_LOG_DEBUG("Done sirius_execute_query");
 
     return result;
+  } catch (duckdb::SiriusBeginWindowFailureException&) {
+    // Rethrown with its dynamic type intact: this query may have part-mutated the shared runtime,
+    // so the entry points must abort it rather than fall back to CPU.
+    if (sirius_active_query) { cleanup_internal(nullptr, false); }
+    throw;
+  } catch (duckdb::SiriusRuntimeUnavailableException&) {
+    // Rethrown with its dynamic type intact: the entry points route it to the CPU fallback that
+    // preserves its message, which an error-carrying result would let the S3 branch rewrite.
+    if (sirius_active_query) { cleanup_internal(nullptr, false); }
+    throw;
   } catch (std::exception& e) {
     if (sirius_active_query) { cleanup_internal(nullptr, false); }
     return sirius_error_result<duckdb::MaterializedQueryResult>(duckdb::ErrorData(e));
