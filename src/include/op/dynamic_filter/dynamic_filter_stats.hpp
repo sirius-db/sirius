@@ -29,6 +29,8 @@ namespace sirius::op {
  * publication tasks have quiesced.
  */
 struct dynamic_filter_stats_snapshot {
+  std::uint64_t producers_enabled = 0;
+
   std::uint64_t keys_considered            = 0;
   std::uint64_t keys_with_known_domain     = 0;
   std::uint64_t keys_skipped_domain_gate   = 0;
@@ -37,7 +39,6 @@ struct dynamic_filter_stats_snapshot {
   std::uint64_t membership_filters_built   = 0;
   std::uint64_t zone_map_filters_built     = 0;
 
-  std::uint64_t producers_enabled                        = 0;
   std::uint64_t publication_attempts                     = 0;
   std::uint64_t publications_finished                    = 0;
   std::uint64_t publications_failed                      = 0;
@@ -54,29 +55,34 @@ struct dynamic_filter_stats_snapshot {
  * owning `SiriusContext` outlives every plan built during a query -- the same lifetime contract as
  * `dynamic_filter_replica_space`.
  *
- * The fields split into two families, and tests must respect the split. The first family records
- * deterministic policy decisions: for a fixed query, settings, and data they are reproducible
- * run-to-run, and they are the assertion anchors for gate regressions and the rollback evidence.
- * They move only for attempts that reach per-key processing -- an attempt vetoed earlier (source
- * not GPU-resident, or every target already drained) moves only its own opportunistic counter.
- * The second family records opportunistic delivery, which races with probe-side draining; assert
- * it only as deltas or directions, never as equality anchors.
+ * The fields have three timing classes.
+ *
+ * `producers_enabled` is a plan-time fact. `sirius_physical_hash_join` increments it when
+ * constructed with an enabled `dynamic_filter_publish_plan`, before execution begins.
+ *
+ * The key and filter counters record policy decisions for attempts that reach per-key processing. A
+ * source-residency or all-targets-drained return occurs earlier and does not increment them.
+ *
+ * The publication and delivery counters may vary with probe-side draining and target lifetime. Each
+ * atomic is coherent independently; `snapshot()` does not provide a transactionally consistent view
+ * across fields.
  */
 struct dynamic_filter_stats {
+  // Plan-time fact
+  std::atomic<std::uint64_t> producers_enabled{0};  ///< Joins constructed with an enabled plan
+
   // Deterministic policy decisions
-  std::atomic<std::uint64_t> keys_considered{0};  ///< Admitted keys walked by publication attempts
-  std::atomic<std::uint64_t> keys_with_known_domain{0};  ///< Keys carrying a nonzero domain -- the
-                                                         ///< gate-liveness (anti-inertness) signal
+  std::atomic<std::uint64_t> keys_considered{0};  ///< Bound admitted keys walked by publication
+                                                  ///< attempts
+  std::atomic<std::uint64_t> keys_with_known_domain{0};      ///< Keys carrying a nonzero domain
   std::atomic<std::uint64_t> keys_skipped_domain_gate{0};    ///< Coverage gate fired
   std::atomic<std::uint64_t> keys_skipped_type_mismatch{0};  ///< Plan/runtime type disagreement
-  std::atomic<std::uint64_t> keys_build_exceeded_domain{0};  ///< Direct Invariant-N violation
-                                                             ///< count: build rows above the
-                                                             ///< domain bound
+  std::atomic<std::uint64_t> keys_build_exceeded_domain{0};  ///< Build row count exceeded the
+                                                             ///< recorded domain bound
   std::atomic<std::uint64_t> membership_filters_built{0};    ///< Constructed, before delivery
   std::atomic<std::uint64_t> zone_map_filters_built{0};      ///< Constructed, before delivery
 
   // Opportunistic delivery
-  std::atomic<std::uint64_t> producers_enabled{0};     ///< Joins constructed with an enabled plan
   std::atomic<std::uint64_t> publication_attempts{0};  ///< OPEN -> PUBLISHING claims
   std::atomic<std::uint64_t> publications_finished{0};
   std::atomic<std::uint64_t> publications_failed{0};
@@ -89,6 +95,7 @@ struct dynamic_filter_stats {
   [[nodiscard]] dynamic_filter_stats_snapshot snapshot() const noexcept
   {
     return dynamic_filter_stats_snapshot{
+      .producers_enabled          = producers_enabled.load(std::memory_order_relaxed),
       .keys_considered            = keys_considered.load(std::memory_order_relaxed),
       .keys_with_known_domain     = keys_with_known_domain.load(std::memory_order_relaxed),
       .keys_skipped_domain_gate   = keys_skipped_domain_gate.load(std::memory_order_relaxed),
@@ -96,7 +103,6 @@ struct dynamic_filter_stats {
       .keys_build_exceeded_domain = keys_build_exceeded_domain.load(std::memory_order_relaxed),
       .membership_filters_built   = membership_filters_built.load(std::memory_order_relaxed),
       .zone_map_filters_built     = zone_map_filters_built.load(std::memory_order_relaxed),
-      .producers_enabled          = producers_enabled.load(std::memory_order_relaxed),
       .publication_attempts       = publication_attempts.load(std::memory_order_relaxed),
       .publications_finished      = publications_finished.load(std::memory_order_relaxed),
       .publications_failed        = publications_failed.load(std::memory_order_relaxed),

@@ -45,6 +45,24 @@
 
 namespace sirius::test {
 
+/// Collect all rows as sorted vectors of stringified values for deterministic comparison. Sorting
+/// makes the comparison a row bag, so an ORDER BY-free query is compared by content, not by the
+/// order the engine happened to emit.
+inline std::vector<std::vector<std::string>> collect_rows(duckdb::MaterializedQueryResult& result)
+{
+  std::vector<std::vector<std::string>> rows;
+  for (duckdb::idx_t r = 0; r < result.RowCount(); r++) {
+    std::vector<std::string> row;
+    row.reserve(result.ColumnCount());
+    for (duckdb::idx_t c = 0; c < result.ColumnCount(); c++) {
+      row.push_back(result.GetValue(c, r).ToString());
+    }
+    rows.push_back(std::move(row));
+  }
+  std::sort(rows.begin(), rows.end());
+  return rows;
+}
+
 /// RAII guard that points Sirius at a config file for the lifetime of a fixture
 /// that spins up its own (non-shared) host database.
 struct sirius_config_env_guard {
@@ -125,20 +143,10 @@ class GpuExecutionFixture {
     REQUIRE_FALSE(result->HasError());
   }
 
-  /// Collect all rows as sorted vectors of stringified values for deterministic comparison.
+  /// @copydoc sirius::test::collect_rows
   static std::vector<std::vector<std::string>> collect_rows(duckdb::MaterializedQueryResult& result)
   {
-    std::vector<std::vector<std::string>> rows;
-    for (duckdb::idx_t r = 0; r < result.RowCount(); r++) {
-      std::vector<std::string> row;
-      row.reserve(result.ColumnCount());
-      for (duckdb::idx_t c = 0; c < result.ColumnCount(); c++) {
-        row.push_back(result.GetValue(c, r).ToString());
-      }
-      rows.push_back(std::move(row));
-    }
-    std::sort(rows.begin(), rows.end());
-    return rows;
+    return sirius::test::collect_rows(result);
   }
 
   void compare_gpu_vs_cpu(const std::string& query)

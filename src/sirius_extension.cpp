@@ -1709,6 +1709,15 @@ static void SetEnableDynamicZoneMapFilter(ClientContext& context, SetScope scope
                    params->enable_dynamic_zone_map_filter);
 }
 
+static void SetEnableDynamicFilterSip(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  params->enable_dynamic_filter_sip = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config ENABLE_DYNAMIC_FILTER_SIP to {}",
+                   params->enable_dynamic_filter_sip);
+}
+
 static void SetDynamicFilterDomainCoverageThreshold(ClientContext& context,
                                                     SetScope scope,
                                                     Value& parameter)
@@ -1962,6 +1971,13 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
     LogicalType::BOOLEAN,
     Value::BOOLEAN(sirius::operator_params{}.enable_dynamic_filter_pushdown),
     SetEnableDynamicFilterPushdown);
+
+  config.AddExtensionOption(
+    "enable_dynamic_filter_sip",
+    "[TEMPORARY] Extended dynamic filter (Sideways Information Passing, SIP)",
+    LogicalType::BOOLEAN,
+    Value::BOOLEAN(sirius::operator_params{}.enable_dynamic_filter_sip),
+    SetEnableDynamicFilterSip);
 
   config.AddExtensionOption(
     "enable_dynamic_zone_map_filter",

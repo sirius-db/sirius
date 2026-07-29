@@ -40,10 +40,8 @@ SELECT l_returnflag, SUM(l_quantity) FROM lineitem GROUP BY l_returnflag;
 | [Configuration](configuration.md) | sirius_config, operator_params, SET variables |
 | [Optimizations](optimizations.md) | Performance optimizations with PRs, code paths, configs |
 | [Multi-GPU Architecture](multi-gpu-architecture.md) | How Sirius executes SQL across every GPU on a node — tiers, pin tables, SCHED-RR, cross-GPU transfers, downgrade, concurrency invariants |
-| [Dynamic Filters](dynamic-filters.md) | Ordered hash-build publication, zone-map/IN-list/Bloom consumers, multi-GPU replicas, and future SIP/refinement design |
+| [Dynamic Filters](dynamic-filters.md) | Ordered hash-build publication, zone-map/IN-list/Bloom consumers, multi-GPU replicas, join-edge (SIP) endpoint placement, and the refinement design that remains future work |
 | [Dynamic Filters — Multi-GPU](dynamic-filters-multi-gpu.md) | Device-local replica fan-out, peer-DMA/HOST-staging routes, ownership contracts, and two-GPU validation |
-| [Dynamic Filters — SIP Code Flow](issue-1010-r1b-code-flow.md) | Reviewer's map of the dynamic-filter path for issue #1010: plan-time ownership transfer, the domain-coverage gate, the coordinate spaces, runtime publication, consumers, observability, and the validation map |
-| [Dynamic Filters — SIP Benchmark Gates](issue-1010-dynamic-filter-sip-benchmark-gates.md) | Pre-registered benchmark protocol, numeric rollout gates, and rollback triggers for issue #1010, recorded before any R2 measurement |
 | [Debugging](debugging.md) | Practical guide to debugging crashes and races — building/running with ASan & TSan, the `tsan.supp` file, and capturing/inspecting core dumps with gdb |
 
 ## Suggested Reading Order

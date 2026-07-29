@@ -138,6 +138,11 @@ struct operator_params {
   /// clustered-keyset joins whose narrow key range is runtime-determined.
   bool enable_dynamic_zone_map_filter = false;
 
+  /// TEMPORARY dark-launch toggle for sideways information passing (SIP) [the extension to phase 1
+  /// dynamic filters]. This and the other dynamic-filter switch (enable_dynamic_filter_pushdown)
+  /// collapse into a single flag when this work merges.
+  bool enable_dynamic_filter_sip = false;
+
   /// Skip publishing a key's membership filter when the build covers at least this fraction of
   /// the key's unfiltered base-table row bound. The gate fires only for build keys proven unique
   /// in their base relation, with evidence from DuckDB-native table scans; everywhere else it is

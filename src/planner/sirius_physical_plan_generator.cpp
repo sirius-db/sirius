@@ -73,15 +73,6 @@ bool is_nested_logical_type(duckdb::LogicalType const& type)
          id == duckdb::LogicalTypeId::MAP;
 }
 
-/// Read the dynamic-filter-pushdown enable flag from the active SiriusContext config. Defaults to
-/// disabled when the state is unavailable (no config to consult outside a configured query).
-bool dynamic_filter_pushdown_enabled(duckdb::ClientContext& context)
-{
-  auto state = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
-  if (!state) { return false; }
-  return state->get_config().get_operator_params().enable_dynamic_filter_pushdown;
-}
-
 //! Insert `factory(std::move(parent.children[i]))` between `parent` and its i-th child. The
 //! factory takes ownership of the original child and must return a wrapper subtree that
 //! already holds the original as a descendant.
@@ -233,7 +224,10 @@ build_duckdb_native_table_info(sirius::op::sirius_physical_table_scan& scan_op,
 //! behavioral input here: a parquet scan already evaluated AST-capable filters (zone maps)
 //! through the reader's `set_filter`, so it wraps in `membership_masks_only`; a duckdb-native
 //! scan has no read-time dynamic path, so it wraps in `include_ast_row_masks` to also evaluate
-//! zone maps row-wise. Filters are elided when no producer ultimately registered — this runs
+//! zone maps row-wise. The `has_producers()` consult enforces the elision invariant: a channel
+//! that never gained a producer is shed before pipelines are built. The discovery walk attaches a
+//! channel and registers its producer in one step, so every attached channel has a producer by
+//! construction; the consult stays as the enforcement against future attach paths. This runs
 //! after the whole tree is built, so `has_producers()` is settled.
 template <typename InfoT>
 duckdb::unique_ptr<sirius::op::sirius_physical_operator> make_gpu_scan_leaf(
@@ -706,19 +700,6 @@ sirius_physical_plan_generator::sirius_physical_plan_generator(duckdb::ClientCon
 }
 
 sirius_physical_plan_generator::~sirius_physical_plan_generator() {}
-
-std::shared_ptr<sirius::op::sirius_dynamic_filter_set>
-sirius_physical_plan_generator::get_or_create_dynamic_filter_channel(
-  duckdb::DynamicTableFilterSet const* key)
-{
-  if (!key) { return nullptr; }
-  // Central gate: when dynamic-filter pushdown is disabled, return no channel so neither the
-  // producer (join) nor the consumer (scan) wires anything.
-  if (!dynamic_filter_pushdown_enabled(context)) { return nullptr; }
-  auto [it, inserted] = dynamic_filter_channels.try_emplace(key, nullptr);
-  if (inserted) { it->second = std::make_shared<sirius::op::sirius_dynamic_filter_set>(); }
-  return it->second;
-}
 
 void sirius_physical_plan_generator::set_parent_ops(sirius::op::sirius_physical_operator& op,
                                                     sirius::op::sirius_physical_operator* parent)

@@ -60,12 +60,10 @@ enum class sirius_dynamic_filter_kind { ZONE_MAP, IN_LIST, BLOOM };
  * Produced by some upstream operator (e.g., a hash-join build) and delivered to a downstream
  * consumer (e.g., a parquet scan) through a @ref sirius_dynamic_filter_set.
  *
- * Concrete filters expose their consumer-side capabilities by inheriting from one or more
- * capability mixins: @ref sirius_ast_lowerable for reader/AST predicates and @ref
- * sirius_mask_applicable for post-decode masks. The base class carries only the kind tag because
- * not every filter kind supports every application path -- for example, a Bloom filter cannot
- * produce a cuDF AST fragment. Consumers `dynamic_cast` a @ref sirius_dynamic_filter pointer to the
- * capability they need; a failed cast means the filter does not support that path.
+ * The base class supplies the kind tag. Concrete filters expose consumer capabilities through
+ * @ref sirius_ast_lowerable and @ref sirius_mask_applicable. Consumers `dynamic_cast` a
+ * @ref sirius_dynamic_filter pointer to the required capability; a failed cast marks that path as
+ * unsupported.
  */
 class sirius_dynamic_filter {
  public:
@@ -175,12 +173,10 @@ struct zone_map_entry {
  *
  * Lowers to `OR_i ( min_i <= col AND col <= max_i )` (or strict variants based on `inclusive_*`).
  *
- * @note A degenerate single-zone (N=1) filter is the simplest case and is equivalent to a global
- * min/max range. The representation can retain multiple independently supplied ranges, but the
- * current hash-join publisher supplies one global zone per key.
+ * `dynamic_filter_publisher` currently supplies one global range per key. The representation also
+ * accepts multiple ranges and combines them with OR.
  *
- * @pre At least one zone must be supplied; every zone's `min` and `max` must be non-null and share
- * the same @ref cudf::data_type as the column being filtered.
+ * @pre Every bound has the same @ref cudf::data_type as the consumer column.
  */
 class sirius_dynamic_zone_map_filter final : public sirius_dynamic_filter,
                                              public sirius_ast_lowerable,
@@ -191,9 +187,9 @@ class sirius_dynamic_zone_map_filter final : public sirius_dynamic_filter,
    *
    * @throw std::invalid_argument if @p zones is empty or any zone has a null bound
    *
-   * @param[in] zones One entry per zone (ownership transferred).
-   * @param[in] inclusive_min If true, the lower comparison is `GREATER_EQUAL`; else `GREATER`.
-   * @param[in] inclusive_max If true, the upper comparison is `LESS_EQUAL`; else `LESS`.
+   * @param[in] zones Non-empty zone vector with non-null bounds; ownership transfers to the filter
+   * @param[in] inclusive_min Whether the lower comparison includes the bound
+   * @param[in] inclusive_max Whether the upper comparison includes the bound
    */
   explicit sirius_dynamic_zone_map_filter(std::vector<zone_map_entry> zones,
                                           bool inclusive_min = true,
@@ -270,8 +266,7 @@ class sirius_mask_applicable {
  * (`numeric_limits<KeyT>::min()`), which the set never stores. A probe key equal to that sentinel
  * is always kept (never pruned), so a build key equal to it can never be a false negative -- the
  * authoritative join still filters it. This costs at most a lost pruning opportunity for that
- * single value. We save an extra kernel pass that would have to scan the probe set for sentinel
- * values.
+ * single value.
  */
 class sirius_dynamic_in_list_filter final : public sirius_dynamic_filter,
                                             public sirius_mask_applicable,
@@ -284,12 +279,13 @@ class sirius_dynamic_in_list_filter final : public sirius_dynamic_filter,
    * builds a persistent `cuco::static_set`; every @ref compute_mask is then a single read-only
    * probe kernel.
    *
-   * @param[in] keys The build keys. The view only needs to remain valid for the constructor; the
-   * filter eagerly builds its own persistent set and does not retain the view.
-   * @param[in] stream Stream to build the persistent probe structure on (the producer's stream; the
-   * publish path synchronizes it before fan-out, so consumer streams never observe a partially
-   * built set).
-   * @param[in] mr Device memory resource backing the structure.
+   * @pre The backing storage for @p keys remains valid until work enqueued on @p stream completes.
+   * `dynamic_filter_publisher` satisfies this by retaining the build batch and synchronizing before
+   * replication.
+   *
+   * @param[in] keys Null-free INT32 or INT64 build keys
+   * @param[in] stream Stream used to build the persistent set
+   * @param[in] mr Device memory resource backing the set
    */
   sirius_dynamic_in_list_filter(cudf::column_view const& keys,
                                 rmm::cuda_stream_view stream,
@@ -358,20 +354,14 @@ class sirius_dynamic_in_list_filter final : public sirius_dynamic_filter,
 // sirius_dynamic_small_in_list_filter
 //===----------------------------------------------------------------------===//
 /**
- * @brief Exact set-membership filter for a SMALL build side (<= @ref k_max_keys keys): keeps rows
- * whose key appears among the build keys
+ * @brief Exact linear-scan membership filter for at most @ref k_max_keys build keys
  *
- * The scale-down of @ref sirius_dynamic_in_list_filter for tiny selective builds. Instead of a
- * persistent `cuco::static_set`, each device replica owns a raw snapshot of the <= @ref k_max_keys
- * build keys, and @ref compute_mask answers with a branchless linear scan (compare every probe
- * value against the m needles). For small m this beats building and probing a hash set, and --
- * having no reserved empty-slot sentinel -- it is exact for every key value (unlike @ref
- * sirius_dynamic_in_list_filter, whose static_set never stores `numeric_limits<KeyT>::min()`).
+ * Each device replica owns a raw snapshot of the build values. `compute_mask()` compares each probe
+ * value with every snapshot value and therefore reserves no sentinel value.
  *
- * Like its siblings it is @ref sirius_device_replicable: the constructor builds the source-device
- * snapshot and @ref replicate_to_devices attempts to fan a tiny copy out to every planned probe
- * device before publication. Each successful replica owns its snapshot. The needle buffers are
- * PIMPL'd so rmm/device headers stay out of this header.
+ * The constructor enqueues the source snapshot. `replicate_to_devices()` copies that completed
+ * snapshot to each planned probe device before publication; a failed target replica remains
+ * unavailable on that device.
  */
 class sirius_dynamic_small_in_list_filter final : public sirius_dynamic_filter,
                                                   public sirius_mask_applicable,
@@ -458,12 +448,10 @@ class sirius_dynamic_small_in_list_filter final : public sirius_dynamic_filter,
 // sirius_dynamic_bloom_filter
 //===----------------------------------------------------------------------===//
 /**
- * @brief Probabilistic set-membership filter backed by a GPU blocked Bloom filter (cuCollections)
+ * @brief Probabilistic set-membership filter backed by a GPU blocked Bloom filter
  *
- * The scale-up of @ref sirius_dynamic_in_list_filter for *large* selective builds.
- *
- * Implementation (the `cuco::bloom_filter` and its kernels) is hidden behind a PIMPL so this header
- * stays compilable by the host toolchain; the definitions live in a `.cu` translation unit.
+ * False positives pass extra rows to the authoritative join; the filter must not produce false
+ * negatives. The `cuco::bloom_filter` implementation is hidden in the CUDA translation unit.
  */
 class sirius_dynamic_bloom_filter final : public sirius_dynamic_filter,
                                           public sirius_mask_applicable,
@@ -472,9 +460,15 @@ class sirius_dynamic_bloom_filter final : public sirius_dynamic_filter,
   /**
    * @brief Build a Bloom filter over the build's join keys
    *
-   * @p keys must be of a @ref supports type.
+   * @pre @p keys has a type accepted by @ref supports and its backing storage remains valid until
+   * work enqueued on @p stream completes. `dynamic_filter_publisher` retains the build batch and
+   * synchronizes before replication.
    *
    * @throw std::invalid_argument if `keys.type()` is unsupported
+   *
+   * @param[in] keys INT32 or INT64 build keys
+   * @param[in] stream Stream used to build the Bloom filter
+   * @param[in] mr Device memory resource backing the filter
    */
   sirius_dynamic_bloom_filter(cudf::column_view const& keys,
                               rmm::cuda_stream_view stream,
@@ -527,55 +521,32 @@ class sirius_dynamic_bloom_filter final : public sirius_dynamic_filter,
 /**
  * @brief Thread-safe append-only channel connecting one or more producer operators to a consumer
  *
- * Filters are keyed by the column index in the consumer's output schema. Multiple producers may
- * push filters for the same column. The set is append-only -- once pushed, filters cannot be
- * removed. A consumer may close the channel when its scan pipeline drains; later producer pushes
- * are ignored because no future split can use them.
+ * Push, storage, and lookup share one coordinate: the consumer operator's output ordinal. On every
+ * route the producing join's discovery walk supplies it as the trace's exit ordinal -- the bound
+ * scan's output ordinal for a scan route, the sited operator's output ordinal for a join-edge
+ * endpoint -- so no translation happens inside the channel.
  *
- * @note A producer pushes filters for the consumer's column index -- i.e. the column index in the
- * downstream operator's output schema, not the producer's. The plan-gen layer is responsible for
- * translating between the two when wiring producers and consumers.
+ * Filters remain immutable and co-owned by the channel and any snapshots returned to consumers.
+ * Appends are individually visible; publishing several filters or targets is not atomic. A consumer
+ * never waits for readiness and may observe no filters, a prefix of a fan-out, or the completed
+ * fan-out.
  *
- * ## Filter availability
- *
- * In the normal `BUILD_PROBE` path, build-side `CONCAT` synchronously delivers the complete build
- * batch to the join's publication hook. Construction, device replication, and channel fan-out all
- * complete before that push returns, and downstream task creation reaches that join's immediate
- * probe producer only afterwards.
- *
- * DuckDB may also route the channel through an intervening join to a deeper base scan. That
- * transitive target is not gated by the producing join's immediate probe edge and can race
- * publication. Every individual filter has finished constructing all usable replicas and is
- * immutable before `push_filter` makes it visible, but fan-out is a sequence of append operations
- * rather than an atomic snapshot, so a racing target may observe none, a subset, or all filters.
- *
- * Consumption is nevertheless opportunistic: there is no readiness wait in this channel API. A
- * consumer snapshots the filters that exist, selects device-local representations, and safely
- * passes data through when publication intentionally emitted nothing or no applicable local filter
- * exists. Metadata preparation and prefetch do not snapshot the channel; reader and post-decode
- * consumers take their own per-split snapshots.
+ * `close_for_new_filters()` ends the append lifecycle after the consumer drains. Later pushes are
+ * rejected. Missing filters and missing device-local replicas pass data through; the producing join
+ * still checks correctness.
  */
 class sirius_dynamic_filter_set {
  public:
   /**
-   * @brief Register a filter for column @p col_idx
+   * @brief Register a filter for consumer output column @p col_idx
    *
-   * No-op if @p f is null or the channel is closed.
+   * A null filter, a closed channel, or an ignored output column is rejected without modifying the
+   * channel.
    *
-   * @p col_idx is the producer's column reference in the consumer's @b column_ids space -- DuckDB
-   * hands it over as a `LogicalGet` binding's `column_index` (see `JoinFilterPushdownColumn`). When
-   * @ref set_consumer_column_remap has installed a translation, @p col_idx is mapped to the
-   * consumer's output-column position before it is stored, so every consumer-side lookup (@ref
-   * filters_for_column, @ref filtered_columns, the AST merge, the post-decode apply) keys by output
-   * position. A @p col_idx that the remap maps to no output column (pure-filter / pruned /
-   * partition) is rejected. With no remap installed the index is stored as-is (the identity case,
-   * e.g. tests and scans whose output already matches column_ids order).
+   * The function is thread-safe. The same immutable filter may be pushed into multiple channels or
+   * columns.
    *
-   * Thread-safe; may be called concurrently from multiple producer operators. The same @p f may be
-   * pushed into multiple channels and/or columns to fan-out a filter without cloning it; the
-   * channels co-own the filter.
-   *
-   * @return true iff the filter was accepted by this channel.
+   * @return True when the channel accepted the filter
    */
   bool push_filter(std::size_t col_idx, std::shared_ptr<sirius_dynamic_filter const> f);
 
@@ -606,23 +577,11 @@ class sirius_dynamic_filter_set {
    * them
    *
    * A scan marks its hive-partition columns here: those are pruned at the file level and the values
-   * aren't in the decoded data, so a dynamic filter on them must never reach the consumer. Indices
-   * are in the consumer's output-column space (matching what @ref push_filter stores after
-   * remapping). Wiring-time setup -- call before any producer publishes (not synchronized against
-   * push_filter).
+   * are not in the decoded data, so a dynamic filter on them must never reach the consumer. Indices
+   * are in the consumer's output-column space, the same space @ref push_filter stores. Wiring-time
+   * setup -- call before any producer publishes (not synchronized against push_filter).
    */
   void ignore_columns(std::vector<std::size_t> const& cols);
-
-  /**
-   * @brief Install the consumer's column_ids -> output-position translation applied by @ref
-   * push_filter
-   *
-   * @p remap is indexed by column_ids position and yields the output-column position, or
-   * `scan_plan::no_output_position` for column_ids entries that produce no output. Typically the
-   * scan's `scan_plan::output_position_by_column_id`. Wiring-time setup -- call before any producer
-   * publishes. An empty @p remap (the default) means identity: indices are stored unchanged.
-   */
-  void set_consumer_column_remap(std::vector<std::size_t> remap);
 
   /**
    * @brief Mark that a producer has been wired to this channel at plan time
@@ -685,13 +644,6 @@ class sirius_dynamic_filter_set {
    * ignore_columns
    */
   std::unordered_set<std::size_t> _ignored_columns;
-
-  /**
-   * @brief column_ids -> output-position translation applied on push; empty means identity
-   *
-   * See @ref set_consumer_column_remap.
-   */
-  std::vector<std::size_t> _consumer_col_remap;
 
   /**
    * @brief Total filters pushed across all columns; backs the lock-free @ref has_filters

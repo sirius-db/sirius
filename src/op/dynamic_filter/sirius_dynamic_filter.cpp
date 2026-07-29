@@ -290,8 +290,8 @@ struct sirius_dynamic_zone_map_filter::device_zones {
       rmm::cuda_set_device_raii guard{rmm::cuda_device_id{device_id}};
       zones.clear();
     } catch (...) {
-      // Something terrible happened (cuda-context/device-switch failure). Attempt to release each
-      // scalar individually, then clear the vector.
+      // Do not destroy device scalars after CUDA device selection fails; releasing ownership
+      // avoids freeing them in the wrong device context.
       for (auto& zone : zones) {
         (void)zone.min.release();
         (void)zone.max.release();
@@ -322,16 +322,16 @@ sirius_dynamic_zone_map_filter::sirius_dynamic_zone_map_filter(std::vector<zone_
 
 sirius_dynamic_zone_map_filter::~sirius_dynamic_zone_map_filter() noexcept
 {
-  // CLear replica zones (see ~device_zones())
+  // device_zones selects each replica's device before releasing its scalars.
   _replicas.clear();
-  // Clear source zones now
+  // Release source scalars while their source device is current.
   if (_source_device >= 0) {
     try {
       rmm::cuda_set_device_raii guard{rmm::cuda_device_id{_source_device}};
       _zones.clear();
     } catch (...) {
-      // Something terrible happened (cuda-context/device-switch failure). Attempt to release each
-      // scalar individually, then clear the vector.
+      // Do not destroy device scalars after CUDA device selection fails; releasing ownership
+      // avoids freeing them in the wrong device context.
       for (auto& zone : _zones) {
         (void)zone.min.release();
         (void)zone.max.release();
@@ -366,8 +366,8 @@ void sirius_dynamic_zone_map_filter::replicate_to_devices(
     return;
   }
 
-  // Read exact source values through the source memory space's durable stream pool. The producer
-  // has already synchronized construction before entering this method.
+  // The publisher synchronized source construction before replication. Use the source memory
+  // space's pooled stream to read exact scalar values.
   rmm::cuda_set_device_raii source_guard{rmm::cuda_device_id{_source_device}};
   auto const source_stream = source->get_gpu_space().acquire_stream();
 
@@ -379,7 +379,7 @@ void sirius_dynamic_zone_map_filter::replicate_to_devices(
       auto replica       = std::make_unique<device_zones>();
       replica->device_id = device_id;
 
-      // Construct every scalar with the allocator and pooled stream owned by the same target space.
+      // Target scalars use the target space's allocator and pooled stream.
       {
         rmm::cuda_set_device_raii target_guard{rmm::cuda_device_id{device_id}};
         auto const target_stream = target_space.acquire_stream();
@@ -458,13 +458,6 @@ bool sirius_dynamic_filter_set::push_filter(std::size_t col_idx,
   {
     std::scoped_lock lk(_mu);
     if (!_accepting_filters.load(std::memory_order_relaxed)) { return false; }
-    // Translate the producer's column_ids-space index to the consumer's output-column position.
-    // An empty remap is identity; a column_ids entry mapping to no output column is rejected.
-    if (!_consumer_col_remap.empty()) {
-      if (col_idx >= _consumer_col_remap.size()) { return false; }
-      col_idx = _consumer_col_remap[col_idx];
-      if (col_idx == static_cast<std::size_t>(-1)) { return false; }
-    }
     if (_ignored_columns.count(col_idx) != 0) { return false; }
     _filters[col_idx].push_back(std::move(f));
   }
@@ -476,12 +469,6 @@ void sirius_dynamic_filter_set::ignore_columns(std::vector<std::size_t> const& c
 {
   std::scoped_lock lk(_mu);
   _ignored_columns.insert(cols.begin(), cols.end());
-}
-
-void sirius_dynamic_filter_set::set_consumer_column_remap(std::vector<std::size_t> remap)
-{
-  std::scoped_lock lk(_mu);
-  _consumer_col_remap = std::move(remap);
 }
 
 void sirius_dynamic_filter_set::register_producer()

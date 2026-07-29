@@ -17,76 +17,41 @@
 #include <catch.hpp>
 #include <duckdb.hpp>
 #include <utils/dynamic_filter_test_utils.hpp>
+#include <utils/gpu_execution_fixture.hpp>
 #include <utils/sirius_test_env.hpp>
 #include <utils/transparent_execution_test_utils.hpp>
 
-#include <algorithm>
-#include <cstdlib>
-#include <filesystem>
 #include <string>
 #include <vector>
 
-namespace fs = std::filesystem;
-
 namespace {
 
-fs::path get_tpch_db_path()
-{
-  const char* env = std::getenv("SIRIUS_INTEGRATION_TEST_DB_PATH");
-  auto db_path =
-    env ? fs::path(env) : fs::path(__FILE__).parent_path() / "data/duckdb/integration.duckdb";
-  REQUIRE(fs::exists(db_path));
-  return db_path;
-}
+using sirius::test::coverage_gate_disable_guard;
 
-//! RAII disable of the domain-coverage gate: a threshold above 1.0 is the gate's explicit
-//! disabled state (the documented rollback lever). The SET mutates the shared SiriusContext, so
-//! restoring the default is mandatory for later tests.
-struct coverage_gate_disable_guard {
-  explicit coverage_gate_disable_guard(duckdb::Connection& c) : con(c)
-  {
-    con.Query("SET dynamic_filter_domain_coverage_threshold = 2.0;");
-  }
-  ~coverage_gate_disable_guard()
-  {
-    con.Query("SET dynamic_filter_domain_coverage_threshold = 0.9;");
-  }
-
-  coverage_gate_disable_guard(const coverage_gate_disable_guard&)            = delete;
-  coverage_gate_disable_guard& operator=(const coverage_gate_disable_guard&) = delete;
-
-  duckdb::Connection& con;
-};
-
-//! RAII toggle for the opt-in zone-map kind (default off). The SET mutates the shared
-//! SiriusContext, so restoring the default is mandatory for later tests.
+//! RAII toggle for the opt-in zone-map kind (default off). Captures and restores for the same
+//! reason as `sirius::test::coverage_gate_disable_guard`.
 struct zone_map_switch_guard {
-  explicit zone_map_switch_guard(duckdb::Connection& c) : con(c)
+  explicit zone_map_switch_guard(duckdb::Connection& c)
+    : con(c),
+      original(sirius::test::get_registered_sirius_context(c)
+                 ->get_config()
+                 .get_operator_params()
+                 .enable_dynamic_zone_map_filter)
   {
     con.Query("SET enable_dynamic_zone_map_filter = true;");
   }
-  ~zone_map_switch_guard() { con.Query("SET enable_dynamic_zone_map_filter = false;"); }
+  ~zone_map_switch_guard()
+  {
+    con.Query(std::string{"SET enable_dynamic_zone_map_filter = "} + (original ? "true" : "false") +
+              ";");
+  }
 
   zone_map_switch_guard(const zone_map_switch_guard&)            = delete;
   zone_map_switch_guard& operator=(const zone_map_switch_guard&) = delete;
 
   duckdb::Connection& con;
+  bool original;
 };
-
-std::vector<std::vector<std::string>> collect_rows(duckdb::MaterializedQueryResult& result)
-{
-  std::vector<std::vector<std::string>> rows;
-  for (duckdb::idx_t r = 0; r < result.RowCount(); r++) {
-    std::vector<std::string> row;
-    row.reserve(result.ColumnCount());
-    for (duckdb::idx_t c = 0; c < result.ColumnCount(); c++) {
-      row.push_back(result.GetValue(c, r).ToString());
-    }
-    rows.push_back(std::move(row));
-  }
-  std::sort(rows.begin(), rows.end());
-  return rows;
-}
 
 //! Transparent GPU run (asserted to actually execute on GPU) vs CPU run, exact row-set
 //! equality. All queries below aggregate to integer/decimal values, so no float tolerance.
@@ -113,8 +78,8 @@ void compare_gpu_vs_cpu(duckdb::Connection& con, const std::string& query)
   REQUIRE(gpu_result->ColumnCount() == cpu_result->ColumnCount());
   REQUIRE(gpu_result->RowCount() == cpu_result->RowCount());
 
-  auto gpu_rows = collect_rows(gpu_result->Cast<duckdb::MaterializedQueryResult>());
-  auto cpu_rows = collect_rows(cpu_result->Cast<duckdb::MaterializedQueryResult>());
+  auto gpu_rows = sirius::test::collect_rows(gpu_result->Cast<duckdb::MaterializedQueryResult>());
+  auto cpu_rows = sirius::test::collect_rows(cpu_result->Cast<duckdb::MaterializedQueryResult>());
   REQUIRE(gpu_rows == cpu_rows);
 }
 
@@ -131,7 +96,7 @@ TEST_CASE("gpu_execution - dynamic filters over duckdb-native tables",
   if (!sirius::test::g_integration_env->is_active()) { sirius::test::g_integration_env->resume(); }
   auto con = sirius::test::g_integration_env->make_connection();
 
-  auto db_path = get_tpch_db_path();
+  auto db_path = sirius::test::integration_tpch_db_path();
   auto r       = con.Query("ATTACH IF NOT EXISTS '" + db_path.string() + "' AS tpch (READ_ONLY);");
   REQUIRE(r);
   REQUIRE_FALSE(r->HasError());
@@ -192,7 +157,7 @@ TEST_CASE("gpu_execution - dynamic-filter domain-coverage gate",
   if (!sirius::test::g_integration_env->is_active()) { sirius::test::g_integration_env->resume(); }
   auto con = sirius::test::g_integration_env->make_connection();
 
-  auto db_path = get_tpch_db_path();
+  auto db_path = sirius::test::integration_tpch_db_path();
   auto r       = con.Query("ATTACH IF NOT EXISTS '" + db_path.string() + "' AS tpch (READ_ONLY);");
   REQUIRE(r);
   REQUIRE_FALSE(r->HasError());

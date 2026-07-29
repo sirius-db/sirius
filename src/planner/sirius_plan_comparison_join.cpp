@@ -36,21 +36,25 @@
 #include "helper/type_conversions.hpp"
 #include "log/logging.hpp"
 #include "op/dynamic_filter/sirius_dynamic_filter.hpp"
+#include "op/scan/sirius_physical_dynamic_filter.hpp"
 #include "op/sirius_physical_hash_join.hpp"
 #include "op/sirius_physical_nested_loop_join.hpp"
+#include "op/sirius_physical_table_scan.hpp"
+#include "planner/dynamic_filter/build_filter_evidence.hpp"
 #include "planner/dynamic_filter/build_key_domain.hpp"
-#include "planner/dynamic_filter/duckdb_join_filter_candidate_adapter.hpp"
 #include "planner/dynamic_filter/dynamic_filter_key_admission.hpp"
-#include "planner/dynamic_filter/dynamic_filter_scan_routes.hpp"
+#include "planner/dynamic_filter/dynamic_filter_target_discovery.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "planner/sirius_plan_projection_utils.hpp"
 #include "sirius_context.hpp"
 
 #include <algorithm>
 #include <cassert>
+#include <memory>
 #include <optional>
-#include <span>
 #include <stdexcept>
+#include <unordered_map>
+#include <vector>
 
 namespace sirius::planner {
 
@@ -397,15 +401,33 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
   std::size_t lhs_cardinality = op.children[0]->EstimateCardinality(context);
   std::size_t rhs_cardinality = op.children[1]->EstimateCardinality(context);
 
-  // Snapshot DuckDB's join-filter pushdown metadata into Sirius-owned values while the logical
-  // join is intact. This is the only read of the optional DuckDB metadata in this function;
-  // everything downstream consumes the snapshot.
-  auto const filter_candidate = duckdb_join_filter_candidate_adapter::extract(op);
+  // The dynamic-filter flags are read once, ahead of the pre-create_plan evidence block below.
+  // These flag reads tolerate a null state (every flag reads disabled); the hash-join branch below
+  // additionally requires a registered context, since it reads the config and memory topology
+  // unconditionally.
+  auto sirius_context = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  bool const master_enabled =
+    sirius_context &&
+    sirius_context->get_config().get_operator_params().enable_dynamic_filter_pushdown;
+  bool const sip_enabled =
+    master_enabled && sirius_context->get_config().get_operator_params().enable_dynamic_filter_sip;
 
-  // Gather per-condition domain evidence BEFORE create_plan, which moves data out of the logical
-  // nodes (same constraint as prove_unique_columns below).
+  // Sirius-owned build-filter evidence, read from the logical build child before create_plan()
+  // moves data out of the logical nodes. When the build child is a LOGICAL_DELIM_GET its data is
+  // drawn from the probe side, so the evidence is read there instead -- the same child rule
+  // DuckDB's IsFiltering call site applies.
+  bool const build_filtered =
+    master_enabled && build_subtree_is_filtering(op.children[1]->type ==
+                                                     duckdb::LogicalOperatorType::LOGICAL_DELIM_GET
+                                                   ? *op.children[0]
+                                                   : *op.children[1]);
+
+  // Gather domain evidence before create_plan() moves data out of the logical children. The guard
+  // is a cost gate: this walk runs for every comparison join reaching this function when armed,
+  // including joins that leave through the nested-loop branch, and no route can use the evidence
+  // unless the scan gate (build_filtered) or the join-edge route (sip_enabled) is armed.
   auto condition_domains =
-    filter_candidate.kind() == duckdb_candidate_kind::admitted
+    master_enabled && (build_filtered || sip_enabled)
       ? build_key_domain_cardinalities(op, duckdb_base_table_cardinality{context})
       : std::vector<std::size_t>{};
 
@@ -463,115 +485,196 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
   bool is_supported_by_hash_join =
     sirius::op::sirius_physical_hash_join::are_conditions_supported(conditions);
   if (is_supported_by_hash_join && !prefer_range_joins) {
-    auto sirius_context   = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
     const auto& op_params = sirius_context->get_config().get_operator_params();
 
-    // Resolve scan endpoints from that snapshot and build the Sirius-owned admitted-key publication
-    // plan before constructing the physical join. Routing and device placement are *currently*
-    // plan-time decisions; runtime code only consumes the resulting dynamic_filter_publish_plan
-    // value and never reads DuckDB metadata.
-    //
-    // The memory-space lookup stays here and is answered before resolve_scan_routes mints
-    // anything: a producer must not register on channels it would then abandon for want of a
-    // replica placement.
+    // Device placement is resolved before discovery attaches or mints any channel: a producer
+    // must not register on channels it would then abandon for want of a replica placement.
     auto& memory_manager  = sirius_context->get_memory_manager();
     auto const gpu_spaces = memory_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
     auto const host_spaces =
       memory_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
-    auto routes = resolve_scan_routes(
-      filter_candidate,
-      /*device_placement_available=*/!gpu_spaces.empty() && !host_spaces.empty(),
-      [this](duckdb::DynamicTableFilterSet const* channel_identity) {
-        return get_or_create_dynamic_filter_channel(channel_identity);
-      });
 
-    std::vector<sirius::op::dynamic_filter_replica_space> filter_replica_spaces;
-    switch (routes.decision) {
-      // A producer whose channels all mint null (the master switch being off, for instance) wires
-      // nothing and says nothing, exactly as an absent candidate does.
-      case dynamic_filter_routing_decision::no_duckdb_metadata:
-      case dynamic_filter_routing_decision::no_live_channel: break;
-      case dynamic_filter_routing_decision::metadata_malformed:
-        SIRIUS_LOG_WARN(
-          "[sirius_plan_comparison_join] Not wiring dynamic filter(s): DuckDB join-filter "
-          "metadata failed structural validation.");
-        break;
-      case dynamic_filter_routing_decision::build_side_unfiltered:
-        SIRIUS_LOG_INFO(
-          "[sirius_plan_comparison_join] Not wiring dynamic filter(s): build side is "
-          "unfiltered (build est {} rows).",
-          rhs_cardinality);
-        break;
-      case dynamic_filter_routing_decision::no_device_placement:
-        SIRIUS_LOG_INFO(
-          "[sirius_plan_comparison_join] Not wiring dynamic filter(s): a GPU and HOST "
-          "memory space are required for device-local replicas.");
-        break;
-      case dynamic_filter_routing_decision::wired: {
-        // Resolve each replica's NUMA-local Sirius HOST space once at plan time. The transfer
-        // path borrows fixed pinned blocks from that explicit space if peer DMA is unavailable.
-        auto const& topology = sirius_context->get_config().get_hw_topology();
-        for (auto const* gpu_space : gpu_spaces) {
-          auto const gpu_id = gpu_space->get_device_id();
-          auto const gpu_info =
-            std::find_if(topology.gpus.begin(), topology.gpus.end(), [gpu_id](auto const& gpu) {
-              return static_cast<int>(gpu.id) == gpu_id;
-            });
-          auto const numa_node = gpu_info == topology.gpus.end() ? -1 : gpu_info->numa_node;
-          auto const local_host =
-            std::find_if(host_spaces.begin(), host_spaces.end(), [numa_node](auto const* host) {
-              return numa_node >= 0 && host->get_device_id() == numa_node;
-            });
-          auto const* host_space =
-            local_host == host_spaces.end() ? host_spaces.front() : *local_host;
-          auto* mutable_gpu_space =
-            memory_manager.get_memory_space(cucascade::memory::Tier::GPU, gpu_id);
-          if (mutable_gpu_space == nullptr) {
-            throw std::logic_error(
-              "[sirius_plan_comparison_join] Dynamic-filter GPU space disappeared during "
-              "plan construction");
-          }
-          filter_replica_spaces.emplace_back(*mutable_gpu_space, *host_space);
-        }
-        SIRIUS_LOG_INFO(
-          "[sirius_plan_comparison_join] Wired hash join with {} dynamic-filter probe "
-          "target(s) (build est {} rows).",
-          routes.targets.size(),
-          rhs_cardinality);
-        break;
-      }
-    }
-
-    // Static key admission: the producer-key admission boundary is one side-effect-free decision
-    // over the wrapped conditions, carried shapes, and resolved targets. When DuckDB named a
-    // condition set, admission is restricted to it so publication constructs exactly the filters
-    // the runtime publisher constructed before admission moved to plan time.
-    auto const hinted_condition_indexes =
-      routes.hinted_condition_indexes.empty()
-        ? std::optional<std::span<std::size_t const>>{}
-        : std::optional<std::span<std::size_t const>>{
-            std::span<std::size_t const>{routes.hinted_condition_indexes}};
     // Only a single-column uniqueness proof arms a key's coverage gate: tuple uniqueness bounds
     // distinct tuples, not distinct values of one column, so a composite proof passes nothing.
     auto const build_side_unique_column =
       build_side_unique_cols.size() == 1
         ? std::optional<std::size_t>{static_cast<std::size_t>(*build_side_unique_cols.begin())}
         : std::nullopt;
-    auto admission = admit_dynamic_filter_keys(conditions,
-                                               condition_key_shapes,
-                                               hinted_condition_indexes,
-                                               routes.target_inputs,
-                                               condition_domains,
-                                               build_side_unique_column);
-    // Postcondition of admit_dynamic_filter_keys: one binding list per input target.
-    assert(admission.per_target_key_bindings.size() == routes.targets.size());
-    for (std::size_t target_index = 0; target_index < routes.targets.size(); ++target_index) {
-      routes.targets[target_index].key_bindings =
-        std::move(admission.per_target_key_bindings[target_index]);
+    auto admitted_keys = admit_dynamic_filter_keys(
+      conditions, condition_key_shapes, condition_domains, build_side_unique_column);
+
+    // Unified target discovery: one trace per admitted key over the built probe subtree. A
+    // TABLE_SCAN terminal binds the key INTO that scan (zone-map capable); any other terminal is a
+    // join-edge endpoint site when the SIP flag allows it; otherwise the key stays a recorded
+    // legality fact. One route per key -- a scan binding wins, so no key is published through both
+    // routes. Per-key parity contract: Sirius never binds a key into a scan that DuckDB's pushdown
+    // walk, given that key alone, would refuse (the discovery parity suite pins this).
+    //
+    // plan_delim_join() also reaches this function; DuckDB only ever generated join filters for
+    // LOGICAL_COMPARISON_JOIN, so a delim-join producer has never had a route on any path and the
+    // structural gate below preserves that.
+    std::vector<sirius::op::dynamic_filter_publish_plan::probe_target> targets;
+    std::size_t scan_target_count = 0;
+    bool const discovery_runs     = master_enabled && (build_filtered || sip_enabled) &&
+                                op.type == duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN &&
+                                !gpu_spaces.empty() && !host_spaces.empty();
+    if (discovery_runs) {
+      // The scan gate is Sirius-owned: build-filter evidence (an unfiltered FK-shaped build is the
+      // whole key domain, so its filter keeps every probe row) and the producer join-type mirror
+      // of DuckDB's GenerateJoinFilters -- without the latter, a LEFT/ANTI/MARK producer's
+      // probe-side filter would change results.
+      bool const scan_bind_armed = build_filtered && scan_route_join_type_admissible(op.join_type);
+      descent_policy const policy{.descend_build_blocks = sip_enabled};
+      std::unordered_map<sirius::op::sirius_physical_operator const*, std::size_t> target_by_scan;
+      for (std::size_t key_index = 0; key_index < admitted_keys.size(); ++key_index) {
+        auto const& key       = admitted_keys[key_index];
+        auto const& condition = conditions[key.planner_condition_index];
+        // The entry ordinal is in the probe child's output space; each terminal's ordinal is in
+        // that terminal operator's own output space. They relate only through the trace.
+        auto const terminals =
+          trace_probe_key(*left, static_cast<std::size_t>(key.probe_key_ordinal), policy);
+        bool scan_bound = false;
+        for (auto const& terminal : terminals) {
+          if (!scan_bind_armed ||
+              terminal.node->type != sirius::op::SiriusPhysicalOperatorType::TABLE_SCAN) {
+            continue;
+          }
+          auto& scan = terminal.node->Cast<sirius::op::sirius_physical_table_scan>();
+          // The exit ordinal is a position in the bound scan's output space (scan.types), which is
+          // also the channel's store and lookup coordinate -- no translation exists between them.
+          assert(terminal.ordinal < scan.types.size());
+          auto const [entry, inserted] = target_by_scan.try_emplace(terminal.node, targets.size());
+          if (inserted) {
+            // The scan node is the pairing point: an inner producer's scan already carries its
+            // channel when an outer producer's trace reaches it (bottom-up construction), so
+            // attach-or-reuse shares one channel across producers.
+            if (!scan.sirius_dynamic_filters) {
+              scan.sirius_dynamic_filters =
+                std::make_shared<sirius::op::sirius_dynamic_filter_set>();
+            }
+            scan.sirius_dynamic_filters->register_producer();
+            targets.push_back({.filter_set  = scan.sirius_dynamic_filters,
+                               .route_class = sirius::op::dynamic_filter_route_class::scan,
+                               .accepts_zone_map_filters = true,
+                               .key_bindings             = {}});
+            ++scan_target_count;
+          }
+          targets[entry->second].key_bindings.push_back(
+            {.admitted_key_index   = key_index,
+             .channel_push_ordinal = terminal.ordinal,
+             .probe_storage_type   = sirius::try_get_cudf_type(scan.types[terminal.ordinal])
+                                     .value_or(cudf::data_type{cudf::type_id::EMPTY})});
+          scan_bound = true;
+        }
+        if (scan_bound || !sip_enabled) { continue; }
+        // Join-edge endpoint. Build-block descent depends on equality admission: under null-equal
+        // semantics, pruning a LEFT join's build input could add a NULL-padded row accepted by
+        // the producing join.
+        //
+        // Projection folding preserves the outer output and inner input spaces, so a recorded
+        // site ordinal remains valid when fold_adjacent_projections() runs later.
+        if (!direct_route_admissible(op.join_type,
+                                     condition.comparison,
+                                     key.key_shape,
+                                     key.probe_storage_type,
+                                     key.storage_type)) {
+          continue;
+        }
+        // One fresh channel per spliced site, minted inside the factory so the mints zip with the
+        // returned site ordinals. place_endpoint() splices at every terminal the policy reaches;
+        // it is only called when no branch of the key was scan-bound, and on plans without a
+        // physical set operation a key has exactly one terminal, so the mixed-branch refinement
+        // is deferred until physical set operations exist.
+        std::vector<std::shared_ptr<sirius::op::sirius_dynamic_filter_set>> site_channels;
+        auto placed = place_endpoint(
+          std::move(left),
+          static_cast<std::size_t>(key.probe_key_ordinal),
+          policy,
+          [&site_channels, &op_params](sirius::op::sirius_physical_operator const& site)
+            -> duckdb::unique_ptr<sirius::op::sirius_physical_operator> {
+            auto channel = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
+            channel->register_producer();
+            auto endpoint = duckdb::make_uniq<sirius::op::scan::sirius_physical_dynamic_filter>(
+              site.types,
+              site.estimated_cardinality,
+              channel,
+              op_params.dynamic_filter_keep_threshold,
+              sirius::op::scan::dynamic_filter_apply_mode::membership_masks_only);
+            site_channels.push_back(std::move(channel));
+            return endpoint;
+          });
+        left = std::move(placed.subtree);
+        assert(site_channels.size() == placed.site_ordinals.size());
+        for (std::size_t site = 0; site < site_channels.size(); ++site) {
+          // A direct channel's push, storage, and lookup coordinate is the site ordinal in the
+          // sited operator's output space, not the probe-child entry ordinal.
+          targets.push_back({.filter_set  = std::move(site_channels[site]),
+                             .route_class = sirius::op::dynamic_filter_route_class::direct,
+                             .accepts_zone_map_filters = false,
+                             .key_bindings             = {{.admitted_key_index   = key_index,
+                                                           .channel_push_ordinal = placed.site_ordinals[site],
+                                                           .probe_storage_type   = key.probe_storage_type}}});
+        }
+      }
     }
+    if (!targets.empty()) {
+      SIRIUS_LOG_INFO(
+        "[sirius_plan_comparison_join] Wired hash join with {} dynamic-filter probe "
+        "target(s) ({} scan-bound, {} join-edge; build est {} rows).",
+        targets.size(),
+        scan_target_count,
+        targets.size() - scan_target_count,
+        rhs_cardinality);
+    } else if (master_enabled && (build_filtered || sip_enabled) &&
+               op.type == duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN &&
+               !admitted_keys.empty() && (gpu_spaces.empty() || host_spaces.empty())) {
+      // Discovery is armed and keys were admitted, so only the replica placement is missing. When
+      // the build-unfiltered case below holds as well, placement is the binding, actionable
+      // constraint, which is why this branch comes first.
+      SIRIUS_LOG_INFO(
+        "[sirius_plan_comparison_join] Not wiring dynamic filter(s): a GPU and HOST "
+        "memory space are required for device-local replicas.");
+    } else if (master_enabled && !build_filtered &&
+               op.type == duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN &&
+               !admitted_keys.empty()) {
+      SIRIUS_LOG_INFO(
+        "[sirius_plan_comparison_join] Not wiring scan-route dynamic filter(s): build side "
+        "is unfiltered (build est {} rows).",
+        rhs_cardinality);
+    }
+
+    // Pair every GPU with a NUMA-local HOST staging space. The publish-plan constructor rejects
+    // targets without a replica placement; replication uses HOST staging when peer DMA is absent.
+    std::vector<sirius::op::dynamic_filter_replica_space> filter_replica_spaces;
+    if (!targets.empty()) {
+      auto const& topology = sirius_context->get_config().get_hw_topology();
+      for (auto const* gpu_space : gpu_spaces) {
+        auto const gpu_id = gpu_space->get_device_id();
+        auto const gpu_info =
+          std::find_if(topology.gpus.begin(), topology.gpus.end(), [gpu_id](auto const& gpu) {
+            return static_cast<int>(gpu.id) == gpu_id;
+          });
+        auto const numa_node = gpu_info == topology.gpus.end() ? -1 : gpu_info->numa_node;
+        auto const local_host =
+          std::find_if(host_spaces.begin(), host_spaces.end(), [numa_node](auto const* host) {
+            return numa_node >= 0 && host->get_device_id() == numa_node;
+          });
+        auto const* host_space =
+          local_host == host_spaces.end() ? host_spaces.front() : *local_host;
+        auto* mutable_gpu_space =
+          memory_manager.get_memory_space(cucascade::memory::Tier::GPU, gpu_id);
+        if (mutable_gpu_space == nullptr) {
+          throw std::logic_error(
+            "[sirius_plan_comparison_join] Dynamic-filter GPU space disappeared during "
+            "plan construction");
+        }
+        filter_replica_spaces.emplace_back(*mutable_gpu_space, *host_space);
+      }
+    }
+
     sirius::op::dynamic_filter_publish_plan filter_plan{
-      std::move(admission.admitted_keys),
-      std::move(routes.targets),
+      std::move(admitted_keys),
+      std::move(targets),
       std::move(filter_replica_spaces),
       {.emit_zone_map_filters     = op_params.enable_dynamic_zone_map_filter,
        .domain_coverage_threshold = op_params.dynamic_filter_domain_coverage_threshold}};

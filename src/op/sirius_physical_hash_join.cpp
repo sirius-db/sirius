@@ -365,44 +365,6 @@ sirius_physical_hash_join::sirius_physical_hash_join(
   }
 };
 
-sirius_physical_hash_join::sirius_physical_hash_join(
-  duckdb::LogicalOperator& op,
-  duckdb::unique_ptr<sirius_physical_operator> left,
-  duckdb::unique_ptr<sirius_physical_operator> right,
-  duckdb::vector<sirius::join_condition> cond,
-  duckdb::JoinType join_type,
-  std::size_t estimated_cardinality,
-  uint64_t max_build_hash_table_bytes,
-  uint64_t hash_partition_bytes,
-  uint64_t max_broadcast_join_size)
-  : sirius_physical_hash_join(op,
-                              std::move(left),
-                              std::move(right),
-                              std::move(cond),
-                              join_type,
-                              {},
-                              {},
-                              {},
-                              estimated_cardinality,
-                              max_build_hash_table_bytes,
-                              {},
-                              hash_partition_bytes,
-                              max_broadcast_join_size)
-{
-}
-
-void sirius_physical_hash_join::finalize_dynamic_filter_targets(
-  std::vector<dynamic_filter_publish_plan::probe_target> direct_targets)
-{
-  if (_dynamic_filter_targets_finalized) {
-    throw std::logic_error(
-      "[sirius_physical_hash_join] finalize_dynamic_filter_targets called more than once; "
-      "dynamic-filter placement must run at most once per producing join");
-  }
-  _dynamic_filter_targets_finalized = true;
-  _dynamic_filter_plan = _dynamic_filter_plan.with_appended_probe_targets(std::move(direct_targets));
-}
-
 //===--------------------------------------------------------------------===//
 // Pipeline Construction
 //===--------------------------------------------------------------------===//
@@ -1833,7 +1795,7 @@ void sirius_physical_hash_join::push_data_batch_partitioned(
         cudaGetErrorString(status));
     }
   } else {
-    // Defense-in-depth for older representations that predate mandatory writer events.
+    // Synchronize the source device when no writer event is available.
     auto const status = cudaDeviceSynchronize();
     if (status != cudaSuccess) {
       throw std::runtime_error(

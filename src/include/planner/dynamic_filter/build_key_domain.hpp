@@ -78,8 +78,8 @@ concept base_table_cardinality_source =
   std::same_as<std::invoke_result_t<Source const&, duckdb::LogicalGet const&>,
                std::optional<std::size_t>>;
 
-/// Internal: declared here so the walk is unit-testable without a ClientContext. Not part of the
-/// module's public surface.
+/// Internal implementation for the overload that accepts a caller-supplied cardinality source; not
+/// part of the public planner API.
 namespace detail {
 
 /**
@@ -120,8 +120,8 @@ namespace detail {
  *
  * The value `admit_dynamic_filter_keys` records on each admitted key as
  * `build_key_domain_cardinality`. The source is consulted once per distinct resolved scan, not
- * once per key. The result is an eager vector because the caller consumes it after `create_plan`
- * has moved data out of the logical children -- a lazy view over `join.conditions` would dangle.
+ * once per key. The result owns its values and remains valid after `create_plan()` moves state out
+ * of the logical children.
  *
  * @param[in] join The producing join, with both logical children still intact
  * @param[in] evidence_for The domain-evidence source; see @ref base_table_cardinality_source

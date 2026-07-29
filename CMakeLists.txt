@@ -323,11 +323,10 @@ set(EXTENSION_SOURCES
     src/pipeline/repository_wiring_materializer.cpp
     src/pipeline/sirius_plan_printer.cpp
     src/pipeline/task_request.cpp
+    src/planner/dynamic_filter/build_filter_evidence.cpp
     src/planner/dynamic_filter/build_key_domain.cpp
-    src/planner/dynamic_filter/duckdb_join_filter_candidate_adapter.cpp
-    src/planner/dynamic_filter/dynamic_filter_endpoint_placement.cpp
     src/planner/dynamic_filter/dynamic_filter_key_admission.cpp
-    src/planner/dynamic_filter/dynamic_filter_scan_routes.cpp
+    src/planner/dynamic_filter/dynamic_filter_target_discovery.cpp
     src/planner/query.cpp
     src/planner/sirius_physical_plan_generator.cpp
     src/planner/sirius_plan_aggregate.cpp
@@ -602,6 +601,7 @@ set(TEST_SOURCES
     test/cpp/helper/test_transaction_utils.cpp
     test/cpp/integration/test_gpu_execution_array.cpp
     test/cpp/integration/test_gpu_execution_dynamic_filter_native.cpp
+    test/cpp/integration/test_gpu_execution_dynamic_filter_sip.cpp
     test/cpp/integration/test_gpu_execution_locality.cpp
     test/cpp/integration/test_gpu_execution_multi_format.cpp
     test/cpp/integration/test_gpu_execution_tpch.cpp
@@ -664,13 +664,14 @@ set(TEST_SOURCES
     test/cpp/operator/test_dynamic_filter_source_policy.cpp
     test/cpp/operator/test_sirius_dynamic_filter_mgpu.cpp
     test/cpp/parallel/test_task_executor.cpp
+    src/planner/dynamic_filter/duckdb_join_filter_candidate_adapter.cpp
     test/cpp/planner/test_distinct_hash_join_detection.cpp
     test/cpp/planner/test_duckdb_join_filter_candidate_adapter.cpp
+    test/cpp/planner/test_build_filter_evidence.cpp
     test/cpp/planner/test_build_key_domain.cpp
-    test/cpp/planner/test_dynamic_filter_endpoint_placement.cpp
+    test/cpp/planner/test_dynamic_filter_discovery_parity.cpp
     test/cpp/planner/test_dynamic_filter_key_admission.cpp
-    test/cpp/planner/test_dynamic_filter_router.cpp
-    test/cpp/planner/test_dynamic_filter_scan_routes.cpp
+    test/cpp/planner/test_dynamic_filter_target_discovery.cpp
     test/cpp/planner/test_join_expression_key.cpp
     test/cpp/planner/test_plan_tree_shape.cpp
     test/cpp/planner/test_projection_fold.cpp
@@ -693,7 +694,6 @@ set(TEST_SOURCES
     test/cpp/scan/test_duckdb_block_layout.cpp
     test/cpp/scan/test_duckdb_mvcc_visibility.cpp
     test/cpp/scan/test_duckdb_native_batch_coalescer.cpp
-    test/cpp/scan/test_duckdb_native_dynamic_filter_remap.cpp
     test/cpp/scan/test_duckdb_native_walker.cpp
     test/cpp/scan/test_dynamic_filter_merge.cpp
     test/cpp/scan/test_gpu_decode_alp.cpp
@@ -708,7 +708,6 @@ set(TEST_SOURCES
     test/cpp/sirius_extension/test_sirius_read_parquet_cardinality.cpp
     test/cpp/sql/test_sirius_sql_rewrite.cpp
     test/cpp/telemetry/test_telemetry_context.cpp
-    test/cpp/transparent/test_preserve_dynamic_filter_metadata.cpp
     test/cpp/unittest.cpp
     test/cpp/utils/pipeline_conversion_test_utils.cpp
     test/cpp/utils/sirius_test_env.cpp

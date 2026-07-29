@@ -60,62 +60,27 @@ struct dynamic_filter_condition_shape {
 };
 
 /**
- * @brief Coordinate space a target channel expects at push time
+ * @brief Which kind of consumer a target channel feeds
  *
- * A scan endpoint's channel is installed with a column_ids-to-output-position remap
- * (`sirius_dynamic_filter_set::set_consumer_column_remap`) that `push_filter` applies once at push
- * time, so scan push ordinals stay in DuckDB `column_ids` space. A join-edge endpoint's channel
- * installs no remap, so its push ordinals are the producing join's probe-child output ordinals,
- * stored unchanged. Pushing an output ordinal through a scan channel would remap twice and can
- * silently filter a same-typed wrong column.
- * KEVIN: the reason this distinction exists is because the scan route is duckdb-owned, and the
- * direct rout is sirius-owned.
+ * Both classes push the consumer operator's own output ordinal -- the coordinate the channel
+ * stores and every lookup uses. A scan route pushes the bound scan's output ordinal, the discovery
+ * walk's exit ordinal at that scan; a direct route pushes `planner::place_endpoint()`'s site
+ * ordinal, in the output schema of the operator the endpoint wraps. Either exit ordinal is derived
+ * by mapping the producing join's probe-key entry ordinal through each accepted descent step, so
+ * entry and exit ordinals differ whenever a hop was accepted.
  */
 enum class dynamic_filter_route_class : std::uint8_t {
-  scan,   ///< Endpoint on a DYNAMIC_FILTER-wrapped table scan; `column_ids`-space push ordinals
-  direct  ///< Endpoint at the producing join's probe edge; probe-child output push ordinals
+  scan,   ///< A GPU scan consumer; zone-map capable
+  direct  ///< A join-edge endpoint consumer; membership only
 };
 
 /**
- * @brief Immutable plan-time description of one hash join's dynamic-filter publication
- *
- * The planner owns admission, routing, and placement: `sirius_plan_comparison_join` classifies key
- * shapes, resolves endpoint channels, and builds this value through the admission helper in
- * `planner/dynamic_filter/dynamic_filter_key_admission.hpp`. The runtime publisher
- * (`publish_dynamic_filters` in `op/dynamic_filter_publisher.hpp`) consumes it but cannot mutate
- * its keys, targets, policy, or device set after operator construction, and it is the publisher's
- * only key/target input -- runtime publication does not read DuckDB metadata.
- *
- * The representation is a dense admitted-key array with sparse per-target bindings: admitted keys
- * carry everything filter construction needs (build ordinal, storage type, carried shape), while
- * each target lists only the keys that apply to it, expressed in its own channel's push-coordinate
- * space. Field naming follows the admitted-key schema in issue #1010's delivery plan -- delivered
- * by that issue's documentation unit as
- * `docs/super-sirius/issue-1010-github-delivery-plan-v2.md` (`filter_set` is that schema's
- * `endpoint_channel`; `accepts_zone_map_filters` encodes its `accepted_filter_kinds`, membership
- * filters being accepted by every target).
- *
- * Replica placements cover every active GPU space, each paired with its planned HOST staging space.
- * The build GPU's space is included because it sources filter construction and the remote
- * transfers, not because a second copy is made there; only other GPUs receive replicas. Their owner
- * follows the lifetime contract on @ref dynamic_filter_replica_space.
- *
- * Placement and routing are orthogonal: `replica_spaces()` says where a filter needs device
- * storage, while `probe_target::key_bindings` says which logical channel coordinate receives it.
- * For keys 0 and 1, bindings `A:{0->12}` and `B:{1->4, 0->7}` push key 0 to A/12 and B/7, and key 1
- * only to B/4. Each filter is constructed once, all usable replicas complete before fan-out, and a
- * missing binding means no publication to that target. Channel producer registration happens
- * earlier during plan wiring; it is lifecycle bookkeeping, not a replica-readiness signal.
- *
- * The nested structs are true aggregates constructed with designated initializers at every
- * construction site; member declaration order is therefore part of their API and must stay stable.
- */
-/**
  * @brief Publication policy transported from configuration
  *
- * Validated once where it enters the engine (`config::valid_domain_coverage_threshold`); the plan
- * constructor does not re-validate it. Everything outside this struct is planner-computed and
- * constructor-validated; everything inside it is config-transported and ingress-validated.
+ * `config::valid_domain_coverage_threshold` validates the threshold before planning;
+ * `dynamic_filter_publish_plan` stores it without revalidation.
+ *
+ * @note This is only effective for DuckDB native tables which carry the requisite statistics.
  */
 struct dynamic_filter_publication_policy {
   /// Whether publication constructs zone-map filters alongside membership filters
@@ -124,6 +89,13 @@ struct dynamic_filter_publication_policy {
   double domain_coverage_threshold = 0.9;
 };
 
+/**
+ * @brief Immutable publication plan for one `sirius_physical_hash_join`
+ *
+ * `sirius_plan_comparison_join` builds a dense array of admitted keys, sparse bindings from each
+ * target to that array, publication policy, and device-replica placements. The plan is consumed by
+ * `publish_dynamic_filters()`.
+ */
 class dynamic_filter_publish_plan final {
  public:
   /**
@@ -152,14 +124,13 @@ class dynamic_filter_publish_plan final {
     /**
      * @brief Probe-child output column holding the probe-side key values
      *
-     * Recorded at admission because a planner-order condition is the only place the probe reference
-     * can be read: join-edge placement runs after the physical join has reordered its own
-     * conditions, and `planner_condition_index` does not subscript that reordered vector. This is
-     * the same coordinate space a `dynamic_filter_route_class::direct` endpoint's push ordinals
-     * use. 0 when the probe side carries no bound reference -- exactly the
-     * `dynamic_filter_key_shape::cast` shape; only a `direct` probe is eligible for the join-edge
-     * route (`planner::direct_route_admissible`) and a `direct` probe always carries a reference,
-     * so no consumer has to tell a recorded 0 from an absent one.
+     * This is the entry ordinal the discovery walk (`planner::trace_probe_key()` /
+     * `planner::place_endpoint()`) starts from; targets publish at
+     * `key_binding::channel_push_ordinal`, the walk's exit ordinal. Every accepted trace step can
+     * remap the value, so the two ordinals are equal only when the walk accepts no step.
+     *
+     * Always a real bound reference: admission admits no key whose probe side is not one, so this
+     * ordinal never needs a sentinel reading.
      */
     cudf::size_type probe_key_ordinal = 0;
     /**
@@ -171,15 +142,22 @@ class dynamic_filter_publish_plan final {
      */
     cudf::data_type storage_type{cudf::type_id::EMPTY};
     /**
+     * @brief Probe-side key storage type recorded at plan time
+     *
+     * `cudf::type_id::EMPTY` when the probe side carries no representable bound reference.
+     * `planner::direct_route_admissible` consumes it; a `direct` endpoint filters the probe-side
+     * column, so its admissibility is decided against this type, not the build type.
+     */
+    cudf::data_type probe_storage_type{cudf::type_id::EMPTY};
+    /**
      * @brief Carried pre-materialization classification of this condition's sides
      */
     dynamic_filter_condition_shape key_shape{};
     /**
      * @brief Unfiltered cardinality of the base table this build key traces to
      *
-     * 0 when untraceable, which disables the membership coverage gate for this key. Carried per
-     * key rather than in a parallel array so a cardinality cannot become misaligned with its key.
-     * The value is a true upper bound, never an estimate; see
+     * Stored with the admitted key. 0 when untraceable, which disables the membership coverage gate
+     * for this key. The value is a true upper bound, never an estimate; see
      * `planner/dynamic_filter/build_key_domain.hpp` for the evidence contract.
      */
     std::size_t build_key_domain_cardinality = 0;
@@ -200,9 +178,8 @@ class dynamic_filter_publish_plan final {
   /**
    * @brief One admitted key's binding onto one target channel
    *
-   * Bindings are sparse because application routes are chosen per key: a producer with one
-   * scan-routed and one edge-routed key lists each key only under its own route's target, and the
-   * publisher iterates a target's bindings, never the full admitted-key array.
+   * Contains only the admitted keys routed to this target. `publish_dynamic_filters()` iterates the
+   * target's bindings rather than the full admitted-key array.
    */
   struct key_binding {
     /**
@@ -227,10 +204,7 @@ class dynamic_filter_publish_plan final {
   };
 
   /**
-   * @brief One application endpoint the publisher fans filters out to
-   *
-   * Deliberately no `operator==`: a defaulted form would compare `filter_set` by channel identity,
-   * which tests should assert explicitly rather than through whole-value equality.
+   * @brief One channel that receives filters from this publisher
    */
   struct probe_target {
     /**
@@ -251,11 +225,8 @@ class dynamic_filter_publish_plan final {
     /**
      * @brief Sparse key bindings
      *
-     * Sparse means that an admitted key need not be bound in every target: this vector lists only
-     * the admitted keys that reach this one.
-     *
-     * May be empty: a producer whose keys are all inadmissible still mints its targets so
-     * consumer-side operator wrapping and the publication state trajectory are unchanged.
+     * An admitted key need not appear in every target. This vector may be empty when planning
+     * created the channel but admitted no key for it.
      */
     std::vector<key_binding> key_bindings;
   };
@@ -274,21 +245,14 @@ class dynamic_filter_publish_plan final {
   /**
    * @brief Validate, canonicalize, and freeze one hash join's publication metadata
    *
-   * The plan persists four distinct coordinates: planner condition index for provenance,
-   * admitted-key index for dense filter construction, build-key ordinal for runtime build-table
-   * lookup, and channel push ordinal for target-specific publication. The constructor validates
-   * every relationship it can represent. One precondition is not verifiable here and is trusted
-   * to the admission helper, the sole producer of bindings: each `channel_push_ordinal` must be
-   * valid in its target channel's push space.
+   * The plan persists five distinct coordinates: original planner condition index, dense
+   * admitted-key index, runtime build-table ordinal, probe-child entry ordinal, and target-specific
+   * channel push ordinal. The constructor validates every represented relationship, but it cannot
+   * verify that a channel push ordinal is meaningful in the target channel's schema; the discovery
+   * walk (`trace_probe_key()` / `place_endpoint()`) owns that precondition.
    *
-   * DuckDB filter ordinal and target index are plan-construction alignment indexes, not persisted
-   * key coordinates: admission consumes the former and replaces it with sparse bindings, while
-   * each `probe_targets[i]` owns the bindings for target `i`.
-   *
-   * @p replica_spaces is canonicalized rather than rejected: any order and any duplication of a
-   * device denote the same replica set, so the constructor sorts by device id and drops repeats.
-   * Two admitted keys naming the same condition are different -- they denote two plans, not one --
-   * and are rejected. `replica_spaces()` therefore returns the canonical form, not the input order.
+   * @p replica_spaces is sorted by device ID and deduplicated. Duplicate admitted keys for the same
+   * planner condition are rejected.
    *
    * @throw std::invalid_argument if the plan has probe targets but no replica space
    * @throw std::invalid_argument if a replica space is not a GPU space with HOST-tier staging
@@ -311,31 +275,10 @@ class dynamic_filter_publish_plan final {
                               dynamic_filter_publication_policy policy = {});
 
   /**
-   * @brief Derive a new plan with additional probe targets appended, revalidated as a whole
-   *
-   * Placement (issue #1010) discovers join-edge (`dynamic_filter_route_class::direct`) endpoints
-   * after this plan is already constructed and must extend it without weakening any invariant.
-   * Rather than mutate in place, this returns a new value: the same admitted keys, this plan's
-   * probe targets followed by @p additional_probe_targets, and the same replica spaces and policy,
-   * all re-run through the validating constructor above. The appended targets therefore face every
-   * check a constructor-time target faces, and this plan is left unchanged. Targets keep their
-   * positions: the appended targets take the highest target indexes, after the existing ones.
-   *
-   * @throw std::invalid_argument under every condition the validating constructor documents
-   *
-   * @param[in] additional_probe_targets Endpoint channels to append, with their sparse key bindings
-   * @return A new validated plan carrying the union of probe targets
-   */
-  [[nodiscard]] dynamic_filter_publish_plan with_appended_probe_targets(
-    std::vector<probe_target> additional_probe_targets) const;
-
-  /**
    * @brief Whether this producer publishes at all
    *
-   * Deliberately target-based: a plan with admitted keys but no live target publishes nothing, and
-   * a plan with targets but no admitted keys still claims publication (and publishes nothing),
-   * keeping the publication state trajectory of producers whose keys are all inadmissible
-   * unchanged.
+   * A plan with admitted keys but no target is disabled. A plan with a target but no admitted key
+   * is enabled and completes a publication attempt without emitting a filter.
    *
    * @return True when at least one probe target exists
    */
@@ -350,18 +293,38 @@ class dynamic_filter_publish_plan final {
   {
     return _admitted_keys;
   }
+  /**
+   * @brief Target channels and their sparse bindings
+   *
+   * @return Targets in planner-defined order
+   */
   [[nodiscard]] std::vector<probe_target> const& probe_targets() const noexcept
   {
     return _probe_targets;
   }
+  /**
+   * @brief Whether the publisher also constructs zone-map filters
+   *
+   * @return The configured zone-map publication setting
+   */
   [[nodiscard]] bool emit_zone_map_filters() const noexcept
   {
     return _policy.emit_zone_map_filters;
   }
+  /**
+   * @brief Canonical device-replica placements
+   *
+   * @return Non-owning placements sorted by GPU device ID
+   */
   [[nodiscard]] std::vector<dynamic_filter_replica_space> const& replica_spaces() const noexcept
   {
     return _replica_spaces;
   }
+  /**
+   * @brief Domain coverage at or above which publication skips an eligible key
+   *
+   * @return The validated configuration value
+   */
   [[nodiscard]] double domain_coverage_threshold() const noexcept
   {
     return _policy.domain_coverage_threshold;

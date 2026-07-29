@@ -18,11 +18,9 @@
  * @file dynamic_filter_source_policy.hpp
  * @brief Representation and gate policy for dynamic-filter publication
  *
- * The decisions `publish_dynamic_filters` makes before it touches a device: which membership
- * representation a build key should carry, and whether either coverage gate suppresses a key.
- * They depend only on counts, sizes, and capability answers, so they are stated here as pure
- * functions that need no GPU. Filter construction, device replication, and channel fan-out are
- * mechanism and stay in `dynamic_filter_publisher.hpp`.
+ * These pure functions select a membership representation and decide whether key coverage makes
+ * publication unhelpful. The publisher (`dynamic_filter_publisher.hpp`) supplies runtime sizes and
+ * capability checks, then owns filter construction, replication, and fan-out.
  */
 
 #pragma once
@@ -45,8 +43,8 @@ enum class membership_filter_kind : std::uint8_t {
 /**
  * @brief Everything the representation choice depends on
  *
- * The `supports_*` answers are evaluated by the caller against the runtime build column, so this
- * type stays free of cuDF column types and the policy stays testable without a device.
+ * Contains the sizes and capability flags passed to `choose_membership_filter()`. The caller
+ * derives each `supports_*` flag from the runtime build column.
  */
 struct membership_choice_inputs {
   std::size_t build_rows               = 0;
@@ -60,9 +58,8 @@ struct membership_choice_inputs {
 /**
  * @brief Choose a key's membership representation
  *
- * Preference order, matching the pre-split behavior: the exact list for a set small enough to scan
- * without a hash build; otherwise the exact hash set when its device-side footprint fits the
- * smallest probe GPU's L2 cache; otherwise a Bloom filter when the key type supports one.
+ * The function selects the small exact list when supported, otherwise the exact hash set when its
+ * footprint fits the smallest probe GPU's L2 cache, otherwise a Bloom filter when supported.
  *
  * @param[in] inputs Row count, cache budget, size estimate, and per-kind capability answers
  * @return The representation to construct, or `membership_filter_kind::none`
@@ -82,17 +79,9 @@ struct membership_choice_inputs {
 /**
  * @brief Whether a build is too dense a sample of its key domain for a filter to repay itself
  *
- * A build covering most of the key's domain keeps nearly every probe row, so the filter costs more
- * to build and apply than it saves.
- *
- * The gate fires solely for keys proven unique in the build's base relation. For a proven-unique
- * key, `build_rows` is the distinct-key count and the base table's rows are the key domain, so the
- * ratio is true coverage; for a duplicate key the same ratio measures row retention, and a
- * near-1.0 retention can coexist with a highly selective filter (900k build rows all carrying one
- * key value must not suppress a one-value membership test).
- *
- * A threshold above 1.0 is the explicit disabled state -- the documented rollback lever: the gate
- * returns false for every input, restoring publish-always behavior through an existing setting.
+ * The ratio is valid only for a key proven unique in its base relation; otherwise row count does
+ * not equal distinct-key count. An unknown domain, an unproven key, or a threshold above 1.0
+ * disables the gate.
  *
  * @param[in] build_rows Rows in the completed build
  * @param[in] domain_cardinality Unfiltered row upper bound of the base table the key traces to; 0
@@ -119,11 +108,10 @@ struct membership_choice_inputs {
  *
  * A `[min, max]` bound spanning most of the key domain prunes no row group.
  *
- * Inactive in production: its numerator is a value span, and the only domain evidence available is
- * a row count -- dimensionally different units, and on sparse integer keys the span dwarfs the row
- * count and the gate would over-fire in exactly the clustered-key case zone maps exist for. The
- * publisher therefore passes a domain of 0 (which never fires) until base-column value-range
- * evidence exists; the arithmetic stays here, tested, for that activation.
+ * No caller passes a domain yet: activation awaits base-column value-range evidence, because the
+ * domain must be a value span -- the ratio is span(build) / span(base column), and a row-count
+ * domain would be dimensionally unsound and over-fire on sparse integer keys. A 0 domain disables
+ * this gate.
  *
  * @param[in] min_value Lowest build key value
  * @param[in] max_value Highest build key value

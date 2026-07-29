@@ -164,17 +164,6 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
     uint64_t max_broadcast_join_size                = config::DEFAULT_MAX_BROADCAST_JOIN_SIZE,
     dynamic_filter_stats* dynamic_filter_stats_sink = {});
 
-  sirius_physical_hash_join(
-    duckdb::LogicalOperator& op,
-    duckdb::unique_ptr<sirius_physical_operator> left,
-    duckdb::unique_ptr<sirius_physical_operator> right,
-    duckdb::vector<sirius::join_condition> cond,
-    duckdb::JoinType join_type,
-    std::size_t estimated_cardinality,
-    uint64_t max_build_hash_table_bytes = config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES,
-    uint64_t hash_partition_bytes       = config::DEFAULT_HASH_PARTITION_BYTES,
-    uint64_t max_broadcast_join_size    = config::DEFAULT_MAX_BROADCAST_JOIN_SIZE);
-
   duckdb::vector<sirius::join_condition> conditions;
   //! The types of the join keys
   duckdb::vector<sirius::logical_type> condition_types;
@@ -353,10 +342,10 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
     CLOSED       ///< Finalization closed the window before the hook claimed it.
   };
 
-  /// Complete plan-time routing, policy, and replica-space description. Extended at most once, before execution, by `finalize_dynamic_filter_targets`; immutable once execution begins.
+  /// Complete plan-time routing, policy, and replica-space description, immutable from
+  /// construction: `sirius_plan_comparison_join` resolves every scan and join-edge target before it
+  /// builds this join.
   dynamic_filter_publish_plan _dynamic_filter_plan;
-  /// Guards `finalize_dynamic_filter_targets` to a single call: a second is a placement double-run.
-  bool _dynamic_filter_targets_finalized = false;
   /**
    * @brief Non-owning publication-counter sink, owned by `SiriusContext`
    *
@@ -371,19 +360,6 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   //===----------------------------------------------------------------------===//
 
  public:
-  /**
-   * @brief Append join-edge probe targets to this join's publish plan, exactly once, at plan time
-   *
-   * Issue #1010 placement runs post-fold in `sirius_physical_plan_generator`, discovers direct-route endpoints DuckDB did not, and hands them here before task construction. This replaces `_dynamic_filter_plan` with `dynamic_filter_publish_plan::with_appended_probe_targets`, so the appended targets are revalidated as a whole and the plan stays an immutable value between and after calls. The join owns this transition, so the settable-once guard lives here rather than on the plan value: a second call is a placement double-run -- an in-process invariant violation, not a recoverable input error.
-   *
-   * @throw std::logic_error if called more than once on this join
-   * @throw std::invalid_argument under every condition `with_appended_probe_targets` documents
-   *
-   * @param[in] direct_targets Join-edge (`dynamic_filter_route_class::direct`) endpoints to append
-   */
-  void finalize_dynamic_filter_targets(
-    std::vector<dynamic_filter_publish_plan::probe_target> direct_targets);
-
   /// @brief Route a partitioned batch and publish dynamic filters from an eligible build batch.
   ///
   /// For the @c build port of a wired @c BUILD_PROBE join, the single concat-folded batch is the
@@ -399,6 +375,13 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   void push_data_batch_partitioned(std::string_view port_id,
                                    std::shared_ptr<::cucascade::data_batch> batch,
                                    std::size_t partition_idx) override;
+
+  /// @brief Read access to this join's dynamic-filter publication plan, for tests and telemetry.
+  /// The plan is immutable from construction.
+  [[nodiscard]] dynamic_filter_publish_plan const& dynamic_filter_plan() const noexcept
+  {
+    return _dynamic_filter_plan;
+  }
 
  public:
   //! True when this HJ is the internal `delim.join` of a RIGHT_DELIM_JOIN (set in its

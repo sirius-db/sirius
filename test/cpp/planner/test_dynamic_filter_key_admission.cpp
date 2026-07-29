@@ -31,7 +31,6 @@
 #include <cstddef>
 #include <limits>
 #include <optional>
-#include <span>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -44,7 +43,6 @@ using sirius::op::dynamic_filter_publish_plan;
 using sirius::planner::admit_dynamic_filter_keys;
 using sirius::planner::classify_join_key_shapes;
 using sirius::planner::direct_route_admissible;
-using sirius::planner::dynamic_filter_scan_target_input;
 
 constexpr auto kInt32 = cudf::data_type{cudf::type_id::INT32};
 constexpr auto kInt64 = cudf::data_type{cudf::type_id::INT64};
@@ -106,6 +104,7 @@ dynamic_filter_publish_plan::admitted_key expected_key(
     .build_key_ordinal       = static_cast<cudf::size_type>(condition_index),
     .probe_key_ordinal       = static_cast<cudf::size_type>(condition_index),
     .storage_type            = kInt32,
+    .probe_storage_type      = kInt32,
     .key_shape               = shape};
 }
 
@@ -118,34 +117,25 @@ dynamic_filter_publish_plan::admitted_key expected_key(
 TEST_CASE("admission reads build and probe ordinals from their own sides, not the condition index",
           "[dynamic_filter][key_admission]")
 {
-  // Probe ordinals 9 and 3, build ordinals 4 and 7, hinted in reverse. Every coordinate differs
-  // from every other, so reading the probe side, or substituting the condition index, fails.
+  // Probe ordinals 9 and 3, build ordinals 4 and 7. Every coordinate differs from every other, so
+  // reading the probe side, or substituting the condition index, fails.
   auto const conditions = make_wrapped_equalities_at({{9, 4}, {3, 7}});
   std::vector<dynamic_filter_condition_shape> const shapes(2, kDirectDirect);
-  std::vector<std::size_t> const hinted{1, 0};
-  std::vector<dynamic_filter_scan_target_input> const targets{
-    {.columns = {{.channel_push_ordinal = 21, .probe_storage_type = kInt32},
-                 {.channel_push_ordinal = 8, .probe_storage_type = kInt32}}}};
 
-  auto const result = admit_dynamic_filter_keys(
-    conditions, shapes, std::span<std::size_t const>{hinted}, targets, {});
+  auto const admitted = admit_dynamic_filter_keys(conditions, shapes, {});
 
-  REQUIRE(result.admitted_keys.size() == 2);
-  REQUIRE(result.admitted_keys[0].planner_condition_index == 1);
-  REQUIRE(result.admitted_keys[0].build_key_ordinal == 7);
-  REQUIRE(result.admitted_keys[1].planner_condition_index == 0);
-  REQUIRE(result.admitted_keys[1].build_key_ordinal == 4);
+  REQUIRE(admitted.size() == 2);
+  REQUIRE(admitted[0].planner_condition_index == 0);
+  REQUIRE(admitted[0].build_key_ordinal == 4);
+  REQUIRE(admitted[1].planner_condition_index == 1);
+  REQUIRE(admitted[1].build_key_ordinal == 7);
   // The probe ordinal is read from the probe (left) side, never the build side: keys[0] is
-  // condition 1 (probe 3), keys[1] is condition 0 (probe 9).
-  REQUIRE(result.admitted_keys[0].probe_key_ordinal == 3);
-  REQUIRE(result.admitted_keys[1].probe_key_ordinal == 9);
-  REQUIRE(result.per_target_key_bindings[0] ==
-          std::vector<dynamic_filter_publish_plan::key_binding>{
-            {.admitted_key_index = 0, .channel_push_ordinal = 21, .probe_storage_type = kInt32},
-            {.admitted_key_index = 1, .channel_push_ordinal = 8, .probe_storage_type = kInt32}});
+  // condition 0 (probe 9), keys[1] is condition 1 (probe 3).
+  REQUIRE(admitted[0].probe_key_ordinal == 9);
+  REQUIRE(admitted[1].probe_key_ordinal == 3);
 }
 
-TEST_CASE("admission records each build side's own storage type", "[dynamic_filter][key_admission]")
+TEST_CASE("admission records each side's own storage type", "[dynamic_filter][key_admission]")
 {
   duckdb::vector<duckdb::JoinCondition> raw;
   raw.push_back(make_condition(make_ref(0), make_ref(0)));
@@ -156,12 +146,34 @@ TEST_CASE("admission records each build side's own storage type", "[dynamic_filt
   auto const conditions = sirius::wrap_join_conditions(std::move(raw));
   std::vector<dynamic_filter_condition_shape> const shapes(3, kDirectDirect);
 
-  auto const result = admit_dynamic_filter_keys(conditions, shapes, std::nullopt, {}, {});
+  auto const admitted = admit_dynamic_filter_keys(conditions, shapes, {});
 
-  REQUIRE(result.admitted_keys.size() == 3);
-  REQUIRE(result.admitted_keys[0].storage_type == kInt32);
-  REQUIRE(result.admitted_keys[1].storage_type == kInt64);
-  REQUIRE(result.admitted_keys[2].storage_type == cudf::data_type{cudf::type_id::TIMESTAMP_DAYS});
+  REQUIRE(admitted.size() == 3);
+  REQUIRE(admitted[0].storage_type == kInt32);
+  REQUIRE(admitted[1].storage_type == kInt64);
+  REQUIRE(admitted[2].storage_type == cudf::data_type{cudf::type_id::TIMESTAMP_DAYS});
+  // The probe type is recorded beside the build type; `direct_route_admissible` compares the two,
+  // so substituting the build type for both would make that comparison vacuous.
+  REQUIRE(admitted[0].probe_storage_type == kInt32);
+  REQUIRE(admitted[1].probe_storage_type == kInt64);
+  REQUIRE(admitted[2].probe_storage_type == cudf::data_type{cudf::type_id::TIMESTAMP_DAYS});
+}
+
+TEST_CASE("admission requires a probe-side bound reference", "[dynamic_filter][key_admission]")
+{
+  // Every use of an admitted key starts a discovery trace at its probe ordinal, so a condition
+  // without a probe-side reference admits no key: there is no entry ordinal to trace from, and
+  // such a key could never produce a filter on any route. (A cast probe side over a direct build
+  // side reaches admission when only the expression -- not the carried shape -- differs.)
+  duckdb::vector<duckdb::JoinCondition> raw;
+  raw.push_back(make_condition(
+    duckdb::BoundCastExpression::AddDefaultCastToType(make_ref(0), duckdb::LogicalType::BIGINT),
+    make_ref(0, duckdb::LogicalType::BIGINT)));
+  auto const conditions = sirius::wrap_join_conditions(std::move(raw));
+  std::vector<dynamic_filter_condition_shape> const shapes(1, kDirectDirect);
+
+  auto const admitted = admit_dynamic_filter_keys(conditions, shapes, {});
+  REQUIRE(admitted.empty());
 }
 
 TEST_CASE("admission rejects a build ordinal outside the cuDF column range",
@@ -172,8 +184,7 @@ TEST_CASE("admission rejects a build ordinal outside the cuDF column range",
   auto const conditions = make_wrapped_equalities_at({{0, oversized}});
   std::vector<dynamic_filter_condition_shape> const shapes(1, kDirectDirect);
 
-  REQUIRE_THROWS_AS(admit_dynamic_filter_keys(conditions, shapes, std::nullopt, {}, {}),
-                    std::invalid_argument);
+  REQUIRE_THROWS_AS(admit_dynamic_filter_keys(conditions, shapes, {}), std::invalid_argument);
 }
 
 TEST_CASE("admission rejects a build side that is not a plain column reference",
@@ -185,8 +196,8 @@ TEST_CASE("admission rejects a build side that is not a plain column reference",
   auto const conditions = sirius::wrap_join_conditions(std::move(raw));
   std::vector<dynamic_filter_condition_shape> const shapes(1, kDirectDirect);
 
-  auto const result = admit_dynamic_filter_keys(conditions, shapes, std::nullopt, {}, {});
-  REQUIRE(result.admitted_keys.empty());
+  auto const admitted = admit_dynamic_filter_keys(conditions, shapes, {});
+  REQUIRE(admitted.empty());
 }
 
 //===----------------------------------------------------------------------===//
@@ -223,52 +234,28 @@ TEST_CASE("key-shape classification distinguishes direct, cast, and computed sid
 // admit_dynamic_filter_keys
 //===----------------------------------------------------------------------===//
 
-TEST_CASE("admission binds reordered non-prefix hinted keys to their channel push ordinals",
+TEST_CASE("admission admits every legal condition in planner order",
           "[dynamic_filter][key_admission]")
 {
   auto const conditions = make_wrapped_equalities(3);
   std::vector<dynamic_filter_condition_shape> const shapes(3, kDirectDirect);
-  // DuckDB discovery names conditions {2, 0}, in that filter-ordinal order.
-  std::vector<std::size_t> const hinted{2, 0};
-  std::vector<dynamic_filter_scan_target_input> const targets{
-    {.columns = {{.channel_push_ordinal = 12, .probe_storage_type = kInt32},
-                 {.channel_push_ordinal = 7, .probe_storage_type = kInt32}}}};
 
-  auto const result = admit_dynamic_filter_keys(
-    conditions, shapes, std::span<std::size_t const>{hinted}, targets, {});
-
-  REQUIRE(result.admitted_keys ==
-          std::vector<dynamic_filter_publish_plan::admitted_key>{expected_key(2), expected_key(0)});
-  REQUIRE(result.per_target_key_bindings.size() == 1);
-  REQUIRE(result.per_target_key_bindings[0] ==
-          std::vector<dynamic_filter_publish_plan::key_binding>{
-            {.admitted_key_index = 0, .channel_push_ordinal = 12, .probe_storage_type = kInt32},
-            {.admitted_key_index = 1, .channel_push_ordinal = 7, .probe_storage_type = kInt32}});
+  auto const admitted = admit_dynamic_filter_keys(conditions, shapes, {});
+  REQUIRE(admitted == std::vector<dynamic_filter_publish_plan::admitted_key>{
+                        expected_key(0), expected_key(1), expected_key(2)});
 }
 
-TEST_CASE("admission keeps partially eligible composites correctly bound",
-          "[dynamic_filter][key_admission]")
+TEST_CASE("admission keeps partially eligible composites", "[dynamic_filter][key_admission]")
 {
   auto const conditions = make_wrapped_equalities(2);
   // Condition 0 carries a cast on its build side: excluded, matching the runtime publisher's cast
-  // skip before producer-key admission moved to plan time. Condition 1 stays eligible and must
-  // keep its own channel_push_ordinal (9) after admitted-key compaction.
+  // skip before producer-key admission moved to plan time. Condition 1 stays eligible.
   std::vector<dynamic_filter_condition_shape> const shapes{
     {.probe = dynamic_filter_key_shape::direct, .build = dynamic_filter_key_shape::cast},
     kDirectDirect};
-  std::vector<std::size_t> const hinted{0, 1};
-  std::vector<dynamic_filter_scan_target_input> const targets{
-    {.columns = {{.channel_push_ordinal = 4, .probe_storage_type = kInt32},
-                 {.channel_push_ordinal = 9, .probe_storage_type = kInt32}}}};
 
-  auto const result = admit_dynamic_filter_keys(
-    conditions, shapes, std::span<std::size_t const>{hinted}, targets, {});
-
-  REQUIRE(result.admitted_keys ==
-          std::vector<dynamic_filter_publish_plan::admitted_key>{expected_key(1)});
-  REQUIRE(result.per_target_key_bindings[0] ==
-          std::vector<dynamic_filter_publish_plan::key_binding>{
-            {.admitted_key_index = 0, .channel_push_ordinal = 9, .probe_storage_type = kInt32}});
+  auto const admitted = admit_dynamic_filter_keys(conditions, shapes, {});
+  REQUIRE(admitted == std::vector<dynamic_filter_publish_plan::admitted_key>{expected_key(1)});
 }
 
 TEST_CASE("admission never admits an inequality condition", "[dynamic_filter][key_admission]")
@@ -280,33 +267,37 @@ TEST_CASE("admission never admits an inequality condition", "[dynamic_filter][ke
   auto const conditions = sirius::wrap_join_conditions(std::move(raw));
   std::vector<dynamic_filter_condition_shape> const shapes(2, kDirectDirect);
 
-  // DuckDB hints inequality comparisons too (`<`, `<=`, `>`, `>=`), so a hint naming a non-equality
-  // condition is reachable. The pre-seam runtime skipped those by a bounds check that held only
-  // because DuckDB reorders equalities to the front before emitting hint indexes; admission rejects
-  // them on the comparison itself and depends on no such ordering.
-  std::vector<std::size_t> const hinted{1};
-  std::vector<dynamic_filter_scan_target_input> const targets{
-    {.columns = {{.channel_push_ordinal = 3, .probe_storage_type = kInt32}}}};
-
-  auto const result = admit_dynamic_filter_keys(
-    conditions, shapes, std::span<std::size_t const>{hinted}, targets, {});
-  REQUIRE(result.admitted_keys.empty());
-  REQUIRE(result.per_target_key_bindings[0].empty());
+  auto const admitted = admit_dynamic_filter_keys(conditions, shapes, {});
+  REQUIRE(admitted == std::vector<dynamic_filter_publish_plan::admitted_key>{expected_key(0)});
 }
 
-TEST_CASE("admission works without DuckDB discovery", "[dynamic_filter][key_admission]")
+TEST_CASE("admission never admits a null-equal condition", "[dynamic_filter][key_admission]")
+{
+  // Obligation B1's guard. Build-side placement is sound only because this clause holds: under
+  // null-equal semantics an endpoint pruning a LEFT join's build input would add NULL-padded rows
+  // the producing join accepts, so the endpoint would change results rather than only pre-filter.
+  duckdb::vector<duckdb::JoinCondition> raw;
+  raw.push_back(
+    make_condition(make_ref(0), make_ref(0), duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM));
+  auto const conditions = sirius::wrap_join_conditions(std::move(raw));
+  std::vector<dynamic_filter_condition_shape> const shapes(1, kDirectDirect);
+
+  auto const admitted = admit_dynamic_filter_keys(conditions, shapes, {});
+  REQUIRE(admitted.empty());
+}
+
+TEST_CASE("admitted keys without any target build a valid but disabled plan",
+          "[dynamic_filter][key_admission]")
 {
   auto const conditions = make_wrapped_equalities(2);
   std::vector<dynamic_filter_condition_shape> const shapes(2, kDirectDirect);
 
-  auto result = admit_dynamic_filter_keys(conditions, shapes, std::nullopt, {}, {});
-  REQUIRE(result.admitted_keys ==
+  auto admitted = admit_dynamic_filter_keys(conditions, shapes, {});
+  REQUIRE(admitted ==
           std::vector<dynamic_filter_publish_plan::admitted_key>{expected_key(0), expected_key(1)});
-  REQUIRE(result.per_target_key_bindings.empty());
 
-  // Admitted keys without any target build a valid but disabled plan: publication is a no-op
-  // until a target exists.
-  dynamic_filter_publish_plan const plan{std::move(result.admitted_keys), {}, {}};
+  // Publication is a no-op until discovery binds a target.
+  dynamic_filter_publish_plan const plan{std::move(admitted), {}, {}};
   REQUIRE_FALSE(plan.enabled());
 }
 
@@ -315,17 +306,14 @@ TEST_CASE("admission re-emits domain cardinalities in admitted order",
 {
   auto const conditions = make_wrapped_equalities(3);
   std::vector<dynamic_filter_condition_shape> const shapes(3, kDirectDirect);
-  std::vector<std::size_t> const hinted{2, 0};
-  std::vector<dynamic_filter_scan_target_input> const targets{
-    {.columns = {{.channel_push_ordinal = 1, .probe_storage_type = kInt32},
-                 {.channel_push_ordinal = 0, .probe_storage_type = kInt32}}}};
   std::vector<std::size_t> const condition_domains{10, 20, 30};
 
-  auto const result = admit_dynamic_filter_keys(
-    conditions, shapes, std::span<std::size_t const>{hinted}, targets, condition_domains);
+  auto const admitted = admit_dynamic_filter_keys(conditions, shapes, condition_domains);
   // Recorded on each key rather than in a parallel array, so it cannot drift out of alignment.
-  REQUIRE(result.admitted_keys[0].build_key_domain_cardinality == 30);
-  REQUIRE(result.admitted_keys[1].build_key_domain_cardinality == 10);
+  REQUIRE(admitted.size() == 3);
+  REQUIRE(admitted[0].build_key_domain_cardinality == 10);
+  REQUIRE(admitted[1].build_key_domain_cardinality == 20);
+  REQUIRE(admitted[2].build_key_domain_cardinality == 30);
 }
 
 TEST_CASE("admission records zero domains from an empty domain vector",
@@ -335,17 +323,12 @@ TEST_CASE("admission records zero domains from an empty domain vector",
   // a programming error and throws): every admitted key's gate stays disabled.
   auto const conditions = make_wrapped_equalities(2);
   std::vector<dynamic_filter_condition_shape> const shapes(2, kDirectDirect);
-  std::vector<std::size_t> const hinted{1, 0};
-  std::vector<dynamic_filter_scan_target_input> const targets{
-    {.columns = {{.channel_push_ordinal = 1, .probe_storage_type = kInt32},
-                 {.channel_push_ordinal = 0, .probe_storage_type = kInt32}}}};
 
-  auto const result = admit_dynamic_filter_keys(
-    conditions, shapes, std::span<std::size_t const>{hinted}, targets, {});
+  auto const admitted = admit_dynamic_filter_keys(conditions, shapes, {});
 
-  REQUIRE(result.admitted_keys.size() == 2);
-  REQUIRE(result.admitted_keys[0].build_key_domain_cardinality == 0);
-  REQUIRE(result.admitted_keys[1].build_key_domain_cardinality == 0);
+  REQUIRE(admitted.size() == 2);
+  REQUIRE(admitted[0].build_key_domain_cardinality == 0);
+  REQUIRE(admitted[1].build_key_domain_cardinality == 0);
 }
 
 TEST_CASE("admission marks only the key whose build ordinal is the proven-unique column",
@@ -358,20 +341,20 @@ TEST_CASE("admission marks only the key whose build ordinal is the proven-unique
 
   SECTION("a singleton proof marks the matching ordinal")
   {
-    auto const result = admit_dynamic_filter_keys(
-      conditions, shapes, std::nullopt, {}, {}, std::optional<std::size_t>{7});
+    auto const admitted =
+      admit_dynamic_filter_keys(conditions, shapes, {}, std::optional<std::size_t>{7});
 
-    REQUIRE(result.admitted_keys.size() == 2);
-    REQUIRE_FALSE(result.admitted_keys[0].build_key_proven_unique);
-    REQUIRE(result.admitted_keys[1].build_key_proven_unique);
+    REQUIRE(admitted.size() == 2);
+    REQUIRE_FALSE(admitted[0].build_key_proven_unique);
+    REQUIRE(admitted[1].build_key_proven_unique);
   }
   SECTION("no proof marks nothing")
   {
-    auto const result = admit_dynamic_filter_keys(conditions, shapes, std::nullopt, {}, {});
+    auto const admitted = admit_dynamic_filter_keys(conditions, shapes, {});
 
-    REQUIRE(result.admitted_keys.size() == 2);
-    REQUIRE_FALSE(result.admitted_keys[0].build_key_proven_unique);
-    REQUIRE_FALSE(result.admitted_keys[1].build_key_proven_unique);
+    REQUIRE(admitted.size() == 2);
+    REQUIRE_FALSE(admitted[0].build_key_proven_unique);
+    REQUIRE_FALSE(admitted[1].build_key_proven_unique);
   }
 }
 
@@ -379,45 +362,17 @@ TEST_CASE("admission rejects inconsistent caller input", "[dynamic_filter][key_a
 {
   auto const conditions = make_wrapped_equalities(2);
   std::vector<dynamic_filter_condition_shape> const shapes(2, kDirectDirect);
-  std::vector<std::size_t> const hinted{0};
-  std::vector<dynamic_filter_scan_target_input> const targets{
-    {.columns = {{.channel_push_ordinal = 3, .probe_storage_type = kInt32}}}};
 
   SECTION("misaligned shapes")
   {
     std::vector<dynamic_filter_condition_shape> const bad_shapes(1, kDirectDirect);
-    REQUIRE_THROWS_AS(admit_dynamic_filter_keys(
-                        conditions, bad_shapes, std::span<std::size_t const>{hinted}, targets, {}),
-                      std::invalid_argument);
-  }
-  SECTION("targets without discovery")
-  {
-    REQUIRE_THROWS_AS(admit_dynamic_filter_keys(conditions, shapes, std::nullopt, targets, {}),
-                      std::invalid_argument);
-  }
-  SECTION("hinted condition index out of range")
-  {
-    std::vector<std::size_t> const bad_hint{5};
-    REQUIRE_THROWS_AS(admit_dynamic_filter_keys(
-                        conditions, shapes, std::span<std::size_t const>{bad_hint}, targets, {}),
-                      std::invalid_argument);
-  }
-  SECTION("target arity mismatched with the discovery")
-  {
-    std::vector<dynamic_filter_scan_target_input> const bad_targets{
-      {.columns = {{.channel_push_ordinal = 3, .probe_storage_type = kInt32},
-                   {.channel_push_ordinal = 4, .probe_storage_type = kInt32}}}};
-    REQUIRE_THROWS_AS(admit_dynamic_filter_keys(
-                        conditions, shapes, std::span<std::size_t const>{hinted}, bad_targets, {}),
-                      std::invalid_argument);
+    REQUIRE_THROWS_AS(admit_dynamic_filter_keys(conditions, bad_shapes, {}), std::invalid_argument);
   }
   SECTION("misaligned domain cardinalities")
   {
     std::vector<std::size_t> const bad_domains{1};
-    REQUIRE_THROWS_AS(
-      admit_dynamic_filter_keys(
-        conditions, shapes, std::span<std::size_t const>{hinted}, targets, bad_domains),
-      std::invalid_argument);
+    REQUIRE_THROWS_AS(admit_dynamic_filter_keys(conditions, shapes, bad_domains),
+                      std::invalid_argument);
   }
 }
 
@@ -450,10 +405,9 @@ TEST_CASE("join-edge route accepts only direct matching INT32/INT64 equality key
     // value-correct); assert both variants so the scopes cannot silently converge.
     auto const conditions = make_wrapped_equalities(2);
     std::vector<dynamic_filter_condition_shape> const shapes{probe_computed, build_computed};
-    auto const result = admit_dynamic_filter_keys(conditions, shapes, std::nullopt, {}, {});
-    REQUIRE(result.admitted_keys ==
-            std::vector<dynamic_filter_publish_plan::admitted_key>{
-              expected_key(0, probe_computed), expected_key(1, build_computed)});
+    auto const admitted = admit_dynamic_filter_keys(conditions, shapes, {});
+    REQUIRE(admitted == std::vector<dynamic_filter_publish_plan::admitted_key>{
+                          expected_key(0, probe_computed), expected_key(1, build_computed)});
   }
   SECTION("negatives")
   {
@@ -520,6 +474,7 @@ TEST_CASE("publish plan rejects inconsistent admitted-key metadata",
                  build_key_ordinal,
                  probe_key_ordinal,
                  storage_type,
+                 probe_storage_type,
                  key_shape,
                  domain,
                  unique] = expected_key(3);
@@ -527,6 +482,7 @@ TEST_CASE("publish plan rejects inconsistent admitted-key metadata",
     (void)build_key_ordinal;
     (void)probe_key_ordinal;
     (void)storage_type;
+    (void)probe_storage_type;
     (void)key_shape;
     (void)domain;
     (void)unique;
@@ -549,6 +505,10 @@ TEST_CASE("publish plan rejects inconsistent admitted-key metadata",
     auto vary_storage_type         = base;
     vary_storage_type.storage_type = kInt64;
     REQUIRE_FALSE(base == vary_storage_type);
+
+    auto vary_probe_storage_type               = base;
+    vary_probe_storage_type.probe_storage_type = kInt64;
+    REQUIRE_FALSE(base == vary_probe_storage_type);
 
     auto vary_key_shape            = base;
     vary_key_shape.key_shape.build = dynamic_filter_key_shape::computed;

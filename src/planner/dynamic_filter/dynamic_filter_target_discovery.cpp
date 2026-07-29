@@ -16,12 +16,17 @@
 
 // sirius
 #include <expression/ast/node.hpp>
+#include <op/sirius_physical_filter.hpp>
 #include <op/sirius_physical_grouped_aggregate.hpp>
 #include <op/sirius_physical_hash_join.hpp>
 #include <op/sirius_physical_operator.hpp>
 #include <op/sirius_physical_operator_type.hpp>
 #include <op/sirius_physical_projection.hpp>
-#include <planner/dynamic_filter/dynamic_filter_endpoint_placement.hpp>
+#include <planner/dynamic_filter/dynamic_filter_target_discovery.hpp>
+
+// stdlib
+#include <cassert>
+#include <variant>
 
 namespace sirius::planner {
 
@@ -69,6 +74,13 @@ bool build_block_is_value_preserving(duckdb::JoinType join_type) noexcept
   return false;  // unreachable;
 }
 
+// Wrap an optional single-step rule result in the fan-out return shape.
+std::vector<descent_step> as_steps(std::optional<descent_step> step)
+{
+  if (!step.has_value()) { return {}; }
+  return {*step};
+}
+
 }  // namespace
 
 std::optional<std::size_t> projection_reference_input(sirius::ast::node const& expression)
@@ -90,7 +102,8 @@ std::optional<descent_step> join_block_descent(
   duckdb::JoinType join_type,
   std::vector<cudf::size_type> const& probe_block_output_columns,
   std::vector<cudf::size_type> const& build_block_output_columns,
-  std::size_t output_ordinal)
+  std::size_t output_ordinal,
+  descent_policy policy)
 {
   auto const probe_block_size = probe_block_output_columns.size();
   if (output_ordinal < probe_block_size) {
@@ -99,6 +112,7 @@ std::optional<descent_step> join_block_descent(
       .child_index   = 0,
       .child_ordinal = static_cast<std::size_t>(probe_block_output_columns[output_ordinal])};
   }
+  if (!policy.descend_build_blocks) { return std::nullopt; }
   if (!build_block_is_value_preserving(join_type)) { return std::nullopt; }
   auto const build_ordinal = output_ordinal - probe_block_size;
   if (build_ordinal >= build_block_output_columns.size()) { return std::nullopt; }
@@ -107,32 +121,61 @@ std::optional<descent_step> join_block_descent(
     .child_ordinal = static_cast<std::size_t>(build_block_output_columns[build_ordinal])};
 }
 
-std::optional<descent_step> pass_through_step(sirius::op::sirius_physical_operator const& node,
-                                              std::size_t output_ordinal)
+std::vector<descent_step> descent_steps(sirius::op::sirius_physical_operator const& node,
+                                        std::size_t output_ordinal,
+                                        descent_policy policy)
 {
   using sirius::op::SiriusPhysicalOperatorType;
   switch (node.type) {
     case SiriusPhysicalOperatorType::PROJECTION: {
       auto const& projection = node.Cast<sirius::op::sirius_physical_projection>();
-      if (output_ordinal >= projection.select_list.size()) { return std::nullopt; }
+      if (output_ordinal >= projection.select_list.size()) { return {}; }
       auto const input = projection_reference_input(*projection.select_list[output_ordinal]);
-      if (!input.has_value()) { return std::nullopt; }
-      return descent_step{.child_index = 0, .child_ordinal = *input};
+      if (!input.has_value()) { return {}; }
+      return {descent_step{.child_index = 0, .child_ordinal = *input}};
     }
     case SiriusPhysicalOperatorType::HASH_GROUP_BY: {
       auto const& aggregate = node.Cast<sirius::op::sirius_physical_grouped_aggregate>();
       auto const input =
         group_by_key_input(aggregate.group_idx, aggregate.grouping_sets.size(), output_ordinal);
-      if (!input.has_value()) { return std::nullopt; }
-      return descent_step{.child_index = 0, .child_ordinal = *input};
+      if (!input.has_value()) { return {}; }
+      return {descent_step{.child_index = 0, .child_ordinal = *input}};
     }
     case SiriusPhysicalOperatorType::HASH_JOIN: {
       auto const& join = node.Cast<sirius::op::sirius_physical_hash_join>();
-      return join_block_descent(join.join_type,
-                                join.lhs_output_columns.col_idxs,
-                                join.rhs_output_columns.col_idxs,
-                                output_ordinal);
+      return as_steps(join_block_descent(join.join_type,
+                                         join.lhs_output_columns.col_idxs,
+                                         join.rhs_output_columns.col_idxs,
+                                         output_ordinal,
+                                         policy));
     }
+    // A filter is a row predicate over unchanged columns: value-preserving through its output
+    // gather and commuting with any other independent row predicate applied below it.
+    case SiriusPhysicalOperatorType::FILTER: {
+      auto const& filter = node.Cast<sirius::op::sirius_physical_filter>();
+      if (std::holds_alternative<sirius::op::passthrough>(filter.output_columns)) {
+        return {descent_step{.child_index = 0, .child_ordinal = output_ordinal}};
+      }
+      auto const* gather = std::get_if<std::vector<cudf::size_type>>(&filter.output_columns);
+      if (gather == nullptr || output_ordinal >= gather->size()) { return {}; }
+      return {descent_step{.child_index   = 0,
+                           .child_ordinal = static_cast<std::size_t>((*gather)[output_ordinal])}};
+    }
+    // A physical union's output is positionally aligned with every child by construction, so the
+    // trace fans out into each child at the same ordinal.
+    case SiriusPhysicalOperatorType::UNION: {
+      std::vector<descent_step> steps;
+      steps.reserve(node.children.size());
+      for (std::size_t child_index = 0; child_index < node.children.size(); ++child_index) {
+        assert(node.children[child_index] != nullptr);
+        steps.push_back(descent_step{.child_index = child_index, .child_ordinal = output_ordinal});
+      }
+      return steps;
+    }
+    // A row mask passes every column through unchanged and commutes with any other row filter, so a
+    // later key's endpoint may descend past an earlier key's rather than stopping on it.
+    case SiriusPhysicalOperatorType::DYNAMIC_FILTER:
+      return {descent_step{.child_index = 0, .child_ordinal = output_ordinal}};
     case SiriusPhysicalOperatorType::INVALID:
     case SiriusPhysicalOperatorType::ORDER_BY:
     case SiriusPhysicalOperatorType::LIMIT:
@@ -144,7 +187,6 @@ std::optional<descent_step> pass_through_step(sirius::op::sirius_physical_operat
     case SiriusPhysicalOperatorType::UNGROUPED_AGGREGATE:
     case SiriusPhysicalOperatorType::PERFECT_HASH_GROUP_BY:
     case SiriusPhysicalOperatorType::PARTITIONED_AGGREGATE:
-    case SiriusPhysicalOperatorType::FILTER:
     case SiriusPhysicalOperatorType::COPY_TO_FILE:
     case SiriusPhysicalOperatorType::BATCH_COPY_TO_FILE:
     case SiriusPhysicalOperatorType::RESERVOIR_SAMPLE:
@@ -171,7 +213,6 @@ std::optional<descent_step> pass_through_step(sirius::op::sirius_physical_operat
     case SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN:
     case SiriusPhysicalOperatorType::POSITIONAL_JOIN:
     case SiriusPhysicalOperatorType::ASOF_JOIN:
-    case SiriusPhysicalOperatorType::UNION:
     case SiriusPhysicalOperatorType::RECURSIVE_CTE:
     case SiriusPhysicalOperatorType::RECURSIVE_KEY_CTE:
     case SiriusPhysicalOperatorType::CTE:
@@ -222,29 +263,81 @@ std::optional<descent_step> pass_through_step(sirius::op::sirius_physical_operat
     case SiriusPhysicalOperatorType::SORT_SAMPLE:
     case SiriusPhysicalOperatorType::GPU_VALUES:
     case SiriusPhysicalOperatorType::GPU_SCAN:
-    case SiriusPhysicalOperatorType::DYNAMIC_FILTER:
-    case SiriusPhysicalOperatorType::STREAMING_SOURCE: return std::nullopt;
+    case SiriusPhysicalOperatorType::STREAMING_SOURCE: return {};
   }
-  return std::nullopt;  // unreachable
+  return {};  // unreachable
 }
 
-endpoint_site resolve_endpoint_site(sirius::op::sirius_physical_operator* probe_subtree_root,
-                                    std::size_t a0)
+namespace {
+
+// True when every step names a live child of `node`. A rule that accepted a step whose child slot
+// is absent cannot be followed; the driver then treats `node` as the terminal, matching the
+// single-step behavior the endpoint splice has always had.
+bool steps_are_followable(sirius::op::sirius_physical_operator const& node,
+                          std::vector<descent_step> const& steps)
 {
-  endpoint_site deepest{.node = probe_subtree_root, .ordinal = a0};
-  auto* node       = probe_subtree_root;
-  auto current_ord = a0;
-  while (node != nullptr) {
-    auto const step = pass_through_step(*node, current_ord);
-    if (!step.has_value()) { break; }
-    if (step->child_index >= node->children.size()) { break; }
-    auto* child = node->children[step->child_index].get();
-    if (child == nullptr) { break; }
-    node        = child;
-    current_ord = step->child_ordinal;
-    deepest     = endpoint_site{.node = node, .ordinal = current_ord};
+  if (steps.empty()) { return false; }
+  for (auto const& step : steps) {
+    if (step.child_index >= node.children.size() || node.children[step.child_index] == nullptr) {
+      return false;
+    }
   }
-  return deepest;
+  return true;
+}
+
+void trace_probe_key_into(sirius::op::sirius_physical_operator& node,
+                          std::size_t ordinal,
+                          descent_policy policy,
+                          std::vector<route_terminal>& terminals)
+{
+  auto const steps = descent_steps(node, ordinal, policy);
+  if (!steps_are_followable(node, steps)) {
+    terminals.push_back(route_terminal{.node = &node, .ordinal = ordinal});
+    return;
+  }
+  for (auto const& step : steps) {
+    trace_probe_key_into(*node.children[step.child_index], step.child_ordinal, policy, terminals);
+  }
+}
+
+}  // namespace
+
+std::vector<route_terminal> trace_probe_key(sirius::op::sirius_physical_operator& root,
+                                            std::size_t a0,
+                                            descent_policy policy)
+{
+  std::vector<route_terminal> terminals;
+  trace_probe_key_into(root, a0, policy, terminals);
+  return terminals;
+}
+
+endpoint_placement place_endpoint(duckdb::unique_ptr<sirius::op::sirius_physical_operator> subtree,
+                                  std::size_t a0,
+                                  descent_policy policy,
+                                  endpoint_factory const& make_endpoint)
+{
+  assert(subtree != nullptr);
+  auto const steps = descent_steps(*subtree, a0, policy);
+  if (steps_are_followable(*subtree, steps)) {
+    // Descend each accepted branch: move the child out, place within it, move the rewrapped child
+    // back. Branch order (ascending child index) keeps site ordinals aligned with the terminal
+    // order trace_probe_key reports.
+    endpoint_placement result;
+    for (auto const& step : steps) {
+      auto& child_slot = subtree->children[step.child_index];
+      auto placed =
+        place_endpoint(std::move(child_slot), step.child_ordinal, policy, make_endpoint);
+      child_slot = std::move(placed.subtree);
+      result.site_ordinals.insert(
+        result.site_ordinals.end(), placed.site_ordinals.begin(), placed.site_ordinals.end());
+    }
+    result.subtree = std::move(subtree);
+    return result;
+  }
+  // Deepest safe site: the endpoint becomes this operator's new parent.
+  auto endpoint = make_endpoint(*subtree);
+  endpoint->children.push_back(std::move(subtree));
+  return endpoint_placement{.subtree = std::move(endpoint), .site_ordinals = {a0}};
 }
 
 }  // namespace sirius::planner

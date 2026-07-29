@@ -35,14 +35,11 @@ namespace sirius::op::scan {
 //===----------------------------------------------------------------------===//
 /// @brief Per-scan selectivity gate for post-decode dynamic filters.
 ///
-/// Used by @ref apply_dynamic_filters_gated_view. The first applied non-empty batch decides:
-/// filters that keep more than @c keep_threshold of the rows they see are disabled for the scan;
-/// more selective filters stay active. Growth beyond the snapshot that produced a disable decision
-/// re-arms the gate for one measurement. An immediate Phase 1 probe normally sees the complete
-/// publication, while a scan target reached through an intervening join may observe additional
-/// filters on later splits. Concurrent scan batches may both measure; decision recording is
-/// serialized so an older measurement cannot demote a gate that a selective batch already made
-/// active.
+/// `apply_dynamic_filters_gated_view()` uses the first applicable non-empty batch to decide whether
+/// post-decode filtering earns its cost. A keep ratio above `keep_threshold` disables filtering;
+/// otherwise the gate becomes permanently active. If an append-only channel grows after a disable
+/// decision, the new filter count permits one new measurement. Decision updates are serialized so
+/// an older concurrent batch cannot overwrite an active decision.
 class dynamic_filter_gate {
  public:
   /// Default fraction of retained rows above which the scan's post-decode filtering is disabled
@@ -72,24 +69,16 @@ class dynamic_filter_gate {
   //===--------------------------------------------------------------------===//
   // Per-filter marginal usefulness
   //===--------------------------------------------------------------------===//
-  // The scan-level gate above decides whether applying anything is worth it; these decide whether
-  // one filter still earns its mask. The apply cascades filters most-selective-first and records
-  // each filter's marginal keep ratio (its drop on the rows surviving the filters before it). A
-  // filter whose marginal keep exceeds the skip threshold is dropped from later splits, until the
-  // channel grows and the verdict is re-measured. Skipping is safe: the join is authoritative.
+  // Membership filters also record their marginal keep ratio after earlier masks. A filter above
+  // the skip threshold is omitted on later splits until channel growth invalidates the reading.
 
-  /// Marginal keep ratio recorded for @p filter, or nullopt while unmeasured or when the reading
-  /// predates the current channel size. A marginal describes this filter only relative to the
-  /// filters that ran ahead of it, so a reading taken against a smaller append-only channel
-  /// describes a cascade that no longer exists and can be wrong in either direction: it is
-  /// re-measured rather than trusted.
+  /// Marginal keep ratio for @p filter, or `std::nullopt` when unmeasured or measured before the
+  /// channel reached @p observed_filter_count.
   [[nodiscard]] std::optional<double> filter_keep_ratio(
     sirius::op::sirius_dynamic_filter const* filter, std::size_t observed_filter_count) const;
 
-  /// Record @p filter's marginal keep ratio, measured against a channel of @p observed_filter_count
-  /// filters. Within one channel size the first measurement wins (later splits see survivor sets
-  /// whose composition depends on cascade order — the first reading is the stable one); a
-  /// measurement against a larger channel supersedes an earlier, now-stale one.
+  /// Record @p filter's marginal keep ratio against a channel of @p observed_filter_count filters.
+  /// The first measurement at one channel size wins; a larger channel size supersedes it.
   void record_filter_keep_ratio(sirius::op::sirius_dynamic_filter const* filter,
                                 double kept,
                                 std::size_t observed_filter_count);

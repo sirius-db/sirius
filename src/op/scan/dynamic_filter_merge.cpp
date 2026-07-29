@@ -76,8 +76,7 @@ std::unique_ptr<cudf::table> apply_dynamic_filters_to_view(
   auto const num_cols = static_cast<std::size_t>(input.num_columns());
   auto const mr       = cudf::get_current_device_resource_ref();
 
-  // Filters apply as a CASCADE, most-selective-first (for membership filters) and AND-merge (for
-  // AST-lowerable filters).
+  // Apply one combined AST mask, then membership masks ordered by recorded selectivity.
   std::unique_ptr<cudf::table> owned;  // most recent step's product backing `current`
   cudf::table_view current = input;
   auto const cascade_step  = [&](std::unique_ptr<cudf::column> mask) -> double {
@@ -90,8 +89,7 @@ std::unique_ptr<cudf::table> apply_dynamic_filters_to_view(
 
   auto const include_ast_masks = mode == dynamic_filter_apply_mode::include_ast_row_masks;
 
-  // (1) AST-lowerable filters (zone-maps) -> one conjoined predicate via compute_column. Skipped
-  // in membership_masks_only mode, where they are already used for row-group pruning at read.
+  // Conjoin AST-lowerable filters into one row mask when the scan reader did not apply them.
   if (include_ast_masks) {
     cudf::ast::tree tree;
     cudf::ast::expression const* root = nullptr;
@@ -113,23 +111,19 @@ std::unique_ptr<cudf::table> apply_dynamic_filters_to_view(
       }
     }
     if (root) {
-      // Because AST-lowering is cross-column, we don't have a per-column keep ratio to gate on.
-      // Ignore it.
+      // The AST mask can span columns, so only the scan-level gate records its combined effect.
       (void)cascade_step(cudf::compute_column(current, *root, stream, mr));
     }
   }
 
-  // (2) Mask-applicable filters (IN-list / bloom membership). Order by recorded marginal keep
-  // ratio (unmeasured filters last, where the cascade has already shrunk the row count, so their
-  // first measurement is cheap); drop filters the gate has marked as not worth their kernel.
+  // Apply membership filters in recorded selectivity order and omit filters the gate disabled.
   struct membership_entry {
     std::size_t col_idx;
     sirius::op::sirius_mask_applicable const* filter;
     sirius::op::sirius_dynamic_filter const* identity;
     std::optional<double> recorded;
   };
-  // Snapshot the channel size once: it scopes every per-filter ratio read and written below, so a
-  // reading is trusted only until the append-only channel grows past the size it was taken at.
+  // Scope every marginal ratio read and update to one channel-size snapshot.
   auto const observed_filter_count = filters.filter_count();
   std::vector<membership_entry> entries;
   for (auto const col_idx : filters.filtered_columns()) {
@@ -174,10 +168,7 @@ std::optional<double> dynamic_filter_gate::filter_keep_ratio(
   std::scoped_lock lock(_filter_ratios_mu);
   auto it = _filter_keep_ratios.find(filter);
   if (it == _filter_keep_ratios.end()) { return std::nullopt; }
-  // A marginal is only meaningful against the filters that ran ahead of it. The channel is
-  // append-only, so a reading taken against fewer filters describes a cascade that no longer
-  // exists -- a filter skipped on it may now prune usefully, and one kept on it may now be
-  // redundant. Re-measure rather than carry the stale verdict for the rest of the query.
+  // Channel growth changes the rows reaching this filter, so remeasure stale marginal ratios.
   if (it->second.observed_filter_count < observed_filter_count) { return std::nullopt; }
   return it->second.kept;
 }
@@ -207,9 +198,7 @@ bool dynamic_filter_gate::applicable(sirius::op::sirius_dynamic_filter_set const
 {
   if (!filters.has_filters()) { return false; }
   if (_state.load(std::memory_order_relaxed) != state::disabled) { return true; }
-  // The channel is append-only and may grow after a transitive target's earlier split snapshots it.
-  // If it grew beyond the snapshot that disabled the gate, the combined mask deserves one fresh
-  // measurement. An immediate Phase 1 probe normally starts after the complete fan-out.
+  // Channel growth after a disable decision permits one measurement of the larger filter set.
   return filters.filter_count() > _decided_filter_count.load(std::memory_order_relaxed);
 }
 
@@ -219,9 +208,7 @@ void dynamic_filter_gate::record_keep_ratio(std::size_t rows_before,
 {
   if (rows_before == 0) { return; }
 
-  // Multiple GPU tasks can finish masks concurrently. Re-read both values while holding the slow
-  // decision-path lock: otherwise an older task can observe UNKNOWN, pause, and overwrite ACTIVE
-  // after a selective task has already committed it.
+  // Serialize state and filter-count updates so an older batch cannot overwrite ACTIVE.
   std::scoped_lock decision_lock(_decision_mu);
   auto const current = _state.load(std::memory_order_relaxed);
   if (current == state::active) { return; }
@@ -247,14 +234,11 @@ std::unique_ptr<cudf::table> apply_dynamic_filters_gated_view(
   int device_id)
 {
   if (!gate.applicable(filters)) { return nullptr; }
-  // Attribute the measurement to the filter-count snapshot used to begin this apply. A transitive
-  // target or another producer may grow the append-only channel beyond that snapshot; the count
-  // change then re-arms the gate once without crediting a mask that omitted the larger snapshot.
+  // Attribute the result to the channel-size snapshot used to start this apply.
   auto const observed_filters = filters.filter_count();
   auto const rows_before      = input.num_rows();
   auto filtered = apply_dynamic_filters_to_view(input, filters, stream, mode, &gate, device_id);
-  // nullptr means no compatible local filter produced a mask/AST. Do not train the shared gate on
-  // that no-op, or one GPU missing a best-effort replica could suppress useful replicas globally.
+  // A device with no applicable local filter must not train the gate shared with other devices.
   if (!filtered) { return nullptr; }
   gate.record_keep_ratio(
     rows_before, static_cast<std::size_t>(filtered->num_rows()), observed_filters);

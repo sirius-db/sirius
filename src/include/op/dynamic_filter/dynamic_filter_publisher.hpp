@@ -33,12 +33,12 @@ namespace sirius::op {
 /**
  * @brief What one publication attempt did
  *
- * Purely descriptive counts, returned to the caller rather than written to a sink, so the
- * publisher stays free of any context and every unit test asserts on a value. The producing join
- * decides where the observation goes.
+ * `publish_dynamic_filters()` returns these counts without retaining a context or updating
+ * `dynamic_filter_stats`. The producing `sirius_physical_hash_join` folds the outcome into its
+ * optional stats sink.
  */
 struct dynamic_filter_publication_outcome {
-  std::size_t keys_considered            = 0;  ///< Admitted keys the attempt walked
+  std::size_t keys_considered            = 0;  ///< Bound admitted keys the attempt walked
   std::size_t keys_with_known_domain     = 0;  ///< Keys whose domain cardinality was nonzero
   std::size_t keys_build_exceeded_domain = 0;  ///< Build rows exceeded the domain bound
   std::size_t skipped_targets_drained    = 0;  ///< 1 when the attempt hit the all-drained return
@@ -54,19 +54,17 @@ struct dynamic_filter_publication_outcome {
  * @brief Build, replicate, and fan out one immutable dynamic-filter snapshot from a complete
  * hash-join build table
  *
- * The immutable @ref dynamic_filter_publish_plan is the only key/target input: filters are
- * constructed densely over its admitted keys and fanned out sparsely along each target's key
- * bindings, pushing at each binding's channel push ordinal. All inputs are read only for the
- * duration of the call; nothing is retained.
+ * The immutable @ref dynamic_filter_publish_plan is the only key and target input. The function
+ * constructs filters only for admitted keys with at least one binding, completes device
+ * replication, and pushes each filter at the binding's channel push ordinal. It retains none of its
+ * inputs.
  *
- * The caller -- @ref sirius_physical_hash_join::publish_dynamic_filters -- owns source readiness
- * and the exactly-once publication arbitration and calls this at most once per query execution.
+ * @ref sirius_physical_hash_join::publish_dynamic_filters owns source readiness and exactly-once
+ * arbitration.
  *
- * A key whose recorded storage type disagrees with the runtime build column is skipped and
- * counted rather than published: the check proves only that plan-time and runtime type derivation
- * agree, and cannot detect the wrong-column case that would actually remove valid rows. A build
- * ordinal outside the build table is different in kind -- it proves the plan is incoherent, and
- * `cudf::table_view::column()` does not bounds-check -- so it fails the attempt.
+ * A key whose recorded storage type disagrees with its runtime build column is skipped and counted.
+ * Before accessing a build column, the function validates its ordinal against @p build_view; an
+ * out-of-range ordinal fails the publication attempt with `std::logic_error`.
  *
  * @throw std::runtime_error if the source GPU cannot be identified
  * @throw std::logic_error if an admitted key's build ordinal lies outside `build_view`, if the

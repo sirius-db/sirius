@@ -29,21 +29,22 @@ namespace sirius::op::scan {
 //===----------------------------------------------------------------------===//
 // sirius_physical_dynamic_filter
 //===----------------------------------------------------------------------===//
-/// @brief Applies dynamic filters to a GPU scan's decoded output.
+/// @brief Applies dynamic filters to the batches flowing through one point in the plan.
 ///
-/// Sits directly above the scan in its pipeline: the scan reads, decodes, and assembles each
-/// batch, then this operator filters it. The apply mode matches the scan format's read-time
-/// capabilities: a parquet scan already ran AST-capable filters (zone maps) through the reader's
-/// @c set_filter, so its operator applies membership masks only; a duckdb-native scan has no
-/// read-time dynamic phase, so its operator also evaluates AST-capable filters row-wise
-/// (@c include_ast_row_masks).
+/// The planner installs this operator in two roles.
 ///
-/// Filters arrive on a @ref sirius_dynamic_filter_set the producing hash-join build publishes into.
-/// The @ref dynamic_filter_gate decides per scan whether filtering earns its cost, and a batch
-/// passes through unchanged when the publication attempt emitted no filter applicable under the
-/// mode, no device-local replica exists, or the gate declines. A producing join's immediate probe
-/// edge is ordered after build-port publication; this operator can run earlier when its scan is a
-/// transitive target below an intervening join, so each execution uses the filters then visible.
+/// On a scan route it sits directly above `sirius_gpu_scan_operator`. Parquet has already applied
+/// AST-capable filters through the reader, so the endpoint uses @c membership_masks_only. A
+/// DuckDB-native scan has no reader filter and uses @c include_ast_row_masks.
+///
+/// On a direct route, `planner::place_endpoint()` inserts it in the producing join's probe
+/// subtree. A @c dynamic_filter_route_class::direct target accepts membership filters, and the
+/// operator uses @c membership_masks_only.
+///
+/// Each execution snapshots the currently visible filters. The batch passes through unchanged when
+/// the channel has no applicable filter, the current device has no replica, or
+/// @ref dynamic_filter_gate declines the work. `on_finalize_operator()` closes the channel after
+/// the endpoint drains.
 class sirius_physical_dynamic_filter : public sirius_physical_operator {
  public:
   static constexpr SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::DYNAMIC_FILTER;
@@ -60,8 +61,8 @@ class sirius_physical_dynamic_filter : public sirius_physical_operator {
 
   void on_finalize_operator() override;
 
-  /// Filtering only shrinks or passes through its input, never expands it — reserve at most the
-  /// input footprint rather than the base 2× expansion default.
+  /// Returns the input footprint. Filtering passes rows through or removes them and never expands
+  /// the input.
   [[nodiscard]] std::size_t no_history_peak_memory_estimate(const input_stats& stats) const override
   {
     return stats.bytes;

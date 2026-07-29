@@ -35,7 +35,6 @@
 #include <cstddef>
 #include <limits>
 #include <memory>
-#include <optional>
 #include <span>
 #include <stdexcept>
 #include <vector>
@@ -96,7 +95,17 @@ dynamic_filter_publication_outcome publish_dynamic_filters(dynamic_filter_publis
   }
 
   auto const& admitted_keys = plan.admitted_keys();
-  outcome.keys_considered   = admitted_keys.size();
+
+  // Publication constructs a filter only for a key some target binds. Admission records legality
+  // beyond consumption -- a legal key for which the discovery walk bound no target (scan or
+  // join-edge) stays in the array as a fact -- and such a key must cost no filter construction.
+  // Binding indexes are constructor-validated, so no bounds check is needed here.
+  std::vector<char> key_bound(admitted_keys.size(), 0);
+  for (auto const& target : probe_targets) {
+    for (auto const& binding : target.key_bindings) {
+      key_bound[binding.admitted_key_index] = 1;
+    }
+  }
 
   int source_device = -1;
   if (cudaGetDevice(&source_device) != cudaSuccess) {
@@ -129,40 +138,10 @@ dynamic_filter_publication_outcome publish_dynamic_filters(dynamic_filter_publis
   std::vector<cudf::data_type> per_key_build_type(admitted_keys.size(),
                                                   cudf::data_type{cudf::type_id::EMPTY});
 
-  // Read a numeric scalar to host as a double for the zone-map range-coverage gate. Returns nullopt
-  // for non-numeric keys (the gate is then skipped and the zone-map is published).
-  auto scalar_to_double = [stream](cudf::scalar const& s) -> std::optional<double> {
-    switch (s.type().id()) {
-      case cudf::type_id::INT8:
-        return static_cast<double>(
-          static_cast<cudf::numeric_scalar<std::int8_t> const&>(s).value(stream));
-      case cudf::type_id::INT16:
-        return static_cast<double>(
-          static_cast<cudf::numeric_scalar<std::int16_t> const&>(s).value(stream));
-      case cudf::type_id::INT32:
-        return static_cast<double>(
-          static_cast<cudf::numeric_scalar<std::int32_t> const&>(s).value(stream));
-      case cudf::type_id::INT64:
-        return static_cast<double>(
-          static_cast<cudf::numeric_scalar<std::int64_t> const&>(s).value(stream));
-      case cudf::type_id::UINT8:
-        return static_cast<double>(
-          static_cast<cudf::numeric_scalar<std::uint8_t> const&>(s).value(stream));
-      case cudf::type_id::UINT16:
-        return static_cast<double>(
-          static_cast<cudf::numeric_scalar<std::uint16_t> const&>(s).value(stream));
-      case cudf::type_id::UINT32:
-        return static_cast<double>(
-          static_cast<cudf::numeric_scalar<std::uint32_t> const&>(s).value(stream));
-      case cudf::type_id::UINT64:
-        return static_cast<double>(
-          static_cast<cudf::numeric_scalar<std::uint64_t> const&>(s).value(stream));
-      default: return std::nullopt;
-    }
-  };
-
   for (std::size_t admitted_key_index = 0; admitted_key_index < admitted_keys.size();
        ++admitted_key_index) {
+    if (key_bound[admitted_key_index] == 0) { continue; }
+    ++outcome.keys_considered;
     auto const& admitted_key = admitted_keys[admitted_key_index];
 
     // Skip domain-covering keys before paying to build a membership structure; their filters keep
@@ -229,53 +208,24 @@ dynamic_filter_publication_outcome publish_dynamic_filters(dynamic_filter_publis
                                 stream,
                                 allocator_ref);
       if (min_s && max_s && min_s->is_valid(stream) && max_s->is_valid(stream)) {
-        // Range-coverage publication gate (the zone-map analogue of the cardinality gate above):
-        // a [min,max] spanning most of the build key's domain prunes nothing, so skip it.
-        // Inactive until base-column value-range evidence exists: the key's domain evidence is a
-        // row count, and dividing this gate's value span by it would over-fire on sparse integer
-        // keys, so the gate receives a domain of 0 and never fires.
-        auto const zone_map_range_domain = std::size_t{0};
-        bool publish_zone_map            = true;
-        if (zone_map_range_domain > 0) {
-          auto const lo = scalar_to_double(*min_s);
-          auto const hi = scalar_to_double(*max_s);
-          if (lo && hi) {
-            auto const coverage = (*hi - *lo + 1.0) / static_cast<double>(zone_map_range_domain);
-            if (zone_map_range_gate_fires(
-                  *lo, *hi, zone_map_range_domain, plan.domain_coverage_threshold())) {
-              SIRIUS_LOG_DEBUG(
-                "[sirius_physical_hash_join] zone-map key {}: skipped (range [{},{}] covers {:.2f} "
-                "of key domain ~{}).",
-                admitted_key_index,
-                *lo,
-                *hi,
-                coverage,
-                zone_map_range_domain);
-              publish_zone_map = false;
-            }
-          }
-        }
-        if (publish_zone_map) {
-          std::vector<sirius::op::zone_map_entry> zones;
-          zones.push_back({std::move(min_s), std::move(max_s)});
-          per_key_zone_map[admitted_key_index] =
-            std::make_shared<sirius::op::sirius_dynamic_zone_map_filter>(
-              std::move(zones), true, true);
-        }
+        // Publish one zone map for every valid min/max reduction. The range gate is inactive
+        // because no value-range domain is available.
+        std::vector<sirius::op::zone_map_entry> zones;
+        zones.push_back({std::move(min_s), std::move(max_s)});
+        per_key_zone_map[admitted_key_index] =
+          std::make_shared<sirius::op::sirius_dynamic_zone_map_filter>(
+            std::move(zones), true, true);
       }
     }
 
-    // (2) Membership filter -- post-decode. Prefer, in order:
-    //  - A. the exact IN-list with a brute-force scan for a very small key set (no hash build);
-    //  - B. the hash-based IN-list when its cuco set fits the device L2 cache;
-    //  - C. otherwise the Bloom filter whenever the key type supports it;
-    // `none` only when the key type has no membership support (anything other than INT32/INT64).
+    // Membership filters apply after decode. choose_membership_filter() prefers
+    // sirius_dynamic_small_in_list_filter for a supported small build,
+    // sirius_dynamic_in_list_filter when its set fits L2, and sirius_dynamic_bloom_filter for the
+    // remaining supported keys. It returns none when no representation supports the key.
     auto const set_bytes =
       sirius::op::sirius_dynamic_in_list_filter::estimated_set_bytes(build_rows, col.type());
     auto const bloom_bytes = sirius::op::sirius_dynamic_bloom_filter::estimated_bytes(build_rows);
 
-    // Decide, then construct: the choice depends only on counts, sizes, and capability answers,
-    // so it lives in dynamic_filter_source_policy.hpp and is testable without a device.
     auto const chosen = choose_membership_filter(
       {.build_rows               = build_rows,
        .l2_cache_bytes           = l2_bytes,
@@ -378,11 +328,12 @@ dynamic_filter_publication_outcome publish_dynamic_filters(dynamic_filter_publis
   }
   SIRIUS_LOG_INFO(
     "[sirius_physical_hash_join] Pushed {} dynamic filter(s) across {} active target(s) "
-    "of {} wired target(s) ({} build rows, {} keys).",
+    "of {} wired target(s) ({} build rows, {} bound keys of {} admitted).",
     total_pushed,
     active_targets,
     probe_targets.size(),
     build_view.num_rows(),
+    outcome.keys_considered,
     admitted_keys.size());
   outcome.filters_pushed = total_pushed;
   return outcome;

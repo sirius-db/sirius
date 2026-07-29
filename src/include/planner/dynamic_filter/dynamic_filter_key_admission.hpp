@@ -16,41 +16,14 @@
 
 /**
  * @file dynamic_filter_key_admission.hpp
- * @brief Pure plan-time admission of hash-join build keys for dynamic filtering
+ * @brief Converts join conditions into statically admitted dynamic-filter keys
  *
- * `sirius_plan_comparison_join` calls these helpers at the **producer-key admission boundary**:
- * the plan-time boundary where DuckDB join conditions and optimizer hints become the Sirius-owned
- * metadata that `dynamic_filter_publish_plan` carries and the runtime publisher consumes.
- *
- * Admission translates five persisted coordinates, which are never interchangeable:
- *
- *  - **condition index** -- position in the planner's original (pre-`wrap_join_conditions`,
- *    pre-reorder) condition vector; `classify_join_key_shapes` results and
- *    `admitted_key::condition_index` live in this space;
- *  - **admitted-key index** -- position in `key_admission_result::admitted_keys`;
- *    `key_binding::admitted_key_index` lives in this space;
- *  - **build-key ordinal** -- position of the materialized key column in the runtime build table;
- *    `admitted_key::build_key_ordinal` lives in this space;
- *  - **probe-key ordinal** -- position of the probe-side key column in the producing join's
- *    probe-child output, which is also the push space of a `direct` endpoint;
- *    `admitted_key::probe_key_ordinal` lives in this space;
- *  - **channel push ordinal** -- a coordinate in one target channel's push space (see
- *    @ref sirius::op::dynamic_filter_route_class); `dynamic_filter_scan_target_input` push
- *    ordinals and `key_binding::channel_push_ordinal` live in this space.
- *
- * Two vector indexes align the inputs but are not key-coordinate spaces:
- *
- *  - **target index** (t) selects corresponding entries in `scan_targets`,
- *    `probe_targets`, and `per_target_key_bindings`;
- *  - **DuckDB filter ordinal** (f) temporarily zips `hinted_condition_indexes[f]` to
- *    `scan_targets[t].channel_push_ordinals[f]` and
- *    `scan_targets[t].probe_storage_types[f]`.
- *
- * For example, hints `[2, 0]` and one target's push ordinals `[12, 7]` pair condition 2 with
- * channel ordinal 12 and condition 0 with channel ordinal 7. If condition 0 is rejected, condition
- * 2 keeps ordinal 12 even though the admitted-key array is compacted. For a scan route, the channel
- * later remaps that `column_ids`-space ordinal once into the consumer's output-position space;
- * that downstream output position is not an admission coordinate.
+ * `admit_dynamic_filter_keys()` decides key legality only; where each admitted key lands is the
+ * discovery walk's output (`dynamic_filter_target_discovery.hpp`), not admission's. The admitted
+ * keys carry three coordinate spaces that are not interchangeable: the original join-condition
+ * index (provenance), the runtime build-table ordinal, and the producing join's probe-child
+ * ordinal -- the entry ordinal every use of an admitted key starts a trace from. The dense
+ * admitted-key index is the position in the returned vector.
  */
 
 #pragma once
@@ -63,7 +36,6 @@
 
 #include <cstddef>
 #include <optional>
-#include <span>
 #include <vector>
 
 namespace duckdb {
@@ -97,81 +69,23 @@ namespace sirius::planner {
   duckdb::vector<duckdb::JoinCondition> const& conditions);
 
 /**
- * @brief One resolved scan endpoint, described in its channel's push-coordinate space
+ * @brief Admit the statically legal build keys of one producing hash join
  *
- * Built by the planner from one probe target that DuckDB's join-filter pushdown metadata named,
- * after that target's channel has been minted. Both vectors are indexed by the temporary DuckDB
- * filter ordinal. At filter ordinal `f`, `hinted_condition_indexes[f]` names the original
- * condition while this target's entries at `f` provide that condition's channel push ordinal and
- * probe storage type. The filter ordinal aligns inputs; it is not itself a channel push ordinal.
- */
-struct dynamic_filter_scan_target_input {
-  /**
-   * @brief One key's landing site in this scan target
-   */
-  struct scan_target_column {
-    /// Where the key lands in this scan's `column_ids` space
-    std::size_t channel_push_ordinal = 0;
-    /**
-     * @brief Probe-side storage type at that coordinate
-     *
-     * `cudf::type_id::EMPTY` when the DuckDB type has no cuDF representation, which suppresses
-     * zone maps for the binding built from this column.
-     */
-    cudf::data_type probe_storage_type{cudf::type_id::EMPTY};
-  };
-
-  /// Indexed by the filter ordinal DuckDB recorded, so a push ordinal cannot become separated
-  /// from the probe type it belongs with.
-  std::vector<scan_target_column> columns;
-};
-
-/**
- * @brief The admission decision for one producing hash join
- */
-struct key_admission_result {
-  /**
-   * @brief Statically admitted build keys, in admitted order
-   *
-   * Positions in this vector are the admitted-key index space (admitted index -> condition index).
-   */
-  std::vector<op::dynamic_filter_publish_plan::admitted_key> admitted_keys;
-  /**
-   * @brief Sparse key bindings, aligned one-to-one with the scan-target inputs
-   */
-  std::vector<std::vector<op::dynamic_filter_publish_plan::key_binding>> per_target_key_bindings;
-};
-
-/**
- * @brief Admit build keys and bind them onto resolved scan targets
+ * A key is admitted when its condition uses `sirius::comparison_type::equal`, neither carried side
+ * shape is a cast, both materialized sides are bound references, and cuDF can represent the build
+ * type. Computed keys remain eligible after materialization. Conditions are considered in planner
+ * order, so the returned vector's order is deterministic.
  *
- * Scan-route legality preserves the runtime publisher's behavior from before producer-key
- * admission moved to this plan-time boundary: a key is admitted when its condition compares with
- * `sirius::comparison_type::equal` (null-equal comparison is outside the supported scope), neither
- * carried side shape is a cast, its build side is a plain bound reference after materialization,
- * and its build type has a cudf representation. Computed (materialized) keys are admitted -- their
- * columns hold the computed values -- and key types are not narrowed.
+ * Every use of an admitted key begins a discovery trace at `admitted_key::probe_key_ordinal`, so a
+ * condition whose probe side is not a bound reference admits no key -- there is no real entry
+ * ordinal to trace from, and such a key could never produce a filter on any route.
  *
- * The build ordinal is converted from the DuckDB reference index at exactly one checked point; see
- * the implementation. Works identically when DuckDB's optimizer attached no join-filter pushdown
- * metadata to this join: pass an empty optional and no targets, and the admitted-key array is
- * computed from the conditions alone.
- *
- * @throw std::invalid_argument if `condition_shapes` is not aligned with `conditions`, if
- * `scan_targets` is non-empty without `hinted_condition_indexes`, or if a hinted index or target
- * arity is inconsistent with `conditions`
+ * @throw std::invalid_argument if `condition_shapes` or a non-empty
+ * `condition_domain_cardinalities` is not aligned one-to-one with `conditions`
  *
  * @param[in] conditions The wrapped join conditions in original planner order
  * (post-materialization; wrapping preserves that order)
  * @param[in] condition_shapes Carried pre-materialization classification, aligned with `conditions`
- * @param[in] hinted_condition_indexes The filter-ordinal to condition-index mapping DuckDB
- * recorded, when its optimizer attached join-filter pushdown metadata to this join; admission is
- * then restricted to those conditions so the publisher constructs exactly the filters constructed
- * by the runtime publisher before producer-key admission moved to plan time. Empty optional when
- * DuckDB attached no such metadata: every legality-passing condition is admitted.
- * @param[in] scan_targets Resolved scan endpoints, in the order DuckDB recorded its probe targets;
- * this target index aligns with the returned `per_target_key_bindings` entry, while each target's
- * inner vectors align by DuckDB filter ordinal
  * @param[in] condition_domain_cardinalities Per condition index, the build key's domain
  * cardinality (0 = unknown); empty when no domain evidence exists. Recorded onto each admitted
  * key, so the result carries no parallel array.
@@ -180,34 +94,28 @@ struct key_admission_result {
  * uniqueness proof bounds distinct tuples, not distinct values of one column, and must not arm
  * any key's coverage gate. An admitted key whose build ordinal equals this value is marked
  * `build_key_proven_unique`.
- * @return The admitted keys and their per-target bindings. `per_target_key_bindings` always has
- * exactly one entry per element of `scan_targets`.
+ * @return The admitted keys, in admitted (planner) order; a key's position is the admitted-key
+ * index `key_binding::admitted_key_index` refers to
  */
-[[nodiscard]] key_admission_result admit_dynamic_filter_keys(
+[[nodiscard]] std::vector<op::dynamic_filter_publish_plan::admitted_key> admit_dynamic_filter_keys(
   duckdb::vector<sirius::join_condition> const& conditions,
   std::vector<op::dynamic_filter_condition_shape> const& condition_shapes,
-  std::optional<std::span<std::size_t const>> hinted_condition_indexes,
-  std::vector<dynamic_filter_scan_target_input> const& scan_targets,
   std::vector<std::size_t> const& condition_domain_cardinalities,
   std::optional<std::size_t> build_side_unique_column = std::nullopt);
 
 /**
  * @brief Static legality of one admitted key for a join-edge (direct) endpoint
  *
- * The join-edge endpoint installed at the producing join's probe boundary (issue #1010; its
- * documentation unit delivers the design as
- * `docs/super-sirius/issue-1010-dynamic-filter-sip-design-v2.md`) accepts a strictly narrower scope
- * than the scan route: the producing join must be INNER or left SEMI, the comparison `equal`, both
- * carried side shapes direct -- a computed key is rejected here even though the scan route admits
- * it -- and the key type a matching INT32 or INT64 on both sides. Consumed by the join-edge
- * placement helper; exercised by unit tests until that helper lands.
+ * A direct route requires an INNER or SEMI join, equality comparison, direct references on both
+ * sides, and identical INT32 or INT64 storage types. `sirius_plan_comparison_join` calls this only
+ * for admitted keys without a scan binding.
  *
  * @param[in] join_type The producing join's type
  * @param[in] comparison The condition's comparison operator
  * @param[in] shape The condition's carried pre-materialization side shapes
  * @param[in] probe_storage_type The probe-side key storage type
  * @param[in] build_storage_type The build-side key storage type
- * @return True when the key may be applied at a join-edge endpoint
+ * @return True when `place_endpoint()` may place the key in the producing join's probe subtree
  */
 [[nodiscard]] bool direct_route_admissible(duckdb::JoinType join_type,
                                            sirius::comparison_type comparison,
