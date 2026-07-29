@@ -90,14 +90,12 @@ TEST_CASE("planner::query reports the id it was constructed with", "[query_id]")
   // window's id so repositories, scheduling and window logs all agree.
   auto tctx           = sirius::test::make_test_telemetry_context();
   const auto query_id = make_query_id(9876);
-  sirius::telemetry::query_telemetry_info tinfo{
-    tctx->engine_id(), tctx->worker_id(), query_id};
+  sirius::telemetry::query_telemetry_info tinfo{tctx->engine_id(), tctx->worker_id(), query_id};
 
-  sirius::planner::query q(
-    duckdb::vector<duckdb::shared_ptr<sirius::pipeline::sirius_pipeline>>{},
-    tctx->context(),
-    query_id,
-    tinfo);
+  sirius::planner::query q(duckdb::vector<duckdb::shared_ptr<sirius::pipeline::sirius_pipeline>>{},
+                           tctx->context(),
+                           query_id,
+                           tinfo);
 
   CHECK(q.query_id() == query_id);
 }
@@ -108,8 +106,7 @@ TEST_CASE("planner::query ids are not drawn from a shared counter", "[query_id]"
   // back, which is what allowed a second, independent query-id counter to exist.
   auto tctx           = sirius::test::make_test_telemetry_context();
   const auto query_id = make_query_id(11);
-  sirius::telemetry::query_telemetry_info tinfo{
-    tctx->engine_id(), tctx->worker_id(), query_id};
+  sirius::telemetry::query_telemetry_info tinfo{tctx->engine_id(), tctx->worker_id(), query_id};
 
   sirius::planner::query first(
     duckdb::vector<duckdb::shared_ptr<sirius::pipeline::sirius_pipeline>>{},
