@@ -753,7 +753,7 @@ def split_sirius_log(log_dir, benchmark_dir, queries, iterations):
         return
     log_path = log_files[0]
     log(f"Splitting {log_path} per query")
-    with open(log_path) as f:
+    with open(log_path, errors="replace") as f:
         lines = f.readlines()
 
     def _norm(sql):
@@ -763,13 +763,17 @@ def split_sirius_log(log_dir, benchmark_dir, queries, iterations):
 
     known = {_norm(QUERIES[f"q{q}"]): q for q in queries}
 
-    marker = "QueryBegin: SQL: "
+    begin_marker = "QueryBegin: "
+    sql_marker = " SQL: "
     begins = []  # (qnum, line_index), in log order
     for i, line in enumerate(lines):
-        pos = line.find(marker)
+        pos = line.find(begin_marker)
         if pos == -1:
             continue
-        qnum = known.get(_norm(line[pos + len(marker) :]))
+        sql_pos = line.find(sql_marker, pos)
+        if sql_pos == -1:
+            continue
+        qnum = known.get(_norm(line[sql_pos + len(sql_marker) :]))
         if qnum is not None:
             begins.append((qnum, i))
 

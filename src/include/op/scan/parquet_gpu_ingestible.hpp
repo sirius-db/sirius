@@ -93,6 +93,19 @@ class parquet_ingestible_table_info : public ingestible_table_info {
   }
 };
 
+/// Canonical identity form for a parquet file path so pinned-cache matching
+/// (@ref cache_entry_info::can_serve_with_columns, a raw set-equality on
+/// resolved_file_paths) is independent of spelling: relative vs absolute,
+/// redundant '/', './..', 'file://', and symlinks all collapse. Remote URIs
+/// (scheme://) pass through. Apply ONLY at the cache-identity boundary
+/// (cache_entry_info): resolved_file_paths on the bind info stay as bound, so
+/// Hive partition parsing reads the original path and is not confused by a
+/// symlink-resolved 'key=value' directory segment.
+[[nodiscard]] std::string canonical_scan_file_path(std::string const& raw);
+
+/// In-place @ref canonical_scan_file_path over a resolved-file-path vector.
+void canonicalize_scan_file_paths(std::vector<std::string>& paths);
+
 //===----------------------------------------------------------------------===//
 // parquet_split_info
 //===----------------------------------------------------------------------===//
@@ -124,8 +137,7 @@ class parquet_split_info : public scan_info {
   /// filter still applies post-decode via @c expression_evaluator.
   bool disable_filter_pushdown = false;
   /// Hive partition values for this split, in @c scan_plan::partition_columns
-  /// order. Empty when the plan has no partition columns. Duplicated here
-  /// (also lives on @c parquet_post_filter_and_projection_info) so
+  /// order. Empty when the plan has no partition columns. Kept on the split so
   /// @ref materialize_table can call @c assemble_scan_output inline on the
   /// reader-side pushdown path and emit @c filter_state::ROW_FILTERED_AND_PROJECTED.
   std::vector<std::string> partition_values;
@@ -242,7 +254,7 @@ class parquet_file_scan_info : public scan_info {
 // parquet_gpu_ingestible
 //===----------------------------------------------------------------------===//
 /**
- * @brief Concrete @c io::gpu_ingestible for parquet sources.
+ * @brief Concrete @c gpu_ingestible for parquet sources.
  *
  * Owns the shared scan plan, reader options, and coalesced filter expression.
  * @ref next_split_provider hands out one file at a time: each metadata-scan task

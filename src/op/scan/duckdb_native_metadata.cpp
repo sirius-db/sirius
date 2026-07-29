@@ -166,7 +166,21 @@ duckdb_segment_descriptor fill_segment_descriptor(duckdb::ColumnSegment& segment
     collect_block_ids visitor(desc.additional_blocks);
     cf.visit_block_ids(segment, visitor);
   }
+  if (desc.compression == duckdb::CompressionType::COMPRESSION_CONSTANT) {
+    // Snapshot the segment's own stats: the constant value lives here, and
+    // row-group-level stats drift as later appends merge into them.
+    desc.segment_stats = std::make_shared<duckdb::BaseStatistics>(segment.stats.statistics.Copy());
+  }
   return desc;
+}
+
+// A CONSTANT validity segment is uniform, with the direction in its stats:
+// all-valid decodes to nothing, all-NULL carries the marker so the decoder
+// synthesizes zero validity bits.
+bool constant_validity_is_all_null(duckdb::ColumnSegment& segment)
+{
+  return segment.GetCompressionFunction().type == duckdb::CompressionType::COMPRESSION_CONSTANT &&
+         segment.stats.statistics.CanHaveNull();
 }
 
 // Grants access to ArrayColumnData's protected child/validity members. C++
@@ -225,7 +239,9 @@ std::optional<std::string> walk_array_column(duckdb::ColumnData& col_data,
                " row group " + std::to_string(rg_idx) + ": unsupported compression " +
                duckdb::CompressionTypeToString(compression);
       }
-      out.push_back(fill_segment_descriptor(segment, node.GetRowStart()));
+      auto desc     = fill_segment_descriptor(segment, node.GetRowStart());
+      desc.all_null = constant_validity_is_all_null(segment);
+      out.push_back(std::move(desc));
     }
     return std::nullopt;
   };
@@ -332,7 +348,9 @@ std::optional<std::string> walk_standard_column(duckdb::ColumnData& col_data,
              std::to_string(rg_idx) + ": unsupported compression " +
              duckdb::CompressionTypeToString(compression);
     }
-    col_md.validity_segments.push_back(fill_segment_descriptor(segment, node.GetRowStart()));
+    auto desc     = fill_segment_descriptor(segment, node.GetRowStart());
+    desc.all_null = constant_validity_is_all_null(segment);
+    col_md.validity_segments.push_back(std::move(desc));
   }
   return std::nullopt;
 }
@@ -485,7 +503,9 @@ bool is_supported_data_compression(duckdb::CompressionType c)
 bool is_supported_validity_compression(duckdb::CompressionType c)
 {
   switch (c) {
-    // CONSTANT is the all-valid case (all-null columns land in EMPTY).
+    // CONSTANT validity is uniform — all-valid or all-NULL, disambiguated by
+    // the segment stats (see constant_validity_is_all_null). EMPTY means the
+    // base data codec covers validity itself.
     // ROARING is host-decoded to a plain bitmap before the GPU sees it.
     case duckdb::CompressionType::COMPRESSION_UNCOMPRESSED:
     case duckdb::CompressionType::COMPRESSION_EMPTY:

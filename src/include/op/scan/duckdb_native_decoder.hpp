@@ -56,12 +56,15 @@ std::vector<cudf::io::text::byte_range_info> row_group_file_ranges(
 /// Supported: fixed-width data (UNCOMPRESSED / RLE / BITPACKING / CONSTANT),
 ///            varchar data (UNCOMPRESSED / DICTIONARY / FSST / DICT_FSST),
 ///            validity (UNCOMPRESSED / EMPTY / CONSTANT / ROARING),
-///            rowid synthesis.
+///            rowid synthesis,
+///            host-backed segments (`host_ptr` set; insert-delta staging).
+/// @param datasource Read handle for the .db file; may be null only when
+///        no segment stages a file read (host-backed / blockless splits).
 /// @throws std::runtime_error on any codec the walker accepted but this decoder does not implement.
 std::unique_ptr<cudf::table> decode_duckdb_native_split(
   std::vector<duckdb_row_group_metadata> const& row_groups,
   duckdb_native_ingestible_table_info const& table_info,
-  sirius::io::sirius_datasource& datasource,
+  sirius::io::sirius_datasource* datasource,
   cucascade::memory::memory_space& mem_space,
   rmm::cuda_stream_view stream);
 

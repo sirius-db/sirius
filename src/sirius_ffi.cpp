@@ -47,6 +47,7 @@ namespace sirius::ffi {
 namespace {
 // ClientContextState key the GPU engine resolves its SiriusContext under.
 constexpr const char* kSiriusStateKey = "sirius_state";
+constexpr const char* kQueryLabel     = "sirius_ffi";
 // Arrow record-batch size for the exported stream; the consumer re-batches as needed.
 constexpr duckdb::idx_t kArrowBatchSize = 1u << 20;
 }  // namespace
@@ -94,6 +95,10 @@ struct Context::Impl {
     // IN_CLAUSE and COMPRESSED_MATERIALIZATION here; this path remains more conservative.
     auto& client = *conn->context;
     client.registered_state->Insert(kSiriusStateKey, context);
+    // Per-connection Sirius state (guard depths, capture bookkeeping) for the
+    // embedded connection, mirroring OnConnectionOpened on the transparent path.
+    client.registered_state->Insert("sirius_connection_state",
+                                    duckdb::make_shared_ptr<duckdb::SiriusConnectionState>());
     client.config.enable_optimizer = true;
     auto& disabled = duckdb::DBConfig::GetConfig(client).options.disabled_optimizers;
     disabled.insert(duckdb::OptimizerType::IN_CLAUSE);
@@ -163,15 +168,24 @@ void Context::execute_substrait(const std::string& plan, std::uintptr_t out_stre
     duckdb::ColumnBindingResolver::Verify(*logical_plan);
     resolver.VisitOperator(*logical_plan);
 
-    // 3. DuckDB LogicalOperator -> Sirius GPU physical plan -> execute directly on the engine.
-    auto physical_plan =
-      sirius::planner::sirius_physical_plan_generator(client).create_plan(std::move(logical_plan));
-    auto gpu_prepared = duckdb::make_shared_ptr<sirius::sirius_prepared_statement_data>(
-      std::move(prepared), std::move(physical_plan));
+    // 3. DuckDB LogicalOperator -> Sirius GPU physical plan -> execute directly
+    // on the engine, inside an execution window: begin mutations and slot
+    // acquire in the constructor, mandatory cleanup and release in finish().
+    // This standalone path bypasses DuckDB's normal query entry point, so
+    // nothing else would clean up for it. (The old manual QueryBegin/QueryEnd
+    // pairing could call QueryEnd twice when the first cleanup threw.)
+    {
+      duckdb::SiriusContext::StandaloneQueryScope window(*impl_->context, client, kQueryLabel);
+      auto physical_plan = sirius::planner::sirius_physical_plan_generator(client).create_plan(
+        std::move(logical_plan));
+      auto gpu_prepared = duckdb::make_shared_ptr<sirius::sirius_prepared_statement_data>(
+        std::move(prepared), std::move(physical_plan));
 
-    sirius::sirius_interface iface(client, std::optional<std::string>("starrocks_substrait"));
-    result = iface.sirius_execute_query(
-      client, "starrocks_substrait", gpu_prepared, duckdb::PendingQueryParameters{});
+      sirius::sirius_interface iface(client, std::optional<std::string>(kQueryLabel));
+      result = iface.sirius_execute_query(
+        client, kQueryLabel, gpu_prepared, duckdb::PendingQueryParameters{});
+      window.finish();
+    }
   } catch (...) {
     impl_->conn->Rollback();
     throw;

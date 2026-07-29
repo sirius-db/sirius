@@ -251,6 +251,7 @@ Thread pool (default `num_threads: 2`, prefix `task_creator`) plus:
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `strategy` | enum: `active`, `lookahead` | `active` | Most speculative request type the task creator may use. `active` is demand-driven only; `lookahead` additionally warms up not-yet-activated scans one task at a time. Values are lowercase. |
+| `priority_order` | enum: `source`, `sink` | `source` | Order in which the task creator prioritizes tasks within a duckdb pipeline. `source` closer to source has higher priority; `sink` closer to sink has higher priority. Values are lowercase. |
 
 ### `sirius.executor.pipeline`
 
@@ -517,6 +518,7 @@ These can also be set at load via the `SIRIUS_LOG_BACKEND`, `SIRIUS_LOG_DIR`, an
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `modified_pipeline` | - | Enable modified pipeline execution |
+| `fuse_merge_pipelines` | true | Fuse eligible GROUP BY / TOP_N merges into their downstream pipeline instead of cutting a boundary (see [physical-plan-generation.md](physical-plan-generation.md) → Merge fusion) |
 | `max_sort_partition_bytes` | 0 (auto) | Max sort partition bytes |
 | `max_sort_partition_memory_fraction` | 0.33 | Auto sort-partition fraction when `max_sort_partition_bytes` is 0 |
 | `hash_partition_bytes` | 512 MB | Hash partition target size |

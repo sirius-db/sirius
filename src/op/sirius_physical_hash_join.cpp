@@ -467,6 +467,135 @@ build_probe_decision select_build_probe_action(std::vector<build_probe_slot_view
   return {build_probe_action::wait_for_probe, std::nullopt};
 }
 
+//===----------------------------------------------------------------------===//
+// STANDARD / MIXED_JOIN partial-barrier scheduling (pure helpers, unit-tested in
+// test/cpp/operator/test_cross_schedule.cpp).
+//===----------------------------------------------------------------------===//
+
+std::vector<cross_schedule_discard> collect_cross_schedule_discards(
+  std::vector<partition_cross_schedule>& cross, bool probe_finished, bool build_finished)
+{
+  std::vector<cross_schedule_discard> discards;
+  for (std::size_t p = 0; p < cross.size(); ++p) {
+    auto& c = cross[p];
+    // A probe batch is done once no more build batches can arrive (build finished) AND it has been
+    // paired with every known build batch. Requires >= 1 build batch: the empty-opposite case is
+    // skipped, matching the legacy grid (which likewise never popped a batch it could not pair).
+    if (build_finished && !c.build_ids.empty()) {
+      for (std::size_t i = 0; i < c.probe_ids.size(); ++i) {
+        uint64_t const id = c.probe_ids[i];
+        if (c.probe_popped.count(id)) { continue; }
+        if (c.probe_paired_count[i] == c.build_ids.size()) {
+          c.probe_popped.insert(id);
+          discards.push_back({p, /*is_build=*/false, id});
+        }
+      }
+    }
+    if (probe_finished && !c.probe_ids.empty()) {
+      for (std::size_t j = 0; j < c.build_ids.size(); ++j) {
+        uint64_t const id = c.build_ids[j];
+        if (c.build_popped.count(id)) { continue; }
+        if (c.build_paired_count[j] == c.probe_ids.size()) {
+          c.build_popped.insert(id);
+          discards.push_back({p, /*is_build=*/true, id});
+        }
+      }
+    }
+  }
+  return discards;
+}
+
+cross_schedule_pair next_cross_schedule_pair(std::vector<partition_cross_schedule>& cross,
+                                             bool probe_finished,
+                                             bool build_finished)
+{
+  for (std::size_t p = 0; p < cross.size(); ++p) {
+    auto& c                 = cross[p];
+    std::size_t const total = c.probe_ids.size() * c.build_ids.size();
+    if (c.scheduled_pairs.size() >= total) { continue; }  // fully scheduled (or a side is empty)
+    for (std::size_t i = 0; i < c.probe_ids.size(); ++i) {
+      for (std::size_t j = 0; j < c.build_ids.size(); ++j) {
+        if (c.scheduled_pairs.insert(encode_cross_pair(i, j)).second) {
+          ++c.probe_paired_count[i];
+          ++c.build_paired_count[j];
+          return {cross_schedule_kind::emit_pair, p, i, j};
+        }
+      }
+    }
+  }
+  // No schedulable pair now. If a producer can still deliver batches that would create new pairs,
+  // wait on it; otherwise the operator is done.
+  if (!build_finished) { return {cross_schedule_kind::wait_build, 0, 0, 0}; }
+  if (!probe_finished) { return {cross_schedule_kind::wait_probe, 0, 0, 0}; }
+  return {cross_schedule_kind::done, 0, 0, 0};
+}
+
+bool has_pending_cross_orphan(std::vector<partition_cross_schedule> const& cross,
+                              bool probe_finished,
+                              bool build_finished)
+{
+  // Only a terminal state: an empty opposite side is only known-final once both producers finished.
+  if (!(probe_finished && build_finished)) { return false; }
+  for (auto const& c : cross) {
+    // Surviving probe batches whose build side is empty.
+    if (c.build_ids.empty()) {
+      for (uint64_t id : c.probe_ids) {
+        if (!c.probe_popped.count(id)) { return true; }
+      }
+    }
+    // Surviving build batches whose probe side is empty.
+    if (c.probe_ids.empty()) {
+      for (uint64_t id : c.build_ids) {
+        if (!c.build_popped.count(id)) { return true; }
+      }
+    }
+  }
+  return false;
+}
+
+cross_schedule_orphan next_cross_schedule_orphan(std::vector<partition_cross_schedule>& cross,
+                                                 bool probe_finished,
+                                                 bool build_finished)
+{
+  if (!(probe_finished && build_finished)) { return {}; }
+  for (std::size_t p = 0; p < cross.size(); ++p) {
+    auto& c = cross[p];
+    if (c.build_ids.empty()) {  // empty build → each surviving probe batch is an orphan
+      for (uint64_t id : c.probe_ids) {
+        if (c.probe_popped.insert(id).second) {
+          return {/*found=*/true, p, /*present_is_build=*/false, id};
+        }
+      }
+    }
+    if (c.probe_ids.empty()) {  // empty probe → each surviving build batch is an orphan
+      for (uint64_t id : c.build_ids) {
+        if (c.build_popped.insert(id).second) {
+          return {/*found=*/true, p, /*present_is_build=*/true, id};
+        }
+      }
+    }
+  }
+  return {};
+}
+
+cross_schedule_kind peek_cross_schedule_kind(std::vector<partition_cross_schedule> const& cross,
+                                             bool probe_finished,
+                                             bool build_finished)
+{
+  for (auto const& c : cross) {
+    if (c.scheduled_pairs.size() < c.probe_ids.size() * c.build_ids.size()) {
+      return cross_schedule_kind::emit_pair;
+    }
+  }
+  // Terminal empty-opposite batches still need a single-side task before the operator is done.
+  if (has_pending_cross_orphan(cross, probe_finished, build_finished)) {
+    return cross_schedule_kind::emit_pair;
+  }
+  if (!build_finished) { return cross_schedule_kind::wait_build; }
+  if (!probe_finished) { return cross_schedule_kind::wait_probe; }
+  return cross_schedule_kind::done;
+}
+
 partition_strategy compute_hash_join_partition_strategy(uint64_t total_bytes,
                                                         bool is_build_side,
                                                         bool build_foldable,
@@ -699,17 +828,18 @@ void sirius_physical_hash_join::discard_build_only_slots_if_probe_complete()
 std::optional<task_creation_hint> sirius_physical_hash_join::get_next_task_hint()
 {
   std::lock_guard<std::mutex> lg(op_state_mutex);
+  auto* build_port = get_port("build");
+  auto* probe_port = get_port("default");
+  if (!build_port || !probe_port) {
+    throw std::runtime_error(
+      "In sirius_physical_hash_join:get_next_task_hint: missing expected ports in operator " +
+      std::to_string(this->get_operator_id()));
+  }
   if (_join_mode == HASH_JOIN_MODE::BUILD_PROBE) {
     // Each partition owns one hash table and runs its own build-then-probe sequence; those
     // sequences interleave (a built partition probes on its GPU while another still builds on a
     // different GPU). Pick the next action from a per-partition snapshot.
-    auto* build_port = get_port("build");
-    auto* probe_port = get_port("default");
-    if (!build_port || !probe_port) {
-      throw std::runtime_error(
-        "In sirius_physical_hash_join:get_next_task_hint: missing expected ports in operator " +
-        std::to_string(this->get_operator_id()));
-    }
+
     // Broadcast mode: reclaim slots that will never be probed before deciding the next action, so
     // the operator can reach completion instead of waiting forever on their absent probe data.
     discard_build_only_slots_if_probe_complete();
@@ -737,7 +867,24 @@ std::optional<task_creation_hint> sirius_physical_hash_join::get_next_task_hint(
         return std::nullopt;
     }
   } else {
-    return sirius_physical_operator::get_next_task_hint();
+    // STANDARD / MIXED_JOIN partial barrier: schedule per-partition build x probe pairs as batches
+    // arrive on either side, rather than waiting (via the base FULL-barrier hint) for both upstream
+    // pipelines to finish. refresh_cross_schedule also frees fully-consumed batches, so completion
+    // (all_ports_empty) converges once both producers finish and every pair has been scheduled.
+    auto const finished = refresh_cross_schedule();
+    switch (peek_cross_schedule_kind(_cross, finished.first, finished.second)) {
+      case cross_schedule_kind::emit_pair: return task_creation_hint{TaskCreationHint::READY, this};
+      case cross_schedule_kind::wait_build: {
+        auto* producer = &build_port->src_pipeline->get_operators()[0].get();
+        return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, producer};
+      }
+      case cross_schedule_kind::wait_probe: {
+        auto* producer = &probe_port->src_pipeline->get_operators()[0].get();
+        return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, producer};
+      }
+      case cross_schedule_kind::done:
+      default: return std::nullopt;
+    }
   }
 }
 
@@ -817,82 +964,184 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::get_next_task_input_da
   return nullptr;
 }
 
+std::pair<bool, bool> sirius_physical_hash_join::refresh_cross_schedule()
+{
+  auto* probe_port = get_port("default");
+  auto* build_port = get_port("build");
+  if (probe_port->repo->num_partitions() != build_port->repo->num_partitions()) {
+    throw std::runtime_error(
+      "In sirius_physical_hash_join:refresh_cross_schedule: number of partitions for probe and "
+      "build ports must match in operator " +
+      std::to_string(this->get_operator_id()));
+  }
+  std::size_t const num_partitions = probe_port->repo->num_partitions();
+  if (_cross.size() < num_partitions) { _cross.resize(num_partitions); }
+
+  bool const probe_finished =
+    probe_port->src_pipeline && probe_port->src_pipeline->is_pipeline_finished();
+  bool const build_finished =
+    build_port->src_pipeline && build_port->src_pipeline->is_pipeline_finished();
+
+  // Re-poll both ports and merge any newly-arrived batch IDs (first-seen order preserved; the
+  // *_seen sets both dedup and keep already-popped IDs from being re-added).
+  for (std::size_t p = 0; p < num_partitions; ++p) {
+    auto& c = _cross[p];
+    for (uint64_t id : probe_port->repo->get_batch_ids(p)) {
+      if (c.probe_id_seen.insert(id).second) {
+        c.probe_ids.push_back(id);
+        c.probe_paired_count.push_back(0);
+      }
+    }
+    for (uint64_t id : build_port->repo->get_batch_ids(p)) {
+      if (c.build_id_seen.insert(id).second) {
+        c.build_ids.push_back(id);
+        c.build_paired_count.push_back(0);
+      }
+    }
+  }
+
+  // Non-INNER whole-side invariant: whichever side must be seen whole for this join type must stay
+  // a single concat-folded batch once its producer is finished. A regression in
+  // sirius_physical_concat that stopped folding would otherwise silently corrupt results, so fail
+  // loudly instead. MARK must never reach this path (it is forced to BUILD_PROBE mode).
+  if (join_type == duckdb::JoinType::MARK) {
+    throw std::runtime_error(
+      "In sirius_physical_hash_join:refresh_cross_schedule: MARK join must run in BUILD_PROBE "
+      "mode, "
+      "not STANDARD/MIXED, in operator " +
+      std::to_string(this->get_operator_id()));
+  }
+  bool const check_build_whole =
+    build_finished && (join_type == duckdb::JoinType::LEFT || join_type == duckdb::JoinType::SEMI ||
+                       join_type == duckdb::JoinType::ANTI || join_type == duckdb::JoinType::OUTER);
+  bool const check_probe_whole =
+    probe_finished && is_right_family();  // RIGHT/RIGHT_SEMI/RIGHT_ANTI
+  bool const check_probe_whole_outer = probe_finished && join_type == duckdb::JoinType::OUTER;
+  for (std::size_t p = 0; p < num_partitions; ++p) {
+    if (check_build_whole && _cross[p].build_ids.size() > 1) {
+      throw std::runtime_error(
+        "In sirius_physical_hash_join:refresh_cross_schedule: join type " +
+        duckdb::JoinTypeToString(join_type) +
+        " requires a single concat-folded build batch, but "
+        "partition " +
+        std::to_string(p) + " has " + std::to_string(_cross[p].build_ids.size()) +
+        " build batches in operator " + std::to_string(this->get_operator_id()));
+    }
+    if ((check_probe_whole || check_probe_whole_outer) && _cross[p].probe_ids.size() > 1) {
+      throw std::runtime_error(
+        "In sirius_physical_hash_join:refresh_cross_schedule: join type " +
+        duckdb::JoinTypeToString(join_type) +
+        " requires a single concat-folded probe batch, but "
+        "partition " +
+        std::to_string(p) + " has " + std::to_string(_cross[p].probe_ids.size()) +
+        " probe batches in operator " + std::to_string(this->get_operator_id()));
+    }
+  }
+
+  // Free every fully-consumed batch from its repository. Borrowers of a batch hold their own live
+  // shared_ptr across the pop, so this only drops the repo's owning reference.
+  if (probe_finished || build_finished) {
+    for (auto const& d : collect_cross_schedule_discards(_cross, probe_finished, build_finished)) {
+      auto* port = d.is_build ? build_port : probe_port;
+      port->repo->pop_data_batch_by_id(d.batch_id, d.partition);
+    }
+  }
+  return {probe_finished, build_finished};
+}
+
 std::unique_ptr<operator_data> sirius_physical_hash_join::get_next_task_input_data()
 {
-  // Hold the mutex for the entire operation to prevent concurrent pop/get races.
-  // A pop on one thread must not remove a batch that another thread's get expects to find.
+  // Hold the mutex for the entire operation to prevent concurrent pop/get races. A pop on one
+  // thread must not remove a batch that another thread's get expects to find.
   std::lock_guard<std::mutex> lg(op_state_mutex);
 
   if (_join_mode == HASH_JOIN_MODE::BUILD_PROBE) {
     return get_next_task_input_data_for_build_probe();
   }
 
-  // One-time initialization: snapshot all batch IDs from both ports.
-  if (left_batch_ids.empty() && right_batch_ids.empty()) {
-    if (ports["default"]->repo->num_partitions() != ports["build"]->repo->num_partitions()) {
+  // STANDARD / MIXED_JOIN partial barrier: batches on each side arrive progressively. Re-poll both
+  // ports, free fully-consumed batches, then schedule the next per-partition (probe, build) pair.
+  auto* probe_port = get_port("default");
+  auto* build_port = get_port("build");
+  if (!probe_port || !build_port) {
+    throw std::runtime_error(
+      "In sirius_physical_hash_join:get_next_task_input_data: missing expected ports in operator " +
+      std::to_string(this->get_operator_id()));
+  }
+
+  auto const finished = refresh_cross_schedule();
+  auto const step     = next_cross_schedule_pair(_cross, finished.first, finished.second);
+  if (step.kind == cross_schedule_kind::emit_pair) {
+    auto& c                 = _cross[step.partition];
+    uint64_t const probe_id = c.probe_ids[step.probe_idx];
+    uint64_t const build_id = c.build_ids[step.build_idx];
+
+    // Always borrow (get, not pop): freeing is handled centrally by refresh_cross_schedule's
+    // discard sweep once a batch has been paired with every batch of a finished opposite side.
+    auto probe_batch = probe_port->repo->get_data_batch_by_id(probe_id, step.partition);
+    auto build_batch = build_port->repo->get_data_batch_by_id(build_id, step.partition);
+    if (!probe_batch || !build_batch) {
       throw std::runtime_error(
-        "In sirius_physical_hash_join:Number of partitions for left and right ports must be the "
-        "same in operator " +
+        "In sirius_physical_hash_join:get_next_task_input_data: expected resident probe and build "
+        "batches for a newly-scheduled pair in partition " +
+        std::to_string(step.partition) + " of operator " + std::to_string(this->get_operator_id()));
+    }
+
+    std::vector<std::shared_ptr<cucascade::data_batch>> input_batch;
+    input_batch.reserve(2);
+    input_batch.push_back(std::move(probe_batch));  // [0] = probe / "default" / left
+    input_batch.push_back(std::move(build_batch));  // [1] = build / "build" / right
+
+    return std::make_unique<partitioned_operator_data>(std::move(input_batch), step.partition);
+  }
+
+  // No normal pair. If both producers finished, a partition may have batches on one side and an
+  // empty opposite side (e.g. a join against an empty table): those survivors are never paired.
+  // Emit each survivor as an ordinary two-batch task by SYNTHESIZING the empty opposite batch here,
+  // so execute() runs the normal join dispatch unchanged — cuDF NULL-pads the survivor for LEFT /
+  // RIGHT / OUTER / ANTI and yields zero rows for INNER / SEMI. Popping the survivor also drains
+  // the repo so the pipeline can complete.
+  auto const orphan = next_cross_schedule_orphan(_cross, finished.first, finished.second);
+  if (orphan.found) {
+    auto* present_port = orphan.present_is_build ? build_port : probe_port;
+    auto present_batch =
+      present_port->repo->pop_data_batch_by_id(orphan.batch_id, orphan.partition);
+    if (!present_batch) { return nullptr; }  // already drained by a concurrent caller
+
+    // Synthesize the empty opposite side from the absent child's output schema (children[0] =
+    // probe/left, children[1] = build/right), on the surviving batch's device. The batch's memory
+    // space is only reachable through a read-only accessor; take one transiently (shared lock) and
+    // release it before handing the idle batch to the task.
+    cucascade::memory::memory_space* ms = nullptr;
+    {
+      auto present_ro = present_batch->to_read_only();
+      ms              = present_ro.get_memory_space();
+    }
+    if (!ms) {
+      throw std::runtime_error(
+        "In sirius_physical_hash_join:get_next_task_input_data: surviving orphan batch has no "
+        "memory space in operator " +
         std::to_string(this->get_operator_id()));
     }
+    auto const& opp_types = orphan.present_is_build ? children[0]->get_types()   // absent probe
+                                                    : children[1]->get_types();  // absent build
+    rmm::cuda_set_device_raii const device_guard{rmm::cuda_device_id{ms->get_device_id()}};
+    auto empty_batch = make_data_batch(
+      sirius::make_empty_table(opp_types), *ms, cudf::get_default_stream(), batch_telemetry());
 
-    left_batch_ids.reserve(ports["default"]->repo->num_partitions());
-    right_batch_ids.reserve(ports["build"]->repo->num_partitions());
-    for (size_t i = 0; i < ports["default"]->repo->num_partitions(); i++) {
-      left_batch_ids.push_back(ports["default"]->repo->get_batch_ids(i));
-      right_batch_ids.push_back(ports["build"]->repo->get_batch_ids(i));
-      num_batches_to_process += left_batch_ids[i].size() * right_batch_ids[i].size();
+    std::vector<std::shared_ptr<cucascade::data_batch>> input_batch;
+    input_batch.reserve(2);
+    if (orphan.present_is_build) {
+      input_batch.push_back(std::move(empty_batch));    // [0] = empty probe / "default" / left
+      input_batch.push_back(std::move(present_batch));  // [1] = build / "build" / right
+    } else {
+      input_batch.push_back(std::move(present_batch));  // [0] = probe / "default" / left
+      input_batch.push_back(std::move(empty_batch));    // [1] = empty build / "build" / right
     }
+    return std::make_unique<partitioned_operator_data>(std::move(input_batch), orphan.partition);
   }
 
-  if (current_partition_index >= num_batches_to_process) { return nullptr; }
-
-  size_t batch_index = current_partition_index++;
-
-  // Walk the partition × left × right grid to find the (left, right) pair for this batch_index.
-  std::vector<std::shared_ptr<cucascade::data_batch>> input_batch;
-  input_batch.reserve(2);
-  size_t counter = 0;
-  for (size_t partition_idx = 0; partition_idx < left_batch_ids.size(); partition_idx++) {
-    size_t left_counter = 0;
-    for (auto& left_batch_id : left_batch_ids[partition_idx]) {
-      size_t right_counter = 0;
-      for (auto& right_batch_id : right_batch_ids[partition_idx]) {
-        if (counter == batch_index) {
-          bool pop_left  = (right_counter == right_batch_ids[partition_idx].size() - 1);
-          bool pop_right = (left_counter == left_batch_ids[partition_idx].size() - 1);
-          if (pop_left) {
-            input_batch.push_back(
-              ports["default"]->repo->pop_data_batch_by_id(left_batch_id, partition_idx));
-          } else {
-            input_batch.push_back(
-              ports["default"]->repo->get_data_batch_by_id(left_batch_id, partition_idx));
-          }
-          if (pop_right) {
-            input_batch.push_back(
-              ports["build"]->repo->pop_data_batch_by_id(right_batch_id, partition_idx));
-          } else {
-            input_batch.push_back(
-              ports["build"]->repo->get_data_batch_by_id(right_batch_id, partition_idx));
-          }
-          // MIXED_JOIN distributes per-partition tasks across GPUs by
-          // partition_idx % num_gpus. Tag with the partition index so the
-          // scheduler can route by partition.
-          return std::make_unique<partitioned_operator_data>(std::move(input_batch), partition_idx);
-        }
-        right_counter++;
-        counter++;
-      }
-      left_counter++;
-    }
-  }
-
-  if (input_batch.empty()) {
-    return nullptr;
-  } else {
-    throw std::runtime_error("Expected to have returned already or received nothing, but got " +
-                             std::to_string(input_batch.size()) + " input batches for hash join");
-  }
+  return nullptr;
 }
 
 /// Result of prepare_join_keys for a single join side: the key table view and any cast columns

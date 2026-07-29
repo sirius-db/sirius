@@ -128,8 +128,9 @@ duckdb::unique_ptr<duckdb::GlobalSourceState> PhysicalSiriusExecution::GetGlobal
 {
   auto state      = duckdb::make_uniq<SiriusGlobalSourceState>();
   auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  auto conn_state = duckdb::get_sirius_connection_state(context);
   auto query_label =
-    sirius_ctx ? sirius_ctx->take_pending_query_label() : std::optional<std::string>{};
+    conn_state ? conn_state->take_pending_query_label() : std::optional<std::string>{};
   state->iface = duckdb::make_uniq<sirius::sirius_interface>(context, std::move(query_label));
   state->sirius_context = sirius_ctx.get();
   return std::move(state);
@@ -159,8 +160,16 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
     // result is fully materialized before the first Fetch, so falling back here
     // cannot duplicate rows.
     duckdb::ErrorData gpu_error;
-    bool gpu_failed = false;
+    bool gpu_failed                = false;
+    bool runtime_unavailable_error = false;
+    // The execution window: begin mutations and slot acquire in one scope on
+    // this thread; finished (mandatory cleanup and release) below, before the
+    // first Fetch exposes the result, so an abandoned result holds nothing.
+    std::optional<duckdb::SiriusContext::StandaloneQueryScope> window;
     try {
+      if (state.sirius_context) {
+        window.emplace(*state.sirius_context, context.client, "transparent_execution");
+      }
       if (!logical_plan_ && query_sql_.empty()) {
         throw duckdb::ExecutorException(
           "Transparent GPU execution is missing the logical plan template");
@@ -195,12 +204,9 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
         }
       }
       if (!fresh_plan) {
-        auto sirius_ctx =
-          context.client.registered_state->Get<duckdb::SiriusContext>("sirius_state");
-        duckdb::unique_ptr<duckdb::SiriusContext::InternalQueryGuard> guard;
-        if (sirius_ctx) {
-          guard = duckdb::make_uniq<duckdb::SiriusContext::InternalQueryGuard>(*sirius_ctx);
-        }
+        // Suppress the optimizer hooks for this nested replan (the guard is a
+        // no-op when Sirius has no per-connection state registered).
+        duckdb::SiriusContext::InternalQueryGuard guard(context.client);
         duckdb::Parser parser(context.client.GetParserOptions());
         parser.ParseQuery(query_sql_);
         if (parser.statements.size() != 1) {
@@ -239,9 +245,34 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
         state.result.reset();
         gpu_failed = true;
       }
+    } catch (duckdb::SiriusBeginWindowFailureException&) {
+      // The BEGIN mutations failed after possibly part-mutating the shared
+      // runtime (now latched unavailable): typed, never a fallback candidate.
+      throw;
+    } catch (duckdb::SiriusRuntimeUnavailableException& e) {
+      // Pre-existing unavailability (this query never touched the runtime):
+      // a local query may fall back to CPU, but the S3 branch below must not
+      // rewrite the stable error.
+      gpu_error                 = duckdb::ErrorData(e);
+      gpu_failed                = true;
+      runtime_unavailable_error = true;
     } catch (std::exception& e) {
       gpu_error  = duckdb::ErrorData(e);
       gpu_failed = true;
+    }
+
+    // Mandatory per-query cleanup + slot release, BEFORE any of the throwing
+    // exits below and before the result is exposed. This covers every
+    // gpu_failed exit (interrupt rethrow, unavailable-s3 rethrow, s3
+    // no-fallback, sanitized INTERNAL/FATAL, generic no-fallback Throw) —
+    // none may skip cleanup — and moves the CPU fallback outside the held
+    // slot. finish() may itself throw
+    // (mandatory-cleanup failure ⇒ runtime latched unavailable); a non-std
+    // exception escaping the try above is handled by the window's destructor
+    // backstop instead.
+    if (window) {
+      window->finish();
+      window.reset();
     }
 
     if (gpu_failed) {
@@ -250,6 +281,14 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
 
       // A user interrupt is never a fallback candidate — propagate it as-is.
       if (gpu_error.Type() == duckdb::ExceptionType::INTERRUPT) { gpu_error.Throw(); }
+
+      // A pre-existing-unavailable error on an S3 query keeps its stable typed
+      // message — the S3 branch below must not rewrite it (S3 has no CPU
+      // fallback either way, so propagate as-is).
+      if (runtime_unavailable_error &&
+          (cpu_plan_reads_s3_ || sirius::references_sirius_owned_s3_parquet(query_sql_))) {
+        gpu_error.Throw();
+      }
 
       // S3 is GPU-only: DuckDB's CPU read_parquet cannot serve Sirius-owned s3://,
       // so surface a clear error instead of a fallback that would fail anyway.
@@ -281,9 +320,9 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
       if (state.sirius_context) { state.sirius_context->record_transparent_runtime_fallback(); }
 
       // CpuFallbackGuard marks the replay so sirius_httpfs refuses to serve s3://
-      // reached indirectly (e.g. through a view) to the CPU plan.
-      std::optional<duckdb::SiriusContext::CpuFallbackGuard> fallback_guard;
-      if (state.sirius_context) { fallback_guard.emplace(*state.sirius_context); }
+      // reached indirectly (e.g. through a view) to the CPU plan. Binds to the
+      // TARGET executing connection's state.
+      duckdb::SiriusContext::CpuFallbackGuard fallback_guard(context.client);
       state.result =
         run_cpu_fallback_plan(context.client, *cpu_fallback_prepared_, state.cpu_executor);
     }

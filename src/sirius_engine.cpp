@@ -209,11 +209,11 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
     static_cast<int>(sirius_ctx_ptr->get_config().get_hw_topology().gpus.size()),
     std::move(active_gpu_ids)};
 
-  // The RESULT_COLLECTOR wrap is added after the plan generator's own `set_parent_ops` ran;
-  // re-walk so the wrapped child's `_parent_op` points at RESULT_COLLECTOR (the tree-parent
-  // wiring needs it to route the final sink pipeline's output there).
+  // The collector is added after planning, so refresh parent pointers before marking fusion.
   sirius::planner::sirius_physical_plan_generator::set_parent_ops(*sirius_physical_plan,
                                                                   /*parent=*/nullptr);
+  sirius::planner::sirius_physical_plan_generator::mark_fusable_merge_pipelines(
+    context, *sirius_physical_plan);
 
   // Build meta-pipeline tree from operator plan
   pipeline::sirius_pipeline_build_state state;

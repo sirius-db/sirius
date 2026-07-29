@@ -37,18 +37,23 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
+#include <cstddef>
 #include <cstdlib>
 #include <filesystem>
 #include <memory>
+#include <set>
 #include <string>
 #include <vector>
 
 namespace sirius::test {
 
-/// Collect all rows as sorted vectors of stringified values for deterministic comparison. Sorting
-/// makes the comparison a row bag, so an ORDER BY-free query is compared by content, not by the
-/// order the engine happened to emit.
-inline std::vector<std::vector<std::string>> collect_rows(duckdb::MaterializedQueryResult& result)
+/// Collect all rows as vectors of stringified values. When `sort` is true (the default) the rows
+/// are sorted so the comparison is a row bag -- an ORDER BY-free query is compared by content, not
+/// by the order the engine happened to emit. Pass false to preserve emitted order (e.g. to verify
+/// ORDER BY / NULLS FIRST|LAST).
+inline std::vector<std::vector<std::string>> collect_rows(duckdb::MaterializedQueryResult& result,
+                                                          bool sort = true)
 {
   std::vector<std::vector<std::string>> rows;
   for (duckdb::idx_t r = 0; r < result.RowCount(); r++) {
@@ -59,7 +64,7 @@ inline std::vector<std::vector<std::string>> collect_rows(duckdb::MaterializedQu
     }
     rows.push_back(std::move(row));
   }
-  std::sort(rows.begin(), rows.end());
+  if (sort) { std::sort(rows.begin(), rows.end()); }
   return rows;
 }
 
@@ -144,12 +149,100 @@ class GpuExecutionFixture {
   }
 
   /// @copydoc sirius::test::collect_rows
-  static std::vector<std::vector<std::string>> collect_rows(duckdb::MaterializedQueryResult& result)
+  static std::vector<std::vector<std::string>> collect_rows(duckdb::MaterializedQueryResult& result,
+                                                            bool sort = true)
   {
-    return sirius::test::collect_rows(result);
+    return sirius::test::collect_rows(result, sort);
   }
 
-  void compare_gpu_vs_cpu(const std::string& query)
+  /// Cell equality used by the comparator. Exact string match by default; when
+  /// `rel_tol > 0` and both cells parse fully as numbers, they match within a
+  /// relative tolerance (with an absolute floor near zero), so floating-point
+  /// aggregation-order differences don't register as mismatches. A partial
+  /// numeric parse ("12abc") or a non-number ("NULL") is never approximate.
+  /// Exposed as a static so it can be unit-tested directly.
+  static bool cells_equal(const std::string& a, const std::string& b, double rel_tol)
+  {
+    if (a == b) { return true; }
+    if (rel_tol <= 0.0) { return false; }
+    // std::stod is C-locale sensitive; correct under CI's default C locale (DuckDB
+    // prints numerics with '.'). Use std::from_chars if that assumption changes.
+    try {
+      std::size_t pa  = 0;
+      std::size_t pb  = 0;
+      double const da = std::stod(a, &pa);
+      double const db = std::stod(b, &pb);
+      // Reject partial parses ("12abc", "NULL") so only fully-numeric cells are
+      // compared approximately.
+      if (pa != a.size() || pb != b.size()) { return false; }
+      // Non-finite values (inf / -inf / NaN) only match via exact string equality
+      // (already handled above). The tolerance test below would otherwise treat
+      // inf vs a finite or opposite-sign value as equal, since inf <= rel_tol*inf.
+      if (!std::isfinite(da) || !std::isfinite(db)) { return false; }
+      double const diff  = std::fabs(da - db);
+      double const scale = std::max(std::fabs(da), std::fabs(db));
+      return diff <= rel_tol * scale || diff <= rel_tol;
+    } catch (...) {
+      return false;
+    }
+  }
+
+  /// GPU-vs-CPU comparison that ignores row order (rows are sorted first). Use
+  /// for filters, joins, aggregates, and any query without an ORDER BY.
+  void compare_gpu_vs_cpu(const std::string& query) { compare_gpu_vs_cpu_impl(query, false); }
+
+  /// GPU-vs-CPU comparison that preserves row order. Use for queries with a
+  /// deterministic output order (ORDER BY / LIMIT) so NULLS FIRST|LAST placement
+  /// is actually verified rather than sorted away.
+  void compare_gpu_vs_cpu_ordered(const std::string& query)
+  {
+    compare_gpu_vs_cpu_impl(query, true);
+  }
+
+  /// GPU-vs-CPU comparison with a relative tolerance applied ONLY to the columns
+  /// named in `approx_cols` (0-based). Those columns match within `rel_tol` (with
+  /// an absolute floor near zero); every other column -- keys, counts, strings,
+  /// NULLs -- still compares exactly. Use for floating-point aggregation (SUM/AVG
+  /// over DECIMAL/DOUBLE), where GPU parallel reduction and CPU serial summation
+  /// legitimately differ in the low bits. Rows are matched order-insensitively by
+  /// sorting stringified rows, which is only valid when the leading column(s) form
+  /// an exact, unique key -- so `approx_cols` must NOT include column 0 of a
+  /// multi-row result (enforced at runtime). NOTE: not
+  /// for aggregates prone to catastrophic cancellation (e.g. sums of signed values
+  /// that nearly cancel) -- there the two summation orders can diverge beyond any
+  /// meaningful tolerance.
+  void compare_gpu_vs_cpu_approx(const std::string& query,
+                                 const std::set<size_t>& approx_cols,
+                                 double rel_tol = 1e-6)
+  {
+    compare_gpu_vs_cpu_impl(query, false, approx_cols, rel_tol);
+  }
+
+  /// Asserts the query does NOT run purely on the GPU: it triggers a runtime
+  /// fallback to DuckDB CPU (which still produces the correct result). Use for
+  /// operations that are unsupported on-device -- this is a coverage fact, not a
+  /// result divergence, so it is a normal passing assertion rather than a
+  /// [!shouldfail] case.
+  void expect_gpu_fallback(const std::string& query)
+  {
+    con->Query("SET gpu_execution = true;");
+    auto before = sirius::test::get_transparent_execution_stats(*con);
+    auto result = con->Query(query);
+    auto after  = sirius::test::get_transparent_execution_stats(*con);
+    REQUIRE(result);
+    if (result->HasError()) { UNSCOPED_INFO("execution error: " << result->GetError()); }
+    REQUIRE_FALSE(result->HasError());
+    if (after.runtime_fallbacks <= before.runtime_fallbacks) {
+      UNSCOPED_INFO("expected a runtime fallback to CPU, but none occurred");
+    }
+    REQUIRE(after.runtime_fallbacks > before.runtime_fallbacks);
+  }
+
+ private:
+  void compare_gpu_vs_cpu_impl(const std::string& query,
+                               bool ordered,
+                               const std::set<size_t>& approx_cols = {},
+                               double rel_tol                      = 0.0)
   {
     // Run on GPU (transparent, plain SQL goes through the Sirius optimizer hook).
     con->Query("SET gpu_execution = true;");
@@ -177,20 +270,34 @@ class GpuExecutionFixture {
 
     auto& gpu_mat = gpu_result->Cast<duckdb::MaterializedQueryResult>();
     auto& cpu_mat = cpu_result->Cast<duckdb::MaterializedQueryResult>();
-    auto gpu_rows = collect_rows(gpu_mat);
-    auto cpu_rows = collect_rows(cpu_mat);
+    // For ordered queries, keep emitted order so NULLS FIRST|LAST is verified;
+    // otherwise sort both sides for an order-insensitive multiset comparison.
+    auto gpu_rows = collect_rows(gpu_mat, !ordered);
+    auto cpu_rows = collect_rows(cpu_mat, !ordered);
+
+    // Order-insensitive approx matching pairs rows by their sorted stringified
+    // values, so an approximate *leading* key (col 0) could misalign rows. Guard
+    // that misuse: with multiple rows, col 0 must be compared exactly.
+    if (!ordered && !approx_cols.empty() && gpu_rows.size() > 1) {
+      REQUIRE(approx_cols.count(0) == 0);
+    }
 
     for (size_t r = 0; r < gpu_rows.size(); r++) {
       for (size_t c = 0; c < gpu_rows[r].size(); c++) {
-        if (gpu_rows[r][c] != cpu_rows[r][c]) {
+        // Only explicitly-approximate columns get the tolerance; keys, counts,
+        // and everything else compare exactly (tol = 0).
+        double const tol = approx_cols.count(c) != 0 ? rel_tol : 0.0;
+        bool const match = cells_equal(gpu_rows[r][c], cpu_rows[r][c], tol);
+        if (!match) {
           UNSCOPED_INFO("Row " << r << " Col " << c << " mismatch: GPU=[" << gpu_rows[r][c]
                                << "] CPU=[" << cpu_rows[r][c] << "]");
         }
-        REQUIRE(gpu_rows[r][c] == cpu_rows[r][c]);
+        REQUIRE(match);
       }
     }
   }
 
+ public:
   std::unique_ptr<duckdb::DuckDB> db;
   std::unique_ptr<duckdb::Connection> con;
   std::string temp_db_path;

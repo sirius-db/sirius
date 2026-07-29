@@ -53,6 +53,19 @@ num_partitions = max(1, ceil(total_bytes / hash_partition_bytes))
 
 **Config:** `sort_sample_bytes` (default: 512 MB), settable via YAML and the `sort_sample_bytes` SET option
 
+### Merge Pipeline Fusion (PR #1190)
+
+**Motivation:** A `MERGE_GROUP_BY` / `MERGE_TOP_N` operator normally forms its own terminal pipeline whose only downstream is a streaming chain ending at the sink (typically `RESULT_COLLECTOR`). That standalone pipeline costs an extra task launch and a repository round-trip for no additional parallelism.
+
+**Mechanism:** At plan time `mark_fusable_merge_pipelines()` walks parent pointers from each merge to the first downstream sink. When that path is unary and streaming and the sink accepts a fused input, the merge is marked to fuse. The merge's `build_pipelines()` override then adds itself as an intermediate operator to the downstream pipeline and recurses into its child (which still cuts the upstream boundary), instead of opening a new terminal pipeline. Total-input structural sinks (`ORDER_BY`, `TOP_N`, an outer `GROUP BY`) are fusable because they already buffer their full input. Excluded: join/CTE/delim terminals, partition sinks, delim-owned distinct merges, and `MERGE_AGGREGATE` (ungrouped aggregate).
+
+**Code path:**
+- `src/planner/sirius_physical_plan_generator.cpp` — `mark_fusable_merge_pipelines()`, `terminal_sink_supports_fusion()`
+- `src/op/sirius_physical_grouped_aggregate_merge.cpp`, `src/op/sirius_physical_top_n.cpp` — `build_pipelines()` overrides
+- `src/sirius_engine.cpp` — invokes marking after parent pointers are refreshed
+
+**Config:** `fuse_merge_pipelines` (default: true). See [physical-plan-generation.md](physical-plan-generation.md) → Merge fusion for pipeline-shape details.
+
 ## Operator-Level Optimizations
 
 ### Adaptive Join BUILD_PROBE Mode (PR #423)
