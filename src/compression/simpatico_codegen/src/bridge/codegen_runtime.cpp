@@ -836,6 +836,15 @@ static int launch_encode_fused_tree_impl(const simpatico::CodegenHead& head,
     for (auto& p : dev_ptrs)
       args.push_back(&p);
 
+    {
+      CUfunction fn_enc   = kernel->func_for_current_device();
+      int static_smem_enc = 0;
+      cuFuncGetAttribute(&static_smem_enc, CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES, fn_enc);
+      if (static_smem_enc + spec.shared_bytes > 48 * 1024) {
+        cuFuncSetAttribute(
+          fn_enc, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, spec.shared_bytes);
+      }
+    }
     SIMPATICO_CU_CHECK(cuLaunchKernel(kernel->func_for_current_device(),
                                       static_cast<unsigned>(num_chunks),
                                       1,
