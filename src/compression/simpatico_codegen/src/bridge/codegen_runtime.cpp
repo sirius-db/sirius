@@ -420,6 +420,9 @@ const char* dtype_to_cxx(const char* dtype)
   // SIGNED int8_t: zigzag's shift = elem_size*8-1 relies on sign-extension.
   // The output column retains the original UINT8 type_id.
   if (s == "uint8" || s == "uint8_t" || s == "int8" || s == "int8_t") return "int8_t";
+  // 16-bit signed/unsigned both process as int16_t; zigzag's shift = 15 relies
+  // on sign-extension, and the output column keeps the original UINT16 type_id.
+  if (s == "int16" || s == "int16_t" || s == "uint16" || s == "uint16_t") return "int16_t";
   // Unsigned 32/64-bit process as their same-width signed integer (bit-level
   // codecs roundtrip either way); the output column keeps the original UINT type.
   if (s == "uint32" || s == "uint32_t") return "int32_t";
@@ -595,9 +598,10 @@ bool launch_decode_fused_tree(codegen::jit::FusedTree const& tree,
                    dtype ? dtype : "(null)");
       return false;
     }
-    const std::size_t elem_size = (std::strcmp(cxx_dtype, "int64_t") == 0)  ? 8u
-                                  : (std::strcmp(cxx_dtype, "int8_t") == 0) ? 1u
-                                                                            : 4u;
+    const std::size_t elem_size = (std::strcmp(cxx_dtype, "int64_t") == 0)   ? 8u
+                                  : (std::strcmp(cxx_dtype, "int16_t") == 0) ? 2u
+                                  : (std::strcmp(cxx_dtype, "int8_t") == 0)  ? 1u
+                                                                             : 4u;
 
     // Device transients (bp_offsets/scratch) from the RMM async pool, freed
     // async on return.
@@ -1313,6 +1317,8 @@ bool launch_encode_fused_tree(CodegenHead const& head,
   switch (input_col.type().id()) {
     case cudf::type_id::INT8: dtype = "int8"; break;
     case cudf::type_id::UINT8: dtype = "uint8"; break;
+    case cudf::type_id::INT16: dtype = "int16"; break;
+    case cudf::type_id::UINT16: dtype = "uint16"; break;
     case cudf::type_id::INT32: dtype = "int32"; break;
     case cudf::type_id::INT64: dtype = "int64"; break;
     case cudf::type_id::UINT32: dtype = "uint32"; break;

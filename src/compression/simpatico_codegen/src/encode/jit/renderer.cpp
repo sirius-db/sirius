@@ -105,6 +105,7 @@ const DtypeInfo* lookup_dtype(const std::string& name)
 {
   static const std::unordered_map<std::string, DtypeInfo> table = {
     {"int8_t", {sizeof(std::int8_t), "INT8_MAX", "INT8_MIN"}},
+    {"int16_t", {sizeof(std::int16_t), "INT16_MAX", "INT16_MIN"}},
     {"int32_t", {sizeof(std::int32_t), "INT32_MAX", "INT32_MIN"}},
     {"int64_t", {sizeof(std::int64_t), "INT64_MAX", "INT64_MIN"}},
   };
