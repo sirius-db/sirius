@@ -611,7 +611,7 @@ class SiriusContext : public ClientContextState {
 
   /// \brief Best-effort task_creator reset for latched-unavailable paths,
   /// where no later window will ever run the in-cleanup reset.
-  void drop_task_creator_state_best_effort() noexcept;
+  void drop_task_creator_state_best_effort(sirius::query_id_t query_id) noexcept;
 
   mutable std::mutex mutex_;
   // The Super Sirius runtime is shared across connections, so plan generation

@@ -464,7 +464,10 @@ void gpu_pipeline_executor::manager_loop()
         }
 
         if (query_complete && _completion_handler) {
-          _task_creator->drain_pending_tasks();
+          // Scoped to the finishing query: its pending creation requests point at operators
+          // that mark_completed() may let the engine destroy. Any other query's requests are
+          // left alone.
+          _task_creator->drain_pending_tasks(pipeline->get_query_id());
           _completion_handler->mark_completed();
         }
       });
