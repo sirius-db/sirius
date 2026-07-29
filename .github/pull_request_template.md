@@ -11,4 +11,4 @@
 - [ ] Update human and agent documentation (README.md, docs/, skills, CLAUDE.md)
 
 ## References
-<!-- Add open issues with "Closes #issue" to close or "Refs #issue" for reference and any relevant URLs -->
+<!-- Add open issues with "Closes #issue" to close or "Refs #issue" for reference, and any relevant URLs -->
