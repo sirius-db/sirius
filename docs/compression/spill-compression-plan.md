@@ -476,6 +476,54 @@ it was built for. Worth checking whether the edges that actually spill are the o
 without lineage (aggregate/computed outputs), which would explain both the low seed
 count and why q21 still explores.
 
+### MEASURED: at 30% GPU budget, the cost is per-edge and hits short queries
+
+The downgrade thresholds are **relative to the usage limit, not the device**:
+`usage_limit_fraction` feeds `_gpu_capacity` → `memory_capacity`, and
+`downgrade_trigger/stop_fraction` multiply that. So they scale automatically and need
+no adjustment when the budget changes — confirmed empirically: dropping
+`usage_limit_fraction` from 0.95 to 0.30 (11.4 GB → 3.6 GB budget on a 12 GB card)
+took spill activity from 6 events to 322 with the fractions untouched.
+
+All 22 queries, SF100, `usage_limit_fraction: 0.30`:
+
+| | off | on | ratio |
+| --- | --- | --- | --- |
+| **sum** | **115.81 s** | **135.67 s** | **1.17x** |
+| q21 | 82.12 s | 80.79 s | **0.98x** |
+| q22 | 0.48 s | 8.70 s | **18.02x** |
+| q10 | 1.81 s | 9.05 s | 4.99x |
+| q4 | 0.77 s | 3.44 s | 4.50x |
+| q11 | 0.78 s | 3.47 s | 4.47x |
+| other 17 | — | — | 0.92x – 1.06x |
+
+Spill activity: 37 seeded from lineage, 13 explored, 204 compressed, 81 declined,
+**3 OOM declines**.
+
+Three things this settles:
+
+1. **The overhead is per-edge and roughly constant, not proportional to query time.**
+   q21 spills heavily for 80 s and compression is *free* there (0.98x — it pays for
+   itself). q22 runs in 0.48 s and pays 8.2 s of setup. The absolute cost of standing
+   up compression for an edge — explore or seed, then compress the first batches —
+   is what hurts, so it is catastrophic on short queries and neutral on long ones.
+   This argues for gating compression on expected spill volume per edge rather than
+   enabling it globally: an edge that will spill a handful of batches should never
+   pay to set it up.
+
+2. **There is a floor on the headroom compression needs.** OOM declines reappeared (3)
+   once the free margin fell from ~4.6 GB to ~1.44 GB. The fractions scale, but the
+   *absolute* room left at the trigger point is what compression actually requires, and
+   a percentage cannot express that. A minimum-bytes floor alongside the fraction would.
+
+3. **Lineage seeding is now doing real work** — 37 seeds against 13 explores, against
+   1 seed in the 0.95 run. It engages once there is enough spilling for it to matter.
+
+The remaining question is whether the 204 compressed spills bought anything: this
+measures time, not bytes saved or host-memory pressure relieved. A run that reports
+spilled-bytes-before/after is needed before concluding the feature is or is not worth
+its cost.
+
 ### Tune the explorer for use during query execution
 
 The explorer's defaults were chosen for offline plan generation, where a long beam

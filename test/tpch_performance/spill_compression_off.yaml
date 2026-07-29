@@ -9,7 +9,7 @@ sirius:
     num_gpus: 1
   memory:
     gpu:
-      usage_limit_fraction: 0.95
+      usage_limit_fraction: 0.30
       reservation_limit_fraction: 0.9
       downgrade_trigger_fraction: 0.6
       downgrade_stop_fraction: 0.4
