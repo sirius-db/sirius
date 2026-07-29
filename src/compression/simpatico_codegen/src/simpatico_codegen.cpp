@@ -15,6 +15,7 @@
 #include <nvtx3/nvtx3.hpp>
 
 #include <atomic>
+#include <map>
 #include <mutex>
 #include <span>
 #include <stdexcept>
@@ -108,17 +109,29 @@ void validate_column_names(std::vector<std::string> const& column_names, size_t 
 // result is safe to free by any stream (including the RMM default) with no
 // external rebinding. Streams are recycled between calls, so this also avoids
 // per-call stream create/destroy churn.
+//
+// The free lists are keyed by device. A CUDA stream belongs to the device that
+// was current when it was created, and driving work on a stream from another
+// device is invalid — kernel launches fail with "invalid resource handle" and
+// the async copies/codec calls around them can fault the context with
+// cudaErrorIllegalAddress. In the affected Sirius path, multi-GPU pin_table
+// compression uses a caller-owned pool; this cache is exercised by the
+// subsequent per-device threaded decode. Without the device key, one device's
+// completed decode can recycle its streams into the next device's decode.
 class stream_cache {
  public:
-  // Hand out n valid streams, reusing recycled ones and creating the rest.
-  std::vector<cudaStream_t> checkout(size_t n)
+  // Hand out n valid streams belonging to `device`, reusing ones recycled from
+  // that device and creating the rest. The caller must have `device` current:
+  // cudaStreamCreateWithFlags binds the new streams to the current device.
+  std::vector<cudaStream_t> checkout(int device, size_t n)
   {
     std::vector<cudaStream_t> out;
     out.reserve(n);
     std::lock_guard<std::mutex> lock(mu_);
-    while (out.size() < n && !free_.empty()) {
-      out.push_back(free_.back());
-      free_.pop_back();
+    auto& free_list = free_[device];
+    while (out.size() < n && !free_list.empty()) {
+      out.push_back(free_list.back());
+      free_list.pop_back();
     }
     while (out.size() < n) {
       cudaStream_t s{};
@@ -127,18 +140,22 @@ class stream_cache {
     }
     return out;
   }
-  // Return streams for reuse. They are kept alive (never destroyed): buffers of
-  // previously-returned results may still reference them for their async free.
-  void check_in(std::vector<cudaStream_t>& streams)
+
+  // Return `device`'s streams for reuse. They are kept alive (never destroyed):
+  // buffers of previously-returned results may still reference them for their
+  // async free. `device` must be the one they were checked out with, so they go
+  // back to the free list of the device they actually belong to.
+  void check_in(int device, std::vector<cudaStream_t>& streams)
   {
     std::lock_guard<std::mutex> lock(mu_);
-    free_.insert(free_.end(), streams.begin(), streams.end());
+    auto& free_list = free_[device];
+    free_list.insert(free_list.end(), streams.begin(), streams.end());
     streams.clear();
   }
 
  private:
   std::mutex mu_;
-  std::vector<cudaStream_t> free_;
+  std::map<int, std::vector<cudaStream_t>> free_;
 };
 
 stream_cache& global_stream_cache()
@@ -153,19 +170,30 @@ stream_cache& global_stream_cache()
 // its eventual async free even after this pool is gone. Concurrent leases get
 // disjoint streams (checkout is mutex-guarded and pops distinct handles), so each
 // call's sync_all only touches its own streams.
+//
+// Public internal-parallel calls retain the caller's current device for the
+// synchronous lease lifetime, and run_column_workers binds each worker thread
+// to that device. Capture it once so checkout and return use the same free list.
 struct leased_pool {
   stream_pool pool;
+  int device = 0;
 
   explicit leased_pool(int column_threads)
   {
-    pool.streams = global_stream_cache().checkout(static_cast<size_t>(std::max(1, column_threads)));
+    if (cudaGetDevice(&device) != cudaSuccess)
+      throw plan_error("failed to query the current device for the internal stream lease");
+
+    pool.streams =
+      global_stream_cache().checkout(device, static_cast<size_t>(std::max(1, column_threads)));
+
     if (pool.streams.empty()) throw plan_error("failed to lease internal streams");
   }
+
   ~leased_pool()
   {
     pool.sync_all();
     global_stream_cache().check_in(
-      pool.streams);  // leaves pool.streams empty; ~stream_pool is a no-op
+      device, pool.streams);  // leaves pool.streams empty; ~stream_pool is a no-op
   }
 
   leased_pool(const leased_pool&)            = delete;
