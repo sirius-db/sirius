@@ -323,6 +323,23 @@ inline std::unique_ptr<cudf::table> make_empty_table(const duckdb::vector<logica
   return std::make_unique<cudf::table>(std::move(columns));
 }
 
+/**
+ * @brief Build a 0-row cudf table with one column per cudf type.
+ *
+ * The carrier-exact counterpart of the logical-type overload, for callers holding an operator's
+ * `physical_types` sidecar: the result reproduces those carriers instead of re-deriving native
+ * ones.
+ */
+inline std::unique_ptr<cudf::table> make_empty_table(const std::vector<cudf::data_type>& types)
+{
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.reserve(types.size());
+  for (auto const& t : types) {
+    columns.push_back(cudf::make_empty_column(t));
+  }
+  return std::make_unique<cudf::table>(std::move(columns));
+}
+
 }  // namespace sirius
 
 namespace duckdb {

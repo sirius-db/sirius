@@ -24,9 +24,12 @@
 // join. The partition_narrow_columns counter — derived from actual batch types inside the
 // hash-partition path — is the engagement proof; a plan-shape case pins down the sidecar
 // stamps on the DYNAMIC_FILTER / GPU_SCAN leaf pair and the wrap-time copies, and a grouped
-// aggregation case proves narrow group keys cross the aggregate-side exchange.
+// aggregation case proves narrow group keys cross the aggregate-side exchange. An outer-join case
+// covers the join types that are forced onto the STANDARD partitioned path, including a side that
+// yields no row at run time.
 
 #include "compressed_materialization_test_common.hpp"
+#include "cudf/cudf_utils.hpp"
 #include "op/scan/sirius_physical_dynamic_filter.hpp"
 #include "op/sirius_physical_concat.hpp"
 #include "op/sirius_physical_operator.hpp"
@@ -35,6 +38,7 @@
 #include "sirius_context.hpp"
 
 #include <cudf/types.hpp>
+#include <cudf/utilities/traits.hpp>
 
 #include <catch.hpp>
 #include <duckdb.hpp>
@@ -85,6 +89,46 @@ constexpr std::size_t kMaxBuildHashTableBytes = 1024;
 
 constexpr char const* kJoinQuery =
   "SELECT SUM(t.v) AS sv, SUM(t.d) AS sd FROM t JOIN dm ON t.k = dm.k WHERE dm.x < 50;";
+
+// RIGHT and FULL OUTER joins are forced onto the STANDARD partitioned path, so they exercise the
+// per-side input schema the join reads whenever it has to build a side's batch itself.
+//
+// The gap table supplies a side that yields no row at run time without being provably empty at plan
+// time: a statically empty side is folded out of the plan by DuckDB, taking the join with it. Its
+// keys are the 4096 values [0, 4095] plus the 4096 values [104096, 108191], written 2048 rows per
+// row group, so no row group's range contains kGapUnmatchedKey while the file-level range does.
+constexpr std::int64_t kGapRows         = 8192;
+constexpr std::int64_t kGapUnmatchedKey = 50000;
+constexpr std::size_t kGapRowGroupSize  = 2048;
+
+void generate_gap_parquet(fs::path const& path)
+{
+  generate_parquet(path,
+                   "SELECT CASE WHEN range < 4096 THEN range ELSE range + 100000 END AS k, "
+                   "(range * 11) % 297 AS v FROM range(" +
+                     std::to_string(kGapRows) + ")",
+                   kGapRowGroupSize);
+}
+
+// An outer join over two fully pinned narrow tables. Both payload carriers survive to the join as
+// join-payload transport, so each of the join's input ports carries a narrow schema.
+constexpr char const* kOuterJoinQuery =
+  "SELECT SUM(t.v) AS sv, SUM(t.d) AS sd, COUNT(dm.x) AS cx FROM t FULL OUTER JOIN dm ON t.k = "
+  "dm.k;";
+
+/// Outer joins whose g side yields no row. Aggregated so the result comparison stays cheap while
+/// the join still materializes every surviving row; the counts cover the NULL padding the join
+/// emits for the side that contributed nothing.
+std::vector<std::string> runtime_empty_side_queries()
+{
+  std::string const dead = "(SELECT * FROM g WHERE k = " + std::to_string(kGapUnmatchedKey) + ")";
+  return {"SELECT COUNT(*) AS c, COUNT(a.v) AS cav, COUNT(b.x) AS cbx FROM " + dead +
+            " a FULL OUTER JOIN dm b ON a.k = b.k;",
+          "SELECT COUNT(*) AS c, COUNT(a.v) AS cav, COUNT(b.x) AS cbx FROM " + dead +
+            " a RIGHT JOIN dm b ON a.k = b.k;",
+          "SELECT COUNT(*) AS c, COUNT(a.v) AS cav, COUNT(t.v) AS ctv FROM t LEFT JOIN " + dead +
+            " a ON t.k = a.k;"};
+}
 
 constexpr char const* kGroupByQuery =
   "SELECT k, COUNT(*) AS c, SUM(v) AS sv FROM t GROUP BY k ORDER BY k LIMIT 10;";
@@ -284,6 +328,99 @@ TEST_CASE(
         require_ok(con.Query("CALL unpin_table('t');"), "unpin fact");
       }
     }
+  }
+
+  fs::remove_all(tmp, ec);
+}
+
+TEST_CASE("gpu_execution - outer joins over narrow carriers match the CPU",
+          "[gpu_execution][parquet][compressed_materialization_partition]")
+{
+  pause_shared_envs();
+
+  auto tmp = fs::temp_directory_path() / ("sirius-compmat-outer-" + std::to_string(::getpid()));
+  std::error_code ec;
+  fs::remove_all(tmp, ec);
+  fs::create_directories(tmp);
+
+  auto fact_path = tmp / "fact.parquet";
+  generate_fact_parquet(fact_path);
+  auto dim_path = tmp / "dim.parquet";
+  generate_dim_parquet(dim_path);
+  auto gap_path = tmp / "gap.parquet";
+  generate_gap_parquet(gap_path);
+
+  auto yaml_path = tmp / "compmat_outer.yaml";
+  write_config(yaml_path, kConfigValues);
+  REQUIRE(fs::exists(yaml_path));
+
+  {
+    sirius::test::shared_test_env local_env(yaml_path);
+    auto con = local_env.make_connection();
+
+    require_ok(con.Query("SET enable_duckdb_fallback = false;"), "disable fallback");
+    require_ok(
+      con.Query("CREATE VIEW t AS SELECT * FROM read_parquet('" + fact_path.string() + "');"),
+      "create fact view");
+    require_ok(
+      con.Query("CREATE VIEW dm AS SELECT * FROM read_parquet('" + dim_path.string() + "');"),
+      "create dim view");
+    require_ok(
+      con.Query("CREATE VIEW g AS SELECT * FROM read_parquet('" + gap_path.string() + "');"),
+      "create gap view");
+
+    // HOST tier keeps the tier narrowing policy inert, so the narrow carriers the pins recorded
+    // survive to the join.
+    require_ok(con.Query("SET enable_compressed_materialization = true;"), "enable flag");
+    require_ok(con.Query("CALL pin_table('" + fact_path.string() + "', tier='host', name='t');"),
+               "pin fact");
+    require_ok(con.Query("CALL pin_table('" + dim_path.string() + "', tier='host', name='dm');"),
+               "pin dim");
+    require_ok(con.Query("CALL pin_table('" + gap_path.string() + "', tier='host', name='g');"),
+               "pin gap");
+
+    SECTION("the join's per-side input schema is the narrow one")
+    {
+      // What the join reads when it has to build one side's batch itself: that child's own
+      // physical sidecar, copied onto the CONCAT/PARTITION feeder chain at wrap time. The schema on
+      // that port is narrower than the native mapping of the same logical columns, so deriving an
+      // empty batch from the logical types instead would not reproduce it.
+      auto plan = build_sirius_plan(con, kOuterJoinQuery);
+      REQUIRE(plan);
+      auto joins = collect(plan.get(), SiriusPhysicalOperatorType::HASH_JOIN);
+      REQUIRE(joins.size() == 1);
+      REQUIRE(joins[0]->children.size() == 2);
+
+      std::size_t narrow_inputs = 0;
+      for (auto const& child : joins[0]->children) {
+        REQUIRE(child->has_physical_overrides());
+        auto const& physical = child->get_physical_types();
+        REQUIRE(physical.size() == child->get_types().size());
+        for (std::size_t column_idx = 0; column_idx < physical.size(); column_idx++) {
+          auto const native = sirius::get_cudf_type(child->get_types()[column_idx]);
+          if (cudf::size_of(physical[column_idx]) < cudf::size_of(native)) { narrow_inputs++; }
+        }
+      }
+      REQUIRE(narrow_inputs > 0);
+    }
+
+    SECTION("results match the CPU when one side yields no row")
+    {
+      for (auto const& query : runtime_empty_side_queries()) {
+        INFO("query: " << query);
+        auto const before = sirius::test::get_compressed_materialization_stats(con);
+        compare_gpu_vs_cpu(con, query);
+        auto const after = sirius::test::get_compressed_materialization_stats(con);
+        // The residency gate installed a narrow sidecar for this query, so the comparison above is
+        // a flag-on result over narrow carriers rather than a silently inert one.
+        REQUIRE(after.scan_sidecars_installed > before.scan_sidecars_installed);
+        REQUIRE(after.scan_narrow_targets_retracted == before.scan_narrow_targets_retracted);
+      }
+    }
+
+    require_ok(con.Query("CALL unpin_table('g');"), "unpin gap");
+    require_ok(con.Query("CALL unpin_table('dm');"), "unpin dim");
+    require_ok(con.Query("CALL unpin_table('t');"), "unpin fact");
   }
 
   fs::remove_all(tmp, ec);
