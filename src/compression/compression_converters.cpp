@@ -25,6 +25,7 @@
 
 #include <cudf/column/column.hpp>
 #include <cudf/table/table.hpp>
+#include <cudf/utilities/traits.hpp>
 
 #include <rmm/device_buffer.hpp>
 #include <rmm/mr/per_device_resource.hpp>
@@ -257,12 +258,42 @@ std::vector<std::string> synthetic_column_names(int n)
 /// round-trips through both the in-memory and the file path.
 constexpr auto kPassthroughDsl = "input -> identity\n";
 
+/// Default plan for a column with no offline plan to seed from.
+///
+/// A fixed choice costs nothing to make, so an edge can start compressing on its
+/// first spill instead of paying for a beam search — which the SF100 sweep showed
+/// is a fixed per-edge cost that ruins short queries (q22: 0.48s -> 8.70s, fixed
+/// to 1.00x by defaulting instead of exploring).
+///
+/// bitpack rather than an entropy coder: bitcomp was tried here and compressed
+/// well but ran far too slowly to be a default. On q21 — the one query that
+/// spills heavily — it cost 8.6x, because the explored plans it replaced were
+/// cheap bitpack/delta cascades. A default is applied to every un-seeded column
+/// on every spilling edge, so its *speed* matters more than its ratio; the
+/// explorer refines it later, once the edge has spilled enough to amortize a
+/// search.
+///
+/// delta -> bitpack was also measured and is *worse* here (1.07x vs 0.95x
+/// overall, and q21 0.98x vs 0.92x): the extra pass costs more than the width it
+/// recovers, because partitioning has already narrowed TPC-H's key columns before
+/// they spill.
+///
+/// Non-fixed-width columns (STRING, nested) are stored raw. A str_split cascade
+/// was tried for STRING and is not obviously worth the risk as a blind default:
+/// its cost profile on real data is unmeasured, and getting it wrong is expensive
+/// on exactly the heavily-spilling queries this is meant to help.
+std::string default_plan_for(cudf::data_type type)
+{
+  if (!cudf::is_fixed_width(type)) { return kPassthroughDsl; }
+  return "input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n";
+}
+
 using column_state = compression::plan_register::column_plan_state;
 
 // Resolve this edge's per-column plans, running Simpatico's beam-search explorer
 // once (on the first batch to spill from this edge) and caching the result in the
 // plan register for every later batch.
-std::vector<column_state> resolve_or_explore_spill_plan(cudf::table_view table,
+std::vector<column_state> resolve_or_explore_spill_plan(cudf::table_view view,
                                                         const compression::spill_context& ctx,
                                                         rmm::cuda_stream_view stream)
 {
@@ -270,6 +301,7 @@ std::vector<column_state> resolve_or_explore_spill_plan(cudf::table_view table,
 
   auto& reg           = compression::plan_register::global();
   const auto decision = reg.decide_spill_plan(ctx.repo, ctx.replan_after_uses);
+  const auto& table   = view;
 
   // A cached entry only applies if it still describes this schema; a differing
   // column count means the plans were explored for other data, so explore again.
@@ -292,25 +324,36 @@ std::vector<column_state> resolve_or_explore_spill_plan(cudf::table_view table,
   // that is optimal and expensive. Columns with no lineage (aggregate results,
   // computed expressions) or whose table has no plan loaded are stored raw until
   // the edge's next scheduled replan.
-  if (auto seeds = reg.seed_plans_from_lineage(ctx.repo, num_cols)) {
+  // First contact with an edge never explores. Seed each column from its base
+  // table's offline plan where lineage reaches, and give the rest a general-
+  // purpose default. Exploration is deferred to the edge's first expiry, so the
+  // beam search is only paid for once an edge has proven it spills enough to
+  // amortize it. Only an entry that has expired (or one that never got installed)
+  // reaches the explorer below.
+  if (!reg.resolve_spill_plan(ctx.repo).has_value()) {
     nvtx3::scoped_range seed_range{"sirius::compression::seed_spill_plan"};
-    std::vector<compression::plan_register::column_plan_candidate> seeded;
-    seeded.reserve(num_cols);
+    auto seeds = reg.seed_plans_from_lineage(ctx.repo, num_cols);
+
+    std::vector<compression::plan_register::column_plan_candidate> initial;
+    initial.reserve(num_cols);
     std::size_t hits = 0;
-    for (auto& seed : *seeds) {
-      if (seed.has_value()) {
+    for (std::size_t i = 0; i < num_cols; ++i) {
+      if (seeds && (*seeds)[i].has_value()) {
         ++hits;
-        seeded.push_back({std::move(*seed), /*ratio=*/1.0, /*c=*/0.0, /*d=*/0.0});
+        initial.push_back({std::move(*(*seeds)[i]), /*ratio=*/1.0, /*c=*/0.0, /*d=*/0.0});
       } else {
-        seeded.push_back({kPassthroughDsl, 1.0, 0.0, 0.0});
+        initial.push_back(
+          {default_plan_for(view.column(static_cast<cudf::size_type>(i)).type()), 1.0, 0.0, 0.0});
       }
     }
-    SIRIUS_LOG_DEBUG("[compression_converters] repo={} seeded {}/{} columns from table plans",
-                     static_cast<const void*>(ctx.repo),
-                     hits,
-                     num_cols);
+    SIRIUS_LOG_DEBUG(
+      "[compression_converters] repo={} initial plans: {}/{} seeded from table plans, "
+      "rest defaulted",
+      static_cast<const void*>(ctx.repo),
+      hits,
+      num_cols);
 
-    reg.set_spill_plan(ctx.repo, std::move(seeded), ctx.replan_change_threshold);
+    reg.set_spill_plan(ctx.repo, std::move(initial), ctx.replan_change_threshold);
     const auto settled = reg.decide_spill_plan(ctx.repo, /*replan_after_uses=*/0);
     if (settled.verdict != verdict::skip) { return settled.columns; }
   }

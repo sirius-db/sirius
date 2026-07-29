@@ -524,6 +524,58 @@ measures time, not bytes saved or host-memory pressure relieved. A run that repo
 spilled-bytes-before/after is needed before concluding the feature is or is not worth
 its cost.
 
+### MEASURED: defer exploration, default to bitpack — spill compression is ~free
+
+The 30% sweep showed the overhead is a fixed *per-edge setup* cost, so an edge's
+first spill no longer explores. It installs plans immediately — seeded from the base
+table's offline plan where lineage reaches, and a fixed default everywhere else —
+and defers exploration to the edge's first expiry on the normal
+`spill_replan_after_uses` schedule, by which point it has spilled enough to amortize
+a beam search.
+
+Choosing that default mattered more than expected. All 22 queries, SF100,
+`usage_limit_fraction: 0.30`:
+
+| default | overall | q21 | short queries | explored |
+| --- | --- | --- | --- | --- |
+| explore on first spill | 1.17x | 0.98x | q22 **18.0x**, q10 5.0x, q4/q11 4.5x | 13 |
+| `bitcomp` | 2.69x | **8.57x** | ~1.0x | 0 |
+| **`bitpack`** | **0.95x** | **0.92x** | ~1.0x | 0 |
+| `delta -> bitpack` | 1.07x | 0.98x | q10 4.5x, q7 2.7x | 2 |
+
+**A default is applied to every un-seeded column on every spilling edge, so its
+speed matters more than its ratio.** `bitcomp` compresses well but is an entropy
+coder: on q21 — the one query that spills heavily — it cost 8.6x, because the
+explored plans it displaced were cheap bitpack/delta cascades. `bitpack` gets both
+halves right, and lands slightly *ahead* of no compression at all.
+
+`delta -> bitpack` was expected to win on the monotonic key columns that dominate
+TPC-H spill traffic (`l_orderkey`, `o_orderkey`). It does not: partitioning has
+already narrowed those columns by the time they spill, so the extra pass costs more
+than the width it recovers. Its q10/q7 regressions are a separate effect — the only
+run since deferral where exploration fired at all (2 edges hit their 128-use expiry),
+which is the same fixed-cost problem on a ~2 s query.
+
+STRING and nested columns are stored raw. A `str_split -> {bitcomp chars, delta ->
+rle -> bitpack offsets}` cascade was written and reverted: its cost profile on real
+data is unmeasured, and a blind default that is wrong is expensive on exactly the
+heavily-spilling queries this is meant to help.
+
+**These margins are not solid.** Two caveats:
+
+- `run_spill_sweep.sh` runs the off arm first and the on arm second, so the off arm
+  reads colder and the bias flatters compression. The off arm swung 43.72 s →
+  118.84 s across runs on identical config — larger than the 5% margin separating
+  bitpack from parity. Fixing the harness to interleave or pre-warm is the highest-
+  value next change before any of these numbers are trusted.
+- One iteration, one workload, one GPU budget. bitpack vs `delta -> bitpack` differ
+  by 12%, which is not comfortably outside that noise.
+
+Treat "plain bitpack, and delta does not help" as a working conclusion, not a settled
+one. What is solid is the shape: deferring exploration removes the short-query
+regressions outright (q22 18.0x → 1.0x), and a cheap default keeps the
+heavily-spilling case fast.
+
 ### Tune the explorer for use during query execution
 
 The explorer's defaults were chosen for offline plan generation, where a long beam
