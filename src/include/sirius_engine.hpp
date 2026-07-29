@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "data/data_repository_manager_registry.hpp"
 #include "duckdb/common/common.hpp"
 #include "duckdb/common/mutex.hpp"
 #include "duckdb/common/pair.hpp"
@@ -56,8 +57,13 @@ class sirius_engine {
   friend class pipeline::sirius_meta_pipeline;
 
  public:
-  explicit sirius_engine(duckdb::ClientContext& context, sirius_interface& sirius_iface);
+  explicit sirius_engine(duckdb::ClientContext& context,
+                         sirius_interface& sirius_iface,
+                         sirius::query_id_t query_id);
   ~sirius_engine();
+
+  /// \brief The query_id this engine belongs to.
+  [[nodiscard]] sirius::query_id_t query_id() const noexcept { return query_id_; }
 
   duckdb::ClientContext& context;
   sirius_interface& sirius_iface;
@@ -100,6 +106,7 @@ class sirius_engine {
   bool query_finished;
 
  private:
+  sirius::query_id_t query_id_;
   std::shared_ptr<const telemetry::telemetry_context> telemetry_context_;
   rust::Box<quent::query::QueryHandle> query_handle_;
 };

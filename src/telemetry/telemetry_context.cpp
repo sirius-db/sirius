@@ -183,7 +183,7 @@ void emit_plan_telemetry(
       std::string chain{};
       for (const auto& name : operators | std::views::transform([](const auto& op) {
                                 return std::format(
-                                  "{}({})", op.get().get_name(), op.get().operator_id);
+                                  "{}({})", op.get().get_name(), op.get().get_operator_id());
                               })) {
         if (chain.empty()) {
           chain = name;
@@ -244,7 +244,7 @@ void emit_plan_telemetry(
                         quent::plan::Declaration{
                           .parent =
                             quent::plan::Parent{
-                              .query_id = telemetry_info.query_id,
+                              .query_id = telemetry_info.telemetry_query_id,
                               .plan_id  = uuid::new_nil(),  // no parent plan
                             },
                           .instance_name = "pipeline_plan",
