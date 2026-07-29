@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -50,13 +51,19 @@ struct vector_join_request {
   std::optional<float> threshold;    ///< If set, drop pairs where distance > threshold.
   std::vector<std::string> probe_output_columns;   ///< Probe columns to emit (in order).
   std::vector<std::string> corpus_output_columns;  ///< Corpus columns to emit (in order).
+  /// Corpus staging budget in bytes; defaults to the GPU space's available memory.
+  /// Set below the corpus size to force the tiled path (tests, diagnostics).
+  std::optional<std::size_t> max_stage_bytes;
 };
 
 /// Run a top-k similarity join over two tables and return the result materialized on
-/// the HOST tier: the probe output columns, then the corpus output columns, then the
-/// FLOAT32 @c distance column. Each probe row contributes @c k consecutive rows of its
-/// nearing neighbors.
-std::unique_ptr<cucascade::host_data_representation> run_vector_join(
+/// the HOST tier.
+///
+/// The result is returned as one batch per probe chunk, in probe order, so the join
+/// never has to hold every pair on the GPU at once; @c global mode reduces to a single
+/// batch. Concatenate them (or stream them in order) to get the full result. An empty
+/// result is an empty vector.
+std::vector<std::unique_ptr<cucascade::host_data_representation>> run_vector_join(
   duckdb::SiriusContext& ctx, const vector_join_request& req);
 
 }  // namespace sirius::vss

@@ -1794,6 +1794,10 @@ static unique_ptr<FunctionData> SiriusVectorJoinBind(ClientContext& context,
       }
     } else if (key == "threshold") {
       req.threshold = static_cast<float>(kv.second.GetValue<double>());
+    } else if (key == "max_stage_bytes") {
+      auto const bytes = kv.second.GetValue<int64_t>();
+      if (bytes <= 0) { throw BinderException("sirius_knn_join: max_stage_bytes must be >= 1"); }
+      req.max_stage_bytes = static_cast<std::size_t>(bytes);
     } else if (key == "schema_name") {
       schema_name = kv.second.ToString();
     } else if (key == "probe_output_columns") {
@@ -1894,6 +1898,14 @@ static unique_ptr<FunctionData> SiriusVectorJoinBind(ClientContext& context,
   return std::move(result);
 }
 
+// The join returns one host batch per probe chunk (see run_vector_join); they are read
+// out in order, and each is released as soon as it is drained.
+struct SiriusVectorJoinGlobalStat : public GlobalTableFunctionState {
+  std::vector<std::unique_ptr<cucascade::host_data_representation>> host_reprs;
+  std::unique_ptr<sirius::op::result::host_table_chunk_reader> reader;
+  std::size_t next_repr{0};
+};
+
 static unique_ptr<GlobalTableFunctionState> SiriusVectorJoinInit(ClientContext& context,
                                                                  TableFunctionInitInput& input)
 {
@@ -1905,10 +1917,8 @@ static unique_ptr<GlobalTableFunctionState> SiriusVectorJoinInit(ClientContext& 
     throw InvalidInputException("sirius_knn_join requires the Sirius context to be initialized");
   }
 
-  auto state       = make_uniq<SiriusStreamedResultGlobalStat>();
-  state->host_repr = sirius::vss::run_vector_join(*sirius_ctx, bind_data.req);
-  state->reader    = std::make_unique<sirius::op::result::host_table_chunk_reader>(
-    context, *state->host_repr, bind_data.reader_types);
+  auto state        = make_uniq<SiriusVectorJoinGlobalStat>();
+  state->host_reprs = sirius::vss::run_vector_join(*sirius_ctx, bind_data.req);
   return std::move(state);
 }
 
@@ -1916,8 +1926,33 @@ static void SiriusVectorJoinFunction(ClientContext& context,
                                      TableFunctionInput& data_p,
                                      DataChunk& output)
 {
-  auto& state = data_p.global_state->Cast<SiriusStreamedResultGlobalStat>();
-  state.reader->get_next_chunk(output);
+  auto& state     = data_p.global_state->Cast<SiriusVectorJoinGlobalStat>();
+  auto& bind_data = data_p.bind_data->Cast<SiriusVectorJoinBindData>();
+
+  // Advance past exhausted batches; empty ones are skipped rather than emitted.
+  while (true) {
+    if (!state.reader) {
+      if (state.next_repr >= state.host_reprs.size()) {
+        output.SetCardinality(0);
+        return;
+      }
+      auto& repr = state.host_reprs[state.next_repr++];
+      if (!repr) { continue; }
+      state.reader = std::make_unique<sirius::op::result::host_table_chunk_reader>(
+        context, *repr, bind_data.reader_types);
+    }
+    // get_next_chunk() Initialize()s the chunk it fills, and DataChunk::Initialize()
+    // appends vectors rather than replacing them. The pipeline only Reset()s the
+    // output between calls, so fill a fresh chunk and move its vectors across.
+    DataChunk batch;
+    if (state.reader->get_next_chunk(batch)) {
+      output.Move(batch);
+      return;
+    }
+    // Reader borrows from the batch, so drop it when finished
+    state.reader.reset();
+    state.host_reprs[state.next_repr - 1].reset();
+  }
 }
 
 void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
@@ -2034,7 +2069,8 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
   catalog.CreateTableFunction(transaction, vector_search_info);
 
   // sirius_knn_join(probe_table, probe_col, corpus_table, corpus_col, k =>, metric =>,
-  //   mode =>, threshold =>, probe_output_columns =>, corpus_output_columns =>, schema_name =>)
+  //   mode =>, threshold =>, probe_output_columns =>, corpus_output_columns =>,
+  //   max_stage_bytes =>, schema_name =>)
   TableFunction vector_join(
     "sirius_knn_join",
     {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
@@ -2047,6 +2083,7 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
   vector_join.named_parameters["threshold"]             = LogicalType::DOUBLE;
   vector_join.named_parameters["probe_output_columns"]  = LogicalType::LIST(LogicalType::VARCHAR);
   vector_join.named_parameters["corpus_output_columns"] = LogicalType::LIST(LogicalType::VARCHAR);
+  vector_join.named_parameters["max_stage_bytes"]       = LogicalType::BIGINT;
   vector_join.named_parameters["schema_name"]           = LogicalType::VARCHAR;
   CreateTableFunctionInfo vector_join_info(vector_join);
   catalog.CreateTableFunction(transaction, vector_join_info);
