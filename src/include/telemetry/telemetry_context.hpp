@@ -114,11 +114,9 @@ class telemetry_context {
 // A POD to hold common identifiers for useful telemetry.
 struct query_telemetry_info {
   /// Quent's own UUID for this query (`QueryHandle::uuid()`), authoritative within telemetry.
-  /// Named distinctly from `query_id` below so the two identities are never confused.
   uuid::UUID telemetry_query_id;
   uuid::UUID worker_id;
-  /// The engine-wide numeric query id (the execution window's id). Carried alongside the UUID
-  /// so telemetry records can be correlated with window-keyed log lines.
+  /// The engine-wide numeric query id (the execution window's id).
   sirius::query_id_t query_id;
 };
 

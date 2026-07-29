@@ -428,8 +428,8 @@ class SiriusContext : public ClientContextState {
   [[nodiscard]] sirius::memory::sirius_memory_reservation_manager& get_memory_manager();
   [[nodiscard]] const sirius::memory::sirius_memory_reservation_manager& get_memory_manager() const;
 
-  /// \brief The data repository manager owned by @p query_id's execution window.
-  /// \return The manager, or nullptr when no window is registered under that id.
+  /// \brief The data repository manager owned by @p query_id's query
+  /// \return The manager, or nullptr
   [[nodiscard]] sirius::data::data_repository_manager_registry::manager_ptr
   get_data_repository_manager(sirius::query_id_t query_id) const;
 
@@ -610,11 +610,7 @@ class SiriusContext : public ClientContextState {
   std::optional<rmm::host_device_async_resource_ref> prev_pinned_mr_{};
   std::size_t prev_pinned_threshold_{0};
   std::shared_ptr<const sirius::telemetry::telemetry_context> telemetry_context_;
-  /// One data repository manager per in-flight query, keyed by execution-window id.
-  /// Replaces the former single SiriusContext-wide manager so query end drops only its own
-  /// repositories. Declared here (not as a unique_ptr) because the registry itself holds no
-  /// GPU resources — the managers it owns do, and those are dropped in terminate() before the
-  /// memory manager goes away.
+  /// One data repository manager per in-flight query, keyed by query_id.
   sirius::data::data_repository_manager_registry data_repository_registry_;
   std::unique_ptr<sirius::pipeline::task_scheduler> task_scheduler_;
   std::vector<std::unique_ptr<sirius::parallel::downgrade_executor>> downgrade_executors_;

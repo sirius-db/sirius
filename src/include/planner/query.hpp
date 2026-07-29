@@ -45,7 +45,7 @@ class query {
    * @brief Construct a new query object.
    *
    * @param pipelines The ordered pipelines required to execute this query.
-   * @param query_id The enclosing execution window's id — the engine-wide query identity.
+   * @param query_id The engine-wide query identity.
    * @param telemetry_info Info useful for emitting identifiable telemetry.
    */
   query(duckdb::vector<duckdb::shared_ptr<pipeline::sirius_pipeline>> pipelines,

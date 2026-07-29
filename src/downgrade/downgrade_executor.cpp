@@ -23,6 +23,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <ranges>
 #include <thread>
 #include <vector>
 
@@ -201,16 +202,26 @@ void downgrade_executor::processing_loop()
 
     // === TIER 1: Data repositories ===
     // Memory pressure is a global condition, so candidates are drawn from EVERY in-flight
-    // query: outer loop ascending by query id, inner loop in get_repositories() order —
-    // ascending {operator_id, port_id} — with early stop once the reservation is satisfied.
-    // Operator ids restart at 0 per query, so ordering is (query id, operator id) rather than
-    // a single global counter. This inherits "lowest query id spills first", which is
-    // arbitrary across concurrent queries; a deliberate fairness policy is still owed here.
+    // query: outer loop DESCENDING by query id (newest query first), inner loop in
+    // get_repositories() order — ascending {operator_id, port_id} — with early stop once the
+    // reservation is satisfied. Operator ids restart at 0 per query, so ordering is
+    // (query id, operator id) rather than a single global counter.
+    //
+    // Newest-first is the fairness policy: query ids are monotonic, so the newest query is the
+    // one that has made the least progress, and spilling it costs the least re-materialization
+    // work. It also keeps the oldest query's working set resident so it can finish and release
+    // its memory, which is what actually relieves the pressure — spilling the oldest query
+    // instead would slow down the query closest to completing while newer arrivals keep
+    // allocating. This makes the pressure response FIFO: earliest queries keep execution
+    // priority, latest queries pay for the memory.
+    //
+    // get_all() returns ascending by query id, so this iterates the snapshot in reverse.
     // get_all_convertible() snapshots eligible batches once per repo so a batch isn't
     // re-scanned before leaving idle. Managers are held by shared_ptr for the duration of the
     // sweep, so a query ending concurrently cannot pull one out from under this loop.
     bool pool_interrupted = false;
-    for (auto const& manager : _data_repo_registry.get_all()) {
+    auto const managers   = _data_repo_registry.get_all();
+    for (auto const& manager : std::views::reverse(managers)) {
       if (req->satisfied.load() || pool_interrupted) break;
       auto repos = manager->get_repositories();
       for (auto* repo : repos) {

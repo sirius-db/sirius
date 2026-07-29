@@ -105,9 +105,6 @@ class sirius_interface {
     const duckdb::PendingQueryParameters& parameters,
     sirius::query_id_t query_id);
   //! Execute the query
-  //! Execute the query. @p query_id is the enclosing execution window's id
-  //! (SiriusContext::StandaloneQueryScope::query_id()); it selects the data repository manager
-  //! this query's operators wire into.
   duckdb::unique_ptr<duckdb::QueryResult> sirius_execute_query(
     duckdb::ClientContext& context,
     const duckdb::string& query,

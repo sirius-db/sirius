@@ -57,14 +57,12 @@ class sirius_engine {
   friend class pipeline::sirius_meta_pipeline;
 
  public:
-  /// @param query_id The enclosing execution window's id. Selects which per-query data
-  ///        repository manager this plan's pipelines wire their repositories into.
   explicit sirius_engine(duckdb::ClientContext& context,
                          sirius_interface& sirius_iface,
                          sirius::query_id_t query_id);
   ~sirius_engine();
 
-  /// \brief The execution window this engine belongs to.
+  /// \brief The query_id this engine belongs to.
   [[nodiscard]] sirius::query_id_t query_id() const noexcept { return query_id_; }
 
   duckdb::ClientContext& context;
@@ -108,7 +106,6 @@ class sirius_engine {
   bool query_finished;
 
  private:
-  /// Execution-window id; picks this query's data repository manager out of the registry.
   sirius::query_id_t query_id_;
   std::shared_ptr<const telemetry::telemetry_context> telemetry_context_;
   rust::Box<quent::query::QueryHandle> query_handle_;

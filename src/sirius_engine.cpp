@@ -242,9 +242,6 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
   pipeline::sirius_pipeline_converter converter(build_ctx, op_params);
   auto result = converter.convert(*root_pipeline);
 
-  // Operator ids were stamped by the converter (see assign_operator_ids); repository wiring
-  // below is the first consumer of them. Ids restart at 0 per query, so they are only unique
-  // within this query's manager — hence the lookup by query_id rather than a shared manager.
   auto repo_manager = sirius_ctx_ptr->get_data_repository_manager(query_id_);
   if (!repo_manager) {
     throw sirius::internal_exception(

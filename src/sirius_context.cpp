@@ -285,9 +285,7 @@ void SiriusContext::begin_execution_window(ClientContext& context,
     SIRIUS_LOG_INFO("QueryBegin: {}", window_label);
   } catch (...) {  // best-effort observability
   }
-  // Register this window's repository manager up front so "inside a window implies a manager
-  // exists" holds for every path. Windows that never wire repositories (pin_table, the FFI
-  // entry point) just carry an empty one; run_mandatory_cleanup erases it either way.
+  // Register this query's repository manager up front
   data_repository_registry_.create_for_query(query_id);
   task_creator_->reset();
   task_creator_->set_client_context(context);

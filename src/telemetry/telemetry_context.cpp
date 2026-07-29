@@ -244,7 +244,6 @@ void emit_plan_telemetry(
                         quent::plan::Declaration{
                           .parent =
                             quent::plan::Parent{
-                              // Quent's own query UUID, not the engine's numeric query id.
                               .query_id = telemetry_info.telemetry_query_id,
                               .plan_id  = uuid::new_nil(),  // no parent plan
                             },

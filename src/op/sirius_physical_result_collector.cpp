@@ -162,11 +162,7 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
           return a->get_available_memory() < b->get_available_memory();
         });
 
-      auto& registry = sirius::converter_registry::get();
-      // Use the process-wide batch-id counter that every other producer uses
-      // (sirius::get_next_batch_id, data_batch_utils.hpp) rather than a repository manager's
-      // own counter: managers are now per-query, so a manager-local counter would restart at 0
-      // for each query and collide with ids already present in a repository.
+      auto& registry     = sirius::converter_registry::get();
       auto next_batch_id = sirius::get_next_batch_id();
 
       auto host_reservation =

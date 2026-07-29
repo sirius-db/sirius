@@ -1,5 +1,5 @@
 /*
- * Copyright 2025, Sirius Contributors.
+ * Copyright 2026, Sirius Contributors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -75,8 +75,8 @@ class data_repository_manager_registry {
   {
     auto manager = std::make_shared<manager_type>();
     {
-      std::lock_guard<std::mutex> lock(mutex_);
-      auto [it, inserted] = managers_.emplace(query_id, std::move(manager));
+      std::lock_guard<std::mutex> lock(_mutex);
+      auto [it, inserted] = _managers.emplace(query_id, std::move(manager));
       if (!inserted) {
         throw std::runtime_error(
           "data_repository_manager_registry: a manager is already registered for query " +
@@ -89,9 +89,9 @@ class data_repository_manager_registry {
   /// \brief The manager for @p query_id, or nullptr if none is registered.
   [[nodiscard]] manager_ptr get(sirius::query_id_t query_id) const
   {
-    std::lock_guard<std::mutex> lock(mutex_);
-    auto it = managers_.find(query_id);
-    return it == managers_.end() ? nullptr : it->second;
+    std::lock_guard<std::mutex> lock(_mutex);
+    auto it = _managers.find(query_id);
+    return it == _managers.end() ? nullptr : it->second;
   }
 
   /**
@@ -99,14 +99,16 @@ class data_repository_manager_registry {
    *
    * Used by the downgrade executors, which must see across all in-flight queries because
    * memory pressure is a global condition. Ordering is deterministic so spill-candidate
-   * selection stays reproducible across runs.
+   * selection stays reproducible across runs. Note that the executors walk this snapshot in
+   * REVERSE (newest query first) to keep the oldest query's data resident; ascending is just
+   * the canonical order to return, not the sweep order.
    */
   [[nodiscard]] std::vector<manager_ptr> get_all() const
   {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::mutex> lock(_mutex);
     std::vector<manager_ptr> result;
-    result.reserve(managers_.size());
-    for (const auto& [id, manager] : managers_) {
+    result.reserve(_managers.size());
+    for (const auto& [id, manager] : _managers) {
       result.push_back(manager);
     }
     return result;
@@ -130,11 +132,11 @@ class data_repository_manager_registry {
   {
     manager_ptr manager;
     {
-      std::lock_guard<std::mutex> lock(mutex_);
-      auto it = managers_.find(query_id);
-      if (it == managers_.end()) { return {}; }
+      std::lock_guard<std::mutex> lock(_mutex);
+      auto it = _managers.find(query_id);
+      if (it == _managers.end()) { return {}; }
       manager = std::move(it->second);
-      managers_.erase(it);
+      _managers.erase(it);
     }
     return manager ? manager->clear_all_repositories() : std::vector<leaked_repository_info>{};
   }
@@ -144,8 +146,8 @@ class data_repository_manager_registry {
   {
     std::map<query_id_t, manager_ptr> drained;
     {
-      std::lock_guard<std::mutex> lock(mutex_);
-      drained.swap(managers_);
+      std::lock_guard<std::mutex> lock(_mutex);
+      drained.swap(_managers);
     }
     // Destroyed outside the lock: manager destruction releases data batches, which can run
     // arbitrary deallocation work that must not happen with the registry mutex held.
@@ -154,14 +156,14 @@ class data_repository_manager_registry {
   /// \brief Number of queries currently holding a manager.
   [[nodiscard]] size_t size() const
   {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return managers_.size();
+    std::lock_guard<std::mutex> lock(_mutex);
+    return _managers.size();
   }
 
  private:
-  mutable std::mutex mutex_;
+  mutable std::mutex _mutex;
   /// std::map (not unordered_map) so get_all() iteration is ascending by query id.
-  std::map<sirius::query_id_t, manager_ptr> managers_;
+  std::map<sirius::query_id_t, manager_ptr> _managers;
 };
 
 }  // namespace sirius::data
