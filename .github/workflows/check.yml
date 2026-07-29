@@ -37,7 +37,17 @@ jobs:
           global-environments: |
             pre-commit
 
-      - run: pre-commit run --show-diff-on-failure --all-files
+      - run: |
+          set -o pipefail
+          pre-commit run --show-diff-on-failure --all-files 2>&1 | tee /tmp/lint.log
+
+      - name: Surface lint errors
+        if: failure()
+        run: |
+          echo '## Lint errors' >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          grep -E '(Failed$|^- hook id:|^- exit code:|^- files were modified)' /tmp/lint.log | head -40 >> "$GITHUB_STEP_SUMMARY" || true
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
 
   build:
     env:
@@ -139,10 +149,20 @@ jobs:
 
       - uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
 
-      - run: ${{ case(matrix.build.cudf-channel == 'nightly', 'pixi run -e nightly-runner nightly-run', '') }} make ${{ case(matrix.build.compiler == 'gcc', matrix.build.build-type, format('clang-{0}', matrix.build.build-type)) }} -j$(nproc)
+      - run: |
+          set -o pipefail
+          ${{ case(matrix.build.cudf-channel == 'nightly', 'pixi run -e nightly-runner nightly-run', '') }} make ${{ case(matrix.build.compiler == 'gcc', matrix.build.build-type, format('clang-{0}', matrix.build.build-type)) }} -j$(nproc) 2>&1 | tee /tmp/build.log
         if: matrix.build.environment != 'vcpkg'
         env:
           CUDAARCHS: "100"
+
+      - name: Surface build errors
+        if: failure() && matrix.build.environment != 'vcpkg'
+        run: |
+          echo '## Build errors' >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          grep -E '(FAILED:|: error:|: fatal error:)' /tmp/build.log | head -60 >> "$GITHUB_STEP_SUMMARY" || true
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
 
       # Rust bindings (sirius-sys + sirius) — fmt/clippy + build/link the test.
       # Run on a single representative entry. `cargo test --no-run` compiles the
@@ -168,6 +188,14 @@ jobs:
           set -o pipefail
           pixi run -e vcpkg cmake -S duckdb --preset vcpkg-release 2>&1 | tee /tmp/vcpkg.log
           pixi run -e vcpkg cmake --build build/vcpkg-release --target duckdb duckdb_local_extension_repo sirius_unittest 2>&1 | tee -a /tmp/vcpkg.log
+
+      - name: Surface build errors (vcpkg)
+        if: failure() && matrix.build.environment == 'vcpkg'
+        run: |
+          echo '## Build errors' >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          grep -E '(FAILED:|: error:|: fatal error:)' /tmp/vcpkg.log | head -60 >> "$GITHUB_STEP_SUMMARY" || true
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
 
       - name: vcpkg cache summary
         if: matrix.build.environment == 'vcpkg' && always()
