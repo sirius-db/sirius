@@ -775,11 +775,14 @@ void Walker::emit_rle(const ::codegen::jit::FusedTree& node, LaneInput in)
   vals_in.elem_type   = in.elem_type;
   vals_in.read_expr   = sh_values + "[__LANE__]";
   vals_in.length_expr = v_nruns;
-  // Use smem accumulation for int32 values Bitpack leaves.
-  // int64 values (bits ≤ 64) would need 8 KB slab — too expensive for occupancy.
-  const bool vals_is_bp_leaf_i32 = vit->second->op == ::codegen::OpKind::Bitpack &&
-                                   vit->second->children.empty() && vals_in.elem_type == "int32_t";
-  if (vals_is_bp_leaf_i32) {
+  // Use smem accumulation for sub-64-bit values Bitpack leaves under RLE.
+  // int64 (8 KB slab) is too expensive for occupancy; int32/int16/int8 are all safe
+  // (slabs are 4 KB, 2 KB, 1 KB respectively).
+  const bool vals_is_bp_leaf_smem =
+    vit->second->op == ::codegen::OpKind::Bitpack && vit->second->children.empty() &&
+    (vals_in.elem_type == "int8_t" || vals_in.elem_type == "int16_t" ||
+     vals_in.elem_type == "int32_t");
+  if (vals_is_bp_leaf_smem) {
     emit_bitpack(*vit->second, std::move(vals_in), /*use_smem=*/true);
   } else {
     emit_node(*vit->second, std::move(vals_in));
@@ -1122,6 +1125,32 @@ void Walker::emit_bitpack(const ::codegen::jit::FusedTree& node, LaneInput in, b
         << "            atomicAdd(" << p_lws
         << " + (static_cast<uint32_t>(chunk_id) & 15u) * 32u, _pw);\n"
         << "        }\n";
+
+  // Fast path: when bits_v equals the full element width (int8→8, int16→16,
+  // int32→32) elements sit flush on 32-bit word boundaries, so we can do a
+  // coalesced direct store instead of the atomicOr scatter.  int64 (2 words per
+  // element) is handled by the regular path below.
+  if (op_dt->elem_size <= 4) {
+    const int elem_bits = static_cast<int>(op_dt->elem_size) * 8;
+    const int epw       = 32 / elem_bits;  // elements per uint32 word
+    body_ << "        if (" << bits_v << " == " << elem_bits << ") {\n"
+          << "            const int32_t _nwl_fp_" << idstr << " = (" << bp_len << " + " << (epw - 1)
+          << ") / " << epw << ";\n"
+          << "            for (int32_t _w = tid; _w < _nwl_fp_" << idstr << "; _w += 128) {\n"
+          << "                uint32_t _word = 0u;\n";
+    for (int s = 0; s < epw; s++) {
+      body_ << "                { const int32_t _idx = _w * " << epw << " + " << s << ";\n"
+            << "                  if (_idx < " << bp_len << ") {\n"
+            << "                      _word |= static_cast<uint32_t>(static_cast<uint64_t>("
+            << at_lane(in.read_expr, "_idx") << ") - static_cast<uint64_t>(" << cmin << "))"
+            << " << " << (s * elem_bits) << ";\n"
+            << "                  } }\n";
+    }
+    body_ << "                " << dst << "[_w] = _word;\n"
+          << "            }\n"
+          << "            break;\n"
+          << "        }\n";
+  }
 
   if (use_smem) {
     // Smem accumulation path: accumulate into per-block __shared__ slab,
