@@ -425,6 +425,57 @@ Plausible directions, roughly in order of appeal:
 A profile of the current state (0 explores, 20 failed compressions) is the next
 diagnostic step — the ~18 s of remaining overhead is not yet attributed.
 
+### MEASURED: full TPC-H sweep with a properly configured GPU
+
+The earlier numbers were distorted by a bad benchmark config of my own making
+(`usage_limit_fraction: 0.5`, no disk tier, and Sirius's default
+`downgrade_trigger_fraction: 1.0` — i.e. spill only once the GPU is *completely*
+full, which is exactly why compression had no memory to allocate in). Re-run against
+the real working config from `~/.sirius/sirius.yaml`: 0.95 device usage, trigger at
+0.6 so ~35% stays free, disk tier configured. Both arms identical except the spill
+compression block.
+
+All 22 queries, SF100, 1 iteration:
+
+| | off | on | ratio |
+| --- | --- | --- | --- |
+| **sum of per-query time** | **34.97 s** | **40.15 s** | **1.15x** |
+| q21 | 4.65 s | 10.22 s | **2.20x** |
+| other 21 queries | — | — | 0.79x – 1.06x |
+
+**The 1.15x is entirely q21.** Every other query lands within noise of parity; several
+are marginally faster with compression on, which is measurement scatter, not a win.
+
+Whole-sweep spill activity — the reason for this:
+
+| | count |
+| --- | --- |
+| seeded from lineage | 1 |
+| explored | 2 |
+| spills compressed | 3 |
+| declined (fallback) | 3 |
+| **OOM declines** | **0** |
+
+Two conclusions:
+
+1. **The OOM problem is solved by configuration, not code.** Zero allocation failures
+   across the whole sweep, against 20 in one query before. Triggering the downgrade at
+   0.6 rather than 1.0 leaves the compressor room to work. The earlier conclusion that
+   this was "inherent to compressing on the device being evacuated" was wrong — it was
+   inherent to spilling only when the device is *already* full.
+
+2. **At SF100 on a 12 GB card with 0.95 usage, almost nothing spills.** Six spill
+   events across 22 queries. Spill compression is therefore close to a no-op for this
+   workload, and q21's 2.2x comes from roughly two explorations costing ~1–2 s each on
+   a 4.65 s query. The feature needs a workload that genuinely spills before its value
+   can be judged — a smaller GPU budget, a larger scale factor, or a
+   deliberately memory-starved config.
+
+Lineage seeding fired only **once** in the sweep, so it is not yet carrying the load
+it was built for. Worth checking whether the edges that actually spill are the ones
+without lineage (aggregate/computed outputs), which would explain both the low seed
+count and why q21 still explores.
+
 ### Tune the explorer for use during query execution
 
 The explorer's defaults were chosen for offline plan generation, where a long beam
