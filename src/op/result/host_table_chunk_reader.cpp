@@ -25,6 +25,11 @@
 
 // duckdb
 #include <duckdb/common/types/decimal.hpp>
+#include <duckdb/common/vector/array_vector.hpp>
+#include <duckdb/common/vector/flat_vector.hpp>
+#include <duckdb/common/vector/list_vector.hpp>
+#include <duckdb/common/vector/string_vector.hpp>
+#include <duckdb/common/vector/struct_vector.hpp>
 #include <duckdb/common/vector_operations/vector_operations.hpp>
 #include <duckdb/common/vector_size.hpp>
 #include <duckdb/main/client_context.hpp>
@@ -33,6 +38,24 @@
 #include <algorithm>
 
 namespace sirius::op::result {
+
+namespace {
+
+// DuckDB dropped StringVector::AddBuffer; an owned string payload is now glued to
+// the vector as auxiliary data, which keeps it alive for as long as the string_t
+// values point into it.
+struct string_payload_holder : duckdb::AuxiliaryDataHolder {
+  explicit string_payload_holder(std::size_t bytes)
+    : bytes(bytes), data(duckdb::make_unsafe_uniq_array_uninitialized<duckdb::data_t>(bytes))
+  {
+  }
+  duckdb::idx_t GetAllocationSize() const override { return bytes; }
+
+  std::size_t bytes;
+  duckdb::unsafe_unique_array<duckdb::data_t> data;
+};
+
+}  // namespace
 
 host_table_chunk_reader::column_reader::column_reader(
   cucascade::memory::column_metadata const& col,
@@ -152,12 +175,12 @@ void host_table_chunk_reader::column_reader::copy_fixed_width(
   // by copying into a temp vector and using DuckDB's cast.
   auto const type_size =
     static_cast<size_t>(duckdb::GetTypeIdSize(vector.GetType().InternalType()));
-  auto* dest_ptr = duckdb::FlatVector::GetData(vector);
+  auto* dest_ptr = duckdb::FlatVector::GetDataMutable(vector);
   data_accessor.memcpy_to(allocation, dest_ptr, count * type_size);
 
   // Do the validity mask copy, if necessary
   if (null_count != 0) {
-    auto& validity = duckdb::FlatVector::Validity(vector);
+    auto& validity = duckdb::FlatVector::ValidityMutable(vector);
     copy_validity_range(validity, row_offset, count, allocation);
   }
 }
@@ -173,7 +196,7 @@ void make_duckdb_strings(memory::multiple_blocks_allocation_accessor<OffsetType>
                          size_t end_offset,
                          duckdb::data_ptr_t str_buffer_ptr)
 {
-  auto* strings = duckdb::FlatVector::GetData<duckdb::string_t>(vector);
+  auto* strings = duckdb::FlatVector::GetDataMutable<duckdb::string_t>(vector);
   size_t start  = start_offset;
   offset_accessor.advance();
   size_t offset_counter = 0;
@@ -230,41 +253,39 @@ void host_table_chunk_reader::column_reader::copy_string(
     auto start_offset           = offset_accessor_64.get_current(allocation);
     auto end_offset             = offset_accessor_64.get(row_offset + count, allocation);
     auto const total_data_bytes = end_offset - start_offset;
-    auto str_buffer             = duckdb::make_buffer<duckdb::VectorBuffer>(total_data_bytes);
-    auto str_buffer_ptr         = str_buffer->GetData();
+    auto str_buffer             = duckdb::make_uniq<string_payload_holder>(total_data_bytes);
+    auto str_buffer_ptr         = str_buffer->data.get();
     data_accessor.memcpy_to(allocation, str_buffer_ptr, total_data_bytes);
 
     if (null_count != 0) {
-      auto& validity = duckdb::FlatVector::Validity(vector);
+      auto& validity = duckdb::FlatVector::ValidityMutable(vector);
       copy_validity_range(validity, row_offset, count, allocation);
       detail::make_duckdb_strings<true, int64_t>(
         offset_accessor_64, allocation, vector, count, start_offset, end_offset, str_buffer_ptr);
-      duckdb::StringVector::AddBuffer(vector, str_buffer);
     } else {
       detail::make_duckdb_strings<false, int64_t>(
         offset_accessor_64, allocation, vector, count, start_offset, end_offset, str_buffer_ptr);
-      duckdb::StringVector::AddBuffer(vector, str_buffer);
     }
+    duckdb::StringVector::AddAuxiliaryData(vector, std::move(str_buffer));
   } else {
     // INT32 offsets (from scan task)
     auto start_offset = static_cast<size_t>(offset_accessor_32.get_current(allocation));
     auto end_offset   = static_cast<size_t>(offset_accessor_32.get(row_offset + count, allocation));
     auto const total_data_bytes = end_offset - start_offset;
-    auto str_buffer             = duckdb::make_buffer<duckdb::VectorBuffer>(total_data_bytes);
-    auto str_buffer_ptr         = str_buffer->GetData();
+    auto str_buffer             = duckdb::make_uniq<string_payload_holder>(total_data_bytes);
+    auto str_buffer_ptr         = str_buffer->data.get();
     data_accessor.memcpy_to(allocation, str_buffer_ptr, total_data_bytes);
 
     if (null_count != 0) {
-      auto& validity = duckdb::FlatVector::Validity(vector);
+      auto& validity = duckdb::FlatVector::ValidityMutable(vector);
       copy_validity_range(validity, row_offset, count, allocation);
       detail::make_duckdb_strings<true, int32_t>(
         offset_accessor_32, allocation, vector, count, start_offset, end_offset, str_buffer_ptr);
-      duckdb::StringVector::AddBuffer(vector, str_buffer);
     } else {
       detail::make_duckdb_strings<false, int32_t>(
         offset_accessor_32, allocation, vector, count, start_offset, end_offset, str_buffer_ptr);
-      duckdb::StringVector::AddBuffer(vector, str_buffer);
     }
+    duckdb::StringVector::AddAuxiliaryData(vector, std::move(str_buffer));
   }
 }
 
@@ -283,12 +304,12 @@ void host_table_chunk_reader::column_reader::copy_array(
   child_vec.SetVectorType(duckdb::VectorType::FLAT_VECTOR);
   auto const child_width =
     static_cast<size_t>(duckdb::GetTypeIdSize(child_vec.GetType().InternalType()));
-  auto* child_dest = duckdb::FlatVector::GetData(child_vec);
+  auto* child_dest = duckdb::FlatVector::GetDataMutable(child_vec);
   data_accessor.memcpy_to(allocation, child_dest, count * array_size * child_width);
 
   // List-level validity
   if (null_count != 0) {
-    auto& validity = duckdb::FlatVector::Validity(vector);
+    auto& validity = duckdb::FlatVector::ValidityMutable(vector);
     copy_validity_range(validity, row_offset, count, allocation);
   }
 
@@ -298,7 +319,7 @@ void host_table_chunk_reader::column_reader::copy_array(
   if (child_null_count != 0) {
     auto const child_count = count * array_size;
     assert(utils::mod_8(row_offset * array_size) == 0);  // byte-aligned start
-    auto& child_validity = duckdb::FlatVector::Validity(child_vec);
+    auto& child_validity = duckdb::FlatVector::ValidityMutable(child_vec);
     child_validity.Initialize(child_count);
     auto* child_validity_ptr = reinterpret_cast<uint8_t*>(child_validity.GetData());
     child_mask_accessor.memcpy_to(allocation, child_validity_ptr, utils::ceil_div_8(child_count));
@@ -405,9 +426,10 @@ void host_table_chunk_reader::column_reader::read_into(
       auto& entries = duckdb::StructVector::GetEntries(vector);
       assert(entries.size() == children.size());
       for (size_t f = 0; f < children.size(); ++f) {
-        children[f].read_into(client_ctx, *entries[f], row_offset, count, allocation);
+        children[f].read_into(client_ctx, entries[f], row_offset, count, allocation);
       }
-      copy_validity_range(duckdb::FlatVector::Validity(vector), row_offset, count, allocation);
+      copy_validity_range(
+        duckdb::FlatVector::ValidityMutable(vector), row_offset, count, allocation);
       break;
     }
     case cudf::type_id::LIST: {
@@ -428,7 +450,8 @@ void host_table_chunk_reader::column_reader::read_into(
         list_entries[i].offset = static_cast<uint64_t>(lo - base);
         list_entries[i].length = static_cast<uint64_t>(hi - lo);
       }
-      copy_validity_range(duckdb::FlatVector::Validity(vector), row_offset, count, allocation);
+      copy_validity_range(
+        duckdb::FlatVector::ValidityMutable(vector), row_offset, count, allocation);
 
       auto const child_count = static_cast<size_t>(offset_at(row_offset + count) - base);
       duckdb::ListVector::Reserve(vector, child_count);

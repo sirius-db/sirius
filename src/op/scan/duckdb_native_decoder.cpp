@@ -50,6 +50,7 @@
 #include <cucascade/memory/memory_space.hpp>
 #include <duckdb/common/types/validity_mask.hpp>
 #include <duckdb/common/types/vector.hpp>
+#include <duckdb/common/vector/flat_vector.hpp>
 #include <duckdb/main/attached_database.hpp>
 #include <duckdb/main/database.hpp>
 #include <duckdb/storage/block_manager.hpp>
@@ -209,7 +210,6 @@ pinned_segment_bytes decode_roaring_validity(duckdb::DatabaseInstance& db,
     block_manager,
     desc.block_id,
     desc.block_offset,
-    validity_type,
     desc.segment_count,
     duckdb::CompressionType::COMPRESSION_ROARING,
     duckdb::BaseStatistics::CreateEmpty(validity_type),
@@ -225,10 +225,10 @@ pinned_segment_bytes decode_roaring_validity(duckdb::DatabaseInstance& db,
 
   for (duckdb::idx_t scanned = 0; scanned < row_count; scanned += CHUNK) {
     auto const to_scan = std::min<duckdb::idx_t>(CHUNK, row_count - scanned);
-    auto& vm           = duckdb::FlatVector::Validity(tmp);
+    auto& vm           = duckdb::FlatVector::ValidityMutable(tmp);
     vm.SetAllValid(CHUNK);
-    rs.ScanPartial(scanned, tmp, /*offset=*/0, to_scan);
-    if (!vm.AllValid()) {
+    rs.ScanPartial(scanned, vm, /*offset=*/0, to_scan);
+    if (!vm.CannotHaveNull()) {
       std::size_t const byte_offset   = scanned / 8;
       std::size_t const bytes_to_copy = (to_scan + 7) / 8;
       std::memcpy(out.owned_bytes.data() + byte_offset,

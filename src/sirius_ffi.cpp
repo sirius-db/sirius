@@ -31,6 +31,7 @@
 #include "duckdb/main/prepared_statement_data.hpp"         // duckdb::PreparedStatementData
 #include "duckdb/main/query_result.hpp"                    // duckdb::QueryResult
 #include "duckdb/main/relation.hpp"                        // duckdb::Relation
+#include "duckdb/main/settings.hpp"                        // duckdb::EnableOptimizerSetting
 #include "duckdb/optimizer/optimizer.hpp"                  // duckdb::Optimizer
 #include "duckdb/parser/statement/relation_statement.hpp"  // duckdb::RelationStatement
 #include "duckdb/planner/planner.hpp"                      // duckdb::Planner
@@ -99,7 +100,8 @@ struct Context::Impl {
     // embedded connection, mirroring OnConnectionOpened on the transparent path.
     client.registered_state->Insert("sirius_connection_state",
                                     duckdb::make_shared_ptr<duckdb::SiriusConnectionState>());
-    client.config.enable_optimizer = true;
+    duckdb::Settings::Set<duckdb::EnableOptimizerSetting>(
+      client, duckdb::SetScope::SESSION, duckdb::Value::BOOLEAN(true));
     auto& disabled = duckdb::DBConfig::GetConfig(client).options.disabled_optimizers;
     disabled.insert(duckdb::OptimizerType::IN_CLAUSE);
     disabled.insert(duckdb::OptimizerType::COMPRESSED_MATERIALIZATION);
@@ -159,13 +161,13 @@ void Context::execute_substrait(const std::string& plan, std::uintptr_t out_stre
     prepared->value_map = std::move(planner.value_map);
 
     auto logical_plan = std::move(planner.plan);
-    if (client.config.enable_optimizer) {
+    if (duckdb::Settings::Get<duckdb::EnableOptimizerSetting>(client)) {
       duckdb::Optimizer optimizer(*planner.binder, client);
       logical_plan = optimizer.Optimize(std::move(logical_plan));
     }
     logical_plan->ResolveOperatorTypes();
     duckdb::ColumnBindingResolver resolver;
-    duckdb::ColumnBindingResolver::Verify(*logical_plan);
+    duckdb::ColumnBindingResolver::Verify(client, *logical_plan);
     resolver.VisitOperator(*logical_plan);
 
     // 3. DuckDB LogicalOperator -> Sirius GPU physical plan -> execute directly

@@ -298,7 +298,7 @@ TEST_CASE("ast_to_duckdb - reference translates to BoundReferenceExpression (col
   REQUIRE(out);
   REQUIRE(out->GetExpressionClass() == ExpressionClass::BOUND_REF);
   auto const& ref = out->Cast<BoundReferenceExpression>();
-  REQUIRE(ref.index == 3);
+  REQUIRE(ref.Index() == 3);
 }
 
 // ============================================================================
@@ -316,7 +316,7 @@ TEST_CASE("ast_to_duckdb - constant INTEGER round-trips to BoundConstantExpressi
   REQUIRE(out);
   REQUIRE(out->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT);
   auto const& bc = out->Cast<BoundConstantExpression>();
-  REQUIRE(bc.value == Value::INTEGER(42));
+  REQUIRE(bc.GetValue() == Value::INTEGER(42));
 }
 
 TEST_CASE("ast_to_duckdb - constant VARCHAR round-trips to BoundConstantExpression",
@@ -330,7 +330,7 @@ TEST_CASE("ast_to_duckdb - constant VARCHAR round-trips to BoundConstantExpressi
   REQUIRE(out);
   REQUIRE(out->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT);
   auto const& bc = out->Cast<BoundConstantExpression>();
-  REQUIRE(bc.value == Value("hello"));
+  REQUIRE(bc.GetValue() == Value("hello"));
 }
 
 TEST_CASE("ast_to_duckdb - constant typed NULL (INTEGER) round-trips to BoundConstantExpression",
@@ -344,8 +344,8 @@ TEST_CASE("ast_to_duckdb - constant typed NULL (INTEGER) round-trips to BoundCon
   REQUIRE(out);
   REQUIRE(out->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT);
   auto const& bc = out->Cast<BoundConstantExpression>();
-  REQUIRE(bc.value.IsNull());
-  REQUIRE(bc.value.type().id() == LogicalTypeId::INTEGER);
+  REQUIRE(bc.GetValue().IsNull());
+  REQUIRE(bc.GetValue().type().id() == LogicalTypeId::INTEGER);
 }
 
 TEST_CASE("ast_to_duckdb - constant DECIMAL64 round-trips to BoundConstantExpression",
@@ -359,7 +359,7 @@ TEST_CASE("ast_to_duckdb - constant DECIMAL64 round-trips to BoundConstantExpres
   REQUIRE(out);
   REQUIRE(out->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT);
   auto const& bc = out->Cast<BoundConstantExpression>();
-  REQUIRE(bc.value.type().id() == LogicalTypeId::DECIMAL);
+  REQUIRE(bc.GetValue().type().id() == LogicalTypeId::DECIMAL);
 }
 
 // ============================================================================
@@ -372,11 +372,11 @@ TEST_CASE("ast_to_duckdb - comparison EQUAL translates to COMPARE_EQUAL", "[ast_
   auto out = sirius::ast::to_duckdb(orig);
   REQUIRE(out);
   REQUIRE(out->GetExpressionType() == ExpressionType::COMPARE_EQUAL);
-  auto const& cmp = out->Cast<BoundComparisonExpression>();
-  REQUIRE(cmp.left);
-  REQUIRE(cmp.right);
-  REQUIRE(cmp.left->GetExpressionClass() == ExpressionClass::BOUND_REF);
-  REQUIRE(cmp.right->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT);
+  REQUIRE(BoundComparisonExpression::IsComparison(*out));
+  auto const& cmp = out->Cast<BoundFunctionExpression>();
+  REQUIRE(BoundComparisonExpression::Left(cmp).GetExpressionClass() == ExpressionClass::BOUND_REF);
+  REQUIRE(BoundComparisonExpression::Right(cmp).GetExpressionClass() ==
+          ExpressionClass::BOUND_CONSTANT);
 }
 
 TEST_CASE("ast_to_duckdb - comparison NOT_EQUAL translates to COMPARE_NOTEQUAL", "[ast_to_duckdb]")
@@ -437,7 +437,7 @@ TEST_CASE("ast_to_duckdb - conjunction AND translates to BoundConjunctionExpress
   REQUIRE(out->GetExpressionType() == ExpressionType::CONJUNCTION_AND);
   REQUIRE(out->GetExpressionClass() == ExpressionClass::BOUND_CONJUNCTION);
   auto const& conj = out->Cast<BoundConjunctionExpression>();
-  REQUIRE(conj.children.size() == 2);
+  REQUIRE(conj.GetChildren().size() == 2);
 }
 
 TEST_CASE("ast_to_duckdb - conjunction OR (3 children) translates to BoundConjunctionExpression",
@@ -452,7 +452,7 @@ TEST_CASE("ast_to_duckdb - conjunction OR (3 children) translates to BoundConjun
   REQUIRE(out);
   REQUIRE(out->GetExpressionType() == ExpressionType::CONJUNCTION_OR);
   auto const& conj = out->Cast<BoundConjunctionExpression>();
-  REQUIRE(conj.children.size() == 3);
+  REQUIRE(conj.GetChildren().size() == 3);
 }
 
 // ============================================================================
@@ -471,13 +471,11 @@ TEST_CASE("ast_to_duckdb - between translates to BoundBetweenExpression (inclusi
   }};
   auto out = sirius::ast::to_duckdb(orig);
   REQUIRE(out);
-  REQUIRE(out->GetExpressionClass() == ExpressionClass::BOUND_BETWEEN);
-  auto const& bt = out->Cast<BoundBetweenExpression>();
-  REQUIRE(bt.lower_inclusive == true);
-  REQUIRE(bt.upper_inclusive == true);
-  REQUIRE(bt.input);
-  REQUIRE(bt.lower);
-  REQUIRE(bt.upper);
+  REQUIRE(out->GetExpressionType() == ExpressionType::COMPARE_BETWEEN);
+  auto const& bt = out->Cast<BoundFunctionExpression>();
+  REQUIRE(BoundBetweenExpression::LowerInclusive(bt) == true);
+  REQUIRE(BoundBetweenExpression::UpperInclusive(bt) == true);
+  REQUIRE(bt.GetChildren().size() == 3);
 }
 
 // ============================================================================
@@ -500,11 +498,11 @@ TEST_CASE("ast_to_duckdb - case_expr (single WHEN/THEN + ELSE) translates to Bou
   REQUIRE(out);
   REQUIRE(out->GetExpressionClass() == ExpressionClass::BOUND_CASE);
   auto const& ce = out->Cast<BoundCaseExpression>();
-  REQUIRE(ce.return_type.id() == LogicalTypeId::INTEGER);
-  REQUIRE(ce.case_checks.size() == 1);
-  REQUIRE(ce.case_checks[0].when_expr);
-  REQUIRE(ce.case_checks[0].then_expr);
-  REQUIRE(ce.else_expr);
+  REQUIRE(ce.GetReturnType().id() == LogicalTypeId::INTEGER);
+  REQUIRE(ce.CaseChecks().size() == 1);
+  REQUIRE(ce.CaseChecks()[0].when_expr);
+  REQUIRE(ce.CaseChecks()[0].then_expr);
+  REQUIRE(ce.Else().GetExpressionClass() == ExpressionClass::BOUND_CONSTANT);
 }
 
 TEST_CASE("ast_to_duckdb - case_expr (two WHEN/THEN + ELSE) translates to BoundCaseExpression",
@@ -527,7 +525,7 @@ TEST_CASE("ast_to_duckdb - case_expr (two WHEN/THEN + ELSE) translates to BoundC
   REQUIRE(out);
   REQUIRE(out->GetExpressionClass() == ExpressionClass::BOUND_CASE);
   auto const& ce = out->Cast<BoundCaseExpression>();
-  REQUIRE(ce.case_checks.size() == 2);
+  REQUIRE(ce.CaseChecks().size() == 2);
 }
 
 // ============================================================================
@@ -544,10 +542,10 @@ TEST_CASE("ast_to_duckdb - cast INTEGER->BIGINT (default) translates to BoundCas
   }};
   auto out = sirius::ast::to_duckdb(orig);
   REQUIRE(out);
-  REQUIRE(out->GetExpressionClass() == ExpressionClass::BOUND_CAST);
-  auto const& ct = out->Cast<BoundCastExpression>();
-  REQUIRE(ct.try_cast == false);
-  REQUIRE(ct.return_type.id() == LogicalTypeId::BIGINT);
+  REQUIRE(BoundCastExpression::IsCast(*out));
+  auto const& ct = out->Cast<BoundFunctionExpression>();
+  REQUIRE(BoundCastExpression::IsTryCast(ct) == false);
+  REQUIRE(ct.GetReturnType().id() == LogicalTypeId::BIGINT);
 }
 
 TEST_CASE("ast_to_duckdb - cast INTEGER->BIGINT (try_cast=true) translates to BoundCastExpression",
@@ -560,10 +558,10 @@ TEST_CASE("ast_to_duckdb - cast INTEGER->BIGINT (try_cast=true) translates to Bo
   }};
   auto out = sirius::ast::to_duckdb(orig);
   REQUIRE(out);
-  REQUIRE(out->GetExpressionClass() == ExpressionClass::BOUND_CAST);
-  auto const& ct = out->Cast<BoundCastExpression>();
-  REQUIRE(ct.try_cast == true);
-  REQUIRE(ct.return_type.id() == LogicalTypeId::BIGINT);
+  REQUIRE(BoundCastExpression::IsCast(*out));
+  auto const& ct = out->Cast<BoundFunctionExpression>();
+  REQUIRE(BoundCastExpression::IsTryCast(ct) == true);
+  REQUIRE(ct.GetReturnType().id() == LogicalTypeId::BIGINT);
 }
 
 // ============================================================================
@@ -576,7 +574,7 @@ TEST_CASE("ast_to_duckdb - unary_op op_not translates to OPERATOR_NOT", "[ast_to
   auto out = sirius::ast::to_duckdb(orig);
   REQUIRE(out);
   REQUIRE(out->GetExpressionType() == ExpressionType::OPERATOR_NOT);
-  REQUIRE(out->Cast<BoundOperatorExpression>().children.size() == 1);
+  REQUIRE(out->Cast<BoundOperatorExpression>().GetChildren().size() == 1);
 }
 
 TEST_CASE("ast_to_duckdb - unary_op op_is_null translates to OPERATOR_IS_NULL", "[ast_to_duckdb]")
@@ -618,8 +616,8 @@ TEST_CASE("ast_to_duckdb - coalesce (3 args) translates to OPERATOR_COALESCE", "
   auto out = sirius::ast::to_duckdb(orig);
   REQUIRE(out);
   REQUIRE(out->GetExpressionType() == ExpressionType::OPERATOR_COALESCE);
-  REQUIRE(out->Cast<BoundOperatorExpression>().return_type.id() == LogicalTypeId::INTEGER);
-  REQUIRE(out->Cast<BoundOperatorExpression>().children.size() == 3);
+  REQUIRE(out->Cast<BoundOperatorExpression>().GetReturnType().id() == LogicalTypeId::INTEGER);
+  REQUIRE(out->Cast<BoundOperatorExpression>().GetChildren().size() == 3);
 }
 
 // ============================================================================
@@ -641,7 +639,7 @@ TEST_CASE("ast_to_duckdb - in_list (negated=false) translates to COMPARE_IN", "[
   REQUIRE(out);
   REQUIRE(out->GetExpressionType() == ExpressionType::COMPARE_IN);
   // probe + 3 values = 4 children.
-  REQUIRE(out->Cast<BoundOperatorExpression>().children.size() == 4);
+  REQUIRE(out->Cast<BoundOperatorExpression>().GetChildren().size() == 4);
 }
 
 TEST_CASE("ast_to_duckdb - in_list (negated=true) translates to COMPARE_NOT_IN", "[ast_to_duckdb]")
@@ -676,9 +674,9 @@ TEST_CASE("ast_to_duckdb - function_call add translates to BoundFunctionExpressi
   REQUIRE(out);
   REQUIRE(out->GetExpressionClass() == ExpressionClass::BOUND_FUNCTION);
   auto const& fn = out->Cast<BoundFunctionExpression>();
-  REQUIRE(fn.function.name == "+");
-  REQUIRE(fn.children.size() == 2);
-  REQUIRE(fn.return_type.id() == LogicalTypeId::INTEGER);
+  REQUIRE(fn.Function().GetName() == "+");
+  REQUIRE(fn.GetChildren().size() == 2);
+  REQUIRE(fn.GetReturnType().id() == LogicalTypeId::INTEGER);
 }
 
 TEST_CASE("ast_to_duckdb - function_call substring translates to BoundFunctionExpression",
@@ -695,8 +693,8 @@ TEST_CASE("ast_to_duckdb - function_call substring translates to BoundFunctionEx
   REQUIRE(out);
   REQUIRE(out->GetExpressionClass() == ExpressionClass::BOUND_FUNCTION);
   auto const& fn = out->Cast<BoundFunctionExpression>();
-  REQUIRE(fn.function.name == "substring");
-  REQUIRE(fn.children.size() == 3);
+  REQUIRE(fn.Function().GetName() == "substring");
+  REQUIRE(fn.GetChildren().size() == 3);
 }
 
 TEST_CASE("ast_to_duckdb - function_call like translates to BoundFunctionExpression",
@@ -712,8 +710,8 @@ TEST_CASE("ast_to_duckdb - function_call like translates to BoundFunctionExpress
   REQUIRE(out);
   REQUIRE(out->GetExpressionClass() == ExpressionClass::BOUND_FUNCTION);
   auto const& fn = out->Cast<BoundFunctionExpression>();
-  REQUIRE(fn.function.name == "~~");
-  REQUIRE(fn.children.size() == 2);
+  REQUIRE(fn.Function().GetName() == "~~");
+  REQUIRE(fn.GetChildren().size() == 2);
 }
 
 TEST_CASE("ast_to_duckdb - function_call regexp_replace translates to BoundFunctionExpression",
@@ -730,8 +728,8 @@ TEST_CASE("ast_to_duckdb - function_call regexp_replace translates to BoundFunct
   REQUIRE(out);
   REQUIRE(out->GetExpressionClass() == ExpressionClass::BOUND_FUNCTION);
   auto const& fn = out->Cast<BoundFunctionExpression>();
-  REQUIRE(fn.function.name == "regexp_replace");
-  REQUIRE(fn.children.size() == 3);
+  REQUIRE(fn.Function().GetName() == "regexp_replace");
+  REQUIRE(fn.GetChildren().size() == 3);
 }
 
 TEST_CASE("ast_to_duckdb - function_call year translates to BoundFunctionExpression",
@@ -746,8 +744,8 @@ TEST_CASE("ast_to_duckdb - function_call year translates to BoundFunctionExpress
   REQUIRE(out);
   REQUIRE(out->GetExpressionClass() == ExpressionClass::BOUND_FUNCTION);
   auto const& fn = out->Cast<BoundFunctionExpression>();
-  REQUIRE(fn.function.name == "year");
-  REQUIRE(fn.children.size() == 1);
+  REQUIRE(fn.Function().GetName() == "year");
+  REQUIRE(fn.GetChildren().size() == 1);
 }
 
 // ============================================================================
@@ -777,7 +775,7 @@ TEST_CASE("ast_to_duckdb - case_expr preserves non-INTEGER (DECIMAL) return_type
   REQUIRE(out);
   REQUIRE(out->GetExpressionClass() == ExpressionClass::BOUND_CASE);
   // Must be the recorded DECIMAL type, NOT an INTEGER placeholder.
-  REQUIRE(out->Cast<BoundCaseExpression>().return_type.id() == LogicalTypeId::DECIMAL);
+  REQUIRE(out->Cast<BoundCaseExpression>().GetReturnType().id() == LogicalTypeId::DECIMAL);
 }
 
 TEST_CASE("ast_to_duckdb - coalesce preserves non-INTEGER (DECIMAL) return_type", "[ast_to_duckdb]")
@@ -791,7 +789,7 @@ TEST_CASE("ast_to_duckdb - coalesce preserves non-INTEGER (DECIMAL) return_type"
   REQUIRE(out);
   REQUIRE(out->GetExpressionType() == ExpressionType::OPERATOR_COALESCE);
   // Must be the recorded DECIMAL type, NOT an INTEGER placeholder.
-  REQUIRE(out->Cast<BoundOperatorExpression>().return_type.id() == LogicalTypeId::DECIMAL);
+  REQUIRE(out->Cast<BoundOperatorExpression>().GetReturnType().id() == LogicalTypeId::DECIMAL);
 }
 
 // ============================================================================

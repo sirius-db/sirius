@@ -102,7 +102,8 @@ duckdb::DataTable& resolve_storage(duckdb::Connection& con, const std::string& t
   auto& catalog = duckdb::Catalog::GetCatalog(ctx, "");
   duckdb::CatalogTransaction txn(catalog, ctx);
   auto& schema = catalog.GetSchema(txn, "main");
-  auto entry   = schema.GetEntry(txn, duckdb::CatalogType::TABLE_ENTRY, table_name);
+  auto entry =
+    schema.GetEntry(txn, duckdb::CatalogType::TABLE_ENTRY, duckdb::Identifier(table_name));
   REQUIRE(entry);
   return entry->Cast<duckdb::DuckTableEntry>().GetStorage();
 }

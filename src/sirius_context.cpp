@@ -25,6 +25,7 @@
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/planner.hpp"
+#include "helper/type_conversions.hpp"
 #include "log/duckdb_sink.hpp"
 #include "log/logging.hpp"
 #include "log/noop_sink.hpp"
@@ -1255,14 +1256,14 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
 
     // Create a new DuckDB PhysicalPlan containing our custom operator.
     auto new_physical_plan = make_uniq<PhysicalPlan>(Allocator::Get(context));
-    auto& sirius_op =
-      new_physical_plan->Make<sirius::transparent::PhysicalSiriusExecution>(std::move(logical_plan),
-                                                                            current_query_sql,
-                                                                            prepared.types,
-                                                                            prepared.names,
-                                                                            std::move(cpu_fallback),
-                                                                            plan_reads_s3,
-                                                                            0);
+    auto& sirius_op        = new_physical_plan->Make<sirius::transparent::PhysicalSiriusExecution>(
+      std::move(logical_plan),
+      current_query_sql,
+      prepared.types,
+      sirius::from_duckdb_names(prepared.names),
+      std::move(cpu_fallback),
+      plan_reads_s3,
+      0);
     new_physical_plan->SetRoot(sirius_op);
 
     // Replace the DuckDB CPU physical plan.

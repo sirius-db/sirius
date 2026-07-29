@@ -29,6 +29,8 @@
  */
 
 // catch2
+#include "duckdb/main/settings.hpp"
+
 #include <catch.hpp>
 
 // sirius
@@ -354,7 +356,8 @@ duckdb::unique_ptr<sirius_physical_operator> generate_gpu_plan(
   const std::string& query,
   duckdb::shared_ptr<sirius_prepared_statement_data>& out_prepared)
 {
-  con.context->config.enable_optimizer      = true;
+  duckdb::Settings::Set<duckdb::EnableOptimizerSetting>(
+    *con.context, duckdb::SetScope::SESSION, duckdb::Value::BOOLEAN(true));
   con.context->config.use_replacement_scans = false;
 
   set<OptimizerType> disabled_optimizers;
@@ -385,7 +388,7 @@ duckdb::unique_ptr<sirius_physical_operator> generate_gpu_plan(
 
   logical_plan->ResolveOperatorTypes();
   duckdb::ColumnBindingResolver resolver;
-  duckdb::ColumnBindingResolver::Verify(*logical_plan);
+  duckdb::ColumnBindingResolver::Verify(*con.context, *logical_plan);
   resolver.VisitOperator(*logical_plan);
 
   sirius_physical_plan_generator physical_planner(*con.context);

@@ -38,6 +38,7 @@
 #include <duckdb/main/client_config.hpp>
 #include <duckdb/main/client_data.hpp>
 #include <duckdb/main/pending_query_result.hpp>
+#include <duckdb/main/settings.hpp>
 #include <signal.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -1179,20 +1180,23 @@ void run_ac6_capture_generation(duckdb::Connection& connection,
   // planning generation, not incidentally cleared by another QueryBegin.
   connection.context->client_data->catalog_search_path->Set(
     duckdb::CatalogSearchEntry::Parse("new_scope"), duckdb::CatalogSetPathType::SET_SCHEMAS);
-  auto& client_config            = duckdb::ClientConfig::GetConfig(*connection.context);
-  client_config.enable_optimizer = false;
+  auto set_optimizer = [&](bool enabled) {
+    duckdb::Settings::Set<duckdb::EnableOptimizerSetting>(
+      *connection.context, duckdb::SetScope::SESSION, duckdb::Value::BOOLEAN(enabled));
+  };
+  set_optimizer(false);
 
   auto const stats_before_prepare = sirius::test::get_transparent_execution_stats(connection);
   mark_workload_started(output_path, out);
   auto prepared = connection.Prepare("SELECT count(*) FROM t;");
   if (!require_success(prepared.get(), "AC-6 Prepare", out)) {
-    client_config.enable_optimizer = true;
+    set_optimizer(true);
     (void)connection.Query("ROLLBACK;");
     return;
   }
   auto const stats_after_prepare = sirius::test::get_transparent_execution_stats(connection);
   if (stats_after_prepare.successful_rebinds != stats_before_prepare.successful_rebinds) {
-    client_config.enable_optimizer = true;
+    set_optimizer(true);
     (void)connection.Query("ROLLBACK;");
     out.error = "AC-6 first Prepare changed successful_rebinds from " +
                 std::to_string(stats_before_prepare.successful_rebinds) + " to " +
@@ -1204,10 +1208,10 @@ void run_ac6_capture_generation(duckdb::Connection& connection,
   try {
     execute_ok = run_prepared_scalar(*prepared, "7", "AC-6 Execute", out.error);
   } catch (...) {
-    client_config.enable_optimizer = true;
+    set_optimizer(true);
     throw;
   }
-  client_config.enable_optimizer = true;
+  set_optimizer(true);
   if (!execute_ok) {
     (void)connection.Query("ROLLBACK;");
     return;

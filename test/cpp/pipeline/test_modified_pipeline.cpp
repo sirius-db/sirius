@@ -32,6 +32,8 @@
  */
 
 // catch2
+#include "duckdb/main/settings.hpp"
+
 #include <catch.hpp>
 
 // sirius
@@ -353,7 +355,8 @@ duckdb::unique_ptr<sirius_physical_operator> generate_gpu_plan(Connection& con,
 {
   // Create a separate connection for extracting the logical plan (like SiriusInitPlanExtractor)
   // Connection plan_conn(*con.context->db);
-  con.context->config.enable_optimizer      = true;
+  duckdb::Settings::Set<duckdb::EnableOptimizerSetting>(
+    *con.context, duckdb::SetScope::SESSION, duckdb::Value::BOOLEAN(true));
   con.context->config.use_replacement_scans = false;
 
   set<OptimizerType> disabled_optimizers;
@@ -390,7 +393,7 @@ duckdb::unique_ptr<sirius_physical_operator> generate_gpu_plan(Connection& con,
   // After optimization, refresh types before column binding resolution
   logical_plan->ResolveOperatorTypes();
   duckdb::ColumnBindingResolver resolver;
-  duckdb::ColumnBindingResolver::Verify(*logical_plan);
+  duckdb::ColumnBindingResolver::Verify(*con.context, *logical_plan);
   resolver.VisitOperator(*logical_plan);
 
   // Create the raw GPU physical plan

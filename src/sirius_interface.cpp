@@ -32,11 +32,12 @@
 
 namespace sirius {
 
-void bind_prepared_statement_parameters(duckdb::PreparedStatementData& statement,
+void bind_prepared_statement_parameters(duckdb::ClientContext& context,
+                                        duckdb::PreparedStatementData& statement,
                                         const duckdb::PendingQueryParameters& parameters)
 {
-  duckdb::case_insensitive_map_t<duckdb::BoundParameterData> owned_values;
-  statement.Bind(std::move(owned_values));
+  duckdb::identifier_map_t<duckdb::BoundParameterData> owned_values;
+  statement.Bind(context, owned_values);
 }
 
 sirius_interface::sirius_interface(duckdb::ClientContext& client_context,
@@ -155,7 +156,7 @@ duckdb::unique_ptr<duckdb::PendingQueryResult> sirius_interface::sirius_pending_
   D_ASSERT(sirius_active_query);
   auto& statement = *(statement_p->prepared);
 
-  bind_prepared_statement_parameters(statement, parameters);
+  bind_prepared_statement_parameters(context, statement, parameters);
 
   duckdb::unique_ptr<sirius_engine> temp =
     duckdb::make_uniq<sirius_engine>(context, *this, query_id);

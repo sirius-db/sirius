@@ -1753,7 +1753,7 @@ duckdb::unique_ptr<duckdb::FunctionData> bind_sirius_read_parquet(
 
     duckdb::named_parameter_map_t named_parameters;
     duckdb::vector<duckdb::LogicalType> input_table_types;
-    duckdb::vector<std::string> input_table_names;
+    duckdb::vector<duckdb::Identifier> input_table_names;
 
     duckdb::TableFunctionRef ref;
     duckdb::vector<duckdb::unique_ptr<duckdb::ParsedExpression>> children;

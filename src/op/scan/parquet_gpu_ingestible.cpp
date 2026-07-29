@@ -49,6 +49,7 @@
 
 // duckdb
 #include <duckdb/common/hive_partitioning.hpp>
+#include <duckdb/planner/table_filter_set.hpp>
 
 // uring_reactor MUST be included last among sirius headers: liburing.h,
 // pulled in transitively, defines a BLOCK_SIZE macro that collides with the
@@ -350,7 +351,7 @@ parquet_gpu_ingestible::parquet_gpu_ingestible(std::unique_ptr<parquet_ingestibl
   // column_ids with empty projection_ids, the no-pushdown sirius_read_parquet
   // case), filter pushdown, or hive-partition injection — needs column names.
   bool const needs_names = !bind.projection_ids.empty() ||
-                           (bind.table_filters && !bind.table_filters->filters.empty()) ||
+                           (bind.table_filters && bind.table_filters->HasFilters()) ||
                            !bind.partition_indices.empty() ||
                            column_ids_need_reader_projection(bind.column_ids, bind.names.size());
   if (needs_names && bind.names.empty()) {
@@ -369,7 +370,7 @@ parquet_gpu_ingestible::parquet_gpu_ingestible(std::unique_ptr<parquet_ingestibl
   // AST translation deferred to materialize_table so a task-local stream is used.
   // Filters on hive-partition columns are dropped — those columns aren't in the
   // parquet file (DuckDB prunes them at the file-list level already).
-  if (bind.table_filters && !bind.table_filters->filters.empty()) {
+  if (bind.table_filters && bind.table_filters->HasFilters()) {
     auto duckdb_expression =
       sirius::op::convert_table_filters_to_expression(*bind.table_filters,
                                                       bind.column_ids,

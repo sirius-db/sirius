@@ -51,13 +51,10 @@ namespace {
 
 duckdb::JoinCondition make_condition(duckdb::ExpressionType comparison)
 {
-  duckdb::JoinCondition cond;
-  cond.left =
-    duckdb::make_uniq<duckdb::BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0ULL);
-  cond.right =
-    duckdb::make_uniq<duckdb::BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0ULL);
-  cond.comparison = comparison;
-  return cond;
+  return duckdb::JoinCondition(
+    duckdb::make_uniq<duckdb::BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0ULL),
+    duckdb::make_uniq<duckdb::BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0ULL),
+    comparison);
 }
 
 duckdb::unique_ptr<duckdb::LogicalComparisonJoin> make_join(
@@ -78,8 +75,9 @@ duckdb::JoinFilterPushdownFilter make_target(duckdb::shared_ptr<duckdb::DynamicT
   pi.dynamic_filters = std::move(dyn);
   for (duckdb::idx_t i = 0; i < column_count; ++i) {
     duckdb::JoinFilterPushdownColumn col;
-    col.probe_column_index = duckdb::ColumnBinding{0, i};
-    col.storage_type       = duckdb::LogicalType::INTEGER;
+    col.probe_column_index =
+      duckdb::ColumnBinding{duckdb::TableIndex(0), duckdb::ProjectionIndex(i)};
+    col.storage_type = duckdb::LogicalType::INTEGER;
     pi.columns.push_back(col);
   }
   return pi;
@@ -99,11 +97,11 @@ duckdb::unique_ptr<duckdb::JoinFilterPushdownInfo> make_pushdown_info(
 duckdb::unique_ptr<duckdb::LogicalGet> make_get()
 {
   return duckdb::make_uniq<duckdb::LogicalGet>(
-    /*table_index=*/0,
+    duckdb::TableIndex(0),
     duckdb::TableFunction(),
     /*bind_data=*/nullptr,
     duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER},
-    duckdb::vector<duckdb::string>{"a"});
+    duckdb::vector<duckdb::Identifier>{"a"});
 }
 
 /// The malformed contract: only `kind` is meaningful; every other field is default/empty.

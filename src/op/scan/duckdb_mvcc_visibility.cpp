@@ -22,6 +22,7 @@
 #include <duckdb/common/vector_size.hpp>
 #include <duckdb/function/partition_stats.hpp>
 #include <duckdb/storage/data_table.hpp>
+#include <duckdb/storage/storage_index.hpp>
 #include <duckdb/storage/table/column_data.hpp>
 #include <duckdb/storage/table/column_segment.hpp>
 #include <duckdb/storage/table/row_group.hpp>
@@ -78,14 +79,16 @@ void write_bit_range(std::span<std::uint32_t> words,
 }
 
 /// Non-loading per-row-group version-state probe (see header docs for why
-/// this is a safe skip signal). Goes through the public GetPartitionStats
-/// surface: DuckDB marks a row group's count APPROXIMATE exactly when it has
-/// version state — in-memory row versions or unloaded persisted deletes
-/// (RowGroup::HasUnloadedDeletes / GetVersionInfoIfLoaded are private).
-bool row_group_has_version_state(duckdb::SegmentNode<duckdb::RowGroup>& node)
+/// this is a safe skip signal). COUNT_APPROXIMATE stopped covering committed
+/// deletes, so read MinMaxIsExact instead: DuckDB clears it exactly when some
+/// physical row is not visible under `transaction` — unloaded or loaded
+/// deletes, committed or not, or a visible-count mismatch. The StorageIndex
+/// is ignored; the flag is per row group, not per column.
+bool row_group_has_version_state(duckdb::SegmentNode<duckdb::RowGroup>& node,
+                                 duckdb::TransactionData transaction)
 {
-  return duckdb::RowGroup::GetPartitionStats(node).count_type ==
-         duckdb::CountType::COUNT_APPROXIMATE;
+  auto const stats = duckdb::RowGroup::GetPartitionStats(node, transaction);
+  return !stats.partition_row_group->MinMaxIsExact(duckdb::StorageIndex());
 }
 
 }  // namespace
@@ -172,7 +175,7 @@ mvcc_visibility_plan capture_mvcc_visibility_plan(
     // mask job serializes unaligned chunks into a single fill task.
     auto const chunk_offset = expected_start - chunk_start;
 
-    bool const dirty = row_group_has_version_state(*node);
+    bool const dirty = row_group_has_version_state(*node, plan.transaction);
     plan.mvcc_row_groups[chunk_idx].push_back(
       {&rg, node->GetRowStart(), chunk_offset, covered, dirty});
     if (dirty) { plan.chunk_has_version_state[chunk_idx] = true; }
@@ -254,7 +257,7 @@ bool any_uncheckpointed_appends(duckdb::DataTable& storage,
     auto& rg = node->GetNode();
     for (auto col : storage_column_indices) {
       for (auto& seg_node : rg.GetRawColumnData(col).GetSegmentTree().SegmentNodes()) {
-        if (seg_node.GetNode().segment_type == duckdb::ColumnSegmentType::TRANSIENT) {
+        if (seg_node.GetNode().GetSegmentType() == duckdb::ColumnSegmentType::TRANSIENT) {
           return true;
         }
       }
@@ -277,7 +280,7 @@ native_read_mvcc_state check_native_read_mvcc_state(
         return native_read_mvcc_state::has_update_chains;
       }
     }
-    if (!row_group_has_version_state(*node)) { continue; }
+    if (!row_group_has_version_state(*node, transaction)) { continue; }
     // Read the physical count first: a concurrent append makes the two
     // counts diverge in either order, so a race can only refuse.
     auto const physical = static_cast<duckdb::idx_t>(rg.count.load());

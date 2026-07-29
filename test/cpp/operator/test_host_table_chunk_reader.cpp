@@ -290,7 +290,8 @@ TEST_CASE("host_table_chunk_reader produces correct DataChunks",
     REQUIRE(reader.get_next_chunk(chunk));
 
     auto const count = static_cast<size_t>(chunk.size());
-    REQUIRE(chunk.GetCapacity() == static_cast<duckdb::idx_t>(count));
+    // DataChunk::GetCapacity was removed upstream; exact-capacity sizing is no
+    // longer observable, so only the row count is asserted.
     auto* int32_data = duckdb::FlatVector::GetData<int32_t>(chunk.data[0]);
     auto* int64_data = duckdb::FlatVector::GetData<int64_t>(chunk.data[1]);
     auto* str_data   = duckdb::FlatVector::GetData<duckdb::string_t>(chunk.data[2]);

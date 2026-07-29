@@ -30,6 +30,7 @@
 #include <duckdb/main/client_context.hpp>
 #include <duckdb/planner/expression.hpp>
 #include <duckdb/planner/table_filter.hpp>
+#include <duckdb/planner/table_filter_set.hpp>
 #include <duckdb/storage/data_table.hpp>
 
 // standard library

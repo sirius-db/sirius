@@ -41,12 +41,13 @@ namespace {
 std::optional<std::size_t> extract_bound_ref_index(const duckdb::Expression& expr)
 {
   if (expr.GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) {
-    return expr.Cast<duckdb::BoundReferenceExpression>().index;
+    return expr.Cast<duckdb::BoundReferenceExpression>().Index();
   }
-  if (expr.GetExpressionClass() == duckdb::ExpressionClass::BOUND_CAST) {
-    auto& cast_expr = expr.Cast<duckdb::BoundCastExpression>();
-    if (cast_expr.child->GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) {
-      return cast_expr.child->Cast<duckdb::BoundReferenceExpression>().index;
+  if (duckdb::BoundCastExpression::IsCast(expr)) {
+    auto& cast_child =
+      duckdb::BoundCastExpression::Child(expr.Cast<duckdb::BoundFunctionExpression>());
+    if (cast_child.GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) {
+      return cast_child.Cast<duckdb::BoundReferenceExpression>().Index();
     }
   }
   return std::nullopt;
@@ -117,8 +118,8 @@ void sirius_physical_partition::get_partition_keys_and_type(sirius_physical_oper
         } else {
           _partition_keys.push_back(left_index.value());
         }
-        if (key_expr.GetExpressionClass() == duckdb::ExpressionClass::BOUND_CAST) {
-          _partition_key_cast_types.push_back(duckdb::GetCudfType(key_expr.return_type));
+        if (duckdb::BoundCastExpression::IsCast(key_expr)) {
+          _partition_key_cast_types.push_back(duckdb::GetCudfType(key_expr.GetReturnType()));
         } else {
           _partition_key_cast_types.push_back(cudf::data_type{cudf::type_id::EMPTY});
         }
@@ -140,7 +141,7 @@ void sirius_physical_partition::get_partition_keys_and_type(sirius_physical_oper
     //   for (auto& group_idx : grouped_aggregate_op.grouping_sets[i]) {
     //     auto& group = grouped_aggregate_op.grouped_aggregate_data.groups[group_idx];
     //     if (group->GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) {
-    //       _partition_keys.push_back(group->Cast<duckdb::BoundReferenceExpression>().index);
+    //       _partition_keys.push_back(group->Cast<duckdb::BoundReferenceExpression>().Index());
     //     }
     //   }
     // }

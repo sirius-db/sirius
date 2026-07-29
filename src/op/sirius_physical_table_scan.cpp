@@ -31,6 +31,7 @@
 
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
+#include <duckdb/planner/table_filter_set.hpp>
 
 #include <format>
 

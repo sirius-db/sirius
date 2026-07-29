@@ -319,7 +319,7 @@ duckdb_join_filter_candidate extract(duckdb::LogicalComparisonJoin const& op)
       return malformed();
     }
     condition_indexes.push_back(condition_index);
-    condition_comparisons.push_back(op.conditions[condition_index].comparison);
+    condition_comparisons.push_back(op.conditions[condition_index].GetComparisonType());
   }
 
   if (info.probe_info.empty()) {

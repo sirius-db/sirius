@@ -34,6 +34,7 @@
 #include <duckdb.hpp>
 #include <duckdb/execution/execution_context.hpp>
 #include <duckdb/main/client_config.hpp>
+#include <duckdb/main/settings.hpp>
 #include <memory/sirius_memory_reservation_manager.hpp>
 #include <utils/utils.hpp>
 
@@ -614,11 +615,12 @@ TEST_CASE("Per-connection state isolates and expires the transparent capture",
   REQUIRE(plan != nullptr);
   conn_state->set_captured_plan(std::move(plan));
 
-  auto const before_prepare      = sirius_ctx->get_transparent_execution_stats();
-  auto& client_config            = duckdb::ClientConfig::GetConfig(client_ctx);
-  client_config.enable_optimizer = false;
-  auto prepared                  = con.Prepare("SELECT 42;");  // SAME SQL as the capture
-  client_config.enable_optimizer = true;
+  auto const before_prepare = sirius_ctx->get_transparent_execution_stats();
+  duckdb::Settings::Set<duckdb::EnableOptimizerSetting>(
+    client_ctx, duckdb::SetScope::SESSION, duckdb::Value::BOOLEAN(false));
+  auto prepared = con.Prepare("SELECT 42;");  // SAME SQL as the capture
+  duckdb::Settings::Set<duckdb::EnableOptimizerSetting>(
+    client_ctx, duckdb::SetScope::SESSION, duckdb::Value::BOOLEAN(true));
   REQUIRE_FALSE(prepared->HasError());
   auto const after_prepare = sirius_ctx->get_transparent_execution_stats();
 

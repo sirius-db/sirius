@@ -31,6 +31,8 @@
 #include <op/sirius_dynamic_filter.hpp>
 
 // duckdb
+#include <duckdb/main/attached_database.hpp>
+#include <duckdb/planner/table_filter_set.hpp>
 #include <duckdb/storage/single_file_block_manager.hpp>
 #include <duckdb/storage/storage_manager.hpp>
 
@@ -222,7 +224,7 @@ duckdb_native_gpu_ingestible::duckdb_native_gpu_ingestible(
   auto const& source_ids = bind.projection_ids.empty() ? source_ids_fallback : bind.projection_ids;
 
   // Pre-build the coalesced filter expression once.
-  if (bind.table_filters && !bind.table_filters->filters.empty()) {
+  if (bind.table_filters && bind.table_filters->HasFilters()) {
     std::vector<std::optional<std::size_t>> emission_order_map(bind.column_ids.size());
     for (std::size_t k = 0; k < source_ids.size(); ++k) {
       emission_order_map[source_ids[k]] = k;

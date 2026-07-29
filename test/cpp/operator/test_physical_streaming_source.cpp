@@ -521,7 +521,7 @@ TEST_CASE("streaming_source SRC-17: execute output feeds into real sirius_physic
   auto source_out   = op->execute(*source_input, stream);
 
   // Build filter: col0 > 3 (BIGINT).
-  auto filter_expr_duck = duckdb::make_uniq<duckdb::BoundComparisonExpression>(
+  auto filter_expr_duck = duckdb::BoundComparisonExpression::Create(
     duckdb::ExpressionType::COMPARE_GREATERTHAN,
     duckdb::make_uniq<duckdb::BoundReferenceExpression>(
       duckdb::LogicalType(duckdb::LogicalTypeId::BIGINT), 0),

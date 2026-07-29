@@ -82,9 +82,9 @@ TEMPLATE_TEST_CASE(
 
   // Create table filter set with a filter on first column (filter_vals > 3)
   auto table_filters   = duckdb::make_uniq<duckdb::TableFilterSet>();
-  auto constant_filter = duckdb::make_uniq<duckdb::ConstantFilter>(
+  auto constant_filter = duckdb::make_uniq<duckdb::LegacyConstantFilter>(
     duckdb::ExpressionType::COMPARE_GREATERTHAN, duckdb::Value::BIGINT(3));
-  table_filters->PushFilter(duckdb::ColumnIndex(0), std::move(constant_filter));
+  table_filters->PushFilter(duckdb::ProjectionIndex(0), std::move(constant_filter));
 
   // Setup types for the table scan
   duckdb::vector<duckdb::LogicalType> types;
@@ -277,13 +277,13 @@ TEST_CASE("sirius_physical_table_scan with multiple filters", "[physical_table_s
   // col0 > 2 AND col1 <= 30
   auto table_filters = duckdb::make_uniq<duckdb::TableFilterSet>();
 
-  auto filter0 = duckdb::make_uniq<duckdb::ConstantFilter>(
+  auto filter0 = duckdb::make_uniq<duckdb::LegacyConstantFilter>(
     duckdb::ExpressionType::COMPARE_GREATERTHAN, duckdb::Value::BIGINT(2));
-  table_filters->PushFilter(duckdb::ColumnIndex(0), std::move(filter0));
+  table_filters->PushFilter(duckdb::ProjectionIndex(0), std::move(filter0));
 
-  auto filter1 = duckdb::make_uniq<duckdb::ConstantFilter>(
+  auto filter1 = duckdb::make_uniq<duckdb::LegacyConstantFilter>(
     duckdb::ExpressionType::COMPARE_LESSTHANOREQUALTO, duckdb::Value::INTEGER(30));
-  table_filters->PushFilter(duckdb::ColumnIndex(1), std::move(filter1));
+  table_filters->PushFilter(duckdb::ProjectionIndex(1), std::move(filter1));
 
   // Setup types
   duckdb::vector<duckdb::LogicalType> types;
@@ -350,9 +350,9 @@ TEST_CASE("sirius_physical_table_scan filters all rows", "[physical_table_scan]"
 
   // Filter that excludes all rows: col0 > 100
   auto table_filters = duckdb::make_uniq<duckdb::TableFilterSet>();
-  auto filter        = duckdb::make_uniq<duckdb::ConstantFilter>(
+  auto filter        = duckdb::make_uniq<duckdb::LegacyConstantFilter>(
     duckdb::ExpressionType::COMPARE_GREATERTHAN, duckdb::Value::BIGINT(100));
-  table_filters->PushFilter(duckdb::ColumnIndex(0), std::move(filter));
+  table_filters->PushFilter(duckdb::ProjectionIndex(0), std::move(filter));
 
   // Setup types
   duckdb::vector<duckdb::LogicalType> types;

@@ -179,7 +179,11 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
       auto prepared = duckdb::make_shared_ptr<duckdb::PreparedStatementData>(
         duckdb::StatementType::SELECT_STATEMENT);
       prepared->types = types;
-      prepared->names = result_names_;
+      prepared->names.clear();
+      prepared->names.reserve(result_names_.size());
+      for (auto const& name : result_names_) {
+        prepared->names.emplace_back(name);
+      }
 
       // Rebuild a fresh Sirius physical plan for this execution. DuckDB may reuse
       // the same prepared physical operator across multiple EXECUTE calls.

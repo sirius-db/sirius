@@ -112,7 +112,7 @@ std::unique_ptr<duckdb::Expression> to_duckdb(comparison const& alt)
 {
   auto left  = to_duck_ptr(to_duckdb(*alt.left));
   auto right = to_duck_ptr(to_duckdb(*alt.right));
-  return from_duck_derived_ptr(duckdb::make_uniq<duckdb::BoundComparisonExpression>(
+  return from_duck_ptr(duckdb::BoundComparisonExpression::Create(
     sirius::to_duckdb(alt.op), std::move(left), std::move(right)));
 }
 
@@ -130,19 +130,18 @@ std::unique_ptr<duckdb::Expression> to_duckdb(conjunction const& alt)
   }
   auto out = duckdb::make_uniq<duckdb::BoundConjunctionExpression>(etype);
   for (auto const& child : alt.children) {
-    out->children.push_back(to_duck_ptr(to_duckdb(*child)));
+    out->GetChildrenMutable().push_back(to_duck_ptr(to_duckdb(*child)));
   }
   return from_duck_derived_ptr(std::move(out));
 }
 
 std::unique_ptr<duckdb::Expression> to_duckdb(between const& alt)
 {
-  return from_duck_derived_ptr(
-    duckdb::make_uniq<duckdb::BoundBetweenExpression>(to_duck_ptr(to_duckdb(*alt.input)),
-                                                      to_duck_ptr(to_duckdb(*alt.lower)),
-                                                      to_duck_ptr(to_duckdb(*alt.upper)),
-                                                      alt.lower_inclusive,
-                                                      alt.upper_inclusive));
+  return from_duck_ptr(duckdb::BoundBetweenExpression::Create(to_duck_ptr(to_duckdb(*alt.input)),
+                                                              to_duck_ptr(to_duckdb(*alt.lower)),
+                                                              to_duck_ptr(to_duckdb(*alt.upper)),
+                                                              alt.lower_inclusive,
+                                                              alt.upper_inclusive));
 }
 
 std::unique_ptr<duckdb::Expression> to_duckdb(case_expr const& alt)
@@ -153,14 +152,14 @@ std::unique_ptr<duckdb::Expression> to_duckdb(case_expr const& alt)
   // expression's return_type via to_duckdb, so the real type must be preserved
   // here to avoid spurious down-casts of the materialized result.
   auto out = duckdb::make_uniq<duckdb::BoundCaseExpression>(sirius::to_duckdb(alt.return_type()));
-  out->case_checks.reserve(alt.cases.size());
+  out->CaseChecksMutable().reserve(alt.cases.size());
   for (auto const& wt : alt.cases) {
     duckdb::BoundCaseCheck check;
     check.when_expr = to_duck_ptr(to_duckdb(*wt.when_));
     check.then_expr = to_duck_ptr(to_duckdb(*wt.then_));
-    out->case_checks.push_back(std::move(check));
+    out->CaseChecksMutable().push_back(std::move(check));
   }
-  out->else_expr = to_duck_ptr(to_duckdb(*alt.else_));
+  out->ElseMutable() = to_duck_ptr(to_duckdb(*alt.else_));
   return from_duck_derived_ptr(std::move(out));
 }
 
@@ -169,13 +168,12 @@ std::unique_ptr<duckdb::Expression> to_duckdb(cast const& alt)
   auto child       = to_duck_ptr(to_duckdb(*alt.child));
   auto target_type = sirius::to_duckdb(alt.target_type);
   if (alt.try_cast) {
-    // Try-cast surface uses the full ctor with is_try_cast=true.
-    // (BoundCastExpression::AddDefaultCastToType always sets is_try_cast=false.)
-    return from_duck_derived_ptr(
-      duckdb::make_uniq<duckdb::BoundCastExpression>(std::move(child),
-                                                     std::move(target_type),
-                                                     duckdb::BoundCastInfo{nullptr},
-                                                     /*is_try_cast=*/true));
+    // Try-cast surface uses the full factory with try_cast=true.
+    // (BoundCastExpression::AddDefaultCastToType always sets try_cast=false.)
+    return from_duck_ptr(duckdb::BoundCastExpression::Create(std::move(child),
+                                                             target_type,
+                                                             duckdb::BoundCastInfo{nullptr},
+                                                             /*try_cast=*/true));
   }
   return from_duck_ptr(
     duckdb::BoundCastExpression::AddDefaultCastToType(std::move(child), std::move(target_type)));
@@ -199,7 +197,7 @@ std::unique_ptr<duckdb::Expression> to_duckdb(unary_op const& alt)
   }
   auto out =
     duckdb::make_uniq<duckdb::BoundOperatorExpression>(etype, duckdb::LogicalType::BOOLEAN);
-  out->children.push_back(to_duck_ptr(to_duckdb(*alt.child)));
+  out->GetChildrenMutable().push_back(to_duck_ptr(to_duckdb(*alt.child)));
   return from_duck_derived_ptr(std::move(out));
 }
 
@@ -213,7 +211,7 @@ std::unique_ptr<duckdb::Expression> to_duckdb(coalesce const& alt)
   auto out = duckdb::make_uniq<duckdb::BoundOperatorExpression>(
     duckdb::ExpressionType::OPERATOR_COALESCE, sirius::to_duckdb(alt.return_type()));
   for (auto const& child : alt.children) {
-    out->children.push_back(to_duck_ptr(to_duckdb(*child)));
+    out->GetChildrenMutable().push_back(to_duck_ptr(to_duckdb(*child)));
   }
   return from_duck_derived_ptr(std::move(out));
 }
@@ -223,9 +221,9 @@ std::unique_ptr<duckdb::Expression> to_duckdb(in_list const& alt)
   auto out = duckdb::make_uniq<duckdb::BoundOperatorExpression>(
     alt.negated ? duckdb::ExpressionType::COMPARE_NOT_IN : duckdb::ExpressionType::COMPARE_IN,
     duckdb::LogicalType::BOOLEAN);
-  out->children.push_back(to_duck_ptr(to_duckdb(*alt.probe)));
+  out->GetChildrenMutable().push_back(to_duck_ptr(to_duckdb(*alt.probe)));
   for (auto const& value : alt.values) {
-    out->children.push_back(to_duck_ptr(to_duckdb(*value)));
+    out->GetChildrenMutable().push_back(to_duck_ptr(to_duckdb(*value)));
   }
   return from_duck_derived_ptr(std::move(out));
 }
@@ -239,8 +237,10 @@ std::unique_ptr<duckdb::Expression> to_duckdb(function_call const& alt)
   // (function.cpp) dispatches via the function-name lookup, never
   // invokes function_ptr_t or inspects arguments().
   auto name = std::string{sirius::to_duckdb_function_name(alt.function())};
-  duckdb::ScalarFunction stub_fn(
-    std::move(name), duckdb::vector<duckdb::LogicalType>{}, return_type, /*function=*/nullptr);
+  duckdb::ScalarFunction stub_fn(duckdb::Identifier{std::move(name)},
+                                 duckdb::vector<duckdb::LogicalType>{},
+                                 std::move(return_type),
+                                 /*function=*/nullptr);
 
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> children;
   children.reserve(alt.arguments().size());
@@ -248,11 +248,9 @@ std::unique_ptr<duckdb::Expression> to_duckdb(function_call const& alt)
     children.push_back(to_duck_ptr(to_duckdb(*arg)));
   }
 
-  return from_duck_derived_ptr(
-    duckdb::make_uniq<duckdb::BoundFunctionExpression>(std::move(return_type),
-                                                       std::move(stub_fn),
-                                                       std::move(children),
-                                                       /*bind_info=*/nullptr));
+  // BoundFunctionExpression takes its return_type from the bound function.
+  return from_duck_derived_ptr(duckdb::make_uniq<duckdb::BoundFunctionExpression>(
+    duckdb::BoundScalarFunction(stub_fn), std::move(children), /*bind_info=*/nullptr));
 }
 
 std::unique_ptr<duckdb::Expression> to_duckdb(aggregate const& /*alt*/)

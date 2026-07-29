@@ -18,6 +18,7 @@
 #include "duckdb/execution/operator/aggregate/physical_perfecthash_aggregate.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/function/function_binder.hpp"
+#include "duckdb/function/partition_stats.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/settings.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
@@ -81,33 +82,33 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> extract_aggregate_expre
   // bind sorted aggregates
   for (auto& aggr : aggregates) {
     auto& bound_aggr = aggr->Cast<duckdb::BoundAggregateExpression>();
-    if (bound_aggr.order_bys) {
+    if (bound_aggr.GetOrderBys()) {
       duckdb::FunctionBinder::BindSortedAggregate(context, bound_aggr, groups, grouping_sets);
     }
   }
   for (auto& group : groups) {
-    auto ref =
-      duckdb::make_uniq<duckdb::BoundReferenceExpression>(group->return_type, expressions.size());
-    types.push_back(group->return_type);
+    auto ref = duckdb::make_uniq<duckdb::BoundReferenceExpression>(group->GetReturnType(),
+                                                                   expressions.size());
+    types.push_back(group->GetReturnType());
     expressions.push_back(std::move(group));
     group = std::move(ref);
   }
   for (auto& aggr : aggregates) {
     auto& bound_aggr = aggr->Cast<duckdb::BoundAggregateExpression>();
-    for (auto& child_expr : bound_aggr.children) {
-      auto ref = duckdb::make_uniq<duckdb::BoundReferenceExpression>(child_expr->return_type,
+    for (auto& child_expr : bound_aggr.GetChildrenMutable()) {
+      auto ref = duckdb::make_uniq<duckdb::BoundReferenceExpression>(child_expr->GetReturnType(),
                                                                      expressions.size());
-      types.push_back(child_expr->return_type);
+      types.push_back(child_expr->GetReturnType());
       expressions.push_back(std::move(child_expr));
       child_expr = std::move(ref);
     }
-    if (bound_aggr.filter) {
-      auto& filter = bound_aggr.filter;
-      auto ref     = duckdb::make_uniq<duckdb::BoundReferenceExpression>(filter->return_type,
+    if (bound_aggr.GetFilter()) {
+      auto& filter = bound_aggr.GetFilterMutable();
+      auto ref     = duckdb::make_uniq<duckdb::BoundReferenceExpression>(filter->GetReturnType(),
                                                                      expressions.size());
-      types.push_back(filter->return_type);
+      types.push_back(filter->GetReturnType());
       expressions.push_back(std::move(filter));
-      bound_aggr.filter = std::move(ref);
+      bound_aggr.GetFilterMutable() = std::move(ref);
     }
   }
   if (expressions.empty()) { return child; }
@@ -149,7 +150,7 @@ static bool can_use_partitioned_aggregate(duckdb::ClientContext& context,
     // only support bound reference here
     if (group_expr->GetExpressionType() != duckdb::ExpressionType::BOUND_REF) { return false; }
     auto& ref = group_expr->Cast<duckdb::BoundReferenceExpression>();
-    partition_columns.push_back(ref.index);
+    partition_columns.push_back(ref.Index());
   }
   // traverse the children of the aggregate to find the source operator
   duckdb::reference<sirius::op::sirius_physical_operator> child_ref(child);
@@ -219,7 +220,7 @@ static bool can_use_perfect_hash_aggregate(duckdb::ClientContext& context,
     auto& group = op.groups[group_idx];
     auto& stats = op.group_stats[group_idx];
 
-    switch (group->return_type.InternalType()) {
+    switch (group->GetReturnType().InternalType()) {
       case duckdb::PhysicalType::INT8:
       case duckdb::PhysicalType::INT16:
       case duckdb::PhysicalType::INT32:
@@ -233,7 +234,7 @@ static bool can_use_perfect_hash_aggregate(duckdb::ClientContext& context,
         return false;
     }
     // check if the group has stats available
-    auto& group_type = group->return_type;
+    auto& group_type = group->GetReturnType();
     if (!stats) {
       // no stats, but we might still be able to use perfect hashing if the type is small enough
       // for small types we can just set the stats to [type_min, type_max]
@@ -297,7 +298,7 @@ static bool can_use_perfect_hash_aggregate(duckdb::ClientContext& context,
   }
   for (auto& expression : op.expressions) {
     auto& aggregate = expression->Cast<duckdb::BoundAggregateExpression>();
-    if (aggregate.IsDistinct() || !aggregate.function.combine) {
+    if (aggregate.IsDistinct() || !aggregate.Function().HasStateCombineCallback()) {
       // distinct aggregates are not supported in perfect hash aggregates
       return false;
     }
@@ -315,8 +316,8 @@ static void downcast_hugeint_types(duckdb::vector<duckdb::LogicalType>& types,
     if (type == duckdb::LogicalType::HUGEINT) { type = duckdb::LogicalType::BIGINT; }
   }
   for (auto& expr : exprs) {
-    if (expr->return_type == duckdb::LogicalType::HUGEINT) {
-      expr->return_type = duckdb::LogicalType::BIGINT;
+    if (expr->GetReturnType() == duckdb::LogicalType::HUGEINT) {
+      expr->SetReturnType(duckdb::LogicalType::BIGINT);
     }
   }
 }
@@ -342,7 +343,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalAggregate& op)
   bool can_use_simple_aggregation = true;
   for (auto& expression : op.expressions) {
     auto& aggregate = expression->Cast<duckdb::BoundAggregateExpression>();
-    if (!aggregate.function.simple_update) {
+    if (!aggregate.Function().GetStateClusterUpdateCallback()) {
       // unsupported aggregate for simple aggregation: use hash aggregation
       can_use_simple_aggregation = false;
       break;
@@ -378,6 +379,20 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalAggregate& op)
   // use a partitioned or perfect hash aggregate if possible
   duckdb::vector<duckdb::column_t> partition_columns;
   duckdb::vector<std::size_t> required_bits;
+
+  // DuckDB tracks grouping-function columns as ProjectionIndex; the sirius
+  // operator keeps plain positions. Converted once up front — the three
+  // construction branches below are mutually exclusive.
+  duckdb::vector<duckdb::unsafe_vector<std::size_t>> grouping_functions;
+  grouping_functions.reserve(op.grouping_functions.size());
+  for (auto const& grouping_function : op.grouping_functions) {
+    duckdb::unsafe_vector<std::size_t> positions;
+    positions.reserve(grouping_function.size());
+    for (auto const& position : grouping_function) {
+      positions.push_back(position.GetIndex());
+    }
+    grouping_functions.push_back(std::move(positions));
+  }
   if (can_use_simple_aggregation &&
       can_use_partitioned_aggregate(context, op, *plan, partition_columns)) {
     auto group_by = duckdb::make_uniq_base<sirius::op::sirius_physical_operator,
@@ -386,7 +401,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalAggregate& op)
       translate_expressions(std::move(op.expressions)),
       translate_expressions(std::move(op.groups)),
       std::move(op.grouping_sets),
-      std::move(op.grouping_functions),
+      std::move(grouping_functions),
       op.estimated_cardinality,
       group_validity,
       op.distinct_validity);
@@ -401,7 +416,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalAggregate& op)
       translate_expressions(std::move(op.expressions)),
       translate_expressions(std::move(op.groups)),
       std::move(op.grouping_sets),
-      std::move(op.grouping_functions),
+      std::move(grouping_functions),
       op.estimated_cardinality,
       group_validity,
       op.distinct_validity);
@@ -415,7 +430,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalAggregate& op)
     translate_expressions(std::move(op.expressions)),
     translate_expressions(std::move(op.groups)),
     std::move(op.grouping_sets),
-    std::move(op.grouping_functions),
+    std::move(grouping_functions),
     op.estimated_cardinality,
     group_validity,
     op.distinct_validity);

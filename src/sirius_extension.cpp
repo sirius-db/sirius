@@ -60,12 +60,14 @@ extern "C" int cudaProfilerStop();
 #include "duckdb/main/prepared_statement_data.hpp"
 #include "duckdb/main/query_result.hpp"
 #include "duckdb/main/relation.hpp"
+#include "duckdb/main/settings.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/parser/column_list.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/qualified_name.hpp"
 #include "duckdb/planner/planner.hpp"
+#include "duckdb/planner/table_filter_set.hpp"
 #include "duckdb/storage/storage_manager.hpp"
 #include "duckdb/transaction/duck_transaction.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
@@ -240,7 +242,7 @@ struct SiriusTableFunctionData : public TableFunctionData {
   // PreparedStatementData from these (parameterized execution is not
   // supported on this path, so no value_map is needed — same as the
   // transparent operator's minimal PreparedStatementData).
-  vector<string> bind_names;
+  vector<Identifier> bind_names;
   vector<LogicalType> bind_types;
   std::optional<std::string> query_label;
   //! Original options from the connection
@@ -252,7 +254,8 @@ struct SiriusTableFunctionData : public TableFunctionData {
     original_config = context.config;
     // The user might want to disable the optimizer of the new connection.
     // (connection-local ClientConfig — safe to toggle per execution)
-    context.config.enable_optimizer = enable_optimizer;
+    Settings::Set<EnableOptimizerSetting>(
+      context, SetScope::SESSION, Value::BOOLEAN(enable_optimizer));
     // The old per-query DBConfig::disabled_optimizers save/modify/restore is
     // gone: that set is DB-global and read locklessly by every connection's
     // optimizer, so per-query mutation was an unprotected concurrent write.
@@ -279,7 +282,7 @@ struct SiriusTableFunctionData : public TableFunctionData {
 
       plan = std::move(planner.plan);
 
-      if (context.config.enable_optimizer) {
+      if (Settings::Get<EnableOptimizerSetting>(context)) {
         Optimizer optimizer(*planner.binder, context);
         plan = optimizer.Optimize(std::move(plan));
       }
@@ -289,7 +292,7 @@ struct SiriusTableFunctionData : public TableFunctionData {
       plan->ResolveOperatorTypes();
 
       ColumnBindingResolver resolver;
-      ColumnBindingResolver::Verify(*plan);
+      ColumnBindingResolver::Verify(context, *plan);
       resolver.VisitOperator(*plan);
     } catch (...) {
       CleanupConnection(context);
@@ -324,7 +327,8 @@ struct GPUTableFunctionData : public TableFunctionData {
     original_disabled_optimizers = DBConfig::GetConfig(context).options.disabled_optimizers;
 
     // The user might want to disable the optimizer of the new connection
-    context.config.enable_optimizer = enable_optimizer;
+    Settings::Set<EnableOptimizerSetting>(
+      context, SetScope::SESSION, Value::BOOLEAN(enable_optimizer));
     // We want for sure to disable the internal compression optimizations.
     // These are DuckDB specific, no other system implements these. Also,
     // respect the user's settings if they chose to disable any specific optimizers.
@@ -371,7 +375,7 @@ struct GPUTableFunctionData : public TableFunctionData {
 
       plan = std::move(planner.plan);
 
-      if (context.config.enable_optimizer) {
+      if (Settings::Get<EnableOptimizerSetting>(context)) {
         Optimizer optimizer(*planner.binder, context);
         plan = optimizer.Optimize(std::move(plan));
       }
@@ -381,7 +385,7 @@ struct GPUTableFunctionData : public TableFunctionData {
       plan->ResolveOperatorTypes();
 
       ColumnBindingResolver resolver;
-      ColumnBindingResolver::Verify(*plan);
+      ColumnBindingResolver::Verify(context, *plan);
       resolver.VisitOperator(*plan);
     } catch (...) {
       CleanupConnection(context);
@@ -551,7 +555,7 @@ unique_ptr<FunctionData> SiriusExtension::GPUExecutionBind(ClientContext& contex
   }
   // however, give precedence to a query_label that was set inline in with
   // gpu_execution SQL call.
-  if (auto it = input.named_parameters.find(QUERY_LABEL_PARAM_KEY);
+  if (auto it = input.named_parameters.find(Identifier(QUERY_LABEL_PARAM_KEY));
       it != input.named_parameters.end() && not it->second.IsNull()) {
     query_label = it->second.ToString();
   }
@@ -732,7 +736,7 @@ void SiriusExtension::GPUExecutionFunction(ClientContext& context,
   SIRIUS_LOG_DEBUG("Query plan:\n{}", plan->ToString());
 
   ColumnBindingResolver resolver;
-  resolver.Verify(*plan);
+  ColumnBindingResolver::Verify(context, *plan);
   resolver.VisitOperator(*plan);
 
   plan->ResolveOperatorTypes();
@@ -979,17 +983,18 @@ std::unique_ptr<sirius::op::scan::duckdb_native_ingestible_table_info> build_duc
   // 'table_ref' is the (optionally schema/catalog-qualified) table name. Resolve it
   // through the catalog honoring the client's search path — so a bare name picks up
   // the current/USE'd database — yielding the same DataTable* a query-time scan binds.
-  auto const qname          = duckdb::QualifiedName::Parse(table_ref);
-  std::string const catalog = qname.catalog;  // empty => search path
-  std::string const schema  = !qname.schema.empty() ? qname.schema : schema_override;
-  std::string const& table  = qname.name;
+  auto const qname                 = duckdb::QualifiedName::Parse(table_ref);
+  duckdb::Identifier const catalog = qname.Catalog();  // empty => search path
+  duckdb::Identifier const schema =
+    !qname.Schema().empty() ? qname.Schema() : duckdb::Identifier(schema_override);
+  duckdb::Identifier const& table = qname.Name();
 
   // Non-template catalog lookup + Cast (mirroring the pipeline converter). The
   // templated Catalog::GetEntry<DuckTableEntry> would ODR-use DuckTableEntry::Name
   // (a static constexpr inherited from TableCatalogEntry), emitting a duplicate
   // symbol against libduckdb_static at link time.
-  auto& entry_base =
-    duckdb::Catalog::GetEntry(context, duckdb::CatalogType::TABLE_ENTRY, catalog, schema, table);
+  auto& entry_base = duckdb::Catalog::GetEntry(
+    context, duckdb::CatalogType::TABLE_ENTRY, duckdb::QualifiedName(catalog, schema, table));
   auto& entry         = entry_base.Cast<duckdb::DuckTableEntry>();
   auto& storage       = entry.GetStorage();
   auto const& columns = entry.GetColumns();
@@ -1043,9 +1048,9 @@ std::unique_ptr<sirius::op::scan::duckdb_native_ingestible_table_info> build_duc
   info->db_path = canonical;
   // Qualified-name identity for the pin cache — derived from the resolved
   // DuckTableEntry so it matches the query-side derivation (the pipeline converter).
-  info->catalog_name           = entry.ParentCatalog().GetName();
-  info->schema_name            = entry.ParentSchema().name;
-  info->table_name             = entry.name;
+  info->catalog_name           = entry.ParentCatalog().GetName().GetIdentifierName();
+  info->schema_name            = entry.ParentSchema().name.GetIdentifierName();
+  info->table_name             = entry.name.GetIdentifierName();
   info->approximate_batch_size = batch_size;
   // Full-schema names (logical order) so column_names() can derive the
   // column_ids-aligned view; the decoder itself ignores names.
@@ -1253,7 +1258,7 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
     // start_time domain, and pins usually target an ATTACHed .db (the catalog
     // resolved by build_duckdb_pin_info), so read the fence off that catalog's
     // DuckTransaction.
-    auto& pinned_catalog = Catalog::GetCatalog(context, info->catalog_name);
+    auto& pinned_catalog = Catalog::GetCatalog(context, Identifier(info->catalog_name));
     duckdb_pin_v_base    = DuckTransaction::Get(context, pinned_catalog).start_time;
     ingestible           = sirius::op::scan::make_ingestible(std::move(info));
   } else {  // parquet
@@ -1558,8 +1563,8 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
                               GPUExecutionFunction,
                               SiriusExtension::GPUExecutionBind,
                               SiriusExtension::GPUExecutionInitGlobal);
-  gpu_execution.named_parameters["enable_optimizer"]    = LogicalType::BOOLEAN;
-  gpu_execution.named_parameters[QUERY_LABEL_PARAM_KEY] = LogicalType::VARCHAR;
+  gpu_execution.named_parameters["enable_optimizer"]                = LogicalType::BOOLEAN;
+  gpu_execution.named_parameters[Identifier(QUERY_LABEL_PARAM_KEY)] = LogicalType::VARCHAR;
   CreateTableFunctionInfo gpu_execution_info(gpu_execution);
   catalog.CreateTableFunction(transaction, gpu_execution_info);
 

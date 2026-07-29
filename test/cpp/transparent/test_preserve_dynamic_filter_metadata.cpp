@@ -89,12 +89,14 @@ duckdb::unique_ptr<duckdb::JoinFilterPushdownInfo> make_pushdown_info(
   pi.dynamic_filters = std::move(dyn_filters);
 
   duckdb::JoinFilterPushdownColumn col_a;
-  col_a.probe_column_index = duckdb::ColumnBinding{1, 2};
-  col_a.storage_type       = duckdb::LogicalType::INTEGER;
+  col_a.probe_column_index =
+    duckdb::ColumnBinding{duckdb::TableIndex(1), duckdb::ProjectionIndex(2)};
+  col_a.storage_type = duckdb::LogicalType::INTEGER;
   duckdb::JoinFilterPushdownColumn col_b;
-  col_b.probe_column_index = duckdb::ColumnBinding{1, 3};
-  col_b.storage_type       = duckdb::LogicalType::BIGINT;
-  pi.columns               = {col_a, col_b};
+  col_b.probe_column_index =
+    duckdb::ColumnBinding{duckdb::TableIndex(1), duckdb::ProjectionIndex(3)};
+  col_b.storage_type = duckdb::LogicalType::BIGINT;
+  pi.columns         = {col_a, col_b};
 
   info->probe_info.push_back(std::move(pi));
   return info;

@@ -63,11 +63,11 @@ std::unique_ptr<cudf::table> compute_top_n_table(
   std::unique_ptr<cudf::table> kept;
   if (orders.size() == 1) {
     auto const& ord = orders[0];
-    if (ord.expression->expression_class != duckdb::ExpressionClass::BOUND_REF) {
+    if (ord.expression->GetExpressionClass() != duckdb::ExpressionClass::BOUND_REF) {
       throw not_implemented_exception("TopN only supports bound reference expressions");
     }
-    auto const idx =
-      static_cast<cudf::size_type>(ord.expression->Cast<duckdb::BoundReferenceExpression>().index);
+    auto const idx = static_cast<cudf::size_type>(
+      ord.expression->Cast<duckdb::BoundReferenceExpression>().Index());
     if (idx < 0 || idx >= input.num_columns()) {
       throw internal_exception("TopN order index out of range");
     }
@@ -109,11 +109,11 @@ std::unique_ptr<cudf::table> compute_top_n_table(
     null_orders.reserve(orders.size());
 
     for (auto const& ord : orders) {
-      if (ord.expression->expression_class != duckdb::ExpressionClass::BOUND_REF) {
+      if (ord.expression->GetExpressionClass() != duckdb::ExpressionClass::BOUND_REF) {
         throw not_implemented_exception("TopN only supports bound reference expressions");
       }
       auto const idx = static_cast<cudf::size_type>(
-        ord.expression->Cast<duckdb::BoundReferenceExpression>().index);
+        ord.expression->Cast<duckdb::BoundReferenceExpression>().Index());
       if (idx < 0 || idx >= input.num_columns()) {
         throw internal_exception("TopN order index out of range");
       }

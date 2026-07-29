@@ -63,9 +63,9 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalProjection& op)
     // e.g. PROJECTION(#0, #1, #2, #3, ...)
     bool omit_projection = true;
     for (std::size_t i = 0; i < op.types.size(); i++) {
-      if (op.expressions[i]->type == duckdb::ExpressionType::BOUND_REF) {
+      if (op.expressions[i]->GetExpressionType() == duckdb::ExpressionType::BOUND_REF) {
         auto& bound_ref = op.expressions[i]->Cast<duckdb::BoundReferenceExpression>();
-        if (bound_ref.index == i) { continue; }
+        if (bound_ref.Index() == i) { continue; }
       }
       omit_projection = false;
       break;

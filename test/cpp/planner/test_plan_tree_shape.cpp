@@ -23,6 +23,7 @@
  *        every operator's `_parent_op` matches its position in the final tree.
  */
 
+#include "duckdb/main/settings.hpp"
 #include "op/sirius_physical_column_data_scan.hpp"
 #include "op/sirius_physical_concat.hpp"
 #include "op/sirius_physical_delim_join.hpp"
@@ -113,7 +114,7 @@ duckdb::unique_ptr<sirius_physical_operator> generate_sirius_plan(Connection& co
 
     auto plan = std::move(planner.plan);
 
-    if (context.config.enable_optimizer) {
+    if (duckdb::Settings::Get<duckdb::EnableOptimizerSetting>(context)) {
       Optimizer optimizer(*planner.binder, context);
       plan = optimizer.Optimize(std::move(plan));
     }
@@ -121,7 +122,7 @@ duckdb::unique_ptr<sirius_physical_operator> generate_sirius_plan(Connection& co
     plan->ResolveOperatorTypes();
 
     ColumnBindingResolver resolver;
-    ColumnBindingResolver::Verify(*plan);
+    ColumnBindingResolver::Verify(context, *plan);
     resolver.VisitOperator(*plan);
 
     sirius::planner::sirius_physical_plan_generator gen(context);

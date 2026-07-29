@@ -28,8 +28,10 @@
 #include <duckdb/common/types/date.hpp>
 #include <duckdb/common/types/timestamp.hpp>
 #include <duckdb/common/types/value.hpp>
+#include <duckdb/planner/expression/bound_reference_expression.hpp>
 #include <duckdb/planner/filter/conjunction_filter.hpp>
 #include <duckdb/planner/filter/constant_filter.hpp>
+#include <duckdb/planner/filter/expression_filter.hpp>
 #include <duckdb/planner/filter/in_filter.hpp>
 #include <duckdb/planner/filter/optional_filter.hpp>
 #include <duckdb/storage/statistics/numeric_stats.hpp>
@@ -225,8 +227,8 @@ pinned_zone_maps pinned_zone_maps::remap(pinned_zone_maps incoming,
 bool filter_safe_for_stats(duckdb::TableFilter const& filter, duckdb::LogicalType const& stats_type)
 {
   switch (filter.filter_type) {
-    case duckdb::TableFilterType::CONSTANT_COMPARISON: {
-      auto const& cf = filter.Cast<duckdb::ConstantFilter>();
+    case duckdb::TableFilterType::LEGACY_CONSTANT_COMPARISON: {
+      auto const& cf = filter.Cast<duckdb::LegacyConstantFilter>();
       switch (cf.comparison_type) {
         case duckdb::ExpressionType::COMPARE_EQUAL:
         case duckdb::ExpressionType::COMPARE_NOTEQUAL:
@@ -241,19 +243,19 @@ bool filter_safe_for_stats(duckdb::TableFilter const& filter, duckdb::LogicalTyp
       // stay defensive on both.
       return !cf.constant.IsNull() && cf.constant.type() == stats_type;
     }
-    case duckdb::TableFilterType::IS_NULL:
-    case duckdb::TableFilterType::IS_NOT_NULL: return true;
-    case duckdb::TableFilterType::IN_FILTER: {
-      auto const& in = filter.Cast<duckdb::InFilter>();
+    case duckdb::TableFilterType::LEGACY_IS_NULL:
+    case duckdb::TableFilterType::LEGACY_IS_NOT_NULL: return true;
+    case duckdb::TableFilterType::LEGACY_IN_FILTER: {
+      auto const& in = filter.Cast<duckdb::LegacyInFilter>();
       return !in.values.empty() && std::ranges::all_of(in.values, [&](duckdb::Value const& v) {
         return !v.IsNull() && v.type() == stats_type;
       });
     }
-    case duckdb::TableFilterType::CONJUNCTION_AND:
-    case duckdb::TableFilterType::CONJUNCTION_OR: {
-      auto const& children = filter.filter_type == duckdb::TableFilterType::CONJUNCTION_AND
-                               ? filter.Cast<duckdb::ConjunctionAndFilter>().child_filters
-                               : filter.Cast<duckdb::ConjunctionOrFilter>().child_filters;
+    case duckdb::TableFilterType::LEGACY_CONJUNCTION_AND:
+    case duckdb::TableFilterType::LEGACY_CONJUNCTION_OR: {
+      auto const& children = filter.filter_type == duckdb::TableFilterType::LEGACY_CONJUNCTION_AND
+                               ? filter.Cast<duckdb::LegacyConjunctionAndFilter>().child_filters
+                               : filter.Cast<duckdb::LegacyConjunctionOrFilter>().child_filters;
       // A childless OR would propagate FILTER_ALWAYS_FALSE and prune unconditionally; a childless
       // AND is merely vacuous. Neither shape is produced by the binder, so reject both rather than
       // reason about them.
@@ -262,10 +264,10 @@ bool filter_safe_for_stats(duckdb::TableFilter const& filter, duckdb::LogicalTyp
                return c && filter_safe_for_stats(*c, stats_type);
              });
     }
-    case duckdb::TableFilterType::OPTIONAL_FILTER: {
+    case duckdb::TableFilterType::LEGACY_OPTIONAL_FILTER: {
       // OptionalFilter's child may legitimately be nullptr (its constructor defaults it); an empty
       // optional constrains nothing and cannot prune.
-      auto const& opt = filter.Cast<duckdb::OptionalFilter>();
+      auto const& opt = filter.Cast<duckdb::LegacyOptionalFilter>();
       return opt.child_filter && filter_safe_for_stats(*opt.child_filter, stats_type);
     }
     // DYNAMIC (mutable at run time), STRUCT_EXTRACT / EXPRESSION / BLOOM
@@ -280,10 +282,13 @@ bool chunk_provably_empty(duckdb::TableFilter const& filter,
 {
   try {
     if (!filter_safe_for_stats(filter, stats.GetType())) { return false; }
-    // CheckStatistics needs a non-const reference to the stats object. Copy instead of const_cast
-    // to keep CheckStatistics safe.
-    auto local_stats = stats.Copy();
-    return filter.CheckStatistics(local_stats) ==
+    // TableFilter no longer carries CheckStatistics; filters are pruned through their
+    // expression form. The reference index is irrelevant — the pruner only matches the
+    // expression shape against this one column's stats.
+    auto const column_ref =
+      duckdb::make_uniq<duckdb::BoundReferenceExpression>(stats.GetType(), duckdb::idx_t(0));
+    auto const filter_expr = filter.ToExpression(*column_ref);
+    return duckdb::ExpressionFilter::CheckExpressionStatistics(*filter_expr, stats) ==
            duckdb::FilterPropagateResult::FILTER_ALWAYS_FALSE;
   } catch (std::exception const& e) {
     // Don't propagate exceptions here on statistics checks; otherwise, a cache miss is generated

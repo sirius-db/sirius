@@ -21,6 +21,7 @@
  *        plain column reference so PARTITION/CONCAT/hash-join see an ordinary column index.
  */
 
+#include "duckdb/main/settings.hpp"
 #include "expression/ast/to_duckdb.hpp"
 #include "expression/join_condition.hpp"
 #include "op/sirius_physical_hash_join.hpp"
@@ -99,7 +100,7 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> generate_sirius_plan(
 
     auto plan = std::move(planner.plan);
 
-    if (context.config.enable_optimizer) {
+    if (duckdb::Settings::Get<duckdb::EnableOptimizerSetting>(context)) {
       Optimizer optimizer(*planner.binder, context);
       plan = optimizer.Optimize(std::move(plan));
     }
@@ -107,7 +108,7 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> generate_sirius_plan(
     plan->ResolveOperatorTypes();
 
     ColumnBindingResolver resolver;
-    ColumnBindingResolver::Verify(*plan);
+    ColumnBindingResolver::Verify(context, *plan);
     resolver.VisitOperator(*plan);
 
     sirius::planner::sirius_physical_plan_generator gen(context);

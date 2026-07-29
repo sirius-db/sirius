@@ -80,7 +80,7 @@ TEMPLATE_TEST_CASE("sirius_physical_filter executes on data_batch for multiple n
       *space, filter_vals, data_vals, Traits::cudf_type, std::nullopt);
   }
 
-  auto filter_duckdb = duckdb::make_uniq<BoundComparisonExpression>(
+  auto filter_duckdb = BoundComparisonExpression::Create(
     ExpressionType::COMPARE_GREATERTHAN,
     duckdb::make_uniq<BoundReferenceExpression>(duckdb::LogicalType(duckdb::LogicalTypeId::BIGINT),
                                                 0),

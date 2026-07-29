@@ -30,6 +30,7 @@
 #include <duckdb/storage/segment/uncompressed.hpp>
 #include <duckdb/storage/statistics/base_statistics.hpp>
 #include <duckdb/storage/statistics/string_stats.hpp>
+#include <duckdb/storage/storage_index.hpp>
 #include <duckdb/storage/table/array_column_data.hpp>
 #include <duckdb/storage/table/column_data.hpp>
 #include <duckdb/storage/table/column_segment.hpp>
@@ -100,7 +101,7 @@ void walk_delta_tree(duckdb::ColumnSegmentTree& tree,
     // bits.
     bool const all_null_validity = is_validity &&
                                    compression == duckdb::CompressionType::COMPRESSION_CONSTANT &&
-                                   segment.stats.statistics.CanHaveNull();
+                                   segment.GetStats().CanHaveNull();
     if (is_validity && !all_null_validity && is_constant_or_empty_validity(compression)) {
       continue;
     }
@@ -115,7 +116,7 @@ void walk_delta_tree(duckdb::ColumnSegmentTree& tree,
 
     if (all_null_validity) {
       // Nothing to stage or read; the marker alone drives the decode.
-    } else if (segment.segment_type == duckdb::ColumnSegmentType::TRANSIENT) {
+    } else if (segment.GetSegmentType() == duckdb::ColumnSegmentType::TRANSIENT) {
       // DuckDB compresses transient segments only at checkpoint, and
       // checkpoints are suppressed while pinned; a compressed one here means
       // a checkpoint ran anyway.
@@ -176,8 +177,7 @@ void walk_delta_tree(duckdb::ColumnSegmentTree& tree,
         // segment's own stats for the decoder: the constant value lives
         // here, and row-group-level stats drift as later appends (e.g. into
         // an indexed table's tail row group) merge into them.
-        out_seg.segment_stats =
-          std::make_shared<duckdb::BaseStatistics>(segment.stats.statistics.Copy());
+        out_seg.segment_stats = std::make_shared<duckdb::BaseStatistics>(segment.GetStats().Copy());
       } else {
         out_seg.block_id     = segment.GetBlockId();
         out_seg.block_offset = segment.GetBlockOffset();
@@ -195,11 +195,11 @@ void walk_delta_tree(duckdb::ColumnSegmentTree& tree,
       // Overflow strings must never reach the GPU string decoder. The
       // plan-time table-stat probe normally declines first; this catches
       // stats drift.
-      if (!duckdb::StringStats::HasMaxStringLength(segment.stats.statistics)) {
+      if (!duckdb::StringStats::HasMaxStringLength(segment.GetStats())) {
         throw_capture("varchar delta segment on column " + std::to_string(column_id) +
                       " row group " + std::to_string(rg_index) + ": Max String Length stat absent");
       }
-      auto const max_len = duckdb::StringStats::MaxStringLength(segment.stats.statistics);
+      auto const max_len = duckdb::StringStats::MaxStringLength(segment.GetStats());
       if (max_len >= duckdb::StringUncompressed::GetStringBlockLimit(segment.GetBlockSize())) {
         throw_capture("varchar delta segment on column " + std::to_string(column_id) +
                       " row group " + std::to_string(rg_index) +
@@ -346,8 +346,11 @@ insert_delta_plan prepare_insert_delta_capture(duckdb::DataTable& storage,
     if (covered_end <= rg_start + rg_plan.k_offset) { continue; }
     rg_plan.row_count       = covered_end - (rg_start + rg_plan.k_offset);
     rg_plan.row_group_start = rg_start + rg_plan.k_offset;
-    rg_plan.has_version_state =
-      duckdb::RowGroup::GetPartitionStats(*node).count_type == duckdb::CountType::COUNT_APPROXIMATE;
+    // COUNT_APPROXIMATE stopped covering committed deletes; MinMaxIsExact is
+    // cleared exactly when some physical row is not visible under the scan's
+    // transaction (the StorageIndex is ignored — the flag is per row group).
+    rg_plan.has_version_state = !duckdb::RowGroup::GetPartitionStats(*node, plan.transaction)
+                                   .partition_row_group->MinMaxIsExact(duckdb::StorageIndex());
 
     plan.row_groups.push_back(std::move(rg_plan));
   }
@@ -450,7 +453,7 @@ void copy_delta_row_group(insert_delta_row_group const& rg,
       for (auto const& s : *segs) {
         if (!s.is_transient) { continue; }
         // Pin just long enough to memcpy; no DuckDB handle outlives the call.
-        auto handle = s.segment->block;
+        auto handle = s.segment->GetBlockHandle();
         auto pin    = buffer_manager.Pin(handle);
         std::memcpy(slab_base + s.slab_offset, pin.Ptr() + s.copy_src_offset, s.bytes_size);
       }

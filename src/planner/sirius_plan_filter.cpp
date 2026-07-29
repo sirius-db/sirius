@@ -74,7 +74,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalFilter& op)
       auto conjunction = duckdb::make_uniq<duckdb::BoundConjunctionExpression>(
         duckdb::ExpressionType::CONJUNCTION_AND);
       for (auto& expr : op.expressions) {
-        conjunction->children.push_back(std::move(expr));
+        conjunction->GetChildrenMutable().push_back(std::move(expr));
       }
       combined = std::move(conjunction);
     } else {

@@ -107,13 +107,13 @@ extracted_plan extract_logical_plan_sirius_order(duckdb::ClientContext& context,
   prepared->value_map = std::move(planner.value_map);
 
   duckdb::unique_ptr<duckdb::LogicalOperator> plan = std::move(planner.plan);
-  if (context.config.enable_optimizer) {
+  if (duckdb::Settings::Get<duckdb::EnableOptimizerSetting>(context)) {
     duckdb::Optimizer optimizer(*planner.binder, context);
     plan = optimizer.Optimize(std::move(plan));
   }
   plan->ResolveOperatorTypes();
   duckdb::ColumnBindingResolver resolver;
-  duckdb::ColumnBindingResolver::Verify(*plan);
+  duckdb::ColumnBindingResolver::Verify(context, *plan);
   resolver.VisitOperator(*plan);
   return {std::move(plan), std::move(prepared)};
 }

@@ -209,10 +209,10 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
     null_precedence.reserve(orders.size());
 
     for (auto const& ord : orders) {
-      if (ord.expression->expression_class != duckdb::ExpressionClass::BOUND_REF) {
+      if (ord.expression->GetExpressionClass() != duckdb::ExpressionClass::BOUND_REF) {
         throw not_implemented_exception("Sort sample only supports bound reference expressions");
       }
-      auto idx = static_cast<int>(ord.expression->Cast<duckdb::BoundReferenceExpression>().index);
+      auto idx = static_cast<int>(ord.expression->Cast<duckdb::BoundReferenceExpression>().Index());
       order_key_idx.push_back(idx);
       column_order.push_back(to_cudf_order(ord.type));
       null_precedence.push_back(to_cudf_null_order(ord.type, ord.null_order));

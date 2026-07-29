@@ -128,4 +128,25 @@ duckdb::vector<duckdb::LogicalType> to_duckdb_vec(const duckdb::vector<logical_t
   return result;
 }
 
+duckdb::vector<std::string> from_duckdb_names(const duckdb::vector<duckdb::Identifier>& names)
+{
+  duckdb::vector<std::string> result;
+  result.reserve(names.size());
+  for (const auto& name : names) {
+    result.push_back(name.GetIdentifierName());
+  }
+  return result;
+}
+
+duckdb::vector<std::size_t> from_duckdb_projection_ids(
+  const duckdb::vector<duckdb::ProjectionIndex>& ids)
+{
+  duckdb::vector<std::size_t> result;
+  result.reserve(ids.size());
+  for (const auto& id : ids) {
+    result.push_back(id.GetIndex());
+  }
+  return result;
+}
+
 }  // namespace sirius

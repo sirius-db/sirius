@@ -203,9 +203,9 @@ bool sirius_physical_nested_loop_join::is_supported(
   if (join_type == duckdb::JoinType::MARK) { return true; }
   for (auto& cond : conditions) {
     auto left_expr = sirius::ast::to_duckdb(*cond.left);
-    if (left_expr->return_type.InternalType() == duckdb::PhysicalType::STRUCT ||
-        left_expr->return_type.InternalType() == duckdb::PhysicalType::LIST ||
-        left_expr->return_type.InternalType() == duckdb::PhysicalType::ARRAY) {
+    if (left_expr->GetReturnType().InternalType() == duckdb::PhysicalType::STRUCT ||
+        left_expr->GetReturnType().InternalType() == duckdb::PhysicalType::LIST ||
+        left_expr->GetReturnType().InternalType() == duckdb::PhysicalType::ARRAY) {
       return false;
     }
   }
@@ -228,7 +228,7 @@ duckdb::vector<sirius::logical_type> sirius_physical_nested_loop_join::get_join_
   duckdb::vector<sirius::logical_type> result;
   for (auto& op : conditions) {
     auto right_expr = sirius::ast::to_duckdb(*op.right);
-    result.push_back(sirius::from_duckdb(right_expr->return_type));
+    result.push_back(sirius::from_duckdb(right_expr->GetReturnType()));
   }
   return result;
 }
@@ -369,19 +369,20 @@ const cudf::ast::expression& fold_logical_and(
 // subquery result = single column, index 0).
 bool get_column_index(const duckdb::Expression& expr, cudf::size_type& out_idx)
 {
-  if (expr.expression_class == duckdb::ExpressionClass::BOUND_REF) {
-    out_idx = static_cast<cudf::size_type>(expr.Cast<duckdb::BoundReferenceExpression>().index);
+  if (expr.GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) {
+    out_idx = static_cast<cudf::size_type>(expr.Cast<duckdb::BoundReferenceExpression>().Index());
     return true;
   }
-  if (expr.expression_class == duckdb::ExpressionClass::BOUND_CAST) {
-    const auto& cast_expr = expr.Cast<duckdb::BoundCastExpression>();
-    if (cast_expr.child->expression_class == duckdb::ExpressionClass::BOUND_REF) {
-      out_idx = static_cast<cudf::size_type>(
-        cast_expr.child->Cast<duckdb::BoundReferenceExpression>().index);
+  if (duckdb::BoundCastExpression::IsCast(expr)) {
+    const auto& cast_child =
+      duckdb::BoundCastExpression::Child(expr.Cast<duckdb::BoundFunctionExpression>());
+    if (cast_child.GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) {
+      out_idx =
+        static_cast<cudf::size_type>(cast_child.Cast<duckdb::BoundReferenceExpression>().Index());
       return true;
     }
   }
-  if (expr.expression_class == duckdb::ExpressionClass::BOUND_SUBQUERY) {
+  if (expr.GetExpressionClass() == duckdb::ExpressionClass::BOUND_SUBQUERY) {
     out_idx = 0;
     return true;
   }
@@ -690,11 +691,11 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::execute(
         col_views.push_back(expr_view.column(0));
         expression_res_scope_hodler.push_back(std::move(expr_result_table));
       } else {
-        auto target_type = duckdb::GetCudfType(expr.return_type);
+        auto target_type = duckdb::GetCudfType(expr.GetReturnType());
 
         // now lets see if we have to cast
         if (table.column(source_idx).type() != target_type) {
-          if (expr.expression_class != duckdb::ExpressionClass::BOUND_CAST) {
+          if (!duckdb::BoundCastExpression::IsCast(expr)) {
             // We might want to just change this to an ASSERT
             throw std::runtime_error(
               "sirius_physical_nested_loop_join: unexpected, column type does not match, yet "

@@ -78,8 +78,15 @@ AggregateFunction make_dummy_aggregate(std::string const& name,
                                        duckdb::vector<LogicalType> const& args,
                                        LogicalType const& ret_type)
 {
-  return AggregateFunction(
-    name, args, ret_type, 0, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+  return AggregateFunction(duckdb::Identifier(name),
+                           args,
+                           ret_type,
+                           nullptr,
+                           nullptr,
+                           nullptr,
+                           nullptr,
+                           nullptr,
+                           duckdb::FunctionNullHandling::DEFAULT_NULL_HANDLING);
 }
 
 }  // namespace
@@ -163,8 +170,11 @@ TEST_CASE("ast_aggregate - sum over a single reference translates to aggregate n
     duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0));
   auto fn = make_dummy_aggregate(
     "sum", {LogicalType{LogicalTypeId::INTEGER}}, LogicalType{LogicalTypeId::BIGINT});
-  auto expr = duckdb::make_uniq<BoundAggregateExpression>(
-    fn, std::move(children), nullptr, nullptr, AggregateType::NON_DISTINCT);
+  auto expr = duckdb::make_uniq<BoundAggregateExpression>(duckdb::BoundAggregateFunction(fn),
+                                                          std::move(children),
+                                                          nullptr,
+                                                          nullptr,
+                                                          AggregateType::NON_DISTINCT);
 
   auto out = sirius::ast::from_duckdb(*expr);
   REQUIRE(out);
@@ -181,8 +191,11 @@ TEST_CASE("ast_aggregate - count_star with no children translates without throwi
 {
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> children;  // empty
   auto fn   = make_dummy_aggregate("count_star", {}, LogicalType{LogicalTypeId::BIGINT});
-  auto expr = duckdb::make_uniq<BoundAggregateExpression>(
-    fn, std::move(children), nullptr, nullptr, AggregateType::NON_DISTINCT);
+  auto expr = duckdb::make_uniq<BoundAggregateExpression>(duckdb::BoundAggregateFunction(fn),
+                                                          std::move(children),
+                                                          nullptr,
+                                                          nullptr,
+                                                          AggregateType::NON_DISTINCT);
 
   std::unique_ptr<node> out;
   REQUIRE_NOTHROW(out = sirius::ast::from_duckdb(*expr));
@@ -207,14 +220,17 @@ TEST_CASE("ast_aggregate - COUNT(DISTINCT struct_pack(a, b)) recurses children a
   ScalarFunction struct_fn(
     "struct_pack", duckdb::vector<LogicalType>{}, struct_return_type, /*function=*/nullptr);
   auto struct_pack_expr = duckdb::make_uniq<BoundFunctionExpression>(
-    struct_return_type, struct_fn, std::move(struct_children), /*bind_info=*/nullptr);
+    duckdb::BoundScalarFunction(struct_fn), std::move(struct_children), /*bind_info=*/nullptr);
 
   // Outer count(DISTINCT struct_pack(a, b)).
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> agg_children;
   agg_children.push_back(std::move(struct_pack_expr));
   auto fn = make_dummy_aggregate("count", {struct_return_type}, LogicalType{LogicalTypeId::BIGINT});
-  auto expr = duckdb::make_uniq<BoundAggregateExpression>(
-    fn, std::move(agg_children), nullptr, nullptr, AggregateType::DISTINCT);
+  auto expr = duckdb::make_uniq<BoundAggregateExpression>(duckdb::BoundAggregateFunction(fn),
+                                                          std::move(agg_children),
+                                                          nullptr,
+                                                          nullptr,
+                                                          AggregateType::DISTINCT);
 
   auto out = sirius::ast::from_duckdb(*expr);
   REQUIRE(out);
@@ -236,8 +252,11 @@ TEST_CASE("ast_aggregate - unsupported aggregate name yields nullptr fallback (n
     duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::DOUBLE}, 0));
   auto fn = make_dummy_aggregate(
     "stddev", {LogicalType{LogicalTypeId::DOUBLE}}, LogicalType{LogicalTypeId::DOUBLE});
-  auto expr = duckdb::make_uniq<BoundAggregateExpression>(
-    fn, std::move(children), nullptr, nullptr, AggregateType::NON_DISTINCT);
+  auto expr = duckdb::make_uniq<BoundAggregateExpression>(duckdb::BoundAggregateFunction(fn),
+                                                          std::move(children),
+                                                          nullptr,
+                                                          nullptr,
+                                                          AggregateType::NON_DISTINCT);
 
   std::unique_ptr<node> out;
   REQUIRE_NOTHROW(out = sirius::ast::from_duckdb(*expr));

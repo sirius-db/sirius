@@ -246,7 +246,7 @@ TEST_CASE("ast_equivalence - constant VARCHAR", "[expression_evaluator_ast]")
 
 TEST_CASE("ast_equivalence - comparison EQUAL (MATERIALIZE)", "[expression_evaluator_ast]")
 {
-  auto duck_expr = duckdb::make_uniq<BoundComparisonExpression>(
+  auto duck_expr = BoundComparisonExpression::Create(
     ExpressionType::COMPARE_EQUAL, duck_int_ref(0), duck_int_const(5));
   auto hand_ast = make_cmp(sirius::comparison_type::equal, make_ref(0), make_int_const(5));
   expect_hand_eq_translated(
@@ -255,7 +255,7 @@ TEST_CASE("ast_equivalence - comparison EQUAL (MATERIALIZE)", "[expression_evalu
 
 TEST_CASE("ast_equivalence - comparison EQUAL (AST_INTERPRET)", "[expression_evaluator_ast]")
 {
-  auto duck_expr = duckdb::make_uniq<BoundComparisonExpression>(
+  auto duck_expr = BoundComparisonExpression::Create(
     ExpressionType::COMPARE_EQUAL, duck_int_ref(0), duck_int_const(5));
   auto hand_ast = make_cmp(sirius::comparison_type::equal, make_ref(0), make_int_const(5));
   expect_hand_eq_translated(
@@ -264,7 +264,7 @@ TEST_CASE("ast_equivalence - comparison EQUAL (AST_INTERPRET)", "[expression_eva
 
 TEST_CASE("ast_equivalence - comparison LESSTHAN (MATERIALIZE)", "[expression_evaluator_ast]")
 {
-  auto duck_expr = duckdb::make_uniq<BoundComparisonExpression>(
+  auto duck_expr = BoundComparisonExpression::Create(
     ExpressionType::COMPARE_LESSTHAN, duck_int_ref(0), duck_int_const(5));
   auto hand_ast = make_cmp(sirius::comparison_type::lt, make_ref(0), make_int_const(5));
   expect_hand_eq_translated(
@@ -278,13 +278,13 @@ TEST_CASE("ast_equivalence - comparison LESSTHAN (MATERIALIZE)", "[expression_ev
 namespace {
 duckdb::unique_ptr<Expression> duck_and_1_9()
 {
-  auto duck_lhs = duckdb::make_uniq<BoundComparisonExpression>(
+  auto duck_lhs = BoundComparisonExpression::Create(
     ExpressionType::COMPARE_GREATERTHAN, duck_int_ref(0), duck_int_const(1));
-  auto duck_rhs = duckdb::make_uniq<BoundComparisonExpression>(
+  auto duck_rhs = BoundComparisonExpression::Create(
     ExpressionType::COMPARE_LESSTHAN, duck_int_ref(0), duck_int_const(9));
   auto duck_expr = duckdb::make_uniq<BoundConjunctionExpression>(ExpressionType::CONJUNCTION_AND);
-  duck_expr->children.push_back(std::move(duck_lhs));
-  duck_expr->children.push_back(std::move(duck_rhs));
+  duck_expr->GetChildrenMutable().push_back(std::move(duck_lhs));
+  duck_expr->GetChildrenMutable().push_back(std::move(duck_rhs));
   return duckdb::unique_ptr<Expression>(duck_expr.release());
 }
 
@@ -319,7 +319,7 @@ TEST_CASE("ast_equivalence - conjunction AND (AST_INTERPRET)", "[expression_eval
 
 TEST_CASE("ast_equivalence - between (MATERIALIZE)", "[expression_evaluator_ast]")
 {
-  auto duck_expr = duckdb::make_uniq<BoundBetweenExpression>(
+  auto duck_expr = BoundBetweenExpression::Create(
     duck_int_ref(0), duck_int_const(5), duck_int_const(15), /*lo=*/true, /*hi=*/true);
   auto hand_ast = make_between(make_ref(0), make_int_const(5), make_int_const(15), true, true);
   expect_hand_eq_translated(
@@ -332,14 +332,14 @@ TEST_CASE("ast_equivalence - between (MATERIALIZE)", "[expression_evaluator_ast]
 
 TEST_CASE("ast_equivalence - case_expr WHEN/THEN/ELSE (MATERIALIZE)", "[expression_evaluator_ast]")
 {
-  auto duck_when = duckdb::make_uniq<BoundComparisonExpression>(
+  auto duck_when = BoundComparisonExpression::Create(
     ExpressionType::COMPARE_EQUAL, duck_int_ref(0), duck_int_const(5));
   BoundCaseCheck check;
   check.when_expr = std::move(duck_when);
   check.then_expr = duck_int_const(10);
   auto duck_expr  = duckdb::make_uniq<BoundCaseExpression>(LogicalType{LogicalTypeId::INTEGER});
-  duck_expr->case_checks.push_back(std::move(check));
-  duck_expr->else_expr = duck_int_const(0);
+  duck_expr->CaseChecksMutable().push_back(std::move(check));
+  duck_expr->ElseMutable() = duck_int_const(0);
 
   std::vector<sirius::ast::case_expr::when_then> cases;
   cases.push_back(sirius::ast::case_expr::when_then{
@@ -374,11 +374,11 @@ TEST_CASE("ast_equivalence - cast INTEGER->BIGINT (MATERIALIZE)", "[expression_e
 TEST_CASE("ast_equivalence - unary_op NOT (MATERIALIZE)", "[expression_evaluator_ast]")
 {
   // Need a BOOLEAN-producing child; use a comparison.
-  auto duck_inner = duckdb::make_uniq<BoundComparisonExpression>(
+  auto duck_inner = BoundComparisonExpression::Create(
     ExpressionType::COMPARE_EQUAL, duck_int_ref(0), duck_int_const(5));
   auto duck_expr = duckdb::make_uniq<BoundOperatorExpression>(ExpressionType::OPERATOR_NOT,
                                                               LogicalType{LogicalTypeId::BOOLEAN});
-  duck_expr->children.push_back(std::move(duck_inner));
+  duck_expr->GetChildrenMutable().push_back(std::move(duck_inner));
 
   auto hand_ast =
     make_unary(sirius::ast::unary_op::kind::op_not,
@@ -392,7 +392,7 @@ TEST_CASE("ast_equivalence - unary_op IS_NULL (MATERIALIZE)", "[expression_evalu
 {
   auto duck_expr = duckdb::make_uniq<BoundOperatorExpression>(ExpressionType::OPERATOR_IS_NULL,
                                                               LogicalType{LogicalTypeId::BOOLEAN});
-  duck_expr->children.push_back(duck_int_ref(0));
+  duck_expr->GetChildrenMutable().push_back(duck_int_ref(0));
 
   auto hand_ast = make_unary(sirius::ast::unary_op::kind::op_is_null, make_ref(0));
 
@@ -404,7 +404,7 @@ TEST_CASE("ast_equivalence - unary_op IS_NOT_NULL (MATERIALIZE)", "[expression_e
 {
   auto duck_expr = duckdb::make_uniq<BoundOperatorExpression>(ExpressionType::OPERATOR_IS_NOT_NULL,
                                                               LogicalType{LogicalTypeId::BOOLEAN});
-  duck_expr->children.push_back(duck_int_ref(0));
+  duck_expr->GetChildrenMutable().push_back(duck_int_ref(0));
 
   auto hand_ast = make_unary(sirius::ast::unary_op::kind::op_is_not_null, make_ref(0));
 
@@ -422,7 +422,7 @@ TEST_CASE("ast_equivalence - unary_op TRY translation (no exec)", "[expression_e
   // the underlying OPERATOR_TRY specialization lands.
   auto duck_expr = duckdb::make_uniq<BoundOperatorExpression>(ExpressionType::OPERATOR_TRY,
                                                               LogicalType{LogicalTypeId::INTEGER});
-  duck_expr->children.push_back(duck_int_ref(0));
+  duck_expr->GetChildrenMutable().push_back(duck_int_ref(0));
 
   auto translated_ast = sirius::ast::from_duckdb(*duck_expr);
   REQUIRE(translated_ast);
@@ -442,8 +442,8 @@ TEST_CASE("ast_equivalence - coalesce (MATERIALIZE)", "[expression_evaluator_ast
 {
   auto duck_expr = duckdb::make_uniq<BoundOperatorExpression>(ExpressionType::OPERATOR_COALESCE,
                                                               LogicalType{LogicalTypeId::INTEGER});
-  duck_expr->children.push_back(duck_int_ref(0));
-  duck_expr->children.push_back(duck_int_const(0));
+  duck_expr->GetChildrenMutable().push_back(duck_int_ref(0));
+  duck_expr->GetChildrenMutable().push_back(duck_int_const(0));
 
   std::vector<std::unique_ptr<sirius::ast::node>> children;
   children.push_back(make_ref(0));
@@ -464,10 +464,10 @@ duckdb::unique_ptr<Expression> duck_in_2_5_8()
 {
   auto duck_expr = duckdb::make_uniq<BoundOperatorExpression>(ExpressionType::COMPARE_IN,
                                                               LogicalType{LogicalTypeId::BOOLEAN});
-  duck_expr->children.push_back(duck_int_ref(0));
-  duck_expr->children.push_back(duck_int_const(2));
-  duck_expr->children.push_back(duck_int_const(5));
-  duck_expr->children.push_back(duck_int_const(8));
+  duck_expr->GetChildrenMutable().push_back(duck_int_ref(0));
+  duck_expr->GetChildrenMutable().push_back(duck_int_const(2));
+  duck_expr->GetChildrenMutable().push_back(duck_int_const(5));
+  duck_expr->GetChildrenMutable().push_back(duck_int_const(8));
   return duckdb::unique_ptr<Expression>(duck_expr.release());
 }
 
@@ -505,13 +505,12 @@ namespace {
 duckdb::unique_ptr<Expression> duck_add_3()
 {
   auto duck_expr = duckdb::make_uniq<BoundFunctionExpression>(
-    LogicalType{LogicalTypeId::INTEGER},
-    ScalarFunction(
-      "+", {LogicalType::INTEGER, LogicalType::INTEGER}, LogicalType::INTEGER, nullptr),
+    duckdb::BoundScalarFunction(ScalarFunction(
+      "+", {LogicalType::INTEGER, LogicalType::INTEGER}, LogicalType::INTEGER, nullptr)),
     duckdb::vector<duckdb::unique_ptr<Expression>>{},
     nullptr);
-  duck_expr->children.push_back(duck_int_ref(0));
-  duck_expr->children.push_back(duck_int_const(3));
+  duck_expr->GetChildrenMutable().push_back(duck_int_ref(0));
+  duck_expr->GetChildrenMutable().push_back(duck_int_const(3));
   return duckdb::unique_ptr<Expression>(duck_expr.release());
 }
 

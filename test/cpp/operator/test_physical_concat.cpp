@@ -98,10 +98,10 @@ hash_join_test_fixture create_test_hash_join(
 
   // Create a single equality join condition (column 0 = column 0)
   duckdb::vector<duckdb::JoinCondition> conditions;
-  duckdb::JoinCondition cond;
-  cond.left  = duckdb::make_uniq<duckdb::BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0);
-  cond.right = duckdb::make_uniq<duckdb::BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0);
-  cond.comparison = duckdb::ExpressionType::COMPARE_EQUAL;
+  duckdb::JoinCondition cond(
+    duckdb::make_uniq<duckdb::BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0),
+    duckdb::make_uniq<duckdb::BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0),
+    duckdb::ExpressionType::COMPARE_EQUAL);
   conditions.push_back(std::move(cond));
 
   // Build the hash join

@@ -56,12 +56,21 @@ struct AggregateExpressionResult {
  * Creates a minimal AggregateFunction with just name and types,
  * suitable for GPU operator testing where full aggregate logic isn't needed.
  */
-inline duckdb::AggregateFunction MakeDummyAggregate(const std::string& name,
-                                                    const duckdb::vector<duckdb::LogicalType>& args,
-                                                    const duckdb::LogicalType& ret_type)
+inline duckdb::BoundAggregateFunction MakeDummyAggregate(
+  const std::string& name,
+  const duckdb::vector<duckdb::LogicalType>& args,
+  const duckdb::LogicalType& ret_type)
 {
-  return duckdb::AggregateFunction(
-    name, args, ret_type, 0, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+  return duckdb::BoundAggregateFunction(
+    duckdb::AggregateFunction(duckdb::Identifier(name),
+                              args,
+                              ret_type,
+                              nullptr,
+                              nullptr,
+                              nullptr,
+                              nullptr,
+                              nullptr,
+                              duckdb::FunctionNullHandling::DEFAULT_NULL_HANDLING));
 }
 
 /**
@@ -132,7 +141,7 @@ AggregateExpressionResult create_aggregate_expressions(
       duckdb::make_uniq<duckdb::BoundReferenceExpression>(Traits::logical_type(), agg_idx));
 
     // Create the dummy aggregate function
-    duckdb::AggregateFunction agg_function =
+    duckdb::BoundAggregateFunction agg_function =
       MakeDummyAggregate(agg_name, {Traits::logical_type()}, ret_type);
 
     // Create the BoundAggregateExpression
@@ -447,7 +456,7 @@ AggregateExpressionResult create_count_distinct_expressions(
   agg_children.push_back(
     duckdb::make_uniq<duckdb::BoundReferenceExpression>(ValTraits::logical_type(), agg_col_idx));
 
-  duckdb::AggregateFunction agg_function =
+  duckdb::BoundAggregateFunction agg_function =
     MakeDummyAggregate("count", {ValTraits::logical_type()}, duckdb::LogicalType::BIGINT);
 
   auto agg_expr =
@@ -504,7 +513,7 @@ inline AggregateExpressionResult create_count_distinct_struct_col_expressions(
 
   duckdb::ScalarFunction struct_fn("struct_pack", struct_arg_types, struct_return_type, nullptr);
   auto struct_expr = duckdb::make_uniq<duckdb::BoundFunctionExpression>(
-    struct_return_type, std::move(struct_fn), std::move(struct_children), nullptr);
+    duckdb::BoundScalarFunction(struct_fn), std::move(struct_children), nullptr);
 
   // COUNT(DISTINCT struct_expr) aggregate expression
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> agg_children;
@@ -512,7 +521,7 @@ inline AggregateExpressionResult create_count_distinct_struct_col_expressions(
 
   auto agg_fn = MakeDummyAggregate("count", {struct_return_type}, duckdb::LogicalType::BIGINT);
   auto count_distinct_expr =
-    duckdb::make_uniq<duckdb::BoundAggregateExpression>(agg_fn,
+    duckdb::make_uniq<duckdb::BoundAggregateExpression>(duckdb::BoundAggregateFunction(agg_fn),
                                                         std::move(agg_children),
                                                         nullptr,  // filter
                                                         nullptr,  // bind_info

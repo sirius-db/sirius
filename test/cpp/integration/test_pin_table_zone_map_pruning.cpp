@@ -30,6 +30,7 @@
 #include <duckdb.hpp>
 #include <duckdb/planner/filter/constant_filter.hpp>
 #include <duckdb/planner/table_filter.hpp>
+#include <duckdb/planner/table_filter_set.hpp>
 #include <scan_manager/sirius_scan_manager.hpp>
 #include <unistd.h>
 #include <utils/sirius_test_env.hpp>
@@ -167,9 +168,9 @@ std::size_t entry_chunk_count(sirius::scan_manager::pinned_entry const& e)
 std::size_t probe_pruned_count(sirius::scan_manager::pinned_entry const& e)
 {
   duckdb::TableFilterSet fs;
-  duckdb::unique_ptr<duckdb::TableFilter> f = duckdb::make_uniq<duckdb::ConstantFilter>(
+  duckdb::unique_ptr<duckdb::TableFilter> f = duckdb::make_uniq<duckdb::LegacyConstantFilter>(
     duckdb::ExpressionType::COMPARE_GREATERTHANOREQUALTO, duckdb::Value::BIGINT(kSelectiveLo));
-  fs.filters[0] = std::move(f);
+  fs.PushFilter(duckdb::ProjectionIndex(0), std::move(f));
   duckdb::vector<duckdb::ColumnIndex> qcols;
   qcols.emplace_back(duckdb::ColumnIndex(0));
   return sirius::scan_manager::build_cached_scan_plan(e, &fs, &qcols).pruned;

@@ -313,7 +313,7 @@ std::vector<std::string> sirius_plan_printer::get_operator_detail_lines(
   std::string scan_name;
   switch (op.type) {
     case op::SiriusPhysicalOperatorType::TABLE_SCAN:
-      scan_name = op.Cast<op::sirius_physical_table_scan>().function.name;
+      scan_name = op.Cast<op::sirius_physical_table_scan>().function.name.GetIdentifierName();
       break;
     default: break;
   }

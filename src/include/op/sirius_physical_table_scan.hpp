@@ -17,6 +17,7 @@
 #pragma once
 
 #include "duckdb/common/extra_operator_info.hpp"
+#include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/execution/operator/scan/physical_table_scan.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/planner/table_filter.hpp"

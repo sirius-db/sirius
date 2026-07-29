@@ -69,11 +69,11 @@ duckdb::unique_ptr<duckdb::TableFilterSet> create_table_filter_set(
 {
   // create the table filter map
   auto table_filter_set = duckdb::make_uniq<duckdb::TableFilterSet>();
-  for (auto& table_filter : table_filters.filters) {
+  for (auto& table_filter : table_filters) {
     // find the relative column index from the absolute column index into the table
     duckdb::optional_idx column_index;
     for (std::size_t i = 0; i < column_ids.size(); i++) {
-      if (table_filter.first == column_ids[i].GetPrimaryIndex()) {
+      if (table_filter.GetIndex() == column_ids[i].GetPrimaryIndex()) {
         column_index = i;
         break;
       }
@@ -81,7 +81,8 @@ duckdb::unique_ptr<duckdb::TableFilterSet> create_table_filter_set(
     if (!column_index.IsValid()) {
       throw duckdb::InternalException("Could not find column index for table filter");
     }
-    table_filter_set->filters[column_index.GetIndex()] = std::move(table_filter.second);
+    table_filter_set->PushFilter(duckdb::ProjectionIndex(column_index.GetIndex()),
+                                 table_filter.TakeFilter());
   }
   return table_filter_set;
 }
@@ -95,7 +96,8 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
   // functions, etc.) must fall back to CPU.
   static const std::unordered_set<std::string> kSupportedScanFunctions = {
     "seq_scan", "parquet_scan", "read_parquet", "sirius_read_parquet"};
-  if (kSupportedScanFunctions.find(op.function.name) == kSupportedScanFunctions.end()) {
+  if (kSupportedScanFunctions.find(op.function.name.GetIdentifierName()) ==
+      kSupportedScanFunctions.end()) {
     throw duckdb::NotImplementedException("Table function '{}' is not supported in Sirius",
                                           op.function.name);
   }
@@ -160,7 +162,9 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
         if (auto sirius_state =
               context.registered_state->Get<duckdb::SiriusContext>("sirius_state")) {
           entry = sirius_state->get_scan_manager().find_pinned_entry_for_duckdb_table(
-            table.ParentCatalog().GetName(), table.ParentSchema().name, table.name);
+            table.ParentCatalog().GetName().GetIdentifierName(),
+            table.ParentSchema().name.GetIdentifierName(),
+            table.name.GetIdentifierName());
         }
       }
       if (entry != nullptr && entry->mvcc != nullptr) {
@@ -317,15 +321,16 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
   }
 
   duckdb::unique_ptr<duckdb::TableFilterSet> table_filters;
-  if (!op.table_filters.filters.empty()) {
+  if (op.table_filters.HasFilters()) {
     table_filters = create_table_filter_set(op.table_filters, column_ids);
     // Predicates pushed into table_filters bypass the LogicalFilter guard —
     // reject nested columns here too (e.g. `WHERE items IS NULL`).
-    for (auto const& entry : table_filters->filters) {
-      auto const column_id = column_ids[entry.first].GetPrimaryIndex();
+    for (auto const& entry : *table_filters) {
+      auto const column_id = column_ids[entry.GetIndex()].GetPrimaryIndex();
       if (column_id < op.returned_types.size()) {
-        auto const column_name =
-          column_id < op.names.size() ? op.names[column_id] : std::to_string(column_id);
+        auto const column_name = column_id < op.names.size()
+                                   ? op.names[column_id].GetIdentifierName()
+                                   : std::to_string(column_id);
         reject_nested_column_type(op.returned_types[column_id], column_name, "a filter predicate");
       }
     }
@@ -340,49 +345,49 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
   // Since we don't pass filters to the DuckDB table function (they're applied by Sirius),
   // we need to ensure all filter columns are included in BOTH column_ids and projection_ids.
   // We track the original projection_ids so we can project back after filtering.
-  duckdb::vector<std::size_t> original_projection_ids = projection_ids;
+  duckdb::vector<duckdb::ProjectionIndex> original_projection_ids = projection_ids;
 
   // Save the original types before we modify projection_ids, because modifying projection_ids
   // might affect the types when we call ResolveOperatorTypes()
   duckdb::vector<duckdb::LogicalType> original_types = op.types;
 
   if (table_filters) {
-    for (auto& entry : table_filters->filters) {
-      // entry.first is the column index in the table_filters (after remapping by
+    for (auto& entry : *table_filters) {
+      // entry.GetIndex() is the column index in the table_filters (after remapping by
       // create_table_filter_set) We need to ensure this column is in projection_ids so it gets
       // scanned by DuckDB
 
       bool found_in_projection = false;
       for (std::size_t j = 0; j < projection_ids.size(); j++) {
-        if (projection_ids[j] == entry.first) {
+        if (projection_ids[j] == entry.GetIndex()) {
           found_in_projection = true;
           break;
         }
       }
 
-      if (!found_in_projection) { projection_ids.push_back(entry.first); }
+      if (!found_in_projection) { projection_ids.push_back(entry.GetIndex()); }
     }
   }
 
   // Handle cases where table function doesn't support pushdown for specific column types
   if (table_filters && op.function.supports_pushdown_type) {
     duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> select_list;
-    duckdb::unordered_set<std::size_t> to_remove;
-    for (auto& entry : table_filters->filters) {
-      auto column_id = column_ids[entry.first].GetPrimaryIndex();
+    duckdb::vector<duckdb::ProjectionIndex> to_remove;
+    for (auto& entry : *table_filters) {
+      auto column_id = column_ids[entry.GetIndex()].GetPrimaryIndex();
       auto& type     = op.returned_types[column_id];
 
       // If the table function doesn't support pushdown for this column type,
       // create a separate filter operator for it
       if (!op.function.supports_pushdown_type(*op.bind_data, column_id)) {
-        std::size_t column_id_filter = entry.first;
+        std::size_t column_id_filter = entry.GetIndex();
         auto column = duckdb::make_uniq<duckdb::BoundReferenceExpression>(type, column_id_filter);
-        select_list.push_back(entry.second->ToExpression(*column));
-        to_remove.insert(entry.first);
+        select_list.push_back(entry.Filter().ToExpression(*column));
+        to_remove.push_back(entry.GetIndex());
       }
     }
     for (auto& col : to_remove) {
-      table_filters->filters.erase(col);
+      table_filters->RemoveFilterByColumnIndex(col);
     }
 
     if (!select_list.empty()) {
@@ -397,7 +402,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
         auto conjunction = duckdb::make_uniq<duckdb::BoundConjunctionExpression>(
           duckdb::ExpressionType::CONJUNCTION_AND);
         for (auto& expr : select_list) {
-          conjunction->children.push_back(std::move(expr));
+          conjunction->GetChildrenMutable().push_back(std::move(expr));
         }
         combined = std::move(conjunction);
       } else {
@@ -420,7 +425,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
       sirius::from_duckdb_vec(op.returned_types),
       column_ids,
       duckdb::vector<duckdb::column_t>(),
-      op.names,
+      sirius::from_duckdb_names(op.names),
       std::move(table_filters),
       op.estimated_cardinality,
       std::move(op.extra_info),
@@ -484,8 +489,8 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
     std::move(op.bind_data),
     sirius::from_duckdb_vec(op.returned_types),
     column_ids,
-    op.projection_ids,
-    op.names,
+    sirius::from_duckdb_projection_ids(op.projection_ids),
+    sirius::from_duckdb_names(op.names),
     std::move(table_filters),
     op.estimated_cardinality,
     std::move(op.extra_info),

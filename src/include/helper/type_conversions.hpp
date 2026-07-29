@@ -23,8 +23,13 @@
 
 #include "helper/logical_type.hpp"
 
+#include <duckdb/common/identifier.hpp>
+#include <duckdb/common/projection_index.hpp>
 #include <duckdb/common/types.hpp>
 #include <duckdb/common/vector.hpp>
+
+#include <cstddef>
+#include <string>
 
 namespace sirius {
 
@@ -67,5 +72,24 @@ duckdb::vector<logical_type> from_duckdb_vec(const duckdb::vector<duckdb::Logica
  * ColumnDataCollection). Accepts duckdb::vector via base-class reference.
  */
 duckdb::vector<duckdb::LogicalType> to_duckdb_vec(const duckdb::vector<logical_type>& types);
+
+/**
+ * @brief Unwrap DuckDB Identifier column names to plain strings.
+ *
+ * Convenience wrapper for operator constructor call sites: DuckDB plan nodes
+ * carry names as case-insensitive Identifier, while sirius operators store
+ * plain strings.
+ */
+duckdb::vector<std::string> from_duckdb_names(const duckdb::vector<duckdb::Identifier>& names);
+
+/**
+ * @brief Unwrap DuckDB ProjectionIndex vectors to plain positions.
+ *
+ * Convenience wrapper for operator constructor call sites: DuckDB plan nodes
+ * carry projection maps as ProjectionIndex, while sirius operators store
+ * plain positions.
+ */
+duckdb::vector<std::size_t> from_duckdb_projection_ids(
+  const duckdb::vector<duckdb::ProjectionIndex>& ids);
 
 }  // namespace sirius

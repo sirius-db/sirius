@@ -74,7 +74,7 @@ static void collect_bound_ref_indices(const duckdb::Expression& expr,
                                       std::unordered_set<std::size_t>& indices)
 {
   if (expr.GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) {
-    indices.insert(expr.Cast<duckdb::BoundReferenceExpression>().index);
+    indices.insert(expr.Cast<duckdb::BoundReferenceExpression>().Index());
     return;
   }
   duckdb::ExpressionIterator::EnumerateChildren(
@@ -340,17 +340,17 @@ sirius_physical_hash_join::sirius_physical_hash_join(
     auto right_class = right_expr->GetExpressionClass();
 
     if (left_class == duckdb::ExpressionClass::BOUND_REF) {
-      left_key_col_indices.push_back(left_expr->Cast<duckdb::BoundReferenceExpression>().index);
-    } else if (left_class == duckdb::ExpressionClass::BOUND_CAST) {
-      auto& bound_cast = left_expr->Cast<duckdb::BoundCastExpression>();
-      if (bound_cast.child->GetExpressionClass() != duckdb::ExpressionClass::BOUND_REF) {
+      left_key_col_indices.push_back(left_expr->Cast<duckdb::BoundReferenceExpression>().Index());
+    } else if (duckdb::BoundCastExpression::IsCast(*left_expr)) {
+      auto& cast_child =
+        duckdb::BoundCastExpression::Child(left_expr->Cast<duckdb::BoundFunctionExpression>());
+      if (cast_child.GetExpressionClass() != duckdb::ExpressionClass::BOUND_REF) {
         throw std::runtime_error(
           "Unsupported join condition: BOUND_CAST child is not BOUND_REF (left)");
       }
-      left_key_col_indices.push_back(
-        bound_cast.child->Cast<duckdb::BoundReferenceExpression>().index);
+      left_key_col_indices.push_back(cast_child.Cast<duckdb::BoundReferenceExpression>().Index());
       cast_info.cast_left        = true;
-      cast_info.left_target_type = duckdb::GetCudfType(left_expr->return_type);
+      cast_info.left_target_type = duckdb::GetCudfType(left_expr->GetReturnType());
       cast_necessary             = true;
     } else {
       throw std::runtime_error("Unsupported join condition left expression");
@@ -358,17 +358,17 @@ sirius_physical_hash_join::sirius_physical_hash_join(
 
     // Extract right key index (may be BOUND_REF or BOUND_CAST wrapping a BOUND_REF)
     if (right_class == duckdb::ExpressionClass::BOUND_REF) {
-      right_key_col_indices.push_back(right_expr->Cast<duckdb::BoundReferenceExpression>().index);
-    } else if (right_class == duckdb::ExpressionClass::BOUND_CAST) {
-      auto& bound_cast = right_expr->Cast<duckdb::BoundCastExpression>();
-      if (bound_cast.child->GetExpressionClass() != duckdb::ExpressionClass::BOUND_REF) {
+      right_key_col_indices.push_back(right_expr->Cast<duckdb::BoundReferenceExpression>().Index());
+    } else if (duckdb::BoundCastExpression::IsCast(*right_expr)) {
+      auto& cast_child =
+        duckdb::BoundCastExpression::Child(right_expr->Cast<duckdb::BoundFunctionExpression>());
+      if (cast_child.GetExpressionClass() != duckdb::ExpressionClass::BOUND_REF) {
         throw std::runtime_error(
           "Unsupported join condition: BOUND_CAST child is not BOUND_REF (right)");
       }
-      right_key_col_indices.push_back(
-        bound_cast.child->Cast<duckdb::BoundReferenceExpression>().index);
+      right_key_col_indices.push_back(cast_child.Cast<duckdb::BoundReferenceExpression>().Index());
       cast_info.cast_right        = true;
-      cast_info.right_target_type = duckdb::GetCudfType(right_expr->return_type);
+      cast_info.right_target_type = duckdb::GetCudfType(right_expr->GetReturnType());
       cast_necessary              = true;
     } else {
       throw std::runtime_error("Unsupported join condition right expression");

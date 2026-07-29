@@ -74,9 +74,9 @@ namespace {
 join_condition wrap_one(duckdb::JoinCondition& c)
 {
   return join_condition{
-    sirius::ast::from_duckdb(*c.left),
-    sirius::ast::from_duckdb(*c.right),
-    from_duckdb(c.comparison),
+    sirius::ast::from_duckdb(c.GetLHS()),
+    sirius::ast::from_duckdb(c.GetRHS()),
+    from_duckdb(c.GetComparisonType()),
   };
 }
 

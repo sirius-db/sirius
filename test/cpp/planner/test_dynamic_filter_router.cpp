@@ -29,6 +29,7 @@
 #include <catch.hpp>
 #include <duckdb.hpp>
 #include <duckdb/planner/table_filter.hpp>
+#include <duckdb/planner/table_filter_set.hpp>
 
 using sirius::op::sirius_dynamic_filter_set;
 using sirius::planner::sirius_physical_plan_generator;

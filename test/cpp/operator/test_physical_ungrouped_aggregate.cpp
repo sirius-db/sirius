@@ -63,12 +63,20 @@ inline duckdb::vector<std::unique_ptr<sirius::ast::node>> translate_expressions(
 
 // Helper to create a dummy AggregateFunction since we only need the name and types for the GPU
 // operator
-AggregateFunction MakeDummyAggregate(const std::string& name,
-                                     const duckdb::vector<LogicalType>& args,
-                                     const LogicalType& ret_type)
+duckdb::BoundAggregateFunction MakeDummyAggregate(const std::string& name,
+                                                  const duckdb::vector<LogicalType>& args,
+                                                  const LogicalType& ret_type)
 {
-  return AggregateFunction(
-    name, args, ret_type, 0, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+  return duckdb::BoundAggregateFunction(
+    AggregateFunction(duckdb::Identifier(name),
+                      args,
+                      ret_type,
+                      nullptr,
+                      nullptr,
+                      nullptr,
+                      nullptr,
+                      nullptr,
+                      duckdb::FunctionNullHandling::DEFAULT_NULL_HANDLING));
 }
 
 TEMPLATE_TEST_CASE("sirius_physical_ungrouped_aggregate computes SUM/MIN/MAX/COUNT",

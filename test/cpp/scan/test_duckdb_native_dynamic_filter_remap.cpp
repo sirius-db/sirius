@@ -19,9 +19,11 @@
 #include <duckdb/catalog/catalog.hpp>
 #include <duckdb/catalog/catalog_entry/duck_table_entry.hpp>
 #include <duckdb/common/column_index.hpp>
+#include <duckdb/main/attached_database.hpp>
 #include <duckdb/main/client_context.hpp>
 #include <duckdb/planner/filter/constant_filter.hpp>
 #include <duckdb/planner/table_filter.hpp>
+#include <duckdb/planner/table_filter_set.hpp>
 #include <duckdb/storage/data_table.hpp>
 #include <duckdb/storage/storage_manager.hpp>
 #include <op/scan/duckdb_native_gpu_ingestible.hpp>
@@ -63,7 +65,8 @@ duckdb::DataTable& get_storage(duckdb::Connection& con, const std::string& table
   auto& catalog = duckdb::Catalog::GetCatalog(ctx, "");
   duckdb::CatalogTransaction txn(catalog, ctx);
   auto& schema = catalog.GetSchema(txn, "main");
-  auto entry   = schema.GetEntry(txn, duckdb::CatalogType::TABLE_ENTRY, table_name);
+  auto entry =
+    schema.GetEntry(txn, duckdb::CatalogType::TABLE_ENTRY, duckdb::Identifier(table_name));
   REQUIRE(entry);
   return entry->Cast<duckdb::DuckTableEntry>().GetStorage();
 }
@@ -197,8 +200,10 @@ TEST_CASE("duckdb-native ingestible installs the dynamic-filter column remap",
     auto channel        = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
     auto info           = make_info(storage, *con.context, all_cols, {0, 1, 2}, 2, channel);
     info->table_filters = duckdb::make_uniq<duckdb::TableFilterSet>();
-    info->table_filters->filters[2] = duckdb::make_uniq<duckdb::ConstantFilter>(
-      duckdb::ExpressionType::COMPARE_GREATERTHAN, duckdb::Value::INTEGER(10));
+    info->table_filters->PushFilter(
+      duckdb::ProjectionIndex(2),
+      duckdb::make_uniq<duckdb::LegacyConstantFilter>(duckdb::ExpressionType::COMPARE_GREATERTHAN,
+                                                      duckdb::Value::INTEGER(10)));
     auto ingestible = make_ingestible(std::move(info));
     REQUIRE(ingestible);
 

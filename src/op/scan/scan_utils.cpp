@@ -17,6 +17,7 @@
 // sirius
 #include <duckdb/planner/expression/bound_conjunction_expression.hpp>
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
+#include <duckdb/planner/table_filter_set.hpp>
 #include <expression/ast/from_duckdb.hpp>
 #include <helper/type_conversions.hpp>
 #include <log/logging.hpp>
@@ -63,10 +64,12 @@ duckdb::unique_ptr<duckdb::Expression> convert_table_filters_to_expression(
 {
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> filter_expressions;
 
-  for (auto& [column_index, filter] : filters.filters) {
+  for (auto& filter_entry : filters) {
+    auto const column_index = static_cast<duckdb::idx_t>(filter_entry.GetIndex());
+    auto const& filter      = filter_entry.Filter();
     // Skip optional and IS_NOT_NULL filters
-    if (filter->filter_type == duckdb::TableFilterType::OPTIONAL_FILTER ||
-        filter->filter_type == duckdb::TableFilterType::IS_NOT_NULL) {
+    if (filter.filter_type == duckdb::TableFilterType::LEGACY_OPTIONAL_FILTER ||
+        filter.filter_type == duckdb::TableFilterType::LEGACY_IS_NOT_NULL) {
       continue;
     }
 
@@ -83,7 +86,7 @@ duckdb::unique_ptr<duckdb::Expression> convert_table_filters_to_expression(
                      column_index,
                      primary_idx,
                      col_type.to_string(),
-                     static_cast<int>(filter->filter_type));
+                     static_cast<int>(filter.filter_type));
 
     auto const& batch_pos = batch_position_by_column_id[column_index];
     if (!batch_pos.has_value()) {
@@ -96,7 +99,7 @@ duckdb::unique_ptr<duckdb::Expression> convert_table_filters_to_expression(
 
     auto column_ref = duckdb::make_uniq<duckdb::BoundReferenceExpression>(
       sirius::to_duckdb(col_type), batch_column_index);
-    auto expr = filter->ToExpression(*column_ref);
+    auto expr = filter.ToExpression(*column_ref);
     filter_expressions.push_back(std::move(expr));
   }
 
@@ -106,7 +109,7 @@ duckdb::unique_ptr<duckdb::Expression> convert_table_filters_to_expression(
   auto conjunction =
     duckdb::make_uniq<duckdb::BoundConjunctionExpression>(duckdb::ExpressionType::CONJUNCTION_AND);
   for (auto& expr : filter_expressions) {
-    conjunction->children.push_back(std::move(expr));
+    conjunction->GetChildrenMutable().push_back(std::move(expr));
   }
   return conjunction;
 }

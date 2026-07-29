@@ -162,7 +162,7 @@ static std::unordered_set<duckdb::idx_t> prove_unique_columns(duckdb::LogicalOpe
       for (duckdb::idx_t i = 0; i < proj.expressions.size(); i++) {
         auto& expr = proj.expressions[i];
         if (expr->GetExpressionClass() != duckdb::ExpressionClass::BOUND_REF) { continue; }
-        auto child_idx = expr->Cast<duckdb::BoundReferenceExpression>().index;
+        auto child_idx = expr->Cast<duckdb::BoundReferenceExpression>().Index();
         if (child_unique.count(child_idx)) { remapped.insert(i); }
       }
       // All child unique columns must map through.
@@ -181,12 +181,12 @@ static std::unordered_set<duckdb::idx_t> prove_unique_columns(duckdb::LogicalOpe
       // Collect equality key columns on each side (only direct column refs).
       std::unordered_set<duckdb::idx_t> left_eq_keys, right_eq_keys;
       for (const auto& c : join.conditions) {
-        if (c.comparison != duckdb::ExpressionType::COMPARE_EQUAL) { continue; }
-        if (c.left->GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) {
-          left_eq_keys.insert(c.left->Cast<duckdb::BoundReferenceExpression>().index);
+        if (c.GetComparisonType() != duckdb::ExpressionType::COMPARE_EQUAL) { continue; }
+        if (c.GetLHS().GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) {
+          left_eq_keys.insert(c.GetLHS().Cast<duckdb::BoundReferenceExpression>().Index());
         }
-        if (c.right->GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) {
-          right_eq_keys.insert(c.right->Cast<duckdb::BoundReferenceExpression>().index);
+        if (c.GetRHS().GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) {
+          right_eq_keys.insert(c.GetRHS().Cast<duckdb::BoundReferenceExpression>().Index());
         }
       }
 
@@ -228,7 +228,7 @@ static std::unordered_set<duckdb::idx_t> prove_unique_columns(duckdb::LogicalOpe
 
       // Remap child unique indices through a projection map to output positions.
       auto remap = [](const std::unordered_set<duckdb::idx_t>& child_unique,
-                      const duckdb::vector<duckdb::idx_t>& proj_map,
+                      const duckdb::vector<duckdb::ProjectionIndex>& proj_map,
                       duckdb::idx_t offset) -> std::unordered_set<duckdb::idx_t> {
         std::unordered_set<duckdb::idx_t> mapped;
         if (proj_map.empty()) {
@@ -300,7 +300,7 @@ duckdb::LogicalGet* trace_binding_to_get(duckdb::LogicalOperator& node,
         return nullptr;
       }
       return trace_binding_to_get(*node.children[0],
-                                  expr.Cast<duckdb::BoundColumnRefExpression>().binding);
+                                  expr.Cast<duckdb::BoundColumnRefExpression>().Binding());
     }
     case duckdb::LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY: {
       auto& aggr = node.Cast<duckdb::LogicalAggregate>();
@@ -313,7 +313,7 @@ duckdb::LogicalGet* trace_binding_to_get(duckdb::LogicalOperator& node,
         return nullptr;
       }
       return trace_binding_to_get(*node.children[0],
-                                  expr.Cast<duckdb::BoundColumnRefExpression>().binding);
+                                  expr.Cast<duckdb::BoundColumnRefExpression>().Binding());
     }
     default: {
       // Table indexes are binder-unique, so recursing into every child finds the owning subtree
@@ -338,10 +338,10 @@ std::vector<std::size_t> build_key_domain_cardinalities(duckdb::LogicalCompariso
   for (std::size_t k = 0; k < pushed.size(); ++k) {
     auto const cond_idx = pushed[k];
     if (cond_idx >= op.conditions.size()) { continue; }
-    auto& key = *op.conditions[cond_idx].right;
+    auto& key = op.conditions[cond_idx].GetRHS();
     if (key.GetExpressionClass() != duckdb::ExpressionClass::BOUND_COLUMN_REF) { continue; }
     auto* get =
-      trace_binding_to_get(*op.children[1], key.Cast<duckdb::BoundColumnRefExpression>().binding);
+      trace_binding_to_get(*op.children[1], key.Cast<duckdb::BoundColumnRefExpression>().Binding());
     if (get == nullptr) { continue; }
     std::size_t card = 0;
     if (get->function.cardinality) {
@@ -364,9 +364,9 @@ std::vector<std::size_t> build_key_domain_cardinalities(duckdb::LogicalCompariso
 static bool is_trivial_key_side(const duckdb::Expression& expr)
 {
   if (expr.GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) { return true; }
-  if (expr.GetExpressionClass() == duckdb::ExpressionClass::BOUND_CAST) {
-    return expr.Cast<duckdb::BoundCastExpression>().child->GetExpressionClass() ==
-           duckdb::ExpressionClass::BOUND_REF;
+  if (duckdb::BoundCastExpression::IsCast(expr)) {
+    return duckdb::BoundCastExpression::Child(expr.Cast<duckdb::BoundFunctionExpression>())
+             .GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF;
   }
   return false;
 }
@@ -393,7 +393,7 @@ static void materialize_expression_join_keys(
   duckdb::unique_ptr<sirius::op::sirius_physical_operator>& right)
 {
   auto materialize_side = [&](duckdb::unique_ptr<sirius::op::sirius_physical_operator>& child,
-                              duckdb::vector<duckdb::idx_t>& projection_map,
+                              duckdb::vector<duckdb::ProjectionIndex>& projection_map,
                               bool is_left) {
     const std::size_t old_width = child->types.size();
 
@@ -403,17 +403,17 @@ static void materialize_expression_join_keys(
     duckdb::vector<sirius::logical_type> key_types;
     for (std::size_t i = 0; i < op.conditions.size(); i++) {
       auto& cond = op.conditions[i];
-      if (cond.comparison != duckdb::ExpressionType::COMPARE_EQUAL &&
-          cond.comparison != duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
+      if (cond.GetComparisonType() != duckdb::ExpressionType::COMPARE_EQUAL &&
+          cond.GetComparisonType() != duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
         continue;  // inequality sides are evaluated inline as the mixed-join predicate
       }
-      auto& side_expr = is_left ? cond.left : cond.right;
+      auto& side_expr = is_left ? cond.LeftReference() : cond.RightReference();
       if (is_trivial_key_side(*side_expr)) { continue; }
       auto node = sirius::ast::from_duckdb(*side_expr);
       if (!node) { continue; }  // untranslatable: leave for the existing downstream throw
       cond_indices.push_back(i);
       key_exprs.push_back(std::move(node));
-      key_types.push_back(sirius::from_duckdb(side_expr->return_type));
+      key_types.push_back(sirius::from_duckdb(side_expr->GetReturnType()));
     }
 
     if (cond_indices.empty()) { return; }
@@ -440,10 +440,10 @@ static void materialize_expression_join_keys(
     // Rewrite each materialized condition side to reference its appended column.
     for (std::size_t k = 0; k < cond_indices.size(); k++) {
       const std::size_t new_index = old_width + k;
-      auto& side_expr =
-        is_left ? op.conditions[cond_indices[k]].left : op.conditions[cond_indices[k]].right;
+      auto& side_expr             = is_left ? op.conditions[cond_indices[k]].LeftReference()
+                                            : op.conditions[cond_indices[k]].RightReference();
       side_expr =
-        duckdb::make_uniq<duckdb::BoundReferenceExpression>(side_expr->return_type, new_index);
+        duckdb::make_uniq<duckdb::BoundReferenceExpression>(side_expr->GetReturnType(), new_index);
     }
 
     // Exclude the synthetic key column(s) from the join output. An empty projection map means
@@ -453,7 +453,7 @@ static void materialize_expression_join_keys(
     if (projection_map.empty()) {
       projection_map.reserve(old_width);
       for (std::size_t c = 0; c < old_width; c++) {
-        projection_map.push_back(static_cast<duckdb::idx_t>(c));
+        projection_map.push_back(duckdb::ProjectionIndex(c));
       }
     }
   };
@@ -470,8 +470,8 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
 
   // Reject nested join keys before planning either child.
   for (auto const& condition : op.conditions) {
-    reject_nested_column_operation(*condition.left, "a join condition");
-    reject_nested_column_operation(*condition.right, "a join condition");
+    reject_nested_column_operation(condition.GetLHS(), "a join condition");
+    reject_nested_column_operation(condition.GetRHS(), "a join condition");
   }
 
   std::size_t lhs_cardinality = op.children[0]->EstimateCardinality(context);
@@ -627,8 +627,8 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
       std::move(right),
       std::move(conditions),
       op.join_type,
-      op.left_projection_map,
-      op.right_projection_map,
+      sirius::from_duckdb_projection_ids(op.left_projection_map),
+      sirius::from_duckdb_projection_ids(op.right_projection_map),
       sirius::from_duckdb_vec(op.mark_types),
       op.estimated_cardinality,
       std::move(op.filter_pushdown),
@@ -636,8 +636,19 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
       std::move(filter_plan),
       op_params.hash_partition_bytes,
       op_params.max_broadcast_join_size);
-    auto& hj                        = join->Cast<sirius::op::sirius_physical_hash_join>();
-    hj.join_stats                   = std::move(op.join_stats);
+    auto& hj = join->Cast<sirius::op::sirius_physical_hash_join>();
+    // DuckDB moved join-key statistics out of LogicalJoin and into the individual
+    // JoinConditions; rebuild the flat [left, right] per-condition vector. Kept
+    // all-or-nothing, matching the old optimizer, which cleared the whole vector
+    // whenever a condition was dropped.
+    for (auto const& cond : op.conditions) {
+      if (!cond.IsComparison() || !cond.GetLeftStats() || !cond.GetRightStats()) {
+        hj.join_stats.clear();
+        break;
+      }
+      hj.join_stats.push_back(cond.GetLeftStats()->ToUnique());
+      hj.join_stats.push_back(cond.GetRightStats()->ToUnique());
+    }
     hj.mark_join_build_switch_ratio = op_params.mark_join_build_switch_ratio;
 
     // --- Detect build-side key uniqueness ---
@@ -663,7 +674,7 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
           keys_extractable = false;
           break;
         }
-        build_key_cols.insert(right_expr->Cast<duckdb::BoundReferenceExpression>().index);
+        build_key_cols.insert(right_expr->Cast<duckdb::BoundReferenceExpression>().Index());
       }
       if (keys_extractable && !build_key_cols.empty()) {
         // build_side_unique_cols was computed before create_plan (which moves logical node data).
@@ -718,15 +729,15 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
   // }
   if (nlj_is_supported) {
     // inequality join: use nested loop; pass projection maps so output column order matches plan
-    auto join =
-      duckdb::make_uniq<sirius::op::sirius_physical_nested_loop_join>(op,
-                                                                      std::move(left),
-                                                                      std::move(right),
-                                                                      std::move(conditions),
-                                                                      op.join_type,
-                                                                      op.estimated_cardinality,
-                                                                      op.left_projection_map,
-                                                                      op.right_projection_map);
+    auto join = duckdb::make_uniq<sirius::op::sirius_physical_nested_loop_join>(
+      op,
+      std::move(left),
+      std::move(right),
+      std::move(conditions),
+      op.join_type,
+      op.estimated_cardinality,
+      sirius::from_duckdb_projection_ids(op.left_projection_map),
+      sirius::from_duckdb_projection_ids(op.right_projection_map));
     return join;
   }
 

@@ -65,7 +65,8 @@ duckdb::DataTable& get_storage(duckdb::Connection& con, const std::string& table
   auto& catalog = duckdb::Catalog::GetCatalog(ctx, "");
   duckdb::CatalogTransaction txn(catalog, ctx);
   auto& schema = catalog.GetSchema(txn, "main");
-  auto entry   = schema.GetEntry(txn, duckdb::CatalogType::TABLE_ENTRY, table_name);
+  auto entry =
+    schema.GetEntry(txn, duckdb::CatalogType::TABLE_ENTRY, duckdb::Identifier(table_name));
   REQUIRE(entry);
   return entry->Cast<duckdb::DuckTableEntry>().GetStorage();
 }
@@ -294,7 +295,7 @@ filter_ctx make_constant_filter(duckdb::idx_t col_key,
 {
   filter_ctx ctx;
   ctx.filters.filters[col_key] =
-    duckdb::make_uniq<duckdb::ConstantFilter>(cmp, std::move(constant));
+    duckdb::make_uniq<duckdb::LegacyConstantFilter>(cmp, std::move(constant));
   // column_ids must be indexable at col_key; pad with the same storage_idx.
   ctx.column_ids.resize(col_key + 1, duckdb::ColumnIndex(storage_idx));
   ctx.column_ids[col_key] = duckdb::ColumnIndex(storage_idx);
@@ -932,7 +933,7 @@ TEST_CASE("statistics pruning prunes through an OPTIONAL_FILTER wrapper",
 
   filter_ctx ctx;
   ctx.filters.filters[0] =
-    duckdb::make_uniq<duckdb::OptionalFilter>(duckdb::make_uniq<duckdb::ConstantFilter>(
+    duckdb::make_uniq<duckdb::LegacyOptionalFilter>(duckdb::make_uniq<duckdb::LegacyConstantFilter>(
       duckdb::ExpressionType::COMPARE_GREATERTHANOREQUALTO, duckdb::Value::INTEGER(250000)));
   ctx.column_ids.push_back(duckdb::ColumnIndex(0));
 

@@ -33,6 +33,7 @@
  * returning the result as a row instead of attempting execution.
  */
 
+#include "duckdb/main/settings.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 
 #include <catch.hpp>
@@ -99,7 +100,7 @@ unique_ptr<FunctionData> PlanCheckBind(ClientContext& context,
     auto plan = std::move(planner.plan);
 
     // 3. Optimize
-    if (context.config.enable_optimizer) {
+    if (duckdb::Settings::Get<duckdb::EnableOptimizerSetting>(context)) {
       Optimizer optimizer(*planner.binder, context);
       plan = optimizer.Optimize(std::move(plan));
     }
@@ -108,7 +109,7 @@ unique_ptr<FunctionData> PlanCheckBind(ClientContext& context,
     plan->ResolveOperatorTypes();
 
     ColumnBindingResolver resolver;
-    ColumnBindingResolver::Verify(*plan);
+    ColumnBindingResolver::Verify(context, *plan);
     resolver.VisitOperator(*plan);
 
     // 5. Translate to Sirius physical plan
@@ -256,7 +257,7 @@ unique_ptr<FunctionData> GPUPlanCheckBind(ClientContext& context,
     auto plan = std::move(planner.plan);
 
     // 3. Optimize
-    if (context.config.enable_optimizer) {
+    if (duckdb::Settings::Get<duckdb::EnableOptimizerSetting>(context)) {
       Optimizer optimizer(*planner.binder, context);
       plan = optimizer.Optimize(std::move(plan));
     }
@@ -265,7 +266,7 @@ unique_ptr<FunctionData> GPUPlanCheckBind(ClientContext& context,
     plan->ResolveOperatorTypes();
 
     ColumnBindingResolver resolver;
-    ColumnBindingResolver::Verify(*plan);
+    ColumnBindingResolver::Verify(context, *plan);
     resolver.VisitOperator(*plan);
 
     // 5. Check operator support against the legacy GPU planner dispatch table

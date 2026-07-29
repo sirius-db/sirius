@@ -23,14 +23,17 @@
 #include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/execution/column_binding_resolver.hpp"
 #include "duckdb/function/table/table_scan.hpp"
+#include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/config.hpp"
+#include "duckdb/main/profiler/metrics.hpp"
 #include "duckdb/main/query_profiler.hpp"
 #include "duckdb/main/settings.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/planner/operator/list.hpp"
 #include "duckdb/planner/operator/logical_extension_operator.hpp"
 #include "duckdb/planner/table_filter.hpp"
+#include "duckdb/planner/table_filter_set.hpp"
 #include "duckdb/storage/storage_manager.hpp"
 #include "log/logging.hpp"
 #include "op/scan/duckdb_native_gpu_ingestible.hpp"
@@ -175,9 +178,9 @@ build_duckdb_native_table_info(sirius::op::sirius_physical_table_scan& scan_op,
   // DuckTableEntry so it matches the pin-side derivation (build_duckdb_pin_info)
   // exactly. Without these a pin_table(format='duckdb', ...) query silently misses
   // the pinned cache and falls through to disk.
-  info->catalog_name           = table.ParentCatalog().GetName();
-  info->schema_name            = table.ParentSchema().name;
-  info->table_name             = table.name;
+  info->catalog_name           = table.ParentCatalog().GetName().GetIdentifierName();
+  info->schema_name            = table.ParentSchema().name.GetIdentifierName();
+  info->table_name             = table.name.GetIdentifierName();
   info->approximate_batch_size = op_params.scan_task_batch_size;
 
   std::vector<std::size_t> source_ids_fallback;
@@ -208,12 +211,7 @@ build_duckdb_native_table_info(sirius::op::sirius_physical_table_scan& scan_op,
   }
 
   // Filters drive row-group pruning in the metadata walk and post-decode filtering.
-  if (scan_op.table_filters) {
-    info->table_filters = duckdb::make_uniq<duckdb::TableFilterSet>();
-    for (auto& [col_idx, filt] : scan_op.table_filters->filters) {
-      info->table_filters->filters[col_idx] = filt->Copy();
-    }
-  }
+  if (scan_op.table_filters) { info->table_filters = scan_op.table_filters->Copy(); }
   info->column_ids     = scan_op.column_ids;
   info->projection_ids = scan_op.projection_ids;
   info->returned_types = scan_op.returned_types;
@@ -661,12 +659,12 @@ void sirius_physical_plan_generator::reject_nested_column_operation(duckdb::Expr
                                                                     std::string_view operation)
 {
   // A nested-typed BOUND_REF names the offending column directly.
-  if (is_nested_logical_type(expr.return_type) &&
+  if (is_nested_logical_type(expr.GetReturnType()) &&
       expr.GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) {
-    auto name = expr.GetName();
+    std::string name = expr.GetName().GetIdentifierName();
     if (name.empty()) { name = expr.ToString(); }
     throw std::runtime_error("nested column operation on column '" + name + "' (" +
-                             expr.return_type.ToString() + ") is unsupported in " +
+                             expr.GetReturnType().ToString() + ") is unsupported in " +
                              std::string(operation) +
                              ": Sirius reads and projects nested columns but cannot operate on "
                              "them yet");
@@ -680,9 +678,9 @@ void sirius_physical_plan_generator::reject_nested_column_operation(duckdb::Expr
 
   // Constructed nested values (struct_pack, list constructors, ...) cannot run
   // on the GPU path either.
-  if (is_nested_logical_type(expr.return_type)) {
+  if (is_nested_logical_type(expr.GetReturnType())) {
     throw std::runtime_error("nested column operation on '" + expr.ToString() + "' (" +
-                             expr.return_type.ToString() + ") is unsupported in " +
+                             expr.GetReturnType().ToString() + ") is unsupported in " +
                              std::string(operation));
   }
 }
@@ -905,20 +903,23 @@ sirius_physical_plan_generator::create_plan(duckdb::unique_ptr<duckdb::LogicalOp
   auto& profiler = duckdb::QueryProfiler::Get(context);
 
   // Resolve the types of each operator.
-  profiler.StartPhase(duckdb::MetricType::PHYSICAL_PLANNER_RESOLVE_TYPES);
-  op->ResolveOperatorTypes();
-  profiler.EndPhase();
+  {
+    auto timer = profiler.StartTimer<duckdb::MetricPhysicalPlannerResolveTypes>();
+    op->ResolveOperatorTypes();
+  }
 
   // Resolve the column references.
-  profiler.StartPhase(duckdb::MetricType::PHYSICAL_PLANNER_COLUMN_BINDING);
-  duckdb::ColumnBindingResolver resolver;
-  resolver.VisitOperator(*op);
-  profiler.EndPhase();
+  {
+    auto timer = profiler.StartTimer<duckdb::MetricPhysicalPlannerColumnBinding>();
+    duckdb::ColumnBindingResolver resolver;
+    resolver.VisitOperator(*op);
+  }
 
   // then create the main physical plan
-  profiler.StartPhase(duckdb::MetricType::PHYSICAL_PLANNER_CREATE_PLAN);
-  auto plan = create_plan(*op);
-  profiler.EndPhase();
+  auto plan = [&] {
+    auto timer = profiler.StartTimer<duckdb::MetricPhysicalPlannerCreatePlan>();
+    return create_plan(*op);
+  }();
 
   plan = fold_adjacent_projections(std::move(plan));
   plan->verify();

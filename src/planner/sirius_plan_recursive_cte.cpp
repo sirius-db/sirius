@@ -30,7 +30,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalCTERef& op)
 
   // Check if this LogicalCTERef is supposed to scan a materialized CTE.
   // Lookup if there is a materialized CTE for the cte_index.
-  auto materialized_cte = materialized_ctes.find(op.cte_index);
+  auto materialized_cte = materialized_ctes.find(op.cte_index.index);
 
   // If this check fails, this is a reference to a materialized recursive CTE.
   if (materialized_cte != materialized_ctes.end()) {
@@ -38,9 +38,9 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalCTERef& op)
       sirius::from_duckdb_vec(op.chunk_types),
       sirius::op::SiriusPhysicalOperatorType::CTE_SCAN,
       op.estimated_cardinality,
-      op.cte_index);
+      op.cte_index.index);
 
-    auto cte = recursive_cte_tables.find(op.cte_index);
+    auto cte = recursive_cte_tables.find(op.cte_index.index);
     if (cte == recursive_cte_tables.end()) {
       throw duckdb::InvalidInputException("Referenced materialized CTE does not exist.");
     }
@@ -48,7 +48,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalCTERef& op)
     chunk_scan->collection = cte->second.get();
     // materialized_cte->second.push_back(*chunk_scan.get())
 
-    // auto gpu_cte = gpu_recursive_cte_tables.find(op.cte_index);
+    // auto gpu_cte = gpu_recursive_cte_tables.find(op.cte_index.index);
     // if (gpu_cte == gpu_recursive_cte_tables.end()) {
     //   throw duckdb::InvalidInputException("Referenced materialized CTE does not exist.");
     // }
@@ -61,14 +61,14 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalCTERef& op)
 
   throw duckdb::NotImplementedException("Recursive CTE is not implemented");
 
-  auto cte = recursive_cte_tables.find(op.cte_index);
+  auto cte = recursive_cte_tables.find(op.cte_index.index);
   if (cte == recursive_cte_tables.end()) {
     throw duckdb::InvalidInputException("Referenced recursive CTE does not exist.");
   }
 
   // If we found a recursive CTE and we want to scan the recurring table, we search for it,
   if (op.is_recurring) {
-    cte = recurring_cte_tables.find(op.cte_index);
+    cte = recurring_cte_tables.find(op.cte_index.index);
     if (cte == recurring_cte_tables.end()) {
       throw duckdb::InvalidInputException(
         "RECURRING can only be used with USING KEY in recursive CTE.");
@@ -79,7 +79,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalCTERef& op)
     sirius::from_duckdb_vec(cte->second.get()->Types()),
     sirius::op::SiriusPhysicalOperatorType::RECURSIVE_CTE_SCAN,
     op.estimated_cardinality,
-    op.cte_index);
+    op.cte_index.index);
 
   chunk_scan->collection = cte->second.get();
   return std::move(chunk_scan);

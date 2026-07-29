@@ -56,7 +56,7 @@ sirius_physical_result_collector::sirius_physical_result_collector(
     statement_type(data.prepared->statement_type),
     properties(data.prepared->properties),
     plan(*data.sirius_physical_plan),
-    names(data.prepared->names)
+    names(from_duckdb_names(data.prepared->names))
 {
   this->types = sirius::from_duckdb_vec(data.prepared->types);
   // Full DuckDB types incl. nested children — sirius::logical_type cannot
