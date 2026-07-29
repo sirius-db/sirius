@@ -270,8 +270,9 @@ Ask in ~3 grouped rounds (`AskUserQuestion` allows up to 4 questions per call). 
 **Round 2 — execution shape**
 1. **Mode** (`--mode`) — `grouped` (default, hot cache), `sequential` (round-robin), `isolated` (true cold-start; needs the sudo setup below), or `nsys-profile` (GPU-only; owned by the `profile-analyzer` skill).
 2. **Pin** (`--pin`) — `none` (from disk), `gpu`, or `host` (pinned cache tier; rejected with `--engine cpu`). This is how "from disk vs pinned" is chosen, for either source.
-3. **Iterations** (`--iterations`) — per-query iteration count (default `1`).
-4. **Queries** (`--queries`) — all 22 (default) or a subset like `1,3,6-10`.
+3. **Pin compression** (`--pin-compression`) — only ask when Pin is `gpu` or `host`; skip it entirely for `none` (the runner rejects the combination). Off (Recommended) or Simpatico-compressed pins; the plan dir (`--compression-plan-dir`) defaults to the shipped `plans/tpch_sf1000`, so only ask for a path if the user has their own plans.
+4. **Iterations** (`--iterations`) — per-query iteration count (default `1`).
+5. **Queries** (`--queries`) — all 22 (default) or a subset like `1,3,6-10`.
 
 **Round 3 — output**
 1. **Validation** (`--validation`) — byte-compare GPU vs CPU after timing (requires `--engine both`).
