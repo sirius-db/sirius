@@ -19,6 +19,7 @@ on:
       - dev
   merge_group:
   pull_request:
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
