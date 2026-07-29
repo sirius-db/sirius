@@ -75,3 +75,28 @@ When the C++ unit test job fails or times out, the workflow automatically upload
 - The last test number logged before output stops — this is the test that hung or crashed
 - Any CUDA error messages preceding the hang
 - Stack traces if the binary aborted
+
+## Pull requests
+
+### Commit and title convention
+
+Sirius squash-merges PRs, the PR titles become the commit message on merge. Commits and PR titles follow [Conventional Commits](https://www.conventionalcommits.org/) format for readability.
+
+Example of Conventional Commits:
+```
+<type>[optional scope]: <description>
+
+[optional body]
+
+[optional footer(s)]
+```
+
+Scope is optional — use it when the change is clearly localized to a subsystem (e.g. `fix(join):`, `ci(distribution):`), omit it for cross-cutting changes.
+
+New contributors: put your best title — reviewers will help refine it before merge.
+
+### Configuration changes
+
+If your PR changes any Sirius configuration option:
+1. Document the change inline where the config lives (code comments, settings files)
+2. Summarize the change in the PR description for reviewers and the changelog
