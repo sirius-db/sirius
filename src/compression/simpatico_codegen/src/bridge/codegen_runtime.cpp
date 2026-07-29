@@ -240,16 +240,13 @@ std::unique_ptr<cudf::column> compact_bitpack_packed(cudf::column const& chunk_c
 
   const std::size_t live = static_cast<std::size_t>(live_packed_bytes);
 
-  // The decode bit-unpack gather (simpatico_bitunpack_one) loads three
-  // consecutive uint32 words unconditionally, so decoding the last element of
-  // simpatico_bitunpack_one unconditionally loads three consecutive uint32 words
-  // (w0, w1, w2) starting at word_in, so the last valid element can touch up to
-  // two words past the last live word.  Allocate three words of trailing slack
-  // (zero-initialised) so all three loads are always within the allocation.
-  // The column's logical size stays ``live`` so serialization remains tight.
-  constexpr std::size_t kDecodeGatherSlackBytes = 3 * sizeof(std::uint32_t);
+  // simpatico_bitunpack_one loads three consecutive uint32 words (w0/w1/w2);
+  // three guard words keep the last element's gather in-bounds.  They travel
+  // as part of the stored payload so num_rows already accounts for them.
+  constexpr std::size_t kGuardWords = 3;
+  const std::size_t guard_bytes     = kGuardWords * sizeof(std::uint32_t);
 
-  rmm::device_buffer dense(live + kDecodeGatherSlackBytes, stream, mr);
+  rmm::device_buffer dense(live + guard_bytes, stream, mr);
   if (live > 0) {
     const cudf::size_type num_chunks = chunk_count.size();
     const void* cc_p                 = chunk_count.view().head<void>();
@@ -294,15 +291,16 @@ std::unique_ptr<cudf::column> compact_bitpack_packed(cudf::column const& chunk_c
              "compact gather");
   }
 
-  // Zero the trailing gather slack so the decode over-read returns deterministic
-  // (masked-out) bytes rather than uninitialised memory.
-  cudaMemsetAsync(
-    static_cast<std::uint8_t*>(dense.data()) + live, 0, kDecodeGatherSlackBytes, stream.value());
+  // Zero the guard words so the decode over-read returns deterministic
+  // (masked-out) zeros rather than uninitialised memory.
+  cudaMemsetAsync(static_cast<std::uint8_t*>(dense.data()) + live, 0, guard_bytes, stream.value());
 
   // packed is uint32 words; UINT32 (size = words) keeps a >2GB dense buffer
-  // under cudf's 2^31-element cap. `live` is a byte count, always a multiple of 4.
+  // under cudf's 2^31-element cap.  The column size includes the guard words
+  // so they travel through serialisation/deserialisation without any special
+  // extra allocation at the read site.  `live` is always a multiple of 4.
   return std::make_unique<cudf::column>(cudf::data_type(cudf::type_id::UINT32),
-                                        static_cast<cudf::size_type>(live / 4),
+                                        static_cast<cudf::size_type>(live / 4 + kGuardWords),
                                         std::move(dense),
                                         rmm::device_buffer(0, stream, mr),
                                         0);
