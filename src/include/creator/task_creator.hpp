@@ -21,17 +21,21 @@
 #include "exec/bounded_thread_pool.hpp"
 #include "exec/config.hpp"
 #include "exec/interruptible_mpmc.hpp"
+#include "exec/multi_index_priority_queue.hpp"
 #include "exec/queue_priority.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "pipeline/sirius_pipeline.hpp"
+#include "query_id.hpp"
 
 #include <blockingconcurrentqueue.h>
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/data/data_repository.hpp>
 
 #include <atomic>
+#include <condition_variable>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -71,6 +75,14 @@ namespace sirius::creator {
 struct task_creation_request {
   op::sirius_physical_operator* node;
   request_type type = request_type::active;
+  //! The query `node` belongs to. Indexes the request in the creation queue so a finished or
+  //! failed query's pending requests can be dropped without touching any other query's.
+  sirius::query_id_t query_id = sirius::make_query_id(0);
+  //! Scheduling priority of `node`'s pipeline; orders the creation queue the same way the
+  //! execution queue is ordered (query first, then within-query pipeline rank).
+  exec::queue_priority priority = 0;
+  //! Preferred GPU, when the caller had a hint. Only a secondary index; does not bind the task.
+  int device_id = exec::no_preferred_device;
 };
 
 class task_creator {
@@ -107,17 +119,31 @@ class task_creator {
   /// \brief The GPU subset this query was admitted onto.
   [[nodiscard]] const std::vector<int>& get_active_gpu_ids() const noexcept;
 
-  /// \brief sets client context needed for task creation
-  void set_client_context(::duckdb::ClientContext& client_context);
+  /// \brief Bind @p query_id to the connection that is running it.
+  /// Called at execution-window begin, before prepare_for_query.
+  void set_client_context(sirius::query_id_t query_id, ::duckdb::ClientContext& client_context);
 
   /// \brief sets pipeline executor reference
   void set_task_scheduler(sirius::pipeline::task_scheduler& task_scheduler);
 
-  /// \brief prepare global states for all pipelines in the query
+  /// \brief Register the per-query state for @p query's pipelines.
+  ///
+  /// Adds an entry; it does NOT clear other queries' entries. Call reset(query_id) to drop one.
   void prepare_for_query(const sirius::planner::query& query);
 
-  /// \brief clean-up query bound resources and prepare the task creator for next query
-  void reset();
+  /// \brief Drop everything held for @p query_id: pending creation requests, in-flight creation
+  /// work, and the per-query state entry. Other queries are untouched.
+  ///
+  /// Runs on both the success and the failure path (SiriusContext::run_mandatory_cleanup, which
+  /// StandaloneQueryScope guarantees exactly once), so a failed query cannot leave the shared
+  /// creator holding stale operator pointers.
+  ///
+  /// Must complete before @p query_id's planner::query is destroyed: queued requests hold raw
+  /// operator pointers into its plan.
+  void reset(sirius::query_id_t query_id);
+
+  /// \brief Drop every query's state. Teardown only (SiriusContext::terminate).
+  void reset_all();
 
   /**
    * @brief Stop the task creator and its thread pool.
@@ -141,12 +167,14 @@ class task_creator {
   void stop_thread_pool();
 
   /**
-   * @brief Drain all pending task creation requests and wait for in-flight tasks to complete.
+   * @brief Drop @p query_id's pending creation requests and wait for its in-flight creation
+   *        work to finish. Other queries keep running.
    *
    * Call this after a query completes (future resolved) but before destroying the engine/operators
-   * to ensure no stale operator pointers are accessed by the task creator threads.
+   * to ensure no stale operator pointers are accessed by the task creator threads. Unlike the
+   * previous global drain, this neither interrupts the queue nor waits on other queries' work.
    */
-  void drain_pending_tasks();
+  void drain_pending_tasks(sirius::query_id_t query_id);
 
   /**
    * @brief Schedule a task creation info for processing.
@@ -155,7 +183,11 @@ class task_creator {
    */
   virtual void schedule(op::sirius_physical_operator* request);
 
-  void schedule_lookahead(std::optional<int> device_id_hint = std::nullopt);
+  /// \brief Overload for callers that already know the query; avoids re-deriving it.
+  void schedule(op::sirius_physical_operator* request, sirius::query_id_t query_id);
+
+  void schedule_lookahead(sirius::query_id_t query_id,
+                          std::optional<int> device_id_hint = std::nullopt);
 
   /**
    * @brief Get the next task id.
@@ -225,21 +257,57 @@ class task_creator {
   sirius::memory::sirius_memory_reservation_manager& _mem_res_mgr;
   std::atomic<uint64_t> _task_id{0};
 
-  std::mutex _lookahead_mutex;              // Protect concurrent access to the lookahead scheduling
-  std::size_t _index_of_next_lookahead{0};  // Index of the next operator to lookahead for
-  std::vector<op::sirius_physical_operator*> _lookahead_queue;
+  /**
+   * @brief Everything the task creator holds on behalf of ONE query.
+   *
+   * Handed out as a `shared_ptr`: a worker resolves it once and then reads `global_states`,
+   * which is never mutated after `prepare_for_query`. That makes the lookup race-free even if
+   * the query is erased concurrently — the worker's copy keeps the state alive until it is done.
+   * Operator ids restart at 0 for every query, so `global_states` is only unique *within* an
+   * entry; keying it globally is what would let two queries fetch each other's state.
+   */
+  struct query_task_state {
+    //! Source operator id -> that pipeline's task global state. Written once by
+    //! prepare_for_query, read-only afterwards.
+    std::unordered_map<size_t, std::shared_ptr<pipeline::sirius_pipeline_task_global_state>>
+      global_states;
+
+    //! Client context of the connection running this query. Per query because two concurrent
+    //! queries on different connections have different contexts.
+    ::duckdb::ClientContext* client_context{nullptr};
+
+    std::mutex lookahead_mutex;
+    std::size_t index_of_next_lookahead{0};
+    std::vector<op::sirius_physical_operator*> lookahead_queue;
+
+    //! Per-query stand-in for `bounded_thread_pool::wait_all()`, which can only wait on every
+    //! query's creation work at once. Incremented before dispatch, decremented when the lambda
+    //! leaves (including by exception); `wait_for_in_flight()` blocks until it reaches zero.
+    std::mutex in_flight_mutex;
+    std::condition_variable in_flight_cv;
+    std::size_t in_flight{0};
+
+    void enter_in_flight();
+    void leave_in_flight();
+    void wait_for_in_flight();
+  };
+
+  //! Resolve a query's state, or nullptr when it has already been reset.
+  std::shared_ptr<query_task_state> get_query_state(sirius::query_id_t query_id) const;
 
   // Queue for creating tasks based on operators. The operator is the starting point to start
   // looking which task should be created, not necessarily the operator for whose pipeline the task
-  // will be created
-  exec::interruptible_mpmc<std::unique_ptr<task_creation_request>> _task_creation_queue;
+  // will be created.
+  //
+  // A multi_index_priority_queue rather than a plain FIFO so that (a) creation is ordered the
+  // same way execution is — earlier query first, then pipeline rank — and (b) a single query's
+  // pending requests can be dropped via drain(query_index{...}) without disturbing any other
+  // query's.
+  exec::multi_index_priority_queue<task_creation_request> _task_creation_queue;
 
-  // Map of operator ID to global state for scan operators
-  std::unordered_map<size_t, std::shared_ptr<pipeline::sirius_pipeline_task_global_state>>
-    _gpu_operator_global_state_map;
-  std::unique_ptr<duckdb::ThreadContext> _thread_context;
-  std::unique_ptr<duckdb::ExecutionContext> _execution_context;
-  std::mutex _global_state_mutex;  // Protect concurrent access to the map
+  //! One entry per in-flight query. Guarded by _global_state_mutex.
+  std::map<sirius::query_id_t, std::shared_ptr<query_task_state>> _query_states;
+  mutable std::mutex _global_state_mutex;  // Protect concurrent access to _query_states
 
   /// Shared GPU<->NUMA topology index for NUMA-aware GPU routing (may be null).
   /// Scoped to the memory manager's reserved GPU/HOST spaces:

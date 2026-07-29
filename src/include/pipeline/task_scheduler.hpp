@@ -196,7 +196,11 @@ class task_scheduler {
  private:
   void management_eventloop();
 
-  std::mutex _query_mutex;
+  /// The query currently installed by prepare_for_query, or nullopt between queries.
+  /// Per-query task_creator cleanup is keyed on it.
+  [[nodiscard]] std::optional<sirius::query_id_t> current_query_id() const;
+
+  mutable std::mutex _query_mutex;
   duckdb::shared_ptr<planner::query> _query;
 
   /// Pipeline-level task queue, ordered by task priority (highest dispatched first).
