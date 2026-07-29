@@ -100,6 +100,11 @@ class SiriusExtension : public Extension {
                                                    TableFunctionBindInput& input,
                                                    vector<LogicalType>& return_types,
                                                    vector<string>& names);
+  /// Per-execution state factory for gpu_execution(): a reusable prepared
+  /// statement gets fresh execution state (result/connection/interface) on
+  /// every execute instead of reusing bind-held state.
+  static unique_ptr<GlobalTableFunctionState> GPUExecutionInitGlobal(ClientContext& context,
+                                                                     TableFunctionInitInput& input);
 
   static void PinTableFunction(ClientContext& context,
                                TableFunctionInput& data_p,
