@@ -302,12 +302,19 @@ def copy_database(src, dst):
     shutil.copy2(src, dst)
 
 
-def open_benchmark_db(scratch_db, pin_tier):
+def open_benchmark_db(scratch_db, pin_tier, compression_plan_dir=None):
     """Connect writable, LOAD Sirius, CHECKPOINT, pin the TPC-H tables."""
     con = duckdb.connect(scratch_db, config={"allow_unsigned_extensions": "true"})
     log(f"Loading Sirius extension from {EXTENSION_PATH}")
     sql(con, f"LOAD '{EXTENSION_PATH}'")
     sql(con, "CHECKPOINT")
+    if compression_plan_dir:
+        log(f"Enabling Simpatico pin compression (plans: {compression_plan_dir})")
+        sql(con, "SET pin_table_compression = true")
+        sql(
+            con,
+            f"SET pin_table_input_compression_plan_dir = '{compression_plan_dir}'",
+        )
     if pin_tier != "none":
         for t in TPCH_TABLES:
             log(f"  Pinning {t} (tier={pin_tier})")
@@ -324,14 +331,51 @@ def close_benchmark_db(con, pin_tier):
         con.close()
 
 
+def compressed_pin_count(log_dir, timeout_s=10.0):
+    """Count pins the engine compressed, via the pin_table INFO log marker.
+
+    The marker is written during CALL pin_table, well before the pins finish,
+    but the log sink may flush late; poll briefly before concluding zero.
+    """
+
+    def scan():
+        found = 0
+        for name in os.listdir(log_dir):
+            if not name.endswith(".log"):
+                continue
+            with open(os.path.join(log_dir, name), errors="replace") as f:
+                found += sum("compressing with plan" in line for line in f)
+        return found
+
+    deadline = time.time() + timeout_s
+    count = scan()
+    while count == 0 and time.time() < deadline:
+        time.sleep(0.5)
+        count = scan()
+    return count
+
+
 @contextlib.contextmanager
 def benchmark_db(args, run_dir, filename):
     """Copy the base DB into run_dir, open it with the TPC-H tables pinned, and
     unpin/close/delete the copy on exit."""
     scratch = os.path.join(run_dir, filename)
     copy_database(args.input, scratch)
-    con = open_benchmark_db(scratch, args.pin)
+    con = open_benchmark_db(
+        scratch,
+        args.pin,
+        args.compression_plan_dir if args.pin_compression else None,
+    )
     try:
+        if args.pin_compression:
+            compressed = compressed_pin_count(os.environ["SIRIUS_LOG_DIR"])
+            if compressed == 0:
+                raise SystemExit(
+                    "--pin-compression was requested but no pinned table was "
+                    "compressed; the run would silently measure uncompressed "
+                    "data. Check the sirius log for '[pin_table]' warnings."
+                )
+            log(f"Simpatico engaged: {compressed} pinned table(s) compressed")
         yield con
     finally:
         close_benchmark_db(con, args.pin)
@@ -603,9 +647,10 @@ def write_summary(run_dir, args, streams, power, throughput, qphh):
     out = lines.append
     out("=" * 72)
     predicates = "qgen" if args.vary_predicates else "fixed"
+    pin_label = args.pin + ("+simpatico" if args.pin_compression else "")
     out(
         f"  TPC-H Power / Throughput — Sirius   "
-        f"(SF{args.sf:g}, pin={args.pin}, predicates={predicates})"
+        f"(SF{args.sf:g}, pin={pin_label}, predicates={predicates})"
     )
     out("=" * 72)
     if power:
@@ -686,6 +731,9 @@ def write_run_info(run_dir, args, streams):
         f"sf: {args.sf:g}",
         f"streams: {streams}",
         f"pin: {args.pin}",
+        f"pin_compression: {args.pin_compression}",
+        f"compression_plan_dir: "
+        f"{args.compression_plan_dir if args.pin_compression else '(off)'}",
         f"mode: {args.mode}",
         f"vary_predicates: {args.vary_predicates}",
         f"query_dir: {args.query_dir if args.vary_predicates else '(fixed)'}",
@@ -739,6 +787,21 @@ def parse_args():
         default="gpu",
         help="Cache tier for the 8 TPC-H tables. 'none' disables pinning, which "
         "also disables GPU serving of refreshed tables (debug only).",
+    )
+    p.add_argument(
+        "--pin-compression",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Compress the pinned tables with Simpatico; needs a pinned tier "
+        "and per-table plan files (--compression-plan-dir)",
+    )
+    p.add_argument(
+        "--compression-plan-dir",
+        type=str,
+        default=None,
+        help="Directory of per-table Simpatico plan files (<table>.<ext>) for "
+        "--pin-compression (default: the SF1000 plans under "
+        "src/compression/simpatico_codegen/plans)",
     )
     p.add_argument(
         "--vary-predicates",
@@ -815,6 +878,31 @@ def main():
     if args.validation is None:
         args.validation = not args.vary_predicates
 
+    # Simpatico compression happens at pin time, so it needs a pinned tier, and
+    # it is a no-op without at least one plan file naming a TPC-H table.
+    compression_tables = []
+    if args.pin_compression:
+        if args.pin == "none":
+            raise SystemExit("--pin-compression needs a pinned tier (--pin gpu|host)")
+        if args.compression_plan_dir is None:
+            args.compression_plan_dir = os.path.join(
+                REPO_ROOT, "src/compression/simpatico_codegen/plans/tpch_sf1000"
+            )
+        args.compression_plan_dir = os.path.abspath(args.compression_plan_dir)
+        if not os.path.isdir(args.compression_plan_dir):
+            raise SystemExit(
+                f"--compression-plan-dir not found: {args.compression_plan_dir}"
+            )
+        plan_stems = {
+            os.path.splitext(f)[0] for f in os.listdir(args.compression_plan_dir)
+        }
+        compression_tables = sorted(t for t in TPCH_TABLES if t in plan_stems)
+        if not compression_tables:
+            raise SystemExit(
+                f"No plan file in {args.compression_plan_dir} names a TPC-H "
+                "table; plan files are <table>.<ext>"
+            )
+
     # Fail fast if any needed refresh set or query stream is missing.
     needed = []
     if args.mode in ("power", "both"):
@@ -860,6 +948,11 @@ def main():
     log(f"Predicates:    {'qgen per stream' if args.vary_predicates else 'fixed'}")
     if args.vary_predicates:
         log(f"Query dir:     {args.query_dir}")
+    if args.pin_compression:
+        log(
+            f"Compression:   simpatico ({len(compression_tables)} table plans: "
+            f"{', '.join(compression_tables)})"
+        )
 
     power = throughput = None
     with open(os.path.join(run_dir, "timings.csv"), "w", newline="") as f:
@@ -889,6 +982,10 @@ def main():
         "sf": args.sf,
         "streams": streams,
         "pin": args.pin,
+        "pin_compression": args.pin_compression,
+        "compression_plan_dir": (
+            args.compression_plan_dir if args.pin_compression else None
+        ),
         "vary_predicates": args.vary_predicates,
         "query_dir": args.query_dir if args.vary_predicates else None,
         "input": args.input,

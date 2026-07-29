@@ -144,6 +144,7 @@ pixi run python test/tpch_performance/performance_test.py \
 - `--iterations <N>` (default `1`) and `--queries 1,3,6-10` (default: all 22).
 - `--mode {grouped,sequential,isolated,nsys-profile}` (default `grouped`) — `grouped` is hot-cache; `isolated` is true cold-start (needs the sudo setup below); `nsys-profile` is GPU-only and owned by the `profile-analyzer` skill.
 - `--pin {none,gpu,host}` (default `none`) — Sirius cache pre-load tier; rejected with `--engine cpu`.
+- `--pin-compression` (default off) — Simpatico-compressed pins; requires `--pin gpu|host`. Plan dir via `--compression-plan-dir` (defaults to the shipped `plans/tpch_sf1000`).
 - `--validation` — byte-compare GPU vs CPU results after timing (`abs_tol=1e-10` on floats); requires `--engine both`.
 - `--name <NAME>` — label the output subdir instead of the default `tpch_<ts>_<mode>_<engine>_iter<N>`.
 
@@ -238,7 +239,9 @@ pixi run python test/tpch_performance/tpch_power_throughput.py \
 
 **Flags** (full reference in `test/tpch_performance/CLAUDE.md`): `--mode power|throughput|both`
 (default `both`), `--streams N` (default: spec minimum for SF — SF1→2, SF10→3, SF30→4, SF100→5),
-`--pin gpu|host` (always one of these), `--vary-predicates/--no-vary-predicates` (default fixed;
+`--pin gpu|host` (always one of these), `--pin-compression/--no-pin-compression`
+(Simpatico-compressed pins; plan dir defaults to the shipped TPC-H plans),
+`--compression-plan-dir <dir>`, `--vary-predicates/--no-vary-predicates` (default fixed;
 varied runs per-stream qgen parameters and rejects `--validation`), `--query-dir <dir>`,
 `--validation/--no-validation` (fixed predicates only, default on; the power run diffs GPU vs a
 same-process DuckDB CPU cursor after RF1 and after RF2), `--baseline-pass/--no-baseline-pass`
@@ -318,9 +321,14 @@ option) and ask for the rest. Mark sensible defaults "(Recommended)".
 3. **Pin tier** (`--pin`): `gpu` or `host`. This run is always pinned; the only choice is the
    tier. Prefer `host` at large SF, since pinning all 8 tables to GPU can OOM and disk spill is
    off by default.
-4. **Streams** (`--streams`): throughput query-stream count (default: TPC-H spec minimum for the
+4. **Pin compression** (`--pin-compression`): off (Recommended) or Simpatico-compressed pins.
+   Compression happens at pin time, so it needs the pinned tier from the previous question. The
+   plan dir (`--compression-plan-dir`) defaults to the shipped
+   `src/compression/simpatico_codegen/plans/tpch_sf1000` (covers 6 of 8 tables); only ask for a
+   path if the user says they have their own plans.
+5. **Streams** (`--streams`): throughput query-stream count (default: TPC-H spec minimum for the
    SF). Ensure the refresh dir has `streams + 1` sets.
-5. **Validation** (`--validation`): only ask with fixed predicates (default on there): after RF1
+6. **Validation** (`--validation`): only ask with fixed predicates (default on there): after RF1
    and RF2, diff GPU vs a same-process DuckDB CPU cursor. With varied predicates skip the
    question — the runner rejects `--validation` — and tell the user the run is timing-only.
 

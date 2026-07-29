@@ -143,6 +143,8 @@ def setup_benchmark_dir(
         "data_source": data_source,
         "queries": [f"q{q}" for q in queries],
         "pin": pin,
+        "pin_compression": PIN_COMPRESSION_PLAN_DIR is not None,
+        "compression_plan_dir": PIN_COMPRESSION_PLAN_DIR,
         "nsys_profile": nsys_profile,
         "runtime_file": os.path.relpath(runtime_csv, benchmark_dir),
     }
@@ -217,6 +219,10 @@ def resolve_engine_modes(engine):
 
 
 DEFAULT_OUTPUT_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output")
+
+# Set from --pin-compression/--compression-plan-dir in main(); when set, every
+# Sirius connection enables Simpatico compression for its pin_table calls.
+PIN_COMPRESSION_PLAN_DIR = None
 
 
 def drop_os_cache():
@@ -295,6 +301,15 @@ def open_connection(source, gpu_execution=False, data_source="parquet"):
         log(f"Loading Sirius extension from {EXTENSION_PATH}")
         con.execute(f"LOAD '{EXTENSION_PATH}'")
         log("Sirius extension loaded")
+        if PIN_COMPRESSION_PLAN_DIR:
+            log(
+                f"Enabling Simpatico pin compression (plans: {PIN_COMPRESSION_PLAN_DIR})"
+            )
+            con.execute("SET pin_table_compression = true;")
+            con.execute(
+                "SET pin_table_input_compression_plan_dir = "
+                f"'{PIN_COMPRESSION_PLAN_DIR}';"
+            )
     return con
 
 
@@ -536,6 +551,12 @@ def _build_nsys_temp_sql(qnum, source, iterations, pin, qdir, data_source="parqu
     parts.append("INSERT INTO _timings VALUES (1, 'views', current_timestamp);")
 
     if pin != "none":
+        if PIN_COMPRESSION_PLAN_DIR:
+            parts.append("SET pin_table_compression = true;")
+            parts.append(
+                "SET pin_table_input_compression_plan_dir = "
+                f"'{PIN_COMPRESSION_PLAN_DIR}';"
+            )
         parts.append(emit_pin(qnum, source, data_source))
 
     parts.append("SET gpu_execution = true;")
@@ -962,6 +983,25 @@ def parse_args():
         ),
     )
     p.add_argument(
+        "--pin-compression",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Compress the pinned tables with Simpatico; needs --pin gpu|host "
+            "and per-table plan files (--compression-plan-dir)"
+        ),
+    )
+    p.add_argument(
+        "--compression-plan-dir",
+        type=str,
+        default=None,
+        help=(
+            "Directory of per-table Simpatico plan files (<table>.<ext>) for "
+            "--pin-compression (default: the SF1000 plans under "
+            "src/compression/simpatico_codegen/plans)"
+        ),
+    )
+    p.add_argument(
         "--name",
         type=str,
         default=None,
@@ -1016,6 +1056,26 @@ def main():
     if args.pin != "none" and args.engine == "cpu":
         raise SystemExit("--pin is Sirius-only; cannot be combined with --engine cpu")
 
+    # Simpatico compression happens at pin time, so it only applies to pinned
+    # input, and it is a no-op without a plan file naming a TPC-H table.
+    if args.pin_compression:
+        if args.pin == "none":
+            raise SystemExit("--pin-compression needs a pinned tier (--pin gpu|host)")
+        plan_dir = args.compression_plan_dir or os.path.join(
+            REPO_ROOT, "src/compression/simpatico_codegen/plans/tpch_sf1000"
+        )
+        plan_dir = os.path.abspath(plan_dir)
+        if not os.path.isdir(plan_dir):
+            raise SystemExit(f"--compression-plan-dir not found: {plan_dir}")
+        plan_stems = {os.path.splitext(f)[0] for f in os.listdir(plan_dir)}
+        if not any(t in plan_stems for t in TPCH_TABLES):
+            raise SystemExit(
+                f"No plan file in {plan_dir} names a TPC-H table; plan files "
+                "are <table>.<ext>"
+            )
+        global PIN_COMPRESSION_PLAN_DIR
+        PIN_COMPRESSION_PLAN_DIR = plan_dir
+
     if args.validation and args.engine != "both":
         raise SystemExit(
             "--validation requires --engine both (needs both result sets to compare)"
@@ -1066,6 +1126,8 @@ def main():
     log(f"Queries:       {queries}")
     log(f"Config:        {config_path or '(default)'}")
     log(f"Pin:           {args.pin}")
+    if PIN_COMPRESSION_PLAN_DIR:
+        log(f"Compression:   simpatico ({PIN_COMPRESSION_PLAN_DIR})")
     log(f"DuckDB profiling: {args.duckdb_profiling}")
     log(f"nsys-profile:  {nsys_profile}")
     log(f"Benchmark dir: {benchmark_dir}")

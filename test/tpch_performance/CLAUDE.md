@@ -168,6 +168,7 @@ Key flags:
 - `--mode grouped|sequential|isolated|nsys-profile` — `grouped` (default, hot cache), `sequential` (round-robin), `isolated` (fresh connection + drop_os_cache per run; requires passwordless sudo), `nsys-profile` (see below).
 - `--queries 1,3,6-10` — subset selection.
 - `--pin gpu|host|none` — Sirius cache pre-load tier. Both `gpu` and `host` are supported; `host` converts the pinned table into NUMA-local pinned host memory. Any other tier throws `NotImplementedException` at bind time (`src/sirius_extension.cpp:811-813`).
+- `--pin-compression` / `--compression-plan-dir <dir>` — pin the tables Simpatico-compressed (requires `--pin gpu|host`; plan dir defaults to the shipped `plans/tpch_sf1000`). Confirm engagement by grepping the run's logs for `compressing with plan`.
 - `--validation` — byte-compare GPU vs CPU `result.txt` after timing (with `abs_tol=1e-10` on float columns). Requires `--engine both`.
 - `--mode nsys-profile` — wrap each query in `nsys profile` (one DuckDB CLI subprocess per query; the cudaProfilerApi capture range covers the cold + hot iterations). Requires `--engine gpu`; incompatible with `--validation` and `--duckdb-profiling`.
 - `--query-timeout N` — per-query subprocess timeout in nsys-profile mode (default 90s).
@@ -309,6 +310,17 @@ predicates — the runner rejects `--validation`.
 Each query runs as its own `READ ONLY` transaction. q15 is a CTE in the 3.0.1 templates, so no
 query creates a view and nothing is shared between concurrent streams.
 
+`--pin-compression` pins the tables Simpatico-compressed (either tier): the runner sets
+`pin_table_compression` and points `pin_table_input_compression_plan_dir` at
+`--compression-plan-dir`, which defaults to the explore-generated TPC-H plans shipped under
+`src/compression/simpatico_codegen/plans/tpch_sf1000` (6 of 8 tables; `nation`/`region` have no
+plans and pin uncompressed). Compression happens at pin time, so the flag requires a pinned tier.
+A table whose plan is missing or does not cover the pinned columns degrades to uncompressed with
+a `[pin_table]` WARN in the log; the runner counts the `compressing with plan` INFO markers after
+pinning and aborts if nothing compressed, so a misconfigured run cannot silently measure
+uncompressed data. Refreshed rows live in the uncompressed insert delta / delete mask on top of
+the compressed base, which is exactly the recurring cost the post-RF passes measure.
+
 Power@Size is a geometric mean, so one very fast query would otherwise pull it up without bound;
 clause 5.4.1.4 caps the spread at 1000:1, and the runner raises any query time below
 `slowest/1000` to that floor before computing the metric (reported in `summary.txt` and
@@ -406,10 +418,11 @@ pixi run python test/tpch_performance/tpch_power_throughput.py \
 Key flags: `--config <yaml>` (**required** unless `SIRIUS_CONFIG_FILE` is set — the runner refuses
 to start without an explicit config; there is no default path), `--mode power|throughput|both`,
 `--streams N`, `--pin gpu|host|none` (`none` disables pinning and thereby GPU serving of refreshed
-tables — debug only), `--vary-predicates/--no-vary-predicates` (per-stream qgen parameters;
-rejects `--validation`), `--query-dir <dir>`, `--validation/--no-validation` (fixed predicates
-only), `--baseline-pass/--no-baseline-pass`, `--query-timeout <s>`, `--keep-scratch-db`,
-`--output`.
+tables — debug only), `--pin-compression/--no-pin-compression` (Simpatico-compressed pins; needs
+a pinned tier), `--compression-plan-dir <dir>`, `--vary-predicates/--no-vary-predicates`
+(per-stream qgen parameters; rejects `--validation`), `--query-dir <dir>`,
+`--validation/--no-validation` (fixed predicates only), `--baseline-pass/--no-baseline-pass`,
+`--query-timeout <s>`, `--keep-scratch-db`, `--output`.
 
 Output (under `test/tpch_performance/output/tpch_power_<ts>_sf<SF>_s<N>/`): `metrics.json`
 (all metrics + per-query/per-stream times + validation verdicts), `timings.csv`
