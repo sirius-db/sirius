@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "duckdb/common/exception.hpp"
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/operator/logical_filter.hpp"
@@ -91,11 +92,23 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalFilter& op)
       }
     }
 
-    auto filter =
-      duckdb::make_uniq<sirius::op::sirius_physical_filter>(std::move(filter_types),
-                                                            sirius::ast::from_duckdb(*combined),
-                                                            op.estimated_cardinality,
-                                                            std::move(output_indices));
+    // from_duckdb returns null for a predicate it cannot represent, and the
+    // operator dereferences it without checking — undefined behaviour, whatever it
+    // happens to look like on a given build. Refuse the plan so a null can never
+    // reach the operator. A cross-side non-equi predicate is the shape that gets
+    // here: DuckDB can neither make it a join condition nor push it into a scan.
+    //
+    // The guard belongs on this call, not on the translate_expressions below — that
+    // one is fed only by locally synthesized reference expressions.
+    auto predicate = sirius::ast::from_duckdb(*combined);
+    if (predicate == nullptr) {
+      throw duckdb::NotImplementedException("Unsupported filter predicate (falling back to CPU): " +
+                                            combined->ToString());
+    }
+    auto filter = duckdb::make_uniq<sirius::op::sirius_physical_filter>(std::move(filter_types),
+                                                                        std::move(predicate),
+                                                                        op.estimated_cardinality,
+                                                                        std::move(output_indices));
     filter->children.push_back(std::move(plan));
     plan = std::move(filter);
   } else if (op.HasProjectionMap()) {
