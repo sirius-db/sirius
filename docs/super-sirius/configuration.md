@@ -22,7 +22,7 @@ Sirius searches for a config file in this order:
 2. **`./sirius.yaml`** — current working directory
 3. **`~/.sirius/sirius.yaml`** — user's home directory
 
-If no config file is found, Sirius initializes with built-in defaults (95% GPU memory, 8 GB pinned host memory per NUMA node).
+If no config file is found, Sirius initializes with built-in defaults (95% GPU memory, 90% of each NUMA node's RAM as pinned host memory).
 
 ### `SIRIUS_DISABLE`
 
@@ -132,7 +132,8 @@ Controls pinned host memory pools. One pool group is created per NUMA node (auto
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `capacity_bytes` | bytes | 8Gi | Pinned host memory capacity **per NUMA node**. This memory is allocated at startup using `cudaMallocHost`. |
+| `capacity_fraction` | double (0,1] | 0.9 | Pinned host memory capacity as a fraction of **each backing NUMA node's total RAM** (read from `/sys/devices/system/node/node<id>/meminfo`). Mutually exclusive with `capacity_bytes`, which wins if both are set. Initialization fails if a node's capacity cannot be determined. |
+| `capacity_bytes` | bytes | — | Pinned host memory capacity **per NUMA node** as absolute bytes, allocated with `cudaMallocHost`. Mutually exclusive with `capacity_fraction`. |
 | `reservation_limit_fraction` | double | 0.9 | Fraction of host capacity that can be reserved. |
 | `reservation_limit_bytes` | bytes | — | Absolute reservation limit. Mutually exclusive with `reservation_limit_fraction`. |
 | `downgrade_trigger_fraction` | double | 1.0 | Start evicting host-resident data to disk when reserved memory exceeds this fraction. At the default of 1.0 host→disk eviction is off, matching the empty `downgrade_root_dirs`. |

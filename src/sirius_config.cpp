@@ -297,7 +297,8 @@ struct gpu_mem_config {
 };
 
 struct host_mem_config {
-  std::uint64_t numa_region_capacity_bytes = 8UL << 30;  // 8GB per NUMA node
+  // fraction of each backing NUMA node's total RAM, or absolute bytes per NUMA node
+  std::variant<double, std::uint64_t> capacity{0.9};
   std::variant<double, std::uint64_t> reservation_limit{0.9};
   // trigger == stop == 1.0 keeps host->disk eviction off by default, matching the empty
   // downgrade_root_dirs default (no spill target). Set both below 1.0 to enable it.
@@ -310,7 +311,20 @@ struct host_mem_config {
   static void from_yaml(const YAML::Node& node, host_mem_config& opt)
   {
     yaml::reader r(node, "memory.host");
-    r.optional("capacity_bytes", yaml::bytes(opt.numa_region_capacity_bytes));
+    // capacity: fraction of node RAM (double) or absolute bytes per node — mutually exclusive keys
+    std::optional<std::uint64_t> cap_bytes;
+    std::optional<double> cap_frac;
+    r.optional("capacity_bytes", yaml::bytes(cap_bytes));
+    r.optional("capacity_fraction", cap_frac);
+    if (cap_frac && !(*cap_frac > 0.0 && *cap_frac <= 1.0)) {
+      throw std::runtime_error("memory.host.capacity_fraction: must be in (0.0, 1.0], got " +
+                               std::to_string(*cap_frac));
+    }
+    if (cap_bytes) {
+      opt.capacity = *cap_bytes;
+    } else if (cap_frac) {
+      opt.capacity = *cap_frac;
+    }
     std::optional<std::uint64_t> res_bytes;
     double res_frac = 0.9;
     r.optional("reservation_limit_bytes", yaml::bytes(res_bytes));
@@ -340,7 +354,11 @@ struct host_mem_config {
       builder.set_reservation_limit_per_host(std::get<std::uint64_t>(reservation_limit));
     }
     builder.set_downgrade_fractions_per_host(downgrade_trigger_fraction, downgrade_stop_fraction);
-    builder.set_per_host_capacity(numa_region_capacity_bytes);
+    if (std::holds_alternative<double>(capacity)) {
+      builder.set_usage_limit_ratio_per_host(std::get<double>(capacity));
+    } else {
+      builder.set_per_host_capacity(std::get<std::uint64_t>(capacity));
+    }
     // NOTE on argument order: cucascade's set_host_pool_features has confusingly-named
     // parameters (chunk_size, block_size, initial_block_count) that it internally remaps onto
     // host_memory_space_config::{block_size, pool_size, initial_number_pools} (see
