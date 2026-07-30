@@ -478,8 +478,14 @@ int run_shard(unsigned shard_idx, unsigned n_shards)
       }
     };
     must_apply("string", {"dictionary", "str_split"});
-    must_apply("i16", {"delta", "rle", "for", "zigzag", "bitpack"});
-    must_apply("u16", {"delta", "rle", "for", "zigzag", "bitpack"});
+    must_apply("i16", {"delta", "rle", "for", "zigzag", "bitpack", "ans", "bitcomp"});
+    must_apply("u16", {"delta", "rle", "for", "zigzag", "bitpack", "ans", "bitcomp"});
+    must_apply("i32", {"delta", "rle", "for", "zigzag", "bitpack", "ans", "bitcomp"});
+    must_apply("u32", {"delta", "rle", "for", "zigzag", "bitpack", "ans", "bitcomp"});
+    must_apply("i64", {"delta", "rle", "for", "zigzag", "bitpack", "ans", "bitcomp"});
+    must_apply("u64", {"delta", "rle", "for", "zigzag", "bitpack", "ans", "bitcomp"});
+    must_apply("f32", {"alp", "alp_rd", "for", "bitpack"});
+    must_apply("f64", {"alp", "alp_rd", "for", "bitpack"});
     must_apply("u8_binary", {"delta", "rle", "for", "zigzag", "bitpack"});
     must_apply("date", {"delta", "rle", "for", "zigzag", "bitpack", "ans", "bitcomp"});
   }
