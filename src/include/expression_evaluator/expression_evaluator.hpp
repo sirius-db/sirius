@@ -426,7 +426,7 @@ class expression_evaluator {
   // Returns the narrowed input carrier when @p column_operand is a reference whose materialized
   // carrier is a strict narrowing of its declared native type AND every entry of @p
   // constant_operands is a constant exactly representable in that carrier (typed NULLs always are).
-  // Returns nullopt otherwise.
+  // Returns `std::nullopt` otherwise.
   [[nodiscard]] std::optional<cudf::data_type> narrow_domain_carrier(
     sirius::ast::node const& column_operand,
     std::initializer_list<sirius::ast::node const*> constant_operands) const;

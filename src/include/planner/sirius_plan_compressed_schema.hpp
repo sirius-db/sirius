@@ -82,8 +82,8 @@ void install_physical_schema(sirius::op::sirius_physical_operator& op,
  * operator, or survival to the plan root — costs a restoration, so the column's sidecar entry flips
  * back to native and its pinned-narrow chunks instead widen once per batch during scan
  * normalization. A column with no uses at all stays narrow. Host-tier-backed and sidecar-less scans
- * are not visited because their narrow carriers reduce the host-to-GPU upload. Returns the number of
- * retracted targets.
+ * are not visited because their narrow carriers reduce the host-to-GPU upload. Returns the number
+ * of retracted targets.
  */
 std::size_t apply_tier_narrowing_policy(sirius::op::sirius_physical_operator& plan);
 

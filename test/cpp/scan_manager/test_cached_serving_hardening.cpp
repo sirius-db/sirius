@@ -120,8 +120,8 @@ using sirius::pinned_column_storage_meta;
 pinned_column_storage_meta narrow_meta(cudf::data_type carrier) { return {carrier, true}; }
 pinned_column_storage_meta native_meta(cudf::data_type carrier) { return {carrier, false}; }
 
-/// Storage-metadata row of same-carrier cells with the given narrowed flags — the common shape of
-/// hand-built fixtures whose stored columns share one type.
+// Storage-metadata row of same-carrier cells with the given narrowed flags — the common shape of
+// hand-built fixtures whose stored columns share one type.
 std::vector<pinned_column_storage_meta> meta_row(cudf::data_type carrier,
                                                  std::initializer_list<bool> narrowed)
 {
@@ -133,9 +133,9 @@ std::vector<pinned_column_storage_meta> meta_row(cudf::data_type carrier,
   return row;
 }
 
-/// Storage-metadata row of per-column carriers, all marked narrowed. The serve-site conversion
-/// decision reads carriers against the scan's plan targets, never the markers, so these fixtures
-/// vary the carrier and leave the flag constant.
+// Storage-metadata row of per-column carriers, all marked narrowed. The serve-site conversion
+// decision reads carriers against the scan's plan targets, never the markers, so these fixtures
+// vary the carrier and leave the flag constant.
 std::vector<pinned_column_storage_meta> carrier_row(std::initializer_list<cudf::data_type> carriers)
 {
   std::vector<pinned_column_storage_meta> row;
@@ -146,8 +146,8 @@ std::vector<pinned_column_storage_meta> carrier_row(std::initializer_list<cudf::
   return row;
 }
 
-/// The scan's carrier targets in output order. Served slot k is output column k, so a slot at or
-/// past the end of this list is a trailing pure-filter column that reaches no target.
+// The scan's carrier targets in output order. Served slot k is output column k, so a slot at or
+// past the end of this list is a trailing pure-filter column that reaches no target.
 std::vector<cudf::data_type> targets(std::initializer_list<cudf::data_type> in_output_order)
 {
   return {in_output_order};
@@ -170,8 +170,8 @@ std::shared_ptr<cudf::column> make_gpu_column(cucascade::memory::memory_space& s
   return std::shared_ptr<cudf::column>(std::move(col));
 }
 
-/// Zero-initialized numeric GPU column of an arbitrary carrier type — the serve-site
-/// restore-destination computation reads only types, row counts, and mask presence.
+// Zero-initialized numeric GPU column of an arbitrary carrier type — the serve-site
+// restore-destination computation reads only types, row counts, and mask presence.
 std::shared_ptr<cudf::column> make_typed_gpu_column(cucascade::memory::memory_space& space,
                                                     cudf::data_type type,
                                                     std::size_t rows,
@@ -184,8 +184,8 @@ std::shared_ptr<cudf::column> make_typed_gpu_column(cucascade::memory::memory_sp
   return std::shared_ptr<cudf::column>(std::move(col));
 }
 
-/// Name the entry's cached columns, filling the column_ids and names lists insertion keeps
-/// lock-step so a fixture is indexable in either space.
+// Name the entry's cached columns, filling the column_ids and names lists insertion keeps
+// lock-step so a fixture is indexable in either space.
 void set_cached_columns(pinned_entry& entry, std::vector<std::string> names)
 {
   for (std::size_t i = 0; i < names.size(); ++i) {
@@ -794,9 +794,9 @@ TEST_CASE("pinned_column_narrow_carrier derives the widest recorded carrier per 
   auto const int16{cudf::data_type{cudf::type_id::INT16}};
   auto const int8{cudf::data_type{cudf::type_id::INT8}};
 
-  /// Single-column entry whose chunk c records @p carriers[c], all marked narrowed so the
-  /// derivation (not the marker fold) is what each section probes. The fold reads only the
-  /// recorded metadata, so the fixture carries no storage at all.
+  // Single-column entry whose chunk c records @p carriers[c], all marked narrowed so the
+  // derivation (not the marker fold) is what each section probes. The fold reads only the
+  // recorded metadata, so the fixture carries no storage at all.
   auto make_single_column_meta_entry = [](std::vector<cudf::data_type> const& carriers) {
     pinned_entry entry;
     set_cached_columns(entry, {"k"});

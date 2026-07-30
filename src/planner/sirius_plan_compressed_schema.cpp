@@ -129,10 +129,10 @@ void install_physical_schema(sirius::op::sirius_physical_operator& op,
   op.set_physical_types(schema == native ? std::vector<cudf::data_type>{} : std::move(schema));
 }
 
-/// Wrap @p slot in a projection that casts every column selected by @p should_restore whose
-/// carrier differs from native back to its logical type, forwarding all other columns as bare
-/// references. The projection's output sidecar keeps the unselected columns' carriers (an
-/// all-native result normalizes to the empty sidecar); a no-op when no selected column differs.
+// Wrap @p slot in a projection that casts every column selected by @p should_restore whose
+// carrier differs from native back to its logical type, forwarding all other columns as bare
+// references. The projection's output sidecar keeps the unselected columns' carriers (an
+// all-native result normalizes to the empty sidecar); a no-op when no selected column differs.
 template <typename ShouldRestore>
 void restore_columns_matching(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot,
                               ShouldRestore const& should_restore)
@@ -191,9 +191,9 @@ void restore_native_output_in_place(duckdb::unique_ptr<sirius::op::sirius_physic
   slot->set_physical_types({});
 }
 
-/// Derive @p op 's output sidecar from @p child_schema: a bare-reference output forwards the
-/// referenced child carrier, every other output keeps its native carrier. Callers guarantee the
-/// projection's select_list arity matches its native output schema.
+// Derive @p op 's output sidecar from @p child_schema: a bare-reference output forwards the
+// referenced child carrier, every other output keeps its native carrier. Callers guarantee the
+// projection's select_list arity matches its native output schema.
 void derive_projection_sidecar(sirius::op::sirius_physical_operator& op,
                                std::vector<cudf::data_type> const& child_schema,
                                std::vector<cudf::data_type> const& native)
@@ -216,9 +216,9 @@ void derive_projection_sidecar(sirius::op::sirius_physical_operator& op,
   derive_projection_sidecar(op, child_schema, native);
 }
 
-/// Return whether @p op is a projection consisting solely of bare column references. Such a
-/// projection forwards column views without materializing a batch, so a narrow carrier crossing
-/// it saves no bandwidth.
+// Return whether @p op is a projection consisting solely of bare column references. Such a
+// projection forwards column views without materializing a batch, so a narrow carrier crossing
+// it saves no bandwidth.
 bool is_pure_reference_projection(sirius::op::sirius_physical_operator const& op)
 {
   if (op.type != sirius::op::SiriusPhysicalOperatorType::PROJECTION) { return false; }

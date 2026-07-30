@@ -151,8 +151,8 @@ void validate_duckdb_pin_chunk(const op::scan::scan_info& batch,
 namespace {
 
 /// Per-materialized-batch sink: receives one GPU-resident table, its GPU placement, the
-/// stream it was decoded on, the chunk's stored-column metadata, and the chunk's zone-map
-/// capture (empty when capture is off).
+// stream it was decoded on, the chunk's stored-column metadata, and the chunk's zone-map
+// capture (empty when capture is off).
 /// The driver does NOT synchronize — the sink owns the sync, because the host-streaming path
 /// must synchronize while the GPU table (and the gpu_table_representation wrapping it) is
 /// still alive, after the D2H conversion has been enqueued on the same stream.
@@ -319,12 +319,12 @@ void materialize_pin_batches(op::scan::gpu_ingestible& ingestible,
   }
 }
 
-/// Diagnostic for a compression failure inside a pin sink, shared by both drivers. Reports the real
-/// blast radius -- the sink latches compression off for every remaining chunk of the pin, not just
-/// the chunk that failed -- and, when this chunk narrowed carriers before compression, names the
-/// narrowed columns: a plan block with a width-explicit op (@c bitextract / @c bitjoin packs a
-/// fixed total field width) is authored against the native element width and cannot encode a
-/// narrowed column, which is the one failure mode narrowing itself can cause.
+// Diagnostic for a compression failure inside a pin sink, shared by both drivers. Reports the real
+// blast radius: the sink latches compression off for every remaining chunk of the pin, not only the
+// failed chunk. When that chunk narrowed carriers before compression, the diagnostic names those
+// columns: a plan block with a width-explicit op (@c bitextract / @c bitjoin packs a fixed total
+// field width) is authored against the native element width and cannot encode a narrowed column,
+// which is the one failure mode narrowing itself can cause.
 std::string compression_failure_warning(std::string_view what,
                                         compression_pin_config const& compression,
                                         std::span<pinned_column_storage_meta const> chunk_storage)

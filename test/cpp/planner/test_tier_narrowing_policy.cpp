@@ -94,7 +94,7 @@ std::unique_ptr<sirius::ast::node> make_integer_constant(int32_t value)
     sirius::ast::constant{sirius::value{value}, integer_type()});
 }
 
-/// A DECIMAL(18, @p scale) literal with unscaled value @p unscaled.
+// A DECIMAL(18, @p scale) literal with unscaled value @p unscaled.
 std::unique_ptr<sirius::ast::node> make_decimal_constant(int64_t unscaled, uint8_t scale)
 {
   return std::make_unique<sirius::ast::node>(
@@ -130,8 +130,8 @@ std::unique_ptr<sirius::ast::node> make_add(std::unique_ptr<sirius::ast::node> l
     sirius::ast::function_call{sirius::function_id::add, std::move(arguments), integer_type()});
 }
 
-/// A TABLE_SCAN leaf over @p types with @p physical installed as its sidecar and the GPU-tier
-/// backing flag set per @p gpu_tier_pin (an identity output mapping throughout).
+// A TABLE_SCAN leaf over @p types with @p physical installed as its sidecar and the GPU-tier
+// backing flag set per @p gpu_tier_pin (an identity output mapping throughout).
 duckdb::unique_ptr<sirius::op::sirius_physical_table_scan> make_scan(
   duckdb::vector<sirius::logical_type> types,
   std::vector<cudf::data_type> physical,
@@ -172,7 +172,7 @@ duckdb::unique_ptr<sirius::op::sirius_physical_table_scan> make_integer_scan(
   return make_scan(integer_types(column_count), std::move(physical), gpu_tier_pin);
 }
 
-/// A passthrough filter over @p child evaluating @p predicate.
+// A passthrough filter over @p child evaluating @p predicate.
 duckdb::unique_ptr<sirius::op::sirius_physical_filter> make_filter(
   std::unique_ptr<sirius::ast::node> predicate, duckdb::unique_ptr<sirius_physical_operator> child)
 {
@@ -193,7 +193,7 @@ duckdb::unique_ptr<sirius::op::sirius_physical_projection> make_projection(
   return projection;
 }
 
-/// A hash join on column 0 of both inputs with identity output maps over each side.
+// A hash join on column 0 of both inputs with identity output maps over each side.
 duckdb::unique_ptr<sirius::op::sirius_physical_hash_join> make_hash_join(
   duckdb::JoinType join_type,
   duckdb::unique_ptr<sirius_physical_operator> left,
@@ -225,8 +225,8 @@ std::unique_ptr<sirius::ast::node> make_aggregate_expression(uint32_t input_idx,
     function, std::move(arguments), sirius::logical_type::make(sirius::type_id::BIGINT), distinct});
 }
 
-/// A HASH_GROUP_BY over @p child grouping on @p group_columns with one @p function per entry of
-/// @p aggregate_input_columns; output layout is [keys..., aggregates...].
+// A HASH_GROUP_BY over @p child grouping on @p group_columns with one @p function per entry of
+// @p aggregate_input_columns; output layout is [keys..., aggregates...].
 duckdb::unique_ptr<sirius::op::sirius_physical_grouped_aggregate> make_grouped_aggregate(
   std::vector<uint32_t> group_columns,
   std::vector<uint32_t> aggregate_input_columns,
@@ -259,9 +259,9 @@ duckdb::unique_ptr<sirius::op::sirius_physical_grouped_aggregate> make_grouped_a
   return aggregate;
 }
 
-/// The Q1 shape: scan(c0..c2 narrow, c3 native) -> filter(constant comparison on the
-/// non-narrowed c3) -> projection [c0 + c1, bare c2, bare c3] -> AVG-bearing aggregate grouped on
-/// the c3 forward. c0/c1 are evaluator restores, c2 dies at the ineligible aggregate's boundary.
+// The Q1 shape: scan(c0..c2 narrow, c3 native) -> filter(constant comparison on the
+// non-narrowed c3) -> projection [c0 + c1, bare c2, bare c3] -> AVG-bearing aggregate grouped on
+// the c3 forward. c0/c1 are evaluator restores, c2 dies at the ineligible aggregate's boundary.
 duckdb::unique_ptr<sirius_physical_operator> build_q1_plan(bool gpu_tier_pin)
 {
   auto scan = make_integer_scan(4, {k_int8, k_int8, k_int8, k_int32}, gpu_tier_pin);
@@ -282,8 +282,8 @@ sirius_physical_operator& q1_scan(sirius_physical_operator& plan)
   return scan;
 }
 
-/// Assert @p subject and @p reference are structurally identical: same operator types, logical
-/// schemas, child arity, sidecar presence, and (for projections) the same select-list node kinds.
+// Assert @p subject and @p reference are structurally identical: same operator types, logical
+// schemas, child arity, sidecar presence, and (for projections) the same select-list node kinds.
 void require_same_structure(sirius_physical_operator const& subject,
                             sirius_physical_operator const& reference)
 {

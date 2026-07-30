@@ -36,8 +36,8 @@ bool fits(__int128_t minimum, __int128_t maximum)
          maximum <= static_cast<__int128_t>(std::numeric_limits<T>::max());
 }
 
-/// True when @p source and @p target are supported numeric carriers in the same family: integral
-/// carriers preserving signedness, or fixed-point carriers preserving their cuDF scale.
+// True when @p source and @p target are supported numeric carriers in the same family: integral
+// carriers preserving signedness, or fixed-point carriers preserving their cuDF scale.
 bool same_numeric_carrier_family(cudf::data_type source, cudf::data_type target)
 {
   if (cudf::is_integral_not_bool(source) && cudf::is_integral_not_bool(target)) {

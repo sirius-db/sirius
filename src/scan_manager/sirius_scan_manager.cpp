@@ -79,10 +79,10 @@ namespace {
 using sirius::pinned_column_storage_matrix;
 using sirius::pinned_column_storage_meta;
 
-/// Actual cuDF carrier of one column of an uncompressed pinned host chunk, rebuilt from the
-/// chunk's host column metadata. Keyed on the DECIMAL type ids, not on a nonzero scale: a
-/// DECIMAL(p,0) column has cudf scale 0 and must still take the two-argument fixed-point
-/// constructor.
+// Actual cuDF carrier of one column of an uncompressed pinned host chunk, rebuilt from the
+// chunk's host column metadata. Keyed on the DECIMAL type ids, not on a nonzero scale: a
+// DECIMAL(p,0) column has cuDF scale 0 and must still take the two-argument fixed-point
+// constructor.
 cudf::data_type host_column_carrier(cucascade::memory::column_metadata const& meta)
 {
   auto const id         = static_cast<cudf::type_id>(meta.type_id);
@@ -222,8 +222,8 @@ struct cached_databatch_provider : public databatch_provider {
       telemetry::quent_data_batch_probe::create(_telemetry_info, batch_id));
   }
 
-  /// True when scan normalization will cast @p carrier -- a recorded stored carrier -- to
-  /// @p target: the same predicate normalize_physical_schema applies per column.
+  // True when scan normalization will cast the recorded stored @p carrier to @p target: the same
+  // predicate normalize_physical_schema applies per column.
   [[nodiscard]] bool will_convert(cudf::data_type carrier, cudf::data_type target) const
   {
     if (carrier == target) { return false; }
@@ -231,9 +231,9 @@ struct cached_databatch_provider : public databatch_provider {
            (_has_physical_overrides && sirius::can_narrow_to(carrier, target));
   }
 
-  /// The plan carrier scan normalization holds selected slot @p sel to, or nullopt when the
-  /// column reaches no normalization target: a pure-filter column, which both ingestibles
-  /// materialize after every output column, or a scan that normalizes nothing.
+  // The plan carrier scan normalization holds selected slot @p sel to, or `std::nullopt` when the
+  // column reaches no normalization target: a pure-filter column, which both ingestibles
+  // materialize after every output column, or a scan that normalizes nothing.
   [[nodiscard]] std::optional<cudf::data_type> target_for(std::size_t sel) const
   {
     return sel < _normalization_targets.size()
@@ -241,9 +241,9 @@ struct cached_databatch_provider : public databatch_provider {
              : std::nullopt;
   }
 
-  /// True when any selected column of chunk @p index converts. Decided from types alone, so a
-  /// chunk whose row count is unreadable still reports the conversion and the caller keeps its
-  /// conservative bound.
+  // True when any selected column of chunk @p index converts. Decided from types alone, so a
+  // chunk whose row count is unreadable still reports the conversion and the caller keeps its
+  // conservative bound.
   [[nodiscard]] bool chunk_needs_carrier_conversion(std::size_t index) const
   {
     auto const& matrix = _entry.column_storage;
@@ -334,12 +334,12 @@ struct cached_databatch_provider : public databatch_provider {
   /// This operator's insert-delta splits, yielded after the resident chunks
   /// (staging and mask words shared with sibling operators' cuts).
   std::vector<insert_delta_split> _delta_splits;
-  /// The scan's carrier targets in output order, which is also the order the served columns
-  /// arrive in (see the note at the make_provider_for_pinned_entry call site). Shorter than the
-  /// served column list exactly when the scan materializes trailing pure-filter columns.
+  // The scan's carrier targets in output order, which is also the order the served columns
+  // arrive in (see the note at the make_provider_for_pinned_entry call site). Shorter than the
+  // served column list exactly when the scan materializes trailing pure-filter columns.
   std::vector<cudf::data_type> _normalization_targets;
-  /// Whether the scan carries an explicit plan sidecar. Normalization narrows a stored carrier
-  /// only with one installed, so it belongs in the conversion predicate.
+  // Whether the scan carries an explicit plan sidecar. Normalization narrows a stored carrier
+  // only with one installed, so it belongs in the conversion predicate.
   bool _has_physical_overrides{false};
   std::atomic<std::size_t> _index{0};
 };

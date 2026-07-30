@@ -120,11 +120,11 @@ constexpr char const* kOuterJoinQuery =
   "SELECT SUM(t.v) AS sv, SUM(t.d) AS sd, COUNT(dm.x) AS cx FROM t FULL OUTER JOIN dm ON t.k = "
   "dm.k;";
 
-/// Outer joins whose g side yields no row. Aggregated so the result comparison stays cheap while
-/// the join still materializes every surviving row; the counts cover the NULL padding the join
-/// emits for the side that contributed nothing. The last query keys the join on IS NOT DISTINCT
-/// FROM, so the null-safe comparison runs over the same narrow payload carriers as the plain
-/// equality forms.
+// Outer joins whose g side yields no row. Aggregated so the result comparison stays cheap while
+// the join still materializes every surviving row; the counts cover the NULL padding the join
+// emits for the side that contributed nothing. The last query keys the join on IS NOT DISTINCT
+// FROM, so the null-safe comparison runs over the same narrow payload carriers as the plain
+// equality forms.
 std::vector<std::string> runtime_empty_side_queries()
 {
   std::string const dead = "(SELECT * FROM g WHERE k = " + std::to_string(kGapUnmatchedKey) + ")";
@@ -167,9 +167,9 @@ void generate_dim_parquet(fs::path const& path)
     10240);
 }
 
-/// Build the Sirius physical plan for @p query exactly as the transparent path does
-/// (parse/plan/optimize with the production-disabled optimizers, then
-/// sirius_physical_plan_generator::create_plan). Restores the optimizer settings on exit.
+// Build the Sirius physical plan for @p query exactly as the transparent path does
+// (parse/plan/optimize with the production-disabled optimizers, then
+// sirius_physical_plan_generator::create_plan). Restores the optimizer settings on exit.
 duckdb::unique_ptr<sirius_physical_operator> build_sirius_plan(duckdb::Connection& con,
                                                                std::string const& query)
 {

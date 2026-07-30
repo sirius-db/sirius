@@ -48,9 +48,9 @@ struct node;
  * @brief Host-exact value of a numeric constant as a degenerate [v, v] range.
  *
  * Returns `std::nullopt` when the constant is not a supported narrowable-domain literal or its
- * payload alternative disagrees with its declared logical type. Typed NULLs return `std::nullopt` here;
- * `constant_representable_in_carrier` treats them as representable in any carrier because only
- * their validity bit is materialized.
+ * payload alternative disagrees with its declared logical type. Typed NULLs return `std::nullopt`
+ * here; `constant_representable_in_carrier` treats them as representable in any carrier because
+ * only their validity bit is materialized.
  */
 [[nodiscard]] std::optional<sirius::numeric_range> constant_numeric_range(constant const& expr);
 

@@ -263,8 +263,8 @@ void validate_column_storage_shape(sirius::pinned_column_storage_matrix const& m
 /// report one. @p stored_type answers (chunk, column) with the stored column's cuDF type, or
 /// `std::nullopt` when the form is opaque — a Simpatico-compressed chunk, whose recorded carrier is
 /// correct by construction (the pin driver recorded exactly what compress_with_plan received) and
-/// whose end-to-end defense is serve-time normalization. Also `std::nullopt` for a chunk or column the
-/// storage does not hold, which the cross-check simply skips. Throws std::invalid_argument.
+/// whose end-to-end defense is serve-time normalization. Also `std::nullopt` for a chunk or column
+/// the storage does not hold, which the cross-check simply skips. Throws std::invalid_argument.
 template <std::invocable<std::size_t, std::size_t> StoredType>
   requires std::same_as<std::invoke_result_t<StoredType, std::size_t, std::size_t>,
                         std::optional<cudf::data_type>>

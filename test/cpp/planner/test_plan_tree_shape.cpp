@@ -578,8 +578,8 @@ std::unique_ptr<sirius::ast::node> wrap_reference(uint32_t column_index)
     sirius::ast::reference{column_index, wrap_integer_type()});
 }
 
-/// A childless pure-reference PROJECTION leaf over @p column_count INTEGER columns, carrying
-/// @p physical as its sidecar (empty for native).
+// A childless pure-reference PROJECTION leaf over @p column_count INTEGER columns, carrying
+// @p physical as its sidecar (empty for native).
 duckdb::unique_ptr<sirius_physical_operator> make_projection_leaf(
   std::size_t column_count, std::vector<cudf::data_type> physical = {})
 {
@@ -593,7 +593,7 @@ duckdb::unique_ptr<sirius_physical_operator> make_projection_leaf(
   return projection;
 }
 
-/// An INNER hash join on column 0 of both sides with a 4-column INTEGER output.
+// An INNER hash join on column 0 of both sides with a 4-column INTEGER output.
 duckdb::unique_ptr<sirius_physical_operator> make_wrap_hash_join(
   duckdb::unique_ptr<sirius_physical_operator> left,
   duckdb::unique_ptr<sirius_physical_operator> right)
@@ -616,7 +616,7 @@ duckdb::unique_ptr<sirius_physical_operator> make_wrap_hash_join(
                                                                   /*estimated_cardinality=*/1);
 }
 
-/// A HASH_GROUP_BY grouping on column 0 with SUM(column 1): output [INTEGER key, BIGINT sum].
+// A HASH_GROUP_BY grouping on column 0 with SUM(column 1): output [INTEGER key, BIGINT sum].
 duckdb::unique_ptr<sirius::op::sirius_physical_grouped_aggregate> make_wrap_grouped_aggregate(
   duckdb::unique_ptr<sirius_physical_operator> child)
 {
@@ -642,8 +642,8 @@ duckdb::unique_ptr<sirius::op::sirius_physical_grouped_aggregate> make_wrap_grou
   return aggregate;
 }
 
-/// Assert `op` is the CONCAT -> PARTITION join-child wrap and both wrappers carry @p expected
-/// (empty = sidecar-free). Returns the original wrapped child.
+// Assert `op` is the CONCAT -> PARTITION join-child wrap and both wrappers carry @p expected
+// (empty = sidecar-free). Returns the original wrapped child.
 sirius_physical_operator* require_wrap_sidecars(sirius_physical_operator* op,
                                                 std::vector<cudf::data_type> const& expected)
 {

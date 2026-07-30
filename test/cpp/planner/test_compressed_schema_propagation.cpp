@@ -86,8 +86,8 @@ std::unique_ptr<sirius::ast::node> make_reference(uint32_t column_index)
   return std::make_unique<sirius::ast::node>(sirius::ast::reference{column_index, integer_type()});
 }
 
-/// A restore cast as the passes emit it: an untyped reference under a cast to the native
-/// logical type.
+// A restore cast as the passes emit it: an untyped reference under a cast to the native
+// logical type.
 std::unique_ptr<sirius::ast::node> make_restore_cast(uint32_t column_index)
 {
   return std::make_unique<sirius::ast::node>(
@@ -96,10 +96,10 @@ std::unique_ptr<sirius::ast::node> make_restore_cast(uint32_t column_index)
                       /*try_cast=*/false});
 }
 
-/// A TABLE_SCAN leaf over INTEGER columns with @p physical installed as its sidecar (one entry
-/// per column, or empty for native). @p projection_ids overrides the identity output mapping:
-/// output i then reads column_ids position projection_ids[i], and column_ids covers enough
-/// positions for the largest one.
+// A TABLE_SCAN leaf over INTEGER columns with @p physical installed as its sidecar (one entry
+// per column, or empty for native). @p projection_ids overrides the identity output mapping:
+// output i then reads column_ids position projection_ids[i], and column_ids covers enough
+// positions for the largest one.
 duckdb::unique_ptr<sirius::op::sirius_physical_table_scan> make_scan(
   std::size_t column_count,
   std::vector<cudf::data_type> physical      = {},
@@ -139,7 +139,7 @@ duckdb::unique_ptr<sirius::op::sirius_physical_table_scan> make_scan(
   return scan;
 }
 
-/// A pure-reference projection forwarding @p input_indices of @p child, in output order.
+// A pure-reference projection forwarding @p input_indices of @p child, in output order.
 duckdb::unique_ptr<sirius::op::sirius_physical_projection> make_pure_reference_projection(
   std::vector<uint32_t> input_indices, duckdb::unique_ptr<sirius_physical_operator> child)
 {
@@ -153,9 +153,9 @@ duckdb::unique_ptr<sirius::op::sirius_physical_projection> make_pure_reference_p
   return projection;
 }
 
-/// A hash join on column 0 of both inputs, with identity output maps over each side (the
-/// convenience constructor derives them from the children's types). @p output_types is the
-/// join's logical output schema for the tested join type.
+// A hash join on column 0 of both inputs, with identity output maps over each side (the
+// convenience constructor derives them from the children's types). @p output_types is the
+// join's logical output schema for the tested join type.
 duckdb::unique_ptr<sirius::op::sirius_physical_hash_join> make_hash_join(
   duckdb::JoinType join_type,
   duckdb::unique_ptr<sirius_physical_operator> left,
@@ -186,7 +186,7 @@ duckdb::vector<duckdb::LogicalType> duckdb_integer_types(std::size_t count)
   return types;
 }
 
-/// An aggregate expression over child column @p input_idx with a BIGINT return type.
+// An aggregate expression over child column @p input_idx with a BIGINT return type.
 std::unique_ptr<sirius::ast::node> make_aggregate(uint32_t input_idx, sirius::aggregate_id function)
 {
   std::vector<std::unique_ptr<sirius::ast::node>> arguments;
@@ -198,8 +198,8 @@ std::unique_ptr<sirius::ast::node> make_aggregate(uint32_t input_idx, sirius::ag
                            /*distinct=*/false});
 }
 
-/// A HASH_GROUP_BY over @p child grouping on @p group_columns with one @p function per entry of
-/// @p aggregate_input_columns; output layout is [keys..., aggregates...].
+// A HASH_GROUP_BY over @p child grouping on @p group_columns with one @p function per entry of
+// @p aggregate_input_columns; output layout is [keys..., aggregates...].
 duckdb::unique_ptr<sirius::op::sirius_physical_grouped_aggregate> make_grouped_aggregate(
   std::vector<uint32_t> group_columns,
   std::vector<uint32_t> aggregate_input_columns,
@@ -231,8 +231,8 @@ duckdb::unique_ptr<sirius::op::sirius_physical_grouped_aggregate> make_grouped_a
   return aggregate;
 }
 
-/// Assert @p slot is a restore projection over the key column: a cast at output 0, bare
-/// references elsewhere, and @p expected as its sidecar.
+// Assert @p slot is a restore projection over the key column: a cast at output 0, bare
+// references elsewhere, and @p expected as its sidecar.
 void require_key_restore_projection(sirius_physical_operator const& op,
                                     std::vector<cudf::data_type> const& expected)
 {

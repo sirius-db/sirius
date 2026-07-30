@@ -39,8 +39,8 @@ using evaluation_mode = expression_evaluator::evaluation_mode;
 
 namespace {
 
-/// Raw unscaled/integral host value of a validated narrowable-domain constant. Callers must have
-/// established representability through constant_representable_in_carrier.
+// Raw unscaled/integral host value of a validated narrowable-domain constant. Callers must have
+// established representability through constant_representable_in_carrier.
 __int128_t constant_host_value(sirius::ast::constant const& expr)
 {
   auto const range = sirius::ast::constant_numeric_range(expr);

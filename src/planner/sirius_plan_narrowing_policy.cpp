@@ -48,14 +48,14 @@
 // per column is `keep iff transport or (not boundary_restore and (narrow_comparison or not
 // evaluator_restore))`; retracted columns flip back to native in the scan sidecar before
 // propagation runs. Because every case mirrors the propagation case of the same operator, an
-// operator this file does not model is by construction one propagation restores at -- the
-// conservative default is always native.
+// operator this file does not model is by construction one where propagation restores at the
+// boundary. The conservative default is always native.
 
 namespace sirius::planner {
 
 namespace {
 
-/// One candidate narrow scan target: its identity plus the use flags accumulated over the walk.
+// One candidate narrow scan target: its identity plus the use flags accumulated over the walk.
 struct narrow_candidate {
   sirius::op::sirius_physical_table_scan* scan;
   std::size_t column_index;  ///< Position in the scan output (and its sidecar).
@@ -67,12 +67,12 @@ struct narrow_candidate {
 };
 
 struct policy_state {
-  /// Seeded per scan in output-column order, so one scan's candidates are contiguous.
+  // Seeded per scan in output-column order, so one scan's candidates are contiguous.
   std::vector<narrow_candidate> candidates;
 };
 
-/// Output position -> candidate index for one subtree, sized to the operator's output width; an
-/// empty slot means that output column carries no candidate narrow carrier.
+// Output position -> candidate index for one subtree, sized to the operator's output width; an
+// empty slot means that output column carries no candidate narrow carrier.
 using carried_columns = std::vector<std::optional<std::size_t>>;
 
 bool is_delim_join(sirius::op::sirius_physical_operator const& op) noexcept
@@ -88,8 +88,8 @@ void mark_boundary_restore(policy_state& state, carried_columns const& columns)
   }
 }
 
-/// Plan-time probe of the narrow-domain eligibility predicate shared with the evaluator,
-/// evaluated against the column's planned carrier instead of a runtime input column.
+// Plan-time probe of the narrow-domain eligibility predicate shared with the evaluator,
+// evaluated against the column's planned carrier instead of a runtime input column.
 bool narrow_domain_engages(sirius::ast::reference const& ref,
                            cudf::data_type carrier,
                            std::initializer_list<sirius::ast::node const*> constant_operands)
@@ -97,8 +97,8 @@ bool narrow_domain_engages(sirius::ast::reference const& ref,
   return sirius::ast::narrow_domain_carrier_eligible(ref.return_type(), carrier, constant_operands);
 }
 
-/// The candidate carried by @p column_operand when it is a bare carried reference and
-/// @p constant_operands engage the narrow domain against its planned carrier.
+// The candidate carried by @p column_operand when it is a bare carried reference and
+// @p constant_operands engage the narrow domain against its planned carrier.
 std::optional<std::size_t> narrow_comparison_candidate(
   sirius::ast::node const* column_operand,
   std::initializer_list<sirius::ast::node const*> constant_operands,
@@ -126,12 +126,12 @@ void classify_child(std::unique_ptr<sirius::ast::node> const& child,
   if (child) { classify_expression(*child, inputs, state); }
 }
 
-/// Classify every reference occurrence in an evaluated expression against the child map @p inputs.
-/// A comparison or BETWEEN whose shape engages the narrow domain marks its column
-/// narrow_comparison and classifies nothing further (the evaluator computes it at the narrow width
-/// with zero restoration); every other reference occurrence marks evaluator_restore, because
-/// `evaluate(reference)` restores a narrowed column unconditionally. The static_assert keeps the
-/// classification total: a new AST alternative fails to compile until it is given an arm here.
+// Classify every reference occurrence in an evaluated expression against the child map @p inputs.
+// A comparison or BETWEEN whose shape engages the narrow domain marks its column
+// narrow_comparison and classifies nothing further (the evaluator computes it at the narrow width
+// with zero restoration); every other reference occurrence marks evaluator_restore, because
+// `evaluate(reference)` restores a narrowed column unconditionally. The static_assert keeps the
+// classification total: a new AST alternative fails to compile until it is given an arm here.
 void classify_expression(sirius::ast::node const& expr,
                          carried_columns const& inputs,
                          policy_state& state)
@@ -211,12 +211,12 @@ void classify_expression(sirius::ast::node const& expr,
 
 carried_columns analyze_subtree(sirius::op::sirius_physical_operator& op, policy_state& state);
 
-/// Analyze one DELIM_JOIN sub-tree. Propagation restores every child of @p sub_root in place and
-/// clears the sub-root's own sidecar, so the sub-root's operator case never runs here: it can
-/// award no transport and forward no carrier, and every carried column reaching the sub-root's
-/// input boundary is a boundary restore. A TABLE_SCAN sub-root has no inputs; its own seeded
-/// outputs die at the cleared sub-root output instead. A DELIM_JOIN sub-root recurses into its
-/// internal sub-trees the same way.
+// Analyze one DELIM_JOIN sub-tree. Propagation restores every child of @p sub_root in place and
+// clears the sub-root's own sidecar, so the sub-root's operator case never runs here: it can
+// award no transport and forward no carrier, and every carried column reaching the sub-root's
+// input boundary is a boundary restore. A TABLE_SCAN sub-root has no inputs; its own seeded
+// outputs die at the cleared sub-root output instead. A DELIM_JOIN sub-root recurses into its
+// internal sub-trees the same way.
 void analyze_delim_subtree(sirius::op::sirius_physical_operator& sub_root, policy_state& state)
 {
   if (sub_root.type == sirius::op::SiriusPhysicalOperatorType::TABLE_SCAN) {
@@ -233,10 +233,10 @@ void analyze_delim_subtree(sirius::op::sirius_physical_operator& sub_root, polic
   }
 }
 
-/// Bottom-up walk returning the carried-column map of @p op 's output. Each case mirrors the
-/// propagation case of the same operator: a use is recorded on the origin candidate, then the map
-/// is transformed the way propagation forwards carriers. Falling out of the switch is the native
-/// boundary, exactly where propagation restores every narrowed child.
+// Bottom-up walk returning the carried-column map of @p op 's output. Each case mirrors the
+// propagation case of the same operator: a use is recorded on the origin candidate, then the map
+// is transformed the way propagation forwards carriers. Falling out of the switch is the native
+// boundary, exactly where propagation restores every narrowed child.
 carried_columns analyze_subtree(sirius::op::sirius_physical_operator& op, policy_state& state)
 {
   std::vector<carried_columns> child_maps;
