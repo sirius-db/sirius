@@ -118,7 +118,33 @@ extracted_plan extract_logical_plan_sirius_order(duckdb::ClientContext& context,
   return {std::move(plan), std::move(prepared)};
 }
 
+//! Starts far above any window id a test process will reach, so a synthetic query can never
+//! collide with a genuine execution window's registration (the registry rejects duplicates).
+sirius::query_id_t next_test_query_id()
+{
+  static std::atomic<std::uint32_t> counter{1'000'000};
+  return sirius::make_query_id(counter.fetch_add(1, std::memory_order_relaxed));
+}
+
 }  // namespace
+
+scoped_test_query::scoped_test_query(duckdb::ClientContext& context)
+  : ctx_(context.registered_state->Get<duckdb::SiriusContext>("sirius_state")),
+    query_id_(next_test_query_id())
+{
+  if (usable()) { ctx_->get_data_repository_registry().create_for_query(query_id_); }
+}
+
+scoped_test_query::~scoped_test_query()
+{
+  if (!usable()) { return; }
+  try {
+    ctx_->get_data_repository_registry().erase(query_id_);
+  } catch (...) {  // best-effort: never throw out of a test-scaffolding destructor
+  }
+}
+
+bool scoped_test_query::usable() const noexcept { return ctx_ && ctx_->is_initialized(); }
 
 void with_conversion_result(
   duckdb::Connection& con,
@@ -185,6 +211,10 @@ void with_initialized_engine(duckdb::Connection& con,
 {
   auto& context = *con.context;
 
+  // Stands in for the execution window this helper never opens: registers this plan's
+  // repository manager and drops it (with its repositories) on the way out.
+  scoped_test_query test_query(context);
+
   con.BeginTransaction();
   try {
     extracted_plan extracted;
@@ -202,7 +232,7 @@ void with_initialized_engine(duckdb::Connection& con,
                              op::sirius_physical_materialized_collector>(*prepared, context);
 
     sirius_interface iface(context);
-    sirius_engine engine(context, iface);
+    sirius_engine engine(context, iface, test_query.query_id());
     engine.initialize(std::move(collector));
     consume(engine);
 

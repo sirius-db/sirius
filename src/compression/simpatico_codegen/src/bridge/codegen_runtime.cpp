@@ -240,16 +240,13 @@ std::unique_ptr<cudf::column> compact_bitpack_packed(cudf::column const& chunk_c
 
   const std::size_t live = static_cast<std::size_t>(live_packed_bytes);
 
-  // The decode bit-unpack gather (simpatico_bitunpack_one) loads three
-  // consecutive uint32 words unconditionally, so decoding the last element of
-  // the last chunk touches up to two uint32 words past the live packed bytes.
-  // Allocate that much readable trailing slack (masked out of every decoded
-  // value); without it the gather over-reads the dense allocation — a real OOB
-  // caught by compute-sanitizer. The column's logical size stays ``live`` so
-  // serialization remains tight.
-  constexpr std::size_t kDecodeGatherSlackBytes = 2 * sizeof(std::uint32_t);
+  // simpatico_bitunpack_one loads three consecutive uint32 words (w0/w1/w2);
+  // three guard words keep the last element's gather in-bounds.  They travel
+  // as part of the stored payload so num_rows already accounts for them.
+  constexpr std::size_t kGuardWords = 3;
+  const std::size_t guard_bytes     = kGuardWords * sizeof(std::uint32_t);
 
-  rmm::device_buffer dense(live + kDecodeGatherSlackBytes, stream, mr);
+  rmm::device_buffer dense(live + guard_bytes, stream, mr);
   if (live > 0) {
     const cudf::size_type num_chunks = chunk_count.size();
     const void* cc_p                 = chunk_count.view().head<void>();
@@ -294,15 +291,16 @@ std::unique_ptr<cudf::column> compact_bitpack_packed(cudf::column const& chunk_c
              "compact gather");
   }
 
-  // Zero the trailing gather slack so the decode over-read returns deterministic
-  // (masked-out) bytes rather than uninitialised memory.
-  cudaMemsetAsync(
-    static_cast<std::uint8_t*>(dense.data()) + live, 0, kDecodeGatherSlackBytes, stream.value());
+  // Zero the guard words so the decode over-read returns deterministic
+  // (masked-out) zeros rather than uninitialised memory.
+  cudaMemsetAsync(static_cast<std::uint8_t*>(dense.data()) + live, 0, guard_bytes, stream.value());
 
   // packed is uint32 words; UINT32 (size = words) keeps a >2GB dense buffer
-  // under cudf's 2^31-element cap. `live` is a byte count, always a multiple of 4.
+  // under cudf's 2^31-element cap.  The column size includes the guard words
+  // so they travel through serialisation/deserialisation without any special
+  // extra allocation at the read site.  `live` is always a multiple of 4.
   return std::make_unique<cudf::column>(cudf::data_type(cudf::type_id::UINT32),
-                                        static_cast<cudf::size_type>(live / 4),
+                                        static_cast<cudf::size_type>(live / 4 + kGuardWords),
                                         std::move(dense),
                                         rmm::device_buffer(0, stream, mr),
                                         0);
@@ -420,6 +418,9 @@ const char* dtype_to_cxx(const char* dtype)
   // SIGNED int8_t: zigzag's shift = elem_size*8-1 relies on sign-extension.
   // The output column retains the original UINT8 type_id.
   if (s == "uint8" || s == "uint8_t" || s == "int8" || s == "int8_t") return "int8_t";
+  // 16-bit signed/unsigned both process as int16_t; zigzag's shift = 15 relies
+  // on sign-extension, and the output column keeps the original UINT16 type_id.
+  if (s == "int16" || s == "int16_t" || s == "uint16" || s == "uint16_t") return "int16_t";
   // Unsigned 32/64-bit process as their same-width signed integer (bit-level
   // codecs roundtrip either way); the output column keeps the original UINT type.
   if (s == "uint32" || s == "uint32_t") return "int32_t";
@@ -595,9 +596,10 @@ bool launch_decode_fused_tree(codegen::jit::FusedTree const& tree,
                    dtype ? dtype : "(null)");
       return false;
     }
-    const std::size_t elem_size = (std::strcmp(cxx_dtype, "int64_t") == 0)  ? 8u
-                                  : (std::strcmp(cxx_dtype, "int8_t") == 0) ? 1u
-                                                                            : 4u;
+    const std::size_t elem_size = (std::strcmp(cxx_dtype, "int64_t") == 0)   ? 8u
+                                  : (std::strcmp(cxx_dtype, "int16_t") == 0) ? 2u
+                                  : (std::strcmp(cxx_dtype, "int8_t") == 0)  ? 1u
+                                                                             : 4u;
 
     // Device transients (bp_offsets/scratch) from the RMM async pool, freed
     // async on return.
@@ -832,6 +834,15 @@ static int launch_encode_fused_tree_impl(const simpatico::CodegenHead& head,
     for (auto& p : dev_ptrs)
       args.push_back(&p);
 
+    {
+      CUfunction fn_enc   = kernel->func_for_current_device();
+      int static_smem_enc = 0;
+      cuFuncGetAttribute(&static_smem_enc, CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES, fn_enc);
+      if (static_smem_enc + spec.shared_bytes > 48 * 1024) {
+        cuFuncSetAttribute(
+          fn_enc, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, spec.shared_bytes);
+      }
+    }
     SIMPATICO_CU_CHECK(cuLaunchKernel(kernel->func_for_current_device(),
                                       static_cast<unsigned>(num_chunks),
                                       1,
@@ -917,6 +928,7 @@ static int launch_encode_fused_tree_impl(const simpatico::CodegenHead& head,
           // be INT32 regardless of the column dtype.
           const cudf::data_type bp_elem_type =
             (spec.buffers[i_min].elem_size == 8)   ? cudf::data_type(cudf::type_id::INT64)
+            : (spec.buffers[i_min].elem_size == 2) ? cudf::data_type(cudf::type_id::INT16)
             : (spec.buffers[i_min].elem_size == 1) ? cudf::data_type(cudf::type_id::UINT8)
                                                    : cudf::data_type(cudf::type_id::INT32);
           auto mins_col = std::make_unique<cudf::column>(bp_elem_type,
@@ -1092,13 +1104,25 @@ static int launch_encode_fused_tree_impl(const simpatico::CodegenHead& head,
           const auto i_zz = find_buffer_idx(spec.buffers, node_id, "zigzag");
           const std::size_t zz_rows =
             static_cast<std::size_t>(num_chunks) * static_cast<std::size_t>(kChunkSize);
-          auto zz_col = std::make_unique<cudf::column>(original_type,
+          // Use the renderer's actual buffer elem_size to determine the column type.
+          // When Zigzag sits on an RLE "runs" channel the kernel processes int32_t
+          // run counts, so elem_size == 4 regardless of the column's element type.
+          // Using original_type for INT16 columns would make ANS compress only the
+          // low 2 bytes of each int32_t code, corrupting the run counts on decode.
+          const std::int32_t zz_elem_size = static_cast<std::int32_t>(spec.buffers[i_zz].elem_size);
+          const cudf::data_type zz_type =
+            (zz_elem_size == static_cast<std::int32_t>(cudf::size_of(original_type)))
+              ? original_type
+            : (zz_elem_size == 8) ? cudf::data_type(cudf::type_id::INT64)
+            : (zz_elem_size == 1) ? cudf::data_type(cudf::type_id::UINT8)
+                                  : cudf::data_type(cudf::type_id::INT32);
+          auto zz_col = std::make_unique<cudf::column>(zz_type,
                                                        static_cast<cudf::size_type>(zz_rows),
                                                        std::move(bufs[i_zz]),
                                                        rmm::device_buffer(0, stream),
                                                        0);
           auto rep    = std::make_unique<simpatico::codegen_fused_representation>(
-            simpatico::OpId::Zigzag, original_type, static_cast<cudf::size_type>(num_rows));
+            simpatico::OpId::Zigzag, zz_type, static_cast<cudf::size_type>(num_rows));
           rep->buffers.emplace_back("zigzag", std::move(zz_col));
           builder->leaves.emplace(origin.plan_node, std::move(rep));
           break;
@@ -1313,6 +1337,8 @@ bool launch_encode_fused_tree(CodegenHead const& head,
   switch (input_col.type().id()) {
     case cudf::type_id::INT8: dtype = "int8"; break;
     case cudf::type_id::UINT8: dtype = "uint8"; break;
+    case cudf::type_id::INT16: dtype = "int16"; break;
+    case cudf::type_id::UINT16: dtype = "uint16"; break;
     case cudf::type_id::INT32: dtype = "int32"; break;
     case cudf::type_id::INT64: dtype = "int64"; break;
     case cudf::type_id::UINT32: dtype = "uint32"; break;

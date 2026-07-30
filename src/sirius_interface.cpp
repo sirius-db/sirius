@@ -132,12 +132,13 @@ sirius_interface::sirius_pending_statement_or_prepared_statement(
   duckdb::ClientContext& context,
   const duckdb::string& query,
   duckdb::shared_ptr<sirius_prepared_statement_data>& statement_p,
-  const duckdb::PendingQueryParameters& parameters)
+  const duckdb::PendingQueryParameters& parameters,
+  sirius::query_id_t query_id)
 {
   begin_query_internal(query);
 
   duckdb::unique_ptr<duckdb::PendingQueryResult> pending =
-    sirius_pending_statement_internal(context, statement_p, parameters);
+    sirius_pending_statement_internal(context, statement_p, parameters, query_id);
 
   if (pending->HasError()) { return pending; }
   D_ASSERT(sirius_active_query->is_open_result(*pending));
@@ -148,18 +149,20 @@ sirius_interface::sirius_pending_statement_or_prepared_statement(
 duckdb::unique_ptr<duckdb::PendingQueryResult> sirius_interface::sirius_pending_statement_internal(
   duckdb::ClientContext& context,
   duckdb::shared_ptr<sirius_prepared_statement_data>& statement_p,
-  const duckdb::PendingQueryParameters& parameters)
+  const duckdb::PendingQueryParameters& parameters,
+  sirius::query_id_t query_id)
 {
   D_ASSERT(sirius_active_query);
   auto& statement = *(statement_p->prepared);
 
   bind_prepared_statement_parameters(statement, parameters);
 
-  duckdb::unique_ptr<sirius_engine> temp = duckdb::make_uniq<sirius_engine>(context, *this);
-  auto prop                              = temp->context.GetClientProperties();
-  sirius_active_query->engine            = std::move(temp);
-  auto& engine                           = get_sirius_engine();
-  bool stream_result                     = false;
+  duckdb::unique_ptr<sirius_engine> temp =
+    duckdb::make_uniq<sirius_engine>(context, *this, query_id);
+  auto prop                   = temp->context.GetClientProperties();
+  sirius_active_query->engine = std::move(temp);
+  auto& engine                = get_sirius_engine();
+  bool stream_result          = false;
 
   duckdb::unique_ptr<op::sirius_physical_result_collector> sirius_collector =
     duckdb::make_uniq_base<op::sirius_physical_result_collector,
@@ -215,11 +218,12 @@ duckdb::unique_ptr<duckdb::QueryResult> sirius_interface::sirius_execute_query(
   duckdb::ClientContext& context,
   const duckdb::string& query,
   duckdb::shared_ptr<sirius_prepared_statement_data>& statement_p,
-  const duckdb::PendingQueryParameters& parameters)
+  const duckdb::PendingQueryParameters& parameters,
+  sirius::query_id_t query_id)
 {
   try {
-    auto pending_query =
-      sirius_pending_statement_or_prepared_statement(context, query, statement_p, parameters);
+    auto pending_query = sirius_pending_statement_or_prepared_statement(
+      context, query, statement_p, parameters, query_id);
 
     if (pending_query->HasError()) {
       if (sirius_active_query) { cleanup_internal(nullptr, false); }

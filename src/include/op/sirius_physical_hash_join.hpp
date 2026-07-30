@@ -414,6 +414,17 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   std::vector<cudf::size_type> right_key_col_indices;
   bool cast_necessary = false;
 
+  /// Null-matching flag for the equi-keys passed to cuDF joins, cached at
+  /// construction (conditions and join_type are fixed thereafter). cuDF applies one
+  /// flag to all key columns, so it is EQUAL (null-safe -- NULL matches NULL) only
+  /// when EVERY equi-key is IS NOT DISTINCT FROM; a plain `=` key (including mixed
+  /// joins such as delim joins) forces UNEQUAL. MARK joins are also forced to
+  /// UNEQUAL to match their IN/EXISTS three-valued result logic -- a null-safe MARK
+  /// join (e.g. EXISTS with IS NOT DISTINCT FROM) is a known unsupported case, see
+  /// the constructor.
+  cudf::null_equality compare_nulls() const { return compare_nulls_; }
+  cudf::null_equality compare_nulls_ = cudf::null_equality::UNEQUAL;
+
  public:
   //! Per-key cast info: whether each join key needs a cast before comparison
   struct key_cast_info {

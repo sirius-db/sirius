@@ -24,6 +24,7 @@
 #include "op/sirius_physical_operator.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
 #include "pipeline/oom_reschedule_exception.hpp"
+#include "pipeline/repository_wiring.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "pipeline/sirius_pipeline_task_states.hpp"
 #include "utils/telemetry_utils.hpp"
@@ -204,6 +205,10 @@ pipeline_context create_pipeline_context()
   build_state.set_pipeline_source(*ctx.pipeline, *ctx.stub_source);
   build_state.add_pipeline_operator(*ctx.pipeline, *ctx.stub_op);
   build_state.set_pipeline_sink(*ctx.pipeline, *ctx.stub_op, 1);
+
+  // Number the stubs as the converter does in production; task execution reads operator ids.
+  duckdb::vector<duckdb::shared_ptr<sirius::pipeline::sirius_pipeline>> pipelines{ctx.pipeline};
+  sirius::pipeline::assign_operator_ids(pipelines);
   return ctx;
 }
 

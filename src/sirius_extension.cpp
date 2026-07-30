@@ -672,8 +672,8 @@ void SiriusExtension::GPUExecutionFunction(ClientContext& context,
           std::move(prepared), std::move(sirius_physical_plan));
 
         gstate.sirius_iface = make_uniq<::sirius::sirius_interface>(context, data.query_label);
-        gstate.res =
-          gstate.sirius_iface->sirius_execute_query(context, data.query, gpu_prepared, {});
+        gstate.res          = gstate.sirius_iface->sirius_execute_query(
+          context, data.query, gpu_prepared, {}, window->query_id());
         if (gstate.res->HasError()) {
           gpu_error = gstate.res->GetErrorObject();
           gstate.res.reset();

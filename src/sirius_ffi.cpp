@@ -183,7 +183,7 @@ void Context::execute_substrait(const std::string& plan, std::uintptr_t out_stre
 
       sirius::sirius_interface iface(client, std::optional<std::string>(kQueryLabel));
       result = iface.sirius_execute_query(
-        client, kQueryLabel, gpu_prepared, duckdb::PendingQueryParameters{});
+        client, kQueryLabel, gpu_prepared, duckdb::PendingQueryParameters{}, window.query_id());
       window.finish();
     }
   } catch (...) {

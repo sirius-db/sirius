@@ -16,11 +16,18 @@
 
 #pragma once
 
+#include "query_id.hpp"
+
 #include <duckdb/main/connection.hpp>
 
+#include <cstdint>
 #include <filesystem>
 #include <functional>
 #include <string>
+
+namespace duckdb {
+class SiriusContext;
+}  // namespace duckdb
 
 namespace sirius::pipeline {
 struct pipeline_conversion_result;
@@ -31,6 +38,33 @@ class sirius_engine;
 }
 
 namespace sirius::test {
+
+//! Registers a data repository manager for a synthetic query and drops it on scope exit,
+//! standing in for a real `SiriusContext::StandaloneQueryScope`.
+//!
+//! Tests that build a `sirius_engine` directly never open an execution window, so nothing
+//! would otherwise create the manager the engine requires, nor clean it up afterwards.
+//! Leaving repositories behind also breaks the *next* real GPU query in the process, since
+//! operator ids restart at 0 for every plan and would collide on `{operator_id, port_id}`.
+//!
+//! Construct it before the engine and keep it alive for at least as long: pass `query_id()`
+//! to the `sirius_engine` constructor. No-op when Sirius is not registered on the connection.
+class scoped_test_query {
+ public:
+  explicit scoped_test_query(duckdb::ClientContext& context);
+  ~scoped_test_query();
+
+  scoped_test_query(const scoped_test_query&)            = delete;
+  scoped_test_query& operator=(const scoped_test_query&) = delete;
+
+  [[nodiscard]] sirius::query_id_t query_id() const noexcept { return query_id_; }
+
+ private:
+  [[nodiscard]] bool usable() const noexcept;
+
+  duckdb::shared_ptr<duckdb::SiriusContext> ctx_;
+  sirius::query_id_t query_id_;
+};
 
 //! Drive the full sirius planner + meta_pipeline + converter flow on `query` (with the
 //! production optimizer disables) and return `dump_pipeline_conversion_result(...)`; stops
