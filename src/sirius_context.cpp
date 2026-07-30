@@ -583,6 +583,14 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
                                                         comp.spill_error_tolerance,
                                                         comp.spill_replan_change_threshold,
                                                         comp.spill_explore_sample_rows);
+    sirius::compression::set_output_compression_settings(
+      comp.enable_output_compression,
+      comp.output_compression_min_ratio,
+      comp.output_compression_min_compress_gbps,
+      comp.output_compression_min_decompress_gbps,
+      comp.max_compressed_fraction,
+      comp.output_compression_min_batch_bytes,
+      comp.enable_device_compression_downgrade);
     sirius::set_decompress_column_threads(comp.column_threads);
 
     // Load every offline table plan up front. These used to be read lazily inside

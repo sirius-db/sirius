@@ -86,6 +86,32 @@ class convertible_data {
    * @return The size in bytes, or 0 if not in that space.
    */
   virtual std::size_t bytes_in_space(cucascade::memory::memory_space* space) const = 0;
+
+  /**
+   * @brief Bytes that compressing this data in place on the device would free.
+   *
+   * A third downgrade option alongside HOST and DISK: the data stays on the GPU
+   * and stays usable, just held smaller. Returns 0 when that is not possible or
+   * not predicted to help, which is the default for every implementation that
+   * has no compression plan to consult.
+   *
+   * Costs a plan-register lookup and no GPU work, so the executor can price a
+   * whole candidate set before committing to any of it.
+   */
+  [[nodiscard]] virtual std::size_t predicted_compression_saving() const { return 0; }
+
+  /**
+   * @brief Compress this data in place on the device; returns bytes freed.
+   *
+   * 0 means nothing happened and the data is untouched. Only called after
+   * @ref predicted_compression_saving has shown the candidate set can satisfy
+   * the request.
+   */
+  [[nodiscard]] virtual std::size_t compress_in_place(rmm::cuda_stream_view stream)
+  {
+    (void)stream;
+    return 0;
+  }
 };
 
 /**

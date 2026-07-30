@@ -81,4 +81,82 @@ scoped_spill_context::scoped_spill_context(const spill_context& ctx) noexcept
 
 scoped_spill_context::~scoped_spill_context() { t_current_spill_context = _previous; }
 
+// ── Task-output compression ──────────────────────────────────────────────────
+
+namespace {
+thread_local const output_compression_context* t_current_output_context = nullptr;
+
+std::atomic<bool> g_output_enabled{false};
+std::atomic<double> g_output_min_ratio{3.0};
+std::atomic<double> g_output_min_compress_gbps{250.0};
+std::atomic<double> g_output_min_decompress_gbps{250.0};
+std::atomic<double> g_output_max_compressed_fraction{0.75};
+std::atomic<std::size_t> g_output_min_batch_bytes{64ULL * 1024 * 1024};
+std::atomic<bool> g_device_downgrade_enabled{false};
+}  // namespace
+
+const output_compression_context* current_output_compression_context() noexcept
+{
+  return t_current_output_context;
+}
+
+void set_output_compression_settings(bool enabled,
+                                     double min_ratio,
+                                     double min_compress_gbps,
+                                     double min_decompress_gbps,
+                                     double max_compressed_fraction,
+                                     std::size_t min_batch_bytes,
+                                     bool enable_device_downgrade) noexcept
+{
+  g_output_enabled.store(enabled, std::memory_order_relaxed);
+  g_output_min_ratio.store(min_ratio, std::memory_order_relaxed);
+  g_output_min_compress_gbps.store(min_compress_gbps, std::memory_order_relaxed);
+  g_output_min_decompress_gbps.store(min_decompress_gbps, std::memory_order_relaxed);
+  g_output_max_compressed_fraction.store(max_compressed_fraction, std::memory_order_relaxed);
+  g_output_min_batch_bytes.store(min_batch_bytes, std::memory_order_relaxed);
+  g_device_downgrade_enabled.store(enable_device_downgrade, std::memory_order_relaxed);
+}
+
+bool output_compression_enabled() noexcept
+{
+  return g_output_enabled.load(std::memory_order_relaxed);
+}
+
+bool device_compression_downgrade_enabled() noexcept
+{
+  return g_device_downgrade_enabled.load(std::memory_order_relaxed);
+}
+
+plan_register::plan_quality_gate output_compression_gate() noexcept
+{
+  return plan_register::plan_quality_gate{
+    .min_ratio           = g_output_min_ratio.load(std::memory_order_relaxed),
+    .min_compress_gbps   = g_output_min_compress_gbps.load(std::memory_order_relaxed),
+    .min_decompress_gbps = g_output_min_decompress_gbps.load(std::memory_order_relaxed),
+  };
+}
+
+output_compression_context make_output_compression_context(
+  const cucascade::shared_data_repository* repo) noexcept
+{
+  return output_compression_context{
+    .repo                    = repo,
+    .max_compressed_fraction = g_output_max_compressed_fraction.load(std::memory_order_relaxed),
+    .min_ratio               = g_output_min_ratio.load(std::memory_order_relaxed),
+    .min_batch_bytes         = g_output_min_batch_bytes.load(std::memory_order_relaxed),
+  };
+}
+
+scoped_output_compression_context::scoped_output_compression_context(
+  const output_compression_context& ctx) noexcept
+  : _previous(t_current_output_context)
+{
+  t_current_output_context = &ctx;
+}
+
+scoped_output_compression_context::~scoped_output_compression_context()
+{
+  t_current_output_context = _previous;
+}
+
 }  // namespace sirius::compression

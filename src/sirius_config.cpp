@@ -220,6 +220,13 @@ static void from_yaml(const YAML::Node& node, compression_config& opt)
   r.optional("spill_error_tolerance", opt.spill_error_tolerance, yaml::greater_than<uint32_t>{0});
   r.optional("spill_replan_change_threshold", opt.spill_replan_change_threshold);
   r.optional("spill_explore_sample_rows", yaml::bytes(opt.spill_explore_sample_rows));
+  r.optional("enable_output_compression", opt.enable_output_compression);
+  r.optional("output_compression_min_ratio", opt.output_compression_min_ratio);
+  r.optional("output_compression_min_compress_gbps", opt.output_compression_min_compress_gbps);
+  r.optional("output_compression_min_decompress_gbps", opt.output_compression_min_decompress_gbps);
+  r.optional("output_compression_min_batch_bytes",
+             yaml::bytes(opt.output_compression_min_batch_bytes));
+  r.optional("enable_device_compression_downgrade", opt.enable_device_compression_downgrade);
   r.reject_unknown();
 }
 

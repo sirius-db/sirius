@@ -8,7 +8,7 @@
 set -uo pipefail
 
 SF_DIR=${SF_DIR:-test_datasets/tpch_parquet_sf100}
-ITERS=${ITERS:-1}
+ITERS=${ITERS:-3}
 QUERIES=${QUERIES:-$(seq 1 22)}
 OUT=./spill_sweep
 mkdir -p "$OUT"
@@ -58,26 +58,50 @@ echo "=== per-query real seconds (off / on)"
 python3 - "$OUT" <<'PY'
 import re, sys, pathlib
 out = pathlib.Path(sys.argv[1])
+
 def times(f):
+    """All per-iteration durations per query, in order."""
     txt = pathlib.Path(f).read_text(errors="ignore")
-    # Rows print as | QMARK | 3 | 1690000000000 |
-    ev = re.findall(r"[|│]\s*(QMARK|QDONE)\s*[|│]\s*(\d+)\s*[|│]\s*(\d+)\s*[|│]", txt)
+    ev = re.findall(r"[|\u2502]\s*(QMARK|QDONE)\s*[|\u2502]\s*(\d+)\s*[|\u2502]\s*(\d+)\s*[|\u2502]", txt)
     start, res = {}, {}
     for kind, q, t in ev:
         q, t = int(q), int(t)
-        if kind == "QMARK": start[q] = t
-        elif q in start:    res[q] = (t - start[q]) / 1000.0
+        if kind == "QMARK":
+            start[q] = t
+        elif q in start:
+            res.setdefault(q, []).append((t - start[q]) / 1000.0)
+            del start[q]
     return res
-a, b = times(out/"off.out"), times(out/"on.out")
-print(f"{'q':>3} {'off':>8} {'on':>8} {'ratio':>7}")
-ta = tb = 0.0
+
+a, b = times(out / "off.out"), times(out / "on.out")
+
+# Steady state: fastest iteration, so page-cache warmth is equal across arms.
+# First iteration is reported alongside because that is where an edge pays its
+# one-off plan setup — the cost the bitpack default exists to remove.
+print(f"{'q':>3} {'off_min':>8} {'on_min':>8} {'ratio':>7}   {'off_1st':>8} {'on_1st':>8} {'ratio':>7}")
+tam = tbm = ta1 = tb1 = 0.0
 for q in sorted(set(a) | set(b)):
-    x, y = a.get(q), b.get(q)
-    if x: ta += x
-    if y: tb += y
-    r = f"{y/x:.2f}x" if x and y and x > 0 else "-"
-    xs = f"{x:.2f}" if x else "-"
-    ys = f"{y:.2f}" if y else "-"
-    print(f"{q:>3} {xs:>8} {ys:>8} {r:>7}")
-print(f"{'sum':>3} {ta:>8.2f} {tb:>8.2f} {(tb/ta if ta else 0):>6.2f}x")
+    xs, ys = a.get(q, []), b.get(q, [])
+    xm, ym = (min(xs) if xs else None), (min(ys) if ys else None)
+    x1, y1 = (xs[0] if xs else None), (ys[0] if ys else None)
+    for v, acc in ((xm, 'tam'), (ym, 'tbm'), (x1, 'ta1'), (y1, 'tb1')):
+        pass
+    if xm: tam += xm
+    if ym: tbm += ym
+    if x1: ta1 += x1
+    if y1: tb1 += y1
+    rm = f"{ym/xm:.2f}x" if xm and ym else "-"
+    r1 = f"{y1/x1:.2f}x" if x1 and y1 else "-"
+    f = lambda v: f"{v:.2f}" if v else "-"
+    print(f"{q:>3} {f(xm):>8} {f(ym):>8} {rm:>7}   {f(x1):>8} {f(y1):>8} {r1:>7}")
+print(f"{'sum':>3} {tam:>8.2f} {tbm:>8.2f} {(tbm/tam if tam else 0):>6.2f}x   "
+      f"{ta1:>8.2f} {tb1:>8.2f} {(tb1/ta1 if ta1 else 0):>6.2f}x")
+
+# Spread across iterations tells us whether the min is stable or noisy.
+import statistics
+for name, d in (("off", a), ("on", b)):
+    sp = [max(v) / min(v) for v in d.values() if len(v) > 1 and min(v) > 0]
+    if sp:
+        print(f"  {name}: per-query max/min spread  median {statistics.median(sp):.2f}x  "
+              f"worst {max(sp):.2f}x")
 PY

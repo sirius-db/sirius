@@ -50,6 +50,7 @@
 #include <data/convertible_data_batch.hpp>
 #include <data/sirius_converter_registry.hpp>
 
+#include <array>
 #include <filesystem>
 #include <memory>
 #include <numeric>
@@ -430,6 +431,50 @@ TEST_CASE("spill compression: compressed_host->compressed_disk blob flush",
     auto& disk = ro.get_data()->cast<sirius::compressed_disk_representation>();
     REQUIRE(fs::exists(disk.path()));
     REQUIRE(fs::file_size(disk.path()) == expected_file_size);
+  }
+
+  require_restores_to(batch, &repo_a(), expected_sum_of(n));
+
+  reset_spill_state(false);
+}
+
+TEST_CASE("spill compression: materialization estimate covers the decode transient",
+          "[compression][spill][isolated_context]")
+{
+  if (!has_gpu()) {
+    SUCCEED("No GPU available — skipping spill compression tests");
+    return;
+  }
+
+  auto& e = env();
+  reset_spill_state();
+  set_plan_1col(&repo_a(), kOneColDsl);
+
+  const std::size_t n = 5000;
+  auto batch          = make_int32_gpu_batch(n);
+
+  // A GPU-resident table decodes nothing, so its estimate is just its footprint.
+  {
+    auto ro = batch->to_read_only();
+    REQUIRE(sirius::estimated_materialization_bytes(*ro.get_data()) ==
+            ro.get_data()->get_uncompressed_data_size_in_bytes());
+  }
+
+  spill_to(batch, e.host_space, &repo_a());
+  REQUIRE(is_compressed_host(*batch));
+
+  // Decoding stages the compressed payload on device and builds the table beside
+  // it, so the peak is both at once — strictly more than the decompressed table
+  // alone, which is what the reservation used to be sized to.
+  {
+    auto ro                 = batch->to_read_only();
+    auto const* data        = ro.get_data();
+    const auto uncompressed = data->get_uncompressed_data_size_in_bytes();
+    const auto compressed   = data->get_size_in_bytes();
+
+    REQUIRE(compressed > 0);
+    REQUIRE(sirius::estimated_materialization_bytes(*data) == uncompressed + compressed);
+    REQUIRE(sirius::estimated_materialization_bytes(*data) > uncompressed);
   }
 
   require_restores_to(batch, &repo_a(), expected_sum_of(n));
@@ -1157,6 +1202,169 @@ TEST_CASE("plan_register: clear_spill_plan removes only the named edge",
   reg.clear_spill_plan(&repo_a());
   REQUIRE_FALSE(reg.resolve_spill_plan(&repo_a()).has_value());
   REQUIRE(reg.resolve_spill_plan(&repo_b()).has_value());
+
+  reg.clear_all();
+}
+
+namespace {
+
+// A two-column plan in the exact shape the offline generator writes, including
+// the `#` measurement comments that split_plan_dsl strips.
+constexpr auto kMeasuredTablePlan = R"(# column: l_orderkey  dtype: i64  ratio: 20.711x  depth: 2
+# comp: 531.34 GB/s  decomp: 626.76 GB/s
+input -> delta -> differences
+delta.differences -> ans
+
+---
+# column: l_partkey  dtype: i32  ratio: 1.140x  depth: 1
+# comp: 681.79 GB/s  decomp: 1496.30 GB/s
+input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+)";
+
+}  // namespace
+
+TEST_CASE("plan_register: plan metrics are parsed and index-aligned with plan blocks",
+          "[compression][plan_register]")
+{
+  auto& reg = sirius::compression::plan_register::global();
+  reg.clear_all();
+
+  reg.set_table_plan("lineitem", kMeasuredTablePlan);
+
+  auto m0 = reg.resolve_plan_metrics("lineitem", 0);
+  REQUIRE(m0.has_value());
+  REQUIRE(m0->compression_ratio == Approx(20.711));
+  // "comp:" must not match inside "decomp:" — both live on one line.
+  REQUIRE(m0->compress_gbps == Approx(531.34));
+  REQUIRE(m0->decompress_gbps == Approx(626.76));
+
+  auto m1 = reg.resolve_plan_metrics("lineitem", 1);
+  REQUIRE(m1.has_value());
+  REQUIRE(m1->compression_ratio == Approx(1.140));
+  REQUIRE(m1->compress_gbps == Approx(681.79));
+
+  // Indices line up with the blocks select_plan_blocks hands out.
+  auto block0 = sirius::compression::select_plan_blocks(kMeasuredTablePlan, {0});
+  REQUIRE(block0.has_value());
+  REQUIRE(block0->find("delta") != std::string::npos);
+  auto block1 = sirius::compression::select_plan_blocks(kMeasuredTablePlan, {1});
+  REQUIRE(block1.has_value());
+  REQUIRE(block1->find("bitpack") != std::string::npos);
+
+  REQUIRE_FALSE(reg.resolve_plan_metrics("lineitem", 2).has_value());
+  REQUIRE_FALSE(reg.resolve_plan_metrics("nosuchtable", 0).has_value());
+
+  // A plan with no measurement comments parses to a present-but-empty entry, so
+  // it neither shifts its neighbours nor claims measurements it does not have.
+  reg.set_table_plan("plain", "input -> identity\n");
+  REQUIRE_FALSE(reg.resolve_plan_metrics("plain", 0).has_value());
+
+  reg.clear_all();
+}
+
+TEST_CASE("plan_register: output plan selection admits only columns clearing the gate",
+          "[compression][plan_register]")
+{
+  using reg_t = sirius::compression::plan_register;
+  auto& reg   = reg_t::global();
+  reg.clear_all();
+
+  reg.set_table_plan("lineitem", kMeasuredTablePlan);
+
+  // col0 -> l_orderkey (20.7x, fast) qualifies; col1 -> l_partkey (1.14x) does
+  // not clear the ratio bar; col2 is computed and has no origin at all.
+  reg.set_spill_column_origins(&repo_a(),
+                               {reg_t::spill_column_origin{"lineitem", 0},
+                                reg_t::spill_column_origin{"lineitem", 1},
+                                std::nullopt});
+
+  const reg_t::plan_quality_gate gate{/*min_ratio=*/3.0,
+                                      /*min_compress_gbps=*/250.0,
+                                      /*min_decompress_gbps=*/250.0};
+
+  auto picked = reg.select_output_plans(&repo_a(), /*expected_columns=*/3, gate);
+  REQUIRE(picked.size() == 1);
+  REQUIRE(picked[0].column_index == 0);
+  REQUIRE(picked[0].metrics.compression_ratio == Approx(20.711));
+  REQUIRE(picked[0].dsl.find("delta") != std::string::npos);
+  // delta's ratio came from the sorted base table, so it must be verified on
+  // first use rather than trusted on a shuffled task output.
+  REQUIRE(picked[0].order_dependent);
+
+  // Raising the compress bar above l_orderkey's 531 GB/s drops it.
+  auto strict = reg.select_output_plans(
+    &repo_a(), 3, reg_t::plan_quality_gate{3.0, /*min_compress_gbps=*/600.0, 250.0});
+  REQUIRE(strict.empty());
+
+  // A column-count mismatch describes a different schema — select nothing rather
+  // than misattribute origins to the wrong columns.
+  REQUIRE(reg.select_output_plans(&repo_a(), /*expected_columns=*/2, gate).empty());
+
+  reg.clear_all();
+}
+
+TEST_CASE("plan_register: an output plan that misses its ratio on real data is dropped",
+          "[compression][plan_register]")
+{
+  using reg_t = sirius::compression::plan_register;
+  auto& reg   = reg_t::global();
+  reg.clear_all();
+
+  reg.set_table_plan("lineitem", kMeasuredTablePlan);
+  reg.set_spill_column_origins(
+    &repo_a(),
+    {reg_t::spill_column_origin{"lineitem", 0}, reg_t::spill_column_origin{"lineitem", 1}});
+
+  const reg_t::plan_quality_gate gate{3.0, 250.0, 250.0};
+
+  auto first = reg.decide_output_plan(&repo_a(), 2, gate);
+  REQUIRE(first.has_value());
+  REQUIRE((*first)[0].has_value());  // l_orderkey: delta, admitted on 20.7x
+  REQUIRE_FALSE((*first)[1].has_value());
+
+  // The decision is cached: a second call does not re-select.
+  REQUIRE(reg.decide_output_plan(&repo_a(), 2, gate).has_value());
+
+  // First batch reality check: the base-table 20.7x came from sorted storage, and
+  // this operator output is shuffled — delta only managed 1.2x. Drop it.
+  const std::array<double, 2> achieved{1.2, 0.0};
+  reg.conclude_output_attempt(&repo_a(), achieved, gate);
+
+  // Nothing viable left, so the edge stops being offered plans at all.
+  REQUIRE_FALSE(reg.decide_output_plan(&repo_a(), 2, gate).has_value());
+
+  // A ratio that clears the bar is kept instead.
+  reg.clear_all();
+  reg.set_table_plan("lineitem", kMeasuredTablePlan);
+  reg.set_spill_column_origins(&repo_b(), {reg_t::spill_column_origin{"lineitem", 0}});
+  REQUIRE(reg.decide_output_plan(&repo_b(), 1, gate).has_value());
+  const std::array<double, 1> good{9.5};
+  reg.conclude_output_attempt(&repo_b(), good, gate);
+  auto kept = reg.decide_output_plan(&repo_b(), 1, gate);
+  REQUIRE(kept.has_value());
+  REQUIRE((*kept)[0].has_value());
+
+  reg.clear_all();
+}
+
+TEST_CASE("plan_register: output plans are dropped with the rest of the per-query state",
+          "[compression][plan_register]")
+{
+  using reg_t = sirius::compression::plan_register;
+  auto& reg   = reg_t::global();
+  reg.clear_all();
+
+  reg.set_table_plan("lineitem", kMeasuredTablePlan);
+  reg.set_spill_column_origins(&repo_a(), {reg_t::spill_column_origin{"lineitem", 0}});
+  REQUIRE(
+    reg.decide_output_plan(&repo_a(), 1, reg_t::plan_quality_gate{3.0, 250.0, 250.0}).has_value());
+  REQUIRE(reg.resolve_output_plan(&repo_a()).has_value());
+
+  // Keyed by a repository pointer that QueryEnd frees — a recycled address must
+  // not inherit this edge's decision.
+  reg.clear_spill_state();
+  REQUIRE_FALSE(reg.resolve_output_plan(&repo_a()).has_value());
+  REQUIRE(reg.resolve_table_plan("lineitem").has_value());
 
   reg.clear_all();
 }

@@ -576,6 +576,76 @@ one. What is solid is the shape: deferring exploration removes the short-query
 regressions outright (q22 18.0x → 1.0x), and a cheap default keeps the
 heavily-spilling case fast.
 
+### MEASURED: 3-way — spill compression is a no-op, output compression is a small win
+
+All 22 queries, SF100, `usage_limit_fraction: 0.30`, 3 iterations x 2 repeats,
+three arms identical but for the compression settings
+(`test/tpch_performance/threeway_{none,spill,output}.yaml`):
+
+| scope | none | spill | output |
+| --- | ---: | ---: | ---: |
+| all 22 queries | 42.45 s | 41.46 s (**0.98x**) | 39.77 s (**0.94x**) |
+| excl. q21 | 33.12 s | 32.88 s (0.99x) | 30.58 s (**0.92x**) |
+| excl. q21 + CPU-fallback queries | 26.81 s | 26.52 s (0.99x) | 24.22 s (**0.90x**) |
+
+Results are byte-identical across all three arms (1359 result rows each).
+
+Signals that clear within-arm noise:
+
+- **spill**: q14 at 0.96x, and nothing else. Neutral — no measurable cost *or*
+  benefit at this budget.
+- **output**: q3 4.29 -> 1.15 (**0.27x**), q9 3.81 -> 4.38 (1.15x).
+
+Output compression compressed 117 batches, 16.07 GiB -> 5.76 GiB (2.79x),
+**saving 10.31 GiB**.
+
+**Two earlier conclusions in this document were artefacts and are withdrawn.**
+
+1. *"Spill compression costs 1.15x-1.17x, concentrated in q21/q22."* Measured
+   here at 0.98x. The earlier runs used `run_spill_sweep.sh`, which always ran the
+   off arm first — the bias this document already flagged as "the highest-value
+   next change before any of these numbers are trusted". Rotating arm order per
+   repeat removes it.
+2. *"Output compression turns q21's intermittent livelock into a permanent one"*
+   (0-for-12 across two sweeps). It does not. With arm order rotated, every arm
+   succeeds sometimes and at indistinguishable rates:
+
+   | arm | q21 per-iteration (s) | succeeded |
+   | --- | --- | --- |
+   | none | 9.3, 84.5, 80.4, 82.0, 86.0, 9.8 | 2/6 |
+   | spill | 85.0, 66.8, 79.9, 8.6, 89.8, 89.7 | 1/6 |
+   | output | 85.5, 84.7, 86.6, 9.2, 82.4, 88.0 | 1/6 |
+
+   q21 livelocks intermittently in the **baseline** (see the livelock note below);
+   compression neither causes nor worsens it.
+
+The methodological lesson is the same one twice: at this budget five of 22 queries
+carry no usable signal — q2/q17/q18/q20 fall back to DuckDB CPU in every arm
+(a pre-existing `SiriusGeneratePhysicalPlan` failure), and q21 is a coin flip — so
+any sweep that reports only a total will mostly be reporting those five.
+
+### MEASURED: the output path's cost is per-batch, not per-byte
+
+The first output-compression sweep regressed (1.16x excl. q21) while compressing
+1861 batches averaging 13.4 MiB. The added time was +5.49 s, i.e. **~2.95 ms per
+batch** — against ~30 us of expected codec work for 13.4 MiB at the offline plans'
+recorded 250-800 GB/s. That is 1-2% of rated throughput: essentially all of the
+cost is fixed per-batch overhead (a per-column, per-plan-node
+`cudaStreamSynchronize` in simpatico's `compress_column`, needed because
+variable-output codecs report their size from device memory, plus blob staging).
+
+Gating on batch size (`output_compression_min_batch_bytes`, 64 MiB) took it from
+1861 batches to 117 — **16x fewer batches, still 61% of the bytes saved** — and
+turned the 1.16x regression into 0.92x.
+
+This also rules out the obvious optimization: batches carry 2-4 columns, so
+per-column parallelism is bounded at a 2-4x dent in a ~100x gap. Worse, it is not
+free to attempt — `reservation_aware_resource_adaptor` keys its tracker state in a
+`thread_local` map, so any allocation on a `stream_pool` worker is neither charged
+to the task's reservation nor subject to its limit/OOM policy. (Note
+`pin_table`'s existing use of `compress_columns_parallel` is untracked for this
+reason; it is tolerable only because pinning runs outside a query reservation.)
+
 ### Spill state is per-query and is cleared at query end
 
 `_spill_plans` and `_spill_origins` are keyed by `shared_data_repository*`, and
@@ -649,6 +719,111 @@ budget is over-charged for every compressed spill until the reservation is resiz
 to the actual compressed footprint. Fixing this needs either a two-phase reserve
 (compress, then reserve the real size) or a reservation-shrink API on cuCascade.
 
+
+### Re-Pareto the offline plans against compression throughput
+
+The plans in `plans/tpch_sf1000/` were picked, per their own header, for
+*"max ratio with decompress >= 250 GB/s per column"*. Compression throughput was
+never a selection criterion, and it shows: of the 27 columns with ratio > 3x, **13
+fail a 300 GB/s compress gate while zero fail the decompress gate**. Median compress
+throughput is 181 GB/s for STRING columns against 338 GB/s for numerics.
+
+That asymmetry is now load-bearing. Any consumer that has to compress *during* a
+query — the spill path, and the task-output path below — pays compression cost on
+the critical path and reads back at most once, so compress speed matters at least as
+much as decompress. The current plans cannot answer whether a column has a fast
+plan, only whether it has a fast-to-*read* one; a column may have been assigned a
+slow-to-write cascade when a slightly worse ratio at 3x the write speed existed and
+was discarded.
+
+Regenerate with compression throughput as a first-class axis (a Pareto front over
+all three of ratio / comp / decomp, rather than a decompress threshold plus a ratio
+argmax), and record the front rather than one pick per column, so a consumer can
+choose by its own cost model instead of inheriting the offline one.
+
+Two things have changed since the current plans were generated and should land in the
+same regeneration:
+
+- **Dictionary encode is believed to be faster now.** Every STRING column that misses
+  the gate misses it on the dictionary/`str_split` build. Several are close enough
+  (`p_mfgr` 281, `p_type` 265 GB/s) that a rebuild may move them over on its own — and
+  the ones that are far off (`l_returnflag` 98, `l_linestatus` 90) are exactly the
+  low-cardinality columns dictionary should be best at. Re-measure before concluding
+  strings are structurally unsuitable.
+- **FSST for STRING columns.** There is an FSST operator on `joost/fsst-operator`
+  (unmerged). FSST is designed for exactly this shape — short repetitive strings with
+  symbol-table reuse — and would plausibly beat the dictionary cascades on both ratio
+  and write speed. Wiring it into the plan space is a prerequisite for the string
+  columns being usable by any compress-on-the-critical-path consumer.
+
+Until this is done, treat the recorded `comp` numbers as a floor rather than a
+measurement of what the codec can do.
+
+### Compress task output columns with a fast, high-ratio lineage plan
+
+Compress selected columns of a task's output when it finishes, rather than only when
+memory pressure forces a spill. The lineage machinery already resolves an output
+column back to a base-table column, and the offline plans already carry measured
+ratio and throughputs — so for a column whose plan is both *fast* and *high-ratio*,
+compressing eagerly buys a smaller resident footprint at a cost the measurements say
+is small.
+
+**Gate: ratio > 3x, compress > 250 GB/s, decompress > 250 GB/s.** Against the current
+SF1000 plans this admits 13 of 53 columns:
+
+| table | column | ratio | comp | decomp | plan | order-dependent |
+| --- | --- | ---: | ---: | ---: | --- | --- |
+| orders | o_shippriority | 455x | 2006 | 3537 | bitpack | |
+| part | p_partkey | 254x | 301 | 504 | zigzag → delta | **yes** |
+| orders | o_orderkey | 106x | 338 | 741 | delta → lz4 | **yes** |
+| partsupp | ps_partkey | 101x | 251 | 715 | delta → … | **yes** |
+| part | p_mfgr | 46.9x | 281 | 579 | dictionary | |
+| part | p_type | 24.4x | 265 | 339 | dictionary | |
+| lineitem | l_orderkey | 20.7x | 531 | 627 | delta → ans | **yes** |
+| lineitem | l_linenumber | 10.4x | 726 | 2123 | bitpack | |
+| lineitem | l_tax | 8.8x | 598 | 691 | ans | |
+| lineitem | l_discount | 8.3x | 594 | 686 | ans | |
+| customer | c_nationkey | 6.3x | 783 | 1772 | bitpack | |
+| supplier | s_nationkey | 6.3x | 307 | 787 | bitpack | |
+| part | p_size | 5.3x | 844 | 1756 | bitpack | |
+
+At 300 GB/s the set is 10 columns and contains **no** STRING at all; at 200 it is 18.
+250 is the knee — it keeps the two string columns that are within reach of a
+dictionary rebuild without admitting the sub-100 GB/s encoders.
+
+**The high-ratio plans are the least trustworthy ones.** Four of the thirteen are
+delta cascades, and their ratios come from the base table being *stored sorted* by
+that key — `l_orderkey` at 20.7x, `o_orderkey` at 106x, `p_partkey` at 254x. A task
+output has been through joins, partitioning and hash shuffles, so that ordering is
+gone and delta collapses toward no compression while still costing a full pass. The
+gate as specified therefore selects hardest for the plans most likely to disappoint.
+
+So a base-table plan is a *hypothesis about* the output column, not a measurement of
+it. Delta plans are admitted, then **verified on first use**: compress the first
+output batch, compare the achieved ratio against the gate, and drop the plan for that
+edge if it misses. That costs one wasted pass on a bad edge and nothing on a good
+one, and it is the only way to tell a still-sorted output from a shuffled one without
+inspecting the data first. The per-column `viable` flag and `conclude_spill_attempt`
+already implement exactly this measure-and-write-off loop; this reuses it rather than
+adding a parallel mechanism.
+
+The order-robust plans need no such check: `ans` is a pure entropy coder over the
+value distribution, and `bitpack` on a low-cardinality column (`nationkey`, `size`,
+`shippriority`, `linenumber`) keeps a narrow `chunk_min`/`chunk_bits` regardless of
+row order.
+
+Open questions before building:
+
+- **Which task outputs are eligible at all?** Lineage only resolves columns tracing
+  back to a scan; aggregate results and computed expressions have no origin and would
+  never seed. On q21 that was ~8% of columns, but a task-output feature may skew
+  toward exactly those computed columns.
+- **What is the actual win?** This trades GPU compute for resident footprint. It pays
+  only if the compressed output is held long enough, or is large enough, for the
+  footprint to matter — which argues for gating on output size as well as on plan
+  quality, in the same spirit as the per-edge setup cost measured above.
+- **Interaction with the spill path.** An already-compressed output that later spills
+  should flush rather than re-compress, the way `flush_host_to_disk` already does.
 
 ### Binary plan storage (avoid DSL roundtrip)
 

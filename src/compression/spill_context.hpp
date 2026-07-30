@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include "plan_register.hpp"
+
 #include <cstddef>
 #include <cstdint>
 
@@ -73,6 +75,75 @@ struct spill_context {
 
 /// The calling thread's active spill context, or nullptr when none is installed.
 [[nodiscard]] const spill_context* current_spill_context() noexcept;
+
+/**
+ * @brief Per-thread context handed to the task-output compression converter.
+ *
+ * Same reason as @ref spill_context — the converter signature cannot carry the
+ * edge — but a distinct type because the two paths differ in kind: the spill
+ * path compresses because it must and will explore to find a plan, while this
+ * one compresses only when lineage already offers a measured plan good enough to
+ * be worth the GPU time.
+ *
+ * Installed by the operator sink for the duration of one
+ * `convert_to<compressed_device_representation>()` call.
+ */
+struct output_compression_context {
+  /// Query-graph edge this batch is being published to; the plan_register key.
+  const cucascade::shared_data_repository* repo{nullptr};
+
+  /// Discard the compressed form when it exceeds this fraction of the original
+  /// device footprint (the batch is then published uncompressed).
+  double max_compressed_fraction{0.75};
+
+  /// Thresholds a column's plan must clear, and that its *achieved* ratio is
+  /// re-checked against on the first batch.
+  double min_ratio{3.0};
+
+  /// Smallest batch worth compressing; below this the fixed per-batch cost
+  /// cannot be repaid. See compression_config for the measurement.
+  std::size_t min_batch_bytes{64ULL * 1024 * 1024};
+};
+
+/// The calling thread's active output-compression context, or nullptr.
+[[nodiscard]] const output_compression_context* current_output_compression_context() noexcept;
+
+/// Mirror the output-compression fields of compression_config into global state.
+void set_output_compression_settings(bool enabled,
+                                     double min_ratio,
+                                     double min_compress_gbps,
+                                     double min_decompress_gbps,
+                                     double max_compressed_fraction,
+                                     std::size_t min_batch_bytes,
+                                     bool enable_device_downgrade) noexcept;
+
+/// Whether eager task-output compression (the sink-time hook) is enabled.
+[[nodiscard]] bool output_compression_enabled() noexcept;
+
+/// Whether the downgrade executor may compress in place on the device.
+[[nodiscard]] bool device_compression_downgrade_enabled() noexcept;
+
+/// The configured gate for admitting a column's offline plan.
+[[nodiscard]] plan_register::plan_quality_gate output_compression_gate() noexcept;
+
+/// Build an output_compression_context for @p repo from the global settings.
+[[nodiscard]] output_compression_context make_output_compression_context(
+  const cucascade::shared_data_repository* repo) noexcept;
+
+/// RAII guard installing an @ref output_compression_context for the calling thread.
+class scoped_output_compression_context {
+ public:
+  explicit scoped_output_compression_context(const output_compression_context& ctx) noexcept;
+  ~scoped_output_compression_context();
+
+  scoped_output_compression_context(const scoped_output_compression_context&)            = delete;
+  scoped_output_compression_context& operator=(const scoped_output_compression_context&) = delete;
+  scoped_output_compression_context(scoped_output_compression_context&&)                 = delete;
+  scoped_output_compression_context& operator=(scoped_output_compression_context&&)      = delete;
+
+ private:
+  const output_compression_context* _previous;
+};
 
 // ── Process-global settings ──────────────────────────────────────────────────
 //

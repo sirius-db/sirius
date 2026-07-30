@@ -514,86 +514,16 @@ device_pin_result materialize_all_batches_compressed(
               // allocating the payload, so it reuses that space (avoids a pin-time peak
               // spike at large scale factors).
               tbl.reset();
-              auto blob = std::make_shared<sirius::compressed_device_blob>();
 
-              // Lay every compressed leaf out in one contiguous device buffer at an
-              // ALIGNED offset (not the header's dense offsets): nvcomp's batched
-              // decode requires aligned input pointers, and the padding after each
-              // buffer also absorbs the few-word read-ahead of bitpacked decode. The
-              // slab hands these offsets back at reconstruct time so the cached table's
-              // leaves are views into this buffer — the only D2D copy, no query re-fetch.
-              //
-              // Each slice is sized to the leaf's reconstructed footprint (alloc_bytes),
-              // NOT its compressed size (size_bytes): read_compressed_table_from_memory
-              // allocates each leaf column at its DECODED element count, and a decode
-              // kernel reads/writes the whole column — a slice sized only to size_bytes
-              // would let the leaf run off its end into the next slice (or past the
-              // payload for the last leaf) and fault the context.
-              constexpr std::size_t kLeafAlign = rmm::CUDA_ALLOCATION_ALIGNMENT;  // 256
-              auto const align_up              = [](std::uint64_t n, std::uint64_t a) {
-                return (n + a - 1) & ~(a - 1);
-              };
-              // The slab hands leaves out positionally: the k-th leaf_mr allocation
-              // during the re-read gets offsets[k]. read_compressed_table_from_memory
-              // allocates one leaf column per enumerated buffer IN ORDER — EXCEPT a
-              // zero-footprint buffer (alloc_bytes == 0, e.g. an empty "output" leaf of
-              // an all-null chunk): cudf::make_numeric_column(size 0) allocates nothing,
-              // so rmm never calls the slab for it and the cursor does not advance. Give
-              // an offset slot only to buffers that actually allocate, or every leaf
-              // after the empty one is handed the wrong slice and the decode faults.
-              blob->offsets.reserve(buffers.size());
-              std::vector<std::size_t> slot_src;  // offsets[k] holds buffers[slot_src[k]]
-              slot_src.reserve(buffers.size());
-              std::uint64_t cur = 0;
-              for (std::size_t i = 0; i < buffers.size(); ++i) {
-                auto const& b         = buffers[i];
-                std::uint64_t const n = std::max(b.size_bytes, b.alloc_bytes);
-                if (n == 0) continue;  // read won't allocate this leaf -> no slot
-                cur = align_up(cur, kLeafAlign);
-                blob->offsets.push_back(cur);
-                slot_src.push_back(i);
-                cur += n;
-              }
-              std::size_t const payload_capacity =
-                align_up(cur, kLeafAlign) + kLeafAlign;  // tail slop for the last buffer
-              blob->payload =
-                rmm::device_buffer(payload_capacity, stream, src_space->get_default_allocator());
-              // Zero first: inter-leaf alignment padding and the tail slop are never
-              // written by the copies below, and a bitpacked decode reads a few bytes
-              // past a leaf's logical end — zeros keep those reads benign.
-              CUCASCADE_CUDA_TRY(
-                cudaMemsetAsync(blob->payload.data(), 0, payload_capacity, stream.value()));
-              for (std::size_t k = 0; k < blob->offsets.size(); ++k) {
-                auto const& b = buffers[slot_src[k]];
-                if (b.size_bytes > 0 && b.device_ptr != nullptr) {
-                  CUCASCADE_CUDA_TRY(cudaMemcpyAsync(
-                    static_cast<std::byte*>(blob->payload.data()) + blob->offsets[k],
-                    b.device_ptr,
-                    static_cast<std::size_t>(b.size_bytes),
-                    cudaMemcpyDeviceToDevice,
-                    stream.value()));
-                }
-              }
-              blob->slab_mr = sirius::slab_memory_resource{
-                static_cast<std::byte*>(blob->payload.data()), &blob->offsets, &blob->slab_cursor};
-
-              auto noop_fetch = [](std::uint64_t, std::size_t, void*, rmm::cuda_stream_view) {};
-              std::string read_err;
-              // Leaf buffers come from the slab (placed as views into the contiguous
-              // payload — zero copy). Codec decode scratch comes from the source GPU
-              // pool instead, so it neither disturbs the slab's positional (idx-based)
-              // placement nor leaks into the pinned payload.
-              blob->table = simpatico::read_compressed_table_from_memory(
-                header,
-                noop_fetch,
-                stream,
-                /*mr (scratch)=*/src_space->get_default_allocator(),
-                &read_err,
-                /*leaf_mr=*/blob->slab_mr);
-              if (!read_err.empty()) {
-                throw std::runtime_error("[materialize_all_batches_compressed] " + read_err);
-              }
-              stream.synchronize();
+              // Leaf buffers become views into the blob's contiguous payload — the only
+              // D2D copy, no query re-fetch. Codec decode scratch comes from the source
+              // GPU pool instead, so it neither disturbs the slab's positional placement
+              // nor leaks into the payload.
+              auto blob = sirius::build_device_compressed_blob(header,
+                                                               buffers,
+                                                               stream,
+                                                               src_space->get_default_allocator(),
+                                                               src_space->get_default_allocator());
 
               compressed_chunk = std::make_shared<sirius::compressed_device_representation>(
                 *src_space,

@@ -18,6 +18,7 @@
 
 #include "compression/compressed_disk_representation.hpp"
 #include "compression/compressed_representation.hpp"
+#include "compression/output_compression.hpp"
 #include "compression/plan_register.hpp"
 #include "compression/spill_context.hpp"
 #include "data/convertible_data.hpp"
@@ -133,21 +134,41 @@ class convertible_data_batch : public convertible_data {
 
       auto& converter_registry = sirius::converter_registry::get();
 
+      // A batch already held compressed on the GPU (eager task-output
+      // compression) re-stages rather than compresses: the bytes are finished,
+      // only their location changes.
+      //
+      // It must NOT go through try_convert_compressed, which is gated on
+      // enable_spill_compression — that setting governs whether to *spend* time
+      // compressing on the spill path, a decision already taken and paid for
+      // here. And it must not fall through to the uncompressed path either: no
+      // converter exists from compressed_device_representation to
+      // host_data_representation, so the batch would be un-evictable for the
+      // rest of the query and the downgrade executor would spin against it.
+      const bool already_compressed =
+        dynamic_cast<const compressed_device_representation*>(mut.get_data()) != nullptr;
+
       switch (space->get_tier()) {
         case cucascade::memory::Tier::GPU:
           mut.convert_to<cucascade::gpu_table_representation>(
             converter_registry, *reservation, stream);
           break;
         case cucascade::memory::Tier::HOST:
-          if (!try_convert_compressed<compressed_host_representation>(
-                mut, converter_registry, *reservation, stream)) {
+          if (already_compressed) {
+            mut.convert_to<compressed_host_representation>(
+              converter_registry, *reservation, stream);
+          } else if (!try_convert_compressed<compressed_host_representation>(
+                       mut, converter_registry, *reservation, stream)) {
             mut.convert_to<cucascade::host_data_representation>(
               converter_registry, *reservation, stream);
           }
           break;
         case cucascade::memory::Tier::DISK:
-          if (!try_convert_compressed<compressed_disk_representation>(
-                mut, converter_registry, *reservation, stream)) {
+          if (already_compressed) {
+            mut.convert_to<compressed_disk_representation>(
+              converter_registry, *reservation, stream);
+          } else if (!try_convert_compressed<compressed_disk_representation>(
+                       mut, converter_registry, *reservation, stream)) {
             mut.convert_to<cucascade::disk_data_representation>(
               converter_registry, *reservation, stream);
           }
@@ -185,6 +206,16 @@ class convertible_data_batch : public convertible_data {
     auto ro = _batch->to_read_only();
     if (ro.get_memory_space() == space) { return ro.get_data()->get_size_in_bytes(); }
     return 0;
+  }
+
+  [[nodiscard]] std::size_t predicted_compression_saving() const override
+  {
+    return compression::estimate_device_compression(*_batch, _source_repo).predicted_freed;
+  }
+
+  [[nodiscard]] std::size_t compress_in_place(rmm::cuda_stream_view stream) override
+  {
+    return compression::compress_in_place_for_downgrade(*_batch, _source_repo, stream);
   }
 
  private:

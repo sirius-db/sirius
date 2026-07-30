@@ -16,6 +16,7 @@
 
 #include "op/sirius_physical_operator.hpp"
 
+#include "compression/output_compression.hpp"
 #include "config.hpp"
 #include "log/logging.hpp"
 #include "pipeline/batch_lock_utils.hpp"
@@ -249,6 +250,23 @@ void sirius_physical_operator::sink(const operator_data& output_data, rmm::cuda_
 {
   auto& pipelineable_output = dynamic_cast<const pipelineable_operator_data&>(output_data);
   for (auto& batch : pipelineable_output.get_data_batches()) {
+    // The task's output is final here and not yet in any repository, so the batch
+    // is still exclusively ours — this is the one point where it can be rewritten
+    // without contending with a consumer.
+    //
+    // Once per batch, not once per (batch, port): on a fan-out every consumer
+    // receives the same shared batch, and every out-edge of this operator was
+    // wired with *this* operator's column origins, so they all resolve to the
+    // same per-column plans. Keying off the first port is therefore well defined.
+    // The helper itself only acts on a FULL barrier — where the batch will sit
+    // until the upstream pipeline drains — so a streaming consumer never pays to
+    // have its input compressed and immediately decompressed again.
+    if (batch && !next_port_after_sink.empty()) {
+      auto& first = next_port_after_sink.front();
+      if (auto* p = first.next_operator->get_port(first.next_operator_port_name)) {
+        compression::try_compress_output_batch(*batch, p->repo, p->type, stream);
+      }
+    }
     for (auto& next_port_info : next_port_after_sink) {
       next_port_info.next_operator->push_data_batch(next_port_info.next_operator_port_name, batch);
     }

@@ -19,9 +19,11 @@
 #include <api/simpatico_codegen.hpp>
 
 #include <algorithm>
+#include <cctype>
 #include <limits>
 #include <mutex>
 #include <shared_mutex>
+#include <string_view>
 #include <utility>
 
 namespace sirius::compression {
@@ -34,14 +36,29 @@ plan_register& plan_register::global()
 
 void plan_register::set_table_plan(const std::string& table_name, std::string full_plan_dsl)
 {
+  // Parse the measurement comments before the string is moved from, and before
+  // any consumer runs it through split_plan_dsl — which strips every `#` line.
+  auto metrics = parse_plan_metrics(full_plan_dsl);
+
   std::unique_lock lock(_mutex);
-  _table_plans[table_name] = std::move(full_plan_dsl);
+  _table_plans[table_name]        = std::move(full_plan_dsl);
+  _table_plan_metrics[table_name] = std::move(metrics);
 }
 
 void plan_register::clear_table_plan(const std::string& table_name)
 {
   std::unique_lock lock(_mutex);
   _table_plans.erase(table_name);
+  _table_plan_metrics.erase(table_name);
+}
+
+std::optional<plan_register::plan_metrics> plan_register::resolve_plan_metrics(
+  const std::string& table_name, std::size_t column_index) const
+{
+  std::shared_lock lock(_mutex);
+  auto it = _table_plan_metrics.find(table_name);
+  if (it == _table_plan_metrics.end() || column_index >= it->second.size()) { return std::nullopt; }
+  return it->second[column_index];
 }
 
 std::optional<std::string> plan_register::resolve_table_plan(const std::string& table_name) const
@@ -329,15 +346,210 @@ void plan_register::clear_spill_state()
   std::unique_lock lock(_mutex);
   _spill_plans.clear();
   _spill_origins.clear();
+  // Same lifetime and the same recycled-address hazard: keyed by a repository
+  // pointer that QueryEnd is about to free.
+  _output_plans.clear();
 }
 
 void plan_register::clear_all()
 {
   std::unique_lock lock(_mutex);
   _table_plans.clear();
+  _table_plan_metrics.clear();
   _col_plans.clear();
   _spill_plans.clear();
   _spill_origins.clear();
+  _output_plans.clear();
+}
+
+namespace {
+
+/// Find `key:` in @p line as a whole token — preceded by start-of-string or a
+/// space — and parse the number after it. Without the boundary check, looking for
+/// "comp:" would match inside "decomp:", which sits on the same line.
+std::optional<double> metric_after(std::string_view line, std::string_view key)
+{
+  for (std::size_t pos = line.find(key); pos != std::string_view::npos;
+       pos             = line.find(key, pos + 1)) {
+    if (pos != 0 && line[pos - 1] != ' ' && line[pos - 1] != '#') { continue; }
+    std::size_t at = pos + key.size();
+    if (at >= line.size() || line[at] != ':') { continue; }
+    ++at;
+    while (at < line.size() && line[at] == ' ') {
+      ++at;
+    }
+    const std::size_t start = at;
+    while (at < line.size() && (std::isdigit(static_cast<unsigned char>(line[at])) != 0 ||
+                                line[at] == '.' || line[at] == '-')) {
+      ++at;
+    }
+    if (at == start) { return std::nullopt; }
+    // std::stod over a copy: the token is short and this runs once per plan at
+    // startup, so from_chars' extra machinery buys nothing here.
+    try {
+      return std::stod(std::string(line.substr(start, at - start)));
+    } catch (const std::exception&) {
+      return std::nullopt;
+    }
+  }
+  return std::nullopt;
+}
+
+}  // namespace
+
+std::vector<std::optional<plan_register::plan_metrics>> parse_plan_metrics(
+  std::string_view full_plan_dsl)
+{
+  std::vector<std::optional<plan_register::plan_metrics>> out;
+
+  bool has_dsl = false;
+  std::optional<double> ratio, comp, decomp;
+
+  // Close the block under construction, mirroring split_plan_dsl: a block with no
+  // DSL lines is not emitted at all, so indices stay aligned with its output.
+  auto flush = [&]() {
+    if (has_dsl) {
+      if (ratio && comp && decomp) {
+        out.push_back(plan_register::plan_metrics{*ratio, *comp, *decomp});
+      } else {
+        out.emplace_back();
+      }
+    }
+    has_dsl = false;
+    ratio = comp = decomp = std::nullopt;
+  };
+
+  std::size_t i = 0;
+  while (i < full_plan_dsl.size()) {
+    std::size_t line_end = full_plan_dsl.find('\n', i);
+    if (line_end == std::string_view::npos) { line_end = full_plan_dsl.size(); }
+    std::string_view line = full_plan_dsl.substr(i, line_end - i);
+    if (!line.empty() && line.back() == '\r') { line.remove_suffix(1); }
+    while (!line.empty() && line.front() == ' ') {
+      line.remove_prefix(1);
+    }
+    while (!line.empty() && line.back() == ' ') {
+      line.remove_suffix(1);
+    }
+
+    if (line == "---") {
+      flush();
+    } else if (!line.empty() && line.front() == '#') {
+      if (auto v = metric_after(line, "ratio")) { ratio = v; }
+      if (auto v = metric_after(line, "decomp")) { decomp = v; }
+      if (auto v = metric_after(line, "comp")) { comp = v; }
+    } else if (!line.empty()) {
+      has_dsl = true;
+    }
+
+    i = (line_end == full_plan_dsl.size()) ? full_plan_dsl.size() : line_end + 1;
+  }
+  flush();
+  return out;
+}
+
+std::vector<plan_register::output_plan_selection> plan_register::select_output_plans(
+  const cucascade::shared_data_repository* repo,
+  std::size_t expected_columns,
+  const plan_quality_gate& gate) const
+{
+  std::shared_lock lock(_mutex);
+  std::vector<output_plan_selection> selected;
+
+  auto origins = _spill_origins.find(repo);
+  if (origins == _spill_origins.end() || origins->second.size() != expected_columns) {
+    return selected;
+  }
+
+  for (std::size_t i = 0; i < expected_columns; ++i) {
+    auto const& origin = origins->second[i];
+    if (!origin.has_value()) { continue; }  // computed column: no base plan to judge
+
+    auto metrics_it = _table_plan_metrics.find(origin->table_name);
+    if (metrics_it == _table_plan_metrics.end() ||
+        origin->table_column_index >= metrics_it->second.size()) {
+      continue;
+    }
+    auto const& measured = metrics_it->second[origin->table_column_index];
+    if (!measured.has_value() || !gate.admits(*measured)) { continue; }
+
+    auto plan_it = _table_plans.find(origin->table_name);
+    if (plan_it == _table_plans.end() || plan_it->second.empty()) { continue; }
+    auto block = select_plan_blocks(plan_it->second, {origin->table_column_index});
+    if (!block.has_value()) { continue; }
+
+    const bool order_dependent = block->find("delta") != std::string::npos;
+    selected.push_back({i, std::move(*block), *measured, order_dependent});
+  }
+  return selected;
+}
+
+std::optional<plan_register::output_column_plans> plan_register::decide_output_plan(
+  const cucascade::shared_data_repository* repo,
+  std::size_t expected_columns,
+  const plan_quality_gate& gate)
+{
+  {
+    std::shared_lock lock(_mutex);
+    auto it = _output_plans.find(repo);
+    if (it != _output_plans.end()) {
+      if (!it->second.any_viable) { return std::nullopt; }
+      return it->second.columns;
+    }
+  }
+
+  // select_output_plans takes the lock itself, so decide outside our own.
+  auto picked = select_output_plans(repo, expected_columns, gate);
+
+  output_edge_state fresh;
+  fresh.columns.assign(expected_columns, std::nullopt);
+  for (auto& p : picked) {
+    if (p.column_index < expected_columns) {
+      fresh.columns[p.column_index] = std::move(p.dsl);
+      fresh.any_viable              = true;
+    }
+  }
+
+  std::unique_lock lock(_mutex);
+  // Another thread may have decided this edge while we were selecting; its
+  // decision is equivalent (same inputs), so keep whichever landed first rather
+  // than clobbering verdicts it may already have concluded.
+  auto [it, inserted] = _output_plans.try_emplace(repo, std::move(fresh));
+  if (!it->second.any_viable) { return std::nullopt; }
+  return it->second.columns;
+}
+
+void plan_register::conclude_output_attempt(const cucascade::shared_data_repository* repo,
+                                            std::span<const double> achieved_ratios,
+                                            const plan_quality_gate& gate)
+{
+  std::unique_lock lock(_mutex);
+  auto it = _output_plans.find(repo);
+  if (it == _output_plans.end()) { return; }
+  auto& state = it->second;
+
+  bool any = false;
+  for (std::size_t i = 0; i < state.columns.size(); ++i) {
+    if (!state.columns[i].has_value()) { continue; }
+    // A column with no measurement this time keeps its plan: silence is not
+    // evidence that the plan failed.
+    if (i < achieved_ratios.size() && achieved_ratios[i] > 0.0 &&
+        achieved_ratios[i] <= gate.min_ratio) {
+      state.columns[i] = std::nullopt;
+      continue;
+    }
+    any = true;
+  }
+  state.any_viable = any;
+}
+
+std::optional<plan_register::output_column_plans> plan_register::resolve_output_plan(
+  const cucascade::shared_data_repository* repo) const
+{
+  std::shared_lock lock(_mutex);
+  auto it = _output_plans.find(repo);
+  if (it == _output_plans.end()) { return std::nullopt; }
+  return it->second.columns;
 }
 
 std::optional<std::string> select_plan_blocks(const std::string& full_plan_dsl,

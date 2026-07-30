@@ -23,10 +23,13 @@
 
 #include <cuda/memory_resource>
 
+#include <api/compressed_table_io.hpp>
 #include <api/simpatico_codegen.hpp>
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
+#include <span>
 #include <vector>
 
 namespace sirius {
@@ -108,5 +111,40 @@ struct compressed_device_blob {
   slab_memory_resource slab_mr;
   simpatico::compressed_table table;
 };
+
+/**
+ * @brief Stage compressed leaf buffers into one contiguous device payload and
+ *        reconstruct the compressed_table as views into it.
+ *
+ * Shared by the pin path and the task-output compression converter — the layout
+ * rules below are subtle enough that a second copy would drift:
+ *
+ * - Leaves are placed at ALIGNED offsets, not the header's dense ones: nvcomp's
+ *   batched decode requires aligned input pointers, and the inter-leaf padding
+ *   absorbs the few-word read-ahead of a bitpacked decode.
+ * - Each slice is sized to the leaf's *reconstructed* footprint (`alloc_bytes`),
+ *   not its compressed `size_bytes`: the re-read allocates each leaf at its
+ *   decoded element count and a decode kernel touches the whole column, so a
+ *   slice sized to size_bytes would run off its end into the next leaf.
+ * - A zero-footprint buffer (e.g. the empty "output" leaf of an all-null chunk)
+ *   gets no offset slot at all: cudf allocates nothing for it, so rmm never calls
+ *   the slab and the cursor does not advance. Giving it a slot would hand every
+ *   later leaf the wrong slice.
+ * - The payload is zeroed first, so the alignment padding and tail slop that the
+ *   copies never write stay benign under a decode's read-ahead.
+ *
+ * @p scratch_mr supplies codec decode scratch during the reconstruct, kept
+ * separate from the slab so it neither disturbs the slab's positional placement
+ * nor lands inside the payload.
+ *
+ * Synchronizes @p stream before returning, so the caller may release the source
+ * buffers enumerated in @p buffers.
+ */
+[[nodiscard]] std::shared_ptr<compressed_device_blob> build_device_compressed_blob(
+  std::span<const std::uint8_t> header,
+  std::span<const simpatico::payload_buffer_ref> buffers,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref payload_mr,
+  rmm::device_async_resource_ref scratch_mr);
 
 }  // namespace sirius

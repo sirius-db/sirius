@@ -638,6 +638,169 @@ std::unique_ptr<cucascade::idata_representation> compress_gpu_to_host(
     static_cast<std::int64_t>(view.num_rows()));
 }
 
+// gpu_table_representation → compressed_device_representation (eager task-output
+// compression). Distinct from the spill converters in what it is for: the batch
+// stays on the GPU and stays usable, it is just held in a smaller form until a
+// consumer materializes it. There is no explorer here — a column is compressed
+// only where lineage already offers a plan whose measured characteristics clear
+// the configured gate.
+std::unique_ptr<cucascade::idata_representation> compress_gpu_to_device(
+  cucascade::idata_representation& source,
+  const cucascade::memory::memory_space* target_memory_space,
+  rmm::cuda_stream_view stream,
+  cucascade::memory::reservation* reservation)
+{
+  nvtx3::scoped_range nvtx_range{"sirius::compression::gpu_to_device_compress"};
+
+  const auto* ctx = compression::current_output_compression_context();
+  if (ctx == nullptr || ctx->repo == nullptr) {
+    throw std::runtime_error("[compression_converters] no output compression context installed");
+  }
+
+  auto& rep     = source.cast<cucascade::gpu_table_representation>();
+  auto view     = rep.get_table_view();
+  auto& reg     = compression::plan_register::global();
+  auto const mr = rmm::mr::get_current_device_resource_ref();
+
+  const auto num_columns               = static_cast<std::size_t>(view.num_columns());
+  const std::size_t uncompressed_bytes = source.get_size_in_bytes();
+
+  auto plans =
+    reg.decide_output_plan(ctx->repo, num_columns, compression::output_compression_gate());
+  if (!plans.has_value() || plans->size() != num_columns) {
+    throw std::runtime_error("[compression_converters] no output column worth compressing");
+  }
+
+  // Compress column by column: a qualifying column uses its lineage plan, and
+  // every other column is carried as cheaply as its dtype allows.
+  simpatico::compressed_table ct;
+  ct.columns.reserve(num_columns);
+  auto names = synthetic_column_names(view.num_columns());
+  std::vector<std::uint64_t> original_bytes(num_columns, 0);
+
+  for (std::size_t i = 0; i < num_columns; ++i) {
+    const auto col   = view.column(static_cast<cudf::size_type>(i));
+    const auto& plan = (*plans)[i];
+
+    // A non-qualifying column cannot be carried by plain identity: the blob
+    // reconstruct allocates every leaf with cudf::make_numeric_column
+    // (compressed_table_io.cpp:281), which rejects DECIMAL and TIMESTAMP — so
+    // `input -> identity` on those faults with "Invalid, non-numeric type".
+    // default_plan_for is the spill path's answer to exactly that: bitpack for
+    // fixed-width types (whose leaves are integral) and passthrough only for
+    // STRING/nested, whose str_split leaves are INT32/INT8. Bitpack is cheap
+    // enough that the spill sweep measured it at ~0.95x against no compression.
+    std::string err;
+    auto tree = simpatico::compress_column(
+      col, plan.has_value() ? *plan : default_plan_for(col.type()), stream, mr, &err);
+    if (!tree) {
+      throw std::runtime_error("[compression_converters] output compress_column " +
+                               std::to_string(i) + ": " + (err.empty() ? "failed" : err));
+    }
+    original_bytes[i] = simpatico::column_size_bytes_ex(col, stream);
+
+    simpatico::compressed_column out_col;
+    out_col.dtype     = col.type();
+    out_col.num_rows  = view.num_rows();
+    out_col.name      = names[i];
+    out_col.plan_tree = std::move(tree);
+    ct.columns.push_back(std::move(out_col));
+  }
+
+  std::vector<std::uint8_t> header;
+  std::vector<simpatico::payload_buffer_ref> buffers;
+  std::uint64_t payload_bytes = 0;
+  const std::string hdr_err =
+    simpatico::build_compressed_table_header(ct, header, buffers, payload_bytes, stream);
+  if (!hdr_err.empty()) {
+    throw std::runtime_error("[compression_converters] output header build: " + hdr_err);
+  }
+
+  // Report what each plan actually achieved on *this* data before deciding
+  // whether to keep the batch. A delta cascade admitted on a base-table ratio
+  // measured over sorted rows is checked here against the shuffled reality of an
+  // operator output, and dropped for later batches if it did not deliver.
+  std::uint64_t selected_original   = 0;
+  std::uint64_t selected_compressed = 0;
+  {
+    const auto descs = ct.describe(stream);
+    std::vector<double> achieved(num_columns, 0.0);
+    for (std::size_t i = 0; i < num_columns && i < descs.size(); ++i) {
+      if (!(*plans)[i].has_value()) { continue; }  // stored raw: nothing to judge
+      std::uint64_t compressed = 0;
+      for (auto const& leaf : descs[i]) {
+        for (auto const& buf : leaf.buffers) {
+          compressed += buf.size_bytes;
+        }
+      }
+      selected_original += original_bytes[i];
+      selected_compressed += compressed;
+      if (compressed > 0 && original_bytes[i] > 0) {
+        achieved[i] = static_cast<double>(original_bytes[i]) / static_cast<double>(compressed);
+      }
+    }
+    reg.conclude_output_attempt(ctx->repo, achieved, compression::output_compression_gate());
+  }
+
+  const std::size_t compressed_bytes = header.size() + payload_bytes;
+
+  // Judge `max_compressed_fraction` on the columns we actually compressed, NOT on
+  // the whole batch.
+  //
+  // Unlike the spill path — where every column is compressed, so the batch total
+  // *is* the result — this path stores every non-qualifying column raw by design.
+  // Including those untouched bytes measures a decision we did not make: a batch
+  // that is 90% raw columns can never clear a 0.75 whole-batch bar however well
+  // the selected columns did, so the check would decline essentially always.
+  // (Measured on q3/SF100: 99.0 MB of 123.8 MB — 0.80 — declined, while the one
+  // compressed column had done its job.)
+  if (selected_original > 0 &&
+      static_cast<double>(selected_compressed) >
+        ctx->max_compressed_fraction * static_cast<double>(selected_original)) {
+    SIRIUS_LOG_DEBUG(
+      "[compression_converters] repo={} output: selected columns compressed {}B of {}B; "
+      "below threshold, publishing uncompressed",
+      static_cast<const void*>(ctx->repo),
+      selected_compressed,
+      selected_original);
+    throw std::runtime_error("[compression_converters] output selected columns compressed " +
+                             std::to_string(selected_compressed) + "B of " +
+                             std::to_string(selected_original) + "B: below threshold");
+  }
+
+  // Whole-batch backstop: keeping a form that is no smaller than the original
+  // costs memory and a decode for nothing. Deliberately a bare "did it shrink"
+  // test rather than a fraction — the fraction is spent above, on the part of the
+  // batch this path is responsible for.
+  if (uncompressed_bytes > 0 && compressed_bytes >= uncompressed_bytes) {
+    throw std::runtime_error("[compression_converters] output compressed " +
+                             std::to_string(compressed_bytes) + "B of " +
+                             std::to_string(uncompressed_bytes) + "B original: no saving");
+  }
+
+  const auto* space = resolve_target_space(source, target_memory_space, reservation);
+  auto* space_mut   = const_cast<cucascade::memory::memory_space*>(space);
+
+  auto blob =
+    build_device_compressed_blob(header, buffers, stream, space_mut->get_default_allocator(), mr);
+
+  SIRIUS_LOG_DEBUG(
+    "[compression_converters] repo={} compressed output {}B → {}B device (cols={} rows={})",
+    static_cast<const void*>(ctx->repo),
+    uncompressed_bytes,
+    compressed_bytes,
+    view.num_columns(),
+    view.num_rows());
+
+  return std::make_unique<compressed_device_representation>(
+    *space_mut,
+    std::move(blob),
+    std::move(names),
+    compressed_bytes,
+    uncompressed_bytes,
+    static_cast<std::int64_t>(view.num_rows()));
+}
+
 // gpu_table_representation → compressed_disk_representation (compress on spill).
 std::unique_ptr<cucascade::idata_representation> compress_gpu_to_disk(
   cucascade::idata_representation& source,
@@ -681,6 +844,129 @@ std::unique_ptr<cucascade::idata_representation> compress_gpu_to_disk(
     uncompressed_bytes,
     static_cast<std::int64_t>(view.num_rows()),
     synthetic_column_names(view.num_columns()));
+}
+
+// compressed_device_representation → compressed_host_representation (spill an
+// already-compressed batch).
+//
+// Without this the downgrade executor cannot evict a device-compressed batch at
+// all: every converter from compressed_device_representation targeted the GPU, so
+// convert() threw "No converter registered" and the batch stayed resident and
+// un-evictable. Measured on the SF100 sweep: 86 failed downgrades, 74 of them in
+// q9, whose spill traffic then *rose* from 6.13 GiB to 7.47 GiB as the executor
+// evicted other batches instead.
+//
+// This is the cheapest spill in the system — cheaper than an uncompressed one.
+// The bytes are already compressed and already contiguous (the device blob is
+// laid out exactly as .hpln wants), so this is a straight D2H of the payload with
+// no compression, no decompression, and no re-layout. Only the structural header
+// is rebuilt, from the cached table, because the device representation does not
+// retain one.
+std::unique_ptr<cucascade::idata_representation> stage_device_to_host(
+  cucascade::idata_representation& source,
+  const cucascade::memory::memory_space* target_memory_space,
+  rmm::cuda_stream_view stream,
+  cucascade::memory::reservation* reservation)
+{
+  nvtx3::scoped_range nvtx_range{"sirius::compression::device_to_host_stage"};
+  auto& rep = source.cast<compressed_device_representation>();
+
+  // A projection is applied at decode time, so it lives in the representation
+  // rather than in the bytes. Carrying it across would need the private
+  // projecting constructor; until something actually spills a projected pin,
+  // decline rather than silently widen the batch back to all columns.
+  if (rep.selected_indices().has_value()) {
+    throw std::runtime_error(
+      "[compression_converters] cannot stage a column-projected device chunk to host");
+  }
+
+  std::vector<std::uint8_t> header;
+  std::vector<simpatico::payload_buffer_ref> buffers;
+  std::uint64_t payload_bytes = 0;
+  const std::string hdr_err =
+    simpatico::build_compressed_table_header(rep.table(), header, buffers, payload_bytes, stream);
+  if (!hdr_err.empty()) {
+    throw std::runtime_error("[compression_converters] device→host header build: " + hdr_err);
+  }
+
+  const auto* space = resolve_target_space(source, target_memory_space, reservation);
+  auto* space_mut   = const_cast<cucascade::memory::memory_space*>(space);
+  auto* host_mr     = space_mut->get_memory_resource_of<cucascade::memory::Tier::HOST>();
+  if (host_mr == nullptr) {
+    throw std::runtime_error(
+      "[compression_converters] spill target has no fixed_size_host_memory_resource");
+  }
+
+  auto blob           = std::make_shared<pinned_compressed_blob>();
+  blob->header        = std::move(header);
+  blob->payload       = host_mr->allocate_multiple_blocks(payload_bytes, reservation);
+  blob->payload_bytes = payload_bytes;
+  for (auto const& b : buffers) {
+    if (b.size_bytes > 0 && b.device_ptr != nullptr) {
+      copy_device_to_pinned_blocks(
+        b.device_ptr, *blob->payload, b.offset, static_cast<std::size_t>(b.size_bytes), stream);
+    }
+  }
+  // The device payload is owned by `source`, which convert_to only destroys after
+  // this returns — but the copies must land before that happens.
+  stream.synchronize();
+
+  const std::size_t compressed_bytes = blob->header.size() + payload_bytes;
+  SIRIUS_LOG_DEBUG("[compression_converters] staged compressed device chunk → host ({}B)",
+                   compressed_bytes);
+
+  return std::make_unique<compressed_host_representation>(*space_mut,
+                                                          std::move(blob),
+                                                          rep.column_names(),
+                                                          compressed_bytes,
+                                                          rep.get_uncompressed_data_size_in_bytes(),
+                                                          rep.num_rows());
+}
+
+// compressed_device_representation → compressed_disk_representation.
+//
+// The host hop above is preferred (the downgrade executor tries HOST before
+// DISK), but a full host tier must not make a compressed batch un-evictable —
+// that is the same trap this whole pair of converters exists to close.
+std::unique_ptr<cucascade::idata_representation> stage_device_to_disk(
+  cucascade::idata_representation& source,
+  const cucascade::memory::memory_space* target_memory_space,
+  rmm::cuda_stream_view stream,
+  cucascade::memory::reservation* reservation)
+{
+  nvtx3::scoped_range nvtx_range{"sirius::compression::device_to_disk_stage"};
+  auto& rep = source.cast<compressed_device_representation>();
+
+  if (rep.selected_indices().has_value()) {
+    throw std::runtime_error(
+      "[compression_converters] cannot stage a column-projected device chunk to disk");
+  }
+
+  const auto* space = resolve_target_space(source, target_memory_space, reservation);
+  auto* space_mut   = const_cast<cucascade::memory::memory_space*>(space);
+
+  const std::string path =
+    compression::make_compressed_temp_path(std::string(space_mut->get_disk_mount_path()));
+  const std::string err = simpatico::write_compressed_table(rep.table(), path, stream);
+  if (!err.empty()) {
+    throw std::runtime_error("[compression_converters] device→disk write: " + err);
+  }
+
+  std::error_code ec;
+  const auto file_size = std::filesystem::file_size(path, ec);
+  const std::size_t compressed_bytes =
+    ec ? rep.get_size_in_bytes() : static_cast<std::size_t>(file_size);
+
+  SIRIUS_LOG_DEBUG("[compression_converters] staged compressed device chunk → disk {} ({}B)",
+                   path,
+                   compressed_bytes);
+
+  return std::make_unique<compressed_disk_representation>(*space_mut,
+                                                          path,
+                                                          compressed_bytes,
+                                                          rep.get_uncompressed_data_size_in_bytes(),
+                                                          rep.num_rows(),
+                                                          rep.column_names());
 }
 
 // compressed_host_representation → compressed_disk_representation (spill cascade).
@@ -810,6 +1096,45 @@ void register_compression_converters(cucascade::representation_converter_registr
     registry.register_converter<compressed_host_representation, compressed_disk_representation>(
       flush_host_to_disk);
   }
+
+  // Eager task-output compression. Requires an output_compression_context
+  // installed by the sink; without one it throws and the batch is published
+  // uncompressed.
+  if (!registry
+         .has_converter<cucascade::gpu_table_representation, compressed_device_representation>()) {
+    registry
+      .register_converter<cucascade::gpu_table_representation, compressed_device_representation>(
+        compress_gpu_to_device);
+  }
+
+  // Spill paths for an already-compressed device batch. These are what make a
+  // device-compressed batch evictable at all; without them the downgrade
+  // executor finds no converter and the batch is pinned in place for the rest of
+  // the query. Neither compresses or decompresses — they re-stage bytes that are
+  // already in .hpln layout.
+  if (!registry.has_converter<compressed_device_representation, compressed_host_representation>()) {
+    registry.register_converter<compressed_device_representation, compressed_host_representation>(
+      stage_device_to_host);
+  }
+  if (!registry.has_converter<compressed_device_representation, compressed_disk_representation>()) {
+    registry.register_converter<compressed_device_representation, compressed_disk_representation>(
+      stage_device_to_disk);
+  }
+}
+
+std::size_t estimated_materialization_bytes(const cucascade::idata_representation& data)
+{
+  const std::size_t uncompressed = data.get_uncompressed_data_size_in_bytes();
+
+  // Every compressed representation decodes the same way — stage the compressed
+  // payload on device, then build the table beside it — so all three carry the
+  // compressed footprint as extra transient peak. See the header for why the two
+  // coexist rather than replace one another.
+  const bool compressed = dynamic_cast<const compressed_host_representation*>(&data) != nullptr ||
+                          dynamic_cast<const compressed_device_representation*>(&data) != nullptr ||
+                          dynamic_cast<const compressed_disk_representation*>(&data) != nullptr;
+
+  return compressed ? uncompressed + data.get_size_in_bytes() : uncompressed;
 }
 
 }  // namespace sirius

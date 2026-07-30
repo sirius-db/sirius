@@ -101,7 +101,7 @@ std::optional<task_creation_hint> sirius_physical_concat::get_next_task_hint()
     for (auto& batch_id : batch_ids) {
       auto batch_idle = port_ptr->repo->get_data_batch_by_id(batch_id, i);
       auto batch_ro   = batch_idle->to_read_only();
-      auto batch_size = batch_ro.get_data()->get_size_in_bytes();
+      auto batch_size = batch_ro.get_data()->get_uncompressed_data_size_in_bytes();
       total_batch_size += batch_size;
       if (!_concat_all && total_batch_size > _concat_batch_bytes) {
         // This batch pushes us over the threshold — the loop would stop here.
@@ -142,7 +142,7 @@ std::unique_ptr<operator_data> sirius_physical_concat::get_next_task_input_data(
     for (auto& batch_id : batch_ids) {
       auto batch_idle = port_ptr->repo->get_data_batch_by_id(batch_id, i);
       auto batch_ro   = batch_idle->to_read_only();
-      auto batch_size = batch_ro.get_data()->get_size_in_bytes();
+      auto batch_size = batch_ro.get_data()->get_uncompressed_data_size_in_bytes();
       total_batch_size += batch_size;
       // Check if the batch size is already exceed the threshold
       if (!_concat_all && total_batch_size > _concat_batch_bytes) {

@@ -16,6 +16,7 @@
 
 #include "downgrade/downgrade_executor.hpp"
 
+#include "compression/output_compression.hpp"
 #include "data/convertible_data.hpp"
 #include "data/convertible_data_batch.hpp"
 #include "data/convertible_gpu_pipeline_task.hpp"
@@ -198,6 +199,82 @@ void downgrade_executor::processing_loop()
     bool disk_not_configured = disk_spaces.empty();
     for (auto* ds : disk_spaces) {
       target_spaces.push_back(ds);
+    }
+
+    // === TIER 0: Compress in place on the device ===
+    //
+    // Cheapest option when it works: the batch stays on the GPU and stays usable,
+    // so there is no D2H copy now and no readback later — only a decode when a
+    // consumer materializes it.
+    //
+    // Only run when the candidate set can actually satisfy the request.
+    // Compressing frees size*(1 - 1/ratio), so candidate bytes C against request
+    // R need a ratio of at least C/(C-R), and C <= R cannot be satisfied at any
+    // ratio. Predicting first matters more than it would for a spill: a spill
+    // that under-delivers still freed device memory, whereas a compression that
+    // under-delivers has spent GPU time to free too little AND left a batch that
+    // must be decoded before use. So the whole set is judged before any of it is
+    // compressed, and if the prediction falls short we fall straight through to
+    // the host/disk path below with nothing wasted.
+    std::size_t inplace_batches = 0;
+    std::size_t inplace_freed   = 0;
+    if (compression::device_compression_downgrade_enabled() && req->requested_bytes > 0 &&
+        !req->satisfied.load()) {
+      const std::size_t requested = req->requested_bytes;
+      std::vector<std::unique_ptr<convertible_data>> picks;
+      std::size_t predicted_total = 0;
+
+      for (auto* repo : _data_repo_mgr.get_repositories()) {
+        if (predicted_total >= requested) break;
+        convertible_data_batch_provider provider(repo);
+        for (auto& cand : provider.get_all_convertible(source_space,
+                                                       /*front_to_back=*/false,
+                                                       /*ignore_subscribed=*/true)) {
+          if (!cand) continue;
+          const std::size_t saving = cand->predicted_compression_saving();
+          if (saving == 0) continue;
+          predicted_total += saving;
+          picks.push_back(std::move(cand));
+          if (predicted_total >= requested) break;
+        }
+      }
+
+      if (predicted_total >= requested) {
+        auto exc_stream = _stream_pool->acquire_stream(
+          cucascade::memory::exclusive_stream_pool::stream_acquire_policy::GROW);
+        for (auto& cand : picks) {
+          const std::size_t freed = cand->compress_in_place(exc_stream);
+          if (freed > 0) {
+            ++inplace_batches;
+            inplace_freed += freed;
+          }
+        }
+        if (inplace_freed > 0) {
+          req->bytes_freed.fetch_add(inplace_freed, std::memory_order_relaxed);
+          req->batches_downgraded.fetch_add(inplace_batches, std::memory_order_relaxed);
+          if (req->predicate && req->predicate()) { req->satisfied.store(true); }
+        }
+        SIRIUS_LOG_DEBUG(
+          "[downgrade] [{}] in-place compression: {}/{} batches compressed, predicted {} bytes, "
+          "freed {} bytes against a {} byte request",
+          _source_label,
+          inplace_batches,
+          picks.size(),
+          predicted_total,
+          inplace_freed,
+          requested);
+      } else if (!picks.empty()) {
+        // Deliberately all-or-nothing. Compressing a subset would spend GPU time
+        // and still leave the request unmet, and every batch it touched now needs
+        // a decode before use — strictly worse than spilling the same batches.
+        SIRIUS_LOG_DEBUG(
+          "[downgrade] [{}] in-place compression declined: {} candidates predict only {} of {} "
+          "bytes; spilling instead",
+          _source_label,
+          picks.size(),
+          predicted_total,
+          requested);
+      }
     }
 
     // === TIER 1: Data repositories ===
@@ -519,7 +596,11 @@ std::future<size_t> downgrade_executor::request_free_memory(size_t bytes)
   req->predicate = [&freed = req->bytes_freed, bytes]() {
     return freed.load(std::memory_order_relaxed) >= bytes;
   };
-  auto future = req->result.get_future();
+  // The in-place compression pass needs the target as a number, not just as a
+  // predicate: it has to price a whole candidate set against it before it will
+  // compress any of it.
+  req->requested_bytes = bytes;
+  auto future          = req->result.get_future();
   if (!_request_queue.push(std::move(req))) {
     SIRIUS_LOG_WARN(
       "[downgrade] request_free_memory: queue inactive, dropping request for {} bytes", bytes);

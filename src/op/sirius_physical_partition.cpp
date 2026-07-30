@@ -284,7 +284,7 @@ uint64_t sirius_physical_partition::compute_total_bytes()
     auto batch = repo->get_data_batch_by_id(batch_id, 0);
     if (batch) {
       auto ro = batch->to_read_only();
-      if (ro.get_data()) { total_bytes += ro.get_data()->get_size_in_bytes(); }
+      if (ro.get_data()) { total_bytes += ro.get_data()->get_uncompressed_data_size_in_bytes(); }
     }
   }
   return total_bytes;

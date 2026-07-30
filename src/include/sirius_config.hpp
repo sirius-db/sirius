@@ -248,6 +248,60 @@ struct compression_config {
   /// caveat: a row prefix picks markedly worse plans for sorted/monotonic
   /// columns, whose best cascade exploits global structure.
   std::size_t spill_explore_sample_rows{65536};
+
+  // ── Eager task-output compression ─────────────────────────────────────────
+
+  /// When true, a finished task's output batch is compressed on the GPU before
+  /// publication, for those columns whose base-table plan (reached through
+  /// column lineage) is measurably both fast and high-ratio. Falls back to
+  /// publishing uncompressed on any failure or when nothing qualifies.
+  ///
+  /// Distinct from spill compression in intent: that one compresses because it
+  /// must, this one only when the offline measurements say the GPU time is worth
+  /// it. An edge with no qualifying column costs one lookup per query.
+  bool enable_output_compression{false};
+
+  /// Minimum recorded compression ratio for a column's plan to be used eagerly.
+  ///
+  /// Also re-checked against the ratio actually *achieved* on the first batch, so
+  /// a plan whose offline ratio does not survive the operator output — notably a
+  /// delta cascade, whose base-table ratio comes from sorted storage that a join
+  /// or hash partition has destroyed — is dropped after one wasted pass.
+  double output_compression_min_ratio{3.0};
+
+  /// Minimum recorded compress throughput (GB/s) for a plan to be used eagerly.
+  ///
+  /// Gated separately from decompression because output is written once and read
+  /// back at most once, so encode speed is on the critical path. Note the shipped
+  /// SF1000 plans were Pareto-picked for *decompress* only, so this is the gate
+  /// that actually binds: at 250 GB/s it admits 13 of 53 TPC-H columns, and every
+  /// column it rejects with a good ratio is rejected on compress speed.
+  double output_compression_min_compress_gbps{250.0};
+
+  /// Minimum recorded decompress throughput (GB/s) for a plan to be used eagerly.
+  double output_compression_min_decompress_gbps{250.0};
+
+  /// Smallest output batch worth compressing eagerly.
+  ///
+  /// Compressing a batch costs a roughly fixed amount regardless of its size —
+  /// a per-column, per-plan-node `cudaStreamSynchronize` (compress.cpp, needed
+  /// because variable-output codecs report their size from device memory), plus
+  /// the blob staging. The SF100 sweep measured ~2.95 ms per batch against
+  /// ~30 us of actual codec work for a 13.4 MiB batch, i.e. ~1-2% of the codecs'
+  /// rated throughput: below some size a batch simply cannot repay the setup.
+  ///
+  /// Separate from `min_batch_size_bytes` (the pin path's threshold) because the
+  /// two pay different fixed costs and run under different pressure.
+  std::size_t output_compression_min_batch_bytes{64ULL * 1024 * 1024};
+
+  /// When true, the downgrade executor may satisfy a request by compressing
+  /// batches in place on the device, instead of spilling them to host/disk.
+  ///
+  /// Independent of `enable_output_compression`: that one compresses task output
+  /// speculatively at the sink, this one only when a downgrade request has proven
+  /// the memory is needed. They share the plan-quality gate but are separate
+  /// policies and are measured separately.
+  bool enable_device_compression_downgrade{false};
 };
 
 struct sirius_config {
