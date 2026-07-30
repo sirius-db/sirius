@@ -30,24 +30,32 @@ namespace sirius {
 /// Concatenating it into a user-facing error leaks an internal wire format.
 /// `duckdb::ErrorData` parses that envelope and exposes the message alone.
 ///
-/// The parse can fail: a message that merely *starts* with `{` and is not valid
-/// JSON makes the parser throw, and the construction can also throw on
-/// allocation. Both call sites need this in places where throwing is not an
-/// option — inside a DuckDB optimizer extension hook, which has no error path,
-/// and inside catch handlers whose exception must not be replaced by a
-/// secondary one. So the conversion is treated as fallible by construction:
-/// on any failure the original `what()` text is returned unchanged. A worse
-/// message is always preferable to losing the original error.
+/// The extraction can fail two ways, and both have to fall back to the raw text.
+///
+/// It can throw: a message that merely *starts* with `{` without being valid JSON
+/// makes the parser throw, and the construction can also throw on allocation.
+///
+/// And it can succeed while yielding nothing. The parser treats any `{`-leading
+/// valid JSON as an envelope but fills the message **only** from an
+/// `exception_message` key; every other key goes to extra info. So a legal JSON
+/// object that simply is not DuckDB's envelope — `{"error":"missing"}` — extracts
+/// to the empty string, and returning that would discard the original error.
+///
+/// Both call sites need this where throwing is not an option: inside a DuckDB
+/// optimizer extension hook, which has no error path, and inside catch handlers
+/// whose exception must not be replaced by a secondary one. A worse message is
+/// always preferable to losing the original error.
 [[nodiscard]] inline std::string sanitized_message(std::exception const& e) noexcept
 {
   try {
-    return duckdb::ErrorData(e).RawMessage();
+    auto message = duckdb::ErrorData(e).RawMessage();
+    if (!message.empty()) { return message; }
+  } catch (...) {  // NOLINT(bugprone-empty-catch) — fall through to the raw text
+  }
+  try {
+    return e.what();
   } catch (...) {
-    try {
-      return e.what();
-    } catch (...) {
-      return "<unavailable>";
-    }
+    return "<unavailable>";
   }
 }
 
