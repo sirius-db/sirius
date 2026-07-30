@@ -113,13 +113,6 @@ class gpu_pipeline_executor : public sirius::parallel::itask_executor {
    */
   [[nodiscard]] executor_metrics get_metrics() const noexcept;
 
-  /**
-   * @brief Set the completion handler for query completion signaling
-   *
-   * @param handler Pointer to the completion handler
-   */
-  void set_completion_handler(completion_handler* handler) noexcept;
-
  protected:
   void manager_loop() override;
 
@@ -140,7 +133,6 @@ class gpu_pipeline_executor : public sirius::parallel::itask_executor {
   cucascade::memory::memory_space* _memory_space;
   sirius::parallel::downgrade_executor* _downgrade_executor{nullptr};
   sirius::creator::task_creator* _task_creator{nullptr};
-  completion_handler* _completion_handler{nullptr};
   std::atomic<size_t> _tasks_executed{0};
 };
 

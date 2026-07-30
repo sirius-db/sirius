@@ -759,6 +759,7 @@ set(TEST_SOURCES
     test/cpp/pipeline/test_pipeline_build_context.cpp
     test/cpp/pipeline/test_pipeline_dynamic_filter_native_shape.cpp
     test/cpp/pipeline/test_pipeline_schedule_canonical.cpp
+    test/cpp/pipeline/test_per_query_completion_handler.cpp
     test/cpp/pipeline/test_plan_printer.cpp
     test/cpp/pipeline/test_repository_wiring_materializer.cpp
     test/cpp/pipeline/test_task_index_keys.cpp

@@ -185,6 +185,21 @@ class gpu_pipeline_task : public sirius_pipeline_itask {
   }
 
   /**
+   * @brief The completion handler of the query this task belongs to.
+   *
+   * Carried on the shared global state, so every executor site holding a task can report that
+   * query's completion or failure without consulting any shared "current query" state. Returns
+   * null when no global state is attached (tests).
+   */
+  [[nodiscard]] std::shared_ptr<completion_handler> get_completion_handler() const
+  {
+    if (auto gs = std::dynamic_pointer_cast<const gpu_pipeline_task_global_state>(_global_state)) {
+      return gs->get_completion_handler();
+    }
+    return nullptr;
+  }
+
+  /**
    * @brief Get the GPU pipeline associated with this task
    *
    * @return const duckdb::sirius_pipeline* Pointer to the GPU pipeline

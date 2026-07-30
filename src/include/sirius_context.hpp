@@ -522,8 +522,12 @@ class SiriusContext : public ClientContextState {
   /// \brief Start a query with its pipelines.
   /// \param pipelines The ordered pipelines for the query.
   /// \param telemetry_info Info useful for emitting identifiable telemetry.
+  /// \param handler The query's completion signal, owned by its sirius_engine. Stamped onto
+  ///        every pipeline's task global state so tasks can report without any shared
+  ///        "current query" handler.
   void create_query(duckdb::vector<duckdb::shared_ptr<sirius::pipeline::sirius_pipeline>> pipelines,
                     sirius::query_id_t query_id,
+                    std::shared_ptr<sirius::pipeline::completion_handler> handler,
                     sirius::telemetry::query_telemetry_info telemetry_info);
 
   /// \brief Get the current query.

@@ -364,7 +364,7 @@ void sirius_pipeline::notify_downstream_pipelines(bool original_pipeline)
     } catch (const std::exception& e) {
       SIRIUS_LOG_ERROR(
         "Pipeline {}: failed to schedule downstream consumers: {}", pipeline_id, e.what());
-      _task_creator->report_fatal_error(std::current_exception());
+      _task_creator->report_fatal_error(get_query_id(), std::current_exception());
     }
   }
 

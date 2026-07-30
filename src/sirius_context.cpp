@@ -1068,13 +1068,13 @@ std::shared_ptr<const sirius::telemetry::telemetry_context> SiriusContext::get_t
 void SiriusContext::create_query(
   duckdb::vector<duckdb::shared_ptr<sirius::pipeline::sirius_pipeline>> pipelines,
   sirius::query_id_t query_id,
+  std::shared_ptr<sirius::pipeline::completion_handler> handler,
   sirius::telemetry::query_telemetry_info telemetry_info)
 {
   throw_if_not_initialized();
   query_ = duckdb::make_shared_ptr<sirius::planner::query>(
     std::move(pipelines), telemetry_context_->context(), query_id, telemetry_info);
-  task_scheduler_->prepare_for_query(query_);
-  task_creator_->prepare_for_query(*query_);
+  task_creator_->prepare_for_query(*query_, std::move(handler));
   // Reads the admitted subset back off task_creator, so this must run after
   // initialize_internal has set it — otherwise scan_manager gets the full topology list.
   scan_manager_->prepare_for_query(*query_,

@@ -26,6 +26,7 @@
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "op/sirius_physical_operator.hpp"
+#include "pipeline/completion_handler.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "query_id.hpp"
 
@@ -130,7 +131,10 @@ class task_creator {
   /// \brief Register the per-query state for @p query's pipelines.
   ///
   /// Adds an entry; it does NOT clear other queries' entries. Call reset(query_id) to drop one.
-  void prepare_for_query(const sirius::planner::query& query);
+  ///
+  /// \param handler The query's completion signal
+  void prepare_for_query(const sirius::planner::query& query,
+                         std::shared_ptr<pipeline::completion_handler> handler);
 
   /// \brief Drop everything held for @p query_id: pending creation requests, in-flight creation
   /// work, and the per-query state entry. Other queries are untouched.
@@ -187,16 +191,18 @@ class task_creator {
   /// \brief Overload for callers that already know the query; avoids re-deriving it.
   void schedule(op::sirius_physical_operator* request, sirius::query_id_t query_id);
 
-  void schedule_lookahead(sirius::query_id_t query_id,
-                          std::optional<int> device_id_hint = std::nullopt);
+  /// \brief Warm up one not-yet-activated scan of the oldest live query.
+  /// No-op when no query is registered.
+  void schedule_lookahead(std::optional<int> device_id_hint = std::nullopt);
 
-  /// \brief Fail the running query with @p error and stop the creator.
+  /// \brief Fail @p query_id with @p error and stop the creator.
   ///
   /// schedule() throws on an operator that carries no pipeline. Callers on paths that must not
   /// propagate (sirius_pipeline::notify_downstream_pipelines runs from ~gpu_pipeline_task and
   /// from the streaming-source close callback) route the exception here instead, so the query
-  /// surfaces the error rather than the process terminating.
-  void report_fatal_error(std::exception_ptr error);
+  /// surfaces the error rather than the process terminating. The error goes to that query's own
+  /// completion handler, so no other in-flight query is failed by it.
+  void report_fatal_error(sirius::query_id_t query_id, std::exception_ptr error);
 
   /**
    * @brief Get the next task id.
@@ -248,6 +254,11 @@ class task_creator {
     op::sirius_physical_operator* node,
     std::vector<duckdb::shared_ptr<pipeline::sirius_pipeline>>& visited_pipelines);
 
+  /// \brief report_fatal_error for callers that already hold the query's handler (the creation
+  /// worker), avoiding a second lookup of a state it has in scope.
+  void report_fatal_error(const std::shared_ptr<pipeline::completion_handler>& handler,
+                          std::exception_ptr error);
+
   /**
    * @brief Manager loop to consume task creation requests and dispatch to the thread pool.
    *
@@ -283,6 +294,10 @@ class task_creator {
     //! Client context of the connection running this query. Per query because two concurrent
     //! queries on different connections have different contexts.
     ::duckdb::ClientContext* client_context{nullptr};
+
+    //! This query's completion signal, for the creation-failure path (which has this state in
+    //! scope but no task). Same handler every pipeline's global state carries.
+    std::shared_ptr<pipeline::completion_handler> completion_handler;
 
     std::mutex lookahead_mutex;
     std::size_t index_of_next_lookahead{0};
