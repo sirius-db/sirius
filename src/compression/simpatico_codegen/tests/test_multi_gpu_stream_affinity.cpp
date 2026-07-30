@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// Regression for device affinity in the process-lifetime stream cache used by
-// the `int column_threads` decode overload.
-//
-// Compression deliberately uses the serial-stream overload so it cannot seed
-// or consume the cache under test. The first decode on device 0 fills the old
-// process-wide free list with device-0 streams; the next decode on device 1
-// would then receive those foreign streams and fail. Returning to device 0
-// checks that both device-local cache lists remain usable.
-//
-// Self-skips successfully when fewer than two GPUs are visible.
+// Serial compression keeps the cache untouched; threaded decodes on devices
+// 0 -> 1 -> 0 verify that cached streams remain device-local. Self-skips when
+// fewer than two GPUs are visible.
 
 #include "api/simpatico_codegen.hpp"
 #include "test_utils.hpp"
@@ -49,16 +42,12 @@ void decode_on_current_device(int device)
 {
   auto const label = "device " + std::to_string(device);
 
-  // RMM owns this resource in its per-device map for the process lifetime.
-  // Every device allocation below is destroyed before the enclosing device
-  // guard, and this reference is never used after the current device changes.
   auto const mr = rmm::mr::get_current_device_resource_ref();
 
   rmm::cuda_stream serial_stream{rmm::cuda_stream::flags::non_blocking};
   auto input = make_int32_table(kNumColumns, kNumRows, 13 + device);
 
-  // Keep compression off the internal stream cache so this test isolates the
-  // cache-bearing threaded decode overload.
+  // Keep compression off the internal stream cache.
   auto compressed =
     simpatico::compress_with_plan(input->view(), kPlanDsl, serial_stream.view(), mr);
   serial_stream.synchronize();
@@ -77,8 +66,7 @@ void decode_on_current_device(int device)
            (label + ": column " + std::to_string(column) + " byte mismatch").c_str());
   }
 
-  // Surface any asynchronous fault left on this device by a foreign-stream
-  // launch even if an earlier API call did not report it synchronously.
+  // Surface asynchronous device faults.
   if (auto const status = cudaDeviceSynchronize(); status != cudaSuccess) {
     throw std::runtime_error(label +
                              ": cudaDeviceSynchronize failed: " + cudaGetErrorString(status));

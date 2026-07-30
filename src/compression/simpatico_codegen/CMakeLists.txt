@@ -254,5 +254,4 @@ add_test(NAME fused_operator_sweep COMMAND test_fused_operator_sweep)
 add_test(NAME operator_sweep COMMAND test_operator_sweep)
 add_test(NAME representation_contract COMMAND test_representation_contract)
 add_test(NAME bitpack_layout_contract COMMAND test_bitpack_layout_contract)
-# Self-skips (PASS) on a single-GPU host.
 add_test(NAME multi_gpu_stream_affinity COMMAND test_multi_gpu_stream_affinity)

@@ -109,20 +109,10 @@ void validate_column_names(std::vector<std::string> const& column_names, size_t 
 // result is safe to free by any stream (including the RMM default) with no
 // external rebinding. Streams are recycled between calls, so this also avoids
 // per-call stream create/destroy churn.
-//
-// The free lists are keyed by device. A CUDA stream belongs to the device that
-// was current when it was created, and driving work on a stream from another
-// device is invalid — kernel launches fail with "invalid resource handle" and
-// the async copies/codec calls around them can fault the context with
-// cudaErrorIllegalAddress. In the affected Sirius path, multi-GPU pin_table
-// compression uses a caller-owned pool; this cache is exercised by the
-// subsequent per-device threaded decode. Without the device key, one device's
-// completed decode can recycle its streams into the next device's decode.
+// CUDA streams are device-bound, so recycled streams are keyed by device.
 class stream_cache {
  public:
-  // Hand out n valid streams belonging to `device`, reusing ones recycled from
-  // that device and creating the rest. The caller must have `device` current:
-  // cudaStreamCreateWithFlags binds the new streams to the current device.
+  // The caller must have `device` current when new streams are created.
   std::vector<cudaStream_t> checkout(int device, size_t n)
   {
     std::vector<cudaStream_t> out;
@@ -141,10 +131,7 @@ class stream_cache {
     return out;
   }
 
-  // Return `device`'s streams for reuse. They are kept alive (never destroyed):
-  // buffers of previously-returned results may still reference them for their
-  // async free. `device` must be the one they were checked out with, so they go
-  // back to the free list of the device they actually belong to.
+  // Return streams to the same device list they were checked out from.
   void check_in(int device, std::vector<cudaStream_t>& streams)
   {
     std::lock_guard<std::mutex> lock(mu_);
@@ -170,10 +157,7 @@ stream_cache& global_stream_cache()
 // its eventual async free even after this pool is gone. Concurrent leases get
 // disjoint streams (checkout is mutex-guarded and pops distinct handles), so each
 // call's sync_all only touches its own streams.
-//
-// Public internal-parallel calls retain the caller's current device for the
-// synchronous lease lifetime, and run_column_workers binds each worker thread
-// to that device. Capture it once so checkout and return use the same free list.
+// Capture the current device once for both checkout and check-in.
 struct leased_pool {
   stream_pool pool;
   int device = 0;
