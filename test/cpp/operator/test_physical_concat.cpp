@@ -58,6 +58,16 @@ struct hash_join_test_fixture {
   duckdb::unique_ptr<sirius_physical_hash_join> hash_join;
 };
 
+//! Depth-first, root-first numbering of a bare operator tree, standing in for
+//! pipeline::assign_operator_ids in fixtures that never build pipelines.
+void number_operator_tree(sirius_physical_operator& op, size_t& next_id)
+{
+  op.operator_id = next_id++;
+  for (auto& child : op.children) {
+    if (child) { number_operator_tree(*child, next_id); }
+  }
+}
+
 /**
  * @brief Create a minimal sirius_physical_hash_join for testing concat.
  *
@@ -108,6 +118,12 @@ hash_join_test_fixture create_test_hash_join(
     sirius::config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES,
     sirius::op::dynamic_filter_publish_plan{},  // dynamic_filter_plan
     hash_partition_bytes);
+
+  // These fixtures build a bare operator tree with no pipelines, so the converter's
+  // assign_operator_ids never runs over it. Number it here — operator code reads
+  // get_operator_id(), which rejects the unassigned sentinel.
+  size_t next_id = 0;
+  number_operator_tree(*fixture.hash_join, next_id);
 
   return fixture;
 }
@@ -666,6 +682,11 @@ TEST_CASE("right-family sibling partitions round up from the probe input", "[phy
   };
   sirius_physical_partition build_partition(make_types(), 4, fixture.hash_join.get(), true);
   sirius_physical_partition probe_partition(make_types(), 9, fixture.hash_join.get(), false);
+  // These partitions hang off the join by pointer, not as children, so create_test_hash_join's
+  // numbering does not reach them. Number them past the join tree's ids.
+  size_t partition_next_id = 100;
+  number_operator_tree(build_partition, partition_next_id);
+  number_operator_tree(probe_partition, partition_next_id);
   build_partition.set_sibling_partition_op(&probe_partition);
   probe_partition.set_sibling_partition_op(&build_partition);
   build_partition.set_drives_partition_count(false);

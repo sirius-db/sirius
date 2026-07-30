@@ -17,6 +17,7 @@
 #include "catch.hpp"
 
 // sirius
+#include "data/data_repository_manager_registry.hpp"
 #include "downgrade/downgrade_executor.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 // data utilities
@@ -63,6 +64,10 @@ size_t get_batch_size(cucascade::data_batch& batch)
 }
 
 const auto GPU_SPACE_ID = cucascade::memory::memory_space_id(cucascade::memory::Tier::GPU, 0);
+
+// These tests exercise a single query's repositories; the executor sweeps the registry,
+// so each test registers its manager under one fixed query id.
+const sirius::query_id_t kTestQueryId = sirius::make_query_id(1);
 
 std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> make_test_memory_manager()
 {
@@ -118,14 +123,14 @@ std::shared_ptr<cucascade::data_batch> make_gpu_batch(cucascade::memory::memory_
  *
  * Pass nullptr for memory_space when the monitor loop shouldn't trigger automatically.
  */
-downgrade_executor make_test_executor(cucascade::shared_data_repository_manager& repo_mgr,
+downgrade_executor make_test_executor(sirius::data::data_repository_manager_registry& repo_registry,
                                       cucascade::memory::memory_space* gpu_space,
                                       sirius::memory::sirius_memory_reservation_manager& mem_mgr)
 {
   sirius::exec::downgrade_executor_config config{
     .thread_pool    = {.num_threads = 1, .thread_name_prefix = "downgrade"},
     .monitor_period = std::chrono::milliseconds{0}};
-  return downgrade_executor(config, repo_mgr, GPU_SPACE_ID, gpu_space, mem_mgr);
+  return downgrade_executor(config, repo_registry, GPU_SPACE_ID, gpu_space, mem_mgr);
 }
 
 }  // namespace
@@ -138,10 +143,11 @@ TEST_CASE("Downgrade executor starts and stops cleanly", "[downgrade_executor]")
 {
   auto mem_mgr    = make_test_memory_manager();
   auto* gpu_space = get_gpu_space(*mem_mgr);
-  cucascade::shared_data_repository_manager repo_mgr;
+  sirius::data::data_repository_manager_registry repo_registry;
+  auto& repo_mgr = *repo_registry.create_for_query(kTestQueryId);
 
   // nullptr memory_space — monitor loop won't trigger, just tests lifecycle
-  auto executor = make_test_executor(repo_mgr, gpu_space, *mem_mgr);
+  auto executor = make_test_executor(repo_registry, gpu_space, *mem_mgr);
 
   REQUIRE_NOTHROW(executor.start());
   REQUIRE_NOTHROW(executor.stop());
@@ -151,9 +157,10 @@ TEST_CASE("request_free_memory_and_wait with no repositories returns 0", "[downg
 {
   auto mem_mgr    = make_test_memory_manager();
   auto* gpu_space = get_gpu_space(*mem_mgr);
-  cucascade::shared_data_repository_manager repo_mgr;
+  sirius::data::data_repository_manager_registry repo_registry;
+  auto& repo_mgr = *repo_registry.create_for_query(kTestQueryId);
 
-  auto executor = make_test_executor(repo_mgr, gpu_space, *mem_mgr);
+  auto executor = make_test_executor(repo_registry, gpu_space, *mem_mgr);
   executor.start();
 
   size_t freed = executor.request_free_memory_and_wait(1024);
@@ -168,11 +175,12 @@ TEST_CASE("request_free_memory_and_wait downgrades GPU batches to HOST", "[downg
   auto* gpu_space = get_gpu_space(*mem_mgr);
   REQUIRE(gpu_space != nullptr);
 
-  cucascade::shared_data_repository_manager repo_mgr;
-  auto repo   = std::make_unique<cucascade::shared_data_repository>();
-  auto batch1 = make_gpu_batch(*gpu_space);
-  auto batch2 = make_gpu_batch(*gpu_space);
-  auto batch3 = make_gpu_batch(*gpu_space);
+  sirius::data::data_repository_manager_registry repo_registry;
+  auto& repo_mgr = *repo_registry.create_for_query(kTestQueryId);
+  auto repo      = std::make_unique<cucascade::shared_data_repository>();
+  auto batch1    = make_gpu_batch(*gpu_space);
+  auto batch2    = make_gpu_batch(*gpu_space);
+  auto batch3    = make_gpu_batch(*gpu_space);
   repo->add_data_batch(batch1);
   repo->add_data_batch(batch2);
   repo->add_data_batch(batch3);
@@ -182,7 +190,7 @@ TEST_CASE("request_free_memory_and_wait downgrades GPU batches to HOST", "[downg
   REQUIRE(get_batch_tier(*batch2) == cucascade::memory::Tier::GPU);
   REQUIRE(get_batch_tier(*batch3) == cucascade::memory::Tier::GPU);
 
-  auto executor = make_test_executor(repo_mgr, gpu_space, *mem_mgr);
+  auto executor = make_test_executor(repo_registry, gpu_space, *mem_mgr);
   executor.start();
 
   size_t freed = executor.request_free_memory_and_wait(1ull << 30);
@@ -201,8 +209,9 @@ TEST_CASE("request_free_memory respects byte target via predicate", "[downgrade_
   auto* gpu_space = get_gpu_space(*mem_mgr);
   REQUIRE(gpu_space != nullptr);
 
-  cucascade::shared_data_repository_manager repo_mgr;
-  auto repo = std::make_unique<cucascade::shared_data_repository>();
+  sirius::data::data_repository_manager_registry repo_registry;
+  auto& repo_mgr = *repo_registry.create_for_query(kTestQueryId);
+  auto repo      = std::make_unique<cucascade::shared_data_repository>();
   std::vector<std::shared_ptr<cucascade::data_batch>> batches;
   for (int i = 0; i < 5; ++i) {
     auto batch = make_gpu_batch(*gpu_space);
@@ -214,7 +223,7 @@ TEST_CASE("request_free_memory respects byte target via predicate", "[downgrade_
   size_t one_batch_size = get_batch_size(*batches[0]);
   REQUIRE(one_batch_size > 0);
 
-  auto executor = make_test_executor(repo_mgr, gpu_space, *mem_mgr);
+  auto executor = make_test_executor(repo_registry, gpu_space, *mem_mgr);
   executor.start();
 
   size_t freed = executor.request_free_memory_and_wait(one_batch_size);
@@ -239,7 +248,8 @@ TEST_CASE("request_free_memory downgrades across multiple repos", "[downgrade_ex
   auto* gpu_space = get_gpu_space(*mem_mgr);
   REQUIRE(gpu_space != nullptr);
 
-  cucascade::shared_data_repository_manager repo_mgr;
+  sirius::data::data_repository_manager_registry repo_registry;
+  auto& repo_mgr = *repo_registry.create_for_query(kTestQueryId);
 
   auto repo_non_partitioned = std::make_unique<cucascade::shared_data_repository>();
   auto batch_np1            = make_gpu_batch(*gpu_space);
@@ -260,7 +270,7 @@ TEST_CASE("request_free_memory downgrades across multiple repos", "[downgrade_ex
 
   size_t one_batch_size = get_batch_size(*batch_p0);
 
-  auto executor = make_test_executor(repo_mgr, gpu_space, *mem_mgr);
+  auto executor = make_test_executor(repo_registry, gpu_space, *mem_mgr);
   executor.start();
 
   // Request enough to downgrade at least one batch
@@ -283,12 +293,13 @@ TEST_CASE("request_free_memory iterates partitions from last to first", "[downgr
   auto* gpu_space = get_gpu_space(*mem_mgr);
   REQUIRE(gpu_space != nullptr);
 
-  cucascade::shared_data_repository_manager repo_mgr;
-  auto repo     = std::make_unique<cucascade::shared_data_repository>();
-  auto batch_p0 = make_gpu_batch(*gpu_space);
-  auto batch_p1 = make_gpu_batch(*gpu_space);
-  auto batch_p2 = make_gpu_batch(*gpu_space);
-  auto batch_p3 = make_gpu_batch(*gpu_space);
+  sirius::data::data_repository_manager_registry repo_registry;
+  auto& repo_mgr = *repo_registry.create_for_query(kTestQueryId);
+  auto repo      = std::make_unique<cucascade::shared_data_repository>();
+  auto batch_p0  = make_gpu_batch(*gpu_space);
+  auto batch_p1  = make_gpu_batch(*gpu_space);
+  auto batch_p2  = make_gpu_batch(*gpu_space);
+  auto batch_p3  = make_gpu_batch(*gpu_space);
   repo->add_data_batch(batch_p0, 0);
   repo->add_data_batch(batch_p1, 1);
   repo->add_data_batch(batch_p2, 2);
@@ -297,7 +308,7 @@ TEST_CASE("request_free_memory iterates partitions from last to first", "[downgr
 
   size_t two_batches = get_batch_size(*batch_p0) * 2;
 
-  auto executor = make_test_executor(repo_mgr, gpu_space, *mem_mgr);
+  auto executor = make_test_executor(repo_registry, gpu_space, *mem_mgr);
   executor.start();
 
   size_t freed = executor.request_free_memory_and_wait(two_batches);
@@ -317,11 +328,12 @@ TEST_CASE("request_free_memory skips active partitions in first pass", "[downgra
   auto* gpu_space = get_gpu_space(*mem_mgr);
   REQUIRE(gpu_space != nullptr);
 
-  cucascade::shared_data_repository_manager repo_mgr;
-  auto repo     = std::make_unique<cucascade::shared_data_repository>();
-  auto batch_p0 = make_gpu_batch(*gpu_space);
-  auto batch_p1 = make_gpu_batch(*gpu_space);
-  auto batch_p2 = make_gpu_batch(*gpu_space);
+  sirius::data::data_repository_manager_registry repo_registry;
+  auto& repo_mgr = *repo_registry.create_for_query(kTestQueryId);
+  auto repo      = std::make_unique<cucascade::shared_data_repository>();
+  auto batch_p0  = make_gpu_batch(*gpu_space);
+  auto batch_p1  = make_gpu_batch(*gpu_space);
+  auto batch_p2  = make_gpu_batch(*gpu_space);
   repo->add_data_batch(batch_p0, 0);
   repo->add_data_batch(batch_p1, 1);
   repo->add_data_batch(batch_p2, 2);
@@ -332,7 +344,7 @@ TEST_CASE("request_free_memory skips active partitions in first pass", "[downgra
 
   size_t three_batches = get_batch_size(*batch_p0) * 3;
 
-  auto executor = make_test_executor(repo_mgr, gpu_space, *mem_mgr);
+  auto executor = make_test_executor(repo_registry, gpu_space, *mem_mgr);
   executor.start();
 
   size_t freed = executor.request_free_memory_and_wait(three_batches);
@@ -355,7 +367,8 @@ TEST_CASE("request_free_memory skips batches already on HOST", "[downgrade_execu
   auto* gpu_space = get_gpu_space(*mem_mgr);
   REQUIRE(gpu_space != nullptr);
 
-  cucascade::shared_data_repository_manager repo_mgr;
+  sirius::data::data_repository_manager_registry repo_registry;
+  auto& repo_mgr  = *repo_registry.create_for_query(kTestQueryId);
   auto repo       = std::make_unique<cucascade::shared_data_repository>();
   auto gpu_batch  = make_gpu_batch(*gpu_space);
   auto gpu_batch2 = make_gpu_batch(*gpu_space);
@@ -381,7 +394,7 @@ TEST_CASE("request_free_memory skips batches already on HOST", "[downgrade_execu
 
   repo_mgr.add_new_repository(1, "out", std::move(repo));
 
-  auto executor = make_test_executor(repo_mgr, gpu_space, *mem_mgr);
+  auto executor = make_test_executor(repo_registry, gpu_space, *mem_mgr);
   executor.start();
 
   size_t freed = executor.request_free_memory_and_wait(1ull << 30);
@@ -399,13 +412,14 @@ TEST_CASE("request_free_memory returns future that resolves to bytes freed", "[d
   auto* gpu_space = get_gpu_space(*mem_mgr);
   REQUIRE(gpu_space != nullptr);
 
-  cucascade::shared_data_repository_manager repo_mgr;
-  auto repo  = std::make_unique<cucascade::shared_data_repository>();
-  auto batch = make_gpu_batch(*gpu_space);
+  sirius::data::data_repository_manager_registry repo_registry;
+  auto& repo_mgr = *repo_registry.create_for_query(kTestQueryId);
+  auto repo      = std::make_unique<cucascade::shared_data_repository>();
+  auto batch     = make_gpu_batch(*gpu_space);
   repo->add_data_batch(batch);
   repo_mgr.add_new_repository(1, "out", std::move(repo));
 
-  auto executor = make_test_executor(repo_mgr, gpu_space, *mem_mgr);
+  auto executor = make_test_executor(repo_registry, gpu_space, *mem_mgr);
   executor.start();
 
   auto future  = executor.request_free_memory(1ull << 30);
@@ -422,8 +436,9 @@ TEST_CASE("request_downgrade with custom predicate stops when satisfied", "[down
   auto* gpu_space = get_gpu_space(*mem_mgr);
   REQUIRE(gpu_space != nullptr);
 
-  cucascade::shared_data_repository_manager repo_mgr;
-  auto repo = std::make_unique<cucascade::shared_data_repository>();
+  sirius::data::data_repository_manager_registry repo_registry;
+  auto& repo_mgr = *repo_registry.create_for_query(kTestQueryId);
+  auto repo      = std::make_unique<cucascade::shared_data_repository>();
   std::vector<std::shared_ptr<cucascade::data_batch>> batches;
   for (int i = 0; i < 5; ++i) {
     auto batch = make_gpu_batch(*gpu_space);
@@ -434,7 +449,7 @@ TEST_CASE("request_downgrade with custom predicate stops when satisfied", "[down
 
   std::atomic<size_t> call_count{0};
 
-  auto executor = make_test_executor(repo_mgr, gpu_space, *mem_mgr);
+  auto executor = make_test_executor(repo_registry, gpu_space, *mem_mgr);
   executor.start();
 
   // Predicate returns true on first call — should stop after ~1 batch
@@ -464,14 +479,15 @@ TEST_CASE("request_free_memory partial fulfillment returns actual bytes freed",
   auto* gpu_space = get_gpu_space(*mem_mgr);
   REQUIRE(gpu_space != nullptr);
 
-  cucascade::shared_data_repository_manager repo_mgr;
+  sirius::data::data_repository_manager_registry repo_registry;
+  auto& repo_mgr    = *repo_registry.create_for_query(kTestQueryId);
   auto repo         = std::make_unique<cucascade::shared_data_repository>();
   auto batch        = make_gpu_batch(*gpu_space);
   size_t batch_size = get_batch_size(*batch);
   repo->add_data_batch(batch);
   repo_mgr.add_new_repository(1, "out", std::move(repo));
 
-  auto executor = make_test_executor(repo_mgr, gpu_space, *mem_mgr);
+  auto executor = make_test_executor(repo_registry, gpu_space, *mem_mgr);
   executor.start();
 
   // Request far more than available

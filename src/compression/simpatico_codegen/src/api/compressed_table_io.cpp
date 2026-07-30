@@ -238,12 +238,7 @@ static std::uint64_t leaf_alloc_bytes(std::string_view name,
   cudf::data_type const dt = tag_to_dtype(type_tag);
   auto const width         = static_cast<std::uint64_t>(cudf::size_of(dt));
   auto const elem          = std::max<std::uint64_t>(width, 1);
-  std::uint64_t pad_elems  = 0;
-  if (name == "packed") {
-    constexpr std::uint64_t kBitpackGatherSlopBytes = 2 * sizeof(std::uint32_t);
-    pad_elems                                       = (kBitpackGatherSlopBytes + elem - 1) / elem;
-  }
-  return (num_rows + pad_elems) * width;
+  return num_rows * width;
 }
 
 static std::unique_ptr<compressed_representation> rep_from_leaf_desc(
@@ -263,23 +258,8 @@ static std::unique_ptr<compressed_representation> rep_from_leaf_desc(
   auto make_col = [&](std::size_t i) -> std::unique_ptr<cudf::column> {
     auto const& bd     = bufs[i];
     cudf::data_type dt = tag_to_dtype(bd.type_tag);
-    // simpatico_bitunpack_one (decode kPrelude) does a fixed 3-word gather
-    // — packed[word_in], [word_in+1], [word_in+2] — so decoding the last
-    // element of a bitpacked "packed" buffer reads up to 2 uint32 words past
-    // its logical end. Over-allocate those buffers by 2 words of tail slop so
-    // the read stays in bounds. The slop is masked off in the decode, so its
-    // (uninitialized) contents never affect the result; only its addressability
-    // matters. Without it the OOB read faults the context and cascades into
-    // unrelated decode-kernel launch failures on concurrent streams.
-    constexpr cudf::size_type kBitpackGatherSlopBytes =
-      2 * static_cast<cudf::size_type>(sizeof(std::uint32_t));
-    cudf::size_type pad_elems = 0;
-    if (bd.name == "packed") {
-      auto const elem = std::max<std::size_t>(cudf::size_of(dt), 1);
-      pad_elems       = static_cast<cudf::size_type>((kBitpackGatherSlopBytes + elem - 1) / elem);
-    }
-    auto col = cudf::make_numeric_column(dt,
-                                         static_cast<cudf::size_type>(bd.num_rows) + pad_elems,
+    auto col           = cudf::make_numeric_column(dt,
+                                         static_cast<cudf::size_type>(bd.num_rows),
                                          cudf::mask_state::UNALLOCATED,
                                          stream,
                                          leaf_mr);

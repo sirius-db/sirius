@@ -15,6 +15,7 @@
 #include <nvtx3/nvtx3.hpp>
 
 #include <atomic>
+#include <map>
 #include <mutex>
 #include <span>
 #include <stdexcept>
@@ -108,17 +109,19 @@ void validate_column_names(std::vector<std::string> const& column_names, size_t 
 // result is safe to free by any stream (including the RMM default) with no
 // external rebinding. Streams are recycled between calls, so this also avoids
 // per-call stream create/destroy churn.
+// CUDA streams are device-bound, so recycled streams are keyed by device.
 class stream_cache {
  public:
-  // Hand out n valid streams, reusing recycled ones and creating the rest.
-  std::vector<cudaStream_t> checkout(size_t n)
+  // The caller must have `device` current when new streams are created.
+  std::vector<cudaStream_t> checkout(int device, size_t n)
   {
     std::vector<cudaStream_t> out;
     out.reserve(n);
     std::lock_guard<std::mutex> lock(mu_);
-    while (out.size() < n && !free_.empty()) {
-      out.push_back(free_.back());
-      free_.pop_back();
+    auto& free_list = free_[device];
+    while (out.size() < n && !free_list.empty()) {
+      out.push_back(free_list.back());
+      free_list.pop_back();
     }
     while (out.size() < n) {
       cudaStream_t s{};
@@ -127,18 +130,19 @@ class stream_cache {
     }
     return out;
   }
-  // Return streams for reuse. They are kept alive (never destroyed): buffers of
-  // previously-returned results may still reference them for their async free.
-  void check_in(std::vector<cudaStream_t>& streams)
+
+  // Return streams to the same device list they were checked out from.
+  void check_in(int device, std::vector<cudaStream_t>& streams)
   {
     std::lock_guard<std::mutex> lock(mu_);
-    free_.insert(free_.end(), streams.begin(), streams.end());
+    auto& free_list = free_[device];
+    free_list.insert(free_list.end(), streams.begin(), streams.end());
     streams.clear();
   }
 
  private:
   std::mutex mu_;
-  std::vector<cudaStream_t> free_;
+  std::map<int, std::vector<cudaStream_t>> free_;
 };
 
 stream_cache& global_stream_cache()
@@ -153,19 +157,27 @@ stream_cache& global_stream_cache()
 // its eventual async free even after this pool is gone. Concurrent leases get
 // disjoint streams (checkout is mutex-guarded and pops distinct handles), so each
 // call's sync_all only touches its own streams.
+// Capture the current device once for both checkout and check-in.
 struct leased_pool {
   stream_pool pool;
+  int device = 0;
 
   explicit leased_pool(int column_threads)
   {
-    pool.streams = global_stream_cache().checkout(static_cast<size_t>(std::max(1, column_threads)));
+    if (cudaGetDevice(&device) != cudaSuccess)
+      throw plan_error("failed to query the current device for the internal stream lease");
+
+    pool.streams =
+      global_stream_cache().checkout(device, static_cast<size_t>(std::max(1, column_threads)));
+
     if (pool.streams.empty()) throw plan_error("failed to lease internal streams");
   }
+
   ~leased_pool()
   {
     pool.sync_all();
     global_stream_cache().check_in(
-      pool.streams);  // leaves pool.streams empty; ~stream_pool is a no-op
+      device, pool.streams);  // leaves pool.streams empty; ~stream_pool is a no-op
   }
 
   leased_pool(const leased_pool&)            = delete;

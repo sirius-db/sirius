@@ -235,7 +235,7 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
       // Execute via the standard sirius_interface path.
       duckdb::PendingQueryParameters parameters;
       state.result = state.iface->sirius_execute_query(
-        context.client, "transparent_execution", gpu_prepared, parameters);
+        context.client, "transparent_execution", gpu_prepared, parameters, window->query_id());
 
       if (state.result->HasError()) {
         gpu_error = state.result->GetErrorObject();
