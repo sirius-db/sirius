@@ -249,9 +249,9 @@ struct topology {
 
 struct gpu_mem_config {
   std::variant<double, std::uint64_t> usage_limit{0.95};
-  std::variant<double, std::uint64_t> reservation_limit{0.9};
-  double downgrade_trigger_fraction{1.0};
-  double downgrade_stop_fraction{0.7};
+  std::variant<double, std::uint64_t> reservation_limit{1.0};
+  double downgrade_trigger_fraction{0.8};
+  double downgrade_stop_fraction{0.6};
   bool track_per_stream_reservation{false};
 
   static void from_yaml(const YAML::Node& node, gpu_mem_config& opt)
@@ -267,7 +267,7 @@ struct gpu_mem_config {
                                   : std::variant<double, std::uint64_t>{usage_frac};
     // reservation_limit: fraction or absolute bytes
     std::optional<std::uint64_t> res_bytes;
-    double res_frac = 0.9;
+    double res_frac = 1.0;
     r.optional("reservation_limit_bytes", yaml::bytes(res_bytes));
     r.optional("reservation_limit_fraction", res_frac, yaml::fraction<double>{});
     opt.reservation_limit = res_bytes ? std::variant<double, std::uint64_t>{*res_bytes}
@@ -299,8 +299,10 @@ struct gpu_mem_config {
 struct host_mem_config {
   std::uint64_t numa_region_capacity_bytes = 8UL << 30;  // 8GB per NUMA node
   std::variant<double, std::uint64_t> reservation_limit{0.9};
-  double downgrade_trigger_fraction{0.8};
-  double downgrade_stop_fraction{0.7};
+  // trigger == stop == 1.0 keeps host->disk eviction off by default, matching the empty
+  // downgrade_root_dirs default (no spill target). Set both below 1.0 to enable it.
+  double downgrade_trigger_fraction{1.0};
+  double downgrade_stop_fraction{1.0};
   std::size_t block_size{cucascade::memory::default_block_size};
   std::size_t pool_size{cucascade::memory::default_pool_size};
   std::size_t initial_number_pools{cucascade::memory::default_initial_number_pools};

@@ -120,10 +120,10 @@ Controls how much GPU VRAM Sirius claims and when it starts evicting data to hos
 |-----|------|---------|-------------|
 | `usage_limit_fraction` | double | 0.95 | Fraction of total VRAM to use as Sirius's GPU memory capacity. The remaining 5% is left for the CUDA runtime, cuDF temporaries, and other GPU consumers. |
 | `usage_limit_bytes` | bytes | — | Absolute VRAM limit. Mutually exclusive with `usage_limit_fraction`. |
-| `reservation_limit_fraction` | double | 0.9 | Fraction of the GPU capacity (set by `usage_limit_*`) that can be reserved by pipeline tasks. Reservations are acquired before task execution and prevent overcommit. |
+| `reservation_limit_fraction` | double | 1.0 | Fraction of the GPU capacity (set by `usage_limit_*`) that can be reserved by pipeline tasks. Reservations are acquired before task execution and prevent overcommit. |
 | `reservation_limit_bytes` | bytes | — | Absolute reservation limit. Mutually exclusive with `reservation_limit_fraction`. |
-| `downgrade_trigger_fraction` | double | 1.0 | Start evicting GPU-resident data to host when reserved memory exceeds this fraction of capacity. At the default of 1.0, downgrading only triggers when the GPU is fully reserved. |
-| `downgrade_stop_fraction` | double | 0.7 | Stop evicting when reserved memory drops to this fraction of capacity. The gap between trigger and stop prevents oscillation. |
+| `downgrade_trigger_fraction` | double | 0.8 | Start evicting GPU-resident data to host when reserved memory exceeds this fraction of capacity. |
+| `downgrade_stop_fraction` | double | 0.6 | Stop evicting when reserved memory drops to this fraction of capacity. The gap between trigger and stop prevents oscillation. |
 | `track_per_stream_reservation` | bool | false | Track memory reservations per CUDA stream instead of globally. Useful for debugging per-task memory usage. |
 
 ### Host Memory (`sirius.memory.host`)
@@ -135,8 +135,8 @@ Controls pinned host memory pools. One pool group is created per NUMA node (auto
 | `capacity_bytes` | bytes | 8Gi | Pinned host memory capacity **per NUMA node**. This memory is allocated at startup using `cudaMallocHost`. |
 | `reservation_limit_fraction` | double | 0.9 | Fraction of host capacity that can be reserved. |
 | `reservation_limit_bytes` | bytes | — | Absolute reservation limit. Mutually exclusive with `reservation_limit_fraction`. |
-| `downgrade_trigger_fraction` | double | 0.8 | Start evicting host-resident data to disk when reserved memory exceeds this fraction. |
-| `downgrade_stop_fraction` | double | 0.7 | Stop evicting when reserved memory drops to this fraction. |
+| `downgrade_trigger_fraction` | double | 1.0 | Start evicting host-resident data to disk when reserved memory exceeds this fraction. At the default of 1.0 host→disk eviction is off, matching the empty `downgrade_root_dirs`. |
+| `downgrade_stop_fraction` | double | 1.0 | Stop evicting when reserved memory drops to this fraction. |
 | `block_size` | bytes | 1Mi | Size of each allocation block in the pool. Larger blocks reduce allocation overhead but waste memory on small allocations. |
 | `pool_size` | int | 128 | Number of blocks per pool. Total pool capacity = `block_size × pool_size`. |
 | `initial_number_pools` | int | 4 | Number of pools pre-allocated at startup. Additional pools are created on demand. Initial host footprint = `block_size × pool_size × initial_number_pools`. |
