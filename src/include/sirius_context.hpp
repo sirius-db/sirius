@@ -609,9 +609,10 @@ class SiriusContext : public ClientContextState {
   void run_mandatory_cleanup_backstop(sirius::query_id_t query_id,
                                       std::string_view end_tag) noexcept;
 
-  /// \brief Best-effort task_creator reset for latched-unavailable paths,
-  /// where no later window will ever run the in-cleanup reset.
-  void drop_task_creator_state_best_effort(sirius::query_id_t query_id) noexcept;
+  /// \brief Best-effort per-query teardown for latched-unavailable paths, where no later
+  /// window will ever run the in-cleanup reset: drops @p query_id's task_creator state and its
+  /// queued tasks. Each step is separately guarded; neither can throw.
+  void drop_query_runtime_state_best_effort(sirius::query_id_t query_id) noexcept;
 
   mutable std::mutex mutex_;
   // The Super Sirius runtime is shared across connections, so plan generation

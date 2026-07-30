@@ -167,6 +167,17 @@ class task_scheduler {
   std::future<void> start_query();
 
   /**
+   * @brief Drop every queued task belonging to @p query_id.
+   *
+   * Clears the scheduler's queue and each GPU executor's queue of that query's pending work,
+   * leaving every other query's tasks in place. In-flight tasks are unaffected.
+   *
+   * Called from the per-query cleanup so a finished or failed query leaves nothing queued that
+   * points into the plan about to be destroyed.
+   */
+  void drain_query_tasks(sirius::query_id_t query_id);
+
+  /**
    * @brief Terminate the query execution and report the error to duckdb.
    *
    * @param error The error to report.
