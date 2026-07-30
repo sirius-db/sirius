@@ -150,12 +150,6 @@ class Walker {
   std::vector<DecodeBufferSpec> buffers_;
   SharedMemAllocator sm_;
   std::unordered_map<const ::codegen::jit::FusedTree*, std::int32_t> ids_;
-  // When non-empty, zigzag_value_source_inline uses this expression as the
-  // per-chunk base index rather than chunk_start.  Set by emit_rle_producer
-  // while generating the Zigzag runs-child producer so that compact run-indexed
-  // data (total_runs elements, not chunk_id*kChunkSize strided) is accessed at
-  // the correct offset.
-  std::string zigzag_rle_base_override_;
 
   // DFS-preorder, lex-sorted children (std::map iteration) — must match
   // jit::assign_ids and the decode binder (bind_fused_subtree) so
@@ -669,14 +663,7 @@ void Walker::emit_rle_producer(const ::codegen::jit::FusedTree& node,
             << "));\n";
     } else {
       // Runs child needs materialisation; use SmemCountsReader functor.
-      // When the direct runs child is a leaf Zigzag its stored data is compact
-      // (total_runs elements indexed by global run number, not chunk-strided),
-      // so use rle_runs_offsets[chunk_id] as the base rather than chunk_start.
-      const bool runs_is_leaf_zigzag =
-        rit->second->op == ::codegen::OpKind::Zigzag && rit->second->children.empty();
-      if (runs_is_leaf_zigzag) zigzag_rle_base_override_ = p_off + "[chunk_id]";
       emit_producer(*rit->second, sh_counts, nruns, "int32_t");
-      zigzag_rle_base_override_.clear();
       body_ << "        __syncthreads();\n"
             << "        ::codegen::block_rle_decompress_fv<" << elem_type << ">(\n"
             << "            " << vread << ",\n"
@@ -874,14 +861,10 @@ ValueSource Walker::zigzag_value_source_inline(const ::codegen::jit::FusedTree& 
   add_param("const " + elem_type + "* __restrict__", p_data);
   add_buffer(id, "zigzag", esize);
 
-  // Stored element at this position.  Normally base == chunk_start
-  // (chunk_id*CHUNK), but when the Zigzag is an RLE's runs child the stored
-  // data is compact (total_runs elements indexed by global run number), so the
-  // base must be the cumulative run offset for this chunk instead.
-  const std::string base_expr =
-    zigzag_rle_base_override_.empty() ? "chunk_start" : zigzag_rle_base_override_;
+  // Stored element at this position (read once textually; compiler CSEs the
+  // duplicate load).  base == chunk_start (chunk_id*CHUNK), known at entry.
   const std::string load = "static_cast<" + utype + ">(static_cast<" + exact_unsigned(esize) +
-                           ">(" + p_data + "[" + base_expr + " + (__POS__)]))";
+                           ">(" + p_data + "[chunk_start + (__POS__)]))";
 
   ValueSource vs;
   vs.elem_type = elem_type;

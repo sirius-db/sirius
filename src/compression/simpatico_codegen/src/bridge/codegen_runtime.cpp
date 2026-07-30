@@ -1104,13 +1104,25 @@ static int launch_encode_fused_tree_impl(const simpatico::CodegenHead& head,
           const auto i_zz = find_buffer_idx(spec.buffers, node_id, "zigzag");
           const std::size_t zz_rows =
             static_cast<std::size_t>(num_chunks) * static_cast<std::size_t>(kChunkSize);
-          auto zz_col = std::make_unique<cudf::column>(original_type,
+          // Use the renderer's actual buffer elem_size to determine the column type.
+          // When Zigzag sits on an RLE "runs" channel the kernel processes int32_t
+          // run counts, so elem_size == 4 regardless of the column's element type.
+          // Using original_type for INT16 columns would make ANS compress only the
+          // low 2 bytes of each int32_t code, corrupting the run counts on decode.
+          const std::int32_t zz_elem_size = static_cast<std::int32_t>(spec.buffers[i_zz].elem_size);
+          const cudf::data_type zz_type =
+            (zz_elem_size == static_cast<std::int32_t>(cudf::size_of(original_type)))
+              ? original_type
+            : (zz_elem_size == 8) ? cudf::data_type(cudf::type_id::INT64)
+            : (zz_elem_size == 1) ? cudf::data_type(cudf::type_id::UINT8)
+                                  : cudf::data_type(cudf::type_id::INT32);
+          auto zz_col = std::make_unique<cudf::column>(zz_type,
                                                        static_cast<cudf::size_type>(zz_rows),
                                                        std::move(bufs[i_zz]),
                                                        rmm::device_buffer(0, stream),
                                                        0);
           auto rep    = std::make_unique<simpatico::codegen_fused_representation>(
-            simpatico::OpId::Zigzag, original_type, static_cast<cudf::size_type>(num_rows));
+            simpatico::OpId::Zigzag, zz_type, static_cast<cudf::size_type>(num_rows));
           rep->buffers.emplace_back("zigzag", std::move(zz_col));
           builder->leaves.emplace(origin.plan_node, std::move(rep));
           break;
