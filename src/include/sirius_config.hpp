@@ -239,8 +239,8 @@ struct sirius_config {
   std::vector<cucascade::memory::memory_space_config> _memory_space_configs;
   creator::task_creator_config _task_creator_config;
   scan_manager::scan_manager_config _scan_manager_config{};
-  exec::thread_pool_config _gpu_pipeline_executor_config{.num_threads        = 4,
-                                                         .thread_name_prefix = "gpu_pipeline"};
+  exec::thread_pool_config _gpu_pipeline_executor_config{
+    .num_threads = exec::default_gpu_pipeline_num_threads, .thread_name_prefix = "gpu_pipeline"};
   exec::downgrade_executor_config _downgrade_executor_config;
   operator_params _operator_params;
   telemetry_config _telemetry_config;

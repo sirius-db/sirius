@@ -246,7 +246,7 @@ Every thread-pool sub-block shares three keys:
 
 ### `sirius.executor.task_creator`
 
-Thread pool (default `num_threads: 2`, prefix `task_creator`) plus:
+Thread pool (default `num_threads: 1`, prefix `task_creator`) plus:
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
@@ -259,7 +259,7 @@ Thread pool only (default `num_threads: 4`, prefix `gpu_pipeline`). No extra key
 
 ### `sirius.executor.downgrade`
 
-Thread pool (default `num_threads: 4`, prefix `downgrade`) plus:
+Thread pool (default `num_threads: 1`, prefix `downgrade`) plus:
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
@@ -273,7 +273,7 @@ The `sirius.executor.scan_manager` block configures the scan-metadata thread poo
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `num_threads` | int (**> 2**) | 8 | Threads in the scan-manager pool that run metadata tasks. Rejected unless strictly greater than 2 (i.e. minimum 3). |
+| `num_threads` | int (**> 2**) | remaining cores (min 4) | Threads in the scan-manager pool that run metadata tasks. Defaults to every core left after the other default pools (1 downgrade + 1 task_creator + 4 pipeline + 1 uring reactor), with a floor of 4. Rejected unless strictly greater than 2 (i.e. minimum 3). |
 | `thread_name_prefix` | string | `scan_manager` | Thread name prefix for logs. |
 | `cpu_affinity` | list of int | — | Cores to pin scan-manager threads to. |
 | `use_sirius_datasource` | bool | true | Route reads through the Sirius `io_uring` datasource. When false, the kvikio fallback is used (single-GPU only; multi-GPU requires the Sirius datasource). |
@@ -452,10 +452,10 @@ per-pool extras.
 
 | Pool | YAML block | Default Threads | Thread Name Prefix | Purpose |
 |------|-----------|----------------|-------------------|---------|
-| `task_creator` | `executor.task_creator` | 2 | `task_creator` | Task creation from scheduling requests |
+| `task_creator` | `executor.task_creator` | 1 | `task_creator` | Task creation from scheduling requests |
 | `gpu_pipeline_executor` | `executor.pipeline` | 4 | `gpu_pipeline` | GPU pipeline task execution |
-| `downgrade_executor` | `executor.downgrade` | 4 | `downgrade` | Data tier migration (GPU→Host) |
-| `scan_manager` | `executor.scan_manager` | 8 | `scan_manager` | Scan metadata production + IO reactor management |
+| `downgrade_executor` | `executor.downgrade` | 1 | `downgrade` | Data tier migration (GPU→Host) |
+| `scan_manager` | `executor.scan_manager` | remaining cores (min 4) | `scan_manager` | Scan metadata production + IO reactor management |
 
 Each pool supports optional CPU affinity lists (`cpu_affinity`) for core pinning. `num_threads`
 must be `> 0` for every pool except `scan_manager`, which requires `> 2`.
