@@ -266,7 +266,7 @@ class task_creator {
    * Operator ids restart at 0 for every query, so `global_states` is only unique *within* an
    * entry; keying it globally is what would let two queries fetch each other's state.
    */
-  struct query_task_state {
+  struct query_task_global_state {
     //! Source operator id -> that pipeline's task global state. Written once by
     //! prepare_for_query, read-only afterwards.
     std::unordered_map<size_t, std::shared_ptr<pipeline::sirius_pipeline_task_global_state>>
@@ -293,7 +293,8 @@ class task_creator {
   };
 
   //! Resolve a query's state, or nullptr when it has already been reset.
-  std::shared_ptr<query_task_state> get_query_state(sirius::query_id_t query_id) const;
+  std::shared_ptr<query_task_global_state> get_query_task_global_state(
+    sirius::query_id_t query_id) const;
 
   // Queue for creating tasks based on operators. The operator is the starting point to start
   // looking which task should be created, not necessarily the operator for whose pipeline the task
@@ -306,8 +307,8 @@ class task_creator {
   exec::multi_index_priority_queue<task_creation_request> _task_creation_queue;
 
   //! One entry per in-flight query. Guarded by _global_state_mutex.
-  std::map<sirius::query_id_t, std::shared_ptr<query_task_state>> _query_states;
-  mutable std::mutex _global_state_mutex;  // Protect concurrent access to _query_states
+  std::map<sirius::query_id_t, std::shared_ptr<query_task_global_state>> _query_task_global_states;
+  mutable std::mutex _global_state_mutex;  // Protect concurrent access to _query_task_global_states
 
   /// Shared GPU<->NUMA topology index for NUMA-aware GPU routing (may be null).
   /// Scoped to the memory manager's reserved GPU/HOST spaces:
