@@ -133,9 +133,9 @@ struct operator_params {
 
   /// Materialize integer and fixed-point DECIMAL scan columns in the narrowest exact physical
   /// cuDF carrier proven by source min/max statistics, restoring the declared SQL type only at
-  /// expression and result boundaries. This is opt-in while the cost model and source coverage
-  /// are being validated.
-  bool enable_compressed_materialization = false;
+  /// expression and result boundaries. Narrowing applies to pinned scans; a scan the pin path
+  /// does not serve keeps its declared carrier.
+  bool enable_compressed_materialization = true;
 };
 
 struct telemetry_config {

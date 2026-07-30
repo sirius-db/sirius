@@ -343,7 +343,7 @@ Four optional nested sub-configs tune the individual backends and caches:
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `scan_task_batch_size` | 512 MB | Target batch size for DuckDB scan tasks |
-| `enable_compressed_materialization` | false | Use statistics-guided, runtime-verified narrower integer and fixed-point DECIMAL carriers for eligible scan outputs and pinned chunks; restore the declared SQL carrier at semantic boundaries. |
+| `enable_compressed_materialization` | true | Store eligible integer and fixed-point DECIMAL values in value-preserving narrower carriers when exact pin-time bounds permit it; restore native carriers at type-sensitive boundaries. |
 | `max_sort_partition_bytes` | 0 (auto) | Max bytes per sort partition. Auto = 33% of GPU memory. |
 | `hash_partition_bytes` | 512 MB | Target partition size for hash joins and group-bys |
 | `concat_batch_bytes` | 512 MB | Target output batch size for CONCAT operator |
@@ -512,18 +512,19 @@ These can also be set at load via the `SIRIUS_LOG_BACKEND`, `SIRIUS_LOG_DIR`, an
 | `opt_table_scan_num_streams` | - | Number of CUDA streams for optimized scan |
 | `opt_table_scan_memcpy_size` | - | Memcpy size for optimized scan |
 | `scan_task_batch_size` | 512 MB | Target scan batch size |
-| `enable_compressed_materialization` | false | Keep eligible integer and fixed-point DECIMAL values in narrower physical carriers until a native semantic boundary. |
+| `enable_compressed_materialization` | true | Keep eligible integer and fixed-point DECIMAL values in narrower physical carriers until a native semantic boundary. |
 
 `enable_compressed_materialization` is also accepted in YAML under `sirius.operator_params`.
-Plan-time source statistics nominate scan carriers for scans served from a pinned entry that
-already narrowed those columns; unpinned scans stay native. Exact runtime bounds guard narrowing
-casts, and `pin_table` selects carriers independently for each materialized chunk. Changing the setting does
-not rewrite an existing pinned entry; cached scans normalize its actual stored carriers for the
+At pin time, exact per-chunk bounds select stored carriers. At query planning, a matching pinned
+entry's recorded column-storage metadata determines the scan carriers; Parquet footer and DuckDB
+catalog statistics are not consulted for this decision. Unpinned scans stay native, and exact
+runtime bounds guard any narrowing cast required after a plan becomes stale. Changing the setting
+does not rewrite an existing pinned entry; cached scans normalize its stored carriers for the
 current query. See [Compressed Materialization](compressed-materialization.md) for eligibility,
-restoration, and cache-reservation behavior.
+restoration boundaries, and cache-reservation behavior.
 
 ```sql
-SET enable_compressed_materialization = true;
+SET enable_compressed_materialization = false;
 ```
 
 ### Pipeline / Operator

@@ -4,16 +4,16 @@ Compressed materialization keeps bounded numeric values in a narrower physical c
 preserving the original SQL logical type. It applies to every eligible scan output, not only join
 or group keys, and includes fixed-point `DECIMAL` payloads.
 
-The optimization is opt-in:
+The optimization is on by default. To turn it off:
 
 ```yaml
 sirius:
   operator_params:
-    enable_compressed_materialization: true
+    enable_compressed_materialization: false
 ```
 
 It can also be changed for a connection with
-`SET enable_compressed_materialization = true`.
+`SET enable_compressed_materialization = false`.
 
 ## Logical and physical schemas
 

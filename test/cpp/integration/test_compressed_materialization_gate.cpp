@@ -31,6 +31,7 @@
 // invisible to that pass, so their serves stay cast-free.
 
 #include "compressed_materialization_test_common.hpp"
+#include "sirius_config.hpp"
 #include "sirius_context.hpp"
 
 #include <catch.hpp>
@@ -126,6 +127,15 @@ std::size_t entry_chunk_count(sirius::scan_manager::pinned_entry const& e)
 
 }  // namespace
 
+// Narrowing is the materialization every pinned numeric scan column gets without anyone asking
+// for it, so the enabled default is part of the contract rather than a convenience. The SQL
+// setting registers its default from this same struct member, which is why pinning the member
+// pins both.
+TEST_CASE("compressed materialization is enabled by default", "[compressed_materialization_gate]")
+{
+  REQUIRE(sirius::operator_params{}.enable_compressed_materialization);
+}
+
 // NB: no [integration]/[shared_context] tag — this TEST_CASE builds its own
 // SiriusContext from a small-batch yaml and manages (pauses) the shared envs
 // itself, mirroring the other isolated-context pin tests.
@@ -149,6 +159,12 @@ TEST_CASE("gpu_execution - compressed materialization residency gate states end 
   {
     sirius::test::shared_test_env local_env(yaml_path);
     auto con = local_env.make_connection();
+
+    // Read before any SET on this connection, so it is the registered default that answers.
+    auto registered_default =
+      con.Query("SELECT current_setting('enable_compressed_materialization')::BOOLEAN;");
+    require_ok(registered_default, "read registered default");
+    REQUIRE(registered_default->GetValue(0, 0).GetValue<bool>());
 
     // A gate regression must fail loudly instead of silently falling back.
     require_ok(con.Query("SET enable_duckdb_fallback = false;"), "disable fallback");
