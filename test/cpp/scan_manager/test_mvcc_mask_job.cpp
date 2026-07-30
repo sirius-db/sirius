@@ -28,6 +28,7 @@
 
 #include <catch.hpp>
 #include <cucascade/memory/topology_discovery.hpp>
+#include <cucascade/memory/topology_index.hpp>
 #include <duckdb.hpp>
 #include <duckdb/catalog/catalog.hpp>
 #include <duckdb/catalog/catalog_entry/duck_table_entry.hpp>
@@ -36,7 +37,6 @@
 #include <duckdb/transaction/duck_transaction.hpp>
 #include <exec/scoped_dispatcher.hpp>
 #include <exec/thread_pool.hpp>
-#include <memory/topology_index.hpp>
 #include <op/scan/duckdb_mvcc_visibility.hpp>
 #include <scan_manager/mvcc_mask_job.hpp>
 #include <unistd.h>
@@ -130,7 +130,7 @@ bool bit_at(std::span<std::uint32_t const> words, std::size_t i)
 /// reservations) + a trivial topology (unknown GPUs normalize to node 0).
 struct job_env {
   std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> mgr;
-  sirius::memory::topology_index topology;
+  cucascade::memory::topology_index topology;
 
   job_env()
     : mgr(sirius::test::operator_utils::initialize_memory_manager()),

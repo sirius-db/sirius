@@ -20,7 +20,6 @@
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/settings.hpp"
 #include "duckdb/parallel/thread_context.hpp"
-#include "io/sirius_datasource.hpp"
 #include "log/logging.hpp"
 #include "op/sirius_physical_concat.hpp"
 #include "op/sirius_physical_cte.hpp"
@@ -41,6 +40,7 @@
 
 #include <nvtx3/nvtx3.hpp>
 
+#include <cucascade/cudf/datasource.hpp>
 #include <cucascade/data/data_repository_manager.hpp>
 #include <cucascade/memory/memory_space.hpp>
 

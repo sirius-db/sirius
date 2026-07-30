@@ -25,9 +25,10 @@
 #include <op/scan/gpu_ingestible_types.hpp>
 
 // rmm
-#include "io/io_context.hpp"
-
 #include <rmm/cuda_stream_view.hpp>
+
+#include <cucascade/io/io_context.hpp>
+#include <io/ioctx_resolver.hpp>
 
 // standard library
 #include <concepts>

@@ -46,6 +46,14 @@ see its [README](docs/super-sirius/README.md) for reading order.
 work targets Super Sirius. Memory spilling / CPU fallback is handled by the downgrade executor
 (`src/downgrade/`, `src/creator/`); see `docs/super-sirius/memory-management.md`.
 
+**The I/O stack lives in cuCascade, not here.** Reactors (io_uring / REST / kvikIO), the
+prefetching cache, the datasource factory and SigV4 are under `cucascade/include/cucascade/io/`
+and `cucascade/src/io/`, with the cuDF `datasource` bridge in `cucascade/src/cudf/`. Sirius keeps
+only the DuckDB-facing glue: `src/io/s3/sirius_httpfs.*` (a `duckdb::FileSystem`),
+`src/io/parquet_helpers.*`, and the `ioctx_resolver` alias. Fix I/O bugs in the submodule.
+Likewise `src/include/exec/{admission_control,scoped_dispatcher,semi_future,thread_pool,try}.hpp`
+are alias shims over cuCascade; the other `exec/` headers are still sirius's own.
+
 Before implementing operators / memory / expression / I/O work, run `/module-context <task>` to
 load accurate cudf/rmm/duckdb/cucascade API docs.
 

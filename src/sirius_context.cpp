@@ -32,7 +32,6 @@
 #include "memory/numa_small_pinned_mr.hpp"
 #include "memory/resource_ref_utils.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
-#include "memory/topology_index.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "sirius_sql_rewrite.hpp"
 #include "telemetry/batch_telemetry.hpp"
@@ -46,13 +45,14 @@
 #include <cuda_runtime_api.h>
 
 #include <cucascade/cudf/host_data_representation.hpp>
+#include <cucascade/io/types.hpp>
+#include <cucascade/io/uring/uring_ioctx.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
 #include <cucascade/memory/small_pinned_host_memory_resource.hpp>
+#include <cucascade/memory/topology_index.hpp>
 #include <duckdb/common/allocator.hpp>
 #include <duckdb/execution/physical_plan_generator.hpp>
-#include <io/types.hpp>
-#include <io/uring/uring_ioctx.hpp>
 #include <sys/resource.h>
 #include <unistd.h>  // for isatty/fileno
 
@@ -608,7 +608,7 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
   // GPU/HOST spaces exist. Every NUMA-aware component below (small-pinned
   // allocator, downgrade executors, task_creator, scan_manager) shares this one
   // index by shared_ptr copy instead of rebuilding its own device<->NUMA map.
-  topology_index_ = std::make_shared<const sirius::memory::topology_index>(
+  topology_index_ = std::make_shared<const cucascade::memory::topology_index>(
     config_.get_hw_topology(), *memory_manager_);
 
   // Enable P2P peer access for every available GPU pair.

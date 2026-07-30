@@ -18,7 +18,7 @@
 
 #include "exec/completion_controller.hpp"
 #include "exec/try.hpp"
-#include "io/io_context.hpp"
+#include "io/ioctx_resolver.hpp"
 #include "op/scan/gpu_ingestible.hpp"
 #include "op/scan/gpu_ingestible_types.hpp"
 #include "scan_manager/split_connector.hpp"

@@ -15,7 +15,7 @@ The pipeline converter rewrites a DuckDB table scan into a `GPU_SCAN` source: it
 
 Before a query runs, `sirius_scan_manager::prepare_for_query` walks the plan's `GPU_SCAN` operators. For each it either (a) matches a pinned-table cache entry and serves the scan from cached batches, or (b) builds a `split_provider` over the operator's ingestible. A single per-query sequencer (`load_balancing_scan_batch_coalescer`) drives metadata production, coalesces the output into right-sized data batches, balances each batch onto a GPU, and pushes the resulting splits onto each operator's `split_connector`.
 
-Data reaches the GPU through the Sirius IO subsystem (`io::sirius_ioctx` / `io::sirius_datasource`, with a pinned-memory prefetching cache) — see the IO sections later in this document. The scan path consumes that layer: each split carries prefetch hints, and the read for a split goes through the `sirius_ioctx` its backend resolves to. The target device travels with the request.
+Data reaches the GPU through the Sirius IO subsystem (`cucascade::io::ioctx` / `cucascade::io::datasource`, with a pinned-memory prefetching cache) — see the IO sections later in this document. The scan path consumes that layer: each split carries prefetch hints, and the read for a split goes through the `cucascade::io::ioctx` its backend resolves to. The target device travels with the request.
 
 ## Scan Operator
 
@@ -86,7 +86,7 @@ There is no factory class. Each implementation provides a free `make_ingestible(
 
 ### Parquet ingestible
 
-`parquet_gpu_ingestible` (`parquet_gpu_ingestible.{hpp,cpp}`) builds the canonical `scan_plan` and shared `parquet_reader_options` (column projection only) once in its constructor, and pre-coalesces the DuckDB filter into a stored expression (partition-column filters dropped — DuckDB already prunes the file list by hive value). `next_split_provider` hands out **one file at a time**: each metadata task opens the file's `sirius_datasource`, reuses or parses+caches the footer, runs the FLBA-decimal pushdown-safety probe, translates the filter to a cuDF AST and prunes row groups by statistics, estimates each surviving row group's projected data columns and all decoded column buffers, and emits one `parquet_file_scan_info`. The coalescer caps batches on decoded column-buffer bytes, while preserving projected-column bytes separately for memory history. `materialize_metadata_to_table` reads the bundled row-group slices via `cudf::io::read_parquet` (re-translating the filter on the task-local stream for reader-side pushdown unless the per-file probe disabled it), and assembles hive-partition output inline. Reader-side filter pushdown is a per-split decision.
+`parquet_gpu_ingestible` (`parquet_gpu_ingestible.{hpp,cpp}`) builds the canonical `scan_plan` and shared `parquet_reader_options` (column projection only) once in its constructor, and pre-coalesces the DuckDB filter into a stored expression (partition-column filters dropped — DuckDB already prunes the file list by hive value). `next_split_provider` hands out **one file at a time**: each metadata task opens the file's `cucascade::io::datasource`, reuses or parses+caches the footer, runs the FLBA-decimal pushdown-safety probe, translates the filter to a cuDF AST and prunes row groups by statistics, estimates each surviving row group's projected data columns and all decoded column buffers, and emits one `parquet_file_scan_info`. The coalescer caps batches on decoded column-buffer bytes, while preserving projected-column bytes separately for memory history. `materialize_metadata_to_table` reads the bundled row-group slices via `cudf::io::read_parquet` (re-translating the filter on the task-local stream for reader-side pushdown unless the per-file probe disabled it), and assembles hive-partition output inline. Reader-side filter pushdown is a per-split decision.
 
 ### DuckDB-native ingestible
 
@@ -138,7 +138,7 @@ For nested types (`STRUCT`, `LIST`), one DuckDB column maps to multiple parquet 
 
 **Files:** `src/include/scan_manager/sirius_scan_manager.hpp`, `src/scan_manager/sirius_scan_manager.cpp`; `split_provider.{hpp,cpp}`, `split_connector.{hpp,cpp}`, `load_balancing_scan_batch_coalescer.{hpp,cpp}`, `balancing_strategy.hpp`, `round_robin_strategy.{hpp,cpp}`, `config.hpp`.
 
-`sirius_scan_manager` prepares scan-side state before a query runs and drives metadata production for every `GPU_SCAN` source. It owns a configurable thread pool, a single `io::sirius_ioctx` (uring on the fast path, kvikio as the universal fallback — multi-GPU requires the uring path), an optional prefetching cache built on that ioctx, and the registry of pinned-table entries. It runs alongside the GPU pipeline executors and is independent of the data-repository machinery used between intermediate operators.
+`sirius_scan_manager` prepares scan-side state before a query runs and drives metadata production for every `GPU_SCAN` source. It owns a configurable thread pool, a single `cucascade::io::ioctx` (uring on the fast path, kvikio as the universal fallback — multi-GPU requires the uring path), an optional prefetching cache built on that ioctx, and the registry of pinned-table entries. It runs alongside the GPU pipeline executors and is independent of the data-repository machinery used between intermediate operators.
 
 ### Components
 
@@ -349,7 +349,7 @@ Only statically-known DuckDB `TableFilter`s participate in this DuckDB-native me
 
 ## Sirius IO Subsystem
 
-**Files:** `src/include/io/`, `src/io/`
+**Files:** `cucascade/include/cucascade/io/`, `cucascade/src/io/` (plus sirius's `src/io/s3/sirius_httpfs.*` and `src/io/parquet_helpers.*`)
 
 `sirius::io` is a `cudf::io::datasource`-compatible I/O stack for high-throughput parquet reading. It is organized around three pieces: a per-backend *ioctx* that owns the reactor pool plus the caches, a generic `templated_ioctx<Reactor>` that implements the read API in terms of a backend reactor, and a pinned-memory *prefetching cache* that sits in front of every backend. Backends plug in by supplying a reactor + io_object pair; the cache and the datasource layer are backend-agnostic.
 
@@ -357,8 +357,8 @@ Only statically-known DuckDB `TableFilter`s participate in this DuckDB-native me
 
 | Component | File | Role |
 |-----------|------|------|
-| `sirius_datasource` | `io/sirius_datasource.{hpp,cpp}` | `cudf::io::datasource` implementation. Thin per-scan delegate: every read forwards to the bound `sirius_ioctx`, passing the shared `sirius_io_object` by reference. Also carries the per-scan `prefetching_handle` used by `fadvise`. |
-| `sirius_ioctx` | `io/io_context.{hpp,cpp}` | Abstract shared backend context. Owns the optional `prefetching_cache` and an always-present `metadata_store`, exposes the backend read API (`host_read_io`, `host_read_async_io`, `device_read_async_io`, `host_to_device_read_async_io`, `host_read_ranges_async_io`) and capability queries, and opens datasources via `open_datasource(path)`. |
+| `cucascade::io::datasource` | `io/cucascade::io::datasource.{hpp,cpp}` | `cudf::io::datasource` implementation. Thin per-scan delegate: every read forwards to the bound `cucascade::io::ioctx`, passing the shared `sirius_io_object` by reference. Also carries the per-scan `prefetching_handle` used by `fadvise`. |
+| `cucascade::io::ioctx` | `io/io_context.{hpp,cpp}` | Abstract shared backend context. Owns the optional `prefetching_cache` and an always-present `metadata_store`, exposes the backend read API (`host_read_io`, `host_read_async_io`, `device_read_async_io`, `host_to_device_read_async_io`, `host_read_ranges_async_io`) and capability queries, and opens datasources via `open_datasource(path)`. |
 | `templated_ioctx<Reactor>` | `io/templated_ioctx.hpp` | Generic ioctx implementation parameterized on a backend reactor. Owns a pool of reactors, splits each caller request across the pool, dispatches via the reactor's `prep_*`/`enqueue`, and derives its capabilities structurally from the reactor (see [Backend Seam](#backend-seam)). |
 | `io_context_registry` | `io/datasource_factory.{hpp,cpp}` | Scheme→backend registry. Each backend registers a scheme checker (the reactor's static `supports()`) and a factory; `lookup(scheme)` resolves a URI scheme to a backend type, `make_ioctx(type)` builds one. |
 | `prefetching_cache` | `io/cache/prefetching_cache.{hpp,cpp}` | Pinned-memory chunk cache with a lock-free per-chunk state machine, background preparation/prefetch/evictor threads, and tiered LRU scoring. Serves partial reads and populates itself on read. |
@@ -369,7 +369,7 @@ Only statically-known DuckDB `TableFilter`s participate in this DuckDB-native me
 
 ### Read path
 
-A scan opens a file with `sirius_ioctx::open_datasource(path)`, which asks the backend to create a `sirius_io_object` (open local fds, or HEAD an object store for its size) and wraps it in a `sirius_datasource` bound to the ioctx. Each cuDF read on the datasource forwards to the ioctx:
+A scan opens a file with `cucascade::io::open_datasource(ioctx, path)`, which asks the backend to create a `sirius_io_object` (open local fds, or HEAD an object store for its size) and wraps it in a `cucascade::io::datasource` bound to the ioctx. Each cuDF read on the datasource forwards to the ioctx:
 
 - When the ioctx has an armed cache (`uses_prefetching_cache()`), `host_read`/`device_read` consult the cache first; a hit copies from pinned host chunks (host reads via `memcpy`, device reads via `cudaMemcpyAsync` from pinned memory). A miss falls through to the backend `*_io` virtuals, which the `templated_ioctx` services through the reactor pool.
 - A backend without batched host reads (e.g. kvikio) reports `preferred_prefetching_stage::none` and is never given a cache.
@@ -397,7 +397,7 @@ The scan manager builds one ioctx for the run: `uring_ioctx` when `use_sirius_da
 
 ### S3 / Object-Store Backend
 
-**Files:** `src/include/io/rest/`, `src/io/rest/`, `src/include/io/s3/`, `src/io/s3/`, `src/io/datasource_factory.cpp`, `src/op/scan/parquet_gpu_ingestible.cpp`
+**Files:** `cucascade/include/cucascade/io/rest/`, `cucascade/src/io/rest/` (reactor, ioctx, sigv4 under `rest/s3/`), `cucascade/src/io/datasource_factory.cpp`, sirius's `src/io/s3/sirius_httpfs.cpp` (DuckDB `FileSystem` glue), `src/op/scan/parquet_gpu_ingestible.cpp`
 
 `rest_ioctx = templated_ioctx<rest_reactor>` handles `s3://` paths for AWS S3 and compatible stores such as MinIO. The `gs://` and `azure://` schemes parsed by `uri_parser` have no registered backend. DuckDB uses the read-only `sirius_httpfs` to bind transparent `read_parquet('s3://...')` queries, while scan-manager callers can open the same path directly through the datasource registry. S3 scans require GPU execution and have no DuckDB CPU fallback.
 
@@ -428,11 +428,11 @@ Both authorizers use path-style URLs and support temporary credentials. The sess
 
 Connection limits, request sizing, footer-probe size, retry budgets, keepalive, and LIST caps live in `rest::config`; the defaults are defined in `io/rest/config.hpp`. `request_timeout_s` is also used as the lifetime of a presigned URL. Async data requests retry transient curl and HTTP failures, with a separate bounded retry for HTTP 403. Control requests treat HTTP 403 as terminal.
 
-`rest_ioctx::perf_snapshot()` reports aggregate request, retry, byte, queue-wait, and H2D metrics across its reactors. Detailed timing is enabled with `perf_instrumentation`.
+The REST reactor has no perf-counter surface: `rest_ioctx::perf_snapshot()` and the `perf_instrumentation` config flag were dropped when the IO stack moved to cuCascade. Retry and failure behaviour is still observable through the logs the reactor emits on each retry.
 
 ### Cache Seam
 
-The prefetching cache is owned by `sirius_ioctx` and is invisible to both the backend and the datasource. `sirius_datasource`'s reads forward to the ioctx; when an armed cache is present the ioctx consults it before falling through to the backend `*_io` virtuals. Backends never see the cache; the cache reaches the backend only through the protected vector-read primitive (`host_read_ranges_async_io`), for which it is friended.
+The prefetching cache is owned by `cucascade::io::ioctx` and is invisible to both the backend and the datasource. `cucascade::io::datasource`'s reads forward to the ioctx; when an armed cache is present the ioctx consults it before falling through to the backend `*_io` virtuals. Backends never see the cache; the cache reaches the backend only through the protected vector-read primitive (`host_read_ranges_async_io`), for which it is friended.
 
 A cache is attached only when the backend can benefit from it — `can_use_prefetching_cache()` is true iff the backend supports vectored host reads or bounce-staged host-to-device reads. The cache constructs itself *armed* or *unarmed* from that capability; the ioctx is unaware of the distinction and simply forwards through `cache()`.
 
@@ -443,7 +443,7 @@ The cache does two things beyond classic prefetch:
 
 Separately from the prefetching cache, the ioctx always exposes a `metadata_store` so parsed file metadata (e.g. a parquet footer) survives across scans of the same path regardless of whether prefetching is wired up.
 
-**fadvise protocol.** `sirius_datasource::fadvise(ranges, dev_id)` is the single entry point for inserting prefetch work: a `speculative`/`immediate` call (honored only when it matches the ioctx's `preferred_prefetching_stage`) hands the ranges to the cache and stashes the returned `prefetching_handle`; a `disposable` call at consume time cancels any still-pending work via that handle.
+**fadvise protocol.** `cucascade::io::datasource::fadvise(ranges, dev_id)` is the single entry point for inserting prefetch work: a `speculative`/`immediate` call (honored only when it matches the ioctx's `preferred_prefetching_stage`) hands the ranges to the cache and stashes the returned `prefetching_handle`; a `disposable` call at consume time cancels any still-pending work via that handle.
 
 ### Cache Internals
 

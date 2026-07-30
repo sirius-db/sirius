@@ -17,11 +17,11 @@
 // sirius
 #include "op/scan/owning_table_view.hpp"
 
+#include <cucascade/cudf/datasource.hpp>
+#include <cucascade/io/io_context.hpp>
 #include <expression/ast/from_duckdb.hpp>
 #include <expression_evaluator/expression_evaluator.hpp>
 #include <helper/utils.hpp>
-#include <io/io_context.hpp>
-#include <io/sirius_datasource.hpp>
 #include <log/logging.hpp>
 #include <op/scan/duckdb_native_decoder.hpp>
 #include <op/scan/duckdb_native_gpu_ingestible.hpp>
@@ -154,7 +154,7 @@ class duckdb_native_batch_coalescer : public batch_coalescer {
 
   bool _have_template = false;
   bool _produced_any  = false;
-  std::shared_ptr<sirius::io::sirius_datasource> _datasource;
+  std::shared_ptr<cucascade::io::datasource> _datasource;
   duckdb::SingleFileBlockManager const* _block_manager = nullptr;
 };
 
@@ -290,7 +290,7 @@ duckdb_native_gpu_ingestible::next_split_provider(io::ioctx_resolver resolve)
     }
     auto split           = std::make_unique<duckdb_native_scan_info>();
     split->row_groups    = std::move(range.row_groups);
-    split->datasource    = io_ctx->open_datasource(_info->db_path);
+    split->datasource    = cucascade::io::open_datasource(io_ctx, _info->db_path);
     split->block_manager = _block_manager;
     return split;
   };

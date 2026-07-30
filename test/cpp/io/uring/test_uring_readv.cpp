@@ -20,10 +20,10 @@
 // sirius
 #include <rmm/cuda_stream_view.hpp>
 
+#include <cucascade/io/types.hpp>
+#include <cucascade/io/uring/types.hpp>
+#include <cucascade/io/uring/uring_reactor.hpp>
 #include <exec/semi_future.hpp>
-#include <io/types.hpp>
-#include <io/uring/types.hpp>
-#include <io/uring/uring_reactor.hpp>
 
 // standard library
 #include <fcntl.h>
@@ -36,12 +36,12 @@
 #include <filesystem>
 #include <vector>
 
-using sirius::io::contiguous;
-using sirius::io::io_object_segment;
-using sirius::io::uring::chunked_rx_request;
-using sirius::io::uring::local_io_object;
-using sirius::io::uring::request_manager;
-using sirius::io::uring::uring_reactor;
+using cucascade::io::contiguous;
+using cucascade::io::io_object_segment;
+using cucascade::io::uring::chunked_rx_request;
+using cucascade::io::uring::local_io_object;
+using cucascade::io::uring::request_manager;
+using cucascade::io::uring::uring_reactor;
 
 namespace {
 
@@ -68,8 +68,8 @@ struct temp_file {
       if (bytes > 0) { REQUIRE(std::fwrite(data.data(), 1, bytes, f) == bytes); }
       std::fclose(f);
     }
-    sirius::io::file_descriptor fd{::open(path.c_str(), O_RDONLY)};
-    sirius::io::file_descriptor fd_direct{::open(path.c_str(), O_RDONLY)};
+    cucascade::io::file_descriptor fd{::open(path.c_str(), O_RDONLY)};
+    cucascade::io::file_descriptor fd_direct{::open(path.c_str(), O_RDONLY)};
     REQUIRE(static_cast<bool>(fd));
     REQUIRE(static_cast<bool>(fd_direct));
     obj =
@@ -176,7 +176,7 @@ TEST_CASE("fill_remaining_buffers resumes after a short read", "[uring_readv]")
 TEST_CASE("prep_host_rxv_request fuses contiguous same-fd segments into one readv", "[uring_readv]")
 {
   temp_file tf(1 << 20);
-  sirius::io::uring::config cfg;
+  cucascade::io::uring::config cfg;
   cfg.use_odirect  = false;  // all segments share the buffered fd
   cfg.max_n_chunks = 16;
 
@@ -201,7 +201,7 @@ TEST_CASE("prep_host_rxv_request fuses contiguous same-fd segments into one read
 TEST_CASE("prep_host_rxv_request starts a new group at a non-contiguous boundary", "[uring_readv]")
 {
   temp_file tf(1 << 20);
-  sirius::io::uring::config cfg;
+  cucascade::io::uring::config cfg;
   cfg.use_odirect  = false;
   cfg.max_n_chunks = 16;
 
@@ -227,7 +227,7 @@ TEST_CASE("prep_host_rxv_request starts a new group at a non-contiguous boundary
 TEST_CASE("prep_host_rxv_request caps each group at max_n_chunks", "[uring_readv]")
 {
   temp_file tf(1 << 20);
-  sirius::io::uring::config cfg;
+  cucascade::io::uring::config cfg;
   cfg.use_odirect  = false;
   cfg.max_n_chunks = 2;  // force splitting a contiguous run
 
@@ -254,7 +254,7 @@ TEST_CASE("prep_host_rxv_request keeps a null-buffer segment standalone between 
           "[uring_readv]")
 {
   temp_file tf(1 << 20);
-  sirius::io::uring::config cfg;
+  cucascade::io::uring::config cfg;
   cfg.use_odirect  = false;
   cfg.max_n_chunks = 16;
 
@@ -287,19 +287,19 @@ TEST_CASE("prep_host_rxv_request keeps a null-buffer segment standalone between 
 TEST_CASE("prep_host_rxv_request does not fuse segments with different fds", "[uring_readv]")
 {
   temp_file tf(1 << 20);
-  sirius::io::uring::config cfg;
+  cucascade::io::uring::config cfg;
   cfg.use_odirect  = true;  // fd chosen per-segment by is_odirect_compatible
   cfg.max_n_chunks = 16;
 
   // Aligned buffer => odirect-compatible; misaligned buffer => buffered.  Both
   // segments are contiguous, so only the differing fd prevents fusion.
-  void* aligned = std::aligned_alloc(sirius::io::IO_BLOCK_SIZE, sirius::io::IO_BLOCK_SIZE);
+  void* aligned = std::aligned_alloc(cucascade::io::IO_BLOCK_SIZE, cucascade::io::IO_BLOCK_SIZE);
   REQUIRE(aligned != nullptr);
   auto* misaligned = reinterpret_cast<uint8_t*>(aligned) + 1;
 
   std::vector<io_object_segment> segs{
-    {0, sirius::io::IO_BLOCK_SIZE, reinterpret_cast<uint8_t*>(aligned)},
-    {sirius::io::IO_BLOCK_SIZE, sirius::io::IO_BLOCK_SIZE, misaligned}};
+    {0, cucascade::io::IO_BLOCK_SIZE, reinterpret_cast<uint8_t*>(aligned)},
+    {cucascade::io::IO_BLOCK_SIZE, cucascade::io::IO_BLOCK_SIZE, misaligned}};
   REQUIRE(segs[0].is_odirect_compatible());
   REQUIRE_FALSE(segs[1].is_odirect_compatible());
 
@@ -320,7 +320,7 @@ TEST_CASE("prep_host_rxv_request clamps bytes_requested at EOF", "[uring_readv]"
 {
   // File is 6 KiB; a single 8 KiB segment over-hangs the end by 2 KiB.
   temp_file tf(6 * 1024);
-  sirius::io::uring::config cfg;
+  cucascade::io::uring::config cfg;
   cfg.use_odirect  = false;
   cfg.max_n_chunks = 16;
 
@@ -339,7 +339,7 @@ TEST_CASE("prep_host_rxv_request clamps bytes_requested at EOF", "[uring_readv]"
 TEST_CASE("prep_host_rxv_request on empty input yields a ready zero-byte request", "[uring_readv]")
 {
   temp_file tf(4096);
-  sirius::io::uring::config cfg;
+  cucascade::io::uring::config cfg;
   std::vector<io_object_segment> segs;
   auto req = uring_reactor::prep_host_rxv_request(cfg, *tf.obj, segs);
   REQUIRE(req != nullptr);
@@ -348,7 +348,8 @@ TEST_CASE("prep_host_rxv_request on empty input yields a ready zero-byte request
 
 // --- align_and_coalesce -----------------------------------------------------
 
-using cudf::io::text::byte_range_info;
+using cucascade::io::byte_range;
+using byte_range_info = cucascade::io::byte_range;  // cuCascade replaced the cudf type
 
 TEST_CASE("align_and_coalesce rounds ends out to the default O_DIRECT alignment", "[uring_readv]")
 {
@@ -413,7 +414,7 @@ TEST_CASE("prep_host_to_device fuses contiguous bounce buffers into one readv wi
           "[uring_readv]")
 {
   temp_file tf(1 << 20);
-  sirius::io::uring::config cfg;
+  cucascade::io::uring::config cfg;
   cfg.use_odirect  = false;
   cfg.max_n_chunks = 16;
 
@@ -452,7 +453,7 @@ TEST_CASE("prep_host_to_device fuses contiguous bounce buffers into one readv wi
 TEST_CASE("prep_host_to_device clips the batched copy to the request window", "[uring_readv]")
 {
   temp_file tf(1 << 20);
-  sirius::io::uring::config cfg;
+  cucascade::io::uring::config cfg;
   cfg.use_odirect  = false;
   cfg.max_n_chunks = 16;
 
@@ -488,7 +489,7 @@ TEST_CASE("prep_host_to_device clips the batched copy to the request window", "[
 TEST_CASE("prep_host_to_device caps each readv group at max_n_chunks", "[uring_readv]")
 {
   temp_file tf(1 << 20);
-  sirius::io::uring::config cfg;
+  cucascade::io::uring::config cfg;
   cfg.use_odirect  = false;
   cfg.max_n_chunks = 2;  // force splitting a contiguous run
 

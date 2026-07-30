@@ -20,11 +20,15 @@
 #include "log/logging.hpp"
 #include "yaml_reader.hpp"
 
+#include <cucascade/io/kvikio/config.hpp>
 #include <cucascade/memory/config.hpp>
 #include <cucascade/memory/reservation_manager_configurator.hpp>
 #include <yaml-cpp/yaml.h>
 
 #include <exception>
+#include <optional>
+#include <stdexcept>
+#include <string>
 #include <variant>
 #include <vector>
 
@@ -92,7 +96,7 @@ static void from_yaml(const YAML::Node& node, creator::task_creator_config& opt)
   r.reject_unknown();
 }
 
-static void from_yaml(const YAML::Node& node, sirius::io::object_store_config& opt)
+static void from_yaml(const YAML::Node& node, cucascade::io::object_store_config& opt)
 {
   yaml::reader r(node, "object_store");
   r.optional("endpoint", opt.endpoint);
@@ -107,7 +111,7 @@ static void from_yaml(const YAML::Node& node, sirius::io::object_store_config& o
   r.reject_unknown();
 }
 
-static void from_yaml(const YAML::Node& node, sirius::io::rest::config& opt)
+static void from_yaml(const YAML::Node& node, cucascade::io::rest::config& opt)
 {
   yaml::reader r(node, "rest");
   r.optional("request_timeout_s", opt.request_timeout_s);
@@ -125,14 +129,13 @@ static void from_yaml(const YAML::Node& node, sirius::io::rest::config& opt)
   r.optional("max_retry_attempts", opt.max_retry_attempts);
   r.optional("max_auth_retry_attempts", opt.max_auth_retry_attempts);
   r.optional("honor_retry_after", opt.honor_retry_after);
-  r.optional("perf_instrumentation", opt.perf_instrumentation);
   r.optional("footer_probe_bytes", yaml::bytes(opt.footer_probe_bytes));
   r.optional("list_max_matches", opt.list_max_matches);
   r.optional("list_max_scanned", opt.list_max_scanned);
   r.reject_unknown();
 }
 
-static void from_yaml(const YAML::Node& node, sirius::io::uring::config& opt)
+static void from_yaml(const YAML::Node& node, cucascade::io::uring::config& opt)
 {
   yaml::reader r(node, "local");
   r.optional("use_odirect", opt.use_odirect);
@@ -140,7 +143,7 @@ static void from_yaml(const YAML::Node& node, sirius::io::uring::config& opt)
   r.reject_unknown();
 }
 
-static void from_yaml(const YAML::Node& node, sirius::io::cache::config& opt)
+static void from_yaml(const YAML::Node& node, cucascade::io::cache::config& opt)
 {
   yaml::reader r(node, "cache");
   r.optional(
@@ -152,6 +155,55 @@ static void from_yaml(const YAML::Node& node, sirius::io::cache::config& opt)
   r.optional(
     "eviction_threshold_fraction", opt.eviction_threshold_fraction, yaml::fraction<double>{});
   r.reject_unknown();
+}
+
+/// Reject a knob kvikIO would reject at apply time, but with the key name.
+/// apply_kvikio_defaults throws std::invalid_argument on a zero nthreads /
+/// task_size / bounce_buffer_size; failing here names the offending YAML key.
+static void reject_zero(const char* key, std::optional<std::size_t> const& value)
+{
+  if (value && *value == 0) {
+    throw std::runtime_error(std::string("kvikio: '") + key + "' must be greater than 0");
+  }
+}
+
+static void from_yaml(const YAML::Node& node, cucascade::io::kvikio_config& opt)
+{
+  yaml::reader r(node, "kvikio");
+  // Every field is optional and default-unset, meaning "leave kvikIO's own
+  // env-var-seeded default alone" — so an absent key is not the same as a key
+  // set to kvikIO's default value.
+  r.optional("nthreads", opt.nthreads);
+  r.optional("task_size", yaml::bytes(opt.task_size));
+  r.optional("gds_threshold", yaml::bytes(opt.gds_threshold));
+  r.optional("bounce_buffer_size", yaml::bytes(opt.bounce_buffer_size));
+  r.optional("auto_direct_io_read", opt.auto_direct_io_read);
+  r.optional("auto_direct_io_read_overread", opt.auto_direct_io_read_overread);
+  r.optional("thread_pool_per_block_device", opt.thread_pool_per_block_device);
+
+  // compat_mode is kvikIO's own enum, so it has no ADL-findable
+  // string_to_enum; map it here rather than injecting one into namespace kvikio.
+  std::optional<std::string> compat;
+  r.optional("compat_mode", compat);
+  if (compat) {
+    if (*compat == "off") {
+      opt.compat_mode = kvikio::CompatMode::OFF;
+    } else if (*compat == "on") {
+      opt.compat_mode = kvikio::CompatMode::ON;
+    } else if (*compat == "auto") {
+      opt.compat_mode = kvikio::CompatMode::AUTO;
+    } else {
+      throw std::runtime_error("kvikio: 'compat_mode' must be one of off/on/auto, got '" + *compat +
+                               "'");
+    }
+  }
+  r.reject_unknown();
+
+  if (opt.nthreads && *opt.nthreads == 0) {
+    throw std::runtime_error("kvikio: 'nthreads' must be greater than 0");
+  }
+  reject_zero("task_size", opt.task_size);
+  reject_zero("bounce_buffer_size", opt.bounce_buffer_size);
 }
 
 static void from_yaml(const YAML::Node& node, scan_manager::scan_manager_config& opt)
@@ -166,6 +218,7 @@ static void from_yaml(const YAML::Node& node, scan_manager::scan_manager_config&
   r.optional("enable_prefetch_cache", opt.enable_prefetch_cache);
   if (auto n = r.optional_node("local")) sirius::from_yaml(*n, opt.local);
   if (auto n = r.optional_node("rest")) sirius::from_yaml(*n, opt.rest);
+  if (auto n = r.optional_node("kvikio")) sirius::from_yaml(*n, opt.kvikio);
   if (auto n = r.optional_node("cache")) sirius::from_yaml(*n, opt.cache);
   if (auto n = r.optional_node("object_store")) sirius::from_yaml(*n, opt.object_store);
   r.reject_unknown();

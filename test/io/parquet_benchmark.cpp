@@ -1,8 +1,3 @@
-#include "io/cache/prefetching_cache.hpp"
-#include "io/sirius_datasource.hpp"
-#include "io/types.hpp"
-#include "io/uring/uring_ioctx.hpp"
-
 #include <cudf/io/datasource.hpp>
 #include <cudf/io/experimental/hybrid_scan.hpp>
 #include <cudf/io/parquet.hpp>
@@ -17,6 +12,10 @@
 #include <rmm/mr/cuda_async_memory_resource.hpp>
 #include <rmm/mr/per_device_resource.hpp>
 
+#include <cucascade/cudf/datasource.hpp>
+#include <cucascade/io/cache/prefetching_cache.hpp>
+#include <cucascade/io/types.hpp>
+#include <cucascade/io/uring/uring_ioctx.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/numa_region_pinned_host_allocator.hpp>
 #include <fcntl.h>
@@ -239,7 +238,7 @@ int main(int argc, char** argv)
     std::sort(byte_ranges.begin(), byte_ranges.end(), [](auto const& a, auto const& b) {
       return a.offset() < b.offset();
     });
-    std::vector<cudf::io::text::byte_range_info> coalesced;
+    std::vector<cucascade::io::byte_range> coalesced;
     coalesced.reserve(byte_ranges.size());
     for (auto const& br : byte_ranges) {
       if (br.size() <= 0) continue;
@@ -249,7 +248,7 @@ int main(int argc, char** argv)
         if (br.offset() <= back_end) {
           int64_t br_end = br.offset() + br.size();
           if (br_end > back_end)
-            back = cudf::io::text::byte_range_info{back.offset(), br_end - back.offset()};
+            back = cucascade::io::byte_range{back.offset(), br_end - back.offset()};
           continue;
         }
       }
@@ -306,19 +305,19 @@ int main(int argc, char** argv)
                                                                CHUNKS_PER_SLAB,  // pool_size
                                                                1);               // initial_pools
 
-    auto uring_ctx = std::make_shared<sirius::io::uring::uring_reactor::reactor_context>(
-      sirius::io::uring::uring_reactor::reactor_config_type{.bounce_size =
-                                                              host_mr.get_block_size()},
+    auto uring_ctx = std::make_shared<cucascade::io::uring::uring_reactor::reactor_context>(
+      cucascade::io::uring::uring_reactor::reactor_config_type{.bounce_size =
+                                                                 host_mr.get_block_size()},
       &host_mr);
     auto io_ctx =
-      std::make_shared<sirius::io::uring::uring_ioctx>(n_reactors, std::move(uring_ctx));
+      std::make_shared<cucascade::io::uring::uring_ioctx>(n_reactors, std::move(uring_ctx));
     io_ctx->start();
     // io_ctx->initialize_cache(pool, INFLIGHT_BUDGET_CHUNKS);
 
     std::vector<std::unique_ptr<cudf::io::datasource>> sources;
     sources.reserve(paths.size());
     for (auto const& path : paths) {
-      sources.push_back(io_ctx->open_datasource(path));
+      sources.push_back(cucascade::io::open_datasource(io_ctx, path));
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(1200));
 

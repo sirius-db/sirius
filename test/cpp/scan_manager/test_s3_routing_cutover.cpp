@@ -15,13 +15,6 @@
  */
 
 #include "catch.hpp"
-#include "io/cache/prefetching_cache.hpp"
-#include "io/datasource_factory.hpp"
-#include "io/io_context.hpp"
-#include "io/rest/config.hpp"
-#include "io/rest/rest_ioctx.hpp"
-#include "io/sirius_datasource.hpp"
-#include "memory/topology_index.hpp"
 #include "op/scan/parquet_gpu_ingestible.hpp"
 #include "op/scan/parquet_metadata.hpp"
 #include "planner/query.hpp"
@@ -38,7 +31,14 @@
 #include <rmm/device_buffer.hpp>
 
 #include <arpa/inet.h>
+#include <cucascade/cudf/datasource.hpp>
+#include <cucascade/io/cache/prefetching_cache.hpp>
+#include <cucascade/io/datasource_factory.hpp>
+#include <cucascade/io/io_context.hpp>
+#include <cucascade/io/rest/config.hpp>
+#include <cucascade/io/rest/rest_ioctx.hpp>
 #include <cucascade/memory/topology_discovery.hpp>
+#include <cucascade/memory/topology_index.hpp>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/time.h>
@@ -69,9 +69,9 @@
 
 namespace {
 
-using sirius::io::io_context_registry;
-using sirius::io::io_context_type;
-using sirius::io::rest::rest_ioctx;
+using cucascade::io::io_context_registry;
+using cucascade::io::io_context_type;
+using cucascade::io::rest::rest_ioctx;
 using sirius::scan_manager::scan_manager_config;
 using sirius::scan_manager::sirius_scan_manager;
 
@@ -162,10 +162,10 @@ cucascade::memory::system_topology_info single_gpu_topology()
   return topology;
 }
 
-std::shared_ptr<const sirius::memory::topology_index> single_gpu_index()
+std::shared_ptr<const cucascade::memory::topology_index> single_gpu_index()
 {
-  return std::make_shared<sirius::memory::topology_index>(single_gpu_topology(),
-                                                          std::vector<int>{0});
+  return std::make_shared<cucascade::memory::topology_index>(single_gpu_topology(),
+                                                             std::vector<int>{0});
 }
 
 scan_manager_config make_s3_scan_config(std::string endpoint, bool use_sirius_datasource)
@@ -194,7 +194,7 @@ scan_manager_config make_s3_scan_config(std::string endpoint, bool use_sirius_da
 struct scan_manager_fixture {
   std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> memory =
     initialize_memory_manager(1);
-  std::shared_ptr<const sirius::memory::topology_index> topology = single_gpu_index();
+  std::shared_ptr<const cucascade::memory::topology_index> topology = single_gpu_index();
 };
 
 std::unique_ptr<sirius::op::scan::parquet_ingestible_table_info> make_nation_table_info(
@@ -244,7 +244,7 @@ routing_observations collect_routing_observations(
 
 sirius::io::ioctx_resolver make_datasource_resolver(sirius_scan_manager& manager)
 {
-  return [&manager](std::string_view path) -> std::shared_ptr<sirius::io::sirius_ioctx> {
+  return [&manager](std::string_view path) -> std::shared_ptr<cucascade::io::ioctx> {
     auto ds = manager.create_datasource(path);
     if (!ds) {
       throw std::runtime_error("test datasource resolver: no backend supports path: " +
@@ -451,7 +451,7 @@ class range_s3_server {
   std::thread _thread;
 };
 
-rest_ioctx* require_rest_ioctx(std::shared_ptr<sirius::io::sirius_datasource> const& ds)
+rest_ioctx* require_rest_ioctx(std::shared_ptr<cucascade::io::datasource> const& ds)
 {
   REQUIRE(ds != nullptr);
   REQUIRE(ds->io_ctx() != nullptr);
@@ -460,13 +460,13 @@ rest_ioctx* require_rest_ioctx(std::shared_ptr<sirius::io::sirius_datasource> co
   return ctx;
 }
 
-void read_one_host_range(sirius::io::sirius_datasource& ds)
+void read_one_host_range(cucascade::io::datasource& ds)
 {
   std::array<std::uint8_t, 128> dst{};
   REQUIRE(ds.host_read(0, dst.size(), dst.data()) == dst.size());
 }
 
-void read_one_device_range(sirius::io::sirius_datasource& ds)
+void read_one_device_range(cucascade::io::datasource& ds)
 {
   rmm::cuda_stream stream;
   rmm::device_buffer dst(128, stream);
@@ -537,7 +537,7 @@ TEST_CASE("scan_manager concurrent first-touch reuses one routed S3 ioctx",
   auto const uri          = std::string{"s3://routing-bucket/data.parquet"};
   std::atomic<std::size_t> ready{0};
   std::atomic<bool> go{false};
-  std::vector<std::shared_ptr<sirius::io::sirius_ioctx>> ioctxs(kThreads);
+  std::vector<std::shared_ptr<cucascade::io::ioctx>> ioctxs(kThreads);
   std::vector<std::exception_ptr> errors(kThreads);
   std::vector<std::thread> threads;
   threads.reserve(kThreads);
@@ -639,22 +639,22 @@ TEST_CASE("scan_manager re-primes routed S3 cache on every query",
   REQUIRE(datasource->io_ctx() != nullptr);
   auto* routed_cache = datasource->io_ctx()->cache();
   REQUIRE(routed_cache != nullptr);
-  REQUIRE(routed_cache->query_epoch() == 0);
 
   auto* default_cache = manager.io_ctx()->cache();
   REQUIRE(default_cache != nullptr);
-  REQUIRE(default_cache->query_epoch() == 0);
 
   auto q = make_empty_query();
-  // The query intentionally has no scan operators: routed caches must still
-  // advance once per query, matching the default ioctx's query-wide refresh.
-  manager.prepare_for_query(q, true);
-  REQUIRE(routed_cache->query_epoch() == 1);
-  REQUIRE(default_cache->query_epoch() == 1);
-
-  manager.prepare_for_query(q, true);
-  REQUIRE(routed_cache->query_epoch() == 2);
-  REQUIRE(default_cache->query_epoch() == 2);
+  // The query intentionally has no scan operators: the routed cache must still
+  // be refreshed once per query, matching the default ioctx's query-wide
+  // refresh, and repeated queries must keep working.
+  //
+  // This used to assert on prefetching_cache::query_epoch() to pin down that
+  // BOTH caches advanced, and by exactly one per call. cuCascade dropped the
+  // epoch ticker along with prepare_for_query's query argument, so the counter
+  // is no longer observable and this is now a smoke test — it would not catch a
+  // routed cache that silently stopped being re-primed.
+  REQUIRE_NOTHROW(manager.prepare_for_query(q, true));
+  REQUIRE_NOTHROW(manager.prepare_for_query(q, true));
 }
 
 TEST_CASE("scan_manager tolerates routed S3 ioctx without a prefetch cache",
@@ -673,174 +673,6 @@ TEST_CASE("scan_manager tolerates routed S3 ioctx without a prefetch cache",
 
   auto q = make_empty_query();
   REQUIRE_NOTHROW(manager.prepare_for_query(q, true));
-}
-
-TEST_CASE("rest perf instrumentation flag gates micro counters", "[s3][rest][perf]")
-{
-  range_s3_server server(std::vector<std::uint8_t>(4096, std::uint8_t{7}));
-  scan_manager_fixture fixture;
-
-  SECTION("flag off leaves latency micro-counters at zero while safety counters are readable")
-  {
-    auto cfg                      = make_s3_scan_config(server.endpoint(), true);
-    cfg.rest.perf_instrumentation = false;
-    sirius_scan_manager manager{cfg, *fixture.memory, fixture.topology};
-
-    auto datasource = manager.create_datasource("s3://routing-bucket/data.parquet");
-    auto* rest_ctx  = require_rest_ioctx(datasource);
-
-    read_one_device_range(*datasource);
-
-    auto const snapshot = rest_ctx->perf_snapshot();
-    CHECK(snapshot.chunk_get_count == 0);
-    CHECK(snapshot.chunk_get_ns_total == 0);
-    CHECK(snapshot.chunk_get_ns_max == 0);
-    CHECK(snapshot.queue_wait_count == 0);
-    CHECK(snapshot.queue_wait_ns_total == 0);
-    CHECK(snapshot.h2d_observed_count == 0);
-    CHECK(snapshot.h2d_observed_ns_total == 0);
-    CHECK(snapshot.h2d_observed_ns_max == 0);
-    CHECK(snapshot.ttfb_ns == 0);
-    CHECK(snapshot.device_stream_sync_total == 0);
-    CHECK(snapshot.retries_total == 0);
-    CHECK(snapshot.terminal_failures_total == 0);
-  }
-
-  SECTION("flag on records GET, queue, H2D, and TTFB timings")
-  {
-    auto cfg                      = make_s3_scan_config(server.endpoint(), true);
-    cfg.rest.perf_instrumentation = true;
-    sirius_scan_manager manager{cfg, *fixture.memory, fixture.topology};
-
-    auto datasource = manager.create_datasource("s3://routing-bucket/data.parquet");
-    auto* rest_ctx  = require_rest_ioctx(datasource);
-
-    read_one_device_range(*datasource);
-
-    auto const snapshot = rest_ctx->perf_snapshot();
-    CHECK(snapshot.chunk_get_count > 0);
-    CHECK(snapshot.chunk_get_ns_total > 0);
-    CHECK(snapshot.chunk_get_ns_max > 0);
-    CHECK(snapshot.chunk_get_ns_max <= snapshot.chunk_get_ns_total);
-    CHECK(snapshot.queue_wait_count > 0);
-    CHECK(snapshot.queue_wait_ns_total > 0);
-    CHECK(snapshot.h2d_observed_count > 0);
-    CHECK(snapshot.h2d_observed_ns_total > 0);
-    CHECK(snapshot.h2d_observed_ns_max > 0);
-    CHECK(snapshot.h2d_observed_ns_max <= snapshot.h2d_observed_ns_total);
-    CHECK(snapshot.ttfb_ns > 0);
-    CHECK(snapshot.device_stream_sync_total == 0);
-    CHECK(snapshot.retries_total == 0);
-    CHECK(snapshot.terminal_failures_total == 0);
-  }
-}
-
-TEST_CASE("rest perf safety counters track retries and terminal failures", "[s3][rest][perf]")
-{
-  scan_manager_fixture fixture;
-
-  SECTION("503 retries are counted even when latency instrumentation is off")
-  {
-    range_fault_policy fault{};
-    fault.fail_first_gets = 2;
-    fault.fail_status     = 503;
-    range_s3_server server(std::vector<std::uint8_t>(4096, std::uint8_t{8}), fault);
-
-    auto cfg                      = make_s3_scan_config(server.endpoint(), true);
-    cfg.rest.max_retry_attempts   = 4;
-    cfg.rest.perf_instrumentation = false;
-    sirius_scan_manager manager{cfg, *fixture.memory, fixture.topology};
-
-    auto datasource = manager.create_datasource("s3://routing-bucket/retry.parquet");
-    auto* rest_ctx  = require_rest_ioctx(datasource);
-
-    read_one_host_range(*datasource);
-
-    auto const snapshot = rest_ctx->perf_snapshot();
-    CHECK(snapshot.retries_total == 2);
-    CHECK(snapshot.terminal_failures_total == 0);
-    CHECK(snapshot.device_stream_sync_total == 0);
-    CHECK(snapshot.chunk_get_count == 0);
-    CHECK(snapshot.queue_wait_count == 0);
-  }
-
-  SECTION("exhausted retries are reported as terminal failures")
-  {
-    range_fault_policy fault{};
-    fault.fail_all_gets = true;
-    fault.fail_status   = 503;
-    range_s3_server server(std::vector<std::uint8_t>(4096, std::uint8_t{9}), fault);
-
-    auto cfg                      = make_s3_scan_config(server.endpoint(), true);
-    cfg.rest.max_retry_attempts   = 2;
-    cfg.rest.perf_instrumentation = false;
-    sirius_scan_manager manager{cfg, *fixture.memory, fixture.topology};
-
-    auto datasource = manager.create_datasource("s3://routing-bucket/terminal.parquet");
-    auto* rest_ctx  = require_rest_ioctx(datasource);
-
-    std::array<std::uint8_t, 128> dst{};
-    CHECK_THROWS(datasource->host_read(0, dst.size(), dst.data()));
-
-    auto const snapshot = rest_ctx->perf_snapshot();
-    CHECK(snapshot.retries_total >= 1);
-    CHECK(snapshot.terminal_failures_total >= 1);
-    CHECK(snapshot.device_stream_sync_total == 0);
-  }
-}
-
-TEST_CASE("rest perf queue wait counts original requests rather than retry attempts",
-          "[s3][rest][perf]")
-{
-  range_fault_policy fault{};
-  fault.fail_first_gets = 2;
-  fault.fail_status     = 503;
-  range_s3_server server(std::vector<std::uint8_t>(4096, std::uint8_t{10}), fault);
-  scan_manager_fixture fixture;
-  auto cfg                      = make_s3_scan_config(server.endpoint(), true);
-  cfg.rest.max_retry_attempts   = 4;
-  cfg.rest.perf_instrumentation = true;
-  sirius_scan_manager manager{cfg, *fixture.memory, fixture.topology};
-
-  auto datasource = manager.create_datasource("s3://routing-bucket/queue.parquet");
-  auto* rest_ctx  = require_rest_ioctx(datasource);
-
-  read_one_host_range(*datasource);
-
-  auto const snapshot = rest_ctx->perf_snapshot();
-  CHECK(snapshot.retries_total == 2);
-  CHECK(snapshot.terminal_failures_total == 0);
-  CHECK(snapshot.queue_wait_count == 1);
-  CHECK(snapshot.chunk_get_count == 1);
-}
-
-TEST_CASE("rest perf snapshot aggregates counters across the reactor pool", "[s3][rest][perf]")
-{
-  range_s3_server server(std::vector<std::uint8_t>(4096, std::uint8_t{11}));
-  scan_manager_fixture fixture;
-  auto cfg                      = make_s3_scan_config(server.endpoint(), true);
-  cfg.rest.perf_instrumentation = true;
-  cfg.rest_n_reactors           = 2;
-  sirius_scan_manager manager{cfg, *fixture.memory, fixture.topology};
-
-  auto datasource = manager.create_datasource("s3://routing-bucket/pool.parquet");
-  auto* rest_ctx  = require_rest_ioctx(datasource);
-
-  for (int i = 0; i < 4; ++i) {
-    read_one_host_range(*datasource);
-  }
-
-  auto const snapshot = rest_ctx->perf_snapshot();
-  CHECK(snapshot.chunk_get_count == 4);
-  CHECK(snapshot.queue_wait_count == 4);
-  CHECK(snapshot.chunk_get_ns_total > 0);
-  CHECK(snapshot.chunk_get_ns_max > 0);
-  CHECK(snapshot.chunk_get_ns_max <= snapshot.chunk_get_ns_total);
-  CHECK(snapshot.queue_wait_ns_total > 0);
-  CHECK(snapshot.ttfb_ns > 0);
-  CHECK(snapshot.retries_total == 0);
-  CHECK(snapshot.terminal_failures_total == 0);
-  CHECK(snapshot.device_stream_sync_total == 0);
 }
 
 TEST_CASE("parquet_gpu_ingestible resolver routes each parquet file independently",

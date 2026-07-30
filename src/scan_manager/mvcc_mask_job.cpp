@@ -19,7 +19,6 @@
 #include "exec/completion_controller.hpp"
 #include "exec/scoped_dispatcher.hpp"
 #include "log/logging.hpp"
-#include "memory/topology_index.hpp"
 #include "op/scan/duckdb_mvcc_visibility.hpp"
 #include "op/scan/duckdb_native_metadata.hpp"
 
@@ -27,6 +26,7 @@
 #include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
 #include <cucascade/memory/memory_space.hpp>
+#include <cucascade/memory/topology_index.hpp>
 #include <duckdb/transaction/transaction_data.hpp>
 
 #include <algorithm>
@@ -108,7 +108,7 @@ struct pinned_mask_bundle {
 /// keyed by NUMA node directly; GPU-tier spaces map device -> node through
 /// the topology (unknown -> node 0, the decoder's normalization).
 std::size_t numa_node_for(ccm::memory_space const& space,
-                          sirius::memory::topology_index const& topology)
+                          cucascade::memory::topology_index const& topology)
 {
   int numa = -1;
   if (space.get_tier() == ccm::Tier::HOST) {
@@ -124,7 +124,7 @@ std::size_t numa_node_for(ccm::memory_space const& space,
 mvcc_mask_workset prepare_mvcc_mask_tasks(
   std::span<mvcc_mask_job_request> requests,
   cucascade::memory::memory_reservation_manager& reservation_manager,
-  sirius::memory::topology_index const& topology)
+  cucascade::memory::topology_index const& topology)
 {
   mvcc_mask_workset workset;
   if (requests.empty()) { return workset; }
@@ -346,7 +346,7 @@ void finalize_mvcc_masks(mvcc_mask_workset& workset)
 void run_mvcc_mask_jobs(std::span<mvcc_mask_job_request> requests,
                         exec::scoped_dispatcher& dispatcher,
                         cucascade::memory::memory_reservation_manager& reservation_manager,
-                        sirius::memory::topology_index const& topology)
+                        cucascade::memory::topology_index const& topology)
 {
   auto workset = prepare_mvcc_mask_tasks(requests, reservation_manager, topology);
   if (workset.fill_tasks.empty()) { return; }

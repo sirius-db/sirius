@@ -46,9 +46,9 @@ namespace sirius::planner {
 class query;
 }  // namespace sirius::planner
 
-namespace sirius::memory {
+namespace cucascade::memory {
 class topology_index;
-}  // namespace sirius::memory
+}  // namespace cucascade::memory
 
 namespace sirius::creator {
 
@@ -83,7 +83,7 @@ class task_creator {
    */
   task_creator(task_creator_config config,
                sirius::memory::sirius_memory_reservation_manager& mem_res_mgr,
-               std::shared_ptr<const sirius::memory::topology_index> topology_index = nullptr);
+               std::shared_ptr<const cucascade::memory::topology_index> topology_index = nullptr);
 
   /**
    * @brief Destructor that ensures the thread pool is stopped.
@@ -229,7 +229,7 @@ class task_creator {
   ///    verbatim from the host memory space's device id.
   ///  - gpu_ids() is the active executor set that partition affinity indexes,
   ///    so the pin resolves to a real executor when num_gpus < physical count.
-  std::shared_ptr<const sirius::memory::topology_index> _topology_index;
+  std::shared_ptr<const cucascade::memory::topology_index> _topology_index;
   /// Round-robin counter for NUMA-affinity routing when multiple GPUs share a NUMA node.
   std::atomic<uint64_t> _numa_affinity_rr{0};
   /// Sorted, deduped active GPU device ids, materialized from

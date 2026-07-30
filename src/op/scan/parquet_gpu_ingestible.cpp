@@ -18,11 +18,11 @@
 #include "op/scan/gpu_ingestible_types.hpp"
 #include "op/scan/owning_table_view.hpp"
 
+#include <cucascade/cudf/datasource.hpp>
+#include <cucascade/io/io_context.hpp>
 #include <expression/ast/from_duckdb.hpp>
 #include <expression_evaluator/expression_evaluator.hpp>
 #include <expression_evaluator/gpu_expression_translator_internal.hpp>
-#include <io/io_context.hpp>
-#include <io/sirius_datasource.hpp>
 #include <log/logging.hpp>
 #include <op/scan/dynamic_filter_merge.hpp>
 #include <op/scan/parquet_gpu_ingestible.hpp>
@@ -53,7 +53,7 @@
 // uring_reactor MUST be included last among sirius headers: liburing.h,
 // pulled in transitively, defines a BLOCK_SIZE macro that collides with the
 // BLOCK_SIZE static member in <blockingconcurrentqueue.h>.
-#include <io/uring/uring_reactor.hpp>
+#include <cucascade/io/uring/uring_reactor.hpp>
 
 // standard library
 #include <algorithm>
@@ -131,8 +131,8 @@ class parquet_batch_coalescer : public batch_coalescer {
       _empty_split_fallback = fallback_file{
         file->file_metadata,
         file->file_path,
-        file->datasource ? std::shared_ptr<io::sirius_datasource>(file->datasource->duplicate())
-                         : std::shared_ptr<io::sirius_datasource>{},
+        file->datasource ? std::shared_ptr<cucascade::io::datasource>(file->datasource->duplicate())
+                         : std::shared_ptr<cucascade::io::datasource>{},
         file->partition_values,
         file->disable_filter_pushdown};
     }
@@ -156,8 +156,8 @@ class parquet_batch_coalescer : public batch_coalescer {
       // each slice gets its own datasource (sharing the io_object) — otherwise
       // a later split's fadvise would stomp an earlier one's handle.
       auto slice_ds = file->datasource
-                                 ? std::shared_ptr<io::sirius_datasource>(file->datasource->duplicate())
-                                 : std::shared_ptr<io::sirius_datasource>{};
+                                 ? std::shared_ptr<cucascade::io::datasource>(file->datasource->duplicate())
+                                 : std::shared_ptr<cucascade::io::datasource>{};
       _slices.emplace_back(file->file_metadata,
                            file->file_path,
                            std::move(cur_rgs),
@@ -256,7 +256,7 @@ class parquet_batch_coalescer : public batch_coalescer {
   struct fallback_file {
     std::shared_ptr<cudf::io::parquet::FileMetaData const> file_metadata;
     std::string file_path;
-    std::shared_ptr<io::sirius_datasource> datasource;
+    std::shared_ptr<cucascade::io::datasource> datasource;
     std::vector<std::string> partition_values;
     bool disable_filter_pushdown;
   };
@@ -456,18 +456,18 @@ std::function<std::unique_ptr<op::scan::scan_info>()> parquet_gpu_ingestible::ne
 // build_file_scan_info — per-file footer read + row-group pruning
 //===----------------------------------------------------------------------===//
 std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
-  std::string const& file_path, std::shared_ptr<io::sirius_ioctx> const& io_ctx)
+  std::string const& file_path, std::shared_ptr<cucascade::io::ioctx> const& io_ctx)
 {
   auto stream = cudf::get_default_stream();
 
-  // Resolve the file to a sirius_datasource (own io backend, prefetch cache and
+  // Resolve the file to a cucascade::io::datasource (own io backend, prefetch cache and
   // cached metadata). The parquet_footer_probe hint collapses the S3 footer read
   // to one suffix-range GET that resolves the size and stashes the footer, so
   // cuDF's footer reads are served locally (no HEAD, no separate trailer/body
   // GETs). Fall back to a plain cudf datasource only for local paths no sirius
   // backend claims.
-  std::shared_ptr<io::sirius_datasource> sirius_ds =
-    io_ctx->open_datasource(file_path, io::open_hint::parquet_footer_probe);
+  std::shared_ptr<cucascade::io::datasource> sirius_ds = cucascade::io::open_datasource(
+    io_ctx, file_path, cucascade::io::open_hint::parquet_footer_probe);
   if (!sirius_ds && has_uri_scheme(file_path)) {
     throw std::runtime_error("[parquet_gpu_ingestible] no backend supports path: " + file_path);
   }

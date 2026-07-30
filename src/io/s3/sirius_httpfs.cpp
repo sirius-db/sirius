@@ -16,11 +16,11 @@
 
 #include "io/s3/sirius_httpfs.hpp"
 
-#include "io/io_context.hpp"
-#include "io/sirius_datasource.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
 #include "sirius_context.hpp"
 
+#include <cucascade/cudf/datasource.hpp>
+#include <cucascade/io/io_context.hpp>
 #include <duckdb/common/exception.hpp>
 #include <duckdb/common/file_opener.hpp>
 #include <duckdb/common/types/value.hpp>
@@ -45,7 +45,7 @@ namespace {
 
 constexpr std::string_view kScheme = "s3://";
 
-/// FileHandle backed by a sirius_datasource resolved through the
+/// FileHandle backed by a cucascade::io::datasource resolved through the
 /// scan_manager's create_datasource(path) seam — the datasource carries its
 /// io backend, io_object and any cached metadata, and its host_read goes
 /// through the prefetch-cache-integrated path. Holds shared ownership so the
@@ -56,14 +56,14 @@ class sirius_httpfs_file_handle : public duckdb::FileHandle {
   sirius_httpfs_file_handle(duckdb::FileSystem& fs,
                             std::string path,
                             duckdb::FileOpenFlags flags,
-                            std::shared_ptr<sirius::io::sirius_datasource> datasource)
+                            std::shared_ptr<cucascade::io::datasource> datasource)
     : duckdb::FileHandle(fs, std::move(path), flags), datasource_(std::move(datasource))
   {
   }
 
   void Close() override {}
 
-  std::shared_ptr<sirius::io::sirius_datasource> datasource_;
+  std::shared_ptr<cucascade::io::datasource> datasource_;
   duckdb::idx_t cursor_{0};
 };
 
@@ -245,7 +245,7 @@ duckdb::unique_ptr<duckdb::FileHandle> sirius_httpfs::OpenFile(
   }
   auto sirius_ctx = resolve_gated_sirius_context(opener, path, "reading");
   // Resolve through the scan_manager's datasource factory (the routed seam):
-  // the returned sirius_datasource performs the HEAD and carries the backend;
+  // the returned cucascade::io::datasource performs the HEAD and carries the backend;
   // HEAD failures (missing key / auth / network) propagate as exceptions for
   // DuckDB to surface at bind time.
   auto datasource = sirius_ctx->get_scan_manager().create_datasource(path);
@@ -271,7 +271,7 @@ duckdb::unique_ptr<duckdb::FileHandle> sirius_httpfs::OpenFileExtended(
   // LIST size that rode the glob expansion) and stashes the footer, so the
   // binder's footer reads are served locally (no HEAD, no separate footer GETs).
   auto datasource = sirius_ctx->get_scan_manager().create_datasource(
-    file.path, sirius::io::open_hint::parquet_footer_probe);
+    file.path, cucascade::io::open_hint::parquet_footer_probe);
   if (!datasource) {
     throw std::runtime_error("[sirius_httpfs] no S3 backend supports '" + file.path + "'");
   }
@@ -410,7 +410,7 @@ duckdb::vector<duckdb::OpenFileInfo> expand_glob(
   std::vector<std::string_view> key_segments;
   std::vector<std::int8_t> memo;
   scan_manager.list_objects_paged(
-    list_uri, /*page_size=*/1000, [&](sirius::io::s3::list_objects_v2_page const& page) {
+    list_uri, /*page_size=*/1000, [&](cucascade::io::rest::s3::list_objects_v2_page const& page) {
       for (auto const& entry : page.entries) {
         split_segments(entry.key, key_segments);
         bool matched;

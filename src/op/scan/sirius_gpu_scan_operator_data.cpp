@@ -28,7 +28,7 @@ void scan_operator_input::prepare_for_processing(
 {
   gpu_memory_space = const_cast<::cucascade::memory::memory_space*>(requested_memory_space);
   if (!std::holds_alternative<std::shared_ptr<cucascade::data_batch>>(materialization_info)) {
-    prefetch(io::cache::prefetching_stage::just_in_time);
+    prefetch(cucascade::io::cache::prefetching_stage::just_in_time);
     return;
   }
   auto batch = std::get<std::shared_ptr<cucascade::data_batch>>(materialization_info);

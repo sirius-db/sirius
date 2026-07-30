@@ -21,9 +21,9 @@
 #include <cuda_runtime_api.h>
 
 #include <catch.hpp>
-#include <io/rest/rest_reactor.hpp>
-#include <io/rest/types.hpp>
-#include <io/types.hpp>
+#include <cucascade/io/rest/rest_reactor.hpp>
+#include <cucascade/io/rest/types.hpp>
+#include <cucascade/io/types.hpp>
 
 #include <array>
 #include <cstdint>
@@ -31,12 +31,13 @@
 #include <span>
 #include <vector>
 
-using cudf::io::text::byte_range_info;
-using sirius::io::device_cpy_request;
-using sirius::io::io_object_segment;
-using sirius::io::rest::rest_chunked_rx_request;
-using sirius::io::rest::rest_io_object;
-using sirius::io::rest::rest_reactor;
+using cucascade::io::byte_range;
+using byte_range_info = cucascade::io::byte_range;  // cuCascade replaced the cudf type
+using cucascade::io::device_cpy_request;
+using cucascade::io::io_object_segment;
+using cucascade::io::rest::rest_chunked_rx_request;
+using cucascade::io::rest::rest_io_object;
+using cucascade::io::rest::rest_reactor;
 
 namespace {
 
@@ -116,7 +117,7 @@ TEST_CASE("align_and_coalesce honors a caller alignment as a lower bound", "[res
 
 TEST_CASE("prep_host_rx_request builds a single chunk for the segment", "[rest]")
 {
-  sirius::io::rest::config cfg;  // pure primitives; shared services live on the context
+  cucascade::io::rest::config cfg;  // pure primitives; shared services live on the context
   rest_io_object const file("s3://bkt/key", "bkt", "key", /*size=*/1 << 20);
 
   SECTION("non-empty segment")
@@ -142,7 +143,7 @@ TEST_CASE("prep_host_rx_request builds a single chunk for the segment", "[rest]"
 
 TEST_CASE("prep_host_rxv_request builds one chunk per non-empty segment", "[rest]")
 {
-  sirius::io::rest::config cfg;
+  cucascade::io::rest::config cfg;
   rest_io_object const file("s3://bkt/key", "bkt", "key", /*size=*/10000);
 
   SECTION("three in-range segments")
@@ -192,7 +193,7 @@ TEST_CASE("prep_host_rx_request splits a contiguous read by max_read_split", "[r
 
   SECTION("a read below 2 MiB stays a single GET")
   {
-    sirius::io::rest::config cfg;
+    cucascade::io::rest::config cfg;
     cfg.max_read_split = 16;
     auto req           = rest_reactor::prep_host_rx_request(
       cfg, file, io_object_segment{0, kMiB + kMiB / 2, fake_ptr(kBase)});  // 1.5 MiB
@@ -201,7 +202,7 @@ TEST_CASE("prep_host_rx_request splits a contiguous read by max_read_split", "[r
 
   SECTION("split count is capped by max_read_split")
   {
-    sirius::io::rest::config cfg;
+    cucascade::io::rest::config cfg;
     cfg.max_read_split = 4;
     // 8 MiB / 1 MiB = 8 candidate pieces, but max_read_split caps it at 4.
     auto req = rest_reactor::prep_host_rx_request(
@@ -223,7 +224,7 @@ TEST_CASE("prep_host_rx_request splits a contiguous read by max_read_split", "[r
 
   SECTION("pieces stay at least 1 MiB when max_read_split exceeds size / 1 MiB")
   {
-    sirius::io::rest::config cfg;
+    cucascade::io::rest::config cfg;
     cfg.max_read_split = 16;
     // 5 MiB / 1 MiB = 5 pieces, fewer than the cap, so each piece is exactly 1 MiB.
     auto req = rest_reactor::prep_host_rx_request(
@@ -237,7 +238,7 @@ TEST_CASE("prep_host_rx_request splits a contiguous read by max_read_split", "[r
 
   SECTION("an uneven split spreads the remainder over the leading pieces")
   {
-    sirius::io::rest::config cfg;
+    cucascade::io::rest::config cfg;
     cfg.max_read_split = 4;
     size_t const size  = 8 * kMiB + 3;  // 3 leading pieces get one extra byte
     auto req =
@@ -260,7 +261,7 @@ TEST_CASE("prep_host_rx_request splits a contiguous read by max_read_split", "[r
 
 TEST_CASE("prep_host_rxv_request fuses file-adjacent segments into a scatter GET", "[rest]")
 {
-  sirius::io::rest::config cfg;
+  cucascade::io::rest::config cfg;
   rest_io_object const file("s3://bkt/key", "bkt", "key", /*size=*/1 << 20);
 
   SECTION("three contiguous segments, separate buffers -> one multi-buffer chunk")
@@ -320,7 +321,7 @@ TEST_CASE("prep_host_rxv_request fuses file-adjacent segments into a scatter GET
 
 TEST_CASE("prep_host_to_device fuses contiguous segments into a multi-copy chunk", "[rest]")
 {
-  sirius::io::rest::config cfg;  // default chunk_size (8 MiB) / max_n_chunks (16)
+  cucascade::io::rest::config cfg;  // default chunk_size (8 MiB) / max_n_chunks (16)
   rest_io_object const file("s3://bkt/key", "bkt", "key", /*size=*/1 << 20);
   constexpr uintptr_t kDst = 0x100000;
   constexpr uintptr_t kB0 = 0xA000, kB1 = 0xB000, kB2 = 0xC000;
@@ -410,7 +411,7 @@ TEST_CASE("prep_host_to_device fuses contiguous segments into a multi-copy chunk
 TEST_CASE("prep_host_to_device keeps null-buffer segments as standalone bounce-staged chunks",
           "[rest]")
 {
-  sirius::io::rest::config cfg;  // default chunk_size (8 MiB) / max_n_chunks (16)
+  cucascade::io::rest::config cfg;  // default chunk_size (8 MiB) / max_n_chunks (16)
   rest_io_object const file("s3://bkt/key", "bkt", "key", /*size=*/1 << 20);
   constexpr uintptr_t kDst = 0x100000;
   constexpr uintptr_t kB0 = 0xA000, kB1 = 0xB000;

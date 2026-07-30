@@ -6,14 +6,14 @@
  */
 
 #include "catch.hpp"
-#include "io/rest/rest_ioctx.hpp"
 #include "io/s3/sirius_httpfs.hpp"
-#include "io/sirius_datasource.hpp"
-#include "io/uri_parser.hpp"
 #include "sirius_context.hpp"
 #include "sirius_extension.hpp"
 #include "utils/s3_container.hpp"
 
+#include <cucascade/cudf/datasource.hpp>
+#include <cucascade/io/rest/rest_ioctx.hpp>
+#include <cucascade/io/uri_parser.hpp>
 #include <duckdb.hpp>
 #include <duckdb/common/file_system.hpp>
 #include <duckdb/common/open_file_info.hpp>
@@ -269,8 +269,8 @@ void set_gpu_execution(duckdb::Connection& con, bool enabled)
   REQUIRE_FALSE(result->HasError());
 }
 
-std::shared_ptr<sirius::io::sirius_datasource> require_rest_datasource(
-  sirius_httpfs_fixture& fixture, std::string const& uri)
+std::shared_ptr<cucascade::io::datasource> require_rest_datasource(sirius_httpfs_fixture& fixture,
+                                                                   std::string const& uri)
 {
   auto sirius_ctx =
     fixture.con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
@@ -278,8 +278,8 @@ std::shared_ptr<sirius::io::sirius_datasource> require_rest_datasource(
   auto datasource = sirius_ctx->get_scan_manager().create_datasource(uri);
   REQUIRE(datasource != nullptr);
   REQUIRE(datasource->io_ctx() != nullptr);
-  CHECK(datasource->io_ctx()->type() == sirius::io::io_context_type::restful);
-  auto* rest_ctx = dynamic_cast<sirius::io::rest::rest_ioctx*>(datasource->io_ctx().get());
+  CHECK(datasource->io_ctx()->type() == cucascade::io::io_context_type::restful);
+  auto* rest_ctx = dynamic_cast<cucascade::io::rest::rest_ioctx*>(datasource->io_ctx().get());
   REQUIRE(rest_ctx != nullptr);
   return datasource;
 }
@@ -309,7 +309,7 @@ TEST_CASE("S3 LIST keys retain literal identity when embedded in object URIs",
                          std::string_view{"100%x.p"}}) {
     DYNAMIC_SECTION("key=" << key)
     {
-      auto const parsed = sirius::io::parse("s3://bkt/" + std::string{key});
+      auto const parsed = cucascade::io::parse("s3://bkt/" + std::string{key});
 
       CHECK(parsed.host == "bkt");
       CHECK(parsed.path == key);
@@ -324,7 +324,7 @@ TEST_CASE("S3 object URI parsing preserves ordinary keys byte for byte", "[s3][f
                          std::string_view{"nested/path/file.parquet"}}) {
     DYNAMIC_SECTION("key=" << key)
     {
-      CHECK(sirius::io::parse("s3://bkt/" + std::string{key}).path == key);
+      CHECK(cucascade::io::parse("s3://bkt/" + std::string{key}).path == key);
     }
   }
 }
@@ -428,7 +428,7 @@ TEST_CASE("sirius_httpfs opens through FileOpener and reads positional ranges",
   auto datasource = require_rest_datasource(fixture, uri);
   auto const size = handle->GetFileSize();
   REQUIRE(size > 16);
-  CHECK(static_cast<std::size_t>(size) == datasource->io_object().size());
+  CHECK(static_cast<std::size_t>(size) == datasource->get_io_object().size());
   CHECK_FALSE(handle->OnDiskFile());
 
   std::vector<std::uint8_t> fs_bytes(8);

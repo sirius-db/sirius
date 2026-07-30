@@ -20,9 +20,6 @@
 #include "cuda/scan/gpu_native_decode.cuh"
 #include "cudf/cudf_utils.hpp"
 #include "helper/type_conversions.hpp"
-#include "io/io_context.hpp"
-#include "io/sirius_datasource.hpp"
-#include "io/types.hpp"
 #include "op/scan/duckdb_block_layout.hpp"
 #include "op/scan/duckdb_native_gpu_ingestible.hpp"
 #include "sirius_context.hpp"
@@ -44,6 +41,9 @@
 
 #include <nvtx3/nvtx3.hpp>
 
+#include <cucascade/cudf/datasource.hpp>
+#include <cucascade/io/io_context.hpp>
+#include <cucascade/io/types.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
@@ -711,7 +711,7 @@ void batched_h2d(std::vector<void*> const& dst,
 
 void submit_and_await(rmm::device_buffer& device_buf,
                       staging_state const& s,
-                      const sirius::io::sirius_datasource& datasource,
+                      const cucascade::io::datasource& datasource,
                       cucascade::memory::memory_reservation_manager& host_mem_mgr,
                       int host_numa_node,
                       std::size_t coalesce_max_gap,
@@ -802,7 +802,7 @@ void submit_and_await(rmm::device_buffer& device_buf,
   auto host_alloc = host_fsmr->allocate_multiple_blocks(host_bytes, reservation.get());
 
   // One coalesced range + contiguous dst span per piece.
-  std::vector<io::io_object_segment> ranges;
+  std::vector<cucascade::io::io_object_segment> ranges;
   ranges.reserve(pieces.size());
   std::size_t total_read = 0;
   for (auto const& p : pieces) {
@@ -818,7 +818,7 @@ void submit_and_await(rmm::device_buffer& device_buf,
   {
     nvtx3::scoped_range nvtx_reads{"native_reads"};
     auto io_ctx           = datasource.io_ctx();
-    auto fut              = io_ctx->host_read_ranges_async_io(datasource.io_object(), ranges);
+    auto fut              = io_ctx->host_read_ranges_async_io(datasource.get_io_object(), ranges);
     std::size_t const got = std::move(fut).get();
     if (got != total_read) {
       throw std::runtime_error(std::string(kTag) + " short coalesced host read: got " +
@@ -972,7 +972,7 @@ std::vector<cudf::io::text::byte_range_info> row_group_file_ranges(
 std::unique_ptr<cudf::table> decode_duckdb_native_split(
   std::vector<duckdb_row_group_metadata> const& row_groups,
   duckdb_native_ingestible_table_info const& table_info,
-  sirius::io::sirius_datasource* datasource,
+  cucascade::io::datasource* datasource,
   cucascade::memory::memory_space& mem_space,
   rmm::cuda_stream_view stream)
 {

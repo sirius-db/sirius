@@ -15,8 +15,8 @@
  */
 
 #include <catch.hpp>
+#include <cucascade/io/kvikio/kvikio_context.hpp>
 #include <duckdb/common/constants.hpp>
-#include <io/kvikio/kvikio_context.hpp>
 #include <op/scan/parquet_gpu_ingestible.hpp>
 #include <op/scan/scan_plan.hpp>
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
@@ -82,9 +82,9 @@ struct scan_estimates {
 scan_estimates read_estimates(std::unique_ptr<scan::parquet_ingestible_table_info> info)
 {
   auto ingestible = scan::make_ingestible(std::move(info));
-  auto ioctx      = std::make_shared<sirius::io::kvikio_context>();
+  auto ioctx      = std::make_shared<cucascade::io::kvikio_context>();
   auto task       = ingestible->next_split_provider(
-    [ioctx](std::string_view) -> std::shared_ptr<sirius::io::sirius_ioctx> { return ioctx; });
+    [ioctx](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> { return ioctx; });
   REQUIRE(task);
 
   auto file = task();
@@ -152,10 +152,10 @@ TEST_CASE("parquet scans without a prefetch cache skip advisory ranges",
           "[scan][parquet][prefetch]")
 {
   auto ingestible = scan::make_ingestible(make_nation_info(false));
-  auto ioctx      = std::make_shared<sirius::io::kvikio_context>();
+  auto ioctx      = std::make_shared<cucascade::io::kvikio_context>();
   REQUIRE_FALSE(ioctx->uses_prefetching_cache());
   auto task = ingestible->next_split_provider(
-    [ioctx](std::string_view) -> std::shared_ptr<sirius::io::sirius_ioctx> { return ioctx; });
+    [ioctx](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> { return ioctx; });
   REQUIRE(task);
 
   auto coalescer = ingestible->create_batch_coalescer();

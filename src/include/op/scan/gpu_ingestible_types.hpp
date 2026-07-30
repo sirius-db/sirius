@@ -16,7 +16,7 @@
 
 #include "op/scan/owning_table_view.hpp"
 
-#include <io/sirius_datasource.hpp>
+#include <cucascade/cudf/datasource.hpp>
 
 #include <memory>
 #include <span>
@@ -77,7 +77,7 @@ class scan_info : public std::enable_shared_from_this<scan_info> {
   /// One unit of work pushed by a provider.  A null @c datasource is the
   /// closure sentinel: the sequencer treats it as "slot done, move on".
   struct fadvise_entry {
-    std::shared_ptr<sirius::io::sirius_datasource> datasource;
+    std::shared_ptr<cucascade::io::datasource> datasource;
     std::vector<cudf::io::text::byte_range_info> ranges;
   };
 
@@ -111,10 +111,13 @@ class scan_info : public std::enable_shared_from_this<scan_info> {
  protected:
   template <typename RangeFactory>
   static void append_fadvise_entry(std::vector<fadvise_entry>& entries,
-                                   std::shared_ptr<sirius::io::sirius_datasource> const& datasource,
+                                   std::shared_ptr<cucascade::io::datasource> const& datasource,
                                    RangeFactory&& make_ranges)
   {
-    if (!datasource || !datasource->uses_prefetching_cache()) { return; }
+    // cuCascade made datasource::uses_prefetching_cache() private; go through the
+    // ioctx, whose public predicate is the same one
+    // (can_use_prefetching_cache() && cache present).
+    if (!datasource || !datasource->io_ctx()->uses_prefetching_cache()) { return; }
     auto ranges = std::forward<RangeFactory>(make_ranges)();
     if (ranges.empty()) { return; }
     entries.push_back(fadvise_entry{datasource, std::move(ranges)});

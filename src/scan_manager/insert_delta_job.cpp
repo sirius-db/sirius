@@ -17,7 +17,6 @@
 #include "scan_manager/insert_delta_job.hpp"
 
 #include "log/logging.hpp"
-#include "memory/topology_index.hpp"
 #include "op/scan/duckdb_native_gpu_ingestible.hpp"
 #include "op/scan/duckdb_native_metadata.hpp"
 #include "scan_manager/mvcc_mask_job.hpp"
@@ -26,6 +25,7 @@
 #include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
 #include <cucascade/memory/memory_space.hpp>
+#include <cucascade/memory/topology_index.hpp>
 
 #include <algorithm>
 #include <cstdint>
@@ -53,7 +53,7 @@ struct pinned_staging_bundle {
 
 std::size_t align_up(std::size_t v, std::size_t a) { return (v + a - 1) / a * a; }
 
-std::size_t numa_node_for_device(int device, sirius::memory::topology_index const& topology)
+std::size_t numa_node_for_device(int device, cucascade::memory::topology_index const& topology)
 {
   int const numa = topology.numa_node_of(device);
   return numa < 0 ? 0 : static_cast<std::size_t>(numa);
@@ -65,7 +65,7 @@ insert_delta_workset prepare_insert_delta_tasks(
   std::span<insert_delta_job_request> requests,
   exec::scoped_dispatcher& dispatcher,
   cucascade::memory::memory_reservation_manager& reservation_manager,
-  sirius::memory::topology_index const& topology,
+  cucascade::memory::topology_index const& topology,
   std::span<int const> gpu_ids)
 {
   insert_delta_workset workset;
@@ -307,7 +307,7 @@ void finalize_insert_delta_jobs(insert_delta_workset& workset)
 void run_insert_delta_jobs(std::span<insert_delta_job_request> requests,
                            exec::scoped_dispatcher& dispatcher,
                            cucascade::memory::memory_reservation_manager& reservation_manager,
-                           sirius::memory::topology_index const& topology,
+                           cucascade::memory::topology_index const& topology,
                            std::span<int const> gpu_ids)
 {
   auto workset =
@@ -323,7 +323,7 @@ void run_insert_delta_jobs(std::span<insert_delta_job_request> requests,
 std::vector<insert_delta_split> cut_delta_splits_for_op(
   insert_delta_job_request const& request,
   std::span<op::scan::projected_column const> op_projected_cols,
-  std::shared_ptr<sirius::io::sirius_datasource> datasource,
+  std::shared_ptr<cucascade::io::datasource> datasource,
   duckdb::SingleFileBlockManager const* block_manager)
 {
   std::vector<std::size_t> union_idx;

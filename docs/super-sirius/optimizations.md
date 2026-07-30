@@ -280,13 +280,13 @@ If translation fails, filtering falls back to `expression_evaluator` on the deco
 
 **Motivation:** Repeated parquet reads pay full file-system cost on every query. A pinned-memory cache between the file and cuDF's parquet reader can serve subsequent reads at H2D-copy speed without re-reading from disk.
 
-**Mechanism:** `sirius::io` provides a `cudf::io::datasource` (`sirius_datasource`) backed by io_uring reactors and an optional pinned-memory `prefetching_cache`. The cache hit path issues `cudaMemcpyAsync` from pinned host memory directly to device; the miss path falls through to backend I/O, which uses `O_DIRECT` reads through pinned bounce slots and round-robin dispatch across reactor threads. A packed atomic state machine (4-bit state + 28-bit pin count in one `atomic<uint32_t>`) eliminates TOCTOU between readability checks and pin acquisition. Eviction is driven by a tiered LRU score; admission control caps concurrent in-flight chunks to keep memory bounded.
+**Mechanism:** `sirius::io` provides a `cudf::io::datasource` (`cucascade::io::datasource`) backed by io_uring reactors and an optional pinned-memory `prefetching_cache`. The cache hit path issues `cudaMemcpyAsync` from pinned host memory directly to device; the miss path falls through to backend I/O, which uses `O_DIRECT` reads through pinned bounce slots and round-robin dispatch across reactor threads. A packed atomic state machine (4-bit state + 28-bit pin count in one `atomic<uint32_t>`) eliminates TOCTOU between readability checks and pin acquisition. Eviction is driven by a tiered LRU score; admission control caps concurrent in-flight chunks to keep memory bounded.
 
 **Code path:**
-- `src/io/sirius_datasource.cpp` — `cudf::io::datasource` implementation
-- `src/io/cache/prefetching_cache.cpp` — chunk cache, worker, evictor, buffer pool
-- `src/io/uring/uring_reactor.cpp` — io_uring backend reactor
-- `src/exec/admission_control.cpp` — RAII budget enforcement
+- `cucascade/src/cudf/datasource.cpp` — `cudf::io::datasource` implementation
+- `cucascade/src/io/cache/prefetching_cache.cpp` — chunk cache, worker, evictor, buffer pool
+- `cucascade/src/io/uring/uring_reactor.cpp` — io_uring backend reactor
+- `cucascade/src/exec/admission_control.cpp` — RAII budget enforcement
 
 ### DuckDB-Native Scan Metadata Walk (PRs #868, #895, #936, #900)
 
@@ -307,7 +307,7 @@ If translation fails, filtering falls back to `expression_evaluator` on the deco
 
 **Motivation:** The DuckDB-native decoder issues many small segment reads. Synchronous `host_read()` calls bypass the datasource backend in favor of direct `pread()`, serializing I/O and inflating the request count per split.
 
-**Mechanism:** The decoder coalesces file-adjacent segment reads — bridging the small per-block header gaps up to a `coalesce_max_gap` derived from the block header size — into large sequential ranges, then issues them as one batch via `sirius_ioctx::host_read_ranges_async_io()` into pinned host blocks. Each coalesced range maps to a contiguous destination span, and the decoder issues bulk asynchronous H2D memcpy into aligned device memory. This cuts read requests per split several-fold and raises read throughput, especially on warm runs.
+**Mechanism:** The decoder coalesces file-adjacent segment reads — bridging the small per-block header gaps up to a `coalesce_max_gap` derived from the block header size — into large sequential ranges, then issues them as one batch via `cucascade::io::ioctx::host_read_ranges_async_io()` into pinned host blocks. Each coalesced range maps to a contiguous destination span, and the decoder issues bulk asynchronous H2D memcpy into aligned device memory. This cuts read requests per split several-fold and raises read throughput, especially on warm runs.
 
 **Code path:** `src/op/scan/duckdb_native_decoder.cpp` — range coalescing and `host_read_ranges_async_io()` dispatch
 
@@ -318,8 +318,8 @@ If translation fails, filtering falls back to `expression_evaluator` on the deco
 **Mechanism:** The remote read path is an asynchronous, concurrent reactor that plugs into the same `templated_ioctx<Reactor>` abstraction as the local io_uring backend, so the backend-agnostic machinery (sync→async bridge, completion aggregation, per-request fan-out, device chunking) is shared rather than reimplemented. A device read issues async ranged GETs into a bounded pinned host staging block, then `cudaMemcpyAsync` H2D, detecting completion by polling a per-chunk `cudaEvent` (`cudaEventQuery`) rather than synchronizing the stream — so the GET window and copy window overlap and up to `max_connections` chunks are in flight while host staging stays O(`max_connections`).
 
 **Code path:**
-- `src/io/rest/rest_reactor.cpp`, `src/io/rest/rest_ioctx.cpp` — async REST/S3 reactor over the shared `templated_ioctx` base
-- `src/include/io/templated_ioctx.hpp` — backend-agnostic async machinery shared with the io_uring path
+- `cucascade/src/io/rest/rest_reactor.cpp`, `cucascade/src/io/rest/rest_ioctx.cpp` — async REST/S3 reactor over the shared `templated_ioctx` base
+- `cucascade/include/cucascade/io/templated_ioctx.hpp` — backend-agnostic async machinery shared with the io_uring path
 
 **Config:** `object_store` config (endpoint / region / credentials / signing mode) under `executor.scan_manager`
 
@@ -344,8 +344,8 @@ If translation fails, filtering falls back to `expression_evaluator` on the deco
 - Chunk readiness uses a packed atomic state machine; admission control caps concurrent in-flight chunks and a tiered-LRU evictor returns chunks to the pool. Asynchronous results are delivered through the `exec::semi_future` primitive, which can be waited on or connected to an executor callback.
 
 **Code path:**
-- `src/io/cache/prefetching_cache.cpp` — `device_read_async()`, partial-read + populate-on-read, evictor
-- `src/io/io_context.cpp` — `sirius_ioctx` cache integration and coverage policy
+- `cucascade/src/io/cache/prefetching_cache.cpp` — `device_read_async()`, partial-read + populate-on-read, evictor
+- `cucascade/src/io/io_context.cpp` — `cucascade::io::ioctx` cache integration and coverage policy
 - `src/include/exec/semi_future.hpp` — async I/O completion primitive
 
 **Config:** `enable_prefetch_cache` and the `cache` sub-config under `executor.scan_manager`

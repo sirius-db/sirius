@@ -110,7 +110,7 @@ class duckdb_native_scan_info : public op::scan::scan_info {
   /// Row-group metadata for this unit.
   std::vector<duckdb_row_group_metadata> row_groups;
   /// Read handle for the .db file; prefetched by the sequencer and decoded by materialize.
-  std::shared_ptr<sirius::io::sirius_datasource> datasource;
+  std::shared_ptr<cucascade::io::datasource> datasource;
   /// Resolves block ids to file offsets when deriving the on-disk ranges below.
   duckdb::SingleFileBlockManager const* block_manager = nullptr;
   /// Owners of the bytes that host-backed descriptors (`host_ptr`) point

@@ -163,10 +163,69 @@ set(CUCASCADE_BUILD_CUDF
 set(CUCASCADE_WARNINGS_AS_ERRORS
     OFF
     CACHE BOOL "" FORCE)
+# cucascade's io/exec layer is the one Sirius runs on (src/io and src/exec were
+# folded into it upstream), so build it here rather than the standalone default.
 set(CUCASCADE_BUILD_IO
-    OFF
+    ON
     CACHE BOOL "" FORCE)
+
+# cucascade-io's two swappable third-party deps. Both must resolve to the exact
+# copies Sirius already links, or the same type would have two definitions
+# across the library boundary.
+#
+# moodycamel: duckdb vendors it at third_party/concurrentqueue and renames the
+# namespace to duckdb_moodycamel. duckdb puts that directory on the global
+# include path (duckdb/CMakeLists.txt), which is how Sirius's own headers reach
+# <blockingconcurrentqueue.h> with no wiring of their own — point cucascade at
+# the same headers so cucascade::io::blocking_concurrent_queue aliases the very
+# same duckdb_moodycamel::BlockingConcurrentQueue.
+set(CUCASCADE_MOODYCAMEL_INCLUDE_DIR
+    "${CMAKE_CURRENT_SOURCE_DIR}/duckdb/third_party/concurrentqueue"
+    CACHE PATH "" FORCE)
+set(CUCASCADE_MOODYCAMEL_NAMESPACE
+    "duckdb_moodycamel"
+    CACHE STRING "" FORCE)
+
+# abseil: duckdb does NOT vendor it, so this is the conda/vcpkg copy found at
+# the top of this file. Backing cucascade::exec::invocable with
+# absl::AnyInvocable (rather than cucascade's in-tree fallback) keeps it
+# identical to the type Sirius already spells everywhere, and avoids the
+# fallback's unconditional heap allocation. test_cucascade_abi.cpp
+# static_asserts that this seam took.
+set(CUCASCADE_USE_ABSEIL_INVOCABLE
+    ON
+    CACHE BOOL "" FORCE)
+set(CUCASCADE_ABSEIL_INVOCABLE_TARGET
+    "absl::any_invocable"
+    CACHE STRING "" FORCE)
 add_subdirectory(cucascade "${CMAKE_BINARY_DIR}/cucascade" EXCLUDE_FROM_ALL)
+
+# BS::thread_pool arrives with kvikio (which cucascade-io links) and advertises
+# INTERFACE_COMPILE_FEATURES "cxx_std_17;cuda_std_17". Compile features are
+# transitive, so cuda_std_17 travels BS::thread_pool -> kvikio::kvikio ->
+# cucascade_io -> sirius_extension -> duckdb's own `src` target. DuckDB is a
+# CXX/C project — only this extension's subdirectory does `project(sirius
+# LANGUAGES CXX CUDA)` — so once the requirement lands there CMake fails the
+# generate step with "No known features for CUDA compiler".
+#
+# Nothing in Sirius compiles CUDA against BS::thread_pool (it is a header-only
+# host-side pool used inside kvikIO), so drop the CUDA requirement and keep the
+# C++ one. Mirrors the CUDA::nvml_static redirect further down: a targeted fix
+# to an imported target we do not own.
+if(TARGET BS::thread_pool)
+  get_target_property(_bs_thread_pool_features BS::thread_pool
+                      INTERFACE_COMPILE_FEATURES)
+  if(_bs_thread_pool_features AND cuda_std_17 IN_LIST _bs_thread_pool_features)
+    list(REMOVE_ITEM _bs_thread_pool_features cuda_std_17)
+    set_target_properties(
+      BS::thread_pool PROPERTIES INTERFACE_COMPILE_FEATURES
+                                 "${_bs_thread_pool_features}")
+    message(
+      STATUS
+        "Sirius: dropped cuda_std_17 from BS::thread_pool's interface (duckdb targets do not enable CUDA)"
+    )
+  endif()
+endif()
 
 # Simpatico GPU compression engine Tests disabled here — run them via the
 # standalone simpatico_codegen build. Benchmark harness
@@ -252,26 +311,10 @@ set(EXTENSION_SOURCES
     src/expression_evaluator/specializations/operator.cpp
     src/expression_evaluator/specializations/reference.cpp
     # Execution primitives (slot-based backpressure / completion tracking)
-    src/exec/admission_control.cpp
-    # I/O adapters (Phase 19 — io_uring + sirius_datasource)
-    src/io/datasource_factory.cpp
-    src/io/io_context.cpp
+    # I/O. The stack itself (reactors, prefetching cache, datasource factory,
+    # sigv4) lives in cuCascade; what remains here is the DuckDB-facing glue.
     src/io/parquet_helpers.cpp
-    src/io/sirius_datasource.cpp
-    src/io/uri_parser.cpp
-    src/io/cache/metadata_store.cpp
-    src/io/cache/prefetching_cache.cpp
-    src/io/cache/types.cpp
-    src/io/kvikio/kvikio_context.cpp
-    src/io/rest/curl_handle.cpp
-    src/io/rest/rest_ioctx.cpp
-    src/io/rest/rest_reactor.cpp
-    src/io/s3/s3_list_parser.cpp
-    src/io/s3/sigv4.cpp
     src/io/s3/sirius_httpfs.cpp
-    src/io/s3/sirius_sigv4_authorizer.cpp
-    src/io/uring/uring_ioctx.cpp
-    src/io/uring/uring_reactor.cpp
     src/log/duckdb_sink.cpp
     src/log/level.cpp
     src/log/logging.cpp
@@ -504,7 +547,9 @@ foreach(_target sirius_extension sirius_loadable_extension)
 
   # cuCascade::cucascade_cudf holds the cudf-coupled representations and
   # converters Sirius uses; it transitively links the cudf-free core
-  # (cuCascade::cucascade) and cudf::cudf.
+  # (cuCascade::cucascade) and cudf::cudf. cuCascade::cucascade_io carries the
+  # io stack (reactors, prefetching cache, datasource factory) plus exec's
+  # admission_control, and brings liburing/libcurl/OpenSSL/kvikio with it.
 
   target_link_libraries(
     ${_target}
@@ -514,6 +559,7 @@ foreach(_target sirius_extension sirius_loadable_extension)
     spdlog::spdlog
     cuCascade::cucascade
     cuCascade::cucascade_cudf
+    cuCascade::cucascade_io
     yaml-cpp::yaml-cpp
     telemetry_bridge
     simpatico)
@@ -573,9 +619,21 @@ endif()
 # topology_discovery into its own static target, and PR #150 split the
 # cudf-coupled code into cucascade_cudf_static — list both here so the export
 # set covers the full dependency chain.
+#
+# cucascade_io_static additionally carries cucascade_io_thirdparty, the
+# INTERFACE target holding the moodycamel/abseil seam (include dirs plus the
+# CUCASCADE_MOODYCAMEL_NAMESPACE / CUCASCADE_USE_ABSEIL_INVOCABLE definitions).
+# It is in cucascade_io_static's INTERFACE_LINK_LIBRARIES, so export() rejects
+# the set unless it is exported alongside.
 install(
-  TARGETS sirius_extension cucascade_static cucascade_cudf_static
-          cucascade_topology_discovery_static telemetry_bridge simpatico
+  TARGETS sirius_extension
+          cucascade_static
+          cucascade_cudf_static
+          cucascade_io_static
+          cucascade_io_thirdparty
+          cucascade_topology_discovery_static
+          telemetry_bridge
+          simpatico
   EXPORT "${DUCKDB_EXPORT_SET}"
   LIBRARY DESTINATION "${INSTALL_LIB_DIR}"
   ARCHIVE DESTINATION "${INSTALL_LIB_DIR}")
@@ -596,6 +654,7 @@ set(TEST_SOURCES
     test/cpp/compression/test_compression.cpp
     test/cpp/config/test_config.cpp
     test/cpp/config/test_context.cpp
+    test/cpp/config/test_kvikio_config.cpp
     test/cpp/config/test_object_store_config.cpp
     test/cpp/data/test_convertible_data_batch.cpp
     test/cpp/data/test_data_repository_manager_registry.cpp
@@ -604,6 +663,7 @@ set(TEST_SOURCES
     test/cpp/downgrade/test_downgrade_executor.cpp
     test/cpp/downgrade/test_downgrade_lifecycle.cpp
     test/cpp/exec/test_bounded_thread_pool.cpp
+    test/cpp/exec/test_cucascade_abi.cpp
     test/cpp/exec/test_exchange_channel.cpp
     test/cpp/exec/test_inspectable_mpsc.cpp
     test/cpp/exec/test_interruptible_mpmc.cpp
@@ -648,12 +708,8 @@ set(TEST_SOURCES
     test/cpp/integration/test_pin_table_zone_map_pruning.cpp
     test/cpp/integration/test_table_gpu_cache_warm_mgpu.cpp
     test/cpp/integration/test_transparent_runtime_fallback.cpp
-    test/cpp/io/s3/test_sigv4.cpp
     test/cpp/io/s3/test_s3_default_visibility_guard.cpp
-    test/cpp/io/s3/test_sirius_sigv4_authorizer.cpp
-    test/cpp/io/s3/test_static_credentials.cpp
     test/cpp/io/test_parquet_helpers.cpp
-    test/cpp/io/test_uri_parser.cpp
     test/cpp/io/uring/test_uring_readv.cpp
     test/cpp/io/rest/test_rest_reactor.cpp
     test/cpp/log/test_duckdb_sink.cpp
@@ -850,6 +906,7 @@ target_link_libraries(
   spdlog::spdlog
   cuCascade::cucascade
   cuCascade::cucascade_cudf
+  cuCascade::cucascade_io
   PkgConfig::LIBURING
   PkgConfig::NUMA)
 link_extension_libraries(parquet_benchmark "")

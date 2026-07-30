@@ -18,7 +18,7 @@
 #include <catch.hpp>
 
 // sirius
-#include <memory/topology_index.hpp>
+#include <cucascade/memory/topology_index.hpp>
 
 // cucascade
 #include <cucascade/memory/topology_discovery.hpp>
@@ -29,7 +29,7 @@
 
 using cucascade::memory::gpu_topology_info;
 using cucascade::memory::system_topology_info;
-using sirius::memory::topology_index;
+using cucascade::memory::topology_index;
 
 namespace {
 

@@ -18,13 +18,8 @@
 
 #include "data/data_batch_utils.hpp"
 #include "exec/thread_pool.hpp"
-#include "io/cache/prefetching_cache.hpp"
-#include "io/io_context.hpp"
 #include "io/parquet_helpers.hpp"
-#include "io/rest/rest_ioctx.hpp"
-#include "io/sirius_datasource.hpp"
 #include "log/logging.hpp"
-#include "memory/topology_index.hpp"
 #include "op/scan/duckdb_native_gpu_ingestible.hpp"
 #include "op/scan/gpu_ingestible.hpp"
 #include "op/scan/parquet_gpu_ingestible.hpp"
@@ -48,10 +43,15 @@
 
 #include <rmm/cuda_device.hpp>
 
+#include <cucascade/cudf/datasource.hpp>
 #include <cucascade/cudf/gpu_data_representation.hpp>
+#include <cucascade/io/cache/prefetching_cache.hpp>
+#include <cucascade/io/io_context.hpp>
+#include <cucascade/io/rest/rest_ioctx.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
 #include <cucascade/memory/memory_space.hpp>
+#include <cucascade/memory/topology_index.hpp>
 #include <duckdb/main/attached_database.hpp>
 #include <duckdb/storage/data_table.hpp>
 #include <duckdb/storage/single_file_block_manager.hpp>
@@ -250,7 +250,7 @@ std::string normalize_path(std::string const& p)
 sirius_scan_manager::sirius_scan_manager(
   const scan_manager_config& config,
   cucascade::memory::memory_reservation_manager& reservation_manager,
-  std::shared_ptr<const sirius::memory::topology_index> topology_index)
+  std::shared_ptr<const cucascade::memory::topology_index> topology_index)
   : _config(config),
     _reservation_manager(reservation_manager),
     _topology_index(std::move(topology_index)),
@@ -265,7 +265,22 @@ sirius_scan_manager::sirius_scan_manager(
     throw std::invalid_argument("[sirius_scan_manager] topology_index must be non-null");
   }
 
-  // scan_manager always owns an io_ctx: sirius_datasource (uring) on the
+  // use_sirius_datasource=false means "serve local files with kvikIO".  Sirius's
+  // own registry had a _prefer_kvikio_for_file_scheme flag that lookup_path
+  // consulted; cuCascade's has no equivalent.  Express it instead by
+  // re-registering the uring backend with a checker that claims nothing —
+  // lookup_path then finds no explicit backend for a local path and defers to
+  // the kvikio catch-all, which is exactly the old behaviour.  register_ioctx
+  // replaces the prior registration for the type, so the factory is still
+  // available to the explicit make_ioctx(uring) call below.
+  if (!_config.use_sirius_datasource) {
+    _ioctx_registry.register_ioctx(
+      cucascade::io::io_context_type::uring,
+      [](std::string_view) { return false; },
+      cucascade::io::make_uring_ioctx_factory(reservation_manager));
+  }
+
+  // scan_manager always owns an io_ctx: the uring reactor on the
   // fast path, kvikio_context as the universal fallback so the rest of the
   // scan path (split_provider, scan tasks) always has an ioctx to
   // talk to.  kvikio_context wraps cudf::io::datasource so the read path
@@ -273,11 +288,11 @@ sirius_scan_manager::sirius_scan_manager(
   // ioctx registry, which sources the reactor staging resource from the
   // reservation manager it was constructed with.
   if (_config.use_sirius_datasource) {
-    _io_ctx = _ioctx_registry.make_ioctx(sirius::io::io_context_type::uring);
+    _io_ctx = _ioctx_registry.make_ioctx(cucascade::io::io_context_type::uring);
     if (!_io_ctx) {
       throw std::runtime_error("[sirius_scan_manager] failed to create uring io_context");
     }
-    SIRIUS_LOG_DEBUG("[sirius_scan_manager] sirius_datasource enabled (uring_ioctx n_reactors={})",
+    SIRIUS_LOG_DEBUG("[sirius_scan_manager] uring backend enabled (n_reactors={})",
                      _config.uring_n_reactors);
   } else {
     if (_topology_index->gpu_ids().size() > 1) {
@@ -287,12 +302,12 @@ sirius_scan_manager::sirius_scan_manager(
         std::to_string(_topology_index->gpu_ids().size()) +
         " GPUs.  Enable use_sirius_datasource for multi-GPU runs.");
     }
-    _io_ctx = _ioctx_registry.make_ioctx(sirius::io::io_context_type::kvikio);
+    _io_ctx = _ioctx_registry.make_ioctx(cucascade::io::io_context_type::kvikio);
     if (!_io_ctx) {
       throw std::runtime_error("[sirius_scan_manager] failed to create kvikio io_context");
     }
     SIRIUS_LOG_DEBUG(
-      "[sirius_scan_manager] sirius_datasource disabled — using kvikio_context fallback");
+      "[sirius_scan_manager] use_sirius_datasource=false — using kvikio_context fallback");
   }
 
   // Build the prefetching cache on the ioctx.  Budget=0 keeps the
@@ -338,8 +353,8 @@ parquet_bind_result sirius_scan_manager::describe_parquet(std::string const& uri
   auto const cache_key     = normalize_path(uri);
   auto const io_ctx        = ioctx_for_path(uri);
   bool const footer_cached = io_ctx && io_ctx->metadata_store().get_metadata(cache_key) != nullptr;
-  auto const hint =
-    footer_cached ? sirius::io::open_hint::generic : sirius::io::open_hint::parquet_footer_probe;
+  auto const hint          = footer_cached ? cucascade::io::open_hint::generic
+                                           : cucascade::io::open_hint::parquet_footer_probe;
 
   auto datasource = create_datasource(uri, hint);
   if (!datasource) {
@@ -389,7 +404,7 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
 
   if (_io_ctx && _io_ctx->cache()) {
     SIRIUS_LOG_INFO("[sirius_scan_manager] cache summary: {}", _io_ctx->cache()->summary());
-    _io_ctx->cache()->prepare_for_query(query);
+    _io_ctx->cache()->prepare_for_query();
   }
 
   // Routed ioctxs (e.g. the restful context serving s3://) are built lazily and
@@ -399,7 +414,7 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
   {
     std::lock_guard lk{_routed_io_ctxs_mtx};
     for (auto& [type, io_ctx] : _routed_io_ctxs) {
-      if (io_ctx && io_ctx->cache()) { io_ctx->cache()->prepare_for_query(query); }
+      if (io_ctx && io_ctx->cache()) { io_ctx->cache()->prepare_for_query(); }
     }
   }
 
@@ -427,7 +442,7 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
     }
     auto provider = std::make_unique<split_provider>(
       op->get_ingestible(),
-      [this](std::string_view file_path) -> std::shared_ptr<io::sirius_ioctx> {
+      [this](std::string_view file_path) -> std::shared_ptr<cucascade::io::ioctx> {
         auto io_ctx = ioctx_for_path(file_path);
         if (!io_ctx) {
           throw std::runtime_error("scan_manager: no backend supports path: " +
@@ -510,10 +525,11 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
         }
         auto const* sf_bm = dynamic_cast<duckdb::SingleFileBlockManager const*>(
           &duckdb_info->storage->GetAttached().GetStorageManager().GetBlockManager());
-        delta_splits = cut_delta_splits_for_op(*delta_request,
-                                               duckdb_info->projected_cols,
-                                               io_ctx->open_datasource(duckdb_info->db_path),
-                                               sf_bm);
+        delta_splits =
+          cut_delta_splits_for_op(*delta_request,
+                                  duckdb_info->projected_cols,
+                                  cucascade::io::open_datasource(io_ctx, duckdb_info->db_path),
+                                  sf_bm);
         SIRIUS_LOG_INFO(
           "[sirius_scan_manager] operator '{}' serves {} insert-delta split(s) of pinned entry "
           "'{}' ({} delta row(s))",
@@ -547,21 +563,21 @@ void sirius_scan_manager::start_metadata_processing()
   }
 }
 
-std::shared_ptr<sirius::io::sirius_datasource> sirius_scan_manager::create_datasource(
-  std::string_view path, sirius::io::open_hint hint)
+std::shared_ptr<cucascade::io::datasource> sirius_scan_manager::create_datasource(
+  std::string_view path, cucascade::io::open_hint hint)
 {
   auto file_path = normalize_path(std::string(path));
   auto io_ctx    = ioctx_for_path(file_path);
   if (!io_ctx) { return nullptr; }  // no backend supports the path
   // Real I/O / HEAD / auth / missing-object errors propagate as exceptions;
   // only "no backend" is reported as nullptr (callers map it to that message).
-  return io_ctx->open_datasource(file_path, hint);
+  return cucascade::io::open_datasource(io_ctx, file_path, hint);
 }
 
 void sirius_scan_manager::list_objects_paged(
   std::string const& s3_prefix_uri,
   std::size_t page_size,
-  std::function<bool(sirius::io::s3::list_objects_v2_page const&)> const& sink,
+  std::function<bool(cucascade::io::rest::s3::list_objects_v2_page const&)> const& sink,
   std::optional<std::size_t> max_scanned)
 {
   // Hand-split rather than uri_parser::parse — a LIST prefix URI legitimately
@@ -588,7 +604,7 @@ void sirius_scan_manager::list_objects_paged(
   auto const route_probe =
     "s3://" + std::string(bucket) + "/" + (prefix.empty() ? "_" : std::string(prefix));
   auto io_ctx = ioctx_for_path(route_probe);
-  auto* rest  = dynamic_cast<sirius::io::rest::rest_ioctx*>(io_ctx.get());
+  auto* rest  = dynamic_cast<cucascade::io::rest::rest_ioctx*>(io_ctx.get());
   if (rest == nullptr) {
     throw std::runtime_error("sirius_scan_manager::list_objects_paged: '" + s3_prefix_uri +
                              "' does not route to an object-store backend that supports LIST");
@@ -613,7 +629,7 @@ std::size_t sirius_scan_manager::s3_list_max_matches(std::string const& s3_uri)
   auto const route_probe =
     "s3://" + std::string(bucket) + "/" + (prefix.empty() ? "_" : std::string(prefix));
   auto io_ctx = ioctx_for_path(route_probe);
-  auto* rest  = dynamic_cast<sirius::io::rest::rest_ioctx*>(io_ctx.get());
+  auto* rest  = dynamic_cast<cucascade::io::rest::rest_ioctx*>(io_ctx.get());
   if (rest == nullptr) {
     throw std::runtime_error("sirius_scan_manager::s3_list_max_matches: '" + s3_uri +
                              "' does not route to an object-store backend that supports LIST");
@@ -621,7 +637,7 @@ std::size_t sirius_scan_manager::s3_list_max_matches(std::string const& s3_uri)
   return rest->list_max_matches();
 }
 
-std::shared_ptr<sirius::io::sirius_ioctx> sirius_scan_manager::ioctx_for_path(std::string_view path)
+std::shared_ptr<cucascade::io::ioctx> sirius_scan_manager::ioctx_for_path(std::string_view path)
 {
   // Normalize here so every caller (incl. the scan resolver, which forwards raw
   // ingestible paths) routes `file://` the same way create_datasource does.

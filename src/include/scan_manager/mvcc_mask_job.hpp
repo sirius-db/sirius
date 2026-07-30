@@ -16,6 +16,9 @@
 
 #pragma once
 
+// scoped_dispatcher is an alias of the cuCascade type, and an alias cannot be
+// forward-declared — include it rather than declaring it below.
+#include "exec/scoped_dispatcher.hpp"
 #include "op/scan/duckdb_mvcc_visibility.hpp"
 #include "scan_manager/duckdb_mvcc_metadata.hpp"
 #include "scan_manager/mvcc_chunk_mask.hpp"
@@ -40,13 +43,9 @@ class memory_reservation_manager;
 class memory_space;
 }  // namespace cucascade::memory
 
-namespace sirius::exec {
-class scoped_dispatcher;
-}  // namespace sirius::exec
-
-namespace sirius::memory {
+namespace cucascade::memory {
 class topology_index;
-}  // namespace sirius::memory
+}  // namespace cucascade::memory
 
 namespace sirius::scan_manager {
 
@@ -148,7 +147,7 @@ struct mvcc_mask_workset {
 [[nodiscard]] mvcc_mask_workset prepare_mvcc_mask_tasks(
   std::span<mvcc_mask_job_request> requests,
   cucascade::memory::memory_reservation_manager& reservation_manager,
-  sirius::memory::topology_index const& topology);
+  cucascade::memory::topology_index const& topology);
 
 /**
  * @brief Reset every work whose fill dropped no rows back to the default
@@ -177,6 +176,6 @@ void finalize_mvcc_masks(mvcc_mask_workset& workset);
 void run_mvcc_mask_jobs(std::span<mvcc_mask_job_request> requests,
                         exec::scoped_dispatcher& dispatcher,
                         cucascade::memory::memory_reservation_manager& reservation_manager,
-                        sirius::memory::topology_index const& topology);
+                        cucascade::memory::topology_index const& topology);
 
 }  // namespace sirius::scan_manager

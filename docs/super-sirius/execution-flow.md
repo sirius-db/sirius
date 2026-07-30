@@ -129,7 +129,7 @@ After meta-pipeline construction, `initialize_internal()` applies Sirius-specifi
 
 ## Step 6: Scan Execution
 
-**Files:** `src/include/scan_manager/sirius_scan_manager.hpp`, `src/op/scan/sirius_gpu_scan_operator.cpp`, `src/io/io_context.cpp`
+**Files:** `src/include/scan_manager/sirius_scan_manager.hpp`, `src/op/scan/sirius_gpu_scan_operator.cpp`, `cucascade/src/io/io_context.cpp`
 
 Scans run as a normal pipeline source on the GPU executor — there is no separate scan executor. Two cooperating pieces drive them:
 

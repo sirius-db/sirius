@@ -19,9 +19,6 @@
 #include "duckdb/planner/table_filter.hpp"
 #include "exec/scoped_dispatcher.hpp"
 #include "exec/thread_pool.hpp"
-#include "io/datasource_factory.hpp"
-#include "io/s3/s3_list_parser.hpp"
-#include "io/sirius_datasource.hpp"
 #include "op/scan/gpu_ingestible_types.hpp"
 #include "pin_table.hpp"
 #include "scan_manager/config.hpp"
@@ -36,13 +33,16 @@
 #include <cudf/table/table.hpp>
 
 #include <compression/compressed_representation.hpp>
+#include <cucascade/cudf/datasource.hpp>
 #include <cucascade/cudf/host_data_representation.hpp>
+#include <cucascade/io/datasource_factory.hpp>
+#include <cucascade/io/rest/s3/list_parser.hpp>
+#include <cucascade/io/types.hpp>
 #include <cucascade/memory/memory_space.hpp>
 #include <duckdb/common/column_index.hpp>
 #include <duckdb/common/types.hpp>
 #include <duckdb/common/vector.hpp>
 #include <duckdb/storage/statistics/base_statistics.hpp>
-#include <io/types.hpp>
 
 namespace cucascade::memory {
 class fixed_size_host_memory_resource;
@@ -63,16 +63,16 @@ namespace cucascade::memory {
 class memory_reservation_manager;
 }  // namespace cucascade::memory
 
-namespace sirius::memory {
+namespace cucascade::memory {
 class topology_index;
-}  // namespace sirius::memory
+}  // namespace cucascade::memory
 
-namespace sirius::io {
-class sirius_ioctx;
+namespace cucascade::io {
+class ioctx;
 namespace cache {
 class buffer_pool;
 }  // namespace cache
-}  // namespace sirius::io
+}  // namespace cucascade::io
 
 namespace sirius::op::scan {
 class sirius_gpu_scan_operator;
@@ -281,14 +281,14 @@ class sirius_scan_manager {
    * The scan_manager owns a single io_context (uring_ioctx) and optionally
    * an S3 backend and a prefetch buffer pool, all created from @p config.
    *
-   * @param config Scan-manager configuration (thread pool + sirius_datasource toggle).
+   * @param config Scan-manager configuration (thread pool + use_sirius_datasource toggle).
    * @param reservation_manager Memory reservation manager for GPU memory.
    * @param topology_index Hardware GPU/NUMA topology index.  Drives round-robin
    *        GPU assignment for scans and is forwarded to the prefetching cache.
    */
   sirius_scan_manager(const scan_manager_config& config,
                       cucascade::memory::memory_reservation_manager& reservation_manager,
-                      std::shared_ptr<const sirius::memory::topology_index> topology_index);
+                      std::shared_ptr<const cucascade::memory::topology_index> topology_index);
 
   ~sirius_scan_manager();
 
@@ -458,13 +458,13 @@ class sirius_scan_manager {
 
   parquet_bind_result describe_parquet(std::string const& uri);
 
-  /// \brief Process-wide ioctx used to mint @c sirius_datasource instances.
+  /// \brief Process-wide ioctx used to mint @c cucascade::io::datasource instances.
   ///        Holds a @c uring_ioctx, or a @c kvikio_context when the manager
   ///        was configured with @c use_sirius_datasource=false.
-  [[nodiscard]] sirius::io::sirius_ioctx* io_ctx() const noexcept { return _io_ctx.get(); }
+  [[nodiscard]] cucascade::io::ioctx* io_ctx() const noexcept { return _io_ctx.get(); }
 
-  [[nodiscard]] std::shared_ptr<sirius::io::sirius_datasource> create_datasource(
-    std::string_view path, sirius::io::open_hint hint = sirius::io::open_hint::generic);
+  [[nodiscard]] std::shared_ptr<cucascade::io::datasource> create_datasource(
+    std::string_view path, cucascade::io::open_hint hint = cucascade::io::open_hint::generic);
 
   /// \brief Stream ListObjectsV2 pages for @p s3_prefix_uri ("s3://bucket/prefix")
   ///        to @p sink, one call per page; @p sink returns false to stop early.
@@ -476,7 +476,7 @@ class sirius_scan_manager {
   void list_objects_paged(
     std::string const& s3_prefix_uri,
     std::size_t page_size,
-    std::function<bool(sirius::io::s3::list_objects_v2_page const&)> const& sink,
+    std::function<bool(cucascade::io::rest::s3::list_objects_v2_page const&)> const& sink,
     std::optional<std::size_t> max_scanned = std::nullopt);
 
   /// \brief The configured glob-match cap (@c rest.list_max_matches) for the
@@ -515,16 +515,16 @@ class sirius_scan_manager {
   /// building it once per backend on first use.  Routes by path through the registry
   /// so an `s3://` URI reaches the rest_ioctx even when the local default `_io_ctx`
   /// is uring/kvikio.  Returns nullptr when no backend supports the path.
-  std::shared_ptr<sirius::io::sirius_ioctx> ioctx_for_path(std::string_view path);
+  std::shared_ptr<cucascade::io::ioctx> ioctx_for_path(std::string_view path);
 
   scan_manager_config _config;
   cucascade::memory::memory_reservation_manager& _reservation_manager;
   /// Hardware GPU/NUMA topology, shared with the prefetching cache.  Source of
   /// the GPU id set fed to the round-robin scan-balancing strategy.
-  std::shared_ptr<const sirius::memory::topology_index> _topology_index;
+  std::shared_ptr<const cucascade::memory::topology_index> _topology_index;
   exec::static_thread_pool _thread_pool;
   std::unique_ptr<exec::scoped_dispatcher> _dispatcher;
-  std::shared_ptr<sirius::io::sirius_ioctx> _io_ctx;
+  std::shared_ptr<cucascade::io::ioctx> _io_ctx;
   /// Lazily-built per-backend ioctxs for path-routed datasources (e.g. an s3://
   /// rest_ioctx alongside the local uring/kvikio `_io_ctx`).  Built exactly once
   /// per type: `_routed_io_ctxs_build_mtx` serializes construction (reactor
@@ -533,7 +533,7 @@ class sirius_scan_manager {
   /// in the dtor.
   std::mutex _routed_io_ctxs_build_mtx;
   std::mutex _routed_io_ctxs_mtx;
-  std::unordered_map<sirius::io::io_context_type, std::shared_ptr<sirius::io::sirius_ioctx>>
+  std::unordered_map<cucascade::io::io_context_type, std::shared_ptr<cucascade::io::ioctx>>
     _routed_io_ctxs;
   std::unordered_map<op::scan::sirius_gpu_scan_operator*, std::unique_ptr<split_provider>>
     _providers_by_op;
@@ -562,7 +562,7 @@ class sirius_scan_manager {
   /// dispatcher's @c request_stop() in @ref reset() therefore tears the
   /// sequencer down without an extra side-channel.
   std::unique_ptr<load_balancing_scan_batch_coalescer> _metadata_processor;
-  io::io_context_registry _ioctx_registry;
+  cucascade::io::io_context_registry _ioctx_registry;
 };
 
 }  // namespace sirius::scan_manager

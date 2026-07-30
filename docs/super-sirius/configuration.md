@@ -267,7 +267,7 @@ Thread pool (default `num_threads: 4`, prefix `downgrade`) plus:
 
 ## Scan Manager & IO Configuration
 
-**Files:** `src/include/scan_manager/config.hpp`, `src/include/io/uring/config.hpp`, `src/include/io/rest/config.hpp`, `src/include/io/cache/config.hpp`, `src/include/io/object_store_config.hpp`
+**Files:** `src/include/scan_manager/config.hpp` (derives from `cucascade::io::io_config`), `cucascade/include/cucascade/io/config.hpp`, and its sub-configs `io/uring/config.hpp`, `io/rest/config.hpp`, `io/kvikio/config.hpp`, `io/cache/config.hpp`, `io/object_store_config.hpp`
 
 The `sirius.executor.scan_manager` block configures the scan-metadata thread pool and the Sirius IO layer that feeds the GPU scan operators.
 
@@ -276,12 +276,12 @@ The `sirius.executor.scan_manager` block configures the scan-metadata thread poo
 | `num_threads` | int (**> 2**) | 8 | Threads in the scan-manager pool that run metadata tasks. Rejected unless strictly greater than 2 (i.e. minimum 3). |
 | `thread_name_prefix` | string | `scan_manager` | Thread name prefix for logs. |
 | `cpu_affinity` | list of int | — | Cores to pin scan-manager threads to. |
-| `use_sirius_datasource` | bool | true | Route reads through the Sirius `io_uring` datasource. When false, the kvikio fallback is used (single-GPU only; multi-GPU requires the Sirius datasource). |
+| `use_sirius_datasource` | bool | true | Route local reads through the io_uring backend. When false the uring backend is re-registered with a checker that claims nothing, so local files fall through to the kvikIO catch-all (single-GPU only; multi-GPU forces this true). |
 | `uring_n_reactors` | int (**> 0**) | 1 | Number of io_uring reactor threads for local-disk reads. |
 | `rest_n_reactors` | int (**> 0**) | 2 | Number of REST reactor threads for object-store (`s3://`) reads. |
 | `enable_prefetch_cache` | bool | false | Attach the pinned-memory prefetching cache in front of the backend. |
 
-Four optional nested sub-configs tune the individual backends and caches:
+Five optional nested sub-configs tune the individual backends and caches:
 
 ### `scan_manager.local` — io_uring backend (`io/uring/config.hpp`)
 
@@ -309,10 +309,34 @@ Four optional nested sub-configs tune the individual backends and caches:
 | `max_retry_attempts` | int | 10 | Retry attempts for transient errors. |
 | `max_auth_retry_attempts` | int | 3 | Retry attempts for HTTP 403 (expired presigned URL). Kept low so a genuine AccessDenied fails fast. |
 | `honor_retry_after` | bool | true | Respect the server's `Retry-After` header. |
-| `perf_instrumentation` | bool | false | Record per-chunk micro-timings (chunk_get, queue_wait, ttfb, h2d) into perf counters. |
 | `footer_probe_bytes` | bytes | 512Ki | Suffix-range window for the parquet footer probe. Must cover the footer, so err large. |
 | `list_max_matches` | int | 100000 | Cap on files a glob/listing may accumulate (throws "narrow the glob prefix", never truncates). |
 | `list_max_scanned` | int | 1000000 | Cap on objects a LIST sweep may scan across pages (throws, never truncates). |
+
+### `scan_manager.kvikio` — kvikIO backend (`cucascade/io/kvikio/config.hpp`)
+
+Every key is optional **and unset by default**, which means "leave kvikIO's own
+env-var-seeded default alone". Setting a key is therefore not the same as writing
+kvikIO's default value back.
+
+> **Process-global.** Every key except `compat_mode` mutates kvikIO's `defaults`
+> singleton, so the last ioctx constructed wins for the whole process.
+> `compat_mode` is per-`FileHandle` and does not have this caveat.
+
+| Key | Type | kvikIO default | Description |
+|-----|------|----------------|-------------|
+| `nthreads` | uint | 1 | kvikIO thread-pool size (`KVIKIO_NTHREADS`). Must be > 0. |
+| `task_size` | bytes | 4 MiB | Per-task read size (`KVIKIO_TASK_SIZE`). Must be > 0. |
+| `gds_threshold` | bytes | 1 MiB | Reads below this bypass GDS (`KVIKIO_GDS_THRESHOLD`). 0 is legal — always try GDS. |
+| `bounce_buffer_size` | bytes | 16 MiB | Staging buffer size (`KVIKIO_BOUNCE_BUFFER_SIZE`). Must be > 0. |
+| `auto_direct_io_read` | bool | — | The `O_DIRECT` switch for the kvikIO path (`KVIKIO_AUTO_DIRECT_IO_READ`). Distinct from `scan_manager.local.use_odirect`, which governs the io_uring backend. |
+| `auto_direct_io_read_overread` | bool | false | Allow over-reading on the device path; requires `auto_direct_io_read`. |
+| `thread_pool_per_block_device` | bool | false | One thread pool per block device (`KVIKIO_THREAD_POOL_PER_BLOCK_DEVICE`). |
+| `compat_mode` | `off` \| `on` \| `auto` | env | `off` forces cuFile/GDS, `on` forces POSIX, `auto` tries cuFile and falls back. |
+
+This backend is only reached when `use_sirius_datasource` is false (local files
+then fall through to the kvikIO catch-all) or for paths no explicit backend
+claims.
 
 ### `scan_manager.cache` — prefetching cache (`io/cache/config.hpp`)
 
@@ -603,4 +627,4 @@ These are compile-time defaults. Runtime configuration via `sirius_config` and D
 | `src/include/config.hpp` | Legacy config flags |
 | `src/sirius_extension.cpp` | SET variable registration |
 | `src/include/scan_manager/config.hpp` | Scan manager config (thread pool, IO reactors, prefetch cache, object store) |
-| `src/include/io/uring/config.hpp`, `io/rest/config.hpp`, `io/cache/config.hpp`, `io/object_store_config.hpp` | Per-backend IO / cache / object-store sub-configs |
+| `cucascade/include/cucascade/io/uring/config.hpp`, `io/rest/config.hpp`, `io/cache/config.hpp`, `io/object_store_config.hpp` | Per-backend IO / cache / object-store sub-configs |

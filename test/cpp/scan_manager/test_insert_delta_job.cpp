@@ -22,7 +22,10 @@
 #include "operator/operator_test_utils.hpp"
 
 #include <catch.hpp>
+#include <cucascade/cudf/datasource.hpp>
+#include <cucascade/io/kvikio/kvikio_context.hpp>
 #include <cucascade/memory/topology_discovery.hpp>
+#include <cucascade/memory/topology_index.hpp>
 #include <duckdb.hpp>
 #include <duckdb/catalog/catalog.hpp>
 #include <duckdb/catalog/catalog_entry/duck_table_entry.hpp>
@@ -30,9 +33,6 @@
 #include <duckdb/storage/data_table.hpp>
 #include <exec/scoped_dispatcher.hpp>
 #include <exec/thread_pool.hpp>
-#include <io/kvikio/kvikio_context.hpp>
-#include <io/sirius_datasource.hpp>
-#include <memory/topology_index.hpp>
 #include <op/scan/duckdb_native_gpu_ingestible.hpp>
 #include <scan_manager/insert_delta_job.hpp>
 #include <unistd.h>
@@ -106,7 +106,7 @@ bool bit_at(std::span<std::uint32_t const> words, std::size_t i)
 
 struct job_env {
   std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> mgr;
-  sirius::memory::topology_index topology;
+  cucascade::memory::topology_index topology;
   std::vector<int> gpu_ids{0};
 
   job_env()
@@ -350,8 +350,9 @@ TEST_CASE("insert-delta job: file-backed splits each own a duplicated datasource
   auto const& request = requests[0];
   REQUIRE(request.bundles.size() >= 2);
 
-  auto ioctx = std::make_shared<sirius::io::kvikio_context>();
-  std::shared_ptr<sirius::io::sirius_datasource> datasource = ioctx->open_datasource(tdb.path);
+  auto ioctx = std::make_shared<cucascade::io::kvikio_context>();
+  std::shared_ptr<cucascade::io::datasource> datasource =
+    cucascade::io::open_datasource(ioctx, tdb.path);
 
   std::vector<sirius::op::scan::projected_column> op{real_col(0)};
   auto splits = cut_delta_splits_for_op(request, op, datasource, /*block_manager=*/nullptr);
@@ -360,7 +361,7 @@ TEST_CASE("insert-delta job: file-backed splits each own a duplicated datasource
   // The datasource's prefetch handle is per-scan state: every file-backed
   // split must own its own duplicate, never the shared original; host-only
   // splits carry none.
-  std::unordered_set<sirius::io::sirius_datasource const*> seen;
+  std::unordered_set<cucascade::io::datasource const*> seen;
   bool saw_host_only = false;
   for (auto const& split : splits) {
     if (split.info->host_backed_only) {
@@ -401,8 +402,9 @@ TEST_CASE("insert-delta job: blockless-only splits carry no datasource",
   run(requests);
   auto const& request = requests[0];
 
-  auto ioctx = std::make_shared<sirius::io::kvikio_context>();
-  std::shared_ptr<sirius::io::sirius_datasource> datasource = ioctx->open_datasource(tdb.path);
+  auto ioctx = std::make_shared<cucascade::io::kvikio_context>();
+  std::shared_ptr<cucascade::io::datasource> datasource =
+    cucascade::io::open_datasource(ioctx, tdb.path);
 
   // An operator projecting only the constant column cuts splits whose
   // persistent descriptors are all blockless: nothing reads the file, so the

@@ -17,7 +17,6 @@
 #include "creator/task_creator.hpp"
 
 #include "log/logging.hpp"
-#include "memory/topology_index.hpp"
 #include "op/scan/sirius_gpu_scan_operator_data.hpp"
 #include "op/sirius_physical_delim_join.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
@@ -29,6 +28,7 @@
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/memory_space.hpp>
+#include <cucascade/memory/topology_index.hpp>
 #include <duckdb/execution/execution_context.hpp>
 #include <duckdb/parallel/thread_context.hpp>
 
@@ -47,7 +47,7 @@ namespace sirius::creator {
 
 task_creator::task_creator(task_creator_config config,
                            sirius::memory::sirius_memory_reservation_manager& mem_res_mgr,
-                           std::shared_ptr<const sirius::memory::topology_index> topology_index)
+                           std::shared_ptr<const cucascade::memory::topology_index> topology_index)
   : _running(false),
     _config(std::move(config)),
     _mem_res_mgr(mem_res_mgr),

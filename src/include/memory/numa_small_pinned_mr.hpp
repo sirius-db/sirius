@@ -16,13 +16,12 @@
 
 #pragma once
 
-#include "memory/topology_index.hpp"
-
 #include <cuda/memory_resource>
 #include <cuda/stream_ref>
 #include <cuda_runtime_api.h>
 
 #include <cucascade/memory/small_pinned_host_memory_resource.hpp>
+#include <cucascade/memory/topology_index.hpp>
 
 #include <cstddef>
 #include <memory>
@@ -68,7 +67,7 @@ class numa_small_pinned_mr {
   numa_small_pinned_mr(
     std::unordered_map<int, std::unique_ptr<cucascade::memory::small_pinned_host_memory_resource>>
       per_node_pools,
-    std::shared_ptr<const topology_index> topology,
+    std::shared_ptr<const cucascade::memory::topology_index> topology,
     int fallback_node)
     : pools_(std::move(per_node_pools)),
       topology_(std::move(topology)),
@@ -155,7 +154,7 @@ class numa_small_pinned_mr {
 
   std::unordered_map<int, std::unique_ptr<cucascade::memory::small_pinned_host_memory_resource>>
     pools_;
-  std::shared_ptr<const topology_index> topology_;
+  std::shared_ptr<const cucascade::memory::topology_index> topology_;
   int fallback_node_;
   // Allocate-time -> deallocate-time NUMA-node lookup. The cuDF pinned MR
   // is shared across worker threads that may be bound to different GPUs;

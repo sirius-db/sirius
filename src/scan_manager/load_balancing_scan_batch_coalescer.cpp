@@ -19,6 +19,7 @@
 #include "exec/try.hpp"
 #include "log/logging.hpp"
 #include "op/scan/sirius_gpu_scan_operator_data.hpp"
+#include "pipeline/sirius_pipeline.hpp"
 
 #include <stop_token>
 #include <utility>
@@ -107,7 +108,7 @@ void load_balancing_scan_batch_coalescer::process_provider_inputs(metadata_proce
         }
       }
     }
-    op_data->prefetch(io::cache::prefetching_stage::opportunistic);
+    op_data->prefetch(cucascade::io::cache::prefetching_stage::opportunistic);
     state.connector->push_split(std::move(op_data));
   };
 
@@ -201,7 +202,7 @@ void load_balancing_scan_batch_coalescer::drain_cached_provider(databatch_provid
             hint.datasource->fadvise(hint.ranges, device);
           }
         }
-        split->prefetch(io::cache::prefetching_stage::opportunistic);
+        split->prefetch(cucascade::io::cache::prefetching_stage::opportunistic);
         connector.push_split(std::move(split));
         continue;
       }

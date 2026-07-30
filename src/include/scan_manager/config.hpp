@@ -18,57 +18,37 @@
 #pragma once
 
 #include "exec/config.hpp"
-#include "io/cache/config.hpp"
-#include "io/object_store_config.hpp"
-#include "io/rest/config.hpp"
-#include "io/uring/config.hpp"
+
+#include <cucascade/io/config.hpp>
 
 namespace sirius::scan_manager {
 
 /**
  * @brief Configuration for the scan_manager.
  *
- * @c use_sirius_datasource selects the backend for local paths: @c uring_ioctx
- * when true, @c kvikio_context when false. Reads go through
- * @c sirius_datasource either way; the kvikio backend delegates to
- * @c cudf::io::datasource::create(). Multi-GPU forces this to true.
+ * Derives from @c cucascade::io::io_config, which owns every knob the IO stack
+ * itself consumes (@c uring_n_reactors, @c rest_n_reactors,
+ * @c enable_prefetch_cache and the @c local / @c rest / @c kvikio / @c cache /
+ * @c object_store sub-configs).  Inheriting rather than duplicating them means
+ * a field added or removed upstream shows up here automatically, and the
+ * registry — whose @c config_type is @c io_config — takes this by base
+ * reference with no conversion step.
  *
- * Sub-configs:
- *  - @c local   — uring reactor tunables (local-disk IO path).
- *  - @c rest    — REST reactor tunables (S3/object-store IO path).
- *  - @c cache   — prefetching cache tunables.
- *  - @c object_store — object-store credentials and endpoint.
+ * The two members below are sirius-only: cuCascade's IO layer has no notion of
+ * either.
+ *
+ * @c use_sirius_datasource selects the backend for local paths: the uring
+ * reactor when true, kvikIO when false.  It is implemented by re-registering
+ * the uring backend with a checker that claims nothing, so local files fall
+ * through to the kvikio catch-all (see @c sirius_scan_manager's registry
+ * setup).  Multi-GPU forces this to true.
  */
-struct scan_manager_config {
+struct scan_manager_config : cucascade::io::io_config {
+  /// Metadata / dispatch pool owned by the scan manager itself — unrelated to
+  /// the reactor threads configured by the base's *_n_reactors.
   exec::thread_pool_config thread_pool{.num_threads = 8, .thread_name_prefix = "scan_manager"};
+
   bool use_sirius_datasource{true};
-
-  /// Number of uring reactor worker threads for the local-disk IO path.
-  std::size_t uring_n_reactors{1};
-
-  /// Number of REST reactor worker threads for the S3/object-store IO path
-  /// (each its own libcurl event loop + connection pool).
-  std::size_t rest_n_reactors{2};
-
-  /// Enable the prefetching cache on the ioctx.  When false the cache is
-  /// constructed but unarmed (no background IO threads).
-  bool enable_prefetch_cache{false};
-
-  /// Local (uring) reactor configuration — bounce-slot size, O_DIRECT,
-  /// ring depth, etc.
-  io::uring::config local{};
-
-  /// REST (S3/object-store) reactor configuration — timeouts, TLS, chunking,
-  /// retry policy, etc.
-  io::rest::config rest{};
-
-  /// Prefetching cache configuration — in-flight budget, pool sizing,
-  /// dispose-after-use policy.
-  io::cache::config cache{};
-
-  /// Object-store credentials and endpoint consumed by the REST reactor.
-  /// Empty fields disable the S3/REST backend.
-  io::object_store_config object_store{};
 };
 
 }  // namespace sirius::scan_manager

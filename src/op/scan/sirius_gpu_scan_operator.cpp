@@ -15,8 +15,7 @@
  */
 
 // sirius
-#include "io/cache/types.hpp"
-
+#include <cucascade/io/cache/types.hpp>
 #include <data/data_batch_utils.hpp>
 #include <data/sirius_converter_registry.hpp>
 #include <log/logging.hpp>
@@ -75,7 +74,7 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::get_next_task_input
   auto next = _split_connector->get_next_split();
   if (!next.has_value()) { return nullptr; }
   if (auto* scan_input = dynamic_cast<scan_operator_input*>(next->get()); scan_input) {
-    scan_input->prefetch(io::cache::prefetching_stage::immediate);
+    scan_input->prefetch(cucascade::io::cache::prefetching_stage::immediate);
   }
   return std::move(*next);
 }

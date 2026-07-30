@@ -53,8 +53,11 @@ class small_pinned_host_memory_resource;
 
 namespace sirius::memory {
 class numa_small_pinned_mr;
-class topology_index;
 }  // namespace sirius::memory
+
+namespace cucascade::memory {
+class topology_index;
+}  // namespace cucascade::memory
 
 namespace sirius {
 class sirius_engine;
@@ -580,7 +583,7 @@ class SiriusContext : public ClientContextState {
   // scan_manager so every NUMA-aware routing decision reads one consistent
   // index instead of rebuilding ad-hoc device<->NUMA maps. Owns a copy of the
   // topology and holds no device resources, so teardown order is unconstrained.
-  std::shared_ptr<const sirius::memory::topology_index> topology_index_;
+  std::shared_ptr<const cucascade::memory::topology_index> topology_index_;
   // P2P: set of (src, dst) GPU pairs where cudaDeviceEnablePeerAccess
   // succeeded in initialize(). Populated under rmm::cuda_set_device_raii, one
   // call per pair. Consumed by is_peer_access_enabled() and any Sirius-side

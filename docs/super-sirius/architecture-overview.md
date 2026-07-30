@@ -151,6 +151,6 @@ A query through Super Sirius follows these steps:
 | `src/include/op/scan/sirius_gpu_scan_operator.hpp` | Unified GPU scan source operator |
 | `src/include/op/scan/gpu_ingestible.hpp` | Per-format split materialization (parquet, duckdb-native) |
 | `src/include/scan_manager/sirius_scan_manager.hpp` | Per-scan preparation, split providers, I/O ownership |
-| `src/include/io/io_context.hpp` | I/O backends (uring / rest / kvikio) + prefetch cache |
+| `cucascade/include/cucascade/io/io_context.hpp` | I/O backends (uring / rest / kvikio) + prefetch cache |
 | `src/include/downgrade/downgrade_executor.hpp` | Memory spilling |
 | `src/include/memory/sirius_memory_reservation_manager.hpp` | Memory management |

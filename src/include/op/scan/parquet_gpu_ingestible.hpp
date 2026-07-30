@@ -210,7 +210,7 @@ class parquet_file_scan_info : public scan_info {
   std::string file_path;
   /// Pre-built datasource for this file, reused by @c materialize_table. May be
   /// null for local paths no sirius backend claims.
-  std::shared_ptr<io::sirius_datasource> datasource;
+  std::shared_ptr<cucascade::io::datasource> datasource;
   /// Pruned row groups for this file, in file order, with byte accounting.
   std::vector<row_group_entry> row_groups;
   /// Shared reader options (column projection), used to compute the column-chunk
@@ -306,8 +306,8 @@ class parquet_gpu_ingestible : public gpu_ingestible {
   /// per-row-group byte accounting. Returns a single @c parquet_file_scan_info.
   /// Runs on a scan-manager dispatcher thread (the task returned by
   /// @ref next_split_provider).
-  std::unique_ptr<scan_info> build_file_scan_info(std::string const& file_path,
-                                                  std::shared_ptr<io::sirius_ioctx> const& io_ctx);
+  std::unique_ptr<scan_info> build_file_scan_info(
+    std::string const& file_path, std::shared_ptr<cucascade::io::ioctx> const& io_ctx);
 
   std::unique_ptr<parquet_ingestible_table_info> _info;
 

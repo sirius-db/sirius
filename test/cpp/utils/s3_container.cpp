@@ -43,8 +43,7 @@ bool env_set(char const* name)
 
 }  // namespace sirius::test
 
-#include "io/s3/sigv4.hpp"
-
+#include <cucascade/io/rest/s3/sigv4.hpp>
 #include <curl/curl.h>
 #include <duckdb.hpp>
 
@@ -331,7 +330,7 @@ long s3_put(minio_instance const& inst,
             std::int64_t body_len,
             std::optional<fs::path> const& ca_bundle)
 {
-  sirius::io::s3::sigv4_signer_config creds;
+  cucascade::io::rest::s3::sigv4_signer_config creds;
   creds.access_key = kAccessKey;
   creds.secret_key = kSecretKey;
   creds.region     = kRegion;
@@ -339,14 +338,14 @@ long s3_put(minio_instance const& inst,
 
   // UNSIGNED-PAYLOAD lets us stream arbitrarily large bodies (e.g. the SF10
   // lineitem fixture) without hashing them; MinIO accepts it.
-  auto signed_req = sirius::io::s3::sign_request("PUT",
-                                                 inst.authority,
-                                                 canonical_uri,
-                                                 /*query=*/"",
-                                                 "UNSIGNED-PAYLOAD",
-                                                 /*extra_headers=*/{},
-                                                 creds,
-                                                 std::time(nullptr));
+  auto signed_req = cucascade::io::rest::s3::sign_request("PUT",
+                                                          inst.authority,
+                                                          canonical_uri,
+                                                          /*query=*/"",
+                                                          "UNSIGNED-PAYLOAD",
+                                                          /*extra_headers=*/{},
+                                                          creds,
+                                                          std::time(nullptr));
 
   CURL* curl = curl_easy_init();
   if (curl == nullptr) return -1;
@@ -383,8 +382,8 @@ long s3_put(minio_instance const& inst,
 
 std::string uri_path_for(std::string const& bucket, std::string const& key)
 {
-  std::string p = "/" + sirius::io::s3::uri_encode(bucket, false);
-  if (!key.empty()) p += "/" + sirius::io::s3::uri_encode(key, false);
+  std::string p = "/" + cucascade::io::rest::s3::uri_encode(bucket, false);
+  if (!key.empty()) p += "/" + cucascade::io::rest::s3::uri_encode(key, false);
   return p;
 }
 

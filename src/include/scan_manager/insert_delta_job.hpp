@@ -16,6 +16,9 @@
 
 #pragma once
 
+// scoped_dispatcher is an alias of the cuCascade type, and an alias cannot be
+// forward-declared — include it rather than declaring it below.
+#include "exec/scoped_dispatcher.hpp"
 #include "op/scan/duckdb_insert_delta.hpp"
 #include "op/scan/duckdb_native_gpu_ingestible.hpp"
 #include "scan_manager/mvcc_chunk_mask.hpp"
@@ -39,17 +42,13 @@ namespace cucascade::memory {
 class memory_reservation_manager;
 }  // namespace cucascade::memory
 
-namespace sirius::exec {
-class scoped_dispatcher;
-}  // namespace sirius::exec
+namespace cucascade::io {
+class datasource;
+}  // namespace cucascade::io
 
-namespace sirius::io {
-class sirius_datasource;
-}  // namespace sirius::io
-
-namespace sirius::memory {
+namespace cucascade::memory {
 class topology_index;
-}  // namespace sirius::memory
+}  // namespace cucascade::memory
 
 namespace sirius::scan_manager {
 
@@ -136,7 +135,7 @@ struct insert_delta_workset {
   std::span<insert_delta_job_request> requests,
   exec::scoped_dispatcher& dispatcher,
   cucascade::memory::memory_reservation_manager& reservation_manager,
-  sirius::memory::topology_index const& topology,
+  cucascade::memory::topology_index const& topology,
   std::span<int const> gpu_ids);
 
 /**
@@ -157,7 +156,7 @@ void finalize_insert_delta_jobs(insert_delta_workset& workset);
 void run_insert_delta_jobs(std::span<insert_delta_job_request> requests,
                            exec::scoped_dispatcher& dispatcher,
                            cucascade::memory::memory_reservation_manager& reservation_manager,
-                           sirius::memory::topology_index const& topology,
+                           cucascade::memory::topology_index const& topology,
                            std::span<int const> gpu_ids);
 
 /// One per-operator split cut from a bundle: the scan info plus the mask and
@@ -180,7 +179,7 @@ struct insert_delta_split {
 std::vector<insert_delta_split> cut_delta_splits_for_op(
   insert_delta_job_request const& request,
   std::span<op::scan::projected_column const> op_projected_cols,
-  std::shared_ptr<sirius::io::sirius_datasource> datasource,
+  std::shared_ptr<cucascade::io::datasource> datasource,
   duckdb::SingleFileBlockManager const* block_manager);
 
 }  // namespace sirius::scan_manager
