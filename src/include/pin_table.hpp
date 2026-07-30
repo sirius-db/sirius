@@ -145,15 +145,6 @@ struct pin_materialization_options {
   bool enable_compressed_materialization = false;  ///< narrow eligible numeric carriers per chunk
 };
 
-/// The carrier a compression-enabled pin stores when narrowing selected @p carrier: INT16/UINT16
-/// widen to INT32/UINT32, every other carrier is returned unchanged. Simpatico's fused-codegen ops
-/// (the ops integer plan blocks use) encode element widths 8/32/64 but not 16, and an unencodable
-/// element type fails the whole batch's compression and latches compression off for the rest of the
-/// pin, so the pin driver floors 16-bit selections instead of selecting them. Applied at
-/// narrow_pin_chunk's chooser call site only when the pin resolved a compression plan and
-/// compression is enabled; a pin without a plan keeps 16-bit carriers. See issue ticket #1310.
-[[nodiscard]] cudf::data_type floor_carrier_for_compression(cudf::data_type carrier) noexcept;
-
 /// Drive @p ingestible 's metadata walk + batch coalescer to completion on @p io_ctx,
 /// materializing every emitted batch into a GPU-resident cudf::table and round-robining
 /// placement across @p gpu_spaces. Single-threaded with deterministic placement, so
@@ -257,9 +248,7 @@ struct device_pin_result {
 ///                            uncompressed.
 /// \param options             Per-pin materialization behavior (zone-map capture, carrier
 ///                            narrowing). Narrowing runs before compression, so a compressed
-///                            chunk stores narrow columns and decompresses straight back to
-///                            them; when compression will run, 16-bit carriers are floored
-///                            (see floor_carrier_for_compression).
+///                            chunk stores narrow columns and decompresses straight back to them.
 /// \return The pinned host chunks in materialization (round-robin) order — one per emitted
 ///         batch — plus their per-chunk row counts, stored-column metadata, and zone-map
 ///         captures.
@@ -277,8 +266,8 @@ host_pin_result materialize_pin_to_host(
 /// (device) memory. A batch that does not qualify (below the size threshold, or it
 /// fails to compress usefully) is kept as an uncompressed device chunk instead, so
 /// @c device_pin_result::chunks may interleave the two forms in emission order.
-/// Carrier narrowing runs before compression exactly as in @ref materialize_pin_to_host
-/// (including the 16-bit carrier floor). Zone-map capture is forced off:
+/// Carrier narrowing runs before compression exactly as in @ref materialize_pin_to_host.
+/// Zone-map capture is forced off:
 /// @c device_pin_result carries no statistics and @c insert_pinned_entry_device stores
 /// none, so device pins keep the statless-pin serving behavior.
 ///

@@ -279,8 +279,7 @@ the finished sidecars at wrap time rather than through a propagation case:
 1. Decode one cache chunk at the native type.
 2. Capture zone-map statistics from that native table when zone-map pruning is enabled.
 3. Compute exact numeric min/max for each eligible column.
-4. Cast to the narrowest exact carrier (floored per the Simpatico interplay below when compression
-   will run).
+4. Cast to the narrowest exact carrier.
 5. Record the chunk's stored-column metadata: each column's actual carrier plus whether it is
    narrower than the native mapping (`pinned_column_storage_meta`).
 6. Hand the chunk to the tier sink, which compresses it with Simpatico when the pin resolved a
@@ -368,32 +367,21 @@ bitpack and FOR derive widths from the data), and encode/decode touch fewer byte
 heterogeneity is naturally supported: each chunk's blob records its own dtypes, and a chunk
 narrower than the plan target widens right after decode through the verified same-family restore.
 
-### Carrier floor while compression runs
+### Carrier encodability
 
-Simpatico's fused-codegen ops (delta/rle/bitpack/for/zigzag — the ops integer plan blocks use)
-encode element widths 8/32/64 (unsigned and float reinterpreted at the same width) but not 16, and
-an unencodable element type fails the whole batch's compression and latches compression off for
-the rest of the pin. When compression will actually run — the pin resolved a compression plan and
-compression is enabled; a table with no plan file keeps 16-bit carriers — the pin driver therefore
-never selects INT16/UINT16: the floored carrier is the 32-bit same-family widening
-(`floor_carrier_for_compression`, composed at the chooser's call site in `narrow_pin_chunk`; the
-chooser itself stays pure). INT8/UINT8 and DECIMAL32/64 remain selectable: codegen maps DECIMAL32
-onto its 4-byte and DECIMAL64 onto its 8-byte element type directly, both inside the renderer's
-supported width set. Narrowing a decimal is in fact the one direction that can make a column
-*more* encodable — DECIMAL128 has no codegen element type at all, so a DECIMAL128 column that
-narrows to DECIMAL64 becomes encodable where the native carrier was not. A floored column is
-still marked narrowed when the floored carrier is narrower than native; a selection floored back
-to the native width leaves the column native. The floor expires with issue #1310, which extends
-Simpatico's dtype tables with int16/uint16 and adds a per-block encodability predicate so the
-policy can become precise instead of conservative.
+Every carrier the chooser can select is encodable by the ops an integer plan block emits
+(delta/rle/bitpack/for/zigzag, and the terminal nvCOMP codecs). Codegen carries element widths
+8/16/32/64 with unsigned and float reinterpreted at the same width, and maps DECIMAL32 onto its
+4-byte and DECIMAL64 onto its 8-byte element type directly. Narrowing a decimal is in fact the one
+direction that can make a column *more* encodable — DECIMAL128 has no codegen element type at all,
+so a DECIMAL128 column that narrows to DECIMAL64 becomes encodable where the native carrier was
+not.
 
-The floor is a per-pin decision, taken from whether compression *will run*, and both compression
-gates (`min_batch_size_bytes` and `max_compressed_fraction`) are evaluated on the already-narrowed
-table. A batch that later falls out of a gate — or arrives after a failure has latched compression
-off — is therefore stored uncompressed at a floored 32-bit carrier where 16 bits would have held
-it. That is a benefit loss only (a wider carrier is always value-preserving, and markers, folds
-and serve-time normalization are unaffected); deciding the floor from the gate outcome would be
-circular, so the precise version needs the same per-block predicate as #1310.
+Width coverage has to be complete rather than merely typical, because the plan is not chosen at pin
+time: it arrives from `plan_register` as a fixed DSL string authored against the unnarrowed column.
+A column narrowed to INT16 is therefore handed a plan written for its INT64 original, and an
+element type the plan's ops cannot encode fails the whole batch's compression and latches
+compression off for the rest of the pin.
 
 Known residual: a plan block with a width-explicit packed op (a `bitextract`/`bitjoin` field spec
 of a fixed total width) on an integer column narrowed to a different width still fails that
@@ -448,8 +436,7 @@ basis unchanged.
 - Compression on, narrowing off: native blobs, all-native metadata, no sidecars — compression-only
   behavior unchanged.
 - Narrowing on, compression off (no plan file, plan does not cover the pinned columns, or the
-  feature disabled): narrowing-only behavior exactly, narrow carriers on uncompressed storage —
-  including 16-bit carriers, since the floor is keyed to compression actually running.
+  feature disabled): narrowing-only behavior exactly, narrow carriers on uncompressed storage.
 - Both on: narrow, then compress; the gate reads the recorded carriers and the serve decompresses
   straight into them — the cast-free happy path plus the full downstream benefit.
 - Both on, a chunk skips compression (minimum batch size, compressed-fraction reject, or the

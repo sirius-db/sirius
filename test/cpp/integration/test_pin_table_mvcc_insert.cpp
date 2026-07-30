@@ -482,7 +482,7 @@ TEST_CASE_METHOD(PinMvccInsertFixture,
   namespace fs = std::filesystem;
 
   // Narrow-eligible values: they fit INT16, so the compression-enabled pin
-  // stores floored INT32 carriers inside compressed chunks.
+  // stores INT16 carriers inside compressed chunks.
   run_ok("CREATE TABLE t_delta_comp AS SELECT (range % 1000)::BIGINT AS k FROM range(50000);");
   run_ok("CHECKPOINT;");
 
@@ -514,7 +514,7 @@ TEST_CASE_METHOD(PinMvccInsertFixture,
   REQUIRE(census.compressed_chunks == census.chunks);
   REQUIRE(census.all_columns_narrowed);
   REQUIRE(census.first_chunk_carriers ==
-          std::vector<cudf::data_type>{cudf::data_type{cudf::type_id::INT32}});
+          std::vector<cudf::data_type>{cudf::data_type{cudf::type_id::INT16}});
 
   // Rows beyond the pinned prefix — one of them representable by no narrow
   // carrier. Delta splits decode fresh at native width, so the gate must

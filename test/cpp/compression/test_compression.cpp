@@ -158,6 +158,7 @@ TEST_CASE("select_plan_blocks - picks blocks by full-table index in pinned order
 #include <utils/pinned_entry_census.hpp>
 #include <utils/transparent_execution_test_utils.hpp>
 
+#include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -273,6 +274,21 @@ void write_plan_file(const fs::path& plan_dir,
   fs::create_directories(plan_dir);
   std::ofstream f(plan_dir / (table_name + ".txt"));
   f << dsl;
+}
+
+// One bitpack block per pinned column, the plan shape the stacking fixtures share: bitpack
+// genuinely shrinks small-range columns, so chunks pass the max_compressed_fraction gate and pin in
+// the compressed form (a plan whose output stays input-sized would fall back to uncompressed
+// storage instead).
+std::string bitpack_plan(std::size_t columns)
+{
+  const std::string block = "input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n";
+  std::string dsl;
+  for (std::size_t i = 0; i < columns; ++i) {
+    if (i > 0) { dsl += "---\n"; }
+    dsl += block;
+  }
+  return dsl;
 }
 
 }  // anonymous namespace
@@ -680,6 +696,30 @@ TEST_CASE("pin_table compression - fallback when compression saves too little",
 //   str_split      — structural op requiring channel routing; see the
 //                    dedicated str_split cascade test below
 
+namespace {
+
+// Every operator an integer plan block can name, with the plan DSL that exercises it. Shared by
+// the native-width and narrowed-carrier sweeps so the two cannot drift apart.
+struct op_case {
+  const char* tag;
+  const char* plan;
+};
+
+constexpr op_case kOps[] = {
+  {"delta", "input -> delta -> differences"},
+  {"rle", "input -> rle -> runs, values"},
+  {"bitpack", "input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed"},
+  {"for", "input -> for -> deltas, references"},
+  {"zigzag", "input -> zigzag -> zigzag"},
+  {"lz4", "input -> lz4"},
+  {"snappy", "input -> snappy"},
+  {"deflate", "input -> deflate"},
+  {"ans", "input -> ans"},
+  {"bitcomp", "input -> bitcomp"},
+};
+
+}  // namespace
+
 TEST_CASE("pin_table compression - single-op sweep over all INT64 operators",
           "[compression][pin_table][isolated_context]")
 {
@@ -701,23 +741,6 @@ TEST_CASE("pin_table compression - single-op sweep over all INT64 operators",
   run_ok(
     con, "SET pin_table_input_compression_plan_dir = '" + plan_dir.string() + "';", "set plan_dir");
 
-  struct op_case {
-    const char* tag;
-    const char* plan;
-  };
-  static const op_case kOps[] = {
-    {"delta", "input -> delta -> differences"},
-    {"rle", "input -> rle -> runs, values"},
-    {"bitpack", "input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed"},
-    {"for", "input -> for -> deltas, references"},
-    {"zigzag", "input -> zigzag -> zigzag"},
-    {"lz4", "input -> lz4"},
-    {"snappy", "input -> snappy"},
-    {"deflate", "input -> deflate"},
-    {"ans", "input -> ans"},
-    {"bitcomp", "input -> bitcomp"},
-  };
-
   const std::string select_sql = "SELECT SUM(k) FROM read_parquet('" + glob + "')";
 
   for (auto const& tc : kOps) {
@@ -736,6 +759,138 @@ TEST_CASE("pin_table compression - single-op sweep over all INT64 operators",
     run_ok(con, "CALL unpin_table('" + tname + "');", std::string("unpin:") + tc.tag);
   }
 
+  fs::remove_all(tmp);
+}
+
+// The narrowed-carrier counterpart of the INT64 sweep: the same operators against a column the pin
+// narrowed, once per carrier width narrowing can select. Where the INT64 sweep asserts only query
+// correctness, this one censuses the entry per operator — a pin that silently failed to compress
+// still answers SUM(k) correctly, so correctness alone would not notice an operator losing support
+// for a carrier width. CAPTURE(tag) names the failing operator and SECTION names the width.
+TEST_CASE("pin_table compression - single-op sweep over narrowed carriers",
+          "[compression][pin_table][isolated_context]")
+{
+  if (no_gpu()) { return; }
+
+  // Range expression, the carrier the chooser selects for it from a BIGINT column, and SUM(k) over
+  // the 5000 generated rows.
+  struct carrier_case {
+    const char* label;
+    const char* select;
+    cudf::type_id carrier;
+    std::int64_t sum;
+  };
+  // Each value repeats ten times consecutively (range // 10), so the data has runs every operator
+  // in kOps can act on -- an all-distinct column expands under rle and would fail the census for a
+  // reason unrelated to the carrier. The multiplier on the int32 case lifts the values past the
+  // 16-bit range without changing the run structure.
+  auto const cases = std::vector<carrier_case>{
+    {"int8", "SELECT (range // 10) % 100 AS k FROM range(5000)", cudf::type_id::INT8, 247500},
+    {"int16", "SELECT (range // 10) % 1000 AS k FROM range(5000)", cudf::type_id::INT16, 1247500},
+    {"int32",
+     "SELECT ((range // 10) % 1000) * 100000 AS k FROM range(5000)",
+     cudf::type_id::INT32,
+     124750000000},
+  };
+
+  for (auto const& cc : cases) {
+    DYNAMIC_SECTION(cc.label)
+    {
+      auto [tmp, yaml_path] = make_comp_env(std::string("sweep_narrow_") + cc.label);
+      sirius::test::mgpu::generate_parquet_surface(tmp, cc.select, 1);
+
+      sirius::test::mgpu::scoped_mgpu_env env(yaml_path);
+      auto con  = env.make_connection();
+      auto glob = sirius::test::mgpu::parquet_glob(tmp);
+
+      run_ok(con, "SET pin_table_compression = true;", "set compression");
+      run_ok(con, "SET pin_table_compression_min_batch_size_bytes = 0;", "set min_batch");
+      // delta, zigzag and for re-emit one element per input element, so they are size-neutral or
+      // slightly expanding by construction and the default fraction gate would store their chunks
+      // uncompressed. Accept any compressed size: this sweep measures encodability, not ratio.
+      run_ok(con, "SET pin_table_compression_max_compressed_fraction = 1.5;", "set fraction");
+      run_ok(con, "SET enable_compressed_materialization = true;", "set narrowing");
+
+      auto plan_dir = tmp / "plans";
+      run_ok(con,
+             "SET pin_table_input_compression_plan_dir = '" + plan_dir.string() + "';",
+             "set plan_dir");
+
+      const std::string select_sql = "SELECT SUM(k) FROM read_parquet('" + glob + "')";
+
+      for (auto const& tc : kOps) {
+        CAPTURE(cc.label, tc.tag);
+        std::string tname = std::string("t_nw_") + cc.label + "_" + tc.tag;
+        write_plan_file(plan_dir, tname, tc.plan);
+
+        auto pin = con.Query("CALL pin_table('" + glob + "', tier='host', name='" + tname + "');");
+        require_ok(pin, std::string("pin:") + tc.tag);
+
+        auto const census = sirius::test::census_entry(con, tname);
+        REQUIRE(census.first_chunk_carriers ==
+                std::vector<cudf::data_type>{cudf::data_type{cc.carrier}});
+        REQUIRE(census.compressed_chunks == census.chunks);
+
+        auto res = con.Query("CALL gpu_execution(\"" + select_sql + "\");");
+        require_ok(res, std::string("select:") + tc.tag);
+        REQUIRE(res->RowCount() == 1);
+        REQUIRE(res->GetValue(0, 0) == duckdb::Value::BIGINT(cc.sum));
+
+        run_ok(con, "CALL unpin_table('" + tname + "');", std::string("unpin:") + tc.tag);
+      }
+
+      fs::remove_all(tmp);
+    }
+  }
+}
+
+// A natively 16-bit column reaches the compressor at INT16 whatever the narrowing setting is: no
+// carrier is narrower than SMALLINT for these values, so the chooser proposes nothing and the
+// column keeps its native carrier. This guards Simpatico's 16-bit support on its own, with carrier
+// narrowing entirely uninvolved.
+TEST_CASE("pin_table compression - a native SMALLINT column compresses",
+          "[compression][pin_table][isolated_context]")
+{
+  if (no_gpu()) { return; }
+
+  auto [tmp, yaml_path] = make_comp_env("smallint");
+  // Values exceed INT8, so the column stays at its native INT16 carrier. 1000 distinct values,
+  // ten rows each; SUM(k) = 10 * (0+1+...+999).
+  sirius::test::mgpu::generate_parquet_surface(
+    tmp, "SELECT (range % 1000)::SMALLINT AS k FROM range(10000)", 1);
+
+  sirius::test::mgpu::scoped_mgpu_env env(yaml_path);
+  auto con  = env.make_connection();
+  auto glob = sirius::test::mgpu::parquet_glob(tmp);
+
+  run_ok(con, "SET pin_table_compression = true;", "set compression");
+  run_ok(con, "SET pin_table_compression_min_batch_size_bytes = 0;", "set min_batch");
+  run_ok(con, "SET pin_table_compression_max_compressed_fraction = 1.5;", "set fraction");
+  // enable_compressed_materialization stays at its default (off): this case is about the native
+  // carrier, not a narrowed one.
+
+  auto plan_dir = tmp / "plans";
+  write_plan_file(plan_dir, "t_smallint", bitpack_plan(1));
+  run_ok(
+    con, "SET pin_table_input_compression_plan_dir = '" + plan_dir.string() + "';", "set plan_dir");
+
+  auto pin = con.Query("CALL pin_table('" + glob + "', tier='host', name='t_smallint');");
+  require_ok(pin, "pin smallint");
+
+  auto const census = sirius::test::census_entry(con, "t_smallint");
+  REQUIRE(census.compressed_chunks == census.chunks);
+  REQUIRE_FALSE(census.any_marker_true);
+  REQUIRE(census.first_chunk_carriers ==
+          std::vector<cudf::data_type>{cudf::data_type{cudf::type_id::INT16}});
+
+  auto res =
+    con.Query("CALL gpu_execution(\"SELECT COUNT(*), SUM(k) FROM read_parquet('" + glob + "')\");");
+  require_ok(res, "select smallint");
+  REQUIRE(res->RowCount() == 1);
+  REQUIRE(res->GetValue(0, 0) == duckdb::Value::BIGINT(10000LL));
+  REQUIRE(res->GetValue(1, 0) == duckdb::Value::BIGINT(4995000LL));
+
+  run_ok(con, "CALL unpin_table('t_smallint');", "unpin smallint");
   fs::remove_all(tmp);
 }
 
@@ -982,38 +1137,28 @@ TEST_CASE("pin_table compression - str_split cascade (snappy chars, delta->rle->
 // Composition with compressed materialization (carrier narrowing)
 // ---------------------------------------------------------------------------
 
-namespace {
-
-// The two-column bitpack plan shared by the stacking fixtures: bitpack genuinely
-// shrinks small-range columns, so chunks pass the max_compressed_fraction gate
-// and pin in the compressed form (a plan whose output stays input-sized would
-// fall back to uncompressed storage instead).
-const std::string kBitpackTwoColumnPlan =
-  "input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n---\n"
-  "input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n";
-
-}  // namespace
-
 // Stacking contract: narrowing runs in the pin driver before compression, so a
 // compression-enabled pin stores NARROW compressed chunks and Simpatico's
 // round-trip contract makes decompression reproduce the narrow carriers
 // directly. The residency gate reads the recorded storage metadata, installs a
 // narrow sidecar, and the serve is cast-free — scan_columns_restored stays flat
-// while the chunks are compressed representations. Because compression will run,
-// the 16-bit carrier selections are floored to 32-bit (Simpatico's fused-codegen
-// ops encode widths 8/32/64 but not 16).
+// while the chunks are compressed representations.
 TEST_CASE("pin_table compression - narrowing stacks with compression (decompress to narrow)",
-          "[compression][pin_table][isolated_context][carrier_floor]")
+          "[compression][pin_table][isolated_context]")
 {
   if (no_gpu()) { return; }
 
   auto [tmp, yaml_path] = make_comp_env("bothflags");
 
-  // k = range % 1000 and v = (range * 3) % 2000 both fit INT16 but not INT8, so
-  // the floor turns their INT16 selections into INT32 carriers. k takes 1000
-  // distinct values, ten rows each.
-  sirius::test::mgpu::generate_parquet_surface(
-    tmp, "SELECT range % 1000 AS k, (range * 3) % 2000 AS v FROM range(10000)", 1);
+  // k = range % 1000 and v = (range * 3) % 2000 both fit INT16 but not INT8, so both select an
+  // INT16 carrier; w spans 0..59999 as UBIGINT, which selects UINT16 and carries the unsigned
+  // 16-bit carrier through the same narrow-then-compress path. k takes 1000 distinct values, ten
+  // rows each.
+  sirius::test::mgpu::generate_parquet_surface(tmp,
+                                               "SELECT range % 1000 AS k, (range * 3) % 2000 AS v, "
+                                               "((range * 7) % 60000)::UBIGINT AS w "
+                                               "FROM range(10000)",
+                                               1);
 
   sirius::test::mgpu::scoped_mgpu_env env(yaml_path);
   auto con  = env.make_connection();
@@ -1024,7 +1169,7 @@ TEST_CASE("pin_table compression - narrowing stacks with compression (decompress
   run_ok(con, "SET enable_compressed_materialization = true;", "set narrowing");
 
   auto plan_dir = tmp / "plans";
-  write_plan_file(plan_dir, "t_both", kBitpackTwoColumnPlan);
+  write_plan_file(plan_dir, "t_both", bitpack_plan(3));
   run_ok(
     con, "SET pin_table_input_compression_plan_dir = '" + plan_dir.string() + "';", "set plan_dir");
 
@@ -1034,14 +1179,17 @@ TEST_CASE("pin_table compression - narrowing stacks with compression (decompress
   auto const pin_after = sirius::test::get_compressed_materialization_stats(con);
   REQUIRE(pin_after.pin_columns_narrowed > pin_before.pin_columns_narrowed);
 
-  // Narrowed AND compressed: every chunk is a compressed representation and the
-  // recorded metadata shows every column narrowed to the floored INT32 carrier.
+  // Narrowed AND compressed: every chunk is a compressed representation and the recorded metadata
+  // shows every column narrowed to a 16-bit carrier, signed and unsigned alike. This triple is the
+  // primary guard on Simpatico's 16-bit support — a regression there throws during the pin, latches
+  // compression off, and every chunk stores uncompressed, so compressed_chunks == chunks fails.
   auto const both = sirius::test::census_entry(con, "t_both");
   REQUIRE(both.compressed_chunks == both.chunks);
   REQUIRE(both.all_columns_narrowed);
-  for (auto const carrier : both.first_chunk_carriers) {
-    REQUIRE(carrier == cudf::data_type{cudf::type_id::INT32});
-  }
+  REQUIRE(both.first_chunk_carriers ==
+          std::vector<cudf::data_type>{cudf::data_type{cudf::type_id::INT16},
+                                       cudf::data_type{cudf::type_id::INT16},
+                                       cudf::data_type{cudf::type_id::UINT16}});
 
   // The gate reads the recorded carriers and installs the sidecar; the serve
   // decompresses straight into the narrow carriers, so nothing narrows or
@@ -1093,7 +1241,7 @@ TEST_CASE("pin_table compression - compression without narrowing stores native c
   run_ok(con, "SET pin_table_compression_min_batch_size_bytes = 0;", "set min_batch");
   run_ok(con, "SET enable_compressed_materialization = false;", "narrowing off");
   auto plan_dir = tmp / "plans";
-  write_plan_file(plan_dir, "t_only", kBitpackTwoColumnPlan);
+  write_plan_file(plan_dir, "t_only", bitpack_plan(2));
   run_ok(
     con, "SET pin_table_input_compression_plan_dir = '" + plan_dir.string() + "';", "set plan_dir");
 
@@ -1148,7 +1296,7 @@ TEST_CASE("pin_table compression - narrowing stacks on the GPU tier and tier pol
   run_ok(con, "SET pin_table_compression_min_batch_size_bytes = 0;", "set min_batch");
   run_ok(con, "SET enable_compressed_materialization = true;", "set narrowing");
   auto plan_dir = tmp / "plans";
-  write_plan_file(plan_dir, "t_gpu", kBitpackTwoColumnPlan);
+  write_plan_file(plan_dir, "t_gpu", bitpack_plan(2));
   run_ok(
     con, "SET pin_table_input_compression_plan_dir = '" + plan_dir.string() + "';", "set plan_dir");
 
@@ -1162,7 +1310,7 @@ TEST_CASE("pin_table compression - narrowing stacks on the GPU tier and tier pol
   REQUIRE(census.compressed_chunks == census.chunks);
   REQUIRE(census.all_columns_narrowed);
   for (auto const carrier : census.first_chunk_carriers) {
-    REQUIRE(carrier == cudf::data_type{cudf::type_id::INT32});
+    REQUIRE(carrier == cudf::data_type{cudf::type_id::INT16});
   }
 
   // Group keys are a transport use, so k stays narrow through the aggregate on
@@ -1264,8 +1412,8 @@ TEST_CASE("pin_table compression - heterogeneous narrow widths widen post-decode
   auto [tmp, yaml_path] = make_comp_env("hetero", /*scan_batch_bytes=*/8u << 10);
 
   // Chunk 0 (rows < 2048) fits INT8; the remaining chunks need INT32 (values
-  // over 32767 keep INT16 out of the picture even without the floor). The plan
-  // target is the widest carrier, INT32, so chunk 0 widens after decode.
+  // over 32767 rule out INT16). The plan target is the widest carrier, INT32,
+  // so chunk 0 widens after decode.
   generate_parquet_row_groups(tmp / "hetero.parquet",
                               "SELECT CASE WHEN range < 2048 THEN range % 100 "
                               "ELSE 40000 + range % 1000 END AS k FROM range(8192)",
@@ -1326,13 +1474,12 @@ TEST_CASE("pin_table compression - heterogeneous narrow widths widen post-decode
   fs::remove_all(tmp);
 }
 
-// The carrier floor's negative direction. The floor is keyed to compression actually running --
-// the pin resolved a plan AND compression is enabled -- not to the setting alone. With
-// pin_table_compression on but no plan file covering the table, nothing will hand this pin to
-// Simpatico, so the 16-bit carrier must be selected and no chunk may end up compressed. Keying
-// the floor to the setting alone would silently widen every such pin to INT32.
-TEST_CASE("pin_table compression - no plan file keeps the 16-bit carrier",
-          "[compression][pin_table][isolated_context][carrier_floor]")
+// Compression engages only when the plan resolver finds a plan for the pinned table, not from
+// pin_table_compression alone. With the setting on but no plan file covering this table, nothing
+// hands the pin to Simpatico, so no chunk may end up compressed while narrowing still proceeds
+// independently and stores its selected carrier.
+TEST_CASE("pin_table compression - no plan file for the table pins uncompressed",
+          "[compression][pin_table][isolated_context]")
 {
   if (no_gpu()) { return; }
 
@@ -1351,7 +1498,7 @@ TEST_CASE("pin_table compression - no plan file keeps the 16-bit carrier",
   // A plan directory holding a plan for some OTHER table: the resolver finds no plan for this
   // one, so compression never engages.
   auto plan_dir = tmp / "plans";
-  write_plan_file(plan_dir, "some_other_table", kBitpackTwoColumnPlan);
+  write_plan_file(plan_dir, "some_other_table", bitpack_plan(2));
   run_ok(
     con, "SET pin_table_input_compression_plan_dir = '" + plan_dir.string() + "';", "set plan_dir");
 
@@ -1378,17 +1525,16 @@ TEST_CASE("pin_table compression - no plan file keeps the 16-bit carrier",
 }
 
 // A width-explicit packed op (bitextract with a 64-bit field spec) cannot encode
-// a column narrowed to 32 bits: that batch's compression fails, pin_table warns
-// and latches compression off, and the pin falls back to UNCOMPRESSED NARROW
-// chunks — markers intact, results correct.
+// a column narrowed to a different width: that batch's compression fails,
+// pin_table warns and latches compression off, and the pin falls back to
+// UNCOMPRESSED NARROW chunks — markers intact, results correct.
 TEST_CASE("pin_table compression - width-explicit op on a narrowed column fails soft",
           "[compression][pin_table][isolated_context]")
 {
   if (no_gpu()) { return; }
 
   auto [tmp, yaml_path] = make_comp_env("widthop");
-  // k fits INT16, floored to INT32 because compression will run; 1000 distinct
-  // values, five rows each.
+  // k fits INT16; 1000 distinct values, five rows each.
   sirius::test::mgpu::generate_parquet_surface(tmp, "SELECT range % 1000 AS k FROM range(5000)", 1);
 
   sirius::test::mgpu::scoped_mgpu_env env(yaml_path);
@@ -1400,7 +1546,7 @@ TEST_CASE("pin_table compression - width-explicit op on a narrowed column fails 
   run_ok(con, "SET enable_compressed_materialization = true;", "set narrowing");
   auto plan_dir = tmp / "plans";
   // Valid against the native INT64 column (32 + 32 field bits), unencodable
-  // against the INT32 carrier the narrowing stores.
+  // against the INT16 carrier the narrowing stores.
   write_plan_file(plan_dir, "t_widthop", "input -> bitextract_32hi_32lo -> hi, lo\n");
   run_ok(
     con, "SET pin_table_input_compression_plan_dir = '" + plan_dir.string() + "';", "set plan_dir");
@@ -1416,7 +1562,7 @@ TEST_CASE("pin_table compression - width-explicit op on a narrowed column fails 
   REQUIRE(census.compressed_chunks == 0);
   REQUIRE(census.all_columns_narrowed);
   REQUIRE(census.first_chunk_carriers ==
-          std::vector<cudf::data_type>{cudf::data_type{cudf::type_id::INT32}});
+          std::vector<cudf::data_type>{cudf::data_type{cudf::type_id::INT16}});
 
   // Grouping by k keeps the carrier narrow (transport use, see the stacking
   // test), so the uncompressed-narrow serve is cast-free.

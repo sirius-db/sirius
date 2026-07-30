@@ -122,7 +122,9 @@ constexpr char const* kOuterJoinQuery =
 
 /// Outer joins whose g side yields no row. Aggregated so the result comparison stays cheap while
 /// the join still materializes every surviving row; the counts cover the NULL padding the join
-/// emits for the side that contributed nothing.
+/// emits for the side that contributed nothing. The last query keys the join on IS NOT DISTINCT
+/// FROM, so the null-safe comparison runs over the same narrow payload carriers as the plain
+/// equality forms.
 std::vector<std::string> runtime_empty_side_queries()
 {
   std::string const dead = "(SELECT * FROM g WHERE k = " + std::to_string(kGapUnmatchedKey) + ")";
@@ -131,7 +133,9 @@ std::vector<std::string> runtime_empty_side_queries()
           "SELECT COUNT(*) AS c, COUNT(a.v) AS cav, COUNT(b.x) AS cbx FROM " + dead +
             " a RIGHT JOIN dm b ON a.k = b.k;",
           "SELECT COUNT(*) AS c, COUNT(a.v) AS cav, COUNT(t.v) AS ctv FROM t LEFT JOIN " + dead +
-            " a ON t.k = a.k;"};
+            " a ON t.k = a.k;",
+          "SELECT COUNT(*) AS c, COUNT(a.v) AS cav, COUNT(b.x) AS cbx FROM " + dead +
+            " a FULL OUTER JOIN dm b ON a.k IS NOT DISTINCT FROM b.k;"};
 }
 
 constexpr char const* kGroupByQuery =
