@@ -218,6 +218,18 @@ class convertible_data_batch : public convertible_data {
     return compression::compress_in_place_for_downgrade(*_batch, _source_repo, stream);
   }
 
+  [[nodiscard]] bool is_device_compressed() const override
+  {
+    // Non-blocking. This runs while ordering every candidate, so a blocking
+    // to_read_only() here deadlocks the downgrade loop against any batch another
+    // thread holds exclusively. An unavailable batch is reported as
+    // uncompressed: that only affects eviction *order*, and convert() re-checks
+    // the real representation under its own lock before doing anything.
+    auto ro = _batch->try_to_read_only();
+    if (!ro) { return false; }
+    return dynamic_cast<const compressed_device_representation*>(ro->get_data()) != nullptr;
+  }
+
  private:
   /**
    * @brief Attempt a Simpatico-compressed spill into @p CompressedRep.

@@ -43,12 +43,14 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <filesystem>
 #include <fstream>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -781,8 +783,108 @@ std::unique_ptr<cucascade::idata_representation> compress_gpu_to_device(
   const auto* space = resolve_target_space(source, target_memory_space, reservation);
   auto* space_mut   = const_cast<cucascade::memory::memory_space*>(space);
 
-  auto blob =
-    build_device_compressed_blob(header, buffers, stream, space_mut->get_default_allocator(), mr);
+  // Release each column's compressed tree as soon as its buffers are staged.
+  //
+  // Without this the peak is U + 2C: the uncompressed source (held by convert_to
+  // until this converter returns, so we cannot drop it), every column's
+  // compressed output in `ct`, AND the contiguous payload copy of the same
+  // bytes. Measured on q3/SF100 that is 124 + 46 + 46 = 216 MB resident to end
+  // up holding 46 MB — and this runs during a downgrade, i.e. when the device
+  // has nothing spare, which is where `launch_encode_fused_tree failed` comes
+  // from. Dropping each tree once its bytes are in the payload takes the peak to
+  // U + C + (largest single column), roughly a third off.
+  //
+  // Buffers are enumerated in column order by build_compressed_table_header, so
+  // a running count per column maps buffer index -> owning column. If the counts
+  // do not add up to the buffer list, the mapping is not what we assume and the
+  // release is skipped entirely rather than freeing the wrong tree.
+  std::vector<std::size_t> last_buffer_of_column;
+  {
+    const auto descs = ct.describe(stream);
+    std::size_t seen = 0;
+    for (auto const& col_leaves : descs) {
+      for (auto const& leaf : col_leaves) {
+        seen += leaf.buffers.size();
+      }
+      last_buffer_of_column.push_back(seen == 0 ? 0 : seen - 1);
+    }
+    if (seen != buffers.size() || descs.size() != num_columns) { last_buffer_of_column.clear(); }
+  }
+
+  // Set once the first tree is dropped: past that point this attempt cannot be
+  // repeated, because a retry would read buffers we have freed.
+  bool staged_release_began = false;
+  buffer_copied_fn release_staged;
+  if (!last_buffer_of_column.empty()) {
+    release_staged =
+      [&ct, &last_buffer_of_column, &staged_release_began](std::size_t buffer_index) {
+        for (std::size_t c = 0; c < last_buffer_of_column.size(); ++c) {
+          if (last_buffer_of_column[c] == buffer_index) {
+            ct.columns[c].plan_tree.reset();
+            staged_release_began = true;
+            break;
+          }
+        }
+      };
+  }
+
+  // Everything that can legitimately decline has already happened: a failed
+  // encode and a below-threshold result both throw ABOVE this line, with the
+  // uncompressed source still intact, so they stay clean fall-backs. From here
+  // the compressed table is complete and the only work left is staging it.
+  //
+  // So release the uncompressed source now. It is dead weight — the compress
+  // loop was its last reader — and holding it is what made the peak U + 2C
+  // (q3/SF100: 124 + 46 + 46 = 216 MB to end up holding 46 MB). Releasing frees
+  // 124 MB immediately before asking for 46 MB, so the allocation below is made
+  // against *more* free memory than we started with, not less. Peak becomes 2C.
+  //
+  // convert_to installs the new representation only on success, so a throw after
+  // this point leaves the batch holding an emptied source — hence the retry.
+  auto consumed_source = rep.release_table(stream);
+
+  // Bounded retry with increasing backoff. Bounded, not unbounded: on the
+  // downgrade path this runs ON the downgrade thread, so spinning here would
+  // stall the very thread other work is waiting on to free memory — the same
+  // livelock shape as a task retrying against a downgrade that can never
+  // proceed. The task executor gets to spin 100 times only because it
+  // *reschedules* and lets other work run; a converter holding an exclusive
+  // batch lock cannot. 10 attempts over ~2.8 s is ample for transient
+  // contention, given we just freed several times what we are asking for.
+  constexpr int kMaxBlobAttempts       = 10;
+  constexpr auto kBlobBackoffIncrement = std::chrono::milliseconds(50);
+  std::shared_ptr<compressed_device_blob> blob;
+  std::string last_error;
+  for (int attempt = 1; attempt <= kMaxBlobAttempts; ++attempt) {
+    try {
+      // Active on every attempt. It only fires from the copy loop, which runs
+      // *after* the payload allocation succeeded — and that allocation is the
+      // failure this loop exists to retry. So on the path we actually retry
+      // nothing has been released yet and the attempt is repeatable.
+      blob = build_device_compressed_blob(
+        header, buffers, stream, space_mut->get_default_allocator(), mr, release_staged);
+      break;
+    } catch (const std::exception& e) {
+      last_error = e.what();
+      // A throw from the reconstruct, after the copy loop began releasing, leaves
+      // ct's buffers freed — this attempt is not repeatable.
+      if (staged_release_began) { break; }
+      if (attempt == kMaxBlobAttempts) { break; }
+      SIRIUS_LOG_DEBUG(
+        "[compression_converters] repo={} blob staging attempt {}/{} failed ({}); retrying",
+        static_cast<const void*>(ctx->repo),
+        attempt,
+        kMaxBlobAttempts,
+        e.what());
+      std::this_thread::sleep_for(kBlobBackoffIncrement * attempt);
+    }
+  }
+  if (!blob) {
+    // The source is gone, so this is fatal for the batch rather than a decline.
+    throw std::runtime_error("[compression_converters] output blob staging failed after " +
+                             std::to_string(kMaxBlobAttempts) +
+                             " attempts (source already released): " + last_error);
+  }
 
   SIRIUS_LOG_DEBUG(
     "[compression_converters] repo={} compressed output {}B → {}B device (cols={} rows={})",

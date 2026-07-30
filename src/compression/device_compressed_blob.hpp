@@ -28,6 +28,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <span>
 #include <vector>
@@ -120,8 +121,7 @@ struct compressed_device_blob {
  * rules below are subtle enough that a second copy would drift:
  *
  * - Leaves are placed at ALIGNED offsets, not the header's dense ones: nvcomp's
- *   batched decode requires aligned input pointers, and the inter-leaf padding
- *   absorbs the few-word read-ahead of a bitpacked decode.
+ *   batched decode requires aligned input pointers.
  * - Each slice is sized to the leaf's *reconstructed* footprint (`alloc_bytes`),
  *   not its compressed `size_bytes`: the re-read allocates each leaf at its
  *   decoded element count and a decode kernel touches the whole column, so a
@@ -130,8 +130,6 @@ struct compressed_device_blob {
  *   gets no offset slot at all: cudf allocates nothing for it, so rmm never calls
  *   the slab and the cursor does not advance. Giving it a slot would hand every
  *   later leaf the wrong slice.
- * - The payload is zeroed first, so the alignment padding and tail slop that the
- *   copies never write stay benign under a decode's read-ahead.
  *
  * @p scratch_mr supplies codec decode scratch during the reconstruct, kept
  * separate from the slab so it neither disturbs the slab's positional placement
@@ -140,11 +138,18 @@ struct compressed_device_blob {
  * Synchronizes @p stream before returning, so the caller may release the source
  * buffers enumerated in @p buffers.
  */
+/// Called with each buffer index once its bytes are safely in the payload, so a
+/// caller can drop the source that owns it and keep peak residency down. The
+/// copies are enqueued on @p stream and synchronized before the *next* callback,
+/// so releasing inside it is ordered.
+using buffer_copied_fn = std::function<void(std::size_t buffer_index)>;
+
 [[nodiscard]] std::shared_ptr<compressed_device_blob> build_device_compressed_blob(
   std::span<const std::uint8_t> header,
   std::span<const simpatico::payload_buffer_ref> buffers,
   rmm::cuda_stream_view stream,
   rmm::device_async_resource_ref payload_mr,
-  rmm::device_async_resource_ref scratch_mr);
+  rmm::device_async_resource_ref scratch_mr,
+  const buffer_copied_fn& on_buffer_copied = {});
 
 }  // namespace sirius

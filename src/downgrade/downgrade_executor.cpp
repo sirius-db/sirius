@@ -207,25 +207,30 @@ void downgrade_executor::processing_loop()
     // so there is no D2H copy now and no readback later — only a decode when a
     // consumer materializes it.
     //
-    // Only run when the candidate set can actually satisfy the request.
-    // Compressing frees size*(1 - 1/ratio), so candidate bytes C against request
-    // R need a ratio of at least C/(C-R), and C <= R cannot be satisfied at any
-    // ratio. Predicting first matters more than it would for a spill: a spill
-    // that under-delivers still freed device memory, whereas a compression that
-    // under-delivers has spent GPU time to free too little AND left a batch that
-    // must be decoded before use. So the whole set is judged before any of it is
-    // compressed, and if the prediction falls short we fall straight through to
-    // the host/disk path below with nothing wasted.
+    // Runs for every request, with or without an explicit byte target. Almost all
+    // downgrade traffic is the monitor's predicate-only request (measured: 24414
+    // monitor vs ~0 explicit on an SF100 sweep), so gating this on
+    // `requested_bytes > 0` made it dead code — it never executed once across a
+    // full 4-arm sweep despite 18137 requests.
+    //
+    // Where a target exists, the set is still priced against it first:
+    // compressing frees size*(1 - 1/ratio), so candidate bytes C against request R
+    // need a ratio of at least C/(C-R), and C <= R cannot be satisfied at any
+    // ratio. That check is worth keeping because a compression that under-delivers
+    // is worse than a spill that under-delivers — it spent GPU time, freed too
+    // little, AND left a batch that must be decoded before use. With no target
+    // there is nothing to price against, so each candidate is judged on its own
+    // predicted saving and the loop stops as soon as the request's predicate is
+    // satisfied.
     std::size_t inplace_batches = 0;
     std::size_t inplace_freed   = 0;
-    if (compression::device_compression_downgrade_enabled() && req->requested_bytes > 0 &&
-        !req->satisfied.load()) {
-      const std::size_t requested = req->requested_bytes;
+    if (compression::device_compression_downgrade_enabled() && !req->satisfied.load()) {
+      const std::size_t requested = req->requested_bytes;  // 0 = predicate-only
       std::vector<std::unique_ptr<convertible_data>> picks;
       std::size_t predicted_total = 0;
 
       for (auto* repo : _data_repo_mgr.get_repositories()) {
-        if (predicted_total >= requested) break;
+        if (requested > 0 && predicted_total >= requested) break;
         convertible_data_batch_provider provider(repo);
         for (auto& cand : provider.get_all_convertible(source_space,
                                                        /*front_to_back=*/false,
@@ -235,11 +240,12 @@ void downgrade_executor::processing_loop()
           if (saving == 0) continue;
           predicted_total += saving;
           picks.push_back(std::move(cand));
-          if (predicted_total >= requested) break;
+          if (requested > 0 && predicted_total >= requested) break;
         }
       }
 
-      if (predicted_total >= requested) {
+      const bool set_is_sufficient = requested == 0 || predicted_total >= requested;
+      if (set_is_sufficient && !picks.empty()) {
         auto exc_stream = _stream_pool->acquire_stream(
           cucascade::memory::exclusive_stream_pool::stream_acquire_policy::GROW);
         for (auto& cand : picks) {
@@ -247,16 +253,19 @@ void downgrade_executor::processing_loop()
           if (freed > 0) {
             ++inplace_batches;
             inplace_freed += freed;
+            req->bytes_freed.fetch_add(freed, std::memory_order_relaxed);
+            req->batches_downgraded.fetch_add(1, std::memory_order_relaxed);
           }
-        }
-        if (inplace_freed > 0) {
-          req->bytes_freed.fetch_add(inplace_freed, std::memory_order_relaxed);
-          req->batches_downgraded.fetch_add(inplace_batches, std::memory_order_relaxed);
-          if (req->predicate && req->predicate()) { req->satisfied.store(true); }
+          // With no byte target the predicate is the only stopping condition, so
+          // check it per batch rather than compressing every candidate we found.
+          if (req->predicate && req->predicate()) {
+            req->satisfied.store(true);
+            break;
+          }
         }
         SIRIUS_LOG_DEBUG(
           "[downgrade] [{}] in-place compression: {}/{} batches compressed, predicted {} bytes, "
-          "freed {} bytes against a {} byte request",
+          "freed {} bytes (request target {} bytes)",
           _source_label,
           inplace_batches,
           picks.size(),
@@ -264,9 +273,10 @@ void downgrade_executor::processing_loop()
           inplace_freed,
           requested);
       } else if (!picks.empty()) {
-        // Deliberately all-or-nothing. Compressing a subset would spend GPU time
-        // and still leave the request unmet, and every batch it touched now needs
-        // a decode before use — strictly worse than spilling the same batches.
+        // Targeted request the set cannot meet: deliberately all-or-nothing.
+        // Compressing a subset would spend GPU time, still leave the request
+        // unmet, and leave every batch it touched needing a decode — strictly
+        // worse than spilling those same batches.
         SIRIUS_LOG_DEBUG(
           "[downgrade] [{}] in-place compression declined: {} candidates predict only {} of {} "
           "bytes; spilling instead",
@@ -307,6 +317,25 @@ void downgrade_executor::processing_loop()
         convertible_data_batch_provider provider(repo);
         auto candidates = provider.get_all_convertible(
           source_space, /*front_to_back=*/false, /*ignore_subscribed=*/true);
+
+        // Spill uncompressed batches first; already-compressed ones last.
+        //
+        // A device-compressed batch has been downgraded once already. It is small,
+        // so evicting it frees less than an uncompressed batch of the same logical
+        // size, and it cost GPU time to produce which spilling discards. Preferring
+        // the uncompressed candidates therefore frees more memory per unit of work
+        // and keeps the compression already paid for.
+        //
+        // stable_partition, not sort: the existing order is meaningful (repos are
+        // visited in ascending {operator_id, port_id} and batches back-to-front),
+        // and this must reorder only across the compressed/uncompressed boundary.
+        if (compression::device_compression_downgrade_enabled()) {
+          std::stable_partition(
+            candidates.begin(), candidates.end(), [](const std::unique_ptr<convertible_data>& c) {
+              return c && !c->is_device_compressed();
+            });
+        }
+
         for (auto& candidate : candidates) {
           if (req->satisfied.load()) break;
 

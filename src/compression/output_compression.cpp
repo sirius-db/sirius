@@ -122,7 +122,15 @@ device_compression_estimate estimate_device_compression(
   device_compression_estimate est;
   if (!device_compression_downgrade_enabled() || repo == nullptr) { return est; }
 
-  auto ro          = const_cast<cucascade::data_batch&>(batch).to_read_only();
+  // Non-blocking, and this is load-bearing. The downgrade thread calls this
+  // while pricing every candidate; a blocking to_read_only() here waits on a
+  // batch a pipeline thread holds exclusively, while that pipeline thread is
+  // itself waiting on this downgrade to free memory — a deadlock, observed as
+  // 12 downgrade requests completed in 420 s against thousands in the baseline.
+  // A batch we cannot inspect is simply not a candidate.
+  auto ro_opt = const_cast<cucascade::data_batch&>(batch).try_to_read_only();
+  if (!ro_opt) { return est; }
+  auto& ro         = *ro_opt;
   auto const* data = ro.get_data();
   auto const* gpu  = as_gpu_table(data);
   if (gpu == nullptr) { return est; }
@@ -162,19 +170,51 @@ std::size_t compress_in_place_for_downgrade(cucascade::data_batch& batch,
 
   try {
     auto mut_opt = batch.try_to_mutable();
-    if (!mut_opt) { return 0; }
+    if (!mut_opt) {
+      SIRIUS_LOG_DEBUG("[output_compression] in-place skip: batch not exclusively lockable");
+      return 0;
+    }
     auto& mut = *mut_opt;
 
     auto* space = const_cast<cucascade::memory::memory_space*>(mut.get_memory_space());
-    if (space == nullptr || space->get_tier() != cucascade::memory::Tier::GPU) { return 0; }
+    if (space == nullptr || space->get_tier() != cucascade::memory::Tier::GPU) {
+      SIRIUS_LOG_DEBUG("[output_compression] in-place skip: not GPU-tier");
+      return 0;
+    }
 
     auto const* data = mut.get_data();
-    if (as_gpu_table(data) == nullptr) { return 0; }
+    if (as_gpu_table(data) == nullptr) {
+      SIRIUS_LOG_DEBUG("[output_compression] in-place skip: not a plain gpu_table");
+      return 0;
+    }
     const std::size_t before = data->get_size_in_bytes();
-    if (before == 0) { return 0; }
+    if (before == 0) {
+      SIRIUS_LOG_DEBUG("[output_compression] in-place skip: zero bytes");
+      return 0;
+    }
 
-    auto reservation = space->make_reservation_or_null(before);
-    if (!reservation) { return 0; }
+    // Reserve the *compressed* footprint we expect to produce, not the source
+    // size. This runs on a GPU that is by definition short of memory — that is
+    // why a downgrade was requested — so reserving `before` fails essentially
+    // always, which is exactly what the first run showed: 0 of 17 candidates
+    // compressed, every one of them blocked on the reservation.
+    //
+    // The compressed output is what the new representation keeps; the codec's
+    // own scratch is transient and is covered by the headroom the downgrade
+    // trigger leaves. Estimated conservatively, and a failed reservation still
+    // just declines.
+    const auto est = estimate_device_compression(batch, repo);
+    const std::size_t reserve_bytes =
+      est.viable && est.predicted_ratio > 1.0
+        ? static_cast<std::size_t>(static_cast<double>(before) / est.predicted_ratio)
+        : before;
+    auto reservation = space->make_reservation_or_null(reserve_bytes);
+    if (!reservation) {
+      SIRIUS_LOG_DEBUG("[output_compression] in-place skip: reservation of {}B failed (batch {}B)",
+                       reserve_bytes,
+                       before);
+      return 0;
+    }
 
     const auto ctx = make_output_compression_context(repo);
     scoped_output_compression_context guard(ctx);

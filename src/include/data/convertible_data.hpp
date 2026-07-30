@@ -112,6 +112,16 @@ class convertible_data {
     (void)stream;
     return 0;
   }
+
+  /**
+   * @brief True when this data is already held compressed on the device.
+   *
+   * Such a batch has already been downgraded once: it is small, it cost GPU time
+   * to make, and spilling it now both frees less than an uncompressed batch of
+   * the same logical size and throws that work away. The downgrade executor
+   * therefore considers these last, after every uncompressed candidate.
+   */
+  [[nodiscard]] virtual bool is_device_compressed() const { return false; }
 };
 
 /**

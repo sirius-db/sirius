@@ -30,7 +30,8 @@ std::shared_ptr<compressed_device_blob> build_device_compressed_blob(
   std::span<const simpatico::payload_buffer_ref> buffers,
   rmm::cuda_stream_view stream,
   rmm::device_async_resource_ref payload_mr,
-  rmm::device_async_resource_ref scratch_mr)
+  rmm::device_async_resource_ref scratch_mr,
+  const buffer_copied_fn& on_buffer_copied)
 {
   auto blob = std::make_shared<compressed_device_blob>();
 
@@ -55,7 +56,6 @@ std::shared_ptr<compressed_device_blob> build_device_compressed_blob(
 
   std::size_t const payload_capacity = align_up(cur, kLeafAlign) + kLeafAlign;  // tail slop
   blob->payload                      = rmm::device_buffer(payload_capacity, stream, payload_mr);
-  CUCASCADE_CUDA_TRY(cudaMemsetAsync(blob->payload.data(), 0, payload_capacity, stream.value()));
 
   for (std::size_t k = 0; k < blob->offsets.size(); ++k) {
     auto const& b = buffers[slot_src[k]];
@@ -66,6 +66,12 @@ std::shared_ptr<compressed_device_blob> build_device_compressed_blob(
                         static_cast<std::size_t>(b.size_bytes),
                         cudaMemcpyDeviceToDevice,
                         stream.value()));
+    }
+    if (on_buffer_copied) {
+      // Sync before handing the index back: the caller will free the source
+      // buffer this copy read from, and the copy is only enqueued above.
+      stream.synchronize();
+      on_buffer_copied(slot_src[k]);
     }
   }
 
