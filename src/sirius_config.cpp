@@ -20,15 +20,45 @@
 #include "log/logging.hpp"
 #include "yaml_reader.hpp"
 
+#include <cuda_runtime_api.h>
+
 #include <cucascade/memory/config.hpp>
 #include <cucascade/memory/reservation_manager_configurator.hpp>
 #include <yaml-cpp/yaml.h>
 
+#include <algorithm>
 #include <exception>
 #include <variant>
 #include <vector>
 
 namespace sirius {
+
+namespace config {
+
+uint64_t derived_default_batch_size()
+{
+  // cudaGetDeviceCount/Properties honor CUDA_VISIBLE_DEVICES and do not create a context.
+  static uint64_t const value = [] {
+    int device_count = 0;
+    if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count <= 0) {
+      return DEFAULT_BATCH_SIZE;
+    }
+    uint64_t min_total = 0;
+    for (int id = 0; id < device_count; ++id) {
+      cudaDeviceProp prop{};
+      if (cudaGetDeviceProperties(&prop, id) != cudaSuccess) { continue; }
+      auto const total = static_cast<uint64_t>(prop.totalGlobalMem);
+      min_total        = min_total == 0 ? total : std::min(min_total, total);
+    }
+    if (min_total == 0) { return DEFAULT_BATCH_SIZE; }
+    constexpr uint64_t min_batch = 512ULL * 1024 * 1024;       // 512 MiB floor
+    constexpr uint64_t max_batch = 5ULL * 1024 * 1024 * 1024;  // 5 GiB ceiling
+    return std::clamp(min_total / 40, min_batch, max_batch);   // 2.5%
+  }();
+  return value;
+}
+
+}  // namespace config
 
 // ================ from_yaml for external types ================= //
 

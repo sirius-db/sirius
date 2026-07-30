@@ -342,17 +342,19 @@ Four optional nested sub-configs tune the individual backends and caches:
 **File:** `src/include/sirius_config.hpp` — `operator_params` struct
 
 The four batch/partition sizes (`scan_task_batch_size`, `hash_partition_bytes`,
-`concat_batch_bytes`, `sort_sample_bytes`) share one built-in default
-(`config::DEFAULT_BATCH_SIZE`, 800 MiB); each can still be overridden individually.
+`concat_batch_bytes`, `sort_sample_bytes`) share one built-in default, computed at
+startup as **2.5% of the smallest visible GPU's memory, clamped to [512 MiB, 5 GiB]**
+(800 MiB when no GPU is visible). `max_build_hash_table_bytes` defaults to **2× that
+batch default**. Each can still be overridden individually.
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `scan_task_batch_size` | 800 MiB | Target batch size for DuckDB scan tasks |
+| `scan_task_batch_size` | 2.5% of GPU mem (512 MiB – 5 GiB) | Target batch size for DuckDB scan tasks |
 | `max_sort_partition_bytes` | 0 (auto) | Max bytes per sort partition. Auto = 33% of GPU memory. |
-| `hash_partition_bytes` | 800 MiB | Target partition size for hash joins and group-bys |
-| `concat_batch_bytes` | 800 MiB | Target output batch size for CONCAT operator |
-| `sort_sample_bytes` | 800 MiB | Bytes sampled before computing sort partition boundaries |
-| `max_build_hash_table_bytes` | 400 MiB | Max build-side size for BUILD_PROBE join mode |
+| `hash_partition_bytes` | 2.5% of GPU mem (512 MiB – 5 GiB) | Target partition size for hash joins and group-bys |
+| `concat_batch_bytes` | 2.5% of GPU mem (512 MiB – 5 GiB) | Target output batch size for CONCAT operator |
+| `sort_sample_bytes` | 2.5% of GPU mem (512 MiB – 5 GiB) | Bytes sampled before computing sort partition boundaries |
+| `max_build_hash_table_bytes` | 2× batch default | Max build-side size for BUILD_PROBE join mode |
 | `max_broadcast_join_size` | 256 MiB | Max build-side size eligible for a broadcast join. A build below this size is replicated to every GPU (instead of hash-partitioned) when it is tiny, or when the DuckDB-estimated probe-to-build row ratio is at least `num_gpus * 1.25`. |
 | `max_sort_partition_memory_fraction` | 0.33 | Fraction of GPU memory per sort partition when `max_sort_partition_bytes` is 0 |
 | `mark_join_build_switch_ratio` | 8.0 | For STANDARD MARK joins, build on the smaller (left) side when `right_rows >= ratio * left_rows` (0 disables) |
@@ -515,7 +517,7 @@ These can also be set at load via the `SIRIUS_LOG_BACKEND`, `SIRIUS_LOG_DIR`, an
 | `use_opt_table_scan` | - | Enable optimized table scan |
 | `opt_table_scan_num_streams` | - | Number of CUDA streams for optimized scan |
 | `opt_table_scan_memcpy_size` | - | Memcpy size for optimized scan |
-| `scan_task_batch_size` | 800 MiB | Target scan batch size |
+| `scan_task_batch_size` | 2.5% of GPU mem (512 MiB – 5 GiB) | Target scan batch size |
 
 ### Pipeline / Operator
 
@@ -525,10 +527,10 @@ These can also be set at load via the `SIRIUS_LOG_BACKEND`, `SIRIUS_LOG_DIR`, an
 | `fuse_merge_pipelines` | true | Fuse eligible GROUP BY / TOP_N merges into their downstream pipeline instead of cutting a boundary (see [physical-plan-generation.md](physical-plan-generation.md) → Merge fusion) |
 | `max_sort_partition_bytes` | 0 (auto) | Max sort partition bytes |
 | `max_sort_partition_memory_fraction` | 0.33 | Auto sort-partition fraction when `max_sort_partition_bytes` is 0 |
-| `hash_partition_bytes` | 800 MiB | Hash partition target size |
-| `concat_batch_bytes` | 800 MiB | CONCAT output batch size |
-| `sort_sample_bytes` | 800 MiB | Bytes sampled before computing sort boundaries |
-| `max_build_hash_table_bytes` | 400 MiB | Max build-side hash table bytes |
+| `hash_partition_bytes` | 2.5% of GPU mem (512 MiB – 5 GiB) | Hash partition target size |
+| `concat_batch_bytes` | 2.5% of GPU mem (512 MiB – 5 GiB) | CONCAT output batch size |
+| `sort_sample_bytes` | 2.5% of GPU mem (512 MiB – 5 GiB) | Bytes sampled before computing sort boundaries |
+| `max_build_hash_table_bytes` | 2× batch default | Max build-side hash table bytes |
 | `max_broadcast_join_size` | 256 MiB | Max build-side size eligible for a broadcast join |
 | `mark_join_build_switch_ratio` | 8.0 | STANDARD MARK join build-side switch ratio (0 disables) |
 
