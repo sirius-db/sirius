@@ -356,9 +356,23 @@ void task_creator::manager_loop()
     auto request_kind = request->type;
     if (node == nullptr) { continue; }
 
+    auto requested_pipeline = node->get_pipeline();
+
     node = get_operator_for_next_task(node);
 
-    if (node == nullptr) { continue; }
+    if (node == nullptr) {
+      // No task to create — but getting here still ran the operator's
+      // get_next_task_hint(), and for a hash join that call performs
+      // refresh_cross_schedule()'s discard sweep, which drains batches whose
+      // opposite side has just finished. That can be the very thing that makes
+      // the pipeline finishable, and the dispatch path below (whose exit
+      // re-evaluates status for exactly this reason) is skipped on this branch.
+      // Without re-evaluating here the pipeline stays unfinished forever and
+      // every downstream consumer parks. See the paired call before the
+      // dispatch lambda returns.
+      if (requested_pipeline) { requested_pipeline->update_pipeline_status(false); }
+      continue;
+    }
 
     // Dispatch the task creation work to the pool
     _bounded_pool->dispatch(std::move(slot), [this, node, request_kind]() mutable {
