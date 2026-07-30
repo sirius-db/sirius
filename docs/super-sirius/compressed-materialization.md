@@ -507,51 +507,36 @@ medians and validate every query against DuckDB. Pinning must be repeated for ea
 the cached representation matches the setting under test.
 
 The GB10 A/B pair differs only by `enable_compressed_materialization: true`. These commands run all
-22 queries for six iterations and validate Sirius against DuckDB:
+22 queries for six iterations at the chosen scale factor and validate Sirius against DuckDB:
 
 ```bash
+SF=<scale factor>
+
 # Unpinned control and treatment.
 pixi run bash test/tpch_performance/benchmark_and_validate.sh \
   --config "$PWD/test/cpp/integration/integration-gb10.yaml" \
-  --parquet-dir "$PWD/test_datasets/tpch_parquet_sf50" \
+  --parquet-dir "$PWD/test_datasets/tpch_parquet_sf$SF" \
   --engines "sirius duckdb" --iterations 6 --timeout 3600 \
-  --pinning-mode none 50
+  --pinning-mode none "$SF"
 pixi run bash test/tpch_performance/benchmark_and_validate.sh \
   --config "$PWD/test/cpp/integration/integration-gb10-compressed-materialization.yaml" \
-  --parquet-dir "$PWD/test_datasets/tpch_parquet_sf50" \
+  --parquet-dir "$PWD/test_datasets/tpch_parquet_sf$SF" \
   --engines "sirius duckdb" --iterations 6 --timeout 3600 \
-  --pinning-mode none 50
+  --pinning-mode none "$SF"
 
 # HOST-pinned control and treatment; per-query mode re-pins for each run.
 SIRIUS_PIN_TIER=host pixi run bash test/tpch_performance/benchmark_and_validate.sh \
   --config "$PWD/test/cpp/integration/integration-gb10.yaml" \
-  --parquet-dir "$PWD/test_datasets/tpch_parquet_sf50" \
+  --parquet-dir "$PWD/test_datasets/tpch_parquet_sf$SF" \
   --engines "sirius duckdb" --iterations 6 --timeout 3600 \
-  --pinning-mode per-query 50
+  --pinning-mode per-query "$SF"
 SIRIUS_PIN_TIER=host pixi run bash test/tpch_performance/benchmark_and_validate.sh \
   --config "$PWD/test/cpp/integration/integration-gb10-compressed-materialization.yaml" \
-  --parquet-dir "$PWD/test_datasets/tpch_parquet_sf50" \
+  --parquet-dir "$PWD/test_datasets/tpch_parquet_sf$SF" \
   --engines "sirius duckdb" --iterations 6 --timeout 3600 \
-  --pinning-mode per-query 50
+  --pinning-mode per-query "$SF"
 ```
 
-### Measured SF50 result (2026-07-23, with the column-granular dynamic-filter guard)
-
-Interleaved OFF/ON rounds per mode (two rounds, 12 iterations per leg; per-query warm medians
-over iterations 2-12 within each round, median across rounds, summed over all 22 queries), same
-binary for every leg:
-
-| Mode | Feature off | Feature on | Change |
-|---|---:|---:|---:|
-| Unpinned | 29.684 s | 29.660 s | -0.08% |
-| HOST-pinned | 10.544 s | 8.921 s | -15.39% |
-
-Lower is better. All eight legs validated 22/22 queries against the stored DuckDB results.
-Per-round host-pinned deltas were -15.47% / -15.31% with same-config off drift of -0.19%;
-unpinned rounds read +0.38% / -0.54% against +0.76% drift (parity, as the residency gate
-guarantees). The join-dense queries drive the improvement over the pre-guard -10.86% (Q5
--31.0%, Q8 -28.7%, Q7 -26.1%, Q3 -24.3%, Q9 -22.4%); Q16 moves -6.3% via the group-key path.
-Run directories: `runs/2026-07-23_17-39-47` through `runs/2026-07-23_18-13-10`.
-
-Earlier measurement rounds (with their tables and run directories) are recorded in
-[docs/reviews/compressed-materialization-final-handoff.md](../reviews/compressed-materialization-final-handoff.md).
+Report the resulting warm medians alongside the run, not here: a design document that carries
+numbers invites reading them as a contract, and they are only meaningful against the machine,
+scale, and configuration that produced them.
