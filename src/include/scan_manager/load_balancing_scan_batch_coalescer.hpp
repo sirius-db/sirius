@@ -108,6 +108,11 @@ class load_balancing_scan_batch_coalescer {
 
     std::size_t op_id{0};
     std::size_t pipeline_id{0};
+    /// The scan operator this slot feeds. Needed so closing the connector can
+    /// ask the task_creator to revisit the operator: pipeline completion is
+    /// only re-evaluated at a task-creation exit, and closing the source is the
+    /// last thing that can make the pipeline finishable. See notify_source_closed().
+    op::scan::sirius_gpu_scan_operator* scan_op{nullptr};
     using provider_value_t = exec::try_t<std::unique_ptr<op::scan::scan_info>>;
     duckdb_moodycamel::BlockingConcurrentQueue<provider_value_t> queue;
     std::shared_ptr<op::scan::batch_coalescer> coalescer;

@@ -18,7 +18,37 @@
 
 #include "exec/try.hpp"
 #include "log/logging.hpp"
+#include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "op/scan/sirius_gpu_scan_operator_data.hpp"
+#include "pipeline/sirius_pipeline.hpp"
+
+namespace {
+
+/// Re-evaluate pipeline completion now that the source is exhausted.
+///
+/// `sirius_pipeline::update_pipeline_status()` finishes a pipeline only when
+/// source-exhaustion AND the balanced task counters hold *at the moment it
+/// runs*, so every event that can flip one of those conjuncts must be paired
+/// with a call. Task completion is paired via `mark_task_completed()`; closing
+/// the split connector is the source-exhaustion edge and was unpaired on the
+/// scan path. When the connector closes after the last task completed and after
+/// the last task-creation exit, nothing re-checked the condition: the pipeline
+/// stayed unfinished forever, so a downstream hash join gated on its
+/// `probe_finished` parked with build batches still in its ports and every
+/// engine thread went idle with the query never completing.
+///
+/// This must call update_pipeline_status() directly rather than going through
+/// task_creator::schedule(): a scheduled request is dropped whenever
+/// get_operator_for_next_task() returns null, and the re-evaluation inside the
+/// creation path would then never run. `sirius_physical_streaming_source` pairs
+/// its own channel close the same way.
+void notify_source_closed(sirius::op::scan::sirius_gpu_scan_operator* scan_op)
+{
+  if (scan_op == nullptr) { return; }
+  if (auto pipeline = scan_op->get_pipeline()) { pipeline->update_pipeline_status(false); }
+}
+
+}  // namespace
 
 #include <stop_token>
 #include <utility>
@@ -38,6 +68,7 @@ load_balancing_scan_batch_coalescer::register_pipeline(op::scan::sirius_gpu_scan
   auto pipeline_id = scan_op->get_pipeline()->get_pipeline_id();
   auto state       = std::make_unique<metadata_processing_state>(
     uid, pipeline_id, std::move(coalescer), std::move(connector), std::move(balancer));
+  state->scan_op = scan_op;
   _pipeline_order.push_back(uid);
   auto state_ptr = state.get();
   _slots[uid]    = std::move(state);
@@ -152,20 +183,24 @@ void load_balancing_scan_batch_coalescer::process_provider_inputs(metadata_proce
         emit(std::move(batch));
       }
       state.connector->close();
+      notify_source_closed(state.scan_op);
     } catch (...) {
       state.connector->close(std::current_exception());
+      notify_source_closed(state.scan_op);
     }
     return;
   }
 
   // Stop requested between iterations — close so downstream consumers unblock.
   state.connector->close();
+  notify_source_closed(state.scan_op);
 }
 
 void load_balancing_scan_batch_coalescer::process_cached_entries(metadata_processing_state& state,
                                                                  std::stop_token const& stop)
 {
   drain_cached_provider(*state.batch_provider, *state.connector, stop, state.row_filter_pending);
+  notify_source_closed(state.scan_op);
 }
 
 void load_balancing_scan_batch_coalescer::drain_cached_provider(databatch_provider& provider,
