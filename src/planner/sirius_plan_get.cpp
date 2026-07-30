@@ -131,7 +131,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
   static const std::unordered_set<std::string> kSupportedScanFunctions = {
     "seq_scan", "parquet_scan", "read_parquet", "sirius_read_parquet"};
   if (kSupportedScanFunctions.find(op.function.name) == kSupportedScanFunctions.end()) {
-    throw duckdb::NotImplementedException("Table function '{}' is not supported in Sirius",
+    throw duckdb::NotImplementedException("Table function '%s' is not supported in Sirius",
                                           op.function.name);
   }
 
