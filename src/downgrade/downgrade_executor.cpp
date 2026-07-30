@@ -255,18 +255,24 @@ void downgrade_executor::processing_loop()
       std::vector<std::unique_ptr<convertible_data>> picks;
       std::size_t predicted_total = 0;
 
-      for (auto* repo : _data_repo_mgr.get_repositories()) {
+      // Same traversal as TIER 1 below: memory pressure is global, so candidates come
+      // from every in-flight query, newest first (get_all() is ascending by query id).
+      auto const managers = _data_repo_registry.get_all();
+      for (auto const& manager : std::views::reverse(managers)) {
         if (requested > 0 && predicted_total >= requested) break;
-        convertible_data_batch_provider provider(repo);
-        for (auto& cand : provider.get_all_convertible(source_space,
-                                                       /*front_to_back=*/false,
-                                                       /*ignore_subscribed=*/true)) {
-          if (!cand) continue;
-          const std::size_t saving = cand->predicted_compression_saving();
-          if (saving == 0) continue;
-          predicted_total += saving;
-          picks.push_back(std::move(cand));
+        for (auto* repo : manager->get_repositories()) {
           if (requested > 0 && predicted_total >= requested) break;
+          convertible_data_batch_provider provider(repo);
+          for (auto& cand : provider.get_all_convertible(source_space,
+                                                         /*front_to_back=*/false,
+                                                         /*ignore_subscribed=*/true)) {
+            if (!cand) continue;
+            const std::size_t saving = cand->predicted_compression_saving();
+            if (saving == 0) continue;
+            predicted_total += saving;
+            picks.push_back(std::move(cand));
+            if (requested > 0 && predicted_total >= requested) break;
+          }
         }
       }
 
