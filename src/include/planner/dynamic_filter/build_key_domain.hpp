@@ -18,30 +18,9 @@
  * @file build_key_domain.hpp
  * @brief Plan-time domain evidence for hash-join build keys
  *
- * `sirius_plan_comparison_join` asks one question here before it hands conditions to
- * `admit_dynamic_filter_keys`: for each join condition, what is the unfiltered row count of the
- * base table its build key comes from? The answer becomes
- * `admitted_key::build_key_domain_cardinality`, the denominator of the membership
- * domain-coverage gate in `dynamic_filter_source_policy.hpp`; 0 means the count could not be
- * established, which disables the gate for that key and the key publishes as it would without
- * evidence.
- *
- * The answer is produced in two decoupled halves:
- *
- *  - **Mechanism** -- a positional lineage walk (`detail::resolve_pass_through_scan`) that follows
- *    one output ordinal down through operators whose rows are an injective image of the traced
- *    child's rows and whose columns pass values through unchanged. The walk refuses -- silently,
- *    its only failure mode -- at every operator it does not model, so an unmodelled shape can
- *    never yield a wrong table.
- *  - **Policy** -- a @ref base_table_cardinality_source that turns a resolved scan into a row
- *    count. The production source, @ref duckdb_base_table_cardinality, answers only for
- *    DuckDB-native table scans, where the figure is a true upper bound; everything else is
- *    refused. Tests substitute a stub source.
- *
- * The gate's safety rests on the source's contract: the returned count must never under-state the
- * domain, because an under-stated denominator inflates the coverage ratio and suppresses a filter
- * that would have paid for itself. Refusing (`std::nullopt` -> 0 -> gate off) is always safe; the
- * key then publishes exactly as today.
+ * A positional lineage walk resolves each plain build key through value-preserving, row-subset
+ * operators to a base scan. A cardinality source then supplies an exact row count or upper bound.
+ * Unresolved keys receive 0, which disables their coverage gate.
  */
 
 #pragma once
@@ -69,8 +48,8 @@ namespace sirius::planner {
  * Answers the unfiltered row count of the scanned base table as an exact figure or a true upper
  * bound, never an estimate that may under-state the domain. Answers `std::nullopt` when the scan
  * cannot vouch for such a figure; the walk then reports 0 for that key and the coverage gate stays
- * off. Sources must not throw; the production source converts its own callback failures to
- * `std::nullopt`.
+ * off. The production source converts callback failures to `std::nullopt`; exceptions from a
+ * caller-supplied source propagate.
  */
 template <class Source>
 concept base_table_cardinality_source =
@@ -78,8 +57,7 @@ concept base_table_cardinality_source =
   std::same_as<std::invoke_result_t<Source const&, duckdb::LogicalGet const&>,
                std::optional<std::size_t>>;
 
-/// Internal implementation for the overload that accepts a caller-supplied cardinality source; not
-/// part of the public planner API.
+// Internal implementation for the overload that accepts a caller-supplied cardinality source.
 namespace detail {
 
 /**
@@ -133,7 +111,7 @@ template <base_table_cardinality_source Source>
 {
   auto const scans = detail::resolve_build_key_scans(join);
   std::vector<std::size_t> domains(scans.size(), 0);
-  std::vector<std::pair<duckdb::LogicalGet const*, std::size_t>> memo;  // tiny n; beats a map
+  std::vector<std::pair<duckdb::LogicalGet const*, std::size_t>> memo;
   for (std::size_t condition_index = 0; condition_index < scans.size(); ++condition_index) {
     if (scans[condition_index] == nullptr) { continue; }
     auto const hit =
@@ -151,13 +129,9 @@ template <base_table_cardinality_source Source>
 /**
  * @brief The production evidence source: DuckDB-native table scans only
  *
- * Yields `NodeStatistics::max_cardinality` for a native table scan -- committed rows plus
- * transaction-local inserts, a true upper bound -- and converts everything else, including a
- * throwing callback, to `std::nullopt`. Refusal is the only failure mode, extended from the walk
- * to the source. Deliberately never reads `LogicalGet::estimated_cardinality`, which the
- * join-order optimizer overwrites with a post-filter figure. Parquet scans are refused as declared
- * scope: without a catalog entry a Parquet build key cannot be proven unique by declared
- * constraint, so the gate could not arm on the evidence anyway.
+ * Yields `NodeStatistics::max_cardinality` for a DuckDB-native table scan and converts unsupported
+ * scans or callback failures to `std::nullopt`. It does not use
+ * `LogicalGet::estimated_cardinality`, which may reflect filters.
  */
 class duckdb_base_table_cardinality {
  public:

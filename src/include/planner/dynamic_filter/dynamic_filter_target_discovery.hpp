@@ -18,15 +18,10 @@
  * @file dynamic_filter_target_discovery.hpp
  * @brief Discovers one producing join's dynamic-filter targets in its built probe subtree
  *
- * `sirius_plan_comparison_join` runs one walk per admitted key over the physical probe subtree it
- * already owns. `trace_probe_key()` classifies where the key's trace bottoms out: a `TABLE_SCAN`
- * terminal is a scan-bind site (the builder attaches the channel to the scan node itself), and any
- * other terminal is a join-edge endpoint site realized by `place_endpoint()`. Both consume the same
- * `descent_steps()` rule set, so the classification and the splice cannot disagree.
- *
- * Every trace starts at the producing join's probe-child output ordinal (the ENTRY ordinal) and
- * remaps it through each accepted hop; a terminal's ordinal is in THAT terminal operator's output
- * space (the EXIT ordinal). The two coincide only when no hop was accepted.
+ * `trace_probe_key()` follows one admitted probe key through the physical probe subtree.
+ * `TABLE_SCAN` terminals are scan-binding sites; other terminals can be wrapped by
+ * `place_endpoint()`. Both operations use @ref descent_steps. Each accepted step remaps the key
+ * ordinal into its child's output space.
  */
 
 #pragma once
@@ -209,9 +204,8 @@ using endpoint_factory = std::function<duckdb::unique_ptr<sirius::op::sirius_phy
  * an operator refuses the trace, then inserts an endpoint immediately above that operator. If the
  * root refuses, the endpoint wraps the root. A fan-out step splices one endpoint per reached
  * branch. The factory has no scan knowledge, so a caller that scan-binds any branch of a key must
- * not call this for that key; on plans without a physical set operation a key has exactly one
- * terminal, so the mixed case cannot arise, and the mixed-branch refinement lands with physical
- * set-operation support.
+ * not call this for that key. On mixed branches, unbound branches therefore receive no direct
+ * endpoint.
  *
  * Existing `sirius_physical_dynamic_filter` operators are transparent to the trace, so placing one
  * key does not prevent later keys from reaching the same depth.

@@ -52,10 +52,8 @@ bool probe_block_is_value_preserving(duckdb::JoinType join_type) noexcept
   return false;  // unreachable
 }
 
-// The build/right block is a direct projection of the build input's columns, and removing a build
-// row only removes or NULL-pads rows P later drops, for INNER and LEFT, respectively. Every other
-// type refuses: SEMI/ANTI emit no build block, MARK's build-block ordinal is the synthetic mark,
-// RIGHT/FULL/RIGHT_SEMI/RIGHT_ANTI are deferred, SINGLE is unsupported.
+// For INNER and LEFT joins, removing a build row only removes a result row or creates a NULL-padded
+// row that the producing join later drops. Other join types are not safe build-block routes.
 bool build_block_is_value_preserving(duckdb::JoinType join_type) noexcept
 {
   switch (join_type) {
@@ -74,7 +72,6 @@ bool build_block_is_value_preserving(duckdb::JoinType join_type) noexcept
   return false;  // unreachable;
 }
 
-// Wrap an optional single-step rule result in the fan-out return shape.
 std::vector<descent_step> as_steps(std::optional<descent_step> step)
 {
   if (!step.has_value()) { return {}; }
@@ -270,9 +267,7 @@ std::vector<descent_step> descent_steps(sirius::op::sirius_physical_operator con
 
 namespace {
 
-// True when every step names a live child of `node`. A rule that accepted a step whose child slot
-// is absent cannot be followed; the driver then treats `node` as the terminal, matching the
-// single-step behavior the endpoint splice has always had.
+// A missing child turns the current node into a terminal.
 bool steps_are_followable(sirius::op::sirius_physical_operator const& node,
                           std::vector<descent_step> const& steps)
 {
@@ -319,9 +314,7 @@ endpoint_placement place_endpoint(duckdb::unique_ptr<sirius::op::sirius_physical
   assert(subtree != nullptr);
   auto const steps = descent_steps(*subtree, a0, policy);
   if (steps_are_followable(*subtree, steps)) {
-    // Descend each accepted branch: move the child out, place within it, move the rewrapped child
-    // back. Branch order (ascending child index) keeps site ordinals aligned with the terminal
-    // order trace_probe_key reports.
+    // Ascending child order keeps site ordinals aligned with trace_probe_key() terminals.
     endpoint_placement result;
     for (auto const& step : steps) {
       auto& child_slot = subtree->children[step.child_index];

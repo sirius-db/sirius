@@ -68,7 +68,7 @@ enum class dynamic_filter_apply_mode { membership_masks_only, include_ast_row_ma
 /// @ref dynamic_filter_apply_mode::include_ast_row_masks. Membership filters then apply
 /// sequentially, with each mask computed over the surviving rows. When @p gate is non-null,
 /// recorded marginal keep ratios order the membership filters and suppress filters that prune too
-/// little. A null gate applies membership filters in channel insertion order.
+/// little. A null gate applies every membership filter without selectivity-based ordering.
 /// @p device_id selects device-local filter storage; -1 resolves to the current CUDA device.
 /// Most scan callers should use @ref apply_dynamic_filters_gated_view, which adds the scan-level
 /// early-out and records the combined keep ratio.

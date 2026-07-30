@@ -201,9 +201,7 @@ TEST_CASE("sirius_dynamic_filter_set tracks wired producers", "[dynamic_filter]"
 
 TEST_CASE("ignore_columns drops pushes for the marked output columns", "[dynamic_filter]")
 {
-  // A scan marks its hive-partition columns: those values are path-derived, not decoded data, so
-  // a filter on them must never reach the consumer. Push, storage, and ignore all share the
-  // consumer output-position coordinate.
+  // Hive-partition values are path-derived, so their output positions reject filter pushes.
   sirius_dynamic_filter_set set;
   set.ignore_columns({0});
 

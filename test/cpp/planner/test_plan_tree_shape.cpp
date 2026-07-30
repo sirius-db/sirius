@@ -93,8 +93,7 @@ class scoped_temp_db_path {
 
 /// Generate a Sirius physical plan from a SQL query string. Throws on any failure (after
 /// rolling back and restoring the optimizer settings) so a planner regression fails the
-/// test instead of silently skipping it. `also_disabled` names optimizers a single test needs
-/// held back on top of the suite-wide set.
+/// test instead of silently skipping it. `also_disabled` adds case-specific optimizer exclusions.
 duckdb::unique_ptr<sirius_physical_operator> generate_sirius_plan(
   Connection& con, const std::string& query, const std::vector<OptimizerType>& also_disabled = {})
 {
@@ -289,9 +288,7 @@ void require_delim_join_common(sirius::op::sirius_physical_delim_join& delim)
   require_join_child_wrap(delim.join->children[1].get(), delim.join.get(), /*is_build=*/true);
 }
 
-/// RAII flip of the dynamic-filter switches on the connection's registered SiriusContext. The plan
-/// generator reads them live while `generate_sirius_plan` runs, and the context outlives this test,
-/// so restoring the originals is mandatory.
+// Set the dynamic-filter switches for one scope and restore their previous values.
 class dynamic_filter_switch_guard {
  public:
   dynamic_filter_switch_guard(Connection& con, bool sip_enabled)
@@ -340,9 +337,7 @@ struct plan_tree_shape_fixture {
     con->Query("CREATE TABLE small_right (rid INTEGER, other INTEGER)");
     con->Query("INSERT INTO small_right VALUES (0, 0), (1, 1)");
 
-    // The third table completes the canonical SIP shape `(A join B) join C`: joining on
-    // small_right.other puts the outer join's probe key on the inner join's BUILD side, where
-    // DuckDB's probe-spine pushdown never reaches.
+    // Complete a left-deep join whose outer probe key comes from the inner build side.
     con->Query("CREATE TABLE small_c (ckey INTEGER, cother INTEGER)");
     con->Query("INSERT INTO small_c VALUES (0, 0), (1, 1)");
 
@@ -429,22 +424,15 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
                  "input",
                  "[plan_tree_shape][isolated_context]")
 {
-  // `(big_left join small_right) join small_c` keyed on small_right.other: that key is produced on
-  // the inner join's BUILD side, so DuckDB's join-filter pushdown -- which walks probe spines only
-  // -- can wire no scan route for it, and the join-edge route is the only one that reaches it.
-  //
-  // JOIN_ORDER and BUILD_SIDE_PROBE_SIDE are held back so the physical tree keeps the syntactic
-  // left-deep shape and the syntactic build sides; the shape, not the cardinalities, is the
-  // subject.
+  // Preserve the left-deep shape and build sides. The outer probe key comes from the inner build,
+  // so only SIP can place a target on that join edge.
   const std::string query =
     "SELECT * FROM big_left l JOIN small_right r ON l.id = r.rid "
     "JOIN small_c c ON r.other = c.ckey";
   const std::vector<OptimizerType> keep_shape{OptimizerType::JOIN_ORDER,
                                               OptimizerType::BUILD_SIDE_PROBE_SIDE};
 
-  // The inner join is the second HASH_JOIN in pre-order and lives inside the outer join's probe
-  // subtree; asserting that containment pins which join is which without assuming what sits
-  // between them.
+  // Identify the inner join by containment in the outer probe subtree.
   auto require_inner_join = [](sirius_physical_operator* plan) {
     auto joins = collect(plan, SiriusPhysicalOperatorType::HASH_JOIN);
     REQUIRE(joins.size() == 2);
@@ -463,9 +451,7 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     auto* build_subtree =
       require_join_child_wrap(inner->children[1].get(), inner, /*is_build=*/true);
 
-    // Position is the discriminator, not the endpoint's child type: an endpoint over a bare build
-    // scan also has a GPU_SCAN child. Every build in this query is unfiltered, so no scan route
-    // exists anywhere in this plan and the DYNAMIC_FILTER above this scan must be the endpoint.
+    // Unfiltered builds disable scan routes, so this build-side endpoint must come from SIP.
     REQUIRE(build_subtree != nullptr);
     REQUIRE(build_subtree->type == SiriusPhysicalOperatorType::DYNAMIC_FILTER);
     REQUIRE(build_subtree->children.size() == 1);
@@ -486,8 +472,7 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     REQUIRE(build_subtree != nullptr);
     CHECK(build_subtree->type == SiriusPhysicalOperatorType::GPU_SCAN);
 
-    // Any endpoint the default path produces is a scan route, which sits directly above its own
-    // GPU_SCAN; none of them is on a join edge.
+    // With SIP disabled, any remaining endpoint must be a scan route above its GPU scan.
     for (auto* endpoint : collect(plan.get(), SiriusPhysicalOperatorType::DYNAMIC_FILTER)) {
       REQUIRE(endpoint->children.size() == 1);
       CHECK(endpoint->children[0]->type == SiriusPhysicalOperatorType::GPU_SCAN);
@@ -498,11 +483,7 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
 
   SECTION("SIP on: the endpoint lands on a LEFT join's build input")
   {
-    // `join_block_descent` allows a build-block hop for LEFT as well as INNER: removing a build row
-    // there removes or NULL-pads only rows the producing join drops. FILTER_PUSHDOWN is held back
-    // as well because it owns DuckDB's one LEFT->INNER conversion
-    // (`duckdb/src/optimizer/pushdown/pushdown_left_join.cpp`); this section is about the shape,
-    // not about which passes reach it, and the join type is asserted rather than assumed.
+    // Hold back filter pushdown to preserve the LEFT join and verify its build-side SIP placement.
     const std::string left_query =
       "SELECT * FROM big_left l LEFT JOIN small_right r ON l.id = r.rid "
       "JOIN small_c c ON r.other = c.ckey";
@@ -529,14 +510,8 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
 
   SECTION("SIP on: a null-equal producing condition places no endpoint")
   {
-    // Obligation B1 end to end. Two guards stand in series: admission admits only `equal`, and the
-    // direct-route selection re-checks the live comparison. Deleting both places an endpoint under
-    // the build wrap and fails this section; deleting only the selection's check does not, because
-    // admission has already returned no key. The single-mutation kill for the admission clause is
-    // the "admission never admits a null-equal condition" case in
-    // `test_dynamic_filter_key_admission.cpp`. The fixture's tables carry no
-    // filter, so DuckDB records no join-filter hint and no scan route can wire an endpoint that
-    // would mask the result.
+    // Null-equal keys are ineligible for SIP. The unfiltered build also disables scan discovery,
+    // so no other route can place an endpoint here.
     const std::string null_equal_query =
       "SELECT * FROM big_left l JOIN small_right r ON l.id = r.rid "
       "JOIN small_c c ON r.other IS NOT DISTINCT FROM c.ckey";
@@ -556,13 +531,8 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
 
   SECTION("SIP on: an aggregate-result key stops the descent at the group-by")
   {
-    // `group_by_key_input` accepts a grouping-key output ordinal only, so when the producing join's
-    // probe key is an aggregate *result* the descent refuses at the HASH_GROUP_BY and the endpoint
-    // takes the floor above it. The endpoint must then stay on the source side of every PARTITION
-    // the later wrap pass inserts: `insert_gpu_pipeline_operators_recursive` visits children before
-    // parents and dispatches on the slot's own type, so it rewrites the HASH_GROUP_BY slot beneath
-    // the endpoint into `MERGE_GROUP_BY -> PARTITION -> HASH_GROUP_BY` and leaves the endpoint
-    // above the whole chain, consuming merged rather than partitioned batches.
+    // Aggregate results cannot trace through HASH_GROUP_BY, so the endpoint stays above the
+    // wrapped group-by chain and consumes merged rather than partitioned batches.
     const std::string aggregate_key_query =
       "SELECT * FROM (SELECT rid, min(other) AS m FROM small_right GROUP BY rid) g "
       "JOIN small_c c ON g.m = c.ckey";
@@ -571,16 +541,14 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     auto plan = generate_sirius_plan(*con, aggregate_key_query, keep_shape);
     INFO(tree_to_string(plan.get()));
 
-    // A perfect-hash aggregate would exercise a different descent case; the suite disables
-    // STATISTICS_PROPAGATION, so the group stats that choice needs are absent and this holds.
+    // Disabled statistics prevent selection of the separate perfect-hash aggregate path.
     REQUIRE(find_first(plan.get(), SiriusPhysicalOperatorType::HASH_GROUP_BY) != nullptr);
 
     auto endpoints = collect(plan.get(), SiriusPhysicalOperatorType::DYNAMIC_FILTER);
     REQUIRE(endpoints.size() == 1);
     auto* endpoint = endpoints.front();
 
-    // The endpoint sits above the group-by chain, not inside it: descending into the chain would
-    // put it below the PARTITION the wrap pass inserts.
+    // The endpoint must remain above the partitioned group-by chain.
     REQUIRE(endpoint->children.size() == 1);
     CHECK(endpoint->children[0]->type != SiriusPhysicalOperatorType::PARTITION);
     CHECK(endpoint->children[0]->type == SiriusPhysicalOperatorType::MERGE_GROUP_BY);
@@ -590,10 +558,8 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
 
   SECTION("SIP on, filtered build: the trace through the build block binds the scan route")
   {
-    // The same shape with a row-keeping predicate on small_c: the outer build now carries filter
-    // evidence, so the outer key's trace -- which crosses the inner join's build block under the
-    // SIP policy -- bottoms at small_right's scan and binds the SCAN route there, zone-map capable.
-    // Scan binding wins per key: no join-edge endpoint is spliced for it.
+    // Build-filter evidence lets the trace cross the inner build block and bind the small_right
+    // scan. A scan binding takes precedence over a direct endpoint for the same key.
     const std::string filtered_build_query =
       "SELECT * FROM big_left l JOIN small_right r ON l.id = r.rid "
       "JOIN small_c c ON r.other = c.ckey WHERE c.cother >= 0";
@@ -616,8 +582,7 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
       return target.route_class == sirius::op::dynamic_filter_route_class::direct;
     }));
 
-    // The bound scan is the inner build's: the wrap pass leaves the Phase-1 consumer
-    // DYNAMIC_FILTER above that GPU_SCAN, proving which scan the trace bottomed out at.
+    // The inner build's GPU scan carries the bound scan-route endpoint.
     auto* inner = joins[1];
     auto* build_subtree =
       require_join_child_wrap(inner->children[1].get(), inner, /*is_build=*/true);
@@ -634,11 +599,8 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
                  "plan tree shape - scan-route discovery wires the probe scan's DYNAMIC_FILTER",
                  "[plan_tree_shape][isolated_context]")
 {
-  // The scan route with the SIP flag off: discovery walks the probe subtree itself (no DuckDB
-  // metadata is read), binds into the probe scan when the build side carries filter evidence, and
-  // the wrap pass then emits DYNAMIC_FILTER directly above that GPU_SCAN. `other % 2 = 0` is not
-  // pushable into table_filters, so it survives as the build-side FILTER that arms the evidence
-  // gate.
+  // With SIP disabled, a residual build filter arms scan discovery and places the endpoint above
+  // the probe GPU scan.
   const std::vector<OptimizerType> keep_shape{OptimizerType::JOIN_ORDER,
                                               OptimizerType::BUILD_SIDE_PROBE_SIDE};
 
@@ -677,9 +639,7 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
 
   SECTION("a LIMIT between the join and the scan leaves a bare GPU_SCAN")
   {
-    // The walk refuses LIMIT (filtering below a position selection changes which rows are
-    // selected), so the filtered build wires nothing and no DYNAMIC_FILTER exists -- the
-    // end-to-end form of the refusal the discovery unit tests and the parity oracle pin.
+    // Discovery stops at LIMIT because filtering below it can change which rows are selected.
     dynamic_filter_switch_guard sip_off(*con, /*sip_enabled=*/false);
     auto plan = generate_sirius_plan(*con,
                                      "SELECT * FROM (SELECT * FROM big_left LIMIT 15) l JOIN "

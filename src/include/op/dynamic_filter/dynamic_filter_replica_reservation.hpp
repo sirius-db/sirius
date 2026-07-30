@@ -118,6 +118,8 @@ class scoped_replica_reservation final {
 
   /**
    * @brief The destination allocator backed by the attached reservation
+   *
+   * @return The reservation-aware device allocator
    */
   [[nodiscard]] rmm::device_async_resource_ref allocator() const noexcept
   {

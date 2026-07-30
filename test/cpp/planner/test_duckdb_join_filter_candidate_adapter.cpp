@@ -21,8 +21,7 @@
  *
  * These are the pin-bump sentinels. Every `malformed` case below is unreachable under the pinned
  * DuckDB: it exists to fail loudly if a future submodule bump breaks a structural invariant that
- * the positional key-to-column pairing depends on -- which would silently invalidate what the
- * discovery parity suite compares Sirius against.
+ * the positional key-to-column pairing and discovery parity suite depend on.
  */
 
 #include "planner/dynamic_filter/duckdb_join_filter_candidate_adapter.hpp"

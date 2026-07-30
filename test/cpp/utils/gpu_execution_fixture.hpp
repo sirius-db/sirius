@@ -48,10 +48,10 @@
 
 namespace sirius::test {
 
-/// Collect all rows as vectors of stringified values. When `sort` is true (the default) the rows
-/// are sorted so the comparison is a row bag -- an ORDER BY-free query is compared by content, not
-/// by the order the engine happened to emit. Pass false to preserve emitted order (e.g. to verify
-/// ORDER BY / NULLS FIRST|LAST).
+/// Collects stringified result rows, sorted by default for order-insensitive comparison.
+/// @param result Materialized result to read.
+/// @param sort Whether to sort the rows; pass false to preserve emitted order.
+/// @return Collected rows.
 inline std::vector<std::vector<std::string>> collect_rows(duckdb::MaterializedQueryResult& result,
                                                           bool sort = true)
 {

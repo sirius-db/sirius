@@ -16,14 +16,7 @@
 
 /**
  * @file test_dynamic_filter_source_policy.cpp
- * @brief Tests for the decisions `publish_dynamic_filters` makes before it touches a device:
- * `choose_membership_filter`, `domain_coverage_gate_fires`, and `zone_map_range_gate_fires` from
- * `op/dynamic_filter/dynamic_filter_source_policy.hpp`.
- *
- * These functions read only counts, sizes, and capability answers, so every case here is stated as
- * a value and needs no GPU, no memory manager, and no fixture. Each test names the decision
- * boundary it pins; the publisher tests in `test_dynamic_filter_publisher.cpp` cover the
- * surrounding mechanism.
+ * @brief Tests the device-independent dynamic-filter publication policy.
  */
 
 #include "op/dynamic_filter/dynamic_filter_source_policy.hpp"
@@ -39,12 +32,10 @@ using sirius::op::domain_coverage_gate_fires;
 using sirius::op::membership_filter_kind;
 using sirius::op::zone_map_range_gate_fires;
 
-/// Cache budget every representation case is stated against, so that a fitting and an overflowing
-/// hash set differ by one byte.
+// Cache budget used to test the exact hash-set fit boundary.
 constexpr std::size_t kL2Bytes = 1024;
 
-/// Threshold both gates are stated against, chosen exactly representable so the at-threshold cases
-/// distinguish `>=` from `>` without rounding.
+// Exactly representable threshold used to test the inclusive gate boundary.
 constexpr double kThreshold = 0.5;
 
 }  // namespace
@@ -160,10 +151,8 @@ TEST_CASE("domain-coverage gate is disabled for an untraceable key domain",
 TEST_CASE("domain-coverage gate fires only for proven-unique keys",
           "[dynamic_filter][source_policy]")
 {
-  // For a duplicate key the ratio measures row retention, not coverage: 900k build rows out of a
-  // 1M-row table can all carry one key value, and suppressing that one-value membership test
-  // would be the worst possible over-fire. A non-unique key therefore never fires -- at 0.9, at
-  // full retention, or beyond it -- while the same ratios fire for a proven-unique key.
+  // Row retention does not measure domain coverage for duplicate keys, so they never fire the
+  // gate even at or above the table cardinality.
   REQUIRE_FALSE(domain_coverage_gate_fires(900'000, 1'000'000, false, 0.9));
   REQUIRE_FALSE(domain_coverage_gate_fires(1'000'000, 1'000'000, false, 0.9));
   REQUIRE_FALSE(domain_coverage_gate_fires(2'000'000, 1'000'000, false, 0.9));
@@ -175,14 +164,11 @@ TEST_CASE("domain-coverage gate fires only for proven-unique keys",
 TEST_CASE("domain-coverage gate treats a threshold above 1.0 as disabled outright",
           "[dynamic_filter][source_policy]")
 {
-  // The early return is contract, not arithmetic accident: at 2.0 the gate returns false for
-  // EVERY input -- including build rows beyond the domain bound (which under upper-bound evidence
-  // signals a defect counted separately, never a legitimate gate decision) and proven uniqueness
-  // both ways. This is the documented rollback lever.
+  // A threshold above 1.0 disables the gate before considering any other input.
   REQUIRE_FALSE(domain_coverage_gate_fires(2'000'000, 1'000'000, true, 2.0));
   REQUIRE_FALSE(domain_coverage_gate_fires(2'000'000, 1'000'000, false, 2.0));
   REQUIRE_FALSE(domain_coverage_gate_fires(1'000'000, 1'000'000, true, 1.5));
-  // Exactly 1.0 is NOT disabled: it fires only at full coverage of a proven-unique key.
+  // Exactly 1.0 remains active and fires at full coverage of a proven-unique key.
   REQUIRE(domain_coverage_gate_fires(100, 100, true, 1.0));
   REQUIRE_FALSE(domain_coverage_gate_fires(99, 100, true, 1.0));
 }

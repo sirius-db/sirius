@@ -71,9 +71,7 @@ std::vector<sirius::op::dynamic_filter_replica_space> get_replica_spaces(
   return {{*gpu_space, *host_space}};
 }
 
-/// One admitted INT64 key over build column @p build_key_ordinal, tracing to a key domain of @p
-/// domain_cardinality values; 0 leaves the membership coverage gate disabled for the key. A key
-/// carrying a domain is marked proven unique, since the gate arms only for proven-unique keys.
+// Build an admitted INT64 key; a nonzero domain marks it unique and enables coverage gating.
 dynamic_filter_publish_plan::admitted_key make_int64_key(std::size_t condition_index,
                                                          cudf::size_type build_key_ordinal,
                                                          std::size_t domain_cardinality = 0)
@@ -87,7 +85,7 @@ dynamic_filter_publish_plan::admitted_key make_int64_key(std::size_t condition_i
     .build_key_proven_unique      = domain_cardinality > 0};
 }
 
-/// GPU fixture: memory manager, replica spaces, a construction stream, and INT64 key columns.
+// GPU resources and key columns used by publisher tests.
 struct publisher_fixture {
   rmm::cuda_set_device_raii device{rmm::cuda_device_id{kDeviceId}};
   decltype(sirius::test::operator_utils::initialize_memory_manager(1)) memory_manager =
@@ -98,7 +96,7 @@ struct publisher_fixture {
 
   std::vector<std::unique_ptr<cudf::column>> columns;
 
-  /// Append an INT64 sequence column of @p rows values starting at @p first.
+  // Append an INT64 sequence column.
   void add_key_column(std::size_t rows, std::int64_t first = 0)
   {
     auto& source_space = replica_spaces.front().get_gpu_space();
@@ -120,7 +118,7 @@ struct publisher_fixture {
   }
 };
 
-/// Device INT64 column holding @p values.
+// Copy INT64 values into a device column.
 std::unique_ptr<cudf::column> make_int64_values(publisher_fixture const& fixture,
                                                 std::vector<std::int64_t> const& values)
 {
@@ -139,7 +137,7 @@ std::unique_ptr<cudf::column> make_int64_values(publisher_fixture const& fixture
   return column;
 }
 
-/// Apply a published membership filter to @p probe and return its host-side keep-mask.
+// Apply a membership filter and copy its keep mask to the host.
 std::vector<std::uint8_t> membership_mask(sirius::op::sirius_dynamic_filter const& filter,
                                           cudf::column_view const& probe,
                                           publisher_fixture const& fixture)
@@ -215,8 +213,7 @@ void require_published_membership(std::size_t rows)
   }
 }
 
-/// Require that @p outcome describes an attempt that walked no key, built nothing, and reached no
-/// target.
+// Require a publication attempt with no considered keys, built filters, or active targets.
 void require_nothing_published(sirius::op::dynamic_filter_publication_outcome const& outcome)
 {
   REQUIRE(outcome.keys_considered == 0);
@@ -228,8 +225,7 @@ void require_nothing_published(sirius::op::dynamic_filter_publication_outcome co
   REQUIRE(outcome.filters_pushed == 0);
 }
 
-/// A HOST memory space, as a mutable reference the plan's replica-space tier guards can be handed
-/// in either slot.
+// Return a mutable host memory space for invalid-tier plan tests.
 cucascade::memory::memory_space& host_memory_space(publisher_fixture& fixture)
 {
   auto const host_spaces =
@@ -241,14 +237,7 @@ cucascade::memory::memory_space& host_memory_space(publisher_fixture& fixture)
   return *space;
 }
 
-/// Publish two admitted keys bound to one target and require that the domain-coverage gate skips
-/// exactly @p gated_key_index.
-///
-/// The two keys differ in every coordinate the publisher could confuse: admitted-key index, build
-/// ordinal, build column values, channel push ordinal, and domain cardinality. Only the gated key
-/// traces to a domain its build covers, so a publisher that read one key's cardinality while
-/// building another key's filter -- or that published a filter at another key's push ordinal --
-/// gates the wrong key and fails here.
+// Verify that coverage gating uses the selected key's domain, build ordinal, and push ordinal.
 void require_domain_gate_skips_only(std::size_t gated_key_index)
 {
   constexpr std::size_t kBuildRows = 3;
@@ -259,9 +248,7 @@ void require_domain_gate_skips_only(std::size_t gated_key_index)
   constexpr std::size_t kKey1PushOrdinal = 5;
 
   publisher_fixture fixture;
-  // Disjoint value ranges per build column: admitted key 0 names build ordinal 1 ({0,1,2}) and
-  // admitted key 1 names build ordinal 0 ({100,101,102}), so the surviving filter's contents say
-  // which key it was built from.
+  // Disjoint values and reversed build ordinals expose coordinate-space mixups.
   fixture.add_key_column(kBuildRows, 100);
   fixture.add_key_column(kBuildRows, 0);
 
@@ -302,8 +289,7 @@ void require_domain_gate_skips_only(std::size_t gated_key_index)
   auto const surviving = channel->filters_for_column(surviving_ordinal);
   REQUIRE(surviving.size() == 1);
 
-  // Presence at the right ordinal is not enough: apply the filter to one value from each build
-  // column, so a filter built from the gated key's column keeps the wrong probe row here.
+  // Applying the filter distinguishes the two build columns, not just their push ordinals.
   auto const probe = make_int64_values(fixture, {0, 100});
   auto const expected =
     gated_key_index == 0 ? std::vector<std::uint8_t>{0, 1} : std::vector<std::uint8_t>{1, 0};
@@ -328,9 +314,7 @@ TEST_CASE("dynamic-filter publisher fans out sparsely: each target receives only
           "[dynamic_filter][publisher]")
 {
   publisher_fixture fixture;
-  // Non-identity ordinal mapping: build column 0 holds {100,101,102} and column 1 holds
-  // {0,1,2}, while admitted key 0 names ordinal 1 and admitted key 1 names ordinal 0 -- a
-  // swapped admitted-key or build-ordinal subscript changes the published values below.
+  // Reverse key-to-column ordinals and use disjoint values to expose coordinate-space mixups.
   fixture.add_key_column(3, 100);
   fixture.add_key_column(3, 0);
 
@@ -388,9 +372,7 @@ TEST_CASE("dynamic-filter publisher applies the domain-coverage gate to each key
 TEST_CASE("dynamic-filter publisher fails loudly on a plan/runtime key-mapping inconsistency",
           "[dynamic_filter][publisher]")
 {
-  // Unreachable through the planner (admission derives ordinal and type from one condition);
-  // this pins the release-mode guard against mapping drift, which must fail the publication
-  // attempt rather than silently construct a filter from the wrong column.
+  // Admission normally keeps these fields consistent; exercise the publisher's runtime guard.
   publisher_fixture fixture;
   fixture.add_key_column(3);
 
@@ -566,7 +548,7 @@ TEST_CASE("dynamic-filter publisher publishes nothing from an empty build",
 TEST_CASE("dynamic-filter publisher publishes nothing once every target has drained",
           "[dynamic_filter][publisher]")
 {
-  // No future consumer split can observe a filter pushed now, so the build is skipped outright.
+  // No consumer remains to observe a filter, so construction is skipped.
   publisher_fixture fixture;
   fixture.add_key_column(3);
 
@@ -713,8 +695,7 @@ TEST_CASE("dynamic-filter publish plan rejects invalid targets and bindings",
 TEST_CASE("dynamic-filter publish plan validates a mixed scan-plus-direct target set",
           "[dynamic_filter][publisher]")
 {
-  // The join builder hands the constructor one target set holding both routes, so the direct
-  // target's invariants must hold at construction rather than at a later extension point.
+  // The constructor validates direct-target invariants in the combined route set.
   publisher_fixture fixture;
   auto scan_channel   = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
   auto direct_channel = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
@@ -782,9 +763,7 @@ TEST_CASE("dynamic-filter publisher builds filters only for bound keys",
   constexpr std::size_t kBoundPushOrdinal = 5;
 
   publisher_fixture fixture;
-  // Disjoint value ranges per build column: the unbound key 0 names build ordinal 1 ({0,1,2}) and
-  // the bound key 1 names build ordinal 0 ({100,101,102}), so the published filter's contents say
-  // which key it was built from.
+  // Reversed ordinals and disjoint values distinguish the bound key from the unbound key.
   fixture.add_key_column(kBuildRows, 100);
   fixture.add_key_column(kBuildRows, 0);
 
@@ -809,8 +788,7 @@ TEST_CASE("dynamic-filter publisher builds filters only for bound keys",
   REQUIRE(outcome.keys_skipped_domain_gate == 0);
   REQUIRE(outcome.keys_skipped_type_mismatch == 0);
 
-  // The single filter lands at the bound key's push ordinal, and applying it to one value from
-  // each build column proves it was built from the bound key's column, not the unbound one's.
+  // Verify both the bound push ordinal and the selected build column.
   auto const published = channel->filters_for_column(kBoundPushOrdinal);
   REQUIRE(published.size() == 1);
   auto const probe = make_int64_values(fixture, {0, 100});

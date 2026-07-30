@@ -562,13 +562,12 @@ TEST_CASE("yaml reader error messages include context", "[config_opt][errors]")
 TEST_CASE("the domain-coverage threshold is validated where it enters the engine",
           "[config_opt][conditional][dynamic_filter]")
 {
-  // One predicate backs both ingress surfaces (the YAML reader and the SQL SET handler) so they
-  // cannot drift. Downstream, the publication plan transports the value without re-validating it:
-  // a plan is built for every GPU hash join and must not be able to fail planning.
+  // YAML and SQL configuration share this ingress validator; publication plans transport the
+  // validated value without repeating the check.
   config::valid_domain_coverage_threshold const accepts;
 
   REQUIRE(accepts(0.9));
-  REQUIRE(accepts(1.5));  // >= 1.0 disables the gate rather than being invalid
+  REQUIRE(accepts(1.5));  // values above 1.0 disable the gate
 
   REQUIRE_FALSE(accepts(0.0));   // would suppress every filter
   REQUIRE_FALSE(accepts(-0.5));  // likewise, and nonsensical as a coverage fraction

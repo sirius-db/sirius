@@ -1073,9 +1073,7 @@ TEST_CASE("per-filter gate re-measures a stale verdict after the channel grows",
   REQUIRE(measured.has_value());
   REQUIRE(sirius::op::scan::dynamic_filter_gate::filter_skippable(*measured));
 
-  // The channel grows, so that verdict describes a cascade that no longer exists. It must not be
-  // carried forward: the filter is re-measured against the new cascade rather than staying skipped
-  // on a reading that predates the arrival.
+  // Growing the channel invalidates verdicts measured against the previous cascade.
   filters.push_filter(0, make_in_list_prefix(2, stream));
   REQUIRE_FALSE(gate.filter_keep_ratio(useless.get(), filters.filter_count()).has_value());
 }

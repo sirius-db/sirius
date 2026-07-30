@@ -30,10 +30,7 @@ namespace sirius::planner {
 
 namespace {
 
-/// Which child of `op`, at which of that child's output ordinals, produces `op`'s output ordinal
-/// `output_ordinal` -- when `op` produces it by value-preserving pass-through and `op`'s rows are
-/// an injective image of that child's rows. Absent otherwise. The only place that knows the
-/// LogicalOperator taxonomy.
+// Origin of a value-preserving output in a child whose rows injectively map to the parent.
 struct ordinal_origin {
   std::size_t child_index;
   std::size_t child_ordinal;
@@ -140,10 +137,7 @@ std::optional<ordinal_origin> pass_through_origin(duckdb::LogicalOperator const&
   }
 }
 
-/// A LOGICAL_GET terminates the walk successfully only when it is a plain base-table scan and the
-/// ordinal lies within the scan's own width. A table-in-out function appends its child's columns
-/// after the scan columns, so "the base table's row count" is not meaningful for such a node at
-/// all; refuse the whole node rather than the ordinal.
+// A table-in/out function appends child columns, so it has no single base-table row domain.
 bool admissible_base_scan(duckdb::LogicalGet const& get, std::size_t ordinal) noexcept
 {
   if (!get.children.empty() || !get.projected_input.empty()) { return false; }
@@ -159,8 +153,6 @@ namespace detail {
 duckdb::LogicalGet const* resolve_pass_through_scan(duckdb::LogicalOperator const& subtree,
                                                     std::size_t output_ordinal) noexcept
 {
-  // A path, not a tree traversal: each step strictly descends into exactly one child, so the loop
-  // terminates on any finite tree and can never wander into the wrong subtree.
   auto const* node = &subtree;
   auto ordinal     = output_ordinal;
   while (node->type != duckdb::LogicalOperatorType::LOGICAL_GET) {
@@ -215,8 +207,7 @@ std::optional<std::size_t> duckdb_base_table_cardinality::operator()(
     if (!stats || !stats->has_max_cardinality) { return std::nullopt; }
     return static_cast<std::size_t>(stats->max_cardinality);
   } catch (...) {
-    // An escaped exception here would fail query planning for the sake of an optional
-    // optimization; refusal is the only failure mode.
+    // Optional evidence must not fail query planning.
     return std::nullopt;
   }
 }

@@ -401,10 +401,7 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
   std::size_t lhs_cardinality = op.children[0]->EstimateCardinality(context);
   std::size_t rhs_cardinality = op.children[1]->EstimateCardinality(context);
 
-  // The dynamic-filter flags are read once, ahead of the pre-create_plan evidence block below.
-  // These flag reads tolerate a null state (every flag reads disabled); the hash-join branch below
-  // additionally requires a registered context, since it reads the config and memory topology
-  // unconditionally.
+  // A missing Sirius context disables dynamic-filter evidence and discovery.
   auto sirius_context = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
   bool const master_enabled =
     sirius_context &&
@@ -412,20 +409,14 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
   bool const sip_enabled =
     master_enabled && sirius_context->get_config().get_operator_params().enable_dynamic_filter_sip;
 
-  // Sirius-owned build-filter evidence, read from the logical build child before create_plan()
-  // moves data out of the logical nodes. When the build child is a LOGICAL_DELIM_GET its data is
-  // drawn from the probe side, so the evidence is read there instead -- the same child rule
-  // DuckDB's IsFiltering call site applies.
+  // A delim build draws its rows from the probe child, so filtering evidence comes from there.
   bool const build_filtered =
     master_enabled && build_subtree_is_filtering(op.children[1]->type ==
                                                      duckdb::LogicalOperatorType::LOGICAL_DELIM_GET
                                                    ? *op.children[0]
                                                    : *op.children[1]);
 
-  // Gather domain evidence before create_plan() moves data out of the logical children. The guard
-  // is a cost gate: this walk runs for every comparison join reaching this function when armed,
-  // including joins that leave through the nested-loop branch, and no route can use the evidence
-  // unless the scan gate (build_filtered) or the join-edge route (sip_enabled) is armed.
+  // Gather domain evidence before create_plan() moves state out of the logical children.
   auto condition_domains =
     master_enabled && (build_filtered || sip_enabled)
       ? build_key_domain_cardinalities(op, duckdb_base_table_cardinality{context})
@@ -444,9 +435,7 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
     // return Make<PhysicalCrossProduct>(op.types, left, right, op.estimated_cardinality);
   }
 
-  // Classify every condition side BEFORE computed keys are materialized into plain references --
-  // afterwards a computed key is indistinguishable from a direct one, and dynamic-filter
-  // admission consumes this carried classification instead of re-deriving it.
+  // Preserve key shape before materialization makes computed keys look like direct references.
   auto condition_key_shapes = classify_join_key_shapes(op.conditions);
 
   // Materialize any complex expressions in equality conditions into real columns below the join,
@@ -503,26 +492,17 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
     auto admitted_keys = admit_dynamic_filter_keys(
       conditions, condition_key_shapes, condition_domains, build_side_unique_column);
 
-    // Unified target discovery: one trace per admitted key over the built probe subtree. A
-    // TABLE_SCAN terminal binds the key INTO that scan (zone-map capable); any other terminal is a
-    // join-edge endpoint site when the SIP flag allows it; otherwise the key stays a recorded
-    // legality fact. One route per key -- a scan binding wins, so no key is published through both
-    // routes. Per-key parity contract: Sirius never binds a key into a scan that DuckDB's pushdown
-    // walk, given that key alone, would refuse (the discovery parity suite pins this).
-    //
-    // plan_delim_join() also reaches this function; DuckDB only ever generated join filters for
-    // LOGICAL_COMPARISON_JOIN, so a delim-join producer has never had a route on any path and the
-    // structural gate below preserves that.
+    // Trace each admitted key through the built probe subtree. Scan bindings take precedence over
+    // join-edge endpoints, so one key never publishes through both routes. Delim joins share this
+    // planner entry point but are not dynamic-filter producers.
     std::vector<sirius::op::dynamic_filter_publish_plan::probe_target> targets;
     std::size_t scan_target_count = 0;
     bool const discovery_runs     = master_enabled && (build_filtered || sip_enabled) &&
                                 op.type == duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN &&
                                 !gpu_spaces.empty() && !host_spaces.empty();
     if (discovery_runs) {
-      // The scan gate is Sirius-owned: build-filter evidence (an unfiltered FK-shaped build is the
-      // whole key domain, so its filter keeps every probe row) and the producer join-type mirror
-      // of DuckDB's GenerateJoinFilters -- without the latter, a LEFT/ANTI/MARK producer's
-      // probe-side filter would change results.
+      // Scan binding requires build-filter evidence and a join type that can safely pre-filter its
+      // probe side.
       bool const scan_bind_armed = build_filtered && scan_route_join_type_admissible(op.join_type);
       descent_policy const policy{.descend_build_blocks = sip_enabled};
       std::unordered_map<sirius::op::sirius_physical_operator const*, std::size_t> target_by_scan;
@@ -580,11 +560,8 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
                                      key.storage_type)) {
           continue;
         }
-        // One fresh channel per spliced site, minted inside the factory so the mints zip with the
-        // returned site ordinals. place_endpoint() splices at every terminal the policy reaches;
-        // it is only called when no branch of the key was scan-bound, and on plans without a
-        // physical set operation a key has exactly one terminal, so the mixed-branch refinement
-        // is deferred until physical set operations exist.
+        // Mint one channel per endpoint. If any branch was scan-bound, scan bindings win and this
+        // key receives no direct endpoint on its other branches.
         std::vector<std::shared_ptr<sirius::op::sirius_dynamic_filter_set>> site_channels;
         auto placed = place_endpoint(
           std::move(left),
@@ -628,9 +605,7 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
     } else if (master_enabled && (build_filtered || sip_enabled) &&
                op.type == duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN &&
                !admitted_keys.empty() && (gpu_spaces.empty() || host_spaces.empty())) {
-      // Discovery is armed and keys were admitted, so only the replica placement is missing. When
-      // the build-unfiltered case below holds as well, placement is the binding, actionable
-      // constraint, which is why this branch comes first.
+      // Report missing placement before less specific discovery gates.
       SIRIUS_LOG_INFO(
         "[sirius_plan_comparison_join] Not wiring dynamic filter(s): a GPU and HOST "
         "memory space are required for device-local replicas.");
@@ -643,8 +618,7 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
         rhs_cardinality);
     }
 
-    // Pair every GPU with a NUMA-local HOST staging space. The publish-plan constructor rejects
-    // targets without a replica placement; replication uses HOST staging when peer DMA is absent.
+    // Prefer a NUMA-local HOST staging space for each GPU and fall back to the first HOST space.
     std::vector<sirius::op::dynamic_filter_replica_space> filter_replica_spaces;
     if (!targets.empty()) {
       auto const& topology = sirius_context->get_config().get_hw_topology();

@@ -175,7 +175,7 @@ bool sirius_physical_hash_join::are_conditions_supported(
 
 namespace {
 
-/// Move equality conditions ahead of the rest.
+// Move equality conditions ahead of the rest.
 void reorder_join_conditions(duckdb::vector<sirius::join_condition>& conditions)
 {
   bool is_ordered     = true;

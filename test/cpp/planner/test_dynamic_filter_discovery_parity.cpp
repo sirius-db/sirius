@@ -16,31 +16,11 @@
 
 /**
  * @file test_dynamic_filter_discovery_parity.cpp
- * @brief The parity ORACLE: Sirius-owned scan-target discovery against DuckDB's own pushdown walk
+ * @brief Compares Sirius scan-target discovery with DuckDB's join-filter pushdown walk.
  *
- * Sirius discovers dynamic-filter scan targets by walking its built physical probe subtree
- * (`dynamic_filter_target_discovery.hpp`); DuckDB's `JoinFilterPushdownOptimizer` walks the
- * logical probe subtree. This suite pins the per-key parity contract between the two: for each
- * Sirius-admissible equality key of a producing join, Sirius binds a scan target exactly when
- * DuckDB's public `GetPushdownFilterTargets`, given that key alone, reaches the same base scan --
- * modulo the documented conservative divergences, each of which has a section here asserting BOTH
- * sides so the divergence is pinned rather than hidden.
- *
- * Method per case: plan and optimize the query; deep-copy the optimized logical plan BEFORE the
- * ColumnBindingResolver runs (the copy keeps binding-space expressions the DuckDB walk consumes,
- * and Copy's serialize round-trip strips DuckDB's own pushdown metadata, so the oracle re-derives
- * targets from structure alone); convert the original through `create_plan`; compare each hash
- * join's `dynamic_filter_plan()` bindings against per-key oracle expectations whose ordinals are
- * DuckDB-computed output positions -- never hardcoded.
- *
- * Divergences without an oracle section: a bare ORDER BY between a join and a scan cannot be
- * planned from SQL (DuckDB elides subquery ORDER BY without LIMIT/OFFSET), so that refusal row is
- * pinned by the shared refusal list in the discovery unit tests and by the LIMIT/TOP_N sections
- * here, which exercise the same walk path. Join-type syntax note: the ANTI producer section uses
- * the explicit `ANTI JOIN` clause, which binds a bare ANTI comparison join directly at bind time;
- * the SQL derivations do not produce one under the pinned optimizer set -- a correlated NOT EXISTS
- * plans through a DELIM_JOIN wrapper, and NOT IN plans as a MARK join (the MARK-to-ANTI conversion
- * lives in the held-back STATISTICS_PROPAGATION pass).
+ * Each admissible equality key is compared by target table and output ordinal. Separate cases
+ * cover conservative routes that Sirius rejects even though DuckDB accepts them. The DuckDB
+ * oracle uses a pre-binding-resolver plan copy; Sirius converts the original optimized plan.
  */
 
 // Reaching a join operator through these headers instantiates `vector<join_condition>`'s
@@ -88,8 +68,7 @@ using sirius::op::SiriusPhysicalOperatorType;
 
 namespace {
 
-/// RAII on-disk DuckDB path: the GPU-native seq_scan ingestible refuses non-single-file
-/// block managers, so these tests need an on-disk database rather than :memory:.
+// GPU-native sequential scans require the single-file block manager used by an on-disk database.
 class scoped_temp_db_path {
  public:
   scoped_temp_db_path()
@@ -119,8 +98,7 @@ class scoped_temp_db_path {
   std::string _path;
 };
 
-/// RAII flip of the dynamic-filter switches on the connection's registered SiriusContext: master
-/// on, SIP off, so discovery runs and every wired target is scan class.
+// Enable scan-target discovery while disabling SIP targets, then restore both settings.
 class master_only_switch_guard {
  public:
   explicit master_only_switch_guard(Connection& con)
@@ -150,10 +128,7 @@ class master_only_switch_guard {
   bool _original_sip      = false;
 };
 
-/// One planned query, carrying both comparison sides. `oracle_plan` is the pre-resolver deep copy
-/// the DuckDB walk consumes; `original_join_had_pushdown[i]` records, per pre-order comparison
-/// join of the ORIGINAL, whether DuckDB's own optimizer attached `filter_pushdown` (read before
-/// `create_plan` consumes the original); `physical` is the Sirius plan built from the original.
+// Logical oracle inputs and the physical Sirius plan for one query.
 struct parity_case {
   duckdb::unique_ptr<duckdb::LogicalOperator> oracle_plan;
   std::vector<bool> original_join_had_pushdown;
@@ -178,9 +153,7 @@ std::vector<duckdb::LogicalComparisonJoin*> comparison_joins_of(duckdb::LogicalO
   return joins;
 }
 
-/// Plan, optimize, and (optionally) convert one query. JOIN_ORDER and BUILD_SIDE_PROBE_SIDE are
-/// always held back so the physical tree keeps the syntactic join order and syntactic build
-/// sides; STATISTICS_PROPAGATION so constant folding does not erase the shapes under test.
+// Plan and optimize while preserving the query's join order, build sides, and test shape.
 duckdb::unique_ptr<duckdb::LogicalOperator> optimize_query(
   Connection& con, const std::string& query, const std::vector<OptimizerType>& also_disabled = {})
 {
@@ -234,8 +207,8 @@ parity_case plan_parity_case(Connection& con,
   parity_case result;
   con.Query("BEGIN TRANSACTION");
   try {
-    // The oracle copy is taken BEFORE the resolver so it keeps binding-space expressions; the
-    // serialize round-trip strips filter_pushdown / dynamic_filters, which the oracle re-derives.
+    // Copy before binding resolution to retain binding-space expressions. Serialization strips
+    // pushdown metadata so the oracle derives targets from the plan structure.
     // Deserialization re-binds each scan's catalog entry, so the copy needs an active transaction.
     result.oracle_plan = original->Copy(context);
     for (auto const* join : comparison_joins_of(*original)) {
@@ -256,10 +229,7 @@ parity_case plan_parity_case(Connection& con,
   return result;
 }
 
-/// Mirror of DuckDB's private `PushdownJoinFilterExpression` entry shapes
-/// (join_filter_pushdown_optimizer.cpp:23-55): nested and INTERVAL keys are refused; otherwise a
-/// plain column reference, or an integral cast chain no wider than 64 bits over one. Returns the
-/// binding the DuckDB walk would track.
+// Return the binding DuckDB tracks for a plain reference or supported integral cast chain.
 std::optional<duckdb::ColumnBinding> oracle_probe_binding(duckdb::Expression const& expr)
 {
   if (expr.return_type.IsNested()) { return std::nullopt; }
@@ -282,17 +252,14 @@ std::optional<duckdb::ColumnBinding> oracle_probe_binding(duckdb::Expression con
   }
 }
 
-/// One per-key oracle finding: DuckDB's walk, given only this condition's probe column, reached
-/// base table `table_name` and expects the key at OUTPUT position `output_ordinal` of that scan.
+// Target found by DuckDB's walk for one join condition.
 struct oracle_key_target {
   std::size_t condition_index = 0;
   std::string table_name;
   std::size_t output_ordinal = 0;
 };
 
-/// Run DuckDB's `GetPushdownFilterTargets` once per condition of @p join_copy (per key -- the
-/// public walk is static, so a single-column vector isolates each key from its siblings) and
-/// convert each found target's binding to the target scan's OUTPUT position.
+// Run DuckDB's walk independently for each condition and resolve the target scan output ordinal.
 std::vector<oracle_key_target> oracle_targets_for_join(duckdb::LogicalComparisonJoin& join_copy)
 {
   std::vector<oracle_key_target> found;
@@ -351,9 +318,7 @@ std::vector<sirius::op::sirius_physical_hash_join*> hash_joins_of(sirius_physica
   return joins;
 }
 
-/// One Sirius scan binding, read back through the publish plan: which planner condition bound, into
-/// which base table's scan, at which channel push ordinal (== the bound scan's output ordinal).
-/// Field order mirrors `oracle_key_target` so the two sides compare member for member.
+// Sirius scan binding in the same coordinate spaces as oracle_key_target.
 struct sirius_scan_binding {
   std::size_t condition_index = 0;
   std::string table_name;
@@ -362,14 +327,7 @@ struct sirius_scan_binding {
   [[nodiscard]] bool operator==(sirius_scan_binding const&) const = default;
 };
 
-/// Resolve the base table read by the one GPU scan leaf whose dynamic-filter channel is
-/// pointer-identical to @p filter_set. The producing join attaches the channel to the probe scan it
-/// reaches, and plan construction hands that same shared channel to the replacing
-/// `sirius_gpu_scan_operator` through its ingestible table info -- the finished tree carries no
-/// TABLE_SCAN nodes. Channel identity IS the production producer/consumer pairing, so a scan-class
-/// target must resolve to exactly one leaf. The fixture's tables are duckdb-native, so the info is
-/// `duckdb_native_ingestible_table_info`, which carries the channel and the resolved base-table
-/// name together.
+// Resolve the unique GPU scan that owns filter_set and return its base table name.
 std::string owning_scan_table_of(
   sirius_physical_operator* root,
   std::shared_ptr<sirius::op::sirius_dynamic_filter_set> const& filter_set)
@@ -540,9 +498,8 @@ TEST_CASE_METHOD(discovery_parity_fixture,
                  "discovery parity - LIMIT on the probe spine: DuckDB binds, Sirius refuses",
                  "[dynamic_filter][parity][isolated_context]")
 {
-  // Filtering below a position selection changes which rows are selected, so the Sirius walk
-  // refuses LIMIT as a correctness rule where DuckDB pushes through it. Costs speed, never
-  // correctness -- and this section pins BOTH sides of that divergence.
+  // Filtering below a position selection can change which rows LIMIT selects, so Sirius stops
+  // where DuckDB continues.
   master_only_switch_guard master_on(*con);
   auto c = plan_parity_case(*con,
                             "SELECT * FROM (SELECT * FROM big_left LIMIT 15) l "
@@ -586,18 +543,15 @@ TEST_CASE_METHOD(discovery_parity_fixture,
                  "refuses",
                  "[dynamic_filter][parity][isolated_context]")
 {
-  // DuckDB's walk recurses children[0] of ANY comparison join, RIGHT included, so it binds l.id
-  // through the intervening join; the Sirius walk refuses every probe block that NULL-pads its
-  // traced column (probe_block_is_value_preserving). Conservative: costs speed, never correctness
-  // -- and this section pins BOTH sides of the divergence.
+  // DuckDB descends through the probe side of any comparison join. Sirius stops when an
+  // intervening RIGHT join can NULL-pad the traced probe column.
   master_only_switch_guard master_on(*con);
   auto c = plan_parity_case(*con,
                             "SELECT * FROM (SELECT l.id AS id FROM big_left l "
                             "RIGHT JOIN small_c c ON l.val = c.ckey) x "
                             "JOIN small_right r ON x.id = r.rid WHERE r.other > 0");
 
-  // Containment pins which join is which, and the join-type guard makes an optimizer flip of the
-  // intervening RIGHT join fail loudly instead of degrading this section into testing nothing.
+  // Identify the producing and intervening joins before comparing their behavior.
   auto joins = comparison_joins_of(*c.oracle_plan);
   REQUIRE(joins.size() == 2);
   auto* producing   = joins[0];
@@ -624,8 +578,7 @@ TEST_CASE_METHOD(discovery_parity_fixture,
                  "discovery parity - a cast projection: DuckDB crosses it, Sirius refuses",
                  "[dynamic_filter][parity][isolated_context]")
 {
-  // DuckDB pushes through integral casts no wider than 64 bits; crossing a cast is a deferred
-  // follow-up for Sirius, whose projection rule accepts plain references only. Conservative.
+  // DuckDB follows supported integral casts; Sirius accepts only plain projection references.
   master_only_switch_guard master_on(*con);
   auto c =
     plan_parity_case(*con,
@@ -734,7 +687,7 @@ TEST_CASE_METHOD(discovery_parity_fixture,
                  "abandons",
                  "[dynamic_filter][parity][isolated_context]")
 {
-  // DuckDB walks all hinted columns jointly and abandons the whole branch when ANY column fails;
+  // DuckDB walks all hinted columns jointly and abandons the whole branch when any column fails;
   // Sirius walks per key. The per-key never-more contract still holds: the extra binding is one
   // DuckDB itself makes for that key in isolation, which the per-key oracle verifies.
   master_only_switch_guard master_on(*con);
@@ -812,8 +765,7 @@ TEST_CASE_METHOD(discovery_parity_fixture,
 
   SECTION("a SEMI producer binds on both sides")
   {
-    // Uncorrelated IN: a correlated EXISTS plans through a DELIM_JOIN wrapper rather than a bare
-    // SEMI comparison join (see the join-type syntax note in the file docblock).
+    // Uncorrelated IN produces the bare SEMI comparison join needed by this case.
     auto c     = plan_parity_case(*con,
                               "SELECT * FROM big_left l "
                                   "WHERE id IN (SELECT rid FROM small_right WHERE other > 0)");
@@ -852,8 +804,7 @@ TEST_CASE_METHOD(discovery_parity_fixture,
   {
     // ANTI keeps exactly the probe rows without a build match -- the rows a probe-side membership
     // filter would remove. DuckDB returns early from GenerateJoinFilters; Sirius's join-type gate
-    // refuses the bind. The explicit ANTI JOIN clause binds this bare shape directly (see the file
-    // docblock's syntax note).
+    // refuses the bind. Explicit ANTI JOIN produces the bare comparison join needed by this case.
     auto c = plan_parity_case(*con,
                               "SELECT * FROM big_left l ANTI JOIN "
                               "(SELECT * FROM small_right WHERE other > 0) r ON l.id = r.rid");
@@ -873,10 +824,7 @@ TEST_CASE_METHOD(discovery_parity_fixture,
                  "discovery parity - the adapter oracle agrees with the per-key walk",
                  "[dynamic_filter][parity][isolated_context]")
 {
-  // The adapter (test-only since unified discovery) extracts what DuckDB's optimizer itself
-  // recorded on the ORIGINAL, before Copy strips it. Cross-checking extract() against the per-key
-  // walk on a plain two-join shape proves the oracle's two data paths agree with each other, so a
-  // future DuckDB bump that breaks one is caught by the other.
+  // Cross-check the test-only metadata adapter against the independent per-key DuckDB walk.
   master_only_switch_guard master_on(*con);
   auto original = optimize_query(*con,
                                  "SELECT * FROM big_left l "

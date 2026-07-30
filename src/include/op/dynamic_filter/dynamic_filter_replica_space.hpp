@@ -28,9 +28,9 @@ namespace sirius::op {
  * @brief Non-owning placement handle for one device-local dynamic-filter replica
  *
  * The GPU memory space supplies reservation admission, the replica allocator, and a pooled CUDA
- * stream. The paired HOST memory space supplies NUMA-local, pre-pinned fixed blocks when direct
- * peer DMA is unavailable. Placement is immutable, while reservation accounting mutates the
- * referenced memory space at runtime.
+ * stream. The paired HOST memory space supplies pre-pinned fixed blocks when direct peer DMA is
+ * unavailable. Both referenced spaces must outlive this handle. Placement is immutable, while
+ * reservation accounting mutates the GPU space at runtime.
  */
 class dynamic_filter_replica_space final {
  public:

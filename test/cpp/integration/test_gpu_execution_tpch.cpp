@@ -244,10 +244,7 @@ class GPUExecutionFixtureBase {
     auto after_gpu_stats = sirius::test::get_transparent_execution_stats(*con);
     sirius::test::require_transparent_execution_delta(before_gpu_stats, after_gpu_stats, 1, 0, 1);
 
-    // Invariant N of the dynamic-filter domain-coverage gate (issue #1010): a build never carries
-    // more rows than its key's recorded domain bound, on every plan this suite produces. A single
-    // increment means the lineage walk accepted a row-amplifying shape or the evidence source
-    // returned something other than a true upper bound.
+    // Domain evidence must remain an upper bound for every build shape exercised by this suite.
     auto after_filter_stats = sirius::test::get_dynamic_filter_stats_snapshot(*con);
     REQUIRE(after_filter_stats.keys_build_exceeded_domain ==
             before_filter_stats.keys_build_exceeded_domain);

@@ -68,9 +68,7 @@ duckdb::JoinCondition make_condition(
   return condition;
 }
 
-/// Wrapped equality conditions whose probe and build ordinals are given per condition, so the
-/// condition index, the build ordinal, and the probe ordinal are three different numbers. Any
-/// confusion between those spaces changes an asserted value.
+// Build wrapped equalities with independently chosen probe and build ordinals.
 duckdb::vector<sirius::join_condition> make_wrapped_equalities_at(
   std::vector<std::pair<duckdb::idx_t, duckdb::idx_t>> const& probe_build_ordinals,
   duckdb::LogicalType type = duckdb::LogicalType::INTEGER)
@@ -83,7 +81,7 @@ duckdb::vector<sirius::join_condition> make_wrapped_equalities_at(
   return sirius::wrap_join_conditions(std::move(conditions));
 }
 
-/// Wrapped equality conditions over INTEGER references: condition i compares L(i) with R(i).
+// Build INTEGER equalities whose condition, probe, and build ordinals coincide.
 duckdb::vector<sirius::join_condition> make_wrapped_equalities(std::size_t count)
 {
   duckdb::vector<duckdb::JoinCondition> conditions;
@@ -93,9 +91,7 @@ duckdb::vector<sirius::join_condition> make_wrapped_equalities(std::size_t count
   return sirius::wrap_join_conditions(std::move(conditions));
 }
 
-/// The expected key for condition @p condition_index of `make_wrapped_equalities`, whose condition
-/// index, build ordinal, and probe ordinal all coincide by construction. Use
-/// `make_wrapped_equalities_at` where those three coordinates must differ.
+// Return the admitted key expected from make_wrapped_equalities.
 dynamic_filter_publish_plan::admitted_key expected_key(
   std::size_t condition_index, dynamic_filter_condition_shape shape = kDirectDirect)
 {
@@ -248,8 +244,7 @@ TEST_CASE("admission admits every legal condition in planner order",
 TEST_CASE("admission keeps partially eligible composites", "[dynamic_filter][key_admission]")
 {
   auto const conditions = make_wrapped_equalities(2);
-  // Condition 0 carries a cast on its build side: excluded, matching the runtime publisher's cast
-  // skip before producer-key admission moved to plan time. Condition 1 stays eligible.
+  // The cast build key is ineligible; the independent direct key remains eligible.
   std::vector<dynamic_filter_condition_shape> const shapes{
     {.probe = dynamic_filter_key_shape::direct, .build = dynamic_filter_key_shape::cast},
     kDirectDirect};
@@ -273,9 +268,8 @@ TEST_CASE("admission never admits an inequality condition", "[dynamic_filter][ke
 
 TEST_CASE("admission never admits a null-equal condition", "[dynamic_filter][key_admission]")
 {
-  // Obligation B1's guard. Build-side placement is sound only because this clause holds: under
-  // null-equal semantics an endpoint pruning a LEFT join's build input would add NULL-padded rows
-  // the producing join accepts, so the endpoint would change results rather than only pre-filter.
+  // Pruning a LEFT join's build input is unsafe for null-equal conditions because it can add
+  // NULL-padded rows that the producing join would otherwise match.
   duckdb::vector<duckdb::JoinCondition> raw;
   raw.push_back(
     make_condition(make_ref(0), make_ref(0), duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM));
@@ -460,9 +454,7 @@ TEST_CASE("publish plan rejects inconsistent admitted-key metadata",
   }
   SECTION("a transported threshold is accepted without re-validation")
   {
-    // The threshold is validated once, where it enters the engine
-    // (config::valid_domain_coverage_threshold). A plan is built for every GPU hash join, so it
-    // must not be able to fail planning over a value it merely transports.
+    // The plan assumes ingress validation and transports the threshold unchanged.
     REQUIRE_NOTHROW(
       dynamic_filter_publish_plan({expected_key(0)}, {}, {}, {.domain_coverage_threshold = 0.0}));
   }

@@ -32,16 +32,6 @@ namespace sirius::planner {
 
 namespace {
 
-/**
- * @brief Whether this side's shape excludes the whole condition from the scan route
- *
- * Only cast keys are excluded -- the runtime publisher did the same before producer-key admission
- * moved to plan time, keeping build and probe base keys type-equivalent -- while computed
- * (materialized) keys publish their value-correct columns.
- *
- * @param[in] shape The carried classification of one condition side
- * @return True when the condition cannot take the scan route
- */
 bool side_blocks_scan_route(op::dynamic_filter_key_shape shape) noexcept
 {
   switch (shape) {
@@ -49,21 +39,10 @@ bool side_blocks_scan_route(op::dynamic_filter_key_shape shape) noexcept
     case op::dynamic_filter_key_shape::cast: return true;
     case op::dynamic_filter_key_shape::computed: return false;
   }
-  return true;  // unreachable; conservative for an unlisted enumerator
+  return true;  // Reject unrecognized enum values conservatively.
 }
 
-/**
- * @brief Convert an AST reference column ordinal to a cuDF column ordinal
- *
- * This is the single checked conversion point between the two index spaces; they meet nowhere else.
- * Both of a condition's key ordinals pass through it, so neither side can acquire a weaker range
- * check than the other.
- *
- * @throw std::invalid_argument if the index exceeds the cuDF column ordinal range
- *
- * @param[in] bound_reference_index One key side's AST reference column ordinal
- * @return The equivalent cudf column ordinal
- */
+// Validate before narrowing an AST reference ordinal to cuDF's column-index type.
 cudf::size_type to_key_column_ordinal(std::uint32_t bound_reference_index)
 {
   constexpr auto k_max_ordinal =
@@ -76,21 +55,6 @@ cudf::size_type to_key_column_ordinal(std::uint32_t bound_reference_index)
   return static_cast<cudf::size_type>(bound_reference_index);
 }
 
-/**
- * @brief Build one admitted key from a scan-route-legal condition
- *
- * A condition is outside the scan route's legality when it is not an `equal` comparison (null-equal
- * is outside the supported scope), carries a cast on either side shape, has a side that is not a
- * plain bound reference after materialization, or has a build type with no cudf representation.
- *
- * @param[in] condition The join condition to admit
- * @param[in] shape The condition's carried pre-materialization side shapes
- * @param[in] condition_index The condition's index in original planner order
- * @param[in] domain_cardinality The build key's domain cardinality, or 0 when unknown
- * @param[in] build_side_unique_column The build child's sole proven-unique output ordinal, when
- * exactly one column is proven unique
- * @return The admitted key, or nullopt when the condition is not scan-route legal
- */
 std::optional<op::dynamic_filter_publish_plan::admitted_key> admit_scan_route_key(
   sirius::join_condition const& condition,
   op::dynamic_filter_condition_shape shape,
@@ -98,10 +62,8 @@ std::optional<op::dynamic_filter_publish_plan::admitted_key> admit_scan_route_ke
   std::size_t domain_cardinality,
   std::optional<std::size_t> build_side_unique_column)
 {
-  // Null-equal is outside the supported scope, and build-side placement depends on that: a
-  // join-edge endpoint pruning a LEFT join's build input under null-equal semantics would add
-  // NULL-padded rows the producing join accepts, so the endpoint would change results rather than
-  // only pre-filter.
+  // Under null-equal semantics, pruning a LEFT join's build input can create an accepted
+  // NULL-padded row, so null-equal keys are not admissible.
   if (condition.comparison != sirius::comparison_type::equal) { return std::nullopt; }
   if (side_blocks_scan_route(shape.probe) || side_blocks_scan_route(shape.build)) {
     return std::nullopt;
@@ -116,11 +78,8 @@ std::optional<op::dynamic_filter_publish_plan::admitted_key> admit_scan_route_ke
 
   auto const build_key_ordinal = to_key_column_ordinal(build_ref.column_index);
 
-  // Every use of an admitted key starts a discovery trace at its probe ordinal, so the probe side
-  // must be a bound reference too; a condition without one could never produce a filter on any
-  // route. The probe type may still have no cuDF representation -- that EMPTY keeps its
-  // zone-map-suppression meaning on bindings and its type-equality role in
-  // direct_route_admissible.
+  // Discovery requires a real probe entry ordinal. EMPTY preserves an unrepresentable probe type
+  // for zone-map suppression and direct-route rejection.
   auto const& probe_side = *condition.left;
   if (!probe_side.is_reference()) { return std::nullopt; }
   auto const probe_key_ordinal  = to_key_column_ordinal(probe_side.as_reference().column_index);
@@ -191,7 +150,6 @@ std::vector<op::dynamic_filter_publish_plan::admitted_key> admit_dynamic_filter_
       "with the join conditions");
   }
 
-  // Admit in a single deterministic pass over the conditions alone, in planner order.
   std::vector<op::dynamic_filter_publish_plan::admitted_key> admitted_keys;
   for (std::size_t condition_index = 0; condition_index < conditions.size(); ++condition_index) {
     auto const domain_cardinality = condition_index < condition_domain_cardinalities.size()

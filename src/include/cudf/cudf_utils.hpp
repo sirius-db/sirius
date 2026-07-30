@@ -216,13 +216,12 @@ inline cudf::data_type get_cudf_type(const logical_type& t)
 /**
  * @brief Map a sirius::logical_type to its cudf::data_type, or nothing when it has no mapping
  *
- * For callers to whom an unmapped type is a routine classification rather than an error --
- * plan-time admission deciding whether a key can carry a GPU filter, for instance. Using @ref
- * get_cudf_type for that decision forces a `catch` that also swallows unrelated failures such as
- * `std::bad_alloc`.
+ * For callers to whom conversion failure is a routine classification rather than an error, such
+ * as plan-time admission of GPU filter keys. Any exception from @ref get_cudf_type is treated as an
+ * unsupported conversion.
  *
  * @param[in] t The Sirius type to map
- * @return The cuDF type, or `std::nullopt` when @p t has no cuDF representation
+ * @return The cuDF type, or `std::nullopt` when conversion fails
  */
 [[nodiscard]] inline std::optional<cudf::data_type> try_get_cudf_type(
   logical_type const& t) noexcept

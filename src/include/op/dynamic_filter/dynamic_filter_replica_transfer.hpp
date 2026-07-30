@@ -30,7 +30,7 @@ namespace sirius::op::detail {
 /**
  * @brief The route selected for a dynamic-filter replica transfer
  *
- * @note This is currently only used for testing and logging.
+ * @note Exposed for transfer tests and logging.
  */
 enum class replica_transfer_route {
   none,
@@ -42,7 +42,7 @@ enum class replica_transfer_route {
 /**
  * @brief The transfer policy
  *
- * @note This is currently only used for testing.
+ * @note Exposed for transfer-route tests.
  */
 enum class replica_transfer_policy {
   automatic,
@@ -65,6 +65,8 @@ enum class replica_transfer_policy {
  * completes both dependent legs before returning so its borrowed blocks can immediately return to
  * the pool. An enqueue or synchronization failure propagates.
  *
+ * @throw std::invalid_argument if either memory space has the wrong tier, the source space belongs
+ * to a different device, or host staging is required but unavailable
  * @param[out] destination Device allocation that receives the copied bytes
  * @param[in] destination_device Device owning @p destination and @p destination_stream
  * @param[in] source Finalized dynamic-filter storage to copy

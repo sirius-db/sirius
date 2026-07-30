@@ -18,14 +18,11 @@
 
 /**
  * @file
- * @brief Test-only parity oracle over DuckDB's join-filter pushdown metadata.
+ * @brief Test-only parity oracle over DuckDB's join-filter pushdown metadata
  *
- * Production discovery is Sirius-owned: `sirius_plan_comparison_join` walks the built physical
- * probe subtree per admitted key (`dynamic_filter_target_discovery.hpp`) and reads no DuckDB
- * dynamic-filter metadata. This adapter survives only as the parity oracle's vocabulary: the
- * discovery parity test extracts what DuckDB's optimizer recorded and cross-checks Sirius's own
- * discovery against it. The translation unit is linked into the test target only, so a production
- * call site fails at link time.
+ * Parity tests snapshot DuckDB optimizer metadata and compare it with Sirius-owned target
+ * discovery. Production code does not consume these values, and the adapter translation unit is
+ * linked only into the test target.
  *
  * The oracle data flow is:
  *
@@ -145,11 +142,8 @@ class duckdb_probe_target_candidate final {
  *
  * (Runtime mirrors this: one filter is built per ordinal j and pushed to every target.)
  *
- * `sirius_plan_comparison_join` consumes these values and compacts the admitted equality keys into
- * a dense array, so the filter ordinal above is a plan-construction alignment index that admission
- * discards. The persisted key coordinates -- planner condition index, admitted-key index, build-key
- * ordinal, and channel push ordinal -- are distinct coordinate spaces documented by
- * `dynamic_filter_publish_plan`. Their named integer fields identify those spaces.
+ * Parity tests use this dense filter ordinal only while aligning DuckDB metadata. The stored
+ * condition index and per-target scan-column position remain distinct coordinate spaces.
  */
 class duckdb_join_filter_candidate final {
  public:

@@ -66,6 +66,7 @@ struct dynamic_filter_publication_outcome {
  * Before accessing a build column, the function validates its ordinal against @p build_view; an
  * out-of-range ordinal fails the publication attempt with `std::logic_error`.
  *
+ * @pre @p plan is enabled
  * @throw std::runtime_error if the source GPU cannot be identified
  * @throw std::logic_error if an admitted key's build ordinal lies outside `build_view`, if the
  * source GPU is absent from the plan's replica spaces, or if a constructed filter does not
@@ -75,7 +76,7 @@ struct dynamic_filter_publication_outcome {
  * placements)
  * @param[in] build_view The complete build table to reduce / build membership over; admitted build
  * key ordinals index its columns
- * @param[in] stream Durable build-memory-space stream used for filter construction
+ * @param[in] stream Stream used for filter construction
  * @return Counts describing what the attempt constructed, skipped, and pushed
  */
 [[nodiscard]] dynamic_filter_publication_outcome publish_dynamic_filters(

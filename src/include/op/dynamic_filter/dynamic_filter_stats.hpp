@@ -25,8 +25,8 @@ namespace sirius::op {
  * @brief Plain copyable snapshot of @ref dynamic_filter_stats
  *
  * Field meanings are documented once, on the atomic aggregate. Each field is individually coherent
- * at any time; cross-field comparisons are meaningful only after the query completes, when
- * publication tasks have quiesced.
+ * at any time; cross-field comparisons are meaningful only while no publisher is updating the
+ * counters.
  */
 struct dynamic_filter_stats_snapshot {
   std::uint64_t producers_enabled = 0;
@@ -92,6 +92,11 @@ struct dynamic_filter_stats {
   std::atomic<std::uint64_t> publications_skipped_targets_drained{0};
   std::atomic<std::uint64_t> filters_pushed{0};  ///< Accepted pushes; drain-dependent
 
+  /**
+   * @brief Read every counter with relaxed ordering
+   *
+   * @return A copyable, non-transactional snapshot
+   */
   [[nodiscard]] dynamic_filter_stats_snapshot snapshot() const noexcept
   {
     return dynamic_filter_stats_snapshot{

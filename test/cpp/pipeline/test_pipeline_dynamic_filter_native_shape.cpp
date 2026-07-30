@@ -72,10 +72,7 @@ class pushdown_switch_guard {
   bool _original;
 };
 
-//! RAII toggle for the temporary SIP switch, set through SQL as the integration suite's guards do.
-//! The SET mutates the shared SiriusContext, which outlives this test, so the destructor restores
-//! whatever value the constructor found rather than the default -- a literal restore would clobber
-//! an enclosing guard.
+// Set SIP for one scope and restore the previous connection setting.
 class sip_switch_guard {
  public:
   sip_switch_guard(duckdb::Connection& con, bool enabled)
@@ -109,9 +106,7 @@ bool contains(const std::string& haystack, const std::string& needle)
   return haystack.find(needle) != std::string::npos;
 }
 
-//! Walk every operator reachable from a converted pipeline set and hand each DYNAMIC_FILTER
-//! endpoint to `check` exactly once. Returns how many distinct endpoints were seen, so a caller
-//! can reject a vacuous pass.
+// Visit each distinct dynamic-filter endpoint in the converted pipelines.
 template <typename Fn>
 std::size_t for_each_endpoint(sirius::pipeline::pipeline_conversion_result& result, const Fn& check)
 {
@@ -137,8 +132,7 @@ std::size_t for_each_endpoint(sirius::pipeline::pipeline_conversion_result& resu
   return count;
 }
 
-//! The invariant every endpoint must satisfy: it masks a plain batch, so its input must be
-//! pipelineable -- never the partitioned data a PARTITION emits.
+// Endpoints consume pipelineable batches, never PARTITION output.
 void require_not_fed_partitioned_data(sirius::op::sirius_physical_operator* endpoint)
 {
   REQUIRE(endpoint->children.size() == 1);
@@ -149,10 +143,7 @@ void require_not_fed_partitioned_data(sirius::op::sirius_physical_operator* endp
 
 }  // namespace
 
-//! A selective build over `part` feeding a `lineitem` probe arms the Sirius discovery walk
-//! (build-filter evidence present), which binds the join key into the lineitem seq_scan. The
-//! duckdb-native GPU scan must then carry a DYNAMIC_FILTER operator above it (conversion only,
-//! no GPU execution).
+// A selective part build binds a dynamic-filter endpoint to the lineitem GPU scan.
 TEST_CASE("duckdb-native scans consume dynamic filters", "[integration][pipeline][dynamic_filter]")
 {
   REQUIRE(sirius::test::g_integration_env != nullptr);
@@ -189,13 +180,7 @@ TEST_CASE("duckdb-native scans consume dynamic filters", "[integration][pipeline
   }
 }
 
-//! The endpoint applies its mask to a plain batch, so it must be fed pipelineable data -- never the
-//! partitioned data a PARTITION produces. `wrap_join_child` wraps whatever occupies a join's child
-//! slot as `CONCAT -> PARTITION -> <that child>`, so an endpoint already sitting in that slot lands
-//! on the source side of the PARTITION. Issue #1010's SIP placement depends on that holding for an
-//! endpoint inserted anywhere in a join's subtree, including on a build input, so pin it here: if
-//! the wrapper passes are ever reordered, this fails loudly instead of silently mis-shaping the
-//! plan. Conversion only -- no GPU execution.
+// Verify that join wrapping leaves endpoints on the source side of PARTITION.
 TEST_CASE("the dynamic-filter endpoint is never fed partitioned data",
           "[integration][pipeline][dynamic_filter]")
 {
@@ -225,21 +210,8 @@ TEST_CASE("the dynamic-filter endpoint is never fed partitioned data",
   REQUIRE(endpoints_checked > 0);
 }
 
-//! Same invariant, on the plan shapes SIP placement (issue #1010) introduces.
-//!
-//! `wrap_join_child` wraps `join.children[idx]` as `CONCAT -> PARTITION -> <child>` for **both**
-//! children (`wrap_join`, `sirius_physical_plan_generator.cpp:506-515`), and `wrap_hash_group_by`
-//! inserts its own PARTITION, so an endpoint already occupying either slot lands on the source
-//! side of the PARTITION rather than being fed partitioned data.
-//!
-//! TPC-H Q5 and a Q3-shaped GROUP BY are the carriers: both are large enough that SIP places
-//! endpoints somewhere in them under whatever plan the optimizer picks. Conversion only, no GPU
-//! execution.
-//!
-//! This suite asserts only order-independent facts. An endpoint's child type cannot tell the two
-//! routes apart -- a join-edge endpoint over a bare build scan also has a scan child -- and its
-//! position depends on a plan shape nothing here pins, so the SIP-specific assertion is the
-//! endpoint count delta.
+// Verify the endpoint input contract across join and group-by wrappers. Q5 also verifies that SIP
+// increases the endpoint count without assuming an optimizer-selected placement.
 TEST_CASE("dynamic-filter endpoints obey the data contract on SIP-shaped plans",
           "[integration][pipeline][dynamic_filter]")
 {
@@ -275,11 +247,8 @@ TEST_CASE("dynamic-filter endpoints obey the data contract on SIP-shaped plans",
 
   SECTION("Q5: SIP adds endpoints, and every endpoint obeys the data contract")
   {
-    // Q5's physical shape is optimizer-owned -- join order and build-side selection both run free
-    // here -- so which side any one endpoint lands on is not assertable in this suite. Build-side
-    // placement is pinned deterministically by the LEFT section of `test_plan_tree_shape.cpp`,
-    // which holds the relevant optimizer passes back. What survives here is order-independent: SIP
-    // adds endpoints, and each one is fed pipelineable data.
+    // Assert only optimizer-independent properties: SIP adds endpoints and each consumes
+    // pipelineable data.
     std::size_t endpoints_off = 0;
     {
       sip_switch_guard sip_off(con, /*enabled=*/false);

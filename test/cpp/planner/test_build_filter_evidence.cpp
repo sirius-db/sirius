@@ -17,11 +17,9 @@
 /*
  * Unit tests for `planner/dynamic_filter/build_filter_evidence.hpp`.
  *
- * `build_subtree_is_filtering` is a mirror of DuckDB's
- * `JoinFilterPushdownOptimizer::IsFiltering` (join_filter_pushdown_optimizer.cpp:184-204): true
- * for a LOGICAL_GET with table filters, a LOGICAL_FILTER, a LOGICAL_TOP_N, or any subtree
- * containing one. These cases pin the mirrored semantics on hand-built logical trees; the
- * discovery parity suite additionally compares the two functions on real optimized plans.
+ * `build_subtree_is_filtering` mirrors DuckDB's join-filter evidence rules for filtered scans,
+ * filters, top-N operators, and containing subtrees. The parity suite compares both implementations
+ * on optimized plans.
  */
 
 #include "planner/dynamic_filter/build_filter_evidence.hpp"
@@ -43,7 +41,7 @@ namespace {
 
 using sirius::planner::build_subtree_is_filtering;
 
-/// A minimal constructible LogicalGet; the walk never invokes the table function.
+// Minimal constructible scan; the evidence walk never invokes its table function.
 duckdb::unique_ptr<duckdb::LogicalGet> make_get()
 {
   return duckdb::make_uniq<duckdb::LogicalGet>(

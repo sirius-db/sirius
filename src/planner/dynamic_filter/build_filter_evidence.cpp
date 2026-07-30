@@ -22,8 +22,7 @@ namespace sirius::planner {
 
 bool build_subtree_is_filtering(duckdb::LogicalOperator const& op)
 {
-  // Mirror of duckdb/src/optimizer/join_filter_pushdown_optimizer.cpp IsFiltering: the three
-  // true-cases below, or any child subtree containing one.
+  // Match DuckDB's join-filter pushdown predicate.
   switch (op.type) {
     case duckdb::LogicalOperatorType::LOGICAL_GET:
       return !op.Cast<duckdb::LogicalGet>().table_filters.filters.empty();

@@ -18,9 +18,8 @@
  * @file dynamic_filter_source_policy.hpp
  * @brief Representation and gate policy for dynamic-filter publication
  *
- * These pure functions select a membership representation and decide whether key coverage makes
- * publication unhelpful. The publisher (`dynamic_filter_publisher.hpp`) supplies runtime sizes and
- * capability checks, then owns filter construction, replication, and fan-out.
+ * The publisher (`dynamic_filter_publisher.hpp`) supplies runtime inputs and owns filter
+ * construction, replication, and fan-out.
  */
 
 #pragma once
@@ -34,7 +33,7 @@ namespace sirius::op {
  * @brief Membership representation chosen for one admitted build key
  */
 enum class membership_filter_kind : std::uint8_t {
-  none,           ///< The key type carries no membership representation
+  none,           ///< No eligible membership representation
   small_in_list,  ///< Exact list scanned linearly; no hash build
   hash_in_list,   ///< Exact hash set, chosen when it fits the smallest probe GPU's L2 cache
   bloom           ///< Probabilistic fallback for sets too large to fit L2
@@ -43,8 +42,8 @@ enum class membership_filter_kind : std::uint8_t {
 /**
  * @brief Everything the representation choice depends on
  *
- * Contains the sizes and capability flags passed to `choose_membership_filter()`. The caller
- * derives each `supports_*` flag from the runtime build column.
+ * Contains the cache budget, size estimate, and capability flags passed to
+ * `choose_membership_filter()`. The small-list capability also incorporates its row-count limit.
  */
 struct membership_choice_inputs {
   std::size_t build_rows               = 0;
@@ -61,7 +60,7 @@ struct membership_choice_inputs {
  * The function selects the small exact list when supported, otherwise the exact hash set when its
  * footprint fits the smallest probe GPU's L2 cache, otherwise a Bloom filter when supported.
  *
- * @param[in] inputs Row count, cache budget, size estimate, and per-kind capability answers
+ * @param[in] inputs Cache budget, size estimate, and per-kind capability answers
  * @return The representation to construct, or `membership_filter_kind::none`
  */
 [[nodiscard]] constexpr membership_filter_kind choose_membership_filter(
@@ -88,8 +87,8 @@ struct membership_choice_inputs {
  * means untraceable and disables the gate
  * @param[in] build_key_proven_unique Whether the key is proven unique in its base relation; false
  * disables the gate
- * @param[in] threshold Fraction of the domain a build may cover and still publish; above 1.0 the
- * gate is disabled outright
+ * @param[in] threshold Coverage fraction at or above which the key is skipped; above 1.0 disables
+ * the gate
  * @return True when the key should be skipped
  */
 [[nodiscard]] constexpr bool domain_coverage_gate_fires(std::size_t build_rows,
@@ -108,15 +107,13 @@ struct membership_choice_inputs {
  *
  * A `[min, max]` bound spanning most of the key domain prunes no row group.
  *
- * No caller passes a domain yet: activation awaits base-column value-range evidence, because the
- * domain must be a value span -- the ratio is span(build) / span(base column), and a row-count
- * domain would be dimensionally unsound and over-fire on sparse integer keys. A 0 domain disables
- * this gate.
+ * The publisher has no base-column value-range domain and does not call this function. A row-count
+ * domain cannot substitute for a value span. A 0 domain disables the gate.
  *
  * @param[in] min_value Lowest build key value
  * @param[in] max_value Highest build key value
  * @param[in] domain_cardinality Unfiltered span of the key's domain; 0 disables the gate
- * @param[in] threshold Fraction of the domain the range may span and still publish
+ * @param[in] threshold Span fraction at or above which the zone map is skipped
  * @return True when the zone map should be skipped
  */
 [[nodiscard]] constexpr bool zone_map_range_gate_fires(double min_value,

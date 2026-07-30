@@ -75,7 +75,7 @@ class sirius_dynamic_filter {
   [[nodiscard]] virtual sirius_dynamic_filter_kind kind() const = 0;
 
   /**
-   * @brief True when this filter has a replica local to @p device_id
+   * @brief Whether this filter has a replica on the requested device
    *
    * Consumers use this cheap guard before lowering an AST; runtime-mask filters also validate the
    * device in @ref compute_mask.
@@ -104,6 +104,8 @@ class sirius_device_replicable {
    * Membership filters reserve destination capacity for construction; after unused capacity is
    * returned, their completed allocations remain accounted. Replicas retain only allocator/stream
    * views whose lifetime is governed by @ref dynamic_filter_replica_space.
+   *
+   * @param[in] spaces Planned GPU and host-staging placements
    */
   virtual void replicate_to_devices(std::span<dynamic_filter_replica_space const> spaces) = 0;
 };
@@ -173,8 +175,8 @@ struct zone_map_entry {
  *
  * Lowers to `OR_i ( min_i <= col AND col <= max_i )` (or strict variants based on `inclusive_*`).
  *
- * `dynamic_filter_publisher` currently supplies one global range per key. The representation also
- * accepts multiple ranges and combines them with OR.
+ * `dynamic_filter_publisher` supplies one global range per key. The representation also accepts
+ * multiple ranges and combines them with OR.
  *
  * @pre Every bound has the same @ref cudf::data_type as the consumer column.
  */
@@ -186,6 +188,7 @@ class sirius_dynamic_zone_map_filter final : public sirius_dynamic_filter,
    * @brief Construct a zone-map filter
    *
    * @throw std::invalid_argument if @p zones is empty or any zone has a null bound
+   * @throw std::runtime_error if the current CUDA device cannot be identified
    *
    * @param[in] zones Non-empty zone vector with non-null bounds; ownership transfers to the filter
    * @param[in] inclusive_min Whether the lower comparison includes the bound
@@ -283,6 +286,10 @@ class sirius_dynamic_in_list_filter final : public sirius_dynamic_filter,
    * `dynamic_filter_publisher` satisfies this by retaining the build batch and synchronizing before
    * replication.
    *
+   * @throw std::invalid_argument if @p keys is not a null-free INT32 or INT64 column
+   * @throw std::runtime_error if the current CUDA device cannot be identified
+   * @throw std::logic_error if the validated key type changes during construction
+   *
    * @param[in] keys Null-free INT32 or INT64 build keys
    * @param[in] stream Stream used to build the persistent set
    * @param[in] mr Device memory resource backing the set
@@ -331,9 +338,12 @@ class sirius_dynamic_in_list_filter final : public sirius_dynamic_filter,
    * @brief Estimated device footprint (bytes) of the `cuco::static_set` built over an IN-list of @p
    * num_keys keys of @p key_type
    *
-   * This is the structure that must stay L2-resident for the per-row membership probe to run at
-   * cache bandwidth (capacity is roughly num_keys / load_factor slots, each `sizeof(key)`).
-   * Consumed by the producer's L2-fit filter-kind policy.
+   * The producer uses this estimate for its L2-fit representation policy. Capacity is approximately
+   * `num_keys / load_factor` slots.
+   *
+   * @param[in] num_keys Number of keys in the set
+   * @param[in] key_type Key storage type
+   * @return Estimated set allocation size in bytes
    */
   [[nodiscard]] static std::size_t estimated_set_bytes(std::size_t num_keys,
                                                        cudf::data_type key_type) noexcept;
@@ -381,6 +391,9 @@ class sirius_dynamic_small_in_list_filter final : public sirius_dynamic_filter,
    * @pre The backing device storage for @p keys remains valid until the snapshot copy enqueued on
    * @p stream completes. The publisher satisfies this precondition by pinning the build
    * representation and synchronizing @p stream before fan-out.
+   *
+   * @throw std::invalid_argument if @p keys is unsupported
+   * @throw std::runtime_error if the current CUDA device cannot be identified
    *
    * @param[in] keys The build keys (INT32/INT64, no nulls; the producer restricts the count to <=
    * @ref k_max_keys). The column-view object need only remain valid for the constructor call.
@@ -465,6 +478,8 @@ class sirius_dynamic_bloom_filter final : public sirius_dynamic_filter,
    * synchronizes before replication.
    *
    * @throw std::invalid_argument if `keys.type()` is unsupported
+   * @throw std::runtime_error if the current CUDA device cannot be identified
+   * @throw std::logic_error if the validated key type changes during construction
    *
    * @param[in] keys INT32 or INT64 build keys
    * @param[in] stream Stream used to build the Bloom filter
@@ -507,6 +522,9 @@ class sirius_dynamic_bloom_filter final : public sirius_dynamic_filter,
    * filter's fixed bits-per-key budget
    *
    * Consumed by the producer's L2-fit filter-kind policy.
+   *
+   * @param[in] num_keys Number of keys represented by the filter
+   * @return Estimated bit-array size in bytes
    */
   [[nodiscard]] static std::size_t estimated_bytes(std::size_t num_keys) noexcept;
 
@@ -578,8 +596,9 @@ class sirius_dynamic_filter_set {
    *
    * A scan marks its hive-partition columns here: those are pruned at the file level and the values
    * are not in the decoded data, so a dynamic filter on them must never reach the consumer. Indices
-   * are in the consumer's output-column space, the same space @ref push_filter stores. Wiring-time
-   * setup -- call before any producer publishes (not synchronized against push_filter).
+   * are in the consumer's output-column space, the same space @ref push_filter stores. Call before
+   * publication; the function blocks future pushes for these columns but does not remove filters
+   * already stored.
    */
   void ignore_columns(std::vector<std::size_t> const& cols);
 

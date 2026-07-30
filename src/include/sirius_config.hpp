@@ -65,12 +65,8 @@ constexpr double DEFAULT_MARK_JOIN_BUILD_SWITCH_RATIO = 8.0;
 /**
  * @brief Accepted range for `dynamic_filter_domain_coverage_threshold`
  *
- * Every surface that accepts this setting -- the YAML configuration reader and the SQL `SET`
- * handler -- validates through this one predicate, so the surfaces cannot drift apart. A
- * non-positive value would make the coverage gate suppress every filter and a NaN would disable
- * the gate silently, so both are rejected where the value enters rather than where it is used:
- * the publication plan that transports it is built for every GPU hash join and must not be able
- * to fail.
+ * The YAML reader and SQL `SET` handler use this predicate to reject non-finite and non-positive
+ * values at configuration ingress.
  */
 struct valid_domain_coverage_threshold {
   [[nodiscard]] bool operator()(double value) const noexcept
@@ -138,18 +134,13 @@ struct operator_params {
   /// clustered-keyset joins whose narrow key range is runtime-determined.
   bool enable_dynamic_zone_map_filter = false;
 
-  /// TEMPORARY dark-launch toggle for sideways information passing (SIP) [the extension to phase 1
-  /// dynamic filters]. This and the other dynamic-filter switch (enable_dynamic_filter_pushdown)
-  /// collapse into a single flag when this work merges.
+  /// Enable join-edge dynamic-filter targets. Requires `enable_dynamic_filter_pushdown`.
   bool enable_dynamic_filter_sip = false;
 
-  /// Skip publishing a key's membership filter when the build covers at least this fraction of
-  /// the key's unfiltered base-table row bound. The gate fires only for build keys proven unique
-  /// in their base relation, with evidence from DuckDB-native table scans; everywhere else it is
-  /// inert and the key publishes normally. A value above 1.0 is the explicit disabled state (the
-  /// rollback lever); exactly 1.0 fires only at full coverage. The zone-map range gate receives
-  /// no domain -- its activation awaits base-column value-range evidence -- so this setting
-  /// currently governs the membership gate only.
+  /// Skip all publication for a key when the build covers at least this fraction of its unfiltered
+  /// base-table row bound. The gate applies only to proven-unique keys with DuckDB-native
+  /// cardinality evidence. Values above 1.0 disable it; 1.0 skips full coverage. The separate
+  /// zone-map range gate remains inactive because no base-column value range is available.
   double dynamic_filter_domain_coverage_threshold = 0.9;
 
   /// Consumer-side scan gate: disable a scan's post-decode dynamic filtering once a measured split

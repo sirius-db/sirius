@@ -28,20 +28,14 @@
 
 namespace sirius::test {
 
-/// Snapshot of the connection's `SiriusContext`-owned dynamic-filter counters. Tests assert
-/// deltas around a query, and only the deterministic-policy family as equalities -- the
-/// opportunistic-delivery family races with probe-side draining and supports directional
-/// assertions only (see `op/dynamic_filter/dynamic_filter_stats.hpp`).
+/// Returns the dynamic-filter counter snapshot for @p con.
 inline sirius::op::dynamic_filter_stats_snapshot get_dynamic_filter_stats_snapshot(
   duckdb::Connection& con)
 {
   return get_registered_sirius_context(con)->get_dynamic_filter_stats_snapshot();
 }
 
-/// RAII disable of the domain-coverage gate: a threshold above 1.0 is the gate's explicit disabled
-/// state (the documented rollback lever). The SET mutates the shared SiriusContext, which outlives
-/// any one test, so the destructor restores whatever value the constructor found rather than the
-/// default -- a literal restore would clobber an enclosing guard.
+/// Disables the domain-coverage gate and restores the previous threshold on destruction.
 struct coverage_gate_disable_guard {
   explicit coverage_gate_disable_guard(duckdb::Connection& c)
     : con(c),

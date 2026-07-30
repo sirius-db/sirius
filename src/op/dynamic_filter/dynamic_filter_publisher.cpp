@@ -127,7 +127,7 @@ dynamic_filter_publication_outcome publish_dynamic_filters(dynamic_filter_publis
   auto const build_rows    = static_cast<std::size_t>(build_view.num_rows());
   auto const l2_bytes      = device_l2_cache_bytes(plan.replica_spaces());
 
-  // Build up to 2 complementary filters per admitted key:
+  // Build up to two complementary filters per admitted key:
   //  1) a zone-map (read-time ROW-GROUP pruning, the only path that cuts scan I/O)
   //  2) a post-decode membership filter: linear-scan IN-list for a tiny build, otherwise a
   //     hash-set IN-list or Bloom filter chosen by L2-cache fit.
@@ -166,10 +166,8 @@ dynamic_filter_publication_outcome publish_dynamic_filters(dynamic_filter_publis
       continue;
     }
 
-    // Validate the plan/runtime key mapping in every build: a silently drifted ordinal or type
-    // could construct a filter from the wrong same-typed column and remove valid probe rows, so
-    // an inconsistency fails this publication attempt loudly (the caller records FAILED) instead
-    // of passing as a successful filter. Unreachable for consistent planner output.
+    // An out-of-range ordinal is a plan invariant failure. A type mismatch remains an advisory
+    // per-key skip because the authoritative join still checks the result.
     if (admitted_key.build_key_ordinal >= build_view.num_columns()) {
       throw std::logic_error(
         "[publish_dynamic_filters] An admitted key's build ordinal lies outside the runtime build "
@@ -192,9 +190,7 @@ dynamic_filter_publication_outcome publish_dynamic_filters(dynamic_filter_publis
     }
     per_key_build_type[admitted_key_index] = col.type();
 
-    // (1) Zone-map -- read-time row-group pruning. This only helps when build keys are
-    // correlatively clustered with the filter column(s), so it is off by default (TPC-H keys are
-    // scattered).
+    // Zone maps can prune Parquet row groups or apply as row masks on native scans.
     if (plan.emit_zone_map_filters()) {
       nvtx3::scoped_range vr{"dynfilter::build_zone_map"};
       auto min_s = cudf::reduce(col,

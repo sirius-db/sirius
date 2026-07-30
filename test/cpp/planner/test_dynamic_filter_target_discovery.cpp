@@ -18,19 +18,9 @@
  * Unit tests for the dynamic-filter target-discovery walk
  * (`planner/dynamic_filter/dynamic_filter_target_discovery.hpp`).
  *
- * The descent rules -- projection_reference_input, group_by_key_input, and join_block_descent --
- * are pure functions of plain arguments, so they are exercised directly and exhaustively. The
- * dispatch (descent_steps), the classification (trace_probe_key), and the splice driver
- * (place_endpoint) are exercised over PROJECTION and FILTER chains, which are cheap to construct
- * and give full control over the traced ordinal at each hop.
- *
- * HASH_JOIN and HASH_GROUP_BY operators are deliberately NOT constructed here: their constructors
- * build cuDF aggregate definitions / output blocks and are heavy and fragile to stand up in a unit
- * test. Their descent_steps cases are thin delegations to join_block_descent / group_by_key_input
- * (both tested below), and the operator-reading paths are covered end to end by the plan-shape and
- * pipeline-shape tests. Rows that read only base-class state (UNION's fan-out, TABLE_SCAN's
- * terminal classification) are pinned through bare base-class operators carrying the type tag,
- * because physical set operations have no constructing planner yet.
+ * Pure descent rules are tested directly. Lightweight projection and filter trees cover dispatch,
+ * trace classification, and endpoint splicing; plan-shape tests cover concrete join and aggregate
+ * operators.
  */
 
 #include "expression/ast/cast.hpp"
@@ -79,8 +69,7 @@ std::unique_ptr<sirius::ast::node> make_reference(std::uint32_t col)
   return std::make_unique<sirius::ast::node>(sirius::ast::reference{col, int_type()});
 }
 
-// A computed projection output: a cast of a reference. Not a plain reference, so the projection
-// rule must refuse it (crossing a cast is a deferred follow-up in the design).
+// A cast is not a pass-through projection reference, so tracing terminates here.
 std::unique_ptr<sirius::ast::node> make_cast(std::uint32_t col)
 {
   return std::make_unique<sirius::ast::node>(
@@ -132,9 +121,7 @@ duckdb::unique_ptr<sirius::op::sirius_physical_filter> make_gather_filter(
     std::move(types), make_reference(0), /*estimated_cardinality=*/0, std::move(output_indices));
 }
 
-// A bare base-class operator wearing a type tag whose descent row reads only base-class state
-// (children / types). UNION has no constructing planner yet, and TABLE_SCAN's full constructor
-// would drag in table-function machinery this suite does not need.
+// Use a tagged base operator where descent reads only base-class children and types.
 duckdb::unique_ptr<sirius::op::sirius_physical_operator> make_typed_double(
   sirius::op::SiriusPhysicalOperatorType type, std::size_t width)
 {
@@ -159,8 +146,7 @@ auto capturing_endpoint_factory(sirius::op::sirius_physical_operator const*& sit
   };
 }
 
-// The real endpoint operator over an empty channel. Constructing it stores members and a gate
-// threshold -- no device work -- so it stays within this file's no-heavy-constructor rule.
+// Construct a real endpoint over an empty channel without device work.
 duckdb::unique_ptr<sirius::op::scan::sirius_physical_dynamic_filter> make_endpoint_operator(
   std::size_t width)
 {
@@ -312,8 +298,8 @@ TEST_CASE(
 
   SECTION("every other join type refuses the build block")
   {
-    // SEMI/ANTI emit no build block; MARK's build-block slot is the synthetic mark; the
-    // right-preserving and SINGLE types are deferred/unsupported.
+    // SEMI/ANTI emit no build block, MARK emits a synthetic mark, and the remaining join types do
+    // not safely support build-block descent.
     for (auto const join_type : {duckdb::JoinType::SEMI,
                                  duckdb::JoinType::ANTI,
                                  duckdb::JoinType::MARK,
@@ -500,9 +486,8 @@ TEST_CASE("trace_probe_key reports the refusing node as the terminal",
 TEST_CASE("trace_probe_key yields one terminal per UNION branch, mixed kinds included",
           "[dynamic_filter][placement][discovery]")
 {
-  // Branch 0 bottoms at a TABLE_SCAN through a projection remap; branch 1 refuses at a DUMMY_SCAN.
-  // One admitted key thus fans out to one terminal per branch (a future scan bind plus an
-  // endpoint site), which is the publish-plan model's one-key-to-many-targets shape.
+  // Branch 0 reaches a TABLE_SCAN through a projection remap; branch 1 stops at a DUMMY_SCAN. One
+  // admitted key therefore produces a scan-binding site and an endpoint site.
   auto scan = make_typed_double(sirius::op::SiriusPhysicalOperatorType::TABLE_SCAN, /*width=*/6);
   auto* scan_node = scan.get();
   auto branch0 =

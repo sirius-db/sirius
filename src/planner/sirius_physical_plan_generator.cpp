@@ -224,10 +224,7 @@ build_duckdb_native_table_info(sirius::op::sirius_physical_table_scan& scan_op,
 //! behavioral input here: a parquet scan already evaluated AST-capable filters (zone maps)
 //! through the reader's `set_filter`, so it wraps in `membership_masks_only`; a duckdb-native
 //! scan has no read-time dynamic path, so it wraps in `include_ast_row_masks` to also evaluate
-//! zone maps row-wise. The `has_producers()` consult enforces the elision invariant: a channel
-//! that never gained a producer is shed before pipelines are built. The discovery walk attaches a
-//! channel and registers its producer in one step, so every attached channel has a producer by
-//! construction; the consult stays as the enforcement against future attach paths. This runs
+//! zone maps row-wise. Channels without registered producers are elided. Registration finishes
 //! after the whole tree is built, so `has_producers()` is settled.
 template <typename InfoT>
 duckdb::unique_ptr<sirius::op::sirius_physical_operator> make_gpu_scan_leaf(

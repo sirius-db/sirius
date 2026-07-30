@@ -16,25 +16,10 @@
 
 /**
  * @file test_build_key_domain.cpp
- * @brief Positional lineage-walk tests for `sirius::planner::build_key_domain`
+ * @brief Tests positional lineage resolution for build-key domains.
  *
- * CPU-only: every case runs against hand-built logical trees with a stub cardinality source, no
- * ClientContext and no GPU. What only this level catches is resolving the WRONG `LogicalGet`, or
- * the right one at the wrong ordinal -- downstream a wrong scan still yields a plausible number
- * and every other test passes.
- *
- * Fixture discipline: index spaces are drawn from disjoint ranges so a crossed space changes an
- * asserted value -- stub cardinalities are `1000 * (table_index + 1)`, and projection maps are
- * chosen so identity and mapped resolution disagree for every mapped case.
- *
- * Mutation contract: each of these one-line mutations must fail at least one case in this file.
- *  1. reading `condition.left` instead of `condition.right` -- traces the probe side;
- *  2. dropping the `projection_map` remap in FILTER or ORDER_BY;
- *  3. treating an AGGREGATE output ordinal as a group ordinal;
- *  4. continuing through an INNER join;
- *  5. restoring a recurse-into-every-child `default:` arm;
- *  6. mislocating a join ordinal's block (left/right/mark);
- *  7. accepting a `LOGICAL_GET` with non-empty `projected_input`.
+ * The CPU-only fixtures use disjoint ordinal and cardinality ranges so resolving the wrong scan or
+ * coordinate produces an unmistakable result.
  */
 
 #include "planner/dynamic_filter/build_key_domain.hpp"
@@ -71,8 +56,7 @@ using sirius::planner::detail::resolve_pass_through_scan;
 
 namespace {
 
-/// Every table's stub cardinality is a distinct value from a disjoint range, so resolving the
-/// wrong GET is loud rather than plausible.
+// Assign each table a distinct cardinality so resolving the wrong scan is visible.
 constexpr std::size_t stub_cardinality_of(duckdb::idx_t table_index)
 {
   return std::size_t{1000} * (static_cast<std::size_t>(table_index) + 1);
@@ -89,7 +73,7 @@ struct refusing_source {
   std::optional<std::size_t> operator()(duckdb::LogicalGet const&) const { return std::nullopt; }
 };
 
-/// Counts distinct consultations, to pin the once-per-resolved-scan memoization.
+// Count cardinality lookups to verify per-scan memoization.
 struct counting_source {
   std::size_t* calls = nullptr;
   std::optional<std::size_t> operator()(duckdb::LogicalGet const& get) const
@@ -99,8 +83,7 @@ struct counting_source {
   }
 };
 
-/// A base scan of @p width INTEGER columns with bound column ids (the walk and the stub source
-/// never invoke the default-constructed TableFunction).
+// Build a scan whose default-constructed table function is never invoked.
 duckdb::unique_ptr<duckdb::LogicalGet> make_get(duckdb::idx_t table_index, duckdb::idx_t width)
 {
   duckdb::vector<duckdb::LogicalType> types(width, duckdb::LogicalType::INTEGER);
@@ -121,7 +104,7 @@ duckdb::unique_ptr<duckdb::Expression> make_ref(duckdb::idx_t index)
   return duckdb::make_uniq<duckdb::BoundReferenceExpression>(duckdb::LogicalType::INTEGER, index);
 }
 
-/// A computed expression: passes no base column's values through, so the walk must refuse it.
+// A computed expression has no pass-through base-column lineage.
 duckdb::unique_ptr<duckdb::Expression> make_computed()
 {
   return duckdb::make_uniq<duckdb::BoundConstantExpression>(duckdb::Value::INTEGER(7));
@@ -162,8 +145,7 @@ duckdb::JoinCondition make_condition(duckdb::unique_ptr<duckdb::Expression> left
   return condition;
 }
 
-/// Every output ordinal of @p subtree resolves to @p expected or refuses; none resolves to
-/// anything else. This is the assertion that catches a walk wandering into the wrong subtree.
+// Require each resolvable output ordinal to reach the expected scan.
 void require_all_ordinals_resolve_to(duckdb::LogicalOperator const& subtree,
                                      std::size_t output_width,
                                      duckdb::LogicalGet const* expected)
@@ -654,10 +636,8 @@ TEST_CASE("walk refuses unmodelled operators", "[dynamic_filter][build_key_domai
 
 namespace {
 
-/// A join over probe GET (table 0, cardinality 1000) and build GET (table 1, cardinality 2000),
-/// with condition build sides supplied by the caller. Probe references are drawn from 90+ --
-/// far outside the build child's width of 3 -- so a walk that reads `condition.left` instead of
-/// `condition.right` resolves nothing, structurally, for every condition.
+// Use out-of-range probe ordinals so tracing the probe side cannot accidentally resolve a build
+// scan.
 duckdb::unique_ptr<duckdb::LogicalComparisonJoin> make_traced_join(
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> build_sides)
 {

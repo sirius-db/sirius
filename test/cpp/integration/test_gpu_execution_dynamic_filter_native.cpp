@@ -28,8 +28,7 @@ namespace {
 
 using sirius::test::coverage_gate_disable_guard;
 
-//! RAII toggle for the opt-in zone-map kind (default off). Captures and restores for the same
-//! reason as `sirius::test::coverage_gate_disable_guard`.
+// Enable zone-map filters for one scope and restore the previous setting.
 struct zone_map_switch_guard {
   explicit zone_map_switch_guard(duckdb::Connection& c)
     : con(c),
@@ -139,17 +138,8 @@ TEST_CASE("gpu_execution - dynamic filters over duckdb-native tables",
   }
 }
 
-//! T3/T4 of the R1b coverage-gate design (issue #1010): the gate fires on a domain-covering
-//! build, stays quiet on a selective one, is provably disabled above threshold 1.0, and never
-//! observes build rows above the domain bound (Invariant N). Both gate queries share one shape:
-//! GROUP BY p_partkey proves the build key unique structurally -- the integration schema declares
-//! no PRIMARY KEYs -- which arms the gate, and the lineage walk resolves the key through the
-//! aggregate to the native part scan, whose row upper bound is the domain.
-//!
-//! Deterministic-policy counters are asserted as exact deltas; `filters_pushed` (opportunistic)
-//! only directionally. The positive `filters_pushed` delta is still deterministic for this
-//! single-join shape: the publisher runs during the build sink, before probe-side task creation,
-//! so the join's own targets cannot have drained.
+// Verify coverage gating for unique grouped build keys traced to the native part scan. Exact
+// policy counters distinguish covering, selective, and disabled-gate behavior.
 TEST_CASE("gpu_execution - dynamic-filter domain-coverage gate",
           "[integration][gpu_execution][dynamic_filter]")
 {
@@ -165,11 +155,8 @@ TEST_CASE("gpu_execution - dynamic-filter domain-coverage gate",
   REQUIRE(r);
   REQUIRE_FALSE(r->HasError());
 
-  // The build predicate drops exactly one part row (p_partkey = 1), so the build still covers
-  // ~all of its key domain. It must NOT be provably always-true: statistics propagation erases an
-  // always-true table filter (min(p_partkey) = 1 proves `> 0`) before the join-filter optimizer
-  // runs, and an unfiltered build wires no publication at all. `> 1` survives as a table filter
-  // on the part scan, which is what makes DuckDB record the hint that wires publication.
+  // `p_partkey > 1` drops one row while remaining a real table filter; an always-true predicate
+  // would be removed before it could provide build-filter evidence.
   std::string const covering_query =
     "SELECT count(*) "
     "FROM lineitem JOIN (SELECT p_partkey FROM part WHERE p_partkey > 1 GROUP BY p_partkey) p "
@@ -219,10 +206,7 @@ TEST_CASE("gpu_execution - dynamic-filter domain-coverage gate",
 
   SECTION("Invariant N holds across the suite's join shapes at the default threshold")
   {
-    // keys_build_exceeded_domain counts build rows above the domain bound regardless of gate
-    // outcome or threshold, so a single increment means the walk accepted an amplifying shape or
-    // the evidence source over-promised -- across whatever plans these queries produce, not just
-    // the shapes T1 enumerates.
+    // Any increment means lineage admitted an amplifying shape or supplied an invalid upper bound.
     auto const before = sirius::test::get_dynamic_filter_stats_snapshot(con);
     compare_gpu_vs_cpu(con, covering_query);
     compare_gpu_vs_cpu(con, selective_query);

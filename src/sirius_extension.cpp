@@ -2321,12 +2321,11 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
     Value::BOOLEAN(sirius::operator_params{}.enable_dynamic_filter_pushdown),
     SetEnableDynamicFilterPushdown);
 
-  config.AddExtensionOption(
-    "enable_dynamic_filter_sip",
-    "[TEMPORARY] Extended dynamic filter (Sideways Information Passing, SIP)",
-    LogicalType::BOOLEAN,
-    Value::BOOLEAN(sirius::operator_params{}.enable_dynamic_filter_sip),
-    SetEnableDynamicFilterSip);
+  config.AddExtensionOption("enable_dynamic_filter_sip",
+                            "Enable join-edge dynamic filters (Sideways Information Passing, SIP)",
+                            LogicalType::BOOLEAN,
+                            Value::BOOLEAN(sirius::operator_params{}.enable_dynamic_filter_sip),
+                            SetEnableDynamicFilterSip);
 
   config.AddExtensionOption(
     "enable_dynamic_zone_map_filter",

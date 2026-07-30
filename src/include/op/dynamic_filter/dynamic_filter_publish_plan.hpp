@@ -80,12 +80,13 @@ enum class dynamic_filter_route_class : std::uint8_t {
  * `config::valid_domain_coverage_threshold` validates the threshold before planning;
  * `dynamic_filter_publish_plan` stores it without revalidation.
  *
- * @note This is only effective for DuckDB native tables which carry the requisite statistics.
+ * @note The coverage threshold is armed only for unique keys with DuckDB-native cardinality
+ * evidence.
  */
 struct dynamic_filter_publication_policy {
   /// Whether publication constructs zone-map filters alongside membership filters
   bool emit_zone_map_filters = false;
-  /// Fraction of a key's domain a build may cover and still publish that key's filters
+  /// Coverage fraction at or above which publication skips a key
   double domain_coverage_threshold = 0.9;
 };
 
@@ -144,7 +145,7 @@ class dynamic_filter_publish_plan final {
     /**
      * @brief Probe-side key storage type recorded at plan time
      *
-     * `cudf::type_id::EMPTY` when the probe side carries no representable bound reference.
+     * `cudf::type_id::EMPTY` when the bound probe reference has no cuDF representation.
      * `planner::direct_route_admissible` consumes it; a `direct` endpoint filters the probe-side
      * column, so its admissibility is decided against this type, not the build type.
      */
@@ -164,11 +165,8 @@ class dynamic_filter_publish_plan final {
     /**
      * @brief Whether this key is proven unique in the build's base relation
      *
-     * Set by admission only when the planner's proven-unique column set is exactly the singleton
-     * of this condition's build column. The membership coverage gate fires solely for
-     * proven-unique keys: only then is `build_rows / build_key_domain_cardinality` the coverage
-     * fraction it claims to be -- for duplicate keys the same ratio measures row retention, and a
-     * near-1.0 retention can coexist with a highly selective filter.
+     * The coverage gate uses this only when the planner proves this build column unique. For a
+     * non-unique key, the row-count ratio is not a distinct-key coverage fraction.
      */
     bool build_key_proven_unique = false;
 
@@ -225,14 +223,13 @@ class dynamic_filter_publish_plan final {
     /**
      * @brief Sparse key bindings
      *
-     * An admitted key need not appear in every target. This vector may be empty when planning
-     * created the channel but admitted no key for it.
+     * An admitted key need not appear in every target. The constructor permits an empty vector.
      */
     std::vector<key_binding> key_bindings;
   };
 
   static constexpr double k_default_domain_coverage_threshold =
-    0.9;  ///< Default fraction of a key's domain a build may cover and still publish its filters
+    0.9;  ///< Default coverage fraction at or above which publication skips a key
 
   /**
    * @brief Construct the canonical disabled plan

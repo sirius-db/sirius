@@ -438,17 +438,9 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
     CLOSED       ///< Finalization closed the window before the hook claimed it.
   };
 
-  /// Complete plan-time routing, policy, and replica-space description, immutable from
-  /// construction: `sirius_plan_comparison_join` resolves every scan and join-edge target before it
-  /// builds this join.
+  /// Plan-time routing, policy, and replica placement; not mutated after construction.
   dynamic_filter_publish_plan _dynamic_filter_plan;
-  /**
-   * @brief Non-owning publication-counter sink, owned by `SiriusContext`
-   *
-   * Handed over by `sirius_plan_comparison_join` at construction; null when no counter surface
-   * exists (unit fixtures). The owner outlives every plan built during a query, the same lifetime
-   * contract as the plan's replica spaces.
-   */
+  // Optional non-owning counter sink. SiriusContext owns it and outlives the plan.
   dynamic_filter_stats* _dynamic_filter_stats = nullptr;
   /// Exactly-once arbitration between the publication hook and finalization.
   std::atomic<dynamic_filter_publication_state> _dynamic_filter_publication_state{
@@ -472,8 +464,11 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
                                    std::shared_ptr<::cucascade::data_batch> batch,
                                    std::size_t partition_idx) override;
 
-  /// @brief Read access to this join's dynamic-filter publication plan, for tests and telemetry.
-  /// The plan is immutable from construction.
+  /**
+   * @brief Return this join's dynamic-filter publication plan
+   *
+   * @return The plan, which is not mutated after construction
+   */
   [[nodiscard]] dynamic_filter_publish_plan const& dynamic_filter_plan() const noexcept
   {
     return _dynamic_filter_plan;

@@ -86,8 +86,8 @@ namespace sirius::planner {
  * @param[in] conditions The wrapped join conditions in original planner order
  * (post-materialization; wrapping preserves that order)
  * @param[in] condition_shapes Carried pre-materialization classification, aligned with `conditions`
- * @param[in] condition_domain_cardinalities Per condition index, the build key's domain
- * cardinality (0 = unknown); empty when no domain evidence exists. Recorded onto each admitted
+ * @param[in] condition_domain_cardinalities Per condition index, the base-table row bound used as
+ * the coverage denominator (0 = unknown); empty when no evidence exists. Recorded on each admitted
  * key, so the result carries no parallel array.
  * @param[in] build_side_unique_column The build child's sole proven-unique output ordinal, when
  * the planner's proven-unique column set is exactly one column; empty otherwise -- a composite
