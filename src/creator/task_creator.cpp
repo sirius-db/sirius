@@ -361,15 +361,9 @@ void task_creator::manager_loop()
     node = get_operator_for_next_task(node);
 
     if (node == nullptr) {
-      // No task to create — but getting here still ran the operator's
-      // get_next_task_hint(), and for a hash join that call performs
-      // refresh_cross_schedule()'s discard sweep, which drains batches whose
-      // opposite side has just finished. That can be the very thing that makes
-      // the pipeline finishable, and the dispatch path below (whose exit
-      // re-evaluates status for exactly this reason) is skipped on this branch.
-      // Without re-evaluating here the pipeline stays unfinished forever and
-      // every downstream consumer parks. See the paired call before the
-      // dispatch lambda returns.
+      // Same re-evaluation the creation path does on exit: get_next_task_hint()
+      // above can have drained ports (hash join's discard sweep), making the
+      // pipeline finishable.
       if (requested_pipeline) { requested_pipeline->update_pipeline_status(false); }
       continue;
     }
