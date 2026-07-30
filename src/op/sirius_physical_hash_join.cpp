@@ -1982,14 +1982,37 @@ void sirius_physical_hash_join::push_data_batch_partitioned(
   //   - Broadcast (`_broadcast`)
   std::optional<::cucascade::read_only_data_batch> build_ro;
   if (port_id == "build" && batch) {
-    bool claim = false;
+    bool claim                    = false;
+    bool wired_but_multipartition = false;
+    std::size_t build_partitions  = 0;
     {
       std::scoped_lock lg(op_state_mutex);
-      claim = _dynamic_filter_publication_state.load(std::memory_order_acquire) ==
-                dynamic_filter_publication_state::OPEN &&
-              _join_mode == HASH_JOIN_MODE::BUILD_PROBE &&
-              (_partition_build_states.size() == 1 || _broadcast) && filter_pushdown &&
-              _dynamic_filter_plan.enabled();
+      const bool open = _dynamic_filter_publication_state.load(std::memory_order_acquire) ==
+                        dynamic_filter_publication_state::OPEN;
+      const bool wired                  = filter_pushdown && _dynamic_filter_plan.enabled();
+      const bool single_partition_build = _partition_build_states.size() == 1 || _broadcast;
+      build_partitions                  = _partition_build_states.size();
+      claim = open && _join_mode == HASH_JOIN_MODE::BUILD_PROBE && single_partition_build && wired;
+
+      // A join that has a filter plan and is still open, but cannot use the
+      // one-shot publisher, silently publishes nothing. Two ways to land here,
+      // and BOTH are the multi-partition case:
+      //   - BUILD_PROBE whose build spans >1 partition, and
+      //   - STANDARD / MIXED_JOIN, which are the partitioned modes to begin with.
+      // Deliberately NOT gated on BUILD_PROBE: gating on it would only ever find
+      // multi-partition builds among the single-partition-shaped joins, which is
+      // empty by construction and reports a reassuring zero.
+      wired_but_multipartition = open && wired && !single_partition_build;
+    }
+    if (wired_but_multipartition) {
+      SIRIUS_LOG_DEBUG(
+        "[sirius_physical_hash_join] dynamic filter NOT published (id={}): mode={} build spans {} "
+        "partition(s); the publisher requires a single-partition or broadcast build",
+        get_operator_id(),
+        _join_mode == HASH_JOIN_MODE::BUILD_PROBE  ? "BUILD_PROBE"
+        : _join_mode == HASH_JOIN_MODE::MIXED_JOIN ? "MIXED_JOIN"
+                                                   : "STANDARD",
+        build_partitions);
     }
     if (claim) { build_ro.emplace(batch->to_read_only()); }
   }
