@@ -169,7 +169,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
       // width. A narrow sidecar over them would pay per-batch exact-range verification and, on
       // an out-of-range inserted value, fail the query over to the CPU fallback — so the
       // residency gate below installs no narrow targets for a delta-serving scan. Entry chunks
-      // and their storage metadata are untouched by deltas.
+      // and their storage metadata are untouched by deltas. See issue ticket #1311.
       if (pinned != nullptr && pinned->mvcc != nullptr &&
           static_cast<std::size_t>(table.GetStorage().GetTotalRows()) > pinned->mvcc->n_cache()) {
         serves_insert_deltas = true;

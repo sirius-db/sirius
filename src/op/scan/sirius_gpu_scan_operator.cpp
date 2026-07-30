@@ -266,6 +266,7 @@ std::size_t sirius_gpu_scan_operator::no_history_peak_memory_estimate(
       // The serve site reported no cast, but this scan carries a plan sidecar. Keep a
       // conversion-sized headroom anyway, bounded by the stored source: a sidecar only ever
       // narrows a resident carrier, so any cast still reachable here fits in the source's bytes.
+      // @kevin See issue ticket #1313 on whether this branch is dead code.
       return saturating_add(stats.working_set_bytes, stats.bytes);
     }
     return std::max(stats.bytes, stats.working_set_bytes);

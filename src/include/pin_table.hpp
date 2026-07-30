@@ -151,7 +151,7 @@ struct pin_materialization_options {
 /// element type fails the whole batch's compression and latches compression off for the rest of the
 /// pin, so the pin driver floors 16-bit selections instead of selecting them. Applied at
 /// narrow_pin_chunk's chooser call site only when the pin resolved a compression plan and
-/// compression is enabled; a pin without a plan keeps 16-bit carriers.
+/// compression is enabled; a pin without a plan keeps 16-bit carriers. See issue ticket #1310.
 [[nodiscard]] cudf::data_type floor_carrier_for_compression(cudf::data_type carrier) noexcept;
 
 /// Drive @p ingestible 's metadata walk + batch coalescer to completion on @p io_ctx,
