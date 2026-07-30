@@ -562,10 +562,9 @@ class sirius_scan_manager {
     const std::function<bool(std::string_view, const pinned_entry&)>& visitor) const;
 
   /// The pinned entry whose duckdb identity matches catalog.schema.table, or
-  /// nullptr. Non-owning; valid only until the next pin/unpin — the same
-  /// single-threaded query-lifecycle discipline as visit_pinned_entries.
-  /// First match wins if one table was pinned under two names. Read by the
-  /// plan-time MVCC guards.
+  /// nullptr. Non-owning; obtain and read it inside one slot-scoped window, and
+  /// never hold it across a pin or unpin. First match wins if one table was
+  /// pinned under two names. Read by the plan-time MVCC guards.
   [[nodiscard]] pinned_entry const* find_pinned_entry_for_duckdb_table(
     std::string_view catalog_name, std::string_view schema_name, std::string_view table_name) const;
 

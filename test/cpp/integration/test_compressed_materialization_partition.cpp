@@ -90,8 +90,12 @@ constexpr std::size_t kMaxBuildHashTableBytes = 1024;
 constexpr char const* kJoinQuery =
   "SELECT SUM(t.v) AS sv, SUM(t.d) AS sd FROM t JOIN dm ON t.k = dm.k WHERE dm.x < 50;";
 
-// RIGHT and FULL OUTER joins are forced onto the STANDARD partitioned path, so they exercise the
-// per-side input schema the join reads whenever it has to build a side's batch itself.
+// RIGHT and FULL OUTER joins are forced onto the STANDARD partitioned path, and the assertions
+// below cover the plan-side half of that: both of the join's input ports carry a narrow schema,
+// which is the schema the join reads when it builds a side's batch itself. The build itself is not
+// reached here — the slicer deposits a zero-row batch in every partition, so a side that yields no
+// row at run time still deposits batches and the orphan condition never holds. Reaching it needs a
+// side depositing zero batches, which only an operator-level test can arrange.
 //
 // The gap table supplies a side that yields no row at run time without being provably empty at plan
 // time: a statically empty side is folded out of the plan by DuckDB, taking the join with it. Its

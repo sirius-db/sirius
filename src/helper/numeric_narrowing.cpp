@@ -202,7 +202,7 @@ bool numeric_range_fits(cudf::data_type target, const numeric_range& range) noex
 }
 
 std::optional<cudf::data_type> choose_narrow_physical_type(const logical_type& type,
-                                                           const numeric_range& range) noexcept
+                                                           const numeric_range& range)
 {
   if (!is_narrowable_numeric_type(type)) { return std::nullopt; }
   auto const native = try_get_cudf_type(type);

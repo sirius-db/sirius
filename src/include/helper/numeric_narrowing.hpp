@@ -79,7 +79,7 @@ struct numeric_range {
 /// Return the narrowest exact cuDF carrier that is strictly smaller than the logical type's native
 /// carrier. A missing result means unknown/incompatible bounds or no profitable width reduction.
 [[nodiscard]] std::optional<cudf::data_type> choose_narrow_physical_type(
-  const logical_type& type, const numeric_range& range) noexcept;
+  const logical_type& type, const numeric_range& range);
 
 /// Reduce a materialized numeric column to exact host-visible bounds. DECIMAL bounds use the raw
 /// unscaled carrier and retain the logical SQL scale. Empty/all-null columns and carrier/logical
