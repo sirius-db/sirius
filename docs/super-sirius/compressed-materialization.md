@@ -53,12 +53,13 @@ in favor of value-preserving carriers:
   the inter-GPU exchange, and co-partition hashing all need one representation across batches. A
   table-global offset keeps one coordinate system but adds nothing at byte granularity when
   column minima sit near zero.
-- Value-preserving carriers are a refinement: every existing kernel computes correctly on them,
-  and a forgotten path fails loudly on a type mismatch. Offset encodings need offset-aware decode
-  at every consumer and fail silently wrong when one is missed.
+- Value-preserving carriers need no offset decode. Audited pass-through and equality-only paths can
+  consume them directly, while type-sensitive consumers restore the native carrier. A missing
+  restoration remains a correctness bug and is not guaranteed to raise a type error; offset
+  encodings add the further requirement that every consumer apply the correct offset.
 - The byte-quantized ratio gain over value-preserving narrowing on such data is nil, and
-  Simpatico's own FOR/bitpack already provides frame-of-reference where it belongs — inside the
-  operator-private compressed blob.
+  Simpatico's own FOR/bitpack already provides frame-of-reference inside the operator-private
+  compressed blob.
 
 ## Scan planning and execution
 
@@ -80,11 +81,11 @@ gate identically to single-file scans. This yields three residency states:
 
 1. **Pinned-narrow** — the pinned entry matches the scan, serves its requested columns, and its
    narrowing markers show a column narrowed in every chunk: that column's sidecar target is the
-   widest carrier across the entry's chunks. Serving narrow is free — the casts were paid at pin
-   time — and the query gets the full downstream benefit.
+   widest carrier across the entry's chunks. No serve-time downcast is needed: a chunk already at
+   the target passes through, while a chunk stored at a narrower width widens to the target.
 2. **Unpinned** — no matching entry, or the entry cannot serve the requested columns: no sidecar.
-   The fresh scan is byte-identical to the feature-off plan — no exact-minmax verification, no cast
-   kernels, no restore projections; the probe costs one lookup.
+   The fresh scan follows the feature-off scan path — no exact-minmax verification, cast kernels,
+   or restore projections — after an additional plan-time cache probe.
 3. **Pinned-native** — the entry matches but the column was not narrowed in every chunk (for
    example, the table was pinned while the flag was off): that column's target stays native, and
    when no column survives the whole sidecar is dropped. A native resident chunk is never narrowed
@@ -98,7 +99,7 @@ through per-batch exact-range verification, and an inserted value outside the na
 fail the query over to the CPU fallback. Entry chunks and their recorded metadata are untouched by
 deltas. Residual race, accepted like the plan-staleness note below: an INSERT landing between this
 check and the delta capture serves native delta batches under a narrow sidecar — the per-batch
-verified cast then either passes or fails loudly to the fallback.
+verified cast then succeeds or is rejected and routed through the configured runtime fallback.
 
 A scan receives a complete physical sidecar only when its output mapping is complete and at least
 one eligible projected column passes the residency derivation. Columns that cannot be narrowed
@@ -114,9 +115,9 @@ of allowing a truncating cast; empty and all-null columns are vacuously safe. Th
 is then cast to the planned physical schema. This placement avoids a separate physical stage even
 though the cuDF reductions and casts remain kernels. On the routine paths the verification does
 not run — unpinned scans carry no sidecar, and a pinned-narrow serve is either a no-op (the
-stored carrier equals the plan target) or a cheap verified-free widening — but it remains reachable
-as defense for the residual case: a plan that predicted cache serving whose execution fell back to
-a disk read.
+stored carrier equals the plan target) or a same-family widening that needs no range check — but it
+remains reachable as defense for the residual case: a plan that predicted cache serving whose
+execution fell back to a disk read.
 
 Plan staleness across pin changes: a prepared statement or cached plan built while a table was
 unpinned stays native after a later pin — correct, but it forgoes the benefit until re-planned. A
@@ -127,9 +128,9 @@ such plans; this bounded staleness is accepted and documented rather than mechan
 
 ### Tier-aware narrowing policy
 
-The residency gate is the mechanism deciding what CAN be narrow; `apply_tier_narrowing_policy` —
-the first pass of `apply_compressed_schema_passes` — is the policy deciding what SHOULD stay
-narrow for this query on this tier. A HOST-tier serve pays a host→GPU upload per batch that
+The residency gate decides what can be narrow; `apply_tier_narrowing_policy` — the first pass of
+`apply_compressed_schema_passes` — decides what should stay narrow for this query on this tier. A
+HOST-tier serve pays a host→GPU upload per batch that
 narrowing always shrinks, so host-tier-backed sidecars are never touched: only scans stamped
 `sidecar_from_gpu_tier_pin` at sidecar install time seed the analysis, making unpinned,
 pinned-native, and host-tier scans structurally invisible to the pass. A GPU-tier serve has no
@@ -167,21 +168,22 @@ plan-time `scan_narrow_targets_retracted` counter.
 
 The policy commutes with the dynamic-filter guard in the propagation pass — both only ever flip
 narrow → native, so a guard target the policy already retracted is a no-op for the guard, and
-payload columns that no dynamic filter targets keep their transport verdicts — and it strictly
-reduces the work of zero-benefit pruning, which remains load-bearing for host-tier pins and for
-kept columns.
+payload columns that no dynamic filter targets keep their transport verdicts. Zero-benefit pruning
+runs afterwards and remains necessary for host-tier pins and kept columns.
 
 Physical schemas propagate through operators that preserve column identity:
 
 - filters;
 - pure-reference projections;
 - limits and streaming limits;
-- hash-join payload outputs.
+- hash-join payload outputs;
+- group-key outputs of eligible grouped aggregates.
 
-Expressions compare a reference's actual carrier with its declared logical return type. A nested
-use restores a narrower integer or same-scale decimal before arithmetic, comparison, `IN`, or
-another semantic operation. The projection operator's pure-reference passthrough fast path can
-forward the narrow column without allocating a copy.
+Expressions compare a reference's actual carrier with its declared logical return type. Except for
+the eligible narrow-domain comparisons described below, a nested use restores a narrower integer or
+same-scale decimal before arithmetic, comparison, `IN`, or another semantic operation. The
+projection operator's pure-reference passthrough fast path can forward the narrow column without
+allocating a copy.
 
 ### Narrow-domain comparisons
 
@@ -198,17 +200,14 @@ to survivors at their consumers instead of to the whole chunk before selection.
 
 ### Zero-benefit pruning
 
-After propagation inserts restoration boundaries, the planner removes scan-time narrowing that a
-restore projection undoes before any batch is materialized narrow — the restore sits directly
-above the scan (join keys, aggregate or ordering inputs, root restores) or is separated from it
-only by zero-copy pure-reference projections. Such a column would pay exact range verification, a
-narrowing cast, and a widening cast without one narrow batch write in between. The pruned column
-becomes native in the scan sidecar, the restore cast collapses to a passthrough reference, and a
-restore projection reduced to a positional identity is removed. Columns whose carrier crosses a
-materializing operator (for example scan → filter → restore) keep their narrowing, and pin-time
-narrowing is unaffected. With the residency gate, the pass operates only on pinned-backed sidecars;
-for such columns its effect is restoring resident narrow chunks during scan normalization instead
-of at a restore projection, plus reclaiming the projection's pipeline stage.
+After propagation inserts restoration boundaries, the planner removes a scan target when a restore
+projection would undo it immediately above the scan or after only zero-copy pure-reference
+projections. The pruned column becomes native in the scan sidecar, the restore cast becomes a
+passthrough reference, and a restore projection reduced to a positional identity is removed. On a
+cache hit, the resident narrow chunk widens during scan normalization instead of at the projection.
+If a stale plan falls back to a fresh read, pruning also avoids a verified downcast followed by an
+immediate widening cast. Columns whose carrier crosses a materializing operator (for example,
+scan → filter → restore) keep their target, and pin-time storage is unchanged.
 
 ## Operator boundaries
 
@@ -294,10 +293,10 @@ reach `cudf::concatenate` together. HOST chunks retain their carrier and decimal
 metadata and transfer that reduced representation back to the GPU before normalization.
 
 Filter safety depends on the path. Fresh reads apply reader or post-decode static filters before
-scan-time narrowing. A cached chunk may already be narrow, so the expression executor restores
-referenced carriers before a static comparison. Scans wired to a runtime dynamic-filter producer
-normalize their planned target columns to native before the downstream dynamic-filter operator;
-their other columns keep the plan carriers.
+scan-time narrowing. A cached chunk may already be narrow; comparisons against representable
+constants can execute in that narrow domain, while other expressions restore referenced carriers.
+Scans wired to a runtime dynamic-filter producer normalize their planned target columns to native
+before the downstream dynamic-filter operator; their other columns keep the plan carriers.
 
 The setting is sampled independently when a table is pinned and when a query plan is built. Changing
 it does not rewrite an existing cache entry:
@@ -322,26 +321,26 @@ slot k is output column k and a slot past the end of the vector is a pure-filter
 could decouple the two, and a scan requesting one cannot serve from a pin. A column is charged
 only when its (stored carrier, target) pair satisfies the same predicate
 `normalize_physical_schema` applies — a same-family widening, or a same-family narrowing under an
-explicit sidecar — and it is charged `rows x size_of(target)` plus validity-mask bytes, the width
-`cudf::cast` allocates.
+explicit sidecar — and it is charged `rows × size_of(target)` plus a validity mask when the source
+has one or the compressed representation cannot expose nullability.
 
 Two consequences are worth stating plainly. A chunk pinned narrow and queried at that same narrow
 target — the stacking happy path — issues no cast and is charged no conversion destination, where
 charging by "storage is narrow" would have reserved a full native destination for a conversion
 that never runs. And the estimate no longer consults the zone-map sidecar at all, so a table
 pinned with `enable_pinned_zone_map_pruning = false`, or a GPU-tier compression-enabled pin (which
-stores no sidecar), is sized as precisely as any other pin. The former 8x-bound limitation on
-those pins is gone.
+stores no zone-map sidecar), uses the same carrier-based sizing path as any other pin. The former
+8×-bound limitation on those pins is gone.
 
 Rows come from whichever form stores the chunk — a Simpatico-compressed chunk reports its row
 count from the representation and always contributes the validity-mask term, since per-column
-nullability inside a blob is opaque (a small over-approximation, never under). When a converting
-chunk's destination is unknowable the estimate falls back to the stored bytes multiplied by the
-named maximum numeric carrier expansion (`kMaxNumericCarrierExpansion`, currently 8); any chunk
-well-formed enough to serve reports its rows, so that constant is a defensive bound rather than a
-path production takes. A scan carrying a plan sidecar keeps a source-bounded floor on top of that
-— working set plus stored bytes — even on chunks the serve site reported cast-free, so a
-pinned-narrow scan under a sidecar reserves that floor rather than its bare working set. All
+nullability inside a blob is opaque. This can overestimate a destination that needs no mask, but
+does not underestimate it. When a converting chunk's destination is unknowable, the estimate falls
+back to the stored bytes multiplied by the named maximum numeric carrier expansion
+(`kMaxNumericCarrierExpansion`, currently 8). Any chunk well-formed enough to serve reports its
+rows, so that constant is a defensive fallback. A scan carrying a plan sidecar keeps a source-bounded
+floor — working set plus stored bytes — even on chunks for which the serve site reported no
+conversion, so a pinned-narrow scan reserves that floor rather than its bare working set. All
 arithmetic saturates. Filter masks and other working-set allocations are additive, and a resident
 input with neither a conversion nor a sidecar uses the larger of its stored and working-set sizes.
 
@@ -360,8 +359,8 @@ The pin materialization driver narrows each batch before the per-tier sinks comp
 `compress_with_plan` receives the narrow table and the blob records the narrow dtypes. Simpatico's
 round-trip contract decompresses to exactly the types it was given, so the cached provider hands
 out the compressed representation, the converter registry decompresses it on the serving GPU, and
-scan normalization sees actual == target — the pinned-narrow serve stays cast-free with no decode
-changes and no redundant native round trip. Compression ratio on a value-preserving narrow column
+scan normalization performs no cast when the stored carrier equals the plan target; a narrower
+stored carrier widens after decode. Compression ratio on a value-preserving narrow column
 is approximately preserved (byte codecs were already compressing away the constant high bytes;
 bitpack and FOR derive widths from the data), and encode/decode touch fewer bytes. Per-chunk width
 heterogeneity is naturally supported: each chunk's blob records its own dtypes, and a chunk
@@ -425,7 +424,7 @@ the scan operator — which is exactly where `normalize_physical_schema` already
 cast. With a sidecar installed, a decompressed carrier that is neither a same-family widening of
 nor a verified narrowing to the plan target throws `internal_exception`, surfaced per engine
 policy as CPU fallback. A width surprise cannot slip through as a silent reinterpretation, because
-normalization compares `cudf::data_type`s and never buffers.
+normalization compares `cudf::data_type`s and never reinterprets a buffer as another type.
 
 ### Accounting per chunk form
 
@@ -440,10 +439,11 @@ basis unchanged.
 
 - Compression on, narrowing off: native blobs, all-native metadata, no sidecars — compression-only
   behavior unchanged.
-- Narrowing on, compression off (no plan file, plan does not cover the pinned columns, or the
-  feature disabled): narrowing-only behavior exactly, narrow carriers on uncompressed storage.
+- Narrowing on, compression off (no plan file, plan does not cover the pinned columns, or
+  compression is disabled): narrow carriers use uncompressed storage.
 - Both on: narrow, then compress; the gate reads the recorded carriers and the serve decompresses
-  straight into them — the cast-free happy path plus the full downstream benefit.
+  straight into them. Chunks stored at the plan target need no normalization cast; narrower chunks
+  widen to it.
 - Both on, a chunk skips compression (minimum batch size, compressed-fraction reject, or the
   failure latch): that chunk is stored uncompressed narrow in the same entry; the provider
   dispatches per chunk and the recorded metadata is identical either way.
@@ -456,7 +456,7 @@ basis unchanged.
 - Disk fallback (plan built pinned-narrow, entry gone at execution): unchanged — the fresh decode
   is native and exact-bounds verification guards every planned downcast.
 - Host-tier round trip: compressed leaves upload host-to-GPU and decompress on the serving GPU;
-  narrowing shrinks the decompressed result, not the upload.
+  scan normalization then uses the decompressed stored carrier.
 
 ## Correctness invariants
 
@@ -470,7 +470,7 @@ basis unchanged.
 7. Pin-time narrowing is selected from exact per-chunk cuDF min/max results.
 8. Join keys, dynamic-filter keys, unsupported boundaries, and final results are native.
 9. A nonempty physical sidecar describes the complete output schema.
-10. Feature-off fresh scans without a sidecar retain their legacy path.
+10. Feature-off fresh scans without a sidecar retain their existing path.
 
 ## Validation and measurement
 
@@ -487,11 +487,11 @@ there), and a runtime
 `partition_narrow_columns` counter, counting input-batch columns that crossed an engaged hash
 PARTITION with a carrier narrower than native — the single observable for the exchange
 pass-through, derived from actual batch types so any regression in the narrow-carrier chain drops
-it to zero. A multi-file parquet gate test pins that sidecar installation is independent of
-source-statistics availability: a two-part pinned-narrow table installs the sidecar and serves
-cast-free on both tiers. After the residency gate,
-unpinned feature-on is expected to be approximately equal to unpinned feature-off — the flag should
-be performance-neutral wherever no pinned narrow data exists.
+it to zero. A multi-file Parquet gate test verifies that sidecar installation is independent of
+source-statistics availability: a two-part pinned-narrow table installs the sidecar on both tiers;
+the assertions distinguish GPU-tier policy retraction and restoration from HOST-tier service with
+no normalization cast. Use unpinned feature-off and feature-on runs as a control: apart from the
+plan-time cache probe, both take the native scan path when no matching pinned narrow data exists.
 
 Performance comparisons must use the same binary and otherwise identical configurations. Run the
 full TPC-H suite with the feature off and on for both unpinned and host-pinned modes; report warm

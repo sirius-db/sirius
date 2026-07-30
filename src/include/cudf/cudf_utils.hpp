@@ -214,7 +214,7 @@ inline cudf::data_type get_cudf_type(const logical_type& t)
 }
 
 /**
- * @brief Native cuDF mapping of @p t, or nullopt when the logical type has no cuDF carrier.
+ * @brief Native cuDF mapping of @p t, or `std::nullopt` when no cuDF carrier exists
  *
  * The optional-returning counterpart of `get_cudf_type` for callers that treat an unmappable type
  * as a fallback signal rather than an error. Only that signal is absorbed: `get_cudf_type` builds
@@ -324,7 +324,7 @@ inline std::unique_ptr<cudf::table> make_empty_table(const duckdb::vector<logica
 }
 
 /**
- * @brief Build a 0-row cudf table with one column per cudf type.
+ * @brief Build a zero-row cuDF table with one column per cuDF type
  *
  * The carrier-exact counterpart of the logical-type overload, for callers holding an operator's
  * `physical_types` sidecar: the result reproduces those carriers instead of re-deriving native

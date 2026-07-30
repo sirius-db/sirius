@@ -2403,9 +2403,9 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
 
   config.AddExtensionOption(
     "enable_compressed_materialization",
-    "Use exact source min/max statistics to keep eligible integer and fixed-point DECIMAL "
-    "columns in narrower physical GPU carriers until an expression or result needs the declared "
-    "SQL type (off by default)",
+    "Keep eligible integer and fixed-point DECIMAL columns in value-preserving narrow cuDF "
+    "carriers selected from exact pin-time bounds; restore native carriers at type-sensitive "
+    "boundaries (on by default)",
     LogicalType::BOOLEAN,
     Value::BOOLEAN(sirius::operator_params{}.enable_compressed_materialization),
     SetEnableCompressedMaterialization);

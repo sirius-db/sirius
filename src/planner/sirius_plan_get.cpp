@@ -75,14 +75,12 @@ std::vector<cudf::data_type> scan_physical_schema(duckdb::LogicalGet& op,
     return {};
   }
 
-  // Residency gate: install a narrow sidecar only when the pinned cache will serve this scan, with
-  // each column's plan target derived from the entry's recorded stored-column metadata (compressed
-  // and uncompressed chunks answer identically) — pin-time narrowing verified exact min/max on
-  // materialized data and already paid the casts, so serving narrow is free. Everything else stays
-  // native: an unpinned scan is byte-identical to feature-off, and a pinned-native column is never
-  // narrowed at serve time (a recurring per-query cost). A pin that cannot serve the requested
-  // columns reads disk fresh, where a narrow sidecar would reintroduce per-batch verification and
-  // casts.
+  // Install a narrow sidecar only when the pinned cache can serve this scan. Each target comes from
+  // recorded stored-column metadata, so compressed and uncompressed chunks use the same path. A
+  // chunk already at the target passes through; one stored narrower widens to the target. An
+  // unpinned scan follows the native path, and a pinned-native column is not narrowed while
+  // serving. A pin that cannot serve every requested column also takes the native disk-read path,
+  // avoiding recurring range verification and downcasts.
   auto const projection = entry->cache_info.column_projection_for(ids);
   if (projection.empty()) { return {}; }
 

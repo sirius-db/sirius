@@ -258,15 +258,11 @@ struct cached_databatch_provider : public databatch_provider {
     return false;
   }
 
-  /// Exact bytes of the destination columns (data plus validity mask) the casts on chunk
-  /// @p index allocate: the plan target's width per converting column, which is what cudf::cast
-  /// asks the allocator for. Rows come from whichever form stores the chunk (a compressed
-  /// representation reports its num_rows()); a compressed chunk's per-column nullability is
-  /// opaque, so its validity-mask term is always added (a <=2% over-approximation of the data
-  /// bytes). Zero -- the caller then keeps its conservative maximum-expansion bound -- whenever a
-  /// converting column's destination is unknowable. Any chunk well-formed enough to serve reports
-  /// its rows, so those bails are guards rather than a path production reaches; the width guard
-  /// covers cudf::size_of, which is defined only on fixed-width types.
+  // Estimate the cast destinations for one chunk from the target width and row count. Include a
+  // validity mask when the source is nullable. Compressed representations do not expose
+  // per-column nullability, so their estimate always includes a mask and may overestimate a
+  // non-nullable destination. Return zero when a destination cannot be sized; the caller then uses
+  // the maximum-expansion fallback. The fixed-width guard protects cudf::size_of.
   [[nodiscard]] std::size_t conversion_destination_bytes_for_chunk(std::size_t index) const
   {
     auto const& matrix = _entry.column_storage;

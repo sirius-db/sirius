@@ -69,20 +69,20 @@ void install_physical_schema(sirius::op::sirius_physical_operator& op,
 /**
  * @brief Retract narrow scan targets that show no plan benefit for a GPU-resident pin.
  *
- * The residency gate decides what CAN be narrow (the carriers stored in the pinned cache); this
- * pass decides what SHOULD stay narrow for this query. A GPU-tier serve pays no host-to-GPU upload,
+ * The residency gate decides what can be narrow from the carriers stored in the pinned cache; this
+ * pass decides what should stay narrow for the query. A GPU-tier serve pays no host-to-GPU upload,
  * so a narrow column must earn its keep inside the plan: the pass walks the tree bottom-up with the
  * same operator column maps `propagate_compressed_schema` uses (including DELIM_JOIN sub-trees) and
  * classifies every use of each candidate column of a scan marked `sidecar_from_gpu_tier_pin`. A
  * column stays narrow iff it survives into a hash-join payload output or an eligible
  * grouped-aggregate key output (transport benefit), or it engages a narrow-domain
  * comparison/BETWEEN (the evaluator's `narrow_domain_carrier` shape, probed against the planned
- * carrier) while no use meets a boundary restore projection. Every other use -- an evaluator
+ * carrier) while no use meets a boundary restore projection. Every other use — an evaluator
  * restore inside an expression, a join key, a value-sensitive aggregate input, an unmodeled
- * operator, survival to the plan root -- costs a restoration, so the column's sidecar entry flips
+ * operator, or survival to the plan root — costs a restoration, so the column's sidecar entry flips
  * back to native and its pinned-narrow chunks instead widen once per batch during scan
  * normalization. A column with no uses at all stays narrow. Host-tier-backed and sidecar-less scans
- * are never visited: narrow always wins when serving shrinks the upload. Returns the number of
+ * are not visited because their narrow carriers reduce the host-to-GPU upload. Returns the number of
  * retracted targets.
  */
 std::size_t apply_tier_narrowing_policy(sirius::op::sirius_physical_operator& plan);
@@ -123,16 +123,13 @@ void restore_native_schema(duckdb::unique_ptr<sirius::op::sirius_physical_operat
  * @brief Remove scan-time narrowing that a restore projection undoes before any batch is
  * materialized narrow.
  *
- * A pruned narrowing is one whose restore sits directly above the scan (join keys,
- * aggregate/ordering inputs, root restores) or is separated from it only by zero-copy
- * pure-reference projections. Such a column pays exact range verification plus a narrowing cast at
- * the scan and a widening cast at the restore without a single narrow batch write in between, so
- * the round trip cannot pay for itself. Pin-time narrowing is unaffected: a pruned (native) sidecar
- * restores resident narrow chunks during scan normalization instead of at the restore projection.
- * Columns whose carrier survives a materializing operator (e.g. scan -> filter -> restore) keep
- * their narrowing, and so does a column another output of the restore projection forwards as a bare
- * reference, so the pruned tree stays indistinguishable from one `propagate_compressed_schema`
- * could have produced.
+ * A restore qualifies when it sits directly above the scan or is separated from it only by
+ * zero-copy pure-reference projections. On a cache hit, pruning moves the required widening of a
+ * resident narrow chunk into scan normalization. On a stale plan that reads the source, it avoids a
+ * verified downcast followed by an immediate widening cast. Pin-time storage is unchanged. Columns
+ * whose carrier survives a materializing operator (for example, scan → filter → restore) keep their
+ * target, as does a scan column that another output of the restore projection forwards as a bare
+ * reference.
  */
 void prune_immediate_scan_restores(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot);
 

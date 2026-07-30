@@ -156,8 +156,9 @@ struct pin_materialization_options {
 /// \param gpu_spaces          Non-empty set of GPU memory spaces to round-robin across.
 /// \param io_ctx              IO context the metadata reads run on (owned by the scan manager).
 /// \param pinned_column_types Pin-time DuckDB type of each batch column, in batch-column
-///                            (column_ids) order — drives the per-chunk zone-map capture
-///                            (compute_pinned_chunk_stats). Empty skips capture (statless pin).
+///                            (column_ids) order. When carrier narrowing is enabled, this vector
+///                            must contain one type per materialized column. Otherwise, an empty
+///                            vector skips zone-map capture (statless pin).
 /// \param options             Per-pin materialization behavior (zone-map capture, carrier
 ///                            narrowing).
 materialized_pin materialize_all_batches(
@@ -243,7 +244,9 @@ struct device_pin_result {
 ///                            (column_ids) order — drives the per-chunk zone-map capture,
 ///                            which runs on the decode GPU before host conversion /
 ///                            compression (so compressed and uncompressed pins alike get
-///                            zone maps). Empty skips capture (statless pin).
+///                            zone maps). When carrier narrowing is enabled, this vector must
+///                            contain one type per materialized column. Otherwise, an empty vector
+///                            skips capture (statless pin).
 /// \param compression         Per-table Simpatico settings; disabled pins every chunk
 ///                            uncompressed.
 /// \param options             Per-pin materialization behavior (zone-map capture, carrier

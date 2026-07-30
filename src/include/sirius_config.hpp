@@ -131,10 +131,10 @@ struct operator_params {
   /// off carries no zone maps and cannot prune until re-pinned with the flag on.
   bool enable_pinned_zone_map_pruning = true;
 
-  /// Materialize integer and fixed-point DECIMAL scan columns in the narrowest exact physical
-  /// cuDF carrier proven by source min/max statistics, restoring the declared SQL type only at
-  /// expression and result boundaries. Narrowing applies to pinned scans; a scan the pin path
-  /// does not serve keeps its declared carrier.
+  /// Store eligible integer and fixed-point DECIMAL columns in carriers selected from exact
+  /// per-chunk bounds during pinning. Matching pinned scans derive targets from recorded storage
+  /// metadata; other scans use native carriers. Logical types remain unchanged, and type-sensitive
+  /// boundaries restore native carriers.
   bool enable_compressed_materialization = true;
 };
 

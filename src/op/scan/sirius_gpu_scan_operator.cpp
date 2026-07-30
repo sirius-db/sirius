@@ -85,10 +85,10 @@ std::unique_ptr<cudf::table> normalize_physical_schema(std::unique_ptr<cudf::tab
       targets.size());
   }
 
-  // Preflight the entire batch while every source column remains owned. Resident batches without a
-  // sidecar may only restore a narrow cache carrier to its native width. An explicit sidecar may
-  // additionally narrow a freshly decoded/native carrier, but only after exact materialized bounds
-  // confirm the statistics-derived target.
+  // Preflight while every source column remains owned. Without a sidecar, resident batches may
+  // only widen a narrow stored carrier to its native type. An explicit sidecar may also narrow a
+  // freshly decoded carrier, but only after exact materialized bounds confirm that its values fit
+  // the planned target.
   auto const table_view = table->view();
   for (std::size_t column_idx = 0; column_idx < targets.size(); column_idx++) {
     auto const& column = table_view.column(column_idx);

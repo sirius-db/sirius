@@ -195,7 +195,7 @@ struct pinned_entry {
   /// that carrier is narrower than the pin-time native mapping. Recorded by the
   /// pin driver at the moment of storage; insertion requires a matrix covering
   /// every chunk and column and cross-checks recorded carriers against
-  /// uncompressed storage. An empty matrix reads as all-native -- a legitimate
+  /// uncompressed storage. An empty matrix reads as all-native — a legitimate
   /// state for a zero-chunk or hand-built entry, which is why the serving
   /// validator still accepts it. The plan-time narrowing folds and the
   /// serve-time conversion sizing read this matrix and never introspect storage.
@@ -239,7 +239,7 @@ void validate_pinned_entry_for_serving(pinned_entry const& entry,
 
 /// Validate the shape of @p matrix alone: it must hold @p expected_chunks rows of
 /// @p expected_columns cells each. @p allow_empty admits the empty matrix, which reads as
-/// all-native -- @ref validate_pinned_entry_for_serving passes true because a zero-chunk or
+/// all-native — @ref validate_pinned_entry_for_serving passes true because a zero-chunk or
 /// hand-built entry is legitimately empty, while insertion passes false because the pin driver
 /// always records coverage. @p context prefixes the thrown message so the caller is named.
 /// Throws std::invalid_argument.
@@ -261,9 +261,9 @@ void validate_column_storage_shape(sirius::pinned_column_storage_matrix const& m
 /// Validate @p matrix against the storage about to be cached: it must cover every chunk and every
 /// cached column, and every recorded carrier must equal the stored type wherever storage can
 /// report one. @p stored_type answers (chunk, column) with the stored column's cuDF type, or
-/// nullopt when the form is opaque -- a Simpatico-compressed chunk, whose recorded carrier is
+/// `std::nullopt` when the form is opaque — a Simpatico-compressed chunk, whose recorded carrier is
 /// correct by construction (the pin driver recorded exactly what compress_with_plan received) and
-/// whose end-to-end defense is serve-time normalization. Also nullopt for a chunk or column the
+/// whose end-to-end defense is serve-time normalization. Also `std::nullopt` for a chunk or column the
 /// storage does not hold, which the cross-check simply skips. Throws std::invalid_argument.
 template <std::invocable<std::size_t, std::size_t> StoredType>
   requires std::same_as<std::invoke_result_t<StoredType, std::size_t, std::size_t>,
@@ -288,20 +288,19 @@ void validate_recorded_column_storage(sirius::pinned_column_storage_matrix const
   }
 }
 
-/// True iff @p entry's recorded storage metadata shows the cached column at @p entry_position (a
-/// position into cache_info.column_ids) narrowed in EVERY chunk. False for the empty (all-native
-/// compat) matrix, for zero-chunk entries, and for an out-of-range @p entry_position. Composed by
-/// pinned_column_narrow_carrier into the plan-time residency gate: a passing column serves narrow
-/// with at most a cheap same-family widening per chunk, while a failing one would pay a per-query
-/// exact-range verification and narrowing cast on its native chunks, so it stays native.
+/// True when @p entry's storage metadata shows the cached column at @p entry_position (a position
+/// into cache_info.column_ids) narrowed in every chunk. False for an empty matrix, a zero-chunk
+/// entry, or an out-of-range position. `pinned_column_narrow_carrier` uses this in the plan-time
+/// residency gate: a passing column needs at most a same-family widening per chunk; a failing
+/// column stays native instead of requiring per-query range verification and downcasts.
 [[nodiscard]] bool pinned_column_narrowed_in_all_chunks(pinned_entry const& entry,
                                                         std::size_t entry_position);
 
 /// The narrow plan-target carrier for the cached column at @p entry_position (a position into
 /// cache_info.column_ids): the widest recorded carrier across all chunks. A pure fold over the
 /// entry's @c column_storage metadata — compressed and uncompressed chunks, both tiers, answer
-/// identically and no storage is touched. nullopt — the column stays native — unless
-/// pinned_column_narrowed_in_all_chunks passes AND every recorded carrier is a strict same-family
+/// identically and no storage is touched. Returns `std::nullopt` unless
+/// pinned_column_narrowed_in_all_chunks passes and every recorded carrier is a strict same-family
 /// narrowing of @p native_type (can_narrow_to, the defense against metadata that contradicts the
 /// pin-time logical type). Chunks narrower than the returned target widen at serve through the
 /// verified same-family restore. Non-owning read of @p entry: obtain and read it inside one
