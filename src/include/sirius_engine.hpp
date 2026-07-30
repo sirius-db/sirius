@@ -24,6 +24,7 @@
 #include "duckdb/execution/task_error_manager.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_result_collector.hpp"
+#include "pipeline/completion_handler.hpp"
 #include "pipeline/pipeline_build_context.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
@@ -107,6 +108,11 @@ class sirius_engine {
 
  private:
   sirius::query_id_t query_id_;
+  /// This query's completion signal, created in execute() and shared with every task through
+  /// its pipeline's global state. shared_ptr because this engine is destroyed (in
+  /// sirius_interface::cleanup_internal) before the query's cleanup drains the task queues, so a
+  /// task still unwinding must be able to report without touching freed memory.
+  std::shared_ptr<pipeline::completion_handler> completion_handler_;
   std::shared_ptr<const telemetry::telemetry_context> telemetry_context_;
   rust::Box<quent::query::QueryHandle> query_handle_;
 };
