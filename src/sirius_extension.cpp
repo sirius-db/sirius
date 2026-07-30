@@ -2014,6 +2014,7 @@ static void SetEnableDynamicFilterSip(ClientContext& context, SetScope scope, Va
 {
   auto* params = get_operator_params(context);
   if (!params) { return; }
+  auto slot                         = lock_operator_params_slot(context);
   params->enable_dynamic_filter_sip = BooleanValue::Get(parameter);
   SIRIUS_LOG_DEBUG("Updated config ENABLE_DYNAMIC_FILTER_SIP to {}",
                    params->enable_dynamic_filter_sip);

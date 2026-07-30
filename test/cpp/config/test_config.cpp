@@ -23,6 +23,8 @@
 #include <chrono>
 #include <cstdlib>
 #include <exception>
+#include <filesystem>
+#include <fstream>
 #include <limits>
 #include <optional>
 #include <stdexcept>
@@ -581,4 +583,23 @@ TEST_CASE("the domain-coverage threshold is validated where it enters the engine
   REQUIRE_THROWS_AS(r.optional("dynamic_filter_domain_coverage_threshold", value, accepts),
                     std::runtime_error);
   REQUIRE(value == 0.9);
+}
+
+TEST_CASE("the SIP switch is consumed from the operator_params YAML section",
+          "[config_opt][dynamic_filter]")
+{
+  auto const path = std::filesystem::temp_directory_path() / "sirius_dynamic_filter_sip.yaml";
+  {
+    std::ofstream out(path);
+    out << "sirius:\n"
+           "  operator_params:\n"
+           "    enable_dynamic_filter_sip: true\n";
+  }
+
+  sirius_config cfg;
+  cfg.load_from_file(path);
+  CHECK(cfg.get_operator_params().enable_dynamic_filter_sip);
+
+  std::error_code ec;
+  std::filesystem::remove(path, ec);
 }
