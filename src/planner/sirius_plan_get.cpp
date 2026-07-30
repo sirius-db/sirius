@@ -62,6 +62,41 @@ duckdb::vector<std::unique_ptr<sirius::ast::node>> translate_expressions(
   return out;
 }
 
+// A predicate the optimizer pushed into LogicalGet::table_filters never reaches
+// the LogicalFilter builder, so it also escapes that builder's translation
+// guard. If Sirius cannot translate its expression form, the scan operators see
+// a null AST: the parquet path dereferences it, and the DuckDB-native path reads
+// it as "no filter" and passes every row through. Refuse the plan here so the
+// query falls back to DuckDB's CPU execution instead.
+//
+// The skip set mirrors convert_table_filters_to_expression (scan_utils.cpp),
+// which is what the scan operators actually build from: OPTIONAL_FILTER is
+// advisory, and IS_NOT_NULL is discharged before the expression is built.
+// Probing anything it skips would reject plans the runtime handles correctly.
+//
+// The probe translates a second time rather than handing its result to the
+// runtime. That is deliberate: the runtime resolves references to batch-relative
+// positions that do not exist at plan time, so the two translations have
+// different inputs. Both are side-effect free — TableFilter::ToExpression
+// returns a fresh expression and from_duckdb takes its argument by const
+// reference.
+void reject_untranslatable_table_filter(duckdb::TableFilter const& filter,
+                                        duckdb::LogicalType const& column_type,
+                                        std::string const& column_name)
+{
+  if (filter.filter_type == duckdb::TableFilterType::OPTIONAL_FILTER ||
+      filter.filter_type == duckdb::TableFilterType::IS_NOT_NULL) {
+    return;
+  }
+  auto column_ref = duckdb::make_uniq<duckdb::BoundReferenceExpression>(column_type, 0);
+  auto expression = filter.ToExpression(*column_ref);
+  if (!expression) { return; }
+  if (sirius::ast::from_duckdb(*expression) == nullptr) {
+    throw duckdb::NotImplementedException("Unsupported filter predicate on column '" + column_name +
+                                          "' (falling back to CPU): " + expression->ToString());
+  }
+}
+
 }  // namespace
 
 duckdb::unique_ptr<duckdb::TableFilterSet> create_table_filter_set(
@@ -327,6 +362,8 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
         auto const column_name =
           column_id < op.names.size() ? op.names[column_id] : std::to_string(column_id);
         reject_nested_column_type(op.returned_types[column_id], column_name, "a filter predicate");
+        reject_untranslatable_table_filter(
+          *entry.second, op.returned_types[column_id], column_name);
       }
     }
   }
