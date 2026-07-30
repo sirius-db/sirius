@@ -20,6 +20,7 @@
 
 // duckdb
 #include <duckdb/common/enums/expression_type.hpp>
+#include <duckdb/common/exception.hpp>
 #include <duckdb/planner/joinside.hpp>
 
 // standard library
@@ -73,9 +74,24 @@ namespace {
 // conditions vector is consumed at the call boundary).
 join_condition wrap_one(duckdb::JoinCondition& c)
 {
+  // A side from_duckdb cannot represent yields a null node, which the hash-join
+  // constructor later dereferences through ast::to_duckdb. Refuse the plan here
+  // so the query falls back to DuckDB's CPU execution instead.
+  auto left  = sirius::ast::from_duckdb(*c.left);
+  auto right = sirius::ast::from_duckdb(*c.right);
+  if (left == nullptr) {
+    throw duckdb::NotImplementedException(
+      "Unsupported expression on the left side of a join condition (falling back to CPU): " +
+      c.left->ToString());
+  }
+  if (right == nullptr) {
+    throw duckdb::NotImplementedException(
+      "Unsupported expression on the right side of a join condition (falling back to CPU): " +
+      c.right->ToString());
+  }
   return join_condition{
-    sirius::ast::from_duckdb(*c.left),
-    sirius::ast::from_duckdb(*c.right),
+    std::move(left),
+    std::move(right),
     from_duckdb(c.comparison),
   };
 }
