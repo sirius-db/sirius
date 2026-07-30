@@ -26,6 +26,14 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalOrder& op)
 {
   D_ASSERT(op.children.size() == 1);
 
+  // Only the sort KEYS are rejected — a nested column that is merely carried
+  // through the operator is the supported read-and-project shape. Sorting on
+  // one reaches cudf::sorted_order and fails at runtime for STRUCT, LIST and
+  // MAP alike, so refuse it at plan time and fall back to CPU instead.
+  for (auto const& order : op.orders) {
+    reject_nested_column_operation(*order.expression, "ORDER BY");
+  }
+
   auto plan = create_plan(*op.children[0]);
   if (!op.orders.empty()) {
     duckdb::vector<std::size_t> projection_map;
