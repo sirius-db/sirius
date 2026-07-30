@@ -161,8 +161,6 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
   if (table_filters) {
     auto duckdb_filter = convert_table_filters_to_expression(
       *table_filters, column_ids, returned_types, batch_column_map);
-    // No converted filter means the predicates were handled elsewhere. A converted
-    // filter that cannot be translated must fail instead of passing rows through.
     if (duckdb_filter) {
       local_filter_expr = sirius::ast::from_duckdb(*duckdb_filter);
       if (local_filter_expr == nullptr) {

@@ -163,7 +163,6 @@ static bool can_use_partitioned_aggregate(duckdb::ClientContext& context,
         for (auto& partition_col : partition_columns) {
           // we only support bound reference here
           auto const* expr = projection.select_list[partition_col].get();
-          // A partition key must reference a translated projection expression.
           if (expr == nullptr) { return false; }
           if (!expr->holds<sirius::ast::reference>()) { return false; }
           new_columns.push_back(expr->get<sirius::ast::reference>().column_index);

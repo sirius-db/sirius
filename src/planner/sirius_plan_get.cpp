@@ -62,20 +62,26 @@ duckdb::vector<std::unique_ptr<sirius::ast::node>> translate_expressions(
   return out;
 }
 
-// Pushed-down filters bypass LogicalFilter. Match the runtime converter's skip
-// set, then validate the remaining predicate at plan time. The runtime translates
-// again because it resolves references against batch-relative positions.
+// An OPTIONAL_FILTER is advisory and an IS_NOT_NULL is applied by the scan itself, so
+// neither contributes to the predicate convert_table_filters_to_expression builds
+// (scan_utils.cpp). This must stay in step with that skip set: probing a filter the
+// scan discharges would reject plans the scan handles correctly.
+[[nodiscard]] bool is_discharged_without_translation(duckdb::TableFilterType filter_type)
+{
+  return filter_type == duckdb::TableFilterType::OPTIONAL_FILTER ||
+         filter_type == duckdb::TableFilterType::IS_NOT_NULL;
+}
+
+// Pushed-down filters bypass LogicalFilter, so validate the remaining predicate at plan
+// time. The runtime translates again because it resolves references against
+// batch-relative positions.
 void reject_untranslatable_table_filter(duckdb::TableFilter const& filter,
                                         duckdb::LogicalType const& column_type,
                                         std::string const& column_name)
 {
-  if (filter.filter_type == duckdb::TableFilterType::OPTIONAL_FILTER ||
-      filter.filter_type == duckdb::TableFilterType::IS_NOT_NULL) {
-    return;
-  }
+  if (is_discharged_without_translation(filter.filter_type)) { return; }
   auto column_ref = duckdb::make_uniq<duckdb::BoundReferenceExpression>(column_type, 0);
   auto expression = filter.ToExpression(*column_ref);
-  if (!expression) { return; }
   if (sirius::ast::from_duckdb(*expression) == nullptr) {
     throw duckdb::NotImplementedException("Unsupported filter predicate on column '" + column_name +
                                           "' (falling back to CPU): " + expression->ToString());

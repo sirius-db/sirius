@@ -92,7 +92,6 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalFilter& op)
       }
     }
 
-    // Reject unsupported predicates before the physical filter stores them.
     auto predicate = sirius::ast::from_duckdb(*combined);
     if (predicate == nullptr) {
       throw duckdb::NotImplementedException("Unsupported filter predicate (falling back to CPU): " +
