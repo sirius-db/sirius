@@ -208,8 +208,10 @@ std::unique_ptr<cucascade::idata_representation> decompress_device_to_gpu(
   nvtx3::scoped_range nvtx_range{"sirius::compression::device_to_gpu"};
   auto& rep           = source.cast<compressed_device_representation>();
   auto const& indices = rep.selected_indices();
-  auto const& ct      = rep.table();
   auto const mr       = rmm::mr::get_current_device_resource_ref();
+  // Reconstructs here for a blob staged by the output/downgrade tiers, which defer it;
+  // for a pinned chunk the table is already built and this is a plain lookup.
+  auto const& ct      = rep.table(stream, mr);
   const int n_threads = std::min(decompress_column_threads(),
                                  static_cast<int>(indices ? indices->size() : ct.num_columns()));
   std::unique_ptr<cudf::table> decompressed;
@@ -811,21 +813,16 @@ std::unique_ptr<cucascade::idata_representation> compress_gpu_to_device(
     if (seen != buffers.size() || descs.size() != num_columns) { last_buffer_of_column.clear(); }
   }
 
-  // Set once the first tree is dropped: past that point this attempt cannot be
-  // repeated, because a retry would read buffers we have freed.
-  bool staged_release_began = false;
   buffer_copied_fn release_staged;
   if (!last_buffer_of_column.empty()) {
-    release_staged =
-      [&ct, &last_buffer_of_column, &staged_release_began](std::size_t buffer_index) {
-        for (std::size_t c = 0; c < last_buffer_of_column.size(); ++c) {
-          if (last_buffer_of_column[c] == buffer_index) {
-            ct.columns[c].plan_tree.reset();
-            staged_release_began = true;
-            break;
-          }
+    release_staged = [&ct, &last_buffer_of_column](std::size_t buffer_index) {
+      for (std::size_t c = 0; c < last_buffer_of_column.size(); ++c) {
+        if (last_buffer_of_column[c] == buffer_index) {
+          ct.columns[c].plan_tree.reset();
+          break;
         }
-      };
+      }
+    };
   }
 
   // Everything that can legitimately decline has already happened: a failed
@@ -843,32 +840,43 @@ std::unique_ptr<cucascade::idata_representation> compress_gpu_to_device(
   // this point leaves the batch holding an emptied source — hence the retry.
   auto consumed_source = rep.release_table(stream);
 
-  // Bounded retry with increasing backoff. Bounded, not unbounded: on the
-  // downgrade path this runs ON the downgrade thread, so spinning here would
-  // stall the very thread other work is waiting on to free memory — the same
-  // livelock shape as a task retrying against a downgrade that can never
-  // proceed. The task executor gets to spin 100 times only because it
-  // *reschedules* and lets other work run; a converter holding an exclusive
-  // batch lock cannot. 10 attempts over ~2.8 s is ample for transient
+  // The one remaining way this can fail is the payload allocation, and it fails
+  // before a single byte has been copied — so every attempt starts from the same
+  // intact `ct` and retrying is always sound. (Until the blob was made to
+  // reconstruct lazily there was a second failure point, the re-read's decode
+  // scratch, which threw *after* the copy loop had begun freeing per-column trees
+  // and so could not be retried at all. That case is gone, along with the flag and
+  // the terminal "source already released" branch that tracked it.)
+  //
+  // Bounded, not unbounded: on the downgrade path this runs ON the downgrade
+  // thread, so spinning here would stall the very thread other work is waiting on
+  // to free memory — the same livelock shape as a task retrying against a
+  // downgrade that can never proceed. The task executor gets to spin 100 times
+  // only because it *reschedules* and lets other work run; a converter holding an
+  // exclusive batch lock cannot. 10 attempts over ~2.8 s is ample for transient
   // contention, given we just freed several times what we are asking for.
+  //
+  // The retry stays because the source is already released above: without it a
+  // transient OOM on this one allocation is fatal for the batch, not a decline.
   constexpr int kMaxBlobAttempts       = 10;
   constexpr auto kBlobBackoffIncrement = std::chrono::milliseconds(50);
   std::shared_ptr<compressed_device_blob> blob;
   std::string last_error;
   for (int attempt = 1; attempt <= kMaxBlobAttempts; ++attempt) {
     try {
-      // Active on every attempt. It only fires from the copy loop, which runs
-      // *after* the payload allocation succeeded — and that allocation is the
-      // failure this loop exists to retry. So on the path we actually retry
-      // nothing has been released yet and the attempt is repeatable.
-      blob = build_device_compressed_blob(
-        header, buffers, stream, space_mut->get_default_allocator(), mr, release_staged);
+      // reconstruct_now=false: this batch is decompressed at most once, so the
+      // re-read is deferred to that point rather than paid here, during a
+      // downgrade, when the device has least to spare.
+      blob = build_device_compressed_blob(header,
+                                          buffers,
+                                          stream,
+                                          space_mut->get_default_allocator(),
+                                          mr,
+                                          /*reconstruct_now=*/false,
+                                          release_staged);
       break;
     } catch (const std::exception& e) {
       last_error = e.what();
-      // A throw from the reconstruct, after the copy loop began releasing, leaves
-      // ct's buffers freed — this attempt is not repeatable.
-      if (staged_release_began) { break; }
       if (attempt == kMaxBlobAttempts) { break; }
       SIRIUS_LOG_DEBUG(
         "[compression_converters] repo={} blob staging attempt {}/{} failed ({}); retrying",
@@ -985,8 +993,16 @@ std::unique_ptr<cucascade::idata_representation> stage_device_to_host(
   std::vector<std::uint8_t> header;
   std::vector<simpatico::payload_buffer_ref> buffers;
   std::uint64_t payload_bytes = 0;
-  const std::string hdr_err =
-    simpatico::build_compressed_table_header(rep.table(), header, buffers, payload_bytes, stream);
+  // Forces a deferred reconstruct: re-deriving the staged layout needs the table, and
+  // the blob's stored header describes the pre-staging one. This runs on the eviction
+  // path, so it asks for scratch under memory pressure — but a compressed chunk that
+  // could not be staged out would be un-evictable, which is worse.
+  const std::string hdr_err = simpatico::build_compressed_table_header(
+    rep.table(stream, rmm::mr::get_current_device_resource_ref()),
+    header,
+    buffers,
+    payload_bytes,
+    stream);
   if (!hdr_err.empty()) {
     throw std::runtime_error("[compression_converters] device→host header build: " + hdr_err);
   }
@@ -1049,7 +1065,8 @@ std::unique_ptr<cucascade::idata_representation> stage_device_to_disk(
 
   const std::string path =
     compression::make_compressed_temp_path(std::string(space_mut->get_disk_mount_path()));
-  const std::string err = simpatico::write_compressed_table(rep.table(), path, stream);
+  const std::string err = simpatico::write_compressed_table(
+    rep.table(stream, rmm::mr::get_current_device_resource_ref()), path, stream);
   if (!err.empty()) {
     throw std::runtime_error("[compression_converters] device→disk write: " + err);
   }

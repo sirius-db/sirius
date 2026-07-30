@@ -25,15 +25,43 @@
 
 namespace sirius {
 
+namespace {
+
+/// Re-read the compressed table from the staged payload. The slab hands out its own
+/// aligned offsets positionally and ignores the dense ones the header carries, so the
+/// header stays valid for this no matter when it runs — it describes the pre-staging
+/// layout and the slab supplies the post-staging one.
+void reconstruct_table(compressed_device_blob& blob,
+                       rmm::cuda_stream_view stream,
+                       rmm::device_async_resource_ref scratch_mr)
+{
+  auto noop_fetch = [](std::uint64_t, std::size_t, void*, rmm::cuda_stream_view) {};
+  std::string read_err;
+  blob.table = simpatico::read_compressed_table_from_memory(
+    blob.header, noop_fetch, stream, scratch_mr, &read_err, /*leaf_mr=*/blob.slab_mr);
+  if (!read_err.empty()) { throw std::runtime_error("[compressed_device_blob] " + read_err); }
+}
+
+}  // namespace
+
+const simpatico::compressed_table& compressed_device_blob::ensure_table(
+  rmm::cuda_stream_view stream, rmm::device_async_resource_ref scratch_mr)
+{
+  std::call_once(table_built, [&] { reconstruct_table(*this, stream, scratch_mr); });
+  return table;
+}
+
 std::shared_ptr<compressed_device_blob> build_device_compressed_blob(
   std::span<const std::uint8_t> header,
   std::span<const simpatico::payload_buffer_ref> buffers,
   rmm::cuda_stream_view stream,
   rmm::device_async_resource_ref payload_mr,
   rmm::device_async_resource_ref scratch_mr,
+  bool reconstruct_now,
   const buffer_copied_fn& on_buffer_copied)
 {
   auto blob = std::make_shared<compressed_device_blob>();
+  blob->header.assign(header.begin(), header.end());
 
   constexpr std::size_t kLeafAlign = rmm::CUDA_ALLOCATION_ALIGNMENT;  // 256
   auto const align_up = [](std::uint64_t n, std::uint64_t a) { return (n + a - 1) & ~(a - 1); };
@@ -78,11 +106,11 @@ std::shared_ptr<compressed_device_blob> build_device_compressed_blob(
   blob->slab_mr = slab_memory_resource{
     static_cast<std::byte*>(blob->payload.data()), &blob->offsets, &blob->slab_cursor};
 
-  auto noop_fetch = [](std::uint64_t, std::size_t, void*, rmm::cuda_stream_view) {};
-  std::string read_err;
-  blob->table = simpatico::read_compressed_table_from_memory(
-    header, noop_fetch, stream, scratch_mr, &read_err, /*leaf_mr=*/blob->slab_mr);
-  if (!read_err.empty()) { throw std::runtime_error("[build_device_compressed_blob] " + read_err); }
+  // Consume the once_flag either way, so the eager table is never rebuilt and the
+  // lazy one is built exactly once whenever ensure_table first reaches it.
+  if (reconstruct_now) {
+    std::call_once(blob->table_built, [&] { reconstruct_table(*blob, stream, scratch_mr); });
+  }
 
   // The caller may drop the source compressed_table (which owns `buffers`) as soon
   // as this returns, so the copies above must have landed.

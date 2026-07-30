@@ -519,11 +519,14 @@ device_pin_result materialize_all_batches_compressed(
               // D2D copy, no query re-fetch. Codec decode scratch comes from the source
               // GPU pool instead, so it neither disturbs the slab's positional placement
               // nor leaks into the payload.
+              // Reconstruct eagerly: a pinned chunk is read by many queries, so the
+              // parse amortises and every read after the first is a plain lookup.
               auto blob = sirius::build_device_compressed_blob(header,
                                                                buffers,
                                                                stream,
                                                                src_space->get_default_allocator(),
-                                                               src_space->get_default_allocator());
+                                                               src_space->get_default_allocator(),
+                                                               /*reconstruct_now=*/true);
 
               compressed_chunk = std::make_shared<sirius::compressed_device_representation>(
                 *src_space,

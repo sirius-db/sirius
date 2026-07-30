@@ -248,8 +248,13 @@ class compressed_device_representation : public cucascade::idata_representation 
   [[nodiscard]] std::unique_ptr<compressed_device_representation> select_columns(
     std::span<const std::size_t> indices) const;
 
-  /// The cached compressed_table (defined in device_compressed_blob.hpp).
-  [[nodiscard]] const simpatico::compressed_table& table() const noexcept;
+  /// The cached compressed_table (defined in device_compressed_blob.hpp), reconstructed
+  /// from the staged payload on first call if the blob was built lazily. Thread-safe.
+  ///
+  /// Not noexcept: a deferred reconstruct allocates decode scratch from @p scratch_mr
+  /// for a non-fused codec, and that can fail.
+  [[nodiscard]] const simpatico::compressed_table& table(
+    rmm::cuda_stream_view stream, rmm::device_async_resource_ref scratch_mr) const;
 
   [[nodiscard]] const std::vector<std::string>& column_names() const noexcept
   {

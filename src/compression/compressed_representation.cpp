@@ -242,9 +242,12 @@ compressed_device_representation::compressed_device_representation(
 {
 }
 
-const simpatico::compressed_table& compressed_device_representation::table() const noexcept
+const simpatico::compressed_table& compressed_device_representation::table(
+  rmm::cuda_stream_view stream, rmm::device_async_resource_ref scratch_mr) const
 {
-  return _blob->table;
+  // const on the representation, not on the blob: the blob is shared and its table is
+  // a cache, so filling it in does not change what this representation holds.
+  return _blob->ensure_table(stream, scratch_mr);
 }
 
 std::unique_ptr<cucascade::idata_representation> compressed_device_representation::clone(
