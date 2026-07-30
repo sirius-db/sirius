@@ -43,8 +43,7 @@ using sirius::creator::task_creator_config;
 //! wired because none of the per-query lifecycle entry points below dispatch tasks.
 struct query_state_fixture {
   query_state_fixture()
-    : memory_manager(initialize_memory_manager(1)),
-      creator(task_creator_config{}, *memory_manager)
+    : memory_manager(initialize_memory_manager(1)), creator(task_creator_config{}, *memory_manager)
   {
   }
 
@@ -95,8 +94,7 @@ TEST_CASE("task_creator reset is idempotent for one query", "[task_creator][quer
   REQUIRE_NOTHROW(f.creator.reset(kQueryA));
 }
 
-TEST_CASE("task_creator drain_pending_tasks targets a single query",
-          "[task_creator][query_state]")
+TEST_CASE("task_creator drain_pending_tasks targets a single query", "[task_creator][query_state]")
 {
   query_state_fixture f;
   f.creator.set_client_context(kQueryA, *f.con.context);

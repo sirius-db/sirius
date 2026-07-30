@@ -308,6 +308,12 @@ void SiriusContext::run_mandatory_cleanup(sirius::query_id_t query_id, std::stri
   // Only this query's is touched; other in-flight queries keep creating tasks.
   if (task_creator_) { task_creator_->reset(query_id); }
 
+  // With the producer stopped, drop whatever it already queued for this query. Ordering is
+  // deliberate: task_creator first so nothing new arrives, then the queues, then query_.reset()
+  // below — queued tasks reach operators through their pipeline, so they must be gone before the
+  // plan is destroyed. Other in-flight queries keep their queued work.
+  if (task_scheduler_) { task_scheduler_->drain_query_tasks(query_id); }
+
   query_.reset();
 
   // Drain all downgrade executors before clearing repositories — ensures no downgrade
@@ -375,7 +381,7 @@ void SiriusContext::run_mandatory_cleanup_backstop(sirius::query_id_t query_id,
     run_mandatory_cleanup(query_id, end_tag);
   } catch (std::exception& e) {
     mark_runtime_unavailable();
-    drop_task_creator_state_best_effort(query_id);
+    drop_query_runtime_state_best_effort(query_id);
     try {
       SIRIUS_LOG_ERROR(
         "Mandatory per-query cleanup failed during unwind; marking the Sirius runtime "
@@ -385,7 +391,7 @@ void SiriusContext::run_mandatory_cleanup_backstop(sirius::query_id_t query_id,
     }
   } catch (...) {
     mark_runtime_unavailable();
-    drop_task_creator_state_best_effort(query_id);
+    drop_query_runtime_state_best_effort(query_id);
     try {
       SIRIUS_LOG_ERROR(
         "Mandatory per-query cleanup failed during unwind (unknown exception); marking the "
@@ -395,14 +401,22 @@ void SiriusContext::run_mandatory_cleanup_backstop(sirius::query_id_t query_id,
   }
 }
 
-void SiriusContext::drop_task_creator_state_best_effort(sirius::query_id_t query_id) noexcept
+void SiriusContext::drop_query_runtime_state_best_effort(sirius::query_id_t query_id) noexcept
 {
-  // Once the runtime is latched unavailable no later window will run the
-  // task_creator reset, so the failed query's per-query global state (and the
-  // buffer handles it retains) would survive until ~task_creator during DB
-  // teardown — the exact shutdown-order crash the in-window reset prevents.
+  // Reached only when run_mandatory_cleanup threw, which means it may have aborted BEFORE its
+  // own reset/drain pair ran. Once the runtime is latched unavailable no later window will run
+  // them either, so the failed query's per-query state (and the buffer handles it retains)
+  // would survive until ~task_creator during DB teardown — the exact shutdown-order crash the
+  // in-window reset prevents.
+  //
+  // Same order as the main path: stop the producer, then drop what it queued. Each step is
+  // independently guarded so a throw in one still lets the other run.
   try {
     if (task_creator_) { task_creator_->reset(query_id); }
+  } catch (...) {
+  }
+  try {
+    if (task_scheduler_) { task_scheduler_->drain_query_tasks(query_id); }
   } catch (...) {
   }
 }
@@ -511,7 +525,7 @@ void SiriusContext::StandaloneQueryScope::finish()
     // error.
     state_ = scope_state::FAILED;
     ctx_.mark_runtime_unavailable();
-    ctx_.drop_task_creator_state_best_effort(window_id_);
+    ctx_.drop_query_runtime_state_best_effort(window_id_);
     log_window_event("end", "cleanup_failed");
     throw;
   }

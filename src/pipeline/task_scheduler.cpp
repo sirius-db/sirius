@@ -51,35 +51,9 @@ task_scheduler::task_scheduler(
   std::shared_ptr<const telemetry::telemetry_context> telemetry_context,
   const cucascade::memory::system_topology_info* sys_topology,
   const std::vector<std::unique_ptr<sirius::parallel::downgrade_executor>>* downgrade_executors)
-  : _task_queue([](const sirius::parallel::itask& task) -> exec::index_keys {
-      // Derive the multi-index keys from the task. The queue orders by priority
-      // (lower value = dispatched first) and additionally indexes by operator type,
-      // query id, and preferred device. Non-pipeline tasks fall back to the maximum
-      // priority so they sort last, with sentinel index keys.
-      if (const auto* gpu_task = dynamic_cast<const pipeline::gpu_pipeline_task*>(&task)) {
-        const exec::queue_priority priority = gpu_task->get_priority();
-        // Take the query id from the pipeline, NOT by unpacking it out of the priority's high
-        // bits: sirius::query_priority_bits masks the id to 31 bits, so the unpacked value
-        // diverges from the real query id once bit 31 is set, and a
-        // drain(query_index{value_of(query_id)}) would then silently miss this task.
-        exec::query_key query_id         = 0;
-        exec::operator_key operator_type = op::SiriusPhysicalOperatorType::INVALID;
-        if (const auto* pipe = gpu_task->get_pipeline()) {
-          query_id = static_cast<exec::query_key>(sirius::value_of(pipe->get_query_id()));
-          if (auto source = pipe->get_source()) { operator_type = source->type; }
-        }
-        const auto pref = gpu_task->get_preferred_device_id();
-        return exec::index_keys{priority,
-                                operator_type,
-                                query_id,
-                                pref.has_value() ? pref.value() : exec::no_preferred_device};
-      }
-      return exec::index_keys{std::numeric_limits<exec::queue_priority>::max(),
-                              op::SiriusPhysicalOperatorType::INVALID,
-                              0,
-                              exec::no_preferred_device};
-    }),
-    _telemetry_context(std::move(telemetry_context))
+  // Shared with every gpu_pipeline_executor's queue so both agree on which query a task
+  // belongs to; see pipeline::index_keys_for.
+  : _task_queue(&index_keys_for), _telemetry_context(std::move(telemetry_context))
 {
   _task_queue_telemetry = std::make_unique<telemetry::TaskQueueHandleWrapper>(
     *_telemetry_context, "task-scheduler-gpu-queue", _telemetry_context->shared_group_id());
@@ -182,10 +156,9 @@ void task_scheduler::set_task_creator(sirius::creator::task_creator& task_creato
 
 void task_scheduler::prepare_for_query(duckdb::shared_ptr<planner::query> query)
 {
-  // Drain leftover tasks from previous query
-  for (auto& [device_id, gpu_exec] : _gpu_executors) {
-    gpu_exec->drain_leftover_tasks();
-  }
+  // No leftover-task drain here: each query drops its own queued work at cleanup
+  // (drain_query_tasks from SiriusContext::run_mandatory_cleanup). Draining every executor at
+  // query START would discard any other in-flight query's tasks along with the stale ones.
 
   std::lock_guard lock(_query_mutex);
   _query = std::move(query);
@@ -312,6 +285,17 @@ void task_scheduler::wait_for_completion()
   if (_task_creator) {
     if (auto query_id = current_query_id()) { _task_creator->drain_pending_tasks(*query_id); }
     _task_creator->start_thread_pool();
+  }
+}
+
+void task_scheduler::drain_query_tasks(sirius::query_id_t query_id)
+{
+  // Pending work only, and only this query's: the scheduler's own queue first, then each GPU
+  // executor's staging queue. In-flight tasks are untouched — quiescing those is
+  // wait_for_completion / drain_after_error's job.
+  _task_queue.drain(exec::query_index{static_cast<exec::query_key>(sirius::value_of(query_id))});
+  for (auto& [device_id, gpu_exec] : _gpu_executors) {
+    gpu_exec->drain_query_tasks(query_id);
   }
 }
 

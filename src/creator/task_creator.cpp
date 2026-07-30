@@ -84,13 +84,13 @@ task_creator::task_creator(task_creator_config config,
 
 task_creator::~task_creator() { stop(); }
 
-void task_creator::query_task_state::enter_in_flight()
+void task_creator::query_task_global_state::enter_in_flight()
 {
   std::lock_guard<std::mutex> lock(in_flight_mutex);
   ++in_flight;
 }
 
-void task_creator::query_task_state::leave_in_flight()
+void task_creator::query_task_global_state::leave_in_flight()
 {
   {
     std::lock_guard<std::mutex> lock(in_flight_mutex);
@@ -100,18 +100,18 @@ void task_creator::query_task_state::leave_in_flight()
   in_flight_cv.notify_all();
 }
 
-void task_creator::query_task_state::wait_for_in_flight()
+void task_creator::query_task_global_state::wait_for_in_flight()
 {
   std::unique_lock<std::mutex> lock(in_flight_mutex);
   in_flight_cv.wait(lock, [this] { return in_flight == 0; });
 }
 
-std::shared_ptr<task_creator::query_task_state> task_creator::get_query_state(
+std::shared_ptr<task_creator::query_task_global_state> task_creator::get_query_task_global_state(
   sirius::query_id_t query_id) const
 {
   std::lock_guard<std::mutex> lock(_global_state_mutex);
-  auto it = _query_states.find(query_id);
-  return it == _query_states.end() ? nullptr : it->second;
+  auto it = _query_task_global_states.find(query_id);
+  return it == _query_task_global_states.end() ? nullptr : it->second;
 }
 
 void task_creator::set_client_context(sirius::query_id_t query_id,
@@ -120,8 +120,8 @@ void task_creator::set_client_context(sirius::query_id_t query_id,
   std::lock_guard<std::mutex> lock(_global_state_mutex);
   // The window begins before the plan exists, so this is where the query's entry is created;
   // prepare_for_query then fills in the pipeline global states.
-  auto& state = _query_states[query_id];
-  if (!state) { state = std::make_shared<query_task_state>(); }
+  auto& state = _query_task_global_states[query_id];
+  if (!state) { state = std::make_shared<query_task_global_state>(); }
   state->client_context = std::addressof(client_context);
 }
 
@@ -135,7 +135,7 @@ void task_creator::prepare_for_query(const sirius::planner::query& query)
 {
   const auto query_id = query.query_id();
 
-  auto state = get_query_state(query_id);
+  auto state = get_query_task_global_state(query_id);
   if (!state) {
     throw sirius::internal_exception(
       "task_creator::prepare_for_query: no state registered for query {}; "
@@ -264,7 +264,7 @@ void task_creator::drain_pending_tasks(sirius::query_id_t query_id)
   _task_creation_queue.drain(
     exec::query_index{static_cast<exec::query_key>(sirius::value_of(query_id))});
 
-  auto state = get_query_state(query_id);
+  auto state = get_query_task_global_state(query_id);
   if (!state) { return; }
 
   // Wait out this query's in-flight creation lambdas — the per-query stand-in for
@@ -285,13 +285,13 @@ void task_creator::reset(sirius::query_id_t query_id)
   // dereference them, so both must be gone before the caller destroys planner::query.
   drain_pending_tasks(query_id);
 
-  std::shared_ptr<query_task_state> state;
+  std::shared_ptr<query_task_global_state> state;
   {
     std::lock_guard<std::mutex> lock(_global_state_mutex);
-    auto it = _query_states.find(query_id);
-    if (it == _query_states.end()) { return; }
+    auto it = _query_task_global_states.find(query_id);
+    if (it == _query_task_global_states.end()) { return; }
     state = std::move(it->second);
-    _query_states.erase(it);
+    _query_task_global_states.erase(it);
   }
   // `state` is released here, outside the lock. Any worker that resolved it before the erase
   // still holds its own shared_ptr and finishes safely against a map that no longer lists it.
@@ -302,8 +302,8 @@ void task_creator::reset_all()
   std::vector<sirius::query_id_t> query_ids;
   {
     std::lock_guard<std::mutex> lock(_global_state_mutex);
-    query_ids.reserve(_query_states.size());
-    for (const auto& [query_id, state] : _query_states) {
+    query_ids.reserve(_query_task_global_states.size());
+    for (const auto& [query_id, state] : _query_task_global_states) {
       query_ids.push_back(query_id);
     }
   }
@@ -414,7 +414,7 @@ void task_creator::schedule_lookahead(sirius::query_id_t query_id,
                                       std::optional<int> device_id_hint)
 {
   if (_config.strategy != request_type::lookahead) { return; }
-  auto state = get_query_state(query_id);
+  auto state = get_query_task_global_state(query_id);
   if (!state) { return; }
 
   std::lock_guard lock(state->lookahead_mutex);
@@ -468,7 +468,7 @@ void task_creator::manager_loop()
     // then reads global_states (immutable after prepare_for_query) with no lock and no risk of
     // the map being rehashed or erased underneath it: its own reference keeps the state alive
     // even if reset(query_id) removes the registry entry mid-flight.
-    auto query_state = get_query_state(query_id);
+    auto query_state = get_query_task_global_state(query_id);
     if (!query_state) {
       // The query was reset while this request sat in the queue (finished, or failed and was
       // cleaned up). Dropping it is the correct outcome — `node` may already be dangling.
@@ -488,7 +488,7 @@ void task_creator::manager_loop()
         // Released on every exit path, including the catch below, so a throwing creation can
         // never strand drain_pending_tasks() waiting forever.
         struct in_flight_guard {
-          const std::shared_ptr<query_task_state>& state;
+          const std::shared_ptr<query_task_global_state>& state;
           ~in_flight_guard() { state->leave_in_flight(); }
         } guard{query_state};
         try {
