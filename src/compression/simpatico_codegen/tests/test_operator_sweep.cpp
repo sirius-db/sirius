@@ -143,13 +143,47 @@ std::unique_ptr<cudf::table> make_u8_table(int num_rows, int seed)
   return std::make_unique<cudf::table>(std::move(cols));
 }
 
+std::unique_ptr<cudf::table> make_int16_table(int num_rows, int seed)
+{
+  std::vector<std::int16_t> host(static_cast<std::size_t>(num_rows));
+  for (int r = 0; r < num_rows; ++r)
+    host[static_cast<std::size_t>(r)] = static_cast<std::int16_t>((r * 1009 + seed * 37) & 0x7FFF);
+  auto col = cudf::make_numeric_column(
+    cudf::data_type{cudf::type_id::INT16}, num_rows, cudf::mask_state::UNALLOCATED);
+  if (cudaMemcpy(col->mutable_view().head<std::int16_t>(),
+                 host.data(),
+                 host.size() * sizeof(std::int16_t),
+                 cudaMemcpyHostToDevice) != cudaSuccess)
+    throw std::runtime_error("make_int16_table: cudaMemcpy failed");
+  std::vector<std::unique_ptr<cudf::column>> cols;
+  cols.push_back(std::move(col));
+  return std::make_unique<cudf::table>(std::move(cols));
+}
+
+std::unique_ptr<cudf::table> make_uint16_table(int num_rows, int seed)
+{
+  std::vector<std::uint16_t> host(static_cast<std::size_t>(num_rows));
+  for (int r = 0; r < num_rows; ++r)
+    host[static_cast<std::size_t>(r)] = static_cast<std::uint16_t>((r * 1009 + seed * 37) & 0xFFFF);
+  auto col = cudf::make_numeric_column(
+    cudf::data_type{cudf::type_id::UINT16}, num_rows, cudf::mask_state::UNALLOCATED);
+  if (cudaMemcpy(col->mutable_view().head<std::uint16_t>(),
+                 host.data(),
+                 host.size() * sizeof(std::uint16_t),
+                 cudaMemcpyHostToDevice) != cudaSuccess)
+    throw std::runtime_error("make_uint16_table: cudaMemcpy failed");
+  std::vector<std::unique_ptr<cudf::column>> cols;
+  cols.push_back(std::move(col));
+  return std::make_unique<cudf::table>(std::move(cols));
+}
+
 // Canonical fixture order, shared by the orchestrator (sizing/labeling only,
 // no CUDA touched) and each shard (which actually builds them). MUST stay in
 // lockstep with build_fixtures() below — the orchestrator sizes/labels work by
 // index into this list, so a shorter list silently drops the trailing fixtures
 // from the sweep.
-constexpr std::array<char const*, 9> kFixtureNames = {
-  "i32", "i64", "u32", "u64", "f32", "f64", "u8_binary", "date", "string"};
+constexpr std::array<char const*, 11> kFixtureNames = {
+  "i16", "i32", "i64", "u16", "u32", "u64", "f32", "f64", "u8_binary", "date", "string"};
 
 struct fixture {
   std::string name;
@@ -168,8 +202,10 @@ std::vector<fixture> build_fixtures(rmm::cuda_stream_view stream, int n)
     f.table = std::move(t);
     fixtures.push_back(std::move(f));
   };
+  add_numeric("i16", make_int16_table(n, 9));
   add_numeric("i32", make_int32_table(1, n, 1));
   add_numeric("i64", make_int64_table(1, n, 2));
+  add_numeric("u16", make_uint16_table(n, 10));
   add_numeric("u32", make_uint32_table(1, n, 7));
   add_numeric("u64", make_uint64_table(1, n, 8));
   add_numeric("f32", make_f32_table(1, n, 3));
@@ -442,6 +478,14 @@ int run_shard(unsigned shard_idx, unsigned n_shards)
       }
     };
     must_apply("string", {"dictionary", "str_split"});
+    must_apply("i16", {"delta", "rle", "for", "zigzag", "bitpack", "ans", "bitcomp"});
+    must_apply("u16", {"delta", "rle", "for", "zigzag", "bitpack", "ans", "bitcomp"});
+    must_apply("i32", {"delta", "rle", "for", "zigzag", "bitpack", "ans", "bitcomp"});
+    must_apply("u32", {"delta", "rle", "for", "zigzag", "bitpack", "ans", "bitcomp"});
+    must_apply("i64", {"delta", "rle", "for", "zigzag", "bitpack", "ans", "bitcomp"});
+    must_apply("u64", {"delta", "rle", "for", "zigzag", "bitpack", "ans", "bitcomp"});
+    must_apply("f32", {"alp", "alp_rd", "for", "bitpack"});
+    must_apply("f64", {"alp", "alp_rd", "for", "bitpack"});
     must_apply("u8_binary", {"delta", "rle", "for", "zigzag", "bitpack"});
     must_apply("date", {"delta", "rle", "for", "zigzag", "bitpack", "ans", "bitcomp"});
   }
