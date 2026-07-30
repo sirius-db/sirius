@@ -81,9 +81,29 @@ static void collect_bound_ref_indices(const duckdb::Expression& expr,
     expr, [&](const duckdb::Expression& child) { collect_bound_ref_indices(child, indices); });
 }
 
-static bool is_equality(sirius::comparison_type c)
+// True when the join mixes a plain `=` key with a null-safe (IS NOT DISTINCT FROM)
+// one -- the case that must be split into a mixed join (see the ctor for why).
+static bool has_mixed_null_safe_keys(duckdb::vector<sirius::join_condition> const& conditions)
 {
-  return c == sirius::comparison_type::equal || c == sirius::comparison_type::not_distinct_from;
+  bool has_plain_equal = false;
+  bool has_null_safe   = false;
+  for (auto const& c : conditions) {
+    if (c.comparison == sirius::comparison_type::equal) {
+      has_plain_equal = true;
+    } else if (c.comparison == sirius::comparison_type::not_distinct_from) {
+      has_null_safe = true;
+    }
+  }
+  return has_plain_equal && has_null_safe;
+}
+
+// Whether a condition belongs in the hash key: a plain `=`, or a null-safe key when it
+// is not being routed to the conditional predicate (route_null_safe_to_conditional).
+static bool is_hash_equality_key(sirius::comparison_type c, bool route_null_safe_to_conditional)
+{
+  if (c == sirius::comparison_type::equal) { return true; }
+  if (c == sirius::comparison_type::not_distinct_from) { return !route_null_safe_to_conditional; }
+  return false;
 }
 
 static cudf::filtered_join make_right_filtered_join(cudf::table_view const& right_keys,
@@ -125,10 +145,18 @@ static cudf::mark_join make_left_mark_join(cudf::table_view const& left_keys,
 bool sirius_physical_hash_join::are_conditions_supported(
   duckdb::vector<sirius::join_condition>& conditions)
 {
-  // Must have at least one equality condition for a hash-based join.
+  // When a plain `=` key is mixed with a null-safe (IS NOT DISTINCT FROM) key, the
+  // null-safe key is treated as conditional (not a hash key), matching the ctor's
+  // runtime split. Unlike the ctor this has no `!= MARK` gate: a MARK join never
+  // actually routes, but classifying its null-safe key as conditional here is still
+  // safe -- disjoint columns run as a regular UNEQUAL hash join (the null-safe MARK
+  // limitation), overlapping columns fall back to CPU; neither crashes.
+  bool const route_null_safe = has_mixed_null_safe_keys(conditions);
+
+  // Must have at least one hash-equality condition for a hash-based join.
   bool has_equality = false;
   for (auto const& cond : conditions) {
-    if (is_equality(cond.comparison)) {
+    if (is_hash_equality_key(cond.comparison, route_null_safe)) {
       has_equality = true;
       break;
     }
@@ -138,28 +166,28 @@ bool sirius_physical_hash_join::are_conditions_supported(
   // Pure equality join: always supported.
   bool has_inequality = false;
   for (auto const& cond : conditions) {
-    if (!is_equality(cond.comparison)) {
+    if (!is_hash_equality_key(cond.comparison, route_null_safe)) {
       has_inequality = true;
       break;
     }
   }
   if (!has_inequality) { return true; }
 
-  // Mixed join: collect the column indices used on each side of the equality conditions.
+  // Mixed join: collect the column indices used on each side of the hash-equality conditions.
   std::unordered_set<std::size_t> equality_left_cols, equality_right_cols;
   for (auto const& cond : conditions) {
-    if (!is_equality(cond.comparison)) { continue; }
+    if (!is_hash_equality_key(cond.comparison, route_null_safe)) { continue; }
     auto left_owned  = sirius::ast::to_duckdb(*cond.left);
     auto right_owned = sirius::ast::to_duckdb(*cond.right);
     collect_bound_ref_indices(*left_owned, equality_left_cols);
     collect_bound_ref_indices(*right_owned, equality_right_cols);
   }
 
-  // For each inequality condition, verify that its left/right column references don't overlap
-  // with the equality key columns on the same side. cuDF's mixed_join API requires the equality
-  // and conditional table columns to be disjoint.
+  // For each conditional condition (inequality or a routed null-safe key), verify its
+  // left/right column references don't overlap with the hash-key columns on the same side.
+  // cuDF's mixed_join API requires the equality and conditional table columns to be disjoint.
   for (auto const& cond : conditions) {
-    if (is_equality(cond.comparison)) { continue; }
+    if (is_hash_equality_key(cond.comparison, route_null_safe)) { continue; }
     std::unordered_set<std::size_t> ineq_left_cols, ineq_right_cols;
     auto left_owned  = sirius::ast::to_duckdb(*cond.left);
     auto right_owned = sirius::ast::to_duckdb(*cond.right);
@@ -176,12 +204,13 @@ bool sirius_physical_hash_join::are_conditions_supported(
   return true;
 }
 
-void reorder_join_conditions(duckdb::vector<sirius::join_condition>& conditions)
+void reorder_join_conditions(duckdb::vector<sirius::join_condition>& conditions,
+                             bool route_null_safe_to_conditional)
 {
   bool is_ordered     = true;
   bool seen_non_equal = false;
   for (auto& cond : conditions) {
-    if (is_equality(cond.comparison)) {
+    if (is_hash_equality_key(cond.comparison, route_null_safe_to_conditional)) {
       if (seen_non_equal) {
         is_ordered = false;
         break;
@@ -194,7 +223,7 @@ void reorder_join_conditions(duckdb::vector<sirius::join_condition>& conditions)
   duckdb::vector<sirius::join_condition> equal_conditions;
   duckdb::vector<sirius::join_condition> other_conditions;
   for (auto& cond : conditions) {
-    if (is_equality(cond.comparison)) {
+    if (is_hash_equality_key(cond.comparison, route_null_safe_to_conditional)) {
       equal_conditions.push_back(std::move(cond));
     } else {
       other_conditions.push_back(std::move(cond));
@@ -235,20 +264,27 @@ sirius_physical_hash_join::sirius_physical_hash_join(
   _max_build_hash_table_bytes = max_build_hash_table_bytes;
   _hash_partition_bytes       = hash_partition_bytes;
   _max_broadcast_join_size    = max_broadcast_join_size;
-  reorder_join_conditions(conditions);
 
-  // Cache the null-matching flag for cuDF joins (conditions and join_type are fixed
-  // hereafter). cuDF applies one flag to all key columns, so EQUAL (null-safe) is
-  // used only when EVERY equi-key is IS NOT DISTINCT FROM; any plain `=` key
-  // (including mixed / delim joins) forces UNEQUAL.
+  // Route null-safe (IS NOT DISTINCT FROM) keys into the mixed-join conditional
+  // predicate (as NULL_EQUAL) when mixed with a plain `=`: cuDF's single null_equality
+  // flag can't give `=` UNEQUAL and null-safe EQUAL at once. MARK joins can't run in
+  // MIXED_JOIN mode, so they are never routed.
+  bool const route_null_safe =
+    has_mixed_null_safe_keys(conditions) && join_type != duckdb::JoinType::MARK;
+  reorder_join_conditions(conditions, route_null_safe);
+
+  // Cache the null-matching flag for the hash-equality keys (conditions and join_type
+  // are fixed hereafter). A pure null-safe join (every hash key IS NOT DISTINCT FROM)
+  // uses EQUAL; any plain `=` hash key forces UNEQUAL. In a mixed `=` + null-safe join
+  // the null-safe keys are routed out to a NULL_EQUAL predicate (route_null_safe above),
+  // so the remaining hash keys are all `=` and UNEQUAL is correct.
   //
-  // MARK joins are forced to UNEQUAL: their result logic (resolve_mark_join_result)
-  // implements IN/EXISTS three-valued semantics, which only holds under UNEQUAL. A
-  // MARK join CAN carry a null-safe key -- e.g. EXISTS(... WHERE r.k IS NOT DISTINCT
-  // FROM l.k) -- and that case is not correctly handled on the GPU today: EQUAL
-  // alone would not fix it, because the mark result would still nullify unmatched
-  // rows instead of returning them as false. This is a known limitation (same family
-  // as mixed-key null-safe joins); UNEQUAL preserves the pre-existing behavior.
+  // MARK joins are always UNEQUAL: resolve_mark_join_result implements IN/EXISTS
+  // three-valued semantics, which only holds under UNEQUAL, and MARK can't run in
+  // MIXED_JOIN mode. A null-safe MARK key -- e.g. EXISTS(... WHERE r.k IS NOT DISTINCT
+  // FROM l.k) -- is therefore still not correct on the GPU (EQUAL alone wouldn't fix
+  // it: unmatched rows would be nullified rather than marked false). This is the one
+  // remaining null-safe join limitation.
   compare_nulls_ = cudf::null_equality::UNEQUAL;
   if (join_type != duckdb::JoinType::MARK) {
     bool saw_null_safe   = false;
@@ -325,9 +361,9 @@ sirius_physical_hash_join::sirius_physical_hash_join(
     auto const* left_expr  = left_owned.get();
     auto const* right_expr = right_owned.get();
 
-    if (!is_equality(condition.comparison)) {
-      // Inequality conditions are handled at execute time via the cuDF mixed_join binary predicate.
-      // No key index extraction is needed here.
+    if (!is_hash_equality_key(condition.comparison, route_null_safe)) {
+      // Inequality (and routed null-safe) conditions are handled at execute time via the
+      // cuDF mixed_join binary predicate. No key index extraction is needed here.
       continue;
     }
 
