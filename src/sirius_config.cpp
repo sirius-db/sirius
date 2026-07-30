@@ -299,11 +299,11 @@ struct gpu_mem_config {
 struct host_mem_config {
   // fraction of each backing NUMA node's total RAM, or absolute bytes per NUMA node
   std::variant<double, std::uint64_t> capacity{0.9};
-  std::variant<double, std::uint64_t> reservation_limit{0.9};
-  // trigger == stop == 1.0 keeps host->disk eviction off by default, matching the empty
-  // downgrade_root_dirs default (no spill target). Set both below 1.0 to enable it.
-  double downgrade_trigger_fraction{1.0};
-  double downgrade_stop_fraction{1.0};
+  std::variant<double, std::uint64_t> reservation_limit{1.0};
+  // stop < trigger < reservation_limit, like the GPU tier. Host->disk eviction still
+  // needs a configured downgrade_root_dirs; without one the executor warns and skips.
+  double downgrade_trigger_fraction{0.9};
+  double downgrade_stop_fraction{0.8};
   std::size_t block_size{cucascade::memory::default_block_size};
   std::size_t pool_size{cucascade::memory::default_pool_size};
   std::size_t initial_number_pools{cucascade::memory::default_initial_number_pools};
@@ -326,7 +326,7 @@ struct host_mem_config {
       opt.capacity = *cap_frac;
     }
     std::optional<std::uint64_t> res_bytes;
-    double res_frac = 0.9;
+    double res_frac = 1.0;
     r.optional("reservation_limit_bytes", yaml::bytes(res_bytes));
     r.optional("reservation_limit_fraction", res_frac, yaml::fraction<double>{});
     opt.reservation_limit = res_bytes ? std::variant<double, std::uint64_t>{*res_bytes}
