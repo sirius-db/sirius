@@ -780,17 +780,38 @@ TEST_CASE("pin_table compression - single-op sweep over narrowed carriers",
     cudf::type_id carrier;
     std::int64_t sum;
   };
-  // Each value repeats ten times consecutively (range // 10), so the data has runs every operator
-  // in kOps can act on -- an all-distinct column expands under rle and would fail the census for a
-  // reason unrelated to the carrier. The multiplier on the int32 case lifts the values past the
-  // 16-bit range without changing the run structure.
+  // Each fixture cycles four values, ten rows each, so the column carries runs every operator in
+  // kOps can act on: an all-distinct column expands under rle and would fail the census for a
+  // reason unrelated to the carrier. Two of the four values are excursions towards the carrier's
+  // limits, which is what makes the sweep sensitive rather than merely green:
+  //
+  //   * The excursions push zigzag's output past the carrier's signed maximum (int8 reaches 146
+  //     against 127, int16 reaches 33097 against 32767), so the stored element goes negative and
+  //     the decoder has to narrow it to the element's exact width before the inverse shift. A
+  //     decoder that widens a signed element straight to 32 bits sign-extends garbage and returns
+  //     wrong values with no error, which correctness assertions alone would catch only here.
+  //   * Their span needs the full element width (146 spans 8 bits, 32998 spans 16), so bitpack
+  //     takes its flush-width path where elements sit on word boundaries instead of the general
+  //     scatter. The int32 case cannot reach that path without a span over 2^31, which would put
+  //     the steps below out of range, so it exercises the general path.
+  //   * The step between adjacent values stays inside the carrier (81, 16597, 5000097), so delta
+  //     re-emits differences the element type can hold.
   auto const cases = std::vector<carrier_case>{
-    {"int8", "SELECT (range // 10) % 100 AS k FROM range(5000)", cudf::type_id::INT8, 247500},
-    {"int16", "SELECT (range // 10) % 1000 AS k FROM range(5000)", cudf::type_id::INT16, 1247500},
+    {"int8",
+     "SELECT CASE (range // 10) % 4 WHEN 1 THEN 64 + (range // 10) % 10 "
+     "WHEN 3 THEN -64 - (range // 10) % 10 ELSE (range // 10) % 10 END AS k FROM range(5000)",
+     cudf::type_id::INT8,
+     10000},
+    {"int16",
+     "SELECT CASE (range // 10) % 4 WHEN 1 THEN 16400 + (range // 10) % 50 "
+     "WHEN 3 THEN -16500 - (range // 10) % 50 ELSE (range // 10) % 50 END AS k FROM range(5000)",
+     cudf::type_id::INT16,
+     -65000},
     {"int32",
-     "SELECT ((range // 10) % 1000) * 100000 AS k FROM range(5000)",
+     "SELECT CASE (range // 10) % 4 WHEN 1 THEN 5000000 + (range // 10) % 50 "
+     "WHEN 3 THEN -5000000 - (range // 10) % 50 ELSE (range // 10) % 50 END AS k FROM range(5000)",
      cudf::type_id::INT32,
-     124750000000},
+     60000},
   };
 
   for (auto const& cc : cases) {

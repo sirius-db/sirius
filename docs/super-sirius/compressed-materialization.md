@@ -383,6 +383,11 @@ A column narrowed to INT16 is therefore handed a plan written for its INT64 orig
 element type the plan's ops cannot encode fails the whole batch's compression and latches
 compression off for the rest of the pin.
 
+Both compression gates (`min_batch_size_bytes` and `max_compressed_fraction`) are evaluated on the
+already-narrowed table, so they measure the batch as it will be stored. A batch that falls out of a
+gate, or that arrives after a failure has latched compression off, is stored uncompressed at the
+carrier narrowing selected for it.
+
 Known residual: a plan block with a width-explicit packed op (a `bitextract`/`bitjoin` field spec
 of a fixed total width) on an integer column narrowed to a different width still fails that
 batch's compression, which latches compression off for the remainder of the pin — the pin falls
