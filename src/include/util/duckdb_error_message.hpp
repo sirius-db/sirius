@@ -23,34 +23,16 @@
 
 namespace sirius {
 
-/// \brief The human-readable message of \p e, without DuckDB's serialized envelope.
+/// \brief Returns DuckDB's message without its serialized exception envelope.
 ///
-/// `std::exception::what()` on a DuckDB exception carrying extra info is not
-/// prose — it is a JSON object (`{"exception_type":…,"exception_message":…}`).
-/// Concatenating it into a user-facing error leaks an internal wire format.
-/// `duckdb::ErrorData` parses that envelope and exposes the message alone.
-///
-/// The extraction can fail two ways, and both have to fall back to the raw text.
-///
-/// It can throw: a message that merely *starts* with `{` without being valid JSON
-/// makes the parser throw, and the construction can also throw on allocation.
-///
-/// And it can succeed while yielding nothing. The parser treats any `{`-leading
-/// valid JSON as an envelope but fills the message **only** from an
-/// `exception_message` key; every other key goes to extra info. So a legal JSON
-/// object that simply is not DuckDB's envelope — `{"error":"missing"}` — extracts
-/// to the empty string, and returning that would discard the original error.
-///
-/// Both call sites need this where throwing is not an option: inside a DuckDB
-/// optimizer extension hook, which has no error path, and inside catch handlers
-/// whose exception must not be replaced by a secondary one. A worse message is
-/// always preferable to losing the original error.
+/// Falls back to `what()` if parsing fails or yields an empty message. This
+/// function is noexcept because it is used from catch paths and optimizer hooks.
 [[nodiscard]] inline std::string sanitized_message(std::exception const& e) noexcept
 {
   try {
     auto message = duckdb::ErrorData(e).RawMessage();
     if (!message.empty()) { return message; }
-  } catch (...) {  // NOLINT(bugprone-empty-catch) — fall through to the raw text
+  } catch (...) {  // NOLINT(bugprone-empty-catch): fall back to e.what()
   }
   try {
     return e.what();

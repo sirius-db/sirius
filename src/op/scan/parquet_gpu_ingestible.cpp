@@ -377,13 +377,7 @@ parquet_gpu_ingestible::parquet_gpu_ingestible(std::unique_ptr<parquet_ingestibl
                                                       _plan->batch_position_by_column_id,
                                                       _plan->partition_primary_indices);
     if (duckdb_expression) {
-      // Prove the predicate translates before any IO is scheduled. The four
-      // sites below re-translate per task and dereference the result; a null
-      // there would either crash or, on the paths that tolerate it, drop the
-      // filter and emit rows it should have removed. Failing here converts both
-      // into one clear error at construction time. The planner refuses such
-      // plans first (sirius_plan_get.cpp), so reaching this throw indicates a
-      // route that bypassed that gate.
+      // Validate before scan tasks retranslate and dereference the predicate.
       if (sirius::ast::from_duckdb(*duckdb_expression) == nullptr) {
         throw duckdb::InvalidInputException(
           "parquet scan: cannot evaluate pushed-down predicate on GPU: %s",
@@ -549,7 +543,6 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
     };
     gpu_expression_translator translator(stream, cudf::get_current_device_resource_ref());
     auto sirius_filter_ast = sirius::ast::from_duckdb(*_duckdb_filter_expression);
-    // Validated at construction; assert the invariant rather than dereference blind.
     D_ASSERT(sirius_filter_ast != nullptr);
     ast_expression = translator.translate_expression_with_names(*sirius_filter_ast, name_resolver);
     if (ast_expression) { opts.set_filter(ast_expression->back()); }
@@ -788,7 +781,6 @@ filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
 
   if (_duckdb_filter_expression && !split.disable_filter_pushdown && !all_slices_pruned) {
     auto sirius_filter_ast = sirius::ast::from_duckdb(*_duckdb_filter_expression);
-    // Validated at construction; assert the invariant rather than dereference blind.
     D_ASSERT(sirius_filter_ast != nullptr);
     auto name_resolver = [plan = split.plan](duckdb::idx_t ref_index) -> std::string {
       return plan->batch_column_name(ref_index);

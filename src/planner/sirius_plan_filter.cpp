@@ -92,14 +92,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalFilter& op)
       }
     }
 
-    // from_duckdb returns null for a predicate it cannot represent, and the
-    // operator dereferences it without checking — undefined behaviour, whatever it
-    // happens to look like on a given build. Refuse the plan so a null can never
-    // reach the operator. A cross-side non-equi predicate is the shape that gets
-    // here: DuckDB can neither make it a join condition nor push it into a scan.
-    //
-    // The guard belongs on this call, not on the translate_expressions below — that
-    // one is fed only by locally synthesized reference expressions.
+    // Reject unsupported predicates before the physical filter stores them.
     auto predicate = sirius::ast::from_duckdb(*combined);
     if (predicate == nullptr) {
       throw duckdb::NotImplementedException("Unsupported filter predicate (falling back to CPU): " +

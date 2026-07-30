@@ -26,8 +26,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalTopN& op)
 {
   D_ASSERT(op.children.size() == 1);
 
-  // Same sort-key rule as LogicalOrder — LogicalTopN is what `ORDER BY … LIMIT n`
-  // becomes, so the message names what the user wrote.
+  // Apply the same sort-key restrictions as LogicalOrder.
   for (auto const& order : op.orders) {
     reject_nested_column_operation(*order.expression, "ORDER BY");
   }

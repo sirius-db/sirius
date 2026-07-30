@@ -74,9 +74,7 @@ namespace {
 // conditions vector is consumed at the call boundary).
 join_condition wrap_one(duckdb::JoinCondition& c)
 {
-  // A side from_duckdb cannot represent yields a null node, which the hash-join
-  // constructor later dereferences through ast::to_duckdb. Refuse the plan here
-  // so the query falls back to DuckDB's CPU execution instead.
+  // Both join-condition expressions must be translatable before the hash join stores them.
   auto left  = sirius::ast::from_duckdb(*c.left);
   auto right = sirius::ast::from_duckdb(*c.right);
   if (left == nullptr) {

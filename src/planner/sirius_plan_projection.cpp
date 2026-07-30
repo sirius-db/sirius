@@ -28,23 +28,8 @@ namespace sirius::planner {
 
 namespace {
 
-// Translate a vector of DuckDB expressions into Sirius AST nodes at the planner
-// boundary. The source vector is drained; size and order are preserved, and a
-// non-null input expression never yields a null Sirius node: from_duckdb returns
-// null for a shape it cannot represent (an unmapped function, a struct/list
-// element access), and the projection operator dereferences its select list
-// unconditionally. Rather than build a GPU plan containing null nodes, throw so
-// the query falls back to DuckDB's CPU execution.
-//
-// The decision is a plan capability, not a data-dependent one: an untranslatable
-// expression makes the plan unsupported even when no batch would ever have
-// reached the projection — an empty source is the reachable case.
-//
-// It does not extend to shapes DuckDB collapses before the plan gets here.
-// `LIMIT 0` becomes a childless LogicalEmptyResult during filter pushdown, and a
-// predicate that statistics prove false takes the projection with it during
-// statistics propagation; both passes run before the optimizer extension hook.
-// Those plans carry no expression to reject and are supported on the GPU.
+// Translate at the planner boundary and reject unsupported expressions before
+// they enter a physical projection. The source vector is consumed in order.
 duckdb::vector<std::unique_ptr<sirius::ast::node>> translate_expressions(
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> exprs)
 {

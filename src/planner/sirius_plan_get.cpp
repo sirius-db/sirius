@@ -62,24 +62,9 @@ duckdb::vector<std::unique_ptr<sirius::ast::node>> translate_expressions(
   return out;
 }
 
-// A predicate the optimizer pushed into LogicalGet::table_filters never reaches
-// the LogicalFilter builder, so it also escapes that builder's translation
-// guard. If Sirius cannot translate its expression form, the scan operators see
-// a null AST: the parquet path dereferences it, and the DuckDB-native path reads
-// it as "no filter" and passes every row through. Refuse the plan here so the
-// query falls back to DuckDB's CPU execution instead.
-//
-// The skip set mirrors convert_table_filters_to_expression (scan_utils.cpp),
-// which is what the scan operators actually build from: OPTIONAL_FILTER is
-// advisory, and IS_NOT_NULL is discharged before the expression is built.
-// Probing anything it skips would reject plans the runtime handles correctly.
-//
-// The probe translates a second time rather than handing its result to the
-// runtime. That is deliberate: the runtime resolves references to batch-relative
-// positions that do not exist at plan time, so the two translations have
-// different inputs. Both are side-effect free — TableFilter::ToExpression
-// returns a fresh expression and from_duckdb takes its argument by const
-// reference.
+// Pushed-down filters bypass LogicalFilter. Match the runtime converter's skip
+// set, then validate the remaining predicate at plan time. The runtime translates
+// again because it resolves references against batch-relative positions.
 void reject_untranslatable_table_filter(duckdb::TableFilter const& filter,
                                         duckdb::LogicalType const& column_type,
                                         std::string const& column_name)

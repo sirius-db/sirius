@@ -163,10 +163,7 @@ static bool can_use_partitioned_aggregate(duckdb::ClientContext& context,
         for (auto& partition_col : partition_columns) {
           // we only support bound reference here
           auto const* expr = projection.select_list[partition_col].get();
-          // A null slot means the projection carried an expression from_duckdb
-          // could not represent. The projection builder now refuses those, so
-          // this is defence in depth for a walk that descends into an already
-          // constructed child operator.
+          // A partition key must reference a translated projection expression.
           if (expr == nullptr) { return false; }
           if (!expr->holds<sirius::ast::reference>()) { return false; }
           new_columns.push_back(expr->get<sirius::ast::reference>().column_index);

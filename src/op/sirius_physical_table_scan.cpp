@@ -161,16 +161,8 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
   if (table_filters) {
     auto duckdb_filter = convert_table_filters_to_expression(
       *table_filters, column_ids, returned_types, batch_column_map);
-    // A null converter result and a null translation mean different things and
-    // must not be collapsed. The converter returns nothing only when every
-    // predicate was already discharged — an advisory OPTIONAL_FILTER, an
-    // IS_NOT_NULL applied elsewhere, or a hive partition column pruned at the
-    // file-list level — in which case passing the batch through is correct. A
-    // translation that fails, on the other hand, means the filter cannot be
-    // applied at all; passing the batch through would silently emit rows the
-    // predicate should have removed. Fail closed instead. The planner refuses
-    // such plans before they get here (sirius_plan_get.cpp), so reaching this
-    // throw indicates a route that bypassed that gate.
+    // No converted filter means the predicates were handled elsewhere. A converted
+    // filter that cannot be translated must fail instead of passing rows through.
     if (duckdb_filter) {
       local_filter_expr = sirius::ast::from_duckdb(*duckdb_filter);
       if (local_filter_expr == nullptr) {
