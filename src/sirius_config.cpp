@@ -228,7 +228,8 @@ static void from_yaml(const YAML::Node& node, exec::downgrade_executor_config& o
 namespace {
 
 struct topology {
-  std::variant<size_t, std::vector<int>> num_gpus_or_gpu_ids{size_t{1}};
+  /// 0 = auto: use every GPU visible to topology discovery (CUDA_VISIBLE_DEVICES-aware).
+  std::variant<size_t, std::vector<int>> num_gpus_or_gpu_ids{size_t{0}};
 
   static void from_yaml(const YAML::Node& node, topology& opt)
   {
@@ -239,13 +240,21 @@ struct topology {
     if (!ids.empty()) {
       opt.num_gpus_or_gpu_ids = std::move(ids);
     } else {
-      size_t n = 1;
+      size_t n = 0;
       r.optional("num_gpus", n);
       opt.num_gpus_or_gpu_ids = n;
     }
     r.reject_unknown();
   }
 };
+
+/// Resolve the configured GPU count: explicit values pass through; 0 (auto) means every
+/// discovered GPU, or 1 when discovery found none (it leaves the ctor default in place).
+size_t resolve_num_gpus(size_t requested, const cucascade::memory::system_topology_info& hw)
+{
+  if (requested > 0) { return requested; }
+  return hw.num_gpus > 0 ? static_cast<size_t>(hw.num_gpus) : size_t{1};
+}
 
 struct gpu_mem_config {
   std::variant<double, std::uint64_t> usage_limit{0.95};
@@ -422,7 +431,8 @@ void sirius_config::apply_defaults()
   disk_mem_config disk_cfg;
 
   cucascade::memory::reservation_manager_configurator builder;
-  builder.set_number_of_gpus(std::get<size_t>(topo.num_gpus_or_gpu_ids));
+  builder.set_number_of_gpus(
+    resolve_num_gpus(std::get<size_t>(topo.num_gpus_or_gpu_ids), _hw_topology));
   gpu_cfg.setup_configurator(builder);
   host_cfg.setup_configurator(builder);
   disk_cfg.setup_configurator(builder);
@@ -515,7 +525,8 @@ void sirius_config::load_from_file(const std::filesystem::path& config_path)
     if (using_configurator) {
       cucascade::memory::reservation_manager_configurator builder;
       if (std::holds_alternative<size_t>(topo.num_gpus_or_gpu_ids)) {
-        builder.set_number_of_gpus(std::get<size_t>(topo.num_gpus_or_gpu_ids));
+        builder.set_number_of_gpus(
+          resolve_num_gpus(std::get<size_t>(topo.num_gpus_or_gpu_ids), _hw_topology));
       } else {
         const auto& gpu_ids = std::get<std::vector<int>>(topo.num_gpus_or_gpu_ids);
         builder.set_gpu_ids(gpu_ids);

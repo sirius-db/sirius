@@ -109,7 +109,7 @@ Sirius uses cuCascade for tiered memory management across GPU, Host (pinned), an
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `num_gpus` | int | 1 | Number of GPUs to use. Mutually exclusive with `gpu_ids`. |
+| `num_gpus` | int | all visible GPUs | Number of GPUs to use. Defaults to every GPU visible to topology discovery (honors `CUDA_VISIBLE_DEVICES`); `0` also means auto. Mutually exclusive with `gpu_ids`. |
 | `gpu_ids` | list of int | — | Explicit GPU device IDs. Mutually exclusive with `num_gpus`. |
 
 ### GPU Memory (`sirius.memory.gpu`)
