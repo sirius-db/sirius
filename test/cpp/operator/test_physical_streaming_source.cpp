@@ -27,7 +27,7 @@
 #include <duckdb/planner/expression/bound_comparison_expression.hpp>
 #include <duckdb/planner/expression/bound_constant_expression.hpp>
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
-#include <exec/exchange_channel.hpp>
+#include <exec/batch_stream.hpp>
 #include <expression/ast/from_duckdb.hpp>
 #include <helper/type_conversions.hpp>
 #include <op/sirius_physical_filter.hpp>
@@ -37,9 +37,11 @@
 
 #include <algorithm>
 #include <atomic>
+#include <exception>
 #include <memory>
 #include <mutex>
 #include <set>
+#include <stdexcept>
 #include <thread>
 #include <vector>
 
@@ -52,31 +54,31 @@ namespace {
 
 using namespace sirius::test::operator_utils;
 
+/// The single sender used by the ordinary (non-fan-in) tests.
+constexpr sender_id_t SOLE_SENDER = 0;
+
 // ============================================================================
 // Test helpers
 // ============================================================================
 
-/// Producer contract helper: register batch in repo, then push handle to channel.
-static void push_batch(std::shared_ptr<cucascade::shared_data_repository> repo,
-                       exchange_channel& ch,
+/// Producer contract: the batch goes in through the operator's own push(), so admission and the
+/// waker behave exactly as they do in production.
+static void push_batch(sirius_physical_streaming_source& op,
                        std::shared_ptr<cucascade::data_batch> batch)
 {
-  uint64_t id = batch->get_batch_id();
-  repo->add_data_batch(batch);
-  REQUIRE(ch.try_push(exchange_batch_handle{id, 0}));
+  REQUIRE(op.push(std::move(batch)));
 }
 
-/// Create a streaming source with a fresh channel and repo.
-static auto make_source(std::size_t channel_capacity = 16)
+/// Create a streaming source over a fresh repository. `expected` defaults to a single sender.
+static auto make_source(std::set<sender_id_t> expected = {SOLE_SENDER})
 {
-  auto ch   = std::make_shared<exchange_channel>(exchange_channel::config{channel_capacity});
   auto repo = std::make_shared<cucascade::shared_data_repository>();
   auto op   = std::make_unique<sirius_physical_streaming_source>(
     sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER}),
     0,
-    ch,
-    repo);
-  return std::make_tuple(std::move(op), ch, repo);
+    repo,
+    std::move(expected));
+  return std::make_tuple(std::move(op), repo);
 }
 
 /// Wire a trivial single-operator pipeline (source == sink, no intermediate
@@ -97,6 +99,37 @@ static duckdb::shared_ptr<sirius::pipeline::sirius_pipeline> make_single_op_pipe
   return pipeline;
 }
 
+/// task_creator that only records what would have been scheduled.
+class recording_task_creator : public sirius::creator::task_creator {
+ public:
+  explicit recording_task_creator(sirius::memory::sirius_memory_reservation_manager& mem_mgr)
+    : task_creator(sirius::creator::task_creator_config{}, mem_mgr)
+  {
+  }
+
+  void schedule(sirius_physical_operator* request) override
+  {
+    std::lock_guard<std::mutex> lock(_mutex);
+    _scheduled.push_back(request);
+  }
+
+  bool scheduled(const sirius_physical_operator* op)
+  {
+    std::lock_guard<std::mutex> lock(_mutex);
+    return std::find(_scheduled.begin(), _scheduled.end(), op) != _scheduled.end();
+  }
+
+  std::size_t schedule_count(const sirius_physical_operator* op)
+  {
+    std::lock_guard<std::mutex> lock(_mutex);
+    return static_cast<std::size_t>(std::count(_scheduled.begin(), _scheduled.end(), op));
+  }
+
+ private:
+  std::mutex _mutex;
+  std::vector<sirius_physical_operator*> _scheduled;
+};
+
 }  // namespace
 
 // ============================================================================
@@ -105,8 +138,8 @@ static duckdb::shared_ptr<sirius::pipeline::sirius_pipeline> make_single_op_pipe
 
 TEST_CASE("streaming_source SRC-1: open+empty hint is WAITING{nullptr}", "[streaming_source]")
 {
-  auto [op, ch, repo] = make_source();
-  auto hint           = op->get_next_task_hint();
+  auto [op, repo] = make_source();
+  auto hint       = op->get_next_task_hint();
   REQUIRE(hint.has_value());
   REQUIRE(hint->hint == TaskCreationHint::WAITING_FOR_INPUT_DATA);
   REQUIRE(hint->producer == nullptr);
@@ -122,9 +155,8 @@ TEST_CASE("streaming_source SRC-2: non-empty hint is READY{this}", "[streaming_s
   auto* gpu_space = mem_mgr->get_memory_space(Tier::GPU, 0);
   REQUIRE(gpu_space != nullptr);
 
-  auto [op, ch, repo] = make_source();
-  auto batch          = make_numeric_batch<int32_t>(*gpu_space, {1, 2, 3}, cudf::type_id::INT32);
-  push_batch(repo, *ch, batch);
+  auto [op, repo] = make_source();
+  push_batch(*op, make_numeric_batch<int32_t>(*gpu_space, {1, 2, 3}, cudf::type_id::INT32));
 
   auto hint = op->get_next_task_hint();
   REQUIRE(hint.has_value());
@@ -133,20 +165,20 @@ TEST_CASE("streaming_source SRC-2: non-empty hint is READY{this}", "[streaming_s
 }
 
 // ============================================================================
-// SRC-3: closed && drained → nullopt
+// SRC-3: ended && drained → nullopt
 // ============================================================================
 
 TEST_CASE("streaming_source SRC-3: closed+drained hint is nullopt", "[streaming_source]")
 {
-  auto [op, ch, repo] = make_source();
-  ch->close();
-  REQUIRE(ch->drained());
+  auto [op, repo] = make_source();
+  op->close_input(SOLE_SENDER);
+  REQUIRE(op->all_ports_empty());
   auto hint = op->get_next_task_hint();
   REQUIRE_FALSE(hint.has_value());
 }
 
 // ============================================================================
-// SRC-4: closed but not drained → READY{this}
+// SRC-4: ended but not drained → READY{this}
 // ============================================================================
 
 TEST_CASE("streaming_source SRC-4: closed+non-empty hint is READY{this}", "[streaming_source]")
@@ -155,12 +187,11 @@ TEST_CASE("streaming_source SRC-4: closed+non-empty hint is READY{this}", "[stre
   auto* gpu_space = mem_mgr->get_memory_space(Tier::GPU, 0);
   REQUIRE(gpu_space != nullptr);
 
-  auto [op, ch, repo] = make_source();
-  auto batch          = make_numeric_batch<int32_t>(*gpu_space, {10}, cudf::type_id::INT32);
-  push_batch(repo, *ch, batch);
+  auto [op, repo] = make_source();
+  push_batch(*op, make_numeric_batch<int32_t>(*gpu_space, {10}, cudf::type_id::INT32));
 
-  ch->close();
-  REQUIRE_FALSE(ch->drained());
+  op->close_input(SOLE_SENDER);
+  REQUIRE_FALSE(op->all_ports_empty());
 
   auto hint = op->get_next_task_hint();
   REQUIRE(hint.has_value());
@@ -172,27 +203,26 @@ TEST_CASE("streaming_source SRC-4: closed+non-empty hint is READY{this}", "[stre
 // SRC-5: all_ports_empty() tracks drained state
 // ============================================================================
 
-TEST_CASE("streaming_source SRC-5: all_ports_empty reflects channel drained state",
+TEST_CASE("streaming_source SRC-5: all_ports_empty reflects stream drained state",
           "[streaming_source]")
 {
   auto mem_mgr    = sirius::test::operator_utils::initialize_memory_manager();
   auto* gpu_space = mem_mgr->get_memory_space(Tier::GPU, 0);
   REQUIRE(gpu_space != nullptr);
 
-  auto [op, ch, repo] = make_source();
+  auto [op, repo] = make_source();
 
   // Open + empty: NOT done (must not finish pipeline early).
   REQUIRE_FALSE(op->all_ports_empty());
 
   // Push a batch, then close.
-  auto batch = make_numeric_batch<int32_t>(*gpu_space, {1}, cudf::type_id::INT32);
-  push_batch(repo, *ch, batch);
-  ch->close();
+  push_batch(*op, make_numeric_batch<int32_t>(*gpu_space, {1}, cudf::type_id::INT32));
+  op->close_input(SOLE_SENDER);
 
-  // Closed but not drained.
+  // Ended but not drained.
   REQUIRE_FALSE(op->all_ports_empty());
 
-  // Drain the channel.
+  // Drain the queue.
   auto pod = op->get_next_task_input_data();
   REQUIRE(pod != nullptr);
 
@@ -211,10 +241,10 @@ TEST_CASE("streaming_source SRC-6: input-data happy path preserves batch identit
   auto* gpu_space = mem_mgr->get_memory_space(Tier::GPU, 0);
   REQUIRE(gpu_space != nullptr);
 
-  auto [op, ch, repo] = make_source();
-  auto batch          = make_numeric_batch<int32_t>(*gpu_space, {1, 2, 3}, cudf::type_id::INT32);
-  auto expected_id    = batch->get_batch_id();
-  push_batch(repo, *ch, batch);
+  auto [op, repo]  = make_source();
+  auto batch       = make_numeric_batch<int32_t>(*gpu_space, {1, 2, 3}, cudf::type_id::INT32);
+  auto expected_id = batch->get_batch_id();
+  push_batch(*op, batch);
 
   auto data = op->get_next_task_input_data();
   REQUIRE(data != nullptr);
@@ -226,48 +256,61 @@ TEST_CASE("streaming_source SRC-6: input-data happy path preserves batch identit
 }
 
 // ============================================================================
-// SRC-7: empty channel → nullptr, no throw
+// SRC-7: empty queue → nullptr, no throw
 // ============================================================================
 
-TEST_CASE("streaming_source SRC-7: empty channel returns nullptr non-blocking",
-          "[streaming_source]")
+TEST_CASE("streaming_source SRC-7: empty stream returns nullptr non-blocking", "[streaming_source]")
 {
-  auto [op, ch, repo] = make_source();
-  auto data           = op->get_next_task_input_data();
+  auto [op, repo] = make_source();
+  auto data       = op->get_next_task_input_data();
   REQUIRE(data == nullptr);
 }
 
 // ============================================================================
-// SRC-8: dangling handle (id not in repo) → throws
+// SRC-8: FIFO order — batches come out in the order they were pushed
 // ============================================================================
 
-TEST_CASE("streaming_source SRC-8: dangling handle throws", "[streaming_source]")
+TEST_CASE("streaming_source SRC-8: batches are delivered in push order", "[streaming_source]")
 {
-  auto [op, ch, repo] = make_source();
+  auto mem_mgr    = sirius::test::operator_utils::initialize_memory_manager();
+  auto* gpu_space = mem_mgr->get_memory_space(Tier::GPU, 0);
+  REQUIRE(gpu_space != nullptr);
 
-  // Push a handle without registering the batch in the repo.
-  REQUIRE(ch->try_push(exchange_batch_handle{9999, 0}));
+  constexpr int K = 5;
+  auto [op, repo] = make_source();
 
-  REQUIRE_THROWS(op->get_next_task_input_data());
+  std::vector<uint64_t> pushed;
+  for (int i = 0; i < K; ++i) {
+    auto batch = make_numeric_batch<int32_t>(*gpu_space, {i}, cudf::type_id::INT32);
+    pushed.push_back(batch->get_batch_id());
+    push_batch(*op, batch);
+  }
+
+  std::vector<uint64_t> pulled;
+  while (auto data = op->get_next_task_input_data()) {
+    auto& pod = dynamic_cast<pipelineable_operator_data&>(*data);
+    REQUIRE(pod.get_data_batches().size() == 1);
+    pulled.push_back(pod.get_data_batches()[0]->get_batch_id());
+  }
+  REQUIRE(pulled == pushed);
 }
 
 // ============================================================================
 // SRC-9: one-batch-per-task
 // ============================================================================
 
-TEST_CASE("streaming_source SRC-9: one handle per call to get_next_task_input_data",
+TEST_CASE("streaming_source SRC-9: one batch per call to get_next_task_input_data",
           "[streaming_source]")
 {
   auto mem_mgr    = sirius::test::operator_utils::initialize_memory_manager();
   auto* gpu_space = mem_mgr->get_memory_space(Tier::GPU, 0);
   REQUIRE(gpu_space != nullptr);
 
-  constexpr int K     = 5;
-  auto [op, ch, repo] = make_source();
+  constexpr int K = 5;
+  auto [op, repo] = make_source();
 
   for (int i = 0; i < K; ++i) {
-    auto batch = make_numeric_batch<int32_t>(*gpu_space, {i}, cudf::type_id::INT32);
-    push_batch(repo, *ch, batch);
+    push_batch(*op, make_numeric_batch<int32_t>(*gpu_space, {i}, cudf::type_id::INT32));
   }
 
   int pulls = 0;
@@ -288,7 +331,7 @@ TEST_CASE("streaming_source SRC-9: one handle per call to get_next_task_input_da
 TEST_CASE("streaming_source SRC-10: memory estimate is stats.bytes (pass-through)",
           "[streaming_source]")
 {
-  auto [op, ch, repo] = make_source();
+  auto [op, repo] = make_source();
 
   input_stats stats;
   stats.bytes       = 12345;
@@ -308,12 +351,11 @@ TEST_CASE("streaming_source SRC-11: execute round-trips numeric batch bit-exact"
   auto* gpu_space = mem_mgr->get_memory_space(Tier::GPU, 0);
   REQUIRE(gpu_space != nullptr);
 
-  auto stream         = default_stream();
-  auto [op, ch, repo] = make_source();
+  auto stream     = default_stream();
+  auto [op, repo] = make_source();
 
   std::vector<int32_t> values{10, 20, 30, 40, 50};
-  auto batch = make_numeric_batch<int32_t>(*gpu_space, values, cudf::type_id::INT32);
-  push_batch(repo, *ch, batch);
+  push_batch(*op, make_numeric_batch<int32_t>(*gpu_space, values, cudf::type_id::INT32));
 
   auto input  = op->get_next_task_input_data();
   auto output = op->execute(*input, stream);
@@ -338,14 +380,13 @@ TEST_CASE("streaming_source SRC-12: execute round-trips two-column and string ba
   auto* gpu_space = mem_mgr->get_memory_space(Tier::GPU, 0);
   REQUIRE(gpu_space != nullptr);
 
-  auto stream         = default_stream();
-  auto [op, ch, repo] = make_source();
+  auto stream     = default_stream();
+  auto [op, repo] = make_source();
 
   std::vector<int64_t> col0{1, 2, 3};
   std::vector<int32_t> col1{10, 20, 30};
-  auto batch =
-    make_two_column_batch<int64_t, int32_t>(*gpu_space, col0, col1, cudf::type_id::INT32);
-  push_batch(repo, *ch, batch);
+  push_batch(*op,
+             make_two_column_batch<int64_t, int32_t>(*gpu_space, col0, col1, cudf::type_id::INT32));
 
   auto input  = op->get_next_task_input_data();
   auto output = op->execute(*input, stream);
@@ -371,9 +412,8 @@ TEST_CASE("streaming_source SRC-13: task owns batch; repo no longer holds it", "
   auto* gpu_space = mem_mgr->get_memory_space(Tier::GPU, 0);
   REQUIRE(gpu_space != nullptr);
 
-  auto [op, ch, repo] = make_source();
-  auto batch          = make_numeric_batch<int32_t>(*gpu_space, {1, 2}, cudf::type_id::INT32);
-  push_batch(repo, *ch, batch);
+  auto [op, repo] = make_source();
+  push_batch(*op, make_numeric_batch<int32_t>(*gpu_space, {1, 2}, cudf::type_id::INT32));
 
   REQUIRE(repo->total_size() == 1);
 
@@ -409,13 +449,14 @@ TEST_CASE("streaming_source SRC-14: spill self-heal via prepare_for_processing",
   rmm::cuda_stream conv_stream;
   auto& registry = sirius::converter_registry::get();
 
-  auto [op, ch, repo] = make_source();
+  auto [op, repo] = make_source();
 
   std::vector<int32_t> values{7, 8, 9};
   auto batch = make_numeric_batch<int32_t>(*gpu_space, values, cudf::type_id::INT32);
-  push_batch(repo, *ch, batch);
+  push_batch(*op, batch);
 
-  // Downgrade the queued batch to HOST while it waits in the repo.
+  // Downgrade the queued batch to HOST while it waits in the repository — the reason batches
+  // stay there rather than in a private queue.
   {
     auto mut = batch->to_mutable();
     mut.convert_to<cucascade::host_data_representation>(registry, host_space, conv_stream);
@@ -455,15 +496,14 @@ TEST_CASE("streaming_source SRC-15: lifecycle end-to-end: k batches out then EOS
   auto* gpu_space = mem_mgr->get_memory_space(Tier::GPU, 0);
   REQUIRE(gpu_space != nullptr);
 
-  constexpr int K     = 4;
-  auto stream         = default_stream();
-  auto [op, ch, repo] = make_source();
+  constexpr int K = 4;
+  auto stream     = default_stream();
+  auto [op, repo] = make_source();
 
   for (int i = 0; i < K; ++i) {
-    auto batch = make_numeric_batch<int32_t>(*gpu_space, {i}, cudf::type_id::INT32);
-    push_batch(repo, *ch, batch);
+    push_batch(*op, make_numeric_batch<int32_t>(*gpu_space, {i}, cudf::type_id::INT32));
   }
-  ch->close();
+  op->close_input(SOLE_SENDER);
 
   int received = 0;
   while (true) {
@@ -487,8 +527,8 @@ TEST_CASE("streaming_source SRC-15: lifecycle end-to-end: k batches out then EOS
 
 TEST_CASE("streaming_source SRC-16: empty stream → immediate EOS", "[streaming_source]")
 {
-  auto [op, ch, repo] = make_source();
-  ch->close();
+  auto [op, repo] = make_source();
+  op->close_input(SOLE_SENDER);
 
   auto hint = op->get_next_task_hint();
   REQUIRE_FALSE(hint.has_value());
@@ -506,15 +546,15 @@ TEST_CASE("streaming_source SRC-17: execute output feeds into real sirius_physic
   auto* gpu_space = mem_mgr->get_memory_space(Tier::GPU, 0);
   REQUIRE(gpu_space != nullptr);
 
-  auto stream         = default_stream();
-  auto [op, ch, repo] = make_source();
+  auto stream     = default_stream();
+  auto [op, repo] = make_source();
 
   // Two-column batch: col0 = filter key (int64), col1 = int32 data.
   std::vector<int64_t> filter_col{1, 5, 2, 8, 3};
   std::vector<int32_t> data_col{10, 50, 20, 80, 30};
-  auto batch =
-    make_two_column_batch<int64_t, int32_t>(*gpu_space, filter_col, data_col, cudf::type_id::INT32);
-  push_batch(repo, *ch, batch);
+  push_batch(*op,
+             make_two_column_batch<int64_t, int32_t>(
+               *gpu_space, filter_col, data_col, cudf::type_id::INT32));
 
   // Execute source: pass-through.
   auto source_input = op->get_next_task_input_data();
@@ -559,12 +599,12 @@ TEST_CASE("streaming_source SRC-18: sink pushes batch to downstream boundary por
   auto* gpu_space = mem_mgr->get_memory_space(Tier::GPU, 0);
   REQUIRE(gpu_space != nullptr);
 
-  auto stream         = default_stream();
-  auto [op, ch, repo] = make_source();
+  auto stream     = default_stream();
+  auto [op, repo] = make_source();
 
   auto batch    = make_numeric_batch<int32_t>(*gpu_space, {1, 2, 3}, cudf::type_id::INT32);
   auto batch_id = batch->get_batch_id();
-  push_batch(repo, *ch, batch);
+  push_batch(*op, batch);
 
   // Execute source to produce output.
   auto input  = op->get_next_task_input_data();
@@ -602,9 +642,9 @@ TEST_CASE("streaming_source SRC-19: hint chaining reaches source via WAITING pro
   auto* gpu_space = mem_mgr->get_memory_space(Tier::GPU, 0);
   REQUIRE(gpu_space != nullptr);
 
-  auto [op, ch, repo] = make_source();
+  auto [op, repo] = make_source();
 
-  // When channel is empty: source returns WAITING{nullptr}. Chaining ends.
+  // When the stream is empty: source returns WAITING{nullptr}. Chaining ends.
   {
     task_creation_hint downstream_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, op.get()};
     auto chained = downstream_hint.producer->get_next_task_hint();
@@ -614,8 +654,7 @@ TEST_CASE("streaming_source SRC-19: hint chaining reaches source via WAITING pro
   }
 
   // Push a batch: source should now return READY.
-  auto batch = make_numeric_batch<int32_t>(*gpu_space, {42}, cudf::type_id::INT32);
-  push_batch(repo, *ch, batch);
+  push_batch(*op, make_numeric_batch<int32_t>(*gpu_space, {42}, cudf::type_id::INT32));
 
   {
     task_creation_hint downstream_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, op.get()};
@@ -636,24 +675,17 @@ TEST_CASE("streaming_source SRC-20: producer thread and consumer loop", "[stream
   auto* gpu_space = mem_mgr->get_memory_space(Tier::GPU, 0);
   REQUIRE(gpu_space != nullptr);
 
-  constexpr int K     = 20;
-  auto stream         = default_stream();
-  auto [op, ch, repo] = make_source(8 /*capacity*/);
+  constexpr int K = 20;
+  auto stream     = default_stream();
+  auto [op, repo] = make_source();
 
   std::atomic<int> pushed{0};
   std::thread producer([&] {
     for (int i = 0; i < K; ++i) {
-      auto batch = make_numeric_batch<int32_t>(*gpu_space, {i}, cudf::type_id::INT32);
-      // Serialize repo registration + channel push.
-      uint64_t id = batch->get_batch_id();
-      repo->add_data_batch(batch);
-      while (!ch->push(exchange_batch_handle{id, 0})) {
-        // push returns false only on close — shouldn't happen during producer run.
-        break;
-      }
+      op->push(make_numeric_batch<int32_t>(*gpu_space, {i}, cudf::type_id::INT32));
       pushed.fetch_add(1, std::memory_order_release);
     }
-    ch->close();
+    op->close_input(SOLE_SENDER);
   });
 
   int received = 0;
@@ -689,12 +721,11 @@ TEST_CASE("streaming_source SRC-21: concurrent input-data pulls deliver each bat
   auto* gpu_space = mem_mgr->get_memory_space(Tier::GPU, 0);
   REQUIRE(gpu_space != nullptr);
 
-  constexpr int K     = 40;
-  auto [op, ch, repo] = make_source(K);
+  constexpr int K = 40;
+  auto [op, repo] = make_source();
 
   for (int i = 0; i < K; ++i) {
-    auto batch = make_numeric_batch<int32_t>(*gpu_space, {i}, cudf::type_id::INT32);
-    push_batch(repo, *ch, batch);
+    push_batch(*op, make_numeric_batch<int32_t>(*gpu_space, {i}, cudf::type_id::INT32));
   }
 
   std::atomic<int> received{0};
@@ -725,8 +756,90 @@ TEST_CASE("streaming_source SRC-21: concurrent input-data pulls deliver each bat
 }
 
 // ============================================================================
-// BUG-1 (reproduction): closing an empty stream must finish a zero-task
-// pipeline.
+// SRC-22: constructor input validation
+// ============================================================================
+
+TEST_CASE("streaming_source SRC-22: null repository is rejected", "[streaming_source]")
+{
+  auto types =
+    sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER});
+
+  REQUIRE_THROWS_AS(
+    sirius_physical_streaming_source(types, 0, nullptr, std::set<sender_id_t>{SOLE_SENDER}),
+    sirius::invalid_input_exception);
+}
+
+// ============================================================================
+// SRC-23: no batch is accepted after end-of-stream
+// ============================================================================
+
+TEST_CASE("streaming_source SRC-23: push after end-of-stream is rejected", "[streaming_source]")
+{
+  auto mem_mgr    = sirius::test::operator_utils::initialize_memory_manager();
+  auto* gpu_space = mem_mgr->get_memory_space(Tier::GPU, 0);
+  REQUIRE(gpu_space != nullptr);
+
+  auto [op, repo] = make_source();
+  op->close_input(SOLE_SENDER);
+
+  // A late batch must not appear behind a consumer that already saw EOS.
+  REQUIRE_FALSE(op->push(make_numeric_batch<int32_t>(*gpu_space, {1}, cudf::type_id::INT32)));
+  REQUIRE(repo->total_size() == 0);
+  REQUIRE(op->all_ports_empty());
+}
+
+// ============================================================================
+// SRC-24: fan-in EOS needs every distinct sender
+// ============================================================================
+
+TEST_CASE("streaming_source SRC-24: fan-in stream ends only after all senders close",
+          "[streaming_source]")
+{
+  auto [op, repo] = make_source({0, 1});
+
+  op->close_input(0);
+  REQUIRE_FALSE(op->all_ports_empty());
+
+  // A repeated close from the same sender must not stand in for the missing one.
+  op->close_input(0);
+  REQUIRE_FALSE(op->all_ports_empty());
+  REQUIRE(op->get_next_task_hint()->hint == TaskCreationHint::WAITING_FOR_INPUT_DATA);
+
+  op->close_input(1);
+  REQUIRE(op->all_ports_empty());
+  REQUIRE_FALSE(op->get_next_task_hint().has_value());
+
+  // An unexpected sender is a wiring bug, not something to silently count.
+  REQUIRE_THROWS_AS(op->close_input(7), sirius::invalid_input_exception);
+}
+
+// ============================================================================
+// SRC-25: the repository is the producer's, not the operator's — destroying the
+// consumer side leaves the queue and its contents intact. This is what lets a
+// session hand the same repository to a wrapper that outlives one fragment.
+// ============================================================================
+
+TEST_CASE("streaming_source SRC-25: the input repository outlives the operator",
+          "[streaming_source][pipeline_completion]")
+{
+  auto mem_mgr    = sirius::test::operator_utils::initialize_memory_manager();
+  auto* gpu_space = mem_mgr->get_memory_space(Tier::GPU, 0);
+  REQUIRE(gpu_space != nullptr);
+
+  auto [op, repo] = make_source();
+  {
+    auto pipeline = make_single_op_pipeline(*op);
+  }
+  push_batch(*op, make_numeric_batch<int32_t>(*gpu_space, {1}, cudf::type_id::INT32));
+
+  // Destroying the operator drops its reference to the stream; the repository is independently
+  // owned and keeps the queued batch.
+  op.reset();
+  REQUIRE(repo->total_size() == 1);
+}
+
+// ============================================================================
+// BUG-1 (regression): closing an empty stream must finish a zero-task pipeline.
 //
 // These BUG-* tests exercise the real sirius_pipeline completion predicate
 // (update_pipeline_status() / is_pipeline_finished()), not just the operator's
@@ -738,29 +851,27 @@ TEST_CASE("streaming_source SRC-21: concurrent input-data pulls deliver each bat
 TEST_CASE("streaming_source BUG-1: closing an empty stream finishes a zero-task pipeline",
           "[streaming_source][pipeline_completion]")
 {
-  auto [op, ch, repo] = make_source();
-  auto pipeline       = make_single_op_pipeline(*op);
+  auto [op, repo] = make_source();
+  auto pipeline   = make_single_op_pipeline(*op);
 
   REQUIRE_FALSE(pipeline->is_pipeline_finished());
 
-  // Stream closes with zero batches ever pushed: tasks_created == tasks_completed
-  // == 0 forever, and the source is now exhausted (closed + drained).
-  ch->close();
+  // Stream ends with zero batches ever pushed: tasks_created == tasks_completed
+  // == 0 forever, and the source is now exhausted.
+  op->close_input(SOLE_SENDER);
   REQUIRE(op->all_ports_empty());
   REQUIRE(pipeline->get_tasks_created() == 0);
   REQUIRE(pipeline->get_tasks_completed() == 0);
 
-  // BUG: nothing in the current architecture re-evaluates pipeline status when a
-  // source's stream closes without ever needing a task — task_creator's
-  // manager_loop silently drops the request when get_operator_for_next_task()
-  // resolves to nullptr, so update_pipeline_status() is never called here. The
-  // finish predicate is already satisfiable (0 == 0 tasks, source exhausted) but
-  // nobody asks it to check.
+  // Without the end-of-stream hook nothing re-evaluates pipeline status here: task_creator's
+  // manager_loop silently drops the request when get_operator_for_next_task() resolves to
+  // nullptr, so update_pipeline_status() would never be called. The finish predicate is already
+  // satisfiable (0 == 0 tasks, source exhausted) but nobody would ask it to check.
   REQUIRE(pipeline->is_pipeline_finished());
 }
 
 // ============================================================================
-// BUG-2 (reproduction): closing the stream after the last task has already
+// BUG-2 (regression): closing the stream after the last task has already
 // completed must finish the pipeline.
 // ============================================================================
 
@@ -771,11 +882,10 @@ TEST_CASE("streaming_source BUG-2: late close after last task completed finishes
   auto* gpu_space = mem_mgr->get_memory_space(Tier::GPU, 0);
   REQUIRE(gpu_space != nullptr);
 
-  auto [op, ch, repo] = make_source();
-  auto pipeline       = make_single_op_pipeline(*op);
+  auto [op, repo] = make_source();
+  auto pipeline   = make_single_op_pipeline(*op);
 
-  auto batch = make_numeric_batch<int32_t>(*gpu_space, {1}, cudf::type_id::INT32);
-  push_batch(repo, *ch, batch);
+  push_batch(*op, make_numeric_batch<int32_t>(*gpu_space, {1}, cudf::type_id::INT32));
 
   // Simulate the one real task the task-creator would have made for this batch:
   // mark_task_created()/mark_task_completed() are the same production calls made
@@ -784,7 +894,7 @@ TEST_CASE("streaming_source BUG-2: late close after last task completed finishes
   auto pod = op->get_next_task_input_data();
   REQUIRE(pod != nullptr);
 
-  // Task completes while the channel is still OPEN (more data could still
+  // Task completes while the stream is still OPEN (more data could still
   // arrive): correctly not finished yet.
   pipeline->mark_task_completed();
   REQUIRE_FALSE(op->all_ports_empty());
@@ -792,51 +902,13 @@ TEST_CASE("streaming_source BUG-2: late close after last task completed finishes
 
   // Later: the producer closes the stream. No more tasks will ever run, and the
   // last one already completed (tasks_created == tasks_completed == 1).
-  ch->close();
+  op->close_input(SOLE_SENDER);
   REQUIRE(op->all_ports_empty());
   REQUIRE(pipeline->get_tasks_created() == pipeline->get_tasks_completed());
 
-  // BUG: the close happens with no task in flight, so nothing calls
-  // mark_task_completed() -> update_pipeline_status() to notice the pipeline can
-  // now finish. The pipeline is stuck even though its finish predicate is
-  // satisfied.
+  // The close happens with no task in flight, so only the end-of-stream hook can notice the
+  // pipeline can now finish.
   REQUIRE(pipeline->is_pipeline_finished());
-}
-
-// ============================================================================
-// SRC-22: constructor input validation
-// ============================================================================
-
-TEST_CASE("streaming_source SRC-22: null channel or repository is rejected", "[streaming_source]")
-{
-  auto types =
-    sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER});
-  auto ch   = std::make_shared<exchange_channel>(exchange_channel::config{16});
-  auto repo = std::make_shared<cucascade::shared_data_repository>();
-
-  REQUIRE_THROWS_AS(sirius_physical_streaming_source(types, 0, nullptr, repo),
-                    sirius::invalid_input_exception);
-  REQUIRE_THROWS_AS(sirius_physical_streaming_source(types, 0, ch, nullptr),
-                    sirius::invalid_input_exception);
-}
-
-// ============================================================================
-// SRC-23: close after the consumer side is destroyed must not touch freed
-// memory. The on-close callback holds only a weak pipeline reference, so a
-// producer closing a channel that outlived its operator/pipeline is a no-op.
-// ============================================================================
-
-TEST_CASE("streaming_source SRC-23: close after operator and pipeline destruction is safe",
-          "[streaming_source][pipeline_completion]")
-{
-  auto [op, ch, repo] = make_source();
-  {
-    auto pipeline = make_single_op_pipeline(*op);
-  }
-  op.reset();  // channel (producer side) outlives the whole consumer side
-
-  ch->close();  // fires on_close; the weak pipeline reference is expired
-  REQUIRE(ch->drained());
 }
 
 // ============================================================================
@@ -847,52 +919,23 @@ TEST_CASE("streaming_source SRC-23: close after operator and pipeline destructio
 // downstream pipeline never gets a task scheduled.
 // ============================================================================
 
-namespace {
-
-/// task_creator that only records what would have been scheduled.
-class recording_task_creator : public sirius::creator::task_creator {
- public:
-  explicit recording_task_creator(sirius::memory::sirius_memory_reservation_manager& mem_mgr)
-    : task_creator(sirius::creator::task_creator_config{}, mem_mgr)
-  {
-  }
-
-  void schedule(sirius_physical_operator* request) override
-  {
-    std::lock_guard<std::mutex> lock(_mutex);
-    _scheduled.push_back(request);
-  }
-
-  bool scheduled(const sirius_physical_operator* op)
-  {
-    std::lock_guard<std::mutex> lock(_mutex);
-    return std::find(_scheduled.begin(), _scheduled.end(), op) != _scheduled.end();
-  }
-
- private:
-  std::mutex _mutex;
-  std::vector<sirius_physical_operator*> _scheduled;
-};
-
-}  // namespace
-
 TEST_CASE("streaming_source BUG-3: closing an empty stream schedules downstream consumers",
           "[streaming_source][pipeline_completion]")
 {
   auto mem_mgr = sirius::test::operator_utils::initialize_memory_manager();
   recording_task_creator creator(*mem_mgr);
 
-  auto [op, ch, repo] = make_source();
-  auto pipeline       = make_single_op_pipeline(*op);
+  auto [op, repo] = make_source();
+  auto pipeline   = make_single_op_pipeline(*op);
   pipeline->set_task_creator(&creator);
 
   // Downstream pipeline consuming this one's output: its source operator is what
   // notify_downstream_pipelines() must hand to the task_creator on finish.
-  auto [downstream_op, downstream_ch, downstream_repo] = make_source();
-  auto downstream                                      = make_single_op_pipeline(*downstream_op);
+  auto [downstream_op, downstream_repo] = make_source();
+  auto downstream                       = make_single_op_pipeline(*downstream_op);
   downstream->add_dependency(pipeline);
 
-  ch->close();
+  op->close_input(SOLE_SENDER);
 
   REQUIRE(pipeline->is_pipeline_finished());
   REQUIRE(creator.scheduled(downstream_op.get()));
@@ -906,17 +949,16 @@ TEST_CASE("streaming_source BUG-4: late close after last task schedules downstre
   REQUIRE(gpu_space != nullptr);
   recording_task_creator creator(*mem_mgr);
 
-  auto [op, ch, repo] = make_source();
-  auto pipeline       = make_single_op_pipeline(*op);
+  auto [op, repo] = make_source();
+  auto pipeline   = make_single_op_pipeline(*op);
   pipeline->set_task_creator(&creator);
 
-  auto [downstream_op, downstream_ch, downstream_repo] = make_source();
-  auto downstream                                      = make_single_op_pipeline(*downstream_op);
+  auto [downstream_op, downstream_repo] = make_source();
+  auto downstream                       = make_single_op_pipeline(*downstream_op);
   downstream->add_dependency(pipeline);
 
-  // Run the stream's one real task to completion while the channel is still open.
-  auto batch = make_numeric_batch<int32_t>(*gpu_space, {1}, cudf::type_id::INT32);
-  push_batch(repo, *ch, batch);
+  // Run the stream's one real task to completion while it is still open.
+  push_batch(*op, make_numeric_batch<int32_t>(*gpu_space, {1}, cudf::type_id::INT32));
   pipeline->mark_task_created();
   auto pod = op->get_next_task_input_data();
   REQUIRE(pod != nullptr);
@@ -926,8 +968,217 @@ TEST_CASE("streaming_source BUG-4: late close after last task schedules downstre
 
   // Late close with no task in flight: the pipeline must finish AND its
   // downstream consumer must still get scheduled.
-  ch->close();
+  op->close_input(SOLE_SENDER);
 
   REQUIRE(pipeline->is_pipeline_finished());
   REQUIRE(creator.scheduled(downstream_op.get()));
+}
+
+// ============================================================================
+// REARM-1: a push after a WAITING hint re-schedules the starved source.
+//
+// This is the live edge the whole streaming source depends on. A head that
+// answers WAITING{nullptr} is dropped by the task creator, and the only
+// built-in re-nomination is task completion — which a starved stream-fed
+// source will never see. Without this the source is non-functional.
+// ============================================================================
+
+TEST_CASE("streaming_source REARM-1: a push after a WAITING hint re-schedules the source",
+          "[streaming_source][pipeline_completion]")
+{
+  auto mem_mgr    = sirius::test::operator_utils::initialize_memory_manager();
+  auto* gpu_space = mem_mgr->get_memory_space(Tier::GPU, 0);
+  REQUIRE(gpu_space != nullptr);
+  recording_task_creator creator(*mem_mgr);
+
+  auto [op, repo] = make_source();
+  auto pipeline   = make_single_op_pipeline(*op);
+  pipeline->set_task_creator(&creator);
+
+  // Starve: the hint parks, and nothing is scheduled yet.
+  auto hint = op->get_next_task_hint();
+  REQUIRE(hint.has_value());
+  REQUIRE(hint->hint == TaskCreationHint::WAITING_FOR_INPUT_DATA);
+  REQUIRE_FALSE(creator.scheduled(op.get()));
+
+  push_batch(*op, make_numeric_batch<int32_t>(*gpu_space, {1}, cudf::type_id::INT32));
+  REQUIRE(creator.schedule_count(op.get()) == 1);
+
+  // Every push nominates the head — there is no arm to re-install, which is precisely why a
+  // push can never race past the notification.
+  push_batch(*op, make_numeric_batch<int32_t>(*gpu_space, {2}, cudf::type_id::INT32));
+  REQUIRE(creator.schedule_count(op.get()) == 2);
+
+  // Still true after a drain, with no intervening hint call.
+  REQUIRE(op->get_next_task_input_data() != nullptr);
+  REQUIRE(op->get_next_task_input_data() != nullptr);
+  REQUIRE(op->get_next_task_input_data() == nullptr);
+  push_batch(*op, make_numeric_batch<int32_t>(*gpu_space, {3}, cudf::type_id::INT32));
+  REQUIRE(creator.schedule_count(op.get()) == 3);
+}
+
+// ============================================================================
+// REARM-4: a producer's second burst is consumed after a drain.
+//
+// The task creator's drain loop is
+//     while (!all_ports_empty()) { d = get_next_task_input_data(); if (!d) break; ... }
+// — it never calls get_next_task_hint(). The head is scheduled once by start_query() and task
+// completion only nominates consumers, so if notification depended on a hint call the head
+// would go silent the moment a drain ended and every later push would be stranded.
+//
+// This drives that exact loop shape instead of hand-calling the hint.
+// ============================================================================
+
+TEST_CASE("streaming_source REARM-4: a push after a drained drain loop re-schedules the source",
+          "[streaming_source][pipeline_completion]")
+{
+  auto mem_mgr    = sirius::test::operator_utils::initialize_memory_manager();
+  auto* gpu_space = mem_mgr->get_memory_space(Tier::GPU, 0);
+  REQUIRE(gpu_space != nullptr);
+  recording_task_creator creator(*mem_mgr);
+
+  auto [op, repo] = make_source();
+  auto pipeline   = make_single_op_pipeline(*op);
+  pipeline->set_task_creator(&creator);
+
+  // First burst, before the source is ever asked for a hint.
+  push_batch(*op, make_numeric_batch<int32_t>(*gpu_space, {1}, cudf::type_id::INT32));
+  REQUIRE(creator.schedule_count(op.get()) == 1);
+
+  // The task creator's drain loop, verbatim.
+  std::size_t drained = 0;
+  while (!op->all_ports_empty()) {
+    auto data = op->get_next_task_input_data();
+    if (!data) { break; }
+    ++drained;
+  }
+  REQUIRE(drained == 1);
+
+  // Second burst, after the loop broke on the empty pop and with no hint call in between.
+  // Nothing else can nominate the head, so this push has to.
+  push_batch(*op, make_numeric_batch<int32_t>(*gpu_space, {2}, cudf::type_id::INT32));
+  REQUIRE(creator.schedule_count(op.get()) == 2);
+
+  // And the batch is really still there to be consumed.
+  REQUIRE(op->get_next_task_input_data() != nullptr);
+}
+
+// ============================================================================
+// REARM-2: a push racing the WAITING hint is not lost.
+//
+// The arm predicate re-checks emptiness under the same lock push() holds while
+// it inserts, so a batch that lands between classify() and the arm turns the
+// hint into READY instead of parking on a waker that will never fire again.
+// ============================================================================
+
+TEST_CASE("streaming_source REARM-2: a batch already queued turns the hint into READY",
+          "[streaming_source][pipeline_completion]")
+{
+  auto mem_mgr    = sirius::test::operator_utils::initialize_memory_manager();
+  auto* gpu_space = mem_mgr->get_memory_space(Tier::GPU, 0);
+  REQUIRE(gpu_space != nullptr);
+  recording_task_creator creator(*mem_mgr);
+
+  auto [op, repo] = make_source();
+  auto pipeline   = make_single_op_pipeline(*op);
+  pipeline->set_task_creator(&creator);
+
+  push_batch(*op, make_numeric_batch<int32_t>(*gpu_space, {1}, cudf::type_id::INT32));
+
+  auto hint = op->get_next_task_hint();
+  REQUIRE(hint.has_value());
+  REQUIRE(hint->hint == TaskCreationHint::READY);
+  REQUIRE(hint->producer == op.get());
+}
+
+// ============================================================================
+// REARM-3: a source with no task_creator wired parks without crashing. The
+// waker resolves the creator through the pipeline at fire time, so a pipeline
+// built before the executor attached is a no-op, not a null dereference.
+// ============================================================================
+
+TEST_CASE("streaming_source REARM-3: a push with no task_creator wired is harmless",
+          "[streaming_source][pipeline_completion]")
+{
+  auto mem_mgr    = sirius::test::operator_utils::initialize_memory_manager();
+  auto* gpu_space = mem_mgr->get_memory_space(Tier::GPU, 0);
+  REQUIRE(gpu_space != nullptr);
+
+  auto [op, repo] = make_source();
+  auto pipeline   = make_single_op_pipeline(*op);  // no set_task_creator()
+
+  REQUIRE(op->get_next_task_hint()->hint == TaskCreationHint::WAITING_FOR_INPUT_DATA);
+  push_batch(*op, make_numeric_batch<int32_t>(*gpu_space, {1}, cudf::type_id::INT32));
+  REQUIRE(op->get_next_task_hint()->hint == TaskCreationHint::READY);
+}
+
+// ============================================================================
+// SRC-26: a producer error reaches the puller as data, then as a throw.
+//
+// The failure travels the same waker → hint → pull path a batch does, because that is the only
+// path a source has: nothing else nominates a starved streaming source.
+// ============================================================================
+
+TEST_CASE("streaming_source SRC-26: a producer error is rethrown to the puller",
+          "[streaming_source][pipeline_completion]")
+{
+  auto mem_mgr = sirius::test::operator_utils::initialize_memory_manager();
+  recording_task_creator creator(*mem_mgr);
+
+  auto [op, repo] = make_source();
+  auto pipeline   = make_single_op_pipeline(*op);
+  pipeline->set_task_creator(&creator);
+
+  // Starve the source, as the scheduler would leave it.
+  REQUIRE(op->get_next_task_hint()->hint == TaskCreationHint::WAITING_FOR_INPUT_DATA);
+  REQUIRE_FALSE(creator.scheduled(op.get()));
+
+  op->fail_input(std::make_exception_ptr(std::runtime_error("producer failed")));
+
+  // Waker: the parked source is nominated again, or the error is never looked at.
+  REQUIRE(creator.schedule_count(op.get()) == 1);
+  // Hint: READY, not the nullopt that would quietly retire the source.
+  auto hint = op->get_next_task_hint();
+  REQUIRE(hint.has_value());
+  REQUIRE(hint->hint == TaskCreationHint::READY);
+  // Pull: the throw.
+  REQUIRE_THROWS_AS(op->get_next_task_input_data(), std::runtime_error);
+}
+
+// ============================================================================
+// SRC-27: an errored stream neither reports success nor wedges the scheduler.
+//
+// all_ports_empty() is error-aware, so a failed stream is never "empty-and-done" and the pipeline
+// cannot finish as if the query had succeeded. The drain loop still terminates — by the throw.
+// ============================================================================
+
+TEST_CASE("streaming_source SRC-27: an errored stream does not finish the pipeline quietly",
+          "[streaming_source][pipeline_completion]")
+{
+  auto mem_mgr    = sirius::test::operator_utils::initialize_memory_manager();
+  auto* gpu_space = mem_mgr->get_memory_space(Tier::GPU, 0);
+  REQUIRE(gpu_space != nullptr);
+
+  auto [op, repo] = make_source();
+  auto pipeline   = make_single_op_pipeline(*op);
+
+  // A batch produced before the failure is queued, and must never be processed.
+  push_batch(*op, make_numeric_batch<int32_t>(*gpu_space, {1}, cudf::type_id::INT32));
+  op->fail_input(std::make_exception_ptr(std::runtime_error("producer failed")));
+
+  // The empty-and-done predicate driving pipeline completion stays false, so the end-of-stream
+  // hook's update_pipeline_status() cannot declare the query finished.
+  REQUIRE_FALSE(op->all_ports_empty());
+  REQUIRE_FALSE(pipeline->is_pipeline_finished());
+
+  // The task creator's drain loop does not spin either: the first pull throws, which is how the
+  // failure leaves the pipeline.
+  REQUIRE_THROWS_AS(
+    [&] {
+      while (!op->all_ports_empty()) {
+        auto data = op->get_next_task_input_data();
+        if (!data) { break; }
+      }
+    }(),
+    std::runtime_error);
 }

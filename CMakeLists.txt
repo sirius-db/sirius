@@ -253,6 +253,7 @@ set(EXTENSION_SOURCES
     src/expression_evaluator/specializations/reference.cpp
     # Execution primitives (slot-based backpressure / completion tracking)
     src/exec/admission_control.cpp
+    src/exec/batch_stream.cpp
     # I/O adapters (Phase 19 — io_uring + sirius_datasource)
     src/io/datasource_factory.cpp
     src/io/io_context.cpp
@@ -603,8 +604,8 @@ set(TEST_SOURCES
     test/cpp/downgrade/test_downgrade_disk.cpp
     test/cpp/downgrade/test_downgrade_executor.cpp
     test/cpp/downgrade/test_downgrade_lifecycle.cpp
+    test/cpp/exec/test_batch_stream.cpp
     test/cpp/exec/test_bounded_thread_pool.cpp
-    test/cpp/exec/test_exchange_channel.cpp
     test/cpp/exec/test_inspectable_mpsc.cpp
     test/cpp/exec/test_interruptible_mpmc.cpp
     test/cpp/exec/test_multi_index_priority_queue.cpp
