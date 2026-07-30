@@ -412,6 +412,12 @@ triggered the spill. Exploration made it far worse (hundreds of trial encodes) a
 removing it was worth doing, but the residual is inherent to compressing *on the
 device being evacuated*. Tuning cannot fix it.
 
+> **Scope narrowed later.** This holds for the `std::bad_alloc: out_of_memory`
+> declines measured here, which are genuine allocation failures. It was subsequently
+> over-applied to the `launch_encode_fused_tree failed` signature, which is a CUDA
+> *handle* error and had an unrelated one-line cause — see "the device tier's
+> `launch_encode_fused_tree` failure was a missing `cudaSetDevice`" below.
+
 Plausible directions, roughly in order of appeal:
 
 1. Reserve a small device arena for spill compression up front, outside the pool the
@@ -645,6 +651,66 @@ free to attempt — `reservation_aware_resource_adaptor` keys its tracker state 
 to the task's reservation nor subject to its limit/OOM policy. (Note
 `pin_table`'s existing use of `compress_columns_parallel` is untracked for this
 reason; it is tolerable only because pinning runs outside a query reservation.)
+
+### MEASURED: the device tier's `launch_encode_fused_tree` failure was a missing `cudaSetDevice`, not memory pressure
+
+**A third conclusion in this document is withdrawn: that compressing on the device
+being evacuated is architecturally blocked by memory pressure.** For the
+`launch_encode_fused_tree failed` signature it is not. That failure was one missing
+`cudaSetDevice` on one thread.
+
+`downgrade_executor::start()` installs a `per_thread_init` calling `cudaSetDevice`,
+but only on the worker pool — `_processing_thread` never got it, and the in-place
+compression pass runs there, in `processing_loop()`. `cudaSetDevice` is what makes
+the device's primary context current. Simpatico derives its JIT `CUfunction` lazily
+on whichever thread first asks and caches it **by device id, not by context**
+(`CompiledKernel::func_for_current_device`, `nvrtc_compiler.cpp:96`). When the
+unbound processing thread won that race, `cuKernelGetFunction` returned a handle
+`cuLaunchKernel` then rejected with `CUDA_ERROR_INVALID_HANDLE`.
+
+q3/SF100, arm `device`, output compression off, before → after the one-line fix:
+
+| | before | after |
+| --- | ---: | ---: |
+| batches compressed | 0 / 78 | **43 / 43** (7 passes) |
+| declines | 75 | 0 |
+| `cuLaunchKernel` failures | 75 | 0 |
+| freed per pass | — | 40–241 MB |
+
+The control that identified it: enabling task-output compression *alongside* the
+device tier — so a task-executor thread populates the `CUfunction` cache first —
+took the identical unfixed run from 0/78 to **76/76**. Same query, same config, same
+process. The variable was cache-warm order, not free memory.
+
+Two lessons worth keeping:
+
+1. **The error was invisible by construction.** `launch_encode_fused_tree` discards
+   its `CUresult` and reports only `"launch_encode_fused_tree failed"`; the actual
+   `cuLaunchKernel failed: invalid resource handle` goes to **stderr via `fprintf`**,
+   not the log. Two separate investigations read the generic message as OOM. Reading
+   the swallowed status was the cheapest possible diagnostic and would have
+   short-circuited both. Propagating it belongs upstream in simpatico.
+2. **`CUDA_ERROR_INVALID_HANDLE` is not an allocation failure.** A launch-time
+   handle error and `std::bad_alloc` are different problems; only the latter is about
+   memory. The "lineage seeding … but compression itself OOMs" section above reports
+   genuine `std::bad_alloc: out_of_memory` from `compress_column` — **that** finding
+   stands and is untouched by this fix.
+
+The peak-residency work (216 MB → 92 MB on q3/SF100, `U + 2C` → `2C`) was aimed at
+the pressure this section now shows was not the blocker. It is still worth having —
+it removed an unretryable throw after `release_table()` — but it did not and could
+not fix the device tier.
+
+Corroboration, not proof, for the spill path: the archived sweeps carry the same
+signature on the spill arm only (`spill_sweep` 26, `threeway_sweep` 28,
+`fourway_sweep` 40 occurrences), which runs on this same thread. A post-fix q3 spill
+run shows 76 successful compressions and zero launch failures, but there is no
+matched pre-fix single-query baseline.
+
+Consequence for the record: **every previously reported `device`-arm timing measured
+a feature that never fired**, which is exactly why the 4-way sweep found that arm
+"behaviourally identical to `normal`". Those numbers say nothing about the tier and
+should not be cited. A re-measurement is now meaningful for the first time.
 
 ### Spill state is per-query and is cleared at query end
 
