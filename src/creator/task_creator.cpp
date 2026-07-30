@@ -131,7 +131,8 @@ void task_creator::set_task_scheduler(sirius::pipeline::task_scheduler& task_sch
   _task_scheduler = &task_scheduler;
 }
 
-void task_creator::prepare_for_query(const sirius::planner::query& query)
+void task_creator::prepare_for_query(const sirius::planner::query& query,
+                                     std::shared_ptr<pipeline::completion_handler> handler)
 {
   const auto query_id = query.query_id();
 
@@ -150,6 +151,8 @@ void task_creator::prepare_for_query(const sirius::planner::query& query)
   std::shared_ptr<const telemetry::telemetry_context> telemetry_context =
     sirius_ctx->get_telemetry_context();
 
+  state->completion_handler = handler;
+
   auto pipeline_priorities = compute_pipeline_priorities(query);
 
   // Filled once, here, and never mutated afterwards: task-creation workers read it without a
@@ -165,6 +168,7 @@ void task_creator::prepare_for_query(const sirius::planner::query& query)
     size_t operator_id = source_operator->get_operator_id();
     auto gs =
       std::make_shared<pipeline::gpu_pipeline_task_global_state>(pipeline, telemetry_context);
+    gs->set_completion_handler(handler);
     if (auto it = pipeline_priorities.find(pipeline.get()); it != pipeline_priorities.end()) {
       gs->set_priority(it->second);
       // Mirror it onto the pipeline so schedule() can key a request without locking.
@@ -410,11 +414,22 @@ void task_creator::schedule(op::sirius_physical_operator* node, sirius::query_id
   _task_creation_queue.push(std::move(request));
 }
 
-void task_creator::schedule_lookahead(sirius::query_id_t query_id,
-                                      std::optional<int> device_id_hint)
+void task_creator::schedule_lookahead(std::optional<int> device_id_hint)
 {
   if (_config.strategy != request_type::lookahead) { return; }
-  auto state = get_query_task_global_state(query_id);
+
+  // Select the first query, which is the implicit FIFO priority.
+  // TODO: Will want to revisit this, to have lookahead be able to schedule lookahead for the
+  // following query as well if needed.
+  sirius::query_id_t query_id{};
+  std::shared_ptr<query_task_global_state> state;
+  {
+    std::lock_guard<std::mutex> lock(_global_state_mutex);
+    if (_query_task_global_states.empty()) { return; }
+    auto it  = _query_task_global_states.begin();
+    query_id = it->first;
+    state    = it->second;
+  }
   if (!state) { return; }
 
   std::lock_guard lock(state->lookahead_mutex);
@@ -672,7 +687,8 @@ void task_creator::manager_loop()
           pipeline->update_pipeline_status(false);
         } catch (const std::exception& e) {
           SIRIUS_LOG_ERROR("Task Creator: Exception during task creation: {}", e.what());
-          _task_scheduler->terminate_query(std::current_exception());
+          _task_scheduler->terminate_query(query_state->completion_handler,
+                                           std::current_exception());
           stop();
         }
       });
