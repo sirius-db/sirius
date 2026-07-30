@@ -808,6 +808,18 @@ bool sirius_physical_hash_join::is_build_probe_mode()
   return _join_mode == HASH_JOIN_MODE::BUILD_PROBE;
 }
 
+bool sirius_physical_hash_join::publishes_dynamic_filters() const
+{
+  // Both are fixed at construction, so this needs no lock.
+  return filter_pushdown != nullptr && _dynamic_filter_plan.enabled();
+}
+
+void sirius_physical_hash_join::set_build_arrives_whole(bool arrives_whole)
+{
+  std::lock_guard<std::mutex> lg(op_state_mutex);
+  _build_arrives_whole = arrives_whole;
+}
+
 std::vector<build_probe_slot_view> sirius_physical_hash_join::snapshot_build_probe_slots()
 {
   auto* build_port = get_port("build");
@@ -1975,44 +1987,40 @@ void sirius_physical_hash_join::push_data_batch_partitioned(
 {
   //===----------Dynamic Table Filters----------===//
   // Build-side dynamic-filter publish: the moment the (single, concat-folded) build batch arrives,
-  // compute and publish the filter from the build keys. This is gated to the two BUILD_PROBE shapes
-  // where a single partition's build batch covers the whole build side, so the one-shot publisher
-  // and its single-GPU reduction emit a complete filter:
-  //   - Single partition (`size() == 1`)
-  //   - Broadcast (`_broadcast`)
+  // compute and publish the filter from the build keys.
+  //
+  // The publisher is one-shot, so the batch it claims must carry the WHOLE build side — a filter
+  // built from part of the key set would drop probe rows that do in fact join. The upstream
+  // PARTITION knows whether that holds (a single-partition or broadcast build, folded to one batch
+  // by a concat_all build-side CONCAT) and reports it at sizing time through
+  // `set_build_arrives_whole`. The join mode is deliberately not part of the condition: a
+  // single-partition STANDARD / MIXED_JOIN build publishes on the same terms as BUILD_PROBE.
   std::optional<::cucascade::read_only_data_batch> build_ro;
   if (port_id == "build" && batch) {
-    bool claim                    = false;
-    bool wired_but_multipartition = false;
-    std::size_t build_partitions  = 0;
+    bool claim              = false;
+    bool wired_but_unusable = false;
+    HASH_JOIN_MODE mode     = HASH_JOIN_MODE::STANDARD;
     {
       std::scoped_lock lg(op_state_mutex);
       const bool open = _dynamic_filter_publication_state.load(std::memory_order_acquire) ==
                         dynamic_filter_publication_state::OPEN;
-      const bool wired                  = filter_pushdown && _dynamic_filter_plan.enabled();
-      const bool single_partition_build = _partition_build_states.size() == 1 || _broadcast;
-      build_partitions                  = _partition_build_states.size();
-      claim = open && _join_mode == HASH_JOIN_MODE::BUILD_PROBE && single_partition_build && wired;
+      const bool wired = filter_pushdown && _dynamic_filter_plan.enabled();
+      claim            = open && wired && _build_arrives_whole;
 
-      // A join that has a filter plan and is still open, but cannot use the
-      // one-shot publisher, silently publishes nothing. Two ways to land here,
-      // and BOTH are the multi-partition case:
-      //   - BUILD_PROBE whose build spans >1 partition, and
-      //   - STANDARD / MIXED_JOIN, which are the partitioned modes to begin with.
-      // Deliberately NOT gated on BUILD_PROBE: gating on it would only ever find
-      // multi-partition builds among the single-partition-shaped joins, which is
-      // empty by construction and reports a reassuring zero.
-      wired_but_multipartition = open && wired && !single_partition_build;
+      // A join that has a filter plan and is still open but cannot use the one-shot publisher
+      // silently publishes nothing — say so.
+      wired_but_unusable = open && wired && !claim;
+      mode               = _join_mode;
     }
-    if (wired_but_multipartition) {
+    if (wired_but_unusable) {
       SIRIUS_LOG_DEBUG(
-        "[sirius_physical_hash_join] dynamic filter NOT published (id={}): mode={} build spans {} "
-        "partition(s); the publisher requires a single-partition or broadcast build",
+        "[sirius_physical_hash_join] dynamic filter NOT published (id={}): mode={}; the build does "
+        "not arrive as a single batch covering the whole build side (multi-partition, or no "
+        "concat-folded build — see this join's partition strategy log line)",
         get_operator_id(),
-        _join_mode == HASH_JOIN_MODE::BUILD_PROBE  ? "BUILD_PROBE"
-        : _join_mode == HASH_JOIN_MODE::MIXED_JOIN ? "MIXED_JOIN"
-                                                   : "STANDARD",
-        build_partitions);
+        mode == HASH_JOIN_MODE::BUILD_PROBE  ? "BUILD_PROBE"
+        : mode == HASH_JOIN_MODE::MIXED_JOIN ? "MIXED_JOIN"
+                                             : "STANDARD");
     }
     if (claim) { build_ro.emplace(batch->to_read_only()); }
   }
