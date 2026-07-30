@@ -24,6 +24,7 @@
 #include <duckdb/main/client_context.hpp>
 #include <duckdb/main/config.hpp>
 #include <log/logging.hpp>
+#include <util/duckdb_error_message.hpp>
 
 #include <exception>
 #include <utility>
@@ -68,12 +69,22 @@ void sirius_optimizer_hook(duckdb::OptimizerExtensionInput& input,
   // throws and we fall back to CPU. A capture whose planning attempt never
   // reaches finalize (e.g. Connection::ExtractPlan) is structurally rejected
   // at the next attempt by the generation check.
+  //
+  // One catch arm, not two: the copy fails either because an operator refuses to
+  // serialize (NotImplementedException) or because the round-trip rejects it
+  // some other way (SerializationException from an operator type the
+  // deserializer does not handle). Both mean the same thing here — no GPU — and
+  // splitting them left the first arm silent, so a whole class of "why did this
+  // query not go to the GPU" left no trace at any log level.
+  //
+  // This hook must not throw: DuckDB has no error path for an optimizer
+  // extension, so an escaping exception would surface as a query failure on a
+  // path whose only job is to *decline*. sanitized_message keeps that property.
   try {
     conn_state->set_captured_plan(copy_logical_plan(*plan, context));
-  } catch (duckdb::NotImplementedException&) {
-    // Plan not serializable — skip GPU.
   } catch (std::exception& e) {
-    SIRIUS_LOG_DEBUG("Transparent execution: failed to copy logical plan: {}", e.what());
+    SIRIUS_LOG_DEBUG("Transparent execution: failed to copy logical plan: {}",
+                     sirius::sanitized_message(e));
   }
 }
 
