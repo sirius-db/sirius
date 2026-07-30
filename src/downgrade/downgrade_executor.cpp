@@ -144,6 +144,32 @@ void downgrade_executor::drain()
 
 void downgrade_executor::processing_loop()
 {
+  // Bind this thread to the GPU, exactly as the worker pool's per_thread_init does.
+  //
+  // The in-place compression pass below runs HERE, on the processing thread, not on a
+  // pool worker — so without this the thread has no current CUDA context. That is not
+  // merely untidy: cudaSetDevice is what makes the device's primary context current,
+  // and simpatico derives its JIT CUfunction lazily on whichever thread first asks
+  // (CompiledKernel::func_for_current_device, keyed by device id, not by context). If
+  // this thread got there first, cuKernelGetFunction handed back a function that
+  // cuLaunchKernel then rejected with CUDA_ERROR_INVALID_HANDLE — "invalid resource
+  // handle" — and every in-place compression attempt declined.
+  //
+  // That failure was previously read as memory pressure, because it only ever showed
+  // up during a downgrade. It is not: with task-output compression also enabled, some
+  // task-executor thread populates the CUfunction cache first, this thread hits the
+  // warm entry, and the identical q3/SF100 run goes from 0/78 batches compressed to
+  // 76/76. The trigger was cache-warm order, not free memory.
+  if (_memory_space && _space_id.tier == cucascade::memory::Tier::GPU) {
+    const int device_id   = _memory_space->get_device_id();
+    const cudaError_t err = cudaSetDevice(device_id);
+    if (err != cudaSuccess) {
+      SIRIUS_LOG_ERROR("downgrade_executor processing_loop: cudaSetDevice({}) failed: {}",
+                       device_id,
+                       cudaGetErrorString(err));
+    }
+  }
+
   while (_running.load()) {
     auto request = _request_queue.pop();
     if (!request) break;  // interrupted
