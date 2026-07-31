@@ -195,20 +195,21 @@ class task_creator {
   /// No-op when no query is registered.
   void schedule_lookahead(std::optional<int> device_id_hint = std::nullopt);
 
-  /// \brief Fail @p query_id with @p error.
+  /// \brief Fail @p query_id with @p error, touching no shared subsystem.
   ///
   /// schedule() throws on an operator that carries no pipeline. Callers on paths that must not
   /// propagate (sirius_pipeline::notify_downstream_pipelines runs from ~gpu_pipeline_task and
   /// from the streaming-source close callback) route the exception here instead, so the query
   /// surfaces the error rather than the process terminating. The error goes to that query's own
-  /// completion handler, so no other in-flight query is failed by it.
+  /// completion handler and nothing else; other in-flight queries keep running, and the failing
+  /// query is unwound by sirius_engine::execute's drain_after_error(query_id).
   ///
   /// Deliberately does NOT stop any thread pool itself: this can run on a worker thread that is
   /// itself a member of one of those pools (this creator's own, or a GPU executor's, via
   /// ~gpu_pipeline_task), and synchronously stopping/draining a pool from its own worker is a
   /// self-wait deadlock (bounded_thread_pool::wait_all() blocks on the very slot the caller is
-  /// occupying). Only fulfills the completion future; task_scheduler::drain_after_error(),
-  /// called by the query thread once it observes the error, does the actual draining.
+  /// occupying). Only fulfills the completion future; drain_after_error(query_id), called by the
+  /// query thread once it observes the error, does the actual draining.
   void report_fatal_error(sirius::query_id_t query_id, std::exception_ptr error);
 
   /**

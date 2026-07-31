@@ -167,15 +167,17 @@ class task_scheduler {
   void drain_query_tasks(sirius::query_id_t query_id);
 
   /**
-   * @brief Report a fatal query error via the completion future.
+   * @brief Fail one query by reporting @p error to its own completion handler.
    *
-   * Deliberately does NOT stop or drain any executor itself: callers can run on a GPU executor's
-   * or the task_creator's own worker thread (e.g. notify_downstream_pipelines() from
-   * ~gpu_pipeline_task), and synchronously stopping a pool from its own worker thread self-
-   * deadlocks in bounded_thread_pool::wait_all(). Fulfilling the future here is what makes the
-   * query thread's future.get() throw; its catch block then calls drain_after_error() to perform
-   * the actual cancellation from a thread that is never a pool worker.
+   * Touches no shared subsystem: other in-flight queries keep running. Deliberately does NOT
+   * stop or drain any executor itself: callers can run on a GPU executor's or the task_creator's
+   * own worker thread (e.g. notify_downstream_pipelines() from ~gpu_pipeline_task), and
+   * synchronously stopping a pool from its own worker thread self-deadlocks in
+   * bounded_thread_pool::wait_all(). Fulfilling the future here is what makes the query thread's
+   * future.get() throw; sirius_engine::execute's catch block then calls drain_after_error(query_id)
+   * to perform the actual cancellation from a thread that is never a pool worker.
    *
+   * @param handler The failing query's completion handler.
    * @param error The error to report.
    */
   void terminate_query(const std::shared_ptr<completion_handler>& handler,

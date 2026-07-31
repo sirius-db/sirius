@@ -445,17 +445,18 @@ void task_creator::report_fatal_error(const std::shared_ptr<pipeline::completion
   // from inside the dispatched task-creation lambda, or via notify_downstream_pipelines() called
   // from ~gpu_pipeline_task on a GPU executor thread). Calling stop() here would join
   // _manager_thread and then block in _bounded_pool->wait_all() waiting for this very task's slot
-  // to free -- a self-wait deadlock, since the slot can't free until this call returns.
-  // terminate_query() only fulfills the completion future; the query thread (sirius_engine.cpp,
-  // future.get() catch block) observes the error and calls task_scheduler::drain_after_error(),
-  // which drains and restarts every pool from a thread that is never one of their own workers.
+  // to free -- a self-wait deadlock, since the slot can't free until this call returns -- and
+  // would tear down task creation for every other in-flight query besides. terminate_query()
+  // only fulfills the completion future; the query thread (sirius_engine.cpp, future.get() catch
+  // block) observes the error and calls task_scheduler::drain_after_error(), which drains and
+  // restarts every pool from a thread that is never one of their own workers.
   if (_task_scheduler != nullptr) { _task_scheduler->terminate_query(handler, std::move(error)); }
 }
 
 void task_creator::report_fatal_error(sirius::query_id_t query_id, std::exception_ptr error)
 {
-  // A query whose state was already dropped has no handler left to report to; the error is
-  // logged upstream by the caller and there is nothing further to signal.
+  // A query whose state was already dropped has no handler left to report to; the error has
+  // nowhere to go, which is correct — that query is already being torn down.
   auto state = get_query_task_global_state(query_id);
   report_fatal_error(state ? state->completion_handler : nullptr, std::move(error));
 }
@@ -770,6 +771,11 @@ void task_creator::manager_loop()
           // queries would hang.
           pipeline->update_pipeline_status(false);
         } catch (const std::exception& e) {
+          // Fail only this query. The stop() that used to follow ran on a task_creator pool
+          // worker and called _bounded_pool->wait_all(), which blocks until active_ == 0 — but
+          // this thread IS an active slot, so it deadlocked outright; and had it got past,
+          // _bounded_pool.reset() would have joined this thread with itself inside a noexcept
+          // function. It also tore down task creation for every other in-flight query.
           SIRIUS_LOG_ERROR("Task Creator: Exception during task creation: {}", e.what());
           report_fatal_error(query_state->completion_handler, std::current_exception());
         }
