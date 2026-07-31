@@ -20,25 +20,21 @@ input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
 input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
 
 ---
-# column: l_quantity  dtype: t26  ratio: 3.959x  depth: 1
-# comp: 25.11 GB/s  decomp: 305.06 GB/s
-input -> snappy
-
+# column: l_quantity  dtype: t26  ratio: 4.885x  depth: 1
+# comp: 111.87 GB/s  decomp: 251.82 GB/s
+input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
 ---
-# column: l_extendedprice  dtype: t26  ratio: 1.984x  depth: 1
-# comp: 361.34 GB/s  decomp: 581.72 GB/s
-input -> ans
-
+# column: l_extendedprice  dtype: t26  ratio: 2.655x  depth: 1
+# comp: 89.73 GB/s  decomp: 218.48 GB/s
+input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
 ---
-# column: l_discount  dtype: t26  ratio: 8.250x  depth: 1
-# comp: 594.35 GB/s  decomp: 685.57 GB/s
-input -> ans
-
+# column: l_discount  dtype: t26  ratio: 15.604x  depth: 1
+# comp: 137.15 GB/s  decomp: 288.22 GB/s
+input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
 ---
-# column: l_tax  dtype: t26  ratio: 8.817x  depth: 1
-# comp: 598.08 GB/s  decomp: 691.28 GB/s
-input -> ans
-
+# column: l_tax  dtype: t26  ratio: 15.604x  depth: 1
+# comp: 137.23 GB/s  decomp: 288.75 GB/s
+input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
 ---
 # column: l_returnflag  dtype: str  ratio: 19.321x  depth: 2
 # comp: 97.85 GB/s  decomp: 846.70 GB/s
