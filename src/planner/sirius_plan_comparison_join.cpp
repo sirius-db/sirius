@@ -416,9 +416,20 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
                                                    ? *op.children[0]
                                                    : *op.children[1]);
 
+  // Join-edge evidence widening: a build that IS (through projections) a delim scan or a
+  // materialized-CTE reference is opaque to the IsFiltering mirror -- the walk bottoms out at the
+  // childless reference, so "unfiltered" carries no key-domain information there. The join-edge
+  // route accepts either evidence kind; the scan route stays on the faithful mirror.
+  bool const build_derived = master_enabled && build_relation_is_derived(*op.children[1]);
+  bool const edge_evidence = build_filtered || build_derived;
+
+  // Some route could accept a key: the scan route on filter evidence alone, the join-edge route on
+  // either evidence kind when SIP allows it.
+  bool const routes_possible = build_filtered || (sip_enabled && edge_evidence);
+
   // Gather domain evidence before create_plan() moves state out of the logical children.
   auto condition_domains =
-    master_enabled && (build_filtered || sip_enabled)
+    master_enabled && routes_possible
       ? build_key_domain_cardinalities(op, duckdb_base_table_cardinality{context})
       : std::vector<std::size_t>{};
 
@@ -497,7 +508,7 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
     // planner entry point but are not dynamic-filter producers.
     std::vector<sirius::op::dynamic_filter_publish_plan::probe_target> targets;
     std::size_t scan_target_count = 0;
-    bool const discovery_runs     = master_enabled && (build_filtered || sip_enabled) &&
+    bool const discovery_runs     = master_enabled && routes_possible &&
                                 op.type == duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN &&
                                 !gpu_spaces.empty() && !host_spaces.empty();
     if (discovery_runs) {
@@ -546,10 +557,11 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
                                      .value_or(cudf::data_type{cudf::type_id::EMPTY})});
           scan_bound = true;
         }
-        if (scan_bound || !sip_enabled || !build_filtered) { continue; }
-        // Join-edge endpoint. Like the scan route, it requires build-filter evidence: an
-        // unfiltered build is (for FK-shaped joins) the whole key domain, so its filter keeps
-        // every probe row by construction and wiring it only buys apply overhead.
+        if (scan_bound || !sip_enabled || !edge_evidence) { continue; }
+        // Join-edge endpoint. The route accepts filtering evidence OR a derived build: for a
+        // base-table-image build, "unfiltered" means the whole key domain (its filter keeps every
+        // probe row by construction); for a delim scan or CTE reference the mirror cannot see the
+        // derivation, and the runtime keep-ratio gate bounds a wrong wire's cost.
         //
         // Build-block descent depends on equality admission: under null-equal
         // semantics, pruning a LEFT join's build input could add a NULL-padded row accepted by
@@ -606,19 +618,28 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
         scan_target_count,
         targets.size() - scan_target_count,
         rhs_cardinality);
-    } else if (master_enabled && (build_filtered || sip_enabled) &&
+    } else if (master_enabled && routes_possible &&
                op.type == duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN &&
                !admitted_keys.empty() && (gpu_spaces.empty() || host_spaces.empty())) {
       // Report missing placement before less specific discovery gates.
       SIRIUS_LOG_INFO(
         "[sirius_plan_comparison_join] Not wiring dynamic filter(s): a GPU and HOST "
         "memory space are required for device-local replicas.");
-    } else if (master_enabled && !build_filtered &&
+    } else if (master_enabled && !build_filtered && build_derived && !sip_enabled &&
+               op.type == duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN &&
+               !admitted_keys.empty()) {
+      // [TEMPORARY -- delete at flag collapse] Distinguishes "feature off" from "no evidence"
+      // during the rollout A/B window.
+      SIRIUS_LOG_INFO(
+        "[sirius_plan_comparison_join] Not wiring dynamic filter(s): derived-build evidence "
+        "serves only the join-edge route, which is disabled (build est {} rows).",
+        rhs_cardinality);
+    } else if (master_enabled && !edge_evidence &&
                op.type == duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN &&
                !admitted_keys.empty()) {
       SIRIUS_LOG_INFO(
-        "[sirius_plan_comparison_join] Not wiring dynamic filter(s): build side is "
-        "unfiltered (build est {} rows).",
+        "[sirius_plan_comparison_join] Not wiring dynamic filter(s): build side carries "
+        "neither filter nor derivation evidence (build est {} rows).",
         rhs_cardinality);
     }
 

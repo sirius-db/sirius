@@ -18,8 +18,10 @@
  * Unit tests for `planner/dynamic_filter/build_filter_evidence.hpp`.
  *
  * `build_subtree_is_filtering` mirrors DuckDB's join-filter evidence rules for filtered scans,
- * filters, top-N operators, and containing subtrees. The parity suite compares both implementations
- * on optimized plans.
+ * filters, top-N operators, and containing subtrees; the parity suite compares both implementations
+ * on optimized plans. `build_relation_is_derived` classifies a build that presents, through
+ * projections, a delim scan or CTE reference -- the childless leaves the mirror cannot see past --
+ * and is root-down on purpose: a derived leaf under visible structure does not count.
  */
 
 #include "planner/dynamic_filter/build_filter_evidence.hpp"
@@ -28,7 +30,10 @@
 #include <duckdb/function/table_function.hpp>
 #include <duckdb/planner/expression/bound_constant_expression.hpp>
 #include <duckdb/planner/filter/constant_filter.hpp>
+#include <duckdb/planner/operator/logical_aggregate.hpp>
 #include <duckdb/planner/operator/logical_comparison_join.hpp>
+#include <duckdb/planner/operator/logical_cteref.hpp>
+#include <duckdb/planner/operator/logical_delim_get.hpp>
 #include <duckdb/planner/operator/logical_filter.hpp>
 #include <duckdb/planner/operator/logical_get.hpp>
 #include <duckdb/planner/operator/logical_projection.hpp>
@@ -39,6 +44,7 @@
 
 namespace {
 
+using sirius::planner::build_relation_is_derived;
 using sirius::planner::build_subtree_is_filtering;
 
 // Minimal constructible scan; the evidence walk never invokes its table function.
@@ -69,6 +75,23 @@ duckdb::unique_ptr<duckdb::LogicalProjection> make_projection_over(
     /*table_index=*/7, duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>{});
   projection->children.push_back(std::move(child));
   return projection;
+}
+
+// A duplicate-eliminated correlation-domain scan; childless like every derived leaf.
+duckdb::unique_ptr<duckdb::LogicalDelimGet> make_delim_get()
+{
+  return duckdb::make_uniq<duckdb::LogicalDelimGet>(
+    /*table_index=*/2, duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER});
+}
+
+// A materialized-CTE reference; childless like every derived leaf.
+duckdb::unique_ptr<duckdb::LogicalCTERef> make_cte_ref()
+{
+  return duckdb::make_uniq<duckdb::LogicalCTERef>(
+    /*table_index=*/3,
+    /*cte_index=*/0,
+    duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER},
+    duckdb::vector<duckdb::string>{"a"});
 }
 
 }  // namespace
@@ -133,4 +156,92 @@ TEST_CASE("a childless non-filtering operator carries no evidence", "[dynamic_fi
   auto const projection = duckdb::make_uniq<duckdb::LogicalProjection>(
     /*table_index=*/1, duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>{});
   REQUIRE_FALSE(build_subtree_is_filtering(*projection));
+}
+
+TEST_CASE("a derived-leaf root is a derived relation", "[dynamic_filter][evidence]")
+{
+  SECTION("a DELIM_GET root") { REQUIRE(build_relation_is_derived(*make_delim_get())); }
+
+  SECTION("a CTE_REF root") { REQUIRE(build_relation_is_derived(*make_cte_ref())); }
+}
+
+TEST_CASE("projection wrappers are transparent to derivation", "[dynamic_filter][evidence]")
+{
+  // Recursion is expression-agnostic: a projection presents the same relation row-for-row
+  // regardless of what it computes.
+  SECTION("a projection over a DELIM_GET")
+  {
+    auto const projection = make_projection_over(make_delim_get());
+    REQUIRE(build_relation_is_derived(*projection));
+  }
+
+  SECTION("stacked projections over a CTE_REF")
+  {
+    auto const projection = make_projection_over(make_projection_over(make_cte_ref()));
+    REQUIRE(build_relation_is_derived(*projection));
+  }
+}
+
+TEST_CASE("derivation is orthogonal to filtering", "[dynamic_filter][evidence]")
+{
+  // The two predicates disagree on purpose in both directions.
+  SECTION("a base-table GET is never derived, filtered or not")
+  {
+    REQUIRE_FALSE(build_relation_is_derived(*make_get()));
+    REQUIRE_FALSE(build_relation_is_derived(*make_filtered_get()));
+  }
+
+  SECTION("the mirror carries no evidence at a derived leaf")
+  {
+    // The opacity this predicate exists for: the mirror bottoms out at the childless reference.
+    REQUIRE_FALSE(build_subtree_is_filtering(*make_delim_get()));
+    REQUIRE_FALSE(build_subtree_is_filtering(*make_cte_ref()));
+  }
+}
+
+TEST_CASE("operators in the mirror's jurisdiction are not derived", "[dynamic_filter][evidence]")
+{
+  SECTION("a FILTER over a GET")
+  {
+    duckdb::LogicalFilter filter;
+    filter.children.push_back(make_get());
+    REQUIRE_FALSE(build_relation_is_derived(filter));
+  }
+
+  SECTION("a TOP_N")
+  {
+    duckdb::LogicalTopN top_n({}, /*limit=*/10, /*offset=*/0);
+    REQUIRE_FALSE(build_relation_is_derived(top_n));
+  }
+}
+
+TEST_CASE("derivation is root-down, not any-descendant", "[dynamic_filter][evidence]")
+{
+  SECTION("a group-less aggregate over a projected CTE_REF is not derived")
+  {
+    // TPC-H q15's est-1-row threshold build: the scalar aggregate presents its own relation, so
+    // recursion stops there even though a reference sits below.
+    auto aggregate = duckdb::make_uniq<duckdb::LogicalAggregate>(
+      /*group_index=*/4,
+      /*aggregate_index=*/5,
+      duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>{});
+    aggregate->children.push_back(make_projection_over(make_cte_ref()));
+    REQUIRE_FALSE(build_relation_is_derived(*aggregate));
+  }
+
+  SECTION("a comparison join with a CTE_REF child is not derived")
+  {
+    // TPC-H q15's SF50 build orientation: containing a reference does not classify the join.
+    auto join = duckdb::make_uniq<duckdb::LogicalComparisonJoin>(duckdb::JoinType::INNER);
+    join->children.push_back(make_cte_ref());
+    join->children.push_back(make_get());
+    REQUIRE_FALSE(build_relation_is_derived(*join));
+  }
+}
+
+TEST_CASE("a childless projection is not derived", "[dynamic_filter][evidence]")
+{
+  auto const projection = duckdb::make_uniq<duckdb::LogicalProjection>(
+    /*table_index=*/6, duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>{});
+  REQUIRE_FALSE(build_relation_is_derived(*projection));
 }

@@ -37,11 +37,11 @@ The framework has four pieces, all designed to be filter-kind, producer-kind, an
 ```mermaid
 flowchart LR
     subgraph PLAN["Plan construction"]
-        EVIDENCE["build_filter_evidence<br/>IsFiltering mirror over the logical build child"]
+        EVIDENCE["build_filter_evidence<br/>IsFiltering mirror + derived-build classifier"]
         DISCOVERY["target discovery walk<br/>one trace per admitted key over the built probe subtree"]
         PUBPLAN["dynamic_filter_publish_plan<br/>target channels + key bindings<br/>GPU/HOST replica spaces + policy"]
 
-        EVIDENCE -->|"arms the scan route"| DISCOVERY
+        EVIDENCE -->|"arms the scan route; widens the join-edge route"| DISCOVERY
         DISCOVERY -->|"attach or mint"| CHANNEL
         DISCOVERY -->|"freeze producer configuration"| PUBPLAN
     end
@@ -115,7 +115,7 @@ Consumer access is via `filters_for_column(col_idx)` and `filtered_columns()`. T
 
 The producing join owns its whole built probe subtree before its constructor runs, so it discovers every consumer itself: per admitted key, `trace_probe_key` follows the shared descent rules from the key's probe-child ordinal. A trace that bottoms out at a GPU table scan binds the key **into** that scan — the channel is stored on the physical scan node, which is the pairing point (an inner producer's scan already carries its channel when an outer producer's walk reaches it, so N producers share one channel by reaching one node). Any other terminal is a join-edge endpoint site, spliced by `place_endpoint` when the SIP flag allows it. There is no route key, no channel registry, and no consumer remap anywhere; the same walk also fans out through physical set operations (one terminal per UNION branch), though no planner constructs one yet.
 
-Sirius reads no DuckDB dynamic-filter metadata in production: the metadata DuckDB's optimizer still computes is consumed only by DuckDB's own CPU fallback and by the test-only parity oracle (`duckdb_join_filter_candidate_adapter`, linked into the test target), which pins Sirius discovery against DuckDB's public `GetPushdownFilterTargets` per key. Both target routes are gated on Sirius-owned build-filter evidence (`build_filter_evidence`, a mirror of DuckDB's `IsFiltering` over the logical build child); the scan route additionally requires the producer join type (INNER, RIGHT, or SEMI — the mirror of DuckDB's `GenerateJoinFilters` gate; other types preserve or negate unmatched probe rows, so a probe-side filter would change results). A future Phase 3 producer that must pair with an operator it does not own would need new pairing machinery; nothing does today.
+Sirius reads no DuckDB dynamic-filter metadata in production: the metadata DuckDB's optimizer still computes is consumed only by DuckDB's own CPU fallback and by the test-only parity oracle (`duckdb_join_filter_candidate_adapter`, linked into the test target), which pins Sirius discovery against DuckDB's public `GetPushdownFilterTargets` per key. The target routes are gated on Sirius-owned build-route evidence (`build_filter_evidence`): the **scan route** requires the `IsFiltering` mirror over the logical build child plus the producer join type (INNER, RIGHT, or SEMI — the mirror of DuckDB's `GenerateJoinFilters` gate; other types preserve or negate unmatched probe rows, so a probe-side filter would change results); the **join-edge route** is gated on that evidence *or* on derived-build classification (`build_relation_is_derived`: the build presents, through projections, a delim scan or a materialized-CTE reference — leaves the mirror cannot see past, so its "unfiltered" verdict is vacuous there). A future Phase 3 producer that must pair with an operator it does not own would need new pairing machinery; nothing does today.
 
 ### Producer / consumer wiring
 
@@ -132,8 +132,9 @@ ordinal. Publication then constructs a filter only for a key some target binds, 
 is a recorded legality fact that costs no GPU work.
 
 Three inputs are gathered before physical planning recurses into the join's children:
-per-condition domain evidence, the build subtree's uniqueness proof, and the build-filter evidence
-that arms the scan route. All three read the logical children, and `create_plan` moves data out of
+per-condition domain evidence, the build subtree's uniqueness proof, and the build-route evidence
+(the `IsFiltering` mirror that arms the scan route, and the derived-build classification that
+widens the join-edge route). All three read the logical children, and `create_plan` moves data out of
 them, so computing any afterwards would read emptied nodes. If discovery binds no target, the plan
 is disabled even if admission found legal keys -- `enabled()` is target-based, not key-based.
 
@@ -142,7 +143,7 @@ The planner-side components and the order they run in:
 ```mermaid
 flowchart TB
     LOGICAL["DuckDB optimized logical comparison join"]
-    EVIDENCE["build-filter evidence<br/>IsFiltering mirror"]
+    EVIDENCE["build-filter evidence<br/>IsFiltering mirror + derived-build classifier"]
     DOMAIN["build-key domain walk<br/>native row upper bounds"]
     UNIQUE["build-subtree uniqueness proof"]
     ADMIT["key admission<br/>dense admitted keys"]
@@ -512,7 +513,10 @@ For both representations, the constructor enqueues creation of an owned source r
 
 **Producer:** `BUILD_PROBE` hash-join build (unchanged).
 **Consumer (new placement):** `sirius_physical_dynamic_filter` in `membership_masks_only` mode, spliced into the producer's probe subtree — the same operator Phase 1 puts above a scan, in a new position. No new operator, no new filter kind, no new code path inside the hash-join probe.
-**Routing:** the same discovery walk as the scan route -- scan binds and join-edge endpoints are the two terminal actions of one trace per admitted key, and a scan bind wins. Both routes require the build-filter evidence gate: an unfiltered build is (for FK-shaped joins) the whole key domain, so its filter keeps every probe row by construction and wiring any target for it only buys apply overhead. Under SIP, a trace that crosses a build block and bottoms out at a GPU scan therefore takes the **scan** route (zone-map capable, the Phase 1 consumer wrap above that scan); the membership endpoint is the outcome when the trace bottoms out anywhere else. An endpoint's channel is minted at placement, registered to the producer, and handed to the endpoint directly.
+**Routing:** the same discovery walk as the scan route -- scan binds and join-edge endpoints are the two terminal actions of one trace per admitted key, and a scan bind wins. The scan route requires the `IsFiltering` mirror; the join-edge route requires the mirror **or** a derived build (`build_relation_is_derived`). The FK-domain rationale -- an unfiltered build is the whole key domain, so its filter keeps every probe row by construction and wiring a target for it only buys apply overhead -- holds only for base-table-image builds; subquery unnesting produces joins against delim domains and materialized subplans whose key sets are collapsed with no syntactic filter anywhere (TPC-H q2/q11/q17/q22), which is what the derived classification admits. The guarantee that survives: a build that is a pass-through image of an unfiltered base table wires nothing on any route. Under SIP, a mirror-armed trace that crosses a build block and bottoms out at a GPU scan therefore takes the **scan** route (zone-map capable, the Phase 1 consumer wrap above that scan); the membership endpoint is the outcome when the trace bottoms out anywhere else. An endpoint's channel is minted at placement, registered to the producer, and handed to the endpoint directly.
+
+The derived classification is a plausibility heuristic, not a selectivity proof. Its failure modes (an unfiltered correlation domain; a user-hinted bare-copy `MATERIALIZED` CTE) wire a filter that keeps every row; the scan-level keep-ratio gate and the per-filter permanent skip disable such a filter after one measured split (measured scale: q15's pre-guard endpoints cost +5 ms total), and results never change because the producing join stays authoritative. The asymmetry is deliberate: on derived-only evidence (the mirror armed no scan bind), a key whose trace bottoms at a GPU scan still takes the join-edge route (endpoint above the scan), never a scan bind — the scan route mirrors DuckDB exactly.
+
 **Flag:** `enable_dynamic_filter_sip`, default off and temporary — it collapses into the master switch when the rollout decision is recorded on [#1010](https://github.com/sirius-db/sirius/issues/1010) against a benchmark protocol registered before any measurement was examined.
 
 ### What it reaches that Phase 1 cannot
@@ -570,7 +574,7 @@ An incrementally refined producer/consumer pair, or a consumer that requires a f
 - `src/include/op/dynamic_filter/sirius_dynamic_filter.hpp`, `src/op/dynamic_filter/sirius_dynamic_filter.cpp`, `test/cpp/operator/test_sirius_dynamic_filter.cpp` — framework API, zone-map implementation, channel, and focused tests
 - `src/cuda/sirius_dynamic_small_in_list_filter.cu`, `src/cuda/sirius_dynamic_in_list_filter.cu`, `src/cuda/sirius_dynamic_bloom_filter.cu` — raw-needle, hash-set, and Bloom membership filters plus replica construction
 - `src/include/op/scan/dynamic_filter_merge.hpp`, `src/op/scan/dynamic_filter_merge.cpp`, `test/cpp/scan/test_dynamic_filter_merge.cpp` — consumer-side merge/apply helpers (`merge_dynamic_filters_into_ast`, `apply_dynamic_filters_to_view`, `apply_dynamic_filters_gated_view`)
-- `src/planner/sirius_plan_comparison_join.cpp`, `src/planner/dynamic_filter/dynamic_filter_target_discovery.cpp`, `src/planner/dynamic_filter/build_filter_evidence.cpp` — producer plan-gen wiring, the discovery walk, and the build-filter evidence gate
+- `src/planner/sirius_plan_comparison_join.cpp`, `src/planner/dynamic_filter/dynamic_filter_target_discovery.cpp`, `src/planner/dynamic_filter/build_filter_evidence.cpp` — producer plan-gen wiring, the discovery walk, and the build-route evidence predicates (the `IsFiltering` mirror and the derived-build classifier)
 - `src/planner/dynamic_filter/duckdb_join_filter_candidate_adapter.cpp` — TEST-ONLY parity oracle over DuckDB's join-filter metadata (linked into the test target, not production)
 - `src/op/sirius_physical_concat.cpp`, `src/op/dynamic_filter/dynamic_filter_publisher.cpp`, `src/op/sirius_physical_hash_join.cpp` — synchronous build-port publication, filter selection/replication, and fan-out
 - `src/include/expression_evaluator/gpu_expression_translator_internal.hpp` — existing AST construction patterns (`cudf::ast::tree::emplace`, scalar lifetime)
@@ -583,7 +587,7 @@ Which test pins which contract, so a change to one knows where its guard lives:
 | Test | Contract it pins |
 |---|---|
 | `test/cpp/planner/test_build_key_domain.cpp` | The lineage walk admits only shapes whose rows are an injective image of the traced child's, and refuses everything else with domain 0 |
-| `test/cpp/planner/test_build_filter_evidence.cpp` | The build-filter evidence gate (both routes) mirrors DuckDB's `IsFiltering`: GET-with-filters, FILTER, and TOP_N fire, and evidence propagates up through any subtree |
+| `test/cpp/planner/test_build_filter_evidence.cpp` | The scan-route evidence mirrors DuckDB's `IsFiltering` (GET-with-filters, FILTER, TOP_N, any-subtree); the join-edge derived-build classifier admits exactly (projected) delim scans and CTE references, root-down, and refuses aggregate-, join-, and scan-rooted builds |
 | `test/cpp/planner/test_dynamic_filter_key_admission.cpp` | Admission is Sirius-owned and reads the conditions alone; the coordinate spaces stay distinct; only `equal` with a probe-side reference is admitted |
 | `test/cpp/planner/test_dynamic_filter_target_discovery.cpp` | The discovery rules: which hop each operator kind accepts (FILTER and UNION fan-out included), how the traced ordinal is remapped, the SIP policy bit, the producer join-type gate, and that trace and splice agree |
 | `test/cpp/planner/test_dynamic_filter_discovery_parity.cpp` | Per-key parity with DuckDB's own `GetPushdownFilterTargets`, with every conservative divergence (LIMIT, TOP_N, cast crossing, joint-bail) asserted on BOTH sides |

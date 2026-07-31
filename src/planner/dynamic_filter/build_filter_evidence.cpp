@@ -36,4 +36,17 @@ bool build_subtree_is_filtering(duckdb::LogicalOperator const& op)
   return false;
 }
 
+bool build_relation_is_derived(duckdb::LogicalOperator const& op)
+{
+  // Root-down: only projection wrappers are transparent; any other operator presents its own
+  // relation, so a derived leaf below it does not count.
+  switch (op.type) {
+    case duckdb::LogicalOperatorType::LOGICAL_DELIM_GET:
+    case duckdb::LogicalOperatorType::LOGICAL_CTE_REF: return true;
+    case duckdb::LogicalOperatorType::LOGICAL_PROJECTION:
+      return !op.children.empty() && build_relation_is_derived(*op.children[0]);
+    default: return false;
+  }
+}
+
 }  // namespace sirius::planner

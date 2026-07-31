@@ -16,13 +16,13 @@
 
 /**
  * @file build_filter_evidence.hpp
- * @brief Sirius-owned evidence that a producing join's build subtree filters its rows
+ * @brief Sirius-owned structural evidence about a producing join's build side
  *
- * `sirius_plan_comparison_join` gates the SCAN route on this evidence: an unfiltered build is (for
- * FK-shaped joins) the whole key domain, so its filter keeps every probe row by construction and a
- * scan target for it would only buy overhead. The evidence is computed from the logical build
- * child before `create_plan` moves data out of the logical nodes, alongside the domain and
- * uniqueness walks.
+ * The evidence is computed by `sirius_plan_comparison_join` from the logical build child before
+ * `create_plan` moves data out of the logical nodes, alongside the domain and uniqueness walks. Two
+ * independent predicates: `build_subtree_is_filtering`, a byte-faithful mirror of DuckDB's
+ * `JoinFilterPushdownOptimizer::IsFiltering`, gates the scan route and contributes to the join-edge
+ * route; `build_relation_is_derived` widens the join-edge route only.
  */
 
 #pragma once
@@ -46,5 +46,29 @@ namespace sirius::planner {
  * @return True when the subtree carries filter evidence
  */
 [[nodiscard]] bool build_subtree_is_filtering(duckdb::LogicalOperator const& op);
+
+/**
+ * @brief Whether @p op presents, through projections, a derived leaf relation
+ *
+ * True exactly when @p op is a `LOGICAL_DELIM_GET` or `LOGICAL_CTE_REF`, or a chain of
+ * `LOGICAL_PROJECTION`s over one. Such a build is opaque to `build_subtree_is_filtering`: the
+ * mirror bottoms out at the childless reference, so its false verdict there means "evidence
+ * unavailable", not "whole key domain" -- the delim scan is a duplicate-eliminated correlation
+ * domain and the CTE reference a materialized subplan, both computed derivations rather than
+ * base-table images. The join-edge route treats that opacity as permission to wire; the scan route
+ * (mirroring DuckDB) treats it as denial.
+ *
+ * Root-down on purpose: containing a derived leaf under visible unfiltered structure (a join, an
+ * aggregate) does not make the presented relation derived, and admitting such shapes re-wires
+ * measured losers (TPC-H q15). This is a plausibility heuristic, not a selectivity proof: a derived
+ * relation can still span the probe key's domain (an unfiltered correlation domain, a bare-copy
+ * MATERIALIZED CTE). A wrong true costs bounded apply overhead -- the consumer-side keep-ratio gate
+ * and per-filter permanent skip contain it, and the producing join stays authoritative -- never
+ * correctness.
+ *
+ * @param[in] op Root of the producing join's logical build child
+ * @return True when the build presents a derived leaf relation
+ */
+[[nodiscard]] bool build_relation_is_derived(duckdb::LogicalOperator const& op);
 
 }  // namespace sirius::planner

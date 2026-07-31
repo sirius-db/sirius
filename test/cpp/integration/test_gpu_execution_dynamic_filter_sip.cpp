@@ -213,4 +213,26 @@ TEST_CASE("gpu_execution - SIP endpoint placement preserves results",
                                    "JOIN customer c ON o.o_custkey = c.c_custkey "
                                    "WHERE c.c_phone = '25-000-000-0000'");
   }
+
+  SECTION("TPC-H q17: a delim-scan build wires only through derived-build evidence")
+  {
+    // q17's correlated-aggregate producer joins lineitem against a DELIM_GET correlation domain.
+    // That build is opaque to the IsFiltering mirror, so only derived-build classification lets
+    // the join-edge route wire an endpoint above the inner lineitem scan; the counter deltas are
+    // the non-inertness proof on this recovered shape. Query text as in scripts/tpch-queries.sql.
+    auto const deltas =
+      require_sip_result_equivalence(con,
+                                     "select sum(l.l_extendedprice) / 7.0 as avg_yearly "
+                                     "from lineitem l, part p "
+                                     "where p.p_partkey = l.l_partkey "
+                                     "and p.p_brand = 'Brand#13' "
+                                     "and p.p_container = 'JUMBO CAN' "
+                                     "and l.l_quantity < ("
+                                     "select 0.2 * avg(l2.l_quantity) "
+                                     "from lineitem l2 "
+                                     "where l2.l_partkey = p.p_partkey)");
+
+    REQUIRE(deltas.on.producers_enabled > deltas.off.producers_enabled);
+    REQUIRE(deltas.on.filters_pushed > deltas.off.filters_pushed);
+  }
 }
