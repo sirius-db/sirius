@@ -36,7 +36,6 @@ src/**/memory/                      @sirius-db/sirius-memory-compression-codeown
 src/**/downgrade/                   @sirius-db/sirius-memory-compression-codeowners
 
 # ── Integrations ──────────────────────────────────────────────────────────────
-src/include/sirius/                 @sirius-db/sirius-integrations-codeowners
 src/**/transparent/                 @sirius-db/sirius-integrations-codeowners
 /cucascade/                         @sirius-db/sirius-integrations-codeowners
 /duckdb/                            @sirius-db/sirius-integrations-codeowners
@@ -51,8 +50,6 @@ src/**/telemetry/                   @sirius-db/sirius-telemetry-codeowners
 src/**/log/                         @sirius-db/sirius-telemetry-codeowners
 
 # ── CMake ─────────────────────────────────────────────────────────────────────
-/CMakeLists.txt                     @sirius-db/sirius-cmake-codeowners
-/extension_config.cmake             @sirius-db/sirius-cmake-codeowners
 /cmake/                             @sirius-db/sirius-cmake-codeowners
 **/CMakeLists.txt                   @sirius-db/sirius-cmake-codeowners
 **/*.cmake                          @sirius-db/sirius-cmake-codeowners
