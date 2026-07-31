@@ -486,15 +486,16 @@ class SiriusContext : public ClientContextState {
   /// \param handler The query's completion signal, owned by its sirius_engine. Stamped onto
   ///        every pipeline's task global state so tasks can report without any shared
   ///        "current query" handler.
-  void create_query(duckdb::vector<duckdb::shared_ptr<sirius::pipeline::sirius_pipeline>> pipelines,
-                    sirius::query_id_t query_id,
-                    std::shared_ptr<sirius::pipeline::completion_handler> handler,
-                    sirius::telemetry::query_telemetry_info telemetry_info);
+  /// \return The constructed query. Ownership belongs to the caller (sirius_engine): the query
+  ///         is an index over that engine's plan, so outliving the plan would leave its cached
+  ///         operator pointers dangling for no benefit.
+  [[nodiscard]] duckdb::shared_ptr<sirius::planner::query> create_query(
+    duckdb::vector<duckdb::shared_ptr<sirius::pipeline::sirius_pipeline>> pipelines,
+    sirius::query_id_t query_id,
+    std::shared_ptr<sirius::pipeline::completion_handler> handler,
+    sirius::telemetry::query_telemetry_info telemetry_info);
 
   /// \brief Get the current query.
-  [[nodiscard]] duckdb::shared_ptr<sirius::planner::query> get_query();
-  [[nodiscard]] duckdb::shared_ptr<const sirius::planner::query> get_query() const;
-
   /// \brief Get the current Sirius configuration (const).
   [[nodiscard]] const sirius::sirius_config& get_config() const noexcept { return config_; }
 
@@ -621,7 +622,6 @@ class SiriusContext : public ClientContextState {
   std::vector<std::unique_ptr<sirius::parallel::downgrade_executor>> downgrade_executors_;
   std::unique_ptr<sirius::creator::task_creator> task_creator_;
   std::unique_ptr<sirius::scan_manager::sirius_scan_manager> scan_manager_;
-  duckdb::shared_ptr<sirius::planner::query> query_;
 
   std::atomic<uint64_t> transparent_rebind_success_count_{0};
   std::atomic<uint64_t> transparent_fallback_count_{0};

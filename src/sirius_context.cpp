@@ -303,18 +303,19 @@ void SiriusContext::run_mandatory_cleanup(sirius::query_id_t query_id, std::stri
   }
 
   // Drop this query's task_creator state FIRST: queued creation requests hold raw operator
-  // pointers into the plan that query_.reset() below destroys, and in-flight creation lambdas
-  // dereference them. reset() drains those requests and joins that work before returning.
-  // Only this query's is touched; other in-flight queries keep creating tasks.
+  // pointers, and in-flight creation lambdas dereference them. reset() drains those requests and
+  // joins that work before returning. Only this query's is touched; other in-flight queries keep
+  // creating tasks.
+  //
+  // Note the plan those pointers target is ALREADY gone by the time this runs: sirius_engine
+  // owns sirius_owned_plan and is destroyed in sirius_interface::cleanup_internal, which runs
+  // before this window's finish(). So this is not "clean up before the plan dies" — it is
+  // "stop touching a plan that has died".
   if (task_creator_) { task_creator_->reset(query_id); }
 
-  // With the producer stopped, drop whatever it already queued for this query. Ordering is
-  // deliberate: task_creator first so nothing new arrives, then the queues, then query_.reset()
-  // below — queued tasks reach operators through their pipeline, so they must be gone before the
-  // plan is destroyed. Other in-flight queries keep their queued work.
+  // With the producer stopped, drop whatever it already queued for this query, for the same
+  // reason. Other in-flight queries keep their queued work.
   if (task_scheduler_) { task_scheduler_->drain_query_tasks(query_id); }
-
-  query_.reset();
 
   // Drain all downgrade executors before clearing repositories — ensures no downgrade
   // tasks hold shared_ptr<data_batch> references to batches we're about to destroy.
@@ -361,9 +362,8 @@ void SiriusContext::run_mandatory_cleanup(sirius::query_id_t query_id, std::stri
   // host_data_representation are gone before the providers go away.
   if (scan_manager_) { scan_manager_->reset(); }
 
-  // NOTE: task_creator_->reset(query_id) already ran at the top of this function — it has to
-  // precede query_.reset(), since queued creation requests point into the plan that destroys.
-  // That reset is also what drops duckdb_scan_task_global_state, which transitively owns a
+  // NOTE: task_creator_->reset(query_id) already ran at the top of this function. That reset is
+  // what drops duckdb_scan_task_global_state, which transitively owns a
   // duckdb::DuckTableScanState referencing BufferManager-owned BlockHandles; leaving it alive
   // past the window would release those handles during ~task_creator at DB teardown (~DBConfig
   // fires ~SiriusContext mid-DB destruction), which SIGSEGVs in ~BlockMemory.
@@ -965,30 +965,22 @@ std::shared_ptr<const sirius::telemetry::telemetry_context> SiriusContext::get_t
   return telemetry_context_;
 }
 
-void SiriusContext::create_query(
+duckdb::shared_ptr<sirius::planner::query> SiriusContext::create_query(
   duckdb::vector<duckdb::shared_ptr<sirius::pipeline::sirius_pipeline>> pipelines,
   sirius::query_id_t query_id,
   std::shared_ptr<sirius::pipeline::completion_handler> handler,
   sirius::telemetry::query_telemetry_info telemetry_info)
 {
   throw_if_not_initialized();
-  query_ = duckdb::make_shared_ptr<sirius::planner::query>(
+  auto query = duckdb::make_shared_ptr<sirius::planner::query>(
     std::move(pipelines), telemetry_context_->context(), query_id, telemetry_info);
-  task_creator_->prepare_for_query(*query_, std::move(handler));
-  scan_manager_->prepare_for_query(*query_,
+  // Pushed down to the subsystems that need it; neither retains the query itself (they extract
+  // pipelines and raw operator pointers, both owned by the caller's plan). Returned rather than
+  // stored so ownership sits with the sirius_engine, whose plan the query indexes.
+  task_creator_->prepare_for_query(*query, std::move(handler));
+  scan_manager_->prepare_for_query(*query,
                                    config_.get_operator_params().enable_pinned_zone_map_pruning);
-}
-
-duckdb::shared_ptr<sirius::planner::query> SiriusContext::get_query()
-{
-  throw_if_not_initialized();
-  return query_;
-}
-
-duckdb::shared_ptr<const sirius::planner::query> SiriusContext::get_query() const
-{
-  throw_if_not_initialized();
-  return query_;
+  return query;
 }
 
 bool SiriusContext::is_query_lifecycle_active() const noexcept

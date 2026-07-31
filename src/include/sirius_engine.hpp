@@ -28,6 +28,7 @@
 #include "pipeline/pipeline_build_context.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
+#include "planner/query.hpp"
 #include "telemetry-bridge/gen/query.rs.h"
 #include "telemetry-bridge/gen/uuid.rs.h"
 #include "telemetry/telemetry_context.hpp"
@@ -108,6 +109,11 @@ class sirius_engine {
 
  private:
   sirius::query_id_t query_id_;
+  /// The planner query for this execution: the pipeline set plus the operator->pipeline and
+  /// scan-operator indices built over `sirius_owned_plan`. Owned here because it indexes this
+  /// engine's plan — outliving the plan would leave its cached operator pointers dangling with
+  /// nothing to gain.
+  duckdb::shared_ptr<planner::query> query_;
   /// This query's completion signal, created in execute() and shared with every task through
   /// its pipeline's global state. shared_ptr because this engine is destroyed (in
   /// sirius_interface::cleanup_internal) before the query's cleanup drains the task queues, so a
