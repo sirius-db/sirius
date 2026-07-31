@@ -1,0 +1,52 @@
+# Pareto-picked plans: max ratio with decompress >= 250 GB/s per column.
+# column: o_orderkey  dtype: i64  ratio: 106.348x  depth: 2
+# comp: 337.98 GB/s  decomp: 740.63 GB/s
+input -> delta -> differences
+delta.differences -> lz4
+
+---
+# column: o_custkey  dtype: i32  ratio: 1.140x  depth: 1
+# comp: 678.76 GB/s  decomp: 1487.39 GB/s
+input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+
+---
+# column: o_orderstatus  dtype: str  ratio: 19.321x  depth: 2
+# comp: 98.10 GB/s  decomp: 855.46 GB/s
+input -> dictionary -> keys_offsets, keys_chars, indices
+dictionary.indices -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+
+---
+# column: o_totalprice  dtype: t26  ratio: 1.840x  depth: 1
+# comp: 352.19 GB/s  decomp: 578.88 GB/s
+input -> ans
+
+---
+# column: o_orderdate  dtype: t12  ratio: 2.651x  depth: 1
+# comp: 755.61 GB/s  decomp: 1668.67 GB/s
+input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+
+---
+# column: o_orderpriority  dtype: str  ratio: 32.310x  depth: 3
+# comp: 181.10 GB/s  decomp: 247.82 GB/s
+input -> dictionary -> keys_offsets, keys_chars, indices
+dictionary.keys_offsets -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+dictionary.indices -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+
+---
+# column: o_clerk  dtype: str  ratio: 7.346x  depth: 5
+# comp: 141.76 GB/s  decomp: 466.69 GB/s
+# hand-picked knee: -1.1% ratio vs the depth-10 rule pick for +34% decode
+input -> dictionary -> keys_offsets, keys_chars, indices
+dictionary.indices -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+dictionary.keys_chars -> ans
+dictionary.keys_offsets -> delta -> differences
+dictionary.keys_offsets.differences -> rle -> runs, values
+
+---
+# column: o_shippriority  dtype: i32  ratio: 455.107x  depth: 1
+# comp: 2006.10 GB/s  decomp: 3537.07 GB/s
+input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+
+---
+# column: o_comment  dtype: str  identity (raw GPU residency; snappy decode 260 GB/s not worth it on-GPU)
+input -> identity

@@ -1,0 +1,266 @@
+=== TRIGGER ARM t08_s075 (trigger=0.8 stop=0.75) ===
+[08:59:05.747] Source:        /home/nvidia/tpch_parquet_sf1000
+[08:59:05.747] Data source:   parquet
+[08:59:05.747] Mode:          grouped
+[08:59:05.747] Iterations:    5
+[08:59:05.747] Engine:        gpu
+[08:59:05.747] Queries:       [9]
+[08:59:05.747] Config:        bench/sirius_trig_t08_s075.yaml
+[08:59:05.747] Pin:           host
+[08:59:05.747] DuckDB profiling: False
+[08:59:05.747] nsys-profile:  False
+[08:59:05.747] Benchmark dir: bench_out/trigger_sweep/tpch_20260731_085905_grouped_gpu_iter5_q9_t08_s075
+[08:59:05.747] Runtime CSV:   bench_out/trigger_sweep/tpch_20260731_085905_grouped_gpu_iter5_q9_t08_s075/csv/runtimes.csv
+[08:59:05.747] Log dir:       bench_out/trigger_sweep/tpch_20260731_085905_grouped_gpu_iter5_q9_t08_s075/log_dir
+[08:59:06.051] OS cache dropped successfully
+[08:59:06.051] Mode 'grouped': single connection per engine, iterations back-to-back per query
+[08:59:06.051] Opening DuckDB connection over parquet dir /home/nvidia/tpch_parquet_sf1000
+[08:59:06.061] Registering TPC-H parquet views
+[08:59:06.091] All TPC-H views registered
+[08:59:06.091] Loading Sirius extension from /home/nvidia/felipe/sirius/.claude/worktrees/combo-prefetch-comp/build/release/extension/sirius/sirius.duckdb_extension
+[08:59:14.615] Sirius extension loaded
+[08:59:14.615] Executing SIRIUS_PRE_SQL: SET pin_table_compression = true; SET pin_table_input_compression_plan_dir = '/home/nvidia/felipe/sirius/.claude/worktrees/combo-prefetch-comp/bench_out/plans_gpu_facts'
+[08:59:14.617]   Pinning tables for q9
+[08:59:20.679] --- q9 iter0 engine=sirius ---
+[08:59:20.679]   SET gpu_execution = true (GPU/sirius)
+[08:59:20.679]   Executing q9 on GPU/sirius…
+[08:59:22.685]   q9 fetched 175 rows in 2.0052s
+[08:59:22.685] [sirius] q9 iter0: 2.0052s
+[08:59:22.685] --- q9 iter1 engine=sirius ---
+[08:59:22.686]   SET gpu_execution = true (GPU/sirius)
+[08:59:22.686]   Executing q9 on GPU/sirius…
+[08:59:24.515]   q9 fetched 175 rows in 1.8290s
+[08:59:24.515] [sirius] q9 iter1: 1.8290s
+[08:59:24.516] --- q9 iter2 engine=sirius ---
+[08:59:24.516]   SET gpu_execution = true (GPU/sirius)
+[08:59:24.517]   Executing q9 on GPU/sirius…
+[08:59:26.367]   q9 fetched 175 rows in 1.8498s
+[08:59:26.367] [sirius] q9 iter2: 1.8498s
+[08:59:26.367] --- q9 iter3 engine=sirius ---
+[08:59:26.368]   SET gpu_execution = true (GPU/sirius)
+[08:59:26.368]   Executing q9 on GPU/sirius…
+[08:59:28.208]   q9 fetched 175 rows in 1.8395s
+[08:59:28.208] [sirius] q9 iter3: 1.8395s
+[08:59:28.208] --- q9 iter4 engine=sirius ---
+[08:59:28.209]   SET gpu_execution = true (GPU/sirius)
+[08:59:28.209]   Executing q9 on GPU/sirius…
+[08:59:30.039]   q9 fetched 175 rows in 1.8297s
+[08:59:30.039] [sirius] q9 iter4: 1.8297s
+[08:59:30.039]   Unpinning tables for q9
+[08:59:30.043] Closing connection
+[08:59:31.627] Benchmark run complete
+[08:59:31.628] Splitting bench_out/trigger_sweep/tpch_20260731_085905_grouped_gpu_iter5_q9_t08_s075/log_dir/sirius_2026-07-31.log per query
+[08:59:31.629] Per-query Sirius logs written under bench_out/trigger_sweep/tpch_20260731_085905_grouped_gpu_iter5_q9_t08_s075/sirius/
+=== TRIGGER ARM t085_s07 (trigger=0.85 stop=0.7) ===
+[08:59:32.181] Source:        /home/nvidia/tpch_parquet_sf1000
+[08:59:32.181] Data source:   parquet
+[08:59:32.181] Mode:          grouped
+[08:59:32.181] Iterations:    5
+[08:59:32.181] Engine:        gpu
+[08:59:32.181] Queries:       [9]
+[08:59:32.181] Config:        bench/sirius_trig_t085_s07.yaml
+[08:59:32.181] Pin:           host
+[08:59:32.181] DuckDB profiling: False
+[08:59:32.181] nsys-profile:  False
+[08:59:32.181] Benchmark dir: bench_out/trigger_sweep/tpch_20260731_085932_grouped_gpu_iter5_q9_t085_s07
+[08:59:32.181] Runtime CSV:   bench_out/trigger_sweep/tpch_20260731_085932_grouped_gpu_iter5_q9_t085_s07/csv/runtimes.csv
+[08:59:32.181] Log dir:       bench_out/trigger_sweep/tpch_20260731_085932_grouped_gpu_iter5_q9_t085_s07/log_dir
+[08:59:32.245] OS cache dropped successfully
+[08:59:32.245] Mode 'grouped': single connection per engine, iterations back-to-back per query
+[08:59:32.245] Opening DuckDB connection over parquet dir /home/nvidia/tpch_parquet_sf1000
+[08:59:32.254] Registering TPC-H parquet views
+[08:59:32.283] All TPC-H views registered
+[08:59:32.283] Loading Sirius extension from /home/nvidia/felipe/sirius/.claude/worktrees/combo-prefetch-comp/build/release/extension/sirius/sirius.duckdb_extension
+[08:59:40.691] Sirius extension loaded
+[08:59:40.691] Executing SIRIUS_PRE_SQL: SET pin_table_compression = true; SET pin_table_input_compression_plan_dir = '/home/nvidia/felipe/sirius/.claude/worktrees/combo-prefetch-comp/bench_out/plans_gpu_facts'
+[08:59:40.693]   Pinning tables for q9
+[08:59:46.854] --- q9 iter0 engine=sirius ---
+[08:59:46.854]   SET gpu_execution = true (GPU/sirius)
+[08:59:46.855]   Executing q9 on GPU/sirius…
+[08:59:48.930]   q9 fetched 175 rows in 2.0755s
+[08:59:48.930] [sirius] q9 iter0: 2.0755s
+[08:59:48.931] --- q9 iter1 engine=sirius ---
+[08:59:48.932]   SET gpu_execution = true (GPU/sirius)
+[08:59:48.932]   Executing q9 on GPU/sirius…
+[08:59:50.820]   q9 fetched 175 rows in 1.8879s
+[08:59:50.820] [sirius] q9 iter1: 1.8879s
+[08:59:50.820] --- q9 iter2 engine=sirius ---
+[08:59:50.821]   SET gpu_execution = true (GPU/sirius)
+[08:59:50.821]   Executing q9 on GPU/sirius…
+[08:59:52.691]   q9 fetched 175 rows in 1.8695s
+[08:59:52.691] [sirius] q9 iter2: 1.8695s
+[08:59:52.691] --- q9 iter3 engine=sirius ---
+[08:59:52.692]   SET gpu_execution = true (GPU/sirius)
+[08:59:52.693]   Executing q9 on GPU/sirius…
+[08:59:54.592]   q9 fetched 175 rows in 1.8997s
+[08:59:54.592] [sirius] q9 iter3: 1.8997s
+[08:59:54.593] --- q9 iter4 engine=sirius ---
+[08:59:54.593]   SET gpu_execution = true (GPU/sirius)
+[08:59:54.594]   Executing q9 on GPU/sirius…
+[08:59:56.454]   q9 fetched 175 rows in 1.8605s
+[08:59:56.454] [sirius] q9 iter4: 1.8605s
+[08:59:56.455]   Unpinning tables for q9
+[08:59:56.458] Closing connection
+[08:59:58.012] Benchmark run complete
+[08:59:58.013] Splitting bench_out/trigger_sweep/tpch_20260731_085932_grouped_gpu_iter5_q9_t085_s07/log_dir/sirius_2026-07-31.log per query
+[08:59:58.014] Per-query Sirius logs written under bench_out/trigger_sweep/tpch_20260731_085932_grouped_gpu_iter5_q9_t085_s07/sirius/
+=== TRIGGER ARM t085_s08 (trigger=0.85 stop=0.8) ===
+[08:59:58.618] Source:        /home/nvidia/tpch_parquet_sf1000
+[08:59:58.618] Data source:   parquet
+[08:59:58.618] Mode:          grouped
+[08:59:58.618] Iterations:    5
+[08:59:58.619] Engine:        gpu
+[08:59:58.619] Queries:       [9]
+[08:59:58.619] Config:        bench/sirius_trig_t085_s08.yaml
+[08:59:58.619] Pin:           host
+[08:59:58.619] DuckDB profiling: False
+[08:59:58.619] nsys-profile:  False
+[08:59:58.619] Benchmark dir: bench_out/trigger_sweep/tpch_20260731_085958_grouped_gpu_iter5_q9_t085_s08
+[08:59:58.619] Runtime CSV:   bench_out/trigger_sweep/tpch_20260731_085958_grouped_gpu_iter5_q9_t085_s08/csv/runtimes.csv
+[08:59:58.619] Log dir:       bench_out/trigger_sweep/tpch_20260731_085958_grouped_gpu_iter5_q9_t085_s08/log_dir
+[08:59:58.692] OS cache dropped successfully
+[08:59:58.692] Mode 'grouped': single connection per engine, iterations back-to-back per query
+[08:59:58.692] Opening DuckDB connection over parquet dir /home/nvidia/tpch_parquet_sf1000
+[08:59:58.701] Registering TPC-H parquet views
+[08:59:58.729] All TPC-H views registered
+[08:59:58.729] Loading Sirius extension from /home/nvidia/felipe/sirius/.claude/worktrees/combo-prefetch-comp/build/release/extension/sirius/sirius.duckdb_extension
+[09:00:07.070] Sirius extension loaded
+[09:00:07.070] Executing SIRIUS_PRE_SQL: SET pin_table_compression = true; SET pin_table_input_compression_plan_dir = '/home/nvidia/felipe/sirius/.claude/worktrees/combo-prefetch-comp/bench_out/plans_gpu_facts'
+[09:00:07.072]   Pinning tables for q9
+[09:00:13.105] --- q9 iter0 engine=sirius ---
+[09:00:13.105]   SET gpu_execution = true (GPU/sirius)
+[09:00:13.106]   Executing q9 on GPU/sirius…
+[09:00:15.171]   q9 fetched 175 rows in 2.0655s
+[09:00:15.172] [sirius] q9 iter0: 2.0655s
+[09:00:15.172] --- q9 iter1 engine=sirius ---
+[09:00:15.173]   SET gpu_execution = true (GPU/sirius)
+[09:00:15.173]   Executing q9 on GPU/sirius…
+[09:00:16.990]   q9 fetched 175 rows in 1.8172s
+[09:00:16.991] [sirius] q9 iter1: 1.8172s
+[09:00:16.991] --- q9 iter2 engine=sirius ---
+[09:00:16.992]   SET gpu_execution = true (GPU/sirius)
+[09:00:16.992]   Executing q9 on GPU/sirius…
+[09:00:18.812]   q9 fetched 175 rows in 1.8199s
+[09:00:18.812] [sirius] q9 iter2: 1.8199s
+[09:00:18.812] --- q9 iter3 engine=sirius ---
+[09:00:18.813]   SET gpu_execution = true (GPU/sirius)
+[09:00:18.813]   Executing q9 on GPU/sirius…
+[09:00:20.633]   q9 fetched 175 rows in 1.8196s
+[09:00:20.633] [sirius] q9 iter3: 1.8196s
+[09:00:20.634] --- q9 iter4 engine=sirius ---
+[09:00:20.634]   SET gpu_execution = true (GPU/sirius)
+[09:00:20.635]   Executing q9 on GPU/sirius…
+[09:00:22.465]   q9 fetched 175 rows in 1.8301s
+[09:00:22.465] [sirius] q9 iter4: 1.8301s
+[09:00:22.465]   Unpinning tables for q9
+[09:00:22.470] Closing connection
+[09:00:24.038] Benchmark run complete
+[09:00:24.038] Splitting bench_out/trigger_sweep/tpch_20260731_085958_grouped_gpu_iter5_q9_t085_s08/log_dir/sirius_2026-07-31.log per query
+[09:00:24.039] Per-query Sirius logs written under bench_out/trigger_sweep/tpch_20260731_085958_grouped_gpu_iter5_q9_t085_s08/sirius/
+=== TRIGGER ARM t09_s085 (trigger=0.9 stop=0.85) ===
+[09:00:24.660] Source:        /home/nvidia/tpch_parquet_sf1000
+[09:00:24.660] Data source:   parquet
+[09:00:24.660] Mode:          grouped
+[09:00:24.660] Iterations:    5
+[09:00:24.660] Engine:        gpu
+[09:00:24.660] Queries:       [9]
+[09:00:24.660] Config:        bench/sirius_trig_t09_s085.yaml
+[09:00:24.660] Pin:           host
+[09:00:24.660] DuckDB profiling: False
+[09:00:24.660] nsys-profile:  False
+[09:00:24.660] Benchmark dir: bench_out/trigger_sweep/tpch_20260731_090024_grouped_gpu_iter5_q9_t09_s085
+[09:00:24.660] Runtime CSV:   bench_out/trigger_sweep/tpch_20260731_090024_grouped_gpu_iter5_q9_t09_s085/csv/runtimes.csv
+[09:00:24.660] Log dir:       bench_out/trigger_sweep/tpch_20260731_090024_grouped_gpu_iter5_q9_t09_s085/log_dir
+[09:00:24.731] OS cache dropped successfully
+[09:00:24.732] Mode 'grouped': single connection per engine, iterations back-to-back per query
+[09:00:24.732] Opening DuckDB connection over parquet dir /home/nvidia/tpch_parquet_sf1000
+[09:00:24.741] Registering TPC-H parquet views
+[09:00:24.770] All TPC-H views registered
+[09:00:24.771] Loading Sirius extension from /home/nvidia/felipe/sirius/.claude/worktrees/combo-prefetch-comp/build/release/extension/sirius/sirius.duckdb_extension
+[09:00:33.114] Sirius extension loaded
+[09:00:33.114] Executing SIRIUS_PRE_SQL: SET pin_table_compression = true; SET pin_table_input_compression_plan_dir = '/home/nvidia/felipe/sirius/.claude/worktrees/combo-prefetch-comp/bench_out/plans_gpu_facts'
+[09:00:33.116]   Pinning tables for q9
+[09:00:39.227] --- q9 iter0 engine=sirius ---
+[09:00:39.228]   SET gpu_execution = true (GPU/sirius)
+[09:00:39.228]   Executing q9 on GPU/sirius…
+[09:00:41.243]   q9 fetched 175 rows in 2.0155s
+[09:00:41.244] [sirius] q9 iter0: 2.0155s
+[09:00:41.244] --- q9 iter1 engine=sirius ---
+[09:00:41.245]   SET gpu_execution = true (GPU/sirius)
+[09:00:41.245]   Executing q9 on GPU/sirius…
+[09:00:43.063]   q9 fetched 175 rows in 1.8175s
+[09:00:43.063] [sirius] q9 iter1: 1.8175s
+[09:00:43.063] --- q9 iter2 engine=sirius ---
+[09:00:43.064]   SET gpu_execution = true (GPU/sirius)
+[09:00:43.064]   Executing q9 on GPU/sirius…
+[09:00:44.873]   q9 fetched 175 rows in 1.8094s
+[09:00:44.874] [sirius] q9 iter2: 1.8094s
+[09:00:44.874] --- q9 iter3 engine=sirius ---
+[09:00:44.875]   SET gpu_execution = true (GPU/sirius)
+[09:00:44.875]   Executing q9 on GPU/sirius…
+[09:00:46.685]   q9 fetched 175 rows in 1.8097s
+[09:00:46.685] [sirius] q9 iter3: 1.8097s
+[09:00:46.685] --- q9 iter4 engine=sirius ---
+[09:00:46.686]   SET gpu_execution = true (GPU/sirius)
+[09:00:46.686]   Executing q9 on GPU/sirius…
+[09:00:48.516]   q9 fetched 175 rows in 1.8297s
+[09:00:48.516] [sirius] q9 iter4: 1.8297s
+[09:00:48.516]   Unpinning tables for q9
+[09:00:48.521] Closing connection
+[09:00:50.128] Benchmark run complete
+[09:00:50.128] Splitting bench_out/trigger_sweep/tpch_20260731_090024_grouped_gpu_iter5_q9_t09_s085/log_dir/sirius_2026-07-31.log per query
+[09:00:50.129] Per-query Sirius logs written under bench_out/trigger_sweep/tpch_20260731_090024_grouped_gpu_iter5_q9_t09_s085/sirius/
+=== TRIGGER ARM t095_s085 (trigger=0.95 stop=0.85) ===
+[09:00:50.756] Source:        /home/nvidia/tpch_parquet_sf1000
+[09:00:50.756] Data source:   parquet
+[09:00:50.756] Mode:          grouped
+[09:00:50.756] Iterations:    5
+[09:00:50.756] Engine:        gpu
+[09:00:50.756] Queries:       [9]
+[09:00:50.756] Config:        bench/sirius_trig_t095_s085.yaml
+[09:00:50.756] Pin:           host
+[09:00:50.756] DuckDB profiling: False
+[09:00:50.756] nsys-profile:  False
+[09:00:50.756] Benchmark dir: bench_out/trigger_sweep/tpch_20260731_090050_grouped_gpu_iter5_q9_t095_s085
+[09:00:50.756] Runtime CSV:   bench_out/trigger_sweep/tpch_20260731_090050_grouped_gpu_iter5_q9_t095_s085/csv/runtimes.csv
+[09:00:50.756] Log dir:       bench_out/trigger_sweep/tpch_20260731_090050_grouped_gpu_iter5_q9_t095_s085/log_dir
+[09:00:50.830] OS cache dropped successfully
+[09:00:50.830] Mode 'grouped': single connection per engine, iterations back-to-back per query
+[09:00:50.830] Opening DuckDB connection over parquet dir /home/nvidia/tpch_parquet_sf1000
+[09:00:50.839] Registering TPC-H parquet views
+[09:00:50.870] All TPC-H views registered
+[09:00:50.870] Loading Sirius extension from /home/nvidia/felipe/sirius/.claude/worktrees/combo-prefetch-comp/build/release/extension/sirius/sirius.duckdb_extension
+[09:00:59.355] Sirius extension loaded
+[09:00:59.355] Executing SIRIUS_PRE_SQL: SET pin_table_compression = true; SET pin_table_input_compression_plan_dir = '/home/nvidia/felipe/sirius/.claude/worktrees/combo-prefetch-comp/bench_out/plans_gpu_facts'
+[09:00:59.357]   Pinning tables for q9
+[09:01:05.348] --- q9 iter0 engine=sirius ---
+[09:01:05.348]   SET gpu_execution = true (GPU/sirius)
+[09:01:05.349]   Executing q9 on GPU/sirius…
+[09:01:07.357]   q9 fetched 175 rows in 2.0080s
+[09:01:07.357] [sirius] q9 iter0: 2.0080s
+[09:01:07.357] --- q9 iter1 engine=sirius ---
+[09:01:07.358]   SET gpu_execution = true (GPU/sirius)
+[09:01:07.358]   Executing q9 on GPU/sirius…
+[09:01:09.176]   q9 fetched 175 rows in 1.8178s
+[09:01:09.176] [sirius] q9 iter1: 1.8178s
+[09:01:09.177] --- q9 iter2 engine=sirius ---
+[09:01:09.177]   SET gpu_execution = true (GPU/sirius)
+[09:01:09.178]   Executing q9 on GPU/sirius…
+[09:01:10.997]   q9 fetched 175 rows in 1.8196s
+[09:01:10.997] [sirius] q9 iter2: 1.8196s
+[09:01:10.998] --- q9 iter3 engine=sirius ---
+[09:01:10.998]   SET gpu_execution = true (GPU/sirius)
+[09:01:10.999]   Executing q9 on GPU/sirius…
+[09:01:12.818]   q9 fetched 175 rows in 1.8196s
+[09:01:12.819] [sirius] q9 iter3: 1.8196s
+[09:01:12.819] --- q9 iter4 engine=sirius ---
+[09:01:12.820]   SET gpu_execution = true (GPU/sirius)
+[09:01:12.820]   Executing q9 on GPU/sirius…
+[09:01:14.629]   q9 fetched 175 rows in 1.8095s
+[09:01:14.630] [sirius] q9 iter4: 1.8095s
+[09:01:14.630]   Unpinning tables for q9
+[09:01:14.633] Closing connection
+[09:01:16.195] Benchmark run complete
+[09:01:16.196] Splitting bench_out/trigger_sweep/tpch_20260731_090050_grouped_gpu_iter5_q9_t095_s085/log_dir/sirius_2026-07-31.log per query
+[09:01:16.197] Per-query Sirius logs written under bench_out/trigger_sweep/tpch_20260731_090050_grouped_gpu_iter5_q9_t095_s085/sirius/
+=== TRIGGER SWEEP COMPLETE ===

@@ -1,0 +1,1200 @@
+=== 07:31:07 ARM A: all-host uncompressed baseline ===
+[07:31:07.863] Source:        /home/nvidia/tpch_parquet_sf1000
+[07:31:07.863] Data source:   parquet
+[07:31:07.863] Mode:          grouped
+[07:31:07.863] Iterations:    3
+[07:31:07.863] Engine:        gpu
+[07:31:07.863] Queries:       [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22]
+[07:31:07.863] Config:        bench/sirius_sf1000_pinned.yaml
+[07:31:07.863] Pin:           host
+[07:31:07.863] DuckDB profiling: False
+[07:31:07.863] nsys-profile:  False
+[07:31:07.863] Benchmark dir: bench_out/compression_arms/tpch_20260731_073107_grouped_gpu_iter3_armA_host_uncompressed
+[07:31:07.863] Runtime CSV:   bench_out/compression_arms/tpch_20260731_073107_grouped_gpu_iter3_armA_host_uncompressed/csv/runtimes.csv
+[07:31:07.863] Log dir:       bench_out/compression_arms/tpch_20260731_073107_grouped_gpu_iter3_armA_host_uncompressed/log_dir
+[07:31:10.922] OS cache dropped successfully
+[07:31:10.922] Mode 'grouped': single connection per engine, iterations back-to-back per query
+[07:31:10.922] Opening DuckDB connection over parquet dir /home/nvidia/tpch_parquet_sf1000
+[07:31:10.931] Registering TPC-H parquet views
+[07:31:10.960] All TPC-H views registered
+[07:31:10.960] Loading Sirius extension from /home/nvidia/felipe/sirius/.claude/worktrees/simpatico-mixed-pin/build/release/extension/sirius/sirius.duckdb_extension
+[07:31:19.617] Sirius extension loaded
+[07:31:19.617]   Pinning tables for q1
+[07:31:27.204] --- q1 iter0 engine=sirius ---
+[07:31:27.204]   SET gpu_execution = true (GPU/sirius)
+[07:31:27.205]   Executing q1 on GPU/sirius…
+[07:31:28.797]   q1 fetched 4 rows in 1.5926s
+[07:31:28.797] [sirius] q1 iter0: 1.5926s
+[07:31:28.798] --- q1 iter1 engine=sirius ---
+[07:31:28.798]   SET gpu_execution = true (GPU/sirius)
+[07:31:28.798]   Executing q1 on GPU/sirius…
+[07:31:30.273]   q1 fetched 4 rows in 1.4749s
+[07:31:30.273] [sirius] q1 iter1: 1.4749s
+[07:31:30.301] --- q1 iter2 engine=sirius ---
+[07:31:30.301]   SET gpu_execution = true (GPU/sirius)
+[07:31:30.301]   Executing q1 on GPU/sirius…
+[07:31:31.702]   q1 fetched 4 rows in 1.4005s
+[07:31:31.702] [sirius] q1 iter2: 1.4005s
+[07:31:31.703]   Unpinning tables for q1
+[07:31:31.704]   Pinning tables for q2
+[07:31:32.204] --- q2 iter0 engine=sirius ---
+[07:31:32.204]   SET gpu_execution = true (GPU/sirius)
+[07:31:32.204]   Executing q2 on GPU/sirius…
+[07:31:32.548]   q2 fetched 100 rows in 0.3439s
+[07:31:32.549] [sirius] q2 iter0: 0.3439s
+[07:31:32.549] --- q2 iter1 engine=sirius ---
+[07:31:32.549]   SET gpu_execution = true (GPU/sirius)
+[07:31:32.550]   Executing q2 on GPU/sirius…
+[07:31:32.759]   q2 fetched 100 rows in 0.2093s
+[07:31:32.759] [sirius] q2 iter1: 0.2093s
+[07:31:32.773] --- q2 iter2 engine=sirius ---
+[07:31:32.773]   SET gpu_execution = true (GPU/sirius)
+[07:31:32.773]   Executing q2 on GPU/sirius…
+[07:31:32.981]   q2 fetched 100 rows in 0.2072s
+[07:31:32.981] [sirius] q2 iter2: 0.2072s
+[07:31:32.981]   Unpinning tables for q2
+[07:31:32.983]   Pinning tables for q3
+[07:31:36.641] --- q3 iter0 engine=sirius ---
+[07:31:36.641]   SET gpu_execution = true (GPU/sirius)
+[07:31:36.641]   Executing q3 on GPU/sirius…
+[07:31:37.437]   q3 fetched 10 rows in 0.7954s
+[07:31:37.437] [sirius] q3 iter0: 0.7954s
+[07:31:37.437] --- q3 iter1 engine=sirius ---
+[07:31:37.437]   SET gpu_execution = true (GPU/sirius)
+[07:31:37.438]   Executing q3 on GPU/sirius…
+[07:31:38.191]   q3 fetched 10 rows in 0.7535s
+[07:31:38.191] [sirius] q3 iter1: 0.7535s
+[07:31:38.205] --- q3 iter2 engine=sirius ---
+[07:31:38.205]   SET gpu_execution = true (GPU/sirius)
+[07:31:38.206]   Executing q3 on GPU/sirius…
+[07:31:38.956]   q3 fetched 10 rows in 0.7503s
+[07:31:38.956] [sirius] q3 iter2: 0.7503s
+[07:31:38.970]   Unpinning tables for q3
+[07:31:38.972]   Pinning tables for q4
+[07:31:41.359] --- q4 iter0 engine=sirius ---
+[07:31:41.359]   SET gpu_execution = true (GPU/sirius)
+[07:31:41.360]   Executing q4 on GPU/sirius…
+[07:31:41.984]   q4 fetched 5 rows in 0.6243s
+[07:31:41.984] [sirius] q4 iter0: 0.6243s
+[07:31:41.985] --- q4 iter1 engine=sirius ---
+[07:31:41.985]   SET gpu_execution = true (GPU/sirius)
+[07:31:41.985]   Executing q4 on GPU/sirius…
+[07:31:42.497]   q4 fetched 5 rows in 0.5120s
+[07:31:42.497] [sirius] q4 iter1: 0.5120s
+[07:31:42.517] --- q4 iter2 engine=sirius ---
+[07:31:42.517]   SET gpu_execution = true (GPU/sirius)
+[07:31:42.518]   Executing q4 on GPU/sirius…
+[07:31:43.030]   q4 fetched 5 rows in 0.5126s
+[07:31:43.030] [sirius] q4 iter2: 0.5126s
+[07:31:43.044]   Unpinning tables for q4
+[07:31:43.045]   Pinning tables for q5
+[07:31:47.154] --- q5 iter0 engine=sirius ---
+[07:31:47.154]   SET gpu_execution = true (GPU/sirius)
+[07:31:47.154]   Executing q5 on GPU/sirius…
+[07:31:47.940]   q5 fetched 5 rows in 0.7859s
+[07:31:47.940] [sirius] q5 iter0: 0.7859s
+[07:31:47.948] --- q5 iter1 engine=sirius ---
+[07:31:47.948]   SET gpu_execution = true (GPU/sirius)
+[07:31:47.949]   Executing q5 on GPU/sirius…
+[07:31:48.695]   q5 fetched 5 rows in 0.7458s
+[07:31:48.695] [sirius] q5 iter1: 0.7458s
+[07:31:48.709] --- q5 iter2 engine=sirius ---
+[07:31:48.709]   SET gpu_execution = true (GPU/sirius)
+[07:31:48.709]   Executing q5 on GPU/sirius…
+[07:31:49.459]   q5 fetched 5 rows in 0.7499s
+[07:31:49.459] [sirius] q5 iter2: 0.7499s
+[07:31:49.473]   Unpinning tables for q5
+[07:31:49.476]   Pinning tables for q6
+[07:31:52.415] --- q6 iter0 engine=sirius ---
+[07:31:52.416]   SET gpu_execution = true (GPU/sirius)
+[07:31:52.416]   Executing q6 on GPU/sirius…
+[07:31:53.107]   q6 fetched 1 rows in 0.6907s
+[07:31:53.107] [sirius] q6 iter0: 0.6907s
+[07:31:53.107] --- q6 iter1 engine=sirius ---
+[07:31:53.107]   SET gpu_execution = true (GPU/sirius)
+[07:31:53.108]   Executing q6 on GPU/sirius…
+[07:31:53.731]   q6 fetched 1 rows in 0.6228s
+[07:31:53.731] [sirius] q6 iter1: 0.6228s
+[07:31:53.747] --- q6 iter2 engine=sirius ---
+[07:31:53.747]   SET gpu_execution = true (GPU/sirius)
+[07:31:53.747]   Executing q6 on GPU/sirius…
+[07:31:54.394]   q6 fetched 1 rows in 0.6469s
+[07:31:54.395] [sirius] q6 iter2: 0.6469s
+[07:31:54.409]   Unpinning tables for q6
+[07:31:54.410]   Pinning tables for q7
+[07:31:58.981] --- q7 iter0 engine=sirius ---
+[07:31:58.981]   SET gpu_execution = true (GPU/sirius)
+[07:31:58.982]   Executing q7 on GPU/sirius…
+[07:32:00.220]   q7 fetched 4 rows in 1.2387s
+[07:32:00.221] [sirius] q7 iter0: 1.2387s
+[07:32:00.221] --- q7 iter1 engine=sirius ---
+[07:32:00.221]   SET gpu_execution = true (GPU/sirius)
+[07:32:00.221]   Executing q7 on GPU/sirius…
+[07:32:01.035]   q7 fetched 4 rows in 0.8140s
+[07:32:01.035] [sirius] q7 iter1: 0.8140s
+[07:32:01.049] --- q7 iter2 engine=sirius ---
+[07:32:01.049]   SET gpu_execution = true (GPU/sirius)
+[07:32:01.050]   Executing q7 on GPU/sirius…
+[07:32:01.871]   q7 fetched 4 rows in 0.8206s
+[07:32:01.871] [sirius] q7 iter2: 0.8206s
+[07:32:01.885]   Unpinning tables for q7
+[07:32:01.887]   Pinning tables for q8
+[07:32:07.271] --- q8 iter0 engine=sirius ---
+[07:32:07.272]   SET gpu_execution = true (GPU/sirius)
+[07:32:07.272]   Executing q8 on GPU/sirius…
+[07:32:08.088]   q8 fetched 2 rows in 0.8161s
+[07:32:08.088] [sirius] q8 iter0: 0.8161s
+[07:32:08.088] --- q8 iter1 engine=sirius ---
+[07:32:08.088]   SET gpu_execution = true (GPU/sirius)
+[07:32:08.089]   Executing q8 on GPU/sirius…
+[07:32:08.893]   q8 fetched 2 rows in 0.8039s
+[07:32:08.893] [sirius] q8 iter1: 0.8039s
+[07:32:08.911] --- q8 iter2 engine=sirius ---
+[07:32:08.911]   SET gpu_execution = true (GPU/sirius)
+[07:32:08.912]   Executing q8 on GPU/sirius…
+[07:32:09.708]   q8 fetched 2 rows in 0.7960s
+[07:32:09.708] [sirius] q8 iter2: 0.7960s
+[07:32:09.722]   Unpinning tables for q8
+[07:32:09.725]   Pinning tables for q9
+[07:32:15.863] --- q9 iter0 engine=sirius ---
+[07:32:15.863]   SET gpu_execution = true (GPU/sirius)
+[07:32:15.864]   Executing q9 on GPU/sirius…
+[07:32:17.998]   q9 fetched 175 rows in 2.1341s
+[07:32:17.998] [sirius] q9 iter0: 2.1341s
+[07:32:17.998] --- q9 iter1 engine=sirius ---
+[07:32:17.998]   SET gpu_execution = true (GPU/sirius)
+[07:32:17.999]   Executing q9 on GPU/sirius…
+[07:32:20.141]   q9 fetched 175 rows in 2.1420s
+[07:32:20.141] [sirius] q9 iter1: 2.1420s
+[07:32:20.157] --- q9 iter2 engine=sirius ---
+[07:32:20.157]   SET gpu_execution = true (GPU/sirius)
+[07:32:20.158]   Executing q9 on GPU/sirius…
+[07:32:22.283]   q9 fetched 175 rows in 2.1256s
+[07:32:22.284] [sirius] q9 iter2: 2.1256s
+[07:32:22.300]   Unpinning tables for q9
+[07:32:22.303]   Pinning tables for q10
+[07:32:26.487] --- q10 iter0 engine=sirius ---
+[07:32:26.487]   SET gpu_execution = true (GPU/sirius)
+[07:32:26.487]   Executing q10 on GPU/sirius…
+[07:32:27.646]   q10 fetched 20 rows in 1.1581s
+[07:32:27.646] [sirius] q10 iter0: 1.1581s
+[07:32:27.646] --- q10 iter1 engine=sirius ---
+[07:32:27.646]   SET gpu_execution = true (GPU/sirius)
+[07:32:27.647]   Executing q10 on GPU/sirius…
+[07:32:28.772]   q10 fetched 20 rows in 1.1257s
+[07:32:28.772] [sirius] q10 iter1: 1.1257s
+[07:32:28.776] --- q10 iter2 engine=sirius ---
+[07:32:28.776]   SET gpu_execution = true (GPU/sirius)
+[07:32:28.777]   Executing q10 on GPU/sirius…
+[07:32:29.919]   q10 fetched 20 rows in 1.1425s
+[07:32:29.919] [sirius] q10 iter2: 1.1425s
+[07:32:29.938]   Unpinning tables for q10
+[07:32:29.940]   Pinning tables for q11
+[07:32:30.371] --- q11 iter0 engine=sirius ---
+[07:32:30.371]   SET gpu_execution = true (GPU/sirius)
+[07:32:30.371]   Executing q11 on GPU/sirius…
+[07:32:30.703]   q11 fetched 0 rows in 0.3323s
+[07:32:30.703] [sirius] q11 iter0: 0.3323s
+[07:32:30.704] --- q11 iter1 engine=sirius ---
+[07:32:30.704]   SET gpu_execution = true (GPU/sirius)
+[07:32:30.704]   Executing q11 on GPU/sirius…
+[07:32:31.005]   q11 fetched 0 rows in 0.3011s
+[07:32:31.005] [sirius] q11 iter1: 0.3011s
+[07:32:31.005] --- q11 iter2 engine=sirius ---
+[07:32:31.005]   SET gpu_execution = true (GPU/sirius)
+[07:32:31.006]   Executing q11 on GPU/sirius…
+[07:32:31.297]   q11 fetched 0 rows in 0.2910s
+[07:32:31.297] [sirius] q11 iter2: 0.2910s
+[07:32:31.297]   Unpinning tables for q11
+[07:32:31.298]   Pinning tables for q12
+[07:32:34.788] --- q12 iter0 engine=sirius ---
+[07:32:34.788]   SET gpu_execution = true (GPU/sirius)
+[07:32:34.788]   Executing q12 on GPU/sirius…
+[07:32:35.674]   q12 fetched 2 rows in 0.8854s
+[07:32:35.674] [sirius] q12 iter0: 0.8854s
+[07:32:35.690] --- q12 iter1 engine=sirius ---
+[07:32:35.690]   SET gpu_execution = true (GPU/sirius)
+[07:32:35.691]   Executing q12 on GPU/sirius…
+[07:32:36.569]   q12 fetched 2 rows in 0.8786s
+[07:32:36.569] [sirius] q12 iter1: 0.8786s
+[07:32:36.583] --- q12 iter2 engine=sirius ---
+[07:32:36.583]   SET gpu_execution = true (GPU/sirius)
+[07:32:36.584]   Executing q12 on GPU/sirius…
+[07:32:37.464]   q12 fetched 2 rows in 0.8806s
+[07:32:37.465] [sirius] q12 iter2: 0.8806s
+[07:32:37.490]   Unpinning tables for q12
+[07:32:37.491]   Pinning tables for q13
+[07:32:39.908] --- q13 iter0 engine=sirius ---
+[07:32:39.908]   SET gpu_execution = true (GPU/sirius)
+[07:32:39.909]   Executing q13 on GPU/sirius…
+[07:32:42.203]   q13 fetched 30 rows in 2.2937s
+[07:32:42.203] [sirius] q13 iter0: 2.2937s
+[07:32:42.203] --- q13 iter1 engine=sirius ---
+[07:32:42.203]   SET gpu_execution = true (GPU/sirius)
+[07:32:42.203]   Executing q13 on GPU/sirius…
+[07:32:43.560]   q13 fetched 30 rows in 1.3569s
+[07:32:43.561] [sirius] q13 iter1: 1.3569s
+[07:32:43.575] --- q13 iter2 engine=sirius ---
+[07:32:43.575]   SET gpu_execution = true (GPU/sirius)
+[07:32:43.575]   Executing q13 on GPU/sirius…
+[07:32:44.928]   q13 fetched 30 rows in 1.3533s
+[07:32:44.929] [sirius] q13 iter2: 1.3533s
+[07:32:44.945]   Unpinning tables for q13
+[07:32:44.946]   Pinning tables for q14
+[07:32:48.771] --- q14 iter0 engine=sirius ---
+[07:32:48.771]   SET gpu_execution = true (GPU/sirius)
+[07:32:48.771]   Executing q14 on GPU/sirius…
+[07:32:49.365]   q14 fetched 1 rows in 0.5937s
+[07:32:49.366] [sirius] q14 iter0: 0.5937s
+[07:32:49.366] --- q14 iter1 engine=sirius ---
+[07:32:49.366]   SET gpu_execution = true (GPU/sirius)
+[07:32:49.366]   Executing q14 on GPU/sirius…
+[07:32:49.959]   q14 fetched 1 rows in 0.5924s
+[07:32:49.959] [sirius] q14 iter1: 0.5924s
+[07:32:49.973] --- q14 iter2 engine=sirius ---
+[07:32:49.973]   SET gpu_execution = true (GPU/sirius)
+[07:32:49.973]   Executing q14 on GPU/sirius…
+[07:32:50.562]   q14 fetched 1 rows in 0.5890s
+[07:32:50.563] [sirius] q14 iter2: 0.5890s
+[07:32:50.576]   Unpinning tables for q14
+[07:32:50.578]   Pinning tables for q15
+[07:32:54.183] --- q15 iter0 engine=sirius ---
+[07:32:54.183]   SET gpu_execution = true (GPU/sirius)
+[07:32:54.184]   Executing q15 on GPU/sirius…
+[07:32:54.737]   q15 fetched 1 rows in 0.5538s
+[07:32:54.738] [sirius] q15 iter0: 0.5538s
+[07:32:54.738] --- q15 iter1 engine=sirius ---
+[07:32:54.738]   SET gpu_execution = true (GPU/sirius)
+[07:32:54.738]   Executing q15 on GPU/sirius…
+[07:32:55.250]   q15 fetched 1 rows in 0.5121s
+[07:32:55.251] [sirius] q15 iter1: 0.5121s
+[07:32:55.265] --- q15 iter2 engine=sirius ---
+[07:32:55.265]   SET gpu_execution = true (GPU/sirius)
+[07:32:55.265]   Executing q15 on GPU/sirius…
+[07:32:55.774]   q15 fetched 1 rows in 0.5085s
+[07:32:55.774] [sirius] q15 iter2: 0.5085s
+[07:32:55.788]   Unpinning tables for q15
+[07:32:55.789]   Pinning tables for q16
+[07:32:56.075] --- q16 iter0 engine=sirius ---
+[07:32:56.075]   SET gpu_execution = true (GPU/sirius)
+[07:32:56.075]   Executing q16 on GPU/sirius…
+[07:32:56.720]   q16 fetched 27840 rows in 0.6451s
+[07:32:56.721] [sirius] q16 iter0: 0.6451s
+[07:32:56.731] --- q16 iter1 engine=sirius ---
+[07:32:56.731]   SET gpu_execution = true (GPU/sirius)
+[07:32:56.732]   Executing q16 on GPU/sirius…
+[07:32:57.305]   q16 fetched 27840 rows in 0.5729s
+[07:32:57.305] [sirius] q16 iter1: 0.5729s
+[07:32:57.343] --- q16 iter2 engine=sirius ---
+[07:32:57.343]   SET gpu_execution = true (GPU/sirius)
+[07:32:57.343]   Executing q16 on GPU/sirius…
+[07:32:57.919]   q16 fetched 27840 rows in 0.5759s
+[07:32:57.920] [sirius] q16 iter2: 0.5759s
+[07:32:57.955]   Unpinning tables for q16
+[07:32:57.957]   Pinning tables for q17
+[07:33:01.229] --- q17 iter0 engine=sirius ---
+[07:33:01.229]   SET gpu_execution = true (GPU/sirius)
+[07:33:01.229]   Executing q17 on GPU/sirius…
+[07:33:02.518]   q17 fetched 1 rows in 1.2885s
+[07:33:02.518] [sirius] q17 iter0: 1.2885s
+[07:33:02.518] --- q17 iter1 engine=sirius ---
+[07:33:02.518]   SET gpu_execution = true (GPU/sirius)
+[07:33:02.519]   Executing q17 on GPU/sirius…
+[07:33:03.795]   q17 fetched 1 rows in 1.2768s
+[07:33:03.796] [sirius] q17 iter1: 1.2768s
+[07:33:03.814] --- q17 iter2 engine=sirius ---
+[07:33:03.814]   SET gpu_execution = true (GPU/sirius)
+[07:33:03.814]   Executing q17 on GPU/sirius…
+[07:33:05.083]   q17 fetched 1 rows in 1.2688s
+[07:33:05.083] [sirius] q17 iter2: 1.2688s
+[07:33:05.097]   Unpinning tables for q17
+[07:33:05.098]   Pinning tables for q18
+[07:33:07.276] --- q18 iter0 engine=sirius ---
+[07:33:07.276]   SET gpu_execution = true (GPU/sirius)
+[07:33:07.277]   Executing q18 on GPU/sirius…
+[07:33:08.646]   q18 fetched 100 rows in 1.3691s
+[07:33:08.646] [sirius] q18 iter0: 1.3691s
+[07:33:08.646] --- q18 iter1 engine=sirius ---
+[07:33:08.646]   SET gpu_execution = true (GPU/sirius)
+[07:33:08.647]   Executing q18 on GPU/sirius…
+[07:33:10.014]   q18 fetched 100 rows in 1.3672s
+[07:33:10.014] [sirius] q18 iter1: 1.3672s
+[07:33:10.033] --- q18 iter2 engine=sirius ---
+[07:33:10.033]   SET gpu_execution = true (GPU/sirius)
+[07:33:10.033]   Executing q18 on GPU/sirius…
+[07:33:11.403]   q18 fetched 100 rows in 1.3693s
+[07:33:11.403] [sirius] q18 iter2: 1.3693s
+[07:33:11.406]   Unpinning tables for q18
+[07:33:11.407]   Pinning tables for q19
+[07:33:17.849] --- q19 iter0 engine=sirius ---
+[07:33:17.850]   SET gpu_execution = true (GPU/sirius)
+[07:33:17.850]   Executing q19 on GPU/sirius…
+[07:33:19.017]   q19 fetched 1 rows in 1.1673s
+[07:33:19.018] [sirius] q19 iter0: 1.1673s
+[07:33:19.018] --- q19 iter1 engine=sirius ---
+[07:33:19.018]   SET gpu_execution = true (GPU/sirius)
+[07:33:19.018]   Executing q19 on GPU/sirius…
+[07:33:20.204]   q19 fetched 1 rows in 1.1859s
+[07:33:20.204] [sirius] q19 iter1: 1.1859s
+[07:33:20.218] --- q19 iter2 engine=sirius ---
+[07:33:20.218]   SET gpu_execution = true (GPU/sirius)
+[07:33:20.219]   Executing q19 on GPU/sirius…
+[07:33:21.381]   q19 fetched 1 rows in 1.1627s
+[07:33:21.382] [sirius] q19 iter2: 1.1627s
+[07:33:21.395]   Unpinning tables for q19
+[07:33:21.397]   Pinning tables for q20
+[07:33:25.636] --- q20 iter0 engine=sirius ---
+[07:33:25.636]   SET gpu_execution = true (GPU/sirius)
+[07:33:25.636]   Executing q20 on GPU/sirius…
+[07:33:26.187]   q20 fetched 111384 rows in 0.5506s
+[07:33:26.187] [sirius] q20 iter0: 0.5506s
+[07:33:26.228] --- q20 iter1 engine=sirius ---
+[07:33:26.228]   SET gpu_execution = true (GPU/sirius)
+[07:33:26.228]   Executing q20 on GPU/sirius…
+[07:33:26.780]   q20 fetched 111384 rows in 0.5513s
+[07:33:26.780] [sirius] q20 iter1: 0.5513s
+[07:33:26.837] --- q20 iter2 engine=sirius ---
+[07:33:26.837]   SET gpu_execution = true (GPU/sirius)
+[07:33:26.838]   Executing q20 on GPU/sirius…
+[07:33:27.396]   q20 fetched 111384 rows in 0.5583s
+[07:33:27.396] [sirius] q20 iter2: 0.5583s
+[07:33:27.453]   Unpinning tables for q20
+[07:33:27.456]   Pinning tables for q21
+[07:33:30.842] --- q21 iter0 engine=sirius ---
+[07:33:30.842]   SET gpu_execution = true (GPU/sirius)
+[07:33:30.842]   Executing q21 on GPU/sirius…
+[07:33:33.430]   q21 fetched 100 rows in 2.5873s
+[07:33:33.430] [sirius] q21 iter0: 2.5873s
+[07:33:33.444] --- q21 iter1 engine=sirius ---
+[07:33:33.444]   SET gpu_execution = true (GPU/sirius)
+[07:33:33.444]   Executing q21 on GPU/sirius…
+[07:33:36.166]   q21 fetched 100 rows in 2.7213s
+[07:33:36.166] [sirius] q21 iter1: 2.7213s
+[07:33:36.182] --- q21 iter2 engine=sirius ---
+[07:33:36.182]   SET gpu_execution = true (GPU/sirius)
+[07:33:36.183]   Executing q21 on GPU/sirius…
+[07:33:38.892]   q21 fetched 100 rows in 2.7092s
+[07:33:38.892] [sirius] q21 iter2: 2.7092s
+[07:33:38.892]   Unpinning tables for q21
+[07:33:38.894]   Pinning tables for q22
+[07:33:39.444] --- q22 iter0 engine=sirius ---
+[07:33:39.444]   SET gpu_execution = true (GPU/sirius)
+[07:33:39.445]   Executing q22 on GPU/sirius…
+[07:33:39.847]   q22 fetched 7 rows in 0.4027s
+[07:33:39.848] [sirius] q22 iter0: 0.4027s
+[07:33:39.848] --- q22 iter1 engine=sirius ---
+[07:33:39.848]   SET gpu_execution = true (GPU/sirius)
+[07:33:39.848]   Executing q22 on GPU/sirius…
+[07:33:40.240]   q22 fetched 7 rows in 0.3914s
+[07:33:40.240] [sirius] q22 iter1: 0.3914s
+[07:33:40.254] --- q22 iter2 engine=sirius ---
+[07:33:40.254]   SET gpu_execution = true (GPU/sirius)
+[07:33:40.254]   Executing q22 on GPU/sirius…
+[07:33:40.642]   q22 fetched 7 rows in 0.3881s
+[07:33:40.642] [sirius] q22 iter2: 0.3881s
+[07:33:40.648]   Unpinning tables for q22
+[07:33:40.649] Closing connection
+[07:33:42.792] Benchmark run complete
+[07:33:42.793] Splitting bench_out/compression_arms/tpch_20260731_073107_grouped_gpu_iter3_armA_host_uncompressed/log_dir/sirius_2026-07-31.log per query
+[07:33:42.801] Per-query Sirius logs written under bench_out/compression_arms/tpch_20260731_073107_grouped_gpu_iter3_armA_host_uncompressed/sirius/
+=== 07:33:43 ARM B: all-host compressed (plans_370) ===
+[07:33:43.346] Source:        /home/nvidia/tpch_parquet_sf1000
+[07:33:43.346] Data source:   parquet
+[07:33:43.346] Mode:          grouped
+[07:33:43.346] Iterations:    3
+[07:33:43.346] Engine:        gpu
+[07:33:43.346] Queries:       [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22]
+[07:33:43.346] Config:        bench/sirius_sf1000_pinned.yaml
+[07:33:43.346] Pin:           host
+[07:33:43.346] DuckDB profiling: False
+[07:33:43.346] nsys-profile:  False
+[07:33:43.346] Benchmark dir: bench_out/compression_arms/tpch_20260731_073343_grouped_gpu_iter3_armB_host_compressed
+[07:33:43.346] Runtime CSV:   bench_out/compression_arms/tpch_20260731_073343_grouped_gpu_iter3_armB_host_compressed/csv/runtimes.csv
+[07:33:43.346] Log dir:       bench_out/compression_arms/tpch_20260731_073343_grouped_gpu_iter3_armB_host_compressed/log_dir
+[07:33:43.604] OS cache dropped successfully
+[07:33:43.604] Mode 'grouped': single connection per engine, iterations back-to-back per query
+[07:33:43.604] Opening DuckDB connection over parquet dir /home/nvidia/tpch_parquet_sf1000
+[07:33:43.614] Registering TPC-H parquet views
+[07:33:43.643] All TPC-H views registered
+[07:33:43.643] Loading Sirius extension from /home/nvidia/felipe/sirius/.claude/worktrees/simpatico-mixed-pin/build/release/extension/sirius/sirius.duckdb_extension
+[07:33:51.992] Sirius extension loaded
+[07:33:51.993] Executing SIRIUS_PRE_SQL: SET pin_table_compression = true; SET pin_table_input_compression_plan_dir = '/home/nvidia/felipe/sirius/.claude/worktrees/simpatico-mixed-pin/bench_out/plans_370'
+[07:33:51.994]   Pinning tables for q1
+[07:33:57.356] --- q1 iter0 engine=sirius ---
+[07:33:57.356]   SET gpu_execution = true (GPU/sirius)
+[07:33:57.356]   Executing q1 on GPU/sirius…
+[07:33:58.798]   q1 fetched 4 rows in 1.4417s
+[07:33:58.798] [sirius] q1 iter0: 1.4417s
+[07:33:58.798] --- q1 iter1 engine=sirius ---
+[07:33:58.798]   SET gpu_execution = true (GPU/sirius)
+[07:33:58.799]   Executing q1 on GPU/sirius…
+[07:34:00.093]   q1 fetched 4 rows in 1.2939s
+[07:34:00.093] [sirius] q1 iter1: 1.2939s
+[07:34:00.107] --- q1 iter2 engine=sirius ---
+[07:34:00.107]   SET gpu_execution = true (GPU/sirius)
+[07:34:00.107]   Executing q1 on GPU/sirius…
+[07:34:01.360]   q1 fetched 4 rows in 1.2532s
+[07:34:01.361] [sirius] q1 iter2: 1.2532s
+[07:34:01.377]   Unpinning tables for q1
+[07:34:01.378]   Pinning tables for q2
+[07:34:01.983] --- q2 iter0 engine=sirius ---
+[07:34:01.984]   SET gpu_execution = true (GPU/sirius)
+[07:34:01.984]   Executing q2 on GPU/sirius…
+[07:34:02.358]   q2 fetched 100 rows in 0.3741s
+[07:34:02.358] [sirius] q2 iter0: 0.3741s
+[07:34:02.364] --- q2 iter1 engine=sirius ---
+[07:34:02.364]   SET gpu_execution = true (GPU/sirius)
+[07:34:02.364]   Executing q2 on GPU/sirius…
+[07:34:02.589]   q2 fetched 100 rows in 0.2244s
+[07:34:02.589] [sirius] q2 iter1: 0.2244s
+[07:34:02.600] --- q2 iter2 engine=sirius ---
+[07:34:02.600]   SET gpu_execution = true (GPU/sirius)
+[07:34:02.601]   Executing q2 on GPU/sirius…
+[07:34:02.830]   q2 fetched 100 rows in 0.2296s
+[07:34:02.830] [sirius] q2 iter2: 0.2296s
+[07:34:02.831]   Unpinning tables for q2
+[07:34:02.832]   Pinning tables for q3
+[07:34:06.511] --- q3 iter0 engine=sirius ---
+[07:34:06.511]   SET gpu_execution = true (GPU/sirius)
+[07:34:06.512]   Executing q3 on GPU/sirius…
+[07:34:07.327]   q3 fetched 10 rows in 0.8152s
+[07:34:07.327] [sirius] q3 iter0: 0.8152s
+[07:34:07.328] --- q3 iter1 engine=sirius ---
+[07:34:07.328]   SET gpu_execution = true (GPU/sirius)
+[07:34:07.328]   Executing q3 on GPU/sirius…
+[07:34:08.122]   q3 fetched 10 rows in 0.7940s
+[07:34:08.122] [sirius] q3 iter1: 0.7940s
+[07:34:08.136] --- q3 iter2 engine=sirius ---
+[07:34:08.136]   SET gpu_execution = true (GPU/sirius)
+[07:34:08.137]   Executing q3 on GPU/sirius…
+[07:34:08.927]   q3 fetched 10 rows in 0.7903s
+[07:34:08.927] [sirius] q3 iter2: 0.7903s
+[07:34:08.941]   Unpinning tables for q3
+[07:34:08.942]   Pinning tables for q4
+[07:34:11.280] --- q4 iter0 engine=sirius ---
+[07:34:11.280]   SET gpu_execution = true (GPU/sirius)
+[07:34:11.281]   Executing q4 on GPU/sirius…
+[07:34:11.834]   q4 fetched 5 rows in 0.5535s
+[07:34:11.834] [sirius] q4 iter0: 0.5535s
+[07:34:11.835] --- q4 iter1 engine=sirius ---
+[07:34:11.835]   SET gpu_execution = true (GPU/sirius)
+[07:34:11.835]   Executing q4 on GPU/sirius…
+[07:34:12.337]   q4 fetched 5 rows in 0.5022s
+[07:34:12.337] [sirius] q4 iter1: 0.5022s
+[07:34:12.351] --- q4 iter2 engine=sirius ---
+[07:34:12.351]   SET gpu_execution = true (GPU/sirius)
+[07:34:12.352]   Executing q4 on GPU/sirius…
+[07:34:12.850]   q4 fetched 5 rows in 0.4986s
+[07:34:12.850] [sirius] q4 iter2: 0.4986s
+[07:34:12.856]   Unpinning tables for q4
+[07:34:12.857]   Pinning tables for q5
+[07:34:16.984] --- q5 iter0 engine=sirius ---
+[07:34:16.984]   SET gpu_execution = true (GPU/sirius)
+[07:34:16.985]   Executing q5 on GPU/sirius…
+[07:34:17.861]   q5 fetched 5 rows in 0.8760s
+[07:34:17.861] [sirius] q5 iter0: 0.8760s
+[07:34:17.861] --- q5 iter1 engine=sirius ---
+[07:34:17.861]   SET gpu_execution = true (GPU/sirius)
+[07:34:17.862]   Executing q5 on GPU/sirius…
+[07:34:18.706]   q5 fetched 5 rows in 0.8441s
+[07:34:18.706] [sirius] q5 iter1: 0.8441s
+[07:34:18.722] --- q5 iter2 engine=sirius ---
+[07:34:18.722]   SET gpu_execution = true (GPU/sirius)
+[07:34:18.723]   Executing q5 on GPU/sirius…
+[07:34:19.571]   q5 fetched 5 rows in 0.8485s
+[07:34:19.571] [sirius] q5 iter2: 0.8485s
+[07:34:19.579]   Unpinning tables for q5
+[07:34:19.582]   Pinning tables for q6
+[07:34:22.487] --- q6 iter0 engine=sirius ---
+[07:34:22.487]   SET gpu_execution = true (GPU/sirius)
+[07:34:22.488]   Executing q6 on GPU/sirius…
+[07:34:23.232]   q6 fetched 1 rows in 0.7445s
+[07:34:23.232] [sirius] q6 iter0: 0.7445s
+[07:34:23.233] --- q6 iter1 engine=sirius ---
+[07:34:23.233]   SET gpu_execution = true (GPU/sirius)
+[07:34:23.233]   Executing q6 on GPU/sirius…
+[07:34:23.936]   q6 fetched 1 rows in 0.7033s
+[07:34:23.937] [sirius] q6 iter1: 0.7033s
+[07:34:23.961] --- q6 iter2 engine=sirius ---
+[07:34:23.961]   SET gpu_execution = true (GPU/sirius)
+[07:34:23.962]   Executing q6 on GPU/sirius…
+[07:34:24.691]   q6 fetched 1 rows in 0.7290s
+[07:34:24.691] [sirius] q6 iter2: 0.7290s
+[07:34:24.703]   Unpinning tables for q6
+[07:34:24.703]   Pinning tables for q7
+[07:34:29.370] --- q7 iter0 engine=sirius ---
+[07:34:29.370]   SET gpu_execution = true (GPU/sirius)
+[07:34:29.370]   Executing q7 on GPU/sirius…
+[07:34:30.358]   q7 fetched 4 rows in 0.9873s
+[07:34:30.358] [sirius] q7 iter0: 0.9873s
+[07:34:30.358] --- q7 iter1 engine=sirius ---
+[07:34:30.358]   SET gpu_execution = true (GPU/sirius)
+[07:34:30.358]   Executing q7 on GPU/sirius…
+[07:34:31.313]   q7 fetched 4 rows in 0.9549s
+[07:34:31.314] [sirius] q7 iter1: 0.9549s
+[07:34:31.330] --- q7 iter2 engine=sirius ---
+[07:34:31.330]   SET gpu_execution = true (GPU/sirius)
+[07:34:31.330]   Executing q7 on GPU/sirius…
+[07:34:32.289]   q7 fetched 4 rows in 0.9589s
+[07:34:32.289] [sirius] q7 iter2: 0.9589s
+[07:34:32.303]   Unpinning tables for q7
+[07:34:32.305]   Pinning tables for q8
+[07:34:37.851] --- q8 iter0 engine=sirius ---
+[07:34:37.851]   SET gpu_execution = true (GPU/sirius)
+[07:34:37.851]   Executing q8 on GPU/sirius…
+[07:34:38.869]   q8 fetched 2 rows in 1.0171s
+[07:34:38.869] [sirius] q8 iter0: 1.0171s
+[07:34:38.869] --- q8 iter1 engine=sirius ---
+[07:34:38.869]   SET gpu_execution = true (GPU/sirius)
+[07:34:38.870]   Executing q8 on GPU/sirius…
+[07:34:39.869]   q8 fetched 2 rows in 0.9993s
+[07:34:39.869] [sirius] q8 iter1: 0.9993s
+[07:34:39.869] --- q8 iter2 engine=sirius ---
+[07:34:39.869]   SET gpu_execution = true (GPU/sirius)
+[07:34:39.870]   Executing q8 on GPU/sirius…
+[07:34:40.865]   q8 fetched 2 rows in 0.9950s
+[07:34:40.865] [sirius] q8 iter2: 0.9950s
+[07:34:40.884]   Unpinning tables for q8
+[07:34:40.886]   Pinning tables for q9
+[07:34:47.292] --- q9 iter0 engine=sirius ---
+[07:34:47.292]   SET gpu_execution = true (GPU/sirius)
+[07:34:47.292]   Executing q9 on GPU/sirius…
+[07:34:49.578]   q9 fetched 175 rows in 2.2852s
+[07:34:49.578] [sirius] q9 iter0: 2.2852s
+[07:34:49.578] --- q9 iter1 engine=sirius ---
+[07:34:49.578]   SET gpu_execution = true (GPU/sirius)
+[07:34:49.579]   Executing q9 on GPU/sirius…
+[07:34:51.871]   q9 fetched 175 rows in 2.2925s
+[07:34:51.871] [sirius] q9 iter1: 2.2925s
+[07:34:51.896] --- q9 iter2 engine=sirius ---
+[07:34:51.896]   SET gpu_execution = true (GPU/sirius)
+[07:34:51.897]   Executing q9 on GPU/sirius…
+[07:34:54.185]   q9 fetched 175 rows in 2.2882s
+[07:34:54.199] [sirius] q9 iter2: 2.2882s
+[07:34:54.203]   Unpinning tables for q9
+[07:34:54.206]   Pinning tables for q10
+[07:34:59.263] --- q10 iter0 engine=sirius ---
+[07:34:59.264]   SET gpu_execution = true (GPU/sirius)
+[07:34:59.264]   Executing q10 on GPU/sirius…
+[07:35:00.412]   q10 fetched 20 rows in 1.1478s
+[07:35:00.412] [sirius] q10 iter0: 1.1478s
+[07:35:00.412] --- q10 iter1 engine=sirius ---
+[07:35:00.412]   SET gpu_execution = true (GPU/sirius)
+[07:35:00.412]   Executing q10 on GPU/sirius…
+[07:35:01.559]   q10 fetched 20 rows in 1.1463s
+[07:35:01.559] [sirius] q10 iter1: 1.1463s
+[07:35:01.571] --- q10 iter2 engine=sirius ---
+[07:35:01.571]   SET gpu_execution = true (GPU/sirius)
+[07:35:01.571]   Executing q10 on GPU/sirius…
+[07:35:02.716]   q10 fetched 20 rows in 1.1446s
+[07:35:02.716] [sirius] q10 iter2: 1.1446s
+[07:35:02.730]   Unpinning tables for q10
+[07:35:02.731]   Pinning tables for q11
+[07:35:03.208] --- q11 iter0 engine=sirius ---
+[07:35:03.208]   SET gpu_execution = true (GPU/sirius)
+[07:35:03.208]   Executing q11 on GPU/sirius…
+[07:35:03.550]   q11 fetched 0 rows in 0.3424s
+[07:35:03.551] [sirius] q11 iter0: 0.3424s
+[07:35:03.551] --- q11 iter1 engine=sirius ---
+[07:35:03.551]   SET gpu_execution = true (GPU/sirius)
+[07:35:03.551]   Executing q11 on GPU/sirius…
+[07:35:03.862]   q11 fetched 0 rows in 0.3110s
+[07:35:03.862] [sirius] q11 iter1: 0.3110s
+[07:35:03.862] --- q11 iter2 engine=sirius ---
+[07:35:03.862]   SET gpu_execution = true (GPU/sirius)
+[07:35:03.863]   Executing q11 on GPU/sirius…
+[07:35:04.174]   q11 fetched 0 rows in 0.3112s
+[07:35:04.174] [sirius] q11 iter2: 0.3112s
+[07:35:04.174]   Unpinning tables for q11
+[07:35:04.176]   Pinning tables for q12
+[07:35:07.735] --- q12 iter0 engine=sirius ---
+[07:35:07.735]   SET gpu_execution = true (GPU/sirius)
+[07:35:07.736]   Executing q12 on GPU/sirius…
+[07:35:08.621]   q12 fetched 2 rows in 0.8857s
+[07:35:08.621] [sirius] q12 iter0: 0.8857s
+[07:35:08.622] --- q12 iter1 engine=sirius ---
+[07:35:08.622]   SET gpu_execution = true (GPU/sirius)
+[07:35:08.622]   Executing q12 on GPU/sirius…
+[07:35:09.507]   q12 fetched 2 rows in 0.8845s
+[07:35:09.507] [sirius] q12 iter1: 0.8845s
+[07:35:09.523] --- q12 iter2 engine=sirius ---
+[07:35:09.523]   SET gpu_execution = true (GPU/sirius)
+[07:35:09.523]   Executing q12 on GPU/sirius…
+[07:35:10.412]   q12 fetched 2 rows in 0.8886s
+[07:35:10.412] [sirius] q12 iter2: 0.8886s
+[07:35:10.426]   Unpinning tables for q12
+[07:35:10.427]   Pinning tables for q13
+[07:35:16.396] --- q13 iter0 engine=sirius ---
+[07:35:16.397]   SET gpu_execution = true (GPU/sirius)
+[07:35:16.397]   Executing q13 on GPU/sirius…
+[07:35:18.168]   q13 fetched 30 rows in 1.7705s
+[07:35:18.168] [sirius] q13 iter0: 1.7705s
+[07:35:18.168] --- q13 iter1 engine=sirius ---
+[07:35:18.168]   SET gpu_execution = true (GPU/sirius)
+[07:35:18.168]   Executing q13 on GPU/sirius…
+[07:35:19.888]   q13 fetched 30 rows in 1.7191s
+[07:35:19.888] [sirius] q13 iter1: 1.7191s
+[07:35:19.901] --- q13 iter2 engine=sirius ---
+[07:35:19.901]   SET gpu_execution = true (GPU/sirius)
+[07:35:19.902]   Executing q13 on GPU/sirius…
+[07:35:21.628]   q13 fetched 30 rows in 1.7262s
+[07:35:21.642] [sirius] q13 iter2: 1.7262s
+[07:35:21.646]   Unpinning tables for q13
+[07:35:21.647]   Pinning tables for q14
+[07:35:25.581] --- q14 iter0 engine=sirius ---
+[07:35:25.581]   SET gpu_execution = true (GPU/sirius)
+[07:35:25.581]   Executing q14 on GPU/sirius…
+[07:35:26.326]   q14 fetched 1 rows in 0.7448s
+[07:35:26.326] [sirius] q14 iter0: 0.7448s
+[07:35:26.326] --- q14 iter1 engine=sirius ---
+[07:35:26.327]   SET gpu_execution = true (GPU/sirius)
+[07:35:26.327]   Executing q14 on GPU/sirius…
+[07:35:27.070]   q14 fetched 1 rows in 0.7436s
+[07:35:27.071] [sirius] q14 iter1: 0.7436s
+[07:35:27.088] --- q14 iter2 engine=sirius ---
+[07:35:27.088]   SET gpu_execution = true (GPU/sirius)
+[07:35:27.089]   Executing q14 on GPU/sirius…
+[07:35:27.825]   q14 fetched 1 rows in 0.7364s
+[07:35:27.825] [sirius] q14 iter2: 0.7364s
+[07:35:27.839]   Unpinning tables for q14
+[07:35:27.840]   Pinning tables for q15
+[07:35:31.549] --- q15 iter0 engine=sirius ---
+[07:35:31.549]   SET gpu_execution = true (GPU/sirius)
+[07:35:31.549]   Executing q15 on GPU/sirius…
+[07:35:32.254]   q15 fetched 1 rows in 0.7046s
+[07:35:32.254] [sirius] q15 iter0: 0.7046s
+[07:35:32.255] --- q15 iter1 engine=sirius ---
+[07:35:32.255]   SET gpu_execution = true (GPU/sirius)
+[07:35:32.255]   Executing q15 on GPU/sirius…
+[07:35:32.918]   q15 fetched 1 rows in 0.6632s
+[07:35:32.918] [sirius] q15 iter1: 0.6632s
+[07:35:32.934] --- q15 iter2 engine=sirius ---
+[07:35:32.934]   SET gpu_execution = true (GPU/sirius)
+[07:35:32.935]   Executing q15 on GPU/sirius…
+[07:35:33.592]   q15 fetched 1 rows in 0.6573s
+[07:35:33.592] [sirius] q15 iter2: 0.6573s
+[07:35:33.608]   Unpinning tables for q15
+[07:35:33.610]   Pinning tables for q16
+[07:35:33.934] --- q16 iter0 engine=sirius ---
+[07:35:33.934]   SET gpu_execution = true (GPU/sirius)
+[07:35:33.934]   Executing q16 on GPU/sirius…
+[07:35:34.569]   q16 fetched 27840 rows in 0.6349s
+[07:35:34.569] [sirius] q16 iter0: 0.6349s
+[07:35:34.580] --- q16 iter1 engine=sirius ---
+[07:35:34.580]   SET gpu_execution = true (GPU/sirius)
+[07:35:34.581]   Executing q16 on GPU/sirius…
+[07:35:35.152]   q16 fetched 27840 rows in 0.5713s
+[07:35:35.152] [sirius] q16 iter1: 0.5713s
+[07:35:35.189] --- q16 iter2 engine=sirius ---
+[07:35:35.189]   SET gpu_execution = true (GPU/sirius)
+[07:35:35.189]   Executing q16 on GPU/sirius…
+[07:35:35.755]   q16 fetched 27840 rows in 0.5662s
+[07:35:35.756] [sirius] q16 iter2: 0.5662s
+[07:35:35.772]   Unpinning tables for q16
+[07:35:35.773]   Pinning tables for q17
+[07:35:39.145] --- q17 iter0 engine=sirius ---
+[07:35:39.145]   SET gpu_execution = true (GPU/sirius)
+[07:35:39.146]   Executing q17 on GPU/sirius…
+[07:35:40.515]   q17 fetched 1 rows in 1.3692s
+[07:35:40.515] [sirius] q17 iter0: 1.3692s
+[07:35:40.515] --- q17 iter1 engine=sirius ---
+[07:35:40.515]   SET gpu_execution = true (GPU/sirius)
+[07:35:40.516]   Executing q17 on GPU/sirius…
+[07:35:41.873]   q17 fetched 1 rows in 1.3573s
+[07:35:41.873] [sirius] q17 iter1: 1.3573s
+[07:35:41.892] --- q17 iter2 engine=sirius ---
+[07:35:41.892]   SET gpu_execution = true (GPU/sirius)
+[07:35:41.893]   Executing q17 on GPU/sirius…
+[07:35:43.261]   q17 fetched 1 rows in 1.3685s
+[07:35:43.262] [sirius] q17 iter2: 1.3685s
+[07:35:43.275]   Unpinning tables for q17
+[07:35:43.277]   Pinning tables for q18
+[07:35:45.373] --- q18 iter0 engine=sirius ---
+[07:35:45.373]   SET gpu_execution = true (GPU/sirius)
+[07:35:45.373]   Executing q18 on GPU/sirius…
+[07:35:46.854]   q18 fetched 100 rows in 1.4802s
+[07:35:46.854] [sirius] q18 iter0: 1.4802s
+[07:35:46.854] --- q18 iter1 engine=sirius ---
+[07:35:46.854]   SET gpu_execution = true (GPU/sirius)
+[07:35:46.855]   Executing q18 on GPU/sirius…
+[07:35:48.312]   q18 fetched 100 rows in 1.4578s
+[07:35:48.312] [sirius] q18 iter1: 1.4578s
+[07:35:48.329] --- q18 iter2 engine=sirius ---
+[07:35:48.329]   SET gpu_execution = true (GPU/sirius)
+[07:35:48.329]   Executing q18 on GPU/sirius…
+[07:35:49.791]   q18 fetched 100 rows in 1.4618s
+[07:35:49.791] [sirius] q18 iter2: 1.4618s
+[07:35:49.792]   Unpinning tables for q18
+[07:35:49.793]   Pinning tables for q19
+[07:35:55.181] --- q19 iter0 engine=sirius ---
+[07:35:55.182]   SET gpu_execution = true (GPU/sirius)
+[07:35:55.182]   Executing q19 on GPU/sirius…
+[07:35:56.349]   q19 fetched 1 rows in 1.1673s
+[07:35:56.349] [sirius] q19 iter0: 1.1673s
+[07:35:56.350] --- q19 iter1 engine=sirius ---
+[07:35:56.350]   SET gpu_execution = true (GPU/sirius)
+[07:35:56.350]   Executing q19 on GPU/sirius…
+[07:35:57.557]   q19 fetched 1 rows in 1.2063s
+[07:35:57.557] [sirius] q19 iter1: 1.2063s
+[07:35:57.573] --- q19 iter2 engine=sirius ---
+[07:35:57.573]   SET gpu_execution = true (GPU/sirius)
+[07:35:57.573]   Executing q19 on GPU/sirius…
+[07:35:58.713]   q19 fetched 1 rows in 1.1400s
+[07:35:58.714] [sirius] q19 iter2: 1.1400s
+[07:35:58.728]   Unpinning tables for q19
+[07:35:58.729]   Pinning tables for q20
+[07:36:03.370] --- q20 iter0 engine=sirius ---
+[07:36:03.370]   SET gpu_execution = true (GPU/sirius)
+[07:36:03.371]   Executing q20 on GPU/sirius…
+[07:36:03.931]   q20 fetched 111384 rows in 0.5600s
+[07:36:03.931] [sirius] q20 iter0: 0.5600s
+[07:36:03.971] --- q20 iter1 engine=sirius ---
+[07:36:03.971]   SET gpu_execution = true (GPU/sirius)
+[07:36:03.971]   Executing q20 on GPU/sirius…
+[07:36:04.514]   q20 fetched 111384 rows in 0.5428s
+[07:36:04.515] [sirius] q20 iter1: 0.5428s
+[07:36:04.581] --- q20 iter2 engine=sirius ---
+[07:36:04.581]   SET gpu_execution = true (GPU/sirius)
+[07:36:04.581]   Executing q20 on GPU/sirius…
+[07:36:05.138]   q20 fetched 111384 rows in 0.5570s
+[07:36:05.139] [sirius] q20 iter2: 0.5570s
+[07:36:05.195]   Unpinning tables for q20
+[07:36:05.198]   Pinning tables for q21
+[07:36:08.554] --- q21 iter0 engine=sirius ---
+[07:36:08.554]   SET gpu_execution = true (GPU/sirius)
+[07:36:08.554]   Executing q21 on GPU/sirius…
+[07:36:11.282]   q21 fetched 100 rows in 2.7276s
+[07:36:11.282] [sirius] q21 iter0: 2.7276s
+[07:36:11.282] --- q21 iter1 engine=sirius ---
+[07:36:11.282]   SET gpu_execution = true (GPU/sirius)
+[07:36:11.283]   Executing q21 on GPU/sirius…
+[07:36:14.038]   q21 fetched 100 rows in 2.7553s
+[07:36:14.038] [sirius] q21 iter1: 2.7553s
+[07:36:14.055] --- q21 iter2 engine=sirius ---
+[07:36:14.055]   SET gpu_execution = true (GPU/sirius)
+[07:36:14.055]   Executing q21 on GPU/sirius…
+[07:36:16.885]   q21 fetched 100 rows in 2.8302s
+[07:36:16.885] [sirius] q21 iter2: 2.8302s
+[07:36:16.899]   Unpinning tables for q21
+[07:36:16.901]   Pinning tables for q22
+[07:36:17.458] --- q22 iter0 engine=sirius ---
+[07:36:17.458]   SET gpu_execution = true (GPU/sirius)
+[07:36:17.458]   Executing q22 on GPU/sirius…
+[07:36:17.851]   q22 fetched 7 rows in 0.3927s
+[07:36:17.851] [sirius] q22 iter0: 0.3927s
+[07:36:17.851] --- q22 iter1 engine=sirius ---
+[07:36:17.851]   SET gpu_execution = true (GPU/sirius)
+[07:36:17.852]   Executing q22 on GPU/sirius…
+[07:36:18.233]   q22 fetched 7 rows in 0.3817s
+[07:36:18.234] [sirius] q22 iter1: 0.3817s
+[07:36:18.247] --- q22 iter2 engine=sirius ---
+[07:36:18.247]   SET gpu_execution = true (GPU/sirius)
+[07:36:18.248]   Executing q22 on GPU/sirius…
+[07:36:18.626]   q22 fetched 7 rows in 0.3782s
+[07:36:18.626] [sirius] q22 iter2: 0.3782s
+[07:36:18.634]   Unpinning tables for q22
+[07:36:18.635] Closing connection
+[07:36:20.227] Benchmark run complete
+[07:36:20.227] Splitting bench_out/compression_arms/tpch_20260731_073343_grouped_gpu_iter3_armB_host_compressed/log_dir/sirius_2026-07-31.log per query
+[07:36:20.236] Per-query Sirius logs written under bench_out/compression_arms/tpch_20260731_073343_grouped_gpu_iter3_armB_host_compressed/sirius/
+=== 07:36:20 ARM C: mixed tier (dims gpu, facts host compressed) ===
+[07:36:20.885] Source:        /home/nvidia/tpch_parquet_sf1000
+[07:36:20.885] Data source:   parquet
+[07:36:20.885] Mode:          grouped
+[07:36:20.885] Iterations:    3
+[07:36:20.885] Engine:        gpu
+[07:36:20.885] Queries:       [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22]
+[07:36:20.885] Config:        bench/sirius_sf1000_pinned.yaml
+[07:36:20.885] Pin:           host
+[07:36:20.885] DuckDB profiling: False
+[07:36:20.885] nsys-profile:  False
+[07:36:20.885] Benchmark dir: bench_out/compression_arms/tpch_20260731_073620_grouped_gpu_iter3_armC_mixed_tier
+[07:36:20.885] Runtime CSV:   bench_out/compression_arms/tpch_20260731_073620_grouped_gpu_iter3_armC_mixed_tier/csv/runtimes.csv
+[07:36:20.885] Log dir:       bench_out/compression_arms/tpch_20260731_073620_grouped_gpu_iter3_armC_mixed_tier/log_dir
+[07:36:21.154] OS cache dropped successfully
+[07:36:21.155] Mode 'grouped': single connection per engine, iterations back-to-back per query
+[07:36:21.155] Opening DuckDB connection over parquet dir /home/nvidia/tpch_parquet_sf1000
+[07:36:21.164] Registering TPC-H parquet views
+[07:36:21.193] All TPC-H views registered
+[07:36:21.193] Loading Sirius extension from /home/nvidia/felipe/sirius/.claude/worktrees/simpatico-mixed-pin/build/release/extension/sirius/sirius.duckdb_extension
+[07:36:29.547] Sirius extension loaded
+[07:36:29.558] Executing SIRIUS_PRE_SQL: SET pin_table_compression = true; SET pin_table_input_compression_plan_dir = '/home/nvidia/felipe/sirius/.claude/worktrees/simpatico-mixed-pin/bench_out/plans_370_facts'
+[07:36:29.562]   Pinning tables for q1
+[07:36:34.918] --- q1 iter0 engine=sirius ---
+[07:36:34.926]   SET gpu_execution = true (GPU/sirius)
+[07:36:34.926]   Executing q1 on GPU/sirius…
+[07:36:36.400]   q1 fetched 4 rows in 1.4740s
+[07:36:36.400] [sirius] q1 iter0: 1.4740s
+[07:36:36.401] --- q1 iter1 engine=sirius ---
+[07:36:36.401]   SET gpu_execution = true (GPU/sirius)
+[07:36:36.402]   Executing q1 on GPU/sirius…
+[07:36:37.675]   q1 fetched 4 rows in 1.2734s
+[07:36:37.675] [sirius] q1 iter1: 1.2734s
+[07:36:37.695] --- q1 iter2 engine=sirius ---
+[07:36:37.695]   SET gpu_execution = true (GPU/sirius)
+[07:36:37.696]   Executing q1 on GPU/sirius…
+[07:36:38.993]   q1 fetched 4 rows in 1.2971s
+[07:36:38.993] [sirius] q1 iter2: 1.2971s
+[07:36:39.007]   Unpinning tables for q1
+[07:36:39.008]   Pinning tables for q2
+[07:36:39.526] --- q2 iter0 engine=sirius ---
+[07:36:39.526]   SET gpu_execution = true (GPU/sirius)
+[07:36:39.526]   Executing q2 on GPU/sirius…
+[07:36:39.820]   q2 fetched 100 rows in 0.2935s
+[07:36:39.820] [sirius] q2 iter0: 0.2935s
+[07:36:39.820] --- q2 iter1 engine=sirius ---
+[07:36:39.820]   SET gpu_execution = true (GPU/sirius)
+[07:36:39.820]   Executing q2 on GPU/sirius…
+[07:36:40.010]   q2 fetched 100 rows in 0.1893s
+[07:36:40.010] [sirius] q2 iter1: 0.1893s
+[07:36:40.026] --- q2 iter2 engine=sirius ---
+[07:36:40.026]   SET gpu_execution = true (GPU/sirius)
+[07:36:40.026]   Executing q2 on GPU/sirius…
+[07:36:40.221]   q2 fetched 100 rows in 0.1948s
+[07:36:40.221] [sirius] q2 iter2: 0.1948s
+[07:36:40.233]   Unpinning tables for q2
+[07:36:40.235]   Pinning tables for q3
+[07:36:43.872] --- q3 iter0 engine=sirius ---
+[07:36:43.872]   SET gpu_execution = true (GPU/sirius)
+[07:36:43.873]   Executing q3 on GPU/sirius…
+[07:36:44.678]   q3 fetched 10 rows in 0.8052s
+[07:36:44.678] [sirius] q3 iter0: 0.8052s
+[07:36:44.678] --- q3 iter1 engine=sirius ---
+[07:36:44.678]   SET gpu_execution = true (GPU/sirius)
+[07:36:44.679]   Executing q3 on GPU/sirius…
+[07:36:45.473]   q3 fetched 10 rows in 0.7941s
+[07:36:45.473] [sirius] q3 iter1: 0.7941s
+[07:36:45.489] --- q3 iter2 engine=sirius ---
+[07:36:45.489]   SET gpu_execution = true (GPU/sirius)
+[07:36:45.489]   Executing q3 on GPU/sirius…
+[07:36:46.288]   q3 fetched 10 rows in 0.7982s
+[07:36:46.288] [sirius] q3 iter2: 0.7982s
+[07:36:46.304]   Unpinning tables for q3
+[07:36:46.305]   Pinning tables for q4
+[07:36:48.671] --- q4 iter0 engine=sirius ---
+[07:36:48.671]   SET gpu_execution = true (GPU/sirius)
+[07:36:48.671]   Executing q4 on GPU/sirius…
+[07:36:49.235]   q4 fetched 5 rows in 0.5638s
+[07:36:49.235] [sirius] q4 iter0: 0.5638s
+[07:36:49.236] --- q4 iter1 engine=sirius ---
+[07:36:49.236]   SET gpu_execution = true (GPU/sirius)
+[07:36:49.236]   Executing q4 on GPU/sirius…
+[07:36:49.748]   q4 fetched 5 rows in 0.5123s
+[07:36:49.748] [sirius] q4 iter1: 0.5123s
+[07:36:49.762] --- q4 iter2 engine=sirius ---
+[07:36:49.762]   SET gpu_execution = true (GPU/sirius)
+[07:36:49.763]   Executing q4 on GPU/sirius…
+[07:36:50.271]   q4 fetched 5 rows in 0.5085s
+[07:36:50.271] [sirius] q4 iter2: 0.5085s
+[07:36:50.285]   Unpinning tables for q4
+[07:36:50.286]   Pinning tables for q5
+[07:36:54.427] --- q5 iter0 engine=sirius ---
+[07:36:54.427]   SET gpu_execution = true (GPU/sirius)
+[07:36:54.427]   Executing q5 on GPU/sirius…
+[07:36:55.314]   q5 fetched 5 rows in 0.8862s
+[07:36:55.314] [sirius] q5 iter0: 0.8862s
+[07:36:55.314] --- q5 iter1 engine=sirius ---
+[07:36:55.314]   SET gpu_execution = true (GPU/sirius)
+[07:36:55.314]   Executing q5 on GPU/sirius…
+[07:36:56.169]   q5 fetched 5 rows in 0.8542s
+[07:36:56.169] [sirius] q5 iter1: 0.8542s
+[07:36:56.196] --- q5 iter2 engine=sirius ---
+[07:36:56.196]   SET gpu_execution = true (GPU/sirius)
+[07:36:56.196]   Executing q5 on GPU/sirius…
+[07:36:57.054]   q5 fetched 5 rows in 0.8574s
+[07:36:57.054] [sirius] q5 iter2: 0.8574s
+[07:36:57.072]   Unpinning tables for q5
+[07:36:57.074]   Pinning tables for q6
+[07:36:59.990] --- q6 iter0 engine=sirius ---
+[07:36:59.990]   SET gpu_execution = true (GPU/sirius)
+[07:36:59.991]   Executing q6 on GPU/sirius…
+[07:37:00.735]   q6 fetched 1 rows in 0.7445s
+[07:37:00.735] [sirius] q6 iter0: 0.7445s
+[07:37:00.736] --- q6 iter1 engine=sirius ---
+[07:37:00.736]   SET gpu_execution = true (GPU/sirius)
+[07:37:00.736]   Executing q6 on GPU/sirius…
+[07:37:01.450]   q6 fetched 1 rows in 0.7134s
+[07:37:01.450] [sirius] q6 iter1: 0.7134s
+[07:37:01.466] --- q6 iter2 engine=sirius ---
+[07:37:01.466]   SET gpu_execution = true (GPU/sirius)
+[07:37:01.466]   Executing q6 on GPU/sirius…
+[07:37:02.184]   q6 fetched 1 rows in 0.7177s
+[07:37:02.184] [sirius] q6 iter2: 0.7177s
+[07:37:02.201]   Unpinning tables for q6
+[07:37:02.201]   Pinning tables for q7
+[07:37:06.861] --- q7 iter0 engine=sirius ---
+[07:37:06.861]   SET gpu_execution = true (GPU/sirius)
+[07:37:06.862]   Executing q7 on GPU/sirius…
+[07:37:07.858]   q7 fetched 4 rows in 0.9968s
+[07:37:07.859] [sirius] q7 iter0: 0.9968s
+[07:37:07.859] --- q7 iter1 engine=sirius ---
+[07:37:07.859]   SET gpu_execution = true (GPU/sirius)
+[07:37:07.859]   Executing q7 on GPU/sirius…
+[07:37:08.824]   q7 fetched 4 rows in 0.9648s
+[07:37:08.824] [sirius] q7 iter1: 0.9648s
+[07:37:08.830] --- q7 iter2 engine=sirius ---
+[07:37:08.830]   SET gpu_execution = true (GPU/sirius)
+[07:37:08.830]   Executing q7 on GPU/sirius…
+[07:37:09.790]   q7 fetched 4 rows in 0.9597s
+[07:37:09.790] [sirius] q7 iter2: 0.9597s
+[07:37:09.804]   Unpinning tables for q7
+[07:37:09.806]   Pinning tables for q8
+[07:37:15.352] --- q8 iter0 engine=sirius ---
+[07:37:15.352]   SET gpu_execution = true (GPU/sirius)
+[07:37:15.353]   Executing q8 on GPU/sirius…
+[07:37:16.350]   q8 fetched 2 rows in 0.9971s
+[07:37:16.350] [sirius] q8 iter0: 0.9971s
+[07:37:16.350] --- q8 iter1 engine=sirius ---
+[07:37:16.350]   SET gpu_execution = true (GPU/sirius)
+[07:37:16.351]   Executing q8 on GPU/sirius…
+[07:37:17.326]   q8 fetched 2 rows in 0.9750s
+[07:37:17.326] [sirius] q8 iter1: 0.9750s
+[07:37:17.342] --- q8 iter2 engine=sirius ---
+[07:37:17.342]   SET gpu_execution = true (GPU/sirius)
+[07:37:17.343]   Executing q8 on GPU/sirius…
+[07:37:18.322]   q8 fetched 2 rows in 0.9791s
+[07:37:18.322] [sirius] q8 iter2: 0.9791s
+[07:37:18.336]   Unpinning tables for q8
+[07:37:18.339]   Pinning tables for q9
+[07:37:24.427] --- q9 iter0 engine=sirius ---
+[07:37:24.427]   SET gpu_execution = true (GPU/sirius)
+[07:37:24.427]   Executing q9 on GPU/sirius…
+[07:37:26.692]   q9 fetched 175 rows in 2.2649s
+[07:37:26.692] [sirius] q9 iter0: 2.2649s
+[07:37:26.692] --- q9 iter1 engine=sirius ---
+[07:37:26.692]   SET gpu_execution = true (GPU/sirius)
+[07:37:26.693]   Executing q9 on GPU/sirius…
+[07:37:28.945]   q9 fetched 175 rows in 2.2524s
+[07:37:28.945] [sirius] q9 iter1: 2.2524s
+[07:37:28.957] --- q9 iter2 engine=sirius ---
+[07:37:28.957]   SET gpu_execution = true (GPU/sirius)
+[07:37:28.958]   Executing q9 on GPU/sirius…
+[07:37:31.209]   q9 fetched 175 rows in 2.2511s
+[07:37:31.209] [sirius] q9 iter2: 2.2511s
+[07:37:31.225]   Unpinning tables for q9
+[07:37:31.227]   Pinning tables for q10
+[07:37:35.603] --- q10 iter0 engine=sirius ---
+[07:37:35.603]   SET gpu_execution = true (GPU/sirius)
+[07:37:35.604]   Executing q10 on GPU/sirius…
+[07:37:36.661]   q10 fetched 20 rows in 1.0573s
+[07:37:36.661] [sirius] q10 iter0: 1.0573s
+[07:37:36.661] --- q10 iter1 engine=sirius ---
+[07:37:36.661]   SET gpu_execution = true (GPU/sirius)
+[07:37:36.662]   Executing q10 on GPU/sirius…
+[07:37:37.707]   q10 fetched 20 rows in 1.0455s
+[07:37:37.708] [sirius] q10 iter1: 1.0455s
+[07:37:37.724] --- q10 iter2 engine=sirius ---
+[07:37:37.724]   SET gpu_execution = true (GPU/sirius)
+[07:37:37.724]   Executing q10 on GPU/sirius…
+[07:37:38.764]   q10 fetched 20 rows in 1.0398s
+[07:37:38.764] [sirius] q10 iter2: 1.0398s
+[07:37:38.778]   Unpinning tables for q10
+[07:37:38.780]   Pinning tables for q11
+[07:37:39.256] --- q11 iter0 engine=sirius ---
+[07:37:39.256]   SET gpu_execution = true (GPU/sirius)
+[07:37:39.256]   Executing q11 on GPU/sirius…
+[07:37:39.609]   q11 fetched 0 rows in 0.3525s
+[07:37:39.609] [sirius] q11 iter0: 0.3525s
+[07:37:39.609] --- q11 iter1 engine=sirius ---
+[07:37:39.609]   SET gpu_execution = true (GPU/sirius)
+[07:37:39.610]   Executing q11 on GPU/sirius…
+[07:37:39.921]   q11 fetched 0 rows in 0.3110s
+[07:37:39.921] [sirius] q11 iter1: 0.3110s
+[07:37:39.921] --- q11 iter2 engine=sirius ---
+[07:37:39.921]   SET gpu_execution = true (GPU/sirius)
+[07:37:39.921]   Executing q11 on GPU/sirius…
+[07:37:40.243]   q11 fetched 0 rows in 0.3213s
+[07:37:40.243] [sirius] q11 iter2: 0.3213s
+[07:37:40.243]   Unpinning tables for q11
+[07:37:40.244]   Pinning tables for q12
+[07:37:43.803] --- q12 iter0 engine=sirius ---
+[07:37:43.803]   SET gpu_execution = true (GPU/sirius)
+[07:37:43.804]   Executing q12 on GPU/sirius…
+[07:37:44.700]   q12 fetched 2 rows in 0.8956s
+[07:37:44.700] [sirius] q12 iter0: 0.8956s
+[07:37:44.700] --- q12 iter1 engine=sirius ---
+[07:37:44.700]   SET gpu_execution = true (GPU/sirius)
+[07:37:44.700]   Executing q12 on GPU/sirius…
+[07:37:45.585]   q12 fetched 2 rows in 0.8845s
+[07:37:45.585] [sirius] q12 iter1: 0.8845s
+[07:37:45.601] --- q12 iter2 engine=sirius ---
+[07:37:45.601]   SET gpu_execution = true (GPU/sirius)
+[07:37:45.602]   Executing q12 on GPU/sirius…
+[07:37:46.490]   q12 fetched 2 rows in 0.8887s
+[07:37:46.491] [sirius] q12 iter2: 0.8887s
+[07:37:46.504]   Unpinning tables for q12
+[07:37:46.506]   Pinning tables for q13
+[07:37:52.475] --- q13 iter0 engine=sirius ---
+[07:37:52.475]   SET gpu_execution = true (GPU/sirius)
+[07:37:52.476]   Executing q13 on GPU/sirius…
+[07:37:54.196]   q13 fetched 30 rows in 1.7204s
+[07:37:54.196] [sirius] q13 iter0: 1.7204s
+[07:37:54.197] --- q13 iter1 engine=sirius ---
+[07:37:54.197]   SET gpu_execution = true (GPU/sirius)
+[07:37:54.197]   Executing q13 on GPU/sirius…
+[07:37:55.876]   q13 fetched 30 rows in 1.6789s
+[07:37:55.876] [sirius] q13 iter1: 1.6789s
+[07:37:55.893] --- q13 iter2 engine=sirius ---
+[07:37:55.893]   SET gpu_execution = true (GPU/sirius)
+[07:37:55.893]   Executing q13 on GPU/sirius…
+[07:37:57.637]   q13 fetched 30 rows in 1.7435s
+[07:37:57.637] [sirius] q13 iter2: 1.7435s
+[07:37:57.654]   Unpinning tables for q13
+[07:37:57.656]   Pinning tables for q14
+[07:38:01.569] --- q14 iter0 engine=sirius ---
+[07:38:01.570]   SET gpu_execution = true (GPU/sirius)
+[07:38:01.570]   Executing q14 on GPU/sirius…
+[07:38:02.295]   q14 fetched 1 rows in 0.7246s
+[07:38:02.295] [sirius] q14 iter0: 0.7246s
+[07:38:02.295] --- q14 iter1 engine=sirius ---
+[07:38:02.295]   SET gpu_execution = true (GPU/sirius)
+[07:38:02.295]   Executing q14 on GPU/sirius…
+[07:38:03.019]   q14 fetched 1 rows in 0.7235s
+[07:38:03.019] [sirius] q14 iter1: 0.7235s
+[07:38:03.033] --- q14 iter2 engine=sirius ---
+[07:38:03.033]   SET gpu_execution = true (GPU/sirius)
+[07:38:03.033]   Executing q14 on GPU/sirius…
+[07:38:03.753]   q14 fetched 1 rows in 0.7198s
+[07:38:03.753] [sirius] q14 iter2: 0.7198s
+[07:38:03.767]   Unpinning tables for q14
+[07:38:03.768]   Pinning tables for q15
+[07:38:07.494] --- q15 iter0 engine=sirius ---
+[07:38:07.495]   SET gpu_execution = true (GPU/sirius)
+[07:38:07.495]   Executing q15 on GPU/sirius…
+[07:38:08.200]   q15 fetched 1 rows in 0.7046s
+[07:38:08.200] [sirius] q15 iter0: 0.7046s
+[07:38:08.205] --- q15 iter1 engine=sirius ---
+[07:38:08.205]   SET gpu_execution = true (GPU/sirius)
+[07:38:08.206]   Executing q15 on GPU/sirius…
+[07:38:08.864]   q15 fetched 1 rows in 0.6579s
+[07:38:08.864] [sirius] q15 iter1: 0.6579s
+[07:38:08.878] --- q15 iter2 engine=sirius ---
+[07:38:08.878]   SET gpu_execution = true (GPU/sirius)
+[07:38:08.878]   Executing q15 on GPU/sirius…
+[07:38:09.538]   q15 fetched 1 rows in 0.6595s
+[07:38:09.538] [sirius] q15 iter2: 0.6595s
+[07:38:09.554]   Unpinning tables for q15
+[07:38:09.555]   Pinning tables for q16
+[07:38:09.849] --- q16 iter0 engine=sirius ---
+[07:38:09.849]   SET gpu_execution = true (GPU/sirius)
+[07:38:09.849]   Executing q16 on GPU/sirius…
+[07:38:10.474]   q16 fetched 27840 rows in 0.6246s
+[07:38:10.474] [sirius] q16 iter0: 0.6246s
+[07:38:10.485] --- q16 iter1 engine=sirius ---
+[07:38:10.485]   SET gpu_execution = true (GPU/sirius)
+[07:38:10.486]   Executing q16 on GPU/sirius…
+[07:38:11.037]   q16 fetched 27840 rows in 0.5511s
+[07:38:11.037] [sirius] q16 iter1: 0.5511s
+[07:38:11.073] --- q16 iter2 engine=sirius ---
+[07:38:11.073]   SET gpu_execution = true (GPU/sirius)
+[07:38:11.073]   Executing q16 on GPU/sirius…
+[07:38:11.620]   q16 fetched 27840 rows in 0.5470s
+[07:38:11.620] [sirius] q16 iter2: 0.5470s
+[07:38:11.656]   Unpinning tables for q16
+[07:38:11.658]   Pinning tables for q17
+[07:38:14.969] --- q17 iter0 engine=sirius ---
+[07:38:14.970]   SET gpu_execution = true (GPU/sirius)
+[07:38:14.970]   Executing q17 on GPU/sirius…
+[07:38:16.319]   q17 fetched 1 rows in 1.3490s
+[07:38:16.319] [sirius] q17 iter0: 1.3490s
+[07:38:16.319] --- q17 iter1 engine=sirius ---
+[07:38:16.319]   SET gpu_execution = true (GPU/sirius)
+[07:38:16.320]   Executing q17 on GPU/sirius…
+[07:38:17.647]   q17 fetched 1 rows in 1.3270s
+[07:38:17.647] [sirius] q17 iter1: 1.3270s
+[07:38:17.661] --- q17 iter2 engine=sirius ---
+[07:38:17.661]   SET gpu_execution = true (GPU/sirius)
+[07:38:17.661]   Executing q17 on GPU/sirius…
+[07:38:18.985]   q17 fetched 1 rows in 1.3236s
+[07:38:18.985] [sirius] q17 iter2: 1.3236s
+[07:38:18.988]   Unpinning tables for q17
+[07:38:18.989]   Pinning tables for q18
+[07:38:21.066] --- q18 iter0 engine=sirius ---
+[07:38:21.066]   SET gpu_execution = true (GPU/sirius)
+[07:38:21.067]   Executing q18 on GPU/sirius…
+[07:38:22.526]   q18 fetched 100 rows in 1.4597s
+[07:38:22.527] [sirius] q18 iter0: 1.4597s
+[07:38:22.527] --- q18 iter1 engine=sirius ---
+[07:38:22.527]   SET gpu_execution = true (GPU/sirius)
+[07:38:22.527]   Executing q18 on GPU/sirius…
+[07:38:23.975]   q18 fetched 100 rows in 1.4478s
+[07:38:23.975] [sirius] q18 iter1: 1.4478s
+[07:38:23.992] --- q18 iter2 engine=sirius ---
+[07:38:23.992]   SET gpu_execution = true (GPU/sirius)
+[07:38:23.992]   Executing q18 on GPU/sirius…
+[07:38:25.455]   q18 fetched 100 rows in 1.4625s
+[07:38:25.455] [sirius] q18 iter2: 1.4625s
+[07:38:25.471]   Unpinning tables for q18
+[07:38:25.473]   Pinning tables for q19
+[07:38:30.795] --- q19 iter0 engine=sirius ---
+[07:38:30.795]   SET gpu_execution = true (GPU/sirius)
+[07:38:30.795]   Executing q19 on GPU/sirius…
+[07:38:32.063]   q19 fetched 1 rows in 1.2679s
+[07:38:32.063] [sirius] q19 iter0: 1.2679s
+[07:38:32.064] --- q19 iter1 engine=sirius ---
+[07:38:32.064]   SET gpu_execution = true (GPU/sirius)
+[07:38:32.064]   Executing q19 on GPU/sirius…
+[07:38:33.280]   q19 fetched 1 rows in 1.2162s
+[07:38:33.280] [sirius] q19 iter1: 1.2162s
+[07:38:33.286] --- q19 iter2 engine=sirius ---
+[07:38:33.286]   SET gpu_execution = true (GPU/sirius)
+[07:38:33.287]   Executing q19 on GPU/sirius…
+[07:38:34.387]   q19 fetched 1 rows in 1.1002s
+[07:38:34.387] [sirius] q19 iter2: 1.1002s
+[07:38:34.401]   Unpinning tables for q19
+[07:38:34.402]   Pinning tables for q20
+[07:38:38.611] --- q20 iter0 engine=sirius ---
+[07:38:38.611]   SET gpu_execution = true (GPU/sirius)
+[07:38:38.611]   Executing q20 on GPU/sirius…
+[07:38:39.121]   q20 fetched 111384 rows in 0.5098s
+[07:38:39.121] [sirius] q20 iter0: 0.5098s
+[07:38:39.162] --- q20 iter1 engine=sirius ---
+[07:38:39.162]   SET gpu_execution = true (GPU/sirius)
+[07:38:39.162]   Executing q20 on GPU/sirius…
+[07:38:39.664]   q20 fetched 111384 rows in 0.5017s
+[07:38:39.664] [sirius] q20 iter1: 0.5017s
+[07:38:39.721] --- q20 iter2 engine=sirius ---
+[07:38:39.721]   SET gpu_execution = true (GPU/sirius)
+[07:38:39.721]   Executing q20 on GPU/sirius…
+[07:38:40.228]   q20 fetched 111384 rows in 0.5067s
+[07:38:40.228] [sirius] q20 iter2: 0.5067s
+[07:38:40.293]   Unpinning tables for q20
+[07:38:40.295]   Pinning tables for q21
+[07:38:43.623] --- q21 iter0 engine=sirius ---
+[07:38:43.624]   SET gpu_execution = true (GPU/sirius)
+[07:38:43.624]   Executing q21 on GPU/sirius…
+[07:38:46.342]   q21 fetched 100 rows in 2.7178s
+[07:38:46.342] [sirius] q21 iter0: 2.7178s
+[07:38:46.342] --- q21 iter1 engine=sirius ---
+[07:38:46.342]   SET gpu_execution = true (GPU/sirius)
+[07:38:46.343]   Executing q21 on GPU/sirius…
+[07:38:49.017]   q21 fetched 100 rows in 2.6747s
+[07:38:49.017] [sirius] q21 iter1: 2.6747s
+[07:38:49.034] --- q21 iter2 engine=sirius ---
+[07:38:49.034]   SET gpu_execution = true (GPU/sirius)
+[07:38:49.034]   Executing q21 on GPU/sirius…
+[07:38:51.764]   q21 fetched 100 rows in 2.7294s
+[07:38:51.764] [sirius] q21 iter2: 2.7294s
+[07:38:51.778]   Unpinning tables for q21
+[07:38:51.780]   Pinning tables for q22
+[07:38:52.315] --- q22 iter0 engine=sirius ---
+[07:38:52.315]   SET gpu_execution = true (GPU/sirius)
+[07:38:52.316]   Executing q22 on GPU/sirius…
+[07:38:52.688]   q22 fetched 7 rows in 0.3725s
+[07:38:52.688] [sirius] q22 iter0: 0.3725s
+[07:38:52.689] --- q22 iter1 engine=sirius ---
+[07:38:52.689]   SET gpu_execution = true (GPU/sirius)
+[07:38:52.689]   Executing q22 on GPU/sirius…
+[07:38:53.050]   q22 fetched 7 rows in 0.3614s
+[07:38:53.051] [sirius] q22 iter1: 0.3614s
+[07:38:53.068] --- q22 iter2 engine=sirius ---
+[07:38:53.068]   SET gpu_execution = true (GPU/sirius)
+[07:38:53.069]   Executing q22 on GPU/sirius…
+[07:38:53.433]   q22 fetched 7 rows in 0.3639s
+[07:38:53.433] [sirius] q22 iter2: 0.3639s
+[07:38:53.438]   Unpinning tables for q22
+[07:38:53.439] Closing connection
+[07:38:55.030] Benchmark run complete
+[07:38:55.030] Splitting bench_out/compression_arms/tpch_20260731_073620_grouped_gpu_iter3_armC_mixed_tier/log_dir/sirius_2026-07-31.log per query
+[07:38:55.039] Per-query Sirius logs written under bench_out/compression_arms/tpch_20260731_073620_grouped_gpu_iter3_armC_mixed_tier/sirius/
+=== 07:38:55 ALL ARMS COMPLETE ===

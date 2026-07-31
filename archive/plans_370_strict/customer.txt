@@ -1,0 +1,48 @@
+# Pareto-picked plans: max ratio with decompress >= 250 GB/s per column.
+# column: c_custkey  dtype: i32  ratio: 193.768x  depth: 8
+# comp: 210.13 GB/s  decomp: 457.05 GB/s
+input -> delta -> differences
+delta.differences -> rle -> runs, values
+delta.differences.runs -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+delta.differences.values -> deflate
+delta.differences.runs.packed -> lz4
+delta.differences.runs.chunk_count -> rle -> runs, values
+delta.differences.runs.chunk_min -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+delta.differences.runs.chunk_bits -> rle -> runs, values
+
+---
+# column: c_name  dtype: str  identity (decomp below 370 GB/s bar)
+input -> identity
+
+---
+# column: c_address  dtype: str  ratio: 1.441x  depth: 4
+# comp: 276.27 GB/s  decomp: 675.83 GB/s
+input -> str_split -> offsets, chars
+str_split.chars -> ans
+str_split.offsets -> delta -> differences
+str_split.offsets.differences -> ans
+
+---
+# column: c_nationkey  dtype: i32  ratio: 6.311x  depth: 1
+# comp: 783.47 GB/s  decomp: 1772.21 GB/s
+input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+
+---
+# column: c_phone  dtype: str  ratio: 2.315x  depth: 3
+# comp: 389.14 GB/s  decomp: 739.57 GB/s
+input -> str_split -> offsets, chars
+str_split.chars -> ans
+str_split.offsets -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+
+---
+# column: c_acctbal  dtype: t26  ratio: 1.979x  depth: 1
+# comp: 370.85 GB/s  decomp: 565.41 GB/s
+input -> ans
+
+---
+# column: c_mktsegment  dtype: str  identity (decomp below 370 GB/s bar)
+input -> identity
+
+---
+# column: c_comment  dtype: str  identity (decomp below 370 GB/s bar)
+input -> identity

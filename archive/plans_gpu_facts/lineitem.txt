@@ -1,0 +1,88 @@
+# Pareto-picked plans: max ratio with decompress >= 250 GB/s per column.
+# column: l_orderkey  dtype: i64  ratio: 20.711x  depth: 2
+# comp: 531.34 GB/s  decomp: 626.76 GB/s
+input -> delta -> differences
+delta.differences -> ans
+
+---
+# column: l_partkey  dtype: i32  ratio: 1.140x  depth: 1
+# comp: 681.79 GB/s  decomp: 1496.30 GB/s
+input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+
+---
+# column: l_suppkey  dtype: i32  ratio: 1.329x  depth: 1
+# comp: 665.35 GB/s  decomp: 1499.53 GB/s
+input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+
+---
+# column: l_linenumber  dtype: i32  ratio: 10.422x  depth: 1
+# comp: 726.41 GB/s  decomp: 2122.72 GB/s
+input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+
+---
+# column: l_quantity  dtype: t26  ratio: 4.885x  (hand: bitpack, GB300)
+# comp: 836.89 GB/s  decomp: 1692.77 GB/s
+input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+
+---
+# column: l_extendedprice  dtype: t26  ratio: 1.984x  depth: 1
+# comp: 361.34 GB/s  decomp: 581.72 GB/s
+input -> ans
+
+---
+# column: l_discount  dtype: t26  ratio: 8.250x  depth: 1
+# comp: 594.35 GB/s  decomp: 685.57 GB/s
+input -> ans
+
+---
+# column: l_tax  dtype: t26  ratio: 8.817x  depth: 1
+# comp: 598.08 GB/s  decomp: 691.28 GB/s
+input -> ans
+
+---
+# column: l_returnflag  dtype: str  ratio: 19.321x  depth: 2
+# comp: 97.85 GB/s  decomp: 846.70 GB/s
+input -> dictionary -> keys_offsets, keys_chars, indices
+dictionary.indices -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+
+---
+# column: l_linestatus  dtype: str  ratio: 37.372x  depth: 2
+# comp: 90.41 GB/s  decomp: 876.63 GB/s
+input -> dictionary -> keys_offsets, keys_chars, indices
+dictionary.indices -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+
+---
+# column: l_shipdate  dtype: t12  ratio: 2.651x  depth: 1
+# comp: 762.53 GB/s  decomp: 1686.72 GB/s
+input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+
+---
+# column: l_commitdate  dtype: t12  ratio: 2.651x  depth: 1
+# comp: 757.54 GB/s  decomp: 1668.48 GB/s
+input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+
+---
+# column: l_receiptdate  dtype: t12  ratio: 2.651x  depth: 1
+# comp: 750.44 GB/s  decomp: 1680.60 GB/s
+input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+
+---
+# column: l_shipinstruct  dtype: str  ratio: 61.823x  depth: 3
+# comp: 218.92 GB/s  decomp: 286.94 GB/s
+input -> dictionary -> keys_offsets, keys_chars, indices
+dictionary.keys_offsets -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+dictionary.indices -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+
+---
+# column: l_shipmode  dtype: str  ratio: 1.700x  depth: 2
+# comp: 330.83 GB/s  decomp: 822.91 GB/s
+input -> str_split -> offsets, chars
+str_split.offsets -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+
+---
+# column: l_comment  dtype: str  ratio: 2.510x  depth: 4
+# comp: 22.28 GB/s  decomp: 264.33 GB/s
+input -> str_split -> offsets, chars
+str_split.offsets -> delta -> differences
+str_split.chars -> snappy
+str_split.offsets.differences -> ans
