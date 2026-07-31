@@ -429,6 +429,30 @@ class multi_index_priority_queue {
     std::lock_guard<std::mutex> lock(_mutex);
     return _levels.empty();
   }
+
+  /// Visits every queued task in dispatch order (lowest priority level first,
+  /// FIFO within a level; reversed when @p front_to_back is false) without
+  /// removing anything. The visitor returns false to stop the walk early. Runs
+  /// under the queue mutex: the visitor must be lightweight and must not touch
+  /// the queue. Used by the downgraded-task prefetcher to snapshot the inputs
+  /// of soon-to-run tasks.
+  void for_each_mutable(const std::function<bool(Task&)>& visitor, bool front_to_back)
+  {
+    std::lock_guard<std::mutex> lock(_mutex);
+    if (front_to_back) {
+      for (auto& [prio, lvl] : _levels) {
+        for (auto& n : lvl.tasks) {
+          if (!visitor(*n.task)) { return; }
+        }
+      }
+    } else {
+      for (auto it = _levels.rbegin(); it != _levels.rend(); ++it) {
+        for (auto n = it->second.tasks.rbegin(); n != it->second.tasks.rend(); ++n) {
+          if (!visitor(*n->task)) { return; }
+        }
+      }
+    }
+  }
   [[nodiscard]] std::size_t size() const
   {
     std::lock_guard<std::mutex> lock(_mutex);

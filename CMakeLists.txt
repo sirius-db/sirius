@@ -333,6 +333,7 @@ set(EXTENSION_SOURCES
     src/op/sirius_physical_top_n.cpp
     src/op/sirius_physical_ungrouped_aggregate.cpp
     src/parallel/task_executor.cpp
+    src/pipeline/downgraded_task_prefetcher.cpp
     src/pipeline/gpu_pipeline_executor.cpp
     src/pipeline/gpu_pipeline_task.cpp
     src/pipeline/sirius_pipeline_itask.cpp
@@ -370,6 +371,7 @@ set(EXTENSION_SOURCES
     src/scan_manager/mvcc_mask_job.cpp
     src/scan_manager/pinned_chunk_stats.cpp
     src/scan_manager/round_robin_strategy.cpp
+    src/scan_manager/memory_prefetcher.cpp
     src/scan_manager/sirius_scan_manager.cpp
     src/scan_manager/split_connector.cpp
     src/scan_manager/split_provider.cpp
@@ -709,6 +711,7 @@ set(TEST_SOURCES
     test/cpp/planner/test_query_id.cpp
     test/cpp/planner/test_query_index.cpp
     test/cpp/pipeline/test_batch_lock_utils.cpp
+    test/cpp/pipeline/test_downgraded_task_prefetcher.cpp
     test/cpp/pipeline/test_gpu_pipeline_executor.cpp
     test/cpp/pipeline/test_oom_reschedule.cpp
     test/cpp/pipeline/test_pipeline_memory_history.cpp

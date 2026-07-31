@@ -22,6 +22,7 @@
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "parallel/task.hpp"
 #include "pipeline/completion_handler.hpp"
+#include "pipeline/downgraded_task_prefetcher.hpp"
 #include "pipeline/gpu_pipeline_executor.hpp"
 #include "pipeline/task_request.hpp"
 #include "planner/query.hpp"
@@ -215,6 +216,11 @@ class task_scheduler {
  private:
   void management_eventloop();
 
+  /// Build and start the HOST/DISK->GPU input prefetcher for queued tasks when
+  /// enabled via SIRIUS_TASK_PREFETCH=1 (see downgraded_task_prefetcher.hpp).
+  /// No-op otherwise.
+  void maybe_start_downgraded_task_prefetcher();
+
   std::mutex _query_mutex;
   duckdb::shared_ptr<planner::query> _query;
 
@@ -242,6 +248,13 @@ class task_scheduler {
   /// arises from which executor sends a device_ready signal first, not from a
   /// counter. Field retained for source compat with set_no_pref_rr_counter_for_testing.
   std::atomic<size_t> _no_pref_rr_counter{0};
+
+  /// For resolving the GPU memory space and reservations of the downgraded-task
+  /// prefetcher (started in start() when SIRIUS_TASK_PREFETCH=1).
+  sirius::memory::sirius_memory_reservation_manager& _mem_mgr;
+  /// Background HOST/DISK->GPU upgrader for queued tasks' downgraded inputs;
+  /// stopped first in stop() so no conversion is in flight during teardown.
+  std::unique_ptr<downgraded_task_prefetcher> _task_prefetcher;
 
   sirius::creator::task_creator* _task_creator{nullptr};
   std::unique_ptr<completion_handler> _completion_handler;

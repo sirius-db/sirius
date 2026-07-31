@@ -35,10 +35,12 @@
 #include <cucascade/memory/memory_space.hpp>
 
 #include <algorithm>
+#include <cstdlib>
 #include <limits>
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -78,6 +80,7 @@ task_scheduler::task_scheduler(
                               0,
                               exec::no_preferred_device};
     }),
+    _mem_mgr(mem_mgr),
     _telemetry_context(std::move(telemetry_context))
 {
   _task_queue_telemetry = std::make_unique<telemetry::TaskQueueHandleWrapper>(
@@ -150,12 +153,55 @@ void task_scheduler::start()
     gpu_exec->start();
   }
   _management_thread = std::thread(&task_scheduler::management_eventloop, this);
+  maybe_start_downgraded_task_prefetcher();
+}
+
+void task_scheduler::maybe_start_downgraded_task_prefetcher()
+{
+  const char* enabled = std::getenv("SIRIUS_TASK_PREFETCH");
+  if (enabled == nullptr || std::string_view{enabled} != "1") { return; }
+
+  // Prototype scope: a single GPU space, mirroring the scan prefetcher.
+  // Multi-GPU needs per-task preferred-device routing to pick the target
+  // space; converting to the wrong space would strand data cross-device.
+  auto gpu_spaces = _mem_mgr.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
+  if (gpu_spaces.size() != 1) {
+    SIRIUS_LOG_WARN("[task_prefetch] disabled: prototype supports exactly 1 GPU space (found {})",
+                    gpu_spaces.size());
+    return;
+  }
+  auto* gpu_space =
+    _mem_mgr.get_memory_space(cucascade::memory::Tier::GPU, gpu_spaces.front()->get_device_id());
+  if (gpu_space == nullptr) { return; }
+
+  downgraded_task_prefetcher::config cfg{};
+  if (const char* threads = std::getenv("SIRIUS_TASK_PREFETCH_THREADS")) {
+    cfg.num_threads = std::max(1UL, std::strtoul(threads, nullptr, 10));
+  }
+  if (const char* frac = std::getenv("SIRIUS_TASK_PREFETCH_MIN_FREE_FRACTION")) {
+    cfg.min_free_fraction = std::clamp(std::strtod(frac, nullptr), 0.05, 0.95);
+  }
+  if (const char* lookahead = std::getenv("SIRIUS_TASK_PREFETCH_LOOKAHEAD")) {
+    cfg.max_lookahead_tasks = std::max(1UL, std::strtoul(lookahead, nullptr, 10));
+  }
+  if (const char* during = std::getenv("SIRIUS_TASK_PREFETCH_DURING_PRESSURE")) {
+    cfg.prefetch_during_pressure = std::string_view{during} == "1";
+  }
+  if (const char* quiet = std::getenv("SIRIUS_TASK_PREFETCH_QUIET_MS")) {
+    cfg.pressure_quiet_ms = std::strtoul(quiet, nullptr, 10);
+  }
+
+  _task_prefetcher =
+    std::make_unique<downgraded_task_prefetcher>(cfg, _task_queue, _mem_mgr, gpu_space);
 }
 
 void task_scheduler::stop()
 {
   bool expected = true;
   if (!_running.compare_exchange_strong(expected, false)) { return; }
+  // Stop the prefetcher first: its workers hold references to queued tasks'
+  // batches and must not start conversions while teardown drains the queue.
+  _task_prefetcher.reset();
   // Pull-signal model: the management event loop blocks on
   // _task_request_channel.get(), so closing the channel is what wakes it.
   // _task_queue.interrupt() is still useful to reject any concurrent
