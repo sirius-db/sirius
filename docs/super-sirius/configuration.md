@@ -604,3 +604,39 @@ These are compile-time defaults. Runtime configuration via `sirius_config` and D
 | `src/sirius_extension.cpp` | SET variable registration |
 | `src/include/scan_manager/config.hpp` | Scan manager config (thread pool, IO reactors, prefetch cache, object store) |
 | `src/include/io/uring/config.hpp`, `io/rest/config.hpp`, `io/cache/config.hpp`, `io/object_store_config.hpp` | Per-backend IO / cache / object-store sub-configs |
+
+## Tuned profile: GB300, TPC-H SF1000 host-pinned
+
+Measured 2026-07-31 (72-core GB300, 256 GB HBM, 3 hot iterations, results
+byte-identical to defaults). Relative to the stock config the following
+deltas are worth **-13% suite hot time** (20.8 s → 18.1 s; q9 -19%):
+
+```yaml
+sirius:
+  memory:
+    host:
+      block_size: 64Mi       # default 1Mi: ~5000 copy segments per 5 GB batch
+      pool_size: 8           # keep block_size x pool_size at 512Mi per pool
+  executor:
+    scan_manager:
+      memory_prefetcher:     # requires the memory prefetcher (PR #1181)
+        enable: true
+        num_threads: 3       # 2 is the swept default; 3 buys q21 ~3% under 8 pipeline threads
+    pipeline:
+      num_threads: 8         # default 4; cliff at 12 (q1/q6 regress)
+```
+
+Attribution: host `block_size` 1 Mi → 64 Mi removes per-segment submission
+overhead in batched host→GPU copies (~11 ms of every 39 ms five-GB
+conversion); sweep 16-64 Mi if small-host-allocation fragmentation is a
+concern. `pipeline.num_threads` 4 → 8 helps task-parallel aggregation
+queries (q1 -16%, q12 -14%). The prefetcher block overlaps pinned-cache
+uploads with compute (see `scan_manager.memory_prefetcher` above). Numbers
+include the cuCascade all-valid null-mask conversion fix; without it,
+expect roughly half the converter-side gain.
+
+The knobs that did NOT help on this hardware, all measured full-suite:
+prefetcher `min_free_fraction` below 0.4, prefetcher threads above 3,
+pipeline threads above 8. The H2D interconnect sustains ~350-380 GB/s
+regardless of stream count; past these settings the link, not scheduling,
+is the bound.
