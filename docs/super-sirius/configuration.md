@@ -371,8 +371,9 @@ sirius:
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `enable_quent` | bool | true | Emit Quent telemetry using the ndjson exporter. When false, telemetry uses the noop exporter. |
-| `output_directory` | string | `telemetry_data` | Directory for Quent ndjson files. |
+| `enable_quent` | bool | true | Emit Quent telemetry using the configured exporter. When false, telemetry uses the noop exporter. |
+| `exporter` | string | `ndjson` | Quent filesystem exporter: `ndjson`, `msgpack`, or `postcard`. |
+| `output_directory` | string | `telemetry_data` | Directory for Quent telemetry files. |
 | `engine_name` | string | `siriusDB` | Engine name reported in engine-level telemetry. |
 
 Per-query labels are configured separately from YAML. They can be set with the
@@ -412,7 +413,8 @@ sirius:
 
 Load that config through the normal config resolution path, usually by setting
 `SIRIUS_CONFIG_FILE=/path/to/sirius.yaml`. Any Sirius query run with
-`enable_quent: true` writes Quent ndjson files into `output_directory`.
+`enable_quent: true` writes Quent ndjson files into `output_directory` by default. Set
+`exporter: postcard` for compact benchmark or CI telemetry.
 
 For TPC-H Parquet runs, the helper script runs queries and labels each
 `(query, iteration)` pair before executing it:

@@ -19,15 +19,12 @@ use quent_analyzer::{
 };
 use quent_events::Event;
 use quent_query_engine_analyzer::{
-    QueryEngineModel,
-    engine::Engine,
-    model::{InMemoryQueryEngineModel, InMemoryQueryEngineModelBuilder, QueryEngineEntityId},
-    operator::Operator,
-    plan::{Plan, tree::PlanTree},
-    port::Port,
-    query::Query,
-    query_group::QueryGroup,
-    worker::Worker,
+    OperatorEntityMut, QueryEngineModel,
+    plain::legacy::{
+        Engine, InMemoryQueryEngineModel, InMemoryQueryEngineModelBuilder, Operator, Plan, Port,
+        Query, QueryEngineEntityId, QueryGroup, Worker,
+    },
+    plan_tree::PlanTree,
 };
 use quent_query_engine_model::QueryEngineEvent;
 use quent_simulator_ui::EntityRef;
@@ -151,6 +148,14 @@ impl Model for SiriusModel {
 }
 
 impl QueryEngineModel for SiriusModel {
+    type Engine = Engine;
+    type Query = Query;
+    type QueryGroup = QueryGroup;
+    type Worker = Worker;
+    type Plan = Plan;
+    type Operator = Operator;
+    type Port = Port;
+
     fn engine(&self) -> AnalyzerResult<&Engine> {
         self.query_engine.engine()
     }
@@ -642,10 +647,7 @@ impl SiriusModelBuilder {
                 && let Some(task_span) = task.active_span()
                 && let Some(operator) = query_engine.operators.get_mut(&operator_id)
             {
-                operator.active_span = Some(match operator.active_span() {
-                    None => task_span,
-                    Some(existing) => existing.extend(&task_span),
-                });
+                operator.extend_active_span(task_span);
             }
 
             tasks.insert(task_id, task);
@@ -673,10 +675,7 @@ impl SiriusModelBuilder {
                         && let Some(data_batch_span) = data_batch.active_span()
                         && let Some(operator) = query_engine.operators.get_mut(&operator_id)
                     {
-                        operator.active_span = Some(match operator.active_span() {
-                            None => data_batch_span,
-                            Some(existing) => existing.extend(&data_batch_span),
-                        });
+                        operator.extend_active_span(data_batch_span);
                     }
 
                     data_batches.insert(data_batch_id, data_batch);
