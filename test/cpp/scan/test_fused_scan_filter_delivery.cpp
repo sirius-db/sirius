@@ -86,14 +86,13 @@ constexpr char const* kStringSourcePlans =
   "---\n"
   "input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n";
 
-/// The null_mask channel that carries the validity of "n" takes its dictionary off the compacted
-/// route, so "n" decodes full width and is then gathered to the survivors.
+/// The validity of "n" travels beside its encoded column (plan/validity.cpp), so the plan names no
+/// null_mask channel; "n" decodes full width and is then gathered to the survivors.
 constexpr char const* kNullableStringSourcePlans =
   "input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n"
   "---\n"
-  "input -> dictionary -> keys_offsets, keys_chars, indices, null_mask\n"
+  "input -> dictionary -> keys_offsets, keys_chars, indices\n"
   "dictionary.indices -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n"
-  "dictionary.null_mask -> identity\n"
   "---\n"
   "input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n";
 
