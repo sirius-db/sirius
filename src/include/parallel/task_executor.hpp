@@ -136,19 +136,50 @@ class itask_executor {
   void drain_and_wait();
 
   /**
-   * @brief Like drain_and_wait(), but VALIDATES the queue is empty instead of
-   * draining it.
+   * @brief Wait for in-flight work, then assert @p query_id has nothing queued here.
    *
-   * Stops the kiosk and interrupts the queue so the manager exits, waits for all
-   * in-flight thread-pool tasks, then — instead of draining — checks that the
-   * task queue is empty. If it is not, logs an error and throws: a non-empty queue
-   * at query completion means tasks were still scheduled when we declared the query
-   * done. Re-enables the queue/pool and restarts the manager thread either way
-   * (the throw happens after the executor is left in a restartable state).
+   * The success-path counterpart of wait_and_drain_query(). A non-empty queue for @p query_id at
+   * completion means tasks were still being scheduled when the query was declared done, so this
+   * throws rather than draining, which would hide the bug.
+   *
+   * Unlike the whole-executor version it replaced, this neither interrupts the shared queue nor
+   * stops and restarts the manager thread — both of which dropped co-tenant queries' queued work
+   * and stalled their producers on every completion. It also no longer validates the *whole*
+   * queue, which made one query fail because another had work legitimately queued.
+   *
+   * The in-flight wait is still whole-pool; per-query in-flight accounting arrives with the
+   * query-aware bounded_thread_pool. Waiting on a co-tenant's task is a stall, not a correctness
+   * problem.
    */
-  void wait_and_validate_empty();
+  void wait_and_validate_empty(sirius::query_id_t query_id);
+
+  /**
+   * @brief Wait for in-flight work, then drop @p query_id's queued tasks.
+   *
+   * The error-path counterpart of wait_and_validate_empty(). Waiting first guarantees no thread is
+   * still executing a task that references the failing query's plan before the caller lets that
+   * plan be destroyed.
+   */
+  void wait_and_drain_query(sirius::query_id_t query_id);
 
  protected:
+  /**
+   * @brief Stop the manager thread and wait for all in-flight pool work.
+   *
+   * Releasing the manager's pool slot is a PRECONDITION for wait_all(), not an optimization:
+   * manager_loop() reserves a slot and then blocks in pop(), so an idle manager holds an active
+   * slot forever and wait_all() (which waits for active_ == 0) would never return.
+   *
+   * Cost, and why it is temporary: interrupting the queue makes push() return false for the
+   * duration, so a co-tenant query's task in transit from the scheduler can be dropped here. The
+   * query-aware bounded_thread_pool removes the need for this bracket by making the in-flight
+   * wait per-query.
+   */
+  void quiesce_manager();
+
+  /// \brief Re-arm the pool and queue and restart the manager thread after quiesce_manager().
+  void resume_manager();
+
   /**
    * @brief Main dispatch loop — must be implemented by each subclass.
    *

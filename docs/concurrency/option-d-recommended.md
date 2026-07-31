@@ -180,6 +180,17 @@ stop/start hammer test.
 Only safe now: step 3 removed the stop/start-per-query cycle that would otherwise destroy and
 recreate the pool — and any per-query state in it — on every completion.
 
+> **Carried over from step 3 — A6 is only partly closed.** `wait_and_validate_empty(query_id)` and
+> `wait_and_drain_query(query_id)` still bracket their work in `quiesce_manager()` /
+> `resume_manager()`, because `manager_loop()` reserves a pool slot and then blocks in `pop()`: an
+> idle manager holds an active slot forever, so `wait_all()` cannot return until the manager is
+> interrupted and joined. That interrupt makes `push()` return false for the duration, so a
+> co-tenant task **in transit** from the scheduler to a device queue can still be dropped. Step 3
+> removed the whole-queue drain that destroyed co-tenants' *queued* work; this step must remove the
+> in-transit drop by making the in-flight wait per-query, after which
+> `test_task_scheduler.cpp`'s "wait_for_completion validates only its own query's queue" should
+> regain the liveness assertion currently documented-but-not-asserted there.
+
 - Tag at `reserve(query_id)`, **not** `dispatch` — that is what puts the manager thread's
   pre-dispatch dereference inside the counted region. Where the query is unknown until after
   `pop()`, use `slot::attach(query_id)`.

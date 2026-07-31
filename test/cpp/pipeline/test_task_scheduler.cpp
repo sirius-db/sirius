@@ -248,6 +248,51 @@ TEST_CASE("the lifecycle gate refuses scheduling for a quiescing query",
   executor.stop();
 }
 
+TEST_CASE("wait_for_completion validates only its own query's queue",
+          "[task_scheduler][query_lifecycle_gate][concurrency]")
+{
+  // Regression for A5: wait_for_completion used the whole-queue size(), so query A completing
+  // normally threw "pipeline task queue not empty at query completion" purely because query B had
+  // work legitimately queued. It also called _task_creator->stop_thread_pool(), tearing down the
+  // SHARED creation pool on every successful completion.
+  auto manager = initialize_memory_manager(1);
+  sirius::exec::thread_pool_config gpu_config{2};
+  sirius::exec::query_lifecycle_registry lifecycle;
+  task_scheduler executor(gpu_config, *manager, sirius::test::make_test_telemetry_context());
+  executor.set_query_lifecycle_registry(&lifecycle);
+
+  // Mock tasks carry no pipeline, so index_keys_for() reports them as query 0. Completing a
+  // DIFFERENT query id must ignore them entirely.
+  const auto other_query      = sirius::make_query_id(0);
+  const auto completing_query = sirius::make_query_id(42);
+  lifecycle.open_query(other_query);
+  lifecycle.open_query(completing_query);
+
+  auto global_state = std::make_shared<mock_gpu_pipeline_task_global_state>();
+  executor.start();
+
+  // Park work belonging to `other_query` in the scheduler queue by keeping every device busy.
+  for (int i = 0; i < 8; ++i) {
+    auto local_state = std::make_unique<mock_gpu_pipeline_task_local_state>(i, 0);
+    executor.schedule(
+      std::make_unique<mock_gpu_pipeline_task>(i, std::move(local_state), global_state));
+  }
+
+  // The assertion this test exists for: completing an unrelated query must not throw because a
+  // co-tenant has work queued. Before the per-query size() check, this threw
+  // "pipeline task queue not empty at query completion" every time.
+  REQUIRE_NOTHROW(executor.wait_for_completion(completing_query));
+
+  // NOT asserted here: that every co-tenant task still runs. wait_and_validate_empty() must
+  // release the manager thread's pool slot before wait_all() can return (see
+  // itask_executor::quiesce_manager), and that interrupt makes push() return false for the
+  // duration — so a co-tenant task in transit from the scheduler to a device queue can still be
+  // dropped. Step 3 removes the *whole-queue* drain that used to destroy co-tenants' queued work
+  // outright; eliminating the in-transit drop needs per-query in-flight accounting from the
+  // query-aware bounded_thread_pool, at which point this test should gain a liveness assertion.
+  executor.stop();
+}
+
 TEST_CASE("Task queue handles empty queue gracefully", "[pipeline_queue]")
 {
   auto manager = initialize_memory_manager(1);

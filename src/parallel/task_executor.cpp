@@ -143,35 +143,71 @@ void itask_executor::drain_and_wait()
   _manager_thread = std::thread([this] { manager_loop(); });
 }
 
-void itask_executor::wait_and_validate_empty()
+void itask_executor::quiesce_manager()
 {
-  // Same quiescing as drain_and_wait(): interrupt the pool + queue so the manager
-  // exits, join it, and wait for all in-flight thread-pool tasks to finish.
+  // Releasing the manager thread's pool slot is a PRECONDITION for wait_all(), not an
+  // optimization. manager_loop() calls reserve() and then blocks in _task_queue.pop(), so an idle
+  // manager permanently holds an active slot; wait_all() waits for active_ == 0 and would never
+  // return. interrupt() makes reserve() hand back an invalid slot and pop() return nullptr, which
+  // is what lets the loop exit and the join succeed.
   _bounded_pool->interrupt();
   _task_queue.interrupt();
   if (_manager_thread.joinable()) { _manager_thread.join(); }
   _bounded_pool->wait_all();
+}
 
-  // Instead of draining, VALIDATE the queue is empty. A non-empty queue here means
-  // tasks were still scheduled on this executor when the query was declared complete.
-  const std::size_t remaining = _task_queue.size();
-
-  // Re-enable the pool/queue and restart the manager so the executor is left in a
-  // usable state for the next query, whether or not validation passes.
+void itask_executor::resume_manager()
+{
   _bounded_pool->resume();
   _task_queue.reactivate();
   _manager_thread = std::thread([this] { manager_loop(); });
+}
+
+void itask_executor::wait_and_validate_empty(sirius::query_id_t query_id)
+{
+  // Never started (or already stopped): nothing dispatched, nothing to validate. drain_and_wait()
+  // has always had this guard; the whole-executor variant this replaced did not, and
+  // null-dereferenced when a query failed before any work reached this executor.
+  if (!_bounded_pool) { return; }
+
+  quiesce_manager();
+  // Only THIS query's tasks must be gone. The previous version validated the WHOLE queue, so a
+  // query completing normally threw because a co-tenant had work legitimately queued.
+  const std::size_t remaining =
+    _task_queue.size(exec::query_index{static_cast<exec::query_key>(sirius::value_of(query_id))});
+  resume_manager();
 
   if (remaining != 0) {
     SIRIUS_LOG_ERROR(
-      "itask_executor::wait_and_validate_empty: task queue NOT empty at query completion — "
+      "itask_executor::wait_and_validate_empty: task queue NOT empty for query {} at completion — "
       "{} task(s) still queued; tasks were still being scheduled when the query was marked "
       "complete",
+      query_id,
       remaining);
     throw std::runtime_error(
       "task_executor: task queue not empty at query completion (" + std::to_string(remaining) +
       " task(s) remaining) — premature completion while work was still scheduled");
   }
+}
+
+void itask_executor::wait_and_drain_query(sirius::query_id_t query_id)
+{
+  // Error-path counterpart of wait_and_validate_empty: let in-flight work finish so no thread is
+  // still touching the failing query's plan, then drop that query's queued tasks.
+  //
+  // The quiesce/resume bracket is still whole-executor — see quiesce_manager() for why wait_all()
+  // requires it. What changed is the drain in the middle: drain_and_wait() cleared the ENTIRE
+  // queue here, destroying every co-tenant query's queued work and leaving those queries waiting
+  // on completions that could never arrive. Now only the failing query's tasks are dropped. The
+  // remaining cost is a brief stall of co-tenants across the bracket, which the query-aware
+  // bounded_thread_pool removes by making the in-flight wait per-query.
+  if (!_bounded_pool) {
+    drain_query_tasks(query_id);
+    return;
+  }
+  quiesce_manager();
+  drain_query_tasks(query_id);
+  resume_manager();
 }
 
 }  // namespace parallel
