@@ -264,7 +264,7 @@ TEST_CASE("type match: a covering entry whose recorded types no longer match los
   auto const matching_name = GENERATE(std::string{"orders"}, std::string{"main.orders"});
   type_match_fixture fixture{matching_name};
 
-  auto const both    = request({0, 1});
+  auto const both   = request({0, 1});
   auto const chosen = fixture.manager.find_pinned_entry_for_duckdb_table(
     kCatalog, kSchema, kTable, &both, &fixture.returned_types);
   REQUIRE(type_match_fixture::types_match(chosen.get()));

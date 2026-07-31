@@ -76,10 +76,10 @@ sirius::scan_manager::scan_manager_config make_local_config()
 
 std::unique_ptr<scan::parquet_ingestible_table_info> make_table_info(std::string const& file)
 {
-  auto info = std::make_unique<scan::parquet_ingestible_table_info>();
-  info->resolved_file_paths = {(project_root() / "test/cpp/integration/data/parquet" / file)
-                                 .string()};
-  info->names               = {"c0"};
+  auto info                 = std::make_unique<scan::parquet_ingestible_table_info>();
+  info->resolved_file_paths = {
+    (project_root() / "test/cpp/integration/data/parquet" / file).string()};
+  info->names = {"c0"};
   info->returned_types.push_back(sirius::logical_type::make(sirius::type_id::INTEGER));
   info->column_ids.push_back(duckdb::ColumnIndex(0));
   info->scan_output_arity = 1;
@@ -89,17 +89,17 @@ std::unique_ptr<scan::parquet_ingestible_table_info> make_table_info(std::string
 /// One query, one pipeline, one GPU scan operator over @p file. Operator ids are assigned per
 /// query (restarting at 0), which is exactly the collision the coalescer slot map used to hit.
 struct query_context {
-  duckdb::shared_ptr<sirius::pipeline::sirius_pipeline> pipeline;
+  std::shared_ptr<sirius::pipeline::sirius_pipeline> pipeline;
   std::unique_ptr<scan::sirius_gpu_scan_operator> scan_op;
   std::shared_ptr<const sirius::telemetry::telemetry_context> tctx;
-  duckdb::shared_ptr<sirius::planner::query> query;
+  std::shared_ptr<sirius::planner::query> query;
 };
 
 query_context make_query(sirius::query_id_t query_id, std::string const& file)
 {
   query_context ctx;
   const sirius::pipeline::pipeline_build_context build_ctx{nullptr, true};
-  ctx.pipeline = duckdb::make_shared_ptr<sirius::pipeline::sirius_pipeline>(build_ctx);
+  ctx.pipeline = std::make_shared<sirius::pipeline::sirius_pipeline>(build_ctx);
   ctx.pipeline->set_pipeline_id(1);
   ctx.pipeline->set_query_id(query_id);
 
@@ -116,14 +116,14 @@ query_context make_query(sirius::query_id_t query_id, std::string const& file)
   // scan_op->get_pipeline() to read the pipeline id. assign_operator_ids walks the same list.
   build_state.add_pipeline_operator(*ctx.pipeline, *ctx.scan_op);
 
-  duckdb::vector<duckdb::shared_ptr<sirius::pipeline::sirius_pipeline>> pipelines{ctx.pipeline};
+  std::vector<std::shared_ptr<sirius::pipeline::sirius_pipeline>> pipelines{ctx.pipeline};
   sirius::pipeline::assign_operator_ids(pipelines);
 
   ctx.tctx = sirius::test::make_test_telemetry_context();
   sirius::telemetry::query_telemetry_info tinfo{
     ctx.tctx->engine_id(), ctx.tctx->worker_id(), query_id};
-  ctx.query = duckdb::make_shared_ptr<sirius::planner::query>(
-    pipelines, ctx.tctx->context(), query_id, tinfo);
+  ctx.query =
+    std::make_shared<sirius::planner::query>(pipelines, ctx.tctx->context(), query_id, tinfo);
   return ctx;
 }
 
@@ -226,8 +226,7 @@ TEST_CASE("concurrent queries do not collide on operator id", "[scan_manager][qu
   REQUIRE(manager.num_active_queries() == 0);
 }
 
-TEST_CASE("reset is a no-op for unknown and already-reset queries",
-          "[scan_manager][query_state]")
+TEST_CASE("reset is a no-op for unknown and already-reset queries", "[scan_manager][query_state]")
 {
   fixture f;
   sirius_scan_manager manager{make_local_config(), *f.memory, f.topology};
@@ -272,14 +271,13 @@ TEST_CASE("a query with no GPU scan operators registers nothing", "[scan_manager
   fixture f;
   sirius_scan_manager manager{make_local_config(), *f.memory, f.topology};
 
-  auto tctx               = sirius::test::make_test_telemetry_context();
-  auto const query_id     = sirius::make_query_id(7);
+  auto tctx           = sirius::test::make_test_telemetry_context();
+  auto const query_id = sirius::make_query_id(7);
   sirius::telemetry::query_telemetry_info tinfo{tctx->engine_id(), tctx->worker_id(), query_id};
-  sirius::planner::query empty{
-    duckdb::vector<duckdb::shared_ptr<sirius::pipeline::sirius_pipeline>>{},
-    tctx->context(),
-    query_id,
-    tinfo};
+  sirius::planner::query empty{std::vector<std::shared_ptr<sirius::pipeline::sirius_pipeline>>{},
+                               tctx->context(),
+                               query_id,
+                               tinfo};
 
   manager.prepare_for_query(empty, true, {});
   // Nothing to tear down, so nothing is registered and the matching reset is a no-op.
