@@ -34,15 +34,6 @@ body:
     validations:
       required: true
 
-  - type: textarea
-    id: error-output
-    attributes:
-      label: Error output
-      description: Paste the relevant error lines from the job log
-      render: shell
-    validations:
-      required: false
-
   - type: dropdown
     id: frequency
     attributes:
@@ -50,25 +41,7 @@ body:
       options:
         - Always (every run)
         - Intermittent (some runs pass)
-        - First occurrence
-    validations:
-      required: true
-
-  - type: dropdown
-    id: affects
-    attributes:
-      label: Bug affects
-      multiple: true
-      options:
-        - GPU runners
-        - CPU runners
-        - ARM runners
-        - sccache / build cache
-        - vcpkg cache
-        - Runner startup / scaling
-        - CI pipeline (check.yml)
-        - CI pipeline (distribution.yml)
-        - CI pipeline (test.yml)
+        - One-time (seen but resolved on retry)
     validations:
       required: true
 
@@ -76,6 +49,6 @@ body:
     id: additional
     attributes:
       label: Additional details
-      description: PR number, recent changes, workaround attempted, etc.
+      description: PR number, relevant log lines, recent changes, workaround attempted
     validations:
       required: false
