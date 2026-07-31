@@ -92,8 +92,17 @@ still running and a subsequent query completes normally.
 
 ---
 
-### Step 2 — `query_lifecycle_registry`, wired live
-**Closes:** foundation — but observable from day one
+> **Executed note (step 1 → step 2 reordering).** Step 1 deleted the `stop()` calls that used to
+> pre-stop the task_creator, which made `drain_after_error → stop_thread_pool()` race a *live*
+> manager thread and exposed the C1 deadlock — intermittently hanging the full suite in ~3 of 8
+> runs. This plan's own dependency note said *"C1 must be fixed before A5/A6 are exercised, because
+> both call `stop_thread_pool()` today"*, and scheduling C1 for step 4 violated it. **C1 and C2 were
+> therefore pulled forward into step 2 and are no longer part of step 4.** The lesson generalizes:
+> any step that stops pre-stopping a subsystem makes that subsystem's lifecycle races live in the
+> same commit.
+
+### Step 2 — `query_lifecycle_registry`, wired live (+ C1/C2 pulled forward)
+**Closes:** C1, C2 — plus the gate that steps 3 and 7 build on
 
 New `src/include/exec/query_lifecycle_registry.hpp` + `.cpp`. States `open → quiescing → closed`,
 keyed by `query_id_t`, owned by `SiriusContext`. `begin_execution_window` opens;
@@ -146,15 +155,13 @@ Same for A erroring.
 
 ---
 
-### Step 4 — Creator lock ordering, in-flight coverage, lookahead
-**Closes:** C1, C2, D1, D2, D3, self-deadlock half of A2 · **prerequisite for step 5**
+### Step 4 — In-flight coverage and lookahead
+**Closes:** D1, D2, D3, self-deadlock half of A2 · **prerequisite for step 5**
 
-- Split the lifecycle mutex from `_global_state_mutex`; never hold either across
-  `_manager_thread.join()`. Today `stop_thread_pool()` holds `_global_state_mutex` across the join
-  while the manager thread needs that same mutex — a deadlock reachable on every query completion
-  until step 3 removed the caller, and still reachable from `terminate()`.
-- Forbid `stop()` from a pool worker (assert; post a stop request). `stop()` currently bypasses
-  `_global_state_mutex` entirely while `start`/`stop_thread_pool` take it.
+> C1 and C2 (the `_global_state_mutex`-across-`join()` deadlock and the unlocked `stop()`) moved to
+> step 2 — see the note above. `_pool_lifecycle_mutex` already exists.
+
+- Forbid `stop()` from a pool worker (assert; post a stop request).
 - Move `enter_in_flight()` to immediately after the `get_query_task_global_state` lookup, so the
   manager thread's own `get_operator_for_next_task(node)` dereference is inside the counted region.
   Release on every early `continue`. Cover the key extractor's `request.node->type` dereference the
@@ -390,7 +397,7 @@ from defect to policy, verified in step 13.
 |---|---|
 | A | A1·1 A2·1,4 A3·1 A4·1 A5·3 A6·3 A7·7 A8·9 A9·11 A10·1 |
 | B | B1·7 B2·7 B3·6 B4·6 B5·8 B6·8 B7·8 B8·8 B9·6 B10·8 B11·9 |
-| C | C1·3,4 C2·4 C3·12 C4·10 |
+| C | C1·2 C2·2 C3·12 C4·10 |
 | D | D1·4 D2·4 D3·4 D4·3 D5·14 D6·7 |
 | E | E1–E7·14 |
 | F | F1·policy (verified 13) · F2·14 F3·14 F4·withdrawn F5·14 F6·14 F7·14 F8·7 F9·14 |
