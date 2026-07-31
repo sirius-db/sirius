@@ -38,15 +38,15 @@ src/**/downgrade/                   @sirius-db/sirius-memory-compression-codeown
 # ── Integrations ──────────────────────────────────────────────────────────────
 src/include/sirius/                 @sirius-db/sirius-integrations-codeowners
 src/**/transparent/                 @sirius-db/sirius-integrations-codeowners
-cucascade/                          @sirius-db/sirius-integrations-codeowners
-duckdb/                             @sirius-db/sirius-integrations-codeowners
-experimental/starrocks/             @sirius-db/sirius-integrations-codeowners
-rust/crates/sirius*/                @sirius-db/sirius-integrations-codeowners
-substrait/                          @sirius-db/sirius-integrations-codeowners
+/cucascade/                         @sirius-db/sirius-integrations-codeowners
+/duckdb/                            @sirius-db/sirius-integrations-codeowners
+/experimental/                      @sirius-db/sirius-integrations-codeowners
+/rust/crates/sirius*/               @sirius-db/sirius-integrations-codeowners
+/substrait/                         @sirius-db/sirius-integrations-codeowners
 
 # ── Telemetry & Observability ─────────────────────────────────────────────────
-rust/crates/telemetry/              @sirius-db/sirius-telemetry-codeowners
-tools/                              @sirius-db/sirius-telemetry-codeowners
+/rust/crates/telemetry/             @sirius-db/sirius-telemetry-codeowners
+/tools/                             @sirius-db/sirius-telemetry-codeowners
 src/**/telemetry/                   @sirius-db/sirius-telemetry-codeowners
 src/**/log/                         @sirius-db/sirius-telemetry-codeowners
 
@@ -71,11 +71,11 @@ src/**/log/                         @sirius-db/sirius-telemetry-codeowners
 
 # ── Testing & Benchmarks & Skills ─────────────────────────────────────────────
 **/CLAUDE.md                        @sirius-db/sirius-testing-codeowners
-setup_test_datasets.sh              @sirius-db/sirius-testing-codeowners
-.claude/                            @sirius-db/sirius-testing-codeowners
-test/                               @sirius-db/sirius-testing-codeowners
-test_datasets/                      @sirius-db/sirius-testing-codeowners
-utils/                              @sirius-db/sirius-testing-codeowners
+/setup_test_datasets.sh             @sirius-db/sirius-testing-codeowners
+/.claude/                           @sirius-db/sirius-testing-codeowners
+/test/                              @sirius-db/sirius-testing-codeowners
+/test_datasets/                     @sirius-db/sirius-testing-codeowners
+/utils/                             @sirius-db/sirius-testing-codeowners
 
 # ── Language overlays (last-match-wins — these take precedence) ───────────────
 **/*.cu                             @sirius-db/sirius-cuda-codeowners
