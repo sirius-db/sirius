@@ -121,7 +121,11 @@ static void from_yaml(const YAML::Node& node, cucascade::io::rest::config& opt)
   r.optional("chunk_size", yaml::bytes(opt.chunk_size));
   r.optional("max_n_chunks", opt.max_n_chunks);
   r.optional("max_read_split", opt.max_read_split);
-  r.optional("bounce_block_size", yaml::bytes(opt.bounce_block_size));
+  // No bounce_block_size key: it is not a user knob. The field exists so the
+  // static prep_device_rx_request can size its bounce windows without reaching
+  // the live memory resource, and make_rest_ioctx_factory always overwrites it
+  // with the HOST staging resource's block size. Parsing it here only created a
+  // key that looked settable and was silently discarded.
   r.optional("upkeep_interval_ms", opt.upkeep_interval);
   r.optional("conn_max_age_s", opt.conn_max_age);
   r.optional("retry_backoff_base_ms", opt.retry_backoff_base);

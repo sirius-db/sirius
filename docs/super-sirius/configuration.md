@@ -292,6 +292,13 @@ Five optional nested sub-configs tune the individual backends and caches:
 
 ### `scan_manager.rest` — REST / S3 backend (`io/rest/config.hpp`)
 
+> The reactor's bounce-slot size is **not** configurable here. `config::bounce_block_size`
+> exists only so the static `prep_device_rx_request` can size its staging windows without
+> reaching the live memory resource; `make_rest_ioctx_factory` always sets it from the
+> HOST-tier staging resource's block size. Tune it via
+> `memory.host_memory_space.block_size` instead — which also sets the io_uring reactor's
+> `bounce_size` and the prefetching cache's chunk size.
+
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `request_timeout_s` | int (seconds) | 30 | Whole-request timeout and presigned-URL TTL (0 = no limit). |
@@ -301,7 +308,6 @@ Five optional nested sub-configs tune the individual backends and caches:
 | `chunk_size` | bytes | 8Mi | Target bytes per ranged GET (scatter/device-staging paths). |
 | `max_n_chunks` | int | 16 | Max file-adjacent segments fused into one scatter GET. |
 | `max_read_split` | int | 16 | Max parallel ranged GETs for one contiguous host read (reads < 2 MiB stay a single GET). |
-| `bounce_block_size` | bytes | 0 | Bounce-slot size for the reactor-staged device path (0 disables that path; normally set from the staging resource at runtime). |
 | `upkeep_interval_ms` | int (ms) | 15000 | Idle-connection keepalive interval (`curl_easy_upkeep`; 0 disables). |
 | `conn_max_age_s` | int (seconds) | 20 | Max age curl may reuse a pooled connection (`CURLOPT_MAXAGE_CONN`; 0 = curl default). |
 | `retry_backoff_base_ms` | int (ms) | 50 | Base backoff between retries. |
