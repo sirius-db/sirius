@@ -69,16 +69,20 @@ class dynamic_filter_gate {
   //===--------------------------------------------------------------------===//
   // Per-filter marginal usefulness
   //===--------------------------------------------------------------------===//
-  // Membership filters also record their marginal keep ratio after earlier masks. A filter above
-  // the skip threshold is omitted on later splits until channel growth invalidates the reading.
+  // Membership filters also record their marginal keep ratio after earlier masks. A skippable
+  // verdict omits the filter from every later split permanently; a selective reading goes stale
+  // on channel growth and is remeasured.
 
-  /// Marginal keep ratio for @p filter, or `std::nullopt` when unmeasured or measured before the
-  /// channel reached @p observed_filter_count.
+  /// Marginal keep ratio for @p filter, or `std::nullopt` when unmeasured. A skippable ratio is
+  /// returned at any channel size; a selective one only when measured against at least
+  /// @p observed_filter_count filters, else `std::nullopt` so the caller remeasures.
   [[nodiscard]] std::optional<double> filter_keep_ratio(
     sirius::op::sirius_dynamic_filter const* filter, std::size_t observed_filter_count) const;
 
   /// Record @p filter's marginal keep ratio against a channel of @p observed_filter_count filters.
-  /// The first measurement at one channel size wins; a larger channel size supersedes it.
+  /// The first measurement at one channel size wins; a larger channel size supersedes it. Only a
+  /// measurement already in flight can supersede a skippable verdict, because
+  /// @ref filter_keep_ratio never invalidates one.
   void record_filter_keep_ratio(sirius::op::sirius_dynamic_filter const* filter,
                                 double kept,
                                 std::size_t observed_filter_count);
@@ -111,7 +115,8 @@ class dynamic_filter_gate {
   std::mutex _decision_mu;
 
   /// One filter's marginal keep ratio and the channel size it was measured against. The size is
-  /// carried so channel growth can invalidate the reading — see @ref filter_keep_ratio.
+  /// carried so channel growth can invalidate a selective reading; a skippable one is permanent —
+  /// see @ref filter_keep_ratio.
   struct filter_measurement {
     double kept                       = 1.0;
     std::size_t observed_filter_count = 0;

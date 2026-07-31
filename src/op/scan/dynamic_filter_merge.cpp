@@ -168,7 +168,10 @@ std::optional<double> dynamic_filter_gate::filter_keep_ratio(
   std::scoped_lock lock(_filter_ratios_mu);
   auto it = _filter_keep_ratios.find(filter);
   if (it == _filter_keep_ratios.end()) { return std::nullopt; }
-  // Channel growth changes the rows reaching this filter, so remeasure stale marginal ratios.
+  // A skippable verdict is permanent: rechecking it would cost the very kernel the verdict
+  // avoids, and a wrong skip only forfeits pruning, never correctness.
+  if (filter_skippable(it->second.kept)) { return it->second.kept; }
+  // Channel growth changes the rows reaching a selective filter, so remeasure its stale ratio.
   if (it->second.observed_filter_count < observed_filter_count) { return std::nullopt; }
   return it->second.kept;
 }
@@ -188,7 +191,7 @@ void dynamic_filter_gate::record_filter_keep_ratio(sirius::op::sirius_dynamic_fi
   if (filter_skippable(kept)) {
     SIRIUS_LOG_DEBUG(
       "[apply_dynamic_filters] per-filter gate: marginal kept {:.3f} against {} filters -> SKIP "
-      "filter until the channel grows.",
+      "filter permanently.",
       kept,
       observed_filter_count);
   }
