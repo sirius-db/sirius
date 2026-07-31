@@ -26,6 +26,32 @@
 namespace sirius::scan_manager {
 
 /**
+ * @brief Configuration for the background host->GPU memory prefetcher
+ *        (see scan_manager/memory_prefetcher.hpp).
+ *
+ * Set via the yaml block sirius.executor.scan_manager.memory_prefetcher.
+ * Disabled by default; single-GPU configurations only (the prefetcher logs a
+ * warning and disables itself when more than one GPU space is configured).
+ */
+struct memory_prefetcher_config {
+  /// Master switch; when false the prefetcher is never constructed.
+  bool enable{false};
+  /// Number of prefetch worker threads. Each drives one in-flight batch
+  /// conversion on its own stream, so this bounds conversion concurrency.
+  std::size_t num_threads{2};
+  /// Keep at least this fraction of the GPU space free after each prefetch;
+  /// the reservation for a batch is only attempted above this floor, so the
+  /// prefetcher backs off well before competing with pipeline reservations.
+  double min_free_fraction{0.4};
+  /// Worker sweep interval while waiting for headroom / new splits.
+  std::size_t poll_interval_ms{2};
+  /// A connector is considered actively draining (and skipped) until this
+  /// long has passed since its last pop. Must exceed the scan's inter-pop
+  /// interval (~10-40ms per 5GB batch) or sweeps race the scan.
+  std::size_t drain_quiet_ms{100};
+};
+
+/**
  * @brief Configuration for the scan_manager.
  *
  * @c use_sirius_datasource controls whether the manager builds a
@@ -69,6 +95,10 @@ struct scan_manager_config {
   /// Object-store credentials and endpoint consumed by the REST reactor.
   /// Empty fields disable the S3/REST backend.
   io::object_store_config object_store{};
+
+  /// Background host->GPU memory prefetcher for queued pinned-cache scan
+  /// splits. Disabled by default.
+  memory_prefetcher_config memory_prefetcher{};
 };
 
 }  // namespace sirius::scan_manager

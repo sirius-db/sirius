@@ -348,7 +348,7 @@ set(EXTENSION_SOURCES
     src/scan_manager/mvcc_mask_job.cpp
     src/scan_manager/pinned_chunk_stats.cpp
     src/scan_manager/round_robin_strategy.cpp
-    src/scan_manager/scan_prefetcher.cpp
+    src/scan_manager/memory_prefetcher.cpp
     src/scan_manager/sirius_scan_manager.cpp
     src/scan_manager/split_connector.cpp
     src/scan_manager/split_provider.cpp

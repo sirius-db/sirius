@@ -20,6 +20,7 @@
 #include "op/sirius_physical_operator.hpp"
 
 #include <cassert>
+#include <chrono>
 #include <utility>
 
 namespace sirius::scan_manager {
@@ -60,10 +61,23 @@ std::optional<std::unique_ptr<op::operator_data>> split_connector::get_next_spli
   if (!_splits.empty()) {
     auto split = std::move(_splits.front());
     _splits.pop_front();
-    _pop_count.fetch_add(1, std::memory_order_relaxed);
+    _last_pop_ms.store(std::chrono::duration_cast<std::chrono::milliseconds>(
+                         std::chrono::steady_clock::now().time_since_epoch())
+                         .count(),
+                       std::memory_order_relaxed);
     return std::optional<std::unique_ptr<op::operator_data>>{std::move(split)};
   }
   return std::nullopt;
+}
+
+bool split_connector::is_draining(std::size_t quiet_ms) const
+{
+  const auto last = _last_pop_ms.load(std::memory_order_relaxed);
+  if (last == 0) { return false; }
+  const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch())
+                        .count();
+  return now_ms - last < static_cast<std::int64_t>(quiet_ms);
 }
 
 bool split_connector::is_closed() const

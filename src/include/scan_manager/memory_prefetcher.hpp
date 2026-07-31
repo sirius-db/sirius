@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "scan_manager/config.hpp"
 #include "scan_manager/split_connector.hpp"
 
 #include <cucascade/memory/memory_space.hpp>
@@ -23,7 +24,6 @@
 
 #include <atomic>
 #include <cstddef>
-#include <cstdint>
 #include <memory>
 #include <thread>
 #include <vector>
@@ -31,7 +31,7 @@
 namespace sirius::scan_manager {
 
 /**
- * @brief Background host->GPU upgrader for queued pinned-cache scan splits.
+ * @brief Background host->GPU memory prefetcher for queued pinned-cache scan splits.
  *
  * Host-pinned scans put all their splits (per-query wrapper data_batches over
  * host slices of the pinned chunks) onto their split_connectors at query start,
@@ -41,11 +41,21 @@ namespace sirius::scan_manager {
  * compute-bound phases and then the next scan's H2D burst runs with idle SMs.
  *
  * The prefetcher overlaps the two: worker threads walk the connectors in scan
- * (execution) order and convert pending resident batches to GPU tier early, on
- * their own streams, gated on GPU memory headroom. When the scan task later
- * runs, prepare_for_processing sees the batch already GPU-resident and skips
- * the upload (and the task creator's cached-scan locality derivation reads the
- * batch's post-conversion space, so device dispatch stays consistent).
+ * execution order (the scan manager passes them ordered by @c _scan_op_order,
+ * the same order the task creator drains them) and convert pending resident
+ * batches to GPU tier early, gated on GPU memory headroom. When the scan task
+ * later runs, prepare_for_processing sees the batch already GPU-resident and
+ * skips the upload (and the task creator's cached-scan locality derivation
+ * reads the batch's post-conversion space, so device dispatch stays
+ * consistent).
+ *
+ * Why worker threads (rather than one async stream of copies): a conversion is
+ * not a bare cudaMemcpyAsync — convert_to allocates the device table,
+ * reconstructs the cudf table from the host layout, and synchronizes its
+ * stream before the batch's exclusive lock can be released, so each in-flight
+ * conversion needs a thread to drive it. Concurrency across batches therefore
+ * scales with num_threads, each conversion on its own stream from a dedicated
+ * pool.
  *
  * Races with a consumer are arbitrated by the data_batch state machine: the
  * conversion holds the exclusive (mutable) lock via try_to_mutable (skip on
@@ -55,34 +65,23 @@ namespace sirius::scan_manager {
  * Memory safety: converted batches live in connector queues, which the
  * downgrade executor does NOT scan (it walks data repositories), so
  * prefetched-but-unconsumed bytes cannot be reclaimed under pressure. The
- * headroom gate must therefore stay conservative: prefetch only while
- * (available - batch_size) >= min_free_fraction * max_memory.
+ * headroom gate must therefore stay conservative: a batch is only converted
+ * (and its GPU reservation only taken) while (available - batch_size) >=
+ * min_free_fraction * max_memory, so the prefetcher backs off long before it
+ * could compete with pipeline task reservations.
  */
-class scan_prefetcher {
+class memory_prefetcher {
  public:
-  struct config {
-    /// Number of prefetch worker threads (each with its own stream).
-    std::size_t num_threads{2};
-    /// Keep at least this fraction of the GPU space free after each prefetch.
-    double min_free_fraction{0.4};
-    /// Worker sweep interval while waiting for headroom / new splits.
-    std::size_t poll_interval_ms{2};
-    /// A connector is considered actively draining (and skipped) until this
-    /// long has passed since its last observed pop. Must exceed the scan's
-    /// inter-pop interval (~10-40ms per 5GB batch) or sweeps race the scan.
-    std::size_t drain_quiet_ms{100};
-  };
+  memory_prefetcher(memory_prefetcher_config cfg,
+                    std::vector<std::shared_ptr<split_connector>> connectors,
+                    cucascade::memory::memory_space* gpu_space);
 
-  scan_prefetcher(config cfg,
-                  std::vector<std::shared_ptr<split_connector>> connectors,
-                  cucascade::memory::memory_space* gpu_space);
+  ~memory_prefetcher();
 
-  ~scan_prefetcher();
-
-  scan_prefetcher(const scan_prefetcher&)            = delete;
-  scan_prefetcher& operator=(const scan_prefetcher&) = delete;
-  scan_prefetcher(scan_prefetcher&&)                 = delete;
-  scan_prefetcher& operator=(scan_prefetcher&&)      = delete;
+  memory_prefetcher(const memory_prefetcher&)            = delete;
+  memory_prefetcher& operator=(const memory_prefetcher&) = delete;
+  memory_prefetcher(memory_prefetcher&&)                 = delete;
+  memory_prefetcher& operator=(memory_prefetcher&&)      = delete;
 
   /// Request stop and join all workers. Idempotent.
   void stop();
@@ -102,17 +101,9 @@ class scan_prefetcher {
   /// Attempt one sweep over all connectors; returns the number of batches converted.
   std::size_t sweep(rmm::cuda_stream_view stream);
 
-  config _config;
+  memory_prefetcher_config _config;
   std::vector<std::shared_ptr<split_connector>> _connectors;
   cucascade::memory::memory_space* _gpu_space;
-  /// Last observed pop_count per connector (parallel to _connectors). A delta
-  /// between sweeps means the scan is actively draining that connector — skip
-  /// it so the prefetcher never serializes conversions the scan's own tasks
-  /// would run concurrently.
-  std::vector<std::atomic<std::uint64_t>> _last_pop_counts;
-  /// steady_clock ms timestamp of the last observed pop per connector; a
-  /// connector stays "draining" until drain_quiet_ms elapse with no pops.
-  std::vector<std::atomic<std::int64_t>> _last_pop_time_ms;
 
   /// Dedicated streams so prefetch copies never share a stream with pipeline
   /// task work (the memory_space's shared round-robin pool would interleave
