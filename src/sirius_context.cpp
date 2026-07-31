@@ -357,10 +357,10 @@ void SiriusContext::run_mandatory_cleanup(sirius::query_id_t query_id, std::stri
     }
   }
 
-  // Drop scan-manager providers for this query. Repositories are already
-  // cleared above, so downstream data_batches that referenced sliced
-  // host_data_representation are gone before the providers go away.
-  if (scan_manager_) { scan_manager_->reset(); }
+  // Drop THIS query's scan-manager providers; any other in-flight query keeps scanning.
+  // Repositories are already cleared above, so downstream data_batches that referenced
+  // sliced host_data_representation are gone before the providers go away.
+  if (scan_manager_) { scan_manager_->reset(query_id); }
 
   // NOTE: task_creator_->reset(query_id) already ran at the top of this function. That reset is
   // what drops duckdb_scan_task_global_state, which transitively owns a
@@ -417,6 +417,14 @@ void SiriusContext::drop_query_runtime_state_best_effort(sirius::query_id_t quer
   }
   try {
     if (task_scheduler_) { task_scheduler_->drain_query_tasks(query_id); }
+  } catch (...) {
+  }
+  // The scan manager needs the same backstop. prepare_for_query no longer performs a global
+  // reset (it would tear down concurrently-running queries), so nothing else will ever drop
+  // this query's scan state: without this, a failed query leaks its dispatcher, coalescer and
+  // split providers until terminate().
+  try {
+    if (scan_manager_) { scan_manager_->reset(query_id); }
   } catch (...) {
   }
 }

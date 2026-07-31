@@ -155,7 +155,9 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
         }
       }
 
-      sirius::scan_manager::pinned_entry const* entry = nullptr;
+      // Owning: holds the entry alive across the guards below, so a concurrent UNPIN on
+      // another connection cannot invalidate it mid-check.
+      std::shared_ptr<const sirius::scan_manager::pinned_entry> entry;
       if (context.registered_state) {
         if (auto sirius_state =
               context.registered_state->Get<duckdb::SiriusContext>("sirius_state")) {
