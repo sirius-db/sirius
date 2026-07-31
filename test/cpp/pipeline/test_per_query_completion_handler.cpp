@@ -42,8 +42,7 @@ using sirius::pipeline::sirius_pipeline_task_global_state;
 
 //! A global state carrying its query's handler, as task_creator::prepare_for_query builds it.
 std::shared_ptr<sirius_pipeline_task_global_state> make_global_state(
-  const sirius::pipeline::pipeline_build_context& ctx,
-  std::shared_ptr<completion_handler> handler)
+  const sirius::pipeline::pipeline_build_context& ctx, std::shared_ptr<completion_handler> handler)
 {
   auto pipeline = duckdb::make_shared_ptr<sirius::pipeline::sirius_pipeline>(ctx);
   auto gs       = std::make_shared<sirius_pipeline_task_global_state>(
