@@ -539,6 +539,10 @@ def _build_nsys_temp_sql(qnum, source, iterations, pin, qdir, data_source="parqu
         parts.append(_build_views_sql(source).rstrip("\n"))
     parts.append("INSERT INTO _timings VALUES (1, 'views', current_timestamp);")
 
+    pre_sql = os.environ.get("SIRIUS_PRE_SQL", "").strip()
+    if pre_sql:
+        parts.append(pre_sql.rstrip(";") + ";")
+
     if pin != "none":
         parts.append(emit_pin(qnum, source, data_source))
 
