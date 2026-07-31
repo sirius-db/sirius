@@ -339,13 +339,17 @@ op::sirius_physical_operator* task_creator::get_operator_for_next_task(
 
 void task_creator::stop()
 {
+  // Takes the same mutex as start/stop_thread_pool. Without it, a stop() racing a
+  // start_thread_pool() could reassign _bounded_pool and _manager_thread while the other thread
+  // was inside do_stop_thread_pool() joining them.
+  std::lock_guard<std::mutex> lock(_pool_lifecycle_mutex);
   _task_creation_queue.interrupt();
   do_stop_thread_pool();
 }
 
 void task_creator::start_thread_pool()
 {
-  std::lock_guard<std::mutex> lock(_global_state_mutex);
+  std::lock_guard<std::mutex> lock(_pool_lifecycle_mutex);
   bool expected = false;
   if (!_running.compare_exchange_strong(expected, true)) { return; }
   // Re-arm the request queue. stop_thread_pool() calls
@@ -374,7 +378,7 @@ void task_creator::do_stop_thread_pool()
 
 void task_creator::stop_thread_pool()
 {
-  std::lock_guard<std::mutex> lock(_global_state_mutex);
+  std::lock_guard<std::mutex> lock(_pool_lifecycle_mutex);
   do_stop_thread_pool();
 }
 
@@ -397,21 +401,33 @@ std::pair<sirius::query_id_t, exec::queue_priority> request_keys_for(
 void task_creator::schedule(op::sirius_physical_operator* node)
 {
   const auto [query_id, priority] = request_keys_for(node);
-  auto request                    = std::make_unique<task_creation_request>();
-  request->node                   = node;
-  request->query_id               = query_id;
-  request->priority               = priority;
+  // Most calls here come from a completion callback (notify_downstream_pipelines, or the GPU
+  // executor scheduling a finished task's consumers). If the query is tearing down, `node` points
+  // into a plan that is about to be destroyed and a drain has very likely already passed this
+  // queue — so refuse rather than enqueue. Previously this was achieved by interrupting the
+  // queue, which refused EVERY query's pushes at once.
+  if (!accepts_work(query_id)) { return; }
+  auto request      = std::make_unique<task_creation_request>();
+  request->node     = node;
+  request->query_id = query_id;
+  request->priority = priority;
   _task_creation_queue.push(std::move(request));
 }
 
 void task_creator::schedule(op::sirius_physical_operator* node, sirius::query_id_t query_id)
 {
+  if (!accepts_work(query_id)) { return; }
   const auto [_, priority] = request_keys_for(node);
   auto request             = std::make_unique<task_creation_request>();
   request->node            = node;
   request->query_id        = query_id;
   request->priority        = priority;
   _task_creation_queue.push(std::move(request));
+}
+
+bool task_creator::accepts_work(sirius::query_id_t query_id) const noexcept
+{
+  return _query_lifecycle == nullptr || _query_lifecycle->accepts_work(query_id);
 }
 
 void task_creator::schedule_lookahead(std::optional<int> device_id_hint)
@@ -431,6 +447,9 @@ void task_creator::schedule_lookahead(std::optional<int> device_id_hint)
     state    = it->second;
   }
   if (!state) { return; }
+  // The oldest entry can be a query that has finished and is mid-cleanup but whose state has not
+  // been dropped yet. Warming it up would dereference operators of a plan that is already gone.
+  if (!accepts_work(query_id)) { return; }
 
   std::lock_guard lock(state->lookahead_mutex);
   for (; state->index_of_next_lookahead < state->lookahead_queue.size();

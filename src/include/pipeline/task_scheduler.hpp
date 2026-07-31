@@ -19,6 +19,7 @@
 #include "exec/channel.hpp"
 #include "exec/config.hpp"
 #include "exec/multi_index_priority_queue.hpp"
+#include "exec/query_lifecycle_registry.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "parallel/task.hpp"
 #include "pipeline/completion_handler.hpp"
@@ -179,6 +180,14 @@ class task_scheduler {
                        std::exception_ptr error);
 
   /**
+   * @brief Bind the per-query lifecycle gate, propagating it to every GPU executor.
+   *
+   * Without one (the default, and what most unit tests use) every query is treated as accepting
+   * work, i.e. the pre-gate behaviour.
+   */
+  void set_query_lifecycle_registry(sirius::exec::query_lifecycle_registry* registry);
+
+  /**
    * @brief Drain all in-flight tasks after a query error.
    *
    * Drains the top-level task queue and waits for each GPU executor to finish
@@ -222,6 +231,8 @@ class task_scheduler {
   /// task dispatch reproducible across runs.
   std::unordered_map<int, std::unique_ptr<gpu_pipeline_executor>> _gpu_executors;
   sirius::creator::task_creator* _task_creator{nullptr};
+  /// Non-owning; owned by SiriusContext and outlives this scheduler. Null in unit tests.
+  sirius::exec::query_lifecycle_registry* _query_lifecycle{nullptr};
   std::shared_ptr<const telemetry::telemetry_context> _telemetry_context;
   std::unique_ptr<telemetry::TaskQueueHandleWrapper> _task_queue_telemetry;
 };
