@@ -55,11 +55,11 @@ src/**/log/                         @sirius-db/sirius-telemetry-codeowners
 **/*.cmake                          @sirius-db/sirius-cmake-codeowners
 
 # ── CI & Build ────────────────────────────────────────────────────────────────
+/.*                                 @sirius-db/sirius-ci-build-codeowners
 /Cargo.*                            @sirius-db/sirius-ci-build-codeowners
 /Makefile                           @sirius-db/sirius-ci-build-codeowners
 /pixi.*                             @sirius-db/sirius-ci-build-codeowners
 /vcpkg*                             @sirius-db/sirius-ci-build-codeowners
-/.github/                           @sirius-db/sirius-ci-build-codeowners
 /docker/                            @sirius-db/sirius-ci-build-codeowners
 /duckdb-python/                     @sirius-db/sirius-ci-build-codeowners
 /extension-ci-tools/                @sirius-db/sirius-ci-build-codeowners
