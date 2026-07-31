@@ -216,10 +216,8 @@ TEST_CASE("gpu_execution - SIP endpoint placement preserves results",
 
   SECTION("TPC-H q17: a delim-scan build wires only through derived-build evidence")
   {
-    // q17's correlated-aggregate producer joins lineitem against a DELIM_GET correlation domain.
-    // That build is opaque to the IsFiltering mirror, so only derived-build classification lets
-    // the join-edge route wire an endpoint above the inner lineitem scan; the counter deltas are
-    // the non-inertness proof on this recovered shape. Query text as in scripts/tpch-queries.sql.
+    // q17's correlated join builds from a DELIM_GET. The counter deltas verify that derived-build
+    // evidence activates the otherwise unreachable join-edge route.
     auto const deltas =
       require_sip_result_equivalence(con,
                                      "select sum(l.l_extendedprice) / 7.0 as avg_yearly "

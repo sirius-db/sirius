@@ -219,9 +219,8 @@ std::string tree_to_string(sirius_physical_operator* root)
 }
 
 /// Every operator's `_parent_op` must equal its position in the final tree; delim joins
-/// stamp their internal `join`/`distinct_root` subtrees with themselves as parent, and a CTE
-/// stamps its consumer child (`children[1]`, whose result IS the CTE's output) with the CTE's
-/// own parent.
+/// stamp their internal `join`/`distinct_root` subtrees with themselves as parent. A CTE's consumer
+/// child (`children[1]`) inherits the CTE's parent because that child produces the CTE's output.
 void require_parent_links(sirius_physical_operator* op, sirius_physical_operator* expected_parent)
 {
   REQUIRE(op != nullptr);
@@ -667,10 +666,9 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
                  "plan tree shape - SIP wires a join-edge endpoint for a derived build",
                  "[plan_tree_shape][isolated_context]")
 {
-  // A single-consumer AS MATERIALIZED CTE survives as CTE + CTE_SCAN, with the reference as the
-  // join's build. The filter inside the definition is invisible at the reference -- the
-  // IsFiltering mirror bottoms out at the childless CTE_SCAN -- so an endpoint wires only through
-  // derived-build classification.
+  // A materialized CTE leaves a childless CTE_SCAN as the join's build. IsFiltering cannot see the
+  // predicate in the CTE definition from that reference, so only derived-build evidence can wire
+  // the endpoint.
   const std::string cte_query =
     "WITH r AS MATERIALIZED (SELECT rid FROM small_right WHERE other % 2 = 0) "
     "SELECT * FROM big_left l JOIN r ON l.id = r.rid";
@@ -716,11 +714,8 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     CHECK(collect(plan.get(), SiriusPhysicalOperatorType::DYNAMIC_FILTER).empty());
   }
 
-  // parts/items reproduce the q17 delim shape (see the delim-join TEST_CASE below): the
-  // correlated side joins items against the DELIM_GET correlation domain, so the producing
-  // join's build is a delim scan and only derived-build evidence can wire its endpoint. The
-  // flat side (items joined with the filtered parts scan) keeps its scan-route endpoint under
-  // both switch settings.
+  // This reproduces q17's delim shape: the correlated side builds from a DELIM_GET, while the flat
+  // side retains its scan-route endpoint under both switch settings.
   const std::string delim_query =
     "SELECT SUM(i.qty) FROM items i, parts p WHERE p.pk = i.fk AND p.pname = 'p1' "
     "AND i.qty < (SELECT 2 * AVG(i2.qty) FROM items i2 WHERE i2.fk = p.pk)";

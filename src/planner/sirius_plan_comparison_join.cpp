@@ -416,15 +416,12 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
                                                    ? *op.children[0]
                                                    : *op.children[1]);
 
-  // Join-edge evidence widening: a build that IS (through projections) a delim scan or a
-  // materialized-CTE reference is opaque to the IsFiltering mirror -- the walk bottoms out at the
-  // childless reference, so "unfiltered" carries no key-domain information there. The join-edge
-  // route accepts either evidence kind; the scan route stays on the faithful mirror.
+  // DuckDB's IsFiltering walk cannot see work behind childless DELIM_GET and CTE_REF leaves.
+  // Derived evidence therefore widens only the SIP join-edge route; scan routing keeps DuckDB
+  // parity.
   bool const build_derived = master_enabled && build_relation_is_derived(*op.children[1]);
   bool const edge_evidence = build_filtered || build_derived;
 
-  // Some route could accept a key: the scan route on filter evidence alone, the join-edge route on
-  // either evidence kind when SIP allows it.
   bool const routes_possible = build_filtered || (sip_enabled && edge_evidence);
 
   // Gather domain evidence before create_plan() moves state out of the logical children.
@@ -558,10 +555,9 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
           scan_bound = true;
         }
         if (scan_bound || !sip_enabled || !edge_evidence) { continue; }
-        // Join-edge endpoint. The route accepts filtering evidence OR a derived build: for a
-        // base-table-image build, "unfiltered" means the whole key domain (its filter keeps every
-        // probe row by construction); for a delim scan or CTE reference the mirror cannot see the
-        // derivation, and the runtime keep-ratio gate bounds a wrong wire's cost.
+        // Derived evidence may arm only this route. Because it is structural rather than
+        // selective, the endpoint's keep-ratio gate suppresses later work when the filter prunes
+        // too little.
         //
         // Build-block descent depends on equality admission: under null-equal
         // semantics, pruning a LEFT join's build input could add a NULL-padded row accepted by

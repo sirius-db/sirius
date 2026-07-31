@@ -19,9 +19,8 @@
  *
  * `build_subtree_is_filtering` mirrors DuckDB's join-filter evidence rules for filtered scans,
  * filters, top-N operators, and containing subtrees; the parity suite compares both implementations
- * on optimized plans. `build_relation_is_derived` classifies a build that presents, through
- * projections, a delim scan or CTE reference -- the childless leaves the mirror cannot see past --
- * and is root-down on purpose: a derived leaf under visible structure does not count.
+ * on optimized plans. `build_relation_is_derived` recognizes only delim-scan and CTE-reference
+ * roots with optional projection wrappers; the tests pin that root-down boundary.
  */
 
 #include "planner/dynamic_filter/build_filter_evidence.hpp"
@@ -77,14 +76,12 @@ duckdb::unique_ptr<duckdb::LogicalProjection> make_projection_over(
   return projection;
 }
 
-// A duplicate-eliminated correlation-domain scan; childless like every derived leaf.
 duckdb::unique_ptr<duckdb::LogicalDelimGet> make_delim_get()
 {
   return duckdb::make_uniq<duckdb::LogicalDelimGet>(
     /*table_index=*/2, duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER});
 }
 
-// A materialized-CTE reference; childless like every derived leaf.
 duckdb::unique_ptr<duckdb::LogicalCTERef> make_cte_ref()
 {
   return duckdb::make_uniq<duckdb::LogicalCTERef>(
@@ -167,8 +164,7 @@ TEST_CASE("a derived-leaf root is a derived relation", "[dynamic_filter][evidenc
 
 TEST_CASE("projection wrappers are transparent to derivation", "[dynamic_filter][evidence]")
 {
-  // Recursion is expression-agnostic: a projection presents the same relation row-for-row
-  // regardless of what it computes.
+  // Projection expressions do not affect whether the input is a derived leaf.
   SECTION("a projection over a DELIM_GET")
   {
     auto const projection = make_projection_over(make_delim_get());
@@ -219,8 +215,7 @@ TEST_CASE("derivation is root-down, not any-descendant", "[dynamic_filter][evide
 {
   SECTION("a group-less aggregate over a projected CTE_REF is not derived")
   {
-    // TPC-H q15's est-1-row threshold build: the scalar aggregate presents its own relation, so
-    // recursion stops there even though a reference sits below.
+    // The aggregate presents a new relation, even though its child is derived.
     auto aggregate = duckdb::make_uniq<duckdb::LogicalAggregate>(
       /*group_index=*/4,
       /*aggregate_index=*/5,
@@ -231,7 +226,7 @@ TEST_CASE("derivation is root-down, not any-descendant", "[dynamic_filter][evide
 
   SECTION("a comparison join with a CTE_REF child is not derived")
   {
-    // TPC-H q15's SF50 build orientation: containing a reference does not classify the join.
+    // The join presents a new relation rather than forwarding either child.
     auto join = duckdb::make_uniq<duckdb::LogicalComparisonJoin>(duckdb::JoinType::INNER);
     join->children.push_back(make_cte_ref());
     join->children.push_back(make_get());
