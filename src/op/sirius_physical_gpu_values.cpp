@@ -204,16 +204,6 @@ std::unique_ptr<cudf::table> staging_to_table(const std::vector<column_staging>&
   return std::make_unique<cudf::table>(std::move(columns));
 }
 
-std::unique_ptr<cudf::table> make_empty_table(const duckdb::vector<sirius::logical_type>& types)
-{
-  std::vector<std::unique_ptr<cudf::column>> columns;
-  columns.reserve(types.size());
-  for (auto const& t : types) {
-    columns.push_back(cudf::make_empty_column(sirius::get_cudf_type(t)));
-  }
-  return std::make_unique<cudf::table>(std::move(columns));
-}
-
 /// cuDF derives table cardinality from its columns, so a positive-row,
 /// zero-column DuckDB source needs a private sentinel column. Downstream
 /// operators use only num_rows() and never expose the sentinel in their output.
@@ -360,7 +350,7 @@ std::unique_ptr<operator_data> sirius_physical_gpu_values::execute(const operato
     // EMPTY_RESULT (or an empty collection): 0-row table with the declared
     // schema, so downstream operators see a real (empty) input — the same
     // shape a filter-everything pipeline produces.
-    output_table = make_empty_table(types);
+    output_table = sirius::make_empty_table(types);
   }
 
   auto batch =

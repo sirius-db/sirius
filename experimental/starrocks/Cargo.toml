@@ -26,10 +26,10 @@ prost = "0.14"
 prost-build = "0.14"
 parquet = { version = "59", default-features = false, features = ["arrow", "async"] }
 heck = "0.5"
-prettyplease = "0.2"
+prettyplease = "0.3.0"
 proc-macro2 = "1"
 quote = "1"
-syn = { version = "2", features = ["full", "parsing"] }
+syn = { version = "3", features = ["full", "parsing"] }
 substrait = "0.63.0"
 substrait-explain = "0.7.0"
 thiserror = "2"

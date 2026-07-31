@@ -36,6 +36,12 @@ constexpr uint64_t DEFAULT_HASH_PARTITION_BYTES       = 512ULL * 1024 * 1024;  /
 constexpr uint64_t DEFAULT_CONCAT_BATCH_BYTES         = 512ULL * 1024 * 1024;  // 512 MB
 constexpr uint64_t DEFAULT_SORT_SAMPLE_BYTES          = 512ULL * 1024 * 1024;  // 512 MB
 constexpr uint64_t DEFAULT_MAX_BUILD_HASH_TABLE_BYTES = 500ULL * 1024 * 1024;  // 500 MB
+constexpr uint64_t DEFAULT_MAX_BROADCAST_JOIN_SIZE    = 256ULL * 1024 * 1024;  // 256 MB
+
+/// Multi-GPU small-table threshold, charged per GPU. A partition-sizing consumer (hash join,
+/// merge_group_by) keeps inputs below `num_gpus * this` on a single GPU (one partition) to avoid
+/// cross-device overhead; above it, the multi-GPU floor of `num_gpus` partitions kicks in.
+constexpr uint64_t PARTITION_SMALL_TABLE_BYTES_PER_GPU = 16ULL * 1024 * 1024;  // 16 MB
 
 /// Fraction of available GPU memory used per sort partition when max_sort_partition_bytes is 0.
 constexpr double DEFAULT_MAX_SORT_PARTITION_MEMORY_FRACTION = 0.33;
@@ -83,6 +89,11 @@ struct operator_params {
   /// May be larger than concat_batch_bytes; build-side batches will be concatenated if needed.
   uint64_t max_build_hash_table_bytes = config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES;
 
+  /// Maximum build-side bytes for a broadcast join. A build below this size is eligible to be
+  /// replicated to every GPU (instead of hash-partitioning across GPUs) when the probe side is
+  /// large relative to the build side. See compute_hash_join_partition_strategy.
+  uint64_t max_broadcast_join_size = config::DEFAULT_MAX_BROADCAST_JOIN_SIZE;
+
   /// For STANDARD-mode MARK joins: build the hash table on the left/output side via
   /// cudf::mark_join (instead of on the right side via filtered_join) when the right (probe)
   /// side has at least this many times more rows than the left side. mark_join only wins when
@@ -123,8 +134,47 @@ struct operator_params {
 
 struct telemetry_config {
   bool enable_quent{true};
+  /// Emit per-batch placement telemetry (Batch FSM + MemoryTier usages).
+  /// Roughly doubles telemetry volume; no-op when enable_quent is false.
+  bool enable_batch_events{true};
   std::string output_directory{"telemetry_data"};
   std::string engine_name{"siriusDB"};
+};
+
+/// Parameters controlling Simpatico compression for pin_table(tier=>'host').
+/// These settings apply exclusively to cached input-table pinning and have no
+/// effect on spill-path compression (Phase 3).
+struct compression_config {
+  /// When true, pin_table(tier=>'host') attempts to compress each chunk with
+  /// Simpatico before storing it in host memory. Falls back to uncompressed
+  /// host storage when no plan file is found for a table or compression fails.
+  bool enable_pin_table_compression{false};
+
+  /// Minimum chunk size (uncompressed bytes) below which compression is
+  /// skipped and the chunk is stored uncompressed.  0 = no threshold.
+  std::size_t min_batch_size_bytes{1ULL * 1024 * 1024};  // 1 MiB
+
+  /// Maximum compressed footprint, as a fraction of the batch's original device
+  /// size, for the compressed form to be kept.  When the compressed header +
+  /// payload exceeds this fraction of the original (i.e. compression saved too
+  /// little), the compressed data is discarded and the uncompressed batch is used.
+  //  Default 0.75 (that coincides with a 1.33x compression ratio).
+  double max_compressed_fraction{0.75};
+
+  /// Directory containing per-table Simpatico plan files for input-table
+  /// compression.  Each file is named "<table_name>.<ext>" (any extension);
+  /// its contents are the multi-column plan DSL (columns separated by "---"
+  /// lines) passed verbatim to simpatico::compress_with_plan.  If no file
+  /// exists for a table, that table is pinned uncompressed regardless of the
+  /// enable flag.  Empty string = feature disabled.
+  std::string input_plan_dir{};
+
+  /// Degree of column-parallelism for Simpatico (de)compression: simpatico fans
+  /// a table's columns across this many worker threads/streams (one column per
+  /// stream). <=1 = sequential (single-stream). Capped at the column count per
+  /// call. Applies to both the pin-time compress path and the scan-time
+  /// decompress converters.
+  int column_threads{4};
 };
 
 struct sirius_config {
@@ -168,6 +218,16 @@ struct sirius_config {
     return _telemetry_config;
   }
 
+  [[nodiscard]] const compression_config& get_compression_config() const noexcept
+  {
+    return _compression_config;
+  }
+
+  [[nodiscard]] compression_config& get_compression_config() noexcept
+  {
+    return _compression_config;
+  }
+
  private:
   /// When @c _memory_space_configs contains more than one GPU memory space,
   /// force @c _scan_manager_config.use_sirius_datasource to true (sirius
@@ -184,6 +244,7 @@ struct sirius_config {
   exec::downgrade_executor_config _downgrade_executor_config;
   operator_params _operator_params;
   telemetry_config _telemetry_config;
+  compression_config _compression_config;
 };
 
 }  // namespace sirius

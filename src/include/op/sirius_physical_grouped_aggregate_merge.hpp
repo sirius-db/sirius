@@ -35,6 +35,9 @@
 #include <numeric>
 
 namespace sirius {
+namespace planner {
+class sirius_physical_plan_generator;
+}  // namespace planner
 namespace op {
 
 class sirius_physical_grouped_aggregate_merge : public sirius_physical_partition_consumer_operator {
@@ -43,7 +46,9 @@ class sirius_physical_grouped_aggregate_merge : public sirius_physical_partition
     SiriusPhysicalOperatorType::MERGE_GROUP_BY;
 
  public:
-  sirius_physical_grouped_aggregate_merge(sirius_physical_grouped_aggregate* grouped_aggregate);
+  sirius_physical_grouped_aggregate_merge(
+    sirius_physical_grouped_aggregate* grouped_aggregate,
+    uint64_t hash_partition_bytes = config::DEFAULT_HASH_PARTITION_BYTES);
 
   sirius_physical_grouped_aggregate_merge(
     duckdb::vector<sirius::logical_type> types,
@@ -123,10 +128,25 @@ class sirius_physical_grouped_aggregate_merge : public sirius_physical_partition
 
   bool sink_order_dependent() const override { return false; }
 
+  //! Whether this merge joins its downstream pipeline.
+  [[nodiscard]] bool fuse_into_parent() const noexcept { return _fuse_into_parent; }
+
+  void build_pipelines(pipeline::sirius_pipeline& current,
+                       pipeline::sirius_meta_pipeline& meta_pipeline) override;
+
   std::unique_ptr<operator_data> get_next_task_input_data() override;
+
+  //! Decide the partition count for the upstream PARTITION operator that feeds this merge
+  partition_strategy get_partition_strategy(const partition_sizing_input& in) override;
 
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          rmm::cuda_stream_view stream) override;
+
+ private:
+  friend class sirius::planner::sirius_physical_plan_generator;
+  void set_fuse_into_parent(bool fuse) noexcept { _fuse_into_parent = fuse; }
+
+  bool _fuse_into_parent = false;
 };
 
 }  // namespace op

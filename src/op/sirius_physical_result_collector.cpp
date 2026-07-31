@@ -162,9 +162,8 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
           return a->get_available_memory() < b->get_available_memory();
         });
 
-      auto& registry      = sirius::converter_registry::get();
-      auto& data_repo_mgr = sirius_ctx->get_data_repository_manager();
-      auto next_batch_id  = data_repo_mgr.get_next_data_batch_id();
+      auto& registry     = sirius::converter_registry::get();
+      auto next_batch_id = sirius::get_next_batch_id();
 
       auto host_reservation =
         const_cast<cucascade::memory::memory_space*>(mem_space)->make_reservation_or_null(

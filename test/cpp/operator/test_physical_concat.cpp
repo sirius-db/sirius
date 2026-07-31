@@ -58,6 +58,16 @@ struct hash_join_test_fixture {
   duckdb::unique_ptr<sirius_physical_hash_join> hash_join;
 };
 
+//! Depth-first, root-first numbering of a bare operator tree, standing in for
+//! pipeline::assign_operator_ids in fixtures that never build pipelines.
+void number_operator_tree(sirius_physical_operator& op, size_t& next_id)
+{
+  op.operator_id = next_id++;
+  for (auto& child : op.children) {
+    if (child) { number_operator_tree(*child, next_id); }
+  }
+}
+
 /**
  * @brief Create a minimal sirius_physical_hash_join for testing concat.
  *
@@ -65,8 +75,10 @@ struct hash_join_test_fixture {
  * @param output_types The logical types for the join output columns
  * @return hash_join_test_fixture owning both the logical and physical join
  */
-hash_join_test_fixture create_test_hash_join(duckdb::JoinType join_type,
-                                             duckdb::vector<duckdb::LogicalType> output_types)
+hash_join_test_fixture create_test_hash_join(
+  duckdb::JoinType join_type,
+  duckdb::vector<duckdb::LogicalType> output_types,
+  uint64_t hash_partition_bytes = sirius::config::DEFAULT_HASH_PARTITION_BYTES)
 {
   hash_join_test_fixture fixture;
 
@@ -103,7 +115,16 @@ hash_join_test_fixture create_test_hash_join(duckdb::JoinType join_type,
     duckdb::vector<duckdb::idx_t>{},  // right_projection_map (empty = all)
     sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{}),  // delim_types
     1000,                                                            // estimated_cardinality
-    nullptr);                                                        // pushdown_info
+    nullptr,                                                         // pushdown_info
+    sirius::config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES,
+    sirius::op::dynamic_filter_publish_plan{},  // dynamic_filter_plan
+    hash_partition_bytes);
+
+  // These fixtures build a bare operator tree with no pipelines, so the converter's
+  // assign_operator_ids never runs over it. Number it here — operator code reads
+  // get_operator_id(), which rejects the unassigned sentinel.
+  size_t next_id = 0;
+  number_operator_tree(*fixture.hash_join, next_id);
 
   return fixture;
 }
@@ -652,15 +673,21 @@ TEST_CASE("right-family sibling partitions round up from the probe input", "[phy
   REQUIRE(probe_bytes > build_bytes);
   auto const partition_size = probe_bytes - 1;
 
-  auto fixture    = create_test_hash_join(duckdb::JoinType::RIGHT, {duckdb::LogicalType::INTEGER});
+  // The join owns hash_partition_bytes (the natural-count divisor) now, so it must be constructed
+  // with partition_size for the probe side to size to two partitions.
+  auto fixture =
+    create_test_hash_join(duckdb::JoinType::RIGHT, {duckdb::LogicalType::INTEGER}, partition_size);
   auto make_types = [] {
     return sirius::from_duckdb_vec(
       duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER});
   };
-  sirius_physical_partition build_partition(
-    make_types(), 4, fixture.hash_join.get(), true, partition_size);
-  sirius_physical_partition probe_partition(
-    make_types(), 9, fixture.hash_join.get(), false, partition_size);
+  sirius_physical_partition build_partition(make_types(), 4, fixture.hash_join.get(), true);
+  sirius_physical_partition probe_partition(make_types(), 9, fixture.hash_join.get(), false);
+  // These partitions hang off the join by pointer, not as children, so create_test_hash_join's
+  // numbering does not reach them. Number them past the join tree's ids.
+  size_t partition_next_id = 100;
+  number_operator_tree(build_partition, partition_next_id);
+  number_operator_tree(probe_partition, partition_next_id);
   build_partition.set_sibling_partition_op(&probe_partition);
   probe_partition.set_sibling_partition_op(&build_partition);
   build_partition.set_drives_partition_count(false);
@@ -671,17 +698,26 @@ TEST_CASE("right-family sibling partitions round up from the probe input", "[phy
   build_repo->add_data_batch(std::move(build_batch), 0);
   probe_repo->add_data_batch(std::move(probe_batch), 0);
 
-  auto attach_port = [](sirius_physical_partition& partition,
+  // The join's per-partition input repos that the sizing decision pre-sizes inside
+  // sirius_physical_hash_join::get_partition_strategy (created during pipeline construction in
+  // production): the build side targets the join's "build" port, the probe side its "default" port.
+  auto join_build_repo   = std::make_unique<cucascade::shared_data_repository>();
+  auto join_default_repo = std::make_unique<cucascade::shared_data_repository>();
+
+  auto attach_port = [](sirius_physical_operator& op,
+                        std::string_view port_id,
                         cucascade::shared_data_repository& repo) {
     auto port           = std::make_unique<sirius_physical_operator::port>();
     port->type          = MemoryBarrierType::FULL;
     port->repo          = &repo;
     port->src_pipeline  = nullptr;
     port->dest_pipeline = nullptr;
-    partition.add_port("default", std::move(port));
+    op.add_port(port_id, std::move(port));
   };
-  attach_port(build_partition, *build_repo);
-  attach_port(probe_partition, *probe_repo);
+  attach_port(build_partition, "default", *build_repo);
+  attach_port(probe_partition, "default", *probe_repo);
+  attach_port(*fixture.hash_join, "build", *join_build_repo);
+  attach_port(*fixture.hash_join, "default", *join_default_repo);
 
   // Enter through the non-driving build side first. It must still size both siblings from probe.
   auto build_input = build_partition.get_next_task_input_data();

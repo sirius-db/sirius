@@ -46,32 +46,24 @@ namespace sirius::op::scan {
  * downstream pipeline.
  *
  * Lifecycle:
- *   1. Pipeline converter constructs the operator with the per-table
- *      @c ingestible_table_info (parquet or duckdb-native today).
- *   2. @c sirius_scan_manager::prepare_for_query peeks the table_info to
- *      match pinned-cache entries. On match: builds the cached ingestible
- *      from the stolen table_info. On miss: calls
- *      @c make_gpu_ingestible(take_table_info(), mgr, gpu_ioctxs).
- *      Either way, scan_manager calls @ref install_ingestible to hand
- *      the operator its source.
- *   3. The scan_manager also installs a fresh @c split_connector and
- *      drives a @c scan_manager::split_provider that composes the same
- *      ingestible — the provider populates the connector with splits
- *      that the operator pulls via @ref get_next_task_input_data.
- *   4. @ref execute dispatches each split through the installed
- *      ingestible's @c materialize_table and (conditionally)
- *      @c post_filter_and_project.
+ * 1. The plan generator creates the ingestible and the scan operator.
+ * 2. prepare_for_query checks whether a pinned entry can serve the scan.
+ * 3. A cache miss uses split_provider. A cache hit uses cached_databatch_provider.
+ * 4. Both providers send inputs through the operator's split connector.
+ * 5. execute() runs each split through materialize_table, then
+ *    post_filter_and_project unless the result is already
+ *    row-filtered and projected.
+ *
+ * The operator retains the ingestible created by the plan generator.
  */
 class sirius_gpu_scan_operator : public sirius_physical_operator {
  public:
   static constexpr SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::GPU_SCAN;
 
-  /**gp
+  /**
    * @param types                  Output column types in plan order.
    * @param estimated_cardinality  Planner-estimated row count.
-   * @param table_info             Per-table bind data; consumed by
-   *                               @c sirius_scan_manager during
-   *                               @c prepare_for_query.
+   * @param ingestible             Per-table source built by the plan generator.
    */
   sirius_gpu_scan_operator(duckdb::vector<sirius::logical_type> types,
                            duckdb::idx_t estimated_cardinality,
@@ -94,17 +86,14 @@ class sirius_gpu_scan_operator : public sirius_physical_operator {
   /**
    * @brief Produce a data batch for one split.
    *
-   * Two input shapes are supported:
-   *   - @c scan_operator_input — fresh read; calls
-   *     @c gpu_ingestible::materialize_table and (when filter info is
-   *     present) @c gpu_ingestible::post_filter_and_project.
-   *   - @c scan_operator_with_pinned_table_input — pinned-cache hit;
-   *     forwards the batch when no filter info is set, otherwise calls
-   *     @c gpu_ingestible::post_filter_and_project on the cached view.
+   * The input is a @c scan_operator_input holding either scan metadata
+   * (fresh read) or a resident batch (pinned-cache hit). Both go through
+   * @c gpu_ingestible::materialize_table; @c post_filter_and_project runs
+   * afterwards unless materialize returned
+   * @c filter_state::ROW_FILTERED_AND_PROJECTED.
    *
-   * Throws when the input is neither type (programmer error: the only
-   * operator_data types pushed into the operator's connector are the two
-   * above).
+   * Throws on any other operator_data type (programmer error: the connector
+   * carries only @c scan_operator_input).
    */
   std::unique_ptr<op::operator_data> execute(const op::operator_data& input_data,
                                              rmm::cuda_stream_view stream) override;
@@ -113,11 +102,8 @@ class sirius_gpu_scan_operator : public sirius_physical_operator {
     const op::input_stats& stats) const override;
 
   /**
-   * @brief Const accessor for the parked table_info. Used by
-   *        @c sirius_scan_manager::try_make_cached_ingestible to match
-   *        the operator's file paths against pinned entries.
-   *
-   * @pre @c take_table_info has not been called yet.
+   * @brief Const accessor for the ingestible's table_info. Called by the
+   *        pipeline converter's scan-identity dump.
    */
   [[nodiscard]] const ingestible_table_info& peek_table_info() const;
 

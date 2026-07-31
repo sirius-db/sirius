@@ -33,6 +33,7 @@
 #include <data/sirius_converter_registry.hpp>
 #include <duckdb.hpp>
 #include <duckdb/execution/execution_context.hpp>
+#include <duckdb/main/client_config.hpp>
 #include <memory/sirius_memory_reservation_manager.hpp>
 #include <utils/utils.hpp>
 
@@ -523,7 +524,23 @@ TEST_CASE("gpu_to_gpu round-trip preserves bytes on N>=2 hosts (MGPU-04 + MGPU-0
   sirius::converter_registry::shutdown();
 }
 
-TEST_CASE("Internal query guard preserves transparent execution state",
+namespace {
+// Execute one statement and report success (used by the guard-isolation test).
+bool run_ok(duckdb::Connection& con, std::string const& sql)
+{
+  auto result = con.Query(sql);
+  return result != nullptr && !result->HasError();
+}
+}  // namespace
+
+// Successor of "Internal query guard preserves transparent execution state":
+// the capture lives on per-connection state with a planning generation, so
+// the properties to pin are (a) an internal query's lifecycle on ANOTHER
+// connection cannot disturb this connection's capture, and (b) a new planning
+// attempt on THIS connection structurally invalidates a leftover capture.
+// (The old per-query disabled_optimizers save/restore machinery is gone — the
+// mask is published once at extension load — so its assertions are retired.)
+TEST_CASE("Per-connection state isolates and expires the transparent capture",
           "[sirius][context][isolated_context]")
 {
   finally cleanup_env{[]() {
@@ -543,22 +560,68 @@ TEST_CASE("Internal query guard preserves transparent execution state",
   auto& client_ctx = *con.context;
   auto sirius_ctx  = client_ctx.registered_state->Get<duckdb::SiriusContext>("sirius_state");
   REQUIRE(sirius_ctx != nullptr);
+  auto conn_state = duckdb::get_sirius_connection_state(client_ctx);
+  REQUIRE(conn_state != nullptr);
 
-  auto plan = con.ExtractPlan("SELECT 42;");
-  REQUIRE(plan != nullptr);
-  sirius_ctx->set_captured_logical_plan(std::move(plan));
-
-  auto expected_disabled =
-    std::set<duckdb::OptimizerType>{duckdb::OptimizerType::COMPRESSED_MATERIALIZATION};
-  duckdb::DBConfig::GetConfig(client_ctx).options.disabled_optimizers = expected_disabled;
-  sirius_ctx->set_transparent_original_disabled_optimizers({duckdb::OptimizerType::IN_CLAUSE});
-
+  // (a) InternalQueryGuard isolation, verified through the REAL entry points
+  // and in BOTH directions: while guard(B) is alive, B's queries must not be
+  // taken over by transparent execution — but an UNRELATED connection A must
+  // proceed completely unaffected (the old SiriusContext-wide depth would
+  // suppress A too, so an instance-global regression fails this test). After
+  // the guard is gone, B's identical query IS taken over — proving the guard
+  // (and not some other condition) caused the suppression.
   {
-    duckdb::SiriusContext::InternalQueryGuard guard(*sirius_ctx);
-    sirius_ctx->QueryBegin(client_ctx);
-    sirius_ctx->QueryEnd(client_ctx);
+    duckdb::Connection internal_con(db);  // "B", the guarded connection
+    REQUIRE(run_ok(internal_con, "SET gpu_execution=true;"));
+    REQUIRE(run_ok(con, "SET gpu_execution=true;"));  // "A", unrelated
+    auto const before = sirius_ctx->get_transparent_execution_stats();
+    {
+      duckdb::SiriusContext::InternalQueryGuard guard(*internal_con.context);
+      // B guarded: suppressed.
+      REQUIRE(run_ok(internal_con, "SELECT 42;"));
+      auto const guarded = sirius_ctx->get_transparent_execution_stats();
+      REQUIRE(guarded.successful_rebinds == before.successful_rebinds);
+      REQUIRE(guarded.executions == before.executions);
+
+      // A while guard(B) is alive: exactly +1 — the guard does NOT leak to
+      // other connections.
+      REQUIRE(run_ok(con, "SELECT 42;"));
+      auto const cross = sirius_ctx->get_transparent_execution_stats();
+      REQUIRE(cross.successful_rebinds == before.successful_rebinds + 1);
+      REQUIRE(cross.executions == before.executions + 1);
+
+      // B again, still guarded: still suppressed.
+      REQUIRE(run_ok(internal_con, "SELECT 42;"));
+      auto const still_guarded = sirius_ctx->get_transparent_execution_stats();
+      REQUIRE(still_guarded.successful_rebinds == before.successful_rebinds + 1);
+      REQUIRE(still_guarded.executions == before.executions + 1);
+    }
+    // Guard released: B proceeds normally (+1 control).
+    REQUIRE(run_ok(internal_con, "SELECT 42;"));
+    auto const unguarded = sirius_ctx->get_transparent_execution_stats();
+    REQUIRE(unguarded.successful_rebinds == before.successful_rebinds + 2);
   }
 
-  REQUIRE(duckdb::DBConfig::GetConfig(client_ctx).options.disabled_optimizers == expected_disabled);
-  REQUIRE(sirius_ctx->take_captured_logical_plan() != nullptr);
+  // (b) Planning-generation expiry, driven by the REAL Prepare path (not by
+  // calling the generation helper directly): ExtractPlan leaves a capture; a
+  // plain Prepare of the SAME SQL with the optimizer disabled bumps the
+  // generation via DuckDB's CanRequestRebind loop WITHOUT producing a new
+  // capture (the optimizer hooks never run). Oracle: an implementation that
+  // WRONGLY consumes the stale capture records a successful rebind (+1) and
+  // also nulls the slot, so "capture is null" alone is ambiguous — the
+  // zero-rebind delta across the Prepare is the discriminating assertion.
+  auto plan = con.ExtractPlan("SELECT 42;");
+  REQUIRE(plan != nullptr);
+  conn_state->set_captured_plan(std::move(plan));
+
+  auto const before_prepare      = sirius_ctx->get_transparent_execution_stats();
+  auto& client_config            = duckdb::ClientConfig::GetConfig(client_ctx);
+  client_config.enable_optimizer = false;
+  auto prepared                  = con.Prepare("SELECT 42;");  // SAME SQL as the capture
+  client_config.enable_optimizer = true;
+  REQUIRE_FALSE(prepared->HasError());
+  auto const after_prepare = sirius_ctx->get_transparent_execution_stats();
+
+  REQUIRE(after_prepare.successful_rebinds == before_prepare.successful_rebinds);
+  REQUIRE(conn_state->take_captured_plan_if_current() == nullptr);
 }

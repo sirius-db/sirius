@@ -27,6 +27,7 @@ namespace {
 
 constexpr std::string_view kSchemeDelim = "://";
 constexpr std::string_view kFileScheme  = "file";
+constexpr std::string_view kS3Scheme    = "s3";
 
 [[noreturn]] void fail(std::string_view reason, std::string_view uri)
 {
@@ -124,6 +125,27 @@ std::string to_lower(std::string_view s)
 parsed_uri parse(std::string_view uri)
 {
   if (uri.empty()) fail("empty URI", uri);
+
+  // S3 object keys are literal: '%', '?', '#' are ordinary key bytes. Handle s3
+  // before the fragment strip / query split / percent-decode below (which would
+  // mutate the key) and return the raw key. Non-s3 schemes fall through unchanged.
+  if (auto delim = uri.find(kSchemeDelim);
+      delim != std::string_view::npos && delim > 0 && to_lower(uri.substr(0, delim)) == kS3Scheme) {
+    auto rest    = uri.substr(delim + kSchemeDelim.size());
+    auto slash   = rest.find('/');
+    auto host_sv = (slash == std::string_view::npos) ? rest : rest.substr(0, slash);
+    auto key_sv  = (slash == std::string_view::npos) ? std::string_view{} : rest.substr(slash);
+    if (host_sv.empty()) fail("empty host", uri);
+    // Strip exactly one bucket/key separator slash (S3 REST semantics, matching
+    // the general object-store branch); any further leading slashes are key bytes.
+    if (!key_sv.empty() && key_sv.front() == '/') key_sv.remove_prefix(1);
+    if (key_sv.empty()) fail("empty object key", uri);
+    parsed_uri s3;
+    s3.scheme = std::string{kS3Scheme};
+    s3.host   = std::string{host_sv};
+    s3.path   = std::string{key_sv};  // RAW literal key: no percent-decode.
+    return s3;
+  }
 
   // Strip fragment early: fragments have no semantics for object-store URIs.
   // Why: users may paste browser URLs; silent drop avoids noisy errors.

@@ -16,10 +16,11 @@
 
 #pragma once
 
+#include "data/data_repository_manager_registry.hpp"
 #include "exec/bounded_thread_pool.hpp"
 #include "exec/config.hpp"
-#include "exec/inspectable_mpsc.hpp"
 #include "exec/interruptible_mpmc.hpp"
+#include "exec/multi_index_priority_queue.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "parallel/task.hpp"
 
@@ -75,7 +76,7 @@ class downgrade_executor {
    * @brief Constructs a new downgrade_executor bound to a specific memory space.
    *
    * @param config Configuration for the thread pool (thread count, etc.)
-   * @param data_repo_mgr Reference to the data repository manager
+   * @param data_repo_registry Registry of every in-flight query's data repository manager
    * @param space_id The memory space this executor is responsible for downgrading FROM
    * @param memory_space Pointer to the memory space (for pressure queries; nullptr disables
    * monitor)
@@ -84,11 +85,12 @@ class downgrade_executor {
    */
   explicit downgrade_executor(
     exec::downgrade_executor_config config,
-    cucascade::shared_data_repository_manager& data_repo_mgr,
+    sirius::data::data_repository_manager_registry& data_repo_registry,
     cucascade::memory::memory_space_id space_id,
     cucascade::memory::memory_space* memory_space,
     sirius::memory::sirius_memory_reservation_manager& reservation_manager,
-    sirius::exec::inspectable_mpsc<sirius::parallel::itask>* pipeline_task_queue = nullptr);
+    sirius::exec::multi_index_priority_queue<sirius::parallel::itask>* pipeline_task_queue =
+      nullptr);
 
   ~downgrade_executor();
 
@@ -137,7 +139,7 @@ class downgrade_executor {
    * @param pipeline_task_queue Pointer to the task_scheduler's task queue
    */
   void set_pipeline_task_queue(
-    sirius::exec::inspectable_mpsc<sirius::parallel::itask>* pipeline_task_queue);
+    sirius::exec::multi_index_priority_queue<sirius::parallel::itask>* pipeline_task_queue);
 
   /**
    * @brief Asynchronously request a predicate-driven downgrade.
@@ -198,12 +200,14 @@ class downgrade_executor {
   std::mutex _monitor_cv_mutex;
   std::condition_variable _monitor_cv;
 
-  cucascade::shared_data_repository_manager& _data_repo_mgr;
+  /// Every in-flight query's repository manager. Memory pressure is a global condition, so
+  /// spill candidates are drawn from across all live queries, not just one.
+  sirius::data::data_repository_manager_registry& _data_repo_registry;
   cucascade::memory::memory_space_id _space_id;
   cucascade::memory::memory_space* _memory_space;
   std::string _source_label;
   sirius::memory::sirius_memory_reservation_manager& _reservation_manager;
-  sirius::exec::inspectable_mpsc<sirius::parallel::itask>* _pipeline_task_queue{nullptr};
+  sirius::exec::multi_index_priority_queue<sirius::parallel::itask>* _pipeline_task_queue{nullptr};
 };
 
 }  // namespace parallel

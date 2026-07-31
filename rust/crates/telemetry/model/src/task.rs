@@ -73,6 +73,9 @@ state! {
 }
 
 state! {
+    // reservation: the processing space (memory reservation) this task holds
+    // while it materializes inputs and computes, on the per-device tier
+    // resource.
     Preparing {
         attributes: {
             origin_tier: String,
@@ -81,18 +84,23 @@ state! {
         },
         usages: {
             executor_thread: ExecutorThread,
+            reservation: crate::batch::MemoryTier,
         },
     }
 }
 
 state! {
+    // peak_allocated_bytes: allocator peak on this task's stream at the moment
+    // this operator started (i.e. after the previous operator finished).
     Computing {
         attributes: {
             current_operator_id: u32,
             input_bytes: u64,
+            peak_allocated_bytes: u64,
         },
         usages: {
             executor_thread: ExecutorThread,
+            reservation: crate::batch::MemoryTier,
         },
     }
 }

@@ -193,12 +193,26 @@ leading whitespace, case-insensitive) starts with `select ` or `with `.
 Skipped: ATTACH, USE, SET, CREATE VIEW, CREATE TABLE, BEGIN, COMMIT, LOAD,
 INSTALL, DROP, COPY, CALL, RESET, INSERT, …
 
+## Keyed execution windows (SHAPE 1.7)
+
+Current logs carry a correlation key on every execution-window line:
+`[window] begin/end instance=<ptr> connection=<N> window=<N> query=<N>
+outcome=<ok|unwind|cleanup_failed|begin_failed|->`, and the pool/SQL lines
+inside a window repeat the same key. When `[window]` lines are present the
+segmenter pairs segments by `(instance, connection, window)` — the
+authoritative boundary — and joins the SQL by `(instance, connection, query)`.
+`QuerySegment` then exposes `instance`, `connection_id`, `window_id`,
+`query_id` and `outcome`. `verify_query_lifecycle_segments.py` runs a
+concurrent two-connection scenario against the real engine and cross-checks
+the segmenter's output line-by-line against a raw parse of the same log.
+
 ## Incomplete queries
 
 A `QueryBegin` with no matching `QueryEnd` (log truncated, crash) is still
-parsed with `status="incomplete"` in `query_meta.json` and `_index.csv`. The
-matching for QueryEnd stops at the next QueryBegin to avoid swallowing the
-following query.
+parsed with `status="incomplete"` in `query_meta.json` and `_index.csv`. On
+keyed logs an incomplete window is capped at the next window-begin; on legacy
+keyless logs the positional matching for QueryEnd stops at the next QueryBegin
+to avoid swallowing the following query.
 
 ## Format drift detection
 

@@ -23,7 +23,7 @@ using sirius::io::parse;
 
 TEST_CASE("uri_parser parses bare absolute paths as file URIs", "[uri_parser]")
 {
-  auto parsed = parse("/tmp/sirius%20data.parquet?version=1&flag");
+  auto parsed = parse("/tmp/sirius%20data.parquet?version=1&flag#ignored");
 
   CHECK(parsed.scheme == "file");
   CHECK(parsed.host.empty());
@@ -35,23 +35,54 @@ TEST_CASE("uri_parser parses bare absolute paths as file URIs", "[uri_parser]")
 
 TEST_CASE("uri_parser parses file scheme with absolute path", "[uri_parser]")
 {
-  auto parsed = parse("file:///var/data/table.parquet");
+  auto parsed = parse("file:///var/data/table%20one.parquet?version=1#ignored");
 
   CHECK(parsed.scheme == "file");
   CHECK(parsed.host.empty());
-  CHECK(parsed.path == "/var/data/table.parquet");
+  CHECK(parsed.path == "/var/data/table one.parquet");
+  REQUIRE(parsed.query.size() == 1);
+  CHECK(parsed.query.at("version") == "1");
+}
+
+TEST_CASE("uri_parser treats S3 object keys as literal bytes", "[uri_parser][s3]")
+{
+  auto parsed = parse("s3://bkt/a%20b");
+
+  CHECK(parsed.scheme == "s3");
+  CHECK(parsed.host == "bkt");
+  CHECK(parsed.path == "a%20b");
   CHECK(parsed.query.empty());
 }
 
-TEST_CASE("uri_parser parses object-store URIs", "[uri_parser]")
+TEST_CASE("uri_parser keeps query and fragment delimiters inside S3 keys", "[uri_parser][s3]")
 {
-  auto parsed = parse("S3://bucket-name//path/to/object%20one.parquet?region=us-west-2");
+  auto query_key = parse("s3://bkt/k?region=x");
+  CHECK(query_key.path == "k?region=x");
+  CHECK(query_key.query.empty());
 
+  auto fragment_key = parse("s3://bkt/k#frag");
+  CHECK(fragment_key.path == "k#frag");
+  CHECK(fragment_key.query.empty());
+
+  auto empty_query_key = parse("s3://bkt/key?=value");
+  CHECK(empty_query_key.path == "key?=value");
+  CHECK(empty_query_key.query.empty());
+}
+
+TEST_CASE("uri_parser accepts malformed percent sequences as literal S3 key bytes",
+          "[uri_parser][s3]")
+{
+  CHECK(parse("s3://bkt/key%ZZ").path == "key%ZZ");
+  CHECK(parse("s3://bkt/key%A").path == "key%A");
+}
+
+TEST_CASE("uri_parser applies the literal S3 path to uppercase schemes", "[uri_parser][s3]")
+{
+  auto parsed = parse("S3://bkt/a%20b");
   CHECK(parsed.scheme == "s3");
-  CHECK(parsed.host == "bucket-name");
-  CHECK(parsed.path == "/path/to/object one.parquet");
-  REQUIRE(parsed.query.size() == 1);
-  CHECK(parsed.query.at("region") == "us-west-2");
+  CHECK(parsed.host == "bkt");
+  CHECK(parsed.path == "a%20b");
+  CHECK(parsed.query.empty());
 }
 
 TEST_CASE("uri_parser preserves S3 leading slashes in object key", "[uri_parser]")
@@ -67,22 +98,28 @@ TEST_CASE("uri_parser preserves S3 leading slashes in object key", "[uri_parser]
 
 TEST_CASE("uri_parser accepts project-internal schemes", "[uri_parser]")
 {
-  auto parsed = parse("rdma_s3://bucket/key");
+  auto parsed = parse("rdma_s3://bucket/a%20b?x=1#ignored");
 
   CHECK(parsed.scheme == "rdma_s3");
   CHECK(parsed.host == "bucket");
-  CHECK(parsed.path == "key");
-}
-
-TEST_CASE("uri_parser strips fragments before parsing", "[uri_parser]")
-{
-  auto parsed = parse("s3://bucket/key.parquet?x=1#ignored");
-
-  CHECK(parsed.scheme == "s3");
-  CHECK(parsed.host == "bucket");
-  CHECK(parsed.path == "key.parquet");
+  CHECK(parsed.path == "a b");
   REQUIRE(parsed.query.size() == 1);
   CHECK(parsed.query.at("x") == "1");
+}
+
+TEST_CASE("uri_parser leaves non-S3 object-store URI semantics unchanged", "[uri_parser]")
+{
+  for (auto const scheme : {"gs", "azure", "http", "https"}) {
+    DYNAMIC_SECTION("scheme=" << scheme)
+    {
+      auto parsed = parse(std::string{scheme} + "://bkt/a%20b?x=1#ignored");
+      CHECK(parsed.scheme == scheme);
+      CHECK(parsed.host == "bkt");
+      CHECK(parsed.path == "a b");
+      REQUIRE(parsed.query.size() == 1);
+      CHECK(parsed.query.at("x") == "1");
+    }
+  }
 }
 
 TEST_CASE("uri_parser query parser decodes values and keeps last duplicate", "[uri_parser]")
@@ -103,7 +140,4 @@ TEST_CASE("uri_parser rejects malformed input", "[uri_parser]")
   CHECK_THROWS_AS(parse("file://relative/path"), std::invalid_argument);
   CHECK_THROWS_AS(parse("s3://bucket"), std::invalid_argument);
   CHECK_THROWS_AS(parse("s3://bucket/"), std::invalid_argument);
-  CHECK_THROWS_AS(parse("s3://bucket/key?=value"), std::invalid_argument);
-  CHECK_THROWS_AS(parse("s3://bucket/key%ZZ"), std::invalid_argument);
-  CHECK_THROWS_AS(parse("s3://bucket/key%A"), std::invalid_argument);
 }

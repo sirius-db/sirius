@@ -88,6 +88,7 @@ static void from_yaml(const YAML::Node& node, creator::task_creator_config& opt)
   r.optional("thread_name_prefix", opt.thread_pool.thread_name_prefix);
   r.optional("cpu_affinity", opt.thread_pool.cpu_affinity_list);
   r.optional("strategy", opt.strategy);
+  r.optional("priority_order", opt.priority);
   r.reject_unknown();
 }
 
@@ -194,6 +195,7 @@ static void from_yaml(const YAML::Node& node, operator_params& opt)
   r.optional("concat_batch_bytes", yaml::bytes(opt.concat_batch_bytes));
   r.optional("sort_sample_bytes", yaml::bytes(opt.sort_sample_bytes));
   r.optional("max_build_hash_table_bytes", yaml::bytes(opt.max_build_hash_table_bytes));
+  r.optional("max_broadcast_join_size", yaml::bytes(opt.max_broadcast_join_size));
   r.optional("mark_join_build_switch_ratio", opt.mark_join_build_switch_ratio);
   r.optional("enable_dynamic_filter_pushdown", opt.enable_dynamic_filter_pushdown);
   r.optional("enable_dynamic_zone_map_filter", opt.enable_dynamic_zone_map_filter);
@@ -208,8 +210,20 @@ static void from_yaml(const YAML::Node& node, telemetry_config& opt)
 {
   yaml::reader r(node, "telemetry");
   r.optional("enable_quent", opt.enable_quent);
+  r.optional("enable_batch_events", opt.enable_batch_events);
   r.optional("output_directory", opt.output_directory);
   r.optional("engine_name", opt.engine_name);
+  r.reject_unknown();
+}
+
+static void from_yaml(const YAML::Node& node, compression_config& opt)
+{
+  yaml::reader r(node, "compression");
+  r.optional("enable_pin_table_compression", opt.enable_pin_table_compression);
+  r.optional("min_batch_size_bytes", yaml::bytes(opt.min_batch_size_bytes));
+  r.optional("max_compressed_fraction", opt.max_compressed_fraction);
+  r.optional("input_plan_dir", opt.input_plan_dir);
+  r.optional("column_threads", opt.column_threads, yaml::greater_than<int>{0});
   r.reject_unknown();
 }
 
@@ -457,6 +471,9 @@ void sirius_config::load_from_file(const std::filesystem::path& config_path)
 
     // Telemetry
     if (auto n = r.optional_node("telemetry")) { sirius::from_yaml(*n, _telemetry_config); }
+
+    // Compression
+    if (auto n = r.optional_node("compression")) { sirius::from_yaml(*n, _compression_config); }
 
     // Explicit space configs (low-level API)
     std::vector<cucascade::memory::gpu_memory_space_config> gpu_space_configs;

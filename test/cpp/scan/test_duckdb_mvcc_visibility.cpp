@@ -483,6 +483,91 @@ TEST_CASE("mvcc visibility: any_update_chains flags updated columns only",
   exec_ok(*env.con, "ROLLBACK");
 }
 
+TEST_CASE("mvcc visibility: any_uncheckpointed_appends flags transient segments only",
+          "[duckdb_mvcc_visibility][scan]")
+{
+  vis_test_db env;
+  exec_ok(*env.con,
+          "CREATE TABLE t AS SELECT range::INTEGER AS k, range::INTEGER AS v FROM range(10000)");
+  exec_ok(*env.con, "CHECKPOINT");
+
+  std::vector<duckdb::storage_t> const both{0, 1};
+
+  // Checkpointed image: everything persistent.
+  exec_ok(*env.con, "BEGIN TRANSACTION");
+  REQUIRE_FALSE(any_uncheckpointed_appends(resolve_storage(*env.con, "t"), both));
+  exec_ok(*env.con, "ROLLBACK");
+
+  // A committed small append lands as transient segments.
+  exec_ok(*env.con, "INSERT INTO t VALUES (10000, 10000)");
+  exec_ok(*env.con, "BEGIN TRANSACTION");
+  REQUIRE(any_uncheckpointed_appends(resolve_storage(*env.con, "t"), both));
+  exec_ok(*env.con, "ROLLBACK");
+
+  // CHECKPOINT folds the append into the persistent image.
+  exec_ok(*env.con, "CHECKPOINT");
+  exec_ok(*env.con, "BEGIN TRANSACTION");
+  REQUIRE_FALSE(any_uncheckpointed_appends(resolve_storage(*env.con, "t"), both));
+  exec_ok(*env.con, "ROLLBACK");
+
+  // Deletes carry version state but no transient segments.
+  exec_ok(*env.con, "DELETE FROM t WHERE rowid < 10");
+  exec_ok(*env.con, "BEGIN TRANSACTION");
+  REQUIRE_FALSE(any_uncheckpointed_appends(resolve_storage(*env.con, "t"), both));
+  exec_ok(*env.con, "ROLLBACK");
+
+  // A bulk insert (>= one row group) is optimistically flushed by MergeStorage
+  // as persistent, checkpoint-shaped segments; deliberately not flagged.
+  vis_test_db bulk_env;
+  exec_ok(*bulk_env.con, "CREATE TABLE tb(k INTEGER)");
+  exec_ok(*bulk_env.con, "INSERT INTO tb SELECT range::INTEGER FROM range(130000)");
+  std::vector<duckdb::storage_t> const one{0};
+  exec_ok(*bulk_env.con, "BEGIN TRANSACTION");
+  REQUIRE_FALSE(any_uncheckpointed_appends(resolve_storage(*bulk_env.con, "tb"), one));
+  exec_ok(*bulk_env.con, "ROLLBACK");
+}
+
+TEST_CASE("mvcc visibility: checkpoint-grown row groups fill at unaligned offsets",
+          "[duckdb_mvcc_visibility][scan]")
+{
+  vis_test_db env;
+  // Checkpoint, append, checkpoint again: the vacuum leaves the large first
+  // row group alone, so the append keeps its own row group and the second
+  // slice starts at unaligned chunk offset 50000 (50000 % 32 == 16).
+  exec_ok(*env.con, "CREATE TABLE t AS SELECT range::INTEGER AS k FROM range(50000)");
+  exec_ok(*env.con, "CHECKPOINT");
+  exec_ok(*env.con, "INSERT INTO t SELECT range::INTEGER + 50000 FROM range(100)");
+  exec_ok(*env.con, "CHECKPOINT");
+  // Straddle the row-group boundary and both edges of the shared mask word.
+  exec_ok(*env.con, "DELETE FROM t WHERE k IN (49995, 49999, 50000, 50001, 50031, 50032)");
+
+  constexpr std::size_t kTotal = 50100;
+  exec_ok(*env.con, "BEGIN TRANSACTION");
+  auto& storage = resolve_storage(*env.con, "t");
+  auto metadata = make_metadata(*env.con, storage, /*rgs_per_chunk=*/8);
+  REQUIRE(metadata.base_row_count_per_chunk == std::vector<std::size_t>{kTotal});
+
+  auto plan = capture_mvcc_visibility_plan(storage, *env.con->context, metadata);
+  REQUIRE(plan.mvcc_row_groups.size() == 1);
+  REQUIRE(plan.mvcc_row_groups[0].size() == 2);
+  REQUIRE(plan.mvcc_row_groups[0][1].chunk_offset == 50000);  // unaligned by design
+
+  std::vector<std::uint32_t> words((kTotal + 31) / 32, 0u);
+  bool const dropped =
+    fill_keep_mask_for_row_groups(plan.mvcc_row_groups[0], plan.transaction, words);
+  REQUIRE(dropped);
+
+  auto visible = visible_rowids(*env.con, "t", kTotal);
+  for (std::size_t i = 0; i < kTotal; ++i) {
+    bool const kept = ((words[i / 32] >> (i % 32)) & 1u) != 0;
+    if (kept != visible[i]) {
+      INFO("rowid " << i);
+      REQUIRE(kept == static_cast<bool>(visible[i]));
+    }
+  }
+  exec_ok(*env.con, "ROLLBACK");
+}
+
 TEST_CASE("mvcc visibility: fused native-read check is precise where the probe is conservative",
           "[duckdb_mvcc_visibility][scan]")
 {

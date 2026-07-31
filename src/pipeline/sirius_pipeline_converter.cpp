@@ -30,6 +30,7 @@
 #include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_operator_type.hpp"
 #include "op/sirius_physical_partition.hpp"
+#include "pipeline/repository_wiring.hpp"
 
 #include <algorithm>
 #include <functional>
@@ -61,6 +62,11 @@ pipeline_conversion_result sirius_pipeline_converter::convert(sirius_meta_pipeli
   // Must run after finalize_pipeline_structure (populates `dependencies`) and after
   // link_join_partition_siblings (reads dependencies[0]/[1] positionally pre-reorder).
   reorder_pipelines_topologically(scheduled_);
+
+  // Number the operators now that the pipeline set is final and topologically ordered. This is
+  // the one point every caller shares — the engine, and the plan-inspection paths that convert
+  // without building an engine — so no consumer can observe an unnumbered plan.
+  assign_operator_ids(scheduled_);
 
   return {std::move(scheduled_), std::move(repository_wirings_), meta_pipeline_count_};
 }
@@ -230,6 +236,18 @@ op::MemoryBarrierType sirius_pipeline_converter::resolve_barrier(
     if (!partition.is_build_partition() && join_feeder && !right_family_full) {
       return op::MemoryBarrierType::PARTIAL;
     }
+  }
+  // A CONCAT feeding a HASH_JOIN drives the join's own "build"/"default" input ports. Make those
+  // ports PARTIAL so the join consumes build and probe batches progressively (partial barrier)
+  // rather than waiting (via the base FULL-barrier hint) for both upstream pipelines to finish. The
+  // hash join's overridden get_next_task_hint / get_next_task_input_data schedule per-partition
+  // build x probe pairs as batches arrive; the concat still folds whichever side must be seen whole
+  // (LEFT/SEMI/ANTI -> build, RIGHT-family -> probe, OUTER -> both) to a single batch, so results
+  // stay correct for every join type. BUILD_PROBE mode is unaffected (it overrides its hint
+  // regardless of the port barrier). See docs/super-sirius/operators.md.
+  if (sink.type == T::CONCAT && sink.get_parent_op() &&
+      sink.get_parent_op()->type == T::HASH_JOIN) {
+    return op::MemoryBarrierType::PARTIAL;
   }
   return op::MemoryBarrierType::FULL;
 }
@@ -462,21 +480,26 @@ void sirius_pipeline_converter::link_join_partition_siblings()
 
 void sirius_pipeline_converter::configure_partition_min_partitions()
 {
-  // Pull num_gpus from the build context (populated from sirius_engine's
-  // hardware topology at convert time). Single-GPU runs keep the default
-  // min of 1 (no-op). For multi-GPU we force a floor equal to num_gpus on
-  // big-enough inputs; small_table_bytes keeps tiny aggregations on a
-  // single GPU to avoid cross-device overhead.
+  // Pull num_gpus from the build context (populated from sirius_engine's hardware topology at
+  // convert time). Single-GPU runs keep the consumer default of 1 (no-op). For multi-GPU we hand
+  // num_gpus to each partition's downstream sizing consumer, which derives the partition floor and
+  // small-table threshold internally (see natural_num_partitions / partition_small_table_bytes) and
+  // lets joins keep one hash table per partition so BUILD_PROBE is admitted for up to num_gpus
+  // partitions rather than only one.
   const int num_gpus = build_ctx_.num_gpus();
   if (num_gpus <= 1) return;
-  // Heuristic threshold: below ~16 MiB per GPU the partition overhead
-  // dominates. Configurable later if we find a workload where this matters.
-  const uint64_t small_table_bytes = static_cast<uint64_t>(num_gpus) * uint64_t{16} * 1024 * 1024;
 
   auto apply_to_op = [&](op::sirius_physical_operator* op) {
-    if (op && op->type == op::SiriusPhysicalOperatorType::PARTITION) {
-      static_cast<op::sirius_physical_partition*>(op)->set_min_num_partitions(num_gpus,
-                                                                              small_table_bytes);
+    if (!op) return;
+    if (op->type != op::SiriusPhysicalOperatorType::PARTITION) return;
+    auto* partition_op = static_cast<op::sirius_physical_partition*>(op);
+    // The active GPU id list lets broadcast partitioning map a probe batch's residence GPU to its
+    // partition slot (inverse of task_creator's partition_idx -> GPU routing).
+    partition_op->set_active_gpu_ids(build_ctx_.active_gpu_ids());
+    // Inform the downstream sizing consumer (hash join / NLJ / merge) of the GPU count.
+    if (auto* consumer = dynamic_cast<op::sirius_physical_partition_consumer_operator*>(
+          partition_op->get_downstream_consumer_op())) {
+      consumer->set_num_gpus(num_gpus);
     }
   };
   for (auto& pipe : scheduled_) {
@@ -508,8 +531,8 @@ std::string dump_barrier_name(op::MemoryBarrierType b)
 //! Scan identity: serialize what the ingestible will scan, so a conversion that drops
 //! identity fields (e.g. the duckdb-native pin-cache qualified name, or a parquet file
 //! list) fails the dump byte-diff instead of passing on an identical operator-type chain.
-//! Conversion-time only: table_info is still parked on the operator (scan_manager takes it
-//! at prepare_for_query).
+//! The operator owns its ingestible for the whole query, so this reads the same table_info
+//! the scan manager later matches against pinned entries.
 void dump_scan_identity(std::ostringstream& out, const op::sirius_physical_operator& op)
 {
   if (op.type != op::SiriusPhysicalOperatorType::GPU_SCAN) { return; }

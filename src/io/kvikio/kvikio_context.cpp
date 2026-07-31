@@ -43,7 +43,7 @@ std::shared_ptr<sirius_io_object> kvikio_context::create_io_object(std::string p
   // cudf::io::datasource::create returns a unique_ptr; promote to shared_ptr
   // so the kvikio_io_object can expose access without transferring
   // ownership (the io_object outlives any single sirius_datasource we hand
-  // back from make_datasource).
+  // back from open_datasource).
   std::shared_ptr<cudf::io::datasource> ds = cudf::io::datasource::create(path);
   auto const file_size                     = ds->size();
   return std::make_shared<kvikio_io_object>(std::move(path), std::move(ds), file_size);

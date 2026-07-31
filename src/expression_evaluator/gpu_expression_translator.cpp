@@ -579,9 +579,11 @@ std::optional<expr_ref> gpu_expression_translator::add_expression(
   // Resolve the cuDF operator once up front rather than re-checking per child.
   cudf::ast::ast_operator cudf_op{};
   using enum sirius::ast::conjunction::kind;
+  // SQL AND/OR use Kleene three-valued logic (TRUE OR NULL = TRUE), so use cuDF's
+  // NULL_LOGICAL_* operators rather than the null-propagating LOGICAL_*.
   switch (alt.op) {
-    case op_and: cudf_op = cudf::ast::ast_operator::LOGICAL_AND; break;
-    case op_or: cudf_op = cudf::ast::ast_operator::LOGICAL_OR; break;
+    case op_and: cudf_op = cudf::ast::ast_operator::NULL_LOGICAL_AND; break;
+    case op_or: cudf_op = cudf::ast::ast_operator::NULL_LOGICAL_OR; break;
     default:
       SIRIUS_LOG_DEBUG("[expression_translator] Unsupported conjunction type: {}",
                        static_cast<int>(alt.op));

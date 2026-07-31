@@ -29,6 +29,7 @@
 
 #include <array>
 #include <atomic>
+#include <limits>
 #include <list>
 #include <memory>
 #include <optional>
@@ -124,7 +125,8 @@ class operator_data {
    *
    * Used by memory estimation in sirius_gpu_scan_operator to distinguish a
    * pass-through over an already-resident batch from a fresh decode that
-   * still needs allocation. Overridden by scan_operator_with_pinned_table_input.
+   * still needs allocation. Overridden by @c scan_operator_input, which reports
+   * true when it holds a resident batch.
    */
   [[nodiscard]] virtual bool is_resident() const noexcept { return false; }
 
@@ -372,20 +374,19 @@ struct input_stats {
 class sirius_physical_operator {
  public:
   static constexpr const SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::INVALID;
-  //! Static counter for generating unique operator IDs
-  static inline std::atomic<size_t> next_operator_id{0};
+  //! Sentinel for `operator_id` before `pipeline::assign_operator_ids` numbers the plan.
+  //! Operators are constructed without an id so that two queries can build their plans
+  //! concurrently; ids are stamped in a single pass once the plan is complete.
+  static constexpr size_t invalid_operator_id = std::numeric_limits<size_t>::max();
 
  public:
   sirius_physical_operator(SiriusPhysicalOperatorType type,
                            duckdb::vector<sirius::logical_type> types,
                            std::size_t estimated_cardinality)
-    : type(type),
-      types(std::move(types)),
-      estimated_cardinality(estimated_cardinality),
-      operator_id(next_operator_id++)
+    : type(type), types(std::move(types)), estimated_cardinality(estimated_cardinality)
   {
   }
-  sirius_physical_operator() : operator_id(next_operator_id++) {}
+  sirius_physical_operator() {}
   virtual ~sirius_physical_operator() {}
 
   //! The physical operator type. Default-initialized to INVALID for the test-only default
@@ -398,8 +399,10 @@ class sirius_physical_operator {
   duckdb::vector<sirius::logical_type> types;
   //! The estimated cardinality of this physical operator
   std::size_t estimated_cardinality;
-  //! The unique ID of this operator (auto-incremented at creation)
-  size_t operator_id;
+  //! The unique ID of this operator within its query. Stamped by
+  //! `pipeline::assign_operator_ids` after plan construction completes; read it through
+  //! `get_operator_id()`, which rejects the unassigned sentinel.
+  size_t operator_id = invalid_operator_id;
 
   //! Lock for concurrent access to operator state
   std::mutex lock;
@@ -418,8 +421,23 @@ class sirius_physical_operator {
   //! Return a vector of the types that will be returned by this operator
   const duckdb::vector<sirius::logical_type>& get_types() const { return types; }
 
-  //! Get the unique operator ID
-  size_t get_operator_id() const { return operator_id; }
+  //! Get the unique operator ID.
+  //! Throws if the plan was not numbered by `pipeline::assign_operator_ids`. An unassigned
+  //! id would otherwise silently collide in the operator-id-keyed maps (repositories,
+  //! task-creator global states) and mis-route data, so this fails loudly in every build.
+  size_t get_operator_id() const
+  {
+    if (operator_id == invalid_operator_id) {
+      throw sirius::internal_exception(
+        "sirius_physical_operator::get_operator_id: operator '{}' has no id assigned; "
+        "pipeline::assign_operator_ids must run over the plan before execution",
+        get_name());
+    }
+    return operator_id;
+  }
+
+  //! Whether this operator has been numbered yet.
+  [[nodiscard]] bool has_operator_id() const noexcept { return operator_id != invalid_operator_id; }
 
   //! Bundle this operator's telemetry attribution (context + producing pipeline)
   //! for passing to the data_batch factories. Returns {nullptr, nil-UUID} if this

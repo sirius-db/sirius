@@ -68,7 +68,7 @@ class scan_operator_input;
  * on each split it pulls off its connector.
  *
  * Implementations today: @c parquet_gpu_ingestible,
- * @c duckdb_native_gpu_ingestible, @c cached_parquet_gpu_ingestible.
+ * @c duckdb_native_gpu_ingestible.
  */
 class gpu_ingestible : public std::enable_shared_from_this<gpu_ingestible> {
  public:
@@ -111,10 +111,11 @@ class gpu_ingestible : public std::enable_shared_from_this<gpu_ingestible> {
    * @brief Materialize the cudf table for one split. Called by
    *        @c sirius_gpu_scan_operator::execute on the task-local stream.
    *
-   * @p mem_space carries both the allocator (via
-   * @c get_default_allocator) and the device_id used to select a per-GPU
-   * sirius_ioctx for the read — implementations route the read through
-   * that ioctx so per-GPU CUDA contexts bind correctly.
+   * @param mem_space Destination memory space for decoded columns.
+   *
+   * Implementations allocate through this space's allocator. The caller must
+   * make its device current before calling this method. I/O uses the datasource
+   * attached to the scan metadata.
    */
   virtual filtered_table materialize_metadata_to_table(
     const scan_info& info,
@@ -123,9 +124,9 @@ class gpu_ingestible : public std::enable_shared_from_this<gpu_ingestible> {
 
   /**
    * @brief Apply post-decode filter and/or projection to the materialized
-   *        table. Called by @c sirius_gpu_scan_operator::execute when the
-   *        split carries a non-null @ref post_filter_and_projection_info,
-   *        or when a pinned-cache batch needs filter/assembly.
+   *        table. Called by @c sirius_gpu_scan_operator::execute whenever
+   *        @ref materialize_metadata_to_table did not return
+   *        @c filter_state::ROW_FILTERED_AND_PROJECTED.
    *
    * Takes the input by owning unique_ptr so implementations that call
    * @c assemble_scan_output (which consumes its input by rvalue) can
