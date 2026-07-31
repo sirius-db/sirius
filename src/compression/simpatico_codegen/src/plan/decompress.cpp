@@ -3,6 +3,7 @@
 #include "codegen/codegen_bridge.hpp"
 #include "codegen/plan/bitjoin_layout.hpp"
 #include "codegen/plan/plan_interpreter.hpp"
+#include "codegen/plan/validity.hpp"
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/copying.hpp>
@@ -804,7 +805,13 @@ std::unique_ptr<cudf::column> decompress_column(PlanTree const& tree,
   }
 
   DecodeWalk walk{tree, stream, mr, error_out};
-  return walk.run();
+  auto col = walk.run();
+  if (!col) return nullptr;
+
+  // Reattach the validity the compress side detached. The walk itself decodes a
+  // null-free column, so this is the only place the mask re-enters the picture.
+  attach_validity(*col, tree.validity, stream, mr);
+  return col;
 }
 
 }  // namespace simpatico

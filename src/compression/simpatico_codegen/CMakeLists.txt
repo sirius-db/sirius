@@ -147,6 +147,7 @@ add_library(
   src/plan/operator_registry.cpp
   src/plan/representation_factory.cpp
   src/plan/bitjoin_layout.cpp
+  src/plan/validity.cpp
   src/plan/compress.cpp
   src/plan/decompress.cpp
   src/util/stream_pool.cpp
