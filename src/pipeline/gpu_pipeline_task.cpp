@@ -19,6 +19,7 @@
 #include "cudf/cudf_utils.hpp"
 #include "log/logging.hpp"
 #include "memory/defragmenter_oom_policy.hpp"
+#include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "op/scan/sirius_gpu_scan_operator_data.hpp"
 #include "pipeline/oom_reschedule_exception.hpp"
 #include "telemetry/batch_telemetry.hpp"
@@ -669,9 +670,9 @@ pipeline::reservation_size_info gpu_pipeline_task::get_estimated_reservation_siz
   auto const* scan_input =
     ls._input_data ? dynamic_cast<const op::scan::scan_operator_input*>(ls._input_data.get())
                    : nullptr;
-  const bool input_needs_carrier_conversion =
+  const bool input_needs_scan_carrier_conversion =
     scan_input != nullptr && scan_input->needs_carrier_conversion;
-  const std::size_t input_conversion_destination_bytes =
+  const std::size_t input_scan_conversion_destination_bytes =
     scan_input != nullptr ? scan_input->conversion_destination_bytes : 0;
   auto working_set_bytes = input_basis;
   // Resident (cached) scan inputs report mask/filter copy peaks through their
@@ -681,6 +682,19 @@ pipeline::reservation_size_info gpu_pipeline_task::get_estimated_reservation_siz
     working_set_bytes = ls._input_data->get_estimated_working_set_size_in_bytes();
   }
 
+  std::size_t num_batches = 0;
+  if (auto* pd = dynamic_cast<const op::pipelineable_operator_data*>(ls._input_data.get())) {
+    num_batches = pd->get_data_batches().size();
+  }
+  const op::input_stats stats{
+    .num_batches                  = num_batches,
+    .bytes                        = input_basis,
+    .type                         = input_type,
+    .resident                     = input_resident,
+    .working_set_bytes            = working_set_bytes,
+    .needs_carrier_conversion     = input_needs_scan_carrier_conversion,
+    .conversion_destination_bytes = input_scan_conversion_destination_bytes};
+
   pipeline::reservation_size_info info;
   info.input_basis                = input_basis;
   info.bytes_to_materialize_input = bytes_to_materialize;
@@ -688,33 +702,26 @@ pipeline::reservation_size_info gpu_pipeline_task::get_estimated_reservation_siz
 
   if (peak_opt.has_value()) {
     info.peak_memory_estimate = *peak_opt;
-    // Non-resident scans keep the per-split decode floor even with history;
-    // resident (cached) scans trust the learned peak — their mask/filter
-    // model only seeds the cold start, and a warm undershoot is repaired by
-    // record_on_failure + retry.
+    // pipeline_memory_history may estimate below the current fresh batch's known decode working
+    // set.
     if (input_type == op::operator_data_type::GPU_SCAN && !input_resident) {
       info.peak_memory_estimate = std::max(info.peak_memory_estimate, working_set_bytes);
     }
-  } else {
-    std::size_t num_batches = 0;
-    if (auto* pd = dynamic_cast<const op::pipelineable_operator_data*>(ls._input_data.get())) {
-      num_batches = pd->get_data_batches().size();
+    // pipeline_memory_history keys estimates by input bytes, not carrier layout, so batches with
+    // the same byte basis can require different normalization casts.
+    if (input_resident && input_needs_scan_carrier_conversion) {
+      auto const conversion_floor =
+        op::scan::sirius_gpu_scan_operator::resident_carrier_conversion_peak_memory_estimate(stats);
+      info.peak_memory_estimate = std::max(info.peak_memory_estimate, conversion_floor);
     }
-    const op::input_stats stats{.num_batches                  = num_batches,
-                                .bytes                        = input_basis,
-                                .type                         = input_type,
-                                .resident                     = input_resident,
-                                .working_set_bytes            = working_set_bytes,
-                                .needs_carrier_conversion     = input_needs_carrier_conversion,
-                                .conversion_destination_bytes = input_conversion_destination_bytes};
-
+  } else {
     std::size_t max_estimate = 0;
     if (auto* pipeline = gs.get_pipeline()) {
       for (auto& op_ref : pipeline->get_operators()) {
         max_estimate = std::max(max_estimate, op_ref.get().no_history_peak_memory_estimate(stats));
       }
     }
-    // If every operator returned 0 (all pass-throughs), fall back to the 2× default.
+    // Preserve the task-level 2× fallback when no operator supplies a positive estimate.
     info.peak_memory_estimate = (max_estimate > 0) ? max_estimate : (input_basis * 2);
   }
 

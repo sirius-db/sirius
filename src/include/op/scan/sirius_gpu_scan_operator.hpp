@@ -69,6 +69,10 @@ class sirius_gpu_scan_operator : public sirius_physical_operator {
   static constexpr SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::GPU_SCAN;
 
   /**
+   * @brief Constructs a GPU scan source
+   *
+   * @throw sirius::internal_exception if an output type has no native cuDF carrier
+   *
    * @param types                  Output column types in plan order.
    * @param estimated_cardinality  Planner-estimated row count.
    * @param ingestible             Per-table source built by the plan generator.
@@ -112,13 +116,27 @@ class sirius_gpu_scan_operator : public sirius_physical_operator {
   [[nodiscard]] std::size_t no_history_peak_memory_estimate(
     const op::input_stats& stats) const override;
 
-  /// The carrier targets scan normalization holds this operator's output table to: the explicit
-  /// plan sidecar when one is installed, otherwise the native mapping of the output logical types.
-  /// Empty when no normalization runs at all (an output type with no cuDF mapping), in which case
-  /// normalize_physical_schema returns its input untouched. Read both by execute() and by
-  /// sirius_scan_manager::prepare_for_query, which resolves the pinned-cache provider's
-  /// per-column conversion targets from it, so the cast and its memory reservation cannot
-  /// disagree about which vector is authoritative.
+  /**
+   * @brief Estimate the peak required by a resident scan carrier conversion.
+   *
+   * The conversion destination coexists with the resident split's working set. Uses the exact
+   * destination size when the scan manager supplied one, otherwise the conservative maximum
+   * numeric-carrier expansion.
+   *
+   * @pre @p stats describes a resident scan input with @c needs_carrier_conversion set.
+   */
+  [[nodiscard]] static std::size_t resident_carrier_conversion_peak_memory_estimate(
+    const op::input_stats& stats) noexcept;
+
+  /**
+   * @brief Returns the complete carrier schema used to normalize scan output
+   *
+   * Selects the explicit physical schema when present and the native cuDF schema otherwise.
+   * `execute()` uses these targets when normalization is required, while
+   * `sirius_scan_manager::prepare_for_query()` uses them to account for resident conversions.
+   *
+   * @return One carrier target per logical output column, in output order
+   */
   [[nodiscard]] std::vector<cudf::data_type> const& normalization_targets() const noexcept
   {
     return has_physical_overrides() ? get_physical_types() : _native_physical_types;
@@ -134,8 +152,7 @@ class sirius_gpu_scan_operator : public sirius_physical_operator {
   /// Non-owning observer. The registered-state shared_ptr owns the context for
   /// at least as long as the query plan; unit-test operators may leave it null.
   duckdb::SiriusContext* _compressed_materialization_observer;
-  /// Native cuDF mapping of `types`, computed once at construction; empty when any output type
-  /// has no cuDF mapping. Immutable afterwards, so concurrent execute() calls read it safely.
+  /// Native cuDF carrier for each logical output column, in output order.
   std::vector<cudf::data_type> _native_physical_types;
 };
 

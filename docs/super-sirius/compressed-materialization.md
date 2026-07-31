@@ -498,37 +498,6 @@ full TPC-H suite with the feature off and on for both unpinned and host-pinned m
 medians and validate every query against DuckDB. Pinning must be repeated for each configuration so
 the cached representation matches the setting under test.
 
-The GB10 A/B pair differs only by `enable_compressed_materialization: true`. These commands run all
-22 queries for six iterations at the chosen scale factor and validate Sirius against DuckDB:
-
-```bash
-SF=<scale factor>
-
-# Unpinned control and treatment.
-pixi run bash test/tpch_performance/benchmark_and_validate.sh \
-  --config "$PWD/test/cpp/integration/integration-gb10.yaml" \
-  --parquet-dir "$PWD/test_datasets/tpch_parquet_sf$SF" \
-  --engines "sirius duckdb" --iterations 6 --timeout 3600 \
-  --pinning-mode none "$SF"
-pixi run bash test/tpch_performance/benchmark_and_validate.sh \
-  --config "$PWD/test/cpp/integration/integration-gb10-compressed-materialization.yaml" \
-  --parquet-dir "$PWD/test_datasets/tpch_parquet_sf$SF" \
-  --engines "sirius duckdb" --iterations 6 --timeout 3600 \
-  --pinning-mode none "$SF"
-
-# HOST-pinned control and treatment; per-query mode re-pins for each run.
-SIRIUS_PIN_TIER=host pixi run bash test/tpch_performance/benchmark_and_validate.sh \
-  --config "$PWD/test/cpp/integration/integration-gb10.yaml" \
-  --parquet-dir "$PWD/test_datasets/tpch_parquet_sf$SF" \
-  --engines "sirius duckdb" --iterations 6 --timeout 3600 \
-  --pinning-mode per-query "$SF"
-SIRIUS_PIN_TIER=host pixi run bash test/tpch_performance/benchmark_and_validate.sh \
-  --config "$PWD/test/cpp/integration/integration-gb10-compressed-materialization.yaml" \
-  --parquet-dir "$PWD/test_datasets/tpch_parquet_sf$SF" \
-  --engines "sirius duckdb" --iterations 6 --timeout 3600 \
-  --pinning-mode per-query "$SF"
-```
-
 Report the resulting warm medians alongside the run, not here: a design document that carries
 numbers invites reading them as a contract, and they are only meaningful against the machine,
 scale, and configuration that produced them.

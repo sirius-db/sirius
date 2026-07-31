@@ -346,6 +346,19 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
 }
 
 TEST_CASE_METHOD(plan_tree_shape_fixture,
+                 "plan tree shape - a scan without a complete native carrier schema is rejected",
+                 "[plan_tree_shape][isolated_context]")
+{
+  auto create = con->Query("CREATE TABLE mixed_schema (wide BIGINT, narrow DECIMAL(4,2))");
+  REQUIRE(create);
+  REQUIRE_FALSE(create->HasError());
+
+  REQUIRE_THROWS_WITH(generate_sirius_plan(*con, "SELECT wide, narrow FROM mixed_schema"),
+                      Catch::Contains("GPU scan output column 1 (DECIMAL(4,2)) has no native cuDF "
+                                      "carrier"));
+}
+
+TEST_CASE_METHOD(plan_tree_shape_fixture,
                  "plan tree shape - materialized sources are replaced by GPU_VALUES",
                  "[plan_tree_shape][isolated_context]")
 {

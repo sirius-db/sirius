@@ -706,6 +706,15 @@ class SiriusContextExtensionCallback : public ExtensionCallback {
   //! Called after an extension fails to load loading
   void OnExtensionLoadFail(DatabaseInstance& db, const string& name, const ErrorData& error) final;
 
+  /// \brief The configuration this callback read from sirius.yaml, or compiled defaults when no
+  ///        file was found.
+  ///
+  /// The constructor reads the file, so this is populated before InitialGPUConfigs registers the
+  /// extension options. Options whose value DuckDB stores per connection take their registered
+  /// default from here, which is what makes a YAML value the default every connection inherits
+  /// and reports through `current_setting`.
+  [[nodiscard]] const sirius::sirius_config& get_loaded_config() const noexcept { return config_; }
+
  private:
   void read_config_file_if_exists();
 
@@ -718,6 +727,17 @@ class SiriusContextExtensionCallback : public ExtensionCallback {
 /// Gates both plan-time and runtime fallback from GPU to DuckDB CPU. Set per
 /// connection via `SET enable_duckdb_fallback = ...`.
 bool duckdb_fallback_enabled(ClientContext& context);
+
+/// \brief Read the per-session `enable_compressed_materialization` setting.
+///
+/// DuckDB stores this value per connection, so it is the only authority on whether narrowing
+/// runs: planning and `CALL pin_table` both resolve it through here, against the context whose
+/// work they are doing. Reading it anywhere else would let one connection's `SET` decide another
+/// connection's behavior while `current_setting` still reported the old value.
+///
+/// The registered default carries the YAML value (see InitialGPUConfigs), so a
+/// `sirius.operator_params` entry is what a connection inherits until it sets its own.
+bool compressed_materialization_enabled(ClientContext& context);
 
 /// \brief Print the "GPU execution failed, falling back to DuckDB" banner.
 ///

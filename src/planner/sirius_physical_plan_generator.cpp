@@ -308,11 +308,24 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> make_gpu_scan_leaf(
   return leaf;
 }
 
+void require_complete_native_scan_schema(const sirius::op::sirius_physical_table_scan& scan)
+{
+  for (std::size_t column_idx = 0; column_idx < scan.types.size(); ++column_idx) {
+    auto const& type = scan.types[column_idx];
+    if (sirius::try_get_cudf_type(type)) { continue; }
+    throw duckdb::NotImplementedException(
+      "GPU scan output column %llu (%s) has no native cuDF "
+      "carrier",
+      static_cast<unsigned long long>(column_idx),
+      type.to_string());
+  }
+}
+
 //! Rewrite a TABLE_SCAN for `seq_scan` / `parquet_scan` / `read_parquet` /
 //! `sirius_read_parquet` (the internal S3 rewrite target): REPLACE the slot with the GPU
 //! leaf so it inherits the TABLE_SCAN's tree position and stays the source-leaf of the
-//! existing pipeline. Throws on unsupported scan functions (unreachable in practice —
-//! `create_plan(LogicalGet&)` declines them first, falling back to CPU).
+//! existing pipeline. Rejects unsupported scan functions and output types without a native cuDF
+//! carrier while plan construction can still trigger transparent CPU fallback.
 void wrap_table_scan_source(
   duckdb::unique_ptr<sirius::op::sirius_physical_operator>& table_scan_slot,
   const sirius::operator_params& op_params,
@@ -322,8 +335,11 @@ void wrap_table_scan_source(
   // a child layout the converter and downstream operators don't expect.
   if (!table_scan_slot->children.empty()) { return; }
 
-  auto& scan      = table_scan_slot->Cast<sirius::op::sirius_physical_table_scan>();
-  const auto& fn  = scan.function.name;
+  auto& scan     = table_scan_slot->Cast<sirius::op::sirius_physical_table_scan>();
+  const auto& fn = scan.function.name;
+  // GPU_SCAN normalization requires one target per output column. Reject an incomplete schema
+  // while transparent execution can still fall back to DuckDB.
+  require_complete_native_scan_schema(scan);
   auto sirius_ctx = context.registered_state
                       ? context.registered_state->Get<duckdb::SiriusContext>("sirius_state")
                       : nullptr;
@@ -732,11 +748,13 @@ void insert_gpu_pipeline_operators_recursive(
   }
 }
 
-bool compressed_materialization_enabled(duckdb::ClientContext& context)
+/// Whether this plan should carry narrow carriers: the connection's setting says so and the
+/// Sirius runtime that holds the plan sidecar is registered on the context.
+bool compressed_materialization_active(duckdb::ClientContext& context)
 {
   if (!context.registered_state) { return false; }
   auto state = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
-  return state && state->get_config().get_operator_params().enable_compressed_materialization;
+  return state != nullptr && duckdb::compressed_materialization_enabled(context);
 }
 
 }  // namespace
@@ -1007,7 +1025,7 @@ sirius_physical_plan_generator::create_plan(duckdb::unique_ptr<duckdb::LogicalOp
   profiler.EndPhase();
 
   plan = fold_adjacent_projections(std::move(plan));
-  if (compressed_materialization_enabled(context)) {
+  if (compressed_materialization_active(context)) {
     auto const retracted = apply_compressed_schema_passes(plan);
     if (retracted > 0) {
       auto sirius_ctx = context.registered_state

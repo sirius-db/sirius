@@ -255,6 +255,40 @@ TEST_CASE("gpu_execution - compressed materialization residency gate states end 
       require_ok(con.Query("CALL unpin_table('t');"), "unpin");
     }
 
+    SECTION("a SET on one connection decides only that connection")
+    {
+      // DuckDB scopes this setting per connection, so pinning and planning read it from the
+      // context doing the work. Mirroring it into the shared SiriusContext instead would let
+      // the SET below turn narrowing off for `other` too, while other's current_setting kept
+      // reporting true -- behavior and the reported value disagreeing.
+      auto other = local_env.make_connection();
+      require_ok(other.Query("SET enable_duckdb_fallback = false;"), "disable fallback on other");
+
+      require_ok(con.Query("SET enable_compressed_materialization = false;"), "flag off on con");
+
+      auto other_setting =
+        other.Query("SELECT current_setting('enable_compressed_materialization')::BOOLEAN;");
+      require_ok(other_setting, "read other's setting");
+      REQUIRE(other_setting->GetValue(0, 0).GetValue<bool>());
+
+      // The setting still describes what other actually does: its pin narrows.
+      auto const pin_before = sirius::test::get_compressed_materialization_stats(other);
+      auto pin =
+        other.Query("CALL pin_table('" + parquet_path.string() + "', tier='gpu', name='t');");
+      require_ok(pin, "pin_table from other");
+      auto const pin_after = sirius::test::get_compressed_materialization_stats(other);
+      REQUIRE(pin_after.pin_columns_narrowed > pin_before.pin_columns_narrowed);
+
+      // And con, which turned it off, still sees it off.
+      auto con_setting =
+        con.Query("SELECT current_setting('enable_compressed_materialization')::BOOLEAN;");
+      require_ok(con_setting, "read con's setting");
+      REQUIRE_FALSE(con_setting->GetValue(0, 0).GetValue<bool>());
+
+      require_ok(other.Query("CALL unpin_table('t');"), "unpin");
+      require_ok(con.Query("SET enable_compressed_materialization = true;"), "restore flag");
+    }
+
     SECTION("unpinned installs nothing")
     {
       // State 2: with no pinned entry the flag-on fresh scan is byte-identical

@@ -1287,7 +1287,9 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
 
   auto const& pin_op_params      = sirius_ctx->get_config().get_operator_params();
   bool const capture_chunk_stats = pin_op_params.enable_pinned_zone_map_pruning;
-  bool const compressed_pin      = pin_op_params.enable_compressed_materialization;
+  // Read from the connection running the CALL, so a table pins with the carriers that
+  // connection asked for rather than whatever another connection set last.
+  bool const compressed_pin = duckdb::compressed_materialization_enabled(context);
   if (!capture_chunk_stats && !compressed_pin) { pinned_column_types.clear(); }
 
   // Build the cache descriptor (table identity + column layout) from the
@@ -2095,19 +2097,19 @@ static void SetEnablePinnedZoneMapPruning(ClientContext& context, SetScope scope
                    params->enable_pinned_zone_map_pruning);
 }
 
-static void SetEnableCompressedMaterialization(ClientContext& context,
-                                               SetScope scope,
-                                               Value& parameter)
+static void SetEnableCompressedMaterialization(ClientContext& /*context*/,
+                                               SetScope /*scope*/,
+                                               Value& /*parameter*/)
 {
-  auto* params = get_operator_params(context);
-  if (!params) { return; }
-  auto slot                                 = lock_operator_params_slot(context);
-  params->enable_compressed_materialization = BooleanValue::Get(parameter);
-  SIRIUS_LOG_DEBUG("Updated config ENABLE_COMPRESSED_MATERIALIZATION to {}",
-                   params->enable_compressed_materialization);
+  // Deliberately empty: DuckDB has already stored the value on the connection that ran the SET
+  // by the time this hook runs. The hook exists only to copy that value somewhere else, and
+  // there is nowhere else it belongs — planning and pinning read it straight back with
+  // compressed_materialization_enabled(). A copy kept in shared state would answer for every
+  // connection, so one connection's SET would redirect another's scans while that connection's
+  // current_setting still reported the old value.
 }
 
-void SiriusExtension::InitialGPUConfigs(DBConfig& config)
+void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::operator_params& defaults)
 {
   // Add in config option for gpu buffer manager
   config.AddExtensionOption("use_pin_memory",
@@ -2401,13 +2403,14 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
     Value::BOOLEAN(sirius::operator_params{}.enable_pinned_zone_map_pruning),
     SetEnablePinnedZoneMapPruning);
 
+  // Default from the YAML-loaded params, so a sirius.yaml value is what connections inherit.
   config.AddExtensionOption(
     "enable_compressed_materialization",
     "Keep eligible integer and fixed-point DECIMAL columns in value-preserving narrow cuDF "
     "carriers selected from exact pin-time bounds; restore native carriers at type-sensitive "
     "boundaries (on by default)",
     LogicalType::BOOLEAN,
-    Value::BOOLEAN(sirius::operator_params{}.enable_compressed_materialization),
+    Value::BOOLEAN(defaults.enable_compressed_materialization),
     SetEnableCompressedMaterialization);
 }
 
@@ -2460,7 +2463,10 @@ static void LoadInternal(ExtensionLoader& loader)
   install_configured_log_sink(&db);
 
   sirius::converter_registry::initialize();
-  SiriusExtension::InitialGPUConfigs(config);
+  // The callback constructor above already read sirius.yaml, so its params are the defaults the
+  // per-connection options register with.
+  SiriusExtension::InitialGPUConfigs(config,
+                                     callback_ptr->get_loaded_config().get_operator_params());
   SiriusExtension::RegisterGPUFunctions(db);
 
   // Register the s3:// FileSystem so DuckDB's native read_parquet('s3://') binds

@@ -67,13 +67,11 @@ duckdb::vector<std::unique_ptr<sirius::ast::node>> translate_expressions(
 
 std::vector<cudf::data_type> scan_physical_schema(duckdb::LogicalGet& op,
                                                   duckdb::SiriusContext* state,
+                                                  bool compressed_materialization_on,
                                                   const duckdb::vector<duckdb::ColumnIndex>& ids,
                                                   sirius::scan_manager::pinned_entry const* entry)
 {
-  if (!state || !state->get_config().get_operator_params().enable_compressed_materialization ||
-      entry == nullptr) {
-    return {};
-  }
+  if (!state || !compressed_materialization_on || entry == nullptr) { return {}; }
 
   // Install a narrow sidecar only when the pinned cache can serve this scan. Each target comes from
   // recorded stored-column metadata, so compressed and uncompressed chunks use the same path. A
@@ -152,6 +150,10 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
                         ? context.registered_state->Get<duckdb::SiriusContext>("sirius_state")
                         : nullptr;
 
+  // Resolved once for this plan against the connection being planned for, so the parquet
+  // identity probe and the residency gate below cannot disagree about whether narrowing is on.
+  bool const compressed_materialization_on = duckdb::compressed_materialization_enabled(context);
+
   // One pinned-entry probe per scan: the compressed-materialization residency gate and
   // the seq_scan MVCC cache-or-CPU guard below share the result. The parquet identity
   // feeds only the gate, so its file resolution runs only when the feature is on.
@@ -173,8 +175,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
         serves_insert_deltas = true;
       }
     }
-  } else if (sirius_state &&
-             sirius_state->get_config().get_operator_params().enable_compressed_materialization) {
+  } else if (sirius_state && compressed_materialization_on) {
     auto const files =
       resolve_parquet_scan_file_paths(op.function.name, op.bind_data.get(), op.parameters);
     if (!files.empty()) {
@@ -182,8 +183,11 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
     }
   }
 
-  auto physical_types = scan_physical_schema(
-    op, sirius_state.get(), column_ids, serves_insert_deltas ? nullptr : pinned);
+  auto physical_types = scan_physical_schema(op,
+                                             sirius_state.get(),
+                                             compressed_materialization_on,
+                                             column_ids,
+                                             serves_insert_deltas ? nullptr : pinned);
 
   if (!op.children.empty()) {
     throw duckdb::NotImplementedException("Table Input Output functions are not supported yet");

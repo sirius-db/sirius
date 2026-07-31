@@ -1147,6 +1147,18 @@ bool duckdb_fallback_enabled(ClientContext& context)
   return true;
 }
 
+bool compressed_materialization_enabled(ClientContext& context)
+{
+  Value setting;
+  if (context.TryGetCurrentSetting("enable_compressed_materialization", setting) &&
+      !setting.IsNull()) {
+    return setting.GetValue<bool>();
+  }
+  // Reached only when the extension option is not registered, which is every caller that runs
+  // without a loaded Sirius extension.
+  return sirius::operator_params{}.enable_compressed_materialization;
+}
+
 void print_cpu_fallback_banner()
 {
   const bool tty  = ::isatty(::fileno(stdout)) != 0;

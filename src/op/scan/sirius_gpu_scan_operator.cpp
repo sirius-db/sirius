@@ -77,10 +77,9 @@ std::unique_ptr<cudf::table> normalize_physical_schema(std::unique_ptr<cudf::tab
 
   auto const actual_width = static_cast<std::size_t>(table->num_columns());
   if (actual_width != targets.size()) {
-    if (!has_explicit_physical_schema) { return table; }
     throw internal_exception(
-      "[sirius_gpu_scan_operator] compressed schema width mismatch: materialized {} columns, "
-      "planned {}",
+      "[sirius_gpu_scan_operator] output schema width mismatch: materialized {} columns, expected "
+      "{}",
       actual_width,
       targets.size());
   }
@@ -96,7 +95,14 @@ std::unique_ptr<cudf::table> normalize_physical_schema(std::unique_ptr<cudf::tab
     auto const target  = targets[column_idx];
     if (actual == target || can_restore_to(actual, target)) { continue; }
 
-    if (!has_explicit_physical_schema) { continue; }
+    if (!has_explicit_physical_schema) {
+      throw internal_exception(
+        "[sirius_gpu_scan_operator] native schema carrier mismatch for column {}: materialized {}, "
+        "expected {}",
+        column_idx,
+        cudf::type_to_name(actual),
+        cudf::type_to_name(target));
+    }
     if (!can_narrow_to(actual, target)) {
       throw internal_exception(
         "[sirius_gpu_scan_operator] invalid compressed carrier for column {}: materialized {}, "
@@ -158,13 +164,15 @@ sirius_gpu_scan_operator::sirius_gpu_scan_operator(
     _split_connector(std::make_shared<scan_manager::split_connector>()),
     _compressed_materialization_observer(compressed_materialization_observer)
 {
-  // `this->types` reads the base-class member; the constructor argument was consumed above.
   _native_physical_types.reserve(this->types.size());
-  for (auto const& type : this->types) {
+  for (std::size_t column_idx = 0; column_idx < this->types.size(); ++column_idx) {
+    auto const& type  = this->types[column_idx];
     auto const native = sirius::try_get_cudf_type(type);
     if (!native) {
-      _native_physical_types.clear();
-      break;
+      throw internal_exception(
+        "[sirius_gpu_scan_operator] output column {} ({}) has no native cuDF carrier",
+        column_idx,
+        type.to_string());
     }
     _native_physical_types.push_back(*native);
   }
@@ -244,37 +252,36 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::execute(
   return std::make_unique<pipelineable_operator_data>(std::move(batches));
 }
 
+std::size_t sirius_gpu_scan_operator::resident_carrier_conversion_peak_memory_estimate(
+  const op::input_stats& stats) noexcept
+{
+  D_ASSERT(stats.resident && stats.needs_carrier_conversion);
+  auto destination_bytes = stats.conversion_destination_bytes;
+  if (destination_bytes == 0) {
+    destination_bytes = saturating_mul(stats.bytes, kMaxNumericCarrierExpansion);
+  }
+  return saturating_add(stats.working_set_bytes, destination_bytes);
+}
+
 std::size_t sirius_gpu_scan_operator::no_history_peak_memory_estimate(
   const op::input_stats& stats) const
 {
-  auto const expanded_bytes = saturating_mul(stats.bytes, kMaxNumericCarrierExpansion);
   if (stats.resident) {
-    // The serve site compared each selected column's recorded carrier against the carrier this
-    // scan plans for it, so a chunk reports a conversion only when normalize_physical_schema
-    // will actually cast one. The cast destination coexists with the resident input/filter
-    // working set at peak.
+    // cached_databatch_provider sets this only when normalize_physical_schema will cast the split.
     if (stats.needs_carrier_conversion) {
-      // The exact per-column destination, in the target widths cudf::cast allocates. A zero
-      // means a converting chunk's row count was unreadable, so the maximum-expansion bound
-      // stays.
-      if (stats.conversion_destination_bytes > 0) {
-        return saturating_add(stats.working_set_bytes, stats.conversion_destination_bytes);
-      }
-      return saturating_add(stats.working_set_bytes, expanded_bytes);
+      return resident_carrier_conversion_peak_memory_estimate(stats);
     }
     if (has_physical_overrides()) {
-      // The serve site reported no cast, but this scan carries a plan sidecar. Keep a
-      // conversion-sized headroom anyway, bounded by the stored source: a sidecar only ever
-      // narrows a resident carrier, so any cast still reachable here fits in the source's bytes.
-      // @kevin See issue ticket #1313 on whether this branch is dead code.
+      // Keep an input-sized fallback for sidecar scans because per-split metadata may be
+      // incomplete.
       return saturating_add(stats.working_set_bytes, stats.bytes);
     }
     return std::max(stats.bytes, stats.working_set_bytes);
   }
 
-  // Preserve the maximum-width fresh-read heuristic for projected data, then add filter-only
-  // columns without expanding the transient working set twice. Explicit physical sidecars retain
-  // this conservative estimate because native decoded columns coexist with their narrow result.
+  // Fresh reads expand projected bytes by the maximum carrier factor. The working set may also
+  // contain decoded filter-only columns, so add only the bytes beyond the projected input.
+  auto const expanded_bytes = saturating_mul(stats.bytes, kMaxNumericCarrierExpansion);
   auto const filter_only_bytes =
     stats.working_set_bytes > stats.bytes ? stats.working_set_bytes - stats.bytes : 0;
   return saturating_add(expanded_bytes, filter_only_bytes);
