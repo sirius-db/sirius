@@ -24,6 +24,7 @@
 #include <pipeline/sirius_pipeline_converter.hpp>
 #include <sirius_config.hpp>
 #include <sirius_context.hpp>
+#include <utils/dynamic_filter_test_utils.hpp>
 #include <utils/pipeline_conversion_test_utils.hpp>
 #include <utils/sirius_test_env.hpp>
 #include <utils/transparent_execution_test_utils.hpp>
@@ -247,8 +248,11 @@ TEST_CASE("dynamic-filter endpoints obey the data contract on SIP-shaped plans",
 
   SECTION("Q5: SIP adds endpoints, and every endpoint obeys the data contract")
   {
-    // Assert only optimizer-independent properties: SIP adds endpoints and each consumes
-    // pipelineable data.
+    // Pin the written join order so the delta is deterministic: the region join's build carries
+    // the r_name filter (the required evidence), and its probe key (n_regionkey) lives on the
+    // nation join's build side, which only SIP's build-block descent reaches. Every endpoint,
+    // whichever mode wired it, must consume pipelineable data.
+    sirius::test::disabled_optimizers_guard shape(con, "join_order,build_side_probe_side");
     std::size_t endpoints_off = 0;
     {
       sip_switch_guard sip_off(con, /*enabled=*/false);

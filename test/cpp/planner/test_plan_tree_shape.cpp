@@ -441,21 +441,22 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     return joins[1];
   };
 
-  SECTION("SIP on: the build wrap carries a DYNAMIC_FILTER above the scan")
+  SECTION("SIP on, unfiltered build: no endpoint wires anywhere")
   {
+    // The producing join's build (small_c) carries no filter, so its membership set covers the
+    // whole key domain and would keep every probe row. Neither the scan route nor a join-edge
+    // endpoint may wire without build-filter evidence.
     dynamic_filter_switch_guard sip_on(*con, /*sip_enabled=*/true);
     auto plan = generate_sirius_plan(*con, query, keep_shape);
     INFO(tree_to_string(plan.get()));
 
+    CHECK(collect(plan.get(), SiriusPhysicalOperatorType::DYNAMIC_FILTER).empty());
+
     auto* inner = require_inner_join(plan.get());
     auto* build_subtree =
       require_join_child_wrap(inner->children[1].get(), inner, /*is_build=*/true);
-
-    // Unfiltered builds disable scan routes, so this build-side endpoint must come from SIP.
     REQUIRE(build_subtree != nullptr);
-    REQUIRE(build_subtree->type == SiriusPhysicalOperatorType::DYNAMIC_FILTER);
-    REQUIRE(build_subtree->children.size() == 1);
-    CHECK(build_subtree->children[0]->type == SiriusPhysicalOperatorType::GPU_SCAN);
+    CHECK(build_subtree->type == SiriusPhysicalOperatorType::GPU_SCAN);
 
     require_parent_links(plan.get(), /*expected_parent=*/nullptr);
   }
@@ -483,16 +484,15 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
 
   SECTION("SIP on: the endpoint lands on a LEFT join's build input")
   {
-    // Hold back filter pushdown to preserve the LEFT join and verify its build-side SIP placement.
+    // The producing join's build filter (pushed into the small_c scan) supplies the required
+    // evidence; holding back join reordering is what preserves the LEFT join. The equality key's
+    // trace crosses the LEFT join's build block down to its scan.
     const std::string left_query =
       "SELECT * FROM big_left l LEFT JOIN small_right r ON l.id = r.rid "
-      "JOIN small_c c ON r.other = c.ckey";
-    const std::vector<OptimizerType> keep_left_shape{OptimizerType::JOIN_ORDER,
-                                                     OptimizerType::BUILD_SIDE_PROBE_SIDE,
-                                                     OptimizerType::FILTER_PUSHDOWN};
+      "JOIN small_c c ON r.other = c.ckey WHERE c.cother >= 0";
 
     dynamic_filter_switch_guard sip_on(*con, /*sip_enabled=*/true);
-    auto plan = generate_sirius_plan(*con, left_query, keep_left_shape);
+    auto plan = generate_sirius_plan(*con, left_query, keep_shape);
     INFO(tree_to_string(plan.get()));
 
     auto* inner = require_inner_join(plan.get());
@@ -510,11 +510,11 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
 
   SECTION("SIP on: a null-equal producing condition places no endpoint")
   {
-    // Null-equal keys are ineligible for SIP. The unfiltered build also disables scan discovery,
-    // so no other route can place an endpoint here.
+    // The build filter supplies discovery evidence, so null-equal inadmissibility is the only
+    // rule blocking an endpoint here.
     const std::string null_equal_query =
       "SELECT * FROM big_left l JOIN small_right r ON l.id = r.rid "
-      "JOIN small_c c ON r.other IS NOT DISTINCT FROM c.ckey";
+      "JOIN small_c c ON r.other IS NOT DISTINCT FROM c.ckey WHERE c.cother >= 0";
 
     dynamic_filter_switch_guard sip_on(*con, /*sip_enabled=*/true);
     auto plan = generate_sirius_plan(*con, null_equal_query, keep_shape);
@@ -531,11 +531,12 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
 
   SECTION("SIP on: an aggregate-result key stops the descent at the group-by")
   {
-    // Aggregate results cannot trace through HASH_GROUP_BY, so the endpoint stays above the
-    // wrapped group-by chain and consumes merged rather than partitioned batches.
+    // The build filter arms discovery, but aggregate results cannot trace through HASH_GROUP_BY,
+    // so the endpoint stays above the wrapped group-by chain and consumes merged rather than
+    // partitioned batches.
     const std::string aggregate_key_query =
       "SELECT * FROM (SELECT rid, min(other) AS m FROM small_right GROUP BY rid) g "
-      "JOIN small_c c ON g.m = c.ckey";
+      "JOIN small_c c ON g.m = c.ckey WHERE c.cother >= 0";
 
     dynamic_filter_switch_guard sip_on(*con, /*sip_enabled=*/true);
     auto plan = generate_sirius_plan(*con, aggregate_key_query, keep_shape);

@@ -54,33 +54,6 @@ struct sip_switch_guard {
   bool original;
 };
 
-// Disable inferred join-key filters so predicate-free queries keep an unfiltered build.
-struct statistics_propagation_disable_guard {
-  explicit statistics_propagation_disable_guard(duckdb::Connection& c) : con(c)
-  {
-    auto current = con.Query("SELECT current_setting('disabled_optimizers');");
-    REQUIRE(current);
-    REQUIRE_FALSE(current->HasError());
-    original    = current->GetValue(0, 0).ToString();
-    auto merged = original.empty() ? std::string{"statistics_propagation"}
-                                   : original + ",statistics_propagation";
-    auto result = con.Query("SET disabled_optimizers = '" + merged + "';");
-    REQUIRE(result);
-    REQUIRE_FALSE(result->HasError());
-  }
-  ~statistics_propagation_disable_guard()
-  {
-    con.Query("SET disabled_optimizers = '" + original + "';");
-  }
-
-  statistics_propagation_disable_guard(const statistics_propagation_disable_guard&) = delete;
-  statistics_propagation_disable_guard& operator=(const statistics_propagation_disable_guard&) =
-    delete;
-
-  duckdb::Connection& con;
-  std::string original;
-};
-
 // Verify GPU execution and return the result as a sorted bag.
 std::vector<std::vector<std::string>> run_on_gpu(duckdb::Connection& con, const std::string& query)
 {
@@ -150,7 +123,7 @@ sip_comparison require_sip_result_equivalence(duckdb::Connection& con, const std
 
 }  // namespace
 
-// Verify that SIP preserves results and is the only target route for predicate-free joins.
+// Verify that SIP preserves results and reaches keys scan-route discovery cannot.
 // Shape-specific placement is covered by test_plan_tree_shape.cpp.
 TEST_CASE("gpu_execution - SIP endpoint placement preserves results",
           "[integration][gpu_execution][dynamic_filter]")
@@ -167,18 +140,23 @@ TEST_CASE("gpu_execution - SIP endpoint placement preserves results",
   REQUIRE(r);
   REQUIRE_FALSE(r->HasError());
 
-  SECTION("SIP is the only route a filter-free join can take")
+  SECTION("SIP is the only route to a key on the inner join's build side")
   {
-    // Suppress inferred predicates and the independent coverage gate. With no filtering build,
-    // scan-route discovery cannot create a target, so any enabled producer comes from SIP.
-    statistics_propagation_disable_guard stats_off(con);
+    // The customer predicate supplies the build-filter evidence both routes require. With the
+    // written join order pinned, the producing join's probe key (o_custkey) lives on the inner
+    // join's build side, where scan-route discovery stops at the join: only SIP's build-block
+    // descent reaches a target, so the switch-off plan wires no producer. Inferred predicates
+    // and the independent coverage gate are suppressed to keep the attribution clean.
+    sirius::test::disabled_optimizers_guard shape(
+      con, "statistics_propagation,join_order,build_side_probe_side");
     sirius::test::coverage_gate_disable_guard gate_off(con);
     auto const deltas =
       require_sip_result_equivalence(con,
                                      "SELECT count(*), sum(o.o_custkey) "
                                      "FROM lineitem l "
                                      "JOIN orders o ON l.l_orderkey = o.o_orderkey "
-                                     "JOIN customer c ON o.o_custkey = c.c_custkey");
+                                     "JOIN customer c ON o.o_custkey = c.c_custkey "
+                                     "WHERE c.c_nationkey = 3");
 
     // Confirm that the switch-off plan has no other dynamic-filter route.
     REQUIRE(deltas.off.producers_enabled == 0);
@@ -191,16 +169,18 @@ TEST_CASE("gpu_execution - SIP endpoint placement preserves results",
 
   SECTION("a LEFT join in the query keeps results identical while SIP is active")
   {
-    // Use the same structural attribution as the predicate-free inner-join case. Dedicated
-    // plan-shape tests cover LEFT-join descent.
-    statistics_propagation_disable_guard stats_off(con);
+    // Use the same structural attribution as the inner-join case. Dedicated plan-shape tests
+    // cover LEFT-join descent.
+    sirius::test::disabled_optimizers_guard shape(
+      con, "statistics_propagation,join_order,build_side_probe_side");
     sirius::test::coverage_gate_disable_guard gate_off(con);
     auto const deltas =
       require_sip_result_equivalence(con,
                                      "SELECT count(*), sum(o.o_custkey) "
                                      "FROM lineitem l "
                                      "LEFT JOIN orders o ON l.l_orderkey = o.o_orderkey "
-                                     "JOIN customer c ON o.o_custkey = c.c_custkey");
+                                     "JOIN customer c ON o.o_custkey = c.c_custkey "
+                                     "WHERE c.c_nationkey = 3");
 
     REQUIRE(deltas.off.producers_enabled == 0);
     REQUIRE(deltas.on.producers_enabled > deltas.off.producers_enabled);

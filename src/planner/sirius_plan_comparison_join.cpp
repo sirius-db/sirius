@@ -546,8 +546,12 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
                                      .value_or(cudf::data_type{cudf::type_id::EMPTY})});
           scan_bound = true;
         }
-        if (scan_bound || !sip_enabled) { continue; }
-        // Join-edge endpoint. Build-block descent depends on equality admission: under null-equal
+        if (scan_bound || !sip_enabled || !build_filtered) { continue; }
+        // Join-edge endpoint. Like the scan route, it requires build-filter evidence: an
+        // unfiltered build is (for FK-shaped joins) the whole key domain, so its filter keeps
+        // every probe row by construction and wiring it only buys apply overhead.
+        //
+        // Build-block descent depends on equality admission: under null-equal
         // semantics, pruning a LEFT join's build input could add a NULL-padded row accepted by
         // the producing join.
         //
@@ -613,8 +617,8 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
                op.type == duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN &&
                !admitted_keys.empty()) {
       SIRIUS_LOG_INFO(
-        "[sirius_plan_comparison_join] Not wiring scan-route dynamic filter(s): build side "
-        "is unfiltered (build est {} rows).",
+        "[sirius_plan_comparison_join] Not wiring dynamic filter(s): build side is "
+        "unfiltered (build est {} rows).",
         rhs_cardinality);
     }
 

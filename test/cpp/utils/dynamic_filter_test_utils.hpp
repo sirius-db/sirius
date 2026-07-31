@@ -58,6 +58,28 @@ struct coverage_gate_disable_guard {
   double original;
 };
 
+/// Appends the given optimizers to `disabled_optimizers` and restores the setting on destruction.
+struct disabled_optimizers_guard {
+  disabled_optimizers_guard(duckdb::Connection& c, const std::string& optimizers) : con(c)
+  {
+    auto current = con.Query("SELECT current_setting('disabled_optimizers');");
+    REQUIRE(current);
+    REQUIRE_FALSE(current->HasError());
+    original    = current->GetValue(0, 0).ToString();
+    auto merged = original.empty() ? optimizers : original + "," + optimizers;
+    auto result = con.Query("SET disabled_optimizers = '" + merged + "';");
+    REQUIRE(result);
+    REQUIRE_FALSE(result->HasError());
+  }
+  ~disabled_optimizers_guard() { con.Query("SET disabled_optimizers = '" + original + "';"); }
+
+  disabled_optimizers_guard(const disabled_optimizers_guard&)            = delete;
+  disabled_optimizers_guard& operator=(const disabled_optimizers_guard&) = delete;
+
+  duckdb::Connection& con;
+  std::string original;
+};
+
 /// Path to the integration DuckDB carrying the SF1 TPC-H schema, honoring the
 /// `SIRIUS_INTEGRATION_TEST_DB_PATH` override. Fails the test if the database is absent.
 inline std::filesystem::path integration_tpch_db_path()
