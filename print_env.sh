@@ -122,9 +122,16 @@ printf '%-32s: %s\n' CUDA_VISIBLE_DEVICES "$CUDA_VISIBLE_DEVICES"
 printf '%-32s: %s\n' CUDA_CACHE_PATH "$CUDA_CACHE_PATH"
 echo
 
-echo "***pixi info & packages***"
+echo "***pixi info***"
 if type "pixi" &> /dev/null; then
     pixi info
+else
+    echo "pixi not found"
+fi
+echo
+
+echo "***pixi list***"
+if type "pixi" &> /dev/null; then
     pixi list
 else
     echo "pixi not found"
