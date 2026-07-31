@@ -418,13 +418,12 @@ std::unique_ptr<operator_data> sirius_physical_partition::get_next_task_input_da
                                    "single batch (concat_all)");
         }
         build_arrives_whole = strategy.num_partitions == 1 || strategy.broadcast;
-      } else if (strategy.num_partitions == 1 && hash_join != nullptr &&
+      } else if (in.is_build_side && strategy.num_partitions == 1 && hash_join != nullptr &&
                  hash_join->publishes_dynamic_filters()) {
-        // Not BUILD_PROBE, but the whole build lands in one partition and the join publishes a
-        // dynamic filter from a single build batch. Folding that partition costs nothing in data
-        // volume — it is the same rows either way — and only moves a batch boundary, so the filter
-        // can be published from a key set that is provably complete. Unlike BUILD_PROBE this is an
-        // optimisation, not an invariant: if no build-side CONCAT exists, publication is skipped.
+        // Not BUILD_PROBE, but the build lands in one partition and this join publishes a filter
+        // from a single build batch, so folding it only moves a batch boundary. Best-effort: no
+        // build-side CONCAT means no publication. Build-side sizing is required — right-family
+        // joins size from the probe, where one partition says nothing about the build's size.
         bool const found_this    = enable_build_concat_all(*this);
         bool const found_sibling = enable_build_concat_all(sibling);
         build_arrives_whole      = found_this || found_sibling;
