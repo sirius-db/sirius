@@ -176,9 +176,13 @@ void task_scheduler::terminate_query(const std::shared_ptr<completion_handler>& 
   // thread. stop() joins each gpu_pipeline_executor's manager thread and then blocks in that
   // executor's bounded_thread_pool::wait_all() -- if the calling thread is itself one of that
   // pool's workers, its slot cannot free until this call returns, so wait_all() would never
-  // observe active_ == 0: a self-wait deadlock. report_error() alone fulfills the completion
-  // future; the query thread's future.get() (sirius_engine.cpp) throws and its catch block calls
-  // drain_after_error(), which does the actual draining from a thread that is never a pool worker.
+  // observe active_ == 0: a self-wait deadlock. Even reached from elsewhere, stop() closes the
+  // request channel, joins the management thread, and stops every GPU executor for ALL queries
+  // with no path that ever calls start() again -- one query's creation error would hang every
+  // other in-flight query and every subsequent query in the process. report_error() alone
+  // fulfills the completion future; the query thread's future.get() (sirius_engine.cpp) throws
+  // and its catch block calls drain_after_error(query_id), which does the actual draining, for
+  // just that query, from a thread that is never a pool worker.
   if (handler) { handler->report_error(std::move(error)); }
 }
 
