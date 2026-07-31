@@ -76,10 +76,10 @@ sirius::scan_manager::scan_manager_config make_local_config()
 
 std::unique_ptr<scan::parquet_ingestible_table_info> make_table_info(std::string const& file)
 {
-  auto info = std::make_unique<scan::parquet_ingestible_table_info>();
-  info->resolved_file_paths = {(project_root() / "test/cpp/integration/data/parquet" / file)
-                                 .string()};
-  info->names               = {"c0"};
+  auto info                 = std::make_unique<scan::parquet_ingestible_table_info>();
+  info->resolved_file_paths = {
+    (project_root() / "test/cpp/integration/data/parquet" / file).string()};
+  info->names = {"c0"};
   info->returned_types.push_back(sirius::logical_type::make(sirius::type_id::INTEGER));
   info->column_ids.push_back(duckdb::ColumnIndex(0));
   info->scan_output_arity = 1;
@@ -226,8 +226,7 @@ TEST_CASE("concurrent queries do not collide on operator id", "[scan_manager][qu
   REQUIRE(manager.num_active_queries() == 0);
 }
 
-TEST_CASE("reset is a no-op for unknown and already-reset queries",
-          "[scan_manager][query_state]")
+TEST_CASE("reset is a no-op for unknown and already-reset queries", "[scan_manager][query_state]")
 {
   fixture f;
   sirius_scan_manager manager{make_local_config(), *f.memory, f.topology};
@@ -272,8 +271,8 @@ TEST_CASE("a query with no GPU scan operators registers nothing", "[scan_manager
   fixture f;
   sirius_scan_manager manager{make_local_config(), *f.memory, f.topology};
 
-  auto tctx               = sirius::test::make_test_telemetry_context();
-  auto const query_id     = sirius::make_query_id(7);
+  auto tctx           = sirius::test::make_test_telemetry_context();
+  auto const query_id = sirius::make_query_id(7);
   sirius::telemetry::query_telemetry_info tinfo{tctx->engine_id(), tctx->worker_id(), query_id};
   sirius::planner::query empty{
     duckdb::vector<duckdb::shared_ptr<sirius::pipeline::sirius_pipeline>>{},
