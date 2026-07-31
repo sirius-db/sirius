@@ -585,20 +585,23 @@ TEST_CASE("the domain-coverage threshold is validated where it enters the engine
   REQUIRE(value == 0.9);
 }
 
-TEST_CASE("the SIP switch is consumed from the operator_params YAML section",
+TEST_CASE("the dynamic-filter switch is consumed from the operator_params YAML section",
           "[config_opt][dynamic_filter]")
 {
-  auto const path = std::filesystem::temp_directory_path() / "sirius_dynamic_filter_sip.yaml";
+  auto const path = std::filesystem::temp_directory_path() / "sirius_dynamic_filter.yaml";
   {
     std::ofstream out(path);
     out << "sirius:\n"
            "  operator_params:\n"
-           "    enable_dynamic_filter_sip: true\n";
+           "    enable_dynamic_filter: false\n";
   }
+
+  // Parsing false is the non-vacuous direction because the default is true.
+  CHECK(operator_params{}.enable_dynamic_filter);
 
   sirius_config cfg;
   cfg.load_from_file(path);
-  CHECK(cfg.get_operator_params().enable_dynamic_filter_sip);
+  CHECK_FALSE(cfg.get_operator_params().enable_dynamic_filter);
 
   std::error_code ec;
   std::filesystem::remove(path, ec);

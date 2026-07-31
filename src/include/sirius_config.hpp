@@ -120,22 +120,22 @@ struct operator_params {
   /// disable (always use filtered_join).
   double mark_join_build_switch_ratio = config::DEFAULT_MARK_JOIN_BUILD_SWITCH_RATIO;
 
-  /// Wire dynamic table-filter pushdown: an eligible BUILD_PROBE hash-join build publishes a raw
-  /// exact IN-list for 1..12 supported build rows, otherwise a hash IN-list if it fits the smallest
-  /// probe-GPU L2, or a Bloom, into the probe-side scan. The scan applies membership post-decode to
-  /// drop non-matching rows before the join. On by default; the master switch for the feature.
-  bool enable_dynamic_filter_pushdown = true;
+  /// Wire runtime dynamic filters from eligible BUILD_PROBE hash-join builds. Per admitted key
+  /// the build publishes one membership filter (a raw exact IN-list for 1..12 supported build
+  /// rows, otherwise a hash IN-list if it fits the smallest probe-GPU L2, or a Bloom) to every
+  /// consumer discovered in its probe subtree: a probe-side scan applies it post-decode, and a
+  /// key no scan bind reaches gets a join-edge endpoint at the deepest value-preserving site,
+  /// including on an intervening join's build input. Redundant with the join, so results never
+  /// change. When off, discovery never runs and no channel exists anywhere. On by default.
+  bool enable_dynamic_filter = true;
 
   /// Additionally emit a runtime zone-map (build-key [min,max]) alongside the membership filter,
   /// for READ-time row-group pruning on parquet scans; duckdb-native scans apply it row-wise
-  /// post-decode instead. Off by default and requires enable_dynamic_filter_pushdown: on
+  /// post-decode instead. Off by default and requires enable_dynamic_filter: on
   /// TPC-H-shaped joins DuckDB's static transitive-predicate pushdown already prunes
   /// range-derivable builds, and scattered keys prune nothing, so the zone-map only pays off on
   /// clustered-keyset joins whose narrow key range is runtime-determined.
   bool enable_dynamic_zone_map_filter = false;
-
-  /// Enable join-edge dynamic-filter targets. Requires `enable_dynamic_filter_pushdown`.
-  bool enable_dynamic_filter_sip = false;
 
   /// Skip all publication for a key when the build covers at least this fraction of its unfiltered
   /// base-table row bound. The gate applies only to proven-unique keys with DuckDB-native

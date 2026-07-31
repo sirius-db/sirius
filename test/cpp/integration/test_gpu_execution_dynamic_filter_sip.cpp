@@ -27,28 +27,27 @@
 
 namespace {
 
-// Restore the previous SIP setting so nested guards remain valid.
-struct sip_switch_guard {
-  sip_switch_guard(duckdb::Connection& c, bool enabled)
+// Restore the previous switch setting so nested guards remain valid.
+struct dynamic_filter_switch_guard {
+  dynamic_filter_switch_guard(duckdb::Connection& c, bool enabled)
     : con(c),
       original(sirius::test::get_registered_sirius_context(c)
                  ->get_config()
                  .get_operator_params()
-                 .enable_dynamic_filter_sip)
+                 .enable_dynamic_filter)
   {
-    auto result = con.Query(std::string{"SET enable_dynamic_filter_sip = "} +
-                            (enabled ? "true" : "false") + ";");
+    auto result =
+      con.Query(std::string{"SET enable_dynamic_filter = "} + (enabled ? "true" : "false") + ";");
     REQUIRE(result);
     REQUIRE_FALSE(result->HasError());
   }
-  ~sip_switch_guard()
+  ~dynamic_filter_switch_guard()
   {
-    con.Query(std::string{"SET enable_dynamic_filter_sip = "} + (original ? "true" : "false") +
-              ";");
+    con.Query(std::string{"SET enable_dynamic_filter = "} + (original ? "true" : "false") + ";");
   }
 
-  sip_switch_guard(const sip_switch_guard&)            = delete;
-  sip_switch_guard& operator=(const sip_switch_guard&) = delete;
+  dynamic_filter_switch_guard(const dynamic_filter_switch_guard&)            = delete;
+  dynamic_filter_switch_guard& operator=(const dynamic_filter_switch_guard&) = delete;
 
   duckdb::Connection& con;
   bool original;
@@ -78,8 +77,8 @@ struct publication_deltas {
   std::uint64_t filters_pushed           = 0;
 };
 
-// Counter deltas for the same query with SIP disabled and enabled.
-struct sip_comparison {
+// Counter deltas for the same query with the feature disabled and enabled.
+struct switch_comparison {
   publication_deltas off;
   publication_deltas on;
 };
@@ -97,23 +96,24 @@ publication_deltas run_and_measure(duckdb::Connection& con,
     .filters_pushed           = after.filters_pushed - before.filters_pushed};
 }
 
-// Compare SIP-disabled and SIP-enabled results and return their counter deltas. With the active
-// task creator, publication completes before the probe subtree starts, so delivery counters are
-// deterministic for these queries.
-sip_comparison require_sip_result_equivalence(duckdb::Connection& con, const std::string& query)
+// Compare feature-disabled and feature-enabled results and return their counter deltas. With the
+// active task creator, publication completes before the probe subtree starts, so delivery counters
+// are deterministic for these queries.
+switch_comparison require_switch_result_equivalence(duckdb::Connection& con,
+                                                    const std::string& query)
 {
   con.Query("SET gpu_execution = true;");
 
-  sip_comparison deltas;
+  switch_comparison deltas;
   std::vector<std::vector<std::string>> off_rows;
   {
-    sip_switch_guard sip_off(con, /*enabled=*/false);
+    dynamic_filter_switch_guard switch_off(con, /*enabled=*/false);
     deltas.off = run_and_measure(con, query, off_rows);
   }
 
   std::vector<std::vector<std::string>> on_rows;
   {
-    sip_switch_guard sip_on(con, /*enabled=*/true);
+    dynamic_filter_switch_guard switch_on(con, /*enabled=*/true);
     deltas.on = run_and_measure(con, query, on_rows);
   }
 
@@ -144,21 +144,23 @@ TEST_CASE("gpu_execution - SIP endpoint placement preserves results",
   {
     // The customer predicate supplies the build-filter evidence both routes require. With the
     // written join order pinned, the producing join's probe key (o_custkey) lives on the inner
-    // join's build side, where scan-route discovery stops at the join: only SIP's build-block
-    // descent reaches a target, so the switch-off plan wires no producer. Inferred predicates
-    // and the independent coverage gate are suppressed to keep the attribution clean.
+    // join's build side, where scan-route discovery stops at the join, so the join-edge route is
+    // the only reachable target for this key (per-route attribution lives in the plan-shape
+    // suite). The feature-off run wires nothing, so the deltas are attributable to the feature.
+    // Inferred predicates and the independent coverage gate are suppressed to keep the
+    // attribution clean.
     sirius::test::disabled_optimizers_guard shape(
       con, "statistics_propagation,join_order,build_side_probe_side");
     sirius::test::coverage_gate_disable_guard gate_off(con);
     auto const deltas =
-      require_sip_result_equivalence(con,
-                                     "SELECT count(*), sum(o.o_custkey) "
-                                     "FROM lineitem l "
-                                     "JOIN orders o ON l.l_orderkey = o.o_orderkey "
-                                     "JOIN customer c ON o.o_custkey = c.c_custkey "
-                                     "WHERE c.c_nationkey = 3");
+      require_switch_result_equivalence(con,
+                                        "SELECT count(*), sum(o.o_custkey) "
+                                        "FROM lineitem l "
+                                        "JOIN orders o ON l.l_orderkey = o.o_orderkey "
+                                        "JOIN customer c ON o.o_custkey = c.c_custkey "
+                                        "WHERE c.c_nationkey = 3");
 
-    // Confirm that the switch-off plan has no other dynamic-filter route.
+    // Confirm that the feature-off run wires no producer at all.
     REQUIRE(deltas.off.producers_enabled == 0);
 
     // Check each publication stage independently.
@@ -175,12 +177,12 @@ TEST_CASE("gpu_execution - SIP endpoint placement preserves results",
       con, "statistics_propagation,join_order,build_side_probe_side");
     sirius::test::coverage_gate_disable_guard gate_off(con);
     auto const deltas =
-      require_sip_result_equivalence(con,
-                                     "SELECT count(*), sum(o.o_custkey) "
-                                     "FROM lineitem l "
-                                     "LEFT JOIN orders o ON l.l_orderkey = o.o_orderkey "
-                                     "JOIN customer c ON o.o_custkey = c.c_custkey "
-                                     "WHERE c.c_nationkey = 3");
+      require_switch_result_equivalence(con,
+                                        "SELECT count(*), sum(o.o_custkey) "
+                                        "FROM lineitem l "
+                                        "LEFT JOIN orders o ON l.l_orderkey = o.o_orderkey "
+                                        "JOIN customer c ON o.o_custkey = c.c_custkey "
+                                        "WHERE c.c_nationkey = 3");
 
     REQUIRE(deltas.off.producers_enabled == 0);
     REQUIRE(deltas.on.producers_enabled > deltas.off.producers_enabled);
@@ -192,7 +194,7 @@ TEST_CASE("gpu_execution - SIP endpoint placement preserves results",
   {
     // These keys are non-null, so result parity cannot verify null-equal rejection. Admission and
     // plan-shape tests cover that rule directly.
-    require_sip_result_equivalence(
+    require_switch_result_equivalence(
       con,
       "SELECT count(*), sum(o.o_custkey) "
       "FROM lineitem l "
@@ -206,29 +208,30 @@ TEST_CASE("gpu_execution - SIP endpoint placement preserves results",
   {
     // The customer predicate produces no rows but remains inside the column statistics, preserving
     // the join in the plan. The empty-build endpoint receives no filter and must pass rows through.
-    require_sip_result_equivalence(con,
-                                   "SELECT count(*), sum(o.o_custkey) "
-                                   "FROM lineitem l "
-                                   "JOIN orders o ON l.l_orderkey = o.o_orderkey "
-                                   "JOIN customer c ON o.o_custkey = c.c_custkey "
-                                   "WHERE c.c_phone = '25-000-000-0000'");
+    require_switch_result_equivalence(con,
+                                      "SELECT count(*), sum(o.o_custkey) "
+                                      "FROM lineitem l "
+                                      "JOIN orders o ON l.l_orderkey = o.o_orderkey "
+                                      "JOIN customer c ON o.o_custkey = c.c_custkey "
+                                      "WHERE c.c_phone = '25-000-000-0000'");
   }
 
   SECTION("TPC-H q17: a delim-scan build wires only through derived-build evidence")
   {
-    // q17's correlated join builds from a DELIM_GET. The counter deltas verify that derived-build
-    // evidence activates the otherwise unreachable join-edge route.
+    // q17's correlated join builds from a DELIM_GET. The feature-off run wires nothing, so the
+    // counter deltas verify the feature wires producers, including through derived-build evidence
+    // -- the only evidence the delim-internal producer has.
     auto const deltas =
-      require_sip_result_equivalence(con,
-                                     "select sum(l.l_extendedprice) / 7.0 as avg_yearly "
-                                     "from lineitem l, part p "
-                                     "where p.p_partkey = l.l_partkey "
-                                     "and p.p_brand = 'Brand#13' "
-                                     "and p.p_container = 'JUMBO CAN' "
-                                     "and l.l_quantity < ("
-                                     "select 0.2 * avg(l2.l_quantity) "
-                                     "from lineitem l2 "
-                                     "where l2.l_partkey = p.p_partkey)");
+      require_switch_result_equivalence(con,
+                                        "select sum(l.l_extendedprice) / 7.0 as avg_yearly "
+                                        "from lineitem l, part p "
+                                        "where p.p_partkey = l.l_partkey "
+                                        "and p.p_brand = 'Brand#13' "
+                                        "and p.p_container = 'JUMBO CAN' "
+                                        "and l.l_quantity < ("
+                                        "select 0.2 * avg(l2.l_quantity) "
+                                        "from lineitem l2 "
+                                        "where l2.l_partkey = p.p_partkey)");
 
     REQUIRE(deltas.on.producers_enabled > deltas.off.producers_enabled);
     REQUIRE(deltas.on.filters_pushed > deltas.off.filters_pushed);

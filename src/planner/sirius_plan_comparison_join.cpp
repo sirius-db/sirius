@@ -403,32 +403,26 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
 
   // A missing Sirius context disables dynamic-filter evidence and discovery.
   auto sirius_context = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
-  bool const master_enabled =
-    sirius_context &&
-    sirius_context->get_config().get_operator_params().enable_dynamic_filter_pushdown;
-  bool const sip_enabled =
-    master_enabled && sirius_context->get_config().get_operator_params().enable_dynamic_filter_sip;
+  bool const dynamic_filter_enabled =
+    sirius_context && sirius_context->get_config().get_operator_params().enable_dynamic_filter;
 
   // A delim build draws its rows from the probe child, so filtering evidence comes from there.
   bool const build_filtered =
-    master_enabled && build_subtree_is_filtering(op.children[1]->type ==
-                                                     duckdb::LogicalOperatorType::LOGICAL_DELIM_GET
-                                                   ? *op.children[0]
-                                                   : *op.children[1]);
+    dynamic_filter_enabled &&
+    build_subtree_is_filtering(
+      op.children[1]->type == duckdb::LogicalOperatorType::LOGICAL_DELIM_GET ? *op.children[0]
+                                                                             : *op.children[1]);
 
   // DuckDB's IsFiltering walk cannot see work behind childless DELIM_GET and CTE_REF leaves.
   // Derived evidence therefore widens only the SIP join-edge route; scan routing keeps DuckDB
   // parity.
-  bool const build_derived = master_enabled && build_relation_is_derived(*op.children[1]);
+  bool const build_derived = dynamic_filter_enabled && build_relation_is_derived(*op.children[1]);
   bool const edge_evidence = build_filtered || build_derived;
-
-  bool const routes_possible = build_filtered || (sip_enabled && edge_evidence);
 
   // Gather domain evidence before create_plan() moves state out of the logical children.
   auto condition_domains =
-    master_enabled && routes_possible
-      ? build_key_domain_cardinalities(op, duckdb_base_table_cardinality{context})
-      : std::vector<std::size_t>{};
+    edge_evidence ? build_key_domain_cardinalities(op, duckdb_base_table_cardinality{context})
+                  : std::vector<std::size_t>{};
 
   // Probe build-side uniqueness BEFORE create_plan, which moves data out of the logical nodes.
   auto build_side_unique_cols  = prove_unique_columns(*op.children[1]);
@@ -505,14 +499,16 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
     // planner entry point but are not dynamic-filter producers.
     std::vector<sirius::op::dynamic_filter_publish_plan::probe_target> targets;
     std::size_t scan_target_count = 0;
-    bool const discovery_runs     = master_enabled && routes_possible &&
+    bool const discovery_runs     = edge_evidence &&
                                 op.type == duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN &&
                                 !gpu_spaces.empty() && !host_spaces.empty();
     if (discovery_runs) {
       // Scan binding requires build-filter evidence and a join type that can safely pre-filter its
       // probe side.
       bool const scan_bind_armed = build_filtered && scan_route_join_type_admissible(op.join_type);
-      descent_policy const policy{.descend_build_blocks = sip_enabled};
+      // Build-block descent is always armed; the policy field remains so the walk rules stay
+      // independently testable.
+      descent_policy const policy{.descend_build_blocks = true};
       std::unordered_map<sirius::op::sirius_physical_operator const*, std::size_t> target_by_scan;
       for (std::size_t key_index = 0; key_index < admitted_keys.size(); ++key_index) {
         auto const& key       = admitted_keys[key_index];
@@ -554,7 +550,9 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
                                      .value_or(cudf::data_type{cudf::type_id::EMPTY})});
           scan_bound = true;
         }
-        if (scan_bound || !sip_enabled || !edge_evidence) { continue; }
+        // Discovery runs only with edge evidence, so any key that found no scan bind may try
+        // the join-edge route, subject to direct-route admission below.
+        if (scan_bound) { continue; }
         // Derived evidence may arm only this route. Because it is structural rather than
         // selective, the endpoint's keep-ratio gate suppresses later work when the filter prunes
         // too little.
@@ -614,23 +612,13 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
         scan_target_count,
         targets.size() - scan_target_count,
         rhs_cardinality);
-    } else if (master_enabled && routes_possible &&
-               op.type == duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN &&
+    } else if (edge_evidence && op.type == duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN &&
                !admitted_keys.empty() && (gpu_spaces.empty() || host_spaces.empty())) {
       // Report missing placement before less specific discovery gates.
       SIRIUS_LOG_INFO(
         "[sirius_plan_comparison_join] Not wiring dynamic filter(s): a GPU and HOST "
         "memory space are required for device-local replicas.");
-    } else if (master_enabled && !build_filtered && build_derived && !sip_enabled &&
-               op.type == duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN &&
-               !admitted_keys.empty()) {
-      // [TEMPORARY -- delete at flag collapse] Distinguishes "feature off" from "no evidence"
-      // during the rollout A/B window.
-      SIRIUS_LOG_INFO(
-        "[sirius_plan_comparison_join] Not wiring dynamic filter(s): derived-build evidence "
-        "serves only the join-edge route, which is disabled (build est {} rows).",
-        rhs_cardinality);
-    } else if (master_enabled && !edge_evidence &&
+    } else if (dynamic_filter_enabled && !edge_evidence &&
                op.type == duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN &&
                !admitted_keys.empty()) {
       SIRIUS_LOG_INFO(

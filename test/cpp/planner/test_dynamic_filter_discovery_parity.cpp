@@ -98,34 +98,30 @@ class scoped_temp_db_path {
   std::string _path;
 };
 
-// Enable scan-target discovery while disabling SIP targets, then restore both settings.
-class master_only_switch_guard {
+// Force the dynamic-filter switch on for the scope, independent of ambient configuration, then
+// restore the previous setting.
+class dynamic_filter_on_guard {
  public:
-  explicit master_only_switch_guard(Connection& con)
+  explicit dynamic_filter_on_guard(Connection& con)
     : _state(con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state"))
   {
     REQUIRE(_state != nullptr);
-    auto& params                          = _state->get_config().get_operator_params();
-    _original_pushdown                    = params.enable_dynamic_filter_pushdown;
-    _original_sip                         = params.enable_dynamic_filter_sip;
-    params.enable_dynamic_filter_pushdown = true;
-    params.enable_dynamic_filter_sip      = false;
+    auto& params                 = _state->get_config().get_operator_params();
+    _original                    = params.enable_dynamic_filter;
+    params.enable_dynamic_filter = true;
   }
 
-  ~master_only_switch_guard()
+  ~dynamic_filter_on_guard()
   {
-    auto& params                          = _state->get_config().get_operator_params();
-    params.enable_dynamic_filter_pushdown = _original_pushdown;
-    params.enable_dynamic_filter_sip      = _original_sip;
+    _state->get_config().get_operator_params().enable_dynamic_filter = _original;
   }
 
-  master_only_switch_guard(const master_only_switch_guard&)            = delete;
-  master_only_switch_guard& operator=(const master_only_switch_guard&) = delete;
+  dynamic_filter_on_guard(const dynamic_filter_on_guard&)            = delete;
+  dynamic_filter_on_guard& operator=(const dynamic_filter_on_guard&) = delete;
 
  private:
   duckdb::shared_ptr<duckdb::SiriusContext> _state;
-  bool _original_pushdown = true;
-  bool _original_sip      = false;
+  bool _original = true;
 };
 
 // Logical oracle inputs and the physical Sirius plan for one query.
@@ -401,7 +397,7 @@ TEST_CASE_METHOD(discovery_parity_fixture,
                  "discovery parity - probe-scan bind matches DuckDB's per-key walk",
                  "[dynamic_filter][parity][isolated_context]")
 {
-  master_only_switch_guard master_on(*con);
+  dynamic_filter_on_guard filter_on(*con);
   auto c = plan_parity_case(*con,
                             "SELECT * FROM big_left l JOIN small_right r ON l.id = r.rid "
                             "WHERE r.other > 0");
@@ -429,7 +425,7 @@ TEST_CASE_METHOD(discovery_parity_fixture,
                  "discovery parity - an unfiltered build wires nothing on either side",
                  "[dynamic_filter][parity][isolated_context]")
 {
-  master_only_switch_guard master_on(*con);
+  dynamic_filter_on_guard filter_on(*con);
   auto c = plan_parity_case(*con, "SELECT * FROM big_left l JOIN small_right r ON l.id = r.rid");
 
   // Evidence parity: the Sirius mirror and DuckDB's IsFiltering agree the build child is
@@ -448,7 +444,7 @@ TEST_CASE_METHOD(discovery_parity_fixture,
                  "discovery parity - filter evidence via bare FILTER and via TOP_N",
                  "[dynamic_filter][parity][isolated_context]")
 {
-  master_only_switch_guard master_on(*con);
+  dynamic_filter_on_guard filter_on(*con);
 
   SECTION("a residual build-side FILTER arms the gate on both sides")
   {
@@ -500,7 +496,7 @@ TEST_CASE_METHOD(discovery_parity_fixture,
 {
   // Filtering below a position selection can change which rows LIMIT selects, so Sirius stops
   // where DuckDB continues.
-  master_only_switch_guard master_on(*con);
+  dynamic_filter_on_guard filter_on(*con);
   auto c = plan_parity_case(*con,
                             "SELECT * FROM (SELECT * FROM big_left LIMIT 15) l "
                             "JOIN small_right r ON l.id = r.rid WHERE r.other > 0");
@@ -521,7 +517,7 @@ TEST_CASE_METHOD(discovery_parity_fixture,
                  "discovery parity - TOP_N on the probe spine: DuckDB binds, Sirius refuses",
                  "[dynamic_filter][parity][isolated_context]")
 {
-  master_only_switch_guard master_on(*con);
+  dynamic_filter_on_guard filter_on(*con);
   auto c = plan_parity_case(*con,
                             "SELECT * FROM (SELECT * FROM big_left ORDER BY val LIMIT 15) l "
                             "JOIN small_right r ON l.id = r.rid WHERE r.other > 0");
@@ -545,7 +541,7 @@ TEST_CASE_METHOD(discovery_parity_fixture,
 {
   // DuckDB descends through the probe side of any comparison join. Sirius stops when an
   // intervening RIGHT join can NULL-pad the traced probe column.
-  master_only_switch_guard master_on(*con);
+  dynamic_filter_on_guard filter_on(*con);
   auto c = plan_parity_case(*con,
                             "SELECT * FROM (SELECT l.id AS id FROM big_left l "
                             "RIGHT JOIN small_c c ON l.val = c.ckey) x "
@@ -569,9 +565,9 @@ TEST_CASE_METHOD(discovery_parity_fixture,
   REQUIRE(physical_joins.size() == 2);
   REQUIRE(hash_joins_of(physical_joins[0]->children[0].get()) ==
           std::vector<sirius::op::sirius_physical_hash_join*>{physical_joins[1]});
-  REQUIRE(scan_bindings_of(*physical_joins[0], c.physical.get())
-            .empty());  // Sirius refuses at the RIGHT join
-  REQUIRE_FALSE(physical_joins[0]->dynamic_filter_plan().enabled());
+  // Sirius's scan walk refuses at the RIGHT join; the key falls through to the join-edge route
+  // (placement pinned by the plan-shape suite).
+  REQUIRE(scan_bindings_of(*physical_joins[0], c.physical.get()).empty());
 }
 
 TEST_CASE_METHOD(discovery_parity_fixture,
@@ -579,7 +575,7 @@ TEST_CASE_METHOD(discovery_parity_fixture,
                  "[dynamic_filter][parity][isolated_context]")
 {
   // DuckDB follows supported integral casts; Sirius accepts only plain projection references.
-  master_only_switch_guard master_on(*con);
+  dynamic_filter_on_guard filter_on(*con);
   auto c =
     plan_parity_case(*con,
                      "SELECT * FROM (SELECT CAST(id AS BIGINT) AS bid, val FROM big_left) l "
@@ -601,7 +597,7 @@ TEST_CASE_METHOD(discovery_parity_fixture,
                  "discovery parity - a computed projection refuses on both sides",
                  "[dynamic_filter][parity][isolated_context]")
 {
-  master_only_switch_guard master_on(*con);
+  dynamic_filter_on_guard filter_on(*con);
   auto c = plan_parity_case(*con,
                             "SELECT * FROM (SELECT id + 1 AS cid, val FROM big_left) l "
                             "JOIN small_right r ON l.cid = r.rid WHERE r.other > 0");
@@ -619,7 +615,7 @@ TEST_CASE_METHOD(discovery_parity_fixture,
                  "discovery parity - aggregate grouping keys pass, aggregate results refuse",
                  "[dynamic_filter][parity][isolated_context]")
 {
-  master_only_switch_guard master_on(*con);
+  dynamic_filter_on_guard filter_on(*con);
 
   SECTION("a grouping key binds on both sides")
   {
@@ -663,7 +659,7 @@ TEST_CASE_METHOD(discovery_parity_fixture,
 {
   // Q19-class shape: a predicate table filters cannot express keeps a FILTER between the join and
   // the probe scan. The FILTER descent row exists precisely so this shape keeps its filter.
-  master_only_switch_guard master_on(*con);
+  dynamic_filter_on_guard filter_on(*con);
   auto c = plan_parity_case(*con,
                             "SELECT * FROM big_left l JOIN small_right r ON l.id = r.rid "
                             "WHERE l.val % 2 = 0 AND r.other > 0");
@@ -690,7 +686,7 @@ TEST_CASE_METHOD(discovery_parity_fixture,
   // DuckDB walks all hinted columns jointly and abandons the whole branch when any column fails;
   // Sirius walks per key. The per-key never-more contract still holds: the extra binding is one
   // DuckDB itself makes for that key in isolation, which the per-key oracle verifies.
-  master_only_switch_guard master_on(*con);
+  dynamic_filter_on_guard filter_on(*con);
   auto c = plan_parity_case(*con,
                             "SELECT * FROM (SELECT id, val + 1 AS w FROM big_left) l "
                             "JOIN small_right r ON l.id = r.rid AND l.w = r.other "
@@ -720,7 +716,7 @@ TEST_CASE_METHOD(discovery_parity_fixture,
                  "discovery parity - producer join-type gate",
                  "[dynamic_filter][parity][isolated_context]")
 {
-  master_only_switch_guard master_on(*con);
+  dynamic_filter_on_guard filter_on(*con);
 
   SECTION("a RIGHT producer binds on both sides")
   {
@@ -825,7 +821,7 @@ TEST_CASE_METHOD(discovery_parity_fixture,
                  "[dynamic_filter][parity][isolated_context]")
 {
   // Cross-check the test-only metadata adapter against the independent per-key DuckDB walk.
-  master_only_switch_guard master_on(*con);
+  dynamic_filter_on_guard filter_on(*con);
   auto original = optimize_query(*con,
                                  "SELECT * FROM big_left l "
                                  "JOIN (SELECT * FROM small_right WHERE other > 0) r "

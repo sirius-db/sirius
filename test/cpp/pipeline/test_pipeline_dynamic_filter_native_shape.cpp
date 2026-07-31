@@ -49,53 +49,30 @@ fs::path integration_db_path()
 #endif
 }
 
-//! RAII flip of the dynamic-filter master switch on the connection's shared SiriusContext.
-//! The plan-gen router reads it live, and the context outlives this test — restore is mandatory.
-class pushdown_switch_guard {
+//! Set the dynamic-filter switch for one scope through its SQL setter and restore the previous
+//! value on exit. SET routes to the shared SiriusContext the plan-gen router reads live, and the
+//! context outlives this test — restore is mandatory.
+class dynamic_filter_switch_guard {
  public:
-  pushdown_switch_guard(duckdb::Connection& con, bool enabled)
-    : _state(con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state")),
-      _original(_state->get_config().get_operator_params().enable_dynamic_filter_pushdown)
-  {
-    REQUIRE(_state != nullptr);
-    _state->get_config().get_operator_params().enable_dynamic_filter_pushdown = enabled;
-  }
-  ~pushdown_switch_guard()
-  {
-    _state->get_config().get_operator_params().enable_dynamic_filter_pushdown = _original;
-  }
-
-  pushdown_switch_guard(const pushdown_switch_guard&)            = delete;
-  pushdown_switch_guard& operator=(const pushdown_switch_guard&) = delete;
-
- private:
-  duckdb::shared_ptr<duckdb::SiriusContext> _state;
-  bool _original;
-};
-
-// Set SIP for one scope and restore the previous connection setting.
-class sip_switch_guard {
- public:
-  sip_switch_guard(duckdb::Connection& con, bool enabled)
+  dynamic_filter_switch_guard(duckdb::Connection& con, bool enabled)
     : _con(con),
       _original(sirius::test::get_registered_sirius_context(con)
                   ->get_config()
                   .get_operator_params()
-                  .enable_dynamic_filter_sip)
+                  .enable_dynamic_filter)
   {
-    auto result = _con.Query(std::string{"SET enable_dynamic_filter_sip = "} +
-                             (enabled ? "true" : "false") + ";");
+    auto result =
+      _con.Query(std::string{"SET enable_dynamic_filter = "} + (enabled ? "true" : "false") + ";");
     REQUIRE(result);
     REQUIRE_FALSE(result->HasError());
   }
-  ~sip_switch_guard()
+  ~dynamic_filter_switch_guard()
   {
-    _con.Query(std::string{"SET enable_dynamic_filter_sip = "} + (_original ? "true" : "false") +
-               ";");
+    _con.Query(std::string{"SET enable_dynamic_filter = "} + (_original ? "true" : "false") + ";");
   }
 
-  sip_switch_guard(const sip_switch_guard&)            = delete;
-  sip_switch_guard& operator=(const sip_switch_guard&) = delete;
+  dynamic_filter_switch_guard(const dynamic_filter_switch_guard&)            = delete;
+  dynamic_filter_switch_guard& operator=(const dynamic_filter_switch_guard&) = delete;
 
  private:
   duckdb::Connection& _con;
@@ -174,9 +151,9 @@ TEST_CASE("duckdb-native scans consume dynamic filters", "[integration][pipeline
     REQUIRE_FALSE(contains(sirius::test::convert_query_to_dump(con, scan_query), "DYNAMIC_FILTER"));
   }
 
-  SECTION("the master switch elides the operator")
+  SECTION("the switch elides the operator")
   {
-    pushdown_switch_guard off(con, /*enabled=*/false);
+    dynamic_filter_switch_guard off(con, /*enabled=*/false);
     REQUIRE_FALSE(contains(sirius::test::convert_query_to_dump(con, join_query), "DYNAMIC_FILTER"));
   }
 }
@@ -211,8 +188,8 @@ TEST_CASE("the dynamic-filter endpoint is never fed partitioned data",
   REQUIRE(endpoints_checked > 0);
 }
 
-// Verify the endpoint input contract across join and group-by wrappers. Q5 also verifies that SIP
-// increases the endpoint count without assuming an optimizer-selected placement.
+// Verify the endpoint input contract across join and group-by wrappers. Q5 also verifies that the
+// feature wires endpoints without assuming an optimizer-selected placement.
 TEST_CASE("dynamic-filter endpoints obey the data contract on SIP-shaped plans",
           "[integration][pipeline][dynamic_filter]")
 {
@@ -246,16 +223,17 @@ TEST_CASE("dynamic-filter endpoints obey the data contract on SIP-shaped plans",
     "WHERE c_mktsegment = 'BUILDING' AND c_custkey = o_custkey AND l_orderkey = o_orderkey "
     "GROUP BY l_orderkey, o_orderdate ORDER BY revenue DESC";
 
-  SECTION("Q5: SIP adds endpoints, and every endpoint obeys the data contract")
+  SECTION("Q5: the feature wires endpoints, and every endpoint obeys the data contract")
   {
-    // Pin the written join order so the delta is deterministic: the region join's build carries
-    // the r_name filter (the required evidence), and its probe key (n_regionkey) lives on the
-    // nation join's build side, which only SIP's build-block descent reaches. Every endpoint,
-    // whichever mode wired it, must consume pipelineable data.
+    // Pin the written join order so the wired plan is deterministic: the region join's build
+    // carries the r_name filter (the required evidence), and its probe key (n_regionkey) lives on
+    // the nation join's build side, which only the join-edge route's build-block descent reaches.
+    // The feature-off run wires nothing, so the delta attributes every endpoint to the feature.
+    // Every endpoint, whichever route wired it, must consume pipelineable data.
     sirius::test::disabled_optimizers_guard shape(con, "join_order,build_side_probe_side");
     std::size_t endpoints_off = 0;
     {
-      sip_switch_guard sip_off(con, /*enabled=*/false);
+      dynamic_filter_switch_guard switch_off(con, /*enabled=*/false);
       sirius::test::with_conversion_result(
         con, build_side_query, [&](sirius::pipeline::pipeline_conversion_result& result) {
           endpoints_off = for_each_endpoint(result, require_not_fed_partitioned_data);
@@ -264,7 +242,7 @@ TEST_CASE("dynamic-filter endpoints obey the data contract on SIP-shaped plans",
 
     std::size_t endpoints_on = 0;
     {
-      sip_switch_guard sip_on(con, /*enabled=*/true);
+      dynamic_filter_switch_guard switch_on(con, /*enabled=*/true);
       sirius::test::with_conversion_result(
         con, build_side_query, [&](sirius::pipeline::pipeline_conversion_result& result) {
           endpoints_on = for_each_endpoint(result, require_not_fed_partitioned_data);
@@ -278,7 +256,7 @@ TEST_CASE("dynamic-filter endpoints obey the data contract on SIP-shaped plans",
   {
     // No lower bound on the count here: what this pins is that any endpoint the converter produces
     // on this shape is fed pipelineable data.
-    sip_switch_guard sip_on(con, /*enabled=*/true);
+    dynamic_filter_switch_guard switch_on(con, /*enabled=*/true);
     sirius::test::with_conversion_result(
       con, group_by_query, [&](sirius::pipeline::pipeline_conversion_result& result) {
         for_each_endpoint(result, require_not_fed_partitioned_data);

@@ -1990,14 +1990,13 @@ static void SetCompressionColumnThreads(ClientContext& context, SetScope scope, 
   SIRIUS_LOG_DEBUG("Updated compression_column_threads to {}", n);
 }
 
-static void SetEnableDynamicFilterPushdown(ClientContext& context, SetScope scope, Value& parameter)
+static void SetEnableDynamicFilter(ClientContext& context, SetScope scope, Value& parameter)
 {
   auto* params = get_operator_params(context);
   if (!params) { return; }
-  auto slot                              = lock_operator_params_slot(context);
-  params->enable_dynamic_filter_pushdown = BooleanValue::Get(parameter);
-  SIRIUS_LOG_DEBUG("Updated config ENABLE_DYNAMIC_FILTER_PUSHDOWN to {}",
-                   params->enable_dynamic_filter_pushdown);
+  auto slot                     = lock_operator_params_slot(context);
+  params->enable_dynamic_filter = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config ENABLE_DYNAMIC_FILTER to {}", params->enable_dynamic_filter);
 }
 
 static void SetEnableDynamicZoneMapFilter(ClientContext& context, SetScope scope, Value& parameter)
@@ -2008,16 +2007,6 @@ static void SetEnableDynamicZoneMapFilter(ClientContext& context, SetScope scope
   params->enable_dynamic_zone_map_filter = BooleanValue::Get(parameter);
   SIRIUS_LOG_DEBUG("Updated config ENABLE_DYNAMIC_ZONE_MAP_FILTER to {}",
                    params->enable_dynamic_zone_map_filter);
-}
-
-static void SetEnableDynamicFilterSip(ClientContext& context, SetScope scope, Value& parameter)
-{
-  auto* params = get_operator_params(context);
-  if (!params) { return; }
-  auto slot                         = lock_operator_params_slot(context);
-  params->enable_dynamic_filter_sip = BooleanValue::Get(parameter);
-  SIRIUS_LOG_DEBUG("Updated config ENABLE_DYNAMIC_FILTER_SIP to {}",
-                   params->enable_dynamic_filter_sip);
 }
 
 static void SetDynamicFilterDomainCoverageThreshold(ClientContext& context,
@@ -2313,26 +2302,20 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
     SetCompressionColumnThreads);
 
   config.AddExtensionOption(
-    "enable_dynamic_filter_pushdown",
-    "Wire dynamic table-filter pushdown: an eligible BUILD_PROBE hash-join build publishes a "
-    "runtime membership filter (raw IN-list for 1-12 supported build rows; otherwise a hash "
-    "IN-list if it fits the smallest probe-GPU L2, or a Bloom) into the probe-side scan to drop "
-    "non-matching rows before the join (on by default)",
+    "enable_dynamic_filter",
+    "Wire runtime dynamic filters: an eligible BUILD_PROBE hash-join build publishes a membership "
+    "filter (raw IN-list for 1-12 supported build rows; otherwise a hash IN-list if it fits the "
+    "smallest probe-GPU L2, or a Bloom) into probe-side scans and, for keys no scan bind reaches, "
+    "into join-edge endpoints inside its own probe subtree (on by default)",
     LogicalType::BOOLEAN,
-    Value::BOOLEAN(sirius::operator_params{}.enable_dynamic_filter_pushdown),
-    SetEnableDynamicFilterPushdown);
-
-  config.AddExtensionOption("enable_dynamic_filter_sip",
-                            "Enable join-edge dynamic filters (Sideways Information Passing, SIP)",
-                            LogicalType::BOOLEAN,
-                            Value::BOOLEAN(sirius::operator_params{}.enable_dynamic_filter_sip),
-                            SetEnableDynamicFilterSip);
+    Value::BOOLEAN(sirius::operator_params{}.enable_dynamic_filter),
+    SetEnableDynamicFilter);
 
   config.AddExtensionOption(
     "enable_dynamic_zone_map_filter",
     "Additionally emit a runtime zone-map (build-key min/max) at the probe scan: parquet scans use "
     "it for read-time row-group pruning, while duckdb-native scans apply it row-wise post-decode; "
-    "requires enable_dynamic_filter_pushdown (off by default)",
+    "requires enable_dynamic_filter (off by default)",
     LogicalType::BOOLEAN,
     Value::BOOLEAN(sirius::operator_params{}.enable_dynamic_zone_map_filter),
     SetEnableDynamicZoneMapFilter);

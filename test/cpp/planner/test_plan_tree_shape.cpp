@@ -295,25 +295,21 @@ void require_delim_join_common(sirius::op::sirius_physical_delim_join& delim)
   require_join_child_wrap(delim.join->children[1].get(), delim.join.get(), /*is_build=*/true);
 }
 
-// Set the dynamic-filter switches for one scope and restore their previous values.
+// Set the dynamic-filter switch for one scope and restore its previous value.
 class dynamic_filter_switch_guard {
  public:
-  dynamic_filter_switch_guard(Connection& con, bool sip_enabled)
+  dynamic_filter_switch_guard(Connection& con, bool enabled)
     : _state(con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state"))
   {
     REQUIRE(_state != nullptr);
-    auto& params                          = _state->get_config().get_operator_params();
-    _original_pushdown                    = params.enable_dynamic_filter_pushdown;
-    _original_sip                         = params.enable_dynamic_filter_sip;
-    params.enable_dynamic_filter_pushdown = true;
-    params.enable_dynamic_filter_sip      = sip_enabled;
+    auto& params                 = _state->get_config().get_operator_params();
+    _original                    = params.enable_dynamic_filter;
+    params.enable_dynamic_filter = enabled;
   }
 
   ~dynamic_filter_switch_guard()
   {
-    auto& params                          = _state->get_config().get_operator_params();
-    params.enable_dynamic_filter_pushdown = _original_pushdown;
-    params.enable_dynamic_filter_sip      = _original_sip;
+    _state->get_config().get_operator_params().enable_dynamic_filter = _original;
   }
 
   dynamic_filter_switch_guard(const dynamic_filter_switch_guard&)            = delete;
@@ -321,8 +317,7 @@ class dynamic_filter_switch_guard {
 
  private:
   duckdb::shared_ptr<duckdb::SiriusContext> _state;
-  bool _original_pushdown = true;
-  bool _original_sip      = false;
+  bool _original = true;
 };
 
 struct plan_tree_shape_fixture {
@@ -448,13 +443,13 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     return joins[1];
   };
 
-  SECTION("SIP on, unfiltered build: no endpoint wires anywhere")
+  SECTION("filter on, unfiltered build: no endpoint wires anywhere")
   {
     // The producing join's build (small_c) is an unfiltered base-table image: its membership set
     // covers the whole key domain and would keep every probe row. The scan route lacks the filter
     // evidence it requires, and the join-edge route refuses too because a base-table build is not
     // a derived relation.
-    dynamic_filter_switch_guard sip_on(*con, /*sip_enabled=*/true);
+    dynamic_filter_switch_guard switch_on(*con, /*enabled=*/true);
     auto plan = generate_sirius_plan(*con, query, keep_shape);
     INFO(tree_to_string(plan.get()));
 
@@ -469,11 +464,13 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     require_parent_links(plan.get(), /*expected_parent=*/nullptr);
   }
 
-  SECTION("SIP off: the same build wrap holds the bare scan")
+  SECTION("filter off: no endpoint anywhere; the build wrap holds the bare scan")
   {
-    dynamic_filter_switch_guard sip_off(*con, /*sip_enabled=*/false);
+    dynamic_filter_switch_guard switch_off(*con, /*enabled=*/false);
     auto plan = generate_sirius_plan(*con, query, keep_shape);
     INFO(tree_to_string(plan.get()));
+
+    CHECK(collect(plan.get(), SiriusPhysicalOperatorType::DYNAMIC_FILTER).empty());
 
     auto* inner = require_inner_join(plan.get());
     auto* build_subtree =
@@ -481,16 +478,10 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     REQUIRE(build_subtree != nullptr);
     CHECK(build_subtree->type == SiriusPhysicalOperatorType::GPU_SCAN);
 
-    // With SIP disabled, any remaining endpoint must be a scan route above its GPU scan.
-    for (auto* endpoint : collect(plan.get(), SiriusPhysicalOperatorType::DYNAMIC_FILTER)) {
-      REQUIRE(endpoint->children.size() == 1);
-      CHECK(endpoint->children[0]->type == SiriusPhysicalOperatorType::GPU_SCAN);
-    }
-
     require_parent_links(plan.get(), /*expected_parent=*/nullptr);
   }
 
-  SECTION("SIP on: the endpoint lands on a LEFT join's build input")
+  SECTION("filter on: the endpoint lands on a LEFT join's build input")
   {
     // The producing join's build filter (pushed into the small_c scan) supplies the required
     // evidence; holding back join reordering is what preserves the LEFT join. The equality key's
@@ -499,7 +490,7 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
       "SELECT * FROM big_left l LEFT JOIN small_right r ON l.id = r.rid "
       "JOIN small_c c ON r.other = c.ckey WHERE c.cother >= 0";
 
-    dynamic_filter_switch_guard sip_on(*con, /*sip_enabled=*/true);
+    dynamic_filter_switch_guard switch_on(*con, /*enabled=*/true);
     auto plan = generate_sirius_plan(*con, left_query, keep_shape);
     INFO(tree_to_string(plan.get()));
 
@@ -516,7 +507,7 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     require_parent_links(plan.get(), /*expected_parent=*/nullptr);
   }
 
-  SECTION("SIP on: a null-equal producing condition places no endpoint")
+  SECTION("filter on: a null-equal producing condition places no endpoint")
   {
     // The build filter supplies discovery evidence, so null-equal inadmissibility is the only
     // rule blocking an endpoint here.
@@ -524,7 +515,7 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
       "SELECT * FROM big_left l JOIN small_right r ON l.id = r.rid "
       "JOIN small_c c ON r.other IS NOT DISTINCT FROM c.ckey WHERE c.cother >= 0";
 
-    dynamic_filter_switch_guard sip_on(*con, /*sip_enabled=*/true);
+    dynamic_filter_switch_guard switch_on(*con, /*enabled=*/true);
     auto plan = generate_sirius_plan(*con, null_equal_query, keep_shape);
     INFO(tree_to_string(plan.get()));
 
@@ -537,7 +528,7 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     require_parent_links(plan.get(), /*expected_parent=*/nullptr);
   }
 
-  SECTION("SIP on: an aggregate-result key stops the descent at the group-by")
+  SECTION("filter on: an aggregate-result key stops the descent at the group-by")
   {
     // The build filter arms discovery, but aggregate results cannot trace through HASH_GROUP_BY,
     // so the endpoint stays above the wrapped group-by chain and consumes merged rather than
@@ -546,7 +537,7 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
       "SELECT * FROM (SELECT rid, min(other) AS m FROM small_right GROUP BY rid) g "
       "JOIN small_c c ON g.m = c.ckey WHERE c.cother >= 0";
 
-    dynamic_filter_switch_guard sip_on(*con, /*sip_enabled=*/true);
+    dynamic_filter_switch_guard switch_on(*con, /*enabled=*/true);
     auto plan = generate_sirius_plan(*con, aggregate_key_query, keep_shape);
     INFO(tree_to_string(plan.get()));
 
@@ -565,7 +556,7 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     require_parent_links(plan.get(), /*expected_parent=*/nullptr);
   }
 
-  SECTION("SIP on, filtered build: the trace through the build block binds the scan route")
+  SECTION("filter on, filtered build: the trace through the build block binds the scan route")
   {
     // Build-filter evidence lets the trace cross the inner build block and bind the small_right
     // scan. A scan binding takes precedence over a direct endpoint for the same key.
@@ -573,7 +564,7 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
       "SELECT * FROM big_left l JOIN small_right r ON l.id = r.rid "
       "JOIN small_c c ON r.other = c.ckey WHERE c.cother >= 0";
 
-    dynamic_filter_switch_guard sip_on(*con, /*sip_enabled=*/true);
+    dynamic_filter_switch_guard switch_on(*con, /*enabled=*/true);
     auto plan = generate_sirius_plan(*con, filtered_build_query, keep_shape);
     INFO(tree_to_string(plan.get()));
 
@@ -608,14 +599,13 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
                  "plan tree shape - scan-route discovery wires the probe scan's DYNAMIC_FILTER",
                  "[plan_tree_shape][isolated_context]")
 {
-  // With SIP disabled, a residual build filter arms scan discovery and places the endpoint above
-  // the probe GPU scan.
+  // A residual build filter arms scan discovery and places the endpoint above the probe GPU scan.
   const std::vector<OptimizerType> keep_shape{OptimizerType::JOIN_ORDER,
                                               OptimizerType::BUILD_SIDE_PROBE_SIDE};
 
   SECTION("filtered build: the probe scan is wrapped in a DYNAMIC_FILTER")
   {
-    dynamic_filter_switch_guard sip_off(*con, /*sip_enabled=*/false);
+    dynamic_filter_switch_guard switch_on(*con, /*enabled=*/true);
     auto plan = generate_sirius_plan(*con,
                                      "SELECT * FROM big_left l JOIN "
                                      "(SELECT * FROM small_right WHERE other % 2 = 0) r "
@@ -638,7 +628,7 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
 
   SECTION("unfiltered build: no DYNAMIC_FILTER anywhere")
   {
-    dynamic_filter_switch_guard sip_off(*con, /*sip_enabled=*/false);
+    dynamic_filter_switch_guard switch_on(*con, /*enabled=*/true);
     auto plan = generate_sirius_plan(
       *con, "SELECT * FROM big_left l JOIN small_right r ON l.id = r.rid", keep_shape);
     INFO(tree_to_string(plan.get()));
@@ -646,10 +636,14 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     CHECK(collect(plan.get(), SiriusPhysicalOperatorType::DYNAMIC_FILTER).empty());
   }
 
-  SECTION("a LIMIT between the join and the scan leaves a bare GPU_SCAN")
+  SECTION(
+    "a LIMIT between the join and the scan: the endpoint stays above the LIMIT, the scan "
+    "stays bare")
   {
-    // Discovery stops at LIMIT because filtering below it can change which rows are selected.
-    dynamic_filter_switch_guard sip_off(*con, /*sip_enabled=*/false);
+    // The trace refuses at LIMIT because filtering below it can change which rows are selected.
+    // The un-bound key instead takes the join-edge route, so the endpoint is spliced above the
+    // LIMIT and the scan below it stays unwrapped.
+    dynamic_filter_switch_guard switch_on(*con, /*enabled=*/true);
     auto plan = generate_sirius_plan(*con,
                                      "SELECT * FROM (SELECT * FROM big_left LIMIT 15) l JOIN "
                                      "(SELECT * FROM small_right WHERE other % 2 = 0) r "
@@ -657,8 +651,15 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
                                      keep_shape);
     INFO(tree_to_string(plan.get()));
 
-    CHECK(collect(plan.get(), SiriusPhysicalOperatorType::DYNAMIC_FILTER).empty());
-    CHECK(find_first(plan.get(), SiriusPhysicalOperatorType::GPU_SCAN) != nullptr);
+    auto endpoints = collect(plan.get(), SiriusPhysicalOperatorType::DYNAMIC_FILTER);
+    REQUIRE(endpoints.size() == 1);
+    REQUIRE(endpoints.front()->children.size() == 1);
+    CHECK(endpoints.front()->children[0]->type == SiriusPhysicalOperatorType::STREAMING_LIMIT);
+
+    auto* scan = find_first(endpoints.front(), SiriusPhysicalOperatorType::GPU_SCAN);
+    REQUIRE(scan != nullptr);
+    REQUIRE(scan->get_parent_op() != nullptr);
+    CHECK(scan->get_parent_op()->type != SiriusPhysicalOperatorType::DYNAMIC_FILTER);
   }
 }
 
@@ -675,9 +676,9 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
   const std::vector<OptimizerType> keep_shape{OptimizerType::JOIN_ORDER,
                                               OptimizerType::BUILD_SIDE_PROBE_SIDE};
 
-  SECTION("materialized-CTE build, SIP on: the endpoint wraps the probe scan")
+  SECTION("materialized-CTE build, filter on: the endpoint wraps the probe scan")
   {
-    dynamic_filter_switch_guard sip_on(*con, /*sip_enabled=*/true);
+    dynamic_filter_switch_guard switch_on(*con, /*enabled=*/true);
     auto plan = generate_sirius_plan(*con, cte_query, keep_shape);
     INFO(tree_to_string(plan.get()));
 
@@ -703,26 +704,25 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     require_parent_links(plan.get(), /*expected_parent=*/nullptr);
   }
 
-  SECTION("materialized-CTE build, SIP off: no DYNAMIC_FILTER anywhere")
+  SECTION("materialized-CTE build, filter off: no DYNAMIC_FILTER anywhere")
   {
-    // Derived-build evidence serves only the join-edge route, so the switch-off tree is the
-    // no-dynamic-filter tree.
-    dynamic_filter_switch_guard sip_off(*con, /*sip_enabled=*/false);
+    // With the feature off, discovery never runs, so nothing wires anywhere.
+    dynamic_filter_switch_guard switch_off(*con, /*enabled=*/false);
     auto plan = generate_sirius_plan(*con, cte_query, keep_shape);
     INFO(tree_to_string(plan.get()));
 
     CHECK(collect(plan.get(), SiriusPhysicalOperatorType::DYNAMIC_FILTER).empty());
   }
 
-  // This reproduces q17's delim shape: the correlated side builds from a DELIM_GET, while the flat
-  // side retains its scan-route endpoint under both switch settings.
+  // This reproduces q17's delim shape: the correlated side builds from a DELIM_GET and wires only
+  // through derived-build evidence, while the flat side wires an ordinary scan-route endpoint.
   const std::string delim_query =
     "SELECT SUM(i.qty) FROM items i, parts p WHERE p.pk = i.fk AND p.pname = 'p1' "
     "AND i.qty < (SELECT 2 * AVG(i2.qty) FROM items i2 WHERE i2.fk = p.pk)";
 
-  SECTION("delim-scan build, SIP on: the endpoint wires inside the delim internals")
+  SECTION("delim-scan build, filter on: the endpoint wires inside the delim internals")
   {
-    dynamic_filter_switch_guard sip_on(*con, /*sip_enabled=*/true);
+    dynamic_filter_switch_guard switch_on(*con, /*enabled=*/true);
     auto plan = generate_sirius_plan(*con, delim_query);
     INFO(tree_to_string(plan.get()));
 
@@ -745,19 +745,14 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     require_parent_links(plan.get(), /*expected_parent=*/nullptr);
   }
 
-  SECTION("delim-scan build, SIP off: the delim internals hold no endpoint")
+  SECTION("delim-scan build, filter off: no endpoint anywhere")
   {
-    dynamic_filter_switch_guard sip_off(*con, /*sip_enabled=*/false);
+    dynamic_filter_switch_guard switch_off(*con, /*enabled=*/false);
     auto plan = generate_sirius_plan(*con, delim_query);
     INFO(tree_to_string(plan.get()));
 
-    auto* node = find_first(plan.get(), SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN);
-    REQUIRE(node != nullptr);
-    auto& delim = node->Cast<sirius::op::sirius_physical_right_delim_join>();
-
-    auto endpoints = collect(plan.get(), SiriusPhysicalOperatorType::DYNAMIC_FILTER);
-    REQUIRE(endpoints.size() == 1);
-    CHECK_FALSE(contains(delim.join.get(), endpoints.front()));
+    REQUIRE(find_first(plan.get(), SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN) != nullptr);
+    CHECK(collect(plan.get(), SiriusPhysicalOperatorType::DYNAMIC_FILTER).empty());
   }
 }
 

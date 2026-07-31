@@ -53,7 +53,8 @@ namespace sirius::planner {
  * @brief Which hops this producer's walk may take
  *
  * Mechanism (what a hop means) is fixed by the rule functions below; policy (which hops this
- * producer is allowed) is carried here so the same rules serve both flag settings.
+ * producer is allowed) is carried here so the rules stay expressible and testable independently of
+ * the planner's choice.
  */
 struct descent_policy {
   /// Build-block hops through an intervening join are the SIP capability; with the bit off the
