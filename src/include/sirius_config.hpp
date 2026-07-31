@@ -124,9 +124,9 @@ struct operator_params {
   /// the build publishes one membership filter (a raw exact IN-list for 1..12 supported build
   /// rows, otherwise a hash IN-list if it fits the smallest probe-GPU L2, or a Bloom) to every
   /// consumer discovered in its probe subtree: a probe-side scan applies it post-decode, and a
-  /// key no scan bind reaches gets a join-edge endpoint at the deepest value-preserving site,
-  /// including on an intervening join's build input. Redundant with the join, so results never
-  /// change. When off, discovery never runs and no channel exists anywhere. On by default.
+  /// key no scan bind reaches can place a join-edge endpoint at the deepest value-preserving
+  /// site, including on an intervening join's build input. Redundant with the join, so results
+  /// never change. When off, discovery never runs and no channel exists anywhere. On by default.
   bool enable_dynamic_filter = true;
 
   /// Additionally emit a runtime zone-map (build-key [min,max]) alongside the membership filter,
