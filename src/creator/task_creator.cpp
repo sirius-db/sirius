@@ -762,11 +762,6 @@ void task_creator::manager_loop()
           // queries would hang.
           pipeline->update_pipeline_status(false);
         } catch (const std::exception& e) {
-          // Fail only this query. The stop() that used to follow ran on a task_creator pool
-          // worker and called _bounded_pool->wait_all(), which blocks until active_ == 0 — but
-          // this thread IS an active slot, so it deadlocked outright; and had it got past,
-          // _bounded_pool.reset() would have joined this thread with itself inside a noexcept
-          // function. It also tore down task creation for every other in-flight query.
           SIRIUS_LOG_ERROR("Task Creator: Exception during task creation: {}", e.what());
           report_fatal_error(query_state->completion_handler, std::current_exception());
         }

@@ -250,8 +250,7 @@ void gpu_pipeline_executor::process_task(
             .get();
       } catch (const std::exception& e) {
         // The downgrade executor cancelled this request (its queue was drained). This task cannot
-        // get its reservation, so fail its query — previously this broke the manager loop, which
-        // killed this GPU for every other in-flight query and left them hanging forever.
+        // get its reservation, so fail its query 
         SIRIUS_LOG_INFO("GPU Pipeline Executor: downgrade request cancelled for task {}: {}",
                         gpu_task->get_task_id(),
                         e.what());
@@ -448,9 +447,6 @@ void gpu_pipeline_executor::process_task(
           this->schedule(std::move(new_task));
           return;
         } catch (const std::exception& e) {
-          // Report to THIS task's query only. This used to also call _task_creator->stop(), which
-          // interrupted the shared creation queue and tore down the shared pool — silently
-          // stalling every other in-flight query because one query's operator threw.
           SIRIUS_LOG_ERROR("GPU Pipeline Executor: Exception during task execution: {}", e.what());
           if (completion) { completion->report_error(std::current_exception()); }
           return;
@@ -511,8 +507,6 @@ void gpu_pipeline_executor::process_task(
         }
       });
   } catch (const std::exception& e) {
-    // Reservation, stream acquisition and telemetry can all throw. Before this catch existed the
-    // throw escaped manager_loop's thread function and aborted the whole process.
     SIRIUS_LOG_ERROR("GPU Pipeline Executor: Exception while preparing task for dispatch: {}",
                      e.what());
     try {
