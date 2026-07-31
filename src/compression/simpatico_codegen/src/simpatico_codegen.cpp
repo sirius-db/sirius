@@ -319,18 +319,9 @@ std::vector<std::string> split_and_validate_plans(std::string_view plan_dsl,
   auto plans = split_plan_dsl_impl(plan_dsl);
   validate_plan_count(plans.size(), table.num_columns());
   validate_column_names(column_names, plans.size());
-  // Leaf operators read input data through column_view::head(), which is
-  // offset-unaware (it returns the allocation base, not data() == head() + offset).
-  // A sliced/offset input column would therefore be compressed from the wrong
-  // elements. Sliced inputs are not supported: reject them loudly rather than emit
-  // corrupt output — the caller must compact (deep-copy) the column first.
-  for (cudf::size_type i = 0; i < table.num_columns(); ++i) {
-    if (table.column(i).offset() != 0) {
-      throw plan_error("compress_with_plan: input column " + std::to_string(i) +
-                       " has a non-zero offset (" + std::to_string(table.column(i).offset()) +
-                       "); sliced/offset column views are not supported, compact the column first");
-    }
-  }
+  // Sliced column views (offset != 0) are supported: every encode kernel reads
+  // data<T>() (= head<T>() + offset) rather than head<T>() so the correct
+  // elements are compressed regardless of the view's allocation base.
   return plans;
 }
 }  // namespace
