@@ -348,6 +348,22 @@ std::vector<std::string> split_plan_dsl(std::string_view plan_dsl)
 // ── compress_with_plan ────────────────────────────────────────────────────────
 
 namespace {
+// Leaf operators read input data through column_view::head(), which is
+// offset-unaware (it returns the allocation base, not data() == head() + offset).
+// A sliced/offset input column would therefore be compressed from the wrong
+// elements. Sliced inputs are not supported: reject them loudly rather than emit
+// corrupt output — the caller must compact (deep-copy) the column first.
+void reject_sliced_columns(cudf::table_view table)
+{
+  for (cudf::size_type i = 0; i < table.num_columns(); ++i) {
+    if (table.column(i).offset() != 0) {
+      throw plan_error("compress_with_plan: input column " + std::to_string(i) +
+                       " has a non-zero offset (" + std::to_string(table.column(i).offset()) +
+                       "); sliced/offset column views are not supported, compact the column first");
+    }
+  }
+}
+
 // Split the per-column plan DSL and validate it against the table + names.
 // Shared preamble of all three compress_with_plan overloads.
 std::vector<std::string> split_and_validate_plans(std::string_view plan_dsl,
@@ -357,21 +373,24 @@ std::vector<std::string> split_and_validate_plans(std::string_view plan_dsl,
   auto plans = split_plan_dsl_impl(plan_dsl);
   validate_plan_count(plans.size(), table.num_columns());
   validate_column_names(column_names, plans.size());
-  // Leaf operators read input data through column_view::head(), which is
-  // offset-unaware (it returns the allocation base, not data() == head() + offset).
-  // A sliced/offset input column would therefore be compressed from the wrong
-  // elements. Sliced inputs are not supported: reject them loudly rather than emit
-  // corrupt output — the caller must compact (deep-copy) the column first.
-  for (cudf::size_type i = 0; i < table.num_columns(); ++i) {
-    if (table.column(i).offset() != 0) {
-      throw plan_error("compress_with_plan: input column " + std::to_string(i) +
-                       " has a non-zero offset (" + std::to_string(table.column(i).offset()) +
-                       "); sliced/offset column views are not supported, compact the column first");
-    }
-  }
+  reject_sliced_columns(table);
   return plans;
 }
 }  // namespace
+
+compressed_table compress_columns(cudf::table_view table,
+                                  std::vector<std::string> const& column_plans,
+                                  int column_threads,
+                                  rmm::device_async_resource_ref mr,
+                                  std::vector<std::string> column_names)
+{
+  nvtx3::scoped_range nvtx_range{"simpatico::compress_columns[threads]"};
+  validate_plan_count(column_plans.size(), table.num_columns());
+  validate_column_names(column_names, column_plans.size());
+  reject_sliced_columns(table);
+  leased_pool lp(std::min(std::max(1, column_threads), std::max(1, table.num_columns())));
+  return compress_columns_parallel(table, column_plans, lp.pool, mr, column_names);
+}
 
 compressed_table compress_with_plan(cudf::table_view table,
                                     std::string_view plan_dsl,

@@ -37,10 +37,11 @@ namespace sirius {
  */
 void register_compression_converters(cucascade::representation_converter_registry& registry);
 
-/// Column-parallelism degree for the decompress converters (process-global since
-/// converters have no per-context config). Mirrors compression_config::column_threads.
-void set_decompress_column_threads(int n) noexcept;
-[[nodiscard]] int decompress_column_threads() noexcept;
+/// Column-parallelism degree for the compress and decompress converters
+/// (process-global since converters have no per-context config). Mirrors
+/// compression_config::column_threads.
+void set_compression_column_threads(int n) noexcept;
+[[nodiscard]] int compression_column_threads() noexcept;
 
 /**
  * @brief Peak device bytes needed to materialize @p data as a GPU table.

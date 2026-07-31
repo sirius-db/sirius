@@ -591,7 +591,7 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
       comp.max_compressed_fraction,
       comp.output_compression_min_batch_bytes,
       comp.enable_device_compression_downgrade);
-    sirius::set_decompress_column_threads(comp.column_threads);
+    sirius::set_compression_column_threads(comp.column_threads);
 
     // Load every offline table plan up front. These used to be read lazily inside
     // pin_table()'s bind, one table at a time — so a query that never pinned

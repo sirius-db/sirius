@@ -57,16 +57,16 @@
 namespace sirius {
 
 namespace {
-std::atomic<int> g_decompress_column_threads{1};
+std::atomic<int> g_compression_column_threads{1};
 }  // namespace
 
-void set_decompress_column_threads(int n) noexcept
+void set_compression_column_threads(int n) noexcept
 {
-  g_decompress_column_threads.store(n, std::memory_order_relaxed);
+  g_compression_column_threads.store(n, std::memory_order_relaxed);
 }
-int decompress_column_threads() noexcept
+int compression_column_threads() noexcept
 {
-  return g_decompress_column_threads.load(std::memory_order_relaxed);
+  return g_compression_column_threads.load(std::memory_order_relaxed);
 }
 
 namespace {
@@ -133,7 +133,7 @@ std::unique_ptr<cucascade::idata_representation> reconstruct_and_decompress_to_g
   // parallel overload owns and syncs its own stream pool, so the result is
   // resident before it is wrapped against `stream` below.
   const int n_threads =
-    std::min(decompress_column_threads(), static_cast<int>(subset.columns.size()));
+    std::min(compression_column_threads(), static_cast<int>(subset.columns.size()));
   std::unique_ptr<cudf::table> decompressed;
   if (n_threads > 1) {
     // The reconstruct above fetched every compressed leaf buffer to device on
@@ -212,7 +212,7 @@ std::unique_ptr<cucascade::idata_representation> decompress_device_to_gpu(
   // Reconstructs here for a blob staged by the output/downgrade tiers, which defer it;
   // for a pinned chunk the table is already built and this is a plain lookup.
   auto const& ct      = rep.table(stream, mr);
-  const int n_threads = std::min(decompress_column_threads(),
+  const int n_threads = std::min(compression_column_threads(),
                                  static_cast<int>(indices ? indices->size() : ct.num_columns()));
   std::unique_ptr<cudf::table> decompressed;
   if (n_threads > 1) {
@@ -290,6 +290,49 @@ std::string default_plan_for(cudf::data_type type)
 {
   if (!cudf::is_fixed_width(type)) { return kPassthroughDsl; }
   return "input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n";
+}
+
+// Compress every column of `view`, each with its own plan, and return the
+// compressed_table. Above one thread this fans the columns across a stream pool
+// exactly as the decompress converters do — one column per worker stream — so a
+// batch's columns encode concurrently instead of queueing behind each other's
+// per-plan-node stream syncs (simpatico's `compress_column` is single-stream by
+// construction and syncs inside every variable-output codec, so cross-column
+// overlap is the only overlap available).
+//
+// Like the parallel decode path, the pool streams do not observe `stream`, so the
+// caller's work that produced `view` has to be ordered before the workers read it.
+simpatico::compressed_table compress_columns_with_plans(cudf::table_view view,
+                                                        std::vector<std::string> plans,
+                                                        std::vector<std::string> names,
+                                                        rmm::cuda_stream_view stream,
+                                                        rmm::device_async_resource_ref mr)
+{
+  const auto num_columns = static_cast<std::size_t>(view.num_columns());
+  const int n_threads    = std::min(compression_column_threads(), static_cast<int>(num_columns));
+  if (n_threads > 1) {
+    stream.synchronize();
+    return simpatico::compress_columns(view, plans, n_threads, mr, std::move(names));
+  }
+
+  simpatico::compressed_table out;
+  out.columns.reserve(num_columns);
+  for (std::size_t i = 0; i < num_columns; ++i) {
+    const auto col = view.column(static_cast<cudf::size_type>(i));
+    std::string err;
+    auto tree = simpatico::compress_column(col, plans[i], stream, mr, &err);
+    if (!tree) {
+      throw std::runtime_error("[compression_converters] compress_column " + std::to_string(i) +
+                               ": " + (err.empty() ? "failed" : err));
+    }
+    simpatico::compressed_column out_col;
+    out_col.dtype     = col.type();
+    out_col.num_rows  = view.num_rows();
+    out_col.name      = std::move(names[i]);
+    out_col.plan_tree = std::move(tree);
+    out.columns.push_back(std::move(out_col));
+  }
+  return out;
 }
 
 using column_state = compression::plan_register::column_plan_state;
@@ -473,27 +516,13 @@ staged_compression compress_for_spill(cudf::table_view view,
   // still carry it for the batch to round-trip, but running a codec that does not
   // shrink it would be pure cost.
   staged_compression out;
-  out.table.columns.reserve(num_columns);
-  auto names = synthetic_column_names(view.num_columns());
+  std::vector<std::string> dsls;
+  dsls.reserve(num_columns);
   for (std::size_t i = 0; i < num_columns; ++i) {
-    const auto col      = view.column(static_cast<cudf::size_type>(i));
-    const bool compress = column_plans[i].viable;
-
-    std::string err;
-    auto tree = simpatico::compress_column(
-      col, compress ? column_plans[i].dsl : kPassthroughDsl, stream, mr, &err);
-    if (!tree) {
-      throw std::runtime_error("[compression_converters] compress_column " + std::to_string(i) +
-                               ": " + (err.empty() ? "failed" : err));
-    }
-
-    simpatico::compressed_column out_col;
-    out_col.dtype     = col.type();
-    out_col.num_rows  = view.num_rows();
-    out_col.name      = names[i];
-    out_col.plan_tree = std::move(tree);
-    out.table.columns.push_back(std::move(out_col));
+    dsls.push_back(column_plans[i].viable ? column_plans[i].dsl : kPassthroughDsl);
   }
+  out.table = compress_columns_with_plans(
+    view, std::move(dsls), synthetic_column_names(view.num_columns()), stream, mr);
 
   const std::string hdr_err = simpatico::build_compressed_table_header(
     out.table, out.header, out.buffers, out.payload_bytes, stream);
@@ -677,39 +706,25 @@ std::unique_ptr<cucascade::idata_representation> compress_gpu_to_device(
 
   // Compress column by column: a qualifying column uses its lineage plan, and
   // every other column is carried as cheaply as its dtype allows.
-  simpatico::compressed_table ct;
-  ct.columns.reserve(num_columns);
-  auto names = synthetic_column_names(view.num_columns());
+  //
+  // A non-qualifying column cannot be carried by plain identity: the blob
+  // reconstruct allocates every leaf with cudf::make_numeric_column
+  // (compressed_table_io.cpp:281), which rejects DECIMAL and TIMESTAMP — so
+  // `input -> identity` on those faults with "Invalid, non-numeric type".
+  // default_plan_for is the spill path's answer to exactly that: bitpack for
+  // fixed-width types (whose leaves are integral) and passthrough only for
+  // STRING/nested, whose str_split leaves are INT32/INT8. Bitpack is cheap
+  // enough that the spill sweep measured it at ~0.95x against no compression.
+  std::vector<std::string> dsls;
+  dsls.reserve(num_columns);
   std::vector<std::uint64_t> original_bytes(num_columns, 0);
-
   for (std::size_t i = 0; i < num_columns; ++i) {
-    const auto col   = view.column(static_cast<cudf::size_type>(i));
-    const auto& plan = (*plans)[i];
-
-    // A non-qualifying column cannot be carried by plain identity: the blob
-    // reconstruct allocates every leaf with cudf::make_numeric_column
-    // (compressed_table_io.cpp:281), which rejects DECIMAL and TIMESTAMP — so
-    // `input -> identity` on those faults with "Invalid, non-numeric type".
-    // default_plan_for is the spill path's answer to exactly that: bitpack for
-    // fixed-width types (whose leaves are integral) and passthrough only for
-    // STRING/nested, whose str_split leaves are INT32/INT8. Bitpack is cheap
-    // enough that the spill sweep measured it at ~0.95x against no compression.
-    std::string err;
-    auto tree = simpatico::compress_column(
-      col, plan.has_value() ? *plan : default_plan_for(col.type()), stream, mr, &err);
-    if (!tree) {
-      throw std::runtime_error("[compression_converters] output compress_column " +
-                               std::to_string(i) + ": " + (err.empty() ? "failed" : err));
-    }
+    const auto col = view.column(static_cast<cudf::size_type>(i));
+    dsls.push_back((*plans)[i].has_value() ? *(*plans)[i] : default_plan_for(col.type()));
     original_bytes[i] = simpatico::column_size_bytes_ex(col, stream);
-
-    simpatico::compressed_column out_col;
-    out_col.dtype     = col.type();
-    out_col.num_rows  = view.num_rows();
-    out_col.name      = names[i];
-    out_col.plan_tree = std::move(tree);
-    ct.columns.push_back(std::move(out_col));
   }
+  simpatico::compressed_table ct = compress_columns_with_plans(
+    view, std::move(dsls), synthetic_column_names(view.num_columns()), stream, mr);
 
   std::vector<std::uint8_t> header;
   std::vector<simpatico::payload_buffer_ref> buffers;
@@ -905,7 +920,7 @@ std::unique_ptr<cucascade::idata_representation> compress_gpu_to_device(
   return std::make_unique<compressed_device_representation>(
     *space_mut,
     std::move(blob),
-    std::move(names),
+    synthetic_column_names(view.num_columns()),
     compressed_bytes,
     uncompressed_bytes,
     static_cast<std::int64_t>(view.num_rows()));
@@ -1140,7 +1155,7 @@ std::unique_ptr<cucascade::idata_representation> decompress_disk_to_gpu(
   }
 
   auto const& indices = rep.selected_indices();
-  const int n_threads = std::min(decompress_column_threads(),
+  const int n_threads = std::min(compression_column_threads(),
                                  static_cast<int>(indices ? indices->size() : ct.num_columns()));
   std::unique_ptr<cudf::table> decompressed;
   if (n_threads > 1) {
