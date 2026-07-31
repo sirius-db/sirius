@@ -202,48 +202,39 @@ void task_scheduler::terminate_query(const std::shared_ptr<completion_handler>& 
 
 void task_scheduler::drain_after_error(sirius::query_id_t query_id)
 {
-  SIRIUS_LOG_INFO("task_scheduler: draining after error");
-  // Teardown ordering is load-bearing. The scan/gpu executor drains below run
-  // in-flight tasks to completion, and a completing task schedules its
-  // downstream consumers via task_creator::schedule() (gpu_pipeline_executor and
-  // duckdb_scan_executor both do this). Each such request holds a raw
-  // sirius_physical_operator* owned by the engine, which is destroyed the moment
-  // execute() returns. If the task_creator is live (or restarted) while those
-  // requests are still in flight, its manager_loop dereferences a freed operator
-  // in get_operator_for_next_task() — a use-after-free that crashes intermittently
-  // under multi-partition sort with many in-flight pipeline tasks.
+  SIRIUS_LOG_INFO("task_scheduler: draining after error for query {}", query_id);
+  // Teardown ordering is load-bearing. The executor drains below run in-flight tasks to
+  // completion, and a completing task schedules its downstream consumers via
+  // task_creator::schedule(). Each such request holds a raw sirius_physical_operator* owned by
+  // the engine, which is destroyed the moment execute() returns. If those requests are processed
+  // after the plan dies, manager_loop dereferences a freed operator in
+  // get_operator_for_next_task() — a use-after-free seen under multi-partition sort with many
+  // in-flight pipeline tasks.
   //
-  // So: stop the task_creator FIRST and keep its queue interrupted across the
-  // executor drains. With the queue interrupted, schedule() pushes from
-  // completion callbacks return false and the requests (and their dangling
-  // operator pointers) are dropped instead of processed. Only AFTER every
-  // executor has quiesced do we drain the creation queue and restart the
-  // creator for the next query.
-  if (_task_creator) { _task_creator->stop_thread_pool(); }
+  // This used to be achieved by stopping the shared task_creator and keeping its queue
+  // interrupted across the drains, so that late schedule() pushes returned false. That worked but
+  // was process-wide: it halted task creation for EVERY in-flight query and dropped their queued
+  // requests too. The lifecycle gate does the same job scoped to one query — from here on,
+  // schedule() for this query is refused while every other query keeps producing.
+  if (_query_lifecycle != nullptr) { _query_lifecycle->quiesce(query_id); }
 
-  // Drain the top-level task queue so management_eventloop doesn't dispatch
-  // stale tasks from the failed query.
-  _task_queue.drain();
+  // Drop this query's queued work so management_eventloop cannot dispatch a stale task from it.
+  _task_queue.drain(exec::query_index{static_cast<exec::query_key>(sirius::value_of(query_id))});
 
-  // Interrupt each GPU executor's manager loop, wait for in-flight thread-pool
-  // tasks to finish, then restart the manager for the next query.
+  // Let in-flight tasks finish, then drop whatever this query still has staged per device.
   for (auto& [device_id, gpu_exec] : _gpu_executors) {
-    gpu_exec->drain_and_wait();
+    gpu_exec->wait_and_drain_query(query_id);
   }
 
-  // Now that no executor can generate further task_creation_requests, discard the ones this
-  // query accumulated — they hold raw operator pointers into a plan that QueryEnd is about to
-  // destroy. Scoped to this query: any other in-flight query keeps its pending requests.
+  // Discard the creation requests this query accumulated — they hold raw operator pointers into a
+  // plan that QueryEnd is about to destroy. Other queries keep their pending requests.
   if (_task_creator) { _task_creator->drain_pending_tasks(query_id); }
 
-  // Belt-and-suspenders: the executor restarts above emit device_ready signals,
-  // and the management loop may have dispatched a leftover task into an executor
-  // queue between the two drains. Clear the top-level queue once more so the
-  // next query starts from empty.
-  _task_queue.drain();
+  // A task completing during the drains above can have handed one more task to the scheduler
+  // queue before the gate refused its successor, so sweep this query once more.
+  _task_queue.drain(exec::query_index{static_cast<exec::query_key>(sirius::value_of(query_id))});
 
-  if (_task_creator) { _task_creator->start_thread_pool(); }
-  SIRIUS_LOG_INFO("task_scheduler: DONE draining after error");
+  SIRIUS_LOG_INFO("task_scheduler: DONE draining after error for query {}", query_id);
 }
 
 void task_scheduler::wait_for_completion(sirius::query_id_t query_id)
@@ -253,38 +244,36 @@ void task_scheduler::wait_for_completion(sirius::query_id_t query_id)
   // throw if not — a non-empty queue means tasks were still being scheduled when we
   // declared the query done.
   //
-  // Halt the producer (task_creator) first so the checks are not racing new task
-  // creation. The task_creator is always restarted afterwards (even on throw) so the
-  // next query can run.
-  if (_task_creator) { _task_creator->stop_thread_pool(); }
+  // Halt this query's producers so the checks are not racing its own task creation. This used to
+  // be _task_creator->stop_thread_pool(), which tore down the SHARED creation pool and interrupted
+  // the shared queue — halting every other in-flight query, and dropping their queued requests,
+  // on every successful completion. The gate does it for one query.
+  if (_query_lifecycle != nullptr) { _query_lifecycle->quiesce(query_id); }
+  const exec::query_index this_query{static_cast<exec::query_key>(sirius::value_of(query_id))};
   try {
-    // The task_scheduler's pipeline task queue must be empty.
-    if (const std::size_t remaining = _task_queue.size(); remaining != 0) {
+    // Only THIS query's tasks must be gone. The old check used the whole-queue size(), so query A
+    // completing normally threw "task queue not empty" because query B had work queued.
+    if (const std::size_t remaining = _task_queue.size(this_query); remaining != 0) {
       SIRIUS_LOG_ERROR(
-        "task_scheduler::wait_for_completion: pipeline _task_queue NOT empty at query "
+        "task_scheduler::wait_for_completion: pipeline _task_queue NOT empty for query {} at "
         "completion — {} task(s) still queued; work was still scheduled when the query was "
         "marked complete",
+        query_id,
         remaining);
       throw std::runtime_error(
         "task_scheduler: pipeline task queue not empty at query completion (" +
         std::to_string(remaining) + " task(s) remaining)");
     }
 
-    // Each executor must finish its in-flight tasks and then have an empty queue.
+    // Each executor must finish its in-flight tasks and then have none of this query's queued.
     for (auto& [device_id, gpu_exec] : _gpu_executors) {
-      gpu_exec->wait_and_validate_empty();
+      gpu_exec->wait_and_validate_empty(query_id);
     }
   } catch (...) {
-    if (_task_creator) {
-      _task_creator->drain_pending_tasks(query_id);
-      _task_creator->start_thread_pool();
-    }
+    if (_task_creator) { _task_creator->drain_pending_tasks(query_id); }
     throw;
   }
-  if (_task_creator) {
-    _task_creator->drain_pending_tasks(query_id);
-    _task_creator->start_thread_pool();
-  }
+  if (_task_creator) { _task_creator->drain_pending_tasks(query_id); }
 }
 
 void task_scheduler::drain_query_tasks(sirius::query_id_t query_id)
@@ -331,7 +320,10 @@ void task_scheduler::management_eventloop()
       }
     }
 
-    if (_task_queue.empty()) {
+    // _ready_devices can be empty here: this loop also wakes on task_available events, which carry
+    // no device, and a per-query drain can empty _task_queue between the push and this check.
+    // Dereferencing begin() on an empty vector is UB — it used to yield a garbage device id.
+    if (_task_queue.empty() && !_ready_devices.empty()) {
       // No query id: the task_creator picks the oldest live query itself, since this loop has
       // none to inherit.
       if (_task_creator) { _task_creator->schedule_lookahead(*_ready_devices.begin()); }
