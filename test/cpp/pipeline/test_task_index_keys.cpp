@@ -51,16 +51,14 @@ class plain_task : public sirius::parallel::itask {
 struct task_fixture {
   //! A pipeline needs a real source/sink: ~gpu_pipeline_task calls mark_task_completed(), which
   //! walks the pipeline's operators.
-  duckdb::shared_ptr<sirius::pipeline::sirius_pipeline> make_pipeline(sirius::query_id_t query_id,
-                                                                      sirius::exec::queue_priority
-                                                                        priority)
+  duckdb::shared_ptr<sirius::pipeline::sirius_pipeline> make_pipeline(
+    sirius::query_id_t query_id, sirius::exec::queue_priority priority)
   {
-    auto pipeline = duckdb::make_shared_ptr<sirius::pipeline::sirius_pipeline>(build_ctx);
-    auto& op      = *operators.emplace_back(
-      std::make_unique<sirius::op::sirius_physical_operator>(
-        sirius::op::SiriusPhysicalOperatorType::FILTER,
-        duckdb::vector<sirius::logical_type>{},
-        /*estimated_cardinality=*/0));
+    auto pipeline  = duckdb::make_shared_ptr<sirius::pipeline::sirius_pipeline>(build_ctx);
+    auto& op       = *operators.emplace_back(std::make_unique<sirius::op::sirius_physical_operator>(
+      sirius::op::SiriusPhysicalOperatorType::FILTER,
+      duckdb::vector<sirius::logical_type>{},
+      /*estimated_cardinality=*/0));
     op.operator_id = operators.size() - 1;
 
     sirius::pipeline::sirius_pipeline_build_state build_state;
