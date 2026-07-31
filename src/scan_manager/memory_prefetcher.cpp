@@ -24,6 +24,7 @@
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <exception>
 
@@ -109,16 +110,25 @@ std::size_t memory_prefetcher::sweep(rmm::cuda_stream_view stream)
   for (const auto& connector : _connectors) {
     if (!_running.load(std::memory_order_relaxed)) { return converted; }
 
-    // Actively-draining connector: its scan tasks convert their own batches
-    // on 1 stream per pipeline thread. Grabbing exclusive locks here would
-    // serialize those conversions behind the (fewer) prefetch threads and
-    // slow scan-bound queries down.
-    if (connector->is_draining(_config.drain_quiet_ms)) { continue; }
+    // Actively-draining connector: its scan tasks convert their own popped
+    // batches on 1 stream per pipeline thread, so racing them near the pop
+    // point serializes those conversions behind the (fewer) prefetch threads.
+    // Collisions only happen at the head of the queue, though — so instead of
+    // skipping the connector entirely, convert TAIL-FIRST and leave a head
+    // margin for the batches the scan will pop imminently.
+    const bool draining = connector->is_draining(_config.drain_quiet_ms);
+    auto batches        = connector->peek_resident_batches();
+    if (draining) {
+      constexpr std::size_t head_margin = 4;
+      if (batches.size() <= head_margin) { continue; }
+      batches.erase(batches.begin(), batches.begin() + head_margin);
+      std::reverse(batches.begin(), batches.end());
+    }
 
-    for (const auto& batch : connector->peek_resident_batches()) {
-      // Re-check between conversions so we back off within one batch of the
-      // scan starting to drain this connector.
-      if (connector->is_draining(_config.drain_quiet_ms)) { break; }
+    for (const auto& batch : batches) {
+      // For a quiet connector, back off to tail-first within one batch of the
+      // scan starting to drain it (the next sweep re-plans with the margin).
+      if (!draining && connector->is_draining(_config.drain_quiet_ms)) { break; }
       if (!_running.load(std::memory_order_relaxed)) { return converted; }
 
       // Cheap pre-check under a shared lock; skip GPU-resident batches.
