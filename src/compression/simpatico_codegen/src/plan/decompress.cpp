@@ -4,6 +4,7 @@
 #include "codegen/decode/masked_launch.hpp"
 #include "codegen/plan/bitjoin_layout.hpp"
 #include "codegen/plan/plan_interpreter.hpp"
+#include "codegen/plan/validity.hpp"
 #include "codegen/util/nvtx.hpp"
 
 #include <cudf/aggregation.hpp>
@@ -1350,6 +1351,9 @@ std::unique_ptr<cudf::column> decompress_column(PlanTree const& tree,
       }
       return nullptr;
     }
+    // Reattach the validity the compress side detached (a no-op for an all-valid column, which
+    // every masked route is guaranteed to see -- selection targets NOT NULL columns only).
+    attach_validity(*col, tree.validity, stream, mr);
     return col;
   }
 
@@ -1432,6 +1436,10 @@ std::unique_ptr<cudf::column> decompress_column(PlanTree const& tree,
     // soon as we return, so the gather must have completed.
     cudaStreamSynchronize(stream.get());
   }
+  // Reattach the validity the compress side detached. The walk itself decodes a
+  // null-free column, so this is the only place (besides the masked str_split
+  // return above) the mask re-enters the picture.
+  if (col) attach_validity(*col, tree.validity, stream, mr);
   return col;
 }
 

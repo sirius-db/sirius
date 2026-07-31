@@ -47,9 +47,8 @@ std::vector<OperatorInfo> const& operator_registry()
     {OpId::For,            "for",             {"deltas", "references"},                                               true,  false, true,  true, {{"references", ChannelLayout::per_chunk_metadata}}},
     {OpId::Zigzag,         "zigzag",          {"zigzag"},                                                             true,  false, true,  true, {{"zigzag", ChannelLayout::bulk_fixed_stride}}},
     // keys_* are the dictionary itself — column state, valid for any subset of the rows that
-    // index into it. `indices` is the row-indexed channel. `null_mask` is deliberately NOT
-    // classified: it is one BIT per row, which no layout here describes, so a nullable dictionary
-    // column refuses (correctly) rather than being addressed with byte-per-row arithmetic.
+    // index into it. `indices` is the row-indexed channel. Validity is stripped upstream of the
+    // plan (compress_column), so a nullable dictionary column carries no null_mask channel here.
     {OpId::Dictionary,     "dictionary",      {},                                                                     true,  false, false, false, {{"keys_offsets", ChannelLayout::column_state}, {"keys_chars", ChannelLayout::column_state}, {"indices", ChannelLayout::bulk_fixed_stride}}},
     {OpId::Alp,            "alp",             {"integers", "exceptions", "exception_positions", "metadata"},          true,  false, true,  false, {}},
     {OpId::AlpRd,          "alp_rd",          {"right_parts", "dict_indices", "dict", "metadata", "exceptions", "exception_positions"}, true, false, true, false, {}},
@@ -61,10 +60,7 @@ std::vector<OperatorInfo> const& operator_registry()
     {OpId::Bitextract,     "bitextract",      {},                                                                     true,  false, true,  false, {}},
     {OpId::Identity,       "identity",        {"data"},                                                               false, false, false, false, {{"data", ChannelLayout::bulk_fixed_stride}}},
     {OpId::NvcompCascaded, "nvcomp_cascaded", {"output"},                                                             false, false, false, false, {{"output", ChannelLayout::whole_column}}},
-
-    // 2 or 3 channels: offsets, chars[, null_mask]. null_mask is optional (present only when
-    // nullable); the generic named_channels() skips nullptr slots so arity is correct at runtime.
-    {OpId::StrSplit,       "str_split",       {"offsets", "chars", "null_mask"},                                     true,  false, true,  false, {{"offsets", ChannelLayout::bulk_fixed_stride}, {"chars", ChannelLayout::whole_column}, {"null_mask", ChannelLayout::bulk_fixed_stride}}},
+    {OpId::StrSplit,       "str_split",       {"offsets", "chars"},                                                   true,  false, true,  false, {{"offsets", ChannelLayout::bulk_fixed_stride}, {"chars", ChannelLayout::whole_column}}},
 
   };
   // clang-format on
