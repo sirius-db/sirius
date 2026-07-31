@@ -167,8 +167,12 @@ class task_scheduler {
   void drain_query_tasks(sirius::query_id_t query_id);
 
   /**
-   * @brief Terminate the query execution and report the error to duckdb.
+   * @brief Fail one query by reporting @p error to its own completion handler.
    *
+   * Touches no shared subsystem: other in-flight queries keep running. The caller's query is
+   * unwound by sirius_engine::execute, whose future.get() catch runs drain_after_error(query_id).
+   *
+   * @param handler The failing query's completion handler.
    * @param error The error to report.
    */
   void terminate_query(const std::shared_ptr<completion_handler>& handler,

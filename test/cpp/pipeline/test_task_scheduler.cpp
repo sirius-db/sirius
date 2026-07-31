@@ -16,6 +16,7 @@
 
 #include "catch.hpp"
 #include "exec/config.hpp"
+#include "pipeline/completion_handler.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
 #include "pipeline/task_scheduler.hpp"
 #include "scan/test_utils.hpp"
@@ -27,8 +28,10 @@
 
 #include <atomic>
 #include <chrono>
+#include <exception>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <thread>
 
 using namespace sirius::pipeline;
@@ -137,6 +140,53 @@ TEST_CASE("Task scheduler executes tasks through pipeline_queue", "[task_schedul
     }
   }
 
+  REQUIRE(global_state->executed_count.load() == num_tasks);
+
+  executor.stop();
+}
+
+TEST_CASE("terminate_query fails only its own query and leaves the scheduler running",
+          "[task_scheduler][concurrency]")
+{
+  // Regression for the "one query's failure hangs the whole engine" class of bug:
+  // terminate_query used to call stop(), which closed the request channel, joined the management
+  // thread and stopped every GPU executor -- for ALL queries -- with no path that ever calls
+  // start() again. Any other in-flight query was left waiting on a completion that could never
+  // arrive, as was every subsequent query in the process.
+  auto manager = initialize_memory_manager(1);
+  sirius::exec::thread_pool_config gpu_config{2};
+  task_scheduler executor(gpu_config, *manager, sirius::test::make_test_telemetry_context());
+
+  executor.start();
+
+  // Query A fails.
+  auto handler_a = std::make_shared<completion_handler>();
+  auto future_a  = handler_a->get_awaitable();
+  executor.terminate_query(handler_a,
+                           std::make_exception_ptr(std::runtime_error("query A creation failed")));
+
+  // A -- and only A -- is failed.
+  REQUIRE_THROWS_AS(future_a.get(), std::runtime_error);
+
+  // The scheduler must still dispatch work. Before the fix this hung until the 10s timeout
+  // because the management thread and every GPU executor were already stopped.
+  auto global_state = std::make_shared<mock_gpu_pipeline_task_global_state>();
+
+  const int num_tasks = 5;
+  for (int i = 0; i < num_tasks; ++i) {
+    auto local_state = std::make_unique<mock_gpu_pipeline_task_local_state>(i, 0);
+    auto task = std::make_unique<mock_gpu_pipeline_task>(i, std::move(local_state), global_state);
+    executor.schedule(std::move(task));
+  }
+
+  auto start_time = std::chrono::steady_clock::now();
+  auto timeout    = std::chrono::seconds(10);
+  while (global_state->executed_count.load(std::memory_order_relaxed) < num_tasks) {
+    std::this_thread::sleep_for(10ms);
+    if (std::chrono::steady_clock::now() - start_time > timeout) {
+      FAIL("scheduler stopped dispatching after terminate_query on an unrelated query");
+    }
+  }
   REQUIRE(global_state->executed_count.load() == num_tasks);
 
   executor.stop();

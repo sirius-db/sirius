@@ -171,8 +171,15 @@ void task_scheduler::start_query(const planner::query& query)
 void task_scheduler::terminate_query(const std::shared_ptr<completion_handler>& handler,
                                      std::exception_ptr error)
 {
+  // Report to THIS query's handler and nothing else. This used to also call stop(), which closed
+  // the request channel, joined the management thread and stopped every GPU executor — for all
+  // queries — with no path that ever calls start() again. One query's creation error therefore
+  // hung every other in-flight query and every subsequent query in the process.
+  //
+  // No drain here: report_error wakes sirius_engine::execute's future.get(), whose catch runs
+  // drain_after_error(query_id) on the engine thread. Draining from here would re-enter the
+  // queues from inside a task_creator pool worker.
   if (handler) { handler->report_error(std::move(error)); }
-  stop();
 }
 
 void task_scheduler::drain_after_error(sirius::query_id_t query_id)
