@@ -56,6 +56,23 @@ Rules of thumb:
   `scan_task_batch_size` of the *pinned subset*, so a narrow pin concentrates a column's
   chars in each batch.
 
+## Interaction with the downgrade executor
+
+GPU pins permanently occupy part of the downgrade budget, so heavy queries ride closer to
+`downgrade_trigger_fraction`. At the defaults (trigger 0.8, stop 0.6) q9 crossed the
+trigger and the executor evicted ~42 GB of ~5 GB concat intermediates in one episode —
+re-uploaded ~450 ms later, an ~84 GB round trip per iteration (visible in quent as
+GPU→HOST `InTransit` bursts; downgrade activity is debug-level, so info logs show nothing).
+
+Measured on q9 (GB300, hot mean): episode **depth** is the cost driver, not triggering
+per se — `0.8/0.75` (same trigger, shallow episodes) recovered 60% of the loss, and the
+plateau is reached at `0.9/0.85` (1.872 s → 1.817 s, -3%; suite-neutral). Pre-staging the
+re-upload (a downgraded-task prefetcher) was measured flat across a 25x staged-bytes
+range: with 8 pipeline threads the re-upload is already overlapped at task-prepare, so
+only avoiding the eviction helps. When GPU-pinning large tables, raise
+`downgrade_stop_fraction` toward the trigger (and optionally the trigger itself) rather
+than reaching for recovery-side prefetching.
+
 ## Benchmarking mixed configs
 
 The TPC-H harness supports these experiments without edits: `SIRIUS_PRE_SQL` runs session
