@@ -247,10 +247,9 @@ std::string normalize_path(std::string const& p)
 
 }  // namespace
 
-void apply_local_backend_policy(
-  cucascade::io::io_context_registry& registry,
-  scan_manager_config const& config,
-  cucascade::memory::memory_reservation_manager& reservation_manager)
+void apply_local_backend_policy(cucascade::io::io_context_registry& registry,
+                                scan_manager_config const& config,
+                                cucascade::memory::memory_reservation_manager& reservation_manager)
 {
   if (config.use_sirius_datasource) { return; }
 
@@ -259,9 +258,10 @@ void apply_local_backend_policy(
   // which is what sirius's own registry did via _prefer_kvikio_for_file_scheme.
   // register_ioctx replaces the prior registration, leaving the factory
   // available to an explicit make_ioctx(uring).
-  registry.register_ioctx(cucascade::io::io_context_type::uring,
-                          [](std::string_view) { return false; },
-                          cucascade::io::make_uring_ioctx_factory(reservation_manager));
+  registry.register_ioctx(
+    cucascade::io::io_context_type::uring,
+    [](std::string_view) { return false; },
+    cucascade::io::make_uring_ioctx_factory(reservation_manager));
 }
 
 sirius_scan_manager::sirius_scan_manager(

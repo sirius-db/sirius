@@ -504,8 +504,7 @@ TEST_CASE(
   // apply_local_backend_policy, which is what sirius_scan_manager's constructor
   // calls. Apply it here too — without it this would only be exercising
   // cuCascade's unconditional default, which is what made this case fail.
-  auto const sirius_cfg =
-    make_s3_scan_config("http://127.0.0.1:1", /*use_sirius_datasource=*/true);
+  auto const sirius_cfg = make_s3_scan_config("http://127.0.0.1:1", /*use_sirius_datasource=*/true);
   io_context_registry sirius_registry{sirius_cfg, *fixture.memory};
   sirius::scan_manager::apply_local_backend_policy(sirius_registry, sirius_cfg, *fixture.memory);
   CHECK(sirius_registry.lookup_path(local_path.string()) == io_context_type::uring);
