@@ -373,7 +373,10 @@ void downgrade_executor::processing_loop()
       size_t max_tasks_to_convert = _pipeline_task_queue->size();
       size_t tasks_converted      = 0;
       failed_pipeline_candidates.reserve(max_tasks_to_convert);
-      convertible_gpu_pipeline_task_provider pipeline_provider(*_pipeline_task_queue);
+      // The gate travels with the provider: each wrapper it hands out consults it before its RAII
+      // re-push, so a task extracted here cannot land back in the queue after its query's drain.
+      convertible_gpu_pipeline_task_provider pipeline_provider(*_pipeline_task_queue,
+                                                               _query_lifecycle);
       while (!req->satisfied.load() && tasks_converted < max_tasks_to_convert) {
         if (predicate_satisfied(req.get()) || wait_if_target_reached()) break;
         auto candidate =
