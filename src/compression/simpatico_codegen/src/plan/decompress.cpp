@@ -4,6 +4,7 @@
 #include "codegen/decode/masked_launch.hpp"
 #include "codegen/plan/bitjoin_layout.hpp"
 #include "codegen/plan/plan_interpreter.hpp"
+#include "codegen/plan/validity.hpp"
 #include "codegen/util/cuda_check.hpp"
 #include "codegen/util/nvtx.hpp"
 #include "decode/decode_session.hpp"
@@ -1097,6 +1098,10 @@ void validate_request(column_decode_request const& request)
     return;
   }
   validate_plan(tree->get());
+  // A selection compacts the value rows, while the stored bitmask describes every row of the
+  // chunk, so the decode cannot reattach it; a caller that wants both declines the selection.
+  if (request.selection && !tree->get().validity.empty())
+    throw unsupported_nullable_selection("decode: selection on a null-masked column unsupported");
   if (predicate && !predicate->predicate.active())
     throw std::invalid_argument("decode: empty predicate request");
   if (predicate && request.selection &&
@@ -1163,6 +1168,9 @@ std::unique_ptr<cudf::column> decode_request(column_decode_request const& reques
       output = walk.run();
     }
   }
+  // Reattach the validity the compress side detached. The walk decodes a null-free column, so this
+  // is the only place the mask re-enters; a selecting request was refused above unless all-valid.
+  attach_validity(*output, tree.validity, frame.stream(), frame.mr());
   if (selection && (output->size() != selection->survivor_count || output->null_count() != 0)) {
     throw std::runtime_error("decode: selected output has wrong size or unsupported nulls");
   }

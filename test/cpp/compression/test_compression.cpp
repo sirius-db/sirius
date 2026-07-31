@@ -646,14 +646,16 @@ TEST_CASE("pin_table compression - decode-time pure-filter column omission prese
   run_ok(con, "SET pin_table_compression_max_compressed_fraction = 1.5;", "set fraction");
 
   auto plan_dir = tmp / "plans";
-  write_plan_file(plan_dir,
-                  "t_dropfilter",
-                  bitpack_plan(3) +
-                    "---\ninput -> dictionary -> keys_offsets, keys_chars, indices\n"
-                    "dictionary.indices -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n"
-                    "---\ninput -> dictionary -> keys_offsets, keys_chars, indices, null_mask\n"
-                    "dictionary.indices -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n"
-                    "dictionary.null_mask -> identity\n");
+  write_plan_file(
+    plan_dir,
+    "t_dropfilter",
+    bitpack_plan(3) +
+      "---\ninput -> dictionary -> keys_offsets, keys_chars, indices\n"
+      "dictionary.indices -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n"
+      // Validity travels beside the encoded column (plan/validity.cpp), so a
+      // nullable column's plan names no null_mask channel.
+      "---\ninput -> dictionary -> keys_offsets, keys_chars, indices\n"
+      "dictionary.indices -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n");
   run_ok(
     con, "SET pin_table_input_compression_plan_dir = '" + plan_dir.string() + "';", "set plan_dir");
 
