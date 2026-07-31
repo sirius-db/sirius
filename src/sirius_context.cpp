@@ -373,6 +373,9 @@ void SiriusContext::begin_execution_window(ClientContext& context,
     SIRIUS_LOG_INFO("QueryBegin: {}", window_label);
   } catch (...) {  // best-effort observability
   }
+  // Open the enqueue gate before anything can schedule. Every producer consults it, so this must
+  // precede repository/task_creator registration.
+  query_lifecycle_.open_query(query_id);
   // Register this query's repository manager up front
   data_repository_registry_.create_for_query(query_id);
   // Registers this query's task_creator state. No reset of a previous query here: each query
@@ -390,6 +393,13 @@ void SiriusContext::run_mandatory_cleanup(sirius::query_id_t query_id, std::stri
     SIRIUS_LOG_INFO("QueryEnd");
   } catch (...) {
   }
+
+  // Close the enqueue gate BEFORE any drain runs. Every producer consults it, so from here on a
+  // completion callback for this query — notify_downstream_pipelines, the GPU executor scheduling
+  // a finished task's consumers, an OOM reschedule, or a TIER-2 downgrade returning a task it
+  // extracted — is refused instead of adding work behind a drain that already passed. Scoped to
+  // this query: other in-flight queries keep scheduling normally.
+  query_lifecycle_.quiesce(query_id);
 
   // Drop this query's task_creator state FIRST: queued creation requests hold raw operator
   // pointers, and in-flight creation lambdas dereference them. reset() drains those requests and
@@ -457,6 +467,10 @@ void SiriusContext::run_mandatory_cleanup(sirius::query_id_t query_id, std::stri
   // past the window would release those handles during ~task_creator at DB teardown (~DBConfig
   // fires ~SiriusContext mid-DB destruction), which SIGSEGVs in ~BlockMemory.
 
+  // Every drain has run; the window is over, so forget the query rather than leaving a tombstone
+  // that would grow the map for the life of the process.
+  query_lifecycle_.close(query_id);
+
   try {
     log_pool_stats(end_tag);
   } catch (...) {  // best-effort observability
@@ -498,8 +512,12 @@ void SiriusContext::drop_query_runtime_state_best_effort(sirius::query_id_t quer
   // would survive until ~task_creator during DB teardown — the exact shutdown-order crash the
   // in-window reset prevents.
   //
-  // Same order as the main path: stop the producer, then drop what it queued. Each step is
-  // independently guarded so a throw in one still lets the other run.
+  // Same order as the main path: shut the gate, stop the producer, then drop what it queued. Each
+  // step is independently guarded so a throw in one still lets the others run.
+  try {
+    query_lifecycle_.quiesce(query_id);
+  } catch (...) {
+  }
   try {
     if (task_creator_) { task_creator_->reset(query_id); }
   } catch (...) {
@@ -514,6 +532,11 @@ void SiriusContext::drop_query_runtime_state_best_effort(sirius::query_id_t quer
   // split providers until terminate().
   try {
     if (scan_manager_) { scan_manager_->reset(query_id); }
+  } catch (...) {
+  }
+  // The window is over either way; drop the gate entry so it does not accumulate.
+  try {
+    query_lifecycle_.close(query_id);
   } catch (...) {
   }
 }
@@ -880,6 +903,15 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
   task_creator_->set_task_scheduler(*task_scheduler_);
   task_scheduler_->set_task_creator(*task_creator_);
 
+  // Bind the per-query enqueue gate to every producer. From here on, a query that has entered
+  // cleanup cannot have work added behind a drain that already passed — previously this was only
+  // achievable by interrupting the shared queues, which refused every query's pushes at once.
+  task_creator_->set_query_lifecycle_registry(&query_lifecycle_);
+  task_scheduler_->set_query_lifecycle_registry(&query_lifecycle_);
+  for (auto& executor : downgrade_executors_) {
+    executor->set_query_lifecycle_registry(&query_lifecycle_);
+  }
+
   scan_manager_ = std::make_unique<sirius::scan_manager::sirius_scan_manager>(
     config_.get_scan_manager_config(), *memory_manager_, topology_index_);
 
@@ -937,6 +969,7 @@ void SiriusContext::terminate()
   // downgrade executors (the only other holders of a manager reference) were stopped above, so
   // no borrower can outlive this.
   data_repository_registry_.clear();
+  query_lifecycle_.clear();
 
   // Restore the previous cuDF pinned memory resource and threshold before destroying the
   // slab allocator — cuDF holds a non-owning reference and would dangle after reset().

@@ -19,6 +19,7 @@
 #include "exec/bounded_thread_pool.hpp"
 #include "exec/config.hpp"
 #include "exec/multi_index_priority_queue.hpp"
+#include "exec/query_lifecycle_registry.hpp"
 #include "parallel/task.hpp"
 #include "query_id.hpp"
 
@@ -70,8 +71,22 @@ class itask_executor {
 
   /**
    * @brief Schedule a task for execution.
+   *
+   * A no-op when the lifecycle gate reports that the task's query is tearing down: the OOM
+   * reschedule path re-enters here from a worker thread long after a drain may have passed.
    */
   void schedule(std::unique_ptr<itask> task);
+
+  /**
+   * @brief Bind the per-query lifecycle gate consulted before enqueuing.
+   *
+   * Without one (the default, and what most unit tests use) every query is treated as accepting
+   * work, i.e. the pre-gate behaviour.
+   */
+  void set_query_lifecycle_registry(exec::query_lifecycle_registry* registry) noexcept
+  {
+    _query_lifecycle = registry;
+  }
 
   /**
    * @brief Start the executor: creates the thread pool and manager thread.
@@ -185,6 +200,8 @@ class itask_executor {
   /// dropped without touching another's. Keys come from pipeline::index_keys_for, the
   /// same extractor the task_scheduler's queue uses.
   exec::multi_index_priority_queue<itask> _task_queue;
+  /// Non-owning; owned by SiriusContext and outlives this executor. Null in unit tests.
+  exec::query_lifecycle_registry* _query_lifecycle{nullptr};
   std::thread _manager_thread;
   std::shared_ptr<const telemetry::telemetry_context> _telemetry_context;
   std::unique_ptr<telemetry::TaskQueueHandleWrapper> _task_queue_telemetry;

@@ -21,6 +21,7 @@
 #include "exec/config.hpp"
 #include "exec/interruptible_mpmc.hpp"
 #include "exec/multi_index_priority_queue.hpp"
+#include "exec/query_lifecycle_registry.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "parallel/task.hpp"
 
@@ -142,6 +143,18 @@ class downgrade_executor {
     sirius::exec::multi_index_priority_queue<sirius::parallel::itask>* pipeline_task_queue);
 
   /**
+   * @brief Bind the per-query lifecycle gate.
+   *
+   * Forwarded to every convertible_gpu_pipeline_task the TIER-2 sweep creates, so a task
+   * extracted from the shared queue is dropped rather than re-pushed once its query starts
+   * tearing down. Without one (the unit-test default) the re-push is ungated, as before.
+   */
+  void set_query_lifecycle_registry(sirius::exec::query_lifecycle_registry* registry) noexcept
+  {
+    _query_lifecycle = registry;
+  }
+
+  /**
    * @brief Asynchronously request a predicate-driven downgrade.
    *
    * Dispatches batch downgrades until the predicate returns true or candidates
@@ -208,6 +221,8 @@ class downgrade_executor {
   std::string _source_label;
   sirius::memory::sirius_memory_reservation_manager& _reservation_manager;
   sirius::exec::multi_index_priority_queue<sirius::parallel::itask>* _pipeline_task_queue{nullptr};
+  /// Non-owning; owned by SiriusContext and outlives this executor. Null in unit tests.
+  sirius::exec::query_lifecycle_registry* _query_lifecycle{nullptr};
 };
 
 }  // namespace parallel

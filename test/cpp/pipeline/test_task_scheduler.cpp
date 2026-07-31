@@ -17,9 +17,11 @@
 #include "catch.hpp"
 #include "data/convertible_gpu_pipeline_task.hpp"
 #include "exec/config.hpp"
+#include "exec/query_lifecycle_registry.hpp"
 #include "pipeline/completion_handler.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
 #include "pipeline/task_scheduler.hpp"
+#include "query_id.hpp"
 #include "scan/test_utils.hpp"
 #include "utils/telemetry_utils.hpp"
 
@@ -188,6 +190,59 @@ TEST_CASE("terminate_query fails only its own query and leaves the scheduler run
       FAIL("scheduler stopped dispatching after terminate_query on an unrelated query");
     }
   }
+  REQUIRE(global_state->executed_count.load() == num_tasks);
+
+  executor.stop();
+}
+
+TEST_CASE("the lifecycle gate refuses scheduling for a quiescing query",
+          "[task_scheduler][query_lifecycle_gate][concurrency]")
+{
+  // Wiring check for the gate: task_scheduler::schedule must consult it. A task creation worker
+  // can land in schedule() after this query's queue drain already ran, and the task would then
+  // sit in the shared queue holding raw repository pointers into a manager about to be erased.
+  auto manager = initialize_memory_manager(1);
+  sirius::exec::thread_pool_config gpu_config{2};
+  // Declared BEFORE the scheduler so it is destroyed AFTER it: the scheduler and every GPU
+  // executor hold a raw pointer to the gate, and ~task_scheduler still runs stop().
+  sirius::exec::query_lifecycle_registry lifecycle;
+  task_scheduler executor(gpu_config, *manager, sirius::test::make_test_telemetry_context());
+  executor.set_query_lifecycle_registry(&lifecycle);
+
+  // Mock tasks carry no pipeline, so index_keys_for() reports them as query 0.
+  const auto mock_query = sirius::make_query_id(0);
+  lifecycle.open_query(mock_query);
+
+  auto global_state = std::make_shared<mock_gpu_pipeline_task_global_state>();
+  executor.start();
+
+  auto schedule_batch = [&](int count, int id_base) {
+    for (int i = 0; i < count; ++i) {
+      auto local_state = std::make_unique<mock_gpu_pipeline_task_local_state>(id_base + i, 0);
+      auto task =
+        std::make_unique<mock_gpu_pipeline_task>(id_base + i, std::move(local_state), global_state);
+      executor.schedule(std::move(task));
+    }
+  };
+
+  // Open: work flows.
+  const int num_tasks = 5;
+  schedule_batch(num_tasks, 0);
+
+  auto start_time = std::chrono::steady_clock::now();
+  while (global_state->executed_count.load(std::memory_order_relaxed) < num_tasks) {
+    std::this_thread::sleep_for(10ms);
+    if (std::chrono::steady_clock::now() - start_time > std::chrono::seconds(10)) {
+      FAIL("tasks did not execute while the query was open");
+    }
+  }
+  REQUIRE(global_state->executed_count.load() == num_tasks);
+
+  // Quiescing: further work is dropped rather than enqueued.
+  lifecycle.quiesce(mock_query);
+  schedule_batch(num_tasks, 100);
+
+  std::this_thread::sleep_for(200ms);
   REQUIRE(global_state->executed_count.load() == num_tasks);
 
   executor.stop();
