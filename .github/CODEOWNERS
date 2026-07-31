@@ -69,7 +69,7 @@ src/**/log/                         @sirius-db/sirius-telemetry-codeowners
 /scripts/                           @sirius-db/sirius-ci-build-codeowners
 /third_party/                       @sirius-db/sirius-ci-build-codeowners
 
-# ── Testing & Benchmarks ──────────────────────────────────────────────────────
+# ── Testing & Benchmarks & Skills ─────────────────────────────────────────────
 **/CLAUDE.md                        @sirius-db/sirius-testing-codeowners
 setup_test_datasets.sh              @sirius-db/sirius-testing-codeowners
 .claude/                            @sirius-db/sirius-testing-codeowners
