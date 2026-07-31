@@ -183,14 +183,19 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
   // One pinned-entry probe per scan: the compressed-materialization residency gate and
   // the seq_scan MVCC cache-or-CPU guard below share the result. The parquet identity
   // feeds only the gate, so its file resolution runs only when the feature is on.
+  // The duckdb-table probe is OWNING: the shared_ptr holds the entry alive across the
+  // guards below, so a concurrent UNPIN on another connection cannot invalidate it
+  // mid-check. `pinned` is the shared raw view over whichever probe matched.
+  std::shared_ptr<sirius::scan_manager::pinned_entry const> pinned_owner;
   sirius::scan_manager::pinned_entry const* pinned = nullptr;
   bool serves_insert_deltas                        = false;
   if (sirius_state && op.function.name == "seq_scan") {
     auto* bind = dynamic_cast<duckdb::TableScanBindData*>(op.bind_data.get());
     if (bind != nullptr && bind->table.IsDuckTable()) {
-      auto& table = bind->table.Cast<duckdb::DuckTableEntry>();
-      pinned      = sirius_state->get_scan_manager().find_pinned_entry_for_duckdb_table(
+      auto& table  = bind->table.Cast<duckdb::DuckTableEntry>();
+      pinned_owner = sirius_state->get_scan_manager().find_pinned_entry_for_duckdb_table(
         table.ParentCatalog().GetName(), table.ParentSchema().name, table.name);
+      pinned = pinned_owner.get();
       // Rows beyond the pinned prefix serve as insert-delta splits, decoded fresh at native
       // width. A narrow sidecar over them would pay per-batch exact-range verification and, on
       // an out-of-range inserted value, fail the query over to the CPU fallback — so the

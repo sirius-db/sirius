@@ -254,10 +254,9 @@ sirius::io::ioctx_resolver make_datasource_resolver(sirius_scan_manager& manager
   };
 }
 
-sirius::planner::query make_empty_query()
+sirius::planner::query make_empty_query(sirius::query_id_t query_id = sirius::make_query_id(1))
 {
-  auto tctx           = sirius::test::make_test_telemetry_context();
-  const auto query_id = sirius::make_query_id(1);
+  auto tctx = sirius::test::make_test_telemetry_context();
   sirius::telemetry::query_telemetry_info tinfo{tctx->engine_id(), tctx->worker_id(), query_id};
   return sirius::planner::query(
     duckdb::vector<duckdb::shared_ptr<sirius::pipeline::sirius_pipeline>>{},
@@ -645,14 +644,18 @@ TEST_CASE("scan_manager re-primes routed S3 cache on every query",
   REQUIRE(default_cache != nullptr);
   REQUIRE(default_cache->query_epoch() == 0);
 
-  auto q = make_empty_query();
-  // The query intentionally has no scan operators: routed caches must still
+  // The queries intentionally have no scan operators: routed caches must still
   // advance once per query, matching the default ioctx's query-wide refresh.
-  manager.prepare_for_query(q, true, {});
+  // Distinct query ids because per-query state is keyed by id — the epoch bump is per
+  // prepare_for_query call, and using one id twice would exercise the stale-state replacement
+  // path rather than the two-queries case this gate is about.
+  auto q1 = make_empty_query(sirius::make_query_id(1));
+  manager.prepare_for_query(q1, true, {});
   REQUIRE(routed_cache->query_epoch() == 1);
   REQUIRE(default_cache->query_epoch() == 1);
 
-  manager.prepare_for_query(q, true, {});
+  auto q2 = make_empty_query(sirius::make_query_id(2));
+  manager.prepare_for_query(q2, true, {});
   REQUIRE(routed_cache->query_epoch() == 2);
   REQUIRE(default_cache->query_epoch() == 2);
 }
