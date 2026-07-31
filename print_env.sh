@@ -5,8 +5,8 @@
 # Reports relevant environment information useful for diagnosing and
 # debugging Sirius issues.
 # Usage:
-# "./scripts/print_env.sh" - prints to stdout
-# "./scripts/print_env.sh > env.txt" - prints to file "env.txt"
+# "bash print_env.sh" - prints to stdout
+# "bash print_env.sh > env.txt" - prints to file "env.txt"
 
 print_env() {
 echo "***git***"
@@ -79,6 +79,7 @@ if type "rustc" &> /dev/null; then
 else
     echo "rustc not found"
 fi
+echo
 if type "cargo" &> /dev/null; then
     which cargo && cargo --version
 else
