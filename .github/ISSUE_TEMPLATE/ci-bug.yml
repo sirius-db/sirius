@@ -1,7 +1,7 @@
 name: CI Bug Report
 description: Report a problem with CI runners, builds, caching, or GPU behavior
 labels: ["ci", "bug"]
-title: "[CI-BUG] "
+title: "bug(ci): "
 body:
   - type: markdown
     attributes:
