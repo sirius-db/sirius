@@ -1,4 +1,4 @@
-name: CI Bug Report
+name: CI Bug report
 description: Report a problem with CI runners, builds, caching, or GPU behavior
 labels: ["ci", "bug"]
 title: "bug(ci): "
