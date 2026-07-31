@@ -1652,9 +1652,8 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
       auto& request         = state->pending_mvcc_mask_jobs[i];
       mask_snapshot_keys[i] = capture_mvcc_mask_snapshot_key(request);
       auto const assignment = std::ranges::find_if(
-        cached_assignments, [&](cached_assignment const& item) {
-          return item.entry_name == request.entry_name;
-        });
+        cached_assignments,
+        [&](cached_assignment const& item) { return item.entry_name == request.entry_name; });
       if (assignment == cached_assignments.end()) { continue; }
       std::shared_ptr<mvcc_mask_version_cache> cache_ptr;
       {
@@ -1684,9 +1683,8 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
       auto& request = state->pending_mvcc_mask_jobs[i];
       if (request.masks_ready || !mvcc_mask_cache_publishable(mask_snapshot_keys[i])) { continue; }
       auto const assignment = std::ranges::find_if(
-        cached_assignments, [&](cached_assignment const& item) {
-          return item.entry_name == request.entry_name;
-        });
+        cached_assignments,
+        [&](cached_assignment const& item) { return item.entry_name == request.entry_name; });
       if (assignment == cached_assignments.end()) { continue; }
       std::shared_ptr<mvcc_mask_version_cache> cache_ptr;
       {
@@ -2104,15 +2102,15 @@ void sirius_scan_manager::reset_all()
 std::size_t sirius_scan_manager::num_active_queries() const noexcept
 {
   std::lock_guard lk{_query_states_mutex};
-  return std::ranges::count_if(
-    _query_states, [](auto const& entry) { return !entry.second->scans.empty(); });
+  return std::ranges::count_if(_query_states,
+                               [](auto const& entry) { return !entry.second->scans.empty(); });
 }
 
 bool sirius_scan_manager::has_readahead_for_testing() const noexcept
 {
   std::lock_guard lk{_query_states_mutex};
-  return std::ranges::any_of(
-    _query_states, [](auto const& entry) { return entry.second->readahead != nullptr; });
+  return std::ranges::any_of(_query_states,
+                             [](auto const& entry) { return entry.second->readahead != nullptr; });
 }
 
 void sirius_scan_manager::reset_caches()
@@ -3046,7 +3044,9 @@ std::shared_ptr<const pinned_entry> sirius_scan_manager::find_pinned_entry_for_d
   std::shared_ptr<const pinned_entry> covering_mismatch;
   std::lock_guard pin_lk{_pinned_entries_mutex};
   for (auto const& [name, entry] : _pinned_entries) {
-    if (!entry->cache_info.matches_duckdb_table(catalog_name, schema_name, table_name)) { continue; }
+    if (!entry->cache_info.matches_duckdb_table(catalog_name, schema_name, table_name)) {
+      continue;
+    }
     if (identity_match == nullptr) { identity_match = entry; }
     if (!match_columns) { return entry; }
     if (entry->cache_info.column_projection_for(*requested_ids).empty()) { continue; }
