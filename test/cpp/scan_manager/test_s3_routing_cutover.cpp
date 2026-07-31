@@ -499,12 +499,22 @@ TEST_CASE(
   scan_manager_fixture fixture;
   auto const local_path = make_regular_file();
 
-  io_context_registry sirius_registry{
-    make_s3_scan_config("http://127.0.0.1:1", /*use_sirius_datasource=*/true), *fixture.memory};
+  // cuCascade's registry always registers uring for local paths; the
+  // use_sirius_datasource policy is layered on top by
+  // apply_local_backend_policy, which is what sirius_scan_manager's constructor
+  // calls. Apply it here too — without it this would only be exercising
+  // cuCascade's unconditional default, which is what made this case fail.
+  auto const sirius_cfg =
+    make_s3_scan_config("http://127.0.0.1:1", /*use_sirius_datasource=*/true);
+  io_context_registry sirius_registry{sirius_cfg, *fixture.memory};
+  sirius::scan_manager::apply_local_backend_policy(sirius_registry, sirius_cfg, *fixture.memory);
   CHECK(sirius_registry.lookup_path(local_path.string()) == io_context_type::uring);
 
-  io_context_registry fallback_registry{
-    make_s3_scan_config("http://127.0.0.1:1", /*use_sirius_datasource=*/false), *fixture.memory};
+  auto const fallback_cfg =
+    make_s3_scan_config("http://127.0.0.1:1", /*use_sirius_datasource=*/false);
+  io_context_registry fallback_registry{fallback_cfg, *fixture.memory};
+  sirius::scan_manager::apply_local_backend_policy(
+    fallback_registry, fallback_cfg, *fixture.memory);
   CHECK(fallback_registry.lookup_path(local_path.string()) == io_context_type::kvikio);
   CHECK(fallback_registry.lookup_path(local_path.string()) != io_context_type::uring);
   CHECK(fallback_registry.lookup_path("s3://bucket/key.parquet") == io_context_type::restful);

@@ -247,6 +247,23 @@ std::string normalize_path(std::string const& p)
 
 }  // namespace
 
+void apply_local_backend_policy(
+  cucascade::io::io_context_registry& registry,
+  scan_manager_config const& config,
+  cucascade::memory::memory_reservation_manager& reservation_manager)
+{
+  if (config.use_sirius_datasource) { return; }
+
+  // Re-register uring with a checker that claims nothing, so lookup_path finds
+  // no explicit backend for a local path and defers to the kvikio catch-all —
+  // which is what sirius's own registry did via _prefer_kvikio_for_file_scheme.
+  // register_ioctx replaces the prior registration, leaving the factory
+  // available to an explicit make_ioctx(uring).
+  registry.register_ioctx(cucascade::io::io_context_type::uring,
+                          [](std::string_view) { return false; },
+                          cucascade::io::make_uring_ioctx_factory(reservation_manager));
+}
+
 sirius_scan_manager::sirius_scan_manager(
   const scan_manager_config& config,
   cucascade::memory::memory_reservation_manager& reservation_manager,
@@ -265,20 +282,7 @@ sirius_scan_manager::sirius_scan_manager(
     throw std::invalid_argument("[sirius_scan_manager] topology_index must be non-null");
   }
 
-  // use_sirius_datasource=false means "serve local files with kvikIO".  Sirius's
-  // own registry had a _prefer_kvikio_for_file_scheme flag that lookup_path
-  // consulted; cuCascade's has no equivalent.  Express it instead by
-  // re-registering the uring backend with a checker that claims nothing —
-  // lookup_path then finds no explicit backend for a local path and defers to
-  // the kvikio catch-all, which is exactly the old behaviour.  register_ioctx
-  // replaces the prior registration for the type, so the factory is still
-  // available to the explicit make_ioctx(uring) call below.
-  if (!_config.use_sirius_datasource) {
-    _ioctx_registry.register_ioctx(
-      cucascade::io::io_context_type::uring,
-      [](std::string_view) { return false; },
-      cucascade::io::make_uring_ioctx_factory(reservation_manager));
-  }
+  apply_local_backend_policy(_ioctx_registry, _config, reservation_manager);
 
   // scan_manager always owns an io_ctx: the uring reactor on the
   // fast path, kvikio_context as the universal fallback so the rest of the

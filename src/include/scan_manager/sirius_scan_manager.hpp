@@ -93,6 +93,32 @@ struct batch_telemetry_info;
 
 namespace sirius::scan_manager {
 
+/**
+ * @brief Apply sirius's local-backend policy to a freshly built cuCascade registry.
+ *
+ * cuCascade's @c io_context_registry always registers uring for local paths.
+ * Sirius's @c use_sirius_datasource=false means "serve local files with kvikIO"
+ * instead — sirius's own registry carried a @c _prefer_kvikio_for_file_scheme
+ * flag that @c lookup_path consulted, which cuCascade's does not have.
+ *
+ * Expressed here by re-registering the uring backend with a checker that claims
+ * nothing: @c lookup_path then finds no explicit backend for a local path and
+ * defers to the kvikio catch-all. @c register_ioctx replaces the prior
+ * registration for the type, so the factory stays available to an explicit
+ * @c make_ioctx(uring).
+ *
+ * A no-op when @c use_sirius_datasource is true. This is the ONLY place the
+ * policy lives: a registry built without it silently keeps local paths on uring,
+ * so every construction site must call it — the scan manager's constructor does,
+ * and so must anything else that builds a registry directly (see
+ * test_s3_routing_cutover.cpp).
+ *
+ * @p reservation_manager must outlive every ioctx the registry creates.
+ */
+void apply_local_backend_policy(cucascade::io::io_context_registry& registry,
+                                scan_manager_config const& config,
+                                cucascade::memory::memory_reservation_manager& reservation_manager);
+
 /// Lightweight descriptor of a pinned table's cache identity + column layout,
 /// stored on @ref pinned_entry in place of the read-side ingestible_table_info.
 /// Captures only what serving needs — the table's identity (parquet file set OR
