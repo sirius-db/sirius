@@ -22,6 +22,7 @@
 #include "exec/config.hpp"
 #include "exec/interruptible_mpmc.hpp"
 #include "exec/multi_index_priority_queue.hpp"
+#include "exec/query_lifecycle_registry.hpp"
 #include "exec/queue_priority.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
@@ -127,6 +128,15 @@ class task_creator {
 
   /// \brief sets pipeline executor reference
   void set_task_scheduler(sirius::pipeline::task_scheduler& task_scheduler);
+
+  /// \brief Bind the per-query lifecycle gate consulted before every enqueue.
+  ///
+  /// Without one (the default, and what most unit tests use) every query is treated as accepting
+  /// work, i.e. the pre-gate behaviour.
+  void set_query_lifecycle_registry(sirius::exec::query_lifecycle_registry* registry) noexcept
+  {
+    _query_lifecycle = registry;
+  }
 
   /// \brief Register the per-query state for @p query's pipelines.
   ///
@@ -236,6 +246,13 @@ class task_creator {
 
  protected:
   /**
+   * @brief Whether the lifecycle gate still accepts work for @p query_id.
+   *
+   * True when no registry is bound (the unit-test default), preserving pre-gate behaviour.
+   */
+  [[nodiscard]] bool accepts_work(sirius::query_id_t query_id) const noexcept;
+
+  /**
    * @brief Stop the worker thread pool.
    *
    * Stops all worker threads and waits for them to finish. This method is
@@ -282,6 +299,8 @@ class task_creator {
   ::duckdb::ClientContext* _client_context;
   // Non-owning; SiriusContext stops and joins this creator before destroying the scheduler.
   sirius::pipeline::task_scheduler* _task_scheduler{nullptr};
+  /// Non-owning; owned by SiriusContext and outlives this creator. Null in unit tests.
+  sirius::exec::query_lifecycle_registry* _query_lifecycle{nullptr};
   sirius::memory::sirius_memory_reservation_manager& _mem_res_mgr;
   std::atomic<uint64_t> _task_id{0};
 
@@ -341,15 +360,17 @@ class task_creator {
   //! One entry per in-flight query. Guarded by _global_state_mutex.
   std::map<sirius::query_id_t, std::shared_ptr<query_task_global_state>> _query_task_global_states;
   mutable std::mutex _global_state_mutex;  // Protect concurrent access to _query_task_global_states
-
-  //! Serializes start_thread_pool()/stop_thread_pool() against each other and guards
-  //! _bounded_pool/_manager_thread. Deliberately separate from _global_state_mutex:
+  //! Serializes pool/manager-thread lifecycle (start_thread_pool / stop_thread_pool / stop) and
+  //! guards _bounded_pool/_manager_thread. Deliberately separate from _global_state_mutex:
   //! do_stop_thread_pool() joins _manager_thread while holding this lock, and manager_loop()
   //! (running on that thread) takes _global_state_mutex on every request via
   //! get_query_task_global_state(). Sharing one mutex between the two let a worker thread's
-  //! error-triggered stop_thread_pool() call block on the join while holding the very lock
-  //! manager_loop() needed to reach its own exit check -- a real deadlock, not a theoretical one,
-  //! since manager_loop() passes through that lock on every iteration.
+  //! error-triggered stop_thread_pool() call (fired whenever a query takes the error path --
+  //! drain_after_error() -> stop_thread_pool() -- while the creator is still running) block on
+  //! the join while holding the very lock manager_loop() needed to reach its own exit check -- a
+  //! real deadlock, not a theoretical one, since manager_loop() passes through that lock on every
+  //! iteration. The two mutexes guard disjoint state -- this one covers _bounded_pool /
+  //! _manager_thread / _running, the other covers _query_task_global_states and _task_scheduler.
   std::mutex _thread_pool_mutex;
 
   /// Shared GPU<->NUMA topology index for NUMA-aware GPU routing (may be null).

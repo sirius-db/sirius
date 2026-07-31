@@ -421,21 +421,33 @@ std::pair<sirius::query_id_t, exec::queue_priority> request_keys_for(
 void task_creator::schedule(op::sirius_physical_operator* node)
 {
   const auto [query_id, priority] = request_keys_for(node);
-  auto request                    = std::make_unique<task_creation_request>();
-  request->node                   = node;
-  request->query_id               = query_id;
-  request->priority               = priority;
+  // Most calls here come from a completion callback (notify_downstream_pipelines, or the GPU
+  // executor scheduling a finished task's consumers). If the query is tearing down, `node` points
+  // into a plan that is about to be destroyed and a drain has very likely already passed this
+  // queue — so refuse rather than enqueue. Previously this was achieved by interrupting the
+  // queue, which refused EVERY query's pushes at once.
+  if (!accepts_work(query_id)) { return; }
+  auto request      = std::make_unique<task_creation_request>();
+  request->node     = node;
+  request->query_id = query_id;
+  request->priority = priority;
   _task_creation_queue.push(std::move(request));
 }
 
 void task_creator::schedule(op::sirius_physical_operator* node, sirius::query_id_t query_id)
 {
+  if (!accepts_work(query_id)) { return; }
   const auto [_, priority] = request_keys_for(node);
   auto request             = std::make_unique<task_creation_request>();
   request->node            = node;
   request->query_id        = query_id;
   request->priority        = priority;
   _task_creation_queue.push(std::move(request));
+}
+
+bool task_creator::accepts_work(sirius::query_id_t query_id) const noexcept
+{
+  return _query_lifecycle == nullptr || _query_lifecycle->accepts_work(query_id);
 }
 
 void task_creator::report_fatal_error(const std::shared_ptr<pipeline::completion_handler>& handler,
@@ -478,6 +490,9 @@ void task_creator::schedule_lookahead(std::optional<int> device_id_hint)
     state    = it->second;
   }
   if (!state) { return; }
+  // The oldest entry can be a query that has finished and is mid-cleanup but whose state has not
+  // been dropped yet. Warming it up would dereference operators of a plan that is already gone.
+  if (!accepts_work(query_id)) { return; }
 
   std::lock_guard lock(state->lookahead_mutex);
   for (; state->index_of_next_lookahead < state->lookahead_queue.size();

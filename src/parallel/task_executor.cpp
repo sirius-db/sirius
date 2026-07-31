@@ -51,6 +51,12 @@ itask_executor::~itask_executor() { stop(); }
 void itask_executor::schedule(std::unique_ptr<itask> task)
 {
   if (task) {
+    // The OOM reschedule path re-enters here from a pool worker after a 50 ms backoff, so a
+    // drain for this query may already have passed. Refuse rather than re-arm work behind it.
+    if (_query_lifecycle != nullptr && !_query_lifecycle->accepts_work(sirius::make_query_id(
+                                         pipeline::index_keys_for(*task).query_id))) {
+      return;
+    }
     if (auto* pipeline_task = dynamic_cast<pipeline::sirius_pipeline_itask*>(task.get())) {
       pipeline_task->telemetry_handle().queued({
         .queue_resource_id      = _task_queue_telemetry->handle->uuid(),

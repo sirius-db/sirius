@@ -103,6 +103,13 @@ task_scheduler::~task_scheduler() { stop(); }
 
 void task_scheduler::schedule(std::unique_ptr<sirius::parallel::itask> task)
 {
+  // Refuse work for a query that is tearing down. A task creation worker can land here after
+  // that query's queue drain already ran, and the task would then sit in the shared queue holding
+  // raw repository pointers into a manager about to be erased.
+  if (_query_lifecycle != nullptr && task &&
+      !_query_lifecycle->accepts_work(sirius::make_query_id(index_keys_for(*task).query_id))) {
+    return;
+  }
   if (auto* pipeline_task = dynamic_cast<sirius_pipeline_itask*>(task.get())) {
     pipeline_task->telemetry_handle().queued({
       .queue_resource_id      = _task_queue_telemetry->handle->uuid(),
@@ -151,6 +158,17 @@ void task_scheduler::set_task_creator(sirius::creator::task_creator& task_creato
 
   for (auto& [device_id, gpu_exec] : _gpu_executors) {
     gpu_exec->set_task_creator(_task_creator);
+  }
+}
+
+void task_scheduler::set_query_lifecycle_registry(sirius::exec::query_lifecycle_registry* registry)
+{
+  _query_lifecycle = registry;
+
+  // Propagated so each device queue refuses a dying query's tasks too — notably the OOM
+  // reschedule, which re-enters itask_executor::schedule from a worker thread.
+  for (auto& [device_id, gpu_exec] : _gpu_executors) {
+    gpu_exec->set_query_lifecycle_registry(registry);
   }
 }
 

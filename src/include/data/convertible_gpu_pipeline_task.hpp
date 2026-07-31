@@ -20,6 +20,7 @@
 #include "data/convertible_data_batch.hpp"
 #include "data/sirius_converter_registry.hpp"
 #include "exec/multi_index_priority_queue.hpp"
+#include "exec/query_lifecycle_registry.hpp"
 #include "log/logging.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "parallel/task.hpp"
@@ -65,8 +66,9 @@ class convertible_gpu_pipeline_task : public convertible_data {
    */
   convertible_gpu_pipeline_task(
     std::unique_ptr<sirius::parallel::itask> task,
-    sirius::exec::multi_index_priority_queue<sirius::parallel::itask>& queue)
-    : _task(std::move(task)), _queue(queue)
+    sirius::exec::multi_index_priority_queue<sirius::parallel::itask>& queue,
+    sirius::exec::query_lifecycle_registry* query_lifecycle = nullptr)
+    : _task(std::move(task)), _queue(queue), _query_lifecycle(query_lifecycle)
   {
   }
 
@@ -82,10 +84,23 @@ class convertible_gpu_pipeline_task : public convertible_data {
    * If the task has been moved-from (nullptr), does nothing.
    * Pushes the task back to the queue; if the queue is closed (shutdown),
    * the task is destroyed -- this is expected during query teardown.
+   *
+   * The lifecycle gate is what makes that "expected during query teardown" actually hold. TIER-2
+   * downgrade pops a task off the shared scheduler queue into a processing-thread local, carries
+   * it across a *blocking* pool reserve() and a full host/device conversion, and only then gets
+   * here. That window easily outlives the owning query's drain, so an ungated push resurrects a
+   * task after its query was cleaned up: the push itself runs the key extractor over a plan that
+   * has already been destroyed, and the resurrected task holds raw repository pointers into a
+   * manager that is about to be erased.
    */
   ~convertible_gpu_pipeline_task() override
   {
-    if (_task) { (void)_queue.push(std::move(_task)); }
+    if (!_task) { return; }
+    if (_query_lifecycle != nullptr && !_query_lifecycle->accepts_work(sirius::make_query_id(
+                                         sirius::pipeline::index_keys_for(*_task).query_id))) {
+      return;  // query is tearing down; drop instead of resurrecting
+    }
+    (void)_queue.push(std::move(_task));
   }
 
   /**
@@ -210,6 +225,8 @@ class convertible_gpu_pipeline_task : public convertible_data {
 
   std::unique_ptr<sirius::parallel::itask> _task;
   sirius::exec::multi_index_priority_queue<sirius::parallel::itask>& _queue;
+  /// Non-owning; owned by SiriusContext. Null in unit tests, which restores the ungated push.
+  sirius::exec::query_lifecycle_registry* _query_lifecycle{nullptr};
 };
 
 /**
@@ -228,8 +245,9 @@ class convertible_gpu_pipeline_task_provider : public convertible_data_provider 
    * @param queue The task queue to search (non-owning reference).
    */
   explicit convertible_gpu_pipeline_task_provider(
-    sirius::exec::multi_index_priority_queue<sirius::parallel::itask>& queue)
-    : _queue(queue)
+    sirius::exec::multi_index_priority_queue<sirius::parallel::itask>& queue,
+    sirius::exec::query_lifecycle_registry* query_lifecycle = nullptr)
+    : _queue(queue), _query_lifecycle(query_lifecycle)
   {
   }
 
@@ -254,7 +272,8 @@ class convertible_gpu_pipeline_task_provider : public convertible_data_provider 
       [space](sirius::parallel::itask& t) { return has_matching_batches(t, space); },
       front_to_back);
     if (!task) { return nullptr; }
-    return std::make_unique<convertible_gpu_pipeline_task>(std::move(*task), _queue);
+    return std::make_unique<convertible_gpu_pipeline_task>(
+      std::move(*task), _queue, _query_lifecycle);
   }
 
   /**
@@ -283,7 +302,8 @@ class convertible_gpu_pipeline_task_provider : public convertible_data_provider 
         [space](sirius::parallel::itask& t) { return has_matching_batches(t, space); },
         front_to_back);
       if (!task) { break; }
-      results.push_back(std::make_unique<convertible_gpu_pipeline_task>(std::move(*task), _queue));
+      results.push_back(std::make_unique<convertible_gpu_pipeline_task>(
+        std::move(*task), _queue, _query_lifecycle));
     }
     return results;
   }
@@ -318,6 +338,9 @@ class convertible_gpu_pipeline_task_provider : public convertible_data_provider 
   }
 
   sirius::exec::multi_index_priority_queue<sirius::parallel::itask>& _queue;
+  /// Non-owning; owned by SiriusContext. Forwarded to each wrapper so its RAII re-push is
+  /// refused once the owning query starts tearing down.
+  sirius::exec::query_lifecycle_registry* _query_lifecycle{nullptr};
 };
 
 }  // namespace sirius
