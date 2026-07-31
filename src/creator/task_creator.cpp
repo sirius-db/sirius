@@ -440,14 +440,18 @@ void task_creator::schedule(op::sirius_physical_operator* node, sirius::query_id
 void task_creator::report_fatal_error(const std::shared_ptr<pipeline::completion_handler>& handler,
                                       std::exception_ptr error)
 {
+  // Report and return: no stop(). This runs on a creation pool worker (and, via
+  // notify_downstream_pipelines, on a GPU executor worker), where stopping the creator would
+  // either join the calling thread with itself or tear down task creation for every other
+  // in-flight query. Unwinding is the failing query's own business — its future.get() catch in
+  // sirius_engine::execute runs drain_after_error(query_id).
   if (_task_scheduler != nullptr) { _task_scheduler->terminate_query(handler, std::move(error)); }
-  stop();
 }
 
 void task_creator::report_fatal_error(sirius::query_id_t query_id, std::exception_ptr error)
 {
-  // A query whose state was already dropped has no handler left to report to; terminate_query
-  // still stops the creator, which is the other half of the failure path.
+  // A query whose state was already dropped has no handler left to report to; the error has
+  // nowhere to go, which is correct — that query is already being torn down.
   auto state = get_query_task_global_state(query_id);
   report_fatal_error(state ? state->completion_handler : nullptr, std::move(error));
 }
@@ -758,6 +762,11 @@ void task_creator::manager_loop()
           // queries would hang.
           pipeline->update_pipeline_status(false);
         } catch (const std::exception& e) {
+          // Fail only this query. The stop() that used to follow ran on a task_creator pool
+          // worker and called _bounded_pool->wait_all(), which blocks until active_ == 0 — but
+          // this thread IS an active slot, so it deadlocked outright; and had it got past,
+          // _bounded_pool.reset() would have joined this thread with itself inside a noexcept
+          // function. It also tore down task creation for every other in-flight query.
           SIRIUS_LOG_ERROR("Task Creator: Exception during task creation: {}", e.what());
           report_fatal_error(query_state->completion_handler, std::current_exception());
         }
