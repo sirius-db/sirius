@@ -103,6 +103,11 @@ class memory_prefetcher {
 
   memory_prefetcher_config _config;
   std::vector<std::shared_ptr<split_connector>> _connectors;
+  /// Per-connector work claim (parallel to _connectors): only one worker at a
+  /// time may convert on a DRAINING connector, so prefetch parallelism never
+  /// stacks on top of the active scan's own conversion threads (regresses
+  /// short scan-bound queries). Quiet connectors allow full parallelism.
+  std::unique_ptr<std::atomic<bool>[]> _drain_claims;
   cucascade::memory::memory_space* _gpu_space;
 
   /// Dedicated streams so prefetch copies never share a stream with pipeline
@@ -113,6 +118,11 @@ class memory_prefetcher {
   std::atomic<bool> _running{true};
   std::atomic<std::size_t> _batches_prefetched{0};
   std::atomic<std::size_t> _bytes_prefetched{0};
+  /// Diagnostic gate counters (logged at stop): why sweeps stopped early.
+  std::atomic<std::size_t> _stops_headroom{0};
+  std::atomic<std::size_t> _stops_reservation{0};
+  std::atomic<std::size_t> _skips_lock{0};
+  std::atomic<std::size_t> _skips_draining{0};
   std::vector<std::thread> _workers;
 };
 

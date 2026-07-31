@@ -39,6 +39,10 @@ memory_prefetcher::memory_prefetcher(memory_prefetcher_config cfg,
     _running.store(false);
     return;
   }
+  _drain_claims = std::make_unique<std::atomic<bool>[]>(_connectors.size());
+  for (std::size_t i = 0; i < _connectors.size(); ++i) {
+    _drain_claims[i].store(false, std::memory_order_relaxed);
+  }
   _stream_pool = std::make_unique<cucascade::memory::exclusive_stream_pool>(
     rmm::cuda_device_id{_gpu_space->get_device_id()}, _config.num_threads);
   _workers.reserve(_config.num_threads);
@@ -58,9 +62,15 @@ void memory_prefetcher::stop()
 {
   bool expected = true;
   if (_running.compare_exchange_strong(expected, false)) {
-    SIRIUS_LOG_INFO("[memory_prefetcher] stopping: prefetched {} batches / {} bytes",
-                    _batches_prefetched.load(),
-                    _bytes_prefetched.load());
+    SIRIUS_LOG_INFO(
+      "[memory_prefetcher] stopping: prefetched {} batches / {} bytes "
+      "(stops: headroom={} reservation={}, skips: lock={} draining={})",
+      _batches_prefetched.load(),
+      _bytes_prefetched.load(),
+      _stops_headroom.load(),
+      _stops_reservation.load(),
+      _skips_lock.load(),
+      _skips_draining.load());
   }
   for (auto& worker : _workers) {
     if (worker.joinable()) { worker.join(); }
@@ -107,7 +117,8 @@ std::size_t memory_prefetcher::sweep(rmm::cuda_stream_view stream)
 
   // Walk connectors in scan (execution) order so the head-of-line pipeline's
   // data lands on the GPU first.
-  for (const auto& connector : _connectors) {
+  for (std::size_t ci = 0; ci < _connectors.size(); ++ci) {
+    const auto& connector = _connectors[ci];
     if (!_running.load(std::memory_order_relaxed)) { return converted; }
 
     // Actively-draining connector: its scan tasks convert their own popped
@@ -115,12 +126,36 @@ std::size_t memory_prefetcher::sweep(rmm::cuda_stream_view stream)
     // point serializes those conversions behind the (fewer) prefetch threads.
     // Collisions only happen at the head of the queue, though — so instead of
     // skipping the connector entirely, convert TAIL-FIRST and leave a head
-    // margin for the batches the scan will pop imminently.
+    // margin for the batches the scan will pop imminently. At most ONE worker
+    // may do this per connector: stacking prefetch parallelism on top of the
+    // scan's own conversion threads regresses short scan-bound queries
+    // (measured: fully relaxed = suite +3.5%, q15 +18%).
     const bool draining = connector->is_draining(_config.drain_quiet_ms);
-    auto batches        = connector->peek_resident_batches();
+    bool claimed        = false;
+    if (draining) {
+      bool expected = false;
+      if (!_drain_claims[ci].compare_exchange_strong(expected, true)) {
+        _skips_draining.fetch_add(1, std::memory_order_relaxed);
+        continue;
+      }
+      claimed = true;
+    }
+    // Release the drain claim on every exit path from this connector.
+    struct claim_release {
+      std::atomic<bool>* flag;
+      ~claim_release()
+      {
+        if (flag) { flag->store(false, std::memory_order_relaxed); }
+      }
+    } release{claimed ? &_drain_claims[ci] : nullptr};
+
+    auto batches = connector->peek_resident_batches();
     if (draining) {
       constexpr std::size_t head_margin = 4;
-      if (batches.size() <= head_margin) { continue; }
+      if (batches.size() <= head_margin) {
+        _skips_draining.fetch_add(1, std::memory_order_relaxed);
+        continue;
+      }
       batches.erase(batches.begin(), batches.begin() + head_margin);
       std::reverse(batches.begin(), batches.end());
     }
@@ -131,14 +166,19 @@ std::size_t memory_prefetcher::sweep(rmm::cuda_stream_view stream)
       if (!draining && connector->is_draining(_config.drain_quiet_ms)) { break; }
       if (!_running.load(std::memory_order_relaxed)) { return converted; }
 
-      // Cheap pre-check under a shared lock; skip GPU-resident batches.
+      // Cheap pre-check under a shared lock; skip GPU-resident batches. Must
+      // be NON-blocking: a sibling worker converting this batch holds its
+      // exclusive lock for the whole conversion, and a blocking to_read_only
+      // here would convoy the workers batch-by-batch (measured: N workers,
+      // conversion concurrency 1).
       std::size_t batch_bytes = 0;
       {
-        auto ro = batch->to_read_only();
-        if (ro.get_data() == nullptr || ro.get_current_tier() == cucascade::memory::Tier::GPU) {
+        auto ro = batch->try_to_read_only();
+        if (!ro || ro->get_data() == nullptr ||
+            ro->get_current_tier() == cucascade::memory::Tier::GPU) {
           continue;
         }
-        batch_bytes = ro.get_data()->get_size_in_bytes();
+        batch_bytes = ro->get_data()->get_size_in_bytes();
       }
 
       // Headroom gate: never let prefetched (unreclaimable) bytes push the
@@ -149,19 +189,26 @@ std::size_t memory_prefetcher::sweep(rmm::cuda_stream_view stream)
         // No room for this batch now; later batches are at least as far from
         // being consumed, so stop the whole sweep and retry after tasks free
         // memory.
+        _stops_headroom.fetch_add(1, std::memory_order_relaxed);
         return converted;
       }
 
       // Exclusive lock, skip on contention (a task is consuming this batch —
       // its own prepare_for_processing does the upload).
       auto mut = batch->try_to_mutable();
-      if (!mut) { continue; }
+      if (!mut) {
+        _skips_lock.fetch_add(1, std::memory_order_relaxed);
+        continue;
+      }
       if (mut->get_data() == nullptr || mut->get_current_tier() == cucascade::memory::Tier::GPU) {
         continue;
       }
 
       auto reservation = _gpu_space->make_reservation_or_null(batch_bytes);
-      if (!reservation) { return converted; }
+      if (!reservation) {
+        _stops_reservation.fetch_add(1, std::memory_order_relaxed);
+        return converted;
+      }
 
       try {
         // Convert against the reservation so the conversion's device
