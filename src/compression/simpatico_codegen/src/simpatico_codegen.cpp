@@ -14,14 +14,12 @@
 #include <cuda_runtime.h>
 #include <nvtx3/nvtx3.hpp>
 
-#include <atomic>
 #include <map>
 #include <mutex>
 #include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
-#include <thread>
 #include <vector>
 
 namespace simpatico {
@@ -184,53 +182,27 @@ struct leased_pool {
   leased_pool& operator=(const leased_pool&) = delete;
 };
 
-// Run `body(i, stream)` for every column index in [0, n_items) across the pool's
-// worker streams. Threads pull indices atomically; `body` signals failure by
-// throwing (any exception is caught, its message preserved). The first failure
-// is rethrown as plan_error after all workers join and the pool syncs.
+// Submit `body(i, stream)` for every index in [0, n_items) across the pool
+// streams from the calling thread (round-robin), then synchronise all streams.
+// No worker threads are spawned: CUDA stream submission is asynchronous, so
+// the GPU can overlap column work across pool streams while the CPU submits
+// serially. All allocations happen on the calling thread, keeping
+// cuCascade's per-thread memory-reservation accounting correct.
 template <typename Body>
-void run_column_workers(size_t n_items,
-                        stream_pool& pool,
-                        std::string_view worker_label,
-                        Body&& body)
+void run_column_workers(size_t n_items, stream_pool& pool, Body&& body)
 {
-  std::atomic<size_t> next{0};
-  std::atomic<bool> failed{false};
+  size_t const n_streams = pool.streams.size();
+  if (n_streams == 0) throw plan_error("stream_pool has no streams");
   std::exception_ptr first_exception;
-  std::mutex err_mu;
-
-  size_t const n_workers = pool.streams.size();
-  if (n_workers == 0) throw plan_error("stream_pool has no streams");
-  // Worker threads must bind the same device as the spawning thread: the fused
-  // codegen path launches kernels through the driver API (cuLaunchKernel), which
-  // uses the calling thread's current context — a fresh std::thread has none, so
-  // without this the launch fails with "invalid resource handle".
-  int device = 0;
-  cudaGetDevice(&device);
-  std::vector<std::thread> workers;
-  workers.reserve(n_workers);
-  for (size_t w = 0; w < n_workers; ++w) {
-    workers.emplace_back([&, w, device]() {
-      cudaSetDevice(device);
-      try {
-        while (true) {
-          size_t i = next.fetch_add(1, std::memory_order_relaxed);
-          if (i >= n_items) break;
-          if (failed.load(std::memory_order_relaxed)) continue;
-          rmm::cuda_stream_view stream{pool.streams[w % pool.streams.size()]};
-          std::string const nvtx_label = std::string{worker_label} + "[col=" + std::to_string(i) +
-                                         "/" + std::to_string(n_items) + "]";
-          nvtx3::scoped_range nvtx_range{nvtx_label.c_str()};
-          body(i, stream);
-        }
-      } catch (...) {
-        std::lock_guard<std::mutex> lock(err_mu);
-        if (!failed.exchange(true)) first_exception = std::current_exception();
-      }
-    });
+  for (size_t i = 0; i < n_items; ++i) {
+    rmm::cuda_stream_view s{pool.streams[i % n_streams]};
+    try {
+      body(i, s);
+    } catch (...) {
+      if (!first_exception) first_exception = std::current_exception();
+      break;
+    }
   }
-  for (auto& t : workers)
-    t.join();
   pool.sync_all();
   if (first_exception) std::rethrow_exception(first_exception);
 }
@@ -243,21 +215,18 @@ compressed_table compress_columns_parallel(cudf::table_view table,
 {
   compressed_table out;
   out.columns.resize(plans.size());
-  run_column_workers(plans.size(),
-                     pool,
-                     "simpatico::compress_column_worker",
-                     [&](size_t i, rmm::cuda_stream_view stream) {
-                       std::string err;
-                       auto plan_tree = compress_column(
-                         table.column(static_cast<cudf::size_type>(i)), plans[i], stream, mr, &err);
-                       if (!plan_tree) throw plan_error(err.empty() ? "compress failed" : err);
-                       compressed_column col;
-                       col.dtype     = table.column(static_cast<cudf::size_type>(i)).type();
-                       col.num_rows  = table.num_rows();
-                       col.plan_tree = std::move(plan_tree);
-                       if (!column_names.empty()) col.name = column_names[i];
-                       out.columns[i] = std::move(col);
-                     });
+  run_column_workers(plans.size(), pool, [&](size_t i, rmm::cuda_stream_view stream) {
+    std::string err;
+    auto plan_tree =
+      compress_column(table.column(static_cast<cudf::size_type>(i)), plans[i], stream, mr, &err);
+    if (!plan_tree) throw plan_error(err.empty() ? "compress failed" : err);
+    compressed_column col;
+    col.dtype     = table.column(static_cast<cudf::size_type>(i)).type();
+    col.num_rows  = table.num_rows();
+    col.plan_tree = std::move(plan_tree);
+    if (!column_names.empty()) col.name = column_names[i];
+    out.columns[i] = std::move(col);
+  });
   return out;
 }
 
@@ -289,15 +258,13 @@ std::unique_ptr<cudf::table> decompress_columns_parallel(compressed_table const&
                                                          rmm::device_async_resource_ref mr)
 {
   std::vector<std::unique_ptr<cudf::column>> cols(table.num_columns());
-  run_column_workers(static_cast<size_t>(table.num_columns()),
-                     pool,
-                     "simpatico::decompress_column_worker",
-                     [&](size_t i, rmm::cuda_stream_view stream) {
-                       std::string err;
-                       auto col = decompress_column(*table.columns[i].plan_tree, stream, mr, &err);
-                       if (!col) throw plan_error(err.empty() ? "decompress failed" : err);
-                       cols[i] = apply_stored_dtype(std::move(col), table.columns[i].dtype);
-                     });
+  run_column_workers(
+    static_cast<size_t>(table.num_columns()), pool, [&](size_t i, rmm::cuda_stream_view stream) {
+      std::string err;
+      auto col = decompress_column(*table.columns[i].plan_tree, stream, mr, &err);
+      if (!col) throw plan_error(err.empty() ? "decompress failed" : err);
+      cols[i] = apply_stored_dtype(std::move(col), table.columns[i].dtype);
+    });
   return std::make_unique<cudf::table>(std::move(cols));
 }
 
@@ -307,19 +274,14 @@ std::unique_ptr<cudf::table> decompress_columns_parallel(compressed_table const&
                                                          rmm::device_async_resource_ref mr)
 {
   std::vector<std::unique_ptr<cudf::column>> cols(selected.size());
-  run_column_workers(selected.size(),
-                     pool,
-                     "simpatico::decompress_column_worker",
-                     [&](size_t i, rmm::cuda_stream_view stream) {
-                       auto const idx = selected[i];
-                       if (idx >= table.columns.size())
-                         throw plan_error("selected column index out of range");
-                       std::string err;
-                       auto col =
-                         decompress_column(*table.columns[idx].plan_tree, stream, mr, &err);
-                       if (!col) throw plan_error(err.empty() ? "decompress failed" : err);
-                       cols[i] = apply_stored_dtype(std::move(col), table.columns[idx].dtype);
-                     });
+  run_column_workers(selected.size(), pool, [&](size_t i, rmm::cuda_stream_view stream) {
+    auto const idx = selected[i];
+    if (idx >= table.columns.size()) throw plan_error("selected column index out of range");
+    std::string err;
+    auto col = decompress_column(*table.columns[idx].plan_tree, stream, mr, &err);
+    if (!col) throw plan_error(err.empty() ? "decompress failed" : err);
+    cols[i] = apply_stored_dtype(std::move(col), table.columns[idx].dtype);
+  });
   return std::make_unique<cudf::table>(std::move(cols));
 }
 
