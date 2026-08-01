@@ -118,11 +118,6 @@ struct build_probe_decision {
 /// when it is below `max_broadcast_join_size` AND the probe side is large relative to the build
 /// (`estimated_probe_to_build_ratio >= num_gpus * 1.25`) — replicating a medium build avoids
 /// shuffling a much larger probe across GPUs.
-///
-/// `probe_parallelism_target` (the pipeline executor's thread count) drives the returned
-/// `probe_split_parts`: probe-side parallelism is deliberately NOT tied to the build partition
-/// count, because a BUILD_PROBE probe batch is joined against the whole (single) build table rather
-/// than a co-partitioned slice of it.
 [[nodiscard]] partition_strategy compute_hash_join_partition_strategy(
   uint64_t total_bytes,
   bool is_build_side,
@@ -133,8 +128,7 @@ struct build_probe_decision {
   uint64_t max_broadcast_join_size,
   duckdb::JoinType join_type,
   HASH_JOIN_MODE join_mode,
-  double estimated_probe_to_build_ratio,
-  int probe_parallelism_target = 1);
+  double estimated_probe_to_build_ratio);
 
 /// Which broadcast slots to discard. In a broadcast join the build table is replicated to every
 /// slot but the probe side is unpartitioned, so a slot may hold build data yet never receive probe
@@ -298,12 +292,6 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   //! left/output side) instead of filtered_join (build on the right side). Switch when
   //! right_rows >= ratio * left_rows; 0 disables. Set from operator_params at planning time.
   double mark_join_build_switch_ratio = config::DEFAULT_MARK_JOIN_BUILD_SWITCH_RATIO;
-
-  //! How many probe-side batches a single-partition BUILD_PROBE join should be fed, so its streamed
-  //! probe tasks can occupy the pipeline executor instead of running one at a time. Set to the GPU
-  //! pipeline executor's thread count at planning time (see sirius_plan_comparison_join); 1 (the
-  //! default) disables the probe split. Consumed by compute_hash_join_partition_strategy.
-  int probe_parallelism_target = 1;
 
   //! Join Keys statistics (optional)
   duckdb::vector<duckdb::unique_ptr<duckdb::BaseStatistics>> join_stats;

@@ -37,7 +37,6 @@
 #include <algorithm>
 #include <limits>
 #include <mutex>
-#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -348,14 +347,8 @@ void task_scheduler::management_eventloop()
       }
     }
 
-    // `_ready_devices` is legitimately empty here: it only records device_ready requests whose
-    // `is_scan` is false, so a loop iteration that saw none leaves it so. The hint is optional
-    // (schedule_lookahead defaults it to nullopt), so pass nothing rather than dereferencing
-    // begin() on an empty vector.
-    if (_task_queue.empty() && _task_creator) {
-      _task_creator->schedule_lookahead(_ready_devices.empty()
-                                          ? std::nullopt
-                                          : std::optional<int>{_ready_devices.front()});
+    if (_task_queue.empty()) {
+      if (_task_creator) { _task_creator->schedule_lookahead(*_ready_devices.begin()); }
     }
 
     // Matcher: for each ready device, try to find a dispatchable task.

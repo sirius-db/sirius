@@ -231,57 +231,11 @@ void sirius_pre_optimizer_hook(duckdb::OptimizerExtensionInput& input,
   }
 }
 
-namespace {
-
-/// True when @p a and @p b have the same operator type and child count at every node.
-bool same_shape(duckdb::LogicalOperator const& a, duckdb::LogicalOperator const& b)
-{
-  if (a.type != b.type || a.children.size() != b.children.size()) { return false; }
-  for (std::size_t i = 0; i < a.children.size(); i++) {
-    if (!same_shape(*a.children[i], *b.children[i])) { return false; }
-  }
-  return true;
-}
-
-void copy_cardinalities(duckdb::LogicalOperator const& original, duckdb::LogicalOperator& copy)
-{
-  // A node the optimizer never estimated is left alone, so LogicalOperator::EstimateCardinality
-  // keeps its lazy max-of-children fallback rather than being pinned to a fabricated 0.
-  if (original.has_estimated_cardinality) {
-    copy.SetEstimatedCardinality(original.estimated_cardinality);
-  }
-  for (std::size_t i = 0; i < original.children.size(); i++) {
-    copy_cardinalities(*original.children[i], *copy.children[i]);
-  }
-}
-
-/// Carry the optimizer's cardinality estimates onto a copied plan.
-///
-/// LogicalOperator::Copy() round-trips through BinarySerializer, and neither
-/// `estimated_cardinality` nor `has_estimated_cardinality` is serialized (they appear nowhere in
-/// duckdb/src/storage/serialization/), so every node of a copy comes back with 0/false. Sirius
-/// then reads the estimates via EstimateCardinality() in plan_comparison_join, which - with the
-/// flag cleared - silently falls back to "max of the children" and bottoms out at raw base-table
-/// row counts. Every filter and every join selectivity is discarded, so a build side over
-/// filtered orders reports lineitem's 5,999,330,220 rows. That number reaches
-/// sirius_physical_hash_join::get_partition_strategy as estimated_probe_to_build_ratio.
-void preserve_estimated_cardinality(duckdb::LogicalOperator const& original,
-                                    duckdb::LogicalOperator& copy)
-{
-  // All-or-nothing, matching preserve_dynamic_filter_metadata: a shape mismatch means the
-  // deserialized tree is not node-for-node comparable and any pairing would be guesswork.
-  if (!same_shape(original, copy)) { return; }
-  copy_cardinalities(original, copy);
-}
-
-}  // namespace
-
 duckdb::unique_ptr<duckdb::LogicalOperator> copy_logical_plan(duckdb::LogicalOperator const& plan,
                                                               duckdb::ClientContext& context)
 {
   auto copy = plan.Copy(context);
   planner::duckdb_join_filter_candidate_adapter::preserve_dynamic_filter_metadata(plan, *copy);
-  preserve_estimated_cardinality(plan, *copy);
   return copy;
 }
 

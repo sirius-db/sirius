@@ -301,25 +301,13 @@ void SiriusContext::run_mandatory_cleanup(sirius::query_id_t query_id, std::stri
   } catch (...) {
   }
 
-  // TEMPORARY INSTRUMENTATION: locate the ~20ms/query dead window measured between QueryEnd
-  // and the pool accounting (0.435 s/iter across 22 queries = 3.4% of an 11.6 s suite).
-  auto _t0 = std::chrono::steady_clock::now();
-  auto _lap = [&_t0](const char* what) {
-    auto now = std::chrono::steady_clock::now();
-    auto us = std::chrono::duration_cast<std::chrono::microseconds>(now - _t0).count();
-    _t0 = now;
-    if (us > 500) { SIRIUS_LOG_INFO("[cleanup-timing] {}: {} us", what, us); }
-  };
-
   query_.reset();
-  _lap("query_.reset");
 
   // Drain all downgrade executors before clearing repositories — ensures no downgrade
   // tasks hold shared_ptr<data_batch> references to batches we're about to destroy.
   for (auto& executor : downgrade_executors_) {
     executor->drain();
   }
-  _lap("downgrade_drain");
 
   // Close out batch placements still alive (un-consumed repo contents,
   // result-collector outputs) before their repositories are cleared.
@@ -327,7 +315,6 @@ void SiriusContext::run_mandatory_cleanup(sirius::query_id_t query_id, std::stri
   // steps or poison the runtime.
   try {
     sirius::telemetry::batch_telemetry_registry::instance().on_query_end();
-    _lap("batch_telemetry_on_query_end");
   } catch (std::exception& e) {
     try {
       SIRIUS_LOG_WARN("batch telemetry on_query_end failed (ignored): {}", e.what());
@@ -342,7 +329,6 @@ void SiriusContext::run_mandatory_cleanup(sirius::query_id_t query_id, std::stri
   // holds a raw data_repository* borrowed from this query's manager.
   {
     auto leaked = data_repository_registry_.erase(query_id);
-    _lap("repository_erase");
     try {
       for (auto const& info : leaked) {
         SIRIUS_LOG_WARN(
@@ -361,7 +347,6 @@ void SiriusContext::run_mandatory_cleanup(sirius::query_id_t query_id, std::stri
   // cleared above, so downstream data_batches that referenced sliced
   // host_data_representation are gone before the providers go away.
   if (scan_manager_) { scan_manager_->reset(); }
-  _lap("scan_manager_reset");
 
   // Drop per-query global states held by task_creator. These include
   // duckdb_scan_task_global_state, which transitively owns a
@@ -371,7 +356,6 @@ void SiriusContext::run_mandatory_cleanup(sirius::query_id_t query_id, std::stri
   // DuckDB's DatabaseInstance have already been torn down (~DBConfig fires
   // ~SiriusContext mid-DB destruction), which SIGSEGVs in ~BlockMemory.
   if (task_creator_) { task_creator_->reset(); }
-  _lap("task_creator_reset");
 
   try {
     log_pool_stats(end_tag);

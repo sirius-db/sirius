@@ -128,34 +128,17 @@ void downgrade_executor::stop()
 
 void downgrade_executor::drain()
 {
-  // TEMPORARY INSTRUMENTATION: drain() costs ~9.3 ms per call (measured: 116 calls = 1.08 s over a
-  // 2-iteration SF1000 suite, ~4.6% of an 11.6 s run) on a workload with ZERO downgrade events.
-  // Find which step actually costs it before choosing a fix.
-  auto _t = std::chrono::steady_clock::now();
-  auto _lap = [&_t](const char* what) {
-    auto now = std::chrono::steady_clock::now();
-    auto us  = std::chrono::duration_cast<std::chrono::microseconds>(now - _t).count();
-    _t       = now;
-    if (us > 200) { SIRIUS_LOG_INFO("[drain-timing] {}: {} us", what, us); }
-  };
-
   _pool->interrupt();
   _request_queue.interrupt();
-  _lap("interrupt");
 
   if (_processing_thread.joinable()) { _processing_thread.join(); }
-  _lap("join_processing_thread");
 
   _pool->wait_all();
-  _lap("pool_wait_all");
   cancel_pending_requests();
-  _lap("cancel_pending");
   _pool->resume();
   _request_queue.reactivate();
-  _lap("resume_reactivate");
 
   _processing_thread = std::thread(&downgrade_executor::processing_loop, this);
-  _lap("respawn_thread");
 }
 
 void downgrade_executor::processing_loop()

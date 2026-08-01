@@ -25,8 +25,6 @@
 #include "op/sirius_physical_top_n.hpp"
 #include "sirius_config.hpp"
 
-#include <atomic>
-
 namespace sirius {
 namespace op {
 
@@ -71,37 +69,13 @@ class sirius_physical_concat : public sirius_physical_partition_consumer_operato
   //! before the join so the hash join sees a single build batch.
   void set_concat_all(bool concat_all);
 
-  //! Probe-side counterpart of `set_concat_all`, applied when `get_partition_strategy` selects
-  //! BUILD_PROBE with a single build partition. The build is folded into one hash table, but probe
-  //! batches are joined against that whole table independently, so instead of coalescing the probe
-  //! into one `_concat_batch_bytes` batch (one join task, one thread) this CONCAT emits up to
-  //! `parts` batches. Only ever set on a probe-side CONCAT (`!is_build_concat()`); `parts <= 1`
-  //! restores the default coalescing. `min_batch_bytes` floors the resulting batch size so a tiny
-  //! probe is not shredded into tasks that cost more to schedule than to run.
-  void set_probe_split_parts(int parts,
-                             uint64_t min_batch_bytes = config::MIN_PROBE_SPLIT_BATCH_BYTES);
-
   [[nodiscard]] std::size_t no_history_peak_memory_estimate(
     const op::input_stats& stats) const override;
 
  private:
-  //! Per-output-batch byte budget for the current pull. Normally `_concat_batch_bytes`; when the
-  //! probe split is enabled AND the source pipeline has finished (so the total probe size is
-  //! known), a smaller budget that yields ~`_probe_split_parts` batches. Caller must hold `lock`.
-  //! The result is cached in `_split_budget_bytes`: recomputing it per pull would shrink the
-  //! budget geometrically as the repository drains.
-  [[nodiscard]] uint64_t effective_batch_bytes();
-
   bool _is_build;
   bool _concat_all;
   uint64_t _concat_batch_bytes;
-  //! Target probe-batch count for a single-partition BUILD_PROBE join; 1 = disabled. Set once at
-  //! partition-sizing time, read by `execute` off the lock, hence atomic.
-  std::atomic<int> _probe_split_parts{1};
-  //! Floor on a split probe batch (see `set_probe_split_parts`).
-  uint64_t _min_probe_split_bytes = config::MIN_PROBE_SPLIT_BATCH_BYTES;
-  //! Cached probe-split byte budget (0 = not yet fixed). See `effective_batch_bytes`.
-  std::atomic<uint64_t> _split_budget_bytes{0};
   //! Non-owning. Captured at construction from the `downstream_join` ctor argument.
   sirius_physical_operator* _downstream_join = nullptr;
 };
