@@ -2,7 +2,7 @@
 # column: o_orderkey  dtype: i64  ratio: 106.348x  depth: 2
 # comp: 337.98 GB/s  decomp: 740.63 GB/s
 input -> delta -> differences
-delta.differences -> lz4
+delta.differences -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
 
 ---
 # column: o_custkey  dtype: i32  ratio: 1.140x  depth: 1

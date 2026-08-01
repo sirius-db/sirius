@@ -1,7 +1,7 @@
-# TPC-H SF1000 reproduction — 9.139 s on GB300
+# TPC-H SF1000 reproduction — 8.501 s on GB300
 
-Reproduces a **9.139 s** TPC-H SF1000 suite (22 queries, best-of-3, 22/22 byte-identical),
-against a **15.99 s** starting point — **−42.8%**.
+Reproduces an **8.501 s** TPC-H SF1000 suite (22 queries, best-of-3, 22/22 byte-identical),
+against a **15.99 s** starting point — **−46.8%**.
 
 Measured 2026-08-01 on `pmgb300ws-0163`: GB300, 152 SMs, 256 GB HBM, 72-core Grace aarch64,
 driver 595.58.03, CUDA 13.2.
@@ -16,7 +16,7 @@ are deliberately not PR-ready (see *Status* at the bottom).
 ```bash
 # 1. Sirius
 git clone https://github.com/felipeblazing/sirius.git && cd sirius
-git checkout repro/sf1000-9.14s
+git checkout repro/sf1000-8.5s
 git submodule update --init --recursive     # NOT automatic; required
 pixi run make
 
@@ -31,7 +31,7 @@ DATA=/path/to/tpch_parquet_sf1000 pixi run bash bench/sf1000-repro/run.sh
 
 ## What produces the number
 
-Seven changes, each measured in isolation on this machine.
+Eight changes, each measured in isolation on this machine.
 
 | # | Change | Effect | Where |
 |---|---|---|---|
@@ -42,8 +42,24 @@ Seven changes, each measured in isolation on this machine.
 | 5 | q16 count-distinct → radix-sortable label | **q16 −39.0%** | `gpu_aggregate_impl.cpp` |
 | 6 | q19 OR-branch derivation + dictionary predicate pushdown | −3.0% suite, q19 −21.4% | optimizer hook + scan |
 | 7 | `scan_task_batch_size` 5GB → 8GB | −1.85% (q4 −25%, q12 −18%) | config only |
+| 8 | orderkey entropy tail → `bitpack` | **−6.98% suite**, 9 queries ≥3% (q4 −19.7%, q5 −17.4%, q21 −14.2%, q18 −9.9%) | `plans/` only |
 | | cuDF memcpy 2 MiB threshold | q9 −5.8% | `felipeblazing/cudf` `9af88b0` |
 | | cuDF groupby shmem replication | q1 ~−5% | `felipeblazing/cudf` `7375a46` |
+
+### Plan selection: decode throughput beats ratio
+
+The largest plan-level win was replacing the entropy tail on `l_orderkey`/`o_orderkey`
+(`delta -> ans` at 626 GB/s, `delta -> lz4` at 740 GB/s) with `delta -> bitpack` at ~1500 GB/s.
+Worth **−6.98% suite**, and GPU peak went *down* 2.2 GB — the entropy coders were paying for
+scratch, so the lower nominal ratio cost nothing.
+
+The campaign's original plan-selection rule was *"max ratio with decompress >= 250 GB/s"*. For
+GPU-resident data that optimises the wrong variable: once the data fits in HBM, ratio buys nothing
+and decode throughput is everything. The same reasoning applies to `l_shipinstruct`, kept as a
+`dictionary` plan here specifically so the decode-time predicate pushdown can answer from its keys.
+
+`l_comment` and `o_clerk` still carry entropy tails, and that is fine — **no TPC-H query references
+either column**, so per-query pinning never decodes them.
 
 ### The single most valuable line
 
@@ -62,7 +78,7 @@ first-iteration cost fell 28.99 s → 10.50 s on a warm cache.
 
 - **SF1000 TPC-H parquet**, one directory per table (`lineitem/*.parquet`, …). Generate with
   `test/tpch_performance/generate_test_data.py`.
-- **~256 GB GPU.** Peak usage is **253.9 GB of 256 GB**. There is under 2 GB of headroom; this
+- **~256 GB GPU.** Peak usage is **251.7 GB of 256 GB**. There is under 2 GB of headroom; this
   will not run on a smaller card without lowering `scan_task_batch_size` and re-tuning.
 - **~470 GB host RAM** for the host memory pool (`capacity_bytes` in the YAML).
 - The pixi environment (`pixi run …`). Do not use a bare `build/release/duckdb` — see *Gotchas*.

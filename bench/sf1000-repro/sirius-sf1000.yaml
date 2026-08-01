@@ -1,5 +1,5 @@
 # TPC-H SF1000 reproduction config -- GB300 (152 SM, 256 GB HBM, 72-core Grace aarch64).
-# Measured 9.139 s suite (best-of-3, 22/22 byte-identical), vs a 15.99 s starting point.
+# Measured 8.501 s suite (best-of-3, 22/22 byte-identical), vs a 15.99 s starting point.
 #
 # Knobs that were swept and measured INERT on this machine (do not bother retuning):
 #   pipeline.num_threads        6 / 8 / 12   all within 0.55%
