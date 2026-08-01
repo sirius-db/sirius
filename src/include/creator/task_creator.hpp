@@ -35,6 +35,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <exception>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -188,6 +189,14 @@ class task_creator {
 
   void schedule_lookahead(sirius::query_id_t query_id,
                           std::optional<int> device_id_hint = std::nullopt);
+
+  /// \brief Fail the running query with @p error and stop the creator.
+  ///
+  /// schedule() throws on an operator that carries no pipeline. Callers on paths that must not
+  /// propagate (sirius_pipeline::notify_downstream_pipelines runs from ~gpu_pipeline_task and
+  /// from the streaming-source close callback) route the exception here instead, so the query
+  /// surfaces the error rather than the process terminating.
+  void report_fatal_error(std::exception_ptr error);
 
   /**
    * @brief Get the next task id.

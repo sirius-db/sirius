@@ -24,6 +24,7 @@
 #include "pipeline/task_scheduler.hpp"
 #include "planner/query.hpp"
 #include "planner/query_index.hpp"
+#include "sirius/exception.hpp"
 #include "sirius_context.hpp"
 
 #include <cucascade/cudf/gpu_data_representation.hpp>
@@ -390,14 +391,23 @@ void task_creator::stop_thread_pool()
 namespace {
 
 //! The query and scheduling priority of the pipeline `node` belongs to.
-//! An unplaced operator (no pipeline yet) yields query 0 / priority 0; such a request is
-//! droppable and will simply find no state when the worker resolves it.
 std::pair<sirius::query_id_t, exec::queue_priority> request_keys_for(
   const op::sirius_physical_operator* node)
 {
-  if (node == nullptr) { return {sirius::make_query_id(0), 0}; }
+  if (node == nullptr) {
+    throw sirius::internal_exception("task_creator::schedule: null operator");
+  }
   const auto pipe = node->get_pipeline();
-  if (!pipe) { return {sirius::make_query_id(0), 0}; }
+  if (!pipe) {
+    throw sirius::internal_exception(
+      "task_creator::schedule: operator {} (id {}) has no pipeline; it was never placed by "
+      "planner::query::build_indices",
+      node->get_name(),
+      // get_operator_id() itself throws on an unnumbered operator; report the sentinel instead so
+      // the pipeline-less diagnosis is not masked by an id-assignment one.
+      node->has_operator_id() ? std::to_string(node->get_operator_id())
+                              : std::string{"unassigned"});
+  }
   return {pipe->get_query_id(), pipe->get_priority()};
 }
 
@@ -421,6 +431,12 @@ void task_creator::schedule(op::sirius_physical_operator* node, sirius::query_id
   request->query_id        = query_id;
   request->priority        = priority;
   _task_creation_queue.push(std::move(request));
+}
+
+void task_creator::report_fatal_error(std::exception_ptr error)
+{
+  if (_task_scheduler != nullptr) { _task_scheduler->terminate_query(std::move(error)); }
+  stop();
 }
 
 void task_creator::schedule_lookahead(sirius::query_id_t query_id,
@@ -719,8 +735,7 @@ void task_creator::manager_loop()
           pipeline->update_pipeline_status(false);
         } catch (const std::exception& e) {
           SIRIUS_LOG_ERROR("Task Creator: Exception during task creation: {}", e.what());
-          _task_scheduler->terminate_query(std::current_exception());
-          stop();
+          report_fatal_error(std::current_exception());
         }
       });
   }
