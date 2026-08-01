@@ -1,7 +1,7 @@
-# TPC-H SF1000 reproduction — 8.501 s on GB300
+# TPC-H SF1000 reproduction — 8.180 s on GB300
 
-Reproduces an **8.501 s** TPC-H SF1000 suite (22 queries, best-of-3, 22/22 byte-identical),
-against a **15.99 s** starting point — **−46.8%**.
+Reproduces an **8.180 s** TPC-H SF1000 suite (22 queries, best-of-3, 22/22 byte-identical),
+against a **15.99 s** starting point — **−48.8%**.
 
 Measured 2026-08-01 on `pmgb300ws-0163`: GB300, 152 SMs, 256 GB HBM, 72-core Grace aarch64,
 driver 595.58.03, CUDA 13.2.
@@ -31,7 +31,7 @@ DATA=/path/to/tpch_parquet_sf1000 pixi run bash bench/sf1000-repro/run.sh
 
 ## What produces the number
 
-Eight changes, each measured in isolation on this machine.
+Ten changes, each measured in isolation on this machine.
 
 | # | Change | Effect | Where |
 |---|---|---|---|
@@ -44,7 +44,29 @@ Eight changes, each measured in isolation on this machine.
 | 7 | `scan_task_batch_size` 5GB → 8GB | −1.85% (q4 −25%, q12 −18%) | config only |
 | 8 | orderkey entropy tail → `bitpack` | **−6.98% suite**, 9 queries ≥3% (q4 −19.7%, q5 −17.4%, q21 −14.2%, q18 −9.9%) | `plans/` only |
 | | cuDF memcpy 2 MiB threshold | q9 −5.8% | `felipeblazing/cudf` `9af88b0` |
+| 9 | Bloom filter fast-range block index | **q21 −15.2%**, q3 −8.9%, q8 −7.3% | `sirius_dynamic_bloom_filter.cu` |
+| 10 | `cuco` set bucket size 1 → 4 | −1.32% suite (q18 −3.4%, q17 −12.3%) | `sirius_dynamic_in_list_filter.cu` |
 | | cuDF groupby shmem replication | q1 ~−5% | `felipeblazing/cudf` `7375a46` |
+
+### Two latent defects in dependency fast-path selection
+
+Both of the last wins were structures silently falling off a fast path, not tuning.
+
+**The Bloom filter was doing a 64-bit integer modulo per probe.** `blocks_for()` sizes every
+Bloom above `cuco::arrow_filter_policy`'s 128 MiB cap, so it always fell through to
+`default_filter_policy`, whose `block_index` is literally `hash % num_blocks`. GPUs have no
+integer-divide instruction, so that is a long emulated sequence and it dominated the kernel. The
+miss is by a hair — the Arrow cap is **67.1M keys** at 16 bits/key and q21's two hot filters hold
+**73.2M and 70.6M**, over by 9% and 5%. Replacing `block_index` with Lemire fast-range
+(`(hash * num_blocks) >> 64`, one `mul.hi.u64`) is **q21 −15.2%**. `cuco::static_set` already
+avoided this via `fast_int` magic reciprocals — only the Bloom policy was raw.
+
+**Hash bucket size is right at 4 for one probing scheme and wrong for the other.** Our IN-list set
+is **double-hashed**, so every probe step is a fresh random sector and a wider bucket retires up to
+4 dependent fetches in one — measured 1.16–1.64x at real build sizes, with bucket **8 regressing**.
+cuDF's *groupby* set uses **linear probing** with `step_size = BucketSize`, so successive steps walk
+contiguous slots and a wider bucket only adds load — measured monotonically worse, bucket 1 optimal.
+Same constant, opposite answer. **The probing scheme decides it, not the constant.**
 
 ### Plan selection: decode throughput beats ratio
 
@@ -130,6 +152,16 @@ Do not spend time retuning these on this machine:
 | `scan_manager.num_threads` | 18 vs 24 | −0.33% |
 | `scan_task_batch_size` | 2GB | +0.10% |
 | `scan_task_batch_size` | 10GB | +0.19% vs 8GB, and costs q9 2.6% |
+| `mark_join_build_switch_ratio` | 3.0 / 0 (default 8.0) | −0.03% / −0.28% — never fires |
+| `dynamic_filter_keep_threshold` | 0.5 / 0.2 (default 0.9) | −0.11% / +0.69% — gate never binds |
+| `max_broadcast_join_size` | 8GB (default 256MB) | −0.24% |
+| `enable_dynamic_zone_map_filter` | true (default false) | +0.06% — scattered keys prune nothing |
+| `enable_dynamic_filter_pushdown` | **false** | **LIVELOCKS** — see below |
+
+**Do not disable dynamic filter pushdown.** At 251 GB of a 256 GB card it is load-bearing for
+*memory feasibility*, not speed: without it more rows survive the scan, intermediates grow, the
+executor cannot get a reservation, and it spins on `reschedule (retry 1/100)` forever with the GPU
+at 0% utilisation. Twelve knobs were swept in total and **only `scan_task_batch_size` mattered**.
 
 **GPU-busy is 91–97% of wall.** Scheduling and parallelism knobs cannot help; only removing work
 or raising achieved bandwidth moves the clock. That also explains why a lookahead scheduler, a
