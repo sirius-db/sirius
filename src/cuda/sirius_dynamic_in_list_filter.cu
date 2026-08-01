@@ -30,6 +30,7 @@
 #include <cub/device/device_for.cuh>
 #include <cuco/operator.hpp>
 #include <cuco/static_set.cuh>
+#include <cuco/storage.cuh>
 #include <cuda/sirius_rmm_cuco_allocator.cuh>
 #include <cuda/std/functional>
 #include <cuda/std/limits>
@@ -54,13 +55,47 @@
 namespace sirius::op {
 
 namespace {
-// Match estimated_set_bytes' 0.5 load factor: capacity = 2 × keys.
+// Baseline load factor: capacity = 2 × keys. estimated_set_bytes reports this size, and the
+// publisher's "does the set fit L2?" test is evaluated against it, so this constant alone decides
+// IN-list vs Bloom. `capacity_factor_for` may grow the *actual* capacity beyond it (see below);
+// that only ever makes an already-fitting set sparser, never flips the filter choice.
 constexpr std::size_t kCapacityFactor = 2;
 constexpr double kLoadFactor          = 1.0 / kCapacityFactor;
 
 // Threads per key probe.
 constexpr std::size_t kCgSize = 1;
 static_assert(kCgSize == 1, "cuco::static_set requires kCgSize==1 for device_for bulk iteration");
+
+// Keys per bucket. compute_mask is a pure miss-heavy membership probe, so its cost is dominated by
+// the number of *random* slot fetches, not by bytes compared. Packing 4 keys into one bucket lets a
+// single 16 B (INT32) / 32 B (INT64) fetch retire what bucket size 1 needed up to 4 dependent
+// fetches for. Measured at the SF1000 probe shapes this is worth 1.16-1.30x on its own, and it
+// leaves capacity (and therefore estimated_set_bytes and the replica byte count) unchanged.
+// Bucket size 8 regresses: the extra intra-bucket comparisons outweigh the fetches saved.
+constexpr std::int32_t kBucketSize = 4;
+
+// Largest capacity multiplier whose table still fits `budget`, else the baseline. A sparser table
+// shortens probe chains, but only pays while the table stays cache-resident -- past that the extra
+// footprint costs more than the saved probes (measured: at 4x, q9's 41 MB of keys grow to 166 MB,
+// blow the 115 MB L2 and give back the entire win). Half of L2 is the budget so the streaming probe
+// column still has room; the remaining candidates are tried largest-first.
+constexpr std::size_t kGrowthCandidates[] = {4, 3};
+
+[[nodiscard]] std::size_t capacity_factor_for(std::size_t num_keys, std::size_t key_bytes) noexcept
+{
+  int l2     = 0;
+  int device = -1;
+  if (cudaGetDevice(&device) != cudaSuccess ||
+      cudaDeviceGetAttribute(&l2, cudaDevAttrL2CacheSize, device) != cudaSuccess || l2 <= 0) {
+    return kCapacityFactor;
+  }
+  auto const budget = static_cast<std::size_t>(l2) / 2;
+  for (auto const factor : kGrowthCandidates) {
+    // num_keys * key_bytes is bounded by the build column's own size, so this cannot overflow.
+    if (num_keys * key_bytes * factor <= budget) { return factor; }
+  }
+  return kCapacityFactor;
+}
 
 // Minimum set capacity.
 constexpr std::size_t kMinCapacity = 8;
@@ -74,7 +109,8 @@ using set_type = cuco::static_set<KeyT,
                                   cuda::thread_scope_device,
                                   cuda::std::equal_to<KeyT>,
                                   cuco::double_hashing<kCgSize, cuco::default_hash_function<KeyT>>,
-                                  set_alloc<KeyT>>;
+                                  set_alloc<KeyT>,
+                                  cuco::storage<kBucketSize>>;
 
 template <class KeyT>
 using set_owner = std::unique_ptr<set_type<KeyT>>;
@@ -182,7 +218,9 @@ sirius_dynamic_in_list_filter::sirius_dynamic_in_list_filter(cudf::column_view c
   }
 
   cuda::stream_ref const s{stream.value()};
-  auto const capacity = std::max<std::size_t>(kCapacityFactor * _num_keys, kMinCapacity);
+  auto const factor =
+    capacity_factor_for(_num_keys, static_cast<std::size_t>(cudf::size_of(_key_type)));
+  auto const capacity = std::max<std::size_t>(factor * _num_keys, kMinCapacity);
   _set                = std::make_unique<set_impl>();
   if (cudaGetDevice(&_set->source_device) != cudaSuccess) {
     throw std::runtime_error("[sirius_dynamic_in_list_filter] failed to identify source device.");
@@ -201,6 +239,14 @@ sirius_dynamic_in_list_filter::sirius_dynamic_in_list_filter(cudf::column_view c
       throw std::logic_error(
         "[sirius_dynamic_in_list_filter] supported key type changed during construction.");
   }
+  SIRIUS_LOG_DEBUG(
+    "[sirius_dynamic_in_list_filter] built set: {} keys, bucket_size={}, capacity_factor={}, "
+    "capacity={} slots ({} bytes).",
+    _num_keys,
+    kBucketSize,
+    factor,
+    capacity,
+    capacity * static_cast<std::size_t>(cudf::size_of(_key_type)));
   _set->replicas.push_back(std::move(source));
 }
 
@@ -372,6 +418,11 @@ std::unique_ptr<cudf::column> sirius_dynamic_in_list_filter::compute_mask(
 
 std::size_t sirius_dynamic_in_list_filter::size() const noexcept { return _num_keys; }
 
+// Reports the *baseline* (kCapacityFactor) footprint, which is the smallest table this filter will
+// ever build. The constructor may pick a sparser table when one comfortably fits L2, so this is a
+// lower bound on the real allocation rather than an exact size -- deliberately so: it keeps the
+// caller's "does the set fit L2?" test, and hence the IN-list/Bloom choice, independent of the
+// probe-side tuning. Callers that need the true size must ask the built set for its capacity.
 std::size_t sirius_dynamic_in_list_filter::estimated_set_bytes(std::size_t num_keys,
                                                                cudf::data_type key_type) noexcept
 {
