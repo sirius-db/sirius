@@ -394,6 +394,13 @@ def run_grouped(
                 try:
                     for it in range(iterations):
                         log(f"--- q{qnum} iter{it} engine={name} ---")
+                        if use_gpu:
+                            try:
+                                con.execute(
+                                    f"CALL sirius_set_query_label('q{qnum}_iter{it}')"
+                                ).fetchall()
+                            except Exception as e:
+                                log(f"  query label failed (non-fatal): {e}")
                         _run_one(
                             writer,
                             con,
