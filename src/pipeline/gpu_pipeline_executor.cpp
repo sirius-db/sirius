@@ -250,7 +250,7 @@ void gpu_pipeline_executor::process_task(
             .get();
       } catch (const std::exception& e) {
         // The downgrade executor cancelled this request (its queue was drained). This task cannot
-        // get its reservation, so fail its query 
+        // get its reservation, so fail its query
         SIRIUS_LOG_INFO("GPU Pipeline Executor: downgrade request cancelled for task {}: {}",
                         gpu_task->get_task_id(),
                         e.what());
