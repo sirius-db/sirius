@@ -5,7 +5,8 @@ Getting Sirius from "per-query data structures exist" to "N queries actually run
 | Document | Purpose |
 |---|---|
 | [00-issue-register.md](00-issue-register.md) | **Read first.** Every remaining issue, with severity, file:line, and failure scenario. All options close all of it. |
-| [**option-d-recommended.md**](option-d-recommended.md) | **The plan to execute.** B's step ordering with C's two structural changes folded in, after the scoping answers. |
+| [**99-execution-summary.md**](99-execution-summary.md) | **Start here for current state.** What was built, what was backed out, and the recommended next steps. |
+| [option-d-recommended.md](option-d-recommended.md) | The plan that was executed. Annotated in place where reality diverged from it. |
 | [option-a-surgical.md](option-a-surgical.md) | Fix each site in place with the narrowest change. No new abstractions. |
 | [option-b-unified-gate.md](option-b-unified-gate.md) | One lifecycle gate + query-aware thread pool. Implements the `drain_and_wait(query_id)` idea. |
 | [option-c-structural.md](option-c-structural.md) | Option B plus shared-ownership repositories, plan lifetime inversion, and fairness. |
