@@ -170,12 +170,21 @@ void itask_executor::wait_and_validate_empty(sirius::query_id_t query_id)
   // null-dereferenced when a query failed before any work reached this executor.
   if (!_bounded_pool) { return; }
 
-  quiesce_manager();
-  // Only THIS query's tasks must be gone. The previous version validated the WHOLE queue, so a
-  // query completing normally threw because a co-tenant had work legitimately queued.
+  // Per-query wait, no quiesce bracket. This is the success path: the query's completion handler
+  // has already fired, so nothing of this query remains to be popped and the pop-to-attach window
+  // that the error path must worry about cannot occur here. Untagged slots (a manager parked in
+  // pop()) are ignored by drain_and_wait, which is exactly what lets this return without stopping
+  // the executor -- and therefore without interrupting the shared queue and dropping a co-tenant's
+  // in-transit task, which the previous bracket did on EVERY successful completion.
+  // wait_for_query, NOT drain_and_wait: this is the success path, so the query's remaining work
+  // must be allowed to RUN. Dropping it here would silently discard tasks the query legitimately
+  // scheduled and then report success.
+  _bounded_pool->wait_for_query(query_id);
+
+  // Only THIS query's tasks must be gone. The original validated the WHOLE queue, so a query
+  // completing normally threw because a co-tenant had work legitimately queued.
   const std::size_t remaining =
     _task_queue.size(exec::query_index{static_cast<exec::query_key>(sirius::value_of(query_id))});
-  resume_manager();
 
   if (remaining != 0) {
     SIRIUS_LOG_ERROR(
@@ -195,12 +204,17 @@ void itask_executor::wait_and_drain_query(sirius::query_id_t query_id)
   // Error-path counterpart of wait_and_validate_empty: let in-flight work finish so no thread is
   // still touching the failing query's plan, then drop that query's queued tasks.
   //
-  // The quiesce/resume bracket is still whole-executor — see quiesce_manager() for why wait_all()
-  // requires it. What changed is the drain in the middle: drain_and_wait() cleared the ENTIRE
-  // queue here, destroying every co-tenant query's queued work and leaving those queries waiting
-  // on completions that could never arrive. Now only the failing query's tasks are dropped. The
-  // remaining cost is a brief stall of co-tenants across the bracket, which the query-aware
-  // bounded_thread_pool removes by making the in-flight wait per-query.
+  // This one KEEPS the quiesce bracket, deliberately. Unlike the success path, a failing query can
+  // still have tasks sitting in the queue that the manager is free to pop at any moment, and there
+  // is a window between pop() and slot::attach() where the task belongs to neither the queue nor
+  // the per-query slot count. Joining the manager is what closes it: after that, no task can be
+  // in-hand. The caller's next act is to let the plan be destroyed, so "almost certainly quiesced"
+  // is not good enough here.
+  //
+  // What did change: the drain in the middle is per-query. The original cleared the ENTIRE queue,
+  // destroying every co-tenant's queued work and leaving those queries waiting on completions that
+  // could never arrive. The residual cost is that co-tenant pushes are refused across the bracket
+  // — on the error path only, not on every successful completion as before.
   if (!_bounded_pool) {
     drain_query_tasks(query_id);
     return;

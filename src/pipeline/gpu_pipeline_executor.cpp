@@ -216,6 +216,11 @@ void gpu_pipeline_executor::process_task(
       return;
     }
     iteration_completion = gpu_task->get_completion_handler();
+    // Attribute the reserved slot now that the task's query is known, so
+    // drain_and_wait(query_id) covers this execution. Not done at reserve() time: the manager
+    // parks in pop() holding the slot before any task exists, and counting that against a query
+    // would make its drain wait for work that may never arrive.
+    if (auto const* pipe = gpu_task->get_pipeline()) { slot.attach(pipe->get_query_id()); }
     // Pass this executor's memory space so cross-space inputs (host/disk tiers and GPU data on
     // another device, which prepare clones into this space) are counted in the reservation.
     auto reservation_info = gpu_task->get_estimated_reservation_size_info(_memory_space);

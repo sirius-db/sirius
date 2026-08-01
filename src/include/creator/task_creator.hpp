@@ -335,16 +335,9 @@ class task_creator {
     std::size_t index_of_next_lookahead{0};
     std::vector<op::sirius_physical_operator*> lookahead_queue;
 
-    //! Per-query stand-in for `bounded_thread_pool::wait_all()`, which can only wait on every
-    //! query's creation work at once. Incremented before dispatch, decremented when the lambda
-    //! leaves (including by exception); `wait_for_in_flight()` blocks until it reaches zero.
-    std::mutex in_flight_mutex;
-    std::condition_variable in_flight_cv;
-    std::size_t in_flight{0};
-
-    void enter_in_flight();
-    void leave_in_flight();
-    void wait_for_in_flight();
+    // (In-flight creation work is tracked by the pool itself, keyed by the query the slot is
+    // attached to; see bounded_thread_pool::drain_and_wait. The bespoke counter that used to live
+    // here duplicated that accounting and had to be kept in sync by hand across every exit path.)
   };
 
   //! Resolve a query's state, or nullptr when it has already been reset.
