@@ -17,13 +17,16 @@
 #pragma once
 
 #include "log/logging.hpp"
+#include "query_id.hpp"
 
 #include <absl/functional/any_invocable.h>
 
 #include <condition_variable>
 #include <latch>
+#include <list>
+#include <map>
 #include <mutex>
-#include <queue>
+#include <optional>
 #include <string>
 #include <thread>
 #include <utility>
@@ -61,14 +64,20 @@ class bounded_thread_pool {
    public:
     explicit slot(bounded_thread_pool* pool = nullptr) noexcept : pool_(pool) {}
 
-    slot(slot&& other) noexcept : pool_(other.pool_) { other.pool_ = nullptr; }
+    slot(slot&& other) noexcept : pool_(other.pool_), query_(other.query_)
+    {
+      other.pool_ = nullptr;
+      other.query_.reset();
+    }
 
     slot& operator=(slot&& other) noexcept
     {
       if (this != &other) {
         release();
         pool_       = other.pool_;
+        query_      = other.query_;
         other.pool_ = nullptr;
+        other.query_.reset();
       }
       return *this;
     }
@@ -81,13 +90,39 @@ class bounded_thread_pool {
     [[nodiscard]] bool is_valid() const noexcept { return pool_ != nullptr; }
     explicit operator bool() const noexcept { return is_valid(); }
 
+    /**
+     * @brief Attribute this slot to @p query_id, so drain_and_wait(query_id) waits for it.
+     *
+     * Deliberately separate from reserve(). Every manager loop in this codebase reserves a slot
+     * and THEN blocks waiting for a task, so the query is not known at reserve() time — and an
+     * idle manager must not be counted against any query, or drain_and_wait() would block until
+     * that manager happened to receive work. Attribution therefore happens once the task has been
+     * popped and its query is known.
+     *
+     * Idempotent; a slot can only be attached once.
+     */
+    void attach(sirius::query_id_t query_id)
+    {
+      if (pool_ == nullptr || query_.has_value()) { return; }
+      query_ = query_id;
+      pool_->attach_slot(query_id);
+    }
+
+    /// \brief The query this slot is attributed to, or nullopt while untagged.
+    [[nodiscard]] std::optional<sirius::query_id_t> query() const noexcept { return query_; }
+
    private:
     void release()
     {
-      if (auto* p = std::exchange(pool_, nullptr); p != nullptr) { p->release_slot(); }
+      if (auto* p = std::exchange(pool_, nullptr); p != nullptr) {
+        const auto q = query_;
+        query_.reset();
+        p->release_slot(q);
+      }
     }
 
     bounded_thread_pool* pool_{nullptr};
+    std::optional<sirius::query_id_t> query_{};
   };
 
   explicit bounded_thread_pool(int capacity,
@@ -205,34 +240,122 @@ class bounded_thread_pool {
   void dispatch(slot&& s, absl::AnyInvocable<void()> fn)
   {
     if (not s) { return; }
+    const auto query = s.query();
     {
       std::lock_guard lock(mu_);
-      work_queue_.push([s = std::move(s), fn = std::move(fn)]() mutable noexcept {
-        try {
-          fn();
-        } catch (const std::exception& e) {
-          SIRIUS_LOG_ERROR("Exception in bounded_thread_pool task: {}", e.what());
-        } catch (...) {
-          SIRIUS_LOG_ERROR("Unknown exception in bounded_thread_pool task");
-        }
-        // Destroy before slot is released upon lambda exit.
-        fn = nullptr;
-        // When slot, s, goes out of scope, release_slot is automatically
-        // invoked, clearing the path for another task to pick up that slot.
-      });
+      work_queue_.push_back(
+        work_item{query, [s = std::move(s), fn = std::move(fn)]() mutable noexcept {
+                    try {
+                      fn();
+                    } catch (const std::exception& e) {
+                      SIRIUS_LOG_ERROR("Exception in bounded_thread_pool task: {}", e.what());
+                    } catch (...) {
+                      SIRIUS_LOG_ERROR("Unknown exception in bounded_thread_pool task");
+                    }
+                    // Destroy before slot is released upon lambda exit.
+                    fn = nullptr;
+                    // When slot, s, goes out of scope, release_slot is automatically
+                    // invoked, clearing the path for another task to pick up that slot.
+                  }});
     }
     cv_work_.notify_one();
   }
 
- private:
-  // Called exclusively by the slot destructor — covers both the drop-without-dispatch
-  // and post-task-completion cases.
-  void release_slot()
+  /**
+   * @brief Wait until @p query_id has no work left — queued or running — without dropping any.
+   *
+   * A slot is attached before it is dispatched, so the per-query count covers queued-but-unstarted
+   * work as well as work in progress; waiting for it to reach zero therefore means every task of
+   * this query has actually RUN. That is what the success path needs: dropping there would
+   * silently discard work the query legitimately scheduled.
+   *
+   * Untagged slots (an idle manager holding a reservation) are ignored, so this returns while
+   * other queries — and the manager itself — carry on. wait_all() cannot: it waits for
+   * active_ == 0, which a parked manager makes unreachable.
+   */
+  void wait_for_query(sirius::query_id_t query_id)
   {
+    std::unique_lock lock(mu_);
+    cv_query_idle_.wait(lock, [&] {
+      auto it = active_by_query_.find(query_id);
+      return it == active_by_query_.end() || it->second == 0;
+    });
+  }
+
+  /**
+   * @brief Drop @p query_id's queued work and wait for its running work to finish.
+   *
+   * The per-query counterpart of wait_all(). Untagged slots — notably a manager thread parked in
+   * its own queue's pop() while holding a reservation — are ignored, which is precisely why this
+   * can return while other queries keep running. wait_all() cannot: it waits for active_ == 0,
+   * which an idle manager makes unreachable.
+   *
+   * Queued items are moved out under the lock and destroyed after releasing it: destroying a work
+   * item runs ~slot, which re-enters release_slot() and would deadlock on a held mutex.
+   */
+  void drain_and_wait(sirius::query_id_t query_id)
+  {
+    std::list<work_item> dropped;
+    {
+      std::lock_guard lock(mu_);
+      for (auto it = work_queue_.begin(); it != work_queue_.end();) {
+        if (it->query == query_id) {
+          auto next = std::next(it);
+          dropped.splice(dropped.end(), work_queue_, it);
+          it = next;
+        } else {
+          ++it;
+        }
+      }
+    }
+    dropped.clear();  // releases the dropped items' slots, outside the lock
+
+    std::unique_lock lock(mu_);
+    cv_query_idle_.wait(lock, [&] {
+      auto it = active_by_query_.find(query_id);
+      return it == active_by_query_.end() || it->second == 0;
+    });
+  }
+
+  /// \brief Number of running slots attributed to @p query_id. Test/diagnostic aid.
+  [[nodiscard]] int active_for_query(sirius::query_id_t query_id)
+  {
+    std::lock_guard lock(mu_);
+    auto it = active_by_query_.find(query_id);
+    return it == active_by_query_.end() ? 0 : it->second;
+  }
+
+ private:
+  /// One unit of dispatched work plus the query it is attributed to (nullopt when untagged).
+  struct work_item {
+    std::optional<sirius::query_id_t> query;
+    absl::AnyInvocable<void() noexcept> fn;
+  };
+
+  // Called by slot::attach() once the query behind a reservation is known.
+  void attach_slot(sirius::query_id_t query_id)
+  {
+    std::lock_guard lock(mu_);
+    ++active_by_query_[query_id];
+  }
+
+  // Called exclusively by the slot destructor — covers both the drop-without-dispatch
+  // and post-task-completion cases. @p query is the slot's attribution, if it had one.
+  void release_slot(std::optional<sirius::query_id_t> query)
+  {
+    bool query_idle = false;
     {
       std::lock_guard lock(mu_);
       --active_;
+      if (query.has_value()) {
+        auto it = active_by_query_.find(*query);
+        if (it != active_by_query_.end() && --it->second <= 0) {
+          active_by_query_.erase(it);
+          query_idle = true;
+        }
+      }
     }
+    if (query_idle) { cv_query_idle_.notify_all(); }
     cv_capacity_.notify_one();
     cv_idle_.notify_all();
   }
@@ -245,8 +368,8 @@ class bounded_thread_pool {
         std::unique_lock lock(mu_);
         cv_work_.wait(lock, [&] { return !work_queue_.empty() || stop_requested_; });
         if (stop_requested_ && work_queue_.empty()) { break; }
-        fn = std::move(work_queue_.front());
-        work_queue_.pop();
+        fn = std::move(work_queue_.front().fn);
+        work_queue_.pop_front();
       }
       if (fn == nullptr) { break; }
       fn();
@@ -254,16 +377,21 @@ class bounded_thread_pool {
   }
 
   std::mutex mu_;
-  std::condition_variable cv_capacity_;  // reserve() waits here when at capacity
-  std::condition_variable cv_idle_;      // wait_all() waits here
-  std::condition_variable cv_work_;      // worker threads wait here for work
+  std::condition_variable cv_capacity_;    // reserve() waits here when at capacity
+  std::condition_variable cv_idle_;        // wait_all() waits here
+  std::condition_variable cv_work_;        // worker threads wait here for work
+  std::condition_variable cv_query_idle_;  // drain_and_wait(query_id) waits here
 
   int active_{0};
   const int capacity_;
   bool interrupted_{false};
   bool stop_requested_{false};
 
-  std::queue<absl::AnyInvocable<void() noexcept>> work_queue_;
+  /// std::list, not std::queue: drain_and_wait(query_id) must remove one query's items from the
+  /// middle without disturbing the ordering of everyone else's.
+  std::list<work_item> work_queue_;
+  /// Running slots per query. Absent key == zero; untagged slots are not represented at all.
+  std::map<sirius::query_id_t, int> active_by_query_;
   std::vector<std::thread> threads_;
 };
 

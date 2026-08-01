@@ -180,7 +180,17 @@ stop/start hammer test.
 Only safe now: step 3 removed the stop/start-per-query cycle that would otherwise destroy and
 recreate the pool — and any per-query state in it — on every completion.
 
-> **Carried over from step 3 — A6 is only partly closed.** `wait_and_validate_empty(query_id)` and
+> **RESOLVED IN STEP 5 (success path).** `wait_and_validate_empty(query_id)` now uses
+> `bounded_thread_pool::wait_for_query(query_id)` with no quiesce bracket, so a successful query
+> completion no longer interrupts the shared queue and can no longer drop a co-tenant's in-transit
+> task. `wait_and_drain_query(query_id)` (the ERROR path) deliberately keeps the bracket: a failing
+> query can still have tasks the manager may pop at any moment, and there is a window between
+> `pop()` and `slot::attach()` where a task belongs to neither the queue nor the per-query count.
+> Joining the manager is what closes it, and the caller's next act is to destroy the plan, so
+> "almost certainly quiesced" is not good enough there. Closing that last window needs the manager
+> to publish its in-hand task's query before leaving the queue's lock — noted as follow-up work.
+>
+> **Original note, kept for context — A6 was only partly closed in step 3.** `wait_and_validate_empty(query_id)` and
 > `wait_and_drain_query(query_id)` still bracket their work in `quiesce_manager()` /
 > `resume_manager()`, because `manager_loop()` reserves a pool slot and then blocks in `pop()`: an
 > idle manager holds an active slot forever, so `wait_all()` cannot return until the manager is

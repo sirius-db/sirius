@@ -86,28 +86,6 @@ task_creator::task_creator(task_creator_config config,
 
 task_creator::~task_creator() { stop(); }
 
-void task_creator::query_task_global_state::enter_in_flight()
-{
-  std::lock_guard<std::mutex> lock(in_flight_mutex);
-  ++in_flight;
-}
-
-void task_creator::query_task_global_state::leave_in_flight()
-{
-  {
-    std::lock_guard<std::mutex> lock(in_flight_mutex);
-    --in_flight;
-    if (in_flight != 0) { return; }
-  }
-  in_flight_cv.notify_all();
-}
-
-void task_creator::query_task_global_state::wait_for_in_flight()
-{
-  std::unique_lock<std::mutex> lock(in_flight_mutex);
-  in_flight_cv.wait(lock, [this] { return in_flight == 0; });
-}
-
 std::shared_ptr<task_creator::query_task_global_state> task_creator::get_query_task_global_state(
   sirius::query_id_t query_id) const
 {
@@ -273,10 +251,12 @@ void task_creator::drain_pending_tasks(sirius::query_id_t query_id)
   auto state = get_query_task_global_state(query_id);
   if (!state) { return; }
 
-  // Wait out this query's in-flight creation lambdas — the per-query stand-in for
-  // _bounded_pool->wait_all(), which would also wait on every other query's work. Workers
-  // decrement on exit (including by exception), so this cannot hang on a throwing lambda.
-  state->wait_for_in_flight();
+  // Wait out this query's in-flight creation work. The pool tracks it per query via the slot
+  // attached in manager_loop, so this waits on THIS query only — never on a co-tenant's lambda,
+  // and never on the manager thread's own idle reservation, which carries no query. Slots are
+  // released by RAII on every exit path including an exception, so a throwing creation lambda
+  // cannot strand this wait.
+  if (_bounded_pool) { _bounded_pool->drain_and_wait(query_id); }
 
   // Clear lookahead state so any schedule_lookahead() racing with query teardown finds an
   // empty queue and exits cleanly instead of dereferencing operators that are about to die.
@@ -535,42 +515,28 @@ void task_creator::manager_loop()
       continue;
     }
 
-    // Enter the counted region BEFORE touching `node` again.
+    // Attribute the slot to this query BEFORE touching `node` again.
     //
     // get_operator_for_next_task() dereferences the operator (recursively, via
-    // get_next_task_hint()) on THIS thread. Counting only from just before dispatch left that
-    // dereference outside the window, so drain_pending_tasks(query_id) could observe
-    // in_flight == 0 and return while the manager thread was still walking the query's operators
-    // — a hole in the exact invariant the counter exists to provide, and the caller's next act is
-    // to let the plan be destroyed.
+    // get_next_task_hint()) on THIS thread. Attaching only just before dispatch would leave that
+    // dereference outside the counted region, so drain_pending_tasks(query_id) could return while
+    // the manager was still walking the query's operators — and the caller's next act is to let
+    // the plan be destroyed.
     //
-    // Released here on every early exit; on the dispatch path ownership passes to the worker's
-    // in_flight_guard, so the count is entered once and left once.
-    query_state->enter_in_flight();
-    bool dispatched = false;
-    struct manager_in_flight_guard {
-      const std::shared_ptr<query_task_global_state>& state;
-      const bool& dispatched;
-      ~manager_in_flight_guard()
-      {
-        if (!dispatched) { state->leave_in_flight(); }
-      }
-    } manager_guard{query_state, dispatched};
+    // The slot's own RAII covers every exit: an early `continue` below destroys it and decrements
+    // the query's count; the dispatch path moves it into the worker, which releases it when the
+    // creation lambda returns. Entered once, left once, with no separate bookkeeping to keep in
+    // sync. (Attribution cannot happen at reserve() time: the manager reserves before it knows
+    // which query it will serve, and an idle manager must not be counted against anyone.)
+    slot.attach(query_id);
 
     node = get_operator_for_next_task(node);
 
     if (node == nullptr) { continue; }
 
-    dispatched = true;
     // Dispatch the task creation work to the pool
     _bounded_pool->dispatch(
       std::move(slot), [this, node, request_kind, query_state = std::move(query_state)]() mutable {
-        // Released on every exit path, including the catch below, so a throwing creation can
-        // never strand drain_pending_tasks() waiting forever.
-        struct in_flight_guard {
-          const std::shared_ptr<query_task_global_state>& state;
-          ~in_flight_guard() { state->leave_in_flight(); }
-        } guard{query_state};
         // Scoped marker so task_creator::stop() can assert it is never called from here.
         struct worker_marker {
           worker_marker() { t_in_creation_worker = true; }
