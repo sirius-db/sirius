@@ -218,6 +218,47 @@ a queued-then-drained item must release its slot. Convert call sites only after 
 
 ---
 
+> ### ⚠ ATTEMPTED AND BACKED OUT — steps 6 and 7 are NOT in the branch
+>
+> Implemented in full, then reverted. The work is preserved in two named stashes:
+> `step6-cucascade-shared-ptr-repositories` (in `cucascade/`) and `step6b-7-sirius-side`
+> (in the Sirius repo).
+>
+> **Symptom.** Deterministic `SIGSEGV`, 3/3 full-suite runs and also in isolation, at
+> `test/cpp/integration` case *"pin_table compression - result equality vs uncompressed pin"* —
+> the 6th test, so it fails almost immediately.
+>
+> **Where.** `sirius::op::sirius_physical_ungrouped_aggregate_merge::get_next_task_input_data()`,
+> on a `task_creator` pool worker inside the creation lambda. Faulting instruction is
+> `mov 0x8(%rcx),%rdi` with `rax = rbx = 0`. The line is
+> `ports.begin()->second->repo->pop_next_data_batch()`, so the candidates are an empty `ports` map
+> (`begin()` == `end()`) or a null/dangling `repo`.
+>
+> **Ruled out during investigation:**
+> - Not pre-existing — the same test passes at the step-5 commit, verified by stashing both halves
+>   and rebuilding.
+> - Not a silently-unhooked virtual override: nothing derives from `data_repository`, so changing
+>   `add_data_batch`'s return type broke no override (and would not have compiled if it had).
+> - Not `pop_next_data_batch` indexing an emptied partition vector: it range-checks and throws.
+>
+> **Not yet ruled out** (in rough order of suspicion):
+> 1. `get_repository()` now returns `shared_ptr` **by value**; `materialize_repository_wiring` does
+>    `.get()` on that temporary. The map still holds a reference so the raw pointer should stay
+>    valid — but this is the one lifetime change on the exact pointer that crashes.
+> 2. The manager's `add_data_batch` moving the per-repository calls **outside** `_mutex`.
+> 3. `close()` leaving `_data_batches` empty (size 0) rather than "one empty partition", which
+>    changes `num_partitions()` for any code that reads it after close.
+>
+> **Recommended next move:** instrument `get_next_task_input_data` to report `ports.size()` and
+> `repo == nullptr` before the deref — that single data point distinguishes all three hypotheses,
+> and none of the black-box debugging did.
+>
+> The plan's own risk table called this out: *"C8 is the highest-consequence single step in any
+> option ... its bad failure mode is silently incomplete results"*, with the contingency
+> *"if cucascade coordination stalls, proceed with the narrowed (per-query) downgrade drain and
+> revisit"*. That is what happened, and that is the state the branch is in: the downgrade drain in
+> `run_mandatory_cleanup` is still the global one.
+
 ### Step 6 — cucascade: shared-ownership repositories with `close()`
 **Closes:** B3, B4, B9, H10 · **two commits: 6a cucascade PR + submodule bump, 6b Sirius side**
 
