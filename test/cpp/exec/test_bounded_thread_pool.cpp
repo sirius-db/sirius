@@ -16,6 +16,7 @@
 
 #include "catch.hpp"
 #include "exec/bounded_thread_pool.hpp"
+#include "query_id.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -344,4 +345,120 @@ TEST_CASE("bounded_thread_pool concurrent producers all tasks execute", "[bounde
 
   pool.wait_all();
   REQUIRE(counter.load() == num_threads * tasks_each);
+}
+
+//===----------------------------------------------------------------------===//
+// Per-query accounting: wait_for_query / drain_and_wait
+//===----------------------------------------------------------------------===//
+
+namespace {
+//! Releases a blocking task on every exit path, so a failed REQUIRE cannot leave a worker spinning
+//! and hang the pool destructor's join().
+struct release_on_exit {
+  std::atomic<bool>& flag;
+  ~release_on_exit() { flag.store(true, std::memory_order_release); }
+};
+}  // namespace
+
+TEST_CASE("wait_for_query runs the query's work and ignores other queries",
+          "[bounded_thread_pool][concurrency]")
+{
+  bounded_thread_pool pool(4, "test");
+  const auto qa = sirius::make_query_id(1);
+  const auto qb = sirius::make_query_id(2);
+
+  std::atomic<bool> release_b{false};
+  release_on_exit guard{release_b};
+  std::atomic<int> a_done{0};
+
+  // B blocks until told otherwise. If wait_for_query(A) waited on the whole pool it would hang
+  // here -- tracking per query is exactly what makes it return.
+  {
+    auto sb = pool.reserve();
+    sb.attach(qb);
+    pool.dispatch(std::move(sb), [&] {
+      while (!release_b.load(std::memory_order_acquire)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+    });
+  }
+
+  for (int i = 0; i < 3; ++i) {
+    auto sa = pool.reserve();
+    sa.attach(qa);
+    pool.dispatch(std::move(sa), [&] { a_done.fetch_add(1, std::memory_order_relaxed); });
+  }
+
+  pool.wait_for_query(qa);
+  // RUN, not dropped: the success path must never discard work the query scheduled.
+  REQUIRE(a_done.load() == 3);
+  REQUIRE(pool.active_for_query(qa) == 0);
+  REQUIRE(pool.active_for_query(qb) == 1);  // B untouched
+
+  release_b.store(true, std::memory_order_release);
+  pool.wait_all();
+}
+
+TEST_CASE("an untagged reservation does not block a per-query wait",
+          "[bounded_thread_pool][concurrency]")
+{
+  // The load-bearing case. Every manager loop in Sirius reserves a slot and THEN blocks waiting
+  // for a task, so a slot with no query is permanently held whenever a manager is idle. wait_all()
+  // can never return in that state; the per-query waits must, or query teardown deadlocks -- which
+  // is exactly how removing the manager-quiesce bracket broke the suite.
+  bounded_thread_pool pool(4, "test");
+  const auto q = sirius::make_query_id(7);
+
+  auto parked = pool.reserve();  // untagged, held for the whole test
+  REQUIRE(parked.is_valid());
+
+  std::atomic<int> ran{0};
+  {
+    auto s = pool.reserve();
+    s.attach(q);
+    pool.dispatch(std::move(s), [&] { ran.fetch_add(1, std::memory_order_relaxed); });
+  }
+
+  pool.wait_for_query(q);  // must not hang despite `parked` still being held
+  REQUIRE(ran.load() == 1);
+  REQUIRE(pool.active_for_query(q) == 0);
+}
+
+TEST_CASE("drain_and_wait discards the query's queued work", "[bounded_thread_pool][concurrency]")
+{
+  // The error-path counterpart: queued work is dropped rather than run, because its query is
+  // failing and its plan is about to be destroyed. Single worker, held by a blocker, so everything
+  // dispatched behind it is still queued when the drain runs.
+  bounded_thread_pool pool(1, "test");
+  const auto q = sirius::make_query_id(3);
+
+  std::atomic<bool> release{false};
+  release_on_exit guard{release};
+  std::atomic<int> ran{0};
+
+  auto blocker = pool.reserve();
+  pool.dispatch(std::move(blocker), [&] {
+    while (!release.load(std::memory_order_acquire)) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+  });
+
+  // Capacity is 1 and taken, so reserve() would block here; dispatch from another thread.
+  std::atomic<int> dispatched{0};
+  std::thread producer([&] {
+    for (int i = 0; i < 2; ++i) {
+      auto s = pool.reserve();
+      if (!s) { return; }
+      s.attach(q);
+      pool.dispatch(std::move(s), [&] { ran.fetch_add(1, std::memory_order_relaxed); });
+      dispatched.fetch_add(1, std::memory_order_relaxed);
+    }
+  });
+
+  release.store(true, std::memory_order_release);
+  producer.join();
+  pool.drain_and_wait(q);
+  REQUIRE(pool.active_for_query(q) == 0);
+  REQUIRE(ran.load() <= dispatched.load());  // some may have run before the drain; none may leak
+  pool.wait_all();
 }
