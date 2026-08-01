@@ -306,18 +306,25 @@ prefetching_cache::file_entry& prefetching_cache::get_or_create_file_entry(
   const sirius_io_object& obj)
 {
   const auto& key = obj.raw_file_cache_id();
-  std::shared_lock lk(_map_mtx);
-  auto it = _file_cache.find(key);
-  if (it == _file_cache.end()) {
-    lk.unlock();
-    std::unique_lock ulk(_map_mtx);
-    auto [new_it, inserted] = _file_cache.try_emplace(key, std::make_unique<file_entry>());
-    it                      = new_it;
-    if (inserted) {
-      it->second->file_size = obj.size();
-      it->second->io_obj    = obj.shared_from_this();
-      it->second->chunks.reserve((obj.size() + _chunk_size - 1) / _chunk_size);
-    }
+  // Capture the ENTRY POINTER while a lock is held, never the iterator. The insert branch below
+  // scopes its unique_lock to the `if`, so returning `*it->second` dereferenced an iterator with
+  // no lock held at all — and a concurrent insert of a different file rehashes _file_cache and
+  // invalidates it. The pointed-to file_entry is heap-allocated and stable across a rehash; only
+  // iterators and references into the map are not. Single-query runs first-touch every file in one
+  // prepare, which is why this only becomes reachable once two queries open different files.
+  file_entry* entry = nullptr;
+  {
+    std::shared_lock lk(_map_mtx);
+    if (auto it = _file_cache.find(key); it != _file_cache.end()) { entry = it->second.get(); }
+  }
+  if (entry != nullptr) { return *entry; }
+
+  std::unique_lock ulk(_map_mtx);
+  auto [it, inserted] = _file_cache.try_emplace(key, std::make_unique<file_entry>());
+  if (inserted) {
+    it->second->file_size = obj.size();
+    it->second->io_obj    = obj.shared_from_this();
+    it->second->chunks.reserve((obj.size() + _chunk_size - 1) / _chunk_size);
   }
   return *it->second;
 }
@@ -382,11 +389,20 @@ bool prefetching_cache::host_read_from_cache_only(const sirius_io_object& obj,
     }
   }
   if (chunks.empty()) {
-    std::shared_lock lk(_map_mtx);
-    auto it = _file_cache.find(obj.raw_file_cache_id());
-    if (it != _file_cache.end()) {
-      lk.unlock();
-      chunks = it->second->fetch_chunks(offset, size, coverage_policy::full, _chunk_size);
+    // Same rule as get_or_create_file_entry: take the entry pointer out under the lock, then drop
+    // the lock. `it` was being dereferenced after lk.unlock(), so a concurrent insert rehashing
+    // _file_cache invalidated it mid-call. fetch_chunks is deliberately called unlocked (it does
+    // its own locking and can be slow), which is why the pointer — stable across rehash — is what
+    // has to be carried across.
+    file_entry* entry = nullptr;
+    {
+      std::shared_lock lk(_map_mtx);
+      if (auto it = _file_cache.find(obj.raw_file_cache_id()); it != _file_cache.end()) {
+        entry = it->second.get();
+      }
+    }
+    if (entry != nullptr) {
+      chunks = entry->fetch_chunks(offset, size, coverage_policy::full, _chunk_size);
     }
   }
 

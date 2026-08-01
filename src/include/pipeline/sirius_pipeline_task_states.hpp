@@ -18,6 +18,7 @@
 
 #include "exec/queue_priority.hpp"
 #include "parallel/task.hpp"
+#include "pipeline/completion_handler.hpp"
 #include "pipeline/pipeline_memory_history.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 
@@ -131,6 +132,32 @@ class sirius_pipeline_task_global_state : public sirius::parallel::itask_global_
    */
   [[nodiscard]] exec::queue_priority get_priority() const { return _priority; }
 
+  /**
+   * @brief Set the completion handler of the query this pipeline belongs to.
+   *
+   * Assigned once per query by task_creator::prepare_for_query(). Every pipeline of a query
+   * shares the one handler its sirius_engine owns.
+   */
+  void set_completion_handler(std::shared_ptr<completion_handler> handler)
+  {
+    _completion_handler = std::move(handler);
+  }
+
+  /**
+   * @brief The completion handler to report this query's completion or failure to.
+   *
+   * Held by shared_ptr, not by raw pointer, because the owning sirius_engine is destroyed while
+   * the query is being torn down (fetch_result_internal runs before run_mandatory_cleanup drains
+   * the queues). A task still unwinding after that point must be able to report safely, so the
+   * handler stays alive as long as any task referencing this state does.
+   *
+   * Null only for states built outside a query (tests).
+   */
+  [[nodiscard]] const std::shared_ptr<completion_handler>& get_completion_handler() const
+  {
+    return _completion_handler;
+  }
+
  private:
   duckdb::shared_ptr<sirius_pipeline> _pipeline;  ///< Shared pointer to the GPU pipeline to execute
   pipeline_memory_history _memory_history;        ///< Historical memory metrics for estimation
@@ -138,6 +165,8 @@ class sirius_pipeline_task_global_state : public sirius::parallel::itask_global_
   exec::queue_priority _priority{0};              ///< Pipeline-level scheduling priority
   std::shared_ptr<const telemetry::telemetry_context>
     _telemetry_context;  ///< SiriusContext telemetry
+  /// The owning query's completion handler; see get_completion_handler().
+  std::shared_ptr<completion_handler> _completion_handler;
 };
 
 /**

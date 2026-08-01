@@ -36,6 +36,7 @@
 
 #include <cstdint>
 #include <format>
+#include <limits>
 #include <optional>
 #include <string>
 #include <unordered_set>
@@ -713,6 +714,31 @@ std::unique_ptr<gpu_pipeline_task> gpu_pipeline_task::create_rescheduled_task(
 {
   return std::make_unique<gpu_pipeline_task>(
     task_id, _data_repos, std::move(local_state), get_shared_global_state());
+}
+
+exec::index_keys index_keys_for(const sirius::parallel::itask& task)
+{
+  if (const auto* gpu_task = dynamic_cast<const gpu_pipeline_task*>(&task)) {
+    const exec::queue_priority priority = gpu_task->get_priority();
+
+    exec::query_key query_id         = 0;
+    exec::operator_key operator_type = op::SiriusPhysicalOperatorType::INVALID;
+    if (const auto* pipe = gpu_task->get_pipeline()) {
+      query_id = static_cast<exec::query_key>(sirius::value_of(pipe->get_query_id()));
+      if (auto source = pipe->get_source()) { operator_type = source->type; }
+    }
+
+    const auto pref = gpu_task->get_preferred_device_id();
+    return exec::index_keys{priority,
+                            operator_type,
+                            query_id,
+                            pref.has_value() ? pref.value() : exec::no_preferred_device};
+  }
+
+  return exec::index_keys{std::numeric_limits<exec::queue_priority>::max(),
+                          op::SiriusPhysicalOperatorType::INVALID,
+                          0,
+                          exec::no_preferred_device};
 }
 
 }  // namespace pipeline

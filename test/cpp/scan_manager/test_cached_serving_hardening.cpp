@@ -336,8 +336,11 @@ TEST_CASE("drain_cached_provider forwards the mvcc keep-mask and filter flag ont
 
 TEST_CASE("cached provider pairs chunk i with mask-set slot i", "[cached_serving][scan_manager]")
 {
-  auto& e    = env();
-  auto entry = make_gpu_entry(*e.gpu_space, 3, 4);
+  auto& e = env();
+  // shared_ptr because the provider co-owns the entry it serves — see
+  // make_provider_for_pinned_entry.
+  auto entry =
+    std::make_shared<sirius::scan_manager::pinned_entry>(make_gpu_entry(*e.gpu_space, 3, 4));
   std::vector<std::size_t> cols{0, 1, 2};
 
   SECTION("with a mask set")

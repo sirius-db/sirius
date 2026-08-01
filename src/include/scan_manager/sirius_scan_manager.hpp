@@ -50,6 +50,7 @@ class fixed_size_host_memory_resource;
 
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -235,8 +236,13 @@ struct cached_scan_plan {
 /// set, the parquet-pin case — serves the chunk unmasked). Declared here so
 /// the chunk↔mask pairing is unit-testable; the provider type itself stays
 /// internal to the scan manager.
+///
+/// The provider CO-OWNS @p entry for its whole life: it reads the entry's chunks on every
+/// get_next_batch, and with concurrent queries another connection may unpin (or replace)
+/// the entry mid-scan. Shared ownership is what keeps that from dangling — an unpin drops
+/// the scan manager's map slot, and the data dies only once the last serving provider does.
 std::unique_ptr<databatch_provider> make_provider_for_pinned_entry(
-  pinned_entry const& entry,
+  std::shared_ptr<pinned_entry const> entry,
   std::span<std::size_t const> selected_columns,
   cached_scan_plan plan,
   const telemetry::batch_telemetry_info& telemetry_info,
@@ -267,11 +273,32 @@ struct parquet_bind_result {
   std::size_t total_num_rows{0};
 };
 
+/// Number of concurrent queries the scan manager sizes its thread pool for.
+///
+/// Each query's coalescer runs exactly ONE sequencer task that BLOCKS in
+/// queue.wait_dequeue, and is unblocked only by that query's own split_provider tasks
+/// running on the same pool. So every concurrent query needs a parked thread on top of the
+/// working budget. With Q concurrent queries and a pool of size P, Q >= P is a hard
+/// deadlock: every thread parked in a sequencer, none left to feed them.
+///
+/// Left at 1 so the pool stays exactly the size it was before per-query state landed
+/// (num_threads + 1, the old single-sequencer allowance) — this makes the concurrency
+/// refactor behaviorally neutral for existing single-query runs.
+///
+/// TODO: promote to a real option on @ref scan_manager_config (scan_manager/config.hpp),
+/// parsed alongside thread_pool.num_threads in sirius_config.cpp's from_yaml, and RAISE IT
+/// before enabling more than a couple of concurrent queries. Nothing else should read this
+/// constant once it moves.
+/// Deprecated compile-time bound, kept only as the default for
+/// scan_manager_config::max_concurrent_queries. Read the config value, not this.
+inline constexpr int k_default_max_concurrent_queries = 1;
+
 /**
  * @brief Manages scan-side preparation for a query.
  *
- * The scan manager owns a configurable-size thread pool and is given a chance
- * to set up per-scan state before a query runs (via prepare_for_query).
+ * The scan manager owns a configurable-size thread pool shared by every query, and holds
+ * per-query scan state keyed by query id (see @c query_scan_manager_state) so concurrent
+ * queries prepare, run and tear down independently.
  */
 class sirius_scan_manager {
  public:
@@ -312,6 +339,10 @@ class sirius_scan_manager {
   /// arrive or the connector is closed, so no separate wake-up channel is
   /// needed.
   ///
+  /// Registers a NEW per-query state entry keyed by @p query 's id; it does NOT touch any
+  /// other query's entry. Call reset(query_id) when the query finishes. A query with no GPU
+  /// scan operators registers nothing, so its reset is a harmless no-op.
+  ///
   /// @param query                           The query whose scan operators must be prepared.
   /// @param enable_pinned_zone_map_pruning  Per-query snapshot of the serve-side pruning flag (the
   ///                                        manager's _config is a construction-time copy, so SET
@@ -320,9 +351,19 @@ class sirius_scan_manager {
   ///                                        the survivor plan.
   void prepare_for_query(const sirius::planner::query& query, bool enable_pinned_zone_map_pruning);
 
-  /// \brief Clear the providers map and join the driver thread if it is
-  ///        still running.
-  void reset();
+  /// \brief Drop everything held for @p query_id: stop and join its scan work, then destroy
+  ///        its providers and coalescer. Other queries are untouched. No-op for an unknown id.
+  ///
+  /// Blocking — waits out this query's in-flight reads. The wait happens OUTSIDE the state
+  /// mutex, so another connection's prepare_for_query is never parked behind it.
+  void reset(sirius::query_id_t query_id);
+
+  /// \brief Drop every query's state. Teardown only (stop(), the destructor, and the
+  ///        failed-query backstop).
+  void reset_all();
+
+  /// \brief Number of queries currently registered. Observability and tests.
+  [[nodiscard]] std::size_t num_active_queries() const noexcept;
 
   /// \brief Start the worker thread pool. Idempotent.
   void start();
@@ -445,15 +486,19 @@ class sirius_scan_manager {
   /// \brief Remove the pinned entry for @p name. No-op if absent.
   void remove_pinned_entry(const std::string& name);
 
+  /// Visit every pinned entry under the pin-table lock. The visitor runs WHILE the lock is
+  /// held, so it must be quick and must not call back into the scan manager. The reference
+  /// it receives is only guaranteed for the duration of the call — a visitor that stashes
+  /// the address for later use is racing any concurrent unpin.
   void visit_pinned_entries(
     const std::function<bool(std::string_view, const pinned_entry&)>& visitor) const;
 
-  /// The pinned entry whose duckdb identity matches catalog.schema.table, or
-  /// nullptr. Non-owning; valid only until the next pin/unpin — the same
-  /// single-threaded query-lifecycle discipline as visit_pinned_entries.
-  /// First match wins if one table was pinned under two names. Read by the
-  /// plan-time MVCC guards.
-  [[nodiscard]] pinned_entry const* find_pinned_entry_for_duckdb_table(
+  /// The pinned entry whose duckdb identity matches catalog.schema.table, or nullptr.
+  /// OWNING: the returned shared_ptr keeps the entry alive for as long as the caller holds
+  /// it, so a concurrent unpin on another connection cannot pull it out from under the
+  /// plan-time MVCC guards that read it. First match wins if one table was pinned under two
+  /// names.
+  [[nodiscard]] std::shared_ptr<const pinned_entry> find_pinned_entry_for_duckdb_table(
     std::string_view catalog_name, std::string_view schema_name, std::string_view table_name) const;
 
   parquet_bind_result describe_parquet(std::string const& uri);
@@ -485,17 +530,86 @@ class sirius_scan_manager {
   [[nodiscard]] std::size_t s3_list_max_matches(std::string const& s3_uri);
 
  private:
-  /// \brief Run providers sequentially: start each, wait on its future, advance.
-  void start_metadata_processing();
+  /**
+   * @brief Everything the scan manager holds on behalf of ONE query.
+   *
+   * Handed out as a `shared_ptr` keyed by query id: a caller resolves it under the state
+   * mutex and uses it outside, so an erase racing a reader cannot pull the state out from
+   * under them. The manager's shared members (ioctxs, registry, pinned entries, thread pool)
+   * stay outside — they are process-wide and outlive every query. What lives here is exactly
+   * what the old global `reset()` used to wipe, and wiping it globally is what made
+   * finishing query A tear down query B's scan work.
+   *
+   * Operator ids restart at 0 for every query, so `metadata_processor`'s slot map (keyed by
+   * `scan_op->get_operator_id()`) is unique only *within* an entry; one shared coalescer
+   * would let two queries' scans collide on the same slot.
+   *
+   * Member order is teardown order: `dispatcher` is declared LAST so it is destroyed FIRST,
+   * while the coalescer and providers its tasks captured are still alive. The destructor's
+   * `drain()` makes that safe even if a member is later added below it.
+   */
+  struct query_scan_manager_state {
+    ~query_scan_manager_state() { drain(); }
+
+    query_scan_manager_state()                                           = default;
+    query_scan_manager_state(const query_scan_manager_state&)            = delete;
+    query_scan_manager_state& operator=(const query_scan_manager_state&) = delete;
+    query_scan_manager_state(query_scan_manager_state&&)                 = delete;
+    query_scan_manager_state& operator=(query_scan_manager_state&&)      = delete;
+
+    //! Stop and join every task this query put on the shared pool. Idempotent, and safe to
+    //! call outside the state mutex — it can block for as long as an in-flight read.
+    void drain() noexcept;
+
+    //! One scan operator and the disk-reading provider built for it (null when the operator
+    //! matched a pinned entry and is served from the cache instead). A vector rather than a
+    //! map plus a parallel order vector: the only traversal is registration order, and one
+    //! container makes the "already registered" guard cover cache-matched operators too.
+    struct scan_entry {
+      op::scan::sirius_gpu_scan_operator* op{nullptr};
+      std::unique_ptr<split_provider> provider;  ///< null for a cache-served operator
+    };
+    std::vector<scan_entry> scans;
+
+    //! Per-query snapshot of the serve-side pruning flag; the manager's _config is a
+    //! construction-time copy, so SET changes arrive per query via prepare_for_query.
+    bool pruning_enabled{true};
+
+    //! One mask computation per distinct pinned entry matched by THIS query (recorded by
+    //! try_match_cached_entry, deduped by entry name); run block-in-prepare, then copied
+    //! into each provider and cleared. Per-query by nature: two queries over the same entry
+    //! see different MVCC snapshots and each needs its own masks.
+    std::vector<mvcc_mask_job_request> pending_mvcc_mask_jobs;
+
+    //! One insert-delta job per distinct pinned entry matched by this query, with the same
+    //! dedup and lifecycle as the mask jobs above.
+    std::vector<insert_delta_job_request> pending_insert_delta_jobs;
+
+    //! This query's sequencer for opportunistic fadvise calls; gets one pipeline slot per
+    //! scan. Its slot map is keyed by operator id, which restarts at 0 per query.
+    std::unique_ptr<load_balancing_scan_batch_coalescer> metadata_processor;
+
+    //! This query's scope for every scan task it puts on the SHARED pool. request_stop()
+    //! here stops only this query's work; the pool and every other query keep running.
+    std::unique_ptr<exec::scoped_dispatcher> dispatcher;
+  };
+
+  /// \brief Run @p state 's providers sequentially: start each, wait on its future, advance.
+  void start_metadata_processing(query_scan_manager_state& state);
+
+  //! Resolve a query's state, or nullptr when it has already been reset.
+  [[nodiscard]] std::shared_ptr<query_scan_manager_state> get_query_state(
+    sirius::query_id_t query_id) const;
 
   /// One matched (scan op ← pinned entry) pairing from the cache-match pass.
   /// Provider construction is deferred to after run_mvcc_mask_jobs so each
-  /// provider takes its own copy of the entry's completed mask set; the entry
-  /// pointer stays valid for the whole prepare (pin/unpin is
-  /// query-lifecycle-serialized).
+  /// provider takes its own copy of the entry's completed mask set. The
+  /// assignment SHARES OWNERSHIP of the entry across that gap: the mask and
+  /// insert-delta jobs block for as long as their IO takes, and with concurrent
+  /// queries another connection may unpin in that window.
   struct cached_assignment {
     op::scan::sirius_gpu_scan_operator* op{nullptr};
-    pinned_entry const* entry{nullptr};
+    std::shared_ptr<pinned_entry const> entry;
     std::vector<std::size_t> columns;  ///< selected columns, materialized order
     std::string entry_name;            ///< handoff key into _pending_mvcc_mask_jobs
     cached_scan_plan plan;             ///< zone-map survivor plan, moved into the provider
@@ -507,8 +621,13 @@ class sirius_scan_manager {
   ///        returns the assignment for the post-mask-run provider handoff.
   ///        Returns nullopt on a miss (the caller then builds the
   ///        disk-reading split_provider for this operator).
+  ///
+  ///        Mask and insert-delta jobs are queued into @p state, and @p state 's
+  ///        pruning_enabled decides whether the survivor plan applies zone-map filters. The
+  ///        dedup is therefore per-query, which is the point: two concurrent queries over
+  ///        the same pinned entry each queue their own job and take their own mask copies.
   [[nodiscard]] std::optional<cached_assignment> try_match_cached_entry(
-    op::scan::sirius_gpu_scan_operator* op);
+    op::scan::sirius_gpu_scan_operator* op, query_scan_manager_state& state);
 
   /// Resolve the ioctx that should serve @p path (normalized internally, so callers
   /// — including the scan resolver — may pass a raw `file://` / `s3://` URI),
@@ -523,7 +642,6 @@ class sirius_scan_manager {
   /// the GPU id set fed to the round-robin scan-balancing strategy.
   std::shared_ptr<const sirius::memory::topology_index> _topology_index;
   exec::static_thread_pool _thread_pool;
-  std::unique_ptr<exec::scoped_dispatcher> _dispatcher;
   std::shared_ptr<sirius::io::sirius_ioctx> _io_ctx;
   /// Lazily-built per-backend ioctxs for path-routed datasources (e.g. an s3://
   /// rest_ioctx alongside the local uring/kvikio `_io_ctx`).  Built exactly once
@@ -535,33 +653,23 @@ class sirius_scan_manager {
   std::mutex _routed_io_ctxs_mtx;
   std::unordered_map<sirius::io::io_context_type, std::shared_ptr<sirius::io::sirius_ioctx>>
     _routed_io_ctxs;
-  std::unordered_map<op::scan::sirius_gpu_scan_operator*, std::unique_ptr<split_provider>>
-    _providers_by_op;
-  std::vector<op::scan::sirius_gpu_scan_operator*> _scan_op_order;
-  std::unordered_map<std::string, pinned_entry> _pinned_entries;
-  bool _pruning_enabled{true};
+  /// The pin table. Shared across every query and outliving all of them, so entries are
+  /// held by shared_ptr rather than by value: a matched scan takes a reference for its
+  /// whole duration, and an unpin from another connection drops only the map slot, leaving
+  /// the data alive until the last serving provider releases it.
+  std::unordered_map<std::string, std::shared_ptr<pinned_entry>> _pinned_entries;
+  /// Guards the STRUCTURE of _pinned_entries (lookup/insert/erase) only, never the serving
+  /// of an entry — shared ownership covers that. Held only for map manipulation and the
+  /// snapshot in try_match_cached_entry, never across match/validate/plan work, so
+  /// concurrent prepares do not serialize behind each other.
+  mutable std::mutex _pinned_entries_mutex;
 
-  /// One mask computation per distinct pinned entry matched this query
-  /// (recorded by try_match_cached_entry, deduped by entry name); executed
-  /// block-in-prepare by run_mvcc_mask_jobs, after which the provider handoff
-  /// copies each completed set out and the vector is cleared (also cleared in
-  /// reset() for the prepare-threw case).
-  std::vector<mvcc_mask_job_request> _pending_mvcc_mask_jobs;
+  //! One entry per in-flight query. Guarded by _query_states_mutex; the shared_ptr is
+  //! resolved under the lock and used outside it, so an erase racing a reader cannot pull
+  //! the state out from under them.
+  std::map<sirius::query_id_t, std::shared_ptr<query_scan_manager_state>> _query_states;
+  mutable std::mutex _query_states_mutex;
 
-  /// One insert-delta job per distinct pinned entry matched this query, with
-  /// the same dedup and lifecycle as the mask jobs above. Later operators
-  /// union their columns into the pending request. The job no-ops when the
-  /// table has no rows beyond the pinned prefix.
-  std::vector<insert_delta_job_request> _pending_insert_delta_jobs;
-
-  /// Per-query sequencer for opportunistic fadvise calls.  Built fresh
-  /// in @ref prepare_for_query, gets one @c pipeline_slot per scan,
-  /// registered before the pinned-cache match.  The
-  /// sequencer task is enqueued on the
-  /// per-query @c _dispatcher, which injects its own stop_token; the
-  /// dispatcher's @c request_stop() in @ref reset() therefore tears the
-  /// sequencer down without an extra side-channel.
-  std::unique_ptr<load_balancing_scan_batch_coalescer> _metadata_processor;
   io::io_context_registry _ioctx_registry;
 };
 

@@ -185,6 +185,21 @@ class gpu_pipeline_task : public sirius_pipeline_itask {
   }
 
   /**
+   * @brief The completion handler of the query this task belongs to.
+   *
+   * Carried on the shared global state, so every executor site holding a task can report that
+   * query's completion or failure without consulting any shared "current query" state. Returns
+   * null when no global state is attached (tests).
+   */
+  [[nodiscard]] std::shared_ptr<completion_handler> get_completion_handler() const
+  {
+    if (auto gs = std::dynamic_pointer_cast<const gpu_pipeline_task_global_state>(_global_state)) {
+      return gs->get_completion_handler();
+    }
+    return nullptr;
+  }
+
+  /**
    * @brief Get the GPU pipeline associated with this task
    *
    * @return const duckdb::sirius_pipeline* Pointer to the GPU pipeline
@@ -273,6 +288,24 @@ class gpu_pipeline_task : public sirius_pipeline_itask {
   uuid::UUID _reservation_tier_resource_id{};
   uint64_t _reservation_bytes = 0;
 };
+
+/**
+ * @brief Multi-index keys for a task sitting in one of the execution queues.
+ *
+ * Shared by the task_scheduler's queue and every gpu_pipeline_executor's queue so the two can
+ * never disagree about which query a task belongs to — a disagreement would make
+ * `drain(query_index{...})` clear a query's tasks from one queue but not the other.
+ *
+ * The queue orders by priority (lower value dispatched first) and additionally indexes by
+ * operator type, query id, and preferred device. A task that is not a gpu_pipeline_task gets the
+ * maximum priority, so it sorts last, with sentinel index keys.
+ *
+ * The query id comes from the task's pipeline, NOT from unpacking the priority's high bits:
+ * `sirius::query_priority_bits` masks the id to 31 bits, so the unpacked value diverges from the
+ * real query id once bit 31 is set, and a `drain(query_index{value_of(query_id)})` would then
+ * silently miss the task.
+ */
+[[nodiscard]] exec::index_keys index_keys_for(const sirius::parallel::itask& task);
 
 }  // namespace pipeline
 }  // namespace sirius

@@ -16,8 +16,11 @@
 
 #include "catch.hpp"
 #include "exec/config.hpp"
+#include "exec/query_lifecycle_registry.hpp"
+#include "pipeline/completion_handler.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
 #include "pipeline/task_scheduler.hpp"
+#include "query_id.hpp"
 #include "scan/test_utils.hpp"
 #include "utils/telemetry_utils.hpp"
 
@@ -27,8 +30,10 @@
 
 #include <atomic>
 #include <chrono>
+#include <exception>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <thread>
 
 using namespace sirius::pipeline;
@@ -139,6 +144,151 @@ TEST_CASE("Task scheduler executes tasks through pipeline_queue", "[task_schedul
 
   REQUIRE(global_state->executed_count.load() == num_tasks);
 
+  executor.stop();
+}
+
+TEST_CASE("terminate_query fails only its own query and leaves the scheduler running",
+          "[task_scheduler][concurrency]")
+{
+  // Regression for the "one query's failure hangs the whole engine" class of bug:
+  // terminate_query used to call stop(), which closed the request channel, joined the management
+  // thread and stopped every GPU executor -- for ALL queries -- with no path that ever calls
+  // start() again. Any other in-flight query was left waiting on a completion that could never
+  // arrive, as was every subsequent query in the process.
+  auto manager = initialize_memory_manager(1);
+  sirius::exec::thread_pool_config gpu_config{2};
+  task_scheduler executor(gpu_config, *manager, sirius::test::make_test_telemetry_context());
+
+  executor.start();
+
+  // Query A fails.
+  auto handler_a = std::make_shared<completion_handler>();
+  auto future_a  = handler_a->get_awaitable();
+  executor.terminate_query(handler_a,
+                           std::make_exception_ptr(std::runtime_error("query A creation failed")));
+
+  // A -- and only A -- is failed.
+  REQUIRE_THROWS_AS(future_a.get(), std::runtime_error);
+
+  // The scheduler must still dispatch work. Before the fix this hung until the 10s timeout
+  // because the management thread and every GPU executor were already stopped.
+  auto global_state = std::make_shared<mock_gpu_pipeline_task_global_state>();
+
+  const int num_tasks = 5;
+  for (int i = 0; i < num_tasks; ++i) {
+    auto local_state = std::make_unique<mock_gpu_pipeline_task_local_state>(i, 0);
+    auto task = std::make_unique<mock_gpu_pipeline_task>(i, std::move(local_state), global_state);
+    executor.schedule(std::move(task));
+  }
+
+  auto start_time = std::chrono::steady_clock::now();
+  auto timeout    = std::chrono::seconds(10);
+  while (global_state->executed_count.load(std::memory_order_relaxed) < num_tasks) {
+    std::this_thread::sleep_for(10ms);
+    if (std::chrono::steady_clock::now() - start_time > timeout) {
+      FAIL("scheduler stopped dispatching after terminate_query on an unrelated query");
+    }
+  }
+  REQUIRE(global_state->executed_count.load() == num_tasks);
+
+  executor.stop();
+}
+
+TEST_CASE("the lifecycle gate refuses scheduling for a quiescing query",
+          "[task_scheduler][query_lifecycle_gate][concurrency]")
+{
+  // Wiring check for the gate: task_scheduler::schedule must consult it. A task creation worker
+  // can land in schedule() after this query's queue drain already ran, and the task would then
+  // sit in the shared queue holding raw repository pointers into a manager about to be erased.
+  auto manager = initialize_memory_manager(1);
+  sirius::exec::thread_pool_config gpu_config{2};
+  // Declared BEFORE the scheduler so it is destroyed AFTER it: the scheduler and every GPU
+  // executor hold a raw pointer to the gate, and ~task_scheduler still runs stop().
+  sirius::exec::query_lifecycle_registry lifecycle;
+  task_scheduler executor(gpu_config, *manager, sirius::test::make_test_telemetry_context());
+  executor.set_query_lifecycle_registry(&lifecycle);
+
+  // Mock tasks carry no pipeline, so index_keys_for() reports them as query 0.
+  const auto mock_query = sirius::make_query_id(0);
+  lifecycle.open_query(mock_query);
+
+  auto global_state = std::make_shared<mock_gpu_pipeline_task_global_state>();
+  executor.start();
+
+  auto schedule_batch = [&](int count, int id_base) {
+    for (int i = 0; i < count; ++i) {
+      auto local_state = std::make_unique<mock_gpu_pipeline_task_local_state>(id_base + i, 0);
+      auto task =
+        std::make_unique<mock_gpu_pipeline_task>(id_base + i, std::move(local_state), global_state);
+      executor.schedule(std::move(task));
+    }
+  };
+
+  // Open: work flows.
+  const int num_tasks = 5;
+  schedule_batch(num_tasks, 0);
+
+  auto start_time = std::chrono::steady_clock::now();
+  while (global_state->executed_count.load(std::memory_order_relaxed) < num_tasks) {
+    std::this_thread::sleep_for(10ms);
+    if (std::chrono::steady_clock::now() - start_time > std::chrono::seconds(10)) {
+      FAIL("tasks did not execute while the query was open");
+    }
+  }
+  REQUIRE(global_state->executed_count.load() == num_tasks);
+
+  // Quiescing: further work is dropped rather than enqueued.
+  lifecycle.quiesce(mock_query);
+  schedule_batch(num_tasks, 100);
+
+  std::this_thread::sleep_for(200ms);
+  REQUIRE(global_state->executed_count.load() == num_tasks);
+
+  executor.stop();
+}
+
+TEST_CASE("wait_for_completion validates only its own query's queue",
+          "[task_scheduler][query_lifecycle_gate][concurrency]")
+{
+  // Regression for A5: wait_for_completion used the whole-queue size(), so query A completing
+  // normally threw "pipeline task queue not empty at query completion" purely because query B had
+  // work legitimately queued. It also called _task_creator->stop_thread_pool(), tearing down the
+  // SHARED creation pool on every successful completion.
+  auto manager = initialize_memory_manager(1);
+  sirius::exec::thread_pool_config gpu_config{2};
+  sirius::exec::query_lifecycle_registry lifecycle;
+  task_scheduler executor(gpu_config, *manager, sirius::test::make_test_telemetry_context());
+  executor.set_query_lifecycle_registry(&lifecycle);
+
+  // Mock tasks carry no pipeline, so index_keys_for() reports them as query 0. Completing a
+  // DIFFERENT query id must ignore them entirely.
+  const auto other_query      = sirius::make_query_id(0);
+  const auto completing_query = sirius::make_query_id(42);
+  lifecycle.open_query(other_query);
+  lifecycle.open_query(completing_query);
+
+  auto global_state = std::make_shared<mock_gpu_pipeline_task_global_state>();
+  executor.start();
+
+  // Park work belonging to `other_query` in the scheduler queue by keeping every device busy.
+  for (int i = 0; i < 8; ++i) {
+    auto local_state = std::make_unique<mock_gpu_pipeline_task_local_state>(i, 0);
+    executor.schedule(
+      std::make_unique<mock_gpu_pipeline_task>(i, std::move(local_state), global_state));
+  }
+
+  // The assertion this test exists for: completing an unrelated query must not throw because a
+  // co-tenant has work queued. Before the per-query size() check, this threw
+  // "pipeline task queue not empty at query completion" every time.
+  REQUIRE_NOTHROW(executor.wait_for_completion(completing_query));
+
+  // NOT asserted here: that every co-tenant task still runs. wait_and_validate_empty() must
+  // release the manager thread's pool slot before wait_all() can return (see
+  // itask_executor::quiesce_manager), and that interrupt makes push() return false for the
+  // duration — so a co-tenant task in transit from the scheduler to a device queue can still be
+  // dropped. Step 3 removes the *whole-queue* drain that used to destroy co-tenants' queued work
+  // outright; eliminating the in-transit drop needs per-query in-flight accounting from the
+  // query-aware bounded_thread_pool, at which point this test should gain a liveness assertion.
   executor.stop();
 }
 

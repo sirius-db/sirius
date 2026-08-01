@@ -19,6 +19,7 @@
 #include "creator/task_creator.hpp"
 #include "data/data_repository_manager_registry.hpp"
 #include "downgrade/downgrade_executor.hpp"
+#include "exec/query_lifecycle_registry.hpp"
 #include "memory/resource_ref_utils.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "pipeline/sirius_pipeline.hpp"
@@ -441,6 +442,12 @@ class SiriusContext : public ClientContextState {
   /// \brief The registry itself, for subsystems that hold a long-lived binding to it.
   [[nodiscard]] sirius::data::data_repository_manager_registry& get_data_repository_registry();
 
+  /// \brief The per-query enqueue gate, for tests and for subsystems that consult it directly.
+  [[nodiscard]] sirius::exec::query_lifecycle_registry& get_query_lifecycle_registry() noexcept
+  {
+    return query_lifecycle_;
+  }
+
   [[nodiscard]] sirius::pipeline::task_scheduler& get_task_scheduler();
   [[nodiscard]] const sirius::pipeline::task_scheduler& get_task_scheduler() const;
 
@@ -483,14 +490,19 @@ class SiriusContext : public ClientContextState {
   /// \brief Start a query with its pipelines.
   /// \param pipelines The ordered pipelines for the query.
   /// \param telemetry_info Info useful for emitting identifiable telemetry.
-  void create_query(duckdb::vector<duckdb::shared_ptr<sirius::pipeline::sirius_pipeline>> pipelines,
-                    sirius::query_id_t query_id,
-                    sirius::telemetry::query_telemetry_info telemetry_info);
+  /// \param handler The query's completion signal, owned by its sirius_engine. Stamped onto
+  ///        every pipeline's task global state so tasks can report without any shared
+  ///        "current query" handler.
+  /// \return The constructed query. Ownership belongs to the caller (sirius_engine): the query
+  ///         is an index over that engine's plan, so outliving the plan would leave its cached
+  ///         operator pointers dangling for no benefit.
+  [[nodiscard]] duckdb::shared_ptr<sirius::planner::query> create_query(
+    duckdb::vector<duckdb::shared_ptr<sirius::pipeline::sirius_pipeline>> pipelines,
+    sirius::query_id_t query_id,
+    std::shared_ptr<sirius::pipeline::completion_handler> handler,
+    sirius::telemetry::query_telemetry_info telemetry_info);
 
   /// \brief Get the current query.
-  [[nodiscard]] duckdb::shared_ptr<sirius::planner::query> get_query();
-  [[nodiscard]] duckdb::shared_ptr<const sirius::planner::query> get_query() const;
-
   /// \brief Get the current Sirius configuration (const).
   [[nodiscard]] const sirius::sirius_config& get_config() const noexcept { return config_; }
 
@@ -547,9 +559,10 @@ class SiriusContext : public ClientContextState {
   void run_mandatory_cleanup_backstop(sirius::query_id_t query_id,
                                       std::string_view end_tag) noexcept;
 
-  /// \brief Best-effort task_creator reset for latched-unavailable paths,
-  /// where no later window will ever run the in-cleanup reset.
-  void drop_task_creator_state_best_effort() noexcept;
+  /// \brief Best-effort per-query teardown for latched-unavailable paths, where no later
+  /// window will ever run the in-cleanup reset: drops @p query_id's task_creator state and its
+  /// queued tasks. Each step is separately guarded; neither can throw.
+  void drop_query_runtime_state_best_effort(sirius::query_id_t query_id) noexcept;
 
   mutable std::mutex mutex_;
   // The Super Sirius runtime is shared across connections, so plan generation
@@ -612,11 +625,27 @@ class SiriusContext : public ClientContextState {
   std::shared_ptr<const sirius::telemetry::telemetry_context> telemetry_context_;
   /// One data repository manager per in-flight query, keyed by query_id.
   sirius::data::data_repository_manager_registry data_repository_registry_;
+  /// Per-query "may work still be enqueued?" gate, consulted by every enqueue point in the
+  /// engine. Opened at window begin, quiesced at the top of the query's cleanup so the drains
+  /// below it cannot be outrun by a completion callback, and closed once they finish. Declared
+  /// before the subsystems that hold a pointer to it so it is destroyed after them.
+  sirius::exec::query_lifecycle_registry query_lifecycle_;
+  // Declaration order is destruction order reversed, and it is load-bearing here.
+  //
+  // task_scheduler is declared LAST so it is destroyed FIRST is wrong — it must be destroyed
+  // *after* everything that holds a pointer into it. Each downgrade_executor holds a raw pointer
+  // to task_scheduler::_task_queue, the task_creator's lambdas hold task_scheduler*, and
+  // ~task_scheduler joins a management thread that calls into task_creator. terminate() stops all
+  // of them in the right order explicitly; this ordering is the backstop for the path where
+  // terminate() never runs — initialize() throwing after task_scheduler_ is constructed leaves
+  // is_initialized_ false, so ~SiriusContext skips terminate() entirely and only these
+  // declarations decide the order.
+  //
+  // Destroyed: scan_manager_ -> task_creator_ -> downgrade_executors_ -> task_scheduler_.
   std::unique_ptr<sirius::pipeline::task_scheduler> task_scheduler_;
   std::vector<std::unique_ptr<sirius::parallel::downgrade_executor>> downgrade_executors_;
   std::unique_ptr<sirius::creator::task_creator> task_creator_;
   std::unique_ptr<sirius::scan_manager::sirius_scan_manager> scan_manager_;
-  duckdb::shared_ptr<sirius::planner::query> query_;
 
   std::atomic<uint64_t> transparent_rebind_success_count_{0};
   std::atomic<uint64_t> transparent_fallback_count_{0};

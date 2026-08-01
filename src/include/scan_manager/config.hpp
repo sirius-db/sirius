@@ -43,6 +43,20 @@ struct scan_manager_config {
   exec::thread_pool_config thread_pool{.num_threads = 8, .thread_name_prefix = "scan_manager"};
   bool use_sirius_datasource{true};
 
+  /**
+   * @brief Maximum queries that may hold scan state at once. Sizes the scan thread pool.
+   *
+   * Each query's coalescer sequencer task BLOCKS (worker_loop -> process_provider_inputs ->
+   * queue.wait_dequeue) and is unblocked only by that query's own split_provider tasks, which run
+   * on the SAME pool. With Q concurrent queries, Q threads are parked in sequencers at all times,
+   * so the pool must be sized num_threads + max_concurrent_queries or Q queries consume the entire
+   * working budget and deadlock by starvation.
+   *
+   * Default 1 keeps the pool exactly the size it was before per-query scan state landed, so
+   * existing single-query deployments are unaffected. RAISE THIS before enabling real concurrency.
+   */
+  int max_concurrent_queries{1};
+
   /// Number of uring reactor worker threads for the local-disk IO path.
   std::size_t uring_n_reactors{1};
 
