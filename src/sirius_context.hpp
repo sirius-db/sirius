@@ -759,8 +759,9 @@ class SiriusContext : public ClientContextState {
   /// below it cannot be outrun by a completion callback, and closed once they finish. Declared
   /// before the subsystems that hold a pointer to it so it is destroyed after them.
   sirius::exec::query_lifecycle_registry query_lifecycle_;
-  // task_creator_ and downgrade_executors_ borrow this scheduler. terminate() stops their threads
-  // before reset; reverse member destruction also preserves that order if initialize() throws.
+  // The creator and downgrade executors borrow this scheduler. Reverse member destruction
+  // destroys scan_manager_, creator, and downgrade executors before the scheduler if initialize()
+  // throws before terminate() can run; terminate() also stops their threads before reset.
   std::unique_ptr<sirius::pipeline::task_scheduler> task_scheduler_;
   std::vector<std::unique_ptr<sirius::parallel::downgrade_executor>> downgrade_executors_;
   std::unique_ptr<sirius::creator::task_creator> task_creator_;
