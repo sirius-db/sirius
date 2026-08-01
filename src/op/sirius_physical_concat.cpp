@@ -17,11 +17,15 @@
 #include "op/sirius_physical_concat.hpp"
 
 #include "data/data_batch_utils.hpp"
+#include "log/logging.hpp"
 #include "op/merge/gpu_merge_impl.hpp"
+#include "op/partition/gpu_partition_impl.hpp"
 #include "op/sirius_physical_hash_join.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 
 #include <nvtx3/nvtx3.hpp>
+
+#include <algorithm>
 
 namespace sirius {
 namespace op {
@@ -68,6 +72,55 @@ sirius_physical_concat::sirius_physical_concat(duckdb::vector<sirius::logical_ty
   }
 }
 
+uint64_t sirius_physical_concat::effective_batch_bytes()
+{
+  // Caller holds `lock`.
+  int const parts = _probe_split_parts.load(std::memory_order_acquire);
+  if (parts <= 1 || _concat_all) { return _concat_batch_bytes; }
+  if (uint64_t const cached = _split_budget_bytes.load(std::memory_order_acquire); cached != 0) {
+    return cached;
+  }
+
+  auto port_ptr = ports.begin()->second;
+  // While the source pipeline is still producing we do not know the total probe size, and the
+  // default budget already emits one batch per `_concat_batch_bytes` — a probe that large is
+  // already multi-task. The pathological case is a probe that fits in one budget, which is only
+  // knowable once the source is finished. (No source pipeline at all means no further input can
+  // arrive, so what is resident is the whole side.)
+  if (port_ptr->src_pipeline != nullptr && !port_ptr->src_pipeline->is_pipeline_finished()) {
+    return _concat_batch_bytes;
+  }
+
+  uint64_t total = 0;
+  for (std::size_t i = 0; i < port_ptr->repo->num_partitions(); i++) {
+    for (auto& batch_id : port_ptr->repo->get_batch_ids(i)) {
+      auto batch = port_ptr->repo->get_data_batch_by_id(batch_id, i);
+      if (!batch) { continue; }
+      auto batch_ro = batch->to_read_only();
+      if (batch_ro.get_data()) { total += batch_ro.get_data()->get_size_in_bytes(); }
+    }
+  }
+  if (total == 0) { return _concat_batch_bytes; }  // nothing resident yet; do not fix a budget
+
+  auto const divisor = static_cast<uint64_t>(parts);
+  uint64_t budget    = (total + divisor - 1) / divisor;
+  // Never split into batches too small to be worth a task, and never make the batch LARGER than
+  // the configured concat budget (so this can only ever add parallelism, never remove it). The
+  // floor is itself capped by the configured budget, which a user may have set below it.
+  uint64_t const floor_bytes = std::min(_min_probe_split_bytes, _concat_batch_bytes);
+  budget                     = std::clamp(budget, floor_bytes, _concat_batch_bytes);
+  if (budget == 0) { return _concat_batch_bytes; }
+  _split_budget_bytes.store(budget, std::memory_order_release);
+  SIRIUS_LOG_DEBUG(
+    "sirius_physical_concat id {}: BUILD_PROBE probe split into ~{} batches ({} total bytes, {} "
+    "bytes per batch)",
+    this->get_operator_id(),
+    (total + budget - 1) / budget,
+    total,
+    budget);
+  return budget;
+}
+
 std::optional<task_creation_hint> sirius_physical_concat::get_next_task_hint()
 {
   std::lock_guard<std::mutex> lg(lock);
@@ -94,6 +147,9 @@ std::optional<task_creation_hint> sirius_physical_concat::get_next_task_hint()
   // Source pipeline still running — check if there is enough data to fire a task early.
   // "Enough" means: for some partition, simulating get_next_task_input_data would pull a group
   // of batches AND there would still be at least one batch left in that partition afterward.
+  // (effective_batch_bytes() is `_concat_batch_bytes` on this path — the probe split only fixes a
+  // smaller budget once the source pipeline is finished — but it keeps the two paths in sync.)
+  uint64_t const batch_bytes_budget = effective_batch_bytes();
   for (size_t i = 0; i < port_ptr->repo->num_partitions(); i++) {
     auto batch_ids          = port_ptr->repo->get_batch_ids(i);
     size_t total_batch_size = 0;
@@ -103,7 +159,7 @@ std::optional<task_creation_hint> sirius_physical_concat::get_next_task_hint()
       auto batch_ro   = batch_idle->to_read_only();
       auto batch_size = batch_ro.get_data()->get_size_in_bytes();
       total_batch_size += batch_size;
-      if (!_concat_all && total_batch_size > _concat_batch_bytes) {
+      if (!_concat_all && total_batch_size > batch_bytes_budget) {
         // This batch pushes us over the threshold — the loop would stop here.
         // If we already accumulated batches (pulled_count > 0), the overflowing batch stays,
         // so there is at least one batch left after the pull.
@@ -133,7 +189,8 @@ std::unique_ptr<operator_data> sirius_physical_concat::get_next_task_input_data(
     throw std::runtime_error("sirius_physical_concat: there should be only one port");
   }
 
-  auto port_ptr = ports.begin()->second;
+  auto port_ptr                     = ports.begin()->second;
+  uint64_t const batch_bytes_budget = effective_batch_bytes();
   for (size_t i = 0; i < port_ptr->repo->num_partitions(); i++) {
     std::vector<std::shared_ptr<::cucascade::data_batch>> input_batch;
     // get all the batch ids from the partition
@@ -145,7 +202,7 @@ std::unique_ptr<operator_data> sirius_physical_concat::get_next_task_input_data(
       auto batch_size = batch_ro.get_data()->get_size_in_bytes();
       total_batch_size += batch_size;
       // Check if the batch size is already exceed the threshold
-      if (!_concat_all && total_batch_size > _concat_batch_bytes) {
+      if (!_concat_all && total_batch_size > batch_bytes_budget) {
         // if the batch size is already exceed the threshold, then we need to return the batch right
         // away
         if (input_batch.size() == 0) {
@@ -187,6 +244,30 @@ std::unique_ptr<operator_data> sirius_physical_concat::execute(const operator_da
 
   cucascade::memory::memory_space* space = input_batches[0].get_memory_space();
   if (space == nullptr) { throw std::runtime_error("sirius_physical_concat: space is nullptr"); }
+
+  // BUILD_PROBE probe split, case 2: grouping in get_next_task_input_data caps a pulled group at
+  // the split budget, but it cannot split a SINGLE upstream batch that is already larger than the
+  // budget — and "the whole probe arrived as one scan batch" is exactly the one-task case we are
+  // fixing. Slice it into row-disjoint pieces here; every probe row still lands in exactly one
+  // output batch, so per-probe-row semantics (LEFT NULL-padding, SEMI/ANTI/MARK one-in-one-out)
+  // are untouched. Only ever reached on a probe-side CONCAT of a single-partition BUILD_PROBE join
+  // (see compute_hash_join_partition_strategy for the join-type allowlist).
+  if (int const split_parts = _probe_split_parts.load(std::memory_order_acquire); split_parts > 1) {
+    uint64_t const budget = _split_budget_bytes.load(std::memory_order_acquire);
+    auto const* data      = input_batches[0].get_data();
+    uint64_t const bytes  = data != nullptr ? data->get_size_in_bytes() : 0;
+    if (input_batches.size() == 1 && budget > 0 && bytes > budget) {
+      auto const num_rows = get_cudf_table_view(input_batches[0]).num_rows();
+      auto parts          = static_cast<int64_t>((bytes + budget - 1) / budget);
+      parts               = std::min<int64_t>(parts, split_parts);
+      parts               = std::min<int64_t>(parts, num_rows);  // never emit empty slices
+      if (parts > 1) {
+        auto slices = gpu_partition_impl::evenly_partition(
+          input_batches[0], static_cast<int>(parts), stream, *space, batch_telemetry());
+        return std::make_unique<partitioned_operator_data>(std::move(slices), partition_idx);
+      }
+    }
+  }
 
   std::vector<std::shared_ptr<cucascade::data_batch>> output_batches;
   output_batches.reserve(1);
@@ -236,10 +317,26 @@ void sirius_physical_concat::set_concat_all(bool concat_all)
   _concat_all = concat_all;
 }
 
+void sirius_physical_concat::set_probe_split_parts(int parts, uint64_t min_batch_bytes)
+{
+  std::lock_guard<std::mutex> lg(lock);
+  if (_is_build || _concat_all) {
+    // Defensive: the build side must stay foldable to a single batch for BUILD_PROBE, and a
+    // concat_all side is whole-side by definition. Callers only target probe-side CONCATs.
+    return;
+  }
+  _min_probe_split_bytes = min_batch_bytes;
+  _probe_split_parts.store(std::max(parts, 1), std::memory_order_release);
+}
+
 std::size_t sirius_physical_concat::no_history_peak_memory_estimate(
   const op::input_stats& stats) const
 {
-  if (stats.num_batches <= 1) { return 0; }
+  // A single input batch is normally forwarded without a copy — except when the probe split is
+  // enabled, where an oversized single batch is sliced into a fresh copy of the same total size.
+  if (stats.num_batches <= 1) {
+    return _probe_split_parts.load(std::memory_order_acquire) > 1 ? stats.bytes : 0;
+  }
   return stats.bytes;
 }
 

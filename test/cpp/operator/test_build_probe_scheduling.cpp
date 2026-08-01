@@ -82,7 +82,8 @@ partition_strategy strategy(uint64_t total_bytes,
                             uint64_t hash_partition_bytes         = kBigPartitionBytes,
                             uint64_t max_build_hash_table_bytes   = kMaxBuildBytes,
                             uint64_t max_broadcast_join_size      = kMaxBroadcastBytes,
-                            double estimated_probe_to_build_ratio = 0.0)
+                            double estimated_probe_to_build_ratio = 0.0,
+                            int probe_parallelism_target          = 1)
 {
   return compute_hash_join_partition_strategy(total_bytes,
                                               is_build_side,
@@ -93,7 +94,31 @@ partition_strategy strategy(uint64_t total_bytes,
                                               max_broadcast_join_size,
                                               join_type,
                                               join_mode,
-                                              estimated_probe_to_build_ratio);
+                                              estimated_probe_to_build_ratio,
+                                              probe_parallelism_target);
+}
+
+// Same defaults as `strategy`, but with the probe-parallelism target (the pipeline executor's
+// thread count) plumbed through — the only input that can make probe_split_parts > 1.
+partition_strategy strategy_threads(uint64_t total_bytes,
+                                    bool build_foldable,
+                                    int num_gpus,
+                                    duckdb::JoinType join_type,
+                                    int probe_parallelism_target,
+                                    HASH_JOIN_MODE join_mode      = HASH_JOIN_MODE::STANDARD,
+                                    uint64_t hash_partition_bytes = kBigPartitionBytes)
+{
+  return strategy(total_bytes,
+                  /*is_build_side=*/true,
+                  build_foldable,
+                  num_gpus,
+                  join_type,
+                  join_mode,
+                  hash_partition_bytes,
+                  kMaxBuildBytes,
+                  kMaxBroadcastBytes,
+                  /*estimated_probe_to_build_ratio=*/0.0,
+                  probe_parallelism_target);
 }
 
 }  // namespace
@@ -106,6 +131,9 @@ TEST_CASE("compute_hash_join_partition_strategy - single-GPU small foldable inne
   REQUIRE(s.num_partitions == 1);
   REQUIRE_FALSE(s.broadcast);
   REQUIRE(s.build_probe);
+  // The default probe-parallelism target (1) leaves the probe feeder alone; the split is only
+  // requested when the planner supplies the executor's thread count (see the probe-split cases).
+  REQUIRE(s.probe_split_parts == 1);
 }
 
 TEST_CASE(
@@ -405,6 +433,151 @@ TEST_CASE("compute_hash_join_partition_strategy - num_gpus < 1 is a precondition
 {
   REQUIRE_THROWS_AS(strategy(k100MB, true, true, /*num_gpus=*/0, duckdb::JoinType::INNER),
                     std::invalid_argument);
+}
+
+//===----------------------------------------------------------------------===//
+// probe_split_parts — probe-side parallelism is NOT tied to the build partition count.
+//===----------------------------------------------------------------------===//
+
+TEST_CASE(
+  "compute_hash_join_partition_strategy - single-GPU BUILD_PROBE keeps one build partition but "
+  "splits the probe across executor threads",
+  "[hash_join][build_probe][unit][probe_split]")
+{
+  // The regression this guards: on one GPU BUILD_PROBE folds the build into a single partition,
+  // which used to drag the probe feeder down to a single batch -> a single task -> a
+  // single-threaded join. The build must STAY at one partition (one hash table is the whole point,
+  // and the precondition for one-shot dynamic-filter publication) while the probe fans out.
+  auto const s = strategy_threads(
+    k100MB, /*foldable=*/true, /*num_gpus=*/1, duckdb::JoinType::INNER, /*threads=*/8);
+  REQUIRE(s.num_partitions == 1);
+  REQUIRE(s.build_probe);
+  REQUIRE(s.probe_split_parts == 8);
+}
+
+TEST_CASE("compute_hash_join_partition_strategy - probe split covers every BUILD_PROBE join type",
+          "[hash_join][build_probe][unit][probe_split]")
+{
+  // INNER/LEFT/SEMI/ANTI/MARK are exactly the join types whose output is a per-probe-row function
+  // of the WHOLE build side, so row-disjoint probe slices reproduce the single-batch result.
+  for (auto jt : {duckdb::JoinType::INNER,
+                  duckdb::JoinType::LEFT,
+                  duckdb::JoinType::SEMI,
+                  duckdb::JoinType::ANTI,
+                  duckdb::JoinType::MARK}) {
+    INFO("join type " << duckdb::JoinTypeToString(jt));
+    auto const s = strategy_threads(k100MB, /*foldable=*/true, /*num_gpus=*/1, jt, /*threads=*/8);
+    REQUIRE(s.build_probe);
+    REQUIRE(s.num_partitions == 1);
+    REQUIRE(s.probe_split_parts == 8);
+  }
+}
+
+TEST_CASE(
+  "compute_hash_join_partition_strategy - joins that never reach BUILD_PROBE never split the probe",
+  "[hash_join][build_probe][unit][probe_split]")
+{
+  // RIGHT-family and full OUTER emit build-side rows and would need unmatched-build tracking shared
+  // across every probe task; MIXED_JOIN is a different cuDF path; an unfoldable build has no single
+  // hash table to stream against. None of them may split the probe.
+  for (auto jt : {duckdb::JoinType::RIGHT,
+                  duckdb::JoinType::RIGHT_SEMI,
+                  duckdb::JoinType::RIGHT_ANTI,
+                  duckdb::JoinType::OUTER}) {
+    INFO("join type " << duckdb::JoinTypeToString(jt));
+    auto const s = strategy_threads(k100MB, /*foldable=*/true, /*num_gpus=*/1, jt, /*threads=*/8);
+    REQUIRE_FALSE(s.build_probe);
+    REQUIRE(s.probe_split_parts == 1);
+  }
+
+  auto const mixed = strategy_threads(k100MB,
+                                      /*foldable=*/true,
+                                      /*num_gpus=*/1,
+                                      duckdb::JoinType::INNER,
+                                      /*threads=*/8,
+                                      HASH_JOIN_MODE::MIXED_JOIN);
+  REQUIRE_FALSE(mixed.build_probe);
+  REQUIRE(mixed.probe_split_parts == 1);
+
+  auto const unfoldable = strategy_threads(
+    k100MB, /*foldable=*/false, /*num_gpus=*/1, duckdb::JoinType::INNER, /*threads=*/8);
+  REQUIRE_FALSE(unfoldable.build_probe);
+  REQUIRE(unfoldable.probe_split_parts == 1);
+}
+
+TEST_CASE("compute_hash_join_partition_strategy - STANDARD-mode joins never split the probe",
+          "[hash_join][build_probe][unit][probe_split]")
+{
+  // 400 MB / 100 MB -> 4 natural partitions on 1 GPU: BUILD_PROBE is refused and the probe is
+  // hash-partitioned four ways, which already yields four tasks. Splitting on top of a
+  // co-partitioned probe would break the build/probe partition correspondence.
+  auto const s = strategy_threads(4 * k100MB,
+                                  /*foldable=*/true,
+                                  /*num_gpus=*/1,
+                                  duckdb::JoinType::INNER,
+                                  /*threads=*/8,
+                                  HASH_JOIN_MODE::STANDARD,
+                                  /*hash_partition_bytes=*/k100MB);
+  REQUIRE(s.num_partitions == 4);
+  REQUIRE_FALSE(s.build_probe);
+  REQUIRE(s.probe_split_parts == 1);
+}
+
+TEST_CASE(
+  "compute_hash_join_partition_strategy - multi-partition BUILD_PROBE keeps the probe "
+  "co-partitioned",
+  "[hash_join][build_probe][unit][probe_split]")
+{
+  // Multi-GPU BUILD_PROBE: each partition owns a GPU and the probe feeder's slots carry GPU
+  // affinity, so the probe stays one-batch-stream-per-partition. Deliberately left alone.
+  auto const hash_partitioned = strategy_threads(4 * k100MB,
+                                                 /*foldable=*/true,
+                                                 /*num_gpus=*/4,
+                                                 duckdb::JoinType::INNER,
+                                                 /*threads=*/8,
+                                                 HASH_JOIN_MODE::STANDARD,
+                                                 /*hash_partition_bytes=*/k100MB);
+  REQUIRE(hash_partitioned.num_partitions == 4);
+  REQUIRE(hash_partitioned.build_probe);
+  REQUIRE(hash_partitioned.probe_split_parts == 1);
+
+  auto const broadcast = strategy_threads(
+    10ull * 1024 * 1024, /*foldable=*/true, /*num_gpus=*/4, duckdb::JoinType::INNER, /*threads=*/8);
+  REQUIRE(broadcast.broadcast);
+  REQUIRE(broadcast.num_partitions == 4);
+  REQUIRE(broadcast.probe_split_parts == 1);
+}
+
+TEST_CASE("compute_hash_join_partition_strategy - probe-driven sizing never splits the probe",
+          "[hash_join][build_probe][unit][probe_split]")
+{
+  // is_build_side == false is the probe-driven (right-family) sizing call: it reports the plain
+  // natural count and no build-probe, so there is nothing to split.
+  auto const s = strategy(k100MB,
+                          /*is_build_side=*/false,
+                          /*foldable=*/true,
+                          /*num_gpus=*/1,
+                          duckdb::JoinType::RIGHT,
+                          HASH_JOIN_MODE::STANDARD,
+                          kBigPartitionBytes,
+                          kMaxBuildBytes,
+                          kMaxBroadcastBytes,
+                          /*estimated_probe_to_build_ratio=*/0.0,
+                          /*probe_parallelism_target=*/8);
+  REQUIRE_FALSE(s.build_probe);
+  REQUIRE(s.probe_split_parts == 1);
+}
+
+TEST_CASE("compute_hash_join_partition_strategy - a single-threaded executor requests no split",
+          "[hash_join][build_probe][unit][probe_split]")
+{
+  for (int threads : {0, 1}) {
+    INFO("threads " << threads);
+    auto const s =
+      strategy_threads(k100MB, /*foldable=*/true, /*num_gpus=*/1, duckdb::JoinType::INNER, threads);
+    REQUIRE(s.build_probe);
+    REQUIRE(s.probe_split_parts == 1);
+  }
 }
 
 //===----------------------------------------------------------------------===//

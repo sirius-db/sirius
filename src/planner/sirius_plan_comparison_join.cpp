@@ -701,6 +701,11 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
     auto& hj                        = join->Cast<sirius::op::sirius_physical_hash_join>();
     hj.join_stats                   = std::move(op.join_stats);
     hj.mark_join_build_switch_ratio = op_params.mark_join_build_switch_ratio;
+    // A single-partition BUILD_PROBE join streams its probe through one hash table, so the probe
+    // side can be cut into as many independent tasks as the pipeline executor has threads. Without
+    // this the probe coalesces into one batch and the whole join runs single-threaded.
+    hj.probe_parallelism_target =
+      sirius_context->get_config().get_gpu_pipeline_executor_config().num_threads;
 
     // --- Detect build-side key uniqueness ---
     // Gate: only for pure equal conditions (not_distinct_from needs null_equality::EQUAL).

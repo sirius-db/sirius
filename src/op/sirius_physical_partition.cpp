@@ -380,6 +380,18 @@ std::unique_ptr<operator_data> sirius_physical_partition::get_next_task_input_da
     }
     return found;
   };
+  // Probe-side counterpart of enable_build_concat_all. A single-partition BUILD_PROBE join folds
+  // its build into one hash table but streams the probe through it, so the probe-side CONCAT is
+  // told to emit `parts` batches instead of coalescing everything into one — otherwise the join
+  // gets a single probe batch, a single task, and runs on one executor thread. Either sibling may
+  // run the sizing decision, so both configure their probe-side CONCAT.
+  auto enable_probe_split = [](sirius_physical_operator& part_op, int parts) {
+    for (auto& next_port : part_op.get_next_ports_after_sink()) {
+      if (next_port.next_operator->type != SiriusPhysicalOperatorType::CONCAT) { continue; }
+      auto& concat = next_port.next_operator->Cast<sirius_physical_concat>();
+      if (!concat.is_build_concat()) { concat.set_probe_split_parts(parts); }
+    }
+  };
 
   auto* consumer =
     dynamic_cast<sirius_physical_partition_consumer_operator*>(_downstream_consumer_op);
@@ -429,15 +441,20 @@ std::unique_ptr<operator_data> sirius_physical_partition::get_next_task_input_da
         build_arrives_whole      = found_this || found_sibling;
       }
       if (hash_join != nullptr) { hash_join->set_build_arrives_whole(build_arrives_whole); }
+      if (strategy.probe_split_parts > 1) {
+        enable_probe_split(*this, strategy.probe_split_parts);
+        enable_probe_split(sibling, strategy.probe_split_parts);
+      }
       _broadcast              = strategy.broadcast;
       sibling._broadcast      = strategy.broadcast;
       _num_partitions         = strategy.num_partitions;
       sibling._num_partitions = strategy.num_partitions;
       SIRIUS_LOG_DEBUG(
-        "sirius_physical_partition id {} sized {} partitions on sizing id {} ({} side){}, sibling "
-        "id {}",
+        "sirius_physical_partition id {} sized {} partitions (probe split {}) on sizing id {} ({} "
+        "side){}, sibling id {}",
         this->get_operator_id(),
         strategy.num_partitions,
+        strategy.probe_split_parts,
         sizing_partition.get_operator_id(),
         (sizing_partition._is_build ? "build" : "probe"),
         (strategy.broadcast ? " [broadcast]" : ""),

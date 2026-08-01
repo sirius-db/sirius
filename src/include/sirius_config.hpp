@@ -43,6 +43,13 @@ constexpr uint64_t DEFAULT_MAX_BROADCAST_JOIN_SIZE    = 256ULL * 1024 * 1024;  /
 /// cross-device overhead; above it, the multi-GPU floor of `num_gpus` partitions kicks in.
 constexpr uint64_t PARTITION_SMALL_TABLE_BYTES_PER_GPU = 16ULL * 1024 * 1024;  // 16 MB
 
+/// Floor on the size of a probe-side batch produced by the BUILD_PROBE probe split (see
+/// compute_hash_join_partition_strategy / sirius_physical_concat). A BUILD_PROBE join folds its
+/// build side into one hash table and streams the probe through it, so the probe can be cut into
+/// as many independent batches as there are pipeline threads — but below this size the extra task
+/// costs more in launch/scheduling overhead than it recovers in parallelism, so the split stops.
+constexpr uint64_t MIN_PROBE_SPLIT_BATCH_BYTES = 32ULL * 1024 * 1024;  // 32 MB
+
 /// Fraction of available GPU memory used per sort partition when max_sort_partition_bytes is 0.
 constexpr double DEFAULT_MAX_SORT_PARTITION_MEMORY_FRACTION = 0.33;
 

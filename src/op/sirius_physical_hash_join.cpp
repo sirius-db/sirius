@@ -658,7 +658,8 @@ partition_strategy compute_hash_join_partition_strategy(uint64_t total_bytes,
                                                         uint64_t max_broadcast_join_size,
                                                         duckdb::JoinType join_type,
                                                         HASH_JOIN_MODE join_mode,
-                                                        double estimated_probe_to_build_ratio)
+                                                        double estimated_probe_to_build_ratio,
+                                                        int probe_parallelism_target)
 {
   // Invariant: num_gpus defaults to 1 and is only ever set to a hardware GPU count >= 1. A value
   // < 1 is a programming error (it makes the per-partition division below ill-defined).
@@ -721,7 +722,36 @@ partition_strategy compute_hash_join_partition_strategy(uint64_t total_bytes,
                              : build_probe                ? build_probe_partitions
                              : (is_mark && num_gpus <= 1) ? 1
                                                           : natural;
-  return {num_partitions, broadcast, build_probe};
+
+  // Phase 3 — probe-side parallelism, deliberately NOT tied to the partition count.
+  //
+  // Folding the build into a single hash table is the whole point of BUILD_PROBE (and the
+  // precondition for one-shot dynamic-filter publication). The probe side, however, is never
+  // co-partitioned with the build in this mode: each probe batch is joined against the WHOLE build
+  // table, so probe batches are mutually independent. With one partition the probe feeder would
+  // otherwise coalesce the entire probe into one batch -> one task -> the whole join runs on one
+  // thread. Ask the probe feeder for `probe_parallelism_target` batches instead.
+  //
+  // Only sound for join types whose result is a per-probe-row function of the whole build side:
+  //   INNER / LEFT — each probe row contributes its matches, or one NULL-padded row. Slices are
+  //                  row-disjoint, so the union over slices is the same multiset of output rows.
+  //   SEMI / ANTI  — each probe row is emitted at most once, decided against the whole build; a
+  //                  row lives in exactly one slice, so no duplicates and no misses.
+  //   MARK         — one bool per probe row, in probe order within each batch; `build_has_null` is
+  //                  join-wide (single/broadcast build), not derived per probe batch.
+  // RIGHT / RIGHT_SEMI / RIGHT_ANTI / OUTER emit build-side rows and would need unmatched-build
+  // tracking shared across every probe task; MIXED_JOIN is a separate cuDF path. All four are
+  // already refused BUILD_PROBE above — the allowlist below keeps this guard correct on its own if
+  // that ever changes. Multi-partition (multi-GPU) BUILD_PROBE is excluded: there each partition
+  // already owns a GPU and the probe feeder's slots carry GPU-affinity meaning.
+  int probe_split_parts = 1;
+  if (build_probe && num_partitions == 1 && probe_parallelism_target > 1) {
+    bool const probe_splittable =
+      join_type == duckdb::JoinType::INNER || join_type == duckdb::JoinType::LEFT ||
+      join_type == duckdb::JoinType::SEMI || join_type == duckdb::JoinType::ANTI || is_mark;
+    if (probe_splittable) { probe_split_parts = probe_parallelism_target; }
+  }
+  return {num_partitions, broadcast, build_probe, probe_split_parts};
 }
 
 partition_strategy sirius_physical_hash_join::get_partition_strategy(
@@ -742,7 +772,8 @@ partition_strategy sirius_physical_hash_join::get_partition_strategy(
                                                              _max_broadcast_join_size,
                                                              join_type,
                                                              _join_mode,
-                                                             estimated_probe_to_build_ratio);
+                                                             estimated_probe_to_build_ratio,
+                                                             probe_parallelism_target);
 
   if (join_type == duckdb::JoinType::MARK && _num_gpus > 1 && in.is_build_side &&
       in.total_bytes >= partition_small_table_bytes(_num_gpus)) {
@@ -781,11 +812,12 @@ partition_strategy sirius_physical_hash_join::get_partition_strategy(
                                                                          : "STANDARD";
 
   SIRIUS_LOG_DEBUG(
-    "sirius_physical_hash_join id {} partition strategy: {} partitions ({} GPUs), build side {} "
-    "bytes. Join Type: {}. Join Mode: {} {}. build_card_est {} probe_card_est {}",
+    "sirius_physical_hash_join id {} partition strategy: {} partitions ({} GPUs), probe split {}, "
+    "build side {} bytes. Join Type: {}. Join Mode: {} {}. build_card_est {} probe_card_est {}",
     this->get_operator_id(),
     strategy.num_partitions,
     _num_gpus,
+    strategy.probe_split_parts,
     in.total_bytes,
     duckdb::JoinTypeToString(join_type),
     join_mode_str,
@@ -1339,7 +1371,7 @@ static std::unique_ptr<operator_data> gather_join_output(
     }
   }
 
-  auto output_cudf_table = std::make_unique<cudf::table>(std::move(out_cols), stream);
+  auto output_cudf_table = std::make_unique<cudf::table>(std::move(out_cols));
   return std::make_unique<pipelineable_operator_data>(
     std::vector<std::shared_ptr<::cucascade::data_batch>>{
       make_data_batch(std::move(output_cudf_table), memory_space, stream, telemetry_info)});
@@ -1381,7 +1413,7 @@ static std::unique_ptr<operator_data> gather_distinct_left_join_output(
     out_cols.push_back(std::move(col));
   }
 
-  auto output_cudf_table = std::make_unique<cudf::table>(std::move(out_cols), stream);
+  auto output_cudf_table = std::make_unique<cudf::table>(std::move(out_cols));
   return std::make_unique<pipelineable_operator_data>(
     std::vector<std::shared_ptr<::cucascade::data_batch>>{
       make_data_batch(std::move(output_cudf_table), memory_space, stream, telemetry_info)});
@@ -1505,7 +1537,7 @@ static std::unique_ptr<operator_data> resolve_mark_join_result(
   if (null_count > 0) { mark_column->set_null_mask(std::move(null_mask), null_count); }
 
   mark_out_cols.push_back(std::move(mark_column));
-  auto output_cudf_table = std::make_unique<cudf::table>(std::move(mark_out_cols), stream);
+  auto output_cudf_table = std::make_unique<cudf::table>(std::move(mark_out_cols));
   return std::make_unique<pipelineable_operator_data>(
     std::vector<std::shared_ptr<::cucascade::data_batch>>{make_data_batch(
       std::move(output_cudf_table), *left_batch.get_memory_space(), stream, telemetry_info)});

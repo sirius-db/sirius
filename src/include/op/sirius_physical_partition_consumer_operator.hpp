@@ -35,12 +35,18 @@ struct partition_sizing_input {
 };
 
 /// The partitioning decision returned by a consumer's get_partition_strategy. `num_partitions` is
-/// applied to the partition operator(s); `broadcast`/`build_probe` are reported back so the
-/// partition can configure its own wiring (e.g. enabling build-side concat_all).
+/// applied to the partition operator(s); `broadcast`/`build_probe`/`probe_split_parts` are reported
+/// back so the partition can configure its own wiring (e.g. enabling build-side concat_all or the
+/// probe-side split).
 struct partition_strategy {
   int num_partitions;
   bool broadcast;
   bool build_probe;
+  /// Number of batches the PROBE-side feeder should emit, independent of `num_partitions`. > 1 only
+  /// for a BUILD_PROBE join whose build side is folded into a single hash table: the probe is not
+  /// co-partitioned with the build, so it can stream through that one table in this many
+  /// independent tasks. 1 means "leave the probe feeder alone" (the historical behaviour).
+  int probe_split_parts = 1;
 };
 
 /// Multi-GPU partition floor derived purely from the GPU count: below the small-table threshold a
