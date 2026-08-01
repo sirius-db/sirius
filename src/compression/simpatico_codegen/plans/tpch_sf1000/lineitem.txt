@@ -20,9 +20,9 @@ input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
 input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
 
 ---
-# column: l_quantity  dtype: t26  ratio: 3.959x  depth: 1
-# comp: 25.11 GB/s  decomp: 305.06 GB/s
-input -> snappy
+# column: l_quantity  dtype: t26  ratio: 4.885x  (hand: bitpack, GB300)
+# comp: 836.89 GB/s  decomp: 1692.77 GB/s
+input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
 
 ---
 # column: l_extendedprice  dtype: t26  ratio: 1.984x  depth: 1
