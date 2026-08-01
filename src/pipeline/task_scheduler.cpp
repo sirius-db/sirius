@@ -116,7 +116,22 @@ void task_scheduler::schedule(std::unique_ptr<sirius::parallel::itask> task)
       .queue_capacity_entries = 1,
     });
   }
-  _task_queue.push(std::move(task));
+  // Read before the move: reporting a drop needs the query, and `task` is gone after push().
+  const auto pushed_query =
+    task ? sirius::make_query_id(index_keys_for(*task).query_id) : sirius::make_query_id(0);
+  if (!_task_queue.push(std::move(task))) {
+    // push returns false only when the queue is interrupted. If the gate still reports this query
+    // as accepting work, the task is destroyed and its query waits forever on a completion that
+    // cannot arrive -- the silent-drop failure mode behind several "query just hangs" reports.
+    if (_query_lifecycle == nullptr || _query_lifecycle->accepts_work(pushed_query)) {
+      SIRIUS_LOG_ERROR(
+        "task_scheduler: task for query {} was DROPPED by an interrupted queue while the query was "
+        "still accepting work; that query will not complete",
+        pushed_query);
+    } else {
+      SIRIUS_LOG_DEBUG("task_scheduler: dropped a task for tearing-down query {}", pushed_query);
+    }
+  }
   if (_self_publisher) {
     auto wake                 = std::make_unique<task_request>();
     wake->kind                = task_request_kind::task_available;
