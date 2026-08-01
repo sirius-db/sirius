@@ -287,6 +287,7 @@ static void from_yaml(const YAML::Node& node, scan_manager::scan_manager_config&
   r.optional("num_threads", opt.thread_pool.num_threads, yaml::greater_than<int>{2});
   r.optional("cpu_affinity", opt.thread_pool.cpu_affinity_list);
   r.optional("backend", opt.backend);
+  r.optional("max_concurrent_queries", opt.max_concurrent_queries, yaml::greater_than<int>{0});
   r.optional("uring_n_reactors", opt.uring_n_reactors, yaml::greater_than<std::size_t>{0});
   r.optional("rest_n_reactors", opt.rest_n_reactors, yaml::greater_than<std::size_t>{0});
   r.optional("max_readahead_scans", opt.max_readahead_scans);

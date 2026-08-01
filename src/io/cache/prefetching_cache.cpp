@@ -368,23 +368,23 @@ prefetching_cache::~prefetching_cache()
 prefetching_cache::file_entry& prefetching_cache::get_or_create_file_entry(const io_object& obj)
 {
   const auto& key = obj.raw_file_cache_id();
-  std::shared_lock lk(_map_mtx);
-  auto it = _file_cache.find(key);
-  if (it == _file_cache.end()) {
-    lk.unlock();
-    std::unique_lock ulk(_map_mtx);
-    auto [new_it, inserted] = _file_cache.try_emplace(key, std::make_unique<file_entry>());
-    it                      = new_it;
-    if (inserted) {
-      it->second->file_size  = obj.size();
-      it->second->io_obj     = obj.shared_from_this();
-      it->second->chunk_size = _chunk_size;
-      // One slot per chunk-aligned position in the file — the same capacity the
-      // sorted chunk vector used to reserve, but indexable instead of searchable.
-      auto const n_slots =
-        obj.size() / _chunk_size + static_cast<size_t>(obj.size() % _chunk_size != 0);
-      it->second->slots.assign(n_slots, nullptr);
-    }
+  // Keep the heap-owned entry pointer, not a map iterator, across the lock boundary. A
+  // concurrent insertion can rehash _file_cache and invalidate its iterators.
+  {
+    std::shared_lock lk(_map_mtx);
+    if (auto it = _file_cache.find(key); it != _file_cache.end()) { return *it->second; }
+  }
+
+  std::unique_lock lk(_map_mtx);
+  auto [it, inserted] = _file_cache.try_emplace(key, std::make_unique<file_entry>());
+  if (inserted) {
+    it->second->file_size  = obj.size();
+    it->second->io_obj     = obj.shared_from_this();
+    it->second->chunk_size = _chunk_size;
+    // One slot per chunk-aligned position in the file.
+    auto const n_slots =
+      obj.size() / _chunk_size + static_cast<size_t>(obj.size() % _chunk_size != 0);
+    it->second->slots.assign(n_slots, nullptr);
   }
   return *it->second;
 }
