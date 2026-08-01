@@ -24,7 +24,9 @@
 #include <cuco/bloom_filter_policies.cuh>
 #include <cuco/hash_functions.cuh>
 #include <cuda/sirius_rmm_cuco_allocator.cuh>
+#include <cuda/std/bit>
 #include <cuda/std/cstddef>
+#include <cuda/std/limits>
 #include <cuda/stream_ref>
 
 #include <cucascade/memory/memory_space.hpp>
@@ -60,29 +62,104 @@ std::size_t blocks_for(std::size_t num_keys)
 
 using bloom_alloc = sirius::rmm_cuco_allocator<cuda::std::byte>;
 
+/**
+ * @brief Fingerprint policy for Sirius's dynamic Bloom filters.
+ *
+ * Byte-for-byte identical to @c cuco::default_filter_policy<xxhash_64<KeyT>,uint32_t,8> in hash
+ * function, block geometry (8 x 32-bit words = one 256-bit block = one 32-byte memory sector) and
+ * fingerprint layout (its default @c pattern_bits==words_per_block, i.e. exactly one bit per word).
+ * The @b only difference is @ref block_index.
+ *
+ * cuCollections offers two stock policies and neither is right here:
+ *   - @c arrow_filter_policy maps the hash with a cheap multiply-shift, but hard-caps the filter at
+ *     Arrow's 128 MiB (2^22 blocks). Every Bloom the publisher actually emits at SF1000 is larger
+ *     than that (q21's are 2^22.13, 2^22.19 and 2^25.4 blocks), so it is never selected.
+ *   - @c default_filter_policy has no cap but computes @c hash % num_blocks. NVIDIA GPUs have no
+ *     integer-divide instruction and a 64-bit modulo by a runtime value is a long emulated
+ *     sequence, which makes it -- not the random gather -- the probe kernel's bottleneck.
+ *
+ * This policy keeps the uncapped sizing and replaces the modulo with Lemire fast-range: one
+ * @c mul.hi.u64. Measured on GB300 (152 SM, 115.5 MiB L2) at TPC-H SF1000 q21's real probe shape
+ * (389M clustered @c l_orderkey probes, @c contains_async):
+ * | build keys | filter    | @c hash%n | fast-range |       |
+ * |------------|-----------|-----------|------------|-------|
+ * | 73.2M      |  139.7 MB |   5.06 ms |    2.34 ms | 2.16x |
+ * | 730.8M     | 1393.9 MB |   5.21 ms |    2.73 ms | 1.91x |
+ *
+ * That the modulo dominates rather than the gather is directly falsifiable and was falsified: a
+ * 69.8 MB filter, small enough to sit entirely in L2, still ran at 4.93 ms with the modulo versus
+ * 2.18 ms with fast-range. Filter size is not the lever; the block-index arithmetic is.
+ *
+ * @note Correctness. Fast-range is a deterministic, uniform map of a 64-bit hash onto
+ *       @c [0,num_blocks) -- @c (hash*num_blocks)>>64 is @c <num_blocks for any @c hash<2^64 -- and
+ *       is applied identically on @c add and @c contains, so the no-false-negative contract is
+ *       preserved: a key that was inserted always tests positive. Only the false-positive @a set
+ *       can differ, which is harmless because the join remains authoritative. Measured, it is a
+ *       slight improvement: fast-range consumes the @a high hash bits while the fingerprint
+ *       consumes the low 40, whereas the modulo draws both from the low bits; at the 73.2M-key
+ *       shape the observed keep ratio fell from 5.002% to 4.878% against a 4.77% true-match rate,
+ *       i.e. the false-positive rate roughly halved at identical footprint.
+ */
 template <class KeyT>
-using arrow_policy = cuco::arrow_filter_policy<KeyT>;
-template <class KeyT>
-using default_policy = cuco::default_filter_policy<cuco::xxhash_64<KeyT>, std::uint32_t, 8>;
+class sirius_bloom_policy {
+ public:
+  using hasher             = cuco::xxhash_64<KeyT>;
+  using word_type          = std::uint32_t;
+  using hash_argument_type = typename hasher::argument_type;
+  using hash_result_type   = decltype(std::declval<hasher>()(std::declval<hash_argument_type>()));
 
-template <class KeyT, class Policy>
-using bloom_filter_for = cuco::
-  bloom_filter<KeyT, cuco::extent<std::size_t>, cuda::thread_scope_device, Policy, bloom_alloc>;
+  static constexpr std::uint32_t words_per_block = 8;
+
+ private:
+  static constexpr std::uint32_t word_bits = cuda::std::numeric_limits<word_type>::digits;
+  /// Bits of hash consumed per fingerprint bit (5 for a 32-bit word).
+  static constexpr std::uint32_t bit_index_width = cuda::std::bit_width(word_bits - 1);
+  static constexpr word_type bit_index_mask      = (word_type{1} << bit_index_width) - 1;
+
+  static_assert(words_per_block * bit_index_width <=
+                  cuda::std::numeric_limits<hash_result_type>::digits,
+                "hash is too narrow to supply one fingerprint bit per word");
+
+ public:
+  __device__ constexpr hash_result_type hash(hash_argument_type const& key) const
+  {
+    return hash_(key);
+  }
+
+  /// Lemire fast-range in place of `hash % num_blocks`: one 64x64->high multiply.
+  template <class Extent>
+  [[nodiscard]] __device__ constexpr Extent block_index(hash_result_type hash,
+                                                        Extent num_blocks) const
+  {
+    auto const wide = static_cast<__uint128_t>(static_cast<std::uint64_t>(hash)) *
+                      static_cast<__uint128_t>(static_cast<std::uint64_t>(num_blocks));
+    return static_cast<Extent>(static_cast<std::uint64_t>(wide >> 64));
+  }
+
+  /// One fingerprint bit per word, drawn from a disjoint `bit_index_width`-wide hash field.
+  [[nodiscard]] __device__ constexpr word_type word_pattern(hash_result_type hash,
+                                                            std::uint32_t word_index) const
+  {
+    return word_type{1} << ((hash >> (word_index * bit_index_width)) & bit_index_mask);
+  }
+
+ private:
+  hasher hash_{};
+};
 
 template <class KeyT>
-using arrow_bloom = bloom_filter_for<KeyT, arrow_policy<KeyT>>;
-
-template <class KeyT>
-using standard_bloom = bloom_filter_for<KeyT, default_policy<KeyT>>;
+using sirius_bloom = cuco::bloom_filter<KeyT,
+                                        cuco::extent<std::size_t>,
+                                        cuda::thread_scope_device,
+                                        sirius_bloom_policy<KeyT>,
+                                        bloom_alloc>;
 
 template <class Filter>
 using bloom_owner = std::unique_ptr<Filter>;
 
-// The four legal key-width/policy combinations. A live replica owns exactly one alternative.
-using bloom_storage = std::variant<bloom_owner<arrow_bloom<std::int32_t>>,
-                                   bloom_owner<standard_bloom<std::int32_t>>,
-                                   bloom_owner<arrow_bloom<std::int64_t>>,
-                                   bloom_owner<standard_bloom<std::int64_t>>>;
+// The two legal key widths. A live replica owns exactly one alternative.
+using bloom_storage =
+  std::variant<bloom_owner<sirius_bloom<std::int32_t>>, bloom_owner<sirius_bloom<std::int64_t>>>;
 
 template <class Filter>
 bloom_owner<Filter> make_bloom(std::size_t num_blocks,
@@ -173,12 +250,10 @@ std::unique_ptr<bloom_replica> build_bloom_replica(int device_id,
                                                    rmm::device_async_resource_ref mr,
                                                    cuda::stream_ref stream)
 {
-  if (num_blocks <= arrow_policy<KeyT>::max_filter_blocks) {
-    return std::make_unique<bloom_replica>(
-      device_id, build_bloom<arrow_bloom<KeyT>>(keys, num_blocks, mr, stream));
-  }
+  // One policy for every size: unlike cuco's stock pair there is no cap to fall off, so there is
+  // no size-dependent branch and no second filter type to carry through the replica variant.
   return std::make_unique<bloom_replica>(
-    device_id, build_bloom<standard_bloom<KeyT>>(keys, num_blocks, mr, stream));
+    device_id, build_bloom<sirius_bloom<KeyT>>(keys, num_blocks, mr, stream));
 }
 }  // namespace
 
