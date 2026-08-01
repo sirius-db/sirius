@@ -363,11 +363,17 @@ void sirius_pipeline::notify_downstream_pipelines(bool original_pipeline)
   // If this is the original pipeline, we dont want to schedule tasks for its consumers, that will
   // be done later.
   if (_task_creator && !original_pipeline) {
-    for (auto* consumer : get_output_consumers()) {
-      // If is possible to have a race condition here where one task finished and here it does to
-      // schedule a task right when the last task finished and marks the operator as finalized. That
-      // is ok. This check here is to minimize unnecessary scheduling of task creation.
-      if (!consumer->finalized.load()) { _task_creator->schedule(consumer); }
+    try {
+      for (auto* consumer : get_output_consumers()) {
+        // If is possible to have a race condition here where one task finished and here it does to
+        // schedule a task right when the last task finished and marks the operator as finalized.
+        // That is ok. This check here is to minimize unnecessary scheduling of task creation.
+        if (!consumer->finalized.load()) { _task_creator->schedule(consumer); }
+      }
+    } catch (const std::exception& e) {
+      SIRIUS_LOG_ERROR(
+        "Pipeline {}: failed to schedule downstream consumers: {}", pipeline_id, e.what());
+      _task_creator->report_fatal_error(std::current_exception());
     }
   }
 

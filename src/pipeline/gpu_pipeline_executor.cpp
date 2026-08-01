@@ -456,8 +456,17 @@ void gpu_pipeline_executor::manager_loop()
           // the task destructor only fires once the pipeline drains —
           // mid-pipeline batches need to start rotating before that point so
           // they reach all GPUs.
-          for (auto* consumer : consumers) {
-            if (consumer) { _task_creator->schedule(consumer); }
+          try {
+            for (auto* consumer : consumers) {
+              if (consumer) { _task_creator->schedule(consumer); }
+            }
+          } catch (const std::exception& e) {
+            SIRIUS_LOG_ERROR("GPU Pipeline Executor: failed to schedule downstream consumers: {}",
+                             e.what());
+            if (_completion_handler) {
+              _completion_handler->report_error(std::current_exception());
+            }
+            return;
           }
         }
 
