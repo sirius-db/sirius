@@ -289,7 +289,9 @@ struct parquet_bind_result {
 /// parsed alongside thread_pool.num_threads in sirius_config.cpp's from_yaml, and RAISE IT
 /// before enabling more than a couple of concurrent queries. Nothing else should read this
 /// constant once it moves.
-inline constexpr int k_max_concurrent_queries = 1;
+/// Deprecated compile-time bound, kept only as the default for
+/// scan_manager_config::max_concurrent_queries. Read the config value, not this.
+inline constexpr int k_default_max_concurrent_queries = 1;
 
 /**
  * @brief Manages scan-side preparation for a query.

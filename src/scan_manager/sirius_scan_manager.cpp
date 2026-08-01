@@ -269,13 +269,14 @@ sirius_scan_manager::sirius_scan_manager(
   : _config(config),
     _reservation_manager(reservation_manager),
     _topology_index(std::move(topology_index)),
-    // num_threads + k_max_concurrent_queries, not num_threads + 1: each query's coalescer
+    // num_threads + max_concurrent_queries, not num_threads + 1: each query's coalescer
     // sequencer task BLOCKS (worker_loop -> process_provider_inputs -> queue.wait_dequeue)
     // and is unblocked only by that query's own split_provider tasks, which run on this same
     // pool. With Q concurrent queries, Q threads are parked in sequencers at all times, so
     // sizing for a single sequencer would let Q queries consume the entire working budget
-    // and deadlock by starvation. See k_max_concurrent_queries for the bound and its TODO.
-    _thread_pool(_config.thread_pool.num_threads + k_max_concurrent_queries,
+    // and deadlock by starvation. The bound is now a real config option, so raising concurrency
+    // and resizing the pool are the same knob.
+    _thread_pool(_config.thread_pool.num_threads + config.max_concurrent_queries,
                  _config.thread_pool.thread_name_prefix,
                  _config.thread_pool.cpu_affinity_list),
     _ioctx_registry(config, reservation_manager)
@@ -594,19 +595,20 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
   // locally and never leaves a half-built entry visible to reset() or a concurrent prepare.
   {
     std::lock_guard lk{_query_states_mutex};
-    if (_query_states.size() >= static_cast<std::size_t>(k_max_concurrent_queries)) {
-      // The pool is sized for k_max_concurrent_queries parked sequencers; past that, each
+    if (_query_states.size() >= static_cast<std::size_t>(_config.max_concurrent_queries)) {
+      // The pool is sized for max_concurrent_queries parked sequencers; past that, each
       // extra query eats into the working budget and at pool size it deadlocks outright.
       // Loud rather than silent, so the missing config option reports itself the first time
-      // real concurrency is exercised. See k_max_concurrent_queries.
+      // real concurrency is exercised.
       SIRIUS_LOG_WARN(
         "[sirius_scan_manager::prepare_for_query] registering query {} brings the live query "
         "count to {}, above the {} the scan thread pool is sized for; scan throughput will "
-        "degrade and {} concurrent queries would deadlock. Raise k_max_concurrent_queries.",
+        "degrade and {} concurrent queries would deadlock. Raise "
+        "scan_manager.max_concurrent_queries.",
         query_id,
         _query_states.size() + 1,
-        k_max_concurrent_queries,
-        _thread_pool.num_threads() + k_max_concurrent_queries);
+        _config.max_concurrent_queries,
+        _thread_pool.num_threads() + _config.max_concurrent_queries);
     }
     _query_states.emplace(query_id, state);
   }

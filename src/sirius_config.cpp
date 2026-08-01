@@ -161,6 +161,9 @@ static void from_yaml(const YAML::Node& node, scan_manager::scan_manager_config&
   r.optional("thread_name_prefix", opt.thread_pool.thread_name_prefix);
   r.optional("cpu_affinity", opt.thread_pool.cpu_affinity_list);
   r.optional("use_sirius_datasource", opt.use_sirius_datasource);
+  // Sizes the scan thread pool (num_threads + this). Each concurrent query parks one blocking
+  // coalescer sequencer on that pool, so raising concurrency without raising this deadlocks.
+  r.optional("max_concurrent_queries", opt.max_concurrent_queries, yaml::greater_than<int>{0});
   r.optional("uring_n_reactors", opt.uring_n_reactors, yaml::greater_than<std::size_t>{0});
   r.optional("rest_n_reactors", opt.rest_n_reactors, yaml::greater_than<std::size_t>{0});
   r.optional("enable_prefetch_cache", opt.enable_prefetch_cache);
