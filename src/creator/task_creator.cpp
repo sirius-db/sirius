@@ -33,6 +33,7 @@
 #include <duckdb/parallel/thread_context.hpp>
 
 #include <algorithm>
+#include <cassert>
 #include <limits>
 #include <mutex>
 #include <optional>
@@ -51,15 +52,16 @@ task_creator::task_creator(task_creator_config config,
   : _running(false),
     _config(std::move(config)),
     _task_creation_queue([](const task_creation_request& request) -> exec::index_keys {
-      // The request carries its own keys: they are resolved at schedule() time, where the
-      // node's pipeline (and therefore its query and priority) is unambiguously alive. The
-      // query key is what makes drain(query_index{...}) able to drop one query's pending
-      // requests and leave every other query's in place.
-      return exec::index_keys{
-        request.priority,
-        request.node != nullptr ? request.node->type : op::SiriusPhysicalOperatorType::INVALID,
-        static_cast<exec::query_key>(sirius::value_of(request.query_id)),
-        request.device_id};
+      // The request carries ALL of its own keys, resolved at schedule() time where the node's
+      // pipeline (and therefore its query, priority and type) is unambiguously alive. Nothing
+      // here dereferences `node`: this runs inside the queue mutex on every push, and reading a
+      // freed operator there would corrupt the index of a queue every query shares. The query key
+      // is what makes drain(query_index{...}) able to drop one query's pending requests and leave
+      // every other query's in place.
+      return exec::index_keys{request.priority,
+                              request.operator_type,
+                              static_cast<exec::query_key>(sirius::value_of(request.query_id)),
+                              request.device_id};
     }),
     _mem_res_mgr(mem_res_mgr),
     _topology_index(std::move(topology_index))
@@ -337,8 +339,24 @@ op::sirius_physical_operator* task_creator::get_operator_for_next_task(
   return nullptr;
 }
 
+namespace {
+//! Set for the duration of a creation-worker lambda, so stop() can assert it is not being called
+//! from inside its own pool (see task_creator::stop).
+thread_local bool t_in_creation_worker = false;
+}  // namespace
+
+bool task_creator::is_pool_worker_thread() { return t_in_creation_worker; }
+
 void task_creator::stop()
 {
+  // Calling this from a creation worker is a guaranteed self-deadlock: do_stop_thread_pool()
+  // calls _bounded_pool->wait_all(), which blocks until active_ == 0, but the calling worker IS
+  // an active slot. If it somehow got past, _bounded_pool.reset() would join the calling thread
+  // with itself inside a noexcept function. The rogue call sites that did this are gone; assert
+  // so a new one is caught in a debug build rather than hanging CI.
+  assert(!is_pool_worker_thread() &&
+         "task_creator::stop() must not be called from one of its own pool workers");
+
   // Takes the same mutex as start/stop_thread_pool. Without it, a stop() racing a
   // start_thread_pool() could reassign _bounded_pool and _manager_thread while the other thread
   // was inside do_stop_thread_pool() joining them.
@@ -407,10 +425,11 @@ void task_creator::schedule(op::sirius_physical_operator* node)
   // queue — so refuse rather than enqueue. Previously this was achieved by interrupting the
   // queue, which refused EVERY query's pushes at once.
   if (!accepts_work(query_id)) { return; }
-  auto request      = std::make_unique<task_creation_request>();
-  request->node     = node;
-  request->query_id = query_id;
-  request->priority = priority;
+  auto request           = std::make_unique<task_creation_request>();
+  request->node          = node;
+  request->query_id      = query_id;
+  request->priority      = priority;
+  request->operator_type = node->type;
   _task_creation_queue.push(std::move(request));
 }
 
@@ -422,6 +441,7 @@ void task_creator::schedule(op::sirius_physical_operator* node, sirius::query_id
   request->node            = node;
   request->query_id        = query_id;
   request->priority        = priority;
+  request->operator_type   = node->type;
   _task_creation_queue.push(std::move(request));
 }
 
@@ -441,15 +461,20 @@ void task_creator::schedule_lookahead(std::optional<int> device_id_hint)
   std::shared_ptr<query_task_global_state> state;
   {
     std::lock_guard<std::mutex> lock(_global_state_mutex);
-    if (_query_task_global_states.empty()) { return; }
-    auto it  = _query_task_global_states.begin();
-    query_id = it->first;
-    state    = it->second;
+    // Oldest-first, matching the FIFO scheduling policy — but SKIPPING queries that are no longer
+    // accepting work rather than giving up on the first one. The oldest entry is routinely a
+    // query that has finished and is mid-cleanup but whose state has not been dropped yet:
+    // warming it up would dereference operators of a plan that is already gone, and bailing out
+    // entirely would starve every younger query of lookahead for the whole cleanup window.
+    for (auto& [id, candidate] : _query_task_global_states) {
+      if (candidate && accepts_work(id)) {
+        query_id = id;
+        state    = candidate;
+        break;
+      }
+    }
   }
   if (!state) { return; }
-  // The oldest entry can be a query that has finished and is mid-cleanup but whose state has not
-  // been dropped yet. Warming it up would dereference operators of a plan that is already gone.
-  if (!accepts_work(query_id)) { return; }
 
   std::lock_guard lock(state->lookahead_mutex);
   for (; state->index_of_next_lookahead < state->lookahead_queue.size();
@@ -472,6 +497,7 @@ void task_creator::schedule_lookahead(std::optional<int> device_id_hint)
       request->query_id        = query_id;
       request->priority        = priority;
       request->device_id       = device_id_hint.value_or(exec::no_preferred_device);
+      request->operator_type   = node->type;
       _task_creation_queue.push(std::move(request));
       ++state->index_of_next_lookahead;
       return;
@@ -509,13 +535,33 @@ void task_creator::manager_loop()
       continue;
     }
 
+    // Enter the counted region BEFORE touching `node` again.
+    //
+    // get_operator_for_next_task() dereferences the operator (recursively, via
+    // get_next_task_hint()) on THIS thread. Counting only from just before dispatch left that
+    // dereference outside the window, so drain_pending_tasks(query_id) could observe
+    // in_flight == 0 and return while the manager thread was still walking the query's operators
+    // — a hole in the exact invariant the counter exists to provide, and the caller's next act is
+    // to let the plan be destroyed.
+    //
+    // Released here on every early exit; on the dispatch path ownership passes to the worker's
+    // in_flight_guard, so the count is entered once and left once.
+    query_state->enter_in_flight();
+    bool dispatched = false;
+    struct manager_in_flight_guard {
+      const std::shared_ptr<query_task_global_state>& state;
+      const bool& dispatched;
+      ~manager_in_flight_guard()
+      {
+        if (!dispatched) { state->leave_in_flight(); }
+      }
+    } manager_guard{query_state, dispatched};
+
     node = get_operator_for_next_task(node);
 
     if (node == nullptr) { continue; }
 
-    // Counted before dispatch so drain_pending_tasks(query_id) cannot observe zero in-flight
-    // while this task creation is still queued to run.
-    query_state->enter_in_flight();
+    dispatched = true;
     // Dispatch the task creation work to the pool
     _bounded_pool->dispatch(
       std::move(slot), [this, node, request_kind, query_state = std::move(query_state)]() mutable {
@@ -525,6 +571,11 @@ void task_creator::manager_loop()
           const std::shared_ptr<query_task_global_state>& state;
           ~in_flight_guard() { state->leave_in_flight(); }
         } guard{query_state};
+        // Scoped marker so task_creator::stop() can assert it is never called from here.
+        struct worker_marker {
+          worker_marker() { t_in_creation_worker = true; }
+          ~worker_marker() { t_in_creation_worker = false; }
+        } marker;
         try {
           // Get what we need to create the task
           auto pipeline = node->get_pipeline();

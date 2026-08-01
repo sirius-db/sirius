@@ -82,6 +82,13 @@ struct task_creation_request {
   //! Scheduling priority of `node`'s pipeline; orders the creation queue the same way the
   //! execution queue is ordered (query first, then within-query pipeline rank).
   exec::queue_priority priority = 0;
+  //! `node`'s operator type, captured at schedule() time.
+  //!
+  //! Stored rather than read back off `node` so the queue's key extractor — which runs inside the
+  //! queue mutex on every push — dereferences no operator. A schedule() racing its query's
+  //! teardown would otherwise read a freed operator while holding that mutex, and unlike the
+  //! other keys this one had no reason to be resolved late.
+  op::SiriusPhysicalOperatorType operator_type = op::SiriusPhysicalOperatorType::INVALID;
   //! Preferred GPU, when the caller had a hint. Only a secondary index; does not bind the task.
   int device_id = exec::no_preferred_device;
 };
@@ -222,6 +229,11 @@ class task_creator {
    * True when no registry is bound (the unit-test default), preserving pre-gate behaviour.
    */
   [[nodiscard]] bool accepts_work(sirius::query_id_t query_id) const noexcept;
+
+  /// \brief Whether the calling thread is one of this creator's task-creation pool workers.
+  /// Used only to assert that stop() is never called from inside its own pool, which would
+  /// self-deadlock in wait_all(). See task_creator::stop.
+  [[nodiscard]] static bool is_pool_worker_thread();
 
   /**
    * @brief Stop the worker thread pool.
