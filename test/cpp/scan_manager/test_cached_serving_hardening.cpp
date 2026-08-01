@@ -51,6 +51,7 @@
 #include <cucascade/memory/memory_space.hpp>
 #include <data/data_batch_utils.hpp>
 #include <data/sirius_converter_registry.hpp>
+#include <op/scan/gpu_ingestible.hpp>
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
 #include <scan_manager/load_balancing_scan_batch_coalescer.hpp>
 #include <scan_manager/mvcc_chunk_mask.hpp>
@@ -218,6 +219,76 @@ std::shared_ptr<cucascade::data_batch> make_test_batch(test_env& e, std::size_t 
   auto repr             = std::make_unique<cucascade::gpu_table_representation>(
     cudf::table_view(views), std::move(columns), alloc_size, *e.gpu_space, rmm::cuda_stream_view{});
   return cucascade::data_batch::make(sirius::get_next_batch_id(), std::move(repr));
+}
+
+/// HOST-resident wrapper batch (single INT32 column) — the shape a host-pinned
+/// chunk's per-query slice arrives in, which prepare_for_processing converts
+/// to a fresh owned GPU table.
+std::shared_ptr<cucascade::data_batch> make_host_batch(test_env& e,
+                                                       std::vector<int32_t> const& values)
+{
+  auto shared = make_gpu_column(*e.gpu_space, values);
+  std::vector<std::unique_ptr<cudf::column>> cols;
+  cols.push_back(std::make_unique<cudf::column>(
+    shared->view(), e.stream(), e.gpu_space->get_default_allocator()));
+  cucascade::gpu_table_representation gpu_repr(
+    std::make_unique<cudf::table>(std::move(cols)), *e.gpu_space, e.stream());
+  auto host_repr = sirius::converter_registry::get().convert<cucascade::host_data_representation>(
+    gpu_repr, e.host_space, e.stream());
+  e.stream().synchronize();
+  return cucascade::data_batch::make(sirius::get_next_batch_id(), std::move(host_repr));
+}
+
+/// Minimal concrete gpu_ingestible: materialize_table's resident branch calls
+/// no virtuals, so every override is an unreachable stub.
+struct stub_table_info final : sirius::op::scan::ingestible_table_info {
+  [[nodiscard]] std::span<std::string const> column_names() const override { return {}; }
+  [[nodiscard]] std::span<std::string const> file_paths() const override { return {}; }
+};
+
+struct stub_ingestible final : sirius::op::scan::gpu_ingestible {
+  [[nodiscard]] std::unique_ptr<sirius::op::scan::batch_coalescer> create_batch_coalescer()
+    const override
+  {
+    return nullptr;
+  }
+  [[nodiscard]] bool has_processed_all_metadata() const override { return true; }
+  metadata_scan_task_t next_split_provider(sirius::io::ioctx_resolver /*resolve*/) override
+  {
+    return {};
+  }
+  sirius::op::scan::filtered_table materialize_metadata_to_table(
+    const sirius::op::scan::scan_info& /*info*/,
+    const cucascade::memory::memory_space& /*mem_space*/,
+    rmm::cuda_stream_view /*stream*/) override
+  {
+    throw std::logic_error("stub_ingestible::materialize_metadata_to_table is unreachable");
+  }
+  std::unique_ptr<cudf::table> post_filter_and_project(
+    sirius::op::scan::filtered_table&& /*input*/,
+    const cucascade::memory::memory_space& /*mem_space*/,
+    rmm::cuda_stream_view /*stream*/) override
+  {
+    throw std::logic_error("stub_ingestible::post_filter_and_project is unreachable");
+  }
+  [[nodiscard]] const sirius::op::scan::ingestible_table_info& table_info() const noexcept override
+  {
+    return _info;
+  }
+  [[nodiscard]] std::vector<std::size_t> materialized_column_order() const override { return {}; }
+
+  stub_table_info _info;
+};
+
+/// Copy the single INT32 column of @p table back to host for content checks.
+std::vector<int32_t> to_host(cudf::table_view const& view)
+{
+  std::vector<int32_t> out(static_cast<std::size_t>(view.num_rows()));
+  cudaMemcpy(out.data(),
+             view.column(0).data<int32_t>(),
+             sizeof(int32_t) * out.size(),
+             cudaMemcpyDeviceToHost);
+  return out;
 }
 
 /// All-ones keep-mask over @p rows rows, its words aliasing a plain vector —
@@ -544,5 +615,115 @@ TEST_CASE("validate_pinned_entry_for_serving refuses malformed entries",
     entry.device_chunks[0].columns[0] = nullptr;
     REQUIRE_THROWS_AS(validate_pinned_entry_for_serving(entry, std::vector<std::size_t>{0}),
                       std::runtime_error);
+  }
+}
+
+//===----------------------------------------------------------------------===//
+// prepare_for_processing steal (zero-copy scan materialize)
+//===----------------------------------------------------------------------===//
+
+TEST_CASE("prepare_for_processing steals the converted table from a per-query wrapper batch",
+          "[cached_serving][scan_manager]")
+{
+  auto& e = env();
+  std::vector<int32_t> const values{10, 11, 12, 13};
+  auto batch = make_host_batch(e, values);
+
+  sirius::op::scan::scan_operator_input split{batch};
+  split.prepare_for_processing(e.gpu_space, e.stream());
+
+  // The uploaded table was taken out of the wrapper; the batch is left holding
+  // a valid empty placeholder, and size estimates answer from the stolen table.
+  REQUIRE(split.stolen_table != nullptr);
+  REQUIRE(split.stolen_table_bytes > 0);
+  REQUIRE(split.get_estimated_size_in_bytes() == split.stolen_table_bytes);
+  {
+    auto ro = batch->to_read_only();
+    REQUIRE(ro.get_current_tier() == cucascade::memory::Tier::GPU);
+    REQUIRE(ro.get_data() != nullptr);
+    REQUIRE(ro.get_data()->get_size_in_bytes() == 0);
+  }
+
+  stub_ingestible ingestible;
+  auto result = ingestible.materialize_table(split, e.stream());
+  REQUIRE(result.state == sirius::op::scan::filter_state::UNFILTERED);
+  auto out = result.table.release(e.stream(), e.gpu_space->get_default_allocator());
+  REQUIRE(out != nullptr);
+  e.stream().synchronize();
+  REQUIRE(to_host(out->view()) == values);
+  REQUIRE(split.stolen_table == nullptr);
+  REQUIRE(split.stolen_table_consumed);
+
+  // Re-entry after consumption (scan-internal OOM retry) fails loudly instead
+  // of serving the emptied wrapper as zero rows...
+  REQUIRE_THROWS_AS(ingestible.materialize_table(split, e.stream()), std::runtime_error);
+  // ...and a re-prepare is a no-op: no second conversion, no second steal.
+  split.prepare_for_processing(e.gpu_space, e.stream());
+  REQUIRE(split.stolen_table == nullptr);
+  REQUIRE(split.get_estimated_size_in_bytes() == split.stolen_table_bytes);
+}
+
+TEST_CASE("prepare_for_processing never steals from a GPU-resident (pin-shaped) batch",
+          "[cached_serving][scan_manager]")
+{
+  auto& e = env();
+  // View-backed shared columns already on the GPU tier — the exact shape a raw
+  // GPU pin serves; no conversion happens, so nothing may be stolen.
+  auto batch             = make_test_batch(e, 4);
+  auto const size_before = [&] {
+    auto ro = batch->to_read_only();
+    return ro.get_data()->get_size_in_bytes();
+  }();
+  REQUIRE(size_before > 0);
+
+  sirius::op::scan::scan_operator_input split{batch};
+  split.prepare_for_processing(e.gpu_space, e.stream());
+  REQUIRE(split.stolen_table == nullptr);
+  REQUIRE(split.stolen_table_bytes == 0);
+
+  stub_ingestible ingestible;
+  auto result = ingestible.materialize_table(split, e.stream());
+  REQUIRE(result.state == sirius::op::scan::filter_state::UNFILTERED);
+  auto out = result.table.release(e.stream(), e.gpu_space->get_default_allocator());
+  REQUIRE(out != nullptr);
+  e.stream().synchronize();
+  REQUIRE(to_host(out->view()) == std::vector<int32_t>(4, 7));
+
+  // Pin-shaped storage untouched: same representation, same bytes.
+  auto ro = batch->to_read_only();
+  REQUIRE(ro.get_data() != nullptr);
+  REQUIRE(ro.get_data()->get_size_in_bytes() == size_before);
+}
+
+TEST_CASE("prepare_for_processing skips the steal for masked or row-filtered splits",
+          "[cached_serving][scan_manager]")
+{
+  auto& e = env();
+  std::vector<int32_t> const values{20, 21, 22, 23};
+
+  SECTION("mvcc keep-mask pending")
+  {
+    auto batch = make_host_batch(e, values);
+    sirius::op::scan::scan_operator_input split{batch};
+    split.mvcc_keep_mask = make_test_mask(values.size());
+    split.prepare_for_processing(e.gpu_space, e.stream());
+    REQUIRE(split.stolen_table == nullptr);
+    // Converted in place but not stolen: the masked materialize path filters
+    // by copy from the batch's view.
+    auto ro = batch->to_read_only();
+    REQUIRE(ro.get_current_tier() == cucascade::memory::Tier::GPU);
+    REQUIRE(ro.get_data()->get_size_in_bytes() > 0);
+  }
+
+  SECTION("row filter pending")
+  {
+    auto batch = make_host_batch(e, values);
+    sirius::op::scan::scan_operator_input split{batch};
+    split.row_filter_pending = true;
+    split.prepare_for_processing(e.gpu_space, e.stream());
+    REQUIRE(split.stolen_table == nullptr);
+    auto ro = batch->to_read_only();
+    REQUIRE(ro.get_current_tier() == cucascade::memory::Tier::GPU);
+    REQUIRE(ro.get_data()->get_size_in_bytes() > 0);
   }
 }

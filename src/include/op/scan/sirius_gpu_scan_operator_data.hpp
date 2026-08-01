@@ -146,6 +146,22 @@ class scan_operator_input : public op::operator_data {
   /// copy). Stamped by drain_cached_provider on resident splits; scan_info
   /// splits fold filter costs into their own estimates instead.
   bool row_filter_pending{false};
+  /// Per-query table taken out of the cached wrapper batch right after
+  /// prepare_for_processing's conversion produced it (decompressed or
+  /// uploaded fresh for this split) — never raw GPU pin storage, which is
+  /// served as a plain gpu_table_representation and never converted.
+  /// Consumed at most once by materialize_table, which moves it into the
+  /// scan output instead of deep-copying the batch. Mutable: the operator
+  /// only sees its input as const during execute.
+  mutable std::unique_ptr<cudf::table> stolen_table;
+  /// Size of the stolen table, kept past consumption so OOM-retry size
+  /// estimates stay accurate while the wrapper batch holds only an empty
+  /// placeholder.
+  std::size_t stolen_table_bytes{0};
+  /// Set when materialize_table consumes the stolen table. A re-entry after
+  /// consumption (scan-internal OOM retry) must fail loudly rather than
+  /// serve the emptied wrapper batch as zero rows.
+  mutable bool stolen_table_consumed{false};
 };
 
 }  // namespace sirius::op::scan

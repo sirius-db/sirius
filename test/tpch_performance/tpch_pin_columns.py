@@ -270,7 +270,9 @@ def _pin_call(table: str, cols: list[str], source: str, data_source: str) -> str
     duckdb:  no positional path — the table is named by 'name' and resolved from
              the attached catalog; the source is selected with format='duckdb'.
     """
-    tier = os.environ.get("SIRIUS_PIN_TIER", "gpu")
+    tier = os.environ.get(
+        f"SIRIUS_PIN_TIER_{table.upper()}", os.environ.get("SIRIUS_PIN_TIER", "gpu")
+    )
     col_literals = ",".join(f"'{c}'" for c in cols)
     if data_source == "duckdb":
         return (
