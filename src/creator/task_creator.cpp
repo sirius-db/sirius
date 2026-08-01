@@ -356,9 +356,17 @@ void task_creator::manager_loop()
     auto request_kind = request->type;
     if (node == nullptr) { continue; }
 
+    auto requested_pipeline = node->get_pipeline();
+
     node = get_operator_for_next_task(node);
 
-    if (node == nullptr) { continue; }
+    if (node == nullptr) {
+      // Same re-evaluation the creation path does on exit: get_next_task_hint()
+      // above can have drained ports (hash join's discard sweep), making the
+      // pipeline finishable.
+      if (requested_pipeline) { requested_pipeline->update_pipeline_status(false); }
+      continue;
+    }
 
     // Dispatch the task creation work to the pool
     _bounded_pool->dispatch(std::move(slot), [this, node, request_kind]() mutable {
