@@ -467,16 +467,6 @@ struct parquet_bind_result {
 /// working budget. With Q concurrent queries and a pool of size P, Q >= P is a hard
 /// deadlock: every thread parked in a sequencer, none left to feed them.
 ///
-/// Left at 1 so the pool stays exactly the size it was before per-query state landed
-/// (num_threads + 1, the old single-sequencer allowance) — this makes the concurrency
-/// refactor behaviorally neutral for existing single-query runs.
-///
-/// TODO: promote to a real option on @ref scan_manager_config (scan_manager/config.hpp),
-/// parsed alongside thread_pool.num_threads in sirius_config.cpp's from_yaml, and RAISE IT
-/// before enabling more than a couple of concurrent queries. Nothing else should read this
-/// constant once it moves.
-inline constexpr int k_max_concurrent_queries = 1;
-
 /**
  * @brief Manages scan-side preparation for a query.
  *
