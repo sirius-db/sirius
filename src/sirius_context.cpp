@@ -222,7 +222,26 @@ SiriusContext::SiriusContext() = default;
 
 SiriusContext::~SiriusContext() noexcept
 {
-  if (is_initialized_) { terminate(); }
+  // terminate() can throw — it opens with throw_if_not_initialized() and goes on to reset_all(),
+  // registry.clear() and memory_manager_->shutdown(). Letting that escape a noexcept destructor is
+  // std::terminate, and this runs mid-DB-destruction (~DBConfig fires ~SiriusContext), where a
+  // clean-enough teardown plus a log line is far better than aborting the process.
+  if (is_initialized_) {
+    try {
+      terminate();
+    } catch (const std::exception& e) {
+      try {
+        SIRIUS_LOG_ERROR(
+          "SiriusContext teardown failed (ignored, process is exiting): {}", e.what());
+      } catch (...) {
+      }
+    } catch (...) {
+      try {
+        SIRIUS_LOG_ERROR("SiriusContext teardown failed (ignored, process is exiting)");
+      } catch (...) {
+      }
+    }
+  }
   // Idempotent backstop for the failed-initialize path (provider registered,
   // is_initialized_ never set): the provider captures scan_manager_ and must
   // not outlive this context.
@@ -537,6 +556,25 @@ void SiriusContext::drop_query_runtime_state_best_effort(sirius::query_id_t quer
   // split providers until terminate().
   try {
     if (scan_manager_) { scan_manager_->reset(query_id); }
+  } catch (...) {
+  }
+  // Drop this query's repositories. run_mandatory_cleanup does this on the normal path, but this
+  // function runs precisely when that threw part-way — and once the runtime is latched
+  // unavailable no later window will ever run it. Without this the failed query's manager, and
+  // every batch still in it, survived until terminate(): its GPU/host memory was never returned,
+  // and the downgrade executors kept sweeping it on every monitor cycle for the life of the
+  // process. Guarded like every other step here so one failure cannot stop the others.
+  try {
+    auto leaked = data_repository_registry_.erase(query_id);
+    for (auto const& info : leaked) {
+      SIRIUS_LOG_WARN(
+        "drop_query_runtime_state_best_effort: query {} operator {} port '{}' still had {} "
+        "un-consumed data batch(es) (memory leak).",
+        query_id,
+        info.operator_id,
+        info.port_id,
+        info.count);
+    }
   } catch (...) {
   }
   // The window is over either way; drop the gate entry so it does not accumulate.
@@ -954,22 +992,32 @@ void SiriusContext::terminate()
 {
   throw_if_not_initialized();
 
+  // Stop every producer and every borrower BEFORE destroying the task_scheduler.
+  //
+  // task_scheduler_.reset() used to run second, while the downgrade executors and the creator pool
+  // were still live. Each downgrade executor holds _pipeline_task_queue — a raw pointer into
+  // task_scheduler::_task_queue — and dereferences it in processing_loop; creation lambdas hold
+  // _task_scheduler and call schedule() on it. A monitor request or an in-flight creation landing
+  // in that window dereferenced a freed queue at DB teardown.
   task_scheduler_->stop();
-  task_scheduler_.reset();
-  // The pipeline executors (the provider's only mid-query callers) are gone;
-  // drop the pinned-bytes provider before the scan manager it captures is
-  // torn down below. Idempotent.
+  // The pipeline executors (the provider's only mid-query callers) are
+  // stopped; drop the pinned-bytes provider before the scan manager it
+  // captures is torn down below. Idempotent.
   sirius::memory::unregister_unevictable_bytes_provider(this);
   if (scan_manager_) { scan_manager_->stop(); }
   task_creator_->stop_thread_pool();
+  for (auto& executor : downgrade_executors_) {
+    executor->stop();
+  }
+  // Only now is nothing left holding a pointer into the scheduler.
+  task_scheduler_.reset();
   // Drop any per-query state a window failed to clean up (e.g. a latched-unavailable path whose
   // best-effort reset threw). Doing it here, rather than letting ~task_creator do it, keeps the
   // DuckTableScanState/BlockHandle releases inside the window where DuckDB is still intact.
   task_creator_->reset_all();
   task_creator_.reset();
-  for (auto& executor : downgrade_executors_) {
-    executor->stop();
-  }
+  // Already stopped above, before task_scheduler_ was destroyed; stop() is idempotent, so this is
+  // only here to keep the destruction of the executors themselves adjacent to their clear().
   downgrade_executors_.clear();
   sirius::telemetry::batch_telemetry_registry::instance().uninstall();
   telemetry_context_.reset();

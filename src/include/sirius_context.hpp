@@ -695,6 +695,18 @@ class SiriusContext : public ClientContextState {
   /// below it cannot be outrun by a completion callback, and closed once they finish. Declared
   /// before the subsystems that hold a pointer to it so it is destroyed after them.
   sirius::exec::query_lifecycle_registry query_lifecycle_;
+  // Declaration order is destruction order reversed, and it is load-bearing here.
+  //
+  // task_scheduler is declared LAST so it is destroyed FIRST is wrong — it must be destroyed
+  // *after* everything that holds a pointer into it. Each downgrade_executor holds a raw pointer
+  // to task_scheduler::_task_queue, the task_creator's lambdas hold task_scheduler*, and
+  // ~task_scheduler joins a management thread that calls into task_creator. terminate() stops all
+  // of them in the right order explicitly; this ordering is the backstop for the path where
+  // terminate() never runs — initialize() throwing after task_scheduler_ is constructed leaves
+  // is_initialized_ false, so ~SiriusContext skips terminate() entirely and only these
+  // declarations decide the order.
+  //
+  // Destroyed: scan_manager_ -> task_creator_ -> downgrade_executors_ -> task_scheduler_.
   std::unique_ptr<sirius::pipeline::task_scheduler> task_scheduler_;
   std::vector<std::unique_ptr<sirius::parallel::downgrade_executor>> downgrade_executors_;
   std::unique_ptr<sirius::creator::task_creator> task_creator_;

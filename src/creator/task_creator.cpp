@@ -433,7 +433,7 @@ void task_creator::schedule(op::sirius_physical_operator* node)
   request->query_id      = query_id;
   request->priority      = priority;
   request->operator_type = node->type;
-  _task_creation_queue.push(std::move(request));
+  report_if_dropped(_task_creation_queue.push(std::move(request)), query_id);
 }
 
 void task_creator::schedule(op::sirius_physical_operator* node, sirius::query_id_t query_id)
@@ -445,7 +445,28 @@ void task_creator::schedule(op::sirius_physical_operator* node, sirius::query_id
   request->query_id        = query_id;
   request->priority        = priority;
   request->operator_type   = node->type;
-  _task_creation_queue.push(std::move(request));
+  report_if_dropped(_task_creation_queue.push(std::move(request)), query_id);
+}
+
+void task_creator::report_if_dropped(bool pushed, sirius::query_id_t query_id) const
+{
+  if (pushed) { return; }
+  // multi_index_priority_queue::push returns false for exactly one reason: the queue is
+  // interrupted, i.e. shutting down. For a query the gate still reports as accepting work that is
+  // a genuine loss -- the request is destroyed, its pipeline never gets its task, and the query
+  // waits on a completion that can never arrive. Silence here is what turned every dropped-work
+  // bug in this subsystem into an unexplained hang.
+  //
+  // For a quiescing/closed query the drop is the documented teardown contract, not a bug.
+  if (accepts_work(query_id)) {
+    SIRIUS_LOG_ERROR(
+      "task_creator: creation request for query {} was DROPPED by an interrupted queue while the "
+      "query was still accepting work; that query will not receive the task it was waiting for",
+      query_id);
+  } else {
+    SIRIUS_LOG_DEBUG("task_creator: dropped a creation request for tearing-down query {}",
+                     query_id);
+  }
 }
 
 bool task_creator::accepts_work(sirius::query_id_t query_id) const noexcept
@@ -520,7 +541,7 @@ void task_creator::schedule_lookahead(std::optional<int> device_id_hint)
       request->priority        = priority;
       request->device_id       = device_id_hint.value_or(exec::no_preferred_device);
       request->operator_type   = node->type;
-      _task_creation_queue.push(std::move(request));
+      report_if_dropped(_task_creation_queue.push(std::move(request)), query_id);
       ++state->index_of_next_lookahead;
       return;
     }

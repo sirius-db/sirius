@@ -252,6 +252,10 @@ class task_creator {
    */
   [[nodiscard]] bool accepts_work(sirius::query_id_t query_id) const noexcept;
 
+  /// \brief Log loudly when a push was refused for a query that is still accepting work.
+  /// A refused push destroys the request, so a live query silently loses a task it is waiting on.
+  void report_if_dropped(bool pushed, sirius::query_id_t query_id) const;
+
   /// \brief Whether the calling thread is one of this creator's task-creation pool workers.
   /// Used only to assert that stop() is never called from inside its own pool, which would
   /// self-deadlock in wait_all(). See task_creator::stop.
