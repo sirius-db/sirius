@@ -1333,8 +1333,6 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
         pin_comp.max_compressed_fraction = comp_cfg.max_compressed_fraction;
         pin_comp.column_names            = cache_info.column_names();
         pin_comp.column_threads          = comp_cfg.column_threads;
-        // Mirror into the decompress converters (no per-context config there).
-        sirius::set_decompress_column_threads(comp_cfg.column_threads);
         SIRIUS_LOG_INFO("[pin_table] '{}' tier={}: compressing with plan for {} column(s)",
                         data.args.name,
                         data.args.tier,
@@ -1662,7 +1660,7 @@ static void ApplyExpressionEvaluatorStrategy(const std::string& value)
   sirius::expression_evaluator_strategy parsed;
   if (!sirius::string_to_strategy(value, parsed)) {
     throw InvalidInputException(
-      "Invalid expression_evaluator_strategy '%s'. Valid values: materialize, ast_interpret, "
+      "Invalid expression_evaluator_strategy '{}'. Valid values: materialize, ast_interpret, "
       "ast_jit",
       value);
   }
@@ -1822,7 +1820,7 @@ static void SetMaxSortPartitionMemoryFraction(ClientContext& context,
   const double fraction = parameter.GetValue<double>();
   if (fraction < 0.0 || fraction > 1.0) {
     throw InvalidInputException(
-      "max_sort_partition_memory_fraction must be between 0.0 and 1.0, got %f", fraction);
+      "max_sort_partition_memory_fraction must be between 0.0 and 1.0, got {}", fraction);
   }
   params->max_sort_partition_memory_fraction = fraction;
   SIRIUS_LOG_DEBUG("Updated config MAX_SORT_PARTITION_MEMORY_FRACTION to {}",
@@ -1927,7 +1925,7 @@ static void SetMarkJoinBuildSwitchRatio(ClientContext& context, SetScope scope, 
   auto slot          = lock_operator_params_slot(context);
   const double ratio = parameter.GetValue<double>();
   if (ratio < 0.0) {
-    throw InvalidInputException("mark_join_build_switch_ratio must be >= 0.0, got %f", ratio);
+    throw InvalidInputException("mark_join_build_switch_ratio must be >= 0.0, got {}", ratio);
   }
   params->mark_join_build_switch_ratio = ratio;
   SIRIUS_LOG_DEBUG("Updated config MARK_JOIN_BUILD_SWITCH_RATIO to {}",
@@ -1986,7 +1984,6 @@ static void SetCompressionColumnThreads(ClientContext& context, SetScope scope, 
   if (!sirius_ctx) { return; }
   const auto n = static_cast<int>(BigIntValue::Get(parameter));
   sirius_ctx->get_config().get_compression_config().column_threads = n;
-  sirius::set_decompress_column_threads(n);
   SIRIUS_LOG_DEBUG("Updated compression_column_threads to {}", n);
 }
 
@@ -2408,13 +2405,15 @@ static void LoadInternal(ExtensionLoader& loader)
   // "S3 CPU fallback is not supported" error; local reads fall back to CPU).
   db.GetFileSystem().RegisterSubSystem(make_uniq<sirius::io::s3::sirius_httpfs>());
 
-  // Register optimizer extension for transparent GPU execution. Only the
-  // post-hook remains (plan capture); the optimizer mask a pre-hook used to
-  // write per query is published once at load (see
-  // publish_transparent_optimizer_mask above), and DuckDB skips a null
-  // pre_optimize_function.
+  // Register optimizer extension for transparent GPU execution. The post-hook
+  // captures the optimized plan; the pre-hook derives the single-table
+  // restrictions implied by OR-ed multi-table filters so DuckDB's own pushdown,
+  // join-order and build/probe-side passes can act on them. (The optimizer mask
+  // an earlier pre-hook used to write per query is published once at load — see
+  // publish_transparent_optimizer_mask above.)
   OptimizerExtension opt_ext;
-  opt_ext.optimize_function = sirius::transparent::sirius_optimizer_hook;
+  opt_ext.pre_optimize_function = sirius::transparent::sirius_pre_optimizer_hook;
+  opt_ext.optimize_function     = sirius::transparent::sirius_optimizer_hook;
   OptimizerExtension::Register(config, std::move(opt_ext));
 
   // Register SiriusContext on connections that were opened before the extension
