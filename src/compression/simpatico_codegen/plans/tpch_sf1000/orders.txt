@@ -16,10 +16,9 @@ input -> dictionary -> keys_offsets, keys_chars, indices
 dictionary.indices -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
 
 ---
-# column: o_totalprice  dtype: t26  ratio: 1.840x  depth: 1
-# comp: 352.19 GB/s  decomp: 578.88 GB/s
-input -> ans
-
+# column: o_totalprice  dtype: t26  ratio: 2.452x  depth: 1
+# comp: 83.95 GB/s  decomp: 208.15 GB/s
+input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
 ---
 # column: o_orderdate  dtype: t12  ratio: 2.651x  depth: 1
 # comp: 755.61 GB/s  decomp: 1668.67 GB/s

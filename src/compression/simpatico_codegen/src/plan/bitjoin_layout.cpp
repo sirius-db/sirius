@@ -170,12 +170,13 @@ std::unique_ptr<cudf::column> copy_column_view_impl(cudf::column_view const& vie
     cudf::size_type const n = view.size();
     auto col = cudf::make_fixed_width_column(dt, n, cudf::mask_state::UNALLOCATED, stream, mr);
     if (n > 0) {
-      size_t bytes = static_cast<size_t>(n) * static_cast<size_t>(cudf::size_of(dt));
-      cudaMemcpyAsync(col->mutable_view().head<void>(),
-                      view.head<void>(),
-                      bytes,
-                      cudaMemcpyDeviceToDevice,
-                      stream.value());
+      size_t const elem_bytes = static_cast<size_t>(cudf::size_of(dt));
+      size_t const bytes      = static_cast<size_t>(n) * elem_bytes;
+      // data<T>() = head<T>() + offset; compute for void* manually.
+      const void* src = static_cast<const uint8_t*>(view.head<void>()) +
+                        static_cast<size_t>(view.offset()) * elem_bytes;
+      cudaMemcpyAsync(
+        col->mutable_view().head<void>(), src, bytes, cudaMemcpyDeviceToDevice, stream.value());
       cudaStreamSynchronize(stream.value());
     }
     return col;
@@ -230,11 +231,11 @@ std::unique_ptr<cudf::column> copy_column_view_as_uint8(cudf::column_view const&
                                            stream,
                                            mr);
   if (total_bytes > 0) {
-    cudaMemcpyAsync(col->mutable_view().head<void>(),
-                    data_view.head<void>(),
-                    total_bytes,
-                    cudaMemcpyDeviceToDevice,
-                    stream.value());
+    // data<T>() = head<T>() + offset; compute for void* manually.
+    const void* src = static_cast<const uint8_t*>(data_view.head<void>()) +
+                      static_cast<size_t>(data_view.offset()) * elem_size;
+    cudaMemcpyAsync(
+      col->mutable_view().head<void>(), src, total_bytes, cudaMemcpyDeviceToDevice, stream.value());
     cudaStreamSynchronize(stream.value());
   }
   return col;

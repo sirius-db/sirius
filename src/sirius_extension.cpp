@@ -1333,8 +1333,6 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
         pin_comp.max_compressed_fraction = comp_cfg.max_compressed_fraction;
         pin_comp.column_names            = cache_info.column_names();
         pin_comp.column_threads          = comp_cfg.column_threads;
-        // Mirror into the decompress converters (no per-context config there).
-        sirius::set_decompress_column_threads(comp_cfg.column_threads);
         SIRIUS_LOG_INFO("[pin_table] '{}' tier={}: compressing with plan for {} column(s)",
                         data.args.name,
                         data.args.tier,
@@ -1986,7 +1984,6 @@ static void SetCompressionColumnThreads(ClientContext& context, SetScope scope, 
   if (!sirius_ctx) { return; }
   const auto n = static_cast<int>(BigIntValue::Get(parameter));
   sirius_ctx->get_config().get_compression_config().column_threads = n;
-  sirius::set_decompress_column_threads(n);
   SIRIUS_LOG_DEBUG("Updated compression_column_threads to {}", n);
 }
 

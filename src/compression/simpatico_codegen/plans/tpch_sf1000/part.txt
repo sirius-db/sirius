@@ -43,10 +43,9 @@ input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
 input -> dictionary -> keys_offsets, keys_chars, indices
 
 ---
-# column: p_retailprice  dtype: t26  ratio: 2.260x  depth: 1
-# comp: 400.19 GB/s  decomp: 586.29 GB/s
-input -> ans
-
+# column: p_retailprice  dtype: t26  ratio: 3.742x  depth: 1
+# comp: 129.13 GB/s  decomp: 289.35 GB/s
+input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
 ---
 # column: p_comment  dtype: str  ratio: 2.030x  depth: 5
 # comp: 22.21 GB/s  decomp: 274.11 GB/s

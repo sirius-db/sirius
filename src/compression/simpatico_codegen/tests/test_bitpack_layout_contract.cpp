@@ -139,12 +139,16 @@ void test_compact_persistence_and_decode()
     expected_words += (live_bits + 31) / 32;
   }
   expect(expected_words == 361, "fixture no longer exercises the intended compact sizes");
-  expect(packed_desc.num_rows == expected_words, "persisted packed column is not compact");
-  expect(packed_desc.size_bytes == expected_words * sizeof(std::uint32_t),
-         "persisted packed byte size includes OverAllocate stride or decode slack");
+  // Guard words are baked into the stored payload (compact_bitpack_packed appends
+  // kGuardWords=3 zero-initialised words so simpatico_bitunpack_one's unconditional
+  // 3-word gather never faults). They travel as part of num_rows/size_bytes.
+  constexpr std::uint64_t kGuardWords = 3;
+  expect(packed_desc.num_rows == expected_words + kGuardWords,
+         "persisted packed column is not compact");
+  expect(packed_desc.size_bytes == (expected_words + kGuardWords) * sizeof(std::uint32_t),
+         "persisted packed byte size includes OverAllocate stride or unexpected slack");
 
-  // Header serialization must expose only the logical Compact bytes. The
-  // private two-word decode over-read slack stays allocation-only.
+  // Header serialization exposes the logical Compact bytes (including guard words).
   std::vector<std::uint8_t> header;
   std::vector<simpatico::payload_buffer_ref> payload_refs;
   std::uint64_t payload_bytes = 0;
@@ -158,8 +162,9 @@ void test_compact_persistence_and_decode()
   expect(packed_ref != payload_refs.end(), "serialized payload omitted packed buffer");
   expect(packed_ref->size_bytes == packed_desc.size_bytes,
          "serialized packed payload is not logically compact");
-  expect(packed_ref->alloc_bytes >= packed_ref->size_bytes + 2 * sizeof(std::uint32_t),
-         "reconstructed packed allocation lacks decode gather slack");
+  // Guard words are inside size_bytes; no extra allocation slack is needed.
+  expect(packed_ref->alloc_bytes >= packed_ref->size_bytes,
+         "reconstructed packed allocation is smaller than logical size");
   expect(payload_bytes == std::accumulate(payload_refs.begin(),
                                           payload_refs.end(),
                                           std::uint64_t{0},
