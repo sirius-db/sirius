@@ -281,7 +281,23 @@ The `sirius.executor.scan_manager` block configures the scan-metadata thread poo
 | `rest_n_reactors` | int (**> 0**) | 2 | Number of REST reactor threads for object-store (`s3://`) reads. |
 | `enable_prefetch_cache` | bool | false | Attach the pinned-memory prefetching cache in front of the backend. |
 
-Four optional nested sub-configs tune the individual backends and caches:
+Five optional nested sub-configs tune the individual backends, caches, and the memory prefetcher:
+
+### `scan_manager.memory_prefetcher` — background host→GPU upload of pinned-cache scan splits (`scan_manager/config.hpp`)
+
+Overlaps the host→GPU upload of queued pinned-cache scan splits with compute:
+worker threads walk the pending splits in scan execution order and convert
+resident batches to GPU tier ahead of task creation, gated on GPU memory
+headroom (see `scan_manager/memory_prefetcher.hpp`). Disabled by default;
+single-GPU configurations only (logs a warning and disables itself otherwise).
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enable` | bool | false | Master switch for the prefetcher. |
+| `num_threads` | int (**> 0**) | 2 | Prefetch worker threads; each drives one in-flight batch conversion on its own stream. |
+| `min_free_fraction` | double [0,1] | 0.4 | Keep at least this fraction of the GPU space free after each prefetch; conversions (and their reservations) are only attempted above this floor. |
+| `poll_interval_ms` | int (**> 0**) | 2 | Worker sweep interval while waiting for headroom / new splits. |
+| `drain_quiet_ms` | int (ms) | 100 | A connector counts as actively draining (and is skipped) until this long passes since its last pop. Must exceed the scan's inter-pop interval. |
 
 ### `scan_manager.local` — io_uring backend (`io/uring/config.hpp`)
 
