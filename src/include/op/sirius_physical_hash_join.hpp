@@ -108,9 +108,9 @@ struct build_probe_decision {
 /// consistent), so they are clamped to one partition on a single GPU and forced to broadcast on
 /// multi-GPU.
 ///
-/// BUILD_PROBE eligibility requires: at most one partition per GPU, the per-GPU hash table fits
-/// within `max_build_hash_table_bytes` (a broadcast join charges the FULL build to every GPU; a
-/// hash-partitioned build charges the per-partition average), the build folds to one batch, and the
+/// BUILD_PROBE eligibility requires: the build folds to one hash table per GPU within
+/// `max_build_hash_table_bytes` (a broadcast join charges the FULL build to every GPU; a
+/// hash-partitioned build charges the per-GPU average), the build folds to one batch, and the
 /// join is not right-family, mixed, or full-outer (those over-emit build rows on the streamed
 /// path). `join_mode` distinguishes MIXED_JOIN; `join_type` supplies the rest.
 ///
