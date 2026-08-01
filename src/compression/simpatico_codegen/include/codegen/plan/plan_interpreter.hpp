@@ -82,10 +82,24 @@ std::unique_ptr<compressed_representation> compress_single_op(std::string const&
 /// single reverse walk: each codegen-fused subtree root is inverted by one
 /// high-level ``decode_fused_subtree`` call and every other step by its rep's
 /// own decompress(). Runs entirely on ``stream``.
+/// @param pred  Optional set-membership directive. When non-null and active the
+///              result is a BOOL8 column of the same row count carrying
+///              `value ∈ pred->equals_any` instead of the reconstructed column
+///              (see @c decode_predicate). A dictionary-rooted tree resolves it
+///              against the key set and never gathers the chars; every other
+///              shape decodes normally and compares afterwards, which is correct
+///              but no cheaper — gate on @c plan_supports_predicate_decode.
 std::unique_ptr<cudf::column> decompress_column(PlanTree const& tree,
                                                 rmm::cuda_stream_view stream,
                                                 rmm::device_async_resource_ref mr,
-                                                std::string* error_out);
+                                                std::string* error_out,
+                                                decode_predicate const* pred = nullptr);
+
+/// True iff @p tree decodes a predicate without materialising the column — i.e.
+/// its root value is produced by a `dictionary` node, so the predicate resolves
+/// against the keys. Callers use this to decide whether pushing a predicate down
+/// is worth anything; pushing it into any other plan is correct but pointless.
+bool plan_supports_predicate_decode(PlanTree const& tree);
 
 /// Reconstruct a compressed_representation from named output columns. A thin
 /// dispatcher mapping the compressor name (or the ``bitextract_<spec>`` prefix)

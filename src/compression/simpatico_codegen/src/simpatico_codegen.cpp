@@ -268,21 +268,36 @@ std::unique_ptr<cudf::table> decompress_columns_parallel(compressed_table const&
   return std::make_unique<cudf::table>(std::move(cols));
 }
 
-std::unique_ptr<cudf::table> decompress_columns_parallel(compressed_table const& table,
-                                                         std::span<const std::size_t> selected,
-                                                         stream_pool& pool,
-                                                         rmm::device_async_resource_ref mr)
+std::unique_ptr<cudf::table> decompress_columns_parallel(
+  compressed_table const& table,
+  std::span<const std::size_t> selected,
+  std::span<const decode_predicate> predicates,
+  stream_pool& pool,
+  rmm::device_async_resource_ref mr)
 {
   std::vector<std::unique_ptr<cudf::column>> cols(selected.size());
   run_column_workers(selected.size(), pool, [&](size_t i, rmm::cuda_stream_view stream) {
     auto const idx = selected[i];
     if (idx >= table.columns.size()) throw plan_error("selected column index out of range");
+    decode_predicate const* pred =
+      (i < predicates.size() && predicates[i].active()) ? &predicates[i] : nullptr;
     std::string err;
-    auto col = decompress_column(*table.columns[idx].plan_tree, stream, mr, &err);
+    auto col = decompress_column(*table.columns[idx].plan_tree, stream, mr, &err, pred);
     if (!col) throw plan_error(err.empty() ? "decompress failed" : err);
-    cols[i] = apply_stored_dtype(std::move(col), table.columns[idx].dtype);
+    // A predicate result is BOOL8 by contract; re-tagging it with the column's
+    // stored dtype would be a lie (and, for a same-width stored type, a silent
+    // one), so the type restore only applies to a reconstructed column.
+    cols[i] = pred ? std::move(col) : apply_stored_dtype(std::move(col), table.columns[idx].dtype);
   });
   return std::make_unique<cudf::table>(std::move(cols));
+}
+
+std::unique_ptr<cudf::table> decompress_columns_parallel(compressed_table const& table,
+                                                         std::span<const std::size_t> selected,
+                                                         stream_pool& pool,
+                                                         rmm::device_async_resource_ref mr)
+{
+  return decompress_columns_parallel(table, selected, {}, pool, mr);
 }
 
 }  // namespace
@@ -448,6 +463,26 @@ std::unique_ptr<cudf::table> decompress(const compressed_table& table,
 {
   nvtx3::scoped_range nvtx_range{"simpatico::decompress_table[selected,pool]"};
   return decompress_columns_parallel(table, selected_columns, pool, mr);
+}
+
+std::unique_ptr<cudf::table> decompress(const compressed_table& table,
+                                        std::span<const std::size_t> selected_columns,
+                                        std::span<const decode_predicate> predicates,
+                                        simpatico::stream_pool& pool,
+                                        rmm::device_async_resource_ref mr)
+{
+  nvtx3::scoped_range nvtx_range{"simpatico::decompress_table[selected,predicated,pool]"};
+  if (predicates.size() != selected_columns.size()) {
+    throw plan_error("decompress: predicates and selected_columns must be the same length");
+  }
+  return decompress_columns_parallel(table, selected_columns, predicates, pool, mr);
+}
+
+bool column_supports_predicate_decode(const compressed_table& table, std::size_t column_index)
+{
+  if (column_index >= table.columns.size()) { return false; }
+  auto const& tree = table.columns[column_index].plan_tree;
+  return tree && plan_supports_predicate_decode(*tree);
 }
 
 }  // namespace simpatico

@@ -236,13 +236,18 @@ struct cached_scan_plan {
 /// set, the parquet-pin case — serves the chunk unmasked). Declared here so
 /// the chunk↔mask pairing is unit-testable; the provider type itself stays
 /// internal to the scan manager.
+/// @p equality_pushdown is parallel to @p selected_columns and lets a GPU-tier
+/// compressed chunk answer an equality/IN filter *during* decompression — the
+/// column arrives as a BOOL8 mask instead of being reconstructed. See
+/// @c sirius::decode_equality_pushdown. Empty (the default) disables it.
 std::unique_ptr<databatch_provider> make_provider_for_pinned_entry(
   pinned_entry const& entry,
   std::span<std::size_t const> selected_columns,
   cached_scan_plan plan,
   const telemetry::batch_telemetry_info& telemetry_info,
-  mvcc_chunk_mask_set mvcc_masks               = {},
-  std::vector<insert_delta_split> delta_splits = {});
+  mvcc_chunk_mask_set mvcc_masks                     = {},
+  std::vector<insert_delta_split> delta_splits       = {},
+  sirius::decode_equality_pushdown equality_pushdown = {});
 
 /**
  * @brief Build the survivor plan for serving @p entry to a scan into @p requiested_column_ids with

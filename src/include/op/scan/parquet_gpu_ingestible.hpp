@@ -301,7 +301,21 @@ class parquet_gpu_ingestible : public gpu_ingestible {
     return _duckdb_filter_expression != nullptr;
   }
 
+  [[nodiscard]] std::unordered_map<std::size_t, std::vector<std::string>>
+  decode_predicate_candidates() const override
+  {
+    return _decode_predicate_candidates;
+  }
+
  private:
+  /// The filter form matching @p batch when one or more candidate columns
+  /// arrived as a decode-time BOOL8 mask: those contribute a bare boolean
+  /// reference instead of a comparison. Returns null when nothing was
+  /// substituted, meaning the caller should use @c _duckdb_filter_expression.
+  /// Never called without @c _duckdb_filter_expression.
+  [[nodiscard]] duckdb::unique_ptr<duckdb::Expression> build_filter_expression_for(
+    cudf::table_view const& batch) const;
+
   /// Read one file's footer, prune its row groups against the filter, and record
   /// per-row-group byte accounting. Returns a single @c parquet_file_scan_info.
   /// Runs on a scan-manager dispatcher thread (the task returned by
@@ -321,6 +335,20 @@ class parquet_gpu_ingestible : public gpu_ingestible {
   // Coalesced DuckDB filter expression. Empty when no filters survived the
   // partition-column drop pass.
   std::shared_ptr<duckdb::Expression> _duckdb_filter_expression;
+
+  // Pure-filter string columns this scan is willing to receive as a decode-time
+  // BOOL8 mask instead of values, as (batch D-space position, primary index)
+  // pairs. Empty when none qualify.
+  //
+  // Only the position list is precomputed: whether a column *was* substituted is
+  // a per-batch, per-column fact (a pinned compressed chunk supplies masks only
+  // for plans that can produce them; the same scan's disk splits supply raw
+  // strings), so build_filter_expression_for reads it off each batch's column
+  // types.
+  std::vector<std::pair<std::size_t, std::size_t>> _pushdown_primary_by_batch_position;
+  // What decode_predicate_candidates() advertises: primary index → constant set.
+  std::unordered_map<std::size_t, std::vector<std::string>> _decode_predicate_candidates;
+
   std::vector<std::string> _file_paths;
 
   // Per-file metadata-scan cursor. next_split_provider hands out one file index

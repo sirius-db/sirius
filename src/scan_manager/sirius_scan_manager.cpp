@@ -16,6 +16,7 @@
 
 #include "scan_manager/sirius_scan_manager.hpp"
 
+#include "compression/device_compressed_blob.hpp"
 #include "data/data_batch_utils.hpp"
 #include "exec/thread_pool.hpp"
 #include "io/cache/prefetching_cache.hpp"
@@ -48,6 +49,7 @@
 
 #include <rmm/cuda_device.hpp>
 
+#include <api/simpatico_codegen.hpp>
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
@@ -76,12 +78,14 @@ struct cached_databatch_provider : public databatch_provider {
                             cached_scan_plan plan,
                             const telemetry::batch_telemetry_info& telemetry_info,
                             mvcc_chunk_mask_set mvcc_masks,
-                            std::vector<insert_delta_split> delta_splits)
+                            std::vector<insert_delta_split> delta_splits,
+                            sirius::decode_equality_pushdown equality_pushdown)
     : _plan(std::move(plan)),
       _entry(entry),
       _telemetry_info(telemetry_info),
       _mvcc_masks(std::move(mvcc_masks)),
-      _delta_splits(std::move(delta_splits))
+      _delta_splits(std::move(delta_splits)),
+      _equality_pushdown(std::move(equality_pushdown))
   {
     auto const& entry_column_names = _entry.cache_info.column_names();
     std::ranges::for_each(selected_columns, [this, &entry_column_names](size_t idx) {
@@ -149,6 +153,24 @@ struct cached_databatch_provider : public databatch_provider {
         // Hand out the projected compressed chunk; decompressed on demand by
         // scan_operator_input::prepare_for_processing.
         auto projected = chunk.compressed->select_columns(_column_indices);
+        // Attach the scan's equality pushdown to this projection only — never to
+        // the shared pinned chunk, which other queries filter differently.
+        // Restricted to columns whose plan can answer a predicate off its
+        // compressed form (a dictionary root); pushing into any other plan is
+        // correct but only moves the comparison, so leave those alone and keep
+        // this a strict no-op for them.
+        if (!_equality_pushdown.empty()) {
+          auto const& ct = chunk.compressed->table();
+          sirius::decode_equality_pushdown chunk_pushdown(_column_indices.size());
+          bool any = false;
+          for (std::size_t i = 0; i < _column_indices.size(); ++i) {
+            if (i >= _equality_pushdown.size() || _equality_pushdown[i].empty()) { continue; }
+            if (!simpatico::column_supports_predicate_decode(ct, _column_indices[i])) { continue; }
+            chunk_pushdown[i] = _equality_pushdown[i];
+            any               = true;
+          }
+          if (any) { projected->set_equality_pushdown(std::move(chunk_pushdown)); }
+        }
         return cucascade::data_batch::make(get_next_batch_id(), std::move(projected));
       }
       // Uncompressed chunk: project the requested columns (positions into the
@@ -198,6 +220,11 @@ struct cached_databatch_provider : public databatch_provider {
   cached_scan_plan _plan;
   std::vector<std::string> _column_names;
   std::vector<size_t> _column_indices;
+  /// Parallel to @c _column_indices; empty entries decompress normally. Only the
+  /// GPU-tier compressed path consumes it (the host path would have to parse the
+  /// chunk header to know whether the plan can exploit it, and that tier is not
+  /// where the decode gather costs anything).
+  sirius::decode_equality_pushdown _equality_pushdown;
   const pinned_entry& _entry;
   telemetry::batch_telemetry_info _telemetry_info;
   /// This provider's own copy of the entry's per-chunk keep-masks (empty for
@@ -208,6 +235,31 @@ struct cached_databatch_provider : public databatch_provider {
   std::vector<insert_delta_split> _delta_splits;
   std::atomic<std::size_t> _index{0};
 };
+
+/// Map the scan's decode-predicate candidates (keyed by column primary index)
+/// onto @p selected_columns, which are positions in the pinned entry's column
+/// list. Returns a vector parallel to @p selected_columns, empty when the scan
+/// offers nothing this entry carries.
+sirius::decode_equality_pushdown build_equality_pushdown(
+  pinned_entry const& entry,
+  std::span<std::size_t const> selected_columns,
+  std::unordered_map<std::size_t, std::vector<std::string>> const& candidates)
+{
+  if (candidates.empty()) { return {}; }
+  sirius::decode_equality_pushdown pushdown(selected_columns.size());
+  bool any = false;
+  for (std::size_t i = 0; i < selected_columns.size(); ++i) {
+    auto const entry_pos = selected_columns[i];
+    if (entry_pos >= entry.cache_info.column_ids.size()) { continue; }
+    auto const primary_idx =
+      static_cast<std::size_t>(entry.cache_info.column_ids[entry_pos].GetPrimaryIndex());
+    auto const it = candidates.find(primary_idx);
+    if (it == candidates.end()) { continue; }
+    pushdown[i] = it->second;
+    any         = true;
+  }
+  return any ? pushdown : sirius::decode_equality_pushdown{};
+}
 
 /// Filter view extracted from the scan's ingestible info: the pushed-down TableFilterSet plus the
 /// scan's column_ids its keys index into.
@@ -523,12 +575,19 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
           delta_request->plan.delta_rows());
       }
     }
+    // Columns the scan will only ever test for equality and never project can be
+    // decompressed straight to a BOOL8 mask (see decode_predicate_candidates).
+    auto equality_pushdown =
+      build_equality_pushdown(*assignment.entry,
+                              assignment.columns,
+                              assignment.op->get_ingestible().decode_predicate_candidates());
     auto provider = make_provider_for_pinned_entry(*assignment.entry,
                                                    assignment.columns,
                                                    std::move(assignment.plan),
                                                    assignment.op->batch_telemetry(),
                                                    std::move(masks),
-                                                   std::move(delta_splits));
+                                                   std::move(delta_splits),
+                                                   std::move(equality_pushdown));
     _metadata_processor->use_cached_entries_for_pipeline(assignment.op, std::move(provider));
   }
   _pending_mvcc_mask_jobs.clear();
@@ -1242,14 +1301,16 @@ std::unique_ptr<databatch_provider> make_provider_for_pinned_entry(
   cached_scan_plan plan,
   const telemetry::batch_telemetry_info& telemetry_info,
   mvcc_chunk_mask_set mvcc_masks,
-  std::vector<insert_delta_split> delta_splits)
+  std::vector<insert_delta_split> delta_splits,
+  sirius::decode_equality_pushdown equality_pushdown)
 {
   return std::make_unique<cached_databatch_provider>(entry,
                                                      selected_columns,
                                                      std::move(plan),
                                                      telemetry_info,
                                                      std::move(mvcc_masks),
-                                                     std::move(delta_splits));
+                                                     std::move(delta_splits),
+                                                     std::move(equality_pushdown));
 }
 
 cached_scan_plan build_cached_scan_plan(pinned_entry const& entry,
