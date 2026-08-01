@@ -370,6 +370,17 @@ std::vector<std::size_t> build_key_domain_cardinalities(duckdb::LogicalCompariso
 ///
 /// Descends through the pass-through operators (projection, filter, order) that
 /// sit between a join and its real input; stops at the first reducing operator.
+///
+/// A @c LOGICAL_DELIM_GET is a leaf with no children, so the recursion below can never reach the
+/// relation it stands for — but it is never a base table either. It replays the
+/// duplicate-eliminated columns of the enclosing delim join's other side, i.e. an already-joined,
+/// already-DISTINCT'd key set. TPC-H q17 is the case in point: the correlated
+/// `avg(l_quantity) per part` subquery joins the SECOND lineitem scan against a DELIM_GET carrying
+/// the distinct p_partkey values of `lineitem ⋈ part WHERE p_brand/p_container` — exactly the
+/// selective key set that already prunes the first lineitem scan. DuckDB additionally reports
+/// `build_side_has_filter = IsFiltering(children[0])` for this shape, inspecting the *probe* side
+/// (the unfiltered lineitem scan), so without this case the target DuckDB already computed in
+/// `probe_info` is discarded and the second scan runs unfiltered.
 static bool build_side_is_derived(const duckdb::LogicalOperator* op)
 {
   if (op == nullptr) { return false; }
@@ -377,6 +388,7 @@ static bool build_side_is_derived(const duckdb::LogicalOperator* op)
     case duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN:
     case duckdb::LogicalOperatorType::LOGICAL_ANY_JOIN:
     case duckdb::LogicalOperatorType::LOGICAL_DELIM_JOIN:
+    case duckdb::LogicalOperatorType::LOGICAL_DELIM_GET:
     case duckdb::LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY:
     case duckdb::LogicalOperatorType::LOGICAL_DISTINCT:
     case duckdb::LogicalOperatorType::LOGICAL_INTERSECT:

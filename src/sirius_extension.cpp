@@ -2405,13 +2405,15 @@ static void LoadInternal(ExtensionLoader& loader)
   // "S3 CPU fallback is not supported" error; local reads fall back to CPU).
   db.GetFileSystem().RegisterSubSystem(make_uniq<sirius::io::s3::sirius_httpfs>());
 
-  // Register optimizer extension for transparent GPU execution. Only the
-  // post-hook remains (plan capture); the optimizer mask a pre-hook used to
-  // write per query is published once at load (see
-  // publish_transparent_optimizer_mask above), and DuckDB skips a null
-  // pre_optimize_function.
+  // Register optimizer extension for transparent GPU execution. The post-hook
+  // captures the optimized plan; the pre-hook derives the single-table
+  // restrictions implied by OR-ed multi-table filters so DuckDB's own pushdown,
+  // join-order and build/probe-side passes can act on them. (The optimizer mask
+  // an earlier pre-hook used to write per query is published once at load — see
+  // publish_transparent_optimizer_mask above.)
   OptimizerExtension opt_ext;
-  opt_ext.optimize_function = sirius::transparent::sirius_optimizer_hook;
+  opt_ext.pre_optimize_function = sirius::transparent::sirius_pre_optimizer_hook;
+  opt_ext.optimize_function     = sirius::transparent::sirius_optimizer_hook;
   OptimizerExtension::Register(config, std::move(opt_ext));
 
   // Register SiriusContext on connections that were opened before the extension
