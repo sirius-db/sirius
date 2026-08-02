@@ -814,6 +814,30 @@ TEST_CASE_METHOD(discovery_parity_fixture,
     REQUIRE(physical_joins.size() == 1);
     REQUIRE_FALSE(physical_joins[0]->dynamic_filter_plan().enabled());
   }
+
+  SECTION("an ANTI producer with a derived build still refuses on both sides")
+  {
+    // A derived build does not soften the join-type gate: a membership filter keeps exactly the
+    // probe rows an ANTI join discards, and a CTE reference has no enclosing join that could
+    // re-check the removed rows. A materialized CTE build arms discovery with derived evidence, so
+    // this pins the refusal to the join type rather than to missing evidence.
+    auto c = plan_parity_case(*con,
+                              "WITH c AS MATERIALIZED "
+                              "(SELECT rid FROM small_right WHERE other > 0) "
+                              "SELECT * FROM big_left l ANTI JOIN c ON l.id = c.rid");
+    REQUIRE(c.original_join_had_pushdown == std::vector<bool>{false});
+
+    auto joins = comparison_joins_of(*c.oracle_plan);
+    REQUIRE(joins.size() == 1);
+    REQUIRE(joins[0]->join_type == duckdb::JoinType::ANTI);
+    // The build is a bare CTE reference: derived, and the only evidence available.
+    REQUIRE(sirius::planner::build_relation_is_derived(*joins[0]->children[1]));
+    REQUIRE_FALSE(sirius::planner::build_subtree_is_filtering(*joins[0]->children[1]));
+
+    auto physical_joins = hash_joins_of(c.physical.get());
+    REQUIRE(physical_joins.size() == 1);
+    REQUIRE_FALSE(physical_joins[0]->dynamic_filter_plan().enabled());
+  }
 }
 
 TEST_CASE_METHOD(discovery_parity_fixture,
