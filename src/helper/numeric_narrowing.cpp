@@ -271,6 +271,7 @@ std::optional<numeric_range> compute_exact_numeric_range(cudf::column_view const
 
   auto [minimum, maximum] = cudf::minmax(column, stream, mr);
   if (!minimum || !maximum || minimum->type() != maximum->type()) { return std::nullopt; }
+  if (!minimum->is_valid(stream) || !maximum->is_valid(stream)) { return std::nullopt; }
   return range_from_scalars(*minimum, *maximum, decimal_scale, stream);
 }
 
