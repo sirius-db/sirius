@@ -115,7 +115,7 @@ Consumer access is via `filters_for_column(col_idx)` and `filtered_columns()`. T
 
 Before constructing the hash join, `sirius_physical_plan_generator::plan_comparison_join` owns the built probe subtree and discovers targets. For each admitted key, `trace_probe_key` follows the shared descent rules from the probe-child ordinal. A GPU table-scan terminal binds the key to that scan. Another terminal is a candidate join-edge site; `place_endpoint` handles it only after `direct_route_admissible` accepts the key. Scan nodes store their channels, allowing multiple producers that reach the same scan to share one. The walk also fans out through physical set operations, though no planner constructs one yet.
 
-Sirius reads no DuckDB dynamic-filter metadata in production: the metadata DuckDB's optimizer still computes is consumed only by DuckDB's own CPU fallback and by the test-only parity oracle (`duckdb_join_filter_candidate_adapter`, linked into the test target), which pins Sirius discovery against DuckDB's public `GetPushdownFilterTargets` per key. Target discovery is gated on Sirius-owned build-route evidence (`build_filter_evidence`): *either* the `IsFiltering` mirror over the logical build child *or* derived-build classification (`build_relation_is_derived`: the build presents, through projections, a delim scan or a materialized-CTE reference — leaves the mirror cannot see past, so its "unfiltered" verdict is vacuous there) arms discovery for both routes. The **scan route** additionally requires the producer join type (INNER, RIGHT, or SEMI — the mirror of DuckDB's `GenerateJoinFilters` gate; other types preserve or negate unmatched probe rows, so a probe-side filter would change results). A future Phase 3 producer that must pair with an operator it does not own would need new pairing machinery; nothing does today.
+Sirius does not consume DuckDB dynamic-filter metadata in production. DuckDB retains that metadata for CPU fallback; the test-only `duckdb_join_filter_candidate_adapter` compares the shared scan-walk cases with `GetPushdownFilterTargets`. Sirius discovery instead requires either `build_subtree_is_filtering` or `build_relation_is_derived`. Scan binding also requires `scan_route_join_type_admissible`; join-edge placement requires `direct_route_admissible`. A future Phase 3 producer that must pair with an operator it does not own would need new pairing machinery; nothing does today.
 
 ### Producer / consumer wiring
 
@@ -132,10 +132,10 @@ ordinal. Publication then constructs a filter only for a key some target binds, 
 is a recorded legality fact that costs no GPU work.
 
 Three inputs are gathered before physical planning recurses into the join's children:
-per-condition domain evidence, the build subtree's uniqueness proof, and the build-route evidence
-(the `IsFiltering` mirror and the derived-build classification; either arms discovery). All three read the logical children, and `create_plan` moves data out of
-them, so computing any afterwards would read emptied nodes. If discovery binds no target, the plan
-is disabled even if admission found legal keys -- `enabled()` is target-based, not key-based.
+per-condition domain evidence, the build subtree's uniqueness proof, and either build-evidence
+predicate. All three read the logical children, and `create_plan` moves data out of them, so
+computing any afterwards would read emptied nodes. If discovery binds no target, the plan is
+disabled even if admission found legal keys -- `enabled()` is target-based, not key-based.
 
 The planner-side components and the order they run in:
 
@@ -513,9 +513,9 @@ For both representations, the constructor enqueues creation of an owned source r
 
 **Producer:** `BUILD_PROBE` hash-join build (unchanged).
 **Consumer (new placement):** `sirius_physical_dynamic_filter` in `membership_masks_only` mode, spliced into the producer's probe subtree — the same operator Phase 1 puts above a scan, in a new position. No new operator, no new filter kind, no new code path inside the hash-join probe.
-**Routing:** the same discovery walk as the scan route -- scan binds and join-edge endpoints are the two terminal actions of one trace per admitted key, and a scan bind wins. Either evidence kind arms both routes. The FK-domain rationale -- an unfiltered build is the whole key domain, so its filter keeps every probe row by construction and wiring a target for it only buys apply overhead -- holds only for base-table-image builds; subquery unnesting produces joins against delim domains and materialized subplans whose key sets are collapsed with no syntactic filter anywhere (TPC-H q2/q11/q17/q22), which is what the derived classification admits. The guarantee that survives: a build that is a pass-through image of an unfiltered base table wires nothing on any route. Any armed trace that bottoms out at a GPU scan takes the **scan** route (zone-map capable, the Phase 1 consumer wrap above that scan); the membership endpoint is the outcome when the trace bottoms out anywhere else. An endpoint's channel is minted at placement, registered to the producer, and handed to the endpoint directly.
+**Routing:** one trace serves both routes, and a scan bind wins. Either evidence predicate can arm discovery. A projected `DELIM_GET` or `CTE_REF` build supplies derived evidence even without a visible filter; an unfiltered base-table image supplies neither. A GPU-scan terminal binds to the scan. Any other terminal may receive a join-edge endpoint after direct-route admission.
 
-The derived classification is a plausibility heuristic, not a selectivity proof. Its failure modes (an unfiltered correlation domain; a user-hinted bare-copy `MATERIALIZED` CTE) wire a filter that keeps every row; the scan-level keep-ratio gate and the per-filter permanent skip disable such a filter after one measured split, and results never change because the producing join stays authoritative. On derived-only evidence a trace that bottoms out at a GPU scan takes the scan bind; DuckDB's own delim hint requires probe-child filter evidence, so Sirius admits a superset of DuckDB's delim-build pushdowns and relies on the runtime gates for the unselective remainder.
+The derived classifier is structural, not a selectivity proof. An unfiltered correlation domain or bare-copy `MATERIALIZED` CTE can produce a membership filter that keeps every row; keep-ratio gates suppress its later mask work, while the authoritative join preserves results. Sirius can therefore admit `DELIM_GET` scan bindings when DuckDB's `build_side_has_filter` is false.
 
 **Flag:** the join-edge route uses `enable_dynamic_filter`; it has no separate switch.
 

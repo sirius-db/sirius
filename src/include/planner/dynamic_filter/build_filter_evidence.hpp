@@ -18,10 +18,8 @@
  * @file build_filter_evidence.hpp
  * @brief Classifies logical join builds for dynamic-filter routing
  *
- * The two evidence sources for dynamic-filter target discovery: either arms both routes.
- * `build_subtree_is_filtering` is a byte-faithful mirror of DuckDB's `IsFiltering`;
- * `build_relation_is_derived` is a structural classifier for relations the mirror cannot see
- * behind.
+ * Either `build_subtree_is_filtering` or `build_relation_is_derived` can arm scan and join-edge
+ * target discovery.
  */
 
 #pragma once
@@ -33,13 +31,11 @@ class LogicalOperator;
 namespace sirius::planner {
 
 /**
- * @brief Whether @p op's subtree contains an operator that removes or reorders-and-truncates rows
+ * @brief Reports whether @p op's subtree contains filter evidence
  *
  * Mirrors DuckDB's `JoinFilterPushdownOptimizer::IsFiltering` exactly: true for a `LOGICAL_GET`
  * with a non-empty `table_filters`, for a `LOGICAL_FILTER`, for a `LOGICAL_TOP_N`, or for any
- * subtree containing one of those; false otherwise. Sirius plans over the same optimized logical
- * tree DuckDB's optimizer annotated, so this walk computes the same value DuckDB's
- * `build_side_has_filter` hint carried.
+ * subtree containing one of those; false otherwise.
  *
  * @param[in] op Root of the subtree to inspect
  * @return True when the subtree carries filter evidence
@@ -47,7 +43,7 @@ namespace sirius::planner {
 [[nodiscard]] bool build_subtree_is_filtering(duckdb::LogicalOperator const& op);
 
 /**
- * @brief Classifies a logical relation as a projected derived leaf
+ * @brief Reports whether a logical relation is a projected derived leaf
  *
  * Returns true for a `LOGICAL_DELIM_GET` or `LOGICAL_CTE_REF` root, or for one reached through only
  * `LOGICAL_PROJECTION` wrappers. Any other operator stops the classification, even if one of its

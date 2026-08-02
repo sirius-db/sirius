@@ -121,9 +121,8 @@ switch_comparison require_switch_result_equivalence(duckdb::Connection& con,
 
 }  // namespace
 
-// Verify that dynamic filters on keys from an inner join's build side, reached by build-block
-// descent, preserve results. Shape-specific placement is covered by test_plan_tree_shape.cpp.
-TEST_CASE("gpu_execution - SIP endpoint placement preserves results",
+// Verify result parity for derived-build and build-block routes; plan-shape tests pin placement.
+TEST_CASE("gpu_execution - derived-build and build-block routes preserve results",
           "[integration][gpu_execution][dynamic_filter]")
 {
   REQUIRE(sirius::test::g_integration_env != nullptr);
@@ -210,8 +209,7 @@ TEST_CASE("gpu_execution - SIP endpoint placement preserves results",
 
   SECTION("TPC-H q17: a delim-scan build wires only through derived-build evidence")
   {
-    // Derived-build evidence arms the trace, which scan-binds the delim-internal lineitem scan;
-    // the counter deltas show that the enabled route publishes filters.
+    // q17's DELIM_GET build uses derived evidence to bind the internal lineitem scan.
     auto const deltas =
       require_switch_result_equivalence(con,
                                         "select sum(l.l_extendedprice) / 7.0 as avg_yearly "

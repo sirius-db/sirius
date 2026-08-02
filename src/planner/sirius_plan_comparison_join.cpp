@@ -406,10 +406,7 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
   bool const dynamic_filter_enabled =
     sirius_context && sirius_context->get_config().get_operator_params().enable_dynamic_filter;
 
-  // Either evidence kind arms target discovery for both routes: the IsFiltering mirror sees
-  // filtering work in the build subtree; the derived classifier admits DELIM_GET/CTE_REF
-  // relations -- leaves the mirror cannot see behind, so its "unfiltered" verdict is vacuous
-  // there. Per-route join-type admissibility is applied at each terminal, not here.
+  // Either filter or derived-relation evidence enables discovery; route-specific admission follows.
   bool const build_evidence =
     dynamic_filter_enabled &&
     (build_subtree_is_filtering(*op.children[1]) || build_relation_is_derived(*op.children[1]));
@@ -498,9 +495,7 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
                                 op.type == duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN &&
                                 !gpu_spaces.empty() && !host_spaces.empty();
     if (discovery_runs) {
-      // Discovery implies build evidence; scan binding needs only a join type that can safely
-      // pre-filter its probe side (correctness rule, mirrored from DuckDB's GenerateJoinFilters
-      // gate).
+      // Scan binding additionally requires a producer join type that may pre-filter its probe side.
       bool const scan_bind_armed = scan_route_join_type_admissible(op.join_type);
       // The planner enables build-block descent; the policy remains independently testable.
       descent_policy const policy{.descend_build_blocks = true};
@@ -546,9 +541,8 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
           scan_bound = true;
         }
         if (scan_bound) { continue; }
-        // The endpoint is the terminal for traces no scan bound. Because evidence may be
-        // structural rather than selective, the endpoint's keep-ratio gate suppresses later work
-        // when the filter prunes too little.
+        // A key with no scan bind may try the join-edge route; runtime gates suppress filters that
+        // prune too little.
         //
         // Build-block descent depends on equality admission: under null-equal
         // semantics, pruning a LEFT join's build input could add a NULL-padded row accepted by
