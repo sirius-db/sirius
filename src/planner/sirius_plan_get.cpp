@@ -108,6 +108,32 @@ std::vector<cudf::data_type> scan_physical_schema(duckdb::LogicalGet& op,
   return changed ? result : std::vector<cudf::data_type>{};
 }
 
+// An OPTIONAL_FILTER is advisory and an IS_NOT_NULL is applied by the scan itself, so
+// neither contributes to the predicate convert_table_filters_to_expression builds
+// (scan_utils.cpp). This must stay in step with that skip set: probing a filter the
+// scan discharges would reject plans the scan handles correctly.
+[[nodiscard]] bool is_discharged_without_translation(duckdb::TableFilterType filter_type)
+{
+  return filter_type == duckdb::TableFilterType::OPTIONAL_FILTER ||
+         filter_type == duckdb::TableFilterType::IS_NOT_NULL;
+}
+
+// Pushed-down filters bypass LogicalFilter, so validate the remaining predicate at plan
+// time. The runtime translates again because it resolves references against
+// batch-relative positions.
+void reject_untranslatable_table_filter(duckdb::TableFilter const& filter,
+                                        duckdb::LogicalType const& column_type,
+                                        std::string const& column_name)
+{
+  if (is_discharged_without_translation(filter.filter_type)) { return; }
+  auto column_ref = duckdb::make_uniq<duckdb::BoundReferenceExpression>(column_type, 0);
+  auto expression = filter.ToExpression(*column_ref);
+  if (sirius::ast::from_duckdb(*expression) == nullptr) {
+    throw duckdb::NotImplementedException("Unsupported filter predicate on column '" + column_name +
+                                          "' (falling back to CPU): " + expression->ToString());
+  }
+}
+
 }  // namespace
 
 duckdb::unique_ptr<duckdb::TableFilterSet> create_table_filter_set(
@@ -142,7 +168,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
   static const std::unordered_set<std::string> kSupportedScanFunctions = {
     "seq_scan", "parquet_scan", "read_parquet", "sirius_read_parquet"};
   if (kSupportedScanFunctions.find(op.function.name) == kSupportedScanFunctions.end()) {
-    throw duckdb::NotImplementedException("Table function '{}' is not supported in Sirius",
+    throw duckdb::NotImplementedException("Table function '%s' is not supported in Sirius",
                                           op.function.name);
   }
 
@@ -408,6 +434,8 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
         auto const column_name =
           column_id < op.names.size() ? op.names[column_id] : std::to_string(column_id);
         reject_nested_column_type(op.returned_types[column_id], column_name, "a filter predicate");
+        reject_untranslatable_table_filter(
+          *entry.second, op.returned_types[column_id], column_name);
       }
     }
   }
