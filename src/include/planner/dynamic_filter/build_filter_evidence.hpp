@@ -18,8 +18,10 @@
  * @file build_filter_evidence.hpp
  * @brief Classifies logical join builds for dynamic-filter routing
  *
- * `build_subtree_is_filtering` supplies filter evidence to the scan and join-edge routes.
- * `build_relation_is_derived` supplies structural evidence only to the join-edge route.
+ * The two evidence sources for dynamic-filter target discovery: either arms both routes.
+ * `build_subtree_is_filtering` is a byte-faithful mirror of DuckDB's `IsFiltering`;
+ * `build_relation_is_derived` is a structural classifier for relations the mirror cannot see
+ * behind.
  */
 
 #pragma once

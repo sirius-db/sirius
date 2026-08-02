@@ -121,8 +121,8 @@ switch_comparison require_switch_result_equivalence(duckdb::Connection& con,
 
 }  // namespace
 
-// Verify that join-edge dynamic filters preserve results on shapes scan routing cannot reach.
-// Shape-specific placement is covered by test_plan_tree_shape.cpp.
+// Verify that dynamic filters on keys from an inner join's build side, reached by build-block
+// descent, preserve results. Shape-specific placement is covered by test_plan_tree_shape.cpp.
 TEST_CASE("gpu_execution - SIP endpoint placement preserves results",
           "[integration][gpu_execution][dynamic_filter]")
 {
@@ -138,9 +138,9 @@ TEST_CASE("gpu_execution - SIP endpoint placement preserves results",
   REQUIRE(r);
   REQUIRE_FALSE(r->HasError());
 
-  SECTION("SIP is the only route to a key on the inner join's build side")
+  SECTION("a key on the inner join's build side, reached by build-block descent")
   {
-    // The pinned join order puts o_custkey on an inner build side, so only join-edge descent can
+    // The pinned join order puts o_custkey on an inner build side, so only build-block descent can
     // target it. Inferred predicates and the coverage gate are disabled to keep attribution stable.
     sirius::test::disabled_optimizers_guard shape(
       con, "statistics_propagation,join_order,build_side_probe_side");
@@ -210,8 +210,8 @@ TEST_CASE("gpu_execution - SIP endpoint placement preserves results",
 
   SECTION("TPC-H q17: a delim-scan build wires only through derived-build evidence")
   {
-    // q17's join-edge route is armed only by derived-build evidence; the counter deltas show that
-    // the enabled route publishes filters.
+    // Derived-build evidence arms the trace, which scan-binds the delim-internal lineitem scan;
+    // the counter deltas show that the enabled route publishes filters.
     auto const deltas =
       require_switch_result_equivalence(con,
                                         "select sum(l.l_extendedprice) / 7.0 as avg_yearly "

@@ -406,23 +406,18 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
   bool const dynamic_filter_enabled =
     sirius_context && sirius_context->get_config().get_operator_params().enable_dynamic_filter;
 
-  // A delim build draws its rows from the probe child, so filtering evidence comes from there.
-  bool const build_filtered =
+  // Either evidence kind arms target discovery for both routes: the IsFiltering mirror sees
+  // filtering work in the build subtree; the derived classifier admits DELIM_GET/CTE_REF
+  // relations -- leaves the mirror cannot see behind, so its "unfiltered" verdict is vacuous
+  // there. Per-route join-type admissibility is applied at each terminal, not here.
+  bool const build_evidence =
     dynamic_filter_enabled &&
-    build_subtree_is_filtering(
-      op.children[1]->type == duckdb::LogicalOperatorType::LOGICAL_DELIM_GET ? *op.children[0]
-                                                                             : *op.children[1]);
-
-  // DuckDB's IsFiltering walk cannot see work behind childless DELIM_GET and CTE_REF leaves.
-  // Derived evidence therefore widens only the SIP join-edge route; scan routing keeps DuckDB
-  // parity.
-  bool const build_derived = dynamic_filter_enabled && build_relation_is_derived(*op.children[1]);
-  bool const edge_evidence = build_filtered || build_derived;
+    (build_subtree_is_filtering(*op.children[1]) || build_relation_is_derived(*op.children[1]));
 
   // Gather domain evidence before create_plan() moves state out of the logical children.
   auto condition_domains =
-    edge_evidence ? build_key_domain_cardinalities(op, duckdb_base_table_cardinality{context})
-                  : std::vector<std::size_t>{};
+    build_evidence ? build_key_domain_cardinalities(op, duckdb_base_table_cardinality{context})
+                   : std::vector<std::size_t>{};
 
   // Probe build-side uniqueness BEFORE create_plan, which moves data out of the logical nodes.
   auto build_side_unique_cols  = prove_unique_columns(*op.children[1]);
@@ -499,13 +494,14 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
     // planner entry point but are not dynamic-filter producers.
     std::vector<sirius::op::dynamic_filter_publish_plan::probe_target> targets;
     std::size_t scan_target_count = 0;
-    bool const discovery_runs     = edge_evidence &&
+    bool const discovery_runs     = build_evidence &&
                                 op.type == duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN &&
                                 !gpu_spaces.empty() && !host_spaces.empty();
     if (discovery_runs) {
-      // Scan binding requires build-filter evidence and a join type that can safely pre-filter its
-      // probe side.
-      bool const scan_bind_armed = build_filtered && scan_route_join_type_admissible(op.join_type);
+      // Discovery implies build evidence; scan binding needs only a join type that can safely
+      // pre-filter its probe side (correctness rule, mirrored from DuckDB's GenerateJoinFilters
+      // gate).
+      bool const scan_bind_armed = scan_route_join_type_admissible(op.join_type);
       // The planner enables build-block descent; the policy remains independently testable.
       descent_policy const policy{.descend_build_blocks = true};
       std::unordered_map<sirius::op::sirius_physical_operator const*, std::size_t> target_by_scan;
@@ -550,9 +546,9 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
           scan_bound = true;
         }
         if (scan_bound) { continue; }
-        // Derived evidence may arm only this route. Because it is structural rather than
-        // selective, the endpoint's keep-ratio gate suppresses later work when the filter prunes
-        // too little.
+        // The endpoint is the terminal for traces no scan bound. Because evidence may be
+        // structural rather than selective, the endpoint's keep-ratio gate suppresses later work
+        // when the filter prunes too little.
         //
         // Build-block descent depends on equality admission: under null-equal
         // semantics, pruning a LEFT join's build input could add a NULL-padded row accepted by
@@ -609,13 +605,13 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
         scan_target_count,
         targets.size() - scan_target_count,
         rhs_cardinality);
-    } else if (edge_evidence && op.type == duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN &&
+    } else if (build_evidence && op.type == duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN &&
                !admitted_keys.empty() && (gpu_spaces.empty() || host_spaces.empty())) {
       // Report missing placement before less specific discovery gates.
       SIRIUS_LOG_INFO(
         "[sirius_plan_comparison_join] Not wiring dynamic filter(s): a GPU and HOST "
         "memory space are required for device-local replicas.");
-    } else if (dynamic_filter_enabled && !edge_evidence &&
+    } else if (dynamic_filter_enabled && !build_evidence &&
                op.type == duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN &&
                !admitted_keys.empty()) {
       SIRIUS_LOG_INFO(

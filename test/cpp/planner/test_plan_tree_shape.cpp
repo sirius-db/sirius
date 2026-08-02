@@ -662,12 +662,12 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
 }
 
 TEST_CASE_METHOD(plan_tree_shape_fixture,
-                 "plan tree shape - SIP wires a join-edge endpoint for a derived build",
+                 "plan tree shape - a derived build arms the scan route",
                  "[plan_tree_shape][isolated_context]")
 {
   // A materialized CTE leaves a childless CTE_SCAN as the join's build. IsFiltering cannot see the
-  // predicate in the CTE definition from that reference, so only derived-build evidence can wire
-  // the endpoint.
+  // predicate in the CTE definition from that reference, so only derived-build evidence can arm
+  // the trace.
   const std::string cte_query =
     "WITH r AS MATERIALIZED (SELECT rid FROM small_right WHERE other % 2 = 0) "
     "SELECT * FROM big_left l JOIN r ON l.id = r.rid";
@@ -685,8 +685,8 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     REQUIRE(endpoints.front()->children.size() == 1);
     CHECK(endpoints.front()->children[0]->type == SiriusPhysicalOperatorType::GPU_SCAN);
 
-    // The endpoint sits inside the producing join's probe wrap (big_left), on the direct route:
-    // derived evidence alone never arms a scan bind.
+    // The trace bottoms out at the big_left scan, so the channel attaches to the scan (zone-map
+    // capable); the scan wrap sits inside the producing join's probe wrap.
     auto* hj = find_first(plan.get(), SiriusPhysicalOperatorType::HASH_JOIN);
     REQUIRE(hj != nullptr);
     REQUIRE(hj->children.size() == 2);
@@ -696,8 +696,8 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     auto const& targets =
       hj->Cast<sirius::op::sirius_physical_hash_join>().dynamic_filter_plan().probe_targets();
     REQUIRE(targets.size() == 1);
-    CHECK(targets[0].route_class == sirius::op::dynamic_filter_route_class::direct);
-    CHECK_FALSE(targets[0].accepts_zone_map_filters);
+    CHECK(targets[0].route_class == sirius::op::dynamic_filter_route_class::scan);
+    CHECK(targets[0].accepts_zone_map_filters);
 
     require_parent_links(plan.get(), /*expected_parent=*/nullptr);
   }
@@ -717,7 +717,7 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     "SELECT SUM(i.qty) FROM items i, parts p WHERE p.pk = i.fk AND p.pname = 'p1' "
     "AND i.qty < (SELECT 2 * AVG(i2.qty) FROM items i2 WHERE i2.fk = p.pk)";
 
-  SECTION("delim-scan build, filter on: the endpoint wires inside the delim internals")
+  SECTION("delim-scan build, filter on: the scan route binds inside the delim internals")
   {
     dynamic_filter_switch_guard switch_on(*con, /*enabled=*/true);
     auto plan = generate_sirius_plan(*con, delim_query);
@@ -738,6 +738,22 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
       REQUIRE(endpoint->children.size() == 1);
       CHECK(endpoint->children[0]->type == SiriusPhysicalOperatorType::GPU_SCAN);
     }
+
+    // The delim-internal producing join's trace bottoms out at the internal GPU scan, so its
+    // single target takes the scan route (zone-map capable).
+    std::vector<sirius::op::sirius_physical_hash_join*> armed_internal_joins;
+    for (auto* join_node : collect(delim.join.get(), SiriusPhysicalOperatorType::HASH_JOIN)) {
+      auto& internal_join = join_node->Cast<sirius::op::sirius_physical_hash_join>();
+      if (!internal_join.dynamic_filter_plan().probe_targets().empty()) {
+        armed_internal_joins.push_back(&internal_join);
+      }
+    }
+    REQUIRE(armed_internal_joins.size() == 1);
+    auto const& internal_targets =
+      armed_internal_joins.front()->dynamic_filter_plan().probe_targets();
+    REQUIRE(internal_targets.size() == 1);
+    CHECK(internal_targets[0].route_class == sirius::op::dynamic_filter_route_class::scan);
+    CHECK(internal_targets[0].accepts_zone_map_filters);
 
     require_parent_links(plan.get(), /*expected_parent=*/nullptr);
   }

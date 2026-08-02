@@ -21,6 +21,8 @@
  * Each admissible equality key is compared by target table and output ordinal. Separate cases
  * cover conservative routes that Sirius rejects even though DuckDB accepts them. The DuckDB
  * oracle uses a pre-binding-resolver plan copy; Sirius converts the original optimized plan.
+ * Derived-build evidence is deliberately wider than DuckDB's hint; the evidence, plan-shape, and
+ * integration tests pin that widening, not this suite.
  */
 
 // Reaching a join operator through these headers instantiates `vector<join_condition>`'s
