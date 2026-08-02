@@ -506,8 +506,7 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
       // Scan binding requires build-filter evidence and a join type that can safely pre-filter its
       // probe side.
       bool const scan_bind_armed = build_filtered && scan_route_join_type_admissible(op.join_type);
-      // Build-block descent is always armed; the policy field remains so the walk rules stay
-      // independently testable.
+      // The planner enables build-block descent; the policy remains independently testable.
       descent_policy const policy{.descend_build_blocks = true};
       std::unordered_map<sirius::op::sirius_physical_operator const*, std::size_t> target_by_scan;
       for (std::size_t key_index = 0; key_index < admitted_keys.size(); ++key_index) {
@@ -550,8 +549,6 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
                                      .value_or(cudf::data_type{cudf::type_id::EMPTY})});
           scan_bound = true;
         }
-        // Discovery runs only with edge evidence, so any key that found no scan bind may try
-        // the join-edge route, subject to direct-route admission below.
         if (scan_bound) { continue; }
         // Derived evidence may arm only this route. Because it is structural rather than
         // selective, the endpoint's keep-ratio gate suppresses later work when the filter prunes

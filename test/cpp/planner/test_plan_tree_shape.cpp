@@ -599,7 +599,6 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
                  "plan tree shape - scan-route discovery wires the probe scan's DYNAMIC_FILTER",
                  "[plan_tree_shape][isolated_context]")
 {
-  // A residual build filter arms scan discovery and places the endpoint above the probe GPU scan.
   const std::vector<OptimizerType> keep_shape{OptimizerType::JOIN_ORDER,
                                               OptimizerType::BUILD_SIDE_PROBE_SIDE};
 
@@ -640,9 +639,8 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     "a LIMIT between the join and the scan: the endpoint stays above the LIMIT, the scan "
     "stays bare")
   {
-    // The trace refuses at LIMIT because filtering below it can change which rows are selected.
-    // The un-bound key instead takes the join-edge route, so the endpoint is spliced above the
-    // LIMIT and the scan below it stays unwrapped.
+    // Filtering below LIMIT could change its rows, so the scan trace stops and the join-edge
+    // endpoint wraps it.
     dynamic_filter_switch_guard switch_on(*con, /*enabled=*/true);
     auto plan = generate_sirius_plan(*con,
                                      "SELECT * FROM (SELECT * FROM big_left LIMIT 15) l JOIN "
@@ -706,7 +704,6 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
 
   SECTION("materialized-CTE build, filter off: no DYNAMIC_FILTER anywhere")
   {
-    // With the feature off, discovery never runs, so nothing wires anywhere.
     dynamic_filter_switch_guard switch_off(*con, /*enabled=*/false);
     auto plan = generate_sirius_plan(*con, cte_query, keep_shape);
     INFO(tree_to_string(plan.get()));

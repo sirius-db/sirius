@@ -49,9 +49,7 @@ fs::path integration_db_path()
 #endif
 }
 
-//! Set the dynamic-filter switch for one scope through its SQL setter and restore the previous
-//! value on exit. SET routes to the shared SiriusContext the plan-gen router reads live, and the
-//! context outlives this test — restore is mandatory.
+// Set the dynamic-filter flag for one scope and restore it on exit.
 class dynamic_filter_switch_guard {
  public:
   dynamic_filter_switch_guard(duckdb::Connection& con, bool enabled)
@@ -188,8 +186,7 @@ TEST_CASE("the dynamic-filter endpoint is never fed partitioned data",
   REQUIRE(endpoints_checked > 0);
 }
 
-// Verify the endpoint input contract across join and group-by wrappers. Q5 also verifies that the
-// feature wires endpoints without assuming an optimizer-selected placement.
+// Verify the endpoint input contract across join and group-by wrappers.
 TEST_CASE("dynamic-filter endpoints obey the data contract on SIP-shaped plans",
           "[integration][pipeline][dynamic_filter]")
 {
@@ -225,11 +222,8 @@ TEST_CASE("dynamic-filter endpoints obey the data contract on SIP-shaped plans",
 
   SECTION("Q5: the feature wires endpoints, and every endpoint obeys the data contract")
   {
-    // Pin the written join order so the wired plan is deterministic: the region join's build
-    // carries the r_name filter (the required evidence), and its probe key (n_regionkey) lives on
-    // the nation join's build side, which only the join-edge route's build-block descent reaches.
-    // The feature-off run wires nothing, so the delta attributes every endpoint to the feature.
-    // Every endpoint, whichever route wired it, must consume pipelineable data.
+    // The pinned join order puts n_regionkey on the nation join's build side, so only join-edge
+    // descent reaches it. Every discovered endpoint must consume pipelineable data.
     sirius::test::disabled_optimizers_guard shape(con, "join_order,build_side_probe_side");
     std::size_t endpoints_off = 0;
     {

@@ -50,15 +50,10 @@ class sirius_physical_operator;
 namespace sirius::planner {
 
 /**
- * @brief Which hops this producer's walk may take
- *
- * Mechanism (what a hop means) is fixed by the rule functions below; policy (which hops this
- * producer is allowed) is carried here so the rules stay expressible and testable independently of
- * the planner's choice.
+ * @brief Controls whether a dynamic-filter trace may enter join build blocks
  */
 struct descent_policy {
-  /// Build-block hops through an intervening join are the SIP capability; with the bit off the
-  /// walk descends probe spines and set-operation branches only.
+  /// Whether the trace may enter an intervening join's build block
   bool descend_build_blocks = false;
 };
 

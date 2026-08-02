@@ -98,8 +98,7 @@ class scoped_temp_db_path {
   std::string _path;
 };
 
-// Force the dynamic-filter switch on for the scope, independent of ambient configuration, then
-// restore the previous setting.
+// Enable dynamic filtering for one scope and restore the previous setting.
 class dynamic_filter_on_guard {
  public:
   explicit dynamic_filter_on_guard(Connection& con)
@@ -565,8 +564,7 @@ TEST_CASE_METHOD(discovery_parity_fixture,
   REQUIRE(physical_joins.size() == 2);
   REQUIRE(hash_joins_of(physical_joins[0]->children[0].get()) ==
           std::vector<sirius::op::sirius_physical_hash_join*>{physical_joins[1]});
-  // Sirius's scan walk refuses at the RIGHT join; the key falls through to the join-edge route
-  // (placement pinned by the plan-shape suite).
+  // The scan route stops at the RIGHT join; plan-shape tests cover join-edge placement.
   REQUIRE(scan_bindings_of(*physical_joins[0], c.physical.get()).empty());
 }
 

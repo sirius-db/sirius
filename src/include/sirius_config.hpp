@@ -120,21 +120,13 @@ struct operator_params {
   /// disable (always use filtered_join).
   double mark_join_build_switch_ratio = config::DEFAULT_MARK_JOIN_BUILD_SWITCH_RATIO;
 
-  /// Wire runtime dynamic filters from eligible BUILD_PROBE hash-join builds. Per admitted key
-  /// the build publishes one membership filter (a raw exact IN-list for 1..12 supported build
-  /// rows, otherwise a hash IN-list if it fits the smallest probe-GPU L2, or a Bloom) to every
-  /// consumer discovered in its probe subtree: a probe-side scan applies it post-decode, and a
-  /// key no scan bind reaches can place a join-edge endpoint at the deepest value-preserving
-  /// site, including on an intervening join's build input. Redundant with the join, so results
-  /// never change. When off, discovery never runs and no channel exists anywhere. On by default.
+  /// Enable runtime dynamic-filter discovery for eligible BUILD_PROBE hash joins. Targets may be
+  /// probe-side scans or join-edge endpoints. When disabled, discovery does not run.
   bool enable_dynamic_filter = true;
 
-  /// Additionally emit a runtime zone-map (build-key [min,max]) alongside the membership filter,
-  /// for READ-time row-group pruning on parquet scans; duckdb-native scans apply it row-wise
-  /// post-decode instead. Off by default and requires enable_dynamic_filter: on
-  /// TPC-H-shaped joins DuckDB's static transitive-predicate pushdown already prunes
-  /// range-derivable builds, and scattered keys prune nothing, so the zone-map only pays off on
-  /// clustered-keyset joins whose narrow key range is runtime-determined.
+  /// Emit build-key min/max filters in addition to membership filters. Parquet scans use them for
+  /// row-group pruning; duckdb-native scans apply them post-decode. Effective only when
+  /// `enable_dynamic_filter` is enabled.
   bool enable_dynamic_zone_map_filter = false;
 
   /// Skip all publication for a key when the build covers at least this fraction of its unfiltered

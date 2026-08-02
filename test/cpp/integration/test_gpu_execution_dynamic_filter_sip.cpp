@@ -27,7 +27,7 @@
 
 namespace {
 
-// Restore the previous switch setting so nested guards remain valid.
+// Set the dynamic-filter flag for one scope and restore it on exit.
 struct dynamic_filter_switch_guard {
   dynamic_filter_switch_guard(duckdb::Connection& c, bool enabled)
     : con(c),
@@ -77,7 +77,6 @@ struct publication_deltas {
   std::uint64_t filters_pushed           = 0;
 };
 
-// Counter deltas for the same query with the feature disabled and enabled.
 struct switch_comparison {
   publication_deltas off;
   publication_deltas on;
@@ -96,9 +95,8 @@ publication_deltas run_and_measure(duckdb::Connection& con,
     .filters_pushed           = after.filters_pushed - before.filters_pushed};
 }
 
-// Compare feature-disabled and feature-enabled results and return their counter deltas. With the
-// active task creator, publication completes before the probe subtree starts, so delivery counters
-// are deterministic for these queries.
+// Publication completes before these probes, making the enabled/disabled counter deltas
+// deterministic.
 switch_comparison require_switch_result_equivalence(duckdb::Connection& con,
                                                     const std::string& query)
 {
@@ -123,7 +121,7 @@ switch_comparison require_switch_result_equivalence(duckdb::Connection& con,
 
 }  // namespace
 
-// Verify that SIP preserves results and reaches keys scan-route discovery cannot.
+// Verify that join-edge dynamic filters preserve results on shapes scan routing cannot reach.
 // Shape-specific placement is covered by test_plan_tree_shape.cpp.
 TEST_CASE("gpu_execution - SIP endpoint placement preserves results",
           "[integration][gpu_execution][dynamic_filter]")
@@ -142,13 +140,8 @@ TEST_CASE("gpu_execution - SIP endpoint placement preserves results",
 
   SECTION("SIP is the only route to a key on the inner join's build side")
   {
-    // The customer predicate supplies the build-filter evidence both routes require. With the
-    // written join order pinned, the producing join's probe key (o_custkey) lives on the inner
-    // join's build side, where scan-route discovery stops at the join, so the join-edge route is
-    // the only reachable target for this key (per-route attribution lives in the plan-shape
-    // suite). The feature-off run wires nothing, so the deltas are attributable to the feature.
-    // Inferred predicates and the independent coverage gate are suppressed to keep the
-    // attribution clean.
+    // The pinned join order puts o_custkey on an inner build side, so only join-edge descent can
+    // target it. Inferred predicates and the coverage gate are disabled to keep attribution stable.
     sirius::test::disabled_optimizers_guard shape(
       con, "statistics_propagation,join_order,build_side_probe_side");
     sirius::test::coverage_gate_disable_guard gate_off(con);
@@ -160,7 +153,6 @@ TEST_CASE("gpu_execution - SIP endpoint placement preserves results",
                                         "JOIN customer c ON o.o_custkey = c.c_custkey "
                                         "WHERE c.c_nationkey = 3");
 
-    // Confirm that the feature-off run wires no producer at all.
     REQUIRE(deltas.off.producers_enabled == 0);
 
     // Check each publication stage independently.
@@ -218,9 +210,8 @@ TEST_CASE("gpu_execution - SIP endpoint placement preserves results",
 
   SECTION("TPC-H q17: a delim-scan build wires only through derived-build evidence")
   {
-    // q17's correlated join builds from a DELIM_GET. The feature-off run wires nothing, so the
-    // counter deltas verify the feature wires producers, including through derived-build evidence
-    // -- the only evidence the delim-internal producer has.
+    // q17's join-edge route is armed only by derived-build evidence; the counter deltas show that
+    // the enabled route publishes filters.
     auto const deltas =
       require_switch_result_equivalence(con,
                                         "select sum(l.l_extendedprice) / 7.0 as avg_yearly "

@@ -90,7 +90,7 @@ sirius:
     hash_partition_bytes:       805306368   # 768 MiB
     concat_batch_bytes:         805306368   # 768 MiB
     max_build_hash_table_bytes: 805306368   # 768 MiB
-    enable_dynamic_filter: true    # BUILD_PROBE membership filters into probe scans and join-edge endpoints
+    enable_dynamic_filter: true    # scan and join-edge runtime filters
     enable_dynamic_zone_map_filter: false  # optional parquet-read/native-post-decode min/max
     dynamic_filter_domain_coverage_threshold: 0.9  # skip keys the build's domain coverage exceeds
     dynamic_filter_keep_threshold: 0.9  # disable a scan's filtering when a split keeps > this fraction
@@ -351,8 +351,8 @@ Four optional nested sub-configs tune the individual backends and caches:
 | `max_broadcast_join_size` | 256 MB | Max build-side size eligible for a broadcast join. A build below this size is replicated to every GPU (instead of hash-partitioned) when it is tiny, or when the DuckDB-estimated probe-to-build row ratio is at least `num_gpus * 1.25`. |
 | `max_sort_partition_memory_fraction` | 0.33 | Fraction of GPU memory per sort partition when `max_sort_partition_bytes` is 0 |
 | `mark_join_build_switch_ratio` | 8.0 | For STANDARD MARK joins, build on the smaller (left) side when `right_rows >= ratio * left_rows` (0 disables) |
-| `enable_dynamic_filter` | true | Feature switch for runtime dynamic filters. An eligible `BUILD_PROBE` hash-join build publishes per-key membership filters (raw exact IN-list for 1–12 supported build rows, otherwise a hash IN-list if it fits the smallest probe-GPU L2 or a Bloom) into probe-side scans for post-decode application, and places join-edge endpoints inside its own probe subtree — including on an intervening join's build input — for keys no scan bind reaches. |
-| `enable_dynamic_zone_map_filter` | false | Additionally publish build-key min/max bounds. Parquet scans use them for read-time row-group pruning; duckdb-native scans apply them row-wise post-decode. Requires `enable_dynamic_filter`; intended for clustered-keyset workloads. |
+| `enable_dynamic_filter` | true | Enable runtime filters for eligible `BUILD_PROBE` joins. Targets may be probe scans or join-edge endpoints. |
+| `enable_dynamic_zone_map_filter` | false | Publish build-key min/max filters in addition to membership filters. Parquet scans use them for row-group pruning; duckdb-native scans apply them post-decode. Requires `enable_dynamic_filter`. |
 | `dynamic_filter_domain_coverage_threshold` | 0.9 | Skip publishing a key's membership filter when the build covers at least this fraction of the key's unfiltered base-table row bound. Fires only for build keys proven unique in their base relation, with evidence from DuckDB-native scans; the zone-map range gate receives no domain and stays inactive. A value above 1.0 is the explicit disabled state (the rollback lever: setting it above 1.0 restores pre-gate publication behavior without disabling dynamic filtering); exactly 1.0 fires only at full coverage. |
 | `dynamic_filter_keep_threshold` | 0.9 | Disable a probe scan's post-decode dynamic filtering once a measured split keeps more than this fraction of its rows; in [0, 1], 1.0 keeps filtering always on. |
 | `enable_pinned_zone_map_pruning` | true | Capture per-chunk min/max statistics while pinning and use them to skip cached chunks that cannot match a scan filter. |
@@ -537,8 +537,8 @@ rejected as unknown, and the old `SET` variables no longer exist.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `enable_dynamic_filter` | true | Feature switch for runtime dynamic filters. An eligible `BUILD_PROBE` hash-join build publishes per-key membership filters (raw exact IN-list for 1–12 supported build rows, otherwise a hash IN-list if it fits the smallest probe-GPU L2 or a Bloom) into probe-side scans for post-decode application, and places join-edge endpoints inside its own probe subtree — including on an intervening join's build input — for keys no scan bind reaches. |
-| `enable_dynamic_zone_map_filter` | false | Additionally publish build-key min/max bounds. Parquet scans use them for read-time row-group pruning; duckdb-native scans apply them row-wise post-decode. Has no effect unless `enable_dynamic_filter` is enabled. |
+| `enable_dynamic_filter` | true | Enable runtime filters for eligible `BUILD_PROBE` joins. Targets may be probe scans or join-edge endpoints. |
+| `enable_dynamic_zone_map_filter` | false | Publish build-key min/max filters in addition to membership filters. Parquet scans use them for row-group pruning; duckdb-native scans apply them post-decode. Requires `enable_dynamic_filter`. |
 | `dynamic_filter_domain_coverage_threshold` | 0.9 | Skip publishing a key's membership filter when the build covers at least this fraction of the key's unfiltered base-table row bound. Fires only for build keys proven unique in their base relation, with evidence from DuckDB-native scans; the zone-map range gate receives no domain and stays inactive. A value above 1.0 is the explicit disabled state (the rollback lever: setting it above 1.0 restores pre-gate publication behavior without disabling dynamic filtering); exactly 1.0 fires only at full coverage. |
 | `dynamic_filter_keep_threshold` | 0.9 | Disable a probe scan's post-decode dynamic filtering once a measured split keeps more than this fraction of its rows; in [0, 1], 1.0 keeps filtering always on. |
 

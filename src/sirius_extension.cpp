@@ -2303,19 +2303,16 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
 
   config.AddExtensionOption(
     "enable_dynamic_filter",
-    "Wire runtime dynamic filters: an eligible BUILD_PROBE hash-join build publishes a membership "
-    "filter (raw IN-list for 1-12 supported build rows; otherwise a hash IN-list if it fits the "
-    "smallest probe-GPU L2, or a Bloom) into probe-side scans and, for keys no scan bind reaches, "
-    "into join-edge endpoints inside its own probe subtree (on by default)",
+    "Enable runtime dynamic-filter discovery for eligible BUILD_PROBE hash joins; targets may be "
+    "probe-side scans or join-edge endpoints (on by default)",
     LogicalType::BOOLEAN,
     Value::BOOLEAN(sirius::operator_params{}.enable_dynamic_filter),
     SetEnableDynamicFilter);
 
   config.AddExtensionOption(
     "enable_dynamic_zone_map_filter",
-    "Additionally emit a runtime zone-map (build-key min/max) at the probe scan: parquet scans use "
-    "it for read-time row-group pruning, while duckdb-native scans apply it row-wise post-decode; "
-    "requires enable_dynamic_filter (off by default)",
+    "Additionally emit build-key min/max filters: parquet scans use them for row-group pruning; "
+    "duckdb-native scans apply them post-decode; requires enable_dynamic_filter (off by default)",
     LogicalType::BOOLEAN,
     Value::BOOLEAN(sirius::operator_params{}.enable_dynamic_zone_map_filter),
     SetEnableDynamicZoneMapFilter);
