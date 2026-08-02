@@ -1,0 +1,41 @@
+# Sirius config tuned for the NVIDIA GB10 Grace Blackwell superchip (aarch64),
+# optimized for the GPU scan paths (GPU-native DuckDB scan + parquet scan) at SF30.
+#
+# Machine: 1× GB10 GPU, 20-core Grace CPU, ~119 GiB UNIFIED LPDDR5X memory shared
+# between CPU and GPU. Because GPU and host memory are the same physical pool, the
+# GPU usage limit + host capacity + OS footprint must all fit within ~119 GiB.
+#   gpu 48 GB (reserved upfront) + host up to 24 GB + OS ~24 GB ≈ 96 GB  (ample headroom)
+#
+# NOTE: data generation must run with SIRIUS_DISABLE=1 — otherwise the Sirius extension
+# auto-loads and reserves this GPU pool up front (the default 0.95 fraction tries ~113 GiB
+# and OOMs on this box).
+#
+# These paths are GPU-bound (they decode straight to the GPU), so the config favors GPU
+# memory and uses 512 MB scan/partition/concat batches for better GPU utilization. The
+# absolute GPU byte cap is used instead of a fraction for predictability on unified memory.
+sirius:
+  topology:
+    num_gpus: 1
+  memory:
+    gpu:
+      usage_limit_bytes: 48000000000
+      reservation_limit_fraction: 1.0
+    host:
+      capacity_bytes: 24000000000
+      initial_number_pools: 10
+      pool_size: 512
+      block_size: 1048576
+  executor:
+    pipeline:
+      num_threads: 8
+    task_creator:
+      num_threads: 4
+    downgrade:
+      num_threads: 2
+      monitor_period: 10ms
+  operator_params:
+    scan_task_batch_size: 536870912
+    max_sort_partition_bytes: 0
+    hash_partition_bytes: 536870912
+    concat_batch_bytes: 536870912
+    max_build_hash_table_bytes: 90000000
