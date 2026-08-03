@@ -17,7 +17,6 @@
 #include <cudf/column/column_factories.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/dictionary/dictionary_factories.hpp>
-#include <cudf/null_mask.hpp>
 
 #include <rmm/device_buffer.hpp>
 #include <rmm/resource_ref.hpp>
@@ -125,36 +124,6 @@ std::unique_ptr<compressed_representation> identity_compressed_representation::f
   return std::make_unique<identity_compressed_representation>(std::move(outputs[0]));
 }
 
-namespace {
-
-// Reads a "null_mask" channel column (UINT8 bitmask bytes, as emitted by
-// dictionary/str_split named_channels) into a device_buffer + null count over
-// `num_rows` rows. Returns false and sets *error_out on a malformed channel.
-bool take_null_mask_channel(std::unique_ptr<cudf::column> mask_col,
-                            cudf::size_type num_rows,
-                            rmm::device_buffer* mask_out,
-                            cudf::size_type* null_count_out,
-                            rmm::cuda_stream_view stream,
-                            std::string* error_out)
-{
-  if (mask_col->type().id() != cudf::type_id::UINT8) {
-    if (error_out) *error_out = "dictionary null_mask must be UINT8";
-    return false;
-  }
-  if (static_cast<std::size_t>(mask_col->size()) < cudf::bitmask_allocation_size_bytes(num_rows)) {
-    if (error_out) *error_out = "dictionary null_mask is shorter than the row count requires";
-    return false;
-  }
-  auto const* bits =
-    reinterpret_cast<cudf::bitmask_type const*>(mask_col->view().data<std::uint8_t>());
-  *null_count_out = num_rows > 0 ? cudf::null_count(bits, 0, num_rows, stream) : 0;
-  auto contents   = mask_col->release();
-  *mask_out       = std::move(*contents.data);
-  return true;
-}
-
-}  // namespace
-
 std::unique_ptr<compressed_representation> dictionary_compressed_representation::from_outputs(
   std::vector<std::string> const& output_names,
   std::vector<std::unique_ptr<cudf::column>> outputs,
@@ -166,17 +135,10 @@ std::unique_ptr<compressed_representation> dictionary_compressed_representation:
     if (error_out) *error_out = "dictionary: output_names / outputs size mismatch";
     return nullptr;
   }
-  // Accepts a trailing optional "null_mask" channel (UINT8 bitmask bytes of the
-  // decoded column) — reattached below so validity survives channel-based
-  // round-trips (.hpln IO and decomposed plans).
-  bool const has_mask = !output_names.empty() && output_names.back() == "null_mask";
-
-  // keys_offsets, keys_chars, indices (+ null_mask).
-  if (outputs.size() != (has_mask ? 4u : 3u) || output_names[0] != "keys_offsets" ||
+  if (outputs.size() != 3u || output_names[0] != "keys_offsets" ||
       output_names[1] != "keys_chars" || output_names[2] != "indices") {
     if (error_out) {
-      *error_out =
-        "dictionary outputs must be named 'keys_offsets, keys_chars, indices[, null_mask]'";
+      *error_out = "dictionary outputs must be named 'keys_offsets, keys_chars, indices'";
     }
     return nullptr;
   }
@@ -188,14 +150,6 @@ std::unique_ptr<compressed_representation> dictionary_compressed_representation:
   cudf::size_type num_keys    = num_offsets > 0 ? static_cast<cudf::size_type>(num_offsets - 1) : 0;
   if (keys_chars->type().id() != cudf::type_id::UINT8) {
     if (error_out) *error_out = "dictionary keys_chars must be UINT8";
-    return nullptr;
-  }
-
-  rmm::device_buffer mask(0, stream, mr);
-  cudf::size_type null_count = 0;
-  if (has_mask &&
-      !take_null_mask_channel(
-        std::move(outputs[3]), indices->size(), &mask, &null_count, stream, error_out)) {
     return nullptr;
   }
 
@@ -212,10 +166,7 @@ std::unique_ptr<compressed_representation> dictionary_compressed_representation:
                                                 rmm::device_buffer(0, stream, mr));
 
   auto dict_col =
-    null_count > 0
-      ? cudf::make_dictionary_column(
-          std::move(keys_strings), std::move(indices), std::move(mask), null_count)
-      : cudf::make_dictionary_column(std::move(keys_strings), std::move(indices), stream, mr);
+    cudf::make_dictionary_column(std::move(keys_strings), std::move(indices), stream, mr);
   // Indices, keys, and chars are then obtained as views from this column via
   // get_dictionary_child_view(dict_col->view(), ...) / dictionary_column_view.
   return std::make_unique<dictionary_compressed_representation>(std::move(dict_col));
@@ -378,20 +329,16 @@ std::unique_ptr<compressed_representation> str_split_compressed_representation::
   rmm::device_async_resource_ref,
   std::string* error_out)
 {
-  // Variable arity: {offsets, chars} or {offsets, chars, null_mask}.
-  bool const has_mask = outputs.size() == 3;
-  if (outputs.size() != 2 && outputs.size() != 3) {
-    if (error_out) *error_out = "str_split expects 2 (offsets, chars) or 3 (+ null_mask) outputs";
+  if (outputs.size() != 2) {
+    if (error_out) *error_out = "str_split expects 2 outputs (offsets, chars)";
     return nullptr;
   }
-  if (output_names[0] != "offsets" || output_names[1] != "chars" ||
-      (has_mask && output_names[2] != "null_mask")) {
-    if (error_out) *error_out = "str_split outputs must be 'offsets, chars[, null_mask]'";
+  if (output_names[0] != "offsets" || output_names[1] != "chars") {
+    if (error_out) *error_out = "str_split outputs must be 'offsets, chars'";
     return nullptr;
   }
   auto offsets       = std::move(outputs[0]);
   auto chars         = std::move(outputs[1]);
-  auto null_mask     = has_mask ? std::move(outputs[2]) : nullptr;
   auto const off_tid = offsets->type().id();
   if (off_tid != cudf::type_id::INT32 && off_tid != cudf::type_id::INT64) {
     if (error_out) *error_out = "str_split offsets must be INT32 or INT64";
@@ -402,13 +349,13 @@ std::unique_ptr<compressed_representation> str_split_compressed_representation::
   auto const chars_tid = chars->type().id();
   bool const chars_ok  = chars_tid == cudf::type_id::UINT8 || chars_tid == cudf::type_id::UINT32 ||
                         chars_tid == cudf::type_id::UINT64;
-  if (!chars_ok || (null_mask && null_mask->type().id() != cudf::type_id::UINT8)) {
-    if (error_out) *error_out = "str_split chars must be UINT8/UINT32/UINT64, null_mask UINT8";
+  if (!chars_ok) {
+    if (error_out) *error_out = "str_split chars must be UINT8/UINT32/UINT64";
     return nullptr;
   }
   cudf::size_type const n = offsets->size() > 0 ? offsets->size() - 1 : 0;
   return std::make_unique<str_split_compressed_representation>(
-    n, std::move(offsets), std::move(chars), std::move(null_mask));
+    n, std::move(offsets), std::move(chars));
 }
 
 std::unique_ptr<compressed_representation> bitextract_compressed_representation::from_outputs(
