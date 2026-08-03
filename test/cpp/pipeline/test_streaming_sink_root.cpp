@@ -121,6 +121,12 @@ TEST_CASE_METHOD(streaming_sink_root_fixture,
       REQUIRE_FALSE(engine.has_result_collector());
 
       REQUIRE(sink.num_output_streams() == 1);
+
+      // The pipeline must actually reach the scheduler. schedule_pipelines() walks the meta
+      // pipelines with skip=true, dropping the ROOT meta -- so a plan whose only real pipeline
+      // lands in the root meta would initialize, report the right shape, and then run zero
+      // tasks. That failure is silent: the query "completes" with an empty result.
+      REQUIRE_FALSE(engine.new_scheduled.empty());
     });
 }
 
@@ -177,5 +183,37 @@ TEST_CASE_METHOD(streaming_sink_root_fixture,
       for (std::size_t i = 0; i < 3; ++i) {
         REQUIRE_FALSE(sink.drained(i));
       }
+    });
+}
+
+// ============================================================================
+// SINKROOT-4: the A/B against the result collector. Same extraction, same plan
+// generator, same connection -- only the terminal operator differs. If this
+// fails while FRAG-CONTROL passes, the sink is at fault, not the harness.
+// ============================================================================
+
+TEST_CASE_METHOD(streaming_sink_root_fixture,
+                 "SINKROOT-4: a sink-rooted plan actually produces batches",
+                 "[integration][pipeline][streaming_sink_root_exec]")
+{
+  auto repos = make_repos(1);
+
+  sirius::test::with_initialized_streaming_fragment(
+    *con,
+    "SELECT a FROM (VALUES (1), (2), (3), (4), (5)) t(a)",
+    repos,
+    std::nullopt,
+    [&](sirius::sirius_engine& engine, sirius_physical_streaming_sink& sink) {
+      engine.execute();
+
+      std::size_t created = 0;
+      for (const auto& p : engine.sirius_pipelines) {
+        created += p->get_tasks_created();
+      }
+      INFO("pipelines=" << engine.sirius_pipelines.size() << " tasks_created=" << created);
+
+      // The sink holds the same repository the caller passed in.
+      REQUIRE(repos[0]->total_size() > 0);
+      REQUIRE(sink.num_output_streams() == 1);
     });
 }
