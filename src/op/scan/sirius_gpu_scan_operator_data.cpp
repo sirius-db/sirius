@@ -19,10 +19,12 @@
 
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <data/sirius_converter_registry.hpp>
+#include <op/scan/row_filtered_table_representation.hpp>
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
 
 #include <algorithm>
 #include <memory>
+#include <stdexcept>
 
 namespace sirius::op::scan {
 
@@ -54,14 +56,34 @@ void scan_operator_input::prepare_for_processing(
       auto mut       = batch->to_mutable();
       mut.convert_to<::cucascade::gpu_table_representation>(
         registry, requested_memory_space, stream);
+      // Fused scan-filter: the converter reports decode-time row filtering by
+      // installing the tagged representation subclass (whole table-filter
+      // conjunction applied, all columns compacted to the survivor rows).
+      // Capture it on the split — materialize_table maps it to
+      // filter_state::ROW_FILTERED so the filter is not re-evaluated. Off-gate
+      // the converters always install the base type and this stays false.
+      decode_row_filtered =
+        dynamic_cast<::sirius::row_filtered_gpu_table_representation*>(mut.get_data()) != nullptr;
+      if (decode_row_filtered && mvcc_keep_mask.has_mask()) {
+        // The keep-mask is positional over the chunk's full row range; a
+        // decode-compacted table no longer lines up with it. The fused
+        // pipeline must never run for mvcc-masked chunks — fail loudly
+        // rather than filter the wrong rows.
+        throw std::runtime_error(
+          "[scan_operator_input::prepare_for_processing] decode-time row filtering is "
+          "incompatible with an mvcc keep-mask; the fused scan-filter gate must exclude "
+          "masked chunks");
+      }
       // The conversion output is a fresh per-query table (raw GPU pins serve a
       // plain gpu_table_representation and never reach this branch), so an
       // unmasked, unfiltered scan may take ownership of it here instead of
       // deep-copying it at materialize. Masked / row-filtered splits keep the
       // view path: they filter by copy and need the source view alive — and
       // skipping them means the scan allocates nothing after the take, so an
-      // OOM retry can never re-enter materialize on a consumed split.
-      if (!mvcc_keep_mask.has_mask() && !row_filter_pending) {
+      // OOM retry can never re-enter materialize on a consumed split. A
+      // decode-row-filtered split has no filter copy left to make, so it
+      // regains the zero-copy steal.
+      if (!mvcc_keep_mask.has_mask() && (!row_filter_pending || decode_row_filtered)) {
         if (auto* gpu_rep = dynamic_cast<::cucascade::gpu_table_representation*>(mut.get_data())) {
           auto& space        = gpu_rep->get_memory_space();
           stolen_table_bytes = gpu_rep->get_size_in_bytes();
@@ -132,11 +154,27 @@ std::size_t scan_operator_input::get_estimated_working_set_size_in_bytes() const
     // mask output + predicate + compacted output, inside the same envelope.
     return 2 * batch_bytes + mvcc_keep_mask.row_count + mvcc_keep_mask.view().size_bytes();
   }
+  if (decode_row_filtered) {
+    // The fused scan-filter decode already compacted this split to its
+    // survivor rows, and batch_bytes reports that compacted footprint (the
+    // conversion replaced the compressed representation; a stolen split
+    // answers from stolen_table_bytes). A stolen table is moved into the scan
+    // output with no copy; the view path still copies once at materialize, so
+    // input + output stay within 2x compacted either way — the pre-decode 2x
+    // FULL-WIDTH envelope below no longer applies.
+    bool const stolen = stolen_table != nullptr || stolen_table_consumed;
+    return stolen ? batch_bytes : 2 * batch_bytes;
+  }
   if (row_filter_pending) {
     // post_filter_and_project filters by copy: the materialized input and the
     // compacted output (up to input-sized) coexist at peak. The BOOL8
     // predicate column (1 B/row) hides inside the 2x conservatism (any
     // projected column is >= 4 B/row).
+    // TODO(fused scan-filter): before conversion this still assumes 2x
+    // full-width even when the fused pipeline will compact at decode — the
+    // reservation-time estimate cannot yet see the gate decision. Needs a
+    // "fused mask planned" query on the compressed representation to drop
+    // toward ~1.25x; over-reserving is safe meanwhile.
     return 2 * batch_bytes;
   }
   // An unmasked, unfiltered chunk serves a zero-copy view whose output copy is

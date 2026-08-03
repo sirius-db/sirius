@@ -17,6 +17,7 @@
 #pragma once
 
 // sirius
+#include <codegen/selection/selection.hpp>
 #include <expression_evaluator/gpu_expression_translator_internal.hpp>
 #include <helper/logical_type.hpp>
 
@@ -99,6 +100,55 @@ std::unordered_map<std::size_t, std::vector<std::string>> extract_string_equalit
   const duckdb::TableFilterSet& filters,
   const duckdb::vector<duckdb::ColumnIndex>& column_ids,
   const duckdb::vector<sirius::logical_type>& returned_types);
+
+/**
+ * @brief Numeric range predicates extracted from a scan's pushed-down filters
+ * (fused scan-filter pipeline, env gate @c SIRIUS_EXP_FUSED_SCAN_FILTER).
+ *
+ * Bounds live in the DECODED integer domain — the values a bitpack decoder
+ * reconstructs: DATE → stored day count, DECIMAL → unscaled integer at the
+ * *column's* scale, plain integers as-is. Inclusive both ends; @c lo > @c hi is
+ * a provably empty range (e.g. an equality against a constant the column's
+ * scale cannot represent) and legitimately selects nothing.
+ */
+struct numeric_range_extraction {
+  /// Inclusive [lo,hi] per filtered column, keyed by column primary index.
+  std::unordered_map<std::size_t, sirius::codegen::range_predicate> ranges;
+  /// True iff EVERY row-restricting filter in the set was converted into
+  /// @c ranges. This is the iteration-1 gate for decode-side compaction: rows
+  /// may only be dropped during decompression when the extracted ranges are
+  /// the *whole* filter. When false, @c ranges is left empty — one unsupported
+  /// conjunct sends the entire scan down today's decode-then-filter path.
+  bool all_conjuncts_convertible = false;
+};
+
+/**
+ * @brief Extract per-column numeric range predicates from a TableFilterSet.
+ *
+ * Recognizes CONSTANT_COMPARISON (<, <=, >, >=, =) and CONJUNCTION_AND of
+ * those, on DATE / DECIMAL(≤18) / signed- and small-unsigned-integer columns,
+ * intersecting all conjuncts into one inclusive [lo,hi] per column. Strict
+ * inequalities tighten the bound by one; decimal constants are rescaled to the
+ * column's scale exactly (floor/ceil on the correct side when the constant has
+ * more fractional digits than the column can store).
+ *
+ * Top-level OPTIONAL_FILTER and IS_NOT_NULL filters are non-restricting on the
+ * scan's post-decompress path — @ref convert_table_filters_to_expression drops
+ * them — so they are skipped here without blocking the gate; likewise for
+ * filters on @p skip_primary_indices (hive partitions, enforced at file-list
+ * level). Any other unconvertible filter clears the result and reports
+ * @c all_conjuncts_convertible == false.
+ *
+ * The caller must still confirm, per batch, that every filtered column's
+ * compression plan can evaluate its range during decode
+ * (@c sirius::build_fused_scan_directives) — this function only speaks for the
+ * filter shapes and constant types.
+ */
+numeric_range_extraction extract_numeric_range_pushdown(
+  const duckdb::TableFilterSet& filters,
+  const duckdb::vector<duckdb::ColumnIndex>& column_ids,
+  const duckdb::vector<sirius::logical_type>& returned_types,
+  const std::unordered_set<std::size_t>& skip_primary_indices = {});
 
 /**
  * @brief Bridge a DuckDB filter expression through sirius::ast::from_duckdb into the

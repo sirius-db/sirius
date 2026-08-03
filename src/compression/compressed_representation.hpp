@@ -23,6 +23,8 @@
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/memory_space.hpp>
 
+#include "decode_pushdown.hpp"
+
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -211,6 +213,29 @@ class compressed_host_representation : public cucascade::idata_representation {
     return _equality_pushdown;
   }
 
+  /// Attach the scan's numeric-range pushdown (fused scan-filter pipeline),
+  /// parallel to the selected column list; same freshly-projected-only
+  /// ownership rule as the equality pushdown above.
+  void set_range_pushdown(decode_range_pushdown pushdown, bool all_conjuncts_convertible)
+  {
+    _range_pushdown              = std::move(pushdown);
+    _range_conjuncts_convertible = all_conjuncts_convertible;
+  }
+
+  /// The attached range pushdown; empty when no decode-time range applies.
+  [[nodiscard]] const decode_range_pushdown& range_pushdown() const noexcept
+  {
+    return _range_pushdown;
+  }
+
+  /// True iff the attached ranges are the scan's WHOLE row-restricting filter —
+  /// the iteration-1 gate for decode-side compaction (rows may only be dropped
+  /// during decode when nothing else still filters the batch).
+  [[nodiscard]] bool range_conjuncts_convertible() const noexcept
+  {
+    return _range_conjuncts_convertible;
+  }
+
  private:
   /// Construct a projection sharing the same backing blob.
   compressed_host_representation(cucascade::memory::memory_space& memory_space,
@@ -228,6 +253,8 @@ class compressed_host_representation : public cucascade::idata_representation {
   std::int64_t _num_rows;
   std::optional<std::vector<std::size_t>> _selected_indices;
   decode_equality_pushdown _equality_pushdown;
+  decode_range_pushdown _range_pushdown;
+  bool _range_conjuncts_convertible = false;
 };
 
 /// A Simpatico-compressed chunk resident in GPU (device) memory.
@@ -310,6 +337,29 @@ class compressed_device_representation : public cucascade::idata_representation 
     return _equality_pushdown;
   }
 
+  /// Attach the scan's numeric-range pushdown (fused scan-filter pipeline),
+  /// parallel to the selected column list; same freshly-projected-only
+  /// ownership rule as the equality pushdown above.
+  void set_range_pushdown(decode_range_pushdown pushdown, bool all_conjuncts_convertible)
+  {
+    _range_pushdown              = std::move(pushdown);
+    _range_conjuncts_convertible = all_conjuncts_convertible;
+  }
+
+  /// The attached range pushdown; empty when no decode-time range applies.
+  [[nodiscard]] const decode_range_pushdown& range_pushdown() const noexcept
+  {
+    return _range_pushdown;
+  }
+
+  /// True iff the attached ranges are the scan's WHOLE row-restricting filter —
+  /// the iteration-1 gate for decode-side compaction (rows may only be dropped
+  /// during decode when nothing else still filters the batch).
+  [[nodiscard]] bool range_conjuncts_convertible() const noexcept
+  {
+    return _range_conjuncts_convertible;
+  }
+
  private:
   compressed_device_representation(cucascade::memory::memory_space& memory_space,
                                    std::shared_ptr<compressed_device_blob> blob,
@@ -326,6 +376,8 @@ class compressed_device_representation : public cucascade::idata_representation 
   std::int64_t _num_rows;
   std::optional<std::vector<std::size_t>> _selected_indices;
   decode_equality_pushdown _equality_pushdown;
+  decode_range_pushdown _range_pushdown;
+  bool _range_conjuncts_convertible = false;
 };
 
 }  // namespace sirius

@@ -132,18 +132,28 @@ class SharedMemAllocator {
 // ---------------------------------------------------------------------
 class Walker {
  public:
-  explicit Walker(std::string root_dtype) : dtype_(std::move(root_dtype)) {}
+  explicit Walker(std::string root_dtype, DecodeVariant variant = DecodeVariant::plain)
+    : dtype_(std::move(root_dtype)), variant_(variant)
+  {
+  }
 
   DecodeKernelSpec build(const ::codegen::jit::FusedTree& tree)
   {
     assign_ids(tree);
-    // Root producer writes the reconstructed chunk straight to global out.
-    emit_producer(tree, "(out + chunk_start)", "len", dtype_);
+    switch (variant_) {
+      case DecodeVariant::plain:
+        // Root producer writes the reconstructed chunk straight to global out.
+        emit_producer(tree, "(out + chunk_start)", "len", dtype_);
+        break;
+      case DecodeVariant::mask_out: emit_bitpack_mask_out(tree); break;
+      case DecodeVariant::mask_consume: emit_bitpack_mask_consume(tree); break;
+    }
     return finalize(tree);
   }
 
  private:
   std::string dtype_;
+  DecodeVariant variant_ = DecodeVariant::plain;
   static constexpr int tbs_ = ::codegen::kTBSize;
   std::ostringstream params_;
   std::ostringstream body_;
@@ -192,6 +202,12 @@ class Walker {
                              const std::string& dst,
                              const std::string& len,
                              const std::string& elem_type);
+
+  // ---- Fused scan-filter variants (K1 / K3, Bitpack leaf root only). ----
+  // K1 emits one __ballot_sync word per 32 consecutive rows; K3 consumes the
+  // mask via a warp scan of per-word popcounts and writes compacted output.
+  void emit_bitpack_mask_out(const ::codegen::jit::FusedTree& node);
+  void emit_bitpack_mask_consume(const ::codegen::jit::FusedTree& node);
   void emit_delta_producer(const ::codegen::jit::FusedTree& node,
                            const std::string& dst,
                            const std::string& len,
@@ -234,15 +250,37 @@ class Walker {
   {
     DecodeKernelSpec spec;
     spec.entry_symbol = make_entry_symbol(tree, dtype_, "simpatico_decode_");
+    if (variant_ == DecodeVariant::mask_out) spec.entry_symbol += "_mask_out";
+    if (variant_ == DecodeVariant::mask_consume) spec.entry_symbol += "_mask_consume";
 
     std::ostringstream src;
     src << kPrelude;
     src << "\nextern \"C\" __global__\n"
         << "void " << spec.entry_symbol << "(\n";
     if (params_.tellp() > 0) src << params_.str() << ",\n";
-    src << "    " << dtype_ << "* __restrict__ out,\n"
-        << "    int64_t n)\n"
-        << "{\n"
+    // Trailing parameters by variant.  The launcher appends the extra scalars/
+    // pointers after (out, n); predicate constants and mask pointers are kernel
+    // ARGUMENTS so one compiled kernel covers every literal (JIT-cache rule).
+    switch (variant_) {
+      case DecodeVariant::plain:
+        src << "    " << dtype_ << "* __restrict__ out,\n"
+            << "    int64_t n)\n";
+        break;
+      case DecodeVariant::mask_out:
+        // `out` slot carries the selection-mask words (ceil(n/1024)*32 of them).
+        src << "    uint32_t* __restrict__ sel_mask,\n"
+            << "    int64_t n,\n"
+            << "    int64_t pred_lo,\n"
+            << "    int64_t pred_hi)\n";
+        break;
+      case DecodeVariant::mask_consume:
+        src << "    " << dtype_ << "* __restrict__ out,\n"
+            << "    int64_t n,\n"
+            << "    const uint32_t* __restrict__ sel_mask,\n"
+            << "    const uint32_t* __restrict__ chunk_offsets)\n";
+        break;
+    }
+    src << "{\n"
         << "    constexpr int32_t CHUNK = " << ::codegen::kChunkSize << ";\n"
         << "    const int32_t chunk_id = static_cast<int32_t>(blockIdx.x);\n"
         << "    const int32_t tid      = static_cast<int32_t>(threadIdx.x);\n"
@@ -395,6 +433,88 @@ void Walker::emit_bitpack_producer(const ::codegen::jit::FusedTree& node,
   body_ << "    // --- node " << id_of(node) << ": Bitpack producer ---\n"
         << "    for (int32_t i = tid; i < (" << len << "); i += " << tbs_ << ") {\n"
         << "        (" << dst << ")[i] = " << at_pos(vs.read_expr, "i") << ";\n"
+        << "    }\n";
+}
+
+// =====================================================================
+// Bitpack mask variants — fused scan-filter epilogues (K1 / K3).
+//
+// Iteration mapping: i = j*128 + tid, so iteration j of warp w covers 32
+// CONSECUTIVE rows [chunk_start + j*128 + w*32, +32) — one __ballot_sync
+// per warp-iteration yields exactly one selection-mask uint32 (row r ->
+// bit r%32 of word r/32), stored coalesced.  Mask layout is 32 words per
+// 1024-row chunk (mask base = chunk_start/32); the last chunk's tail
+// bits/words are written as zero, which the CNT/combine wave relies on.
+// =====================================================================
+void Walker::emit_bitpack_mask_out(const ::codegen::jit::FusedTree& node)
+{
+  if (node.op != ::codegen::OpKind::Bitpack || !node.children.empty()) {
+    throw RenderError("decode render: mask_out variant requires a Bitpack leaf root (got '" +
+                      std::string(::codegen::jit::op_kind_name(node.op)) + "')");
+  }
+  ValueSource vs = bitpack_value_source(node, dtype_);
+  // Compare widened to int64 in the DECODED domain so one compiled kernel
+  // serves every literal (lo/hi are kernel parameters).
+  body_ << "    // --- node " << id_of(node)
+        << ": Bitpack fused range predicate -> selection mask (K1) ---\n"
+        << "    uint32_t* mask_words = sel_mask + (chunk_start >> 5);\n"
+        << "    #pragma unroll\n"
+        << "    for (int32_t j = 0; j < CHUNK / " << tbs_ << "; ++j) {\n"
+        << "        const int32_t i = j * " << tbs_ << " + tid;\n"
+        << "        bool pass = false;\n"
+        << "        if (i < len) {\n"
+        << "            const int64_t v = static_cast<int64_t>(" << at_pos(vs.read_expr, "i")
+        << ");\n"
+        << "            pass = (v >= pred_lo) && (v <= pred_hi);\n"
+        << "        }\n"
+        << "        const uint32_t ballot = __ballot_sync(0xFFFFFFFFu, pass);\n"
+        << "        if ((tid & 31) == 0) mask_words[i >> 5] = ballot;\n"
+        << "    }\n";
+}
+
+void Walker::emit_bitpack_mask_consume(const ::codegen::jit::FusedTree& node)
+{
+  if (node.op != ::codegen::OpKind::Bitpack || !node.children.empty()) {
+    throw RenderError("decode render: mask_consume variant requires a Bitpack leaf root (got '" +
+                      std::string(::codegen::jit::op_kind_name(node.op)) + "')");
+  }
+  // Stage 1 (warp 0): load the chunk's 32 mask words, exclusive per-word
+  // survivor prefix + chunk total via a warp scan of popcounts.
+  body_ << "    // --- node " << id_of(node)
+        << ": Bitpack masked decode -> compacted output (K3) ---\n"
+        << "    (void)len;  // mask tail bits are zero, so selected rows are always < len\n"
+        << "    __shared__ uint32_t sel_words[CHUNK / 32];\n"
+        << "    __shared__ int32_t sel_base[CHUNK / 32];  // exclusive survivor prefix per word\n"
+        << "    __shared__ int32_t sel_total;             // survivors in this chunk\n"
+        << "    if (tid < CHUNK / 32) {\n"
+        << "        const uint32_t w = sel_mask[(chunk_start >> 5) + tid];\n"
+        << "        sel_words[tid] = w;\n"
+        << "        const int32_t pc = __popc(w);\n"
+        << "        int32_t x = pc;\n"
+        << "        #pragma unroll\n"
+        << "        for (int32_t o = 1; o < 32; o <<= 1) {\n"
+        << "            const int32_t y = __shfl_up_sync(0xFFFFFFFFu, x, o);\n"
+        << "            if (tid >= o) x += y;\n"
+        << "        }\n"
+        << "        sel_base[tid] = x - pc;\n"
+        << "        if (tid == 31) sel_total = x;\n"
+        << "    }\n"
+        << "    __syncthreads();\n"
+        << "    if (sel_total == 0) return;  // zero-survivor chunk: skip the unpack entirely\n";
+
+  // Stage 2: per-chunk scalar prelude (chunk_min/bits/base loads), then the
+  // masked unpack — skipped rows are never unpacked.
+  ValueSource vs = bitpack_value_source(node, dtype_);
+  body_ << "    const int64_t out_base = static_cast<int64_t>(chunk_offsets[chunk_id]);\n"
+        << "    #pragma unroll\n"
+        << "    for (int32_t j = 0; j < CHUNK / " << tbs_ << "; ++j) {\n"
+        << "        const int32_t i = j * " << tbs_ << " + tid;\n"
+        << "        const uint32_t w = sel_words[i >> 5];\n"
+        << "        if ((w >> (i & 31)) & 1u) {\n"
+        << "            const int32_t rank = sel_base[i >> 5] + __popc(w & ((1u << (i & 31)) - "
+           "1u));\n"
+        << "            (out + out_base)[rank] = " << at_pos(vs.read_expr, "i") << ";\n"
+        << "        }\n"
         << "    }\n";
 }
 
@@ -1050,7 +1170,8 @@ void Walker::emit_raw_producer(const ::codegen::jit::FusedTree& node,
 // =====================================================================
 DecodeKernelSpec render(const ::codegen::jit::FusedTree& tree,
                         const std::string& element_dtype,
-                        std::int32_t num_chunks)
+                        std::int32_t num_chunks,
+                        DecodeVariant variant)
 {
   if (element_dtype.empty()) {
     throw std::invalid_argument("decode render: element_dtype is empty");
@@ -1060,7 +1181,7 @@ DecodeKernelSpec render(const ::codegen::jit::FusedTree& tree,
     throw RenderError("decode render: unsupported element_dtype '" + element_dtype +
                       "'. Supported: int32_t, int64_t");
   }
-  Walker w(element_dtype);
+  Walker w(element_dtype, variant);
   return w.build(tree);
 }
 

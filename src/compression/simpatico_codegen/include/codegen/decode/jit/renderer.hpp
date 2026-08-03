@@ -56,6 +56,37 @@
 
 namespace codegen::decode::jit {
 
+// Kernel variant for the fused scan-filter pipeline (experimental; engine
+// gate SIRIUS_EXP_FUSED_SCAN_FILTER lives in the wave orchestrator, not
+// here).  The variant changes the rendered source AND the entry symbol, so
+// each variant gets its own JIT-cache entry automatically; predicate
+// constants and mask/offset pointers are KERNEL PARAMETERS (appended after
+// `out, n`), never baked into the source — one compile covers all literals.
+//
+//   * plain        — full-column decode, today's behaviour (byte-identical
+//                    source to the pre-variant renderer).
+//   * mask_out     — K1: Bitpack-LEAF-root decode fused with an inclusive
+//                    [lo,hi] range predicate on the decoded integer domain,
+//                    producing selection-mask words (row r -> bit r%32 of
+//                    word r/32; 32 words per 1024-row chunk, tail bits and
+//                    tail words written as zero).  NO column write; the
+//                    `out` parameter slot is `uint32_t* sel_mask`, which
+//                    must hold ceil(n/1024)*32 words.  Extra params:
+//                    `int64_t pred_lo, int64_t pred_hi` (values are widened
+//                    to int64 for the compare).
+//   * mask_consume — K3: Bitpack-LEAF-root decode consuming a selection
+//                    mask plus per-chunk exclusive survivor offsets
+//                    (`chunk_offsets[c]` = compacted output base of chunk
+//                    c, length num_chunks+1), writing compacted output in
+//                    row order.  Skipped rows are never unpacked; chunks
+//                    with zero survivors early-return.  Extra params:
+//                    `const uint32_t* sel_mask, const uint32_t*
+//                    chunk_offsets`.
+//
+// Non-Bitpack-leaf tree shapes are rejected with RenderError for the mask
+// variants (Delta/RLE cannot row-skip — block-wide scan / run expansion).
+enum class DecodeVariant : std::uint8_t { plain = 0, mask_out = 1, mask_consume = 2 };
+
 // One decode-input channel the rendered kernel reads.  `field` is the
 // manifest key (`buffer_key(node_id, field)` resolves the device
 // pointer in the launcher's LabeledBuffers).
@@ -96,8 +127,13 @@ using ::codegen::jit::RenderError;
 // boundary), For (semi-inline transformer), Zigzag (inline transform or
 // leaf store), and Raw (verbatim-passthrough leaf, valid as a
 // delta/rle/for child), composed arbitrarily.
+//
+// `variant` selects the epilogue (see DecodeVariant above); the default
+// renders today's plain full-column decode byte-identically.  mask_out /
+// mask_consume require a Bitpack leaf root.
 DecodeKernelSpec render(const ::codegen::jit::FusedTree& tree,
                         const std::string& element_dtype,
-                        std::int32_t num_chunks);
+                        std::int32_t num_chunks,
+                        DecodeVariant variant = DecodeVariant::plain);
 
 }  // namespace codegen::decode::jit

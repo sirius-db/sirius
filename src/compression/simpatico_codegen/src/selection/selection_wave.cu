@@ -1,0 +1,231 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// selection_wave.cu — device helpers for the fused scan-filter selection wave
+// (SIRIUS_EXP_FUSED_SCAN_FILTER). Three pieces, all mask-shaped (1 bit/row,
+// 32 uint32 words per 1024-row chunk, tail bits zero):
+//
+//   * combine_masks_and : AND k per-column K1 masks into one batch mask.
+//   * run_selection_cnt : per-chunk popcount + CUB exclusive scan ->
+//                         chunk_offsets (K3's per-chunk output bases) +
+//                         survivor_count D2H (the one host sync — it gates
+//                         wave-2 allocations).
+//   * mask_to_row_indices : mask -> ascending int32 survivor rows (the TierB
+//                         cudf::gather map, built once per batch).
+//
+// Kernel logic is ported from the verified microbench
+// (scratchpad/fusebench/fusebench.cu: k1/cnt/k2a idioms), with CNT re-shaped
+// from its slow one-block-per-chunk form to word-per-thread grid-stride with a
+// warp reduce (a warp's 32 lanes cover exactly one chunk's 32 words).
+
+#include "codegen/selection/selection.hpp"
+
+#include <rmm/device_buffer.hpp>
+
+#include <cub/device/device_scan.cuh>
+#include <cuda_runtime.h>
+
+#include <cstdint>
+#include <stdexcept>
+#include <string>
+
+namespace sirius::codegen {
+
+namespace {
+
+constexpr int kBlock = 256;                 // threads per block, all kernels here
+constexpr int kWordsPerChunk = 32;          // 1024 rows / 32 bits
+constexpr unsigned kFullWarp = 0xffffffffu;
+
+inline void throw_on_cuda(cudaError_t err, char const* what)
+{
+  if (err != cudaSuccess) {
+    throw std::runtime_error(std::string("selection_wave: ") + what + ": " +
+                             cudaGetErrorString(err));
+  }
+}
+
+inline int grid_for(int64_t items, int per_block)
+{
+  int64_t g = (items + per_block - 1) / per_block;
+  if (g < 1) g = 1;
+  if (g > 4096) g = 4096;  // grid-stride covers the rest
+  return static_cast<int>(g);
+}
+
+// Up-to-8 source masks, passed by value as kernel params.
+struct mask_src_ptrs {
+  uint32_t const* p[8];
+};
+
+// dst = AND of n srcs, uint4-vectorized (num_words is a multiple of 4: masks
+// are 32 words per chunk). Grid-stride.
+__global__ void mask_and_combine_kernel(uint32_t* __restrict__ dst,
+                                        mask_src_ptrs srcs,
+                                        int num_srcs,
+                                        int64_t num_quads)
+{
+  auto* __restrict__ d4 = reinterpret_cast<uint4*>(dst);
+  int64_t const stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
+  for (int64_t q = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; q < num_quads;
+       q += stride) {
+    uint4 v = reinterpret_cast<uint4 const*>(srcs.p[0])[q];
+    for (int s = 1; s < num_srcs; ++s) {
+      uint4 const w = reinterpret_cast<uint4 const*>(srcs.p[s])[q];
+      v.x &= w.x;
+      v.y &= w.y;
+      v.z &= w.z;
+      v.w &= w.w;
+    }
+    d4[q] = v;
+  }
+}
+
+// Per-chunk popcount: word-per-thread, one warp covers one chunk's 32 words,
+// warp shfl reduce, lane 0 writes counts[chunk]. Grid-stride over chunks.
+__global__ void chunk_popcount_kernel(uint32_t const* __restrict__ words,
+                                      int64_t num_chunks,
+                                      uint32_t* __restrict__ counts)
+{
+  int const lane = threadIdx.x & 31;
+  int64_t const warps_per_grid = (static_cast<int64_t>(gridDim.x) * blockDim.x) >> 5;
+  int64_t warp = (static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x) >> 5;
+  for (; warp < num_chunks; warp += warps_per_grid) {
+    unsigned pc = __popc(words[warp * kWordsPerChunk + lane]);
+    for (int o = 16; o; o >>= 1)
+      pc += __shfl_down_sync(kFullWarp, pc, o);
+    if (lane == 0) counts[warp] = pc;
+  }
+}
+
+// Sentinel: chunk_offsets[nc] = chunk_offsets[nc-1] + counts[nc-1]. One thread;
+// avoids a D2H round-trip for the tail (same idiom as bp_offsets_tail_kernel
+// in src/bridge/offsets_cumsum.cu).
+__global__ void chunk_offsets_tail_kernel(uint32_t const* __restrict__ counts,
+                                          int64_t num_chunks,
+                                          uint32_t* __restrict__ offsets)
+{
+  offsets[num_chunks] = offsets[num_chunks - 1] + counts[num_chunks - 1];
+}
+
+// mask -> ascending survivor row ids. One warp per chunk: lane l owns word l,
+// warp-exclusive shfl_up prefix of popcounts gives each word's output base
+// inside the chunk; bits are drained in ascending order so the global output
+// is fully ordered (cudf gather map contract). Ported from the microbench's
+// load_mask_scan/k2a idiom, flattened to warp shuffles (no smem, no block sync).
+__global__ void mask_to_indices_kernel(uint32_t const* __restrict__ words,
+                                       uint32_t const* __restrict__ chunk_offsets,
+                                       int64_t num_chunks,
+                                       int32_t* __restrict__ out)
+{
+  int const lane = threadIdx.x & 31;
+  int64_t const warps_per_grid = (static_cast<int64_t>(gridDim.x) * blockDim.x) >> 5;
+  int64_t warp = (static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x) >> 5;
+  for (; warp < num_chunks; warp += warps_per_grid) {
+    uint32_t wv = words[warp * kWordsPerChunk + lane];
+    int const pc = __popc(wv);
+    int x = pc;
+    for (int o = 1; o < 32; o <<= 1) {
+      int const y = __shfl_up_sync(kFullWarp, x, o);
+      if (lane >= o) x += y;
+    }
+    int64_t base = chunk_offsets[warp] + static_cast<int64_t>(x - pc);
+    int32_t const row0 =
+      static_cast<int32_t>(warp * SELECTION_CHUNK_ROWS) + lane * 32;
+    while (wv) {
+      int const b = __ffs(wv) - 1;
+      wv &= wv - 1u;
+      out[base++] = row0 + b;
+    }
+  }
+}
+
+}  // namespace
+
+void combine_masks_and(uint32_t* dst_words,
+                       uint32_t const* const* src_words,
+                       int num_srcs,
+                       int64_t num_words,
+                       rmm::cuda_stream_view stream)
+{
+  if (num_srcs < 1 || num_srcs > 8)
+    throw std::runtime_error("selection_wave: combine_masks_and needs 1..8 sources");
+  if ((num_words & 3) != 0)
+    throw std::runtime_error("selection_wave: num_words must be a multiple of 4");
+  if (num_words == 0) return;
+  mask_src_ptrs srcs{};
+  for (int s = 0; s < num_srcs; ++s)
+    srcs.p[s] = src_words[s];
+  int64_t const num_quads = num_words / 4;
+  mask_and_combine_kernel<<<grid_for(num_quads, kBlock), kBlock, 0, stream.value()>>>(
+    dst_words, srcs, num_srcs, num_quads);
+  throw_on_cuda(cudaPeekAtLastError(), "mask_and_combine launch");
+}
+
+int64_t run_selection_cnt(selection_mask& mask,
+                          rmm::cuda_stream_view stream,
+                          rmm::device_async_resource_ref mr)
+{
+  if (mask.words == nullptr || mask.chunk_offsets == nullptr || mask.num_rows <= 0)
+    throw std::runtime_error("selection_wave: run_selection_cnt on an unbound mask");
+  int64_t const nc = selection_mask::ChunksFor(mask.num_rows);
+
+  // Per-chunk survivor counts (transient, stream-ordered, freed on return —
+  // safe: the final D2H copy below host-syncs the stream).
+  rmm::device_buffer counts_buf(static_cast<std::size_t>(nc) * sizeof(uint32_t), stream, mr);
+  auto* counts = static_cast<uint32_t*>(counts_buf.data());
+
+  int const warps_per_block = kBlock / 32;
+  chunk_popcount_kernel<<<grid_for(nc, warps_per_block), kBlock, 0, stream.value()>>>(
+    mask.words, nc, counts);
+  throw_on_cuda(cudaPeekAtLastError(), "chunk_popcount launch");
+
+  // CUB two-call exclusive scan counts -> chunk_offsets[0..nc).
+  std::size_t tmp_bytes = 0;
+  throw_on_cuda(cub::DeviceScan::ExclusiveSum(nullptr,
+                                              tmp_bytes,
+                                              counts,
+                                              mask.chunk_offsets,
+                                              static_cast<int>(nc),
+                                              stream.value()),
+                "chunk_offsets scan probe");
+  rmm::device_buffer tmp(tmp_bytes, stream, mr);
+  throw_on_cuda(cub::DeviceScan::ExclusiveSum(tmp.data(),
+                                              tmp_bytes,
+                                              counts,
+                                              mask.chunk_offsets,
+                                              static_cast<int>(nc),
+                                              stream.value()),
+                "chunk_offsets scan");
+  chunk_offsets_tail_kernel<<<1, 1, 0, stream.value()>>>(counts, nc, mask.chunk_offsets);
+  throw_on_cuda(cudaPeekAtLastError(), "chunk_offsets tail launch");
+
+  // The one host sync of the selection wave: survivor_count gates wave-2
+  // allocations (compacted TierA columns, the TierB gather map).
+  uint32_t total = 0;
+  throw_on_cuda(cudaMemcpyAsync(&total,
+                                mask.chunk_offsets + nc,
+                                sizeof(uint32_t),
+                                cudaMemcpyDeviceToHost,
+                                stream.value()),
+                "survivor_count D2H");
+  throw_on_cuda(cudaStreamSynchronize(stream.value()), "survivor_count sync");
+
+  mask.survivor_count = static_cast<int64_t>(total);
+  return mask.survivor_count;
+}
+
+void mask_to_row_indices(selection_mask const& mask,
+                         int32_t* out_indices,
+                         rmm::cuda_stream_view stream)
+{
+  if (mask.survivor_count < 0 || mask.chunk_offsets == nullptr)
+    throw std::runtime_error("selection_wave: mask_to_row_indices before CNT ran");
+  if (mask.survivor_count == 0) return;
+  int64_t const nc = selection_mask::ChunksFor(mask.num_rows);
+  int const warps_per_block = kBlock / 32;
+  mask_to_indices_kernel<<<grid_for(nc, warps_per_block), kBlock, 0, stream.value()>>>(
+    mask.words, mask.chunk_offsets, nc, out_indices);
+  throw_on_cuda(cudaPeekAtLastError(), "mask_to_indices launch");
+}
+
+}  // namespace sirius::codegen

@@ -240,6 +240,10 @@ struct cached_scan_plan {
 /// compressed chunk answer an equality/IN filter *during* decompression — the
 /// column arrives as a BOOL8 mask instead of being reconstructed. See
 /// @c sirius::decode_equality_pushdown. Empty (the default) disables it.
+/// @p range_pushdown is the fused scan-filter analog (whole-filter numeric
+/// ranges, @c sirius::decode_range_pushdown): GPU-tier compressed chunks may
+/// evaluate it during decode and hand back already-filtered batches. Empty
+/// (the default) disables it.
 std::unique_ptr<databatch_provider> make_provider_for_pinned_entry(
   pinned_entry const& entry,
   std::span<std::size_t const> selected_columns,
@@ -247,7 +251,8 @@ std::unique_ptr<databatch_provider> make_provider_for_pinned_entry(
   const telemetry::batch_telemetry_info& telemetry_info,
   mvcc_chunk_mask_set mvcc_masks                     = {},
   std::vector<insert_delta_split> delta_splits       = {},
-  sirius::decode_equality_pushdown equality_pushdown = {});
+  sirius::decode_equality_pushdown equality_pushdown = {},
+  sirius::decode_range_pushdown range_pushdown       = {});
 
 /**
  * @brief Build the survivor plan for serving @p entry to a scan into @p requiested_column_ids with

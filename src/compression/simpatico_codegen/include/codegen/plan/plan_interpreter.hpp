@@ -7,8 +7,12 @@
 #include "codegen/plan/representation.hpp"
 #include "codegen/util/stream_pool.hpp"
 
+#include "codegen/selection/selection.hpp"
+
+#include <cudf/table/table.hpp>
 #include <cudf/utilities/default_stream.hpp>
 
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -78,6 +82,35 @@ std::unique_ptr<compressed_representation> compress_single_op(std::string const&
                                                               rmm::device_async_resource_ref mr,
                                                               std::string* error_out);
 
+/// Per-column decode-time row selection for the fused scan-filter pipeline
+/// (`SIRIUS_EXP_FUSED_SCAN_FILTER`). Built by the wave-2 orchestrator in
+/// ``decompress_columns_parallel`` AFTER the combine + CNT wave fixed the
+/// survivor count; never active on the default path (gate off ⇒ callers pass
+/// nullptr and behavior is byte-identical).
+///
+/// Two consumption modes:
+///  * ``compact_capable`` (Tier A): the plan's root fused region decodes with
+///    the mask and writes compacted output directly — the output column is
+///    allocated count-first with ``survivor_count`` rows.
+///  * ``!compact_capable`` (Tier B): the column decodes full width exactly as
+///    today, then one ``cudf::gather`` over ``survivor_indices`` compacts it.
+struct decode_selection {
+  /// Combined AND-of-all-conjuncts scan mask; CNT already ran. Opaque to the
+  /// decode driver — only forwarded to the masked JIT launch as kernel
+  /// arguments (see codegen/selection/selection.hpp).
+  sirius::codegen::selection_mask const* mask = nullptr;
+  /// Survivor row count (popcount of @c mask); >= 0 once the CNT wave ran.
+  std::int64_t survivor_count = -1;
+  /// INT32 survivor row indices, size == @c survivor_count. Built ONCE per
+  /// batch by the selection wave's mask→indices kernel and shared by every
+  /// Tier-B column of the batch. Only read on the Tier-B path.
+  cudf::column_view survivor_indices{};
+  /// True when the plan's root region consumes the mask in-kernel (Tier A).
+  bool compact_capable = false;
+
+  [[nodiscard]] bool active() const noexcept { return mask != nullptr && survivor_count >= 0; }
+};
+
 /// Decompress a plan tree produced by compress_column. DecodeWalk performs a
 /// single reverse walk: each codegen-fused subtree root is inverted by one
 /// high-level ``decode_fused_subtree`` call and every other step by its rep's
@@ -89,17 +122,73 @@ std::unique_ptr<compressed_representation> compress_single_op(std::string const&
 ///              against the key set and never gathers the chars; every other
 ///              shape decodes normally and compares afterwards, which is correct
 ///              but no cheaper — gate on @c plan_supports_predicate_decode.
+/// @param sel   Optional fused scan-filter row selection (see
+///              @c decode_selection). When non-null and active the result holds
+///              only the mask's survivor rows: a Tier-A plan decodes compacted
+///              in-kernel, a Tier-B plan decodes full width and is gathered.
+///              Mutually exclusive with @p pred. Iteration 1 requires non-null
+///              columns — a null-masked decode fails loudly (never corrupts).
 std::unique_ptr<cudf::column> decompress_column(PlanTree const& tree,
                                                 rmm::cuda_stream_view stream,
                                                 rmm::device_async_resource_ref mr,
                                                 std::string* error_out,
-                                                decode_predicate const* pred = nullptr);
+                                                decode_predicate const* pred = nullptr,
+                                                decode_selection const* sel  = nullptr);
 
 /// True iff @p tree decodes a predicate without materialising the column — i.e.
 /// its root value is produced by a `dictionary` node, so the predicate resolves
 /// against the keys. Callers use this to decide whether pushing a predicate down
 /// is worth anything; pushing it into any other plan is correct but pointless.
 bool plan_supports_predicate_decode(PlanTree const& tree);
+
+/// True iff @p tree can run the masked (K1 mask-out / K3 mask-consume) decode
+/// variants — i.e. its root value is produced by a `bitpack` node. The wave
+/// orchestrator gates every fused scan-filter column on this; any other plan
+/// shape decodes full width (Tier B) or falls back to the classic path.
+bool plan_supports_selection_decode(PlanTree const& tree);
+
+/// Wave 1 / K1: decode @p tree's root bitpack region fused with the inclusive
+/// decoded-domain range @p pred, writing selection-mask words into
+/// @p mask_words — NO column output is allocated or written. @p mask_words
+/// must hold ``selection_mask::AllocWordsFor(num_rows)`` words; every word of
+/// every covered chunk is written (out-of-range lanes ballot to 0, so tail
+/// bits are zero by construction). Returns false + @p error_out when the plan
+/// is not bitpack-rooted or the launch fails; no device state is corrupted.
+bool decompress_column_selection_mask(PlanTree const& tree,
+                                      sirius::codegen::range_predicate pred,
+                                      std::uint32_t* mask_words,
+                                      rmm::cuda_stream_view stream,
+                                      rmm::device_async_resource_ref mr,
+                                      std::string* error_out);
+
+/// Wave 2 / K3 (Tier A): decode @p tree compacted through @p mask — the output
+/// column is allocated count-first with ``mask.survivor_count`` rows and rows
+/// whose mask bit is 0 are never unpacked. Requires the CNT wave to have run
+/// (``mask.survivor_count >= 0`` and ``mask.chunk_offsets != nullptr``) and a
+/// bitpack-rooted plan (gate on @c plan_supports_selection_decode). Returns
+/// nullptr + @p error_out otherwise — never a full-width column.
+std::unique_ptr<cudf::column> decompress_column_compacted(
+  PlanTree const& tree,
+  sirius::codegen::selection_mask const& mask,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr,
+  std::string* error_out);
+
+/// Assemble the fused scan-filter decode output (see
+/// ``simpatico::decompress_scan_filter``) into one uniformly survivor-sized
+/// table: Tier-A columns pass through (already compacted); ALL Tier-B
+/// (full-width) columns are compacted with ONE ``cudf::gather`` over
+/// ``result.row_indices``. When ``result.applied`` is false the columns are
+/// assembled unchanged (classic full-width decode). Iteration 1 refuses
+/// null-masked columns (returns nullptr + @p error_out; the caller must fall
+/// back to the classic decode — never corrupt). Synchronizes @p stream before
+/// returning, so the caller may free/rebind the inputs immediately.
+std::unique_ptr<cudf::table> compact_scan_filter_output(
+  std::vector<std::unique_ptr<cudf::column>>&& columns,
+  sirius::codegen::scan_filter_result const& result,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr,
+  std::string* error_out);
 
 /// Reconstruct a compressed_representation from named output columns. A thin
 /// dispatcher mapping the compressor name (or the ``bitextract_<spec>`` prefix)

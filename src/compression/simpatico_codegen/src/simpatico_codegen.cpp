@@ -3,9 +3,11 @@
 
 #include "codegen/plan/plan_interpreter.hpp"
 #include "codegen/plan/representation.hpp"
+#include "codegen/selection/selection.hpp"
 #include "codegen/util/stream_pool.hpp"
 
 #include <cudf/column/column.hpp>
+#include <cudf/column/column_view.hpp>
 #include <cudf/types.hpp>
 #include <cudf/utilities/traits.hpp>
 
@@ -14,8 +16,12 @@
 #include <cuda_runtime.h>
 #include <nvtx3/nvtx3.hpp>
 
+#include <cstdio>
+#include <cstdlib>
+#include <limits>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -300,6 +306,242 @@ std::unique_ptr<cudf::table> decompress_columns_parallel(compressed_table const&
   return decompress_columns_parallel(table, selected, {}, pool, mr);
 }
 
+// ── Fused scan-filter orchestration (env gate SIRIUS_EXP_FUSED_SCAN_FILTER) ──
+//
+// Two-wave schedule inside one converter call (contract W4):
+//   wave 1: K1 mask decodes for the filter columns, round-robin on the pool
+//           streams; stream 0 waits on the others (events, no host sync),
+//           AND-combines the masks, runs CNT (per-chunk popcount + CUB scan ->
+//           chunk_offsets) and D2H's the survivor count — the single added
+//           host sync, it gates wave-2 allocations.
+//   wave 2: TierA K3 compacted decodes + TierB plain decodes in parallel on
+//           the pool streams (run_column_workers, as today); the TierB gather
+//           map (mask -> int32 row indices) is built on stream 0 concurrently.
+// Any missing precondition ⇒ std::nullopt, and the caller runs today's path
+// byte-identically (same kernels, same allocations, zero added syncs).
+
+bool fused_scan_filter_enabled()
+{
+  static bool const enabled = [] {
+    char const* v = std::getenv("SIRIUS_EXP_FUSED_SCAN_FILTER");
+    return v != nullptr && std::string_view{v} == "1";
+  }();
+  return enabled;
+}
+
+// ── Wave-1 per-column entry point required from W3 (stubbed until published) ─
+// W1 published the FusedTree-level K1 launcher (launch_decode_fused_tree_mask_out,
+// codegen/decode/masked_launch.hpp), but the PlanTree -> FusedTree/LabeledBuffers
+// binding lives in plan/decompress.cpp (W3). Needed there (tracked in
+// scratchpad/fusebench/STATUS-W4.md):
+//
+//   // Wave 1 / K1: decode the root bitpack leaf fused with the inclusive
+//   // decoded-domain range -> mask.words; NO column output. Must write all 32
+//   // words of every 1024-row chunk (out-of-range lanes ballot to 0, so tail
+//   // bits are zero); mask.words holds AllocWordsFor(num_rows) words.
+//   bool decompress_column_selection_mask(PlanTree const& tree,
+//                                         sirius::codegen::range_predicate pred,
+//                                         sirius::codegen::selection_mask& mask,
+//                                         rmm::cuda_stream_view stream,
+//                                         rmm::device_async_resource_ref mr,
+//                                         std::string* error_out);
+//
+// Wave 2 needs no stub: it calls the published decompress_column(...,
+// decode_selection const* sel) (plan_interpreter.hpp; TierA = compact_capable,
+// TierB = full decode + in-call gather over survivor_indices).
+
+// Flip when W3's per-column K1 wrapper lands; false keeps the fused path
+// rejected in the preconditions (zero device work, no per-batch log spam).
+constexpr bool kSelectionMaskDecodeAvailable = false;
+
+bool fused_decompress_column_selection_mask(PlanTree const& /*tree*/,
+                                            sirius::codegen::range_predicate /*pred*/,
+                                            sirius::codegen::selection_mask& /*mask*/,
+                                            rmm::cuda_stream_view /*stream*/,
+                                            rmm::device_async_resource_ref /*mr*/,
+                                            std::string* error_out)
+{
+  if (error_out) *error_out = "K1 selection-mask decode not published yet (W3 wrapper over W1)";
+  return false;
+}
+
+// RAII CUDA events for the wave-1 -> combine cross-stream join.
+struct event_set {
+  std::vector<cudaEvent_t> events;
+
+  cudaEvent_t make()
+  {
+    cudaEvent_t ev{};
+    if (cudaEventCreateWithFlags(&ev, cudaEventDisableTiming) != cudaSuccess)
+      throw plan_error("fused scan-filter: cudaEventCreate failed");
+    events.push_back(ev);
+    return ev;
+  }
+
+  ~event_set()
+  {
+    for (auto ev : events)
+      cudaEventDestroy(ev);
+  }
+};
+
+// The fused two-wave decode. Returns std::nullopt in two cases:
+//   (a) a precondition fails BEFORE any device work — nothing was issued;
+//   (b) anything fails mid-flight — the pool is synchronized, `result` is
+//       reset, and the WHOLE batch is retried unfused by the caller (W3's
+//       required fallback semantics; TierA/TierB errors from decompress_column
+//       surface here as plan_error).
+std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
+  compressed_table const& table,
+  std::span<const std::size_t> selected,
+  sirius::codegen::scan_filter_request const& request,
+  sirius::codegen::scan_filter_result& result,
+  stream_pool& pool,
+  rmm::device_async_resource_ref mr)
+{
+  namespace sc = sirius::codegen;
+
+  // Preconditions — all checked before touching the device.
+  if (!fused_scan_filter_enabled()) return std::nullopt;
+  if (!kSelectionMaskDecodeAvailable) return std::nullopt;  // W3 K1 wrapper pending
+  if (request.filters.empty()) return std::nullopt;
+  if (request.tiers.size() != selected.size()) return std::nullopt;
+  if (pool.streams.empty()) return std::nullopt;
+  int64_t const num_rows = table.num_rows();
+  if (num_rows <= 0) return std::nullopt;
+  if (num_rows > std::numeric_limits<std::int32_t>::max()) return std::nullopt;
+  if (request.filters.size() > 8) return std::nullopt;  // combine_masks_and limit
+  for (auto const idx : selected) {
+    if (idx >= table.columns.size()) return std::nullopt;
+    auto const& col = table.columns[idx];
+    if (!col.plan_tree || col.num_rows != num_rows) return std::nullopt;
+  }
+  for (auto const& f : request.filters) {
+    if (f.column >= selected.size()) return std::nullopt;
+    if (f.pred.lo > f.pred.hi) return std::nullopt;  // empty range: let the engine filter
+  }
+
+  // Declared before the try so the mid-flight catch can pool.sync_all() BEFORE
+  // these buffers/events unwind (their stream-ordered frees must not race the
+  // combine's cross-stream reads).
+  std::vector<rmm::device_buffer> per_filter;
+  event_set join_events;
+
+  try {
+    int64_t const nc          = sc::selection_mask::ChunksFor(num_rows);
+    int64_t const alloc_words = sc::selection_mask::AllocWordsFor(num_rows);
+    size_t const n_streams    = pool.streams.size();
+    rmm::cuda_stream_view s0{pool.streams[0]};
+
+    result.num_rows = num_rows;
+    result.mask_words =
+      rmm::device_buffer(static_cast<std::size_t>(alloc_words) * sizeof(std::uint32_t), s0, mr);
+    result.chunk_offsets =
+      rmm::device_buffer(static_cast<std::size_t>(nc + 1) * sizeof(std::uint32_t), s0, mr);
+    auto* combined = static_cast<std::uint32_t*>(result.mask_words.data());
+
+    // ── Wave 1: K1 mask decodes, filter 0 straight into the combined buffer on
+    // stream 0 (its allocation stream), filters 1..k-1 into per-filter buffers
+    // allocated on the stream that writes them.
+    size_t const k = request.filters.size();
+    per_filter.reserve(k > 1 ? k - 1 : 0);
+    std::vector<std::uint32_t const*> mask_ptrs;
+    mask_ptrs.reserve(k);
+    mask_ptrs.push_back(combined);
+
+    for (size_t f = 0; f < k; ++f) {
+      rmm::cuda_stream_view stream =
+        (f == 0) ? s0 : rmm::cuda_stream_view{pool.streams[f % n_streams]};
+      std::uint32_t* dst = combined;
+      if (f > 0) {
+        per_filter.emplace_back(static_cast<std::size_t>(alloc_words) * sizeof(std::uint32_t),
+                                stream,
+                                mr);
+        dst = static_cast<std::uint32_t*>(per_filter.back().data());
+        mask_ptrs.push_back(dst);
+      }
+      auto const& directive = request.filters[f];
+      auto const& col       = table.columns[selected[directive.column]];
+      sc::selection_mask fmask{dst, num_rows, -1, nullptr};
+      std::string err;
+      if (!fused_decompress_column_selection_mask(
+            *col.plan_tree, directive.pred, fmask, stream, mr, &err)) {
+        throw plan_error(err.empty() ? "fused scan-filter: K1 mask decode failed" : err);
+      }
+      if (f > 0 && stream.value() != s0.value()) {
+        // Publish this stream's mask to stream 0 without a host sync.
+        cudaEvent_t ev = join_events.make();
+        if (cudaEventRecord(ev, stream.value()) != cudaSuccess ||
+            cudaStreamWaitEvent(s0.value(), ev, 0) != cudaSuccess) {
+          throw plan_error("fused scan-filter: wave-1 stream join failed");
+        }
+      }
+    }
+
+    // ── Combine + CNT on stream 0. run_selection_cnt host-syncs s0 once (the
+    // survivor count gates wave-2 allocations); after it returns, every wave-1
+    // kernel and the combine have completed, so per_filter teardown is safe.
+    if (k > 1) {
+      sc::combine_masks_and(combined, mask_ptrs.data(), static_cast<int>(k), alloc_words, s0);
+    }
+    sc::selection_mask sel{
+      combined, num_rows, -1, static_cast<std::uint32_t*>(result.chunk_offsets.data())};
+    sc::run_selection_cnt(sel, s0, mr);
+    result.survivor_count = sel.survivor_count;
+    per_filter.clear();
+
+    // ── TierB gather map on stream 0, overlapping wave 2 (column 0's wave-2
+    // work serializes behind it on s0; the other streams run free). Built ONCE
+    // per batch; the same view is handed to every TierB column (W3 contract).
+    result.tiers.assign(request.tiers.begin(), request.tiers.end());
+    bool any_tier_b = false;
+    for (auto const t : result.tiers)
+      any_tier_b |= t == sc::output_tier::tier_b;
+    cudf::column_view survivor_indices{cudf::data_type{cudf::type_id::INT32}, 0, nullptr, nullptr, 0};
+    if (any_tier_b && sel.survivor_count > 0) {
+      result.row_indices = rmm::device_buffer(
+        static_cast<std::size_t>(sel.survivor_count) * sizeof(std::int32_t), s0, mr);
+      sc::mask_to_row_indices(sel, static_cast<std::int32_t*>(result.row_indices.data()), s0);
+      survivor_indices = cudf::column_view{cudf::data_type{cudf::type_id::INT32},
+                                           static_cast<cudf::size_type>(sel.survivor_count),
+                                           result.row_indices.data(),
+                                           nullptr,
+                                           0};
+    }
+
+    // ── Wave 2: TierA compacted (compact_capable) + TierB full-decode+gather,
+    // round-robin on the pool streams via the published
+    // decompress_column(..., decode_selection const*) contract. Everything
+    // wave 2 consumes (mask, chunk_offsets) completed before the CNT host sync
+    // above, so no cross-stream waits are needed.
+    std::vector<std::unique_ptr<cudf::column>> cols(selected.size());
+    run_column_workers(selected.size(), pool, [&](size_t i, rmm::cuda_stream_view stream) {
+      auto const& col = table.columns[selected[i]];
+      decode_selection dsel;
+      dsel.mask             = &sel;
+      dsel.survivor_count   = sel.survivor_count;
+      dsel.survivor_indices = survivor_indices;
+      dsel.compact_capable  = result.tiers[i] == sc::output_tier::tier_a;
+      std::string err;
+      auto out = decompress_column(*col.plan_tree, stream, mr, &err, nullptr, &dsel);
+      if (!out) throw plan_error(err.empty() ? "fused scan-filter: decompress failed" : err);
+      cols[i] = apply_stored_dtype(std::move(out), col.dtype);
+    });
+    // run_column_workers ended with pool.sync_all(), which also covers the
+    // mask_to_row_indices launch on s0.
+
+    result.applied = true;
+    return cols;
+  } catch (std::exception const& e) {
+    std::fprintf(stderr,
+                 "simpatico: fused scan-filter failed (%s); retrying the batch unfused\n",
+                 e.what());
+    pool.sync_all();  // quiesce in-flight wave kernels before buffers unwind
+    result = sirius::codegen::scan_filter_result{};
+    return std::nullopt;
+  }
+}
+
 }  // namespace
 
 // ── compressed_table ─────────────────────────────────────────────────────────
@@ -483,6 +725,23 @@ bool column_supports_predicate_decode(const compressed_table& table, std::size_t
   if (column_index >= table.columns.size()) { return false; }
   auto const& tree = table.columns[column_index].plan_tree;
   return tree && plan_supports_predicate_decode(*tree);
+}
+
+std::vector<std::unique_ptr<cudf::column>> decompress_scan_filter(
+  const compressed_table& table,
+  std::span<const std::size_t> selected_columns,
+  sirius::codegen::scan_filter_request const& request,
+  sirius::codegen::scan_filter_result& result,
+  simpatico::stream_pool& pool,
+  rmm::device_async_resource_ref mr)
+{
+  nvtx3::scoped_range nvtx_range{"simpatico::decompress_table[scan_filter,pool]"};
+  result = sirius::codegen::scan_filter_result{};
+  if (auto cols = try_decompress_fused(table, selected_columns, request, result, pool, mr)) {
+    return std::move(*cols);
+  }
+  // Gate off / no directives / precondition failed: exactly today's path.
+  return decompress_columns_parallel(table, selected_columns, pool, mr)->release();
 }
 
 }  // namespace simpatico

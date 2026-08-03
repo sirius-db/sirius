@@ -30,6 +30,7 @@
 #include "op/scan/gpu_ingestible.hpp"
 #include "op/scan/parquet_gpu_ingestible.hpp"
 #include "op/scan/parquet_metadata.hpp"
+#include "op/scan/scan_utils.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "op/scan/sirius_gpu_scan_operator_data.hpp"
 #include "op/sirius_physical_operator_type.hpp"
@@ -37,6 +38,8 @@
 #include "scan_manager/round_robin_strategy.hpp"
 
 #include <cudf/column/column_view.hpp>
+
+#include <cstdlib>
 #include <cudf/io/datasource.hpp>
 #include <cudf/io/experimental/hybrid_scan.hpp>
 #include <cudf/io/parquet.hpp>
@@ -72,6 +75,18 @@ namespace sirius::scan_manager {
 
 namespace {
 
+/// Env gate for the fused scan-filter pipeline (decode-time range masks +
+/// compacted payload decode). Read once; the orchestrator re-reads it too, so
+/// this only saves the extraction work when the feature is off.
+bool fused_scan_filter_enabled()
+{
+  static const bool enabled = []() {
+    char const* v = std::getenv("SIRIUS_EXP_FUSED_SCAN_FILTER");
+    return v != nullptr && v[0] != '\0' && !(v[0] == '0' && v[1] == '\0');
+  }();
+  return enabled;
+}
+
 struct cached_databatch_provider : public databatch_provider {
   cached_databatch_provider(pinned_entry const& entry,
                             std::span<std::size_t const> selected_columns,
@@ -79,13 +94,15 @@ struct cached_databatch_provider : public databatch_provider {
                             const telemetry::batch_telemetry_info& telemetry_info,
                             mvcc_chunk_mask_set mvcc_masks,
                             std::vector<insert_delta_split> delta_splits,
-                            sirius::decode_equality_pushdown equality_pushdown)
+                            sirius::decode_equality_pushdown equality_pushdown,
+                            sirius::decode_range_pushdown range_pushdown)
     : _plan(std::move(plan)),
       _entry(entry),
       _telemetry_info(telemetry_info),
       _mvcc_masks(std::move(mvcc_masks)),
       _delta_splits(std::move(delta_splits)),
-      _equality_pushdown(std::move(equality_pushdown))
+      _equality_pushdown(std::move(equality_pushdown)),
+      _range_pushdown(std::move(range_pushdown))
   {
     auto const& entry_column_names = _entry.cache_info.column_names();
     std::ranges::for_each(selected_columns, [this, &entry_column_names](size_t idx) {
@@ -171,6 +188,14 @@ struct cached_databatch_provider : public databatch_provider {
           }
           if (any) { projected->set_equality_pushdown(std::move(chunk_pushdown)); }
         }
+        // Fused scan-filter ranges: attach the whole-filter range pushdown so the
+        // converter can decide, per chunk, whether decode-side compaction applies
+        // (build_fused_scan_directives re-checks every plan there). Skipped when
+        // this operator carries mvcc keep-masks — decode-side row dropping cannot
+        // compose with deleted-row masks (iteration 1; TPC-H pins have no deltas).
+        if (!_range_pushdown.empty() && _mvcc_masks.empty()) {
+          projected->set_range_pushdown(_range_pushdown, /*all_conjuncts_convertible=*/true);
+        }
         return cucascade::data_batch::make(get_next_batch_id(), std::move(projected));
       }
       // Uncompressed chunk: project the requested columns (positions into the
@@ -225,6 +250,9 @@ struct cached_databatch_provider : public databatch_provider {
   /// chunk header to know whether the plan can exploit it, and that tier is not
   /// where the decode gather costs anything).
   sirius::decode_equality_pushdown _equality_pushdown;
+  /// The scan's whole-filter range pushdown (fused scan-filter pipeline);
+  /// non-empty only when every restricting conjunct converted to a range.
+  sirius::decode_range_pushdown _range_pushdown;
   const pinned_entry& _entry;
   telemetry::batch_telemetry_info _telemetry_info;
   /// This provider's own copy of the entry's per-chunk keep-masks (empty for
@@ -259,6 +287,35 @@ sirius::decode_equality_pushdown build_equality_pushdown(
     any         = true;
   }
   return any ? pushdown : sirius::decode_equality_pushdown{};
+}
+
+/// Map the scan's extracted numeric ranges (keyed by column primary index) onto
+/// @p selected_columns — the range analog of build_equality_pushdown above.
+/// Ranges that map to no pinned column are dropped: partition filters are
+/// enforced at file-list level, so nothing is lost, and the extraction gate only
+/// vouches for filter *shapes* — build_fused_scan_directives makes the final
+/// per-chunk call.
+sirius::decode_range_pushdown build_range_pushdown(
+  pinned_entry const& entry,
+  std::span<std::size_t const> selected_columns,
+  std::unordered_map<std::size_t, sirius::codegen::range_predicate> const& ranges)
+{
+  if (ranges.empty()) { return {}; }
+  sirius::decode_range_pushdown pushdown(selected_columns.size());
+  bool any = false;
+  for (std::size_t i = 0; i < selected_columns.size(); ++i) {
+    auto const entry_pos = selected_columns[i];
+    if (entry_pos >= entry.cache_info.column_ids.size()) { continue; }
+    auto const primary_idx =
+      static_cast<std::size_t>(entry.cache_info.column_ids[entry_pos].GetPrimaryIndex());
+    auto const it = ranges.find(primary_idx);
+    if (it == ranges.end()) { continue; }
+    pushdown[i].active = true;
+    pushdown[i].lo     = it->second.lo;
+    pushdown[i].hi     = it->second.hi;
+    any                = true;
+  }
+  return any ? pushdown : sirius::decode_range_pushdown{};
 }
 
 /// Filter view extracted from the scan's ingestible info: the pushed-down TableFilterSet plus the
@@ -581,13 +638,36 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
       build_equality_pushdown(*assignment.entry,
                               assignment.columns,
                               assignment.op->get_ingestible().decode_predicate_candidates());
+    // Fused scan-filter (env-gated): when the scan's WHOLE restricting filter
+    // converts to numeric ranges, hand them to the provider so compressed chunks
+    // can filter (and compact) during decode instead of after it.
+    sirius::decode_range_pushdown range_pushdown;
+    if (fused_scan_filter_enabled()) {
+      if (auto const* pq = dynamic_cast<op::scan::parquet_ingestible_table_info const*>(
+            &assignment.op->get_ingestible().table_info());
+          pq && pq->table_filters && !pq->table_filters->filters.empty()) {
+        auto extraction = sirius::op::extract_numeric_range_pushdown(
+          *pq->table_filters, pq->column_ids, pq->returned_types);
+        if (extraction.all_conjuncts_convertible && !extraction.ranges.empty()) {
+          range_pushdown =
+            build_range_pushdown(*assignment.entry, assignment.columns, extraction.ranges);
+          SIRIUS_LOG_DEBUG(
+            "[sirius_scan_manager] fused scan-filter: {} range(s) extracted for entry '{}', {} "
+            "column(s) mapped",
+            extraction.ranges.size(),
+            assignment.entry_name,
+            range_pushdown.size());
+        }
+      }
+    }
     auto provider = make_provider_for_pinned_entry(*assignment.entry,
                                                    assignment.columns,
                                                    std::move(assignment.plan),
                                                    assignment.op->batch_telemetry(),
                                                    std::move(masks),
                                                    std::move(delta_splits),
-                                                   std::move(equality_pushdown));
+                                                   std::move(equality_pushdown),
+                                                   std::move(range_pushdown));
     _metadata_processor->use_cached_entries_for_pipeline(assignment.op, std::move(provider));
   }
   _pending_mvcc_mask_jobs.clear();
@@ -1302,7 +1382,8 @@ std::unique_ptr<databatch_provider> make_provider_for_pinned_entry(
   const telemetry::batch_telemetry_info& telemetry_info,
   mvcc_chunk_mask_set mvcc_masks,
   std::vector<insert_delta_split> delta_splits,
-  sirius::decode_equality_pushdown equality_pushdown)
+  sirius::decode_equality_pushdown equality_pushdown,
+  sirius::decode_range_pushdown range_pushdown)
 {
   return std::make_unique<cached_databatch_provider>(entry,
                                                      selected_columns,
@@ -1310,7 +1391,8 @@ std::unique_ptr<databatch_provider> make_provider_for_pinned_entry(
                                                      telemetry_info,
                                                      std::move(mvcc_masks),
                                                      std::move(delta_splits),
-                                                     std::move(equality_pushdown));
+                                                     std::move(equality_pushdown),
+                                                     std::move(range_pushdown));
 }
 
 cached_scan_plan build_cached_scan_plan(pinned_entry const& entry,

@@ -123,6 +123,7 @@ add_library(
   "${EMBED_CCCL_HEADERS_OUT}"
   # CUDA kernels: operators + offsets
   src/bridge/offsets_cumsum.cu
+  src/selection/selection_wave.cu
   src/operators/alp_compressor.cu
   src/operators/alp_rd_compressor.cu
   src/operators/ans_compressor.cu
@@ -222,6 +223,7 @@ add_codegen_host_test(test_operator_sweep)
 add_codegen_host_test(test_representation_contract)
 add_codegen_host_test(test_bitpack_layout_contract)
 add_codegen_host_test(test_multi_gpu_stream_affinity)
+add_codegen_host_test(test_masked_decode_variants)
 
 # Multi-mode CLI. Target is simpatico_cli to avoid clashing with the lib target;
 # the installed binary is named 'simpatico'.
@@ -255,3 +257,4 @@ add_test(NAME operator_sweep COMMAND test_operator_sweep)
 add_test(NAME representation_contract COMMAND test_representation_contract)
 add_test(NAME bitpack_layout_contract COMMAND test_bitpack_layout_contract)
 add_test(NAME multi_gpu_stream_affinity COMMAND test_multi_gpu_stream_affinity)
+add_test(NAME masked_decode_variants COMMAND test_masked_decode_variants)

@@ -15,6 +15,7 @@
  */
 
 // sirius
+#include <duckdb/common/types/value.hpp>
 #include <duckdb/planner/expression/bound_conjunction_expression.hpp>
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
 #include <duckdb/planner/filter/conjunction_filter.hpp>
@@ -26,7 +27,9 @@
 #include <op/scan/scan_utils.hpp>
 
 // standard library
+#include <cstdint>
 #include <format>
+#include <limits>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -116,6 +119,178 @@ bool collect_equality_values(duckdb::TableFilter const& filter, std::vector<std:
   }
 }
 
+// ── Numeric range extraction (fused scan-filter) ─────────────────────────────
+
+/// Wide intermediate for bound arithmetic: rescaling a decimal constant and the
+/// ±1 of strict inequalities can step just past the int64 edge, so bounds are
+/// intersected as __int128 and clamped once at the end.
+using int128 = __int128;
+
+/// A constant lowered into the decoded integer domain as a (possibly
+/// non-integral) rational, kept as its integer floor and ceil. Equal for a
+/// constant the domain represents exactly; one apart otherwise (a decimal with
+/// more fractional digits than the column's scale).
+struct decoded_bound {
+  int128 floor;
+  int128 ceil;
+};
+
+/// The constant's unscaled integer payload when its physical storage is an
+/// integer no wider than 64 bits, nullopt otherwise. Reads the PHYSICAL value:
+/// for a DECIMAL this is the unscaled integer, not the rounded SQL value.
+std::optional<std::int64_t> physical_integer_payload(duckdb::Value const& value)
+{
+  switch (value.type().InternalType()) {
+    case duckdb::PhysicalType::INT8: return duckdb::TinyIntValue::Get(value);
+    case duckdb::PhysicalType::INT16: return duckdb::SmallIntValue::Get(value);
+    case duckdb::PhysicalType::INT32: return duckdb::IntegerValue::Get(value);
+    case duckdb::PhysicalType::INT64: return duckdb::BigIntValue::Get(value);
+    case duckdb::PhysicalType::UINT8: return duckdb::UTinyIntValue::Get(value);
+    case duckdb::PhysicalType::UINT16: return duckdb::USmallIntValue::Get(value);
+    case duckdb::PhysicalType::UINT32: return duckdb::UIntegerValue::Get(value);
+    default: return std::nullopt;  // UINT64/INT128/FLOAT/... — not this path
+  }
+}
+
+/// 10^e as int128 (e ≤ 38 fits; callers never exceed decimal precision bounds).
+int128 pow10_128(int e)
+{
+  int128 r = 1;
+  while (e-- > 0) {
+    r *= 10;
+  }
+  return r;
+}
+
+/// Lower @p value into the decoded integer domain of a column of @p col_type:
+/// DATE → stored day count, DECIMAL → unscaled integer at the COLUMN's scale,
+/// integers as-is. nullopt when the constant's type/width has no exact rational
+/// image there (the caller then refuses the whole scan).
+std::optional<decoded_bound> to_decoded_bound(duckdb::Value const& value,
+                                              sirius::logical_type const& col_type)
+{
+  if (value.IsNull()) { return std::nullopt; }
+  auto const value_type = value.type().id();
+
+  if (col_type.id() == sirius::type_id::DATE) {
+    if (value_type != duckdb::LogicalTypeId::DATE) { return std::nullopt; }
+    auto const days = static_cast<int128>(duckdb::DateValue::Get(value).days);
+    return decoded_bound{days, days};
+  }
+
+  if (col_type.is_decimal()) {
+    // Wider decimals are int128-backed and never bitpack-planned.
+    if (col_type.decimal_precision() > sirius::logical_type::decimal_max_precision_int64) {
+      return std::nullopt;
+    }
+    int constant_scale = 0;
+    if (value_type == duckdb::LogicalTypeId::DECIMAL) {
+      constant_scale = duckdb::DecimalType::GetScale(value.type());
+    } else if (!value.type().IsIntegral()) {
+      return std::nullopt;  // integral constants are scale-0; anything else refuses
+    }
+    auto const unscaled = physical_integer_payload(value);
+    if (!unscaled.has_value()) { return std::nullopt; }
+
+    auto const scale_diff = static_cast<int>(col_type.decimal_scale()) - constant_scale;
+    if (scale_diff >= 0) {
+      // Column carries at least the constant's fractional digits: exact.
+      auto const v = static_cast<int128>(*unscaled) * pow10_128(scale_diff);
+      return decoded_bound{v, v};
+    }
+    // Constant is finer than the column's scale: floor/ceil of m / 10^-diff.
+    auto const divisor   = pow10_128(-scale_diff);
+    auto const m         = static_cast<int128>(*unscaled);
+    int128 quotient      = m / divisor;
+    int128 const rem     = m % divisor;
+    if (rem != 0 && m < 0) { quotient -= 1; }  // truncation → floor
+    return decoded_bound{quotient, quotient + (rem != 0 ? 1 : 0)};
+  }
+
+  if (col_type.is_integer()) {
+    if (!value.type().IsIntegral()) { return std::nullopt; }
+    auto const v = physical_integer_payload(value);
+    if (!v.has_value()) { return std::nullopt; }
+    return decoded_bound{static_cast<int128>(*v), static_cast<int128>(*v)};
+  }
+
+  return std::nullopt;
+}
+
+/// Running intersection of all conjuncts on one column, in int128 so bound
+/// arithmetic cannot wrap. Starts at the full int64 domain (the decoder only
+/// ever produces int64-representable values).
+struct range_accumulator {
+  int128 lo = std::numeric_limits<std::int64_t>::min();
+  int128 hi = std::numeric_limits<std::int64_t>::max();
+};
+
+/// Fold @p filter into @p acc. False if any node is not an AND-tree of
+/// supported constant comparisons — the caller then refuses the whole scan.
+/// IS_NOT_NULL child conjuncts are absorbed: today's post-decompress filter
+/// (convert_table_filters_to_expression) drops them, so ignoring them here
+/// changes nothing. A nested OPTIONAL_FILTER, by contrast, WOULD be evaluated
+/// by TableFilter::ToExpression on today's path, so it refuses rather than
+/// risk dropping a live conjunct.
+bool fold_numeric_conjunct(duckdb::TableFilter const& filter,
+                           sirius::logical_type const& col_type,
+                           range_accumulator& acc)
+{
+  switch (filter.filter_type) {
+    case duckdb::TableFilterType::CONSTANT_COMPARISON: {
+      auto const& cmp   = filter.Cast<duckdb::ConstantFilter>();
+      auto const bound = to_decoded_bound(cmp.constant, col_type);
+      if (!bound.has_value()) { return false; }
+      switch (cmp.comparison_type) {
+        case duckdb::ExpressionType::COMPARE_EQUAL:
+          // Non-integral constant ⇒ ceil > floor ⇒ lo > hi: provably empty.
+          acc.lo = std::max(acc.lo, bound->ceil);
+          acc.hi = std::min(acc.hi, bound->floor);
+          return true;
+        case duckdb::ExpressionType::COMPARE_GREATERTHANOREQUALTO:
+          acc.lo = std::max(acc.lo, bound->ceil);
+          return true;
+        case duckdb::ExpressionType::COMPARE_GREATERTHAN:
+          acc.lo = std::max(acc.lo, bound->floor + 1);
+          return true;
+        case duckdb::ExpressionType::COMPARE_LESSTHANOREQUALTO:
+          acc.hi = std::min(acc.hi, bound->floor);
+          return true;
+        case duckdb::ExpressionType::COMPARE_LESSTHAN:
+          acc.hi = std::min(acc.hi, bound->ceil - 1);
+          return true;
+        default: return false;  // <>, IS DISTINCT FROM, ... — not a range
+      }
+    }
+    case duckdb::TableFilterType::CONJUNCTION_AND: {
+      auto const& conjunction = filter.Cast<duckdb::ConjunctionAndFilter>();
+      bool found              = false;
+      for (auto const& child : conjunction.child_filters) {
+        if (child->filter_type == duckdb::TableFilterType::IS_NOT_NULL) { continue; }
+        if (!fold_numeric_conjunct(*child, col_type, acc)) { return false; }
+        found = true;
+      }
+      return found;  // an AND of only IS_NOT_NULLs restricts nothing we can express
+    }
+    default: return false;
+  }
+}
+
+/// Clamp the int128 intersection back into an inclusive int64 range_predicate.
+/// A range lying entirely outside int64 (possible only through rescaled decimal
+/// bounds) is empty for any decodable value, canonically {0, -1}.
+sirius::codegen::range_predicate clamp_to_range_predicate(range_accumulator const& acc)
+{
+  constexpr auto kMin = std::numeric_limits<std::int64_t>::min();
+  constexpr auto kMax = std::numeric_limits<std::int64_t>::max();
+  if (acc.lo > acc.hi || acc.lo > static_cast<int128>(kMax) ||
+      acc.hi < static_cast<int128>(kMin)) {
+    return {0, -1};
+  }
+  return {static_cast<std::int64_t>(std::max<int128>(acc.lo, kMin)),
+          static_cast<std::int64_t>(std::min<int128>(acc.hi, kMax))};
+}
+
 }  // namespace
 
 std::unordered_map<std::size_t, std::vector<std::string>> extract_string_equality_pushdown(
@@ -142,6 +317,84 @@ std::unordered_map<std::size_t, std::vector<std::string>> extract_string_equalit
     if (!collect_equality_values(*filter, values) || values.empty()) { continue; }
     result.emplace(primary_idx, std::move(values));
   }
+  return result;
+}
+
+numeric_range_extraction extract_numeric_range_pushdown(
+  const duckdb::TableFilterSet& filters,
+  const duckdb::vector<duckdb::ColumnIndex>& column_ids,
+  const duckdb::vector<sirius::logical_type>& returned_types,
+  const std::unordered_set<std::size_t>& skip_primary_indices)
+{
+  numeric_range_extraction result;
+  result.all_conjuncts_convertible = true;
+
+  // One unsupported restricting conjunct disqualifies the whole scan
+  // (iteration 1: rows may only be dropped during decode when the extracted
+  // ranges are the complete filter), so refusal clears everything.
+  auto const refuse = [&result](duckdb::idx_t column_index, char const* why) {
+    SIRIUS_LOG_DEBUG(
+      "TABLE_SCAN range pushdown: refused — filter on column_index={} {}; scan keeps the "
+      "post-decompress filter path",
+      column_index,
+      why);
+    result.ranges.clear();
+    result.all_conjuncts_convertible = false;
+  };
+
+  for (auto const& [column_index, filter] : filters.filters) {
+    if (!filter) { continue; }
+    // Non-restricting forms, exactly as convert_table_filters_to_expression
+    // skips them: dynamic/optional filters run downstream, IS_NOT_NULL is
+    // dropped from the post-decompress conjunction today.
+    if (filter->filter_type == duckdb::TableFilterType::OPTIONAL_FILTER ||
+        filter->filter_type == duckdb::TableFilterType::IS_NOT_NULL) {
+      continue;
+    }
+    if (column_index >= column_ids.size()) {
+      refuse(column_index, "references no scan column");
+      return result;
+    }
+    auto const& column_id = column_ids[column_index];
+    if (!column_id.HasPrimaryIndex() || column_id.IsRowIdColumn() || column_id.IsEmptyColumn() ||
+        column_id.IsVirtualColumn()) {
+      refuse(column_index, "targets a rowid/virtual column");
+      return result;
+    }
+    auto const primary_idx = static_cast<std::size_t>(column_id.GetPrimaryIndex());
+    // Hive-partition filters are enforced at the file-list level and dropped
+    // from the post-decompress conjunction, so they don't restrict batch rows.
+    if (skip_primary_indices.count(primary_idx)) { continue; }
+    if (primary_idx >= returned_types.size()) {
+      refuse(column_index, "has no returned type");
+      return result;
+    }
+    auto const& col_type = returned_types[primary_idx];
+
+    range_accumulator acc;
+    if (!fold_numeric_conjunct(*filter, col_type, acc)) {
+      refuse(column_index, "is not an AND-tree of numeric constant comparisons");
+      return result;
+    }
+    auto const range = clamp_to_range_predicate(acc);
+    auto [it, inserted] = result.ranges.emplace(primary_idx, range);
+    if (!inserted) {  // same physical column filtered twice: intersect
+      it->second.lo = std::max(it->second.lo, range.lo);
+      it->second.hi = std::min(it->second.hi, range.hi);
+    }
+    SIRIUS_LOG_DEBUG(
+      "TABLE_SCAN range pushdown: primary_idx={} type={} → decoded-domain range [{}, {}]{}",
+      primary_idx,
+      col_type.to_string(),
+      it->second.lo,
+      it->second.hi,
+      it->second.lo > it->second.hi ? " (provably empty)" : "");
+  }
+
+  SIRIUS_LOG_DEBUG("TABLE_SCAN range pushdown: extracted {} range predicate(s), "
+                   "all_conjuncts_convertible={}",
+                   result.ranges.size(),
+                   result.all_conjuncts_convertible);
   return result;
 }
 

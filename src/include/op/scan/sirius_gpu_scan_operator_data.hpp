@@ -146,6 +146,15 @@ class scan_operator_input : public op::operator_data {
   /// copy). Stamped by drain_cached_provider on resident splits; scan_info
   /// splits fold filter costs into their own estimates instead.
   bool row_filter_pending{false};
+  /// True when prepare_for_processing's conversion came back as a
+  /// row_filtered_gpu_table_representation: the fused scan-filter decode
+  /// (SIRIUS_EXP_FUSED_SCAN_FILTER) already applied the split's whole
+  /// table-filter conjunction and every column is compacted to the survivor
+  /// rows. materialize_table then returns filter_state::ROW_FILTERED so
+  /// post_filter_and_project skips filter evaluation and only projects. Never
+  /// set while the gate is off — the converters then always produce the plain
+  /// representation.
+  bool decode_row_filtered{false};
   /// Per-query table taken out of the cached wrapper batch right after
   /// prepare_for_processing's conversion produced it (decompressed or
   /// uploaded fresh for this split) — never raw GPU pin storage, which is

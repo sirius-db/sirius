@@ -2,6 +2,7 @@
 #pragma once
 
 #include "codegen/plan/plan_interpreter.hpp"
+#include "codegen/selection/selection.hpp"
 #include "codegen/util/stream_pool.hpp"
 
 #include <cudf/table/table.hpp>
@@ -220,5 +221,35 @@ std::unique_ptr<cudf::table> decompress(
 /// materialising the column (i.e. its plan is dictionary-rooted). False for an
 /// out-of-range index or a column with no plan tree.
 bool column_supports_predicate_decode(const compressed_table& table, std::size_t column_index);
+
+/// Fused scan-filter decompress (experimental, env gate
+/// SIRIUS_EXP_FUSED_SCAN_FILTER=1). @p request carries the scan's
+/// decode-resolvable range conjuncts plus the TierA/TierB tag per selected
+/// output column (built by the scan-side extraction; see
+/// codegen/selection/selection.hpp).
+///
+/// When the gate is on and every precondition holds, columns are decoded with
+/// the two-wave mask pipeline: wave 1 runs the K1 mask variants for the filter
+/// columns, the masks are AND-combined and counted (one host sync for the
+/// survivor count), then wave 2 decodes TierA columns directly to compacted
+/// survivor_count-row columns and TierB columns full-width as today.
+/// @p result comes back with applied=true, the selection mask/offsets, and the
+/// TierB gather map (row_indices) — the caller gathers TierB survivors
+/// scan-side and skips its post-decompress filter pass.
+///
+/// When the gate is off, @p request is empty, or any precondition fails
+/// (non-bitpack filter column, nulls, ...), this is EXACTLY the classic
+/// decompress(table, selected_columns, pool, mr) — same kernels, same
+/// allocations — returned as released columns, and result.applied is false.
+///
+/// Not composable with string-equality decode_predicates (iteration 1): calls
+/// that carry those must use the predicated decompress overload above.
+std::vector<std::unique_ptr<cudf::column>> decompress_scan_filter(
+  const compressed_table& table,
+  std::span<const std::size_t> selected_columns,
+  sirius::codegen::scan_filter_request const& request,
+  sirius::codegen::scan_filter_result& result,
+  simpatico::stream_pool& pool,
+  rmm::device_async_resource_ref mr = rmm::mr::get_current_device_resource_ref());
 
 }  // namespace simpatico

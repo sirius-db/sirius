@@ -137,6 +137,7 @@ std::unique_ptr<cucascade::idata_representation> compressed_host_representation:
                                        _selected_indices));
   // The pushdown is indexed by the selected column list, which the clone shares.
   copy->set_equality_pushdown(_equality_pushdown);
+  copy->set_range_pushdown(_range_pushdown, _range_conjuncts_convertible);
   return copy;
 }
 
@@ -264,6 +265,7 @@ std::unique_ptr<cucascade::idata_representation> compressed_device_representatio
                                          _selected_indices));
   // The pushdown is indexed by the selected column list, which the clone shares.
   copy->set_equality_pushdown(_equality_pushdown);
+  copy->set_range_pushdown(_range_pushdown, _range_conjuncts_convertible);
   return copy;
 }
 
