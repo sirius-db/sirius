@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Reproduce the TPC-H SF1000 result: 9.139 s suite, 22/22 byte-identical.
+# Reproduce the TPC-H SF1000 result: 6.918 s suite, 22/22 byte-identical.
 # Run from the repo root:  pixi run bash bench/sf1000-repro/run.sh
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -27,6 +27,17 @@ export LD_PRELOAD="$CUDF_SO"
 export SIRIUS_PRE_SQL="SET pin_table_compression = true; \
 SET pin_table_input_compression_plan_dir = '$PLANS'; \
 SET expression_evaluator_strategy = 'ast_jit'"
+
+# Fused scan-filter (decode-time filtering + selection-consuming decompression):
+# the -15.4% on top of the 8.180 s stack. Off by default in the engine; this kit
+# turns it on. Gate off => byte-identical classic behavior. Tuning knobs (defaults
+# shipped, all measured — see bench/sf1000-repro/NEXT-STEPS.md):
+#   SIRIUS_EXP_FUSED_SCAN_MAX_SEL=0.35        write-skip bail threshold (RULE 2)
+#   SIRIUS_EXP_FUSED_SCAN_TIERB_MAX_SEL=0.10  tier-B re-admission threshold
+#   SIRIUS_EXP_FUSED_SCAN_K4_MAX_SEL=0.15     K3-vs-K4 payload pick crossover
+#   SIRIUS_EXP_FUSED_SCAN_MAX_MEMBER=1        dynamic membership sources kept per scan
+#   SIRIUS_EXP_FUSED_SCAN_DIAG=1              deterministic decision tracing (debug)
+export SIRIUS_EXP_FUSED_SCAN_FILTER=1
 
 # All eight tables pinned GPU-tier compressed. partsupp included: no TPC-H query ever
 # materialises ps_comment, so the union across q2/q9/q11/q16/q20 is 4 narrow columns (~20-25 GB).

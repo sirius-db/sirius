@@ -1,9 +1,12 @@
-# TPC-H SF1000 reproduction — 8.180 s on GB300
+# TPC-H SF1000 reproduction — 6.918 s on GB300
 
-Reproduces an **8.180 s** TPC-H SF1000 suite (22 queries, best-of-3, 22/22 byte-identical),
-against a **15.99 s** starting point — **−48.8%**.
+Reproduces a **6.918 s** TPC-H SF1000 suite (22 queries, best-of-3, 22/22 byte-identical),
+against a **15.99 s** starting point — **−56.7%**. The final −15.4% comes from the fused
+scan-filter program (decode-time masks + selection-consuming decompression, gated behind
+`SIRIUS_EXP_FUSED_SCAN_FILTER`, enabled by `run.sh`); the 8.180 s base stack reproduces
+with the gate unset. Full per-iteration ledger: `NEXT-STEPS.md`.
 
-Measured 2026-08-01 on `pmgb300ws-0163`: GB300, 152 SMs, 256 GB HBM, 72-core Grace aarch64,
+Measured 2026-08-01 (base stack) and 2026-08-03 (fused program) on `pmgb300ws-0163`: GB300, 152 SMs, 256 GB HBM, 72-core Grace aarch64,
 driver 595.58.03, CUDA 13.2.
 
 This branch is for reproduction only. It is not proposed for merge, and several changes here
