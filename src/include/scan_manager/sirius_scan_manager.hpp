@@ -252,7 +252,8 @@ std::unique_ptr<databatch_provider> make_provider_for_pinned_entry(
   mvcc_chunk_mask_set mvcc_masks                     = {},
   std::vector<insert_delta_split> delta_splits       = {},
   sirius::decode_equality_pushdown equality_pushdown = {},
-  sirius::decode_range_pushdown range_pushdown       = {});
+  sirius::decode_range_pushdown range_pushdown       = {},
+  bool range_covers_whole_filter                     = false);
 
 /**
  * @brief Build the survivor plan for serving @p entry to a scan into @p requiested_column_ids with

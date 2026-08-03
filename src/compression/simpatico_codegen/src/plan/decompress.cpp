@@ -618,15 +618,40 @@ std::unique_ptr<cudf::column> decode_fused_subtree_impl(PlanTree const& tree,
       if (error_out) *error_out = "codegen decompress: decode_selection and mask disagree on survivor_count";
       return nullptr;
     }
-    bool const masked_ok = launch_decode_fused_tree_mask_consume(*built.tree,
-                                                                 labeled,
-                                                                 dtype,
-                                                                 static_cast<std::int64_t>(num_rows),
-                                                                 *sel->mask,
-                                                                 out_col->mutable_view().head<void>(),
-                                                                 stream);
+    // Track B runtime pick: the index-list variant (K4) decodes only the
+    // listed survivor rows by random access into the packed bits — preferred
+    // by the orchestrator at low selectivity. Bitpack LEAF roots only: delta
+    // roots keep K3-delta (K4 rejects them at render) and the dict-K5 codes
+    // region keeps K3 by contract. Any anomaly (indices absent or
+    // mismatched) silently keeps K3 — the pick is an optimization and the
+    // mask walk is always renderable here.
+    bool const use_index_decode =
+      sel->prefer_index_decode && !sel->dict_compact && sel->survivor_count > 0 &&
+      root_nid < tree.nodes.size() && tree.nodes[root_nid].op == "bitpack" &&
+      static_cast<std::int64_t>(sel->survivor_indices.size()) == sel->survivor_count;
+    bool const masked_ok =
+      use_index_decode
+        ? launch_decode_fused_tree_index_consume(*built.tree,
+                                                 labeled,
+                                                 dtype,
+                                                 static_cast<std::int64_t>(num_rows),
+                                                 *sel->mask,
+                                                 sel->survivor_indices.data<std::int32_t>(),
+                                                 out_col->mutable_view().head<void>(),
+                                                 stream)
+        : launch_decode_fused_tree_mask_consume(*built.tree,
+                                                labeled,
+                                                dtype,
+                                                static_cast<std::int64_t>(num_rows),
+                                                *sel->mask,
+                                                out_col->mutable_view().head<void>(),
+                                                stream);
     if (!masked_ok) {
-      if (error_out) *error_out = "codegen decompress: masked (mask-consume) decode failed";
+      if (error_out) {
+        *error_out = use_index_decode
+                       ? "codegen decompress: masked (index-consume) decode failed"
+                       : "codegen decompress: masked (mask-consume) decode failed";
+      }
       return nullptr;
     }
     return out_col;
@@ -1085,6 +1110,46 @@ std::unique_ptr<cudf::column> try_dict_k5_fast_path(PlanTree const& tree,
   cudaStreamSynchronize(stream.value());
   return col;
 }
+
+// K6 masked strings decode for `str_split -> {offsets: bitpack, chars: raw}`
+// plans (l_shipmode shape; c_phone's delta->rle->bitpack offsets chain and
+// entropy-coded chars stay tier_b). Variable-width F5 pattern, W3's half:
+//   phase A (W1, PROPOSED — see STATUS-W3): masked offsets-subtree decode
+//     emitting per-survivor LENGTHS into an int32 buffer of survivors+1
+//     entries (slot [survivors] pre-zeroed by W3) plus per-survivor SOURCE
+//     char start offsets (int64[survivors]);
+//   W3: exclusive-sum scan over the lengths column -> destination offsets
+//     [survivors+1]; one D2H of offsets[survivors] sizes the count-first
+//     chars buffer (full char width is never materialized);
+//   phase B (W1, PROPOSED): survivor char gather (src_starts/lengths ->
+//     out_chars at the destination offsets); W3 assembles via
+//     cudf::make_strings_column.
+// The launchers are W1's iteration-5 deliverable; until they land this
+// declines (nullptr + error). The taxonomy keeps K6 plans off the
+// str_compact route until the tier_str_k6 classifier arm flips, so the stub
+// is unreachable in production.
+std::unique_ptr<cudf::column> try_str_k6_path(PlanTree const& tree,
+                                              decode_selection const& sel,
+                                              rmm::cuda_stream_view stream,
+                                              rmm::device_async_resource_ref mr,
+                                              std::string* error_out)
+{
+  (void)sel;
+  (void)stream;
+  (void)mr;
+  // Shape gates (mirror plan_supports_str_selection_decode; these stay the
+  // real runtime guards once the launchers land).
+  NodeId const str_nid = root_value_producer(tree);
+  if (str_nid >= tree.nodes.size() || tree.nodes[str_nid].op != "str_split") {
+    if (error_out) *error_out = "decompress: K6 requires a str_split-rooted plan";
+    return nullptr;
+  }
+  // TODO(W1 K6 launchers): phase-A/phase-B wiring per the contract above.
+  if (error_out) {
+    *error_out = "decompress: K6 masked strings launchers not yet available";
+  }
+  return nullptr;
+}
 }  // namespace
 
 std::unique_ptr<cudf::column> decompress_column(PlanTree const& tree,
@@ -1108,9 +1173,10 @@ std::unique_ptr<cudf::column> decompress_column(PlanTree const& tree,
     if (error_out) *error_out = "decompress: decode_selection and decode_predicate are exclusive";
     return nullptr;
   }
-  if (selecting && sel->compact_capable && sel->dict_compact) {
+  if (selecting && (static_cast<int>(sel->compact_capable) + static_cast<int>(sel->dict_compact) +
+                    static_cast<int>(sel->str_compact)) > 1) {
     if (error_out) {
-      *error_out = "decompress: compact_capable and dict_compact are exclusive selection modes";
+      *error_out = "decompress: compacted selection modes are mutually exclusive";
     }
     return nullptr;
   }
@@ -1134,6 +1200,33 @@ std::unique_ptr<cudf::column> decompress_column(PlanTree const& tree,
       *error_out = "decompress: plan does not support dict-K5 compacted decode";
     }
     return nullptr;
+  }
+  if (selecting && sel->str_compact) {
+    if (!plan_supports_str_selection_decode(tree)) {
+      if (error_out) {
+        *error_out = "decompress: plan does not support K6 masked strings decode";
+      }
+      return nullptr;
+    }
+    // K6 has NO generic fallback: compacted offsets cannot feed the classic
+    // str_split reconstruct, so a declined dedicated route must error (the
+    // orchestrator re-runs the batch classic) rather than fall through to a
+    // full-width walk the compacted() belt below would reject anyway.
+    auto col = try_str_k6_path(tree, *sel, stream, mr, error_out);
+    if (!col) {
+      if (error_out && error_out->empty()) {
+        *error_out = "decompress: K6 masked strings decode declined";
+      }
+      return nullptr;
+    }
+    if (static_cast<std::int64_t>(col->size()) != sel->survivor_count ||
+        col->null_count() != 0) {
+      if (error_out) {
+        *error_out = "decompress: K6 decode returned a non-survivor-sized or null-masked column";
+      }
+      return nullptr;
+    }
+    return col;
   }
 
   std::unique_ptr<cudf::column> col;
@@ -1286,7 +1379,56 @@ sirius::codegen::output_tier plan_selection_tier(PlanTree const& tree)
   if (plan_supports_dict_selection_decode(tree)) {
     return sirius::codegen::output_tier::tier_dict_k5;
   }
+  // K6-capable str_split plans (plan_supports_str_selection_decode) stay
+  // tier_b until output_tier grows tier_str_k6 — flip this arm together with
+  // the umbrella's str arm (invariant: umbrella true ⇔ classifier != tier_b)
+  // and W1's K6 launchers.
   return sirius::codegen::output_tier::tier_b;
+}
+
+bool plan_supports_str_selection_decode(PlanTree const& tree)
+{
+  NodeId const nid = root_value_producer(tree);
+  if (nid >= tree.nodes.size() || tree.nodes[nid].op != "str_split") { return false; }
+  PlanNode const& node = tree.nodes[nid];
+  // Nullable plans carry a trailing `null_mask` output channel; iteration-5
+  // selection has no null model — refuse (never corrupt).
+  for (auto const& name : node.output_names) {
+    if (name == "null_mask") { return false; }
+  }
+  // `chars` must be TERMINAL raw UINT8 bytes: a child edge means
+  // entropy-coded chars (snappy/ans) — no byte gather without a full
+  // decompress — and widened (UINT32/UINT64, >2 GB) chars need addressing
+  // the masked gather does not model yet.
+  bool chars_ok   = false;
+  bool offsets_ok = false;
+  for (std::size_t i = 0; i < node.output_names.size(); ++i) {
+    std::string const& name = node.output_names[i];
+    if (name == "chars") {
+      bool has_edge = false;
+      for (auto const& e : node.children) {
+        if (e.channel == name) {
+          has_edge = true;
+          break;
+        }
+      }
+      if (has_edge) { return false; }
+      auto it = node.channels.find(node.output_paths[i]);
+      chars_ok = it != node.channels.end() && it->second &&
+                 it->second->decoded_type().id() == cudf::type_id::UINT8;
+    } else if (name == "offsets") {
+      // Iteration 5: plain bitpack offsets only (the masked reconstruction
+      // W1 renders); deeper chains (delta->rle->bitpack, c_phone) stay
+      // tier_b until the renderer composes them.
+      for (auto const& e : node.children) {
+        if (e.channel == name) {
+          offsets_ok = e.child < tree.nodes.size() && tree.nodes[e.child].op == "bitpack";
+          break;
+        }
+      }
+    }
+  }
+  return chars_ok && offsets_ok;
 }
 
 bool plan_supports_dict_selection_decode(PlanTree const& tree)
@@ -1387,11 +1529,14 @@ std::unique_ptr<cudf::column> decompress_column_compacted(
   sel.mask           = &mask;
   sel.survivor_count = mask.survivor_count;
   // Dispatch on plan shape: dictionary root with bitpack codes -> dict-K5;
-  // everything else is requested as bitpack Tier A / K3, and decompress_column
-  // refuses non-bitpack roots there (the dict probe must run first — the
-  // umbrella plan_supports_selection_decode admits both shapes).
+  // K6-capable str_split root -> masked strings; everything else is requested
+  // as mask_consume Tier A, and decompress_column refuses unsupported roots
+  // there (the specific probes must run first — the umbrella
+  // plan_supports_selection_decode admits every compactable shape).
   if (plan_supports_dict_selection_decode(tree)) {
     sel.dict_compact = true;
+  } else if (plan_supports_str_selection_decode(tree)) {
+    sel.str_compact = true;
   } else {
     sel.compact_capable = true;
   }
@@ -1446,9 +1591,17 @@ std::unique_ptr<cudf::table> compact_scan_filter_output(
       }
       continue;
     }
+    // Tier B arrives in one of two shapes depending on the wave-2 routing:
+    // already survivor-sized (the in-call decode_selection gather compacted it
+    // per column) — pass through; or full width — collected for the single
+    // batch-level gather below. When survivors == num_rows the two are
+    // indistinguishable, and the ascending all-rows gather is the identity,
+    // so passing through is correct either way.
+    if (columns[i]->size() == survivors) { continue; }
     if (static_cast<std::int64_t>(columns[i]->size()) != result.num_rows) {
       if (error_out) {
-        *error_out = "compact_scan_filter_output: Tier-B column is not full width";
+        *error_out =
+          "compact_scan_filter_output: Tier-B column is neither full width nor survivor-sized";
       }
       return nullptr;
     }

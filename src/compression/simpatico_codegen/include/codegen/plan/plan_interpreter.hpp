@@ -116,10 +116,30 @@ struct decode_selection {
   /// True for the dict-K5 mode above. Mutually exclusive with
   /// @c compact_capable; gate on @c plan_supports_dict_selection_decode.
   bool dict_compact = false;
+  /// Track B: prefer the index-list payload decode (K4) over the mask walk
+  /// (K3). Only meaningful with @c compact_capable; bitpack LEAF roots route
+  /// to ``launch_decode_fused_tree_index_consume`` over @c survivor_indices,
+  /// delta roots IGNORE it (K3-delta — K4 rejects them at render), and the
+  /// dict-K5 codes region is unaffected. The orchestrator populates
+  /// @c survivor_indices (int32, survivor_count entries) whenever it sets
+  /// this; any anomaly silently keeps K3 (the pick is an optimization).
+  bool prefer_index_decode = false;
+  /// K6 (str_split masked strings): survivor lengths from the masked offsets
+  /// decode, an exclusive-sum scan to destination offsets, and a survivor
+  /// char gather into a count-first chars buffer — variable-width strings
+  /// never materialize full char width. Mutually exclusive with the other
+  /// compacted modes; gate on @c plan_supports_str_selection_decode. There is
+  /// NO generic in-walk fallback for this mode (compacted offsets cannot feed
+  /// the classic str_split reconstruct): if the dedicated route declines, the
+  /// call errors and the orchestrator re-runs the batch classic.
+  bool str_compact = false;
 
   [[nodiscard]] bool active() const noexcept { return mask != nullptr && survivor_count >= 0; }
-  /// Either compacted mode: the result column must be survivor-sized.
-  [[nodiscard]] bool compacted() const noexcept { return compact_capable || dict_compact; }
+  /// Any compacted mode: the result column must be survivor-sized.
+  [[nodiscard]] bool compacted() const noexcept
+  {
+    return compact_capable || dict_compact || str_compact;
+  }
 };
 
 /// Decompress a plan tree produced by compress_column. DecodeWalk performs a
@@ -175,9 +195,21 @@ bool plan_supports_selection_decode(PlanTree const& tree);
 /// channel) are refused: iteration-1 selection has no null model.
 bool plan_supports_dict_selection_decode(PlanTree const& tree);
 
+/// True iff @p tree can decode survivor-compacted through the K6 masked
+/// strings route: its root value is produced by a non-null `str_split` node
+/// whose `chars` channel is TERMINAL (raw/identity — entropy-coded chars
+/// cannot be byte-gathered without a full decompress) and whose `offsets`
+/// channel is routed to a plain bitpack child. Deeper offsets chains
+/// (c_phone's delta->rle->bitpack) and widened (>2 GB, non-UINT8) chars stay
+/// tier_b for iteration 5 — widen only in lockstep with the renderer's
+/// masked offsets-reconstruction coverage.
+bool plan_supports_str_selection_decode(PlanTree const& tree);
+
 /// Per-tier ground truth for the wave orchestrator's RULE-1 switch: tier_a
 /// for a bitpack-rooted plan, tier_a_delta for a delta->bitpack root,
-/// tier_dict_k5 for a dict-K5-capable plan, tier_b for everything else.
+/// tier_dict_k5 for a dict-K5-capable plan, tier_b for everything else
+/// (including K6-capable str_split plans until output_tier grows tier_str_k6
+/// — the classifier and umbrella flip together to preserve the invariant).
 /// Consistent by construction with @c plan_supports_selection_decode:
 /// umbrella true ⇔ classifier != tier_b.
 sirius::codegen::output_tier plan_selection_tier(PlanTree const& tree);

@@ -317,15 +317,21 @@ compressed_device_representation::probe_fused_scan_reservation() const
   // caller must keep the classic envelope. A tier_dict_k5 column also lifts
   // the RULE-2 selectivity bound (dict batches skip the bail). Pure host
   // metadata (plan-tree walks), no device work.
-  auto const& ct       = _blob->table;
-  bool any_dict        = false;
-  auto probes_fusable  = [&](std::size_t idx) {
+  auto const& ct     = _blob->table;
+  bool any_unbounded = false;
+  auto probes_fusable = [&](std::size_t idx) {
     if (idx >= ct.columns.size()) { return false; }
     auto const& plan = ct.columns[idx].plan_tree;
     if (!plan) { return false; }
     if (!simpatico::plan_supports_selection_decode(*plan)) { return false; }
-    any_dict = any_dict || simpatico::plan_selection_tier(*plan) ==
-                             sirius::codegen::output_tier::tier_dict_k5;
+    // Tiers exempt from the RULE-2 selectivity bail (their masked routes win
+    // at every selectivity): dict-K5, and K6 strings once its classifier arm
+    // flips (the str probe is checked directly so this line needs no change
+    // at flip time; pre-flip the umbrella excludes str plans anyway).
+    any_unbounded = any_unbounded ||
+                    simpatico::plan_selection_tier(*plan) ==
+                      sirius::codegen::output_tier::tier_dict_k5 ||
+                    simpatico::plan_supports_str_selection_decode(*plan);
     return true;
   };
   bool planned = false;
@@ -341,7 +347,7 @@ compressed_device_representation::probe_fused_scan_reservation() const
     }
   }
   probe.planned       = planned;
-  probe.rule2_bounded = planned && !any_dict;
+  probe.rule2_bounded = planned && !any_unbounded;
   return probe;
 }
 

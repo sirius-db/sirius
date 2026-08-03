@@ -90,6 +90,20 @@ namespace codegen::decode::jit {
 //                        the downstream compaction pass, not the unpack.
 //                    Extra params: `const uint32_t* sel_mask, const
 //                    uint32_t* chunk_offsets`.
+//   * index_consume — K4: Bitpack-LEAF-root decode consuming an int32 ROW-
+//                    INDEX LIST (global row ids, ascending — the
+//                    mask->indices wave output) plus the same per-chunk
+//                    exclusive survivor offsets as K3.  Block c reads its
+//                    slice row_indices[chunk_offsets[c] ..
+//                    chunk_offsets[c+1]) and random-access decodes ONLY
+//                    those rows into compacted output — no mask-word
+//                    staging, per-block work scales with the chunk's
+//                    survivor count, so it beats K3 at low selectivity
+//                    (the runtime K3-vs-K4 pick is the caller's).  Delta
+//                    roots are rejected (sequential reconstruction cannot
+//                    row-skip — callers fall back to K3-delta).  Extra
+//                    params: `const int32_t* row_indices, const uint32_t*
+//                    chunk_offsets`.
 //   * mask_dict_gather — K5: Bitpack-LEAF-root decode of DICTIONARY CODES
 //                    consuming the selection mask like K3, but instead of
 //                    storing the code it gathers the key's bytes from a
@@ -104,11 +118,33 @@ namespace codegen::decode::jit {
 // Unsupported (shape, variant) combinations are rejected with RenderError
 // (e.g. RLE cannot row-skip — run expansion; dict gather needs a bitpack
 // code leaf).
+//   * str_split_meta — K6 phase 1: for `input -> str_split -> {offsets
+//                    subtree, raw chars}` string columns, the tree passed
+//                    is the OFFSETS subtree (any value_source-decodable
+//                    cascade — bitpack, delta->rle->bitpack, ...; its ROOT
+//                    must be Bitpack or Delta so the next chunk's first
+//                    offset can be peeked from per-chunk scalars).  The
+//                    kernel is launched over the OFFSETS domain (n =
+//                    n_strings + 1): each block reconstructs its offsets
+//                    chunk IN FULL via the existing emitters, then for
+//                    survivor rows only emits the source char offset
+//                    (`out`, int64) and byte length (`len_out`, int32),
+//                    compacted by survivor rank.  Non-survivor chars are
+//                    never touched; the raw chars byte gather is phase 2
+//                    (a fixed kernel, see masked_launch.hpp
+//                    launch_masked_char_copy) after the caller scans the
+//                    lengths into output offsets.  Entropy-coded chars
+//                    are out of scope by construction (this never reads
+//                    chars).  Extra params: `const uint32_t* sel_mask,
+//                    const uint32_t* chunk_offsets` (both ROW-space),
+//                    `int32_t* len_out`.
 enum class DecodeVariant : std::uint8_t {
   plain            = 0,
   mask_out         = 1,
   mask_consume     = 2,
   mask_dict_gather = 3,
+  index_consume    = 4,
+  str_split_meta   = 5,
 };
 
 // One decode-input channel the rendered kernel reads.  `field` is the
@@ -159,5 +195,23 @@ DecodeKernelSpec render(const ::codegen::jit::FusedTree& tree,
                         const std::string& element_dtype,
                         std::int32_t num_chunks,
                         DecodeVariant variant = DecodeVariant::plain);
+
+// K1m2: two-column fused pair-predicate mask (`a OP b`, optionally AND-ed
+// with per-column constant ranges) for two Bitpack-LEAF columns of the SAME
+// table (identical chunk geometry — the launcher must verify chunk_count
+// match).  One kernel decodes both columns in-chunk and ballots the
+// combined predicate into selection-mask words (same layout as mask_out).
+// The comparison op ({<,<=,>,>=} as an int32 code) and all four range
+// bounds are KERNEL PARAMETERS — one compile per (dtype_a, dtype_b) covers
+// every op/literal (cache keyed by variant + arity, not constants).
+// Column A binds as node 0, column B as node 1 in `buffers` (the launcher
+// re-keys B's LabeledBuffers "0.*" -> "1.*").  Trailing params:
+// `uint32_t* sel_mask, int64_t n, int32_t cmp_op, int64_t lo_a, int64_t
+// hi_a, int64_t lo_b, int64_t hi_b`; cmp_op: 0 '<', 1 '<=', 2 '>', 3 '>='.
+DecodeKernelSpec render_pair_mask(const ::codegen::jit::FusedTree& tree_a,
+                                  const std::string& dtype_a,
+                                  const ::codegen::jit::FusedTree& tree_b,
+                                  const std::string& dtype_b,
+                                  std::int32_t num_chunks);
 
 }  // namespace codegen::decode::jit

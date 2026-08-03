@@ -75,9 +75,13 @@ struct range_predicate {
 // Output-column tier for wave 2.
 //   tier_a       — bitpack K3: decoded straight to a compacted
 //                  survivor_count-row column (shipped, iteration 1).
-//   tier_b       — full decode + survivor gather. Measured strictly worse than
-//                  the classic path (q1 +43.5%, q5 +6.2%): RULE 1 refuses any
-//                  batch with a tier_b output.
+//   tier_b       — full decode + survivor gather (mask->indices map, shared by
+//                  every tier_b column of the batch). Costs about the classic
+//                  path, so it is admitted only at low selectivity: post-CNT
+//                  the batch proceeds iff survivors/rows <=
+//                  SIRIUS_EXP_FUSED_SCAN_TIERB_MAX_SEL (default 0.10, q12-class
+//                  scans), else the memoized high-selectivity bail fires
+//                  (measured losses at high sel: q1 +43.5%, q5 +6.2%).
 //   tier_a_delta — delta->bitpack root masked decode (live: W1 delta variant +
 //                  W3 dispatch; same decode_selection{compact_capable} route
 //                  as tier_a).
@@ -89,19 +93,30 @@ struct range_predicate {
 //                  (it skips the full string materialization round trip), so
 //                  RULE 2's selectivity bail does NOT apply to batches with a
 //                  tier_dict_k5 output.
+//   tier_str_k6  — str_split masked strings (W3 K6 route: masked offsets
+//                  reconstruction + survivor-only chars byte-gather).
+//                  Economics are dict-K5-like in shape (skipped char
+//                  materialization scales with selectivity) but WEAKER at
+//                  ~1-char average widths, so iteration 5 keeps it under the
+//                  write-skip RULE-2 regime (0.35 threshold), NOT the dict
+//                  exemption — move it only if q12/q22 measurements say so.
 // Values 0/1 are stable (shipped); new tiers append.
 enum class output_tier : uint8_t {
   tier_a       = 0,
   tier_b       = 1,
   tier_a_delta = 2,
   tier_dict_k5 = 3,
+  tier_str_k6  = 4,
 };
 
-// True for tiers wave 2 can decode compacted (RULE 1's admission set).
+// True for tiers wave 2 decodes compacted in one pass (in-kernel mask consume,
+// the dict-K5 arm, or the str-K6 arm). tier_b is NOT in this set — it is
+// admitted separately through the full-decode + survivor-gather path at low
+// selectivity.
 constexpr bool tier_is_fused_capable(output_tier t)
 {
   return t == output_tier::tier_a || t == output_tier::tier_a_delta ||
-         t == output_tier::tier_dict_k5;
+         t == output_tier::tier_dict_k5 || t == output_tier::tier_str_k6;
 }
 
 // One scan conjunct resolved to a decoded-domain range on a bitpack column.
@@ -122,12 +137,41 @@ struct bool8_filter_directive {
   std::vector<std::string> equals_any;  // decode_predicate payload (equality / IN)
 };
 
+// Column-vs-column comparison for pair-predicate mask sources (iteration 5,
+// q12-class conjuncts like l_commitdate < l_receiptdate).
+enum class pair_compare_op : uint8_t { lt = 0, le = 1, gt = 2, ge = 3, eq = 4, ne = 5 };
+
+// One scan conjunct comparing two bitpack columns row-wise, resolved by ONE
+// kernel reading both packed regions (W1 K1m2: comparison ballot, optional
+// fused constant ranges on each side). Row passes iff
+//   decoded(a) OP decoded(b)  &&  decoded(a) in range_a  &&  decoded(b) in range_b
+// (full-domain range = inactive side). Both columns MUST be bitpack roots over
+// the batch's num_rows — that fixes both to the same 1024-row chunk geometry;
+// any other shape (nested bitpack, delta parent) is a geometry mismatch and
+// the extraction must DROP the conjunct (covers_whole_filter=false) rather
+// than emit the pair. The orchestrator re-checks and refuses the batch on a
+// bad pair — never a wrong mask.
+struct pair_predicate {
+  pair_compare_op op;
+  range_predicate range_a{INT64_MIN, INT64_MAX};  // inclusive; optional fused constants
+  range_predicate range_b{INT64_MIN, INT64_MAX};
+};
+
+struct pair_filter_directive {
+  std::size_t column_a;  // indexes into `selected`; bitpack-rooted
+  std::size_t column_b;
+  pair_predicate pred;
+};
+
 // The whole-batch fused request. W2 only builds one when EVERY conjunct on the
 // scanned table is decode-resolvable (iteration 1 rule; iteration 3 relaxes
 // this to partial coverage via bool8_filters + an untagged batch); W4 re-checks
 // the per-plan preconditions and falls back to the classic path when any fail.
+// Source-count cap: ranges + pairs + bool8 <= 8, a PAIR counting as ONE source
+// (one kernel, one mask buffer).
 struct scan_filter_request {
   std::vector<filter_column_directive> filters;      // range conjuncts (K1 sources)
+  std::vector<pair_filter_directive> pair_filters;    // col-vs-col conjuncts (K1m2 sources)
   std::vector<bool8_filter_directive> bool8_filters;  // dict-code conjuncts (BOOL8 sources)
   std::vector<output_tier> tiers;                     // parallel to `selected`
 };

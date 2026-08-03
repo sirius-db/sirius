@@ -319,11 +319,88 @@ bool run_roundtrip(const std::string& dtype, std::int64_t base, std::int64_t ran
                 pred_names[p],
                 expect.size());
 
-    std::printf("PASS: %s/%s (survivors=%lld of %lld)\n",
+    // K4 (index_consume) must produce the exact same compacted output from
+    // the ascending global row-index list (mask->indices wave equivalent).
+    std::vector<std::int32_t> row_indices;
+    row_indices.reserve(static_cast<std::size_t>(survivors));
+    for (std::int64_t r = 0; r < n; ++r)
+      if ((mask_ref[static_cast<std::size_t>(r) / 32] >> (r % 32)) & 1u)
+        row_indices.push_back(static_cast<std::int32_t>(r));
+    CUdeviceptr d_idx = enc.upload_bytes(
+      row_indices.data(), row_indices.size() * sizeof(std::int32_t));
+
+    CUdeviceptr d_out4 =
+      enc.alloc(static_cast<std::size_t>(survivors > 0 ? survivors : 1) * sizeof(Element));
+    cudaMemset(reinterpret_cast<void*>(d_out4), 0xCD,
+               static_cast<std::size_t>(survivors > 0 ? survivors : 1) * sizeof(Element));
+    REQUIRE_MSG(simpatico::launch_decode_fused_tree_index_consume(
+                  *tree,
+                  enc.buffers,
+                  dtype.c_str(),
+                  n,
+                  sm,
+                  reinterpret_cast<const std::int32_t*>(d_idx),
+                  reinterpret_cast<void*>(d_out4),
+                  stream),
+                "[%s/%s] launch_decode_fused_tree_index_consume failed",
+                dtype.c_str(),
+                pred_names[p]);
+    std::vector<Element> got4(static_cast<std::size_t>(survivors));
+    if (survivors > 0) {
+      cudaMemcpy(got4.data(), reinterpret_cast<const void*>(d_out4),
+                 got4.size() * sizeof(Element), cudaMemcpyDeviceToHost);
+    }
+    REQUIRE_MSG(got4 == expect,
+                "[%s/%s] K4 index-list output != K3/host reference (%zu survivors)",
+                dtype.c_str(),
+                pred_names[p],
+                expect.size());
+
+    std::printf("PASS: %s/%s k3+k4 (survivors=%lld of %lld)\n",
                 dtype.c_str(),
                 pred_names[p],
                 static_cast<long long>(survivors),
                 static_cast<long long>(n));
+  }
+
+  // K4 singleton: exactly one listed row (deep in a late chunk) — exercises
+  // the one-survivor block path and all-other-blocks early return.
+  {
+    const std::int64_t row = 3 * kChunk + 321;
+    std::vector<std::uint32_t> chunk_offsets(static_cast<std::size_t>(nc) + 1, 0u);
+    for (std::int64_t c = 0; c <= nc; ++c)
+      chunk_offsets[static_cast<std::size_t>(c)] = (c > 3) ? 1u : 0u;
+    const std::int32_t idx_host = static_cast<std::int32_t>(row);
+
+    selection_mask sm1;
+    sm1.words          = reinterpret_cast<std::uint32_t*>(d_plain);  // unused by K4
+    sm1.num_rows       = n;
+    sm1.chunk_offsets  = reinterpret_cast<std::uint32_t*>(
+      enc.upload_bytes(chunk_offsets.data(), chunk_offsets.size() * 4));
+    sm1.survivor_count = 1;
+
+    CUdeviceptr d_idx1 = enc.upload_bytes(&idx_host, sizeof(idx_host));
+    CUdeviceptr d_out1 = enc.alloc(sizeof(Element));
+    REQUIRE_MSG(simpatico::launch_decode_fused_tree_index_consume(
+                  *tree,
+                  enc.buffers,
+                  dtype.c_str(),
+                  n,
+                  sm1,
+                  reinterpret_cast<const std::int32_t*>(d_idx1),
+                  reinterpret_cast<void*>(d_out1),
+                  stream),
+                "[%s] K4 singleton launch failed",
+                dtype.c_str());
+    Element got1{};
+    cudaMemcpy(&got1, reinterpret_cast<const void*>(d_out1), sizeof(Element),
+               cudaMemcpyDeviceToHost);
+    REQUIRE_MSG(got1 == data[static_cast<std::size_t>(row)],
+                "[%s] K4 singleton decoded wrong value",
+                dtype.c_str());
+    std::printf("PASS: %s k4-singleton (row=%lld)\n",
+                dtype.c_str(),
+                static_cast<long long>(row));
   }
   return true;
 }
@@ -497,6 +574,261 @@ bool run_dict_gather(std::int32_t key_width, int arch)
   return true;
 }
 
+// K6: str_split masked survivor meta + fixed char copy.  `deep` = c_phone
+// shape (offsets->delta->rle->bitpack, constant length 15); shallow =
+// l_shipmode shape (offsets->bitpack, variable lengths 3..12).
+bool run_str_split_masked(bool deep, int arch)
+{
+  const std::int64_t n     = 4 * kChunk + 300;  // string rows
+  const std::int64_t n_off = n + 1;             // offsets elements
+  const std::int64_t nc    = codegen::num_chunks_for(n);      // row chunks
+  const rmm::cuda_stream_view stream{};
+  const char* tag = deep ? "str-deep" : "str-shallow";
+
+  // Host strings: offsets cumulative; chars pseudo-random bytes.
+  std::vector<std::int32_t> offsets(static_cast<std::size_t>(n_off));
+  offsets[0] = 0;
+  for (std::int64_t r = 0; r < n; ++r) {
+    std::uint64_t s = 0x57Ull ^ (0x9E3779B97F4A7C15ull * static_cast<std::uint64_t>(r + 1));
+    const std::int32_t len =
+      deep ? 15 : static_cast<std::int32_t>(3 + splitmix64(s) % 10ull);
+    offsets[static_cast<std::size_t>(r) + 1] = offsets[static_cast<std::size_t>(r)] + len;
+  }
+  const std::int64_t chars_bytes = offsets[static_cast<std::size_t>(n)];
+  std::vector<char> chars(static_cast<std::size_t>(chars_bytes));
+  for (std::int64_t b = 0; b < chars_bytes; ++b) {
+    std::uint64_t s = 0xC4A5ull ^ (0xD1B54A32D192ED03ull * static_cast<std::uint64_t>(b + 1));
+    chars[static_cast<std::size_t>(b)] = static_cast<char>('a' + splitmix64(s) % 26ull);
+  }
+
+  auto tree = deep
+                ? jit::FusedTree::make(
+                    OpKind::Delta,
+                    {{"differences",
+                      jit::FusedTree::make(OpKind::Rle,
+                                           {{"runs", jit::FusedTree::make(OpKind::Bitpack)},
+                                            {"values", jit::FusedTree::make(OpKind::Bitpack)}})}})
+                : jit::FusedTree::make(OpKind::Bitpack);
+
+  GpuEncoded enc =
+    codegen_test::gpu_encode_tree<std::int32_t>(*tree, "int32_t", offsets.data(), n_off, arch);
+  const std::int64_t nc_off = codegen::num_chunks_for(n_off);
+  if (deep) {
+    // Preorder: delta=0 -> rle=1 -> {runs=2, values=3} (lex order).
+    if (!compact_packed_on_host(enc, nc_off, /*node_id=*/2)) return false;
+    if (!compact_packed_on_host(enc, nc_off, /*node_id=*/3)) return false;
+  } else {
+    if (!compact_packed_on_host(enc, nc_off, /*node_id=*/0)) return false;
+  }
+
+  // Plain offsets decode through the production launcher = cascade sanity.
+  CUdeviceptr d_plain = enc.alloc(static_cast<std::size_t>(n_off) * sizeof(std::int32_t));
+  REQUIRE_MSG(simpatico::launch_decode_fused_tree(
+                *tree, enc.buffers, "int32_t", n_off, reinterpret_cast<void*>(d_plain), stream),
+              "[%s] plain offsets decode failed",
+              tag);
+  std::vector<std::int32_t> plain(static_cast<std::size_t>(n_off));
+  cudaMemcpy(plain.data(),
+             reinterpret_cast<const void*>(d_plain),
+             plain.size() * sizeof(std::int32_t),
+             cudaMemcpyDeviceToHost);
+  REQUIRE_MSG(plain == offsets, "[%s] plain offsets decode != input", tag);
+
+  // Row-space mask; force the chunk-boundary rows of chunks 0 and 2 on so
+  // the next-chunk first-offset peek is exercised (chunk 1 is all-zero).
+  std::vector<std::uint32_t> mask = make_host_mask(n, nc, 0x57A7, 40, /*zero_chunk=*/1);
+  mask[(0 * kChunk + 1023) / 32] |= (1u << ((0 * kChunk + 1023) % 32));
+  mask[(2 * kChunk + 1023) / 32] |= (1u << ((2 * kChunk + 1023) % 32));
+  std::vector<std::uint32_t> chunk_offsets;
+  const std::int64_t survivors = host_cnt(mask, nc, chunk_offsets);
+
+  selection_mask sm;
+  sm.words          = reinterpret_cast<std::uint32_t*>(
+    enc.upload_bytes(mask.data(), mask.size() * 4));
+  sm.num_rows       = n;
+  sm.chunk_offsets  = reinterpret_cast<std::uint32_t*>(
+    enc.upload_bytes(chunk_offsets.data(), chunk_offsets.size() * 4));
+  sm.survivor_count = survivors;
+
+  CUdeviceptr d_src = enc.alloc(static_cast<std::size_t>(survivors) * sizeof(std::int64_t));
+  CUdeviceptr d_len = enc.alloc(static_cast<std::size_t>(survivors) * sizeof(std::int32_t));
+  REQUIRE_MSG(simpatico::launch_decode_fused_tree_str_split_meta(
+                *tree,
+                enc.buffers,
+                "int32_t",
+                n,
+                sm,
+                reinterpret_cast<std::int64_t*>(d_src),
+                reinterpret_cast<std::int32_t*>(d_len),
+                stream),
+              "[%s] str_split_meta launch failed",
+              tag);
+
+  std::vector<std::int64_t> src_got(static_cast<std::size_t>(survivors));
+  std::vector<std::int32_t> len_got(static_cast<std::size_t>(survivors));
+  cudaMemcpy(src_got.data(), reinterpret_cast<const void*>(d_src), src_got.size() * 8,
+             cudaMemcpyDeviceToHost);
+  cudaMemcpy(len_got.data(), reinterpret_cast<const void*>(d_len), len_got.size() * 4,
+             cudaMemcpyDeviceToHost);
+
+  std::vector<std::int64_t> src_ref;
+  std::vector<std::int32_t> len_ref;
+  std::vector<std::int32_t> out_off(1, 0);
+  std::vector<char> chars_ref;
+  for (std::int64_t r = 0; r < n; ++r) {
+    if ((mask[static_cast<std::size_t>(r) / 32] >> (r % 32)) & 1u) {
+      const std::int32_t o0 = offsets[static_cast<std::size_t>(r)];
+      const std::int32_t o1 = offsets[static_cast<std::size_t>(r) + 1];
+      src_ref.push_back(o0);
+      len_ref.push_back(o1 - o0);
+      out_off.push_back(out_off.back() + (o1 - o0));
+      chars_ref.insert(chars_ref.end(), chars.begin() + o0, chars.begin() + o1);
+    }
+  }
+  REQUIRE_MSG(src_got == src_ref && len_got == len_ref,
+              "[%s] K6 meta (src offsets / lengths) != host reference (%lld survivors)",
+              tag,
+              static_cast<long long>(survivors));
+
+  // Phase 2: fixed char copy against the host gather.
+  CUdeviceptr d_chars   = enc.upload_bytes(chars.data(), chars.size());
+  CUdeviceptr d_out_off = enc.upload_bytes(out_off.data(), out_off.size() * 4);
+  const std::size_t out_bytes = chars_ref.empty() ? 1 : chars_ref.size();
+  CUdeviceptr d_out_chars     = enc.alloc(out_bytes);
+  cudaMemset(reinterpret_cast<void*>(d_out_chars), 0xEE, out_bytes);
+  REQUIRE_MSG(simpatico::launch_masked_char_copy(reinterpret_cast<const void*>(d_chars),
+                                                 reinterpret_cast<const std::int64_t*>(d_src),
+                                                 reinterpret_cast<const std::int32_t*>(d_out_off),
+                                                 survivors,
+                                                 reinterpret_cast<void*>(d_out_chars),
+                                                 stream),
+              "[%s] masked_char_copy launch failed",
+              tag);
+  std::vector<char> chars_got(chars_ref.size());
+  if (!chars_got.empty()) {
+    cudaMemcpy(chars_got.data(), reinterpret_cast<const void*>(d_out_chars), chars_got.size(),
+               cudaMemcpyDeviceToHost);
+  }
+  REQUIRE_MSG(chars_got == chars_ref,
+              "[%s] K6 gathered chars != host reference (%zu bytes)",
+              tag,
+              chars_ref.size());
+  std::printf("PASS: %s (survivors=%lld of %lld, %zu chars)\n",
+              tag,
+              static_cast<long long>(survivors),
+              static_cast<long long>(n),
+              chars_ref.size());
+  return true;
+}
+
+// K1m2: two-column pair predicate truth table (diffs in {-1,0,+1} so the
+// equal-values boundary is dense), plus a constant-range AND and the
+// chunk-geometry-mismatch rejection.
+bool run_pair_mask(int arch)
+{
+  const std::int64_t n  = 3 * kChunk + 257;
+  const std::int64_t nc = codegen::num_chunks_for(n);
+  const rmm::cuda_stream_view stream{};
+
+  std::vector<std::int32_t> a(static_cast<std::size_t>(n));
+  std::vector<std::int32_t> b(static_cast<std::size_t>(n));
+  for (std::int64_t i = 0; i < n; ++i) {
+    std::uint64_t s = 0xAB12ull ^ (0x9E3779B97F4A7C15ull * static_cast<std::uint64_t>(i + 1));
+    a[static_cast<std::size_t>(i)] = 8035 + static_cast<std::int32_t>(splitmix64(s) % 2526ull);
+    b[static_cast<std::size_t>(i)] =
+      a[static_cast<std::size_t>(i)] + static_cast<std::int32_t>(splitmix64(s) % 3ull) - 1;
+  }
+
+  auto tree_a = jit::FusedTree::make(OpKind::Bitpack);
+  auto tree_b = jit::FusedTree::make(OpKind::Bitpack);
+  GpuEncoded enc_a =
+    codegen_test::gpu_encode_tree<std::int32_t>(*tree_a, "int32_t", a.data(), n, arch);
+  GpuEncoded enc_b =
+    codegen_test::gpu_encode_tree<std::int32_t>(*tree_b, "int32_t", b.data(), n, arch);
+  if (!compact_packed_on_host(enc_a, nc)) return false;
+  if (!compact_packed_on_host(enc_b, nc)) return false;
+
+  const std::size_t nwords = static_cast<std::size_t>(nc) * kWordsPerChunk;
+  const range_predicate no_range{INT64_MIN, INT64_MAX};
+  const range_predicate a_range{8035 + 100, 8035 + 1200};
+
+  struct Case {
+    simpatico::pair_cmp op;
+    const char* name;
+    bool ranged;
+  };
+  const Case cases[] = {
+    {simpatico::pair_cmp::lt, "lt", false},
+    {simpatico::pair_cmp::le, "le", false},
+    {simpatico::pair_cmp::gt, "gt", false},
+    {simpatico::pair_cmp::ge, "ge", false},
+    {simpatico::pair_cmp::lt, "lt+range_a", true},
+  };
+  for (const Case& c : cases) {
+    CUdeviceptr d_mask = enc_a.alloc(nwords * 4);
+    cudaMemset(reinterpret_cast<void*>(d_mask), 0xFF, nwords * 4);
+    selection_mask sm;
+    sm.words    = reinterpret_cast<std::uint32_t*>(d_mask);
+    sm.num_rows = n;
+    REQUIRE_MSG(simpatico::launch_decode_fused_tree_pair_mask_out(*tree_a,
+                                                                  enc_a.buffers,
+                                                                  "int32_t",
+                                                                  *tree_b,
+                                                                  enc_b.buffers,
+                                                                  "int32_t",
+                                                                  n,
+                                                                  c.op,
+                                                                  sm,
+                                                                  stream,
+                                                                  c.ranged ? a_range : no_range,
+                                                                  no_range),
+                "[pair/%s] launch failed",
+                c.name);
+    std::vector<std::uint32_t> got(nwords);
+    cudaMemcpy(got.data(), reinterpret_cast<const void*>(d_mask), nwords * 4,
+               cudaMemcpyDeviceToHost);
+
+    std::vector<std::uint32_t> ref(nwords, 0u);
+    for (std::int64_t r = 0; r < n; ++r) {
+      const std::int64_t av = a[static_cast<std::size_t>(r)];
+      const std::int64_t bv = b[static_cast<std::size_t>(r)];
+      bool pass = (c.op == simpatico::pair_cmp::lt)   ? (av < bv)
+                  : (c.op == simpatico::pair_cmp::le) ? (av <= bv)
+                  : (c.op == simpatico::pair_cmp::gt) ? (av > bv)
+                                                      : (av >= bv);
+      if (c.ranged) pass = pass && av >= a_range.lo && av <= a_range.hi;
+      if (pass) ref[static_cast<std::size_t>(r) / 32] |= (1u << (r % 32));
+    }
+    REQUIRE_MSG(got == ref, "[pair/%s] K1m2 mask != host truth table", c.name);
+    std::printf("PASS: pair/%s\n", c.name);
+  }
+
+  // Chunk-geometry mismatch must be rejected before any launch.
+  {
+    jit::LabeledBuffers bad = enc_b.buffers;
+    auto it                 = bad.find(jit::buffer_key(0, "chunk_count"));
+    REQUIRE_MSG(it != bad.end(), "[pair] missing chunk_count in copy");
+    it->second.length -= 1;
+    CUdeviceptr d_mask = enc_a.alloc(nwords * 4);
+    selection_mask sm;
+    sm.words    = reinterpret_cast<std::uint32_t*>(d_mask);
+    sm.num_rows = n;
+    REQUIRE_MSG(!simpatico::launch_decode_fused_tree_pair_mask_out(*tree_a,
+                                                                   enc_a.buffers,
+                                                                   "int32_t",
+                                                                   *tree_b,
+                                                                   bad,
+                                                                   "int32_t",
+                                                                   n,
+                                                                   simpatico::pair_cmp::lt,
+                                                                   sm,
+                                                                   stream),
+                "[pair] chunk-geometry mismatch must be rejected");
+    std::printf("PASS: pair/geometry-mismatch-rejected\n");
+  }
+  return true;
+}
+
 // Render-level contract checks (no kernel launches).
 bool render_checks()
 {
@@ -566,6 +898,95 @@ bool render_checks()
   }
   REQUIRE_MSG(rejected, "mask_dict_gather on a Delta root must throw RenderError");
 
+  // 5. K4 index_consume: bitpack leaf only; own symbol; index list + offsets
+  //    are kernel params; delta roots rejected (fall back to K3-delta).
+  const cdj::DecodeKernelSpec k4 = cdj::render(*bp, "int64_t", 8, cdj::DecodeVariant::index_consume);
+  REQUIRE_MSG(k4.entry_symbol == s3.entry_symbol + "_index_consume",
+              "K4 entry symbol suffix wrong: %s",
+              k4.entry_symbol.c_str());
+  REQUIRE_MSG(k4.source.find("row_indices") != std::string::npos &&
+                k4.source.find("chunk_offsets") != std::string::npos,
+              "K4 source must take row_indices/chunk_offsets kernel params");
+  REQUIRE_MSG(k4.buffers.size() == s3.buffers.size(),
+              "K4 must not change the input-channel manifest");
+  REQUIRE_MSG(k4.source != k3.source && k4.source != s3.source,
+              "K4 source must be distinct (JIT-cache separation)");
+  rejected = false;
+  try {
+    (void)cdj::render(*delta, "int64_t", 8, cdj::DecodeVariant::index_consume);
+  } catch (const cdj::RenderError&) {
+    rejected = true;
+  }
+  REQUIRE_MSG(rejected, "index_consume on a Delta root must throw RenderError");
+
+  // 6. K6 str_split_meta: bitpack + delta roots render (with the next-chunk
+  //    peek), rle root rejected; params not literals.
+  const cdj::DecodeKernelSpec k6 = cdj::render(*bp, "int32_t", 8, cdj::DecodeVariant::str_split_meta);
+  REQUIRE_MSG(k6.entry_symbol == p32.entry_symbol + "_str_meta",
+              "K6 entry symbol suffix wrong: %s",
+              k6.entry_symbol.c_str());
+  REQUIRE_MSG(k6.source.find("len_out") != std::string::npos &&
+                k6.source.find("next0") != std::string::npos,
+              "K6 source must take len_out and emit the next-chunk peek");
+  auto deep_offsets = jit::FusedTree::make(
+    OpKind::Delta,
+    {{"differences",
+      jit::FusedTree::make(OpKind::Rle,
+                           {{"runs", jit::FusedTree::make(OpKind::Bitpack)},
+                            {"values", jit::FusedTree::make(OpKind::Bitpack)}})}});
+  const cdj::DecodeKernelSpec k6d =
+    cdj::render(*deep_offsets, "int32_t", 8, cdj::DecodeVariant::str_split_meta);
+  REQUIRE_MSG(k6d.source.find("delta_first_0[chunk_id + 1]") != std::string::npos,
+              "K6 delta root must peek delta_first[chunk_id+1]");
+  rejected = false;
+  try {
+    auto rle_root = jit::FusedTree::make(OpKind::Rle,
+                                         {{"runs", jit::FusedTree::make(OpKind::Bitpack)},
+                                          {"values", jit::FusedTree::make(OpKind::Bitpack)}});
+    (void)cdj::render(*rle_root, "int32_t", 8, cdj::DecodeVariant::str_split_meta);
+  } catch (const cdj::RenderError&) {
+    rejected = true;
+  }
+  REQUIRE_MSG(rejected, "str_split_meta on an Rle root must throw RenderError");
+
+  // 7. Compositional mask_consume: a FOR-rooted cascade renders through the
+  //    generic value_source seam (no hand-written variant needed).
+  auto for_tree = jit::FusedTree::make(
+    OpKind::For, {{"deltas", jit::FusedTree::make(OpKind::Bitpack)}});
+  const cdj::DecodeKernelSpec kfor =
+    cdj::render(*for_tree, "int64_t", 8, cdj::DecodeVariant::mask_consume);
+  REQUIRE_MSG(kfor.entry_symbol.find("_mask_consume") != std::string::npos &&
+                kfor.source.find("K3-generic") != std::string::npos,
+              "FOR-rooted mask_consume must render via the generic seam");
+
+  // 8. K1m2 pair mask: combined symbol, params-not-constants, both columns'
+  //    channels distinct; self-pair and non-bitpack columns rejected.
+  const cdj::DecodeKernelSpec kp = cdj::render_pair_mask(*bp, "int32_t", *for_tree->children.at("deltas"), "int32_t", 8);
+  REQUIRE_MSG(kp.entry_symbol == "simpatico_decode_pair_mask_int32_t_int32_t",
+              "pair mask entry symbol wrong: %s",
+              kp.entry_symbol.c_str());
+  REQUIRE_MSG(kp.source.find("cmp_op") != std::string::npos &&
+                kp.source.find("lo_a") != std::string::npos &&
+                kp.source.find("chunk_min_0") != std::string::npos &&
+                kp.source.find("chunk_min_1") != std::string::npos,
+              "pair mask must take op/bounds params and bind two node channels");
+  REQUIRE_MSG(kp.buffers.size() == 2 * p32.buffers.size(),
+              "pair mask manifest must carry both columns' channels");
+  rejected = false;
+  try {
+    (void)cdj::render_pair_mask(*bp, "int32_t", *bp, "int32_t", 8);
+  } catch (const cdj::RenderError&) {
+    rejected = true;
+  }
+  REQUIRE_MSG(rejected, "pair mask with the same tree object twice must throw");
+  rejected = false;
+  try {
+    (void)cdj::render_pair_mask(*delta, "int64_t", *bp, "int64_t", 8);
+  } catch (const cdj::RenderError&) {
+    rejected = true;
+  }
+  REQUIRE_MSG(rejected, "pair mask with a non-bitpack column must throw");
+
   std::printf("PASS: render contract checks\n");
   return true;
 }
@@ -591,6 +1012,11 @@ int main()
     run_delta_masked<std::int32_t>("int32_t", arch);
     run_dict_gather(/*key_width=*/1, arch);  // l_returnflag / l_linestatus
     run_dict_gather(/*key_width=*/4, arch);  // constant-width generality
+    // Iteration 5: K6 str_split gather (l_shipmode / c_phone shapes) and
+    // K1m2 pair predicates (q12 shape).
+    run_str_split_masked(/*deep=*/false, arch);
+    run_str_split_masked(/*deep=*/true, arch);
+    run_pair_mask(arch);
   } catch (const std::exception& e) {
     std::fprintf(stderr, "FAIL: unhandled exception: %s\n", e.what());
     return 1;

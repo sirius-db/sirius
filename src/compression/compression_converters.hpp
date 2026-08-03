@@ -67,10 +67,28 @@ enum class decode_output_tier : std::uint8_t {
   /// Dictionary-rooted string plan (`dictionary -> ... indices -> bitpack`):
   /// compacted decode via the K5 masked key gather once available.
   tier_dict_k5,
+  /// `str_split` string plan (bitpack offsets + raw chars): compacted decode
+  /// via the K6 masked offsets + survivor-only chars gather once available.
+  tier_str_k6,
   /// Everything else: full-width decode as today, survivors gathered
   /// afterwards with mask-derived indices (scan side).
   tier_b,
 };
+
+/// Column-vs-column conjunct attached by the scan (iteration 5, q12-class
+/// `colA OP colB`): positions index the representation's selected column list.
+/// @c op numerically mirrors @c sirius::codegen::pair_compare_op
+/// (lt=0, le=1, gt=2, ge=3, eq=4, ne=5) — spelled out so this header stays
+/// simpatico-free, like the rest of the carrier types. The directive builder
+/// validates both sides are K1m2-capable bitpack leaves and folds each side's
+/// constant range into the pair (see codegen::pair_predicate); an invalid pair
+/// is DROPPED (covers_whole_filter cleared) rather than emitted.
+struct decode_pair_entry {
+  std::size_t column_a = 0;
+  std::size_t column_b = 0;
+  std::uint8_t op      = 0;
+};
+using decode_pair_pushdown = std::vector<decode_pair_entry>;
 
 /// The per-batch directive package for the wave orchestrator.
 ///
@@ -95,6 +113,10 @@ struct fused_scan_directives {
   /// (simpatico::plan_supports_selection_decode). Parallel to output_tiers;
   /// tier_b entries are always false.
   std::vector<std::uint8_t> compact_capable;
+  /// Validated col-vs-col mask sources (K1m2), post drop. A column whose
+  /// constant range is folded into a kept pair side has its standalone K1
+  /// participation cleared (the pair is the source; one kernel does both).
+  decode_pair_pushdown pairs;
 };
 
 /**
@@ -116,12 +138,21 @@ struct fused_scan_directives {
  * this build can decode it compacted; a pure-filter column's compacted output
  * is simply dropped by the scan's projection as usual.
  *
+ * @p has_bool8_mask_sources declares that the caller will also contribute
+ * dict-code equality conjuncts (scan_filter_request::bool8_filters) to the
+ * scan mask: the package then enables even with zero range sources (q19-style
+ * string-only masks), and @c covers_whole_filter is forced false — the
+ * extraction gate only speaks for the numeric view, so bool8-carrying batches
+ * always keep the residual post-filter.
+ *
  * @throws std::runtime_error if @p attached_ranges is wider than
  *         @p selected_columns (a wiring bug, mirroring the equality pushdown).
  */
 fused_scan_directives build_fused_scan_directives(const simpatico::compressed_table& table,
                                                   std::span<const std::size_t> selected_columns,
                                                   const decode_range_pushdown& attached_ranges,
-                                                  bool all_conjuncts_convertible);
+                                                  bool all_conjuncts_convertible,
+                                                  bool has_bool8_mask_sources = false,
+                                                  const decode_pair_pushdown& attached_pairs = {});
 
 }  // namespace sirius

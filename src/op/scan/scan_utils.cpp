@@ -16,6 +16,7 @@
 
 // sirius
 #include <duckdb/common/types/value.hpp>
+#include <duckdb/planner/expression/bound_comparison_expression.hpp>
 #include <duckdb/planner/expression/bound_conjunction_expression.hpp>
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
 #include <duckdb/planner/filter/conjunction_filter.hpp>
@@ -482,6 +483,49 @@ duckdb::unique_ptr<duckdb::Expression> convert_table_filters_to_expression(
     conjunction->children.push_back(std::move(expr));
   }
   return conjunction;
+}
+
+std::vector<pair_conjunct> extract_pair_conjuncts(duckdb::Expression const& expr)
+{
+  std::vector<pair_conjunct> result;
+  if (expr.GetExpressionClass() == duckdb::ExpressionClass::BOUND_CONJUNCTION &&
+      expr.type == duckdb::ExpressionType::CONJUNCTION_AND) {
+    auto const& conjunction = expr.Cast<duckdb::BoundConjunctionExpression>();
+    for (auto const& child : conjunction.children) {
+      auto found = extract_pair_conjuncts(*child);
+      result.insert(result.end(), found.begin(), found.end());
+    }
+    return result;
+  }
+  if (expr.GetExpressionClass() != duckdb::ExpressionClass::BOUND_COMPARISON) { return result; }
+  auto const& cmp = expr.Cast<duckdb::BoundComparisonExpression>();
+  sirius::codegen::pair_compare_op op;
+  switch (cmp.type) {
+    case duckdb::ExpressionType::COMPARE_LESSTHAN: op = sirius::codegen::pair_compare_op::lt; break;
+    case duckdb::ExpressionType::COMPARE_LESSTHANOREQUALTO:
+      op = sirius::codegen::pair_compare_op::le;
+      break;
+    case duckdb::ExpressionType::COMPARE_GREATERTHAN:
+      op = sirius::codegen::pair_compare_op::gt;
+      break;
+    case duckdb::ExpressionType::COMPARE_GREATERTHANOREQUALTO:
+      op = sirius::codegen::pair_compare_op::ge;
+      break;
+    default: return result;  // =, <>, DISTINCT — not harvested (iteration 5 scope)
+  }
+  if (cmp.left->GetExpressionClass() != duckdb::ExpressionClass::BOUND_REF ||
+      cmp.right->GetExpressionClass() != duckdb::ExpressionClass::BOUND_REF) {
+    return result;  // casts/functions around a side ⇒ not a plain pair
+  }
+  auto const& left  = cmp.left->Cast<duckdb::BoundReferenceExpression>();
+  auto const& right = cmp.right->Cast<duckdb::BoundReferenceExpression>();
+  result.push_back({left.index, right.index, op});
+  SIRIUS_LOG_DEBUG("TABLE_SCAN pair harvest: binding {} {} binding {} (op={})",
+                   left.index,
+                   duckdb::ExpressionTypeToString(cmp.type),
+                   right.index,
+                   static_cast<int>(op));
+  return result;
 }
 
 std::optional<gpu_expression_translator::translated_expression>

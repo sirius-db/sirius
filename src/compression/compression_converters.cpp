@@ -40,7 +40,9 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdint>
 #include <cstdlib>
+#include <limits>
 #include <numeric>
 #include <optional>
 #include <stdexcept>
@@ -130,6 +132,7 @@ decode_output_tier to_local_tier(sirius::codegen::output_tier t)
     case sirius::codegen::output_tier::tier_a: return decode_output_tier::tier_a;
     case sirius::codegen::output_tier::tier_a_delta: return decode_output_tier::tier_a_delta;
     case sirius::codegen::output_tier::tier_dict_k5: return decode_output_tier::tier_dict_k5;
+    case sirius::codegen::output_tier::tier_str_k6: return decode_output_tier::tier_str_k6;
     default: return decode_output_tier::tier_b;
   }
 }
@@ -140,6 +143,7 @@ sirius::codegen::output_tier to_shared_tier(decode_output_tier t)
     case decode_output_tier::tier_a: return sirius::codegen::output_tier::tier_a;
     case decode_output_tier::tier_a_delta: return sirius::codegen::output_tier::tier_a_delta;
     case decode_output_tier::tier_dict_k5: return sirius::codegen::output_tier::tier_dict_k5;
+    case decode_output_tier::tier_str_k6: return sirius::codegen::output_tier::tier_str_k6;
     default: return sirius::codegen::output_tier::tier_b;
   }
 }
@@ -226,36 +230,100 @@ enum class fused_batch_tag : std::uint8_t {
 };
 
 // Attempt the fused scan-filter decompress (SIRIUS_EXP_FUSED_SCAN_FILTER):
-// wave-1 K1 masks on the range columns, wave-2 decode against the combined
-// mask, output assembled to one uniformly survivor-sized table. Returns
-// nullptr when the attempt is declined here (directives not buildable for this
-// chunk) or the assembly refuses (null-masked column, iteration-1 guard) — the
-// caller then runs the classic path. `tag` reports how to wrap a non-null
-// return; `none` with a non-null return means the orchestrator fell back
-// internally (refused/failed) and the table is the classic full-width decode,
-// usable as-is.
+// wave-1 K1 masks on the range columns + dict-code BOOL8 masks on equality
+// columns, wave-2 decode against the combined mask, output assembled to one
+// uniformly survivor-sized table. Returns nullptr when the attempt is
+// declined here (directives not buildable, or shape-impossible with bool8
+// sources) or the assembly refuses — the caller then runs the classic path
+// (predicated when an equality pushdown exists). `tag` reports how to wrap a
+// non-null return; `none` with a non-null return means the engine fell back
+// internally and the table is the classic decode — with routed bool8_filters
+// that fallback is PREDICATED (BOOL8 substitution columns at those slots, the
+// dict win survives every outcome; decompress_scan_filter contract), and the
+// scan's per-batch type inspection consumes them exactly like the shipped
+// pushdown.
+//
+// ITERATION-4 POLICY (dict-code mask sources): when a pure-filter dict column's
+// equality/IN joins the scan mask (bool8_filters) AND the fused pipeline
+// applies, its BOOL8 substitution is DROPPED — no decode_predicates ride the
+// applied path, the column decodes as real (compacted) values, and the batch
+// stays untagged so the post-filter re-runs everything (idempotent) plus any
+// residual. Single delivery: whichever path wins carries the predicate.
 std::unique_ptr<cudf::table> try_decompress_scan_filter(
   simpatico::compressed_table const& ct,
   std::span<const std::size_t> selected,
   decode_range_pushdown const& attached_ranges,
   bool all_conjuncts_convertible,
+  decode_equality_pushdown const& equality_pushdown,
+  decode_pair_pushdown const& attached_pairs,
   simpatico::stream_pool& pool,
   rmm::cuda_stream_view stream,
   rmm::device_async_resource_ref mr,
   fused_batch_tag& tag)
 {
-  auto const directives =
-    build_fused_scan_directives(ct, selected, attached_ranges, all_conjuncts_convertible);
+  // bool8 mask candidates = the shipped equality pushdown's non-empty entries
+  // (attach already gates them per chunk on column_supports_predicate_decode,
+  // i.e. dictionary-rooted pure-filter columns; W4 re-probes).
+  bool has_bool8_candidates = false;
+  for (std::size_t i = 0; i < equality_pushdown.size() && i < selected.size(); ++i) {
+    if (!equality_pushdown[i].empty()) {
+      has_bool8_candidates = true;
+      break;
+    }
+  }
+  auto const directives = build_fused_scan_directives(
+    ct, selected, attached_ranges, all_conjuncts_convertible, has_bool8_candidates,
+    attached_pairs);
   if (!directives.enabled) { return nullptr; }
+
+  // bool8 routing policy, measured (closing matrix, iteration 4): a
+  // bool8-ONLY mask lost on q19 (+5.8%, 0.3254 → 0.3441) — single delivery
+  // turns the substituted column into K5-materialized compacted strings and
+  // the partial-coverage post-filter then string-compares them, strictly more
+  // work than the BOOL8-substitution baseline at ~7% survivors. So dict-code
+  // conjuncts join the mask only when at least one range (later: pair) source
+  // is ALSO present; bool8-only decline to the predicated classic path, which
+  // IS today's optimum. No suite scan currently pairs ranges with dict-code
+  // masks, so this gates nothing real — see STATUS-W2 for the dual-delivery
+  // design to adopt when such a customer appears.
+  //
+  // Shape checks: structurally impossible requests skip the engine
+  // round-trip. No admissibility mirror remains: since W4's rev 14, EVERY
+  // non-applied outcome with routed bool8_filters reruns classic WITH the
+  // dict-code conjuncts as decode_predicates (BOOL8 substitution floor, see
+  // the decompress_scan_filter contract in api/simpatico_codegen.hpp).
+  std::size_t range_sources = 0;
+  for (auto const& e : directives.ranges) {
+    if (e.participates_in_scan_mask) { ++range_sources; }
+  }
+  bool route_bool8 = false;
+  if (has_bool8_candidates) {
+    if (range_sources + directives.pairs.size() == 0) {
+      SIRIUS_FUSED_DIAG(
+        "[fused-diag] bool8-only mask declined (no range/pair source) — keeping the predicated "
+        "classic path (measured optimum, q19 iteration-4 matrix)");
+      return nullptr;
+    }
+    std::size_t bool8_sources = 0;
+    for (std::size_t i = 0; i < equality_pushdown.size() && i < selected.size(); ++i) {
+      if (!equality_pushdown[i].empty()) { ++bool8_sources; }
+    }
+    if (range_sources + directives.pairs.size() + bool8_sources > 8 ||
+        ct.num_rows() > std::numeric_limits<std::int32_t>::max()) {
+      SIRIUS_FUSED_DIAG(
+        "[fused-diag] bool8 routing declined on shape ({} mask sources, {} rows) — keeping the "
+        "predicated classic path",
+        range_sources + directives.pairs.size() + bool8_sources,
+        ct.num_rows());
+      return nullptr;
+    }
+    route_bool8 = true;
+  }
 
   // Build the wave request directly (not via make_scan_filter_request, whose
   // column_decode_directive collapses tiers to a boolean): W4's wave-2
   // dispatch and RULE 2's dict-K5 exemption key off the TRUE tier, so the
-  // delta/dict unlocks only work when the request carries them. bool8_filters
-  // stays empty here: no scan produces ranges and an equality pushdown
-  // together today (equality candidates require pure-filter columns), and
-  // flipping q19 from BOOL8 substitution to a fused dict-code mask is a
-  // measured policy decision, not a default.
+  // delta/dict unlocks only work when the request carries them.
   sirius::codegen::scan_filter_request request;
   request.tiers.reserve(selected.size());
   for (std::size_t i = 0; i < selected.size(); ++i) {
@@ -266,6 +334,24 @@ std::unique_ptr<cudf::table> try_decompress_scan_filter(
     request.tiers.push_back(directives.compact_capable[i] != 0
                               ? to_shared_tier(directives.output_tiers[i])
                               : sirius::codegen::output_tier::tier_b);
+  }
+  // Pair sources: one K1m2 kernel per pair, with each side's constant range
+  // folded in (an inactive side stays full-domain). The builder already
+  // cleared those sides' standalone K1 participation.
+  for (auto const& pair : directives.pairs) {
+    sirius::codegen::pair_predicate pred;
+    pred.op          = static_cast<sirius::codegen::pair_compare_op>(pair.op);
+    auto const& ra   = directives.ranges[pair.column_a];
+    auto const& rb   = directives.ranges[pair.column_b];
+    if (ra.active) { pred.range_a = {ra.lo, ra.hi}; }
+    if (rb.active) { pred.range_b = {rb.lo, rb.hi}; }
+    request.pair_filters.push_back({pair.column_a, pair.column_b, pred});
+  }
+  if (route_bool8) {
+    for (std::size_t i = 0; i < equality_pushdown.size() && i < selected.size(); ++i) {
+      if (equality_pushdown[i].empty()) { continue; }
+      request.bool8_filters.push_back({i, equality_pushdown[i]});
+    }
   }
 
   sirius::codegen::scan_filter_result result;
@@ -295,11 +381,13 @@ std::unique_ptr<cudf::table> try_decompress_scan_filter(
     tag = fused_batch_tag::row_filtered;
   }
   SIRIUS_FUSED_DIAG(
-    "[fused-diag] decompress_scan_filter {} (status={}): filters={} survivors={}/{} "
-    "column(s)={} covers_whole_filter={} tag={}",
+    "[fused-diag] decompress_scan_filter {} (status={}): range_filters={} pair_filters={} "
+    "bool8_filters={} survivors={}/{} column(s)={} covers_whole_filter={} tag={}",
     result.applied ? "APPLIED" : "NOT applied (classic output)",
     static_cast<int>(result.status),
     request.filters.size(),
+    request.pair_filters.size(),
+    request.bool8_filters.size(),
     result.survivor_count,
     result.num_rows,
     table->num_columns(),
@@ -355,8 +443,9 @@ std::unique_ptr<cucascade::idata_representation> reconstruct_and_decompress_to_g
     to_decode_predicates(equality_pushdown, static_cast<std::size_t>(subset.num_columns()));
   std::unique_ptr<cudf::table> decompressed;
   fused_batch_tag tag = fused_batch_tag::none;
-  // Fused scan-filter attempt — same contract as the device converter: only
-  // without string-equality predicates, decline ⇒ classic path below.
+  // Fused scan-filter attempt — same contract as the device converter:
+  // equality pushdowns route into the mask when admissible (substitution
+  // dropped), decline ⇒ classic (predicated) path below.
   SIRIUS_FUSED_DIAG(
     "[fused-diag] host converter: n_columns={} equality_predicates={} range_entries={} "
     "range_gate={}",
@@ -364,7 +453,7 @@ std::unique_ptr<cucascade::idata_representation> reconstruct_and_decompress_to_g
     predicates.size(),
     range_pushdown.size(),
     range_conjuncts_convertible);
-  if (predicates.empty() && !range_pushdown.empty()) {
+  if (!range_pushdown.empty() || !predicates.empty()) {
     // `subset` holds exactly the projected columns, so selection is identity.
     std::vector<std::size_t> identity_selection(subset.num_columns());
     std::iota(identity_selection.begin(), identity_selection.end(), std::size_t{0});
@@ -372,6 +461,8 @@ std::unique_ptr<cucascade::idata_representation> reconstruct_and_decompress_to_g
                                               identity_selection,
                                               range_pushdown,
                                               range_conjuncts_convertible,
+                                              equality_pushdown,
+                                              decode_pair_pushdown{},  // carrier pending (STATUS-W2)
                                               pool,
                                               stream,
                                               mr,
@@ -470,8 +561,10 @@ std::unique_ptr<cucascade::idata_representation> decompress_device_to_gpu(
   fused_batch_tag tag = fused_batch_tag::none;
   // Fused scan-filter attempt (SIRIUS_EXP_FUSED_SCAN_FILTER; the env gate and
   // every per-plan precondition are re-checked inside decompress_scan_filter).
-  // Not composable with string-equality predicates (iteration 1) — those scans
-  // keep the predicated overload below. Any decline falls through classically.
+  // Iteration 4: string-equality pushdowns are composable — try_ routes them
+  // into the mask (bool8_filters, substitution dropped) when the request is
+  // admissible, and declines otherwise so the predicated overload below keeps
+  // the shipped BOOL8-substitution behavior.
   SIRIUS_FUSED_DIAG(
     "[fused-diag] device converter: n_selected={} equality_predicates={} range_entries={} "
     "range_gate={}",
@@ -480,7 +573,7 @@ std::unique_ptr<cucascade::idata_representation> decompress_device_to_gpu(
     rep.range_pushdown().size(),
     rep.range_conjuncts_convertible());
   std::vector<std::size_t> identity_selection;
-  if (predicates.empty() && !rep.range_pushdown().empty()) {
+  if (!rep.range_pushdown().empty() || !predicates.empty()) {
     std::span<const std::size_t> selected;
     if (indices.has_value()) {
       selected = *indices;
@@ -493,6 +586,8 @@ std::unique_ptr<cucascade::idata_representation> decompress_device_to_gpu(
                                               selected,
                                               rep.range_pushdown(),
                                               rep.range_conjuncts_convertible(),
+                                              rep.equality_pushdown(),
+                                              decode_pair_pushdown{},  // carrier pending (STATUS-W2)
                                               pool,
                                               stream,
                                               mr,
@@ -545,7 +640,9 @@ std::unique_ptr<cucascade::idata_representation> decompress_device_to_gpu(
 fused_scan_directives build_fused_scan_directives(const simpatico::compressed_table& table,
                                                   std::span<const std::size_t> selected_columns,
                                                   const decode_range_pushdown& attached_ranges,
-                                                  bool all_conjuncts_convertible)
+                                                  bool all_conjuncts_convertible,
+                                                  bool has_bool8_mask_sources,
+                                                  const decode_pair_pushdown& attached_pairs)
 {
   fused_scan_directives out;  // disabled/empty unless a mask source survives
   // The [fused-diag] lines trace every accept/refuse decision of the fused
@@ -554,10 +651,10 @@ fused_scan_directives build_fused_scan_directives(const simpatico::compressed_ta
   // classic path (see the M2 hunt in STATUS-W2).
   bool const any_active = std::any_of(
     attached_ranges.begin(), attached_ranges.end(), [](auto const& e) { return e.active; });
-  if (!any_active) {
-    SIRIUS_FUSED_DIAG("[fused-diag] directives: {} attached range entr(ies), NONE active — "
-                     "classic path (remap produced empty slots?)",
-                     attached_ranges.size());
+  if (!any_active && !has_bool8_mask_sources && attached_pairs.empty()) {
+    SIRIUS_FUSED_DIAG("[fused-diag] directives: {} attached range entr(ies), NONE active, no "
+                      "bool8/pair sources — classic path",
+                      attached_ranges.size());
     return out;
   }
   if (attached_ranges.size() > selected_columns.size()) {
@@ -614,16 +711,62 @@ fused_scan_directives build_fused_scan_directives(const simpatico::compressed_ta
     ++mask_columns;
   }
 
-  if (mask_columns == 0) {
+  // Pair validation (K1m2 sources): both sides must be K1-capable bitpack
+  // leaves — same 1024-row chunk geometry, per the pair_predicate contract. A
+  // kept pair CONSUMES its sides' standalone K1 participation (the pair kernel
+  // fuses each side's constant range; one kernel, one mask). A bad pair is
+  // DROPPED and clears whole-filter coverage per the contract in
+  // selection.hpp — never emitted wrong.
+  bool dropped_pair = false;
+  for (auto const& pair : attached_pairs) {
+    bool ok = pair.column_a < count && pair.column_b < count && pair.column_a != pair.column_b &&
+              pair.op <= static_cast<std::uint8_t>(sirius::codegen::pair_compare_op::ne);
+    if (ok) {
+      auto const probe_a = probe_fused_column(table, selected_columns[pair.column_a]);
+      auto const probe_b = probe_fused_column(table, selected_columns[pair.column_b]);
+      ok = probe_a.range_source_ok() && probe_b.range_source_ok();
+    }
+    if (!ok) {
+      SIRIUS_FUSED_DIAG(
+        "[fused-diag] directives: DROPPING pair conjunct (sel {} vs {}, op={}) — sides not both "
+        "K1m2-capable bitpack leaves",
+        pair.column_a,
+        pair.column_b,
+        pair.op);
+      dropped_pair = true;
+      continue;
+    }
+    out.pairs.push_back(pair);
+  }
+  for (auto const& pair : out.pairs) {
+    for (auto const idx : {pair.column_a, pair.column_b}) {
+      if (out.ranges[idx].participates_in_scan_mask) {
+        out.ranges[idx].participates_in_scan_mask = false;  // folded into the pair side
+        --mask_columns;
+      }
+    }
+  }
+
+  if (mask_columns == 0 && out.pairs.empty() && !has_bool8_mask_sources) {
     SIRIUS_FUSED_DIAG("[fused-diag] directives: no mask source survived — classic path");
     return {};
   }
-  out.enabled             = true;
-  out.covers_whole_filter = all_conjuncts_convertible && !dropped_conjunct;
+  out.enabled = true;
+  // Coverage: bool8 sources never upgrade it (the extraction gate only speaks
+  // for the numeric view — such batches stay untagged and the post-decompress
+  // filter re-evaluates everything plus the residual). Kept pairs do NOT
+  // affect it either — q12-class pair conjuncts live in the FILTER operator
+  // ABOVE the scan, which runs regardless of the scan's row-filtered tag, so
+  // masking them is a pure bonus restriction; a DROPPED pair clears coverage
+  // per the selection.hpp contract (conservative — costs only the tag).
+  out.covers_whole_filter = all_conjuncts_convertible && !dropped_conjunct && !dropped_pair &&
+                            (mask_columns > 0 || !out.pairs.empty()) && !has_bool8_mask_sources;
   SIRIUS_FUSED_DIAG(
-    "[fused-diag] directives ENABLED: {} mask column(s), {}/{} compact-capable output column(s), "
-    "covers_whole_filter={}",
+    "[fused-diag] directives ENABLED: {} range mask column(s), {} pair source(s), "
+    "bool8_sources={}, {}/{} compact-capable output column(s), covers_whole_filter={}",
     mask_columns,
+    out.pairs.size(),
+    has_bool8_mask_sources,
     compactable,
     count,
     out.covers_whole_filter);

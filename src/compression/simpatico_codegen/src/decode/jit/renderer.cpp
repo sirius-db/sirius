@@ -148,14 +148,66 @@ class Walker {
       case DecodeVariant::mask_out: emit_bitpack_mask_out(tree); break;
       case DecodeVariant::mask_consume:
         if (tree.op == ::codegen::OpKind::Delta) {
-          emit_delta_mask_consume(tree);
+          emit_delta_mask_consume(tree);  // tuned register path, no slab
+        } else if (tree.op == ::codegen::OpKind::Bitpack) {
+          emit_bitpack_mask_consume(tree);  // tuned closed-form path
         } else {
-          emit_bitpack_mask_consume(tree);
+          // Compositional fallback: any value_source-supported root (FOR,
+          // Zigzag, RLE cascades, ...) stages the chunk via the existing
+          // emitters and masked-stores from it — one seam, no per-shape
+          // hand-written variants.
+          emit_generic_mask_consume(tree);
         }
         break;
       case DecodeVariant::mask_dict_gather: emit_bitpack_mask_dict_gather(tree); break;
+      case DecodeVariant::index_consume: emit_bitpack_index_consume(tree); break;
+      case DecodeVariant::str_split_meta: emit_str_split_meta(tree); break;
     }
     return finalize(tree);
+  }
+
+  // K1m2: two-column fused pair-predicate mask (see render_pair_mask).
+  DecodeKernelSpec build_pair(const ::codegen::jit::FusedTree& tree_a,
+                              const ::codegen::jit::FusedTree& tree_b,
+                              const std::string& dtype_b)
+  {
+    if (&tree_a == &tree_b) {
+      throw RenderError("decode render: pair_mask requires two distinct column trees");
+    }
+    if (tree_a.op != ::codegen::OpKind::Bitpack || !tree_a.children.empty() ||
+        tree_b.op != ::codegen::OpKind::Bitpack || !tree_b.children.empty()) {
+      throw RenderError("decode render: pair_mask requires two Bitpack leaf columns");
+    }
+    assign_ids(tree_a);  // node 0 (column A)
+    assign_ids(tree_b);  // node 1 (column B)
+    ValueSource va = bitpack_value_source(tree_a, dtype_);
+    ValueSource vb = bitpack_value_source(tree_b, dtype_b);
+    // One ballot word per 32 consecutive rows, same layout as mask_out.
+    // cmp_op and all four bounds are kernel params — uniform branches, one
+    // compiled kernel per (dtype_a, dtype_b) for every op/literal.
+    body_ << "    // --- pair predicate: col0 OP col1 (+ optional ranges) -> selection mask "
+             "(K1m2) ---\n"
+          << "    uint32_t* mask_words = sel_mask + (chunk_start >> 5);\n"
+          << "    #pragma unroll\n"
+          << "    for (int32_t j = 0; j < CHUNK / " << tbs_ << "; ++j) {\n"
+          << "        const int32_t i = j * " << tbs_ << " + tid;\n"
+          << "        bool pass = false;\n"
+          << "        if (i < len) {\n"
+          << "            const int64_t a_v = static_cast<int64_t>(" << at_pos(va.read_expr, "i")
+          << ");\n"
+          << "            const int64_t b_v = static_cast<int64_t>(" << at_pos(vb.read_expr, "i")
+          << ");\n"
+          << "            const bool cmp_ok = (cmp_op == 0)   ? (a_v < b_v)\n"
+          << "                                : (cmp_op == 1) ? (a_v <= b_v)\n"
+          << "                                : (cmp_op == 2) ? (a_v > b_v)\n"
+          << "                                                : (a_v >= b_v);\n"
+          << "            pass = cmp_ok && (a_v >= lo_a) && (a_v <= hi_a) && (b_v >= lo_b) && "
+             "(b_v <= hi_b);\n"
+          << "        }\n"
+          << "        const uint32_t ballot = __ballot_sync(0xFFFFFFFFu, pass);\n"
+          << "        if ((tid & 31) == 0) mask_words[i >> 5] = ballot;\n"
+          << "    }\n";
+    return finalize_pair(dtype_b);
   }
 
  private:
@@ -219,6 +271,10 @@ class Walker {
   void emit_bitpack_mask_consume(const ::codegen::jit::FusedTree& node);
   void emit_delta_mask_consume(const ::codegen::jit::FusedTree& node);
   void emit_bitpack_mask_dict_gather(const ::codegen::jit::FusedTree& node);
+  void emit_bitpack_index_consume(const ::codegen::jit::FusedTree& node);
+  void emit_generic_mask_consume(const ::codegen::jit::FusedTree& node);
+  void emit_str_split_meta(const ::codegen::jit::FusedTree& node);
+  DecodeKernelSpec finalize_pair(const std::string& dtype_b);
   void emit_delta_producer(const ::codegen::jit::FusedTree& node,
                            const std::string& dst,
                            const std::string& len,
@@ -264,6 +320,8 @@ class Walker {
     if (variant_ == DecodeVariant::mask_out) spec.entry_symbol += "_mask_out";
     if (variant_ == DecodeVariant::mask_consume) spec.entry_symbol += "_mask_consume";
     if (variant_ == DecodeVariant::mask_dict_gather) spec.entry_symbol += "_mask_dict";
+    if (variant_ == DecodeVariant::index_consume) spec.entry_symbol += "_index_consume";
+    if (variant_ == DecodeVariant::str_split_meta) spec.entry_symbol += "_str_meta";
 
     std::ostringstream src;
     src << kPrelude;
@@ -299,6 +357,23 @@ class Walker {
             << "    const uint32_t* __restrict__ chunk_offsets,\n"
             << "    const char* __restrict__ keys_chars,\n"
             << "    int32_t key_width)\n";
+        break;
+      case DecodeVariant::index_consume:
+        src << "    " << dtype_ << "* __restrict__ out,\n"
+            << "    int64_t n,\n"
+            << "    const int32_t* __restrict__ row_indices,\n"
+            << "    const uint32_t* __restrict__ chunk_offsets)\n";
+        break;
+      case DecodeVariant::str_split_meta:
+        // `out` = per-survivor SOURCE char offsets (int64, whatever the
+        // offsets dtype); `len_out` = per-survivor byte lengths.  `n` is the
+        // OFFSETS element count (string rows + 1); sel_mask/chunk_offsets
+        // are row-space.
+        src << "    int64_t* __restrict__ out,\n"
+            << "    int64_t n,\n"
+            << "    const uint32_t* __restrict__ sel_mask,\n"
+            << "    const uint32_t* __restrict__ chunk_offsets,\n"
+            << "    int32_t* __restrict__ len_out)\n";
         break;
     }
     src << "{\n"
@@ -700,6 +775,198 @@ void Walker::emit_bitpack_mask_dict_gather(const ::codegen::jit::FusedTree& node
         << "            for (int32_t b = 0; b < key_width; ++b) o[b] = k[b];\n"
         << "        }\n"
         << "    }\n";
+}
+
+// =====================================================================
+// Index-list-consuming decode (K4) — the low-selectivity sibling of K3.
+// Block c reads its slice of the ascending GLOBAL row-index list
+// (row_indices[chunk_offsets[c] .. chunk_offsets[c+1])) and random-access
+// decodes only those rows: out slot chunk_offsets[c]+k gets the value of
+// row row_indices[chunk_offsets[c]+k].  No mask staging, no ballot — the
+// per-block loop runs `cnt` iterations instead of 8 full 128-wide strips,
+// so runtime scales with survivors (microbench: 0.30 vs K3's 0.78
+// ms/payload at 1.9% selectivity; K3 wins again above the ~15% crossover
+// — the caller picks from the survivor count).  Delta roots cannot
+// row-skip and are rejected.
+// =====================================================================
+void Walker::emit_bitpack_index_consume(const ::codegen::jit::FusedTree& node)
+{
+  if (node.op != ::codegen::OpKind::Bitpack || !node.children.empty()) {
+    throw RenderError("decode render: index_consume variant requires a Bitpack leaf root "
+                      "(got '" +
+                      std::string(::codegen::jit::op_kind_name(node.op)) + "')");
+  }
+  body_ << "    // --- node " << id_of(node)
+        << ": Bitpack index-list decode -> compacted output (K4) ---\n"
+        << "    (void)len;  // listed rows are < n by construction (mask tail bits were zero)\n"
+        << "    const int64_t out_base = static_cast<int64_t>(chunk_offsets[chunk_id]);\n"
+        << "    const int32_t cnt = static_cast<int32_t>(\n"
+        << "        static_cast<int64_t>(chunk_offsets[chunk_id + 1]) - out_base);\n"
+        << "    if (cnt == 0) return;  // zero-survivor chunk: nothing to decode\n";
+
+  // Per-chunk scalar prelude after the early return, then the survivor loop.
+  ValueSource vs = bitpack_value_source(node, dtype_);
+  body_ << "    const int32_t* idxs = row_indices + out_base;\n"
+        << "    for (int32_t k = tid; k < cnt; k += " << tbs_ << ") {\n"
+        << "        const int32_t i = static_cast<int32_t>(idxs[k] - chunk_start);  // in-chunk "
+           "pos\n"
+        << "        (out + out_base)[k] = " << at_pos(vs.read_expr, "i") << ";\n"
+        << "    }\n";
+}
+
+// =====================================================================
+// Generic mask_consume — the compositional seam.  Any root the existing
+// value_source machinery supports (FOR/Zigzag transformers, RLE cascades,
+// ...) is staged in full for the chunk (closed-form or shared-mem slab via
+// the plain emitters) and masked-stored from there.  The tuned Bitpack
+// (closed-form, no staging) and Delta (register-striped scan) roots keep
+// their dedicated emitters; everything else routes here, so new depth
+// combinations don't multiply hand-written variants.
+// =====================================================================
+void Walker::emit_generic_mask_consume(const ::codegen::jit::FusedTree& node)
+{
+  body_ << "    // --- node " << id_of(node) << ": "
+        << ::codegen::jit::op_kind_name(node.op)
+        << " masked decode -> compacted output (K3-generic) ---\n"
+        << "    (void)len;  // mask tail bits are zero, so selected rows are always < len\n";
+  emit_selection_stage();
+
+  const auto mark = sm_.mark();
+  ValueSource vs  = value_source(node, dtype_, "len");
+  body_ << "    const int64_t out_base = static_cast<int64_t>(chunk_offsets[chunk_id]);\n"
+        << "    #pragma unroll\n"
+        << "    for (int32_t j = 0; j < CHUNK / " << tbs_ << "; ++j) {\n"
+        << "        const int32_t i = j * " << tbs_ << " + tid;\n"
+        << "        const uint32_t w = sel_words[i >> 5];\n"
+        << "        if ((w >> (i & 31)) & 1u) {\n"
+        << "            const int32_t rank = " << rank_expr("i") << ";\n"
+        << "            (out + out_base)[rank] = " << at_pos(vs.read_expr, "i") << ";\n"
+        << "        }\n"
+        << "    }\n";
+  sm_.release_to(mark);
+}
+
+// =====================================================================
+// str_split meta (K6 phase 1) — masked survivor {source char offset,
+// length} extraction from a string column's OFFSETS subtree.  The offsets
+// cascade is reconstructed IN FULL per chunk through value_source (depth
+// is fine: bitpack closed-form, delta->rle->bitpack slab, ...); only the
+// per-survivor metadata is written.  Rows live in [0, n-1) — the offsets
+// column has one trailing element — and row r needs offsets[r] and
+// offsets[r+1]; the latter crosses into the next chunk for the chunk's
+// last row, so the root must expose its next chunk's FIRST element as a
+// per-chunk scalar peek:
+//   * Bitpack leaf: bp_at(packed + bp_offsets[c+1], bits[c+1], min[c+1], 0)
+//   * Delta root:   delta_first[c+1] (the stored per-chunk anchor)
+// Other roots are rejected.  Raw chars are gathered in phase 2
+// (launch_masked_char_copy) after the caller scans the lengths.
+// =====================================================================
+void Walker::emit_str_split_meta(const ::codegen::jit::FusedTree& node)
+{
+  const bool bitpack_root = node.op == ::codegen::OpKind::Bitpack && node.children.empty();
+  const bool delta_root   = node.op == ::codegen::OpKind::Delta;
+  if (!bitpack_root && !delta_root) {
+    throw RenderError("decode render: str_split_meta requires a Bitpack- or Delta-rooted "
+                      "offsets subtree (got '" +
+                      std::string(::codegen::jit::op_kind_name(node.op)) + "')");
+  }
+
+  body_ << "    // --- node " << id_of(node)
+        << ": str_split offsets masked survivor meta (K6) ---\n"
+        << "    const int64_t n_rows = n - 1;  // offsets count = string rows + 1\n"
+        << "    if (chunk_start >= n_rows) return;  // offsets-tail chunk: no rows\n";
+  emit_selection_stage();
+
+  const auto mark = sm_.mark();
+  ValueSource vs  = value_source(node, dtype_, "len");
+
+  // Next chunk's first offset (only read when the chunk is full and its last
+  // row survives; the guard also proves chunk_id+1 is in range then).
+  const std::string idstr = std::to_string(id_of(node));
+  body_ << "    " << dtype_ << " next0 = " << dtype_ << "{0};\n"
+        << "    if ((static_cast<int64_t>(chunk_id) + 1) * static_cast<int64_t>(CHUNK) < n) {\n";
+  if (bitpack_root) {
+    body_ << "        next0 = simpatico_bp_at(packed_" << idstr << " + bp_offsets_" << idstr
+          << "[chunk_id + 1],\n"
+          << "                                static_cast<int32_t>(chunk_bits_" << idstr
+          << "[chunk_id + 1]),\n"
+          << "                                chunk_min_" << idstr << "[chunk_id + 1], 0);\n";
+  } else {
+    body_ << "        next0 = delta_first_" << idstr << "[chunk_id + 1];\n";
+  }
+  body_ << "    }\n";
+
+  body_ << "    const int64_t out_base = static_cast<int64_t>(chunk_offsets[chunk_id]);\n"
+        << "    #pragma unroll\n"
+        << "    for (int32_t j = 0; j < CHUNK / " << tbs_ << "; ++j) {\n"
+        << "        const int32_t i = j * " << tbs_ << " + tid;\n"
+        << "        const uint32_t w = sel_words[i >> 5];\n"
+        << "        if ((w >> (i & 31)) & 1u) {\n"
+        << "            const int32_t rank = " << rank_expr("i") << ";\n"
+        << "            const int64_t off_r = static_cast<int64_t>(" << at_pos(vs.read_expr, "i")
+        << ");\n"
+        << "            const int64_t off_r1 = (i + 1 < len)\n"
+        << "                ? static_cast<int64_t>(" << at_pos(vs.read_expr, "(i + 1)") << ")\n"
+        << "                : static_cast<int64_t>(next0);\n"
+        << "            (out + out_base)[rank] = off_r;\n"
+        << "            len_out[out_base + rank] = static_cast<int32_t>(off_r1 - off_r);\n"
+        << "        }\n"
+        << "    }\n";
+  sm_.release_to(mark);
+}
+
+// =====================================================================
+// finalize_pair — K1m2 signature: both columns' channels (A = node 0,
+// B = node 1, in buffers order), then the mask output and the runtime
+// predicate parameters.  Symbol carries both dtypes (arity+variant is the
+// cache axis; op/bounds are parameters).
+// =====================================================================
+DecodeKernelSpec Walker::finalize_pair(const std::string& dtype_b)
+{
+  DecodeKernelSpec spec;
+  std::string sym  = "simpatico_decode_pair_mask_";
+  auto append_sane = [&sym](const std::string& s) {
+    for (char c : s)
+      sym += (std::isalnum(static_cast<unsigned char>(c)) || c == '_') ? c : '_';
+  };
+  append_sane(dtype_);
+  sym += "_";
+  append_sane(dtype_b);
+  spec.entry_symbol = sym;
+
+  std::ostringstream src;
+  src << kPrelude;
+  src << "\nextern \"C\" __global__\n"
+      << "void " << spec.entry_symbol << "(\n";
+  if (params_.tellp() > 0) src << params_.str() << ",\n";
+  src << "    uint32_t* __restrict__ sel_mask,\n"
+      << "    int64_t n,\n"
+      << "    int32_t cmp_op,\n"
+      << "    int64_t lo_a,\n"
+      << "    int64_t hi_a,\n"
+      << "    int64_t lo_b,\n"
+      << "    int64_t hi_b)\n"
+      << "{\n"
+      << "    constexpr int32_t CHUNK = " << ::codegen::kChunkSize << ";\n"
+      << "    const int32_t chunk_id = static_cast<int32_t>(blockIdx.x);\n"
+      << "    const int32_t tid      = static_cast<int32_t>(threadIdx.x);\n"
+      << "    const int64_t chunk_start = static_cast<int64_t>(chunk_id) *\n"
+      << "                                static_cast<int64_t>(CHUNK);\n"
+      << "    const int32_t len = static_cast<int32_t>(\n"
+      << "        (n - chunk_start) < static_cast<int64_t>(CHUNK)\n"
+      << "            ? (n - chunk_start) : static_cast<int64_t>(CHUNK));\n"
+      << "    if (len <= 0) return;\n"
+      << "    extern __shared__ __align__(16) unsigned char workspace[];\n"
+      << "    (void)workspace;\n"
+      << "\n"
+      << body_.str() << "}\n";
+
+  spec.source       = src.str();
+  spec.buffers      = std::move(buffers_);
+  spec.block_x      = tbs_;
+  spec.shared_bytes = static_cast<int>(sm_.peak_bytes());
+  spec.note         = "decode-walker-rendered pair mask (K1m2)";
+  return spec;
 }
 
 // =====================================================================
@@ -1367,6 +1634,24 @@ DecodeKernelSpec render(const ::codegen::jit::FusedTree& tree,
   }
   Walker w(element_dtype, variant);
   return w.build(tree);
+}
+
+DecodeKernelSpec render_pair_mask(const ::codegen::jit::FusedTree& tree_a,
+                                  const std::string& dtype_a,
+                                  const ::codegen::jit::FusedTree& tree_b,
+                                  const std::string& dtype_b,
+                                  std::int32_t num_chunks)
+{
+  if (dtype_a.empty() || dtype_b.empty()) {
+    throw std::invalid_argument("decode render: pair_mask dtype is empty");
+  }
+  if (num_chunks < 1) { throw std::invalid_argument("decode render: num_chunks must be >= 1"); }
+  if (dtype_elem_size(dtype_a) == 0 || dtype_elem_size(dtype_b) == 0) {
+    throw RenderError("decode render: pair_mask unsupported dtype '" + dtype_a + "'/'" + dtype_b +
+                      "'");
+  }
+  Walker w(dtype_a);
+  return w.build_pair(tree_a, tree_b, dtype_b);
 }
 
 }  // namespace codegen::decode::jit

@@ -156,6 +156,31 @@ numeric_range_extraction extract_numeric_range_pushdown(
   const duckdb::vector<sirius::logical_type>& returned_types,
   const std::unordered_set<std::size_t>& skip_primary_indices = {});
 
+/// One `colA OP colB` conjunct harvested from a bound filter expression
+/// (fused scan-filter pair predicates, iteration 5). The binding indices are
+/// whatever the expression's BoundReferenceExpressions carry — for a FILTER
+/// operator above a scan these are positions into the scan's output layout;
+/// the harvest wiring owns the mapping onto scan columns and the per-chunk
+/// plan checks (@c sirius::build_fused_scan_directives drops non-bitpack
+/// pairs).
+struct pair_conjunct {
+  duckdb::idx_t left_binding          = 0;
+  duckdb::idx_t right_binding         = 0;
+  sirius::codegen::pair_compare_op op = sirius::codegen::pair_compare_op::lt;
+};
+
+/**
+ * @brief Harvest column-vs-column comparison conjuncts from a bound expression.
+ *
+ * Walks AND conjunctions recursively and collects every
+ * `BoundReferenceExpression OP BoundReferenceExpression` comparison with OP in
+ * {<, <=, >, >=} (q12-class `l_commitdate < l_receiptdate`). Anything else —
+ * OR branches, constants, casts, function calls — is left alone: the caller
+ * uses the result as ADDITIONAL mask conjuncts only, so under-harvesting is
+ * always sound (the source expression keeps running wherever it runs today).
+ */
+std::vector<pair_conjunct> extract_pair_conjuncts(duckdb::Expression const& expr);
+
 /**
  * @brief Bridge a DuckDB filter expression through sirius::ast::from_duckdb into the
  * cuDF-AST translator's column-name pathway.

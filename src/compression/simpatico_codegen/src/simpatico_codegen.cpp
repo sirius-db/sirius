@@ -320,15 +320,20 @@ std::unique_ptr<cudf::table> decompress_columns_parallel(compressed_table const&
 // Any missing precondition ⇒ std::nullopt, and the caller runs today's path
 // byte-identically (same kernels, same allocations, zero added syncs).
 //
-// Enable policy (measured on the M2/M3 A/B matrix):
-//   RULE 1 (static): every output column must decode compacted
-//           (tier_is_fused_capable); any tierB output ⇒ classic path (tierB
-//           full-decode+gather lost 17..328 ms/query). K1 range-filter sources
-//           are exempt and forced tierA.
-//   RULE 2 (dynamic): post-CNT, survivors/rows > SIRIUS_EXP_FUSED_SCAN_MAX_SEL
-//           (default 0.35) ⇒ bail to classic — UNLESS a tier_dict_k5 output is
-//           present (dict-string masked gather wins at all selectivities);
-//           masks dropped, batch not tagged ROW_FILTERED.
+// Enable policy (measured on the M2/M3 + iteration-3/4 A/B matrices):
+//   RULE 1 (static): compacted tiers (tier_a / tier_a_delta / tier_dict_k5)
+//           verify against W3's plan_selection_tier classifier; tier_b outputs
+//           are ADMITTED (full decode + survivor gather) with their economics
+//           deferred to RULE 2. K1 range-filter sources are exempt from the
+//           tag check and forced tierA.
+//   RULE 2 (dynamic, post-CNT), two regimes, both bails memoized scan-wide via
+//           scan_filter_status::bailed_high_selectivity:
+//           - any tier_b output: proceed iff survivors/rows <=
+//             SIRIUS_EXP_FUSED_SCAN_TIERB_MAX_SEL (default 0.10);
+//           - otherwise: bail above SIRIUS_EXP_FUSED_SCAN_MAX_SEL (default
+//             0.35) unless a tier_dict_k5 output is present (dict-string
+//             masked gather wins at all selectivities).
+//           Bail = masks dropped, classic decode, batch not ROW_FILTERED.
 
 bool fused_scan_filter_enabled()
 {
@@ -354,6 +359,78 @@ double fused_scan_max_selectivity()
     return (end != v && d > 0.0) ? d : 0.35;
   }();
   return threshold;
+}
+
+// TierB re-admission threshold (iteration 4, track A): when tier_b outputs are
+// present the batch proceeds only at sel <= this (default 0.10) — a TierB
+// full-decode + gather costs about the classic path, so the win is the
+// compacted batch (and, whole-filter case, the skipped post-filter), which
+// only pays off at low selectivity (q12 ~.005 is nearly free). Above it the
+// batch takes the memoized RULE-2 bail like any other.
+double fused_scan_tierb_max_selectivity()
+{
+  static double const threshold = [] {
+    char const* v = std::getenv("SIRIUS_EXP_FUSED_SCAN_TIERB_MAX_SEL");
+    if (v == nullptr || *v == '\0') return 0.10;
+    char* end      = nullptr;
+    double const d = std::strtod(v, &end);
+    return (end != v && d > 0.0) ? d : 0.10;
+  }();
+  return threshold;
+}
+
+// K4 crossover (iteration 4, track B): at survivors/rows <= this (default
+// 0.15) the index-list payload decode (W1's K4,
+// launch_decode_fused_tree_index_consume) beats the mask-walk K3 for bitpack
+// tier_a outputs — microbench crossover sits at 15-50% depending on bits, so
+// 0.15 is the conservative edge. Bitpack leaf roots only: delta roots always
+// keep K3-delta, dict-k5 is unaffected.
+double fused_scan_k4_max_selectivity()
+{
+  static double const threshold = [] {
+    char const* v = std::getenv("SIRIUS_EXP_FUSED_SCAN_K4_MAX_SEL");
+    if (v == nullptr || *v == '\0') return 0.15;
+    char* end      = nullptr;
+    double const d = std::strtod(v, &end);
+    return (end != v && d > 0.0) ? d : 0.15;
+  }();
+  return threshold;
+}
+
+// Track B dispatch: W1's K4 launcher + W3's decode_selection.prefer_index_decode
+// routing are live — the pick below reaches the decode. Effective kill switch:
+// set SIRIUS_EXP_FUSED_SCAN_K4_MAX_SEL to a tiny value (parse requires > 0).
+
+// ── Pair-predicate wave-1 entry (iteration 5, stubbed until published) ───────
+// W1 is building the K1m2 render variant (ONE kernel over two bitpack regions:
+// comparison ballot + optional fused constant ranges per side); the
+// PlanTree-binding wrapper belongs in W3's decompress.cpp, same split as the
+// shipped K1. SIGNATURE NEEDED (published here + selection.hpp + STATUS-W4 so
+// it cannot drift like the boolean adapter almost did):
+//
+//   bool decompress_column_pair_selection_mask(PlanTree const& tree_a,
+//       PlanTree const& tree_b,
+//       sirius::codegen::pair_predicate pred,
+//       std::uint32_t* mask_words,   // AllocWordsFor(n); write all 32 words/chunk
+//       rmm::cuda_stream_view stream,
+//       rmm::device_async_resource_ref mr,
+//       std::string* error_out);     // false on non-bitpack root / geometry / launch fail
+//
+// Until it lands, requests carrying pair_filters refuse in the preconditions
+// (self-announcing under SIRIUS_EXP_FUSED_SCAN_DIAG); flip this constant and
+// forward the stub when W1/W3 publish.
+constexpr bool kPairMaskDecodeAvailable = false;
+
+bool fused_decompress_column_pair_selection_mask(PlanTree const& /*tree_a*/,
+                                                 PlanTree const& /*tree_b*/,
+                                                 sirius::codegen::pair_predicate /*pred*/,
+                                                 std::uint32_t* /*mask_words*/,
+                                                 rmm::cuda_stream_view /*stream*/,
+                                                 rmm::device_async_resource_ref /*mr*/,
+                                                 std::string* error_out)
+{
+  if (error_out) *error_out = "pair (K1m2) mask decode not published yet (W1/W3)";
+  return false;
 }
 
 // Env-gated fused scan-filter diagnostics: SIRIUS_EXP_FUSED_SCAN_DIAG set (and
@@ -422,9 +499,12 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
   };
   if (!fused_scan_filter_enabled()) return refuse("env gate off");
   size_t const k_range = request.filters.size();
-  size_t const k_total = k_range + request.bool8_filters.size();
-  if (k_total == 0) return refuse("no mask directives (no range or bool8 conjuncts)");
-  if (k_total > 8) return refuse("more than 8 mask-source conjuncts");
+  size_t const k_pair  = request.pair_filters.size();
+  size_t const k_total = k_range + k_pair + request.bool8_filters.size();
+  if (k_total == 0) return refuse("no mask directives (no range, pair or bool8 conjuncts)");
+  if (k_total > 8) return refuse("more than 8 mask sources (a pair counts once)");
+  if (k_pair > 0 && !kPairMaskDecodeAvailable)
+    return refuse("pair sources pending W1/W3 (K1m2 launcher + binding wrapper)");
   if (request.tiers.size() != selected.size())
     return refuse("request.tiers not parallel to selected");
   if (pool.streams.empty()) return refuse("stream pool empty");
@@ -449,6 +529,23 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
         sc::output_tier::tier_a)
       return refuse("filter column plan not a bitpack-rooted K1 source");
   }
+  for (auto const& p : request.pair_filters) {
+    if (p.column_a >= selected.size() || p.column_b >= selected.size())
+      return refuse("pair directive column out of range");
+    if (p.column_a == p.column_b) return refuse("pair directive compares a column to itself");
+    if (p.pred.range_a.lo > p.pred.range_a.hi || p.pred.range_b.lo > p.pred.range_b.hi)
+      return refuse("pair directive with an empty fused range");
+    // Both sides must be bitpack roots: over the batch's shared num_rows that
+    // fixes both to the identical 1024-row chunk geometry (the ONLY mismatch
+    // vector is a nested/parented bitpack, which classifies != tier_a). The
+    // extraction should have dropped such a conjunct (covers_whole_filter
+    // false); if one leaks through, refusing the batch is never wrong.
+    if (plan_selection_tier(*table.columns[selected[p.column_a]].plan_tree) !=
+          sc::output_tier::tier_a ||
+        plan_selection_tier(*table.columns[selected[p.column_b]].plan_tree) !=
+          sc::output_tier::tier_a)
+      return refuse("pair column not a bitpack root (chunk-geometry mismatch class)");
+  }
   for (auto const& b : request.bool8_filters) {
     if (b.column >= selected.size()) return refuse("bool8 directive column out of range");
     if (b.equals_any.empty()) return refuse("bool8 directive with empty equals_any");
@@ -458,17 +555,23 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
       return refuse("bool8 filter column plan not dictionary-rooted");
   }
 
-  // RULE 1 (static, zero-cost): fused only when EVERY output column decodes
-  // compacted (tier_is_fused_capable). A tierB output (full decode + gather)
-  // is strictly more work than classic's single post-filter compaction —
-  // measured q1 +43.5%, q5 +6.2% vs the all-tierA winners (q6 -51.7%,
-  // q14/-33.2%, q15/-32.6%, q20/-20.6%). Range-filter source columns are
-  // exempt from the tag check (probed selection-decodable above) and forced
-  // tier_a; bool8 sources get no exemption (dict-rooted — they must carry a
-  // fused-capable tier of their own, tier_dict_k5 once it lands).
+  // RULE 1 (static, zero-cost): compacted tags (tier_a / tier_a_delta /
+  // tier_dict_k5) must match the plan classifier; tier_b outputs are ADMITTED
+  // (iteration 4) and take the wave-2 full-decode + survivor-gather path, with
+  // their economics enforced post-CNT (TierB threshold — full-width decode +
+  // gather costs ~classic, so only low-sel batches pay off; measured losses at
+  // high sel: q1 +43.5%, q5 +6.2%). Range-filter source columns are exempt
+  // from the tag check (probed bitpack-rooted above) and forced tier_a; bool8
+  // sources get no exemption (dict-rooted — they carry their own tier).
   std::vector<sc::output_tier> tiers(request.tiers.begin(), request.tiers.end());
   for (auto const& f : request.filters)
     tiers[f.column] = sc::output_tier::tier_a;
+  for (auto const& p : request.pair_filters) {
+    // Pair-source columns are classifier-verified bitpack roots (above) —
+    // same exemption as range sources.
+    tiers[p.column_a] = sc::output_tier::tier_a;
+    tiers[p.column_b] = sc::output_tier::tier_a;
+  }
   for (size_t i = 0; i < selected.size(); ++i) {
     switch (tiers[i]) {
       case sc::output_tier::tier_a:
@@ -490,16 +593,37 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
             sc::output_tier::tier_a_delta)
           return refuse("RULE1: tier_a_delta-tagged output not a delta->bitpack root");
         break;
+      case sc::output_tier::tier_str_k6:
+        // W3's K6 masked-strings route (str_compact). Until W3's classifier
+        // reports tier_str_k6 (it flips together with the umbrella when this
+        // enum value is consumed end-to-end), any such tag refuses — safe.
+        if (plan_selection_tier(*table.columns[selected[i]].plan_tree) !=
+            sc::output_tier::tier_str_k6)
+          return refuse("RULE1: tier_str_k6-tagged output not K6-decodable");
+        break;
       case sc::output_tier::tier_b:
-      default: return refuse("RULE1: tierB output column (classic path is faster)");
+        // Iteration 4 (track A): tier_b outputs are ADMITTED — they take the
+        // wave-2 full-decode + survivor-gather path (mask->indices + event
+        // fence). Economics are enforced post-CNT: the batch proceeds only at
+        // sel <= SIRIUS_EXP_FUSED_SCAN_TIERB_MAX_SEL, else memoized bail.
+        // No probe needed: every plan can full-decode (W3's gather guards
+        // null-masked columns with a loud error, never corruption).
+        break;
+      default: return refuse("RULE1: unknown output tier");
     }
   }
 
   if (fused_scan_diag_enabled()) {
+    static constexpr char const* kOpNames[] = {"<", "<=", ">", ">=", "==", "!="};
     std::string line = "simpatico: fused scan-filter wave-1 sources:";
     for (auto const& f : request.filters) {
       line += " range(col " + std::to_string(f.column) + " [" + std::to_string(f.pred.lo) +
               "," + std::to_string(f.pred.hi) + "])";
+    }
+    for (auto const& p : request.pair_filters) {
+      line += " pair(col " + std::to_string(p.column_a) + " " +
+              kOpNames[static_cast<uint8_t>(p.pred.op) < 6 ? static_cast<uint8_t>(p.pred.op) : 0] +
+              " col " + std::to_string(p.column_b) + ")";
     }
     for (auto const& b : request.bool8_filters) {
       line +=
@@ -573,8 +697,21 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
         }
       });
     }
+    for (size_t p = 0; p < k_pair; ++p) {
+      submit_mask_source(k_range + p, [&](std::uint32_t* dst, rmm::cuda_stream_view stream) {
+        auto const& directive = request.pair_filters[p];
+        auto const& col_a     = table.columns[selected[directive.column_a]];
+        auto const& col_b     = table.columns[selected[directive.column_b]];
+        std::string err;
+        if (!fused_decompress_column_pair_selection_mask(
+              *col_a.plan_tree, *col_b.plan_tree, directive.pred, dst, stream, mr, &err)) {
+          throw plan_error(err.empty() ? "fused scan-filter: K1m2 pair mask decode failed"
+                                       : err);
+        }
+      });
+    }
     for (size_t b = 0; b < request.bool8_filters.size(); ++b) {
-      submit_mask_source(k_range + b, [&](std::uint32_t* dst, rmm::cuda_stream_view stream) {
+      submit_mask_source(k_range + k_pair + b, [&](std::uint32_t* dst, rmm::cuda_stream_view stream) {
         auto const& directive = request.bool8_filters[b];
         auto const& col       = table.columns[selected[directive.column]];
         decode_predicate pred;
@@ -607,46 +744,74 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
     result.survivor_count = sel.survivor_count;
     per_filter.clear();
 
-    // RULE 2 (dynamic, post-CNT guard): above the selectivity threshold the
-    // WRITE-SKIP tiers have no measured win (K3 ~ K0 at sel .5) — abandon
-    // wave 2 via the mid-flight machinery below (sync, drop masks, classic
-    // decode; batch NOT tagged ROW_FILTERED, post-filter runs as today). The
-    // wasted wave-1 + CNT is ~1 ms/batch insurance. tier_dict_k5 economics are
-    // selectivity-INdependent (F5 wins 2.1-2.6x even at 97.5% — it skips the
-    // string materialization round trip regardless), so any dict-k5 output
-    // exempts the batch from the bail.
+    // RULE 2 (dynamic, post-CNT guard), two regimes:
+    //  * tier_b outputs present: proceed only at sel <= TIERB threshold
+    //    (default 0.10) — TierB full-decode + gather costs ~classic, so only a
+    //    near-empty survivor set pays for the compacted batch.
+    //  * no tier_b: the shipped 0.35 write-skip threshold (K3 ~ K0 at sel .5)
+    //    covering tier_a / tier_a_delta AND tier_str_k6 (iteration-5 policy:
+    //    K6's char-gather savings are dict-like but weak at ~1-char widths —
+    //    deliberately NOT exempt until q12/q22 measures say otherwise), with
+    //    only a tier_dict_k5 output exempting the batch (F5 wins 2.1-2.6x at
+    //    ALL selectivities — string-materialization savings are
+    //    survivor-count-independent).
+    // Both regimes bail via the mid-flight machinery below with the MEMOIZED
+    // rule2_bailed status (one bail latches the whole scan; sync, drop masks,
+    // classic decode; batch NOT tagged ROW_FILTERED).
     bool any_dict_k5 = false;
-    for (auto const t : tiers)
+    bool any_tier_b  = false;
+    for (auto const t : tiers) {
       any_dict_k5 |= t == sc::output_tier::tier_dict_k5;
+      any_tier_b |= t == sc::output_tier::tier_b;
+    }
     double const sel_frac =
       static_cast<double>(sel.survivor_count) / static_cast<double>(num_rows);
-    if (sel_frac > fused_scan_max_selectivity() && !any_dict_k5) {
+    bool const bail = any_tier_b
+                        ? sel_frac > fused_scan_tierb_max_selectivity()
+                        : (sel_frac > fused_scan_max_selectivity() && !any_dict_k5);
+    if (bail) {
+      double const threshold =
+        any_tier_b ? fused_scan_tierb_max_selectivity() : fused_scan_max_selectivity();
+      char const* env_name = any_tier_b ? "SIRIUS_EXP_FUSED_SCAN_TIERB_MAX_SEL"
+                                        : "SIRIUS_EXP_FUSED_SCAN_MAX_SEL";
       if (fused_scan_diag_enabled()) {
         std::fprintf(stderr,
-                     "simpatico: fused scan-filter RULE-2 bail: sel=%.4f > %.4f "
-                     "(survivors=%lld/%lld)\n",
+                     "simpatico: fused scan-filter RULE-2 bail: sel=%.4f > %.4f (%s, "
+                     "survivors=%lld/%lld)\n",
                      sel_frac,
-                     fused_scan_max_selectivity(),
+                     threshold,
+                     env_name,
                      static_cast<long long>(sel.survivor_count),
                      static_cast<long long>(num_rows));
       }
       rule2_bailed = true;
-      throw plan_error("selectivity " + std::to_string(sel_frac) +
-                       " above SIRIUS_EXP_FUSED_SCAN_MAX_SEL " +
-                       std::to_string(fused_scan_max_selectivity()));
+      throw plan_error("selectivity " + std::to_string(sel_frac) + " above " + env_name +
+                       " " + std::to_string(threshold));
     }
 
-    // ── TierB gather map on stream 0, overlapping wave 2 (column 0's wave-2
+    // Track B: per-batch payload-variant pick for tier_a bitpack outputs —
+    // K4 (index-list decode) below the crossover, K3 (mask walk) above.
+    // tier_a_delta always K3-delta (K4 rejects delta roots at render); dict-k5
+    // unchanged.
+    bool any_tier_a = false;
+    for (auto const t : tiers)
+      any_tier_a |= t == sc::output_tier::tier_a;
+    bool const k4_pick = any_tier_a && sel_frac <= fused_scan_k4_max_selectivity();
+    if (fused_scan_diag_enabled()) {
+      std::fprintf(stderr,
+                   "simpatico: fused scan-filter payload pick: %s (sel=%.4f, k4_max=%.4f)\n",
+                   k4_pick ? "k4" : "k3",
+                   sel_frac,
+                   fused_scan_k4_max_selectivity());
+    }
+
+    // ── Survivor index map on stream 0, overlapping wave 2 (column 0's wave-2
     // work serializes behind it on s0; the other streams run free). Built ONCE
-    // per batch; the same view is handed to every TierB column (W3 contract).
-    // Under RULE 1 every tier is tier_a, so this stays dormant until the
-    // policy loosens (iteration 2 mixed-tier batches).
+    // per batch and SHARED by every consumer: TierB gathers and, once W3's
+    // dispatch lands, K4 index-list decodes (same int32 buffer, W1 contract).
     result.tiers = tiers;
-    bool any_tier_b = false;
-    for (auto const t : result.tiers)
-      any_tier_b |= t == sc::output_tier::tier_b;
     cudf::column_view survivor_indices{cudf::data_type{cudf::type_id::INT32}, 0, nullptr, nullptr, 0};
-    if (any_tier_b && sel.survivor_count > 0) {
+    if ((any_tier_b || k4_pick) && sel.survivor_count > 0) {
       result.row_indices = rmm::device_buffer(
         static_cast<std::size_t>(sel.survivor_count) * sizeof(std::int32_t), s0, mr);
       sc::mask_to_row_indices(sel, static_cast<std::int32_t*>(result.row_indices.data()), s0);
@@ -655,7 +820,8 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
                                            result.row_indices.data(),
                                            nullptr,
                                            0};
-      // TierB gathers run on the other pool streams; order them after the
+      // Index consumers (TierB gathers, K4 decodes) run on the other pool
+      // streams; order them after the
       // indices kernel on s0 with a device-side wait (streams are FIFO, so one
       // up-front wait per stream covers every wave-2 launch on it).
       cudaEvent_t ev_idx = join_events.make();
@@ -686,6 +852,13 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
       dsel.compact_capable = result.tiers[i] == sc::output_tier::tier_a ||
                              result.tiers[i] == sc::output_tier::tier_a_delta;
       dsel.dict_compact    = result.tiers[i] == sc::output_tier::tier_dict_k5;
+      dsel.str_compact     = result.tiers[i] == sc::output_tier::tier_str_k6;
+      // Track B: below the K4 crossover, tier_a bitpack roots take W1's
+      // index-list decode over survivor_indices (populated above whenever
+      // k4_pick, per the decode_selection contract); W3's dispatch silently
+      // keeps K3 on any anomaly, delta roots ignore it, dict-k5 unchanged.
+      dsel.prefer_index_decode = k4_pick && result.tiers[i] == sc::output_tier::tier_a &&
+                                 sel.survivor_count > 0;
       std::string err;
       auto out = decompress_column(*col.plan_tree, stream, mr, &err, nullptr, &dsel);
       if (!out) throw plan_error(err.empty() ? "fused scan-filter: decompress failed" : err);
@@ -908,26 +1081,44 @@ std::vector<std::unique_ptr<cudf::column>> decompress_scan_filter(
   result = sirius::codegen::scan_filter_result{};
   if (auto cols = try_decompress_fused(table, selected_columns, request, result, pool, mr)) {
     if (fused_scan_diag_enabled()) {
-      int n_a = 0, n_delta = 0, n_k5 = 0;
+      int n_a = 0, n_delta = 0, n_k5 = 0, n_k6 = 0, n_b = 0;
       for (auto const t : result.tiers) {
         n_a += t == sirius::codegen::output_tier::tier_a;
         n_delta += t == sirius::codegen::output_tier::tier_a_delta;
         n_k5 += t == sirius::codegen::output_tier::tier_dict_k5;
+        n_k6 += t == sirius::codegen::output_tier::tier_str_k6;
+        n_b += t == sirius::codegen::output_tier::tier_b;
       }
       std::fprintf(stderr,
                    "simpatico: fused scan-filter applied: survivors=%lld/%lld "
-                   "tiers a=%d delta=%d k5=%d sources=%zu\n",
+                   "tiers a=%d delta=%d k5=%d k6=%d b=%d sources=%zu\n",
                    static_cast<long long>(result.survivor_count),
                    static_cast<long long>(result.num_rows),
                    n_a,
                    n_delta,
                    n_k5,
-                   request.filters.size() + request.bool8_filters.size());
+                   n_k6,
+                   n_b,
+                   request.filters.size() + request.pair_filters.size() +
+                     request.bool8_filters.size());
     }
     return std::move(*cols);
   }
   // Gate off / no directives / policy refusal / mid-flight fallback: exactly
-  // today's path.
+  // today's path — with one obligation: when the request routed dict-code
+  // conjuncts (bool8_filters) into the mask, the fallback must NOT be a plain
+  // decode, or every refused/failed/bailed batch would silently lose the
+  // shipped dict BOOL8-substitution win (q19 -21.4%). Re-express them as
+  // classic decode_predicates so the fallback degrades to today's
+  // substitution behavior, never below it.
+  if (!request.bool8_filters.empty()) {
+    std::vector<decode_predicate> predicates(selected_columns.size());
+    for (auto const& b : request.bool8_filters) {
+      if (b.column < predicates.size()) predicates[b.column].equals_any = b.equals_any;
+    }
+    return decompress_columns_parallel(table, selected_columns, predicates, pool, mr)
+      ->release();
+  }
   return decompress_columns_parallel(table, selected_columns, pool, mr)->release();
 }
 

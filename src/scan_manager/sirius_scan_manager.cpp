@@ -95,14 +95,16 @@ struct cached_databatch_provider : public databatch_provider {
                             mvcc_chunk_mask_set mvcc_masks,
                             std::vector<insert_delta_split> delta_splits,
                             sirius::decode_equality_pushdown equality_pushdown,
-                            sirius::decode_range_pushdown range_pushdown)
+                            sirius::decode_range_pushdown range_pushdown,
+                            bool range_covers_whole_filter)
     : _plan(std::move(plan)),
       _entry(entry),
       _telemetry_info(telemetry_info),
       _mvcc_masks(std::move(mvcc_masks)),
       _delta_splits(std::move(delta_splits)),
       _equality_pushdown(std::move(equality_pushdown)),
-      _range_pushdown(std::move(range_pushdown))
+      _range_pushdown(std::move(range_pushdown)),
+      _range_covers_whole_filter(range_covers_whole_filter)
   {
     auto const& entry_column_names = _entry.cache_info.column_names();
     std::ranges::for_each(selected_columns, [this, &entry_column_names](size_t idx) {
@@ -194,7 +196,7 @@ struct cached_databatch_provider : public databatch_provider {
         // this operator carries mvcc keep-masks — decode-side row dropping cannot
         // compose with deleted-row masks (iteration 1; TPC-H pins have no deltas).
         if (!_range_pushdown.empty() && _mvcc_masks.empty()) {
-          projected->set_range_pushdown(_range_pushdown, /*all_conjuncts_convertible=*/true);
+          projected->set_range_pushdown(_range_pushdown, _range_covers_whole_filter);
         }
         return cucascade::data_batch::make(get_next_batch_id(), std::move(projected));
       }
@@ -253,6 +255,9 @@ struct cached_databatch_provider : public databatch_provider {
   /// The scan's whole-filter range pushdown (fused scan-filter pipeline);
   /// non-empty only when every restricting conjunct converted to a range.
   sirius::decode_range_pushdown _range_pushdown;
+  /// True iff the ranges cover the scan's WHOLE restricting filter (batches may
+  /// be tagged ROW_FILTERED); false = partial mask, post-filter must re-run.
+  bool _range_covers_whole_filter = false;
   const pinned_entry& _entry;
   telemetry::batch_telemetry_info _telemetry_info;
   /// This provider's own copy of the entry's per-chunk keep-masks (empty for
@@ -642,15 +647,20 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
     // converts to numeric ranges, hand them to the provider so compressed chunks
     // can filter (and compact) during decode instead of after it.
     sirius::decode_range_pushdown range_pushdown;
+    bool range_covers_whole_filter = false;
     if (fused_scan_filter_enabled()) {
       if (auto const* pq = dynamic_cast<op::scan::parquet_ingestible_table_info const*>(
             &assignment.op->get_ingestible().table_info());
           pq && pq->table_filters && !pq->table_filters->filters.empty()) {
         auto extraction = sirius::op::extract_numeric_range_pushdown(
           *pq->table_filters, pq->column_ids, pq->returned_types);
-        if (extraction.all_conjuncts_convertible && !extraction.ranges.empty()) {
+        // Iteration 4: partial coverage is sound — mask conjuncts are conjunctive
+        // over-approximations, and a batch whose mask does not cover the whole
+        // filter is left untagged so the post-filter re-evaluates everything.
+        if (!extraction.ranges.empty()) {
           range_pushdown =
             build_range_pushdown(*assignment.entry, assignment.columns, extraction.ranges);
+          range_covers_whole_filter = extraction.all_conjuncts_convertible;
           SIRIUS_LOG_DEBUG(
             "[sirius_scan_manager] fused scan-filter: {} range(s) extracted for entry '{}', "
             "remap -> {} slot(s)",
@@ -667,7 +677,8 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
                                                    std::move(masks),
                                                    std::move(delta_splits),
                                                    std::move(equality_pushdown),
-                                                   std::move(range_pushdown));
+                                                   std::move(range_pushdown),
+                                                   range_covers_whole_filter);
     _metadata_processor->use_cached_entries_for_pipeline(assignment.op, std::move(provider));
   }
   _pending_mvcc_mask_jobs.clear();
@@ -1383,7 +1394,8 @@ std::unique_ptr<databatch_provider> make_provider_for_pinned_entry(
   mvcc_chunk_mask_set mvcc_masks,
   std::vector<insert_delta_split> delta_splits,
   sirius::decode_equality_pushdown equality_pushdown,
-  sirius::decode_range_pushdown range_pushdown)
+  sirius::decode_range_pushdown range_pushdown,
+  bool range_covers_whole_filter)
 {
   return std::make_unique<cached_databatch_provider>(entry,
                                                      selected_columns,
@@ -1392,7 +1404,8 @@ std::unique_ptr<databatch_provider> make_provider_for_pinned_entry(
                                                      std::move(mvcc_masks),
                                                      std::move(delta_splits),
                                                      std::move(equality_pushdown),
-                                                     std::move(range_pushdown));
+                                                     std::move(range_pushdown),
+                                                     range_covers_whole_filter);
 }
 
 cached_scan_plan build_cached_scan_plan(pinned_entry const& entry,
