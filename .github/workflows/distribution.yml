@@ -30,7 +30,7 @@ jobs:
     uses: sirius-db/extension-ci-tools/.github/workflows/_extension_distribution.yml@sirius
     with:
       extension_name: sirius
-      duckdb_version: v1.5.4
+      duckdb_version: v1.5.5
       ci_tools_version: sirius
       exclude_archs: "linux_amd64_musl;linux_arm64_musl;osx_amd64;osx_arm64;windows_amd64;windows_arm64;windows_amd64_mingw;wasm_mvp;wasm_eh;wasm_threads"
       extra_toolchains: "cuda;rust;protobuf"
@@ -54,7 +54,7 @@ jobs:
     uses: sirius-db/extension-ci-tools/.github/workflows/_extension_distribution.yml@sirius
     with:
       extension_name: sirius
-      duckdb_version: v1.5.4
+      duckdb_version: v1.5.5
       ci_tools_version: sirius
       exclude_archs: "linux_amd64_musl;linux_arm64_musl;osx_amd64;osx_arm64;windows_amd64;windows_arm64;windows_amd64_mingw;wasm_mvp;wasm_eh;wasm_threads"
       extra_toolchains: "cuda;rust;protobuf"
