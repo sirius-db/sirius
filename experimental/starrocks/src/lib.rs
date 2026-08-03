@@ -50,6 +50,7 @@ mod compute_node_service;
 mod engine;
 mod file_schema;
 mod fragment_executor;
+mod local_exchange;
 mod proto;
 mod prpc;
 mod result_encoder;
