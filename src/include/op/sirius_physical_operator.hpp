@@ -24,6 +24,8 @@
 #include "sirius/exception.hpp"
 #include "telemetry-bridge/gen/uuid.rs.h"
 
+#include <cudf/types.hpp>
+
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/data/data_repository.hpp>
 
@@ -367,6 +369,12 @@ struct input_stats {
   /// Transient working set needed to materialize the input. Defaults to zero
   /// for callers that only provide the historical byte basis.
   std::size_t working_set_bytes = 0;
+  /// Whether scan normalization will cast a selected column of the resident scan input.
+  bool needs_carrier_conversion = false;
+  /// Exact bytes of the destinations those casts allocate (see
+  /// scan_operator_input::conversion_destination_bytes). Zero means unknown; the scan estimate
+  /// then keeps its conservative maximum-expansion bound.
+  std::size_t conversion_destination_bytes = 0;
 };
 
 //! sirius_physical_operator is the base class of the physical operators present in the
@@ -420,6 +428,27 @@ class sirius_physical_operator {
 
   //! Return a vector of the types that will be returned by this operator
   const duckdb::vector<sirius::logical_type>& get_types() const { return types; }
+
+  //! Return the optional physical output schema. Empty means the native schema derived from
+  //! get_types().
+  [[nodiscard]] const std::vector<cudf::data_type>& get_physical_types() const noexcept
+  {
+    return _physical_types;
+  }
+
+  [[nodiscard]] bool has_physical_overrides() const noexcept { return !_physical_types.empty(); }
+
+  //! Install a complete physical output schema. Callers must supply one entry per logical column;
+  //! keeping this invariant local prevents a partial sidecar from silently shifting columns.
+  void set_physical_types(std::vector<cudf::data_type> schema)
+  {
+    if (!schema.empty() && schema.size() != types.size()) {
+      throw internal_exception("physical schema width {} does not match logical schema width {}",
+                               schema.size(),
+                               types.size());
+    }
+    _physical_types = std::move(schema);
+  }
 
   //! Get the unique operator ID.
   //! Throws if the plan was not numbered by `pipeline::assign_operator_ids`. An unassigned
@@ -669,6 +698,13 @@ class sirius_physical_operator {
   sirius_physical_delim_join* _owning_delim_join = nullptr;
 
  private:
+  //! Optional physical cuDF carrier schema for this operator's output. SQL semantics always use
+  //! `types`; an empty vector means every column uses its native carrier. This sidecar lets scan
+  //! materialization keep bounded integer and fixed-point DECIMAL values narrow without lying
+  //! about their logical type. Private so the complete-or-absent invariant enforced by
+  //! set_physical_types() cannot be bypassed by direct assignment.
+  std::vector<cudf::data_type> _physical_types;
+
   //! Restricted to the plan generator so parent pointers stay immutable post-plan-gen.
   void set_parent_op(sirius_physical_operator* parent_op) noexcept { _parent_op = parent_op; }
 

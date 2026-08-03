@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "cudf/cudf_utils.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/function/table/table_scan.hpp"
 #include "duckdb/main/attached_database.hpp"
@@ -30,6 +31,7 @@
 #include "duckdb/transaction/local_storage.hpp"
 #include "expression/ast/from_duckdb.hpp"
 #include "expression/ast/node.hpp"
+#include "helper/numeric_narrowing.hpp"
 #include "helper/type_conversions.hpp"
 #include "log/logging.hpp"
 #include "op/scan/duckdb_mvcc_visibility.hpp"
@@ -41,6 +43,7 @@
 #include "sirius_context.hpp"
 
 #include <memory>
+#include <optional>
 #include <unordered_set>
 
 namespace sirius::planner {
@@ -60,6 +63,49 @@ duckdb::vector<std::unique_ptr<sirius::ast::node>> translate_expressions(
     out.push_back(e ? sirius::ast::from_duckdb(*e) : nullptr);
   }
   return out;
+}
+
+std::vector<cudf::data_type> scan_physical_schema(duckdb::LogicalGet& op,
+                                                  duckdb::SiriusContext* state,
+                                                  bool compressed_materialization_on,
+                                                  const duckdb::vector<duckdb::ColumnIndex>& ids,
+                                                  sirius::scan_manager::pinned_entry const* entry)
+{
+  if (!state || !compressed_materialization_on || entry == nullptr) { return {}; }
+
+  // Install a narrow sidecar only when the pinned cache can serve this scan. Each target comes from
+  // recorded stored-column metadata, so compressed and uncompressed chunks use the same path. A
+  // chunk already at the target passes through; one stored narrower widens to the target. An
+  // unpinned scan follows the native path, and a pinned-native column is not narrowed while
+  // serving. A pin that cannot serve every requested column also takes the native disk-read path,
+  // avoiding recurring range verification and downcasts.
+  auto const projection = entry->cache_info.column_projection_for(ids);
+  if (projection.empty()) { return {}; }
+
+  std::vector<cudf::data_type> result;
+  result.reserve(op.types.size());
+  bool changed = false;
+  for (std::size_t output_idx = 0; output_idx < op.types.size(); output_idx++) {
+    auto const logical = sirius::from_duckdb(op.types[output_idx]);
+    auto const native  = sirius::try_get_cudf_type(logical);
+    if (!native) { return {}; }
+    result.push_back(*native);
+    if (!sirius::is_narrowable_numeric_type(logical)) { continue; }
+
+    std::size_t ids_position = output_idx;
+    if (!op.projection_ids.empty()) {
+      if (output_idx >= op.projection_ids.size()) { continue; }
+      ids_position = op.projection_ids[output_idx];
+    }
+    if (ids_position >= ids.size()) { continue; }
+
+    auto const target =
+      sirius::scan_manager::pinned_column_narrow_carrier(*entry, projection[ids_position], *native);
+    if (!target) { continue; }
+    result.back() = *target;
+    changed       = true;
+  }
+  return changed ? result : std::vector<cudf::data_type>{};
 }
 
 // An OPTIONAL_FILTER is advisory and an IS_NOT_NULL is applied by the scan itself, so
@@ -126,6 +172,49 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
                                           op.function.name);
   }
 
+  auto sirius_state = context.registered_state
+                        ? context.registered_state->Get<duckdb::SiriusContext>("sirius_state")
+                        : nullptr;
+
+  // Resolved once for this plan against the connection being planned for, so the parquet
+  // identity probe and the residency gate below cannot disagree about whether narrowing is on.
+  bool const compressed_materialization_on = duckdb::compressed_materialization_enabled(context);
+
+  // One pinned-entry probe per scan: the compressed-materialization residency gate and
+  // the seq_scan MVCC cache-or-CPU guard below share the result. The parquet identity
+  // feeds only the gate, so its file resolution runs only when the feature is on.
+  sirius::scan_manager::pinned_entry const* pinned = nullptr;
+  bool serves_insert_deltas                        = false;
+  if (sirius_state && op.function.name == "seq_scan") {
+    auto* bind = dynamic_cast<duckdb::TableScanBindData*>(op.bind_data.get());
+    if (bind != nullptr && bind->table.IsDuckTable()) {
+      auto& table = bind->table.Cast<duckdb::DuckTableEntry>();
+      pinned      = sirius_state->get_scan_manager().find_pinned_entry_for_duckdb_table(
+        table.ParentCatalog().GetName(), table.ParentSchema().name, table.name);
+      // Rows beyond the pinned prefix serve as insert-delta splits, decoded fresh at native
+      // width. A narrow sidecar over them would pay per-batch exact-range verification and, on
+      // an out-of-range inserted value, fail the query over to the CPU fallback — so the
+      // residency gate below installs no narrow targets for a delta-serving scan. Entry chunks
+      // and their storage metadata are untouched by deltas. See issue ticket #1311.
+      if (pinned != nullptr && pinned->mvcc != nullptr &&
+          static_cast<std::size_t>(table.GetStorage().GetTotalRows()) > pinned->mvcc->n_cache()) {
+        serves_insert_deltas = true;
+      }
+    }
+  } else if (sirius_state && compressed_materialization_on) {
+    auto const files =
+      resolve_parquet_scan_file_paths(op.function.name, op.bind_data.get(), op.parameters);
+    if (!files.empty()) {
+      pinned = sirius_state->get_scan_manager().find_pinned_entry_for_parquet_files(files);
+    }
+  }
+
+  auto physical_types = scan_physical_schema(op,
+                                             sirius_state.get(),
+                                             compressed_materialization_on,
+                                             column_ids,
+                                             serves_insert_deltas ? nullptr : pinned);
+
   if (!op.children.empty()) {
     throw duckdb::NotImplementedException("Table Input Output functions are not supported yet");
   }
@@ -181,32 +270,24 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
         }
       }
 
-      sirius::scan_manager::pinned_entry const* entry = nullptr;
-      if (context.registered_state) {
-        if (auto sirius_state =
-              context.registered_state->Get<duckdb::SiriusContext>("sirius_state")) {
-          entry = sirius_state->get_scan_manager().find_pinned_entry_for_duckdb_table(
-            table.ParentCatalog().GetName(), table.ParentSchema().name, table.name);
-        }
-      }
-      if (entry != nullptr && entry->mvcc != nullptr) {
+      if (pinned != nullptr && pinned->mvcc != nullptr) {
         // Cache-or-CPU guards: while this table is MVCC-pinned, a GPU plan
         // either serves exactly from the pinned cache (DELETE keep-masks) or is
         // refused HERE, where the throw still becomes a clean CPU fallback. The
         // disk-native path is MVCC-blind, and the pin's checkpoint suppression
         // makes its snapshot increasingly stale — so scans the pin cannot serve
         // never fall through to it.
-        auto const n_cache = entry->mvcc->n_cache();
+        auto const n_cache = pinned->mvcc->n_cache();
         // (a) snapshot-too-old: this transaction opened before the pin, so
         // the cache's base image is from its future.
         auto const start_time =
           duckdb::DuckTransaction::Get(context, table.ParentCatalog()).start_time;
-        if (start_time < entry->mvcc->v_base) {
+        if (start_time < pinned->mvcc->v_base) {
           throw duckdb::NotImplementedException(
             "duckdb-native scan: transaction snapshot (%llu) predates the pinned cache "
             "snapshot (%llu) for table '%s'",
             static_cast<unsigned long long>(start_time),
-            static_cast<unsigned long long>(entry->mvcc->v_base),
+            static_cast<unsigned long long>(pinned->mvcc->v_base),
             table.name);
         }
         // (b) transaction-local appends: rows in this transaction's
@@ -241,7 +322,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
         }
         bool pin_serves = !has_unservable_column;
         if (pin_serves && !column_ids.empty()) {
-          pin_serves = !entry->cache_info.column_projection_for(column_ids).empty();
+          pin_serves = !pinned->cache_info.column_projection_for(column_ids).empty();
         }
         if (!pin_serves) {
           // (d) column-mismatch: the scan would fall through to the MVCC-blind
@@ -301,7 +382,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
       // unpinned table is MVCC-blind (#1143): uncheckpointed deletes and
       // update chains are served silently, and committed-but-uncheckpointed
       // inserts fail loudly at execution.
-      if (entry == nullptr || entry->mvcc == nullptr) {
+      if (pinned == nullptr || pinned->mvcc == nullptr) {
         // No MVCC-pinned cache for this table: the plan is the disk-native
         // read, which applies no visibility filtering — refuse any state it
         // would misread HERE, where the throw still becomes a clean CPU
@@ -519,6 +600,12 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
     std::move(op.extra_info),
     std::move(op.parameters),
     std::move(op.virtual_columns));
+  if (!physical_types.empty() && physical_types.size() == node->types.size()) {
+    node->set_physical_types(std::move(physical_types));
+    node->sidecar_from_gpu_tier_pin =
+      pinned != nullptr && pinned->tier == cucascade::memory::Tier::GPU;
+    if (sirius_state) { sirius_state->record_compressed_materialization_scan_sidecar_installed(); }
+  }
   node->named_parameters = std::move(op.named_parameters);
   node->dynamic_filters  = op.dynamic_filters;
   if (op.dynamic_filters) {

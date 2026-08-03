@@ -2,7 +2,7 @@
 //
 // Production-path contract for Bitpack's layout boundary:
 //   encode kernel: strided OverAllocate scratch
-//   persisted rep: dense Compact words only
+//   persisted rep: dense Compact words + decode gather guard words
 //   decode kernel: Compact words + synthesized bp_offsets
 
 #include "api/compressed_table_io.hpp"
@@ -138,13 +138,20 @@ void test_compact_persistence_and_decode()
       static_cast<std::uint64_t>(counts[i]) * static_cast<std::uint64_t>(bits[i]);
     expected_words += (live_bits + 31) / 32;
   }
+  // The persisted packed column is the dense Compact words plus the guard words that keep
+  // the decode gather addressable: simpatico_bitunpack_one loads packed[word_in ..
+  // word_in + 2] unconditionally, so the last element reaches two words past the final
+  // live word. Anything wider than this means the OverAllocate encode stride leaked into
+  // the persisted rep.
+  constexpr std::uint64_t kDecodeGuardWords = 3;  // compact_bitpack_packed; covers that reach
   expect(expected_words == 361, "fixture no longer exercises the intended compact sizes");
-  expect(packed_desc.num_rows == expected_words, "persisted packed column is not compact");
-  expect(packed_desc.size_bytes == expected_words * sizeof(std::uint32_t),
-         "persisted packed byte size includes OverAllocate stride or decode slack");
+  expect(packed_desc.num_rows == expected_words + kDecodeGuardWords,
+         "persisted packed column is not compact words plus decode guard");
+  expect(packed_desc.size_bytes == (expected_words + kDecodeGuardWords) * sizeof(std::uint32_t),
+         "persisted packed byte size includes OverAllocate stride");
 
-  // Header serialization must expose only the logical Compact bytes. The
-  // private two-word decode over-read slack stays allocation-only.
+  // The guard words are part of the buffer's logical size, so serialization carries them
+  // and a reader that allocates exactly size_bytes already covers the gather reach.
   std::vector<std::uint8_t> header;
   std::vector<simpatico::payload_buffer_ref> payload_refs;
   std::uint64_t payload_bytes = 0;
@@ -157,9 +164,9 @@ void test_compact_persistence_and_decode()
     });
   expect(packed_ref != payload_refs.end(), "serialized payload omitted packed buffer");
   expect(packed_ref->size_bytes == packed_desc.size_bytes,
-         "serialized packed payload is not logically compact");
-  expect(packed_ref->alloc_bytes >= packed_ref->size_bytes + 2 * sizeof(std::uint32_t),
-         "reconstructed packed allocation lacks decode gather slack");
+         "serialized packed payload disagrees with the persisted column");
+  expect(packed_ref->alloc_bytes == packed_ref->size_bytes,
+         "reconstructed packed allocation disagrees with the serialized payload");
   expect(payload_bytes == std::accumulate(payload_refs.begin(),
                                           payload_refs.end(),
                                           std::uint64_t{0},

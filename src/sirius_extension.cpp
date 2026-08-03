@@ -118,6 +118,7 @@ extern "C" int cudaProfilerStop();
 #include "io/types.hpp"                // sirius::io::sirius_ioctx
 #include "io/uring/uring_reactor.hpp"  // sirius::io::uring_io_object
 
+#include <cstdint>
 #include <cstdlib>
 #include <unordered_map>
 
@@ -131,6 +132,18 @@ bool SiriusExtension::buffer_is_initialized = false;
 constexpr std::string QUERY_LABEL_PARAM_KEY = "query_label";
 
 namespace {
+
+std::uint64_t count_narrowed_columns(
+  sirius::pinned_column_storage_matrix const& column_storage) noexcept
+{
+  std::uint64_t count = 0;
+  for (auto const& chunk : column_storage) {
+    for (auto const& column : chunk) {
+      count += column.narrowed ? 1 : 0;
+    }
+  }
+  return count;
+}
 
 unique_ptr<QueryResult> run_internal_cpu_fallback_query(ClientContext& context,
                                                         Connection& connection,
@@ -1272,9 +1285,12 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
     ingestible = sirius::op::scan::make_ingestible(std::move(info));
   }
 
-  if (!sirius_ctx->get_config().get_operator_params().enable_pinned_zone_map_pruning) {
-    pinned_column_types.clear();
-  }
+  auto const& pin_op_params      = sirius_ctx->get_config().get_operator_params();
+  bool const capture_chunk_stats = pin_op_params.enable_pinned_zone_map_pruning;
+  // Read from the connection running the CALL, so a table pins with the carriers that
+  // connection asked for rather than whatever another connection set last.
+  bool const compressed_pin = duckdb::compressed_materialization_enabled(context);
+  if (!capture_chunk_stats && !compressed_pin) { pinned_column_types.clear(); }
 
   // Build the cache descriptor (table identity + column layout) from the
   // ingestible; it is stored on the pinned entry in place of the heavyweight
@@ -1354,13 +1370,23 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
   }
 
   if (data.args.tier == "host") {
-    auto host_result = sirius::materialize_pin_to_host(*ingestible,
-                                                       gpu_spaces_mut,
-                                                       host_space_by_gpu,
-                                                       *scan_mgr.io_ctx(),
-                                                       pinned_column_types,
-                                                       pin_comp);
-
+    // Stream each batch GPU->host: materialize one batch on its round-robin GPU, convert it
+    // to a pinned host representation (compressed when it qualifies) on that GPU's NUMA-local
+    // host space, then free the GPU table before materializing the next. Peak GPU residency
+    // stays at ~one batch, so the whole table never needs to fit in GPU memory. On multi-GPU
+    // the chunks land round-robin across NUMA nodes; the cached-serve path then reads each
+    // chunk back on a NUMA-local GPU.
+    auto host_result =
+      sirius::materialize_pin_to_host(*ingestible,
+                                      gpu_spaces_mut,
+                                      host_space_by_gpu,
+                                      *scan_mgr.io_ctx(),
+                                      pinned_column_types,
+                                      pin_comp,
+                                      {.capture_chunk_stats               = capture_chunk_stats,
+                                       .enable_compressed_materialization = compressed_pin});
+    sirius_ctx->record_compressed_materialization_pin_columns_narrowed(
+      count_narrowed_columns(host_result.column_storage));
     // entry.memory_space is metadata only; each host_chunk carries its own per-GPU
     // NUMA-local memory_space. Pass a representative (the first GPU's host space).
     int const first_gpu_id          = gpu_spaces_mut[0]->get_device_id();
@@ -1371,7 +1397,8 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
                                       std::move(host_result.chunks),
                                       *representative_host_space,
                                       std::move(pinned_column_types),
-                                      std::move(host_result.chunk_stats));
+                                      std::move(host_result.chunk_stats),
+                                      std::move(host_result.column_storage));
     if (data.args.format == "duckdb") {
       sirius::scan_manager::duckdb_mvcc_metadata mvcc;
       mvcc.v_base                   = duckdb_pin_v_base;
@@ -1379,15 +1406,25 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
       scan_mgr.attach_mvcc_metadata(data.args.name, std::move(mvcc));
     }
   } else if (pin_comp.enabled) {
-    // GPU tier, compression enabled: materialize each batch and compress it when it
-    // qualifies, keeping the compressed payload in device memory; batches that do
-    // not qualify are pinned uncompressed. Both forms land in one ordered chunk
-    // vector, so a table that mixes them pins without special-casing.
+    // GPU tier, compression enabled: narrow each materialized batch (when narrowing is
+    // on), then compress it when it qualifies, keeping the compressed payload in device
+    // memory; batches that do not qualify are pinned uncompressed. Both forms land in
+    // one ordered chunk vector, so a table that mixes them pins without special-casing.
     auto dev_result = sirius::materialize_all_batches_compressed(
-      *ingestible, gpu_spaces_mut, *scan_mgr.io_ctx(), pin_comp);
+      *ingestible,
+      gpu_spaces_mut,
+      *scan_mgr.io_ctx(),
+      pinned_column_types,
+      pin_comp,
+      {.capture_chunk_stats = false, .enable_compressed_materialization = compressed_pin});
+    sirius_ctx->record_compressed_materialization_pin_columns_narrowed(
+      count_narrowed_columns(dev_result.column_storage));
 
-    scan_mgr.insert_pinned_entry_device(
-      data.args.name, std::move(cache_info), std::move(dev_result.chunks), *gpu_spaces_mut[0]);
+    scan_mgr.insert_pinned_entry_device(data.args.name,
+                                        std::move(cache_info),
+                                        std::move(dev_result.chunks),
+                                        *gpu_spaces_mut[0],
+                                        std::move(dev_result.column_storage));
     if (data.args.format == "duckdb") {
       sirius::scan_manager::duckdb_mvcc_metadata mvcc;
       mvcc.v_base                   = duckdb_pin_v_base;
@@ -1397,15 +1434,23 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
   } else {
     // GPU tier, uncompressed: materialize every batch as a GPU-resident cudf::table
     // (with its GPU placement) and pin them in place.
-    auto mat = sirius::materialize_all_batches(
-      *ingestible, gpu_spaces_mut, *scan_mgr.io_ctx(), pinned_column_types);
+    auto mat =
+      sirius::materialize_all_batches(*ingestible,
+                                      gpu_spaces_mut,
+                                      *scan_mgr.io_ctx(),
+                                      pinned_column_types,
+                                      {.capture_chunk_stats               = capture_chunk_stats,
+                                       .enable_compressed_materialization = compressed_pin});
+    sirius_ctx->record_compressed_materialization_pin_columns_narrowed(
+      count_narrowed_columns(mat.column_storage));
     auto base_row_count_per_chunk = std::move(mat.base_row_count_per_chunk);
     scan_mgr.insert_pinned_entry(data.args.name,
                                  std::move(cache_info),
                                  std::move(mat.tables),
                                  std::move(mat.chunk_memory_spaces),
                                  std::move(pinned_column_types),
-                                 std::move(mat.chunk_stats));
+                                 std::move(mat.chunk_stats),
+                                 std::move(mat.column_storage));
     if (data.args.format == "duckdb") {
       sirius::scan_manager::duckdb_mvcc_metadata mvcc;
       mvcc.v_base                   = duckdb_pin_v_base;
@@ -2052,7 +2097,19 @@ static void SetEnablePinnedZoneMapPruning(ClientContext& context, SetScope scope
                    params->enable_pinned_zone_map_pruning);
 }
 
-void SiriusExtension::InitialGPUConfigs(DBConfig& config)
+static void SetEnableCompressedMaterialization(ClientContext& /*context*/,
+                                               SetScope /*scope*/,
+                                               Value& /*parameter*/)
+{
+  // Deliberately empty: DuckDB has already stored the value on the connection that ran the SET
+  // by the time this hook runs. The hook exists only to copy that value somewhere else, and
+  // there is nowhere else it belongs — planning and pinning read it straight back with
+  // compressed_materialization_enabled(). A copy kept in shared state would answer for every
+  // connection, so one connection's SET would redirect another's scans while that connection's
+  // current_setting still reported the old value.
+}
+
+void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::operator_params& defaults)
 {
   // Add in config option for gpu buffer manager
   config.AddExtensionOption("use_pin_memory",
@@ -2345,6 +2402,16 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
     LogicalType::BOOLEAN,
     Value::BOOLEAN(sirius::operator_params{}.enable_pinned_zone_map_pruning),
     SetEnablePinnedZoneMapPruning);
+
+  // Default from the YAML-loaded params, so a sirius.yaml value is what connections inherit.
+  config.AddExtensionOption(
+    "enable_compressed_materialization",
+    "Keep eligible integer and fixed-point DECIMAL columns in value-preserving narrow cuDF "
+    "carriers selected from exact pin-time bounds; restore native carriers at type-sensitive "
+    "boundaries (on by default)",
+    LogicalType::BOOLEAN,
+    Value::BOOLEAN(defaults.enable_compressed_materialization),
+    SetEnableCompressedMaterialization);
 }
 
 // Publish the transparent optimizer mask once at extension load, unioned
@@ -2396,7 +2463,10 @@ static void LoadInternal(ExtensionLoader& loader)
   install_configured_log_sink(&db);
 
   sirius::converter_registry::initialize();
-  SiriusExtension::InitialGPUConfigs(config);
+  // The callback constructor above already read sirius.yaml, so its params are the defaults the
+  // per-connection options register with.
+  SiriusExtension::InitialGPUConfigs(config,
+                                     callback_ptr->get_loaded_config().get_operator_params());
   SiriusExtension::RegisterGPUFunctions(db);
 
   // Register the s3:// FileSystem so DuckDB's native read_parquet('s3://') binds

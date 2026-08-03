@@ -66,13 +66,12 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::cast const& alt, eva
 
     if (mode == evaluation_mode::AST) {
       //===----------1: AST Mode----------===//
-      return evaluate_result(
-        ast_result(cast_expr, child.get_temp_scalar_indices(), child.get_temp_column_indices()));
+      return evaluate_result(compose(cast_expr, {&child}));
     }
     //===----------2: MATERIALIZE Mode, evaluate node with AST----------===//
     auto result_column = evaluate_ast(cast_expr);
 
-    release_temporaries(child.get_temp_scalar_indices(), child.get_temp_column_indices());
+    release_temporaries({&child});
     return evaluate_result(std::move(result_column));
   }
 

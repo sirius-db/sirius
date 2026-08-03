@@ -484,9 +484,21 @@ void sirius_dynamic_filter_set::set_consumer_column_remap(std::vector<std::size_
   _consumer_col_remap = std::move(remap);
 }
 
-void sirius_dynamic_filter_set::register_producer()
+void sirius_dynamic_filter_set::register_producer(std::vector<std::size_t> planned_target_columns)
 {
+  if (planned_target_columns.empty()) {
+    _has_unscoped_producer.store(true, std::memory_order_release);
+  } else {
+    std::scoped_lock lk(_mu);
+    _planned_target_columns.insert(planned_target_columns.begin(), planned_target_columns.end());
+  }
   _producer_count.fetch_add(1, std::memory_order_release);
+}
+
+std::vector<std::size_t> sirius_dynamic_filter_set::planned_target_columns() const
+{
+  std::scoped_lock lk(_mu);
+  return {_planned_target_columns.begin(), _planned_target_columns.end()};
 }
 
 void sirius_dynamic_filter_set::close_for_new_filters()
