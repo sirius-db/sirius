@@ -39,6 +39,9 @@ libprotobuf = "*"
 rust = "*"
 cuda-nvrtc-dev = "*"
 
+[pypi-dependencies]
+rumdl = "==0.2.44"
+
 [feature.dev-libs.dependencies]
 librmm = "*"
 libcurand-dev = "*"
@@ -58,6 +61,10 @@ pnpm = "*"
 go-cgo = ">=1.25"
 
 [tasks]
+
+[tasks.clion-env]
+description = "Generate the Pixi environment file used by CLion."
+cmd = "mkdir -p build && pixi shell-hook -s bash > build/sirius_pixi_env_for_clion.sh"
 
 [tasks.quent]
 description = "Run the Quent telemetry UI server."

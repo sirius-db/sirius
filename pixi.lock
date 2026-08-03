@@ -37,6 +37,8 @@ environments:
     channels:
     - url: https://conda.anaconda.org/rapidsai/
     - url: https://conda.anaconda.org/conda-forge/
+    indexes:
+    - https://pypi.org/simple
     packages:
       p3:
       - conda: https://conda.anaconda.org/conda-forge/linux-64/_go_select-2.3.0-cgo.tar.bz2
@@ -210,6 +212,7 @@ environments:
       - conda: https://conda.anaconda.org/rapidsai/linux-64/libkvikio-26.06.00-cuda12_260603_5eb6c5d8.conda
       - conda: https://conda.anaconda.org/rapidsai/linux-64/librmm-26.06.00-cuda12_260603_87184183.conda
       - conda: https://conda.anaconda.org/rapidsai/linux-64/rapids-logger-0.2.3-h98325ef_0.conda
+      - pypi: https://files.pythonhosted.org/packages/e5/61/7f9958174c5b969a6a5e94e676364fffcd6fee53e5eef2e98c36d91dfc7a/rumdl-0.2.44-py3-none-manylinux_2_28_x86_64.whl
       p4:
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/_go_select-2.3.0-cgo.tar.bz2
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/_openmp_mutex-4.5-20_gnu.conda
@@ -385,10 +388,13 @@ environments:
       - conda: https://conda.anaconda.org/rapidsai/linux-aarch64/libkvikio-26.06.00-cuda12_260603_5eb6c5d8.conda
       - conda: https://conda.anaconda.org/rapidsai/linux-aarch64/librmm-26.06.00-cuda12_260603_87184183.conda
       - conda: https://conda.anaconda.org/rapidsai/linux-aarch64/rapids-logger-0.2.3-h4f43097_0.conda
+      - pypi: https://files.pythonhosted.org/packages/ba/ff/77597bc208f92d884eceda704f6b95dbebb08ef5de3a24348d715ed6774e/rumdl-0.2.44-py3-none-manylinux_2_28_aarch64.whl
   default:
     channels:
     - url: https://conda.anaconda.org/rapidsai/
     - url: https://conda.anaconda.org/conda-forge/
+    indexes:
+    - https://pypi.org/simple
     packages:
       p1:
       - conda: https://conda.anaconda.org/conda-forge/linux-64/_go_select-2.3.0-cgo.tar.bz2
@@ -562,6 +568,7 @@ environments:
       - conda: https://conda.anaconda.org/rapidsai/linux-64/libkvikio-26.06.00-cuda13_260603_5eb6c5d8.conda
       - conda: https://conda.anaconda.org/rapidsai/linux-64/librmm-26.06.00-cuda13_260603_87184183.conda
       - conda: https://conda.anaconda.org/rapidsai/linux-64/rapids-logger-0.2.3-h98325ef_0.conda
+      - pypi: https://files.pythonhosted.org/packages/e5/61/7f9958174c5b969a6a5e94e676364fffcd6fee53e5eef2e98c36d91dfc7a/rumdl-0.2.44-py3-none-manylinux_2_28_x86_64.whl
       p2:
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/_go_select-2.3.0-cgo.tar.bz2
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/_openmp_mutex-4.5-20_gnu.conda
@@ -737,10 +744,13 @@ environments:
       - conda: https://conda.anaconda.org/rapidsai/linux-aarch64/libkvikio-26.06.00-cuda13_260603_5eb6c5d8.conda
       - conda: https://conda.anaconda.org/rapidsai/linux-aarch64/librmm-26.06.00-cuda13_260603_87184183.conda
       - conda: https://conda.anaconda.org/rapidsai/linux-aarch64/rapids-logger-0.2.3-h4f43097_0.conda
+      - pypi: https://files.pythonhosted.org/packages/ba/ff/77597bc208f92d884eceda704f6b95dbebb08ef5de3a24348d715ed6774e/rumdl-0.2.44-py3-none-manylinux_2_28_aarch64.whl
   duckdb-python:
     channels:
     - url: https://conda.anaconda.org/rapidsai/
     - url: https://conda.anaconda.org/conda-forge/
+    indexes:
+    - https://pypi.org/simple
     packages:
       p1:
       - conda: https://conda.anaconda.org/conda-forge/linux-64/_openmp_mutex-4.5-20_gnu.conda
@@ -889,6 +899,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/noarch/vcs_versioning-2.2.0-pyhcf101f3_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/virtualenv-21.5.1-pyhcf101f3_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/zipp-4.1.0-pyhcf101f3_0.conda
+      - pypi: https://files.pythonhosted.org/packages/e5/61/7f9958174c5b969a6a5e94e676364fffcd6fee53e5eef2e98c36d91dfc7a/rumdl-0.2.44-py3-none-manylinux_2_28_x86_64.whl
       p2:
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/_openmp_mutex-4.5-20_gnu.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/bc-1.07.1-hf897c2e_0.tar.bz2
@@ -1040,6 +1051,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/noarch/virtualenv-21.5.1-pyhcf101f3_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/wheel-0.47.0-pyhd8ed1ab_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/zipp-4.1.0-pyhcf101f3_0.conda
+      - pypi: https://files.pythonhosted.org/packages/ba/ff/77597bc208f92d884eceda704f6b95dbebb08ef5de3a24348d715ed6774e/rumdl-0.2.44-py3-none-manylinux_2_28_aarch64.whl
   nightly-runner:
     channels:
     - url: https://conda.anaconda.org/rapidsai/
@@ -1065,6 +1077,8 @@ environments:
     channels:
     - url: https://conda.anaconda.org/rapidsai/
     - url: https://conda.anaconda.org/conda-forge/
+    indexes:
+    - https://pypi.org/simple
     packages:
       p1:
       - conda: https://conda.anaconda.org/conda-forge/linux-64/_openmp_mutex-4.5-20_gnu.conda
@@ -1258,6 +1272,7 @@ environments:
       - conda: https://conda.anaconda.org/rapidsai/linux-64/libkvikio-26.06.00-cuda13_260603_5eb6c5d8.conda
       - conda: https://conda.anaconda.org/rapidsai/linux-64/librmm-26.06.00-cuda13_260603_87184183.conda
       - conda: https://conda.anaconda.org/rapidsai/linux-64/rapids-logger-0.2.3-h98325ef_0.conda
+      - pypi: https://files.pythonhosted.org/packages/e5/61/7f9958174c5b969a6a5e94e676364fffcd6fee53e5eef2e98c36d91dfc7a/rumdl-0.2.44-py3-none-manylinux_2_28_x86_64.whl
       p2:
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/_openmp_mutex-4.5-20_gnu.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/aws-c-auth-0.10.1-h32143b3_3.conda
@@ -1451,10 +1466,13 @@ environments:
       - conda: https://conda.anaconda.org/rapidsai/linux-aarch64/libkvikio-26.06.00-cuda13_260603_5eb6c5d8.conda
       - conda: https://conda.anaconda.org/rapidsai/linux-aarch64/librmm-26.06.00-cuda13_260603_87184183.conda
       - conda: https://conda.anaconda.org/rapidsai/linux-aarch64/rapids-logger-0.2.3-h4f43097_0.conda
+      - pypi: https://files.pythonhosted.org/packages/ba/ff/77597bc208f92d884eceda704f6b95dbebb08ef5de3a24348d715ed6774e/rumdl-0.2.44-py3-none-manylinux_2_28_aarch64.whl
   vcpkg-cuda12:
     channels:
     - url: https://conda.anaconda.org/rapidsai/
     - url: https://conda.anaconda.org/conda-forge/
+    indexes:
+    - https://pypi.org/simple
     packages:
       p3:
       - conda: https://conda.anaconda.org/conda-forge/linux-64/_openmp_mutex-4.5-20_gnu.conda
@@ -1648,6 +1666,7 @@ environments:
       - conda: https://conda.anaconda.org/rapidsai/linux-64/libkvikio-26.06.00-cuda12_260603_5eb6c5d8.conda
       - conda: https://conda.anaconda.org/rapidsai/linux-64/librmm-26.06.00-cuda12_260603_87184183.conda
       - conda: https://conda.anaconda.org/rapidsai/linux-64/rapids-logger-0.2.3-h98325ef_0.conda
+      - pypi: https://files.pythonhosted.org/packages/e5/61/7f9958174c5b969a6a5e94e676364fffcd6fee53e5eef2e98c36d91dfc7a/rumdl-0.2.44-py3-none-manylinux_2_28_x86_64.whl
       p4:
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/_openmp_mutex-4.5-20_gnu.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/aws-c-auth-0.10.1-h32143b3_3.conda
@@ -1841,6 +1860,7 @@ environments:
       - conda: https://conda.anaconda.org/rapidsai/linux-aarch64/libkvikio-26.06.00-cuda12_260603_5eb6c5d8.conda
       - conda: https://conda.anaconda.org/rapidsai/linux-aarch64/librmm-26.06.00-cuda12_260603_87184183.conda
       - conda: https://conda.anaconda.org/rapidsai/linux-aarch64/rapids-logger-0.2.3-h4f43097_0.conda
+      - pypi: https://files.pythonhosted.org/packages/ba/ff/77597bc208f92d884eceda704f6b95dbebb08ef5de3a24348d715ed6774e/rumdl-0.2.44-py3-none-manylinux_2_28_aarch64.whl
 packages:
 - conda: https://conda.anaconda.org/conda-forge/linux-64/_go_select-2.3.0-cgo.tar.bz2
   sha256: d86836d4f3094b4ac149dcdc55f1f12be6e84ed1206a4234404a024e49769832
@@ -1861,6 +1881,7 @@ packages:
   - openmp_impl <0.0a0
   license: BSD-3-Clause
   license_family: BSD
+  purls: []
   run_exports:
     strong:
     - _openmp_mutex >=4.5
@@ -2162,6 +2183,7 @@ packages:
   - libgcc >=14
   license: bzip2-1.0.6
   license_family: BSD
+  purls: []
   run_exports:
     weak:
     - bzip2 >=1.0.8,<2.0a0
@@ -3423,6 +3445,7 @@ packages:
   - expat 2.8.1.*
   license: MIT
   license_family: MIT
+  purls: []
   run_exports: {}
   size: 77856
   timestamp: 1781203599810
@@ -3434,6 +3457,7 @@ packages:
   - libgcc >=14
   license: MIT
   license_family: MIT
+  purls: []
   run_exports:
     weak:
     - libffi >=3.5.2,<3.6.0a0
@@ -3589,6 +3613,7 @@ packages:
   constrains:
   - xz 5.8.3.*
   license: 0BSD
+  purls: []
   run_exports:
     weak:
     - liblzma >=5.8.3,<6.0a0
@@ -3602,6 +3627,7 @@ packages:
   - libgcc >=14
   license: BSD-2-Clause
   license_family: BSD
+  purls: []
   run_exports: {}
   size: 92400
   timestamp: 1769482286018
@@ -3931,6 +3957,7 @@ packages:
   - __glibc >=2.17,<3.0.a0
   license: BSD-3-Clause
   license_family: BSD
+  purls: []
   run_exports:
     weak:
     - libuuid >=2.42.2,<3.0a0
@@ -4110,6 +4137,7 @@ packages:
   - __glibc >=2.17,<3.0.a0
   - libgcc >=14
   license: X11 AND BSD-3-Clause
+  purls: []
   run_exports:
     weak:
     - ncurses >=6.6,<7.0a0
@@ -4161,6 +4189,7 @@ packages:
   - libgcc >=14
   license: Apache-2.0
   license_family: Apache
+  purls: []
   run_exports:
     weak:
     - openssl >=3.6.3,<4.0a0
@@ -4316,6 +4345,7 @@ packages:
   - ncurses >=6.5,<7.0a0
   license: GPL-3.0-only
   license_family: GPL
+  purls: []
   run_exports:
     weak:
     - readline >=8.3,<9.0a0
@@ -4552,6 +4582,7 @@ packages:
   - libzlib >=1.3.1,<2.0a0
   license: BSD-3-Clause
   license_family: BSD
+  purls: []
   run_exports:
     weak:
     - zstd >=1.5.7,<1.6.0a0
@@ -4575,6 +4606,7 @@ packages:
   - openmp_impl <0.0a0
   license: BSD-3-Clause
   license_family: BSD
+  purls: []
   run_exports:
     strong:
     - _openmp_mutex >=4.5
@@ -4865,6 +4897,7 @@ packages:
   - libgcc >=14
   license: bzip2-1.0.6
   license_family: BSD
+  purls: []
   run_exports:
     weak:
     - bzip2 >=1.0.8,<2.0a0
@@ -6163,6 +6196,7 @@ packages:
   - expat 2.8.1.*
   license: MIT
   license_family: MIT
+  purls: []
   run_exports: {}
   size: 77649
   timestamp: 1781203572523
@@ -6173,6 +6207,7 @@ packages:
   - libgcc >=14
   license: MIT
   license_family: MIT
+  purls: []
   run_exports:
     weak:
     - libffi >=3.5.2,<3.6.0a0
@@ -6335,6 +6370,7 @@ packages:
   constrains:
   - xz 5.8.3.*
   license: 0BSD
+  purls: []
   run_exports:
     weak:
     - liblzma >=5.8.3,<6.0a0
@@ -6347,6 +6383,7 @@ packages:
   - libgcc >=14
   license: BSD-2-Clause
   license_family: BSD
+  purls: []
   run_exports: {}
   size: 114056
   timestamp: 1769482343003
@@ -6696,6 +6733,7 @@ packages:
   - libgcc >=14
   license: BSD-3-Clause
   license_family: BSD
+  purls: []
   run_exports:
     weak:
     - libuuid >=2.42.2,<3.0a0
@@ -6907,6 +6945,7 @@ packages:
   depends:
   - libgcc >=14
   license: X11 AND BSD-3-Clause
+  purls: []
   run_exports:
     weak:
     - ncurses >=6.6,<7.0a0
@@ -6956,6 +6995,7 @@ packages:
   - libgcc >=14
   license: Apache-2.0
   license_family: Apache
+  purls: []
   run_exports:
     weak:
     - openssl >=3.6.3,<4.0a0
@@ -7148,6 +7188,7 @@ packages:
   - ncurses >=6.5,<7.0a0
   license: GPL-3.0-only
   license_family: GPL
+  purls: []
   run_exports:
     weak:
     - readline >=8.3,<9.0a0
@@ -7384,6 +7425,7 @@ packages:
   - libzlib >=1.3.1,<2.0a0
   license: BSD-3-Clause
   license_family: BSD
+  purls: []
   run_exports:
     weak:
     - zstd >=1.5.7,<1.6.0a0
@@ -8940,3 +8982,13 @@ packages:
   license: Apache-2.0
   size: 225119
   timestamp: 1759854009923
+- pypi: https://files.pythonhosted.org/packages/ba/ff/77597bc208f92d884eceda704f6b95dbebb08ef5de3a24348d715ed6774e/rumdl-0.2.44-py3-none-manylinux_2_28_aarch64.whl
+  name: rumdl
+  version: 0.2.44
+  sha256: 847aa72f039d9eea19138f2a0909f934691ed65af628a8346aae02484f7aef20
+  requires_python: '>=3.9'
+- pypi: https://files.pythonhosted.org/packages/e5/61/7f9958174c5b969a6a5e94e676364fffcd6fee53e5eef2e98c36d91dfc7a/rumdl-0.2.44-py3-none-manylinux_2_28_x86_64.whl
+  name: rumdl
+  version: 0.2.44
+  sha256: 82e113db86949cadf5ff39c2ce303265340ea9e333dcd80259c44207b4f495f0
+  requires_python: '>=3.9'
