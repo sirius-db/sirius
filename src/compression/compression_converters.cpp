@@ -216,15 +216,24 @@ std::vector<simpatico::decode_predicate> to_decode_predicates(
   return predicates;
 }
 
+// Which representation class the converter must construct for a fused-attempt
+// batch — the scan side keys its behavior off the class alone.
+enum class fused_batch_tag : std::uint8_t {
+  none,          ///< plain gpu_table_representation (classic or partial-mask output)
+  row_filtered,  ///< whole conjunction applied ⇒ row_filtered_gpu_table_representation
+  rule2_bailed,  ///< RULE-2 selectivity bail ⇒ rule2_bailed_gpu_table_representation,
+                 ///< letting the scan latch and strip the pushdown for later batches
+};
+
 // Attempt the fused scan-filter decompress (SIRIUS_EXP_FUSED_SCAN_FILTER):
 // wave-1 K1 masks on the range columns, wave-2 decode against the combined
 // mask, output assembled to one uniformly survivor-sized table. Returns
 // nullptr when the attempt is declined here (directives not buildable for this
 // chunk) or the assembly refuses (null-masked column, iteration-1 guard) — the
-// caller then runs the classic path. `row_filtered` reports whether the fused
-// pipeline actually applied the whole conjunction; false with a non-null
-// return means the orchestrator fell back internally and the table is the
-// classic full-width decode, usable as-is.
+// caller then runs the classic path. `tag` reports how to wrap a non-null
+// return; `none` with a non-null return means the orchestrator fell back
+// internally (refused/failed) and the table is the classic full-width decode,
+// usable as-is.
 std::unique_ptr<cudf::table> try_decompress_scan_filter(
   simpatico::compressed_table const& ct,
   std::span<const std::size_t> selected,
@@ -233,7 +242,7 @@ std::unique_ptr<cudf::table> try_decompress_scan_filter(
   simpatico::stream_pool& pool,
   rmm::cuda_stream_view stream,
   rmm::device_async_resource_ref mr,
-  bool& row_filtered)
+  fused_batch_tag& tag)
 {
   auto const directives =
     build_fused_scan_directives(ct, selected, attached_ranges, all_conjuncts_convertible);
@@ -272,23 +281,30 @@ std::unique_ptr<cudf::table> try_decompress_scan_filter(
                     error);
     return nullptr;
   }
-  // Tag only when the mask carried EVERY restricting conjunct: a partial mask
-  // must leave the batch untagged so post_filter_and_project evaluates the
-  // residual (re-checking already-applied conjuncts on the compacted rows is
-  // idempotent). applied=false means decompress_scan_filter itself declined
-  // (env gate off, precondition-reject, RULE 1/2, or an internal fallback)
-  // and returned the classic full-width decode.
-  row_filtered = result.applied && directives.covers_whole_filter;
+  // row_filtered only when the mask carried EVERY restricting conjunct: a
+  // partial mask must leave the batch untagged so post_filter_and_project
+  // evaluates the residual (re-checking already-applied conjuncts on the
+  // compacted rows is idempotent). A RULE-2 bail gets its own tag class —
+  // classic full-width columns inside, but the scan latches on the type and
+  // strips the range pushdown from the operator's remaining batches (bail
+  // memoization: per-batch selectivity is uniform across a scan's batches).
+  // refused/failed stay plain.
+  if (result.status == sirius::codegen::scan_filter_status::bailed_high_selectivity) {
+    tag = fused_batch_tag::rule2_bailed;
+  } else if (result.applied && directives.covers_whole_filter) {
+    tag = fused_batch_tag::row_filtered;
+  }
   SIRIUS_FUSED_DIAG(
-    "[fused-diag] decompress_scan_filter {}: filters={} survivors={}/{} column(s)={} "
-    "covers_whole_filter={} row_filtered_tag={}",
-    result.applied ? "APPLIED" : "NOT applied (W4 declined internally — classic output)",
+    "[fused-diag] decompress_scan_filter {} (status={}): filters={} survivors={}/{} "
+    "column(s)={} covers_whole_filter={} tag={}",
+    result.applied ? "APPLIED" : "NOT applied (classic output)",
+    static_cast<int>(result.status),
     request.filters.size(),
     result.survivor_count,
     result.num_rows,
     table->num_columns(),
     directives.covers_whole_filter,
-    row_filtered);
+    static_cast<int>(tag));
   return table;
 }
 
@@ -338,7 +354,7 @@ std::unique_ptr<cucascade::idata_representation> reconstruct_and_decompress_to_g
   auto const predicates =
     to_decode_predicates(equality_pushdown, static_cast<std::size_t>(subset.num_columns()));
   std::unique_ptr<cudf::table> decompressed;
-  bool decode_row_filtered = false;
+  fused_batch_tag tag = fused_batch_tag::none;
   // Fused scan-filter attempt — same contract as the device converter: only
   // without string-equality predicates, decline ⇒ classic path below.
   SIRIUS_FUSED_DIAG(
@@ -359,7 +375,7 @@ std::unique_ptr<cucascade::idata_representation> reconstruct_and_decompress_to_g
                                               pool,
                                               stream,
                                               mr,
-                                              decode_row_filtered);
+                                              tag);
   }
   if (!decompressed) {
     if (predicates.empty()) {
@@ -384,10 +400,16 @@ std::unique_ptr<cucascade::idata_representation> reconstruct_and_decompress_to_g
                    decompressed->num_rows(),
                    space->get_device_id());
 
-  // Tagged subclass ⇔ the fused pipeline applied the whole conjunction (see
-  // row_filtered_table_representation.hpp).
-  if (decode_row_filtered) {
+  // Tagged subclasses (see row_filtered_table_representation.hpp):
+  // row_filtered ⇔ the fused pipeline applied the whole conjunction;
+  // rule2_bailed ⇔ RULE-2 selectivity bail (classic columns inside — the scan
+  // latches on the type and strips the pushdown for its remaining batches).
+  if (tag == fused_batch_tag::row_filtered) {
     return std::make_unique<row_filtered_gpu_table_representation>(
+      std::move(decompressed), *const_cast<cucascade::memory::memory_space*>(space), stream);
+  }
+  if (tag == fused_batch_tag::rule2_bailed) {
+    return std::make_unique<rule2_bailed_gpu_table_representation>(
       std::move(decompressed), *const_cast<cucascade::memory::memory_space*>(space), stream);
   }
   return std::make_unique<cucascade::gpu_table_representation>(
@@ -445,7 +467,7 @@ std::unique_ptr<cucascade::idata_representation> decompress_device_to_gpu(
   auto const predicates = to_decode_predicates(rep.equality_pushdown(), n_selected);
 
   std::unique_ptr<cudf::table> decompressed;
-  bool decode_row_filtered = false;
+  fused_batch_tag tag = fused_batch_tag::none;
   // Fused scan-filter attempt (SIRIUS_EXP_FUSED_SCAN_FILTER; the env gate and
   // every per-plan precondition are re-checked inside decompress_scan_filter).
   // Not composable with string-equality predicates (iteration 1) — those scans
@@ -474,7 +496,7 @@ std::unique_ptr<cucascade::idata_representation> decompress_device_to_gpu(
                                               pool,
                                               stream,
                                               mr,
-                                              decode_row_filtered);
+                                              tag);
   }
   if (!decompressed) {
     if (predicates.empty()) {
@@ -501,11 +523,17 @@ std::unique_ptr<cucascade::idata_representation> decompress_device_to_gpu(
                    decompressed->num_rows(),
                    space->get_device_id());
 
-  // The tagged subclass is the scan's hard promise that the WHOLE table-filter
-  // conjunction was applied during decode (see row_filtered_table_representation.hpp);
-  // it is only constructed when the fused pipeline reported applied=true.
-  if (decode_row_filtered) {
+  // Tagged subclasses (see row_filtered_table_representation.hpp):
+  // row_filtered is the scan's hard promise that the WHOLE table-filter
+  // conjunction was applied during decode; rule2_bailed carries classic
+  // full-width columns but lets the scan latch the per-operator bail flag and
+  // strip the range pushdown from its remaining batches.
+  if (tag == fused_batch_tag::row_filtered) {
     return std::make_unique<row_filtered_gpu_table_representation>(
+      std::move(decompressed), *const_cast<cucascade::memory::memory_space*>(space), stream);
+  }
+  if (tag == fused_batch_tag::rule2_bailed) {
+    return std::make_unique<rule2_bailed_gpu_table_representation>(
       std::move(decompressed), *const_cast<cucascade::memory::memory_space*>(space), stream);
   }
   return std::make_unique<cucascade::gpu_table_representation>(

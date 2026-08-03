@@ -450,6 +450,27 @@ unlocking q5/q3/q10/q12 payloads; (3) low-sel tier-B re-admission (q19: 3 tier-A
 re-gathered col at sel .044); (4) K4 index-list variant below the 15% crossover;
 (5) `bp_offsets` transient reuse across K1+K3 on the filter column.
 
+### Iteration 3 results (2026-08-03, commit 56b0fe31): **suite 7.600 s, −7.3%, 22/22**
+
+Items (1) and (2) shipped. **q1 −38.3%** (0.756→0.467; survivors 52.63% exactly as
+predicted; dict-K5 general route + row_filtered tag) — the microbench's
+"dict fusion wins at any selectivity" claim transferred. q5 −3.2% (delta tier flipped
+its +6.2%), q10 −2.4%, q12 +0.6% (RULE-1 refusal is free). Suite gate-on **7.600 s,
+22/22 byte-identical = −7.3% vs same-binary gate-off, −7.1% vs the 8.180 baseline** —
+above the top of the pre-registered −3..−6% band. Campaign total 15.99 → 7.60 = −52.5%.
+
+Debugging cost two blind cycles: a stale mid-edit binary (dict tier refused before the
+classifier landed) and DEBUG-invisible logs. Fixed structurally: `SIRIUS_EXP_FUSED_SCAN_DIAG`
+env-gated tracing + tag-vs-classifier cross-checks + single-ground-truth probes. Three
+seam bugs were caught by the team's own review passes before they could bite (mask word
+sizing ceil(n/32)→ChunksFor·32, a TierB gather race, a tier-collapsing adapter).
+
+Known remainder: q3 +4.4% — RULE-2 bail insurance paid per batch (~36×) at sel .535;
+fix in flight = bail memoization (selectivity is uniform across batches, zone-map study;
+first bail disables fused for the scan's remaining batches). Then: q19-class low-sel
+tier-B re-admission, K4 below the 15% crossover, `bp_offsets` reuse, K1_fc for projected
+filter columns (q7/q3 economics).
+
 ---
 
 ## On this machine (pmgb300ws-0163) — concrete paths
