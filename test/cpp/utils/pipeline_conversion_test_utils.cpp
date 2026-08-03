@@ -248,6 +248,7 @@ void with_initialized_streaming_fragment(
   duckdb::Connection& con,
   const std::string& query,
   std::vector<std::shared_ptr<cucascade::shared_data_repository>> output_repos,
+  std::optional<op::partition_spec> spec,
   const std::function<void(sirius_engine&, op::sirius_physical_streaming_sink&)>& consume)
 {
   auto& context = *con.context;
@@ -258,11 +259,13 @@ void with_initialized_streaming_fragment(
       "with_initialized_streaming_fragment: Sirius is not registered on this connection");
   }
 
-  // This shape roots the plan in a single-destination sink: no repository would index an empty
-  // vector below, and extra ones would be silently dropped rather than wired to anything.
-  if (output_repos.size() != 1) {
+  // Without a partition spec the plan is rooted in a single-destination sink: no repository would
+  // index an empty vector below, and extra ones would be silently dropped rather than wired to
+  // anything. With a spec, every repository becomes a destination.
+  if (output_repos.empty() || (!spec.has_value() && output_repos.size() != 1)) {
     throw sirius::invalid_input_exception(
-      "with_initialized_streaming_fragment: expected exactly 1 output repository, got " +
+      "with_initialized_streaming_fragment: expected " +
+      std::string(spec.has_value() ? "at least 1" : "exactly 1") + " output repository, got " +
       std::to_string(output_repos.size()));
   }
 
@@ -288,8 +291,14 @@ void with_initialized_streaming_fragment(
     // subtree as children[0] is what keeps that special-casing unnecessary.
     auto types       = sirius_plan->types;
     auto cardinality = sirius_plan->estimated_cardinality;
-    auto sink        = duckdb::make_uniq<op::sirius_physical_streaming_sink>(
-      std::move(types), cardinality, output_repos[0]);
+    duckdb::unique_ptr<op::sirius_physical_streaming_sink> sink;
+    if (spec.has_value()) {
+      sink = duckdb::make_uniq<op::sirius_physical_streaming_sink>(
+        std::move(types), cardinality, std::move(output_repos), std::move(*spec));
+    } else {
+      sink = duckdb::make_uniq<op::sirius_physical_streaming_sink>(
+        std::move(types), cardinality, output_repos[0]);
+    }
     sink->children.push_back(std::move(sirius_plan));
 
     sirius_interface iface(context);

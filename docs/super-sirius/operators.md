@@ -131,9 +131,15 @@ Key design facts:
   upgrade. A queued batch stays spillable in the repository until pulled.
 - **execute() is a pass-through** (same shape as `RESULT_COLLECTOR`): it hands the batches back so
   `publish_output()` can deliver them to `sink()`. The base implementation drops them.
-- **`no_history_peak_memory_estimate()` is 0.** The push allocates nothing on top of the input the
-  task already materialized, which is what this cold-start estimate measures; the caller maxes it
-  across the pipeline's operators, so anything higher would inflate the reservation.
+- **Partitioned variant (N destinations).** The second constructor takes N repositories and a
+  `partition_spec` (key columns + optional casts, validated at construction: one cast per key or
+  none, every key column inside the input schema). `sink()` GPU-hash-partitions each input batch
+  and routes slice *i* into `_outputs[i]`, skipping empty slices. Each destination has its own
+  `exec::batch_stream` and EOS reaches all of them on a single `on_finalize_operator()` call.
+  When N = 1 the spec is ignored and a native push bypasses partitioning entirely.
+  `no_history_peak_memory_estimate()` stays 0 for N = 1 and becomes 2× the input above it:
+  `hash_partition()` holds a full reordered copy of the table and the per-partition copies at the
+  same time, the same shape `PARTITION` reports.
 
 ### `sirius_physical_dummy_scan` — `DUMMY_SCAN`
 **File:** `src/include/op/sirius_physical_dummy_scan.hpp`
