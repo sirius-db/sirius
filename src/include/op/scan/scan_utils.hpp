@@ -113,12 +113,16 @@ std::unordered_map<std::size_t, std::vector<std::string>> extract_string_equalit
  */
 struct numeric_range_extraction {
   /// Inclusive [lo,hi] per filtered column, keyed by column primary index.
+  /// Always a sound conjunctive over-approximation of that column's filter:
+  /// every row the range rejects is a row the full filter rejects.
   std::unordered_map<std::size_t, sirius::codegen::range_predicate> ranges;
   /// True iff EVERY row-restricting filter in the set was converted into
-  /// @c ranges. This is the iteration-1 gate for decode-side compaction: rows
-  /// may only be dropped during decompression when the extracted ranges are
-  /// the *whole* filter. When false, @c ranges is left empty — one unsupported
-  /// conjunct sends the entire scan down today's decode-then-filter path.
+  /// @c ranges. When true and the decode mask applies them all, the scan may
+  /// skip its post-decompress filter (batch tagged row-filtered). When false,
+  /// @c ranges may still be non-empty (iteration 3, mixed-mask): they are
+  /// usable as a PARTIAL decode mask — rows dropped by it are sound because
+  /// mask conjuncts are conjunctive — but the post-decompress filter MUST
+  /// still run to evaluate the residual conjuncts.
   bool all_conjuncts_convertible = false;
 };
 
@@ -136,8 +140,10 @@ struct numeric_range_extraction {
  * scan's post-decompress path — @ref convert_table_filters_to_expression drops
  * them — so they are skipped here without blocking the gate; likewise for
  * filters on @p skip_primary_indices (hive partitions, enforced at file-list
- * level). Any other unconvertible filter clears the result and reports
- * @c all_conjuncts_convertible == false.
+ * level). Any other unconvertible conjunct clears only
+ * @c all_conjuncts_convertible; convertible conjuncts elsewhere in the set
+ * (including convertible AND-siblings of an unconvertible one) still yield
+ * ranges, forming a partial mask.
  *
  * The caller must still confirm, per batch, that every filtered column's
  * compression plan can evaluate its range during decode

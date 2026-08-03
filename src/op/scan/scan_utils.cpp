@@ -225,22 +225,31 @@ struct range_accumulator {
   int128 hi = std::numeric_limits<std::int64_t>::max();
 };
 
-/// Fold @p filter into @p acc. False if any node is not an AND-tree of
-/// supported constant comparisons — the caller then refuses the whole scan.
-/// IS_NOT_NULL child conjuncts are absorbed: today's post-decompress filter
-/// (convert_table_filters_to_expression) drops them, so ignoring them here
-/// changes nothing. A nested OPTIONAL_FILTER, by contrast, WOULD be evaluated
-/// by TableFilter::ToExpression on today's path, so it refuses rather than
-/// risk dropping a live conjunct.
+/// Fold @p filter into @p acc, returning true iff at least one bound was
+/// contributed. @p fully_covered is cleared whenever some restricting part of
+/// the filter could NOT be expressed in the range — the resulting range is
+/// then a sound over-approximation (mask conjuncts are conjunctive: skipping
+/// one only under-filters), usable as a PARTIAL decode mask but never as
+/// grounds to skip the post-decompress filter.
+///
+/// IS_NOT_NULL child conjuncts are absorbed without affecting coverage:
+/// today's post-decompress filter (convert_table_filters_to_expression) drops
+/// them, so ignoring them changes nothing. Unconvertible AND children are
+/// skipped (coverage lost, bounds kept). OR/IN and other shapes contribute no
+/// bounds at all — decomposing them soundly needs a hull, not an intersection.
 bool fold_numeric_conjunct(duckdb::TableFilter const& filter,
                            sirius::logical_type const& col_type,
-                           range_accumulator& acc)
+                           range_accumulator& acc,
+                           bool& fully_covered)
 {
   switch (filter.filter_type) {
     case duckdb::TableFilterType::CONSTANT_COMPARISON: {
-      auto const& cmp   = filter.Cast<duckdb::ConstantFilter>();
+      auto const& cmp  = filter.Cast<duckdb::ConstantFilter>();
       auto const bound = to_decoded_bound(cmp.constant, col_type);
-      if (!bound.has_value()) { return false; }
+      if (!bound.has_value()) {
+        fully_covered = false;
+        return false;
+      }
       switch (cmp.comparison_type) {
         case duckdb::ExpressionType::COMPARE_EQUAL:
           // Non-integral constant ⇒ ceil > floor ⇒ lo > hi: provably empty.
@@ -259,20 +268,21 @@ bool fold_numeric_conjunct(duckdb::TableFilter const& filter,
         case duckdb::ExpressionType::COMPARE_LESSTHAN:
           acc.hi = std::min(acc.hi, bound->ceil - 1);
           return true;
-        default: return false;  // <>, IS DISTINCT FROM, ... — not a range
+        default:  // <>, IS DISTINCT FROM, ... — not a range
+          fully_covered = false;
+          return false;
       }
     }
     case duckdb::TableFilterType::CONJUNCTION_AND: {
       auto const& conjunction = filter.Cast<duckdb::ConjunctionAndFilter>();
-      bool found              = false;
+      bool any_bound          = false;
       for (auto const& child : conjunction.child_filters) {
         if (child->filter_type == duckdb::TableFilterType::IS_NOT_NULL) { continue; }
-        if (!fold_numeric_conjunct(*child, col_type, acc)) { return false; }
-        found = true;
+        any_bound |= fold_numeric_conjunct(*child, col_type, acc, fully_covered);
       }
-      return found;  // an AND of only IS_NOT_NULLs restricts nothing we can express
+      return any_bound;
     }
-    default: return false;
+    default: fully_covered = false; return false;
   }
 }
 
@@ -329,16 +339,18 @@ numeric_range_extraction extract_numeric_range_pushdown(
   numeric_range_extraction result;
   result.all_conjuncts_convertible = true;
 
-  // One unsupported restricting conjunct disqualifies the whole scan
-  // (iteration 1: rows may only be dropped during decode when the extracted
-  // ranges are the complete filter), so refusal clears everything.
-  auto const refuse = [&result](duckdb::idx_t column_index, char const* why) {
+  // An unsupported restricting conjunct no longer discards the other columns'
+  // ranges (iteration 3, mixed-mask): the extracted ranges remain a sound
+  // conjunctive over-approximation usable as a PARTIAL decode mask. It does
+  // clear the whole-filter flag — the scan must keep its post-decompress
+  // filter, which re-checks masked conjuncts (idempotent) and evaluates the
+  // residual.
+  auto const not_covered = [&result](duckdb::idx_t column_index, char const* why) {
     SIRIUS_LOG_DEBUG(
-      "TABLE_SCAN range pushdown: refused — filter on column_index={} {}; scan keeps the "
-      "post-decompress filter path",
+      "TABLE_SCAN range pushdown: filter on column_index={} {} — residual filter required "
+      "(partial mask only)",
       column_index,
       why);
-    result.ranges.clear();
     result.all_conjuncts_convertible = false;
   };
 
@@ -352,31 +364,33 @@ numeric_range_extraction extract_numeric_range_pushdown(
       continue;
     }
     if (column_index >= column_ids.size()) {
-      refuse(column_index, "references no scan column");
-      return result;
+      not_covered(column_index, "references no scan column");
+      continue;
     }
     auto const& column_id = column_ids[column_index];
     if (!column_id.HasPrimaryIndex() || column_id.IsRowIdColumn() || column_id.IsEmptyColumn() ||
         column_id.IsVirtualColumn()) {
-      refuse(column_index, "targets a rowid/virtual column");
-      return result;
+      not_covered(column_index, "targets a rowid/virtual column");
+      continue;
     }
     auto const primary_idx = static_cast<std::size_t>(column_id.GetPrimaryIndex());
     // Hive-partition filters are enforced at the file-list level and dropped
     // from the post-decompress conjunction, so they don't restrict batch rows.
     if (skip_primary_indices.count(primary_idx)) { continue; }
     if (primary_idx >= returned_types.size()) {
-      refuse(column_index, "has no returned type");
-      return result;
+      not_covered(column_index, "has no returned type");
+      continue;
     }
     auto const& col_type = returned_types[primary_idx];
 
     range_accumulator acc;
-    if (!fold_numeric_conjunct(*filter, col_type, acc)) {
-      refuse(column_index, "is not an AND-tree of numeric constant comparisons");
-      return result;
+    bool fully_covered = true;
+    bool const any_bound = fold_numeric_conjunct(*filter, col_type, acc, fully_covered);
+    if (!fully_covered) {
+      not_covered(column_index, "is not fully an AND-tree of numeric constant comparisons");
     }
-    auto const range = clamp_to_range_predicate(acc);
+    if (!any_bound) { continue; }
+    auto const range    = clamp_to_range_predicate(acc);
     auto [it, inserted] = result.ranges.emplace(primary_idx, range);
     if (!inserted) {  // same physical column filtered twice: intersect
       it->second.lo = std::max(it->second.lo, range.lo);

@@ -72,10 +72,37 @@ struct range_predicate {
 
 // ── Converter-boundary contract (W2 produces, W4 consumes, W3 unpacks) ───────
 
-// Output-column tier for wave 2. tier_a = bitpack K3-capable: decoded straight
-// to a compacted survivor_count-row column. tier_b = full decode as today; the
-// scan side gathers survivors with scan_filter_result::row_indices (W3).
-enum class output_tier : uint8_t { tier_a = 0, tier_b = 1 };
+// Output-column tier for wave 2.
+//   tier_a       — bitpack K3: decoded straight to a compacted
+//                  survivor_count-row column (shipped, iteration 1).
+//   tier_b       — full decode + survivor gather. Measured strictly worse than
+//                  the classic path (q1 +43.5%, q5 +6.2%): RULE 1 refuses any
+//                  batch with a tier_b output.
+//   tier_a_delta — delta->bitpack root masked decode (live: W1 delta variant +
+//                  W3 dispatch; same decode_selection{compact_capable} route
+//                  as tier_a).
+//   tier_dict_k5 — dictionary-string masked decode (live: W3 general route =
+//                  mask->codes K3 + survivor-only key gather, count-first
+//                  strings out; W1 fast path for constant-width identity-
+//                  stored keys). Economics differ from the write-skip tiers:
+//                  the microbench F5 case wins 2.1-2.6x at ALL selectivities
+//                  (it skips the full string materialization round trip), so
+//                  RULE 2's selectivity bail does NOT apply to batches with a
+//                  tier_dict_k5 output.
+// Values 0/1 are stable (shipped); new tiers append.
+enum class output_tier : uint8_t {
+  tier_a       = 0,
+  tier_b       = 1,
+  tier_a_delta = 2,
+  tier_dict_k5 = 3,
+};
+
+// True for tiers wave 2 can decode compacted (RULE 1's admission set).
+constexpr bool tier_is_fused_capable(output_tier t)
+{
+  return t == output_tier::tier_a || t == output_tier::tier_a_delta ||
+         t == output_tier::tier_dict_k5;
+}
 
 // One scan conjunct resolved to a decoded-domain range on a bitpack column.
 struct filter_column_directive {
@@ -83,12 +110,26 @@ struct filter_column_directive {
   range_predicate pred; // inclusive [lo,hi] in the decoded integer domain
 };
 
+// One scan conjunct resolved by the shipped dict-code BOOL8 pushdown (q19-style
+// mixed masks, iteration 3): wave 1 decodes the column's BOOL8 predicate result
+// (decode_predicate path — indices unpack + key LUT, no chars gather), converts
+// it to packed mask words (mask_from_bool8) and ANDs it into the batch mask
+// like any K1 source. Partial-conjunction coverage is the CALLER's contract:
+// when the mask does not cover the whole conjunction, the batch must stay
+// untagged so the residual filter still runs post-decode (W2's design).
+struct bool8_filter_directive {
+  std::size_t column;                   // index into `selected`; dictionary-rooted plan
+  std::vector<std::string> equals_any;  // decode_predicate payload (equality / IN)
+};
+
 // The whole-batch fused request. W2 only builds one when EVERY conjunct on the
-// scanned table is decode-resolvable (iteration 1 rule); W4 re-checks the
-// per-plan preconditions and falls back to the classic path when any fail.
+// scanned table is decode-resolvable (iteration 1 rule; iteration 3 relaxes
+// this to partial coverage via bool8_filters + an untagged batch); W4 re-checks
+// the per-plan preconditions and falls back to the classic path when any fail.
 struct scan_filter_request {
-  std::vector<filter_column_directive> filters;  // empty => classic path
-  std::vector<output_tier> tiers;                // parallel to `selected`
+  std::vector<filter_column_directive> filters;      // range conjuncts (K1 sources)
+  std::vector<bool8_filter_directive> bool8_filters;  // dict-code conjuncts (BOOL8 sources)
+  std::vector<output_tier> tiers;                     // parallel to `selected`
 };
 
 // Per-selected-column directive, the shape W2's converter builder emits (see
@@ -114,12 +155,29 @@ inline scan_filter_request make_scan_filter_request(
   return req;
 }
 
+// Outcome of a decompress_scan_filter call. `bailed_high_selectivity` is the
+// bail-memoization key: per-batch selectivity is uniform across a scan's
+// batches (SF1000 zone-map study: unclustered, <1% variance), so ONE RULE-2
+// bail predicts all remaining batches — the scan side sets a per-operator flag
+// on seeing it and strips the range pushdown from subsequent batches
+// (set_range_pushdown({}, false) before convert), dropping the wave-1+CNT
+// insurance cost from every-batch to once-per-scan. Provider and converter
+// stay stateless.
+enum class scan_filter_status : uint8_t {
+  refused = 0,                  // gate off / no directives / precondition / RULE-1
+                                // (no device work was done)
+  applied = 1,                  // fused pipeline produced the batch
+  bailed_high_selectivity = 2,  // RULE-2 post-CNT bail (wave-1 cost paid, classic output)
+  failed = 3,                   // mid-flight failure; classic output (exceptional)
+};
+
 // Selection data surviving the converter call, owned by the batch (freed with
 // it). Buffers are stream-ordered RMM allocations; call set_stream() when
 // rebinding the batch to the pipeline stream (same discipline as
 // rebind_column_stream in compression_converters.cpp).
 struct scan_filter_result {
   bool applied = false;      // false => output is the classic full-width decode
+  scan_filter_status status = scan_filter_status::refused;  // always applied ⇔ status==applied
   int64_t num_rows = 0;      // pre-filter batch rows
   int64_t survivor_count = -1;
   std::vector<output_tier> tiers;    // EFFECTIVE per-output tier (W4 may demote
@@ -173,5 +231,15 @@ int64_t run_selection_cnt(selection_mask& mask,
 void mask_to_row_indices(selection_mask const& mask,
                          int32_t* out_indices,
                          rmm::cuda_stream_view stream);
+
+// BOOL8 -> packed mask adapter (mixed-mask combine, iteration 3): flags is a
+// BOOL8/uint8 device array of num_rows (nonzero = survivor, no null mask);
+// writes the FULL WordsFor(num_rows) padded strip into mask_words (rows beyond
+// num_rows ballot to 0, preserving the tail-zero invariant). The result is a
+// normal AND-combine source.
+void mask_from_bool8(uint8_t const* flags,
+                     int64_t num_rows,
+                     uint32_t* mask_words,
+                     rmm::cuda_stream_view stream);
 
 }  // namespace sirius::codegen

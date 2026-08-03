@@ -139,6 +139,25 @@ __global__ void mask_to_indices_kernel(uint32_t const* __restrict__ words,
   }
 }
 
+// BOOL8 flags -> packed mask words. One warp per word: lane l tests row
+// w*32+l, ballot packs the word, lane 0 stores it. Grid-stride over the FULL
+// padded strip; rows beyond num_rows ballot to 0 (tail-zero invariant).
+__global__ void mask_from_bool8_kernel(uint8_t const* __restrict__ flags,
+                                       int64_t num_rows,
+                                       int64_t num_words,
+                                       uint32_t* __restrict__ words)
+{
+  int const lane = threadIdx.x & 31;
+  int64_t const warps_per_grid = (static_cast<int64_t>(gridDim.x) * blockDim.x) >> 5;
+  int64_t w = (static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x) >> 5;
+  for (; w < num_words; w += warps_per_grid) {
+    int64_t const r = w * 32 + lane;
+    bool const p   = (r < num_rows) && (flags[r] != 0);
+    uint32_t const b = __ballot_sync(kFullWarp, p);
+    if (lane == 0) words[w] = b;
+  }
+}
+
 }  // namespace
 
 void combine_masks_and(uint32_t* dst_words,
@@ -212,6 +231,20 @@ int64_t run_selection_cnt(selection_mask& mask,
 
   mask.survivor_count = static_cast<int64_t>(total);
   return mask.survivor_count;
+}
+
+void mask_from_bool8(uint8_t const* flags,
+                     int64_t num_rows,
+                     uint32_t* mask_words,
+                     rmm::cuda_stream_view stream)
+{
+  if (flags == nullptr || mask_words == nullptr || num_rows <= 0)
+    throw std::runtime_error("selection_wave: mask_from_bool8 on unbound buffers");
+  int64_t const num_words   = selection_mask::WordsFor(num_rows);
+  int const warps_per_block = kBlock / 32;
+  mask_from_bool8_kernel<<<grid_for(num_words, warps_per_block), kBlock, 0, stream.value()>>>(
+    flags, num_rows, num_words, mask_words);
+  throw_on_cuda(cudaPeekAtLastError(), "mask_from_bool8 launch");
 }
 
 void mask_to_row_indices(selection_mask const& mask,

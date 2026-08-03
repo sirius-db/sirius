@@ -51,11 +51,22 @@ void register_compression_converters(cucascade::representation_converter_registr
 // to a projected compressed representation without including this interface.
 // The env gate is read by the orchestrator, not here.
 
-/// Wave-2 output tier for one selected column.
+/// Wave-2 output tier for one selected column: the plan-shape TAXONOMY, not a
+/// capability claim. Whether a tier can actually decode compacted on this
+/// build is answered by @c simpatico::plan_supports_selection_decode — the
+/// probe lives next to the decode implementation, so new masked variants
+/// (W1's delta mask-consume, K5 dict gather) light their tiers up the moment
+/// they land, with no constant here to go stale.
 enum class decode_output_tier : std::uint8_t {
-  /// Bitpack-leaf plan: decode consumes the selection mask and writes
-  /// compacted output directly (K3, survivor-count-first allocation).
+  /// Plain bitpack leaf: K3 mask-consume writes compacted output directly
+  /// (survivor-count-first allocation).
   tier_a,
+  /// `input -> delta -> differences -> bitpack` (e.g. l_orderkey): compacted
+  /// decode via the delta mask-consume variant once available.
+  tier_a_delta,
+  /// Dictionary-rooted string plan (`dictionary -> ... indices -> bitpack`):
+  /// compacted decode via the K5 masked key gather once available.
+  tier_dict_k5,
   /// Everything else: full-width decode as today, survivors gathered
   /// afterwards with mask-derived indices (scan side).
   tier_b,
@@ -63,16 +74,27 @@ enum class decode_output_tier : std::uint8_t {
 
 /// The per-batch directive package for the wave orchestrator.
 ///
-/// @c enabled is the iteration-1 gate: true iff every restricting conjunct of
-/// the scan resolves during decode ON THIS CHUNK — the extraction converted the
-/// whole filter (@c numeric_range_extraction::all_conjuncts_convertible) AND
-/// every range column's plan here is a bitpack leaf. Only then may decode drop
-/// rows (compacted output, post-decompress filter skipped). When false the
-/// package is empty and the batch takes today's path unchanged.
+/// @c enabled: at least one range conjunct survives as a wave-1 mask source on
+/// this chunk. Iteration 3 relaxes iteration 1's all-or-nothing rule: a
+/// PARTIAL mask (some conjuncts unconvertible or dropped) is still sound —
+/// mask conjuncts are conjunctive, so rows it drops are rows the full filter
+/// would drop — as long as the batch is NOT tagged row-filtered and the scan
+/// re-runs the full filter on the compacted output.
+///
+/// @c covers_whole_filter: the mask carries EVERY restricting conjunct of the
+/// scan's pushed-down filter (extraction converted everything AND nothing was
+/// dropped at directive build). Only then may the converter hand out a
+/// @c row_filtered_gpu_table_representation; a partial mask must leave the
+/// batch untagged so post_filter_and_project evaluates the residual.
 struct fused_scan_directives {
-  bool enabled = false;
+  bool enabled            = false;
+  bool covers_whole_filter = false;
   decode_range_pushdown ranges;                  ///< parallel to selected columns
   std::vector<decode_output_tier> output_tiers;  ///< parallel to selected columns
+  /// Per selected column: its plan decodes compacted on THIS build
+  /// (simpatico::plan_supports_selection_decode). Parallel to output_tiers;
+  /// tier_b entries are always false.
+  std::vector<std::uint8_t> compact_capable;
 };
 
 /**
@@ -86,11 +108,13 @@ struct fused_scan_directives {
  * @param all_conjuncts_convertible The extraction gate
  *                                  (@c numeric_range_extraction::all_conjuncts_convertible).
  *
- * Returns a disabled (empty) package unless every active range column's plan is
- * a bitpack leaf of a fusable lane type — one non-fusable filter column sends
- * the whole batch down today's path (iteration 1: no mixed-mask combine).
- * Output tiers are tagged for ALL selected columns; a pure-filter column's
- * tier-A output is simply dropped by the scan's projection as usual.
+ * An active range on a column that is not a fusable bitpack leaf is DROPPED
+ * from the mask (sound: the mask under-filters and the residual filter still
+ * runs) and clears @c covers_whole_filter; the package is disabled only when
+ * no mask source survives. Output tiers are tagged for ALL selected columns
+ * (plan-shape taxonomy) with @c compact_capable answering per column whether
+ * this build can decode it compacted; a pure-filter column's compacted output
+ * is simply dropped by the scan's projection as usual.
  *
  * @throws std::runtime_error if @p attached_ranges is wider than
  *         @p selected_columns (a wiring bug, mirroring the equality pushdown).

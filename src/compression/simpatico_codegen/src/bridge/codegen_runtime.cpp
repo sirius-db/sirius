@@ -460,8 +460,10 @@ struct VariantLaunchArgs {
   cdj::DecodeVariant variant = cdj::DecodeVariant::plain;
   std::int64_t pred_lo       = 0;  // mask_out: inclusive range, decoded int domain
   std::int64_t pred_hi       = 0;
-  CUdeviceptr sel_mask       = 0;  // mask_consume: selection-mask words (input)
-  CUdeviceptr chunk_offsets  = 0;  // mask_consume: per-chunk survivor bases
+  CUdeviceptr sel_mask       = 0;  // mask_consume/mask_dict_gather: selection-mask words (input)
+  CUdeviceptr chunk_offsets  = 0;  // mask_consume/mask_dict_gather: per-chunk survivor bases
+  CUdeviceptr keys_chars     = 0;  // mask_dict_gather: constant-width key pool chars
+  std::int32_t key_width     = 0;  // mask_dict_gather: bytes per key
 };
 
 // Launch the plain-CUDA rendered decode kernel (symmetric to the
@@ -546,23 +548,30 @@ int run_rendered_decode(const jit::FusedTree& tree,
   CUdeviceptr d_out    = static_cast<CUdeviceptr>(out_ptr);
   std::int64_t total_n = num_rows;
   std::vector<void*> args;
-  args.reserve(dptrs.size() + 4);
+  args.reserve(dptrs.size() + 6);
   for (auto& p : dptrs)
     args.push_back(&p);
   args.push_back(&d_out);
   args.push_back(&total_n);
 
   // Variant trailing kernel parameters (locals outlive the launch below).
-  std::int64_t pred_lo = va.pred_lo;
-  std::int64_t pred_hi = va.pred_hi;
-  CUdeviceptr d_mask   = va.sel_mask;
-  CUdeviceptr d_choffs = va.chunk_offsets;
+  std::int64_t pred_lo   = va.pred_lo;
+  std::int64_t pred_hi   = va.pred_hi;
+  CUdeviceptr d_mask     = va.sel_mask;
+  CUdeviceptr d_choffs   = va.chunk_offsets;
+  CUdeviceptr d_keys     = va.keys_chars;
+  std::int32_t key_width = va.key_width;
   if (va.variant == cdj::DecodeVariant::mask_out) {
     args.push_back(&pred_lo);
     args.push_back(&pred_hi);
   } else if (va.variant == cdj::DecodeVariant::mask_consume) {
     args.push_back(&d_mask);
     args.push_back(&d_choffs);
+  } else if (va.variant == cdj::DecodeVariant::mask_dict_gather) {
+    args.push_back(&d_mask);
+    args.push_back(&d_choffs);
+    args.push_back(&d_keys);
+    args.push_back(&key_width);
   }
 
   if (!maybe_raise_smem(
@@ -768,6 +777,41 @@ bool launch_decode_fused_tree_mask_consume(codegen::jit::FusedTree const& tree,
   va.sel_mask      = reinterpret_cast<CUdeviceptr>(mask.words);
   va.chunk_offsets = reinterpret_cast<CUdeviceptr>(mask.chunk_offsets);
   return launch_decode_fused_tree_impl(tree, labeled, dtype, num_rows, out, stream, va);
+}
+
+// K5: masked constant-width dictionary gather (masked_launch.hpp).
+bool launch_decode_fused_tree_mask_dict_gather(codegen::jit::FusedTree const& tree,
+                                               codegen::jit::LabeledBuffers& labeled,
+                                               char const* dtype,
+                                               std::int64_t num_rows,
+                                               ::sirius::codegen::selection_mask const& mask,
+                                               void const* keys_chars,
+                                               std::int32_t key_width,
+                                               void* out_chars,
+                                               rmm::cuda_stream_view stream)
+{
+  if (mask.words == nullptr || mask.chunk_offsets == nullptr || mask.num_rows != num_rows ||
+      keys_chars == nullptr || key_width < 1 || out_chars == nullptr) {
+    std::fprintf(stderr,
+                 "simpatico::codegen: launch_decode_fused_tree_mask_dict_gather: incomplete "
+                 "inputs (words=%p chunk_offsets=%p mask.num_rows=%lld num_rows=%lld keys=%p "
+                 "key_width=%d out=%p) — did the CNT wave run?\n",
+                 static_cast<void*>(mask.words),
+                 static_cast<void*>(mask.chunk_offsets),
+                 static_cast<long long>(mask.num_rows),
+                 static_cast<long long>(num_rows),
+                 keys_chars,
+                 key_width,
+                 out_chars);
+    return false;
+  }
+  VariantLaunchArgs va;
+  va.variant       = cdj::DecodeVariant::mask_dict_gather;
+  va.sel_mask      = reinterpret_cast<CUdeviceptr>(mask.words);
+  va.chunk_offsets = reinterpret_cast<CUdeviceptr>(mask.chunk_offsets);
+  va.keys_chars    = reinterpret_cast<CUdeviceptr>(const_cast<void*>(keys_chars));
+  va.key_width     = key_width;
+  return launch_decode_fused_tree_impl(tree, labeled, dtype, num_rows, out_chars, stream, va);
 }
 
 }  // namespace simpatico

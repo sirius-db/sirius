@@ -62,4 +62,34 @@ class row_filtered_gpu_table_representation final
   }
 };
 
+/**
+ * @brief Classic full-width decode whose fused scan-filter attempt BAILED on
+ *        RULE 2 (post-CNT survivors above SIRIUS_EXP_FUSED_SCAN_MAX_SEL).
+ *
+ * Constructed by the compression converters instead of the plain
+ * gpu_table_representation when decompress_scan_filter reports
+ * scan_filter_status::bailed_high_selectivity. The table content is exactly
+ * the classic decode (NOT row-filtered — post_filter_and_project must still
+ * run); the tag only carries the bail signal so the scan can memoize it:
+ * per-batch selectivity is uniform across a scan's batches (unclustered
+ * chunks), so one bail predicts all remaining batches. On seeing this type,
+ * scan_operator_input::prepare_for_processing latches the operator-shared
+ * bail flag; later splits of the same scan then strip the attached range
+ * pushdown before conversion, skipping the wave-1 + CNT insurance cost. The
+ * flag is per-operator: another query's scan of the same pinned entry
+ * decides fresh.
+ *
+ * Same clone()/lifetime notes as the row-filtered tag above.
+ */
+class rule2_bailed_gpu_table_representation final
+  : public ::cucascade::gpu_table_representation {
+ public:
+  rule2_bailed_gpu_table_representation(std::unique_ptr<cudf::table> table,
+                                        ::cucascade::memory::memory_space& memory_space,
+                                        rmm::cuda_stream_view writer_stream)
+    : ::cucascade::gpu_table_representation(std::move(table), memory_space, writer_stream)
+  {
+  }
+};
+
 }  // namespace sirius

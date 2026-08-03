@@ -117,15 +117,16 @@ std::vector<std::uint32_t> host_mask(const std::vector<Element>& data,
   return m;
 }
 
-// Replace the OverAllocate ``packed`` channel with the dense Compact layout
-// (chunk c's live words at the exclusive scan of ceil(count*bits/32), plus 3
-// zeroed guard words) so the production launchers' synthesized bp_offsets
-// match the buffer. Mirrors compact_bitpack_packed's layout on host.
-bool compact_packed_on_host(GpuEncoded& enc, std::int64_t nc)
+// Replace the OverAllocate ``packed`` channel of bitpack node ``node_id``
+// with the dense Compact layout (chunk c's live words at the exclusive scan
+// of ceil(count*bits/32), plus 3 zeroed guard words) so the production
+// launchers' synthesized bp_offsets match the buffer. Mirrors
+// compact_bitpack_packed's layout on host.
+bool compact_packed_on_host(GpuEncoded& enc, std::int64_t nc, std::int32_t node_id = 0)
 {
-  const auto key_packed = jit::buffer_key(0, "packed");
+  const auto key_packed = jit::buffer_key(node_id, "packed");
   auto it               = enc.buffers.find(key_packed);
-  REQUIRE_MSG(it != enc.buffers.end(), "missing 0.packed");
+  REQUIRE_MSG(it != enc.buffers.end(), "missing %d.packed", node_id);
   const std::size_t total_words = it->second.length;
   const std::size_t stride      = total_words / static_cast<std::size_t>(nc);
 
@@ -135,11 +136,11 @@ bool compact_packed_on_host(GpuEncoded& enc, std::int64_t nc)
   if (cudaMemcpy(over.data(), it->second.ptr, total_words * 4, cudaMemcpyDeviceToHost) !=
         cudaSuccess ||
       cudaMemcpy(bits.data(),
-                 device_ptr<std::uint8_t>(enc, 0, "chunk_bits"),
+                 device_ptr<std::uint8_t>(enc, node_id, "chunk_bits"),
                  bits.size(),
                  cudaMemcpyDeviceToHost) != cudaSuccess ||
       cudaMemcpy(count.data(),
-                 device_ptr<std::int32_t>(enc, 0, "chunk_count"),
+                 device_ptr<std::int32_t>(enc, node_id, "chunk_count"),
                  count.size() * 4,
                  cudaMemcpyDeviceToHost) != cudaSuccess) {
     REQUIRE_MSG(false, "compact_packed_on_host: D2H failed");
@@ -162,6 +163,43 @@ bool compact_packed_on_host(GpuEncoded& enc, std::int64_t nc)
   enc.buffers[key_packed] =
     jit::LabeledBuffer{reinterpret_cast<const void*>(d), dense.size(), sizeof(std::uint32_t)};
   return true;
+}
+
+// Arbitrary host-side selection mask (the consuming variants accept ANY mask,
+// e.g. one ANDed together from other columns' K1 outputs): ~keep_pct% bits
+// set, chunk ``zero_chunk`` fully cleared (K3/K5 early-return path), tail
+// bits/words beyond n zero (contract).
+std::vector<std::uint32_t> make_host_mask(std::int64_t n,
+                                          std::int64_t nc,
+                                          unsigned seed,
+                                          unsigned keep_pct,
+                                          std::int64_t zero_chunk)
+{
+  std::vector<std::uint32_t> m(static_cast<std::size_t>(nc) * kWordsPerChunk, 0u);
+  for (std::int64_t r = 0; r < n; ++r) {
+    if (r / kChunk == zero_chunk) continue;
+    std::uint64_t s = seed ^ (0x9E3779B97F4A7C15ull * static_cast<std::uint64_t>(r + 1));
+    if (splitmix64(s) % 100ull < keep_pct)
+      m[static_cast<std::size_t>(r) / 32] |= (1u << (r % 32));
+  }
+  return m;
+}
+
+// Exclusive per-chunk survivor prefix (host CNT-equivalent). Returns total.
+std::int64_t host_cnt(const std::vector<std::uint32_t>& mask,
+                      std::int64_t nc,
+                      std::vector<std::uint32_t>& chunk_offsets)
+{
+  chunk_offsets.assign(static_cast<std::size_t>(nc) + 1, 0u);
+  std::uint32_t acc = 0;
+  for (std::int64_t c = 0; c < nc; ++c) {
+    chunk_offsets[static_cast<std::size_t>(c)] = acc;
+    for (int w = 0; w < kWordsPerChunk; ++w)
+      acc += static_cast<std::uint32_t>(
+        __builtin_popcount(mask[static_cast<std::size_t>(c) * kWordsPerChunk + w]));
+  }
+  chunk_offsets[static_cast<std::size_t>(nc)] = acc;
+  return acc;
 }
 
 template <typename Element>
@@ -290,6 +328,175 @@ bool run_roundtrip(const std::string& dtype, std::int64_t base, std::int64_t ran
   return true;
 }
 
+// K3-delta: masked compacting decode of a delta->bitpack column
+// (o_orderkey shape).  The mask is host-generated (arbitrary — in
+// production it comes from other columns' K1 wave), CNT-equivalent on
+// host, then mask_consume must equal plain decode + host filter.
+template <typename Element>
+bool run_delta_masked(const std::string& dtype, int arch)
+{
+  const std::int64_t n  = 5 * kChunk + 700;
+  const std::int64_t nc = codegen::num_chunks_for(n);
+  const rmm::cuda_stream_view stream{};
+
+  // Orderkey-like: monotone with small steps (delta diffs bitpack tightly).
+  std::vector<Element> data(static_cast<std::size_t>(n));
+  std::int64_t v = 1000;
+  for (std::int64_t i = 0; i < n; ++i) {
+    std::uint64_t s = 0xBADD1Eull ^ (0xD1B54A32D192ED03ull * static_cast<std::uint64_t>(i + 1));
+    v += static_cast<std::int64_t>(splitmix64(s) % 16ull);
+    data[static_cast<std::size_t>(i)] = static_cast<Element>(v);
+  }
+
+  auto tree = jit::FusedTree::make(
+    OpKind::Delta, {{"differences", jit::FusedTree::make(OpKind::Bitpack)}});
+
+  GpuEncoded enc = codegen_test::gpu_encode_tree<Element>(*tree, dtype, data.data(), n, arch);
+  // Delta root = node 0, bitpack differences child = node 1.
+  if (!compact_packed_on_host(enc, nc, /*node_id=*/1)) return false;
+
+  CUdeviceptr d_plain = enc.alloc(static_cast<std::size_t>(n) * sizeof(Element));
+  REQUIRE_MSG(simpatico::launch_decode_fused_tree(
+                *tree, enc.buffers, dtype.c_str(), n, reinterpret_cast<void*>(d_plain), stream),
+              "[delta/%s] plain launch failed",
+              dtype.c_str());
+  std::vector<Element> plain(static_cast<std::size_t>(n));
+  cudaMemcpy(plain.data(),
+             reinterpret_cast<const void*>(d_plain),
+             plain.size() * sizeof(Element),
+             cudaMemcpyDeviceToHost);
+  REQUIRE_MSG(plain == data, "[delta/%s] plain decode != original input", dtype.c_str());
+
+  const std::vector<std::uint32_t> mask = make_host_mask(n, nc, 0x5EED, 37, /*zero_chunk=*/1);
+  std::vector<std::uint32_t> chunk_offsets;
+  const std::int64_t survivors = host_cnt(mask, nc, chunk_offsets);
+
+  selection_mask sm;
+  sm.words = reinterpret_cast<std::uint32_t*>(
+    enc.upload_bytes(mask.data(), mask.size() * 4));
+  sm.num_rows       = n;
+  sm.chunk_offsets  = reinterpret_cast<std::uint32_t*>(
+    enc.upload_bytes(chunk_offsets.data(), chunk_offsets.size() * 4));
+  sm.survivor_count = survivors;
+
+  CUdeviceptr d_out =
+    enc.alloc(static_cast<std::size_t>(survivors > 0 ? survivors : 1) * sizeof(Element));
+  REQUIRE_MSG(simpatico::launch_decode_fused_tree_mask_consume(
+                *tree, enc.buffers, dtype.c_str(), n, sm, reinterpret_cast<void*>(d_out), stream),
+              "[delta/%s] mask_consume launch failed",
+              dtype.c_str());
+
+  std::vector<Element> expect;
+  expect.reserve(static_cast<std::size_t>(survivors));
+  for (std::int64_t r = 0; r < n; ++r)
+    if ((mask[static_cast<std::size_t>(r) / 32] >> (r % 32)) & 1u)
+      expect.push_back(data[static_cast<std::size_t>(r)]);
+
+  std::vector<Element> got(static_cast<std::size_t>(survivors));
+  if (survivors > 0) {
+    cudaMemcpy(got.data(), reinterpret_cast<const void*>(d_out),
+               got.size() * sizeof(Element), cudaMemcpyDeviceToHost);
+  }
+  REQUIRE_MSG(got == expect,
+              "[delta/%s] K3-delta compacted output != plain decode + host filter (%lld "
+              "survivors)",
+              dtype.c_str(),
+              static_cast<long long>(survivors));
+  std::printf("PASS: delta/%s (survivors=%lld of %lld)\n",
+              dtype.c_str(),
+              static_cast<long long>(survivors),
+              static_cast<long long>(n));
+  return true;
+}
+
+// K5: masked constant-width dictionary gather.  Codes are bitpacked int32
+// (q1's l_returnflag/l_linestatus are width-1, 2-3 keys); the kernel must
+// copy exactly the survivors' key bytes, compacted, in row order.
+bool run_dict_gather(std::int32_t key_width, int arch)
+{
+  const std::int64_t n  = 3 * kChunk + 511;
+  const std::int64_t nc = codegen::num_chunks_for(n);
+  const std::int32_t num_keys = 3;
+  const rmm::cuda_stream_view stream{};
+
+  std::vector<std::int32_t> codes(static_cast<std::size_t>(n));
+  for (std::int64_t i = 0; i < n; ++i) {
+    std::uint64_t s = 0xD1C7ull ^ (0x9E3779B97F4A7C15ull * static_cast<std::uint64_t>(i + 1));
+    // Chunk 1 constant (bits==0 short-circuit on the code leaf).
+    codes[static_cast<std::size_t>(i)] =
+      (i / kChunk == 1) ? 2 : static_cast<std::int32_t>(splitmix64(s) % num_keys);
+  }
+
+  auto tree      = jit::FusedTree::make(OpKind::Bitpack);
+  GpuEncoded enc = codegen_test::gpu_encode_tree<std::int32_t>(
+    *tree, "int32_t", codes.data(), n, arch);
+  if (!compact_packed_on_host(enc, nc)) return false;
+
+  // Key pool: key k = key_width copies of ('A' + k), so any wrong
+  // code/rank/width shows up as a byte mismatch.
+  std::vector<char> keys(static_cast<std::size_t>(num_keys) * key_width);
+  for (std::int32_t k = 0; k < num_keys; ++k)
+    for (std::int32_t b = 0; b < key_width; ++b)
+      keys[static_cast<std::size_t>(k) * key_width + b] = static_cast<char>('A' + k);
+  CUdeviceptr d_keys = enc.upload_bytes(keys.data(), keys.size());
+
+  const std::vector<std::uint32_t> mask = make_host_mask(n, nc, 0xD1C7, 42, /*zero_chunk=*/2);
+  std::vector<std::uint32_t> chunk_offsets;
+  const std::int64_t survivors = host_cnt(mask, nc, chunk_offsets);
+
+  selection_mask sm;
+  sm.words          = reinterpret_cast<std::uint32_t*>(
+    enc.upload_bytes(mask.data(), mask.size() * 4));
+  sm.num_rows       = n;
+  sm.chunk_offsets  = reinterpret_cast<std::uint32_t*>(
+    enc.upload_bytes(chunk_offsets.data(), chunk_offsets.size() * 4));
+  sm.survivor_count = survivors;
+
+  const std::size_t out_bytes =
+    static_cast<std::size_t>(survivors > 0 ? survivors : 1) * key_width;
+  CUdeviceptr d_out = enc.alloc(out_bytes);
+  cudaMemset(reinterpret_cast<void*>(d_out), 0xEE, out_bytes);
+
+  REQUIRE_MSG(simpatico::launch_decode_fused_tree_mask_dict_gather(
+                *tree,
+                enc.buffers,
+                "int32_t",
+                n,
+                sm,
+                reinterpret_cast<const void*>(d_keys),
+                key_width,
+                reinterpret_cast<void*>(d_out),
+                stream),
+              "[dict/w%d] mask_dict_gather launch failed",
+              key_width);
+
+  std::vector<char> expect;
+  expect.reserve(static_cast<std::size_t>(survivors) * key_width);
+  for (std::int64_t r = 0; r < n; ++r) {
+    if ((mask[static_cast<std::size_t>(r) / 32] >> (r % 32)) & 1u) {
+      const std::int32_t code = codes[static_cast<std::size_t>(r)];
+      expect.insert(expect.end(),
+                    keys.begin() + static_cast<std::size_t>(code) * key_width,
+                    keys.begin() + static_cast<std::size_t>(code + 1) * key_width);
+    }
+  }
+
+  std::vector<char> got(static_cast<std::size_t>(survivors) * key_width);
+  if (!got.empty()) {
+    cudaMemcpy(got.data(), reinterpret_cast<const void*>(d_out), got.size(),
+               cudaMemcpyDeviceToHost);
+  }
+  REQUIRE_MSG(got == expect,
+              "[dict/w%d] K5 gathered chars != host reference (%lld survivors)",
+              key_width,
+              static_cast<long long>(survivors));
+  std::printf("PASS: dict/w%d (survivors=%lld of %lld)\n",
+              key_width,
+              static_cast<long long>(survivors),
+              static_cast<long long>(n));
+  return true;
+}
+
 // Render-level contract checks (no kernel launches).
 bool render_checks()
 {
@@ -319,7 +526,8 @@ bool render_checks()
                 k1.source.find("pred_hi") != std::string::npos,
               "mask_out source must take pred_lo/pred_hi kernel params");
 
-  // 3. non-Bitpack-leaf roots are rejected for mask variants.
+  // 3. Delta root: mask_out stays rejected (filter columns are bitpack);
+  //    mask_consume renders (K3-delta) with its own symbol + source.
   auto delta = jit::FusedTree::make(
     OpKind::Delta, {{"differences", jit::FusedTree::make(OpKind::Bitpack)}});
   bool rejected = false;
@@ -329,13 +537,34 @@ bool render_checks()
     rejected = true;
   }
   REQUIRE_MSG(rejected, "mask_out on a Delta root must throw RenderError");
+  const cdj::DecodeKernelSpec dplain = cdj::render(*delta, "int64_t", 8);
+  const cdj::DecodeKernelSpec dmask =
+    cdj::render(*delta, "int64_t", 8, cdj::DecodeVariant::mask_consume);
+  REQUIRE_MSG(dmask.entry_symbol == dplain.entry_symbol + "_mask_consume",
+              "K3-delta entry symbol suffix wrong: %s",
+              dmask.entry_symbol.c_str());
+  REQUIRE_MSG(dmask.source != dplain.source && dmask.buffers.size() == dplain.buffers.size(),
+              "K3-delta must differ in source only, not in the channel manifest");
+
+  // 4. K5 dict gather: bitpack code leaf only; distinct symbol; key pool +
+  //    width are kernel params (never literals in the source).
+  const cdj::DecodeKernelSpec k5 = cdj::render(*bp, "int32_t", 8, cdj::DecodeVariant::mask_dict_gather);
+  const cdj::DecodeKernelSpec p32 = cdj::render(*bp, "int32_t", 8);
+  REQUIRE_MSG(k5.entry_symbol == p32.entry_symbol + "_mask_dict",
+              "K5 entry symbol suffix wrong: %s",
+              k5.entry_symbol.c_str());
+  REQUIRE_MSG(k5.source.find("keys_chars") != std::string::npos &&
+                k5.source.find("key_width") != std::string::npos,
+              "K5 source must take keys_chars/key_width kernel params");
+  REQUIRE_MSG(k5.buffers.size() == p32.buffers.size(),
+              "K5 must not change the input-channel manifest");
   rejected = false;
   try {
-    (void)cdj::render(*delta, "int64_t", 8, cdj::DecodeVariant::mask_consume);
+    (void)cdj::render(*delta, "int64_t", 8, cdj::DecodeVariant::mask_dict_gather);
   } catch (const cdj::RenderError&) {
     rejected = true;
   }
-  REQUIRE_MSG(rejected, "mask_consume on a Delta root must throw RenderError");
+  REQUIRE_MSG(rejected, "mask_dict_gather on a Delta root must throw RenderError");
 
   std::printf("PASS: render contract checks\n");
   return true;
@@ -357,6 +586,11 @@ int main()
     // int64 compare path is exercised on genuinely 64-bit decoded values.
     run_roundtrip<std::int32_t>("int32_t", 8035, 2526, arch);
     run_roundtrip<std::int64_t>("int64_t", 3'000'000'000LL, 5052, arch);
+    // Iteration 3: K3-delta (o_orderkey shape) and K5 dict gather (q1 shape).
+    run_delta_masked<std::int64_t>("int64_t", arch);
+    run_delta_masked<std::int32_t>("int32_t", arch);
+    run_dict_gather(/*key_width=*/1, arch);  // l_returnflag / l_linestatus
+    run_dict_gather(/*key_width=*/4, arch);  // constant-width generality
   } catch (const std::exception& e) {
     std::fprintf(stderr, "FAIL: unhandled exception: %s\n", e.what());
     return 1;

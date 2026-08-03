@@ -22,6 +22,7 @@
 #include <op/sirius_physical_operator_type.hpp>
 
 // standard library
+#include <atomic>
 #include <memory>
 #include <optional>
 
@@ -122,6 +123,12 @@ class sirius_gpu_scan_operator : public sirius_physical_operator {
  private:
   std::shared_ptr<gpu_ingestible> _ingestible;
   std::shared_ptr<scan_manager::split_connector> _split_connector;
+  /// RULE-2 bail latch for the fused scan-filter pipeline, shared with every
+  /// split this operator hands out (see scan_operator_input::fused_bail_flag).
+  /// Per-operator so another query's scan of the same pinned entry decides
+  /// fresh.
+  std::shared_ptr<std::atomic<bool>> _fused_rule2_bailed =
+    std::make_shared<std::atomic<bool>>(false);
 };
 
 }  // namespace sirius::op::scan

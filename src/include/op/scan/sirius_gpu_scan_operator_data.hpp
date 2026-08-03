@@ -29,6 +29,7 @@
 #include <rmm/cuda_stream_view.hpp>
 
 // standard library
+#include <atomic>
 #include <cstddef>
 #include <memory>
 #include <variant>
@@ -155,6 +156,16 @@ class scan_operator_input : public op::operator_data {
   /// set while the gate is off — the converters then always produce the plain
   /// representation.
   bool decode_row_filtered{false};
+  /// Operator-shared RULE-2 bail latch, stamped by
+  /// sirius_gpu_scan_operator::get_next_task_input_data on every split it
+  /// hands out. Selectivity is uniform across a scan's batches (unclustered
+  /// chunks), so one post-CNT bail predicts the rest: prepare_for_processing
+  /// latches it on seeing a rule2_bailed_gpu_table_representation, and later
+  /// splits strip the attached range pushdown before conversion (and the
+  /// working-set estimator keeps the classic 2x envelope). Per-operator by
+  /// construction — another query's scan decides fresh. May be null (splits
+  /// not routed through the operator, e.g. tests): all reads null-check.
+  std::shared_ptr<std::atomic<bool>> fused_bail_flag;
   /// Per-query table taken out of the cached wrapper batch right after
   /// prepare_for_processing's conversion produced it (decompressed or
   /// uploaded fresh for this split) — never raw GPU pin storage, which is

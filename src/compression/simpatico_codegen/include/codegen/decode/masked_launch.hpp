@@ -52,11 +52,15 @@ bool launch_decode_fused_tree_mask_out(codegen::jit::FusedTree const& tree,
                                        ::sirius::codegen::selection_mask& mask,
                                        rmm::cuda_stream_view stream);
 
-/// K3: Bitpack-leaf decode consuming ``mask.words`` + ``mask.chunk_offsets``
-/// (both required non-null; chunk_offsets means the CNT wave already ran),
+/// K3: decode consuming ``mask.words`` + ``mask.chunk_offsets`` (both
+/// required non-null; chunk_offsets means the CNT wave already ran),
 /// writing compacted output in row order into ``out``.  ``out`` must have
-/// capacity for ``mask.survivor_count`` elements.  Rows whose mask bit is 0
-/// are never unpacked; zero-survivor chunks early-return.
+/// capacity for ``mask.survivor_count`` elements.  Supported tree roots:
+/// Bitpack leaf (rows whose mask bit is 0 are never unpacked) and Delta
+/// root with a value_source-supported ``differences`` child (o_orderkey's
+/// delta->bitpack shape; the per-chunk prefix-sum reconstruction still
+/// runs, only the stores are masked/compacted).  Zero-survivor chunks
+/// early-return.
 bool launch_decode_fused_tree_mask_consume(codegen::jit::FusedTree const& tree,
                                            codegen::jit::LabeledBuffers& labeled,
                                            char const* dtype,
@@ -64,5 +68,27 @@ bool launch_decode_fused_tree_mask_consume(codegen::jit::FusedTree const& tree,
                                            ::sirius::codegen::selection_mask const& mask,
                                            void* out,
                                            rmm::cuda_stream_view stream);
+
+/// K5: masked dictionary gather for dictionary->bitpack string columns with
+/// CONSTANT-WIDTH, null-free keys (q1's l_returnflag / l_linestatus).  The
+/// tree is the dictionary INDICES bitpack leaf (codes, int32 domain).  For
+/// survivor rows only, decodes the code and copies the key's
+/// ``key_width`` bytes from ``keys_chars`` (device pointer to the key
+/// pool's chars, key k at ``keys_chars + k*key_width``) into
+/// ``out_chars`` at ``(chunk_offsets[chunk] + rank) * key_width`` —
+/// compacted, row order preserved.  ``out_chars`` must have capacity
+/// ``mask.survivor_count * key_width`` bytes.  The offsets column is
+/// analytic (``j * key_width``) and assembled by the caller together with
+/// the strings column (same split as try_decode_constant_width's
+/// tabulate).  Requires mask.chunk_offsets non-null (CNT ran).
+bool launch_decode_fused_tree_mask_dict_gather(codegen::jit::FusedTree const& tree,
+                                               codegen::jit::LabeledBuffers& labeled,
+                                               char const* dtype,
+                                               std::int64_t num_rows,
+                                               ::sirius::codegen::selection_mask const& mask,
+                                               void const* keys_chars,
+                                               std::int32_t key_width,
+                                               void* out_chars,
+                                               rmm::cuda_stream_view stream);
 
 }  // namespace simpatico

@@ -241,9 +241,17 @@ bool column_supports_predicate_decode(const compressed_table& table, std::size_t
 /// (non-bitpack filter column, nulls, ...), this is EXACTLY the classic
 /// decompress(table, selected_columns, pool, mr) — same kernels, same
 /// allocations — returned as released columns, and result.applied is false.
+/// result.status refines the applied=false cases: `refused` (no device work),
+/// `bailed_high_selectivity` (RULE-2 post-CNT bail — the scan side should
+/// memoize this per operator and strip the range pushdown from the scan's
+/// remaining batches), or `failed` (mid-flight fallback, exceptional).
 ///
-/// Not composable with string-equality decode_predicates (iteration 1): calls
-/// that carry those must use the predicated decompress overload above.
+/// Dict-code equality/IN conjuncts ride INSIDE the request
+/// (scan_filter_request::bool8_filters, iteration 3): wave 1 resolves them via
+/// the shipped decode_predicate pushdown, packs the BOOL8 result to mask words
+/// and ANDs it into the batch mask. Calls that instead want the classic BOOL8
+/// column substitution must use the predicated decompress overload above — the
+/// two contracts do not mix in one call.
 std::vector<std::unique_ptr<cudf::column>> decompress_scan_filter(
   const compressed_table& table,
   std::span<const std::size_t> selected_columns,

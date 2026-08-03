@@ -15,6 +15,8 @@
  */
 
 // sirius
+#include "compression/compressed_representation.hpp"
+
 #include <cudf/table/table.hpp>
 
 #include <cucascade/cudf/gpu_data_representation.hpp>
@@ -23,10 +25,49 @@
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
 
 #include <algorithm>
+#include <cstdlib>
 #include <memory>
 #include <stdexcept>
 
 namespace sirius::op::scan {
+
+namespace {
+
+// RULE-2 selectivity ceiling (SIRIUS_EXP_FUSED_SCAN_MAX_SEL, default 0.35):
+// above it the fused pipeline bails post-CNT and re-runs classic, so every
+// batch that STAYS fused is bounded by it. Mirrors the wave orchestrator's
+// reader in simpatico_codegen.cpp — keep the default in sync.
+double fused_scan_max_selectivity()
+{
+  static double const value = [] {
+    char const* s = std::getenv("SIRIUS_EXP_FUSED_SCAN_MAX_SEL");
+    if (s == nullptr) { return 0.35; }
+    char* end      = nullptr;
+    double const d = std::strtod(s, &end);
+    if (end == s || d < 0.0) { return 0.35; }
+    return std::min(d, 1.0);
+  }();
+  return value;
+}
+
+// Reservation probe for this resident split's compressed batch: whether the
+// fused scan-filter decode is expected to compact it, and whether the
+// survivor count is RULE-2-bounded (no dict-K5 output — those skip the bail).
+// {false, false} for anything else — including post-convert states, where the
+// data is no longer a compressed representation.
+sirius::compressed_device_representation::fused_scan_reservation_probe fused_decode_probe(
+  scan_operator_input const& split)
+{
+  if (!split.is_resident()) { return {}; }
+  auto batch = split.get_cached_batch();
+  auto ro    = batch->to_read_only();
+  auto const* rep =
+    dynamic_cast<sirius::compressed_device_representation const*>(ro.get_data());
+  if (rep == nullptr) { return {}; }
+  return rep->probe_fused_scan_reservation();
+}
+
+}  // namespace
 
 void scan_operator_input::prepare_for_processing(
   const ::cucascade::memory::memory_space* requested_memory_space, rmm::cuda_stream_view stream)
@@ -54,6 +95,20 @@ void scan_operator_input::prepare_for_processing(
     if (needs_upload) {
       auto& registry = ::sirius::converter_registry::get();
       auto mut       = batch->to_mutable();
+      if (fused_bail_flag && fused_bail_flag->load(std::memory_order_relaxed)) {
+        // An earlier batch of this scan bailed on RULE 2; selectivity is
+        // uniform across batches, so strip the attached ranges and skip the
+        // fused attempt (wave-1 + CNT insurance) outright. Only the per-query
+        // projected clone is touched — never the shared pin — and only this
+        // operator's splits: another query's scan decides fresh.
+        if (auto* device_rep =
+              dynamic_cast<::sirius::compressed_device_representation*>(mut.get_data())) {
+          device_rep->set_range_pushdown({}, false);
+        } else if (auto* host_rep =
+                     dynamic_cast<::sirius::compressed_host_representation*>(mut.get_data())) {
+          host_rep->set_range_pushdown({}, false);
+        }
+      }
       mut.convert_to<::cucascade::gpu_table_representation>(
         registry, requested_memory_space, stream);
       // Fused scan-filter: the converter reports decode-time row filtering by
@@ -64,6 +119,13 @@ void scan_operator_input::prepare_for_processing(
       // the converters always install the base type and this stays false.
       decode_row_filtered =
         dynamic_cast<::sirius::row_filtered_gpu_table_representation*>(mut.get_data()) != nullptr;
+      // A RULE-2 bail comes back as classic full-width content under the
+      // bailed tag; latch it so the scan's remaining splits skip the attempt.
+      if (fused_bail_flag &&
+          dynamic_cast<::sirius::rule2_bailed_gpu_table_representation*>(mut.get_data()) !=
+            nullptr) {
+        fused_bail_flag->store(true, std::memory_order_relaxed);
+      }
       if (decode_row_filtered && mvcc_keep_mask.has_mask()) {
         // The keep-mask is positional over the chunk's full row range; a
         // decode-compacted table no longer lines up with it. The fused
@@ -166,15 +228,29 @@ std::size_t scan_operator_input::get_estimated_working_set_size_in_bytes() const
     return stolen ? batch_bytes : 2 * batch_bytes;
   }
   if (row_filter_pending) {
+    // A latched RULE-2 bail means later batches strip the pushdown and run
+    // classic — keep the classic 2x envelope for them.
+    bool const bail_latched =
+      fused_bail_flag && fused_bail_flag->load(std::memory_order_relaxed);
+    if (auto const probe = fused_decode_probe(*this); probe.planned && !bail_latched) {
+      // Fused-planned reservation: wave-1 mask words (1 bit/row per filter
+      // column — <= batch/4 across the 8-filter limit at >= 4 B/row columns)
+      // plus survivor-compacted outputs, and fused splits steal, so no second
+      // output copy. Survivors are bounded by the RULE-2 selectivity ceiling
+      // (the pipeline re-runs classic above it) UNLESS a dict-K5 output is
+      // present — those batches skip the bail, so size for up to full-width
+      // survivors. A RULE-2 bail re-runs the classic 2x path and
+      // over-allocates into the adaptor's over-reservation handling; by
+      // policy that only happens where fusing was mis-planned. Replaces a
+      // ~5x over-reservation on q6-class batches.
+      auto const cap = probe.rule2_bounded ? fused_scan_max_selectivity() : 1.0;
+      return batch_bytes / 4 +
+             static_cast<std::size_t>(static_cast<double>(batch_bytes) * cap);
+    }
     // post_filter_and_project filters by copy: the materialized input and the
     // compacted output (up to input-sized) coexist at peak. The BOOL8
     // predicate column (1 B/row) hides inside the 2x conservatism (any
     // projected column is >= 4 B/row).
-    // TODO(fused scan-filter): before conversion this still assumes 2x
-    // full-width even when the fused pipeline will compact at decode — the
-    // reservation-time estimate cannot yet see the gate decision. Needs a
-    // "fused mask planned" query on the compressed representation to drop
-    // toward ~1.25x; over-reserving is safe meanwhile.
     return 2 * batch_bytes;
   }
   // An unmasked, unfiltered chunk serves a zero-copy view whose output copy is

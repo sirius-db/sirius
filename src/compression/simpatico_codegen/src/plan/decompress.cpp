@@ -9,6 +9,7 @@
 #include <cudf/column/column_factories.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/dictionary/dictionary_factories.hpp>
+#include <cudf/filling.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
@@ -131,10 +132,12 @@ class DecodeWalk {
   /// pending — the one place a rep may answer the predicate instead of decoding.
   [[nodiscard]] bool predicate_applies_to(NodeId nid) const;
 
-  /// True when @p nid produces the column's final value and a Tier-A (mask
-  /// consuming) selection is pending — the one node that may decode compacted.
-  /// Inner fused subtrees (entropy tails, dictionary keys_offsets, ...) hold
-  /// metadata that is NOT row-aligned with the column and must decode full.
+  /// True when @p nid is THE node whose fused decode consumes the pending
+  /// selection: the (0,0)-producing bitpack region (Tier A), or — for the
+  /// dict-K5 mode — the bitpack region producing the dictionary's `indices`
+  /// value. Inner fused subtrees (entropy tails, dictionary keys_offsets, ...)
+  /// hold metadata that is NOT row-aligned with the column and must decode
+  /// full; the precomputed @c sel_target pins the exact consumer.
   [[nodiscard]] bool selection_applies_to(NodeId nid) const;
 
   PlanTree const& tree;
@@ -146,6 +149,8 @@ class DecodeWalk {
   decode_predicate const* pred = nullptr;
   /// Borrowed fused scan-filter selection; null on the default path.
   decode_selection const* sel = nullptr;
+  /// The one NodeId selection_applies_to accepts; tree.nodes.size() = none.
+  NodeId sel_target;
   /// Set once a rep has answered `pred`, so run() knows not to compare again.
   bool predicate_resolved = false;
 };
@@ -850,11 +855,33 @@ DecodeWalk::DecodeWalk(PlanTree const& tree,
     mr(mr),
     error_out(error_out),
     pred(pred != nullptr && pred->active() ? pred : nullptr),
-    sel(sel != nullptr && sel->active() ? sel : nullptr)
+    sel(sel != nullptr && sel->active() ? sel : nullptr),
+    sel_target(static_cast<NodeId>(tree.nodes.size()))
 {
   for (auto const& node : tree.nodes) {
     for (auto const& src : node.input_sources) {
       ++memo.remaining_consumers[value_id_key(src)];
+    }
+  }
+  if (this->sel != nullptr && this->sel->compacted()) {
+    // Pin the one node whose fused decode consumes the mask. The producer of
+    // the column's final value is whichever node consumes (0,0).
+    for (NodeId nid = 1; nid < tree.nodes.size(); ++nid) {
+      auto const& sources = tree.nodes[nid].input_sources;
+      if (sources.empty() || !(sources.front() == ValueId{0, 0})) { continue; }
+      if (this->sel->compact_capable) {
+        sel_target = nid;  // Tier A: the bitpack root region itself.
+      } else {
+        // dict-K5: the consumer is the bitpack region producing the
+        // dictionary's `indices` value, never the dictionary node itself.
+        for (auto const& e : tree.nodes[nid].children) {
+          if (e.channel == "indices") {
+            sel_target = e.child;
+            break;
+          }
+        }
+      }
+      break;
     }
   }
 }
@@ -870,11 +897,7 @@ bool DecodeWalk::predicate_applies_to(NodeId nid) const
 
 bool DecodeWalk::selection_applies_to(NodeId nid) const
 {
-  if (sel == nullptr || !sel->compact_capable) { return false; }
-  // Same discipline as predicate_applies_to: only the node producing the
-  // column's final value (node 0, port 0) is row-aligned with the mask.
-  auto const& sources = tree.nodes[nid].input_sources;
-  return !sources.empty() && sources.front() == ValueId{0, 0};
+  return sel != nullptr && nid == sel_target;
 }
 
 std::unique_ptr<cudf::column> DecodeWalk::run()
@@ -944,6 +967,126 @@ std::unique_ptr<cudf::column> decode_fused_subtree(PlanTree const& tree,
   return decode_fused_subtree_impl(tree, start_node, materialize, stream, mr, error_out);
 }
 
+namespace {
+// Defined alongside plan_supports_selection_decode below; used by the
+// compact_capable gate and the K5 fast path in decompress_column.
+NodeId root_value_producer(PlanTree const& tree);
+bool mask_consume_selection_root(PlanTree const& tree);
+
+// W1's specialized K5 char-emit (launch_decode_fused_tree_mask_dict_gather):
+// constant-width, null-free keys with IDENTITY-STORED key channels (q1's
+// l_returnflag / l_linestatus; dict->bp->bp keys and variable-width keys take
+// the general route). The caller owns key-width measurement, keys_chars
+// extraction, the analytic offsets (j * width) and the strings assembly —
+// W1's kernel emits only the compacted chars. Returns nullptr when the fast
+// path does not apply OR the launch declines — nothing shared is mutated, so
+// the caller simply falls through to the general dict route.
+std::unique_ptr<cudf::column> try_dict_k5_fast_path(PlanTree const& tree,
+                                                    decode_selection const& sel,
+                                                    rmm::cuda_stream_view stream,
+                                                    rmm::device_async_resource_ref mr)
+{
+  NodeId const dict_nid = root_value_producer(tree);
+  if (dict_nid >= tree.nodes.size()) { return nullptr; }
+  PlanNode const& dict_node = tree.nodes[dict_nid];
+
+  // Key channels must be terminal (identity-stored): a child edge on either
+  // means compressed keys — general route.
+  compressed_representation const* keys_offsets_rep = nullptr;
+  compressed_representation const* keys_chars_rep   = nullptr;
+  for (std::size_t i = 0; i < dict_node.output_names.size(); ++i) {
+    std::string const& name = dict_node.output_names[i];
+    if (name != "keys_offsets" && name != "keys_chars") { continue; }
+    for (auto const& e : dict_node.children) {
+      if (e.channel == name) { return nullptr; }
+    }
+    auto it = dict_node.channels.find(dict_node.output_paths[i]);
+    if (it == dict_node.channels.end() || !it->second) { return nullptr; }
+    (name == "keys_offsets" ? keys_offsets_rep : keys_chars_rep) = it->second.get();
+  }
+  if (keys_offsets_rep == nullptr || keys_chars_rep == nullptr) { return nullptr; }
+
+  std::string err;
+  auto keys_offsets = decompress_standalone_representation(keys_offsets_rep, stream, mr, &err);
+  if (!keys_offsets || keys_offsets->type().id() != cudf::type_id::INT32 ||
+      keys_offsets->size() < 2 || keys_offsets->null_count() != 0) {
+    return nullptr;
+  }
+  auto keys_chars = decompress_standalone_representation(keys_chars_rep, stream, mr, &err);
+  if (!keys_chars || keys_chars->type().id() != cudf::type_id::UINT8 ||
+      keys_chars->null_count() != 0) {
+    return nullptr;
+  }
+
+  // Key-width measurement: D2H the K+1 offsets (K <= 150 for every TPC-H dict
+  // column — a few hundred bytes) on the decode stream, then require a
+  // constant width. The classic path pays an equivalent lazy probe inside
+  // dictionary decompress (constant_key_width), so this adds no new sync
+  // class; a plan-side cache is a follow-up (needs a mutable PlanNode slot).
+  auto const n_offsets = static_cast<std::size_t>(keys_offsets->size());
+  std::vector<std::int32_t> host_offsets(n_offsets);
+  if (cudaMemcpyAsync(host_offsets.data(),
+                      keys_offsets->view().head<void>(),
+                      n_offsets * sizeof(std::int32_t),
+                      cudaMemcpyDeviceToHost,
+                      stream.value()) != cudaSuccess ||
+      cudaStreamSynchronize(stream.value()) != cudaSuccess) {
+    return nullptr;
+  }
+  std::int32_t const width = host_offsets[1] - host_offsets[0];
+  if (width < 1) { return nullptr; }
+  for (std::size_t i = 2; i < n_offsets; ++i) {
+    if (host_offsets[i] - host_offsets[i - 1] != width) { return nullptr; }
+  }
+
+  // Bind the codes (indices) region; entropy tails resolve through a local
+  // walk whose memo owns them across the synchronous launch.
+  NodeId codes_nid = static_cast<NodeId>(tree.nodes.size());
+  for (auto const& e : dict_node.children) {
+    if (e.channel == "indices") {
+      codes_nid = e.child;
+      break;
+    }
+  }
+  if (codes_nid >= tree.nodes.size()) { return nullptr; }
+  DecodeWalk tail_walk{tree, stream, mr, &err, nullptr, nullptr};
+  decode_materialize_fn resolve = [&tail_walk](NodeId dependency) {
+    return tail_walk.materialize(dependency);
+  };
+  auto region = bind_fused_region(tree, codes_nid, resolve, stream, mr, &err);
+  if (!region) { return nullptr; }
+
+  auto const survivors = sel.survivor_count;
+  rmm::device_buffer out_chars(
+    static_cast<std::size_t>(survivors) * static_cast<std::size_t>(width), stream, mr);
+  if (!launch_decode_fused_tree_mask_dict_gather(*region->built.tree,
+                                                 region->labeled,
+                                                 region->dtype,
+                                                 static_cast<std::int64_t>(region->num_rows),
+                                                 *sel.mask,
+                                                 keys_chars->view().head<void>(),
+                                                 width,
+                                                 out_chars.data(),
+                                                 stream)) {
+    return nullptr;  // render/launch declined — general route still serves this batch
+  }
+
+  // Analytic offsets (j * width) + zero-copy chars wrap. The launcher synced;
+  // sync again after the sequence so the caller may free/rebind immediately.
+  cudf::numeric_scalar<std::int32_t> const init(0, true, stream);
+  cudf::numeric_scalar<std::int32_t> const step(width, true, stream);
+  auto offsets =
+    cudf::sequence(static_cast<cudf::size_type>(survivors + 1), init, step, stream, mr);
+  auto col = cudf::make_strings_column(static_cast<cudf::size_type>(survivors),
+                                       std::move(offsets),
+                                       std::move(out_chars),
+                                       0,
+                                       rmm::device_buffer(0, stream, mr));
+  cudaStreamSynchronize(stream.value());
+  return col;
+}
+}  // namespace
+
 std::unique_ptr<cudf::column> decompress_column(PlanTree const& tree,
                                                 rmm::cuda_stream_view stream,
                                                 rmm::device_async_resource_ref mr,
@@ -965,33 +1108,71 @@ std::unique_ptr<cudf::column> decompress_column(PlanTree const& tree,
     if (error_out) *error_out = "decompress: decode_selection and decode_predicate are exclusive";
     return nullptr;
   }
-  if (selecting && sel->compact_capable && !plan_supports_selection_decode(tree)) {
-    // A non-bitpack-rooted plan would silently decode full width while the
-    // caller expects survivor_count rows — refuse instead (never corrupt).
+  if (selecting && sel->compact_capable && sel->dict_compact) {
     if (error_out) {
-      *error_out = "decompress: plan is not bitpack-rooted; Tier-A compacted decode unavailable";
+      *error_out = "decompress: compact_capable and dict_compact are exclusive selection modes";
+    }
+    return nullptr;
+  }
+  if (selecting && sel->compact_capable && !mask_consume_selection_root(tree)) {
+    // compact_capable means mask_consume on the ROOT region specifically —
+    // bitpack (tier_a) or delta->bitpack (tier_a_delta). The umbrella
+    // plan_supports_selection_decode also admits dict-K5 plans, which must be
+    // requested via dict_compact. Anything else would silently decode full
+    // width while the caller expects survivor_count rows — refuse instead
+    // (never corrupt).
+    if (error_out) {
+      *error_out =
+        "decompress: plan root renders no mask_consume variant; compacted decode unavailable";
+    }
+    return nullptr;
+  }
+  if (selecting && sel->dict_compact && !plan_supports_dict_selection_decode(tree)) {
+    // Same hazard for the dict route: anything but a non-null dictionary root
+    // with bitpack codes would come back full width.
+    if (error_out) {
+      *error_out = "decompress: plan does not support dict-K5 compacted decode";
     }
     return nullptr;
   }
 
-  DecodeWalk walk{tree, stream, mr, error_out, pred, sel};
-  auto col = walk.run();
+  std::unique_ptr<cudf::column> col;
+  if (selecting && sel->dict_compact) {
+    // Constant-width fast path: W1's K5 char-emit kernel replaces the
+    // compacted-codes intermediate + cudf key gather with one launch. A
+    // nullptr (not applicable / launch declined) falls through to the general
+    // dict route — nothing shared was mutated.
+    col = try_dict_k5_fast_path(tree, *sel, stream, mr);
+  }
+  if (!col) {
+    DecodeWalk walk{tree, stream, mr, error_out, pred, sel};
+    col = walk.run();
+  }
 
-  if (col && selecting && sel->compact_capable &&
-      static_cast<std::int64_t>(col->size()) != sel->survivor_count) {
-    // Belt and braces for the same hazard: whatever comes back from a Tier-A
-    // request must already be compacted.
-    if (error_out) {
-      *error_out = "decompress: Tier-A decode returned a non-compacted column";
+  if (col && selecting && sel->compacted()) {
+    // Belt and braces for the same hazard: whatever comes back from a
+    // compacted-mode request must already be survivor-sized (Tier A directly
+    // from K3; dict-K5 via the key gather over the K3-compacted codes) and —
+    // iteration-1 null policy — carry no null mask.
+    if (static_cast<std::int64_t>(col->size()) != sel->survivor_count) {
+      if (error_out) {
+        *error_out = "decompress: compacted decode returned a non-survivor-sized column";
+      }
+      return nullptr;
     }
-    return nullptr;
+    if (col->null_count() != 0) {
+      if (error_out) {
+        *error_out = "decompress: selection on a null-masked column is not supported";
+      }
+      return nullptr;
+    }
   }
 
   // Fused scan-filter Tier B: the walk decoded the column full width exactly
   // as today; compact it to the batch's survivor rows with one gather over the
-  // shared mask→indices buffer. (Tier A came back compacted from the masked
-  // fused decode and skips this.)
-  if (col && selecting && !sel->compact_capable) {
+  // shared mask→indices buffer. (The compacted modes — Tier A and dict-K5 —
+  // came back survivor-sized from the masked decode and skip this.)
+  if (col && selecting && !sel->compacted()) {
     if (col->null_count() != 0) {
       // Iteration 1 targets NOT NULL columns only; refuse rather than risk a
       // mask/null interaction the selection wave has not modeled.
@@ -1035,17 +1216,100 @@ bool plan_supports_predicate_decode(PlanTree const& tree)
   return false;
 }
 
-bool plan_supports_selection_decode(PlanTree const& tree)
+namespace {
+
+// The node producing the column's final value: whichever consumes (0,0).
+NodeId root_value_producer(PlanTree const& tree)
 {
-  if (tree.nodes.empty() || tree.nodes[0].op != "input") { return false; }
-  // The producer of the column's final value is whichever node consumes (0,0).
-  // Only a bitpack-rooted region renders the masked (K1/K3) decode variants —
-  // anything else must take the classic full-width path (Tier B).
+  if (tree.nodes.empty() || tree.nodes[0].op != "input") {
+    return static_cast<NodeId>(tree.nodes.size());
+  }
   for (NodeId nid = 1; nid < tree.nodes.size(); ++nid) {
     auto const& sources = tree.nodes[nid].input_sources;
-    if (!sources.empty() && sources.front() == ValueId{0, 0}) {
-      return tree.nodes[nid].op == "bitpack";
+    if (!sources.empty() && sources.front() == ValueId{0, 0}) { return nid; }
+  }
+  return static_cast<NodeId>(tree.nodes.size());
+}
+
+// The bitpack Tier-A arm of plan_supports_selection_decode: the column's
+// final value is produced by a bitpack region, so the masked K1/K3 render
+// variants apply to the root region directly.
+bool bitpack_selection_root(PlanTree const& tree)
+{
+  NodeId const nid = root_value_producer(tree);
+  return nid < tree.nodes.size() && tree.nodes[nid].op == "bitpack";
+}
+
+// The tier_a_delta arm: a delta root whose `differences` child is bitpack
+// (o_orderkey / l_orderkey shape). The mask_consume launcher renders this
+// shape too — the per-chunk prefix-sum reconstruction still runs, only the
+// stores are masked/compacted.
+bool delta_selection_root(PlanTree const& tree)
+{
+  NodeId const nid = root_value_producer(tree);
+  if (nid >= tree.nodes.size() || tree.nodes[nid].op != "delta") { return false; }
+  for (auto const& e : tree.nodes[nid].children) {
+    if (e.channel == "differences") {
+      return e.child < tree.nodes.size() && tree.nodes[e.child].op == "bitpack";
     }
+  }
+  return false;  // raw-passthrough differences: not a rendered mask_consume shape
+}
+
+// Any root region the mask_consume (K3 / K3-delta) launcher renders — the
+// admission check for the compact_capable decode mode.
+bool mask_consume_selection_root(PlanTree const& tree)
+{
+  return bitpack_selection_root(tree) || delta_selection_root(tree);
+}
+
+}  // namespace
+
+bool plan_supports_selection_decode(PlanTree const& tree)
+{
+  // Survivor-compactable by ANY masked route: bitpack Tier A / delta
+  // tier_a_delta (mask_consume on the root region) or dict-K5 (K3 on the
+  // dictionary codes + survivor-only key gather). The taxonomy layer keys
+  // compact-capability off this one umbrella probe; per-route dispatch asks
+  // plan_selection_tier / plan_supports_dict_selection_decode.
+  // NOTE for wave-1 callers: FILTER (mask-producing K1) columns must be
+  // bitpack — gate filters on `plan_selection_tier(...) == tier_a`.
+  return mask_consume_selection_root(tree) || plan_supports_dict_selection_decode(tree);
+}
+
+sirius::codegen::output_tier plan_selection_tier(PlanTree const& tree)
+{
+  // Per-tier ground truth for RULE 1's switch (STATUS-W4 rev-8 ask). The
+  // shapes are mutually exclusive (a plan has exactly one (0,0)-producer).
+  if (bitpack_selection_root(tree)) { return sirius::codegen::output_tier::tier_a; }
+  if (delta_selection_root(tree)) { return sirius::codegen::output_tier::tier_a_delta; }
+  if (plan_supports_dict_selection_decode(tree)) {
+    return sirius::codegen::output_tier::tier_dict_k5;
+  }
+  return sirius::codegen::output_tier::tier_b;
+}
+
+bool plan_supports_dict_selection_decode(PlanTree const& tree)
+{
+  if (tree.nodes.empty() || tree.nodes[0].op != "input") { return false; }
+  for (NodeId nid = 1; nid < tree.nodes.size(); ++nid) {
+    auto const& sources = tree.nodes[nid].input_sources;
+    if (sources.empty() || !(sources.front() == ValueId{0, 0})) { continue; }
+    PlanNode const& node = tree.nodes[nid];
+    if (node.op != "dictionary") { return false; }
+    // Nullable dictionary plans carry a trailing `null_mask` output channel;
+    // iteration-1 selection has no null model — refuse (never corrupt).
+    for (auto const& name : node.output_names) {
+      if (name == "null_mask") { return false; }
+    }
+    // The mask consumer is the codes region: the `indices` channel must be
+    // routed to a bitpack child so K3 can decode it compacted.
+    for (auto const& e : node.children) {
+      if (e.channel == "indices") {
+        return e.child < tree.nodes.size() && tree.nodes[e.child].op == "bitpack";
+      }
+    }
+    return false;  // indices stored inline (identity) — no fused region to mask
   }
   return false;
 }
@@ -1120,9 +1384,17 @@ std::unique_ptr<cudf::column> decompress_column_compacted(
     return nullptr;
   }
   decode_selection sel{};
-  sel.mask            = &mask;
-  sel.survivor_count  = mask.survivor_count;
-  sel.compact_capable = true;
+  sel.mask           = &mask;
+  sel.survivor_count = mask.survivor_count;
+  // Dispatch on plan shape: dictionary root with bitpack codes -> dict-K5;
+  // everything else is requested as bitpack Tier A / K3, and decompress_column
+  // refuses non-bitpack roots there (the dict probe must run first — the
+  // umbrella plan_supports_selection_decode admits both shapes).
+  if (plan_supports_dict_selection_decode(tree)) {
+    sel.dict_compact = true;
+  } else {
+    sel.compact_capable = true;
+  }
   return decompress_column(tree, stream, mr, error_out, /*pred=*/nullptr, &sel);
 }
 
@@ -1163,10 +1435,12 @@ std::unique_ptr<cudf::table> compact_scan_filter_output(
       }
       return nullptr;
     }
-    if (result.tiers[i] == sirius::codegen::output_tier::tier_a) {
+    if (result.tiers[i] != sirius::codegen::output_tier::tier_b) {
+      // Any compacted tier (tier_a K3, dict-K5, future variants): the decode
+      // already emitted survivor rows.
       if (columns[i]->size() != survivors) {
         if (error_out) {
-          *error_out = "compact_scan_filter_output: Tier-A column is not survivor-sized";
+          *error_out = "compact_scan_filter_output: compacted-tier column is not survivor-sized";
         }
         return nullptr;
       }

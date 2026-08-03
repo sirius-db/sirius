@@ -360,6 +360,28 @@ class compressed_device_representation : public cucascade::idata_representation 
     return _range_conjuncts_convertible;
   }
 
+  /// Reservation-time fused scan-filter probe (host metadata only — never
+  /// touches the device).
+  struct fused_scan_reservation_probe {
+    /// The fused pipeline is expected to compact this projection at decode:
+    /// env gate on, at least one attached ACTIVE range, the ranges cover the
+    /// whole filter, and every selected column's plan probes
+    /// survivor-compactable (bitpack tier_a, delta tier_a_delta, or
+    /// dict-K5) — the reservation-time mirror of the converter's RULE 1.
+    bool planned = false;
+    /// True when the batch's survivor count is capped by the RULE-2
+    /// selectivity ceiling — i.e. NO selected column classifies tier_dict_k5
+    /// (dict-K5 batches skip the RULE-2 bail: the masked key gather wins at
+    /// every selectivity). When false, size survivor-dependent reservations
+    /// for up to full-width survivors.
+    bool rule2_bounded = false;
+  };
+
+  /// See @ref fused_scan_reservation_probe. RULE 2 itself (the post-CNT bail)
+  /// is data-dependent and invisible here; callers scaling reservations by
+  /// the RULE-2 ceiling accept the rare bail-path over-allocation.
+  [[nodiscard]] fused_scan_reservation_probe probe_fused_scan_reservation() const;
+
  private:
   compressed_device_representation(cucascade::memory::memory_space& memory_space,
                                    std::shared_ptr<compressed_device_blob> blob,

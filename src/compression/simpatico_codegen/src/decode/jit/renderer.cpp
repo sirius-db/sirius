@@ -146,7 +146,14 @@ class Walker {
         emit_producer(tree, "(out + chunk_start)", "len", dtype_);
         break;
       case DecodeVariant::mask_out: emit_bitpack_mask_out(tree); break;
-      case DecodeVariant::mask_consume: emit_bitpack_mask_consume(tree); break;
+      case DecodeVariant::mask_consume:
+        if (tree.op == ::codegen::OpKind::Delta) {
+          emit_delta_mask_consume(tree);
+        } else {
+          emit_bitpack_mask_consume(tree);
+        }
+        break;
+      case DecodeVariant::mask_dict_gather: emit_bitpack_mask_dict_gather(tree); break;
     }
     return finalize(tree);
   }
@@ -203,11 +210,15 @@ class Walker {
                              const std::string& len,
                              const std::string& elem_type);
 
-  // ---- Fused scan-filter variants (K1 / K3, Bitpack leaf root only). ----
-  // K1 emits one __ballot_sync word per 32 consecutive rows; K3 consumes the
-  // mask via a warp scan of per-word popcounts and writes compacted output.
+  // ---- Fused scan-filter variants (K1 / K3 / K5). ----
+  // K1 emits one __ballot_sync word per 32 consecutive rows; the consuming
+  // variants stage the chunk's mask via a warp scan of per-word popcounts
+  // (emit_selection_stage) and write compacted output.
+  void emit_selection_stage();
   void emit_bitpack_mask_out(const ::codegen::jit::FusedTree& node);
   void emit_bitpack_mask_consume(const ::codegen::jit::FusedTree& node);
+  void emit_delta_mask_consume(const ::codegen::jit::FusedTree& node);
+  void emit_bitpack_mask_dict_gather(const ::codegen::jit::FusedTree& node);
   void emit_delta_producer(const ::codegen::jit::FusedTree& node,
                            const std::string& dst,
                            const std::string& len,
@@ -252,6 +263,7 @@ class Walker {
     spec.entry_symbol = make_entry_symbol(tree, dtype_, "simpatico_decode_");
     if (variant_ == DecodeVariant::mask_out) spec.entry_symbol += "_mask_out";
     if (variant_ == DecodeVariant::mask_consume) spec.entry_symbol += "_mask_consume";
+    if (variant_ == DecodeVariant::mask_dict_gather) spec.entry_symbol += "_mask_dict";
 
     std::ostringstream src;
     src << kPrelude;
@@ -278,6 +290,15 @@ class Walker {
             << "    int64_t n,\n"
             << "    const uint32_t* __restrict__ sel_mask,\n"
             << "    const uint32_t* __restrict__ chunk_offsets)\n";
+        break;
+      case DecodeVariant::mask_dict_gather:
+        // `out` is the compacted CHARS buffer (survivor_count * key_width bytes).
+        src << "    char* __restrict__ out,\n"
+            << "    int64_t n,\n"
+            << "    const uint32_t* __restrict__ sel_mask,\n"
+            << "    const uint32_t* __restrict__ chunk_offsets,\n"
+            << "    const char* __restrict__ keys_chars,\n"
+            << "    int32_t key_width)\n";
         break;
     }
     src << "{\n"
@@ -472,18 +493,14 @@ void Walker::emit_bitpack_mask_out(const ::codegen::jit::FusedTree& node)
         << "    }\n";
 }
 
-void Walker::emit_bitpack_mask_consume(const ::codegen::jit::FusedTree& node)
+// Shared mask-consuming stage (warp 0): load the chunk's 32 selection-mask
+// words into shared memory, compute the exclusive per-word survivor prefix +
+// chunk total via a warp scan of popcounts, and early-return zero-survivor
+// chunks.  Leaves sel_words / sel_base / sel_total live for the caller's
+// store loop.
+void Walker::emit_selection_stage()
 {
-  if (node.op != ::codegen::OpKind::Bitpack || !node.children.empty()) {
-    throw RenderError("decode render: mask_consume variant requires a Bitpack leaf root (got '" +
-                      std::string(::codegen::jit::op_kind_name(node.op)) + "')");
-  }
-  // Stage 1 (warp 0): load the chunk's 32 mask words, exclusive per-word
-  // survivor prefix + chunk total via a warp scan of popcounts.
-  body_ << "    // --- node " << id_of(node)
-        << ": Bitpack masked decode -> compacted output (K3) ---\n"
-        << "    (void)len;  // mask tail bits are zero, so selected rows are always < len\n"
-        << "    __shared__ uint32_t sel_words[CHUNK / 32];\n"
+  body_ << "    __shared__ uint32_t sel_words[CHUNK / 32];\n"
         << "    __shared__ int32_t sel_base[CHUNK / 32];  // exclusive survivor prefix per word\n"
         << "    __shared__ int32_t sel_total;             // survivors in this chunk\n"
         << "    if (tid < CHUNK / 32) {\n"
@@ -500,10 +517,30 @@ void Walker::emit_bitpack_mask_consume(const ::codegen::jit::FusedTree& node)
         << "        if (tid == 31) sel_total = x;\n"
         << "    }\n"
         << "    __syncthreads();\n"
-        << "    if (sel_total == 0) return;  // zero-survivor chunk: skip the unpack entirely\n";
+        << "    if (sel_total == 0) return;  // zero-survivor chunk: nothing to write\n";
+}
 
-  // Stage 2: per-chunk scalar prelude (chunk_min/bits/base loads), then the
-  // masked unpack — skipped rows are never unpacked.
+// Emitted C++ expression for a row's survivor rank given `w` (its mask word,
+// already loaded from sel_words) and `pos` (the row's in-chunk position).
+static std::string rank_expr(const std::string& pos)
+{
+  return "sel_base[" + pos + " >> 5] + __popc(w & ((1u << (" + pos + " & 31)) - 1u))";
+}
+
+void Walker::emit_bitpack_mask_consume(const ::codegen::jit::FusedTree& node)
+{
+  if (node.op != ::codegen::OpKind::Bitpack || !node.children.empty()) {
+    throw RenderError("decode render: mask_consume variant requires a Bitpack leaf or Delta root "
+                      "(got '" +
+                      std::string(::codegen::jit::op_kind_name(node.op)) + "')");
+  }
+  body_ << "    // --- node " << id_of(node)
+        << ": Bitpack masked decode -> compacted output (K3) ---\n"
+        << "    (void)len;  // mask tail bits are zero, so selected rows are always < len\n";
+  emit_selection_stage();
+
+  // Per-chunk scalar prelude (chunk_min/bits/base loads), then the masked
+  // unpack — skipped rows are never unpacked.
   ValueSource vs = bitpack_value_source(node, dtype_);
   body_ << "    const int64_t out_base = static_cast<int64_t>(chunk_offsets[chunk_id]);\n"
         << "    #pragma unroll\n"
@@ -511,9 +548,156 @@ void Walker::emit_bitpack_mask_consume(const ::codegen::jit::FusedTree& node)
         << "        const int32_t i = j * " << tbs_ << " + tid;\n"
         << "        const uint32_t w = sel_words[i >> 5];\n"
         << "        if ((w >> (i & 31)) & 1u) {\n"
-        << "            const int32_t rank = sel_base[i >> 5] + __popc(w & ((1u << (i & 31)) - "
-           "1u));\n"
+        << "            const int32_t rank = " << rank_expr("i") << ";\n"
         << "            (out + out_base)[rank] = " << at_pos(vs.read_expr, "i") << ";\n"
+        << "        }\n"
+        << "    }\n";
+}
+
+// =====================================================================
+// Delta mask_consume — masked-store variant of emit_delta_producer's
+// root-level (striped) path.  The prefix-sum reconstruction is inherently
+// sequential within a chunk, so ALL rows are still decoded; the mask only
+// gates the global STORE (row idx+1 lands at its compacted survivor slot).
+// Saves the full-width column write + the downstream gather/compaction,
+// not the unpack compute.  Kept as a standalone emitter (instead of
+// threading a store-sink through emit_delta_producer) so the plain
+// rendered source stays byte-identical.
+// =====================================================================
+void Walker::emit_delta_mask_consume(const ::codegen::jit::FusedTree& node)
+{
+  if (node.op != ::codegen::OpKind::Delta || node.children.size() != 1) {
+    throw RenderError("decode render: mask_consume Delta root must have exactly one "
+                      "'differences' child");
+  }
+  auto vit = node.children.find("differences");
+  if (vit == node.children.end()) {
+    throw RenderError("decode render: mask_consume Delta root missing 'differences' child");
+  }
+  const std::size_t esize = dtype_elem_size(dtype_);
+  if (esize == 0) {
+    throw RenderError("decode render: Delta op-local dtype '" + dtype_ + "' not supported");
+  }
+
+  const std::int32_t id     = id_of(node);
+  const std::string idstr   = std::to_string(id);
+  const std::string p_first = "delta_first_" + idstr;
+  add_param("const " + dtype_ + "* __restrict__", p_first);
+  add_buffer(id, "delta_first", esize);
+
+  body_ << "    // --- node " << id
+        << ": Delta masked decode -> compacted output (K3-delta) ---\n";
+  emit_selection_stage();
+
+  const std::string dlen  = "dlen_" + idstr;
+  const std::string ndiff = "ndiff_" + idstr;
+  const std::string items = "ditems_" + idstr;
+  const std::string first = "dfirst_" + idstr;
+  const std::string scan  = "DScan_" + idstr;
+  const std::string exch  = "DExch_" + idstr;
+  const std::string tmp   = "dtmp_" + idstr;
+
+  body_ << "    {\n"
+        << "        constexpr int32_t TBS = " << tbs_ << ";\n"
+        << "        constexpr int32_t IPT = CHUNK / TBS;\n"
+        << "        const int32_t " << dlen << " = static_cast<int32_t>(len);\n"
+        << "        const int32_t " << ndiff << " = (" << dlen << " > 0) ? (" << dlen
+        << " - 1) : 0;\n";
+
+  // Child value source (closed-form expr, or a materialised slab read) —
+  // same contract as the plain Delta producer.
+  const auto mark = sm_.mark();
+  ValueSource child_vs =
+    value_source(*vit->second, dtype_, "((len) > 0 ? ((len) - 1) : 0)");
+
+  // Root level: STRIPED loads + BlockExchange transpose, exactly like the
+  // plain producer's use_striped branch (masked variants are root-only, so
+  // the blocked/nested-smem branch never applies here).
+  body_ << "        " << dtype_ << " " << items << "[IPT];\n"
+        << "        #pragma unroll\n"
+        << "        for (int32_t j = 0; j < IPT; ++j) {\n"
+        << "            const int32_t idx = j * TBS + tid;  // striped\n"
+        << "            " << items << "[j] = (idx < " << ndiff << ")\n"
+        << "                ? static_cast<" << dtype_ << ">(" << at_pos(child_vs.read_expr, "idx")
+        << ")\n"
+        << "                : " << dtype_ << "{0};\n"
+        << "        }\n"
+        << "        typedef cub::BlockScan<" << dtype_ << ", TBS> " << scan << ";\n"
+        << "        typedef cub::BlockExchange<" << dtype_ << ", TBS, IPT> " << exch << ";\n"
+        << "        __shared__ union {\n"
+        << "            typename " << exch << "::TempStorage ex;\n"
+        << "            typename " << scan << "::TempStorage sc;\n"
+        << "        } " << tmp << ";\n"
+        << "        " << exch << "(" << tmp << ".ex).StripedToBlocked(" << items << ", " << items
+        << ");\n"
+        << "        __syncthreads();\n"
+        << "        " << scan << "(" << tmp << ".sc).InclusiveSum(" << items << ", " << items
+        << ");\n"
+        << "        __syncthreads();\n"
+        << "        " << exch << "(" << tmp << ".ex).BlockedToStriped(" << items << ", " << items
+        << ");\n"
+        << "        __syncthreads();\n";
+
+  // Masked stores: row 0 = first, row idx+1 = first + prefix[idx]; only
+  // survivor rows are written, at out_base + rank.  Row 0's rank is always
+  // 0 when its bit is set (no lower bits in word 0).
+  const std::string dutype = unsigned_counterpart(esize);
+  body_ << "        const " << dtype_ << " " << first << " = " << p_first << "[chunk_id];\n"
+        << "        const int64_t out_base = static_cast<int64_t>(chunk_offsets[chunk_id]);\n"
+        << "        if (tid == 0 && " << dlen << " > 0 && (sel_words[0] & 1u)) (out + out_base)[0] "
+           "= "
+        << first << ";\n"
+        << "        #pragma unroll\n"
+        << "        for (int32_t j = 0; j < IPT; ++j) {\n"
+        << "            const int32_t idx = j * TBS + tid;  // striped global pos\n"
+        << "            const int32_t row = idx + 1;\n"
+        << "            if (row < " << dlen << ") {\n"
+        << "                const uint32_t w = sel_words[row >> 5];\n"
+        << "                if ((w >> (row & 31)) & 1u) {\n"
+        << "                    const int32_t rank = " << rank_expr("row") << ";\n"
+        << "                    (out + out_base)[rank] = static_cast<" << dtype_
+        << ">(static_cast<" << dutype << ">(" << first << ") + static_cast<" << dutype << ">("
+        << items << "[j]));\n"
+        << "                }\n"
+        << "            }\n"
+        << "        }\n"
+        << "    }\n";
+  sm_.release_to(mark);
+}
+
+// =====================================================================
+// Dictionary-code masked gather (K5) — Bitpack leaf holds the dictionary
+// CODES; for survivor rows only, decode the code and copy the key's bytes
+// from a constant-width, null-free key pool straight into the compacted
+// chars output.  Skips both the full-width INT32 code materialisation and
+// the separate key-gather pass.  Offsets are analytic (j * key_width) and
+// built by the caller (see masked_launch.hpp).
+// =====================================================================
+void Walker::emit_bitpack_mask_dict_gather(const ::codegen::jit::FusedTree& node)
+{
+  if (node.op != ::codegen::OpKind::Bitpack || !node.children.empty()) {
+    throw RenderError("decode render: mask_dict_gather variant requires a Bitpack code leaf root "
+                      "(got '" +
+                      std::string(::codegen::jit::op_kind_name(node.op)) + "')");
+  }
+  body_ << "    // --- node " << id_of(node)
+        << ": Bitpack code masked dictionary gather (K5) ---\n"
+        << "    (void)len;  // mask tail bits are zero, so selected rows are always < len\n";
+  emit_selection_stage();
+
+  ValueSource vs = bitpack_value_source(node, dtype_);
+  body_ << "    const int64_t out_base = static_cast<int64_t>(chunk_offsets[chunk_id]);\n"
+        << "    #pragma unroll\n"
+        << "    for (int32_t j = 0; j < CHUNK / " << tbs_ << "; ++j) {\n"
+        << "        const int32_t i = j * " << tbs_ << " + tid;\n"
+        << "        const uint32_t w = sel_words[i >> 5];\n"
+        << "        if ((w >> (i & 31)) & 1u) {\n"
+        << "            const int32_t rank = " << rank_expr("i") << ";\n"
+        << "            const int64_t code = static_cast<int64_t>(" << at_pos(vs.read_expr, "i")
+        << ");\n"
+        << "            const char* k = keys_chars + code * key_width;\n"
+        << "            char* o = out + (out_base + rank) * key_width;\n"
+        << "            for (int32_t b = 0; b < key_width; ++b) o[b] = k[b];\n"
         << "        }\n"
         << "    }\n";
 }

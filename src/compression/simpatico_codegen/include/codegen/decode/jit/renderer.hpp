@@ -74,18 +74,42 @@ namespace codegen::decode::jit {
 //                    must hold ceil(n/1024)*32 words.  Extra params:
 //                    `int64_t pred_lo, int64_t pred_hi` (values are widened
 //                    to int64 for the compare).
-//   * mask_consume — K3: Bitpack-LEAF-root decode consuming a selection
-//                    mask plus per-chunk exclusive survivor offsets
-//                    (`chunk_offsets[c]` = compacted output base of chunk
-//                    c, length num_chunks+1), writing compacted output in
-//                    row order.  Skipped rows are never unpacked; chunks
-//                    with zero survivors early-return.  Extra params:
-//                    `const uint32_t* sel_mask, const uint32_t*
-//                    chunk_offsets`.
+//   * mask_consume — K3: decode consuming a selection mask plus per-chunk
+//                    exclusive survivor offsets (`chunk_offsets[c]` =
+//                    compacted output base of chunk c, length
+//                    num_chunks+1), writing compacted output in row order.
+//                    Supported roots:
+//                      - Bitpack leaf: skipped rows are never unpacked;
+//                        zero-survivor chunks early-return.
+//                      - Delta root (any value_source-supported
+//                        `differences` child, e.g. o_orderkey's
+//                        delta->bitpack): the per-chunk prefix-sum
+//                        reconstruction still runs in full (deltas are
+//                        sequential within a chunk), but only survivor
+//                        rows are WRITTEN — saves the full-column store +
+//                        the downstream compaction pass, not the unpack.
+//                    Extra params: `const uint32_t* sel_mask, const
+//                    uint32_t* chunk_offsets`.
+//   * mask_dict_gather — K5: Bitpack-LEAF-root decode of DICTIONARY CODES
+//                    consuming the selection mask like K3, but instead of
+//                    storing the code it gathers the key's bytes from a
+//                    CONSTANT-WIDTH, null-free key pool straight into the
+//                    compacted chars output (survivor rank r of chunk c
+//                    lands at (chunk_offsets[c]+r)*key_width).  Offsets
+//                    are analytic (j*key_width) and built by the caller.
+//                    Extra params: `const uint32_t* sel_mask, const
+//                    uint32_t* chunk_offsets, const char* keys_chars,
+//                    int32_t key_width`.
 //
-// Non-Bitpack-leaf tree shapes are rejected with RenderError for the mask
-// variants (Delta/RLE cannot row-skip — block-wide scan / run expansion).
-enum class DecodeVariant : std::uint8_t { plain = 0, mask_out = 1, mask_consume = 2 };
+// Unsupported (shape, variant) combinations are rejected with RenderError
+// (e.g. RLE cannot row-skip — run expansion; dict gather needs a bitpack
+// code leaf).
+enum class DecodeVariant : std::uint8_t {
+  plain            = 0,
+  mask_out         = 1,
+  mask_consume     = 2,
+  mask_dict_gather = 3,
+};
 
 // One decode-input channel the rendered kernel reads.  `field` is the
 // manifest key (`buffer_key(node_id, field)` resolves the device
