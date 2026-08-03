@@ -103,6 +103,7 @@ void with_initialized_streaming_fragment(
   duckdb::Connection& con,
   const std::string& query,
   std::vector<std::shared_ptr<cucascade::shared_data_repository>> output_repos,
+  std::optional<op::partition_spec> spec,
   const std::function<void(sirius_engine&, op::sirius_physical_streaming_sink&)>& consume);
 
 //! Path to the canonical TPC-H queries (`test/tpch_performance/tpch_queries/orig/`).

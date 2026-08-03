@@ -109,6 +109,7 @@ TEST_CASE_METHOD(streaming_sink_root_fixture,
     *con,
     "SELECT n_regionkey FROM nation",
     repos,
+    std::nullopt,
     [&](sirius::sirius_engine& engine, sirius_physical_streaming_sink& sink) {
       // The sink is the plan root and its subtree hangs off children[], so the plan generator
       // needs none of the out-of-tree descent the RESULT_COLLECTOR requires.
@@ -137,6 +138,7 @@ TEST_CASE_METHOD(streaming_sink_root_fixture,
     *con,
     "SELECT n_regionkey FROM nation",
     repos,
+    std::nullopt,
     [&](sirius::sirius_engine& engine, sirius_physical_streaming_sink& sink) {
       // This is the load-bearing invariant. on_finalize_operator() -- the sink's only route to
       // end-of-stream -- is driven by update_pipeline_status() iterating get_operators(), which
@@ -150,5 +152,30 @@ TEST_CASE_METHOD(streaming_sink_root_fixture,
       // complete once that pipeline finishes.
       REQUIRE(owning->get_sink().get() == &sink);
       REQUIRE(owning->is_query_terminal());
+    });
+}
+
+// ============================================================================
+// SINKROOT-3: a partitioned sink root exposes one output stream per destination
+// ============================================================================
+
+TEST_CASE_METHOD(streaming_sink_root_fixture,
+                 "SINKROOT-3: a partitioned sink root keeps its fan-out",
+                 "[integration][pipeline][streaming_sink_root]")
+{
+  auto repos = make_repos(3);
+
+  sirius::test::with_initialized_streaming_fragment(
+    *con,
+    "SELECT n_regionkey FROM nation",
+    repos,
+    sirius::op::partition_spec{{0}, {}},
+    [&](sirius::sirius_engine& engine, sirius_physical_streaming_sink& sink) {
+      REQUIRE(sink.num_output_streams() == 3);
+      REQUIRE(pipeline_with_operator(engine.sirius_pipelines, sink) != nullptr);
+      // Nothing has run, so every destination is empty but none has ended.
+      for (std::size_t i = 0; i < 3; ++i) {
+        REQUIRE_FALSE(sink.drained(i));
+      }
     });
 }
