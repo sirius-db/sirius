@@ -515,6 +515,24 @@ dict on p_brand/p_container/c_mktsegment, identity on 12 projected string payloa
 structurally identical to what K1 feeds the selection decoders today. Plus: q19-shape
 dual-delivery bool8, c_phone-class K6 widening, explorer per-column role input.
 
+### Iteration 7 (2026-08-03, commit 73f46779): the dynamic-filter frontier collected —
+**suite 6.918 s, 22/22 ×2 (0.01% spread) = −15.4% this session, campaign −56.7%.**
+
+Membership masks live (Phase A, zero new kernels): q17 −20.9%, q9 −7.1%, q8 −18.6%,
+q21 −10.2% — the 19.3 s DYNAMIC_FILTER bucket attacked from both ends (payloads compact
+during decode; the operator self-disables). Dual-delivery bool8: q19 −25.0%. Debugging
+lessons banked: drain-time snapshots precede join publication (fix: decode-time
+re-snapshot, the disk path's late-binding pattern); multi-probe cost is pure wave-1
+volume (nsys-attributed) → MAX_MEMBER=1 cap with keep-ordered sources (set forms before
+Blooms) turned both regressors into wins. The duckdb log sink ignores levels
+(duckdb_sink.cpp:61) — root cause of every DEBUG-invisible mystery this campaign; use
+SET sirius_log_backend='spdlog'.
+
+Iteration-8 shelf, pre-sized: K7 single-pass multi-probe with per-row short-circuit
+(re-admits q8's full conjunction, ~0.19 predicted, lifts the cap); K1-delta + pair
+machinery landed dark and unit-proven; dict/dual-delivery for arm-D side tables
+(q17's part scan with p_brand/p_container code masks); explorer per-column role input.
+
 ---
 
 ## On this machine (pmgb300ws-0163) — concrete paths
