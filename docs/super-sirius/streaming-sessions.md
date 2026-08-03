@@ -224,14 +224,52 @@ sweep can see and spill them (GPU → host → disk). Cross-fragment and cross-q
 scheduling concern (per-fragment priority), and a future sink↔source slowness signal would be
 additive — nothing in this design forecloses it.
 
+## `exec::streaming_fragment` — plan builder + blocking runner
+
+**Files:** `src/include/exec/streaming_fragment.hpp`, `src/exec/streaming_fragment.cpp`
+
+Owns a complete fragment life cycle: declares inputs, builds the plan, constructs the sink, runs,
+and keeps the output pullable after `run()` returns.
+
+```
+fragment_spec spec = { plan_source, inputs, outputs, partitioning };
+streaming_fragment frag(context, spec);
+frag.build(query_id);   // declare → plan → create operators → register with session
+// push batches into frag.session() here if this fragment has inputs
+frag.run();             // blocks until all pipelines finish
+// pull from frag.session() until drained
+```
+
+Two lifetime decisions are load-bearing:
+
+**Repositories outlive the engine.** The fragment creates every repository before planning and
+registers none of them with `data_repository_manager_`. The query window's mandatory cleanup
+(`StandaloneQueryScope::finish()`) therefore cannot touch them. A sender's output stays in its
+repository and is still there when the receiver runs — which is what makes sequential streaming
+work without copying.
+
+**One query window, shared.** `run()` reuses the caller's `StandaloneQueryScope` rather than
+opening its own. A second scope resets the task creator and scan manager that `build()` populated;
+the fragment would then run zero tasks and return silently empty. The caller brackets `build()`
+and `run()` in one window (as `Context::execute_substrait` does for ordinary queries).
+
+**`stream_bind_catalog` bridges bind time and plan time.** DuckDB's table-function bind runs
+long before physical planning. The catalog is registered as a `ClientContextState` so
+`sirius_stream_source(id)` can resolve a schema at bind time; the physical plan generator
+re-reads the catalog at plan time to build each `STREAMING_SOURCE`.
+
 ## Tests
 
-| File | Catch2 tag |
+| File | Catch2 tags |
 |---|---|
 | `test/cpp/exec/test_batch_stream.cpp` | `[batch_stream]` |
 | `test/cpp/operator/test_physical_streaming_source.cpp` | `[streaming_source]` |
 | `test/cpp/operator/test_physical_streaming_sink.cpp` | `[streaming_sink]` |
 | `test/cpp/exec/test_stream_session.cpp` | `[stream_session]` |
+| `test/cpp/exec/test_stream_bind_catalog.cpp` | `[stream_bind_catalog]` |
+| `test/cpp/exec/test_streaming_fragment.cpp` | `[streaming_fragment]`, `[streaming_fragment_control]` |
+| `test/cpp/pipeline/test_streaming_sink_root.cpp` | `[streaming_sink_root]`, `[streaming_sink_root_exec]` |
 
 A `recording_task_creator` stands in for the scheduler, so the live re-arm and the `on_data`
-hook path are proven without a live executor.
+hook path are proven without a live executor. `test_streaming_fragment.cpp` requires a GPU and
+a real DuckDB integration database (`[integration]` tag).
