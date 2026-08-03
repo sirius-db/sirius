@@ -1033,48 +1033,37 @@ std::unique_ptr<cudf::column> try_dict_k5_fast_path(PlanTree const& tree,
   }
   if (keys_offsets_rep == nullptr || keys_chars_rep == nullptr) { return nullptr; }
 
-  // Key-width measurement, ONCE per stored rep (pin lifetime): the first
-  // decoder D2H's the K+1 offsets (K <= 150 for every TPC-H dict column — a
-  // few hundred bytes) and host-syncs; every later batch of every query reads
-  // the cached verdict with no decode, no D2H, no sync (audit iteration-6
-  // rank 5: this probe was 44 round-trips/iteration on q1). Failures record
-  // the -1 sentinel (variable/unusable) — sticky general-route downgrade,
-  // never a wedge.
-  auto& cache = keys_offsets_rep->decode_cache;
-  std::call_once(cache.key_width_once, [&] {
-    cache.key_width = -1;
-    std::string once_err;
-    auto keys_offsets =
-      decompress_standalone_representation(keys_offsets_rep, stream, mr, &once_err);
-    if (!keys_offsets || keys_offsets->type().id() != cudf::type_id::INT32 ||
-        keys_offsets->size() < 2 || keys_offsets->null_count() != 0) {
-      return;
-    }
-    auto const n_offsets = static_cast<std::size_t>(keys_offsets->size());
-    std::vector<std::int32_t> host_offsets(n_offsets);
-    if (cudaMemcpyAsync(host_offsets.data(),
-                        keys_offsets->view().head<void>(),
-                        n_offsets * sizeof(std::int32_t),
-                        cudaMemcpyDeviceToHost,
-                        stream.value()) != cudaSuccess ||
-        cudaStreamSynchronize(stream.value()) != cudaSuccess) {
-      return;
-    }
-    std::int32_t const measured = host_offsets[1] - host_offsets[0];
-    if (measured < 1) { return; }
-    for (std::size_t i = 2; i < n_offsets; ++i) {
-      if (host_offsets[i] - host_offsets[i - 1] != measured) { return; }
-    }
-    cache.key_width = measured;
-  });
-  std::int32_t const width = cache.key_width;
-  if (width < 1) { return nullptr; }
-
   std::string err;
+  auto keys_offsets = decompress_standalone_representation(keys_offsets_rep, stream, mr, &err);
+  if (!keys_offsets || keys_offsets->type().id() != cudf::type_id::INT32 ||
+      keys_offsets->size() < 2 || keys_offsets->null_count() != 0) {
+    return nullptr;
+  }
   auto keys_chars = decompress_standalone_representation(keys_chars_rep, stream, mr, &err);
   if (!keys_chars || keys_chars->type().id() != cudf::type_id::UINT8 ||
       keys_chars->null_count() != 0) {
     return nullptr;
+  }
+
+  // Key-width measurement: D2H the K+1 offsets (K <= 150 for every TPC-H dict
+  // column — a few hundred bytes) on the decode stream, then require a
+  // constant width. The classic path pays an equivalent lazy probe inside
+  // dictionary decompress (constant_key_width), so this adds no new sync
+  // class; a plan-side cache is a follow-up (needs a mutable PlanNode slot).
+  auto const n_offsets = static_cast<std::size_t>(keys_offsets->size());
+  std::vector<std::int32_t> host_offsets(n_offsets);
+  if (cudaMemcpyAsync(host_offsets.data(),
+                      keys_offsets->view().head<void>(),
+                      n_offsets * sizeof(std::int32_t),
+                      cudaMemcpyDeviceToHost,
+                      stream.value()) != cudaSuccess ||
+      cudaStreamSynchronize(stream.value()) != cudaSuccess) {
+    return nullptr;
+  }
+  std::int32_t const width = host_offsets[1] - host_offsets[0];
+  if (width < 1) { return nullptr; }
+  for (std::size_t i = 2; i < n_offsets; ++i) {
+    if (host_offsets[i] - host_offsets[i - 1] != width) { return nullptr; }
   }
 
   // Bind the codes (indices) region; entropy tails resolve through a local

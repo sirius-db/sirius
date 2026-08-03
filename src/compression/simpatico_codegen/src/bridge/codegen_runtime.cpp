@@ -15,12 +15,8 @@
 //      across compress and decompress). First touch pays the nvrtc compile;
 //      warm hits are cheap. CUfunction is derived per-device at launch time.
 //   3. cuLaunchKernel binds the labeled buffers as flat per-field device
-//      pointers in the kernel's parameter order and enqueues the rendered
-//      __global__ kernel on the caller's stream; transients are freed
-//      stream-ordered on that same stream.  Decode launchers are ASYNC by
-//      contract: all work is enqueued on the handed stream before returning
-//      (no internal stream hops, no sync) — callers own any cross-stream
-//      join before consuming the output.
+//      pointers in the kernel's parameter order, runs over the rendered
+//      __global__ kernel, syncs the stream, and frees the transients.
 //
 // Restrictions: int32/int64 dtypes; fused leaf kinds bitpack/delta/rle/for/
 // zigzag (+ the synthesized raw passthrough).
@@ -155,6 +151,35 @@ bool maybe_raise_smem(CUfunction fn, int dynamic_bytes, const char* ctx)
   return true;
 }
 
+// Fill ``d_bp_off`` (int32[num_chunks+1]) with the exclusive-prefix scan of the
+// per-chunk live-word counts (derived from chunk_bits × chunk_count) plus the
+// [num_chunks] total sentinel, so bp_offsets[c+1]-bp_offsets[c] == live_words[c].
+// ``alloc_scratch(bytes)`` supplies CUB temp storage that must stay live until
+// this returns (the caller owns it). Shared by the encode-side compaction and
+// the decode-side transient synthesis. Returns 0 on success, else the failing
+// cuda/rc code.
+int compute_bp_offsets(const void* cc_p,
+                       const void* cb_p,
+                       std::int32_t num_chunks,
+                       void* d_bp_off,
+                       const std::function<void*(std::size_t)>& alloc_scratch,
+                       void* stream_v)
+{
+  std::size_t scratch_bytes = 0;
+  if (int rc = simpatico_compute_bp_offsets_scan(
+        cc_p, cb_p, num_chunks, d_bp_off, /*d_temp_storage=*/nullptr, &scratch_bytes, stream_v);
+      rc != 0) {
+    return rc;
+  }
+  void* d_scratch = scratch_bytes > 0 ? alloc_scratch(scratch_bytes) : nullptr;
+  if (int rc = simpatico_compute_bp_offsets_scan(
+        cc_p, cb_p, num_chunks, d_bp_off, d_scratch, &scratch_bytes, stream_v);
+      rc != 0) {
+    return rc;
+  }
+  return simpatico_compute_bp_offsets_tail(cc_p, cb_p, num_chunks, d_bp_off, stream_v);
+}
+
 // Render-side kernel compile: optionally dump the source (``dump_env`` names an
 // env var holding a path), then compile-or-warm-cache the rendered source.
 // Returns the cached kernel, or nullptr on any failure (logged with ``ctx`` as
@@ -196,45 +221,6 @@ const jit::CompiledKernel* compile_rendered(const std::string& source,
 }  // namespace
 
 namespace simpatico {
-
-// Fill ``d_bp_off`` (int32[num_chunks+1]) with the exclusive-prefix scan of the
-// per-chunk live-word counts (derived from chunk_bits × chunk_count) plus the
-// [num_chunks] total sentinel, so bp_offsets[c+1]-bp_offsets[c] == live_words[c].
-// ``alloc_scratch(bytes)`` supplies CUB temp storage that must stay live until
-// the enqueued scan completes (stream-ordered lifetime on ``stream_v`` is
-// fine). Shared by the encode-side compaction and the decode-side transient
-// synthesis; EXPORTED (codegen_bridge.hpp) so rep-level caches can compute
-// bp_offsets once and pre-bind them (the decode launchers then skip their
-// per-launch recomputation). Enqueues on ``stream_v`` only. Returns 0 on
-// success, else the failing cuda/rc code.
-int compute_bp_offsets(const void* d_chunk_count,
-                       const void* d_chunk_bits,
-                       std::int32_t num_chunks,
-                       void* d_bp_offsets,
-                       const std::function<void*(std::size_t)>& alloc_scratch,
-                       void* stream_v)
-{
-  std::size_t scratch_bytes = 0;
-  if (int rc = simpatico_compute_bp_offsets_scan(d_chunk_count,
-                                                 d_chunk_bits,
-                                                 num_chunks,
-                                                 d_bp_offsets,
-                                                 /*d_temp_storage=*/nullptr,
-                                                 &scratch_bytes,
-                                                 stream_v);
-      rc != 0) {
-    return rc;
-  }
-  void* d_scratch = scratch_bytes > 0 ? alloc_scratch(scratch_bytes) : nullptr;
-  if (int rc = simpatico_compute_bp_offsets_scan(
-        d_chunk_count, d_chunk_bits, num_chunks, d_bp_offsets, d_scratch, &scratch_bytes, stream_v);
-      rc != 0) {
-    return rc;
-  }
-  return simpatico_compute_bp_offsets_tail(
-    d_chunk_count, d_chunk_bits, num_chunks, d_bp_offsets, stream_v);
-}
-
 namespace {
 
 // ---------------------------------------------------------------------------
@@ -378,8 +364,7 @@ bool synthesize_decode_transients(const jit::FusedTree& tree,
                                   const std::function<CUdeviceptr(std::size_t)>& alloc,
                                   void* stream_v,
                                   jit::LabeledBuffers& out,
-                                  std::string* err,
-                                  std::vector<std::string>* synthesized_keys = nullptr)
+                                  std::string* err)
 {
   std::vector<const jit::FusedTree*> nodes;
   dfs_nodes(tree, nodes);
@@ -396,17 +381,6 @@ bool synthesize_decode_transients(const jit::FusedTree& tree,
         return false;
       }
       const std::int64_t num_chunks = static_cast<std::int64_t>(cc_it->second.length);
-      const std::string bp_key      = jit::buffer_key(node_id, "bp_offsets");
-      // Memoization hook: a caller-pre-bound bp_offsets (rep-level cache,
-      // full num_chunks+1 length) is trusted and NOT recomputed.  Entries
-      // synthesized HERE are per-launch transients: the launch wrappers
-      // erase them from ``out`` after the launch is enqueued, so a stale
-      // transient pointer can never masquerade as a cached one later.
-      if (auto pre = out.find(bp_key);
-          pre != out.end() && pre->second.ptr != nullptr &&
-          pre->second.length >= static_cast<std::size_t>(num_chunks) + 1) {
-        continue;
-      }
       // Every bitpack rep is dense, so decode uses the Compact gather:
       // synthesize the per-chunk ``bp_offsets`` on-device via a CUB scan of
       // chunk_bits × chunk_count.
@@ -419,7 +393,7 @@ bool synthesize_decode_transients(const jit::FusedTree& tree,
 
         // Transients (bp_offsets + CUB scratch) both come from the caller's
         // ``alloc`` pool, so the shared helper's scratch outlives the scan.
-        if (int rc = simpatico::compute_bp_offsets(
+        if (int rc = compute_bp_offsets(
               cc_p,
               cb_p,
               static_cast<std::int32_t>(num_chunks),
@@ -430,10 +404,9 @@ bool synthesize_decode_transients(const jit::FusedTree& tree,
           if (err) *err = "compute_bp_offsets failed (cudaError=" + std::to_string(rc) + ")";
           return false;
         }
-        out[bp_key] = {reinterpret_cast<const void*>(d_bp_off),
-                       static_cast<std::size_t>(num_chunks) + 1,
-                       sizeof(std::int32_t)};
-        if (synthesized_keys != nullptr) synthesized_keys->push_back(bp_key);
+        out[jit::buffer_key(node_id, "bp_offsets")] = {reinterpret_cast<const void*>(d_bp_off),
+                                                       static_cast<std::size_t>(num_chunks) + 1,
+                                                       sizeof(std::int32_t)};
       }
     } else if (node.op == cc::OpKind::Rle) {
       auto ro_it = out.find(jit::buffer_key(node_id, "rle_runs_offsets"));
@@ -633,12 +606,10 @@ int run_rendered_decode(const jit::FusedTree& tree,
                      "rendered decode: cuLaunchKernel failed");
   lap("launch");
 
-  // NO stream sync here: the launcher contract is that ALL work — transient
-  // bp_offsets scan included — is enqueued on the handed stream before
-  // returning, and nothing host-side reads device results. Transient frees
-  // are stream-ordered on the same stream (rmm), so the enqueued kernel
-  // finishes before its inputs are recycled. Callers own any cross-stream
-  // join before consuming the output.
+  SIMPATICO_CUDA_CHECK(cudaStreamSynchronize(reinterpret_cast<cudaStream_t>(stream_ptr)),
+                       -1,
+                       "rendered decode: stream sync failed");
+  lap("sync");
   return 1;
 }
 
@@ -654,13 +625,10 @@ namespace simpatico {
 // ``buffer_key(node_id, field)`` — exactly the ids ``run_rendered_decode``
 // resolves against. This function only adds the decode-only transients the
 // encoder never stores (Compact ``bp_offsets`` CUB scan, RLE scratch), compiles
-// (or warm-cache hits) the rendered decode kernel, and enqueues the launch on
-// the caller's stream (ASYNC — no sync on return; callers join streams before
-// consuming the output).
+// (or warm-cache hits) the rendered decode kernel, launches, and synchronises.
 //
-// All device transients come from the RMM async pool and are freed
-// stream-ordered on the same stream when this returns, so they outlive the
-// enqueued kernel. ``labeled`` is mutated in place (transients are added).
+// All device transients come from the RMM async pool and are freed when this
+// returns. ``labeled`` is mutated in place (transients are added).
 //
 // Returns 1 on success, -1 on any failure (logged to stderr).
 namespace {
@@ -709,9 +677,7 @@ bool launch_decode_fused_tree_impl(codegen::jit::FusedTree const& tree,
     };
 
     std::string err;
-    std::vector<std::string> synthesized;
-    if (!synthesize_decode_transients(
-          tree, elem_size, alloc, stream.value(), labeled, &err, &synthesized)) {
+    if (!synthesize_decode_transients(tree, elem_size, alloc, stream.value(), labeled, &err)) {
       std::fprintf(stderr,
                    "simpatico::codegen: launch_decode_fused_tree: transient synth failed: %s\n",
                    err.c_str());
@@ -722,20 +688,14 @@ bool launch_decode_fused_tree_impl(codegen::jit::FusedTree const& tree,
 
     // run_rendered_decode is an internal helper with a uintptr_t ABI; the public
     // signature is C++-typed, so convert once here.
-    const int rc = run_rendered_decode(tree,
-                                       cxx_dtype,
-                                       labeled,
-                                       num_rows,
-                                       reinterpret_cast<std::uintptr_t>(out),
-                                       reinterpret_cast<std::uintptr_t>(stream.value()),
-                                       [&](const char* what) { _lap(what); },
-                                       va);
-    // Drop the per-launch transient entries so the map never carries a
-    // dangling pointer into a later call (caller-pre-bound bp_offsets — the
-    // memoized case — are untouched: they were skipped, not synthesized).
-    for (const auto& k : synthesized)
-      labeled.erase(k);
-    return rc == 1;
+    return run_rendered_decode(tree,
+                               cxx_dtype,
+                               labeled,
+                               num_rows,
+                               reinterpret_cast<std::uintptr_t>(out),
+                               reinterpret_cast<std::uintptr_t>(stream.value()),
+                               [&](const char* what) { _lap(what); },
+                               va) == 1;
   } catch (const jit::CompileError& e) {
     std::fprintf(
       stderr,
@@ -963,8 +923,8 @@ bool launch_masked_char_copy(void const* chars,
                                     nullptr),
                      false,
                      "masked char copy: cuLaunchKernel failed");
-  // Async by contract: the copy is enqueued on the handed stream; no
-  // host-visible results, no internal stream hops, nothing to sync here.
+  SIMPATICO_CUDA_CHECK(
+    cudaStreamSynchronize(stream.value()), false, "masked char copy: stream sync failed");
   return true;
 }
 
@@ -1041,28 +1001,20 @@ bool launch_decode_fused_tree_pair_mask_out(codegen::jit::FusedTree const& tree_
                                                   : 4u;
     };
     std::string err;
-    std::vector<std::string> synth_a, synth_b;
     if (!synthesize_decode_transients(
-          tree_a, elem_size_of(cxx_a), alloc, stream.value(), labeled_a, &err, &synth_a) ||
+          tree_a, elem_size_of(cxx_a), alloc, stream.value(), labeled_a, &err) ||
         !synthesize_decode_transients(
-          tree_b, elem_size_of(cxx_b), alloc, stream.value(), labeled_b, &err, &synth_b)) {
+          tree_b, elem_size_of(cxx_b), alloc, stream.value(), labeled_b, &err)) {
       std::fprintf(
         stderr, "simpatico::codegen: pair_mask_out: transient synth failed: %s\n", err.c_str());
       return false;
     }
 
     // Merged binding map: column A stays node 0; column B re-keys "0.*" -> "1.*".
-    // ``merged`` copies the entries, so the per-launch transient keys can be
-    // dropped from the callers' maps right away (no dangling entries survive
-    // this call; pre-bound memoized bp_offsets were skipped, not synthesized).
     jit::LabeledBuffers merged = labeled_a;
     for (const auto& [key, buf] : labeled_b) {
       if (key.rfind("0.", 0) == 0) { merged["1." + key.substr(2)] = buf; }
     }
-    for (const auto& k : synth_a)
-      labeled_a.erase(k);
-    for (const auto& k : synth_b)
-      labeled_b.erase(k);
 
     cdj::DecodeKernelSpec spec;
     try {
@@ -1125,9 +1077,8 @@ bool launch_decode_fused_tree_pair_mask_out(codegen::jit::FusedTree const& tree_
                                       nullptr),
                        false,
                        "pair mask: cuLaunchKernel failed");
-    // Async by contract: everything (both columns' transient scans + the
-    // kernel) is enqueued on the handed stream; transient frees at scope
-    // exit are stream-ordered on that same stream.
+    SIMPATICO_CUDA_CHECK(
+      cudaStreamSynchronize(stream.value()), false, "pair mask: stream sync failed");
     return true;
   } catch (const jit::CompileError& e) {
     std::fprintf(stderr,

@@ -164,11 +164,6 @@ bool compact_packed_on_host(GpuEncoded& enc, std::int64_t nc, std::int32_t node_
   CUdeviceptr d = enc.upload_bytes(dense.data(), dense.size() * 4);
   enc.buffers[key_packed] =
     jit::LabeledBuffer{reinterpret_cast<const void*>(d), dense.size(), sizeof(std::uint32_t)};
-  // Drop the harness-injected OverAllocate-stride bp_offsets: the launchers
-  // trust a pre-bound bp_offsets entry (rep-level memoization), and the
-  // stride offsets are wrong for the dense layout just uploaded — erasing
-  // makes the launcher synthesize the matching dense offsets per launch.
-  enc.buffers.erase(jit::buffer_key(node_id, "bp_offsets"));
   return true;
 }
 
@@ -408,45 +403,6 @@ bool run_roundtrip(const std::string& dtype, std::int64_t base, std::int64_t ran
     std::printf("PASS: %s k4-singleton (row=%lld)\n",
                 dtype.c_str(),
                 static_cast<long long>(row));
-  }
-
-  // Exported compute_bp_offsets + memoization guard: pre-bind dense offsets
-  // once, verify the launcher reuses them (correct decode) and does NOT
-  // erase the pre-bound entry (only per-launch synthesized transients are
-  // dropped).
-  {
-    const auto& cc    = enc.buffers.at(jit::buffer_key(0, "chunk_count"));
-    const auto& cb    = enc.buffers.at(jit::buffer_key(0, "chunk_bits"));
-    CUdeviceptr d_off = enc.alloc((static_cast<std::size_t>(nc) + 1) * sizeof(std::int32_t));
-    REQUIRE_MSG(
-      simpatico::compute_bp_offsets(
-        cc.ptr,
-        cb.ptr,
-        static_cast<std::int32_t>(nc),
-        reinterpret_cast<void*>(d_off),
-        [&](std::size_t bytes) { return reinterpret_cast<void*>(enc.alloc(bytes)); },
-        stream.value()) == 0,
-      "[%s] exported compute_bp_offsets failed",
-      dtype.c_str());
-    enc.buffers[jit::buffer_key(0, "bp_offsets")] = jit::LabeledBuffer{
-      reinterpret_cast<const void*>(d_off), static_cast<std::size_t>(nc) + 1, sizeof(std::int32_t)};
-
-    REQUIRE_MSG(simpatico::launch_decode_fused_tree(
-                  *tree, enc.buffers, dtype.c_str(), n, reinterpret_cast<void*>(d_plain), stream),
-                "[%s] memoized plain decode failed",
-                dtype.c_str());
-    std::vector<Element> memo(static_cast<std::size_t>(n));
-    cudaMemcpy(memo.data(),
-               reinterpret_cast<const void*>(d_plain),
-               memo.size() * sizeof(Element),
-               cudaMemcpyDeviceToHost);
-    REQUIRE_MSG(memo == data, "[%s] memoized decode != input", dtype.c_str());
-    auto it = enc.buffers.find(jit::buffer_key(0, "bp_offsets"));
-    REQUIRE_MSG(it != enc.buffers.end() && it->second.ptr == reinterpret_cast<const void*>(d_off),
-                "[%s] pre-bound bp_offsets must survive the launch (memoization contract)",
-                dtype.c_str());
-    enc.buffers.erase(jit::buffer_key(0, "bp_offsets"));  // leave the map as the other cases expect
-    std::printf("PASS: %s bp_offsets-memoization\n", dtype.c_str());
   }
   return true;
 }

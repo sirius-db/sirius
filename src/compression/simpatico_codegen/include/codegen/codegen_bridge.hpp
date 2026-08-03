@@ -76,32 +76,9 @@ std::unique_ptr<cudf::column> decode_fused_subtree(PlanTree const& tree,
                                                    rmm::device_async_resource_ref const& mr,
                                                    std::string* error_out);
 
-/// Fill ``d_bp_offsets`` (int32[num_chunks+1]) with the exclusive-prefix scan
-/// of the per-chunk live-word counts derived from chunk_bits x chunk_count,
-/// plus the [num_chunks] total sentinel (so bp_offsets[c+1]-bp_offsets[c] ==
-/// live_words[c]). ``alloc_scratch(bytes)`` supplies CUB temp storage that
-/// must stay live until the enqueued scan completes (stream-ordered lifetime
-/// on the same stream is sufficient). Enqueues on ``stream_v`` (a
-/// cudaStream_t) only — no sync, no other streams. Returns 0 on success, else
-/// a cuda error code.
-///
-/// Exported for rep-level bp_offsets memoization: compute once per (column,
-/// bitpack node), keep the buffer alive rep-side, and pre-bind it as
-/// ``buffer_key(node_id, "bp_offsets")`` in the LabeledBuffers handed to the
-/// decode launchers — synthesize_decode_transients trusts a pre-bound entry
-/// (non-null, length >= num_chunks+1) and skips its per-launch recomputation.
-int compute_bp_offsets(const void* d_chunk_count,
-                       const void* d_chunk_bits,
-                       std::int32_t num_chunks,
-                       void* d_bp_offsets,
-                       const std::function<void*(std::size_t)>& alloc_scratch,
-                       void* stream_v);
-
 /// Launch an already-prepared fused decode tree. ``labeled`` must contain all
-/// persisted buffers; this adds decode-only transients (dropped from
-/// ``labeled`` again before returning; caller-pre-bound bp_offsets are kept
-/// and reused), renders/compiles, and enqueues the kernel into ``out`` on
-/// ``stream`` (async — callers join streams before consuming the output).
+/// persisted buffers; this adds decode-only transients, renders/compiles, and
+/// launches the kernel into ``out``.
 bool launch_decode_fused_tree(codegen::jit::FusedTree const& tree,
                               codegen::jit::LabeledBuffers& labeled,
                               char const* dtype,

@@ -3,14 +3,10 @@
 // Companions to ``simpatico::launch_decode_fused_tree`` (codegen_bridge.hpp):
 // same LabeledBuffers contract (persisted channels keyed
 // ``buffer_key(node_id, field)``; decode-only transients such as bp_offsets
-// are synthesized inside), same false-on-failure (logged to stderr).
-// ALL launchers here are ASYNC by contract: every piece of device work is
-// enqueued on the handed stream before returning (no internal stream hops,
-// no sync-on-return; transient frees are stream-ordered on the same stream).
-// Callers own any cross-stream join before consuming outputs.  The K1/K3
-// entry points require the fused tree to be a **Bitpack leaf root** (K3 also
-// accepts Delta roots); unsupported shapes are rejected at render time and
-// return false, so callers can fall back to the plain decode path.
+// are synthesized inside), same stream-sync-on-return, same false-on-failure
+// (logged to stderr).  Both require the fused tree to be a **Bitpack leaf
+// root**; any other shape is rejected at render time and returns false, so
+// callers can fall back to the plain decode path.
 //
 // These entry points are dead code unless the wave orchestrator calls them
 // (engine gate SIRIUS_EXP_FUSED_SCAN_FILTER lives there): the plain decode

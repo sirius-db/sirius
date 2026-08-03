@@ -12,10 +12,6 @@
 #include <cudf/types.hpp>
 #include <cudf/utilities/default_stream.hpp>
 
-#include <rmm/device_buffer.hpp>
-
-#include <mutex>
-
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_buffer.hpp>
 #include <rmm/mr/per_device_resource.hpp>
@@ -117,33 +113,6 @@ struct compressed_representation {
   cudf::size_type num_rows{0};
   // Channel columns in registry order (populated by subclass constructors).
   std::vector<std::unique_ptr<cudf::column>> channels_;
-
-  /// One-shot decode-side caches, computed lazily on the FIRST decode of a
-  /// stored rep and reused by every later decode of the same pin (reps live
-  /// for the pin's lifetime; queries re-decode them once per batch today).
-  ///
-  /// call_once discipline: the winner fully materializes the value AND
-  /// stream-synchronizes before returning, so later readers on any stream
-  /// need no extra ordering; concurrent losers block until then. Populate
-  /// paths must record the failure sentinel instead of throwing out of the
-  /// once, so decode degrades (recompute / fall back), never wedges.
-  struct decode_time_cache {
-    /// bp_offsets decode transient (int32[num_chunks+1]) of a bitpack rep —
-    /// a pure function of the stored chunk_bits x chunk_count, otherwise
-    /// recomputed via a multi-launch CUB scan on EVERY decode. Empty until
-    /// computed. Allocate from the process-lifetime device resource, not a
-    /// per-call pool.
-    std::once_flag bp_offsets_once;
-    rmm::device_buffer bp_offsets;
-    /// Uniform key byte-width of a dictionary keys_offsets rep (K5 fast
-    /// path): -2 = not measured yet, -1 = variable/unusable, >= 1 = uniform.
-    std::once_flag key_width_once;
-    std::int32_t key_width = -2;
-  };
-  /// Mutable: decode-side caches on a logically-const stored rep. Makes reps
-  /// non-copyable/non-movable, which they already are in practice (always
-  /// held by unique_ptr on PlanNodes/channels).
-  mutable decode_time_cache decode_cache;
 
   compressed_representation() = default;
   compressed_representation(cudf::data_type t, cudf::size_type n) : original_type(t), num_rows(n) {}
