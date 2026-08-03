@@ -227,23 +227,16 @@ using leaf_buffer_fill =
   std::function<void(std::size_t i, void* dst_device, std::size_t size, rmm::cuda_stream_view)>;
 
 // Bytes make_col allocates from leaf_mr for one enumerated buffer: the leaf column
-// is sized to the DECODED element count (num_rows) times the element width, plus the
-// bitpack gather slop for "packed" buffers — NOT the compressed byte count. Must stay
-// in lockstep with make_col below; build_compressed_table_header records this so a slab
+// is sized to the DECODED element count (num_rows) times the element width — NOT the
+// compressed byte count. Every buffer that a decode kernel over-reads carries the
+// reachable tail inside its own num_rows, so this stays a plain product. Must stay in
+// lockstep with make_col below; build_compressed_table_header records this so a slab
 // caller reserves the right slice size (a decode kernel reaches the whole column).
-static std::uint64_t leaf_alloc_bytes(std::string_view name,
-                                      std::uint8_t type_tag,
-                                      std::uint64_t num_rows)
+static std::uint64_t leaf_alloc_bytes(std::uint8_t type_tag, std::uint64_t num_rows)
 {
   cudf::data_type const dt = tag_to_dtype(type_tag);
   auto const width         = static_cast<std::uint64_t>(cudf::size_of(dt));
-  auto const elem          = std::max<std::uint64_t>(width, 1);
-  std::uint64_t pad_elems  = 0;
-  if (name == "packed") {
-    constexpr std::uint64_t kBitpackGatherSlopBytes = 2 * sizeof(std::uint32_t);
-    pad_elems                                       = (kBitpackGatherSlopBytes + elem - 1) / elem;
-  }
-  return (num_rows + pad_elems) * width;
+  return num_rows * width;
 }
 
 static std::unique_ptr<compressed_representation> rep_from_leaf_desc(
@@ -263,23 +256,8 @@ static std::unique_ptr<compressed_representation> rep_from_leaf_desc(
   auto make_col = [&](std::size_t i) -> std::unique_ptr<cudf::column> {
     auto const& bd     = bufs[i];
     cudf::data_type dt = tag_to_dtype(bd.type_tag);
-    // simpatico_bitunpack_one (decode kPrelude) does a fixed 3-word gather
-    // — packed[word_in], [word_in+1], [word_in+2] — so decoding the last
-    // element of a bitpacked "packed" buffer reads up to 2 uint32 words past
-    // its logical end. Over-allocate those buffers by 2 words of tail slop so
-    // the read stays in bounds. The slop is masked off in the decode, so its
-    // (uninitialized) contents never affect the result; only its addressability
-    // matters. Without it the OOB read faults the context and cascades into
-    // unrelated decode-kernel launch failures on concurrent streams.
-    constexpr cudf::size_type kBitpackGatherSlopBytes =
-      2 * static_cast<cudf::size_type>(sizeof(std::uint32_t));
-    cudf::size_type pad_elems = 0;
-    if (bd.name == "packed") {
-      auto const elem = std::max<std::size_t>(cudf::size_of(dt), 1);
-      pad_elems       = static_cast<cudf::size_type>((kBitpackGatherSlopBytes + elem - 1) / elem);
-    }
-    auto col = cudf::make_numeric_column(dt,
-                                         static_cast<cudf::size_type>(bd.num_rows) + pad_elems,
+    auto col           = cudf::make_numeric_column(dt,
+                                         static_cast<cudf::size_type>(bd.num_rows),
                                          cudf::mask_state::UNALLOCATED,
                                          stream,
                                          leaf_mr);
@@ -337,7 +315,15 @@ static std::unique_ptr<compressed_representation> rep_from_leaf_desc(
     std::string(cname), names, std::move(cols), stream, mr, err, ld.meta);
 }
 
-static constexpr std::uint8_t kVersion = 10;
+// Payload layout identifier. A reader accepts only an exact match (parse_hpln_header),
+// so this must advance whenever the meaning of the serialized bytes changes — including
+// changes that keep every field in place but reinterpret one, which no structural check
+// downstream could catch.
+//
+// 11: a Bitpack "packed" buffer counts its decode gather guard words in num_rows, so the
+//     stored word count is what the reader allocates and the guard needs no read-side
+//     reconstruction (see compact_bitpack_packed).
+static constexpr std::uint8_t kVersion = 11;
 
 // Serialize one node's structure (op, bitjoin params, edges, output names).
 // Other ops carry their params in the op name, so only bitjoin needs attrs.
@@ -816,11 +802,10 @@ std::string build_compressed_table_header(compressed_table const& table,
 
         // Record the buffer for the caller to stage out of device memory; no
         // bytes are copied here.
-        out_buffers.push_back(
-          payload_buffer_ref{payload_offset,
-                             bd.device_ptr,
-                             bd.size_bytes,
-                             leaf_alloc_bytes(bd.name, bd.type_tag, bd.num_rows)});
+        out_buffers.push_back(payload_buffer_ref{payload_offset,
+                                                 bd.device_ptr,
+                                                 bd.size_bytes,
+                                                 leaf_alloc_bytes(bd.type_tag, bd.num_rows)});
         payload_offset += bd.size_bytes;
       }
     }

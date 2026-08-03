@@ -12,15 +12,15 @@ axum = "0.8"
 clap = { version = "4", features = ["derive", "env"] }
 instrumentation-model = { path = "../model", features = ["collector"] }
 sirius-telemetry-analyzer = { path = "../analyzer" }
-quent-collector = { git = "https://github.com/rapidsai/quent.git", rev = "4a3107e15e85e97eb4e77f0c02a84a8591a5ca3b" }
-quent-io = { git = "https://github.com/rapidsai/quent.git", rev = "4a3107e15e85e97eb4e77f0c02a84a8591a5ca3b" }
-quent-query-engine-server = { git = "https://github.com/rapidsai/quent.git", rev = "4a3107e15e85e97eb4e77f0c02a84a8591a5ca3b" }
+quent-collector = { git = "https://github.com/rapidsai/quent.git", rev = "2a5ca83442953cbea1c9c53560808104f6b59127" }
+quent-io = { git = "https://github.com/rapidsai/quent.git", rev = "2a5ca83442953cbea1c9c53560808104f6b59127" }
+quent-query-engine-server = { git = "https://github.com/rapidsai/quent.git", rev = "2a5ca83442953cbea1c9c53560808104f6b59127" }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros"] }
 tracing = "0.1"
 uuid = "1"
 
 [build-dependencies]
-quent-simulator-ui = { git = "https://github.com/rapidsai/quent.git", rev = "4a3107e15e85e97eb4e77f0c02a84a8591a5ca3b" }
-quent-query-engine-ui = { git = "https://github.com/rapidsai/quent.git", rev = "4a3107e15e85e97eb4e77f0c02a84a8591a5ca3b" }
-quent-ui = { git = "https://github.com/rapidsai/quent.git", rev = "4a3107e15e85e97eb4e77f0c02a84a8591a5ca3b" }
+quent-simulator-ui = { git = "https://github.com/rapidsai/quent.git", rev = "2a5ca83442953cbea1c9c53560808104f6b59127" }
+quent-query-engine-ui = { git = "https://github.com/rapidsai/quent.git", rev = "2a5ca83442953cbea1c9c53560808104f6b59127" }
+quent-ui = { git = "https://github.com/rapidsai/quent.git", rev = "2a5ca83442953cbea1c9c53560808104f6b59127" }
 ts-rs = { version = "12", features = ["uuid-impl", "serde-json-impl"] }

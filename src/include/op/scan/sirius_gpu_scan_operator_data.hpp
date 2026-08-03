@@ -146,6 +146,14 @@ class scan_operator_input : public op::operator_data {
   /// copy). Stamped by drain_cached_provider on resident splits; scan_info
   /// splits fold filter costs into their own estimates instead.
   bool row_filter_pending{false};
+  /// True when scan normalization will cast at least one selected column of this resident cached
+  /// split. Stamped by drain_cached_provider from databatch_provider::batch, which owns the
+  /// definition.
+  bool needs_carrier_conversion{false};
+  /// Stamped by drain_cached_provider from databatch_provider::batch::conversion_destination_bytes,
+  /// which owns the definition. Zero means unknown; the scan memory estimate then keeps its
+  /// conservative maximum-expansion bound.
+  std::size_t conversion_destination_bytes{0};
 };
 
 }  // namespace sirius::op::scan

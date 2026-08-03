@@ -36,6 +36,7 @@ cufile.log
 envs/
 compile_commands.json
 .cache
+.rumdl_cache/
 
 # Zed editor settings
 .zed
