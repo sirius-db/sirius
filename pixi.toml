@@ -62,6 +62,10 @@ go-cgo = ">=1.25"
 
 [tasks]
 
+[tasks.clion-env]
+description = "Generate the Pixi environment file used by CLion."
+cmd = "mkdir -p build && pixi shell-hook -s bash > build/sirius_pixi_env_for_clion.sh"
+
 [tasks.quent]
 description = "Run the Quent telemetry UI server."
 cmd = "echo 'Quent UI will be served at: http://localhost:8080' && cargo run --manifest-path rust/Cargo.toml -p sirius-telemetry-server --features ui -- --output-dir {{ output_dir }}"
