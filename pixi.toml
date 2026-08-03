@@ -39,6 +39,9 @@ libprotobuf = "*"
 rust = "*"
 cuda-nvrtc-dev = "*"
 
+[pypi-dependencies]
+rumdl = "==0.2.44"
+
 [feature.dev-libs.dependencies]
 librmm = "*"
 libcurand-dev = "*"
