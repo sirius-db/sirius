@@ -309,6 +309,22 @@ region in every mode), so pin-once can only ever *lose* on it. Measured against 
 including setup, ~25 s of per-query re-pinning would dominate a 1.06 s regression. Pin-once
 is a latency/throughput trade, not a dead end.
 
+**Re-measured on the it7 fused binary (2026-08-03, `bench/sf1000-repro/run-pinonce.sh`):
+7.866 s, 22/22 byte-identical.** The fused wins survive the tier split nearly intact
+(−14.9% vs the same layout pre-fused, against −15.4% per-query-pin) because lineitem and
+orders stay GPU-compressed, so every selection decoder and membership mask keeps firing.
+
+| arm (same binary, gate on) | suite | note |
+|---|---|---|
+| per-query pin, grouped (it7 bank) | 6.918 s | — |
+| tier-split pin-once, sequential | **7.866 s** | +13.7% |
+| tier-split pin-once, pre-fused (2026-08-02) | 9.238 s | fused = −14.9% on this arm |
+
+The +0.948 s premium is the same C2C shape as before — q2 +127%, q9 +29%, q15 +26%,
+q20 +26%, q19 +23% track host-resident column count; q1 is +2.8% (lineitem-only, still
+GPU). Same caveat as above: the metric excludes pin time, so per-query mode also hides
+~25 s of wall-clock re-pinning that pin-once pays once per session.
+
 ### Pin-once (union of all 22 queries' columns): OOM, cause identified
 
 `--mode sequential` already implements it. It failed on the 8th pin (`orders`) at
