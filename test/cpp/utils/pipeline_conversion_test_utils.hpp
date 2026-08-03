@@ -16,14 +16,19 @@
 
 #pragma once
 
+#include "op/sirius_physical_streaming_sink.hpp"
 #include "query_id.hpp"
 
+#include <cucascade/data/data_repository.hpp>
 #include <duckdb/main/connection.hpp>
 
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <memory>
+#include <optional>
 #include <string>
+#include <vector>
 
 namespace duckdb {
 class SiriusContext;
@@ -89,6 +94,16 @@ void with_conversion_result(
 void with_initialized_engine(duckdb::Connection& con,
                              const std::string& query,
                              const std::function<void(sirius_engine&)>& consume);
+
+//! Like `with_initialized_engine`, but roots the plan in a STREAMING_SINK over `output_repos`
+//! instead of a RESULT_COLLECTOR — the shape a streaming fragment runs. The caller (standing in
+//! for the fragment) owns the plan tree, so the engine borrows it via `initialize_internal`.
+//! `consume` runs while both are alive.
+void with_initialized_streaming_fragment(
+  duckdb::Connection& con,
+  const std::string& query,
+  std::vector<std::shared_ptr<cucascade::shared_data_repository>> output_repos,
+  const std::function<void(sirius_engine&, op::sirius_physical_streaming_sink&)>& consume);
 
 //! Path to the canonical TPC-H queries (`test/tpch_performance/tpch_queries/orig/`).
 std::filesystem::path tpch_queries_dir();
