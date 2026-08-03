@@ -106,6 +106,34 @@ relieves memory pressure. Sirius has no upward "stop producing" signal today (hi
 `READY` / `WAITING` / nothing), so the intended lever is per-fragment priority, not a bounded
 queue.
 
+### `sirius_physical_streaming_sink` — `STREAMING_SINK`
+**File:** `src/include/op/sirius_physical_streaming_sink.hpp`
+
+Terminal operator of a streaming fragment: every batch the pipeline produces is pushed into one
+`exec::batch_stream` and exposed to an external consumer via `pull()` / `wait()` / `drained()`.
+
+Where the source stands where no table exists, the sink stands where no `RESULT_COLLECTOR` exists:
+the fragment's output travels over an exchange channel rather than into a query result. It is shaped
+like `RESULT_COLLECTOR` (appended to `current` in `build_pipelines`, set as the meta-pipeline sink)
+so the executor places it at `operators[last]` and drives its `on_finalize_operator()` — which is
+the only route to end-of-stream for the output stream.
+
+Key design facts:
+- **One sender, one finalize.** The pipeline feeding this sink is its single expected sender
+  (`PIPELINE_SENDER = 0`). `on_finalize_operator()` calls `close(PIPELINE_SENDER)` on the output
+  `exec::batch_stream`, which is what makes it terminal. Without `build_pipelines` placing the sink in
+  `operators`, `on_finalize_operator()` is never called and every consumer blocked in `wait()`
+  hangs forever with no error visible.
+- **No re-arm waker.** Unlike the source, the sink does not wire an `on_data` hook: its consumer
+  is an external thread blocking in `wait()`, not an engine task needing re-nomination.
+- **Native tier.** Batches are pushed in whatever tier they arrived — no Arrow, no forced GPU
+  upgrade. A queued batch stays spillable in the repository until pulled.
+- **execute() is a pass-through** (same shape as `RESULT_COLLECTOR`): it hands the batches back so
+  `publish_output()` can deliver them to `sink()`. The base implementation drops them.
+- **`no_history_peak_memory_estimate()` is 0.** The push allocates nothing on top of the input the
+  task already materialized, which is what this cold-start estimate measures; the caller maxes it
+  across the pipeline's operators, so anything higher would inflate the reservation.
+
 ### `sirius_physical_dummy_scan` — `DUMMY_SCAN`
 **File:** `src/include/op/sirius_physical_dummy_scan.hpp`
 
@@ -382,6 +410,7 @@ After pipeline finalization, `source` and `sink` are just aliases for the first 
 |----------|----------|-----------|
 | GPU_SCAN | Scan | Unified GPU scan source served by `sirius_scan_manager` via a per-format `gpu_ingestible` |
 | STREAMING_SOURCE | Scan | Exchange-input source; drains an `exec::batch_stream` (repository fed by `push()`, sender-aware EOS, producer-error plane) |
+| STREAMING_SINK | Exchange output | Terminal operator of a streaming fragment; pushes each batch into an `exec::batch_stream`; `on_finalize_operator()` closes the stream |
 | DUMMY_SCAN | Scan | Generates 1 row |
 | COLUMN_DATA_SCAN | Scan | Reads ColumnDataCollection |
 | FILTER | Relational | `expression_evaluator::select()` |
