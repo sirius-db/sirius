@@ -106,39 +106,8 @@ relieves memory pressure. Sirius has no upward "stop producing" signal today (hi
 `READY` / `WAITING` / nothing), so the intended lever is per-fragment priority, not a bounded
 queue.
 
-### `sirius_physical_streaming_sink` — `STREAMING_SINK`
-**File:** `src/include/op/sirius_physical_streaming_sink.hpp`
-
-Terminal operator of a streaming fragment: every batch the pipeline produces is pushed into one
-`exec::batch_stream` and exposed to an external consumer via `pull()` / `wait()` / `drained()`.
-
-Where the source stands where no table exists, the sink stands where no `RESULT_COLLECTOR` exists:
-the fragment's output travels over an exchange channel rather than into a query result. It is shaped
-like `RESULT_COLLECTOR` (appended to `current` in `build_pipelines`, set as the meta-pipeline sink)
-so the executor places it at `operators[last]` and drives its `on_finalize_operator()` — which is
-the only route to end-of-stream for the output stream.
-
-Key design facts:
-- **One sender, one finalize.** The pipeline feeding this sink is its single expected sender
-  (`PIPELINE_SENDER = 0`). `on_finalize_operator()` calls `close(PIPELINE_SENDER)` on the output
-  `exec::batch_stream`, which is what makes it terminal. Without `build_pipelines` placing the sink in
-  `operators`, `on_finalize_operator()` is never called and every consumer blocked in `wait()`
-  hangs forever with no error visible.
-- **No re-arm waker.** Unlike the source, the sink does not wire an `on_data` hook: its consumer
-  is an external thread blocking in `wait()`, not an engine task needing re-nomination.
-- **Native tier.** Batches are pushed in whatever tier they arrived — no Arrow, no forced GPU
-  upgrade. A queued batch stays spillable in the repository until pulled.
-- **execute() is a pass-through** (same shape as `RESULT_COLLECTOR`): it hands the batches back so
-  `publish_output()` can deliver them to `sink()`. The base implementation drops them.
-- **Partitioned variant (N destinations).** The second constructor takes N repositories and a
-  `partition_spec` (key columns + optional casts, validated at construction: one cast per key or
-  none, every key column inside the input schema). `sink()` GPU-hash-partitions each input batch
-  and routes slice *i* into `_outputs[i]`, skipping empty slices. Each destination has its own
-  `exec::batch_stream` and EOS reaches all of them on a single `on_finalize_operator()` call.
-  When N = 1 the spec is ignored and a native push bypasses partitioning entirely.
-  `no_history_peak_memory_estimate()` stays 0 for N = 1 and becomes 2× the input above it:
-  `hash_partition()` holds a full reordered copy of the table and the per-partition copies at the
-  same time, the same shape `PARTITION` reports.
+The sink that closes a streaming fragment is documented with the other terminal operators:
+[`STREAMING_SINK`](#sirius_physical_streaming_sink--streaming_sink).
 
 ### `sirius_physical_dummy_scan` — `DUMMY_SCAN`
 **File:** `src/include/op/sirius_physical_dummy_scan.hpp`
@@ -403,6 +372,52 @@ Base interface for operators that consume partitioned data. Provides `push_data_
 
 Final sink that materializes query results into a `ColumnDataCollection`. The GPU executor checks for this operator type to determine query completion.
 
+### `sirius_physical_streaming_sink` — `STREAMING_SINK`
+**File:** `src/include/op/sirius_physical_streaming_sink.hpp`
+
+Terminal operator of a streaming fragment: where a `RESULT_COLLECTOR` materializes rows for the
+connection that ran the query, this hands them to a consumer that is *not* the engine — an
+external thread (session / FFI wrapper) blocking in `wait()`. Every batch its pipeline produces
+is pushed into one `exec::batch_stream` per destination; batches are exposed natively, in
+whatever tier they currently sit, and a queued batch stays spill-visible to the downgrade
+executor until it is pulled. Arrow never appears here.
+
+It is shaped like `RESULT_COLLECTOR` (appended to `current` in `build_pipelines`, set as the
+meta-pipeline sink) so the executor places it at `operators[last]` and drives its
+`on_finalize_operator()` — the only route to end-of-stream. Without that placement the hook never
+fires and every consumer blocked in `wait()` hangs forever with no error visible.
+
+Key design invariants:
+- `execute()` is a pass-through override. The executor runs every operator in the chain —
+  terminal sink included — and feeds the chain's result back into `sink()`; the base
+  implementation returns an empty batch list, so without the override the pipeline "succeeds"
+  with an empty output stream and no error anywhere.
+- One `batch_stream` per destination. The single-destination constructor takes one repository;
+  the partitioned one takes N repositories plus a `partition_spec` (key columns, optional casts).
+  With N = 1 the spec is ignored and the batch is handed over untouched — no copy,
+  no partition pass. With N > 1 each batch is GPU-hash-partitioned by the `partition_spec` and
+  slice *i* goes to `_outputs[i]`; empty slices are skipped. On both paths a push refused after
+  end-of-stream is warned, never dropped silently — otherwise a stream that went terminal early
+  turns into rows that quietly never arrive.
+- EOS: the pipeline is the single expected sender of all N streams (`PIPELINE_SENDER`);
+  `on_finalize_operator()` closes every output stream. No re-arm waker exists — the consumer is
+  an external thread, not an engine task that needs re-nominating.
+- `fail_output(error)` poisons every output stream: consumers unblock from `wait()` and collect
+  the rethrow from `pull()` — never a clean end. First failure wins.
+- A `STREAMING_SINK` plan root is query-terminal (`sirius_pipeline::is_query_terminal()`), so
+  the executor's manager loop finishes the query exactly as it does for `RESULT_COLLECTOR`.
+- `no_history_peak_memory_estimate()` is 0 for a single destination — that push allocates nothing
+  on top of the input the task already materialized — and `2 × stats.bytes` above it, because
+  `hash_partition()` holds a full reordered copy of the table and the per-partition copies at the
+  same time. Same value `PARTITION` reports for the same kernel.
+
+Consumer surface (external threads only): `pull(index)` (non-blocking; `nullopt` means *not
+right now*, ask `drained(index)` to tell it from EOS), `wait(index)`, `availability(index)`.
+
+This is the operator-registry view only. The cross-cutting story — the id-addressed session
+router above the sink, the fragment topology it sits in, and the no-backpressure bet — lives in
+[Streaming Sessions](streaming-sessions.md).
+
 ### `sirius_physical_empty_result` — `EMPTY_RESULT`
 **File:** `src/include/op/sirius_physical_empty_result.hpp`
 
@@ -416,7 +431,6 @@ After pipeline finalization, `source` and `sink` are just aliases for the first 
 |----------|----------|-----------|
 | GPU_SCAN | Scan | Unified GPU scan source served by `sirius_scan_manager` via a per-format `gpu_ingestible` |
 | STREAMING_SOURCE | Scan | Exchange-input source; drains an `exec::batch_stream` (repository fed by `push()`, sender-aware EOS, producer-error plane) |
-| STREAMING_SINK | Exchange output | Terminal operator of a streaming fragment; pushes each batch into an `exec::batch_stream`; `on_finalize_operator()` closes the stream |
 | DUMMY_SCAN | Scan | Generates 1 row |
 | COLUMN_DATA_SCAN | Scan | Reads ColumnDataCollection |
 | FILTER | Relational | `expression_evaluator::select()` |
@@ -440,4 +454,5 @@ After pipeline finalization, `source` and `sink` are just aliases for the first 
 | MERGE_TOP_N | Pipeline | Merge per-partition top-N |
 | CTE | CTE | Materialize to ColumnDataCollection |
 | RESULT_COLLECTOR | Result | Final result materialization |
+| STREAMING_SINK | Result | Exchange-output sink; pushes native batches into one `exec::batch_stream` per destination (GPU hash partition when N > 1), consumed by an external thread |
 | EMPTY_RESULT | Result | Empty result set |
