@@ -473,6 +473,27 @@ host_pin_result materialize_pin_to_host(
       }
     });
 
+  // Per-pin compression coverage, always at INFO: a per-chunk encode failure
+  // only WARNs and silently pins that chunk raw — a whole campaign ran with
+  // several such fallbacks in every suite before anyone noticed. One line per
+  // pin keeps this class of degradation visible forever.
+  {
+    std::size_t compressed_count = 0;
+    for (auto const& chunk : out.chunks) {
+      if (dynamic_cast<sirius::compressed_host_representation const*>(chunk.get()) != nullptr) {
+        ++compressed_count;
+      }
+    }
+    auto const paths = ingestible.table_info().file_paths();
+    SIRIUS_LOG_INFO("[materialize_pin_to_host] pin '{}': {}/{} chunk(s) compressed{}",
+                    paths.empty() ? "<unknown>" : paths.front(),
+                    compressed_count,
+                    out.chunks.size(),
+                    compressed_count == out.chunks.size()
+                      ? ""
+                      : " — remainder pinned UNCOMPRESSED (see warnings above)");
+  }
+
   return out;
 }
 
@@ -633,6 +654,23 @@ device_pin_result materialize_all_batches_compressed(
           .compressed = nullptr, .columns = std::move(shared_cols), .memory_space = src_space});
       }
     });
+
+  // Per-pin compression coverage, always at INFO (see the host twin above for
+  // why): raw-fallback chunks otherwise hide behind per-chunk WARNs.
+  {
+    std::size_t compressed_count = 0;
+    for (auto const& chunk : out.chunks) {
+      if (chunk.compressed) { ++compressed_count; }
+    }
+    auto const paths = ingestible.table_info().file_paths();
+    SIRIUS_LOG_INFO("[materialize_all_batches_compressed] pin '{}': {}/{} chunk(s) compressed{}",
+                    paths.empty() ? "<unknown>" : paths.front(),
+                    compressed_count,
+                    out.chunks.size(),
+                    compressed_count == out.chunks.size()
+                      ? ""
+                      : " — remainder pinned UNCOMPRESSED (see warnings above)");
+  }
 
   return out;
 }

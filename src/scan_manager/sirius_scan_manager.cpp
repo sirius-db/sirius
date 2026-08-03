@@ -87,6 +87,17 @@ bool fused_scan_filter_enabled()
   return enabled;
 }
 
+/// Deterministic tracing for the fused scan-filter pipeline (same env contract
+/// as the converter/orchestrator diag: set and != "0" = INFO tracing on).
+bool fused_scan_diag_enabled()
+{
+  static const bool enabled = []() {
+    char const* v = std::getenv("SIRIUS_EXP_FUSED_SCAN_DIAG");
+    return v != nullptr && v[0] != '\0' && !(v[0] == '0' && v[1] == '\0');
+  }();
+  return enabled;
+}
+
 struct cached_databatch_provider : public databatch_provider {
   cached_databatch_provider(pinned_entry const& entry,
                             std::span<std::size_t const> selected_columns,
@@ -649,11 +660,24 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
     sirius::decode_range_pushdown range_pushdown;
     bool range_covers_whole_filter = false;
     if (fused_scan_filter_enabled()) {
-      if (auto const* pq = dynamic_cast<op::scan::parquet_ingestible_table_info const*>(
-            &assignment.op->get_ingestible().table_info());
-          pq && pq->table_filters && !pq->table_filters->filters.empty()) {
+      auto const* pq = dynamic_cast<op::scan::parquet_ingestible_table_info const*>(
+        &assignment.op->get_ingestible().table_info());
+      if (fused_scan_diag_enabled()) {
+        SIRIUS_LOG_INFO("[fused-diag] scan-mgr entry '{}': cast={} filters={} n={}",
+                        assignment.entry_name,
+                        pq != nullptr,
+                        pq && pq->table_filters != nullptr,
+                        (pq && pq->table_filters) ? pq->table_filters->filters.size() : 0);
+      }
+      if (pq && pq->table_filters && !pq->table_filters->filters.empty()) {
         auto extraction = sirius::op::extract_numeric_range_pushdown(
           *pq->table_filters, pq->column_ids, pq->returned_types);
+        if (fused_scan_diag_enabled()) {
+          SIRIUS_LOG_INFO("[fused-diag] scan-mgr extraction '{}': gate={} ranges={}",
+                          assignment.entry_name,
+                          extraction.all_conjuncts_convertible,
+                          extraction.ranges.size());
+        }
         // Iteration 4: partial coverage is sound — mask conjuncts are conjunctive
         // over-approximations, and a batch whose mask does not cover the whole
         // filter is left untagged so the post-filter re-evaluates everything.

@@ -1,0 +1,24 @@
+# Arm D: copied verbatim from plans-gb300/region.txt — all identity; 25/5-row tables never
+# qualify for compression anyway (min_batch_size_bytes 1 MiB gate).
+# Pareto-picked plans: max ratio with decompress >= 250 GB/s per column.
+# Provenance: GB300 re-measure 2026-08-03T11:27Z, input=/localhome/local-faramburu/tpch_parquet_sf1000/region/part.0.parquet,
+#   simpatico explore --score pareto --decomp-floor 250 --beam-width 100 --max-depth 10 \
+#     --rerank-warmup 2 --rerank-iters 5
+# Rates: comp/decomp = warmed median-of-5 (event-bracketed);
+#   old_wall_* = legacy one-shot metric of the pre-fix harness, for continuity.
+# column: r_regionkey  dtype: i32  ratio: 1.000x  depth: 1
+# comp: 0.00 GB/s  decomp: 0.00 GB/s
+# old_wall_comp: 0.00 GB/s  old_wall_decomp: 0.00 GB/s
+input -> identity
+
+---
+# column: r_name  dtype: str  ratio: 1.000x  depth: 1
+# comp: 0.00 GB/s  decomp: 0.00 GB/s
+# old_wall_comp: 0.00 GB/s  old_wall_decomp: 0.00 GB/s
+input -> identity
+
+---
+# column: r_comment  dtype: str  ratio: 1.000x  depth: 1
+# comp: 0.01 GB/s  decomp: 0.03 GB/s
+# old_wall_comp: 0.01 GB/s  old_wall_decomp: 0.02 GB/s
+input -> identity
