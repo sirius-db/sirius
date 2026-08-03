@@ -488,8 +488,13 @@ pair machinery (dark: FilterCombiner folds q12's pairs into constant hulls — p
 suite customer). **Suite 7.436 s, campaign −53.5%.**
 
 **It6** (f4c4b6c2, REVERTED in 799b6889): sync surgery + decode memos. Sanitizer-clean,
-formally audited — and **+0.46% vs same-hour it5 binary** (3-run median 7.485 vs 7.451;
-0.09% spread). H-already-optimal confirmed: decode kernels measured 1.7–3.5 TB/s (within
+formally audited — and **NEUTRAL** (post-revert control run: 7.484 ≈ the 7.485 it6 median;
+the +0.46% vs the 7.451 stash run is attributable to the KEPT MAX_INDICES fix, whose four
+newly-compressed pins carry projected/join-key columns — the role rule's third confirmation,
+hiding inside a correctness fix). Revert stands per wins-only (neutral = debt).
+Surgical follow-up available: role-correct those four pins' column plans (o_custkey et al.
+→ identity) to reclaim the ~33 ms, or fold into the arm-D deployment decision.
+H-already-optimal confirmed: decode kernels measured 1.7–3.5 TB/s (within
 ~10% of hand-tuned reference; the plan-file rates were 6.7–12× stale), the GPU is
 saturated, the syncs were free. Kernel-level decoder work is DEAD by direct measurement.
 Kept from the audit (35e65949): dict-encode row-cap fix (4 pins/suite had silently pinned
