@@ -678,6 +678,21 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
       produce(dst, stream);
       if (s > 0 && stream.value() != s0.value()) {
         // Publish this stream's mask to stream 0 without a host sync.
+        //
+        // LOAD-BEARING since the iteration-6 sync surgery: with
+        // run_rendered_decode's per-launch cudaStreamSynchronize gone, THIS
+        // event is the only thing ordering the source's mask writes before
+        // the combine/CNT on s0. Invariants it relies on:
+        //  (1) produce() has ENQUEUED every kernel/copy it issues on `stream`
+        //      before returning (launcher contract: no internal cross-stream
+        //      hops, no work left on other streams);
+        //  (2) the record happens after produce() on this host thread, so the
+        //      event captures all of it;
+        //  (3) same-stream sources (s==0, or round-robin collisions with s0)
+        //      need no event — FIFO order on s0 covers them.
+        // Downstream, CNT's D2H host sync on s0 (kept, load-bearing) then
+        // implies every wave-1 kernel finished before per_filter teardown and
+        // wave-2 submission.
         cudaEvent_t ev = join_events.make();
         if (cudaEventRecord(ev, stream.value()) != cudaSuccess ||
             cudaStreamWaitEvent(s0.value(), ev, 0) != cudaSuccess) {

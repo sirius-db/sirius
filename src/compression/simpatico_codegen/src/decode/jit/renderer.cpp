@@ -772,7 +772,31 @@ void Walker::emit_bitpack_mask_dict_gather(const ::codegen::jit::FusedTree& node
         << ");\n"
         << "            const char* k = keys_chars + code * key_width;\n"
         << "            char* o = out + (out_base + rank) * key_width;\n"
-        << "            for (int32_t b = 0; b < key_width; ++b) o[b] = k[b];\n"
+           // Width-chunked copies when BOTH the element stride (key_width)
+           // and the base pointers permit aligned vector access; the checks
+           // are uniform across the warp (no divergence).  Misaligned widths
+           // stay byte-wise: destination writes must be byte-exact (an
+           // over-write would race with the neighbouring survivor's chars) —
+           // only over-READS are covered by the guard-padded key pool.
+        << "            const unsigned long long bases =\n"
+        << "                reinterpret_cast<unsigned long long>(keys_chars) |\n"
+        << "                reinterpret_cast<unsigned long long>(out);\n"
+        << "            if ((key_width & 15) == 0 && (bases & 15) == 0) {\n"
+        << "                const uint4* ks = reinterpret_cast<const uint4*>(k);\n"
+        << "                uint4* od = reinterpret_cast<uint4*>(o);\n"
+        << "                for (int32_t b = 0; b < (key_width >> 4); ++b) od[b] = ks[b];\n"
+        << "            } else if ((key_width & 7) == 0 && (bases & 7) == 0) {\n"
+        << "                const unsigned long long* ks = reinterpret_cast<const unsigned long "
+           "long*>(k);\n"
+        << "                unsigned long long* od = reinterpret_cast<unsigned long long*>(o);\n"
+        << "                for (int32_t b = 0; b < (key_width >> 3); ++b) od[b] = ks[b];\n"
+        << "            } else if ((key_width & 3) == 0 && (bases & 3) == 0) {\n"
+        << "                const uint32_t* ks = reinterpret_cast<const uint32_t*>(k);\n"
+        << "                uint32_t* od = reinterpret_cast<uint32_t*>(o);\n"
+        << "                for (int32_t b = 0; b < (key_width >> 2); ++b) od[b] = ks[b];\n"
+        << "            } else {\n"
+        << "                for (int32_t b = 0; b < key_width; ++b) o[b] = k[b];\n"
+        << "            }\n"
         << "        }\n"
         << "    }\n";
 }
