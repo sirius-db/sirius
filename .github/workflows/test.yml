@@ -59,10 +59,13 @@ jobs:
         run: git submodule update --init --depth=1 --jobs 3 duckdb substrait cucascade
 
       - uses: prefix-dev/setup-pixi@a09b6247153796b190642a2b53fac4241043cf6f # v0.10.0
+        env:
+          RUNNER_DEBUG: true
         with:
           cache: false
           pixi-version: v0.71.1
           activate-environment: ${{ matrix.cuda.pixi-environment }}
+          log-level: vvv
 
       - name: Configure sccache backend
         run: |
