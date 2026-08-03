@@ -71,11 +71,13 @@ struct dynamic_filter_stats_snapshot {
  * atomic is coherent independently; `snapshot()` does not provide a transactionally consistent view
  * across fields.
  *
- * The delivery counters partition *build deliveries*, not joins: each build batch a wired join
- * receives either fails the claim and increments `publications_skipped_build_not_whole`, or claims
- * and then either attempts publication or reports its source not resident. Only the not-whole
- * counter is latched to fire once per join; the others can fire repeatedly for one join, because a
- * broadcast build delivers one batch per GPU.
+ * The delivery counters classify *build deliveries*, not joins, and they are disjoint but not
+ * exhaustive. A delivery that claims the window goes on to either attempt publication or report its
+ * source not resident. The first delivery of a wired join that cannot claim increments
+ * `publications_skipped_build_not_whole`; that counter is latched, so the same join's later
+ * non-claiming deliveries are counted nowhere, and neither is a delivery arriving after the window
+ * has closed. Only the not-whole counter is latched -- the others can fire repeatedly for one join,
+ * because a broadcast build delivers one batch per GPU.
  */
 struct dynamic_filter_stats {
   // Plan-time fact
@@ -99,9 +101,9 @@ struct dynamic_filter_stats {
   /// Build batch was not GPU-resident at delivery; publication skipped without claiming
   std::atomic<std::uint64_t> publications_skipped_source_not_resident{0};
   /// Wired join the upstream PARTITION never reported a whole build for, so its one-shot
-  /// publication window can never claim: probe-driven sizing, a multi-partition build, or no
-  /// build-side CONCAT to fold. Counted once per join, at the first build delivery that observes
-  /// the condition.
+  /// publication window can never claim: probe-driven sizing, a hash-partitioned multi-partition
+  /// build (a broadcast build is whole on every partition), or no build-side CONCAT to fold.
+  /// Counted once per join, at the first build delivery that observes the condition.
   std::atomic<std::uint64_t> publications_skipped_build_not_whole{0};
   /// Attempt hit the all-targets-drained early return; no deterministic counter moved for it
   std::atomic<std::uint64_t> publications_skipped_targets_drained{0};

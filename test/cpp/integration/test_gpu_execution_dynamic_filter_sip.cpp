@@ -70,30 +70,6 @@ std::vector<std::vector<std::string>> run_on_gpu(duckdb::Connection& con, const 
   return sirius::test::collect_rows(result->Cast<duckdb::MaterializedQueryResult>());
 }
 
-// Set one numeric Sirius setting for a scope and restore its previous value on exit.
-struct scoped_setting {
-  scoped_setting(duckdb::Connection& c, std::string setting, std::uint64_t value)
-    : con(c), name(std::move(setting))
-  {
-    auto current = con.Query("SELECT current_setting('" + name + "');");
-    REQUIRE(current);
-    REQUIRE_FALSE(current->HasError());
-    original = current->GetValue(0, 0).ToString();
-
-    auto result = con.Query("SET " + name + " = " + std::to_string(value) + ";");
-    REQUIRE(result);
-    REQUIRE_FALSE(result->HasError());
-  }
-  ~scoped_setting() { con.Query("SET " + name + " = " + original + ";"); }
-
-  scoped_setting(const scoped_setting&)            = delete;
-  scoped_setting& operator=(const scoped_setting&) = delete;
-
-  duckdb::Connection& con;
-  std::string name;
-  std::string original;
-};
-
 // Dynamic-filter counter deltas for one query execution.
 struct publication_deltas {
   std::uint64_t producers_enabled                    = 0;
@@ -272,8 +248,8 @@ TEST_CASE("gpu_execution - derived-build and build-block routes preserve results
     sirius::test::disabled_optimizers_guard shape(
       con, "statistics_propagation,join_order,build_side_probe_side");
     sirius::test::coverage_gate_disable_guard gate_off(con);
-    scoped_setting no_broadcast(con, "max_broadcast_join_size", 1);
-    scoped_setting small_partitions(con, "hash_partition_bytes", 8ULL * 1024 * 1024);
+    sirius::test::scoped_setting no_broadcast(con, "max_broadcast_join_size", 1);
+    sirius::test::scoped_setting small_partitions(con, "hash_partition_bytes", 8ULL * 1024 * 1024);
     auto const deltas = require_switch_result_equivalence(
       con,
       "select count(*), sum(l.l_partkey), sum(l.l_suppkey), sum(l.l_linenumber), "

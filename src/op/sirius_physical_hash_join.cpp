@@ -2029,8 +2029,9 @@ void sirius_physical_hash_join::push_data_batch_partitioned(
       SIRIUS_LOG_DEBUG(
         "[sirius_physical_hash_join] dynamic filter NOT published (id={}): mode={}; the upstream "
         "PARTITION did not report a build arriving as one batch covering the whole build side. It "
-        "reports one only when the sizing decision is build-side, lands in a single partition, and "
-        "finds a build-side CONCAT to fold; probe-driven sizing (right-family joins), a "
+        "reports one for a BUILD_PROBE build that is single-partition or broadcast, and otherwise "
+        "only for a build-side sizing decision that lands in a single partition and finds a "
+        "build-side CONCAT to fold. Probe-driven sizing (right-family joins), a hash-partitioned "
         "multi-partition build, and a missing build-side CONCAT each fail that. See this join's "
         "partition strategy log line.",
         get_operator_id(),

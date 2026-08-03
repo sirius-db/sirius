@@ -22,9 +22,11 @@
 #include <catch.hpp>
 #include <duckdb.hpp>
 
+#include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <string>
+#include <utility>
 
 namespace sirius::test {
 
@@ -34,6 +36,35 @@ inline sirius::op::dynamic_filter_stats_snapshot get_dynamic_filter_stats_snapsh
 {
   return get_registered_sirius_context(con)->get_dynamic_filter_stats_snapshot();
 }
+
+/// Sets one numeric Sirius setting for a scope and restores its previous value on destruction.
+///
+/// These settings live on `SiriusContext`, so they outlive the connection that changed them. The
+/// restore is issued from a destructor and its result is therefore discarded rather than asserted:
+/// a destructor must not throw, and Catch2's assertion macros do. A restore can only fail if the
+/// connection is already unusable, in which case the rest of the test is failing anyway.
+struct scoped_setting {
+  scoped_setting(duckdb::Connection& c, std::string setting, std::uint64_t value)
+    : con(c), name(std::move(setting))
+  {
+    auto current = con.Query("SELECT current_setting('" + name + "');");
+    REQUIRE(current);
+    REQUIRE_FALSE(current->HasError());
+    original = current->GetValue(0, 0).ToString();
+
+    auto result = con.Query("SET " + name + " = " + std::to_string(value) + ";");
+    REQUIRE(result);
+    REQUIRE_FALSE(result->HasError());
+  }
+  ~scoped_setting() { con.Query("SET " + name + " = " + original + ";"); }
+
+  scoped_setting(const scoped_setting&)            = delete;
+  scoped_setting& operator=(const scoped_setting&) = delete;
+
+  duckdb::Connection& con;
+  std::string name;
+  std::string original;
+};
 
 /// Disables the domain-coverage gate and restores the previous threshold on destruction.
 struct coverage_gate_disable_guard {
