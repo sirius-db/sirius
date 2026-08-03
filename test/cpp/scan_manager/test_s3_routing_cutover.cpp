@@ -684,6 +684,174 @@ TEST_CASE("scan_manager tolerates routed S3 ioctx without a prefetch cache",
   REQUIRE_NOTHROW(manager.prepare_for_query(q, true));
 }
 
+TEST_CASE("rest perf instrumentation flag gates micro counters", "[s3][rest][perf]")
+{
+  range_s3_server server(std::vector<std::uint8_t>(4096, std::uint8_t{7}));
+  scan_manager_fixture fixture;
+
+  SECTION("flag off leaves latency micro-counters at zero while safety counters are readable")
+  {
+    auto cfg                      = make_s3_scan_config(server.endpoint(), true);
+    cfg.rest.perf_instrumentation = false;
+    sirius_scan_manager manager{cfg, *fixture.memory, fixture.topology};
+
+    auto datasource = manager.create_datasource("s3://routing-bucket/data.parquet");
+    auto* rest_ctx  = require_rest_ioctx(datasource);
+
+    read_one_device_range(*datasource);
+
+    auto const snapshot = rest_ctx->perf_snapshot();
+    CHECK(snapshot.chunk_get_count == 0);
+    CHECK(snapshot.chunk_get_ns_total == 0);
+    CHECK(snapshot.chunk_get_ns_max == 0);
+    CHECK(snapshot.queue_wait_count == 0);
+    CHECK(snapshot.queue_wait_ns_total == 0);
+    CHECK(snapshot.h2d_observed_count == 0);
+    CHECK(snapshot.h2d_observed_ns_total == 0);
+    CHECK(snapshot.h2d_observed_ns_max == 0);
+    CHECK(snapshot.ttfb_ns == 0);
+    CHECK(snapshot.device_stream_sync_total == 0);
+    CHECK(snapshot.retries_total == 0);
+    CHECK(snapshot.terminal_failures_total == 0);
+  }
+
+  SECTION("flag on records GET, queue, H2D, and TTFB timings")
+  {
+    auto cfg                      = make_s3_scan_config(server.endpoint(), true);
+    cfg.rest.perf_instrumentation = true;
+    sirius_scan_manager manager{cfg, *fixture.memory, fixture.topology};
+
+    auto datasource = manager.create_datasource("s3://routing-bucket/data.parquet");
+    auto* rest_ctx  = require_rest_ioctx(datasource);
+
+    read_one_device_range(*datasource);
+
+    auto const snapshot = rest_ctx->perf_snapshot();
+    CHECK(snapshot.chunk_get_count > 0);
+    CHECK(snapshot.chunk_get_ns_total > 0);
+    CHECK(snapshot.chunk_get_ns_max > 0);
+    CHECK(snapshot.chunk_get_ns_max <= snapshot.chunk_get_ns_total);
+    CHECK(snapshot.queue_wait_count > 0);
+    CHECK(snapshot.queue_wait_ns_total > 0);
+    CHECK(snapshot.h2d_observed_count > 0);
+    CHECK(snapshot.h2d_observed_ns_total > 0);
+    CHECK(snapshot.h2d_observed_ns_max > 0);
+    CHECK(snapshot.h2d_observed_ns_max <= snapshot.h2d_observed_ns_total);
+    CHECK(snapshot.ttfb_ns > 0);
+    CHECK(snapshot.device_stream_sync_total == 0);
+    CHECK(snapshot.retries_total == 0);
+    CHECK(snapshot.terminal_failures_total == 0);
+  }
+}
+
+TEST_CASE("rest perf safety counters track retries and terminal failures", "[s3][rest][perf]")
+{
+  scan_manager_fixture fixture;
+
+  SECTION("503 retries are counted even when latency instrumentation is off")
+  {
+    range_fault_policy fault{};
+    fault.fail_first_gets = 2;
+    fault.fail_status     = 503;
+    range_s3_server server(std::vector<std::uint8_t>(4096, std::uint8_t{8}), fault);
+
+    auto cfg                      = make_s3_scan_config(server.endpoint(), true);
+    cfg.rest.max_retry_attempts   = 4;
+    cfg.rest.perf_instrumentation = false;
+    sirius_scan_manager manager{cfg, *fixture.memory, fixture.topology};
+
+    auto datasource = manager.create_datasource("s3://routing-bucket/retry.parquet");
+    auto* rest_ctx  = require_rest_ioctx(datasource);
+
+    read_one_host_range(*datasource);
+
+    auto const snapshot = rest_ctx->perf_snapshot();
+    CHECK(snapshot.retries_total == 2);
+    CHECK(snapshot.terminal_failures_total == 0);
+    CHECK(snapshot.device_stream_sync_total == 0);
+    CHECK(snapshot.chunk_get_count == 0);
+    CHECK(snapshot.queue_wait_count == 0);
+  }
+
+  SECTION("exhausted retries are reported as terminal failures")
+  {
+    range_fault_policy fault{};
+    fault.fail_all_gets = true;
+    fault.fail_status   = 503;
+    range_s3_server server(std::vector<std::uint8_t>(4096, std::uint8_t{9}), fault);
+
+    auto cfg                      = make_s3_scan_config(server.endpoint(), true);
+    cfg.rest.max_retry_attempts   = 2;
+    cfg.rest.perf_instrumentation = false;
+    sirius_scan_manager manager{cfg, *fixture.memory, fixture.topology};
+
+    auto datasource = manager.create_datasource("s3://routing-bucket/terminal.parquet");
+    auto* rest_ctx  = require_rest_ioctx(datasource);
+
+    std::array<std::uint8_t, 128> dst{};
+    CHECK_THROWS(datasource->host_read(0, dst.size(), dst.data()));
+
+    auto const snapshot = rest_ctx->perf_snapshot();
+    CHECK(snapshot.retries_total >= 1);
+    CHECK(snapshot.terminal_failures_total >= 1);
+    CHECK(snapshot.device_stream_sync_total == 0);
+  }
+}
+
+TEST_CASE("rest perf queue wait counts original requests rather than retry attempts",
+          "[s3][rest][perf]")
+{
+  range_fault_policy fault{};
+  fault.fail_first_gets = 2;
+  fault.fail_status     = 503;
+  range_s3_server server(std::vector<std::uint8_t>(4096, std::uint8_t{10}), fault);
+  scan_manager_fixture fixture;
+  auto cfg                      = make_s3_scan_config(server.endpoint(), true);
+  cfg.rest.max_retry_attempts   = 4;
+  cfg.rest.perf_instrumentation = true;
+  sirius_scan_manager manager{cfg, *fixture.memory, fixture.topology};
+
+  auto datasource = manager.create_datasource("s3://routing-bucket/queue.parquet");
+  auto* rest_ctx  = require_rest_ioctx(datasource);
+
+  read_one_host_range(*datasource);
+
+  auto const snapshot = rest_ctx->perf_snapshot();
+  CHECK(snapshot.retries_total == 2);
+  CHECK(snapshot.terminal_failures_total == 0);
+  CHECK(snapshot.queue_wait_count == 1);
+  CHECK(snapshot.chunk_get_count == 1);
+}
+
+TEST_CASE("rest perf snapshot aggregates counters across the reactor pool", "[s3][rest][perf]")
+{
+  range_s3_server server(std::vector<std::uint8_t>(4096, std::uint8_t{11}));
+  scan_manager_fixture fixture;
+  auto cfg                      = make_s3_scan_config(server.endpoint(), true);
+  cfg.rest.perf_instrumentation = true;
+  cfg.rest_n_reactors           = 2;
+  sirius_scan_manager manager{cfg, *fixture.memory, fixture.topology};
+
+  auto datasource = manager.create_datasource("s3://routing-bucket/pool.parquet");
+  auto* rest_ctx  = require_rest_ioctx(datasource);
+
+  for (int i = 0; i < 4; ++i) {
+    read_one_host_range(*datasource);
+  }
+
+  auto const snapshot = rest_ctx->perf_snapshot();
+  CHECK(snapshot.chunk_get_count == 4);
+  CHECK(snapshot.queue_wait_count == 4);
+  CHECK(snapshot.chunk_get_ns_total > 0);
+  CHECK(snapshot.chunk_get_ns_max > 0);
+  CHECK(snapshot.chunk_get_ns_max <= snapshot.chunk_get_ns_total);
+  CHECK(snapshot.queue_wait_ns_total > 0);
+  CHECK(snapshot.ttfb_ns > 0);
+  CHECK(snapshot.retries_total == 0);
+  CHECK(snapshot.terminal_failures_total == 0);
+  CHECK(snapshot.device_stream_sync_total == 0);
+}
+
 TEST_CASE("parquet_gpu_ingestible resolver routes each parquet file independently",
           "[s3][routing][scan_manager][parquet_gpu_ingestible]")
 {

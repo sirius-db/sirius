@@ -251,24 +251,29 @@ TEST_CASE("sirius_config defaults chunk prewarm to enabled when YAML omits the k
   std::filesystem::remove(path, ec);
 }
 
-TEST_CASE("sirius_config parses rest probe and listing caps", "[scan_manager][config][s3][rest]")
+TEST_CASE("sirius_config parses rest perf instrumentation flag",
+          "[scan_manager][config][s3][rest][perf]")
 {
+  CHECK_FALSE(cucascade::io::rest::config{}.perf_instrumentation);
   CHECK(cucascade::io::rest::config{}.footer_probe_bytes == 512UL * 1024);
   CHECK(cucascade::io::rest::config{}.list_max_matches == 100'000);
   CHECK(cucascade::io::rest::config{}.list_max_scanned == 1'000'000);
 
-  auto const path = std::filesystem::temp_directory_path() / "sirius_rest_probe_caps.yaml";
+  auto const path =
+    std::filesystem::temp_directory_path() / "sirius_rest_perf_instrumentation.yaml";
   write_yaml(path,
              "sirius:\n"
              "  executor:\n"
              "    scan_manager:\n"
              "      rest:\n"
+             "        perf_instrumentation: true\n"
              "        footer_probe_bytes: 256KiB\n"
              "        list_max_matches: 5\n"
              "        list_max_scanned: 50\n");
 
   sirius::sirius_config cfg;
   REQUIRE_NOTHROW(cfg.load_from_file(path));
+  CHECK(cfg.get_scan_manager_config().rest.perf_instrumentation);
   CHECK(cfg.get_scan_manager_config().rest.footer_probe_bytes == 256UL * 1024);
   CHECK(cfg.get_scan_manager_config().rest.list_max_matches == 5);
   CHECK(cfg.get_scan_manager_config().rest.list_max_scanned == 50);
@@ -285,7 +290,7 @@ TEST_CASE("sirius_config rejects unknown rest config keys", "[scan_manager][conf
              "  executor:\n"
              "    scan_manager:\n"
              "      rest:\n"
-             "        footer_probe_bytes_typo: true\n");
+             "        perf_instrumentation_typo: true\n");
 
   sirius::sirius_config cfg;
   CHECK_THROWS(cfg.load_from_file(path));

@@ -83,19 +83,20 @@ struct scan_manager_fixture {
   std::shared_ptr<const cucascade::memory::topology_index> topology = single_gpu_index();
 };
 
-scan_manager_config make_minio_rest_config()
+scan_manager_config make_minio_rest_config(bool perf_instrumentation = false)
 {
   scan_manager_config cfg{};
-  cfg.use_sirius_datasource   = true;
-  cfg.object_store.endpoint   = require_env("SIRIUS_TEST_S3_ENDPOINT");
-  cfg.object_store.region     = env_or("SIRIUS_TEST_S3_REGION", "us-east-1");
-  cfg.object_store.access_key = require_env("SIRIUS_TEST_S3_ACCESS_KEY");
-  cfg.object_store.secret_key = require_env("SIRIUS_TEST_S3_SECRET_KEY");
-  cfg.object_store.tls_verify = false;
-  cfg.rest.request_timeout_s  = 30;
-  cfg.rest.max_connections    = 8;
-  cfg.rest_n_reactors         = 1;
-  cfg.enable_prefetch_cache   = false;
+  cfg.use_sirius_datasource     = true;
+  cfg.object_store.endpoint     = require_env("SIRIUS_TEST_S3_ENDPOINT");
+  cfg.object_store.region       = env_or("SIRIUS_TEST_S3_REGION", "us-east-1");
+  cfg.object_store.access_key   = require_env("SIRIUS_TEST_S3_ACCESS_KEY");
+  cfg.object_store.secret_key   = require_env("SIRIUS_TEST_S3_SECRET_KEY");
+  cfg.object_store.tls_verify   = false;
+  cfg.rest.request_timeout_s    = 30;
+  cfg.rest.max_connections      = 8;
+  cfg.rest.perf_instrumentation = perf_instrumentation;
+  cfg.rest_n_reactors           = 1;
+  cfg.enable_prefetch_cache     = false;
   return cfg;
 }
 
@@ -187,15 +188,19 @@ rest_ioctx* require_rest_ioctx_for(sirius_scan_manager& manager, std::string con
   return require_rest_ioctx(manager.create_datasource(uri));
 }
 
-// This used to be describe_with_counter(), which bracketed the describe with
-// rest_ioctx::perf_snapshot().chunk_get_count to prove a warm describe issued
-// ZERO network GETs (i.e. the metadata store served it) and that a cold one
-// stayed within a small GET budget. cuCascade dropped the REST perf counters, so
-// that is no longer observable — only the bind results themselves are.
-parquet_bind_result describe_parquet_for(sirius_scan_manager& manager, std::string const& uri)
+std::uint64_t chunk_get_count(rest_ioctx const& ctx) { return ctx.perf_snapshot().chunk_get_count; }
+
+parquet_bind_result describe_with_counter(sirius_scan_manager& manager,
+                                          std::string const& uri,
+                                          std::uint64_t& delta)
 {
-  (void)require_rest_ioctx_for(manager, uri);  // still assert it routed to REST
-  return manager.describe_parquet(uri);
+  auto* rest_ctx    = require_rest_ioctx_for(manager, uri);
+  auto const before = chunk_get_count(*rest_ctx);
+  auto result       = manager.describe_parquet(uri);
+  auto const after  = chunk_get_count(*rest_ctx);
+  REQUIRE(after >= before);
+  delta = after - before;
+  return result;
 }
 
 }  // namespace
@@ -361,10 +366,16 @@ TEST_CASE("describe_parquet reuses the metadata store on repeated S3 binds",
   auto const uri    = parquet_uri(bucket, "nation.parquet");
 
   scan_manager_fixture fixture;
-  sirius_scan_manager manager{make_minio_rest_config(), *fixture.memory, fixture.topology};
+  sirius_scan_manager manager{
+    make_minio_rest_config(/*perf_instrumentation=*/true), *fixture.memory, fixture.topology};
 
-  auto cold = describe_parquet_for(manager, uri);
-  auto warm = describe_parquet_for(manager, uri);
+  std::uint64_t cold_gets = 0;
+  auto cold               = describe_with_counter(manager, uri, cold_gets);
+  CHECK(cold_gets >= 1);
+
+  std::uint64_t warm_gets = 0;
+  auto warm               = describe_with_counter(manager, uri, warm_gets);
+  CHECK(warm_gets == 0);
   require_same_bind_result(cold, warm);
 }
 
@@ -377,12 +388,17 @@ TEST_CASE("describe_parquet footer fetch stays bounded for small and larger S3 p
 
   auto require_bounded_footer_fetch = [&](std::string const& file_name) {
     scan_manager_fixture fixture;
-    sirius_scan_manager manager{make_minio_rest_config(), *fixture.memory, fixture.topology};
+    sirius_scan_manager manager{
+      make_minio_rest_config(/*perf_instrumentation=*/true), *fixture.memory, fixture.topology};
     auto const uri = parquet_uri(bucket, file_name);
 
-    auto result = describe_parquet_for(manager, uri);
+    std::uint64_t get_count = 0;
+    auto result             = describe_with_counter(manager, uri, get_count);
 
-    INFO(file_name << " object_size: " << result.object_size);
+    INFO(file_name << " footer GET count: " << get_count
+                   << ", object_size: " << result.object_size);
+    CHECK(get_count >= 1);
+    CHECK(get_count <= 4);
     CHECK(result.object_size > 0);
     CHECK(result.total_num_rows > 0);
   };
