@@ -471,6 +471,13 @@ first bail disables fused for the scan's remaining batches). Then: q19-class low
 tier-B re-admission, K4 below the 15% crossover, `bp_offsets` reuse, K1_fc for projected
 filter columns (q7/q3 economics).
 
+**Iteration 3.1 (commit 00094c0b): bail memoization landed — suite 7.584 s, 22/22.**
+q3 +4.4% → +2.4% (residual = the in-flight batches that pay insurance before the
+per-operator latch is visible across the 4-stream convert pipeline; a pre-flight
+selectivity estimate would close it). q1 −37.1% and q6 −51.3% unchanged.
+**Final iteration-3 state: 7.584 s = −7.5% vs same-binary gate-off, −7.3% vs the
+8.180 baseline; campaign 15.99 → 7.584 = −52.6%.**
+
 ---
 
 ## On this machine (pmgb300ws-0163) — concrete paths
