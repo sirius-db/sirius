@@ -478,6 +478,38 @@ selectivity estimate would close it). q1 −37.1% and q6 −51.3% unchanged.
 **Final iteration-3 state: 7.584 s = −7.5% vs same-binary gate-off, −7.3% vs the
 8.180 baseline; campaign 15.99 → 7.584 = −52.6%.**
 
+### Iterations 4–6 + plan re-selection (2026-08-03, commits e9c18f6d..799b6889)
+
+**It4** (e9c18f6d): K4 index decode (q6 −51→−63%, q14 −42%, q15 −44%) + low-sel TierB
+re-admission + bool8 mask plumbing (bool8-ONLY masks measured +5.8% on q19 → routing
+requires a range/pair source; dual-delivery documented for a future ranges+bool8 customer).
+**It5** (f5bc9378): K6 str_split masked gather (q12 −35.8%) + compositional emitters +
+pair machinery (dark: FilterCombiner folds q12's pairs into constant hulls — pairs have no
+suite customer). **Suite 7.436 s, campaign −53.5%.**
+
+**It6** (f4c4b6c2, REVERTED in 799b6889): sync surgery + decode memos. Sanitizer-clean,
+formally audited — and **+0.46% vs same-hour it5 binary** (3-run median 7.485 vs 7.451;
+0.09% spread). H-already-optimal confirmed: decode kernels measured 1.7–3.5 TB/s (within
+~10% of hand-tuned reference; the plan-file rates were 6.7–12× stale), the GPU is
+saturated, the syncs were free. Kernel-level decoder work is DEAD by direct measurement.
+Kept from the audit (35e65949): dict-encode row-cap fix (4 pins/suite had silently pinned
+raw all campaign — narrow pins exceed rows-per-chunk proxies; q4 −2.4%), per-pin coverage
+logging, explorer event-bracketed rates + frontier TSVs.
+
+**Plan re-selection verdict**: current lineitem/orders plans validated (every proposed
+change lost in-engine: ans/lz4 orderkeys re-confirmed the ee8fe639 lesson; dict l_shipmode
+lost BOTH fused-K5 (+100 ms vs K6) and projected decode (194 vs 823 GB/s)). **Selection
+rule: PROJECTED columns need fast full decode; filter/fused-served columns want max
+ratio** — measured twice (l_shipmode, p_type q8-vs-q14). Arm D (surgical side tables:
+dict on p_brand/p_container/c_mktsegment, identity on 12 projected string payloads) is
+**suite-neutral with q10 −4.5% / q11 −5.4% / q4 / q8 wins and large pin-memory savings**
+— deploy is a footprint call; it also reopens pin-once viability.
+
+**Next frontier (unchanged, quantified by the quent census)**: DYNAMIC_FILTER masks —
+19.3 s of task time sits immediately after GPU_SCAN (100% of that operator's occurrences),
+structurally identical to what K1 feeds the selection decoders today. Plus: q19-shape
+dual-delivery bool8, c_phone-class K6 widening, explorer per-column role input.
+
 ---
 
 ## On this machine (pmgb300ws-0163) — concrete paths
