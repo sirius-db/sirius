@@ -9,7 +9,9 @@
 #include <cudf/column/column_factories.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/dictionary/dictionary_factories.hpp>
+#include <cudf/aggregation.hpp>
 #include <cudf/filling.hpp>
+#include <cudf/reduction.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
@@ -1112,43 +1114,146 @@ std::unique_ptr<cudf::column> try_dict_k5_fast_path(PlanTree const& tree,
 }
 
 // K6 masked strings decode for `str_split -> {offsets: bitpack, chars: raw}`
-// plans (l_shipmode shape; c_phone's delta->rle->bitpack offsets chain and
-// entropy-coded chars stay tier_b). Variable-width F5 pattern, W3's half:
-//   phase A (W1, PROPOSED — see STATUS-W3): masked offsets-subtree decode
-//     emitting per-survivor LENGTHS into an int32 buffer of survivors+1
-//     entries (slot [survivors] pre-zeroed by W3) plus per-survivor SOURCE
-//     char start offsets (int64[survivors]);
-//   W3: exclusive-sum scan over the lengths column -> destination offsets
-//     [survivors+1]; one D2H of offsets[survivors] sizes the count-first
-//     chars buffer (full char width is never materialized);
-//   phase B (W1, PROPOSED): survivor char gather (src_starts/lengths ->
-//     out_chars at the destination offsets); W3 assembles via
-//     cudf::make_strings_column.
-// The launchers are W1's iteration-5 deliverable; until they land this
-// declines (nullptr + error). The taxonomy keeps K6 plans off the
-// str_compact route until the tier_str_k6 classifier arm flips, so the stub
-// is unreachable in production.
+// plans (l_shipmode shape; deep offsets chains and entropy-coded chars stay
+// tier_b via the probe). Variable-width F5 pattern:
+//   phase 1 (W1, launch_decode_fused_tree_str_split_meta): masked offsets-
+//     subtree decode emitting per-survivor byte lengths + int64 source char
+//     starts, compacted by rank;
+//   W3: exclusive-sum scan over the lengths column (one extra zeroed tail
+//     slot makes the scan output the full cudf offsets layout directly —
+//     n+1 entries, last = total survivor chars); ONE D2H of that total sizes
+//     the count-first chars buffer — FULL char width is never materialized;
+//   phase 2 (W1, launch_masked_char_copy): survivor byte ranges copied from
+//     the RAW parked chars buffer into the compacted chars at the scan's
+//     destination offsets; W3 assembles via cudf::make_strings_column, with
+//     the scan output doubling as the strings offsets column.
 std::unique_ptr<cudf::column> try_str_k6_path(PlanTree const& tree,
                                               decode_selection const& sel,
                                               rmm::cuda_stream_view stream,
                                               rmm::device_async_resource_ref mr,
                                               std::string* error_out)
 {
-  (void)sel;
-  (void)stream;
-  (void)mr;
-  // Shape gates (mirror plan_supports_str_selection_decode; these stay the
-  // real runtime guards once the launchers land).
   NodeId const str_nid = root_value_producer(tree);
   if (str_nid >= tree.nodes.size() || tree.nodes[str_nid].op != "str_split") {
     if (error_out) *error_out = "decompress: K6 requires a str_split-rooted plan";
     return nullptr;
   }
-  // TODO(W1 K6 launchers): phase-A/phase-B wiring per the contract above.
-  if (error_out) {
-    *error_out = "decompress: K6 masked strings launchers not yet available";
+  PlanNode const& str_node = tree.nodes[str_nid];
+
+  // Locate the RAW chars channel (zero-copy view into the parked rep — a
+  // standalone decompress would materialize the full char width, the very
+  // cost K6 exists to avoid) and the offsets child region.
+  compressed_representation const* chars_rep = nullptr;
+  NodeId offsets_nid                         = static_cast<NodeId>(tree.nodes.size());
+  for (std::size_t i = 0; i < str_node.output_names.size(); ++i) {
+    std::string const& name = str_node.output_names[i];
+    if (name == "chars") {
+      auto it = str_node.channels.find(str_node.output_paths[i]);
+      if (it != str_node.channels.end()) { chars_rep = it->second.get(); }
+    } else if (name == "offsets") {
+      for (auto const& e : str_node.children) {
+        if (e.channel == name) {
+          offsets_nid = e.child;
+          break;
+        }
+      }
+    }
   }
-  return nullptr;
+  if (chars_rep == nullptr || offsets_nid >= tree.nodes.size()) {
+    if (error_out) *error_out = "decompress: K6 plan shape missing raw chars / offsets child";
+    return nullptr;
+  }
+  auto const chars_channels = chars_rep->named_channels(stream);
+  if (chars_channels.empty() ||
+      chars_channels.front().view.type().id() != cudf::type_id::UINT8) {
+    if (error_out) *error_out = "decompress: K6 chars channel is not raw UINT8";
+    return nullptr;
+  }
+  cudf::column_view const chars_view = chars_channels.front().view;
+
+  // Bind the offsets subtree; entropy tails resolve through a local walk
+  // whose memo owns them across the synchronous launches.
+  std::string tail_err;
+  DecodeWalk tail_walk{tree, stream, mr, &tail_err, nullptr, nullptr};
+  decode_materialize_fn resolve = [&tail_walk](NodeId dependency) {
+    return tail_walk.materialize(dependency);
+  };
+  auto region = bind_fused_region(tree, offsets_nid, resolve, stream, mr, error_out);
+  if (!region) { return nullptr; }
+
+  auto const survivors        = sel.survivor_count;
+  auto const num_string_rows  = sel.mask->num_rows;
+
+  auto lengths = cudf::make_fixed_width_column(cudf::data_type{cudf::type_id::INT32},
+                                               static_cast<cudf::size_type>(survivors + 1),
+                                               cudf::mask_state::UNALLOCATED,
+                                               stream,
+                                               mr);
+  rmm::device_buffer src_offsets(
+    static_cast<std::size_t>(survivors) * sizeof(std::int64_t), stream, mr);
+  if (survivors > 0) {
+    // Phase 1 writes [0, survivors); the scan's tail slot must read as zero.
+    cudaMemsetAsync(lengths->mutable_view().data<std::int32_t>() + survivors,
+                    0,
+                    sizeof(std::int32_t),
+                    stream.value());
+    if (!launch_decode_fused_tree_str_split_meta(*region->built.tree,
+                                                 region->labeled,
+                                                 region->dtype,
+                                                 num_string_rows,
+                                                 *sel.mask,
+                                                 static_cast<std::int64_t*>(src_offsets.data()),
+                                                 lengths->mutable_view().data<std::int32_t>(),
+                                                 stream)) {
+      if (error_out) *error_out = "decompress: K6 phase-1 (str_split_meta) launch failed";
+      return nullptr;
+    }
+  } else {
+    cudaMemsetAsync(
+      lengths->mutable_view().head<void>(), 0, sizeof(std::int32_t), stream.value());
+  }
+
+  // Exclusive-sum scan -> destination offsets; doubles as the strings
+  // offsets column (cudf layout: survivors+1 entries, last = total chars).
+  auto out_offsets = cudf::scan(lengths->view(),
+                                *cudf::make_sum_aggregation<cudf::scan_aggregation>(),
+                                cudf::scan_type::EXCLUSIVE,
+                                cudf::null_policy::EXCLUDE,
+                                stream,
+                                mr);
+  std::int32_t total_chars = 0;
+  if (cudaMemcpyAsync(&total_chars,
+                      out_offsets->view().data<std::int32_t>() + survivors,
+                      sizeof(std::int32_t),
+                      cudaMemcpyDeviceToHost,
+                      stream.value()) != cudaSuccess ||
+      cudaStreamSynchronize(stream.value()) != cudaSuccess) {
+    if (error_out) *error_out = "decompress: K6 offsets readback failed";
+    return nullptr;
+  }
+
+  rmm::device_buffer out_chars(static_cast<std::size_t>(total_chars), stream, mr);
+  if (survivors > 0 && total_chars > 0) {
+    if (!launch_masked_char_copy(chars_view.head<void>(),
+                                 static_cast<std::int64_t const*>(src_offsets.data()),
+                                 out_offsets->view().data<std::int32_t>(),
+                                 survivors,
+                                 out_chars.data(),
+                                 stream)) {
+      if (error_out) *error_out = "decompress: K6 phase-2 (char copy) launch failed";
+      return nullptr;
+    }
+  }
+  auto col = cudf::make_strings_column(static_cast<cudf::size_type>(survivors),
+                                       std::move(out_offsets),
+                                       std::move(out_chars),
+                                       0,
+                                       rmm::device_buffer(0, stream, mr));
+  // The phase-1 lengths column and src_offsets free on return; the launches
+  // synced above, and make_strings_column launched nothing — sync once more
+  // for the same caller-may-free discipline as the other compacted routes.
+  cudaStreamSynchronize(stream.value());
+  return col;
 }
 }  // namespace
 
@@ -1367,7 +1472,8 @@ bool plan_supports_selection_decode(PlanTree const& tree)
   // plan_selection_tier / plan_supports_dict_selection_decode.
   // NOTE for wave-1 callers: FILTER (mask-producing K1) columns must be
   // bitpack — gate filters on `plan_selection_tier(...) == tier_a`.
-  return mask_consume_selection_root(tree) || plan_supports_dict_selection_decode(tree);
+  return mask_consume_selection_root(tree) || plan_supports_dict_selection_decode(tree) ||
+         plan_supports_str_selection_decode(tree);
 }
 
 sirius::codegen::output_tier plan_selection_tier(PlanTree const& tree)
@@ -1379,10 +1485,9 @@ sirius::codegen::output_tier plan_selection_tier(PlanTree const& tree)
   if (plan_supports_dict_selection_decode(tree)) {
     return sirius::codegen::output_tier::tier_dict_k5;
   }
-  // K6-capable str_split plans (plan_supports_str_selection_decode) stay
-  // tier_b until output_tier grows tier_str_k6 — flip this arm together with
-  // the umbrella's str arm (invariant: umbrella true ⇔ classifier != tier_b)
-  // and W1's K6 launchers.
+  if (plan_supports_str_selection_decode(tree)) {
+    return sirius::codegen::output_tier::tier_str_k6;
+  }
   return sirius::codegen::output_tier::tier_b;
 }
 
@@ -1509,6 +1614,83 @@ bool decompress_column_selection_mask(PlanTree const& tree,
                                                     mask,
                                                     stream);
   if (!ok && error_out) { *error_out = "decompress: masked (mask-out) decode failed"; }
+  return ok;
+}
+
+bool decompress_column_pair_selection_mask(PlanTree const& tree_a,
+                                           PlanTree const& tree_b,
+                                           sirius::codegen::pair_predicate pred,
+                                           std::uint32_t* mask_words,
+                                           rmm::cuda_stream_view stream,
+                                           rmm::device_async_resource_ref mr,
+                                           std::string* error_out)
+{
+  nvtx3::scoped_range nvtx_range{"simpatico::decompress_column_pair_selection_mask"};
+
+  if (mask_words == nullptr) {
+    if (error_out) *error_out = "decompress: pair selection mask words buffer is null";
+    return false;
+  }
+  // The K1m2 render covers the ordering comparisons only; the values of the
+  // two enums align on that shared range (lt/le/gt/ge = 0..3).
+  if (pred.op != sirius::codegen::pair_compare_op::lt &&
+      pred.op != sirius::codegen::pair_compare_op::le &&
+      pred.op != sirius::codegen::pair_compare_op::gt &&
+      pred.op != sirius::codegen::pair_compare_op::ge) {
+    if (error_out) {
+      *error_out = "decompress: pair op not supported by the K1m2 render (lt/le/gt/ge only)";
+    }
+    return false;
+  }
+  if (!bitpack_selection_root(tree_a) || !bitpack_selection_root(tree_b)) {
+    if (error_out) {
+      *error_out = "decompress: pair predicate requires two bitpack-rooted plans";
+    }
+    return false;
+  }
+  NodeId const root_a = root_value_producer(tree_a);
+  NodeId const root_b = root_value_producer(tree_b);
+
+  // One walk per tree resolves any entropy tails; both memos own their
+  // buffers across the synchronous launch.
+  std::string tail_err_a;
+  std::string tail_err_b;
+  DecodeWalk walk_a{tree_a, stream, mr, &tail_err_a, nullptr, nullptr};
+  DecodeWalk walk_b{tree_b, stream, mr, &tail_err_b, nullptr, nullptr};
+  decode_materialize_fn resolve_a = [&walk_a](NodeId dependency) {
+    return walk_a.materialize(dependency);
+  };
+  decode_materialize_fn resolve_b = [&walk_b](NodeId dependency) {
+    return walk_b.materialize(dependency);
+  };
+  auto region_a = bind_fused_region(tree_a, root_a, resolve_a, stream, mr, error_out);
+  if (!region_a) { return false; }
+  auto region_b = bind_fused_region(tree_b, root_b, resolve_b, stream, mr, error_out);
+  if (!region_b) { return false; }
+  if (region_a->num_rows != region_b->num_rows) {
+    if (error_out) {
+      *error_out = "decompress: pair predicate columns disagree on row count";
+    }
+    return false;
+  }
+
+  sirius::codegen::selection_mask mask{};
+  mask.words    = mask_words;
+  mask.num_rows = static_cast<std::int64_t>(region_a->num_rows);
+  bool const ok =
+    launch_decode_fused_tree_pair_mask_out(*region_a->built.tree,
+                                           region_a->labeled,
+                                           region_a->dtype,
+                                           *region_b->built.tree,
+                                           region_b->labeled,
+                                           region_b->dtype,
+                                           static_cast<std::int64_t>(region_a->num_rows),
+                                           static_cast<pair_cmp>(pred.op),
+                                           mask,
+                                           stream,
+                                           pred.range_a,
+                                           pred.range_b);
+  if (!ok && error_out) { *error_out = "decompress: pair (K1m2) mask decode failed"; }
   return ok;
 }
 

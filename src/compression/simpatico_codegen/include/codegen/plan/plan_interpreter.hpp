@@ -228,6 +228,23 @@ bool decompress_column_selection_mask(PlanTree const& tree,
                                       rmm::device_async_resource_ref mr,
                                       std::string* error_out);
 
+/// Wave 1 / K1m2: two-column pair-predicate mask (q12-class col-vs-col
+/// conjuncts). Both plans must be bitpack-rooted over the same row count —
+/// the launcher additionally verifies matching chunk geometry. Row r's mask
+/// bit is `decoded_a(r) OP decoded_b(r) && decoded_a(r) in pred.range_a &&
+/// decoded_b(r) in pred.range_b` (full-domain range = inactive side). Writes
+/// mask words only (AllocWordsFor sizing, tail-zero), NO column output.
+/// pair_compare_op eq/ne are refused (the K1m2 render covers lt/le/gt/ge) —
+/// the extraction must not emit them. Returns false + @p error_out on any
+/// refusal; no device state is corrupted.
+bool decompress_column_pair_selection_mask(PlanTree const& tree_a,
+                                           PlanTree const& tree_b,
+                                           sirius::codegen::pair_predicate pred,
+                                           std::uint32_t* mask_words,
+                                           rmm::cuda_stream_view stream,
+                                           rmm::device_async_resource_ref mr,
+                                           std::string* error_out);
+
 /// Wave 2, compacted decode: dispatches on plan shape — a bitpack-rooted plan
 /// runs Tier A / K3 (rows whose mask bit is 0 are never unpacked), a
 /// dictionary-rooted plan with bitpack codes runs the dict-K5 route (K3 over

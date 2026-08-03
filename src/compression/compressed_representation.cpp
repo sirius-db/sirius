@@ -324,14 +324,12 @@ compressed_device_representation::probe_fused_scan_reservation() const
     auto const& plan = ct.columns[idx].plan_tree;
     if (!plan) { return false; }
     if (!simpatico::plan_supports_selection_decode(*plan)) { return false; }
-    // Tiers exempt from the RULE-2 selectivity bail (their masked routes win
-    // at every selectivity): dict-K5, and K6 strings once its classifier arm
-    // flips (the str probe is checked directly so this line needs no change
-    // at flip time; pre-flip the umbrella excludes str plans anyway).
-    any_unbounded = any_unbounded ||
-                    simpatico::plan_selection_tier(*plan) ==
-                      sirius::codegen::output_tier::tier_dict_k5 ||
-                    simpatico::plan_supports_str_selection_decode(*plan);
+    // Tiers exempt from the RULE-2 selectivity bail: dict-K5 only (its masked
+    // key gather wins at every selectivity). K6 strings stay on the 0.35
+    // write-skip regime per the declared wave policy — savings are weak at
+    // ~1-char widths — so tier_str_k6 does NOT lift the bound here.
+    any_unbounded = any_unbounded || simpatico::plan_selection_tier(*plan) ==
+                                       sirius::codegen::output_tier::tier_dict_k5;
     return true;
   };
   bool planned = false;
