@@ -186,6 +186,13 @@ class sirius_pipeline : public duckdb::enable_shared_from_this<sirius_pipeline> 
   //! Checks if the pipeline has been finished
   virtual bool is_pipeline_finished() const;
 
+  //! Whether this pipeline's sink terminates the query — it has no downstream consumer to
+  //! schedule and no repository wiring to emit, and its completion is what signals the future
+  //! `sirius_engine::execute()` waits on. True for a RESULT_COLLECTOR (the engine-injected root
+  //! of a normal query) and for a STREAMING_SINK (the root of a streaming fragment, whose output
+  //! leaves through session-owned repositories rather than a QueryResult).
+  [[nodiscard]] bool is_query_terminal() const;
+
   void mark_task_created();
   void mark_task_completed();
 
