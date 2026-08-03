@@ -30,9 +30,12 @@
 #include <utils/sirius_test_env.hpp>
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <thread>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -529,6 +532,243 @@ TEST_CASE_METHOD(fragment_fixture,
     // Every value from every batch: a receiver that ran one task and stopped would return the
     // first batch's rows and look like a plausible partial success.
     REQUIRE(drain_values(receiver, 1) == std::vector<std::int32_t>{1, 2, 3, 4, 5, 6});
+
+    con->Rollback();
+  } catch (...) {
+    con->Rollback();
+    throw;
+  }
+}
+
+namespace {
+
+//! Joins on every exit path. A test that throws past a live producer thread would terminate();
+//! this keeps the failure a failure instead of an abort.
+struct thread_joiner {
+  std::thread& t;
+  ~thread_joiner()
+  {
+    if (t.joinable()) { t.join(); }
+  }
+};
+
+//! Build and run `query` as a sender fragment inside its own window, then hand back everything
+//! it parked. The staged batches are how the live-producer and fan-in tests get real GPU batches
+//! without touching the memory manager directly.
+std::vector<std::shared_ptr<cucascade::data_batch>> staged_batches_of(
+  duckdb::Connection& con, duckdb::SiriusContext& sirius_ctx, const char* query)
+{
+  fragment_spec spec;
+  spec.plan_source = sirius::test::sql_plan_source(query);
+  spec.outputs     = {0};
+  streaming_fragment sender(*con.context, std::move(spec));
+
+  query_window window(sirius_ctx, *con.context, "frag_stage_sender");
+  sender.build(window.query_id());
+  sender.run();
+  window.finish();
+
+  std::vector<std::shared_ptr<cucascade::data_batch>> staged;
+  while (auto batch = sender.session().pull(0)) {
+    staged.push_back(*batch);
+  }
+  return staged;
+}
+
+}  // namespace
+
+// ============================================================================
+// FRAG-6: a live producer pushes while run() executes.
+//
+// Every earlier FRAG case pre-fills and closes the stream before run(); a
+// concurrent compute node does neither. This is the first fragment-level
+// exercise of the source's persistent on_data hook under a real pipeline:
+// run() starts against an open, EMPTY stream, the pipeline parks, and each
+// push must re-nominate the source or run() never returns.
+// ============================================================================
+
+TEST_CASE_METHOD(fragment_fixture,
+                 "FRAG-6: a producer pushing during run() is drained to the last value",
+                 "[integration][streaming_fragment]")
+{
+  auto sirius_ctx = con->context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  REQUIRE(sirius_ctx != nullptr);
+
+  con->BeginTransaction();
+  try {
+    // Disjoint halves again (cf. FRAG-5): two staged batches, so at least one push lands while
+    // the pipeline is already parked, not merely before the first task.
+    auto staged = staged_batches_of(*con, *sirius_ctx, "SELECT a FROM (VALUES (1), (2), (3)) t(a)");
+    auto second = staged_batches_of(*con, *sirius_ctx, "SELECT a FROM (VALUES (4), (5), (6)) t(a)");
+    staged.insert(staged.end(), second.begin(), second.end());
+    REQUIRE(staged.size() >= 2);
+
+    fragment_spec receiver_spec;
+    receiver_spec.plan_source =
+      sirius::test::sql_plan_source("SELECT a FROM sirius_stream_source(0)");
+    receiver_spec.inputs[0] = stream_input_spec{
+      {"a"},
+      sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER}),
+      {0}};
+    receiver_spec.outputs = {1};
+    streaming_fragment receiver(*con->context, std::move(receiver_spec));
+
+    query_window receiver_window(*sirius_ctx, *con->context, "frag6_receiver");
+    receiver.build(receiver_window.query_id());
+
+    // Catch2 assertions are not thread-safe; the producer records refusals and the main thread
+    // asserts after the join.
+    std::atomic<bool> push_refused{false};
+    std::thread producer([&] {
+      for (const auto& batch : staged) {
+        // Long enough for run() to start, drain what exists, and park between pushes.
+        std::this_thread::sleep_for(std::chrono::milliseconds(30));
+        if (!receiver.session().push(0, batch)) { push_refused.store(true); }
+      }
+      receiver.session().close_input(0, 0);
+    });
+    thread_joiner join_producer{producer};
+
+    // Blocks until the stream ends -- which only happens if every live push re-armed the
+    // pipeline and the producer's close was seen. A lost wake-up hangs here, not later.
+    receiver.run();
+    producer.join();
+    receiver_window.finish();
+
+    REQUIRE_FALSE(push_refused.load());
+    REQUIRE(drain_values(receiver, 1) == std::vector<std::int32_t>{1, 2, 3, 4, 5, 6});
+
+    con->Rollback();
+  } catch (...) {
+    con->Rollback();
+    throw;
+  }
+}
+
+// ============================================================================
+// FRAG-7: fan-in with two DISTINCT sender ids, and the duplicate-close attack.
+//
+// FRAG-5 pushed two senders' batches under one sender id and one close. This
+// is the property the sender *set* exists for: with senders {0, 1}, a repeated
+// close from sender 0 must not end the stream -- a plain counter would, and
+// the rows sender 1 had not yet pushed would silently never arrive.
+// ============================================================================
+
+TEST_CASE_METHOD(fragment_fixture,
+                 "FRAG-7: a duplicated close from one sender cannot end a fan-in stream",
+                 "[integration][streaming_fragment]")
+{
+  auto sirius_ctx = con->context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  REQUIRE(sirius_ctx != nullptr);
+
+  con->BeginTransaction();
+  try {
+    auto first  = staged_batches_of(*con, *sirius_ctx, "SELECT a FROM (VALUES (1), (2), (3)) t(a)");
+    auto second = staged_batches_of(*con, *sirius_ctx, "SELECT a FROM (VALUES (4), (5), (6)) t(a)");
+    REQUIRE_FALSE(first.empty());
+    REQUIRE_FALSE(second.empty());
+
+    fragment_spec receiver_spec;
+    receiver_spec.plan_source =
+      sirius::test::sql_plan_source("SELECT a FROM sirius_stream_source(0)");
+    receiver_spec.inputs[0] = stream_input_spec{
+      {"a"},
+      sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER}),
+      {0, 1}};
+    receiver_spec.outputs = {1};
+    streaming_fragment receiver(*con->context, std::move(receiver_spec));
+
+    query_window receiver_window(*sirius_ctx, *con->context, "frag7_receiver");
+    receiver.build(receiver_window.query_id());
+
+    for (const auto& batch : first) {
+      REQUIRE(receiver.session().push(0, batch));
+    }
+    receiver.session().close_input(0, 0);
+    // The attack: close sender 0 again. Idempotent per identity -- if this advanced the stream,
+    // the push below would be refused and sender 1's rows would be lost.
+    REQUIRE_NOTHROW(receiver.session().close_input(0, 0));
+
+    for (const auto& batch : second) {
+      // Still open: only sender 1's close may end it.
+      REQUIRE(receiver.session().push(0, batch));
+    }
+    receiver.session().close_input(0, 1);
+
+    receiver.run();
+    receiver_window.finish();
+
+    REQUIRE(drain_values(receiver, 1) == std::vector<std::int32_t>{1, 2, 3, 4, 5, 6});
+
+    con->Rollback();
+  } catch (...) {
+    con->Rollback();
+    throw;
+  }
+}
+
+// ============================================================================
+// FRAG-8: a fragment whose plan reads TWO stream inputs.
+//
+// task_scheduler::start_query() kicks off only scans.front(), so the second
+// STREAMING_SOURCE is reached the way the probe side of any join is: when
+// the pipeline it depends on finishes, notify_downstream_pipelines()
+// schedules the blocked consumer, and get_operator_for_next_task() walks the
+// consumer's WAITING_FOR_INPUT_DATA hints back to this source; batches
+// arriving after that re-nominate it through the on_data hook. (The
+// task creator's lookahead queue also holds scans.begin()+1, but feeds tasks
+// only under the non-default lookahead strategy -- this test runs the
+// notification chain.) Pins that a two-stream plan actually drains both:
+// the shape a shuffle-consuming fragment will have.
+// ============================================================================
+
+TEST_CASE_METHOD(fragment_fixture,
+                 "FRAG-8: a fragment reading two stream inputs drains both",
+                 "[integration][streaming_fragment]")
+{
+  auto sirius_ctx = con->context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  REQUIRE(sirius_ctx != nullptr);
+
+  con->BeginTransaction();
+  try {
+    auto left  = staged_batches_of(*con, *sirius_ctx, "SELECT a FROM (VALUES (1), (2), (3)) t(a)");
+    auto right = staged_batches_of(*con, *sirius_ctx, "SELECT b FROM (VALUES (2), (3), (4)) t(b)");
+    REQUIRE_FALSE(left.empty());
+    REQUIRE_FALSE(right.empty());
+
+    fragment_spec receiver_spec;
+    receiver_spec.plan_source = sirius::test::sql_plan_source(
+      "SELECT s0.a FROM sirius_stream_source(0) s0 JOIN sirius_stream_source(1) s1 "
+      "ON s0.a = s1.b");
+    receiver_spec.inputs[0] = stream_input_spec{
+      {"a"},
+      sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER}),
+      {0}};
+    receiver_spec.inputs[1] = stream_input_spec{
+      {"b"},
+      sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER}),
+      {0}};
+    receiver_spec.outputs = {2};
+    streaming_fragment receiver(*con->context, std::move(receiver_spec));
+
+    query_window receiver_window(*sirius_ctx, *con->context, "frag8_receiver");
+    receiver.build(receiver_window.query_id());
+
+    for (const auto& batch : left) {
+      REQUIRE(receiver.session().push(0, batch));
+    }
+    receiver.session().close_input(0, 0);
+    for (const auto& batch : right) {
+      REQUIRE(receiver.session().push(1, batch));
+    }
+    receiver.session().close_input(1, 0);
+
+    receiver.run();
+    receiver_window.finish();
+
+    // The join's answer identifies which streams were read: {2, 3} requires values from BOTH
+    // sides. A starved second source would hang run() or produce an empty (or one-sided) result.
+    REQUIRE(drain_values(receiver, 2) == std::vector<std::int32_t>{2, 3});
 
     con->Rollback();
   } catch (...) {

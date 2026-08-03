@@ -760,3 +760,45 @@ TEST_CASE("streaming_sink PART-7: destination list and spec are validated", "[st
   REQUIRE_THROWS_AS(op->drained(2), sirius::invalid_input_exception);
   REQUIRE_THROWS_AS(op->availability(2), sirius::invalid_input_exception);
 }
+
+// ============================================================================
+// PART-8: a batch arriving after end-of-stream is refused on every partition
+// ============================================================================
+
+TEST_CASE("streaming_sink PART-8: a partitioned push after end-of-stream publishes nothing",
+          "[streaming_sink]")
+{
+  auto mem_mgr    = sirius::test::operator_utils::initialize_memory_manager();
+  auto* gpu_space = mem_mgr->get_memory_space(Tier::GPU, 0);
+  REQUIRE(gpu_space != nullptr);
+
+  constexpr std::size_t N = 2;
+  auto [op, repos]        = make_partitioned_sink(N);
+
+  const std::vector<int64_t> keys{1, 2, 3, 4};
+  const std::vector<int32_t> vals{10, 20, 30, 40};
+  sink_one(*op,
+           make_two_column_batch<int64_t, int32_t>(*gpu_space, keys, vals, cudf::type_id::INT32));
+  op->finalize_operator();
+
+  // Drain to a clean end on every partition first, so anything appearing below is unambiguously
+  // the late batch.
+  std::size_t drained_rows = 0;
+  for (std::size_t i = 0; i < N; ++i) {
+    drained_rows += drain_rows(*op, i).size();
+    REQUIRE(op->drained(i));
+  }
+  REQUIRE(drained_rows == keys.size());
+
+  // The late arrival. Same disaster class as SINK-ERR on the single path: rows that vanish
+  // behind a consumer that already saw end-of-stream would make a partial shuffle look like a
+  // clean one. The sink must refuse the slices (and warn), never publish them.
+  sink_one(*op,
+           make_two_column_batch<int64_t, int32_t>(*gpu_space, keys, vals, cudf::type_id::INT32));
+
+  for (std::size_t i = 0; i < N; ++i) {
+    REQUIRE(op->availability(i) == availability::END_OF_STREAM);
+    REQUIRE(op->drained(i));
+    REQUIRE_FALSE(op->pull(i).has_value());
+  }
+}
