@@ -145,7 +145,15 @@ class Walker {
         // Root producer writes the reconstructed chunk straight to global out.
         emit_producer(tree, "(out + chunk_start)", "len", dtype_);
         break;
-      case DecodeVariant::mask_out: emit_bitpack_mask_out(tree); break;
+      case DecodeVariant::mask_out:
+        if (tree.op == ::codegen::OpKind::Bitpack) {
+          emit_bitpack_mask_out(tree);  // tuned closed-form path
+        } else {
+          // Compositional fallback (K1-delta and friends): stage the chunk
+          // via the existing emitters, ballot from the staged values.
+          emit_generic_mask_out(tree);
+        }
+        break;
       case DecodeVariant::mask_consume:
         if (tree.op == ::codegen::OpKind::Delta) {
           emit_delta_mask_consume(tree);  // tuned register path, no slab
@@ -273,6 +281,7 @@ class Walker {
   void emit_bitpack_mask_dict_gather(const ::codegen::jit::FusedTree& node);
   void emit_bitpack_index_consume(const ::codegen::jit::FusedTree& node);
   void emit_generic_mask_consume(const ::codegen::jit::FusedTree& node);
+  void emit_generic_mask_out(const ::codegen::jit::FusedTree& node);
   void emit_str_split_meta(const ::codegen::jit::FusedTree& node);
   DecodeKernelSpec finalize_pair(const std::string& dtype_b);
   void emit_delta_producer(const ::codegen::jit::FusedTree& node,
@@ -911,6 +920,40 @@ void Walker::emit_str_split_meta(const ::codegen::jit::FusedTree& node)
         << "            (out + out_base)[rank] = off_r;\n"
         << "            len_out[out_base + rank] = static_cast<int32_t>(off_r1 - off_r);\n"
         << "        }\n"
+        << "    }\n";
+  sm_.release_to(mark);
+}
+
+// =====================================================================
+// Generic mask_out (K1-generic / K1-delta) — the compositional K1 for
+// non-closed-form roots, primarily delta->bitpack orderkey shapes: the
+// decode-evaluable form of min-max dynamic join filters.  Delta's prefix
+// sum is sequential within a chunk, so the chunk is reconstructed IN FULL
+// via value_source (staged to a shared-mem slab by the existing plain
+// emitters), then the range predicate is balloted from the staged values.
+// Reading i-aligned positions keeps the one-word-per-32-consecutive-rows
+// mask layout intact (ballot lanes == mask bits).  No column output; same
+// trailing params as the bitpack K1 (sel_mask in the out slot, pred_lo/
+// pred_hi widened-int64 kernel parameters).
+// =====================================================================
+void Walker::emit_generic_mask_out(const ::codegen::jit::FusedTree& node)
+{
+  body_ << "    // --- node " << id_of(node) << ": " << ::codegen::jit::op_kind_name(node.op)
+        << " fused range predicate -> selection mask (K1-generic) ---\n";
+  const auto mark = sm_.mark();
+  ValueSource vs  = value_source(node, dtype_, "len");
+  body_ << "    uint32_t* mask_words = sel_mask + (chunk_start >> 5);\n"
+        << "    #pragma unroll\n"
+        << "    for (int32_t j = 0; j < CHUNK / " << tbs_ << "; ++j) {\n"
+        << "        const int32_t i = j * " << tbs_ << " + tid;\n"
+        << "        bool pass = false;\n"
+        << "        if (i < len) {\n"
+        << "            const int64_t v = static_cast<int64_t>(" << at_pos(vs.read_expr, "i")
+        << ");\n"
+        << "            pass = (v >= pred_lo) && (v <= pred_hi);\n"
+        << "        }\n"
+        << "        const uint32_t ballot = __ballot_sync(0xFFFFFFFFu, pass);\n"
+        << "        if ((tid & 31) == 0) mask_words[i >> 5] = ballot;\n"
         << "    }\n";
   sm_.release_to(mark);
 }

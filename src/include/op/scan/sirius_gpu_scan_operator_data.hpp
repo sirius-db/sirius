@@ -17,6 +17,8 @@
 #pragma once
 
 // sirius
+#include "compression/decode_pushdown.hpp"
+
 #include <op/scan/gpu_ingestible.hpp>
 #include <op/sirius_physical_operator.hpp>
 #include <scan_manager/mvcc_chunk_mask.hpp>
@@ -34,7 +36,39 @@
 #include <memory>
 #include <variant>
 
+namespace sirius::op {
+class sirius_dynamic_filter_set;  // membership channel (op/sirius_dynamic_filter.hpp)
+}
+
 namespace sirius::op::scan {
+
+//===----------------------------------------------------------------------===//
+// membership snapshot (fused scan-filter Phase A)
+//===----------------------------------------------------------------------===//
+/// One snapshot of a scan's dynamic-filter channel, shaped for decode.
+struct membership_snapshot {
+  sirius::decode_membership_pushdown pushdown;  ///< parallel to the selected slots
+  std::uint64_t generation    = 0;              ///< set->filter_count(), read BEFORE the walk
+  std::size_t attached_probes = 0;
+  std::size_t skipped_non_mask = 0;  ///< filters without the mask-applicable mixin (zone maps)
+};
+
+/// Build a membership pushdown over @p n_slots provider/representation slots.
+///
+/// THE MAPPING INVARIANT (single source of truth — both the scan-manager
+/// drain attach and the decode-time refresh call this): slot order ==
+/// materialized_column_order == output columns FIRST, IN OUTPUT ORDER, then
+/// pure-filter columns, while the filter set keys by the consumer's
+/// OUTPUT-COLUMN position (parquet installs set_consumer_column_remap with
+/// scan_plan::output_position_by_column_id). Slot i therefore maps to output
+/// position i for every output column, so slot i's probes are exactly
+/// filters_for_column(i); trailing pure-filter slots query keys the set can
+/// never hold (push_filter rejects non-output columns) and come back empty by
+/// construction. generation is read BEFORE the walk so it never claims probes
+/// the walk did not capture (a racing publish only ADDS an uncounted probe —
+/// the safe direction for the converter's generation echo).
+[[nodiscard]] membership_snapshot snapshot_membership_pushdown(
+  sirius::op::sirius_dynamic_filter_set const& set, std::size_t n_slots);
 
 //===----------------------------------------------------------------------===//
 // scan_operator_input
@@ -156,6 +190,13 @@ class scan_operator_input : public op::operator_data {
   /// set while the gate is off — the converters then always produce the plain
   /// representation.
   bool decode_row_filtered{false};
+  /// The operator's dynamic-filter channel (may be null), stamped by
+  /// sirius_gpu_scan_operator::get_next_task_input_data. prepare_for_processing
+  /// snapshots it at DECODE time — the scan-manager drain runs at query
+  /// prepare, before any join build has published, so only a decode-time
+  /// snapshot can see membership filters (the iteration-7 zero-member() root
+  /// cause).
+  std::shared_ptr<sirius::op::sirius_dynamic_filter_set> dynamic_filters;
   /// Operator-shared RULE-2 bail latch, stamped by
   /// sirius_gpu_scan_operator::get_next_task_input_data on every split it
   /// hands out. Selectivity is uniform across a scan's batches (unclustered

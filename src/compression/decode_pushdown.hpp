@@ -16,8 +16,18 @@
 
 #pragma once
 
+#include <rmm/cuda_stream_view.hpp>
+#include <rmm/resource_ref.hpp>
+
 #include <cstdint>
+#include <functional>
+#include <memory>
 #include <vector>
+
+namespace cudf {
+class column;
+class column_view;
+}  // namespace cudf
 
 namespace sirius {
 
@@ -55,5 +65,36 @@ struct decode_range_entry {
 /// decode_equality_pushdown: entry @c i describes the @c i-th column the
 /// converter will decompress. May be shorter (missing tail = inactive).
 using decode_range_pushdown = std::vector<decode_range_entry>;
+
+/// Type-erased membership probe for dynamic join filters (Phase A): evaluates
+/// the published device structure (small_in_list / cuco set / Bloom) over the
+/// decoded key column and returns a BOOL8 keep-mask. Wraps
+/// sirius_dynamic_filter::compute_mask with the device id bound; the closure
+/// co-owns the filter (shared_ptr capture) for the call's duration and must
+/// enqueue only on the handed stream.
+using membership_probe_fn = std::function<std::unique_ptr<cudf::column>(
+  cudf::column_view const&, rmm::cuda_stream_view, rmm::device_async_resource_ref)>;
+
+/// One probe plus its cap-ordering signal. The converter sorts the request's
+/// membership sources by ascending EXPECTED keep-rate before the engine's
+/// membership cap truncates the list (q21 lesson: a prefix cap must see the
+/// strong filters first). Best static signal, in priority order:
+///   kind_rank — 0 = small_in_list, 1 = cuco in_list set, 2 = Bloom (the set
+///   forms are exact; Bloom over-keeps by construction); 255 = unknown, last.
+///   num_keys  — build keys when the filter exposes it (fewer ⇒ stronger);
+///   0 = unknown. Ties keep channel (publication) order.
+struct decode_membership_probe {
+  membership_probe_fn probe;
+  std::uint8_t kind_rank = 255;
+  std::uint64_t num_keys = 0;
+};
+
+/// Membership pushdown for one selected column: every probe ANDs into the
+/// scan mask. Parallel to the selected column list like the ranges; an entry
+/// with no probes decodes normally.
+struct decode_membership_entry {
+  std::vector<decode_membership_probe> probes;
+};
+using decode_membership_pushdown = std::vector<decode_membership_entry>;
 
 }  // namespace sirius

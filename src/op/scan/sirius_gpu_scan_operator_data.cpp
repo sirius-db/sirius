@@ -21,17 +21,41 @@
 
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <data/sirius_converter_registry.hpp>
+#include <log/logging.hpp>
 #include <op/scan/row_filtered_table_representation.hpp>
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
+#include <op/sirius_dynamic_filter.hpp>
 
 #include <algorithm>
 #include <cstdlib>
 #include <memory>
 #include <stdexcept>
+#include <utility>
 
 namespace sirius::op::scan {
 
 namespace {
+
+// Env-gate readers, duplicated from the wave orchestrator / scan manager by
+// design (this TU runs before any simpatico call); cached statics, defaults
+// kept in sync.
+bool fused_scan_gate_enabled()
+{
+  static bool const enabled = [] {
+    char const* v = std::getenv("SIRIUS_EXP_FUSED_SCAN_FILTER");
+    return v != nullptr && v[0] == '1' && v[1] == '\0';
+  }();
+  return enabled;
+}
+
+bool fused_scan_diag_enabled()
+{
+  static bool const enabled = [] {
+    char const* v = std::getenv("SIRIUS_EXP_FUSED_SCAN_DIAG");
+    return v != nullptr && v[0] != '\0' && !(v[0] == '0' && v[1] == '\0');
+  }();
+  return enabled;
+}
 
 // RULE-2 selectivity ceiling (SIRIUS_EXP_FUSED_SCAN_MAX_SEL, default 0.35):
 // above it the fused pipeline bails post-CNT and re-runs classic, so every
@@ -68,6 +92,57 @@ sirius::compressed_device_representation::fused_scan_reservation_probe fused_dec
 }
 
 }  // namespace
+
+membership_snapshot snapshot_membership_pushdown(
+  sirius::op::sirius_dynamic_filter_set const& set, std::size_t n_slots)
+{
+  membership_snapshot snap;
+  // generation FIRST: it must never claim probes the walk below did not
+  // capture (see the header doc).
+  snap.generation = set.filter_count();
+  snap.pushdown.resize(n_slots);
+  for (std::size_t i = 0; i < n_slots; ++i) {
+    auto filters = set.filters_for_column(i);
+    for (auto& filter : filters) {
+      // Only mask-capable kinds (in-list / small-in-list / Bloom) can probe
+      // at decode; zone-map filters have no per-row form.
+      auto const* applicable =
+        dynamic_cast<sirius::op::sirius_mask_applicable const*>(filter.get());
+      if (applicable == nullptr) {
+        ++snap.skipped_non_mask;
+        continue;
+      }
+      // Cap-ordering signal (decode_membership_probe doc): kind rank by
+      // ascending expected keep-rate, num_keys where the concrete filter
+      // exposes it. Bloom has no size accessor — rank alone places it last.
+      std::uint8_t kind_rank = 255;
+      std::uint64_t num_keys = 0;
+      if (auto const* small =
+            dynamic_cast<sirius::op::sirius_dynamic_small_in_list_filter const*>(filter.get())) {
+        kind_rank = 0;
+        num_keys  = small->size();
+      } else if (auto const* set =
+                   dynamic_cast<sirius::op::sirius_dynamic_in_list_filter const*>(filter.get())) {
+        kind_rank = 1;
+        num_keys  = set->size();
+      } else if (filter->kind() == sirius::op::sirius_dynamic_filter_kind::BLOOM) {
+        kind_rank = 2;
+      }
+      // The closure co-owns the filter and binds device 0 (GPU-tier pinned
+      // decode; compute_mask re-validates the device itself).
+      snap.pushdown[i].probes.push_back(
+        {[f = std::move(filter), applicable](cudf::column_view const& keys,
+                                             rmm::cuda_stream_view s,
+                                             rmm::device_async_resource_ref mr) {
+           return applicable->compute_mask(keys, /*device_id=*/0, s, mr);
+         },
+         kind_rank,
+         num_keys});
+      ++snap.attached_probes;
+    }
+  }
+  return snap;
+}
 
 void scan_operator_input::prepare_for_processing(
   const ::cucascade::memory::memory_space* requested_memory_space, rmm::cuda_stream_view stream)
@@ -107,6 +182,43 @@ void scan_operator_input::prepare_for_processing(
         } else if (auto* host_rep =
                      dynamic_cast<::sirius::compressed_host_representation*>(mut.get_data())) {
           host_rep->set_range_pushdown({}, false);
+        }
+      }
+      // Decode-time membership snapshot (fused scan-filter Phase A): the
+      // scan-manager drain runs at query PREPARE, before any join build has
+      // published, so a drain-time snapshot is empty for the whole scan (the
+      // iteration-7 zero-member() root cause). Executor tasks prepare right
+      // before decode — by then upstream builds have published — so refresh
+      // the projected rep with a fresh per-batch snapshot here, replacing any
+      // (typically empty) drain-time one. Mapping invariant lives in
+      // snapshot_membership_pushdown; same mvcc guard as the range attach.
+      if (fused_scan_gate_enabled() && dynamic_filters && dynamic_filters->has_filters() &&
+          !mvcc_keep_mask.has_mask()) {
+        auto snapshot_onto = [&](auto* rep) {
+          std::size_t const n_slots = rep->selected_indices().has_value()
+                                        ? rep->selected_indices()->size()
+                                        : rep->column_names().size();
+          auto snap = snapshot_membership_pushdown(*dynamic_filters, n_slots);
+          if (fused_scan_diag_enabled()) {
+            SIRIUS_LOG_INFO(
+              "[fused-diag] membership attach (decode-time) channel={}: has_filters=true "
+              "slots={} attached_probes={} gen={} skipped_cast={}",
+              static_cast<void const*>(dynamic_filters.get()),
+              n_slots,
+              snap.attached_probes,
+              snap.generation,
+              snap.skipped_non_mask);
+          }
+          if (snap.attached_probes > 0) {
+            rep->set_membership_pushdown(std::move(snap.pushdown), snap.generation);
+          }
+        };
+        if (auto* device_rep =
+              dynamic_cast<::sirius::compressed_device_representation*>(mut.get_data())) {
+          snapshot_onto(device_rep);
+        } else if (auto* host_rep =
+                     dynamic_cast<::sirius::compressed_host_representation*>(mut.get_data())) {
+          snapshot_onto(host_rep);
         }
       }
       mut.convert_to<::cucascade::gpu_table_representation>(

@@ -65,15 +65,22 @@ namespace codegen::decode::jit {
 //
 //   * plain        — full-column decode, today's behaviour (byte-identical
 //                    source to the pre-variant renderer).
-//   * mask_out     — K1: Bitpack-LEAF-root decode fused with an inclusive
-//                    [lo,hi] range predicate on the decoded integer domain,
-//                    producing selection-mask words (row r -> bit r%32 of
-//                    word r/32; 32 words per 1024-row chunk, tail bits and
-//                    tail words written as zero).  NO column write; the
-//                    `out` parameter slot is `uint32_t* sel_mask`, which
-//                    must hold ceil(n/1024)*32 words.  Extra params:
-//                    `int64_t pred_lo, int64_t pred_hi` (values are widened
-//                    to int64 for the compare).
+//   * mask_out     — K1: decode fused with an inclusive [lo,hi] range
+//                    predicate on the decoded integer domain, producing
+//                    selection-mask words (row r -> bit r%32 of word r/32;
+//                    32 words per 1024-row chunk, tail bits and tail words
+//                    written as zero).  NO column write; the `out`
+//                    parameter slot is `uint32_t* sel_mask`, which must
+//                    hold ceil(n/1024)*32 words.  Extra params: `int64_t
+//                    pred_lo, int64_t pred_hi` (values are widened to
+//                    int64 for the compare).  Supported roots: Bitpack
+//                    leaf (closed-form, skips nothing but stores nothing),
+//                    and — for delta->bitpack orderkey shapes, the
+//                    decode-evaluable form of min-max dynamic join
+//                    filters — any value_source-supported root (K1-delta:
+//                    the chunk is reconstructed IN FULL via the existing
+//                    emitters, then the predicate is balloted from the
+//                    staged values, keeping the mask-word alignment).
 //   * mask_consume — K3: decode consuming a selection mask plus per-chunk
 //                    exclusive survivor offsets (`chunk_offsets[c]` =
 //                    compacted output base of chunk c, length

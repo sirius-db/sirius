@@ -140,10 +140,12 @@ struct fused_scan_directives {
  *
  * @p has_bool8_mask_sources declares that the caller will also contribute
  * dict-code equality conjuncts (scan_filter_request::bool8_filters) to the
- * scan mask: the package then enables even with zero range sources (q19-style
- * string-only masks), and @c covers_whole_filter is forced false — the
- * extraction gate only speaks for the numeric view, so bool8-carrying batches
- * always keep the residual post-filter.
+ * scan mask; @p has_membership_mask_sources likewise for dynamic-membership
+ * probes (scan_filter_request::membership_filters, Phase A). Either one lets
+ * the package enable with zero range sources, and either forces
+ * @c covers_whole_filter false — the extraction gate only speaks for the
+ * static numeric view (dynamic filters are never whole-filter), so such
+ * batches always keep the residual post-filter.
  *
  * @throws std::runtime_error if @p attached_ranges is wider than
  *         @p selected_columns (a wiring bug, mirroring the equality pushdown).
@@ -153,6 +155,7 @@ fused_scan_directives build_fused_scan_directives(const simpatico::compressed_ta
                                                   const decode_range_pushdown& attached_ranges,
                                                   bool all_conjuncts_convertible,
                                                   bool has_bool8_mask_sources = false,
-                                                  const decode_pair_pushdown& attached_pairs = {});
+                                                  const decode_pair_pushdown& attached_pairs = {},
+                                                  bool has_membership_mask_sources = false);
 
 }  // namespace sirius

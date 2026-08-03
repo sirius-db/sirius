@@ -485,6 +485,44 @@ bool run_delta_masked(const std::string& dtype, int arch)
               dtype.c_str(),
               static_cast<long long>(survivors),
               static_cast<long long>(n));
+
+  // K1-delta (mask_out on the delta root): fused range predicate over the
+  // fully reconstructed values -> mask words, no column output.  Data is
+  // monotone, so a value band selects a contiguous row band; also all/none.
+  {
+    const std::int64_t v_lo = static_cast<std::int64_t>(data[static_cast<std::size_t>(n / 4)]);
+    const std::int64_t v_hi =
+      static_cast<std::int64_t>(data[static_cast<std::size_t>((3 * n) / 4)]);
+    const std::int64_t v_max    = static_cast<std::int64_t>(data[static_cast<std::size_t>(n - 1)]);
+    const range_predicate preds[] = {
+      {v_lo, v_hi},              // mid band
+      {0, v_max},                // all pass
+      {v_max + 1, v_max + 100},  // none pass
+    };
+    const char* names[] = {"mid", "all", "none"};
+    const std::size_t nwords = static_cast<std::size_t>(nc) * kWordsPerChunk;
+    for (int p = 0; p < 3; ++p) {
+      CUdeviceptr d_mask1 = enc.alloc(nwords * 4);
+      cudaMemset(reinterpret_cast<void*>(d_mask1), 0xFF, nwords * 4);  // prove tail zeroing
+      selection_mask sm1;
+      sm1.words    = reinterpret_cast<std::uint32_t*>(d_mask1);
+      sm1.num_rows = n;
+      REQUIRE_MSG(simpatico::launch_decode_fused_tree_mask_out(
+                    *tree, enc.buffers, dtype.c_str(), n, preds[p], sm1, stream),
+                  "[delta-k1/%s/%s] mask_out launch failed",
+                  dtype.c_str(),
+                  names[p]);
+      std::vector<std::uint32_t> got_mask(nwords);
+      cudaMemcpy(got_mask.data(), reinterpret_cast<const void*>(d_mask1), nwords * 4,
+                 cudaMemcpyDeviceToHost);
+      const std::vector<std::uint32_t> ref_mask = host_mask(data, nc, preds[p]);
+      REQUIRE_MSG(got_mask == ref_mask,
+                  "[delta-k1/%s/%s] K1-delta mask != host reference",
+                  dtype.c_str(),
+                  names[p]);
+      std::printf("PASS: delta-k1/%s/%s\n", dtype.c_str(), names[p]);
+    }
+  }
   return true;
 }
 
@@ -1016,18 +1054,22 @@ bool render_checks()
                 k1.source.find("pred_hi") != std::string::npos,
               "mask_out source must take pred_lo/pred_hi kernel params");
 
-  // 3. Delta root: mask_out stays rejected (filter columns are bitpack);
-  //    mask_consume renders (K3-delta) with its own symbol + source.
+  // 3. Delta root: mask_out AND mask_consume both render (K1-delta via the
+  //    generic value_source seam; K3-delta tuned), each with its own symbol
+  //    + source.
   auto delta = jit::FusedTree::make(
     OpKind::Delta, {{"differences", jit::FusedTree::make(OpKind::Bitpack)}});
-  bool rejected = false;
-  try {
-    (void)cdj::render(*delta, "int64_t", 8, cdj::DecodeVariant::mask_out);
-  } catch (const cdj::RenderError&) {
-    rejected = true;
-  }
-  REQUIRE_MSG(rejected, "mask_out on a Delta root must throw RenderError");
+  bool rejected                      = false;
   const cdj::DecodeKernelSpec dplain = cdj::render(*delta, "int64_t", 8);
+  const cdj::DecodeKernelSpec dk1 =
+    cdj::render(*delta, "int64_t", 8, cdj::DecodeVariant::mask_out);
+  REQUIRE_MSG(dk1.entry_symbol == dplain.entry_symbol + "_mask_out",
+              "K1-delta entry symbol suffix wrong: %s",
+              dk1.entry_symbol.c_str());
+  REQUIRE_MSG(dk1.source.find("K1-generic") != std::string::npos &&
+                dk1.source.find("pred_lo") != std::string::npos &&
+                dk1.buffers.size() == dplain.buffers.size(),
+              "K1-delta must render via the generic seam with pred params, same manifest");
   const cdj::DecodeKernelSpec dmask =
     cdj::render(*delta, "int64_t", 8, cdj::DecodeVariant::mask_consume);
   REQUIRE_MSG(dmask.entry_symbol == dplain.entry_symbol + "_mask_consume",

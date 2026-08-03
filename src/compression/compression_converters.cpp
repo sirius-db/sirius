@@ -46,6 +46,7 @@
 #include <numeric>
 #include <optional>
 #include <stdexcept>
+#include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -230,25 +231,24 @@ enum class fused_batch_tag : std::uint8_t {
 };
 
 // Attempt the fused scan-filter decompress (SIRIUS_EXP_FUSED_SCAN_FILTER):
-// wave-1 K1 masks on the range columns + dict-code BOOL8 masks on equality
-// columns, wave-2 decode against the combined mask, output assembled to one
-// uniformly survivor-sized table. Returns nullptr when the attempt is
-// declined here (directives not buildable, or shape-impossible with bool8
-// sources) or the assembly refuses — the caller then runs the classic path
+// wave-1 K1 masks on range columns + K1m2 pairs + dict-code BOOL8 masks +
+// dynamic-membership probes (Phase A), wave-2 decode against the combined
+// mask, output assembled to one uniformly survivor-sized table. Returns
+// nullptr when the attempt is declined here (directives not buildable, shape
+// checks) or the assembly refuses — the caller then runs the classic path
 // (predicated when an equality pushdown exists). `tag` reports how to wrap a
 // non-null return; `none` with a non-null return means the engine fell back
 // internally and the table is the classic decode — with routed bool8_filters
 // that fallback is PREDICATED (BOOL8 substitution columns at those slots, the
-// dict win survives every outcome; decompress_scan_filter contract), and the
-// scan's per-batch type inspection consumes them exactly like the shipped
-// pushdown.
+// dict win survives every outcome; decompress_scan_filter contract).
 //
-// ITERATION-4 POLICY (dict-code mask sources): when a pure-filter dict column's
-// equality/IN joins the scan mask (bool8_filters) AND the fused pipeline
-// applies, its BOOL8 substitution is DROPPED — no decode_predicates ride the
-// applied path, the column decodes as real (compacted) values, and the batch
-// stays untagged so the post-filter re-runs everything (idempotent) plus any
-// residual. Single delivery: whichever path wins carries the predicate.
+// DUAL DELIVERY (bool8 sources, W4 rev 18): a bool8 column's slot carries the
+// wave-1 BOOL8 gathered to survivors (compacted BOOL8, never K5 values), so
+// the scan's type inspection takes the substitution branch and the residual
+// re-eval is a bare boolean AND. Membership sources are dynamic — the batch
+// stays untagged regardless (the authoritative join still runs), and the
+// post-scan DYNAMIC_FILTER operator's gate self-disables once it measures
+// keep ≈ 1 on the already-masked stream.
 std::unique_ptr<cudf::table> try_decompress_scan_filter(
   simpatico::compressed_table const& ct,
   std::span<const std::size_t> selected,
@@ -256,6 +256,8 @@ std::unique_ptr<cudf::table> try_decompress_scan_filter(
   bool all_conjuncts_convertible,
   decode_equality_pushdown const& equality_pushdown,
   decode_pair_pushdown const& attached_pairs,
+  decode_membership_pushdown const& membership_pushdown,
+  std::uint64_t membership_generation,
   simpatico::stream_pool& pool,
   rmm::cuda_stream_view stream,
   rmm::device_async_resource_ref mr,
@@ -271,54 +273,48 @@ std::unique_ptr<cudf::table> try_decompress_scan_filter(
       break;
     }
   }
-  auto const directives = build_fused_scan_directives(
-    ct, selected, attached_ranges, all_conjuncts_convertible, has_bool8_candidates,
-    attached_pairs);
+  // Membership sources (Phase A): dynamic-filter probes, one source per probe.
+  std::size_t membership_sources = 0;
+  for (std::size_t i = 0; i < membership_pushdown.size() && i < selected.size(); ++i) {
+    membership_sources += membership_pushdown[i].probes.size();
+  }
+  auto const directives = build_fused_scan_directives(ct,
+                                                      selected,
+                                                      attached_ranges,
+                                                      all_conjuncts_convertible,
+                                                      has_bool8_candidates,
+                                                      attached_pairs,
+                                                      membership_sources > 0);
   if (!directives.enabled) { return nullptr; }
 
-  // bool8 routing policy, measured (closing matrix, iteration 4): a
-  // bool8-ONLY mask lost on q19 (+5.8%, 0.3254 → 0.3441) — single delivery
-  // turns the substituted column into K5-materialized compacted strings and
-  // the partial-coverage post-filter then string-compares them, strictly more
-  // work than the BOOL8-substitution baseline at ~7% survivors. So dict-code
-  // conjuncts join the mask only when at least one range (later: pair) source
-  // is ALSO present; bool8-only decline to the predicated classic path, which
-  // IS today's optimum. No suite scan currently pairs ranges with dict-code
-  // masks, so this gates nothing real — see STATUS-W2 for the dual-delivery
-  // design to adopt when such a customer appears.
-  //
-  // Shape checks: structurally impossible requests skip the engine
-  // round-trip. No admissibility mirror remains: since W4's rev 14, EVERY
-  // non-applied outcome with routed bool8_filters reruns classic WITH the
-  // dict-code conjuncts as decode_predicates (BOOL8 substitution floor, see
-  // the decompress_scan_filter contract in api/simpatico_codegen.hpp).
+  // bool8 routing (dual delivery, W4 rev 18): the wave-1 BOOL8 is retained and
+  // gathered to the column's slot (compacted BOOL8, RULE-1-bypassed, write-skip
+  // cheap), so the residual re-eval is a bare boolean AND — bool8-ONLY masks
+  // are now sound AND profitable (the iteration-4 +5.8% came from the old
+  // single-delivery K5 string re-compare; that path is gone). No decline
+  // remains beyond the shape checks: a REFUSED request with routed
+  // bool8_filters still reruns classic PREDICATED (substitution floor, W4
+  // rev 14 contract).
   std::size_t range_sources = 0;
   for (auto const& e : directives.ranges) {
     if (e.participates_in_scan_mask) { ++range_sources; }
   }
-  bool route_bool8 = false;
-  if (has_bool8_candidates) {
-    if (range_sources + directives.pairs.size() == 0) {
-      SIRIUS_FUSED_DIAG(
-        "[fused-diag] bool8-only mask declined (no range/pair source) — keeping the predicated "
-        "classic path (measured optimum, q19 iteration-4 matrix)");
-      return nullptr;
-    }
-    std::size_t bool8_sources = 0;
-    for (std::size_t i = 0; i < equality_pushdown.size() && i < selected.size(); ++i) {
-      if (!equality_pushdown[i].empty()) { ++bool8_sources; }
-    }
-    if (range_sources + directives.pairs.size() + bool8_sources > 8 ||
-        ct.num_rows() > std::numeric_limits<std::int32_t>::max()) {
-      SIRIUS_FUSED_DIAG(
-        "[fused-diag] bool8 routing declined on shape ({} mask sources, {} rows) — keeping the "
-        "predicated classic path",
-        range_sources + directives.pairs.size() + bool8_sources,
-        ct.num_rows());
-      return nullptr;
-    }
-    route_bool8 = true;
+  std::size_t bool8_sources = 0;
+  for (std::size_t i = 0; i < equality_pushdown.size() && i < selected.size(); ++i) {
+    if (!equality_pushdown[i].empty()) { ++bool8_sources; }
   }
+  // Shape checks: structurally impossible requests skip the engine round-trip.
+  // Every source counts once (a pair once, each membership probe once).
+  auto const total_sources =
+    range_sources + directives.pairs.size() + bool8_sources + membership_sources;
+  if (total_sources > 8 || ct.num_rows() > std::numeric_limits<std::int32_t>::max()) {
+    SIRIUS_FUSED_DIAG(
+      "[fused-diag] fused routing declined on shape ({} mask sources, {} rows) — classic path",
+      total_sources,
+      ct.num_rows());
+    return nullptr;
+  }
+  bool const route_bool8 = has_bool8_candidates;
 
   // Build the wave request directly (not via make_scan_filter_request, whose
   // column_decode_directive collapses tiers to a boolean): W4's wave-2
@@ -353,6 +349,50 @@ std::unique_ptr<cudf::table> try_decompress_scan_filter(
       request.bool8_filters.push_back({i, equality_pushdown[i]});
     }
   }
+  // Membership sources (Phase A): the attach snapshotted the dynamic filter
+  // set per batch; each probe closure co-owns its published device replica, so
+  // copying the std::function here keeps the filter pinned for the call.
+  // GLOBAL order = ascending expected keep-rate (kind_rank, then num_keys,
+  // ties in channel order): the engine's membership cap keeps a PREFIX, so
+  // the strong filters must come first (q21: the suppkey in_list must beat
+  // the orders Bloom to the cap).
+  {
+    struct ordered_probe {
+      std::size_t column;
+      decode_membership_probe const* probe;
+    };
+    std::vector<ordered_probe> ordered;
+    for (std::size_t i = 0; i < membership_pushdown.size() && i < selected.size(); ++i) {
+      for (auto const& probe : membership_pushdown[i].probes) {
+        ordered.push_back({i, &probe});
+      }
+    }
+    std::stable_sort(ordered.begin(), ordered.end(), [](auto const& a, auto const& b) {
+      if (a.probe->kind_rank != b.probe->kind_rank) {
+        return a.probe->kind_rank < b.probe->kind_rank;
+      }
+      // 0 = unknown key count: sort after known counts within the same kind.
+      auto const a_keys = a.probe->num_keys == 0 ? std::numeric_limits<std::uint64_t>::max()
+                                                 : a.probe->num_keys;
+      auto const b_keys = b.probe->num_keys == 0 ? std::numeric_limits<std::uint64_t>::max()
+                                                 : b.probe->num_keys;
+      return a_keys < b_keys;
+    });
+    std::string order_echo;
+    for (auto const& e : ordered) {
+      request.membership_filters.push_back({e.column, e.probe->probe});
+      order_echo += order_echo.empty() ? "" : ",";
+      order_echo += std::to_string(e.probe->kind_rank) + ":c" + std::to_string(e.column);
+    }
+    if (!ordered.empty()) {
+      SIRIUS_FUSED_DIAG("[fused-diag] membership cap order (ascending expected keep): [{}]",
+                        order_echo);
+    }
+  }
+  // Dynamic-filter-set version behind those probes (0 = static-only); echoed
+  // on the result so the scan-side bail latch can clear when a later, tighter
+  // set arrives (transitive targets).
+  request.source_generation = membership_generation;
 
   sirius::codegen::scan_filter_result result;
   auto decoded = simpatico::decompress_scan_filter(ct, selected, request, result, pool, mr);
@@ -381,13 +421,16 @@ std::unique_ptr<cudf::table> try_decompress_scan_filter(
     tag = fused_batch_tag::row_filtered;
   }
   SIRIUS_FUSED_DIAG(
-    "[fused-diag] decompress_scan_filter {} (status={}): range_filters={} pair_filters={} "
-    "bool8_filters={} survivors={}/{} column(s)={} covers_whole_filter={} tag={}",
+    "[fused-diag] decompress_scan_filter {} (status={} gen={}): range_filters={} pair_filters={} "
+    "bool8_filters={} membership_filters={} survivors={}/{} column(s)={} covers_whole_filter={} "
+    "tag={}",
     result.applied ? "APPLIED" : "NOT applied (classic output)",
     static_cast<int>(result.status),
+    result.source_generation,
     request.filters.size(),
     request.pair_filters.size(),
     request.bool8_filters.size(),
+    request.membership_filters.size(),
     result.survivor_count,
     result.num_rows,
     table->num_columns(),
@@ -406,6 +449,8 @@ std::unique_ptr<cucascade::idata_representation> reconstruct_and_decompress_to_g
   decode_equality_pushdown const& equality_pushdown,
   decode_range_pushdown const& range_pushdown,
   bool range_conjuncts_convertible,
+  decode_membership_pushdown const& membership_pushdown,
+  std::uint64_t membership_generation,
   cucascade::idata_representation& source,
   const cucascade::memory::memory_space* target_memory_space,
   rmm::cuda_stream_view stream)
@@ -453,7 +498,7 @@ std::unique_ptr<cucascade::idata_representation> reconstruct_and_decompress_to_g
     predicates.size(),
     range_pushdown.size(),
     range_conjuncts_convertible);
-  if (!range_pushdown.empty() || !predicates.empty()) {
+  if (!range_pushdown.empty() || !predicates.empty() || !membership_pushdown.empty()) {
     // `subset` holds exactly the projected columns, so selection is identity.
     std::vector<std::size_t> identity_selection(subset.num_columns());
     std::iota(identity_selection.begin(), identity_selection.end(), std::size_t{0});
@@ -463,6 +508,8 @@ std::unique_ptr<cucascade::idata_representation> reconstruct_and_decompress_to_g
                                               range_conjuncts_convertible,
                                               equality_pushdown,
                                               decode_pair_pushdown{},  // carrier pending (STATUS-W2)
+                                              membership_pushdown,
+                                              membership_generation,
                                               pool,
                                               stream,
                                               mr,
@@ -531,6 +578,8 @@ std::unique_ptr<cucascade::idata_representation> decompress_host_to_gpu(
                                            rep.equality_pushdown(),
                                            rep.range_pushdown(),
                                            rep.range_conjuncts_convertible(),
+                                           rep.membership_pushdown(),
+                                           rep.membership_generation(),
                                            source,
                                            target_memory_space,
                                            stream);
@@ -573,7 +622,8 @@ std::unique_ptr<cucascade::idata_representation> decompress_device_to_gpu(
     rep.range_pushdown().size(),
     rep.range_conjuncts_convertible());
   std::vector<std::size_t> identity_selection;
-  if (!rep.range_pushdown().empty() || !predicates.empty()) {
+  if (!rep.range_pushdown().empty() || !predicates.empty() ||
+      !rep.membership_pushdown().empty()) {
     std::span<const std::size_t> selected;
     if (indices.has_value()) {
       selected = *indices;
@@ -588,6 +638,8 @@ std::unique_ptr<cucascade::idata_representation> decompress_device_to_gpu(
                                               rep.range_conjuncts_convertible(),
                                               rep.equality_pushdown(),
                                               decode_pair_pushdown{},  // carrier pending (STATUS-W2)
+                                              rep.membership_pushdown(),
+                                              rep.membership_generation(),
                                               pool,
                                               stream,
                                               mr,
@@ -642,18 +694,20 @@ fused_scan_directives build_fused_scan_directives(const simpatico::compressed_ta
                                                   const decode_range_pushdown& attached_ranges,
                                                   bool all_conjuncts_convertible,
                                                   bool has_bool8_mask_sources,
-                                                  const decode_pair_pushdown& attached_pairs)
+                                                  const decode_pair_pushdown& attached_pairs,
+                                                  bool has_membership_mask_sources)
 {
   fused_scan_directives out;  // disabled/empty unless a mask source survives
+  bool const has_external_sources = has_bool8_mask_sources || has_membership_mask_sources;
   // The [fused-diag] lines trace every accept/refuse decision of the fused
   // scan-filter pipeline. Kept at DEBUG: quiet by default, and raising the
   // level is the first move whenever a batch silently falls back to the
   // classic path (see the M2 hunt in STATUS-W2).
   bool const any_active = std::any_of(
     attached_ranges.begin(), attached_ranges.end(), [](auto const& e) { return e.active; });
-  if (!any_active && !has_bool8_mask_sources && attached_pairs.empty()) {
+  if (!any_active && !has_external_sources && attached_pairs.empty()) {
     SIRIUS_FUSED_DIAG("[fused-diag] directives: {} attached range entr(ies), NONE active, no "
-                      "bool8/pair sources — classic path",
+                      "bool8/pair/membership sources — classic path",
                       attached_ranges.size());
     return out;
   }
@@ -747,26 +801,30 @@ fused_scan_directives build_fused_scan_directives(const simpatico::compressed_ta
     }
   }
 
-  if (mask_columns == 0 && out.pairs.empty() && !has_bool8_mask_sources) {
+  if (mask_columns == 0 && out.pairs.empty() && !has_external_sources) {
     SIRIUS_FUSED_DIAG("[fused-diag] directives: no mask source survived — classic path");
     return {};
   }
   out.enabled = true;
-  // Coverage: bool8 sources never upgrade it (the extraction gate only speaks
-  // for the numeric view — such batches stay untagged and the post-decompress
-  // filter re-evaluates everything plus the residual). Kept pairs do NOT
-  // affect it either — q12-class pair conjuncts live in the FILTER operator
-  // ABOVE the scan, which runs regardless of the scan's row-filtered tag, so
-  // masking them is a pure bonus restriction; a DROPPED pair clears coverage
-  // per the selection.hpp contract (conservative — costs only the tag).
+  // Coverage: bool8 and membership sources never upgrade it (the extraction
+  // gate only speaks for the static numeric view; dynamic filters are NEVER
+  // whole-filter — the authoritative join must still run). Such batches stay
+  // untagged and the post-decompress filter re-evaluates everything plus the
+  // residual. Kept pairs do NOT affect it either — q12-class pair conjuncts
+  // live in the FILTER operator ABOVE the scan, which runs regardless of the
+  // scan's row-filtered tag, so masking them is a pure bonus restriction; a
+  // DROPPED pair clears coverage per the selection.hpp contract (conservative
+  // — costs only the tag).
   out.covers_whole_filter = all_conjuncts_convertible && !dropped_conjunct && !dropped_pair &&
-                            (mask_columns > 0 || !out.pairs.empty()) && !has_bool8_mask_sources;
+                            (mask_columns > 0 || !out.pairs.empty()) && !has_external_sources;
   SIRIUS_FUSED_DIAG(
     "[fused-diag] directives ENABLED: {} range mask column(s), {} pair source(s), "
-    "bool8_sources={}, {}/{} compact-capable output column(s), covers_whole_filter={}",
+    "bool8_sources={}, membership_sources={}, {}/{} compact-capable output column(s), "
+    "covers_whole_filter={}",
     mask_columns,
     out.pairs.size(),
     has_bool8_mask_sources,
+    has_membership_mask_sources,
     compactable,
     count,
     out.covers_whole_filter);

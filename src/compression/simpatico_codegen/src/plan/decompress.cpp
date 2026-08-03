@@ -1271,11 +1271,19 @@ std::unique_ptr<cudf::column> decompress_column(PlanTree const& tree,
     return nullptr;
   }
 
-  bool const selecting = sel != nullptr && sel->active();
-  if (selecting && pred != nullptr && pred->active()) {
-    // The fused scan-filter pipeline already resolved every conjunct into the
-    // mask; a simultaneous BOOL8-substitution directive is a scheduling bug.
-    if (error_out) *error_out = "decompress: decode_selection and decode_predicate are exclusive";
+  bool const selecting   = sel != nullptr && sel->active();
+  bool const substituting = pred != nullptr && pred->active();
+  if (selecting && substituting && (sel->compact_capable || sel->str_compact)) {
+    // Dual delivery (a survivor-sized BOOL8 at a mask-source slot) composes
+    // only where the predicate has a compacted meaning: the dict route
+    // (predicate answered over the K3-compacted codes) and the plain Tier-B
+    // route (full-width BOOL8, then the survivor gather). A numeric
+    // mask_consume region or the K6 strings route with a string-equality
+    // directive is a scheduling bug.
+    if (error_out) {
+      *error_out = "decompress: decode_predicate composes only with dict_compact or Tier-B "
+                   "selection";
+    }
     return nullptr;
   }
   if (selecting && (static_cast<int>(sel->compact_capable) + static_cast<int>(sel->dict_compact) +
@@ -1335,16 +1343,32 @@ std::unique_ptr<cudf::column> decompress_column(PlanTree const& tree,
   }
 
   std::unique_ptr<cudf::column> col;
-  if (selecting && sel->dict_compact) {
+  if (selecting && sel->dict_compact && !substituting) {
     // Constant-width fast path: W1's K5 char-emit kernel replaces the
     // compacted-codes intermediate + cudf key gather with one launch. A
     // nullptr (not applicable / launch declined) falls through to the general
-    // dict route — nothing shared was mutated.
+    // dict route — nothing shared was mutated. Skipped under dual delivery:
+    // the caller wants a BOOL8 answer, not strings.
     col = try_dict_k5_fast_path(tree, *sel, stream, mr);
   }
   if (!col) {
+    // Dual delivery composes here without special cases: the dict route
+    // reconstructs its rep over the K3-compacted codes, so the existing
+    // predicate answer (decompress_predicate — or run()'s generic
+    // decode-and-compare fallback) yields a SURVIVOR-SIZED BOOL8; the plain
+    // Tier-B route produces full-width BOOL8 and the gather below compacts it.
     DecodeWalk walk{tree, stream, mr, error_out, pred, sel};
     col = walk.run();
+  }
+
+  if (col && selecting && substituting && col->type().id() != cudf::type_id::BOOL8) {
+    // Dual-delivery belt: a predicate directive promises "BOOL8 result" to the
+    // filter-expression rewrite; anything else must fail loudly here rather
+    // than let a strings column meet a bare boolean reference downstream.
+    if (error_out) {
+      *error_out = "decompress: predicate directive under selection returned a non-BOOL8 column";
+    }
+    return nullptr;
   }
 
   if (col && selecting && sel->compacted()) {
@@ -1522,12 +1546,14 @@ bool plan_supports_str_selection_decode(PlanTree const& tree)
       chars_ok = it != node.channels.end() && it->second &&
                  it->second->decoded_type().id() == cudf::type_id::UINT8;
     } else if (name == "offsets") {
-      // Iteration 5: plain bitpack offsets only (the masked reconstruction
-      // W1 renders); deeper chains (delta->rle->bitpack, c_phone) stay
-      // tier_b until the renderer composes them.
+      // Iteration 7 widening: the masked offsets reconstruction renders
+      // Bitpack- OR Delta-rooted subtrees at ANY depth below (str-deep
+      // GPU-proven), which admits c_phone's delta->rle->bitpack chain. Other
+      // roots return false at render, so the probe mirrors exactly that set.
       for (auto const& e : node.children) {
         if (e.channel == name) {
-          offsets_ok = e.child < tree.nodes.size() && tree.nodes[e.child].op == "bitpack";
+          offsets_ok = e.child < tree.nodes.size() && (tree.nodes[e.child].op == "bitpack" ||
+                                                       tree.nodes[e.child].op == "delta");
           break;
         }
       }

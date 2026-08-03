@@ -17,13 +17,21 @@
 
 #pragma once
 
+#include <cudf/column/column_view.hpp>
+
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_buffer.hpp>
 #include <rmm/resource_ref.hpp>
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
+#include <memory>
 #include <vector>
+
+namespace cudf {
+class column;
+}
 
 namespace sirius::codegen {
 
@@ -123,6 +131,25 @@ constexpr bool tier_is_fused_capable(output_tier t)
 struct filter_column_directive {
   std::size_t column;   // index into the decompress call's `selected` span
   range_predicate pred; // inclusive [lo,hi] in the decoded integer domain
+  bool dynamic = false;  // provenance: join-produced dynamic min-max (DIAG `range*`)
+};
+
+// One dynamic MEMBERSHIP conjunct (iteration 7 phase A: join-build in_list /
+// cuco set / Bloom on a scan key column). Wave 1 decodes the key column full
+// width, invokes `probe` (device-side membership test -> BOOL8, nonzero =
+// keep, NO null mask, exactly the batch's row count) and ANDs the packed
+// result into the batch mask; wave 2 compacts everything else as usual.
+// Probe contract (same as every wave-1 launcher): ALL device work enqueued on
+// the given stream before returning — no internal stream hops, no host sync
+// required; the closure must PIN the filter structure it captures (e.g. a
+// shared_ptr to the published device set) for the duration of the
+// decompress_scan_filter call. Directives snapshot the filter SET per batch —
+// the converter must never hand a probe that reads mutable live state.
+struct membership_filter_directive {
+  std::size_t column;  // key column, indexes into `selected`
+  std::function<std::unique_ptr<cudf::column>(
+    cudf::column_view keys, rmm::cuda_stream_view stream, rmm::device_async_resource_ref mr)>
+    probe;
 };
 
 // One scan conjunct resolved by the shipped dict-code BOOL8 pushdown (q19-style
@@ -173,7 +200,13 @@ struct scan_filter_request {
   std::vector<filter_column_directive> filters;      // range conjuncts (K1 sources)
   std::vector<pair_filter_directive> pair_filters;    // col-vs-col conjuncts (K1m2 sources)
   std::vector<bool8_filter_directive> bool8_filters;  // dict-code conjuncts (BOOL8 sources)
+  std::vector<membership_filter_directive> membership_filters;  // dynamic probes
   std::vector<output_tier> tiers;                     // parallel to `selected`
+  // Dynamic-filter-set version at request build (0 = static-only). Echoed on
+  // the result so the scan-side bail latch can clear when a later, tighter
+  // filter set arrives (transitive targets; direct probe targets see complete
+  // filters from the first batch per the census).
+  uint64_t source_generation = 0;
 };
 
 // Per-selected-column directive, the shape W2's converter builder emits (see
@@ -222,6 +255,7 @@ enum class scan_filter_status : uint8_t {
 struct scan_filter_result {
   bool applied = false;      // false => output is the classic full-width decode
   scan_filter_status status = scan_filter_status::refused;  // always applied ⇔ status==applied
+  uint64_t source_generation = 0;  // echo of the request (bail-latch keying)
   int64_t num_rows = 0;      // pre-filter batch rows
   int64_t survivor_count = -1;
   std::vector<output_tier> tiers;    // EFFECTIVE per-output tier (W4 may demote

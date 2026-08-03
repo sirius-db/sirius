@@ -236,6 +236,27 @@ class compressed_host_representation : public cucascade::idata_representation {
     return _range_conjuncts_convertible;
   }
 
+  /// Attach dynamic-membership probes (Phase A), parallel to the selected
+  /// column list; same freshly-projected ownership rule. @p generation is the
+  /// producing channel's monotonic filter_count() at snapshot time — the wave
+  /// orchestrator echoes it so bail latches can be generation-keyed.
+  void set_membership_pushdown(decode_membership_pushdown pushdown, std::uint64_t generation)
+  {
+    _membership_pushdown  = std::move(pushdown);
+    _membership_generation = generation;
+  }
+
+  [[nodiscard]] const decode_membership_pushdown& membership_pushdown() const noexcept
+  {
+    return _membership_pushdown;
+  }
+
+  [[nodiscard]] std::uint64_t membership_generation() const noexcept
+  {
+    return _membership_generation;
+  }
+
+
  private:
   /// Construct a projection sharing the same backing blob.
   compressed_host_representation(cucascade::memory::memory_space& memory_space,
@@ -255,6 +276,8 @@ class compressed_host_representation : public cucascade::idata_representation {
   decode_equality_pushdown _equality_pushdown;
   decode_range_pushdown _range_pushdown;
   bool _range_conjuncts_convertible = false;
+  decode_membership_pushdown _membership_pushdown;
+  std::uint64_t _membership_generation = 0;
 };
 
 /// A Simpatico-compressed chunk resident in GPU (device) memory.
@@ -360,6 +383,27 @@ class compressed_device_representation : public cucascade::idata_representation 
     return _range_conjuncts_convertible;
   }
 
+  /// Attach dynamic-membership probes (Phase A), parallel to the selected
+  /// column list; same freshly-projected ownership rule. @p generation is the
+  /// producing channel's monotonic filter_count() at snapshot time — the wave
+  /// orchestrator echoes it so bail latches can be generation-keyed.
+  void set_membership_pushdown(decode_membership_pushdown pushdown, std::uint64_t generation)
+  {
+    _membership_pushdown  = std::move(pushdown);
+    _membership_generation = generation;
+  }
+
+  [[nodiscard]] const decode_membership_pushdown& membership_pushdown() const noexcept
+  {
+    return _membership_pushdown;
+  }
+
+  [[nodiscard]] std::uint64_t membership_generation() const noexcept
+  {
+    return _membership_generation;
+  }
+
+
   /// Reservation-time fused scan-filter probe (host metadata only — never
   /// touches the device).
   struct fused_scan_reservation_probe {
@@ -400,6 +444,8 @@ class compressed_device_representation : public cucascade::idata_representation 
   decode_equality_pushdown _equality_pushdown;
   decode_range_pushdown _range_pushdown;
   bool _range_conjuncts_convertible = false;
+  decode_membership_pushdown _membership_pushdown;
+  std::uint64_t _membership_generation = 0;
 };
 
 }  // namespace sirius

@@ -157,8 +157,14 @@ struct decode_selection {
 ///              @c decode_selection). When non-null and active the result holds
 ///              only the mask's survivor rows: a Tier-A plan decodes compacted
 ///              in-kernel, a Tier-B plan decodes full width and is gathered.
-///              Mutually exclusive with @p pred. Iteration 1 requires non-null
-///              columns — a null-masked decode fails loudly (never corrupts).
+///              Composition with @p pred (dual delivery — a survivor-sized
+///              BOOL8 at a mask-source slot): allowed for @c dict_compact (the
+///              predicate is answered over the K3-compacted codes) and for the
+///              plain Tier-B route (full-width BOOL8, then the survivor
+///              gather); refused for @c compact_capable / @c str_compact. The
+///              result is then BOOL8[survivor_count] — enforced by a belt.
+///              Iteration 1 requires non-null columns — a null-masked decode
+///              fails loudly (never corrupts).
 std::unique_ptr<cudf::column> decompress_column(PlanTree const& tree,
                                                 rmm::cuda_stream_view stream,
                                                 rmm::device_async_resource_ref mr,

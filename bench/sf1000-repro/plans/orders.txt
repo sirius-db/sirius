@@ -5,9 +5,10 @@ input -> delta -> differences
 delta.differences -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
 
 ---
-# column: o_custkey  dtype: i32  ratio: 1.140x  depth: 1
-# comp: 678.76 GB/s  decomp: 1487.39 GB/s
-input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+# column: o_custkey  dtype: i64  ratio: 1.000x  depth: 1
+# role rule: q13/q18 scan it UNFILTERED (join key, projected) and its bitpack ratio was
+# only 1.14x — identity serves raw with zero decode. See NEXT-STEPS it4-6 section.
+input -> identity
 
 ---
 # column: o_orderstatus  dtype: str  ratio: 19.321x  depth: 2

@@ -21,6 +21,7 @@
 #include <data/sirius_converter_registry.hpp>
 #include <log/logging.hpp>
 #include <op/scan/gpu_ingestible.hpp>
+#include <op/scan/parquet_gpu_ingestible.hpp>
 #include <op/scan/sirius_gpu_scan_operator.hpp>
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
 #include <op/sirius_physical_operator.hpp>
@@ -55,6 +56,13 @@ sirius_gpu_scan_operator::sirius_gpu_scan_operator(duckdb::vector<sirius::logica
     _ingestible(std::move(ingestible)),
     _split_connector(std::make_shared<scan_manager::split_connector>())
 {
+  // Resolve the scan's dynamic-filter channel once (null for non-parquet
+  // ingestibles): every split gets it stamped so prepare_for_processing can
+  // snapshot membership filters at decode time.
+  if (auto const* pq = dynamic_cast<parquet_ingestible_table_info const*>(
+        &_ingestible->table_info())) {
+    _dynamic_filters_channel = pq->sirius_dynamic_filters;
+  }
 }
 
 sirius_gpu_scan_operator::~sirius_gpu_scan_operator() = default;
@@ -80,6 +88,9 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::get_next_task_input
     // per-batch selectivity), and both the working-set estimator and
     // prepare_for_processing consult the latch.
     scan_input->fused_bail_flag = _fused_rule2_bailed;
+    // Membership channel for the decode-time snapshot (join builds publish
+    // during execution — only a snapshot taken at prepare/decode can see them).
+    scan_input->dynamic_filters = _dynamic_filters_channel;
     scan_input->prefetch(io::cache::prefetching_stage::immediate);
   }
   return std::move(*next);

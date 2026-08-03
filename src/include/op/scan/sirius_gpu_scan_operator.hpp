@@ -31,6 +31,10 @@ class split_connector;
 class sirius_scan_manager;
 }  // namespace sirius::scan_manager
 
+namespace sirius::op {
+class sirius_dynamic_filter_set;  // membership channel (op/sirius_dynamic_filter.hpp)
+}
+
 namespace sirius::op::scan {
 
 //===----------------------------------------------------------------------===//
@@ -129,6 +133,11 @@ class sirius_gpu_scan_operator : public sirius_physical_operator {
   /// fresh.
   std::shared_ptr<std::atomic<bool>> _fused_rule2_bailed =
     std::make_shared<std::atomic<bool>>(false);
+  /// The scan's dynamic-filter channel (null for non-parquet ingestibles),
+  /// resolved once at construction and stamped onto every split so
+  /// prepare_for_processing can snapshot membership filters at DECODE time
+  /// (see scan_operator_input::dynamic_filters).
+  std::shared_ptr<sirius::op::sirius_dynamic_filter_set> _dynamic_filters_channel;
 };
 
 }  // namespace sirius::op::scan

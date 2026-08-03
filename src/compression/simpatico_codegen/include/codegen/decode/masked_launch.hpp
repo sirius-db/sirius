@@ -4,9 +4,9 @@
 // same LabeledBuffers contract (persisted channels keyed
 // ``buffer_key(node_id, field)``; decode-only transients such as bp_offsets
 // are synthesized inside), same stream-sync-on-return, same false-on-failure
-// (logged to stderr).  Both require the fused tree to be a **Bitpack leaf
-// root**; any other shape is rejected at render time and returns false, so
-// callers can fall back to the plain decode path.
+// (logged to stderr).  Unsupported (shape, variant) combinations are
+// rejected at render time and return false, so callers can fall back to the
+// plain decode path.
 //
 // These entry points are dead code unless the wave orchestrator calls them
 // (engine gate SIRIUS_EXP_FUSED_SCAN_FILTER lives there): the plain decode
@@ -35,11 +35,15 @@
 
 namespace simpatico {
 
-/// K1: Bitpack-leaf decode fused with the inclusive range predicate
-/// ``pred`` (decoded integer domain, values widened to int64 for the
-/// compare), producing selection-mask words into ``mask.words``.  No column
-/// output is written or allocated.  ``mask.num_rows`` must equal
-/// ``num_rows`` and ``mask.words`` must hold ChunksFor(num_rows)*32 words.
+/// K1: decode fused with the inclusive range predicate ``pred`` (decoded
+/// integer domain, values widened to int64 for the compare), producing
+/// selection-mask words into ``mask.words``.  No column output is written
+/// or allocated.  Supported roots: Bitpack leaf (closed-form), and — the
+/// K1-delta form used for min-max dynamic join filters on orderkey-shaped
+/// delta->bitpack columns — any value_source-supported root (the chunk is
+/// reconstructed in full in-chunk, then the predicate is balloted; nothing
+/// is stored).  ``mask.num_rows`` must equal ``num_rows`` and
+/// ``mask.words`` must hold ChunksFor(num_rows)*32 words.
 /// ``mask.survivor_count`` / ``mask.chunk_offsets`` are untouched (the CNT
 /// wave fills them).  Float32/float64 columns must not be routed here:
 /// they decode as bit-reinterpreted integers, so an integer-domain range
