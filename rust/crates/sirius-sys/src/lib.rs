@@ -55,7 +55,72 @@ mod ffi {
             plan: &CxxString,
             out_stream_addr: usize,
         ) -> Result<()>;
+
+        /// One plan fragment of a multi-fragment query. Either declares output
+        /// streams (an intermediate fragment, whose results park as native GPU
+        /// batches that outlive its own query) or none (a result fragment,
+        /// which produces Arrow).
+        type Fragment;
+
+        /// Create a [`Fragment`] on `context`, which must outlive it.
+        fn make_fragment(context: Pin<&mut Context>) -> Result<UniquePtr<Fragment>>;
+
+        /// Name of the view a plan reads to consume input stream `stream_id` —
+        /// the single definition of the convention, so a front end emitting the
+        /// read and the engine creating the view cannot drift apart.
+        fn stream_view_name(stream_id: u64) -> UniquePtr<CxxString>;
+
+        /// Declare one column of an input stream, in plan order. `ty` is a
+        /// DuckDB type name; a stream has no file to probe.
+        fn declare_input_column(
+            self: Pin<&mut Fragment>,
+            stream_id: u64,
+            name: &CxxString,
+            ty: &CxxString,
+        ) -> Result<()>;
+
+        /// Declare a sender that must close this input stream before it ends.
+        fn declare_input_sender(
+            self: Pin<&mut Fragment>,
+            stream_id: u64,
+            sender_id: u32,
+        ) -> Result<()>;
+
+        /// Declare an output stream. A fragment with none is a result fragment.
+        fn declare_output(self: Pin<&mut Fragment>, stream_id: u64) -> Result<()>;
+
+        /// Plan `substrait_plan` against the declared streams and open the
+        /// fragment's query lifecycle.
+        fn build(self: Pin<&mut Fragment>, substrait_plan: &CxxString) -> Result<()>;
+
+        /// Move every batch parked on `source`'s output stream into this
+        /// fragment's input stream as native handles — no Arrow, no file, no
+        /// copy — then close `sender_id`. Returns the number of batches moved.
+        fn relay_from(
+            self: Pin<&mut Fragment>,
+            source: Pin<&mut Fragment>,
+            source_stream_id: u64,
+            input_stream_id: u64,
+            sender_id: u32,
+        ) -> Result<usize>;
+
+        /// Execute the fragment and close its query lifecycle.
+        fn run(self: Pin<&mut Fragment>) -> Result<()>;
+
+        /// Write a result fragment's rows into the caller-owned
+        /// `ArrowArrayStream` at `out_stream_addr`.
+        ///
+        /// # Safety
+        /// `out_stream_addr` must be the address of a valid, writable
+        /// `ArrowArrayStream` that outlives this call.
+        unsafe fn result_to_arrow(self: Pin<&mut Fragment>, out_stream_addr: usize) -> Result<()>;
+
+        /// Batches currently parked on an output stream — the evidence that a
+        /// fragment boundary carried native batches rather than nothing.
+        fn output_batch_count(self: &Fragment, stream_id: u64) -> Result<usize>;
     }
 }
 
-pub use ffi::{Context, make_context, make_context_from_config};
+pub use ffi::{
+    Context, Fragment, make_context, make_context_from_config, make_fragment, stream_view_name,
+};

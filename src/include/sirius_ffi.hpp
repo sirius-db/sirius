@@ -39,6 +39,15 @@
 
 namespace sirius::ffi {
 
+class Fragment;
+
+namespace detail {
+/// Engine handle + embedded DuckDB behind a [`Context`]. Defined in the .cpp so this public
+/// header pulls in no DuckDB/cudf/rmm types; named here (rather than nested and private) because
+/// a `Fragment` runs on the same connection and has to reach it.
+struct context_state;
+}  // namespace detail
+
 /// RAII handle to a Sirius engine context.
 ///
 /// Constructing a `Context` brings up an initialized engine (a
@@ -75,10 +84,93 @@ class SIRIUS_FFI_EXPORT Context {
   void execute_substrait(const std::string& plan, std::uintptr_t out_stream_addr);
 
  private:
-  // PIMPL: the engine handle + embedded DuckDB live in the .cpp so this public
-  // header pulls in no DuckDB/cudf/rmm types (DuckDB uses its own smart pointers).
+  // PIMPL: see detail::context_state.
+  std::unique_ptr<detail::context_state> impl_;
+
+  friend class Fragment;
+  friend SIRIUS_FFI_EXPORT std::unique_ptr<Fragment> make_fragment(Context& context);
+};
+
+/// One plan fragment of a multi-fragment query, executed on this process's [`Context`].
+///
+/// A fragment is either **intermediate** — it declares one or more output streams and is rooted in
+/// a streaming sink, parking its results as native `cucascade::data_batch`es that outlive its own
+/// query — or a **result** fragment, which declares none and produces Arrow for the caller.
+/// Both kinds may declare input streams, which is how one fragment's output becomes another's
+/// input without Arrow, parquet, or a copy.
+///
+/// Usage is strictly ordered: declare inputs and outputs, `build`, `relay_from` every sender,
+/// `run`, then either drain via a downstream fragment's `relay_from` or `result_to_arrow`.
+///
+/// `build()` opens a query lifecycle on the shared context and `run()` closes it, so exactly one
+/// fragment may sit between its own `build` and `run` at a time — the engine serializes queries
+/// anyway. A `Fragment` destroyed after `build()` but before `run()` closes the lifecycle itself.
+///
+/// The `Context` must outlive every `Fragment` made from it.
+class SIRIUS_FFI_EXPORT Fragment {
+ public:
+  ~Fragment();
+
+  Fragment(const Fragment&)            = delete;
+  Fragment& operator=(const Fragment&) = delete;
+
+  /// Declare one column of input stream `stream_id`, in plan order. `type` is a DuckDB type name
+  /// (`BIGINT`, `DECIMAL(15,2)`, `DATE`, …) — a stream has no file to probe, so the front end's
+  /// descriptor table is the only schema source.
+  /// @throws after `build()`, or on an unparsable type name.
+  void declare_input_column(std::uint64_t stream_id,
+                            const std::string& name,
+                            const std::string& type);
+
+  /// Declare a sender that must close input stream `stream_id` before it ends. With none
+  /// declared, the stream expects the single sender `0`.
+  /// @throws after `build()`.
+  void declare_input_sender(std::uint64_t stream_id, std::uint32_t sender_id);
+
+  /// Declare an output stream. A fragment with no output stream is a result fragment.
+  /// @throws after `build()`, or on a duplicate id.
+  void declare_output(std::uint64_t stream_id);
+
+  /// Plan `substrait_plan` against the declared streams and open this fragment's query lifecycle.
+  /// Reads of a declared input stream must name the view `sirius_stream_<id>`, which this call
+  /// creates.
+  /// @throws on a translation or planning failure, or if already built.
+  void build(const std::string& substrait_plan);
+
+  /// Move every batch parked on `source`'s output stream `source_stream_id` into this fragment's
+  /// input stream `input_stream_id`, then close `sender_id` on it.
+  ///
+  /// The batches move as native handles: no Arrow, no file, no copy. `source` must have finished
+  /// `run()`; its output survives its own lifecycle, which is what makes the sequential relay
+  /// legal.
+  /// @return the number of batches moved.
+  /// @throws when either stream id is unknown, or before `build()`.
+  std::size_t relay_from(Fragment& source,
+                         std::uint64_t source_stream_id,
+                         std::uint64_t input_stream_id,
+                         std::uint32_t sender_id);
+
+  /// Execute the fragment and close its query lifecycle. Blocks until its pipelines finish.
+  /// @throws before `build()`, or on an execution failure.
+  void run();
+
+  /// Write this result fragment's rows into the caller-owned `ArrowArrayStream` at
+  /// `out_stream_addr`, per the Arrow C Data Interface — the same contract as
+  /// `Context::execute_substrait`.
+  /// @throws on an intermediate fragment, or before `run()`.
+  void result_to_arrow(std::uintptr_t out_stream_addr);
+
+  /// Batches currently parked on output stream `stream_id`. Diagnostics: it is how a caller
+  /// confirms a fragment boundary carried native batches rather than nothing. A result fragment
+  /// reports 0 for every id — it parks nothing by definition.
+  [[nodiscard]] std::size_t output_batch_count(std::uint64_t stream_id) const;
+
+ private:
   struct Impl;
+  explicit Fragment(std::unique_ptr<Impl> impl);
   std::unique_ptr<Impl> impl_;
+
+  friend SIRIUS_FFI_EXPORT std::unique_ptr<Fragment> make_fragment(Context& context);
 };
 
 /// Create an initialized [`Context`] configured from built-in defaults, owned by
@@ -88,5 +180,15 @@ SIRIUS_FFI_EXPORT std::unique_ptr<Context> make_context();
 /// Create an initialized [`Context`] configured from the YAML file at
 /// `config_path`, owned by the returned `unique_ptr`.
 SIRIUS_FFI_EXPORT std::unique_ptr<Context> make_context_from_config(const std::string& config_path);
+
+/// Create a [`Fragment`] on `context`. The context must outlive it.
+SIRIUS_FFI_EXPORT std::unique_ptr<Fragment> make_fragment(Context& context);
+
+/// Name of the view a plan must read to consume input stream `stream_id`. `Fragment::build`
+/// creates it; a front end emits a read of this name where it would otherwise emit a file scan.
+///
+/// Returned by `unique_ptr` so the cxx bridge can bind it directly — the convention has to have
+/// exactly one definition, and that is only true if both languages read it from here.
+SIRIUS_FFI_EXPORT std::unique_ptr<std::string> stream_view_name(std::uint64_t stream_id);
 
 }  // namespace sirius::ffi

@@ -258,6 +258,12 @@ long before physical planning. The catalog is registered as a `ClientContextStat
 `sirius_stream_source(id)` can resolve a schema at bind time; the physical plan generator
 re-reads the catalog at plan time to build each `STREAMING_SOURCE`.
 
+`sirius::ffi::Fragment` (`src/include/sirius_ffi.hpp`, `src/sirius_ffi.cpp`) is the cxx-FFI
+wrapper over this substrate: a Rust caller declares inputs and outputs, builds a Substrait plan
+against them (each input read through a `sirius_stream_<id>` view), relays each sender in, and
+runs, with engine exceptions crossing the bridge as `Result`. No batch type crosses cxx —
+`relay_from` moves batches entirely inside C++, and Arrow appears only at a result fragment.
+
 ## Tests
 
 | File | Catch2 tags |
