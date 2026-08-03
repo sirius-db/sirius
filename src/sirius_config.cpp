@@ -133,6 +133,7 @@ static void from_yaml(const YAML::Node& node, cucascade::io::rest::config& opt)
   r.optional("max_retry_attempts", opt.max_retry_attempts);
   r.optional("max_auth_retry_attempts", opt.max_auth_retry_attempts);
   r.optional("honor_retry_after", opt.honor_retry_after);
+  r.optional("perf_instrumentation", opt.perf_instrumentation);
   r.optional("footer_probe_bytes", yaml::bytes(opt.footer_probe_bytes));
   r.optional("list_max_matches", opt.list_max_matches);
   r.optional("list_max_scanned", opt.list_max_scanned);
