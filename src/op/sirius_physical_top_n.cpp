@@ -45,6 +45,33 @@ namespace op {
 
 namespace {
 
+//! Selects the first `keep_rows` rows of `input` under the given lexicographic ordering.
+//!
+//! Sorting the keys into a permutation and gathering only the surviving rows is much cheaper than
+//! `cudf::sort_by_key` for a top-N: the sort materializes an int32 index column rather than a fully
+//! sorted copy of every payload column, and the gather touches `keep_rows` rows instead of all of
+//! them. Unlike `cudf::top_k_order` this honors SQL NULLS FIRST/LAST, so it is the fallback for
+//! nullable and multi-key orderings.
+std::unique_ptr<cudf::table> sorted_order_top_k(cudf::table_view input,
+                                                cudf::table_view keys,
+                                                std::vector<cudf::order> const& key_orders,
+                                                std::vector<cudf::null_order> const& null_orders,
+                                                cudf::size_type keep_rows,
+                                                rmm::cuda_stream_view stream,
+                                                rmm::device_async_resource_ref memory_resource)
+{
+  auto indices = cudf::sorted_order(keys, key_orders, null_orders, stream, memory_resource);
+
+  auto indices_view = indices->view();
+  if (keep_rows < indices_view.size()) {
+    // Views into `indices`, which outlives the gather below.
+    indices_view = cudf::slice(indices_view, {0, keep_rows}, stream).front();
+  }
+
+  return cudf::gather(
+    input, indices_view, cudf::out_of_bounds_policy::DONT_CHECK, stream, memory_resource);
+}
+
 std::unique_ptr<cudf::table> compute_top_n_table(
   cudf::table_view input,
   duckdb::vector<duckdb::BoundOrderByNode> const& orders,
@@ -77,15 +104,14 @@ std::unique_ptr<cudf::table> compute_top_n_table(
     if (input.column(idx).has_nulls()) {
       // cudf::top_k_order takes no null_order, so it cannot honor SQL NULLS FIRST/LAST when
       // selecting which rows are in the top k (it treats NULLs as the largest value). For a
-      // nullable key, fall back to a full sort that honors null placement, then slice the top k.
-      auto sorted = cudf::sort_by_key(
-        input, cudf::table_view({input.column(idx)}), {order}, {null_ord}, stream, memory_resource);
-      if (keep_rows == sorted->num_rows()) {
-        kept = std::move(sorted);
-      } else {
-        auto slices = cudf::slice(sorted->view(), {0, keep_rows}, stream);
-        kept        = std::make_unique<cudf::table>(slices.front(), stream, memory_resource);
-      }
+      // nullable key, fall back to a sort that honors null placement, then take the top k.
+      kept = sorted_order_top_k(input,
+                                cudf::table_view({input.column(idx)}),
+                                {order},
+                                {null_ord},
+                                keep_rows,
+                                stream,
+                                memory_resource);
     } else {
       auto indices =
         cudf::top_k_order(input.column(idx), keep_rows, order, stream, memory_resource);
@@ -100,7 +126,7 @@ std::unique_ptr<cudf::table> compute_top_n_table(
                                memory_resource);
     }
   } else {
-    // Multi-key: fall back to full sort_by_key
+    // Multi-key: cudf::top_k_order is single-column only, so sort the key tuple and take the top k.
     std::vector<cudf::column_view> key_views;
     key_views.reserve(orders.size());
     std::vector<cudf::order> key_orders;
@@ -122,16 +148,13 @@ std::unique_ptr<cudf::table> compute_top_n_table(
       null_orders.push_back(to_cudf_null_order(ord.type, ord.null_order));
     }
 
-    auto keys_table = cudf::table_view(key_views);
-    auto sorted =
-      cudf::sort_by_key(input, keys_table, key_orders, null_orders, stream, memory_resource);
-
-    if (keep_rows == sorted->num_rows()) {
-      kept = std::move(sorted);
-    } else {
-      auto slices = cudf::slice(sorted->view(), {0, keep_rows}, stream);
-      kept        = std::make_unique<cudf::table>(slices.front(), stream, memory_resource);
-    }
+    kept = sorted_order_top_k(input,
+                              cudf::table_view(key_views),
+                              key_orders,
+                              null_orders,
+                              keep_rows,
+                              stream,
+                              memory_resource);
   }
 
   return kept;
