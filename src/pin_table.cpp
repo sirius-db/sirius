@@ -262,6 +262,17 @@ void materialize_pin_batches(op::scan::gpu_ingestible& ingestible,
   }
 }
 
+// Thread-local pool of 4 CUDA streams for cross-column encode parallelism,
+// matching the decompress path in compression_converters.cpp.
+simpatico::stream_pool& compress_pool()
+{
+  thread_local simpatico::stream_pool pool;
+  if (pool.streams.empty()) {
+    if (!pool.init(4)) throw std::runtime_error("[pin_table] compress stream_pool init failed");
+  }
+  return pool;
+}
+
 /// Shared compress step for the host and device pin drivers: compress @p tbl per
 /// @p compression on @p stream, and when the batch qualifies (compression on and
 /// >= the size threshold) AND the compressed footprint saves enough (<=
@@ -288,30 +299,16 @@ bool compress_and_stage_batch(cudf::table const& tbl,
   const std::size_t uncompressed_bytes = tbl.alloc_size();
   if (uncompressed_bytes < compression.min_batch_size_bytes) { return false; }
 
-  // Parallel per-column compress when >1 (capped at the column count). The pool
-  // must outlive `ct` (whose buffers free on the pool streams at teardown), so it
-  // is declared before `ct`.
-  const int n_threads = std::min(compression.column_threads, tbl.num_columns());
-  simpatico::stream_pool comp_pool;
-  const bool parallel = n_threads > 1 && comp_pool.init(static_cast<std::size_t>(n_threads));
-  // `tbl` was decoded on `stream` (the caller's materialize stream). The parallel
-  // compress runs each column on its own pool stream, which is NOT ordered after
-  // `stream`, so without a barrier the compress kernels could read the table's
-  // buffers while the decode is still writing them. Synchronize `stream` first so
-  // the table is fully resident before the pool streams read it (mirrors the
-  // parallel decompress path in compression_converters.cpp). The serial branch runs
-  // on `stream` itself, so it is stream-ordered and needs no barrier.
-  if (parallel) { stream.synchronize(); }
-  auto ct = parallel ? simpatico::compress_with_plan(tbl.view(),
-                                                     compression.plan_dsl,
-                                                     comp_pool,
-                                                     rmm::mr::get_current_device_resource_ref(),
-                                                     compression.column_names)
-                     : simpatico::compress_with_plan(tbl.view(),
-                                                     compression.plan_dsl,
-                                                     stream,
-                                                     rmm::mr::get_current_device_resource_ref(),
-                                                     compression.column_names);
+  // `tbl` was decoded on `stream` (the caller's materialize stream). The pool
+  // streams are NOT ordered after `stream`, so synchronize first to ensure the
+  // table is fully resident before the pool streams read it — mirrors the
+  // parallel decompress path in compression_converters.cpp.
+  stream.synchronize();
+  auto ct = simpatico::compress_with_plan(tbl.view(),
+                                          compression.plan_dsl,
+                                          compress_pool(),
+                                          rmm::mr::get_current_device_resource_ref(),
+                                          compression.column_names);
 
   // Build the structural header and enumerate the payload buffers (no bytes copied yet).
   std::vector<std::uint8_t> header;

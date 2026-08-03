@@ -1332,7 +1332,6 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
         pin_comp.min_batch_size_bytes    = comp_cfg.min_batch_size_bytes;
         pin_comp.max_compressed_fraction = comp_cfg.max_compressed_fraction;
         pin_comp.column_names            = cache_info.column_names();
-        pin_comp.column_threads          = comp_cfg.column_threads;
         SIRIUS_LOG_INFO("[pin_table] '{}' tier={}: compressing with plan for {} column(s)",
                         data.args.name,
                         data.args.tier,
@@ -1978,15 +1977,6 @@ static void SetPinTableCompressionMaxCompressedFraction(ClientContext& context,
   SIRIUS_LOG_DEBUG("Updated pin_table_compression_max_compressed_fraction");
 }
 
-static void SetCompressionColumnThreads(ClientContext& context, SetScope scope, Value& parameter)
-{
-  auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
-  if (!sirius_ctx) { return; }
-  const auto n = static_cast<int>(BigIntValue::Get(parameter));
-  sirius_ctx->get_config().get_compression_config().column_threads = n;
-  SIRIUS_LOG_DEBUG("Updated compression_column_threads to {}", n);
-}
-
 static void SetEnableDynamicFilterPushdown(ClientContext& context, SetScope scope, Value& parameter)
 {
   auto* params = get_operator_params(context);
@@ -2288,15 +2278,6 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
     LogicalType::DOUBLE,
     Value::DOUBLE(0.95),
     SetPinTableCompressionMaxCompressedFraction);
-
-  config.AddExtensionOption(
-    "compression_column_threads",
-    "Column-parallelism degree for Simpatico (de)compression: fan a table's columns across this "
-    "many worker threads/streams (one column per stream). <=1 = sequential. Capped at the column "
-    "count. Applies to both the pin-time compress path and the scan-time decompress converters",
-    LogicalType::BIGINT,
-    Value::BIGINT(4),
-    SetCompressionColumnThreads);
 
   config.AddExtensionOption(
     "enable_dynamic_filter_pushdown",
