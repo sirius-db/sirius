@@ -31,11 +31,14 @@
 #include <op/sirius_physical_streaming_source.hpp>
 #include <sirius/exception.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <map>
 #include <memory>
 #include <set>
 #include <thread>
+#include <utility>
 #include <vector>
 
 using namespace sirius::exec;
@@ -61,12 +64,43 @@ auto make_sink()
   return std::make_tuple(std::move(op), repo);
 }
 
+/// Partitioned sink over `n` fresh output repositories, routing on column 0.
+auto make_partitioned_sink(std::size_t n)
+{
+  std::vector<std::shared_ptr<cucascade::shared_data_repository>> repos;
+  for (std::size_t i = 0; i < n; ++i) {
+    repos.push_back(std::make_shared<cucascade::shared_data_repository>());
+  }
+  duckdb::vector<duckdb::LogicalType> types{duckdb::LogicalType::BIGINT,
+                                            duckdb::LogicalType::INTEGER};
+  auto op = std::make_unique<sirius_physical_streaming_sink>(
+    sirius::from_duckdb_vec(types), 0, repos, partition_spec{{0}, {}});
+  return std::make_tuple(std::move(op), repos);
+}
+
 /// Feed one batch through the sink exactly as publish_output() would.
 void sink_one(sirius_physical_streaming_sink& op, std::shared_ptr<cucascade::data_batch> batch)
 {
   pipelineable_operator_data data{
     std::vector<std::shared_ptr<cucascade::data_batch>>{std::move(batch)}};
   op.sink(data, default_stream());
+}
+
+/// Drain output stream `index` completely, returning the (key, payload) rows it held.
+std::vector<std::pair<int64_t, int32_t>> drain_rows(sirius_physical_streaming_sink& op,
+                                                    std::size_t index)
+{
+  std::vector<std::pair<int64_t, int32_t>> rows;
+  while (auto batch = op.pull(index)) {
+    auto view = sirius::get_cudf_table_view(**batch);
+    auto keys = copy_column_to_host<int64_t>(view.column(0));
+    auto vals = copy_column_to_host<int32_t>(view.column(1));
+    REQUIRE(keys.size() == vals.size());
+    for (std::size_t i = 0; i < keys.size(); ++i) {
+      rows.emplace_back(keys[i], vals[i]);
+    }
+  }
+  return rows;
 }
 
 }  // namespace
@@ -387,4 +421,315 @@ TEST_CASE("streaming_sink SINK-ERR-2: errored stream never reports clean end", "
   REQUIRE(op->availability() == availability::HAS_DATA);
   // drained() stays false: the error is never consumed, so EOS is never a clean end.
   REQUIRE_FALSE(op->drained());
+}
+
+// ============================================================================
+// PART-1: fan-out routes every row to exactly one destination, losing nothing
+// ============================================================================
+
+TEST_CASE("streaming_sink PART-1: partitioned fan-out preserves every row exactly once",
+          "[streaming_sink]")
+{
+  auto mem_mgr    = sirius::test::operator_utils::initialize_memory_manager();
+  auto* gpu_space = mem_mgr->get_memory_space(Tier::GPU, 0);
+  REQUIRE(gpu_space != nullptr);
+
+  const std::size_t N = GENERATE(std::size_t{2}, std::size_t{3});
+  auto [op, repos]    = make_partitioned_sink(N);
+  REQUIRE(op->num_output_streams() == N);
+
+  // Three batches of distinct keys, so the union across destinations is the whole input.
+  std::vector<std::pair<int64_t, int32_t>> expected;
+  for (int b = 0; b < 3; ++b) {
+    std::vector<int64_t> keys;
+    std::vector<int32_t> vals;
+    for (int i = 0; i < 8; ++i) {
+      const auto key = static_cast<int64_t>(b * 8 + i);
+      keys.push_back(key);
+      vals.push_back(static_cast<int32_t>(key * 10));
+      expected.emplace_back(key, static_cast<int32_t>(key * 10));
+    }
+    sink_one(*op,
+             make_two_column_batch<int64_t, int32_t>(*gpu_space, keys, vals, cudf::type_id::INT32));
+  }
+  op->finalize_operator();
+
+  std::vector<std::pair<int64_t, int32_t>> seen;
+  for (std::size_t i = 0; i < N; ++i) {
+    auto rows = drain_rows(*op, i);
+    seen.insert(seen.end(), rows.begin(), rows.end());
+  }
+
+  std::sort(seen.begin(), seen.end());
+  std::sort(expected.begin(), expected.end());
+  REQUIRE(seen == expected);
+}
+
+// ============================================================================
+// PART-2: equal keys are co-located — the property a shuffle actually needs
+// ============================================================================
+
+TEST_CASE("streaming_sink PART-2: rows with the same key land on the same destination",
+          "[streaming_sink]")
+{
+  auto mem_mgr    = sirius::test::operator_utils::initialize_memory_manager();
+  auto* gpu_space = mem_mgr->get_memory_space(Tier::GPU, 0);
+  REQUIRE(gpu_space != nullptr);
+
+  constexpr std::size_t N = 3;
+  auto [op, repos]        = make_partitioned_sink(N);
+
+  // The same four keys, repeated across two separate batches (i.e. two separate tasks).
+  const std::vector<int64_t> keys{100, 200, 300, 400};
+  for (int b = 0; b < 2; ++b) {
+    std::vector<int32_t> vals(keys.size(), static_cast<int32_t>(b));
+    sink_one(*op,
+             make_two_column_batch<int64_t, int32_t>(*gpu_space, keys, vals, cudf::type_id::INT32));
+  }
+  op->finalize_operator();
+
+  // Where each key ended up. Whatever the hash, a key must never appear on two destinations —
+  // otherwise a downstream MERGE_GROUP_BY on another node would see a partial group.
+  std::map<int64_t, std::size_t> destination_of;
+  for (std::size_t i = 0; i < N; ++i) {
+    for (const auto& [key, _] : drain_rows(*op, i)) {
+      auto [it, inserted] = destination_of.emplace(key, i);
+      REQUIRE(it->second == i);
+    }
+  }
+  REQUIRE(destination_of.size() == keys.size());
+}
+
+// ============================================================================
+// PART-3: a slow destination cannot head-of-line-block the others
+//
+// This is the whole point of per-destination repositories: one destination that received rows is
+// never drained, and the remaining destinations must still drain and reach EOS.
+// ============================================================================
+
+TEST_CASE("streaming_sink PART-3: an undrained destination does not block its siblings",
+          "[streaming_sink]")
+{
+  auto mem_mgr    = sirius::test::operator_utils::initialize_memory_manager();
+  auto* gpu_space = mem_mgr->get_memory_space(Tier::GPU, 0);
+  REQUIRE(gpu_space != nullptr);
+
+  constexpr std::size_t N = 2;
+  auto [op, repos]        = make_partitioned_sink(N);
+
+  std::vector<int64_t> keys;
+  std::vector<int32_t> vals;
+  for (int i = 0; i < 64; ++i) {
+    keys.push_back(i);
+    vals.push_back(i);
+  }
+  sink_one(*op,
+           make_two_column_batch<int64_t, int32_t>(*gpu_space, keys, vals, cudf::type_id::INT32));
+  op->finalize_operator();
+
+  // Find a destination that actually received rows, and leave it untouched.
+  std::size_t slow = N;
+  for (std::size_t i = 0; i < N; ++i) {
+    if (!repos[i]->all_empty()) {
+      slow = i;
+      break;
+    }
+  }
+  REQUIRE(slow < N);
+
+  for (std::size_t i = 0; i < N; ++i) {
+    if (i == slow) continue;
+    drain_rows(*op, i);
+    // Drained independently, even though `slow` still holds a backlog.
+    REQUIRE(op->drained(i));
+    REQUIRE(op->availability(i) == availability::END_OF_STREAM);
+  }
+
+  // The slow destination is still distinguishable from EOS: terminal, but not drained.
+  REQUIRE_FALSE(op->drained(slow));
+  REQUIRE(op->availability(slow) == availability::HAS_DATA);
+
+  // And it drains cleanly whenever its consumer gets around to it.
+  drain_rows(*op, slow);
+  REQUIRE(op->drained(slow));
+}
+
+// ============================================================================
+// PART-4: finalize drives every destination to EOS together
+// ============================================================================
+
+TEST_CASE("streaming_sink PART-4: one finalize ends all destinations", "[streaming_sink]")
+{
+  constexpr std::size_t N = 3;
+  auto [op, repos]        = make_partitioned_sink(N);
+
+  for (std::size_t i = 0; i < N; ++i) {
+    REQUIRE(op->availability(i) == availability::WAITING);
+    REQUIRE_FALSE(op->drained(i));
+  }
+
+  op->finalize_operator();
+
+  for (std::size_t i = 0; i < N; ++i) {
+    REQUIRE(op->availability(i) == availability::END_OF_STREAM);
+    REQUIRE(op->drained(i));
+  }
+}
+
+// ============================================================================
+// PART-5: wait(i) tracks its own destination
+// ============================================================================
+
+TEST_CASE("streaming_sink PART-5: wait on one destination unblocks on its own data",
+          "[streaming_sink]")
+{
+  auto mem_mgr    = sirius::test::operator_utils::initialize_memory_manager();
+  auto* gpu_space = mem_mgr->get_memory_space(Tier::GPU, 0);
+  REQUIRE(gpu_space != nullptr);
+
+  constexpr std::size_t N = 2;
+  auto [op, repos]        = make_partitioned_sink(N);
+
+  std::vector<int64_t> keys;
+  std::vector<int32_t> vals;
+  for (int i = 0; i < 32; ++i) {
+    keys.push_back(i);
+    vals.push_back(i);
+  }
+
+  std::atomic<int> returned{0};
+  std::thread c0([&] {
+    op->wait(0);
+    returned.fetch_add(1);
+  });
+  std::thread c1([&] {
+    op->wait(1);
+    returned.fetch_add(1);
+  });
+
+  std::this_thread::sleep_for(20ms);
+  REQUIRE(returned.load() == 0);
+
+  sink_one(*op,
+           make_two_column_batch<int64_t, int32_t>(*gpu_space, keys, vals, cudf::type_id::INT32));
+  op->finalize_operator();  // guarantees both waiters wake even if one partition got no rows
+
+  c0.join();
+  c1.join();
+  REQUIRE(returned.load() == 2);
+}
+
+// ============================================================================
+// PART-6: N = 1 through the partitioned constructor is the single-destination sink
+// ============================================================================
+
+TEST_CASE("streaming_sink PART-6: a single destination bypasses partitioning", "[streaming_sink]")
+{
+  auto mem_mgr    = sirius::test::operator_utils::initialize_memory_manager();
+  auto* gpu_space = mem_mgr->get_memory_space(Tier::GPU, 0);
+  REQUIRE(gpu_space != nullptr);
+
+  std::vector<std::shared_ptr<cucascade::shared_data_repository>> repos{
+    std::make_shared<cucascade::shared_data_repository>()};
+  duckdb::vector<duckdb::LogicalType> types{duckdb::LogicalType::BIGINT,
+                                            duckdb::LogicalType::INTEGER};
+  // No key columns needed: with one destination there is nothing to route.
+  sirius_physical_streaming_sink op(sirius::from_duckdb_vec(types), 0, repos, partition_spec{});
+
+  const std::vector<int64_t> keys{1, 2, 3};
+  const std::vector<int32_t> vals{10, 20, 30};
+  auto batch =
+    make_two_column_batch<int64_t, int32_t>(*gpu_space, keys, vals, cudf::type_id::INT32);
+  auto batch_id = batch->get_batch_id();
+  sink_one(op, batch);
+  op.finalize_operator();
+
+  // Identity preserved, exactly as the single-repository constructor: no partition, no copy.
+  auto pulled = op.pull();
+  REQUIRE(pulled.has_value());
+  REQUIRE((*pulled)->get_batch_id() == batch_id);
+  REQUIRE(op.drained());
+
+  // Nothing is allocated on this path. A partitioned sink instead pays for the reordered table
+  // and the per-partition copies, which hash_partition() holds at the same time.
+  input_stats stats;
+  stats.bytes       = 4096;
+  stats.num_batches = 1;
+  REQUIRE(op.no_history_peak_memory_estimate(stats) == 0);
+
+  auto [partitioned, repos_2] = make_partitioned_sink(2);
+  REQUIRE(partitioned->no_history_peak_memory_estimate(stats) == stats.bytes * 2);
+}
+
+// ============================================================================
+// PART-7: partitioned-sink construction contracts
+// ============================================================================
+
+TEST_CASE("streaming_sink PART-7: destination list and spec are validated", "[streaming_sink]")
+{
+  duckdb::vector<duckdb::LogicalType> types{duckdb::LogicalType::BIGINT,
+                                            duckdb::LogicalType::INTEGER};
+  auto sirius_types = sirius::from_duckdb_vec(types);
+  auto repo         = std::make_shared<cucascade::shared_data_repository>();
+
+  // No destinations at all.
+  REQUIRE_THROWS_AS(sirius_physical_streaming_sink(
+                      sirius_types,
+                      0,
+                      std::vector<std::shared_ptr<cucascade::shared_data_repository>>{},
+                      partition_spec{{0}, {}}),
+                    sirius::invalid_input_exception);
+
+  // A null destination.
+  REQUIRE_THROWS_AS(
+    sirius_physical_streaming_sink(
+      sirius_types,
+      0,
+      std::vector<std::shared_ptr<cucascade::shared_data_repository>>{repo, nullptr},
+      partition_spec{{0}, {}}),
+    sirius::invalid_input_exception);
+
+  // Several destinations but nothing to route by — silently sending every row to destination 0
+  // would corrupt a downstream shuffle, so this is rejected.
+  REQUIRE_THROWS_AS(
+    sirius_physical_streaming_sink(sirius_types,
+                                   0,
+                                   std::vector<std::shared_ptr<cucascade::shared_data_repository>>{
+                                     repo, std::make_shared<cucascade::shared_data_repository>()},
+                                   partition_spec{}),
+    sirius::invalid_input_exception);
+
+  // More cast types than key columns: hash_partition() reads key_columns[i] for each cast type,
+  // so the extra entry would index past the end of the key list.
+  REQUIRE_THROWS_AS(
+    sirius_physical_streaming_sink(
+      sirius_types,
+      0,
+      std::vector<std::shared_ptr<cucascade::shared_data_repository>>{
+        repo, std::make_shared<cucascade::shared_data_repository>()},
+      partition_spec{
+        {0}, {cudf::data_type{cudf::type_id::INT64}, cudf::data_type{cudf::type_id::INT64}}}),
+    sirius::invalid_input_exception);
+
+  // A key column outside the input schema, and a negative one: both would index the input table
+  // out of range inside the partition kernel.
+  REQUIRE_THROWS_AS(
+    sirius_physical_streaming_sink(sirius_types,
+                                   0,
+                                   std::vector<std::shared_ptr<cucascade::shared_data_repository>>{
+                                     repo, std::make_shared<cucascade::shared_data_repository>()},
+                                   partition_spec{{5}, {}}),
+    sirius::invalid_input_exception);
+  REQUIRE_THROWS_AS(
+    sirius_physical_streaming_sink(sirius_types,
+                                   0,
+                                   std::vector<std::shared_ptr<cucascade::shared_data_repository>>{
+                                     repo, std::make_shared<cucascade::shared_data_repository>()},
+                                   partition_spec{{-1}, {}}),
+    sirius::invalid_input_exception);
+
+  auto [op, repos] = make_partitioned_sink(2);
+  REQUIRE_THROWS_AS(op->pull(2), sirius::invalid_input_exception);
+  REQUIRE_THROWS_AS(op->drained(2), sirius::invalid_input_exception);
+  REQUIRE_THROWS_AS(op->availability(2), sirius::invalid_input_exception);
 }
