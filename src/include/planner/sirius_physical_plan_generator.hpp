@@ -166,6 +166,13 @@ class sirius_physical_plan_generator {
   // &op);
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalFilter& op);
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalGet& op);
+
+  //! Builds the STREAMING_SOURCE a `sirius_stream_source(id)` read stands for, wired to the
+  //! repository and expected sender set the fragment declared for that id on this connection.
+  //! Records the built operator back into the catalog so the fragment can register it with its
+  //! stream_session once the plan tree owns it.
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_streaming_source_plan(
+    duckdb::LogicalGet& op);
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalLimit& op);
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalOrder& op);
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalTopN& op);

@@ -29,6 +29,8 @@
 #include "duckdb/storage/storage_manager.hpp"
 #include "duckdb/transaction/duck_transaction.hpp"
 #include "duckdb/transaction/local_storage.hpp"
+#include "exec/stream_bind_catalog.hpp"
+#include "exec/stream_plan_bindings.hpp"
 #include "expression/ast/from_duckdb.hpp"
 #include "expression/ast/node.hpp"
 #include "helper/numeric_narrowing.hpp"
@@ -159,6 +161,42 @@ duckdb::unique_ptr<duckdb::TableFilterSet> create_table_filter_set(
 }
 
 duckdb::unique_ptr<sirius::op::sirius_physical_operator>
+sirius_physical_plan_generator::create_streaming_source_plan(duckdb::LogicalGet& op)
+{
+  auto const* bind = dynamic_cast<sirius::exec::stream_source_bind_data const*>(op.bind_data.get());
+  if (bind == nullptr) {
+    throw duckdb::InternalException("sirius_stream_source is missing its stream bind data");
+  }
+
+  auto catalog = context.registered_state->Get<sirius::exec::stream_bind_catalog>(
+    sirius::exec::stream_bind_catalog::kStateKey);
+  if (!catalog) {
+    throw duckdb::InternalException(
+      "sirius_stream_source bound without a stream catalog on this connection");
+  }
+  auto const& binding = catalog->get(bind->stream_id);
+
+  // The source emits the whole declared schema. Projection pushdown is off for this function, so
+  // DuckDB projects above the scan; a narrowed column list here would mean the two disagree.
+  auto column_ids = op.GetColumnIds();
+  if (column_ids.size() != binding.types.size()) {
+    throw duckdb::NotImplementedException(
+      "sirius_stream_source: column projection into a stream read is not supported (stream "
+      "declares %llu columns, plan requests %llu)",
+      static_cast<unsigned long long>(binding.types.size()),
+      static_cast<unsigned long long>(column_ids.size()));
+  }
+
+  auto source = duckdb::make_uniq<sirius::op::sirius_physical_streaming_source>(
+    binding.types, op.EstimateCardinality(context), binding.repository, binding.expected_senders);
+
+  // The plan tree owns the operator from here; this back-pointer is how the fragment finds it
+  // again to register it with its stream_session.
+  catalog->set_built(bind->stream_id, source.get());
+  return source;
+}
+
+duckdb::unique_ptr<sirius::op::sirius_physical_operator>
 sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
 {
   auto column_ids = op.GetColumnIds();
@@ -166,7 +204,11 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
   // Only GPU-route known table scan functions; all others (pragma, system catalog
   // functions, etc.) must fall back to CPU.
   static const std::unordered_set<std::string> kSupportedScanFunctions = {
-    "seq_scan", "parquet_scan", "read_parquet", "sirius_read_parquet"};
+    "seq_scan",
+    "parquet_scan",
+    "read_parquet",
+    "sirius_read_parquet",
+    sirius::exec::kStreamSourceFunctionName};
   if (kSupportedScanFunctions.find(op.function.name) == kSupportedScanFunctions.end()) {
     throw duckdb::NotImplementedException("Table function '%s' is not supported in Sirius",
                                           op.function.name);
@@ -222,6 +264,13 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
   if (!op.projected_input.empty()) {
     throw duckdb::InternalException(
       "LogicalGet::project_input can only be set for table-in-out functions");
+  }
+
+  // A stream read is not a scan: there is no file, no metadata and nothing to push filters into.
+  // Swap it for the STREAMING_SOURCE the fragment already declared, wired to the repository its
+  // senders push into. Everything above it in the plan is bound exactly as for a real scan.
+  if (op.function.name == sirius::exec::kStreamSourceFunctionName) {
+    return create_streaming_source_plan(op);
   }
 
   // Plan-time probe for the duckdb-native seq_scan path: strings at/over
