@@ -225,6 +225,9 @@ std::size_t gpu_pipeline_task_local_state::get_estimated_bytes_to_materialize_in
   // For compressed data the encoded payload must first be staged on device
   // before decompression produces the output, so both are alive simultaneously:
   //   peak = compressed_bytes + uncompressed_bytes.
+  // When a column projection is applied (compressed_host/device_representation::
+  // select_columns), both byte fields are scaled pro-rata, so the estimate
+  // naturally covers only the projected columns.
   auto peak_materialization_bytes = [](const cucascade::idata_representation* data) -> std::size_t {
     auto const compressed   = data->get_size_in_bytes();
     auto const uncompressed = data->get_uncompressed_data_size_in_bytes();

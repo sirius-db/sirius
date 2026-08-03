@@ -161,6 +161,14 @@ std::unique_ptr<compressed_host_representation> compressed_host_representation::
     }
   }
 
+  // Scale byte estimates pro-rata so size queries on the projected representation
+  // reflect only the selected columns. `absolute` is always indexed into the full
+  // column list, so the fraction is correct even for chained projections.
+  const auto total        = _column_names.size();
+  const auto sel          = absolute.size();
+  const auto scaled_cmp   = total > 0 ? _compressed_bytes * sel / total : 0;
+  const auto scaled_uncmp = total > 0 ? _uncompressed_bytes * sel / total : 0;
+
   // const_cast is safe: select_columns is logically const (it creates a
   // projection sharing the same blob) but the base-class constructor requires
   // a non-const memory_space& — the underlying object is non-const.
@@ -168,8 +176,8 @@ std::unique_ptr<compressed_host_representation> compressed_host_representation::
     const_cast<cucascade::memory::memory_space&>(get_memory_space()),
     _blob,
     _column_names,
-    _compressed_bytes,
-    _uncompressed_bytes,
+    scaled_cmp,
+    scaled_uncmp,
     _num_rows,
     std::move(absolute)));
 }
@@ -266,6 +274,13 @@ std::unique_ptr<compressed_device_representation> compressed_device_representati
 {
   auto absolute = resolve_absolute_indices(indices, _selected_indices, _column_names.size());
 
+  // Scale byte estimates pro-rata (same rationale as
+  // compressed_host_representation::select_columns).
+  const auto total        = _column_names.size();
+  const auto sel          = absolute.size();
+  const auto scaled_cmp   = total > 0 ? _compressed_bytes * sel / total : 0;
+  const auto scaled_uncmp = total > 0 ? _uncompressed_bytes * sel / total : 0;
+
   // const_cast is safe: select_columns is logically const (it creates a
   // projection sharing the same blob) but the base-class constructor requires
   // a non-const memory_space& — the underlying object is non-const.
@@ -273,8 +288,8 @@ std::unique_ptr<compressed_device_representation> compressed_device_representati
     const_cast<cucascade::memory::memory_space&>(get_memory_space()),
     _blob,
     _column_names,
-    _compressed_bytes,
-    _uncompressed_bytes,
+    scaled_cmp,
+    scaled_uncmp,
     _num_rows,
     std::move(absolute)));
 }
