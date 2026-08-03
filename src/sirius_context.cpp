@@ -38,6 +38,7 @@
 #include "telemetry/batch_telemetry.hpp"
 #include "transparent/physical_sirius_execution.hpp"
 #include "transparent/sirius_optimizer_extension.hpp"
+#include "util/duckdb_error_message.hpp"
 
 #include <cudf/utilities/pinned_memory.hpp>
 
@@ -1175,25 +1176,28 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
       if (sirius::references_sirius_owned_s3_parquet(current_query_sql)) { throw; }
       if (!duckdb_fallback_enabled(context)) { throw; }
       record_transparent_fallback();
-      SIRIUS_LOG_INFO("Transparent execution fallback (runtime unavailable): {}", e.what());
+      SIRIUS_LOG_INFO("Transparent execution fallback (runtime unavailable): {}",
+                      sirius::sanitized_message(e));
       return RebindQueryInfo::DO_NOT_REBIND;
     } catch (NotImplementedException& e) {
       // No captured plan to inspect on the replan path; guard on the SQL text so
       // a direct read_parquet('s3://') that fails to re-plan does not CPU-fall-back.
-      throw_if_s3_no_cpu_fallback(false, current_query_sql, e.what());
+      throw_if_s3_no_cpu_fallback(false, current_query_sql, sirius::sanitized_message(e));
       if (!duckdb_fallback_enabled(context)) {
         rethrow_gpu_error_no_fallback(e, "GPU plan generation failed: ");
       }
       record_transparent_fallback();
-      SIRIUS_LOG_INFO("Transparent execution fallback (replan unsupported): {}", e.what());
+      SIRIUS_LOG_INFO("Transparent execution fallback (replan unsupported): {}",
+                      sirius::sanitized_message(e));
       return RebindQueryInfo::DO_NOT_REBIND;
     } catch (std::exception& e) {
-      throw_if_s3_no_cpu_fallback(false, current_query_sql, e.what());
+      throw_if_s3_no_cpu_fallback(false, current_query_sql, sirius::sanitized_message(e));
       if (!duckdb_fallback_enabled(context)) {
         rethrow_gpu_error_no_fallback(e, "GPU plan generation failed: ");
       }
       record_transparent_fallback();
-      SIRIUS_LOG_INFO("Transparent execution fallback (replan failed): {}", e.what());
+      SIRIUS_LOG_INFO("Transparent execution fallback (replan failed): {}",
+                      sirius::sanitized_message(e));
       return RebindQueryInfo::DO_NOT_REBIND;
     }
     if (!logical_plan) { return RebindQueryInfo::DO_NOT_REBIND; }
@@ -1277,22 +1281,24 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
     if (plan_reads_s3) { throw; }
     if (!duckdb_fallback_enabled(context)) { throw; }
     record_transparent_fallback();
-    SIRIUS_LOG_INFO("Transparent execution fallback (runtime unavailable): {}", e.what());
+    SIRIUS_LOG_INFO("Transparent execution fallback (runtime unavailable): {}",
+                    sirius::sanitized_message(e));
     return RebindQueryInfo::DO_NOT_REBIND;
   } catch (NotImplementedException& e) {
-    throw_if_s3_no_cpu_fallback(plan_reads_s3, current_query_sql, e.what());
+    throw_if_s3_no_cpu_fallback(plan_reads_s3, current_query_sql, sirius::sanitized_message(e));
     if (!duckdb_fallback_enabled(context)) {
       rethrow_gpu_error_no_fallback(e, "GPU plan generation failed: ");
     }
     record_transparent_fallback();
-    SIRIUS_LOG_INFO("Transparent execution fallback (unsupported): {}", e.what());
+    SIRIUS_LOG_INFO("Transparent execution fallback (unsupported): {}",
+                    sirius::sanitized_message(e));
   } catch (std::exception& e) {
-    throw_if_s3_no_cpu_fallback(plan_reads_s3, current_query_sql, e.what());
+    throw_if_s3_no_cpu_fallback(plan_reads_s3, current_query_sql, sirius::sanitized_message(e));
     if (!duckdb_fallback_enabled(context)) {
       rethrow_gpu_error_no_fallback(e, "GPU plan generation failed: ");
     }
     record_transparent_fallback();
-    SIRIUS_LOG_INFO("Transparent execution fallback: {}", e.what());
+    SIRIUS_LOG_INFO("Transparent execution fallback: {}", sirius::sanitized_message(e));
   }
 
   return RebindQueryInfo::DO_NOT_REBIND;

@@ -7,14 +7,14 @@ a modular instrumentation based telemetry toolkit to better understand runtime
 behaviours of complex applications. When a query runs, Sirius emits structured
 traces describing the engine, the plan (operators, ports, edges), executor
 /task-manager threads, task queues, and per-query activity. These traces are written
-as newline-delimited JSON (ndjson) files that Quent's analyzer server then ingests
+as newline-delimited JSON (ndjson) files by default that Quent's analyzer server then ingests
 and renders as an interactive timeline in your browser.
 
 ## 1. Enable the exporter
 
 Telemetry is controlled entirely by the Sirius YAML config (see the
 [Configuration reference](configuration.md#telemetry) for where config files are resolved). Enable
-the Quent ndjson exporter and choose an output directory:
+the Quent exporter and choose an output directory:
 
 ```yaml
 sirius:
@@ -26,13 +26,15 @@ sirius:
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `enable_quent` | bool | `true` | Emit Quent telemetry using the ndjson exporter. When `false`, telemetry uses the no-op exporter and nothing is written. |
-| `output_directory` | string | `telemetry_data` | Directory for the Quent ndjson files. |
+| `enable_quent` | bool | `true` | Emit Quent telemetry using the configured exporter. When `false`, telemetry uses the no-op exporter and nothing is written. |
+| `exporter` | string | `ndjson` | Quent filesystem exporter: `ndjson`, `msgpack`, or `postcard`. |
+| `output_directory` | string | `telemetry_data` | Directory for Quent telemetry files. |
 | `engine_name` | string | `siriusDB` | Engine name reported in engine-level telemetry. |
 
 Load the config through the normal resolution path — usually by setting
 `SIRIUS_CONFIG_FILE=/path/to/sirius.yaml` before loading the extension. Any Sirius query run with
-`enable_quent: true` then writes ndjson files into `output_directory`.
+`enable_quent: true` then writes ndjson files into `output_directory` by default. Set
+`exporter: postcard` for compact benchmark or CI telemetry.
 
 ## 2. Label your queries (optional)
 
@@ -57,7 +59,7 @@ with `sirius_set_query_label`. Unlabeled queries are reported as `unnamed_query`
 
 ## 3. Generate telemetry
 
-Run any query with the exporter enabled and ndjson files appear under `output_directory`.
+Run any query with the exporter enabled and telemetry files appear under `output_directory`.
 
 ### TPC-H helper
 

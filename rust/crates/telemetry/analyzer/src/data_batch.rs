@@ -37,9 +37,10 @@ impl DataBatchExt for DataBatch {
     }
 
     fn matches_filter(&self, filter: &OperatorFilter) -> bool {
-        filter
-            .operator_id
-            .is_none_or(|pipeline_uuid| self.producer_pipeline_uuid() == Some(pipeline_uuid))
+        filter.operator_ids.is_empty()
+            || self
+                .producer_pipeline_uuid()
+                .is_some_and(|pipeline_uuid| filter.operator_ids.contains(&pipeline_uuid))
     }
 
     fn active_span(&self) -> Option<SpanUnixNanoSec> {

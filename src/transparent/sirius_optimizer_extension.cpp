@@ -23,6 +23,7 @@
 #include <duckdb/main/client_context.hpp>
 #include <duckdb/main/config.hpp>
 #include <log/logging.hpp>
+#include <util/duckdb_error_message.hpp>
 
 #include <exception>
 #include <utility>
@@ -65,12 +66,14 @@ void sirius_optimizer_hook(duckdb::OptimizerExtensionInput& input,
   // throws and we fall back to CPU. A capture whose planning attempt never
   // reaches finalize (e.g. Connection::ExtractPlan) is structurally rejected
   // at the next attempt by the generation check.
+  //
+  // Plan-copy failures make the query ineligible for GPU execution. Optimizer
+  // hooks must not throw, so log a readable message and decline the plan.
   try {
     conn_state->set_captured_plan(copy_logical_plan(*plan, context));
-  } catch (duckdb::NotImplementedException&) {
-    // Plan not serializable — skip GPU.
   } catch (std::exception& e) {
-    SIRIUS_LOG_DEBUG("Transparent execution: failed to copy logical plan: {}", e.what());
+    SIRIUS_LOG_DEBUG("Transparent execution: failed to copy logical plan: {}",
+                     sirius::sanitized_message(e));
   }
 }
 

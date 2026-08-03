@@ -407,9 +407,11 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
     sirius_context && sirius_context->get_config().get_operator_params().enable_dynamic_filter;
 
   // Either filter or derived-relation evidence enables discovery; route-specific admission follows.
-  bool const build_evidence =
-    dynamic_filter_enabled &&
-    (build_subtree_is_filtering(*op.children[1]) || build_relation_is_derived(*op.children[1]));
+  // The two are tracked apart only so the wired log can say which one armed the join: derived-only
+  // evidence is structural, so the publish-time and runtime gates are what decide its worth.
+  bool const build_filtered = dynamic_filter_enabled && build_subtree_is_filtering(*op.children[1]);
+  bool const build_derived  = dynamic_filter_enabled && build_relation_is_derived(*op.children[1]);
+  bool const build_evidence = build_filtered || build_derived;
 
   // Gather domain evidence before create_plan() moves state out of the logical children.
   auto condition_domains =
@@ -594,10 +596,11 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
     if (!targets.empty()) {
       SIRIUS_LOG_INFO(
         "[sirius_plan_comparison_join] Wired hash join with {} dynamic-filter probe "
-        "target(s) ({} scan-bound, {} join-edge; build est {} rows).",
+        "target(s) ({} scan-bound, {} join-edge; evidence={}; build est {} rows).",
         targets.size(),
         scan_target_count,
         targets.size() - scan_target_count,
+        build_filtered ? (build_derived ? "filtered+derived" : "filtered") : "derived",
         rhs_cardinality);
     } else if (build_evidence && op.type == duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN &&
                !admitted_keys.empty() && (gpu_spaces.empty() || host_spaces.empty())) {

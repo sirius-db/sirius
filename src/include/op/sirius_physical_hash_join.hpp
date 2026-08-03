@@ -313,6 +313,16 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   /// decision so the partition can finish its own wiring (e.g. enabling build-side concat_all).
   partition_strategy get_partition_strategy(const partition_sizing_input& in) override;
 
+  /// True when this join publishes dynamic filters (an enabled publication plan, i.e. wired probe
+  /// targets). The upstream PARTITION folds a single-partition build to one batch for such a join
+  /// so the one-shot publisher sees the whole key set.
+  [[nodiscard]] bool publishes_dynamic_filters() const;
+
+  /// Reported by the upstream PARTITION at sizing time: the build port will deliver one
+  /// concat-folded batch covering the entire build side (single-partition or broadcast build).
+  /// Precondition for claiming a build batch for dynamic-filter publication, in any join mode.
+  void set_build_arrives_whole(bool arrives_whole);
+
   /// @brief True when this join runs in build-then-probe mode (see `get_partition_strategy`).
   [[nodiscard]] bool is_build_probe_mode();
 
@@ -365,6 +375,17 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   // Broadcast (small build table) BUILD_PROBE join: the build side is replicated to every slot and
   // the probe side is streamed unpartitioned.
   bool _broadcast = false;
+
+  // Whether the build port delivers one concat-folded batch covering the entire build side
+  // (single-partition or broadcast build with a concat_all'd build-side CONCAT). Set by the
+  // upstream PARTITION at sizing time; the one-shot dynamic-filter publisher only claims a build
+  // batch when this holds. Guarded by op_state_mutex.
+  bool _build_arrives_whole = false;
+
+  // One-shot latch for the "dynamic filter NOT published" diagnostic and its stats counter: a
+  // wired join whose build cannot arrive whole reports that once, not once per build batch.
+  // Guarded by op_state_mutex.
+  bool _build_not_whole_reported = false;
 
   // Whether any build-side join key column contains a NULL. Used exclusively for MARK join
   // three-valued logic. Sentinel -1 = unset, 0 = false, 1 = true. Join-wide (not per-partition)

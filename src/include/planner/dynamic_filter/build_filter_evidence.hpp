@@ -43,16 +43,27 @@ namespace sirius::planner {
 [[nodiscard]] bool build_subtree_is_filtering(duckdb::LogicalOperator const& op);
 
 /**
- * @brief Reports whether a logical relation is a projected derived leaf
+ * @brief Reports whether a logical relation is derived rather than a base-table image
  *
- * Returns true for a `LOGICAL_DELIM_GET` or `LOGICAL_CTE_REF` root, or for one reached through only
- * `LOGICAL_PROJECTION` wrappers. Any other operator stops the classification, even if one of its
- * descendants is a matching leaf.
+ * Returns true when the subtree contains a derivation marker anywhere below the root, recursing
+ * through every other operator. A derivation marker is either a childless derived leaf
+ * (`LOGICAL_DELIM_GET`, `LOGICAL_CTE_REF`) or a reducing operator (`LOGICAL_COMPARISON_JOIN`,
+ * `LOGICAL_ANY_JOIN`, `LOGICAL_DELIM_JOIN`, `LOGICAL_AGGREGATE_AND_GROUP_BY`, `LOGICAL_DISTINCT`,
+ * `LOGICAL_INTERSECT`, `LOGICAL_EXCEPT`). `LOGICAL_UNION` is deliberately not a marker, because a
+ * union does not reduce its inputs' key sets.
  *
- * This is structural evidence only; it does not imply that the relation filters any rows.
+ * This is structural evidence only; it does not imply that the relation filters any rows. The known
+ * false-positive class is the cardinality-preserving enrichment join: a build that joins a table to
+ * a dimension on that dimension's key is structurally derived, yet emits every key its larger input
+ * held. Two gates downstream contain it. `publish_dynamic_filters` applies the build-key
+ * domain-coverage gate, which skips a key whose build covers most of the traced base table's domain
+ * before any membership structure is built; the trace descends through joins to the underlying
+ * `LOGICAL_GET`, so an enrichment join's key still resolves to its base domain.
+ * `dynamic_filter_gate` then measures what an applied filter actually keeps and retires one that
+ * prunes too little.
  *
  * @param[in] op Root of the logical relation to classify
- * @return True if the relation is a derived leaf with only projection wrappers
+ * @return True when the subtree contains a derivation marker
  */
 [[nodiscard]] bool build_relation_is_derived(duckdb::LogicalOperator const& op);
 

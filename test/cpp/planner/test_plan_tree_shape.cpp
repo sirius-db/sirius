@@ -43,6 +43,10 @@
 #include <duckdb/main/config.hpp>
 #include <duckdb/optimizer/optimizer.hpp>
 #include <duckdb/parser/parser.hpp>
+#include <duckdb/planner/expression/bound_function_expression.hpp>
+#include <duckdb/planner/expression/bound_reference_expression.hpp>
+#include <duckdb/planner/filter/expression_filter.hpp>
+#include <duckdb/planner/operator/logical_get.hpp>
 #include <duckdb/planner/planner.hpp>
 #include <unistd.h>
 
@@ -216,6 +220,21 @@ std::string tree_to_string(sirius_physical_operator* root)
   std::ostringstream out;
   tree_to_string(root, 0, out);
   return out.str();
+}
+
+duckdb::unique_ptr<duckdb::Expression> untranslatable_table_filter_expression()
+{
+  auto expression = duckdb::make_uniq<duckdb::BoundFunctionExpression>(
+    duckdb::LogicalType::BOOLEAN,
+    duckdb::ScalarFunction("sirius_unmapped_filter",
+                           {duckdb::LogicalType::BIGINT},
+                           duckdb::LogicalType::BOOLEAN,
+                           nullptr),
+    duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>{},
+    nullptr);
+  expression->children.push_back(
+    duckdb::make_uniq<duckdb::BoundReferenceExpression>(duckdb::LogicalType::BIGINT, 0));
+  return expression;
 }
 
 /// Every operator's `_parent_op` must equal its position in the final tree; delim joins
@@ -919,4 +938,31 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
       }
     }
   }
+}
+
+TEST_CASE_METHOD(plan_tree_shape_fixture,
+                 "plan generation rejects an untranslatable pushed-down table filter",
+                 "[plan_tree_shape][table_filter][isolated_context]")
+{
+  duckdb::TableFunction function;
+  function.name                = "seq_scan";
+  function.projection_pushdown = true;
+  function.filter_pushdown     = true;
+
+  auto get = duckdb::make_uniq<duckdb::LogicalGet>(
+    0,
+    std::move(function),
+    nullptr,
+    duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::BIGINT},
+    duckdb::vector<duckdb::string>{"id"});
+  get->SetColumnIds({duckdb::ColumnIndex(0)});
+  get->projection_ids        = {0};
+  get->estimated_cardinality = 1;
+  get->table_filters.filters[0] =
+    duckdb::make_uniq<duckdb::ExpressionFilter>(untranslatable_table_filter_expression());
+
+  duckdb::unique_ptr<duckdb::LogicalOperator> logical = std::move(get);
+  sirius::planner::sirius_physical_plan_generator generator(*con->context);
+  CHECK_THROWS_WITH(generator.create_plan(std::move(logical)),
+                    Catch::Contains("Unsupported filter predicate on column 'id'"));
 }

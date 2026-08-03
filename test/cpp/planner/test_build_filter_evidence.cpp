@@ -19,8 +19,9 @@
  *
  * `build_subtree_is_filtering` mirrors DuckDB's join-filter evidence rules for filtered scans,
  * filters, top-N operators, and containing subtrees; the parity suite compares both implementations
- * on optimized plans. `build_relation_is_derived` recognizes only delim-scan and CTE-reference
- * roots with optional projection wrappers; the tests pin that root-down boundary.
+ * on optimized plans. `build_relation_is_derived` fires on a derivation marker anywhere in the
+ * subtree -- a derived leaf or a reducing operator; the tests pin which operators are markers and
+ * that the walk is any-descendant.
  */
 
 #include "planner/dynamic_filter/build_filter_evidence.hpp"
@@ -30,12 +31,17 @@
 #include <duckdb/planner/expression/bound_constant_expression.hpp>
 #include <duckdb/planner/filter/constant_filter.hpp>
 #include <duckdb/planner/operator/logical_aggregate.hpp>
+#include <duckdb/planner/operator/logical_any_join.hpp>
 #include <duckdb/planner/operator/logical_comparison_join.hpp>
 #include <duckdb/planner/operator/logical_cteref.hpp>
 #include <duckdb/planner/operator/logical_delim_get.hpp>
+#include <duckdb/planner/operator/logical_distinct.hpp>
 #include <duckdb/planner/operator/logical_filter.hpp>
 #include <duckdb/planner/operator/logical_get.hpp>
+#include <duckdb/planner/operator/logical_limit.hpp>
+#include <duckdb/planner/operator/logical_order.hpp>
 #include <duckdb/planner/operator/logical_projection.hpp>
+#include <duckdb/planner/operator/logical_set_operation.hpp>
 #include <duckdb/planner/operator/logical_top_n.hpp>
 #include <duckdb/planner/table_filter.hpp>
 
@@ -89,6 +95,55 @@ duckdb::unique_ptr<duckdb::LogicalCTERef> make_cte_ref()
     /*cte_index=*/0,
     duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER},
     duckdb::vector<duckdb::string>{"a"});
+}
+
+duckdb::unique_ptr<duckdb::LogicalAggregate> make_aggregate_over(
+  duckdb::unique_ptr<duckdb::LogicalOperator> child)
+{
+  auto aggregate = duckdb::make_uniq<duckdb::LogicalAggregate>(
+    /*group_index=*/4,
+    /*aggregate_index=*/5,
+    duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>{});
+  aggregate->children.push_back(std::move(child));
+  return aggregate;
+}
+
+duckdb::unique_ptr<duckdb::LogicalComparisonJoin> make_join_over(
+  duckdb::unique_ptr<duckdb::LogicalOperator> left,
+  duckdb::unique_ptr<duckdb::LogicalOperator> right)
+{
+  auto join = duckdb::make_uniq<duckdb::LogicalComparisonJoin>(duckdb::JoinType::INNER);
+  join->children.push_back(std::move(left));
+  join->children.push_back(std::move(right));
+  return join;
+}
+
+duckdb::unique_ptr<duckdb::LogicalLimit> make_limit_over(
+  duckdb::unique_ptr<duckdb::LogicalOperator> child)
+{
+  auto limit = duckdb::make_uniq<duckdb::LogicalLimit>(duckdb::BoundLimitNode::ConstantValue(10),
+                                                       duckdb::BoundLimitNode());
+  limit->children.push_back(std::move(child));
+  return limit;
+}
+
+duckdb::unique_ptr<duckdb::LogicalOrder> make_order_over(
+  duckdb::unique_ptr<duckdb::LogicalOperator> child)
+{
+  auto order = duckdb::make_uniq<duckdb::LogicalOrder>(duckdb::vector<duckdb::BoundOrderByNode>{});
+  order->children.push_back(std::move(child));
+  return order;
+}
+
+duckdb::unique_ptr<duckdb::LogicalSetOperation> make_set_operation(duckdb::LogicalOperatorType type)
+{
+  return duckdb::make_uniq<duckdb::LogicalSetOperation>(
+    /*table_index=*/8,
+    /*column_count=*/1,
+    make_get(),
+    make_get(),
+    type,
+    /*setop_all=*/false);
 }
 
 }  // namespace
@@ -211,26 +266,88 @@ TEST_CASE("operators in the mirror's jurisdiction are not derived", "[dynamic_fi
   }
 }
 
-TEST_CASE("derivation is root-down, not any-descendant", "[dynamic_filter][evidence]")
+TEST_CASE("derivation is any-descendant over derivation markers", "[dynamic_filter][evidence]")
 {
-  SECTION("a group-less aggregate over a projected CTE_REF is not derived")
+  SECTION("a group-less aggregate over a projected CTE_REF is derived")
   {
-    // The aggregate presents a new relation, even though its child is derived.
-    auto aggregate = duckdb::make_uniq<duckdb::LogicalAggregate>(
-      /*group_index=*/4,
-      /*aggregate_index=*/5,
-      duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>{});
-    aggregate->children.push_back(make_projection_over(make_cte_ref()));
-    REQUIRE_FALSE(build_relation_is_derived(*aggregate));
+    // Two markers: the aggregate itself and the reference below it.
+    REQUIRE(build_relation_is_derived(*make_aggregate_over(make_projection_over(make_cte_ref()))));
   }
 
-  SECTION("a comparison join with a CTE_REF child is not derived")
+  SECTION("a comparison join with a CTE_REF child is derived")
   {
-    // The join presents a new relation rather than forwarding either child.
-    auto join = duckdb::make_uniq<duckdb::LogicalComparisonJoin>(duckdb::JoinType::INNER);
-    join->children.push_back(make_cte_ref());
+    REQUIRE(build_relation_is_derived(*make_join_over(make_cte_ref(), make_get())));
+  }
+
+  SECTION("a marker below a non-projection wrapper is still found")
+  {
+    // The property the walk exists for: no operator between the root and a marker hides it.
+    REQUIRE(build_relation_is_derived(*make_order_over(make_join_over(make_get(), make_get()))));
+    REQUIRE(build_relation_is_derived(*make_limit_over(make_join_over(make_get(), make_get()))));
+  }
+
+  SECTION("a LIMIT over a CTE_REF is derived")
+  {
+    // Deliberate: one uniform rule for leaves and reducing operators alike. A rule that admitted
+    // an unfiltered aggregate under this LIMIT but refused the CTE reference -- the more clearly
+    // derived relation of the two -- would be incoherent.
+    REQUIRE(build_relation_is_derived(*make_limit_over(make_cte_ref())));
+  }
+}
+
+TEST_CASE("reducing operators are derivation markers", "[dynamic_filter][evidence]")
+{
+  SECTION("a grouped aggregate over a GET")
+  {
+    REQUIRE(build_relation_is_derived(*make_aggregate_over(make_get())));
+  }
+
+  SECTION("a DISTINCT over a GET")
+  {
+    auto distinct = duckdb::make_uniq<duckdb::LogicalDistinct>(
+      duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>{}, duckdb::DistinctType::DISTINCT);
+    distinct->children.push_back(make_get());
+    REQUIRE(build_relation_is_derived(*distinct));
+  }
+
+  SECTION("an ANY_JOIN over two GETs")
+  {
+    auto join = duckdb::make_uniq<duckdb::LogicalAnyJoin>(duckdb::JoinType::INNER);
     join->children.push_back(make_get());
-    REQUIRE_FALSE(build_relation_is_derived(*join));
+    join->children.push_back(make_get());
+    REQUIRE(build_relation_is_derived(*join));
+  }
+
+  SECTION("an INTERSECT of two GETs")
+  {
+    REQUIRE(build_relation_is_derived(
+      *make_set_operation(duckdb::LogicalOperatorType::LOGICAL_INTERSECT)));
+  }
+
+  SECTION("an EXCEPT of two GETs")
+  {
+    REQUIRE(
+      build_relation_is_derived(*make_set_operation(duckdb::LogicalOperatorType::LOGICAL_EXCEPT)));
+  }
+}
+
+TEST_CASE("row-preserving operators over base tables are not derived", "[dynamic_filter][evidence]")
+{
+  SECTION("a LIMIT over a GET")
+  {
+    REQUIRE_FALSE(build_relation_is_derived(*make_limit_over(make_get())));
+  }
+
+  SECTION("an ORDER_BY over a GET")
+  {
+    REQUIRE_FALSE(build_relation_is_derived(*make_order_over(make_get())));
+  }
+
+  SECTION("a UNION of two GETs")
+  {
+    // A union does not reduce either input's key set, so it is deliberately not a marker.
+    REQUIRE_FALSE(
+      build_relation_is_derived(*make_set_operation(duckdb::LogicalOperatorType::LOGICAL_UNION)));
   }
 }
 

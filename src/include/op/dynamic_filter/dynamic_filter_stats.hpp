@@ -43,6 +43,7 @@ struct dynamic_filter_stats_snapshot {
   std::uint64_t publications_finished                    = 0;
   std::uint64_t publications_failed                      = 0;
   std::uint64_t publications_skipped_source_not_resident = 0;
+  std::uint64_t publications_skipped_build_not_whole     = 0;
   std::uint64_t publications_skipped_targets_drained     = 0;
   std::uint64_t filters_pushed                           = 0;
 };
@@ -66,6 +67,11 @@ struct dynamic_filter_stats_snapshot {
  * The publication and delivery counters may vary with probe-side draining and target lifetime. Each
  * atomic is coherent independently; `snapshot()` does not provide a transactionally consistent view
  * across fields.
+ *
+ * Every enabled producer reaches exactly one of three ends, so `producers_enabled` accounts for
+ * `publication_attempts + publications_skipped_build_not_whole +
+ * publications_skipped_source_not_resident`. The identity is approximate because a query can finish
+ * before a join receives any build batch at all.
  */
 struct dynamic_filter_stats {
   // Plan-time fact
@@ -88,6 +94,10 @@ struct dynamic_filter_stats {
   std::atomic<std::uint64_t> publications_failed{0};
   /// Build batch was not GPU-resident at delivery; publication skipped without claiming
   std::atomic<std::uint64_t> publications_skipped_source_not_resident{0};
+  /// Wired join whose build never arrives as one whole batch (multi-partition, or no concat-folded
+  /// build): its one-shot publication window can never claim. Counted once per join, at the first
+  /// build delivery that observes the condition.
+  std::atomic<std::uint64_t> publications_skipped_build_not_whole{0};
   /// Attempt hit the all-targets-drained early return; no deterministic counter moved for it
   std::atomic<std::uint64_t> publications_skipped_targets_drained{0};
   std::atomic<std::uint64_t> filters_pushed{0};  ///< Accepted pushes; drain-dependent
@@ -113,6 +123,8 @@ struct dynamic_filter_stats {
       .publications_failed        = publications_failed.load(std::memory_order_relaxed),
       .publications_skipped_source_not_resident =
         publications_skipped_source_not_resident.load(std::memory_order_relaxed),
+      .publications_skipped_build_not_whole =
+        publications_skipped_build_not_whole.load(std::memory_order_relaxed),
       .publications_skipped_targets_drained =
         publications_skipped_targets_drained.load(std::memory_order_relaxed),
       .filters_pushed = filters_pushed.load(std::memory_order_relaxed)};
