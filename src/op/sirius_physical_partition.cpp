@@ -402,7 +402,9 @@ std::unique_ptr<operator_data> sirius_physical_partition::get_next_task_input_da
                                       has_build_concat(*this) || has_build_concat(sibling)};
       // The consumer owns the decision: it computes the count / broadcast flag, updates its own
       // execution state (e.g. hash-join BUILD_PROBE mode), and pre-sizes its own input repos.
-      auto const strategy = consumer->get_partition_strategy(in);
+      auto const strategy      = consumer->get_partition_strategy(in);
+      auto* hash_join          = dynamic_cast<sirius_physical_hash_join*>(consumer);
+      bool build_arrives_whole = false;
       if (strategy.build_probe) {
         // Configure both siblings' build-side CONCAT (do not short-circuit) and require that at
         // least one build-side CONCAT exists — BUILD_PROBE cannot run without a concat_all'd build.
@@ -415,7 +417,18 @@ std::unique_ptr<operator_data> sirius_physical_partition::get_next_task_input_da
                                    "to fold the build into a "
                                    "single batch (concat_all)");
         }
+        build_arrives_whole = strategy.num_partitions == 1 || strategy.broadcast;
+      } else if (in.is_build_side && strategy.num_partitions == 1 && hash_join != nullptr &&
+                 hash_join->publishes_dynamic_filters()) {
+        // Not BUILD_PROBE, but the build lands in one partition and this join publishes a filter
+        // from a single build batch, so folding it only moves a batch boundary. Best-effort: no
+        // build-side CONCAT means no publication. Build-side sizing is required — right-family
+        // joins size from the probe, where one partition says nothing about the build's size.
+        bool const found_this    = enable_build_concat_all(*this);
+        bool const found_sibling = enable_build_concat_all(sibling);
+        build_arrives_whole      = found_this || found_sibling;
       }
+      if (hash_join != nullptr) { hash_join->set_build_arrives_whole(build_arrives_whole); }
       _broadcast              = strategy.broadcast;
       sibling._broadcast      = strategy.broadcast;
       _num_partitions         = strategy.num_partitions;
