@@ -310,6 +310,18 @@ TEST_CASE("reducing operators are derivation markers", "[dynamic_filter][evidenc
     REQUIRE(build_relation_is_derived(*distinct));
   }
 
+  SECTION("a DELIM_JOIN over two GETs")
+  {
+    // A delim join is a LogicalComparisonJoin carrying its own operator type, so the marker switch
+    // has to name it separately from LOGICAL_COMPARISON_JOIN.
+    auto join = duckdb::make_uniq<duckdb::LogicalComparisonJoin>(
+      duckdb::JoinType::INNER, duckdb::LogicalOperatorType::LOGICAL_DELIM_JOIN);
+    join->children.push_back(make_get());
+    join->children.push_back(make_get());
+    REQUIRE(join->type == duckdb::LogicalOperatorType::LOGICAL_DELIM_JOIN);
+    REQUIRE(build_relation_is_derived(*join));
+  }
+
   SECTION("an ANY_JOIN over two GETs")
   {
     auto join = duckdb::make_uniq<duckdb::LogicalAnyJoin>(duckdb::JoinType::INNER);

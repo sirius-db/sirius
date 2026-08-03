@@ -59,7 +59,10 @@ struct dynamic_filter_stats_snapshot {
  * The fields have three timing classes.
  *
  * `producers_enabled` is a plan-time fact. `sirius_physical_hash_join` increments it when
- * constructed with an enabled `dynamic_filter_publish_plan`, before execution begins.
+ * constructed with an enabled `dynamic_filter_publish_plan`, before execution begins. It counts
+ * plan constructions, not executed producers: the transparent path builds the physical plan once at
+ * prepare and again at execution, so a single query contributes twice per producing join. Compare
+ * it across runs or use it as a direction, never as the left side of an accounting identity.
  *
  * The key and filter counters record policy decisions for attempts that reach per-key processing. A
  * source-residency or all-targets-drained return occurs earlier and does not increment them.
@@ -68,10 +71,11 @@ struct dynamic_filter_stats_snapshot {
  * atomic is coherent independently; `snapshot()` does not provide a transactionally consistent view
  * across fields.
  *
- * Every enabled producer reaches exactly one of three ends, so `producers_enabled` accounts for
- * `publication_attempts + publications_skipped_build_not_whole +
- * publications_skipped_source_not_resident`. The identity is approximate because a query can finish
- * before a join receives any build batch at all.
+ * The delivery counters partition *build deliveries*, not joins: each build batch a wired join
+ * receives either fails the claim and increments `publications_skipped_build_not_whole`, or claims
+ * and then either attempts publication or reports its source not resident. Only the not-whole
+ * counter is latched to fire once per join; the others can fire repeatedly for one join, because a
+ * broadcast build delivers one batch per GPU.
  */
 struct dynamic_filter_stats {
   // Plan-time fact
@@ -94,9 +98,10 @@ struct dynamic_filter_stats {
   std::atomic<std::uint64_t> publications_failed{0};
   /// Build batch was not GPU-resident at delivery; publication skipped without claiming
   std::atomic<std::uint64_t> publications_skipped_source_not_resident{0};
-  /// Wired join whose build never arrives as one whole batch (multi-partition, or no concat-folded
-  /// build): its one-shot publication window can never claim. Counted once per join, at the first
-  /// build delivery that observes the condition.
+  /// Wired join the upstream PARTITION never reported a whole build for, so its one-shot
+  /// publication window can never claim: probe-driven sizing, a multi-partition build, or no
+  /// build-side CONCAT to fold. Counted once per join, at the first build delivery that observes
+  /// the condition.
   std::atomic<std::uint64_t> publications_skipped_build_not_whole{0};
   /// Attempt hit the all-targets-drained early return; no deterministic counter moved for it
   std::atomic<std::uint64_t> publications_skipped_targets_drained{0};

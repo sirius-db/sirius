@@ -70,12 +70,37 @@ std::vector<std::vector<std::string>> run_on_gpu(duckdb::Connection& con, const 
   return sirius::test::collect_rows(result->Cast<duckdb::MaterializedQueryResult>());
 }
 
+// Set one numeric Sirius setting for a scope and restore its previous value on exit.
+struct scoped_setting {
+  scoped_setting(duckdb::Connection& c, std::string setting, std::uint64_t value)
+    : con(c), name(std::move(setting))
+  {
+    auto current = con.Query("SELECT current_setting('" + name + "');");
+    REQUIRE(current);
+    REQUIRE_FALSE(current->HasError());
+    original = current->GetValue(0, 0).ToString();
+
+    auto result = con.Query("SET " + name + " = " + std::to_string(value) + ";");
+    REQUIRE(result);
+    REQUIRE_FALSE(result->HasError());
+  }
+  ~scoped_setting() { con.Query("SET " + name + " = " + original + ";"); }
+
+  scoped_setting(const scoped_setting&)            = delete;
+  scoped_setting& operator=(const scoped_setting&) = delete;
+
+  duckdb::Connection& con;
+  std::string name;
+  std::string original;
+};
+
 // Dynamic-filter counter deltas for one query execution.
 struct publication_deltas {
-  std::uint64_t producers_enabled        = 0;
-  std::uint64_t membership_filters_built = 0;
-  std::uint64_t publications_finished    = 0;
-  std::uint64_t filters_pushed           = 0;
+  std::uint64_t producers_enabled                    = 0;
+  std::uint64_t membership_filters_built             = 0;
+  std::uint64_t publications_finished                = 0;
+  std::uint64_t publications_skipped_build_not_whole = 0;
+  std::uint64_t filters_pushed                       = 0;
 };
 
 struct switch_comparison {
@@ -94,7 +119,9 @@ publication_deltas run_and_measure(duckdb::Connection& con,
     .producers_enabled        = after.producers_enabled - before.producers_enabled,
     .membership_filters_built = after.membership_filters_built - before.membership_filters_built,
     .publications_finished    = after.publications_finished - before.publications_finished,
-    .filters_pushed           = after.filters_pushed - before.filters_pushed};
+    .publications_skipped_build_not_whole =
+      after.publications_skipped_build_not_whole - before.publications_skipped_build_not_whole,
+    .filters_pushed = after.filters_pushed - before.filters_pushed};
 }
 
 // Publication completes before these probes, making the enabled/disabled counter deltas
@@ -226,6 +253,38 @@ TEST_CASE("gpu_execution - derived-build and build-block routes preserve results
     REQUIRE(deltas.on.producers_enabled > deltas.off.producers_enabled);
     REQUIRE(deltas.on.publications_finished > deltas.off.publications_finished);
     REQUIRE(deltas.on.filters_pushed > deltas.off.filters_pushed);
+  }
+
+  SECTION("a multi-partition build publishes nothing")
+  {
+    // The one property here whose violation is a wrong result rather than a lost optimization: a
+    // filter built from one partition's slice of the build keys would drop probe rows that do
+    // join. The join no longer decides this itself, it trusts the PARTITION, so pin it end to end
+    // on a build that really does span partitions rather than on a join that was simply never
+    // told.
+    //
+    // Reaching that shape needs the build to clear the small-table threshold: a build under it is
+    // a broadcast candidate, and broadcast collapses to a single partition no matter how small
+    // the hash-partition target is. Hence the wide build -- the summed columns exist to keep the
+    // projection from pruning them, not for their values. Disabling broadcast outright removes
+    // the remaining candidacy path, and the small hash-partition target then drives the natural
+    // count above one, which also makes the join ineligible for BUILD_PROBE.
+    sirius::test::disabled_optimizers_guard shape(
+      con, "statistics_propagation,join_order,build_side_probe_side");
+    sirius::test::coverage_gate_disable_guard gate_off(con);
+    scoped_setting no_broadcast(con, "max_broadcast_join_size", 1);
+    scoped_setting small_partitions(con, "hash_partition_bytes", 8ULL * 1024 * 1024);
+    auto const deltas = require_switch_result_equivalence(
+      con,
+      "select count(*), sum(l.l_partkey), sum(l.l_suppkey), sum(l.l_linenumber), "
+      "       sum(l.l_quantity), sum(l.l_extendedprice), sum(l.l_discount), sum(l.l_tax) "
+      "from orders o join lineitem l on o.o_orderkey = l.l_orderkey "
+      "where l.l_shipdate >= date '1992-01-01'");
+
+    // The producer is wired, so the window opens and then can never claim.
+    REQUIRE(deltas.on.producers_enabled > deltas.off.producers_enabled);
+    REQUIRE(deltas.on.publications_finished == 0);
+    REQUIRE(deltas.on.publications_skipped_build_not_whole > 0);
   }
 
   SECTION("an unfiltered aggregate build supplies derived evidence")
