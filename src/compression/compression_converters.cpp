@@ -89,18 +89,27 @@ std::unique_ptr<cudf::column> rebind_column_stream(std::unique_ptr<cudf::column>
     type, size, std::move(*contents.data), std::move(null_mask), nc, std::move(children));
 }
 
-// True when column `column_index`'s plan is a plain bitpack leaf over a lane
-// type the fused decode variants handle: `input -> bitpack` and nothing else —
-// the node consuming the column input is `bitpack` and no node consumes the
-// bitpack's output. `dictionary -> bitpack` (indices) and `delta -> bitpack`
-// (orderkeys) fail the first test; a hypothetical re-compressed
-// `bitpack -> <codec>` fails the second. The lane gate mirrors what K1/K3
-// decode into: int32/int64-backed values compared as signed int64 — uint64 is
-// excluded because its upper half would misorder under a signed compare.
-bool column_is_fusable_bitpack_leaf(simpatico::compressed_table const& table,
-                                    std::size_t column_index)
+// Fusability verdict for one column, split per gate so diagnostics can name
+// the offending one. lane_ok: the dtype decodes into a lane K1/K3 compare as
+// signed int64 — uint64 is excluded because its upper half would misorder
+// under a signed compare. plan_ok: plain bitpack leaf — the node consuming the
+// column input is `bitpack` and no node consumes the bitpack's output.
+// `dictionary -> bitpack` (indices) and `delta -> bitpack` (orderkeys) fail
+// the first test; a hypothetical re-compressed `bitpack -> <codec>` fails the
+// second. NOTE: the routed FOR header channels (`bitpack -> chunk_min,
+// chunk_count, chunk_bits, packed`) are the bitpack node's own output_names,
+// NOT consumer nodes — they do not trip the re-consumption test.
+struct bitpack_leaf_verdict {
+  bool lane_ok = false;
+  bool plan_ok = false;
+  [[nodiscard]] bool fusable() const noexcept { return lane_ok && plan_ok; }
+};
+
+bitpack_leaf_verdict probe_bitpack_leaf(simpatico::compressed_table const& table,
+                                        std::size_t column_index)
 {
-  if (column_index >= table.columns.size()) { return false; }
+  bitpack_leaf_verdict verdict;
+  if (column_index >= table.columns.size()) { return verdict; }
   auto const& column = table.columns[column_index];
   switch (column.dtype.id()) {
     case cudf::type_id::INT8:
@@ -112,28 +121,29 @@ bool column_is_fusable_bitpack_leaf(simpatico::compressed_table const& table,
     case cudf::type_id::UINT32:
     case cudf::type_id::TIMESTAMP_DAYS:
     case cudf::type_id::DECIMAL32:
-    case cudf::type_id::DECIMAL64: break;
-    default: return false;
+    case cudf::type_id::DECIMAL64: verdict.lane_ok = true; break;
+    default: break;
   }
   auto const* tree = column.plan_tree.get();
-  if (tree == nullptr || tree->nodes.empty() || tree->nodes[0].op != "input") { return false; }
+  if (tree == nullptr || tree->nodes.empty() || tree->nodes[0].op != "input") { return verdict; }
   simpatico::NodeId bitpack_id = 0;
   for (simpatico::NodeId nid = 1; nid < tree->nodes.size(); ++nid) {
     auto const& sources = tree->nodes[nid].input_sources;
     if (!sources.empty() && sources.front() == simpatico::ValueId{0, 0}) {
-      if (tree->nodes[nid].op != "bitpack") { return false; }
+      if (tree->nodes[nid].op != "bitpack") { return verdict; }
       bitpack_id = nid;
       break;
     }
   }
-  if (bitpack_id == 0) { return false; }
+  if (bitpack_id == 0) { return verdict; }
   for (simpatico::NodeId nid = 1; nid < tree->nodes.size(); ++nid) {
     if (nid == bitpack_id) { continue; }
     for (auto const& src : tree->nodes[nid].input_sources) {
-      if (src.node == bitpack_id) { return false; }  // bitpack output re-consumed: not a leaf
+      if (src.node == bitpack_id) { return verdict; }  // bitpack output re-consumed: not a leaf
     }
   }
-  return true;
+  verdict.plan_ok = true;
+  return verdict;
 }
 
 // Translate the representation's string-only pushdown into simpatico's decode
@@ -199,16 +209,18 @@ std::unique_ptr<cudf::table> try_decompress_scan_filter(
   // buffers there anyway so their teardown follows the batch's ordering.
   result.set_stream(stream);
   if (!table) {
-    SIRIUS_LOG_DEBUG(
-      "[compression_converters] fused scan-filter assembly refused ({}); falling back to the "
-      "classic decompress",
-      error);
+    SIRIUS_LOG_DEBUG("[fused-diag] assembly REFUSED ({}); falling back to classic decompress",
+                    error);
     return nullptr;
   }
   row_filtered = result.applied;
+  // applied=false here means decompress_scan_filter itself declined (env gate
+  // off, precondition-reject — e.g. W4's kSelectionMaskDecodeAvailable — or an
+  // internal fallback) and returned the classic full-width decode.
   SIRIUS_LOG_DEBUG(
-    "[compression_converters] fused scan-filter {}: {} of {} row(s) survive, {} column(s)",
-    result.applied ? "applied" : "not applied (classic output)",
+    "[fused-diag] decompress_scan_filter {}: filters={} survivors={}/{} column(s)={}",
+    result.applied ? "APPLIED" : "NOT applied (W4 declined internally — classic output)",
+    request.filters.size(),
     result.survivor_count,
     result.num_rows,
     table->num_columns());
@@ -264,6 +276,13 @@ std::unique_ptr<cucascade::idata_representation> reconstruct_and_decompress_to_g
   bool decode_row_filtered = false;
   // Fused scan-filter attempt — same contract as the device converter: only
   // without string-equality predicates, decline ⇒ classic path below.
+  SIRIUS_LOG_DEBUG(
+    "[fused-diag] host converter: n_columns={} equality_predicates={} range_entries={} "
+    "range_gate={}",
+    subset.num_columns(),
+    predicates.size(),
+    range_pushdown.size(),
+    range_conjuncts_convertible);
   if (predicates.empty() && range_conjuncts_convertible && !range_pushdown.empty()) {
     // `subset` holds exactly the projected columns, so selection is identity.
     std::vector<std::size_t> identity_selection(subset.num_columns());
@@ -366,6 +385,13 @@ std::unique_ptr<cucascade::idata_representation> decompress_device_to_gpu(
   // every per-plan precondition are re-checked inside decompress_scan_filter).
   // Not composable with string-equality predicates (iteration 1) — those scans
   // keep the predicated overload below. Any decline falls through classically.
+  SIRIUS_LOG_DEBUG(
+    "[fused-diag] device converter: n_selected={} equality_predicates={} range_entries={} "
+    "range_gate={}",
+    n_selected,
+    predicates.size(),
+    rep.range_pushdown().size(),
+    rep.range_conjuncts_convertible());
   std::vector<std::size_t> identity_selection;
   if (predicates.empty() && rep.range_conjuncts_convertible() && !rep.range_pushdown().empty()) {
     std::span<const std::size_t> selected;
@@ -429,10 +455,22 @@ fused_scan_directives build_fused_scan_directives(const simpatico::compressed_ta
                                                   bool all_conjuncts_convertible)
 {
   fused_scan_directives out;  // disabled/empty unless everything below holds
-  if (!all_conjuncts_convertible) { return out; }
+  if (!all_conjuncts_convertible) {
+    // The [fused-diag] lines (here and below) trace every accept/refuse
+    // decision of the fused scan-filter pipeline. Kept at DEBUG: quiet by
+    // default, and raising the level is the first move whenever a batch
+    // silently falls back to the classic path (see the M2 hunt in STATUS-W2).
+    SIRIUS_LOG_DEBUG("[fused-diag] directives: extraction gate FALSE — classic path");
+    return out;
+  }
   bool const any_active = std::any_of(
     attached_ranges.begin(), attached_ranges.end(), [](auto const& e) { return e.active; });
-  if (!any_active) { return out; }
+  if (!any_active) {
+    SIRIUS_LOG_DEBUG("[fused-diag] directives: {} attached range entr(ies), NONE active — "
+                    "classic path (remap produced empty slots?)",
+                    attached_ranges.size());
+    return out;
+  }
   if (attached_ranges.size() > selected_columns.size()) {
     throw std::runtime_error("[compression_converters] range pushdown wider than the projection");
   }
@@ -445,21 +483,35 @@ fused_scan_directives build_fused_scan_directives(const simpatico::compressed_ta
   std::size_t mask_columns   = 0;
   std::size_t tier_a_columns = 0;
   for (std::size_t i = 0; i < count; ++i) {
-    bool const fusable = column_is_fusable_bitpack_leaf(table, selected_columns[i]);
-    if (fusable) {
+    auto const verdict = probe_bitpack_leaf(table, selected_columns[i]);
+    auto const phys    = selected_columns[i];
+    SIRIUS_LOG_DEBUG(
+      "[fused-diag] directives col[{}] phys={} dtype={} lane_ok={} plan_ok={} range_active={} "
+      "range=[{}, {}]",
+      i,
+      phys,
+      phys < table.columns.size() ? type_id_to_name(table.columns[phys].dtype) : "OUT-OF-RANGE",
+      verdict.lane_ok,
+      verdict.plan_ok,
+      out.ranges[i].active,
+      out.ranges[i].lo,
+      out.ranges[i].hi);
+    if (verdict.fusable()) {
       out.output_tiers[i] = decode_output_tier::tier_a;
       ++tier_a_columns;
     }
     if (!out.ranges[i].active) { continue; }
-    if (!fusable) {
+    if (!verdict.fusable()) {
       // A range conjunct this chunk cannot evaluate in-decode ⇒ the combined
       // mask would under-filter. Iteration 1 has no mixed-mask combine, so the
       // whole batch keeps today's decode-then-filter path.
       SIRIUS_LOG_DEBUG(
-        "[compression_converters] fused scan-filter disabled for this batch: range column "
-        "(selected pos {}, physical {}) is not a fusable bitpack leaf",
+        "[fused-diag] directives REFUSED: range column (selected pos {}, physical {}) is not a "
+        "fusable bitpack leaf (lane_ok={} plan_ok={}) — whole batch classic",
         i,
-        selected_columns[i]);
+        phys,
+        verdict.lane_ok,
+        verdict.plan_ok);
       return {};
     }
     out.ranges[i].participates_in_scan_mask = true;
@@ -468,8 +520,7 @@ fused_scan_directives build_fused_scan_directives(const simpatico::compressed_ta
 
   out.enabled = true;
   SIRIUS_LOG_DEBUG(
-    "[compression_converters] fused scan-filter directives: {} mask column(s), {} tier-A / {} "
-    "tier-B output column(s)",
+    "[fused-diag] directives ENABLED: {} mask column(s), {} tier-A / {} tier-B output column(s)",
     mask_columns,
     tier_a_columns,
     count - tier_a_columns);

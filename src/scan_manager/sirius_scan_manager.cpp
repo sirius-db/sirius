@@ -652,8 +652,8 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
           range_pushdown =
             build_range_pushdown(*assignment.entry, assignment.columns, extraction.ranges);
           SIRIUS_LOG_DEBUG(
-            "[sirius_scan_manager] fused scan-filter: {} range(s) extracted for entry '{}', {} "
-            "column(s) mapped",
+            "[sirius_scan_manager] fused scan-filter: {} range(s) extracted for entry '{}', "
+            "remap -> {} slot(s)",
             extraction.ranges.size(),
             assignment.entry_name,
             range_pushdown.size());

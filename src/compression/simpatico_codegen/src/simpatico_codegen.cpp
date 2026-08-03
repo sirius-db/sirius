@@ -319,51 +319,46 @@ std::unique_ptr<cudf::table> decompress_columns_parallel(compressed_table const&
 //           map (mask -> int32 row indices) is built on stream 0 concurrently.
 // Any missing precondition ⇒ std::nullopt, and the caller runs today's path
 // byte-identically (same kernels, same allocations, zero added syncs).
+//
+// Enable policy (measured on the M2/M3 A/B matrix):
+//   RULE 1 (static): every output column must decode tier-A compacted; any
+//           tierB output ⇒ classic path (tierB full-decode+gather lost
+//           17..328 ms/query). K1 filter sources are exempt and forced tierA.
+//   RULE 2 (dynamic): post-CNT, survivors/rows > SIRIUS_EXP_FUSED_SCAN_MAX_SEL
+//           (default 0.35) ⇒ bail to classic; masks dropped, batch not tagged
+//           ROW_FILTERED.
 
 bool fused_scan_filter_enabled()
 {
+  // Gate semantics shared with the scan-side extraction: set and not exactly
+  // "0" = on (cached; the gate check must stay cheap).
   static bool const enabled = [] {
     char const* v = std::getenv("SIRIUS_EXP_FUSED_SCAN_FILTER");
-    return v != nullptr && std::string_view{v} == "1";
+    return v != nullptr && std::string_view{v} != "0";
   }();
   return enabled;
 }
 
-// ── Wave-1 per-column entry point required from W3 (stubbed until published) ─
-// W1 published the FusedTree-level K1 launcher (launch_decode_fused_tree_mask_out,
-// codegen/decode/masked_launch.hpp), but the PlanTree -> FusedTree/LabeledBuffers
-// binding lives in plan/decompress.cpp (W3). Needed there (tracked in
-// scratchpad/fusebench/STATUS-W4.md):
-//
-//   // Wave 1 / K1: decode the root bitpack leaf fused with the inclusive
-//   // decoded-domain range -> mask.words; NO column output. Must write all 32
-//   // words of every 1024-row chunk (out-of-range lanes ballot to 0, so tail
-//   // bits are zero); mask.words holds AllocWordsFor(num_rows) words.
-//   bool decompress_column_selection_mask(PlanTree const& tree,
-//                                         sirius::codegen::range_predicate pred,
-//                                         sirius::codegen::selection_mask& mask,
-//                                         rmm::cuda_stream_view stream,
-//                                         rmm::device_async_resource_ref mr,
-//                                         std::string* error_out);
-//
-// Wave 2 needs no stub: it calls the published decompress_column(...,
-// decode_selection const* sel) (plan_interpreter.hpp; TierA = compact_capable,
-// TierB = full decode + in-call gather over survivor_indices).
-
-// Flip when W3's per-column K1 wrapper lands; false keeps the fused path
-// rejected in the preconditions (zero device work, no per-batch log spam).
-constexpr bool kSelectionMaskDecodeAvailable = false;
-
-bool fused_decompress_column_selection_mask(PlanTree const& /*tree*/,
-                                            sirius::codegen::range_predicate /*pred*/,
-                                            sirius::codegen::selection_mask& /*mask*/,
-                                            rmm::cuda_stream_view /*stream*/,
-                                            rmm::device_async_resource_ref /*mr*/,
-                                            std::string* error_out)
+// RULE 2 threshold: bail out of the fused path after CNT when
+// survivors/rows exceeds this (masks dropped, classic decode, batch NOT
+// ROW_FILTERED). Measured: wins at sel <= .152, losses by .526; K3 ~ K0 at .5.
+double fused_scan_max_selectivity()
 {
-  if (error_out) *error_out = "K1 selection-mask decode not published yet (W3 wrapper over W1)";
-  return false;
+  static double const threshold = [] {
+    char const* v = std::getenv("SIRIUS_EXP_FUSED_SCAN_MAX_SEL");
+    if (v == nullptr || *v == '\0') return 0.35;
+    char* end      = nullptr;
+    double const d = std::strtod(v, &end);
+    return (end != v && d > 0.0) ? d : 0.35;
+  }();
+  return threshold;
 }
+
+// Wave-1 K1 + the TierA/filter probe come from W3's published entry points in
+// plan/decompress.cpp (plan_interpreter.hpp:148/157): plan_supports_selection_decode
+// + decompress_column_selection_mask. Wave 2 calls the published
+// decompress_column(..., decode_selection const* sel) (TierA = compact_capable,
+// TierB = full decode + in-call gather over survivor_indices).
 
 // RAII CUDA events for the wave-1 -> combine cross-stream join.
 struct event_set {
@@ -401,24 +396,47 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
 {
   namespace sc = sirius::codegen;
 
-  // Preconditions — all checked before touching the device.
-  if (!fused_scan_filter_enabled()) return std::nullopt;
-  if (!kSelectionMaskDecodeAvailable) return std::nullopt;  // W3 K1 wrapper pending
-  if (request.filters.empty()) return std::nullopt;
-  if (request.tiers.size() != selected.size()) return std::nullopt;
-  if (pool.streams.empty()) return std::nullopt;
+  // Preconditions — all checked before touching the device. A refusal is a
+  // normal-path decision (the caller silently runs today's byte-identical
+  // decode), not an error.
+  auto refuse = [](char const* /*why*/) { return std::nullopt; };
+  if (!fused_scan_filter_enabled()) return refuse("env gate off");
+  if (request.filters.empty()) return refuse("request.filters empty (no directives)");
+  if (request.tiers.size() != selected.size())
+    return refuse("request.tiers not parallel to selected");
+  if (pool.streams.empty()) return refuse("stream pool empty");
   int64_t const num_rows = table.num_rows();
-  if (num_rows <= 0) return std::nullopt;
-  if (num_rows > std::numeric_limits<std::int32_t>::max()) return std::nullopt;
-  if (request.filters.size() > 8) return std::nullopt;  // combine_masks_and limit
+  if (num_rows <= 0) return refuse("num_rows <= 0");
+  if (num_rows > std::numeric_limits<std::int32_t>::max())
+    return refuse("num_rows > INT32_MAX (int32 row indices)");
+  if (request.filters.size() > 8) return refuse("more than 8 filter conjuncts");
   for (auto const idx : selected) {
-    if (idx >= table.columns.size()) return std::nullopt;
+    if (idx >= table.columns.size()) return refuse("selected column index out of range");
     auto const& col = table.columns[idx];
-    if (!col.plan_tree || col.num_rows != num_rows) return std::nullopt;
+    if (!col.plan_tree || col.num_rows != num_rows)
+      return refuse("selected column missing plan_tree or row-count mismatch");
   }
   for (auto const& f : request.filters) {
-    if (f.column >= selected.size()) return std::nullopt;
-    if (f.pred.lo > f.pred.hi) return std::nullopt;  // empty range: let the engine filter
+    if (f.column >= selected.size()) return refuse("filter directive column out of range");
+    if (f.pred.lo > f.pred.hi) return refuse("empty predicate range (lo > hi)");
+    if (!plan_supports_selection_decode(*table.columns[selected[f.column]].plan_tree))
+      return refuse("filter column plan not selection-decodable (non-bitpack root)");
+  }
+
+  // RULE 1 (static, zero-cost): fused only when EVERY output column decodes
+  // tier-A compacted. A tierB output (full decode + gather) is strictly more
+  // work than classic's single post-filter compaction — measured q1 +43.5%,
+  // q5 +6.2% vs the all-tierA winners (q6 -51.7%, q14/-33.2%, q15/-32.6%,
+  // q20/-20.6%). K1 filter-source columns are exempt from the tag check
+  // (probed selection-decodable above) and forced tier_a.
+  std::vector<sc::output_tier> tiers(request.tiers.begin(), request.tiers.end());
+  for (auto const& f : request.filters)
+    tiers[f.column] = sc::output_tier::tier_a;
+  for (size_t i = 0; i < selected.size(); ++i) {
+    if (tiers[i] != sc::output_tier::tier_a)
+      return refuse("RULE1: tierB-tagged output column (classic path is faster)");
+    if (!plan_supports_selection_decode(*table.columns[selected[i]].plan_tree))
+      return refuse("RULE1: output column not selection-decodable (would need tierB)");
   }
 
   // Declared before the try so the mid-flight catch can pool.sync_all() BEFORE
@@ -462,10 +480,8 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
       }
       auto const& directive = request.filters[f];
       auto const& col       = table.columns[selected[directive.column]];
-      sc::selection_mask fmask{dst, num_rows, -1, nullptr};
       std::string err;
-      if (!fused_decompress_column_selection_mask(
-            *col.plan_tree, directive.pred, fmask, stream, mr, &err)) {
+      if (!decompress_column_selection_mask(*col.plan_tree, directive.pred, dst, stream, mr, &err)) {
         throw plan_error(err.empty() ? "fused scan-filter: K1 mask decode failed" : err);
       }
       if (f > 0 && stream.value() != s0.value()) {
@@ -490,10 +506,25 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
     result.survivor_count = sel.survivor_count;
     per_filter.clear();
 
+    // RULE 2 (dynamic, post-CNT guard): above the selectivity threshold the
+    // compacted decode has no measured win (K3 ~ K0 at sel .5) — abandon wave
+    // 2 via the mid-flight machinery below (sync, drop masks, classic decode;
+    // batch NOT tagged ROW_FILTERED, post-filter runs as today). The wasted
+    // K1+CNT is ~1 ms/batch insurance.
+    double const sel_frac =
+      static_cast<double>(sel.survivor_count) / static_cast<double>(num_rows);
+    if (sel_frac > fused_scan_max_selectivity()) {
+      throw plan_error("selectivity " + std::to_string(sel_frac) +
+                       " above SIRIUS_EXP_FUSED_SCAN_MAX_SEL " +
+                       std::to_string(fused_scan_max_selectivity()));
+    }
+
     // ── TierB gather map on stream 0, overlapping wave 2 (column 0's wave-2
     // work serializes behind it on s0; the other streams run free). Built ONCE
     // per batch; the same view is handed to every TierB column (W3 contract).
-    result.tiers.assign(request.tiers.begin(), request.tiers.end());
+    // Under RULE 1 every tier is tier_a, so this stays dormant until the
+    // policy loosens (iteration 2 mixed-tier batches).
+    result.tiers = tiers;
     bool any_tier_b = false;
     for (auto const t : result.tiers)
       any_tier_b |= t == sc::output_tier::tier_b;
@@ -507,6 +538,16 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
                                            result.row_indices.data(),
                                            nullptr,
                                            0};
+      // TierB gathers run on the other pool streams; order them after the
+      // indices kernel on s0 with a device-side wait (streams are FIFO, so one
+      // up-front wait per stream covers every wave-2 launch on it).
+      cudaEvent_t ev_idx = join_events.make();
+      if (cudaEventRecord(ev_idx, s0.value()) != cudaSuccess)
+        throw plan_error("fused scan-filter: indices event record failed");
+      for (size_t si = 1; si < n_streams; ++si) {
+        if (cudaStreamWaitEvent(pool.streams[si], ev_idx, 0) != cudaSuccess)
+          throw plan_error("fused scan-filter: indices stream wait failed");
+      }
     }
 
     // ── Wave 2: TierA compacted (compact_capable) + TierB full-decode+gather,
@@ -534,7 +575,7 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
     return cols;
   } catch (std::exception const& e) {
     std::fprintf(stderr,
-                 "simpatico: fused scan-filter failed (%s); retrying the batch unfused\n",
+                 "simpatico: fused scan-filter fell back to the classic decode (%s)\n",
                  e.what());
     pool.sync_all();  // quiesce in-flight wave kernels before buffers unwind
     result = sirius::codegen::scan_filter_result{};
@@ -740,7 +781,8 @@ std::vector<std::unique_ptr<cudf::column>> decompress_scan_filter(
   if (auto cols = try_decompress_fused(table, selected_columns, request, result, pool, mr)) {
     return std::move(*cols);
   }
-  // Gate off / no directives / precondition failed: exactly today's path.
+  // Gate off / no directives / policy refusal / mid-flight fallback: exactly
+  // today's path.
   return decompress_columns_parallel(table, selected_columns, pool, mr)->release();
 }
 
