@@ -654,6 +654,53 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     CHECK(collect(plan.get(), SiriusPhysicalOperatorType::DYNAMIC_FILTER).empty());
   }
 
+  SECTION("unfiltered aggregate build: derived evidence wires the scan route")
+  {
+    // No predicate appears anywhere in the build subtree, so the aggregate is the only derivation
+    // marker arming discovery. The wiring must otherwise match the filtered-build section.
+    dynamic_filter_switch_guard switch_on(*con, /*enabled=*/true);
+    auto plan = generate_sirius_plan(*con,
+                                     "SELECT * FROM big_left l JOIN "
+                                     "(SELECT rid, count(*) c FROM small_right GROUP BY rid) r "
+                                     "ON l.id = r.rid",
+                                     keep_shape);
+    INFO(tree_to_string(plan.get()));
+
+    auto endpoints = collect(plan.get(), SiriusPhysicalOperatorType::DYNAMIC_FILTER);
+    REQUIRE(endpoints.size() == 1);
+    REQUIRE(endpoints.front()->children.size() == 1);
+    CHECK(endpoints.front()->children[0]->type == SiriusPhysicalOperatorType::GPU_SCAN);
+
+    auto* hj = find_first(plan.get(), SiriusPhysicalOperatorType::HASH_JOIN);
+    REQUIRE(hj != nullptr);
+    CHECK(contains(hj->children[0].get(), endpoints.front()));
+
+    require_parent_links(plan.get(), /*expected_parent=*/nullptr);
+  }
+
+  SECTION("unfiltered join-output build: derived evidence wires the scan route")
+  {
+    // The same rule through a different marker: the build is a join output with no predicate
+    // anywhere below it.
+    dynamic_filter_switch_guard switch_on(*con, /*enabled=*/true);
+    auto plan = generate_sirius_plan(*con,
+                                     "SELECT * FROM big_left l JOIN "
+                                     "(SELECT r.rid FROM small_right r JOIN small_c c "
+                                     " ON r.other = c.ckey) j "
+                                     "ON l.id = j.rid",
+                                     keep_shape);
+    INFO(tree_to_string(plan.get()));
+
+    auto* hj = find_first(plan.get(), SiriusPhysicalOperatorType::HASH_JOIN);
+    REQUIRE(hj != nullptr);
+    auto endpoints = collect(hj->children[0].get(), SiriusPhysicalOperatorType::DYNAMIC_FILTER);
+    REQUIRE(endpoints.size() == 1);
+    REQUIRE(endpoints.front()->children.size() == 1);
+    CHECK(endpoints.front()->children[0]->type == SiriusPhysicalOperatorType::GPU_SCAN);
+
+    require_parent_links(plan.get(), /*expected_parent=*/nullptr);
+  }
+
   SECTION(
     "a LIMIT between the join and the scan: the endpoint stays above the LIMIT, the scan "
     "stays bare")

@@ -74,6 +74,7 @@ std::vector<std::vector<std::string>> run_on_gpu(duckdb::Connection& con, const 
 struct publication_deltas {
   std::uint64_t producers_enabled        = 0;
   std::uint64_t membership_filters_built = 0;
+  std::uint64_t publications_finished    = 0;
   std::uint64_t filters_pushed           = 0;
 };
 
@@ -92,6 +93,7 @@ publication_deltas run_and_measure(duckdb::Connection& con,
   return publication_deltas{
     .producers_enabled        = after.producers_enabled - before.producers_enabled,
     .membership_filters_built = after.membership_filters_built - before.membership_filters_built,
+    .publications_finished    = after.publications_finished - before.publications_finished,
     .filters_pushed           = after.filters_pushed - before.filters_pushed};
 }
 
@@ -205,6 +207,40 @@ TEST_CASE("gpu_execution - derived-build and build-block routes preserve results
                                       "JOIN orders o ON l.l_orderkey = o.o_orderkey "
                                       "JOIN customer c ON o.o_custkey = c.c_custkey "
                                       "WHERE c.c_phone = '25-000-000-0000'");
+  }
+
+  SECTION("a single-partition MIXED_JOIN publishes through the partition fold")
+  {
+    // An equality plus an inequality condition puts the join in MIXED_JOIN mode, which
+    // compute_hash_join_partition_strategy excludes from BUILD_PROBE. Such a join could not
+    // publish at all until the PARTITION started folding a single-partition build for any
+    // publishing join.
+    sirius::test::coverage_gate_disable_guard gate_off(con);
+    auto const deltas = require_switch_result_equivalence(
+      con,
+      "select count(*) from orders o "
+      "join (select l_orderkey, l_shipdate from lineitem "
+      "      where l_shipdate < date '1992-02-01') l "
+      "on o.o_orderkey = l.l_orderkey and o.o_orderdate < l.l_shipdate");
+
+    REQUIRE(deltas.on.producers_enabled > deltas.off.producers_enabled);
+    REQUIRE(deltas.on.publications_finished > deltas.off.publications_finished);
+    REQUIRE(deltas.on.filters_pushed > deltas.off.filters_pushed);
+  }
+
+  SECTION("an unfiltered aggregate build supplies derived evidence")
+  {
+    // No predicate appears anywhere in the build subtree, so only the derivation marker on the
+    // aggregate arms discovery. The join order is pinned so the aggregate stays the build side.
+    sirius::test::disabled_optimizers_guard shape(con, "join_order,build_side_probe_side");
+    sirius::test::coverage_gate_disable_guard gate_off(con);
+    auto const deltas = require_switch_result_equivalence(
+      con,
+      "select count(*) from lineitem l "
+      "join (select l_orderkey from lineitem group by l_orderkey) g "
+      "on l.l_orderkey = g.l_orderkey");
+
+    REQUIRE(deltas.on.producers_enabled > deltas.off.producers_enabled);
   }
 
   SECTION("TPC-H q17: a delim-scan build wires only through derived-build evidence")
