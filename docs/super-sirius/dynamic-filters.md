@@ -4,7 +4,7 @@ A **dynamic filter** is a predicate that is computed at query runtime by one ope
 
 This is a category, not a single feature. It spans:
 
-- **Dynamic table-filter pushdown** — an eligible `BUILD_PROBE` hash-join build pushes runtime membership filters into a downstream GPU scan (parquet or duckdb-native); an optional zone-map can additionally prune parquet row groups against the actual build-side key range. It is a pure optimization — redundant with the join, so it never changes results. Membership pushdown is **on by default**; zone maps are off by default.
+- **Dynamic table-filter pushdown** — an eligible hash-join build pushes runtime membership filters into a downstream GPU scan (parquet or duckdb-native); an optional zone-map can additionally prune parquet row groups against the actual build-side key range. It is a pure optimization — redundant with the join, so it never changes results. Membership pushdown is **on by default**; zone maps are off by default.
 - **Sideways information passing (SIP)** — a hash-join build applies its membership filter inside its own probe subtree, as deep as the key stays a faithful pass-through, so intervening operators also skip rows the join would discard. Controlled by `enable_dynamic_filter`.
 - **Aggregation-driven pushdown** — a `GROUP BY` or `DISTINCT` exposes its distinct-value set to downstream consumers.
 - **Sort- or top-N-driven pruning** — a post-sort min/max is exact and free; a top-N's current threshold tightens upstream filters.
@@ -20,7 +20,7 @@ The framework has four axes of generality. Each phase opens one axis:
 |------|---------|---------|---------|---------|
 | Filter kind | zone map + Bloom + IN-list | (reuses Phase 1's filter zoo) | (reuses) | (reuses) |
 | Consumer kind | parquet reader + post-decode scan operator (parquet + duckdb-native) | + membership endpoint spliced into the producer's own probe subtree | + any operator with a column input | (unchanged) |
-| Producer kind | `BUILD_PROBE` hash-join build only | (unchanged) | + agg, sort, filter | (unchanged) |
+| Producer kind | hash-join build (any join mode) whose build arrives whole | (unchanged) | + agg, sort, filter | (unchanged) |
 | Coordination | single-shot build-port publication; direct probes ordered, transitive scan targets opportunistic | deterministic under the active task strategy; opportunistic under lookahead | (unchanged) | streaming / incremental refinement |
 
 Anything implemented in Phase 1 is reused unchanged by later phases. We do not replace DuckDB's static table-filter pushdown — static filters continue to flow through the existing translator path and are AND-merged with dynamic filters at the consumer.
@@ -148,7 +148,7 @@ flowchart TB
     ADMIT["key admission<br/>dense admitted keys"]
     DISCOVERY["target discovery<br/>one trace per admitted key"]
     PLAN["immutable dynamic_filter_publish_plan"]
-    JOIN["BUILD_PROBE hash join"]
+    JOIN["hash join (build arrives whole)"]
     POLICY["source policy<br/>gate + representation"]
     PUB["publisher<br/>construct + replicate + fan out"]
     CHANNEL["append-only filter channel"]
@@ -246,7 +246,7 @@ This is an ordering property of the producing join's **immediate** probe edge, n
 sequenceDiagram
     participant B as Build GPU_SCAN / PARTITION
     participant C as Build CONCAT (concat_all)
-    participant J as BUILD_PROBE hash join
+    participant J as Hash join (build arrives whole)
     participant R as Device replica spaces
     participant F as Dynamic-filter channel(s)
     participant T as task_creator
@@ -361,9 +361,9 @@ flowchart TB
 
 ## Phase 1 — Dynamic table-filter pushdown
 
-**Goal:** establish the framework end-to-end against a single (producer, consumer) pair — `BUILD_PROBE` hash-join build → GPU scan (parquet and duckdb-native) — and exercise filter-kind polymorphism via progressively richer filters.
+**Goal:** establish the framework end-to-end against a single (producer, consumer) pair — hash-join build → GPU scan (parquet and duckdb-native) — and exercise filter-kind polymorphism via progressively richer filters.
 
-**Producer:** `BUILD_PROBE` hash-join build side.
+**Producer:** hash-join build side, in any join mode, whose build port delivers the whole build side as one batch.
 **Consumer:** GPU scan — parquet (`parquet_gpu_ingestible`: reader zone-map + post-decode operator) and duckdb-native (post-decode operator only).
 **Routing:** Sirius-owned discovery (a walk over the built probe subtree binds each admitted key into the scan its trace bottoms out at).
 **Coordination:** synchronous build-side CONCAT publication strictly precedes the producing join's immediate probe data scan; transitive scan targets remain nonblocking and race publication under normal scheduler order.
@@ -390,7 +390,16 @@ The normal path is deliberately ordered:
 4. The hook acquires the batch's read-only accessor before routing it — once deposited into a repository the batch becomes a downgrade candidate, and the shared lock pins its GPU representation until publication completes. It then waits for the representation's writer event, claims `OPEN -> PUBLISHING`, constructs the selected filters, completes device replication, pushes the immutable filters into every accepting channel, and stores `FINISHED` before returning.
 5. Only after the CONCAT task returns does downstream task creation ask the join for its next hint and follow `WAITING_FOR_INPUT_DATA` into the immediate probe producer. A scan on that edge therefore cannot run while normal build-port publication is in progress.
 
-The publish gate admits two `BUILD_PROBE` shapes where one partition's build batch is the complete build side: a **single partition** (`_partition_build_states.size() == 1`), and a **broadcast** join (`_broadcast`), where the small build table is replicated to every GPU so each partition's `concat_all`-folded batch is the full build. Under broadcast there is one build CONCAT per GPU, each racing the build-port hook; the `OPEN -> PUBLISHING` compare-exchange in `publish_dynamic_filters` selects exactly one publisher (the first to arrive), while the rest return at the CAS before constructing anything. A genuinely hash-partitioned (non-broadcast) multi-partition build keeps pushdown disabled, because each partition holds only a slice of the build keys and no single batch could emit a complete filter (cross-partition aggregation is a future extension). The gate is `(_partition_build_states.size() == 1 || _broadcast)` in `sirius_physical_hash_join::push_data_batch_partitioned`.
+The publish gate is `OPEN && _dynamic_filter_plan.enabled() && _build_arrives_whole` in `sirius_physical_hash_join::push_data_batch_partitioned`. Because the publisher is one-shot, the batch it claims must carry the whole build side: a filter built from a slice of the key set would drop probe rows that do in fact join. The join mode is deliberately not part of the condition — a single-partition STANDARD or MIXED_JOIN build publishes on the same terms as a `BUILD_PROBE` one.
+
+`sirius_physical_partition` owns that judgement and reports it at sizing time through `set_build_arrives_whole`, in two cases:
+
+- **`BUILD_PROBE`** — whole iff `num_partitions == 1 || broadcast`. Under broadcast the small build table is replicated to every GPU, so each partition's `concat_all`-folded batch is the full build.
+- **Any other mode** — a build-side sizing decision that lands in one partition, for a join whose `publishes_dynamic_filters()` is true. The PARTITION then enables build-side `concat_all` on itself or its sibling; the build arrives whole only if such a CONCAT was found, so this is best effort. The canonical client is the **`MIXED_JOIN`** (equality plus inequality conditions), which `compute_hash_join_partition_strategy` excludes from `BUILD_PROBE` and which therefore could not publish at all before. Full-outer joins and builds too large for the hash-table budget reach it the same way. Build-side sizing is a real precondition, not a formality: right-family joins are sized by their probe partition, where one partition says nothing about the build's size, so they remain non-publishers.
+
+Under broadcast there is one build CONCAT per GPU, each racing the build-port hook; the `OPEN -> PUBLISHING` compare-exchange in `publish_dynamic_filters` selects exactly one publisher (the first to arrive), while the rest return at the CAS before constructing anything. A genuinely hash-partitioned (non-broadcast) multi-partition build keeps pushdown disabled, because each partition holds only a slice of the build keys and no single batch could emit a complete filter (cross-partition aggregation is a future extension).
+
+A wired join whose build cannot arrive whole would otherwise publish nothing silently, so the first build delivery that observes the condition logs a `dynamic filter NOT published` diagnostic naming the join mode, and increments `publications_skipped_build_not_whole`. Both fire **once per join**: `_build_arrives_whole` is fixed before the first delivery, so every later build batch of the same join would repeat the same fact.
 
 That sequence does not gate a scan reached transitively through an intervening join. Those targets
 run under normal locality-aware dispatch and may observe no filter, a partial fan-out, or the
@@ -475,7 +484,9 @@ Set `dynamic_filter_domain_coverage_threshold` above 1.0 to disable the coverage
 
 #### Observability
 
-`SiriusContext` owns connection-lifetime cumulative counters, read through `get_dynamic_filter_stats_snapshot()`; tests take before/after snapshots around a query. The counters split into three families and the split is a contract. `producers_enabled` stands alone as a **plan-time fact**: the hash-join constructor increments it on receiving an enabled plan, before execution begins, so nothing races it and it is the one counter that may anchor an exact equality. It is also an honest capability signal: discovery creates a target only when a key actually binds, so an enabled producer always has at least one bound key and a publication attempt that can push. The **policy-decision** family (`keys_considered`, `keys_with_known_domain`, `keys_skipped_domain_gate`, `keys_skipped_type_mismatch`, `keys_build_exceeded_domain`, filters built) is deterministic for attempts that reach per-key processing, and is the anchor for gate regressions. The **delivery** family (attempts, finished/failed, source-not-resident, targets-drained, `filters_pushed`) races probe-side draining and target liveness: assert it as deltas or directions, never as an equality anchor. `keys_with_known_domain` means only that nonzero row evidence exists -- uniqueness is separate, so the counter alone does not mean the gate was armed.
+`SiriusContext` owns connection-lifetime cumulative counters, read through `get_dynamic_filter_stats_snapshot()`; tests take before/after snapshots around a query. The counters split into three families and the split is a contract. `producers_enabled` stands alone as a **plan-time fact**: the hash-join constructor increments it on receiving an enabled plan, before execution begins, so nothing races it and it is the one counter that may anchor an exact equality. It is also an honest capability signal: discovery creates a target only when a key actually binds, so an enabled producer always has at least one bound key and a publication attempt that can push. The **policy-decision** family (`keys_considered`, `keys_with_known_domain`, `keys_skipped_domain_gate`, `keys_skipped_type_mismatch`, `keys_build_exceeded_domain`, filters built) is deterministic for attempts that reach per-key processing, and is the anchor for gate regressions. The **delivery** family (attempts, finished/failed, source-not-resident, build-not-whole, targets-drained, `filters_pushed`) races probe-side draining and target liveness: assert it as deltas or directions, never as an equality anchor. `keys_with_known_domain` means only that nonzero row evidence exists -- uniqueness is separate, so the counter alone does not mean the gate was armed.
+
+`publications_skipped_build_not_whole` is the delivery family's one per-join counter: a wired join whose build never arrives as one whole batch can never claim its publication window, and it is counted once, at the first build delivery that observes the condition. It closes the accounting for an enabled producer, which reaches exactly one of three ends: `producers_enabled` accounts for `publication_attempts + publications_skipped_build_not_whole + publications_skipped_source_not_resident`. The identity is approximate because a query can finish before a join receives any build batch at all.
 
 #### Ready replicas and per-split snapshots
 
@@ -511,11 +522,13 @@ For both representations, the constructor enqueues creation of an owned source r
 
 **Goal:** generalize the *consumer* axis to reach keys no scan can filter. Phase 1 can only prune at a GPU scan the probe-spine trace bottoms out at. Phase 2 places a membership endpoint **inside the producing join's own probe subtree**, at the deepest operator where the probe key is still the same value-preserving column.
 
-**Producer:** `BUILD_PROBE` hash-join build (unchanged).
+**Producer:** hash-join build (unchanged).
 **Consumer (new placement):** `sirius_physical_dynamic_filter` in `membership_masks_only` mode, spliced into the producer's probe subtree — the same operator Phase 1 puts above a scan, in a new position. No new operator, no new filter kind, no new code path inside the hash-join probe.
-**Routing:** one trace serves both routes, and a scan bind wins. Either evidence predicate can arm discovery. A projected `DELIM_GET` or `CTE_REF` build supplies derived evidence even without a visible filter; an unfiltered base-table image supplies neither. A GPU-scan terminal binds to the scan. Any other terminal may receive a join-edge endpoint after direct-route admission.
+**Routing:** one trace serves both routes, and a scan bind wins. Either evidence predicate can arm discovery. A derived build supplies evidence even without a visible filter; an unfiltered base-table image supplies neither. A GPU-scan terminal binds to the scan. Any other terminal may receive a join-edge endpoint after direct-route admission.
 
-The derived classifier is structural, not a selectivity proof. An unfiltered correlation domain or bare-copy `MATERIALIZED` CTE can produce a membership filter that keeps every row; keep-ratio gates suppress its later mask work, while the authoritative join preserves results. Sirius can therefore admit `DELIM_GET` scan bindings when DuckDB's `build_side_has_filter` is false.
+`build_relation_is_derived` calls a build derived when its subtree contains a **derivation marker** anywhere below the root, recursing through every other operator. A marker is either a childless derived leaf (`DELIM_GET`, `CTE_REF`) or a reducing operator (comparison / any / delim join, grouped aggregate, distinct, intersect, except). `UNION` is deliberately not a marker, because it does not reduce its inputs' key sets. The reason the rule is not "does a predicate appear below this build" is that "unfiltered" implies "whole key domain" only for a base-table image. A derived relation's key set is already a subset of the domain — a join output carries only the keys that survived, an aggregate collapses to its groups — so the plan cannot rule its filter out and the runtime decides its worth instead. Sirius can therefore admit `DELIM_GET` scan bindings when DuckDB's `build_side_has_filter` is false.
+
+The classifier is structural, not a selectivity proof, and it has a known false-positive class: the **cardinality-preserving enrichment join**, a build that joins a table to a dimension on that dimension's key. It is structurally derived, yet it emits every key its larger input held. Two gates contain that case. The build-key domain-coverage gate skips such a key at publication time, before any membership structure is built — the domain walk descends through joins to the underlying scan, so the enrichment join's key still resolves to its base domain. The consumer-side keep-ratio gates then measure what an applied filter keeps and suppress its later mask work. The same containment covers an unfiltered correlation domain or a bare-copy `MATERIALIZED` CTE. In every case the authoritative join preserves results.
 
 **Flag:** the join-edge route uses `enable_dynamic_filter`; it has no separate switch.
 
@@ -587,13 +600,14 @@ Which test pins which contract, so a change to one knows where its guard lives:
 | Test | Contract it pins |
 |---|---|
 | `test/cpp/planner/test_build_key_domain.cpp` | The lineage walk admits only shapes whose rows are an injective image of the traced child's, and refuses everything else with domain 0 |
-| `test/cpp/planner/test_build_filter_evidence.cpp` | The filter-evidence predicate mirrors DuckDB's `IsFiltering` (GET-with-filters, FILTER, TOP_N, any-subtree); the derived-build classifier admits exactly (projected) delim scans and CTE references, root-down, and refuses aggregate-, join-, and scan-rooted builds |
+| `test/cpp/planner/test_build_filter_evidence.cpp` | The filter-evidence predicate mirrors DuckDB's `IsFiltering` (GET-with-filters, FILTER, TOP_N, any-subtree); the derived-build classifier fires on a derivation marker anywhere in the subtree, admits neither `UNION` nor a row-preserving operator over a base table, and never calls a base-table image derived |
 | `test/cpp/planner/test_dynamic_filter_key_admission.cpp` | Admission is Sirius-owned and reads the conditions alone; the coordinate spaces stay distinct; only `equal` with a probe-side reference is admitted |
 | `test/cpp/planner/test_dynamic_filter_target_discovery.cpp` | The discovery rules: which hop each operator kind accepts (FILTER and UNION fan-out included), how the traced ordinal is remapped, the SIP policy bit, the producer join-type gate, and that trace and splice agree |
 | `test/cpp/planner/test_dynamic_filter_discovery_parity.cpp` | Per-key parity with DuckDB's own `GetPushdownFilterTargets`, with every conservative divergence (LIMIT, TOP_N, cast crossing, joint-bail) asserted on BOTH sides |
 | `test/cpp/operator/test_dynamic_filter_source_policy.cpp` | Membership-representation selection and both publication gates, as pure functions with no device |
 | `test/cpp/operator/test_dynamic_filter_publisher.cpp` | Publication builds filters only for bound keys, fans out sparsely along bindings, and keeps zone maps out of membership-only targets |
+| `test/cpp/operator/test_dynamic_filter_publication_claim.cpp` | The build-port claim reads only `_build_arrives_whole`, not the join mode, and a wired join that can never claim is counted and logged once |
 | `test/cpp/planner/test_plan_tree_shape.cpp` | Where the endpoint sits in the finished plan tree, including on a join's build input, and that no endpoint appears when a guard rejects the key |
 | `test/cpp/pipeline/test_pipeline_dynamic_filter_native_shape.cpp` | Every endpoint is fed pipelineable data, never a PARTITION's output, on both routes |
 | `test/cpp/integration/test_gpu_execution_dynamic_filter_native.cpp` | Scan-route results match CPU exactly, and the coverage gate fires and stays quiet where it should |
-| `test/cpp/integration/test_gpu_execution_dynamic_filter_sip.cpp` | Derived-build and join-edge placements change no result row, and the publication counters show the routes are not inert |
+| `test/cpp/integration/test_gpu_execution_dynamic_filter_sip.cpp` | Derived-build and join-edge placements change no result row, and the publication counters show the routes are not inert; a single-partition right join publishes through the partition fold, and an unfiltered aggregate build arms discovery |
