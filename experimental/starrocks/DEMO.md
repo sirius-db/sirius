@@ -7,32 +7,42 @@ This branch is `dev` plus the repository-backed streaming work
 ([`docs/super-sirius/streaming-sessions.md`](../../docs/super-sirius/streaming-sessions.md))
 plus this multi-fragment compute node.
 
-## What this does and does not exercise
+## What this exercises
 
-The compute node coordinates fragments the way it does today: `LocalExchange` is a
-receiver-first rendezvous that buffers each sender's **fully materialized** Arrow result and
-writes it to a temporary parquet file the receiver re-scans as a `local_files` scan.
+**A fragment's output crosses the exchange boundary as native `cucascade::data_batch` handles.**
+It is never converted to Arrow, never written to a file, and never copied: the sender's rows stay
+in GPU memory, parked in the engine's output repository, and the receiver's `STREAMING_SOURCE`
+takes them from there. Each mechanism the earlier compute node used to relay data has been
+replaced by the streaming primitive it was staged for:
 
-The streaming primitives in this branch — `STREAMING_SOURCE`, `STREAMING_SINK`,
-`exec::streaming_fragment`, `exec::stream_session` — are **built into the engine and unit-tested,
-but not yet wired into this compute node**. The cxx-FFI boundary that reaches them
-(`sirius::ffi::Fragment`) landed in the previous part of this stack; wiring the compute node onto
-it is the next part, and it is a seam swap rather than a rewrite: each primitive replaces exactly
-one mechanism here.
-
-| Compute-node mechanism today | Streaming replacement |
+| Was | Is |
 |---|---|
-| `ExchangeFile` temp parquet + `local_files` re-scan | `push(stream_id, batch)` → source repository, native |
-| `ExchangeOutput` (the whole result) | incremental native `data_batch` push |
-| `LocalExchange` rendezvous (expected sender **count**) | the streaming source's expected sender **set** + the `stream_session` registry |
-| `ExchangeKey{fragment_instance_id, node_id}` | the direction-separated input `stream_id` |
-| `per_exch_num_senders` + `exec.sender_id` | the source's expected sender set |
-| `exec.destinations` | one sink partition per destination + the wrapper's routing table |
-| `FragmentExecutor::execute → FragmentResult` (sync) | build session + submit; `push`/`pull` over cxx-FFI |
-| `ResultStore` + `fetch_data` | root `STREAMING_SINK` + `pull`/`wait`/`drained` |
+| `ExchangeFile` temp parquet + `local_files` re-scan | `Fragment::relay_from` — a pointer move between two live fragments |
+| `ExchangeOutput` (a whole materialized Arrow result) | native `data_batch` handles, parked on the GPU |
+| The receiver's `EXCHANGE_NODE` lowered to a file read | lowered to a read of `sirius_stream_<node_id>` |
+| `FragmentExecutor::execute → FragmentResult` per fragment | `FragmentExecutor::run`; only a *result* fragment produces Arrow |
+| `LocalExchange` buffering sender data | `LocalExchange` tracking only *which* senders have produced |
 
-So: this demo proves the cluster runs the query correctly on the engine that carries the new
-primitives. It does not yet prove the query flows *through* them.
+`ExchangeFile` is deleted, which is what makes a correct answer evidence rather than coincidence:
+with the temp-parquet path physically gone, the rows can only have crossed as native batches.
+`grep -r ExchangeFile experimental/` finds nothing but this file, and no file appears under
+`$TMPDIR/sirius-starrocks-cn` during a run.
+
+The CN logs each boundary it crosses:
+
+```
+INFO sirius_starrocks_cn::engine: relayed native batches across a fragment boundary
+     stream_id=2 sender_id=0 batches=1
+```
+
+### What it does not exercise yet
+
+- **One destination per sender.** A gather exchange only. Fan-out needs the partitioned sink
+  (#838); a sender with several destinations is refused rather than silently under-delivering.
+- **Sequential fragments.** The engine serializes queries, so a sender runs to completion before
+  its receiver starts. Concurrency needs per-query lifecycle isolation.
+- **A pre-filled stream.** Senders finish before the receiver is built, so the live producer path
+  — a push arriving while the receiver runs — is still untested here.
 
 ## Running it
 
@@ -75,7 +85,25 @@ WHERE l_shipdate >= date '1997-01-01'
   AND l_quantity < 24;
 ```
 
-Point `path` at whatever TPC-H `lineitem` parquet you have.
+Point `path` at whatever TPC-H `lineitem` parquet you have. On TPC-H SF1 that query returns
+
+```
+revenue
+61567694.95019999
+```
+
+which matches DuckDB on CPU over the same file (`61567694.9502`).
+
+A `GROUP BY` is worth running too — it plans two exchanges rather than one, so the CN logs two
+boundary crossings for a single query:
+
+```sql
+WITH lineitem AS (SELECT * FROM FILES(
+  "path"="file:///home/ubuntu/git/sirius/scratch/tpch_sf1/lineitem/part.0.parquet",
+  "format"="parquet"))
+SELECT l_returnflag, count(*) AS n, sum(l_quantity) AS qty
+FROM lineitem GROUP BY l_returnflag ORDER BY l_returnflag;
+```
 
 ## The pre-packaged front end
 

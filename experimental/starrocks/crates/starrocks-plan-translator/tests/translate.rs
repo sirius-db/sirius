@@ -2506,7 +2506,7 @@ fn nestloop_join_translates_to_filtered_cross_rel() {
     );
 }
 
-/// Verifies an exchange node without a materialized input is rejected.
+/// Verifies an exchange node with no bound input stream is rejected.
 #[test]
 fn exchange_node_is_rejected() {
     let mut exchange = base_plan_node(1, TPlanNodeType::EXCHANGE_NODE, 0, vec![0]);
@@ -2533,9 +2533,11 @@ fn exchange_node_is_rejected() {
     ));
 }
 
-/// Verifies a materialized exchange becomes the read below the receiver aggregate.
+/// Verifies a bound exchange becomes a stream read below the receiver aggregate -- and that no
+/// file appears anywhere in the plan, which is what makes the boundary native rather than a
+/// parquet round-trip.
 #[test]
-fn materialized_exchange_feeds_aggregate() {
+fn bound_exchange_feeds_aggregate_from_a_stream() {
     let mut exchange = base_plan_node(7, TPlanNodeType::EXCHANGE_NODE, 0, vec![0]);
     exchange.exchange_node = Some(TExchangeNode::new(
         vec![0],
@@ -2564,7 +2566,7 @@ fn materialized_exchange_feeds_aggregate() {
             ),
             &[ExchangeInput {
                 node_id: 7,
-                paths: vec!["/tmp/materialized-exchange.parquet".to_string()],
+                stream_view: "sirius_stream_7".to_string(),
                 names: vec!["id".to_string(), "name".to_string()],
             }],
         )
@@ -2578,18 +2580,32 @@ fn materialized_exchange_feeds_aggregate() {
     };
     let rel::RelType::Read(read) = aggregate.input.as_ref().unwrap().rel_type.as_ref().unwrap()
     else {
-        panic!("expected materialized exchange read");
+        panic!("expected exchange read");
     };
-    let Some(read_rel::ReadType::LocalFiles(files)) = read.read_type.as_ref() else {
-        panic!("expected local_files exchange input");
+    let Some(read_rel::ReadType::NamedTable(table)) = read.read_type.as_ref() else {
+        panic!("expected a stream read for the exchange input");
     };
-    assert_eq!(files.items.len(), 1);
+    assert_eq!(table.names, vec!["sirius_stream_7"]);
     assert_eq!(read.base_schema.as_ref().unwrap().names, vec!["id", "name"]);
+
+    // The declaration the engine needs, derived from the same schema the read carries.
+    assert_eq!(translated.stream_inputs.len(), 1);
+    let stream = &translated.stream_inputs[0];
+    assert_eq!(stream.node_id, 7);
+    assert_eq!(stream.stream_view, "sirius_stream_7");
+    assert_eq!(
+        stream
+            .columns
+            .iter()
+            .map(|column| (column.name.as_str(), column.ty.as_str()))
+            .collect::<Vec<_>>(),
+        vec![("id", "BIGINT"), ("name", "VARCHAR")]
+    );
 }
 
-/// Verifies a merging exchange globally sorts the materialized local sender output.
+/// Verifies a merging exchange globally sorts the local sender output it streams in.
 #[test]
-fn materialized_merging_exchange_becomes_sort_over_read() {
+fn merging_exchange_becomes_sort_over_stream_read() {
     let sort_info = TSortInfo::new(
         vec![slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT))],
         vec![false],
@@ -2610,7 +2626,7 @@ fn materialized_merging_exchange_becomes_sort_over_read() {
             &params(Some(TPlan::new(vec![exchange])), Some(base_desc()), None),
             &[ExchangeInput {
                 node_id: 7,
-                paths: vec!["/tmp/materialized-exchange.parquet".to_string()],
+                stream_view: "sirius_stream_7".to_string(),
                 names: vec!["id".to_string(), "name".to_string()],
             }],
         )
@@ -2620,9 +2636,16 @@ fn materialized_merging_exchange_becomes_sort_over_read() {
     let rel::RelType::Sort(sort) = root.input.as_ref().unwrap().rel_type.as_ref().unwrap() else {
         panic!("expected merging exchange sort");
     };
-    let rel::RelType::Read(_) = sort.input.as_ref().unwrap().rel_type.as_ref().unwrap() else {
-        panic!("expected materialized exchange read under sort");
+    let rel::RelType::Read(read) = sort.input.as_ref().unwrap().rel_type.as_ref().unwrap() else {
+        panic!("expected an exchange read under the sort");
     };
+    assert!(
+        matches!(
+            read.read_type.as_ref(),
+            Some(read_rel::ReadType::NamedTable(_))
+        ),
+        "a merging exchange must stream its input too, not re-scan a file"
+    );
     assert_eq!(sort.sorts.len(), 1);
 }
 
