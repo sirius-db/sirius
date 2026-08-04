@@ -33,7 +33,6 @@
 
 #include <arpa/inet.h>
 #include <config.hpp>
-#include <cucascade/memory/topology_discovery.hpp>
 #include <log/logging.hpp>
 #include <netinet/in.h>
 #include <sys/socket.h>
@@ -90,27 +89,10 @@ std::string require_env(std::string const& name)
   return value;
 }
 
-cucascade::memory::system_topology_info single_gpu_topology()
-{
-  cucascade::memory::system_topology_info topology;
-  topology.num_gpus = 1;
-  cucascade::memory::gpu_topology_info gpu;
-  gpu.id        = 0;
-  gpu.numa_node = 0;
-  topology.gpus.push_back(std::move(gpu));
-  return topology;
-}
-
-std::shared_ptr<const sirius::memory::topology_index> single_gpu_index()
-{
-  return std::make_shared<sirius::memory::topology_index>(single_gpu_topology(),
-                                                          std::vector<int>{0});
-}
-
 struct scan_manager_fixture {
   std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> memory =
     initialize_memory_manager(1);
-  std::shared_ptr<const sirius::memory::topology_index> topology = single_gpu_index();
+  std::shared_ptr<const sirius::memory::topology_index> topology = discover_topology_index(*memory);
 };
 
 scan_manager_config make_minio_rest_config()

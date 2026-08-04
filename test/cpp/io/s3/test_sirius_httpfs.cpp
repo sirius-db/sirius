@@ -10,24 +10,36 @@
 #include "io/s3/sirius_httpfs.hpp"
 #include "io/sirius_datasource.hpp"
 #include "io/uri_parser.hpp"
+#include "memory/topology_index.hpp"
+#include "scan/test_utils.hpp"
+#include "scan_manager/sirius_scan_manager.hpp"
 #include "sirius_context.hpp"
 #include "sirius_extension.hpp"
 #include "utils/s3_container.hpp"
 
+#include <arpa/inet.h>
 #include <duckdb.hpp>
 #include <duckdb/common/file_system.hpp>
 #include <duckdb/common/open_file_info.hpp>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <memory>
 #include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -297,6 +309,247 @@ class exposed_sirius_httpfs final : public sirius::io::s3::sirius_httpfs {
   using sirius::io::s3::sirius_httpfs::SupportsOpenFileExtended;
 };
 
+struct glob_scan_manager_fixture {
+  std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> memory =
+    initialize_memory_manager(1);
+  std::shared_ptr<const sirius::memory::topology_index> topology = discover_topology_index(*memory);
+};
+
+sirius::scan_manager::scan_manager_config make_fake_list_config(std::string endpoint)
+{
+  sirius::scan_manager::scan_manager_config cfg{};
+  cfg.use_sirius_datasource        = true;
+  cfg.object_store.endpoint        = std::move(endpoint);
+  cfg.object_store.region          = "us-east-1";
+  cfg.object_store.access_key      = "glob-stress-access-key";
+  cfg.object_store.secret_key      = "glob-stress-secret-key";
+  cfg.object_store.tls_verify      = false;
+  cfg.rest.request_timeout_s       = 2;
+  cfg.rest.max_connections         = 1;
+  cfg.rest.max_retry_attempts      = 1;
+  cfg.rest.max_auth_retry_attempts = 1;
+  cfg.rest.retry_backoff_base      = std::chrono::milliseconds{0};
+  cfg.rest.retry_jitter            = std::chrono::milliseconds{0};
+  cfg.rest.honor_retry_after       = false;
+  cfg.rest_n_reactors              = 1;
+  cfg.enable_prefetch_cache        = false;
+  return cfg;
+}
+
+class generated_list_http_server {
+ public:
+  explicit generated_list_http_server(std::vector<std::string> keys) : _keys(std::move(keys))
+  {
+    _listen_fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (_listen_fd < 0) { throw std::runtime_error("socket failed: " + errno_message()); }
+
+    int one = 1;
+    if (::setsockopt(_listen_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)) != 0) {
+      throw std::runtime_error("setsockopt failed: " + errno_message());
+    }
+
+    sockaddr_in addr{};
+    addr.sin_family      = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port        = 0;
+    if (::bind(_listen_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+      throw std::runtime_error("bind failed: " + errno_message());
+    }
+    if (::listen(_listen_fd, 8) != 0) {
+      throw std::runtime_error("listen failed: " + errno_message());
+    }
+
+    socklen_t len = sizeof(addr);
+    if (::getsockname(_listen_fd, reinterpret_cast<sockaddr*>(&addr), &len) != 0) {
+      throw std::runtime_error("getsockname failed: " + errno_message());
+    }
+    _port   = ntohs(addr.sin_port);
+    _thread = std::thread([this] { accept_loop(); });
+  }
+
+  ~generated_list_http_server()
+  {
+    _stop.store(true);
+    if (_listen_fd >= 0) {
+      ::shutdown(_listen_fd, SHUT_RDWR);
+      ::close(_listen_fd);
+      _listen_fd = -1;
+    }
+    if (_thread.joinable()) { _thread.join(); }
+    for (auto& worker : _workers) {
+      if (worker.joinable()) { worker.join(); }
+    }
+  }
+
+  generated_list_http_server(generated_list_http_server const&)            = delete;
+  generated_list_http_server& operator=(generated_list_http_server const&) = delete;
+
+  [[nodiscard]] std::string endpoint() const { return "http://127.0.0.1:" + std::to_string(_port); }
+
+ private:
+  static std::string errno_message() { return std::strerror(errno); }
+
+  static std::string request_target(std::string const& request)
+  {
+    auto const first_space = request.find(' ');
+    if (first_space == std::string::npos) { return {}; }
+    auto const second_space = request.find(' ', first_space + 1);
+    if (second_space == std::string::npos) { return {}; }
+    return request.substr(first_space + 1, second_space - first_space - 1);
+  }
+
+  static int from_hex(char c)
+  {
+    if (c >= '0' && c <= '9') { return c - '0'; }
+    if (c >= 'a' && c <= 'f') { return c - 'a' + 10; }
+    if (c >= 'A' && c <= 'F') { return c - 'A' + 10; }
+    return -1;
+  }
+
+  static std::string percent_decode(std::string_view value)
+  {
+    std::string out;
+    out.reserve(value.size());
+    for (std::size_t i = 0; i < value.size(); ++i) {
+      if (value[i] == '%' && i + 2 < value.size()) {
+        auto const hi = from_hex(value[i + 1]);
+        auto const lo = from_hex(value[i + 2]);
+        if (hi >= 0 && lo >= 0) {
+          out.push_back(static_cast<char>((hi << 4) | lo));
+          i += 2;
+          continue;
+        }
+      }
+      out.push_back(value[i]);
+    }
+    return out;
+  }
+
+  static std::string query_value(std::string const& target, std::string_view key)
+  {
+    auto const query_pos = target.find('?');
+    if (query_pos == std::string::npos) { return {}; }
+    auto const query  = std::string_view{target}.substr(query_pos + 1);
+    auto const needle = std::string{key} + "=";
+    for (std::size_t pos = 0; pos < query.size();) {
+      auto amp = query.find('&', pos);
+      if (amp == std::string_view::npos) { amp = query.size(); }
+      auto const part        = query.substr(pos, amp - pos);
+      auto const needle_view = std::string_view{needle};
+      if (part.size() >= needle_view.size() && part.substr(0, needle_view.size()) == needle_view) {
+        return percent_decode(part.substr(needle_view.size()));
+      }
+      pos = amp + 1;
+    }
+    return {};
+  }
+
+  static std::string xml_escape(std::string_view value)
+  {
+    std::string out;
+    out.reserve(value.size());
+    for (char c : value) {
+      switch (c) {
+        case '&': out += "&amp;"; break;
+        case '<': out += "&lt;"; break;
+        case '>': out += "&gt;"; break;
+        case '"': out += "&quot;"; break;
+        case '\'': out += "&apos;"; break;
+        default: out.push_back(c); break;
+      }
+    }
+    return out;
+  }
+
+  static void send_all(int fd, std::string_view bytes)
+  {
+    std::size_t sent = 0;
+    while (sent < bytes.size()) {
+      auto const written = ::send(fd, bytes.data() + sent, bytes.size() - sent, MSG_NOSIGNAL);
+      if (written <= 0) { return; }
+      sent += static_cast<std::size_t>(written);
+    }
+  }
+
+  void accept_loop()
+  {
+    while (!_stop.load()) {
+      sockaddr_in client{};
+      socklen_t len = sizeof(client);
+      auto const fd = ::accept(_listen_fd, reinterpret_cast<sockaddr*>(&client), &len);
+      if (fd < 0) {
+        if (_stop.load()) { return; }
+        continue;
+      }
+      _workers.emplace_back([this, fd] {
+        handle_client(fd);
+        ::close(fd);
+      });
+    }
+  }
+
+  void handle_client(int fd)
+  {
+    std::string request(16 * 1024, '\0');
+    auto const received = ::recv(fd, request.data(), request.size(), 0);
+    if (received <= 0) { return; }
+    request.resize(static_cast<std::size_t>(received));
+
+    auto const target = request_target(request);
+    if (request.rfind("GET ", 0) != 0 || target.find("list-type=2") == std::string::npos) {
+      send_all(fd,
+               "HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+      return;
+    }
+
+    auto const prefix = query_value(target, "prefix");
+    std::ostringstream xml;
+    xml << "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+           "<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">"
+           "<IsTruncated>false</IsTruncated>";
+    for (auto const& key : _keys) {
+      if (key.rfind(prefix, 0) != 0) { continue; }
+      xml << "<Contents><Key>" << xml_escape(key) << "</Key><Size>" << key.size()
+          << "</Size></Contents>";
+    }
+    xml << "</ListBucketResult>";
+
+    auto const body     = xml.str();
+    auto const response = "HTTP/1.1 200 OK\r\nContent-Type: application/xml\r\nContent-Length: " +
+                          std::to_string(body.size()) + "\r\nConnection: close\r\n\r\n" + body;
+    send_all(fd, response);
+  }
+
+  int _listen_fd{-1};
+  std::uint16_t _port{0};
+  std::vector<std::string> _keys;
+  std::atomic<bool> _stop{false};
+  std::thread _thread;
+  std::vector<std::thread> _workers;
+};
+
+std::string deep_key(std::string_view prefix, std::size_t depth, std::string_view tail)
+{
+  std::string key{prefix};
+  for (std::size_t i = 0; i < depth; ++i) {
+    key += "segment-" + std::to_string(i) + "/";
+  }
+  key += tail;
+  return key;
+}
+
+std::vector<std::string> glob_paths(sirius::scan_manager::sirius_scan_manager& manager,
+                                    std::string const& pattern)
+{
+  auto files = sirius::io::s3::expand_glob(pattern, manager);
+  std::vector<std::string> paths;
+  paths.reserve(files.size());
+  for (auto const& file : files) {
+    paths.push_back(file.path);
+  }
+  return paths;
+}
+
 }  // namespace
 
 TEST_CASE("S3 LIST keys retain literal identity when embedded in object URIs",
@@ -326,6 +579,63 @@ TEST_CASE("S3 object URI parsing preserves ordinary keys byte for byte", "[s3][f
     {
       CHECK(sirius::io::parse("s3://bkt/" + std::string{key}).path == key);
     }
+  }
+}
+
+TEST_CASE("S3 glob matcher handles deep crawl patterns without backtracking blowup",
+          "[s3][filesystem][glob]")
+{
+  auto const stress_key = deep_key("stress/", 28, "y.parquet");
+  std::vector<std::string> const keys{
+    "prefix/x.parquet",
+    "prefix/a/b/x.parquet",
+    "prefix/a/b/y.parquet",
+    "prefix/part-alpha/filea1.parquet",
+    "prefix/deep/part-z/fileb2.parquet",
+    "prefix/deep/notpart-z/filea3.parquet",
+    "prefix/deep/part-z/filec4.parquet",
+    "prefix/deep/part-z/filea12.parquet",
+    "tail.parquet",
+    "leading/a/tail.parquet",
+    "leading/a/not-tail.csv",
+    stress_key,
+  };
+  generated_list_http_server server(keys);
+  glob_scan_manager_fixture fixture;
+  sirius::scan_manager::sirius_scan_manager manager{
+    make_fake_list_config(server.endpoint()), *fixture.memory, fixture.topology};
+
+  CHECK(
+    glob_paths(manager, "s3://bucket/prefix/**/x.parquet") ==
+    std::vector<std::string>{"s3://bucket/prefix/a/b/x.parquet", "s3://bucket/prefix/x.parquet"});
+
+  CHECK(glob_paths(manager, "s3://bucket/prefix/**/part-*/file[ab]?.parquet") ==
+        std::vector<std::string>{"s3://bucket/prefix/deep/part-z/fileb2.parquet",
+                                 "s3://bucket/prefix/part-alpha/filea1.parquet"});
+
+  CHECK(glob_paths(manager, "s3://bucket/**/tail.parquet") ==
+        std::vector<std::string>{"s3://bucket/leading/a/tail.parquet", "s3://bucket/tail.parquet"});
+
+  CHECK(glob_paths(manager, "s3://bucket/prefix/**") ==
+        std::vector<std::string>{"s3://bucket/prefix/a/b/x.parquet",
+                                 "s3://bucket/prefix/a/b/y.parquet",
+                                 "s3://bucket/prefix/deep/notpart-z/filea3.parquet",
+                                 "s3://bucket/prefix/deep/part-z/filea12.parquet",
+                                 "s3://bucket/prefix/deep/part-z/fileb2.parquet",
+                                 "s3://bucket/prefix/deep/part-z/filec4.parquet",
+                                 "s3://bucket/prefix/part-alpha/filea1.parquet",
+                                 "s3://bucket/prefix/x.parquet"});
+
+  auto const started = std::chrono::steady_clock::now();
+  auto const stress_matches =
+    glob_paths(manager, "s3://bucket/stress/**/**/**/**/**/**/**/**/**/**/x.parquet");
+  auto const elapsed = std::chrono::steady_clock::now() - started;
+
+  INFO("memoized deep-crawl mismatch completed in "
+       << std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count() << " ms");
+  CHECK(stress_matches.empty());
+  if (elapsed > std::chrono::seconds{1}) {
+    WARN("deep-crawl glob match exceeded the expected memoized runtime");
   }
 }
 
