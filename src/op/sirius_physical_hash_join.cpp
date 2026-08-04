@@ -681,30 +681,40 @@ partition_strategy compute_hash_join_partition_strategy(uint64_t total_bytes,
   bool const is_full_outer = join_type == duckdb::JoinType::OUTER;
   uint64_t const small     = partition_small_table_bytes(num_gpus);
 
-  // Broadcast candidacy. MARK multi-GPU is forced broadcast (build_has_null must be globally
-  // consistent); otherwise a build is a candidate when it is below the small-table threshold, OR
-  // below max_broadcast_join_size while the probe side is large relative to the build (replicating
-  // the build avoids shuffling a much larger probe across GPUs).
-  bool const broadcast_candidate =
-    is_mark ? num_gpus > 1
-            : (total_bytes < small ||
-               (total_bytes < max_broadcast_join_size &&
-                estimated_probe_to_build_ratio >= static_cast<double>(num_gpus) * 1.25));
+  // Phase 1 — broadcast candidacy and the partition count we propose to the eligibility check.
+  //   MARK multi-GPU: forced broadcast (build_has_null must be globally consistent).
+  //   MARK single-GPU: clamped to one partition (may still enter BUILD_PROBE below).
+  //   Otherwise: a build is a broadcast candidate when it is below the small-table threshold, OR
+  //   below max_broadcast_join_size while the probe side is large relative to the build (so
+  //   replicating the build avoids shuffling a much larger probe across GPUs).
+  bool broadcast_candidate = false;
+  int proposed             = natural;
+  if (is_mark && num_gpus > 1) {
+    broadcast_candidate = true;
+    proposed            = num_gpus;
+  } else if (is_mark) {
+    broadcast_candidate = false;
+    proposed            = 1;
+  } else {
+    broadcast_candidate = total_bytes < small ||
+                          (total_bytes < max_broadcast_join_size &&
+                           estimated_probe_to_build_ratio >= static_cast<double>(num_gpus) * 1.25);
+    proposed = broadcast_candidate ? num_gpus : natural;
+  }
 
-  // BUILD_PROBE eligibility. MARK/SEMI/ANTI are eligible (persistent filtered_join built on the
-  // right, reused across streamed left probe batches); RIGHT_SEMI/RIGHT_ANTI/RIGHT and full OUTER
-  // emit build-side output and stay on the STANDARD path.
-  //
-  // Evaluated at the count BUILD_PROBE would run with — one build table per GPU, capped at
-  // `natural` — not at the natural count: `hash_partition_bytes` targets a streaming batch size
-  // and must not veto `max_build_hash_table_bytes`, which is what sizes the folded hash table.
-  // A broadcast join charges the FULL build to every GPU; a hash-partitioned build charges the
-  // per-GPU average.
-  int const build_probe_partitions = std::max(1, std::min(natural, num_gpus));
-  uint64_t const per_gpu_build_bytes =
-    broadcast_candidate ? total_bytes : total_bytes / static_cast<uint64_t>(build_probe_partitions);
-  bool build_probe = per_gpu_build_bytes < max_build_hash_table_bytes && build_foldable &&
-                     !is_right_family && !is_mixed && !is_full_outer;
+  // Phase 2 — BUILD_PROBE eligibility at `proposed`. MARK/SEMI/ANTI are eligible (persistent
+  // filtered_join built on the right, reused across streamed left probe batches). RIGHT_SEMI/
+  // RIGHT_ANTI/RIGHT and full OUTER emit build-side output and would need cross-batch (and, on
+  // multi-GPU, cross-partition/cross-GPU) accumulation of unmatched build rows, so they stay on the
+  // STANDARD path. A broadcast join charges the FULL build to every GPU; a hash-partitioned build
+  // charges the per-partition average.
+  bool build_probe = false;
+  if (proposed <= num_gpus) {
+    uint64_t const per_gpu_build_bytes =
+      broadcast_candidate ? total_bytes : total_bytes / static_cast<uint64_t>(proposed);
+    build_probe = per_gpu_build_bytes < max_build_hash_table_bytes && build_foldable &&
+                  !is_right_family && !is_mixed && !is_full_outer;
+  }
 
   // A MARK join must always run in BUILD_PROBE mode. It needs the entire build side resident to
   // compute the global build_has_null sentinel and the per-probe-row marks, and on multi-GPU it is
@@ -715,12 +725,9 @@ partition_strategy compute_hash_join_partition_strategy(uint64_t total_bytes,
 
   bool const broadcast = broadcast_candidate && build_probe;
 
-  // BUILD_PROBE runs at the count its eligibility was measured at; MARK single-GPU is clamped to
-  // one partition; broadcast takes num_gpus; everything else the natural count.
-  int const num_partitions = broadcast                    ? num_gpus
-                             : build_probe                ? build_probe_partitions
-                             : (is_mark && num_gpus <= 1) ? 1
-                                                          : natural;
+  // MARK single-GPU is clamped to one partition regardless of the natural count; every other case
+  // takes num_gpus when broadcasting and the natural count otherwise.
+  int const num_partitions = broadcast ? num_gpus : ((is_mark && num_gpus <= 1) ? 1 : natural);
   return {num_partitions, broadcast, build_probe};
 }
 
@@ -799,18 +806,6 @@ bool sirius_physical_hash_join::is_build_probe_mode()
 {
   std::lock_guard<std::mutex> lg(op_state_mutex);
   return _join_mode == HASH_JOIN_MODE::BUILD_PROBE;
-}
-
-bool sirius_physical_hash_join::publishes_dynamic_filters() const
-{
-  // Both are fixed at construction, so this needs no lock.
-  return filter_pushdown != nullptr && _dynamic_filter_plan.enabled();
-}
-
-void sirius_physical_hash_join::set_build_arrives_whole(bool arrives_whole)
-{
-  std::lock_guard<std::mutex> lg(op_state_mutex);
-  _build_arrives_whole = arrives_whole;
 }
 
 std::vector<build_probe_slot_view> sirius_physical_hash_join::snapshot_build_probe_slots()
@@ -1980,40 +1975,21 @@ void sirius_physical_hash_join::push_data_batch_partitioned(
 {
   //===----------Dynamic Table Filters----------===//
   // Build-side dynamic-filter publish: the moment the (single, concat-folded) build batch arrives,
-  // compute and publish the filter from the build keys.
-  //
-  // The publisher is one-shot, so the batch it claims must carry the WHOLE build side — a filter
-  // built from part of the key set would drop probe rows that do in fact join. The upstream
-  // PARTITION knows whether that holds (a single-partition or broadcast build, folded to one batch
-  // by a concat_all build-side CONCAT) and reports it at sizing time through
-  // `set_build_arrives_whole`. The join mode is deliberately not part of the condition: a
-  // single-partition STANDARD / MIXED_JOIN build publishes on the same terms as BUILD_PROBE.
+  // compute and publish the filter from the build keys. This is gated to the two BUILD_PROBE shapes
+  // where a single partition's build batch covers the whole build side, so the one-shot publisher
+  // and its single-GPU reduction emit a complete filter:
+  //   - Single partition (`size() == 1`)
+  //   - Broadcast (`_broadcast`)
   std::optional<::cucascade::read_only_data_batch> build_ro;
   if (port_id == "build" && batch) {
-    bool claim              = false;
-    bool wired_but_unusable = false;
-    HASH_JOIN_MODE mode     = HASH_JOIN_MODE::STANDARD;
+    bool claim = false;
     {
       std::scoped_lock lg(op_state_mutex);
-      const bool open = _dynamic_filter_publication_state.load(std::memory_order_acquire) ==
-                        dynamic_filter_publication_state::OPEN;
-      const bool wired = filter_pushdown && _dynamic_filter_plan.enabled();
-      claim            = open && wired && _build_arrives_whole;
-
-      // A join that has a filter plan and is still open but cannot use the one-shot publisher
-      // silently publishes nothing — say so.
-      wired_but_unusable = open && wired && !claim;
-      mode               = _join_mode;
-    }
-    if (wired_but_unusable) {
-      SIRIUS_LOG_DEBUG(
-        "[sirius_physical_hash_join] dynamic filter NOT published (id={}): mode={}; the build does "
-        "not arrive as a single batch covering the whole build side (multi-partition, or no "
-        "concat-folded build — see this join's partition strategy log line)",
-        get_operator_id(),
-        mode == HASH_JOIN_MODE::BUILD_PROBE  ? "BUILD_PROBE"
-        : mode == HASH_JOIN_MODE::MIXED_JOIN ? "MIXED_JOIN"
-                                             : "STANDARD");
+      claim = _dynamic_filter_publication_state.load(std::memory_order_acquire) ==
+                dynamic_filter_publication_state::OPEN &&
+              _join_mode == HASH_JOIN_MODE::BUILD_PROBE &&
+              (_partition_build_states.size() == 1 || _broadcast) && filter_pushdown &&
+              _dynamic_filter_plan.enabled();
     }
     if (claim) { build_ro.emplace(batch->to_read_only()); }
   }
