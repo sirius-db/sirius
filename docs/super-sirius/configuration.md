@@ -315,6 +315,7 @@ Five optional nested sub-configs tune the individual backends and caches:
 | `max_retry_attempts` | int | 10 | Retry attempts for transient errors. |
 | `max_auth_retry_attempts` | int | 3 | Retry attempts for HTTP 403 (expired presigned URL). Kept low so a genuine AccessDenied fails fast. |
 | `honor_retry_after` | bool | true | Respect the server's `Retry-After` header. |
+| `perf_instrumentation` | bool | false | Record the per-chunk micro timings (chunk_get, queue_wait, ttfb, h2d_observed) into the reactor perf counters read back by `rest_ioctx::perf_snapshot()`. Retry, terminal-failure, device-stream-sync and payload-byte counts are recorded regardless. |
 | `footer_probe_bytes` | bytes | 512Ki | Suffix-range window for the parquet footer probe. Must cover the footer, so err large. |
 | `list_max_matches` | int | 100000 | Cap on files a glob/listing may accumulate (throws "narrow the glob prefix", never truncates). |
 | `list_max_scanned` | int | 1000000 | Cap on objects a LIST sweep may scan across pages (throws, never truncates). |
