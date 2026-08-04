@@ -123,6 +123,7 @@ class memory_prefetcher {
   std::atomic<std::size_t> _stops_reservation{0};
   std::atomic<std::size_t> _skips_lock{0};
   std::atomic<std::size_t> _skips_draining{0};
+  std::atomic<std::size_t> _errors_conversion{0};
   std::vector<std::thread> _workers;
 };
 

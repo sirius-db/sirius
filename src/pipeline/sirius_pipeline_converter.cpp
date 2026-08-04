@@ -536,7 +536,7 @@ std::string dump_barrier_name(op::MemoryBarrierType b)
 void dump_scan_identity(std::ostringstream& out, const op::sirius_physical_operator& op)
 {
   if (op.type != op::SiriusPhysicalOperatorType::GPU_SCAN) { return; }
-  auto const& info = op.Cast<op::scan::sirius_gpu_scan_operator>().peek_table_info();
+  auto const& info = op.Cast<op::scan::sirius_gpu_scan_operator>().get_ingestible().table_info();
   if (auto const* pq = dynamic_cast<op::scan::parquet_ingestible_table_info const*>(&info)) {
     out << "      scan: parquet files=[";
     for (std::size_t f = 0; f < pq->resolved_file_paths.size(); ++f) {

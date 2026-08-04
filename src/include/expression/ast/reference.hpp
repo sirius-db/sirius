@@ -28,11 +28,12 @@ namespace sirius::ast {
 /**
  * @brief Sirius-native mirror of duckdb::BoundReferenceExpression.
  *
- * Carries an index into the input data batch's column vector and the SQL type
- * of the referenced column (mirroring duckdb::BoundReferenceExpression's
- * return_type). The executor resolves column types from the input table_view at
- * runtime and ignores return_type(); it exists so the cuDF-AST translator's
- * decimal-propagation guard can see the type of a referenced decimal column.
+ * Carries an index into the input data batch's column vector and the SQL type of the referenced
+ * column (mirroring duckdb::BoundReferenceExpression's return_type). The executor normally resolves
+ * the carrier from the input table_view at runtime. When that carrier is a strictly narrower
+ * compatible integer or same-scale DECIMAL, return_type() names the native type to restore to;
+ * every other mismatch passes the column through unchanged. The declared type also feeds the
+ * cuDF-AST translator's decimal-propagation guard.
  */
 struct reference {
   uint32_t column_index{0};

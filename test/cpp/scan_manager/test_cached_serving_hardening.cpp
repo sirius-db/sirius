@@ -31,20 +31,27 @@
 // rethrows; pre-stopped token -> close without draining) and
 // validate_pinned_entry_for_serving (malformed entries throw so
 // try_match_cached_entry falls back to the disk read; well-formed and
-// zero-chunk entries pass).
+// zero-chunk entries pass). The file also gates the pinned-entry storage-metadata helpers — the
+// pinned_column_narrowed_in_all_chunks marker fold and the pinned_column_narrow_carrier carrier
+// derivation that composes it for the plan-time residency gate. Both are pure folds over the
+// entry's recorded column_storage matrix: compressed and uncompressed chunks, both tiers, answer
+// through the same metadata, so several fixtures here carry no storage at all.
 
 #include "operator/operator_test_utils.hpp"
 
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
+#include <cudf/null_mask.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
+#include <cudf/utilities/traits.hpp>
 
 #include <rmm/cuda_stream.hpp>
 
 #include <cuda_runtime.h>
 
 #include <catch.hpp>
+#include <compression/compressed_representation.hpp>
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
@@ -62,6 +69,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <stop_token>
 #include <string>
@@ -108,6 +116,44 @@ int32_t cell(std::size_t chunk, std::size_t col, std::size_t row)
   return static_cast<int32_t>(1000 * chunk + 100 * col + row);
 }
 
+using sirius::pinned_column_storage_meta;
+
+pinned_column_storage_meta narrow_meta(cudf::data_type carrier) { return {carrier, true}; }
+pinned_column_storage_meta native_meta(cudf::data_type carrier) { return {carrier, false}; }
+
+// Storage-metadata row of same-carrier cells with the given narrowed flags — the common shape of
+// hand-built fixtures whose stored columns share one type.
+std::vector<pinned_column_storage_meta> meta_row(cudf::data_type carrier,
+                                                 std::initializer_list<bool> narrowed)
+{
+  std::vector<pinned_column_storage_meta> row;
+  row.reserve(narrowed.size());
+  for (bool const flag : narrowed) {
+    row.push_back({carrier, flag});
+  }
+  return row;
+}
+
+// Storage-metadata row of per-column carriers, all marked narrowed. The serve-site conversion
+// decision reads carriers against the scan's plan targets, never the markers, so these fixtures
+// vary the carrier and leave the flag constant.
+std::vector<pinned_column_storage_meta> carrier_row(std::initializer_list<cudf::data_type> carriers)
+{
+  std::vector<pinned_column_storage_meta> row;
+  row.reserve(carriers.size());
+  for (auto const carrier : carriers) {
+    row.push_back(narrow_meta(carrier));
+  }
+  return row;
+}
+
+// The scan's carrier targets in output order. Served slot k is output column k, so a slot at or
+// past the end of this list is a trailing pure-filter column that reaches no target.
+std::vector<cudf::data_type> targets(std::initializer_list<cudf::data_type> in_output_order)
+{
+  return {in_output_order};
+}
+
 std::shared_ptr<cudf::column> make_gpu_column(cucascade::memory::memory_space& space,
                                               std::vector<int32_t> const& values)
 {
@@ -125,6 +171,30 @@ std::shared_ptr<cudf::column> make_gpu_column(cucascade::memory::memory_space& s
   return std::shared_ptr<cudf::column>(std::move(col));
 }
 
+// Zero-initialized numeric GPU column of an arbitrary carrier type — the serve-site
+// restore-destination computation reads only types, row counts, and mask presence.
+std::shared_ptr<cudf::column> make_typed_gpu_column(cucascade::memory::memory_space& space,
+                                                    cudf::data_type type,
+                                                    std::size_t rows,
+                                                    cudf::mask_state mask_state)
+{
+  auto mr     = sirius::test::operator_utils::get_resource_ref(space);
+  auto stream = sirius::test::operator_utils::default_stream();
+  auto col =
+    cudf::make_numeric_column(type, static_cast<cudf::size_type>(rows), mask_state, stream, mr);
+  return std::shared_ptr<cudf::column>(std::move(col));
+}
+
+// Name the entry's cached columns, filling the column_ids and names lists insertion keeps
+// lock-step so a fixture is indexable in either space.
+void set_cached_columns(pinned_entry& entry, std::vector<std::string> names)
+{
+  for (std::size_t i = 0; i < names.size(); ++i) {
+    entry.cache_info.column_ids.emplace_back(i);
+  }
+  entry.cache_info.names = std::move(names);
+}
+
 /// GPU-tier pinned entry with columns {k, v, w} x @p n_chunks chunks of
 /// @p rows rows, every chunk placed in @p space.
 pinned_entry make_gpu_entry(cucascade::memory::memory_space& space,
@@ -132,9 +202,9 @@ pinned_entry make_gpu_entry(cucascade::memory::memory_space& space,
                             std::size_t rows)
 {
   pinned_entry entry;
-  entry.cache_info.names = {"k", "v", "w"};
-  entry.tier             = cucascade::memory::Tier::GPU;
-  entry.memory_space     = &space;
+  set_cached_columns(entry, {"k", "v", "w"});
+  entry.tier         = cucascade::memory::Tier::GPU;
+  entry.memory_space = &space;
   for (std::size_t c = 0; c < n_chunks; ++c) {
     entry.chunk_memory_spaces.push_back(&space);
     for (std::size_t col = 0; col < entry.cache_info.names.size(); ++col) {
@@ -158,9 +228,9 @@ pinned_entry make_device_chunks_entry(cucascade::memory::memory_space& space,
                                       std::size_t rows)
 {
   pinned_entry entry;
-  entry.cache_info.names = {"k", "v", "w"};
-  entry.tier             = cucascade::memory::Tier::GPU;
-  entry.memory_space     = &space;
+  set_cached_columns(entry, {"k", "v", "w"});
+  entry.tier         = cucascade::memory::Tier::GPU;
+  entry.memory_space = &space;
   for (std::size_t c = 0; c < n_chunks; ++c) {
     sirius::device_pin_chunk chunk;
     chunk.memory_space = &space;
@@ -182,9 +252,9 @@ pinned_entry make_device_chunks_entry(cucascade::memory::memory_space& space,
 pinned_entry make_host_entry(test_env& e, std::size_t n_chunks, std::size_t rows)
 {
   pinned_entry entry;
-  entry.cache_info.names = {"k", "v"};
-  entry.tier             = cucascade::memory::Tier::HOST;
-  entry.memory_space     = e.host_space;
+  set_cached_columns(entry, {"k", "v"});
+  entry.tier         = cucascade::memory::Tier::HOST;
+  entry.memory_space = e.host_space;
 
   auto& registry = sirius::converter_registry::get();
   for (std::size_t c = 0; c < n_chunks; ++c) {
@@ -306,6 +376,7 @@ sirius::scan_manager::mvcc_chunk_mask make_test_mask(std::size_t rows)
 struct scripted_provider final : databatch_provider {
   std::vector<std::shared_ptr<cucascade::data_batch>> batches;
   std::vector<sirius::scan_manager::mvcc_chunk_mask> masks;
+  std::vector<bool> converting;
   std::size_t served{0};
   bool throw_when_exhausted{false};
 
@@ -314,7 +385,8 @@ struct scripted_provider final : databatch_provider {
     if (served < batches.size()) {
       auto idx = served++;
       return {batches[idx],
-              idx < masks.size() ? masks[idx] : sirius::scan_manager::mvcc_chunk_mask{}};
+              idx < masks.size() ? masks[idx] : sirius::scan_manager::mvcc_chunk_mask{},
+              idx < converting.size() && converting[idx]};
     }
     if (throw_when_exhausted) { throw std::runtime_error("provider blew up mid-stream"); }
     return {};
@@ -378,8 +450,9 @@ TEST_CASE("drain_cached_provider forwards the mvcc keep-mask and filter flag ont
   auto& e    = env();
   auto mask0 = make_test_mask(4);
   scripted_provider provider;
-  provider.batches = {make_test_batch(e, 4), make_test_batch(e, 4)};
-  provider.masks   = {mask0};  // second batch deliberately mask-less
+  provider.batches    = {make_test_batch(e, 4), make_test_batch(e, 4)};
+  provider.masks      = {mask0};  // second batch deliberately mask-less
+  provider.converting = {true, false};
 
   split_connector connector;
   std::stop_source stop;
@@ -394,6 +467,7 @@ TEST_CASE("drain_cached_provider forwards the mvcc keep-mask and filter flag ont
   REQUIRE(in0->mvcc_keep_mask.words == mask0.words);
   REQUIRE(in0->mvcc_keep_mask.row_count == mask0.row_count);
   REQUIRE(in0->row_filter_pending);
+  REQUIRE(in0->needs_carrier_conversion);
 
   auto second = connector.get_next_split();
   REQUIRE(second.has_value());
@@ -401,6 +475,7 @@ TEST_CASE("drain_cached_provider forwards the mvcc keep-mask and filter flag ont
   REQUIRE(in1 != nullptr);
   REQUIRE_FALSE(in1->mvcc_keep_mask.has_mask());
   REQUIRE(in1->row_filter_pending);  // per-op flag: stamped on every split
+  REQUIRE_FALSE(in1->needs_carrier_conversion);
 
   REQUIRE_FALSE(connector.get_next_split().has_value());
 }
@@ -449,6 +524,452 @@ TEST_CASE("cached provider pairs chunk i with mask-set slot i", "[cached_serving
       REQUIRE_FALSE(b.mvcc_keep_mask.has_mask());
     }
     REQUIRE_FALSE(provider->get_next_batch().data);
+  }
+}
+
+TEST_CASE("cached provider marks only selected converting columns",
+          "[cached_serving][scan_manager]")
+{
+  auto& e    = env();
+  auto entry = make_gpu_entry(*e.gpu_space, 3, 4);
+  auto const int64{cudf::data_type{cudf::type_id::INT64}};
+  auto const int32{cudf::data_type{cudf::type_id::INT32}};
+  // Every column targets INT64, so a chunk's column converts exactly when it recorded INT32.
+  entry.column_storage = {carrier_row({int64, int32, int64}),
+                          carrier_row({int32, int64, int64}),
+                          carrier_row({int64, int64, int64})};
+
+  SECTION("a selected converting column marks only its chunk")
+  {
+    std::vector<std::size_t> selected{1};
+    sirius::scan_manager::cached_scan_plan plan{.survivor_chunk_indices = {0, 1, 2}};
+    auto provider = sirius::scan_manager::make_provider_for_pinned_entry(
+      entry,
+      selected,
+      std::move(plan),
+      sirius::telemetry::batch_telemetry_info{},
+      {},
+      {},
+      targets({int64}));
+
+    REQUIRE(provider->get_next_batch().needs_carrier_conversion);
+    REQUIRE_FALSE(provider->get_next_batch().needs_carrier_conversion);
+    REQUIRE_FALSE(provider->get_next_batch().needs_carrier_conversion);
+  }
+
+  SECTION("converting unselected columns do not mark the served batch")
+  {
+    std::vector<std::size_t> selected{2};
+    sirius::scan_manager::cached_scan_plan plan{.survivor_chunk_indices = {0, 1, 2}};
+    auto provider = sirius::scan_manager::make_provider_for_pinned_entry(
+      entry,
+      selected,
+      std::move(plan),
+      sirius::telemetry::batch_telemetry_info{},
+      {},
+      {},
+      targets({int64}));
+
+    for (int i = 0; i < 3; ++i) {
+      auto batch = provider->get_next_batch();
+      REQUIRE(batch.data);
+      REQUIRE_FALSE(batch.needs_carrier_conversion);
+    }
+  }
+}
+
+TEST_CASE("cached provider computes exact conversion-destination bytes per chunk",
+          "[cached_serving][scan_manager]")
+{
+  auto& e = env();
+  constexpr std::size_t rows{100};
+  auto const int64{cudf::data_type{cudf::type_id::INT64}};
+  auto const int32{cudf::data_type{cudf::type_id::INT32}};
+  auto const int8{cudf::data_type{cudf::type_id::INT8}};
+  auto const mask_bytes = cudf::bitmask_allocation_size_bytes(static_cast<cudf::size_type>(rows));
+
+  // Columns {k, v, w} of one GPU chunk, each stored at the carrier the metadata records.
+  auto make_entry = [&](std::vector<cudf::data_type> const& carriers, cudf::mask_state k_mask) {
+    pinned_entry entry;
+    set_cached_columns(entry, {"k", "v", "w"});
+    entry.tier         = cucascade::memory::Tier::GPU;
+    entry.memory_space = e.gpu_space;
+    entry.chunk_memory_spaces.push_back(e.gpu_space);
+    std::vector<pinned_column_storage_meta> row;
+    for (std::size_t col = 0; col < entry.cache_info.names.size(); ++col) {
+      entry.data_batches_by_column[entry.cache_info.names[col]].push_back(make_typed_gpu_column(
+        *e.gpu_space, carriers[col], rows, col == 0 ? k_mask : cudf::mask_state::UNALLOCATED));
+      row.push_back(narrow_meta(carriers[col]));
+    }
+    entry.column_storage = {std::move(row)};
+    entry.num_rows       = rows;
+    return entry;
+  };
+
+  auto serve_one = [](pinned_entry const& entry,
+                      std::vector<std::size_t> const& selected,
+                      std::vector<cudf::data_type> normalization_targets,
+                      bool has_overrides = false) {
+    sirius::scan_manager::cached_scan_plan plan{.survivor_chunk_indices = {0}};
+    auto provider = sirius::scan_manager::make_provider_for_pinned_entry(
+      entry,
+      selected,
+      std::move(plan),
+      sirius::telemetry::batch_telemetry_info{},
+      {},
+      {},
+      std::move(normalization_targets),
+      has_overrides);
+    return provider->get_next_batch();
+  };
+
+  SECTION("a stored carrier that already equals the plan target is charge-free")
+  {
+    // The stacking happy path: pinned narrow, planned narrow, so normalization issues no cast.
+    auto entry = make_entry({int32, int32, int32}, cudf::mask_state::UNALLOCATED);
+    auto batch = serve_one(entry, {0, 1, 2}, targets({int32, int32, int32}));
+    REQUIRE(batch.data);
+    REQUIRE_FALSE(batch.needs_carrier_conversion);
+    REQUIRE(batch.conversion_destination_bytes == 0);
+  }
+
+  SECTION("a compressed chunk whose recorded carrier equals the plan target is charge-free")
+  {
+    // The GPU-tier and host-tier compressed cells: nothing about the blob is readable, and
+    // nothing needs to be -- the recorded carrier already answers.
+    pinned_entry device_entry;
+    set_cached_columns(device_entry, {"k"});
+    device_entry.tier         = cucascade::memory::Tier::GPU;
+    device_entry.memory_space = e.gpu_space;
+    sirius::device_pin_chunk chunk;
+    chunk.memory_space = e.gpu_space;
+    chunk.compressed   = std::make_shared<sirius::compressed_device_representation>(
+      *e.gpu_space,
+      /*blob=*/nullptr,  // select_columns/num_rows never touch the blob
+      std::vector<std::string>{"k"},
+      /*compressed_bytes=*/64,
+      /*uncompressed_bytes=*/256,
+      /*num_rows=*/static_cast<std::int64_t>(rows));
+    device_entry.device_chunks.push_back(std::move(chunk));
+    device_entry.num_rows       = rows;
+    device_entry.column_storage = {{narrow_meta(int32)}};
+
+    auto device_batch = serve_one(device_entry, {0}, targets({int32}));
+    REQUIRE(device_batch.data);
+    REQUIRE_FALSE(device_batch.needs_carrier_conversion);
+    REQUIRE(device_batch.conversion_destination_bytes == 0);
+
+    pinned_entry host_entry;
+    set_cached_columns(host_entry, {"k"});
+    host_entry.tier         = cucascade::memory::Tier::HOST;
+    host_entry.memory_space = e.host_space;
+    host_entry.host_chunks.emplace_back(std::make_shared<sirius::compressed_host_representation>(
+      *e.host_space,
+      std::make_shared<sirius::pinned_compressed_blob>(),
+      std::vector<std::string>{"k"},
+      /*compressed_bytes=*/64,
+      /*uncompressed_bytes=*/256,
+      /*num_rows=*/static_cast<std::int64_t>(rows)));
+    host_entry.num_rows       = rows;
+    host_entry.column_storage = {{narrow_meta(int32)}};
+
+    auto host_batch = serve_one(host_entry, {0}, targets({int32}));
+    REQUIRE(host_batch.data);
+    REQUIRE_FALSE(host_batch.needs_carrier_conversion);
+    REQUIRE(host_batch.conversion_destination_bytes == 0);
+  }
+
+  SECTION("per-column exact destination in the target's width")
+  {
+    auto entry = make_entry({int8, int32, int32}, cudf::mask_state::UNALLOCATED);
+    auto batch = serve_one(entry, {0, 1, 2}, targets({int64, int64, int32}));
+    REQUIRE(batch.data);
+    REQUIRE(batch.needs_carrier_conversion);
+    // k and v restore to INT64; w already sits at its target and contributes nothing.
+    REQUIRE(batch.conversion_destination_bytes == 2 * rows * sizeof(std::int64_t));
+  }
+
+  SECTION("a stored validity mask adds the destination mask bytes")
+  {
+    auto entry = make_entry({int8, int32, int32}, cudf::mask_state::ALL_VALID);
+    auto batch = serve_one(entry, {0}, targets({int64}));
+    REQUIRE(batch.data);
+    REQUIRE(batch.conversion_destination_bytes == rows * sizeof(std::int64_t) + mask_bytes);
+  }
+
+  SECTION("no sidecar over narrow storage still charges the native restore")
+  {
+    // Pin-on / query-off: the target is the native mapping, so every narrow carrier widens.
+    auto entry = make_entry({int8, int32, int32}, cudf::mask_state::UNALLOCATED);
+    auto batch = serve_one(entry, {0}, targets({int64}));
+    REQUIRE(batch.needs_carrier_conversion);
+    REQUIRE(batch.conversion_destination_bytes == rows * sizeof(std::int64_t));
+  }
+
+  SECTION("a sidecar narrowing a native cached carrier charges the narrow destination")
+  {
+    auto entry = make_entry({int64, int32, int32}, cudf::mask_state::UNALLOCATED);
+
+    auto narrowing = serve_one(entry, {0}, targets({int32}), /*has_overrides=*/true);
+    REQUIRE(narrowing.needs_carrier_conversion);
+    REQUIRE(narrowing.conversion_destination_bytes == rows * sizeof(std::int32_t));
+
+    // Without a sidecar normalization never narrows, so the same pair converts nothing.
+    auto unplanned = serve_one(entry, {0}, targets({int32}), /*has_overrides=*/false);
+    REQUIRE_FALSE(unplanned.needs_carrier_conversion);
+    REQUIRE(unplanned.conversion_destination_bytes == 0);
+  }
+
+  SECTION("a trailing pure-filter column is never charged")
+  {
+    // Both ingestibles materialize pure-filter columns after every output column, so such a
+    // column occupies a served slot past the end of the target list. post_filter_and_project
+    // drops it before normalization, and it must not be charged even though its INT8 carrier
+    // would convert if it had a target.
+    auto entry = make_entry({int8, int8, int32}, cudf::mask_state::UNALLOCATED);
+
+    // One output column plus one filter-only column: only the output column is charged.
+    auto mixed = serve_one(entry, {0, 1}, targets({int64}));
+    REQUIRE(mixed.needs_carrier_conversion);
+    REQUIRE(mixed.conversion_destination_bytes == rows * sizeof(std::int64_t));
+
+    // A scan that emits nothing at all charges nothing at all.
+    auto filter_only = serve_one(entry, {0}, targets({}));
+    REQUIRE(filter_only.data);
+    REQUIRE_FALSE(filter_only.needs_carrier_conversion);
+    REQUIRE(filter_only.conversion_destination_bytes == 0);
+  }
+
+  SECTION("non-converting selections report zero destination bytes")
+  {
+    auto entry = make_entry({int8, int32, int32}, cudf::mask_state::UNALLOCATED);
+    auto batch = serve_one(entry, {2}, targets({int32}));
+    REQUIRE(batch.data);
+    REQUIRE_FALSE(batch.needs_carrier_conversion);
+    REQUIRE(batch.conversion_destination_bytes == 0);
+  }
+
+  SECTION("host-tier chunks compute from the host column metadata")
+  {
+    auto entry           = make_host_entry(e, /*n_chunks=*/2, /*rows=*/4);
+    entry.column_storage = {carrier_row({int32, int64}), carrier_row({int64, int64})};
+    std::vector<std::size_t> selected{0, 1};
+    sirius::scan_manager::cached_scan_plan plan{.survivor_chunk_indices = {0, 1}};
+    auto provider = sirius::scan_manager::make_provider_for_pinned_entry(
+      entry,
+      selected,
+      std::move(plan),
+      sirius::telemetry::batch_telemetry_info{},
+      {},
+      {},
+      targets({int64, int64}));
+
+    auto first = provider->get_next_batch();
+    REQUIRE(first.data);
+    REQUIRE(first.needs_carrier_conversion);
+    REQUIRE(first.conversion_destination_bytes == 4 * sizeof(std::int64_t));
+
+    auto second = provider->get_next_batch();
+    REQUIRE(second.data);
+    REQUIRE_FALSE(second.needs_carrier_conversion);
+    REQUIRE(second.conversion_destination_bytes == 0);
+  }
+
+  SECTION("compressed chunks take rows from the representation and always add the mask term")
+  {
+    // Empty-blob compressed chunk: metadata only, nothing here decompresses. A compressed
+    // chunk's per-column nullability is opaque, so its validity-mask term is always added
+    // (over-approximation, never under).
+    pinned_entry host_entry;
+    set_cached_columns(host_entry, {"k"});
+    host_entry.tier         = cucascade::memory::Tier::HOST;
+    host_entry.memory_space = e.host_space;
+    host_entry.host_chunks.emplace_back(std::make_shared<sirius::compressed_host_representation>(
+      *e.host_space,
+      std::make_shared<sirius::pinned_compressed_blob>(),
+      std::vector<std::string>{"k"},
+      /*compressed_bytes=*/64,
+      /*uncompressed_bytes=*/256,
+      /*num_rows=*/static_cast<std::int64_t>(rows)));
+    host_entry.num_rows       = rows;
+    host_entry.column_storage = {{narrow_meta(int8)}};
+
+    auto host_batch = serve_one(host_entry, {0}, targets({int64}));
+    REQUIRE(host_batch.data);
+    REQUIRE(host_batch.needs_carrier_conversion);
+    REQUIRE(host_batch.conversion_destination_bytes == rows * sizeof(std::int64_t) + mask_bytes);
+
+    pinned_entry device_entry;
+    set_cached_columns(device_entry, {"k"});
+    device_entry.tier         = cucascade::memory::Tier::GPU;
+    device_entry.memory_space = e.gpu_space;
+    sirius::device_pin_chunk chunk;
+    chunk.memory_space = e.gpu_space;
+    chunk.compressed   = std::make_shared<sirius::compressed_device_representation>(
+      *e.gpu_space,
+      /*blob=*/nullptr,
+      std::vector<std::string>{"k"},
+      /*compressed_bytes=*/64,
+      /*uncompressed_bytes=*/256,
+      /*num_rows=*/static_cast<std::int64_t>(rows));
+    device_entry.device_chunks.push_back(std::move(chunk));
+    device_entry.num_rows       = rows;
+    device_entry.column_storage = {{narrow_meta(int8)}};
+
+    auto device_batch = serve_one(device_entry, {0}, targets({int64}));
+    REQUIRE(device_batch.data);
+    REQUIRE(device_batch.needs_carrier_conversion);
+    REQUIRE(device_batch.conversion_destination_bytes == rows * sizeof(std::int64_t) + mask_bytes);
+  }
+}
+
+TEST_CASE("pinned_column_narrowed_in_all_chunks folds the marker matrix per column",
+          "[cached_serving][scan_manager]")
+{
+  auto& e    = env();
+  auto entry = make_gpu_entry(*e.gpu_space, 3, 4);
+  auto const int32{cudf::data_type{cudf::type_id::INT32}};
+
+  SECTION("empty (all-native compat) matrix folds false")
+  {
+    entry.column_storage = {};
+    REQUIRE_FALSE(sirius::scan_manager::pinned_column_narrowed_in_all_chunks(entry, 0));
+  }
+
+  SECTION("columns fold independently")
+  {
+    // Column 0 narrowed in every chunk; column 1 mixed (true in one chunk,
+    // false in another); column 2 never narrowed.
+    entry.column_storage = {meta_row(int32, {true, true, false}),
+                            meta_row(int32, {true, false, false}),
+                            meta_row(int32, {true, true, false})};
+    REQUIRE(sirius::scan_manager::pinned_column_narrowed_in_all_chunks(entry, 0));
+    REQUIRE_FALSE(sirius::scan_manager::pinned_column_narrowed_in_all_chunks(entry, 1));
+    REQUIRE_FALSE(sirius::scan_manager::pinned_column_narrowed_in_all_chunks(entry, 2));
+  }
+
+  SECTION("out-of-range position folds false")
+  {
+    entry.column_storage = {meta_row(int32, {true, true, true}),
+                            meta_row(int32, {true, true, true}),
+                            meta_row(int32, {true, true, true})};
+    REQUIRE_FALSE(sirius::scan_manager::pinned_column_narrowed_in_all_chunks(entry, 3));
+  }
+}
+
+TEST_CASE("pinned_column_narrow_carrier derives the widest recorded carrier per column",
+          "[cached_serving][scan_manager]")
+{
+  auto const int64{cudf::data_type{cudf::type_id::INT64}};
+  auto const int32{cudf::data_type{cudf::type_id::INT32}};
+  auto const int16{cudf::data_type{cudf::type_id::INT16}};
+  auto const int8{cudf::data_type{cudf::type_id::INT8}};
+
+  // Single-column entry whose chunk c records @p carriers[c], all marked narrowed so the
+  // derivation (not the marker fold) is what each section probes. The fold reads only the
+  // recorded metadata, so the fixture carries no storage at all.
+  auto make_single_column_meta_entry = [](std::vector<cudf::data_type> const& carriers) {
+    pinned_entry entry;
+    set_cached_columns(entry, {"k"});
+    entry.tier = cucascade::memory::Tier::GPU;
+    for (auto const type : carriers) {
+      entry.column_storage.push_back({narrow_meta(type)});
+    }
+    entry.num_rows = carriers.size() * 4;
+    return entry;
+  };
+
+  SECTION("uniform carrier")
+  {
+    auto entry        = make_single_column_meta_entry({int32, int32, int32});
+    auto const target = sirius::scan_manager::pinned_column_narrow_carrier(entry, 0, int64);
+    REQUIRE(target.has_value());
+    REQUIRE(*target == int32);
+  }
+
+  SECTION("mixed widths derive the widest")
+  {
+    auto entry        = make_single_column_meta_entry({int8, int16, int32});
+    auto const target = sirius::scan_manager::pinned_column_narrow_carrier(entry, 0, int64);
+    REQUIRE(target.has_value());
+    REQUIRE(*target == int32);
+  }
+
+  SECTION("a false marker yields nullopt")
+  {
+    auto entry           = make_single_column_meta_entry({int8, int16, int32});
+    entry.column_storage = {{narrow_meta(int8)}, {native_meta(int16)}, {narrow_meta(int32)}};
+    REQUIRE_FALSE(sirius::scan_manager::pinned_column_narrow_carrier(entry, 0, int64).has_value());
+    entry.column_storage = {};
+    REQUIRE_FALSE(sirius::scan_manager::pinned_column_narrow_carrier(entry, 0, int64).has_value());
+  }
+
+  SECTION("a zero-chunk entry yields nullopt")
+  {
+    auto entry = make_single_column_meta_entry({});
+    REQUIRE_FALSE(sirius::scan_manager::pinned_column_narrow_carrier(entry, 0, int64).has_value());
+  }
+
+  SECTION("a carrier outside a strict same-family narrowing yields nullopt")
+  {
+    // Cross-family: an unsigned recorded carrier against a signed native carrier.
+    auto cross_family =
+      make_single_column_meta_entry({int8, cudf::data_type{cudf::type_id::UINT16}, int32});
+    REQUIRE_FALSE(
+      sirius::scan_manager::pinned_column_narrow_carrier(cross_family, 0, int64).has_value());
+
+    // Not a strict narrowing: a chunk recorded at the native width.
+    auto native_width = make_single_column_meta_entry({int8, int64});
+    REQUIRE_FALSE(
+      sirius::scan_manager::pinned_column_narrow_carrier(native_width, 0, int64).has_value());
+  }
+
+  SECTION("decimal carriers preserve the recorded scale")
+  {
+    auto const decimal32_s2{cudf::data_type{cudf::type_id::DECIMAL32, -2}};
+    auto const decimal64_s2{cudf::data_type{cudf::type_id::DECIMAL64, -2}};
+
+    auto entry        = make_single_column_meta_entry({decimal32_s2, decimal32_s2});
+    auto const target = sirius::scan_manager::pinned_column_narrow_carrier(entry, 0, decimal64_s2);
+    REQUIRE(target.has_value());
+    REQUIRE(*target == decimal32_s2);
+
+    // A chunk with a different cuDF scale is outside the carrier family.
+    auto mixed_scale =
+      make_single_column_meta_entry({decimal32_s2, cudf::data_type{cudf::type_id::DECIMAL32, -1}});
+    REQUIRE_FALSE(
+      sirius::scan_manager::pinned_column_narrow_carrier(mixed_scale, 0, decimal64_s2).has_value());
+  }
+
+  SECTION("a DECIMAL(p,0)-shaped carrier keeps its zero scale distinct from the integer family")
+  {
+    auto const decimal64_s0{cudf::data_type{cudf::type_id::DECIMAL64, 0}};
+    auto const decimal128_s0{cudf::data_type{cudf::type_id::DECIMAL128, 0}};
+    auto entry = make_single_column_meta_entry({decimal64_s0, decimal64_s0});
+    auto const decimal_target =
+      sirius::scan_manager::pinned_column_narrow_carrier(entry, 0, decimal128_s0);
+    REQUIRE(decimal_target.has_value());
+    REQUIRE(*decimal_target == decimal64_s0);
+    REQUIRE_FALSE(sirius::scan_manager::pinned_column_narrow_carrier(entry, 0, int64).has_value());
+  }
+
+  SECTION("out-of-range entry_position yields nullopt")
+  {
+    // A position beyond the recorded rows fails the marker fold.
+    auto entry           = make_single_column_meta_entry({int8, int16});
+    entry.column_storage = {meta_row(int8, {true, true}), meta_row(int16, {true, true})};
+    REQUIRE_FALSE(sirius::scan_manager::pinned_column_narrow_carrier(entry, 2, int64).has_value());
+  }
+
+  SECTION("a matrix wider than the entry's columns yields nullopt")
+  {
+    // The matrix and the entry's column list disagree, which insertion would have rejected. This
+    // runs at plan time, on an entry no serving validator has inspected, so the narrower of the
+    // two authorities wins rather than the fold answering from an unvalidated cell.
+    auto entry           = make_single_column_meta_entry({int8, int16});
+    entry.column_storage = {meta_row(int8, {true, true, true}),
+                            meta_row(int16, {true, true, true})};
+    REQUIRE_FALSE(sirius::scan_manager::pinned_column_narrow_carrier(entry, 2, int64).has_value());
   }
 }
 
@@ -517,9 +1038,9 @@ TEST_CASE("validate_pinned_entry_for_serving accepts well-formed and zero-chunk 
   SECTION("zero-chunk GPU entry")
   {
     pinned_entry entry;
-    entry.cache_info.names = {"k"};
-    entry.tier             = cucascade::memory::Tier::GPU;
-    entry.memory_space     = e.gpu_space;
+    set_cached_columns(entry, {"k"});
+    entry.tier         = cucascade::memory::Tier::GPU;
+    entry.memory_space = e.gpu_space;
     REQUIRE_NOTHROW(validate_pinned_entry_for_serving(entry, std::vector<std::size_t>{0}));
   }
 
@@ -591,6 +1112,31 @@ TEST_CASE("validate_pinned_entry_for_serving refuses malformed entries",
     entry.data_batches_by_column["k"][1] = nullptr;
     REQUIRE_THROWS_AS(validate_pinned_entry_for_serving(entry, std::vector<std::size_t>{0}),
                       std::runtime_error);
+  }
+
+  SECTION("storage-metadata matrix chunk count disagrees")
+  {
+    auto entry           = make_gpu_entry(*e.gpu_space, 2, 4);
+    entry.column_storage = {meta_row(cudf::data_type{cudf::type_id::INT32}, {true, false, false})};
+    REQUIRE_THROWS_AS(validate_pinned_entry_for_serving(entry, std::vector<std::size_t>{0}),
+                      std::invalid_argument);
+  }
+
+  SECTION("storage-metadata matrix column count disagrees")
+  {
+    auto entry           = make_gpu_entry(*e.gpu_space, 2, 4);
+    auto const int32     = cudf::data_type{cudf::type_id::INT32};
+    entry.column_storage = {meta_row(int32, {true, false}), meta_row(int32, {false, false})};
+    REQUIRE_THROWS_AS(validate_pinned_entry_for_serving(entry, std::vector<std::size_t>{0}),
+                      std::invalid_argument);
+  }
+
+  SECTION("host storage-metadata matrix shape disagrees")
+  {
+    auto entry           = make_host_entry(e, 2, 4);
+    entry.column_storage = {meta_row(cudf::data_type{cudf::type_id::INT32}, {true, false})};
+    REQUIRE_THROWS_AS(validate_pinned_entry_for_serving(entry, std::vector<std::size_t>{0}),
+                      std::invalid_argument);
   }
 
   SECTION("null host chunk")
@@ -725,5 +1271,165 @@ TEST_CASE("prepare_for_processing skips the steal for masked or row-filtered spl
     auto ro = batch->to_read_only();
     REQUIRE(ro.get_current_tier() == cucascade::memory::Tier::GPU);
     REQUIRE(ro.get_data()->get_size_in_bytes() > 0);
+  }
+}
+
+// Compressed chunks are opaque blobs, but the carrier fold never needs to open them: the pin
+// driver recorded each chunk's compress-input types in column_storage, and by Simpatico's
+// round-trip contract decompression reproduces exactly those types. These tests pin that the
+// fold answers identically for compressed storage forms on both tiers.
+TEST_CASE("pinned_column_narrow_carrier derives from recorded metadata on compressed entries",
+          "[cached_serving][scan_manager][compression]")
+{
+  auto& e = env();
+  auto const int64{cudf::data_type{cudf::type_id::INT64}};
+  auto const int32{cudf::data_type{cudf::type_id::INT32}};
+
+  SECTION("compression-enabled device entry (device_chunks form)")
+  {
+    auto entry           = make_device_chunks_entry(*e.gpu_space, /*n_chunks=*/2, /*rows=*/4);
+    entry.column_storage = {meta_row(int32, {true, true, true}),
+                            meta_row(int32, {true, true, true})};
+    auto const target =
+      sirius::scan_manager::pinned_column_narrow_carrier(entry, /*entry_position=*/1, int64);
+    REQUIRE(target.has_value());
+    REQUIRE(*target == int32);
+  }
+
+  SECTION("compressed host chunk (empty blob -- nothing here decompresses)")
+  {
+    pinned_entry entry;
+    entry.tier         = cucascade::memory::Tier::HOST;
+    entry.memory_space = e.host_space;
+    set_cached_columns(entry, {"k"});
+    entry.host_chunks.emplace_back(std::make_shared<sirius::compressed_host_representation>(
+      *e.host_space,
+      std::make_shared<sirius::pinned_compressed_blob>(),
+      std::vector<std::string>{"k"},
+      /*compressed_bytes=*/64,
+      /*uncompressed_bytes=*/256,
+      /*num_rows=*/4));
+    entry.num_rows       = 4;
+    entry.column_storage = {{narrow_meta(int32)}};
+
+    auto const target =
+      sirius::scan_manager::pinned_column_narrow_carrier(entry, /*entry_position=*/0, int64);
+    REQUIRE(target.has_value());
+    REQUIRE(*target == int32);
+
+    // An empty matrix (nothing recorded) keeps the column native.
+    entry.column_storage = {};
+    REQUIRE_FALSE(
+      sirius::scan_manager::pinned_column_narrow_carrier(entry, /*entry_position=*/0, int64)
+        .has_value());
+  }
+}
+
+TEST_CASE("validate_pinned_entry_for_serving checks the device-entry matrix shape",
+          "[cached_serving][scan_manager][compression]")
+{
+  auto& e    = env();
+  auto entry = make_device_chunks_entry(*e.gpu_space, /*n_chunks=*/2, /*rows=*/4);
+  auto const int32{cudf::data_type{cudf::type_id::INT32}};
+
+  SECTION("empty matrix (all-native compat) passes")
+  {
+    REQUIRE_NOTHROW(validate_pinned_entry_for_serving(entry, std::vector<std::size_t>{0, 1, 2}));
+  }
+
+  SECTION("matrix with the wrong chunk count throws")
+  {
+    entry.column_storage.assign(1, meta_row(int32, {false, false, false}));
+    REQUIRE_THROWS_AS(validate_pinned_entry_for_serving(entry, std::vector<std::size_t>{0, 1, 2}),
+                      std::invalid_argument);
+  }
+
+  SECTION("matrix with the wrong column count throws")
+  {
+    entry.column_storage.assign(2, meta_row(int32, {false, false}));
+    REQUIRE_THROWS_AS(validate_pinned_entry_for_serving(entry, std::vector<std::size_t>{0, 1, 2}),
+                      std::invalid_argument);
+  }
+}
+
+// The insert-time cross-check every pin path shares. Each insert supplies a callable that reads
+// its own storage form; the three callables here mirror those, so the rule they collapse to --
+// a recorded carrier must equal the stored type wherever storage can report one -- is pinned
+// once for all three rather than once per insert.
+TEST_CASE("validate_recorded_column_storage cross-checks recorded carriers against storage",
+          "[cached_serving][scan_manager][compression]")
+{
+  auto const int64{cudf::data_type{cudf::type_id::INT64}};
+  auto const int32{cudf::data_type{cudf::type_id::INT32}};
+  constexpr std::string_view kContext = "[test]";
+
+  // Two chunks x two columns, everything recorded INT32.
+  sirius::pinned_column_storage_matrix matrix{carrier_row({int32, int32}),
+                                              carrier_row({int32, int32})};
+
+  SECTION("a matrix matching the stored types passes")
+  {
+    auto stored = [&](std::size_t, std::size_t) { return std::optional<cudf::data_type>{int32}; };
+    REQUIRE_NOTHROW(
+      sirius::scan_manager::validate_recorded_column_storage(matrix, 2, 2, kContext, stored));
+  }
+
+  SECTION("GPU tables: a contradictory recorded carrier throws")
+  {
+    // insert_pinned_entry reads cudf::table::get_column(i).type(); a null chunk table reports
+    // nothing.
+    auto stored = [&](std::size_t chunk, std::size_t column) {
+      return chunk == 1 && column == 0 ? std::optional<cudf::data_type>{int64} : std::nullopt;
+    };
+    REQUIRE_THROWS_AS(
+      sirius::scan_manager::validate_recorded_column_storage(matrix, 2, 2, kContext, stored),
+      std::invalid_argument);
+  }
+
+  SECTION("host chunks: a contradictory recorded carrier throws")
+  {
+    // insert_pinned_entry_host reads the host column metadata; a compressed chunk reports
+    // nothing, and its recorded cells are trusted.
+    auto stored = [&](std::size_t chunk, std::size_t column) {
+      if (chunk == 0) { return std::optional<cudf::data_type>{}; }  // compressed chunk
+      return column == 1 ? std::optional<cudf::data_type>{int64} : std::optional<cudf::data_type>{};
+    };
+    REQUIRE_THROWS_AS(
+      sirius::scan_manager::validate_recorded_column_storage(matrix, 2, 2, kContext, stored),
+      std::invalid_argument);
+  }
+
+  SECTION("device chunks: a contradictory recorded carrier throws")
+  {
+    // insert_pinned_entry_device reads cudf::column::type() on the uncompressed form.
+    auto stored = [&](std::size_t, std::size_t column) {
+      return column == 0 ? std::optional<cudf::data_type>{int32}
+                         : std::optional<cudf::data_type>{int64};
+    };
+    REQUIRE_THROWS_AS(
+      sirius::scan_manager::validate_recorded_column_storage(matrix, 2, 2, kContext, stored),
+      std::invalid_argument);
+  }
+
+  SECTION("an opaque chunk is trusted, not cross-checked")
+  {
+    // Every cell unreadable -- an all-compressed pin. The recorded carriers stand.
+    auto stored = [](std::size_t, std::size_t) { return std::optional<cudf::data_type>{}; };
+    REQUIRE_NOTHROW(
+      sirius::scan_manager::validate_recorded_column_storage(matrix, 2, 2, kContext, stored));
+  }
+
+  SECTION("insertion requires coverage while serving tolerates an empty matrix")
+  {
+    auto stored = [&](std::size_t, std::size_t) { return std::optional<cudf::data_type>{int32}; };
+    REQUIRE_THROWS_AS(sirius::scan_manager::validate_recorded_column_storage(
+                        sirius::pinned_column_storage_matrix{}, 2, 2, kContext, stored),
+                      std::invalid_argument);
+    REQUIRE_NOTHROW(sirius::scan_manager::validate_column_storage_shape(
+      sirius::pinned_column_storage_matrix{}, 2, 2, kContext, /*allow_empty=*/true));
+
+    // A zero-chunk pin records nothing and is not an error.
+    REQUIRE_NOTHROW(sirius::scan_manager::validate_recorded_column_storage(
+      sirius::pinned_column_storage_matrix{}, 0, 2, kContext, stored));
   }
 }

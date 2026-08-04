@@ -358,29 +358,14 @@ std::vector<std::size_t> build_key_domain_cardinalities(duckdb::LogicalCompariso
 }  // namespace
 //===----------------------------------------------------------------------===//
 
-/// True when @p op is a *derived* relation rather than a base table read: its
-/// subtree contains a join, aggregate, or set operation that has already reduced
-/// its key set.
-///
-/// This is the distinction the "unfiltered build side" refusal actually needs.
-/// An unfiltered base relation is the whole key domain, so a dynamic filter from
-/// it keeps every probe row. An unfiltered *derived* relation is not — a join
-/// output carries only the keys that survived the join, and can be far smaller
-/// than the domain even though no predicate appears anywhere below it.
-///
-/// Descends through the pass-through operators (projection, filter, order) that
-/// sit between a join and its real input; stops at the first reducing operator.
-///
-/// A @c LOGICAL_DELIM_GET is a leaf with no children, so the recursion below can never reach the
-/// relation it stands for — but it is never a base table either. It replays the
-/// duplicate-eliminated columns of the enclosing delim join's other side, i.e. an already-joined,
-/// already-DISTINCT'd key set. TPC-H q17 is the case in point: the correlated
-/// `avg(l_quantity) per part` subquery joins the SECOND lineitem scan against a DELIM_GET carrying
-/// the distinct p_partkey values of `lineitem ⋈ part WHERE p_brand/p_container` — exactly the
-/// selective key set that already prunes the first lineitem scan. DuckDB additionally reports
-/// `build_side_has_filter = IsFiltering(children[0])` for this shape, inspecting the *probe* side
-/// (the unfiltered lineitem scan), so without this case the target DuckDB already computed in
-/// `probe_info` is discarded and the second scan runs unfiltered.
+/// True when @p op is a *derived* relation rather than a base table read: its subtree contains a
+/// join, aggregate, or set operation that has already reduced its key set. An unfiltered base
+/// relation is the whole key domain, but an unfiltered *derived* relation can be far smaller —
+/// the distinction the "unfiltered build side" refusal needs. Descends through pass-through
+/// operators (projection, filter, order); stops at the first reducing operator.
+/// @c LOGICAL_DELIM_GET is a childless leaf but never a base table: it replays the
+/// duplicate-eliminated (already joined, already DISTINCT'd) keys of the enclosing delim join's
+/// other side.
 static bool build_side_is_derived(const duckdb::LogicalOperator* op)
 {
   if (op == nullptr) { return false; }
@@ -586,18 +571,10 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
       // An unfiltered build is (for FK-shaped joins) the whole key domain — its filter keeps
       // every probe row by construction, so wiring a producer target for it only buys overhead.
       // DuckDB's flag covers the delim-join case where the effective build data is children[0].
-      //
-      // But "unfiltered" only implies "whole key domain" when the build side IS a base table.
-      // A build that is itself a join or aggregate output has already been reduced, so its key
-      // set is a strict subset of the domain and its filter can be highly selective even with
-      // no predicate anywhere in its subtree. TPC-H q3 is the case in point: the build of
-      // orders⋈lineitem is the output of customer⋈orders, and the filter it would produce keeps
-      // ~1% of lineitem.
-      //
-      // So the refusal now applies only to a base-relation build. For a derived build we wire
-      // the producer and let the *runtime* selectivity gate decide — it measures what the filter
-      // actually keeps and disables it if that is not worth the probe-side cost, which is a real
-      // measurement rather than a plan-time guess.
+      // That reasoning only holds when the build IS a base table: a derived build (join or
+      // aggregate output) can be a strict subset of the domain with no predicate anywhere in
+      // its subtree, so wire the producer and let the runtime selectivity gate measure whether
+      // the filter earns its probe-side cost.
       const bool derived_build = build_side_is_derived(op.children[1].get());
       if (!op.filter_pushdown->build_side_has_filter && !derived_build) {
         SIRIUS_LOG_INFO(
@@ -625,7 +602,15 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
           for (auto const& pi : op.filter_pushdown->probe_info) {
             auto channel = get_or_create_dynamic_filter_channel(pi.dynamic_filters.get());
             if (!channel) { continue; }
-            channel->register_producer();
+            // Declare this producer's planned target columns: the same probe_column_index values
+            // that become the publish plan's probe_col_idx below, so the planned set is exhaustive
+            // for every push_filter this producer can ever issue.
+            std::vector<std::size_t> planned_columns;
+            planned_columns.reserve(pi.columns.size());
+            for (auto const& col : pi.columns) {
+              planned_columns.push_back(col.probe_column_index.column_index);
+            }
+            channel->register_producer(std::move(planned_columns));
             sirius::op::dynamic_filter_publish_plan::probe_target target{std::move(channel), {}};
             target.probe_col_idx.reserve(pi.columns.size());
             target.probe_col_type.reserve(pi.columns.size());

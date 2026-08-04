@@ -223,6 +223,14 @@ class scan_operator_input : public op::operator_data {
   /// consumption (scan-internal OOM retry) must fail loudly rather than
   /// serve the emptied wrapper batch as zero rows.
   mutable bool stolen_table_consumed{false};
+  /// True when scan normalization will cast at least one selected column of this resident cached
+  /// split. Stamped by drain_cached_provider from databatch_provider::batch, which owns the
+  /// definition.
+  bool needs_carrier_conversion{false};
+  /// Stamped by drain_cached_provider from databatch_provider::batch::conversion_destination_bytes,
+  /// which owns the definition. Zero means unknown; the scan memory estimate then keeps its
+  /// conservative maximum-expansion bound.
+  std::size_t conversion_destination_bytes{0};
 };
 
 }  // namespace sirius::op::scan

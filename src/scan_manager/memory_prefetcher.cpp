@@ -16,9 +16,11 @@
 
 #include "scan_manager/memory_prefetcher.hpp"
 
+#include "data/data_batch_utils.hpp"
 #include "data/sirius_converter_registry.hpp"
 #include "log/logging.hpp"
 
+#include <rmm/cuda_device.hpp>
 #include <rmm/error.hpp>
 
 #include <cucascade/cudf/gpu_data_representation.hpp>
@@ -64,13 +66,14 @@ void memory_prefetcher::stop()
   if (_running.compare_exchange_strong(expected, false)) {
     SIRIUS_LOG_INFO(
       "[memory_prefetcher] stopping: prefetched {} batches / {} bytes "
-      "(stops: headroom={} reservation={}, skips: lock={} draining={})",
+      "(stops: headroom={} reservation={}, skips: lock={} draining={}, errors={})",
       _batches_prefetched.load(),
       _bytes_prefetched.load(),
       _stops_headroom.load(),
       _stops_reservation.load(),
       _skips_lock.load(),
-      _skips_draining.load());
+      _skips_draining.load(),
+      _errors_conversion.load());
   }
   for (auto& worker : _workers) {
     if (worker.joinable()) { worker.join(); }
@@ -80,6 +83,10 @@ void memory_prefetcher::stop()
 
 void memory_prefetcher::worker_loop()
 {
+  // Bind this worker to the space's device: a fresh thread's current device is
+  // 0, and the compression converters allocate from the CURRENT device's
+  // resource rather than the target space's.
+  rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{_gpu_space->get_device_id()}};
   auto stream = _stream_pool->acquire_stream();
   while (_running.load(std::memory_order_relaxed)) {
     std::size_t converted = 0;
@@ -128,8 +135,7 @@ std::size_t memory_prefetcher::sweep(rmm::cuda_stream_view stream)
     // skipping the connector entirely, convert TAIL-FIRST and leave a head
     // margin for the batches the scan will pop imminently. At most ONE worker
     // may do this per connector: stacking prefetch parallelism on top of the
-    // scan's own conversion threads regresses short scan-bound queries
-    // (measured: fully relaxed = suite +3.5%, q15 +18%).
+    // scan's own conversion threads regresses short scan-bound queries.
     const bool draining = connector->is_draining(_config.drain_quiet_ms);
     bool claimed        = false;
     if (draining) {
@@ -169,9 +175,9 @@ std::size_t memory_prefetcher::sweep(rmm::cuda_stream_view stream)
       // Cheap pre-check under a shared lock; skip GPU-resident batches. Must
       // be NON-blocking: a sibling worker converting this batch holds its
       // exclusive lock for the whole conversion, and a blocking to_read_only
-      // here would convoy the workers batch-by-batch (measured: N workers,
-      // conversion concurrency 1).
+      // here would convoy the workers batch-by-batch.
       std::size_t batch_bytes = 0;
+      std::size_t peak_bytes  = 0;
       {
         auto ro = batch->try_to_read_only();
         if (!ro || ro->get_data() == nullptr ||
@@ -179,13 +185,17 @@ std::size_t memory_prefetcher::sweep(rmm::cuda_stream_view stream)
           continue;
         }
         batch_bytes = ro->get_data()->get_size_in_bytes();
+        // A compressed batch stages its encoded payload on device while the
+        // decoded output is written, so gate and reserve the conversion PEAK,
+        // not the resting size.
+        peak_bytes = sirius::peak_materialization_bytes(ro->get_data());
       }
 
       // Headroom gate: never let prefetched (unreclaimable) bytes push the
       // space below the free floor. This also keeps the reservation below out
       // of the executors' way: it is only attempted while the space has at
       // least min_free_fraction headroom to spare.
-      if (_gpu_space->get_available_memory() < batch_bytes + min_free_bytes) {
+      if (_gpu_space->get_available_memory() < peak_bytes + min_free_bytes) {
         // No room for this batch now; later batches are at least as far from
         // being consumed, so stop the whole sweep and retry after tasks free
         // memory.
@@ -204,7 +214,7 @@ std::size_t memory_prefetcher::sweep(rmm::cuda_stream_view stream)
         continue;
       }
 
-      auto reservation = _gpu_space->make_reservation_or_null(batch_bytes);
+      auto reservation = _gpu_space->make_reservation_or_null(peak_bytes);
       if (!reservation) {
         _stops_reservation.fetch_add(1, std::memory_order_relaxed);
         return converted;
@@ -218,6 +228,16 @@ std::size_t memory_prefetcher::sweep(rmm::cuda_stream_view stream)
         SIRIUS_LOG_DEBUG("[memory_prefetcher] OOM converting batch {}; backing off",
                          mut->get_batch_id());
         return converted;
+      } catch (const std::exception& e) {
+        // Conversion is more than data movement (compressed batches decode
+        // here), so non-OOM failures are possible. Skip the batch: the scan
+        // task converts it itself on the authoritative path and surfaces the
+        // error to the query if it persists.
+        _errors_conversion.fetch_add(1, std::memory_order_relaxed);
+        SIRIUS_LOG_WARN("[memory_prefetcher] conversion of batch {} failed (skipping): {}",
+                        mut->get_batch_id(),
+                        e.what());
+        continue;
       }
 
       ++converted;

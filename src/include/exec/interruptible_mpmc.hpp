@@ -19,10 +19,11 @@
 #include <blockingconcurrentqueue.h>
 
 #include <atomic>
-#include <cstdint>
 #include <concepts>
+#include <cstdint>
 #include <memory>
 #include <optional>
+#include <vector>
 
 namespace sirius::exec {
 
@@ -111,24 +112,27 @@ class interruptible_mpmc {
   /**
    * \brief Attempts to pop without blocking.
    * \return Returns nullptr if the queue is empty.
+   *
+   * Interrupt sentinels are skipped, not returned: try_pop reports work or
+   * emptiness, never interruption — otherwise a real item queued behind a
+   * sentinel would be unreachable to drain/cancel loops.
    */
   pointer_type try_pop()
   {
     pointer_type item = nullptr;
-    if (queue.try_dequeue(item)) { return std::move(item); }
+    while (queue.try_dequeue(item)) {
+      if (item != nullptr) { return std::move(item); }
+    }
     return nullptr;
   }
 
   /**
-   * Interrupts the queue.
    * \brief Clears the active flag AND wakes any blocked consumer immediately.
    *
-   * Previously this only set the flag, so a consumer blocked in wait_dequeue_timed did not notice
-   * until its poll interval elapsed — a mean 5 ms stall per interrupt. That is paid on the
-   * teardown path of every query (downgrade_executor::drain, task_creator::stop_thread_pool):
-   * measured at 5.10 ms mean over 43 calls, ~4.6% of an 11.6 s TPC-H SF1000 suite, on a workload
-   * with zero downgrade activity. Enqueuing null sentinels wakes the waiter at once; pop() maps a
-   * null item to its existing "interrupted" return. kWakeSentinels covers multiple consumers.
+   * A consumer blocked in wait_dequeue_timed would otherwise not notice the interrupt until its
+   * poll interval elapsed, a stall paid on the teardown path of every query. Enqueuing null
+   * sentinels wakes the waiter at once; pop() maps a null item to its existing "interrupted"
+   * return. kWakeSentinels covers multiple consumers.
    */
   void interrupt()
   {
@@ -158,11 +162,17 @@ class interruptible_mpmc {
    */
   void reactivate()
   {
-    // Discard any interrupt sentinels a consumer did not consume, so they cannot be mistaken for
-    // an interrupt after the queue is live again.
+    // Discard every unconsumed interrupt sentinel so it cannot be mistaken for an interrupt
+    // after the queue is live again. try_dequeue does not honor FIFO across producer
+    // sub-queues, so a single scan that stops at the first real item can leave sentinels
+    // behind it — drain to exhaustion, then re-enqueue the surviving real items.
+    std::vector<pointer_type> kept;
     pointer_type item = nullptr;
     while (queue.try_dequeue(item)) {
-      if (item != nullptr) { queue.enqueue(std::move(item)); break; }
+      if (item != nullptr) { kept.push_back(std::move(item)); }
+    }
+    for (auto& survivor : kept) {
+      queue.enqueue(std::move(survivor));
     }
     _is_active.store(true, std::memory_order_relaxed);
   }

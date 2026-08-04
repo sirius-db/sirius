@@ -65,40 +65,20 @@ using bloom_alloc = sirius::rmm_cuco_allocator<cuda::std::byte>;
 /**
  * @brief Fingerprint policy for Sirius's dynamic Bloom filters.
  *
- * Byte-for-byte identical to @c cuco::default_filter_policy<xxhash_64<KeyT>,uint32_t,8> in hash
- * function, block geometry (8 x 32-bit words = one 256-bit block = one 32-byte memory sector) and
- * fingerprint layout (its default @c pattern_bits==words_per_block, i.e. exactly one bit per word).
- * The @b only difference is @ref block_index.
+ * Identical to @c cuco::default_filter_policy<xxhash_64<KeyT>,uint32_t,8> in hash function,
+ * block geometry and fingerprint layout; the @b only difference is @ref block_index. Neither
+ * stock cuco policy fits here: @c arrow_filter_policy hard-caps the filter at 128 MiB (2^22
+ * blocks), below the sizes the publisher emits at scale, and @c default_filter_policy computes
+ * @c hash % num_blocks — an emulated 64-bit divide that dominates the probe kernel on GPUs.
+ * This policy keeps the uncapped sizing and replaces the modulo with Lemire fast-range
+ * (@c (hash*num_blocks)>>64, one @c mul.hi.u64).
  *
- * cuCollections offers two stock policies and neither is right here:
- *   - @c arrow_filter_policy maps the hash with a cheap multiply-shift, but hard-caps the filter at
- *     Arrow's 128 MiB (2^22 blocks). Every Bloom the publisher actually emits at SF1000 is larger
- *     than that (q21's are 2^22.13, 2^22.19 and 2^25.4 blocks), so it is never selected.
- *   - @c default_filter_policy has no cap but computes @c hash % num_blocks. NVIDIA GPUs have no
- *     integer-divide instruction and a 64-bit modulo by a runtime value is a long emulated
- *     sequence, which makes it -- not the random gather -- the probe kernel's bottleneck.
- *
- * This policy keeps the uncapped sizing and replaces the modulo with Lemire fast-range: one
- * @c mul.hi.u64. Measured on GB300 (152 SM, 115.5 MiB L2) at TPC-H SF1000 q21's real probe shape
- * (389M clustered @c l_orderkey probes, @c contains_async):
- * | build keys | filter    | @c hash%n | fast-range |       |
- * |------------|-----------|-----------|------------|-------|
- * | 73.2M      |  139.7 MB |   5.06 ms |    2.34 ms | 2.16x |
- * | 730.8M     | 1393.9 MB |   5.21 ms |    2.73 ms | 1.91x |
- *
- * That the modulo dominates rather than the gather is directly falsifiable and was falsified: a
- * 69.8 MB filter, small enough to sit entirely in L2, still ran at 4.93 ms with the modulo versus
- * 2.18 ms with fast-range. Filter size is not the lever; the block-index arithmetic is.
- *
- * @note Correctness. Fast-range is a deterministic, uniform map of a 64-bit hash onto
- *       @c [0,num_blocks) -- @c (hash*num_blocks)>>64 is @c <num_blocks for any @c hash<2^64 -- and
- *       is applied identically on @c add and @c contains, so the no-false-negative contract is
- *       preserved: a key that was inserted always tests positive. Only the false-positive @a set
- *       can differ, which is harmless because the join remains authoritative. Measured, it is a
- *       slight improvement: fast-range consumes the @a high hash bits while the fingerprint
- *       consumes the low 40, whereas the modulo draws both from the low bits; at the 73.2M-key
- *       shape the observed keep ratio fell from 5.002% to 4.878% against a 4.77% true-match rate,
- *       i.e. the false-positive rate roughly halved at identical footprint.
+ * @note Correctness. Fast-range is deterministic and applied identically on @c add and
+ *       @c contains, so the no-false-negative contract is preserved; only the false-positive
+ *       set can differ (the join remains authoritative). Fast-range consumes the high hash
+ *       bits while the fingerprint consumes the low 40, so the two draws stay disjoint until
+ *       very large block counts; measured false-positive rates at the shapes that motivated
+ *       this change were slightly better than the modulo's.
  */
 template <class KeyT>
 class sirius_bloom_policy {
@@ -250,8 +230,7 @@ std::unique_ptr<bloom_replica> build_bloom_replica(int device_id,
                                                    rmm::device_async_resource_ref mr,
                                                    cuda::stream_ref stream)
 {
-  // One policy for every size: unlike cuco's stock pair there is no cap to fall off, so there is
-  // no size-dependent branch and no second filter type to carry through the replica variant.
+  // The same policy serves every filter size, so replicas carry a single filter type.
   return std::make_unique<bloom_replica>(
     device_id, build_bloom<sirius_bloom<KeyT>>(keys, num_blocks, mr, stream));
 }

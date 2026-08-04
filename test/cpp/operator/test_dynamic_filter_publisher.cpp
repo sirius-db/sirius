@@ -132,3 +132,53 @@ TEST_CASE("dynamic-filter publisher falls through to the hash IN-list above the 
   require_published_membership<sirius::op::sirius_dynamic_in_list_filter>(
     sirius::op::sirius_dynamic_small_in_list_filter::k_max_keys + 1);
 }
+
+TEST_CASE("dynamic-filter publisher never publishes for an inequality condition ordinal",
+          "[dynamic_filter][publisher]")
+{
+  rmm::cuda_set_device_raii const device{rmm::cuda_device_id{kDeviceId}};
+  auto memory_manager = sirius::test::operator_utils::initialize_memory_manager(1);
+  auto replica_spaces = get_replica_spaces(*memory_manager);
+  auto& source_space  = replica_spaces.front().get_gpu_space();
+
+  auto channel = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
+  std::vector<sirius::op::dynamic_filter_publish_plan::probe_target> targets;
+  targets.push_back(
+    {channel,
+     {kProbeColumnIndex, kProbeColumnIndex + 1},
+     {cudf::data_type{cudf::type_id::INT64}, cudf::data_type{cudf::type_id::INT64}}});
+  sirius::op::dynamic_filter_publish_plan plan{
+    std::move(targets), false, {0, 0}, std::move(replica_spaces)};
+
+  // A MIXED_JOIN shape: DuckDB records pushdown candidates for the equality
+  // (ordinal 0) AND the inequality (ordinal 1) condition, but Sirius extracts
+  // build key columns only for equalities, so right_key_col_indices has one
+  // entry and ordinal 1 must publish nothing. A membership filter keyed on an
+  // inequality column would drop probe rows that satisfy the inequality but
+  // miss the build's exact key set.
+  duckdb::JoinFilterPushdownInfo pushdown{};
+  pushdown.join_condition.push_back(0);
+  pushdown.join_condition.push_back(1);
+  std::vector<sirius::op::sirius_physical_hash_join::key_cast_info> key_casts(1);
+  std::vector<cudf::size_type> right_key_col_indices{0};
+
+  auto const stream = source_space.acquire_stream();
+  auto eq_keys      = cudf::sequence(3,
+                                cudf::numeric_scalar<std::int64_t>(0, true, stream),
+                                cudf::numeric_scalar<std::int64_t>(1, true, stream),
+                                stream,
+                                source_space.get_default_allocator());
+  auto ineq_keys    = cudf::sequence(3,
+                                  cudf::numeric_scalar<std::int64_t>(100, true, stream),
+                                  cudf::numeric_scalar<std::int64_t>(1, true, stream),
+                                  stream,
+                                  source_space.get_default_allocator());
+
+  std::vector<cudf::column_view> columns{eq_keys->view(), ineq_keys->view()};
+  cudf::table_view build_view{columns};
+  sirius::op::dynamic_filter_publisher{pushdown, plan, key_casts, right_key_col_indices}.publish(
+    build_view, stream);
+
+  REQUIRE(channel->filters_for_column(kProbeColumnIndex).size() == 1);
+  REQUIRE(channel->filters_for_column(kProbeColumnIndex + 1).empty());
+}

@@ -203,6 +203,7 @@ static void from_yaml(const YAML::Node& node, operator_params& opt)
              opt.dynamic_filter_domain_coverage_threshold);
   r.optional("dynamic_filter_keep_threshold", opt.dynamic_filter_keep_threshold);
   r.optional("enable_pinned_zone_map_pruning", opt.enable_pinned_zone_map_pruning);
+  r.optional("enable_compressed_materialization", opt.enable_compressed_materialization);
   r.reject_unknown();
 }
 
@@ -224,7 +225,6 @@ static void from_yaml(const YAML::Node& node, compression_config& opt)
   r.optional("min_batch_size_bytes", yaml::bytes(opt.min_batch_size_bytes));
   r.optional("max_compressed_fraction", opt.max_compressed_fraction);
   r.optional("input_plan_dir", opt.input_plan_dir);
-  r.optional("column_threads", opt.column_threads, yaml::greater_than<int>{0});
   r.reject_unknown();
 }
 

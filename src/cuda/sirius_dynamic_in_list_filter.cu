@@ -55,10 +55,7 @@
 namespace sirius::op {
 
 namespace {
-// Baseline load factor: capacity = 2 × keys. estimated_set_bytes reports this size, and the
-// publisher's "does the set fit L2?" test is evaluated against it, so this constant alone decides
-// IN-list vs Bloom. `capacity_factor_for` may grow the *actual* capacity beyond it (see below);
-// that only ever makes an already-fitting set sparser, never flips the filter choice.
+// Baseline load factor: capacity = 2 × keys.
 constexpr std::size_t kCapacityFactor = 2;
 constexpr double kLoadFactor          = 1.0 / kCapacityFactor;
 
@@ -66,19 +63,14 @@ constexpr double kLoadFactor          = 1.0 / kCapacityFactor;
 constexpr std::size_t kCgSize = 1;
 static_assert(kCgSize == 1, "cuco::static_set requires kCgSize==1 for device_for bulk iteration");
 
-// Keys per bucket. compute_mask is a pure miss-heavy membership probe, so its cost is dominated by
-// the number of *random* slot fetches, not by bytes compared. Packing 4 keys into one bucket lets a
-// single 16 B (INT32) / 32 B (INT64) fetch retire what bucket size 1 needed up to 4 dependent
-// fetches for. Measured at the SF1000 probe shapes this is worth 1.16-1.30x on its own, and it
-// leaves capacity (and therefore estimated_set_bytes and the replica byte count) unchanged.
-// Bucket size 8 regresses: the extra intra-bucket comparisons outweigh the fetches saved.
+// Keys per bucket. Sized for a double-hashed probe, where each step is a random fetch and a
+// wider bucket retires several dependent fetches in one; the right value depends on the probing
+// scheme, not on the key type.
 constexpr std::int32_t kBucketSize = 4;
 
-// Largest capacity multiplier whose table still fits `budget`, else the baseline. A sparser table
-// shortens probe chains, but only pays while the table stays cache-resident -- past that the extra
-// footprint costs more than the saved probes (measured: at 4x, q9's 41 MB of keys grow to 166 MB,
-// blow the 115 MB L2 and give back the entire win). Half of L2 is the budget so the streaming probe
-// column still has room; the remaining candidates are tried largest-first.
+// Largest capacity multiplier whose table still fits `budget`, else the baseline. Growth only
+// makes an already-chosen set sparser: estimated_set_bytes (and so IN-list vs Bloom selection)
+// is always evaluated at the baseline factor.
 constexpr std::size_t kGrowthCandidates[] = {4, 3};
 
 [[nodiscard]] std::size_t capacity_factor_for(std::size_t num_keys, std::size_t key_bytes) noexcept
@@ -418,11 +410,8 @@ std::unique_ptr<cudf::column> sirius_dynamic_in_list_filter::compute_mask(
 
 std::size_t sirius_dynamic_in_list_filter::size() const noexcept { return _num_keys; }
 
-// Reports the *baseline* (kCapacityFactor) footprint, which is the smallest table this filter will
-// ever build. The constructor may pick a sparser table when one comfortably fits L2, so this is a
-// lower bound on the real allocation rather than an exact size -- deliberately so: it keeps the
-// caller's "does the set fit L2?" test, and hence the IN-list/Bloom choice, independent of the
-// probe-side tuning. Callers that need the true size must ask the built set for its capacity.
+// Reports the *baseline* (kCapacityFactor) footprint — a lower bound on the real allocation
+// rather than an exact size, keeping the IN-list/Bloom choice independent of probe-side tuning.
 std::size_t sirius_dynamic_in_list_filter::estimated_set_bytes(std::size_t num_keys,
                                                                cudf::data_type key_type) noexcept
 {
