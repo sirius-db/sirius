@@ -1184,12 +1184,27 @@ void try_install_late_mat_deferral(op::scan::sirius_gpu_scan_operator* scan_op,
     }
     target_arity = tail_types.size();
     expected_types.reserve(tail_types.size());
-    try {
-      for (auto const& lt : tail_types) {
-        expected_types.push_back(sirius::get_cudf_type(lt).id());
+    // Narrow column widths (#1260): when the plan pass installed a physical
+    // output schema on the tail, batches reach the port in THOSE carriers,
+    // not the native mapping — record them so the apply-time signature
+    // matcher agrees with what actually arrives. An empty override sidecar
+    // means the native schema (get_physical_types() contract).
+    if (target_tail->has_physical_overrides()) {
+      auto const& phys = target_tail->get_physical_types();
+      if (phys.size() != tail_types.size()) {
+        return;  // malformed sidecar: refuse rather than half-match
       }
-    } catch (std::exception const&) {
-      return;  // untranslatable planned type: refuse rather than half-match
+      for (auto const& dt : phys) {
+        expected_types.push_back(dt.id());
+      }
+    } else {
+      try {
+        for (auto const& lt : tail_types) {
+          expected_types.push_back(sirius::get_cudf_type(lt).id());
+        }
+      } catch (std::exception const&) {
+        return;  // untranslatable planned type: refuse rather than half-match
+      }
     }
   }
 

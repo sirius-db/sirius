@@ -16,6 +16,7 @@
 
 #include "op/late_mat_port_materialize.hpp"
 
+#include "helper/numeric_narrowing.hpp"
 #include "late_mat/late_materializer.hpp"
 #include "log/logging.hpp"
 
@@ -37,21 +38,58 @@ namespace sirius::op {
 
 namespace {
 
-/// Placeholder-signature check, hardened per review finding F1: the ENTIRE table schema
-/// must equal the expected post-substitution schema (producer's planned
-/// types with deferred positions as UINT64/INT8). A directive without a full
-/// schema never matches — no partial-signature matching exists anymore.
-bool matches_placeholder_signature(cudf::table_view const& view,
-                                   late_mat::port_materialize_directive const& d)
+/// Placeholder-signature classification, hardened per review finding F1 and
+/// extended for narrow column widths (#1260): a batch is DEFERRED iff it
+/// carries the full placeholder pattern (INT8 at every deferred position,
+/// UINT64 — or UINT32 for narrow rider keys — at each bundle's rowid
+/// position) at the directive's arity. A deferred batch's remaining columns
+/// must then match the recorded schema, tolerating value-preserving numeric
+/// carrier drift on NON-deferred positions: the plan may serve a column in a
+/// narrower (or the restored) carrier of the same numeric family than the
+/// one recorded at install, which is irrelevant to the splice. Any residual
+/// divergence is MISMATCH — and the caller must fail loudly, because
+/// silently passing a deferred batch through emits placeholders and raw row
+/// ids as user-visible results.
+enum class signature_match : std::uint8_t { not_deferred, deferred, mismatch };
+
+signature_match classify_placeholder_signature(cudf::table_view const& view,
+                                               late_mat::port_materialize_directive const& d)
 {
-  if (d.expected_types.empty()) { return false; }
-  if (static_cast<std::size_t>(view.num_columns()) != d.expected_types.size()) { return false; }
-  for (cudf::size_type c = 0; c < view.num_columns(); ++c) {
-    if (view.column(c).type().id() != d.expected_types[static_cast<std::size_t>(c)]) {
-      return false;
+  if (d.expected_types.empty()) { return signature_match::not_deferred; }
+  if (static_cast<std::size_t>(view.num_columns()) != d.expected_types.size()) {
+    return signature_match::not_deferred;
+  }
+  std::vector<bool> is_deferred(d.expected_types.size(), false);
+  for (auto const& bundle : d.bundles) {
+    for (auto const pos : bundle.positions) {
+      is_deferred[pos] = true;
+      auto const id = view.column(static_cast<cudf::size_type>(pos)).type().id();
+      if (pos == bundle.rowid_position) {
+        if (id != cudf::type_id::UINT64 && id != cudf::type_id::UINT32) {
+          return signature_match::not_deferred;
+        }
+      } else if (id != cudf::type_id::INT8) {
+        return signature_match::not_deferred;
+      }
     }
   }
-  return true;
+  for (std::size_t c = 0; c < d.expected_types.size(); ++c) {
+    if (is_deferred[c]) { continue; }
+    auto const actual   = view.column(static_cast<cudf::size_type>(c)).type();
+    auto const expected = cudf::data_type{d.expected_types[c]};
+    if (actual.id() == expected.id()) { continue; }
+    if (sirius::can_narrow_to(actual, expected) || sirius::can_restore_to(actual, expected)) {
+      continue;
+    }
+    SIRIUS_LOG_ERROR(
+      "[late_mat_apply_port_directive] deferred batch column {} carrier {} does not match "
+      "recorded {} and is not a value-preserving numeric variant",
+      c,
+      cudf::type_to_name(actual),
+      cudf::type_to_name(expected));
+    return signature_match::mismatch;
+  }
+  return signature_match::deferred;
 }
 
 }  // namespace
@@ -63,7 +101,18 @@ bool matches_placeholder_signature(cudf::table_view const& view,
 {
   auto const* gpu_rep = dynamic_cast<::cucascade::gpu_table_representation const*>(ro.get_data());
   if (gpu_rep == nullptr) { return ro; }
-  if (!matches_placeholder_signature(gpu_rep->get_table_view(), directive)) { return ro; }
+  switch (classify_placeholder_signature(gpu_rep->get_table_view(), directive)) {
+    case signature_match::not_deferred: return ro;
+    case signature_match::mismatch:
+      // Fail closed and LOUD: a batch carrying the placeholder pattern is a
+      // deferred batch; passing it through un-materialized would surface
+      // placeholders and raw row ids as query results.
+      throw std::runtime_error(
+        "[late_mat_apply_port_directive] deferred batch schema disagrees with the recorded "
+        "signature outside the deferred positions (carrier drift?); refusing to pass "
+        "placeholders through as results");
+    case signature_match::deferred: break;
+  }
 
   // Review finding F3: re-check every origin's generation at USE time (the
   // directive's views were resolved at install; a re-pin since then must fail
