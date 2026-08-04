@@ -86,8 +86,13 @@ struct head_object_result {
  */
 class rest_io_object : public sirius_io_object {
  public:
-  rest_io_object(std::string path, std::string bucket, std::string key, size_t size)
-    : _path(std::move(path)), _bucket(std::move(bucket)), _key(std::move(key)), _file_size(size)
+  rest_io_object(
+    std::string path, std::string bucket, std::string key, size_t size, std::string etag = {})
+    : _path(std::move(path)),
+      _bucket(std::move(bucket)),
+      _key(std::move(key)),
+      _file_size(size),
+      _etag(std::move(etag))
   {
   }
 
@@ -99,19 +104,22 @@ class rest_io_object : public sirius_io_object {
                  std::string key,
                  size_t object_size,
                  size_t window_lo,
-                 std::shared_ptr<const std::vector<std::uint8_t>> stash)
+                 std::shared_ptr<const std::vector<std::uint8_t>> stash,
+                 std::string etag = {})
     : _path(std::move(path)),
       _bucket(std::move(bucket)),
       _key(std::move(key)),
       _file_size(object_size),
       _window_lo(window_lo),
-      _stash(std::move(stash))
+      _stash(std::move(stash)),
+      _etag(std::move(etag))
   {
   }
 
   [[nodiscard]] const std::string& raw_file_cache_id() const noexcept override { return _path; }
   [[nodiscard]] const std::string& object_path() const noexcept override { return _path; }
   [[nodiscard]] size_t size() const noexcept override { return _file_size; }
+  [[nodiscard]] std::string_view validation_etag() const noexcept override { return _etag; }
 
   [[nodiscard]] const std::string& bucket() const noexcept { return _bucket; }
   [[nodiscard]] const std::string& key() const noexcept { return _key; }
@@ -133,6 +141,7 @@ class rest_io_object : public sirius_io_object {
   size_t _file_size{0};
   size_t _window_lo{0};
   std::shared_ptr<const std::vector<std::uint8_t>> _stash;
+  std::string _etag;
 };
 
 // ---------------------------------------------------------------------------
