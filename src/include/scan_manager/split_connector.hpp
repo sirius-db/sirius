@@ -20,6 +20,7 @@
 #include "op/sirius_physical_operator.hpp"
 
 #include <array>
+#include <atomic>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -97,8 +98,10 @@ class split_connector : public std::enable_shared_from_this<split_connector> {
   /// requirement. See @ref kSelectionFoldBudget for the second axis of the bound.
   ///
   /// Complexity: **O(1) in the queue length**, on both axes. The armed walk inspects at most
-  /// @ref kSelectionWindow splits *and* spends at most @ref kSelectionFoldBudget datasource
-  /// folds across them (plus the front split, which is always inspected); it stops early at the
+  /// @ref kSelectionWindow splits and spends at most `fold_cost(front) + @ref
+  /// kSelectionFoldBudget` datasource folds doing it: the front split is always classified and its
+  /// fold is not charged, so the budget governs only the optional splits behind it (see
+  /// @ref kSelectionFoldBudget for why that asymmetry is the point). The walk stops early at the
   /// first landed split. The deque erase is within the window, so it moves at most
   /// @c kSelectionWindow-1 pointers, and index 0 is a plain @c pop_front. The unarmed path does
   /// none of the above.
@@ -133,14 +136,29 @@ class split_connector : public std::enable_shared_from_this<split_connector> {
    * unbounded walk would be a scalability hazard.
    *
    * A split is hinted when it is a @c scan_operator_input, @p predicate accepts it, and it is
-   * prefetchable for @p kind (@c is_io_prefetchable / @c is_memory_prefetchable, the latter's
-   * @c nullopt treated as "yes"). Splits stay in the queue — nothing is extracted, despite what
-   * a name like @c extract_if would suggest.
+   * prefetchable for @p kind. For @c prefetch_kind::io that test is the structural classification
+   * recorded at push time — the same answer @c op::scan::scan_operator_input::is_io_prefetchable
+   * gives, read from a cached bit instead of re-walking the split's datasources. For
+   * @c prefetch_kind::memory it is @c is_memory_prefetchable, whose @c nullopt is treated as
+   * "yes". Splits stay in the queue — nothing is extracted, despite what a name like
+   * @c extract_if would suggest.
    *
    * @param upto_n    Look-ahead window size. Zero inspects nothing and returns 0.
    * @param kind      Which resource to warm.
    * @param predicate Caller filter, evaluated on each inspected split before the prefetchability
    *                  test.
+   *
+   * @warning **The cost is `upto_n × fold_cost`, not `upto_n`.** The window bounds how many
+   *          *splits* are inspected, not the work inside them: hinting one folds
+   *          @c op::scan::scan_operator_input::prefetch over every datasource it carries, and a
+   *          @c op::scan::parquet_split_info carries one per row-group slice — several hundred at
+   *          the 512 MB default @c scan_task_batch_size. All of it runs under @c _mutex (L2),
+   *          which a consumer blocks on inside @ref get_next_split while holding L1. That fold is
+   *          inherent — firing the hints is what this method *is* — so unlike the selection walk
+   *          it carries no internal fold budget (@ref kSelectionFoldBudget bounds
+   *          @ref get_next_split, which only *reads* state, and does not apply here). Bounding it
+   *          is therefore the caller's job: choose @p upto_n against the split shape this
+   *          connector carries, not against the queue length.
    *
    * @warning @p predicate runs at **lock rank L2** (@c split_connector::_mutex, held for the
    *          whole walk) and must not acquire any lock of rank L1 or lower: no
@@ -219,7 +237,8 @@ class split_connector : public std::enable_shared_from_this<split_connector> {
   static constexpr std::size_t kSelectionWindow = 8;
 
   /**
-   * @brief Hard ceiling on the datasource folds one @ref get_next_split may perform.
+   * @brief Hard ceiling on the datasource folds one @ref get_next_split may spend on the
+   *        **optional** splits behind the queue front.
    *
    * @ref kSelectionWindow bounds how many *splits* are inspected; this bounds the work **inside**
    * them. A @c op::scan::parquet_split_info carries one datasource per row-group slice, so at the
@@ -230,10 +249,24 @@ class split_connector : public std::enable_shared_from_this<split_connector> {
    * @c _mutex (L2) while the consumer holds @c sirius_pipeline::_status_mutex (L1) and every task
    * completion on the pipeline serialises behind it.
    *
+   * **What it governs: indices 1..@ref kSelectionWindow-1, and nothing else.** Split 0 is always
+   * inspected and its fold cost is **not** charged against this budget. That is not a rounding
+   * decision — split 0 is rule 3's mandatory fallback candidate *and* rules 1 and 2's first
+   * candidate, so an armed selection cannot answer at all without classifying it, and its fold is
+   * therefore unavoidable. Charging it would make the budget self-defeating on precisely the split
+   * shape it exists for: one front split of a few hundred datasources exhausts a 32-fold budget
+   * before index 1 is considered, the walk stops at one entry, rule 3 fires, and an armed
+   * connector degenerates into the same FIFO it already is when unarmed — with
+   * @ref kSelectionWindow unreachable.
+   *
+   * **Worst case per dequeue: `fold_cost(front) + kSelectionFoldBudget` folds.** The
+   * `fold_cost(front)` term is irreducible for an armed connector: the only way not to pay it is
+   * not to run the selection at all, which is exactly what @ref get_next_split's arming gate does
+   * on every shipped backend. It is bounded by one split's width, never by the queue length, so
+   * the dequeue stays O(1) in how many splits are queued either way.
+   *
    * The budget is spent against a per-split fold cost captured once at push time, on the producer
    * thread, so the consumer never walks a split's datasources to find out what it would cost.
-   * The window always inspects at least the front split, whatever its fold cost, so selection is
-   * never skipped entirely and rule 3 of @ref select_split_index always has a candidate.
    */
   static constexpr std::size_t kSelectionFoldBudget = 32;
 
@@ -254,10 +287,12 @@ class split_connector : public std::enable_shared_from_this<split_connector> {
 
   /// Fill @p out with the prefetch progress of the queued splits, front first, and return how
   /// many entries were written (always >= 1 when the queue is non-empty). Bounded on both axes:
-  /// at most @ref kSelectionWindow entries, and past the always-inspected front split it stops
-  /// before its accumulated @c _split_fold_costs would exceed @ref kSelectionFoldBudget. It also
-  /// **stops at the first landed split**: rule 1 of @ref select_split_index takes the first
-  /// @c cached entry, so nothing past it can change the answer. Caller must hold @c _mutex.
+  /// at most @ref kSelectionWindow entries, and the splits *behind* the always-inspected front one
+  /// stop before their accumulated @c _split_fold_costs would exceed @ref kSelectionFoldBudget —
+  /// the front split's own cost is not charged against that budget (see @ref kSelectionFoldBudget
+  /// for why). It also **stops at the first landed split**: rule 1 of @ref select_split_index
+  /// takes the first @c cached entry, so nothing past it can change the answer. Caller must hold
+  /// @c _mutex.
   std::size_t fill_progress_window(
     std::array<io::cache::prefetch_progress, kSelectionWindow>& out) const noexcept;
 
@@ -290,12 +325,27 @@ class split_connector : public std::enable_shared_from_this<split_connector> {
   /// Written under @c _mutex by @ref push_split and read under it by @ref get_next_split. The
   /// datasource walk that *computes* the value runs off the lock — that walk is exactly what the
   /// fold budget keeps out of the critical section — but the store itself is not hoisted with it.
-  bool _selection_armed{false};
+  /// Atomic for the same reason as @c _arming_checked below, with which it is latched as a pair.
+  std::atomic<bool> _selection_armed{false};
   /// Whether the one-shot arming decision above has been taken yet. Separate from
   /// @c _selection_armed so a connector whose first io-candidate says "no" does not re-walk on
-  /// every subsequent push. Producer-private: only @ref push_split touches it, which is why it can
-  /// be tested outside @c _mutex to skip the walk.
-  bool _arming_checked{false};
+  /// every subsequent push.
+  ///
+  /// **Atomic rather than mutex-protected, deliberately.** @ref push_split tests this flag
+  /// *outside* @c _mutex, because a false reading is what gates the one
+  /// @c can_land_while_queued() datasource walk per connector — the very walk that must not run
+  /// under L2 while a consumer holds L1. The authoritative latch still happens under the lock
+  /// (@c _selection_armed is read there by @ref get_next_split, so it must be *stored* there) and
+  /// both flags are re-checked under it, so an unlocked read that is stale costs at most one
+  /// redundant walk, never a wrong answer. Today the producer side is single-threaded —
+  /// @c load_balancing_scan_batch_coalescer::spawn_workers enqueues exactly one sequencer
+  /// callable, and @c worker_loop walks the pipelines inside it — but that invariant lives in
+  /// another file, is asserted nowhere, and the plural name invites one worker per slot. As plain
+  /// @c bool s an unlocked read racing the locked write would be a data race and therefore
+  /// undefined behaviour, not a stale read; as atomics it stays merely stale, which the re-check
+  /// under the lock absorbs. Relaxed ordering suffices on both: nothing is published through
+  /// either flag, and @c _mutex still orders the store against @ref get_next_split's read.
+  std::atomic<bool> _arming_checked{false};
   bool _closed{false};
   std::exception_ptr _exception;
 };

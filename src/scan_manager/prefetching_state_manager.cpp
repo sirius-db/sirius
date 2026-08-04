@@ -67,12 +67,33 @@ void prefetching_state_manager::clean_up() noexcept
   } catch (...) {  // deliberately swallowed: the log line is the only casualty
   }
 
-  // Detach. Written FIRST, so no hook can start work against a query whose connectors are gone.
+  // Detach. Be precise about *when* this lands, because the ordering is the opposite of what
+  // "detach first" would suggest:
   //
-  // This flag, not the weak_ptr the hooks capture, is what makes the stale-hook window safe. A
-  // straggler split still holds a shared_ptr to this manager, so the weak_ptr does NOT expire in
-  // that window -- it locks successfully, exactly when the query's split_connectors have already
-  // been destroyed along with the pipelines.
+  //   SiriusContext::run_mandatory_cleanup
+  //     query_.reset()                 <- destroys the query's pipelines and, with them, every
+  //                                       split_connector. The gate is still OPEN here.
+  //     ... drain, telemetry, repositories ...
+  //     scan_manager_->reset()         -> sirius_scan_manager::reset -> clean_up() -> this store.
+  //
+  // So the flag is latched *after* the connectors are already gone, and the gate stands open
+  // across that entire interval with nothing behind it. Latching it here closes only the tail of
+  // the window -- from this store until the manager itself dies -- which is still worth having,
+  // because that tail is unbounded in principle (the manager outlives the scan manager for as long
+  // as any straggler split holds a shared_ptr to it).
+  //
+  // The weak_ptr the hooks capture does not cover the interval either, which is why this flag
+  // exists at all: a straggler split still holds a shared_ptr to this manager, so the weak_ptr
+  // does NOT expire and lock() succeeds -- precisely when the connectors have already been
+  // destroyed.
+  //
+  // WARNING (mirrored as an @warning on clean_up's declaration): whoever wires the TODO'd
+  // split_connector::prefetch_if walk into on_task_queue_depleted / on_task_not_created must NOT
+  // read `_detached == false` as "this query's connectors are alive". It does not mean that in
+  // either direction: it is false throughout the post-query_.reset() interval above, and a hook
+  // that had already passed the check when this store lands is still running. That walk needs the
+  // connectors' own lifetime guarantee -- shared ownership of each connector it touches, or a
+  // driver whose lifetime is tied to them -- and this gate on top, never this gate alone.
   _detached.store(true, kOrder);
 
   // The counters are deliberately left alone: a straggler split can still be destroyed after this
@@ -123,13 +144,15 @@ void prefetching_state_manager::on_input_disposed() noexcept
 void prefetching_state_manager::on_task_queue_depleted() noexcept
 {
   // The detach gate, and the first statement on purpose. Once clean_up() has run, this query's
-  // split_connectors have already been destroyed with its pipelines, so anything this hook would
+  // split_connectors have certainly been destroyed with its pipelines, so anything this hook would
   // walk is gone. The weak_ptr the hook captures does not protect that window: a straggler split
   // still holds a shared_ptr here, so the lock() succeeds.
   //
-  // A gate, not a barrier: a hook that had already passed this line when clean_up() ran is still
-  // inside. Whatever goes below must therefore be safe against a connector disappearing mid-walk
-  // in its own right -- the gate narrows the window, it does not close it.
+  // A gate, not a barrier, and it narrows the window from one side only. `false` does NOT mean the
+  // connectors are alive -- clean_up() runs well after query_.reset() has destroyed them (see the
+  // teardown sequence spelled out there) -- and a hook that had already passed this line when
+  // clean_up() ran is still inside. Whatever goes below must therefore hold its own guarantee that
+  // what it walks outlives the walk.
   if (_detached.load(kOrder)) { return; }
 
   // TODO: drive the bounded split_connector::prefetch_if walk from here, once the query's

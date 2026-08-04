@@ -102,12 +102,18 @@ class prefetching_state_manager {
    * after this call still decrement the counters harmlessly — nobody reads them again.
    *
    * Also **latches the detached flag**, after which @ref on_task_queue_depleted and
-   * @ref on_task_not_created return immediately. That is the real protection against a straggler
-   * hook: the @c weak_ptr the hooks are installed with cannot expire while any split still holds a
-   * @c shared_ptr to this manager, so it still locks successfully in exactly the window where the
-   * query's connectors have already been destroyed. @ref prepare_for_query clears the flag again.
-   * It narrows that window rather than closing it — a hook already past the check when this runs
-   * is still inside — so a hook body must also be safe against what it walks disappearing.
+   * @ref on_task_not_created return immediately. That is worth having because the @c weak_ptr the
+   * hooks are installed with cannot expire while any split still holds a @c shared_ptr to this
+   * manager, so it still locks successfully in exactly the window where the query's connectors
+   * have already been destroyed. @ref prepare_for_query clears the flag again.
+   *
+   * @warning The flag narrows that window from one side only; it does not close it and it is
+   *          **not** a liveness guarantee for anything a hook might walk. This method is reached
+   *          from @c sirius_scan_manager::reset, which @c SiriusContext::run_mandatory_cleanup
+   *          calls long *after* it has destroyed the query's pipelines and every
+   *          @c split_connector with them — so the flag reads @c false for that whole interval,
+   *          with the connectors already gone. A hook already past the check when this runs is
+   *          also still inside. A hook body must own what it touches in its own right.
    *
    * @note The summary this logs comes from @ref summary, which builds a @c std::string and can
    *       therefore throw (@c std::bad_alloc, or a formatting error). Because this method is
@@ -147,13 +153,15 @@ class prefetching_state_manager {
    * @brief Hook target for @c creator::task_creator::task_queue_depleted_hook. Non-blocking.
    *
    * Runs on the task_scheduler management thread with no lock held. Returns immediately once
-   * @ref clean_up has detached this instance, which is what keeps a straggler hook from touching
-   * a query's connectors after they have been destroyed.
+   * @ref clean_up has detached this instance, which shortens — but does not close — the window in
+   * which a straggler hook can fire against a query whose connectors are already gone; see the
+   * @c \@warning on @ref clean_up.
    *
    * @note **Reserved — not yet implemented** beyond the detach gate. The bounded
    *       @c split_connector::prefetch_if walk this hook exists to trigger needs the query's
    *       connectors, which reach this object with the scan-manager wiring; see the TODO on the
-   *       implementation for the constraints that walk has to satisfy.
+   *       implementation for the constraints that walk has to satisfy — including that it must
+   *       establish connector liveness itself rather than infer it from the detach gate.
    */
   void on_task_queue_depleted() noexcept;
 

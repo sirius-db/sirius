@@ -20,10 +20,12 @@
 #include "op/sirius_physical_operator.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <cstdint>
 #include <iterator>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <utility>
 
@@ -94,14 +96,16 @@ void split_connector::push_split(std::unique_ptr<op::operator_data> split)
 
   // The one datasource walk that answers the arming question, taken here rather than under the
   // lock: it is the walk the whole fold budget exists to keep out of the critical section, and it
-  // happens once per connector. _arming_checked is producer-private -- the consumer never reads
-  // it -- so testing it unlocked races with nothing.
+  // happens once per connector. _arming_checked is an atomic precisely so this read may sit
+  // outside _mutex while the store below sits inside it -- see its declaration for why that is a
+  // correctness requirement and not a micro-optimisation. A stale `false` here costs one redundant
+  // walk; the latch is re-checked under the lock.
   //
   // Only an io candidate can answer the question meaningfully: a resident split has no datasource
   // and no backend, so letting one latch the flag would report "not armed" for a connector that
   // later carries delta splits.
   std::optional<bool> arming_answer;
-  if (!_arming_checked && (cls.kinds & kIoCandidate) != 0) {
+  if (!_arming_checked.load(std::memory_order_relaxed) && (cls.kinds & kIoCandidate) != 0) {
     auto const* input = dynamic_cast<const op::scan::scan_operator_input*>(split.get());
     if (input != nullptr) { arming_answer = input->can_land_while_queued(); }
   }
@@ -128,13 +132,15 @@ void split_connector::push_split(std::unique_ptr<op::operator_data> split)
     }
     if ((cls.kinds & kIoCandidate) != 0) { ++_n_io_prefetchable; }
     if ((cls.kinds & kMemoryCandidate) != 0) { ++_n_memory_prefetchable; }
-    // Latched under the lock, because get_next_split reads it under the lock: the answer was
-    // computed off the lock but must not be *stored* off it, or the store would race the read.
-    // After the pushes, so a throwing push does not leave the connector armed by a split that
-    // never joined the queue.
-    if (arming_answer.has_value() && !_arming_checked) {
-      _arming_checked  = true;
-      _selection_armed = *arming_answer;
+    // Latched under the lock, because get_next_split reads _selection_armed under the lock: the
+    // answer was computed off the lock but must not be *stored* off it, or the mutex would no
+    // longer order the store against that read. After the pushes, so a throwing push does not
+    // leave the connector armed by a split that never joined the queue. Re-checked here so that a
+    // stale unlocked read above can only cost a redundant walk, never overwrite a latched answer.
+    // _selection_armed is stored first, so nothing can observe "checked" without the value.
+    if (arming_answer.has_value() && !_arming_checked.load(std::memory_order_relaxed)) {
+      _selection_armed.store(*arming_answer, std::memory_order_relaxed);
+      _arming_checked.store(true, std::memory_order_relaxed);
     }
   }
   _cv.notify_one();
@@ -167,11 +173,13 @@ std::optional<std::unique_ptr<op::operator_data>> split_connector::get_next_spli
   // same O(1) move-and-pop_front the connector had before the policy existed -- no state reads,
   // no virtual calls, no datasource walks.
   std::size_t index = 0;
-  if (_selection_armed) {
-    // Everything in here is bounded by kSelectionWindow splits AND kSelectionFoldBudget folds,
-    // never by _splits.size() or by a split's datasource count: this runs while the consumer
-    // holds sirius_pipeline::_status_mutex, behind which every task completing on the pipeline
-    // blocks. There must be no loop over the whole deque, and none over a whole split, here.
+  if (_selection_armed.load(std::memory_order_relaxed)) {
+    // Everything in here is bounded by kSelectionWindow splits and by
+    // fold_cost(front) + kSelectionFoldBudget folds -- never by _splits.size(), and never by the
+    // datasource count of any split but the front one, whose fold is unavoidable for an armed
+    // connector (see kSelectionFoldBudget). This runs while the consumer holds
+    // sirius_pipeline::_status_mutex, behind which every task completing on the pipeline blocks.
+    // There must be no loop over the whole deque here, and none over a whole split past index 0.
     std::array<io::cache::prefetch_progress, kSelectionWindow> window{};
     auto const filled = fill_progress_window(window);
     index =
@@ -214,7 +222,17 @@ std::size_t split_connector::prefetch_if(std::size_t upto_n,
     if (pred && !pred(*input)) { continue; }
 
     if (kind == prefetch_kind::io) {
-      if (!input->is_io_prefetchable()) { continue; }
+      // The cached structural bit, NOT is_io_prefetchable(). The two answer the same question --
+      // "does this split have datasources to fetch?" -- but the predicate recomputes it with a
+      // datasource_count() walk, which is an O(rg_slices) count_if on a parquet_split_info, and
+      // this loop holds _mutex (L2) for its whole length while a consumer can be blocked on it
+      // inside get_next_split holding sirius_pipeline::_status_mutex (L1). classify() already paid
+      // that walk once per split, on the producer thread, off both locks.
+      if ((_split_kinds[i] & kIoCandidate) == 0) { continue; }
+      // The fold below is inherent -- firing the hints IS this method -- so it is not budgeted
+      // here the way fill_progress_window budgets its state reads; see the @warning on the
+      // declaration, which makes choosing upto_n against the split shape the caller's job.
+      //
       // Counted only when the split's ladder actually advanced. This walk restarts from the queue
       // front on every invocation and the dequeue fires task_queued again afterwards, so counting
       // inspections instead would grow without bound over a static queue.
@@ -283,12 +301,19 @@ std::size_t split_connector::fill_progress_window(
   std::size_t filled  = 0;
   std::size_t spent   = 0;
   while (filled < n) {
-    // Second axis of the bound. The per-split fold cost was measured once by the producer, so
-    // this decision costs a deque index rather than the datasource walk it is protecting against.
-    // The front split is always inspected whatever it costs, so selection is never skipped
-    // outright and rule 3 of select_split_index always has a candidate.
-    if (filled > 0 && spent + _split_fold_costs[filled] > kSelectionFoldBudget) { break; }
-    spent += _split_fold_costs[filled];
+    // Second axis of the bound, and it governs the OPTIONAL splits only. Split 0 is inspected
+    // whatever it costs and its fold is deliberately NOT charged: it is rule 3's mandatory
+    // fallback candidate and rules 1 and 2's first candidate, so an armed selection cannot answer
+    // at all without classifying it. Charging it would make the budget self-defeating on exactly
+    // the split shape it was written for -- one parquet_split_info of a few hundred datasources
+    // would blow a 32-fold budget before index 1 was ever considered, the walk would stop at one
+    // entry, rule 3 would fire, and an armed connector would degenerate into the FIFO it already
+    // is when unarmed. The per-split fold cost was measured once by the producer, so this decision
+    // costs a deque index rather than the datasource walk it is protecting against.
+    if (filled > 0) {
+      if (spent + _split_fold_costs[filled] > kSelectionFoldBudget) { break; }
+      spent += _split_fold_costs[filled];
+    }
     out[filled] = progress_of(*_splits[filled]);
     ++filled;
     // Rule 1 of select_split_index takes the FIRST landed split, so nothing past it can change

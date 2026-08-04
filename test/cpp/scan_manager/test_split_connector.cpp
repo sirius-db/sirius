@@ -552,8 +552,18 @@ TEST_CASE("the fold budget bounds the selection walk",
   // kSelectionWindow bounds how many splits are inspected; this bounds the work inside them. A
   // parquet_split_info carries one datasource per row-group slice, so a per-split bound alone
   // still leaves the walk unbounded on exactly the split type production queues.
-  SECTION("a split wider than the whole budget is still inspected, and stops the walk")
+  //
+  // The budget governs the OPTIONAL splits -- indices 1..kSelectionWindow-1 -- and nothing else.
+  // Split 0's fold is not charged against it, because split 0 is rule 3's mandatory fallback
+  // candidate and rules 1 and 2's first candidate: an armed selection cannot answer without
+  // classifying it, so its fold is unavoidable and the true per-dequeue worst case is
+  // fold_cost(front) + kSelectionFoldBudget.
+  SECTION("a wide front split does not spend the budget for the splits behind it")
   {
+    // Charging the front split would end the policy on production's split shape: one
+    // parquet_split_info of a few hundred datasources exhausts a 32-fold budget before index 1 is
+    // considered, the walk stops at one entry, rule 3 fires, and an armed connector degenerates
+    // into the FIFO it already is when unarmed -- with kSelectionWindow unreachable.
     staged_factory factory;
     split_connector connector;
     factory.push(connector,
@@ -565,18 +575,40 @@ TEST_CASE("the fold budget bounds the selection walk",
       factory.push(connector, id, prefetch_progress::cached);
     }
 
-    // The front split is always inspected whatever it costs -- otherwise selection would be
-    // skipped entirely and rule 3 would have no candidate -- but nothing after it fits.
+    // Index 1 is reached and its landing wins under rule 1 -- which a budget seeded with the front
+    // split's cost could never observe.
     auto pulled = connector.get_next_split();
     REQUIRE(pulled.has_value());
-    CHECK(id_of(**pulled) == 1);
-    CHECK(factory.total_folds() == 1);
+    CHECK(id_of(**pulled) == 2);
+    // The front split, then the landed one; rule 1 takes the first landed split, so the walk stops
+    // there and the six behind it are never read.
+    CHECK(factory.total_folds() == 2);
+  }
+
+  SECTION("a wide split behind the front is refused before it is inspected")
+  {
+    // The one thing the budget is now responsible for: index 0's fold is unavoidable, everything
+    // after it is optional and has to fit.
+    staged_factory factory;
+    split_connector connector;
+    factory.push(connector, 1, prefetch_progress::prepared, /*can_land=*/true);
+    factory.push(connector,
+                 2,
+                 prefetch_progress::cached,
+                 /*can_land=*/true,
+                 /*fold_cost=*/split_connector::kSelectionFoldBudget + 1);
+
+    auto pulled = connector.get_next_split();
+    REQUIRE(pulled.has_value());
+    CHECK(id_of(**pulled) == 1);        // the landed split at index 1 was too wide to look at
+    CHECK(factory.total_folds() == 1);  // and its state was never read
   }
 
   SECTION("the budget stops the walk before the window does")
   {
-    // Eight splits at a quarter of the budget each: the fourth exhausts it exactly, so the fifth
-    // is where the walk stops -- half the window.
+    // Eight splits at a quarter of the budget each. Split 0 is free, so the four optional splits
+    // at indices 1..4 exhaust the budget exactly; index 5 would take the total to 40. The walk
+    // therefore stops after five of the eight, short of the window.
     constexpr std::size_t kCost = split_connector::kSelectionFoldBudget / 4;
     staged_factory factory;
     split_connector connector;
@@ -587,7 +619,7 @@ TEST_CASE("the fold budget bounds the selection walk",
     auto pulled = connector.get_next_split();
     REQUIRE(pulled.has_value());
     CHECK(id_of(**pulled) == 1);
-    CHECK(factory.total_folds() == 4);
+    CHECK(factory.total_folds() == 5);
   }
 }
 
