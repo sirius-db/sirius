@@ -1,4 +1,4 @@
-name: Semantic PR title
+name: Validate
 
 on:
   pull_request_target:
@@ -6,7 +6,7 @@ on:
 
 jobs:
   semantic-pr:
-    name: Validate PR title
+    name: pr-title
     runs-on: ubuntu-slim
     permissions:
       pull-requests: read
