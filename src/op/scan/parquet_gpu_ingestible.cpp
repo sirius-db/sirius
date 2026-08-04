@@ -332,23 +332,33 @@ std::vector<scan_info::fadvise_entry> parquet_split_info::fadvise_entries() cons
 void parquet_file_scan_info::for_each_datasource(
   const std::function<void(sirius::io::sirius_datasource&)>& visit) const
 {
-  throw std::logic_error("parquet_file_scan_info::for_each_datasource: not implemented");
+  // Unlike fadvise_entries above, nothing here consults file_metadata or reader_options: the
+  // datasource is what the caller asked for, and computing the byte ranges to reach it is the
+  // cost this method exists to avoid.
+  if (datasource) { visit(*datasource); }
 }
 
 std::size_t parquet_file_scan_info::datasource_count() const noexcept
 {
-  throw std::logic_error("parquet_file_scan_info::datasource_count: not implemented");
+  return datasource ? 1U : 0U;
 }
 
 void parquet_split_info::for_each_datasource(
   const std::function<void(sirius::io::sirius_datasource&)>& visit) const
 {
-  throw std::logic_error("parquet_split_info::for_each_datasource: not implemented");
+  // One datasource per row-group slice: splits that span several parquet files carry one per
+  // file, each with its own prefetch handle (io_objects are shareable, handles are not).
+  for (auto const& slice : rg_slices) {
+    if (slice.datasource) { visit(*slice.datasource); }
+  }
 }
 
 std::size_t parquet_split_info::datasource_count() const noexcept
 {
-  throw std::logic_error("parquet_split_info::datasource_count: not implemented");
+  return static_cast<std::size_t>(
+    std::count_if(rg_slices.begin(), rg_slices.end(), [](auto const& slice) {
+      return slice.datasource != nullptr;
+    }));
 }
 
 //===----------------------------------------------------------------------===//

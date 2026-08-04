@@ -158,7 +158,38 @@ bool buffer_pool::should_start_evicting() const noexcept
 
 prefetch_progress combine_prefetch_progress(std::span<const prefetch_progress> parts) noexcept
 {
-  throw std::logic_error("combine_prefetch_progress: not implemented");
+  // One pass collecting the four predicates the precedence table is written in terms of, then a
+  // single ranked decision. Written this way rather than as a running "strongest so far" reduction
+  // because rule 3 is an ALL-quantifier sitting between two ANY-quantifiers, which a pairwise
+  // maximum cannot express. Every predicate is order-insensitive, so the result is too — which
+  // matters: split_connector folds a split's datasources in whatever order scan_info visits them.
+  if (parts.empty()) { return prefetch_progress::empty; }
+
+  bool any_loading   = false;
+  bool any_prepared  = false;
+  bool any_cancelled = false;
+  bool all_ready     = true;  // every part is cached or in_use, i.e. the split is servable
+
+  for (auto const part : parts) {
+    switch (part) {
+      case prefetch_progress::loading: any_loading = true; break;
+      case prefetch_progress::prepared: any_prepared = true; break;
+      case prefetch_progress::cancelled: any_cancelled = true; break;
+      case prefetch_progress::empty:
+      case prefetch_progress::cached:
+      case prefetch_progress::in_use:
+      case prefetch_progress::evicting: break;
+    }
+    if (part != prefetch_progress::cached && part != prefetch_progress::in_use) {
+      all_ready = false;
+    }
+  }
+
+  if (any_loading) { return prefetch_progress::loading; }
+  if (all_ready) { return prefetch_progress::cached; }
+  if (any_prepared) { return prefetch_progress::prepared; }
+  if (any_cancelled) { return prefetch_progress::cancelled; }
+  return prefetch_progress::empty;
 }
 
 }  // namespace sirius::io::cache

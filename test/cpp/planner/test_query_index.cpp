@@ -278,11 +278,6 @@ TEST_CASE("query_index barrier_order does not pipeline the hash-join probe side"
 //===----------------------------------------------------------------------===//
 // prefetching_order / get_branch_order_type
 //===----------------------------------------------------------------------===//
-//
-// TODO(phase4): two things change in the cases below once the implementations land — drop the [.]
-// tag, and restore the broad [query_index] tag alongside [prefetch_api]. A Catch2 test spec
-// *includes* hidden cases, so while these are hidden the broad tag has to stay off: with it,
-// running `sirius_unittest "[query_index]"` would drag in cases whose Phase-1 bodies throw.
 
 namespace {
 
@@ -335,7 +330,7 @@ struct scan_join_dag {
 }  // namespace
 
 TEST_CASE("prefetching_order lists only GPU scan branch heads",
-          "[.][prefetch_api][prefetching_order]")
+          "[query_index][prefetch_api][prefetching_order]")
 {
   auto b     = make_scan_example();
   auto index = query_index::build_index(b.pipelines(), build_index_options{pipeline_order{}});
@@ -348,7 +343,7 @@ TEST_CASE("prefetching_order lists only GPU scan branch heads",
 }
 
 TEST_CASE("prefetching_order classifies a branch by its terminating barrier",
-          "[.][prefetch_api][prefetching_order]")
+          "[query_index][prefetch_api][prefetching_order]")
 {
   SECTION("a branch cut by a full barrier is a full_barrier step")
   {
@@ -392,7 +387,7 @@ TEST_CASE("prefetching_order classifies a branch by its terminating barrier",
 }
 
 TEST_CASE("prefetching_order puts a hash join's build side before its probe side",
-          "[.][prefetch_api][prefetching_order]")
+          "[query_index][prefetch_api][prefetching_order]")
 {
   // The scheduler wants the blocking side warm first: nothing downstream of the join runs until
   // the build completes. Under build_probe the probe edge is rewritten to PIPELINE, so the probe
@@ -406,7 +401,7 @@ TEST_CASE("prefetching_order puts a hash join's build side before its probe side
 }
 
 TEST_CASE("prefetching_order preserves plan order within a barrier class",
-          "[.][prefetch_api][prefetching_order]")
+          "[query_index][prefetch_api][prefetching_order]")
 {
   // Three independent scans all cut by a FULL edge into one multiport consumer. The sort is
   // stable, so nothing reorders them and they come out in the order they were added — which is
@@ -427,7 +422,8 @@ TEST_CASE("prefetching_order preserves plan order within a barrier class",
                                                           {3, order_type::full_barrier}});
 }
 
-TEST_CASE("prefetching_order emits a fan-out scan once", "[.][prefetch_api][prefetching_order]")
+TEST_CASE("prefetching_order emits a fan-out scan once",
+          "[query_index][prefetch_api][prefetching_order]")
 {
   // One scan feeding two consumers. Each consumer heads its own branch (the producer's forward
   // walk cannot continue into either), and the scan must still be named exactly once.
@@ -444,7 +440,8 @@ TEST_CASE("prefetching_order emits a fan-out scan once", "[.][prefetch_api][pref
   CHECK(b.label(index->prefetching_order()) == scan_steps{{1, order_type::full_barrier}});
 }
 
-TEST_CASE("prefetching_order terminates on a cyclic dag", "[.][prefetch_api][prefetching_order]")
+TEST_CASE("prefetching_order terminates on a cyclic dag",
+          "[query_index][prefetch_api][prefetching_order]")
 {
   // Delim-join distribution edges make genuine cycles reachable, so the ordering must not be a
   // graph search that can loop: 2 and 3 feed each other. The assertion is that the call returns
@@ -465,7 +462,7 @@ TEST_CASE("prefetching_order terminates on a cyclic dag", "[.][prefetch_api][pre
 }
 
 TEST_CASE("prefetching_order is empty for a query with no GPU scan",
-          "[.][prefetch_api][prefetching_order]")
+          "[query_index][prefetch_api][prefetching_order]")
 {
   auto b     = make_example();  // every pipeline is a PROJECTION
   auto index = query_index::build_index(b.pipelines());
@@ -474,7 +471,7 @@ TEST_CASE("prefetching_order is empty for a query with no GPU scan",
 }
 
 TEST_CASE("get_branch_order_type is parallel to get_branches",
-          "[.][prefetch_api][prefetching_order]")
+          "[query_index][prefetch_api][prefetching_order]")
 {
   auto b     = make_scan_example();
   auto index = query_index::build_index(b.pipelines(), build_index_options{pipeline_order{}});

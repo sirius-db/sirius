@@ -14,14 +14,6 @@
  * limitations under the License.
  */
 
-// TODO(phase4): two things change here once the implementations land — drop the [.] tag, and
-// restore the broad [scan_manager] tag alongside [prefetch_api].
-//
-// select_split_index is declared noexcept and its Phase-1 body throws, so an unhidden case here
-// would abort the whole test binary instead of failing. A Catch2 test spec *includes* hidden
-// cases, so the broad tag stays off until then: with it, running `sirius_unittest "[scan_manager]"`
-// would pull these in and abort.
-//
 // Two properties of split_connector's dequeue are load-bearing and are what this file exists to
 // pin:
 //   - liveness. Preferring a split whose IO has landed is safe; *refusing* one whose IO is still in
@@ -241,7 +233,8 @@ struct split_factory {
 
 }  // namespace
 
-TEST_CASE("select_split_index prefers a landed prefetch", "[.][prefetch_api][split_connector]")
+TEST_CASE("select_split_index prefers a landed prefetch",
+          "[scan_manager][prefetch_api][split_connector]")
 {
   SECTION("the front split wins when nothing has landed")
   {
@@ -274,7 +267,7 @@ TEST_CASE("select_split_index prefers a landed prefetch", "[.][prefetch_api][spl
 }
 
 TEST_CASE("select_split_index never starves when every split is loading",
-          "[.][prefetch_api][split_connector]")
+          "[scan_manager][prefetch_api][split_connector]")
 {
   // Liveness regression gate, not a tie-break. Refusing a loading split has no wakeup path: the
   // split leaving `loading` notifies io::cache::entry_state's atomic, not this connector's
@@ -286,7 +279,8 @@ TEST_CASE("select_split_index never starves when every split is loading",
     0);
 }
 
-TEST_CASE("select_split_index is total for a single split", "[.][prefetch_api][split_connector]")
+TEST_CASE("select_split_index is total for a single split",
+          "[scan_manager][prefetch_api][split_connector]")
 {
   for (auto const state : {prefetch_progress::empty,
                            prefetch_progress::cancelled,
@@ -301,7 +295,7 @@ TEST_CASE("select_split_index is total for a single split", "[.][prefetch_api][s
 }
 
 TEST_CASE("n_prefetchable counts io candidates as they are pushed and pulled",
-          "[.][prefetch_api][split_connector]")
+          "[scan_manager][prefetch_api][split_connector]")
 {
   split_factory factory;
   split_connector connector;
@@ -322,7 +316,8 @@ TEST_CASE("n_prefetchable counts io candidates as they are pushed and pulled",
   CHECK(connector.n_prefetchable(prefetch_kind::memory) == 0);
 }
 
-TEST_CASE("prefetch_if honours its look-ahead window", "[.][prefetch_api][split_connector]")
+TEST_CASE("prefetch_if honours its look-ahead window",
+          "[scan_manager][prefetch_api][split_connector]")
 {
   SECTION("a window of zero hints nothing")
   {
@@ -368,7 +363,8 @@ TEST_CASE("prefetch_if honours its look-ahead window", "[.][prefetch_api][split_
   }
 }
 
-TEST_CASE("prefetch_if leaves every split in the queue", "[.][prefetch_api][split_connector]")
+TEST_CASE("prefetch_if leaves every split in the queue",
+          "[scan_manager][prefetch_api][split_connector]")
 {
   split_factory factory;
   split_connector connector;
@@ -385,7 +381,7 @@ TEST_CASE("prefetch_if leaves every split in the queue", "[.][prefetch_api][spli
 }
 
 TEST_CASE("a connector holding more than the window inspects only the window",
-          "[.][prefetch_api][split_connector]")
+          "[scan_manager][prefetch_api][split_connector]")
 {
   split_factory factory;
   split_connector connector;
@@ -404,7 +400,8 @@ TEST_CASE("a connector holding more than the window inspects only the window",
   }
 }
 
-TEST_CASE("get_next_split is fifo when nothing has landed", "[.][prefetch_api][split_connector]")
+TEST_CASE("get_next_split is fifo when nothing has landed",
+          "[scan_manager][prefetch_api][split_connector]")
 {
   // The local-disk common path: no backend arms the prefetch ladder, so every split reports
   // prefetch_progress::empty and the bounded window must not reorder anything.
@@ -422,7 +419,7 @@ TEST_CASE("get_next_split is fifo when nothing has landed", "[.][prefetch_api][s
 }
 
 TEST_CASE("get_next_split hands out the split whose prefetch has landed",
-          "[.][prefetch_api][split_connector]")
+          "[scan_manager][prefetch_api][split_connector]")
 {
   // select_split_index's policy driven through the real dequeue rather than as a pure function.
   // The states are synthetic (see staged_split): no shipped backend can produce a landed split.
@@ -438,13 +435,17 @@ TEST_CASE("get_next_split hands out the split whose prefetch has landed",
     REQUIRE(landed.has_value());
     CHECK(id_of(**landed) == 2);
 
-    // The two it stepped over keep their relative order and are still there to be served.
+    // The policy re-applies on every dequeue, so the remainder is not served FIFO: the queue is
+    // now [1 loading, 3 prepared], and rule 2 steps over the loading split again. Skipping 1 is
+    // deliberate — materialize_table fires prefetch(disposable), which cancels the handle, so
+    // handing out a split whose IO is still in flight would throw that IO away. Split 1 is served
+    // last, once nothing better is left (rule 3), which is what keeps the connector live.
     auto next = connector.get_next_split();
     REQUIRE(next.has_value());
-    CHECK(id_of(**next) == 1);
+    CHECK(id_of(**next) == 3);
     auto last = connector.get_next_split();
     REQUIRE(last.has_value());
-    CHECK(id_of(**last) == 3);
+    CHECK(id_of(**last) == 1);
   }
 
   SECTION("the front split is returned when every split is still loading")

@@ -14,14 +14,6 @@
  * limitations under the License.
  */
 
-// TODO(phase4): two things change here once the implementations land — drop the [.] tag, and
-// restore the broad [io] tag alongside [prefetch_api].
-//
-// combine_prefetch_progress is declared noexcept and its Phase-1 body throws, so an unhidden case
-// here would abort the whole test binary rather than report a failure. A Catch2 test spec
-// *includes* hidden cases, so the broad tag stays off until then: with it, running
-// `sirius_unittest "[io]"` would pull these in and abort.
-//
 // progress_from and combine_prefetch_progress carry 100% of the prefetch state-model decision
 // making: both are pure and total, which is what lets the whole model be tested with no I/O, no
 // GPU and no mock ioctx. Everything left on the real types is trivial forwarding.
@@ -47,7 +39,7 @@ prefetch_progress fold(const std::vector<prefetch_progress>& parts)
 }  // namespace
 
 TEST_CASE("progress_from maps every entry_state onto a prefetch_progress",
-          "[.][prefetch_api][prefetch_progress]")
+          "[io][prefetch_api][prefetch_progress]")
 {
   using sirius::io::cache::progress_from;
 
@@ -63,7 +55,7 @@ TEST_CASE("progress_from maps every entry_state onto a prefetch_progress",
 }
 
 TEST_CASE("progress_from reports cancelled regardless of entry state",
-          "[.][prefetch_api][prefetch_progress]")
+          "[io][prefetch_api][prefetch_progress]")
 {
   using sirius::io::cache::progress_from;
 
@@ -78,7 +70,7 @@ TEST_CASE("progress_from reports cancelled regardless of entry state",
 }
 
 TEST_CASE("combine_prefetch_progress folds a multi-file split",
-          "[.][prefetch_api][prefetch_progress]")
+          "[io][prefetch_api][prefetch_progress]")
 {
   SECTION("an empty handle list is empty") { CHECK(fold({}) == prefetch_progress::empty); }
 

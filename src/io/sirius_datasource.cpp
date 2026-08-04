@@ -236,7 +236,15 @@ bool sirius_datasource::uses_prefetching_cache() const noexcept
 
 cache::prefetch_progress sirius_datasource::prefetch_state() const noexcept
 {
-  throw std::logic_error("sirius_datasource::prefetch_state: not implemented");
+  // No handle at all is the normal state on every shipped local backend: fadvise returns without
+  // storing one when the ioctx has no prefetching cache.
+  if (!_prefetch_handle) { return cache::prefetch_progress::empty; }
+  auto const ctx = _prefetch_handle.get_context();
+  if (!ctx || !ctx->state) { return cache::prefetch_progress::empty; }
+  // Exactly two lock-free single-word loads. ctx->chunks is NOT read here, and must never be:
+  // prefetching_cache::prefetch_loop erases from that vector with no lock held, so walking it
+  // from a consumer thread is a data race.
+  return cache::progress_from(ctx->state->get_state(), ctx->is_cancelled());
 }
 
 }  // namespace sirius::io

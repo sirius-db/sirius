@@ -14,14 +14,6 @@
  * limitations under the License.
  */
 
-// TODO(phase4): two things change here once the implementations land — drop the [.] tag, and
-// restore the broad [task_creator] tag alongside [prefetch_api].
-//
-// Both fire_* helpers are declared noexcept and their Phase-1 bodies throw, so an unhidden case
-// would abort the whole test binary instead of failing. A Catch2 test spec *includes* hidden
-// cases, so the broad tag stays off until then: with it, running `sirius_unittest "[task_creator]"`
-// would pull these in and abort.
-//
 // Two prefetch hooks hang off task_creator. What matters about them is not what they do but where
 // and how they are called:
 //   - the depleted hook fires from the FIRST statement of schedule_lookahead, before the strategy
@@ -85,7 +77,7 @@ struct probe_operator : sirius_physical_operator {
 }  // namespace
 
 TEST_CASE("the depleted hook fires even when look-ahead is disabled",
-          "[.][prefetch_api][task_creator_hooks]")
+          "[task_creator][prefetch_api][task_creator_hooks]")
 {
   // The shipped default is strategy{request_type::active}, under which schedule_lookahead returns
   // at its strategy gate. The hook is anchored before that gate precisely so it is not dead in the
@@ -101,7 +93,7 @@ TEST_CASE("the depleted hook fires even when look-ahead is disabled",
 }
 
 TEST_CASE("the depleted hook is a single slot and the last setter wins",
-          "[.][prefetch_api][task_creator_hooks]")
+          "[task_creator][prefetch_api][task_creator_hooks]")
 {
   hook_probe creator;
 
@@ -116,7 +108,7 @@ TEST_CASE("the depleted hook is a single slot and the last setter wins",
 }
 
 TEST_CASE("a throwing depleted hook does not escape schedule_lookahead",
-          "[.][prefetch_api][task_creator_hooks]")
+          "[task_creator][prefetch_api][task_creator_hooks]")
 {
   // The fire helper is noexcept, so a hook that throws must be contained rather than propagated:
   // schedule_lookahead runs on the scheduler's management thread and an escaping exception would
@@ -127,7 +119,7 @@ TEST_CASE("a throwing depleted hook does not escape schedule_lookahead",
   REQUIRE_NOTHROW(creator.schedule_lookahead());
 }
 
-TEST_CASE("clearing a hook stops it firing", "[.][prefetch_api][task_creator_hooks]")
+TEST_CASE("clearing a hook stops it firing", "[task_creator][prefetch_api][task_creator_hooks]")
 {
   hook_probe creator;
 
@@ -140,7 +132,7 @@ TEST_CASE("clearing a hook stops it firing", "[.][prefetch_api][task_creator_hoo
 }
 
 TEST_CASE("a hook that re-enters schedule_lookahead does not deadlock",
-          "[.][prefetch_api][task_creator_hooks]")
+          "[task_creator][prefetch_api][task_creator_hooks]")
 {
   // The reason the hook fires before _lookahead_mutex is taken. That mutex is a plain
   // std::mutex, so firing from inside it would hang this case rather than fail it — which is why
@@ -162,7 +154,7 @@ TEST_CASE("a hook that re-enters schedule_lookahead does not deadlock",
 }
 
 TEST_CASE("the not-created hook is a single slot and the last setter wins",
-          "[.][prefetch_api][task_creator_hooks]")
+          "[task_creator][prefetch_api][task_creator_hooks]")
 {
   hook_probe creator;
   probe_operator requested;
@@ -187,7 +179,7 @@ TEST_CASE("the not-created hook is a single slot and the last setter wins",
 }
 
 TEST_CASE("a throwing not-created hook does not escape the fire helper",
-          "[.][prefetch_api][task_creator_hooks]")
+          "[task_creator][prefetch_api][task_creator_hooks]")
 {
   // The backstop that matters most: this helper's one production call site is outside the dispatch
   // lambda's try block, on the single task-creation thread in the engine.
@@ -200,7 +192,8 @@ TEST_CASE("a throwing not-created hook does not escape the fire helper",
   REQUIRE_NOTHROW(creator.fire_task_not_created(&requested, request_type::active));
 }
 
-TEST_CASE("firing with no hook installed is a no-op", "[.][prefetch_api][task_creator_hooks]")
+TEST_CASE("firing with no hook installed is a no-op",
+          "[task_creator][prefetch_api][task_creator_hooks]")
 {
   // The empty-slot path both helpers take on every query that never wires the prefetch hooks.
   hook_probe creator;

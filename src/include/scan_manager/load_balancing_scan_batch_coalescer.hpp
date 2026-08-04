@@ -172,10 +172,18 @@ class load_balancing_scan_batch_coalescer {
   /// an unclosed connector is a silent query hang). Static and public so the
   /// drain behavior is unit-testable against a fake provider; production use
   /// is the sequencer's cached-slot path.
-  static void drain_cached_provider(databatch_provider& provider,
-                                    split_connector& connector,
-                                    std::stop_token const& stop,
-                                    bool row_filter_pending);
+  ///
+  /// @param prefetch_state Per-query prefetch-ladder bookkeeping, stamped onto every split this
+  ///        drain produces. Optional and defaulted so the existing four-argument call sites keep
+  ///        compiling; @c nullptr means the splits carry no counters. Passed here rather than read
+  ///        from a slot because this is a static helper — it takes the provider and the connector
+  ///        directly and never sees a @ref metadata_processing_state.
+  static void drain_cached_provider(
+    databatch_provider& provider,
+    split_connector& connector,
+    std::stop_token const& stop,
+    bool row_filter_pending,
+    std::shared_ptr<prefetching_state_manager> prefetch_state = nullptr);
 
   /// Spawn the sequencer task on @p dispatcher.  The dispatcher must
   /// expose @c enqueue(callable) and inject a @c std::stop_token when

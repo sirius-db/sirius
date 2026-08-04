@@ -76,22 +76,21 @@ class scan_operator_input : public op::operator_data {
   /// @param prefetch_state Per-query prefetch counters this split reports its ladder
   ///                       progress to. Null (the default) disables the reporting, which
   ///                       is what every call site outside the scan manager wants.
+  ///
+  /// Out-of-line because the body reports the construction to @c prefetching_state_manager,
+  /// which is only forward-declared here.
   explicit scan_operator_input(
     std::unique_ptr<scan_info> metadata,
-    std::shared_ptr<scan_manager::prefetching_state_manager> prefetch_state = nullptr)
-    : materialization_info(std::move(metadata)), _prefetch_state(std::move(prefetch_state))
-  {
-  }
+    std::shared_ptr<scan_manager::prefetching_state_manager> prefetch_state = nullptr);
 
   /// @param cached_batch   The resident pinned-cache batch this split serves.
   /// @param prefetch_state Per-query prefetch counters this split reports its ladder
   ///                       progress to. Null (the default) disables the reporting.
+  ///
+  /// Out-of-line for the same reason as the metadata constructor above.
   explicit scan_operator_input(
     std::shared_ptr<cucascade::data_batch> cached_batch,
-    std::shared_ptr<scan_manager::prefetching_state_manager> prefetch_state = nullptr)
-    : materialization_info(std::move(cached_batch)), _prefetch_state(std::move(prefetch_state))
-  {
-  }
+    std::shared_ptr<scan_manager::prefetching_state_manager> prefetch_state = nullptr);
 
   /// User-declared (not implicit) so the prefetching state manager can be told the split
   /// was disposed of. Out-of-line because @c prefetching_state_manager is only
@@ -129,14 +128,19 @@ class scan_operator_input : public op::operator_data {
     return std::get<std::unique_ptr<scan_info>>(materialization_info)->fadvise_entries();
   }
 
-  void prefetch(io::cache::prefetching_stage site) const
-  {
-    if (!has_scan_metadata()) { return; }
-    auto hints = get_fadvise_hints();
-    for (auto& hint : hints) {
-      hint.datasource->prefetch(site);
-    }
-  }
+  /**
+   * @brief Fire the prefetch hint for ladder rung @p site on every datasource of this split, and
+   *        record the rung with the query's prefetching state manager.
+   *
+   * The state-manager update happens **before** the metadata check, so resident (pinned-cache)
+   * splits are counted too — they climb the same ladder and do the same work, they just have no
+   * IO to hint. Counting after the check reports zero for a fully-pinned query.
+   *
+   * Reaches the datasources through @ref for_each_datasource, never @ref get_fadvise_hints: the
+   * latter rebuilds the split's byte ranges on every call (a parquet footer walk per row-group
+   * slice) and this method would only throw them away.
+   */
+  void prefetch(io::cache::prefetching_stage site) const;
 
   /// @brief Visit each datasource backing this split. Empty for a resident split.
   /// Cheap: forwards to @ref scan_info::for_each_datasource, which computes no byte ranges.

@@ -166,12 +166,15 @@ class duckdb_native_batch_coalescer : public batch_coalescer {
 void duckdb_native_scan_info::for_each_datasource(
   const std::function<void(sirius::io::sirius_datasource&)>& visit) const
 {
-  throw std::logic_error("duckdb_native_scan_info::for_each_datasource: not implemented");
+  // Deliberately not gated on block_manager (which fadvise_entries needs to derive byte ranges)
+  // or on host_backed_only: a datasource that is present is a live object the caller may hint,
+  // and no ranges are computed here.
+  if (datasource) { visit(*datasource); }
 }
 
 std::size_t duckdb_native_scan_info::datasource_count() const noexcept
 {
-  throw std::logic_error("duckdb_native_scan_info::datasource_count: not implemented");
+  return datasource ? 1U : 0U;
 }
 
 //===----------------------------------------------------------------------===//

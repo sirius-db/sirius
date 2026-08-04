@@ -14,14 +14,6 @@
  * limitations under the License.
  */
 
-// TODO(phase4): two things change here once the implementations land — drop the [.] tag, and
-// restore the broad [scan_manager] tag alongside [prefetch_api].
-//
-// Nearly every method here is declared noexcept — including the constructor — and their Phase-1
-// bodies throw, so an unhidden case would abort the whole test binary instead of failing. A Catch2
-// test spec *includes* hidden cases, so the broad tag stays off until then: with it, running
-// `sirius_unittest "[scan_manager]"` would pull these in and abort.
-//
 // The per-query prefetch bookkeeping. Two properties are what this file exists to pin:
 //   - the counters are complete. A rung is recorded above scan_operator_input's metadata check, so
 //     a fully-pinned query — every split resident, no datasource, no IO — still reports the ladder
@@ -70,7 +62,8 @@ sirius::planner::query make_query(std::uint32_t id)
 
 }  // namespace
 
-TEST_CASE("a fresh manager reports zero counters", "[.][prefetch_api][prefetching_state_manager]")
+TEST_CASE("a fresh manager reports zero counters",
+          "[scan_manager][prefetch_api][prefetching_state_manager]")
 {
   prefetching_state_manager manager{test_config()};
   auto const counters = manager.snapshot();
@@ -86,7 +79,7 @@ TEST_CASE("a fresh manager reports zero counters", "[.][prefetch_api][prefetchin
 }
 
 TEST_CASE("the manager reports the tunables it was constructed with",
-          "[.][prefetch_api][prefetching_state_manager]")
+          "[scan_manager][prefetch_api][prefetching_state_manager]")
 {
   prefetching_state_manager manager{test_config()};
 
@@ -96,7 +89,7 @@ TEST_CASE("the manager reports the tunables it was constructed with",
 }
 
 TEST_CASE("update maps each ladder rung to its own counter",
-          "[.][prefetch_api][prefetching_state_manager]")
+          "[scan_manager][prefetch_api][prefetching_state_manager]")
 {
   prefetching_state_manager manager{test_config()};
 
@@ -161,7 +154,7 @@ TEST_CASE("update maps each ladder rung to its own counter",
 }
 
 TEST_CASE("the live gauge tracks construction and disposal",
-          "[.][prefetch_api][prefetching_state_manager]")
+          "[scan_manager][prefetch_api][prefetching_state_manager]")
 {
   prefetching_state_manager manager{test_config()};
 
@@ -182,7 +175,7 @@ TEST_CASE("the live gauge tracks construction and disposal",
 }
 
 TEST_CASE("prepare_for_query zeroes the counters and binds the query id",
-          "[.][prefetch_api][prefetching_state_manager]")
+          "[scan_manager][prefetch_api][prefetching_state_manager]")
 {
   prefetching_state_manager manager{test_config()};
   manager.on_input_created();
@@ -204,7 +197,7 @@ TEST_CASE("prepare_for_query zeroes the counters and binds the query id",
 }
 
 TEST_CASE("counters survive disposal after clean_up",
-          "[.][prefetch_api][prefetching_state_manager]")
+          "[scan_manager][prefetch_api][prefetching_state_manager]")
 {
   // The straggler-split case, and the reason each query gets a fresh instance. ~split_connector
   // runs when the query's pipelines are destroyed, which is before the scan manager is reset, and

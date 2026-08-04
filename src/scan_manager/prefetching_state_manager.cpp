@@ -16,80 +16,153 @@
 
 #include "scan_manager/prefetching_state_manager.hpp"
 
-#include <stdexcept>
+#include "log/logging.hpp"
+#include "planner/query.hpp"
+
+#include <atomic>
+#include <format>
 
 namespace sirius::scan_manager {
 
-prefetching_state_manager::prefetching_state_manager(config cfg) noexcept : _cfg(cfg)
-{
-  throw std::logic_error("prefetching_state_manager::prefetching_state_manager: not implemented");
-}
+namespace {
+
+/// Every counter access in this file uses relaxed ordering, mirroring
+/// io::cache::prefetching_cache::counters. The counters are diagnostics and a scheduling
+/// heuristic; nothing is published through them, so no counter ever needs to order any other
+/// memory. That is what keeps the mutators usable from a destructor, from a GPU executor thread
+/// mid-pipeline, and from a task_creator worker that is holding sirius_pipeline::_status_mutex.
+constexpr auto kOrder = std::memory_order_relaxed;
+
+}  // namespace
+
+prefetching_state_manager::prefetching_state_manager(config cfg) noexcept : _cfg(cfg) {}
 
 void prefetching_state_manager::prepare_for_query(const sirius::planner::query& query) noexcept
 {
-  throw std::logic_error("prefetching_state_manager::prepare_for_query: not implemented");
+  // The id is all that is kept: planner::query is destroyed before the scan manager is reset, so
+  // a retained reference would dangle by the time clean_up() runs.
+  _query_id.store(query.query_id(), kOrder);
+
+  _counters.n_inputs_created.store(0, kOrder);
+  _counters.n_inputs_disposed.store(0, kOrder);
+  _counters.n_metadata_created.store(0, kOrder);
+  _counters.n_task_queued.store(0, kOrder);
+  _counters.n_task_prepared.store(0, kOrder);
+  _counters.n_task_completed.store(0, kOrder);
+  _counters.n_live.store(0, kOrder);
 }
 
 void prefetching_state_manager::clean_up() noexcept
 {
-  // IMPLEMENTATION NOTE: this method is noexcept but has to log summary(), which builds a
-  // std::string and can throw. Letting that escape would call std::terminate on the query
-  // teardown path, so the real body must be shaped as:
-  //     try { SIRIUS_LOG_TRACE("prefetching_state_manager: {}", summary()); } catch (...) {}
-  // Losing one diagnostic line is always preferable to aborting the process during cleanup.
-  throw std::logic_error("prefetching_state_manager::clean_up: not implemented");
+  // summary() builds a std::string and the log call formats it, either of which can throw. This
+  // method is noexcept and runs on the query teardown path, so an escaping exception would call
+  // std::terminate: losing one diagnostic line is always the better trade.
+  try {
+    SIRIUS_LOG_TRACE("{}", summary());
+  } catch (...) {  // deliberately swallowed: the log line is the only casualty
+  }
+
+  // Detach. The counters are deliberately left alone: a straggler split can still be destroyed
+  // after this point (~split_connector runs when the query's pipelines die, before the scan
+  // manager is reset, and a task can be in flight on a GPU executor thread), and its decrement
+  // must land somewhere harmless rather than be raced against a reset.
+  _query_id.store(sirius::query_id_t{}, kOrder);
 }
 
 sirius::query_id_t prefetching_state_manager::query_id() const noexcept
 {
-  throw std::logic_error("prefetching_state_manager::query_id: not implemented");
+  return _query_id.load(kOrder);
 }
 
 void prefetching_state_manager::update(io::cache::prefetching_stage site) noexcept
 {
-  throw std::logic_error("prefetching_state_manager::update: not implemented");
+  switch (site) {
+    case io::cache::prefetching_stage::metadata_created:
+      _counters.n_metadata_created.fetch_add(1, kOrder);
+      break;
+    case io::cache::prefetching_stage::task_queued:
+      _counters.n_task_queued.fetch_add(1, kOrder);
+      break;
+    case io::cache::prefetching_stage::task_preprocessing:
+      _counters.n_task_prepared.fetch_add(1, kOrder);
+      break;
+    case io::cache::prefetching_stage::disposable:
+      _counters.n_task_completed.fetch_add(1, kOrder);
+      break;
+    // `none` is not a rung: io_context uses it to mean "this backend never wants prefetch
+    // activated", so counting it would report progress that never happened.
+    case io::cache::prefetching_stage::none: break;
+  }
 }
 
 void prefetching_state_manager::on_input_created() noexcept
 {
-  throw std::logic_error("prefetching_state_manager::on_input_created: not implemented");
+  _counters.n_inputs_created.fetch_add(1, kOrder);
+  _counters.n_live.fetch_add(1, kOrder);
 }
 
 void prefetching_state_manager::on_input_disposed() noexcept
 {
-  throw std::logic_error("prefetching_state_manager::on_input_disposed: not implemented");
+  _counters.n_inputs_disposed.fetch_add(1, kOrder);
+  _counters.n_live.fetch_sub(1, kOrder);
 }
 
 void prefetching_state_manager::on_task_queue_depleted() noexcept
 {
-  // IMPLEMENTATION NOTE: noexcept. The bounded split_connector::prefetch_if walk this will drive
-  // acquires a mutex and runs a caller-supplied predicate, both of which can throw; contain them
-  // with try/catch(...) here rather than propagating out onto the scheduler management thread.
-  throw std::logic_error("prefetching_state_manager::on_task_queue_depleted: not implemented");
+  // Nothing to drive yet. The bounded split_connector::prefetch_if walk this hook exists to
+  // trigger needs the query's connectors, which reach this object with the scan-manager wiring;
+  // until then the hook is installable and inert rather than absent.
+  //
+  // @warning When that walk lands it MUST be wrapped in try/catch(...): prefetch_if acquires
+  //          split_connector::_mutex and runs a caller-supplied predicate, either of which can
+  //          throw, and this method is noexcept -- an escaping exception calls std::terminate on
+  //          the task_scheduler management thread. Same for on_task_not_created below, where it
+  //          would instead take down the engine's single task-creation thread.
 }
 
-void prefetching_state_manager::on_task_not_created(const op::sirius_physical_operator* requested,
-                                                    creator::request_type kind) noexcept
+void prefetching_state_manager::on_task_not_created(
+  const op::sirius_physical_operator* /*requested*/, creator::request_type /*kind*/) noexcept
 {
-  // IMPLEMENTATION NOTE: same try/catch(...) requirement as on_task_queue_depleted, and stricter
-  // still — this runs on the single task-creation thread, outside any try block, so an escaping
-  // exception would silently end all task creation.
-  throw std::logic_error("prefetching_state_manager::on_task_not_created: not implemented");
+  // See on_task_queue_depleted: inert until the connectors are wired in, and the same
+  // try/catch(...) requirement applies to the walk that will go here.
 }
 
 prefetching_state_manager::counters_snapshot prefetching_state_manager::snapshot() const noexcept
 {
-  throw std::logic_error("prefetching_state_manager::snapshot: not implemented");
+  // Seven independent relaxed loads, so the result need not correspond to any single instant.
+  // Documented and accepted: this feeds a log line and a look-ahead heuristic, never a decision
+  // that has to be consistent.
+  return counters_snapshot{
+    .n_inputs_created   = _counters.n_inputs_created.load(kOrder),
+    .n_inputs_disposed  = _counters.n_inputs_disposed.load(kOrder),
+    .n_metadata_created = _counters.n_metadata_created.load(kOrder),
+    .n_task_queued      = _counters.n_task_queued.load(kOrder),
+    .n_task_prepared    = _counters.n_task_prepared.load(kOrder),
+    .n_task_completed   = _counters.n_task_completed.load(kOrder),
+    .n_live             = _counters.n_live.load(kOrder),
+  };
 }
 
 std::string prefetching_state_manager::summary() const
 {
-  throw std::logic_error("prefetching_state_manager::summary: not implemented");
+  auto const counters = snapshot();
+  return std::format(
+    "prefetching_state_manager: query={} "
+    "inputs[created={} disposed={} live={}] "
+    "ladder[metadata_created={} task_queued={} task_prepared={} task_completed={}]",
+    _query_id.load(kOrder),
+    counters.n_inputs_created,
+    counters.n_inputs_disposed,
+    counters.n_live,
+    counters.n_metadata_created,
+    counters.n_task_queued,
+    counters.n_task_prepared,
+    counters.n_task_completed);
 }
 
 const prefetching_state_manager::config& prefetching_state_manager::get_config() const noexcept
 {
-  throw std::logic_error("prefetching_state_manager::get_config: not implemented");
+  return _cfg;
 }
 
 }  // namespace sirius::scan_manager

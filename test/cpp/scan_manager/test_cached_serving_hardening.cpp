@@ -1261,12 +1261,6 @@ TEST_CASE("validate_recorded_column_storage cross-checks recorded carriers again
 // prefetch predicates over the resident (pinned-cache) split
 //===----------------------------------------------------------------------===//
 //
-// TODO(phase4): two things change in the cases below once the implementations land — drop the [.]
-// tag, and restore the broad [cached_serving][scan_manager] tags alongside [prefetch_api]. Every
-// predicate exercised here is declared noexcept and its Phase-1 body throws, so an unhidden case
-// would abort the whole test binary; and because a Catch2 test spec *includes* hidden cases, the
-// broad tags have to stay off too or `sirius_unittest "[scan_manager]"` would drag them in.
-//
 // The resident half of scan_operator_input's prefetch predicates: it needs a real GPU batch, which
 // is why it lives here rather than next to the metadata half in
 // test/cpp/scan/test_scan_input_prefetchability.cpp. Also here: the one datasource-level state
@@ -1300,7 +1294,7 @@ std::shared_ptr<cucascade::data_batch> make_host_tier_batch(test_env& e, std::si
 }  // namespace
 
 TEST_CASE("a datasource with no fadvise reports an empty prefetch state",
-          "[.][prefetch_api][datasource]")
+          "[cached_serving][scan_manager][prefetch_api][datasource]")
 {
   // No mock ioctx anywhere in this repo: this is a real kvikio-backed datasource over a real file.
   // kvikio's activation stage is `none` and enable_prefetch_cache defaults off, so fadvise never
@@ -1314,7 +1308,7 @@ TEST_CASE("a datasource with no fadvise reports an empty prefetch state",
 }
 
 TEST_CASE("a resident split reports its upload need through is_memory_prefetchable",
-          "[.][prefetch_api][scan_input]")
+          "[cached_serving][scan_manager][prefetch_api][scan_input]")
 {
   auto& e = env();
 
@@ -1343,7 +1337,7 @@ TEST_CASE("a resident split reports its upload need through is_memory_prefetchab
 }
 
 TEST_CASE("is_memory_prefetchable agrees with prepare_for_processing",
-          "[.][prefetch_api][scan_input]")
+          "[cached_serving][scan_manager][prefetch_api][scan_input]")
 {
   // The anti-drift gate, and the whole reason batch_needs_gpu_upload exists as a shared
   // definition: the scheduling view and the execution behaviour read the same predicate, so a

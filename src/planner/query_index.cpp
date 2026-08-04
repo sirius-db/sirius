@@ -18,7 +18,8 @@
 
 #include "planner/query.hpp"
 
-#include <stdexcept>
+#include <algorithm>
+#include <cstdint>
 #include <string_view>
 #include <unordered_set>
 
@@ -138,6 +139,30 @@ std::vector<pipeline_ptr> walk_branch(const pipeline_dag& dag,
   return chain;
 }
 
+/// Classify a branch by the edge(s) leaving its tail: the hardest barrier any consumer of the
+/// branch's output waits on.
+///
+/// A branch with no consumer is the plan's final sink -- nothing waits on it, so it streams.
+/// Cycle-safe by construction: this reads one adjacency list and never follows an edge, which is
+/// why the prefetch ordering built on top of it terminates on the cyclic DAGs delim-join
+/// distribution edges produce.
+order_type classify_branch(const pipeline_dag& dag, pipeline_ptr tail)
+{
+  const auto& consumers = dag.out(tail);
+  if (consumers.empty()) { return order_type::streaming; }
+  // MemoryBarrierType is declared PIPELINE < PARTIAL < FULL, so the maximum is the hardest.
+  auto strongest = op::MemoryBarrierType::PIPELINE;
+  for (const auto& edge : consumers) {
+    strongest = std::max(strongest, edge.barrier);
+  }
+  switch (strongest) {
+    case op::MemoryBarrierType::FULL: return order_type::full_barrier;
+    case op::MemoryBarrierType::PARTIAL: return order_type::serial_barrier;
+    case op::MemoryBarrierType::PIPELINE: return order_type::streaming;
+  }
+  return order_type::streaming;
+}
+
 }  // namespace
 
 std::shared_ptr<const query_index> query_index::build_index(const query& q,
@@ -168,12 +193,21 @@ std::shared_ptr<const query_index> query_index::build_index(
   }
 
   // Second pass (after _branches is fully populated so the inner-vector buffers are stable):
-  // build the span views and the head-operator lookup.
+  // build the span views, the head-operator lookup, and the two parallel vectors
+  // prefetching_order() reads. Those are filled here, while `dag` is still in scope, precisely so
+  // the prefetch order costs no extra traversal of its own.
   index->_branch_views.reserve(index->_branches.size());
+  index->_branch_order_types.reserve(index->_branches.size());
+  index->_branch_heads.reserve(index->_branches.size());
   for (std::size_t i = 0; i < index->_branches.size(); ++i) {
     const auto& chain = index->_branches[i];
     index->_branch_views.emplace_back(chain.data(), chain.size());
-    if (const auto source = chain.front()->get_source()) {
+    index->_branch_order_types.push_back(classify_branch(dag, chain.back()));
+    const auto source = chain.front()->get_source();
+    // get_mutable(): _branch_heads is non-const because prefetch_step hands the operator to a
+    // caller that narrows and drives it. The index itself never mutates through the pointer.
+    index->_branch_heads.push_back(source.get_mutable());
+    if (source) {
       // First branch headed by this operator wins (a fan-out head owns several branches).
       index->_head_op_to_branch.try_emplace(source->get_operator_id(), i);
     }
@@ -193,12 +227,35 @@ query_index::branch query_index::get_consumer_pipelines_till_next_branch(
 
 std::vector<prefetch_step> query_index::prefetching_order() const
 {
-  throw std::logic_error("query_index::prefetching_order: not implemented");
+  // No graph search at all: build_index already classified every branch, so this is one pass over
+  // the parallel vectors plus a sort. That is what makes the result deterministic and what makes
+  // it terminate on a cyclic DAG -- there is nothing here that can follow an edge twice.
+  std::vector<prefetch_step> steps;
+  steps.reserve(_branch_heads.size());
+
+  std::unordered_set<std::size_t> seen;  // operator ids already emitted
+  for (std::size_t i = 0; i < _branch_heads.size(); ++i) {
+    auto* head = _branch_heads[i];
+    if (head == nullptr) { continue; }
+    if (head->type != op::SiriusPhysicalOperatorType::GPU_SCAN) { continue; }
+    // A fan-out head owns several branches; name it once, under the first (matching the same
+    // first-wins rule _head_op_to_branch uses).
+    if (!seen.insert(head->get_operator_id()).second) { continue; }
+    steps.push_back(prefetch_step{head, _branch_order_types[i]});
+  }
+
+  // Stable so that within one barrier class the branches keep plan order, which is the order
+  // task_creator::compute_pipeline_priorities assigns scheduling priority in.
+  std::stable_sort(
+    steps.begin(), steps.end(), [](const prefetch_step& lhs, const prefetch_step& rhs) {
+      return static_cast<std::uint8_t>(lhs.order) < static_cast<std::uint8_t>(rhs.order);
+    });
+  return steps;
 }
 
 order_type query_index::get_branch_order_type(std::size_t branch_index) const
 {
-  throw std::logic_error("query_index::get_branch_order_type: not implemented");
+  return _branch_order_types.at(branch_index);
 }
 
 }  // namespace sirius::planner

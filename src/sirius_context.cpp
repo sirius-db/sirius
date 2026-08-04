@@ -34,6 +34,7 @@
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "memory/topology_index.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
+#include "scan_manager/prefetching_state_manager.hpp"
 #include "sirius_sql_rewrite.hpp"
 #include "telemetry/batch_telemetry.hpp"
 #include "transparent/physical_sirius_execution.hpp"
@@ -955,6 +956,30 @@ void SiriusContext::create_query(
   task_creator_->prepare_for_query(*query_);
   scan_manager_->prepare_for_query(*query_,
                                    config_.get_operator_params().enable_pinned_zone_map_pruning);
+
+  // Point the task_creator's scheduling hooks at this query's prefetch bookkeeping. Installed last,
+  // after scan_manager_->prepare_for_query has built the fresh instance, so the captured weak_ptr
+  // refers to this query's manager and not the previous one's.
+  //
+  // A weak_ptr, never a shared_ptr: the task_creator outlives every query, and a straggler hook
+  // firing between scan_manager_->reset() and task_creator_->reset() (run_mandatory_cleanup drops
+  // them in that order) must not resurrect a dead query's manager. An expired weak_ptr makes the
+  // hook a silent no-op, which is also what makes the stale-hook window harmless.
+  //
+  // The manager is captured directly rather than looked up through get_scan_manager(): that
+  // accessor calls throw_if_not_initialized() and throws once the context has been terminated, and
+  // the not-created hook fires from outside the dispatch lambda's try block on the engine's single
+  // task-creation thread — a throw there would end all task creation silently.
+  std::weak_ptr<sirius::scan_manager::prefetching_state_manager> weak_state =
+    scan_manager_->prefetching_state();
+  task_creator_->set_on_task_queue_depleted([weak_state] {
+    if (auto state = weak_state.lock()) { state->on_task_queue_depleted(); }
+  });
+  task_creator_->set_on_task_not_created(
+    [weak_state](const sirius::op::sirius_physical_operator* requested,
+                 sirius::creator::request_type kind) {
+      if (auto state = weak_state.lock()) { state->on_task_not_created(requested, kind); }
+    });
 }
 
 duckdb::shared_ptr<sirius::planner::query> SiriusContext::get_query()

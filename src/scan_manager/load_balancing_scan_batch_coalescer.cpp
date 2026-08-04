@@ -19,6 +19,7 @@
 #include "exec/try.hpp"
 #include "log/logging.hpp"
 #include "op/scan/sirius_gpu_scan_operator_data.hpp"
+#include "scan_manager/prefetching_state_manager.hpp"
 
 #include <stop_token>
 #include <utility>
@@ -101,8 +102,9 @@ void load_balancing_scan_batch_coalescer::process_provider_inputs(metadata_proce
 
   // Balance one coalesced batch onto a GPU and hand it to the connector.
   auto emit = [&state](std::unique_ptr<op::scan::scan_info> batch) {
-    auto op_data = std::make_unique<op::scan::scan_operator_input>(std::move(batch));
-    auto dev_id  = state.balancer->get_next_gpu(state.pipeline_id, op_data.get());
+    auto op_data =
+      std::make_unique<op::scan::scan_operator_input>(std::move(batch), state.prefetch_state);
+    auto dev_id = state.balancer->get_next_gpu(state.pipeline_id, op_data.get());
     if (dev_id.has_value() && *dev_id >= 0) { op_data->set_preferred_device_id(dev_id.value()); }
 
     auto fadvise_hints = op_data->get_fadvise_hints();
@@ -171,23 +173,32 @@ void load_balancing_scan_batch_coalescer::process_provider_inputs(metadata_proce
 void load_balancing_scan_batch_coalescer::process_cached_entries(metadata_processing_state& state,
                                                                  std::stop_token const& stop)
 {
-  drain_cached_provider(*state.batch_provider, *state.connector, stop, state.row_filter_pending);
+  drain_cached_provider(
+    *state.batch_provider, *state.connector, stop, state.row_filter_pending, state.prefetch_state);
 }
 
-void load_balancing_scan_batch_coalescer::drain_cached_provider(databatch_provider& provider,
-                                                                split_connector& connector,
-                                                                std::stop_token const& stop,
-                                                                bool row_filter_pending)
+void load_balancing_scan_batch_coalescer::drain_cached_provider(
+  databatch_provider& provider,
+  split_connector& connector,
+  std::stop_token const& stop,
+  bool row_filter_pending,
+  std::shared_ptr<prefetching_state_manager> prefetch_state)
 {
   try {
     while (!stop.stop_requested()) {
       auto next = provider.get_next_batch();
       if (next.data) {
-        auto split = std::make_unique<op::scan::scan_operator_input>(std::move(next.data));
+        auto split =
+          std::make_unique<op::scan::scan_operator_input>(std::move(next.data), prefetch_state);
         split->mvcc_keep_mask               = std::move(next.mvcc_keep_mask);
         split->needs_carrier_conversion     = next.needs_carrier_conversion;
         split->conversion_destination_bytes = next.conversion_destination_bytes;
         split->row_filter_pending           = row_filter_pending;
+        // The resident rung. A pinned-cache split has no datasource, so this fires no IO hint --
+        // it records that the split reached metadata_created, which is the same rung the two
+        // scan_info paths report. Without it a fully-pinned query reports zero on this rung while
+        // doing exactly the same ladder walk.
+        split->prefetch(io::cache::prefetching_stage::metadata_created);
         connector.push_split(std::move(split));
         continue;
       }
@@ -196,7 +207,8 @@ void load_balancing_scan_batch_coalescer::drain_cached_provider(databatch_provid
         // splits fold filter costs into their own estimates. Same fadvise +
         // metadata_created prefetch as the walk path; host-backed splits have
         // no file ranges, so the hints no-op.
-        auto split = std::make_unique<op::scan::scan_operator_input>(std::move(next.scan_info));
+        auto split = std::make_unique<op::scan::scan_operator_input>(std::move(next.scan_info),
+                                                                     prefetch_state);
         split->mvcc_keep_mask = std::move(next.mvcc_keep_mask);
         std::optional<int> device;
         if (next.preferred_device >= 0) {

@@ -14,15 +14,6 @@
  * limitations under the License.
  */
 
-// TODO(phase4): two things change here once the implementations land — drop the [.] tag, and
-// restore the broad [io] tag alongside [prefetch_api].
-//
-// The prefetch-scan APIs currently ship as declarations whose bodies throw. Most of them are
-// noexcept, so a throw from one aborts the whole test binary instead of failing a case; the
-// hidden-test tag keeps the default suite runnable until the implementations arrive. A Catch2
-// test spec *includes* hidden cases, so the broad tag stays off until then: with it, running
-// `sirius_unittest "[io]"` would pull these in and abort.
-//
 // backgrounds_prefetch is the only consumer-visible policy on the prefetching_stage ladder: it
 // decides whether prefetching_cache::prepare_loop hands a hint to its own background thread or
 // lets the read path do the IO inline. The assertions below are STATIC_REQUIREs, so they are
@@ -32,7 +23,7 @@
 #include <io/cache/types.hpp>
 
 TEST_CASE("backgrounds_prefetch is false exactly for none and task_preprocessing",
-          "[.][prefetch_api][prefetch_stage]")
+          "[io][prefetch_api][prefetch_stage]")
 {
   using sirius::io::cache::backgrounds_prefetch;
   using sirius::io::cache::prefetching_stage;

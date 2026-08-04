@@ -14,14 +14,6 @@
  * limitations under the License.
  */
 
-// TODO(phase4): two things change here once the implementations land — drop the [.] tag, and
-// restore the broad [scan] tag alongside [prefetch_api].
-//
-// Every predicate exercised here is declared noexcept and its Phase-1 body throws, so an unhidden
-// case would abort the whole test binary instead of failing. A Catch2 test spec *includes* hidden
-// cases, so the broad tag stays off until then: with it, running `sirius_unittest "[scan]"` would
-// pull these in and abort.
-//
 // scan_operator_input's prefetch predicates over the *metadata* split shape, plus the ladder
 // counting both shapes share. There is deliberately no mock ioctx or mock datasource in this repo:
 // the datasources below are real kvikio-backed ones over a real parquet file, which is exactly the
@@ -118,7 +110,7 @@ struct three_slice_split {
 }  // namespace
 
 TEST_CASE("a metadata split with no datasource is not io-prefetchable",
-          "[.][prefetch_api][scan_input]")
+          "[scan][prefetch_api][scan_input]")
 {
   auto file = std::make_unique<scan::parquet_file_scan_info>();
   file->row_groups.push_back({0, 20, 60, 10, 1});
@@ -130,7 +122,7 @@ TEST_CASE("a metadata split with no datasource is not io-prefetchable",
 }
 
 TEST_CASE("a metadata split counts one datasource per row-group slice",
-          "[.][prefetch_api][scan_input]")
+          "[scan][prefetch_api][scan_input]")
 {
   three_slice_split fixture;
 
@@ -143,7 +135,7 @@ TEST_CASE("a metadata split counts one datasource per row-group slice",
 }
 
 TEST_CASE("a metadata split with no fadvise reports an empty prefetch state",
-          "[.][prefetch_api][scan_input]")
+          "[scan][prefetch_api][scan_input]")
 {
   three_slice_split fixture;
 
@@ -152,7 +144,7 @@ TEST_CASE("a metadata split with no fadvise reports an empty prefetch state",
 }
 
 TEST_CASE("prefetch on a split with no fadvised datasource is a no-op",
-          "[.][prefetch_api][scan_input]")
+          "[scan][prefetch_api][scan_input]")
 {
   three_slice_split fixture;
 
@@ -162,7 +154,7 @@ TEST_CASE("prefetch on a split with no fadvised datasource is a no-op",
   }
 }
 
-TEST_CASE("a metadata split is not memory-prefetchable", "[.][prefetch_api][scan_input]")
+TEST_CASE("a metadata split is not memory-prefetchable", "[scan][prefetch_api][scan_input]")
 {
   three_slice_split fixture;
 
@@ -177,7 +169,7 @@ TEST_CASE("a metadata split is not memory-prefetchable", "[.][prefetch_api][scan
 // ladder counting
 //===----------------------------------------------------------------------===//
 
-TEST_CASE("a counted split reports every ladder rung it climbs", "[.][prefetch_api][scan_input]")
+TEST_CASE("a counted split reports every ladder rung it climbs", "[scan][prefetch_api][scan_input]")
 {
   auto counters = std::make_shared<prefetching_state_manager>(
     prefetching_state_manager::config{.memory_threshold = 0, .max_concurrent_scan = 4});
@@ -207,7 +199,7 @@ TEST_CASE("a counted split reports every ladder rung it climbs", "[.][prefetch_a
 }
 
 TEST_CASE("a resident split is counted even though it has no datasource",
-          "[.][prefetch_api][scan_input]")
+          "[scan][prefetch_api][scan_input]")
 {
   // The regression gate for the under-count: the rung is recorded above prefetch()'s metadata
   // check, so a pinned-cache split — which has no scan metadata and no datasource, and therefore
@@ -232,7 +224,7 @@ TEST_CASE("a resident split is counted even though it has no datasource",
   CHECK(climbed.n_task_completed == 1);
 }
 
-TEST_CASE("a split with no state manager does not crash", "[.][prefetch_api][scan_input]")
+TEST_CASE("a split with no state manager does not crash", "[scan][prefetch_api][scan_input]")
 {
   // The defaulted null manager is what keeps every call site outside the scan manager — including
   // every other case in this file — compiling and running unchanged.
