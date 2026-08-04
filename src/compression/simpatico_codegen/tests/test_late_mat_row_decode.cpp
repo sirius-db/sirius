@@ -970,6 +970,98 @@ bool run_multi_source_gather()
   return true;
 }
 
+// ── 11. Multi-origin output-group materialization (FD-GBR composition) ──────
+// The v3 shape: groups keyed by ONE nominated rowid; key columns from N
+// origin tables, each with its own rider rowid column at the output port.
+// This test proves the claim that NO new machinery is needed: N origins = N
+// INDEPENDENT prepare_selection+materialize pairs against the same port row
+// set — different layouts, different id lists (row-aligned), same stream.
+// Rider semantics under the FD proof: all rows of a group share the rider
+// value, so the (arbitrary, duplicated) per-group representative ids here
+// stand in for any group-representative choice.
+bool run_multi_origin_groups()
+{
+  const rmm::cuda_stream_view stream{};
+  auto mr = rmm::mr::get_current_device_resource_ref();
+
+  // Origin A: tiny single-batch dimension (nation-like, 25 rows, INT32).
+  const std::int64_t n_a = 25;
+  std::vector<std::int32_t> a_data(n_a);
+  for (int i = 0; i < n_a; ++i) a_data[i] = 900 + i;
+  auto a_col = cudf::make_fixed_width_column(cudf::data_type{cudf::type_id::INT32},
+                                             static_cast<cudf::size_type>(n_a),
+                                             cudf::mask_state::UNALLOCATED, stream, mr);
+  cudaMemcpy(a_col->mutable_view().head<void>(), a_data.data(), a_data.size() * 4,
+             cudaMemcpyHostToDevice);
+
+  // Origin B: larger single-batch fact-side table (customer-like, INT64).
+  const std::int64_t n_b = 3 * kChunk + 11;
+  std::vector<std::int64_t> b_data(static_cast<std::size_t>(n_b));
+  for (std::int64_t i = 0; i < n_b; ++i)
+    b_data[static_cast<std::size_t>(i)] = 5'000'000 + i * 3;
+  auto b_col = cudf::make_fixed_width_column(cudf::data_type{cudf::type_id::INT64},
+                                             static_cast<cudf::size_type>(n_b),
+                                             cudf::mask_state::UNALLOCATED, stream, mr);
+  cudaMemcpy(b_col->mutable_view().head<void>(), b_data.data(), b_data.size() * 8,
+             cudaMemcpyHostToDevice);
+
+  // One output-group port: G groups, each carrying a rider id per origin
+  // (duplicated + unordered — group order is whatever the aggregate emitted).
+  const std::size_t G = 700;
+  std::vector<std::uint64_t> a_ids(G), b_ids(G);
+  std::uint64_t s = 0x6B0;
+  for (std::size_t g = 0; g < G; ++g) {
+    a_ids[g] = splitmix64(s) % static_cast<std::uint64_t>(n_a);
+    b_ids[g] = splitmix64(s) % static_cast<std::uint64_t>(n_b);
+  }
+  void *d_a = nullptr, *d_b = nullptr;
+  cudaMalloc(&d_a, G * 8);
+  cudaMalloc(&d_b, G * 8);
+  cudaMemcpy(d_a, a_ids.data(), G * 8, cudaMemcpyHostToDevice);
+  cudaMemcpy(d_b, b_ids.data(), G * 8, cudaMemcpyHostToDevice);
+
+  // N independent prepare+materialize pairs, same stream, same port rows.
+  auto layout_a = sirius::late_mat::pinned_table_layout::from_batch_rows({n_a}, 11);
+  auto layout_b = sirius::late_mat::pinned_table_layout::from_batch_rows({n_b}, 12);
+  auto sel_a    = sirius::late_mat::prepare_selection(
+    layout_a, {static_cast<std::uint64_t const*>(d_a), static_cast<std::int64_t>(G), false},
+    stream, mr);
+  auto sel_b = sirius::late_mat::prepare_selection(
+    layout_b, {static_cast<std::uint64_t const*>(d_b), static_cast<std::int64_t>(G), false},
+    stream, mr);
+
+  sirius::late_mat::pinned_column_view origin_a;
+  origin_a.dtype          = cudf::data_type{cudf::type_id::INT32};
+  origin_a.pin_generation = 11;
+  origin_a.batches.push_back({nullptr, 0, a_col->view(), n_a});
+  sirius::late_mat::pinned_column_view origin_b;
+  origin_b.dtype          = cudf::data_type{cudf::type_id::INT64};
+  origin_b.pin_generation = 12;
+  origin_b.batches.push_back({nullptr, 0, b_col->view(), n_b});
+
+  auto got_a = sirius::late_mat::materialize(origin_a, *sel_a, stream, mr);
+  auto got_b = sirius::late_mat::materialize(origin_b, *sel_b, stream, mr);
+  cudaStreamSynchronize(stream.value());
+
+  REQUIRE_MSG(got_a && got_a->size() == static_cast<cudf::size_type>(G) && got_b &&
+                got_b->size() == static_cast<cudf::size_type>(G),
+              "multi-origin output sizes");
+  std::vector<std::int32_t> ha(G);
+  std::vector<std::int64_t> hb(G);
+  cudaMemcpy(ha.data(), got_a->view().head<void>(), G * 4, cudaMemcpyDeviceToHost);
+  cudaMemcpy(hb.data(), got_b->view().head<void>(), G * 8, cudaMemcpyDeviceToHost);
+  bool ok = true;
+  for (std::size_t g = 0; g < G; ++g) {
+    ok &= ha[g] == a_data[static_cast<std::size_t>(a_ids[g])];
+    ok &= hb[g] == b_data[static_cast<std::size_t>(b_ids[g])];
+  }
+  REQUIRE_MSG(ok, "multi-origin per-group values (row alignment across origins)");
+  cudaFree(d_a);
+  cudaFree(d_b);
+  std::printf("PASS: multi-origin output-group materialization (2 origins, 1 port)\n");
+  return true;
+}
+
 }  // namespace
 
 int main()
@@ -994,6 +1086,7 @@ int main()
     run_stored_dtype_retag();
     run_rowid_emission();
     run_multi_source_gather();
+    run_multi_origin_groups();
   } catch (const std::exception& e) {
     std::fprintf(stderr, "FAIL: unhandled exception: %s\n", e.what());
     return 1;

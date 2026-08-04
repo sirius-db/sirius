@@ -82,6 +82,19 @@ inline bool late_mat_v2_enabled()
   return enabled && late_mat_enabled();
 }
 
+/// v3 sub-gate (SIRIUS_EXP_LATE_MAT_V3, default off): FD/composite-key
+/// group-by-rowid proofs (determination closures over pin-unique seeds and
+/// INNER-join equality transfer). Implies the v2 sub-gate, which implies the
+/// main gate — the stack can never invert.
+inline bool late_mat_v3_enabled()
+{
+  static const bool enabled = []() {
+    char const* v = std::getenv("SIRIUS_EXP_LATE_MAT_V3");
+    return v != nullptr && v[0] != '\0' && !(v[0] == '0' && v[1] == '\0');
+  }();
+  return enabled && late_mat_v2_enabled();
+}
+
 /// Columns selected by SIRIUS_LATE_MAT_PIN_UNIQUE_COLS for the pin-time
 /// uniqueness probes, as positions into @p column_names. Two value forms:
 /// a comma-separated case-sensitive name list, or a boolean-style value

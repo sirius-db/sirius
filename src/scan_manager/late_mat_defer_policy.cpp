@@ -22,6 +22,7 @@
 #include "expression/ast/utils.hpp"
 #include "late_mat/defer_directive.hpp"
 #include "late_mat/plan_deferral.hpp"
+#include "op/sirius_physical_grouped_aggregate.hpp"
 #include "log/logging.hpp"
 #include "op/scan/gpu_ingestible.hpp"
 #include "op/scan/parquet_gpu_ingestible.hpp"
@@ -33,7 +34,9 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <numeric>
 #include <optional>
+#include <set>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -124,6 +127,28 @@ bool count_on_deferred_enabled()
     return v != nullptr && v[0] != '\0' && !(v[0] == '0' && v[1] == '\0');
   }();
   return enabled;
+}
+
+/// Group-by-rowid admit gate on GROUP-INPUT volume
+/// (SIRIUS_LATE_MAT_GBR_MIN_GROUP_ROWS, default 0 = INERT). The mechanism is
+/// retained because the ride's fixed costs (rowid hashing, per-group
+/// materialization, port prep) can only pay on large aggregate inputs — a
+/// 44.5 M-row group input measured -198 ms — but the suspected small-input
+/// tax did NOT reproduce under a dedicated N=4 A/B on the shipping binary
+/// (the 444 K-row shape measured +0.3/-1.0/+0.3/-1.3 ms, pooled ~0), so the
+/// floor ships disabled and the shipping behavior equals the measured no-gate
+/// arms exactly. Plan-time estimate of the FIRST ridden aggregate's input;
+/// FAIL-OPEN — a missing/zero estimate always installs.
+std::size_t min_gbr_group_rows()
+{
+  static const std::size_t value = []() -> std::size_t {
+    char const* v = std::getenv("SIRIUS_LATE_MAT_GBR_MIN_GROUP_ROWS");
+    if (v == nullptr) { return 0; }
+    char* end    = nullptr;
+    auto const n = std::strtoull(v, &end, 10);
+    return end == v ? 0 : static_cast<std::size_t>(n);
+  }();
+  return value;
 }
 
 constexpr double kRowidBytes = 8.0;  // UINT64 pin-order rowid
@@ -508,6 +533,8 @@ void try_install_count_only_deferral(op::scan::sirius_gpu_scan_operator* scan_op
 struct ride_extension {
   op::sirius_physical_operator* consumer{nullptr};       // port owner at the final pipeline
   op::sirius_physical_operator* producer_tail{nullptr};  // last op feeding that port
+  op::sirius_physical_operator* fact_consumer{nullptr};  // the facts' final content reader
+  std::vector<op::sirius_physical_operator*> chain;      // ridden aggregates, ride order
   std::size_t extra_boundaries{0};
   std::size_t group_by_stages{0};
   std::string unique_key_name;
@@ -556,6 +583,24 @@ std::optional<ride_extension> try_extend_group_ride(
     }
   }
   if (final_consumer == nullptr || key_chain == nullptr) { return std::nullopt; }
+
+  // Volume admit gate: the FIRST ridden aggregate's input estimate.
+  if (min_gbr_group_rows() > 0 && !key_chain->empty()) {
+    auto const* first_agg = key_chain->front();
+    std::size_t const input_estimate =
+      (first_agg != nullptr && !first_agg->children.empty() && first_agg->children[0])
+        ? first_agg->children[0]->estimated_cardinality
+        : 0;
+    if (input_estimate > 0 && input_estimate < min_gbr_group_rows()) {
+      SIRIUS_LOG_INFO(
+        "[late_mat] group-by-rowid REFUSED (group input est. {} rows < admit floor {}): "
+        "scan op {} — falling back to the pre-aggregate port",
+        input_estimate,
+        min_gbr_group_rows(),
+        scan_op->get_operator_id());
+      return std::nullopt;
+    }
+  }
 
   // Uniqueness proof (census line emitted by the caller): a non-deferred
   // column with a pin-proven-unique fact must be a group key at every ridden
@@ -625,6 +670,8 @@ std::optional<ride_extension> try_extend_group_ride(
       ride.extra_boundaries = extra_boundaries;
       ride.group_by_stages  = key_chain->size();
       ride.unique_key_name  = unique_key_name;
+      ride.fact_consumer    = final_consumer;
+      ride.chain            = *key_chain;
       if (ride.producer_tail == nullptr) { return std::nullopt; }
       return ride;
     }
@@ -633,11 +680,180 @@ std::optional<ride_extension> try_extend_group_ride(
   return std::nullopt;
 }
 
+/// One v3 rider origin ready for install: the port-side bundle, the rider
+/// scan's own substitution positions, and the width it adds to the install's
+/// arbitration value.
+struct rider_plan {
+  op::scan::sirius_gpu_scan_operator* scan{nullptr};
+  late_mat::port_materialize_directive::origin_bundle bundle;
+  std::vector<std::size_t> scan_positions;
+  double width{0.0};
+};
+
+/// v3 FD closure + rider construction (SIRIUS_EXP_LATE_MAT_V3, dark
+/// generality — no TPC-H perf claim). Seed: row(current origin), already
+/// proven by the v2 admission (a pin-unique key of this origin is a planned
+/// group key riding real). Transfer across the pass's INNER-join equality
+/// edges; a rider origin's group keys drop iff its ROW becomes determined.
+/// Every unprovable link contributes nothing — affected keys ride real. The
+/// derivation-order trace is returned for the census verbatim.
+std::vector<rider_plan> build_fd_riders(op::scan::sirius_gpu_scan_operator* scan_op,
+                                        late_mat_defer_context const& context,
+                                        late_mat::planned_fd_graph const& graph,
+                                        ride_extension const& ride,
+                                        std::string& trace)
+{
+  std::vector<rider_plan> riders;
+  std::set<op::sirius_physical_operator*> determined_rows{scan_op};
+  std::set<std::pair<op::sirius_physical_operator*, std::size_t>> determined_cols;
+  trace = "row(scan " + std::to_string(scan_op->get_operator_id()) + ")";
+  auto unique_in = [&](op::sirius_physical_operator* scan, std::size_t pos) -> bool {
+    auto* gpu_scan = dynamic_cast<op::scan::sirius_gpu_scan_operator*>(scan);
+    if (gpu_scan == nullptr) { return false; }
+    auto const it = context.by_scan.find(gpu_scan);
+    if (it == context.by_scan.end() || pos >= it->second.columns.size()) { return false; }
+    auto const entry_pos = static_cast<std::uint32_t>(it->second.columns[pos]);
+    return std::ranges::find(it->second.entry->unique_columns, entry_pos) !=
+           it->second.entry->unique_columns.end();
+  };
+  auto determined = [&](op::sirius_physical_operator* scan, std::size_t pos) {
+    return determined_rows.contains(scan) || determined_cols.contains({scan, pos});
+  };
+  bool changed = true;
+  while (changed) {
+    changed = false;
+    for (auto const& e : graph.edges) {
+      for (int dir = 0; dir < 2; ++dir) {
+        auto* from    = dir == 0 ? e.scan_a : e.scan_b;
+        auto from_pos = dir == 0 ? e.pos_a : e.pos_b;
+        auto* to      = dir == 0 ? e.scan_b : e.scan_a;
+        auto to_pos   = dir == 0 ? e.pos_b : e.pos_a;
+        if (!determined(from, from_pos) || determined(to, to_pos)) { continue; }
+        determined_cols.insert({to, to_pos});
+        changed = true;
+        trace += " -> (scan " + std::to_string(to->get_operator_id()) + " col " +
+                 std::to_string(to_pos) + ") ==join(op " +
+                 std::to_string(e.join ? e.join->get_operator_id() : 0) + ")";
+        if (!determined_rows.contains(to) && unique_in(to, to_pos)) {
+          determined_rows.insert(to);
+          trace += " [unique] -> row(scan " + std::to_string(to->get_operator_id()) + ")";
+        }
+      }
+    }
+  }
+
+  // Rider keys: provenances at the ride's FIRST aggregate from OTHER,
+  // row-determined origins, whose own lifetime facts rode the same chain to
+  // the same final consumer.
+  if (ride.chain.empty()) { return riders; }
+  auto* first_agg = ride.chain.front();
+  std::map<op::scan::sirius_gpu_scan_operator*, std::vector<late_mat::planned_fd_graph::key_provenance const*>>
+    by_rider;
+  for (auto const& kp : graph.key_provenances) {
+    if (kp.aggregate != first_agg || kp.scan == scan_op) { continue; }
+    auto* rider_scan = dynamic_cast<op::scan::sirius_gpu_scan_operator*>(kp.scan);
+    if (rider_scan == nullptr || !determined_rows.contains(kp.scan)) { continue; }
+    by_rider[rider_scan].push_back(&kp);
+  }
+  for (auto& [rider_scan, kps] : by_rider) {
+    auto const ctx_it = context.by_scan.find(rider_scan);
+    if (ctx_it == context.by_scan.end() || !rider_scan->late_mat_plan) { continue; }
+    auto const& info = ctx_it->second;
+    if (!info.entry->late_mat_handle) { continue; }
+    rider_plan plan;
+    plan.scan = rider_scan;
+    std::optional<late_mat::pinned_table_layout> rider_layout;
+    struct rider_col {
+      std::size_t scan_pos;
+      std::size_t port_pos;
+    };
+    std::vector<rider_col> cols;
+    for (auto const* kp : kps) {
+      // The rider column's own lifetime fact must have ridden the SAME chain
+      // to the SAME final consumer, null-free.
+      late_mat::planned_column_deferral const* fact = nullptr;
+      for (auto const& f : rider_scan->late_mat_plan->columns) {
+        if (f.scan_output_position == kp->scan_pos) {
+          fact = &f;
+          break;
+        }
+      }
+      if (fact == nullptr || fact->consumer != ride.fact_consumer || fact->nullified_on_ride ||
+          fact->consumed_as_count_only) {
+        SIRIUS_LOG_INFO(
+          "[late_mat] fd-chain REFUSED for rider scan {} column {}: lifetime fact does not "
+          "reach the ride's final consumer null-free",
+          rider_scan->get_operator_id(),
+          kp->scan_pos);
+        continue;
+      }
+      bool covers = true;
+      for (auto* agg : ride.chain) {
+        if (std::ranges::find(fact->group_key_at, agg) == fact->group_key_at.end()) {
+          covers = false;
+          break;
+        }
+      }
+      if (!covers) { continue; }
+      if (kp->scan_pos >= info.columns.size() ||
+          kp->scan_pos >= rider_scan->get_types().size()) {
+        continue;
+      }
+      auto const width = pinned_column_width_bytes(
+        *info.entry, info.columns[kp->scan_pos], rider_scan->get_types()[kp->scan_pos]);
+      if (!width) { continue; }
+      late_mat::column_origin origin{info.entry->late_mat_handle,
+                                     static_cast<std::uint32_t>(info.columns[kp->scan_pos]),
+                                     info.entry->late_mat_handle->generation()};
+      auto view = resolve_pinned_column(origin);
+      if (!view) { continue; }
+      if (!rider_layout) {
+        rider_layout = resolve_pinned_layout(origin);
+        if (!rider_layout) { break; }
+      }
+      cols.push_back({kp->scan_pos, fact->final_position});
+      plan.bundle.positions.push_back(fact->final_position);
+      plan.bundle.origins.push_back(origin);
+      plan.bundle.columns.push_back(std::move(*view));
+      plan.width += *width;
+    }
+    if (plan.bundle.positions.empty() || !rider_layout) { continue; }
+    plan.bundle.layout = std::move(*rider_layout);
+    // Sort bundle vectors by port position; the rider's rowid rides at the
+    // FIRST dropped scan position (its own scan-side directive convention).
+    std::vector<std::size_t> order(plan.bundle.positions.size());
+    std::iota(order.begin(), order.end(), std::size_t{0});
+    std::ranges::sort(order, {}, [&](std::size_t i) { return plan.bundle.positions[i]; });
+    late_mat::port_materialize_directive::origin_bundle sorted_bundle;
+    sorted_bundle.layout = std::move(plan.bundle.layout);
+    for (auto const i : order) {
+      sorted_bundle.positions.push_back(plan.bundle.positions[i]);
+      sorted_bundle.origins.push_back(plan.bundle.origins[i]);
+      sorted_bundle.columns.push_back(std::move(plan.bundle.columns[i]));
+    }
+    for (auto const& c : cols) {
+      plan.scan_positions.push_back(c.scan_pos);
+    }
+    std::ranges::sort(plan.scan_positions);
+    // Rowid at the FIRST scan position -> its port position.
+    for (auto const& c : cols) {
+      if (c.scan_pos == plan.scan_positions.front()) {
+        sorted_bundle.rowid_position = c.port_pos;
+        break;
+      }
+    }
+    plan.bundle = std::move(sorted_bundle);
+    riders.push_back(std::move(plan));
+  }
+  return riders;
+}
+
 }  // namespace
 
 void try_install_late_mat_deferral(op::scan::sirius_gpu_scan_operator* scan_op,
                                    pinned_entry const& entry,
-                                   std::span<std::size_t const> selected_columns)
+                                   std::span<std::size_t const> selected_columns,
+                                   late_mat_defer_context const* context)
 {
   if (!late_mat::late_mat_enabled() || !defer_enabled()) { return; }
   if (scan_op == nullptr || !entry.late_mat_handle) { return; }
@@ -767,8 +983,10 @@ void try_install_late_mat_deferral(op::scan::sirius_gpu_scan_operator* scan_op,
   op::sirius_physical_operator* target_tail     = stop->producer_tail;
   std::size_t ride_boundaries                   = 0;
   bool group_ride                               = false;
+  std::optional<ride_extension> active_ride;
   if (late_mat::late_mat_v2_enabled() && scan_op->late_mat_plan) {
     if (auto ride = try_extend_group_ride(scan_op, entry, selected_columns, *stop)) {
+      active_ride     = *ride;
       target_consumer = ride->consumer;
       target_tail     = ride->producer_tail;
       ride_boundaries = ride->extra_boundaries;
@@ -896,6 +1114,9 @@ void try_install_late_mat_deferral(op::scan::sirius_gpu_scan_operator* scan_op,
       scan_op->get_operator_id(),
       bundle_value);
     if (incumbent->source_scan != nullptr) { incumbent->source_scan->late_mat_defer.reset(); }
+    for (auto* rider : incumbent->rider_scans) {
+      if (rider != nullptr) { rider->late_mat_defer.reset(); }
+    }
     target_consumer->late_mat_port_directive.reset();
   }
 
@@ -943,27 +1164,75 @@ void try_install_late_mat_deferral(op::scan::sirius_gpu_scan_operator* scan_op,
     }
   }
 
-  auto port_directive               = std::make_shared<late_mat::port_materialize_directive>();
-  port_directive->expected_arity    = target_arity;
-  port_directive->layout            = std::move(*layout);
+  auto port_directive                = std::make_shared<late_mat::port_materialize_directive>();
+  port_directive->expected_arity     = target_arity;
   port_directive->bundle_value_bytes = bundle_value;
   port_directive->source_scan        = scan_op;
-  // The rowid rides at the FIRST deferred scan position; find where that
-  // position landed at the port.
+  // Nominated origin's bundle. The rowid rides at the FIRST deferred scan
+  // position; find where that position landed at the port.
+  late_mat::port_materialize_directive::origin_bundle nominated;
+  nominated.layout          = std::move(*layout);
   auto const rowid_scan_pos = scan_directive->output_positions.front();
   for (auto const& c : resolved) {
-    port_directive->positions.push_back(c.port_pos);
-    port_directive->origins.push_back(c.origin);
-    port_directive->columns.push_back(c.view);
-    if (c.scan_pos == rowid_scan_pos) { port_directive->rowid_position = c.port_pos; }
+    nominated.positions.push_back(c.port_pos);
+    nominated.origins.push_back(c.origin);
+    nominated.columns.push_back(c.view);
+    if (c.scan_pos == rowid_scan_pos) { nominated.rowid_position = c.port_pos; }
   }
-  // Swap the deferred positions to their placeholder types (rowid UINT64,
-  // INT8 elsewhere) — the schema the matcher must see, exactly.
-  for (auto const& c : resolved) {
-    expected_types[c.port_pos] = cudf::type_id::INT8;
+  auto const nominated_rowid_port_pos = nominated.rowid_position;
+  port_directive->bundles.push_back(std::move(nominated));
+
+  // v3 FD riders (dark generality — census-verbose, no perf claim): other
+  // origins whose ROW the determination closure proves from this origin's
+  // seed contribute rider bundles; their keys drop and materialize per
+  // output group alongside the nominated bundle. Installed only after the
+  // arbitration below (a rider whose scan still holds a foreign directive at
+  // that point is dropped, never half-installed).
+  std::vector<rider_plan> riders;
+  std::string fd_trace;
+  if (group_ride && active_ride && late_mat::late_mat_v3_enabled() && context != nullptr &&
+      scan_op->late_mat_fd_graph) {
+    riders =
+      build_fd_riders(scan_op, *context, *scan_op->late_mat_fd_graph, *active_ride, fd_trace);
+    for (auto const& r : riders) {
+      port_directive->bundle_value_bytes += r.width;
+    }
   }
-  expected_types[port_directive->rowid_position] = cudf::type_id::UINT64;
-  port_directive->expected_types                 = std::move(expected_types);
+
+  // Finalize riders now that the slot is clear: a rider scan still holding a
+  // directive here belongs to a flow the arbitration did NOT evict — drop it
+  // (its keys ride real; bundle and value adjusted).
+  for (auto& r : riders) {
+    if (r.scan->late_mat_defer) {
+      SIRIUS_LOG_INFO(
+        "[late_mat] fd rider DROPPED (scan op {} holds a foreign directive)",
+        r.scan->get_operator_id());
+      port_directive->bundle_value_bytes -= r.width;
+      continue;
+    }
+    auto rider_directive              = std::make_shared<late_mat::deferred_scan_output>();
+    rider_directive->output_positions = r.scan_positions;
+    r.scan->late_mat_defer            = std::move(rider_directive);
+    port_directive->rider_scans.push_back(r.scan);
+    port_directive->bundles.push_back(std::move(r.bundle));
+    SIRIUS_LOG_INFO(
+      "[late_mat] group-by-rowid[v3] rider: scan op {} contributes {} key column(s) "
+      "(width {:.1f} B/row); chain: {}",
+      r.scan->get_operator_id(),
+      port_directive->bundles.back().positions.size(),
+      r.width,
+      fd_trace);
+  }
+  // Swap every bundle's deferred positions to placeholder types (rowid
+  // UINT64 at each bundle's rowid position, INT8 elsewhere) — the schema the
+  // matcher must see, exactly.
+  for (auto const& bundle : port_directive->bundles) {
+    for (auto const pos : bundle.positions) {
+      expected_types[pos] = cudf::type_id::INT8;
+    }
+    expected_types[bundle.rowid_position] = cudf::type_id::UINT64;
+  }
+  port_directive->expected_types = std::move(expected_types);
 
   SIRIUS_LOG_INFO(
     "[late_mat] deferral installed: scan op {} -> consumer op {} ({}), {} column(s), {} "
@@ -974,7 +1243,7 @@ void try_install_late_mat_deferral(op::scan::sirius_gpu_scan_operator* scan_op,
     resolved.size(),
     stop->boundaries + ride_boundaries,
     rowid_scan_pos,
-    port_directive->rowid_position,
+    nominated_rowid_port_pos,
     total_width,
     bundle_value);
 

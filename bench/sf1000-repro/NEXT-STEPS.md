@@ -780,3 +780,86 @@ only on a workload whose count query is not scan-dominant.
 Single-binary closure (ship binary, one run): gate-off 6.912 s 22/22 (q10 0.5111) →
 v2-on 6.677/6.679 = **−234 ms (−3.4%) on the identical binary** — also the W6
 reservation-guard neutrality gate (guard present, byte-identical, in-band).
+
+### Session 4c (2026-08-04) — v3 close-out: FD group-by-rowid ships DARK; volume-gate
+### null; campaign final — **15.99 → 6.677 s = −58.2%; late-mat gate −234 ms
+### single-binary (−3.4%)**
+
+**v3 = FD/composite-key group-by-rowid machinery, shipped DARK as a generality
+capability — no TPC-H performance claim, by pre-registration.** The perf case was
+killed in ANALYSIS before any experiment (the campaign's first zero-GPU kill —
+analysis-first paying for itself): q18's FD chain is sound but the touchable
+group-by is ~444 K rows / 63,430 groups → ≤ 2.4 ms ceiling, and its 7.84 %-of-suite
+instance is the phase-A l_orderkey group-by (6 B rows, no unique key — structurally
+outside any GBR); R3 sized the v3 increment at +0.01..0.04 ms. q3 composite keys:
+declined (a new delta-positivity primitive for an 8–15 ms ceiling over a 1–2 ms
+floor; q3 measured dead-flat across all four gbrF arms). q21: shelved (~8 ms
+ceiling; s_name is probe-ably unique but the 180× join fan-out permits only the
+full through-group ride). q13-GBR: pre-killed empirically (q13's measured transfer
+is ~0.06 ms/GB — the 26 GB model prices at ~1.6 ms). Multi-batch uncompressed fast
+path: capability-only per W3, no measurement claim.
+
+What "shipped dark" was VALIDATED on (four independent legs, all on audited
+binaries): (1) census parity — every v2 install byte-identical under v3, all
+refusals logged with reasons; (2) FD-live neutrality — v2-vs-v3 pairs with q18's
+FD install firing, derivation chain printed verbatim (o_orderkey PK → same-table +
+join-equality → c_custkey → c_name), q18 −2.5/+0.6 ms = inside R3's prediction,
+8/8 runs 22/22; (3) W4's FD adversarial sweep: **11/11 byte-identical
+refusal-safety** across every attack shape — non-FK equality, non-bare conditions,
+LEFT/semi/anti chains, expression keys, nomination races, and the
+duplicated-build-side probe (join input ≠ table, the design's §1(c) gap) — no
+silent-wrong grouping anywhere; (4) the production fire-path proof: the suite
+window's ride + rider byte-identity ×4 (the sweep's in-harness positive control
+came back vacuous for a storage-form reason, below; harness fixed, corrected sweep
+is an optional idle-window item). Recorded and deliberately UNBANKED (v3 is off by
+default, so it is not in the ship config): q10 ran −13.2/−13.9 ms in both FD-live
+pairs — consistent with the FD rider extending the customer bundle; if v3 is ever
+lit for perf, that is the pre-sized first arm.
+
+**Volume-gate: clean null.** The q18 v2-GBR tax measured earlier (+2.9/+7.3 ms) did
+not reproduce under the pre-registered N=4: gated-vs-ungated q18 = +0.3/−1.0/+0.3/
+−1.3 ms, pooled ~0, 1/4 positive → NO BANK, and the gate default flipped to inert
+(`SIRIUS_LATE_MAT_GBR_MIN_GROUP_ROWS=0`, build 21) — ship config equals the
+measured nogate arms by construction, so the flip itself needed no re-measurement.
+Knob + machinery retained.
+
+**Storage-form nomination limitation (capability gap, not a bug):** pin-proven
+uniqueness facts are effectively unavailable for compressed pins whose files are
+not globally sorted — the probe's stage 1 needs sorted chunk boundaries and stage 2
+needs device-assemblable (uncompressed) storage. This is WHY suite q18 nominates
+c_custkey (uncompressed customer) rather than o_orderkey (compressed orders), and
+why any future v3 target nominating from a compressed pin depends on stage 1
+passing. Worth remembering before pointing v3 at a new workload.
+
+Knobs (campaign-final, build 21 = the 2026-08-04 20:23:42 binary):
+`SIRIUS_EXP_LATE_MAT` + `SIRIUS_EXP_LATE_MAT_V2` = the banked config;
+`SIRIUS_EXP_LATE_MAT_V3` default-OFF (dark generality);
+`SIRIUS_LATE_MAT_GBR_MIN_GROUP_ROWS=0` (inert; N=4 null result);
+`SIRIUS_LATE_MAT_COUNT_DEFER=0` (killed); `SIRIUS_LATE_MAT_PIN_UNIQUE_COLS` (probe
+list, ≤26 ms/col pin-time); v1 floors unchanged (MIN_VALUE_BYTES=32,
+MIN_VALUE_COMPRESSED=32, MASK_SEL=1.0, DENSE_SEL=0.35, MIN_BOUNDARIES=4,
+COMPRESSED=off).
+
+**Closing scoreboard.** Single-binary gate proof (ship-window binary): gate-off
+6.9123 → gate-on 6.6772/6.6793 = **−234 ms (−3.4%), 22/22**. All-time best suite:
+**6.677 s**; campaign: 15.99 → 6.677 = **−58.2%**.
+
+| item | disposition | evidence |
+|---|---|---|
+| v1 boundary deferral (D1) | **BANKED** −33..−64 ms/pair (N=4), q10 −47..−49 constant | 8 runs 22/22; census = one q10 5-col install |
+| policy first cut (no value floor, first-install-wins) | killed: −65 ms LOSS, q9 +61 | ATTRIBUTION-1; fixed by T=32 + widest-bundle-wins |
+| D2 compressed width-arbitrage | **KILLED** (q9 +66 vs −5..−35 band) | arm C, census-verified live |
+| q13 count-on-deferred | **KILLED** at N=4 (pooled −2.9 vs −16..−32) | disambig table, Session 4b |
+| v2 group-by-rowid | **BANKED** −198.6/−197.3 ms on q10 (−42.8%) | 4 runs 22/22 = bijectivity proof |
+| GBR volume gate | null (+0.3/−1.0/+0.3/−1.3, pooled ~0) → inert default | N=4, q10 untouched in every pair |
+| v3 FD/composite GBR | shipped DARK, validated 4-way, no perf claim | census parity, FD-live neutral, 11/11 adversarial, ride+rider ×4 |
+| q10 FD-rider upside | recorded UNBANKED: −13 ms ×2 with v3 lit | pre-sized first arm if v3 ever ships lit |
+
+Process notes that should outlive the campaign: pre-registered bands + kill bars
+ruled every result (two above-band landings both traced to the SAME model
+conservatism — NVTX-as-ceiling compute terms and 1r+1w partition pricing — and
+two kills cost one arm each); census-before-suite caught every mis-install before
+GPU time was spent on it; byte-identity was load-bearing twice (the DECIMAL64
+retag ×100 and the GBR bijectivity proof); and the one attribution that mattered
+(−65 ms) came entirely from logs + plan dumps — the pre-authorized nsys was never
+spent.

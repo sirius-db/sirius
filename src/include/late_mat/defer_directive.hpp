@@ -69,35 +69,40 @@ struct deferred_scan_output {
 /// prepare_selection over the rowid column's ids (unsorted u64, gather
 /// semantics), then materialize each deferred column and splice it in.
 struct port_materialize_directive {
-  /// Placeholder signature of a pre-materialization batch. Hardened (review finding F1):
-  /// the matcher requires the FULL expected post-substitution schema — every
-  /// column's cudf type id, i.e. the producer's planned types with deferred
-  /// positions swapped to UINT64 (rowid) / INT8 (placeholders) — plus a
-  /// content check on the rowid column (min/max within the pinned row range)
-  /// before any gather. A batch that does not match is passed through
-  /// untouched (e.g. the other port's batches in a mixed join task input);
-  /// a silent-wrong now needs a whole-schema AND in-range coincidence.
+  /// Full expected post-substitution schema (review-hardened matcher input) —
+  /// producer's planned types with every deferred position swapped to its
+  /// placeholder type (UINT64/UINT32 rowid at each bundle's rowid position,
+  /// INT8 elsewhere).
   std::size_t expected_arity{0};
-  std::vector<cudf::type_id> expected_types;  ///< full port schema, post-substitution
-  std::vector<std::size_t> positions;  ///< deferred positions at this port, ascending
-  std::size_t rowid_position{0};       ///< == positions.front() mapped to this port
+  std::vector<cudf::type_id> expected_types;
 
-  /// Origins parallel to `positions` (generation-checked at every use).
-  std::vector<column_origin> origins;
-  /// Bundle value = Σ(real deferred widths) − rowid bytes, in B/row (the
-  /// attribution currency). Used by the consumer-slot arbitration: the
-  /// widest bundle per consumer wins, so a 25-row dimension string can never
-  /// lock out a 154 B/row payload bundle again.
+  /// One materialization bundle per ORIGIN table contributing deferred
+  /// columns at this port. v1/v2 installs carry exactly one; the v3
+  /// FD/multi-origin ride carries the nominated origin plus one rider bundle
+  /// per additional origin. Each bundle is independently the v2 contract:
+  /// u64 ids at rowid_position (u32 riders are widened port-side with a cast
+  /// temporary the materializer owns) -> prepare_selection -> materialize per
+  /// column.
+  struct origin_bundle {
+    std::size_t rowid_position{0};       ///< this origin's rowid column at the port
+    std::vector<std::size_t> positions;  ///< deferred positions at this port, ascending
+    std::vector<column_origin> origins;  ///< parallel to positions
+    pinned_table_layout layout;
+    std::vector<pinned_column_view> columns;  ///< parallel to positions
+  };
+  std::vector<origin_bundle> bundles;
+
+  /// Bundle value = Σ(real deferred widths, all bundles) − rowid bytes, in
+  /// B/row (the attribution currency). Used by the consumer-slot arbitration:
+  /// the widest install per consumer wins.
   double bundle_value_bytes{0.0};
-  /// The scan this directive pairs with — an arbitration eviction must clear
-  /// the loser's scan-side substitution directive atomically with replacing
-  /// this one (installs are plan-time, pre-execution, single-threaded).
+  /// The scan this directive pairs with (nominated origin for v3 rides) — an
+  /// arbitration eviction must clear the loser's scan-side substitution
+  /// directives atomically with replacing this one.
   op::scan::sirius_gpu_scan_operator* source_scan{nullptr};
-  /// Resolved once at install (pin storage is stable for the query): the
-  /// origin table's layout and the per-column source views the late materializer
-  /// consumes. `columns` is parallel to `positions`.
-  pinned_table_layout layout;
-  std::vector<pinned_column_view> columns;
+  /// Rider origins' scans (v3): their scan-side directives are cleared on
+  /// eviction together with source_scan's.
+  std::vector<op::scan::sirius_gpu_scan_operator*> rider_scans;
 };
 
 }  // namespace sirius::late_mat

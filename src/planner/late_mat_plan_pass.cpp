@@ -36,10 +36,12 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <map>
 #include <memory>
 #include <optional>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -60,6 +62,25 @@ std::unordered_set<std::size_t> expression_references(sirius::ast::node const& r
 
 /// True when @p expr is a bare bound reference (pure positional pass-through).
 bool is_bare_reference(sirius::ast::node const& expr, std::size_t& out_index);
+
+/// v3 raw material collected during a scan's march (paired into the shared
+/// FD graph by the driver): INNER-join bare-reference equality endpoints and
+/// aggregate group-key provenances.
+struct march_side_data {
+  struct endpoint {
+    op::sirius_physical_operator* join{nullptr};
+    std::size_t condition{0};
+    bool left_side{false};
+    std::size_t scan_pos{0};
+  };
+  std::vector<endpoint> endpoints;
+  struct key_prov {
+    op::sirius_physical_operator* aggregate{nullptr};
+    std::size_t input_pos{0};
+    std::size_t scan_pos{0};
+  };
+  std::vector<key_prov> key_provs;
+};
 
 /// One tracked scan column during the upward march.
 struct tracked_column {
@@ -84,7 +105,7 @@ struct tracked_column {
 /// shape consumes everything it still tracks (fail-closed: lifetimes only
 /// shorten, rides only end early).
 std::shared_ptr<const late_mat::planned_deferral> analyze_scan(
-  op::scan::sirius_gpu_scan_operator& scan)
+  op::scan::sirius_gpu_scan_operator& scan, march_side_data& side)
 {
   auto result = std::make_shared<late_mat::planned_deferral>();
   std::vector<tracked_column> live;
@@ -200,6 +221,23 @@ std::shared_ptr<const late_mat::planned_deferral> analyze_scan(
           if (!side) { continue; }
           for (auto const r : expression_references(*side)) { key_refs.insert(r); }
         }
+        // v3 equality endpoints: INNER-join bare-reference equality sides only
+        // (anything else contributes no edge — fail-closed, the affected key
+        // simply rides real).
+        if (late_mat::late_mat_v3_enabled() && join->join_type == duckdb::JoinType::INNER) {
+          for (std::size_t ci = 0; ci < join->conditions.size(); ++ci) {
+            auto const& cond = join->conditions[ci];
+            if (cond.comparison != sirius::comparison_type::equal) { continue; }
+            auto const& side_expr = from_left ? cond.left : cond.right;
+            std::size_t ref       = 0;
+            if (!side_expr || !is_bare_reference(*side_expr, ref)) { continue; }
+            for (auto const& col : live) {
+              if (col.cur_pos == ref && !col.nullified) {
+                side.endpoints.push_back({parent, ci, from_left, col.scan_pos});
+              }
+            }
+          }
+        }
         auto const& own  = from_left ? join->lhs_output_columns.col_idxs
                                      : join->rhs_output_columns.col_idxs;
         std::size_t const base = from_left ? 0 : join->lhs_output_columns.col_idxs.size();
@@ -267,6 +305,9 @@ std::shared_ptr<const late_mat::planned_deferral> analyze_scan(
                                         static_cast<int>(col.cur_pos));
           if (key_it != group_idx->end()) {
             mark_group_key(col, parent);
+            if (late_mat::late_mat_v3_enabled() && !col.nullified) {
+              side.key_provs.push_back({parent, col.cur_pos, col.scan_pos});
+            }
             col.cur_pos =
               static_cast<std::size_t>(std::distance(group_idx->begin(), key_it));
             next.push_back(std::move(col));
@@ -356,8 +397,51 @@ void run_late_mat_plan_pass(op::sirius_physical_operator& root)
   if (!late_mat::late_mat_v2_enabled()) { return; }
   std::vector<op::scan::sirius_gpu_scan_operator*> scans;
   collect_scans(root, scans);
+  std::vector<std::pair<op::scan::sirius_gpu_scan_operator*, march_side_data>> side_data;
+  side_data.reserve(scans.size());
   for (auto* scan : scans) {
-    scan->late_mat_plan = analyze_scan(*scan);
+    march_side_data side;
+    scan->late_mat_plan = analyze_scan(*scan, side);
+    side_data.emplace_back(scan, std::move(side));
+  }
+  // v3: pair equality endpoints into the query-wide FD graph and collect the
+  // aggregate key provenances; the lowering runs the determination closure
+  // against the pinned entries' uniqueness facts.
+  if (late_mat::late_mat_v3_enabled() && !scans.empty()) {
+    auto graph = std::make_shared<late_mat::planned_fd_graph>();
+    struct half {
+      op::scan::sirius_gpu_scan_operator* scan;
+      std::size_t scan_pos;
+    };
+    std::map<std::pair<op::sirius_physical_operator*, std::size_t>, std::pair<std::optional<half>, std::optional<half>>>
+      by_condition;
+    for (auto& [scan, side] : side_data) {
+      for (auto const& ep : side.endpoints) {
+        auto& slot = by_condition[{ep.join, ep.condition}];
+        auto& mine = ep.left_side ? slot.first : slot.second;
+        if (!mine) { mine = half{scan, ep.scan_pos}; }
+      }
+      for (auto const& kp : side.key_provs) {
+        graph->key_provenances.push_back({kp.aggregate, kp.input_pos, scan, kp.scan_pos});
+      }
+    }
+    for (auto const& [key, halves] : by_condition) {
+      if (halves.first && halves.second) {
+        graph->edges.push_back({halves.first->scan,
+                                halves.first->scan_pos,
+                                halves.second->scan,
+                                halves.second->scan_pos,
+                                key.first});
+      }
+    }
+    SIRIUS_LOG_DEBUG("[late_mat v3] fd graph: {} edge(s), {} key provenance(s)",
+                     graph->edges.size(),
+                     graph->key_provenances.size());
+    for (auto* scan : scans) {
+      scan->late_mat_fd_graph = graph;
+    }
+  }
+  for (auto* scan : scans) {
     if (scan->late_mat_plan) {
       // NOTE: operator ids are not assigned yet at plan time — identify by
       // address; the lowering logs the id-bearing install/reject lines later.

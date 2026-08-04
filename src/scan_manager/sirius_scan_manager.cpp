@@ -892,6 +892,18 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
   // shared through the masks' owning pointers), then the requests release
   // theirs. The sequencer only spawns in start_metadata_processing, so
   // serving still starts with finished masks.
+  // Late-mat v3: per-query origin registry, built COMPLETE before any install
+  // so rider origins resolve regardless of assignment order. Parquet-pin
+  // entries only (MVCC-carrying duckdb pins are excluded — rider
+  // materialization by rowid cannot compose with visibility masks).
+  late_mat_defer_context late_mat_ctx;
+  if (late_mat::late_mat_enabled()) {
+    for (auto const& assignment : cached_assignments) {
+      if (assignment.entry->late_mat_handle && assignment.entry->mvcc == nullptr) {
+        late_mat_ctx.by_scan[assignment.op] = {assignment.entry, assignment.columns};
+      }
+    }
+  }
   for (auto& assignment : cached_assignments) {
     mvcc_chunk_mask_set masks;  // stays empty for parquet pins
     std::vector<insert_delta_split> delta_splits;
@@ -948,7 +960,8 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
     // in v1). Bails internally on any shape it cannot prove transparent.
     if (late_mat::late_mat_enabled() && masks.empty() && delta_splits.empty() &&
         _topology_index && _topology_index->gpu_ids().size() == 1) {
-      try_install_late_mat_deferral(assignment.op, *assignment.entry, assignment.columns);
+      try_install_late_mat_deferral(
+        assignment.op, *assignment.entry, assignment.columns, &late_mat_ctx);
     }
     // Columns the scan will only ever test for equality and never project can be
     // decompressed straight to a BOOL8 mask (see decode_predicate_candidates).

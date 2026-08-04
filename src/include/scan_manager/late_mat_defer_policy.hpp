@@ -54,6 +54,8 @@
 #include "scan_manager/sirius_scan_manager.hpp"
 
 #include <span>
+#include <unordered_map>
+#include <vector>
 
 namespace sirius::op::scan {
 class sirius_gpu_scan_operator;
@@ -66,8 +68,20 @@ namespace sirius::scan_manager {
 /// Preconditions the CALLER guarantees (the prepare_for_query handoff):
 /// gate on, entry has a live late-mat handle, no MVCC masks, no insert-delta
 /// splits, single-GPU topology.
+/// Per-query origin registry for the v3 FD closure: every gate-eligible
+/// cached assignment's (entry, selected columns), built by prepare_for_query
+/// BEFORE any install so rider origins resolve regardless of scan order.
+struct late_mat_defer_context {
+  struct origin_info {
+    pinned_entry const* entry{nullptr};
+    std::vector<std::size_t> columns;  ///< materialized order -> entry positions
+  };
+  std::unordered_map<op::scan::sirius_gpu_scan_operator*, origin_info> by_scan;
+};
+
 void try_install_late_mat_deferral(op::scan::sirius_gpu_scan_operator* scan_op,
                                    pinned_entry const& entry,
-                                   std::span<std::size_t const> selected_columns);
+                                   std::span<std::size_t const> selected_columns,
+                                   late_mat_defer_context const* context = nullptr);
 
 }  // namespace sirius::scan_manager

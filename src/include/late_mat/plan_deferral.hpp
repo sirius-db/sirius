@@ -31,6 +31,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string>
 #include <vector>
 
 namespace sirius::op {
@@ -79,6 +80,55 @@ struct planned_column_deferral {
 /// Per-scan analysis result (empty-by-default annotation on the scan op).
 struct planned_deferral {
   std::vector<planned_column_deferral> columns;
+};
+
+/// v3 raw FD material (SIRIUS_EXP_LATE_MAT_V3), stamped as ONE shared graph
+/// on every GPU_SCAN of the query. The pass records only PLAN facts —
+/// INNER-join bare-reference equality edges between scan-column provenances,
+/// and each aggregate's group-key provenances. The determination closure and
+/// nomination run in the LOWERING, which is where the pin-time uniqueness
+/// facts live (the pass runs before cache matching and cannot see entries).
+struct planned_fd_graph {
+  /// (scan_a, pos_a) ≡ (scan_b, pos_b), contributed by INNER join `join`
+  /// (kept for the census chain trace).
+  struct equality_edge {
+    op::sirius_physical_operator* scan_a{nullptr};
+    std::size_t pos_a{0};
+    op::sirius_physical_operator* scan_b{nullptr};
+    std::size_t pos_b{0};
+    op::sirius_physical_operator* join{nullptr};
+  };
+  std::vector<equality_edge> edges;
+  /// One aggregate group key whose input is a pure pass-through of
+  /// (scan, scan_pos).
+  struct key_provenance {
+    op::sirius_physical_operator* aggregate{nullptr};
+    std::size_t input_pos{0};
+    op::sirius_physical_operator* scan{nullptr};
+    std::size_t scan_pos{0};
+  };
+  std::vector<key_provenance> key_provenances;
+};
+
+/// v3 resolved FD proof — BUILT BY THE LOWERING (closure + nomination over
+/// the graph above plus the pinned entries' uniqueness facts); the census
+/// prints `chain_trace` verbatim so adversarial review can audit every link.
+struct planned_group_by_fd {
+  /// Aggregates the substituted keys ride through, in ride order.
+  std::vector<op::sirius_physical_operator*> aggregate_chain;
+  /// The nominated origin's pin-unique key (scan output position) — stays a
+  /// REAL group key; this is the closure's (⇒) direction.
+  std::size_t nominated_unique_key_position{0};
+  struct origin_bundle {
+    op::sirius_physical_operator* origin_scan{nullptr};
+    /// Dropped group-key columns, as that scan's output positions (ascending;
+    /// the first carries this origin's rowid/rider column).
+    std::vector<std::size_t> dropped_scan_positions;
+    bool is_nominated{false};  ///< false = rider origin
+  };
+  std::vector<origin_bundle> bundles;
+  /// Human-readable derivation-order proof chain for the census.
+  std::string chain_trace;
 };
 
 }  // namespace sirius::late_mat
