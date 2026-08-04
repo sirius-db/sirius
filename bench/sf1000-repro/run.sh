@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Reproduce the TPC-H SF1000 result: 6.918 s suite, 22/22 byte-identical.
+# Reproduce the TPC-H SF1000 result: 6.654 s suite, 22/22 byte-identical.
 # Run from the repo root:  pixi run bash bench/sf1000-repro/run.sh
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -38,6 +38,14 @@ SET expression_evaluator_strategy = 'ast_jit'"
 #   SIRIUS_EXP_FUSED_SCAN_MAX_MEMBER=1        dynamic membership sources kept per scan
 #   SIRIUS_EXP_FUSED_SCAN_DIAG=1              deterministic decision tracing (debug)
 export SIRIUS_EXP_FUSED_SCAN_FILTER=1
+
+# Late materialization v1-v3 (ship config, banked 2026-08-04: suite 6.654 s):
+# v1 stop-port deferral + v2 planner pass/group-by-rowid + v3 FD riders. Gate off =>
+# byte-identical classic. Knobs documented in NEXT-STEPS.md Sessions 4/4b/4c.
+export SIRIUS_EXP_LATE_MAT=1
+export SIRIUS_EXP_LATE_MAT_V2=1
+export SIRIUS_EXP_LATE_MAT_V3=1
+export SIRIUS_LATE_MAT_PIN_UNIQUE_COLS=all
 
 # All eight tables pinned GPU-tier compressed. partsupp included: no TPC-H query ever
 # materialises ps_comment, so the union across q2/q9/q11/q16/q20 is 4 narrow columns (~20-25 GB).

@@ -863,3 +863,14 @@ GPU time was spent on it; byte-identity was load-bearing twice (the DECIMAL64
 retag ×100 and the GBR bijectivity proof); and the one attribution that mattered
 (−65 ms) came entirely from logs + plan dumps — the pre-authorized nsys was never
 spent.
+
+**Session 4c addendum — v3 LIT AND BANKED as the ship config.** The unbanked −13 ms q10
+observation was re-tested under its own pre-registered arm on the final build-21 binary
+(bank bar: pooled q10 ≥ 8 ms, both pairs negative, suite non-regressing, 22/22 ×4):
+q10 0.2653→0.2513 / 0.2654→0.2517 (**−14.0/−13.7 ms**), suites 6.677→**6.658** /
+6.681→**6.654**, all byte-identical, census matching the validated v3 pattern.
+Ship config is now `SIRIUS_EXP_LATE_MAT=1 + _V2=1 + _V3=1 + PIN_UNIQUE_COLS=all`.
+**All-time best 6.654 s; campaign 15.99 → 6.654 = −58.4%.** Attribution note: the win is
+the FD rider extending q10's customer bundle (nine boundaries vs six, keys materializing
+at output groups under the FD proof) — the machinery analysis said had no *new* target
+still improved its own flagship query.
