@@ -12,9 +12,9 @@ src/**/planner/                     @sirius-db/sirius-planner-codeowners
 src/**/pipeline/                    @sirius-db/sirius-planner-codeowners
 
 # ── Executors ─────────────────────────────────────────────────────────────────
+src/creator/                        @sirius-db/sirius-executors-codeowners
 src/**/exec/                        @sirius-db/sirius-executors-codeowners
 src/**/parallel/                    @sirius-db/sirius-executors-codeowners
-src/creator/                        @sirius-db/sirius-executors-codeowners
 
 # ── Operators & Expressions ───────────────────────────────────────────────────
 src/include/common/                 @sirius-db/sirius-operators-codeowners
