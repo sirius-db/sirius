@@ -16,9 +16,9 @@
 
 #pragma once
 
-#include <cucascade/io/io_context.hpp>
 #include <cudf/types.hpp>
 
+#include <cucascade/io/io_context.hpp>
 #include <duckdb/common/types.hpp>
 #include <duckdb/common/vector.hpp>
 #include <duckdb/storage/statistics/base_statistics.hpp>

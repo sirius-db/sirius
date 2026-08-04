@@ -397,7 +397,8 @@ struct host_mem_config {
     } else {
       builder.set_reservation_limit_per_numa_region(std::get<std::uint64_t>(reservation_limit));
     }
-    builder.set_downgrade_fractions_per_numa_region(downgrade_trigger_fraction, downgrade_stop_fraction);
+    builder.set_downgrade_fractions_per_numa_region(downgrade_trigger_fraction,
+                                                    downgrade_stop_fraction);
     builder.set_per_numa_region_capacity(numa_region_capacity_bytes);
     // NOTE on argument order: cucascade's set_host_pool_features has confusingly-named
     // parameters (chunk_size, block_size, initial_block_count) that it internally remaps onto
