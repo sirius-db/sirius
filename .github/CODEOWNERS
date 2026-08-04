@@ -14,7 +14,6 @@ src/**/pipeline/                    @sirius-db/sirius-planner-codeowners
 # ── Executors ─────────────────────────────────────────────────────────────────
 src/**/exec/                        @sirius-db/sirius-executors-codeowners
 src/**/parallel/                    @sirius-db/sirius-executors-codeowners
-src/compression/                    @sirius-db/sirius-executors-codeowners
 src/creator/                        @sirius-db/sirius-executors-codeowners
 
 # ── Operators & Expressions ───────────────────────────────────────────────────
@@ -32,6 +31,7 @@ src/**/scan*/                       @sirius-db/sirius-scan-io-codeowners
 src/**/io/                          @sirius-db/sirius-scan-io-codeowners
 
 # ── Memory & Compression ──────────────────────────────────────────────────────
+src/compression/                    @sirius-db/sirius-memory-compression-codeowners
 src/**/memory/                      @sirius-db/sirius-memory-compression-codeowners
 src/**/downgrade/                   @sirius-db/sirius-memory-compression-codeowners
 
