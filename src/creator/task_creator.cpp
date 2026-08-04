@@ -36,6 +36,7 @@
 #include <limits>
 #include <mutex>
 #include <optional>
+#include <stdexcept>
 #include <unordered_map>
 #include <utility>
 
@@ -336,6 +337,31 @@ void task_creator::schedule_lookahead(std::optional<int> device_id_hint)
       return;
     }
   }
+}
+
+void task_creator::set_on_task_queue_depleted(task_queue_depleted_hook hook)
+{
+  // Sink parameter: taken by value and moved into the slot, so an rvalue callback costs one
+  // move rather than a copy. _hook_mutex is a leaf lock and nothing is called out to under it.
+  std::lock_guard<std::mutex> lock(_hook_mutex);
+  _on_task_queue_depleted = std::move(hook);
+}
+
+void task_creator::set_on_task_not_created(task_not_created_hook hook)
+{
+  std::lock_guard<std::mutex> lock(_hook_mutex);
+  _on_task_not_created = std::move(hook);
+}
+
+void task_creator::fire_task_queue_depleted() noexcept
+{
+  throw std::logic_error("task_creator::fire_task_queue_depleted: not implemented");
+}
+
+void task_creator::fire_task_not_created(const op::sirius_physical_operator* requested,
+                                         request_type kind) noexcept
+{
+  throw std::logic_error("task_creator::fire_task_not_created: not implemented");
 }
 
 void task_creator::manager_loop()

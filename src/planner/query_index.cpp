@@ -18,6 +18,7 @@
 
 #include "planner/query.hpp"
 
+#include <stdexcept>
 #include <string_view>
 #include <unordered_set>
 
@@ -188,6 +189,16 @@ query_index::branch query_index::get_consumer_pipelines_till_next_branch(
   auto it = _head_op_to_branch.find(op->get_operator_id());
   if (it == _head_op_to_branch.end()) { return {}; }
   return _branch_views[it->second];
+}
+
+std::vector<prefetch_step> query_index::prefetching_order() const
+{
+  throw std::logic_error("query_index::prefetching_order: not implemented");
+}
+
+order_type query_index::get_branch_order_type(std::size_t branch_index) const
+{
+  throw std::logic_error("query_index::get_branch_order_type: not implemented");
 }
 
 }  // namespace sirius::planner

@@ -193,10 +193,10 @@ void sirius_datasource::fadvise(std::span<const cudf::io::text::byte_range_info>
   auto* cache = _io_ctx->cache();
   if (cache == nullptr || !_io_ctx->can_use_prefetching_cache()) { return; }
 
-  // The contract is "one scan, one datasource": a second
-  // speculative/immediate fadvise on a datasource that already carries a
-  // handle is a caller bug.  Warn loudly; cancel the stale handle so the
-  // worker drops the old request and we don't leak both into the cache.
+  // The contract is "one scan, one datasource": a second fadvise on a
+  // datasource that already carries a handle is a caller bug.  Warn loudly;
+  // cancel the stale handle so the worker drops the old request and we don't
+  // leak both into the cache.
   if (_prefetch_handle) {
     if (_prefetch_handle.is_active()) {
       SIRIUS_LOG_WARN(
@@ -218,7 +218,7 @@ void sirius_datasource::fadvise(std::span<const cudf::io::text::byte_range_info>
 
 void sirius_datasource::prefetch(cache::prefetching_stage site)
 {
-  auto const preferred = _io_ctx->preferred_prefetching_stage();
+  auto const preferred = _io_ctx->prefetching_activation_stage();
   if (preferred == cache::prefetching_stage::none) { return; }
   if (_prefetch_handle) {
     if (site == cache::prefetching_stage::disposable) {
@@ -232,6 +232,11 @@ void sirius_datasource::prefetch(cache::prefetching_stage site)
 bool sirius_datasource::uses_prefetching_cache() const noexcept
 {
   return _io_ctx->uses_prefetching_cache();
+}
+
+cache::prefetch_progress sirius_datasource::prefetch_state() const noexcept
+{
+  throw std::logic_error("sirius_datasource::prefetch_state: not implemented");
 }
 
 }  // namespace sirius::io

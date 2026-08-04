@@ -156,4 +156,9 @@ bool buffer_pool::should_start_evicting() const noexcept
   return max_system_wide_usage() > max_allowed_budget_for_prefetching();
 }
 
+prefetch_progress combine_prefetch_progress(std::span<const prefetch_progress> parts) noexcept
+{
+  throw std::logic_error("combine_prefetch_progress: not implemented");
+}
+
 }  // namespace sirius::io::cache

@@ -18,6 +18,8 @@
 
 #include <io/sirius_datasource.hpp>
 
+#include <cstddef>
+#include <functional>
 #include <memory>
 #include <span>
 #include <utility>
@@ -84,6 +86,32 @@ class scan_info : public std::enable_shared_from_this<scan_info> {
   virtual ~scan_info() = default;
 
   virtual std::vector<fadvise_entry> fadvise_entries() const { return {}; }
+
+  /**
+   * @brief Visit each datasource this split reads through, without computing byte ranges.
+   *
+   * The cheap counterpart to @ref fadvise_entries, which rebuilds the split's byte ranges on
+   * every call (a parquet footer walk per row-group slice). Use this whenever only the
+   * datasources are wanted — prefetch hints, prefetch-state queries, datasource counting.
+   *
+   * Null datasources are skipped, so @p visit always receives a live object. Visit order is
+   * unspecified; callers must not depend on it.
+   *
+   * The default implementation visits nothing, matching @ref fadvise_entries' default.
+   */
+  virtual void for_each_datasource(
+    const std::function<void(sirius::io::sirius_datasource&)>& visit) const
+  {
+  }
+
+  /**
+   * @brief Number of non-null datasources @ref for_each_datasource would visit. Default 0.
+   *
+   * Cheap: never computes byte ranges. Note this counts *datasources*, not files that will
+   * actually be prefetched — a datasource whose ioctx has no prefetching cache is counted
+   * here but produces no @ref fadvise_entries entry.
+   */
+  [[nodiscard]] virtual std::size_t datasource_count() const noexcept { return 0; }
 
   /**
    * @brief Estimated decoded bytes for projected data columns before row filtering.

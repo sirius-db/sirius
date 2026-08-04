@@ -27,7 +27,7 @@ The single GPU scan source operator. It owns:
 - a `std::shared_ptr<gpu_ingestible>` — the installed per-format source, built by the pipeline converter and parked on the operator;
 - a `std::shared_ptr<split_connector>` — the blocking queue the scan manager pushes splits into.
 
-**Source interface.** As a pipeline source the operator exposes `get_next_task_hint()` / `all_ports_empty()` (both keyed off `split_connector::is_closed()`) and `get_next_task_input_data()`, which blocks inside `split_connector::get_next_split()` until a split arrives or the connector is closed and drained. Each pulled split is a `scan_operator_input`; on dequeue the operator issues an immediate prefetch hint for the split's byte ranges.
+**Source interface.** As a pipeline source the operator exposes `get_next_task_hint()` / `all_ports_empty()` (both keyed off `split_connector::is_closed()`) and `get_next_task_input_data()`, which blocks inside `split_connector::get_next_split()` until a split arrives or the connector is closed and drained. Each pulled split is a `scan_operator_input`; on dequeue the operator issues a `task_queued` prefetch hint for the split's byte ranges.
 
 **Execution.** `execute(input_data, stream)` runs one split:
 
@@ -159,7 +159,7 @@ For nested types (`STRUCT`, `LIST`), one DuckDB column maps to multiple parquet 
 2. **Per-query preparation.** `prepare_for_query(query)` resets prior state, builds a `round_robin_strategy` over the topology's GPU ids and a fresh `load_balancing_scan_batch_coalescer`, then walks the query's `GPU_SCAN` operators in order. For each it `register_pipeline`s a sequencer slot (which builds the ingestible's `batch_coalescer` and captures the operator's connector). Then either:
    - **Cache hit** — `try_assign_cached_entries` finds a pinned entry whose identity and columns can serve the scan; it attaches a `databatch_provider` to the slot and skips disk reading entirely; or
    - **Cache miss** — a `split_provider` is built over the operator's ingestible and stored in `_providers_by_op`.
-3. **Execution.** `start_metadata_processing` spawns the single sequencer worker on the dispatcher, then calls `split_provider::run` for each non-cached operator. `run` iterates `has_more_splits` / `next_split_provider` and hands each claimed metadata task to the dispatcher; each task enqueues its `scan_info` onto the operator's sequencer slot queue. The sequencer worker walks slots in registration order, coalescing each slot's metadata into data-batch splits, balancing each onto a GPU, firing `fadvise`/`opportunistic` prefetch, and pushing a `scan_operator_input` onto the operator's connector. Consumers (the scan operators) block in `split_connector::get_next_split` until splits arrive.
+3. **Execution.** `start_metadata_processing` spawns the single sequencer worker on the dispatcher, then calls `split_provider::run` for each non-cached operator. `run` iterates `has_more_splits` / `next_split_provider` and hands each claimed metadata task to the dispatcher; each task enqueues its `scan_info` onto the operator's sequencer slot queue. The sequencer worker walks slots in registration order, coalescing each slot's metadata into data-batch splits, balancing each onto a GPU, firing `fadvise`/`metadata_created` prefetch, and pushing a `scan_operator_input` onto the operator's connector. Consumers (the scan operators) block in `split_connector::get_next_split` until splits arrive.
 4. **Teardown.** The sequencer closes each connector when its slot is drained (forwarding any worker-captured exception, first-writer-wins). Once closed and drained, the operator's `all_ports_empty()` returns true and `get_next_task_hint()` returns `nullopt`. `reset()` requests the dispatcher stop and rebuilds it for the next query.
 
 ### split_provider
@@ -168,7 +168,7 @@ For nested types (`STRUCT`, `LIST`), one DuckDB column maps to multiple parquet 
 
 ### load_balancing_scan_batch_coalescer
 
-This is the per-query sequencer. Each `GPU_SCAN` operator gets a `metadata_processing_state` slot holding a blocking queue (fed by the provider's metadata tasks), the ingestible's `batch_coalescer`, the shared `balancing_strategy`, and the operator's `split_connector`. A single worker walks the slots in registration order. For a live scan it dequeues per-unit `scan_info`s, pushes them through the coalescer, and for each coalesced batch: picks a GPU via the balancer (stamping `preferred_device_id`), fires `fadvise` and an `opportunistic` prefetch for the batch's byte ranges, and pushes a `scan_operator_input` onto the connector. For a cached pipeline it replays the attached `databatch_provider`, pushing one resident `scan_operator_input` per cached chunk. Serialising the opportunistic prefetch tier across pipelines in execution order gives the prefetching cache its longest lead time for the head-of-line pipeline.
+This is the per-query sequencer. Each `GPU_SCAN` operator gets a `metadata_processing_state` slot holding a blocking queue (fed by the provider's metadata tasks), the ingestible's `batch_coalescer`, the shared `balancing_strategy`, and the operator's `split_connector`. A single worker walks the slots in registration order. For a live scan it dequeues per-unit `scan_info`s, pushes them through the coalescer, and for each coalesced batch: picks a GPU via the balancer (stamping `preferred_device_id`), fires `fadvise` and a `metadata_created` prefetch for the batch's byte ranges, and pushes a `scan_operator_input` onto the connector. For a cached pipeline it replays the attached `databatch_provider`, pushing one resident `scan_operator_input` per cached chunk. Serialising the `metadata_created` prefetch tier across pipelines in execution order gives the prefetching cache its longest lead time for the head-of-line pipeline.
 
 ### Device balancing
 
@@ -374,7 +374,7 @@ Only statically-known DuckDB `TableFilter`s participate in this DuckDB-native me
 A scan opens a file with `sirius_ioctx::open_datasource(path)`, which asks the backend to create a `sirius_io_object` (open local fds, or HEAD an object store for its size) and wraps it in a `sirius_datasource` bound to the ioctx. Each cuDF read on the datasource forwards to the ioctx:
 
 - When the ioctx has an armed cache (`uses_prefetching_cache()`), `host_read`/`device_read` consult the cache first; a hit copies from pinned host chunks (host reads via `memcpy`, device reads via `cudaMemcpyAsync` from pinned memory). A miss falls through to the backend `*_io` virtuals, which the `templated_ioctx` services through the reactor pool.
-- A backend without batched host reads (e.g. kvikio) reports `preferred_prefetching_stage::none` and is never given a cache.
+- A backend without batched host reads (e.g. kvikio) reports `prefetching_activation_stage() == none` and is never given a cache.
 
 The ioctx is built parked: the reactor pool is constructed cheaply at `make_ioctx` time, and `start()` launches the worker threads and allocates per-reactor staging only once the read API is first exercised.
 
@@ -382,7 +382,7 @@ The ioctx is built parked: the reactor pool is constructed cheaply at `make_ioct
 
 A backend is a *reactor* + *io_object* pair plugged into `templated_ioctx<Reactor>`. The contract is expressed as C++20 concepts and structural traits rather than hand-maintained capability flags.
 
-- `io_reactor_c<R>` (the baseline contract) requires associated types (`io_object_type`, `request_type`, `request_type_ptr`, `reactor_config_type`), buffered host reads (`prep_host_rx_request` + synchronous `host_read`), dispatch (`enqueue`), lifecycle (`shutdown`/`interrupt`), `create_io_object`, and the static capability queries `supports(path)` and `preferred_prefetching_stage()`.
+- `io_reactor_c<R>` (the baseline contract) requires associated types (`io_object_type`, `request_type`, `request_type_ptr`, `reactor_config_type`), buffered host reads (`prep_host_rx_request` + synchronous `host_read`), dispatch (`enqueue`), lifecycle (`shutdown`/`interrupt`), `create_io_object`, and the static capability queries `supports(path)` and `prefetching_activation_stage()`.
 - `reactor_traits<R>` detects the *optional* dispatch paths structurally: a reactor supports device reads, bounce-staged host-to-device reads, or vectored host reads iff it defines the matching `prep_device_rx_request` / `prep_host_to_device_rx_request` / `prep_host_rxv_request` overload. `templated_ioctx` answers `supports_device_read()` / `supports_host_to_device_read()` / `supports_vector_host_read()` from these traits, so a reactor advertises a capability simply by implementing the corresponding prep method.
 
 Dispatch is uniform across backends: `templated_ioctx` builds one request via the reactor's `prep_*`, retrieves its `semi_future`, then `splits` the per-chunk requests across the reactor pool (round-robin) and `enqueue`s each split. The shared request-lifecycle primitives in `io/io_request.hpp` (`request_manager`, `device_cpy_request`, `rx_request_t<Chunk>`) fan one logical read out into N per-chunk reads and fulfill a single future when the last chunk completes (with the first reported error, if any). Each backend instantiates `rx_request_t` for its own chunk type (`uring::chunked_rx_request`, `rest::rest_chunked_rx_request`).
@@ -391,9 +391,9 @@ Three backends ship:
 
 | Backend | ioctx | Reactor | Scheme | Notes |
 |---------|-------|---------|--------|-------|
-| io_uring | `uring::uring_ioctx = templated_ioctx<uring_reactor>` | `uring/uring_reactor.hpp` | local files | One `io_uring` + worker thread per reactor. `O_DIRECT` device reads through pinned bounce slots; buffered host reads on the same ring. `preferred_prefetching_stage = none`. |
-| REST / object store | `rest::rest_ioctx = templated_ioctx<rest_reactor>` | `rest/rest_reactor.hpp` | `s3://` | libcurl-multi over an epoll loop; see [S3 / Object-Store Backend](#s3--object-store-backend). `preferred_prefetching_stage = just_in_time`. |
-| kvikio fallback | `kvikio_context` | (none) | any | Wraps cudf's default datasource (GDS-capable). Overrides the public read API directly so cudf's `std::future` flows through unchanged; the protected `_io` primitives are unreachable placeholders. No reactors, no cache, `preferred_prefetching_stage = none`. |
+| io_uring | `uring::uring_ioctx = templated_ioctx<uring_reactor>` | `uring/uring_reactor.hpp` | local files | One `io_uring` + worker thread per reactor. `O_DIRECT` device reads through pinned bounce slots; buffered host reads on the same ring. `prefetching_activation_stage = none`. |
+| REST / object store | `rest::rest_ioctx = templated_ioctx<rest_reactor>` | `rest/rest_reactor.hpp` | `s3://` | libcurl-multi over an epoll loop; see [S3 / Object-Store Backend](#s3--object-store-backend). `prefetching_activation_stage = task_preprocessing`. |
+| kvikio fallback | `kvikio_context` | (none) | any | Wraps cudf's default datasource (GDS-capable). Overrides the public read API directly so cudf's `std::future` flows through unchanged; the protected `_io` primitives are unreachable placeholders. No reactors, no cache, `prefetching_activation_stage = none`. |
 
 The scan manager builds one ioctx for the run: `uring_ioctx` when `use_sirius_datasource` is set, otherwise the `kvikio_context` fallback (the registry can also resolve an `s3://` URL to the REST backend via `lookup`). A new backend is a reactor + io_object that satisfy the concepts, a `templated_ioctx` specialization, and a registry entry.
 
@@ -445,7 +445,7 @@ The cache does two things beyond classic prefetch:
 
 Separately from the prefetching cache, the ioctx always exposes a `metadata_store` so parsed file metadata (e.g. a parquet footer) survives across scans of the same path regardless of whether prefetching is wired up.
 
-**fadvise protocol.** `sirius_datasource::fadvise(ranges, dev_id)` is the single entry point for inserting prefetch work: a `speculative`/`immediate` call (honored only when it matches the ioctx's `preferred_prefetching_stage`) hands the ranges to the cache and stashes the returned `prefetching_handle`; a `disposable` call at consume time cancels any still-pending work via that handle.
+**fadvise protocol.** `sirius_datasource::fadvise(ranges, dev_id)` is the single entry point for inserting prefetch work: it hands the ranges to the cache and stashes the returned `prefetching_handle`. `sirius_datasource::prefetch(site)` then drives that handle along the ladder: the rung matching the ioctx's `prefetching_activation_stage()` activates the request, and a `disposable` call at consume time cancels any still-pending work.
 
 ### Cache Internals
 

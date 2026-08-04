@@ -111,7 +111,7 @@ concept io_reactor_c = requires(R r,
 
   // -- capabilities --------------------------------------------------------
   { R::supports(path) } -> std::same_as<bool>;
-  { R::preferred_prefetching_stage() } -> std::same_as<cache::prefetching_stage>;
+  { R::prefetching_activation_stage() } -> std::same_as<cache::prefetching_stage>;
 };
 
 // ---------------------------------------------------------------------------
@@ -281,9 +281,9 @@ class templated_ioctx : public sirius_ioctx {
     return reactor_traits_t::supports_vector_host_read;
   }
 
-  [[nodiscard]] cache::prefetching_stage preferred_prefetching_stage() const noexcept override
+  [[nodiscard]] cache::prefetching_stage prefetching_activation_stage() const noexcept override
   {
-    return Reactor::preferred_prefetching_stage();
+    return Reactor::prefetching_activation_stage();
   }
 
   [[nodiscard]] std::vector<cudf::io::text::byte_range_info> align_and_coalesce(

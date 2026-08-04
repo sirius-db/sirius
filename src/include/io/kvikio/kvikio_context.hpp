@@ -83,7 +83,7 @@ class kvikio_io_object final : public sirius_io_object {
  *   - @c supports_device_read: true (cudf's datasource supports it where the
  *     platform allows, e.g. GDS).
  *   - @c supports_vector_host_read: false — no batched dispatch path.
- *   - @c preferred_prefetching_stage: @c none.
+ *   - @c prefetching_activation_stage: @c none.
  */
 class kvikio_context final : public sirius_ioctx {
  public:
@@ -104,7 +104,7 @@ class kvikio_context final : public sirius_ioctx {
   [[nodiscard]] bool supports_device_read() const noexcept override { return true; }
   [[nodiscard]] bool supports_vector_host_read() const noexcept override { return false; }
   [[nodiscard]] bool supports_host_to_device_read() const noexcept override { return false; }
-  [[nodiscard]] cache::prefetching_stage preferred_prefetching_stage() const noexcept override
+  [[nodiscard]] cache::prefetching_stage prefetching_activation_stage() const noexcept override
   {
     return cache::prefetching_stage::none;
   }

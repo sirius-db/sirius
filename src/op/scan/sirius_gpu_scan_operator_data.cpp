@@ -20,15 +20,56 @@
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
 
 #include <algorithm>
+#include <stdexcept>
 
 namespace sirius::op::scan {
+
+bool batch_needs_gpu_upload(const ::cucascade::read_only_data_batch& ro) noexcept
+{
+  throw std::logic_error("batch_needs_gpu_upload: not implemented");
+}
+
+// Out-of-line so scan_manager::prefetching_state_manager only has to be
+// forward-declared in the header. Defaulted until the disposal counter lands.
+scan_operator_input::~scan_operator_input() = default;
+
+void scan_operator_input::for_each_datasource(
+  const std::function<void(io::sirius_datasource&)>& visit) const
+{
+  throw std::logic_error("scan_operator_input::for_each_datasource: not implemented");
+}
+
+std::size_t scan_operator_input::datasource_count() const noexcept
+{
+  throw std::logic_error("scan_operator_input::datasource_count: not implemented");
+}
+
+io::cache::prefetch_progress scan_operator_input::prefetch_state() const noexcept
+{
+  throw std::logic_error("scan_operator_input::prefetch_state: not implemented");
+}
+
+bool scan_operator_input::is_io_prefetchable() const noexcept
+{
+  throw std::logic_error("scan_operator_input::is_io_prefetchable: not implemented");
+}
+
+std::optional<bool> scan_operator_input::is_memory_prefetchable() const noexcept
+{
+  throw std::logic_error("scan_operator_input::is_memory_prefetchable: not implemented");
+}
+
+std::optional<bool> scan_operator_input::is_prefetched() const noexcept
+{
+  throw std::logic_error("scan_operator_input::is_prefetched: not implemented");
+}
 
 void scan_operator_input::prepare_for_processing(
   const ::cucascade::memory::memory_space* requested_memory_space, rmm::cuda_stream_view stream)
 {
   gpu_memory_space = const_cast<::cucascade::memory::memory_space*>(requested_memory_space);
   if (!std::holds_alternative<std::shared_ptr<cucascade::data_batch>>(materialization_info)) {
-    prefetch(io::cache::prefetching_stage::just_in_time);
+    prefetch(io::cache::prefetching_stage::task_preprocessing);
     return;
   }
   auto batch = std::get<std::shared_ptr<cucascade::data_batch>>(materialization_info);

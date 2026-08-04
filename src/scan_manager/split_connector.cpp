@@ -19,6 +19,7 @@
 #include "op/sirius_physical_operator.hpp"
 
 #include <cassert>
+#include <stdexcept>
 #include <utility>
 
 namespace sirius::scan_manager {
@@ -74,6 +75,43 @@ bool split_connector::is_closed() const
 {
   std::lock_guard<std::mutex> lock(_mutex);
   return !_splits.empty();
+}
+
+std::size_t split_connector::prefetch_if(std::size_t upto_n,
+                                         prefetch_kind kind,
+                                         const std::function<bool(const op::operator_data&)>& pred)
+{
+  throw std::logic_error("split_connector::prefetch_if: not implemented");
+}
+
+std::size_t split_connector::n_prefetchable(prefetch_kind kind) const
+{
+  throw std::logic_error("split_connector::n_prefetchable: not implemented");
+}
+
+// IMPLEMENTATION NOTE: rule 3 (fall back to index 0) is a liveness requirement, not a tie-break.
+// A split leaving prefetch_progress::loading notifies io::cache::entry_state's atomic, never this
+// connector's condition variable, so refusing to hand out a loading split is a permanent hang.
+//
+// Rule 3 is also what keeps test/cpp/scan_manager/test_cached_serving_hardening.cpp:376-410
+// passing unmodified: resident splits carry no prefetch handle, so every state reads `empty`,
+// selection falls through to index 0, and the cached-serving dequeue stays exactly FIFO. Any
+// change to this policy must be checked against that positional test.
+std::size_t split_connector::select_split_index(
+  std::span<const io::cache::prefetch_progress> states) noexcept
+{
+  throw std::logic_error("split_connector::select_split_index: not implemented");
+}
+
+std::size_t split_connector::fill_progress_window(
+  std::array<io::cache::prefetch_progress, kSelectionWindow>& out) const noexcept
+{
+  throw std::logic_error("split_connector::fill_progress_window: not implemented");
+}
+
+void split_connector::drop_at(std::size_t index) noexcept
+{
+  throw std::logic_error("split_connector::drop_at: not implemented");
 }
 
 }  // namespace sirius::scan_manager

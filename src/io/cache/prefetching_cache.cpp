@@ -728,8 +728,7 @@ void prefetching_cache::prepare_loop(const std::stop_token& st)
     std::ignore = req->state->mark_allocated();
 
     if (!_io_ctx->supports_vector_host_read() ||
-        _io_ctx->preferred_prefetching_stage() == prefetching_stage::just_in_time ||
-        _io_ctx->preferred_prefetching_stage() == prefetching_stage::none) {
+        !backgrounds_prefetch(_io_ctx->prefetching_activation_stage())) {
       // either the backend doesn't support scatter-gather reads or it prefers not to reuse
       // buffers for multiple reads.  In either case, we can skip the prefetching step and let the
       // read() path handle the IO directly into the caller's buffer.

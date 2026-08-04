@@ -36,6 +36,8 @@
 
 namespace sirius::scan_manager {
 
+class prefetching_state_manager;
+
 struct databatch_provider {
   /// One cached chunk or one insert-delta split, plus its (optional)
   /// per-query MVCC keep-mask. A batch carries either @ref data (resident
@@ -60,16 +62,16 @@ struct databatch_provider {
 };
 
 /**
- * @brief Pipeline-ordered sequencer for @c fadvise(opportunistic) calls.
+ * @brief Pipeline-ordered sequencer for @c fadvise calls.
  *
  * Each pipeline registers a per-pipeline slot (a @c metadata_processing_state)
  * holding a blocking queue its split provider feeds and the coalescer,
  * balancer and connector used to place and forward the resulting splits.  A
  * single sequencer task drains the slots in the order they were registered,
  * coalescing each pipeline's splits, choosing a device, issuing the
- * @c fadvise(opportunistic) / prefetch hints and pushing onto the connector,
- * advancing to the next slot only after the current one signals closure.  This
- * serialises the opportunistic fadvise tier across pipelines so the prefetching
+ * @c fadvise / @c prefetch(metadata_created) hints and pushing onto the
+ * connector, advancing to the next slot only after the current one signals
+ * closure.  This serialises the fadvise tier across pipelines so the prefetching
  * cache receives ranges in execution order rather than in
  * metadata-scan-completion order — giving the cache its longest possible lead
  * time for the head-of-line pipeline before later pipelines start competing for
@@ -77,7 +79,7 @@ struct databatch_provider {
  *
  * Usage:
  *   - scan_manager calls @c register_pipeline(scan_op, balancer) once per
- *     pipeline that needs opportunistic prefetching; the returned slot pointer
+ *     pipeline that needs prefetching; the returned slot pointer
  *     drives that pipeline's splits.  Its split provider is wired up via
  *     @c get_split_provider_bridge (live metadata scan) or
  *     @c use_cached_entries_for_pipeline (cached-batch replay).
@@ -92,16 +94,23 @@ class load_balancing_scan_batch_coalescer {
   /// consumes.  Holds its own semaphore so the sequencer can block on
   /// an empty slot without spinning.
   struct metadata_processing_state {
-    explicit metadata_processing_state(std::size_t op_id,
-                                       std::size_t pipeline_id,
-                                       std::shared_ptr<op::scan::batch_coalescer> coalescer,
-                                       std::shared_ptr<split_connector> connector,
-                                       std::shared_ptr<balancing_strategy> balancer)
+    /// @param prefetch_state Per-query prefetch-ladder bookkeeping, stamped onto every
+    ///        @c op::scan::scan_operator_input this slot produces. Optional: @c nullptr means
+    ///        the splits carry no counters and report nothing. Defaulted so every existing
+    ///        construction site stays source-compatible.
+    explicit metadata_processing_state(
+      std::size_t op_id,
+      std::size_t pipeline_id,
+      std::shared_ptr<op::scan::batch_coalescer> coalescer,
+      std::shared_ptr<split_connector> connector,
+      std::shared_ptr<balancing_strategy> balancer,
+      std::shared_ptr<prefetching_state_manager> prefetch_state = nullptr)
       : op_id(op_id),
         pipeline_id(pipeline_id),
         coalescer(std::move(coalescer)),
         balancer(std::move(balancer)),
-        connector(std::move(connector))
+        connector(std::move(connector)),
+        prefetch_state(std::move(prefetch_state))
     {
       assert(this->coalescer);
       assert(this->connector);
@@ -120,6 +129,9 @@ class load_balancing_scan_batch_coalescer {
     std::shared_ptr<op::scan::batch_coalescer> coalescer;
     std::shared_ptr<balancing_strategy> balancer;
     std::shared_ptr<split_connector> connector;
+    /// Per-query prefetch-ladder bookkeeping shared with every split this slot produces.
+    /// May be null (no counters wired), in which case the splits simply report nothing.
+    std::shared_ptr<prefetching_state_manager> prefetch_state;
     std::unique_ptr<databatch_provider> batch_provider;
     /// Whether the op's ingestible applies a row-filter expression to cached
     /// batches; stamped onto each drained split so its working-set estimate
@@ -136,8 +148,14 @@ class load_balancing_scan_batch_coalescer {
   /// sequencer task in the order they were added — typically scan_manager
   /// adds them in pipeline-id order so the head-of-line pipeline drains
   /// first.  The returned pointer is valid for the manager's lifetime.
-  metadata_processing_state* register_pipeline(op::scan::sirius_gpu_scan_operator* scan_op,
-                                               std::shared_ptr<balancing_strategy> balancer);
+  ///
+  /// @param prefetch_state Per-query prefetch-ladder bookkeeping, forwarded to the slot and
+  ///        from there onto every split it produces.  Optional and defaulted, so existing
+  ///        two-argument call sites keep compiling unchanged.
+  metadata_processing_state* register_pipeline(
+    op::scan::sirius_gpu_scan_operator* scan_op,
+    std::shared_ptr<balancing_strategy> balancer,
+    std::shared_ptr<prefetching_state_manager> prefetch_state = nullptr);
 
   void use_cached_entries_for_pipeline(op::scan::sirius_gpu_scan_operator* scan_op,
                                        std::unique_ptr<databatch_provider> provider);

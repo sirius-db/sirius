@@ -20,6 +20,7 @@
 #include "pipeline/sirius_pipeline.hpp"
 
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <span>
 #include <unordered_map>
@@ -49,6 +50,40 @@ struct build_probe {};
 struct build_index_options {
   /// How branches are formed from the pipeline DAG. Defaults to pipeline_order.
   std::variant<pipeline_order, barrier_order, build_probe> branch_order{pipeline_order{}};
+};
+
+/**
+ * @brief How hard the barrier is between a branch's output and whatever consumes it.
+ *
+ * A new enum, not an alias of @c op::MemoryBarrierType: it describes a *branch's* relationship
+ * to the rest of the plan, and its values are chosen for the prefetch scheduler's vocabulary.
+ * The mapping from the barrier of the branch's terminating edge is total and 1:1:
+ *
+ *   op::MemoryBarrierType::FULL     -> full_barrier
+ *   op::MemoryBarrierType::PARTIAL  -> serial_barrier
+ *   op::MemoryBarrierType::PIPELINE -> streaming
+ *
+ * @note @c serial_barrier has no pre-existing analogue in the codebase; @c PARTIAL is the only
+ *       unclaimed @c MemoryBarrierType and the mapping is by elimination. PARTIAL is documented
+ *       as "incremental but respects pipeline boundaries"
+ *       (docs/super-sirius/pipeline-execution.md:65) — a *rate* property, whereas "serial" reads
+ *       as an *ordering* property. If the two are not meant to coincide, this mapping is the
+ *       thing to change.
+ */
+enum class order_type : std::uint8_t {
+  full_barrier,    ///< The consumer waits for this branch to finish entirely.
+  serial_barrier,  ///< The consumer makes incremental progress, bounded by pipeline boundaries.
+  streaming,       ///< The consumer consumes batches as they arrive.
+};
+
+/// One entry of @ref query_index::prefetching_order: a scan and the barrier class of the branch
+/// it heads.
+struct prefetch_step {
+  /// The branch head's source operator. Always a @c SiriusPhysicalOperatorType::GPU_SCAN.
+  /// Typed as the base class so a synthetic test operator can stand in for a real
+  /// @c sirius_gpu_scan_operator (which needs a @c gpu_ingestible to construct).
+  op::sirius_physical_operator* scan{nullptr};
+  order_type order{order_type::streaming};
 };
 
 /**
@@ -114,6 +149,47 @@ class query_index {
   [[nodiscard]] branch get_consumer_pipelines_till_next_branch(
     const op::sirius_physical_operator* op) const;
 
+  /**
+   * @brief The order in which this query's scans should be prefetched, hardest barrier first.
+   *
+   * One entry per GPU scan operator that heads a branch, deduplicated (a fan-out head owns
+   * several branches; the first in plan order wins, matching @c _head_op_to_branch).
+   *
+   * Ordering: branches are classified by the barrier of the edge leaving their tail
+   * (@ref order_type), then **stable-sorted** by that class — @c full_barrier, then
+   * @c serial_barrier, then @c streaming. Stability means that within one class the original
+   * plan order (which is the branch order, which is the scheduling priority order produced by
+   * @c creator::task_creator::compute_pipeline_priorities) is preserved.
+   *
+   * That ordering is what makes a join's build side precede its probe side: under
+   * @ref build_probe the build edge keeps its FULL barrier while the probe edge is rewritten to
+   * PIPELINE, so the build branch sorts to @c full_barrier and the probe branch to
+   * @c streaming. The scheduler wants the blocking side warm first — nothing downstream of the
+   * join can run until the build completes.
+   *
+   * The classification is fixed at @ref build_index time, so it reflects whichever
+   * @ref build_index_options the index was built with. **Production callers must pass
+   * @ref build_probe** — the same option @c creator::task_creator::compute_pipeline_priorities
+   * uses — so prefetch order and dispatch priority agree.
+   *
+   * Deterministic and terminating: no recursion, no graph search beyond the one
+   * @c build_index already performs.
+   *
+   * Allocates (a vector, a hash set and a sort), so this is not @c noexcept and does not belong
+   * in a hot loop or a destructor. Intended to be called once per query and the result cached.
+   * The returned pointers are borrowed from the query's pipelines and are only valid while the
+   * query lives.
+   *
+   * @return Steps in prefetch order. Empty when the query has no GPU scan heading a branch.
+   */
+  [[nodiscard]] std::vector<prefetch_step> prefetching_order() const;
+
+  /**
+   * @brief The barrier class of branch @p branch_index, parallel to @ref get_branches.
+   * @throws std::out_of_range when @p branch_index is out of range.
+   */
+  [[nodiscard]] order_type get_branch_order_type(std::size_t branch_index) const;
+
  private:
   query_index() = default;
 
@@ -123,6 +199,11 @@ class query_index {
   std::vector<branch> _branch_views;
   //! Head operator id -> index of the first branch that operator heads.
   std::unordered_map<std::size_t, std::size_t> _head_op_to_branch;
+  //! Barrier class of each branch's terminating edge, parallel to _branch_views.
+  std::vector<order_type> _branch_order_types;
+  //! Source operator of each branch's head pipeline (null when the head has no source),
+  //! parallel to _branch_views. Captured during build so prefetching_order() needs no re-walk.
+  std::vector<op::sirius_physical_operator*> _branch_heads;
 };
 
 }  // namespace sirius::planner

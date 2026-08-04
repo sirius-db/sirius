@@ -161,6 +161,20 @@ class duckdb_native_batch_coalescer : public batch_coalescer {
 }  // namespace
 
 //===----------------------------------------------------------------------===//
+// duckdb_native_scan_info — datasource access
+//===----------------------------------------------------------------------===//
+void duckdb_native_scan_info::for_each_datasource(
+  const std::function<void(sirius::io::sirius_datasource&)>& visit) const
+{
+  throw std::logic_error("duckdb_native_scan_info::for_each_datasource: not implemented");
+}
+
+std::size_t duckdb_native_scan_info::datasource_count() const noexcept
+{
+  throw std::logic_error("duckdb_native_scan_info::datasource_count: not implemented");
+}
+
+//===----------------------------------------------------------------------===//
 // duckdb_native_gpu_ingestible — construction
 //===----------------------------------------------------------------------===//
 duckdb_native_gpu_ingestible::duckdb_native_gpu_ingestible(

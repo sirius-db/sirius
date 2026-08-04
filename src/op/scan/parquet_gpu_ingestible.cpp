@@ -329,6 +329,28 @@ std::vector<scan_info::fadvise_entry> parquet_split_info::fadvise_entries() cons
   return entries;
 }
 
+void parquet_file_scan_info::for_each_datasource(
+  const std::function<void(sirius::io::sirius_datasource&)>& visit) const
+{
+  throw std::logic_error("parquet_file_scan_info::for_each_datasource: not implemented");
+}
+
+std::size_t parquet_file_scan_info::datasource_count() const noexcept
+{
+  throw std::logic_error("parquet_file_scan_info::datasource_count: not implemented");
+}
+
+void parquet_split_info::for_each_datasource(
+  const std::function<void(sirius::io::sirius_datasource&)>& visit) const
+{
+  throw std::logic_error("parquet_split_info::for_each_datasource: not implemented");
+}
+
+std::size_t parquet_split_info::datasource_count() const noexcept
+{
+  throw std::logic_error("parquet_split_info::datasource_count: not implemented");
+}
+
 //===----------------------------------------------------------------------===//
 // parquet_ingestible_table_info::make_ingestible
 //===----------------------------------------------------------------------===//

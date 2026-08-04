@@ -54,6 +54,12 @@ struct scan_manager_config {
   /// constructed but unarmed (no background IO threads).
   bool enable_prefetch_cache{false};
 
+  /// Host-cache bytes above which scan prefetch look-ahead backs off. 0 disables the check.
+  std::size_t prefetch_memory_threshold{0};
+
+  /// Look-ahead window: the most splits one prefetch hook invocation will hint.
+  std::size_t max_concurrent_scan{4};
+
   /// Local (uring) reactor configuration — bounce-slot size, O_DIRECT,
   /// ring depth, etc.
   io::uring::config local{};

@@ -30,10 +30,29 @@
 
 // standard library
 #include <cstddef>
+#include <functional>
 #include <memory>
+#include <optional>
 #include <variant>
 
+namespace sirius::scan_manager {
+class prefetching_state_manager;
+}  // namespace sirius::scan_manager
+
 namespace sirius::op::scan {
+
+/**
+ * @brief Whether a locked cache batch still needs a GPU upload/conversion before execute().
+ *
+ * True when the batch's data is off the GPU tier, **or** on the GPU tier but not a plain
+ * @c gpu_table_representation (e.g. a @c compressed_device_representation, which must be
+ * decompressed in place). False for a null representation — nothing to upload.
+ *
+ * Single definition shared by @ref scan_operator_input::prepare_for_processing (which acts on
+ * it) and @ref scan_operator_input::is_memory_prefetchable (which reports it), so the
+ * scheduling view and the execution behaviour cannot drift apart.
+ */
+[[nodiscard]] bool batch_needs_gpu_upload(const ::cucascade::read_only_data_batch& ro) noexcept;
 
 //===----------------------------------------------------------------------===//
 // scan_operator_input
@@ -53,15 +72,31 @@ namespace sirius::op::scan {
  */
 class scan_operator_input : public op::operator_data {
  public:
-  explicit scan_operator_input(std::unique_ptr<scan_info> metadata)
-    : materialization_info(std::move(metadata))
+  /// @param metadata       The split's scan descriptor.
+  /// @param prefetch_state Per-query prefetch counters this split reports its ladder
+  ///                       progress to. Null (the default) disables the reporting, which
+  ///                       is what every call site outside the scan manager wants.
+  explicit scan_operator_input(
+    std::unique_ptr<scan_info> metadata,
+    std::shared_ptr<scan_manager::prefetching_state_manager> prefetch_state = nullptr)
+    : materialization_info(std::move(metadata)), _prefetch_state(std::move(prefetch_state))
   {
   }
 
-  explicit scan_operator_input(std::shared_ptr<cucascade::data_batch> cached_batch)
-    : materialization_info(std::move(cached_batch))
+  /// @param cached_batch   The resident pinned-cache batch this split serves.
+  /// @param prefetch_state Per-query prefetch counters this split reports its ladder
+  ///                       progress to. Null (the default) disables the reporting.
+  explicit scan_operator_input(
+    std::shared_ptr<cucascade::data_batch> cached_batch,
+    std::shared_ptr<scan_manager::prefetching_state_manager> prefetch_state = nullptr)
+    : materialization_info(std::move(cached_batch)), _prefetch_state(std::move(prefetch_state))
   {
   }
+
+  /// User-declared (not implicit) so the prefetching state manager can be told the split
+  /// was disposed of. Out-of-line because @c prefetching_state_manager is only
+  /// forward-declared here.
+  ~scan_operator_input() override;
 
   [[nodiscard]] op::operator_data_type get_type() const override
   {
@@ -93,6 +128,66 @@ class scan_operator_input : public op::operator_data {
       hint.datasource->prefetch(site);
     }
   }
+
+  /// @brief Visit each datasource backing this split. Empty for a resident split.
+  /// Cheap: forwards to @ref scan_info::for_each_datasource, which computes no byte ranges.
+  void for_each_datasource(const std::function<void(io::sirius_datasource&)>& visit) const;
+
+  /// @brief Number of datasources backing this split. Zero for a resident split.
+  [[nodiscard]] std::size_t datasource_count() const noexcept;
+
+  /**
+   * @brief Advisory prefetch progress for this split, folded across its N datasources.
+   *
+   * @return @c prefetch_progress::empty for a resident split (it has no IO request) and for
+   *         a metadata split whose datasources carry no handle; otherwise
+   *         @c combine_prefetch_progress over each datasource's @c prefetch_state.
+   *         Advisory only — see @ref io::cache::prefetch_progress.
+   *
+   * @warning Same ordering precondition as @c sirius_datasource::prefetch_state: the caller
+   *          must be ordered after this split's @c fadvise calls (production: after
+   *          @c push_split).
+   */
+  [[nodiscard]] io::cache::prefetch_progress prefetch_state() const noexcept;
+
+  /**
+   * @brief Whether IO prefetching could do useful work for this split.
+   *
+   * True iff the split carries scan metadata with at least one datasource
+   * (@c datasource_count() > 0). A *structural* property, fixed for the split's lifetime —
+   * it does not become false once the data lands, and it deliberately does **not** consult
+   * @c io_context::prefetching_activation_stage. On every shipped local-disk backend that
+   * stage is @c none, so a call to @ref prefetch is a no-op there; this predicate reports
+   * "there is IO to prefetch", not "the backend will act on it". Pair it with
+   * @ref prefetch_state when the distinction matters.
+   */
+  [[nodiscard]] bool is_io_prefetchable() const noexcept;
+
+  /**
+   * @brief Whether an early GPU upload could do useful work for this split.
+   *
+   * @return @c false for a metadata split (nothing resident to promote) and for a resident
+   *         split already materialized as a plain @c gpu_table_representation on the GPU tier;
+   *         @c true for a resident split that still needs an upload or a decompress;
+   *         @c std::nullopt when the batch is exclusively locked right now and the tier
+   *         cannot be read (@c data_batch::try_to_read_only returned @c nullopt — a real
+   *         window, since @c prepare_for_processing takes a mutable lock to convert).
+   *
+   * Callers should treat @c nullopt conservatively as "yes, might need it": over-scheduling
+   * an upload that turns out unnecessary is cheap; skipping a needed one stalls the task.
+   * Mirrors the @c "UNKNOWN" escape hatch @ref get_origin_tiers already uses.
+   */
+  [[nodiscard]] std::optional<bool> is_memory_prefetchable() const noexcept;
+
+  /**
+   * @brief Whether this split's data is already where the task will want it.
+   *
+   * @return For a metadata split: @c prefetch_state() == @c prefetch_progress::cached — i.e.
+   *         every datasource reported a completed request. For a resident split: the negation
+   *         of @ref is_memory_prefetchable. @c std::nullopt only in the resident case when the
+   *         batch is exclusively locked. Advisory: "cached" is a request-level report, not a pin.
+   */
+  [[nodiscard]] std::optional<bool> is_prefetched() const noexcept;
 
   void prepare_for_processing(const ::cucascade::memory::memory_space* requested_memory_space,
                               rmm::cuda_stream_view /*stream*/) override;
@@ -154,6 +249,12 @@ class scan_operator_input : public op::operator_data {
   /// which owns the definition. Zero means unknown; the scan memory estimate then keeps its
   /// conservative maximum-expansion bound.
   std::size_t conversion_destination_bytes{0};
+
+ private:
+  /// Per-query prefetch counters, injected by the scan manager at construction. Null on
+  /// every split built outside it, in which case the reporting is skipped entirely.
+  /// A @c shared_ptr so this class stays as copy/move-friendly as its variant allows.
+  std::shared_ptr<scan_manager::prefetching_state_manager> _prefetch_state;
 };
 
 }  // namespace sirius::op::scan

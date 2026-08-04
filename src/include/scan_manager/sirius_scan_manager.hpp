@@ -603,6 +603,18 @@ class sirius_scan_manager {
   ///        with it. Throws a clear error for a non-object-store path.
   [[nodiscard]] std::size_t s3_list_max_matches(std::string const& s3_uri);
 
+  /// \brief The current query's prefetch-ladder bookkeeping, or null outside a query.
+  ///
+  /// A fresh instance is built by @ref prepare_for_query and released by @ref reset(); the
+  /// @c shared_ptr is what keeps it alive for splits that outlive their query (a split can be
+  /// destroyed on a GPU executor thread after the scan manager has already moved on). Callers
+  /// that outlive queries — the task_creator hooks in particular — must hold a @c weak_ptr to
+  /// it, never a strong one.
+  [[nodiscard]] const std::shared_ptr<prefetching_state_manager>& prefetching_state() const noexcept
+  {
+    return _prefetching_state;
+  }
+
  private:
   /// \brief Run providers sequentially: start each, wait on its future, advance.
   void start_metadata_processing();
@@ -673,7 +685,7 @@ class sirius_scan_manager {
   /// table has no rows beyond the pinned prefix.
   std::vector<insert_delta_job_request> _pending_insert_delta_jobs;
 
-  /// Per-query sequencer for opportunistic fadvise calls.  Built fresh
+  /// Per-query sequencer for fadvise calls.  Built fresh
   /// in @ref prepare_for_query, gets one @c pipeline_slot per scan,
   /// registered before the pinned-cache match.  The
   /// sequencer task is enqueued on the
@@ -681,6 +693,13 @@ class sirius_scan_manager {
   /// dispatcher's @c request_stop() in @ref reset() therefore tears the
   /// sequencer down without an extra side-channel.
   std::unique_ptr<load_balancing_scan_batch_coalescer> _metadata_processor;
+
+  /// Per-query prefetch-ladder bookkeeping, built fresh in @ref prepare_for_query and
+  /// released in @ref reset().  A *fresh* instance per query is mandatory: a straggler split
+  /// destroyed after the query has torn down must decrement its own query's counters, not the
+  /// next query's.  Shared (not owned outright) so those stragglers keep it alive.
+  std::shared_ptr<prefetching_state_manager> _prefetching_state;
+
   io::io_context_registry _ioctx_registry;
 };
 
