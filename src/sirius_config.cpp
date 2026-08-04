@@ -393,7 +393,8 @@ struct host_mem_config {
     } else {
       builder.set_reservation_limit_per_numa_region(std::get<std::uint64_t>(reservation_limit));
     }
-    builder.set_downgrade_fractions_per_numa_region(downgrade_trigger_fraction, downgrade_stop_fraction);
+    builder.set_downgrade_fractions_per_numa_region(downgrade_trigger_fraction,
+                                                    downgrade_stop_fraction);
     if (std::holds_alternative<double>(capacity)) {
       builder.set_usage_limit_ratio_per_numa_region(std::get<double>(capacity));
     } else {

@@ -75,7 +75,7 @@ make_test_memory_manager_with_disk()
     .set_gpu_usage_limit(gpu_capacity)
     .set_reservation_fraction_per_gpu(limit_ratio)
     .set_per_numa_region_capacity(host_capacity)
-    .use_host_per_gpu()
+    .use_gpu_id_as_host_id()
     .set_reservation_fraction_per_numa_region(limit_ratio)
     .set_disk_mounting_point(0, disk_capacity, tmp_dir.string());
 

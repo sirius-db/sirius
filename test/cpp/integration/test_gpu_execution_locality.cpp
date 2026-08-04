@@ -272,7 +272,7 @@ TEST_CASE("adaptive scan + P2P path distributes asymmetric preload (MGPU-07)",
     .set_gpu_usage_limit(512ull << 20)
     .set_reservation_fraction_per_gpu(0.75)
     .set_per_numa_region_capacity(1ull << 30)
-    .use_host_per_gpu()
+    .use_gpu_id_as_host_id()
     .set_reservation_fraction_per_numa_region(0.75);
   auto space_configs = builder.build();
   auto mem_mgr =

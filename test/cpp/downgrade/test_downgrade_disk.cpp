@@ -135,7 +135,7 @@ std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> make_no_disk_
     .set_reservation_fraction_per_gpu(0.9)
     .set_downgrade_fractions_per_gpu(0.1, 0.05)  // trigger GPU downgrade under modest pressure
     .set_per_numa_region_capacity(host_capacity)
-    .use_host_per_gpu()
+    .use_gpu_id_as_host_id()
     .set_reservation_fraction_per_numa_region(0.75)
     .set_downgrade_fractions_per_numa_region(0.1, 0.05);  // also let a HOST monitor reach pressure
   // No set_disk_mounting_point — DISK tier is absent.
@@ -183,7 +183,7 @@ TEST_CASE("Downgrade task falls back to DISK when HOST is full", "[downgrade_dis
     .set_gpu_usage_limit(gpu_capacity)
     .set_reservation_fraction_per_gpu(limit_ratio)
     .set_per_numa_region_capacity(host_capacity)
-    .use_host_per_gpu()
+    .use_gpu_id_as_host_id()
     .set_reservation_fraction_per_numa_region(limit_ratio)
     .set_disk_mounting_point(0, 4ull << 30, tmp_dir.string());
 
@@ -236,7 +236,7 @@ TEST_CASE("Downgrade task uses HOST when HOST has capacity", "[downgrade_disk]")
     .set_gpu_usage_limit(gpu_capacity)
     .set_reservation_fraction_per_gpu(limit_ratio)
     .set_per_numa_region_capacity(4ull << 30)
-    .use_host_per_gpu()
+    .use_gpu_id_as_host_id()
     .set_reservation_fraction_per_numa_region(limit_ratio)
     .set_disk_mounting_point(0, 4ull << 30, tmp_dir.string());
 
@@ -284,7 +284,7 @@ TEST_CASE("Downgrade task returns false when HOST full and no DISK tier", "[down
     .set_gpu_usage_limit(gpu_capacity)
     .set_reservation_fraction_per_gpu(limit_ratio)
     .set_per_numa_region_capacity(host_capacity)
-    .use_host_per_gpu()
+    .use_gpu_id_as_host_id()
     .set_reservation_fraction_per_numa_region(limit_ratio);
   // No set_disk_mounting_point — DISK tier is absent
 

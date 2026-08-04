@@ -141,7 +141,7 @@ struct pipeline_task_history_fixture {
         .set_gpu_usage_limit(kGpuCapacity)
         .set_reservation_fraction_per_gpu(0.95)
         .set_per_numa_region_capacity(1ULL * 1024 * 1024 * 1024)
-        .use_host_per_gpu()
+        .use_gpu_id_as_host_id()
         .track_reservation_per_stream(false)
         .set_reservation_fraction_per_numa_region(0.75);
       auto space_configs = builder.build();

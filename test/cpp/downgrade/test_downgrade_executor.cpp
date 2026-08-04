@@ -82,7 +82,7 @@ std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> make_test_mem
     .set_gpu_usage_limit(gpu_capacity)
     .set_reservation_fraction_per_gpu(limit_ratio)
     .set_per_numa_region_capacity(host_capacity)
-    .use_host_per_gpu()
+    .use_gpu_id_as_host_id()
     .set_reservation_fraction_per_numa_region(limit_ratio);
 
   auto space_configs = builder.build();
