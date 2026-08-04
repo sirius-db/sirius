@@ -164,9 +164,12 @@ std::shared_ptr<sirius_io_object> rest_ioctx::create_io_object(std::string path)
   // A blocking HEAD on the caller thread (a one-time metadata round-trip) via
   // any reactor's authorizer — head_object_size uses a local easy handle and
   // does not touch worker state, so any reactor is equivalent.
-  size_t const size = _reactors.front()->head_object_size(parsed.host, parsed.path);
-  return std::make_shared<rest_io_object>(
-    std::move(path), std::move(parsed.host), std::move(parsed.path), size);
+  auto head = _reactors.front()->head_object_size(parsed.host, parsed.path);
+  return std::make_shared<rest_io_object>(std::move(path),
+                                          std::move(parsed.host),
+                                          std::move(parsed.path),
+                                          head.object_size,
+                                          std::move(head.etag));
 }
 
 std::shared_ptr<sirius_io_object> rest_ioctx::create_io_object(std::string path, open_hint hint)
@@ -209,16 +212,20 @@ std::shared_ptr<sirius_io_object> rest_ioctx::create_footer_probe_object(std::st
   if (!probe.bytes) {
     // Unusable suffix response (200 full body, 416, missing / "*" Content-Range):
     // fall back to a plain HEAD for the size, with no stash.
-    size_t const size = _reactors.front()->head_object_size(parsed.host, parsed.path);
-    return std::make_shared<rest_io_object>(
-      std::move(path), std::move(parsed.host), std::move(parsed.path), size);
+    auto head = _reactors.front()->head_object_size(parsed.host, parsed.path);
+    return std::make_shared<rest_io_object>(std::move(path),
+                                            std::move(parsed.host),
+                                            std::move(parsed.path),
+                                            head.object_size,
+                                            std::move(head.etag));
   }
   return std::make_shared<rest_io_object>(std::move(path),
                                           std::move(parsed.host),
                                           std::move(parsed.path),
                                           probe.object_size,
                                           probe.window_lo,
-                                          probe.bytes);
+                                          probe.bytes,
+                                          std::move(probe.etag));
 }
 
 }  // namespace sirius::io::rest

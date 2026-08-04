@@ -28,6 +28,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace sirius::io {
@@ -92,6 +93,13 @@ class sirius_io_object : public std::enable_shared_from_this<sirius_io_object> {
   /// Total size of the underlying object, populated by the reactor at
   /// construction time and stored on the io_object thereafter.
   [[nodiscard]] virtual size_t size() const noexcept = 0;
+
+  /// Opaque validation tag associated with this open (the HTTP ETag for
+  /// object-store backends, quotes preserved); empty when unavailable.
+  /// Consumers compare it only for equality against a tag they captured
+  /// earlier; an empty tag disables validation-based caching above —
+  /// degraded performance, never wrong bytes.
+  [[nodiscard]] virtual std::string_view validation_etag() const noexcept { return {}; }
 };
 
 class sirius_io_object_metadata {
