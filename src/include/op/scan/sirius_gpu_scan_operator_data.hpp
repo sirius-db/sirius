@@ -98,6 +98,15 @@ class scan_operator_input : public op::operator_data {
   /// forward-declared here.
   ~scan_operator_input() override;
 
+  /// Explicit because the user-declared destructor above suppresses the implicit move
+  /// operations, and the implicit *copy* operations are deleted by the @c std::unique_ptr
+  /// alternative in @c materialization_info — without these the class would be neither
+  /// copyable nor movable. Splits are moved (the coalescer hands a @c unique_ptr down the
+  /// chain, and the value type itself is moved in the tests), so movability is part of the
+  /// contract.
+  scan_operator_input(scan_operator_input&&)            = default;
+  scan_operator_input& operator=(scan_operator_input&&) = default;
+
   [[nodiscard]] op::operator_data_type get_type() const override
   {
     return op::operator_data_type::GPU_SCAN;
@@ -147,8 +156,19 @@ class scan_operator_input : public op::operator_data {
    * @warning Same ordering precondition as @c sirius_datasource::prefetch_state: the caller
    *          must be ordered after this split's @c fadvise calls (production: after
    *          @c push_split).
+   *
+   * @note **Virtual on purpose — do not devirtualize.** Production has exactly one
+   *       implementation and needs no dispatch, but reaching @c prefetch_progress::cached for
+   *       real requires a live, armed @c prefetching_cache, and no shipped local backend arms
+   *       one (both return @c prefetching_stage::none). With this method non-virtual, nothing
+   *       in a test can make a split report anything but @c empty, which leaves
+   *       @c split_connector::get_next_split's non-FIFO selection policy — the riskiest
+   *       behaviour change in the prefetch-scan work — testable only as a pure function.
+   *       @c split_connector reaches splits through @c dynamic_cast<const scan_operator_input*>,
+   *       so a test-local subclass overriding this reports a synthetic state and drives the
+   *       policy end to end. The cost is one slot in an already-populated vtable.
    */
-  [[nodiscard]] io::cache::prefetch_progress prefetch_state() const noexcept;
+  [[nodiscard]] virtual io::cache::prefetch_progress prefetch_state() const noexcept;
 
   /**
    * @brief Whether IO prefetching could do useful work for this split.
