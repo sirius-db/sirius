@@ -1660,7 +1660,7 @@ static void ApplyExpressionEvaluatorStrategy(const std::string& value)
   sirius::expression_evaluator_strategy parsed;
   if (!sirius::string_to_strategy(value, parsed)) {
     throw InvalidInputException(
-      "Invalid expression_evaluator_strategy '{}'. Valid values: materialize, ast_interpret, "
+      "Invalid expression_evaluator_strategy '%s'. Valid values: materialize, ast_interpret, "
       "ast_jit",
       value);
   }
@@ -1820,7 +1820,7 @@ static void SetMaxSortPartitionMemoryFraction(ClientContext& context,
   const double fraction = parameter.GetValue<double>();
   if (fraction < 0.0 || fraction > 1.0) {
     throw InvalidInputException(
-      "max_sort_partition_memory_fraction must be between 0.0 and 1.0, got {}", fraction);
+      "max_sort_partition_memory_fraction must be between 0.0 and 1.0, got %f", fraction);
   }
   params->max_sort_partition_memory_fraction = fraction;
   SIRIUS_LOG_DEBUG("Updated config MAX_SORT_PARTITION_MEMORY_FRACTION to {}",
@@ -1925,7 +1925,7 @@ static void SetMarkJoinBuildSwitchRatio(ClientContext& context, SetScope scope, 
   auto slot          = lock_operator_params_slot(context);
   const double ratio = parameter.GetValue<double>();
   if (ratio < 0.0) {
-    throw InvalidInputException("mark_join_build_switch_ratio must be >= 0.0, got {}", ratio);
+    throw InvalidInputException("mark_join_build_switch_ratio must be >= 0.0, got %f", ratio);
   }
   params->mark_join_build_switch_ratio = ratio;
   SIRIUS_LOG_DEBUG("Updated config MARK_JOIN_BUILD_SWITCH_RATIO to {}",

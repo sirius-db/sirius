@@ -28,6 +28,7 @@
 #include <duckdb/planner/expression_iterator.hpp>
 #include <duckdb/planner/operator/logical_filter.hpp>
 #include <log/logging.hpp>
+#include <util/duckdb_error_message.hpp>
 
 #include <cstddef>
 #include <exception>
@@ -222,12 +223,8 @@ void sirius_pre_optimizer_hook(duckdb::OptimizerExtensionInput& input,
   try {
     derive_join_dependent_filters_recursive(*plan);
   } catch (std::exception& e) {
-    // NOTE: upstream uses sirius::sanitized_message() (util/duckdb_error_message.hpp, added by
-    // #1339) which prefers duckdb::ErrorData::RawMessage(). This branch predates #1339, and the
-    // helper is only cosmetic on a debug log line, so use what() directly rather than pulling in
-    // an unrelated PR.
     SIRIUS_LOG_DEBUG("Transparent execution: join-dependent filter derivation failed: {}",
-                     e.what());
+                     sirius::sanitized_message(e));
   }
 }
 
@@ -258,12 +255,14 @@ void sirius_optimizer_hook(duckdb::OptimizerExtensionInput& input,
   // throws and we fall back to CPU. A capture whose planning attempt never
   // reaches finalize (e.g. Connection::ExtractPlan) is structurally rejected
   // at the next attempt by the generation check.
+  //
+  // Plan-copy failures make the query ineligible for GPU execution. Optimizer
+  // hooks must not throw, so log a readable message and decline the plan.
   try {
     conn_state->set_captured_plan(copy_logical_plan(*plan, context));
-  } catch (duckdb::NotImplementedException&) {
-    // Plan not serializable — skip GPU.
   } catch (std::exception& e) {
-    SIRIUS_LOG_DEBUG("Transparent execution: failed to copy logical plan: {}", e.what());
+    SIRIUS_LOG_DEBUG("Transparent execution: failed to copy logical plan: {}",
+                     sirius::sanitized_message(e));
   }
 }
 
