@@ -19,6 +19,7 @@
 #include "duckdb/common/shared_ptr_ipp.hpp"
 #include "log/logging.hpp"
 #include "op/scan/duckdb_native_gpu_ingestible.hpp"
+#include "op/scan/iceberg_gpu_ingestible.hpp"
 #include "op/scan/parquet_gpu_ingestible.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "op/sirius_physical_column_data_scan.hpp"
@@ -531,7 +532,18 @@ void dump_scan_identity(std::ostringstream& out, const op::sirius_physical_opera
 {
   if (op.type != op::SiriusPhysicalOperatorType::GPU_SCAN) { return; }
   auto const& info = op.Cast<op::scan::sirius_gpu_scan_operator>().peek_table_info();
-  if (auto const* pq = dynamic_cast<op::scan::parquet_ingestible_table_info const*>(&info)) {
+  // Iceberg first: its table info derives from parquet's, so the parquet branch would match it
+  // and describe an iceberg scan as a plain parquet one. The delete-file count belongs in the
+  // identity — two scans of the same files that apply different deletes are not the same scan.
+  if (auto const* ice = dynamic_cast<op::scan::iceberg_ingestible_table_info const*>(&info)) {
+    out << "      scan: iceberg table=" << ice->table_path
+        << " deleted_files=" << (ice->delete_data ? ice->delete_data->positional_deletes.size() : 0)
+        << " files=[";
+    for (std::size_t f = 0; f < ice->resolved_file_paths.size(); ++f) {
+      out << (f == 0 ? "" : ",") << ice->resolved_file_paths[f];
+    }
+    out << "]\n";
+  } else if (auto const* pq = dynamic_cast<op::scan::parquet_ingestible_table_info const*>(&info)) {
     out << "      scan: parquet files=[";
     for (std::size_t f = 0; f < pq->resolved_file_paths.size(); ++f) {
       out << (f == 0 ? "" : ",") << pq->resolved_file_paths[f];

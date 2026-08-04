@@ -26,6 +26,7 @@
 #include <cudf/utilities/default_stream.hpp>
 
 #include <duckdb/main/connection.hpp>
+#include <io/sirius_datasource.hpp>
 #include <log/logging.hpp>
 #include <op/scan/iceberg_avro_reader.hpp>
 #include <op/scan/iceberg_metadata_reader.hpp>
@@ -91,9 +92,11 @@ IcebergManifestDiscovery discover_from_manifests(duckdb::ClientContext& context,
 
   auto meta_result = conn.Query(query);
   if (meta_result->HasError()) {
-    SIRIUS_LOG_WARN(
-      "[iceberg] iceberg_metadata() failed for '{}': {}", table_path, meta_result->GetError());
-    return result;
+    // Must throw, not return an empty discovery: an empty result reads as "this table has no
+    // delete files", so swallowing the error here turns "could not list the deletes" into
+    // "there are none" and the scan silently returns deleted rows.
+    throw std::runtime_error("[iceberg] iceberg_metadata() failed for '" + table_path +
+                             "': " + meta_result->GetError());
   }
 
   static constexpr auto kPositionDeletes = "POSITION_DELETES";
@@ -220,11 +223,13 @@ equality_delete_read_result read_equality_delete_file(std::string const& delete_
   auto stream = cudf::get_default_stream();
 
   // Both the read_parquet (table data) AND the read_parquet_footers (field-id
-  // extraction) share the same uring_io_object + sirius_datasource — the
-  // io_object opens 2 fds (O_RDONLY + O_RDONLY|O_DIRECT) so reusing avoids
-  // reopening for the footer pass.
-  auto io_object  = ioctx.create_io_object(delete_file_path);
-  auto datasource = ioctx.make_datasource(io_object);
+  // extraction) share the same sirius_datasource — its io_object opens 2 fds
+  // (O_RDONLY + O_RDONLY|O_DIRECT) so reusing avoids reopening for the footer pass.
+  //
+  // `create_io_object` + `make_datasource` was the pair this used before iceberg left the
+  // build; the ioctx surface has since narrowed to `open_datasource`, which does both and
+  // keeps io_object construction a backend detail.
+  auto datasource = ioctx.open_datasource(delete_file_path);
 
   auto opts =
     cudf::io::parquet_reader_options::builder(cudf::io::source_info{datasource.get()}).build();
@@ -243,11 +248,10 @@ equality_delete_read_result read_equality_delete_file(std::string const& delete_
   // Extract Iceberg field IDs from the parquet footer schema.
   std::vector<std::optional<int32_t>> field_ids;
   try {
-    // Reuse the same datasource pointer for the footer pass — datasource and
-    // io_object MUST outlive both reads. Both calls are synchronous so by
-    // function exit both io_object and datasource are dropped together; the
-    // function returns by-value (result.tbl, col_names, field_ids) and
-    // doesn't retain any handle.
+    // Hand the same datasource to the footer pass. The table read above has already
+    // completed, so transferring ownership here is safe; `sources` then keeps it alive for the
+    // duration of read_parquet_footers. The function returns by value (result.tbl, col_names,
+    // field_ids) and retains no handle to it.
     std::vector<std::unique_ptr<cudf::io::datasource>> sources;
     sources.push_back(std::move(datasource));
     auto footers = cudf::io::read_parquet_footers(sources);
@@ -427,41 +431,42 @@ void materialize_equality_deletes(std::vector<IcebergDeleteFileEntry> const& eq_
 std::shared_ptr<const IcebergDeleteData> read_iceberg_delete_data(
   duckdb::ClientContext& context,
   std::string const& table_path,
-  std::shared_ptr<sirius::io::sirius_ioctx> metadata_ioctx,
+  sirius::io::sirius_ioctx* metadata_ioctx,
   std::optional<uint64_t> snapshot_id)
 {
   auto data = std::make_shared<IcebergDeleteData>();
 
-  if (!metadata_ioctx) {
+  if (metadata_ioctx == nullptr) {
     throw std::invalid_argument(
       "[iceberg] read_iceberg_delete_data: metadata_ioctx is null; caller must provide a "
       "sirius_ioctx (this entry point does not implement a kvikio fallback).");
   }
 
-  try {
-    // Single-pass discovery: reads manifest list once, each manifest once.
-    auto discovery = discover_from_manifests(context, table_path, snapshot_id);
+  // Errors propagate. This function used to swallow every exception and return empty delete
+  // data described as "treating as V1" — but an empty result is indistinguishable from a table
+  // that genuinely has no deletes, so a failure to READ the deletes became a silent decision to
+  // IGNORE them, and the scan returned rows the table had deleted. Its caller must decide what
+  // an unreadable manifest means; for the planner that means declining the GPU scan and letting
+  // DuckDB read the table.
+  //
+  // Single-pass discovery: reads manifest list once, each manifest once.
+  auto discovery = discover_from_manifests(context, table_path, snapshot_id);
 
-    bool has_pos_deletes =
-      !discovery.positional_delete_files.empty() || !discovery.deletion_vector_entries.empty();
-    bool has_eq_deletes = !discovery.equality_delete_entries.empty();
+  bool has_pos_deletes =
+    !discovery.positional_delete_files.empty() || !discovery.deletion_vector_entries.empty();
+  bool has_eq_deletes = !discovery.equality_delete_entries.empty();
 
-    if (!has_pos_deletes && !has_eq_deletes) {
-      SIRIUS_LOG_DEBUG("[iceberg] No delete files for '{}'; treating as V1.", table_path);
-      return data;
-    }
+  if (!has_pos_deletes && !has_eq_deletes) {
+    SIRIUS_LOG_DEBUG("[iceberg] No delete files for '{}'; append-only.", table_path);
+    return data;
+  }
 
-    if (has_pos_deletes) {
-      materialize_positional_deletes(*context.db, discovery, data->positional_deletes);
-    }
-    if (has_eq_deletes) {
-      data->data_file_sequence_numbers = std::move(discovery.data_file_sequence_numbers);
-      materialize_equality_deletes(discovery.equality_delete_entries, *metadata_ioctx, *data);
-    }
-
-  } catch (std::exception const& e) {
-    SIRIUS_LOG_WARN("[iceberg] Failed for '{}': {}. Treating as V1.", table_path, e.what());
-    return std::make_shared<IcebergDeleteData>();
+  if (has_pos_deletes) {
+    materialize_positional_deletes(*context.db, discovery, data->positional_deletes);
+  }
+  if (has_eq_deletes) {
+    data->data_file_sequence_numbers = std::move(discovery.data_file_sequence_numbers);
+    materialize_equality_deletes(discovery.equality_delete_entries, *metadata_ioctx, *data);
   }
 
   return data;

@@ -50,16 +50,19 @@ namespace sirius::planner {
 
 namespace {
 
-// True when an `iceberg_scan` table carries ANY delete file — a V2 positional delete, a V2
-// equality delete, or a V3 deletion vector (which `iceberg_metadata()` reports as
-// content='POSITION_DELETES' with file_format='PUFFIN'). Every non-data manifest entry reports a
-// `content` other than 'EXISTING', so one counting query covers all three.
+// True when an `iceberg_scan` table carries a delete kind the GPU scan path cannot apply.
 //
-// Conservative by construction: any failure to PROVE the table delete-free — absent path,
-// failed query, unexpected result shape — returns true and falls the scan back to DuckDB CPU.
-// A false positive costs performance; a false negative would silently drop deletes and corrupt
-// results, so the asymmetry is deliberate.
-bool iceberg_table_has_deletes(duckdb::LogicalGet& op, duckdb::ClientContext& context)
+// The GPU path now applies V2 positional deletes and V3 deletion vectors (which
+// `iceberg_metadata()` reports as content='POSITION_DELETES' with file_format='PUFFIN', and
+// which merge into the same per-file position map). Equality deletes are not applied: they
+// match on key VALUES, so the scan must force-project the key columns even when the query does
+// not select them, which is not wired. Those tables still go to DuckDB.
+//
+// Conservative by construction: any failure to PROVE the table free of equality deletes —
+// absent path, failed query, unexpected result shape — returns true and falls the scan back to
+// DuckDB CPU. A false positive costs performance; a false negative would silently drop deletes
+// and corrupt results, so the asymmetry is deliberate.
+bool iceberg_table_has_unsupported_deletes(duckdb::LogicalGet& op, duckdb::ClientContext& context)
 {
   if (op.parameters.empty() || op.parameters.front().IsNull()) { return true; }
 
@@ -89,7 +92,7 @@ bool iceberg_table_has_deletes(duckdb::LogicalGet& op, duckdb::ClientContext& co
       return true;
     }
   }
-  query += ") WHERE content <> 'EXISTING'";
+  query += ") WHERE content = 'EQUALITY_DELETES'";
 
   try {
     // Opening a second Connection to the same database re-registers the SAME SiriusContext, so
@@ -119,8 +122,8 @@ bool iceberg_table_has_deletes(duckdb::LogicalGet& op, duckdb::ClientContext& co
     auto const n_delete_files = chunk->GetValue(0, 0).GetValue<int64_t>();
     if (n_delete_files > 0) {
       SIRIUS_LOG_INFO(
-        "[sirius_plan_get] iceberg table '{}' has {} delete file(s); the GPU scan path does not "
-        "apply iceberg deletes yet — falling back to DuckDB CPU.",
+        "[sirius_plan_get] iceberg table '{}' has {} equality-delete file(s); the GPU scan path "
+        "does not apply equality deletes yet — falling back to DuckDB CPU.",
         table_path,
         n_delete_files);
       return true;
@@ -188,14 +191,14 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
   }
 
   // An iceberg table's data files are parquet, and `iceberg_scan` binds them into the same
-  // MultiFileBindData `read_parquet` uses, so the parquet ingestible reads them as-is. That is
-  // correct ONLY for append-only tables: the parquet path knows nothing about iceberg deletes,
-  // so a V2/V3 table would silently return rows the table logically deleted. Refuse here — where
-  // NotImplementedException is the established CPU-fallback signal — until delete application
-  // lands. See reference/iceberg_legacy/ for the shipped delete algorithms.
-  if (op.function.name == "iceberg_scan" && iceberg_table_has_deletes(op, context)) {
+  // MultiFileBindData `read_parquet` uses, so the parquet ingestible reads them as-is; the
+  // iceberg ingestible then applies positional deletes and deletion vectors to each decoded
+  // batch. Equality deletes are not applied yet, and reading a table that has them as plain
+  // parquet would silently return rows the table logically deleted — so refuse here, where
+  // NotImplementedException is the established CPU-fallback signal.
+  if (op.function.name == "iceberg_scan" && iceberg_table_has_unsupported_deletes(op, context)) {
     throw duckdb::NotImplementedException(
-      "Iceberg tables with delete files are not yet supported on the GPU scan path");
+      "Iceberg tables with equality-delete files are not yet supported on the GPU scan path");
   }
 
   if (!op.children.empty()) {

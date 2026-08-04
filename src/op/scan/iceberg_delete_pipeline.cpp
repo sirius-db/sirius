@@ -25,35 +25,30 @@ void iceberg_delete_pipeline::add_filter(std::shared_ptr<iceberg_delete_filter> 
   _filters.push_back(std::move(filter));
 }
 
-post_convert_fn_t iceberg_delete_pipeline::build_hook() const
+std::unique_ptr<cudf::table> iceberg_delete_pipeline::apply(std::unique_ptr<cudf::table> tbl,
+                                                            batch_layout layout,
+                                                            rmm::cuda_stream_view stream,
+                                                            rmm::device_async_resource_ref mr) const
 {
-  auto filters = _filters;  // shared_ptr copies — safe to capture
-  auto extra   = _extra_column_count;
+  // Apply each filter in order.
+  for (auto const& f : _filters) {
+    tbl = f->apply(std::move(tbl), layout, stream, mr);
+  }
 
-  return [filters = std::move(filters), extra](
-           std::unique_ptr<cudf::table> tbl,
-           std::string const& path,
-           int64_t first_row,
-           rmm::cuda_stream_view stream) -> std::unique_ptr<cudf::table> {
-    // Apply each filter in order.
-    for (auto const& f : filters) {
-      tbl = f->apply(std::move(tbl), path, first_row, stream);
+  // Strip force-projected extra columns (equality keys appended at the end).
+  if (_extra_column_count > 0) {
+    auto const total = tbl->num_columns();
+    auto const keep =
+      static_cast<cudf::size_type>(total) - static_cast<cudf::size_type>(_extra_column_count);
+    if (keep > 0 && keep < total) {
+      // Move columns out and truncate — no GPU memory copy.
+      auto cols = tbl->release();
+      cols.resize(static_cast<size_t>(keep));
+      tbl = std::make_unique<cudf::table>(std::move(cols));
     }
+  }
 
-    // Strip force-projected extra columns (equality keys appended at the end).
-    if (extra > 0) {
-      auto const total = tbl->num_columns();
-      auto const keep  = static_cast<cudf::size_type>(total) - static_cast<cudf::size_type>(extra);
-      if (keep > 0 && keep < total) {
-        // Move columns out and truncate — no GPU memory copy.
-        auto cols = tbl->release();
-        cols.resize(static_cast<size_t>(keep));
-        tbl = std::make_unique<cudf::table>(std::move(cols));
-      }
-    }
-
-    return tbl;
-  };
+  return tbl;
 }
 
 }  // namespace sirius::op::scan

@@ -283,6 +283,13 @@ set(EXTENSION_SOURCES
     src/op/scan/gpu_ingestible.cpp
     src/op/scan/parquet_gpu_ingestible.cpp
     src/op/scan/duckdb_native_gpu_ingestible.cpp
+    src/op/scan/iceberg_avro_reader.cpp
+    src/op/scan/iceberg_metadata_reader.cpp
+    src/op/scan/puffin_reader.cpp
+    src/op/scan/positional_delete_filter.cpp
+    src/op/scan/equality_delete_filter.cpp
+    src/op/scan/iceberg_delete_pipeline.cpp
+    src/op/scan/iceberg_gpu_ingestible.cpp
     src/op/dynamic_filter_publish_plan.cpp
     src/op/dynamic_filter_publisher.cpp
     src/op/sirius_dynamic_filter.cpp
@@ -375,6 +382,7 @@ set(EXTENSION_SOURCES
 # Deleting src/legacy/ cleanly removes legacy build support.
 set(CUDA_SOURCES
     src/op/partition/crc32_partition_hash.cu
+    src/op/scan/equality_delete_mask.cu
     src/cuda/dynamic_filter_replica_transfer.cu
     src/cuda/sirius_dynamic_bloom_filter.cu
     src/cuda/sirius_dynamic_in_list_filter.cu
@@ -705,6 +713,7 @@ set(TEST_SOURCES
     test/cpp/scan/test_duckdb_native_host_backed_decode.cpp
     test/cpp/scan/test_duckdb_native_walker.cpp
     test/cpp/scan/test_dynamic_filter_merge.cpp
+    test/cpp/scan/test_iceberg_batch_layout.cpp
     test/cpp/scan/test_gpu_decode_alp.cpp
     test/cpp/scan/test_gpu_decode_bitpacking.cpp
     test/cpp/scan/test_gpu_decode_rle.cpp

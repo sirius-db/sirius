@@ -94,25 +94,29 @@ struct IcebergDeleteData {
  *   5. Deduplicates equality deletes and builds the GPU hash join.
  *
  * Caller must ensure DuckDB side-effects are suppressed (InternalQueryGuard).
- * Falls back gracefully on errors (returns empty data, treated as V1).
+ *
+ * THROWS on any failure to read the manifests or delete files. An empty result therefore
+ * means "this table has no deletes", never "the deletes could not be read" — the two must not
+ * be confused, because acting on the second as if it were the first drops deletes silently and
+ * returns rows the table logically removed.
  *
  * @param context        DuckDB client context for running iceberg_snapshots()
  *                       and reading positional-delete parquet files.
  * @param table_path     The Iceberg table path passed to iceberg_scan().
- * @param metadata_ioctx Single-GPU sirius_ioctx for routing parquet reads
- *                       (V2 equality-delete files + footer extraction). Per
- *                       A single GPU's ioctx is sufficient — these are
+ * @param metadata_ioctx Non-owning sirius_ioctx for routing parquet reads
+ *                       (V2 equality-delete files + footer extraction). A
+ *                       single GPU's ioctx is sufficient — these are
  *                       planning-time reads, not on the multi-GPU column-
  *                       chunk hot path. Multi-GPU residency for iceberg
- *                       metadata is deferred. The caller MUST provide a
- *                       non-null ioctx; nullptr throws.
+ *                       metadata is deferred. Must outlive the call and be
+ *                       non-null; nullptr throws.
  * @param snapshot_id    Optional Iceberg snapshot id (latest if omitted).
  * @return Shared pointer to immutable delete data.
  */
 std::shared_ptr<const IcebergDeleteData> read_iceberg_delete_data(
   duckdb::ClientContext& context,
   std::string const& table_path,
-  std::shared_ptr<sirius::io::sirius_ioctx> metadata_ioctx,
+  sirius::io::sirius_ioctx* metadata_ioctx,
   std::optional<uint64_t> snapshot_id = std::nullopt);
 
 /**

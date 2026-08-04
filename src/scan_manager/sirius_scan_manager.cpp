@@ -27,6 +27,7 @@
 #include "memory/topology_index.hpp"
 #include "op/scan/duckdb_native_gpu_ingestible.hpp"
 #include "op/scan/gpu_ingestible.hpp"
+#include "op/scan/iceberg_gpu_ingestible.hpp"
 #include "op/scan/parquet_gpu_ingestible.hpp"
 #include "op/scan/parquet_metadata.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
@@ -719,6 +720,14 @@ std::vector<std::size_t> cache_entry_info::can_serve_with_columns(
   // serves a duckdb scan over the same catalog.schema.table. A cache of one format
   // never serves a scan of the other — the identity check below falls through (a
   // duckdb cache has empty resolved_file_paths; a parquet cache has an empty table_name).
+  // An iceberg scan carrying deletes is NOT a parquet scan over the same files, even though its
+  // bind data derives from parquet's and its file set matches exactly. A pinned entry holds the
+  // data files' rows as written; the deletes live in manifests the pin never saw. Serving that
+  // cache would return rows the table logically deleted, and would look like a cache hit rather
+  // than a correctness bug — so an iceberg scan with deletes always reads from disk.
+  if (auto const* ice = dynamic_cast<op::scan::iceberg_ingestible_table_info const*>(&other)) {
+    if (ice->delete_data && !ice->delete_data->empty()) { return {}; }
+  }
   if (auto const* p = dynamic_cast<op::scan::parquet_ingestible_table_info const*>(&other)) {
     if (resolved_file_paths.size() != p->resolved_file_paths.size()) { return {}; }
     auto these_files = resolved_file_paths;

@@ -22,6 +22,9 @@
 #include <op/scan/iceberg_equality_delete_mask.hpp>
 #include <op/scan/iceberg_metadata_reader.hpp>
 
+#include <stdexcept>
+#include <string>
+
 namespace sirius::op::scan {
 
 equality_delete_filter::equality_delete_filter(std::shared_ptr<const IcebergDeleteData> delete_data,
@@ -34,9 +37,9 @@ equality_delete_filter::equality_delete_filter(std::shared_ptr<const IcebergDele
 }
 
 std::unique_ptr<cudf::table> equality_delete_filter::apply(std::unique_ptr<cudf::table> tbl,
-                                                           std::string const& data_file_path,
-                                                           int64_t /*first_row*/,
-                                                           rmm::cuda_stream_view stream)
+                                                           batch_layout layout,
+                                                           rmm::cuda_stream_view stream,
+                                                           rmm::device_async_resource_ref mr)
 {
   auto const n_rows = tbl->num_rows();
   if (n_rows == 0) { return tbl; }
@@ -44,17 +47,36 @@ std::unique_ptr<cudf::table> equality_delete_filter::apply(std::unique_ptr<cudf:
   // Sequence number filtering: per Iceberg spec, equality deletes only apply
   // to data files whose sequence number is strictly LOWER than the delete's.
   // Each group has exactly one sequence number (grouped by schema + seq).
+  //
+  // Applicability is per data file, but the mask below is per batch, so a batch mixing files
+  // that disagree cannot be served by one mask. Rather than silently applying one file's
+  // answer to another's rows, that case is refused — the caller's job is to keep such files
+  // out of the same batch. It is unreachable while the planner routes equality deletes to CPU.
   auto const& group = _delete_data->equality_delete_groups[_group_index];
-  auto seq_it       = _delete_data->data_file_sequence_numbers.find(data_file_path);
-  if (group.sequence_number > 0 && seq_it != _delete_data->data_file_sequence_numbers.end() &&
-      seq_it->second > 0 && seq_it->second >= group.sequence_number) {
-    // Data file's sequence number >= delete's — deletes don't apply.
+
+  auto applies_to = [&](std::string const& path) {
+    auto seq_it = _delete_data->data_file_sequence_numbers.find(path);
+    return !(group.sequence_number > 0 &&
+             seq_it != _delete_data->data_file_sequence_numbers.end() && seq_it->second > 0 &&
+             seq_it->second >= group.sequence_number);
+  };
+
+  bool const first_applies = layout.empty() || applies_to(layout.front().data_file_path);
+  for (auto const& run : layout) {
+    if (applies_to(run.data_file_path) != first_applies) {
+      throw std::invalid_argument(
+        "[equality_delete_filter] batch mixes data files that disagree on whether delete group "
+        "sequence " +
+        std::to_string(group.sequence_number) +
+        " applies; equality deletes need one sequence number per batch");
+    }
+  }
+
+  if (!first_applies) {
     SIRIUS_LOG_DEBUG(
-      "[equality_delete_filter] Skipping group (data_seq={} >= delete_seq={}) "
-      "for file '{}'",
-      seq_it->second,
-      group.sequence_number,
-      data_file_path);
+      "[equality_delete_filter] Skipping group (delete_seq={}) — batch's data "
+      "file(s) are at or above it",
+      group.sequence_number);
     return tbl;
   }
 
@@ -76,7 +98,7 @@ std::unique_ptr<cudf::table> equality_delete_filter::apply(std::unique_ptr<cudf:
   // Anti-join mask entirely on GPU — no host roundtrip.
   auto bool_col = make_anti_join_mask(*build_indices, n_rows, stream);
 
-  return cudf::apply_boolean_mask(tbl->view(), bool_col->view(), stream);
+  return cudf::apply_boolean_mask(tbl->view(), bool_col->view(), stream, mr);
 }
 
 }  // namespace sirius::op::scan
