@@ -358,6 +358,37 @@ std::vector<std::size_t> build_key_domain_cardinalities(duckdb::LogicalCompariso
 }  // namespace
 //===----------------------------------------------------------------------===//
 
+/// True when @p op is a *derived* relation rather than a base table read: its
+/// subtree contains a join, aggregate, or set operation that has already reduced
+/// its key set.
+///
+/// This is the distinction the "unfiltered build side" refusal actually needs.
+/// An unfiltered base relation is the whole key domain, so a dynamic filter from
+/// it keeps every probe row. An unfiltered *derived* relation is not — a join
+/// output carries only the keys that survived the join, and can be far smaller
+/// than the domain even though no predicate appears anywhere below it.
+///
+/// Descends through the pass-through operators (projection, filter, order) that
+/// sit between a join and its real input; stops at the first reducing operator.
+static bool build_side_is_derived(const duckdb::LogicalOperator* op)
+{
+  if (op == nullptr) { return false; }
+  switch (op->type) {
+    case duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN:
+    case duckdb::LogicalOperatorType::LOGICAL_ANY_JOIN:
+    case duckdb::LogicalOperatorType::LOGICAL_DELIM_JOIN:
+    case duckdb::LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY:
+    case duckdb::LogicalOperatorType::LOGICAL_DISTINCT:
+    case duckdb::LogicalOperatorType::LOGICAL_INTERSECT:
+    case duckdb::LogicalOperatorType::LOGICAL_EXCEPT: return true;
+    default: break;
+  }
+  for (auto const& child : op->children) {
+    if (build_side_is_derived(child.get())) { return true; }
+  }
+  return false;
+}
+
 /// A join equality-condition side that is a plain column reference (BOUND_REF) or a cast of one
 /// (BOUND_CAST(BOUND_REF)) is already handled directly by the hash-join key extraction and by the
 /// PARTITION operator's cast-alignment logic, so it needs no materialization.
@@ -543,12 +574,31 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
       // An unfiltered build is (for FK-shaped joins) the whole key domain — its filter keeps
       // every probe row by construction, so wiring a producer target for it only buys overhead.
       // DuckDB's flag covers the delim-join case where the effective build data is children[0].
-      if (!op.filter_pushdown->build_side_has_filter) {
+      //
+      // But "unfiltered" only implies "whole key domain" when the build side IS a base table.
+      // A build that is itself a join or aggregate output has already been reduced, so its key
+      // set is a strict subset of the domain and its filter can be highly selective even with
+      // no predicate anywhere in its subtree. TPC-H q3 is the case in point: the build of
+      // orders⋈lineitem is the output of customer⋈orders, and the filter it would produce keeps
+      // ~1% of lineitem.
+      //
+      // So the refusal now applies only to a base-relation build. For a derived build we wire
+      // the producer and let the *runtime* selectivity gate decide — it measures what the filter
+      // actually keeps and disables it if that is not worth the probe-side cost, which is a real
+      // measurement rather than a plan-time guess.
+      const bool derived_build = build_side_is_derived(op.children[1].get());
+      if (!op.filter_pushdown->build_side_has_filter && !derived_build) {
         SIRIUS_LOG_INFO(
-          "[sirius_plan_comparison_join] Not wiring dynamic filter(s): build side is "
-          "unfiltered (build est {} rows).",
+          "[sirius_plan_comparison_join] Not wiring dynamic filter(s): build side is an "
+          "unfiltered base relation (build est {} rows).",
           rhs_cardinality);
       } else {
+        if (!op.filter_pushdown->build_side_has_filter) {
+          SIRIUS_LOG_INFO(
+            "[sirius_plan_comparison_join] Wiring dynamic filter(s) for an unfiltered but "
+            "derived build side (build est {} rows); runtime selectivity gate decides.",
+            rhs_cardinality);
+        }
         auto& memory_manager = sirius_context->get_memory_manager();
         auto const gpu_spaces =
           memory_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
@@ -563,7 +613,15 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
           for (auto const& pi : op.filter_pushdown->probe_info) {
             auto channel = get_or_create_dynamic_filter_channel(pi.dynamic_filters.get());
             if (!channel) { continue; }
-            channel->register_producer();
+            // Declare this producer's planned target columns: the same probe_column_index values
+            // that become the publish plan's probe_col_idx below, so the planned set is exhaustive
+            // for every push_filter this producer can ever issue.
+            std::vector<std::size_t> planned_columns;
+            planned_columns.reserve(pi.columns.size());
+            for (auto const& col : pi.columns) {
+              planned_columns.push_back(col.probe_column_index.column_index);
+            }
+            channel->register_producer(std::move(planned_columns));
             sirius::op::dynamic_filter_publish_plan::probe_target target{std::move(channel), {}};
             target.probe_col_idx.reserve(pi.columns.size());
             target.probe_col_type.reserve(pi.columns.size());

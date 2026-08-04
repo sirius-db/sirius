@@ -130,6 +130,12 @@ struct operator_params {
   /// pin-time statistics capture and the serve-side survivor plan: a table pinned while the flag is
   /// off carries no zone maps and cannot prune until re-pinned with the flag on.
   bool enable_pinned_zone_map_pruning = true;
+
+  /// Store eligible integer and fixed-point DECIMAL columns in carriers selected from exact
+  /// per-chunk bounds during pinning. Matching pinned scans derive targets from recorded storage
+  /// metadata; other scans use native carriers. Logical types remain unchanged, and type-sensitive
+  /// boundaries restore native carriers.
+  bool enable_compressed_materialization = true;
 };
 
 struct telemetry_config {
@@ -137,6 +143,7 @@ struct telemetry_config {
   /// Emit per-batch placement telemetry (Batch FSM + MemoryTier usages).
   /// Roughly doubles telemetry volume; no-op when enable_quent is false.
   bool enable_batch_events{true};
+  std::string exporter{"ndjson"};
   std::string output_directory{"telemetry_data"};
   std::string engine_name{"siriusDB"};
 };

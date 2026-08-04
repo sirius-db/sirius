@@ -23,12 +23,23 @@
  *        every operator's `_parent_op` matches its position in the final tree.
  */
 
+#include "expression/aggregate_id.hpp"
+#include "expression/ast/aggregate.hpp"
+#include "expression/ast/node.hpp"
+#include "expression/ast/reference.hpp"
+#include "expression/join_condition.hpp"
 #include "op/sirius_physical_column_data_scan.hpp"
 #include "op/sirius_physical_concat.hpp"
 #include "op/sirius_physical_delim_join.hpp"
 #include "op/sirius_physical_grouped_aggregate.hpp"
+#include "op/sirius_physical_grouped_aggregate_merge.hpp"
+#include "op/sirius_physical_hash_join.hpp"
+#include "op/sirius_physical_nested_loop_join.hpp"
 #include "op/sirius_physical_partition.hpp"
+#include "op/sirius_physical_projection.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
+
+#include <cudf/types.hpp>
 
 #include <catch.hpp>
 #include <duckdb.hpp>
@@ -36,6 +47,11 @@
 #include <duckdb/main/config.hpp>
 #include <duckdb/optimizer/optimizer.hpp>
 #include <duckdb/parser/parser.hpp>
+#include <duckdb/planner/expression/bound_function_expression.hpp>
+#include <duckdb/planner/expression/bound_reference_expression.hpp>
+#include <duckdb/planner/filter/expression_filter.hpp>
+#include <duckdb/planner/operator/logical_dummy_scan.hpp>
+#include <duckdb/planner/operator/logical_get.hpp>
 #include <duckdb/planner/planner.hpp>
 #include <unistd.h>
 
@@ -207,6 +223,21 @@ std::string tree_to_string(sirius_physical_operator* root)
   return out.str();
 }
 
+duckdb::unique_ptr<duckdb::Expression> untranslatable_table_filter_expression()
+{
+  auto expression = duckdb::make_uniq<duckdb::BoundFunctionExpression>(
+    duckdb::LogicalType::BOOLEAN,
+    duckdb::ScalarFunction("sirius_unmapped_filter",
+                           {duckdb::LogicalType::BIGINT},
+                           duckdb::LogicalType::BOOLEAN,
+                           nullptr),
+    duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>{},
+    nullptr);
+  expression->children.push_back(
+    duckdb::make_uniq<duckdb::BoundReferenceExpression>(duckdb::LogicalType::BIGINT, 0));
+  return expression;
+}
+
 /// Every operator's `_parent_op` must equal its position in the final tree; delim joins
 /// stamp their internal `join`/`distinct_root` subtrees with themselves as parent.
 void require_parent_links(sirius_physical_operator* op, sirius_physical_operator* expected_parent)
@@ -331,6 +362,19 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
   for (auto* scan : gpu_scans) {
     CHECK(scan->children.empty());
   }
+}
+
+TEST_CASE_METHOD(plan_tree_shape_fixture,
+                 "plan tree shape - a scan without a complete native carrier schema is rejected",
+                 "[plan_tree_shape][isolated_context]")
+{
+  auto create = con->Query("CREATE TABLE mixed_schema (wide BIGINT, narrow DECIMAL(4,2))");
+  REQUIRE(create);
+  REQUIRE_FALSE(create->HasError());
+
+  REQUIRE_THROWS_WITH(generate_sirius_plan(*con, "SELECT wide, narrow FROM mixed_schema"),
+                      Catch::Contains("GPU scan output column 1 (DECIMAL(4,2)) has no native cuDF "
+                                      "carrier"));
 }
 
 TEST_CASE_METHOD(plan_tree_shape_fixture,
@@ -529,4 +573,281 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
       }
     }
   }
+}
+
+//===----------------------------------------------------------------------===//
+// Wrap-time physical-sidecar copies (compressed materialization)
+//===----------------------------------------------------------------------===//
+// These cases drive `insert_gpu_pipeline_operators` over hand-built sirius trees whose leaves
+// are PROJECTION operators with manually installed sidecars (a TABLE_SCAN leaf would make
+// wrap_table_scan_source throw on the unknown scan function) and assert the wrap-time sidecar
+// copies: join children onto CONCAT and PARTITION, HASH_GROUP_BY onto PARTITION and
+// GROUPED_AGGREGATE_MERGE.
+
+namespace {
+
+constexpr cudf::data_type kInt8{cudf::type_id::INT8};
+constexpr cudf::data_type kInt32{cudf::type_id::INT32};
+constexpr cudf::data_type kInt64{cudf::type_id::INT64};
+
+sirius::logical_type wrap_integer_type()
+{
+  return sirius::logical_type::make(sirius::type_id::INTEGER);
+}
+
+duckdb::vector<sirius::logical_type> wrap_integer_types(std::size_t count)
+{
+  duckdb::vector<sirius::logical_type> types;
+  for (std::size_t i = 0; i < count; i++) {
+    types.push_back(wrap_integer_type());
+  }
+  return types;
+}
+
+std::unique_ptr<sirius::ast::node> wrap_reference(uint32_t column_index)
+{
+  return std::make_unique<sirius::ast::node>(
+    sirius::ast::reference{column_index, wrap_integer_type()});
+}
+
+// A childless pure-reference PROJECTION leaf over @p column_count INTEGER columns, carrying
+// @p physical as its sidecar (empty for native).
+duckdb::unique_ptr<sirius_physical_operator> make_projection_leaf(
+  std::size_t column_count, std::vector<cudf::data_type> physical = {})
+{
+  duckdb::vector<std::unique_ptr<sirius::ast::node>> select_list;
+  for (std::size_t i = 0; i < column_count; i++) {
+    select_list.push_back(wrap_reference(static_cast<uint32_t>(i)));
+  }
+  auto projection = duckdb::make_uniq<sirius::op::sirius_physical_projection>(
+    wrap_integer_types(column_count), std::move(select_list), /*estimated_cardinality=*/1);
+  projection->set_physical_types(std::move(physical));
+  return projection;
+}
+
+// An INNER hash join on column 0 of both sides with a 4-column INTEGER output.
+duckdb::unique_ptr<sirius_physical_operator> make_wrap_hash_join(
+  duckdb::unique_ptr<sirius_physical_operator> left,
+  duckdb::unique_ptr<sirius_physical_operator> right)
+{
+  duckdb::LogicalDummyScan stub(0);
+  stub.types = {duckdb::LogicalType::INTEGER,
+                duckdb::LogicalType::INTEGER,
+                duckdb::LogicalType::INTEGER,
+                duckdb::LogicalType::INTEGER};
+  duckdb::vector<sirius::join_condition> conditions;
+  sirius::join_condition condition;
+  condition.left  = wrap_reference(0);
+  condition.right = wrap_reference(0);
+  conditions.push_back(std::move(condition));
+  return duckdb::make_uniq<sirius::op::sirius_physical_hash_join>(stub,
+                                                                  std::move(left),
+                                                                  std::move(right),
+                                                                  std::move(conditions),
+                                                                  duckdb::JoinType::INNER,
+                                                                  /*estimated_cardinality=*/1);
+}
+
+// A HASH_GROUP_BY grouping on column 0 with SUM(column 1): output [INTEGER key, BIGINT sum].
+duckdb::unique_ptr<sirius::op::sirius_physical_grouped_aggregate> make_wrap_grouped_aggregate(
+  duckdb::unique_ptr<sirius_physical_operator> child)
+{
+  duckdb::vector<sirius::logical_type> output_types;
+  output_types.push_back(wrap_integer_type());
+  output_types.push_back(sirius::logical_type::make(sirius::type_id::BIGINT));
+  duckdb::vector<std::unique_ptr<sirius::ast::node>> groups;
+  groups.push_back(wrap_reference(0));
+  std::vector<std::unique_ptr<sirius::ast::node>> sum_arguments;
+  sum_arguments.push_back(wrap_reference(1));
+  duckdb::vector<std::unique_ptr<sirius::ast::node>> expressions;
+  expressions.push_back(std::make_unique<sirius::ast::node>(
+    sirius::ast::aggregate{sirius::aggregate_id::sum,
+                           std::move(sum_arguments),
+                           sirius::logical_type::make(sirius::type_id::BIGINT),
+                           /*distinct=*/false}));
+  auto aggregate =
+    duckdb::make_uniq<sirius::op::sirius_physical_grouped_aggregate>(std::move(output_types),
+                                                                     std::move(expressions),
+                                                                     std::move(groups),
+                                                                     /*estimated_cardinality=*/1);
+  aggregate->children.push_back(std::move(child));
+  return aggregate;
+}
+
+// Assert `op` is the CONCAT -> PARTITION join-child wrap and both wrappers carry @p expected
+// (empty = sidecar-free). Returns the original wrapped child.
+sirius_physical_operator* require_wrap_sidecars(sirius_physical_operator* op,
+                                                std::vector<cudf::data_type> const& expected)
+{
+  REQUIRE(op != nullptr);
+  REQUIRE(op->type == SiriusPhysicalOperatorType::CONCAT);
+  CHECK(op->get_physical_types() == expected);
+  REQUIRE(op->children.size() == 1);
+  auto* partition = op->children[0].get();
+  REQUIRE(partition->type == SiriusPhysicalOperatorType::PARTITION);
+  CHECK(partition->get_physical_types() == expected);
+  REQUIRE(partition->children.size() == 1);
+  return partition->children[0].get();
+}
+
+}  // namespace
+
+TEST_CASE_METHOD(plan_tree_shape_fixture,
+                 "plan tree shape - join-child wrap copies the physical sidecar onto CONCAT and "
+                 "PARTITION",
+                 "[plan_tree_shape][compressed_schema]")
+{
+  sirius::planner::sirius_physical_plan_generator gen(*con->context);
+
+  SECTION("narrow children stamp both wrappers on both sides")
+  {
+    std::vector<cudf::data_type> const probe_sidecar{kInt32, kInt8};
+    std::vector<cudf::data_type> const build_sidecar{kInt32, kInt8};
+    auto plan = make_wrap_hash_join(make_projection_leaf(2, probe_sidecar),
+                                    make_projection_leaf(2, build_sidecar));
+
+    gen.insert_gpu_pipeline_operators(plan);
+
+    REQUIRE(plan->type == SiriusPhysicalOperatorType::HASH_JOIN);
+    auto* probe_child = require_wrap_sidecars(plan->children[0].get(), probe_sidecar);
+    CHECK(probe_child->type == SiriusPhysicalOperatorType::PROJECTION);
+    CHECK(probe_child->get_physical_types() == probe_sidecar);
+    auto* build_child = require_wrap_sidecars(plan->children[1].get(), build_sidecar);
+    CHECK(build_child->type == SiriusPhysicalOperatorType::PROJECTION);
+    CHECK(build_child->get_physical_types() == build_sidecar);
+  }
+
+  SECTION("a native child leaves the wrappers sidecar-free")
+  {
+    auto plan = make_wrap_hash_join(make_projection_leaf(2), make_projection_leaf(2));
+
+    gen.insert_gpu_pipeline_operators(plan);
+
+    require_wrap_sidecars(plan->children[0].get(), {});
+    require_wrap_sidecars(plan->children[1].get(), {});
+  }
+}
+
+TEST_CASE_METHOD(plan_tree_shape_fixture,
+                 "plan tree shape - aggregate wrap copies the group-key sidecar",
+                 "[plan_tree_shape][compressed_schema]")
+{
+  sirius::planner::sirius_physical_plan_generator gen(*con->context);
+
+  SECTION("a group-key sidecar lands on PARTITION and GROUPED_AGGREGATE_MERGE")
+  {
+    std::vector<cudf::data_type> const aggregate_sidecar{kInt8, kInt64};
+    duckdb::unique_ptr<sirius_physical_operator> plan =
+      make_wrap_grouped_aggregate(make_projection_leaf(2, {kInt8, kInt32}));
+    plan->set_physical_types(aggregate_sidecar);
+
+    gen.insert_gpu_pipeline_operators(plan);
+
+    REQUIRE(plan->type == SiriusPhysicalOperatorType::MERGE_GROUP_BY);
+    CHECK(plan->get_physical_types() == aggregate_sidecar);
+    REQUIRE(plan->children.size() == 1);
+    auto* partition = plan->children[0].get();
+    REQUIRE(partition->type == SiriusPhysicalOperatorType::PARTITION);
+    CHECK(partition->get_physical_types() == aggregate_sidecar);
+    REQUIRE(partition->children.size() == 1);
+    CHECK(partition->children[0]->type == SiriusPhysicalOperatorType::HASH_GROUP_BY);
+    CHECK(partition->children[0]->get_physical_types() == aggregate_sidecar);
+  }
+
+  SECTION("a sidecar-free aggregate leaves both wrappers sidecar-free")
+  {
+    duckdb::unique_ptr<sirius_physical_operator> plan =
+      make_wrap_grouped_aggregate(make_projection_leaf(2));
+
+    gen.insert_gpu_pipeline_operators(plan);
+
+    REQUIRE(plan->type == SiriusPhysicalOperatorType::MERGE_GROUP_BY);
+    CHECK(!plan->has_physical_overrides());
+    auto* partition = plan->children[0].get();
+    REQUIRE(partition->type == SiriusPhysicalOperatorType::PARTITION);
+    CHECK(!partition->has_physical_overrides());
+  }
+
+  SECTION("delim-distinct partitions stay sidecar-free")
+  {
+    // The propagation delim case restores `distinct_root` in place, so the distinct chain never
+    // carries a sidecar; the wrap must not invent one.
+    auto delim = duckdb::make_uniq<sirius::op::sirius_physical_delim_join>(
+      SiriusPhysicalOperatorType::LEFT_DELIM_JOIN,
+      wrap_integer_types(1),
+      make_projection_leaf(1),
+      duckdb::vector<duckdb::const_reference<sirius_physical_operator>>{},
+      /*estimated_cardinality=*/1,
+      duckdb::optional_idx());
+    delim->distinct_root = make_wrap_grouped_aggregate(make_projection_leaf(2));
+    delim->children.push_back(make_projection_leaf(1));
+    duckdb::unique_ptr<sirius_physical_operator> plan = std::move(delim);
+
+    gen.insert_gpu_pipeline_operators(plan);
+
+    auto& delim_ref = plan->Cast<sirius::op::sirius_physical_delim_join>();
+    REQUIRE(delim_ref.distinct_root);
+    auto* merge = delim_ref.distinct_root.get();
+    REQUIRE(merge->type == SiriusPhysicalOperatorType::MERGE_GROUP_BY);
+    CHECK(!merge->has_physical_overrides());
+    REQUIRE(merge->children.size() == 1);
+    auto* partition = merge->children[0].get();
+    REQUIRE(partition->type == SiriusPhysicalOperatorType::PARTITION);
+    CHECK(!partition->has_physical_overrides());
+    REQUIRE(partition->children.size() == 1);
+    CHECK(partition->children[0]->type == SiriusPhysicalOperatorType::HASH_GROUP_BY);
+  }
+}
+
+TEST_CASE_METHOD(plan_tree_shape_fixture,
+                 "plan tree shape - nested-loop-join wrappers stay sidecar-free",
+                 "[plan_tree_shape][compressed_schema]")
+{
+  // NLJ is a propagation native boundary: its children arrive fully restored, so the wrap has
+  // nothing to copy.
+  sirius::planner::sirius_physical_plan_generator gen(*con->context);
+
+  duckdb::LogicalDummyScan stub(0);
+  stub.types = {duckdb::LogicalType::INTEGER, duckdb::LogicalType::INTEGER};
+  duckdb::unique_ptr<sirius_physical_operator> plan =
+    duckdb::make_uniq<sirius::op::sirius_physical_nested_loop_join>(
+      stub,
+      make_projection_leaf(1),
+      make_projection_leaf(1),
+      duckdb::vector<sirius::join_condition>{},
+      duckdb::JoinType::INNER,
+      /*estimated_cardinality=*/1);
+
+  gen.insert_gpu_pipeline_operators(plan);
+
+  REQUIRE(plan->type == SiriusPhysicalOperatorType::NESTED_LOOP_JOIN);
+  require_wrap_sidecars(plan->children[0].get(), {});
+  require_wrap_sidecars(plan->children[1].get(), {});
+}
+
+TEST_CASE_METHOD(plan_tree_shape_fixture,
+                 "plan generation rejects an untranslatable pushed-down table filter",
+                 "[plan_tree_shape][table_filter][isolated_context]")
+{
+  duckdb::TableFunction function;
+  function.name                = "seq_scan";
+  function.projection_pushdown = true;
+  function.filter_pushdown     = true;
+
+  auto get = duckdb::make_uniq<duckdb::LogicalGet>(
+    0,
+    std::move(function),
+    nullptr,
+    duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::BIGINT},
+    duckdb::vector<duckdb::string>{"id"});
+  get->SetColumnIds({duckdb::ColumnIndex(0)});
+  get->projection_ids        = {0};
+  get->estimated_cardinality = 1;
+  get->table_filters.filters[0] =
+    duckdb::make_uniq<duckdb::ExpressionFilter>(untranslatable_table_filter_expression());
+
+  duckdb::unique_ptr<duckdb::LogicalOperator> logical = std::move(get);
+  sirius::planner::sirius_physical_plan_generator generator(*con->context);
+  CHECK_THROWS_WITH(generator.create_plan(std::move(logical)),
+                    Catch::Contains("Unsupported filter predicate on column 'id'"));
 }

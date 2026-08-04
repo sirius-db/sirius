@@ -191,6 +191,7 @@ static void from_yaml(const YAML::Node& node, operator_params& opt)
              opt.dynamic_filter_domain_coverage_threshold);
   r.optional("dynamic_filter_keep_threshold", opt.dynamic_filter_keep_threshold);
   r.optional("enable_pinned_zone_map_pruning", opt.enable_pinned_zone_map_pruning);
+  r.optional("enable_compressed_materialization", opt.enable_compressed_materialization);
   r.reject_unknown();
 }
 
@@ -199,6 +200,7 @@ static void from_yaml(const YAML::Node& node, telemetry_config& opt)
   yaml::reader r(node, "telemetry");
   r.optional("enable_quent", opt.enable_quent);
   r.optional("enable_batch_events", opt.enable_batch_events);
+  r.optional("exporter", opt.exporter);
   r.optional("output_directory", opt.output_directory);
   r.optional("engine_name", opt.engine_name);
   r.reject_unknown();

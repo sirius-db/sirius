@@ -808,6 +808,18 @@ bool sirius_physical_hash_join::is_build_probe_mode()
   return _join_mode == HASH_JOIN_MODE::BUILD_PROBE;
 }
 
+bool sirius_physical_hash_join::publishes_dynamic_filters() const
+{
+  // Both are fixed at construction, so this needs no lock.
+  return filter_pushdown != nullptr && _dynamic_filter_plan.enabled();
+}
+
+void sirius_physical_hash_join::set_build_arrives_whole(bool arrives_whole)
+{
+  std::lock_guard<std::mutex> lg(op_state_mutex);
+  _build_arrives_whole = arrives_whole;
+}
+
 std::vector<build_probe_slot_view> sirius_physical_hash_join::snapshot_build_probe_slots()
 {
   auto* build_port = get_port("build");
@@ -1162,9 +1174,12 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::get_next_task_input_da
     if (!present_batch) { return nullptr; }  // already drained by a concurrent caller
 
     // Synthesize the empty opposite side from the absent child's output schema (children[0] =
-    // probe/left, children[1] = build/right), on the surviving batch's device. The batch's memory
-    // space is only reachable through a read-only accessor; take one transiently (shared lock) and
-    // release it before handing the idle batch to the task.
+    // probe/left, children[1] = build/right), on the surviving batch's device. The absent child's
+    // physical sidecar, when it has one, is the carrier schema its batches would have arrived with,
+    // so synthesizing from it keeps every output batch of this join agreeing with the carriers the
+    // join's own sidecar advertises for that side. The batch's memory space is only reachable
+    // through a read-only accessor; take one transiently (shared lock) and release it before
+    // handing the idle batch to the task.
     cucascade::memory::memory_space* ms = nullptr;
     {
       auto present_ro = present_batch->to_read_only();
@@ -1176,11 +1191,14 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::get_next_task_input_da
         "memory space in operator " +
         std::to_string(this->get_operator_id()));
     }
-    auto const& opp_types = orphan.present_is_build ? children[0]->get_types()   // absent probe
-                                                    : children[1]->get_types();  // absent build
+    auto const& absent = orphan.present_is_build ? *children[0]   // absent probe
+                                                 : *children[1];  // absent build
     rmm::cuda_set_device_raii const device_guard{rmm::cuda_device_id{ms->get_device_id()}};
-    auto empty_batch = make_data_batch(
-      sirius::make_empty_table(opp_types), *ms, cudf::get_default_stream(), batch_telemetry());
+    auto empty_table = absent.has_physical_overrides()
+                         ? sirius::make_empty_table(absent.get_physical_types())
+                         : sirius::make_empty_table(absent.get_types());
+    auto empty_batch =
+      make_data_batch(std::move(empty_table), *ms, cudf::get_default_stream(), batch_telemetry());
 
     std::vector<std::shared_ptr<cucascade::data_batch>> input_batch;
     input_batch.reserve(2);
@@ -1975,21 +1993,40 @@ void sirius_physical_hash_join::push_data_batch_partitioned(
 {
   //===----------Dynamic Table Filters----------===//
   // Build-side dynamic-filter publish: the moment the (single, concat-folded) build batch arrives,
-  // compute and publish the filter from the build keys. This is gated to the two BUILD_PROBE shapes
-  // where a single partition's build batch covers the whole build side, so the one-shot publisher
-  // and its single-GPU reduction emit a complete filter:
-  //   - Single partition (`size() == 1`)
-  //   - Broadcast (`_broadcast`)
+  // compute and publish the filter from the build keys.
+  //
+  // The publisher is one-shot, so the batch it claims must carry the WHOLE build side — a filter
+  // built from part of the key set would drop probe rows that do in fact join. The upstream
+  // PARTITION knows whether that holds (a single-partition or broadcast build, folded to one batch
+  // by a concat_all build-side CONCAT) and reports it at sizing time through
+  // `set_build_arrives_whole`. The join mode is deliberately not part of the condition: a
+  // single-partition STANDARD / MIXED_JOIN build publishes on the same terms as BUILD_PROBE.
   std::optional<::cucascade::read_only_data_batch> build_ro;
   if (port_id == "build" && batch) {
-    bool claim = false;
+    bool claim              = false;
+    bool wired_but_unusable = false;
+    HASH_JOIN_MODE mode     = HASH_JOIN_MODE::STANDARD;
     {
       std::scoped_lock lg(op_state_mutex);
-      claim = _dynamic_filter_publication_state.load(std::memory_order_acquire) ==
-                dynamic_filter_publication_state::OPEN &&
-              _join_mode == HASH_JOIN_MODE::BUILD_PROBE &&
-              (_partition_build_states.size() == 1 || _broadcast) && filter_pushdown &&
-              _dynamic_filter_plan.enabled();
+      const bool open = _dynamic_filter_publication_state.load(std::memory_order_acquire) ==
+                        dynamic_filter_publication_state::OPEN;
+      const bool wired = filter_pushdown && _dynamic_filter_plan.enabled();
+      claim            = open && wired && _build_arrives_whole;
+
+      // A join that has a filter plan and is still open but cannot use the one-shot publisher
+      // silently publishes nothing — say so.
+      wired_but_unusable = open && wired && !claim;
+      mode               = _join_mode;
+    }
+    if (wired_but_unusable) {
+      SIRIUS_LOG_DEBUG(
+        "[sirius_physical_hash_join] dynamic filter NOT published (id={}): mode={}; the build does "
+        "not arrive as a single batch covering the whole build side (multi-partition, or no "
+        "concat-folded build — see this join's partition strategy log line)",
+        get_operator_id(),
+        mode == HASH_JOIN_MODE::BUILD_PROBE  ? "BUILD_PROBE"
+        : mode == HASH_JOIN_MODE::MIXED_JOIN ? "MIXED_JOIN"
+                                             : "STANDARD");
     }
     if (claim) { build_ro.emplace(batch->to_read_only()); }
   }
