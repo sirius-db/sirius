@@ -234,6 +234,21 @@ std::unique_ptr<op::operator_data> run_one_operator(
 std::size_t gpu_pipeline_task_local_state::get_estimated_bytes_to_materialize_input(
   const cucascade::memory::memory_space* target_space) const
 {
+  // Peak device memory while making one representation GPU-resident.
+  // For uncompressed data the source lives in host memory; only the destination
+  // lands on device, so the peak equals the uncompressed size.
+  // For compressed data the encoded payload must first be staged on device
+  // before decompression produces the output, so both are alive simultaneously:
+  //   peak = compressed_bytes + uncompressed_bytes.
+  // When a column projection is applied (compressed_host/device_representation::
+  // select_columns), both byte fields are scaled pro-rata, so the estimate
+  // naturally covers only the projected columns.
+  auto peak_materialization_bytes = [](const cucascade::idata_representation* data) -> std::size_t {
+    auto const compressed   = data->get_size_in_bytes();
+    auto const uncompressed = data->get_uncompressed_data_size_in_bytes();
+    return compressed < uncompressed ? compressed + uncompressed : uncompressed;
+  };
+
   if (auto* scan_input = dynamic_cast<const op::scan::scan_operator_input*>(_input_data.get());
       scan_input && scan_input->is_resident()) {
     // Cached scan inputs can still reside in HOST and require an upload before execution.
@@ -243,7 +258,7 @@ std::size_t gpu_pipeline_task_local_state::get_estimated_bytes_to_materialize_in
     auto ro          = batch->to_read_only();
     auto const* data = ro.get_data();
     if (!data || ro.get_current_tier() == cucascade::memory::Tier::GPU) { return 0; }
-    return data->get_uncompressed_data_size_in_bytes();
+    return peak_materialization_bytes(data);
   }
 
   std::size_t input_size   = 0;
@@ -254,9 +269,7 @@ std::size_t gpu_pipeline_task_local_state::get_estimated_bytes_to_materialize_in
       const bool non_gpu     = ro.get_current_tier() != cucascade::memory::Tier::GPU;
       const bool cross_space = target_space != nullptr && ro.get_memory_space() != nullptr &&
                                ro.get_memory_space()->get_id() != target_space->get_id();
-      if (non_gpu || cross_space) {
-        input_size += ro.get_data()->get_uncompressed_data_size_in_bytes();
-      }
+      if (non_gpu || cross_space) { input_size += peak_materialization_bytes(ro.get_data()); }
     }
   }
   return input_size;

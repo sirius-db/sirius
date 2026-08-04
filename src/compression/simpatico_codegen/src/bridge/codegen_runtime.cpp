@@ -127,6 +127,29 @@ int simpatico_compact_raw_values(const void* d_padded_v,
 
 namespace {
 
+// Raise MAX_DYNAMIC_SHARED_SIZE_BYTES if needed; return false and log on
+// failure (skipping cuLaunchKernel avoids CUDA_ERROR_INVALID_HANDLE cascade).
+bool maybe_raise_smem(CUfunction fn, int dynamic_bytes, const char* ctx)
+{
+  int static_smem = 0;
+  cuFuncGetAttribute(&static_smem, CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES, fn);
+  if (static_smem + dynamic_bytes <= 48 * 1024) return true;
+  if (CUresult r =
+        cuFuncSetAttribute(fn, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, dynamic_bytes);
+      r != CUDA_SUCCESS) {
+    const char* desc = nullptr;
+    cuGetErrorString(r, &desc);
+    std::fprintf(stderr,
+                 "simpatico::codegen: %s: "
+                 "cuFuncSetAttribute(MAX_DYNAMIC_SHARED_SIZE_BYTES, %d) failed: %s\n",
+                 ctx,
+                 dynamic_bytes,
+                 desc ? desc : "?");
+    return false;
+  }
+  return true;
+}
+
 // Fill ``d_bp_off`` (int32[num_chunks+1]) with the exclusive-prefix scan of the
 // per-chunk live-word counts (derived from chunk_bits × chunk_count) plus the
 // [num_chunks] total sentinel, so bp_offsets[c+1]-bp_offsets[c] == live_words[c].
@@ -513,19 +536,9 @@ int run_rendered_decode(const jit::FusedTree& tree,
   args.push_back(&d_out);
   args.push_back(&total_n);
 
-  // Raise the per-block shared memory limit when the total (static compiler-
-  // allocated + dynamic spec.shared_bytes) exceeds the 48 KB default.  The
-  // existing guard only checked the dynamic portion; for deep trees (e.g.
-  // nvcomp_def with two RLE levels) the Delta CUB union (~8 KB) + RLE block-
-  // scan storage (~1 KB) can push static over the residual budget.
-  {
-    CUfunction fn   = kernel->func_for_current_device();
-    int static_smem = 0;
-    cuFuncGetAttribute(&static_smem, CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES, fn);
-    if (static_smem + spec.shared_bytes > 48 * 1024) {
-      cuFuncSetAttribute(fn, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, spec.shared_bytes);
-    }
-  }
+  if (!maybe_raise_smem(
+        kernel->func_for_current_device(), static_cast<int>(spec.shared_bytes), "rendered decode"))
+    return -1;
 
   CUstream stream   = reinterpret_cast<CUstream>(stream_ptr);
   CUfunction fn_dec = kernel->func_for_current_device();
@@ -834,15 +847,9 @@ static int launch_encode_fused_tree_impl(const simpatico::CodegenHead& head,
     for (auto& p : dev_ptrs)
       args.push_back(&p);
 
-    {
-      CUfunction fn_enc   = kernel->func_for_current_device();
-      int static_smem_enc = 0;
-      cuFuncGetAttribute(&static_smem_enc, CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES, fn_enc);
-      if (static_smem_enc + spec.shared_bytes > 48 * 1024) {
-        cuFuncSetAttribute(
-          fn_enc, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, spec.shared_bytes);
-      }
-    }
+    if (!maybe_raise_smem(
+          kernel->func_for_current_device(), static_cast<int>(spec.shared_bytes), "cpp encode"))
+      return -1;
     SIMPATICO_CU_CHECK(cuLaunchKernel(kernel->func_for_current_device(),
                                       static_cast<unsigned>(num_chunks),
                                       1,

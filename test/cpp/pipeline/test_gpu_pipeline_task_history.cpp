@@ -88,6 +88,33 @@ class stub_operator : public sirius::op::sirius_physical_operator {
   bool acts_as_sink = false;
 };
 
+// Minimal idata_representation stub that reports different compressed vs uncompressed
+// sizes without requiring the full compressed_host_representation infrastructure.
+// Used to test the peak_materialization_bytes logic in get_estimated_bytes_to_materialize_input.
+class fake_compressed_representation : public cucascade::idata_representation {
+ public:
+  fake_compressed_representation(cucascade::memory::memory_space& host_space,
+                                 std::size_t compressed,
+                                 std::size_t uncompressed)
+    : idata_representation(host_space), compressed_(compressed), uncompressed_(uncompressed)
+  {
+  }
+  [[nodiscard]] std::size_t get_size_in_bytes() const override { return compressed_; }
+  [[nodiscard]] std::size_t get_uncompressed_data_size_in_bytes() const override
+  {
+    return uncompressed_;
+  }
+  [[nodiscard]] std::unique_ptr<cucascade::idata_representation> clone(
+    rmm::cuda_stream_view) override
+  {
+    return nullptr;
+  }
+
+ private:
+  std::size_t compressed_;
+  std::size_t uncompressed_;
+};
+
 class scan_sizing_input : public sirius::op::operator_data {
  public:
   [[nodiscard]] sirius::op::operator_data_type get_type() const override
@@ -162,6 +189,16 @@ struct pipeline_task_history_fixture {
       REQUIRE(ro.get_data()->get_current_tier() == cucascade::memory::Tier::HOST);
     }
     return batch;
+  }
+
+  /// Create a data batch that looks like a compressed host batch with known sizes.
+  std::shared_ptr<cucascade::data_batch> create_compressed_host_data_batch(
+    std::size_t compressed_bytes, std::size_t uncompressed_bytes)
+  {
+    auto rep = std::make_unique<fake_compressed_representation>(
+      *host_space, compressed_bytes, uncompressed_bytes);
+    auto batch_id = sirius::get_next_batch_id();
+    return cucascade::data_batch::make(batch_id, std::move(rep));
   }
 
   /// Create a data batch that stays on GPU.
@@ -365,6 +402,32 @@ TEST_CASE("cached scan input materialization contributes to task reservations",
     REQUIRE(info_with_history.had_history);
     REQUIRE(info_with_history.peak_memory_estimate == input_basis / 2);
     REQUIRE(info_with_history.reservation_size == input_basis / 2 + materialization_bytes);
+  }
+
+  SECTION("HOST-cached COMPRESSED input accounts for staged payload")
+  {
+    // A compressed host batch has get_size_in_bytes() < get_uncompressed_data_size_in_bytes().
+    // During H2D materialization both the compressed payload and the decompressed output are
+    // simultaneously resident on device, so the peak = compressed + uncompressed.
+    constexpr std::size_t compressed_bytes   = 1000;
+    constexpr std::size_t uncompressed_bytes = 4000;
+    auto batch = f.create_compressed_host_data_batch(compressed_bytes, uncompressed_bytes);
+    {
+      auto ro = batch->to_read_only();
+      REQUIRE(ro.get_current_tier() == cucascade::memory::Tier::HOST);
+      REQUIRE(ro.get_data()->get_size_in_bytes() == compressed_bytes);
+      REQUIRE(ro.get_data()->get_uncompressed_data_size_in_bytes() == uncompressed_bytes);
+    }
+
+    auto task = create_cached_scan_task(global_state, batch, 1);
+    auto info = task->get_estimated_reservation_size_info(nullptr);
+    // input_basis = max(compressed, uncompressed) = uncompressed (scan working set)
+    REQUIRE(info.input_basis == uncompressed_bytes);
+    // bytes_to_materialize must include the compressed payload staged on device + the output
+    REQUIRE(info.bytes_to_materialize_input == compressed_bytes + uncompressed_bytes);
+    REQUIRE_FALSE(info.had_history);
+    REQUIRE(info.peak_memory_estimate == uncompressed_bytes);
+    REQUIRE(info.reservation_size == uncompressed_bytes + compressed_bytes + uncompressed_bytes);
   }
 
   SECTION("GPU-cached input does not add an upload size")

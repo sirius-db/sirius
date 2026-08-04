@@ -805,7 +805,8 @@ std::string build_compressed_table_header(compressed_table const& table,
         out_buffers.push_back(payload_buffer_ref{payload_offset,
                                                  bd.device_ptr,
                                                  bd.size_bytes,
-                                                 leaf_alloc_bytes(bd.type_tag, bd.num_rows)});
+                                                 leaf_alloc_bytes(bd.type_tag, bd.num_rows),
+                                                 ci});
         payload_offset += bd.size_bytes;
       }
     }

@@ -213,7 +213,6 @@ static void from_yaml(const YAML::Node& node, compression_config& opt)
   r.optional("min_batch_size_bytes", yaml::bytes(opt.min_batch_size_bytes));
   r.optional("max_compressed_fraction", opt.max_compressed_fraction);
   r.optional("input_plan_dir", opt.input_plan_dir);
-  r.optional("column_threads", opt.column_threads, yaml::greater_than<int>{0});
   r.reject_unknown();
 }
 
