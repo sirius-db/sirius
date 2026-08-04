@@ -8,6 +8,22 @@
 # "bash print_env.sh" - prints to stdout
 # "bash print_env.sh > env.txt" - prints to file "env.txt"
 
+MISSING_RUNTIME=()
+MISSING_BUILD=()
+MISSING_OPTIONAL=()
+
+check_tools() {
+    type "git"        &>/dev/null || MISSING_RUNTIME+=("git")
+    type "nvidia-smi" &>/dev/null || MISSING_RUNTIME+=("nvidia-smi")
+    type "pixi"       &>/dev/null || MISSING_RUNTIME+=("pixi")
+    type "nvcc"       &>/dev/null || MISSING_BUILD+=("nvcc")
+    type "cmake"      &>/dev/null || MISSING_BUILD+=("cmake")
+    type "g++"        &>/dev/null || MISSING_BUILD+=("g++")
+    type "clang"      &>/dev/null || MISSING_BUILD+=("clang")
+    type "rustc"      &>/dev/null || MISSING_OPTIONAL+=("rustc")
+    type "cargo"      &>/dev/null || MISSING_OPTIONAL+=("cargo")
+}
+
 print_env() {
 echo "***git***"
 if [ "$(git rev-parse --is-inside-work-tree 2>/dev/null)" == "true" ]; then
@@ -138,6 +154,22 @@ else
 fi
 echo
 }
+
+check_tools
+
+if [ ${#MISSING_RUNTIME[@]} -gt 0 ]; then
+    echo "ERROR:   Missing runtime tools required to run Sirius: ${MISSING_RUNTIME[*]}"
+    echo "Please install the missing tools and try again."
+    exit 1
+fi
+if [ ${#MISSING_BUILD[@]} -gt 0 ]; then
+    echo ""
+    echo "WARNING: Missing build tools (not required to run Sirius): ${MISSING_BUILD[*]}"
+fi
+if [ ${#MISSING_OPTIONAL[@]} -gt 0 ]; then
+    echo ""
+    echo "NOTE:    Optional tools not found: ${MISSING_OPTIONAL[*]}"
+fi
 
 echo "<details><summary>Click here to see environment details</summary><pre>"
 echo "     "
