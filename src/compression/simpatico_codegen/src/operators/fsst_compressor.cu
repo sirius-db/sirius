@@ -219,16 +219,22 @@ std::unique_ptr<cudf::column> fsst_compressed_representation::decompress(
 
   auto const* base = static_cast<const std::uint8_t*>(payload_data());
 
+  // Stream-scoped header reads (a blocking cudaMemcpy here would serialize the whole device).
   FrameHeader fh{};
-  check_cuda(cudaMemcpy(&fh, base, sizeof(fh), cudaMemcpyDeviceToHost), "read frame header");
+  check_cuda(cudaMemcpyAsync(&fh, base, sizeof(fh), cudaMemcpyDeviceToHost, stream.value()),
+             "read frame header");
+  stream.synchronize();
   size_t const n_chunks     = fh.n_chunks;
   size_t const chunk_uncomp = fh.chunk_uncomp;
 
   std::vector<std::uint64_t> dir(2 * n_chunks);
-  check_cuda(
-    cudaMemcpy(
-      dir.data(), base + sizeof(fh), dir.size() * sizeof(std::uint64_t), cudaMemcpyDeviceToHost),
-    "read frame dir");
+  check_cuda(cudaMemcpyAsync(dir.data(),
+                             base + sizeof(fh),
+                             dir.size() * sizeof(std::uint64_t),
+                             cudaMemcpyDeviceToHost,
+                             stream.value()),
+             "read frame dir");
+  stream.synchronize();
 
   CompactionV5TCompressor comp;
   // Decode exactly once — skip the library's 20-iter kernel-timing loop, which only exists to
@@ -243,7 +249,6 @@ std::unique_ptr<cudf::column> fsst_compressed_representation::decompress(
     padded_total += round_up(len, block);
   }
   rmm::device_buffer out(padded_total, stream, mr);
-  stream.synchronize();
 
   for (size_t c = 0; c < n_chunks; ++c) {
     size_t const off = c * chunk_uncomp;
@@ -253,6 +258,7 @@ std::unique_ptr<cudf::column> fsst_compressed_representation::decompress(
     dcfg.input_buffer_size         = dir[2 * c + 1];
     dcfg.decompression_buffer_size = round_up(len, block);
     dcfg.device_buffers            = true;
+    dcfg.stream                    = stream.value();
 
     size_t out_size = 0;
     auto const st   = comp.decompress(

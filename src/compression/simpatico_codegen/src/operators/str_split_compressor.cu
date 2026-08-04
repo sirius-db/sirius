@@ -49,6 +49,28 @@ std::unique_ptr<cudf::column> str_split_compressed_representation::decompress(
     num_rows, std::move(offsets_copy), std::move(chars_buf), nc, std::move(mask_buf));
 }
 
+std::unique_ptr<cudf::column> str_split_compressed_representation::decompress_consume(
+  rmm::cuda_stream_view stream, rmm::device_async_resource_ref mr)
+{
+  if (num_rows == 0 || !channels_[0]) {
+    return cudf::make_empty_column(cudf::data_type(cudf::type_id::STRING));
+  }
+
+  auto chars_contents = channels_[1]->release();
+  rmm::device_buffer chars_buf(std::move(*chars_contents.data));
+
+  cudf::size_type nc = 0;
+  rmm::device_buffer mask_buf(0, stream, mr);
+  if (channels_.size() > 2 && channels_[2]) {
+    auto const* bits =
+      reinterpret_cast<cudf::bitmask_type const*>(channels_[2]->view().data<std::uint8_t>());
+    nc = cudf::null_count(bits, 0, num_rows, stream);
+    if (nc > 0) { mask_buf = std::move(*channels_[2]->release().data); }
+  }
+  return cudf::make_strings_column(
+    num_rows, std::move(channels_[0]), std::move(chars_buf), nc, std::move(mask_buf));
+}
+
 std::unique_ptr<compressed_representation> str_split_compressor::compress(
   cudf::column_view column_to_compress,
   rmm::cuda_stream_view stream,

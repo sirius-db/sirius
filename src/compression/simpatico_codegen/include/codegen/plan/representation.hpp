@@ -151,6 +151,14 @@ struct standalone_compressed_representation : compressed_representation {
 
   virtual std::unique_ptr<cudf::column> decompress(rmm::cuda_stream_view stream,
                                                    rmm::device_async_resource_ref mr) const = 0;
+
+  // Like decompress(), but may steal the rep's channel buffers instead of copying them.
+  // Only call on an exclusively-owned, single-use rep (the decode walk's temporaries).
+  virtual std::unique_ptr<cudf::column> decompress_consume(rmm::cuda_stream_view stream,
+                                                           rmm::device_async_resource_ref mr)
+  {
+    return decompress(stream, mr);
+  }
 };
 
 /// Identity / passthrough: stores a column as-is (e.g. keys_chars "stored as-is" in plan).
@@ -380,6 +388,10 @@ struct str_split_compressed_representation : standalone_compressed_representatio
 
   std::unique_ptr<cudf::column> decompress(rmm::cuda_stream_view stream,
                                            rmm::device_async_resource_ref mr) const override;
+
+  // Moves offsets/chars into the strings column instead of copying them.
+  std::unique_ptr<cudf::column> decompress_consume(rmm::cuda_stream_view stream,
+                                                   rmm::device_async_resource_ref mr) override;
 
   std::vector<std::string> required_channels() const override
   {
@@ -905,6 +917,14 @@ struct codegen_fused_representation : compressed_representation {
 /// Callers should use this instead of calling rep->decompress() directly.
 std::unique_ptr<cudf::column> decompress_standalone_representation(
   compressed_representation const* rep,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr,
+  std::string* error_out);
+
+/// decompress_consume() variant: may steal the rep's buffers. Only for
+/// exclusively-owned, single-use reps (the decode walk's temporaries).
+std::unique_ptr<cudf::column> decompress_consume_standalone_representation(
+  compressed_representation* rep,
   rmm::cuda_stream_view stream,
   rmm::device_async_resource_ref mr,
   std::string* error_out);

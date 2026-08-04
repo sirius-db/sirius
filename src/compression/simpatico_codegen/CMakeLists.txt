@@ -135,9 +135,9 @@ else()
   include(FetchContent)
   FetchContent_Declare(
     fsst_gpu_src
-    URL https://github.com/joosthooz/fsst-gpu/archive/1958667a5709d15b4b50c0592fb7c05fc6cbc572.tar.gz
+    URL https://github.com/joosthooz/fsst-gpu/archive/c86c0426a7fd2e3568ffcf6e6122d885867aaad4.tar.gz
     URL_HASH
-      SHA256=3bb54b353c6556b921eb81e17d56fd28ed3997e1fae2b039a3182f6f7ee79bdf
+      SHA256=1b8615bdfa2e5be4ba356d7e9f9a441950b4264647d898e0a255eb05486f2504
     SOURCE_SUBDIR do-not-build)
   FetchContent_MakeAvailable(fsst_gpu_src)
   set(FSST_GPU_ROOT "${fsst_gpu_src_SOURCE_DIR}")

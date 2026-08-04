@@ -648,4 +648,25 @@ std::unique_ptr<cudf::column> decompress_standalone_representation(
   return standalone->decompress(stream, mr);
 }
 
+std::unique_ptr<cudf::column> decompress_consume_standalone_representation(
+  compressed_representation* rep,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr,
+  std::string* error_out)
+{
+  if (!rep) {
+    if (error_out) *error_out = "decompress_standalone_representation: null representation";
+    return nullptr;
+  }
+  auto* standalone = dynamic_cast<standalone_compressed_representation*>(rep);
+  if (!standalone) {
+    if (error_out)
+      *error_out = "decompress_standalone_representation: representation of kind " +
+                   std::to_string(static_cast<int>(rep->kind())) +
+                   " is storage-only and requires the PlanTree decode bridge (e.g. DecodeWalk)";
+    return nullptr;
+  }
+  return standalone->decompress_consume(stream, mr);
+}
+
 }  // namespace simpatico
