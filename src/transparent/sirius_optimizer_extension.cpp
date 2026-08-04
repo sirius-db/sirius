@@ -218,6 +218,14 @@ void sirius_pre_optimizer_hook(duckdb::OptimizerExtensionInput& input,
                                duckdb::unique_ptr<duckdb::LogicalOperator>& plan)
 {
   if (!plan || !gpu_execution_enabled(input.context)) { return; }
+  // Mirror sirius_optimizer_hook's gate: when Sirius never initialized (or this
+  // is one of its internal queries), the query runs on CPU and its plan must
+  // stay byte-identical to a stock DuckDB plan — the derivation is
+  // row-preserving but still perturbs EXPLAIN output and cost estimates.
+  auto ctx = input.context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  if (!ctx || !ctx->is_initialized()) { return; }
+  auto conn_state = duckdb::get_sirius_connection_state(input.context);
+  if (!conn_state || conn_state->is_internal_query_active()) { return; }
 
   // Optimizer hooks must not throw: a failed derivation only costs the pushdown, never the query.
   try {

@@ -173,7 +173,9 @@ struct leased_pool {
 
   ~leased_pool()
   {
-    pool.sync_all();
+    // Destructors cannot throw; run_column_workers' own sync_all already
+    // surfaced any async error before this cleanup sync runs.
+    (void)pool.sync_all();
     global_stream_cache().check_in(
       device, pool.streams);  // leaves pool.streams empty; ~stream_pool is a no-op
   }
@@ -203,8 +205,12 @@ void run_column_workers(size_t n_items, stream_pool& pool, Body&& body)
       break;
     }
   }
-  pool.sync_all();
+  cudaError_t sync_err = pool.sync_all();
   if (first_exception) std::rethrow_exception(first_exception);
+  if (sync_err != cudaSuccess) {
+    throw plan_error(std::string("column worker stream sync failed: ") +
+                     cudaGetErrorString(sync_err));
+  }
 }
 
 compressed_table compress_columns_parallel(cudf::table_view table,

@@ -36,6 +36,7 @@
 #include <mutex>
 #include <thread>
 #include <unordered_map>
+#include <vector>
 
 namespace sirius::pipeline {
 class task_scheduler;
@@ -186,7 +187,15 @@ class task_creator {
    * @return The operator node that should be scheduled next, or nullptr if no task should be
    * scheduled.
    */
-  op::sirius_physical_operator* get_operator_for_next_task(op::sirius_physical_operator* node);
+  /// Follows WAITING_FOR_INPUT_DATA hints upstream to the operator that can
+  /// produce next. get_next_task_hint() is side-effecting at every level (it
+  /// can drain ports and make that pipeline finishable), so every pipeline the
+  /// walk visits is appended to @p visited_pipelines for the caller to
+  /// re-evaluate — a pipeline whose tasks all completed earlier gets no later
+  /// mark_task_completed() to do it.
+  op::sirius_physical_operator* get_operator_for_next_task(
+    op::sirius_physical_operator* node,
+    std::vector<duckdb::shared_ptr<pipeline::sirius_pipeline>>& visited_pipelines);
 
   /**
    * @brief Manager loop to consume task creation requests and dispatch to the thread pool.
