@@ -40,10 +40,12 @@
 
 #include <rmm/device_buffer.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstdlib>
 #include <memory>
+#include <span>
 #include <string>
 #include <utility>
 #include <vector>
@@ -64,6 +66,61 @@ inline bool late_mat_enabled()
     return v != nullptr && v[0] != '\0' && !(v[0] == '0' && v[1] == '\0');
   }();
   return enabled;
+}
+
+/// v2 sub-gate (SIRIUS_EXP_LATE_MAT_V2, default off): the PLANNER lifetime
+/// pass decides deferrals and the v1 pipeline walk demotes to a lowering/
+/// verification backend. Implies the main gate — v2 can never be on while
+/// late_mat_enabled() is false, so v1 banked behavior stays re-measurable
+/// byte-identically with the sub-gate unset.
+inline bool late_mat_v2_enabled()
+{
+  static const bool enabled = []() {
+    char const* v = std::getenv("SIRIUS_EXP_LATE_MAT_V2");
+    return v != nullptr && v[0] != '\0' && !(v[0] == '0' && v[1] == '\0');
+  }();
+  return enabled && late_mat_enabled();
+}
+
+/// Columns selected by SIRIUS_LATE_MAT_PIN_UNIQUE_COLS for the pin-time
+/// uniqueness probes, as positions into @p column_names. Two value forms:
+/// a comma-separated case-sensitive name list, or a boolean-style value
+/// ("1"/"all"/"*") selecting every column. Shared by the cheap per-chunk
+/// probe and the exact-count fallback so the two can never track different
+/// column sets. Empty when the env is unset/empty or the main gate is off.
+inline std::vector<std::uint32_t> pin_unique_probe_columns(
+  std::span<std::string const> column_names)
+{
+  std::vector<std::uint32_t> tracked;
+  if (!late_mat_enabled()) { return tracked; }
+  char const* env = std::getenv("SIRIUS_LATE_MAT_PIN_UNIQUE_COLS");
+  if (env == nullptr || env[0] == '\0') { return tracked; }
+  std::string const list(env);
+  if (list == "1" || list == "all" || list == "*") {
+    tracked.reserve(column_names.size());
+    for (std::size_t i = 0; i < column_names.size(); ++i) {
+      tracked.push_back(static_cast<std::uint32_t>(i));
+    }
+    return tracked;
+  }
+  std::size_t start = 0;
+  while (start <= list.size()) {
+    auto const comma = list.find(',', start);
+    auto name =
+      list.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
+    while (!name.empty() && name.front() == ' ') { name.erase(name.begin()); }
+    while (!name.empty() && name.back() == ' ') { name.pop_back(); }
+    if (!name.empty()) {
+      auto const it = std::find(column_names.begin(), column_names.end(), name);
+      if (it != column_names.end()) {
+        tracked.push_back(
+          static_cast<std::uint32_t>(std::distance(column_names.begin(), it)));
+      }
+    }
+    if (comma == std::string::npos) { break; }
+    start = comma + 1;
+  }
+  return tracked;
 }
 
 /// Pin generation. 0 is never a live generation (it is the invalidated /

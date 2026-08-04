@@ -47,6 +47,7 @@
 // test target (see the target_sources line in CMakeLists.txt).
 #include "api/simpatico_codegen.hpp"
 #include "late_mat/late_materializer.hpp"
+#include "late_mat/rowid_emission.hpp"
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/copying.hpp>
@@ -777,6 +778,198 @@ bool run_stored_dtype_retag()
   return ok;
 }
 
+// Host mask + CNT helpers for the emission test (same shapes as
+// test_masked_decode_variants' harness).
+std::vector<std::uint32_t> make_host_mask(std::int64_t n,
+                                          std::int64_t nc,
+                                          unsigned seed,
+                                          unsigned keep_pct,
+                                          std::int64_t zero_chunk)
+{
+  std::vector<std::uint32_t> m(static_cast<std::size_t>(nc) * kWordsPerChunk, 0u);
+  for (std::int64_t r = 0; r < n; ++r) {
+    if (r / kChunk == zero_chunk) continue;
+    std::uint64_t s = seed ^ (0x9E3779B97F4A7C15ull * static_cast<std::uint64_t>(r + 1));
+    if (splitmix64(s) % 100ull < keep_pct)
+      m[static_cast<std::size_t>(r) / 32] |= (1u << (r % 32));
+  }
+  return m;
+}
+
+std::int64_t host_cnt(std::vector<std::uint32_t> const& mask,
+                      std::int64_t nc,
+                      std::vector<std::uint32_t>& chunk_offsets)
+{
+  chunk_offsets.assign(static_cast<std::size_t>(nc) + 1, 0u);
+  std::uint32_t acc = 0;
+  for (std::int64_t c = 0; c < nc; ++c) {
+    chunk_offsets[static_cast<std::size_t>(c)] = acc;
+    for (int w = 0; w < kWordsPerChunk; ++w)
+      acc += static_cast<std::uint32_t>(
+        __builtin_popcount(mask[static_cast<std::size_t>(c) * kWordsPerChunk + w]));
+  }
+  chunk_offsets[static_cast<std::size_t>(nc)] = acc;
+  return acc;
+}
+
+// ── 9. Rowid emission: dense/mask x u64/u32 + guards ────────────────────────
+bool run_rowid_emission()
+{
+  const rmm::cuda_stream_view stream{};
+  auto mr = rmm::mr::get_current_device_resource_ref();
+  using sirius::late_mat::emit_rowid_column;
+  using sirius::late_mat::rowid_emission_request;
+  using sirius::late_mat::rowid_width;
+
+  // Dense, both widths: out[k] == start + k.
+  for (auto width : {rowid_width::u64, rowid_width::u32}) {
+    rowid_emission_request req;
+    req.range = {123456, 2000};
+    req.width = width;
+    auto col  = emit_rowid_column(req, 2000, stream, mr);
+    cudaStreamSynchronize(stream.value());
+    REQUIRE_MSG(col && col->size() == 2000, "dense emission size");
+    if (width == rowid_width::u64) {
+      REQUIRE_MSG(col->type().id() == cudf::type_id::UINT64, "dense u64 type");
+      std::vector<std::uint64_t> got(2000);
+      cudaMemcpy(got.data(), col->view().head<void>(), 2000 * 8, cudaMemcpyDeviceToHost);
+      for (int k = 0; k < 2000; ++k)
+        if (got[k] != 123456ull + k) { REQUIRE_MSG(false, "dense u64 value at %d", k); }
+    } else {
+      REQUIRE_MSG(col->type().id() == cudf::type_id::UINT32, "dense u32 type");
+      std::vector<std::uint32_t> got(2000);
+      cudaMemcpy(got.data(), col->view().head<void>(), 2000 * 4, cudaMemcpyDeviceToHost);
+      for (int k = 0; k < 2000; ++k)
+        if (got[k] != 123456u + k) { REQUIRE_MSG(false, "dense u32 value at %d", k); }
+    }
+  }
+
+  // Mask form: survivors of a host mask, + base, both widths.
+  {
+    const std::int64_t n  = 2 * kChunk + 300;
+    const std::int64_t nc = codegen::num_chunks_for(n);
+    auto hmask            = make_host_mask(n, nc, 0xAB, 20, /*zero_chunk=*/1);
+    std::vector<std::uint32_t> choffs(static_cast<std::size_t>(nc) + 1, 0);
+    std::int64_t const survivors = host_cnt(hmask, nc, choffs);
+    void* d_mask  = nullptr;
+    void* d_offs  = nullptr;
+    cudaMalloc(&d_mask, hmask.size() * 4);
+    cudaMalloc(&d_offs, choffs.size() * 4);
+    cudaMemcpy(d_mask, hmask.data(), hmask.size() * 4, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_offs, choffs.data(), choffs.size() * 4, cudaMemcpyHostToDevice);
+    selection_mask mask{static_cast<std::uint32_t*>(d_mask), n, survivors,
+                        static_cast<std::uint32_t*>(d_offs)};
+    std::vector<std::uint64_t> expect;
+    for (std::int64_t r = 0; r < n; ++r)
+      if ((hmask[static_cast<std::size_t>(r) / 32] >> (r % 32)) & 1u)
+        expect.push_back(7777000ull + static_cast<std::uint64_t>(r));
+
+    rowid_emission_request req;
+    req.range = {7777000, n};
+    req.mask  = &mask;
+    for (auto width : {sirius::late_mat::rowid_width::u64, sirius::late_mat::rowid_width::u32}) {
+      req.width = width;
+      auto col  = emit_rowid_column(req, survivors, stream, mr);
+      cudaStreamSynchronize(stream.value());
+      REQUIRE_MSG(col && col->size() == static_cast<cudf::size_type>(survivors),
+                  "mask emission size");
+      bool ok = true;
+      if (width == sirius::late_mat::rowid_width::u64) {
+        std::vector<std::uint64_t> got(expect.size());
+        cudaMemcpy(got.data(), col->view().head<void>(), got.size() * 8,
+                   cudaMemcpyDeviceToHost);
+        ok = got == expect;
+      } else {
+        std::vector<std::uint32_t> got(expect.size());
+        cudaMemcpy(got.data(), col->view().head<void>(), got.size() * 4,
+                   cudaMemcpyDeviceToHost);
+        for (std::size_t i = 0; ok && i < got.size(); ++i)
+          ok = got[i] == static_cast<std::uint32_t>(expect[i]);
+      }
+      REQUIRE_MSG(ok, "mask emission values (width %d)", static_cast<int>(width));
+    }
+    cudaFree(d_mask);
+    cudaFree(d_offs);
+  }
+
+  // Guards: dense row mismatch throws; u32 span overflow throws.
+  {
+    bool threw = false;
+    try {
+      rowid_emission_request req;
+      req.range = {0, 100};
+      (void)emit_rowid_column(req, 99, stream, mr);
+    } catch (std::exception const&) {
+      threw = true;
+    }
+    REQUIRE_MSG(threw, "dense rows/range mismatch must throw");
+    threw = false;
+    try {
+      rowid_emission_request req;
+      req.range = {(std::int64_t{1} << 32) - 10, 100};  // crosses 2^32
+      req.width = sirius::late_mat::rowid_width::u32;
+      (void)emit_rowid_column(req, 100, stream, mr);
+    } catch (std::exception const&) {
+      threw = true;
+    }
+    REQUIRE_MSG(threw, "u32 overflow span must throw");
+  }
+  std::printf("PASS: rowid emission (dense/mask x u64/u32 + guards)\n");
+  return true;
+}
+
+// ── 10. Multi-source fixed-width gather (the multi-batch raw-path kernel) ───
+// Kernel-level coverage. The materializer's multi-batch raw dispatch reads the
+// SIRIUS_EXP_LATE_MAT_V2 gate through a first-use-cached static, so a single
+// process runs either the gated or ungated dispatch — this file tests the
+// ungated (v1) semantics end to end and the gated path's kernel directly; a
+// gate-on integration run needs a setenv-before-first-use main.
+bool run_multi_source_gather()
+{
+  const rmm::cuda_stream_view stream{};
+  // 3 batches with uneven sizes; ids unsorted, duplicated, hugging batch
+  // boundaries.
+  const std::vector<std::int64_t> rows = {1000, 1, 2048};
+  std::vector<std::int64_t> starts     = {0, 1000, 1001, 3049};
+  std::vector<std::vector<std::int64_t>> data(3);
+  std::vector<void*> d_batches(3);
+  std::vector<void const*> bases(3);
+  for (int b = 0; b < 3; ++b) {
+    data[b].resize(static_cast<std::size_t>(rows[b]));
+    for (std::int64_t i = 0; i < rows[b]; ++i)
+      data[b][static_cast<std::size_t>(i)] = (b + 1) * 1000000 + i;
+    cudaMalloc(&d_batches[b], data[b].size() * 8);
+    cudaMemcpy(d_batches[b], data[b].data(), data[b].size() * 8, cudaMemcpyHostToDevice);
+    bases[b] = d_batches[b];
+  }
+  std::vector<std::uint64_t> ids = {0, 999, 1000, 1001, 3048, 500, 1000, 2048, 3048, 0};
+  std::vector<std::int64_t> expect;
+  for (auto id : ids) {
+    int b = id < 1000 ? 0 : (id < 1001 ? 1 : 2);
+    expect.push_back(data[b][static_cast<std::size_t>(id - starts[b])]);
+  }
+  void *d_bases = nullptr, *d_starts = nullptr, *d_ids = nullptr, *d_out = nullptr;
+  cudaMalloc(&d_bases, bases.size() * sizeof(void*));
+  cudaMalloc(&d_starts, starts.size() * 8);
+  cudaMalloc(&d_ids, ids.size() * 8);
+  cudaMalloc(&d_out, ids.size() * 8);
+  cudaMemcpy(d_bases, bases.data(), bases.size() * sizeof(void*), cudaMemcpyHostToDevice);
+  cudaMemcpy(d_starts, starts.data(), starts.size() * 8, cudaMemcpyHostToDevice);
+  cudaMemcpy(d_ids, ids.data(), ids.size() * 8, cudaMemcpyHostToDevice);
+  sirius::codegen::multi_source_gather_fixed(
+    static_cast<void const* const*>(d_bases), static_cast<std::int64_t const*>(d_starts), 3,
+    /*elem_size=*/8, static_cast<std::uint64_t const*>(d_ids),
+    static_cast<std::int64_t>(ids.size()), d_out, stream);
+  cudaStreamSynchronize(stream.value());
+  std::vector<std::int64_t> got(ids.size());
+  cudaMemcpy(got.data(), d_out, got.size() * 8, cudaMemcpyDeviceToHost);
+  REQUIRE_MSG(got == expect, "multi-source gather mismatch (8B)");
+  for (auto p : {d_bases, d_starts, d_ids, d_out}) cudaFree(p);
+  for (auto p : d_batches) cudaFree(p);
+  std::printf("PASS: multi-source fixed-width gather (boundary/dup/disorder)\n");
+  return true;
+}
+
 }  // namespace
 
 int main()
@@ -799,6 +992,8 @@ int main()
     run_raw_fastpath();
     run_capture_contract();
     run_stored_dtype_retag();
+    run_rowid_emission();
+    run_multi_source_gather();
   } catch (const std::exception& e) {
     std::fprintf(stderr, "FAIL: unhandled exception: %s\n", e.what());
     return 1;

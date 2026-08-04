@@ -41,6 +41,11 @@
 #include "scan_manager/round_robin_strategy.hpp"
 
 #include <cudf/column/column_view.hpp>
+#include <cudf/concatenate.hpp>
+#include <cudf/reduction/unique_count.hpp>
+#include <cudf/sorting.hpp>
+
+#include <chrono>
 
 #include <cstdlib>
 #include <cudf/io/datasource.hpp>
@@ -68,6 +73,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -112,6 +118,135 @@ std::size_t pinned_host_chunk_rows(cucascade::idata_representation const& chunk)
 void invalidate_late_mat_handle(pinned_entry& entry)
 {
   if (entry.late_mat_handle) { entry.late_mat_handle->invalidate(); }
+}
+
+/// Record pin-time uniqueness facts on the freshly installed entry (census
+/// proof line per fact — the group-by-rowid admission cites these). Facts are
+/// only attached on fresh installs/replacements; the GPU-tier merge path
+/// keeps the existing entry's facts (positions stay valid, append-only).
+void attach_unique_column_facts(std::string const& name,
+                                pinned_entry& slot,
+                                std::vector<std::uint32_t> unique_columns)
+{
+  slot.unique_columns = std::move(unique_columns);
+  for (auto const pos : slot.unique_columns) {
+    if (pos < slot.cache_info.names.size()) {
+      SIRIUS_LOG_INFO(
+        "[late_mat] pin uniqueness fact: entry '{}' column '{}' proven unique (pin-exact)",
+        name,
+        slot.cache_info.names[pos]);
+    }
+  }
+  // EXACT-COUNT FALLBACK: the cheap per-chunk composition (sorted + strict
+  // boundaries) fails whenever the pin's chunk order is not key-ordered (e.g.
+  // multi-file parquet pins), even for a globally-unique column. For every
+  // tracked-but-unproven column that is still device-resident and small
+  // enough to assemble, run a full EXACT check: concatenate -> sort ->
+  // unique_count == rows (unique_count over sorted data IS the exact distinct
+  // count; nothing approximate is ever recorded). Pin-time-only cost, logged
+  // per column. Skips (each logged): compressed chunks, non-GPU tiers,
+  // cross-device pins, > INT32_MAX rows (cudf column bound).
+  auto const tracked = late_mat::pin_unique_probe_columns(slot.cache_info.names);
+  for (auto const pos : tracked) {
+    if (std::ranges::find(slot.unique_columns, pos) != slot.unique_columns.end()) {
+      continue;  // already proven by the cheap pass
+    }
+    if (pos >= slot.cache_info.names.size()) { continue; }
+    auto const& col_name = slot.cache_info.names[pos];
+    if (slot.num_rows == 0 ||
+        slot.num_rows > static_cast<std::size_t>(std::numeric_limits<cudf::size_type>::max())) {
+      SIRIUS_LOG_INFO(
+        "[late_mat] pin exact-uniqueness check skipped: entry '{}' column '{}' ({} rows exceed "
+        "the single-column bound)",
+        name,
+        col_name,
+        slot.num_rows);
+      continue;
+    }
+    // Gather the column's chunk views (device-resident forms only).
+    std::vector<cudf::column_view> views;
+    int device_id  = -1;
+    bool supported = slot.tier == cucascade::memory::Tier::GPU;
+    if (supported && !slot.device_chunks.empty()) {
+      for (auto const& chunk : slot.device_chunks) {
+        if (chunk.compressed || pos >= chunk.columns.size() || !chunk.columns[pos]) {
+          supported = false;
+          break;
+        }
+        views.push_back(chunk.columns[pos]->view());
+        int const dev = chunk.memory_space ? chunk.memory_space->get_device_id() : -1;
+        if (device_id == -1) { device_id = dev; }
+        if (dev != device_id) { supported = false; break; }
+      }
+    } else if (supported && !slot.data_batches_by_column.empty()) {
+      auto const it = slot.data_batches_by_column.find(col_name);
+      supported     = it != slot.data_batches_by_column.end();
+      if (supported) {
+        for (std::size_t c = 0; c < it->second.size(); ++c) {
+          auto const& chunk = it->second[c];
+          if (!chunk) { supported = false; break; }
+          views.push_back(chunk->view());
+          int const dev = c < slot.chunk_memory_spaces.size() && slot.chunk_memory_spaces[c]
+                            ? slot.chunk_memory_spaces[c]->get_device_id()
+                            : -1;
+          if (device_id == -1) { device_id = dev; }
+          if (dev != device_id) { supported = false; break; }
+        }
+      }
+    } else {
+      supported = false;
+    }
+    if (!supported || views.empty() || views.front().null_count() > 0) {
+      SIRIUS_LOG_INFO(
+        "[late_mat] pin exact-uniqueness check skipped: entry '{}' column '{}' (storage form "
+        "not device-assemblable)",
+        name,
+        col_name);
+      continue;
+    }
+    try {
+      auto const t0 = std::chrono::steady_clock::now();
+      rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{device_id}};
+      auto assembled = cudf::concatenate(views);
+      if (assembled->view().null_count() > 0) { continue; }
+      auto sorted =
+        cudf::sort(cudf::table_view({assembled->view()}), {cudf::order::ASCENDING}, {});
+      assembled.reset();
+      auto const distinct = cudf::unique_count(sorted->view().column(0),
+                                               cudf::null_policy::EXCLUDE,
+                                               cudf::nan_policy::NAN_IS_VALID);
+      sorted.reset();
+      auto const ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - t0)
+                        .count();
+      if (static_cast<std::size_t>(distinct) == slot.num_rows) {
+        slot.unique_columns.push_back(pos);
+        SIRIUS_LOG_INFO(
+          "[late_mat] pin uniqueness fact: entry '{}' column '{}' proven unique "
+          "(pin-exact-count, {} rows, {} ms)",
+          name,
+          col_name,
+          slot.num_rows,
+          ms);
+      } else {
+        SIRIUS_LOG_INFO(
+          "[late_mat] pin exact-uniqueness check: entry '{}' column '{}' NOT unique "
+          "({} distinct of {} rows, {} ms)",
+          name,
+          col_name,
+          distinct,
+          slot.num_rows,
+          ms);
+      }
+    } catch (std::exception const& e) {
+      SIRIUS_LOG_WARN(
+        "[late_mat] pin exact-uniqueness check failed for entry '{}' column '{}': {} — no "
+        "fact recorded",
+        name,
+        col_name,
+        e.what());
+    }
+  }
 }
 
 void attach_late_mat_handle(std::string const& name, pinned_entry& slot)
@@ -1206,7 +1341,8 @@ void sirius_scan_manager::insert_pinned_entry(
   std::vector<std::unique_ptr<cudf::table>> data_tables,
   std::vector<cucascade::memory::memory_space*> chunk_memory_spaces,
   duckdb::vector<duckdb::LogicalType> column_types,
-  std::vector<std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>>> chunk_stats)
+  std::vector<std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>>> chunk_stats,
+  std::vector<std::uint32_t> unique_columns)
 {
   // chunk_memory_spaces is parallel to data_tables — the caller
   // (PinTableFunction) emits one memory_space* per coalesced batch, and
@@ -1417,6 +1553,7 @@ void sirius_scan_manager::insert_pinned_entry(
 
   auto& slot = _pinned_entries[name] = std::move(entry);
   attach_late_mat_handle(name, slot);
+  attach_unique_column_facts(name, slot, std::move(unique_columns));
 }
 
 namespace {
@@ -1444,7 +1581,8 @@ void sirius_scan_manager::insert_pinned_entry_host(
   std::vector<std::shared_ptr<cucascade::idata_representation>> host_chunks,
   cucascade::memory::memory_space& memory_space,
   duckdb::vector<duckdb::LogicalType> column_types,
-  std::vector<std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>>> chunk_stats)
+  std::vector<std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>>> chunk_stats,
+  std::vector<std::uint32_t> unique_columns)
 {
   // The host-tier path captures one chunk per emitted batch; each chunk holds every
   // pinned column (compressed or uncompressed). Re-insert always replaces — there is
@@ -1486,12 +1624,14 @@ void sirius_scan_manager::insert_pinned_entry_host(
   }
   auto& slot = _pinned_entries[name] = std::move(entry);
   attach_late_mat_handle(name, slot);
+  attach_unique_column_facts(name, slot, std::move(unique_columns));
 }
 
 void sirius_scan_manager::insert_pinned_entry_device(const std::string& name,
                                                      cache_entry_info cache_info,
                                                      std::vector<sirius::device_pin_chunk> chunks,
-                                                     cucascade::memory::memory_space& memory_space)
+                                                     cucascade::memory::memory_space& memory_space,
+                                                     std::vector<std::uint32_t> unique_columns)
 {
   std::size_t new_num_rows = 0;
   for (auto const& chunk : chunks) {
@@ -1521,6 +1661,7 @@ void sirius_scan_manager::insert_pinned_entry_device(const std::string& name,
   }
   auto& slot = _pinned_entries[name] = std::move(entry);
   attach_late_mat_handle(name, slot);
+  attach_unique_column_facts(name, slot, std::move(unique_columns));
 }
 
 void sirius_scan_manager::attach_mvcc_metadata(const std::string& name,

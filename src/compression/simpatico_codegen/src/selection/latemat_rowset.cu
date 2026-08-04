@@ -301,7 +301,81 @@ __global__ void global_to_local_kernel(std::uint64_t const* __restrict__ ids,
   }
 }
 
+// Multi-source fixed-width gather (SIRIUS_EXP_LATE_MAT_V2 multi-batch raw
+// path): element i comes from the batch found by binary search over row_start
+// (B+1 exclusive starts). Templated on the element width so the copy is one
+// load/store.
+template <typename Elem>
+__global__ void multi_source_gather_kernel(void const* const* __restrict__ bases,
+                                           std::int64_t const* __restrict__ row_start,
+                                           std::int32_t num_batches,
+                                           std::uint64_t const* __restrict__ ids,
+                                           std::int64_t count,
+                                           Elem* __restrict__ out)
+{
+  std::int64_t const stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
+  for (std::int64_t i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       i < count;
+       i += stride) {
+    std::int64_t const id = static_cast<std::int64_t>(ids[i]);
+    // upper_bound(row_start, id) - 1: B is small, the array stays in cache.
+    std::int32_t lo = 0, hi = num_batches;
+    while (lo < hi) {
+      std::int32_t const mid = lo + ((hi - lo) >> 1);
+      if (row_start[mid + 1] <= id) {
+        lo = mid + 1;
+      } else {
+        hi = mid;
+      }
+    }
+    out[i] = static_cast<Elem const*>(bases[lo])[id - row_start[lo]];
+  }
+}
+
 }  // namespace
+
+void multi_source_gather_fixed(void const* const* bases_dev,
+                               std::int64_t const* row_start_dev,
+                               std::int32_t num_batches,
+                               std::size_t elem_size,
+                               std::uint64_t const* ids,
+                               std::int64_t count,
+                               void* out,
+                               rmm::cuda_stream_view stream)
+{
+  if (count == 0) { return; }
+  if (bases_dev == nullptr || row_start_dev == nullptr || ids == nullptr || out == nullptr ||
+      num_batches <= 0) {
+    throw std::runtime_error("latemat_rowset: multi_source_gather_fixed: invalid inputs");
+  }
+  auto const grid = grid_for(count, kBlock);
+  switch (elem_size) {
+    case 1:
+      multi_source_gather_kernel<std::uint8_t><<<grid, kBlock, 0, stream.value()>>>(
+        bases_dev, row_start_dev, num_batches, ids, count, static_cast<std::uint8_t*>(out));
+      break;
+    case 2:
+      multi_source_gather_kernel<std::uint16_t><<<grid, kBlock, 0, stream.value()>>>(
+        bases_dev, row_start_dev, num_batches, ids, count, static_cast<std::uint16_t*>(out));
+      break;
+    case 4:
+      multi_source_gather_kernel<std::uint32_t><<<grid, kBlock, 0, stream.value()>>>(
+        bases_dev, row_start_dev, num_batches, ids, count, static_cast<std::uint32_t*>(out));
+      break;
+    case 8:
+      multi_source_gather_kernel<std::uint64_t><<<grid, kBlock, 0, stream.value()>>>(
+        bases_dev, row_start_dev, num_batches, ids, count, static_cast<std::uint64_t*>(out));
+      break;
+    case 16:
+      multi_source_gather_kernel<uint4><<<grid, kBlock, 0, stream.value()>>>(
+        bases_dev, row_start_dev, num_batches, ids, count, static_cast<uint4*>(out));
+      break;
+    default:
+      throw std::runtime_error("latemat_rowset: multi_source_gather_fixed: unsupported width " +
+                               std::to_string(elem_size));
+  }
+  throw_on_cuda(cudaGetLastError(), "multi-source gather");
+}
 
 owned_chunk_row_set bucket_sorted_local_ids(std::uint32_t const* sorted_local_ids,
                                             std::int64_t count,

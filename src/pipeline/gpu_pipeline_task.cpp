@@ -81,7 +81,8 @@ void validate_operator_output_types(const op::operator_data* data,
         // port's prepare restores the real columns. Suppress exactly that shape —
         // gate off, nothing changes.
         if (late_mat::late_mat_enabled() &&
-            (actual.id() == cudf::type_id::UINT64 || actual.id() == cudf::type_id::INT8)) {
+            (actual.id() == cudf::type_id::UINT64 || actual.id() == cudf::type_id::UINT32 ||
+             actual.id() == cudf::type_id::INT8)) {
           continue;
         }
         SIRIUS_LOG_WARN(

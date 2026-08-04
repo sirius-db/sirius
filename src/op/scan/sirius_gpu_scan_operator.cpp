@@ -23,6 +23,7 @@
 #include <late_mat/annotated_table_representation.hpp>
 #include <late_mat/column_origin.hpp>
 #include <late_mat/defer_directive.hpp>
+#include <late_mat/rowid_emission.hpp>
 #include <log/logging.hpp>
 #include <op/scan/gpu_ingestible.hpp>
 #include <op/scan/parquet_gpu_ingestible.hpp>
@@ -138,6 +139,53 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::execute(
   ::cucascade::memory::memory_space* mem_space = scan_input->gpu_memory_space;
   std::unique_ptr<cudf::table> output_table;
   auto materialized_table = _ingestible->materialize_table(*scan_input, stream);
+  // v2 count-on-deferred under a static scan filter: substitute BEFORE
+  // post_filter_and_project by VIEW-SPLICING the rowid/placeholder columns
+  // over the deferred positions (no copy — post_filter's filter-by-copy then
+  // compacts the spliced columns with the batch). Sound because the policy
+  // proved the filter references no deferred position, and emission is dense
+  // over the full chunk at this point. The spliced sources are kept alive by
+  // the owning_table_view's owner until the filter copies them.
+  bool substituted_pre_filter = false;
+  if (late_mat_defer && late_mat_defer->pre_filter && scan_input->late_mat_origin &&
+      output_table == nullptr &&
+      materialized_table.state != filter_state::ROW_FILTERED_AND_PROJECTED) {
+    auto const& origin = *scan_input->late_mat_origin;
+    auto const& defer  = *late_mat_defer;
+    auto view          = materialized_table.table.view();
+    auto mr            = mem_space->get_default_allocator();
+    auto const n_rows  = static_cast<std::int64_t>(view.num_rows());
+    late_mat::rowid_emission_request req;
+    req.range = origin.range;
+    req.width = defer.narrow_rowid ? late_mat::rowid_width::u32 : late_mat::rowid_width::u64;
+    // Dense only at this point: the batch has not been row-filtered yet.
+    auto holder = std::make_shared<std::vector<std::unique_ptr<cudf::column>>>();
+    holder->push_back(late_mat::emit_rowid_column(req, n_rows, stream, mr));
+    std::vector<cudf::column_view> spliced(view.begin(), view.end());
+    for (auto const pos : defer.output_positions) {
+      if (pos >= spliced.size()) {
+        throw std::runtime_error(
+          "[sirius_gpu_scan_operator::execute] pre-filter defer position out of range");
+      }
+      if (pos == defer.rowid_position()) {
+        spliced[pos] = holder->front()->view();
+      } else {
+        holder->push_back(
+          cudf::make_column_from_scalar(cudf::numeric_scalar<std::int8_t>(0, true, stream),
+                                        static_cast<cudf::size_type>(n_rows),
+                                        stream,
+                                        mr));
+        spliced[pos] = holder->back()->view();
+      }
+    }
+    // Owner = the previous view's owner AND the spliced columns (shared_ptr
+    // pair — std::any requires copy-constructible owners).
+    auto previous = std::make_shared<owning_table_view>(std::move(materialized_table.table));
+    materialized_table.table =
+      owning_table_view(std::make_pair(std::move(previous), std::move(holder)),
+                        cudf::table_view(spliced));
+    substituted_pre_filter = true;
+  }
   if (materialized_table.state != filter_state::ROW_FILTERED_AND_PROJECTED) {
     output_table =
       _ingestible->post_filter_and_project(std::move(materialized_table), *mem_space, stream);
@@ -160,62 +208,31 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::execute(
   //    batch is neither dense nor mask-captured must FAIL — batches of one
   //    scan must substitute consistently or CONCAT downstream would see
   //    mixed types (never silent wrong data).
-  if (late_mat_defer && scan_input->late_mat_origin && output_table) {
+  if (late_mat_defer && !substituted_pre_filter && scan_input->late_mat_origin && output_table) {
     auto const& origin = *scan_input->late_mat_origin;
     auto const& defer  = *late_mat_defer;
     auto const n_rows  = static_cast<std::int64_t>(output_table->num_rows());
     auto mr            = mem_space->get_default_allocator();
 
-    std::unique_ptr<cudf::column> rowid_col;
-    if (n_rows == origin.range.rows) {
-      // Dense: batch row k is global row range.start + k.
-      rowid_col = cudf::sequence(
-        static_cast<cudf::size_type>(n_rows),
-        cudf::numeric_scalar<std::uint64_t>(static_cast<std::uint64_t>(origin.range.start),
-                                            true,
-                                            stream),
-        cudf::numeric_scalar<std::uint64_t>(1, true, stream),
-        stream,
-        mr);
-    } else if (scan_input->late_mat_selection &&
-               scan_input->late_mat_selection->kind == late_mat::row_selection_kind::mask &&
-               n_rows == scan_input->late_mat_selection->survivor_count) {
-      // Fused-compacted: expand the captured wave-1 mask to batch-local
-      // survivor ids (shipped kernel), then add the chunk's global base.
-      auto const& sel = *scan_input->late_mat_selection;
-      sirius::codegen::selection_mask mask;
+    // One-line emission via the shared helper (dense iota / captured wave-1
+    // mask; u32 only for count-on-deferred bundles). A stamped batch matching
+    // neither shape throws inside — batches of one scan must substitute
+    // consistently or CONCAT downstream would see mixed types.
+    late_mat::rowid_emission_request req;
+    req.range = origin.range;
+    req.width = defer.narrow_rowid ? late_mat::rowid_width::u32 : late_mat::rowid_width::u64;
+    sirius::codegen::selection_mask mask;
+    if (n_rows != origin.range.rows && scan_input->late_mat_selection &&
+        scan_input->late_mat_selection->kind == late_mat::row_selection_kind::mask &&
+        n_rows == scan_input->late_mat_selection->survivor_count) {
+      auto const& sel     = *scan_input->late_mat_selection;
       mask.words          = static_cast<std::uint32_t*>(sel.mask_words->data());
       mask.num_rows       = origin.range.rows;
       mask.survivor_count = sel.survivor_count;
       mask.chunk_offsets  = static_cast<std::uint32_t*>(sel.chunk_offsets->data());
-      rmm::device_buffer local_ids(sizeof(std::int32_t) * static_cast<std::size_t>(n_rows),
-                                   stream,
-                                   mr);
-      sirius::codegen::mask_to_row_indices(
-        mask, static_cast<std::int32_t*>(local_ids.data()), stream);
-      cudf::column_view local_view(cudf::data_type{cudf::type_id::INT32},
-                                   static_cast<cudf::size_type>(n_rows),
-                                   local_ids.data(),
-                                   nullptr,
-                                   0);
-      rowid_col = cudf::binary_operation(
-        local_view,
-        cudf::numeric_scalar<std::uint64_t>(static_cast<std::uint64_t>(origin.range.start),
-                                            true,
-                                            stream),
-        cudf::binary_operator::ADD,
-        cudf::data_type{cudf::type_id::UINT64},
-        stream,
-        mr);
-      // local_ids feeds the binary op enqueued on `stream` and was allocated
-      // on `stream` — its stream-ordered free at scope exit is safe.
-    } else {
-      throw std::runtime_error(
-        "[sirius_gpu_scan_operator::execute] late-mat deferral stamped but the batch is neither "
-        "dense nor mask-captured (rows=" +
-        std::to_string(n_rows) + ", chunk rows=" + std::to_string(origin.range.rows) +
-        "); refusing to emit inconsistent placeholder batches");
+      req.mask            = &mask;
     }
+    auto rowid_col = late_mat::emit_rowid_column(req, n_rows, stream, mr);
 
     auto cols = output_table->release();
     for (auto const pos : defer.output_positions) {

@@ -21,6 +21,7 @@
 #include "expression/ast/reference.hpp"
 #include "expression/ast/utils.hpp"
 #include "late_mat/defer_directive.hpp"
+#include "late_mat/plan_deferral.hpp"
 #include "log/logging.hpp"
 #include "op/scan/gpu_ingestible.hpp"
 #include "op/scan/parquet_gpu_ingestible.hpp"
@@ -107,6 +108,22 @@ double min_value_bytes_compressed()
     return (end == v || d < 0.0) ? min_value_bytes() : d;
   }();
   return value;
+}
+
+/// Count-on-deferred admit switch (SIRIUS_LATE_MAT_COUNT_DEFER, default OFF).
+/// Measured neutral-to-noise on TPC-H SF1000 (q13, the only shape it fires
+/// on: a ~4 B/row ride saving that repeated A/B runs could not separate from
+/// that query's run-to-run spread), so it ships dark. The machinery stays —
+/// outer-join lifetime modeling, pre-filter substitution and u32 emission are
+/// shared with the group-by-rowid transform — and a workload with a heavier
+/// count ride can re-enable it here.
+bool count_on_deferred_enabled()
+{
+  static const bool enabled = []() {
+    char const* v = std::getenv("SIRIUS_LATE_MAT_COUNT_DEFER");
+    return v != nullptr && v[0] != '\0' && !(v[0] == '0' && v[1] == '\0');
+  }();
+  return enabled;
 }
 
 constexpr double kRowidBytes = 8.0;  // UINT64 pin-order rowid
@@ -380,6 +397,242 @@ std::optional<walk_stop> walk_to_materialization_port(
   return std::nullopt;
 }
 
+/// v2 count-on-deferred filter-purity check: a static filter may coexist with
+/// the pre-filter rowid splice only when EVERY filter key is a pure-filter
+/// column (materialized position >= output arity), i.e. the filter can never
+/// read a deferred output position. Parquet-only in v2 (duckdb pins carry
+/// MVCC machinery the deferral preconditions already exclude).
+bool static_filters_only_on_pure_filter_columns(op::scan::sirius_gpu_scan_operator& op)
+{
+  auto const* pq = dynamic_cast<op::scan::parquet_ingestible_table_info const*>(
+    &op.get_ingestible().table_info());
+  if (pq == nullptr || pq->table_filters == nullptr) { return false; }
+  auto const order = op.get_ingestible().materialized_column_order();
+  auto const n_out = op.get_types().size();
+  for (auto const& [key, filter] : pq->table_filters->filters) {
+    if (static_cast<std::size_t>(key) >= pq->column_ids.size()) { return false; }
+    auto const primary =
+      static_cast<std::size_t>(pq->column_ids[key].GetPrimaryIndex());
+    auto const it = std::find(order.begin(), order.end(), primary);
+    if (it == order.end()) { return false; }
+    if (static_cast<std::size_t>(std::distance(order.begin(), it)) < n_out) {
+      return false;  // filter reads an OUTPUT column — refuse
+    }
+  }
+  return true;
+}
+
+/// v2 count-on-deferred install (no-port shape). The rowid never
+/// materializes: count(rowid) == count(col) for a non-null source, and an
+/// outer join's NULLIFY nullifies the rowid exactly as it would the column.
+/// Floors are count-specific (pure ride savings, zero materialize cost):
+/// value = width − rowid_width >= 2 B/row, walk boundaries >= 2 (the
+/// validation shape rides 3; same-pipeline counts stay out).
+void try_install_count_only_deferral(op::scan::sirius_gpu_scan_operator* scan_op,
+                                     pinned_entry const& entry,
+                                     std::span<std::size_t const> selected_columns,
+                                     duckdb::vector<sirius::logical_type> const& types,
+                                     std::size_t scan_pos,
+                                     late_mat::planned_column_deferral const& fact,
+                                     bool has_static_filters)
+{
+  if (has_static_filters && !static_filters_only_on_pure_filter_columns(*scan_op)) {
+    SIRIUS_LOG_INFO(
+      "[late_mat] candidate REJECTED (count: static filter reads output columns): scan op {}",
+      scan_op->get_operator_id());
+    return;
+  }
+  std::unordered_map<std::size_t, std::size_t> positions{{scan_pos, scan_pos}};
+  auto stop = walk_to_materialization_port(scan_op, std::move(positions), types.size());
+  constexpr std::size_t kCountMinBoundaries = 2;
+  if (!stop || stop->boundaries < kCountMinBoundaries) {
+    SIRIUS_LOG_INFO(
+      "[late_mat] candidate REJECTED (count: walk refused or ride too short): scan op {}",
+      scan_op->get_operator_id());
+    return;
+  }
+  if (fact.consumer == nullptr) { return; }
+  auto const consumer_pipeline = fact.consumer->get_pipeline();
+  auto const stop_pipeline     = stop->consumer->get_pipeline();
+  if (!consumer_pipeline || !stop_pipeline ||
+      consumer_pipeline.get() != stop_pipeline.get()) {
+    SIRIUS_LOG_INFO(
+      "[late_mat] v2 plan/walk DISAGREEMENT (count shape): scan op {} column {}",
+      scan_op->get_operator_id(),
+      scan_pos);
+    return;
+  }
+  // Non-null gate: the resolver refuses nullable uncompressed sources;
+  // simpatico-compressed pin columns are non-null by encode construction.
+  late_mat::column_origin origin{entry.late_mat_handle,
+                                 static_cast<std::uint32_t>(selected_columns[scan_pos]),
+                                 entry.late_mat_handle->generation()};
+  if (!resolve_pinned_column(origin)) { return; }
+  auto const layout = resolve_pinned_layout(origin);
+  if (!layout || layout->batch_row_start.empty()) { return; }
+  bool const narrow =
+    layout->batch_row_start.back() <= static_cast<std::int64_t>(std::uint64_t{1} << 32);
+  auto const width =
+    pinned_column_width_bytes(entry, selected_columns[scan_pos], types[scan_pos]);
+  constexpr double kCountMinValue = 2.0;
+  double const value = width.value_or(0.0) - (narrow ? 4.0 : 8.0);
+  if (value < kCountMinValue) {
+    SIRIUS_LOG_INFO(
+      "[late_mat] candidate REJECTED (count value): scan op {} width={:.1f} value={:.1f} < {:.1f}",
+      scan_op->get_operator_id(),
+      width.value_or(0.0),
+      value,
+      kCountMinValue);
+    return;
+  }
+  auto directive              = std::make_shared<late_mat::deferred_scan_output>();
+  directive->output_positions = {scan_pos};
+  directive->narrow_rowid     = narrow;
+  directive->pre_filter       = has_static_filters;
+  SIRIUS_LOG_INFO(
+    "[late_mat] deferral installed (count-on-deferred, no port): scan op {} -> consumer op {} "
+    "({}), column {} width={:.1f}, rowid={} bit, pre_filter={}, {} boundary(ies)",
+    scan_op->get_operator_id(),
+    stop->consumer->get_operator_id(),
+    stop->consumer->get_name(),
+    scan_pos,
+    width.value_or(0.0),
+    narrow ? 32 : 64,
+    has_static_filters,
+    stop->boundaries);
+  scan_op->late_mat_defer = std::move(directive);
+}
+
+/// Successful group-by-rowid ride extension: the port moves to the final
+/// consumer's input, past the pass-modeled aggregate pipeline(s).
+struct ride_extension {
+  op::sirius_physical_operator* consumer{nullptr};       // port owner at the final pipeline
+  op::sirius_physical_operator* producer_tail{nullptr};  // last op feeding that port
+  std::size_t extra_boundaries{0};
+  std::size_t group_by_stages{0};
+  std::string unique_key_name;
+};
+
+/// Admission + pipeline hop for the group-by-rowid transform. Returns nullopt
+/// on ANY unproven condition (the caller falls back to the sound stop-port
+/// install). Requirements per the design's bijection argument:
+///  - every stop-surviving candidate's fact rode through >=1 group-by to ONE
+///    shared final consumer beyond the stop pipeline, null-free;
+///  - a REAL-riding (non-deferred) column of the same origin with a pin-time
+///    proven-unique fact is a planned group key at every aggregate on the
+///    chain (rowid FD by planned keys ⇒ identical groups);
+///  - the pipeline hops from the stop to the final consumer pass the same
+///    single-producer checks the walk applies.
+std::optional<ride_extension> try_extend_group_ride(
+  op::scan::sirius_gpu_scan_operator* scan_op,
+  pinned_entry const& entry,
+  std::span<std::size_t const> selected_columns,
+  walk_stop const& stop)
+{
+  auto const& plan   = *scan_op->late_mat_plan;
+  auto stop_pipeline = stop.consumer->get_pipeline();
+  if (!stop_pipeline) { return std::nullopt; }
+  std::unordered_map<std::size_t, late_mat::planned_column_deferral const*> fact_by_pos;
+  for (auto const& f : plan.columns) {
+    fact_by_pos.emplace(f.scan_output_position, &f);
+  }
+  op::sirius_physical_operator* final_consumer                = nullptr;
+  std::vector<op::sirius_physical_operator*> const* key_chain = nullptr;
+  for (auto const& [scan_pos, port_pos] : stop.position_map) {
+    auto const it = fact_by_pos.find(scan_pos);
+    if (it == fact_by_pos.end()) { return std::nullopt; }
+    auto const* f = it->second;
+    if (f->consumer == nullptr || f->group_key_at.empty() || f->nullified_on_ride ||
+        f->consumed_as_count_only) {
+      return std::nullopt;
+    }
+    auto const fp = f->consumer->get_pipeline();
+    if (!fp || fp.get() == stop_pipeline.get()) { return std::nullopt; }
+    if (final_consumer == nullptr) {
+      final_consumer = f->consumer;
+      key_chain      = &f->group_key_at;
+    } else if (final_consumer != f->consumer) {
+      return std::nullopt;
+    }
+  }
+  if (final_consumer == nullptr || key_chain == nullptr) { return std::nullopt; }
+
+  // Uniqueness proof (census line emitted by the caller): a non-deferred
+  // column with a pin-proven-unique fact must be a group key at every ridden
+  // aggregate.
+  std::string unique_key_name;
+  bool proven = false;
+  for (auto const& f : plan.columns) {
+    if (stop.position_map.contains(f.scan_output_position)) { continue; }  // must ride REAL
+    if (f.group_key_at.empty()) { continue; }
+    bool covers = true;
+    for (auto* agg : *key_chain) {
+      if (std::ranges::find(f.group_key_at, agg) == f.group_key_at.end()) {
+        covers = false;
+        break;
+      }
+    }
+    if (!covers) { continue; }
+    if (f.scan_output_position >= selected_columns.size()) { continue; }
+    auto const entry_pos = selected_columns[f.scan_output_position];
+    if (std::ranges::find(entry.unique_columns, static_cast<std::uint32_t>(entry_pos)) ==
+        entry.unique_columns.end()) {
+      continue;
+    }
+    proven          = true;
+    unique_key_name = entry.cache_info.names[entry_pos];
+    break;
+  }
+  if (!proven) {
+    SIRIUS_LOG_INFO(
+      "[late_mat] group-by-rowid REFUSED (no pin-proven-unique group key rides real): scan op "
+      "{} — falling back to the pre-aggregate port",
+      scan_op->get_operator_id());
+    return std::nullopt;
+  }
+
+  // Hop pipelines to the final consumer with the walk's producer checks.
+  auto pipeline             = stop_pipeline;
+  auto const final_pipeline = final_consumer->get_pipeline();
+  if (!final_pipeline) { return std::nullopt; }
+  std::size_t extra_boundaries = 0;
+  for (int hops = 0; hops < 16; ++hops) {
+    auto const& next_ports = pipeline->get_next_ports_after_sink();
+    if (next_ports.size() != 1) { return std::nullopt; }
+    auto* next_op        = next_ports.front().next_operator;
+    auto const port_name = next_ports.front().next_operator_port_name;
+    if (next_op == nullptr) { return std::nullopt; }
+    auto* entered = next_op->get_port(port_name);
+    if (entered == nullptr || entered->src_pipeline.get() != pipeline.get()) {
+      return std::nullopt;
+    }
+    for (auto const other_id : next_op->get_port_ids()) {
+      if (other_id == port_name) { continue; }
+      auto* other = next_op->get_port(other_id);
+      if (other != nullptr && other->repo != nullptr && other->repo == entered->repo) {
+        return std::nullopt;
+      }
+    }
+    ++extra_boundaries;
+    auto next_pipeline = next_op->get_pipeline();
+    if (!next_pipeline) { return std::nullopt; }
+    if (next_pipeline.get() == final_pipeline.get()) {
+      ride_extension ride;
+      ride.consumer      = next_op;  // the port owner (first op of the final pipeline)
+      ride.producer_tail = pipeline->get_operators().empty()
+                             ? nullptr
+                             : &pipeline->get_operators().back().get();
+      ride.extra_boundaries = extra_boundaries;
+      ride.group_by_stages  = key_chain->size();
+      ride.unique_key_name  = unique_key_name;
+      if (ride.producer_tail == nullptr) { return std::nullopt; }
+      return ride;
+    }
+    pipeline = next_pipeline;
+  }
+  return std::nullopt;
+}
+
 }  // namespace
 
 void try_install_late_mat_deferral(op::scan::sirius_gpu_scan_operator* scan_op,
@@ -388,7 +641,12 @@ void try_install_late_mat_deferral(op::scan::sirius_gpu_scan_operator* scan_op,
 {
   if (!late_mat::late_mat_enabled() || !defer_enabled()) { return; }
   if (scan_op == nullptr || !entry.late_mat_handle) { return; }
-  if (scan_has_static_filters(*scan_op)) { return; }
+  bool const has_static_filters = scan_has_static_filters(*scan_op);
+  // v1 refuses static filters outright; v2 defers the decision — the
+  // count-on-deferred shape may substitute PRE-filter when the filter provably
+  // never reads a deferred position (checked below). The normal bundle path
+  // still refuses further down.
+  if (!late_mat::late_mat_v2_enabled() && has_static_filters) { return; }
 
   // Compressed origins ride the wave-seam capture; hold them behind their own
   // gate until the wave-seam capture is live (a stamped scan whose fused batch lacks a
@@ -409,9 +667,122 @@ void try_install_late_mat_deferral(op::scan::sirius_gpu_scan_operator* scan_op,
   }
   if (positions.empty()) { return; }
 
+  // v2 (SIRIUS_EXP_LATE_MAT_V2): the planner's lifetime facts are the
+  // authoritative CANDIDACY source — keep only columns the plan pass proved
+  // are pure pass-throughs up to a recorded consumer. The pipeline walk below
+  // still runs in full as the lowering/verification backend, and every
+  // value/arbitration policy and runtime guard applies unchanged.
+  std::unordered_map<std::size_t, late_mat::planned_column_deferral const*> planned_consumers;
+  if (late_mat::late_mat_v2_enabled()) {
+    if (!scan_op->late_mat_plan) {
+      SIRIUS_LOG_INFO(
+        "[late_mat] candidate REJECTED (v2: no plan annotation): scan op {} — lifetime pass "
+        "recorded no deferrable column",
+        scan_op->get_operator_id());
+      return;
+    }
+    // Partition the facts: count-only candidates (NULL-extended rides are
+    // sound here — COUNT_VALID counts the positionally-preserved null-ness)
+    // vs normal-bundle candidacy (must be null-free: the port materializer
+    // refuses NULL rowids by design).
+    late_mat::planned_column_deferral const* count_fact = nullptr;
+    std::size_t count_facts                             = 0;
+    bool other_bundle_potential                         = false;
+    for (auto const& fact : scan_op->late_mat_plan->columns) {
+      if (fact.consumer == nullptr || !positions.contains(fact.scan_output_position)) {
+        continue;
+      }
+      if (fact.consumed_as_count_only) {
+        count_fact = &fact;
+        ++count_facts;
+        continue;
+      }
+      if (!fact.nullified_on_ride) {
+        planned_consumers.emplace(fact.scan_output_position, &fact);
+        // A fact whose consumer is a path join is key/expression-consumed en
+        // route — the walk key-drops it, so it can never form a port bundle.
+        if (fact.consumer->type != op::SiriusPhysicalOperatorType::HASH_JOIN) {
+          other_bundle_potential = true;
+        }
+      }
+    }
+    // v2 count-on-deferred (no-port shape): exactly one count-only candidate
+    // and nothing else that could form a (wider, precedence-winning) normal
+    // bundle. The rowid IS the counted value — non-null source ⇒ identical
+    // count; an outer join's NULLIFY nullifies it exactly as it would the
+    // column.
+    if (count_facts == 1 && !other_bundle_potential && count_on_deferred_enabled()) {
+      try_install_count_only_deferral(scan_op,
+                                      entry,
+                                      selected_columns,
+                                      types,
+                                      count_fact->scan_output_position,
+                                      *count_fact,
+                                      has_static_filters);
+      return;
+    }
+    for (auto it = positions.begin(); it != positions.end();) {
+      it = planned_consumers.contains(it->first) ? std::next(it) : positions.erase(it);
+    }
+    if (positions.empty()) {
+      SIRIUS_LOG_INFO(
+        "[late_mat] candidate REJECTED (v2: no type-eligible column with a lifetime fact): "
+        "scan op {}",
+        scan_op->get_operator_id());
+      return;
+    }
+  }
+  if (has_static_filters) {
+    // Census visibility: every refusal on the normal-bundle path logs a line.
+    SIRIUS_LOG_INFO(
+      "[late_mat] candidate REJECTED (static filters on scan op {} — normal-bundle path)",
+      scan_op->get_operator_id());
+    return;
+  }
+
   auto stop = walk_to_materialization_port(scan_op, positions, types.size());
-  if (!stop || stop->boundaries < min_boundaries()) { return; }
+  // (positions was moved; candidate identity continues via stop->position_map.)
+  if (!stop || stop->boundaries < min_boundaries()) {
+    // Census visibility for formerly-silent walk refusals — v2-gated so the
+    // banked v1 census line set stays byte-comparable.
+    if (late_mat::late_mat_v2_enabled()) {
+      SIRIUS_LOG_INFO(
+        "[late_mat] candidate REJECTED (walk refused or ride shorter than {} boundaries): "
+        "scan op {}",
+        min_boundaries(),
+        scan_op->get_operator_id());
+    }
+    return;
+  }
   if (scan_op->late_mat_defer) { return; }
+
+  // v2 group-by-rowid ride extension: when every stop-surviving candidate's
+  // fact rode THROUGH the stop pipeline's group-by(s) to one shared final
+  // consumer, move the materialization port past the aggregates (per-output-
+  // group materialization). Admission needs the pin-time uniqueness proof; on
+  // any refusal the bundle FALLS BACK to the stop-port install — early
+  // materialization is always sound for a rode-through fact, so the banked
+  // pre-aggregate behavior is preserved.
+  op::sirius_physical_operator* target_consumer = stop->consumer;
+  op::sirius_physical_operator* target_tail     = stop->producer_tail;
+  std::size_t ride_boundaries                   = 0;
+  bool group_ride                               = false;
+  if (late_mat::late_mat_v2_enabled() && scan_op->late_mat_plan) {
+    if (auto ride = try_extend_group_ride(scan_op, entry, selected_columns, *stop)) {
+      target_consumer = ride->consumer;
+      target_tail     = ride->producer_tail;
+      ride_boundaries = ride->extra_boundaries;
+      group_ride      = true;
+      SIRIUS_LOG_INFO(
+        "[late_mat] group-by-rowid ride: scan op {} -> final consumer op {} ({}), through {} "
+        "group-by stage(s), unique key '{}' proof=pin-exact",
+        scan_op->get_operator_id(),
+        target_consumer->get_operator_id(),
+        target_consumer->get_name(),
+        ride->group_by_stages,
+        ride->unique_key_name);
+    }
+  }
 
   // Resolve each surviving candidate's origin; drop what the resolver refuses
   // (nullable columns, unsupported storage). Sort by PORT position — the port
@@ -428,6 +799,31 @@ void try_install_late_mat_deferral(op::scan::sirius_gpu_scan_operator* scan_op,
   std::optional<late_mat::pinned_table_layout> layout;
   for (auto const& [scan_pos, port_pos] : stop->position_map) {
     if (scan_pos >= selected_columns.size()) { continue; }
+    // v2 verification: the walk's stop pipeline must contain the planner's
+    // recorded consumer for this column — a disagreement means one of the two
+    // analyses mis-modeled the plan, so the candidate fails closed.
+    std::size_t use_port_pos = port_pos;
+    if (!planned_consumers.empty()) {
+      auto const planned = planned_consumers.find(scan_pos);
+      if (planned == planned_consumers.end()) { continue; }
+      auto const* fact             = planned->second;
+      auto const consumer_pipeline = fact->consumer->get_pipeline();
+      auto const stop_pipeline     = stop->consumer->get_pipeline();
+      bool const same_pipeline     = consumer_pipeline && stop_pipeline &&
+                                 consumer_pipeline.get() == stop_pipeline.get();
+      // A fact that rode through the stop pipeline's group-by(s) is accepted
+      // beyond it: materializing at the stop port is early-but-sound, and the
+      // ride extension (when admitted) moves the port to the final consumer.
+      if (!same_pipeline && fact->group_key_at.empty()) {
+        SIRIUS_LOG_INFO(
+          "[late_mat] v2 plan/walk DISAGREEMENT: scan op {} column {} — planned consumer's "
+          "pipeline differs from the walk's stop pipeline; dropping candidate",
+          scan_op->get_operator_id(),
+          scan_pos);
+        continue;
+      }
+      if (group_ride) { use_port_pos = fact->final_position; }
+    }
     // Priceable-or-dropped: the value threshold below needs a REAL width
     // (measured: the earlier proxy rules installed eight losers); a column we cannot
     // price from pin metadata does not defer.
@@ -442,7 +838,7 @@ void try_install_late_mat_deferral(op::scan::sirius_gpu_scan_operator* scan_op,
       layout = resolve_pinned_layout(origin);
       if (!layout) { return; }
     }
-    resolved.push_back({scan_pos, port_pos, *width, std::move(origin), std::move(*view)});
+    resolved.push_back({scan_pos, use_port_pos, *width, std::move(origin), std::move(*view)});
   }
   if (resolved.empty()) { return; }
   std::ranges::sort(resolved, {}, &resolved_candidate::port_pos);
@@ -478,7 +874,7 @@ void try_install_late_mat_deferral(op::scan::sirius_gpu_scan_operator* scan_op,
   // plan-time, pre-execution and single-threaded, so an eviction atomically
   // clears the loser's scan-side directive — a 25-row dimension string can
   // never lock out a payload bundle again.
-  if (auto const& incumbent = stop->consumer->late_mat_port_directive) {
+  if (auto const& incumbent = target_consumer->late_mat_port_directive) {
     if (incumbent->bundle_value_bytes >= bundle_value) {
       SIRIUS_LOG_INFO(
         "[late_mat] candidate REJECTED (arbitration): scan op {} value={:.1f} <= incumbent "
@@ -486,21 +882,21 @@ void try_install_late_mat_deferral(op::scan::sirius_gpu_scan_operator* scan_op,
         scan_op->get_operator_id(),
         bundle_value,
         incumbent->bundle_value_bytes,
-        stop->consumer->get_operator_id(),
-        stop->consumer->get_name());
+        target_consumer->get_operator_id(),
+        target_consumer->get_name());
       return;
     }
     SIRIUS_LOG_INFO(
       "[late_mat] arbitration EVICTION at consumer op {} ({}): incumbent scan op {} "
       "(value={:.1f}) replaced by scan op {} (value={:.1f})",
-      stop->consumer->get_operator_id(),
-      stop->consumer->get_name(),
+      target_consumer->get_operator_id(),
+      target_consumer->get_name(),
       incumbent->source_scan ? incumbent->source_scan->get_operator_id() : 0,
       incumbent->bundle_value_bytes,
       scan_op->get_operator_id(),
       bundle_value);
     if (incumbent->source_scan != nullptr) { incumbent->source_scan->late_mat_defer.reset(); }
-    stop->consumer->late_mat_port_directive.reset();
+    target_consumer->late_mat_port_directive.reset();
   }
 
   // Install the pair.
@@ -520,19 +916,23 @@ void try_install_late_mat_deferral(op::scan::sirius_gpu_scan_operator* scan_op,
   // arity disagreement with the walk, untranslatable type) refuses the
   // install — the matcher must never run on a partial schema.
   std::vector<cudf::type_id> expected_types;
-  if (stop->producer_tail == nullptr) { return; }
+  if (target_tail == nullptr) { return; }
+  std::size_t target_arity = 0;
   {
-    auto const& tail_types = stop->producer_tail->get_types();
-    if (tail_types.size() != stop->port_arity) {
+    auto const& tail_types = target_tail->get_types();
+    // The walk's arity crosscheck applies at ITS stop port; a group ride's
+    // port schema is the (pass-modeled) final producer tail's planned types.
+    if (!group_ride && tail_types.size() != stop->port_arity) {
       SIRIUS_LOG_INFO(
         "[late_mat] candidate REJECTED (schema): scan op {} -> consumer op {}: producer tail "
         "arity {} != walk arity {}",
         scan_op->get_operator_id(),
-        stop->consumer->get_operator_id(),
+        target_consumer->get_operator_id(),
         tail_types.size(),
         stop->port_arity);
       return;
     }
+    target_arity = tail_types.size();
     expected_types.reserve(tail_types.size());
     try {
       for (auto const& lt : tail_types) {
@@ -544,7 +944,7 @@ void try_install_late_mat_deferral(op::scan::sirius_gpu_scan_operator* scan_op,
   }
 
   auto port_directive               = std::make_shared<late_mat::port_materialize_directive>();
-  port_directive->expected_arity    = stop->port_arity;
+  port_directive->expected_arity    = target_arity;
   port_directive->layout            = std::move(*layout);
   port_directive->bundle_value_bytes = bundle_value;
   port_directive->source_scan        = scan_op;
@@ -569,16 +969,16 @@ void try_install_late_mat_deferral(op::scan::sirius_gpu_scan_operator* scan_op,
     "[late_mat] deferral installed: scan op {} -> consumer op {} ({}), {} column(s), {} "
     "boundary(ies), rowid at scan pos {} / port pos {}, sum_width={:.1f} B/row, value={:.1f}",
     scan_op->get_operator_id(),
-    stop->consumer->get_operator_id(),
-    stop->consumer->get_name(),
+    target_consumer->get_operator_id(),
+    target_consumer->get_name(),
     resolved.size(),
-    stop->boundaries,
+    stop->boundaries + ride_boundaries,
     rowid_scan_pos,
     port_directive->rowid_position,
     total_width,
     bundle_value);
 
-  stop->consumer->late_mat_port_directive = std::move(port_directive);
+  target_consumer->late_mat_port_directive = std::move(port_directive);
   scan_op->late_mat_defer                 = std::move(scan_directive);
 }
 

@@ -52,6 +52,15 @@ namespace sirius::late_mat {
 /// positions (== materialized slots, the materialized-order mapping invariant).
 struct deferred_scan_output {
   std::vector<std::size_t> output_positions;  ///< ascending; front() carries the rowid
+  /// v2 count-on-deferred: emit the rowid as UINT32 (pinned rows < 2^32) —
+  /// the counted ride never materializes, so the narrow width is pure ride
+  /// savings. v1 and every port-materialized bundle stay UINT64.
+  bool narrow_rowid{false};
+  /// v2 count-on-deferred under a static scan filter: substitute BEFORE
+  /// post_filter_and_project (view-splice; the filter then compacts the
+  /// rowid column with the batch), valid because the policy proved the
+  /// filter references no deferred position.
+  bool pre_filter{false};
   [[nodiscard]] std::size_t rowid_position() const { return output_positions.front(); }
 };
 

@@ -1371,7 +1371,8 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
                                       std::move(host_result.chunks),
                                       *representative_host_space,
                                       std::move(pinned_column_types),
-                                      std::move(host_result.chunk_stats));
+                                      std::move(host_result.chunk_stats),
+                                      std::move(host_result.unique_columns));
     if (data.args.format == "duckdb") {
       sirius::scan_manager::duckdb_mvcc_metadata mvcc;
       mvcc.v_base                   = duckdb_pin_v_base;
@@ -1386,8 +1387,11 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
     auto dev_result = sirius::materialize_all_batches_compressed(
       *ingestible, gpu_spaces_mut, *scan_mgr.io_ctx(), pin_comp);
 
-    scan_mgr.insert_pinned_entry_device(
-      data.args.name, std::move(cache_info), std::move(dev_result.chunks), *gpu_spaces_mut[0]);
+    scan_mgr.insert_pinned_entry_device(data.args.name,
+                                        std::move(cache_info),
+                                        std::move(dev_result.chunks),
+                                        *gpu_spaces_mut[0],
+                                        std::move(dev_result.unique_columns));
     if (data.args.format == "duckdb") {
       sirius::scan_manager::duckdb_mvcc_metadata mvcc;
       mvcc.v_base                   = duckdb_pin_v_base;
@@ -1405,7 +1409,8 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
                                  std::move(mat.tables),
                                  std::move(mat.chunk_memory_spaces),
                                  std::move(pinned_column_types),
-                                 std::move(mat.chunk_stats));
+                                 std::move(mat.chunk_stats),
+                                 std::move(mat.unique_columns));
     if (data.args.format == "duckdb") {
       sirius::scan_manager::duckdb_mvcc_metadata mvcc;
       mvcc.v_base                   = duckdb_pin_v_base;

@@ -702,3 +702,81 @@ also unlocks group-by-rowid under a PK proof, q10 v2 60–130 ms band); **K6s
 survivor-offsets** (sparse string decode GPU roundtrip); **multi-batch uncompressed
 fast path** (the no-sort raw-gather path currently canonicalizes when an
 uncompressed origin spans >1 pinned batch).
+
+### Session 4b (2026-08-04) — late-mat v2: group-by-rowid — **suite 6.677 s, all-time
+### best; q10 −42.8%; campaign 15.99 → 6.677 = −58.2%**
+
+The v2 gate (`SIRIUS_EXP_LATE_MAT_V2`, rides inside the v1 gate) adds a planner-side
+column-lifetime pass and two operator extensions on the v1 rowid representation.
+Ship config after measurement: **group-by-rowid admit ON, count-on-deferred admit
+OFF** — one banked win, one kill, both by pre-registration.
+
+**Banked: q10 group-by-rowid = −198.6/−197.3 ms (0.4643/0.4628 → 0.2657/0.2655,
+−42.8%, pair agreement 1.3 ms), all 4 runs 22/22 byte-identical; suites 6.875→6.677
+/ 6.870→6.679.** Mechanism: when a pin-proven-unique column of the origin table
+(c_custkey) is in the group-key set, the deferred bundle's rowid becomes a group key
+and the five customer payload columns (158.9 B/row) leave the key set — the v1
+deferral, which stopped at the final join's port, now rides through HASH_GROUP_BY →
+PARTITION → MERGE_GROUP_BY → TOP_N to MERGE_TOP_N (9 boundaries) and materializes at
+**20 rows** instead of 44.53 M. Both group-by phases hash 4 B rowids instead of
+~130 B of ~unique strings (the dict-encode heuristic never fires there — NDV/rows
+≈ 1 — so classic row-hashed raw c_comment/c_address at both phases plus two
+approx_distinct_count passes). Groups are bijective with the classic key set, so
+results are byte-identical after final materialization + sort — byte-identity ×4 is
+the bijectivity proof, not just a correctness formality. Non-q10 residual across
+both pairs: +0.9/+6.2 ms (neutral). Chained to gate-off through the v1 bank
+(−33..−64, N=4): **the full late-mat gate is worth ≈ −245 ms ≈ −3.5% vs gate-off**
+(cross-binary absolute check: off mean 6.913 → v2-on mean 6.678 = −235 ms).
+
+Above-band note (both q10 results landed past their band tops, same reason): the
+pre-registered band was −60..−130 vs a measured −198. R1 had priced the string-key
+group compute at +10–30 ms against its own 262 NVTX range-ms/iter ceiling (HGB 132 +
+MGB 130), discounted for fan-out caution; the measured win puts the true compute
+term at ~125–165 ms, near the ceiling. Session lesson: the impact bands built from
+"NVTX as ceilings" and 1r+1w partition pricing were honest floors — twice the
+delivered win was the model's conservative tail.
+
+The uniqueness proof is pin-time and cheap: a sortedness probe with an
+**exact-distinct-count fallback** (cudf) — c_custkey proven on 150,000,000 rows in
+**4 ms**; all probed columns ≤ 26 ms; a single-column row-count bound skips
+6 B-row lineitem columns; unproven keys refuse and fall back to the v1
+pre-aggregate port (q10's nation candidate did exactly that: REFUSED → normal-bundle
+path → value-rejected 5.8 < 32 B — the guard chain, exercised in production).
+Columns to probe come from `SIRIUS_LATE_MAT_PIN_UNIQUE_COLS`.
+
+**Killed: q13 count-on-deferred** (count(o_orderkey) → count over a 4 B rowid,
+census-verified live with rowid=32bit — R1's width assumption honored). Disambig at
+N=4 interleaved pairs, all 22/22: **−3.6 / −12.0 / +4.7 / −0.7 ms, pooled mean −2.9**
+vs band −16..−32 — fails the pre-registered bank rule (mean ≤ −8; no pair > +3) on
+both prongs. The count ride saves real bytes but q13's wall is GPU_SCAN-dominant;
+noise. Admit default-off (`SIRIUS_LATE_MAT_COUNT_DEFER`); the machinery
+(outer-join-aware lifetime modeling, pre-filter substitution) stays in-tree,
+unit-proven, for count-heavy non-TPC-H shapes.
+
+Also shipped en route: the planner lifetime pass at census parity (v1-vs-v2 installs
+byte-identical on the parity run, every rejection now logged with its reason — the
+silent-refusal class that cost an attribution round in Session 4 is closed).
+Skipped, with rationale: **K6s survivor-offsets GPU roundtrip** — render/launcher/
+dispatch landed and unit-covered, but no banked win ever exercised sparse string
+decode (the winners used uncompressed gathers or no materialization at all), so the
+str_split-harness roundtrip test stays on the shelf rather than blocking the close.
+
+Knobs (v2 final): `SIRIUS_EXP_LATE_MAT_V2` (ships ON where the v1 gate is on);
+`SIRIUS_LATE_MAT_PIN_UNIQUE_COLS` (probe list, pin-time, ≤26 ms/col);
+`SIRIUS_LATE_MAT_COUNT_DEFER=0` default (killed on TPC-H);
+v1 knobs unchanged (MIN_VALUE_BYTES=32, MIN_VALUE_COMPRESSED=32, MASK_SEL=1.0,
+DENSE_SEL=0.35, MIN_BOUNDARIES=4, COMPRESSED=off).
+
+v3 shelf, pre-sized where possible: **GBR generalization** — FD/composite-key proofs
+beyond single-column PK, and multi-origin group keys (q10 needed only c_custkey; a
+q3-class (custkey, orderdate, shippriority) key set needs the FD argument);
+**wide-compressed-bundle D2** for workloads where a compressed origin's deferred set
+is wide AND the ride thins (the Session-4 kill was TPC-H-shape-specific, the
+machinery is live behind the knob); **multi-batch uncompressed fast path** (the
+no-sort gather currently canonicalizes when an uncompressed origin spans >1 pinned
+batch); **K6s roundtrip test** (str_split harness); **count-on-deferred re-entry**
+only on a workload whose count query is not scan-dominant.
+
+Single-binary closure (ship binary, one run): gate-off 6.912 s 22/22 (q10 0.5111) →
+v2-on 6.677/6.679 = **−234 ms (−3.4%) on the identical binary** — also the W6
+reservation-guard neutrality gate (guard present, byte-identical, in-band).

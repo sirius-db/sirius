@@ -8,6 +8,7 @@
 // restoration.
 
 #include "late_materializer.hpp"
+#include "rowid_emission.hpp"  // late_mat_v2_enabled (single v2-gate reader)
 
 #include "api/simpatico_codegen.hpp"
 #include "codegen/plan/row_decode.hpp"
@@ -17,6 +18,7 @@
 #include <cudf/concatenate.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/table/table_view.hpp>
+#include <cudf/utilities/traits.hpp>
 
 #include <cuda_runtime.h>
 
@@ -282,15 +284,26 @@ std::shared_ptr<prepared_selection> prepare_selection_impl(pinned_table_layout c
   // NO host sync at prepare. Compressed consumers canonicalize lazily
   // (prepared_selection::canonical). The list is BORROWED per the
   // row_id_list lifetime contract.
-  if (allow_raw && layout.batch_rows.size() == 1) {
+  // SIRIUS_EXP_LATE_MAT_V2: multi-batch layouts also stay raw — uncompressed
+  // fixed-width columns take the one-pass multi-source gather at materialize
+  // (no sort, no restore); strings/compressed columns canonicalize lazily
+  // exactly like the single-batch case. v1 behavior (eager canonical for B>1)
+  // is byte-preserved with the sub-gate off.
+  if (allow_raw && (layout.batch_rows.size() == 1 ||
+                    (late_mat_v2_enabled() && !layout.batch_rows.empty()))) {
     sel->raw_ids           = ids.ids;
     sel->raw_count         = ids.count;
     sel->raw_sorted_unique = ids.sorted_unique;
     sel->total_survivors   = ids.count;  // gather semantics: output rows = input ids
     sel->out_base          = {0, ids.count};
-    sel->batches.resize(1);
-    sel->batches[0].rows.num_rows       = layout.batch_rows[0];
-    sel->batches[0].rows.num_survivors  = ids.count;
+    // Per-batch survivor counts are unknown (and unneeded) in raw mode; the
+    // batch descriptors carry geometry only. batches[0].num_survivors keeps
+    // the v1 convention for the single-batch consumers.
+    sel->batches.resize(layout.batch_rows.size());
+    for (std::size_t k = 0; k < layout.batch_rows.size(); ++k) {
+      sel->batches[k].rows.num_rows = layout.batch_rows[k];
+    }
+    sel->batches[0].rows.num_survivors = ids.count;
     sel->batches[0].density =
       layout.batch_rows[0] > 0 ? static_cast<double>(ids.count) / layout.batch_rows[0] : 0.0;
     return sel;
@@ -466,21 +479,66 @@ std::unique_ptr<cudf::column> materialize(pinned_column_view const& origin,
   // canonical path below.
   if (sel.raw_ids != nullptr) {
     if (sel.raw_count == 0) { return cudf::make_empty_column(origin.dtype); }
-    auto const& src = origin.batches.front();
-    if (src.compressed == nullptr) {
-      if (src.uncompressed.null_count() != 0) {
-        fail("nullable columns are not supported (v1)");
+    if (origin.batches.size() == 1) {
+      auto const& src = origin.batches.front();
+      if (src.compressed == nullptr) {
+        if (src.uncompressed.null_count() != 0) {
+          fail("nullable columns are not supported (v1)");
+        }
+        // Zero-copy UINT64 gather-map view over the borrowed ids (cudf's
+        // index normalizer accepts any integral map type). DONT_CHECK: ids
+        // are pin-order positions inside this batch by the annotation
+        // contract.
+        cudf::column_view const map{cudf::data_type{cudf::type_id::UINT64},
+                                    static_cast<cudf::size_type>(sel.raw_count),
+                                    static_cast<void const*>(sel.raw_ids),
+                                    nullptr,
+                                    0};
+        return gather_one(src.uncompressed, map, stream, mr);
       }
-      // Zero-copy UINT64 gather-map view over the borrowed ids (cudf's
-      // index normalizer accepts any integral map type). DONT_CHECK: ids
-      // are pin-order positions inside this batch by the annotation
-      // contract.
-      cudf::column_view const map{cudf::data_type{cudf::type_id::UINT64},
-                                  static_cast<cudf::size_type>(sel.raw_count),
-                                  static_cast<void const*>(sel.raw_ids),
-                                  nullptr,
-                                  0};
-      return gather_one(src.uncompressed, map, stream, mr);
+      return materialize(origin, sel.canonical(stream, mr), stream, mr);
+    }
+    // Multi-batch raw (SIRIUS_EXP_LATE_MAT_V2): one-pass multi-source gather
+    // for ALL-UNCOMPRESSED fixed-width origins (no sort, no restore; per-
+    // element batch resolve against the B+1 row starts). Strings and
+    // compressed origins canonicalize lazily, like the single-batch fallback.
+    bool all_uncompressed = true;
+    for (auto const& b : origin.batches) {
+      if (b.compressed != nullptr) {
+        all_uncompressed = false;
+        break;
+      }
+    }
+    if (all_uncompressed && cudf::is_fixed_width(origin.dtype)) {
+      std::vector<void const*> bases;
+      bases.reserve(origin.batches.size());
+      for (std::size_t k = 0; k < origin.batches.size(); ++k) {
+        auto const& b = origin.batches[k];
+        if (b.uncompressed.null_count() != 0) {
+          fail("nullable columns are not supported (v1)");
+        }
+        if (b.num_rows != sel.layout.batch_rows[k]) { fail("origin batch row count drift"); }
+        bases.push_back(b.uncompressed.head<void>());
+      }
+      // Tiny per-call H2D uploads (B pointers + B+1 starts), stream-ordered.
+      rmm::device_buffer bases_dev(bases.data(), bases.size() * sizeof(void*), stream, mr);
+      rmm::device_buffer starts_dev(sel.layout.batch_row_start.data(),
+                                    sel.layout.batch_row_start.size() * sizeof(std::int64_t),
+                                    stream, mr);
+      auto out = cudf::make_fixed_width_column(origin.dtype,
+                                               static_cast<cudf::size_type>(sel.raw_count),
+                                               cudf::mask_state::UNALLOCATED, stream, mr);
+      sirius::codegen::multi_source_gather_fixed(
+        static_cast<void const* const*>(bases_dev.data()),
+        static_cast<std::int64_t const*>(starts_dev.data()),
+        static_cast<std::int32_t>(origin.batches.size()),
+        cudf::size_of(origin.dtype),
+        sel.raw_ids,
+        sel.raw_count,
+        out->mutable_view().head<void>(),
+        stream);
+      // bases_dev/starts_dev free stream-ordered after the kernel — safe.
+      return out;
     }
     return materialize(origin, sel.canonical(stream, mr), stream, mr);
   }

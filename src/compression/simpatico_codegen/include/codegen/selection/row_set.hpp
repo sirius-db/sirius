@@ -174,6 +174,27 @@ void global_slice_to_local(std::uint64_t const* ids,
                            std::uint32_t* out_local,
                            rmm::cuda_stream_view stream);
 
+// ── Multi-source raw gather (SIRIUS_EXP_LATE_MAT_V2; latemat_rowset.cu) ─────
+// One-pass gather from B per-batch base pointers by GLOBAL pin-order id: for
+// each element, binary-search the batch (row_start, B+1 exclusive starts —
+// B is small, the array stays cache-resident) and copy elem_size bytes from
+// bases[b] + (id - row_start[b])*elem_size. Caller order preserved,
+// duplicates and disorder fine (gather semantics), NO sort/restore — this is
+// what replaces the canonical u64 sort for multi-batch UNCOMPRESSED
+// fixed-width origins (~130-190 B/row of sort traffic -> S*(elem_size+8)
+// bytes). elem_size in {1,2,4,8,16}. `bases`/`row_start` are DEVICE arrays
+// (upload once per call; a few hundred bytes). Ids must be valid pin-order
+// positions (same DONT_CHECK contract as the single-batch raw gather).
+// Asynchronous on `stream`.
+void multi_source_gather_fixed(void const* const* bases_dev,
+                               std::int64_t const* row_start_dev,
+                               std::int32_t num_batches,
+                               std::size_t elem_size,
+                               std::uint64_t const* ids,
+                               std::int64_t count,
+                               void* out,
+                               rmm::cuda_stream_view stream);
+
 // Expand a chunk-CSR into fused-format selection-mask words +
 // per-ALL-chunks exclusive survivor offsets (the shipped K3/CNT shape):
 // mask_words must hold selection_mask::WordsFor(num_rows) words and is

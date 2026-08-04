@@ -229,7 +229,8 @@ add_codegen_host_test(test_late_mat_row_decode)
 # Fast-path coverage: compile the extension-side late materializer into the
 # row-decode test (its headers need only src/include + src + this include dir).
 target_sources(test_late_mat_row_decode
-               PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../late_mat/late_materializer.cpp)
+               PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../late_mat/late_materializer.cpp
+                       ${CMAKE_CURRENT_SOURCE_DIR}/../../late_mat/rowid_emission.cpp)
 target_include_directories(test_late_mat_row_decode
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../include
                                    ${CMAKE_CURRENT_SOURCE_DIR}/../..)

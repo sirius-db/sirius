@@ -33,6 +33,7 @@ class sirius_scan_manager;
 
 namespace sirius::late_mat {
 struct deferred_scan_output;  // late_mat/defer_directive.hpp
+struct planned_deferral;      // late_mat/plan_deferral.hpp
 }  // namespace sirius::late_mat
 
 namespace sirius::op {
@@ -134,6 +135,11 @@ class sirius_gpu_scan_operator : public sirius_physical_operator {
   /// output positions with a UINT64 pin-order rowid column (first position)
   /// and INT8 placeholders (the rest). Empty when the gate is off.
   std::shared_ptr<const late_mat::deferred_scan_output> late_mat_defer;
+
+  /// v2 planner annotation (SIRIUS_EXP_LATE_MAT_V2): per-output-column
+  /// lifetime facts from the plan-time pass. Read by the lowering backend at
+  /// query prepare; empty when the sub-gate is off.
+  std::shared_ptr<const late_mat::planned_deferral> late_mat_plan;
 
  private:
   std::shared_ptr<gpu_ingestible> _ingestible;

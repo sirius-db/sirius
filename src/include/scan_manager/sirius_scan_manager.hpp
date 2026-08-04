@@ -217,6 +217,13 @@ struct pinned_entry {
   /// mutates the entry). Gate off ⇒ always empty — one inert shared_ptr per
   /// pinned TABLE, the only off-gate footprint on this struct.
   std::shared_ptr<late_mat::pin_entry_handle> late_mat_handle;
+  /// Late-mat uniqueness facts: entry positions (into cache_info.column_ids)
+  /// PROVEN unique at pin time by the opt-in exact check
+  /// (SIRIUS_LATE_MAT_PIN_UNIQUE_COLS — per-chunk sorted+distinct with strict
+  /// cross-chunk boundaries; approximate counts are never recorded). Consumed
+  /// by the group-by-rowid admission; absence means "unknown", never
+  /// "not unique". Empty unless the pin captured facts.
+  std::vector<std::uint32_t> unique_columns;
 };
 
 /// Validate that @p entry can serve @p selected_columns (positions into
@@ -420,7 +427,8 @@ class sirius_scan_manager {
     std::vector<std::unique_ptr<cudf::table>> data_tables,
     std::vector<cucascade::memory::memory_space*> chunk_memory_spaces,
     duckdb::vector<duckdb::LogicalType> column_types                                 = {},
-    std::vector<std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>>> chunk_stats = {});
+    std::vector<std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>>> chunk_stats = {},
+    std::vector<std::uint32_t> unique_columns                                        = {});
 
   /// \brief Pin the host-tier entry for a table.
   ///
@@ -455,7 +463,8 @@ class sirius_scan_manager {
     std::vector<std::shared_ptr<cucascade::idata_representation>> host_chunks,
     cucascade::memory::memory_space& memory_space,
     duckdb::vector<duckdb::LogicalType> column_types                                 = {},
-    std::vector<std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>>> chunk_stats = {});
+    std::vector<std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>>> chunk_stats = {},
+    std::vector<std::uint32_t> unique_columns                                        = {});
 
   /// \brief Pin the entry for a table on the GPU tier from a compression-enabled pin.
   ///
@@ -474,7 +483,8 @@ class sirius_scan_manager {
   void insert_pinned_entry_device(const std::string& name,
                                   cache_entry_info cache_info,
                                   std::vector<sirius::device_pin_chunk> chunks,
-                                  cucascade::memory::memory_space& memory_space);
+                                  cucascade::memory::memory_space& memory_space,
+                                  std::vector<std::uint32_t> unique_columns = {});
 
   /// \brief Attach MVCC snapshot metadata to the pinned entry for @p name.
   ///

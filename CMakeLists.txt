@@ -225,6 +225,7 @@ set(EXTENSION_SOURCES
     src/compression/compression_converters.cpp
     src/compression/plan_register.cpp
     src/late_mat/late_materializer.cpp
+    src/late_mat/rowid_emission.cpp
     src/config.cpp
     src/helper/type_conversions.cpp
     src/debug_utils.cpp
@@ -349,6 +350,7 @@ set(EXTENSION_SOURCES
     src/planner/duckdb_join_filter_candidate_adapter.cpp
     src/planner/query.cpp
     src/planner/query_index.cpp
+    src/planner/late_mat_plan_pass.cpp
     src/planner/sirius_physical_plan_generator.cpp
     src/planner/sirius_plan_aggregate.cpp
     src/planner/sirius_plan_column_data_get.cpp
