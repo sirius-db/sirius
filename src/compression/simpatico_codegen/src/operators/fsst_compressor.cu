@@ -202,7 +202,7 @@ std::unique_ptr<compressed_representation> fsst_compressor::compress(
   stream.synchronize();
 
   return std::make_unique<fsst_compressed_representation>(
-    dt, n_rows, std::move(payload), payload_bytes, bytes);
+    dt, n_rows, std::move(payload), payload_bytes, bytes, /*widen=*/true);
 }
 
 std::unique_ptr<cudf::column> fsst_compressed_representation::decompress(
