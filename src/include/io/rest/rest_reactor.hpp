@@ -62,6 +62,15 @@ struct footer_probe {
   std::size_t object_size{0};
   std::size_t window_lo{0};
   std::shared_ptr<const std::vector<std::uint8_t>> bytes;
+  // ETag from the verified 206, quotes preserved; empty otherwise.
+  std::string etag;
+};
+
+/// Result of a blocking HEAD: the object's size plus its ETag when the server
+/// sent one (quotes preserved, empty otherwise).
+struct head_object_result {
+  std::size_t object_size{0};
+  std::string etag;
 };
 
 // ---------------------------------------------------------------------------
@@ -271,15 +280,15 @@ class rest_reactor {
   /// Synchronous buffered host read (blocking ranged GET).  Blocks the caller.
   size_t host_read(const io_object_type& file, size_t offset, size_t size, uint8_t* dst);
 
-  /// Blocking HEAD to discover an object's size.  Used by the ioctx to build
-  /// an @c rest_io_object.  @p bucket / @p key identify the object.
-  size_t head_object_size(std::string_view bucket, std::string_view key);
+  /// Blocking HEAD to discover an object's size and ETag.  Used by the ioctx to
+  /// build an @c rest_io_object.  @p bucket / @p key identify the object.
+  head_object_result head_object_size(std::string_view bucket, std::string_view key);
 
   /// Blocking suffix-range GET of the last @p n bytes of an object, resolving
   /// the size and stashing the parquet footer in a single round-trip.  On a
   /// well-formed 206 the returned @c footer_probe carries the object size, the
-  /// window origin, and the trailing bytes; on any unusable response (200 full
-  /// body, missing / unsatisfied Content-Range) @c bytes is null so the caller
+  /// window origin, the trailing bytes, and the ETag; on any unusable response
+  /// (200 full body, missing / unsatisfied Content-Range) @c bytes is null so the caller
   /// falls back to a HEAD.  @p bucket / @p key identify the object.
   footer_probe fetch_footer_suffix(std::string_view bucket, std::string_view key, std::size_t n);
 

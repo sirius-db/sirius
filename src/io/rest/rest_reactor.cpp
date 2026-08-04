@@ -143,10 +143,39 @@ size_t capture_header(char* buffer, size_t size, size_t nitems, void* userdata)
   return bytes;
 }
 
+/// True iff @p line is an HTTP status line ("HTTP/..."), i.e. the start of a
+/// (possibly interim) response's header block within one transfer.
+bool is_http_status_line(std::string_view line) noexcept
+{
+  return line.size() >= 5 && ascii_lower(line[0]) == 'h' && ascii_lower(line[1]) == 't' &&
+         ascii_lower(line[2]) == 't' && ascii_lower(line[3]) == 'p' && line[4] == '/';
+}
+
+/// Per-attempt capture for the blocking HEAD: Retry-After for backoff plus the
+/// object's ETag.  Separate from @c header_capture so the async data-GET path
+/// parses nothing it does not consume.  The ETag resets on every status line,
+/// so interim responses (proxy CONNECT) within one transfer leave no residue.
+struct head_capture {
+  std::string retry_after;
+  std::string etag;
+};
+
+size_t head_header_cb(char* buffer, size_t size, size_t nitems, void* userdata)
+{
+  auto* hc           = static_cast<head_capture*>(userdata);
+  size_t const bytes = size * nitems;
+  std::string_view const line(buffer, bytes);
+  if (is_http_status_line(line)) { hc->etag.clear(); }
+  if (auto v = match_header(line, "etag"); !v.empty()) { hc->etag = std::move(v); }
+  if (auto v = match_header(line, "retry-after"); !v.empty()) { hc->retry_after = std::move(v); }
+  return bytes;
+}
+
 /// Shared sink for a suffix-range footer probe: the header callback records the
-/// HTTP status (from the status line) plus Content-Range / Retry-After; the body
-/// callback consults @c status to abort a non-206 response before it streams a
-/// whole object into us.  @c HEADERDATA and @c WRITEDATA point at the same one.
+/// HTTP status (from the status line) plus Content-Range / Retry-After / ETag;
+/// the body callback consults @c status to abort a non-206 response before it
+/// streams a whole object into us.  @c HEADERDATA and @c WRITEDATA point at the
+/// same one.
 struct suffix_sink {
   std::vector<std::uint8_t> data;
   std::size_t cap{0};
@@ -154,18 +183,20 @@ struct suffix_sink {
   long status{0};
   std::string content_range;
   std::string retry_after;
+  std::string etag;
 };
 
 /// Header callback for a suffix probe: parse the status code out of the status
 /// line so the body callback can abort a non-206 early, and capture the headers
-/// the caller needs (Content-Range to verify the 206, Retry-After for backoff).
+/// the caller needs (Content-Range to verify the 206, Retry-After for backoff,
+/// ETag for the probe result).
 size_t suffix_header_cb(char* buffer, size_t size, size_t nitems, void* userdata)
 {
   auto* s            = static_cast<suffix_sink*>(userdata);
   size_t const bytes = size * nitems;
   std::string_view const line(buffer, bytes);
-  if (line.size() >= 5 && ascii_lower(line[0]) == 'h' && ascii_lower(line[1]) == 't' &&
-      ascii_lower(line[2]) == 't' && ascii_lower(line[3]) == 'p' && line[4] == '/') {
+  if (is_http_status_line(line)) {
+    s->etag.clear();
     if (auto const sp = line.find(' '); sp != std::string_view::npos) {
       long code = 0;
       for (size_t i = sp + 1; i < line.size() && line[i] >= '0' && line[i] <= '9'; ++i) {
@@ -176,6 +207,7 @@ size_t suffix_header_cb(char* buffer, size_t size, size_t nitems, void* userdata
   }
   if (auto v = match_header(line, "content-range"); !v.empty()) { s->content_range = std::move(v); }
   if (auto v = match_header(line, "retry-after"); !v.empty()) { s->retry_after = std::move(v); }
+  if (auto v = match_header(line, "etag"); !v.empty()) { s->etag = std::move(v); }
   return bytes;
 }
 
@@ -818,12 +850,12 @@ rest_perf_snapshot rest_reactor::perf_snapshot() const noexcept
   return s;
 }
 
-size_t rest_reactor::head_object_size(std::string_view bucket, std::string_view key)
+head_object_result rest_reactor::head_object_size(std::string_view bucket, std::string_view key)
 {
   s3::s3_object_ref const obj{std::string(bucket), std::string(key)};
   std::string last_error;
   for (std::size_t attempt = 0; attempt < _config.max_retry_attempts; ++attempt) {
-    header_capture hc;
+    head_capture hc;
     auto const authd =
       _ctx->authorizer()->authorize(obj, s3::s3_request_method::HEAD, presign_ttl(_config));
 
@@ -837,7 +869,7 @@ size_t rest_reactor::head_object_size(std::string_view bucket, std::string_view 
     SIRIUS_CURL_CHECK(curl_easy_setopt(h.get(), CURLOPT_NOBODY, 1L));
     SIRIUS_CURL_CHECK(curl_easy_setopt(h.get(), CURLOPT_HTTPHEADER, hdrs.get()));
     SIRIUS_CURL_CHECK(curl_easy_setopt(h.get(), CURLOPT_WRITEFUNCTION, &write_discard));
-    SIRIUS_CURL_CHECK(curl_easy_setopt(h.get(), CURLOPT_HEADERFUNCTION, &capture_header));
+    SIRIUS_CURL_CHECK(curl_easy_setopt(h.get(), CURLOPT_HEADERFUNCTION, &head_header_cb));
     SIRIUS_CURL_CHECK(curl_easy_setopt(h.get(), CURLOPT_HEADERDATA, &hc));
 
     CURLcode const rc = curl_easy_perform(h.get());
@@ -852,7 +884,7 @@ size_t rest_reactor::head_object_size(std::string_view bucket, std::string_view 
         throw std::runtime_error("rest_reactor::head_object_size: missing Content-Length for " +
                                  obj.bucket + "/" + obj.key);
       }
-      return static_cast<size_t>(cl);
+      return head_object_result{static_cast<size_t>(cl), std::move(hc.etag)};
     }
 
     last_error =
@@ -1015,6 +1047,7 @@ footer_probe rest_reactor::fetch_footer_suffix(std::string_view bucket,
         probe.object_size = *total;
         probe.window_lo   = *start;
         probe.bytes       = std::make_shared<const std::vector<std::uint8_t>>(std::move(sink.data));
+        probe.etag        = std::move(sink.etag);
       }
       return probe;
     } else if (status == 200 || status == 416) {
