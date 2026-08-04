@@ -391,14 +391,14 @@ struct host_mem_config {
     // SiriusContext::initialize() which asserts host_spaces.size() ==
     // topology.num_numa_nodes on the default path. YAML configs may override
     // by explicitly setting per-space numa_id.
-    builder.use_host_per_numa();
+    builder.use_numa_id_as_host_id();
     if (std::holds_alternative<double>(reservation_limit)) {
-      builder.set_reservation_fraction_per_host(std::get<double>(reservation_limit));
+      builder.set_reservation_fraction_per_numa_region(std::get<double>(reservation_limit));
     } else {
-      builder.set_reservation_limit_per_host(std::get<std::uint64_t>(reservation_limit));
+      builder.set_reservation_limit_per_numa_region(std::get<std::uint64_t>(reservation_limit));
     }
-    builder.set_downgrade_fractions_per_host(downgrade_trigger_fraction, downgrade_stop_fraction);
-    builder.set_per_host_capacity(numa_region_capacity_bytes);
+    builder.set_downgrade_fractions_per_numa_region(downgrade_trigger_fraction, downgrade_stop_fraction);
+    builder.set_per_numa_region_capacity(numa_region_capacity_bytes);
     // NOTE on argument order: cucascade's set_host_pool_features has confusingly-named
     // parameters (chunk_size, block_size, initial_block_count) that it internally remaps onto
     // host_memory_space_config::{block_size, pool_size, initial_number_pools} (see

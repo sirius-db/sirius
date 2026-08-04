@@ -259,7 +259,7 @@ TEST_CASE("reservation_manager_configurator builds N GPU spaces", "[multi_gpu_fo
   auto const& topology = discovery.get_topology();
 
   cucascade::memory::reservation_manager_configurator builder;
-  builder.set_number_of_gpus(topology.num_gpus).use_host_per_numa();
+  builder.set_number_of_gpus(topology.num_gpus).use_numa_id_as_host_id();
   auto configs = builder.build(topology);
 
   // Count GPU and HOST tier configs (memory_space_config is a variant post-bump f47de0b)
@@ -290,9 +290,9 @@ TEST_CASE("memory_manager creates independent spaces per GPU", "[multi_gpu_found
   builder.set_number_of_gpus(static_cast<size_t>(device_count))
     .set_gpu_usage_limit(gpu_capacity)
     .set_reservation_fraction_per_gpu(limit_ratio)
-    .set_per_host_capacity(host_capacity)
-    .use_host_per_gpu()
-    .set_reservation_fraction_per_host(limit_ratio);
+    .set_per_numa_region_capacity(host_capacity)
+    .use_gpu_id_as_host_id()
+    .set_reservation_fraction_per_numa_region(limit_ratio);
 
   auto space_configs = builder.build();
   auto manager =
@@ -375,9 +375,9 @@ TEST_CASE("multi_gpu_config_two_gpus", "[.][multi_gpu_foundation]")
   builder.set_number_of_gpus(2)
     .set_gpu_usage_limit(gpu_capacity)
     .set_reservation_fraction_per_gpu(limit_ratio)
-    .set_per_host_capacity(host_capacity)
-    .use_host_per_gpu()
-    .set_reservation_fraction_per_host(limit_ratio);
+    .set_per_numa_region_capacity(host_capacity)
+    .use_gpu_id_as_host_id()
+    .set_reservation_fraction_per_numa_region(limit_ratio);
 
   auto space_configs = builder.build();
   auto manager =
@@ -424,9 +424,9 @@ TEST_CASE("gpu_to_gpu round-trip preserves bytes on N>=2 hosts (MGPU-04 + MGPU-0
   builder.set_number_of_gpus(2)
     .set_gpu_usage_limit(gpu_capacity)
     .set_reservation_fraction_per_gpu(limit_ratio)
-    .set_per_host_capacity(host_capacity)
-    .use_host_per_numa()
-    .set_reservation_fraction_per_host(limit_ratio);
+    .set_per_numa_region_capacity(host_capacity)
+    .use_numa_id_as_host_id()
+    .set_reservation_fraction_per_numa_region(limit_ratio);
 
   auto space_configs = builder.build();
   auto manager =
