@@ -445,7 +445,7 @@ The cache does two things beyond classic prefetch:
 
 Separately from the prefetching cache, the ioctx always exposes a `metadata_store` so parsed file metadata (e.g. a parquet footer) survives across scans of the same path regardless of whether prefetching is wired up.
 
-**fadvise protocol.** `sirius_datasource::fadvise(ranges, dev_id)` is the single entry point for inserting prefetch work: it hands the ranges to the cache and stashes the returned `prefetching_handle`. `sirius_datasource::prefetch(site)` then drives that handle along the ladder: the rung matching the ioctx's `prefetching_activation_stage()` activates the request, and a `disposable` call at consume time cancels any still-pending work.
+**fadvise protocol.** `sirius_datasource::fadvise(ranges, dev_id)` is the single entry point for inserting prefetch work: it hands the ranges to the cache and stashes the returned `prefetching_handle`. `sirius_datasource::prefetch(site)` then drives that handle along the ladder: the rung matching the ioctx's `prefetching_activation_stage()` activates the request, and a `disposable` call at consume time cancels any still-pending work. Both are honored only when a handle is stored *and* the backend's activation stage is not `none` — a backend that opted out of the ladder neither activates nor cancels.
 
 ### Cache Internals
 
