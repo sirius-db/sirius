@@ -45,7 +45,7 @@
 #include <cucascade/memory/memory_space.hpp>
 #include <data/data_batch_utils.hpp>
 #include <helper/type_conversions.hpp>
-#include <io/io_context.hpp>
+#include <io/ioctx_resolver.hpp>
 #include <op/scan/gpu_ingestible.hpp>
 #include <op/scan/gpu_ingestible_types.hpp>
 #include <op/scan/sirius_gpu_scan_operator.hpp>
