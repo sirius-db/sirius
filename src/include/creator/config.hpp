@@ -86,10 +86,15 @@ inline bool enum_to_string(priority_order order, std::string& s)
   }
 }
 
+/// Default task-creator pool size; counted in the scan-manager sizing budget
+/// (see scan_manager::default_scan_manager_num_threads).
+inline constexpr int default_task_creator_num_threads = 1;
+
 /// Configuration for the task creator.
 /// Embeds the thread pool config plus the task creation strategy.
 struct task_creator_config {
-  exec::thread_pool_config thread_pool{.num_threads = 2, .thread_name_prefix = "task_creator"};
+  exec::thread_pool_config thread_pool{.num_threads        = default_task_creator_num_threads,
+                                       .thread_name_prefix = "task_creator"};
 
   /// The most speculative request type the task creator is allowed to use when
   /// servicing scheduling requests: active (demand-driven only) or lookahead
