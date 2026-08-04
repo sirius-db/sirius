@@ -1336,6 +1336,52 @@ TEST_CASE("a resident split reports its upload need through is_memory_prefetchab
   }
 }
 
+TEST_CASE("prefetch_if reports the resident splits an early upload could promote",
+          "[cached_serving][scan_manager][prefetch_api][split_connector]")
+{
+  // The only coverage prefetch_kind::memory has, and the only route to it: drain_cached_provider
+  // is the one producer of resident splits and it needs a real GPU batch, so this cannot live in
+  // the GPU-free split_connector file.
+  using sirius::op::operator_data;
+  using sirius::scan_manager::prefetch_kind;
+
+  auto& e = env();
+  scripted_provider provider;
+  // Two off the GPU tier (an upload would help) and one already on it (it would not).
+  provider.batches = {
+    make_host_tier_batch(e, 4), make_test_batch(e, 4), make_host_tier_batch(e, 4)};
+
+  split_connector connector;
+  std::stop_source stop;
+  load_balancing_scan_batch_coalescer::drain_cached_provider(
+    provider, connector, stop.get_token(), /*row_filter_pending=*/false);
+
+  auto const always = [](const operator_data&) { return true; };
+
+  // Structural counts: a resident split carries a batch, never a datasource, so it is a memory
+  // candidate and never an io one.
+  CHECK(connector.n_prefetchable(prefetch_kind::memory) == 3);
+  CHECK(connector.n_prefetchable(prefetch_kind::io) == 0);
+
+  // The dynamic test on top of that structural count: only the two that still need an upload.
+  CHECK(connector.prefetch_if(3, prefetch_kind::memory, always) == 2);
+  // Unlike the io kind, this issues no hint and advances no ladder, so the value is a candidate
+  // count and repeating the call reports the same thing rather than converging to zero.
+  CHECK(connector.prefetch_if(3, prefetch_kind::memory, always) == 2);
+  // The window bounds this kind too.
+  CHECK(connector.prefetch_if(1, prefetch_kind::memory, always) == 1);
+  CHECK(connector.prefetch_if(0, prefetch_kind::memory, always) == 0);
+  // And the io kind finds nothing to do over a resident queue.
+  CHECK(connector.prefetch_if(3, prefetch_kind::io, always) == 0);
+
+  // Non-extracting for this kind as well: every split is still queued, in push order.
+  for (int i = 0; i < 3; ++i) {
+    INFO("split " << i);
+    REQUIRE(connector.get_next_split().has_value());
+  }
+  REQUIRE_FALSE(connector.get_next_split().has_value());
+}
+
 TEST_CASE("is_memory_prefetchable agrees with prepare_for_processing",
           "[cached_serving][scan_manager][prefetch_api][scan_input]")
 {

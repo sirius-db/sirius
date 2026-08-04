@@ -29,7 +29,9 @@
 #include <rmm/cuda_stream_view.hpp>
 
 // standard library
+#include <atomic>
 #include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -53,6 +55,54 @@ namespace sirius::op::scan {
  * scheduling view and the execution behaviour cannot drift apart.
  */
 [[nodiscard]] bool batch_needs_gpu_upload(const ::cucascade::read_only_data_batch& ro) noexcept;
+
+/**
+ * @brief The highest prefetch ladder rung a split has reached, as a movable relaxed atomic.
+ *
+ * @c std::atomic is neither copyable nor movable, but @ref scan_operator_input must stay
+ * move-constructible — the coalescer moves splits down the chain and the tests move the value
+ * type. Wrapping the counter keeps that move constructor defaulted, so it cannot silently drop a
+ * member when one is added to the class.
+ *
+ * Relaxed throughout: the rung orders no other memory. It exists so each ladder rung is reported
+ * to @c scan_manager::prefetching_state_manager at most once per split, however many sites fire
+ * it — @c split_connector::prefetch_if hints a still-queued split and re-walks from the queue
+ * front on every invocation, and the dequeue path fires @c task_queued again afterwards.
+ */
+class ladder_rung {
+ public:
+  ladder_rung() noexcept                     = default;
+  ~ladder_rung() noexcept                    = default;
+  ladder_rung(const ladder_rung&)            = delete;
+  ladder_rung& operator=(const ladder_rung&) = delete;
+  /// Move-assignment is deliberately absent: see @ref scan_operator_input's deleted one.
+  ladder_rung& operator=(ladder_rung&&) = delete;
+
+  /// The source is being consumed by the move and is not concurrently reachable (a split is a
+  /// strict @c unique_ptr baton pass), so a relaxed load is all the ordering there is to do.
+  ladder_rung(ladder_rung&& other) noexcept : _value(other._value.load(std::memory_order_relaxed))
+  {
+  }
+
+  /// @brief Raise the rung to @p rung, reporting whether it **strictly** advanced.
+  ///
+  /// @return @c true exactly once per distinct increase, so a caller can use it to count
+  ///         first-time arrivals. @p rung == 0 (@c prefetching_stage::none) never advances.
+  [[nodiscard]] bool advance_to(std::uint8_t rung) noexcept
+  {
+    std::uint8_t seen = _value.load(std::memory_order_relaxed);
+    while (rung > seen) {
+      if (_value.compare_exchange_weak(
+            seen, rung, std::memory_order_relaxed, std::memory_order_relaxed)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+ private:
+  std::atomic<std::uint8_t> _value{0};
+};
 
 //===----------------------------------------------------------------------===//
 // scan_operator_input
@@ -99,12 +149,22 @@ class scan_operator_input : public op::operator_data {
 
   /// Explicit because the user-declared destructor above suppresses the implicit move
   /// operations, and the implicit *copy* operations are deleted by the @c std::unique_ptr
-  /// alternative in @c materialization_info — without these the class would be neither
-  /// copyable nor movable. Splits are moved (the coalescer hands a @c unique_ptr down the
-  /// chain, and the value type itself is moved in the tests), so movability is part of the
-  /// contract.
-  scan_operator_input(scan_operator_input&&)            = default;
-  scan_operator_input& operator=(scan_operator_input&&) = default;
+  /// alternative in @c materialization_info — without this the class would be neither copyable
+  /// nor movable. Splits are moved (the coalescer hands a @c unique_ptr down the chain, and the
+  /// value type itself is moved in the tests), so move-construction is part of the contract.
+  /// It is also the only move operation that preserves the create/dispose invariant: it leaves
+  /// the source's @c _prefetch_state null, so the moved-from shell's destructor reports nothing
+  /// and the split still accounts for exactly one creation and one disposal.
+  scan_operator_input(scan_operator_input&&) = default;
+
+  /// **Deliberately deleted, not defaulted.** @c a @c = @c std::move(b) would overwrite @c a's
+  /// @c _prefetch_state without reporting @c a's disposal, so the split @c a used to be would be
+  /// counted as created and never disposed and @c n_live would leak for the rest of the query.
+  /// Production never needs it: splits are handed down as @c unique_ptr<operator_data> and are
+  /// only ever move-*constructed*. Fixing the leak instead of deleting the operation would mean
+  /// running disposal bookkeeping inside an assignment, which is strictly more surface for no
+  /// caller.
+  scan_operator_input& operator=(scan_operator_input&&) = delete;
 
   [[nodiscard]] op::operator_data_type get_type() const override
   {
@@ -136,11 +196,44 @@ class scan_operator_input : public op::operator_data {
    * splits are counted too — they climb the same ladder and do the same work, they just have no
    * IO to hint. Counting after the check reports zero for a fully-pinned query.
    *
+   * The recording is **monotone per split**: each rung is reported at most once however many
+   * times it fires. Without that, @c split_connector::prefetch_if — which hints still-queued
+   * splits and re-walks from the queue front on every invocation — plus the dequeue path firing
+   * @c task_queued again would grow @c n_task_queued without bound.
+   *
    * Reaches the datasources through @ref for_each_datasource, never @ref get_fadvise_hints: the
    * latter rebuilds the split's byte ranges on every call (a parquet footer walk per row-group
-   * slice) and this method would only throw them away.
+   * slice) and this method would only throw them away. The hint itself is fired unconditionally —
+   * only the *counter* is deduplicated, because @c sirius_datasource::prefetch is idempotent for
+   * activate and must still see a later @c disposable.
+   *
+   * @return Whether this call advanced the split's ladder, i.e. whether it was the first time
+   *         this split reached rung @p site or any higher one. @c prefetching_stage::none never
+   *         advances.
    */
-  void prefetch(io::cache::prefetching_stage site) const;
+  bool prefetch(io::cache::prefetching_stage site) const;
+
+  /**
+   * @brief Whether this split's prefetch could complete while it is still queued.
+   *
+   * True iff some datasource's backend activates at @c prefetching_stage::metadata_created or
+   * @c prefetching_stage::task_queued — the only two rungs that fire before
+   * @c split_connector hands the split out. A backend that activates at
+   * @c task_preprocessing (REST today) does its IO after the dequeue, so its splits can never
+   * report @c prefetch_progress::cached while queued and there is nothing for the connector's
+   * selection policy to find. A backend at @c none never activates at all.
+   *
+   * Structural and constant for the split's lifetime; @c split_connector evaluates it once per
+   * connector, on the producer thread.
+   *
+   * @note **Virtual for the same reason as @ref prefetch_state — do not devirtualize.** No
+   *       shipped backend returns a pre-dequeue activation stage, so with this non-virtual
+   *       nothing in a test could arm the connector's selection gate, and the policy behind that
+   *       gate would become unreachable from any test. @c split_connector reaches splits through
+   *       @c dynamic_cast<const scan_operator_input*>, so a test-local subclass overriding this
+   *       arms the gate end to end.
+   */
+  [[nodiscard]] virtual bool can_land_while_queued() const noexcept;
 
   /// @brief Visit each datasource backing this split. Empty for a resident split.
   /// Cheap: forwards to @ref scan_info::for_each_datasource, which computes no byte ranges.
@@ -279,6 +372,9 @@ class scan_operator_input : public op::operator_data {
   /// every split built outside it, in which case the reporting is skipped entirely.
   /// A @c shared_ptr so this class stays as copy/move-friendly as its variant allows.
   std::shared_ptr<scan_manager::prefetching_state_manager> _prefetch_state;
+  /// Highest ladder rung this split has reported, so each rung is counted once. @c mutable
+  /// because @ref prefetch is @c const — the rung is bookkeeping, not observable split state.
+  mutable ladder_rung _highest_rung;
 };
 
 }  // namespace sirius::op::scan

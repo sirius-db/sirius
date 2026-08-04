@@ -183,13 +183,19 @@ class task_creator {
   /**
    * @brief Install the queue-depleted hook. Single slot — the last setter wins.
    *
-   * The hook is snapshotted under an internal mutex and invoked on the copy after unlocking, so
-   * replacing a callback does not synchronize with an in-flight invocation. Callbacks must not
-   * capture raw pointers to objects the task_creator can outlive — capture a @c std::weak_ptr.
-   * In particular a hook must **never** reach the scan manager through
-   * @c duckdb::SiriusContext::get_scan_manager(): that accessor throws once the context has been
-   * terminated, and the not-created hook fires from outside any @c try block.
-   * Cleared by @ref reset.
+   * The callable is moved onto the heap once, here, and the fire path only ever copies the
+   * owning @c shared_ptr. That is deliberate: the installed lambdas capture a @c std::weak_ptr,
+   * which is not trivially copyable, so libstdc++'s @c std::function small-object optimisation
+   * does not apply and copying the @c std::function itself would @c malloc on **every** fire —
+   * once per matcher iteration on the single thread that dispatches every GPU task.
+   *
+   * The slot is snapshotted atomically and invoked on the copy, so replacing a callback does not
+   * synchronize with an in-flight invocation (a fire already in progress runs to completion
+   * against the old callable). Callbacks must not capture raw pointers to objects the
+   * task_creator can outlive — capture a @c std::weak_ptr. In particular a hook must **never**
+   * reach the scan manager through @c duckdb::SiriusContext::get_scan_manager(): that accessor
+   * throws once the context has been terminated, and the not-created hook fires from outside any
+   * @c try block. Cleared by @ref reset.
    */
   void set_on_task_queue_depleted(task_queue_depleted_hook hook);
 
@@ -249,11 +255,11 @@ class task_creator {
   /**
    * @brief Invoke the queue-depleted hook, if one is installed.
    *
-   * Follows the single-slot pattern of @c exec::exchange_channel: snapshot the callback under
-   * @c _hook_mutex, then invoke the copy **after** unlocking, so a hook can never run with a
-   * task_creator lock held and replacing a hook does not synchronize with an in-flight call.
-   * The invocation is wrapped in @c try/catch(...) and the exception logged and dropped, which
-   * is what makes this @c noexcept honest.
+   * Snapshot the slot, then invoke the snapshot, so a hook never runs with a task_creator lock
+   * held and replacing a hook does not synchronize with an in-flight call. The snapshot is a
+   * @c shared_ptr copy — one refcount bump, **no allocation** — which is why this fire path takes
+   * no task_creator lock at all. The invocation is wrapped in @c try/catch(...) and the exception
+   * logged and dropped, which is what makes this @c noexcept honest.
    *
    * Protected rather than private so the hook plumbing is drivable from a test subclass without
    * having to reach the anchor that calls it.
@@ -263,10 +269,10 @@ class task_creator {
   /**
    * @brief Invoke the not-created hook, if one is installed.
    *
-   * Same snapshot-then-fire-outside-the-lock discipline and the same @c try/catch(...) backstop
-   * as @ref fire_task_queue_depleted. The backstop is load-bearing here: the call site sits
-   * outside the dispatch lambda's @c try block on the single manager thread, so an escaping
-   * exception would silently end all task creation.
+   * Same lock-free snapshot-then-fire discipline and the same @c try/catch(...) backstop as
+   * @ref fire_task_queue_depleted. The backstop is load-bearing here: the call site sits outside
+   * the dispatch lambda's @c try block on the single manager thread, so an escaping exception
+   * would silently end all task creation.
    *
    * @param requested The operator the failed request started from. Borrowed for the call only.
    * @param kind      Whether the request was active or speculative look-ahead.
@@ -287,13 +293,22 @@ class task_creator {
   std::size_t _index_of_next_lookahead{0};  // Index of the next operator to lookahead for
   std::vector<op::sirius_physical_operator*> _lookahead_queue;
 
-  /// Guards the two single-slot hooks below. A leaf lock: never held while calling out (the
-  /// fire_* helpers snapshot under it and invoke after unlocking) and never nested inside
-  /// another lock, so it cannot participate in any cycle with
-  /// _lookahead_mutex -> sirius_pipeline::_status_mutex -> split_connector::_mutex.
-  mutable std::mutex _hook_mutex;
-  task_queue_depleted_hook _on_task_queue_depleted;
-  task_not_created_hook _on_task_not_created;
+  /// The two single-slot hooks. Held by @c shared_ptr so a fire is a refcount bump rather than a
+  /// @c std::function copy: the installed lambdas capture a @c std::weak_ptr, which defeats
+  /// libstdc++'s small-object optimisation, so copying the @c std::function would allocate on
+  /// **every** fire — once per matcher iteration on the single thread that dispatches every GPU
+  /// task.
+  ///
+  /// @c std::atomic so the slot is readable with no task_creator lock at all. (libstdc++ backs
+  /// this with an internal spinlock rather than a lock-free CAS, but that spinlock is a strict
+  /// leaf — held only across a pointer copy, never while calling out — so it cannot participate in
+  /// any cycle with _lookahead_mutex -> sirius_pipeline::_status_mutex ->
+  /// split_connector::_mutex, and it never allocates.)
+  ///
+  /// @c const because a snapshot is shared with an in-flight invocation: the callable itself must
+  /// not be mutated behind a running hook's back, only the slot repointed.
+  std::atomic<std::shared_ptr<const task_queue_depleted_hook>> _on_task_queue_depleted;
+  std::atomic<std::shared_ptr<const task_not_created_hook>> _on_task_not_created;
 
   // Queue for creating tasks based on operators. The operator is the starting point to start
   // looking which task should be created, not necessarily the operator for whose pipeline the task

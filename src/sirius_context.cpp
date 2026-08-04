@@ -961,10 +961,16 @@ void SiriusContext::create_query(
   // after scan_manager_->prepare_for_query has built the fresh instance, so the captured weak_ptr
   // refers to this query's manager and not the previous one's.
   //
-  // A weak_ptr, never a shared_ptr: the task_creator outlives every query, and a straggler hook
-  // firing between scan_manager_->reset() and task_creator_->reset() (run_mandatory_cleanup drops
-  // them in that order) must not resurrect a dead query's manager. An expired weak_ptr makes the
-  // hook a silent no-op, which is also what makes the stale-hook window harmless.
+  // A weak_ptr, never a shared_ptr: the task_creator outlives every query, so capturing a
+  // shared_ptr here would keep every query's manager alive until the next one replaced the hook.
+  //
+  // The weak_ptr alone does NOT close the stale-hook window, and the code must not rely on it
+  // doing so. A straggler split holds a shared_ptr to the manager, so between
+  // scan_manager_->reset() and task_creator_->reset() (run_mandatory_cleanup drops them in that
+  // order) the lock() below still succeeds -- and by then this query's split_connectors have been
+  // destroyed along with its pipelines. What actually makes the window safe is
+  // prefetching_state_manager::clean_up latching its detached flag, which both hook targets check
+  // and return on.
   //
   // The manager is captured directly rather than looked up through get_scan_manager(): that
   // accessor calls throw_if_not_initialized() and throws once the context has been terminated, and

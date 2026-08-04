@@ -234,16 +234,25 @@ bool sirius_datasource::uses_prefetching_cache() const noexcept
   return _io_ctx->uses_prefetching_cache();
 }
 
+cache::prefetching_stage sirius_datasource::activation_stage() const noexcept
+{
+  // _io_ctx is set at construction and never reassigned; the null guard mirrors metadata()'s and
+  // keeps this accessor honestly noexcept for a defensively-constructed datasource.
+  if (!_io_ctx) { return cache::prefetching_stage::none; }
+  return _io_ctx->prefetching_activation_stage();
+}
+
 cache::prefetch_progress sirius_datasource::prefetch_state() const noexcept
 {
   // No handle at all is the normal state on every shipped local backend: fadvise returns without
   // storing one when the ioctx has no prefetching cache.
   if (!_prefetch_handle) { return cache::prefetch_progress::empty; }
+  // get_context() returns the shared_ptr BY VALUE, so this is a shared_ptr copy (two atomic RMWs)
+  // plus the two lock-free single-word loads below -- not two loads on their own.
   auto const ctx = _prefetch_handle.get_context();
   if (!ctx || !ctx->state) { return cache::prefetch_progress::empty; }
-  // Exactly two lock-free single-word loads. ctx->chunks is NOT read here, and must never be:
-  // prefetching_cache::prefetch_loop erases from that vector with no lock held, so walking it
-  // from a consumer thread is a data race.
+  // ctx->chunks is NOT read here, and must never be: prefetching_cache::prefetch_loop erases from
+  // that vector with no lock held, so walking it from a consumer thread is a data race.
   return cache::progress_from(ctx->state->get_state(), ctx->is_cancelled());
 }
 

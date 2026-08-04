@@ -236,17 +236,13 @@ void task_creator::reset()
   // The hooks are per-query — SiriusContext::create_query installs them with that query's state
   // manager captured — so one left installed by query N would keep firing into query N+1.
   //
-  // Cleared before _global_state_mutex is taken, not under it, so _hook_mutex stays the leaf lock
-  // its declaration claims: acquired with nothing else held, and released before the snapshotted
-  // callables (and therefore anything they captured) are destroyed.
+  // Cleared before _global_state_mutex is taken, not under it, so the callables (and therefore
+  // anything they captured) are destroyed with no task_creator lock held. The exchanges below
+  // hold the last reference unless a fire is running concurrently, in which case that fire's
+  // snapshot keeps the callable alive until it returns.
   {
-    task_queue_depleted_hook depleted;
-    task_not_created_hook not_created;
-    {
-      std::lock_guard<std::mutex> hook_lock(_hook_mutex);
-      depleted.swap(_on_task_queue_depleted);
-      not_created.swap(_on_task_not_created);
-    }
+    auto const depleted    = _on_task_queue_depleted.exchange(nullptr);
+    auto const not_created = _on_task_not_created.exchange(nullptr);
   }
 
   std::lock_guard<std::mutex> lock(_global_state_mutex);
@@ -367,33 +363,30 @@ void task_creator::schedule_lookahead(std::optional<int> device_id_hint)
 
 void task_creator::set_on_task_queue_depleted(task_queue_depleted_hook hook)
 {
-  // Sink parameter: taken by value and moved into the slot, so an rvalue callback costs one
-  // move rather than a copy. _hook_mutex is a leaf lock and nothing is called out to under it.
-  std::lock_guard<std::mutex> lock(_hook_mutex);
-  _on_task_queue_depleted = std::move(hook);
+  // Sink parameter moved onto the heap exactly once, here. This is the only allocation in the
+  // hook's whole life: every later fire copies the shared_ptr, not the std::function.
+  // An empty callable clears the slot, so set(nullptr) still means "no hook".
+  _on_task_queue_depleted.store(
+    hook ? std::make_shared<const task_queue_depleted_hook>(std::move(hook)) : nullptr);
 }
 
 void task_creator::set_on_task_not_created(task_not_created_hook hook)
 {
-  std::lock_guard<std::mutex> lock(_hook_mutex);
-  _on_task_not_created = std::move(hook);
+  _on_task_not_created.store(hook ? std::make_shared<const task_not_created_hook>(std::move(hook))
+                                  : nullptr);
 }
 
 void task_creator::fire_task_queue_depleted() noexcept
 {
-  // The whole body is guarded, not just the invocation: copying the std::function out of the slot
-  // allocates, and this method is noexcept, so a bad_alloc anywhere in here would terminate the
-  // scheduler's management thread rather than skip one prefetch nudge.
+  // The whole body is guarded, not just the invocation, so a throw from anywhere in here skips
+  // one prefetch nudge rather than terminating the scheduler's management thread.
   try {
-    task_queue_depleted_hook hook;
-    {
-      // Snapshot under the leaf lock; the copy is invoked AFTER unlocking so a hook never runs
-      // with a task_creator lock held and cannot deadlock by re-entering.
-      std::lock_guard<std::mutex> lock(_hook_mutex);
-      hook = _on_task_queue_depleted;
-    }
-    if (!hook) { return; }
-    hook();
+    // A shared_ptr copy: one atomic refcount bump, no allocation, no lock. The snapshot keeps the
+    // callable alive across the call, so a concurrent set_* or reset() cannot destroy it
+    // mid-invocation, and the hook never runs with a task_creator lock held.
+    auto const hook = _on_task_queue_depleted.load();
+    if (!hook || !*hook) { return; }
+    (*hook)();
   } catch (...) {
     SIRIUS_LOG_WARN("Task Creator: on_task_queue_depleted hook threw; ignoring");
   }
@@ -402,17 +395,13 @@ void task_creator::fire_task_queue_depleted() noexcept
 void task_creator::fire_task_not_created(const op::sirius_physical_operator* requested,
                                          request_type kind) noexcept
 {
-  // Same snapshot-then-fire-outside-the-lock discipline. The backstop matters more here: the
-  // production call site sits outside the dispatch lambda's try block on the engine's single
-  // task-creation thread, so an escaping exception would end all task creation silently.
+  // Same lock-free snapshot-then-fire discipline. The backstop matters more here: the production
+  // call site sits outside the dispatch lambda's try block on the engine's single task-creation
+  // thread, so an escaping exception would end all task creation silently.
   try {
-    task_not_created_hook hook;
-    {
-      std::lock_guard<std::mutex> lock(_hook_mutex);
-      hook = _on_task_not_created;
-    }
-    if (!hook) { return; }
-    hook(requested, kind);
+    auto const hook = _on_task_not_created.load();
+    if (!hook || !*hook) { return; }
+    (*hook)(requested, kind);
   } catch (...) {
     SIRIUS_LOG_WARN("Task Creator: on_task_not_created hook threw; ignoring");
   }

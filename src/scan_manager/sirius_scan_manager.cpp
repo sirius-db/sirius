@@ -548,9 +548,10 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
   // task can still be in flight on a GPU executor thread at that point — so a straggler split from
   // query N must decrement query N's counters, not this query's. The shared_ptr each split holds is
   // what keeps the old instance alive for exactly that long.
-  _prefetching_state = std::make_shared<prefetching_state_manager>(
-    prefetching_state_manager::config{.memory_threshold    = _config.prefetch_memory_threshold,
-                                      .max_concurrent_scan = _config.max_concurrent_scan});
+  _prefetching_state =
+    std::make_shared<prefetching_state_manager>(prefetching_state_manager::config{
+      .memory_threshold          = _config.prefetch_memory_threshold,
+      .prefetch_lookahead_window = _config.prefetch_lookahead_window});
   _prefetching_state->prepare_for_query(query);
 
   _metadata_processor = std::make_unique<load_balancing_scan_batch_coalescer>();

@@ -83,18 +83,25 @@ class split_connector : public std::enable_shared_from_this<split_connector> {
   /// \brief Pull the next split, blocking until one is available or the connector
   ///        is closed and drained.
   ///
-  /// Not strictly FIFO: among the first @ref kSelectionWindow queued splits it prefers one whose
-  /// prefetch has already landed (see @ref select_split_index). Splits are independent units of
-  /// work — each becomes its own concurrently-executed task on its own device
-  /// (task_creator.cpp:518-524) — so the engine has no cross-split ordering requirement. Resident
-  /// splits carry no prefetch handle and all report the same state, so the cached-serving path
-  /// stays FIFO in practice.
+  /// **Strictly FIFO unless the connector is armed.** The selection policy below runs only when
+  /// some pushed split reported @c op::scan::scan_operator_input::can_land_while_queued — i.e.
+  /// only when a backend on this connector activates its prefetch at a rung that fires *before*
+  /// the dequeue. No shipped backend does, so on every shipped configuration this method is the
+  /// same @c move(front) + @c pop_front it was before the selection policy existed: no state
+  /// reads, no virtual calls, no datasource walks.
   ///
-  /// Complexity: **O(kSelectionWindow)** in the queue length — independent of how many splits are
-  /// queued. At most @ref kSelectionWindow prefetch-state reads (each folding over that split's
-  /// datasources), stopping early at the first landed split; plus a deque erase within the window,
-  /// which moves at most kSelectionWindow-1 pointers. The common path is one state read and a
-  /// @c pop_front, i.e. the same O(1) dequeue as before this policy existed.
+  /// When armed it is not strictly FIFO: among the leading queued splits it prefers one whose
+  /// prefetch has already landed (see @ref select_split_index). Splits are independent units of
+  /// work — each becomes its own concurrently-executed task on its own device, in
+  /// @c creator::task_creator's dispatch loop — so the engine has no cross-split ordering
+  /// requirement. See @ref kSelectionFoldBudget for the second axis of the bound.
+  ///
+  /// Complexity: **O(1) in the queue length**, on both axes. The armed walk inspects at most
+  /// @ref kSelectionWindow splits *and* spends at most @ref kSelectionFoldBudget datasource
+  /// folds across them (plus the front split, which is always inspected); it stops early at the
+  /// first landed split. The deque erase is within the window, so it moves at most
+  /// @c kSelectionWindow-1 pointers, and index 0 is a plain @c pop_front. The unarmed path does
+  /// none of the above.
   ///
   /// \warning The wait predicate is and must remain exactly `!_splits.empty() || _closed`, and the
   ///          `_exception` rethrow must remain the first statement after the wait. Preferring a
@@ -133,9 +140,23 @@ class split_connector : public std::enable_shared_from_this<split_connector> {
    * @param upto_n    Look-ahead window size. Zero inspects nothing and returns 0.
    * @param kind      Which resource to warm.
    * @param predicate Caller filter, evaluated on each inspected split before the prefetchability
-   *                  test. Must be non-blocking and must not re-enter the connector — it runs
-   *                  with the connector's mutex held.
-   * @return How many splits were actually hinted.
+   *                  test.
+   *
+   * @warning @p predicate runs at **lock rank L2** (@c split_connector::_mutex, held for the
+   *          whole walk) and must not acquire any lock of rank L1 or lower: no
+   *          @c pipeline::sirius_pipeline status lock, no @c creator::task_creator lock, no
+   *          scan-manager lock, and no re-entry into this connector. The engine's established
+   *          order is L0 @c task_creator::_lookahead_mutex → L1 @c sirius_pipeline::_status_mutex
+   *          → L2 this mutex, and a task-creator worker routinely holds L1 while blocking on L2
+   *          inside @ref get_next_split. A natural-looking filter such as "only splits whose
+   *          pipeline is not finished" would take L2 → L1 and deadlock ABBA against it. The
+   *          predicate must also be non-blocking, for the same reason.
+   *
+   * @return How many splits this call **advanced the ladder for**. A split already hinted at this
+   *         rung by an earlier invocation is inspected but not counted again, so repeated calls
+   *         over a static queue converge to 0. For @c prefetch_kind::memory no hint is issued yet
+   *         (see @ref prefetch_kind) and the value reports the splits that *would* be hinted —
+   *         advisory, not a count of work done.
    */
   std::size_t prefetch_if(std::size_t upto_n,
                           prefetch_kind kind,
@@ -183,11 +204,11 @@ class split_connector : public std::enable_shared_from_this<split_connector> {
    * @brief How many queued splits @ref get_next_split inspects before choosing one.
    *
    * @ref get_next_split runs on the critical path **while the consumer holds
-   * @c sirius_pipeline::_status_mutex** (task_creator.cpp:376-524), and every task completing on
-   * that pipeline blocks behind that mutex (gpu_pipeline_task.cpp:325 -> mark_task_completed ->
-   * update_pipeline_status). The dequeue is O(1) today; a full-queue scan would make it O(n) in a
-   * deque that routinely holds ~200 splits, times the datasources each split folds over. This
-   * constant is what keeps the critical section O(1) in the queue length.
+   * @c sirius_pipeline::_status_mutex** (@c creator::task_creator's task-creation lock), and
+   * every task completing on that pipeline blocks behind that mutex on its way through
+   * @c mark_task_completed -> @c update_pipeline_status. The dequeue is O(1) today; a full-queue
+   * scan would make it O(n) in a deque that routinely holds ~200 splits. This constant is what
+   * keeps the critical section O(1) in the queue length.
    *
    * Small on purpose. The window only has to be wide enough to step over a short run of splits
    * whose IO has not landed; if the first few are all still in flight, the whole queue almost
@@ -196,6 +217,25 @@ class split_connector : public std::enable_shared_from_this<split_connector> {
    * something with no workload-dependent optimum.
    */
   static constexpr std::size_t kSelectionWindow = 8;
+
+  /**
+   * @brief Hard ceiling on the datasource folds one @ref get_next_split may perform.
+   *
+   * @ref kSelectionWindow bounds how many *splits* are inspected; this bounds the work **inside**
+   * them. A @c op::scan::parquet_split_info carries one datasource per row-group slice, so at the
+   * 512 MB default @c scan_task_batch_size over small parquet files a single split can hold
+   * several hundred — a per-split bound alone leaves the walk unbounded. Each fold is a
+   * @c std::function indirect call, a @c io::cache::prefetching_handle::get_context()
+   * @c shared_ptr copy (two atomic RMWs) and a @c combine_prefetch_progress step, all under
+   * @c _mutex (L2) while the consumer holds @c sirius_pipeline::_status_mutex (L1) and every task
+   * completion on the pipeline serialises behind it.
+   *
+   * The budget is spent against a per-split fold cost captured once at push time, on the producer
+   * thread, so the consumer never walks a split's datasources to find out what it would cost.
+   * The window always inspects at least the front split, whatever its fold cost, so selection is
+   * never skipped entirely and rule 3 of @ref select_split_index always has a candidate.
+   */
+  static constexpr std::size_t kSelectionFoldBudget = 32;
 
  private:
   friend class load_balancing_scan_batch_coalescer;
@@ -213,16 +253,18 @@ class split_connector : public std::enable_shared_from_this<split_connector> {
   void push_split(std::unique_ptr<op::operator_data> split);
 
   /// Fill @p out with the prefetch progress of the queued splits, front first, and return how
-  /// many entries were written (always >= 1 when the queue is non-empty). Writes at most
-  /// @ref kSelectionWindow entries and **stops at the first landed split**: rule 1 of
-  /// @ref select_split_index takes the first @c cached entry, so nothing past it can change the
-  /// answer. Caller must hold @c _mutex.
+  /// many entries were written (always >= 1 when the queue is non-empty). Bounded on both axes:
+  /// at most @ref kSelectionWindow entries, and past the always-inspected front split it stops
+  /// before its accumulated @c _split_fold_costs would exceed @ref kSelectionFoldBudget. It also
+  /// **stops at the first landed split**: rule 1 of @ref select_split_index takes the first
+  /// @c cached entry, so nothing past it can change the answer. Caller must hold @c _mutex.
   std::size_t fill_progress_window(
     std::array<io::cache::prefetch_progress, kSelectionWindow>& out) const noexcept;
 
-  /// Remove the split at @p index (< @ref kSelectionWindow) from @c _splits and @c _split_kinds
-  /// and decrement the affected count. O(index) pointer moves: std::deque::erase relocates the
-  /// shorter side, and the index is always within the leading window. Caller must hold @c _mutex.
+  /// Remove the split at @p index (< @ref kSelectionWindow) from @c _splits, @c _split_kinds and
+  /// @c _split_fold_costs, and decrement the affected count. O(index) pointer moves:
+  /// std::deque::erase relocates the shorter side, and the index is always within the leading
+  /// window. Caller must hold @c _mutex.
   void drop_at(std::size_t index) noexcept;
 
   mutable std::mutex _mutex;
@@ -232,8 +274,28 @@ class split_connector : public std::enable_shared_from_this<split_connector> {
   /// the counts below can be maintained without re-inspecting (and re-@c dynamic_cast ing) a
   /// split on the removal path, which runs under @c _mutex on the critical path.
   std::deque<std::uint8_t> _split_kinds;
+  /// Parallel to @c _splits: what one @c prefetch_state() fold of that split would cost, in
+  /// datasources. Captured on the producer thread by the same walk that computes
+  /// @c _split_kinds, so @ref fill_progress_window can spend @ref kSelectionFoldBudget against it
+  /// without the consumer ever calling @c datasource_count() itself.
+  std::deque<std::uint32_t> _split_fold_costs;
   std::size_t _n_io_prefetchable{0};
   std::size_t _n_memory_prefetchable{0};
+  /// Whether any split pushed so far could land while queued
+  /// (@c op::scan::scan_operator_input::can_land_while_queued). Until this is true,
+  /// @ref get_next_split skips the selection walk entirely and behaves exactly as the pre-policy
+  /// FIFO dequeue did. Latched, never cleared: a connector serves one backend, and re-checking
+  /// per split would reintroduce the per-split datasource walk this exists to avoid.
+  ///
+  /// Written under @c _mutex by @ref push_split and read under it by @ref get_next_split. The
+  /// datasource walk that *computes* the value runs off the lock — that walk is exactly what the
+  /// fold budget keeps out of the critical section — but the store itself is not hoisted with it.
+  bool _selection_armed{false};
+  /// Whether the one-shot arming decision above has been taken yet. Separate from
+  /// @c _selection_armed so a connector whose first io-candidate says "no" does not re-walk on
+  /// every subsequent push. Producer-private: only @ref push_split touches it, which is why it can
+  /// be tested outside @c _mutex to skip the walk.
+  bool _arming_checked{false};
   bool _closed{false};
   std::exception_ptr _exception;
 };

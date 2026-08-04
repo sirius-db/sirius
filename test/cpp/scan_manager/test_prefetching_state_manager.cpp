@@ -44,7 +44,7 @@ using sirius::scan_manager::prefetching_state_manager;
 
 prefetching_state_manager::config test_config()
 {
-  return {.memory_threshold = 1024, .max_concurrent_scan = 4};
+  return {.memory_threshold = 1024, .prefetch_lookahead_window = 4};
 }
 
 /// A query carrying nothing but an id — which is all prepare_for_query is allowed to keep, since
@@ -84,7 +84,7 @@ TEST_CASE("the manager reports the tunables it was constructed with",
   prefetching_state_manager manager{test_config()};
 
   CHECK(manager.get_config().memory_threshold == 1024);
-  CHECK(manager.get_config().max_concurrent_scan == 4);
+  CHECK(manager.get_config().prefetch_lookahead_window == 4);
   CHECK_FALSE(manager.summary().empty());
 }
 
@@ -220,4 +220,33 @@ TEST_CASE("counters survive disposal after clean_up",
   CHECK(counters.n_inputs_disposed == 2);
   CHECK(counters.n_live == 0);
   CHECK(counters.n_task_completed == 1);
+}
+
+TEST_CASE("clean_up detaches the hook targets and prepare_for_query re-arms them",
+          "[scan_manager][prefetch_api][prefetching_state_manager]")
+{
+  // The straggler-hook gate. The weak_ptr the hooks are installed with does NOT close this window:
+  // a straggler split still holds a shared_ptr to the manager, so the hook's lock() succeeds in
+  // exactly the interval where the query's split_connectors have already been destroyed with its
+  // pipelines. This flag is what makes the hooks no-ops there.
+  prefetching_state_manager manager{test_config()};
+  CHECK_FALSE(manager.is_detached());
+
+  auto const query = make_query(11);
+  manager.prepare_for_query(query);
+  CHECK_FALSE(manager.is_detached());
+
+  manager.clean_up();
+  CHECK(manager.is_detached());
+  // Still callable, and still noexcept, once detached — they just return at the gate. A null
+  // operator is safe precisely because the gate returns before the pointer is looked at; the hook
+  // contract's "never null" is about what task_creator passes, not what this early return needs.
+  REQUIRE_NOTHROW(manager.on_task_queue_depleted());
+  REQUIRE_NOTHROW(manager.on_task_not_created(nullptr, sirius::creator::request_type::active));
+
+  // Reused for a second query, the manager serves hooks again: the flag is latched per query, not
+  // for the manager's lifetime.
+  auto const next = make_query(12);
+  manager.prepare_for_query(next);
+  CHECK_FALSE(manager.is_detached());
 }

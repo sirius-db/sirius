@@ -137,7 +137,11 @@ TEST_CASE("a hook that re-enters schedule_lookahead does not deadlock",
   // The reason the hook fires before _lookahead_mutex is taken. That mutex is a plain
   // std::mutex, so firing from inside it would hang this case rather than fail it — which is why
   // the assertion is simply that the call returns.
-  hook_probe creator;
+  //
+  // strategy MUST be lookahead here. Under the default (active) schedule_lookahead returns at its
+  // strategy gate, which sits above _lookahead_mutex, so the mutex is never taken and the case
+  // proves nothing — it would pass just as well with the hook moved below the lock.
+  hook_probe creator{task_creator_config{.strategy = request_type::lookahead}};
 
   std::size_t depth = 0;
   std::size_t fired = 0;

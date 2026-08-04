@@ -109,13 +109,37 @@ TEST_CASE("combine_prefetch_progress folds a multi-file split",
   {
     // split_connector reads this value per queued split and never controls the order its
     // datasources were visited in, so every permutation of one multiset must agree.
-    std::vector<prefetch_progress> parts{prefetch_progress::prepared,
+    //
+    // The multiset deliberately excludes `loading`, which absorbs everything: a sweep containing
+    // it passes for any implementation that special-cases loading first, however order-dependent
+    // the rest is. These four exercise the rules that actually compete -- "all ready" against
+    // "any prepared" against "any cancelled" -- so a fold that leaked its accumulator's history
+    // would fail here.
+    std::vector<prefetch_progress> parts{prefetch_progress::cached,
+                                         prefetch_progress::cached,
                                          prefetch_progress::prepared,
-                                         prefetch_progress::loading,
-                                         prefetch_progress::cached};
+                                         prefetch_progress::cancelled};
     std::sort(parts.begin(), parts.end());
     do {
-      CHECK(fold(parts) == prefetch_progress::loading);
+      CHECK(fold(parts) == prefetch_progress::prepared);
     } while (std::next_permutation(parts.begin(), parts.end()));
+  }
+
+  SECTION("loading absorbs every other progress")
+  {
+    // Precedence rule 2 on its own: whatever else a split's files report, one file with IO in
+    // flight makes the split in flight. Asserted separately from the order sweep above, which is
+    // vacuous if it contains an absorbing element.
+    for (auto const other : {prefetch_progress::empty,
+                             prefetch_progress::cancelled,
+                             prefetch_progress::prepared,
+                             prefetch_progress::loading,
+                             prefetch_progress::cached,
+                             prefetch_progress::in_use,
+                             prefetch_progress::evicting}) {
+      INFO("other = " << static_cast<int>(other));
+      CHECK(fold({prefetch_progress::loading, other}) == prefetch_progress::loading);
+      CHECK(fold({other, prefetch_progress::loading}) == prefetch_progress::loading);
+    }
   }
 }

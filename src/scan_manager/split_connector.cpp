@@ -21,7 +21,10 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstdint>
 #include <iterator>
+#include <limits>
+#include <stdexcept>
 #include <utility>
 
 namespace sirius::scan_manager {
@@ -34,19 +37,33 @@ constexpr std::uint8_t kIoCandidate = 1U << 0;
 /// promote.
 constexpr std::uint8_t kMemoryCandidate = 1U << 1;
 
-/// Classify a split for the incremental @c n_prefetchable counts. Structural, so it is evaluated
-/// exactly once per split (at push time) and read back from @c _split_kinds on the removal path --
-/// which runs under the mutex on the critical path and must not re-run this @c dynamic_cast.
-[[nodiscard]] std::uint8_t classify(const op::operator_data& split) noexcept
+/// Structural facts about a split, computed once at push time on the producer thread.
+struct split_class {
+  /// kIoCandidate | kMemoryCandidate.
+  std::uint8_t kinds{0};
+  /// datasource_count(): exactly how many folds a prefetch_state() of this split would perform.
+  std::uint32_t fold_cost{0};
+};
+
+/// Classify a split for the incremental @c n_prefetchable counts and the consumer's fold budget.
+/// Structural, so it is evaluated exactly once per split (at push time) and read back from
+/// @c _split_kinds / @c _split_fold_costs on the consumer path -- which runs under the mutex on
+/// the critical path and must re-run neither this @c dynamic_cast nor the datasource walk.
+[[nodiscard]] split_class classify(const op::operator_data& split) noexcept
 {
   auto const* input = dynamic_cast<const op::scan::scan_operator_input*>(&split);
-  if (input == nullptr) { return 0; }
-  std::uint8_t mask = 0;
+  if (input == nullptr) { return {}; }
+  split_class result;
+  // One datasource walk, here on the producer thread, outside _mutex and outside the pipeline
+  // status lock. Its count is kept so the consumer never has to repeat it.
+  auto const n_datasources = input->datasource_count();
+  result.fold_cost         = static_cast<std::uint32_t>(
+    std::min<std::size_t>(n_datasources, std::numeric_limits<std::uint32_t>::max()));
   // Structural on both axes: "has datasources" and "is a resident batch" are fixed for the
   // split's lifetime, so the counts never need a rescan. The dynamic tests live in prefetch_if.
-  if (input->is_io_prefetchable()) { mask |= kIoCandidate; }
-  if (input->is_resident()) { mask |= kMemoryCandidate; }
-  return mask;
+  if (n_datasources > 0) { result.kinds |= kIoCandidate; }
+  if (input->is_resident()) { result.kinds |= kMemoryCandidate; }
+  return result;
 }
 
 /// A split's advisory prefetch progress, or @c empty for anything that is not a scan split.
@@ -63,24 +80,62 @@ split_connector::~split_connector() = default;
 
 void split_connector::push_split(std::unique_ptr<op::operator_data> split)
 {
-  assert(split != nullptr && "push_split requires a non-null split");
-  // Classified outside the lock: one dynamic_cast plus two lock-free predicates, none of which
-  // touch connector state.
-  auto const mask = classify(*split);
+  // A hard check, not an assert: asserts are compiled out in release, and both classify() and
+  // fill_progress_window() dereference every queued split -- the latter under _mutex (L2) while
+  // the consumer holds sirius_pipeline::_status_mutex (L1), on the path every task completion on
+  // the pipeline blocks behind. A null entry that used to flow through harmlessly would be a null
+  // deref there, in the worst place in the engine to take one.
+  if (split == nullptr) {
+    throw std::invalid_argument("[split_connector::push_split] split must be non-null");
+  }
+  // Classified outside the lock: one dynamic_cast plus one datasource walk, none of which touch
+  // connector state.
+  auto const cls = classify(*split);
+
+  // The one datasource walk that answers the arming question, taken here rather than under the
+  // lock: it is the walk the whole fold budget exists to keep out of the critical section, and it
+  // happens once per connector. _arming_checked is producer-private -- the consumer never reads
+  // it -- so testing it unlocked races with nothing.
+  //
+  // Only an io candidate can answer the question meaningfully: a resident split has no datasource
+  // and no backend, so letting one latch the flag would report "not armed" for a connector that
+  // later carries delta splits.
+  std::optional<bool> arming_answer;
+  if (!_arming_checked && (cls.kinds & kIoCandidate) != 0) {
+    auto const* input = dynamic_cast<const op::scan::scan_operator_input*>(split.get());
+    if (input != nullptr) { arming_answer = input->can_land_while_queued(); }
+  }
+
   {
     std::lock_guard<std::mutex> lock(_mutex);
     assert(!_closed && "push_split after close() is forbidden");
-    // _splits and _split_kinds are index-parallel. Grow the kinds side first and undo it if the
-    // split push fails, so an allocation failure can never leave them misaligned.
-    _split_kinds.push_back(mask);
+    // _splits, _split_kinds and _split_fold_costs are index-parallel. Grow the two side channels
+    // first and undo them if a later push fails, so an allocation failure can never leave them
+    // misaligned.
+    _split_kinds.push_back(cls.kinds);
     try {
-      _splits.push_back(std::move(split));
+      _split_fold_costs.push_back(cls.fold_cost);
     } catch (...) {
       _split_kinds.pop_back();
       throw;
     }
-    if ((mask & kIoCandidate) != 0) { ++_n_io_prefetchable; }
-    if ((mask & kMemoryCandidate) != 0) { ++_n_memory_prefetchable; }
+    try {
+      _splits.push_back(std::move(split));
+    } catch (...) {
+      _split_fold_costs.pop_back();
+      _split_kinds.pop_back();
+      throw;
+    }
+    if ((cls.kinds & kIoCandidate) != 0) { ++_n_io_prefetchable; }
+    if ((cls.kinds & kMemoryCandidate) != 0) { ++_n_memory_prefetchable; }
+    // Latched under the lock, because get_next_split reads it under the lock: the answer was
+    // computed off the lock but must not be *stored* off it, or the store would race the read.
+    // After the pushes, so a throwing push does not leave the connector armed by a split that
+    // never joined the queue.
+    if (arming_answer.has_value() && !_arming_checked) {
+      _arming_checked  = true;
+      _selection_armed = *arming_answer;
+    }
   }
   _cv.notify_one();
 }
@@ -106,13 +161,22 @@ std::optional<std::unique_ptr<op::operator_data>> split_connector::get_next_spli
   if (_exception) { std::rethrow_exception(_exception); }
   if (_splits.empty()) { return std::nullopt; }
 
-  // Everything below is bounded by kSelectionWindow, never by _splits.size(): this runs while the
-  // consumer holds sirius_pipeline::_status_mutex, behind which every task completing on the
-  // pipeline blocks. There must be no loop over the whole deque here.
-  std::array<io::cache::prefetch_progress, kSelectionWindow> window{};
-  auto const filled = fill_progress_window(window);
-  auto const index =
-    select_split_index(std::span<const io::cache::prefetch_progress>{window.data(), filled});
+  // The gate. No backend on this connector activates a prefetch before the dequeue, so nothing
+  // queued can report `cached` or `loading` and the selection walk provably cannot beat the queue
+  // front. Skip it entirely: this is the path every shipped configuration takes, and it is the
+  // same O(1) move-and-pop_front the connector had before the policy existed -- no state reads,
+  // no virtual calls, no datasource walks.
+  std::size_t index = 0;
+  if (_selection_armed) {
+    // Everything in here is bounded by kSelectionWindow splits AND kSelectionFoldBudget folds,
+    // never by _splits.size() or by a split's datasource count: this runs while the consumer
+    // holds sirius_pipeline::_status_mutex, behind which every task completing on the pipeline
+    // blocks. There must be no loop over the whole deque, and none over a whole split, here.
+    std::array<io::cache::prefetch_progress, kSelectionWindow> window{};
+    auto const filled = fill_progress_window(window);
+    index =
+      select_split_index(std::span<const io::cache::prefetch_progress>{window.data(), filled});
+  }
 
   // Always hands out what it selected -- select_split_index is total and never refuses. Waiting
   // for a better candidate would be a permanent hang: a split leaving prefetch_progress::loading
@@ -151,7 +215,10 @@ std::size_t split_connector::prefetch_if(std::size_t upto_n,
 
     if (kind == prefetch_kind::io) {
       if (!input->is_io_prefetchable()) { continue; }
-      input->prefetch(io::cache::prefetching_stage::task_queued);
+      // Counted only when the split's ladder actually advanced. This walk restarts from the queue
+      // front on every invocation and the dequeue fires task_queued again afterwards, so counting
+      // inspections instead would grow without bound over a static queue.
+      if (!input->prefetch(io::cache::prefetching_stage::task_queued)) { continue; }
     } else {
       // nullopt means the batch is exclusively locked right now; assume it still needs the
       // upload, because over-scheduling one is cheap and skipping a needed one stalls the task.
@@ -159,6 +226,7 @@ std::size_t split_connector::prefetch_if(std::size_t upto_n,
       // Counters only for now (D-N3): the resident path never calls prefetch(), and the only
       // place an early GPU upload can run is prepare_for_processing on the executor thread.
       // Scheduling one needs a dispatcher task and a memory reservation -- a separate design.
+      // The return value therefore reports candidates, not work done, for this kind.
     }
     ++hinted;
   }
@@ -175,10 +243,15 @@ std::size_t split_connector::n_prefetchable(prefetch_kind kind) const
 // A split leaving prefetch_progress::loading notifies io::cache::entry_state's atomic, never this
 // connector's condition variable, so refusing to hand out a loading split is a permanent hang.
 //
-// Rule 3 is also what keeps test/cpp/scan_manager/test_cached_serving_hardening.cpp:376-410
-// passing unmodified: resident splits carry no prefetch handle, so every state reads `empty`,
-// selection falls through to index 0, and the cached-serving dequeue stays exactly FIFO. Any
-// change to this policy must be checked against that positional test.
+// This function is also what the positional cached-serving regression case in
+// test/cpp/scan_manager/test_cached_serving_hardening.cpp ("drain_cached_provider forwards the
+// mvcc keep-mask and filter flag onto each split") depends on, and any change to the policy must
+// be checked against it. Note the connector that case builds is NOT resident-only in general --
+// drain_cached_provider feeds resident batches and delta metadata splits into one connector -- so
+// "resident splits carry no handle" is not on its own a reordering argument. The guarantee comes
+// from get_next_split's arming gate instead: a delta split's datasources are subject to the same
+// activation-stage test, no shipped backend passes it, the connector never arms, and the dequeue
+// is a literal pop_front that cannot reorder anything.
 std::size_t split_connector::select_split_index(
   std::span<const io::cache::prefetch_progress> states) noexcept
 {
@@ -208,7 +281,14 @@ std::size_t split_connector::fill_progress_window(
   // Bounded by kSelectionWindow, not by the queue length -- see get_next_split.
   std::size_t const n = std::min(_splits.size(), kSelectionWindow);
   std::size_t filled  = 0;
+  std::size_t spent   = 0;
   while (filled < n) {
+    // Second axis of the bound. The per-split fold cost was measured once by the producer, so
+    // this decision costs a deque index rather than the datasource walk it is protecting against.
+    // The front split is always inspected whatever it costs, so selection is never skipped
+    // outright and rule 3 of select_split_index always has a candidate.
+    if (filled > 0 && spent + _split_fold_costs[filled] > kSelectionFoldBudget) { break; }
+    spent += _split_fold_costs[filled];
     out[filled] = progress_of(*_splits[filled]);
     ++filled;
     // Rule 1 of select_split_index takes the FIRST landed split, so nothing past it can change
@@ -221,7 +301,8 @@ std::size_t split_connector::fill_progress_window(
 void split_connector::drop_at(std::size_t index) noexcept
 {
   assert(index < _splits.size() && index < _split_kinds.size() &&
-         "drop_at requires an index inside both _splits and _split_kinds");
+         index < _split_fold_costs.size() &&
+         "drop_at requires an index inside _splits, _split_kinds and _split_fold_costs");
 
   auto const mask = _split_kinds[index];
   if ((mask & kIoCandidate) != 0 && _n_io_prefetchable > 0) { --_n_io_prefetchable; }
@@ -234,6 +315,8 @@ void split_connector::drop_at(std::size_t index) noexcept
   _splits.erase(std::next(_splits.begin(), offset));
   _split_kinds.erase(
     std::next(_split_kinds.begin(), static_cast<std::deque<std::uint8_t>::difference_type>(index)));
+  _split_fold_costs.erase(std::next(
+    _split_fold_costs.begin(), static_cast<std::deque<std::uint32_t>::difference_type>(index)));
 }
 
 }  // namespace sirius::scan_manager

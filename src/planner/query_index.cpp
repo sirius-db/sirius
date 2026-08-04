@@ -233,13 +233,18 @@ std::vector<prefetch_step> query_index::prefetching_order() const
   std::vector<prefetch_step> steps;
   steps.reserve(_branch_heads.size());
 
+  // Defensive, and deliberately not covered by a test: a fan-out head owns several branches, and
+  // this names it once, under the first (matching the same first-wins rule _head_op_to_branch
+  // uses). Every route the plan converter takes today gives each pipeline its own source operator,
+  // so two _branch_heads entries with the same operator id are not constructible -- not from a
+  // real plan and not from the unit-test dag_builder. It stays because the invariant it depends on
+  // (one source operator per pipeline) is not this file's to enforce, and duplicating a scan in
+  // the prefetch order would silently double a query's hint budget.
   std::unordered_set<std::size_t> seen;  // operator ids already emitted
   for (std::size_t i = 0; i < _branch_heads.size(); ++i) {
     auto* head = _branch_heads[i];
     if (head == nullptr) { continue; }
     if (head->type != op::SiriusPhysicalOperatorType::GPU_SCAN) { continue; }
-    // A fan-out head owns several branches; name it once, under the first (matching the same
-    // first-wins rule _head_op_to_branch uses).
     if (!seen.insert(head->get_operator_id()).second) { continue; }
     steps.push_back(prefetch_step{head, _branch_order_types[i]});
   }

@@ -56,14 +56,20 @@ namespace sirius::io::cache {
  *
  * - @c none: not a rung. Used by @c io_context::prefetching_activation_stage to mean
  *   "this backend never wants prefetch activated"; ignored by @c prefetch.
- * - @c metadata_created: the coalescer has produced a split's metadata and is about to
- *   place it on the connector (load_balancing_scan_batch_coalescer.cpp:110, :206).
- * - @c task_queued: the task creator has dequeued the split and is about to build a task
- *   for it (sirius_gpu_scan_operator.cpp:199).
- * - @c task_preprocessing: the task's per-split preparation hook is running on a GPU
- *   executor thread (sirius_gpu_scan_operator_data.cpp:31).
- * - @c disposable: the split is being materialized; any still-pending prefetch for it is
- *   now waste and is cancelled (gpu_ingestible.cpp:35).
+ * - @c metadata_created: the coalescer has produced a split's metadata and is about to place it
+ *   on the connector — @c load_balancing_scan_batch_coalescer, both the parquet and the
+ *   duckdb-native emit paths.
+ * - @c task_queued: the split has left the connector and a task is about to be built for it —
+ *   @c sirius_gpu_scan_operator::get_next_task_input_data. Also fired for still-queued splits by
+ *   @c scan_manager::split_connector::prefetch_if.
+ * - @c task_preprocessing: the task's per-split preparation hook is running on a GPU executor
+ *   thread — @c op::scan::scan_operator_input::prepare_for_processing.
+ * - @c disposable: the split is being materialized; any still-pending prefetch for it is now
+ *   waste and is cancelled — @c op::scan::gpu_ingestible::materialize_table.
+ *
+ * @warning The enumerators are declared in ladder order and their underlying values are used as
+ *          rung indices (@c scan_operator_input compares them to deduplicate reports), so
+ *          reordering them or inserting one in the middle is a behaviour change.
  */
 enum class prefetching_stage {
   none,
@@ -377,17 +383,23 @@ class entry_state {
  * @c prefetching_cache::prefetch_loop, so iterating it from a consumer thread is UB.
  *
  * @warning ADVISORY ONLY. Never gate correctness on this value. It is a stale snapshot the
- *          instant it is returned, and it carries three documented inaccuracies:
+ *          instant it is returned, and it carries these documented inaccuracies:
  *          - @c prepared is also the IO-*failure* landing state (@c entry_state::mark_load_failed
  *            reverts loading -> allocated), and is indistinguishable from "not started yet".
- *          - @c prepared is permanent on backends whose @c prefetching_activation_stage is
- *            @c none (uring, kvikio): the request never leaves @c allocated.
+ *          - @c prepared is permanent on a backend that has a cache but whose
+ *            @c prefetching_activation_stage is @c none (uring with @c enable_prefetch_cache on):
+ *            @c fadvise stores a handle that is never activated, so the request never leaves
+ *            @c allocated. kvikio is a *different* case — it is never given a cache at all, so
+ *            @c fadvise stores no handle and the report is @c empty, not @c prepared.
  *          - @c cached on a request does not imply every chunk is cached —
  *            @c prefetch_loop erases un-loadable chunks and then marks the request cached.
  *          The only real readiness test is @c entry_state::acquire_read, which pins.
  */
 enum class prefetch_progress : std::uint8_t {
-  empty,      ///< No handle, or the handle carries no request context.
+  /// No handle, or the handle carries no request context. Also what
+  /// @ref combine_prefetch_progress reports for a split whose per-datasource progresses match no
+  /// other rule — an empty list, or a mixture such as @c {cached,empty} or @c {evicting}.
+  empty,
   cancelled,  ///< Consumer intent is cancelled; any pending IO is being abandoned.
   prepared,   ///< Request registered; queued, chunks allocated, or reverted after an IO failure.
   loading,    ///< IO is in flight for this request.
@@ -432,9 +444,16 @@ enum class prefetch_progress : std::uint8_t {
  *   5. any @c cancelled                     -> @c cancelled
  *   6. otherwise                            -> @c empty
  *
- * Rule 2 outranks rule 3 on purpose: @c split_connector's selection policy uses "in flight"
- * to steer away from a split whose IO has not landed, and a split is in flight if *any* of
- * its files is.
+ * Most of that table is structural rather than a policy choice: for a non-empty span rules 2 and
+ * 3 cannot both apply (a @c loading part breaks "all cached or in_use"), and neither can 3 and 4.
+ * **The one rule that decides anything is 4 over 5 — @c prepared beats @c cancelled**: a split
+ * with one live request and one abandoned one is still worth waiting for, so it must not report
+ * as abandoned. Rule 2's rank over 3 matters only in that it is the rule a reader is most likely
+ * to invert; a split is in flight if *any* of its files is, and @c split_connector's selection
+ * policy steers away from those.
+ *
+ * Rule 6 is why @c prefetch_progress::empty has a third meaning beyond "no handle": a mixture the
+ * table does not name (@c {cached,empty}, @c {evicting}) folds to it.
  */
 [[nodiscard]] prefetch_progress combine_prefetch_progress(
   std::span<const prefetch_progress> parts) noexcept;

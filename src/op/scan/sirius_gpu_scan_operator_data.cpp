@@ -22,6 +22,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdint>
 #include <span>
 #include <stdexcept>
 
@@ -58,20 +59,50 @@ scan_operator_input::scan_operator_input(
 
 scan_operator_input::~scan_operator_input()
 {
-  // The defaulted move operations leave the moved-from object's _prefetch_state null, so a split
-  // that was moved on its way down the chain reports exactly one creation and one disposal.
+  // Move CONSTRUCTION leaves the moved-from object's _prefetch_state null, so a split that was
+  // moved on its way down the chain reports exactly one creation and one disposal. Move
+  // *assignment* would not balance -- it would drop the target's _prefetch_state without
+  // reporting its disposal -- which is why it is deleted rather than defaulted.
   if (_prefetch_state) { _prefetch_state->on_input_disposed(); }
 }
 
-void scan_operator_input::prefetch(io::cache::prefetching_stage site) const
+bool scan_operator_input::prefetch(io::cache::prefetching_stage site) const
 {
+  // The ladder is monotone per split: the counters see each rung once however many times a site
+  // fires it. prefetch_if hints a still-queued split and re-walks from the queue front on every
+  // invocation, and get_next_task_input_data fires task_queued again after the dequeue, so an
+  // unconditional bump would grow n_task_queued without bound. prefetching_stage's enumerators
+  // are declared in ladder order (none = 0), so the underlying value is the rung index and
+  // `none` -- which is not a rung -- can never advance.
+  const bool advanced = _highest_rung.advance_to(static_cast<std::uint8_t>(site));
   // Above the metadata check on purpose (D11): a resident pinned-cache split has no scan metadata
   // and no datasource, but it climbs the same ladder. Recording the rung below the check reported
   // 0/0/0/0 for a fully-pinned query.
-  if (_prefetch_state) { _prefetch_state->update(site); }
+  if (advanced && _prefetch_state) { _prefetch_state->update(site); }
+  // The hint itself is unconditional: sirius_datasource::prefetch is idempotent for activate and
+  // must still observe a later disposable even if this split already reported that rung.
+  //
   // for_each_datasource, not get_fadvise_hints(): the latter walks the parquet footer once per
   // row-group slice to rebuild byte ranges this method does not use.
   for_each_datasource([site](io::sirius_datasource& datasource) { datasource.prefetch(site); });
+  return advanced;
+}
+
+bool scan_operator_input::can_land_while_queued() const noexcept
+{
+  // One bool by pointer, so the visitor fits libstdc++'s std::function small-object buffer and
+  // cannot heap-allocate on this noexcept boundary -- the same discipline prefetch_state() uses.
+  bool can_land = false;
+  for_each_datasource([&can_land](io::sirius_datasource& datasource) {
+    auto const stage = datasource.activation_stage();
+    // The only two rungs that fire before split_connector hands the split out. task_preprocessing
+    // (REST) runs in prepare_for_processing, after the dequeue; none never activates.
+    if (stage == io::cache::prefetching_stage::metadata_created ||
+        stage == io::cache::prefetching_stage::task_queued) {
+      can_land = true;
+    }
+  });
+  return can_land;
 }
 
 void scan_operator_input::for_each_datasource(

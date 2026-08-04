@@ -14,25 +14,30 @@
  * limitations under the License.
  */
 
-// Two properties of split_connector's dequeue are load-bearing and are what this file exists to
+// Three properties of split_connector's dequeue are load-bearing and are what this file exists to
 // pin:
 //   - liveness. Preferring a split whose IO has landed is safe; *refusing* one whose IO is still in
 //     flight is a permanent hang, because leaving prefetch_progress::loading notifies
 //     io::cache::entry_state's atomic and nothing in io/cache holds a reference to this connector's
 //     condition variable. select_split_index therefore always returns a valid index.
-//   - boundedness. get_next_split runs while the consumer holds sirius_pipeline::_status_mutex, and
-//     every task completing on that pipeline blocks behind it. The selection must stay O(1) in the
-//     queue length, which on local disk (where every state reads empty, so no landed split ever
-//     short-circuits the walk) is only true because of the kSelectionWindow bound.
+//   - the arming gate. The selection walk runs only when some pushed split reported
+//     can_land_while_queued, i.e. only when a backend on this connector activates its prefetch
+//     before the dequeue. No shipped backend does, so the shipped dequeue is the same move-and-
+//     pop_front it was before the policy existed: no state reads, no virtual calls, no walks.
+//   - boundedness, when the gate IS open. get_next_split runs while the consumer holds
+//     sirius_pipeline::_status_mutex, and every task completing on that pipeline blocks behind it.
+//     The selection must stay O(1) in the queue length AND in each split's datasource count, which
+//     is what kSelectionWindow and kSelectionFoldBudget bound respectively.
 //
 // The connector-level cases use metadata splits, which the public API cannot produce — the one
 // public producer route, drain_cached_provider, only emits resident splits and needs a GPU batch.
 // They go in through the split_connector_test_access friend seam instead.
 //
-// scan_operator_input::prefetch_state is virtual precisely so the selection policy can be driven
-// end to end from here: reaching prefetch_progress::cached for real needs a live armed prefetching
-// cache, and no shipped local backend arms one, so the synthetic-state subclass below is the only
-// route to a non-empty state. See the @note on that method before devirtualizing it.
+// scan_operator_input::prefetch_state and ::can_land_while_queued are virtual precisely so the
+// selection policy can be driven end to end from here: arming the gate needs a pre-dequeue
+// activation stage and reaching prefetch_progress::cached needs a live armed prefetching cache,
+// and no shipped local backend provides either. The synthetic subclass below is the only route to
+// both. See the @note on each method before devirtualizing it.
 
 #include "scan_manager/split_connector_test_access.hpp"
 
@@ -66,13 +71,21 @@ using sirius::scan_manager::split_connector_test_access;
 // scan_operator_input has a user-declared destructor (it reports the split's disposal to the
 // per-query prefetch counters), which suppresses the implicit move operations, and its
 // unique_ptr<scan_info> variant alternative separately deletes the copy operations. Without the
-// explicitly defaulted moves on the class the type would be neither copyable nor movable, and
-// every split in this file is moved on its way into the connector. Asserted at namespace scope so
-// a regression is a compile error rather than a case failure.
+// explicitly defaulted move CONSTRUCTOR the type would be neither copyable nor movable, and every
+// split in this file is moved on its way into the connector.
+//
+// Move ASSIGNMENT must stay deleted, and that is the create/dispose invariant, not a style rule:
+// `a = std::move(b)` would overwrite a's prefetching_state_manager handle without reporting a's
+// disposal, so the split a used to be would be counted as created and never disposed and n_live
+// would leak for the rest of the query. Move construction has no such hole -- it leaves the
+// source's handle null, so the split still accounts for exactly one creation and one disposal.
+//
+// Asserted at namespace scope so a regression is a compile error rather than a case failure.
 static_assert(std::is_move_constructible_v<scan::scan_operator_input>,
               "scan_operator_input must stay move-constructible");
-static_assert(std::is_move_assignable_v<scan::scan_operator_input>,
-              "scan_operator_input must stay move-assignable");
+static_assert(!std::is_move_assignable_v<scan::scan_operator_input>,
+              "scan_operator_input must NOT be move-assignable: assignment would drop the source "
+              "split's disposal report and leak prefetching_state_manager::n_live");
 
 std::size_t select(const std::vector<prefetch_progress>& states)
 {
@@ -94,32 +107,52 @@ std::string nation_parquet()
 }
 
 /// Metadata-split descriptor carrying a push-order identity, optionally one real datasource, and a
-/// count of how many times the connector folded this split's prefetch state.
+/// count of how many times anything walked this split's datasources.
 class probe_scan_info : public scan::scan_info {
  public:
-  probe_scan_info(std::size_t id, std::shared_ptr<sirius::io::sirius_datasource> datasource)
-    : _id(id), _datasource(std::move(datasource))
+  /// @param id          Push-order identity, readable back through @ref id_of.
+  /// @param datasource  The real datasource to visit, or null to visit nothing.
+  /// @param declared    What @ref datasource_count reports, which is what the connector records
+  ///                    as this split's fold cost. Defaults to the real count. Set it above 1 to
+  ///                    stand in for a @c parquet_split_info with many row-group slices without
+  ///                    having to open that many files.
+  probe_scan_info(std::size_t id,
+                  std::shared_ptr<sirius::io::sirius_datasource> datasource,
+                  std::size_t declared = 0)
+    : declared_datasources(declared != 0 ? declared : (datasource ? 1U : 0U)),
+      _id(id),
+      _datasource(std::move(datasource))
   {
   }
 
   void for_each_datasource(
     const std::function<void(sirius::io::sirius_datasource&)>& visit) const override
   {
-    ++folds;
-    if (_datasource) { visit(*_datasource); }
+    ++walks;
+    // Kept consistent with datasource_count() so a wide split really does cost that many visits.
+    // With a null datasource there is nothing to visit; only staged_split does that, and it
+    // overrides both methods that would walk.
+    if (!_datasource) { return; }
+    for (std::size_t i = 0; i < declared_datasources; ++i) {
+      visit(*_datasource);
+    }
   }
 
   [[nodiscard]] std::size_t datasource_count() const noexcept override
   {
-    return _datasource ? 1 : 0;
+    return declared_datasources;
   }
 
   /// The connector only ever sees a split as an @c operator_data, so the identity rides on the one
   /// @c scan_info value @c scan_operator_input forwards through that interface.
   [[nodiscard]] std::size_t estimated_bytes() const noexcept override { return _id; }
 
-  /// How many times this split's prefetch state was folded; mutable because the fold is const.
-  mutable std::size_t folds{0};
+  std::size_t declared_datasources;
+
+  /// How many times this split's datasources were walked, by anything: the connector's one
+  /// per-connector arming check, or a consumer-side prefetch_state() fold. Mutable because the
+  /// walk is const.
+  mutable std::size_t walks{0};
 
  private:
   std::size_t _id;
@@ -132,18 +165,34 @@ std::size_t id_of(const operator_data& split)
   return input == nullptr ? 0 : input->get_estimated_size_in_bytes();
 }
 
-/// A split that reports whichever prefetch state the test asked for.
+/// A split that reports whichever prefetch state the test asked for, on a connector it arms or
+/// leaves unarmed on request.
 ///
-/// The only way to observe @c get_next_split's selection end to end. Reaching
-/// @c prefetch_progress::cached for real requires a live armed prefetching cache, and no shipped
-/// local backend arms one (both opt out of the ladder), so no *real* split can ever be steered off
-/// the FIFO path — which would leave the policy testable only as a pure function.
-/// @c split_connector reaches splits through @c dynamic_cast<const scan_operator_input*>, which
-/// succeeds for this subclass, so overriding the (virtual) state accessor is enough.
+/// The only way to observe @c get_next_split's selection end to end. Arming the gate for real
+/// requires a backend that activates its prefetch before the dequeue, and reaching
+/// @c prefetch_progress::cached requires a live armed prefetching cache; no shipped local backend
+/// provides either, so no *real* split can ever be steered off the FIFO path — which would leave
+/// the policy testable only as a pure function. @c split_connector reaches splits through
+/// @c dynamic_cast<const scan_operator_input*>, which succeeds for this subclass, so overriding
+/// the two virtual accessors is enough.
+///
+/// The descriptor carries no real datasource but declares a non-zero @c datasource_count, which is
+/// what makes the split an io candidate (so the connector runs its arming check on it) and what
+/// gives it a fold cost. Nothing walks those declared datasources, because both methods that
+/// would are overridden here.
 class staged_split : public scan::scan_operator_input {
  public:
-  staged_split(std::size_t id, prefetch_progress state)
-    : scan_operator_input(std::make_unique<probe_scan_info>(id, nullptr)), _state(state)
+  /// @param can_land  What @ref can_land_while_queued reports, i.e. whether this split arms the
+  ///                  connector's selection gate.
+  /// @param fold_cost What the split declares as its datasource count, which the connector spends
+  ///                  against @c kSelectionFoldBudget.
+  staged_split(std::size_t id,
+               prefetch_progress state,
+               bool can_land         = true,
+               std::size_t fold_cost = 1)
+    : scan_operator_input(std::make_unique<probe_scan_info>(id, nullptr, fold_cost)),
+      _state(state),
+      _can_land(can_land)
   {
   }
 
@@ -153,11 +202,14 @@ class staged_split : public scan::scan_operator_input {
     return _state;
   }
 
+  [[nodiscard]] bool can_land_while_queued() const noexcept override { return _can_land; }
+
   /// How many times the connector read this split's state; mutable because the read is const.
   mutable std::size_t folds{0};
 
  private:
   prefetch_progress _state;
+  bool _can_land;
 };
 
 /// Builds @ref staged_split s while keeping a raw handle on each, so a test can read back how
@@ -166,9 +218,13 @@ class staged_split : public scan::scan_operator_input {
 struct staged_factory {
   std::vector<staged_split*> probes;
 
-  void push(split_connector& connector, std::size_t id, prefetch_progress state)
+  void push(split_connector& connector,
+            std::size_t id,
+            prefetch_progress state,
+            bool can_land         = true,
+            std::size_t fold_cost = 1)
   {
-    auto split = std::make_unique<staged_split>(id, state);
+    auto split = std::make_unique<staged_split>(id, state, can_land, fold_cost);
     probes.push_back(split.get());
     split_connector_test_access::push(connector, std::move(split));
   }
@@ -183,14 +239,15 @@ struct staged_factory {
   }
 };
 
-/// Builds metadata splits over one real parquet file, keeping a raw handle on each descriptor so a
-/// test can read back how often the connector inspected it.
+/// Builds real metadata splits over one real parquet file, keeping a raw handle on each descriptor
+/// so a test can read back how often anything walked its datasources.
 ///
 /// No prefetching cache is wired anywhere in this file — there is no mock ioctx and none is needed.
-/// Every datasource here is a real kvikio one that was never fadvised, so every split reports
-/// prefetch_progress::empty. That is the shipped local-disk shape, and it is exactly the case the
-/// kSelectionWindow bound exists to keep cheap: with nothing ever landed, the walk never
-/// short-circuits.
+/// Every datasource here is a real kvikio one, whose activation stage is `none`, so a connector
+/// filled from here never arms and every split would report prefetch_progress::empty if anything
+/// asked. **That is the shipped local-disk shape**, and these splits are how this file pins it:
+/// the dequeue must be a plain pop_front, and the only datasource walk in the connector's whole
+/// life is the single arming check on the first push.
 ///
 /// The @ref probes pointers are only valid while the splits are alive — i.e. while they are still
 /// queued or while a pulled split is still held.
@@ -221,11 +278,11 @@ struct split_factory {
     }
   }
 
-  [[nodiscard]] std::size_t total_folds() const
+  [[nodiscard]] std::size_t total_walks() const
   {
     std::size_t total = 0;
     for (auto const* probe : probes) {
-      total += probe->folds;
+      total += probe->walks;
     }
     return total;
   }
@@ -363,6 +420,23 @@ TEST_CASE("prefetch_if honours its look-ahead window",
   }
 }
 
+TEST_CASE("prefetch_if counts a split's ladder rung only the first time it advances",
+          "[scan_manager][prefetch_api][split_connector]")
+{
+  // The ladder must be monotone per split. This walk restarts from the queue front on every
+  // invocation and the dequeue fires task_queued again afterwards, so counting inspections rather
+  // than advances would grow prefetching_state_manager::n_task_queued without bound on a queue
+  // that is not draining -- which is exactly when the depleted hook fires repeatedly.
+  split_factory factory;
+  split_connector connector;
+  factory.fill(connector, 3);
+
+  auto const always = [](const operator_data&) { return true; };
+  CHECK(connector.prefetch_if(3, prefetch_kind::io, always) == 3);
+  CHECK(connector.prefetch_if(3, prefetch_kind::io, always) == 0);
+  CHECK(connector.prefetch_if(3, prefetch_kind::io, always) == 0);
+}
+
 TEST_CASE("prefetch_if leaves every split in the queue",
           "[scan_manager][prefetch_api][split_connector]")
 {
@@ -380,42 +454,141 @@ TEST_CASE("prefetch_if leaves every split in the queue",
   CHECK_FALSE(connector.has_more_splits());
 }
 
-TEST_CASE("a connector holding more than the window inspects only the window",
+TEST_CASE("an armed connector holding more than the window inspects only the window",
           "[scan_manager][prefetch_api][split_connector]")
 {
-  split_factory factory;
+  constexpr std::size_t kPushed = split_connector::kSelectionWindow * 3;
+  staged_factory factory;
   split_connector connector;
-  factory.fill(connector, split_connector::kSelectionWindow * 3);
+  // Nothing landed, so the walk never short-circuits: only kSelectionWindow stops it. One fold
+  // each, so the queue stays well inside kSelectionFoldBudget and this case isolates the window.
+  for (std::size_t id = 1; id <= kPushed; ++id) {
+    factory.push(connector, id, prefetch_progress::prepared);
+  }
 
   // Held for the rest of the case: the fold counters live on the split that was handed out.
   auto pulled = connector.get_next_split();
   REQUIRE(pulled.has_value());
+  CHECK(id_of(**pulled) == 1);  // nothing landed, so rule 2/3 still return the queue front
 
   // The dequeue runs under sirius_pipeline::_status_mutex, where every task completion on the
   // pipeline blocks behind it, so its cost must not scale with the queue length.
-  CHECK(factory.total_folds() <= split_connector::kSelectionWindow);
+  CHECK(factory.total_folds() == split_connector::kSelectionWindow);
   for (std::size_t i = split_connector::kSelectionWindow; i < factory.probes.size(); ++i) {
     INFO("split at index " << i << " is past the selection window");
     CHECK(factory.probes[i]->folds == 0);
   }
 }
 
-TEST_CASE("get_next_split is fifo when nothing has landed",
+TEST_CASE("an unarmed connector dequeues strictly fifo and never reads a split's state",
           "[scan_manager][prefetch_api][split_connector]")
 {
-  // The local-disk common path: no backend arms the prefetch ladder, so every split reports
-  // prefetch_progress::empty and the bounded window must not reorder anything.
+  // The shipped path, and the whole point of the arming gate. Every datasource here is a real
+  // kvikio one, whose activation stage is `none`, so no queued split could ever report `cached`
+  // and the selection walk could not beat the queue front even if it ran. It does not run: the
+  // dequeue is the same move-and-pop_front it was before the policy existed.
   constexpr std::size_t kPushed = split_connector::kSelectionWindow * 2;
   split_factory factory;
   split_connector connector;
   factory.fill(connector, kPushed);
 
+  // The one datasource walk this connector will ever do: push_split's arming check, on the
+  // producer thread, on the first io candidate only.
+  CHECK(factory.total_walks() == 1);
+
+  // Pulled splits are kept alive so the counters below are read off live probes.
+  std::vector<std::optional<std::unique_ptr<operator_data>>> pulled;
   for (std::size_t expected = 1; expected <= kPushed; ++expected) {
     auto split = connector.get_next_split();
     REQUIRE(split.has_value());
     CHECK(id_of(**split) == expected);
+    pulled.push_back(std::move(split));
   }
   CHECK_FALSE(connector.has_more_splits());
+
+  // Still one: kPushed dequeues added no consumer-side folds at all. Any prefetch_state() read on
+  // this path would show up here, because scan_operator_input::prefetch_state folds through
+  // for_each_datasource.
+  CHECK(factory.total_walks() == 1);
+}
+
+TEST_CASE("a connector arms only when a split can land while queued",
+          "[scan_manager][prefetch_api][split_connector]")
+{
+  // Identical queue shapes; the only difference is what the splits report for
+  // can_land_while_queued. That is the gate, isolated.
+  SECTION("an unarmed connector ignores a landed split behind the queue front")
+  {
+    staged_factory factory;
+    split_connector connector;
+    factory.push(connector, 1, prefetch_progress::loading, /*can_land=*/false);
+    factory.push(connector, 2, prefetch_progress::cached, /*can_land=*/false);
+
+    auto split = connector.get_next_split();
+    REQUIRE(split.has_value());
+    CHECK(id_of(**split) == 1);         // FIFO: the cached split at index 1 is never looked for
+    CHECK(factory.total_folds() == 0);  // and no state was read to find that out
+  }
+
+  SECTION("one split that can land arms the connector for all of them")
+  {
+    // Latched per connector, not per split: the first io candidate decides, and the splits behind
+    // it are selected over without being asked again.
+    staged_factory factory;
+    split_connector connector;
+    factory.push(connector, 1, prefetch_progress::loading, /*can_land=*/true);
+    factory.push(connector, 2, prefetch_progress::cached, /*can_land=*/false);
+
+    auto split = connector.get_next_split();
+    REQUIRE(split.has_value());
+    CHECK(id_of(**split) == 2);
+    CHECK(factory.total_folds() == 2);
+  }
+}
+
+TEST_CASE("the fold budget bounds the selection walk",
+          "[scan_manager][prefetch_api][split_connector]")
+{
+  // kSelectionWindow bounds how many splits are inspected; this bounds the work inside them. A
+  // parquet_split_info carries one datasource per row-group slice, so a per-split bound alone
+  // still leaves the walk unbounded on exactly the split type production queues.
+  SECTION("a split wider than the whole budget is still inspected, and stops the walk")
+  {
+    staged_factory factory;
+    split_connector connector;
+    factory.push(connector,
+                 1,
+                 prefetch_progress::prepared,
+                 /*can_land=*/true,
+                 /*fold_cost=*/split_connector::kSelectionFoldBudget + 8);
+    for (std::size_t id = 2; id <= split_connector::kSelectionWindow; ++id) {
+      factory.push(connector, id, prefetch_progress::cached);
+    }
+
+    // The front split is always inspected whatever it costs -- otherwise selection would be
+    // skipped entirely and rule 3 would have no candidate -- but nothing after it fits.
+    auto pulled = connector.get_next_split();
+    REQUIRE(pulled.has_value());
+    CHECK(id_of(**pulled) == 1);
+    CHECK(factory.total_folds() == 1);
+  }
+
+  SECTION("the budget stops the walk before the window does")
+  {
+    // Eight splits at a quarter of the budget each: the fourth exhausts it exactly, so the fifth
+    // is where the walk stops -- half the window.
+    constexpr std::size_t kCost = split_connector::kSelectionFoldBudget / 4;
+    staged_factory factory;
+    split_connector connector;
+    for (std::size_t id = 1; id <= split_connector::kSelectionWindow; ++id) {
+      factory.push(connector, id, prefetch_progress::prepared, /*can_land=*/true, kCost);
+    }
+
+    auto pulled = connector.get_next_split();
+    REQUIRE(pulled.has_value());
+    CHECK(id_of(**pulled) == 1);
+    CHECK(factory.total_folds() == 4);
+  }
 }
 
 TEST_CASE("get_next_split hands out the split whose prefetch has landed",

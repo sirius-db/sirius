@@ -44,10 +44,10 @@ namespace sirius::scan_manager {
  * end-of-query summary log.
  *
  * **A fresh instance per query is mandatory, not stylistic.** A split can outlive its query:
- * @c ~split_connector runs when the pipelines are destroyed at @c query_.reset()
- * (sirius_context.cpp:305), which is *before* @c scan_manager_->reset() (:350), and a task can be
- * mid-flight on a GPU executor thread. A straggler from query N must decrement query N's instance,
- * not query N+1's. Resetting a long-lived instance would silently skew the next query's counts.
+ * @c ~split_connector runs when the query's pipelines are destroyed, which is *before* the scan
+ * manager is reset, and a task can be mid-flight on a GPU executor thread. A straggler from query
+ * N must decrement query N's instance, not query N+1's. Resetting a long-lived instance would
+ * silently skew the next query's counts.
  *
  * All counters are relaxed atomics, following @c io::cache::prefetching_cache::counters. Every
  * mutating method is @c noexcept and non-blocking: they are called from destructors, from GPU
@@ -61,9 +61,12 @@ class prefetching_state_manager {
   /// @brief Tunables, mirrored from @c scan_manager_config.
   struct config {
     /// Host-cache bytes above which look-ahead prefetching backs off. 0 disables the check.
+    /// @note Reserved — not yet read; the look-ahead walk the hooks will drive is a follow-up.
     std::size_t memory_threshold{0};
-    /// Look-ahead window: the most splits a single hook invocation will hint.
-    std::size_t max_concurrent_scan{4};
+    /// Prefetch look-ahead window: the most queued splits a single hook invocation will hint.
+    /// Not a concurrency limit.
+    /// @note Reserved — not yet read; the look-ahead walk the hooks will drive is a follow-up.
+    std::size_t prefetch_lookahead_window{4};
   };
 
   /// @brief Immutable view of the counters. Plain integers — safe to copy and log.
@@ -83,7 +86,7 @@ class prefetching_state_manager {
   prefetching_state_manager& operator=(const prefetching_state_manager&) = delete;
 
   /**
-   * @brief Bind this instance to @p query and zero the counters.
+   * @brief Bind this instance to @p query, zero the counters, and re-attach the hook targets.
    *
    * Captures @c query.query_id() only — it does not retain a reference. @c sirius::planner::query
    * is destroyed before the scan manager is reset, so retaining one would dangle.
@@ -94,9 +97,17 @@ class prefetching_state_manager {
    * @brief Detach from the current query and log the final summary.
    *
    * Takes no argument **by design**: there is no point in the teardown order at which a
-   * @c const query& is still valid. @c query_ is destroyed at sirius_context.cpp:305, before
-   * @c scan_manager_->reset() at :350, which is this method's only caller. Straggler splits
-   * destroyed after this call still decrement the counters harmlessly — nobody reads them again.
+   * @c const query& is still valid. @c sirius::planner::query is destroyed before
+   * @c sirius_scan_manager::reset, which is this method's only caller. Straggler splits destroyed
+   * after this call still decrement the counters harmlessly — nobody reads them again.
+   *
+   * Also **latches the detached flag**, after which @ref on_task_queue_depleted and
+   * @ref on_task_not_created return immediately. That is the real protection against a straggler
+   * hook: the @c weak_ptr the hooks are installed with cannot expire while any split still holds a
+   * @c shared_ptr to this manager, so it still locks successfully in exactly the window where the
+   * query's connectors have already been destroyed. @ref prepare_for_query clears the flag again.
+   * It narrows that window rather than closing it — a hook already past the check when this runs
+   * is still inside — so a hook body must also be safe against what it walks disappearing.
    *
    * @note The summary this logs comes from @ref summary, which builds a @c std::string and can
    *       therefore throw (@c std::bad_alloc, or a formatting error). Because this method is
@@ -135,12 +146,14 @@ class prefetching_state_manager {
   /**
    * @brief Hook target for @c creator::task_creator::task_queue_depleted_hook. Non-blocking.
    *
-   * Runs on the task_scheduler management thread with no lock held. Budget: one relaxed counter
-   * read plus one bounded @c split_connector::prefetch_if walk.
+   * Runs on the task_scheduler management thread with no lock held. Returns immediately once
+   * @ref clean_up has detached this instance, which is what keeps a straggler hook from touching
+   * a query's connectors after they have been destroyed.
    *
-   * @note @c prefetch_if acquires a mutex and runs a caller-supplied predicate, either of which
-   *       can throw. Since this method is @c noexcept, the implementation **must** wrap that call
-   *       in @c try/catch(...); it must also not allocate on the common path.
+   * @note **Reserved — not yet implemented** beyond the detach gate. The bounded
+   *       @c split_connector::prefetch_if walk this hook exists to trigger needs the query's
+   *       connectors, which reach this object with the scan-manager wiring; see the TODO on the
+   *       implementation for the constraints that walk has to satisfy.
    */
   void on_task_queue_depleted() noexcept;
 
@@ -148,14 +161,20 @@ class prefetching_state_manager {
    * @brief Hook target for @c creator::task_creator::task_not_created_hook. Non-blocking.
    *
    * Runs on the task_creator's single manager thread with no lock held — blocking here stalls
-   * task creation engine-wide. Same budget and the same @c try/catch(...) requirement as
+   * task creation engine-wide. Same detach gate and same constraints as
    * @ref on_task_queue_depleted.
+   *
+   * @note **Reserved — not yet implemented** beyond the detach gate.
    *
    * @param requested The operator the failed request started from. Borrowed for the call only.
    * @param kind      Whether the request was active or speculative look-ahead.
    */
   void on_task_not_created(const op::sirius_physical_operator* requested,
                            creator::request_type kind) noexcept;
+
+  /// @brief Whether @ref clean_up has detached this instance from its query. Relaxed load.
+  ///        Exposed so the detach gate is observable without driving a hook.
+  [[nodiscard]] bool is_detached() const noexcept;
 
   /**
    * @brief A torn but cheap read of every counter.
@@ -190,6 +209,10 @@ class prefetching_state_manager {
 
   const config _cfg;
   std::atomic<sirius::query_id_t> _query_id{};
+  /// Latched by @ref clean_up, cleared by @ref prepare_for_query. Gates both hook targets.
+  /// Relaxed: it publishes nothing, and a hook that reads it one instant stale is exactly as
+  /// harmless as one that fired one instant earlier.
+  std::atomic<bool> _detached{false};
   counters _counters;
 };
 

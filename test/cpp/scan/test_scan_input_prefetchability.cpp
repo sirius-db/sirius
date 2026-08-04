@@ -172,7 +172,7 @@ TEST_CASE("a metadata split is not memory-prefetchable", "[scan][prefetch_api][s
 TEST_CASE("a counted split reports every ladder rung it climbs", "[scan][prefetch_api][scan_input]")
 {
   auto counters = std::make_shared<prefetching_state_manager>(
-    prefetching_state_manager::config{.memory_threshold = 0, .max_concurrent_scan = 4});
+    prefetching_state_manager::config{.memory_threshold = 0, .prefetch_lookahead_window = 4});
 
   {
     auto split = std::make_unique<scan::parquet_file_scan_info>();
@@ -207,7 +207,7 @@ TEST_CASE("a resident split is counted even though it has no datasource",
   // 0/0/0/0 for a fully-pinned query. A null batch pointer is enough: is_resident() is true and
   // has_scan_metadata() is false, with no GPU involved.
   auto counters = std::make_shared<prefetching_state_manager>(
-    prefetching_state_manager::config{.memory_threshold = 0, .max_concurrent_scan = 4});
+    prefetching_state_manager::config{.memory_threshold = 0, .prefetch_lookahead_window = 4});
 
   scan::scan_operator_input input{std::shared_ptr<cucascade::data_batch>{}, counters};
   REQUIRE(input.is_resident());

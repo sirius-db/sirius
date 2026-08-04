@@ -50,6 +50,11 @@ void prefetching_state_manager::prepare_for_query(const sirius::planner::query& 
   _counters.n_task_prepared.store(0, kOrder);
   _counters.n_task_completed.store(0, kOrder);
   _counters.n_live.store(0, kOrder);
+
+  // Re-attach: a manager that was cleaned up and then bound to a new query must serve hooks again.
+  // Cleared after the counters are zeroed, so the statement order reads "reset, then re-arm".
+  // Relaxed like every other access here; nothing is published through these.
+  _detached.store(false, kOrder);
 }
 
 void prefetching_state_manager::clean_up() noexcept
@@ -62,10 +67,18 @@ void prefetching_state_manager::clean_up() noexcept
   } catch (...) {  // deliberately swallowed: the log line is the only casualty
   }
 
-  // Detach. The counters are deliberately left alone: a straggler split can still be destroyed
-  // after this point (~split_connector runs when the query's pipelines die, before the scan
-  // manager is reset, and a task can be in flight on a GPU executor thread), and its decrement
-  // must land somewhere harmless rather than be raced against a reset.
+  // Detach. Written FIRST, so no hook can start work against a query whose connectors are gone.
+  //
+  // This flag, not the weak_ptr the hooks capture, is what makes the stale-hook window safe. A
+  // straggler split still holds a shared_ptr to this manager, so the weak_ptr does NOT expire in
+  // that window -- it locks successfully, exactly when the query's split_connectors have already
+  // been destroyed along with the pipelines.
+  _detached.store(true, kOrder);
+
+  // The counters are deliberately left alone: a straggler split can still be destroyed after this
+  // point (~split_connector runs when the query's pipelines die, before the scan manager is reset,
+  // and a task can be in flight on a GPU executor thread), and its decrement must land somewhere
+  // harmless rather than be raced against a reset.
   _query_id.store(sirius::query_id_t{}, kOrder);
 }
 
@@ -109,23 +122,39 @@ void prefetching_state_manager::on_input_disposed() noexcept
 
 void prefetching_state_manager::on_task_queue_depleted() noexcept
 {
-  // Nothing to drive yet. The bounded split_connector::prefetch_if walk this hook exists to
-  // trigger needs the query's connectors, which reach this object with the scan-manager wiring;
-  // until then the hook is installable and inert rather than absent.
+  // The detach gate, and the first statement on purpose. Once clean_up() has run, this query's
+  // split_connectors have already been destroyed with its pipelines, so anything this hook would
+  // walk is gone. The weak_ptr the hook captures does not protect that window: a straggler split
+  // still holds a shared_ptr here, so the lock() succeeds.
   //
-  // @warning When that walk lands it MUST be wrapped in try/catch(...): prefetch_if acquires
-  //          split_connector::_mutex and runs a caller-supplied predicate, either of which can
-  //          throw, and this method is noexcept -- an escaping exception calls std::terminate on
-  //          the task_scheduler management thread. Same for on_task_not_created below, where it
-  //          would instead take down the engine's single task-creation thread.
+  // A gate, not a barrier: a hook that had already passed this line when clean_up() ran is still
+  // inside. Whatever goes below must therefore be safe against a connector disappearing mid-walk
+  // in its own right -- the gate narrows the window, it does not close it.
+  if (_detached.load(kOrder)) { return; }
+
+  // TODO: drive the bounded split_connector::prefetch_if walk from here, once the query's
+  // connectors reach this object with the scan-manager wiring. Until then the hook is installable
+  // and inert rather than absent. Three constraints on that walk, all load-bearing:
+  //   - budget: one relaxed counter read plus one prefetch_if call bounded by
+  //     _cfg.prefetch_lookahead_window. This runs on the task_scheduler management thread, which
+  //     is also the thread that matches every ready device to a task.
+  //   - try/catch(...): prefetch_if acquires split_connector::_mutex and runs a caller-supplied
+  //     predicate, either of which can throw, and this method is noexcept -- an escaping exception
+  //     calls std::terminate. Same for on_task_not_created below, where it would instead take down
+  //     the engine's single task-creation thread.
+  //   - lock rank: the predicate passed to prefetch_if runs at L2 and must acquire nothing of rank
+  //     L1 or lower. See split_connector::prefetch_if's @warning.
 }
 
 void prefetching_state_manager::on_task_not_created(
   const op::sirius_physical_operator* /*requested*/, creator::request_type /*kind*/) noexcept
 {
-  // See on_task_queue_depleted: inert until the connectors are wired in, and the same
-  // try/catch(...) requirement applies to the walk that will go here.
+  // See on_task_queue_depleted: the same detach gate, and the same TODO and its three constraints
+  // apply to the walk that will go here.
+  if (_detached.load(kOrder)) { return; }
 }
+
+bool prefetching_state_manager::is_detached() const noexcept { return _detached.load(kOrder); }
 
 prefetching_state_manager::counters_snapshot prefetching_state_manager::snapshot() const noexcept
 {

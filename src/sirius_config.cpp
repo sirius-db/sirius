@@ -165,7 +165,8 @@ static void from_yaml(const YAML::Node& node, scan_manager::scan_manager_config&
   r.optional("rest_n_reactors", opt.rest_n_reactors, yaml::greater_than<std::size_t>{0});
   r.optional("enable_prefetch_cache", opt.enable_prefetch_cache);
   r.optional("prefetch_memory_threshold", yaml::bytes(opt.prefetch_memory_threshold));
-  r.optional("max_concurrent_scan", opt.max_concurrent_scan, yaml::greater_than<std::size_t>{0});
+  r.optional(
+    "prefetch_lookahead_window", opt.prefetch_lookahead_window, yaml::greater_than<std::size_t>{0});
   if (auto n = r.optional_node("local")) sirius::from_yaml(*n, opt.local);
   if (auto n = r.optional_node("rest")) sirius::from_yaml(*n, opt.rest);
   if (auto n = r.optional_node("cache")) sirius::from_yaml(*n, opt.cache);

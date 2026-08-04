@@ -161,11 +161,22 @@ class query_index {
    * plan order (which is the branch order, which is the scheduling priority order produced by
    * @c creator::task_creator::compute_pipeline_priorities) is preserved.
    *
-   * That ordering is what makes a join's build side precede its probe side: under
-   * @ref build_probe the build edge keeps its FULL barrier while the probe edge is rewritten to
-   * PIPELINE, so the build branch sorts to @c full_barrier and the probe branch to
-   * @c streaming. The scheduler wants the blocking side warm first — nothing downstream of the
-   * join can run until the build completes.
+   * **This puts a hash join's build side before its probe side only when the probe branch's
+   * terminating edge is weaker than the build branch's** — i.e. when the join's own output is not
+   * itself cut by a `FULL` barrier. Under @ref build_probe the probe edge is rewritten to
+   * PIPELINE and therefore never cuts (@c pipeline_dag::cuts requires FULL), so the probe branch
+   * always absorbs the join and is classified by whatever is downstream of it. When that is a
+   * FULL edge into a multiport consumer — a join feeding another join's build side, a common
+   * TPC-H shape — both branches classify @c full_barrier and plan order decides, which puts the
+   * probe first. The rewritten probe edge is never the operative mechanism.
+   *
+   * Making build-before-probe unconditional requires ranking branches by
+   * distance-to-first-blocking-barrier rather than by their terminating edge:
+   * @c blocking_distance(B) = the smallest index @c i in @c B such that some out-edge of @c B[i]
+   * into a multiport consumer carries @c MemoryBarrierType::FULL (and @c |B| when none does),
+   * sorted by @c (blocking_distance, order_rank, plan_index). That is a deferred follow-up: it
+   * changes what @ref order_type means, and @ref order_type is also the public per-branch
+   * accessor @ref get_branch_order_type.
    *
    * The classification is fixed at @ref build_index time, so it reflects whichever
    * @ref build_index_options the index was built with. **Production callers must pass

@@ -390,14 +390,56 @@ TEST_CASE("prefetching_order puts a hash join's build side before its probe side
           "[query_index][prefetch_api][prefetching_order]")
 {
   // The scheduler wants the blocking side warm first: nothing downstream of the join runs until
-  // the build completes. Under build_probe the probe edge is rewritten to PIPELINE, so the probe
-  // branch classifies streaming while the build branch keeps its FULL barrier — and the sort by
-  // barrier class overrides plan order, in which the probe comes first.
+  // the build completes. Here the join's own output is NOT cut, so the probe branch (which always
+  // absorbs the join under build_probe) is classified streaming by that uncut output while the
+  // build branch keeps its FULL barrier — and the sort by barrier class overrides plan order, in
+  // which the probe comes first. The next case shows what happens when the join's output IS cut.
   scan_join_dag d;
   auto index = query_index::build_index(d.b.pipelines(), build_index_options{build_probe{}});
 
   CHECK(d.b.label(index->prefetching_order()) ==
         scan_steps{{3, order_type::full_barrier}, {1, order_type::streaming}});
+}
+
+TEST_CASE("prefetching_order does not order build before probe when the join output is cut",
+          "[query_index][prefetch_api][prefetching_order]")
+{
+  // The counter-example to the guarantee, and a shape TPC-H produces routinely: a join feeding
+  // another join's build side.
+  //
+  //   probe(1) --[FULL,"default"]--> join(2) ;  build(3) --[FULL,"build"]--> join(2)
+  //   join(2)  --[FULL]-----------> agg(4, multiport)
+  //
+  // build_probe rewrites the probe edge to PIPELINE, which never cuts (pipeline_dag::cuts requires
+  // FULL), so the probe branch ALWAYS absorbs the join and is classified by what is downstream of
+  // it — here a FULL edge into a multiport consumer. Both branches therefore classify
+  // full_barrier, the stable sort preserves plan order, and the probe (added first) is emitted
+  // first. The rewritten probe edge is never the operative mechanism.
+  //
+  // This case pins current behaviour on purpose. Making build-before-probe unconditional needs a
+  // rank ("how soon does this branch block") rather than a three-valued barrier class — the
+  // deferred blocking_distance rule documented on query_index::prefetching_order. When that lands,
+  // this expectation flips to {3, ...} then {1, ...} and this comment goes with it.
+  dag_builder b;
+  auto probe = b.add(1, SiriusPhysicalOperatorType::GPU_SCAN);
+  auto build = b.add(3, SiriusPhysicalOperatorType::GPU_SCAN);
+  auto join  = b.add(2, SiriusPhysicalOperatorType::HASH_JOIN);
+  auto other = b.add(5);  // second input to the multiport consumer, so agg really is multiport
+  auto agg   = b.add(4);
+
+  b.connect(probe, join, MemoryBarrierType::FULL, "default");
+  b.connect(build, join, MemoryBarrierType::FULL, "build");
+  b.connect(join, agg, MemoryBarrierType::FULL);
+  b.connect(other, agg, MemoryBarrierType::FULL);
+
+  auto index = query_index::build_index(b.pipelines(), build_index_options{build_probe{}});
+  auto steps = b.label(index->prefetching_order());
+
+  REQUIRE(steps.size() == 2);
+  CHECK(steps[0].second == order_type::full_barrier);
+  CHECK(steps[1].second == order_type::full_barrier);
+  // Plan order, not build-first: the probe was added first and nothing reorders it.
+  CHECK(steps == scan_steps{{1, order_type::full_barrier}, {3, order_type::full_barrier}});
 }
 
 TEST_CASE("prefetching_order preserves plan order within a barrier class",
@@ -422,23 +464,11 @@ TEST_CASE("prefetching_order preserves plan order within a barrier class",
                                                           {3, order_type::full_barrier}});
 }
 
-TEST_CASE("prefetching_order emits a fan-out scan once",
-          "[query_index][prefetch_api][prefetching_order]")
-{
-  // One scan feeding two consumers. Each consumer heads its own branch (the producer's forward
-  // walk cannot continue into either), and the scan must still be named exactly once.
-  dag_builder b;
-  auto scan  = b.add(1, SiriusPhysicalOperatorType::GPU_SCAN);
-  auto left  = b.add(2);
-  auto right = b.add(3);
-
-  b.connect(scan, left, MemoryBarrierType::FULL);
-  b.connect(scan, right, MemoryBarrierType::FULL);
-
-  auto index = query_index::build_index(b.pipelines());
-  REQUIRE(index->get_branches().size() == 3);
-  CHECK(b.label(index->prefetching_order()) == scan_steps{{1, order_type::full_barrier}});
-}
+// NOTE: there is deliberately no case for prefetching_order's `seen` dedup set. Every branch head
+// it could deduplicate is a distinct source operator -- dag_builder, like the real plan converter,
+// gives each pipeline its own -- so no input this harness can build reaches the second insert.
+// Extending the harness to fabricate two pipelines sharing one source operator would be testing a
+// state the engine does not produce. The set is commented as defensive at its definition instead.
 
 TEST_CASE("prefetching_order terminates on a cyclic dag",
           "[query_index][prefetch_api][prefetching_order]")

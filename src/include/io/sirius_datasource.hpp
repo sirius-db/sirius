@@ -128,20 +128,34 @@ class sirius_datasource : public cudf::io::datasource {
 
   /// \brief Drive the stored @c prefetching_handle for ladder rung @p site.
   ///
-  /// The behaviour depends on @p site and the io_ctx's
-  /// @c prefetching_activation_stage:
+  /// A rung is honored only when a handle is stored (i.e. an earlier @c fadvise enqueued work)
+  /// **and** the io_ctx's @c prefetching_activation_stage is not @c prefetching_stage::none.
+  /// Under those two preconditions:
   ///   - @p site == the ioctx's activation stage: activate the stored handle so
   ///     the cache worker starts the IO.
-  ///   - @c prefetching_stage::disposable: always honored.  If a handle is
-  ///     stored (i.e. an earlier @c fadvise enqueued work), cancel it so the
-  ///     cache worker drops still-pending entries.
+  ///   - @c prefetching_stage::disposable: cancel the handle so the cache worker
+  ///     drops still-pending entries.
   ///   - any other rung: no-op.
   ///
-  /// Entirely a no-op when the backend's activation stage is
-  /// @c prefetching_stage::none, or when no @c fadvise has stored a handle.
+  /// The @c none check comes first, so a backend that opted out of the ladder does not cancel
+  /// either — even if some other route armed a cache and stored a handle on it. That ordering is
+  /// deliberate but arguably wrong for @c disposable; changing it is a behaviour change to the IO
+  /// path and is tracked as a follow-up rather than fixed here.
   void prefetch(cache::prefetching_stage site);
 
   [[nodiscard]] bool uses_prefetching_cache() const noexcept;
+
+  /**
+   * @brief The ladder rung at which this datasource's backend activates a prefetch.
+   *
+   * Forwards to @c sirius_ioctx::prefetching_activation_stage without copying the ioctx
+   * @c shared_ptr — @ref io_ctx returns it **by value**, so routing through that accessor would
+   * cost a refcount round trip per call on a path that runs per datasource under a mutex.
+   *
+   * @return @c cache::prefetching_stage::none when the backend never activates (both shipped
+   *         local backends), and also when this datasource carries no ioctx.
+   */
+  [[nodiscard]] cache::prefetching_stage activation_stage() const noexcept;
 
   /**
    * @brief Advisory progress of this datasource's stored prefetch request.
