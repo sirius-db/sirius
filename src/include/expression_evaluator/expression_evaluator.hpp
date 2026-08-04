@@ -21,10 +21,6 @@
 #include <expression/ast/node.hpp>  // sirius::ast::node + 11 alternative types
 #include <expression_evaluator/expression_evaluator_strategy.hpp>
 
-// cucascades
-#include <cucascade/data/data_batch.hpp>
-#include <cucascade/data/data_repository_manager.hpp>
-
 // cudf
 #include <cudf/ast/expressions.hpp>
 #include <cudf/column/column_view.hpp>
@@ -36,14 +32,13 @@
 #include <rmm/resource_ref.hpp>
 
 // standard library
+#include <cstdint>
+#include <initializer_list>
 #include <memory>
+#include <optional>
 #include <span>
 #include <variant>
 #include <vector>
-
-namespace duckdb {
-class Expression;
-}  // namespace duckdb
 
 namespace sirius {
 
@@ -57,7 +52,7 @@ inline expression_evaluator_strategy strategy_from_config()
 }
 
 /**
- * @brief The expression_evaluator is responsible for evaluating DuckDB expressions on the GPU
+ * @brief The expression_evaluator is responsible for evaluating Sirius AST expressions on the GPU
  * using cuDF.
  *
  * It builds a tree of AST trees whose edges are 'AST breakers', i.e., expression
@@ -72,9 +67,6 @@ class expression_evaluator {
   using expr_ref = std::reference_wrapper<cudf::ast::expression const>;
 
  public:
-  using data_batch              = cucascade::data_batch;
-  using data_repository_manager = cucascade::data_repository_manager;
-
   /**
    * @brief The result of adding an expression to the executor's AST tree.
    *
@@ -116,20 +108,6 @@ class expression_evaluator {
         temp_column_indices(std::move(column_indices))
     {
     }
-
-    /**
-     * @brief Construct an ast_result with the given AST node reference and sets of scalar and
-     * column indices.
-     *
-     * @param e The reference to the AST node corresponding to the expression
-     * @param scalar_indices The set of indices of the temp scalars that need to be kept alive for
-     * this AST expression.
-     * @param column_indices The set of indices of the temp columns that need to be kept alive for
-     * this AST expression.
-     */
-    ast_result(expr_ref e,
-               std::vector<std::vector<std::size_t>> scalar_indices,
-               std::vector<std::vector<std::size_t>> column_indices);
   };
 
   /**
@@ -199,22 +177,6 @@ class expression_evaluator {
      * @throws std::runtime_error if the payload does not hold an ast_result.
      */
     [[nodiscard]] expr_ref get_expr() const;
-
-    /**
-     * @brief Returns the indices of temporary scalars that must be kept alive for the AST
-     * expression.
-     * @return The temporary scalar indices if the payload holds an ast_result, otherwise an empty
-     * vector.
-     */
-    [[nodiscard]] std::vector<std::size_t> get_temp_scalar_indices() const;
-
-    /**
-     * @brief Returns the indices of temporary columns that must be kept alive for the AST
-     * expression.
-     * @return The temporary column indices if the payload holds an ast_result, otherwise an empty
-     * vector.
-     */
-    [[nodiscard]] std::vector<std::size_t> get_temp_column_indices() const;
 
     /**
      * @brief Returns a const reference to the cudf::scalar held by the payload.
@@ -370,12 +332,8 @@ class expression_evaluator {
    * @brief Evaluate a single Sirius AST node and return its execution result.
    *
    * Dispatches via std::visit over @p expr's variant to the matching private
-   * per-alternative overload. The per-alternative overloads currently round-
-   * trip back to the existing DuckDB-typed evaluate() via sirius::ast::to_duckdb;
-   * subsequent commits replace the round-trip with native Sirius-AST evaluation
-   * one specialization at a time. See
-   * https://github.com/sirius-db/sirius/issues/699 for the per-specialization
-   * migration plan.
+   * per-alternative overload; every alternative evaluates natively on the
+   * Sirius AST.
    *
    * @param expr The Sirius AST node to evaluate.
    * @param mode AST hint vs. MATERIALIZE hint; honored only where the node kind
@@ -384,6 +342,21 @@ class expression_evaluator {
    */
   evaluate_result evaluate(sirius::ast::node const& expr,
                            evaluation_mode mode = evaluation_mode::AST);
+
+  /// Number of numeric restoration casts issued by the most recent top-level evaluation.
+  /// Exposed so tests can verify repeated references share one cached restoration.
+  [[nodiscard]] std::size_t restored_reference_cast_count_for_testing() const noexcept
+  {
+    return _restored_reference_cast_count;
+  }
+
+  /// Number of comparison/BETWEEN nodes the most recent top-level evaluation executed directly on
+  /// a narrowed carrier (no restoration cast). Exposed so tests can verify the narrow-domain path
+  /// engaged instead of merely producing correct results through a restore.
+  [[nodiscard]] std::size_t narrow_domain_comparison_count_for_testing() const noexcept
+  {
+    return _narrow_domain_comparison_count;
+  }
 
  private:
   std::vector<sirius::ast::node const*> _ast_expressions;  ///< The AST expressions to evaluate
@@ -406,6 +379,19 @@ class expression_evaluator {
     _temp_columns;  ///< The temporary columns that need to be kept alive for the AST nodes in
                     ///< _ast_tree.
 
+  // Numeric reference restorations live in _temp_columns so AST references address them through the
+  // combined-table layout. AST results built over these cache entries deliberately advertise no
+  // releasable indices to release_temporaries: a restoration stays alive for the whole top-level
+  // evaluation.
+  struct restored_reference_cache_entry {
+    std::uint32_t column_index;     ///< The index of the input column in the original table
+    cudf::data_type target_type;    ///< The target type for the numeric restoration
+    std::size_t temp_column_index;  ///< The index of the CAST temporary column in _temp_columns
+  };
+  std::vector<restored_reference_cache_entry> _restored_reference_cache;
+  std::size_t _restored_reference_cast_count{0};   ///< For observability/testing
+  std::size_t _narrow_domain_comparison_count{0};  ///< For observability/testing
+
   // Evaluate the executor's single boolean predicate over @p input and return the resulting
   // mask column (the sole column of evaluate()'s output). Shared by both select() overloads.
   std::unique_ptr<cudf::column> compute_mask(cudf::table_view input);
@@ -424,20 +410,72 @@ class expression_evaluator {
    */
   evaluate_result materialize_as_ast_column(std::unique_ptr<cudf::column> column);
 
-  // Release memory for the temporary scalars and columns with the given indices.
-  void release_temporaries(std::vector<std::size_t> const& scalar_indices,
-                           std::vector<std::size_t> const& column_indices);
-  void release_temporaries(std::vector<std::vector<std::size_t>> const& scalar_indices,
-                           std::vector<std::vector<std::size_t>> const& column_indices);
+  // Return a cached strict numeric restoration for one input reference. MATERIALIZE mode receives
+  // a non-owning view; AST mode receives a reference to the cache-owned _temp_columns entry.
+  evaluate_result get_or_create_restored_reference(std::uint32_t column_index,
+                                                   cudf::data_type target_type,
+                                                   evaluation_mode mode);
+
+  // Narrow-domain comparison support (compressed materialization). Narrowing is value-preserving
+  // (same values, same family, same DECIMAL scale — no offset), so a comparison between a
+  // narrowed reference and constants exactly representable in its carrier yields identical
+  // results computed at the narrow width. These helpers let comparison/BETWEEN skip the
+  // full-column restoration cast for that shape; every ineligible shape falls back to the
+  // restore path.
+  //
+  // Returns the narrowed input carrier when @p column_operand is a reference whose materialized
+  // carrier is a strict narrowing of its declared native type AND every entry of @p
+  // constant_operands is a constant exactly representable in that carrier (typed NULLs always are).
+  // Returns `std::nullopt` otherwise.
+  [[nodiscard]] std::optional<cudf::data_type> narrow_domain_carrier(
+    sirius::ast::node const& column_operand,
+    std::initializer_list<sirius::ast::node const*> constant_operands) const;
+
+  // Evaluate a numeric constant as a scalar of @p carrier (a narrowed integer or fixed-point
+  // carrier). Callers must have validated representability via narrow_domain_carrier.
+  evaluate_result evaluate_constant_in_carrier(sirius::ast::constant const& expr,
+                                               cudf::data_type carrier,
+                                               evaluation_mode mode);
+
+  // Park @p device_scalar (a concrete cudf scalar type — cudf::ast::literal's constructors are
+  // typed) and return it as an evaluate_result: AST mode emplaces a literal over the scalar and
+  // stores the ownership in _temp_scalars, advertising the index for release; MATERIALIZE mode
+  // returns the owning scalar directly.
+  template <typename ScalarPtr>
+  evaluate_result finish_scalar(ScalarPtr device_scalar, evaluation_mode mode)
+  {
+    if (mode == evaluation_mode::AST) {
+      auto const& literal_ref    = _ast_tree.emplace<cudf::ast::literal>(*device_scalar);
+      auto const temp_scalar_idx = _temp_scalars.size();
+      _temp_scalars.push_back(std::move(device_scalar));
+      return evaluate_result(
+        ast_result(literal_ref, {temp_scalar_idx}, std::vector<std::size_t>{}));
+    }
+    return evaluate_result(std::move(device_scalar));
+  }
+
+  // Evaluate one comparison/BETWEEN operand: under an engaged @p narrow_carrier, a reference
+  // passes through at its materialized narrow width and a constant materializes in the carrier;
+  // without one, the operand takes the ordinary dispatch.
+  evaluate_result evaluate_narrow_domain_operand(sirius::ast::node const& operand,
+                                                 std::optional<cudf::data_type> narrow_carrier,
+                                                 evaluation_mode mode);
+
+  // Flatten the AST children's kept-alive temporary indices into one ast_result for the composed
+  // expression @p e. Non-AST children contribute nothing.
+  [[nodiscard]] static ast_result compose(expr_ref e,
+                                          std::initializer_list<evaluate_result const*> children);
+
+  // Release the temporary scalars and columns kept alive by the AST results in @p children.
+  void release_temporaries(std::initializer_list<evaluate_result const*> children);
 
   // Leaf Sirius-AST nodes — dispatch targets for the std::visit-based
   // evaluate(sirius::ast::node, mode) above.
   evaluate_result evaluate(sirius::ast::reference const& expr, evaluation_mode mode);
   evaluate_result evaluate(sirius::ast::constant const& expr, evaluation_mode mode);
 
-  // Interior Sirius-AST nodes — 11 alternatives total. Compared to the 9
-  // DuckDB-typed overloads, Sirius AST splits BOUND_OPERATOR's kinds across
-  // 3 alternative types (unary_op, coalesce, in_list).
+  // Interior Sirius-AST nodes — 11 alternatives total (BOUND_OPERATOR's kinds
+  // split across unary_op, coalesce, and in_list).
   evaluate_result evaluate(sirius::ast::between const& expr, evaluation_mode mode);
   evaluate_result evaluate(sirius::ast::case_expr const& expr, evaluation_mode mode);
   evaluate_result evaluate(sirius::ast::cast const& expr, evaluation_mode mode);

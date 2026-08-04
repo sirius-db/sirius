@@ -22,10 +22,6 @@
 #include <expression_evaluator/expression_evaluator.hpp>
 #include <sirius/exception.hpp>
 
-// cucascade
-#include <cucascade/cudf/gpu_data_representation.hpp>
-#include <data/data_batch_utils.hpp>
-
 // cudf
 #include <cudf/column/column_factories.hpp>
 #include <cudf/stream_compaction.hpp>
@@ -50,10 +46,10 @@ bool IsFixedWidth(cudf::data_type const& type)
   return id != cudf::type_id::STRING && id != cudf::type_id::LIST && id != cudf::type_id::STRUCT &&
          id != cudf::type_id::DICTIONARY32 && id != cudf::type_id::EMPTY;
 }
+
 }  // namespace
 
 namespace sirius {
-using data_batch      = cucascade::data_batch;
 using evaluate_result = expression_evaluator::evaluate_result;
 using ast_result      = expression_evaluator::ast_result;
 
@@ -61,34 +57,31 @@ using ast_result      = expression_evaluator::ast_result;
 // ast_result
 //===----------------------------------------------------------------------===//
 
-expression_evaluator::ast_result::ast_result(expr_ref e,
-                                             std::vector<std::vector<std::size_t>> scalar_indices,
-                                             std::vector<std::vector<std::size_t>> column_indices)
-  : expr(e)
+ast_result expression_evaluator::compose(expr_ref e,
+                                         std::initializer_list<evaluate_result const*> children)
 {
-  auto const total_scalars = std::accumulate(
-    scalar_indices.begin(),
-    scalar_indices.end(),
-    std::size_t(0),
-    [](std::size_t sum, const std::vector<std::size_t>& vec) { return sum + vec.size(); });
-  temp_scalar_indices.reserve(total_scalars);
-  for (auto& vec : scalar_indices) {
-    temp_scalar_indices.insert(temp_scalar_indices.end(),
-                               std::make_move_iterator(vec.begin()),
-                               std::make_move_iterator(vec.end()));
+  ast_result result{e};
+  std::size_t total_scalars = 0;
+  std::size_t total_columns = 0;
+  for (auto const* child : children) {
+    if (!child->is_ast()) { continue; }
+    auto const& ast = std::get<ast_result>(child->payload);
+    total_scalars += ast.temp_scalar_indices.size();
+    total_columns += ast.temp_column_indices.size();
   }
-
-  auto const total_columns = std::accumulate(
-    column_indices.begin(),
-    column_indices.end(),
-    std::size_t(0),
-    [](std::size_t sum, const std::vector<std::size_t>& vec) { return sum + vec.size(); });
-  temp_column_indices.reserve(total_columns);
-  for (auto& vec : column_indices) {
-    temp_column_indices.insert(temp_column_indices.end(),
-                               std::make_move_iterator(vec.begin()),
-                               std::make_move_iterator(vec.end()));
+  result.temp_scalar_indices.reserve(total_scalars);
+  result.temp_column_indices.reserve(total_columns);
+  for (auto const* child : children) {
+    if (!child->is_ast()) { continue; }
+    auto const& ast = std::get<ast_result>(child->payload);
+    result.temp_scalar_indices.insert(result.temp_scalar_indices.end(),
+                                      ast.temp_scalar_indices.begin(),
+                                      ast.temp_scalar_indices.end());
+    result.temp_column_indices.insert(result.temp_column_indices.end(),
+                                      ast.temp_column_indices.begin(),
+                                      ast.temp_column_indices.end());
   }
+  return result;
 }
 
 //===----------------------------------------------------------------------===//
@@ -102,18 +95,6 @@ expression_evaluator::evaluate_result::get_expr() const
     throw std::runtime_error("[evaluate_result] Attempted to get expr from materialized result");
   }
   return std::get<ast_result>(payload).expr;
-}
-
-std::vector<std::size_t> expression_evaluator::evaluate_result::get_temp_scalar_indices() const
-{
-  if (is_ast()) { return std::get<ast_result>(payload).temp_scalar_indices; }
-  return {};
-}
-
-std::vector<std::size_t> expression_evaluator::evaluate_result::get_temp_column_indices() const
-{
-  if (is_ast()) { return std::get<ast_result>(payload).temp_column_indices; }
-  return {};
 }
 
 cudf::scalar const& expression_evaluator::evaluate_result::get_scalar() const
@@ -236,28 +217,16 @@ evaluate_result expression_evaluator::materialize_as_ast_column(
   return evaluate_result(ast_result(col_ref, std::vector<std::size_t>{}, {temp_column_idx}));
 }
 
-void expression_evaluator::release_temporaries(std::vector<std::size_t> const& scalar_indices,
-                                               std::vector<std::size_t> const& column_indices)
-{
-  for (auto const idx : scalar_indices) {
-    _temp_scalars[idx].reset();
-  }
-  for (auto const idx : column_indices) {
-    _temp_columns[idx].reset();
-  }
-}
-
 void expression_evaluator::release_temporaries(
-  std::vector<std::vector<std::size_t>> const& scalar_indices,
-  std::vector<std::vector<std::size_t>> const& column_indices)
+  std::initializer_list<evaluate_result const*> children)
 {
-  for (auto const& vec : scalar_indices) {
-    for (auto const idx : vec) {
+  for (auto const* child : children) {
+    if (!child->is_ast()) { continue; }
+    auto const& ast = std::get<ast_result>(child->payload);
+    for (auto const idx : ast.temp_scalar_indices) {
       _temp_scalars[idx].reset();
     }
-  }
-  for (auto const& vec : column_indices) {
-    for (auto const idx : vec) {
+    for (auto const idx : ast.temp_column_indices) {
       _temp_columns[idx].reset();
     }
   }
@@ -268,9 +237,13 @@ std::unique_ptr<cudf::table> expression_evaluator::evaluate(cudf::table_view inp
   _output_columns.clear();
   _output_columns.reserve(_ast_expressions.size());
 
-  // Reset AST state from any previous invocation so that the tree, temp scalars, and temp columns
-  // do not accumulate stale nodes across calls.
-  _ast_tree = cudf::ast::tree{};
+  // Reset AST state from any previous invocation so that the tree, temp scalars, temp columns,
+  // the restored-reference cache over them, and the per-call instrumentation do not carry stale
+  // state across calls.
+  _restored_reference_cache.clear();
+  _restored_reference_cast_count  = 0;
+  _narrow_domain_comparison_count = 0;
+  _ast_tree                       = cudf::ast::tree{};
   _temp_scalars.clear();
   _temp_columns.clear();
 
@@ -281,9 +254,15 @@ std::unique_ptr<cudf::table> expression_evaluator::evaluate(cudf::table_view inp
   // natively from the Sirius AST (no DuckDB round-trip).
   auto post_process = [this](sirius::ast::node const& expr, evaluate_result result) {
     if (expr.holds<sirius::ast::reference>()) {
-      // Bound reference: pass column through without type check
-      _output_columns.push_back(
-        std::make_unique<cudf::column>(result.get_column_view(), _stream, _mr));
+      // A narrowed reference restores as a view of a column owned by the per-evaluation restoration
+      // cache; an unchanged reference stays a zero-copy view of the input. Copying the view (or
+      // releasing an owned column) gives the output table independent columns.
+      if (result.is_owned_column()) {
+        _output_columns.push_back(result.release_column());
+      } else {
+        _output_columns.push_back(
+          std::make_unique<cudf::column>(result.get_column_view(), _stream, _mr));
+      }
     } else {
       // Cast the `result` from libcudf to the node's return type if `result` has a different
       // type. E.g., `extract(year from col)` from libcudf returns int16_t but the SQL type is
@@ -299,7 +278,7 @@ std::unique_ptr<cudf::table> expression_evaluator::evaluate(cudf::table_view inp
       } else {
         result_column = result.release_column();
       }
-      if (result_column->type().id() != cudf_return_type.id()) {
+      if (result_column->type() != cudf_return_type) {
         // Cast is only valid for fixed-width types (no STRING/LIST/STRUCT/etc.).
         if (IsFixedWidth(result_column->type()) && IsFixedWidth(cudf_return_type)) {
           result_column = cudf::cast(result_column->view(), cudf_return_type, _stream, _mr);

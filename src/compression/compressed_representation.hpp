@@ -76,6 +76,13 @@ struct pinned_compressed_blob {
   std::uint64_t payload_bytes = 0;
 };
 
+/// Per-column byte footprints recorded at pin time, one entry per column of the
+/// chunk, so a projection can report exact sizes instead of scaling the totals.
+struct per_column_byte_sizes {
+  std::vector<std::size_t> compressed;
+  std::vector<std::size_t> uncompressed;
+};
+
 // ── Block-aware copies over a cuCascade multi-block pinned allocation ─────────
 //
 // A single compressed buffer may straddle fixed-size block boundaries, so copies
@@ -126,13 +133,17 @@ class compressed_host_representation : public cucascade::idata_representation {
    *                            (cudf::table::alloc_size: data + null masks +
    *                            padding + string offsets/chars).
    * @param num_rows            Row count.
+   * @param column_sizes        Optional per-column footprints; when present,
+   *                            select_columns() sums the selected entries.
    */
-  compressed_host_representation(cucascade::memory::memory_space& memory_space,
-                                 std::shared_ptr<pinned_compressed_blob> blob,
-                                 std::vector<std::string> column_names,
-                                 std::size_t compressed_bytes,
-                                 std::size_t uncompressed_bytes,
-                                 std::int64_t num_rows);
+  compressed_host_representation(
+    cucascade::memory::memory_space& memory_space,
+    std::shared_ptr<pinned_compressed_blob> blob,
+    std::vector<std::string> column_names,
+    std::size_t compressed_bytes,
+    std::size_t uncompressed_bytes,
+    std::int64_t num_rows,
+    std::shared_ptr<const per_column_byte_sizes> column_sizes = nullptr);
 
   ~compressed_host_representation() override = default;
 
@@ -219,7 +230,8 @@ class compressed_host_representation : public cucascade::idata_representation {
                                  std::size_t compressed_bytes,
                                  std::size_t uncompressed_bytes,
                                  std::int64_t num_rows,
-                                 std::optional<std::vector<std::size_t>> selected_indices);
+                                 std::optional<std::vector<std::size_t>> selected_indices,
+                                 std::shared_ptr<const per_column_byte_sizes> column_sizes);
 
   std::shared_ptr<pinned_compressed_blob> _blob;
   std::vector<std::string> _column_names;
@@ -228,6 +240,7 @@ class compressed_host_representation : public cucascade::idata_representation {
   std::int64_t _num_rows;
   std::optional<std::vector<std::size_t>> _selected_indices;
   decode_equality_pushdown _equality_pushdown;
+  std::shared_ptr<const per_column_byte_sizes> _column_sizes;
 };
 
 /// A Simpatico-compressed chunk resident in GPU (device) memory.
@@ -251,12 +264,14 @@ class compressed_host_representation : public cucascade::idata_representation {
  */
 class compressed_device_representation : public cucascade::idata_representation {
  public:
-  compressed_device_representation(cucascade::memory::memory_space& memory_space,
-                                   std::shared_ptr<compressed_device_blob> blob,
-                                   std::vector<std::string> column_names,
-                                   std::size_t compressed_bytes,
-                                   std::size_t uncompressed_bytes,
-                                   std::int64_t num_rows);
+  compressed_device_representation(
+    cucascade::memory::memory_space& memory_space,
+    std::shared_ptr<compressed_device_blob> blob,
+    std::vector<std::string> column_names,
+    std::size_t compressed_bytes,
+    std::size_t uncompressed_bytes,
+    std::int64_t num_rows,
+    std::shared_ptr<const per_column_byte_sizes> column_sizes = nullptr);
 
   ~compressed_device_representation() override = default;
 
@@ -317,7 +332,8 @@ class compressed_device_representation : public cucascade::idata_representation 
                                    std::size_t compressed_bytes,
                                    std::size_t uncompressed_bytes,
                                    std::int64_t num_rows,
-                                   std::optional<std::vector<std::size_t>> selected_indices);
+                                   std::optional<std::vector<std::size_t>> selected_indices,
+                                   std::shared_ptr<const per_column_byte_sizes> column_sizes);
 
   std::shared_ptr<compressed_device_blob> _blob;
   std::vector<std::string> _column_names;
@@ -326,6 +342,7 @@ class compressed_device_representation : public cucascade::idata_representation 
   std::int64_t _num_rows;
   std::optional<std::vector<std::size_t>> _selected_indices;
   decode_equality_pushdown _equality_pushdown;
+  std::shared_ptr<const per_column_byte_sizes> _column_sizes;
 };
 
 }  // namespace sirius

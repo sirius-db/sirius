@@ -91,13 +91,15 @@ compressed_host_representation::compressed_host_representation(
   std::vector<std::string> column_names,
   std::size_t compressed_bytes,
   std::size_t uncompressed_bytes,
-  std::int64_t num_rows)
+  std::int64_t num_rows,
+  std::shared_ptr<const per_column_byte_sizes> column_sizes)
   : cucascade::idata_representation(memory_space),
     _blob(std::move(blob)),
     _column_names(std::move(column_names)),
     _compressed_bytes(compressed_bytes),
     _uncompressed_bytes(uncompressed_bytes),
-    _num_rows(num_rows)
+    _num_rows(num_rows),
+    _column_sizes(std::move(column_sizes))
 {
 }
 
@@ -110,14 +112,16 @@ compressed_host_representation::compressed_host_representation(
   std::size_t compressed_bytes,
   std::size_t uncompressed_bytes,
   std::int64_t num_rows,
-  std::optional<std::vector<std::size_t>> selected_indices)
+  std::optional<std::vector<std::size_t>> selected_indices,
+  std::shared_ptr<const per_column_byte_sizes> column_sizes)
   : cucascade::idata_representation(memory_space),
     _blob(std::move(blob)),
     _column_names(std::move(column_names)),
     _compressed_bytes(compressed_bytes),
     _uncompressed_bytes(uncompressed_bytes),
     _num_rows(num_rows),
-    _selected_indices(std::move(selected_indices))
+    _selected_indices(std::move(selected_indices)),
+    _column_sizes(std::move(column_sizes))
 {
 }
 
@@ -134,13 +138,43 @@ std::unique_ptr<cucascade::idata_representation> compressed_host_representation:
                                        _compressed_bytes,
                                        _uncompressed_bytes,
                                        _num_rows,
-                                       _selected_indices));
+                                       _selected_indices,
+                                       _column_sizes));
   // The pushdown is indexed by the selected column list, which the clone shares.
   copy->set_equality_pushdown(_equality_pushdown);
   return copy;
 }
 
 // ── Projection ───────────────────────────────────────────────────────────────
+
+namespace {
+
+/// Bytes of the selected columns: exact sum when the pin recorded per-column
+/// sizes, otherwise the totals scaled by the selected fraction of columns.
+std::pair<std::size_t, std::size_t> projected_bytes(
+  std::span<const std::size_t> absolute,
+  const std::shared_ptr<const per_column_byte_sizes>& sizes,
+  std::size_t total_columns,
+  std::size_t total_compressed,
+  std::size_t total_uncompressed)
+{
+  if (sizes && sizes->compressed.size() == total_columns &&
+      sizes->uncompressed.size() == total_columns) {
+    std::size_t compressed   = 0;
+    std::size_t uncompressed = 0;
+    for (auto idx : absolute) {
+      compressed += sizes->compressed[idx];
+      uncompressed += sizes->uncompressed[idx];
+    }
+    return {compressed, uncompressed};
+  }
+  if (total_columns == 0) { return {0, 0}; }
+  const auto selected = absolute.size();
+  return {total_compressed * selected / total_columns,
+          total_uncompressed * selected / total_columns};
+}
+
+}  // namespace
 
 std::unique_ptr<compressed_host_representation> compressed_host_representation::select_columns(
   std::span<const std::size_t> indices) const
@@ -164,6 +198,9 @@ std::unique_ptr<compressed_host_representation> compressed_host_representation::
     }
   }
 
+  auto const [compressed, uncompressed] = projected_bytes(
+    absolute, _column_sizes, _column_names.size(), _compressed_bytes, _uncompressed_bytes);
+
   // const_cast is safe: select_columns is logically const (it creates a
   // projection sharing the same blob) but the base-class constructor requires
   // a non-const memory_space& — the underlying object is non-const.
@@ -171,10 +208,11 @@ std::unique_ptr<compressed_host_representation> compressed_host_representation::
     const_cast<cucascade::memory::memory_space&>(get_memory_space()),
     _blob,
     _column_names,
-    _compressed_bytes,
-    _uncompressed_bytes,
+    compressed,
+    uncompressed,
     _num_rows,
-    std::move(absolute)));
+    std::move(absolute),
+    _column_sizes));
 }
 
 // ── compressed_device_representation ─────────────────────────────────────────
@@ -217,13 +255,15 @@ compressed_device_representation::compressed_device_representation(
   std::vector<std::string> column_names,
   std::size_t compressed_bytes,
   std::size_t uncompressed_bytes,
-  std::int64_t num_rows)
+  std::int64_t num_rows,
+  std::shared_ptr<const per_column_byte_sizes> column_sizes)
   : cucascade::idata_representation(memory_space),
     _blob(std::move(blob)),
     _column_names(std::move(column_names)),
     _compressed_bytes(compressed_bytes),
     _uncompressed_bytes(uncompressed_bytes),
-    _num_rows(num_rows)
+    _num_rows(num_rows),
+    _column_sizes(std::move(column_sizes))
 {
 }
 
@@ -234,14 +274,16 @@ compressed_device_representation::compressed_device_representation(
   std::size_t compressed_bytes,
   std::size_t uncompressed_bytes,
   std::int64_t num_rows,
-  std::optional<std::vector<std::size_t>> selected_indices)
+  std::optional<std::vector<std::size_t>> selected_indices,
+  std::shared_ptr<const per_column_byte_sizes> column_sizes)
   : cucascade::idata_representation(memory_space),
     _blob(std::move(blob)),
     _column_names(std::move(column_names)),
     _compressed_bytes(compressed_bytes),
     _uncompressed_bytes(uncompressed_bytes),
     _num_rows(num_rows),
-    _selected_indices(std::move(selected_indices))
+    _selected_indices(std::move(selected_indices)),
+    _column_sizes(std::move(column_sizes))
 {
 }
 
@@ -261,7 +303,8 @@ std::unique_ptr<cucascade::idata_representation> compressed_device_representatio
                                          _compressed_bytes,
                                          _uncompressed_bytes,
                                          _num_rows,
-                                         _selected_indices));
+                                         _selected_indices,
+                                         _column_sizes));
   // The pushdown is indexed by the selected column list, which the clone shares.
   copy->set_equality_pushdown(_equality_pushdown);
   return copy;
@@ -272,6 +315,9 @@ std::unique_ptr<compressed_device_representation> compressed_device_representati
 {
   auto absolute = resolve_absolute_indices(indices, _selected_indices, _column_names.size());
 
+  auto const [compressed, uncompressed] = projected_bytes(
+    absolute, _column_sizes, _column_names.size(), _compressed_bytes, _uncompressed_bytes);
+
   // const_cast is safe: select_columns is logically const (it creates a
   // projection sharing the same blob) but the base-class constructor requires
   // a non-const memory_space& — the underlying object is non-const.
@@ -279,10 +325,11 @@ std::unique_ptr<compressed_device_representation> compressed_device_representati
     const_cast<cucascade::memory::memory_space&>(get_memory_space()),
     _blob,
     _column_names,
-    _compressed_bytes,
-    _uncompressed_bytes,
+    compressed,
+    uncompressed,
     _num_rows,
-    std::move(absolute)));
+    std::move(absolute),
+    _column_sizes));
 }
 
 }  // namespace sirius

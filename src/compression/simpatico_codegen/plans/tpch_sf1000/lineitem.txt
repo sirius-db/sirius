@@ -1,8 +1,8 @@
 # Pareto-picked plans: max ratio with decompress >= 250 GB/s per column.
-# column: l_orderkey  dtype: i64  ratio: 20.711x  depth: 2
-# comp: 531.34 GB/s  decomp: 626.76 GB/s
+# column: l_orderkey  dtype: i64  ratio: 12.393x  depth: 2
+# comp: 1326.88 GB/s  decomp: 2072.39 GB/s
 input -> delta -> differences
-delta.differences -> ans
+delta.differences -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
 
 ---
 # column: l_partkey  dtype: i32  ratio: 1.140x  depth: 1

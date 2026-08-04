@@ -25,6 +25,10 @@
 #include "op/sirius_physical_top_n.hpp"
 #include "sirius_config.hpp"
 
+namespace duckdb {
+class SiriusContext;
+}  // namespace duckdb
+
 namespace sirius {
 namespace op {
 
@@ -50,10 +54,12 @@ class sirius_physical_partition : public sirius_physical_operator {
   //! `key_source` is the downstream consumer whose keys determine partitioning (HJ join
   //! conditions, HGB/MERGE_GROUP_BY grouping columns). Captured at construction, never
   //! stored — the tree parent is `_parent_op`, stamped later by `set_parent_ops`.
-  explicit sirius_physical_partition(duckdb::vector<sirius::logical_type> types,
-                                     std::size_t estimated_cardinality,
-                                     sirius_physical_operator* key_source,
-                                     bool is_build = false);
+  explicit sirius_physical_partition(
+    duckdb::vector<sirius::logical_type> types,
+    std::size_t estimated_cardinality,
+    sirius_physical_operator* key_source,
+    bool is_build                                              = false,
+    duckdb::SiriusContext* compressed_materialization_observer = nullptr);
 
   std::string get_name() const override;
 
@@ -152,6 +158,9 @@ class sirius_physical_partition : public sirius_physical_operator {
   /// num_gpus partitions. Build side deposits its batch into every slot; probe side deposits each
   /// batch into the slot matching its current GPU. See get_next_task_input_data / sink.
   bool _broadcast{false};
+  /// Non-owning observer for the narrow-passthrough counter. The registered-state shared_ptr owns
+  /// the context for at least as long as the query plan; unit-test operators may leave it null.
+  duckdb::SiriusContext* _compressed_materialization_observer = nullptr;
 };
 
 }  // namespace op
