@@ -1,0 +1,4 @@
+[global]
+# Start with functional documentation checks. Style rules can be adopted separately
+# without forcing an unrelated repo-wide Markdown rewrite.
+enable = ["MD051", "MD057"]

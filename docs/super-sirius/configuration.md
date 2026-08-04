@@ -350,6 +350,7 @@ batch default**. Each can still be overridden individually.
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `scan_task_batch_size` | 2.5% of GPU mem (512 MiB – 5 GiB) | Target batch size for DuckDB scan tasks |
+| `enable_compressed_materialization` | true | Store eligible integer and fixed-point DECIMAL values in value-preserving narrower carriers when exact pin-time bounds permit it; restore native carriers at type-sensitive boundaries. |
 | `max_sort_partition_bytes` | 0 (auto) | Max bytes per sort partition. Auto = 33% of GPU memory. |
 | `hash_partition_bytes` | 2.5% of GPU mem (512 MiB – 5 GiB) | Target partition size for hash joins and group-bys |
 | `concat_batch_bytes` | 2.5% of GPU mem (512 MiB – 5 GiB) | Target output batch size for CONCAT operator |
@@ -378,8 +379,9 @@ sirius:
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `enable_quent` | bool | true | Emit Quent telemetry using the ndjson exporter. When false, telemetry uses the noop exporter. |
-| `output_directory` | string | `telemetry_data` | Directory for Quent ndjson files. |
+| `enable_quent` | bool | true | Emit Quent telemetry using the configured exporter. When false, telemetry uses the noop exporter. |
+| `exporter` | string | `ndjson` | Quent filesystem exporter: `ndjson`, `msgpack`, or `postcard`. |
+| `output_directory` | string | `telemetry_data` | Directory for Quent telemetry files. |
 | `engine_name` | string | `siriusDB` | Engine name reported in engine-level telemetry. |
 
 Per-query labels are configured separately from YAML. They can be set with the
@@ -419,7 +421,8 @@ sirius:
 
 Load that config through the normal config resolution path, usually by setting
 `SIRIUS_CONFIG_FILE=/path/to/sirius.yaml`. Any Sirius query run with
-`enable_quent: true` writes Quent ndjson files into `output_directory`.
+`enable_quent: true` writes Quent ndjson files into `output_directory` by default. Set
+`exporter: postcard` for compact benchmark or CI telemetry.
 
 For TPC-H Parquet runs, the helper script runs queries and labels each
 `(query, iteration)` pair before executing it:
@@ -518,6 +521,20 @@ These can also be set at load via the `SIRIUS_LOG_BACKEND`, `SIRIUS_LOG_DIR`, an
 | `opt_table_scan_num_streams` | - | Number of CUDA streams for optimized scan |
 | `opt_table_scan_memcpy_size` | - | Memcpy size for optimized scan |
 | `scan_task_batch_size` | 2.5% of GPU mem (512 MiB – 5 GiB) | Target scan batch size |
+| `enable_compressed_materialization` | true | Keep eligible integer and fixed-point DECIMAL values in narrower physical carriers until a native semantic boundary. |
+
+`enable_compressed_materialization` is also accepted in YAML under `sirius.operator_params`.
+At pin time, exact per-chunk bounds select stored carriers. At query planning, a matching pinned
+entry's recorded column-storage metadata determines the scan carriers; Parquet footer and DuckDB
+catalog statistics are not consulted for this decision. Unpinned scans stay native, and exact
+runtime bounds guard any narrowing cast required after a plan becomes stale. Changing the setting
+does not rewrite an existing pinned entry; cached scans normalize its stored carriers for the
+current query. See [Compressed Materialization](compressed-materialization.md) for eligibility,
+restoration boundaries, and cache-reservation behavior.
+
+```sql
+SET enable_compressed_materialization = false;
+```
 
 ### Pipeline / Operator
 

@@ -64,6 +64,7 @@ using ::codegen::jit::unsigned_counterpart;
 std::size_t dtype_elem_size(const std::string& name)
 {
   if (name == "int8_t") return 1;
+  if (name == "int16_t") return 2;
   if (name == "int32_t") return 4;
   if (name == "int64_t") return 8;
   return 0;  // 0 => unsupported (caller throws)
@@ -76,7 +77,10 @@ std::size_t dtype_elem_size(const std::string& name)
 // elements (exact width == counterpart width).
 const char* exact_unsigned(std::size_t elem_size)
 {
-  return (elem_size == 8) ? "uint64_t" : (elem_size == 1) ? "uint8_t" : "uint32_t";
+  return (elem_size == 8)   ? "uint64_t"
+         : (elem_size == 2) ? "uint16_t"
+         : (elem_size == 1) ? "uint8_t"
+                            : "uint32_t";
 }
 
 // Substitute a value source's __POS__ token with the given position expr.
@@ -859,8 +863,6 @@ ValueSource Walker::zigzag_value_source_inline(const ::codegen::jit::FusedTree& 
 
   // Stored element at this position (read once textually; compiler CSEs the
   // duplicate load).  base == chunk_start (chunk_id*CHUNK), known at entry.
-  // Cast through the exact-width unsigned so a negative stored byte doesn't
-  // sign-extend garbage into the shift domain.
   const std::string load = "static_cast<" + utype + ">(static_cast<" + exact_unsigned(esize) +
                            ">(" + p_data + "[chunk_start + (__POS__)]))";
 

@@ -22,8 +22,13 @@
 #include <catch.hpp>
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <duckdb/function/table_function.hpp>
+#include <duckdb/planner/expression/bound_function_expression.hpp>
+#include <duckdb/planner/expression/bound_reference_expression.hpp>
 #include <duckdb/planner/filter/constant_filter.hpp>
+#include <duckdb/planner/filter/expression_filter.hpp>
 #include <duckdb/planner/table_filter.hpp>
+#include <expression/ast/from_duckdb.hpp>
+#include <op/scan/scan_utils.hpp>
 #include <op/sirius_physical_table_scan.hpp>
 
 using namespace duckdb;
@@ -34,6 +39,26 @@ using namespace cucascade::memory;
 namespace {
 
 using namespace sirius::test::operator_utils;
+
+duckdb::unique_ptr<duckdb::Expression> make_untranslatable_filter_expression()
+{
+  auto expression = duckdb::make_uniq<duckdb::BoundFunctionExpression>(
+    duckdb::LogicalType::BOOLEAN,
+    duckdb::ScalarFunction("sirius_unmapped_filter",
+                           {duckdb::LogicalType::BIGINT},
+                           duckdb::LogicalType::BOOLEAN,
+                           nullptr),
+    duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>{},
+    nullptr);
+  expression->children.push_back(
+    duckdb::make_uniq<duckdb::BoundReferenceExpression>(duckdb::LogicalType::BIGINT, 0));
+  return expression;
+}
+
+duckdb::unique_ptr<duckdb::TableFilter> make_untranslatable_filter()
+{
+  return duckdb::make_uniq<duckdb::ExpressionFilter>(make_untranslatable_filter_expression());
+}
 }  // namespace
 
 TEMPLATE_TEST_CASE(
@@ -393,4 +418,99 @@ TEST_CASE("sirius_physical_table_scan filters all rows", "[physical_table_scan]"
     *dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches()[0]);
   REQUIRE(view.num_columns() == 2);
   REQUIRE(view.num_rows() == 0);
+}
+
+TEST_CASE("table-filter conversion distinguishes discharged filters from failed translations",
+          "[physical_table_scan][table_filter]")
+{
+  duckdb::vector<duckdb::ColumnIndex> column_ids{duckdb::ColumnIndex(0), duckdb::ColumnIndex(1)};
+  duckdb::vector<duckdb::LogicalType> duckdb_types{duckdb::LogicalType::BIGINT,
+                                                   duckdb::LogicalType::BIGINT};
+  auto const returned_types = sirius::from_duckdb_vec(duckdb_types);
+  auto const batch_map      = sirius::op::build_batch_column_map({}, column_ids.size());
+
+  SECTION("partition-only filter is discharged")
+  {
+    duckdb::TableFilterSet filters;
+    filters.filters[0] = duckdb::make_uniq<duckdb::ConstantFilter>(
+      duckdb::ExpressionType::COMPARE_EQUAL, duckdb::Value::BIGINT(1));
+    CHECK(sirius::op::convert_table_filters_to_expression(
+            filters, column_ids, returned_types, batch_map, {0}) == nullptr);
+  }
+
+  SECTION("plain data filter produces a translatable expression")
+  {
+    duckdb::TableFilterSet filters;
+    filters.filters[0] = duckdb::make_uniq<duckdb::ConstantFilter>(
+      duckdb::ExpressionType::COMPARE_GREATERTHAN, duckdb::Value::BIGINT(1));
+    auto expression = sirius::op::convert_table_filters_to_expression(
+      filters, column_ids, returned_types, batch_map);
+    REQUIRE(expression);
+    CHECK(sirius::ast::from_duckdb(*expression) != nullptr);
+  }
+
+  SECTION("unsupported data filter remains distinguishable from an empty conversion")
+  {
+    duckdb::TableFilterSet filters;
+    filters.filters[0] = make_untranslatable_filter();
+    auto expression    = sirius::op::convert_table_filters_to_expression(
+      filters, column_ids, returned_types, batch_map);
+    REQUIRE(expression);
+    CHECK(sirius::ast::from_duckdb(*expression) == nullptr);
+  }
+
+  SECTION("partition and data filters retain the data predicate")
+  {
+    duckdb::TableFilterSet filters;
+    filters.filters[0] = duckdb::make_uniq<duckdb::ConstantFilter>(
+      duckdb::ExpressionType::COMPARE_EQUAL, duckdb::Value::BIGINT(1));
+    filters.filters[1] = duckdb::make_uniq<duckdb::ConstantFilter>(
+      duckdb::ExpressionType::COMPARE_GREATERTHAN, duckdb::Value::BIGINT(2));
+    auto expression = sirius::op::convert_table_filters_to_expression(
+      filters, column_ids, returned_types, batch_map, {0});
+    REQUIRE(expression);
+    CHECK(sirius::ast::from_duckdb(*expression) != nullptr);
+  }
+}
+
+TEST_CASE("sirius_physical_table_scan fails closed for an untranslatable pushed-down filter",
+          "[physical_table_scan][table_filter]")
+{
+  auto memory_manager = sirius::test::operator_utils::initialize_memory_manager();
+  auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  REQUIRE(space);
+
+  std::vector<int64_t> filter_values{1, 2, 3};
+  std::vector<int32_t> data_values{10, 20, 30};
+  auto input_batch = make_two_column_batch<int64_t, int32_t>(
+    *space, filter_values, data_values, cudf::type_id::INT32, std::nullopt);
+
+  auto table_filters        = duckdb::make_uniq<duckdb::TableFilterSet>();
+  table_filters->filters[0] = make_untranslatable_filter();
+  duckdb::vector<duckdb::LogicalType> types{duckdb::LogicalType::BIGINT,
+                                            duckdb::LogicalType::INTEGER};
+  duckdb::vector<duckdb::ColumnIndex> column_ids{duckdb::ColumnIndex(0), duckdb::ColumnIndex(1)};
+  duckdb::vector<duckdb::idx_t> projection_ids{0, 1};
+  duckdb::vector<std::string> names{"filter_col", "data_col"};
+  duckdb::vector<duckdb::Value> parameters;
+  duckdb::virtual_column_map_t virtual_columns;
+  duckdb::TableFunction table_function("test_scan", {}, nullptr, nullptr);
+
+  sirius_physical_table_scan table_scan(sirius::from_duckdb_vec(types),
+                                        std::move(table_function),
+                                        nullptr,
+                                        sirius::from_duckdb_vec(types),
+                                        std::move(column_ids),
+                                        std::move(projection_ids),
+                                        std::move(names),
+                                        std::move(table_filters),
+                                        filter_values.size(),
+                                        duckdb::ExtraOperatorInfo(),
+                                        std::move(parameters),
+                                        std::move(virtual_columns));
+  std::vector<std::shared_ptr<cucascade::data_batch>> inputs{input_batch};
+
+  CHECK_THROWS_WITH(
+    table_scan.execute(pipelineable_operator_data(inputs), cudf::get_default_stream()),
+    Catch::Contains("cannot evaluate pushed-down predicate"));
 }

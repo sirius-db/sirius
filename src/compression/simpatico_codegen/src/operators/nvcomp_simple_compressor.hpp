@@ -43,10 +43,12 @@ inline std::pair<std::unique_ptr<rmm::device_buffer>, std::size_t> nvcomp_compre
   if (!cudf::is_fixed_width(col.type())) {
     throw std::runtime_error("nvcomp simple compressor: only fixed-width columns supported");
   }
-  std::size_t const uncompressed_size =
-    static_cast<std::size_t>(col.size()) * static_cast<std::size_t>(cudf::size_of(col.type()));
-
-  return batched_compress_bytes(ops, col.head<void>(), uncompressed_size, stream, mr);
+  std::size_t const elem_size         = static_cast<std::size_t>(cudf::size_of(col.type()));
+  std::size_t const uncompressed_size = static_cast<std::size_t>(col.size()) * elem_size;
+  // data<T>() = head<T>() + offset; for void* compute the offset manually.
+  const void* src = static_cast<const uint8_t*>(col.head<void>()) +
+                    static_cast<std::size_t>(col.offset()) * elem_size;
+  return batched_compress_bytes(ops, src, uncompressed_size, stream, mr);
 }
 
 // Decompress a frame produced by nvcomp_compress_impl back to a fixed-width column.

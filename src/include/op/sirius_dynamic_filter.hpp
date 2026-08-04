@@ -36,6 +36,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <span>
 #include <unordered_map>
 #include <unordered_set>
@@ -552,13 +553,27 @@ class sirius_dynamic_filter_set {
   /// unchanged.
   void set_consumer_column_remap(std::vector<std::size_t> remap);
 
-  /// Mark that a producer has been wired to this channel at plan time.
-  void register_producer();
+  /// Mark that a producer has been wired to this channel at plan time, together with the columns
+  /// it plans to publish filters for. @p planned_target_columns is in the consumer's column_ids
+  /// space (the same space @ref push_filter receives before remapping). An empty vector registers
+  /// an unscoped producer: consumers that need the target set must then assume every column is a
+  /// potential target.
+  void register_producer(std::vector<std::size_t> planned_target_columns);
 
   /// True iff at least one producer can publish into this channel.
   [[nodiscard]] bool has_producers() const noexcept
   {
     return _producer_count.load(std::memory_order_acquire) > 0;
+  }
+
+  /// Union of all producers' planned target columns, sorted, in the consumer's column_ids space.
+  /// Meaningful only when has_producers() && !has_unscoped_producer().
+  [[nodiscard]] std::vector<std::size_t> planned_target_columns() const;
+
+  /// True iff any producer registered without declaring its target columns.
+  [[nodiscard]] bool has_unscoped_producer() const noexcept
+  {
+    return _has_unscoped_producer.load(std::memory_order_acquire);
   }
 
   /// Close the channel once the consumer scan has drained; future pushes cannot prune anything.
@@ -601,11 +616,19 @@ class sirius_dynamic_filter_set {
   /// @ref set_consumer_column_remap.
   std::vector<std::size_t> _consumer_col_remap;
 
+  /// Union of the plan-time producers' planned target columns (consumer column_ids space); see
+  /// @ref register_producer.
+  std::set<std::size_t> _planned_target_columns;
+
   /// Total filters pushed across all columns; backs the lock-free @ref has_filters.
   std::atomic<std::size_t> _filter_count{0};
 
   /// Number of plan-time producers wired to this channel; zero means the consumer can be elided.
   std::atomic<std::size_t> _producer_count{0};
+
+  /// True once any producer registered without declaring its target columns; backs the lock-free
+  /// @ref has_unscoped_producer.
+  std::atomic<bool> _has_unscoped_producer{false};
 
   /// False once the consumer has drained. Producers use this to skip construction that no future
   /// consumer can use.
