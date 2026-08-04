@@ -17,6 +17,9 @@
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/function/table/table_scan.hpp"
 #include "duckdb/main/attached_database.hpp"
+#include "duckdb/main/client_context.hpp"
+#include "duckdb/main/connection.hpp"
+#include "duckdb/main/database.hpp"
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
@@ -46,6 +49,90 @@
 namespace sirius::planner {
 
 namespace {
+
+// True when an `iceberg_scan` table carries ANY delete file — a V2 positional delete, a V2
+// equality delete, or a V3 deletion vector (which `iceberg_metadata()` reports as
+// content='POSITION_DELETES' with file_format='PUFFIN'). Every non-data manifest entry reports a
+// `content` other than 'EXISTING', so one counting query covers all three.
+//
+// Conservative by construction: any failure to PROVE the table delete-free — absent path,
+// failed query, unexpected result shape — returns true and falls the scan back to DuckDB CPU.
+// A false positive costs performance; a false negative would silently drop deletes and corrupt
+// results, so the asymmetry is deliberate.
+bool iceberg_table_has_deletes(duckdb::LogicalGet& op, duckdb::ClientContext& context)
+{
+  if (op.parameters.empty() || op.parameters.front().IsNull()) { return true; }
+
+  std::string table_path;
+  try {
+    table_path = op.parameters.front().GetValue<std::string>();
+  } catch (...) {
+    return true;
+  }
+  if (table_path.empty()) { return true; }
+
+  // Escape single quotes for SQL string embedding.
+  std::string escaped;
+  escaped.reserve(table_path.size());
+  for (char c : table_path) {
+    if (c == '\'') { escaped += '\''; }
+    escaped += c;
+  }
+
+  std::string query = "SELECT count(*) FROM iceberg_metadata('" + escaped + "'";
+  // Inspect the same snapshot the scan will read.
+  auto sid_it = op.named_parameters.find("snapshot_from_id");
+  if (sid_it != op.named_parameters.end() && !sid_it->second.IsNull()) {
+    try {
+      query += ", snapshot_from_id = " + std::to_string(sid_it->second.GetValue<int64_t>());
+    } catch (...) {
+      return true;
+    }
+  }
+  query += ") WHERE content <> 'EXISTING'";
+
+  try {
+    // Opening a second Connection to the same database re-registers the SAME SiriusContext, so
+    // its query-lifecycle callbacks would fire QueryBegin (resetting next_operator_id and
+    // task_creator state) and QueryEnd (clearing all data repositories) underneath the query
+    // currently being planned. InternalQueryGuard suppresses both; without it this probe hangs
+    // the outer query. Same pattern as sirius_extension.cpp's CPU-fallback replay.
+    auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+    if (!sirius_ctx) {
+      SIRIUS_LOG_DEBUG(
+        "[sirius_plan_get] iceberg delete probe: no SiriusContext — CPU fallback for '{}'",
+        table_path);
+      return true;
+    }
+    duckdb::SiriusContext::InternalQueryGuard guard(*sirius_ctx);
+
+    duckdb::Connection conn(*context.db);
+    auto result = conn.Query(query);
+    if (!result || result->HasError()) {
+      SIRIUS_LOG_DEBUG("[sirius_plan_get] iceberg delete probe failed for '{}': {} — CPU fallback",
+                       table_path,
+                       result ? result->GetError() : "null result");
+      return true;
+    }
+    auto chunk = result->Fetch();
+    if (!chunk || chunk->size() == 0) { return true; }
+    auto const n_delete_files = chunk->GetValue(0, 0).GetValue<int64_t>();
+    if (n_delete_files > 0) {
+      SIRIUS_LOG_INFO(
+        "[sirius_plan_get] iceberg table '{}' has {} delete file(s); the GPU scan path does not "
+        "apply iceberg deletes yet — falling back to DuckDB CPU.",
+        table_path,
+        n_delete_files);
+      return true;
+    }
+    return false;
+  } catch (std::exception const& e) {
+    SIRIUS_LOG_DEBUG("[sirius_plan_get] iceberg delete probe threw for '{}': {} — CPU fallback",
+                     table_path,
+                     e.what());
+    return true;
+  }
+}
 
 // Translate a vector of DuckDB expressions into Sirius AST nodes at the planner
 // boundary. The source vector is drained; size and order are preserved, with a
@@ -94,10 +181,21 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
   // Only GPU-route known table scan functions; all others (pragma, system catalog
   // functions, etc.) must fall back to CPU.
   static const std::unordered_set<std::string> kSupportedScanFunctions = {
-    "seq_scan", "parquet_scan", "read_parquet", "sirius_read_parquet"};
+    "seq_scan", "parquet_scan", "read_parquet", "sirius_read_parquet", "iceberg_scan"};
   if (kSupportedScanFunctions.find(op.function.name) == kSupportedScanFunctions.end()) {
     throw duckdb::NotImplementedException("Table function '{}' is not supported in Sirius",
                                           op.function.name);
+  }
+
+  // An iceberg table's data files are parquet, and `iceberg_scan` binds them into the same
+  // MultiFileBindData `read_parquet` uses, so the parquet ingestible reads them as-is. That is
+  // correct ONLY for append-only tables: the parquet path knows nothing about iceberg deletes,
+  // so a V2/V3 table would silently return rows the table logically deleted. Refuse here — where
+  // NotImplementedException is the established CPU-fallback signal — until delete application
+  // lands. See reference/iceberg_legacy/ for the shipped delete algorithms.
+  if (op.function.name == "iceberg_scan" && iceberg_table_has_deletes(op, context)) {
+    throw duckdb::NotImplementedException(
+      "Iceberg tables with delete files are not yet supported on the GPU scan path");
   }
 
   if (!op.children.empty()) {

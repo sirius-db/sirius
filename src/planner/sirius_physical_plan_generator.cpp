@@ -25,6 +25,7 @@
 #include "duckdb/function/table/table_scan.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/config.hpp"
+#include "duckdb/main/connection.hpp"
 #include "duckdb/main/query_profiler.hpp"
 #include "duckdb/main/settings.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
@@ -294,7 +295,14 @@ void wrap_table_scan_source(
                               sirius::op::scan::dynamic_filter_apply_mode::include_ast_row_masks);
     // The TABLE_SCAN is dropped — its bind_data/metadata were lifted into the table info.
     replace_slot = true;
-  } else if (fn == "parquet_scan" || fn == "read_parquet" || fn == "sirius_read_parquet") {
+  } else if (fn == "parquet_scan" || fn == "read_parquet" || fn == "sirius_read_parquet" ||
+             fn == "iceberg_scan") {
+    // `iceberg_scan` rides the parquet ingestible: an iceberg table's data files ARE parquet, and
+    // the iceberg extension resolves its manifests into the same MultiFileBindData file list
+    // read_parquet produces, so build_parquet_table_info consumes it unchanged. Delete files are
+    // NOT handled here — create_plan(LogicalGet&) refuses any table carrying them before this
+    // point, so only append-only tables reach the GPU path.
+    //
     // The parquet ingestible consumes AST filters for read-time row-group pruning, so its wrapped
     // DYNAMIC_FILTER applies membership masks only.
     leaf = make_gpu_scan_leaf(build_parquet_table_info(scan, op_params),

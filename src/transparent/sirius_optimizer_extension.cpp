@@ -101,8 +101,11 @@ void sirius_optimizer_hook(duckdb::OptimizerExtensionInput& input,
   // unsupported operators, create_plan() throws and we fall back to CPU.
   try {
     ctx->set_captured_logical_plan(copy_logical_plan(*plan, context));
-  } catch (duckdb::NotImplementedException&) {
-    // Plan not serializable — skip GPU.
+  } catch (duckdb::NotImplementedException& e) {
+    // Plan not serializable — skip GPU. Logged because a silent skip here is
+    // indistinguishable from "GPU ran and was slow": the query still returns correct
+    // CPU results, so an unserializable table function looks like a perf mystery.
+    SIRIUS_LOG_DEBUG("Transparent execution: plan not serializable, skipping GPU: {}", e.what());
   } catch (std::exception& e) {
     SIRIUS_LOG_DEBUG("Transparent execution: failed to copy logical plan: {}", e.what());
   }
