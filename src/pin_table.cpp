@@ -372,7 +372,8 @@ std::string compression_failure_warning(std::string_view what,
 /// @p stage runs while the compressed_table (which owns the device payload buffers
 /// enumerated in @c buffers) and the compress stream pool are still alive, so it
 /// must copy the buffers out and synchronize @p stream before returning. It is
-/// called as stage(header&&, buffers, payload_bytes, uncompressed_bytes).
+/// called as stage(ct&&, header&&, buffers, payload_bytes, uncompressed_bytes,
+/// column_sizes).
 template <typename StageFn>
 bool compress_and_stage_batch(cudf::table const& tbl,
                               compression_pin_config const& compression,
@@ -420,9 +421,28 @@ bool compress_and_stage_batch(cudf::table const& tbl,
     return false;
   }
 
+  // Exact per-column footprints, so a projection over this chunk can size itself by
+  // summing the columns it selects rather than scaling the whole-chunk totals.
+  auto column_sizes = std::make_shared<sirius::per_column_byte_sizes>();
+  column_sizes->compressed.assign(static_cast<std::size_t>(tbl.num_columns()), 0);
+  column_sizes->uncompressed.reserve(static_cast<std::size_t>(tbl.num_columns()));
+  for (cudf::size_type i = 0; i < tbl.num_columns(); ++i) {
+    column_sizes->uncompressed.push_back(tbl.get_column(i).alloc_size());
+  }
+  for (auto const& b : buffers) {
+    if (b.column_index < column_sizes->compressed.size()) {
+      column_sizes->compressed[b.column_index] += b.size_bytes;
+    }
+  }
+
   {
     nvtx3::scoped_range stage_range{"sirius::compression::stage_payload"};
-    stage(std::move(ct), std::move(header), buffers, payload_bytes, uncompressed_bytes);
+    stage(std::move(ct),
+          std::move(header),
+          buffers,
+          payload_bytes,
+          uncompressed_bytes,
+          std::move(column_sizes));
   }
   return true;
 }
@@ -501,7 +521,8 @@ host_pin_result materialize_pin_to_host(
                 std::vector<std::uint8_t>&& header,
                 std::vector<simpatico::payload_buffer_ref> const& buffers,
                 std::uint64_t payload_bytes,
-                std::size_t uncompressed_bytes) {
+                std::size_t uncompressed_bytes,
+                std::shared_ptr<const sirius::per_column_byte_sizes> column_sizes) {
               // Allocate the pinned payload from the target host space's chunked
               // pool (the same tracked pool the uncompressed path uses), reserved
               // against the host budget so the pinned footprint is accounted, then
@@ -535,7 +556,8 @@ host_pin_result materialize_pin_to_host(
                 compression.column_names,
                 static_cast<std::size_t>(payload_bytes),
                 uncompressed_bytes,
-                static_cast<int64_t>(tbl->num_rows())));
+                static_cast<int64_t>(tbl->num_rows()),
+                std::move(column_sizes)));
             });
         } catch (const std::exception& e) {
           compression_failed = true;
@@ -610,7 +632,8 @@ device_pin_result materialize_all_batches_compressed(
                 std::vector<std::uint8_t>&& header,
                 std::vector<simpatico::payload_buffer_ref> const& buffers,
                 std::uint64_t payload_bytes,
-                std::size_t uncompressed_bytes) {
+                std::size_t uncompressed_bytes,
+                std::shared_ptr<const sirius::per_column_byte_sizes> column_sizes) {
               // Free the uncompressed source now that the batch is compressed, BEFORE
               // allocating the payload, so it reuses that space (avoids a pin-time peak
               // spike at large scale factors).
@@ -702,7 +725,8 @@ device_pin_result materialize_all_batches_compressed(
                 compression.column_names,
                 static_cast<std::size_t>(payload_bytes),
                 uncompressed_bytes,
-                chunk_rows);
+                chunk_rows,
+                std::move(column_sizes));
             });
         } catch (const std::exception& e) {
           if (!tbl) { throw; }  // source released inside callback — no fallback possible

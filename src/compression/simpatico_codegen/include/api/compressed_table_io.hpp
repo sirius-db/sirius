@@ -88,6 +88,9 @@ struct payload_buffer_ref {
   /// bytes per leaf, not size_bytes: a decode kernel reads/writes the full column,
   /// so a slice sized only to the compressed bytes would run past its end.
   std::uint64_t alloc_bytes = 0;
+  /// Index of the table column this buffer belongs to; summing `size_bytes` over
+  /// the buffers sharing an index gives that column's compressed footprint.
+  std::uint64_t column_index = 0;
 };
 
 /// Build the .hpln header for @p table into @p out_header and enumerate every
