@@ -13,7 +13,7 @@ block per full-table column in schema order; a pin of a column subset selects th
 blocks (`select_plan_blocks`). Scans of a compressed entry decompress the projected columns
 at task-prepare time via the `compressed_host_representation` /
 `compressed_device_blob` → `gpu_table_representation` converters, column-parallel across
-`compression_column_threads` streams (default 4 — measured strictly better than serial).
+4 fixed streams (measured strictly better than serial).
 
 ## Which tier to compress on (GB300, TPC-H SF1000, 22-query hot suite)
 
