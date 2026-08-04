@@ -81,6 +81,22 @@ std::string sql_string_literal(std::string const& value)
 }
 
 /**
+ * @brief How a query is expected to be routed by the transparent optimizer.
+ *
+ * Correctness alone cannot distinguish "the GPU computed the right answer" from "the GPU
+ * declined and DuckDB computed the right answer" — both return the same rows. Every
+ * comparison therefore asserts the route as well, so a silent regression to CPU shows up as a
+ * test failure rather than a pass. This matters most for the iceberg cases below, where the
+ * delete gate deliberately routes some tables to CPU: when a delete kind starts running on the
+ * GPU, its expectation flips from `plan_fallback` to `gpu` and the assertion proves it.
+ */
+enum class gpu_route {
+  gpu,              ///< Plan generated and executed on the GPU.
+  plan_fallback,    ///< Declined at plan time (NotImplementedException) — DuckDB CPU ran it.
+  runtime_fallback  ///< GPU plan installed, then failed at execute time — CPU fallback ran it.
+};
+
+/**
  * @brief Base fixture providing compare_gpu_vs_cpu for multi-format tests.
  */
 class MultiFormatFixtureBase {
@@ -120,8 +136,29 @@ class MultiFormatFixtureBase {
     return rows;
   }
 
+  /// Assert that `query` took `route`, in terms of the transparent-execution counters.
+  static void require_route(const duckdb::SiriusContext::transparent_execution_stats& before,
+                            const duckdb::SiriusContext::transparent_execution_stats& after,
+                            gpu_route route)
+  {
+    switch (route) {
+      case gpu_route::gpu:
+        sirius::test::require_transparent_execution_delta(before, after, 1, 0, 1, 0);
+        break;
+      case gpu_route::plan_fallback:
+        // create_plan threw NotImplementedException: no rebind, no GPU execution, one fallback.
+        sirius::test::require_transparent_execution_delta(before, after, 0, 1, 0, 0);
+        break;
+      case gpu_route::runtime_fallback:
+        // The rebind succeeded and the GPU operator ran, then bailed to the stashed CPU plan.
+        sirius::test::require_transparent_execution_delta(before, after, 1, 0, 1, 1);
+        break;
+    }
+  }
+
   void compare_gpu_vs_cpu(const std::string& query,
-                          std::optional<float> float_tolerance = std::nullopt)
+                          std::optional<float> float_tolerance = std::nullopt,
+                          gpu_route route                      = gpu_route::gpu)
   {
     // Enable transparent GPU execution
     con->Query("SET gpu_execution = true;");
@@ -135,7 +172,7 @@ class MultiFormatFixtureBase {
     }
     REQUIRE_FALSE(gpu_result->HasError());
     auto after_gpu_stats = sirius::test::get_transparent_execution_stats(*con);
-    sirius::test::require_transparent_execution_delta(before_gpu_stats, after_gpu_stats, 1, 0, 1);
+    require_route(before_gpu_stats, after_gpu_stats, route);
 
     // Run on CPU (disable transparent execution)
     con->Query("SET gpu_execution = false;");
@@ -467,6 +504,510 @@ class MultiFormatFixtureBase {
 //     "select o_orderkey, o_orderdate from orders "
 //     "where o_orderstatus = 'F' order by o_orderdate limit 10;");
 // }
+
+//===----------------------------------------------------------------------===//
+// Iceberg scan tests
+//
+// These cases were hidden ([.] tag) and hard-skipped (iceberg_available = false) while iceberg
+// was out of the build, so they passed for a month without running any SQL — which is how the
+// rot went unnoticed. They are now unhidden, unskipped, and a missing iceberg extension is a
+// hard failure rather than a WARN-and-return.
+//
+// Every case asserts three things: the rows are right, DuckDB's own reader agrees, and the
+// query took the route it is supposed to take. The literal row expectations matter as much as
+// the GPU-vs-CPU comparison — an engine that drops deletes and a reader that drops deletes
+// agree with each other perfectly.
+//===----------------------------------------------------------------------===//
+
+/**
+ * @brief Iceberg test fixture.
+ *
+ * Loads the community iceberg extension and resolves the fixture tables under
+ * test/cpp/integration/data/. Tests compare gpu_execution against DuckDB's native iceberg
+ * reader and against literal expected rows.
+ */
+class GPUExecutionIcebergFixture : public MultiFormatFixtureBase {
+ public:
+  // Community-extension builds these expectations were verified against. A different build is
+  // not automatically wrong, so a mismatch warns rather than fails — but it is recorded, so a
+  // behaviour change arriving with an extension upgrade is attributable instead of mysterious.
+  // (Under 75726455 the reader applies equality deletes; under the older 1.4.4-era build it
+  // silently ignored them, which is why the pre-removal versions of these tests avoided
+  // comparing against it.)
+  static constexpr const char* kVerifiedIcebergVersion = "75726455";
+
+  // Which delete kinds the GPU scan path applies itself. Positional deletes and V3 deletion
+  // vectors are applied by iceberg_gpu_ingestible (they share one per-file position map), so
+  // those tables must execute as GPU_SCAN — asserting the route is what distinguishes "the GPU
+  // applied the deletes" from "the GPU quietly handed the table back to DuckDB", since both
+  // return the same rows. Equality deletes match on key values and need the key columns
+  // force-projected into the scan, which is not wired; the gate still sends them to CPU.
+  static constexpr gpu_route kPositionalDeleteRoute = gpu_route::gpu;
+  static constexpr gpu_route kDeletionVectorRoute   = gpu_route::gpu;
+  static constexpr gpu_route kEqualityDeleteRoute   = gpu_route::plan_fallback;
+
+  GPUExecutionIcebergFixture()
+  {
+    require_repo_root_cwd();
+    load_iceberg_extension();
+
+    auto root = get_project_root();
+    v1_path   = (root / "test/cpp/integration/data/iceberg_v1").string();
+    v2_path   = (root / "test/cpp/integration/data/iceberg_v2_delete").string();
+  }
+
+  /**
+   * @brief Fail early, and legibly, when the process cwd is not the repo root.
+   *
+   * Fixture metadata (manifest lists, manifests, data files) stores repo-relative paths, so
+   * iceberg_scan resolves them against the process cwd — passing an absolute table path does
+   * not help. Without this check every iceberg case fails with an opaque
+   * `IO Error: Cannot open file "test/cpp/..."` that reads like a missing fixture.
+   */
+  static void require_repo_root_cwd()
+  {
+    if (!fs::exists("test/cpp/integration/data/iceberg_v1/metadata")) {
+      FAIL(
+        "iceberg fixture metadata stores repo-relative paths, so these tests must run with "
+        "the repo root as cwd; cwd is "
+        << fs::current_path().string());
+    }
+  }
+
+  /**
+   * @brief Load the iceberg extension, failing hard if it is unavailable.
+   *
+   * Deliberately LOAD without INSTALL: a test must not reach the network, and an INSTALL here
+   * would silently paper over an unprovisioned environment. The extension is a build/CI
+   * dependency and is installed once, out of band.
+   */
+  void load_iceberg_extension()
+  {
+    auto load = con->Query("LOAD iceberg;");
+    REQUIRE(load);
+    if (load->HasError()) {
+      FAIL("the iceberg extension is required by these tests but could not be loaded: "
+           << load->GetError()
+           << "\nprovision it once with:  duckdb -unsigned -c \"INSTALL avro; INSTALL iceberg;\"");
+    }
+
+    auto version = con->Query(
+      "SELECT extension_version FROM duckdb_extensions() WHERE extension_name = 'iceberg';");
+    REQUIRE(version);
+    REQUIRE_FALSE(version->HasError());
+    REQUIRE(version->RowCount() == 1);
+    auto const installed = version->GetValue(0, 0).ToString();
+    if (installed != kVerifiedIcebergVersion) {
+      WARN("iceberg extension version " << installed << " differs from the verified "
+                                        << kVerifiedIcebergVersion
+                                        << "; reader behaviour differences trace to this");
+    }
+  }
+
+  /// Non-data manifest entries (V2 positional, V2 equality, V3 deletion vectors — the last
+  /// reported as content='POSITION_DELETES', file_format='PUFFIN') at the snapshot being read.
+  int64_t delete_file_count(const std::string& table_path, const std::string& extra_args = "")
+  {
+    auto result = con->Query("SELECT count(*) FROM iceberg_metadata('" + table_path + "'" +
+                             extra_args + ") WHERE content <> 'EXISTING';");
+    REQUIRE(result);
+    if (result->HasError()) { UNSCOPED_INFO("iceberg_metadata error: " << result->GetError()); }
+    REQUIRE_FALSE(result->HasError());
+    REQUIRE(result->RowCount() == 1);
+    return result->GetValue(0, 0).GetValue<int64_t>();
+  }
+
+  /**
+   * @brief Canary: prove the table really carries delete files before asserting deletes work.
+   *
+   * The engine once fabricated empty delete data, and the delete tests still looked correct —
+   * with nothing to delete, a right-looking row set proves nothing. Asserting the delete-file
+   * count up front means a delete test can no longer pass by having no deletes to apply.
+   */
+  void require_delete_files(const std::string& table_path, int64_t expected)
+  {
+    INFO("delete-file canary for " << table_path);
+    REQUIRE(delete_file_count(table_path) == expected);
+  }
+
+  /**
+   * @brief Run a query on the GPU and assert route, oracle agreement, and literal rows.
+   *
+   * `expected` is compared as stringified rows in sorted order, so it works for any result
+   * shape. It is not redundant with the GPU-vs-CPU check: if DuckDB's reader ever stops
+   * applying deletes, a GPU that also ignores them would still match it.
+   */
+  void expect_iceberg_rows(const std::string& query,
+                           gpu_route route,
+                           std::vector<std::vector<std::string>> expected)
+  {
+    INFO("query: " << query);
+
+    con->Query("SET gpu_execution = true;");
+    auto before     = sirius::test::get_transparent_execution_stats(*con);
+    auto gpu_result = con->Query(query);
+    REQUIRE(gpu_result);
+    if (gpu_result->HasError()) {
+      UNSCOPED_INFO("transparent GPU execution error: " << gpu_result->GetError());
+    }
+    REQUIRE_FALSE(gpu_result->HasError());
+    require_route(before, sirius::test::get_transparent_execution_stats(*con), route);
+
+    con->Query("SET gpu_execution = false;");
+    auto cpu_result = con->Query(query);
+    con->Query("SET gpu_execution = true;");
+    REQUIRE(cpu_result);
+    if (cpu_result->HasError()) {
+      UNSCOPED_INFO("DuckDB reader error: " << cpu_result->GetError());
+    }
+    REQUIRE_FALSE(cpu_result->HasError());
+
+    auto gpu_rows = collect_rows(gpu_result->Cast<duckdb::MaterializedQueryResult>());
+    auto cpu_rows = collect_rows(cpu_result->Cast<duckdb::MaterializedQueryResult>());
+    std::sort(expected.begin(), expected.end());
+
+    REQUIRE(gpu_rows == cpu_rows);
+    REQUIRE(gpu_rows == expected);
+  }
+
+  std::string v1_path;
+  std::string v2_path;
+};
+
+//===----------------------------------------------------------------------===//
+// V1 — append-only. Runs on the GPU: iceberg data files are parquet, and iceberg_scan binds
+// them into the same MultiFileBindData read_parquet produces.
+//===----------------------------------------------------------------------===//
+
+TEST_CASE_METHOD(GPUExecutionIcebergFixture,
+                 "gpu_execution iceberg - V1 basic scan",
+                 "[integration][gpu_execution][iceberg]")
+{
+  REQUIRE(delete_file_count(v1_path) == 0);  // append-only: nothing for the gate to catch
+  expect_iceberg_rows("SELECT fruit, count FROM iceberg_scan('" + v1_path + "') ORDER BY count;",
+                      gpu_route::gpu,
+                      {{"apple", "1"}, {"banana", "2"}, {"cherry", "3"}});
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergFixture,
+                 "gpu_execution iceberg - V1 count(*)",
+                 "[integration][gpu_execution][iceberg]")
+{
+  expect_iceberg_rows(
+    "SELECT count(*) FROM iceberg_scan('" + v1_path + "');", gpu_route::gpu, {{"3"}});
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergFixture,
+                 "gpu_execution iceberg - V1 filter and order by",
+                 "[integration][gpu_execution][iceberg]")
+{
+  expect_iceberg_rows(
+    "SELECT fruit, count FROM iceberg_scan('" + v1_path + "') WHERE count > 1 ORDER BY count;",
+    gpu_route::gpu,
+    {{"banana", "2"}, {"cherry", "3"}});
+}
+
+//===----------------------------------------------------------------------===//
+// V2 positional deletes.
+//
+// Fixture: 5 rows apple/1..elderberry/5; the delete file removes positions 1 and 3
+// (banana/2, date/4). Surviving: apple/1, cherry/3, elderberry/5.
+//===----------------------------------------------------------------------===//
+
+TEST_CASE_METHOD(GPUExecutionIcebergFixture,
+                 "gpu_execution iceberg - V2 positional deletes basic scan",
+                 "[integration][gpu_execution][iceberg]")
+{
+  require_delete_files(v2_path, 1);
+  expect_iceberg_rows("SELECT fruit, count FROM iceberg_scan('" + v2_path + "') ORDER BY count;",
+                      kPositionalDeleteRoute,
+                      {{"apple", "1"}, {"cherry", "3"}, {"elderberry", "5"}});
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergFixture,
+                 "gpu_execution iceberg - V2 positional deletes count(*)",
+                 "[integration][gpu_execution][iceberg]")
+{
+  require_delete_files(v2_path, 1);
+  // 5 data rows minus 2 deleted. A count that reads row counts from parquet footers without
+  // applying deletes returns 5 — this is the case that catches it.
+  expect_iceberg_rows(
+    "SELECT count(*) FROM iceberg_scan('" + v2_path + "');", kPositionalDeleteRoute, {{"3"}});
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergFixture,
+                 "gpu_execution iceberg - V2 positional deletes order by desc",
+                 "[integration][gpu_execution][iceberg]")
+{
+  require_delete_files(v2_path, 1);
+  expect_iceberg_rows(
+    "SELECT fruit, count FROM iceberg_scan('" + v2_path + "') ORDER BY count DESC;",
+    kPositionalDeleteRoute,
+    {{"apple", "1"}, {"cherry", "3"}, {"elderberry", "5"}});
+}
+
+//===----------------------------------------------------------------------===//
+// V2 equality deletes.
+//
+// Fixture: 5 rows apple/1..elderberry/5; an equality-delete file keyed on (fruit, count)
+// removes banana/2 and date/4. Surviving: apple/1, cherry/3, elderberry/5.
+//===----------------------------------------------------------------------===//
+
+class GPUExecutionIcebergEqualityDeleteFixture : public GPUExecutionIcebergFixture {
+ public:
+  GPUExecutionIcebergEqualityDeleteFixture()
+  {
+    eq_path =
+      (get_project_root() / "test/cpp/integration/data/iceberg_v2_equality_delete").string();
+  }
+
+  std::string eq_path;
+};
+
+TEST_CASE_METHOD(GPUExecutionIcebergEqualityDeleteFixture,
+                 "gpu_execution iceberg - V2 equality deletes basic scan",
+                 "[integration][gpu_execution][iceberg]")
+{
+  require_delete_files(eq_path, 1);
+  expect_iceberg_rows("SELECT fruit, count FROM iceberg_scan('" + eq_path + "') ORDER BY count;",
+                      kEqualityDeleteRoute,
+                      {{"apple", "1"}, {"cherry", "3"}, {"elderberry", "5"}});
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergEqualityDeleteFixture,
+                 "gpu_execution iceberg - V2 equality deletes count(*)",
+                 "[integration][gpu_execution][iceberg]")
+{
+  require_delete_files(eq_path, 1);
+  expect_iceberg_rows(
+    "SELECT count(*) FROM iceberg_scan('" + eq_path + "');", kEqualityDeleteRoute, {{"3"}});
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergEqualityDeleteFixture,
+                 "gpu_execution iceberg - V2 equality deletes filter on surviving rows",
+                 "[integration][gpu_execution][iceberg]")
+{
+  require_delete_files(eq_path, 1);
+  expect_iceberg_rows(
+    "SELECT fruit, count FROM iceberg_scan('" + eq_path + "') WHERE count > 2 ORDER BY count;",
+    kEqualityDeleteRoute,
+    {{"cherry", "3"}, {"elderberry", "5"}});
+}
+
+//===----------------------------------------------------------------------===//
+// V2 equality delete edge cases: single-column keys, multiple delete files, everything
+// deleted, equality combined with positional, and multiple data files.
+//===----------------------------------------------------------------------===//
+
+class GPUExecutionIcebergEqEdgeCaseFixture : public GPUExecutionIcebergFixture {
+ public:
+  GPUExecutionIcebergEqEdgeCaseFixture()
+  {
+    auto root       = get_project_root();
+    single_col_path = (root / "test/cpp/integration/data/iceberg_v2_eq_single_col").string();
+    multi_del_path  = (root / "test/cpp/integration/data/iceberg_v2_eq_multi_delete_file").string();
+    all_del_path    = (root / "test/cpp/integration/data/iceberg_v2_eq_all_deleted").string();
+    combined_path   = (root / "test/cpp/integration/data/iceberg_v2_eq_pos_combined").string();
+    multi_data_path = (root / "test/cpp/integration/data/iceberg_v2_eq_multi_data_file").string();
+  }
+
+  std::string single_col_path;
+  std::string multi_del_path;
+  std::string all_del_path;
+  std::string combined_path;
+  std::string multi_data_path;
+};
+
+TEST_CASE_METHOD(GPUExecutionIcebergEqEdgeCaseFixture,
+                 "gpu_execution iceberg - V2 equality deletes single-column key",
+                 "[integration][gpu_execution][iceberg]")
+{
+  require_delete_files(single_col_path, 1);
+  // The key is the fruit column alone (field_id=1); count is not part of it.
+  // Delete entries "banana" and "date" must match on fruit regardless of count.
+  expect_iceberg_rows(
+    "SELECT fruit, count FROM iceberg_scan('" + single_col_path + "') ORDER BY count;",
+    kEqualityDeleteRoute,
+    {{"apple", "1"}, {"cherry", "3"}, {"elderberry", "5"}});
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergEqEdgeCaseFixture,
+                 "gpu_execution iceberg - V2 equality deletes multiple delete files",
+                 "[integration][gpu_execution][iceberg]")
+{
+  // Two separate one-row equality-delete files — exercises the concatenate/deduplicate path.
+  require_delete_files(multi_del_path, 2);
+  expect_iceberg_rows(
+    "SELECT fruit, count FROM iceberg_scan('" + multi_del_path + "') ORDER BY count;",
+    kEqualityDeleteRoute,
+    {{"apple", "1"}, {"cherry", "3"}, {"elderberry", "5"}});
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergEqEdgeCaseFixture,
+                 "gpu_execution iceberg - V2 equality deletes all rows deleted",
+                 "[integration][gpu_execution][iceberg]")
+{
+  // The delete file covers every data row — an all-false mask, which is where an
+  // apply_boolean_mask that mishandles the empty result shows up.
+  require_delete_files(all_del_path, 1);
+  expect_iceberg_rows(
+    "SELECT fruit, count FROM iceberg_scan('" + all_del_path + "');", kEqualityDeleteRoute, {});
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergEqEdgeCaseFixture,
+                 "gpu_execution iceberg - V2 equality and positional deletes combined",
+                 "[integration][gpu_execution][iceberg]")
+{
+  // Both delete kinds against one table. The positional delete removes row 0 (apple/1). The
+  // equality delete sits at the same sequence number as the data, so per the Iceberg spec it
+  // does NOT apply — deletes only affect data files with strictly lower sequence numbers.
+  // banana/2 surviving is the assertion that the sequence-number rule is honoured.
+  require_delete_files(combined_path, 2);
+  expect_iceberg_rows(
+    "SELECT fruit, count FROM iceberg_scan('" + combined_path + "') ORDER BY count;",
+    kEqualityDeleteRoute,
+    {{"banana", "2"}, {"cherry", "3"}, {"date", "4"}, {"elderberry", "5"}});
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergEqEdgeCaseFixture,
+                 "gpu_execution iceberg - V2 equality deletes multiple data files",
+                 "[integration][gpu_execution][iceberg]")
+{
+  // Two data files, one delete file removing a row from each: file 1 loses banana/2, file 2
+  // loses elderberry/5. Exercises applying one delete set across per-file boundaries — the
+  // same boundary the GPU path's one-file-per-batch coalescing rule exists to protect.
+  require_delete_files(multi_data_path, 1);
+  expect_iceberg_rows(
+    "SELECT fruit, count FROM iceberg_scan('" + multi_data_path + "') ORDER BY count;",
+    kEqualityDeleteRoute,
+    {{"apple", "1"}, {"cherry", "3"}, {"date", "4"}, {"fig", "6"}});
+}
+
+//===----------------------------------------------------------------------===//
+// V3 deletion vectors (Puffin / Roaring bitmap).
+//
+// Same data and same surviving rows as the V2 positional fixture — deliberately, so the DV
+// path is checked to produce identical output to the positional path.
+//===----------------------------------------------------------------------===//
+
+class GPUExecutionIcebergDVFixture : public GPUExecutionIcebergFixture {
+ public:
+  GPUExecutionIcebergDVFixture()
+  {
+    dv_path =
+      (get_project_root() / "test/cpp/integration/data/iceberg_v3_deletion_vector").string();
+  }
+
+  std::string dv_path;
+};
+
+TEST_CASE_METHOD(GPUExecutionIcebergDVFixture,
+                 "gpu_execution iceberg - V3 deletion vector basic scan",
+                 "[integration][gpu_execution][iceberg]")
+{
+  require_delete_files(dv_path, 1);
+  expect_iceberg_rows("SELECT fruit, count FROM iceberg_scan('" + dv_path + "') ORDER BY count;",
+                      kDeletionVectorRoute,
+                      {{"apple", "1"}, {"cherry", "3"}, {"elderberry", "5"}});
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergDVFixture,
+                 "gpu_execution iceberg - V3 deletion vector count(*)",
+                 "[integration][gpu_execution][iceberg]")
+{
+  require_delete_files(dv_path, 1);
+  expect_iceberg_rows(
+    "SELECT count(*) FROM iceberg_scan('" + dv_path + "');", kDeletionVectorRoute, {{"3"}});
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergDVFixture,
+                 "gpu_execution iceberg - V3 deletion vector filter",
+                 "[integration][gpu_execution][iceberg]")
+{
+  // A filter over the surviving rows: a deleted row must not reappear because a predicate
+  // happens to select it.
+  require_delete_files(dv_path, 1);
+  expect_iceberg_rows(
+    "SELECT fruit, count FROM iceberg_scan('" + dv_path + "') WHERE count > 2 ORDER BY count;",
+    kDeletionVectorRoute,
+    {{"cherry", "3"}, {"elderberry", "5"}});
+}
+
+//===----------------------------------------------------------------------===//
+// Schema evolution, snapshot selection, and sequence numbers.
+//===----------------------------------------------------------------------===//
+
+TEST_CASE_METHOD(GPUExecutionIcebergFixture,
+                 "gpu_execution iceberg - schema evolution added column",
+                 "[integration][gpu_execution][iceberg]")
+{
+  auto path = (get_project_root() / "test/cpp/integration/data/iceberg_schema_evolution").string();
+  REQUIRE(delete_file_count(path) == 0);  // append-only — the gate lets this through
+
+  // File 1 holds {fruit, count}; a later snapshot added `color`, so file 2 holds
+  // {fruit, count, color} and file 1's rows must read back with color NULL.
+  //
+  // The GPU scan has no way to synthesize a column that is absent from a data file, so the
+  // plan is accepted and then fails at execute time with "Projected column 'color' not found
+  // in parquet file", and the stashed CPU plan returns the correct rows. Asserting
+  // runtime_fallback (not gpu) records that this is unsupported-but-correct; the fix is the
+  // MISSING-column entry kind in scan_plan, at which point this becomes gpu_route::gpu.
+  expect_iceberg_rows("SELECT * FROM iceberg_scan('" + path + "') ORDER BY count;",
+                      gpu_route::runtime_fallback,
+                      {{"apple", "1", "NULL"},
+                       {"banana", "2", "NULL"},
+                       {"cherry", "3", "NULL"},
+                       {"date", "4", "brown"},
+                       {"elderberry", "5", "purple"}});
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergFixture,
+                 "gpu_execution iceberg - snapshot-aware deletes",
+                 "[integration][gpu_execution][iceberg]")
+{
+  auto path = (get_project_root() / "test/cpp/integration/data/iceberg_snapshot_deletes").string();
+
+  // Latest snapshot carries a delete file, so the gate declines it and DuckDB applies it.
+  require_delete_files(path, 1);
+  expect_iceberg_rows("SELECT * FROM iceberg_scan('" + path + "') ORDER BY count;",
+                      kPositionalDeleteRoute,
+                      {{"apple", "1"}, {"cherry", "3"}, {"elderberry", "5"}});
+
+  // Snapshot 1 predates the delete: all 5 rows, and — the point of this case — the gate must
+  // probe the SAME snapshot the scan reads, so this one runs on the GPU. A gate that ignored
+  // snapshot_from_id would see the table's delete file and needlessly decline.
+  auto const snap1_args = ", snapshot_from_id = 9400000000000001";
+  REQUIRE(delete_file_count(path, snap1_args) == 0);
+  expect_iceberg_rows(
+    "SELECT * FROM iceberg_scan('" + path + "'" + snap1_args + ") ORDER BY count;",
+    gpu_route::gpu,
+    {{"apple", "1"}, {"banana", "2"}, {"cherry", "3"}, {"date", "4"}, {"elderberry", "5"}});
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergFixture,
+                 "gpu_execution iceberg - equality delete sequence numbers",
+                 "[integration][gpu_execution][iceberg]")
+{
+  auto path = (get_project_root() / "test/cpp/integration/data/iceberg_eq_seq_number").string();
+  // seq1 = [apple/1, banana/2, cherry/3], seq2 = delete(banana), seq3 = [banana/4, date/5].
+  // The re-inserted banana/4 must survive: its data sequence number is above the delete's, and
+  // an implementation that matches on key alone would wrongly drop it.
+  require_delete_files(path, 1);
+  expect_iceberg_rows("SELECT fruit, count FROM iceberg_scan('" + path + "') ORDER BY count;",
+                      kEqualityDeleteRoute,
+                      {{"apple", "1"}, {"cherry", "3"}, {"banana", "4"}, {"date", "5"}});
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergFixture,
+                 "gpu_execution iceberg - deflate compressed manifests",
+                 "[integration][gpu_execution][iceberg]")
+{
+  auto path = (get_project_root() / "test/cpp/integration/data/iceberg_deflate_manifest").string();
+  REQUIRE(delete_file_count(path) == 0);
+  expect_iceberg_rows("SELECT * FROM iceberg_scan('" + path + "') ORDER BY count;",
+                      gpu_route::gpu,
+                      {{"apple", "1"}, {"banana", "2"}, {"cherry", "3"}});
+}
 
 //===----------------------------------------------------------------------===//
 // Hive-partitioned parquet scan tests
