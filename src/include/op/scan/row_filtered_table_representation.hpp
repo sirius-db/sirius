@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include "late_mat/column_origin.hpp"
+
 #include <cucascade/cudf/gpu_data_representation.hpp>
 
 #include <memory>
@@ -60,6 +62,19 @@ class row_filtered_gpu_table_representation final
     : ::cucascade::gpu_table_representation(std::move(table), memory_space, writer_stream)
   {
   }
+
+  /// Late-mat wave-seam capture (SIRIUS_EXP_LATE_MAT): the wave-1 selection
+  /// buffers, moved out of the fused decode instead of freed, when the source
+  /// representation requested capture (compressed_*_representation::
+  /// request_selection_capture) AND the whole conjunction was applied (this
+  /// tag). kind=mask, geometry over the chunk's FULL row count; `range` is
+  /// left zeroed by the converter — scan_operator_input::prepare_for_processing
+  /// fills it from the split's origin when it harvests this field. Same
+  /// transient lifetime as the tag itself (conversion -> same-thread capture);
+  /// clone() degrades to the base type and drops it. Default empty; never set
+  /// on a RULE-2 bail or partial-coverage batch (their mask does not describe
+  /// the output rows).
+  std::shared_ptr<const late_mat::row_selection> captured_selection;
 };
 
 /**

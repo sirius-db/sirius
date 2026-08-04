@@ -256,6 +256,21 @@ class compressed_host_representation : public cucascade::idata_representation {
     return _membership_generation;
   }
 
+  /// Late-materialization capture request (SIRIUS_EXP_LATE_MAT, additive):
+  /// when set on a freshly projected per-query representation (same ownership
+  /// rule as the pushdown setters — NEVER the shared pinned chunk), a fused
+  /// scan-filter decode that APPLIES the whole conjunction (row_filtered tag
+  /// only, never a RULE-2 bail or partial coverage) moves its wave-1
+  /// selection buffers onto the produced row_filtered_gpu_table_representation
+  /// (captured_selection) instead of freeing them. Default false; the flag is
+  /// a plain bool and adds no behavior anywhere until the converter reads it.
+  void request_selection_capture() noexcept { _selection_capture_requested = true; }
+
+  [[nodiscard]] bool selection_capture_requested() const noexcept
+  {
+    return _selection_capture_requested;
+  }
+
 
  private:
   /// Construct a projection sharing the same backing blob.
@@ -278,6 +293,8 @@ class compressed_host_representation : public cucascade::idata_representation {
   bool _range_conjuncts_convertible = false;
   decode_membership_pushdown _membership_pushdown;
   std::uint64_t _membership_generation = 0;
+  /// Late-mat capture request (see request_selection_capture()).
+  bool _selection_capture_requested = false;
 };
 
 /// A Simpatico-compressed chunk resident in GPU (device) memory.
@@ -403,6 +420,21 @@ class compressed_device_representation : public cucascade::idata_representation 
     return _membership_generation;
   }
 
+  /// Late-materialization capture request (SIRIUS_EXP_LATE_MAT, additive):
+  /// when set on a freshly projected per-query representation (same ownership
+  /// rule as the pushdown setters — NEVER the shared pinned chunk), a fused
+  /// scan-filter decode that APPLIES the whole conjunction (row_filtered tag
+  /// only, never a RULE-2 bail or partial coverage) moves its wave-1
+  /// selection buffers onto the produced row_filtered_gpu_table_representation
+  /// (captured_selection) instead of freeing them. Default false; the flag is
+  /// a plain bool and adds no behavior anywhere until the converter reads it.
+  void request_selection_capture() noexcept { _selection_capture_requested = true; }
+
+  [[nodiscard]] bool selection_capture_requested() const noexcept
+  {
+    return _selection_capture_requested;
+  }
+
 
   /// Reservation-time fused scan-filter probe (host metadata only — never
   /// touches the device).
@@ -446,6 +478,8 @@ class compressed_device_representation : public cucascade::idata_representation 
   bool _range_conjuncts_convertible = false;
   decode_membership_pushdown _membership_pushdown;
   std::uint64_t _membership_generation = 0;
+  /// Late-mat capture request (see request_selection_capture()).
+  bool _selection_capture_requested = false;
 };
 
 }  // namespace sirius

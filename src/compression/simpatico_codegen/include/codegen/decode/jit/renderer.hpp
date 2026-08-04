@@ -145,13 +145,37 @@ namespace codegen::decode::jit {
 //                    chars).  Extra params: `const uint32_t* sel_mask,
 //                    const uint32_t* chunk_offsets` (both ROW-space),
 //                    `int32_t* len_out`.
+//   * sparse_index_consume / sparse_dict_gather / sparse_str_meta — the
+//                    late-materialization (SIRIUS_EXP_LATE_MAT) sparse-grid
+//                    K8 family.  Identical decode semantics to
+//                    index_consume / mask_dict_gather / str_split_meta, but
+//                    the row selection arrives as a chunk-bucketed CSR
+//                    (codegen/selection/row_set.hpp) and the launch grid is
+//                    the TOUCHED-chunk list, not every chunk: block b serves
+//                    chunk `chunk_list[b]`, its survivors are the uint16
+//                    in-chunk positions at in_chunk_offsets[out_offsets[b]
+//                    .. out_offsets[b+1]) (out_offsets is indexed by BLOCK),
+//                    and compacted output starts at out_offsets[b].
+//                    sparse_index_consume is COMPOSITIONAL: any
+//                    value_source-supported root works (Bitpack closed-form
+//                    = true random access; Delta/RLE/FOR stage the chunk
+//                    in-SM — sequential reconstruction cannot row-skip — and
+//                    store survivors only).  sparse_dict_gather requires a
+//                    Bitpack code leaf; sparse_str_meta a Bitpack- or
+//                    Delta-rooted offsets subtree (K6's next-chunk peek).
+//                    Trailing params: `const uint32_t* chunk_list, const
+//                    uint32_t* out_offsets, const uint16_t*
+//                    in_chunk_offsets` (+ the base variant's extras).
 enum class DecodeVariant : std::uint8_t {
-  plain            = 0,
-  mask_out         = 1,
-  mask_consume     = 2,
-  mask_dict_gather = 3,
-  index_consume    = 4,
-  str_split_meta   = 5,
+  plain                = 0,
+  mask_out             = 1,
+  mask_consume         = 2,
+  mask_dict_gather     = 3,
+  index_consume        = 4,
+  str_split_meta       = 5,
+  sparse_index_consume = 6,
+  sparse_dict_gather   = 7,
+  sparse_str_meta      = 8,
 };
 
 // One decode-input channel the rendered kernel reads.  `field` is the

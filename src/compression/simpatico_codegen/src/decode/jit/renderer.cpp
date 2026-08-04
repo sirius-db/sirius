@@ -170,6 +170,9 @@ class Walker {
       case DecodeVariant::mask_dict_gather: emit_bitpack_mask_dict_gather(tree); break;
       case DecodeVariant::index_consume: emit_bitpack_index_consume(tree); break;
       case DecodeVariant::str_split_meta: emit_str_split_meta(tree); break;
+      case DecodeVariant::sparse_index_consume: emit_sparse_index_consume(tree); break;
+      case DecodeVariant::sparse_dict_gather: emit_sparse_dict_gather(tree); break;
+      case DecodeVariant::sparse_str_meta: emit_sparse_str_meta(tree); break;
     }
     return finalize(tree);
   }
@@ -283,6 +286,16 @@ class Walker {
   void emit_generic_mask_consume(const ::codegen::jit::FusedTree& node);
   void emit_generic_mask_out(const ::codegen::jit::FusedTree& node);
   void emit_str_split_meta(const ::codegen::jit::FusedTree& node);
+  // Late-materialization sparse-grid variants (K8 family; chunk-CSR input).
+  void emit_sparse_index_consume(const ::codegen::jit::FusedTree& node);
+  void emit_sparse_dict_gather(const ::codegen::jit::FusedTree& node);
+  void emit_sparse_str_meta(const ::codegen::jit::FusedTree& node);
+  bool sparse_grid_variant() const noexcept
+  {
+    return variant_ == DecodeVariant::sparse_index_consume ||
+           variant_ == DecodeVariant::sparse_dict_gather ||
+           variant_ == DecodeVariant::sparse_str_meta;
+  }
   DecodeKernelSpec finalize_pair(const std::string& dtype_b);
   void emit_delta_producer(const ::codegen::jit::FusedTree& node,
                            const std::string& dst,
@@ -331,6 +344,9 @@ class Walker {
     if (variant_ == DecodeVariant::mask_dict_gather) spec.entry_symbol += "_mask_dict";
     if (variant_ == DecodeVariant::index_consume) spec.entry_symbol += "_index_consume";
     if (variant_ == DecodeVariant::str_split_meta) spec.entry_symbol += "_str_meta";
+    if (variant_ == DecodeVariant::sparse_index_consume) spec.entry_symbol += "_sparse_index";
+    if (variant_ == DecodeVariant::sparse_dict_gather) spec.entry_symbol += "_sparse_dict";
+    if (variant_ == DecodeVariant::sparse_str_meta) spec.entry_symbol += "_sparse_str_meta";
 
     std::ostringstream src;
     src << kPrelude;
@@ -384,10 +400,52 @@ class Walker {
             << "    const uint32_t* __restrict__ chunk_offsets,\n"
             << "    int32_t* __restrict__ len_out)\n";
         break;
+      // Sparse-grid CSR trailing params (row_set.hpp layout): chunk_list =
+      // touched batch-local chunk ids (one per BLOCK), out_offsets = per-
+      // touched-chunk exclusive survivor offsets (indexed by block, T+1
+      // entries), in_chunk_offsets = uint16 in-chunk positions grouped by
+      // touched chunk.  All are runtime pointers — one compile per (shape,
+      // dtype, variant) serves every selection (JIT-cache rule).
+      case DecodeVariant::sparse_index_consume:
+        src << "    " << dtype_ << "* __restrict__ out,\n"
+            << "    int64_t n,\n"
+            << "    const uint32_t* __restrict__ chunk_list,\n"
+            << "    const uint32_t* __restrict__ out_offsets,\n"
+            << "    const uint16_t* __restrict__ in_chunk_offsets)\n";
+        break;
+      case DecodeVariant::sparse_dict_gather:
+        // `out` is the compacted CHARS buffer (survivor_count * key_width).
+        src << "    char* __restrict__ out,\n"
+            << "    int64_t n,\n"
+            << "    const uint32_t* __restrict__ chunk_list,\n"
+            << "    const uint32_t* __restrict__ out_offsets,\n"
+            << "    const uint16_t* __restrict__ in_chunk_offsets,\n"
+            << "    const char* __restrict__ keys_chars,\n"
+            << "    int32_t key_width)\n";
+        break;
+      case DecodeVariant::sparse_str_meta:
+        // Same domain contract as str_split_meta (`n` = offsets count =
+        // string rows + 1); the CSR is ROW-space (row chunks == offsets
+        // chunks, K6 alignment note).
+        src << "    int64_t* __restrict__ out,\n"
+            << "    int64_t n,\n"
+            << "    const uint32_t* __restrict__ chunk_list,\n"
+            << "    const uint32_t* __restrict__ out_offsets,\n"
+            << "    const uint16_t* __restrict__ in_chunk_offsets,\n"
+            << "    int32_t* __restrict__ len_out)\n";
+        break;
     }
     src << "{\n"
-        << "    constexpr int32_t CHUNK = " << ::codegen::kChunkSize << ";\n"
-        << "    const int32_t chunk_id = static_cast<int32_t>(blockIdx.x);\n"
+        << "    constexpr int32_t CHUNK = " << ::codegen::kChunkSize << ";\n";
+    // Sparse-grid variants launch one block per TOUCHED chunk; everything
+    // downstream (chunk_start/len and every per-chunk channel load) is
+    // unchanged because it keys off chunk_id, not blockIdx.
+    if (sparse_grid_variant()) {
+      src << "    const int32_t chunk_id = static_cast<int32_t>(chunk_list[blockIdx.x]);\n";
+    } else {
+      src << "    const int32_t chunk_id = static_cast<int32_t>(blockIdx.x);\n";
+    }
+    src
         << "    const int32_t tid      = static_cast<int32_t>(threadIdx.x);\n"
         << "    const int64_t chunk_start = static_cast<int64_t>(chunk_id) *\n"
         << "                                static_cast<int64_t>(CHUNK);\n"
@@ -920,6 +978,134 @@ void Walker::emit_str_split_meta(const ::codegen::jit::FusedTree& node)
         << "            (out + out_base)[rank] = off_r;\n"
         << "            len_out[out_base + rank] = static_cast<int32_t>(off_r1 - off_r);\n"
         << "        }\n"
+        << "    }\n";
+  sm_.release_to(mark);
+}
+
+// =====================================================================
+// Sparse-grid late-materialization variants (K8 family) — the chunk-CSR
+// consuming counterparts of index_consume / mask_dict_gather /
+// str_split_meta for row selections that arrive AFTER scan time.  Grid =
+// touched-chunk count; the finalize() preamble derives chunk_id from
+// chunk_list[blockIdx.x], so every per-chunk channel load below is
+// unchanged.  out_offsets is indexed by BLOCK (position in chunk_list):
+// block b's survivors are in_chunk_offsets[out_offsets[b] ..
+// out_offsets[b+1]) (uint16 in-chunk positions, ascending) and its
+// compacted output starts at out_offsets[b].
+// =====================================================================
+
+// K8: compositional sparse decode.  Bitpack roots read closed-form (true
+// random access — only listed rows are ever unpacked); Delta/RLE/FOR roots
+// stage the chunk via value_source (sequential reconstruction cannot
+// row-skip) and store survivors only — chunk-granular work, but only for
+// TOUCHED chunks, which is the whole point at low density.
+void Walker::emit_sparse_index_consume(const ::codegen::jit::FusedTree& node)
+{
+  body_ << "    // --- node " << id_of(node) << ": " << ::codegen::jit::op_kind_name(node.op)
+        << " sparse index-list decode -> compacted output (K8) ---\n"
+        << "    (void)len;  // listed in-chunk positions are < len by construction\n"
+        << "    const int64_t out_base = static_cast<int64_t>(out_offsets[blockIdx.x]);\n"
+        << "    const int32_t cnt = static_cast<int32_t>(\n"
+        << "        static_cast<int64_t>(out_offsets[blockIdx.x + 1]) - out_base);\n"
+        << "    if (cnt == 0) return;  // defensive: touched chunks carry >= 1 survivor\n";
+  // Uniform per block, so the early return above is safe before any
+  // block-collective staging value_source may emit (Delta/RLE slabs).
+  const auto mark = sm_.mark();
+  ValueSource vs  = value_source(node, dtype_, "len");
+  body_ << "    const uint16_t* idxs = in_chunk_offsets + out_base;\n"
+        << "    for (int32_t k = tid; k < cnt; k += " << tbs_ << ") {\n"
+        << "        const int32_t i = static_cast<int32_t>(idxs[k]);\n"
+        << "        (out + out_base)[k] = " << at_pos(vs.read_expr, "i") << ";\n"
+        << "    }\n";
+  sm_.release_to(mark);
+}
+
+// K5s: sparse dictionary-code gather — mask_dict_gather's CSR sibling.
+// Bitpack code leaf only; for listed rows, decode the code and copy the
+// key's bytes from the constant-width, null-free key pool.
+void Walker::emit_sparse_dict_gather(const ::codegen::jit::FusedTree& node)
+{
+  if (node.op != ::codegen::OpKind::Bitpack || !node.children.empty()) {
+    throw RenderError("decode render: sparse_dict_gather variant requires a Bitpack code leaf "
+                      "root (got '" +
+                      std::string(::codegen::jit::op_kind_name(node.op)) + "')");
+  }
+  body_ << "    // --- node " << id_of(node)
+        << ": Bitpack code sparse dictionary gather (K5s) ---\n"
+        << "    (void)len;  // listed in-chunk positions are < len by construction\n"
+        << "    const int64_t out_base = static_cast<int64_t>(out_offsets[blockIdx.x]);\n"
+        << "    const int32_t cnt = static_cast<int32_t>(\n"
+        << "        static_cast<int64_t>(out_offsets[blockIdx.x + 1]) - out_base);\n"
+        << "    if (cnt == 0) return;\n";
+  ValueSource vs = bitpack_value_source(node, dtype_);
+  body_ << "    const uint16_t* idxs = in_chunk_offsets + out_base;\n"
+        << "    for (int32_t k = tid; k < cnt; k += " << tbs_ << ") {\n"
+        << "        const int32_t i = static_cast<int32_t>(idxs[k]);\n"
+        << "        const int64_t code = static_cast<int64_t>(" << at_pos(vs.read_expr, "i")
+        << ");\n"
+        << "        const char* kk = keys_chars + code * key_width;\n"
+        << "        char* o = out + (out_base + k) * key_width;\n"
+        << "        for (int32_t b = 0; b < key_width; ++b) o[b] = kk[b];\n"
+        << "    }\n";
+}
+
+// K6s: sparse str_split survivor metadata — str_split_meta's CSR sibling.
+// The offsets chunk is reconstructed IN FULL via value_source (offsets
+// plans are commonly delta-rooted and cannot row-skip; for bitpack roots
+// two random reads per survivor only beat the ~1.7 KB chunk reconstruct
+// below ~69 survivors/chunk, and the reconstruct is in-SM compute
+// overlapped with the char gather's DRAM traffic — so full reconstruct is
+// the v1 choice), but only for TOUCHED chunks, and only survivor
+// {source offset, length} pairs are written.  Root must be Bitpack or
+// Delta for the next-chunk first-offset peek (same contract as K6).
+void Walker::emit_sparse_str_meta(const ::codegen::jit::FusedTree& node)
+{
+  const bool bitpack_root = node.op == ::codegen::OpKind::Bitpack && node.children.empty();
+  const bool delta_root   = node.op == ::codegen::OpKind::Delta;
+  if (!bitpack_root && !delta_root) {
+    throw RenderError("decode render: sparse_str_meta requires a Bitpack- or Delta-rooted "
+                      "offsets subtree (got '" +
+                      std::string(::codegen::jit::op_kind_name(node.op)) + "')");
+  }
+
+  body_ << "    // --- node " << id_of(node)
+        << ": str_split offsets sparse survivor meta (K6s) ---\n"
+        << "    const int64_t n_rows = n - 1;  // offsets count = string rows + 1\n"
+        << "    if (chunk_start >= n_rows) return;  // offsets-tail chunk: no rows\n"
+        << "    const int64_t out_base = static_cast<int64_t>(out_offsets[blockIdx.x]);\n"
+        << "    const int32_t cnt = static_cast<int32_t>(\n"
+        << "        static_cast<int64_t>(out_offsets[blockIdx.x + 1]) - out_base);\n"
+        << "    if (cnt == 0) return;\n";
+
+  const auto mark = sm_.mark();
+  ValueSource vs  = value_source(node, dtype_, "len");
+
+  // Next chunk's first offset (read when a listed row is the chunk's last;
+  // the guard proves chunk_id+1 is in range then) — identical peek to K6.
+  const std::string idstr = std::to_string(id_of(node));
+  body_ << "    " << dtype_ << " next0 = " << dtype_ << "{0};\n"
+        << "    if ((static_cast<int64_t>(chunk_id) + 1) * static_cast<int64_t>(CHUNK) < n) {\n";
+  if (bitpack_root) {
+    body_ << "        next0 = simpatico_bp_at(packed_" << idstr << " + bp_offsets_" << idstr
+          << "[chunk_id + 1],\n"
+          << "                                static_cast<int32_t>(chunk_bits_" << idstr
+          << "[chunk_id + 1]),\n"
+          << "                                chunk_min_" << idstr << "[chunk_id + 1], 0);\n";
+  } else {
+    body_ << "        next0 = delta_first_" << idstr << "[chunk_id + 1];\n";
+  }
+  body_ << "    }\n";
+
+  body_ << "    const uint16_t* idxs = in_chunk_offsets + out_base;\n"
+        << "    for (int32_t k = tid; k < cnt; k += " << tbs_ << ") {\n"
+        << "        const int32_t i = static_cast<int32_t>(idxs[k]);\n"
+        << "        const int64_t off_r = static_cast<int64_t>(" << at_pos(vs.read_expr, "i")
+        << ");\n"
+        << "        const int64_t off_r1 = (i + 1 < len)\n"
+        << "            ? static_cast<int64_t>(" << at_pos(vs.read_expr, "(i + 1)") << ")\n"
+        << "            : static_cast<int64_t>(next0);\n"
+        << "        (out + out_base)[k] = off_r;\n"
+        << "        len_out[out_base + k] = static_cast<int32_t>(off_r1 - off_r);\n"
         << "    }\n";
   sm_.release_to(mark);
 }

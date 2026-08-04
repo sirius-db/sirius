@@ -594,3 +594,111 @@ command line and returns a false positive. Gate on
 (~25 min) and ~25 s incremental. Build incrementally; never clean unless a build is actually
 broken. And never run two `ninja` invocations against the libcudf build dir concurrently — it
 corrupts `.ninja_deps` and costs two full rebuilds.
+
+## Session 4 (2026-08-03/04) — late materialization v1 (branch `exp/late-mat`)
+
+**Suite 6.918 → gate-on 6.853–6.874 s across five audited A/B pairs, all 22/22 ×10;
+banked D1 result: −33..−64 ms per pair, mean −53 ms (−0.8%), driven entirely by
+q10 −47..−49 ms in every pair.** The pair scatter is non-q10 small-query noise —
+q10 itself reproduced within 2 ms across all five pairs (spread 0.05%). Fifth pair
+(bank re-confirmation on the final guard-fixed binary): off 6.919 / on 6.860 (−59 ms).
+
+Architecture (gate `SIRIUS_EXP_LATE_MAT`, default OFF = byte-identical): a plan-time
+policy walk in the scan manager's prepare_for_query installs a directive PAIR — the
+scan substitutes deferred payload columns with one UINT64 pin-order rowid (+ INT8
+placeholders, arity preserved; operators carry them as ordinary data), and the first
+non-transparent consuming pipeline's input-port prepare materializes the real columns
+by gather/decode from the pinned origin (generation-checked pin handles; origins
+refuse MVCC masks, delta splits, nullables, non-GPU tiers, static-filtered scans).
+The materializer is two-phase (prepare_selection shared across a batch's deferred
+columns, then per-column materialize): uncompressed origins take a raw-gather no-sort
+fast path; compressed origins take K8 sparse chunk-CSR / shipped-mask / full-decode
+routes with a wave-side selection capture on fused batches (seam ii). The two policy
+rules that turned the first measurement (−65 ms LOSS) into the banked win: a
+**deferred-value floor** (Σ real width − rowid ≥ 32 B/row, widths from pin metadata)
+and **widest-bundle-wins consumer arbitration** (first-install-wins had let a 25-row
+nation scan's 11 B n_name claim the consumer slot ahead of q10's 151 B/row customer
+bundle — and pay a port-rows-sized sort/restore prep, q9 +61 ms, to save 3 B/row).
+
+**Arm C (COMPRESSED origins / D2 width arbitrage): KILLED per pre-registration.**
+With the census exactly as designed (q9 lineitem 3-col install live: 24.0 B/row,
+value 16.0, 9 boundaries; q5/q7 riders off) and results 22/22 byte-identical, q9
+measured 0.8619 → **0.9283 (+66 ms)** against a pre-registered band of −5..−35 ms
+and a kill bar of <8 ms improvement — 15× q9's spread past kill. Arithmetic of the
+kill: the ride never thins (326.45 M rows flat scan→final join), so deferral buys
+only 14 B/row of ride width, while the compressed port materialization pays a u64
+sort/unique + chunk-CSR prep + rank-restore gather + per-batch syncs, all sized by
+the same 326.45 M unthinned port rows. q5 (value 8) and q7 (value 12) die a
+fortiori. `SIRIUS_EXP_LATE_MAT_COMPRESSED` stays default-OFF and
+`MIN_VALUE_BYTES=32` is final; the knob and the full compressed-materialize
+machinery remain in-tree, unit-proven, for non-TPC-H workloads where a WIDE
+compressed bundle rides a genuinely thinning path (TPC-H SF1000 has none: every
+wide-string origin here is an uncompressed pin).
+
+Bugs banked on the way: (1) **stored-dtype re-tag** — the column-level compressed
+materialize path returned the physical storage dtype (INT64) without the
+apply_stored_dtype re-tag, so q9 DECIMAL64 values came back ×100; caught by the
+byte-identity bar on arm C's first-ever compressed DECIMAL64 materialization, fixed
+in the materializer + 6-case class-wide unit tests (decimal64 bitpack/delta,
+decimal32, date32, timestamp_us, tier-b identity), arm-C re-run byte-identical.
+(2) **Reservation livelock (pre-existing engine behavior, W4-F5)** — gpu-tier pins
+are unevictable, so a right-sized pin set plus history-ballooned demand can make the
+reservation blocking-wait spin silently forever (113-min observed hang, zero log
+lines; the MAX_RETRIES=100 cap at gpu_pipeline_executor.cpp:348 guards only the
+oom_reschedule throw path). The unsatisfiable-reservation guard ships VALIDATED BY
+PARTS: fail-fast arithmetic + provider registry unit-tested, limit source
+code-chain-verified to see the shrunken pool, suite-neutral at five pairs. The
+in-engine fail-fast firing is NOT deterministically constructible — over-sized gpu
+pins abort loudly at pin time on a pre-existing capacity bound, right-sized pins
+leave satisfiable headroom — so worst case the guard never fires and behavior is
+unchanged; if the hang class recurs, the 10 s watchdog INFO line ends the
+zero-diagnostics failure mode and unsatisfiable demand errors immediately. E2e proof
+seam if ever needed: a test-build-gated synthetic provider in the registry.
+(3) **CUB tail reads (2 real fixes + 1 documented toolchain artifact)** — memcheck
+on the new rowset layer found CCCL-3 predicated tail loads reading past exactly-sized
+allocations (fixed: 16-byte tail guards on every cub-touched buffer) and a cub
+shared-staging fault on degenerate scan sizes (fixed: trivially-auditable small-N
+prefix-sum dispatcher, n≤2048, cub unchanged above). The residue — an Invalid
+__shared__ read inside cub DeviceScanKernel's own staging at multi-tile N — is a
+**CCCL 3.4-specific compute-sanitizer artifact**: a textbook-usage parity repro with
+the verbatim TU flag set reproduces it, CCCL 3.2 arms are clean, accesses are
+staging reads only, never data-affecting (plain runs bit-correct at every geometry;
+racecheck clean everywhere). Repro + evidence: campaign scratchpad lazymat/, worth an
+upstream CCCL report.
+
+Validation record: five A/B pairs 22/22 ×10 on staleness-audited binaries;
+adversarial sweep 22 shapes × 4 arms PASS-EXACT with a hard vacuousness gate (the
+compressed decimal/temporal ride shapes verified to actually install); pressure
+arm with genuine downgrades in both arms (spill contract: annotations die safely,
+force-materialize inside the reservation envelope); racecheck clean; memcheck clean
+modulo the documented CCCL artifact. Also banked as process lessons: .ninja_deps
+corruption produced a stale-object layout-mix binary whose gate-off crash was a
+build defect, not code (and an earlier "green" stale-mix pass was layout luck) —
+staleness audits are now part of every measurement build; sanitizer runs must target
+unit binaries directly (the pixi/python harness breaks compute-sanitizer attach).
+
+Dead ends and knobs (do-not-retry additions):
+
+| tried | result | verdict |
+|---|---|---|
+| thin single-string deferral from small dims (n_name 11 B, s_name 25 B) | q9 +61, q5 +7, q21 +6, q10 +4 ms — port prep sized by fanned-out port rows vs 3 B/row saved | dead; killed by MIN_VALUE_BYTES=32 |
+| first-install-wins consumer slots | nation blocked q10's 151 B/row bundle silently | replaced by widest-bundle-wins |
+| D2 width arbitrage on flat rides (q9 24 B, q7 20 B, q5 16 B numeric bundles) | q9 +66 ms vs −5..−35 band with everything working correctly | dead on TPC-H; COMPRESSED default-off |
+| global threshold drop (T<32) without D2 | re-admits only the fan-out losers above | pre-killed by arithmetic, never run |
+| q13 count-substitution at the aggregate seam | rewrite adds a 1.53 B-row pass to save less; the real 48 GB is upstream of the seam | needs v2 scan-side rowid emission |
+| gpu-pins-into-shrunken-pool as a spill test | pins are unevictable → downgrade reclaims nothing (livelock) or pin aborts at capacity | host-tier pins + shrunken pool is the valid form |
+
+Knobs (final): `SIRIUS_LATE_MAT_MIN_VALUE_BYTES=32` (deferred-value floor, B/row);
+`SIRIUS_LATE_MAT_MIN_VALUE_COMPRESSED=32` default (=12 only in the killed arm-C
+experiment); `SIRIUS_LATE_MAT_MASK_SEL=1.0` (sparse route tried at every density —
+mask route never wins, capability fallback only); `SIRIUS_LATE_MAT_DENSE_SEL=0.35`
+(mask-vs-full fallback crossover, measured, dict/str tiers exempt);
+`SIRIUS_LATE_MAT_MIN_BOUNDARIES=4`.
+
+v2 shelf, pre-sized: **q13 count-on-deferred** (count(o_orderkey)→count(rowid),
+16–32 ms, needs scan-side rowid emission under planner control); **planner-side
+deferral pass** (replaces the pipeline-walk heuristic with bound column lifetimes;
+also unlocks group-by-rowid under a PK proof, q10 v2 60–130 ms band); **K6s
+survivor-offsets** (sparse string decode GPU roundtrip); **multi-batch uncompressed
+fast path** (the no-sort raw-gather path currently canonicalizes when an
+uncompressed origin spans >1 pinned batch).

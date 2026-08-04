@@ -92,6 +92,10 @@ namespace sirius::planner {
 class query;
 }  // namespace sirius::planner
 
+namespace sirius::late_mat {
+class pin_entry_handle;  // late_mat/column_origin.hpp
+}  // namespace sirius::late_mat
+
 namespace sirius::telemetry {
 struct batch_telemetry_info;
 }  // namespace sirius::telemetry
@@ -205,6 +209,14 @@ struct pinned_entry {
   /// @ref sirius_scan_manager::attach_mvcc_metadata right after insert. nullptr
   /// for parquet pins (immutable sources need no visibility reconciliation).
   std::unique_ptr<duckdb_mvcc_metadata> mvcc;
+  /// Late-materialization origin handle (SIRIUS_EXP_LATE_MAT). Created by the
+  /// insert paths ONLY when the gate is on; column_origins minted against this
+  /// entry share it and validate their captured generation through it, so an
+  /// origin can never dangle across unpin/re-pin/merge (the handle is
+  /// invalidated or generation-bumped by the same insert/remove code that
+  /// mutates the entry). Gate off ⇒ always empty — one inert shared_ptr per
+  /// pinned TABLE, the only off-gate footprint on this struct.
+  std::shared_ptr<late_mat::pin_entry_handle> late_mat_handle;
 };
 
 /// Validate that @p entry can serve @p selected_columns (positions into
@@ -222,6 +234,18 @@ struct pinned_entry {
 /// recording the assignment and converts a throw into a disk-read fallback.
 void validate_pinned_entry_for_serving(pinned_entry const& entry,
                                        std::span<std::size_t const> selected_columns);
+
+/// Per-chunk row counts of @p entry, in chunk-index order (pin emission order),
+/// covering all three storage forms with the same dispatch priority the cached
+/// provider uses (device_chunks > data_batches_by_column > host_chunks). A
+/// null/absent chunk contributes 0. Read-only; O(#chunks), no device work.
+///
+/// Late-materialization layout source of truth: the exclusive prefix sum of
+/// this vector is the per-chunk GLOBAL row start (pin-order row addressing,
+/// late_mat/column_origin.hpp) — the scan manager's origin stamping and the
+/// late materializer's layout builder must both derive from it so they can
+/// never disagree.
+[[nodiscard]] std::vector<std::int64_t> pinned_chunk_row_counts(pinned_entry const& entry);
 
 /**
  * @brief Cache-serve-time survivor plan for one cached scan.

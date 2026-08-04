@@ -17,8 +17,12 @@
 // sirius
 #include "io/cache/types.hpp"
 
+#include <codegen/selection/selection.hpp>
 #include <data/data_batch_utils.hpp>
 #include <data/sirius_converter_registry.hpp>
+#include <late_mat/annotated_table_representation.hpp>
+#include <late_mat/column_origin.hpp>
+#include <late_mat/defer_directive.hpp>
 #include <log/logging.hpp>
 #include <op/scan/gpu_ingestible.hpp>
 #include <op/scan/parquet_gpu_ingestible.hpp>
@@ -28,9 +32,16 @@
 #include <scan_manager/split_connector.hpp>
 
 // cudf
+#include <cudf/binaryop.hpp>
+#include <cudf/column/column_factories.hpp>
+#include <cudf/column/column_view.hpp>
+#include <cudf/filling.hpp>
+#include <cudf/scalar/scalar.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
 #include <cudf/utilities/memory_resource.hpp>
+
+#include <rmm/device_buffer.hpp>
 
 // cucascade
 #include <cucascade/cudf/gpu_data_representation.hpp>
@@ -134,8 +145,133 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::execute(
     output_table = materialized_table.table.release(stream, mem_space->get_default_allocator());
   }
 
-  auto batch =
-    sirius::make_data_batch(std::move(output_table), *mem_space, stream, batch_telemetry());
+  std::shared_ptr<::cucascade::data_batch> batch;
+  // Late-mat (SIRIUS_EXP_LATE_MAT). Two gated features, both keyed off the
+  // provider-stamped origin; gate off ⇒ late_mat_origin is never set and this
+  // whole region is a single null check.
+  //
+  // 1. DEFERRAL SUBSTITUTION (late_mat_defer, installed by the defer policy in
+  //    a pair with the consuming port's directive): replace the deferred
+  //    output positions with a UINT64 pin-order rowid column (first position;
+  //    dense iota for full-chunk batches, captured wave-1 survivor ids for
+  //    fused-compacted ones) and INT8 zero placeholders. Arity and positions
+  //    are preserved, so every operator between here and the consuming port
+  //    carries the narrow columns as ordinary data. A stamped scan whose
+  //    batch is neither dense nor mask-captured must FAIL — batches of one
+  //    scan must substitute consistently or CONCAT downstream would see
+  //    mixed types (never silent wrong data).
+  if (late_mat_defer && scan_input->late_mat_origin && output_table) {
+    auto const& origin = *scan_input->late_mat_origin;
+    auto const& defer  = *late_mat_defer;
+    auto const n_rows  = static_cast<std::int64_t>(output_table->num_rows());
+    auto mr            = mem_space->get_default_allocator();
+
+    std::unique_ptr<cudf::column> rowid_col;
+    if (n_rows == origin.range.rows) {
+      // Dense: batch row k is global row range.start + k.
+      rowid_col = cudf::sequence(
+        static_cast<cudf::size_type>(n_rows),
+        cudf::numeric_scalar<std::uint64_t>(static_cast<std::uint64_t>(origin.range.start),
+                                            true,
+                                            stream),
+        cudf::numeric_scalar<std::uint64_t>(1, true, stream),
+        stream,
+        mr);
+    } else if (scan_input->late_mat_selection &&
+               scan_input->late_mat_selection->kind == late_mat::row_selection_kind::mask &&
+               n_rows == scan_input->late_mat_selection->survivor_count) {
+      // Fused-compacted: expand the captured wave-1 mask to batch-local
+      // survivor ids (shipped kernel), then add the chunk's global base.
+      auto const& sel = *scan_input->late_mat_selection;
+      sirius::codegen::selection_mask mask;
+      mask.words          = static_cast<std::uint32_t*>(sel.mask_words->data());
+      mask.num_rows       = origin.range.rows;
+      mask.survivor_count = sel.survivor_count;
+      mask.chunk_offsets  = static_cast<std::uint32_t*>(sel.chunk_offsets->data());
+      rmm::device_buffer local_ids(sizeof(std::int32_t) * static_cast<std::size_t>(n_rows),
+                                   stream,
+                                   mr);
+      sirius::codegen::mask_to_row_indices(
+        mask, static_cast<std::int32_t*>(local_ids.data()), stream);
+      cudf::column_view local_view(cudf::data_type{cudf::type_id::INT32},
+                                   static_cast<cudf::size_type>(n_rows),
+                                   local_ids.data(),
+                                   nullptr,
+                                   0);
+      rowid_col = cudf::binary_operation(
+        local_view,
+        cudf::numeric_scalar<std::uint64_t>(static_cast<std::uint64_t>(origin.range.start),
+                                            true,
+                                            stream),
+        cudf::binary_operator::ADD,
+        cudf::data_type{cudf::type_id::UINT64},
+        stream,
+        mr);
+      // local_ids feeds the binary op enqueued on `stream` and was allocated
+      // on `stream` — its stream-ordered free at scope exit is safe.
+    } else {
+      throw std::runtime_error(
+        "[sirius_gpu_scan_operator::execute] late-mat deferral stamped but the batch is neither "
+        "dense nor mask-captured (rows=" +
+        std::to_string(n_rows) + ", chunk rows=" + std::to_string(origin.range.rows) +
+        "); refusing to emit inconsistent placeholder batches");
+    }
+
+    auto cols = output_table->release();
+    for (auto const pos : defer.output_positions) {
+      if (pos >= cols.size()) {
+        throw std::runtime_error(
+          "[sirius_gpu_scan_operator::execute] late-mat defer position out of range");
+      }
+      if (pos == defer.rowid_position()) {
+        cols[pos] = std::move(rowid_col);
+      } else {
+        cols[pos] = cudf::make_column_from_scalar(
+          cudf::numeric_scalar<std::int8_t>(0, true, stream),
+          static_cast<cudf::size_type>(n_rows),
+          stream,
+          mr);
+      }
+    }
+    output_table = std::make_unique<cudf::table>(std::move(cols));
+  }
+  // 2. ORIGIN ANNOTATION on non-substituted outputs (downstream consumers /
+  //    prepare_selection_from_batch):
+  //  - dense form when the output demonstrably covers the WHOLE chunk (the
+  //    row guard is self-verifying: filters/masks/compaction fall through);
+  //  - mask form when the fused decode compacted the batch and the capture
+  //    harvested its selection (rows == survivor count);
+  //  - the column guard enforces the materialized-order mapping invariant (output
+  //    column j == materialized slot j).
+  else if (scan_input->late_mat_origin && output_table) {
+    auto const& origin = *scan_input->late_mat_origin;
+    auto const n_rows  = static_cast<std::int64_t>(output_table->num_rows());
+    bool const columns_map =
+      origin.columns &&
+      static_cast<std::size_t>(output_table->num_columns()) <= origin.columns->size();
+    std::shared_ptr<const late_mat::batch_annotation> annotation;
+    if (columns_map && n_rows == origin.range.rows) {
+      annotation = std::make_shared<const late_mat::batch_annotation>(
+        late_mat::batch_annotation{origin, late_mat::row_selection::make_dense(origin.range)});
+    } else if (columns_map && scan_input->late_mat_selection &&
+               scan_input->late_mat_selection->kind == late_mat::row_selection_kind::mask &&
+               n_rows == scan_input->late_mat_selection->survivor_count) {
+      annotation = std::make_shared<const late_mat::batch_annotation>(
+        late_mat::batch_annotation{origin, *scan_input->late_mat_selection});
+    }
+    if (annotation) {
+      auto annotated_repr = std::make_unique<late_mat::origin_annotated_gpu_table_representation>(
+        std::move(output_table), *mem_space, stream, std::move(annotation));
+      const auto batch_id = sirius::get_next_batch_id();
+      batch               = ::cucascade::data_batch::make(
+        batch_id,
+        std::move(annotated_repr),
+        telemetry::quent_data_batch_probe::create(batch_telemetry(), batch_id));
+    }
+  }
+  if (!batch) {
+    batch = sirius::make_data_batch(std::move(output_table), *mem_space, stream, batch_telemetry());
+  }
   std::vector<std::shared_ptr<::cucascade::data_batch>> batches{std::move(batch)};
   return std::make_unique<pipelineable_operator_data>(std::move(batches));
 }

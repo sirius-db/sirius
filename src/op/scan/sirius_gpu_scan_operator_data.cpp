@@ -23,8 +23,11 @@
 #include <data/sirius_converter_registry.hpp>
 #include <log/logging.hpp>
 #include <op/scan/row_filtered_table_representation.hpp>
+#include <op/scan/selection_captured_table_representation.hpp>
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
 #include <op/sirius_dynamic_filter.hpp>
+
+#include <late_mat/column_origin.hpp>
 
 #include <algorithm>
 #include <cstdlib>
@@ -221,6 +224,21 @@ void scan_operator_input::prepare_for_processing(
           snapshot_onto(host_rep);
         }
       }
+      // Late-mat wave-seam capture request (SIRIUS_EXP_LATE_MAT): this split's
+      // scan defers columns (origin stamped), so ask the fused decode to hand
+      // back its wave-1 survivor selection instead of freeing it. Set only on
+      // the per-query projected clone (this batch's rep), never the shared
+      // pin; only meaningful when the converter takes the row_filtered path —
+      // RULE-2 bails and partial coverage never capture (the converter enforces).
+      if (late_mat::late_mat_enabled() && late_mat_origin && !mvcc_keep_mask.has_mask()) {
+        if (auto* device_rep =
+              dynamic_cast<::sirius::compressed_device_representation*>(mut.get_data())) {
+          device_rep->request_selection_capture();
+        } else if (auto* host_rep =
+                     dynamic_cast<::sirius::compressed_host_representation*>(mut.get_data())) {
+          host_rep->request_selection_capture();
+        }
+      }
       mut.convert_to<::cucascade::gpu_table_representation>(
         registry, requested_memory_space, stream);
       // Fused scan-filter: the converter reports decode-time row filtering by
@@ -229,8 +247,31 @@ void scan_operator_input::prepare_for_processing(
       // Capture it on the split — materialize_table maps it to
       // filter_state::ROW_FILTERED so the filter is not re-evaluated. Off-gate
       // the converters always install the base type and this stays false.
-      decode_row_filtered =
-        dynamic_cast<::sirius::row_filtered_gpu_table_representation*>(mut.get_data()) != nullptr;
+      auto* row_filtered_rep =
+        dynamic_cast<::sirius::row_filtered_gpu_table_representation*>(mut.get_data());
+      decode_row_filtered = row_filtered_rep != nullptr;
+      // Harvest the captured wave-1 selection (filled by the fused decode
+      // converter): copy the light struct, fill the global range from the
+      // split's origin (the converter cannot know it), and take it off the
+      // transient carrier. Two carriers exist: the row_filtered tag (whole
+      // conjunction applied) and the metadata-only selection_captured type
+      // (status==applied but untagged — membership-compacted / partial
+      // coverage; its filter semantics are byte-identical to a plain
+      // representation, so decode_row_filtered deliberately stays false).
+      std::shared_ptr<const late_mat::row_selection>* capture_slot = nullptr;
+      if (row_filtered_rep != nullptr) {
+        capture_slot = &row_filtered_rep->captured_selection;
+      } else if (auto* captured_rep =
+                   dynamic_cast<::sirius::selection_captured_gpu_table_representation*>(
+                     mut.get_data())) {
+        capture_slot = &captured_rep->captured_selection;
+      }
+      if (capture_slot != nullptr && *capture_slot && late_mat_origin) {
+        auto harvested     = std::make_shared<late_mat::row_selection>(**capture_slot);
+        harvested->range   = late_mat_origin->range;
+        late_mat_selection = std::move(harvested);
+        capture_slot->reset();
+      }
       // A RULE-2 bail comes back as classic full-width content under the
       // bailed tag; latch it so the scan's remaining splits skip the attempt.
       if (fused_bail_flag &&

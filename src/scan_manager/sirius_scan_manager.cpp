@@ -19,6 +19,8 @@
 #include "compression/device_compressed_blob.hpp"
 #include "data/data_batch_utils.hpp"
 #include "exec/thread_pool.hpp"
+#include "late_mat/column_origin.hpp"
+#include "scan_manager/late_mat_defer_policy.hpp"
 #include "io/cache/prefetching_cache.hpp"
 #include "io/io_context.hpp"
 #include "io/parquet_helpers.hpp"
@@ -99,6 +101,26 @@ bool fused_scan_diag_enabled()
   return enabled;
 }
 
+/// Defined below, next to insert_pinned_entry_host (same anonymous namespace).
+std::size_t pinned_host_chunk_rows(cucascade::idata_representation const& chunk);
+
+/// Late-mat handle lifecycle (SIRIUS_EXP_LATE_MAT). The
+/// insert/remove paths call these so an origin can never dangle: any entry
+/// death or replacement invalidates the old handle first (outstanding origins
+/// fail closed), and a fresh entry gets a fresh handle only when the gate is
+/// on (gate off ⇒ no handle is ever created and the field stays empty).
+void invalidate_late_mat_handle(pinned_entry& entry)
+{
+  if (entry.late_mat_handle) { entry.late_mat_handle->invalidate(); }
+}
+
+void attach_late_mat_handle(std::string const& name, pinned_entry& slot)
+{
+  if (!late_mat::late_mat_enabled()) { return; }
+  slot.late_mat_handle = std::make_shared<late_mat::pin_entry_handle>(name, /*generation=*/1);
+  slot.late_mat_handle->set_entry(&slot);
+}
+
 struct cached_databatch_provider : public databatch_provider {
   cached_databatch_provider(pinned_entry const& entry,
                             std::span<std::size_t const> selected_columns,
@@ -125,6 +147,31 @@ struct cached_databatch_provider : public databatch_provider {
       _column_names.emplace_back(entry_column_names[idx]);
       _column_indices.push_back(idx);
     });
+    // Late-mat origin stamping (SIRIUS_EXP_LATE_MAT): precompute the shared
+    // per-column origins and the chunk row-starts prefix so each served batch
+    // knows its global row span. Same invariants as the fused attaches — no
+    // MVCC keep-masks and no insert-delta splits (origins under MVCC would
+    // resurrect masked rows; delta rows lie beyond the pinned prefix). Gate
+    // off ⇒ this whole block is a null-handle check.
+    if (late_mat::late_mat_enabled() && _entry.late_mat_handle && _mvcc_masks.empty() &&
+        _delta_splits.empty()) {
+      auto const& handle = _entry.late_mat_handle;
+      auto origins       = std::make_shared<std::vector<late_mat::column_origin>>();
+      origins->reserve(_column_indices.size());
+      for (auto const idx : _column_indices) {
+        origins->push_back(late_mat::column_origin{
+          handle, static_cast<std::uint32_t>(idx), handle->generation()});
+      }
+      _origin_columns        = std::move(origins);
+      auto const chunk_rows  = pinned_chunk_row_counts(_entry);
+      _chunk_row_counts      = chunk_rows;
+      _chunk_row_starts.resize(chunk_rows.size());
+      std::int64_t running = 0;
+      for (std::size_t i = 0; i < chunk_rows.size(); ++i) {
+        _chunk_row_starts[i] = running;
+        running += chunk_rows[i];
+      }
+    }
   }
 
   databatch_provider::batch get_next_batch() override
@@ -152,7 +199,18 @@ struct cached_databatch_provider : public databatch_provider {
     }
     if (!data) { return {}; }
     auto mask = index < _mvcc_masks.size() ? _mvcc_masks[index] : mvcc_chunk_mask{};
-    return {std::move(data), std::move(mask)};
+    databatch_provider::batch out{std::move(data), std::move(mask)};
+    // Late-mat: stamp this chunk's global row span (origins were only built
+    // when the invariants held — see the constructor — so the mask above is
+    // necessarily default here).
+    if (_origin_columns && index < _chunk_row_starts.size()) {
+      auto origin          = std::make_shared<late_mat::scan_batch_origin>();
+      origin->columns      = _origin_columns;
+      origin->range        = {_chunk_row_starts[index], _chunk_row_counts[index]};
+      origin->chunk_index  = index;
+      out.late_mat_origin  = std::move(origin);
+    }
+    return out;
   }
 
  private:
@@ -335,6 +393,13 @@ struct cached_databatch_provider : public databatch_provider {
   /// This operator's insert-delta splits, yielded after the resident chunks
   /// (staging and mask words shared with sibling operators' cuts).
   std::vector<insert_delta_split> _delta_splits;
+  /// Late-mat origin state (SIRIUS_EXP_LATE_MAT; empty when the gate is off or
+  /// the invariants failed): the shared per-column origins, and per-chunk
+  /// row starts/counts in pin order indexed by CHUNK INDEX (zone-map pruning
+  /// skips chunks, so the prefix covers all of them).
+  std::shared_ptr<const std::vector<late_mat::column_origin>> _origin_columns;
+  std::vector<std::int64_t> _chunk_row_starts;
+  std::vector<std::int64_t> _chunk_row_counts;
   std::atomic<std::size_t> _index{0};
 };
 
@@ -429,6 +494,42 @@ std::string normalize_path(std::string const& p)
 }
 
 }  // namespace
+
+// Public (declared in scan_manager/sirius_scan_manager.hpp): the late-mat
+// layout source of truth. The cached provider's origin stamping above and
+// the late materializer both derive per-chunk global row starts from this —
+// keep the storage-form dispatch priority identical to the provider's
+// (device_chunks > data_batches_by_column > host_chunks).
+std::vector<std::int64_t> pinned_chunk_row_counts(pinned_entry const& entry)
+{
+  std::vector<std::int64_t> counts;
+  if (!entry.device_chunks.empty()) {
+    counts.reserve(entry.device_chunks.size());
+    for (auto const& chunk : entry.device_chunks) {
+      if (chunk.compressed) {
+        counts.push_back(chunk.compressed->num_rows());
+      } else if (!chunk.columns.empty() && chunk.columns.front()) {
+        counts.push_back(static_cast<std::int64_t>(chunk.columns.front()->size()));
+      } else {
+        counts.push_back(0);
+      }
+    }
+    return counts;
+  }
+  if (!entry.data_batches_by_column.empty()) {
+    auto const& first_column_chunks = entry.data_batches_by_column.begin()->second;
+    counts.reserve(first_column_chunks.size());
+    for (auto const& chunk : first_column_chunks) {
+      counts.push_back(chunk ? static_cast<std::int64_t>(chunk->size()) : 0);
+    }
+    return counts;
+  }
+  counts.reserve(entry.host_chunks.size());
+  for (auto const& chunk : entry.host_chunks) {
+    counts.push_back(chunk ? static_cast<std::int64_t>(pinned_host_chunk_rows(*chunk)) : 0);
+  }
+  return counts;
+}
 
 sirius_scan_manager::sirius_scan_manager(
   const scan_manager_config& config,
@@ -705,6 +806,14 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
           assignment.entry_name,
           delta_request->plan.delta_rows());
       }
+    }
+    // Late-mat deferral (SIRIUS_EXP_LATE_MAT): plan-time walk + directive pair
+    // install. Same invariants as the origin stamping (no MVCC masks, no
+    // insert-delta splits), plus single-GPU (cross-device pin gathers are not
+    // in v1). Bails internally on any shape it cannot prove transparent.
+    if (late_mat::late_mat_enabled() && masks.empty() && delta_splits.empty() &&
+        _topology_index && _topology_index->gpu_ids().size() == 1) {
+      try_install_late_mat_deferral(assignment.op, *assignment.entry, assignment.columns);
     }
     // Columns the scan will only ever test for equality and never project can be
     // decompressed straight to a BOOL8 mask (see decode_predicate_candidates).
@@ -1160,6 +1269,10 @@ void sirius_scan_manager::insert_pinned_entry(
       // the same files differently. Reject any mismatch loudly rather than
       // silently aliasing.
       auto& entry = existing_it->second;
+      // Late-mat: the merge mutates the entry in place (append-only columns).
+      // Bump BEFORE any mutation so origins captured against the pre-merge
+      // state fail closed even if a later check throws mid-merge.
+      if (entry.late_mat_handle) { entry.late_mat_handle->bump_generation(); }
       if (entry.chunk_memory_spaces.size() != chunk_memory_spaces.size()) {
         throw std::runtime_error(
           "[sirius_scan_manager::insert_pinned_entry] merge mismatch — "
@@ -1278,6 +1391,7 @@ void sirius_scan_manager::insert_pinned_entry(
       return;
     }
     // Row count or completeness contract differs → drop the stale entry and rebuild below.
+    invalidate_late_mat_handle(existing_it->second);
     _pinned_entries.erase(existing_it);
   }
 
@@ -1301,7 +1415,8 @@ void sirius_scan_manager::insert_pinned_entry(
     }
   }
 
-  _pinned_entries[name] = std::move(entry);
+  auto& slot = _pinned_entries[name] = std::move(entry);
+  attach_late_mat_handle(name, slot);
 }
 
 namespace {
@@ -1364,7 +1479,13 @@ void sirius_scan_manager::insert_pinned_entry_host(
   entry.host_chunks  = std::move(host_chunks);
   entry.zone_maps    = std::move(pin_zone_maps);
 
-  _pinned_entries[name] = std::move(entry);
+  // Host re-pin always REPLACES: fail any origins minted against the old
+  // entry before its content is overwritten in place.
+  if (auto it = _pinned_entries.find(name); it != _pinned_entries.end()) {
+    invalidate_late_mat_handle(it->second);
+  }
+  auto& slot = _pinned_entries[name] = std::move(entry);
+  attach_late_mat_handle(name, slot);
 }
 
 void sirius_scan_manager::insert_pinned_entry_device(const std::string& name,
@@ -1393,7 +1514,13 @@ void sirius_scan_manager::insert_pinned_entry_device(const std::string& name,
                    entry.device_chunks.size(),
                    new_num_rows);
 
-  _pinned_entries[name] = std::move(entry);
+  // Device re-pin always REPLACES: fail any origins minted against the old
+  // entry before its content is overwritten in place.
+  if (auto it = _pinned_entries.find(name); it != _pinned_entries.end()) {
+    invalidate_late_mat_handle(it->second);
+  }
+  auto& slot = _pinned_entries[name] = std::move(entry);
+  attach_late_mat_handle(name, slot);
 }
 
 void sirius_scan_manager::attach_mvcc_metadata(const std::string& name,
@@ -1408,6 +1535,9 @@ void sirius_scan_manager::attach_mvcc_metadata(const std::string& name,
 
 void sirius_scan_manager::remove_pinned_entry(const std::string& name)
 {
+  if (auto it = _pinned_entries.find(name); it != _pinned_entries.end()) {
+    invalidate_late_mat_handle(it->second);
+  }
   _pinned_entries.erase(name);
 }
 

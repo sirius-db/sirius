@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "codegen/bridge/fused_tree_build.hpp"
 #include "codegen/codegen_bridge.hpp"
+#include "codegen/decode/latemat_launch.hpp"
 #include "codegen/decode/masked_launch.hpp"
 #include "codegen/plan/bitjoin_layout.hpp"
 #include "codegen/plan/plan_interpreter.hpp"
+#include "codegen/plan/row_decode.hpp"
 
 #include <cudf/binaryop.hpp>
 #include <cudf/column/column_factories.hpp>
@@ -1852,6 +1854,338 @@ std::unique_ptr<cudf::table> compact_scan_filter_output(
     }
   }
   return std::make_unique<cudf::table>(std::move(columns));
+}
+
+// ═════════════════════════════════════════════════════════════════════════
+// Late-materialization row decode (row_decode.hpp) — additive.
+// Sparse (chunk-CSR) sibling of decompress_column_compacted: decodes ONLY
+// the listed rows via the sparse-grid launchers (latemat_launch.hpp),
+// compacted in ascending row order. Returns nullptr + error on any refusal
+// so the caller can fall back (mask route / full decode + gather) — never a
+// wrong or full-width column.
+// ═════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+// K8 on the root fused region (tier_a bitpack / tier_a_delta shapes).
+std::unique_ptr<cudf::column> rows_decode_fused_root(
+  PlanTree const& tree,
+  sirius::codegen::chunk_row_set const& rows,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr,
+  std::string* error_out)
+{
+  NodeId const root_nid = root_value_producer(tree);
+  if (root_nid >= tree.nodes.size()) {
+    if (error_out) *error_out = "decompress_rows: no root value producer";
+    return nullptr;
+  }
+  std::string tail_err;
+  DecodeWalk tail_walk{tree, stream, mr, &tail_err, nullptr, nullptr};
+  decode_materialize_fn resolve = [&tail_walk](NodeId dependency) {
+    return tail_walk.materialize(dependency);
+  };
+  auto region = bind_fused_region(tree, root_nid, resolve, stream, mr, error_out);
+  if (!region) { return nullptr; }
+  if (static_cast<std::int64_t>(region->num_rows) != rows.num_rows) {
+    if (error_out) {
+      *error_out = "decompress_rows: row_set covers " + std::to_string(rows.num_rows) +
+                   " rows but the column has " + std::to_string(region->num_rows);
+    }
+    return nullptr;
+  }
+  auto out_col = cudf::make_fixed_width_column(region->root_type,
+                                               static_cast<cudf::size_type>(rows.num_survivors),
+                                               cudf::mask_state::UNALLOCATED,
+                                               stream,
+                                               mr);
+  if (rows.num_survivors > 0 &&
+      !launch_decode_fused_tree_sparse_rows(*region->built.tree,
+                                            region->labeled,
+                                            region->dtype,
+                                            static_cast<std::int64_t>(region->num_rows),
+                                            rows,
+                                            out_col->mutable_view().head<void>(),
+                                            stream)) {
+    if (error_out) *error_out = "decompress_rows: sparse (K8) decode launch failed";
+    return nullptr;
+  }
+  // Entropy-tail memo columns (tail_walk) and region transients die on
+  // return; the sparse launcher is stream-ordered (NO sync-on-return), so
+  // keep their frees ordered after the launch by a stream-ordered release:
+  // rmm frees are stream-ordered on `stream` already — nothing to do.
+  return out_col;
+}
+
+// K5s sparse fast path: constant-width, null-free, identity-stored keys —
+// the same admission shape as try_dict_k5_fast_path. Returns nullptr when
+// the shape does not apply; the caller falls back to the mask route.
+std::unique_ptr<cudf::column> rows_decode_dict_fast_path(
+  PlanTree const& tree,
+  sirius::codegen::chunk_row_set const& rows,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr,
+  std::string* error_out)
+{
+  NodeId const dict_nid = root_value_producer(tree);
+  if (dict_nid >= tree.nodes.size()) { return nullptr; }
+  PlanNode const& dict_node = tree.nodes[dict_nid];
+
+  compressed_representation const* keys_offsets_rep = nullptr;
+  compressed_representation const* keys_chars_rep   = nullptr;
+  for (std::size_t i = 0; i < dict_node.output_names.size(); ++i) {
+    std::string const& name = dict_node.output_names[i];
+    if (name != "keys_offsets" && name != "keys_chars") { continue; }
+    for (auto const& e : dict_node.children) {
+      if (e.channel == name) { return nullptr; }  // compressed keys: general route
+    }
+    auto it = dict_node.channels.find(dict_node.output_paths[i]);
+    if (it == dict_node.channels.end() || !it->second) { return nullptr; }
+    (name == "keys_offsets" ? keys_offsets_rep : keys_chars_rep) = it->second.get();
+  }
+  if (keys_offsets_rep == nullptr || keys_chars_rep == nullptr) { return nullptr; }
+
+  std::string err;
+  auto keys_offsets = decompress_standalone_representation(keys_offsets_rep, stream, mr, &err);
+  if (!keys_offsets || keys_offsets->type().id() != cudf::type_id::INT32 ||
+      keys_offsets->size() < 2 || keys_offsets->null_count() != 0) {
+    return nullptr;
+  }
+  auto keys_chars = decompress_standalone_representation(keys_chars_rep, stream, mr, &err);
+  if (!keys_chars || keys_chars->type().id() != cudf::type_id::UINT8 ||
+      keys_chars->null_count() != 0) {
+    return nullptr;
+  }
+
+  // Key-width probe (D2H of K+1 offsets — tiny; same sync class as the
+  // shipped fast path and the classic dictionary decompress).
+  auto const n_offsets = static_cast<std::size_t>(keys_offsets->size());
+  std::vector<std::int32_t> host_offsets(n_offsets);
+  if (cudaMemcpyAsync(host_offsets.data(),
+                      keys_offsets->view().head<void>(),
+                      n_offsets * sizeof(std::int32_t),
+                      cudaMemcpyDeviceToHost,
+                      stream.value()) != cudaSuccess ||
+      cudaStreamSynchronize(stream.value()) != cudaSuccess) {
+    return nullptr;
+  }
+  std::int32_t const width = host_offsets[1] - host_offsets[0];
+  if (width < 1) { return nullptr; }
+  for (std::size_t i = 2; i < n_offsets; ++i) {
+    if (host_offsets[i] - host_offsets[i - 1] != width) { return nullptr; }
+  }
+
+  NodeId codes_nid = static_cast<NodeId>(tree.nodes.size());
+  for (auto const& e : dict_node.children) {
+    if (e.channel == "indices") {
+      codes_nid = e.child;
+      break;
+    }
+  }
+  if (codes_nid >= tree.nodes.size()) { return nullptr; }
+  DecodeWalk tail_walk{tree, stream, mr, &err, nullptr, nullptr};
+  decode_materialize_fn resolve = [&tail_walk](NodeId dependency) {
+    return tail_walk.materialize(dependency);
+  };
+  auto region = bind_fused_region(tree, codes_nid, resolve, stream, mr, &err);
+  if (!region) { return nullptr; }
+  if (static_cast<std::int64_t>(region->num_rows) != rows.num_rows) {
+    if (error_out) *error_out = "decompress_rows: dict codes row count != row_set rows";
+    return nullptr;
+  }
+
+  auto const survivors = rows.num_survivors;
+  rmm::device_buffer out_chars(
+    static_cast<std::size_t>(survivors) * static_cast<std::size_t>(width), stream, mr);
+  if (survivors > 0 &&
+      !launch_decode_fused_tree_sparse_dict_gather(*region->built.tree,
+                                                   region->labeled,
+                                                   region->dtype,
+                                                   static_cast<std::int64_t>(region->num_rows),
+                                                   rows,
+                                                   keys_chars->view().head<void>(),
+                                                   width,
+                                                   out_chars.data(),
+                                                   stream)) {
+    return nullptr;  // launch declined — caller falls back to the mask route
+  }
+
+  cudf::numeric_scalar<std::int32_t> const init(0, true, stream);
+  cudf::numeric_scalar<std::int32_t> const step(width, true, stream);
+  auto offsets =
+    cudf::sequence(static_cast<cudf::size_type>(survivors + 1), init, step, stream, mr);
+  // keys_chars must outlive the (stream-ordered, unsynced) gather; its
+  // stream-ordered free on `stream` is ordered after the launch above.
+  return cudf::make_strings_column(static_cast<cudf::size_type>(survivors),
+                                   std::move(offsets),
+                                   std::move(out_chars),
+                                   0,
+                                   rmm::device_buffer(0, stream, mr));
+}
+
+// K6s: sparse str_split survivor decode — mirror of try_str_k6_path with the
+// CSR phase 1 and the SHIPPED phase-2 char copy. One data-dependent host
+// sync (total survivor chars), same as the shipped route.
+std::unique_ptr<cudf::column> rows_decode_str_k6(
+  PlanTree const& tree,
+  sirius::codegen::chunk_row_set const& rows,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr,
+  std::string* error_out)
+{
+  NodeId const str_nid = root_value_producer(tree);
+  if (str_nid >= tree.nodes.size() || tree.nodes[str_nid].op != "str_split") {
+    if (error_out) *error_out = "decompress_rows: K6s requires a str_split-rooted plan";
+    return nullptr;
+  }
+  PlanNode const& str_node = tree.nodes[str_nid];
+
+  compressed_representation const* chars_rep = nullptr;
+  NodeId offsets_nid                         = static_cast<NodeId>(tree.nodes.size());
+  for (std::size_t i = 0; i < str_node.output_names.size(); ++i) {
+    std::string const& name = str_node.output_names[i];
+    if (name == "chars") {
+      auto it = str_node.channels.find(str_node.output_paths[i]);
+      if (it != str_node.channels.end()) { chars_rep = it->second.get(); }
+    } else if (name == "offsets") {
+      for (auto const& e : str_node.children) {
+        if (e.channel == name) {
+          offsets_nid = e.child;
+          break;
+        }
+      }
+    }
+  }
+  if (chars_rep == nullptr || offsets_nid >= tree.nodes.size()) {
+    if (error_out) *error_out = "decompress_rows: K6s plan shape missing raw chars / offsets";
+    return nullptr;
+  }
+  auto const chars_channels = chars_rep->named_channels(stream);
+  if (chars_channels.empty() ||
+      chars_channels.front().view.type().id() != cudf::type_id::UINT8) {
+    if (error_out) *error_out = "decompress_rows: K6s chars channel is not raw UINT8";
+    return nullptr;
+  }
+  cudf::column_view const chars_view = chars_channels.front().view;
+
+  std::string tail_err;
+  DecodeWalk tail_walk{tree, stream, mr, &tail_err, nullptr, nullptr};
+  decode_materialize_fn resolve = [&tail_walk](NodeId dependency) {
+    return tail_walk.materialize(dependency);
+  };
+  auto region = bind_fused_region(tree, offsets_nid, resolve, stream, mr, error_out);
+  if (!region) { return nullptr; }
+
+  auto const survivors       = rows.num_survivors;
+  auto const num_string_rows = rows.num_rows;
+
+  auto lengths = cudf::make_fixed_width_column(cudf::data_type{cudf::type_id::INT32},
+                                               static_cast<cudf::size_type>(survivors + 1),
+                                               cudf::mask_state::UNALLOCATED,
+                                               stream,
+                                               mr);
+  rmm::device_buffer src_offsets(
+    static_cast<std::size_t>(survivors) * sizeof(std::int64_t), stream, mr);
+  if (survivors > 0) {
+    cudaMemsetAsync(lengths->mutable_view().data<std::int32_t>() + survivors,
+                    0,
+                    sizeof(std::int32_t),
+                    stream.value());
+    if (!launch_decode_fused_tree_sparse_str_meta(*region->built.tree,
+                                                  region->labeled,
+                                                  region->dtype,
+                                                  num_string_rows,
+                                                  rows,
+                                                  static_cast<std::int64_t*>(src_offsets.data()),
+                                                  lengths->mutable_view().data<std::int32_t>(),
+                                                  stream)) {
+      if (error_out) *error_out = "decompress_rows: K6s phase-1 launch failed";
+      return nullptr;
+    }
+  } else {
+    cudaMemsetAsync(
+      lengths->mutable_view().head<void>(), 0, sizeof(std::int32_t), stream.value());
+  }
+
+  auto out_offsets = cudf::scan(lengths->view(),
+                                *cudf::make_sum_aggregation<cudf::scan_aggregation>(),
+                                cudf::scan_type::EXCLUSIVE,
+                                cudf::null_policy::EXCLUDE,
+                                stream,
+                                mr);
+  std::int32_t total_chars = 0;
+  if (cudaMemcpyAsync(&total_chars,
+                      out_offsets->view().data<std::int32_t>() + survivors,
+                      sizeof(std::int32_t),
+                      cudaMemcpyDeviceToHost,
+                      stream.value()) != cudaSuccess ||
+      cudaStreamSynchronize(stream.value()) != cudaSuccess) {
+    if (error_out) *error_out = "decompress_rows: K6s offsets readback failed";
+    return nullptr;
+  }
+
+  rmm::device_buffer out_chars(static_cast<std::size_t>(total_chars), stream, mr);
+  if (survivors > 0 && total_chars > 0) {
+    if (!launch_masked_char_copy(chars_view.head<void>(),
+                                 static_cast<std::int64_t const*>(src_offsets.data()),
+                                 out_offsets->view().data<std::int32_t>(),
+                                 survivors,
+                                 out_chars.data(),
+                                 stream)) {
+      if (error_out) *error_out = "decompress_rows: K6s phase-2 (char copy) launch failed";
+      return nullptr;
+    }
+  }
+  return cudf::make_strings_column(static_cast<cudf::size_type>(survivors),
+                                   std::move(out_offsets),
+                                   std::move(out_chars),
+                                   0,
+                                   rmm::device_buffer(0, stream, mr));
+}
+
+}  // namespace
+
+std::unique_ptr<cudf::column> decompress_column_rows(
+  PlanTree const& tree,
+  sirius::codegen::chunk_row_set const& rows,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr,
+  std::string* error_out)
+{
+  nvtx3::scoped_range nvtx_range{"simpatico::decompress_column_rows"};
+
+  if (tree.nodes.empty() || tree.nodes[0].op != "input") {
+    if (error_out) *error_out = "decompress_rows: tree missing input root";
+    return nullptr;
+  }
+  if (!rows.valid() || rows.num_rows <= 0 || rows.num_survivors > rows.num_rows) {
+    if (error_out) *error_out = "decompress_rows: invalid chunk_row_set";
+    return nullptr;
+  }
+
+  auto const tier = plan_selection_tier(tree);
+  switch (tier) {
+    case sirius::codegen::output_tier::tier_a:
+    case sirius::codegen::output_tier::tier_a_delta:
+      return rows_decode_fused_root(tree, rows, stream, mr, error_out);
+    case sirius::codegen::output_tier::tier_dict_k5: {
+      auto col = rows_decode_dict_fast_path(tree, rows, stream, mr, error_out);
+      if (!col && error_out && error_out->empty()) {
+        *error_out = "decompress_rows: dict plan outside the sparse fast path "
+                     "(compressed/variable-width keys) — fall back to the mask route";
+      }
+      return col;
+    }
+    case sirius::codegen::output_tier::tier_str_k6:
+      return rows_decode_str_k6(tree, rows, stream, mr, error_out);
+    case sirius::codegen::output_tier::tier_b:
+    default:
+      if (error_out) {
+        *error_out = "decompress_rows: tier_b plan has no random access — "
+                     "full decode + gather is the caller's fallback";
+      }
+      return nullptr;
+  }
 }
 
 }  // namespace simpatico

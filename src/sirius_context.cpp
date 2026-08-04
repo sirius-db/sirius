@@ -30,6 +30,7 @@
 #include "log/noop_sink.hpp"
 #include "log/spdlog_owning_sink.hpp"
 #include "memory/numa_small_pinned_mr.hpp"
+#include "memory/pinned_reservation_guard.hpp"
 #include "memory/resource_ref_utils.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "memory/topology_index.hpp"
@@ -134,6 +135,10 @@ SiriusContext::SiriusContext() = default;
 SiriusContext::~SiriusContext() noexcept
 {
   if (is_initialized_) { terminate(); }
+  // Idempotent backstop for the failed-initialize path (provider registered,
+  // is_initialized_ never set): the provider captures scan_manager_ and must
+  // not outlive this context.
+  sirius::memory::unregister_unevictable_bytes_provider(this);
 }
 
 // Log host and GPU memory pool stats at a labeled point.
@@ -766,6 +771,19 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
   scan_manager_ = std::make_unique<sirius::scan_manager::sirius_scan_manager>(
     config_.get_scan_manager_config(), *memory_manager_, topology_index_);
 
+  // Reservation livelock guard: let the pipeline executors and the
+  // reservation-wait watchdog see how many gpu-tier pinned bytes sit on each
+  // memory space (pins are allocated with no reservation and live in no data
+  // repository, so the downgrade executor can never evict them) without
+  // coupling them to the scan manager. Recomputed on demand from the
+  // pinned-entry registry — pin/unpin is serialized against execution
+  // windows, so a walk during query execution reads a stable registry.
+  // Unregistered in terminate() before the scan manager is torn down.
+  sirius::memory::register_unevictable_bytes_provider(
+    this, [mgr = scan_manager_.get()](const cucascade::memory::memory_space* space) {
+      return sirius::memory::gpu_tier_pinned_bytes(*mgr, space);
+    });
+
   // Wire the pipeline task queue into downgrade executors now that task_scheduler_
   // has been constructed.
   for (auto& executor : downgrade_executors_) {
@@ -789,6 +807,10 @@ void SiriusContext::terminate()
 
   task_scheduler_->stop();
   task_scheduler_.reset();
+  // The pipeline executors (the provider's only mid-query callers) are gone;
+  // drop the pinned-bytes provider before the scan manager it captures is
+  // torn down below. Idempotent.
+  sirius::memory::unregister_unevictable_bytes_provider(this);
   if (scan_manager_) { scan_manager_->stop(); }
   task_creator_->stop_thread_pool();
   task_creator_.reset();

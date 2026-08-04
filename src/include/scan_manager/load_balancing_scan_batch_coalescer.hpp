@@ -34,6 +34,10 @@
 #include <memory>
 #include <stop_token>
 
+namespace sirius::late_mat {
+struct scan_batch_origin;  // late_mat/column_origin.hpp
+}  // namespace sirius::late_mat
+
 namespace sirius::scan_manager {
 
 struct databatch_provider {
@@ -46,6 +50,11 @@ struct databatch_provider {
     mvcc_chunk_mask mvcc_keep_mask;  ///< default = all rows visible
     std::unique_ptr<op::scan::scan_info> scan_info;
     int preferred_device{-1};  ///< placement for scan_info splits (-1 = none)
+    /// Late-mat origin stamp (SIRIUS_EXP_LATE_MAT): the served chunk's
+    /// per-column origins + global row span in pin order. Only ever non-null
+    /// for resident chunks from an origin-capable provider (gate on, no MVCC
+    /// masks, no delta splits); always empty when the gate is off.
+    std::shared_ptr<const late_mat::scan_batch_origin> late_mat_origin;
   };
 
   virtual ~databatch_provider()  = default;

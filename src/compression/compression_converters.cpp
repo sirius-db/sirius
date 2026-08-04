@@ -31,12 +31,14 @@
 #include <api/compressed_table_io.hpp>
 #include <api/simpatico_codegen.hpp>
 #include <codegen/selection/selection.hpp>
+#include <codegen/selection/selection_capture.hpp>
 #include <codegen/util/stream_pool.hpp>
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/data/representation_converter.hpp>
 #include <cucascade/memory/memory_space.hpp>
 #include <log/logging.hpp>
 #include <op/scan/row_filtered_table_representation.hpp>
+#include <op/scan/selection_captured_table_representation.hpp>
 
 #include <algorithm>
 #include <cstddef>
@@ -152,9 +154,9 @@ sirius::codegen::output_tier to_shared_tier(decode_output_tier t)
 // Per-column probe for the fused scan-filter pipeline.
 //
 // `tier` defers to simpatico::plan_selection_tier — the ground-truth
-// classifier next to the decode implementation (W3), consistent by
+// classifier next to the decode implementation, consistent by
 // construction with the umbrella plan_supports_selection_decode probe that
-// W4's RULE 1 re-checks. Keeping a single classifier means a new masked
+// the RULE-1 gate re-checks. Keeping a single classifier means a new masked
 // variant lights its tier up everywhere at once, with no shape-walk here to
 // drift.
 //
@@ -261,7 +263,9 @@ std::unique_ptr<cudf::table> try_decompress_scan_filter(
   simpatico::stream_pool& pool,
   rmm::cuda_stream_view stream,
   rmm::device_async_resource_ref mr,
-  fused_batch_tag& tag)
+  fused_batch_tag& tag,
+  bool capture_selection,
+  std::shared_ptr<const late_mat::row_selection>& captured_out)
 {
   // bool8 mask candidates = the shipped equality pushdown's non-empty entries
   // (attach already gates them per chunk on column_supports_predicate_decode,
@@ -420,6 +424,36 @@ std::unique_ptr<cudf::table> try_decompress_scan_filter(
   } else if (result.applied && directives.covers_whole_filter) {
     tag = fused_batch_tag::row_filtered;
   }
+  // Late-mat wave-seam capture (SIRIUS_EXP_LATE_MAT; gated on status ==
+  // applied, NOT on the row_filtered tag): when the source representation
+  // requested capture AND status == applied — the converter's promise that
+  // EVERY emitted column is compacted to exactly survivor_count rows; the
+  // conversion has no row-shaping step after compact_scan_filter_output, and
+  // residual bool8/membership re-evaluation happens scan-side POST-emission
+  // (it thins the batch as ordinary data, so the captured selection still
+  // describes the rows as emitted here) — MOVE the wave-1 selection buffers
+  // out of `result` instead of letting them die function-local. Capture
+  // therefore also covers the membership-compacted and partial-coverage
+  // batches that stay UNTAGGED by design (their tag semantics are unchanged
+  // — the caller wraps them in the
+  // metadata-only selection_captured carrier, never promotes them to
+  // row_filtered). A RULE-2 bail / refusal / failure can never capture: their
+  // status is never `applied` (the helper also re-checks). `range` is left
+  // zeroed — the scan side fills it from the split's origin at harvest. The
+  // helper set_stream-rebinds each moved buffer and leaves result's scalar
+  // fields intact (the DIAG line below stays valid).
+  if (capture_selection &&
+      result.status == sirius::codegen::scan_filter_status::applied) {
+    auto cap = sirius::codegen::capture_scan_filter_selection(std::move(result), stream);
+    if (cap) {
+      auto sel            = std::make_shared<late_mat::row_selection>();
+      sel->kind           = late_mat::row_selection_kind::mask;
+      sel->mask_words     = std::move(cap.mask_words);
+      sel->chunk_offsets  = std::move(cap.chunk_offsets);
+      sel->survivor_count = cap.survivor_count;
+      captured_out        = std::move(sel);
+    }
+  }
   SIRIUS_FUSED_DIAG(
     "[fused-diag] decompress_scan_filter {} (status={} gen={}): range_filters={} pair_filters={} "
     "bool8_filters={} membership_filters={} survivors={}/{} column(s)={} covers_whole_filter={} "
@@ -453,7 +487,8 @@ std::unique_ptr<cucascade::idata_representation> reconstruct_and_decompress_to_g
   std::uint64_t membership_generation,
   cucascade::idata_representation& source,
   const cucascade::memory::memory_space* target_memory_space,
-  rmm::cuda_stream_view stream)
+  rmm::cuda_stream_view stream,
+  bool capture_selection)
 {
   // Reconstruct only the requested columns. read_compressed_table_subset_from_memory
   // fetches just those columns' payload buffers, so serving a projection of a wide
@@ -498,6 +533,7 @@ std::unique_ptr<cucascade::idata_representation> reconstruct_and_decompress_to_g
     predicates.size(),
     range_pushdown.size(),
     range_conjuncts_convertible);
+  std::shared_ptr<const late_mat::row_selection> captured;
   if (!range_pushdown.empty() || !predicates.empty() || !membership_pushdown.empty()) {
     // `subset` holds exactly the projected columns, so selection is identity.
     std::vector<std::size_t> identity_selection(subset.num_columns());
@@ -507,13 +543,15 @@ std::unique_ptr<cucascade::idata_representation> reconstruct_and_decompress_to_g
                                               range_pushdown,
                                               range_conjuncts_convertible,
                                               equality_pushdown,
-                                              decode_pair_pushdown{},  // carrier pending (STATUS-W2)
+                                              decode_pair_pushdown{},  // pair carrier not yet threaded
                                               membership_pushdown,
                                               membership_generation,
                                               pool,
                                               stream,
                                               mr,
-                                              tag);
+                                              tag,
+                                              capture_selection,
+                                              captured);
   }
   if (!decompressed) {
     if (predicates.empty()) {
@@ -543,12 +581,24 @@ std::unique_ptr<cucascade::idata_representation> reconstruct_and_decompress_to_g
   // rule2_bailed ⇔ RULE-2 selectivity bail (classic columns inside — the scan
   // latches on the type and strips the pushdown for its remaining batches).
   if (tag == fused_batch_tag::row_filtered) {
-    return std::make_unique<row_filtered_gpu_table_representation>(
+    auto tagged = std::make_unique<row_filtered_gpu_table_representation>(
       std::move(decompressed), *const_cast<cucascade::memory::memory_space*>(space), stream);
+    tagged->captured_selection = std::move(captured);  // empty unless requested+applied
+    return tagged;
   }
   if (tag == fused_batch_tag::rule2_bailed) {
     return std::make_unique<rule2_bailed_gpu_table_representation>(
       std::move(decompressed), *const_cast<cucascade::memory::memory_space*>(space), stream);
+  }
+  if (captured) {
+    // Untagged but applied (membership-compacted / partial-coverage batch):
+    // metadata-only carrier — downstream filter semantics stay byte-identical
+    // to a plain representation (the carrier adds a captured selection and
+    // nothing else: no tag, no row shaping).
+    auto neutral = std::make_unique<selection_captured_gpu_table_representation>(
+      std::move(decompressed), *const_cast<cucascade::memory::memory_space*>(space), stream);
+    neutral->captured_selection = std::move(captured);
+    return neutral;
   }
   return std::make_unique<cucascade::gpu_table_representation>(
     std::move(decompressed), *const_cast<cucascade::memory::memory_space*>(space), stream);
@@ -582,7 +632,8 @@ std::unique_ptr<cucascade::idata_representation> decompress_host_to_gpu(
                                            rep.membership_generation(),
                                            source,
                                            target_memory_space,
-                                           stream);
+                                           stream,
+                                           rep.selection_capture_requested());
 }
 
 // compressed_device_representation (device memory) → GPU.
@@ -622,6 +673,7 @@ std::unique_ptr<cucascade::idata_representation> decompress_device_to_gpu(
     rep.range_pushdown().size(),
     rep.range_conjuncts_convertible());
   std::vector<std::size_t> identity_selection;
+  std::shared_ptr<const late_mat::row_selection> captured;
   if (!rep.range_pushdown().empty() || !predicates.empty() ||
       !rep.membership_pushdown().empty()) {
     std::span<const std::size_t> selected;
@@ -637,13 +689,15 @@ std::unique_ptr<cucascade::idata_representation> decompress_device_to_gpu(
                                               rep.range_pushdown(),
                                               rep.range_conjuncts_convertible(),
                                               rep.equality_pushdown(),
-                                              decode_pair_pushdown{},  // carrier pending (STATUS-W2)
+                                              decode_pair_pushdown{},  // pair carrier not yet threaded
                                               rep.membership_pushdown(),
                                               rep.membership_generation(),
                                               pool,
                                               stream,
                                               mr,
-                                              tag);
+                                              tag,
+                                              rep.selection_capture_requested(),
+                                              captured);
   }
   if (!decompressed) {
     if (predicates.empty()) {
@@ -676,12 +730,24 @@ std::unique_ptr<cucascade::idata_representation> decompress_device_to_gpu(
   // full-width columns but lets the scan latch the per-operator bail flag and
   // strip the range pushdown from its remaining batches.
   if (tag == fused_batch_tag::row_filtered) {
-    return std::make_unique<row_filtered_gpu_table_representation>(
+    auto tagged = std::make_unique<row_filtered_gpu_table_representation>(
       std::move(decompressed), *const_cast<cucascade::memory::memory_space*>(space), stream);
+    tagged->captured_selection = std::move(captured);  // empty unless requested+applied
+    return tagged;
   }
   if (tag == fused_batch_tag::rule2_bailed) {
     return std::make_unique<rule2_bailed_gpu_table_representation>(
       std::move(decompressed), *const_cast<cucascade::memory::memory_space*>(space), stream);
+  }
+  if (captured) {
+    // Untagged but applied (membership-compacted / partial-coverage batch):
+    // metadata-only carrier — downstream filter semantics stay byte-identical
+    // to a plain representation (the carrier adds a captured selection and
+    // nothing else: no tag, no row shaping).
+    auto neutral = std::make_unique<selection_captured_gpu_table_representation>(
+      std::move(decompressed), *const_cast<cucascade::memory::memory_space*>(space), stream);
+    neutral->captured_selection = std::move(captured);
+    return neutral;
   }
   return std::make_unique<cucascade::gpu_table_representation>(
     std::move(decompressed), *const_cast<cucascade::memory::memory_space*>(space), stream);

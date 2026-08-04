@@ -56,6 +56,9 @@ class sirius_meta_pipeline;
 namespace planner {
 class sirius_physical_plan_generator;
 }  // namespace planner
+namespace late_mat {
+struct port_materialize_directive;  // late_mat/defer_directive.hpp
+}  // namespace late_mat
 namespace op {
 
 enum class TaskCreationHint { WAITING_FOR_INPUT_DATA, READY };
@@ -232,6 +235,15 @@ class operator_data {
  */
 class pipelineable_operator_data : public operator_data {
  public:
+  /// Late-mat port materialization directive (SIRIUS_EXP_LATE_MAT), stamped by
+  /// the task creator from the consuming operator right after
+  /// get_next_task_input_data. prepare_for_processing transforms every batch
+  /// whose table matches the directive's placeholder signature (deferred
+  /// rowid/placeholder columns -> materialized columns); non-matching batches
+  /// (e.g. the other join port's) pass through untouched. Always empty when
+  /// the gate is off — one inert shared_ptr.
+  std::shared_ptr<const late_mat::port_materialize_directive> late_mat_directive;
+
   pipelineable_operator_data()
   {
     _data_batches = std::vector<std::shared_ptr<::cucascade::data_batch>>();
@@ -406,6 +418,13 @@ class sirius_physical_operator {
 
   //! Lock for concurrent access to operator state
   std::mutex lock;
+
+  //! Late-mat (SIRIUS_EXP_LATE_MAT): materialization directive for deferred
+  //! columns arriving at this operator's input, installed by the defer policy
+  //! at query prepare and stamped onto each task's pipelineable_operator_data
+  //! by the task creator. Empty when the gate is off (one inert shared_ptr
+  //! per operator instance; operators are per-query objects).
+  std::shared_ptr<const late_mat::port_materialize_directive> late_mat_port_directive;
 
  public:
   virtual std::string get_name() const;

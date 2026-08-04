@@ -26,6 +26,7 @@
 // Failures log to stderr and return nullptr / -1.
 
 #include "codegen/decode/jit/renderer.hpp"
+#include "codegen/decode/latemat_launch.hpp"
 #include "codegen/decode/masked_launch.hpp"
 #include "codegen/encode/jit/renderer.hpp"
 #include "codegen/jit/fused_tree.hpp"
@@ -466,6 +467,12 @@ struct VariantLaunchArgs {
   std::int32_t key_width     = 0;  // mask_dict_gather: bytes per key
   CUdeviceptr row_indices    = 0;  // index_consume: ascending global int32 row ids
   CUdeviceptr len_out        = 0;  // str_split_meta: per-survivor byte lengths (output)
+  // Late-materialization sparse-grid variants (chunk-CSR, row_set.hpp):
+  CUdeviceptr chunk_list     = 0;  // sparse_*: touched batch-local chunk ids (uint32)
+  CUdeviceptr out_offsets    = 0;  // sparse_*: per-touched-chunk exclusive offsets (uint32, T+1)
+  CUdeviceptr in_chunk_off   = 0;  // sparse_*: uint16 in-chunk positions, grouped by chunk
+  std::int64_t grid_override = 0;  // sparse_*: launch exactly this many blocks (touched chunks)
+  bool sync_on_return        = true;  // late-mat launchers are stream-ordered (no host sync)
 };
 
 // Launch the plain-CUDA rendered decode kernel (symmetric to the
@@ -565,6 +572,9 @@ int run_rendered_decode(const jit::FusedTree& tree,
   std::int32_t key_width = va.key_width;
   CUdeviceptr d_rowidx   = va.row_indices;
   CUdeviceptr d_lenout   = va.len_out;
+  CUdeviceptr d_clist    = va.chunk_list;
+  CUdeviceptr d_ooffs    = va.out_offsets;
+  CUdeviceptr d_icoffs   = va.in_chunk_off;
   if (va.variant == cdj::DecodeVariant::mask_out) {
     args.push_back(&pred_lo);
     args.push_back(&pred_hi);
@@ -583,6 +593,21 @@ int run_rendered_decode(const jit::FusedTree& tree,
     args.push_back(&d_mask);
     args.push_back(&d_choffs);
     args.push_back(&d_lenout);
+  } else if (va.variant == cdj::DecodeVariant::sparse_index_consume) {
+    args.push_back(&d_clist);
+    args.push_back(&d_ooffs);
+    args.push_back(&d_icoffs);
+  } else if (va.variant == cdj::DecodeVariant::sparse_dict_gather) {
+    args.push_back(&d_clist);
+    args.push_back(&d_ooffs);
+    args.push_back(&d_icoffs);
+    args.push_back(&d_keys);
+    args.push_back(&key_width);
+  } else if (va.variant == cdj::DecodeVariant::sparse_str_meta) {
+    args.push_back(&d_clist);
+    args.push_back(&d_ooffs);
+    args.push_back(&d_icoffs);
+    args.push_back(&d_lenout);
   }
 
   if (!maybe_raise_smem(
@@ -591,8 +616,12 @@ int run_rendered_decode(const jit::FusedTree& tree,
 
   CUstream stream   = reinterpret_cast<CUstream>(stream_ptr);
   CUfunction fn_dec = kernel->func_for_current_device();
+  // Sparse-grid variants launch one block per TOUCHED chunk (grid_override),
+  // never one per chunk of the whole batch.
+  const unsigned grid_x = va.grid_override > 0 ? static_cast<unsigned>(va.grid_override)
+                                               : static_cast<unsigned>(num_chunks);
   SIMPATICO_CU_CHECK(cuLaunchKernel(fn_dec,
-                                    static_cast<unsigned>(num_chunks),
+                                    grid_x,
                                     1,
                                     1,
                                     static_cast<unsigned>(spec.block_x),
@@ -606,10 +635,12 @@ int run_rendered_decode(const jit::FusedTree& tree,
                      "rendered decode: cuLaunchKernel failed");
   lap("launch");
 
-  SIMPATICO_CUDA_CHECK(cudaStreamSynchronize(reinterpret_cast<cudaStream_t>(stream_ptr)),
-                       -1,
-                       "rendered decode: stream sync failed");
-  lap("sync");
+  if (va.sync_on_return) {
+    SIMPATICO_CUDA_CHECK(cudaStreamSynchronize(reinterpret_cast<cudaStream_t>(stream_ptr)),
+                         -1,
+                         "rendered decode: stream sync failed");
+    lap("sync");
+  }
   return 1;
 }
 
@@ -818,6 +849,135 @@ bool launch_decode_fused_tree_index_consume(codegen::jit::FusedTree const& tree,
   va.chunk_offsets = reinterpret_cast<CUdeviceptr>(mask.chunk_offsets);
   va.row_indices   = reinterpret_cast<CUdeviceptr>(const_cast<std::int32_t*>(row_indices));
   return launch_decode_fused_tree_impl(tree, labeled, dtype, num_rows, out, stream, va);
+}
+
+// ── Late-materialization sparse launchers (latemat_launch.hpp) ──────────────
+// Chunk-CSR row selections, touched-chunk grids, NO sync-on-return (the
+// late-mat scheduling contract; transients are stream-ordered).
+
+namespace {
+
+bool validate_sparse_rows(::sirius::codegen::chunk_row_set const& rows,
+                          std::int64_t num_rows,
+                          char const* what)
+{
+  if (!rows.valid() || rows.num_rows != num_rows || rows.num_touched > INT32_MAX) {
+    std::fprintf(stderr,
+                 "simpatico::codegen: %s: invalid chunk_row_set (touched=%lld survivors=%lld "
+                 "rows.num_rows=%lld num_rows=%lld)\n",
+                 what,
+                 static_cast<long long>(rows.num_touched),
+                 static_cast<long long>(rows.num_survivors),
+                 static_cast<long long>(rows.num_rows),
+                 static_cast<long long>(num_rows));
+    return false;
+  }
+  return true;
+}
+
+}  // namespace
+
+// K8: sparse index-list decode (latemat_launch.hpp).
+bool launch_decode_fused_tree_sparse_rows(codegen::jit::FusedTree const& tree,
+                                          codegen::jit::LabeledBuffers& labeled,
+                                          char const* dtype,
+                                          std::int64_t num_rows,
+                                          ::sirius::codegen::chunk_row_set const& rows,
+                                          void* out,
+                                          rmm::cuda_stream_view stream)
+{
+  if (!validate_sparse_rows(rows, num_rows, "launch_decode_fused_tree_sparse_rows")) {
+    return false;
+  }
+  if (rows.num_survivors == 0) { return true; }  // empty selection: nothing to decode
+  if (out == nullptr) {
+    std::fprintf(stderr, "simpatico::codegen: launch_decode_fused_tree_sparse_rows: null out\n");
+    return false;
+  }
+  VariantLaunchArgs va;
+  va.variant        = cdj::DecodeVariant::sparse_index_consume;
+  va.chunk_list     = reinterpret_cast<CUdeviceptr>(const_cast<std::uint32_t*>(rows.chunk_ids));
+  va.out_offsets    = reinterpret_cast<CUdeviceptr>(
+    const_cast<std::uint32_t*>(rows.chunk_out_offsets));
+  va.in_chunk_off   = reinterpret_cast<CUdeviceptr>(
+    const_cast<std::uint16_t*>(rows.in_chunk_offsets));
+  va.grid_override  = rows.num_touched;
+  va.sync_on_return = false;
+  return launch_decode_fused_tree_impl(tree, labeled, dtype, num_rows, out, stream, va);
+}
+
+// K5s: sparse constant-width dictionary gather (latemat_launch.hpp).
+bool launch_decode_fused_tree_sparse_dict_gather(codegen::jit::FusedTree const& tree,
+                                                 codegen::jit::LabeledBuffers& labeled,
+                                                 char const* dtype,
+                                                 std::int64_t num_rows,
+                                                 ::sirius::codegen::chunk_row_set const& rows,
+                                                 void const* keys_chars,
+                                                 std::int32_t key_width,
+                                                 void* out_chars,
+                                                 rmm::cuda_stream_view stream)
+{
+  if (!validate_sparse_rows(rows, num_rows, "launch_decode_fused_tree_sparse_dict_gather")) {
+    return false;
+  }
+  if (rows.num_survivors == 0) { return true; }
+  if (keys_chars == nullptr || key_width < 1 || out_chars == nullptr) {
+    std::fprintf(stderr,
+                 "simpatico::codegen: launch_decode_fused_tree_sparse_dict_gather: incomplete "
+                 "inputs (keys=%p key_width=%d out=%p)\n",
+                 keys_chars,
+                 key_width,
+                 out_chars);
+    return false;
+  }
+  VariantLaunchArgs va;
+  va.variant        = cdj::DecodeVariant::sparse_dict_gather;
+  va.chunk_list     = reinterpret_cast<CUdeviceptr>(const_cast<std::uint32_t*>(rows.chunk_ids));
+  va.out_offsets    = reinterpret_cast<CUdeviceptr>(
+    const_cast<std::uint32_t*>(rows.chunk_out_offsets));
+  va.in_chunk_off   = reinterpret_cast<CUdeviceptr>(
+    const_cast<std::uint16_t*>(rows.in_chunk_offsets));
+  va.keys_chars     = reinterpret_cast<CUdeviceptr>(const_cast<void*>(keys_chars));
+  va.key_width      = key_width;
+  va.grid_override  = rows.num_touched;
+  va.sync_on_return = false;
+  return launch_decode_fused_tree_impl(tree, labeled, dtype, num_rows, out_chars, stream, va);
+}
+
+// K6s phase 1: sparse str_split survivor metadata (latemat_launch.hpp).
+bool launch_decode_fused_tree_sparse_str_meta(codegen::jit::FusedTree const& tree,
+                                              codegen::jit::LabeledBuffers& labeled,
+                                              char const* dtype,
+                                              std::int64_t num_string_rows,
+                                              ::sirius::codegen::chunk_row_set const& rows,
+                                              std::int64_t* src_offsets_out,
+                                              std::int32_t* lengths_out,
+                                              rmm::cuda_stream_view stream)
+{
+  if (!validate_sparse_rows(rows, num_string_rows,
+                            "launch_decode_fused_tree_sparse_str_meta")) {
+    return false;
+  }
+  if (rows.num_survivors == 0) { return true; }
+  if (src_offsets_out == nullptr || lengths_out == nullptr) {
+    std::fprintf(stderr,
+                 "simpatico::codegen: launch_decode_fused_tree_sparse_str_meta: null outputs\n");
+    return false;
+  }
+  VariantLaunchArgs va;
+  va.variant        = cdj::DecodeVariant::sparse_str_meta;
+  va.chunk_list     = reinterpret_cast<CUdeviceptr>(const_cast<std::uint32_t*>(rows.chunk_ids));
+  va.out_offsets    = reinterpret_cast<CUdeviceptr>(
+    const_cast<std::uint32_t*>(rows.chunk_out_offsets));
+  va.in_chunk_off   = reinterpret_cast<CUdeviceptr>(
+    const_cast<std::uint16_t*>(rows.in_chunk_offsets));
+  va.len_out        = reinterpret_cast<CUdeviceptr>(lengths_out);
+  va.grid_override  = rows.num_touched;
+  va.sync_on_return = false;
+  // Offsets domain: n = string rows + 1 (the CSR stays row-space; row chunks
+  // and offsets chunks are aligned — same contract as the K6 launcher).
+  return launch_decode_fused_tree_impl(
+    tree, labeled, dtype, num_string_rows + 1, src_offsets_out, stream, va);
 }
 
 // K6 phase 1: str_split masked survivor metadata (masked_launch.hpp).

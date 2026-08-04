@@ -180,6 +180,7 @@ void load_balancing_scan_batch_coalescer::drain_cached_provider(databatch_provid
         auto split = std::make_unique<op::scan::scan_operator_input>(std::move(next.data));
         split->mvcc_keep_mask     = std::move(next.mvcc_keep_mask);
         split->row_filter_pending = row_filter_pending;
+        split->late_mat_origin    = std::move(next.late_mat_origin);
         connector.push_split(std::move(split));
         continue;
       }
