@@ -258,8 +258,7 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::unary_op const& alt,
       (mode == evaluation_mode::AST || ast_op_count >= _min_ast_size)) {
     auto child        = evaluate(*alt.child, evaluation_mode::AST);
     auto build_output = [&](expr_ref const& produced) -> evaluate_result {
-      return evaluate_result(
-        ast_result(produced, child.get_temp_scalar_indices(), child.get_temp_column_indices()));
+      return evaluate_result(compose(produced, {&child}));
     };
 
     evaluate_result output = [&]() -> evaluate_result {
@@ -295,7 +294,7 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::unary_op const& alt,
 
     //===----------2: MATERIALIZE Mode, evaluate node with AST----------===//
     auto result_column = evaluate_ast(output.get_expr());
-    release_temporaries(output.get_temp_scalar_indices(), output.get_temp_column_indices());
+    release_temporaries({&output});
     return evaluate_result(std::move(result_column));
   }
 
@@ -351,10 +350,7 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::in_list const& alt,
     auto comparator          = evaluate(*alt.values[0], evaluation_mode::AST);
     expr_ref comparison_expr = _ast_tree.emplace<cudf::ast::operation>(
       cudf::ast::ast_operator::EQUAL, test.get_expr(), comparator.get_expr());
-    auto output = evaluate_result(
-      ast_result(comparison_expr,
-                 {test.get_temp_scalar_indices(), comparator.get_temp_scalar_indices()},
-                 {test.get_temp_column_indices(), comparator.get_temp_column_indices()}));
+    auto output = evaluate_result(compose(comparison_expr, {&test, &comparator}));
 
     for (std::size_t value_idx = 1; value_idx < alt.values.size(); ++value_idx) {
       auto next_comparator          = evaluate(*alt.values[value_idx], evaluation_mode::AST);
@@ -362,23 +358,19 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::in_list const& alt,
         cudf::ast::ast_operator::EQUAL, test.get_expr(), next_comparator.get_expr());
       comparison_expr = _ast_tree.emplace<cudf::ast::operation>(
         cudf::ast::ast_operator::LOGICAL_OR, comparison_expr, next_comparison_expr);
-      output = evaluate_result(
-        ast_result(comparison_expr,
-                   {output.get_temp_scalar_indices(), next_comparator.get_temp_scalar_indices()},
-                   {output.get_temp_column_indices(), next_comparator.get_temp_column_indices()}));
+      output = evaluate_result(compose(comparison_expr, {&output, &next_comparator}));
     }
 
     if (!alt.negated) {
       // produce IN result (positive)
       if (mode == evaluation_mode::AST) { return output; }
       auto result_column = evaluate_ast(output.get_expr());
-      release_temporaries(output.get_temp_scalar_indices(), output.get_temp_column_indices());
+      release_temporaries({&output});
       return evaluate_result(std::move(result_column));
     }
     auto const& not_expr =
       _ast_tree.emplace<cudf::ast::operation>(cudf::ast::ast_operator::NOT, comparison_expr);
-    auto not_output = evaluate_result(
-      ast_result(not_expr, output.get_temp_scalar_indices(), output.get_temp_column_indices()));
+    auto not_output = evaluate_result(compose(not_expr, {&output}));
 
     if (mode == evaluation_mode::AST) {
       //===----------1: AST Mode----------===//
@@ -387,7 +379,7 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::in_list const& alt,
 
     //===----------2: MATERIALIZE Mode, evaluate node with AST----------===//
     auto result_column = evaluate_ast(not_output.get_expr());
-    release_temporaries(not_output.get_temp_scalar_indices(), not_output.get_temp_column_indices());
+    release_temporaries({&not_output});
     return evaluate_result(std::move(result_column));
   }
 

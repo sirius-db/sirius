@@ -202,16 +202,12 @@ struct pipeline_task_history_fixture {
   }
 
   /// Create a data batch that stays on GPU.
-  std::shared_ptr<cucascade::data_batch> create_gpu_data_batch(std::size_t num_rows,
-                                                               rmm::cuda_stream_view stream)
+  std::shared_ptr<cucascade::data_batch> create_gpu_data_batch(
+    std::size_t num_rows, rmm::cuda_stream_view stream, cudf::type_id type = cudf::type_id::INT64)
   {
-    auto gpu_mr = gpu_space->get_default_allocator();
-    auto gpu_table =
-      sirius::create_cudf_table_with_random_data(num_rows,
-                                                 {cudf::data_type{cudf::type_id::INT64}},
-                                                 {std::make_pair(0, 1000000)},
-                                                 stream,
-                                                 gpu_mr);
+    auto gpu_mr    = gpu_space->get_default_allocator();
+    auto gpu_table = sirius::create_cudf_table_with_random_data(
+      num_rows, {cudf::data_type{type}}, {std::make_pair(0, 1000000)}, stream, gpu_mr);
     stream.synchronize();
 
     auto batch = sirius::make_data_batch(
@@ -347,9 +343,13 @@ std::unique_ptr<sirius::pipeline::gpu_pipeline_task> create_pipeline_task(
 std::unique_ptr<sirius::pipeline::gpu_pipeline_task> create_cached_scan_task(
   std::shared_ptr<sirius::pipeline::sirius_pipeline_task_global_state> global_state,
   std::shared_ptr<cucascade::data_batch> batch,
-  int task_id)
+  int task_id,
+  bool needs_carrier_conversion            = false,
+  std::size_t conversion_destination_bytes = 0)
 {
   auto op_data = std::make_unique<sirius::op::scan::scan_operator_input>(std::move(batch));
+  op_data->needs_carrier_conversion     = needs_carrier_conversion;
+  op_data->conversion_destination_bytes = conversion_destination_bytes;
   return std::make_unique<sirius::pipeline::gpu_pipeline_task>(
     task_id,
     std::vector<cucascade::shared_data_repository*>{},
@@ -448,6 +448,51 @@ TEST_CASE("cached scan input materialization contributes to task reservations",
     REQUIRE_FALSE(info.had_history);
     REQUIRE(info.peak_memory_estimate == input_basis);
     REQUIRE(info.reservation_size == input_basis);
+  }
+
+  SECTION("history includes an exact carrier-conversion destination")
+  {
+    auto batch = f.create_gpu_data_batch(kInputNumRows, stream, cudf::type_id::INT32);
+    std::size_t input_basis;
+    {
+      auto ro     = batch->to_read_only();
+      input_basis = ro.get_data()->get_size_in_bytes();
+      REQUIRE(ro.get_current_tier() == cucascade::memory::Tier::GPU);
+    }
+    REQUIRE(input_basis > 0);
+    auto const destination_bytes = kInputNumRows * sizeof(int64_t);
+    REQUIRE(destination_bytes > input_basis);
+
+    global_state->get_memory_history().record({input_basis, input_basis / 2, input_basis});
+    auto task = create_cached_scan_task(global_state, std::move(batch), 1, true, destination_bytes);
+    auto info = task->get_estimated_reservation_size_info(nullptr);
+    REQUIRE(info.input_basis == input_basis);
+    REQUIRE(info.bytes_to_materialize_input == 0);
+    REQUIRE(info.had_history);
+    REQUIRE(info.peak_memory_estimate == input_basis + destination_bytes);
+    REQUIRE(info.reservation_size == input_basis + destination_bytes);
+  }
+
+  SECTION("history uses the conservative carrier-conversion bound when destination is unknown")
+  {
+    auto batch = f.create_gpu_data_batch(kInputNumRows, stream);
+    std::size_t input_basis;
+    {
+      auto ro     = batch->to_read_only();
+      input_basis = ro.get_data()->get_size_in_bytes();
+      REQUIRE(ro.get_current_tier() == cucascade::memory::Tier::GPU);
+    }
+    REQUIRE(input_basis > 0);
+
+    global_state->get_memory_history().record({input_basis, input_basis / 2, input_basis});
+    auto task = create_cached_scan_task(global_state, std::move(batch), 1, true, 0);
+    auto info = task->get_estimated_reservation_size_info(nullptr);
+    auto const conversion_floor = input_basis + input_basis * 8;
+    REQUIRE(info.input_basis == input_basis);
+    REQUIRE(info.bytes_to_materialize_input == 0);
+    REQUIRE(info.had_history);
+    REQUIRE(info.peak_memory_estimate == conversion_floor);
+    REQUIRE(info.reservation_size == conversion_floor);
   }
 }
 

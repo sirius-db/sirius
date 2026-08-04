@@ -74,13 +74,12 @@ pixi run build/release/extension/sirius/test/cpp/sirius_unittest "test_cpu_cache
 
 CLion does not natively support pixi environments. One way to circumvent that is to create a custom
 toolchain for sirius and load the pixi environment via an environment file. This allows a consistent use of CLion, both
-when using natively on a system, or via the remote development workflow. To support this, we create a
-`sirius_pixi_env_for_clion.sh` file inside the `build` directory (ignored by default) when the pixi environment is
-activated.
+when using natively on a system, or via the remote development workflow. To support this, the `clion-env` task creates a
+`sirius_pixi_env_for_clion.sh` file inside the `build` directory (ignored by default).
 
 ### First time setup
 
-- Run `pixi shell`. This will generate/update the `sirius_pixi_env_for_clion.sh`.
+- Run `pixi run clion-env`. This will generate/update the `sirius_pixi_env_for_clion.sh`.
 - Choose correct `CMakeLists.txt`:
     - Open the sirius directory in CLion. CLion will ask how load the project, as a `Makefile` project or a `CMake`
       project, choose `CMake`.

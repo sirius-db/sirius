@@ -130,6 +130,12 @@ struct operator_params {
   /// pin-time statistics capture and the serve-side survivor plan: a table pinned while the flag is
   /// off carries no zone maps and cannot prune until re-pinned with the flag on.
   bool enable_pinned_zone_map_pruning = true;
+
+  /// Store eligible integer and fixed-point DECIMAL columns in carriers selected from exact
+  /// per-chunk bounds during pinning. Matching pinned scans derive targets from recorded storage
+  /// metadata; other scans use native carriers. Logical types remain unchanged, and type-sensitive
+  /// boundaries restore native carriers.
+  bool enable_compressed_materialization = true;
 };
 
 struct telemetry_config {
@@ -169,13 +175,6 @@ struct compression_config {
   /// exists for a table, that table is pinned uncompressed regardless of the
   /// enable flag.  Empty string = feature disabled.
   std::string input_plan_dir{};
-
-  /// Degree of column-parallelism for Simpatico (de)compression: simpatico fans
-  /// a table's columns across this many worker threads/streams (one column per
-  /// stream). <=1 = sequential (single-stream). Capped at the column count per
-  /// call. Applies to both the pin-time compress path and the scan-time
-  /// decompress converters.
-  int column_threads{4};
 };
 
 struct sirius_config {

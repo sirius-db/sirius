@@ -332,6 +332,13 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   /// so the one-shot publisher sees the whole key set.
   [[nodiscard]] bool publishes_dynamic_filters() const;
 
+  /// The per-GPU hash-table byte budget (also the upstream PARTITION's bound on folding a build
+  /// whole for dynamic-filter publication).
+  [[nodiscard]] uint64_t max_build_hash_table_bytes() const noexcept
+  {
+    return _max_build_hash_table_bytes;
+  }
+
   /// Reported by the upstream PARTITION at sizing time: the build port will deliver one
   /// concat-folded batch covering the entire build side (single-partition or broadcast build).
   /// Precondition for claiming a build batch for dynamic-filter publication, in any join mode.

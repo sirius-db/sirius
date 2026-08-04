@@ -1,8 +1,8 @@
 # Pareto-picked plans: max ratio with decompress >= 250 GB/s per column.
-# column: o_orderkey  dtype: i64  ratio: 106.348x  depth: 2
-# comp: 337.98 GB/s  decomp: 740.63 GB/s
+# column: o_orderkey  dtype: i64  ratio: 12.393x  depth: 2
+# comp: 1327.24 GB/s  decomp: 2098.18 GB/s
 input -> delta -> differences
-delta.differences -> lz4
+delta.differences -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
 
 ---
 # column: o_custkey  dtype: i32  ratio: 1.140x  depth: 1
@@ -47,8 +47,6 @@ dictionary.keys_offsets.differences -> rle -> runs, values
 input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
 
 ---
-# column: o_comment  dtype: str  ratio: 2.630x  depth: 3
-# comp: 22.08 GB/s  decomp: 279.77 GB/s
-input -> str_split -> offsets, chars
-str_split.chars -> snappy
-str_split.offsets -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+# column: o_comment  dtype: str  ratio: 0.929x  depth: 0  [GPU-TIER OVERRIDE: raw GPU residency; snappy decode 260 GB/s not worth it on-GPU]
+# comp: 2880.06 GB/s  decomp: 2915.27 GB/s
+input -> identity

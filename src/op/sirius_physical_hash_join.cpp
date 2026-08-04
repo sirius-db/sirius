@@ -1167,9 +1167,12 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::get_next_task_input_da
     if (!present_batch) { return nullptr; }  // already drained by a concurrent caller
 
     // Synthesize the empty opposite side from the absent child's output schema (children[0] =
-    // probe/left, children[1] = build/right), on the surviving batch's device. The batch's memory
-    // space is only reachable through a read-only accessor; take one transiently (shared lock) and
-    // release it before handing the idle batch to the task.
+    // probe/left, children[1] = build/right), on the surviving batch's device. The absent child's
+    // physical sidecar, when it has one, is the carrier schema its batches would have arrived with,
+    // so synthesizing from it keeps every output batch of this join agreeing with the carriers the
+    // join's own sidecar advertises for that side. The batch's memory space is only reachable
+    // through a read-only accessor; take one transiently (shared lock) and release it before
+    // handing the idle batch to the task.
     cucascade::memory::memory_space* ms = nullptr;
     {
       auto present_ro = present_batch->to_read_only();
@@ -1181,11 +1184,14 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::get_next_task_input_da
         "memory space in operator " +
         std::to_string(this->get_operator_id()));
     }
-    auto const& opp_types = orphan.present_is_build ? children[0]->get_types()   // absent probe
-                                                    : children[1]->get_types();  // absent build
+    auto const& absent = orphan.present_is_build ? *children[0]   // absent probe
+                                                 : *children[1];  // absent build
     rmm::cuda_set_device_raii const device_guard{rmm::cuda_device_id{ms->get_device_id()}};
-    auto empty_batch = make_data_batch(
-      sirius::make_empty_table(opp_types), *ms, cudf::get_default_stream(), batch_telemetry());
+    auto empty_table = absent.has_physical_overrides()
+                         ? sirius::make_empty_table(absent.get_physical_types())
+                         : sirius::make_empty_table(absent.get_types());
+    auto empty_batch =
+      make_data_batch(std::move(empty_table), *ms, cudf::get_default_stream(), batch_telemetry());
 
     std::vector<std::shared_ptr<cucascade::data_batch>> input_batch;
     input_batch.reserve(2);

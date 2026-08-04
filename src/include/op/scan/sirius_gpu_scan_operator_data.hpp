@@ -241,6 +241,14 @@ class scan_operator_input : public op::operator_data {
   /// prepare_for_processing. Non-null only for decode_row_filtered splits of
   /// an origin-stamped scan whose converter ran the capture.
   std::shared_ptr<const late_mat::row_selection> late_mat_selection;
+  /// True when scan normalization will cast at least one selected column of this resident cached
+  /// split. Stamped by drain_cached_provider from databatch_provider::batch, which owns the
+  /// definition.
+  bool needs_carrier_conversion{false};
+  /// Stamped by drain_cached_provider from databatch_provider::batch::conversion_destination_bytes,
+  /// which owns the definition. Zero means unknown; the scan memory estimate then keeps its
+  /// conservative maximum-expansion bound.
+  std::size_t conversion_destination_bytes{0};
 };
 
 }  // namespace sirius::op::scan

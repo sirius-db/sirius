@@ -807,6 +807,15 @@ std::vector<rider_plan> build_fd_riders(op::scan::sirius_gpu_scan_operator* scan
                                      info.entry->late_mat_handle->generation()};
       auto view = resolve_pinned_column(origin);
       if (!view) { continue; }
+      try {
+        if (view->dtype.id() != cudf::type_id::EMPTY &&
+            view->dtype !=
+              sirius::get_cudf_type(rider_scan->get_types()[kp->scan_pos])) {
+          continue;  // narrow-stored rider column: same normalization-bypass guard
+        }
+      } catch (std::exception const&) {
+        continue;
+      }
       if (!rider_layout) {
         rider_layout = resolve_pinned_layout(origin);
         if (!rider_layout) { break; }
@@ -1052,6 +1061,26 @@ void try_install_late_mat_deferral(op::scan::sirius_gpu_scan_operator* scan_op,
       handle, static_cast<std::uint32_t>(selected_columns[scan_pos]), handle->generation()};
     auto view = resolve_pinned_column(origin);
     if (!view) { continue; }
+    // Narrow-column-width interaction guard: a column STORED NARROW in the
+    // pin must not defer — port-side materialization emits the stored
+    // carrier and bypasses scan normalization, so downstream would see a
+    // narrow type where the plan promises the native one. Only native-stored
+    // columns defer; narrowing thus legitimately shrinks sum_width via the
+    // columns that remain eligible.
+    try {
+      if (view->dtype.id() != cudf::type_id::EMPTY &&
+          view->dtype != sirius::get_cudf_type(types[scan_pos])) {
+        SIRIUS_LOG_INFO(
+          "[late_mat] candidate REJECTED (narrow-stored): scan op {} column {} — stored "
+          "carrier differs from the native type; materialization would bypass scan "
+          "normalization",
+          scan_op->get_operator_id(),
+          scan_pos);
+        continue;
+      }
+    } catch (std::exception const&) {
+      continue;  // untranslatable native type: refuse rather than mis-type
+    }
     if (!layout) {
       layout = resolve_pinned_layout(origin);
       if (!layout) { return; }
