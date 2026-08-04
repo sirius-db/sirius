@@ -63,9 +63,9 @@ inline std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> initia
   builder.set_number_of_gpus(n_gpus)
     .set_gpu_usage_limit(gpu_capacity / n_gpus)
     .set_reservation_fraction_per_gpu(limit_ratio)
-    .set_per_host_capacity(host_capacity / n_gpus)
+    .set_per_numa_region_capacity(host_capacity / n_gpus)
     .use_host_per_gpu()
-    .set_reservation_fraction_per_host(limit_ratio);
+    .set_reservation_fraction_per_numa_region(limit_ratio);
 
   auto space_configs = builder.build();
   auto manager =

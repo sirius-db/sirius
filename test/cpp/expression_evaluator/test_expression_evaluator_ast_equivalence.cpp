@@ -95,9 +95,9 @@ std::unique_ptr<memory_mgr> initialize_memory_manager()
   builder.set_number_of_gpus(1)
     .set_gpu_usage_limit(gpu_capacity)
     .set_reservation_fraction_per_gpu(limit_ratio)
-    .set_per_host_capacity(host_capacity)
+    .set_per_numa_region_capacity(host_capacity)
     .use_host_per_gpu()
-    .set_reservation_fraction_per_host(limit_ratio);
+    .set_reservation_fraction_per_numa_region(limit_ratio);
   auto configs = builder.build();
   auto manager = std::make_unique<memory_mgr>(std::move(configs));
   ::sirius::converter_registry::initialize();

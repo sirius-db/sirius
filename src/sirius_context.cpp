@@ -598,7 +598,7 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
       SIRIUS_LOG_WARN(
         "SiriusContext: host space count ({}) != NUMA node count ({}) — "
         "expected one host space per NUMA domain. Check "
-        "sirius_config apply_defaults (.use_host_per_numa()) or YAML host "
+        "sirius_config apply_defaults (.use_numa_id_as_host_id()) or YAML host "
         "configuration.",
         mgpu05_host_spaces.size(),
         topo.num_numa_nodes);

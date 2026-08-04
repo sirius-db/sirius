@@ -159,10 +159,10 @@ TEST_CASE("GPU pipeline executor schedules GPU tasks directly (push-model)",
     builder.set_number_of_gpus(1)
       .set_gpu_usage_limit(256 * 1024 * 1024)
       .set_reservation_fraction_per_gpu(0.75)
-      .set_per_host_capacity(1 * 1024 * 1024 * 1024)
+      .set_per_numa_region_capacity(1 * 1024 * 1024 * 1024)
       .use_host_per_gpu()
       .track_reservation_per_stream(false)
-      .set_reservation_fraction_per_host(0.75);
+      .set_reservation_fraction_per_numa_region(0.75);
     auto space_configs = builder.build();
     manager =
       std::make_unique<sirius::memory::sirius_memory_reservation_manager>(std::move(space_configs));
