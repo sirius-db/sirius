@@ -8,8 +8,10 @@
 # Teams follow the pattern: @sirius-db/sirius-<component|language>-codeowners
 
 # ── Planner ───────────────────────────────────────────────────────────────────
-src/**/planner/                     @sirius-db/sirius-planner-codeowners
-src/**/pipeline/                    @sirius-db/sirius-planner-codeowners
+src/pipeline/                       @sirius-db/sirius-planner-codeowners
+src/include/pipeline/               @sirius-db/sirius-planner-codeowners
+src/planner/                        @sirius-db/sirius-planner-codeowners
+src/include/planner/                @sirius-db/sirius-planner-codeowners
 
 # ── Executors ─────────────────────────────────────────────────────────────────
 src/creator/                        @sirius-db/sirius-executors-codeowners
@@ -20,39 +22,39 @@ src/**/parallel/                    @sirius-db/sirius-executors-codeowners
 src/include/common/                 @sirius-db/sirius-operators-codeowners
 src/include/cudf/                   @sirius-db/sirius-operators-codeowners
 src/include/data/                   @sirius-db/sirius-operators-codeowners @sirius-db/sirius-scan-io-codeowners
-src/**/op/                          @sirius-db/sirius-operators-codeowners
-src/**/expression*/                 @sirius-db/sirius-operators-codeowners
 src/**/cuda/                        @sirius-db/sirius-operators-codeowners
+src/**/expression*/                 @sirius-db/sirius-operators-codeowners
 src/**/helper/                      @sirius-db/sirius-operators-codeowners @sirius-db/sirius-scan-io-codeowners
+src/**/op/                          @sirius-db/sirius-operators-codeowners
 src/**/util/                        @sirius-db/sirius-operators-codeowners @sirius-db/sirius-scan-io-codeowners
 
 # ── Scan & I/O (overrides Operators entries above for scan paths) ─────────────
-src/**/scan*/                       @sirius-db/sirius-scan-io-codeowners
 src/**/io/                          @sirius-db/sirius-scan-io-codeowners
+src/**/scan*/                       @sirius-db/sirius-scan-io-codeowners
 
 # ── Memory & Compression ──────────────────────────────────────────────────────
 src/compression/                    @sirius-db/sirius-memory-compression-codeowners
-src/**/memory/                      @sirius-db/sirius-memory-compression-codeowners
 src/**/downgrade/                   @sirius-db/sirius-memory-compression-codeowners
+src/**/memory/                      @sirius-db/sirius-memory-compression-codeowners
 
 # ── Integrations ──────────────────────────────────────────────────────────────
-src/**/transparent/                 @sirius-db/sirius-integrations-codeowners
 /cucascade/                         @sirius-db/sirius-integrations-codeowners
 /duckdb/                            @sirius-db/sirius-integrations-codeowners
 /experimental/                      @sirius-db/sirius-integrations-codeowners
-/rust/crates/sirius*/               @sirius-db/sirius-integrations-codeowners
 /substrait/                         @sirius-db/sirius-integrations-codeowners
+/rust/crates/sirius*/               @sirius-db/sirius-integrations-codeowners
+src/**/transparent/                 @sirius-db/sirius-integrations-codeowners
 
 # ── Telemetry & Observability ─────────────────────────────────────────────────
 /rust/crates/telemetry/             @sirius-db/sirius-telemetry-codeowners
 /tools/                             @sirius-db/sirius-telemetry-codeowners
-src/**/telemetry/                   @sirius-db/sirius-telemetry-codeowners
 src/**/log/                         @sirius-db/sirius-telemetry-codeowners
+src/**/telemetry/                   @sirius-db/sirius-telemetry-codeowners
 
 # ── CMake ─────────────────────────────────────────────────────────────────────
 /cmake/                             @sirius-db/sirius-cmake-codeowners
-**/CMakeLists.txt                   @sirius-db/sirius-cmake-codeowners
 **/*.cmake                          @sirius-db/sirius-cmake-codeowners
+**/CMakeLists.txt                   @sirius-db/sirius-cmake-codeowners
 
 # ── CI & Build ────────────────────────────────────────────────────────────────
 /.*                                 @sirius-db/sirius-ci-build-codeowners
