@@ -20,3 +20,7 @@ E5-49,done,2026-08-05T00:54:02Z,2026-08-05T00:57:59Z,019fcf6a-b138-7c40-a881-2ae
 B2+E3,done,2026-08-05T00:58:00Z,2026-08-05T01:07:08Z,15_sessions_see_traces_dirs,cold,per-query,"1 6 19",900,B=6.411_Cmix=7.110_B2repeat<=2.6pct
 B3,done,2026-08-05T01:08:41Z,2026-08-05T01:14:56Z,019fcf79-9321-7a82-a3ce-840fd8647c6d,1.0,1.0,"1 9 13 19 21",300,fuse_merge_pipelines_false_retry_after_wrapper_pathfix
 E7,done,2026-08-05T01:17:05Z,2026-08-05T01:19:53Z,019fcf7e-e535-7f10-b754-02620792dad3,0.50,0.50,"13 21",300,mps50_plus_fusefalse
+R1,done,2026-08-05T03:42:49Z,2026-08-05T03:44:59Z,019fd004-7262-7b52-a6e2-cebaaf0da0b2,1.0,1.0,"1 9 13 19 21",60,paired_quent+nsys_tierA_oldbinary_walls_+1.2..+7.4pct_vs_B1_tierB_blocked_ERR_NVGPUCTRPERM
+R2,done,2026-08-05T03:48:45Z,2026-08-05T03:49:20Z,019fd009-de8a-70c3-9f2f-d5cb9e41e18a,1.0,1.0,"6 14",35,hostpin_lane_baseline_pin_lineitem5cols+part2cols_host_tier_pipeline8
+R2n,done,2026-08-05T03:49:30Z,2026-08-05T03:50:43Z,019fd00b-13de-7311-b643-7f3901ce49fa,1.0,1.0,"6 14",40,paired_quent+nsys_hostpin_lane_link_335-339GBs_sustained_56-85pct_of_wall
+R3,done,2026-08-05T03:52:54Z,2026-08-05T03:54:01Z,019fd00e-1258-7e83-bf99-6714b7f41e33,0.49,0.5038,"6 14",65,c2c_eater_floor_256mb_cosets_c2c0.504_dram0.538_hbm0.892_eater_achieved_271GBs

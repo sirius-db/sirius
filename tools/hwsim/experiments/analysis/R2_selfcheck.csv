@@ -1,0 +1,9 @@
+index,label,traced_ms,sim_ms,err_pct,tasks,binding,forced_admissions,dep_cycle_breaks,spill_mode
+0,R2_tpch_q6_iter1_iter1,642.64,641.367,-0.2,378,executor_threads,0,0,off
+1,R2_tpch_q6_iter2_iter1,574.124,573.374,-0.13,378,executor_threads,0,0,off
+2,R2_tpch_q6_iter3_iter1,578.899,578.182,-0.12,378,executor_threads,0,0,off
+3,R2_tpch_q6_iter4_iter1,573.604,572.856,-0.13,378,executor_threads,0,0,off
+4,R2_tpch_q14_iter1_iter1,764.382,761.993,-0.31,817,executor_threads,0,0,off
+5,R2_tpch_q14_iter2_iter1,721.49,715.964,-0.77,817,executor_threads,0,0,off
+6,R2_tpch_q14_iter3_iter1,748.369,741.405,-0.93,817,executor_threads,0,0,off
+7,R2_tpch_q14_iter4_iter1,713.34,711.273,-0.29,817,executor_threads,0,0,off

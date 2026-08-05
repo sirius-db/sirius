@@ -42,7 +42,10 @@ def register_physics_cli(sub, common) -> None:
     )
     sp.set_defaults(fn=cmd_ingest_nsys)
 
-    for name, dispatch in (("simulate", _dispatch_simulate), ("sweep", _dispatch_sweep)):
+    for name, dispatch in (
+        ("simulate", _dispatch_simulate),
+        ("sweep", _dispatch_sweep),
+    ):
         spx = sub.choices.get(name)
         if spx is not None:
             spx.add_argument(
@@ -60,10 +63,40 @@ def register_physics_cli(sub, common) -> None:
 # --------------------------------------------------------------------------
 
 
+def _transfer_knobs_requested(args) -> bool:
+    """True when the invocation moves c2c_bandwidth / cpu_mem_bandwidth."""
+    knobs = parse_knob_args(getattr(args, "knob", None) or [])
+    if knobs.c2c_bandwidth != 1.0 or knobs.cpu_mem_bandwidth != 1.0:
+        return True
+    for spec in getattr(args, "sweep", None) or []:
+        name = spec.partition("=")[0].strip()
+        if name in ("c2c_bandwidth", "cpu_mem_bandwidth"):
+            return True
+    return False
+
+
+def _warn_unphysical_channels(args) -> None:
+    """E5 guard (validation-results.md section 3.4): on coherent-C2C traces
+    the derived channel capacity is unphysical and the transfer knobs are
+    silently inert — warn loudly before delegating to the v0 path. The
+    parsed-model cache makes the extra load cheap."""
+    if not _transfer_knobs_requested(args):
+        return
+    from .sanity import channel_capacity_warnings
+
+    try:
+        model = _load_model(args)
+    except Exception:
+        return  # the delegated command will report the real error
+    for w in channel_capacity_warnings(dict(model.channel_peak_rate)):
+        print(f"WARNING: {w}", file=sys.stderr)
+
+
 def _dispatch_simulate(args) -> int:
     if not getattr(args, "physics", None):
         from ..cli import cmd_simulate
 
+        _warn_unphysical_channels(args)
         return cmd_simulate(args)
     return cmd_simulate_physics(args)
 
@@ -72,6 +105,7 @@ def _dispatch_sweep(args) -> int:
     if not getattr(args, "physics", None):
         from ..cli import cmd_sweep
 
+        _warn_unphysical_channels(args)
         return cmd_sweep(args)
     return cmd_sweep_physics(args)
 
@@ -177,9 +211,7 @@ def cmd_simulate_physics(args) -> int:
     result, jstats, rstats = simulate_with_physics(model, graph, knobs, profile)
     _print_physics_header(knobs, jstats, rstats)
 
-    rep = _physics_report(
-        graph, knobs, result, baseline, jstats, rstats, args.physics
-    )
+    rep = _physics_report(graph, knobs, result, baseline, jstats, rstats, args.physics)
     print(
         f"=== {graph.info.label}  (physics join: "
         f"{jstats.tasks_matched}/{jstats.tasks_total} tasks, "

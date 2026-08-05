@@ -12,11 +12,11 @@ CSVs/metrics; `traces/`, `throttle_logs/`, `env/` gitignored). ~150 min GPU-busy
 
 | Knob | Rows | Validated? | Slowdown-ratio error (E_ratio) | Recommendation |
 |---|---|---|---|---|
-| `gpu_compute` (MPS pct 75/50/25) | E1-75/50/25 | **NO — fails at every factor** | median **+26% / +71% / +188%**, uniformly pessimistic; structure (binding, pipeline shares ≤1.2 pp, monotonicity, per-query rank ρ=1.0) intact | Do not use for quantitative what-ifs. Needs G4 per-kernel SM/HBM split or an empirical span-sensitivity coefficient (§5 #1) |
+| `gpu_compute` (MPS pct 75/50/25) | E1-75/50/25 | **NO — fails at every factor** (v0). **FIXED by the physics join — see §7**: median −1.5/−3.7/−6.4% | median **+26% / +71% / +188%**, uniformly pessimistic; structure (binding, pipeline shares ≤1.2 pp, monotonicity, per-query rank ρ=1.0) intact | Use `--physics` (§7) for quantitative what-ifs; the v0 path stays for structure-only questions |
 | `gpu_mem_capacity` (pool YAML 0.50/0.25/0.15) | E2-hi/mid/lo | **YES above the spill threshold; NO below it — and in the *opposite* direction to design assumptions** | unpressured queries: ≤0.5% (12/12 null matches); pressured: **−82%** (q21@mid, real ×11.2 vs sim ×2.0), **−58%** (q9@lo, real ×55.2 vs sim ×23.1) — sim *under*-prices spill 2.4–5.6× | Capacity knob is trustworthy for "does it still fit" questions; forbid/flag predictions past the spill knee until a G5 spill model is calibrated (captures now exist) |
 | `io_bandwidth` (O_DIRECT injector, cold) | B2, E3-84/60/36 | **YES (best knob in the matrix)** | scan-bound q6/q19: **±5% at every depth**; decode-heavy q1: +19–20% pessimistic at deep throttle | G1 instrumentation **deprioritized** per §7.4 rule (errors ≪ the 50% promotion trigger); optional cheap fix for decode-heavy queries (§5 #4) |
-| `gpu_mem_bandwidth` (HBM CE eater) | E4-73/45 | **NO (quantify-G4 row)** | median **+24% @0.76, +74% @0.48**, all-pessimistic; rank ρ = 0.9–1.0 | Same root cause and same fix as `gpu_compute` (they share the v0 scaling law) |
-| `c2c_bandwidth` (C2C H2D eater + co-sets) | E5-70/49 | **UNTESTABLE on this box** (formally passes: ≤+7.6%) | null–null agreement: real ≤3% even at the physical floor (c2c 0.50 + dram 0.57); sim c2c knob touches ~0.6% of wall (zero-length Preparing spans) | Re-validate on a capture with explicit staged H2D before trusting the knob anywhere; instrument transfer windows on coherent-C2C boxes (§5 #3) |
+| `gpu_mem_bandwidth` (HBM CE eater) | E4-73/45 | **NO (quantify-G4 row)** (v0). **FIXED by the physics join — see §7**: median −2.8/−5.3% | median **+24% @0.76, +74% @0.48**, all-pessimistic; rank ρ = 0.9–1.0 | Same root cause and same fix as `gpu_compute` (they share the v0 scaling law) |
+| `c2c_bandwidth` (C2C H2D eater + co-sets) | E5-70/49 | **UNTESTABLE on this box** (formally passes: ≤+7.6%). **Now TESTED and VALIDATED on a link-bound lane — see §7.3**: physics −9.1/−1.5% where real slowdown is ×1.83/×1.53 | null–null agreement: real ≤3% even at the physical floor (c2c 0.50 + dram 0.57); sim c2c knob touches ~0.6% of wall (zero-length Preparing spans) | Physics path + wire-capacity correction validated (§7.3); v0/physics on coherent-C2C traces now WARN the knob is inert (§7.4) |
 | plan-delta under degradation | B3, E7 | **INCONCLUSIVE (null result)** | real cross-plan deltas ±1.0–1.6% ≈ noise; sim −0.6/−0.9%; sign 1/2, magnitudes within 15 pp trivially | `fuse_merge_pipelines=false` changes structure (4/5 queries +1–2 pipelines) but not walls; retest with a lever that moves walls |
 | self-consistency (G-SELF) | P1/B1/B3 + every degraded trace | **YES, exceptional** | median 0.02–0.10%, worst 0.36% across 9 traced sessions — *including under MPS, eaters and injectors*; sole exception: spill-heavy executions (+2743%) | Replay core is solid; the fidelity frontier is span *scaling laws* and *spill*, not flow |
 
@@ -311,3 +311,147 @@ reasons). 21/21 matrix rows executed or accounted: E5-49/B3/E7 stretch rows all 
 E2-lo-q21 is the single guard-sanctioned drop. Environment snapshots pre/post every row
 in `experiments/env/`; mechanism evidence (probe outputs, eater/injector CSVs, iostat
 sidecars, eviction transcripts) in `experiments/throttle_logs/<ROW>/`.
+
+## 7. Physics re-score (WS12, 2026-08-05) — the failed knobs after the nsys join
+
+**Status: COMPLETE.** First real nsys captures taken (WS10's join had only been
+fixture-verified), the two failed knob families re-scored against WS8's *actual
+measured* degraded rows, and the c2c knob validated on a purpose-built link-bound
+lane. Rows R1/R2/R2n/R3 in `runs.csv`; sim CSVs `analysis/E*P_sim.csv`,
+`analysis/R3{v0,phys}_sim.csv`. Same binary as the whole campaign
+(main repo dev@b77aa438, sha verified).
+
+### 7.1 First-real-capture checklist (nsys-join.md §7), R1 = paired quent+nsys of the 5 campaign queries
+
+1. **Ingest clean** — `reader_notes: []` on both captures (R1 and R2n): no schema
+   drift against nsys 2025.6.3.
+2. **Kernel attribution** — R1: 99.9% by count, **100.0% of kernel time** (240,641
+   kernels); R2n: 100/100. (R1 memcpy-time attribution is 41% — the NVMe lane's
+   small staging copies often launch outside task NVTX ranges; their absolute time
+   is trivial.)
+3. **GPU_METRICS semantics** — **unverifiable on this box**: Tier B capture fails
+   with `ERR_NVGPUCTRPERM` (GPU perf counters restricted to admin). Classification
+   ran on name priors alone: 23.0% of R1 kernel time classified (6.2% R2n); the
+   rest scales by the v0 conflated rule. ncu spot-checks are blocked by the same
+   permission — not attempted (see gaps).
+4. **Curve sanity** — R1 buckets monotone (H2D pinned pooled 54.6→75.2→113.1→138.8
+   GB/s up to its 1 MB max — all R1 H2D copies are small staging chunks); R2n
+   large buckets (64–256 MB): **338.9–347.4 GB/s pooled H2D** — inside the
+   measured 340–380 C2C line; R1 D2D 256 MB bucket **464.7 GB/s** ≈ the
+   flag-capped ~470. Wire-side peak aggregates: 214 GB/s H2D (R1), **382.3 GB/s**
+   H2D (R2n).
+5. **Clock fit** — same-run detected on all 9 windows; R1 slopes 1.000004
+   (±4 ppm), rms 0.5–29.7 µs (< 100 µs everywhere).
+6. **knobs=1 identity** — R1 trace, physics vs traced wall: −0.11/−0.04/−0.14/
+   +0.01/−0.04% (5/5 within ±1.2%); R2n: −0.13/−1.34% (q14 marginally at the
+   envelope edge).
+7. **Split-prediction divergence** — see 7.2: physics predictions diverge from v0
+   exactly as the kernel/host mix dictates.
+
+**Capture overhead**: R1 walls vs B1 medians: q1 +6.3%, q9 +2.7%, q13 +2.9%,
+q19 +6.4%, q21 +1.4% — Tier A in the expected +1–5% band (slightly above on the
+launch-densest queries). Physics quantities are per-event device durations and
+byte counts (overhead-clean); only span *fractions* inherit host-side skew.
+
+**The one-number explanation of the E1/E4 failure** (from the R1 decomposition):
+Sirius spans on this NVMe-streaming lane are **85–93% host time** (span minus
+GPU-busy: q1 85.4%, q9 93.3%, q13 84.9%, q19 92.7%, q21 92.1%); GPU-kernel-busy
+time is 5–15% of traced busy time. v0 scaled the whole span by 1/f; reality only
+scales the small GPU share. No query-level proxy could see this (E6's r = −0.23);
+the per-span nsys decomposition does.
+
+### 7.2 Before/after: v0 error vs physics error per (query, factor)
+
+Method identical to §3 (same P3/B1 real anchors, same iters, `row_metrics.py`);
+physics rows simulate the same B1 traces with `--physics physics_R1.json`.
+E_ratio = sim-slowdown / real-slowdown − 1; **v0 → physics**:
+
+| q | E1-75 | E1-50 | E1-25 | E4-73 | E4-45 |
+|---|---|---|---|---|---|
+| 1 | +23.7% → **−2.6%** | +61.3% → **−7.0%** | +156% → **−6.4%** | +9.4% → **−12.6%** | +68.7% → **−5.3%** |
+| 9 | +28.2% → **−1.5%** | +79.8% → **−3.7%** | +212% → **−5.4%** | +24.8% → **−2.4%** | +86.3% → **−3.4%** |
+| 13 | +25.2% → **−0.4%** | +68.8% → **−0.8%** | +188% → **+9.6%** | +18.2% → **−6.2%** | +73.8% → **−5.5%** |
+| 19 | +29.6% → **−0.4%** | +83.6% → **−1.4%** | +201% → **−8.0%** | +24.3% → **−2.8%** | +74.2% → **−9.3%** |
+| 21 | +25.8% → **−3.4%** | +70.6% → **−8.0%** | +169% → **−16.5%** | +25.2% → **−2.1%** | +88.5% → **−1.6%** |
+| **median** | **+25.8 → −1.5** | **+70.6 → −3.7** | **+188 → −6.4** | **+24.3 → −2.8** | **+74.2 → −5.3** |
+
+**24/25 cells within ±15%** (sole exception q21@E1-25: −16.5%); direction flips
+from uniformly pessimistic to mildly optimistic — consistent with the residual
+name-prior share and MPS effects the split cannot see (launch/host overhead does
+degrade slightly under a 25% SM ceiling). Join coverage 99.8–100% of busy time on
+every row; the classification weakness (77% of kernel time unclassified) turned
+out **not** to be the binding error term — the host/GPU-busy decomposition did
+the work. The §5 #1 "empirical stopgap coefficient" is obsolete.
+
+### 7.3 c2c re-test on a link-bound lane (the E5 non-test, done properly)
+
+**Scenario construction** (option "make bytes cross the wire"): `pin_table` the
+q6+q14 column union into pinned **HOST** memory (SF1000; lineitem 5 cols + part
+2 cols, ~250 GB decoded) with `pipeline.num_threads: 8`, so every scan does
+explicit staged H2D. Link-boundness verified from the paired capture's memcpy
+table (R2n): **sustained aggregate H2D 335–339 GB/s while active** (≈ the 340–380
+line), link active 56–85% of the query wall, individual copies at 381–382 GB/s.
+Quent-side: real Preparing transfer spans reappear (171.0 / 152.8 GB per query,
+byte-identical to nsys wire volume — uncompressed lane), channel peak 730 GB/s
+(same order as the WS6 sample trace's 709.6, confirming that capture was this
+kind of lane).
+
+**Degraded run** (R3): WS4 c2c eater at its floor (`--engine h2d --chunk-mb 256
+--buf-mb 1024 --gbps max`, achieved 271 GB/s); in-session co-sets measured
+c2c **0.5038**, dram **0.5383**, hbm **0.8922**. Real traced slowdowns (iters
+2–4 medians vs R2): **q6 ×1.834, q14 ×1.531** — the knob's territory is finally
+exercised (E5 had ≤×1.03). Selfcheck on both traces ≤0.93%.
+
+Sim (co-set knobs `c2c=0.5038, cpu_mem=0.5383, gpu_mem=0.8922`) vs real:
+
+| q | real × | v0 sim × (E) | physics, uncorrected cap × (E) | physics + wire cap × (E) |
+|---|---|---|---|---|
+| 6 | 1.834 | 1.421 (**−22.5%**) | 1.148 (−37.4%) | **1.668 (−9.1%)** |
+| 14 | 1.531 | 1.616 (+5.5%) | 1.083 (−29.3%) | **1.507 (−1.5%)** |
+
+**Verdict: c2c knob slope VALIDATED** through the physics path with the
+wire-capacity correction (both queries within ±10%; floor was 15%). The
+correction was the missing piece: the physics transfer-only line-sweep
+overlap-inflates channel capacity (derived **3,433 GB/s** vs **382.3 GB/s** of
+true wire aggregate — sub-windows are placed contiguously at span starts while
+real copies stagger), so an uncorrected knob under-binds. The v0 path on this
+lane is usable but noisier (−22%/+6%).
+
+### 7.4 Code changes (physics package; v0 engine untouched)
+
+New `sim/hwsim/physics/sanity.py` + hooks in `physics/integrate.py` /
+`physics/cli.py` (13 new unit tests; suite now 122, all green; B1 selfcheck and
+a stored E1-50 v0 prediction reproduce bit-identically):
+
+1. **Unphysical-capacity warning** — any host↔GPU channel whose trace-derived
+   capacity exceeds 1 TB/s (B1-lane traces derive ~165,000 GB/s) now WARNs, on
+   both the v0 and physics paths, whenever `c2c_bandwidth`/`cpu_mem_bandwidth`
+   moves: the knob is inert on such traces (fixes §5 #3's "confident no-op").
+2. **nsys wire-capacity correction** — `corrected = wire-side peak aggregate ×
+   (quent bytes / nsys wire bytes over matched transfers)`, applied as an upper
+   bound on the physics channel capacity **only when the link multiplier ≠ 1**
+   (identity at knobs=1 stays by-construction; gated on ≥50% byte coverage and
+   ≥1 GB matched wire volume, so degenerate coherent-C2C lanes are never
+   "corrected", they warn instead).
+
+### 7.5 Remaining gaps (updates to §5)
+
+- §5 #1 (G4) — **CLOSED** by measurement for gpu_compute/gpu_mem_bandwidth at
+  SF1000 on this box (7.2). Residual: q21 deep-throttle −16.5%; per-kernel
+  classification still priors-only (Tier B + ncu both blocked by
+  `ERR_NVGPUCTRPERM`; re-run classification once admin perf-counter access
+  exists).
+- §5 #3 — **partially closed**: the silent no-op is now loud (7.4), and the knob
+  is validated where the link genuinely binds (7.3). Still open as a quent
+  instrumentation ask (G-item): **wire-time transfer spans** — emit cudaEvent-
+  timed copy windows (start/stop around the `cudaMemcpyAsync` batch in the
+  host-pin/staging path, e.g. `cached_databatch_provider`'s H2D slice-copy and
+  `native_h2d`) so Preparing spans carry (bytes, wire-ns) even on coherent
+  lanes; that would let the v0 path price c2c without a paired nsys capture.
+- Physics baseline identity on heavily link-bound traces: −1.3% (R2n q14) — the
+  fluid-prep approximation's edge; acceptable but worth a regression test if
+  future lanes go deeper.
+- R1 memcpy-time attribution 41%: small staging copies launched outside task
+  ranges; harmless here (trivial absolute time) but a candidate for a
+  scan-manager-thread attribution pass if a lane ever stages large volumes
+  outside tasks.

@@ -1,0 +1,6 @@
+row,query,knobs,median_sim_wall_ms,median_sim_baseline_ms,binding,forced_admissions,n,pct_span_matched
+E4-45P,1,gpu_mem_bandwidth=0.480,9147.7,7842.7,executor_threads,0,3,100.0
+E4-45P,9,gpu_mem_bandwidth=0.480,13423.4,12494.7,executor_threads,0,3,100.0
+E4-45P,13,gpu_mem_bandwidth=0.480,6150.4,5452.1,executor_threads,0,3,100.0
+E4-45P,19,gpu_mem_bandwidth=0.480,9101.9,8440.9,executor_threads,0,3,100.0
+E4-45P,21,gpu_mem_bandwidth=0.480,18904.3,17447.0,executor_threads,0,3,99.8

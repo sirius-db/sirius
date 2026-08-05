@@ -1,0 +1,3 @@
+row,query,knobs,median_sim_wall_ms,median_sim_baseline_ms,binding,forced_admissions,n
+R3v0,6,c2c_bandwidth=0.5038;gpu_mem_bandwidth=0.8922,814.8,573.4,executor_threads,0,3
+R3v0,14,c2c_bandwidth=0.5038;gpu_mem_bandwidth=0.8922,1156.8,716.0,executor_threads,0,3

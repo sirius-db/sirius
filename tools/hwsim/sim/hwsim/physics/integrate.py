@@ -33,7 +33,7 @@ from typing import Dict, List, Optional, Tuple
 from ..engine import ChannelKey, Engine, SimResult
 from ..knobs import Knobs
 from ..model import QueryGraph
-from . import laws
+from . import laws, sanity
 from .curves import BandwidthCurve
 from .join import JoinStats, TaskAnnotation, join_graph
 from .schema import OpPhysics, PhysicsProfile, PrepPhysics
@@ -140,8 +140,7 @@ def retime_graph(
         if prep_ann is not None and task.prep_ns > 0:
             for cls in ("compute", "membw", "unknown", "host"):
                 stats.class_ns[cls] += (
-                    getattr(prep_ann, f"f_{cls}"
-                            if cls != "compute" else "f_comp")
+                    getattr(prep_ann, f"f_{cls}" if cls != "compute" else "f_comp")
                     * task.prep_ns
                 )
             stats.class_ns["xfer"] += prep_ann.f_xfer * task.prep_ns
@@ -150,11 +149,7 @@ def retime_graph(
             m_chan = laws.channel_transfer_mult(
                 task.prep_origin, task.prep_target, knobs
             )
-            if (
-                is_link
-                and prep_ann.f_xfer >= MIN_XFER_FRAC
-                and prep_ann.xfer_bytes > 0
-            ):
+            if is_link and prep_ann.f_xfer >= MIN_XFER_FRAC and prep_ann.xfer_bytes > 0:
                 xfer_base = task.prep_ns * prep_ann.f_xfer
                 xfer_scaled = xfer_base * _curve_factor(prep_ann, curves, m_chan)
                 task.prep_ns = max(1, round(xfer_scaled))
@@ -219,11 +214,16 @@ def physics_channel_capacity(
     annotations: Dict[int, TaskAnnotation],
     knobs: Knobs,
     session_peak: Optional[Dict[ChannelKey, float]] = None,
+    corrected: Optional[Dict[ChannelKey, float]] = None,
 ) -> Dict[ChannelKey, float]:
     """Channel capacity: line-sweep peak aggregate rate over *transfer-only*
     sub-windows of the traced Preparing spans (annotated tasks contribute
     their memcpy share of the window at the correspondingly higher rate),
-    floored by the session-wide v0 peak, then scaled by the transfer knob."""
+    floored by the session-wide v0 peak, capped by the nsys wire-side
+    corrected capacity where available (``sanity.corrected_link_capacities``
+    — the sub-window line-sweep overlap-inflates the peak; measured 3,433
+    vs 382 GB/s wire on the host-pinned lane), then scaled by the transfer
+    knob."""
     events: Dict[ChannelKey, List[Tuple[float, float]]] = {}
     for task in graph.tasks.values():
         if not (task.is_transfer_prep and task.prep_ns > 1000 and task.prep_bytes > 0):
@@ -248,11 +248,20 @@ def physics_channel_capacity(
         if session_peak and key in session_peak:
             peak = max(peak, session_peak[key])
         m = laws.channel_transfer_mult(key[0], key[1], knobs)
+        # The nsys wire-side correction applies only when the link knob
+        # moves: at m == 1 the traced spans already contain the real wire
+        # serialization (identity by construction), while the line-sweep
+        # peak is overlap-inflated (measured 3,433 vs 382 GB/s wire) and
+        # would let a degraded link go unpriced.
+        if m != 1.0 and corrected and key in corrected:
+            peak = min(peak, corrected[key])
         caps[key] = peak * m
     if session_peak:
         for key, base in session_peak.items():
             if key not in caps:
                 m = laws.channel_transfer_mult(key[0], key[1], knobs)
+                if m != 1.0 and corrected and key in corrected:
+                    base = min(base, corrected[key])
                 caps[key] = base * m
     return caps
 
@@ -281,9 +290,16 @@ def simulate_with_physics(
         for ms in model.memory_spaces.values()
         if ms.tier == "GPU"
     }
+    corrected = sanity.corrected_link_capacities(graph, annotations, profile)
     caps = physics_channel_capacity(
-        graph, annotations, knobs, session_peak=dict(model.channel_peak_rate)
+        graph,
+        annotations,
+        knobs,
+        session_peak=dict(model.channel_peak_rate),
+        corrected=corrected,
     )
+    if knobs.c2c_bandwidth != 1.0 or knobs.cpu_mem_bandwidth != 1.0:
+        rstats.warnings += sanity.channel_capacity_warnings(caps)
     host = getattr(model, "host_pool_capacity", 0)
     result = Engine(
         g2,

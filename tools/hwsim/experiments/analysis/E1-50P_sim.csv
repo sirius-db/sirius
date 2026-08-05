@@ -1,0 +1,6 @@
+row,query,knobs,median_sim_wall_ms,median_sim_baseline_ms,binding,forced_admissions,n,pct_span_matched
+E1-50P,1,gpu_compute=0.50,9018.9,7842.7,executor_threads,0,3,100.0
+E1-50P,9,gpu_compute=0.50,13317.4,12494.7,executor_threads,0,3,100.0
+E1-50P,13,gpu_compute=0.50,6382.6,5452.1,executor_threads,0,3,100.0
+E1-50P,19,gpu_compute=0.50,9014.0,8440.9,executor_threads,0,3,100.0
+E1-50P,21,gpu_compute=0.50,18756.9,17447.0,executor_threads,0,3,99.8
