@@ -44,13 +44,15 @@
 #include "sirius_context.hpp"
 
 #include <memory>
+#include <optional>
+#include <string>
 #include <unordered_set>
 
 namespace sirius::planner {
 
 namespace {
 
-// True when an `iceberg_scan` table carries a delete kind the GPU scan path cannot apply.
+// Why an `iceberg_scan` table must decline the GPU scan path, or nullopt when it may run there.
 //
 // The GPU path now applies V2 positional deletes and V3 deletion vectors (which
 // `iceberg_metadata()` reports as content='POSITION_DELETES' with file_format='PUFFIN', and
@@ -59,20 +61,30 @@ namespace {
 // not select them, which is not wired. Those tables still go to DuckDB.
 //
 // Conservative by construction: any failure to PROVE the table free of equality deletes —
-// absent path, failed query, unexpected result shape — returns true and falls the scan back to
-// DuckDB CPU. A false positive costs performance; a false negative would silently drop deletes
-// and corrupt results, so the asymmetry is deliberate.
-bool iceberg_table_has_unsupported_deletes(duckdb::LogicalGet& op, duckdb::ClientContext& context)
+// absent path, failed query, unexpected result shape — declines to DuckDB CPU. A false positive
+// costs performance; a false negative would silently drop deletes and corrupt results, so the
+// asymmetry is deliberate.
+//
+// The conservatism is right; the DIAGNOSTIC used to lie. Every decline reported itself as
+// "this table has equality-delete files", including declines that never managed to look. On a
+// table with no version hint the probe's own query errored, so a table with ZERO delete files
+// was reported as having unsupported ones. Each decline now carries the reason it actually hit.
+std::optional<std::string> iceberg_gpu_scan_decline_reason(duckdb::LogicalGet& op,
+                                                           duckdb::ClientContext& context)
 {
-  if (op.parameters.empty() || op.parameters.front().IsNull()) { return true; }
+  if (op.parameters.empty() || op.parameters.front().IsNull()) {
+    return "iceberg_scan called without a table path, so its delete files cannot be inspected";
+  }
 
   std::string table_path;
   try {
     table_path = op.parameters.front().GetValue<std::string>();
   } catch (...) {
-    return true;
+    return "iceberg_scan table path is not a string, so its delete files cannot be inspected";
   }
-  if (table_path.empty()) { return true; }
+  if (table_path.empty()) {
+    return "iceberg_scan table path is empty, so its delete files cannot be inspected";
+  }
 
   // Escape single quotes for SQL string embedding.
   std::string escaped;
@@ -89,7 +101,8 @@ bool iceberg_table_has_unsupported_deletes(duckdb::LogicalGet& op, duckdb::Clien
     try {
       query += ", snapshot_from_id = " + std::to_string(sid_it->second.GetValue<int64_t>());
     } catch (...) {
-      return true;
+      return "iceberg_scan snapshot_from_id is not an integer, so the snapshot the scan will read "
+             "cannot be inspected for delete files";
     }
   }
   query += ") WHERE content = 'EQUALITY_DELETES'";
@@ -105,20 +118,37 @@ bool iceberg_table_has_unsupported_deletes(duckdb::LogicalGet& op, duckdb::Clien
       SIRIUS_LOG_DEBUG(
         "[sirius_plan_get] iceberg delete probe: no SiriusContext — CPU fallback for '{}'",
         table_path);
-      return true;
+      return "the iceberg delete probe could not acquire the Sirius context, so the table could "
+             "not be proven free of equality-delete files";
     }
     duckdb::SiriusContext::InternalQueryGuard guard(*sirius_ctx);
 
     duckdb::Connection conn(*context.db);
+    // The probe runs on a FRESH connection, which does not inherit the session's settings. Without
+    // this, a table whose metadata carries no version hint fails the probe outright — and because
+    // any failure declines, a table with ZERO delete files was refused and told it had equality
+    // deletes. Only a user who had typed `SET GLOBAL unsafe_enable_version_guessing` (global scope
+    // reaches new connections; plain `SET` does not) ever got past this.
+    //
+    // Matches discover_from_manifests (iceberg_metadata_reader.cpp), which sets it on its own
+    // connection for the same reason. Both read the same manifests through iceberg_metadata(), so
+    // they must agree on which tables are legible; if they disagree, the gate's verdict is about a
+    // different table than the one the scan goes on to read.
+    conn.Query("SET unsafe_enable_version_guessing = true");
     auto result = conn.Query(query);
     if (!result || result->HasError()) {
       SIRIUS_LOG_DEBUG("[sirius_plan_get] iceberg delete probe failed for '{}': {} — CPU fallback",
                        table_path,
                        result ? result->GetError() : "null result");
-      return true;
+      return "the iceberg delete probe could not read this table's metadata (" +
+             std::string(result ? result->GetError() : "null result") +
+             "), so it could not be proven free of equality-delete files";
     }
     auto chunk = result->Fetch();
-    if (!chunk || chunk->size() == 0) { return true; }
+    if (!chunk || chunk->size() == 0) {
+      return "the iceberg delete probe returned no rows, so the table could not be proven free of "
+             "equality-delete files";
+    }
     auto const n_delete_files = chunk->GetValue(0, 0).GetValue<int64_t>();
     if (n_delete_files > 0) {
       SIRIUS_LOG_INFO(
@@ -126,14 +156,16 @@ bool iceberg_table_has_unsupported_deletes(duckdb::LogicalGet& op, duckdb::Clien
         "does not apply equality deletes yet — falling back to DuckDB CPU.",
         table_path,
         n_delete_files);
-      return true;
+      return "this iceberg table has " + std::to_string(n_delete_files) +
+             " equality-delete file(s), which the GPU scan path does not apply yet";
     }
-    return false;
+    return std::nullopt;
   } catch (std::exception const& e) {
     SIRIUS_LOG_DEBUG("[sirius_plan_get] iceberg delete probe threw for '{}': {} — CPU fallback",
                      table_path,
                      e.what());
-    return true;
+    return "the iceberg delete probe threw (" + std::string(e.what()) +
+           "), so the table could not be proven free of equality-delete files";
   }
 }
 
@@ -196,9 +228,10 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
   // batch. Equality deletes are not applied yet, and reading a table that has them as plain
   // parquet would silently return rows the table logically deleted — so refuse here, where
   // NotImplementedException is the established CPU-fallback signal.
-  if (op.function.name == "iceberg_scan" && iceberg_table_has_unsupported_deletes(op, context)) {
-    throw duckdb::NotImplementedException(
-      "Iceberg tables with equality-delete files are not yet supported on the GPU scan path");
+  if (op.function.name == "iceberg_scan") {
+    if (auto reason = iceberg_gpu_scan_decline_reason(op, context)) {
+      throw duckdb::NotImplementedException("iceberg_scan declines the GPU scan path: " + *reason);
+    }
   }
 
   if (!op.children.empty()) {
