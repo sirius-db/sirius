@@ -20,6 +20,12 @@ src/include/cudf/                   @sirius-db/sirius-core
 src/**/cuda/                        @sirius-db/sirius-core
 src/**/expression*/                 @sirius-db/sirius-core
 src/**/op/                          @sirius-db/sirius-core
+test/**/op/                         @sirius-db/sirius-core
+test/**/exec/                       @sirius-db/sirius-core
+test/**/pipeline/                   @sirius-db/sirius-core
+test/**/planner/                    @sirius-db/sirius-core
+test/**/expression*/                @sirius-db/sirius-core
+test/**/utils/                      @sirius-db/sirius-core
 
 # ── I/O (Scan, Compression & Memory) ──────────────────────────────────────────
 src/include/data/                   @sirius-db/sirius-io
@@ -30,6 +36,11 @@ src/**/scan*/                       @sirius-db/sirius-io
 src/compression/                    @sirius-db/sirius-io
 src/**/downgrade/                   @sirius-db/sirius-io
 src/**/memory/                      @sirius-db/sirius-io
+test/**/io/                         @sirius-db/sirius-io
+test/**/scan*/                      @sirius-db/sirius-io
+test/**/compression/                @sirius-db/sirius-io
+test/**/memory/                     @sirius-db/sirius-io
+test/**/downgrade/                  @sirius-db/sirius-io
 
 # ── Integrations ──────────────────────────────────────────────────────────────
 /cucascade/                         @sirius-db/sirius-integrations
@@ -38,6 +49,7 @@ src/**/memory/                      @sirius-db/sirius-io
 /substrait/                         @sirius-db/sirius-integrations
 /rust/crates/sirius*/               @sirius-db/sirius-integrations
 src/**/transparent/                 @sirius-db/sirius-integrations
+test/**/integration/                @sirius-db/sirius-integrations
 
 # ── Telemetry & Observability ─────────────────────────────────────────────────
 /rust/crates/telemetry/             @sirius-db/sirius-telemetry
