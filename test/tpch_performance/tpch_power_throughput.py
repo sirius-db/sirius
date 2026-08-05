@@ -300,6 +300,30 @@ def copy_database(src, dst):
         if os.path.exists(stale):
             os.remove(stale)
     shutil.copy2(src, dst)
+    _evict_page_cache(dst, dirty=True)
+    _evict_page_cache(src, dirty=False)
+
+
+def _evict_page_cache(path, dirty):
+    """Drop a file's page cache before LOADing Sirius.
+
+    On coherent-memory hosts (GB300) the copy's pages land partly on the GPU's
+    NUMA node and block the RMM pool allocation at extension load. The data is
+    re-read once for the pin and served from Sirius memory afterwards, so the
+    cache buys nothing. Dirty pages can't be dropped, hence the fsync first.
+    """
+    if not hasattr(os, "posix_fadvise"):
+        return
+    try:
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            if dirty:
+                os.fsync(fd)
+            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+        finally:
+            os.close(fd)
+    except OSError as e:
+        log(f"  page-cache eviction skipped for {path}: {e}")
 
 
 def open_benchmark_db(scratch_db, pin_tier, compression_plan_dir=None):
