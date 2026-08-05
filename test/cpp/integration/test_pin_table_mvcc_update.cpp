@@ -91,6 +91,66 @@ TEST_CASE_METHOD(PinMvccUpdateFixture,
 }
 
 TEST_CASE_METHOD(PinMvccUpdateFixture,
+                 "mvcc update guard: the writer transaction sees its own updated values",
+                 "[integration][gpu_execution][pin_table_mvcc_update]")
+{
+  run_ok("CREATE TABLE t AS SELECT range::INTEGER AS k, range::INTEGER AS v FROM range(1000);");
+  run_ok("CHECKPOINT;");
+  run_ok("CALL pin_table(format='duckdb', name='t', tier='gpu');");
+
+  run_ok("BEGIN TRANSACTION;");
+  run_ok("UPDATE t SET v = 77 WHERE k = 1;");
+  expect_runtime_fallback_matches_cpu(*this, "SELECT v FROM t WHERE k = 1;");
+  run_ok("COMMIT;");
+  run_ok("CALL unpin_table('t');");
+}
+
+TEST_CASE_METHOD(PinMvccUpdateFixture,
+                 "mvcc update guard: checkpoint and repin restore GPU cache serving",
+                 "[integration][gpu_execution][pin_table_mvcc_update]")
+{
+  run_ok("CREATE TABLE t AS SELECT range::INTEGER AS k, range::INTEGER AS v FROM range(1000);");
+  run_ok("CHECKPOINT;");
+  run_ok("CALL pin_table(format='duckdb', name='t', tier='gpu');");
+  run_ok("UPDATE t SET v = 99 WHERE k = 1;");
+
+  expect_runtime_fallback_matches_cpu(*this, "SELECT v FROM t WHERE k = 1;");
+  run_ok("CALL unpin_table('t');");
+  run_ok("CHECKPOINT;");
+  run_ok("CALL pin_table(format='duckdb', name='t', tier='gpu');");
+
+  // The checkpoint folds away the update chain and the refreshed pin contains
+  // the updated value, so the query must execute on GPU without a fallback.
+  compare_gpu_vs_cpu("SELECT v FROM t WHERE k = 1;");
+  run_ok("CALL unpin_table('t');");
+}
+
+TEST_CASE_METHOD(PinMvccUpdateFixture,
+                 "mvcc update guard: a checkpoint under a live pin never serves stale data",
+                 "[integration][gpu_execution][pin_table_mvcc_update]")
+{
+  run_ok("CREATE TABLE t AS SELECT range::INTEGER AS k, range::INTEGER AS v FROM range(1000);");
+  run_ok("CHECKPOINT;");
+  run_ok("CALL pin_table(format='duckdb', name='t', tier='gpu');");
+  run_ok("UPDATE t SET v = 99 WHERE k = 1;");
+
+  // CHECKPOINT folds away the update chain but does not refresh the pin. The
+  // checkpoint-generation guard must still reject the old cached image.
+  run_ok("CHECKPOINT;");
+  expect_runtime_fallback_matches_cpu(*this, "SELECT v FROM t WHERE k = 1;");
+
+  run_ok("SET enable_duckdb_fallback = false;");
+  auto result = con->Query("SELECT v FROM t WHERE k = 1;");
+  REQUIRE(result);
+  REQUIRE(result->HasError());
+  REQUIRE_THAT(result->GetError(), Catch::Contains("checkpointed after pin_table"));
+  REQUIRE_THAT(result->GetError(), Catch::Contains("CALL unpin_table('t')"));
+
+  run_ok("SET enable_duckdb_fallback = true;");
+  run_ok("CALL unpin_table('t');");
+}
+
+TEST_CASE_METHOD(PinMvccUpdateFixture,
                  "mvcc update guard: updates to insert-delta rows fall back",
                  "[integration][gpu_execution][pin_table_mvcc_update]")
 {

@@ -66,6 +66,7 @@ extern "C" int cudaProfilerStop();
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/qualified_name.hpp"
 #include "duckdb/planner/planner.hpp"
+#include "duckdb/storage/single_file_block_manager.hpp"
 #include "duckdb/storage/storage_manager.hpp"
 #include "duckdb/transaction/duck_transaction.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
@@ -1254,7 +1255,8 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
   vector<LogicalType> pinned_column_types;
   // The pin transaction's MVCC fence on the pinned table's own AttachedDatabase;
   // meaningful only for format == "duckdb" (see duckdb_mvcc_metadata::v_base).
-  transaction_t duckdb_pin_v_base = 0;
+  transaction_t duckdb_pin_v_base               = 0;
+  std::uint64_t duckdb_pin_checkpoint_iteration = 0;
 
   if (data.args.format == "duckdb") {
     auto info = build_duckdb_pin_info(
@@ -1266,9 +1268,15 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
     // start_time domain, and pins usually target an ATTACHed .db (the catalog
     // resolved by build_duckdb_pin_info), so read the fence off that catalog's
     // DuckTransaction.
-    auto& pinned_catalog = Catalog::GetCatalog(context, info->catalog_name);
-    duckdb_pin_v_base    = DuckTransaction::Get(context, pinned_catalog).start_time;
-    ingestible           = sirius::op::scan::make_ingestible(std::move(info));
+    auto& pinned_catalog      = Catalog::GetCatalog(context, info->catalog_name);
+    duckdb_pin_v_base         = DuckTransaction::Get(context, pinned_catalog).start_time;
+    auto const* block_manager = dynamic_cast<SingleFileBlockManager const*>(
+      &info->storage->GetAttached().GetStorageManager().GetBlockManager());
+    if (block_manager == nullptr) {
+      throw InvalidInputException("pin_table: DuckDB-native pins require a single-file database");
+    }
+    duckdb_pin_checkpoint_iteration = block_manager->GetCheckpointIteration();
+    ingestible                      = sirius::op::scan::make_ingestible(std::move(info));
   } else {  // parquet
     auto& fs   = FileSystem::GetFileSystem(context);
     auto files = fs.GlobFiles(data.args.path);
@@ -1400,6 +1408,7 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
       sirius::scan_manager::duckdb_mvcc_metadata mvcc;
       mvcc.v_base                   = duckdb_pin_v_base;
       mvcc.base_row_count_per_chunk = std::move(host_result.base_row_count_per_chunk);
+      mvcc.checkpoint_iteration     = duckdb_pin_checkpoint_iteration;
       scan_mgr.attach_mvcc_metadata(data.args.name, std::move(mvcc));
     }
   } else if (pin_comp.enabled) {
@@ -1426,6 +1435,7 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
       sirius::scan_manager::duckdb_mvcc_metadata mvcc;
       mvcc.v_base                   = duckdb_pin_v_base;
       mvcc.base_row_count_per_chunk = std::move(dev_result.base_row_count_per_chunk);
+      mvcc.checkpoint_iteration     = duckdb_pin_checkpoint_iteration;
       scan_mgr.attach_mvcc_metadata(data.args.name, std::move(mvcc));
     }
   } else {
@@ -1452,6 +1462,7 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
       sirius::scan_manager::duckdb_mvcc_metadata mvcc;
       mvcc.v_base                   = duckdb_pin_v_base;
       mvcc.base_row_count_per_chunk = std::move(base_row_count_per_chunk);
+      mvcc.checkpoint_iteration     = duckdb_pin_checkpoint_iteration;
       scan_mgr.attach_mvcc_metadata(data.args.name, std::move(mvcc));
     }
   }

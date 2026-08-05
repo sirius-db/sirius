@@ -581,6 +581,23 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
     return;
   }
 
+  // A manual CHECKPOINT can replace DuckDB's on-disk base while the pinned
+  // cache still holds the preceding image. Auto-checkpoint is suppressed for
+  // pins, but explicit checkpoints remain possible; reject a changed database
+  // generation before serving any cached rows.
+  for (auto const& request : _pending_mvcc_mask_jobs) {
+    auto const* block_manager = dynamic_cast<duckdb::SingleFileBlockManager const*>(
+      &request.storage->GetAttached().GetStorageManager().GetBlockManager());
+    if (block_manager == nullptr ||
+        block_manager->GetCheckpointIteration() != request.metadata.checkpoint_iteration) {
+      throw std::runtime_error(
+        "Sirius cannot safely scan pinned DuckDB table '" + request.entry_name +
+        "': its database was checkpointed after pin_table, so the pinned cache may be stale. "
+        "Run CALL unpin_table('" +
+        request.entry_name + "'), then pin_table again");
+    }
+  }
+
   // DuckDB UPDATE chains version column values in place. The cached base and
   // insert-delta decoders read the underlying pre-update values, while the
   // visibility masks below can only keep or discard whole rows. Refuse before
