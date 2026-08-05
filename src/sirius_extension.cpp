@@ -1677,6 +1677,7 @@ static void throw_if_sirius_runtime_unavailable(ClientContext& context)
   }
 }
 
+#ifdef SIRIUS_ENABLE_LEGACY
 static void SetUsePinMemory(ClientContext& context, SetScope scope, Value& parameter)
 {
   throw_if_sirius_runtime_unavailable(context);
@@ -1698,6 +1699,7 @@ static void SetUseCudfExpr(ClientContext& context, SetScope scope, Value& parame
   Config::USE_CUDF_EXPR = BooleanValue::Get(parameter);
   SIRIUS_LOG_DEBUG("Updated config USE_CUDF_EXPR to {}", Config::USE_CUDF_EXPR);
 }
+#endif
 
 static void ApplyExpressionEvaluatorStrategy(const std::string& value)
 {
@@ -1734,6 +1736,7 @@ static void SetExpressionExecutorStrategyDeprecated(ClientContext& context,
   ApplyExpressionEvaluatorStrategy(StringValue::Get(parameter));
 }
 
+#ifdef SIRIUS_ENABLE_LEGACY
 static void SetUseCustomTopN(ClientContext& context, SetScope scope, Value& parameter)
 {
   throw_if_sirius_runtime_unavailable(context);
@@ -1778,6 +1781,7 @@ static void SetEnableFallbackCheck(ClientContext& context, SetScope scope, Value
   Config::ENABLE_FALLBACK_CHECK = BooleanValue::Get(parameter);
   SIRIUS_LOG_DEBUG("Updated config ENABLE_FALLBACK_CHECK to {}", Config::ENABLE_FALLBACK_CHECK);
 }
+#endif
 
 static void SetEnableDuckdbFallback(ClientContext& /*context*/,
                                     SetScope /*scope*/,
@@ -1797,12 +1801,14 @@ static void SetEnableRegexJitImpl(ClientContext& context, SetScope scope, Value&
   SIRIUS_LOG_DEBUG("Updated config ENABLE_REGEX_JIT_IMPL to {}", Config::ENABLE_REGEX_JIT_IMPL);
 }
 
+#ifdef SIRIUS_ENABLE_LEGACY
 static void SetModifiedPipeline(ClientContext& context, SetScope scope, Value& parameter)
 {
   throw_if_sirius_runtime_unavailable(context);
   Config::MODIFIED_PIPELINE = BooleanValue::Get(parameter);
   SIRIUS_LOG_DEBUG("Updated config MODIFIED_PIPELINE to {}", Config::MODIFIED_PIPELINE);
 }
+#endif
 
 static void SetFuseMergePipelines(ClientContext& /*context*/,
                                   SetScope /*scope*/,
@@ -2098,6 +2104,7 @@ static void SetEnableCompressedMaterialization(ClientContext& /*context*/,
 
 void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::operator_params& defaults)
 {
+#ifdef SIRIUS_ENABLE_LEGACY
   // Add in config option for gpu buffer manager
   config.AddExtensionOption("use_pin_memory",
                             "Whether or not the buffer manager is initialized with pinned memory",
@@ -2118,6 +2125,7 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::operator
                             LogicalType::BOOLEAN,
                             Value::BOOLEAN(Config::USE_CUDF_EXPR),
                             SetUseCudfExpr);
+#endif
 
   config.AddExtensionOption(
     "expression_evaluator_strategy",
@@ -2136,6 +2144,7 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::operator
     Value(std::string(sirius::strategy_to_string(Config::EXPRESSION_EVALUATOR_STRATEGY))),
     SetExpressionExecutorStrategyDeprecated);
 
+#ifdef SIRIUS_ENABLE_LEGACY
   // Add in config option for top-N
   config.AddExtensionOption("use_custom_top_n",
                             "Whether or not custom kernel is used to evalaute top n",
@@ -2173,6 +2182,7 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::operator
                             LogicalType::BOOLEAN,
                             Value::BOOLEAN(Config::ENABLE_FALLBACK_CHECK),
                             SetEnableFallbackCheck);
+#endif
 
   config.AddExtensionOption(
     "enable_duckdb_fallback",
@@ -2200,12 +2210,14 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::operator
     Value::BOOLEAN(Config::ENABLE_REGEX_JIT_IMPL),
     SetEnableRegexJitImpl);
 
+#ifdef SIRIUS_ENABLE_LEGACY
   // Add in config options for modified pipeline
   config.AddExtensionOption("modified_pipeline",
                             "Whether to use modified pipeline for GPU execution",
                             LogicalType::BOOLEAN,
                             Value::BOOLEAN(Config::MODIFIED_PIPELINE),
                             SetModifiedPipeline);
+#endif
 
   config.AddExtensionOption("fuse_merge_pipelines",
                             "Fuse eligible GROUP BY and TOP_N merges into downstream pipelines",

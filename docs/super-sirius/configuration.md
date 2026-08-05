@@ -493,22 +493,13 @@ Registered in `src/sirius_extension.cpp`. These can be changed at runtime:
 These can also be set at load via the `SIRIUS_LOG_BACKEND`, `SIRIUS_LOG_DIR`, and
 `SIRIUS_LOG_LEVEL` environment variables.
 
-### Memory
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `use_pin_memory` | true | Use pinned memory for CPU↔GPU transfers |
-| `use_pin_memory_for_caching` | false | Use pinned memory for scan caching |
-
 ### Expression Evaluation
 
 **File:** `src/include/expression_evaluator/expression_evaluator_strategy.hpp`
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `use_cudf_expr` | true | Use cuDF-based expression evaluation |
 | `expression_evaluator_strategy` | `ast_interpret` | Expression evaluator strategy: `materialize`, `ast_interpret`, or `ast_jit` |
-| `use_custom_top_n` | false | Use custom top-N implementation |
 
 `expression_executor_strategy` remains registered as a deprecated compatibility alias for
 `expression_evaluator_strategy`; new configuration should use the evaluator name.
@@ -517,9 +508,6 @@ These can also be set at load via the `SIRIUS_LOG_BACKEND`, `SIRIUS_LOG_DIR`, an
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `use_opt_table_scan` | - | Enable optimized table scan |
-| `opt_table_scan_num_streams` | - | Number of CUDA streams for optimized scan |
-| `opt_table_scan_memcpy_size` | - | Memcpy size for optimized scan |
 | `scan_task_batch_size` | 2.5% of GPU mem (512 MiB – 5 GiB) | Target scan batch size |
 | `enable_compressed_materialization` | true | Keep eligible integer and fixed-point DECIMAL values in narrower physical carriers until a native semantic boundary. |
 
@@ -540,7 +528,6 @@ SET enable_compressed_materialization = false;
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `modified_pipeline` | - | Enable modified pipeline execution |
 | `fuse_merge_pipelines` | true | Fuse eligible GROUP BY / TOP_N merges into their downstream pipeline instead of cutting a boundary (see [physical-plan-generation.md](physical-plan-generation.md) → Merge fusion) |
 | `max_sort_partition_bytes` | 0 (auto) | Max sort partition bytes |
 | `max_sort_partition_memory_fraction` | 0.33 | Auto sort-partition fraction when `max_sort_partition_bytes` is 0 |
@@ -595,13 +582,33 @@ SET enable_pinned_zone_map_pruning = false;
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `print_gpu_table_max_rows` | - | Max rows to print in debug output |
-| `enable_fallback_check` | - | Enable fallback validation |
 | `enable_duckdb_fallback` | true | Fall back to DuckDB CPU execution on Sirius errors. Gates both plan-time fallback (unsupported operator/type) and runtime fallback (GPU execution failure) on the transparent path, plus the legacy `CALL gpu_execution(...)` path. Set to `false` to surface Sirius errors instead of falling back. |
 | `enable_regex_jit_impl` | - | Use JIT regex implementation |
 
 
 ## Legacy Config Flags
+
+### Legacy-release DuckDB settings
+
+The following settings only control the legacy `gpu_processing` path. Sirius registers them
+when built with `ENABLE_LEGACY_SIRIUS=ON`, including the `legacy-release` preset used by
+`make legacy-release`. Normal builds omit them from `duckdb_settings()` and reject attempts to
+`SET` them.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `use_pin_memory` | true | Use pinned memory for legacy CPU↔GPU transfers |
+| `use_pin_memory_for_caching` | false | Use pinned memory for the legacy scan cache |
+| `use_cudf_expr` | true | Use cuDF in the legacy expression executor |
+| `use_custom_top_n` | true | Use the legacy custom top-N kernel |
+| `use_opt_table_scan` | true | Use the legacy optimized table scan |
+| `opt_table_scan_num_streams` | 8 | CUDA streams used by the legacy optimized scan |
+| `opt_table_scan_memcpy_size` | 64 MiB | Copy chunk size used by the legacy optimized scan |
+| `print_gpu_table_max_rows` | 1000 | Maximum rows rendered by the legacy GPU-table printer |
+| `enable_fallback_check` | false | Enable legacy fallback validation |
+| `modified_pipeline` | false | Enable legacy modified-pipeline scheduling |
+
+### Static flags
 
 **File:** `src/include/config.hpp`
 
