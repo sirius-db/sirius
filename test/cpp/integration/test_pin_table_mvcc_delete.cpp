@@ -23,9 +23,9 @@
 // results, never the MVCC-blind disk-native read. Cache-served queries keep
 // the {1, 0, 1} signature compare_gpu_vs_cpu asserts.
 //
-// Walk-based guards (post-pin UPDATE chains on pinned tables; scans of
-// unpinned tables, #1143) are disabled in the planner — #1160 tracks the
-// execution-time replacement; their coverage lands with that work.
+// Walk-based guards for unpinned tables (#1143) remain disabled in the
+// planner. Post-pin UPDATE chains are rejected during scan-manager query
+// preparation, before cached rows can be served (partial #1160).
 
 #include <catch.hpp>
 #include <duckdb.hpp>

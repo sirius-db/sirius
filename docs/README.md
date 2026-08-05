@@ -99,6 +99,12 @@ CALL unpin_table('lineitem');
 `tier = 'gpu'` pins columns in GPU memory for the fastest scans; `tier = 'host'` pins them in
 pinned host memory instead, for tables larger than GPU memory.
 
+DuckDB base tables remain writable while pinned. Deletes and committed inserts are reconciled
+per query. If an `UPDATE` changes a column used by a query, Sirius does not serve stale cached
+values: with the default `enable_duckdb_fallback = true` the query runs on DuckDB CPU in the same
+transaction; with fallback disabled it returns a clear error. To resume GPU cache serving, run
+`CALL unpin_table(...)`, then `CHECKPOINT`, then pin the table again.
+
 ## Configuration
 
 Sirius loads its settings from a YAML config file, searched in this order:

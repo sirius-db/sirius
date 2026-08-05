@@ -76,6 +76,9 @@ struct insert_delta_bundle {
  * One pending insert-delta computation for a pinned entry, recorded by the
  * cache-match pass and run before serving starts. Deduped per entry: a
  * self-join queues one request holding the union of the operators' columns.
+ * Queued unconditionally even when the entry currently has no delta: query
+ * preparation also uses that union to reject UPDATE chains before serving the
+ * pinned cache.
  */
 struct insert_delta_job_request {
   duckdb::DataTable* storage{nullptr};
