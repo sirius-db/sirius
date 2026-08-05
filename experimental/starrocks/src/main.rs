@@ -3,15 +3,15 @@ use std::{num::NonZeroU32, path::PathBuf, sync::Arc, time::Duration};
 use anyhow::{Result, anyhow};
 use backon::{ExponentialBuilder, Retryable};
 use clap::Parser;
-#[cfg(feature = "sirius-engine")]
-use sirius_starrocks_cn::{EngineSettings, SiriusEngine, derive_sirius_config_yaml};
 #[cfg(not(feature = "sirius-engine"))]
 use sirius_starrocks_cn::StubExecutor;
 use sirius_starrocks_cn::{
-    BackendServer, BrpcServer, ComputeNodeConfig, FeConfig, FragmentExecutor, HeartbeatServer,
-    SharedHeartbeatState, register_node, report_to_frontend_once, start_backend_server,
-    start_heartbeat_server,
+    BackendServer, BrpcServer, ComputeNodeConfig, ExchangeIdentity, FeConfig, FragmentExecutor,
+    HeartbeatServer, SharedHeartbeatState, register_node, report_to_frontend_once,
+    start_backend_server, start_heartbeat_server,
 };
+#[cfg(feature = "sirius-engine")]
+use sirius_starrocks_cn::{EngineSettings, SiriusEngine, derive_sirius_config_yaml};
 use tokio::task::{JoinError, JoinSet};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
@@ -473,6 +473,9 @@ impl BrpcRuntime {
         executor: Arc<dyn FragmentExecutor>,
     ) -> Result<Self> {
         let listener = BrpcServer::bind(compute_node.bind_host.as_str(), compute_node.brpc_port)?;
+        // The identity the FE routes exchanges by: the advertised host plus this brpc port.
+        let identity =
+            ExchangeIdentity::new(compute_node.advertise_host.as_str(), compute_node.brpc_port);
         let shutdown = CancellationToken::new();
         let server_shutdown = shutdown.clone();
         let join = tokio::task::spawn_blocking(move || {
@@ -481,7 +484,7 @@ impl BrpcRuntime {
                 .build()
                 .map_err(|err| anyhow!("failed to create BRPC service runtime: {err}"))?;
             runtime.block_on(
-                BrpcServer::with_executor(executor)
+                BrpcServer::with_executor(executor, identity)
                     .serve_with_listener_shutdown(listener, server_shutdown.cancelled_owned()),
             )
         });

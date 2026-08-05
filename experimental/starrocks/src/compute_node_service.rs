@@ -1,26 +1,27 @@
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 
 #[cfg(test)]
 use crate::fragment_executor::StubExecutor;
 use crate::fragment_executor::{FragmentExecutor, FragmentRun, SenderSlot};
-use crate::local_exchange::{ExchangeKey, LocalExchange, ReadyFragment, SenderOutput};
+use crate::local_exchange::{ExchangeKey, LocalExchange, ReadyFragment, SenderSource};
 use crate::proto::starrocks::{
     PExecBatchPlanFragmentsRequest, PExecBatchPlanFragmentsResult, PExecPlanFragmentRequest,
     PExecPlanFragmentResult, PFetchDataRequest, PFetchDataResult, PGetFileSchemaRequest,
     PGetFileSchemaResult, PSlotDescriptor, StatusPb, p_internal_service_brpc::PInternalService,
 };
 use crate::result_encoder::{self, ThriftBinary};
-use crate::result_store::{FragmentInstanceId, ResultStore};
+use crate::result_store::{FetchOutcome, FragmentInstanceId, ResultStore};
 use starrocks_plan_translator::{ExchangeInput, PlanTranslator, TranslatedPlan};
 use starrocks_thrift::{
-    data_sinks::{TDataSinkType, TResultSinkType},
+    data_sinks::{TDataSinkType, TPlanFragmentDestination, TResultSinkType},
     descriptors::TDescriptorTable,
     internal_service::{
         TExecBatchPlanFragmentsParams, TExecPlanFragmentParams, TGetFileSchemaRequest,
     },
     plan_nodes::TFileFormatType,
     status_code::TStatusCode,
+    types::TNetworkAddress,
 };
 use thrift::{
     protocol::{TBinaryInputProtocol, TSerializable},
@@ -45,43 +46,139 @@ fn sirius_stream_view_name(stream_id: u64) -> String {
     }
 }
 
+/// The exchange endpoint this CN is known by to the FE: advertised host plus brpc port.
+///
+/// A data-stream sink destination is classified against it before the sender runs: a match
+/// keeps the exchange in-process, anything else is a remote CN.
+#[derive(Clone, Debug)]
+pub struct ExchangeIdentity {
+    host: String,
+    brpc_port: u16,
+}
+
+impl ExchangeIdentity {
+    /// Builds the identity from the CN's advertised host and brpc port (`ComputeNodeConfig`).
+    pub fn new(host: impl Into<String>, brpc_port: u16) -> Self {
+        Self {
+            host: host.into(),
+            brpc_port,
+        }
+    }
+
+    /// Hostname AND port equality — the stock BE's locality rule (`exchange_sink_operator.cpp`
+    /// compares both), which is exactly what makes two CNs on one host see each other as remote.
+    fn matches(&self, addr: &TNetworkAddress) -> bool {
+        addr.hostname == self.host && addr.port == i32::from(self.brpc_port)
+    }
+}
+
+/// Where a data-stream sink's single destination lives relative to this CN. Decided before the
+/// sender fragment runs; the cross-node transport (PLAN-PATH-B B5) implements the `Remote` arm.
+#[derive(Debug)]
+enum DestinationRoute {
+    /// The receiver is this process: park output on the GPU and rendezvous in-memory.
+    Local,
+    /// The receiver is another CN, reached via its advertised brpc endpoint.
+    Remote { host: String, brpc_port: i32 },
+}
+
 /// Sirius compute-node implementation of StarRocks PInternalService.
 ///
 /// Plan-fragment translation is the first implemented RPC path; future
 /// compute-node tasks should land here behind the generated service facade.
 #[derive(Clone, Debug)]
 pub(crate) struct SiriusComputeNodeService {
+    /// Fragment-processing state shared across BRPC connections and the dispatch worker.
+    core: Arc<ServiceCore>,
+    /// Hands ready receiver fragments to the dispatch worker instead of executing them on the
+    /// RPC thread that completed the sender set.
+    ready_fragments: mpsc::Sender<ReadyFragment>,
+}
+
+/// Shared state behind every clone of [`SiriusComputeNodeService`].
+///
+/// One `Arc` so a `fetch_data` poll on one BRPC connection sees what an `exec_plan_fragment` on
+/// another buffered — and so the dispatch worker holds the state (executor included) without
+/// holding a `ready_fragments` sender, letting the channel close and the worker exit when the
+/// last service clone drops. That keeps engine teardown ordered behind the servers.
+#[derive(Debug)]
+struct ServiceCore {
     /// Reusable StarRocks thrift-to-Substrait fragment translator.
     translator: PlanTranslator,
     /// Executes a translated fragment into Arrow result batches. Production injects the GPU-backed
-    /// `SiriusEngine` (via [`with_executor`](Self::with_executor)); tests use a stub.
+    /// `SiriusEngine` (via [`SiriusComputeNodeService::with_executor`]); tests use a stub.
     executor: Arc<dyn FragmentExecutor>,
-    /// Buffers executed-fragment results for FE `fetch_data` collection. Shared across BRPC
-    /// connections so a `fetch_data` poll sees what an `exec_plan_fragment` buffered.
-    results: Arc<ResultStore>,
-    /// Sequential same-node fragment exchange state, shared across BRPC connections.
-    exchanges: Arc<LocalExchange>,
+    /// Buffers executed-fragment results for FE `fetch_data` collection.
+    results: ResultStore,
+    /// Sequential same-node fragment exchange state.
+    exchanges: LocalExchange,
     /// StarRocks may send a descriptor table once per query and mark later fragments as cached.
-    descriptor_tables: Arc<Mutex<HashMap<FragmentInstanceId, TDescriptorTable>>>,
+    descriptor_tables: Mutex<HashMap<FragmentInstanceId, TDescriptorTable>>,
+    /// The exchange endpoint this CN advertises; destinations matching it are local.
+    identity: ExchangeIdentity,
 }
 
 impl SiriusComputeNodeService {
-    /// Test-only constructor with the placeholder [`StubExecutor`]. Production injects a real
-    /// executor via [`with_executor`](Self::with_executor).
+    /// Test-only constructor with the placeholder [`StubExecutor`] and the default local
+    /// identity. Production injects both via [`with_executor`](Self::with_executor).
     #[cfg(test)]
     pub(crate) fn new() -> Self {
-        Self::with_executor(Arc::new(StubExecutor))
+        Self::with_executor(
+            Arc::new(StubExecutor),
+            ExchangeIdentity::new("127.0.0.1", 8060),
+        )
     }
 
     /// Builds the service with a caller-provided fragment executor (e.g. the GPU-backed
-    /// `SiriusEngine`), shared across BRPC connections via the `Arc`.
-    pub(crate) fn with_executor(executor: Arc<dyn FragmentExecutor>) -> Self {
-        Self {
+    /// `SiriusEngine`) and this CN's advertised exchange identity, shared across BRPC
+    /// connections via the `Arc`. Also spawns the fragment dispatch worker.
+    pub(crate) fn with_executor(
+        executor: Arc<dyn FragmentExecutor>,
+        identity: ExchangeIdentity,
+    ) -> Self {
+        let core = Arc::new(ServiceCore {
             translator: PlanTranslator::new(),
             executor,
-            results: Arc::new(ResultStore::default()),
-            exchanges: Arc::new(LocalExchange::default()),
-            descriptor_tables: Arc::new(Mutex::new(HashMap::new())),
+            results: ResultStore::default(),
+            exchanges: LocalExchange::default(),
+            descriptor_tables: Mutex::new(HashMap::new()),
+            identity,
+        });
+        // A dedicated thread with a std channel (not a tokio task): fragment execution is
+        // synchronous and blocking, so it gets the same dedicated-thread shape as the engine
+        // itself, and the BRPC current-thread runtime is never involved.
+        let (ready_fragments, worker_inbox) = mpsc::channel();
+        let worker_core = Arc::clone(&core);
+        std::thread::Builder::new()
+            .name("fragment-dispatch".to_string())
+            .spawn(move || dispatch_worker(worker_core, worker_inbox))
+            .expect("failed to spawn fragment dispatch worker");
+        Self {
+            core,
+            ready_fragments,
+        }
+    }
+
+    /// Hands a ready receiver to the dispatch worker so this RPC thread returns immediately
+    /// instead of blocking on the receiver's whole execution.
+    fn dispatch(&self, ready: ReadyFragment) -> std::result::Result<(), String> {
+        self.ready_fragments.send(ready).map_err(|_| {
+            "fragment dispatch worker has exited; cannot execute receiver fragment".to_string()
+        })
+    }
+}
+
+/// Executes ready receiver fragments sequentially, off the RPC threads.
+///
+/// Exits when every service clone has dropped its sender; the worker then releases its core
+/// handle (and with it the executor), keeping engine teardown ordered.
+fn dispatch_worker(core: Arc<ServiceCore>, inbox: mpsc::Receiver<ReadyFragment>) {
+    while let Ok(ready) = inbox.recv() {
+        // A receiver can itself be a sender whose completion readies the next receiver (a
+        // middle fragment); chase that chain inline — this thread is already off the RPC path.
+        let mut next = Some(ready);
+        while let Some(ready) = next.take() {
+            next = core.run_ready_fragment(ready);
         }
     }
 }
@@ -156,7 +253,7 @@ impl PInternalService for SiriusComputeNodeService {
         // An unknown id is an error, not EOS: it means this CN never buffered a result for the
         // fragment the FE is polling (wrong id, or a dispatch/result-sink path that did not run),
         // and StarRocks treats a missing result buffer as a failure rather than an empty result.
-        let Some(outcome) = self.results.take_next(id) else {
+        let Some(outcome) = self.core.results.take_next(id) else {
             return Ok(Self::fetch_data_result(
                 Self::internal_error(format!("no buffered result for fragment instance {id}")),
                 0,
@@ -164,22 +261,31 @@ impl PInternalService for SiriusComputeNodeService {
             )
             .into());
         };
-        match outcome.batch {
-            Some(batch) => match batch.to_binary() {
+        match outcome {
+            FetchOutcome::Failed(cause) => Ok(Self::fetch_data_result(
+                Self::internal_error(format!("fragment instance {id} failed: {cause}")),
+                0,
+                true,
+            )
+            .into()),
+            FetchOutcome::Rows {
+                batch: Some(batch),
+                packet_seq,
+                eos,
+            } => match batch.to_binary() {
                 Ok(bytes) => Ok(crate::prpc::Reply::with_attachment(
-                    Self::fetch_data_result(Self::ok_status(), outcome.packet_seq, outcome.eos),
+                    Self::fetch_data_result(Self::ok_status(), packet_seq, eos),
                     bytes,
                 )),
-                Err(err) => Ok(Self::fetch_data_result(
-                    Self::internal_error(err),
-                    outcome.packet_seq,
-                    true,
-                )
-                .into()),
+                Err(err) => {
+                    Ok(Self::fetch_data_result(Self::internal_error(err), packet_seq, true).into())
+                }
             },
-            None => Ok(
-                Self::fetch_data_result(Self::ok_status(), outcome.packet_seq, outcome.eos).into(),
-            ),
+            FetchOutcome::Rows {
+                batch: None,
+                packet_seq,
+                eos,
+            } => Ok(Self::fetch_data_result(Self::ok_status(), packet_seq, eos).into()),
         }
     }
 
@@ -205,7 +311,8 @@ impl PInternalService for SiriusComputeNodeService {
 }
 
 impl SiriusComputeNodeService {
-    /// Deserializes one binary-thrift TExecPlanFragmentParams attachment and processes it.
+    /// Deserializes one binary-thrift TExecPlanFragmentParams attachment and processes it,
+    /// handing any completed receiver to the dispatch worker.
     fn exec_single_attachment(
         &self,
         protocol: Option<&str>,
@@ -214,16 +321,60 @@ impl SiriusComputeNodeService {
         Self::ensure_binary_protocol(protocol)?;
         let params = Self::deserialize_binary::<TExecPlanFragmentParams>(attachment)
             .map_err(|err| format!("failed to deserialize TExecPlanFragmentParams: {err}"))?;
-        self.process_fragment(&params)
+        if let Some(ready) = self.core.process_fragment(&params)? {
+            self.dispatch(ready)?;
+        }
+        Ok(())
+    }
+}
+
+impl ServiceCore {
+    /// Runs one dispatched receiver, parking a failure where `fetch_data` can see it. Returns
+    /// the next receiver when this fragment's own sink completed another sender set.
+    fn run_ready_fragment(&self, ready: ReadyFragment) -> Option<ReadyFragment> {
+        let id = Self::fragment_instance_id(&ready.params);
+        let is_result_fragment = matches!(Self::is_mysql_result_sink(&ready.params), Ok(true));
+        match self.execute_ready_fragment(ready) {
+            Ok(next) => next,
+            Err(error) => {
+                match id {
+                    Some(id) if is_result_fragment => {
+                        // The FE polls fetch_data on this id; its reserved entry becomes the
+                        // error instead of waiting forever.
+                        tracing::error!(fragment_instance_id = %id, error = %error, "dispatched result fragment failed");
+                        self.results.fail(id, error);
+                    }
+                    Some(id) => {
+                        // An intermediate receiver has no reserved result entry, and the result
+                        // fragment downstream of it keeps reporting not-ready until the FE times
+                        // out — full cancellation propagation is out of scope for this branch
+                        // (PLAN-PATH-B cuts M4). Park the error under this id anyway so any poll
+                        // against it fails loudly instead of reading as unknown.
+                        tracing::error!(
+                            fragment_instance_id = %id,
+                            error = %error,
+                            "dispatched intermediate receiver fragment failed; its downstream result fragment will wait until the FE times out"
+                        );
+                        self.results.fail(id, error);
+                    }
+                    None => {
+                        tracing::error!(error = %error, "dispatched receiver fragment without a fragment_instance_id failed");
+                    }
+                }
+                None
+            }
+        }
     }
 
     /// Processes one fragment and buffers supported RESULT_SINK rows for later `fetch_data`.
     /// Shared by single and batch dispatch; exchange receivers are registered until their local
-    /// sender output is materialized.
+    /// sender output is materialized. Returns a receiver whose sender set this fragment
+    /// completed — the caller decides where it executes (RPC handlers hand it to the dispatch
+    /// worker; the worker itself runs it inline).
     fn process_fragment(
         &self,
         params: &TExecPlanFragmentParams,
-    ) -> std::result::Result<(), String> {
+    ) -> std::result::Result<Option<ReadyFragment>, String> {
         let params = self.resolve_descriptor_table(params)?;
         Self::dump_fragment(&params);
         // Survey mode: accept every fragment so the FE dispatches (and we dump) the whole
@@ -232,7 +383,7 @@ impl SiriusComputeNodeService {
             if let Err(err) = self.translate_fragment_logged(&params) {
                 tracing::warn!(error = %err, "translate-only mode: accepting untranslatable fragment");
             }
-            return Ok(());
+            return Ok(None);
         }
         let expected_senders = Self::receiver_exchanges(&params)?;
         if !expected_senders.is_empty() {
@@ -241,13 +392,11 @@ impl SiriusComputeNodeService {
             if Self::is_mysql_result_sink(&params)? {
                 self.results.reserve(fragment_instance_id);
             }
-            let ready =
-                self.exchanges
-                    .register_receiver(fragment_instance_id, expected_senders, params)?;
-            if let Some(ready) = ready {
-                self.execute_ready_fragment(ready)?;
-            }
-            return Ok(());
+            return self.exchanges.register_receiver(
+                fragment_instance_id,
+                expected_senders,
+                params,
+            );
         }
 
         let translated = self.translate_fragment_logged(&params)?;
@@ -311,18 +460,20 @@ impl SiriusComputeNodeService {
         &self,
         params: &TExecPlanFragmentParams,
         translated: TranslatedPlan,
-    ) -> std::result::Result<(), String> {
+    ) -> std::result::Result<Option<ReadyFragment>, String> {
         self.execute_fragment_with_inputs(params, translated, Vec::new())
     }
 
     /// Executes a result fragment, or runs a data-stream sender and parks its output on the GPU
     /// for its local receiver. `inputs` names the parked sender outputs this fragment consumes.
+    /// A sender that completes its receiver's sender set returns that receiver for the caller
+    /// to run or dispatch.
     fn execute_fragment_with_inputs(
         &self,
         params: &TExecPlanFragmentParams,
         translated: TranslatedPlan,
         inputs: Vec<(i32, Vec<SenderSlot>)>,
-    ) -> std::result::Result<(), String> {
+    ) -> std::result::Result<Option<ReadyFragment>, String> {
         if Self::is_mysql_result_sink(params)? {
             let id = Self::fragment_instance_id(params).ok_or_else(|| {
                 "RESULT_SINK fragment is missing a fragment_instance_id".to_string()
@@ -337,7 +488,7 @@ impl SiriusComputeNodeService {
                 .ok_or_else(|| "result fragment returned no rows".to_string())?;
             let batch = result_encoder::MysqlResultEncoder::encode(&result.batches, 0)?;
             self.results.insert(id, batch);
-            return Ok(());
+            return Ok(None);
         }
 
         let Some(stream_sink) = params
@@ -347,7 +498,7 @@ impl SiriusComputeNodeService {
             .filter(|sink| sink.type_ == TDataSinkType::DATA_STREAM_SINK)
             .and_then(|sink| sink.stream_sink.as_ref())
         else {
-            return Ok(());
+            return Ok(None);
         };
         if stream_sink.limit.is_some_and(|limit| limit >= 0) {
             return Err("data stream sink limits are not supported".to_string());
@@ -391,46 +542,87 @@ impl SiriusComputeNodeService {
             sender_id,
         };
 
-        // The sender's rows stay on the GPU, parked under `slot` as native batches; only the
-        // rendezvous bookkeeping — which sender produced, and its output names — comes back here.
-        self.executor.run(FragmentRun {
-            plan: &translated,
-            inputs,
-            output: Some(slot),
-        })?;
+        // Route before running: a remote destination must fail before any GPU work happens.
+        match self.route_destination(destination)? {
+            DestinationRoute::Local => {
+                // The sender's rows stay on the GPU, parked under `slot` as native batches; only
+                // the rendezvous bookkeeping — which sender produced, and its output names —
+                // comes back here.
+                self.executor.run(FragmentRun {
+                    plan: &translated,
+                    inputs,
+                    output: Some(slot),
+                })?;
 
-        let ready = self.exchanges.push_sender(
-            ExchangeKey {
-                fragment_instance_id: slot.fragment_instance_id,
-                node_id: slot.node_id,
-            },
-            sender_id,
-            SenderOutput {
-                names: translated.output_names,
-                slot,
-            },
-        )?;
-        if let Some(ready) = ready {
-            self.execute_ready_fragment(ready)?;
+                self.exchanges.push_sender(
+                    ExchangeKey {
+                        fragment_instance_id: slot.fragment_instance_id,
+                        node_id: slot.node_id,
+                    },
+                    sender_id,
+                    SenderSource::LocalParked {
+                        names: translated.output_names,
+                        slot,
+                    },
+                )
+            }
+            // PLAN-PATH-B B5 replaces this arm with the transmit path: drain the fragment's
+            // output and ship it to the remote receiver instead of parking it locally.
+            DestinationRoute::Remote { host, brpc_port } => Err(format!(
+                "cross-node exchange to {host}:{brpc_port} is not wired yet: the nixl transport \
+                 tier lands in a later commit (PLAN-PATH-B B5)"
+            )),
         }
-        Ok(())
+    }
+
+    /// Classifies a data-stream sink destination against this CN's advertised exchange
+    /// identity. A missing `brpc_server` is a malformed dispatch, not a local default: the FE
+    /// always attaches the receiver's brpc address (ExecutionDAG.java:560).
+    fn route_destination(
+        &self,
+        destination: &TPlanFragmentDestination,
+    ) -> std::result::Result<DestinationRoute, String> {
+        let brpc_server = destination.brpc_server.as_ref().ok_or_else(|| {
+            format!(
+                "DATA_STREAM_SINK destination for fragment instance {} has no brpc_server address",
+                FragmentInstanceId::from(&destination.fragment_instance_id)
+            )
+        })?;
+        if self.identity.matches(brpc_server) {
+            Ok(DestinationRoute::Local)
+        } else {
+            Ok(DestinationRoute::Remote {
+                host: brpc_server.hostname.clone(),
+                brpc_port: brpc_server.port,
+            })
+        }
     }
 
     /// Translates a receiver whose sender set is complete, binding each exchange to the input
-    /// stream its senders parked into, and runs it.
-    fn execute_ready_fragment(&self, ready: ReadyFragment) -> std::result::Result<(), String> {
+    /// stream its senders parked into, and runs it. Returns the next receiver when this one's
+    /// own sink completed another sender set.
+    fn execute_ready_fragment(
+        &self,
+        ready: ReadyFragment,
+    ) -> std::result::Result<Option<ReadyFragment>, String> {
         let exchange_inputs = ready
             .inputs
             .iter()
             .map(|input| {
                 let names = input
-                    .outputs
+                    .sources
                     .first()
-                    .map(|output| output.names.clone())
+                    .map(|source| {
+                        let SenderSource::LocalParked { names, .. } = source;
+                        names.clone()
+                    })
                     .ok_or_else(|| {
-                        format!("exchange node {} has no sender output", input.node_id)
+                        format!("exchange node {} has no sender source", input.node_id)
                     })?;
-                if input.outputs.iter().any(|output| output.names != names) {
+                if input.sources.iter().any(|source| {
+                    let SenderSource::LocalParked { names: other, .. } = source;
+                    other != &names
+                }) {
                     return Err("exchange senders produced different output names".to_string());
                 }
                 let stream_id = u64::try_from(input.node_id)
@@ -448,7 +640,14 @@ impl SiriusComputeNodeService {
             .map(|input| {
                 (
                     input.node_id,
-                    input.outputs.iter().map(|output| output.slot).collect(),
+                    input
+                        .sources
+                        .iter()
+                        .map(|source| {
+                            let SenderSource::LocalParked { slot, .. } = source;
+                            *slot
+                        })
+                        .collect(),
                 )
             })
             .collect();
@@ -492,51 +691,6 @@ impl SiriusComputeNodeService {
                 Ok((node_id, expected))
             })
             .collect()
-    }
-
-    /// Deserializes a FE batch attachment and merges common params into each instance.
-    fn translate_batch_attachment(
-        &self,
-        protocol: Option<&str>,
-        attachment: &[u8],
-    ) -> std::result::Result<(), String> {
-        Self::ensure_binary_protocol(protocol)?;
-        let batch = Self::deserialize_binary::<TExecBatchPlanFragmentsParams>(attachment)
-            .map_err(|err| format!("failed to deserialize TExecBatchPlanFragmentsParams: {err}"))?;
-        let common = batch
-            .common_param
-            .as_ref()
-            .ok_or_else(|| "TExecBatchPlanFragmentsParams.common_param is missing".to_string())?;
-        let instances = batch.unique_param_per_instance.as_ref().ok_or_else(|| {
-            "TExecBatchPlanFragmentsParams.unique_param_per_instance is missing".to_string()
-        })?;
-
-        if instances.is_empty() {
-            return Err(
-                "TExecBatchPlanFragmentsParams.unique_param_per_instance is empty".to_string(),
-            );
-        }
-
-        for (idx, instance) in instances.iter().enumerate() {
-            let mut params = instance.clone();
-            if params.desc_tbl.is_none() {
-                params.desc_tbl = common.desc_tbl.clone();
-            }
-            if params.query_globals.is_none() {
-                params.query_globals = common.query_globals.clone();
-            }
-            if params.query_options.is_none() {
-                params.query_options = common.query_options.clone();
-            }
-            if params.resource_info.is_none() {
-                params.resource_info = common.resource_info.clone();
-            }
-
-            self.process_fragment(&params)
-                .map_err(|err| format!("fragment {idx}: {err}"))?;
-        }
-
-        Ok(())
     }
 
     /// Converts a StarRocks thrift plan fragment to Substrait, logs substrait-explain output, and
@@ -617,6 +771,59 @@ impl SiriusComputeNodeService {
             .params
             .as_ref()
             .map(|exec| FragmentInstanceId::from(&exec.fragment_instance_id))
+    }
+}
+
+impl SiriusComputeNodeService {
+    /// Deserializes a FE batch attachment and merges common params into each instance, handing
+    /// any completed receiver to the dispatch worker.
+    fn translate_batch_attachment(
+        &self,
+        protocol: Option<&str>,
+        attachment: &[u8],
+    ) -> std::result::Result<(), String> {
+        Self::ensure_binary_protocol(protocol)?;
+        let batch = Self::deserialize_binary::<TExecBatchPlanFragmentsParams>(attachment)
+            .map_err(|err| format!("failed to deserialize TExecBatchPlanFragmentsParams: {err}"))?;
+        let common = batch
+            .common_param
+            .as_ref()
+            .ok_or_else(|| "TExecBatchPlanFragmentsParams.common_param is missing".to_string())?;
+        let instances = batch.unique_param_per_instance.as_ref().ok_or_else(|| {
+            "TExecBatchPlanFragmentsParams.unique_param_per_instance is missing".to_string()
+        })?;
+
+        if instances.is_empty() {
+            return Err(
+                "TExecBatchPlanFragmentsParams.unique_param_per_instance is empty".to_string(),
+            );
+        }
+
+        for (idx, instance) in instances.iter().enumerate() {
+            let mut params = instance.clone();
+            if params.desc_tbl.is_none() {
+                params.desc_tbl = common.desc_tbl.clone();
+            }
+            if params.query_globals.is_none() {
+                params.query_globals = common.query_globals.clone();
+            }
+            if params.query_options.is_none() {
+                params.query_options = common.query_options.clone();
+            }
+            if params.resource_info.is_none() {
+                params.resource_info = common.resource_info.clone();
+            }
+
+            if let Some(ready) = self
+                .core
+                .process_fragment(&params)
+                .map_err(|err| format!("fragment {idx}: {err}"))?
+            {
+                self.dispatch(ready)?;
+            }
+        }
+
+        Ok(())
     }
 
     /// Extracts the parquet paths from the binary-thrift attachment and infers their common
@@ -729,8 +936,8 @@ mod tests {
         },
         planner::TPlanFragment,
         types::{
-            TFileType, TPrimitiveType, TScalarType, TTableType, TTypeDesc, TTypeNode,
-            TTypeNodeType, TUniqueId,
+            TFileType, TNetworkAddress, TPrimitiveType, TScalarType, TTableType, TTypeDesc,
+            TTypeNode, TTypeNodeType, TUniqueId,
         },
     };
     use thrift::{protocol::TBinaryOutputProtocol, transport::TIoChannel};
@@ -756,6 +963,141 @@ mod tests {
         fn run(&self, run: FragmentRun<'_>) -> Result<Option<FragmentResult>, String> {
             self.calls.fetch_add(1, Ordering::Relaxed);
             StubExecutor.run(run)
+        }
+    }
+
+    /// Recognizes the run the dispatch worker performs: a receiver consumes exchange inputs and
+    /// returns rows instead of parking output.
+    fn is_receiver_run(run: &FragmentRun<'_>) -> bool {
+        run.output.is_none() && !run.inputs.is_empty()
+    }
+
+    /// Blocks receiver execution until the test releases it, proving the sender's RPC thread
+    /// does not run the receiver inline.
+    #[derive(Debug)]
+    struct GatedExecutor {
+        release: Mutex<std::sync::mpsc::Receiver<()>>,
+        receiver_ran: std::sync::atomic::AtomicBool,
+    }
+
+    impl FragmentExecutor for GatedExecutor {
+        fn run(&self, run: FragmentRun<'_>) -> Result<Option<FragmentResult>, String> {
+            if is_receiver_run(&run) {
+                // Bounded wait so a regression fails the test instead of hanging the suite.
+                self.release
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .map_err(|err| format!("gated receiver was never released: {err}"))?;
+                self.receiver_ran.store(true, Ordering::SeqCst);
+            }
+            StubExecutor.run(run)
+        }
+    }
+
+    /// Fails every receiver run so tests can watch the dispatch worker's failure path.
+    #[derive(Debug)]
+    struct FailingReceiverExecutor;
+
+    impl FragmentExecutor for FailingReceiverExecutor {
+        fn run(&self, run: FragmentRun<'_>) -> Result<Option<FragmentResult>, String> {
+            if is_receiver_run(&run) {
+                return Err("receiver exploded on the GPU".to_string());
+            }
+            StubExecutor.run(run)
+        }
+    }
+
+    /// The exchange endpoint [`SiriusComputeNodeService::new`] advertises in tests.
+    fn test_identity() -> ExchangeIdentity {
+        ExchangeIdentity::new("127.0.0.1", 8060)
+    }
+
+    /// A destination on this CN. The FE always attaches the receiver's brpc address
+    /// (ExecutionDAG.java:560), so fixtures must too.
+    fn local_destination(receiver_id: TUniqueId) -> TPlanFragmentDestination {
+        TPlanFragmentDestination::new(
+            receiver_id,
+            None,
+            Some(TNetworkAddress::new("127.0.0.1".to_string(), 8060)),
+            None,
+        )
+    }
+
+    /// Polls until `predicate` holds; receiver execution now happens on the dispatch worker.
+    fn wait_until(what: &str, predicate: impl Fn() -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !predicate() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {what}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
+    /// Polls `fetch_data` until the dispatched receiver's rows land, panicking on an error
+    /// status or on EOS before any rows arrived.
+    fn fetch_rows_eventually(
+        service: &SiriusComputeNodeService,
+        hi: i64,
+        lo: i64,
+    ) -> prpc::Response {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let response = route(
+                service,
+                methods::FETCH_DATA,
+                fetch_request(hi, lo),
+                Vec::new(),
+            );
+            let result = PFetchDataResult::decode(response.body.as_slice()).unwrap();
+            assert_eq!(
+                result.status.status_code,
+                TStatusCode::OK.0,
+                "{:?}",
+                result.status.error_msgs
+            );
+            if !response.attachment.is_empty() {
+                return response;
+            }
+            assert_eq!(
+                result.eos,
+                Some(false),
+                "receiver reported EOS before delivering rows"
+            );
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for receiver rows"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
+    /// Polls `fetch_data` until the dispatched receiver's failure surfaces as a non-OK status.
+    fn fetch_error_eventually(
+        service: &SiriusComputeNodeService,
+        hi: i64,
+        lo: i64,
+    ) -> PFetchDataResult {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let response = route(
+                service,
+                methods::FETCH_DATA,
+                fetch_request(hi, lo),
+                Vec::new(),
+            );
+            let result = PFetchDataResult::decode(response.body.as_slice()).unwrap();
+            if result.status.status_code != TStatusCode::OK.0 {
+                return result;
+            }
+            assert!(response.attachment.is_empty());
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for receiver failure"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
         }
     }
 
@@ -981,7 +1323,7 @@ mod tests {
     #[test]
     fn self_exchange_executes_sender_then_receiver_when_receiver_arrives_first() {
         let executor = Arc::new(CountingExecutor::default());
-        let service = SiriusComputeNodeService::with_executor(executor.clone());
+        let service = SiriusComputeNodeService::with_executor(executor.clone(), test_identity());
         let query_id = TUniqueId::new(10, 1);
         let receiver_id = TUniqueId::new(10, 2);
 
@@ -1019,12 +1361,7 @@ mod tests {
         sender.fragment.as_mut().unwrap().output_sink = Some(data_stream_sink(7));
         let mut sender_exec = exec_params(query_id, TUniqueId::new(10, 3));
         sender_exec.sender_id = Some(0);
-        sender_exec.destinations = Some(vec![TPlanFragmentDestination::new(
-            receiver_id.clone(),
-            None,
-            None,
-            None,
-        )]);
+        sender_exec.destinations = Some(vec![local_destination(receiver_id.clone())]);
         sender.params = Some(sender_exec);
 
         let sender_response = route(
@@ -1039,14 +1376,12 @@ mod tests {
         let sender_response =
             PExecPlanFragmentResult::decode(sender_response.body.as_slice()).unwrap();
         assert_eq!(sender_response.status.status_code, TStatusCode::OK.0);
-        assert_eq!(executor.calls.load(Ordering::Relaxed), 2);
+        // The sender ran on the RPC path; the receiver executes on the dispatch worker.
+        wait_until("sender and receiver to execute", || {
+            executor.calls.load(Ordering::Relaxed) == 2
+        });
 
-        let fetched = route(
-            &service,
-            methods::FETCH_DATA,
-            fetch_request(receiver_id.hi, receiver_id.lo),
-            Vec::new(),
-        );
+        let fetched = fetch_rows_eventually(&service, receiver_id.hi, receiver_id.lo);
         let fetched_result = PFetchDataResult::decode(fetched.body.as_slice()).unwrap();
         assert_eq!(fetched_result.status.status_code, TStatusCode::OK.0);
         assert_eq!(fetched_result.eos, Some(false));
@@ -1056,7 +1391,7 @@ mod tests {
     #[test]
     fn self_exchange_executes_an_intermediate_receiver_and_reuses_cached_descriptors() {
         let executor = Arc::new(CountingExecutor::default());
-        let service = SiriusComputeNodeService::with_executor(executor.clone());
+        let service = SiriusComputeNodeService::with_executor(executor.clone(), test_identity());
         let query_id = TUniqueId::new(20, 1);
         let root_id = TUniqueId::new(20, 2);
         let middle_id = TUniqueId::new(20, 3);
@@ -1074,12 +1409,7 @@ mod tests {
         let mut middle_exec = exec_params(query_id.clone(), middle_id.clone());
         middle_exec.per_exch_num_senders.insert(7, 1);
         middle_exec.sender_id = Some(0);
-        middle_exec.destinations = Some(vec![TPlanFragmentDestination::new(
-            root_id.clone(),
-            None,
-            None,
-            None,
-        )]);
+        middle_exec.destinations = Some(vec![local_destination(root_id.clone())]);
         middle.params = Some(middle_exec);
         assert_exec_ok(&service, &middle);
 
@@ -1087,23 +1417,182 @@ mod tests {
         leaf.fragment.as_mut().unwrap().output_sink = Some(data_stream_sink(7));
         let mut leaf_exec = exec_params(query_id, TUniqueId::new(20, 4));
         leaf_exec.sender_id = Some(0);
-        leaf_exec.destinations = Some(vec![TPlanFragmentDestination::new(
-            middle_id, None, None, None,
-        )]);
+        leaf_exec.destinations = Some(vec![local_destination(middle_id)]);
         leaf.params = Some(leaf_exec);
         assert_exec_ok(&service, &leaf);
 
-        assert_eq!(executor.calls.load(Ordering::Relaxed), 3);
-        let fetched = route(
-            &service,
-            methods::FETCH_DATA,
-            fetch_request(root_id.hi, root_id.lo),
-            Vec::new(),
-        );
+        // The leaf ran on the RPC path; the middle and root receivers chain on the dispatch
+        // worker after the leaf's RPC already returned.
+        wait_until("all three fragments to execute", || {
+            executor.calls.load(Ordering::Relaxed) == 3
+        });
+        let fetched = fetch_rows_eventually(&service, root_id.hi, root_id.lo);
         let fetched_result = PFetchDataResult::decode(fetched.body.as_slice()).unwrap();
         assert_eq!(fetched_result.status.status_code, TStatusCode::OK.0);
         assert_eq!(fetched_result.eos, Some(false));
         assert!(!fetched.attachment.is_empty());
+    }
+
+    #[test]
+    fn exchange_identity_requires_host_and_port_equality() {
+        let identity = ExchangeIdentity::new("cn-a.example", 8060);
+        assert!(identity.matches(&TNetworkAddress::new("cn-a.example".to_string(), 8060)));
+        // Two CNs on one host differ only by port and must see each other as remote.
+        assert!(!identity.matches(&TNetworkAddress::new("cn-a.example".to_string(), 8061)));
+        assert!(!identity.matches(&TNetworkAddress::new("cn-b.example".to_string(), 8060)));
+    }
+
+    #[test]
+    fn data_stream_sink_to_remote_destination_is_a_loud_error() {
+        // Until the cross-node transport lands, a remote destination must fail the sender's
+        // dispatch loudly — the silent alternative is an FE query that hangs forever.
+        let executor = Arc::new(CountingExecutor::default());
+        let service = SiriusComputeNodeService::with_executor(executor.clone(), test_identity());
+
+        let mut sender = fragment_params(Some(scan_plan(0, 0)), Some(desc_table()));
+        sender.fragment.as_mut().unwrap().output_sink = Some(data_stream_sink(7));
+        let mut sender_exec = exec_params(TUniqueId::new(30, 1), TUniqueId::new(30, 2));
+        sender_exec.sender_id = Some(0);
+        // A second CN on the same host: same hostname, different brpc port.
+        sender_exec.destinations = Some(vec![TPlanFragmentDestination::new(
+            TUniqueId::new(30, 3),
+            None,
+            Some(TNetworkAddress::new("127.0.0.1".to_string(), 8061)),
+            None,
+        )]);
+        sender.params = Some(sender_exec);
+
+        let response = route(
+            &service,
+            methods::EXEC_PLAN_FRAGMENT,
+            PExecPlanFragmentRequest {
+                attachment_protocol: Some("binary".to_string()),
+            }
+            .encode_to_vec(),
+            serialize_binary(&sender),
+        );
+        let result = PExecPlanFragmentResult::decode(response.body.as_slice()).unwrap();
+        assert_eq!(result.status.status_code, TStatusCode::INTERNAL_ERROR.0);
+        assert!(
+            result.status.error_msgs[0]
+                .contains("cross-node exchange to 127.0.0.1:8061 is not wired yet"),
+            "{:?}",
+            result.status.error_msgs
+        );
+        // Routing is decided before the sender runs, so no GPU work happened.
+        assert_eq!(executor.calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn data_stream_sink_destination_without_brpc_server_is_a_loud_error() {
+        // The FE always sets brpc_server on a destination; a missing one is malformed dispatch,
+        // not an implicit "local".
+        let service = SiriusComputeNodeService::new();
+
+        let mut sender = fragment_params(Some(scan_plan(0, 0)), Some(desc_table()));
+        sender.fragment.as_mut().unwrap().output_sink = Some(data_stream_sink(7));
+        let mut sender_exec = exec_params(TUniqueId::new(31, 1), TUniqueId::new(31, 2));
+        sender_exec.sender_id = Some(0);
+        sender_exec.destinations = Some(vec![TPlanFragmentDestination::new(
+            TUniqueId::new(31, 3),
+            None,
+            None,
+            None,
+        )]);
+        sender.params = Some(sender_exec);
+
+        let response = route(
+            &service,
+            methods::EXEC_PLAN_FRAGMENT,
+            PExecPlanFragmentRequest {
+                attachment_protocol: Some("binary".to_string()),
+            }
+            .encode_to_vec(),
+            serialize_binary(&sender),
+        );
+        let result = PExecPlanFragmentResult::decode(response.body.as_slice()).unwrap();
+        assert_eq!(result.status.status_code, TStatusCode::INTERNAL_ERROR.0);
+        assert!(
+            result.status.error_msgs[0].contains("has no brpc_server address"),
+            "{:?}",
+            result.status.error_msgs
+        );
+    }
+
+    #[test]
+    fn sender_rpc_returns_before_the_dispatched_receiver_executes() {
+        // The last sender's exec_plan_fragment must hand the ready receiver to the dispatch
+        // worker and return, not block on the receiver's whole execution. The gate holds the
+        // receiver open; under the old inline design the sender RPC could not return until the
+        // gate released.
+        let (release, gate) = std::sync::mpsc::channel();
+        let executor = Arc::new(GatedExecutor {
+            release: Mutex::new(gate),
+            receiver_ran: std::sync::atomic::AtomicBool::new(false),
+        });
+        let service = SiriusComputeNodeService::with_executor(executor.clone(), test_identity());
+        let query_id = TUniqueId::new(40, 1);
+        let receiver_id = TUniqueId::new(40, 2);
+
+        let mut receiver = fragment_params(Some(exchange_plan(7, 0)), Some(desc_table()));
+        receiver.fragment.as_mut().unwrap().output_sink = Some(result_sink());
+        let mut receiver_exec = exec_params(query_id.clone(), receiver_id.clone());
+        receiver_exec.per_exch_num_senders.insert(7, 1);
+        receiver.params = Some(receiver_exec);
+        assert_exec_ok(&service, &receiver);
+
+        let mut sender = fragment_params(Some(scan_plan(0, 0)), Some(desc_table()));
+        sender.fragment.as_mut().unwrap().output_sink = Some(data_stream_sink(7));
+        let mut sender_exec = exec_params(query_id, TUniqueId::new(40, 3));
+        sender_exec.sender_id = Some(0);
+        sender_exec.destinations = Some(vec![local_destination(receiver_id.clone())]);
+        sender.params = Some(sender_exec);
+        assert_exec_ok(&service, &sender);
+
+        // The sender RPC returned while the receiver is still gated.
+        assert!(!executor.receiver_ran.load(Ordering::SeqCst));
+
+        release.send(()).unwrap();
+        let fetched = fetch_rows_eventually(&service, receiver_id.hi, receiver_id.lo);
+        assert!(!fetched.attachment.is_empty());
+        assert!(executor.receiver_ran.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn dispatched_receiver_failure_surfaces_through_fetch_data() {
+        // The receiver fails on the dispatch worker, after every RPC already returned OK — the
+        // only remaining signal path to the FE is the fetch_data poll, which must report the
+        // cause instead of waiting forever.
+        let service = SiriusComputeNodeService::with_executor(
+            Arc::new(FailingReceiverExecutor),
+            test_identity(),
+        );
+        let query_id = TUniqueId::new(50, 1);
+        let receiver_id = TUniqueId::new(50, 2);
+
+        let mut receiver = fragment_params(Some(exchange_plan(7, 0)), Some(desc_table()));
+        receiver.fragment.as_mut().unwrap().output_sink = Some(result_sink());
+        let mut receiver_exec = exec_params(query_id.clone(), receiver_id.clone());
+        receiver_exec.per_exch_num_senders.insert(7, 1);
+        receiver.params = Some(receiver_exec);
+        assert_exec_ok(&service, &receiver);
+
+        let mut sender = fragment_params(Some(scan_plan(0, 0)), Some(desc_table()));
+        sender.fragment.as_mut().unwrap().output_sink = Some(data_stream_sink(7));
+        let mut sender_exec = exec_params(query_id, TUniqueId::new(50, 3));
+        sender_exec.sender_id = Some(0);
+        sender_exec.destinations = Some(vec![local_destination(receiver_id.clone())]);
+        sender.params = Some(sender_exec);
+        assert_exec_ok(&service, &sender);
+
+        let result = fetch_error_eventually(&service, receiver_id.hi, receiver_id.lo);
+        assert_eq!(result.status.status_code, TStatusCode::INTERNAL_ERROR.0);
+        assert!(
+            result.status.error_msgs[0].contains("failed: receiver exploded on the GPU"),
+            "{:?}",
+            result.status.error_msgs
+        );
+        assert_eq!(result.eos, Some(true));
     }
 
     #[test]
@@ -1114,6 +1603,7 @@ mod tests {
         let mut initial = fragment_params(None, Some(desc_table()));
         initial.params = Some(exec_params(query_id.clone(), TUniqueId::new(4, 3)));
         service
+            .core
             .resolve_descriptor_table(&initial)
             .expect("cache initial descriptor table");
 
@@ -1121,6 +1611,7 @@ mod tests {
         let mut reference = fragment_params(None, Some(cached));
         reference.params = Some(exec_params(query_id, TUniqueId::new(4, 4)));
         let resolved = service
+            .core
             .resolve_descriptor_table(&reference)
             .expect("resolve cached descriptor table");
 
@@ -1137,7 +1628,10 @@ mod tests {
         let mut reference = fragment_params(None, Some(cached));
         reference.params = Some(exec_params(TUniqueId::new(7, 1), TUniqueId::new(7, 2)));
 
-        let err = service.resolve_descriptor_table(&reference).unwrap_err();
+        let err = service
+            .core
+            .resolve_descriptor_table(&reference)
+            .unwrap_err();
         assert!(err.contains("descriptor table cache miss"), "{err}");
     }
 

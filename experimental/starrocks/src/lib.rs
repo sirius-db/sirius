@@ -58,6 +58,7 @@ mod result_encoder;
 mod result_store;
 
 pub use brpc::BrpcServer;
+pub use compute_node_service::ExchangeIdentity;
 #[cfg(feature = "sirius-engine")]
 pub use engine::SiriusEngine;
 pub use engine_settings::{EngineSettings, derive_sirius_config_yaml};

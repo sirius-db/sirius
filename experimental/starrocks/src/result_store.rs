@@ -56,17 +56,25 @@ enum FragmentState {
     Pending(TResultBatch),
     /// Rows delivered; the next poll reports end-of-stream.
     Drained,
+    /// Execution failed (e.g. on the dispatch worker); every poll re-reports the cause so the
+    /// FE errors instead of polling a `Waiting` entry forever.
+    Failed(String),
 }
 
 /// What a single `fetch_data` poll should return to the FE.
 #[derive(Debug)]
-pub(crate) struct FetchOutcome {
-    /// Result rows to ship as the response attachment, when present.
-    pub(crate) batch: Option<TResultBatch>,
-    /// Monotonic packet sequence the FE uses to detect lost packets.
-    pub(crate) packet_seq: i64,
-    /// End-of-stream marker; the FE stops polling once true.
-    pub(crate) eos: bool,
+pub(crate) enum FetchOutcome {
+    /// Result-stream progress for a live fragment.
+    Rows {
+        /// Result rows to ship as the response attachment, when present.
+        batch: Option<TResultBatch>,
+        /// Monotonic packet sequence the FE uses to detect lost packets.
+        packet_seq: i64,
+        /// End-of-stream marker; the FE stops polling once true.
+        eos: bool,
+    },
+    /// The fragment failed; the poll must surface this cause as an error.
+    Failed(String),
 }
 
 /// Process-wide store of fragment results keyed by fragment instance id.
@@ -90,6 +98,13 @@ impl ResultStore {
         self.lock().insert(id, FragmentState::Pending(batch));
     }
 
+    /// Marks a fragment failed so `fetch_data` reports the cause instead of waiting forever.
+    /// The failure sticks: like `Drained`, repeat polls keep re-reporting it rather than
+    /// reverting to "unknown fragment".
+    pub(crate) fn fail(&self, id: FragmentInstanceId, error: String) {
+        self.lock().insert(id, FragmentState::Failed(error));
+    }
+
     /// Advances the `fetch_data` state machine for one fragment: deliver rows once, then EOS.
     /// Returns `None` for an id this CN never buffered, which the caller reports as an error
     /// (StarRocks treats a missing result buffer as a failure, not an empty result). A drained
@@ -104,7 +119,7 @@ impl ResultStore {
         let mut guard = self.lock();
         match guard.get_mut(&id) {
             None => None,
-            Some(FragmentState::Waiting) => Some(FetchOutcome {
+            Some(FragmentState::Waiting) => Some(FetchOutcome::Rows {
                 batch: None,
                 packet_seq: 0,
                 eos: false,
@@ -115,17 +130,18 @@ impl ResultStore {
                 else {
                     unreachable!("state matched Pending")
                 };
-                Some(FetchOutcome {
+                Some(FetchOutcome::Rows {
                     batch: Some(batch),
                     packet_seq: 0,
                     eos: false,
                 })
             }
-            Some(FragmentState::Drained) => Some(FetchOutcome {
+            Some(FragmentState::Drained) => Some(FetchOutcome::Rows {
                 batch: None,
                 packet_seq: 1,
                 eos: true,
             }),
+            Some(FragmentState::Failed(error)) => Some(FetchOutcome::Failed(error.clone())),
         }
     }
 
@@ -150,23 +166,32 @@ mod tests {
         )
     }
 
+    /// Destructures a poll that must be live result-stream progress, not a failure.
+    fn rows(outcome: FetchOutcome) -> (Option<TResultBatch>, bool) {
+        match outcome {
+            FetchOutcome::Rows { batch, eos, .. } => (batch, eos),
+            FetchOutcome::Failed(error) => panic!("expected rows, got failure: {error}"),
+        }
+    }
+
     #[test]
     fn delivers_rows_once_then_reports_eos_on_repeat_polls() {
         let store = ResultStore::default();
         let id = FragmentInstanceId::from_halves(1, 2);
         store.insert(id, batch(&["a", "b"]));
 
-        let first = store.take_next(id).expect("known fragment");
-        assert!(!first.eos);
-        assert_eq!(first.batch.unwrap().rows.len(), 2);
+        let (first_batch, first_eos) = rows(store.take_next(id).expect("known fragment"));
+        assert!(!first_eos);
+        assert_eq!(first_batch.unwrap().rows.len(), 2);
 
         // A drained fragment keeps reporting EOS, never reverting to "unknown".
-        let second = store.take_next(id).expect("drained fragment still known");
-        assert!(second.eos);
-        assert!(second.batch.is_none());
+        let (second_batch, second_eos) =
+            rows(store.take_next(id).expect("drained fragment still known"));
+        assert!(second_eos);
+        assert!(second_batch.is_none());
 
-        let third = store.take_next(id).expect("drained fragment still known");
-        assert!(third.eos);
+        let (_, third_eos) = rows(store.take_next(id).expect("drained fragment still known"));
+        assert!(third_eos);
     }
 
     #[test]
@@ -185,13 +210,32 @@ mod tests {
         let id = FragmentInstanceId::from_halves(4, 2);
         store.reserve(id);
 
-        let waiting = store.take_next(id).expect("reserved fragment is known");
-        assert!(!waiting.eos);
-        assert!(waiting.batch.is_none());
+        let (waiting_batch, waiting_eos) =
+            rows(store.take_next(id).expect("reserved fragment is known"));
+        assert!(!waiting_eos);
+        assert!(waiting_batch.is_none());
 
         store.insert(id, batch(&["ready"]));
-        let ready = store.take_next(id).expect("completed fragment is known");
-        assert!(!ready.eos);
-        assert_eq!(ready.batch.unwrap().rows.len(), 1);
+        let (ready_batch, ready_eos) =
+            rows(store.take_next(id).expect("completed fragment is known"));
+        assert!(!ready_eos);
+        assert_eq!(ready_batch.unwrap().rows.len(), 1);
+    }
+
+    #[test]
+    fn failed_fragment_reports_its_cause_on_every_poll() {
+        let store = ResultStore::default();
+        let id = FragmentInstanceId::from_halves(5, 5);
+        store.reserve(id);
+        store.fail(id, "receiver exploded".to_string());
+
+        // The failure sticks across polls, mirroring Drained: the FE must never see the
+        // fragment revert to "waiting" or "unknown" after its execution failed.
+        for _ in 0..2 {
+            match store.take_next(id).expect("failed fragment is known") {
+                FetchOutcome::Failed(error) => assert_eq!(error, "receiver exploded"),
+                other => panic!("expected failure, got {other:?}"),
+            }
+        }
     }
 }

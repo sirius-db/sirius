@@ -19,20 +19,26 @@ pub(crate) struct ExchangeKey {
     pub(crate) node_id: i32,
 }
 
-/// One sender that has produced, and where the engine parked its output.
+/// One sender that has produced, and where its output sits.
+///
+/// An enum so the cross-node transport (PLAN-PATH-B B5) can add a `Remote` variant carrying
+/// received batches next to the local GPU-parked variant.
 #[derive(Clone, Debug)]
-pub(crate) struct SenderOutput {
-    /// Sender output names, which become the input stream's column names.
-    pub(crate) names: Vec<String>,
-    /// Where the engine parked this sender's batches.
-    pub(crate) slot: SenderSlot,
+pub(crate) enum SenderSource {
+    /// A same-node sender whose batches the engine parked on the GPU.
+    LocalParked {
+        /// Sender output names, which become the input stream's column names.
+        names: Vec<String>,
+        /// Where the engine parked this sender's batches.
+        slot: SenderSlot,
+    },
 }
 
 /// One exchange input of a receiver fragment whose sender set is complete.
 #[derive(Debug)]
 pub(crate) struct ReadyExchangeInput {
     pub(crate) node_id: i32,
-    pub(crate) outputs: Vec<SenderOutput>,
+    pub(crate) sources: Vec<SenderSource>,
 }
 
 /// A receiver fragment whose exchange inputs are all ready for sequential execution.
@@ -51,7 +57,7 @@ struct PendingReceiver {
 #[derive(Debug, Default)]
 struct ExchangeState {
     receivers: HashMap<FragmentInstanceId, PendingReceiver>,
-    outputs: HashMap<ExchangeKey, HashMap<i32, SenderOutput>>,
+    sources: HashMap<ExchangeKey, HashMap<i32, SenderSource>>,
 }
 
 /// Matches receiver-first StarRocks dispatch with later same-node sender results.
@@ -103,14 +109,14 @@ impl LocalExchange {
         &self,
         key: ExchangeKey,
         sender_id: i32,
-        output: SenderOutput,
+        source: SenderSource,
     ) -> Result<Option<ReadyFragment>, String> {
         let mut state = self.lock();
-        let senders = state.outputs.entry(key).or_default();
+        let senders = state.sources.entry(key).or_default();
         if senders.contains_key(&sender_id) {
             return Err(format!("duplicate sender {sender_id} for exchange {key:?}"));
         }
-        senders.insert(sender_id, output);
+        senders.insert(sender_id, source);
         Self::take_ready(&mut state, key.fragment_instance_id)
     }
 
@@ -126,7 +132,7 @@ impl LocalExchange {
                 fragment_instance_id,
                 node_id,
             };
-            let actual = state.outputs.get(&key).map(HashMap::len).unwrap_or(0);
+            let actual = state.sources.get(&key).map(HashMap::len).unwrap_or(0);
             if actual > expected {
                 return Err(format!(
                     "exchange {key:?} received {actual} senders but expected {expected}"
@@ -150,14 +156,14 @@ impl LocalExchange {
                     fragment_instance_id,
                     node_id,
                 };
-                let mut senders = state.outputs.remove(&key).unwrap_or_default();
+                let mut senders = state.sources.remove(&key).unwrap_or_default();
                 let mut sender_ids = senders.keys().copied().collect::<Vec<_>>();
                 sender_ids.sort_unstable();
-                let outputs = sender_ids
+                let sources = sender_ids
                     .into_iter()
                     .map(|sender_id| senders.remove(&sender_id).expect("sender id came from map"))
                     .collect();
-                ReadyExchangeInput { node_id, outputs }
+                ReadyExchangeInput { node_id, sources }
             })
             .collect();
         Ok(Some(ReadyFragment {

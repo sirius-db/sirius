@@ -94,7 +94,8 @@ impl StubExecutor {
         // TODO(starrocks-execute): replace with a SiriusExecutor that hands
         // `translated.to_substrait_bytes()` to the embedded Sirius engine, executes it on the
         // GPU, and imports the result via the Arrow C Data Interface. That executor will hold an
-        // `Arc<sirius::SiriusContext>` threaded in from `main` (see `BrpcServer::new`). For now
+        // `Arc<sirius::SiriusContext>` threaded in from `main` (see `BrpcServer::with_executor`).
+        // For now
         // we emit one placeholder string row per output column so the FE→client path is exercised.
         let names = &translated.output_names;
         if names.is_empty() {
