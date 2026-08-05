@@ -23,6 +23,7 @@
 #include "io/s3/s3_list_parser.hpp"
 #include "io/sirius_datasource.hpp"
 #include "op/scan/gpu_ingestible_types.hpp"
+#include "pin_table.hpp"
 #include "scan_manager/config.hpp"
 #include "scan_manager/duckdb_mvcc_metadata.hpp"
 #include "scan_manager/insert_delta_job.hpp"
@@ -34,6 +35,7 @@
 #include <cudf/column/column.hpp>
 #include <cudf/table/table.hpp>
 
+#include <compression/compressed_representation.hpp>
 #include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/memory/memory_space.hpp>
 #include <duckdb/common/column_index.hpp>
@@ -46,6 +48,7 @@ namespace cucascade::memory {
 class fixed_size_host_memory_resource;
 }  // namespace cucascade::memory
 
+#include <concepts>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -54,6 +57,7 @@ class fixed_size_host_memory_resource;
 #include <span>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <unordered_map>
 #include <vector>
 
@@ -126,6 +130,12 @@ class cache_entry_info {
                                           std::string_view schema,
                                           std::string_view table) const;
 
+  /// Parquet-identity check shared by can_serve_with_columns and the plan-time
+  /// residency gate — one matcher, so the probe and prepare can never drift.
+  /// Same file set irrespective of order (both sides sorted, byte-exact compare).
+  /// False for duckdb entries (empty resolved_file_paths) and for an empty @p files.
+  [[nodiscard]] bool matches_parquet_files(std::span<std::string const> files) const;
+
   /// Column-superset gather over @p requested_ids (requested order): for each
   /// requested column, its position within the cached @c column_ids. Empty
   /// when the cache cannot serve — a requested rowid/virtual/empty/
@@ -161,10 +171,35 @@ struct pinned_entry {
   /// share the same memory_space because they came from the same
   /// coalesced batch.
   std::vector<cucascade::memory::memory_space*> chunk_memory_spaces;
-  /// HOST-tier storage: one host_data_representation per chunk, each holding all
-  /// pinned columns. The cached provider slices these by column index when
-  /// serving a particular scan. Populated by @ref insert_pinned_entry_host.
-  std::vector<std::shared_ptr<cucascade::host_data_representation>> host_chunks;
+  /// HOST-tier storage: one chunk per emitted batch in emission order, each
+  /// holding all pinned columns. Every element is either a
+  /// cucascade::host_data_representation (uncompressed) or a
+  /// sirius::compressed_host_representation (Simpatico-compressed) — a single
+  /// pinned table may mix the two, since compression is decided per chunk. The
+  /// cached provider dispatches on the concrete type per chunk (slice() for the
+  /// uncompressed form, select_columns() for the compressed form). Populated by
+  /// @ref insert_pinned_entry_host.
+  std::vector<std::shared_ptr<cucascade::idata_representation>> host_chunks;
+  /// GPU-tier compression-enabled storage: one @ref device_pin_chunk per emitted
+  /// batch, in emission order. Each chunk is either Simpatico-compressed (served
+  /// as a compressed_device_representation, decompressed on demand) or
+  /// uncompressed (served directly as a gpu_table_representation) — a single pin
+  /// may interleave the two, since compression is decided per chunk. The cached
+  /// provider dispatches on the populated form per chunk. Populated by
+  /// @ref insert_pinned_entry_device. Takes priority over data_batches_by_column
+  /// (the plain, non-compression GPU pin path) when non-empty.
+  std::vector<sirius::device_pin_chunk> device_chunks;
+  /// Chunk-major stored-column metadata, positional with the cached data:
+  /// column_storage[c][i] is the recorded carrier of cached column i in chunk c
+  /// (for a compressed chunk, the type its decompression reproduces) plus whether
+  /// that carrier is narrower than the pin-time native mapping. Recorded by the
+  /// pin driver at the moment of storage; insertion requires a matrix covering
+  /// every chunk and column and cross-checks recorded carriers against
+  /// uncompressed storage. An empty matrix reads as all-native — a legitimate
+  /// state for a zero-chunk or hand-built entry, which is why the serving
+  /// validator still accepts it. The plan-time narrowing folds and the
+  /// serve-time conversion sizing read this matrix and never introspect storage.
+  sirius::pinned_column_storage_matrix column_storage;
   /// Tier the pinned data resides in. Drives which storage member above is used
   /// and which fetch path the cached provider takes.
   cucascade::memory::Tier tier{cucascade::memory::Tier::GPU};
@@ -202,6 +237,77 @@ struct pinned_entry {
 void validate_pinned_entry_for_serving(pinned_entry const& entry,
                                        std::span<std::size_t const> selected_columns);
 
+/// Validate the shape of @p matrix alone: it must hold @p expected_chunks rows of
+/// @p expected_columns cells each. @p allow_empty admits the empty matrix, which reads as
+/// all-native — @ref validate_pinned_entry_for_serving passes true because a zero-chunk or
+/// hand-built entry is legitimately empty, while insertion passes false because the pin driver
+/// always records coverage. @p context prefixes the thrown message so the caller is named.
+/// Throws std::invalid_argument.
+void validate_column_storage_shape(sirius::pinned_column_storage_matrix const& matrix,
+                                   std::size_t expected_chunks,
+                                   std::size_t expected_columns,
+                                   std::string_view context,
+                                   bool allow_empty);
+
+/// Report a recorded carrier that contradicts the type storage actually holds. The single throw
+/// site of @ref validate_recorded_column_storage's cross-check; declared here only because that
+/// validator is a template.
+[[noreturn]] void throw_recorded_carrier_mismatch(std::string_view context,
+                                                  std::size_t chunk_idx,
+                                                  std::size_t column_idx,
+                                                  cudf::data_type recorded,
+                                                  cudf::data_type stored);
+
+/// Validate @p matrix against the storage about to be cached: it must cover every chunk and every
+/// cached column, and every recorded carrier must equal the stored type wherever storage can
+/// report one. @p stored_type answers (chunk, column) with the stored column's cuDF type, or
+/// `std::nullopt` when the form is opaque — a Simpatico-compressed chunk, whose recorded carrier is
+/// correct by construction (the pin driver recorded exactly what compress_with_plan received) and
+/// whose end-to-end defense is serve-time normalization. Also `std::nullopt` for a chunk or column
+/// the storage does not hold, which the cross-check simply skips. Throws std::invalid_argument.
+template <std::invocable<std::size_t, std::size_t> StoredType>
+  requires std::same_as<std::invoke_result_t<StoredType, std::size_t, std::size_t>,
+                        std::optional<cudf::data_type>>
+void validate_recorded_column_storage(sirius::pinned_column_storage_matrix const& matrix,
+                                      std::size_t expected_chunks,
+                                      std::size_t expected_columns,
+                                      std::string_view context,
+                                      StoredType const& stored_type)
+{
+  validate_column_storage_shape(
+    matrix, expected_chunks, expected_columns, context, /*allow_empty=*/false);
+  for (std::size_t chunk_idx = 0; chunk_idx < matrix.size(); ++chunk_idx) {
+    for (std::size_t column_idx = 0; column_idx < matrix[chunk_idx].size(); ++column_idx) {
+      auto const stored = stored_type(chunk_idx, column_idx);
+      if (!stored) { continue; }
+      if (matrix[chunk_idx][column_idx].carrier != *stored) {
+        throw_recorded_carrier_mismatch(
+          context, chunk_idx, column_idx, matrix[chunk_idx][column_idx].carrier, *stored);
+      }
+    }
+  }
+}
+
+/// True when @p entry's storage metadata shows the cached column at @p entry_position (a position
+/// into cache_info.column_ids) narrowed in every chunk. False for an empty matrix, a zero-chunk
+/// entry, or an out-of-range position. `pinned_column_narrow_carrier` uses this in the plan-time
+/// residency gate: a passing column needs at most a same-family widening per chunk; a failing
+/// column stays native instead of requiring per-query range verification and downcasts.
+[[nodiscard]] bool pinned_column_narrowed_in_all_chunks(pinned_entry const& entry,
+                                                        std::size_t entry_position);
+
+/// The narrow plan-target carrier for the cached column at @p entry_position (a position into
+/// cache_info.column_ids): the widest recorded carrier across all chunks. A pure fold over the
+/// entry's @c column_storage metadata — compressed and uncompressed chunks, both tiers, answer
+/// identically and no storage is touched. Returns `std::nullopt` unless
+/// pinned_column_narrowed_in_all_chunks passes and every recorded carrier is a strict same-family
+/// narrowing of @p native_type (can_narrow_to, the defense against metadata that contradicts the
+/// pin-time logical type). Chunks narrower than the returned target widen at serve through the
+/// verified same-family restore. Non-owning read of @p entry: obtain and read it inside one
+/// slot-scoped window, and never hold it across a pin or unpin.
+[[nodiscard]] std::optional<cudf::data_type> pinned_column_narrow_carrier(
+  pinned_entry const& entry, std::size_t entry_position, cudf::data_type native_type);
+
 /**
  * @brief Cache-serve-time survivor plan for one cached scan.
  */
@@ -216,16 +322,24 @@ struct cached_scan_plan {
 /// provider serves (the identity plan when nothing was pruned). @p mvcc_masks
 /// is the provider's own copy of the per-chunk MVCC keep-mask set, paired with
 /// each chunk it yields (slot i masks chunk i; a default slot — or an empty
-/// set, the parquet-pin case — serves the chunk unmasked). Declared here so
-/// the chunk↔mask pairing is unit-testable; the provider type itself stays
-/// internal to the scan manager.
+/// set, the parquet-pin case — serves the chunk unmasked). @p normalization_targets
+/// is the scan's carrier targets in output order
+/// (@c sirius_gpu_scan_operator::normalization_targets); served slot k is output
+/// column k, so a slot past the end is a pure-filter column that reaches no
+/// target. Together with @p has_physical_overrides it decides which columns each
+/// served chunk reports as converting, and how many destination bytes that
+/// conversion allocates. Declared here so the chunk↔mask pairing and the
+/// conversion sizing are unit-testable; the provider type itself stays internal
+/// to the scan manager.
 std::unique_ptr<databatch_provider> make_provider_for_pinned_entry(
   pinned_entry const& entry,
   std::span<std::size_t const> selected_columns,
   cached_scan_plan plan,
   const telemetry::batch_telemetry_info& telemetry_info,
-  mvcc_chunk_mask_set mvcc_masks               = {},
-  std::vector<insert_delta_split> delta_splits = {});
+  mvcc_chunk_mask_set mvcc_masks                     = {},
+  std::vector<insert_delta_split> delta_splits       = {},
+  std::vector<cudf::data_type> normalization_targets = {},
+  bool has_physical_overrides                        = false);
 
 /**
  * @brief Build the survivor plan for serving @p entry to a scan into @p requiested_column_ids with
@@ -353,29 +467,38 @@ class sirius_scan_manager {
   ///                              with @p cache_info's column_ids; empty pins statless.
   /// \param chunk_stats           Per-chunk zone-map stats (chunk_stats[c][i] = column i
   ///                              of chunk c, as compute_pinned_chunk_stats emits).
+  /// \param column_storage        Chunk-major stored-column metadata as the pin driver
+  ///                              recorded it; must cover every chunk and cached column. A
+  ///                              recorded carrier that contradicts a stored column type throws.
   void insert_pinned_entry(
     const std::string& name,
     cache_entry_info cache_info,
     std::vector<std::unique_ptr<cudf::table>> data_tables,
     std::vector<cucascade::memory::memory_space*> chunk_memory_spaces,
-    duckdb::vector<duckdb::LogicalType> column_types                                 = {},
-    std::vector<std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>>> chunk_stats = {});
+    duckdb::vector<duckdb::LogicalType> column_types,
+    std::vector<std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>>> chunk_stats,
+    sirius::pinned_column_storage_matrix column_storage);
 
   /// \brief Pin the host-tier entry for a table.
   ///
   /// Each entry in @p host_chunks describes one batch's worth of pinned data
-  /// (covering all pinned columns) as a host_data_representation. The
-  /// cached provider built from this entry slices each chunk by column
-  /// index at scan time. This path always REPLACES any existing entry for @p name
-  /// — there is no per-column merge analog to the GPU path because the
-  /// chunk-vs-column dimensions are flipped (each chunk already holds every column).
+  /// (covering all pinned columns), in emission order. A chunk is either a
+  /// cucascade::host_data_representation (uncompressed) or a
+  /// sirius::compressed_host_representation (Simpatico-compressed); a single pin
+  /// may mix the two, since compression is decided per chunk. The cached provider
+  /// built from this entry projects each chunk by column index at scan time,
+  /// dispatching on the concrete type. This path always REPLACES any existing
+  /// entry for @p name — there is no per-column merge analog to the GPU path
+  /// because the chunk-vs-column dimensions are flipped (each chunk already holds
+  /// every column).
   ///
   /// \param name          Table name key.
   /// \param cache_info    Cache identity plus the cached columns and their
   ///                      @c column_ids-aligned names (the i-th column in each
-  ///                      host_data_representation corresponds to
-  ///                      @c cache_info.column_names()[i]); drives cache-hit matching.
-  /// \param host_chunks   One host_data_representation per emitted batch.
+  ///                      chunk corresponds to @c cache_info.column_names()[i]);
+  ///                      drives cache-hit matching.
+  /// \param host_chunks   One representation per emitted batch (uncompressed or
+  ///                      compressed).
   /// \param memory_space  Representative host memory space the chunks reside in
   ///                      (metadata only; each chunk carries its own per-GPU
   ///                      NUMA-local memory_space).
@@ -383,13 +506,42 @@ class sirius_scan_manager {
   ///                      with @p cache_info's column_ids; empty pins statless.
   /// \param chunk_stats   Per-chunk zone-map stats (chunk_stats[c][i] = column i of chunk c, as
   ///                      compute_pinned_chunk_stats emits).
+  /// \param column_storage Chunk-major stored-column metadata as the pin driver recorded it;
+  ///                      must cover every chunk and cached column. A recorded carrier that
+  ///                      contradicts an uncompressed chunk's stored type throws; a compressed
+  ///                      chunk's types are unreadable here, so its cells are trusted.
   void insert_pinned_entry_host(
     const std::string& name,
     cache_entry_info cache_info,
-    std::vector<std::shared_ptr<cucascade::host_data_representation>> host_chunks,
+    std::vector<std::shared_ptr<cucascade::idata_representation>> host_chunks,
     cucascade::memory::memory_space& memory_space,
-    duckdb::vector<duckdb::LogicalType> column_types                                 = {},
-    std::vector<std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>>> chunk_stats = {});
+    duckdb::vector<duckdb::LogicalType> column_types,
+    std::vector<std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>>> chunk_stats,
+    sirius::pinned_column_storage_matrix column_storage);
+
+  /// \brief Pin the entry for a table on the GPU tier from a compression-enabled pin.
+  ///
+  /// Each entry in @p chunks is one emitted batch, in emission order, holding all
+  /// pinned columns — either Simpatico-compressed (decompressed on demand at scan
+  /// time) or uncompressed (served directly); a single pin may interleave the two.
+  /// The cached provider prefers @c device_chunks over @c data_batches_by_column
+  /// when non-empty. Always REPLACES any existing entry for @p name — there is no
+  /// per-column merge analog (each chunk already holds every column).
+  ///
+  /// \param name          Table name key.
+  /// \param cache_info    Cache identity plus the cached columns and their
+  ///                      @c column_ids-aligned names.
+  /// \param chunks        One @ref device_pin_chunk per batch (compressed or not).
+  /// \param memory_space  Representative GPU memory space (metadata only).
+  /// \param column_storage Chunk-major stored-column metadata as the pin driver recorded it;
+  ///                      must cover every chunk and cached column. A recorded carrier that
+  ///                      contradicts an uncompressed chunk's stored type throws; a compressed
+  ///                      chunk's types are unreadable here, so its cells are trusted.
+  void insert_pinned_entry_device(const std::string& name,
+                                  cache_entry_info cache_info,
+                                  std::vector<sirius::device_pin_chunk> chunks,
+                                  cucascade::memory::memory_space& memory_space,
+                                  sirius::pinned_column_storage_matrix column_storage);
 
   /// \brief Attach MVCC snapshot metadata to the pinned entry for @p name.
   ///
@@ -409,12 +561,19 @@ class sirius_scan_manager {
     const std::function<bool(std::string_view, const pinned_entry&)>& visitor) const;
 
   /// The pinned entry whose duckdb identity matches catalog.schema.table, or
-  /// nullptr. Non-owning; valid only until the next pin/unpin — the same
-  /// single-threaded query-lifecycle discipline as visit_pinned_entries.
-  /// First match wins if one table was pinned under two names. Read by the
-  /// plan-time MVCC guards.
+  /// nullptr. Non-owning; obtain and read it inside one slot-scoped window, and
+  /// never hold it across a pin or unpin. First match wins if one table was
+  /// pinned under two names. Read by the plan-time MVCC guards.
   [[nodiscard]] pinned_entry const* find_pinned_entry_for_duckdb_table(
     std::string_view catalog_name, std::string_view schema_name, std::string_view table_name) const;
+
+  /// The pinned entry whose parquet identity matches @p resolved_file_paths
+  /// (cache_entry_info::matches_parquet_files), or nullptr. Non-owning; obtain
+  /// and read it inside one slot-scoped window, and never hold it across a pin
+  /// or unpin. First match wins if one file set was pinned under two names.
+  /// Read by the plan-time compressed-materialization residency gate.
+  [[nodiscard]] pinned_entry const* find_pinned_entry_for_parquet_files(
+    std::span<std::string const> resolved_file_paths) const;
 
   parquet_bind_result describe_parquet(std::string const& uri);
 

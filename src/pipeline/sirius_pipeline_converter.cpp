@@ -31,6 +31,7 @@
 #include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_operator_type.hpp"
 #include "op/sirius_physical_partition.hpp"
+#include "pipeline/repository_wiring.hpp"
 
 #include <algorithm>
 #include <functional>
@@ -62,6 +63,11 @@ pipeline_conversion_result sirius_pipeline_converter::convert(sirius_meta_pipeli
   // Must run after finalize_pipeline_structure (populates `dependencies`) and after
   // link_join_partition_siblings (reads dependencies[0]/[1] positionally pre-reorder).
   reorder_pipelines_topologically(scheduled_);
+
+  // Number the operators now that the pipeline set is final and topologically ordered. This is
+  // the one point every caller shares — the engine, and the plan-inspection paths that convert
+  // without building an engine — so no consumer can observe an unnumbered plan.
+  assign_operator_ids(scheduled_);
 
   return {std::move(scheduled_), std::move(repository_wirings_), meta_pipeline_count_};
 }
@@ -531,7 +537,7 @@ std::string dump_barrier_name(op::MemoryBarrierType b)
 void dump_scan_identity(std::ostringstream& out, const op::sirius_physical_operator& op)
 {
   if (op.type != op::SiriusPhysicalOperatorType::GPU_SCAN) { return; }
-  auto const& info = op.Cast<op::scan::sirius_gpu_scan_operator>().peek_table_info();
+  auto const& info = op.Cast<op::scan::sirius_gpu_scan_operator>().get_ingestible().table_info();
   // Iceberg first: its table info derives from parquet's, so the parquet branch would match it
   // and describe an iceberg scan as a plain parquet one. The delete-file count belongs in the
   // identity — two scans of the same files that apply different deletes are not the same scan.

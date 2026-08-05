@@ -3810,6 +3810,29 @@ TEST_CASE("transparent S3 window query reports unsupported S3 CPU fallback",
   CHECK(error.find("no filesystem") == std::string::npos);
 }
 
+TEST_CASE("transparent S3 projection fallback reports prose instead of an exception envelope",
+          "[s3][integration][sql][gpu_execution][fallback][transparent]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  s3_sql_fixture fixture(*env);
+  set_gpu_execution(fixture.con, true);
+  auto const query =
+    "SELECT abs(n_nationkey - 100) FROM " + s3_parquet_scan(*env, "nation") + " LIMIT 1";
+  auto result = fixture.con.Query(query);
+  REQUIRE(result);
+  REQUIRE(result->HasError());
+
+  auto const error = result->GetError();
+  INFO(error);
+  CHECK(error.find("S3 CPU fallback is not supported") != std::string::npos);
+  CHECK(error.find("Underlying GPU error: Unsupported expression in projection") !=
+        std::string::npos);
+  CHECK(error.find("\"exception_type\"") == std::string::npos);
+  CHECK(error.find("\"exception_message\"") == std::string::npos);
+}
+
 TEST_CASE("transparent S3 view fallback is rejected instead of replaying on CPU",
           "[s3][integration][sql][gpu_execution][fallback][transparent]")
 {

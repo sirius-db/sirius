@@ -21,14 +21,22 @@
 #include <op/sirius_physical_operator.hpp>
 #include <op/sirius_physical_operator_type.hpp>
 
+// cudf
+#include <cudf/types.hpp>
+
 // standard library
 #include <memory>
 #include <optional>
+#include <vector>
 
 namespace sirius::scan_manager {
 class split_connector;
 class sirius_scan_manager;
 }  // namespace sirius::scan_manager
+
+namespace duckdb {
+class SiriusContext;
+}  // namespace duckdb
 
 namespace sirius::op::scan {
 
@@ -61,13 +69,20 @@ class sirius_gpu_scan_operator : public sirius_physical_operator {
   static constexpr SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::GPU_SCAN;
 
   /**
+   * @brief Constructs a GPU scan source
+   *
+   * @throw sirius::internal_exception if an output type has no native cuDF carrier
+   *
    * @param types                  Output column types in plan order.
    * @param estimated_cardinality  Planner-estimated row count.
    * @param ingestible             Per-table source built by the plan generator.
+   * @param compressed_materialization_observer  Plan-time counter sink for
+   *                               narrowing observability; may be null.
    */
   sirius_gpu_scan_operator(duckdb::vector<sirius::logical_type> types,
                            duckdb::idx_t estimated_cardinality,
-                           std::shared_ptr<gpu_ingestible> ingestible);
+                           std::shared_ptr<gpu_ingestible> ingestible,
+                           duckdb::SiriusContext* compressed_materialization_observer = nullptr);
 
   ~sirius_gpu_scan_operator() override;
 
@@ -102,10 +117,30 @@ class sirius_gpu_scan_operator : public sirius_physical_operator {
     const op::input_stats& stats) const override;
 
   /**
-   * @brief Const accessor for the ingestible's table_info. Called by the
-   *        pipeline converter's scan-identity dump.
+   * @brief Estimate the peak required by a resident scan carrier conversion.
+   *
+   * The conversion destination coexists with the resident split's working set. Uses the exact
+   * destination size when the scan manager supplied one, otherwise the conservative maximum
+   * numeric-carrier expansion.
+   *
+   * @pre @p stats describes a resident scan input with @c needs_carrier_conversion set.
    */
-  [[nodiscard]] const ingestible_table_info& peek_table_info() const;
+  [[nodiscard]] static std::size_t resident_carrier_conversion_peak_memory_estimate(
+    const op::input_stats& stats) noexcept;
+
+  /**
+   * @brief Returns the complete carrier schema used to normalize scan output
+   *
+   * Selects the explicit physical schema when present and the native cuDF schema otherwise.
+   * `execute()` uses these targets when normalization is required, while
+   * `sirius_scan_manager::prepare_for_query()` uses them to account for resident conversions.
+   *
+   * @return One carrier target per logical output column, in output order
+   */
+  [[nodiscard]] std::vector<cudf::data_type> const& normalization_targets() const noexcept
+  {
+    return has_physical_overrides() ? get_physical_types() : _native_physical_types;
+  }
 
   [[nodiscard]] gpu_ingestible& get_ingestible() const;
 
@@ -114,6 +149,11 @@ class sirius_gpu_scan_operator : public sirius_physical_operator {
  private:
   std::shared_ptr<gpu_ingestible> _ingestible;
   std::shared_ptr<scan_manager::split_connector> _split_connector;
+  /// Non-owning observer. The registered-state shared_ptr owns the context for
+  /// at least as long as the query plan; unit-test operators may leave it null.
+  duckdb::SiriusContext* _compressed_materialization_observer;
+  /// Native cuDF carrier for each logical output column, in output order.
+  std::vector<cudf::data_type> _native_physical_types;
 };
 
 }  // namespace sirius::op::scan

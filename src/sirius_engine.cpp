@@ -69,9 +69,12 @@ std::shared_ptr<const telemetry::telemetry_context> get_telemetry_context_from_c
 
 }  // namespace
 
-sirius_engine::sirius_engine(duckdb::ClientContext& context, sirius_interface& sirius_iface)
+sirius_engine::sirius_engine(duckdb::ClientContext& context,
+                             sirius_interface& sirius_iface,
+                             sirius::query_id_t query_id)
   : context(context),
     sirius_iface(sirius_iface),
+    query_id_(query_id),
     telemetry_context_(get_telemetry_context_from_client_context(this->context)),
     query_handle_(
       quent::query::create(telemetry_context_->context(),
@@ -138,11 +141,22 @@ void sirius_engine::execute()
     throw invalid_input_exception("Sirius context is not initialized.");
   }
 
+  // Quent mints its own UUID for the query and its Init struct takes no caller-supplied id, so
+  // telemetry stays UUID-native while the engine uses the numeric window id. Emit the mapping
+  // once so log lines (keyed by query id) and telemetry (keyed by UUID) can be joined.
+  auto const telemetry_uuid = query_handle_->uuid();
+  SIRIUS_LOG_INFO("query {} telemetry_query={:016x}{:016x}",
+                  query_id_,
+                  telemetry_uuid.high_bits,
+                  telemetry_uuid.low_bits);
+
   // Create the query with the pipelines
   sirius_ctx->create_query(std::move(new_scheduled),
+                           query_id_,
                            telemetry::query_telemetry_info{
-                             .query_id  = query_handle_->uuid(),
-                             .worker_id = telemetry_context_->worker_id(),
+                             .telemetry_query_id = telemetry_uuid,
+                             .worker_id          = telemetry_context_->worker_id(),
+                             .query_id           = query_id_,
                            });
   auto future = sirius_ctx->get_task_scheduler().start_query();
   try {
@@ -228,16 +242,19 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
   pipeline::sirius_pipeline_converter converter(build_ctx, op_params);
   auto result = converter.convert(*root_pipeline);
 
+  auto repo_manager = sirius_ctx_ptr->get_data_repository_manager(query_id_);
+  if (!repo_manager) {
+    throw sirius::internal_exception(
+      "sirius_engine::initialize_internal: no data repository manager registered for query {}; "
+      "the engine must run inside a SiriusContext execution window",
+      query_id_);
+  }
+
   // Materialize plan-time wiring descriptors into runtime repositories and ports.
-  pipeline::materialize_repository_wiring(result.repository_wirings,
-                                          sirius_ctx_ptr->get_data_repository_manager());
+  pipeline::materialize_repository_wiring(result.repository_wirings, *repo_manager);
 
   new_scheduled   = std::move(result.scheduled_pipelines);
   total_pipelines = result.meta_pipeline_count;
-
-  // NOTE: dead code preserved for operator ID numbering stability
-  auto invalid_op = make_uniq<op::sirius_physical_operator>(
-    op::SiriusPhysicalOperatorType::INVALID, duckdb::vector<sirius::logical_type>{}, 0);
 
   // Collect all pipelines for progress tracking
   root_pipeline->get_pipelines(sirius_pipelines, true);

@@ -3,6 +3,10 @@ use quent_events::Event;
 pub use quent_query_engine_analyzer::QueryEngineModel;
 use quent_query_engine_analyzer::entities;
 use quent_query_engine_analyzer::ui::{QuentViewer, UiAnalyzer, ViewerEventStream};
+use quent_query_engine_analyzer::{
+    EngineEntity, OperatorEntity, PlanEntity, PortEntity, QueryEntity, QueryGroupEntity,
+    WorkerEntity,
+};
 use quent_query_engine_ui::{
     DataFlowTimelineBinned, OperatorFilter, QueryBundle, QueryEntities, QueryFilter,
 };

@@ -327,6 +327,16 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   /// decision so the partition can finish its own wiring (e.g. enabling build-side concat_all).
   partition_strategy get_partition_strategy(const partition_sizing_input& in) override;
 
+  /// True when this join publishes dynamic filters (a filter-pushdown plan with wired probe
+  /// targets). The upstream PARTITION folds a single-partition build to one batch for such a join
+  /// so the one-shot publisher sees the whole key set.
+  [[nodiscard]] bool publishes_dynamic_filters() const;
+
+  /// Reported by the upstream PARTITION at sizing time: the build port will deliver one
+  /// concat-folded batch covering the entire build side (single-partition or broadcast build).
+  /// Precondition for claiming a build batch for dynamic-filter publication, in any join mode.
+  void set_build_arrives_whole(bool arrives_whole);
+
   /// @brief True when this join runs in build-then-probe mode (see `get_partition_strategy`).
   [[nodiscard]] bool is_build_probe_mode();
 
@@ -380,6 +390,12 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   // the probe side is streamed unpartitioned.
   bool _broadcast = false;
 
+  // Whether the build port delivers one concat-folded batch covering the entire build side
+  // (single-partition or broadcast build with a concat_all'd build-side CONCAT). Set by the
+  // upstream PARTITION at sizing time; the one-shot dynamic-filter publisher only claims a build
+  // batch when this holds. Guarded by op_state_mutex.
+  bool _build_arrives_whole = false;
+
   // Whether any build-side join key column contains a NULL. Used exclusively for MARK join
   // three-valued logic. Sentinel -1 = unset, 0 = false, 1 = true. Join-wide (not per-partition)
   // because MARK joins are forced to a single partition / broadcast, so all build batches agree.
@@ -413,6 +429,17 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   std::vector<cudf::size_type> left_key_col_indices;
   std::vector<cudf::size_type> right_key_col_indices;
   bool cast_necessary = false;
+
+  /// Null-matching flag for the equi-keys passed to cuDF joins, cached at
+  /// construction (conditions and join_type are fixed thereafter). cuDF applies one
+  /// flag to all key columns, so it is EQUAL (null-safe -- NULL matches NULL) only
+  /// when EVERY equi-key is IS NOT DISTINCT FROM; a plain `=` key (including mixed
+  /// joins such as delim joins) forces UNEQUAL. MARK joins are also forced to
+  /// UNEQUAL to match their IN/EXISTS three-valued result logic -- a null-safe MARK
+  /// join (e.g. EXISTS with IS NOT DISTINCT FROM) is a known unsupported case, see
+  /// the constructor.
+  cudf::null_equality compare_nulls() const { return compare_nulls_; }
+  cudf::null_equality compare_nulls_ = cudf::null_equality::UNEQUAL;
 
  public:
   //! Per-key cast info: whether each join key needs a cast before comparison

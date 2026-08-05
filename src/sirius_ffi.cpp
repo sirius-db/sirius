@@ -95,6 +95,10 @@ struct Context::Impl {
     // IN_CLAUSE and COMPRESSED_MATERIALIZATION here; this path remains more conservative.
     auto& client = *conn->context;
     client.registered_state->Insert(kSiriusStateKey, context);
+    // Per-connection Sirius state (guard depths, capture bookkeeping) for the
+    // embedded connection, mirroring OnConnectionOpened on the transparent path.
+    client.registered_state->Insert("sirius_connection_state",
+                                    duckdb::make_shared_ptr<duckdb::SiriusConnectionState>());
     client.config.enable_optimizer = true;
     auto& disabled = duckdb::DBConfig::GetConfig(client).options.disabled_optimizers;
     disabled.insert(duckdb::OptimizerType::IN_CLAUSE);
@@ -137,12 +141,8 @@ void Context::execute_substrait(const std::string& plan, std::uintptr_t out_stre
   // execution is eager (the result is materialized), so the transaction can close
   // before the Arrow stream is consumed.
   impl_->conn->BeginTransaction();
-  bool query_started = false;
   duckdb::unique_ptr<duckdb::QueryResult> result;
   try {
-    impl_->context->QueryBeginStandalone(client, kQueryLabel);
-    query_started = true;
-
     // 1. Substrait bytes -> DuckDB Relation. DuckDB is used only for this lowering.
     duckdb::SubstraitToDuckDB transformer(impl_->conn->context, plan, /*json=*/false);
     auto relation = transformer.TransformPlan();
@@ -168,29 +168,25 @@ void Context::execute_substrait(const std::string& plan, std::uintptr_t out_stre
     duckdb::ColumnBindingResolver::Verify(*logical_plan);
     resolver.VisitOperator(*logical_plan);
 
-    // 3. DuckDB LogicalOperator -> Sirius GPU physical plan -> execute directly on the engine.
-    auto physical_plan =
-      sirius::planner::sirius_physical_plan_generator(client).create_plan(std::move(logical_plan));
-    auto gpu_prepared = duckdb::make_shared_ptr<sirius::sirius_prepared_statement_data>(
-      std::move(prepared), std::move(physical_plan));
+    // 3. DuckDB LogicalOperator -> Sirius GPU physical plan -> execute directly
+    // on the engine, inside an execution window: begin mutations and slot
+    // acquire in the constructor, mandatory cleanup and release in finish().
+    // This standalone path bypasses DuckDB's normal query entry point, so
+    // nothing else would clean up for it. (The old manual QueryBegin/QueryEnd
+    // pairing could call QueryEnd twice when the first cleanup threw.)
+    {
+      duckdb::SiriusContext::StandaloneQueryScope window(*impl_->context, client, kQueryLabel);
+      auto physical_plan = sirius::planner::sirius_physical_plan_generator(client).create_plan(
+        std::move(logical_plan));
+      auto gpu_prepared = duckdb::make_shared_ptr<sirius::sirius_prepared_statement_data>(
+        std::move(prepared), std::move(physical_plan));
 
-    sirius::sirius_interface iface(client, std::optional<std::string>(kQueryLabel));
-    result = iface.sirius_execute_query(
-      client, kQueryLabel, gpu_prepared, duckdb::PendingQueryParameters{});
-
-    // This standalone path bypasses DuckDB's normal query entry point, so its
-    // ClientContextState callbacks are not invoked automatically. End every
-    // single-shot execution explicitly to clear repositories, scan providers,
-    // and task-creator state before the next fragment.
-    impl_->context->QueryEnd();
-    query_started = false;
-  } catch (...) {
-    if (query_started) {
-      try {
-        impl_->context->QueryEnd();
-      } catch (...) {
-      }
+      sirius::sirius_interface iface(client, std::optional<std::string>(kQueryLabel));
+      result = iface.sirius_execute_query(
+        client, kQueryLabel, gpu_prepared, duckdb::PendingQueryParameters{}, window.query_id());
+      window.finish();
     }
+  } catch (...) {
     impl_->conn->Rollback();
     throw;
   }

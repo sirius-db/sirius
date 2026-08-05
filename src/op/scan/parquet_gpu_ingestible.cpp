@@ -57,11 +57,14 @@
 
 // standard library
 #include <algorithm>
+#include <cctype>
 #include <cstdint>
+#include <filesystem>
 #include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -70,6 +73,23 @@ namespace sirius::op::scan {
 namespace {
 
 bool has_uri_scheme(std::string const& p) { return p.find("://") != std::string::npos; }
+
+// Strip a leading, case-insensitive "file://" scheme, if present.
+std::string strip_file_uri(std::string const& p)
+{
+  static constexpr std::string_view kFile = "file://";
+  if (p.size() > kFile.size()) {
+    bool is_file_uri = true;
+    for (std::size_t i = 0; i < kFile.size(); ++i) {
+      if (std::tolower(static_cast<unsigned char>(p[i])) != static_cast<unsigned char>(kFile[i])) {
+        is_file_uri = false;
+        break;
+      }
+    }
+    if (is_file_uri) { return p.substr(kFile.size()); }
+  }
+  return p;
+}
 
 //===----------------------------------------------------------------------===//
 // parquet_batch_coalescer
@@ -261,6 +281,22 @@ std::vector<cudf::io::text::byte_range_info> column_chunk_ranges(
 
 }  // namespace
 
+std::string canonical_scan_file_path(std::string const& raw)
+{
+  std::string p = strip_file_uri(raw);
+  if (has_uri_scheme(p)) { return p; }  // s3://, gs://, http(s):// — local canon N/A
+  std::error_code ec;
+  auto c = std::filesystem::weakly_canonical(std::filesystem::path(p), ec);
+  return ec ? std::filesystem::path(p).lexically_normal().string() : c.string();
+}
+
+void canonicalize_scan_file_paths(std::vector<std::string>& paths)
+{
+  for (auto& p : paths) {
+    p = canonical_scan_file_path(p);
+  }
+}
+
 //===----------------------------------------------------------------------===//
 // scan_info fadvise_entries — prefetch byte ranges
 //===----------------------------------------------------------------------===//
@@ -340,7 +376,15 @@ parquet_gpu_ingestible::parquet_gpu_ingestible(std::unique_ptr<parquet_ingestibl
                                                       bind.returned_types,
                                                       _plan->batch_position_by_column_id,
                                                       _plan->partition_primary_indices);
-    if (duckdb_expression) { _duckdb_filter_expression = std::move(duckdb_expression); }
+    if (duckdb_expression) {
+      // Validate before scan tasks retranslate and dereference the predicate.
+      if (sirius::ast::from_duckdb(*duckdb_expression) == nullptr) {
+        throw duckdb::InvalidInputException(
+          "parquet scan: cannot evaluate pushed-down predicate on GPU: %s",
+          duckdb_expression->ToString());
+      }
+      _duckdb_filter_expression = std::move(duckdb_expression);
+    }
   }
 
   // Shared reader options — column projection only. set_filter is never applied
@@ -499,6 +543,7 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
     };
     gpu_expression_translator translator(stream, cudf::get_current_device_resource_ref());
     auto sirius_filter_ast = sirius::ast::from_duckdb(*_duckdb_filter_expression);
+    D_ASSERT(sirius_filter_ast != nullptr);
     ast_expression = translator.translate_expression_with_names(*sirius_filter_ast, name_resolver);
     if (ast_expression) { opts.set_filter(ast_expression->back()); }
   }
@@ -736,7 +781,8 @@ filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
 
   if (_duckdb_filter_expression && !split.disable_filter_pushdown && !all_slices_pruned) {
     auto sirius_filter_ast = sirius::ast::from_duckdb(*_duckdb_filter_expression);
-    auto name_resolver     = [plan = split.plan](duckdb::idx_t ref_index) -> std::string {
+    D_ASSERT(sirius_filter_ast != nullptr);
+    auto name_resolver = [plan = split.plan](duckdb::idx_t ref_index) -> std::string {
       return plan->batch_column_name(ref_index);
     };
     gpu_expression_translator translator(stream, cudf::get_current_device_resource_ref());

@@ -74,12 +74,22 @@ jobs:
             echo "SCCACHE_GHA_ENABLED=true" >> $GITHUB_ENV
           fi
 
-      - uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+      - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
 
       - name: Build
         env:
           CUDAARCHS: "75" # 75 for T4 capability; 89 for L4 capability
-        run: make -j$(nproc)
+        run: |
+          set -o pipefail
+          make -j$(nproc) 2>&1 | tee /tmp/build.log
+
+      - name: Surface build errors
+        if: failure()
+        run: |
+          echo '## Build errors' >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          grep -E '(FAILED:|: error:|: fatal error:)' /tmp/build.log | head -60 >> "$GITHUB_STEP_SUMMARY" || true
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
 
       - name: Package build artifacts
         run: tar -cf build.tar build/release/
@@ -133,8 +143,17 @@ jobs:
 
       - name: Run C++ unit tests
         run: |
+          set -o pipefail
           nvidia-smi
-          timeout 45m ./build/release/extension/sirius/test/cpp/sirius_unittest --abort
+          timeout 45m ./build/release/extension/sirius/test/cpp/sirius_unittest --abort 2>&1 | tee /tmp/unittest.log
+
+      - name: Surface test failures
+        if: failure()
+        run: |
+          echo '## Test failures' >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          grep -B 5 -A 10 'FAILED:' /tmp/unittest.log | head -80 >> "$GITHUB_STEP_SUMMARY" || true
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload unit test logs
         if: always()

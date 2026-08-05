@@ -1,5 +1,6 @@
 sirius:
   telemetry:
     enable_quent: true
+    exporter: postcard
     output_directory: telemetry_data
     engine_name: siriusDB

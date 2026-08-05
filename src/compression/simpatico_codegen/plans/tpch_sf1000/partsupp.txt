@@ -1,0 +1,28 @@
+# Pareto-picked plans: max ratio with decompress >= 250 GB/s per column.
+# column: ps_partkey  dtype: i32  ratio: 101.136x  depth: 2
+# comp: 251.44 GB/s  decomp: 714.73 GB/s
+input -> delta -> differences
+delta.differences -> lz4
+
+---
+# column: ps_suppkey  dtype: i32  ratio: 37.380x  depth: 2
+# comp: 82.06 GB/s  decomp: 426.30 GB/s
+input -> delta -> differences
+delta.differences -> deflate
+
+---
+# column: ps_availqty  dtype: i32  ratio: 2.274x  depth: 1
+# comp: 724.97 GB/s  decomp: 1573.71 GB/s
+input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+
+---
+# column: ps_supplycost  dtype: t26  ratio: 3.742x  depth: 1
+# comp: 100.00 GB/s  decomp: 267.09 GB/s
+input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+---
+# column: ps_comment  dtype: str  ratio: 1.019x  depth: 3
+# note: chars stay raw — its ~12GB buffer compresses to >INT32_MAX bytes, which
+# cannot be serialized as a single nvcomp leaf (.hpln header is a UINT8 column)
+input -> str_split -> offsets, chars
+str_split.offsets -> delta -> differences
+str_split.offsets.differences -> ans

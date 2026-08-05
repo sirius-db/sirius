@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "data/data_repository_manager_registry.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "sirius_engine.hpp"
 
@@ -94,19 +95,22 @@ class sirius_interface {
   duckdb::unique_ptr<duckdb::PendingQueryResult> sirius_pending_statement_internal(
     duckdb::ClientContext& context,
     duckdb::shared_ptr<sirius_prepared_statement_data>& statement_p,
-    const duckdb::PendingQueryParameters& parameters);
+    const duckdb::PendingQueryParameters& parameters,
+    sirius::query_id_t query_id);
   //! Create the pending statement or prepared statement
   duckdb::unique_ptr<duckdb::PendingQueryResult> sirius_pending_statement_or_prepared_statement(
     duckdb::ClientContext& context,
     const duckdb::string& query,
     duckdb::shared_ptr<sirius_prepared_statement_data>& statement_p,
-    const duckdb::PendingQueryParameters& parameters);
+    const duckdb::PendingQueryParameters& parameters,
+    sirius::query_id_t query_id);
   //! Execute the query
   duckdb::unique_ptr<duckdb::QueryResult> sirius_execute_query(
     duckdb::ClientContext& context,
     const duckdb::string& query,
     duckdb::shared_ptr<sirius_prepared_statement_data>& statement_p,
-    const duckdb::PendingQueryParameters& parameters);
+    const duckdb::PendingQueryParameters& parameters,
+    sirius::query_id_t query_id);
   //! Execute the pending query result
   duckdb::unique_ptr<duckdb::QueryResult> sirius_execute_pending_query_result(
     duckdb::PendingQueryResult& pending);
