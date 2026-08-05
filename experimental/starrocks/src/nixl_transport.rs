@@ -1,0 +1,759 @@
+//! The nixl exchange transport tier (PLAN-PATH-B B5).
+//!
+//! One dedicated thread owns the nixl [`Agent`] — the Rust binding documents a multithreading
+//! deadlock caveat, so every agent touch funnels through the request channel, mirroring the
+//! engine-thread pattern. The [`NixlTransport`] handle and its request types compile in every
+//! build so the service can hold and test the seam; only [`NixlTransport::start`] and the thread
+//! body need libnixl and are gated on the `nixl-transport` feature.
+//!
+//! Wire shape (WRITE-based; every lease lifetime stays process-local):
+//! sender `export_packed` → `request_staging_lease` at the peer → nixl WRITE lease→lease →
+//! `transmit_packed` (pack metadata in the brpc attachment) → release the local lease; a final
+//! `transmit_packed{eos}` closes the sender on the peer's rendezvous. EOS and sender-set
+//! completion stay on brpc — one source of truth.
+
+use std::sync::Mutex;
+use std::sync::mpsc::{Sender, channel};
+use std::thread::JoinHandle;
+
+use crate::fragment_executor::SenderSlot;
+
+/// A bare `nixl_capi_is_stub()` build would dlopen-fail at agent creation; every startup error
+/// message points here so the fix is discoverable.
+#[cfg(feature = "nixl-transport")]
+const ENV_HINT: &str = "source tools/nvda_nixl/ENV.sh (NIXL_PREFIX/NIXL_PLUGIN_DIR/\
+                        LD_LIBRARY_PATH) and set UCX_TLS=cuda_copy,cuda_ipc,tcp,self";
+
+/// Reply to a metadata exchange: this CN's agent identity for the peer to load.
+#[derive(Clone, Debug)]
+pub(crate) struct MdReply {
+    /// This CN's nixl agent name (`{advertise_host}:{brpc_port}`).
+    pub(crate) agent_name: String,
+    /// This CN's serialized agent metadata (getLocalMD blob).
+    pub(crate) metadata: Vec<u8>,
+}
+
+/// One parked sender output to transmit to a remote receiver.
+#[derive(Clone, Debug)]
+#[cfg_attr(not(feature = "nixl-transport"), allow(dead_code))]
+pub(crate) struct RemoteSendSpec {
+    /// Peer CN advertised host.
+    pub(crate) host: String,
+    /// Peer CN brpc port.
+    pub(crate) brpc_port: u16,
+    /// Where the engine parked the sender's batches; also carries the receiver instance id,
+    /// exchange node id, and sender ordinal the wire frames address.
+    pub(crate) slot: SenderSlot,
+    /// Sender fragment output column names, repeated on every frame (pack metadata carries none).
+    pub(crate) names: Vec<String>,
+}
+
+/// One message to the transport thread.
+#[cfg_attr(not(feature = "nixl-transport"), allow(dead_code))]
+pub(crate) enum TransportRequest {
+    /// A peer opened a session: load its metadata, reply with ours. Idempotent.
+    ExchangeMd {
+        peer_agent_name: String,
+        peer_metadata: Vec<u8>,
+        respond: Sender<Result<MdReply, String>>,
+    },
+    /// Drain one parked sender output to a remote receiver (blocking the requesting RPC thread
+    /// until every batch and the eos have been transmitted, exactly like the engine pattern).
+    SendFragment {
+        spec: RemoteSendSpec,
+        respond: Sender<Result<(), String>>,
+    },
+}
+
+/// Handle to the transport thread. Constructible only with the `nixl-transport` feature (via
+/// [`start`](Self::start)); without it the type still exists so the service seam — and its
+/// pure-Rust tests — compile everywhere.
+#[derive(Debug)]
+pub struct NixlTransport {
+    /// Sender to the transport thread. `Mutex<Option<..>>` makes the `!Sync` sender shareable
+    /// and lets `Drop` close the channel before joining; sends are brief.
+    requests: Mutex<Option<Sender<TransportRequest>>>,
+    /// Transport thread handle, taken and joined on drop.
+    thread: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl NixlTransport {
+    /// Sends one request to the transport thread and blocks for its answer.
+    fn transport_call<T>(
+        &self,
+        make_request: impl FnOnce(Sender<Result<T, String>>) -> TransportRequest,
+    ) -> Result<T, String> {
+        let (respond_tx, respond_rx) = channel();
+        self.requests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .ok_or_else(|| "nixl transport is shutting down".to_string())?
+            .send(make_request(respond_tx))
+            .map_err(|_| "nixl transport thread is not running".to_string())?;
+        respond_rx
+            .recv()
+            .map_err(|_| "nixl transport thread dropped the response".to_string())?
+    }
+
+    /// Loads a peer's agent metadata and returns ours (the `exchange_nixl_md` handler body).
+    pub(crate) fn exchange_md(
+        &self,
+        peer_agent_name: String,
+        peer_metadata: Vec<u8>,
+    ) -> Result<MdReply, String> {
+        self.transport_call(|respond| TransportRequest::ExchangeMd {
+            peer_agent_name,
+            peer_metadata,
+            respond,
+        })
+    }
+
+    /// Transmits one parked sender output to a remote receiver, blocking until the eos frame is
+    /// acknowledged (or failing loudly — the caller propagates the error to the FE).
+    pub(crate) fn send_fragment(&self, spec: RemoteSendSpec) -> Result<(), String> {
+        self.transport_call(|respond| TransportRequest::SendFragment { spec, respond })
+    }
+
+    /// Test seam: a handle whose requests land on `requests` instead of a real transport thread.
+    #[cfg(test)]
+    pub(crate) fn for_test(requests: Sender<TransportRequest>) -> Self {
+        Self {
+            requests: Mutex::new(Some(requests)),
+            thread: Mutex::new(None),
+        }
+    }
+}
+
+impl Drop for NixlTransport {
+    fn drop(&mut self) {
+        // Close the request channel so the thread's `recv()` returns, then join for an ordered
+        // teardown (the thread holds an executor handle that must release before the engine).
+        self.requests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(thread) = self
+            .thread
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        {
+            let _ = thread.join();
+        }
+    }
+}
+
+#[cfg(feature = "nixl-transport")]
+mod agent_tier {
+    //! Everything that touches libnixl: the transport thread body and its helpers.
+
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::sync::mpsc::Receiver;
+    use std::time::{Duration, Instant};
+
+    use nixl_sys::{
+        Agent, MemType, MemoryRegion, NixlDescriptor, OptArgs, RegistrationHandle, XferDescList,
+        XferOp, XferStatus,
+    };
+    use prost::Message;
+    use starrocks_thrift::status_code::TStatusCode;
+    use tracing::{info, warn};
+
+    use super::*;
+    use crate::fragment_executor::FragmentExecutor;
+    use crate::proto::starrocks::p_internal_service_brpc::methods;
+    use crate::proto::starrocks::{
+        PExchangeNixlMd, PExchangeNixlMdResult, PStagingLeaseRequest, PStagingLeaseResult,
+        PTransmitPackedParams, PTransmitPackedResult, PUniqueId, StatusPb,
+    };
+    use crate::prpc_client::PrpcClient;
+
+    /// Bytes of the mandatory first-contact bandwidth canary (finding F1): pool memory over
+    /// cuda_ipc silently degrades ~220x with correct bytes, so a slow link must be refused, not
+    /// tolerated.
+    pub(super) const CANARY_BYTES: u64 = 16 << 20;
+    /// A small first WRITE settles UCX connection wireup so the canary times the steady link,
+    /// not the handshake.
+    pub(super) const WARMUP_BYTES: u64 = 1 << 20;
+    /// Floor under which the link is declared degraded. The healthy same-host cuda_ipc path
+    /// measured ~85-90 GB/s; the degraded staged-copy path ~0.4 GB/s.
+    pub(super) const CANARY_FLOOR_GBPS: f64 = 2.0;
+    /// Bound on waiting for one posted WRITE to reach DONE.
+    const XFER_TIMEOUT: Duration = Duration::from_secs(30);
+
+    impl NixlTransport {
+        /// Brings up the transport on a dedicated thread (fail-fast): nixl agent named
+        /// `agent_name`, UCX backend, and the executor's staging arena registered as VRAM.
+        /// Blocks until the agent is ready — or bring-up fails — so a missing libnixl, plugin
+        /// dir, or arena surfaces here, before any cross-node query is accepted.
+        pub fn start(
+            executor: Arc<dyn FragmentExecutor>,
+            agent_name: String,
+        ) -> Result<Self, String> {
+            let (request_tx, request_rx) = channel::<TransportRequest>();
+            let (ready_tx, ready_rx) = channel::<Result<(), String>>();
+            let thread = std::thread::Builder::new()
+                .name("nixl-transport".to_string())
+                .spawn(move || transport_thread(executor, agent_name, request_rx, ready_tx))
+                .map_err(|err| format!("failed to spawn nixl-transport thread: {err}"))?;
+            match ready_rx.recv() {
+                Ok(Ok(())) => Ok(Self {
+                    requests: Mutex::new(Some(request_tx)),
+                    thread: Mutex::new(Some(thread)),
+                }),
+                Ok(Err(err)) => {
+                    let _ = thread.join();
+                    Err(err)
+                }
+                Err(_) => Err("nixl-transport thread exited during bring-up".to_string()),
+            }
+        }
+    }
+
+    /// Transport-thread body: bring the agent up, signal readiness, then serve requests until
+    /// the channel closes.
+    fn transport_thread(
+        executor: Arc<dyn FragmentExecutor>,
+        agent_name: String,
+        requests: Receiver<TransportRequest>,
+        ready: Sender<Result<(), String>>,
+    ) {
+        let mut state = match TransportState::bring_up(executor, agent_name) {
+            Ok(state) => {
+                // A send error means the caller is already gone; nothing to serve.
+                if ready.send(Ok(())).is_err() {
+                    return;
+                }
+                state
+            }
+            Err(err) => {
+                let _ = ready.send(Err(err));
+                return;
+            }
+        };
+
+        while let Ok(request) = requests.recv() {
+            // Respond-send errors are ignored: the waiting caller may have been dropped.
+            match request {
+                TransportRequest::ExchangeMd {
+                    peer_agent_name,
+                    peer_metadata,
+                    respond,
+                } => {
+                    let _ = respond.send(state.exchange_md(&peer_agent_name, &peer_metadata));
+                }
+                TransportRequest::SendFragment { spec, respond } => {
+                    let result = state.send_fragment(&spec);
+                    if result.is_err() {
+                        // Best-effort GPU cleanup: without it a failed transmit pins the parked
+                        // output for the process lifetime (per-query GC is cut from Path B).
+                        if let Err(drop_err) = state.executor.drop_parked(spec.slot) {
+                            warn!(
+                                slot = ?spec.slot,
+                                error = %drop_err,
+                                "failed to drop the parked output of a failed remote transmit"
+                            );
+                        }
+                    }
+                    let _ = respond.send(result);
+                }
+            }
+        }
+        info!("nixl-transport thread shutting down");
+    }
+
+    /// The staging arena as a nixl memory descriptor: device-resident (`cudaMalloc` by the
+    /// arena's contract — pool memory silently degrades over cuda_ipc), device ordinal 0
+    /// (`CUDA_VISIBLE_DEVICES` pins the device per process).
+    #[derive(Debug)]
+    struct ArenaRegion {
+        base: usize,
+        len: usize,
+    }
+
+    impl MemoryRegion for ArenaRegion {
+        unsafe fn as_ptr(&self) -> *const u8 {
+            self.base as *const u8
+        }
+
+        fn size(&self) -> usize {
+            self.len
+        }
+    }
+
+    impl NixlDescriptor for ArenaRegion {
+        fn mem_type(&self) -> MemType {
+            MemType::Vram
+        }
+
+        fn device_id(&self) -> u64 {
+            0
+        }
+    }
+
+    /// One established peer: a cached brpc control-plane connection plus the loaded nixl agent.
+    struct PeerSession {
+        client: PrpcClient,
+        remote_agent: String,
+    }
+
+    /// Thread-local transport state; the agent never leaves this thread.
+    pub(super) struct TransportState {
+        pub(super) executor: Arc<dyn FragmentExecutor>,
+        pub(super) agent: Agent,
+        pub(super) agent_name: String,
+        pub(super) local_md: Vec<u8>,
+        pub(super) staging_base: u64,
+        /// Keeps the arena registered with the agent for the thread's lifetime.
+        _arena_registration: RegistrationHandle,
+        peers: HashMap<String, PeerSession>,
+    }
+
+    /// Creates one nixl agent with a UCX backend and the staging arena registered as VRAM.
+    /// Returns the agent, the registration (kept alive for the agent's lifetime), and the
+    /// serialized local metadata peers load.
+    fn bring_up_agent(
+        agent_name: &str,
+        staging_base: u64,
+        staging_capacity: u64,
+    ) -> Result<(Agent, RegistrationHandle, Vec<u8>), String> {
+        let agent = Agent::new(agent_name).map_err(|err| {
+            format!("failed to create nixl agent '{agent_name}': {err} — {ENV_HINT}")
+        })?;
+        let (_mem_types, params) = agent
+            .get_plugin_params("UCX")
+            .map_err(|err| format!("nixl UCX plugin unavailable: {err} — {ENV_HINT}"))?;
+        let backend = agent.create_backend("UCX", &params).map_err(|err| {
+            format!("failed to create the nixl UCX backend: {err} — {ENV_HINT}")
+        })?;
+        let mut opt_args =
+            OptArgs::new().map_err(|err| format!("failed to create nixl opt args: {err}"))?;
+        opt_args
+            .add_backend(&backend)
+            .map_err(|err| format!("failed to select the UCX backend: {err}"))?;
+        let arena = ArenaRegion {
+            base: staging_base as usize,
+            len: staging_capacity as usize,
+        };
+        let arena_registration = agent.register_memory(&arena, Some(&opt_args)).map_err(|err| {
+            format!(
+                "failed to register the {staging_capacity}-byte staging arena with nixl: {err} — \
+                 UCX_TLS must include cuda_copy for VRAM detection ({ENV_HINT})"
+            )
+        })?;
+        let local_md = agent
+            .get_local_md()
+            .map_err(|err| format!("failed to serialize nixl agent metadata: {err}"))?;
+        Ok((agent, arena_registration, local_md))
+    }
+
+    impl TransportState {
+        pub(super) fn bring_up(
+            executor: Arc<dyn FragmentExecutor>,
+            agent_name: String,
+        ) -> Result<Self, String> {
+            let (staging_base, staging_capacity) = executor.staging_info().map_err(|err| {
+                format!("nixl transport needs the exchange staging arena: {err}")
+            })?;
+            let (agent, arena_registration, local_md) =
+                bring_up_agent(&agent_name, staging_base, staging_capacity)?;
+            info!(
+                agent = %agent_name,
+                staging_base,
+                staging_capacity,
+                "nixl transport ready; staging arena registered"
+            );
+            Ok(Self {
+                executor,
+                agent,
+                agent_name,
+                local_md,
+                staging_base,
+                _arena_registration: arena_registration,
+                peers: HashMap::new(),
+            })
+        }
+
+        /// Receiver side of first contact: load the peer's metadata, reply with ours.
+        fn exchange_md(&mut self, peer_agent_name: &str, peer_metadata: &[u8]) -> Result<MdReply, String> {
+            let loaded = self.agent.load_remote_md(peer_metadata).map_err(|err| {
+                format!("failed to load nixl metadata of peer '{peer_agent_name}': {err}")
+            })?;
+            if loaded != peer_agent_name {
+                return Err(format!(
+                    "peer announced agent name '{peer_agent_name}' but its metadata decodes to \
+                     '{loaded}'"
+                ));
+            }
+            Ok(MdReply {
+                agent_name: self.agent_name.clone(),
+                metadata: self.local_md.clone(),
+            })
+        }
+
+        /// Establishes the peer session on first contact: metadata exchange over brpc, then the
+        /// mandatory bandwidth canary. Returns the session key.
+        fn ensure_session(&mut self, host: &str, brpc_port: u16) -> Result<String, String> {
+            let key = format!("{host}:{brpc_port}");
+            if self.peers.contains_key(&key) {
+                return Ok(key);
+            }
+            let mut client = PrpcClient::new(host, brpc_port);
+            let reply = rpc_exchange_md(&mut client, &self.agent_name, &self.local_md)?;
+            let loaded = self.agent.load_remote_md(&reply.metadata).map_err(|err| {
+                format!("failed to load nixl metadata of peer {key}: {err}")
+            })?;
+            if loaded != reply.agent_name {
+                return Err(format!(
+                    "peer {key} announced agent name '{}' but its metadata decodes to '{loaded}'",
+                    reply.agent_name
+                ));
+            }
+            self.bandwidth_canary(&mut client, &loaded)?;
+            self.peers.insert(
+                key.clone(),
+                PeerSession {
+                    client,
+                    remote_agent: loaded,
+                },
+            );
+            Ok(key)
+        }
+
+        /// F1's silent-degradation guard: nothing in nixl/UCX flags the ~220x staged-copy path
+        /// (wrongly-allocated memory still transfers correct bytes), so the first contact WRITEs
+        /// a 16 MiB lease→lease probe and refuses the tier below the floor.
+        fn bandwidth_canary(&mut self, client: &mut PrpcClient, remote_agent: &str) -> Result<(), String> {
+            let local_offset = self.executor.staging_lease(CANARY_BYTES).map_err(|err| {
+                format!("failed to lease canary staging bytes locally: {err}")
+            })?;
+            let result = (|| {
+                let lease = rpc_request_lease(client, CANARY_BYTES)?;
+                let local_addr = self.staging_base + local_offset;
+                // Warmup settles connection wireup; the timed WRITE measures the steady link.
+                write_and_wait(&self.agent, remote_agent, local_addr, lease.remote_addr, WARMUP_BYTES)?;
+                let elapsed = write_and_wait(
+                    &self.agent,
+                    remote_agent,
+                    local_addr,
+                    lease.remote_addr,
+                    CANARY_BYTES,
+                )?;
+                // The canary flag makes the peer release its lease without touching its engine.
+                rpc_transmit(
+                    client,
+                    PTransmitPackedParams {
+                        canary: Some(true),
+                        offset: Some(lease.offset),
+                        length: Some(CANARY_BYTES),
+                        ..Default::default()
+                    },
+                    Vec::new(),
+                )?;
+                let gbps = CANARY_BYTES as f64 / elapsed.as_secs_f64() / 1e9;
+                info!(
+                    peer = %client.peer(),
+                    gbps = format!("{gbps:.1}"),
+                    bytes = CANARY_BYTES,
+                    "nixl bandwidth canary"
+                );
+                if gbps < CANARY_FLOOR_GBPS {
+                    return Err(format!(
+                        "nixl link to {} measured {gbps:.2} GB/s, below the {CANARY_FLOOR_GBPS} \
+                         GB/s floor — the silent cuda_ipc degradation trap (F1: non-cudaMalloc \
+                         staging memory, or UCX_TLS missing cuda_ipc). Refusing the transport \
+                         tier",
+                        client.peer()
+                    ));
+                }
+                Ok(())
+            })();
+            if let Err(err) = self.executor.staging_release(local_offset) {
+                warn!(error = %err, "failed to release the local canary lease");
+            }
+            result
+        }
+
+        /// Sender flow: drain the parked output batch by batch through the peer's staging arena.
+        pub(super) fn send_fragment(&mut self, spec: &RemoteSendSpec) -> Result<(), String> {
+            let key = self.ensure_session(&spec.host, spec.brpc_port)?;
+            let session = self.peers.get_mut(&key).expect("session ensured above");
+            let (hi, lo) = spec.slot.fragment_instance_id.as_halves();
+            let finst_id = PUniqueId { hi, lo };
+            let mut seq: i64 = 0;
+            let mut batches: u64 = 0;
+            let mut bytes: u64 = 0;
+
+            while let Some(batch) = self.executor.export_packed_next(spec.slot)? {
+                // A metadata-only empty batch carries no payload: no peer lease, no WRITE, and
+                // the receiver knows `len == 0` means nothing to release.
+                let (remote_offset, length) = if batch.len > 0 {
+                    let lease = rpc_request_lease(&mut session.client, batch.len)?;
+                    write_and_wait(
+                        &self.agent,
+                        &session.remote_agent,
+                        self.staging_base + batch.offset,
+                        lease.remote_addr,
+                        batch.len,
+                    )?;
+                    (lease.offset, batch.len)
+                } else {
+                    (0, 0)
+                };
+                rpc_transmit(
+                    &mut session.client,
+                    PTransmitPackedParams {
+                        finst_id: Some(finst_id),
+                        node_id: Some(spec.slot.node_id),
+                        sender_id: Some(spec.slot.sender_id),
+                        eos: Some(false),
+                        seq: Some(seq),
+                        offset: Some(remote_offset),
+                        length: Some(length),
+                        column_names: spec.names.clone(),
+                        canary: None,
+                    },
+                    batch.metadata,
+                )?;
+                if batch.len > 0 {
+                    self.executor.staging_release(batch.offset)?;
+                }
+                seq += 1;
+                batches += 1;
+                bytes += batch.len;
+            }
+
+            rpc_transmit(
+                &mut session.client,
+                PTransmitPackedParams {
+                    finst_id: Some(finst_id),
+                    node_id: Some(spec.slot.node_id),
+                    sender_id: Some(spec.slot.sender_id),
+                    eos: Some(true),
+                    seq: Some(seq),
+                    offset: None,
+                    length: None,
+                    column_names: spec.names.clone(),
+                    canary: None,
+                },
+                Vec::new(),
+            )?;
+            self.executor.drop_parked(spec.slot)?;
+            info!(
+                stream_id = spec.slot.node_id,
+                sender_id = spec.slot.sender_id,
+                dest = %session.client.peer(),
+                batches,
+                bytes,
+                "transmitted batches via nixl"
+            );
+            Ok(())
+        }
+    }
+
+    /// Posts one WRITE `[local_addr, +len)` → `[remote_addr, +len)` and polls it to DONE within
+    /// [`XFER_TIMEOUT`]. Returns the elapsed post-to-done time.
+    pub(super) fn write_and_wait(
+        agent: &Agent,
+        remote_agent: &str,
+        local_addr: u64,
+        remote_addr: u64,
+        len: u64,
+    ) -> Result<Duration, String> {
+        let mut local = XferDescList::new(MemType::Vram)
+            .map_err(|err| format!("failed to create the local descriptor list: {err}"))?;
+        local.add_desc(local_addr as usize, len as usize, 0);
+        let mut remote = XferDescList::new(MemType::Vram)
+            .map_err(|err| format!("failed to create the remote descriptor list: {err}"))?;
+        remote.add_desc(remote_addr as usize, len as usize, 0);
+        let request = agent
+            .create_xfer_req(XferOp::Write, &local, &remote, remote_agent, None)
+            .map_err(|err| {
+                format!("failed to create a {len}-byte WRITE to agent '{remote_agent}': {err}")
+            })?;
+        let start = Instant::now();
+        let mut in_progress = agent
+            .post_xfer_req(&request, None)
+            .map_err(|err| format!("failed to post a {len}-byte WRITE: {err}"))?;
+        while in_progress {
+            if start.elapsed() > XFER_TIMEOUT {
+                return Err(format!(
+                    "a {len}-byte nixl WRITE to agent '{remote_agent}' did not complete within \
+                     {XFER_TIMEOUT:?}"
+                ));
+            }
+            match agent
+                .get_xfer_status(&request)
+                .map_err(|err| format!("failed to poll a nixl WRITE: {err}"))?
+            {
+                XferStatus::Success => in_progress = false,
+                XferStatus::InProgress => std::thread::yield_now(),
+            }
+        }
+        Ok(start.elapsed())
+    }
+
+    /// Fails on a non-OK StarRocks method status, naming the peer's error messages.
+    fn check_status(what: &str, status: &StatusPb) -> Result<(), String> {
+        if status.status_code == TStatusCode::OK.0 {
+            return Ok(());
+        }
+        Err(format!(
+            "{what} failed with status {}: {}",
+            status.status_code,
+            status.error_msgs.join("; ")
+        ))
+    }
+
+    /// `exchange_nixl_md` over brpc: our identity out, the peer's identity back.
+    fn rpc_exchange_md(
+        client: &mut PrpcClient,
+        agent_name: &str,
+        local_md: &[u8],
+    ) -> Result<MdReply, String> {
+        let body = PExchangeNixlMd {
+            agent_name: Some(agent_name.to_string()),
+            agent_metadata: Some(local_md.to_vec()),
+        }
+        .encode_to_vec();
+        let response = client.call(methods::EXCHANGE_NIXL_MD, body, Vec::new())?;
+        let result = PExchangeNixlMdResult::decode(response.body.as_slice())
+            .map_err(|err| format!("undecodable exchange_nixl_md reply: {err}"))?;
+        check_status("exchange_nixl_md", &result.status)?;
+        let agent_name = result
+            .agent_name
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| "exchange_nixl_md reply carries no agent name".to_string())?;
+        let metadata = result
+            .agent_metadata
+            .filter(|metadata| !metadata.is_empty())
+            .ok_or_else(|| "exchange_nixl_md reply carries no agent metadata".to_string())?;
+        Ok(MdReply {
+            agent_name,
+            metadata,
+        })
+    }
+
+    /// A lease of the peer's staging arena to WRITE into.
+    pub(super) struct RemoteLease {
+        pub(super) remote_addr: u64,
+        pub(super) offset: u64,
+    }
+
+    /// `request_staging_lease` over brpc.
+    fn rpc_request_lease(client: &mut PrpcClient, length: u64) -> Result<RemoteLease, String> {
+        let body = PStagingLeaseRequest { length }.encode_to_vec();
+        let response = client.call(methods::REQUEST_STAGING_LEASE, body, Vec::new())?;
+        let result = PStagingLeaseResult::decode(response.body.as_slice())
+            .map_err(|err| format!("undecodable request_staging_lease reply: {err}"))?;
+        check_status("request_staging_lease", &result.status)?;
+        let remote_addr = result
+            .remote_addr
+            .filter(|addr| *addr != 0)
+            .ok_or_else(|| "request_staging_lease reply carries no remote address".to_string())?;
+        let offset = result
+            .offset
+            .ok_or_else(|| "request_staging_lease reply carries no lease offset".to_string())?;
+        Ok(RemoteLease {
+            remote_addr,
+            offset,
+        })
+    }
+
+    /// `transmit_packed` over brpc; the pack metadata rides the attachment.
+    fn rpc_transmit(
+        client: &mut PrpcClient,
+        params: PTransmitPackedParams,
+        metadata: Vec<u8>,
+    ) -> Result<(), String> {
+        let response = client.call(methods::TRANSMIT_PACKED, params.encode_to_vec(), metadata)?;
+        let result = PTransmitPackedResult::decode(response.body.as_slice())
+            .map_err(|err| format!("undecodable transmit_packed reply: {err}"))?;
+        check_status("transmit_packed", &result.status)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::sync::Arc;
+
+        use super::*;
+        use crate::engine::SiriusEngine;
+        use crate::engine_settings::EngineSettings;
+
+        /// GPU + libnixl smoke for the agent tier in one process: proves that two real agents
+        /// come up over the engine's `cudaMalloc` staging arena (registered as VRAM by both,
+        /// like the two CNs of the demo), the metadata handshake loads, a cross-agent WRITE
+        /// between two leases reaches DONE, and the measured bandwidth clears the F1 canary
+        /// floor. It does NOT verify the transferred bytes (Rust has no view into the device
+        /// leases) — value verification is the B6 end-to-end query, where real results are
+        /// compared. nixl 1.3.2 refuses loading an agent's own metadata, so the "two processes"
+        /// are two agents here.
+        #[test]
+        #[ignore = "GPU + libnixl smoke: source tools/nvda_nixl/ENV.sh, set UCX_TLS, run with --ignored"]
+        fn nixl_cross_agent_write_between_arena_leases() {
+            let _guard = crate::GPU_ENGINE_TEST_LOCK
+                .lock()
+                .unwrap_or_else(|err| err.into_inner());
+            // The arena is constructed at context bring-up, only when this is set.
+            // SAFETY: the GPU lock is held, so no other thread touches the environment here.
+            unsafe { std::env::set_var("SIRIUS_EXCHANGE_STAGING_BYTES", "128MiB") };
+
+            let engine_dir = std::env::temp_dir().join("sirius-nixl-smoke");
+            let executor: Arc<dyn FragmentExecutor> = Arc::new(
+                SiriusEngine::start(EngineSettings {
+                    config: None,
+                    engine_dir,
+                    gpu_device: None,
+                })
+                .expect("bring up sirius engine"),
+            );
+            let (base, capacity) = executor.staging_info().expect("staging arena info");
+
+            let (sender_agent, _sender_registration, _sender_md) =
+                bring_up_agent("127.0.0.1:18060", base, capacity)
+                    .expect("bring up the sender-side nixl agent");
+            let (receiver_agent, _receiver_registration, receiver_md) =
+                bring_up_agent("127.0.0.1:18061", base, capacity)
+                    .expect("bring up the receiver-side nixl agent");
+
+            // The brpc handshake, minus the wire: the sender loads the receiver's metadata.
+            let receiver_name = sender_agent
+                .load_remote_md(&receiver_md)
+                .expect("load the receiver agent's metadata");
+            assert_eq!(receiver_name, "127.0.0.1:18061");
+
+            let source = executor.staging_lease(CANARY_BYTES).unwrap();
+            let target = executor.staging_lease(CANARY_BYTES).unwrap();
+            assert_ne!(source, target, "two live leases must not alias");
+
+            write_and_wait(&sender_agent, &receiver_name, base + source, base + target, WARMUP_BYTES)
+                .expect("warmup cross-agent WRITE");
+            let elapsed = write_and_wait(
+                &sender_agent,
+                &receiver_name,
+                base + source,
+                base + target,
+                CANARY_BYTES,
+            )
+            .expect("timed cross-agent WRITE");
+            let gbps = CANARY_BYTES as f64 / elapsed.as_secs_f64() / 1e9;
+            eprintln!("nixl cross-agent WRITE: {CANARY_BYTES} bytes in {elapsed:?} = {gbps:.1} GB/s");
+            assert!(
+                gbps >= CANARY_FLOOR_GBPS,
+                "cross-agent WRITE measured {gbps:.2} GB/s, below the {CANARY_FLOOR_GBPS} GB/s \
+                 canary floor — the F1 silent-degradation trap"
+            );
+
+            executor.staging_release(target).unwrap();
+            executor.staging_release(source).unwrap();
+            // Drop the agents (and their registrations) before the engine that owns the arena.
+            drop(sender_agent);
+            drop(receiver_agent);
+            drop(executor);
+            // SAFETY: the GPU lock is still held.
+            unsafe { std::env::remove_var("SIRIUS_EXCHANGE_STAGING_BYTES") };
+        }
+    }
+}

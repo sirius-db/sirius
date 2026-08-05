@@ -3,12 +3,15 @@ use std::sync::{Arc, Mutex, mpsc};
 
 #[cfg(test)]
 use crate::fragment_executor::StubExecutor;
-use crate::fragment_executor::{FragmentExecutor, FragmentRun, SenderSlot};
+use crate::fragment_executor::{FragmentExecutor, FragmentRun, SenderSlot, StagedBatch};
 use crate::local_exchange::{ExchangeKey, LocalExchange, ReadyFragment, SenderSource};
+use crate::nixl_transport::{NixlTransport, RemoteSendSpec};
 use crate::proto::starrocks::{
-    PExecBatchPlanFragmentsRequest, PExecBatchPlanFragmentsResult, PExecPlanFragmentRequest,
-    PExecPlanFragmentResult, PFetchDataRequest, PFetchDataResult, PGetFileSchemaRequest,
-    PGetFileSchemaResult, PSlotDescriptor, StatusPb, p_internal_service_brpc::PInternalService,
+    PExchangeNixlMd, PExchangeNixlMdResult, PExecBatchPlanFragmentsRequest,
+    PExecBatchPlanFragmentsResult, PExecPlanFragmentRequest, PExecPlanFragmentResult,
+    PFetchDataRequest, PFetchDataResult, PGetFileSchemaRequest, PGetFileSchemaResult,
+    PSlotDescriptor, PStagingLeaseRequest, PStagingLeaseResult, PTransmitPackedParams,
+    PTransmitPackedResult, StatusPb, p_internal_service_brpc::PInternalService,
 };
 use crate::result_encoder::{self, ThriftBinary};
 use crate::result_store::{FetchOutcome, FragmentInstanceId, ResultStore};
@@ -116,11 +119,17 @@ struct ServiceCore {
     descriptor_tables: Mutex<HashMap<FragmentInstanceId, TDescriptorTable>>,
     /// The exchange endpoint this CN advertises; destinations matching it are local.
     identity: ExchangeIdentity,
+    /// The nixl transport tier for remote destinations. `None` keeps every remote destination a
+    /// loud error naming how to enable it.
+    transport: Option<NixlTransport>,
+    /// Staging arena `(base, capacity)`, fetched from the engine once (it never moves) so lease
+    /// requests cost one engine round-trip, not two.
+    staging_info: Mutex<Option<(u64, u64)>>,
 }
 
 impl SiriusComputeNodeService {
     /// Test-only constructor with the placeholder [`StubExecutor`] and the default local
-    /// identity. Production injects both via [`with_executor`](Self::with_executor).
+    /// identity. Production injects everything via [`with_transport`](Self::with_transport).
     #[cfg(test)]
     pub(crate) fn new() -> Self {
         Self::with_executor(
@@ -129,12 +138,24 @@ impl SiriusComputeNodeService {
         )
     }
 
-    /// Builds the service with a caller-provided fragment executor (e.g. the GPU-backed
-    /// `SiriusEngine`) and this CN's advertised exchange identity, shared across BRPC
-    /// connections via the `Arc`. Also spawns the fragment dispatch worker.
+    /// [`with_transport`](Self::with_transport) without a nixl transport: every remote
+    /// destination stays a loud error.
+    #[cfg(test)]
     pub(crate) fn with_executor(
         executor: Arc<dyn FragmentExecutor>,
         identity: ExchangeIdentity,
+    ) -> Self {
+        Self::with_transport(executor, identity, None)
+    }
+
+    /// Builds the service with a caller-provided fragment executor (e.g. the GPU-backed
+    /// `SiriusEngine`), this CN's advertised exchange identity, and an optional nixl transport
+    /// for remote destinations, shared across BRPC connections via the `Arc`. Also spawns the
+    /// fragment dispatch worker.
+    pub(crate) fn with_transport(
+        executor: Arc<dyn FragmentExecutor>,
+        identity: ExchangeIdentity,
+        transport: Option<NixlTransport>,
     ) -> Self {
         let core = Arc::new(ServiceCore {
             translator: PlanTranslator::new(),
@@ -143,6 +164,8 @@ impl SiriusComputeNodeService {
             exchanges: LocalExchange::default(),
             descriptor_tables: Mutex::new(HashMap::new()),
             identity,
+            transport,
+            staging_info: Mutex::new(None),
         });
         // A dedicated thread with a std channel (not a tokio task): fragment execution is
         // synchronous and blocking, so it gets the same dedicated-thread shape as the engine
@@ -289,6 +312,99 @@ impl PInternalService for SiriusComputeNodeService {
         }
     }
 
+    /// First-contact handshake of the nixl tier: load the caller's agent metadata, reply with
+    /// this CN's. Idempotent, so a peer restart re-exchanges cleanly.
+    #[instrument(skip_all)]
+    async fn exchange_nixl_md(
+        &self,
+        request: PExchangeNixlMd,
+        _attachment: Vec<u8>,
+    ) -> Result<crate::prpc::Reply<PExchangeNixlMdResult>, crate::prpc::Error> {
+        // The transport thread call blocks on a respond channel; keep the BRPC current-thread
+        // runtime free, like every other blocking handler here.
+        let service = self.clone();
+        let outcome =
+            tokio::task::spawn_blocking(move || service.core.handle_exchange_nixl_md(&request))
+                .await;
+        let result = match outcome {
+            Ok(Ok(reply)) => PExchangeNixlMdResult {
+                status: Self::ok_status(),
+                agent_name: Some(reply.agent_name),
+                agent_metadata: Some(reply.metadata),
+            },
+            Ok(Err(err)) => PExchangeNixlMdResult {
+                status: Self::internal_error(err),
+                agent_name: None,
+                agent_metadata: None,
+            },
+            Err(join_err) => PExchangeNixlMdResult {
+                status: Self::internal_error(format!("exchange_nixl_md task panicked: {join_err}")),
+                agent_name: None,
+                agent_metadata: None,
+            },
+        };
+        Ok(result.into())
+    }
+
+    /// Leases bytes of this CN's staging arena for a peer's nixl WRITE. The lease request queues
+    /// behind whatever the engine thread is running; the peer's client timeout bounds the wait.
+    #[instrument(skip_all)]
+    async fn request_staging_lease(
+        &self,
+        request: PStagingLeaseRequest,
+        _attachment: Vec<u8>,
+    ) -> Result<crate::prpc::Reply<PStagingLeaseResult>, crate::prpc::Error> {
+        let service = self.clone();
+        let outcome =
+            tokio::task::spawn_blocking(move || service.core.handle_staging_lease(request.length))
+                .await;
+        let result = match outcome {
+            Ok(Ok((remote_addr, offset))) => PStagingLeaseResult {
+                status: Self::ok_status(),
+                remote_addr: Some(remote_addr),
+                offset: Some(offset),
+            },
+            Ok(Err(err)) => PStagingLeaseResult {
+                status: Self::internal_error(err),
+                remote_addr: None,
+                offset: None,
+            },
+            Err(join_err) => PStagingLeaseResult {
+                status: Self::internal_error(format!(
+                    "request_staging_lease task panicked: {join_err}"
+                )),
+                remote_addr: None,
+                offset: None,
+            },
+        };
+        Ok(result.into())
+    }
+
+    /// Ingests one remote exchange frame: a packed batch already WRITTEN into this CN's arena
+    /// (metadata in the attachment), an eos, or a canary lease release.
+    #[instrument(skip_all)]
+    async fn transmit_packed(
+        &self,
+        request: PTransmitPackedParams,
+        attachment: Vec<u8>,
+    ) -> Result<crate::prpc::Reply<PTransmitPackedResult>, crate::prpc::Error> {
+        // Blocking again: the canary path round-trips the engine thread, and a completed sender
+        // set dispatches (cheaply) to the fragment worker.
+        let service = self.clone();
+        let outcome = tokio::task::spawn_blocking(move || {
+            service.handle_transmit_packed(&request, attachment)
+        })
+        .await;
+        let status = match outcome {
+            Ok(Ok(())) => Self::ok_status(),
+            Ok(Err(err)) => Self::internal_error(err),
+            Err(join_err) => {
+                Self::internal_error(format!("transmit_packed task panicked: {join_err}"))
+            }
+        };
+        Ok(PTransmitPackedResult { status }.into())
+    }
+
     /// Infers the schema of the FILES() target so the FE can resolve the table function.
     #[instrument(skip_all)]
     async fn get_file_schema(
@@ -322,6 +438,76 @@ impl SiriusComputeNodeService {
         let params = Self::deserialize_binary::<TExecPlanFragmentParams>(attachment)
             .map_err(|err| format!("failed to deserialize TExecPlanFragmentParams: {err}"))?;
         if let Some(ready) = self.core.process_fragment(&params)? {
+            self.dispatch(ready)?;
+        }
+        Ok(())
+    }
+
+    /// Records one remote exchange frame in the rendezvous (or releases a canary lease), handing
+    /// a completed receiver to the dispatch worker.
+    fn handle_transmit_packed(
+        &self,
+        params: &PTransmitPackedParams,
+        attachment: Vec<u8>,
+    ) -> std::result::Result<(), String> {
+        if params.canary() {
+            // The bandwidth canary writes into a lease nothing will consume; release it without
+            // touching the rendezvous or the engine's input streams.
+            let offset = params
+                .offset
+                .ok_or_else(|| "canary transmit_packed frame carries no lease offset".to_string())?;
+            return self.core.executor.staging_release(offset);
+        }
+        let finst_id = params
+            .finst_id
+            .as_ref()
+            .ok_or_else(|| "transmit_packed frame carries no finst_id".to_string())?;
+        let node_id = params
+            .node_id
+            .ok_or_else(|| "transmit_packed frame carries no node_id".to_string())?;
+        let sender_id = params
+            .sender_id
+            .ok_or_else(|| "transmit_packed frame carries no sender_id".to_string())?;
+        let seq = params
+            .seq
+            .ok_or_else(|| "transmit_packed frame carries no seq".to_string())?;
+        let eos = params.eos.unwrap_or(false);
+        let key = ExchangeKey {
+            fragment_instance_id: FragmentInstanceId::from(finst_id),
+            node_id,
+        };
+        // The pack metadata rides the attachment; its presence is what makes a frame a batch.
+        let batch = if attachment.is_empty() {
+            None
+        } else {
+            let length = params.length.ok_or_else(|| {
+                "transmit_packed batch frame carries no payload length".to_string()
+            })?;
+            let offset = params.offset.ok_or_else(|| {
+                "transmit_packed batch frame carries no lease offset".to_string()
+            })?;
+            Some(StagedBatch {
+                metadata: attachment,
+                offset,
+                len: length,
+            })
+        };
+        tracing::debug!(
+            exchange = ?key,
+            sender_id,
+            seq,
+            eos,
+            batch_bytes = batch.as_ref().map(|batch| batch.len),
+            "received remote exchange frame"
+        );
+        if let Some(ready) = self.core.exchanges.push_remote_frame(
+            key,
+            sender_id,
+            seq,
+            eos,
+            params.column_names.clone(),
+            batch,
+        )? {
             self.dispatch(ready)?;
         }
         Ok(())
@@ -461,11 +647,12 @@ impl ServiceCore {
         params: &TExecPlanFragmentParams,
         translated: TranslatedPlan,
     ) -> std::result::Result<Option<ReadyFragment>, String> {
-        self.execute_fragment_with_inputs(params, translated, Vec::new())
+        self.execute_fragment_with_inputs(params, translated, Vec::new(), Vec::new())
     }
 
     /// Executes a result fragment, or runs a data-stream sender and parks its output on the GPU
-    /// for its local receiver. `inputs` names the parked sender outputs this fragment consumes.
+    /// for its local receiver (transmitting it when the receiver is remote). `inputs` names the
+    /// parked sender outputs this fragment consumes; `remote_inputs` the staged remote batches.
     /// A sender that completes its receiver's sender set returns that receiver for the caller
     /// to run or dispatch.
     fn execute_fragment_with_inputs(
@@ -473,6 +660,7 @@ impl ServiceCore {
         params: &TExecPlanFragmentParams,
         translated: TranslatedPlan,
         inputs: Vec<(i32, Vec<SenderSlot>)>,
+        remote_inputs: Vec<(i32, i32, Vec<StagedBatch>)>,
     ) -> std::result::Result<Option<ReadyFragment>, String> {
         if Self::is_mysql_result_sink(params)? {
             let id = Self::fragment_instance_id(params).ok_or_else(|| {
@@ -483,6 +671,7 @@ impl ServiceCore {
                 .run(FragmentRun {
                     plan: &translated,
                     inputs: inputs.clone(),
+                    remote_inputs,
                     output: None,
                 })?
                 .ok_or_else(|| "result fragment returned no rows".to_string())?;
@@ -542,7 +731,8 @@ impl ServiceCore {
             sender_id,
         };
 
-        // Route before running: a remote destination must fail before any GPU work happens.
+        // Route before running: a remote destination without a transport must fail before any
+        // GPU work happens.
         match self.route_destination(destination)? {
             DestinationRoute::Local => {
                 // The sender's rows stay on the GPU, parked under `slot` as native batches; only
@@ -551,6 +741,7 @@ impl ServiceCore {
                 self.executor.run(FragmentRun {
                     plan: &translated,
                     inputs,
+                    remote_inputs,
                     output: Some(slot),
                 })?;
 
@@ -566,12 +757,36 @@ impl ServiceCore {
                     },
                 )
             }
-            // PLAN-PATH-B B5 replaces this arm with the transmit path: drain the fragment's
-            // output and ship it to the remote receiver instead of parking it locally.
-            DestinationRoute::Remote { host, brpc_port } => Err(format!(
-                "cross-node exchange to {host}:{brpc_port} is not wired yet: the nixl transport \
-                 tier lands in a later commit (PLAN-PATH-B B5)"
-            )),
+            DestinationRoute::Remote { host, brpc_port } => {
+                let Some(transport) = self.transport.as_ref() else {
+                    return Err(format!(
+                        "cross-node exchange to {host}:{brpc_port} needs the nixl transport \
+                         tier, which is not active: build the CN with the `nixl-transport` \
+                         feature (default) and set SIRIUS_EXCHANGE_STAGING_BYTES so the exchange \
+                         staging arena exists"
+                    ));
+                };
+                let brpc_port = u16::try_from(brpc_port).map_err(|_| {
+                    format!("destination brpc port {brpc_port} is not a valid TCP port")
+                })?;
+                // Park exactly like the local path — the packed export drains the parked
+                // output — then block this (already-blocking) RPC thread until the whole
+                // fragment has crossed the wire. Any failure fails the sender's dispatch, so
+                // the FE sees it.
+                self.executor.run(FragmentRun {
+                    plan: &translated,
+                    inputs,
+                    remote_inputs,
+                    output: Some(slot),
+                })?;
+                transport.send_fragment(RemoteSendSpec {
+                    host,
+                    brpc_port,
+                    slot,
+                    names: translated.output_names,
+                })?;
+                Ok(None)
+            }
         }
     }
 
@@ -598,9 +813,55 @@ impl ServiceCore {
         }
     }
 
+    /// Loads a peer's nixl agent metadata into this CN's agent and returns ours.
+    fn handle_exchange_nixl_md(
+        &self,
+        request: &PExchangeNixlMd,
+    ) -> std::result::Result<crate::nixl_transport::MdReply, String> {
+        let Some(transport) = self.transport.as_ref() else {
+            return Err(
+                "the nixl transport tier is not active on this CN: build with the \
+                 `nixl-transport` feature (default) and set SIRIUS_EXCHANGE_STAGING_BYTES"
+                    .to_string(),
+            );
+        };
+        let peer_agent_name = request
+            .agent_name
+            .clone()
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| "exchange_nixl_md request carries no agent name".to_string())?;
+        let peer_metadata = request
+            .agent_metadata
+            .clone()
+            .filter(|metadata| !metadata.is_empty())
+            .ok_or_else(|| "exchange_nixl_md request carries no agent metadata".to_string())?;
+        transport.exchange_md(peer_agent_name, peer_metadata)
+    }
+
+    /// Leases `length` bytes of the staging arena and returns `(absolute address, offset)`.
+    fn handle_staging_lease(&self, length: u64) -> std::result::Result<(u64, u64), String> {
+        let (base, _capacity) = self.staging_info()?;
+        let offset = self.executor.staging_lease(length)?;
+        Ok((base + offset, offset))
+    }
+
+    /// Staging arena `(base, capacity)`, cached after the first successful engine round-trip.
+    fn staging_info(&self) -> std::result::Result<(u64, u64), String> {
+        let mut cached = self
+            .staging_info
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(info) = *cached {
+            return Ok(info);
+        }
+        let info = self.executor.staging_info()?;
+        *cached = Some(info);
+        Ok(info)
+    }
+
     /// Translates a receiver whose sender set is complete, binding each exchange to the input
-    /// stream its senders parked into, and runs it. Returns the next receiver when this one's
-    /// own sink completed another sender set.
+    /// stream its senders parked into (or staged, for remote senders), and runs it. Returns the
+    /// next receiver when this one's own sink completed another sender set.
     fn execute_ready_fragment(
         &self,
         ready: ReadyFragment,
@@ -612,17 +873,17 @@ impl ServiceCore {
                 let names = input
                     .sources
                     .first()
-                    .map(|source| {
-                        let SenderSource::LocalParked { names, .. } = source;
-                        names.clone()
-                    })
+                    .map(|source| source.names().to_vec())
                     .ok_or_else(|| {
                         format!("exchange node {} has no sender source", input.node_id)
                     })?;
-                if input.sources.iter().any(|source| {
-                    let SenderSource::LocalParked { names: other, .. } = source;
-                    other != &names
-                }) {
+                // Local and remote senders alike must agree on the schema they produced; the
+                // first source is the reference, disagreement fails the query.
+                if input
+                    .sources
+                    .iter()
+                    .any(|source| source.names() != names.as_slice())
+                {
                     return Err("exchange senders produced different output names".to_string());
                 }
                 let stream_id = u64::try_from(input.node_id)
@@ -634,26 +895,39 @@ impl ServiceCore {
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
-        let inputs = ready
-            .inputs
-            .iter()
-            .map(|input| {
-                (
-                    input.node_id,
-                    input
-                        .sources
-                        .iter()
-                        .map(|source| {
-                            let SenderSource::LocalParked { slot, .. } = source;
-                            *slot
-                        })
-                        .collect(),
-                )
-            })
-            .collect();
         let translated =
             self.translate_fragment_logged_with_inputs(&ready.params, &exchange_inputs)?;
-        self.execute_fragment_with_inputs(&ready.params, translated, inputs)
+        let mut inputs: Vec<(i32, Vec<SenderSlot>)> = Vec::new();
+        let mut remote_inputs: Vec<(i32, i32, Vec<StagedBatch>)> = Vec::new();
+        for input in ready.inputs {
+            let mut slots = Vec::new();
+            for source in input.sources {
+                match source {
+                    SenderSource::LocalParked { slot, .. } => slots.push(slot),
+                    SenderSource::Remote {
+                        sender_id,
+                        batches,
+                        closed,
+                        ..
+                    } => {
+                        // take_ready only releases complete sender sets; an open remote source
+                        // here is a rendezvous bug, not a recoverable state.
+                        if !closed {
+                            return Err(format!(
+                                "exchange node {} became ready with remote sender {sender_id} \
+                                 still open",
+                                input.node_id
+                            ));
+                        }
+                        remote_inputs.push((input.node_id, sender_id, batches));
+                    }
+                }
+            }
+            if !slots.is_empty() {
+                inputs.push((input.node_id, slots));
+            }
+        }
+        self.execute_fragment_with_inputs(&ready.params, translated, inputs, remote_inputs)
     }
 
     /// Finds every exchange receiver in a fragment and each expected sender count.
@@ -1475,12 +1749,352 @@ mod tests {
         assert_eq!(result.status.status_code, TStatusCode::INTERNAL_ERROR.0);
         assert!(
             result.status.error_msgs[0]
-                .contains("cross-node exchange to 127.0.0.1:8061 is not wired yet"),
+                .contains("cross-node exchange to 127.0.0.1:8061 needs the nixl transport tier"),
             "{:?}",
             result.status.error_msgs
         );
         // Routing is decided before the sender runs, so no GPU work happened.
         assert_eq!(executor.calls.load(Ordering::Relaxed), 0);
+    }
+
+    /// With a transport wired in, a remote destination runs the sender (parking its output) and
+    /// hands the parked slot to the transport with the peer address and output names.
+    #[test]
+    fn data_stream_sink_to_remote_destination_hands_the_parked_output_to_the_transport() {
+        let (requests_tx, requests_rx) = mpsc::channel();
+        let fake_transport = std::thread::spawn(move || {
+            match requests_rx.recv().expect("the sender flow sends one request") {
+                crate::nixl_transport::TransportRequest::SendFragment { spec, respond } => {
+                    respond.send(Ok(())).unwrap();
+                    spec
+                }
+                crate::nixl_transport::TransportRequest::ExchangeMd { .. } => {
+                    panic!("the sender flow never exchanges metadata itself")
+                }
+            }
+        });
+        let executor = Arc::new(CountingExecutor::default());
+        let service = SiriusComputeNodeService::with_transport(
+            executor.clone(),
+            test_identity(),
+            Some(crate::nixl_transport::NixlTransport::for_test(requests_tx)),
+        );
+
+        let receiver_id = TUniqueId::new(32, 3);
+        let mut sender = fragment_params(Some(scan_plan(0, 0)), Some(desc_table()));
+        sender.fragment.as_mut().unwrap().output_sink = Some(data_stream_sink(7));
+        let mut sender_exec = exec_params(TUniqueId::new(32, 1), TUniqueId::new(32, 2));
+        sender_exec.sender_id = Some(0);
+        sender_exec.destinations = Some(vec![TPlanFragmentDestination::new(
+            receiver_id.clone(),
+            None,
+            Some(TNetworkAddress::new("127.0.0.1".to_string(), 8061)),
+            None,
+        )]);
+        sender.params = Some(sender_exec);
+        assert_exec_ok(&service, &sender);
+
+        // The sender fragment ran (parked) before the transport was invoked.
+        assert_eq!(executor.calls.load(Ordering::Relaxed), 1);
+        let spec = fake_transport.join().unwrap();
+        assert_eq!(spec.host, "127.0.0.1");
+        assert_eq!(spec.brpc_port, 8061);
+        assert_eq!(
+            spec.slot.fragment_instance_id,
+            FragmentInstanceId::from(&receiver_id)
+        );
+        assert_eq!(spec.slot.node_id, 7);
+        assert_eq!(spec.slot.sender_id, 0);
+        assert_eq!(spec.names, vec!["id".to_string(), "name".to_string()]);
+    }
+
+    /// A transport failure fails the sender's dispatch — the FE sees the error, never a hang.
+    #[test]
+    fn remote_transmit_failure_fails_the_sender_dispatch() {
+        let (requests_tx, requests_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            while let Ok(request) = requests_rx.recv() {
+                if let crate::nixl_transport::TransportRequest::SendFragment { respond, .. } =
+                    request
+                {
+                    let _ = respond.send(Err("nixl WRITE timed out".to_string()));
+                }
+            }
+        });
+        let service = SiriusComputeNodeService::with_transport(
+            Arc::new(CountingExecutor::default()),
+            test_identity(),
+            Some(crate::nixl_transport::NixlTransport::for_test(requests_tx)),
+        );
+
+        let mut sender = fragment_params(Some(scan_plan(0, 0)), Some(desc_table()));
+        sender.fragment.as_mut().unwrap().output_sink = Some(data_stream_sink(7));
+        let mut sender_exec = exec_params(TUniqueId::new(33, 1), TUniqueId::new(33, 2));
+        sender_exec.sender_id = Some(0);
+        sender_exec.destinations = Some(vec![TPlanFragmentDestination::new(
+            TUniqueId::new(33, 3),
+            None,
+            Some(TNetworkAddress::new("127.0.0.1".to_string(), 8061)),
+            None,
+        )]);
+        sender.params = Some(sender_exec);
+
+        let response = route(
+            &service,
+            methods::EXEC_PLAN_FRAGMENT,
+            PExecPlanFragmentRequest {
+                attachment_protocol: Some("binary".to_string()),
+            }
+            .encode_to_vec(),
+            serialize_binary(&sender),
+        );
+        let result = PExecPlanFragmentResult::decode(response.body.as_slice()).unwrap();
+        assert_eq!(result.status.status_code, TStatusCode::INTERNAL_ERROR.0);
+        assert!(
+            result.status.error_msgs[0].contains("nixl WRITE timed out"),
+            "{:?}",
+            result.status.error_msgs
+        );
+    }
+
+    /// Records what the executor was asked to do on the remote-ingest path.
+    #[derive(Debug, Default)]
+    struct RecordingExecutor {
+        remote_inputs: Mutex<Vec<(i32, i32, Vec<StagedBatch>)>>,
+        released: Mutex<Vec<u64>>,
+    }
+
+    impl FragmentExecutor for RecordingExecutor {
+        fn run(&self, run: FragmentRun<'_>) -> Result<Option<FragmentResult>, String> {
+            self.remote_inputs
+                .lock()
+                .unwrap()
+                .extend(run.remote_inputs.iter().cloned());
+            StubExecutor.run(run)
+        }
+
+        fn staging_release(&self, offset: u64) -> Result<(), String> {
+            self.released.lock().unwrap().push(offset);
+            Ok(())
+        }
+    }
+
+    /// One `transmit_packed` frame as the wire would carry it.
+    #[allow(clippy::too_many_arguments)]
+    fn transmit_params(
+        receiver: &TUniqueId,
+        node_id: i32,
+        sender_id: i32,
+        seq: i64,
+        eos: bool,
+        offset: u64,
+        length: u64,
+        names: &[&str],
+    ) -> Vec<u8> {
+        PTransmitPackedParams {
+            finst_id: Some(crate::proto::starrocks::PUniqueId {
+                hi: receiver.hi,
+                lo: receiver.lo,
+            }),
+            node_id: Some(node_id),
+            sender_id: Some(sender_id),
+            eos: Some(eos),
+            seq: Some(seq),
+            offset: Some(offset),
+            length: Some(length),
+            column_names: names.iter().map(|name| name.to_string()).collect(),
+            canary: None,
+        }
+        .encode_to_vec()
+    }
+
+    /// The receiver registers first (StarRocks dispatch order); remote frames stage batches, the
+    /// eos completes the set, and the dispatch worker runs the receiver with the staged batches
+    /// as `remote_inputs` — the full receiver half of the nixl tier minus the device WRITE.
+    #[test]
+    fn transmit_packed_frames_feed_a_dispatched_receiver() {
+        let executor = Arc::new(RecordingExecutor::default());
+        let service = SiriusComputeNodeService::with_executor(executor.clone(), test_identity());
+        let query_id = TUniqueId::new(60, 1);
+        let receiver_id = TUniqueId::new(60, 2);
+
+        let mut receiver = fragment_params(Some(exchange_plan(7, 0)), Some(desc_table()));
+        receiver.fragment.as_mut().unwrap().output_sink = Some(result_sink());
+        let mut receiver_exec = exec_params(query_id, receiver_id.clone());
+        receiver_exec.per_exch_num_senders.insert(7, 1);
+        receiver.params = Some(receiver_exec);
+        assert_exec_ok(&service, &receiver);
+
+        // A data frame: pack metadata in the attachment, payload location in the body.
+        let metadata = vec![0xAB; 16];
+        let data = route(
+            &service,
+            methods::TRANSMIT_PACKED,
+            transmit_params(&receiver_id, 7, 0, 0, false, 4096, 256, &["id", "name"]),
+            metadata.clone(),
+        );
+        let data = PTransmitPackedResult::decode(data.body.as_slice()).unwrap();
+        assert_eq!(
+            data.status.status_code,
+            TStatusCode::OK.0,
+            "{:?}",
+            data.status.error_msgs
+        );
+
+        // The eos frame (no attachment) completes the sender set and dispatches the receiver.
+        let eos = route(
+            &service,
+            methods::TRANSMIT_PACKED,
+            transmit_params(&receiver_id, 7, 0, 1, true, 0, 0, &["id", "name"]),
+            Vec::new(),
+        );
+        let eos = PTransmitPackedResult::decode(eos.body.as_slice()).unwrap();
+        assert_eq!(
+            eos.status.status_code,
+            TStatusCode::OK.0,
+            "{:?}",
+            eos.status.error_msgs
+        );
+
+        let fetched = fetch_rows_eventually(&service, receiver_id.hi, receiver_id.lo);
+        assert!(!fetched.attachment.is_empty());
+        assert_eq!(
+            executor.remote_inputs.lock().unwrap().as_slice(),
+            &[(
+                7,
+                0,
+                vec![StagedBatch {
+                    metadata,
+                    offset: 4096,
+                    len: 256,
+                }],
+            )],
+            "the dispatched receiver consumed exactly the staged batch"
+        );
+    }
+
+    /// A lost frame must fail the exchange loudly — silently dropping rows is this subsystem's
+    /// cardinal sin.
+    #[test]
+    fn transmit_packed_sequence_gap_is_an_internal_error() {
+        let service = SiriusComputeNodeService::new();
+        let receiver_id = TUniqueId::new(61, 2);
+        let first = route(
+            &service,
+            methods::TRANSMIT_PACKED,
+            transmit_params(&receiver_id, 7, 0, 0, false, 0, 8, &["id"]),
+            vec![1u8; 8],
+        );
+        let first = PTransmitPackedResult::decode(first.body.as_slice()).unwrap();
+        assert_eq!(first.status.status_code, TStatusCode::OK.0);
+
+        let gapped = route(
+            &service,
+            methods::TRANSMIT_PACKED,
+            transmit_params(&receiver_id, 7, 0, 2, false, 0, 8, &["id"]),
+            vec![2u8; 8],
+        );
+        let gapped = PTransmitPackedResult::decode(gapped.body.as_slice()).unwrap();
+        assert_eq!(gapped.status.status_code, TStatusCode::INTERNAL_ERROR.0);
+        assert!(
+            gapped.status.error_msgs[0].contains("skipped from frame seq 1 to 2"),
+            "{:?}",
+            gapped.status.error_msgs
+        );
+    }
+
+    /// The bandwidth canary's lease release skips the rendezvous and the engine's input streams.
+    #[test]
+    fn transmit_packed_canary_releases_the_lease_without_touching_the_rendezvous() {
+        let executor = Arc::new(RecordingExecutor::default());
+        let service = SiriusComputeNodeService::with_executor(executor.clone(), test_identity());
+        let params = PTransmitPackedParams {
+            canary: Some(true),
+            offset: Some(7777),
+            length: Some(16 << 20),
+            ..Default::default()
+        };
+        let response = route(
+            &service,
+            methods::TRANSMIT_PACKED,
+            params.encode_to_vec(),
+            Vec::new(),
+        );
+        let result = PTransmitPackedResult::decode(response.body.as_slice()).unwrap();
+        assert_eq!(
+            result.status.status_code,
+            TStatusCode::OK.0,
+            "{:?}",
+            result.status.error_msgs
+        );
+        assert_eq!(executor.released.lock().unwrap().as_slice(), &[7777]);
+        assert!(executor.remote_inputs.lock().unwrap().is_empty());
+    }
+
+    /// Without a staging arena (stub executor default), a canary release must fail loudly.
+    #[test]
+    fn transmit_packed_canary_without_an_arena_is_an_internal_error() {
+        let service = SiriusComputeNodeService::new();
+        let params = PTransmitPackedParams {
+            canary: Some(true),
+            offset: Some(0),
+            ..Default::default()
+        };
+        let response = route(
+            &service,
+            methods::TRANSMIT_PACKED,
+            params.encode_to_vec(),
+            Vec::new(),
+        );
+        let result = PTransmitPackedResult::decode(response.body.as_slice()).unwrap();
+        assert_eq!(result.status.status_code, TStatusCode::INTERNAL_ERROR.0);
+        assert!(
+            result.status.error_msgs[0].contains("staging arena"),
+            "{:?}",
+            result.status.error_msgs
+        );
+    }
+
+    /// Without a transport, `exchange_nixl_md` names the remedy instead of pretending.
+    #[test]
+    fn exchange_nixl_md_without_transport_is_an_internal_error() {
+        let service = SiriusComputeNodeService::new();
+        let request = PExchangeNixlMd {
+            agent_name: Some("127.0.0.1:8062".to_string()),
+            agent_metadata: Some(vec![1, 2, 3]),
+        };
+        let response = route(
+            &service,
+            methods::EXCHANGE_NIXL_MD,
+            request.encode_to_vec(),
+            Vec::new(),
+        );
+        let result = PExchangeNixlMdResult::decode(response.body.as_slice()).unwrap();
+        assert_eq!(result.status.status_code, TStatusCode::INTERNAL_ERROR.0);
+        assert!(
+            result.status.error_msgs[0].contains("SIRIUS_EXCHANGE_STAGING_BYTES"),
+            "{:?}",
+            result.status.error_msgs
+        );
+    }
+
+    /// Without an arena, a peer's lease request fails loudly (stub executor default).
+    #[test]
+    fn request_staging_lease_without_an_arena_is_an_internal_error() {
+        let service = SiriusComputeNodeService::new();
+        let response = route(
+            &service,
+            methods::REQUEST_STAGING_LEASE,
+            PStagingLeaseRequest { length: 1024 }.encode_to_vec(),
+            Vec::new(),
+        );
+        let result = PStagingLeaseResult::decode(response.body.as_slice()).unwrap();
+        assert_eq!(result.status.status_code, TStatusCode::INTERNAL_ERROR.0);
+        assert!(
+            result.status.error_msgs[0].contains("staging arena"),
+            "{:?}",
+            result.status.error_msgs
+        );
     }
 
     #[test]

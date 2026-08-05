@@ -27,6 +27,13 @@ impl FragmentInstanceId {
     pub(crate) fn from_halves(hi: i64, lo: i64) -> Self {
         Self(Uuid::from_u64_pair(hi as u64, lo as u64))
     }
+
+    /// The `hi`/`lo` halves back out, for proto messages that carry them (`PUniqueId`).
+    #[cfg_attr(not(feature = "nixl-transport"), allow(dead_code))]
+    pub(crate) fn as_halves(&self) -> (i64, i64) {
+        let (hi, lo) = self.0.as_u64_pair();
+        (hi as i64, lo as i64)
+    }
 }
 
 impl From<&TUniqueId> for FragmentInstanceId {

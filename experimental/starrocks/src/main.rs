@@ -7,7 +7,7 @@ use clap::Parser;
 use sirius_starrocks_cn::StubExecutor;
 use sirius_starrocks_cn::{
     BackendServer, BrpcServer, ComputeNodeConfig, ExchangeIdentity, FeConfig, FragmentExecutor,
-    HeartbeatServer, SharedHeartbeatState, register_node, report_to_frontend_once,
+    HeartbeatServer, NixlTransport, SharedHeartbeatState, register_node, report_to_frontend_once,
     start_backend_server, start_heartbeat_server,
 };
 #[cfg(feature = "sirius-engine")]
@@ -172,8 +172,11 @@ impl Args {
         )?;
         // BackendService exposes the shallow CN RPC skeleton on the normal thrift port.
         let backend_server = start_backend_server(&self.compute_node)?;
+        // The cross-node exchange tier, when this build carries nixl and the staging arena is
+        // configured; a remote exchange destination stays a loud error otherwise.
+        let transport = build_nixl_transport(&self.compute_node, executor.clone())?;
         // BRPC PInternalService dispatches plan fragments on the brpc port.
-        let brpc_runtime = BrpcRuntime::start(&self.compute_node, executor.clone())?;
+        let brpc_runtime = BrpcRuntime::start(&self.compute_node, executor.clone(), transport)?;
         self.registration
             .register_node_with_retries(&self.fe, &self.compute_node)
             .await?;
@@ -457,6 +460,49 @@ async fn maintain_frontend_report(compute_node: ComputeNodeConfig, state: Shared
     }
 }
 
+/// Brings up the nixl exchange transport when the build carries it AND the operator configured
+/// the staging arena. Both conditions surface in logs: cross-node placements need this tier,
+/// and its absence must be discoverable, not deduced from a later query failure.
+#[cfg(feature = "nixl-transport")]
+fn build_nixl_transport(
+    compute_node: &ComputeNodeConfig,
+    executor: Arc<dyn FragmentExecutor>,
+) -> Result<Option<NixlTransport>> {
+    if std::env::var_os("SIRIUS_EXCHANGE_STAGING_BYTES").is_none() {
+        info!(
+            "SIRIUS_EXCHANGE_STAGING_BYTES is not set, so there is no exchange staging arena: \
+             the nixl cross-node exchange tier stays disabled and any remote exchange \
+             destination will fail loudly"
+        );
+        return Ok(None);
+    }
+    // The agent is named by this CN's exchange identity, so two CNs on one host get distinct
+    // agents and the FE-routed destination address doubles as the peer's agent name.
+    let agent_name = format!(
+        "{}:{}",
+        compute_node.advertise_host, compute_node.brpc_port
+    );
+    NixlTransport::start(executor, agent_name)
+        .map(Some)
+        .map_err(|err| anyhow!("failed to bring up the nixl exchange transport: {err}"))
+}
+
+/// Without the `nixl-transport` feature there is nothing to construct; remote exchange
+/// destinations fail loudly with the build-time remedy in the message.
+#[cfg(not(feature = "nixl-transport"))]
+fn build_nixl_transport(
+    _compute_node: &ComputeNodeConfig,
+    _executor: Arc<dyn FragmentExecutor>,
+) -> Result<Option<NixlTransport>> {
+    if std::env::var_os("SIRIUS_EXCHANGE_STAGING_BYTES").is_some() {
+        warn!(
+            "SIRIUS_EXCHANGE_STAGING_BYTES is set but this CN was built without the \
+             `nixl-transport` feature; the cross-node exchange tier stays disabled"
+        );
+    }
+    Ok(None)
+}
+
 /// Dedicated current-thread Tokio runtime used for the BRPC service future.
 struct BrpcRuntime {
     /// Cancellation token passed into `BrpcServer::serve_with_listener_shutdown`.
@@ -466,11 +512,12 @@ struct BrpcRuntime {
 }
 
 impl BrpcRuntime {
-    /// Binds the BRPC listener and starts serving it on a dedicated runtime, dispatching fragments
-    /// to `executor`.
+    /// Binds the BRPC listener and starts serving it on a dedicated runtime, dispatching
+    /// fragments to `executor` and remote exchanges to `transport`.
     fn start(
         compute_node: &ComputeNodeConfig,
         executor: Arc<dyn FragmentExecutor>,
+        transport: Option<NixlTransport>,
     ) -> Result<Self> {
         let listener = BrpcServer::bind(compute_node.bind_host.as_str(), compute_node.brpc_port)?;
         // The identity the FE routes exchanges by: the advertised host plus this brpc port.
@@ -484,7 +531,7 @@ impl BrpcRuntime {
                 .build()
                 .map_err(|err| anyhow!("failed to create BRPC service runtime: {err}"))?;
             runtime.block_on(
-                BrpcServer::with_executor(executor, identity)
+                BrpcServer::with_executor(executor, identity, transport)
                     .serve_with_listener_shutdown(listener, server_shutdown.cancelled_owned()),
             )
         });

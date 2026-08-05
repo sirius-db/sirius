@@ -48,6 +48,22 @@ pub struct SenderSlot {
     pub sender_id: i32,
 }
 
+/// One packed batch sitting in an exchange staging arena as cudf packed bytes.
+///
+/// The neutral wire shape of the nixl tier: on the sender it names a lease in the *local* arena
+/// (filled by `export_packed`), on the receiver a lease in the *receiver's* arena (filled by a
+/// nixl WRITE). Whoever holds the arena releases the lease after the bytes leave it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StagedBatch {
+    /// Host-side cudf pack metadata (travels over brpc next to the device payload).
+    pub metadata: Vec<u8>,
+    /// Byte offset of the packed payload from the arena base. `0` with `len == 0` means no
+    /// lease exists for this batch (a metadata-only empty batch) — nothing to release.
+    pub offset: u64,
+    /// Length of the packed payload in bytes.
+    pub len: u64,
+}
+
 /// One fragment to run: the plan, where its exchange inputs come from, and where its output goes.
 #[derive(Debug)]
 pub struct FragmentRun<'a> {
@@ -55,6 +71,10 @@ pub struct FragmentRun<'a> {
     pub plan: &'a TranslatedPlan,
     /// Parked sender outputs to relay into this fragment, keyed by receiver exchange node id.
     pub inputs: Vec<(i32, Vec<SenderSlot>)>,
+    /// Remote sender outputs already staged in this CN's arena, as
+    /// `(exchange node id, sender id, batches)`: pushed via `push_packed` + `close_input`
+    /// before the fragment runs, with each lease released the moment its push returns.
+    pub remote_inputs: Vec<(i32, i32, Vec<StagedBatch>)>,
     /// Set for a sender fragment: its output parks under this slot instead of returning rows.
     pub output: Option<SenderSlot>,
 }
@@ -72,6 +92,49 @@ pub struct FragmentRun<'a> {
 pub trait FragmentExecutor: std::fmt::Debug + Send + Sync {
     /// Runs `run`. Returns rows only for a fragment with no `output` slot — a result fragment.
     fn run(&self, run: FragmentRun<'_>) -> Result<Option<FragmentResult>, String>;
+
+    /// Exchange staging arena `(device base address, capacity in bytes)`, for transport memory
+    /// registration. Errors when the executor has no arena — the default for every executor
+    /// that is not the engine with `SIRIUS_EXCHANGE_STAGING_BYTES` set.
+    fn staging_info(&self) -> Result<(u64, u64), String> {
+        Err("this fragment executor has no exchange staging arena \
+             (engine build with SIRIUS_EXCHANGE_STAGING_BYTES required)"
+            .to_string())
+    }
+
+    /// Leases `len` bytes of the staging arena, returning the lease offset from the base.
+    fn staging_lease(&self, len: u64) -> Result<u64, String> {
+        let _ = len;
+        Err("this fragment executor has no exchange staging arena \
+             (engine build with SIRIUS_EXCHANGE_STAGING_BYTES required)"
+            .to_string())
+    }
+
+    /// Returns the staging lease at `offset`.
+    fn staging_release(&self, offset: u64) -> Result<(), String> {
+        let _ = offset;
+        Err("this fragment executor has no exchange staging arena \
+             (engine build with SIRIUS_EXCHANGE_STAGING_BYTES required)"
+            .to_string())
+    }
+
+    /// Packs the next batch parked under `slot` into a fresh staging lease; `Ok(None)` once the
+    /// parked output is drained. The lease stays outstanding until
+    /// [`staging_release`](Self::staging_release).
+    fn export_packed_next(&self, slot: SenderSlot) -> Result<Option<StagedBatch>, String> {
+        let _ = slot;
+        Err("this fragment executor cannot export packed batches \
+             (engine build with SIRIUS_EXCHANGE_STAGING_BYTES required)"
+            .to_string())
+    }
+
+    /// Drops the parked fragment under `slot`, releasing the GPU memory its batches hold. Called
+    /// after the drained output has been transmitted (or on a failed transmit, so a wedged
+    /// cross-node query does not pin its output for the process lifetime).
+    fn drop_parked(&self, slot: SenderSlot) -> Result<(), String> {
+        let _ = slot;
+        Err("this fragment executor parks nothing to drop".to_string())
+    }
 }
 
 /// Placeholder executor that fabricates one row so the result path works without a GPU.

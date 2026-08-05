@@ -52,8 +52,10 @@ mod engine_settings;
 mod file_schema;
 mod fragment_executor;
 mod local_exchange;
+mod nixl_transport;
 mod proto;
 mod prpc;
+mod prpc_client;
 mod result_encoder;
 mod result_store;
 
@@ -63,6 +65,12 @@ pub use compute_node_service::ExchangeIdentity;
 pub use engine::SiriusEngine;
 pub use engine_settings::{EngineSettings, derive_sirius_config_yaml};
 pub use fragment_executor::{FragmentExecutor, FragmentResult, StubExecutor};
+pub use nixl_transport::NixlTransport;
+
+/// Serializes tests that bring up a GPU engine context: the engine keeps process-global GPU
+/// state, so at most one context may be live at a time within the test binary.
+#[cfg(all(test, feature = "sirius-engine"))]
+pub(crate) static GPU_ENGINE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 const COMPUTE_NODE_PROC_PATH: &str = "/compute_nodes";
 
