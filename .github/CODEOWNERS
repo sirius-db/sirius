@@ -5,58 +5,58 @@
 # CODEOWNER approval is not required to merge. Teams exist for routing and
 # load distribution so PRs reach the right reviewers without a Slack ping.
 #
-# Teams follow the pattern: @sirius-db/sirius-<component|language>-codeowners
+# Teams follow the pattern: @sirius-db/sirius-<component|language>
 
 # ── Core (Planner, Executors & Operators/Expressions) ─────────────────────────
-src/planner/                        @sirius-db/sirius-core-codeowners
-src/include/planner/                @sirius-db/sirius-core-codeowners
-src/creator/                        @sirius-db/sirius-core-codeowners
-src/pipeline/                       @sirius-db/sirius-core-codeowners
-src/include/pipeline/               @sirius-db/sirius-core-codeowners
-src/**/exec/                        @sirius-db/sirius-core-codeowners
-src/**/parallel/                    @sirius-db/sirius-core-codeowners
-src/include/common/                 @sirius-db/sirius-core-codeowners
-src/include/cudf/                   @sirius-db/sirius-core-codeowners
-src/**/cuda/                        @sirius-db/sirius-core-codeowners
-src/**/expression*/                 @sirius-db/sirius-core-codeowners
-src/**/op/                          @sirius-db/sirius-core-codeowners
+src/planner/                        @sirius-db/sirius-core
+src/include/planner/                @sirius-db/sirius-core
+src/creator/                        @sirius-db/sirius-core
+src/pipeline/                       @sirius-db/sirius-core
+src/include/pipeline/               @sirius-db/sirius-core
+src/**/exec/                        @sirius-db/sirius-core
+src/**/parallel/                    @sirius-db/sirius-core
+src/include/common/                 @sirius-db/sirius-core
+src/include/cudf/                   @sirius-db/sirius-core
+src/**/cuda/                        @sirius-db/sirius-core
+src/**/expression*/                 @sirius-db/sirius-core
+src/**/op/                          @sirius-db/sirius-core
 
 # ── I/O (Scan, Compression & Memory) ──────────────────────────────────────────
-src/include/data/                   @sirius-db/sirius-io-codeowners
-src/**/helper/                      @sirius-db/sirius-io-codeowners
-src/**/util/                        @sirius-db/sirius-io-codeowners
-src/**/io/                          @sirius-db/sirius-io-codeowners
-src/**/scan*/                       @sirius-db/sirius-io-codeowners
-src/compression/                    @sirius-db/sirius-io-codeowners
-src/**/downgrade/                   @sirius-db/sirius-io-codeowners
-src/**/memory/                      @sirius-db/sirius-io-codeowners
+src/include/data/                   @sirius-db/sirius-io
+src/**/helper/                      @sirius-db/sirius-io
+src/**/util/                        @sirius-db/sirius-io
+src/**/io/                          @sirius-db/sirius-io
+src/**/scan*/                       @sirius-db/sirius-io
+src/compression/                    @sirius-db/sirius-io
+src/**/downgrade/                   @sirius-db/sirius-io
+src/**/memory/                      @sirius-db/sirius-io
 
 # ── Integrations ──────────────────────────────────────────────────────────────
-/cucascade/                         @sirius-db/sirius-integrations-codeowners
-/duckdb/                            @sirius-db/sirius-integrations-codeowners
-/experimental/                      @sirius-db/sirius-integrations-codeowners
-/substrait/                         @sirius-db/sirius-integrations-codeowners
-/rust/crates/sirius*/               @sirius-db/sirius-integrations-codeowners
-src/**/transparent/                 @sirius-db/sirius-integrations-codeowners
+/cucascade/                         @sirius-db/sirius-integrations
+/duckdb/                            @sirius-db/sirius-integrations
+/experimental/                      @sirius-db/sirius-integrations
+/substrait/                         @sirius-db/sirius-integrations
+/rust/crates/sirius*/               @sirius-db/sirius-integrations
+src/**/transparent/                 @sirius-db/sirius-integrations
 
 # ── Telemetry & Observability ─────────────────────────────────────────────────
-/rust/crates/telemetry/             @sirius-db/sirius-telemetry-codeowners
-/tools/                             @sirius-db/sirius-telemetry-codeowners
-src/**/log/                         @sirius-db/sirius-telemetry-codeowners
-src/**/telemetry/                   @sirius-db/sirius-telemetry-codeowners
+/rust/crates/telemetry/             @sirius-db/sirius-telemetry
+/tools/                             @sirius-db/sirius-telemetry
+src/**/log/                         @sirius-db/sirius-telemetry
+src/**/telemetry/                   @sirius-db/sirius-telemetry
 
 # ── CMake ─────────────────────────────────────────────────────────────────────
-/cmake/                             @sirius-db/sirius-cmake-codeowners
-**/*.cmake                          @sirius-db/sirius-cmake-codeowners
-**/CMakeLists.txt                   @sirius-db/sirius-cmake-codeowners
+/cmake/                             @sirius-db/sirius-cmake
+**/*.cmake                          @sirius-db/sirius-cmake
+**/CMakeLists.txt                   @sirius-db/sirius-cmake
 
 # ── Ops  ──────────────────────────────────────────────────────────────────────
-/.github                            @sirius-db/sirius-ops-codeowners
+/.github                            @sirius-db/sirius-ops
 
 # ── Documentation──────────────────────────────────────────────────────────────
-**/CLAUDE.md                        @sirius-db/sirius-docs-codeowners
-**/*.md                             @sirius-db/sirius-docs-codeowners
+**/CLAUDE.md                        @sirius-db/sirius-docs
+**/*.md                             @sirius-db/sirius-docs
 
 # ── Language overlays (last-match-wins — these take precedence) ───────────────
-**/*.rs                             @sirius-db/sirius-rust-codeowners
-**/*.py                             @sirius-db/sirius-python-codeowners
+**/*.rs                             @sirius-db/sirius-rust
+**/*.py                             @sirius-db/sirius-python
