@@ -1,0 +1,39 @@
+# Pareto-picked plans: max ratio with decompress >= 250 GB/s per column.
+# Provenance: GB300 re-measure 2026-08-03T11:05Z, input=/localhome/local-faramburu/tpch_parquet_sf1000/partsupp/part.0.parquet,
+#   simpatico explore --score pareto --decomp-floor 250 --beam-width 100 --max-depth 10 \
+#     --rerank-warmup 2 --rerank-iters 5
+# Rates: comp/decomp = warmed median-of-5 (event-bracketed);
+#   old_wall_* = legacy one-shot metric of the pre-fix harness, for continuity.
+# column: ps_partkey  dtype: i32  ratio: 101.136x  depth: 2
+# comp: 251.90 GB/s  decomp: 704.58 GB/s
+# old_wall_comp: 252.09 GB/s  old_wall_decomp: 109.22 GB/s
+input -> delta -> differences
+delta.differences -> lz4
+
+---
+# column: ps_suppkey  dtype: i32  ratio: 37.378x  depth: 2
+# comp: 81.95 GB/s  decomp: 421.17 GB/s
+# old_wall_comp: 82.10 GB/s  old_wall_decomp: 426.50 GB/s
+input -> delta -> differences
+delta.differences -> deflate
+
+---
+# column: ps_availqty  dtype: i32  ratio: 2.274x  depth: 1
+# comp: 801.13 GB/s  decomp: 1584.28 GB/s
+# old_wall_comp: 789.84 GB/s  old_wall_decomp: 1570.74 GB/s
+input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+
+---
+# column: ps_supplycost  dtype: t26  ratio: 3.742x  depth: 1
+# comp: 1215.60 GB/s  decomp: 2763.65 GB/s
+# old_wall_comp: 1167.02 GB/s  old_wall_decomp: 2609.32 GB/s
+input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+
+---
+# column: ps_comment  dtype: str  ratio: 2.991x  depth: 4
+# comp: 22.73 GB/s  decomp: 255.38 GB/s
+# old_wall_comp: 22.68 GB/s  old_wall_decomp: 253.99 GB/s
+input -> str_split -> offsets, chars
+str_split.chars -> snappy
+str_split.offsets -> delta -> differences
+str_split.offsets.differences -> ans

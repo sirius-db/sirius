@@ -1,0 +1,31 @@
+# Arm D surgical plans — projected/filter-aware selection (2026-08-03).
+# Census: partsupp is a pure join table — no filters ever (q2/q9/q11/q16/q20);
+# value is bandwidth on the 4 narrow columns (q9/q11 heavy). Bitpack on all
+# numerics (no frontier point beats bitpack at >= 1 TB/s decode: ps_partkey
+# delta->lz4 101x @ 704.6 GB/s and ps_suppkey delta->deflate 37x @ 421 GB/s
+# both rejected). IDENTITY on ps_comment (never materialized by any query).
+# Rates: GB300 warmed median-of-5 from plans-gb300/frontier/partsupp.tsv.
+# column: ps_partkey  dtype: i32  ratio: 3.965x  depth: 1
+# comp: 1034.1 GB/s  decomp: 1626.3 GB/s
+input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+
+---
+# column: ps_suppkey  dtype: i32  ratio: 1.387x  depth: 1
+# comp: 724.1 GB/s  decomp: 1542.1 GB/s
+input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+
+---
+# column: ps_availqty  dtype: i32  ratio: 2.274x  depth: 1
+# comp: 801.1 GB/s  decomp: 1584.3 GB/s
+input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+
+---
+# column: ps_supplycost  dtype: t26  ratio: 3.742x  depth: 1
+# comp: 1215.6 GB/s  decomp: 2763.7 GB/s
+input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+
+---
+# column: ps_comment  dtype: str  ratio: 1.000x  depth: 1
+# comp: 2955 GB/s  decomp: 3086 GB/s
+# identity: no TPC-H query ever materializes ps_comment (union-pin census)
+input -> identity

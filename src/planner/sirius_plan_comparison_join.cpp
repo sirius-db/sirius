@@ -358,18 +358,14 @@ std::vector<std::size_t> build_key_domain_cardinalities(duckdb::LogicalCompariso
 }  // namespace
 //===----------------------------------------------------------------------===//
 
-/// True when @p op is a *derived* relation rather than a base table read: its
-/// subtree contains a join, aggregate, or set operation that has already reduced
-/// its key set.
-///
-/// This is the distinction the "unfiltered build side" refusal actually needs.
-/// An unfiltered base relation is the whole key domain, so a dynamic filter from
-/// it keeps every probe row. An unfiltered *derived* relation is not — a join
-/// output carries only the keys that survived the join, and can be far smaller
-/// than the domain even though no predicate appears anywhere below it.
-///
-/// Descends through the pass-through operators (projection, filter, order) that
-/// sit between a join and its real input; stops at the first reducing operator.
+/// True when @p op is a *derived* relation rather than a base table read: its subtree contains a
+/// join, aggregate, or set operation that has already reduced its key set. An unfiltered base
+/// relation is the whole key domain, but an unfiltered *derived* relation can be far smaller —
+/// the distinction the "unfiltered build side" refusal needs. Descends through pass-through
+/// operators (projection, filter, order); stops at the first reducing operator.
+/// @c LOGICAL_DELIM_GET is a childless leaf but never a base table: it replays the
+/// duplicate-eliminated (already joined, already DISTINCT'd) keys of the enclosing delim join's
+/// other side.
 static bool build_side_is_derived(const duckdb::LogicalOperator* op)
 {
   if (op == nullptr) { return false; }
@@ -377,6 +373,7 @@ static bool build_side_is_derived(const duckdb::LogicalOperator* op)
     case duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN:
     case duckdb::LogicalOperatorType::LOGICAL_ANY_JOIN:
     case duckdb::LogicalOperatorType::LOGICAL_DELIM_JOIN:
+    case duckdb::LogicalOperatorType::LOGICAL_DELIM_GET:
     case duckdb::LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY:
     case duckdb::LogicalOperatorType::LOGICAL_DISTINCT:
     case duckdb::LogicalOperatorType::LOGICAL_INTERSECT:
@@ -574,18 +571,10 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
       // An unfiltered build is (for FK-shaped joins) the whole key domain — its filter keeps
       // every probe row by construction, so wiring a producer target for it only buys overhead.
       // DuckDB's flag covers the delim-join case where the effective build data is children[0].
-      //
-      // But "unfiltered" only implies "whole key domain" when the build side IS a base table.
-      // A build that is itself a join or aggregate output has already been reduced, so its key
-      // set is a strict subset of the domain and its filter can be highly selective even with
-      // no predicate anywhere in its subtree. TPC-H q3 is the case in point: the build of
-      // orders⋈lineitem is the output of customer⋈orders, and the filter it would produce keeps
-      // ~1% of lineitem.
-      //
-      // So the refusal now applies only to a base-relation build. For a derived build we wire
-      // the producer and let the *runtime* selectivity gate decide — it measures what the filter
-      // actually keeps and disables it if that is not worth the probe-side cost, which is a real
-      // measurement rather than a plan-time guess.
+      // That reasoning only holds when the build IS a base table: a derived build (join or
+      // aggregate output) can be a strict subset of the domain with no predicate anywhere in
+      // its subtree, so wire the producer and let the runtime selectivity gate measure whether
+      // the filter earns its probe-side cost.
       const bool derived_build = build_side_is_derived(op.children[1].get());
       if (!op.filter_pushdown->build_side_has_filter && !derived_build) {
         SIRIUS_LOG_INFO(

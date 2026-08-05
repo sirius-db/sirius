@@ -23,6 +23,8 @@
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/memory_space.hpp>
 
+#include "decode_pushdown.hpp"
+
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -38,6 +40,25 @@ class compressed_table;
 namespace sirius {
 
 struct compressed_device_blob;  // defined in device_compressed_blob.hpp
+
+/// Per-selected-column equality/IN pushdown for decompression.
+///
+/// Parallel to a representation's selected column list, so entry @c i describes
+/// the @c i-th column the converter will decompress. Entry @c i holds the string
+/// values that column is tested against; an empty entry decompresses normally.
+///
+/// A column with a non-empty entry comes back as a **BOOL8** column
+/// (`value ∈ values`, nulls propagated) rather than its declared type: a
+/// dictionary-compressed column answers the predicate from its key set and never
+/// gathers the decoded chars (see @c simpatico::decode_predicate). Consumers
+/// must therefore expect the type substitution — @c parquet_gpu_ingestible
+/// rewrites its filter expression to a bare boolean reference when it sees one.
+///
+/// Held as plain strings rather than @c simpatico::decode_predicate so this
+/// header stays free of the simpatico API (matching the forward-declared
+/// @c compressed_table above); @c compression_converters.cpp converts at the
+/// call boundary.
+using decode_equality_pushdown = std::vector<std::vector<std::string>>;
 
 /// A Simpatico-compressed chunk resident in pinned host memory.
 ///
@@ -187,6 +208,81 @@ class compressed_host_representation : public cucascade::idata_representation {
     return _selected_indices;
   }
 
+  /// Attach an equality/IN pushdown, parallel to the selected column list.
+  ///
+  /// Call only on a freshly projected representation the caller owns outright
+  /// (as @ref select_columns returns): the pushdown is a property of one scan's
+  /// filter, never of the shared pinned chunk.
+  void set_equality_pushdown(decode_equality_pushdown pushdown)
+  {
+    _equality_pushdown = std::move(pushdown);
+  }
+
+  /// The attached pushdown; empty when the columns decompress normally.
+  [[nodiscard]] const decode_equality_pushdown& equality_pushdown() const noexcept
+  {
+    return _equality_pushdown;
+  }
+
+  /// Attach the scan's numeric-range pushdown (fused scan-filter pipeline),
+  /// parallel to the selected column list; same freshly-projected-only
+  /// ownership rule as the equality pushdown above.
+  void set_range_pushdown(decode_range_pushdown pushdown, bool all_conjuncts_convertible)
+  {
+    _range_pushdown              = std::move(pushdown);
+    _range_conjuncts_convertible = all_conjuncts_convertible;
+  }
+
+  /// The attached range pushdown; empty when no decode-time range applies.
+  [[nodiscard]] const decode_range_pushdown& range_pushdown() const noexcept
+  {
+    return _range_pushdown;
+  }
+
+  /// True iff the attached ranges are the scan's WHOLE row-restricting filter —
+  /// the iteration-1 gate for decode-side compaction (rows may only be dropped
+  /// during decode when nothing else still filters the batch).
+  [[nodiscard]] bool range_conjuncts_convertible() const noexcept
+  {
+    return _range_conjuncts_convertible;
+  }
+
+  /// Attach dynamic-membership probes (Phase A), parallel to the selected
+  /// column list; same freshly-projected ownership rule. @p generation is the
+  /// producing channel's monotonic filter_count() at snapshot time — the wave
+  /// orchestrator echoes it so bail latches can be generation-keyed.
+  void set_membership_pushdown(decode_membership_pushdown pushdown, std::uint64_t generation)
+  {
+    _membership_pushdown  = std::move(pushdown);
+    _membership_generation = generation;
+  }
+
+  [[nodiscard]] const decode_membership_pushdown& membership_pushdown() const noexcept
+  {
+    return _membership_pushdown;
+  }
+
+  [[nodiscard]] std::uint64_t membership_generation() const noexcept
+  {
+    return _membership_generation;
+  }
+
+  /// Late-materialization capture request (SIRIUS_EXP_LATE_MAT, additive):
+  /// when set on a freshly projected per-query representation (same ownership
+  /// rule as the pushdown setters — NEVER the shared pinned chunk), a fused
+  /// scan-filter decode that APPLIES the whole conjunction (row_filtered tag
+  /// only, never a RULE-2 bail or partial coverage) moves its wave-1
+  /// selection buffers onto the produced row_filtered_gpu_table_representation
+  /// (captured_selection) instead of freeing them. Default false; the flag is
+  /// a plain bool and adds no behavior anywhere until the converter reads it.
+  void request_selection_capture() noexcept { _selection_capture_requested = true; }
+
+  [[nodiscard]] bool selection_capture_requested() const noexcept
+  {
+    return _selection_capture_requested;
+  }
+
+
  private:
   /// Construct a projection sharing the same backing blob.
   compressed_host_representation(cucascade::memory::memory_space& memory_space,
@@ -204,6 +300,13 @@ class compressed_host_representation : public cucascade::idata_representation {
   std::size_t _uncompressed_bytes;
   std::int64_t _num_rows;
   std::optional<std::vector<std::size_t>> _selected_indices;
+  decode_equality_pushdown _equality_pushdown;
+  decode_range_pushdown _range_pushdown;
+  bool _range_conjuncts_convertible = false;
+  decode_membership_pushdown _membership_pushdown;
+  std::uint64_t _membership_generation = 0;
+  /// Late-mat capture request (see request_selection_capture()).
+  bool _selection_capture_requested = false;
   std::shared_ptr<const per_column_byte_sizes> _column_sizes;
 };
 
@@ -273,6 +376,103 @@ class compressed_device_representation : public cucascade::idata_representation 
     return _selected_indices;
   }
 
+  /// Attach an equality/IN pushdown, parallel to the selected column list.
+  ///
+  /// Call only on a freshly projected representation the caller owns outright
+  /// (as @ref select_columns returns): the pushdown is a property of one scan's
+  /// filter, never of the shared pinned chunk.
+  void set_equality_pushdown(decode_equality_pushdown pushdown)
+  {
+    _equality_pushdown = std::move(pushdown);
+  }
+
+  /// The attached pushdown; empty when the columns decompress normally.
+  [[nodiscard]] const decode_equality_pushdown& equality_pushdown() const noexcept
+  {
+    return _equality_pushdown;
+  }
+
+  /// Attach the scan's numeric-range pushdown (fused scan-filter pipeline),
+  /// parallel to the selected column list; same freshly-projected-only
+  /// ownership rule as the equality pushdown above.
+  void set_range_pushdown(decode_range_pushdown pushdown, bool all_conjuncts_convertible)
+  {
+    _range_pushdown              = std::move(pushdown);
+    _range_conjuncts_convertible = all_conjuncts_convertible;
+  }
+
+  /// The attached range pushdown; empty when no decode-time range applies.
+  [[nodiscard]] const decode_range_pushdown& range_pushdown() const noexcept
+  {
+    return _range_pushdown;
+  }
+
+  /// True iff the attached ranges are the scan's WHOLE row-restricting filter —
+  /// the iteration-1 gate for decode-side compaction (rows may only be dropped
+  /// during decode when nothing else still filters the batch).
+  [[nodiscard]] bool range_conjuncts_convertible() const noexcept
+  {
+    return _range_conjuncts_convertible;
+  }
+
+  /// Attach dynamic-membership probes (Phase A), parallel to the selected
+  /// column list; same freshly-projected ownership rule. @p generation is the
+  /// producing channel's monotonic filter_count() at snapshot time — the wave
+  /// orchestrator echoes it so bail latches can be generation-keyed.
+  void set_membership_pushdown(decode_membership_pushdown pushdown, std::uint64_t generation)
+  {
+    _membership_pushdown  = std::move(pushdown);
+    _membership_generation = generation;
+  }
+
+  [[nodiscard]] const decode_membership_pushdown& membership_pushdown() const noexcept
+  {
+    return _membership_pushdown;
+  }
+
+  [[nodiscard]] std::uint64_t membership_generation() const noexcept
+  {
+    return _membership_generation;
+  }
+
+  /// Late-materialization capture request (SIRIUS_EXP_LATE_MAT, additive):
+  /// when set on a freshly projected per-query representation (same ownership
+  /// rule as the pushdown setters — NEVER the shared pinned chunk), a fused
+  /// scan-filter decode that APPLIES the whole conjunction (row_filtered tag
+  /// only, never a RULE-2 bail or partial coverage) moves its wave-1
+  /// selection buffers onto the produced row_filtered_gpu_table_representation
+  /// (captured_selection) instead of freeing them. Default false; the flag is
+  /// a plain bool and adds no behavior anywhere until the converter reads it.
+  void request_selection_capture() noexcept { _selection_capture_requested = true; }
+
+  [[nodiscard]] bool selection_capture_requested() const noexcept
+  {
+    return _selection_capture_requested;
+  }
+
+
+  /// Reservation-time fused scan-filter probe (host metadata only — never
+  /// touches the device).
+  struct fused_scan_reservation_probe {
+    /// The fused pipeline is expected to compact this projection at decode:
+    /// env gate on, at least one attached ACTIVE range, the ranges cover the
+    /// whole filter, and every selected column's plan probes
+    /// survivor-compactable (bitpack tier_a, delta tier_a_delta, or
+    /// dict-K5) — the reservation-time mirror of the converter's RULE 1.
+    bool planned = false;
+    /// True when the batch's survivor count is capped by the RULE-2
+    /// selectivity ceiling — i.e. NO selected column classifies tier_dict_k5
+    /// (dict-K5 batches skip the RULE-2 bail: the masked key gather wins at
+    /// every selectivity). When false, size survivor-dependent reservations
+    /// for up to full-width survivors.
+    bool rule2_bounded = false;
+  };
+
+  /// See @ref fused_scan_reservation_probe. RULE 2 itself (the post-CNT bail)
+  /// is data-dependent and invisible here; callers scaling reservations by
+  /// the RULE-2 ceiling accept the rare bail-path over-allocation.
+  [[nodiscard]] fused_scan_reservation_probe probe_fused_scan_reservation() const;
+
  private:
   compressed_device_representation(cucascade::memory::memory_space& memory_space,
                                    std::shared_ptr<compressed_device_blob> blob,
@@ -289,6 +489,13 @@ class compressed_device_representation : public cucascade::idata_representation 
   std::size_t _uncompressed_bytes;
   std::int64_t _num_rows;
   std::optional<std::vector<std::size_t>> _selected_indices;
+  decode_equality_pushdown _equality_pushdown;
+  decode_range_pushdown _range_pushdown;
+  bool _range_conjuncts_convertible = false;
+  decode_membership_pushdown _membership_pushdown;
+  std::uint64_t _membership_generation = 0;
+  /// Late-mat capture request (see request_selection_capture()).
+  bool _selection_capture_requested = false;
   std::shared_ptr<const per_column_byte_sizes> _column_sizes;
 };
 

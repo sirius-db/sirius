@@ -18,6 +18,7 @@
 
 #include <compression/compression_converters.hpp>
 #include <cucascade/cudf/builtin_converters.hpp>
+#include <late_mat/annotated_table_representation.hpp>
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/data/representation_converter.hpp>
@@ -55,6 +56,12 @@ class converter_registry {
     instance_ = std::make_unique<registry_type>();
     cucascade::register_builtin_converters(*instance_);
     sirius::register_compression_converters(*instance_);
+    // Late-mat annotated representation (SIRIUS_EXP_LATE_MAT): registered
+    // unconditionally — registration is one-time and free on the hot path,
+    // and the annotated type is only ever CONSTRUCTED behind the gate. The
+    // typeid-exact converter dispatch would otherwise strand an annotated
+    // batch at the downgrade/cross-device boundary.
+    sirius::late_mat::register_late_mat_converters(*instance_);
   }
 
   /**

@@ -1,0 +1,113 @@
+# exploring column 0 (r_regionkey, dtype=i32, rows=5)
+[explore] Input size: 20 bytes, max_candidates=100, max_depth=10
+[explore] Depth 0: 1 candidates, best=1
+[explore]   delta: 4096/20 (0.005x)
+[explore]   rle: 40/20 (0.500x)
+[explore]   bitpack: 25/20 (0.800x)
+[explore]   for: 4100/20 (0.005x)
+[explore]   zigzag: 4096/20 (0.005x)
+[explore]   ans: 456/20 (0.044x)
+[explore]   bitcomp: 316/20 (0.063x)
+[explore]   snappy: 278/20 (0.072x)
+[explore]   deflate: 516/20 (0.039x)
+[explore]   lz4: 278/20 (0.072x)
+[explore] Depth 1: 4 candidates, best=1.000
+[explore] Depth 2: 42 candidates, best=1.000
+[explore] Depth 3: 100 candidates, best=1.000
+[explore] Depth 4: 100 candidates, best=1.000
+[explore] Depth 5: 100 candidates, best=1.000
+[explore] Depth 6: 100 candidates, best=1.000
+[explore] Depth 7: 100 candidates, best=1.000
+[explore] Depth 8: 100 candidates, best=1.000
+[explore] Depth 9: 100 candidates, best=1.000
+[explore] Rerank pool (15 candidates):
+[explore]   ratio=1.000  steps=1  input -> identity
+[explore]   ratio=0.833  steps=4  input -> rle -> runs, values
+[explore]   ratio=0.714  steps=2  input -> rle -> runs, values
+[explore]   ratio=0.500  steps=1  input -> rle -> runs, values
+[explore]   ratio=0.005  steps=1  input -> zigzag -> zigzag
+[explore]   ratio=0.005  steps=1  input -> delta -> differences
+[explore]   ratio=0.005  steps=1  input -> for -> deltas, references
+[explore]   ratio=0.417  steps=2  input -> zigzag -> zigzag
+[explore]   ratio=0.385  steps=2  input -> for -> deltas, references
+[explore]   ratio=0.333  steps=2  input -> rle -> runs, values
+[explore]   ratio=0.179  steps=2  input -> delta -> differences
+[explore]   ratio=0.625  steps=3  input -> rle -> runs, values
+[explore]   ratio=0.625  steps=3  input -> rle -> runs, values
+[explore]   ratio=0.500  steps=3  input -> zigzag -> zigzag
+[explore]   ratio=0.455  steps=3  input -> for -> deltas, references
+[explore] Final: ratio=1.000 depth=1
+DSL:
+input -> identity
+# exploring column 1 (r_name, dtype=str, rows=5)
+[explore] Input size: 58 bytes, max_candidates=100, max_depth=10
+[explore] Depth 0: 1 candidates, best=1.000
+[explore]   dictionary: 78/58 (0.744x)
+[explore]   str_split: 58/58 (1.000x)
+[explore] Depth 1: 1 candidates, best=1.000
+[explore] Depth 2: 8 candidates, best=1.000
+[explore] Depth 3: 100 candidates, best=1.000
+[explore] Depth 4: 100 candidates, best=1.000
+[explore] Depth 5: 100 candidates, best=1.000
+[explore] Depth 6: 100 candidates, best=1.000
+[explore] Depth 7: 100 candidates, best=1.000
+[explore] Depth 8: 100 candidates, best=1.000
+[explore] Depth 9: 100 candidates, best=1.000
+[explore] Rerank pool (14 candidates):
+[explore]   ratio=1.000  steps=1  input -> identity
+[explore]   ratio=0.879  steps=3  input -> str_split -> offsets, chars
+[explore]   ratio=0.866  steps=4  input -> str_split -> offsets, chars
+[explore]   ratio=0.773  steps=4  input -> str_split -> offsets, chars
+[explore]   ratio=0.734  steps=3  input -> str_split -> offsets, chars
+[explore]   ratio=1.000  steps=1  input -> str_split -> offsets, chars
+[explore]   ratio=0.707  steps=2  input -> str_split -> offsets, chars
+[explore]   ratio=0.324  steps=2  input -> str_split -> offsets, chars
+[explore]   ratio=0.055  steps=2  input -> str_split -> offsets, chars
+[explore]   ratio=0.055  steps=2  input -> str_split -> offsets, chars
+[explore]   ratio=0.725  steps=3  input -> str_split -> offsets, chars
+[explore]   ratio=0.644  steps=3  input -> str_split -> offsets, chars
+[explore]   ratio=0.617  steps=3  input -> str_split -> offsets, chars
+[explore]   ratio=0.547  steps=3  input -> str_split -> offsets, chars
+[explore] Final: ratio=1.000 depth=1
+DSL:
+input -> identity
+# exploring column 2 (r_comment, dtype=str, rows=5)
+[explore] Input size: 354 bytes, max_candidates=100, max_depth=10
+[explore] Depth 0: 1 candidates, best=1.000
+[explore]   dictionary: 374/354 (0.947x)
+[explore]   str_split: 354/354 (1.000x)
+[explore] Depth 1: 1 candidates, best=1.000
+[explore] Depth 2: 9 candidates, best=1.060
+[explore] Depth 3: 100 candidates, best=1.060
+[explore] Depth 4: 100 candidates, best=1.060
+[explore] Depth 5: 100 candidates, best=1.060
+[explore] Depth 6: 100 candidates, best=1.060
+[explore] Depth 7: 100 candidates, best=1.060
+[explore] Depth 8: 100 candidates, best=1.060
+[explore] Depth 9: 100 candidates, best=1.060
+[explore] Rerank pool (15 candidates):
+[explore]   ratio=1.060  steps=2  input -> str_split -> offsets, chars
+[explore]   ratio=1.032  steps=5  input -> str_split -> offsets, chars
+[explore]   ratio=1.000  steps=1  input -> identity
+[explore]   ratio=0.978  steps=3  input -> str_split -> offsets, chars
+[explore]   ratio=0.954  steps=4  input -> str_split -> offsets, chars
+[explore]   ratio=0.944  steps=3  input -> str_split -> offsets, chars
+[explore]   ratio=1.000  steps=1  input -> str_split -> offsets, chars
+[explore]   ratio=0.937  steps=2  input -> str_split -> offsets, chars
+[explore]   ratio=0.338  steps=2  input -> str_split -> offsets, chars
+[explore]   ratio=0.338  steps=2  input -> str_split -> offsets, chars
+[explore]   ratio=0.337  steps=2  input -> str_split -> offsets, chars
+[explore]   ratio=1.047  steps=3  input -> str_split -> offsets, chars
+[explore]   ratio=1.047  steps=3  input -> str_split -> offsets, chars
+[explore]   ratio=1.047  steps=3  input -> str_split -> offsets, chars
+[explore]   ratio=0.989  steps=3  input -> str_split -> offsets, chars
+[explore] Final: ratio=1.000 depth=1
+DSL:
+input -> identity
+
+=== Pareto alternates (1) ===
+--- alt 0 ---
+  ratio=1.06x comp=0.00 GB/s decomp=0.01 GB/s
+  input -> str_split -> offsets, chars
+  str_split.chars -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+

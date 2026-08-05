@@ -17,6 +17,7 @@
 #include "pipeline/gpu_pipeline_task.hpp"
 
 #include "cudf/cudf_utils.hpp"
+#include "late_mat/column_origin.hpp"
 #include "log/logging.hpp"
 #include "memory/defragmenter_oom_policy.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
@@ -89,6 +90,16 @@ void validate_operator_output_types(const op::operator_data* data,
                                         : physical_types[static_cast<std::size_t>(c)];
       cudf::data_type actual        = tbl.column(c).type();
       if (actual != expected_cudf) {
+        // Late-mat placeholder whitelist (SIRIUS_EXP_LATE_MAT):
+        // deferred columns legitimately ride as UINT64 pin-order rowids / INT8
+        // placeholders at positions the plan types differently, until the consuming
+        // port's prepare restores the real columns. Suppress exactly that shape —
+        // gate off, nothing changes.
+        if (late_mat::late_mat_enabled() &&
+            (actual.id() == cudf::type_id::UINT64 || actual.id() == cudf::type_id::UINT32 ||
+             actual.id() == cudf::type_id::INT8)) {
+          continue;
+        }
         SIRIUS_LOG_WARN(
           "gpu_pipeline_task: operator '{}' (id={}) output batch {} column {} datatype "
           "mismatch: got {}, expected {}",
@@ -251,18 +262,8 @@ std::size_t gpu_pipeline_task_local_state::get_estimated_bytes_to_materialize_in
   const cucascade::memory::memory_space* target_space) const
 {
   // Peak device memory while making one representation GPU-resident.
-  // For uncompressed data the source lives in host memory; only the destination
-  // lands on device, so the peak equals the uncompressed size.
-  // For compressed data the encoded payload must first be staged on device
-  // before decompression produces the output, so both are alive simultaneously:
-  //   peak = compressed_bytes + uncompressed_bytes.
-  // When a column projection is applied (compressed_host/device_representation::
-  // select_columns), both byte fields are scaled pro-rata, so the estimate
-  // naturally covers only the projected columns.
-  auto peak_materialization_bytes = [](const cucascade::idata_representation* data) -> std::size_t {
-    auto const compressed   = data->get_size_in_bytes();
-    auto const uncompressed = data->get_uncompressed_data_size_in_bytes();
-    return compressed < uncompressed ? compressed + uncompressed : uncompressed;
+  auto peak_materialization_bytes = [](const cucascade::idata_representation* data) {
+    return sirius::peak_materialization_bytes(data);
   };
 
   if (auto* scan_input = dynamic_cast<const op::scan::scan_operator_input*>(_input_data.get());

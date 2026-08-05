@@ -154,6 +154,17 @@ static void from_yaml(const YAML::Node& node, sirius::io::cache::config& opt)
   r.reject_unknown();
 }
 
+static void from_yaml(const YAML::Node& node, scan_manager::memory_prefetcher_config& opt)
+{
+  yaml::reader r(node, "memory_prefetcher");
+  r.optional("enable", opt.enable);
+  r.optional("num_threads", opt.num_threads, yaml::greater_than<std::size_t>{0});
+  r.optional("min_free_fraction", opt.min_free_fraction, yaml::fraction<double>{});
+  r.optional("poll_interval_ms", opt.poll_interval_ms, yaml::greater_than<std::size_t>{0});
+  r.optional("drain_quiet_ms", opt.drain_quiet_ms);
+  r.reject_unknown();
+}
+
 static void from_yaml(const YAML::Node& node, scan_manager::scan_manager_config& opt)
 {
   yaml::reader r(node, "scan_manager");
@@ -168,6 +179,7 @@ static void from_yaml(const YAML::Node& node, scan_manager::scan_manager_config&
   if (auto n = r.optional_node("rest")) sirius::from_yaml(*n, opt.rest);
   if (auto n = r.optional_node("cache")) sirius::from_yaml(*n, opt.cache);
   if (auto n = r.optional_node("object_store")) sirius::from_yaml(*n, opt.object_store);
+  if (auto n = r.optional_node("memory_prefetcher")) from_yaml(*n, opt.memory_prefetcher);
   r.reject_unknown();
 }
 
