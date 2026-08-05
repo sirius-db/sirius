@@ -736,3 +736,129 @@ min(1, 1.27f).
 5. First engagement attempt (L-ENG row 1) aborted on the union-pin OOM;
    harness restart mid-campaign (coordinator-confirmed) cost no data — the
    L-ENG diag session completed and is the one reported.
+
+## 9. Suite campaign — full 22-query SF1000 ship config (WS16, 2026-08-05)
+
+**Status: COMPLETE — first suite-level scoring and what-if report.** The owner's
+yardstick ("validation makes most sense when running SF1K benchmarks") executed:
+the entire TPC-H suite on the lit ship lane (§8.1 config incl. the
+`enable_compressed_materialization = false` workaround in every arm), baselines +
+MPS-100 anchor + one MPS-50 degraded arm + paired nsys captures, scored with the
+G4b model (`4f2c57a6`) that landed mid-campaign, with all pre-G4b paths kept for
+contrast. Rows `S-*` in `runs.csv`; artifacts `analysis/S-*`, `analysis/SW-*`
+(what-if grid), `nsys/S-NSYS*`. Deliverable:
+[suite-whatif-sf1000.md](suite-whatif-sf1000.md). ~14 min GPU total.
+
+### 9.1 Collection integrity
+
+- **S-BASE** (3 iters): per-query medians (iters 2–3) sum to **6.654 s — the PR's
+  banked suite time to the millisecond.** Selfcheck median 0.11%, worst 0.58%.
+- **S-P3** (MPS pct=100 anchor, 3 iters): traced suite sum within **−0.03%** of
+  S-BASE — MPS daemon overhead is zero on this lane at suite scale. fma probe
+  52 158 GFLOP/s (≡ §2.1 anchor). Selfcheck 0.11%/0.66%.
+- **S-M50** (MPS pct=50, 3 iters): fma f_ach **0.5000 exactly** (saxpy co-point
+  0.637). Selfcheck 0.06%/0.39% — replay stays exact under suite-wide MPS.
+- **S-NSYS** (paired quent+nsys, 2 iters): **22 queries arrived in 19 reports** —
+  nsys silently *merges* consecutive capture ranges when a profiler_stop/start
+  pair is missed (q8+q9; q17+q18+q19; verified nothing lost: every query window
+  present, structure scores 1.0). Merged reports show range-level attribution
+  36–45% (inter-query pin work inside the range) but per-window attribution is
+  intact; un-merged reports 97–100%. `reader_notes: []` on all. Tier-A overhead
+  vs S-BASE: median +1.5%, worst +12% (q15, an 80 ms window). Physics knobs=1
+  identity on all 22 paired windows: **−0.02…−0.34%**. A 3-query follow-up
+  capture (S-NSYS2) was made before the merge was diagnosed; kept as replicate.
+
+### 9.2 Real suite-wide MPS-50 sensitivity
+
+Real slowdown (traced, med iters 2–3, S-P3-anchored) spans **×1.397 (q2) …
+×1.920 (q1)**, suite-aggregate **×1.779** = 89% of ideal 1/f. Device-level
+GPU-busy (kernel-sum ÷ steady window) is 82–100% on 21/22 queries — the entire
+suite sits in §8's device-saturated regime except **q2** (40% busy,
+dependency-bound, mildest slowdown ×1.40) — and **q1** is saturated via
+*co-running* kernels (serialization 0.29–0.33 vs ≥0.90 for the other 21; §9.6).
+
+### 9.3 Scoring — four paths on identical inputs (E_ratio vs f=0.5000)
+
+| path | median E | range | within ±15% | suite-agg E | rank ρ |
+|---|---|---|---|---|---|
+| v0 pre-G4b | −18.9% | −39.4…+17.1 | 9/22 | −12.3% | −0.04 |
+| physics pre-G4b | −27.4% | −38.4…−1.9 | 4/22 | −25.5% | 0.21 |
+| **v0-new (prep-scaling)** | **+3.9%** | −13.6…+22.2 | **17/22** | **+3.0%** | 0.32 |
+| **physics G4b** | **+6.8%** | −27.2…+26.9 | **17/22** | **+6.7%** | 0.17 |
+
+(metrics files `analysis/S-M50{v0,v0f,P,Pf}_metrics.txt`; suite-agg E is the
+time-weighted aggregate — Σsim/Σreal ratios.)
+
+- §8's verdict reproduces suite-wide: both old paths under-predict device-saturated
+  throttling on ~all 22 queries; **G4b flips the suite to mildly pessimistic**, and
+  the binding constraint reports `gpu_device` on 20/22 queries.
+- **The G4b serialization gate fired exactly once — q1** (0.33 < 0.9): model stood
+  down, warned lower-bound, and indeed under-predicted (E −27.2%, the table's worst).
+  The regime split §8 predicted is real but *narrow* on this suite: 21 engaged / 1
+  gated.
+- G4b outliers beyond q1: q15 +26.9%, q17 +26.0%, q13 +16.9% (pessimistic tail —
+  co-residency-shaped, §8.7 limitation 1, already visible at the mild 0.50 point);
+  q2 −15.4% (host-dominated, 71 ms — smallest real signal).
+- **v0-new is a genuinely decent no-capture fallback at f=0.5** (median +3.9%,
+  suite +3.0%) — but its errors are structural (q17 +22.2, q15/q19/q20 +16…+19 vs
+  q21 −13.6), where G4b's skew is a single physical mechanism. Cross-query rank ρ
+  is weak for every path (real spread is only ×1.4…×1.9 — ranks carry little
+  signal; §8.4 caveat holds).
+
+### 9.4 What-if grid (the deliverable)
+
+13 scenarios × 22 queries on the S-BASE trace, G4b physics:
+[suite-whatif-sf1000.md](suite-whatif-sf1000.md). Headlines: gpu_compute 0.5 →
+suite **+89.7%** (validated tier, vs real ×1.78 at MPS-50); gpu_compute 2.0 →
+**−10.5…−24.3%** band (G4b↔v0f — the queue/host floor caps the win);
+gpu_mem_capacity 0.5/0.25 → **+4.7% / +106%** (G5 tier, optimistic floor: pins
+unmodeled); c2c **inert** (≤+0.2% suite at 0.25×, expected on the all-pinned
+lane); io **inert-in-reality** — the S-BASE `io_request` stream is *empty*, and
+the grid's io cells (+21% suite at 0.25×) are pure gap-G1 artifact (v0 scales
+GPU_SCAN spans that contain zero device reads on this lane). Flagged in the
+report; do not quote.
+
+### 9.5 New model-quality facts (things §8.7 could not see with 5 queries)
+
+1. **Speedup direction has wrong-sign cells:** at gpu_compute=1.25, G4b predicts
+   q9 +4.9%, q11 +8.7%, q8 +0.8% (*slower* from faster SMs) — fluid-device packing
+   artifact (natural durations shrink faster than work, demand rate rises against
+   a capacity frozen at baseline busy). Same mechanism inflates
+   gpu_mem_bandwidth=2 (q17 +45.8%). Speedup cells need the [G4b, v0f] band
+   treatment until the demand-rate law is revisited.
+2. **The pessimistic tail at deep *suite* coverage is wider than the L-lane's:**
+   §8.7 saw +3.6…+6.8 medians and ≤+13 worst; the suite at f=0.5 already shows
+   +26.9/+26.0 worst cells (q15/q17). Both are short-window queries (75–158 ms)
+   with serialization 0.91–0.95 — the co-residency pessimism is not exclusive to
+   deep throttle.
+3. **Attribution robustness:** the structural join absorbed merged multi-query
+   captures (range-level attribution as low as 36%) with zero effect on identity
+   (−0.02…−0.34%) or join coverage (100.0% span matched on all 22).
+
+### 9.6 Surprises
+
+1. **nsys range-merging** (9.1): `--capture-range-end=repeat` can merge adjacent
+   per-query ranges rather than drop them; detection = fewer reports than
+   profiler_start calls, diagnosis = multi-label physics profiles. The runbook
+   assumption "one report per query" is unsafe; always verify by matched labels.
+2. **Co-running kernels don't dodge the SM knife:** q1's kernels overlap 3.4×
+   (sum/wall 343%) yet its real MPS-50 slowdown (×1.92) is the suite's *worst* —
+   an SM partition squeezes co-runners harder than serialized queues, the exact
+   opposite of the NVMe lane where co-running kernels shrugged the throttle off
+   (§8.7). The G4b gate is honest to stand down at serialization <0.9, but the
+   two gated populations (co-running-and-immune vs co-running-and-hyper-exposed)
+   now demonstrably exist; a q1-shaped lane is the next model frontier.
+3. **The suite's q10 GBR workaround held in every arm** — no re-regression under
+   MPS or nsys (q10 medians 252–254 ms across S-BASE/S-P3/S-NSYS).
+
+### 9.7 Deviations
+
+1. S-NSYS used **2 iterations** (not the protocol's 1) to match §8's proven
+   recipe: window 2 is the steady-state window (iteration 1 carries ast_jit
+   warmup), and the §8.2 device-busy convention needs it.
+2. `SET enable_compressed_materialization = false` in every arm (as §8.8.3).
+3. S-M50 walls measured with 1 warmup + 2 measured iterations (σ ≤0.6%, §8.8.1
+   rule); real ratios anchored on S-P3 (common-mode daemon cancellation, §2.1).
+4. A harness restart (07:21–12:23 UTC) split the campaign between S-M50 and
+   S-NSYS; S-M50 completed unattended and its trace/selfcheck verified clean
+   post-hoc. GPU idle-verified before resuming; no foreign users.
