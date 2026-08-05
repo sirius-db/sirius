@@ -121,12 +121,13 @@ std::vector<IcebergDeleteFileEntry> read_deletion_vectors_from_manifest(
     "') "
     "WHERE data_file.content = 1");
 
-  if (result->HasError()) {
+  if (!result || result->HasError()) {
     // Same rule as discover_from_manifests: an unreadable manifest must not degrade into an
     // empty entry list, because empty means "no deletion vectors here" and the scan would then
-    // return rows the table deleted.
+    // return rows the table deleted. A null result is folded in here rather than dereferenced,
+    // for the same reason: it must not read as an absence of deletes.
     throw std::runtime_error("[iceberg] Failed to read manifest '" + manifest_path +
-                             "': " + result->GetError());
+                             "': " + (result ? result->GetError() : "null result"));
   }
 
   std::vector<IcebergDeleteFileEntry> entries;
@@ -176,12 +177,13 @@ IcebergManifestDiscovery discover_from_manifests(duckdb::ClientContext& context,
   query += ")";
 
   auto meta_result = conn.Query(query);
-  if (meta_result->HasError()) {
+  if (!meta_result || meta_result->HasError()) {
     // Must throw, not return an empty discovery: an empty result reads as "this table has no
     // delete files", so swallowing the error here turns "could not list the deletes" into
-    // "there are none" and the scan silently returns deleted rows.
+    // "there are none" and the scan silently returns deleted rows. A null result is the same
+    // failure and takes the same exit.
     throw std::runtime_error("[iceberg] iceberg_metadata() failed for '" + table_path +
-                             "': " + meta_result->GetError());
+                             "': " + (meta_result ? meta_result->GetError() : "null result"));
   }
 
   static constexpr auto kPositionDeletes = "POSITION_DELETES";
@@ -263,9 +265,12 @@ void read_positional_delete_file(duckdb::DatabaseInstance& db,
   auto result = conn.Query("SELECT file_path, pos FROM read_parquet('" +
                            escape_sql_string(delete_file_path) + "')");
 
-  if (result->HasError()) {
+  if (!result || result->HasError()) {
+    // Throws for the reason given in discover_from_manifests: unread deletes must never become
+    // no deletes. A null result is that same failure.
     throw std::runtime_error("[iceberg] Failed to read positional-delete file '" +
-                             delete_file_path + "': " + result->GetError());
+                             delete_file_path +
+                             "': " + (result ? result->GetError() : "null result"));
   }
 
   while (true) {

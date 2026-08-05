@@ -37,15 +37,6 @@ class sirius_ioctx;
 
 namespace sirius::op::scan {
 
-/**
- * @brief Fully materialized Iceberg delete data for one table.
- *
- * All I/O (positional deletes, deletion vectors, equality deletes) is
- * performed once during sirius_engine::initialize() under a single
- * InternalQueryGuard.  This struct is immutable after construction and
- * is shared (via shared_ptr<const>) across the operator, task creator,
- * and delete filters.
- */
 /// One group of equality-delete files sharing the same key column schema.
 struct EqualityDeleteGroup {
   /// GPU-resident deduplicated key table.
@@ -62,6 +53,18 @@ struct EqualityDeleteGroup {
   int64_t sequence_number{0};
 };
 
+/**
+ * @brief Fully materialized Iceberg delete data for one table.
+ *
+ * All I/O (positional deletes, deletion vectors, equality deletes) happens at PLAN time, in
+ * read_iceberg_delete_data() via build_iceberg_table_info(), on internal connections that are
+ * each bracketed by their own InternalQueryGuard. Planning is also why the per-query memo is
+ * cleared on the QueryEnd hook and not inside the execution window — see
+ * clear_iceberg_delete_data_cache().
+ *
+ * Immutable after construction and shared (via shared_ptr<const>) across the operator, task
+ * creator, and delete filters.
+ */
 struct IcebergDeleteData {
   /// V2 positional deletes + V3 deletion vectors (merged, sorted).
   /// Key: data_file_path, Value: sorted deleted row positions.
@@ -123,8 +126,11 @@ std::shared_ptr<const IcebergDeleteData> read_iceberg_delete_data(
 /**
  * @brief Drop everything the per-query delete-data cache is holding.
  *
- * MUST be called from the query lifecycle (QueryBegin and QueryEnd). Two reasons, and the
- * second is not optional:
+ * MUST be called from the QueryEnd hook. Not from the execution window: this scan path
+ * declines unsupported iceberg tables at PLAN time, after planning has filled the memo, and
+ * such a query never opens an execution window — so a window-scoped clear would miss exactly
+ * the entries most likely to go stale. Two reasons it must happen at all, and the second is
+ * not optional:
  *
  * 1. Correctness. The cache exists only to collapse the repeated reads WITHIN one query
  *    (see read_iceberg_delete_data). An entry that outlives its query could answer for a

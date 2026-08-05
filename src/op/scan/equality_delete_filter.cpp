@@ -82,12 +82,18 @@ std::unique_ptr<cudf::table> equality_delete_filter::apply(std::unique_ptr<cudf:
   }
 
   // Verify all key columns are present in this chunk.
+  //
+  // Returning the batch unchanged here would drop the group's deletes and hand back rows the
+  // table deleted — the silent-wrong failure this path exists to prevent. A key column absent
+  // from the decoded batch means the planner's projection widening did not reach the scan, so
+  // it is a defect in this code, not a table we can serve; throwing turns it into a runtime
+  // fallback with correct rows.
   for (auto idx : _data_key_indices) {
     if (idx >= static_cast<cudf::size_type>(tbl->num_columns())) {
-      SIRIUS_LOG_WARN("[equality_delete_filter] Key column index {} >= num_columns {}; skipping.",
-                      idx,
-                      tbl->num_columns());
-      return tbl;
+      throw std::invalid_argument("[equality_delete_filter] equality-delete key column index " +
+                                  std::to_string(idx) + " is absent from the decoded batch (" +
+                                  std::to_string(tbl->num_columns()) +
+                                  " columns); the key columns must be appended to the projection");
     }
   }
 
