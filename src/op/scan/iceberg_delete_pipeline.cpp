@@ -30,7 +30,6 @@ std::unique_ptr<cudf::table> iceberg_delete_pipeline::apply(std::unique_ptr<cudf
                                                             rmm::cuda_stream_view stream,
                                                             rmm::device_async_resource_ref mr) const
 {
-  // Apply each filter in order.
   for (auto const& f : _filters) {
     tbl = f->apply(std::move(tbl), layout, stream, mr);
   }

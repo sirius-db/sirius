@@ -24,6 +24,7 @@
 
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace sirius::op::scan {
 

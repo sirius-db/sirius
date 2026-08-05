@@ -27,8 +27,10 @@
 #include <op/scan/iceberg_metadata_reader.hpp>
 
 #include <algorithm>
+#include <cstdint>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace sirius::op::scan {
 

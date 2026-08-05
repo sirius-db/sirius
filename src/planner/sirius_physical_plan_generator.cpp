@@ -191,7 +191,7 @@ std::unique_ptr<sirius::op::scan::iceberg_ingestible_table_info> build_iceberg_t
       "iceberg delete data cannot be read without a registered SiriusContext");
   }
 
-  // Delete discovery opens its own Connection to run iceberg_snapshots() and to read the
+  // Delete discovery opens its own Connection to run iceberg_metadata() and to read the
   // positional-delete parquet files. That re-registers this same SiriusContext, whose
   // QueryBegin/QueryEnd would reset task_creator state and clear the data repositories under
   // the query being planned — the query hangs. Same guard the delete gate uses.

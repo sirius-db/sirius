@@ -24,6 +24,7 @@
 
 #include <duckdb/main/client_context.hpp>
 
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>
@@ -86,7 +87,8 @@ struct IcebergDeleteData {
  * @brief Read and fully materialize Iceberg delete data for the given table.
  *
  * Consolidates all delete-related I/O into one call:
- *   1. Discovers delete file paths via iceberg_snapshots() + Avro manifests.
+ *   1. Discovers delete file paths via iceberg_metadata(), plus a read_avro pass
+ *      over a manifest when a V3 deletion vector needs its Puffin offsets.
  *   2. Reads V2 positional-delete parquet files (CPU via DuckDB).
  *   3. Reads V3 deletion vectors from Puffin files (CPU).
  *   4. Reads V2 equality-delete parquet files (GPU via cuDF).
@@ -99,7 +101,7 @@ struct IcebergDeleteData {
  * be confused, because acting on the second as if it were the first drops deletes silently and
  * returns rows the table logically removed.
  *
- * @param context        DuckDB client context for running iceberg_snapshots()
+ * @param context        DuckDB client context for running iceberg_metadata()
  *                       and reading positional-delete parquet files.
  * @param table_path     The Iceberg table path passed to iceberg_scan().
  * @param metadata_ioctx Non-owning sirius_ioctx for routing parquet reads

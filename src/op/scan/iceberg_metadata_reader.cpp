@@ -155,8 +155,8 @@ std::vector<IcebergDeleteFileEntry> read_deletion_vectors_from_manifest(
 /// Discover all delete files and data file metadata using DuckDB's iceberg_metadata().
 /// Delegates ALL Avro/manifest parsing to DuckDB's iceberg extension — handles all
 /// manifest versions, codecs, catalog types, and snapshot selection automatically.
-/// The only fallback to our custom Avro reader is for V3 deletion vectors (PUFFIN),
-/// where iceberg_metadata() doesn't expose content_offset/size/referenced_data_file.
+/// V3 deletion vectors need a second look at the manifest via read_avro, because
+/// iceberg_metadata() doesn't expose content_offset/size/referenced_data_file.
 IcebergManifestDiscovery discover_from_manifests(duckdb::ClientContext& context,
                                                  std::string const& table_path,
                                                  std::optional<uint64_t> snapshot_id)
@@ -166,7 +166,6 @@ IcebergManifestDiscovery discover_from_manifests(duckdb::ClientContext& context,
   duckdb::Connection conn(*context.db);
   conn.Query("SET unsafe_enable_version_guessing = true");
 
-  // Build the iceberg_metadata() query, with optional snapshot selection.
   std::string query =
     "SELECT content, file_path, manifest_sequence_number, file_format, manifest_path "
     "FROM iceberg_metadata('" +
@@ -243,7 +242,7 @@ IcebergManifestDiscovery discover_from_manifests(duckdb::ClientContext& context,
 }
 
 // =========================================================================
-// Content readers (moved from iceberg_scan_task.cpp)
+// Content readers
 // =========================================================================
 
 /**
@@ -311,10 +310,6 @@ equality_delete_read_result read_equality_delete_file(std::string const& delete_
   // Both the read_parquet (table data) AND the read_parquet_footers (field-id
   // extraction) share the same sirius_datasource — its io_object opens 2 fds
   // (O_RDONLY + O_RDONLY|O_DIRECT) so reusing avoids reopening for the footer pass.
-  //
-  // `create_io_object` + `make_datasource` was the pair this used before iceberg left the
-  // build; the ioctx surface has since narrowed to `open_datasource`, which does both and
-  // keeps io_object construction a backend detail.
   auto datasource = ioctx.open_datasource(delete_file_path);
 
   auto opts =
@@ -331,7 +326,6 @@ equality_delete_read_result read_equality_delete_file(std::string const& delete_
     col_names.push_back(si.name);
   }
 
-  // Extract Iceberg field IDs from the parquet footer schema.
   std::vector<std::optional<int32_t>> field_ids;
   try {
     // Hand the same datasource to the footer pass. The table read above has already
@@ -399,7 +393,6 @@ void materialize_positional_deletes(duckdb::DatabaseInstance& db,
     }
   }
 
-  // Sort all position vectors.
   for (auto& [path, positions] : out_map) {
     std::sort(positions.begin(), positions.end());
   }

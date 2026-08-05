@@ -24,12 +24,14 @@
 #include <log/logging.hpp>
 #include <op/scan/iceberg_gpu_ingestible.hpp>
 
+#include <cstdint>
 #include <numeric>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <tuple>
 #include <utility>
+#include <vector>
 
 namespace sirius::op::scan {
 
