@@ -959,7 +959,40 @@ TEST_CASE("pin_table compression - single-op sweep over float operators (ALP / A
   fs::remove_all(tmp);
 }
 
-TEST_CASE("pin_table compression - single-op sweep over string operators (dictionary)",
+namespace {
+
+constexpr op_case kStrOps[] = {
+  {"dict", "input -> dictionary"},
+  {"fsst",
+   "input -> str_split -> offsets, chars\n"
+   "str_split.chars -> fsst\n"
+   "str_split.offsets -> bitpack -> chunk_min, chunk_count, chunk_bits, packed"},
+  {"fsst_delta_off",
+   "input -> str_split -> offsets, chars\n"
+   "str_split.chars -> fsst\n"
+   "str_split.offsets -> delta -> differences\n"
+   "str_split.offsets.differences -> bitpack -> chunk_min, chunk_count, chunk_bits, packed"},
+  {"snappy_chars",
+   "input -> str_split -> offsets, chars\n"
+   "str_split.chars -> snappy\n"
+   "str_split.offsets -> bitpack -> chunk_min, chunk_count, chunk_bits, packed"},
+  {"lz4_chars",
+   "input -> str_split -> offsets, chars\n"
+   "str_split.chars -> lz4\n"
+   "str_split.offsets -> bitpack -> chunk_min, chunk_count, chunk_bits, packed"},
+  {"deflate_chars",
+   "input -> str_split -> offsets, chars\n"
+   "str_split.chars -> deflate\n"
+   "str_split.offsets -> bitpack -> chunk_min, chunk_count, chunk_bits, packed"},
+  {"ans_chars",
+   "input -> str_split -> offsets, chars\n"
+   "str_split.chars -> ans\n"
+   "str_split.offsets -> bitpack -> chunk_min, chunk_count, chunk_bits, packed"},
+};
+
+}  // namespace
+
+TEST_CASE("pin_table compression - single-op sweep over string operators",
           "[compression][pin_table][isolated_context]")
 {
   if (no_gpu()) { return; }
@@ -982,19 +1015,24 @@ TEST_CASE("pin_table compression - single-op sweep over string operators (dictio
   run_ok(
     con, "SET pin_table_input_compression_plan_dir = '" + plan_dir.string() + "';", "set plan_dir");
 
-  write_plan_file(plan_dir, "t_sw_dict", "input -> dictionary\n");
-
-  auto pin = con.Query("CALL pin_table('" + glob + "', tier='host', name='t_sw_dict');");
-  require_ok(pin, "pin dict");
-
   const std::string select_sql = "SELECT COUNT(*), MAX(s) FROM read_parquet('" + glob + "')";
-  auto res                     = con.Query("CALL gpu_execution(\"" + select_sql + "\");");
-  require_ok(res, "select dict");
-  REQUIRE(res->RowCount() == 1);
-  REQUIRE(res->GetValue(0, 0) == duckdb::Value::BIGINT(5000LL));
-  REQUIRE(res->GetValue(1, 0).ToString() == "0000004999");
 
-  run_ok(con, "CALL unpin_table('t_sw_dict');", "unpin dict");
+  for (auto const& tc : kStrOps) {
+    CAPTURE(tc.tag);
+    std::string tname = std::string("t_sw_") + tc.tag;
+    write_plan_file(plan_dir, tname, std::string(tc.plan) + "\n");
+
+    auto pin = con.Query("CALL pin_table('" + glob + "', tier='host', name='" + tname + "');");
+    require_ok(pin, std::string("pin:") + tc.tag);
+
+    auto res = con.Query("CALL gpu_execution(\"" + select_sql + "\");");
+    require_ok(res, std::string("select:") + tc.tag);
+    REQUIRE(res->RowCount() == 1);
+    REQUIRE(res->GetValue(0, 0) == duckdb::Value::BIGINT(5000LL));
+    REQUIRE(res->GetValue(1, 0).ToString() == "0000004999");
+
+    run_ok(con, "CALL unpin_table('" + tname + "');", std::string("unpin:") + tc.tag);
+  }
 
   fs::remove_all(tmp);
 }
