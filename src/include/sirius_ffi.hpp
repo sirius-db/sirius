@@ -32,6 +32,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 
 #ifndef SIRIUS_FFI_EXPORT
 #define SIRIUS_FFI_EXPORT __attribute__((visibility("default")))
@@ -82,6 +83,28 @@ class SIRIUS_FFI_EXPORT Context {
   /// Arrow/DuckDB types; the Rust bindings pass the address of an
   /// `FFI_ArrowArrayStream` they own.
   void execute_substrait(const std::string& plan, std::uintptr_t out_stream_addr);
+
+  /// Lease `len` bytes of the exchange staging arena; returns the lease's byte offset from
+  /// `staging_base()`. For the receive side of a transport: lease, land the remote bytes at
+  /// `staging_base() + offset`, `Fragment::push_packed`, then `staging_release`. (The send side's
+  /// `Fragment::export_packed` takes its own lease; releasing it after the transmit completes is
+  /// still the caller's job, through `staging_release`.)
+  /// @throws when no arena is configured (`SIRIUS_EXCHANGE_STAGING_BYTES` unset) or on
+  /// exhaustion — the error names the requested/free/capacity byte counts.
+  std::uint64_t staging_lease(std::uint64_t len);
+
+  /// Return the staging lease at `offset`. When it was the last one outstanding the arena's
+  /// bump head resets — leases are short-lived by design (copy-out-on-arrival).
+  /// @throws on an offset that is not an outstanding lease, or when no arena is configured.
+  void staging_release(std::uint64_t offset);
+
+  /// Device base address of the staging arena, for transport memory registration.
+  /// @throws when no arena is configured.
+  std::uintptr_t staging_base() const;
+
+  /// Capacity of the staging arena in bytes.
+  /// @throws when no arena is configured.
+  std::uint64_t staging_capacity() const;
 
  private:
   // PIMPL: see detail::context_state.
@@ -149,6 +172,44 @@ class SIRIUS_FFI_EXPORT Fragment {
                          std::uint64_t source_stream_id,
                          std::uint64_t input_stream_id,
                          std::uint32_t sender_id);
+
+  /// Pack the next batch parked on output stream `stream_id` into a fresh staging-arena lease
+  /// (`cudf::chunked_pack` gathers directly into the lease — the staging copy is the pack's own
+  /// gather, no extra copy). Returns the cudf pack metadata the receiver's `push_packed` needs,
+  /// or nullptr when nothing is parked right now; on success writes the lease offset and the
+  /// packed payload length.
+  ///
+  /// The packing stream is synchronized before returning, so the caller may transmit from
+  /// `[staging_base()+offset, +length)` immediately. The lease outlives this call by design:
+  /// releasing it — via `Context::staging_release(offset)`, after the transmit completes — is
+  /// the caller's responsibility.
+  /// @throws before `build()`, on an unknown output stream, when no arena is configured, on
+  /// lease exhaustion, or on a parked batch that is not GPU-resident.
+  std::unique_ptr<std::vector<std::uint8_t>> export_packed(std::uint64_t stream_id,
+                                                           std::uint64_t& offset,
+                                                           std::uint64_t& length);
+
+  /// The receive-side mirror of `export_packed`: unpack the `length` packed bytes at staging
+  /// offset `offset` using the pack metadata at `metadata_addr` (`metadata_len` bytes, host
+  /// memory), deep-copy the table out of the lease into ordinary pool memory, and push it into
+  /// input stream `stream_id`. The copy is synchronized before returning, so the lease is
+  /// reusable (and releasable) immediately — copy-out-on-arrival.
+  ///
+  /// Legal between `build()` and `run()`, exactly where `relay_from` sits.
+  /// @throws before `build()`, on an unknown input stream, when no arena is configured, on an
+  /// out-of-bounds lease range or empty metadata, or when the stream already ended (a push
+  /// after EOS never disappears silently).
+  void push_packed(std::uint64_t stream_id,
+                   std::uintptr_t metadata_addr,
+                   std::size_t metadata_len,
+                   std::uint64_t offset,
+                   std::uint64_t length);
+
+  /// Record that `sender_id` finished producing into input stream `stream_id` — the EOS mirror
+  /// of `push_packed` for remote senders (`relay_from` closes its own sender). Idempotent per
+  /// sender; the stream ends once every expected sender has closed.
+  /// @throws before `build()`, or on an unknown stream or sender.
+  void close_input(std::uint64_t stream_id, std::uint32_t sender_id);
 
   /// Execute the fragment and close its query lifecycle. Blocks until its pipelines finish.
   /// @throws before `build()`, or on an execution failure.
