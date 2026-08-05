@@ -37,6 +37,7 @@
 #include <filesystem>
 #include <optional>
 #include <string>
+#include <system_error>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -112,7 +113,11 @@ class ParquetNullPredicateFixture : public sirius::test::GpuExecutionFixture {
     scan_ = "read_parquet('" + pq_path + "')";
   }
 
-  ~ParquetNullPredicateFixture() { fs::remove_all(dir_); }
+  ~ParquetNullPredicateFixture()
+  {
+    std::error_code ec;
+    fs::remove_all(dir_, ec);
+  }
 
  protected:
   fs::path dir_;
@@ -156,7 +161,11 @@ class ParquetHiveNullPredicateFixture : public sirius::test::GpuExecutionFixture
     scan_ = "read_parquet('" + root + "/part=*/*.parquet', hive_partitioning=true)";
   }
 
-  ~ParquetHiveNullPredicateFixture() { fs::remove_all(dir_); }
+  ~ParquetHiveNullPredicateFixture()
+  {
+    std::error_code ec;
+    fs::remove_all(dir_, ec);
+  }
 
  protected:
   fs::path dir_;
