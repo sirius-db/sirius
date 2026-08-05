@@ -741,7 +741,9 @@ impl ServiceCore {
         // is the honest answer — the alternative silently gives every receiver but one no rows.
         if destinations.len() > 1 {
             return Err(format!(
-                "a data stream sink with {} destinations needs partitioned streaming",
+                "a data stream sink with {} destinations needs partitioned streaming output \
+                 (#838); grouped two-phase aggregation across compute nodes is not supported \
+                 yet (SET new_planner_agg_stage = 1)",
                 destinations.len()
             ));
         }

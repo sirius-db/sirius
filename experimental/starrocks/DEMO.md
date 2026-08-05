@@ -64,10 +64,9 @@ Then:
 ```sql
 SHOW COMPUTE NODES;
 
--- The simplest two-fragment shape: a scan+filter+project sender and a single aggregate
--- receiver, joined by a gather exchange.
-SET new_planner_agg_stage = 1;
-
+-- The FE's default plan is two-phase: a partial aggregate ("update serialize") in the scan
+-- fragment and a merge aggregate ("merge finalize") behind a gather exchange. Both phases
+-- translate; only the partial states cross the fragment boundary.
 WITH lineitem AS (
   SELECT *
   FROM FILES(
@@ -94,9 +93,12 @@ revenue
 which matches DuckDB on CPU over the same file (`61567694.9502`).
 
 A `GROUP BY` is worth running too — it plans two exchanges rather than one, so the CN logs two
-boundary crossings for a single query:
+boundary crossings for a single query. Grouped queries are the one place the session variable
+is still required: grouped *two-phase* aggregation needs the hash-partitioned sink (#838), so
+the default plan is refused and `agg_stage = 1` forces the supported one-phase shape:
 
 ```sql
+SET new_planner_agg_stage = 1;
 WITH lineitem AS (SELECT * FROM FILES(
   "path"="file:///home/ubuntu/git/sirius/scratch/tpch_sf1/lineitem/part.0.parquet",
   "format"="parquet"))
@@ -119,7 +121,6 @@ The deterministic cross-node shape needs the scan split across both CNs, which
 places one whole file per CN and can never byte-split them.
 
 ```sql
-SET new_planner_agg_stage = 1;
 WITH lineitem AS (SELECT * FROM FILES(
   "path"="file:///home/ubuntu/git/sirius/scratch/tpch_sf1/lineitem_multi/*.parquet",
   "format"="parquet"))
@@ -134,24 +135,29 @@ the single-node `61567694.95019999` is double-precision summation order across t
 scan. Read the logs, not just the answer:
 
 ```
-nixl bandwidth canary peer=127.0.0.1:8060 gbps="67.3" bytes=16777216          <- first contact
-transmitted batches via nixl stream_id=2 sender_id=1 dest=127.0.0.1:8060 batches=1 bytes=457856
-relayed native batches across a fragment boundary stream_id=2 sender_id=0 batches=1
-received remote batches stream_id=2 sender_id=1 batches=1
+nixl bandwidth canary peer=127.0.0.1:8062 gbps="145.3" bytes=16777216         <- first contact
+transmitted batches via nixl stream_id=3 sender_id=0 dest=127.0.0.1:8062 batches=1 bytes=64
+relayed native batches across a fragment boundary stream_id=3 sender_id=1 batches=1
+received remote batches stream_id=3 sender_id=0 batches=1
 ```
 
-The receiver aggregates a **cross-node fan-in**: sender 0 relayed in-process, sender 1 arrived
-over nixl. `batches=0` anywhere would mean the boundary carried nothing. The canary is the guard
-against the one failure nothing else reports: `cudaMallocAsync` pool memory over `cuda_ipc`
-does not error — it silently degrades ~220× — so a first-contact transfer below 2 GB/s refuses
-the tier loudly. (`nvidia-smi`: two CNs at ~8.9 GiB each — pool + arena + context — on the
-23 GiB L4.)
+The receiver aggregates a **cross-node fan-in**: one sender relayed in-process, the other
+arrived over nixl. `batches=0` anywhere would mean the boundary carried nothing. Those 64 bytes
+are the whole point of two-phase aggregation: each CN reduces its scan to a single partial-state
+row before the hop, where the one-phase plan (`agg_stage = 1`) ships every filtered row —
+`bytes=457856` for the same query. The canary is the guard against the one failure nothing else
+reports: `cudaMallocAsync` pool memory over `cuda_ipc` does not error — it silently degrades
+~220× — so a first-contact transfer below 2 GB/s refuses the tier loudly. (`nvidia-smi`: two
+CNs at ~8.9 GiB each — pool + arena + context — on the 23 GiB L4.)
 
-**What this topology cannot run:** any plan whose sender has more than one destination — on two
-CNs that includes `GROUP BY` even at `agg_stage=1` (the aggregate gets an instance per CN, i.e.
-a hash shuffle). It fails loudly: `a data stream sink with 2 destinations needs partitioned
-streaming`. The two-CN surface today is Q6-class scalar aggregation; partitioned output is the
-recorded next step.
+**What this topology cannot run:** any plan whose sender has more than one destination. On two
+CNs that includes `GROUP BY` at any agg stage — grouped two-phase is refused in the translator
+(`grouped two-phase aggregation needs partitioned streaming output (#838)`), and at
+`agg_stage=1` the aggregate gets an instance per CN, i.e. a hash shuffle, refused at the sink
+(`a data stream sink with 2 destinations needs partitioned streaming output (#838)`). `avg` in
+a two-phase plan is also refused (StarRocks serializes its partial state as an opaque
+VARBINARY). The two-CN surface today is scalar `sum`/`count`/`min`/`max` aggregation — with the
+FE's **default** plan, no session variable; partitioned output is the recorded next step.
 
 ## The pre-packaged front end
 
