@@ -303,7 +303,11 @@ copy and pin. The single modes each pin a fresh copy of the input.
 Substitution parameters are fixed by default: every stream runs the same literals from
 `queries.py`, so passes stay comparable and validation can diff GPU vs CPU. `--vary-predicates`
 instead runs the per-stream query sets that `generate_tpch_queries.sh` builds with `qgen`, the
-reference parameter generator, which is what an official run requires. The power run always uses
+reference parameter generator, which is what an official run requires. Stream seeding follows
+spec clause 2.1.3.3: stream n is generated with `qgen -r <seed0 + n>` (the power stream 0 runs on
+seed0), because qgen's `-p` only permutes query order and never varies the parameters. seed0
+defaults to the generation-time timestamp (mmddhhmmss); an official run passes
+`--seed <load-end timestamp mmddhhmmss>` and discloses it. The power run always uses
 stream 0, so its three passes share one parameter set. Validation is not supported with varied
 predicates — the runner rejects `--validation`.
 
@@ -397,7 +401,9 @@ loader's job regardless of version.
 # One-time per SF: generate refresh sets with classic dbgen -U (needs >= streams+1 sets)
 ./test/tpch_performance/generate_tpch_refresh.sh 1 5     # -> test_datasets/tpch_refresh_sf1/
 
-# Only for --vary-predicates: per-stream query sets from qgen (streams 0..N)
+# Only for --vary-predicates: per-stream query sets from qgen (streams 0..N),
+# seeded seed0+n per spec clause 2.1.3.3. Official runs pass the load-end
+# timestamp: --seed $(date +%m%d%H%M%S at load end)
 ./test/tpch_performance/generate_tpch_queries.sh 1 4     # -> test_datasets/tpch_queries_sf1/
 
 export SIRIUS_CONFIG_FILE=$(pwd)/test/cpp/integration/integration.yaml

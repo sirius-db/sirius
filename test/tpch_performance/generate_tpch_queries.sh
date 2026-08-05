@@ -16,10 +16,18 @@
 #   --dbgen-dir   <project>/test_datasets/tpch-dbgen  (unzipped/built from tpch-dbgen.zip if missing)
 #   --output-dir  <project>/test_datasets/tpch_queries_sf<SF>
 #
-# Without --seed, qgen draws a time-based seed per stream, which is what an
-# official run wants. --seed <n> makes the draws reproducible: stream i uses
-# seed n + i. One seed shared by every stream would give every stream the same
-# parameters, because -p only permutes the query order.
+# Seeding follows TPC-H spec clause 2.1.3.3: stream n is generated with
+# qgen -r <seed0 + n>, so the power stream (0) runs on seed0 and every
+# throughput stream gets its own substitution parameters. qgen's -p only
+# permutes the query order — it never varies the parameters — and without -r
+# qgen falls back to time(NULL), whose one-second granularity hands every
+# stream generated in the same second identical parameters.
+#
+# --seed <seed0> sets seed0 explicitly; an official run passes the end of the
+# database load formatted mmddhhmmss (clause 2.1.3.3) and discloses it.
+# Without --seed, seed0 defaults to the current time in that format: the
+# streams are still spec-shaped (distinct, consecutive seeds), but seed0 is
+# not tied to the load end, so pass --seed for an official-style run.
 
 set -euo pipefail
 
@@ -49,6 +57,19 @@ fi
 SF="$1"
 NUM_STREAMS="$2"
 
+if [ -n "$SEED" ] && ! [[ "$SEED" =~ ^[0-9]+$ ]]; then
+    echo "ERROR: --seed must be a non-negative integer (mmddhhmmss for an official run), got '$SEED'"
+    exit 1
+fi
+if [ -z "$SEED" ]; then
+    RAW_SEED="$(date +%m%d%H%M%S)"
+    SEED="$((10#$RAW_SEED))"
+    echo "No --seed given; seed0=$SEED (current time $RAW_SEED, mmddhhmmss)."
+    echo "An official run passes --seed <load-end timestamp mmddhhmmss> (TPC-H clause 2.1.3.3)."
+else
+    SEED="$((10#$SEED))"
+fi
+
 DBGEN_DIR="${DBGEN_DIR:-$PROJECT_DIR/test_datasets/tpch-dbgen}"
 OUTPUT_DIR="${OUTPUT_DIR:-$PROJECT_DIR/test_datasets/tpch_queries_sf${SF}}"
 
@@ -59,10 +80,9 @@ OUTPUT_DIR="$(cd "$OUTPUT_DIR" && pwd)"
 
 echo "Generating query streams 0..$NUM_STREAMS at SF$SF -> $OUTPUT_DIR"
 for ((n = 0; n <= NUM_STREAMS; n++)); do
-    args=(-c -s "$SF" -p "$n")
-    if [ -n "$SEED" ]; then
-        args+=(-r "$((SEED + n))")
-    fi
+    # Clause 2.1.3.3: stream n runs on seed0 + n. Never rely on qgen's no-seed
+    # fallback — time(NULL) collides across streams generated in the same second.
+    args=(-c -s "$SF" -p "$n" -r "$((SEED + n))")
     # qgen reads dists.dss from the cwd and the query templates from DSS_QUERY.
     # The templates in the dbgen root are the corrected ones; queries/ holds the
     # older variants (view-based q15, ANSI "day (3)" in q1).
