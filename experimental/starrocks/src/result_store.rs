@@ -92,6 +92,11 @@ pub(crate) enum FetchOutcome {
 pub(crate) struct ResultStore {
     /// Buffered results keyed by fragment instance id.
     inner: Mutex<HashMap<FragmentInstanceId, FragmentState>>,
+    /// Signalled whenever a fragment leaves `Waiting` (rows buffered or failure recorded), so a
+    /// long-polling `fetch_data` can block instead of replying not-ready. An empty reply is not
+    /// harmless: the FE's ResultReceiver counts every packet, so a not-ready reply consumes a
+    /// sequence number and the rows that follow arrive with a stale one ("expect=1, receive=0").
+    ready: std::sync::Condvar,
 }
 
 impl ResultStore {
@@ -103,6 +108,7 @@ impl ResultStore {
     /// Buffers an executed fragment's result for later `fetch_data` collection.
     pub(crate) fn insert(&self, id: FragmentInstanceId, batch: TResultBatch) {
         self.lock().insert(id, FragmentState::Pending(batch));
+        self.ready.notify_all();
     }
 
     /// Marks a fragment failed so `fetch_data` reports the cause instead of waiting forever.
@@ -110,6 +116,38 @@ impl ResultStore {
     /// reverting to "unknown fragment".
     pub(crate) fn fail(&self, id: FragmentInstanceId, error: String) {
         self.lock().insert(id, FragmentState::Failed(error));
+        self.ready.notify_all();
+    }
+
+    /// Blocks until fragment `id` has something to report, then advances the state machine —
+    /// the long-poll `fetch_data` needs now that receivers execute on the dispatch thread. The
+    /// stock BE holds the rpc open until the sink produces; replying not-ready instead desyncs
+    /// the FE's packet counter (see `ready`). A timeout is a *loud* failure rather than an empty
+    /// reply, for the same reason.
+    pub(crate) fn wait_ready(
+        &self,
+        id: FragmentInstanceId,
+        timeout: std::time::Duration,
+    ) -> Option<FetchOutcome> {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut guard = self.lock();
+        while let Some(FragmentState::Waiting) = guard.get(&id) {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return Some(FetchOutcome::Failed(format!(
+                    "timed out after {timeout:?} waiting for fragment instance {id} to produce \
+                     rows (its exchange senders may have stalled)"
+                )));
+            }
+            let (g, wait) = self
+                .ready
+                .wait_timeout(guard, deadline - now)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard = g;
+            let _ = wait;
+        }
+        drop(guard);
+        self.take_next(id)
     }
 
     /// Advances the `fetch_data` state machine for one fragment: deliver rows once, then EOS.
@@ -227,6 +265,45 @@ mod tests {
             rows(store.take_next(id).expect("completed fragment is known"));
         assert!(!ready_eos);
         assert_eq!(ready_batch.unwrap().rows.len(), 1);
+    }
+
+    #[test]
+    fn wait_ready_blocks_until_rows_arrive() {
+        use std::sync::Arc;
+        let store = Arc::new(ResultStore::default());
+        let id = FragmentInstanceId::from_halves(9, 1);
+        store.reserve(id);
+
+        // Rows land from another thread while the poll is blocked -- the dispatch-worker shape.
+        let producer = {
+            let store = Arc::clone(&store);
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                store.insert(id, batch(&["late"]));
+            })
+        };
+        let (rows_batch, eos) = rows(
+            store
+                .wait_ready(id, std::time::Duration::from_secs(5))
+                .expect("reserved fragment is known"),
+        );
+        producer.join().expect("producer thread");
+        assert!(!eos);
+        assert_eq!(rows_batch.expect("rows delivered").rows.len(), 1);
+    }
+
+    #[test]
+    fn wait_ready_times_out_loudly_instead_of_replying_not_ready() {
+        let store = ResultStore::default();
+        let id = FragmentInstanceId::from_halves(9, 2);
+        store.reserve(id);
+
+        match store.wait_ready(id, std::time::Duration::from_millis(20)) {
+            Some(FetchOutcome::Failed(cause)) => {
+                assert!(cause.contains("timed out"), "cause: {cause}")
+            }
+            other => panic!("expected a loud timeout failure, got {other:?}"),
+        }
     }
 
     #[test]

@@ -273,10 +273,31 @@ impl PInternalService for SiriusComputeNodeService {
         _attachment: Vec<u8>,
     ) -> Result<crate::prpc::Reply<PFetchDataResult>, crate::prpc::Error> {
         let id = FragmentInstanceId::from(&request.finst_id);
+        // Long-poll: receivers execute on the dispatch thread now, so a reserved result may not
+        // be ready when the FE's first poll arrives. Block off the runtime until it is — every
+        // reply consumes a packet-sequence slot in the FE's ResultReceiver, so a not-ready reply
+        // would desync the counter and cancel the query ("expect=1, receive=0").
+        let core = self.core.clone();
+        let outcome = match tokio::task::spawn_blocking(move || {
+            core.results
+                .wait_ready(id, std::time::Duration::from_secs(600))
+        })
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(join_err) => {
+                return Ok(Self::fetch_data_result(
+                    Self::internal_error(format!("fetch_data wait task panicked: {join_err}")),
+                    0,
+                    true,
+                )
+                .into());
+            }
+        };
         // An unknown id is an error, not EOS: it means this CN never buffered a result for the
         // fragment the FE is polling (wrong id, or a dispatch/result-sink path that did not run),
         // and StarRocks treats a missing result buffer as a failure rather than an empty result.
-        let Some(outcome) = self.core.results.take_next(id) else {
+        let Some(outcome) = outcome else {
             return Ok(Self::fetch_data_result(
                 Self::internal_error(format!("no buffered result for fragment instance {id}")),
                 0,
@@ -1621,16 +1642,9 @@ mod tests {
         assert_eq!(receiver_response.status.status_code, TStatusCode::OK.0);
         assert_eq!(executor.calls.load(Ordering::Relaxed), 0);
 
-        let waiting = route(
-            &service,
-            methods::FETCH_DATA,
-            fetch_request(receiver_id.hi, receiver_id.lo),
-            Vec::new(),
-        );
-        let waiting = PFetchDataResult::decode(waiting.body.as_slice()).unwrap();
-        assert_eq!(waiting.status.status_code, TStatusCode::OK.0);
-        assert_eq!(waiting.eos, Some(false));
-
+        // No intermediate not-ready probe: fetch_data long-polls now (an empty reply would
+        // desync the FE's packet counter), so the reserved entry is only fetched after the
+        // sender completes -- which exercises the blocking path end to end.
         let mut sender = fragment_params(Some(scan_plan(0, 0)), Some(desc_table()));
         sender.fragment.as_mut().unwrap().output_sink = Some(data_stream_sink(7));
         let mut sender_exec = exec_params(query_id, TUniqueId::new(10, 3));
