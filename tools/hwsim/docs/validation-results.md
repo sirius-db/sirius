@@ -862,3 +862,45 @@ report; do not quote.
 4. A harness restart (07:21–12:23 UTC) split the campaign between S-M50 and
    S-NSYS; S-M50 completed unattended and its trace/selfcheck verified clean
    post-hoc. GPU idle-verified before resuming; no foreign users.
+
+## 10. Cross-machine grading — the frozen GB300→RTX predictions vs reality (2026-08-05)
+
+**Status: GRADED on the RTX PRO 6000 box.** Full report:
+[cross-machine-grading-rtx.md](cross-machine-grading-rtx.md). The WS21 frozen
+predictions (GB300 SF100 trace + spec-sheet descriptor, no RTX measurement) were
+scored with `grade_cross_machine.py --iters 2,3` against the RTX baseline session
+`019fd242-f189…` — grading only, nothing refit.
+
+**Verdict against the §4 pre-registered bands (primary arm; q11-out changes nothing):**
+
+| band | result | tier |
+|---|---|---|
+| suite time-weighted E | **+103.2%** | FAILURE (beyond ±50%) |
+| per-query median \|E\| | **109.6%** | FAILURE (> 50%) |
+| device-bound-query subset | vacuous — fluid gate stood down on all 44 GB300 windows; no query predicted device-bound (and the CSVs carry no binding column, a runbook mismatch) | — |
+| rank ρ(real, nominal) | **0.936** | OUTSTANDING (≥ 0.9) |
+| [nom, opt] bracket coverage | 0/22 | informative miss (arms differ ~1–9%, real error ~100%) |
+
+cpufrozen arm: median |E| 92.5%, suite +79.7%, ρ 0.915 — **closer on 22/22 queries**,
+still a failure. The failure is single-tier and it is the tier §4's rationale flagged:
+reality runs this box at 0.34–0.55× GB300 (median 0.42×) while `cpu_compute=0.667`
+(cores-only, 48/72) told the model the RTX host is *slower*. The four pre-identified
+host-dominated probes (q10/q13/q16/q20) were predicted slower-or-equal vs the GB300
+source and came in at 0.34–0.45×: E +134% to +215%, the table's worst cells. Implied
+effective knob ≈ **2.2–2.9** — the cores-only basis is off 3.3–4.3× and directionally
+inverted, because both configs pin the engine at 4 executor threads: host work is
+per-core-latency-bound, so per-core throughput (clock × IPC class), not core count, is
+what transfers. Validated tiers show through where the host tier doesn't dominate: q6
+frozen-arm error **−0.6%** (io-carried), q14/q15 +16/+24%. Descriptor fix filed in the
+full report: per-core-perf `cpu_compute` (+ a seconds-long single-thread anchor in the
+calibration kit), and a loud bound-warning on host-dominated lanes until then.
+
+Follow-ups run at head (details §5–§6 of the full report): **(1)** the `57b4dae6`
+dispatch fix does not move RTX's q11 (bit-identical +14.8/+10.3% on iters 1/3; exec-entry
+timestamps present, inversions present, concurrency and attribution probes clean) —
+**RTX q11 is a second, distinct replay defect, still open**; **(2)** the WS20
+overlap-cap re-score of the RTX MPS-50 what-if is a **clean null**: q17/q20 unchanged
+(+15.6/+19.7%) because only 0.4%/0.0% of their kernel time sits above the 0.9 overlap
+gate (suite median overlap 0.0) — sync-hidden kernels are not the mechanism; revised
+hypothesis is SM-partition-insensitive low-occupancy kernels (needs perf-counter access,
+blocked on both boxes). Suite physics numbers at head: median |E| 3.3%, TW +0.8%.
