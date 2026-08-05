@@ -2293,15 +2293,100 @@ fn merge_aggregation_is_rejected() {
     assert!(message.contains("new_planner_agg_stage"), "{message}");
 }
 
-/// Verifies a partial-phase ("update serialize") aggregation is rejected with a message naming
-/// the phase and the session-variable workaround.
+/// Verifies a partial-phase ("update serialize") aggregation translates to a plain aggregate
+/// whose measure carries the InitialToIntermediate phase and the modeled partial-state type
+/// (I64 for an integer sum), not the FE's declared slot type.
 #[test]
-fn partial_aggregation_is_rejected() {
-    let err = translate_phase_case(phase_aggregation_node(&[false], false)).unwrap_err();
-    assert!(matches!(err, TranslateError::UnsupportedPlanNode { .. }));
+fn partial_aggregation_translates_with_the_modeled_state_type() {
+    let translated = translate_phase_case(phase_aggregation_node(&[false], false)).unwrap();
+
+    let root = root(&translated.plan);
+    assert_eq!(root.names, vec!["total"]);
+    let rel::RelType::Aggregate(aggregate) =
+        root.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected aggregate relation");
+    };
+    assert_eq!(aggregate.measures.len(), 1);
+    let measure = aggregate.measures[0].measure.as_ref().unwrap();
+    assert_eq!(
+        measure.phase,
+        substrait::proto::AggregationPhase::InitialToIntermediate as i32
+    );
+    let output_type = measure.output_type.as_ref().unwrap();
+    assert!(
+        matches!(
+            output_type.kind.as_ref().unwrap(),
+            substrait::proto::r#type::Kind::I64(_)
+        ),
+        "{output_type:?}"
+    );
+    let names: Vec<_> = extension_function_names(&translated.plan);
+    assert!(names.contains(&"sum".to_string()), "{names:?}");
+}
+
+/// Verifies a partial avg is rejected: its Sirius partial state is two columns where the FE
+/// allocates one VARBINARY slot, which a type override cannot express.
+#[test]
+fn partial_avg_is_rejected_with_the_agg_stage_workaround() {
+    let mut aggregate = aggregate_expr(
+        "avg",
+        scalar_type(TPrimitiveType::DOUBLE),
+        Some(slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT))),
+    );
+    aggregate.nodes[0].agg_expr = Some(TAggregateExpr::new(false));
+    let mut node = aggregation_node(1, 1, Vec::new(), vec![aggregate]);
+    node.agg_node.as_mut().unwrap().need_finalize = false;
+    let err = translate_phase_case(node).unwrap_err();
     let message = err.to_string();
-    assert!(message.contains("partial"), "{message}");
+    assert!(message.contains("VARBINARY"), "{message}");
     assert!(message.contains("new_planner_agg_stage"), "{message}");
+}
+
+/// Verifies grouped two-phase aggregation is rejected in the translator. The multi-CN case is
+/// also stopped by the destination guard, but a single-CN merge fragment has one destination,
+/// so without this guard grouped two-phase would be reachable yet untested.
+#[test]
+fn grouped_two_phase_is_rejected() {
+    let mut aggregate = aggregate_expr(
+        "sum",
+        scalar_type(TPrimitiveType::BIGINT),
+        Some(slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT))),
+    );
+    aggregate.nodes[0].agg_expr = Some(TAggregateExpr::new(false));
+    let mut node = aggregation_node(
+        1,
+        1,
+        vec![slot_ref(2, 0, scalar_type(TPrimitiveType::VARCHAR))],
+        vec![aggregate],
+    );
+    node.agg_node.as_mut().unwrap().need_finalize = false;
+    let err = translate_fragment(&params(
+        Some(TPlan::new(vec![node, scan_node(0, 0)])),
+        Some(agg_desc()),
+        None,
+    ))
+    .unwrap_err();
+    let message = err.to_string();
+    assert!(message.contains("partitioned streaming"), "{message}");
+    assert!(message.contains("new_planner_agg_stage"), "{message}");
+}
+
+/// Verifies the one-shot path labels its measures InitialToResult (advisory; the engine
+/// ignores phases, but dumped plans should say what each aggregate is).
+#[test]
+fn one_shot_measures_are_labeled_initial_to_result() {
+    let translated = translate_phase_case(phase_aggregation_node(&[false], true)).unwrap();
+    let root = root(&translated.plan);
+    let rel::RelType::Aggregate(aggregate) =
+        root.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected aggregate relation");
+    };
+    assert_eq!(
+        aggregate.measures[0].measure.as_ref().unwrap().phase,
+        substrait::proto::AggregationPhase::InitialToResult as i32
+    );
 }
 
 /// Verifies the "merge serialize" combination (a 3/4-phase DISTINCT plan's middle stage) is

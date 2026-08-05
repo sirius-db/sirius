@@ -7,15 +7,16 @@ use substrait::proto::read_rel::local_files::file_or_files::{
 };
 use substrait::proto::read_rel::{LocalFiles, NamedTable, ReadType};
 use substrait::proto::{
-    AggregateFunction, AggregateRel, Expression, FetchRel, FilterRel, JoinRel, ProjectRel, ReadRel,
-    Rel, RelCommon, SortField, SortRel, aggregate_rel, fetch_rel, function_argument, join_rel, rel,
-    rel_common, sort_field,
+    AggregateFunction, AggregateRel, AggregationPhase, Expression, FetchRel, FilterRel, JoinRel,
+    ProjectRel, ReadRel, Rel, RelCommon, SortField, SortRel, aggregate_rel, fetch_rel,
+    function_argument, join_rel, rel, rel_common, sort_field,
 };
 
 use crate::agg_phase::{self, AggPhase};
 use crate::descriptor_table::DescriptorTable;
 use crate::error::{Result, TranslateError};
 use crate::expr_translator::{self, ExprContext, TranslateExpr};
+use crate::partial_state;
 use crate::scan_paths::ScanFilePaths;
 use crate::{
     ExchangeInput, ExtensionRegistry, StreamInputColumn, StreamInputSchema, URN_AGGREGATE,
@@ -449,15 +450,7 @@ fn translate_aggregation(
         });
     }
     match phase {
-        AggPhase::OneShot => {}
-        AggPhase::Partial => {
-            return Err(TranslateError::UnsupportedPlanNode {
-                node_id: node.node_id,
-                node_type: node.node_type,
-                reason: "partial (update-serialize) aggregation is not translated yet \
-                         (SET new_planner_agg_stage = 1)",
-            });
-        }
+        AggPhase::OneShot | AggPhase::Partial => {}
         AggPhase::Merge => {
             return Err(TranslateError::UnsupportedPlanNode {
                 node_id: node.node_id,
@@ -466,6 +459,18 @@ fn translate_aggregation(
                          (SET new_planner_agg_stage = 1)",
             });
         }
+    }
+    // Grouped two-phase needs the hash-partitioned shuffle that partitioned streaming output
+    // (#838) will provide. Multi-CN plans would also be stopped by the destination guard, but
+    // on a single CN the merge fragment has one instance -- one destination -- and grouped
+    // two-phase would become reachable yet untested; reject it in the translator instead.
+    if phase != AggPhase::OneShot && !agg.grouping_exprs.as_deref().unwrap_or_default().is_empty() {
+        return Err(TranslateError::UnsupportedPlanNode {
+            node_id: node.node_id,
+            node_type: node.node_type,
+            reason: "grouped two-phase aggregation needs partitioned streaming output (#838) \
+                     (SET new_planner_agg_stage = 1)",
+        });
     }
     let output_tuple = agg.output_tuple_id;
 
@@ -508,15 +513,40 @@ fn translate_aggregation(
                 reason: "distinct aggregates without grouping keys are not supported",
             });
         }
-        let output_type = ctx
-            .desc
-            .slot(output_tuple, *slot_id)?
-            .substrait_type
-            .clone()
-            .ok_or(TranslateError::MissingField {
-                context: "aggregate output slot",
-                field: "slotType",
-            })?;
+        // A partial measure's output is its partial state, whose wire type is modeled: the
+        // FE's intermediate slot type lies about what Sirius emits (see partial_state). The
+        // engine ignores measure output types either way; carrying the modeled type keeps
+        // dumped plans honest about what is actually on the wire.
+        let output_type = match phase {
+            AggPhase::Partial => {
+                if call.distinct {
+                    return Err(TranslateError::UnsupportedPlanNode {
+                        node_id: node.node_id,
+                        node_type: node.node_type,
+                        reason: "DISTINCT aggregates are not supported in two-phase plans \
+                                 (SET new_planner_agg_stage = 1)",
+                    });
+                }
+                let function = expr
+                    .nodes
+                    .first()
+                    .and_then(|root| root.fn_.as_ref())
+                    .ok_or(TranslateError::MissingField {
+                        context: "aggregate expression",
+                        field: "fn",
+                    })?;
+                partial_state::wire_type(function)?
+            }
+            _ => ctx
+                .desc
+                .slot(output_tuple, *slot_id)?
+                .substrait_type
+                .clone()
+                .ok_or(TranslateError::MissingField {
+                    context: "aggregate output slot",
+                    field: "slotType",
+                })?,
+        };
         // `count` lives in the generic aggregate extension; sum/avg/min/max are declared by
         // the arithmetic extension.
         let urn = if call.name == "count" {
@@ -541,6 +571,15 @@ fn translate_aggregation(
                 } else {
                     substrait::proto::aggregate_function::AggregationInvocation::All as i32
                 },
+                // Advisory only: the engine's Substrait consumer ignores phases and executes
+                // exactly what the function names say, so the plan must be correct for a
+                // phase-ignoring reader first (substitute functions, then label). The label
+                // makes dumped plans self-describing.
+                phase: match phase {
+                    AggPhase::OneShot => AggregationPhase::InitialToResult,
+                    AggPhase::Partial => AggregationPhase::InitialToIntermediate,
+                    AggPhase::Merge => AggregationPhase::IntermediateToResult,
+                } as i32,
                 ..Default::default()
             }),
             filter: None,
