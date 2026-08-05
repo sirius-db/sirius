@@ -110,12 +110,43 @@ class RetimeStats:
     device_model_active: bool = False
     device_busy_frac: Dict[int, float] = field(default_factory=dict)
     device_capacity: Dict[int, float] = field(default_factory=dict)
+    # WS20 per-span overlap cap (section-7 split path only; stands down when
+    # the G4b fluid device engages — serialized kernels are not hidden)
+    overlap_cap_active: bool = False
+    overlap_hidden_kernel_ns: float = 0.0  # traced kernel-ns marked hidden
 
     def to_dict(self) -> dict:
         return {k: getattr(self, k) for k in self.__dataclass_fields__}
 
 
-def _op_inv_factor(op: OpPhysics, knobs: Knobs) -> float:
+def _capped_kernel_share(
+    kern: float, kern_scaled: float, f_host: float, overlap: float
+) -> float:
+    """Charged kernel share of a span under the per-span overlap cap (WS20).
+
+    ``overlap`` is the measured share of the span's kernel-busy time hidden
+    under concurrent host work (not covered by a same-thread sync wait,
+    attribute.py). The hidden part co-runs with host work, so its stretch is
+    absorbed until it exhausts the hiding capacity — the original hidden
+    window plus the span's host-only residue ``f_host`` (paid once; the span
+    charges max(host, kernels) there, not their sum):
+
+        charged = (1-ov)*kern_scaled + max(ov*kern, ov*kern_scaled - f_host)
+
+    Identity at knobs=1 (kern_scaled == kern); exact old behavior at ov=0;
+    shrinking hidden kernels (kern_scaled < kern) floors at ov*kern — the
+    co-running host work does not get faster. Motivated by the RTX PRO 6000
+    q17/q20 outliers: real x ~ 1.0 at MPS-50 while the uncapped split
+    charged +15.6/+19.7%."""
+    if overlap <= 0.0 or kern <= 0.0:
+        return kern_scaled
+    ov = min(1.0, overlap)
+    hidden = ov * kern
+    hidden_scaled = ov * kern_scaled
+    return (kern_scaled - hidden_scaled) + max(hidden, hidden_scaled - f_host)
+
+
+def _op_inv_factor(op: OpPhysics, knobs: Knobs, overlap_cap: bool = False) -> float:
     """scaled_duration / traced_span for one annotated operator span."""
     k_c = knobs.gpu_compute
     k_m = laws.effective_membw_mult(knobs)
@@ -124,10 +155,16 @@ def _op_inv_factor(op: OpPhysics, knobs: Knobs) -> float:
     k_d2h = laws.transfer_mult("d2h", knobs)
     k_d2d = laws.transfer_mult("d2d", knobs)
     k_host = laws.host_mult(knobs)
+    kern_scaled = op.f_comp / k_c + op.f_membw / k_m + op.f_unknown / k_u
+    if overlap_cap:
+        kern_scaled = _capped_kernel_share(
+            _op_kernel_frac(op),
+            kern_scaled,
+            op.f_host,
+            getattr(op, "f_kernel_overlap", 0.0),
+        )
     return (
-        op.f_comp / k_c
-        + op.f_membw / k_m
-        + op.f_unknown / k_u
+        kern_scaled
         + op.f_h2d / k_h2d
         + op.f_d2h / k_d2h
         + op.f_d2d / k_d2d
@@ -135,15 +172,24 @@ def _op_inv_factor(op: OpPhysics, knobs: Knobs) -> float:
     )
 
 
-def _prep_nonxfer_factor(prep: PrepPhysics, knobs: Knobs) -> float:
+def _prep_nonxfer_factor(
+    prep: PrepPhysics, knobs: Knobs, overlap_cap: bool = False
+) -> float:
     """scaled/traced factor for the non-transfer share of a Preparing span
     (kernel time — decompress is SM-bound — plus host glue)."""
-    return (
+    kern_scaled = (
         prep.f_comp / knobs.gpu_compute
         + prep.f_membw / laws.effective_membw_mult(knobs)
         + prep.f_unknown / laws.conflated_mult(knobs)
-        + prep.f_host / laws.host_mult(knobs)
     )
+    if overlap_cap:
+        kern_scaled = _capped_kernel_share(
+            _prep_kernel_frac(prep),
+            kern_scaled,
+            prep.f_host,
+            getattr(prep, "f_kernel_overlap", 0.0),
+        )
+    return kern_scaled + prep.f_host / laws.host_mult(knobs)
 
 
 def _curve_factor(
@@ -212,6 +258,11 @@ def retime_graph(
     serial_ok = serial_frac is None or serial_frac >= DEVICE_SERIAL_MIN
     device_on = device_requested and serial_ok
     stats.device_model_active = device_on
+    # WS20 overlap cap: only in the section-7 split path. When the G4b fluid
+    # device engages, the lane's kernels serialize (the gate's premise), so
+    # no kernel time is host-hidden and the cap must not double-discount.
+    overlap_cap = not device_on
+    stats.overlap_cap_active = overlap_cap
     if device_requested and serial_frac is None:
         stats.warnings.append(
             "G4b: the physics profile carries no kernel-serialization "
@@ -240,7 +291,14 @@ def retime_graph(
                     * task.prep_ns
                 )
             stats.class_ns["xfer"] += prep_ann.f_xfer * task.prep_ns
-            nonxfer_scaled = task.prep_ns * _prep_nonxfer_factor(prep_ann, knobs)
+            stats.overlap_hidden_kernel_ns += (
+                getattr(prep_ann, "f_kernel_overlap", 0.0)
+                * _prep_kernel_frac(prep_ann)
+                * task.prep_ns
+            )
+            nonxfer_scaled = task.prep_ns * _prep_nonxfer_factor(
+                prep_ann, knobs, overlap_cap=overlap_cap
+            )
             is_link = task.is_transfer_prep
             m_chan = laws.channel_transfer_mult(
                 task.prep_origin, task.prep_target, knobs
@@ -285,7 +343,12 @@ def retime_graph(
                     op_ann.f_h2d + op_ann.f_d2h + op_ann.f_d2d
                 ) * dur
                 stats.class_ns["host"] += op_ann.f_host * dur
-                scaled = dur * _op_inv_factor(op_ann, knobs)
+                stats.overlap_hidden_kernel_ns += (
+                    getattr(op_ann, "f_kernel_overlap", 0.0)
+                    * _op_kernel_frac(op_ann)
+                    * dur
+                )
+                scaled = dur * _op_inv_factor(op_ann, knobs, overlap_cap=overlap_cap)
                 base_kernel_ns += _op_kernel_frac(op_ann) * dur
                 scaled_kernel_ns += _op_kernel_inv_factor(op_ann, knobs) * dur
             else:
@@ -447,7 +510,16 @@ def simulate_with_physics(
     knobs: Knobs,
     profile: PhysicsProfile,
     queue_order: str = "traced",
-) -> Tuple[SimResult, JoinStats, RetimeStats]:
+    return_graph: bool = False,
+):
+    """Run the physics-retimed simulation.
+
+    Returns ``(result, jstats, rstats)``; with ``return_graph=True`` also
+    returns the retimed graph the engine actually executed as a 4th element —
+    span durations there are the knob-scaled ones (the engine ran with
+    neutralized GPU knobs), which is what the quent exporter needs to lay out
+    per-operator boundaries of a physics run.
+    """
     annotations, jstats = join_graph(profile, graph)
     g2, rstats = retime_graph(
         graph,
@@ -483,6 +555,8 @@ def simulate_with_physics(
         host_capacity=host if host else None,
         device_capacity=rstats.device_capacity or None,
     ).run()
+    if return_graph:
+        return result, jstats, rstats, g2
     return result, jstats, rstats
 
 
