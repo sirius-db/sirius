@@ -7,7 +7,7 @@
 #
 # Teams follow the pattern: @sirius-db/sirius-<component|language>-codeowners
 
-# ── Core (Planner, Executors & Operators) ─────────────────────────────────────
+# ── Core (Planner, Executors & Operators/Expressions) ─────────────────────────
 src/planner/                        @sirius-db/sirius-core-codeowners
 src/include/planner/                @sirius-db/sirius-core-codeowners
 src/creator/                        @sirius-db/sirius-core-codeowners
