@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include <io/uri_parser.hpp>
 #include <log/logging.hpp>
 #include <op/scan/puffin_reader.hpp>
 
@@ -25,6 +26,11 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+// The integer readers below memcpy straight into the target type, so they are only correct on a
+// little-endian host. Iceberg fixes these fields as little-endian on the wire.
+static_assert(__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__,
+              "puffin_reader decodes little-endian fields by direct memcpy");
 
 namespace sirius::op::scan {
 
@@ -116,6 +122,15 @@ static uint32_t compute_crc32(const uint8_t* data, size_t length)
 static constexpr uint32_t SERIAL_COOKIE_NO_RUNCONTAINER = 12346;
 static constexpr uint32_t SERIAL_COOKIE                 = 12347;
 
+/// Bytes still readable at @p p. Bounds checks below are written as
+/// `remaining(p, p_end) < need` rather than `p + need > p_end`: forming a pointer past the end
+/// of the buffer is undefined behaviour even when the result is only compared, and `need` here
+/// comes from the file.
+static size_t remaining(const uint8_t* p, const uint8_t* p_end)
+{
+  return static_cast<size_t>(p_end - p);
+}
+
 static size_t deserialize_roaring32(const uint8_t* data,
                                     size_t data_len,
                                     std::vector<uint32_t>& out)
@@ -140,12 +155,16 @@ static size_t deserialize_roaring32(const uint8_t* data,
 
     // Run bitmap: ceil(num_containers / 8) bytes
     run_bitmap_bytes = static_cast<size_t>((num_containers + 7) / 8);
-    if (p + run_bitmap_bytes > p_end) { throw std::runtime_error("roaring: truncated run bitmap"); }
+    if (remaining(p, p_end) < run_bitmap_bytes) {
+      throw std::runtime_error("roaring: truncated run bitmap");
+    }
     run_bitmap = p;
     p += run_bitmap_bytes;
   } else if (cookie == SERIAL_COOKIE_NO_RUNCONTAINER) {
     p += 4;
-    if (p + 4 > p_end) { throw std::runtime_error("roaring: truncated container count"); }
+    if (remaining(p, p_end) < 4u) {
+      throw std::runtime_error("roaring: truncated container count");
+    }
     num_containers = static_cast<int>(read_u32_le(p));
     p += 4;
   } else {
@@ -156,7 +175,9 @@ static size_t deserialize_roaring32(const uint8_t* data,
 
   // Read key-cardinality pairs: [key(u16), cardinality_minus_1(u16)] × num_containers
   size_t descriptor_bytes = static_cast<size_t>(num_containers) * 4;
-  if (p + descriptor_bytes > p_end) { throw std::runtime_error("roaring: truncated descriptors"); }
+  if (remaining(p, p_end) < descriptor_bytes) {
+    throw std::runtime_error("roaring: truncated descriptors");
+  }
 
   struct ContainerDesc {
     uint16_t key;
@@ -190,7 +211,9 @@ static size_t deserialize_roaring32(const uint8_t* data,
     (cookie == SERIAL_COOKIE_NO_RUNCONTAINER) || (has_run_containers && num_containers >= 4);
   if (has_offsets) {
     size_t offset_bytes = static_cast<size_t>(num_containers) * 4;
-    if (p + offset_bytes > p_end) { throw std::runtime_error("roaring: truncated offset header"); }
+    if (remaining(p, p_end) < offset_bytes) {
+      throw std::runtime_error("roaring: truncated offset header");
+    }
     p += offset_bytes;
   }
 
@@ -201,14 +224,18 @@ static size_t deserialize_roaring32(const uint8_t* data,
     if (containers[i].type == 0) {
       // Array container: cardinality × uint16 sorted values
       size_t nbytes = static_cast<size_t>(containers[i].cardinality) * 2;
-      if (p + nbytes > p_end) { throw std::runtime_error("roaring: truncated array container"); }
+      if (remaining(p, p_end) < nbytes) {
+        throw std::runtime_error("roaring: truncated array container");
+      }
       for (uint32_t j = 0; j < containers[i].cardinality; ++j) {
         out.push_back(high | read_u16_le(p));
         p += 2;
       }
     } else if (containers[i].type == 1) {
       // Bitmap container: 1024 × uint64 = 8192 bytes
-      if (p + 8192 > p_end) { throw std::runtime_error("roaring: truncated bitmap container"); }
+      if (remaining(p, p_end) < 8192u) {
+        throw std::runtime_error("roaring: truncated bitmap container");
+      }
       for (int w = 0; w < 1024; ++w) {
         uint64_t word = read_u64_le(p + w * 8);
         while (word != 0) {
@@ -220,11 +247,15 @@ static size_t deserialize_roaring32(const uint8_t* data,
       p += 8192;
     } else {
       // Run container: num_runs(u16), then num_runs × (start_u16, length_u16)
-      if (p + 2 > p_end) { throw std::runtime_error("roaring: truncated run container header"); }
+      if (remaining(p, p_end) < 2u) {
+        throw std::runtime_error("roaring: truncated run container header");
+      }
       uint16_t num_runs = read_u16_le(p);
       p += 2;
       size_t run_bytes = static_cast<size_t>(num_runs) * 4;
-      if (p + run_bytes > p_end) { throw std::runtime_error("roaring: truncated run container"); }
+      if (remaining(p, p_end) < run_bytes) {
+        throw std::runtime_error("roaring: truncated run container");
+      }
       for (uint16_t r = 0; r < num_runs; ++r) {
         uint16_t start  = read_u16_le(p);
         uint16_t length = read_u16_le(p + 2);
@@ -255,8 +286,19 @@ std::vector<int64_t> read_deletion_vector(std::string const& puffin_path,
       " size=" + std::to_string(content_size_in_bytes));
   }
 
-  std::ifstream f(puffin_path, std::ios::binary);
-  if (!f) { throw std::runtime_error("[puffin] Cannot open file: " + puffin_path); }
+  // Manifests written by Apache tooling carry URIs, and this reader opens the file directly
+  // rather than through sirius_ioctx — so the scheme stripping done at the datasource boundary
+  // (io_context.cpp) does not reach it. Without this, every deletion vector on a real Iceberg
+  // table fails to open and the table declines to CPU: the V3 path would appear simply never to
+  // engage, rather than to fail. Uses the shared helper so this agrees with the I/O layer and
+  // with delete-key matching on what a path means.
+  auto const local_path = sirius::io::strip_file_scheme(puffin_path);
+
+  std::ifstream f(local_path, std::ios::binary);
+  if (!f) {
+    throw std::runtime_error("[puffin] Cannot open file: " + local_path +
+                             (local_path == puffin_path ? "" : " (from '" + puffin_path + "')"));
+  }
 
   // Validate the container before trusting an offset into it. The blob's own magic and CRC
   // (below) are not enough: a bare deletion-vector blob written with no container passes all of
@@ -336,6 +378,15 @@ std::vector<int64_t> read_deletion_vector(std::string const& puffin_path,
   int64_t num_bitmaps = read_i64_le(p);
   p += 8;
   roaring_len -= 8;
+
+  // A negative count would skip the loop entirely and return an EMPTY position list, which reads
+  // as "this data file has no deleted rows" — the scan would then return rows the table deleted.
+  // The CRC above already covers this field, so reaching here means a writer emitted a valid
+  // checksum over a nonsensical count; refuse it rather than turn it into an absence of deletes.
+  if (num_bitmaps < 0) {
+    throw std::runtime_error("[puffin] Negative bitmap count (" + std::to_string(num_bitmaps) +
+                             ") in " + puffin_path);
+  }
 
   std::vector<int64_t> positions;
 

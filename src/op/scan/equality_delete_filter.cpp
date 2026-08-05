@@ -55,11 +55,22 @@ std::unique_ptr<cudf::table> equality_delete_filter::apply(std::unique_ptr<cudf:
   // out of the same batch. It is unreachable while the planner routes equality deletes to CPU.
   auto const& group = _delete_data->equality_delete_groups[_group_index];
 
+  // A data file whose sequence number we cannot find is REFUSED, not assumed deletable. The
+  // lookup is keyed on the path the manifest recorded, and the caller translates each run to
+  // that form; a miss therefore means the translation did not cover this file, and answering
+  // "the deletes apply" would remove rows whose data file may well post-date the delete. That
+  // is the silent-wrong direction, so it throws and takes the runtime fallback instead.
   auto applies_to = [&](std::string const& path) {
+    if (group.sequence_number <= 0) { return true; }
     auto seq_it = _delete_data->data_file_sequence_numbers.find(path);
-    return !(group.sequence_number > 0 &&
-             seq_it != _delete_data->data_file_sequence_numbers.end() && seq_it->second > 0 &&
-             seq_it->second >= group.sequence_number);
+    if (seq_it == _delete_data->data_file_sequence_numbers.end()) {
+      throw std::invalid_argument(
+        "[equality_delete_filter] no sequence number recorded for data file '" + path +
+        "'; equality deletes apply only to data files strictly older than the delete, so this "
+        "cannot be decided (the manifest-to-scan path translation did not cover this file)");
+    }
+    if (seq_it->second <= 0) { return true; }
+    return seq_it->second < group.sequence_number;
   };
 
   bool const first_applies = layout.empty() || applies_to(layout.front().data_file_path);
