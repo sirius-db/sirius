@@ -526,3 +526,364 @@ TEST_CASE_METHOD(fragment_fixture,
     throw;
   }
 }
+
+namespace {
+
+//! Every row in an output stream with all columns widened to int64, draining it. Two-phase
+//! results mix BIGINT (sum/count) and INTEGER (min/max/keys) columns, so a single-type drain
+//! cannot read them.
+std::vector<std::vector<std::int64_t>> drain_rows_as_i64(streaming_fragment& fragment,
+                                                         stream_id_t id)
+{
+  std::vector<std::vector<std::int64_t>> rows;
+  while (auto batch = fragment.session().pull(id)) {
+    auto view = sirius::get_cudf_table_view(**batch);
+    std::vector<std::vector<std::int64_t>> cols;
+    for (int c = 0; c < view.num_columns(); ++c) {
+      const auto& col = view.column(c);
+      std::vector<std::int64_t> host;
+      switch (col.type().id()) {
+        case cudf::type_id::INT32: {
+          auto v = sirius::test::operator_utils::copy_column_to_host<std::int32_t>(col);
+          host.assign(v.begin(), v.end());
+          break;
+        }
+        case cudf::type_id::INT64: {
+          host = sirius::test::operator_utils::copy_column_to_host<std::int64_t>(col);
+          break;
+        }
+        // The scaled integer representation; assertions compare scaled values.
+        case cudf::type_id::DECIMAL64: {
+          host = sirius::test::operator_utils::copy_column_to_host<std::int64_t>(col);
+          break;
+        }
+        default:
+          FAIL("drain_rows_as_i64: unexpected column type id "
+               << static_cast<int>(col.type().id()));
+      }
+      cols.push_back(std::move(host));
+    }
+    for (std::size_t r = 0; r < static_cast<std::size_t>(view.num_rows()); ++r) {
+      std::vector<std::int64_t> row;
+      row.reserve(cols.size());
+      for (const auto& col : cols) {
+        row.push_back(col[r]);
+      }
+      rows.push_back(std::move(row));
+    }
+  }
+  std::sort(rows.begin(), rows.end());
+  return rows;
+}
+
+}  // namespace
+
+// ============================================================================
+// FRAG-6: partial aggregates merge to the one-shot answer
+// ============================================================================
+//
+// The two-phase aggregation design rests on two engine behaviours nothing else
+// tests: an ungrouped aggregate under a STREAMING_SINK emits its single-row
+// partial state, and a plain aggregate with substituted merge functions over
+// those rows -- sum(s), sum(c), min(mn), max(mx) -- reproduces the one-shot
+// answer. The substitution table is the one the engine applies internally
+// between a local aggregate and its merge wrap (gpu_merge_impl.cpp), applied
+// here across a fragment boundary instead.
+
+TEST_CASE_METHOD(fragment_fixture,
+                 "FRAG-6: partial aggregates merge to the one-shot answer",
+                 "[integration][streaming_fragment]")
+{
+  constexpr const char* kPartials = "sum(a) AS s, count(*) AS c, min(a) AS mn, max(a) AS mx";
+  const std::string first_leaf    = "(VALUES (1), (2), (3), (4), (5)) t(a)";
+  std::string second_leaf         = "(VALUES (6), (7), (8), (9), (10)) t(a)";
+  std::string oracle_leaf = "(VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10)) t(a)";
+
+  // A compute node whose scan got no rows still participates in the merge; its partial state
+  // (sum=NULL, count=0) must not corrupt the answer.
+  SECTION("both senders contribute") {}
+  SECTION("one sender has an empty input")
+  {
+    second_leaf = "(VALUES (6), (7), (8), (9), (10)) t(a) WHERE a > 100";
+    oracle_leaf = "(VALUES (1), (2), (3), (4), (5)) t(a)";
+  }
+
+  auto expected = con->Query("SELECT sum(a), count(*), min(a), max(a) FROM " + oracle_leaf);
+  REQUIRE_FALSE(expected->HasError());
+  const std::vector<std::int64_t> oracle{expected->GetValue(0, 0).GetValue<std::int64_t>(),
+                                         expected->GetValue(1, 0).GetValue<std::int64_t>(),
+                                         expected->GetValue(2, 0).GetValue<std::int64_t>(),
+                                         expected->GetValue(3, 0).GetValue<std::int64_t>()};
+
+  auto sirius_ctx = con->context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  REQUIRE(sirius_ctx != nullptr);
+
+  con->BeginTransaction();
+  try {
+    auto make_sender = [&](const std::string& leaf) {
+      fragment_spec spec;
+      spec.plan_source =
+        sirius::test::sql_plan_source(std::string("SELECT ") + kPartials + " FROM " + leaf);
+      spec.outputs = {0};
+      return std::make_unique<streaming_fragment>(*con->context, std::move(spec));
+    };
+    auto first  = make_sender(first_leaf);
+    auto second = make_sender(second_leaf);
+
+    for (auto* sender : {first.get(), second.get()}) {
+      query_lifecycle sender_lifecycle(*sirius_ctx, *con->context, "frag6_sender");
+      sender->build();
+      sender->run();
+    }
+
+    // Pins the partial-state wire types the translator's schema model has to predict:
+    // sum(INTEGER) and count(*) are BIGINT (the plan generator downcasts DuckDB's HUGEINT sum),
+    // min/max keep their input type. A change here is a change to that model.
+    {
+      const auto& types = first->sink_types();
+      REQUIRE(types.size() == 4);
+      INFO("sink types: " << types[0].to_string() << ", " << types[1].to_string() << ", "
+                          << types[2].to_string() << ", " << types[3].to_string());
+      CHECK(types[0].to_string() == "BIGINT");
+      CHECK(types[1].to_string() == "BIGINT");
+      CHECK(types[2].to_string() == "INTEGER");
+      CHECK(types[3].to_string() == "INTEGER");
+    }
+
+    // The merge side: a plain aggregate with the substituted merge functions. count merges by
+    // SUMMING partial counts -- merging it with count() would count rows and be silently wrong.
+    fragment_spec receiver_spec;
+    receiver_spec.plan_source = sirius::test::sql_plan_source(
+      "SELECT sum(s), sum(c), min(mn), max(mx) FROM sirius_stream_source(0)");
+    receiver_spec.inputs[0] = stream_input_spec{
+      {"s", "c", "mn", "mx"},
+      sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::BIGINT,
+                                                                  duckdb::LogicalType::BIGINT,
+                                                                  duckdb::LogicalType::INTEGER,
+                                                                  duckdb::LogicalType::INTEGER}),
+      {0, 1}};
+    receiver_spec.outputs = {1};
+    streaming_fragment receiver(*con->context, std::move(receiver_spec));
+
+    query_lifecycle receiver_lifecycle(*sirius_ctx, *con->context, "frag6_receiver");
+    receiver.build();
+
+    std::uint32_t sender_id = 0;
+    for (auto* sender : {first.get(), second.get()}) {
+      std::size_t relayed = 0;
+      while (auto batch = sender->session().pull(0)) {
+        REQUIRE(receiver.session().push(0, *batch));
+        ++relayed;
+      }
+      INFO("sender " << sender_id << " relayed " << relayed << " partial batches");
+      receiver.session().close_input(0, sender_id);
+      ++sender_id;
+    }
+
+    receiver.run();
+    receiver_lifecycle.end();
+
+    auto rows = drain_rows_as_i64(receiver, 1);
+    REQUIRE(rows.size() == 1);
+    REQUIRE(rows[0] == oracle);
+
+    con->Rollback();
+  } catch (...) {
+    con->Rollback();
+    throw;
+  }
+}
+
+// ============================================================================
+// FRAG-7: grouped partial aggregates merge to the one-shot answer
+// ============================================================================
+//
+// The distributed grouped path stays blocked until partitioned streaming
+// output lands, but the merge *semantics* -- group keys carried in the partial
+// rows, per-key substitution -- are pinned here so unblocking it later is a
+// translator change, not an engine question.
+
+TEST_CASE_METHOD(fragment_fixture,
+                 "FRAG-7: grouped partial aggregates merge to the one-shot answer",
+                 "[integration][streaming_fragment]")
+{
+  constexpr const char* kFirstLeaf  = "(VALUES (1), (2), (3), (4), (5)) t(a)";
+  constexpr const char* kSecondLeaf = "(VALUES (6), (7), (8), (9), (10)) t(a)";
+  constexpr const char* kOracleLeaf =
+    "(VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10)) t(a)";
+
+  auto expected = con->Query(std::string("SELECT a % 2 AS k, sum(a), count(*), min(a), max(a) "
+                                         "FROM ") +
+                             kOracleLeaf + " GROUP BY k ORDER BY k");
+  REQUIRE_FALSE(expected->HasError());
+  std::vector<std::vector<std::int64_t>> oracle;
+  for (duckdb::idx_t r = 0; r < expected->RowCount(); ++r) {
+    oracle.push_back({expected->GetValue(0, r).GetValue<std::int64_t>(),
+                      expected->GetValue(1, r).GetValue<std::int64_t>(),
+                      expected->GetValue(2, r).GetValue<std::int64_t>(),
+                      expected->GetValue(3, r).GetValue<std::int64_t>(),
+                      expected->GetValue(4, r).GetValue<std::int64_t>()});
+  }
+  std::sort(oracle.begin(), oracle.end());
+
+  auto sirius_ctx = con->context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  REQUIRE(sirius_ctx != nullptr);
+
+  con->BeginTransaction();
+  try {
+    auto make_sender = [&](const char* leaf) {
+      fragment_spec spec;
+      spec.plan_source = sirius::test::sql_plan_source(
+        std::string("SELECT a % 2 AS k, sum(a) AS s, count(*) AS c, min(a) AS mn, max(a) AS mx "
+                    "FROM ") +
+        leaf + " GROUP BY k");
+      spec.outputs = {0};
+      return std::make_unique<streaming_fragment>(*con->context, std::move(spec));
+    };
+    auto first  = make_sender(kFirstLeaf);
+    auto second = make_sender(kSecondLeaf);
+
+    for (auto* sender : {first.get(), second.get()}) {
+      query_lifecycle sender_lifecycle(*sirius_ctx, *con->context, "frag7_sender");
+      sender->build();
+      sender->run();
+    }
+
+    {
+      const auto& types = first->sink_types();
+      REQUIRE(types.size() == 5);
+      INFO("sink types: " << types[0].to_string() << ", " << types[1].to_string() << ", "
+                          << types[2].to_string() << ", " << types[3].to_string() << ", "
+                          << types[4].to_string());
+      CHECK(types[0].to_string() == "INTEGER");
+      CHECK(types[1].to_string() == "BIGINT");
+      CHECK(types[2].to_string() == "BIGINT");
+      CHECK(types[3].to_string() == "INTEGER");
+      CHECK(types[4].to_string() == "INTEGER");
+    }
+
+    fragment_spec receiver_spec;
+    receiver_spec.plan_source = sirius::test::sql_plan_source(
+      "SELECT k, sum(s), sum(c), min(mn), max(mx) FROM sirius_stream_source(0) GROUP BY k");
+    receiver_spec.inputs[0] = stream_input_spec{
+      {"k", "s", "c", "mn", "mx"},
+      sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER,
+                                                                  duckdb::LogicalType::BIGINT,
+                                                                  duckdb::LogicalType::BIGINT,
+                                                                  duckdb::LogicalType::INTEGER,
+                                                                  duckdb::LogicalType::INTEGER}),
+      {0, 1}};
+    receiver_spec.outputs = {1};
+    streaming_fragment receiver(*con->context, std::move(receiver_spec));
+
+    query_lifecycle receiver_lifecycle(*sirius_ctx, *con->context, "frag7_receiver");
+    receiver.build();
+
+    std::uint32_t sender_id = 0;
+    for (auto* sender : {first.get(), second.get()}) {
+      while (auto batch = sender->session().pull(0)) {
+        REQUIRE(receiver.session().push(0, *batch));
+      }
+      receiver.session().close_input(0, sender_id);
+      ++sender_id;
+    }
+
+    receiver.run();
+    receiver_lifecycle.end();
+
+    REQUIRE(drain_rows_as_i64(receiver, 1) == oracle);
+
+    con->Rollback();
+  } catch (...) {
+    con->Rollback();
+    throw;
+  }
+}
+
+// ============================================================================
+// FRAG-8: decimal min/max partial states cross the hop unchanged
+// ============================================================================
+//
+// min/max keep their input type, so their partial-state wire type is the
+// identity mapping -- but only if a DECIMAL column survives the GPU aggregate
+// and the hop without being rewritten. sum over decimals is lowered to FP64
+// upstream and never reaches this path.
+
+TEST_CASE_METHOD(fragment_fixture,
+                 "FRAG-8: decimal min/max partials survive the hop unchanged",
+                 "[integration][streaming_fragment]")
+{
+  constexpr const char* kFirstLeaf =
+    "(VALUES (CAST('1.10' AS DECIMAL(15,2))), (CAST('7.25' AS DECIMAL(15,2))), "
+    "(CAST('3.50' AS DECIMAL(15,2)))) t(d)";
+  constexpr const char* kSecondLeaf =
+    "(VALUES (CAST('0.75' AS DECIMAL(15,2))), (CAST('9.99' AS DECIMAL(15,2)))) t(d)";
+
+  auto sirius_ctx = con->context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  REQUIRE(sirius_ctx != nullptr);
+
+  con->BeginTransaction();
+  try {
+    auto make_sender = [&](const char* leaf) {
+      fragment_spec spec;
+      spec.plan_source = sirius::test::sql_plan_source(
+        std::string("SELECT min(d) AS mn, max(d) AS mx FROM ") + leaf);
+      spec.outputs = {0};
+      return std::make_unique<streaming_fragment>(*con->context, std::move(spec));
+    };
+    auto first  = make_sender(kFirstLeaf);
+    auto second = make_sender(kSecondLeaf);
+
+    for (auto* sender : {first.get(), second.get()}) {
+      query_lifecycle sender_lifecycle(*sirius_ctx, *con->context, "frag8_sender");
+      sender->build();
+      sender->run();
+    }
+
+    // The identity mapping the wire-type model relies on: the partial state is still
+    // DECIMAL(15,2), not a widened or lowered stand-in.
+    {
+      const auto& types = first->sink_types();
+      REQUIRE(types.size() == 2);
+      INFO("sink types: " << types[0].to_string() << ", " << types[1].to_string());
+      CHECK(types[0].to_string() == "DECIMAL(15,2)");
+      CHECK(types[1].to_string() == "DECIMAL(15,2)");
+    }
+
+    fragment_spec receiver_spec;
+    receiver_spec.plan_source =
+      sirius::test::sql_plan_source("SELECT min(mn), max(mx) FROM sirius_stream_source(0)");
+    receiver_spec.inputs[0] = stream_input_spec{
+      {"mn", "mx"},
+      sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{
+        duckdb::LogicalType::DECIMAL(15, 2), duckdb::LogicalType::DECIMAL(15, 2)}),
+      {0, 1}};
+    receiver_spec.outputs = {1};
+    streaming_fragment receiver(*con->context, std::move(receiver_spec));
+
+    query_lifecycle receiver_lifecycle(*sirius_ctx, *con->context, "frag8_receiver");
+    receiver.build();
+
+    std::uint32_t sender_id = 0;
+    for (auto* sender : {first.get(), second.get()}) {
+      while (auto batch = sender->session().pull(0)) {
+        REQUIRE(receiver.session().push(0, *batch));
+      }
+      receiver.session().close_input(0, sender_id);
+      ++sender_id;
+    }
+
+    receiver.run();
+    receiver_lifecycle.end();
+
+    // Scaled-integer representation of DECIMAL(15,2): 0.75 -> 75, 9.99 -> 999.
+    auto rows = drain_rows_as_i64(receiver, 1);
+    REQUIRE(rows.size() == 1);
+    REQUIRE(rows[0] == std::vector<std::int64_t>{75, 999});
+
+    con->Rollback();
+  } catch (...) {
+    con->Rollback();
+    throw;
+  }
+}
