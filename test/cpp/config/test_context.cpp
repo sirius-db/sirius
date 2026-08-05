@@ -168,9 +168,8 @@ constexpr std::array<setting_assignment, 10> legacy_only_settings{{
   {"modified_pipeline", "true"},
 }};
 
-constexpr std::array<const char*, 4> super_sirius_settings{{
+constexpr std::array<const char*, 3> super_sirius_settings{{
   "expression_evaluator_strategy",
-  "enable_regex_jit_impl",
   "enable_duckdb_fallback",
   "like_swar_fastpath",
 }};
@@ -377,6 +376,64 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     result = con.Query("RESET concat_batch_bytes");
     REQUIRE(result != nullptr);
     REQUIRE_FALSE(result->HasError());
+  }
+}
+
+TEST_CASE("Regex implementation setting is internal outside legacy builds",
+          "[sirius][config][regex-jit-setting][isolated_context]")
+{
+  std::optional<std::string> original_test_options;
+  if (auto const* value = std::getenv("SIRIUS_ENABLE_TEST_OPTIONS")) {
+    original_test_options = value;
+  }
+  finally restore_state{[original_test_options]() {
+    if (original_test_options) {
+      setenv("SIRIUS_ENABLE_TEST_OPTIONS", original_test_options->c_str(), 1);
+    } else {
+      unsetenv("SIRIUS_ENABLE_TEST_OPTIONS");
+    }
+    setenv("SIRIUS_DISABLE", "1", 1);
+  }};
+
+  auto setting_count = [](duckdb::Connection& con) {
+    auto result =
+      con.Query("SELECT count(*) FROM duckdb_settings() WHERE name = 'enable_regex_jit_impl'");
+    REQUIRE(result != nullptr);
+    REQUIRE_FALSE(result->HasError());
+    return result->GetValue(0, 0).GetValue<int64_t>();
+  };
+
+  setenv("SIRIUS_DISABLE", "1", 1);
+  unsetenv("SIRIUS_ENABLE_TEST_OPTIONS");
+  {
+    duckdb::DuckDB db(nullptr);
+    duckdb::Connection con(db);
+#ifdef SIRIUS_ENABLE_LEGACY
+    REQUIRE(setting_count(con) == 1);
+#else
+    REQUIRE(setting_count(con) == 0);
+    auto result = con.Query("SET enable_regex_jit_impl = false");
+    REQUIRE(result != nullptr);
+    REQUIRE(result->HasError());
+#endif
+  }
+
+  setenv("SIRIUS_ENABLE_TEST_OPTIONS", "true", 1);
+  {
+    duckdb::DuckDB db(nullptr);
+    duckdb::Connection con(db);
+#ifdef SIRIUS_ENABLE_LEGACY
+    REQUIRE(setting_count(con) == 1);
+#else
+    REQUIRE(setting_count(con) == 0);
+#endif
+  }
+
+  setenv("SIRIUS_ENABLE_TEST_OPTIONS", "1", 1);
+  {
+    duckdb::DuckDB db(nullptr);
+    duckdb::Connection con(db);
+    REQUIRE(setting_count(con) == 1);
   }
 }
 
