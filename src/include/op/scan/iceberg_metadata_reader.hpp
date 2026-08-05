@@ -120,6 +120,34 @@ std::shared_ptr<const IcebergDeleteData> read_iceberg_delete_data(
   std::optional<uint64_t> snapshot_id = std::nullopt);
 
 /**
+ * @brief Drop everything the per-query delete-data cache is holding.
+ *
+ * MUST be called from the query lifecycle (QueryBegin and QueryEnd). Two reasons, and the
+ * second is not optional:
+ *
+ * 1. Correctness. The cache exists only to collapse the repeated reads WITHIN one query
+ *    (see read_iceberg_delete_data). An entry that outlives its query could answer for a
+ *    table that has since been committed to, and returning a previous snapshot's deletes
+ *    means returning rows the table has removed.
+ * 2. Resources. IcebergDeleteData owns EqualityDeleteGroups, and those hold a GPU key table
+ *    and a prebuilt hash join. Holding them past the query pins GPU memory.
+ */
+void clear_iceberg_delete_data_cache();
+
+/**
+ * @brief Count of delete-data reads that actually walked the manifests (cache MISSES).
+ *
+ * The point of the cache is that one query performs this work once rather than repeatedly.
+ * Release builds compile INFO/DEBUG logging out, so a log line cannot demonstrate that, and
+ * a passing test only shows the memo did not corrupt results — not that it eliminated any
+ * work. This counter makes the claim measurable, and turns "the memo silently stopped
+ * hitting" into a test failure instead of a cost that quietly returns.
+ *
+ * Monotonic for the process lifetime; tests take a delta around a query.
+ */
+uint64_t iceberg_delete_data_uncached_read_count();
+
+/**
  * @brief Extract a column_name → field_id map from a parquet FileMetaData.
  *
  * Walks the flattened schema depth-first and collects field IDs for leaf

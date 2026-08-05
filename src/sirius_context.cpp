@@ -23,6 +23,7 @@
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/parser/parser.hpp"
+#include "op/scan/iceberg_metadata_reader.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/planner.hpp"
 #include "log/duckdb_sink.hpp"
@@ -184,6 +185,13 @@ void SiriusContext::QueryBegin(ClientContext& context)
     // Clear any stale captured plan from a previous query.
     captured_logical_plan_.reset();
 
+    // Bound the iceberg delete-data memo to this query. Cleared at BOTH ends: QueryEnd
+    // releases the GPU memory its EqualityDeleteGroups hold, and this catches an entry that
+    // survived a QueryEnd that did not run (an error path, a connection torn down mid-query).
+    // An entry that outlived its query could serve a previous snapshot's deletes, which means
+    // returning rows the table has since removed.
+    sirius::op::scan::clear_iceberg_delete_data_cache();
+
     // Reset operator ID counter so each query starts from 0
     sirius::op::sirius_physical_operator::next_operator_id.store(0);
 
@@ -244,6 +252,10 @@ void SiriusContext::QueryEnd()
   try {
     SIRIUS_LOG_INFO("QueryEnd");
     captured_logical_plan_.reset();
+
+    // Release the iceberg delete-data memo before the repositories go: its
+    // EqualityDeleteGroups own a GPU key table and a prebuilt hash join.
+    sirius::op::scan::clear_iceberg_delete_data_cache();
 
     query_.reset();
 

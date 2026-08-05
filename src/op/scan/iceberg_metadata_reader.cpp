@@ -25,7 +25,9 @@
 #include <cudf/types.hpp>
 #include <cudf/utilities/default_stream.hpp>
 
+#include <duckdb/main/client_context.hpp>
 #include <duckdb/main/connection.hpp>
+#include <duckdb/transaction/meta_transaction.hpp>
 #include <io/sirius_datasource.hpp>
 #include <log/logging.hpp>
 #include <op/scan/iceberg_avro_reader.hpp>
@@ -33,6 +35,8 @@
 #include <op/scan/puffin_reader.hpp>
 
 #include <algorithm>
+#include <atomic>
+#include <mutex>
 #include <numeric>
 #include <stdexcept>
 #include <string>
@@ -428,12 +432,39 @@ void materialize_equality_deletes(std::vector<IcebergDeleteFileEntry> const& eq_
 // Public API
 // =========================================================================
 
-std::shared_ptr<const IcebergDeleteData> read_iceberg_delete_data(
+namespace {
+
+/// Per-query memo for read_iceberg_delete_data. See the wrapper below for why it is keyed and
+/// scoped the way it is; see clear_iceberg_delete_data_cache() for why it must be cleared.
+std::mutex g_delete_data_cache_mtx;
+std::unordered_map<std::string, std::shared_ptr<const IcebergDeleteData>> g_delete_data_cache;
+
+/// Incremented on every read that actually walks the manifests. See the header.
+std::atomic<uint64_t> g_uncached_read_count{0};
+
+}  // namespace
+
+uint64_t iceberg_delete_data_uncached_read_count()
+{
+  return g_uncached_read_count.load(std::memory_order_relaxed);
+}
+
+void clear_iceberg_delete_data_cache()
+{
+  std::lock_guard lk{g_delete_data_cache_mtx};
+  g_delete_data_cache.clear();
+}
+
+namespace {
+
+std::shared_ptr<const IcebergDeleteData> read_iceberg_delete_data_uncached(
   duckdb::ClientContext& context,
   std::string const& table_path,
   sirius::io::sirius_ioctx* metadata_ioctx,
   std::optional<uint64_t> snapshot_id)
 {
+  g_uncached_read_count.fetch_add(1, std::memory_order_relaxed);
+
   auto data = std::make_shared<IcebergDeleteData>();
 
   if (metadata_ioctx == nullptr) {
@@ -470,6 +501,69 @@ std::shared_ptr<const IcebergDeleteData> read_iceberg_delete_data(
   }
 
   return data;
+}
+
+}  // namespace
+
+std::shared_ptr<const IcebergDeleteData> read_iceberg_delete_data(
+  duckdb::ClientContext& context,
+  std::string const& table_path,
+  sirius::io::sirius_ioctx* metadata_ioctx,
+  std::optional<uint64_t> snapshot_id)
+{
+  // One query reads this three times: the planner generates the plan twice (iceberg_scan is
+  // not serializable, so validation is followed by a replan at execute), and the delete gate
+  // probes the same manifests before either. Each pass walks the manifest list, every
+  // manifest, and every positional-delete file a row at a time — on the planning thread.
+  //
+  // SCOPE IS PER QUERY, deliberately, and is NOT an arbitrary limitation:
+  //
+  //   - IcebergDeleteData owns EqualityDeleteGroups, which hold a GPU key table and a
+  //     prebuilt hash join. A cache that outlived the query would pin GPU memory and fight
+  //     QueryEnd's repository teardown. That alone rules out a cross-query cache.
+  //   - Within one query the three passes read the same snapshot by construction: same table
+  //     path, same snapshot argument, same instant. So a hit inside a query is always right.
+  //
+  // Do NOT "improve" this by resolving the latest snapshot id and keying on that to survive
+  // across queries. When snapshot_id is nullopt, discover_from_manifests calls
+  // iceberg_metadata() with no snapshot argument, which reads current-snapshot-id from the
+  // table metadata. Resolving "latest" independently (e.g. MAX(sequence_number) from
+  // iceberg_snapshots) disagrees with that after a rollback, and would file one snapshot's
+  // deletes under another snapshot's key — a worse failure than the cost it saves.
+  //
+  // The transaction id in the key is a belt, not the braces: the QueryBegin/QueryEnd hooks
+  // are what bound the lifetime, and this only narrows the blast radius if one of them does
+  // not fire. Residual, documented rather than papered over: two statements inside one
+  // explicit BEGIN/COMMIT share a transaction id, so if a hook were missed AND another writer
+  // committed to the table between them, the second could see the first's delete data.
+  // QueryEnd fires per statement, including inside a transaction, so this needs a hook
+  // failure to reach.
+  std::string key;
+  try {
+    key = std::to_string(context.ActiveTransaction().global_transaction_id) + "|" + table_path +
+          "|" + (snapshot_id.has_value() ? std::to_string(*snapshot_id) : "current");
+  } catch (...) {
+    // No usable transaction identity: skip the cache rather than key it ambiguously.
+    return read_iceberg_delete_data_uncached(context, table_path, metadata_ioctx, snapshot_id);
+  }
+
+  {
+    std::lock_guard lk{g_delete_data_cache_mtx};
+    if (auto it = g_delete_data_cache.find(key); it != g_delete_data_cache.end()) {
+      SIRIUS_LOG_DEBUG("[iceberg] delete-data cache hit for '{}'", table_path);
+      return it->second;
+    }
+  }
+
+  // Built outside the lock: this reads manifests and delete files and can throw. Errors must
+  // propagate (never cached, never softened into "no deletes"), and a concurrent duplicate
+  // build is wasteful but harmless, whereas holding the lock across the read would serialize
+  // planning across every iceberg scan in the process.
+  auto data = read_iceberg_delete_data_uncached(context, table_path, metadata_ioctx, snapshot_id);
+
+  std::lock_guard lk{g_delete_data_cache_mtx};
+  auto [it, inserted] = g_delete_data_cache.emplace(key, std::move(data));
+  return it->second;
 }
 
 std::unordered_map<std::string, int32_t> extract_field_id_map(

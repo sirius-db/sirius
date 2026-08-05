@@ -30,6 +30,7 @@
 #include <signal.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <op/scan/iceberg_metadata_reader.hpp>
 #include <utils/sirius_test_env.hpp>
 #include <utils/transparent_execution_test_utils.hpp>
 
@@ -725,6 +726,31 @@ class GPUExecutionIcebergFixture : public MultiFormatFixtureBase {
 // run_conformance.py, which isolates each case in its own process behind a timeout.
 // Wire them up here once the scan declines at PLAN time instead of failing at runtime.
 //===----------------------------------------------------------------------===//
+
+TEST_CASE_METHOD(GPUExecutionIcebergFixture,
+                 "gpu_execution iceberg - delete data is read once per query",
+                 "[integration][gpu_execution][iceberg]")
+{
+  // The planner builds the plan TWICE for an iceberg scan -- iceberg_scan is not serializable,
+  // so validation is followed by a replan at execute -- and each build walked the manifest list,
+  // every manifest, and every positional-delete file a row at a time, on the planning thread.
+  //
+  // Asserting on a counter rather than a log line is deliberate: release builds compile
+  // INFO/DEBUG logging out, so there is no observable signal at this level, and a green suite
+  // would only show the memo did not corrupt results -- not that it removed any work. Without
+  // the memo this delta is 2; the memo is what makes it 1. If someone later breaks it, the cost
+  // does not quietly return, this fails.
+  require_delete_files(v2_path, 1);
+
+  auto const before = sirius::op::scan::iceberg_delete_data_uncached_read_count();
+  auto result       = con->Query("SELECT count(*) FROM iceberg_scan('" + v2_path + "');");
+  REQUIRE(result);
+  REQUIRE_FALSE(result->HasError());
+  auto const after = sirius::op::scan::iceberg_delete_data_uncached_read_count();
+
+  UNSCOPED_INFO("manifest-walking delete reads for one query: " << (after - before));
+  CHECK(after - before == 1);
+}
 
 TEST_CASE_METHOD(GPUExecutionIcebergFixture,
                  "gpu_execution iceberg - conformance append-only matches pyiceberg",
