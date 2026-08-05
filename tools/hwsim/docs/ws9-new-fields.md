@@ -77,12 +77,20 @@ Keys emitted (one-time, per session):
 
 | kind | keys |
 |---|---|
-| string | `host.name`; `gpu.<id>.name`; `scan_manager.io_backend` (`"uring"`\|`"kvikio"`) |
-| i64 | `hw.num_gpus`, `hw.num_numa_nodes`, `hw.host_cores`; `gpu.<id>.numa_node`, `gpu.<id>.sm_count`, `gpu.<id>.sm_clock_khz`, `gpu.<id>.mem_clock_khz`, `gpu.<id>.mem_bus_width_bits` (each `gpu.<id>.*` hw attr omitted if the CUDA attribute query fails); `memory.gpu<dev>.capacity_bytes`, `memory.gpu<dev>.reservation_limit_bytes`, `memory.host<numa>.capacity_bytes`, `memory.host<numa>.reservation_limit_bytes`, `memory.disk<id>.capacity_bytes`; `executor.num_threads`, `task_creator.num_threads`, `downgrade.num_threads`, `downgrade.monitor_period_ms`; `scan_manager.num_threads`, `scan_manager.uring_n_reactors`, `scan_manager.rest_n_reactors`, `scan_manager.prefetch_cache_enabled` (0/1), `scan_manager.cache.inflight_io_chunk_budget`; `operator.scan_task_batch_size`, `operator.hash_partition_bytes`; `telemetry.batch_events` (0/1) |
+| string | `host.name`; `gpu.<id>.name`; `scan_manager.io_backend` (`"uring"`\|`"kvikio"`); `late_mat.pin_unique_cols` (raw `SIRIUS_LATE_MAT_PIN_UNIQUE_COLS` value; omitted when unset/empty) |
+| i64 | `hw.num_gpus`, `hw.num_numa_nodes`, `hw.host_cores`; `gpu.<id>.numa_node`, `gpu.<id>.sm_count`, `gpu.<id>.sm_clock_khz`, `gpu.<id>.mem_clock_khz`, `gpu.<id>.mem_bus_width_bits` (each `gpu.<id>.*` hw attr omitted if the CUDA attribute query fails); `memory.gpu<dev>.capacity_bytes`, `memory.gpu<dev>.reservation_limit_bytes`, `memory.host<numa>.capacity_bytes`, `memory.host<numa>.reservation_limit_bytes`, `memory.disk<id>.capacity_bytes`; `executor.num_threads`, `task_creator.num_threads`, `downgrade.num_threads`, `downgrade.monitor_period_ms`; `scan_manager.num_threads`, `scan_manager.uring_n_reactors`, `scan_manager.rest_n_reactors`, `scan_manager.prefetch_cache_enabled` (0/1), `scan_manager.memory_prefetcher.enabled` (0/1), `scan_manager.memory_prefetcher.num_threads`, `scan_manager.cache.inflight_io_chunk_budget`; `operator.scan_task_batch_size`, `operator.hash_partition_bytes`; `telemetry.batch_events` (0/1); `late_mat.enabled`, `late_mat.v2`, `late_mat.v3`, `late_mat.defer`, `late_mat.compressed`, `fused_scan_filter.enabled` (all 0/1) |
 | f64 | `scan_manager.cache.min_prefetching_budget_fraction`, `scan_manager.cache.eviction_threshold_fraction` |
 
 Notes: `<id>`/`<dev>`/`<numa>` are the numeric device / NUMA ids. `hw.host_cores` is
 `std::thread::hardware_concurrency()`. Dataset identity is still not in-trace.
+
+The `late_mat.*` / `fused_scan_filter.enabled` keys snapshot the PR #1409 experimental
+env gates (added post-merge; absent on traces from earlier binaries). Values are
+EFFECTIVE, not raw env: sub-gates imply their parents (`v3` ⇒ `v2` ⇒ `enabled`),
+`late_mat.defer` defaults ON under the main gate, and `late_mat.compressed` defaults
+OFF — matching the in-engine readers (`src/include/late_mat/column_origin.hpp`,
+`src/scan_manager/late_mat_defer_policy.cpp`). A trace with `late_mat.enabled=1` came
+from the compute-bound late-mat lane (see `tools/hwsim/docs/late-mat-lane.md`).
 
 ## 5. New entity: `io_request` (G1) — scan-split disk I/O
 

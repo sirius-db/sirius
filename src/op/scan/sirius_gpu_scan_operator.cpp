@@ -182,8 +182,8 @@ sirius_gpu_scan_operator::sirius_gpu_scan_operator(
   // Resolve the scan's dynamic-filter channel once (null for non-parquet
   // ingestibles): every split gets it stamped so prepare_for_processing can
   // snapshot membership filters at decode time.
-  if (auto const* pq = dynamic_cast<parquet_ingestible_table_info const*>(
-        &_ingestible->table_info())) {
+  if (auto const* pq =
+        dynamic_cast<parquet_ingestible_table_info const*>(&_ingestible->table_info())) {
     _dynamic_filters_channel = pq->sirius_dynamic_filters;
   }
   _native_physical_types.reserve(this->types.size());
@@ -344,9 +344,8 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::execute(
     // Owner = the previous view's owner AND the spliced columns (shared_ptr
     // pair — std::any requires copy-constructible owners).
     auto previous = std::make_shared<owning_table_view>(std::move(materialized_table.table));
-    materialized_table.table =
-      owning_table_view(std::make_pair(std::move(previous), std::move(holder)),
-                        cudf::table_view(spliced));
+    materialized_table.table = owning_table_view(
+      std::make_pair(std::move(previous), std::move(holder)), cudf::table_view(spliced));
     substituted_pre_filter = true;
   }
   if (materialized_table.state != filter_state::ROW_FILTERED_AND_PROJECTED) {
@@ -423,11 +422,11 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::execute(
       if (pos == defer.rowid_position()) {
         cols[pos] = std::move(rowid_col);
       } else {
-        cols[pos] = cudf::make_column_from_scalar(
-          cudf::numeric_scalar<std::int8_t>(0, true, stream),
-          static_cast<cudf::size_type>(n_rows),
-          stream,
-          mr);
+        cols[pos] =
+          cudf::make_column_from_scalar(cudf::numeric_scalar<std::int8_t>(0, true, stream),
+                                        static_cast<cudf::size_type>(n_rows),
+                                        stream,
+                                        mr);
       }
     }
     output_table = std::make_unique<cudf::table>(std::move(cols));
@@ -457,13 +456,18 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::execute(
         late_mat::batch_annotation{origin, *scan_input->late_mat_selection});
     }
     if (annotation) {
+      // Batch shape for telemetry, captured before the table is moved into
+      // the annotated representation (same rows/columns stamping as
+      // make_data_batch — see tools/hwsim/docs/ws9-new-fields.md §1).
+      const auto num_columns = static_cast<uint64_t>(output_table->num_columns());
       auto annotated_repr = std::make_unique<late_mat::origin_annotated_gpu_table_representation>(
         std::move(output_table), *mem_space, stream, std::move(annotation));
       const auto batch_id = sirius::get_next_batch_id();
       batch               = ::cucascade::data_batch::make(
         batch_id,
         std::move(annotated_repr),
-        telemetry::quent_data_batch_probe::create(batch_telemetry(), batch_id));
+        telemetry::quent_data_batch_probe::create(
+          batch_telemetry(), batch_id, static_cast<uint64_t>(n_rows), num_columns));
     }
   }
   if (!batch) {
