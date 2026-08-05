@@ -1,0 +1,3 @@
+row,query,knobs,median_sim_wall_ms,median_sim_baseline_ms,binding,forced_admissions,n
+E7-B3sim,13,gpu_compute=0.5,10754.9,5399.7,executor_threads,0,3
+E7-B3sim,21,gpu_compute=0.5,34561.4,17343.6,executor_threads,0,3
