@@ -35,41 +35,41 @@ namespace sirius::op::scan {
 
 namespace {
 
-static uint32_t read_u32_le(const uint8_t* p)
+uint32_t read_u32_le(const uint8_t* p)
 {
   uint32_t v;
   std::memcpy(&v, p, 4);
   return v;
 }
 
-static uint16_t read_u16_le(const uint8_t* p)
+uint16_t read_u16_le(const uint8_t* p)
 {
   uint16_t v;
   std::memcpy(&v, p, 2);
   return v;
 }
 
-static int64_t read_i64_le(const uint8_t* p)
+int64_t read_i64_le(const uint8_t* p)
 {
   int64_t v;
   std::memcpy(&v, p, 8);
   return v;
 }
 
-static int32_t read_i32_le(const uint8_t* p)
+int32_t read_i32_le(const uint8_t* p)
 {
   int32_t v;
   std::memcpy(&v, p, 4);
   return v;
 }
 
-static uint32_t read_u32_be(const uint8_t* p)
+uint32_t read_u32_be(const uint8_t* p)
 {
   return (static_cast<uint32_t>(p[0]) << 24) | (static_cast<uint32_t>(p[1]) << 16) |
          (static_cast<uint32_t>(p[2]) << 8) | static_cast<uint32_t>(p[3]);
 }
 
-static uint64_t read_u64_le(const uint8_t* p)
+uint64_t read_u64_le(const uint8_t* p)
 {
   uint64_t v;
   std::memcpy(&v, p, 8);
@@ -77,10 +77,10 @@ static uint64_t read_u64_le(const uint8_t* p)
 }
 
 // CRC-32, same polynomial as DuckDB's iceberg extension.
-static uint32_t crc32_table[256];
-static std::once_flag crc32_init_flag;
+uint32_t crc32_table[256];
+std::once_flag crc32_init_flag;
 
-static void init_crc32_table()
+void init_crc32_table()
 {
   for (uint32_t i = 0; i < 256; ++i) {
     uint32_t c = i;
@@ -91,7 +91,7 @@ static void init_crc32_table()
   }
 }
 
-static uint32_t compute_crc32(const uint8_t* data, size_t length)
+uint32_t compute_crc32(const uint8_t* data, size_t length)
 {
   std::call_once(crc32_init_flag, init_crc32_table);
   uint32_t crc = 0xFFFFFFFFu;
@@ -103,19 +103,14 @@ static uint32_t compute_crc32(const uint8_t* data, size_t length)
 
 // Roaring portable format, 32-bit: https://github.com/RoaringBitmap/RoaringFormatSpec
 // Appends the set values to @p out and returns the bytes consumed.
-static constexpr uint32_t SERIAL_COOKIE_NO_RUNCONTAINER = 12346;
-static constexpr uint32_t SERIAL_COOKIE                 = 12347;
+constexpr uint32_t SERIAL_COOKIE_NO_RUNCONTAINER = 12346;
+constexpr uint32_t SERIAL_COOKIE                 = 12347;
 
 /// Checks read as `remaining(...) < need` rather than `p + need > p_end` because `need` comes
 /// from the file, and forming a pointer past the end is UB even if only compared.
-static size_t remaining(const uint8_t* p, const uint8_t* p_end)
-{
-  return static_cast<size_t>(p_end - p);
-}
+size_t remaining(const uint8_t* p, const uint8_t* p_end) { return static_cast<size_t>(p_end - p); }
 
-static size_t deserialize_roaring32(const uint8_t* data,
-                                    size_t data_len,
-                                    std::vector<uint32_t>& out)
+size_t deserialize_roaring32(const uint8_t* data, size_t data_len, std::vector<uint32_t>& out)
 {
   if (data_len < 4) { throw std::runtime_error("roaring: buffer too small for cookie"); }
 

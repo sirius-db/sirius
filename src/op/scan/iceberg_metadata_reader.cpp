@@ -65,12 +65,11 @@ struct IcebergDeleteFileEntry {
   }
 };
 
-/// Everything discovered from a single manifest-list scan.
 struct IcebergManifestDiscovery {
   std::vector<std::string> positional_delete_files;
   std::vector<IcebergDeleteFileEntry> equality_delete_entries;
   std::vector<IcebergDeleteFileEntry> deletion_vector_entries;
-  /// Per-data-file sequence numbers (from data manifests, for eq delete filtering).
+  /// From the data manifests; equality deletes need them to test applicability.
   std::unordered_map<std::string, int64_t> data_file_sequence_numbers;
 };
 
@@ -244,7 +243,6 @@ void read_positional_delete_file(duckdb::DatabaseInstance& db,
   }
 }
 
-/// Result of reading an equality-delete parquet file.
 struct equality_delete_read_result {
   std::unique_ptr<cudf::table> tbl;
   std::vector<std::string> col_names;
@@ -305,7 +303,7 @@ equality_delete_read_result read_equality_delete_file(std::string const& delete_
   return {std::move(result.tbl), std::move(col_names), std::move(field_ids)};
 }
 
-/// Read all positional deletes + deletion vectors into a single map.
+/// Merges V2 positional deletes and V3 deletion vectors into one per-data-file map.
 void materialize_positional_deletes(duckdb::DatabaseInstance& db,
                                     IcebergManifestDiscovery const& files,
                                     std::unordered_map<std::string, std::vector<int64_t>>& out_map)
@@ -342,7 +340,6 @@ void materialize_positional_deletes(duckdb::DatabaseInstance& db,
   }
 }
 
-/// Build one EqualityDeleteGroup from a set of tables sharing the same schema.
 EqualityDeleteGroup build_equality_group(std::vector<std::string> key_names,
                                          std::vector<std::optional<int32_t>> key_field_ids,
                                          std::vector<cudf::table_view> const& views)
@@ -397,8 +394,7 @@ void materialize_equality_deletes(std::vector<IcebergDeleteFileEntry> const& eq_
   struct FileGroup {
     std::vector<std::string> key_names;
     std::vector<std::optional<int32_t>> key_field_ids;
-    std::vector<cudf::table_view> views;
-    std::vector<std::unique_ptr<cudf::table>> owned;
+    std::vector<std::unique_ptr<cudf::table>> tables;
     int64_t sequence_number;
   };
   std::vector<FileGroup> groups;
@@ -422,17 +418,19 @@ void materialize_equality_deletes(std::vector<IcebergDeleteFileEntry> const& eq_
     auto const [it, inserted] = group_index.emplace(std::move(key), groups.size());
     if (inserted) {
       groups.push_back(
-        {read_result.col_names, read_result.field_ids, {}, {}, eq_entry.sequence_number});
+        {read_result.col_names, read_result.field_ids, {}, eq_entry.sequence_number});
     }
-    auto& target = groups[it->second];
-
-    target.views.push_back(read_result.tbl->view());
-    target.owned.push_back(std::move(read_result.tbl));
+    groups[it->second].tables.push_back(std::move(read_result.tbl));
   }
 
   for (auto& g : groups) {
-    if (g.views.empty()) continue;
-    auto group = build_equality_group(std::move(g.key_names), std::move(g.key_field_ids), g.views);
+    if (g.tables.empty()) continue;
+    std::vector<cudf::table_view> views;
+    views.reserve(g.tables.size());
+    for (auto const& table : g.tables) {
+      views.push_back(table->view());
+    }
+    auto group = build_equality_group(std::move(g.key_names), std::move(g.key_field_ids), views);
     group.sequence_number = g.sequence_number;
     data.equality_delete_groups.push_back(std::move(group));
   }
@@ -445,12 +443,11 @@ void materialize_equality_deletes(std::vector<IcebergDeleteFileEntry> const& eq_
 
 namespace {
 
-/// Per-query memo for read_iceberg_delete_data. See the wrapper below for why it is keyed and
-/// scoped the way it is; see clear_iceberg_delete_data_cache() for why it must be cleared.
+/// Per-query memo; the wrapper below explains the key and the scope.
 std::mutex g_delete_data_cache_mtx;
 std::unordered_map<std::string, std::shared_ptr<const IcebergDeleteData>> g_delete_data_cache;
 
-/// Incremented on every read that actually walks the manifests. See the header.
+/// See the header.
 std::atomic<uint64_t> g_uncached_read_count{0};
 
 }  // namespace

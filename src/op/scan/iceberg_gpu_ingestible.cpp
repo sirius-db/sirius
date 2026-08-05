@@ -200,9 +200,8 @@ void iceberg_gpu_ingestible::build_delete_key_map(
   for (auto const& [delete_key, positions] : _delete_data->positional_deletes) {
     if (!positions.empty()) { manifest_keys.push_back(&delete_key); }
   }
-  for (auto const& [data_file, sequence_number] : _delete_data->data_file_sequence_numbers) {
-    (void)sequence_number;
-    manifest_keys.push_back(&data_file);
+  for (auto const& entry : _delete_data->data_file_sequence_numbers) {
+    manifest_keys.push_back(&entry.first);
   }
 
   for (auto const* delete_key_ptr : manifest_keys) {

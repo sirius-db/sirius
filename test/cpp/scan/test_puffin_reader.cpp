@@ -52,18 +52,23 @@ std::string fixture_puffin_path()
          "dv-00000-0-d7e8f9a0-0007-0007-0007-000000000002-00001.puffin";
 }
 
+/// Fixture paths are repo-relative, so a wrong cwd otherwise surfaces as a confusing parse error.
+std::string require_fixture(std::string path)
+{
+  if (!fs::exists(path)) {
+    FAIL("fixture '" << path
+                     << "' not found; these tests must run with the repo root as cwd, cwd is "
+                     << fs::current_path().string());
+  }
+  return path;
+}
+
 }  // namespace
 
 TEST_CASE("puffin reader reads the fixture deletion vector", "[scan][iceberg]")
 {
-  auto const path = fixture_puffin_path();
-  // Same cwd requirement as the iceberg integration cases: fixture paths are repo-relative.
-  if (!fs::exists(path)) {
-    FAIL("puffin fixture not found; these tests must run with the repo root as cwd, cwd is "
-         << fs::current_path().string());
-  }
-
-  auto const positions = read_deletion_vector(path, kBlobOffset, kBlobSize);
+  auto const positions =
+    read_deletion_vector(require_fixture(fixture_puffin_path()), kBlobOffset, kBlobSize);
 
   // The fixture deletes 2 of its 5 rows — the same 3 survivors the integration case asserts.
   REQUIRE(positions.size() == 2);
@@ -72,12 +77,7 @@ TEST_CASE("puffin reader reads the fixture deletion vector", "[scan][iceberg]")
 
 TEST_CASE("puffin reader accepts a file:// URI", "[scan][iceberg]")
 {
-  auto const path = fixture_puffin_path();
-  if (!fs::exists(path)) {
-    FAIL("puffin fixture not found; these tests must run with the repo root as cwd, cwd is "
-         << fs::current_path().string());
-  }
-
+  auto const path     = require_fixture(fixture_puffin_path());
   auto const expected = read_deletion_vector(path, kBlobOffset, kBlobSize);
 
   // What an Apache writer records: an absolute file:// URI. Before the reader stripped the
@@ -90,13 +90,9 @@ TEST_CASE("puffin reader rejects a non-Puffin file", "[scan][iceberg]")
 {
   // A parquet data file is not a Puffin container. Pointing the reader at one must fail rather
   // than return an empty position list, which would read as "this data file has no deletes".
-  auto const not_puffin = std::string(
+  auto const not_puffin = require_fixture(
     "test/cpp/integration/data/iceberg_v3_deletion_vector/data/"
     "00000-0-d7e8f9a0-0007-0007-0007-000000000001-00001.parquet");
-  if (!fs::exists(not_puffin)) {
-    FAIL("fixture not found; these tests must run with the repo root as cwd, cwd is "
-         << fs::current_path().string());
-  }
 
   REQUIRE_THROWS(read_deletion_vector(not_puffin, kBlobOffset, kBlobSize));
 }
