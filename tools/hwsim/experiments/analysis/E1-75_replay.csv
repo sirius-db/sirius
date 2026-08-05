@@ -1,0 +1,6 @@
+row,query,knobs,median_sim_wall_ms,median_sim_baseline_ms,binding,forced_admissions,n
+E1-75-replay,1,none,8451.9,8451.9,executor_threads,0,3
+E1-75-replay,9,none,13047.0,13047.0,executor_threads,0,3
+E1-75-replay,13,none,5955.9,5955.9,executor_threads,0,3
+E1-75-replay,19,none,8610.6,8610.6,executor_threads,0,3
+E1-75-replay,21,none,18575.1,18575.1,executor_threads,0,3

@@ -1,0 +1,7 @@
+*
+!.gitignore
+!runs.csv
+!analysis/
+analysis/*
+!analysis/*.csv
+!analysis/*.json

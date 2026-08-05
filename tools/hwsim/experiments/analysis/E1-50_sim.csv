@@ -1,0 +1,6 @@
+row,query,knobs,median_sim_wall_ms,median_sim_baseline_ms,binding,forced_admissions,n
+E1-50,1,gpu_compute=0.50,15645.3,7842.7,executor_threads,0,3
+E1-50,9,gpu_compute=0.50,24847.9,12494.7,executor_threads,0,3
+E1-50,13,gpu_compute=0.50,10853.3,5452.1,executor_threads,0,3
+E1-50,19,gpu_compute=0.50,16785.0,8440.9,executor_threads,0,3
+E1-50,21,gpu_compute=0.50,34760.6,17447.0,executor_threads,0,3
