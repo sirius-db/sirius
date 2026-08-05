@@ -41,6 +41,7 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace sirius::op::scan {
@@ -159,8 +160,11 @@ IcebergManifestDiscovery discover_from_manifests(duckdb::ClientContext& context,
   static constexpr auto kExisting        = "EXISTING";
   static constexpr auto kFormatPuffin    = "PUFFIN";
 
-  // Cached by path: several DVs can share one manifest, and each would otherwise re-read it.
-  std::unordered_map<std::string, std::vector<IcebergDeleteFileEntry>> dv_manifest_cache;
+  // iceberg_metadata() returns one PUFFIN row per deletion vector, but read_avro returns ALL of
+  // a manifest's vectors at once — so a manifest must be expanded exactly once. Keyed on the
+  // manifest rather than the row: N vectors in one manifest would otherwise yield N² entries,
+  // and materialize_positional_deletes opens the Puffin file once per entry.
+  std::unordered_set<std::string> expanded_manifests;
 
   while (true) {
     auto chunk = meta_result->Fetch();
@@ -176,10 +180,12 @@ IcebergManifestDiscovery discover_from_manifests(duckdb::ClientContext& context,
         if (file_format == kFormatPuffin) {
           // iceberg_metadata() omits the V3 fields, so re-read the manifest via read_avro.
           auto manifest_path = chunk->GetValue(4, i).ToString();
-          auto& cached       = dv_manifest_cache[manifest_path];
-          if (cached.empty()) { cached = read_deletion_vectors_from_manifest(conn, manifest_path); }
-          for (auto& dv : cached) {
-            if (dv.is_deletion_vector()) { result.deletion_vector_entries.push_back(dv); }
+          if (expanded_manifests.insert(manifest_path).second) {
+            for (auto& dv : read_deletion_vectors_from_manifest(conn, manifest_path)) {
+              if (dv.is_deletion_vector()) {
+                result.deletion_vector_entries.push_back(std::move(dv));
+              }
+            }
           }
         } else {
           result.positional_delete_files.push_back(std::move(filepath));
@@ -396,6 +402,10 @@ void materialize_equality_deletes(std::vector<IcebergDeleteFileEntry> const& eq_
     int64_t sequence_number;
   };
   std::vector<FileGroup> groups;
+  // Indexed rather than scanned: every commit can write a delete file at a NEW sequence number,
+  // so the group count grows with the file count and a linear search per file would compare
+  // O(files²) name vectors.
+  std::unordered_map<std::string, std::size_t> group_index;
 
   for (auto const& eq_entry : eq_entries) {
     SIRIUS_LOG_DEBUG("[iceberg] Reading equality-delete file: {} (seq={})",
@@ -403,21 +413,21 @@ void materialize_equality_deletes(std::vector<IcebergDeleteFileEntry> const& eq_
                      eq_entry.sequence_number);
     auto read_result = read_equality_delete_file(eq_entry.file_path, ioctx);
 
-    FileGroup* target = nullptr;
-    for (auto& g : groups) {
-      if (g.key_names == read_result.col_names && g.sequence_number == eq_entry.sequence_number) {
-        target = &g;
-        break;
-      }
-    }
-    if (!target) {
-      groups.push_back(
-        {read_result.col_names, read_result.field_ids, {}, {}, eq_entry.sequence_number});
-      target = &groups.back();
+    std::string key = std::to_string(eq_entry.sequence_number);
+    for (auto const& name : read_result.col_names) {
+      key += '\0';  // not a legal column-name character, so the join is unambiguous
+      key += name;
     }
 
-    target->views.push_back(read_result.tbl->view());
-    target->owned.push_back(std::move(read_result.tbl));
+    auto const [it, inserted] = group_index.emplace(std::move(key), groups.size());
+    if (inserted) {
+      groups.push_back(
+        {read_result.col_names, read_result.field_ids, {}, {}, eq_entry.sequence_number});
+    }
+    auto& target = groups[it->second];
+
+    target.views.push_back(read_result.tbl->view());
+    target.owned.push_back(std::move(read_result.tbl));
   }
 
   for (auto& g : groups) {

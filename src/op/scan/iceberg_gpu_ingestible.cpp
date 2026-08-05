@@ -165,17 +165,32 @@ void iceberg_gpu_ingestible::build_delete_key_map(
   // binder resolved. A key that fails to match finds no deletes and returns deleted rows while
   // looking healthy, so the correspondence is established once here and ambiguity declines the
   // scan. Two paths name one file when one is a suffix of the other on a component boundary.
-  auto same_file = [&](std::string_view a_in, std::string_view b_in) {
-    auto const a_str = sirius::io::strip_file_scheme(a_in);
-    auto const b_str = sirius::io::strip_file_scheme(b_in);
-    std::string_view a{a_str};
-    std::string_view b{b_str};
+  auto same_file = [](std::string_view a, std::string_view b) {
     if (a == b) { return true; }
     std::string_view longer  = a.size() >= b.size() ? a : b;
     std::string_view shorter = a.size() >= b.size() ? b : a;
     if (shorter.empty() || !longer.ends_with(shorter)) { return false; }
     return longer[longer.size() - shorter.size() - 1] == '/';
   };
+
+  auto basename = [](std::string_view path) {
+    auto const slash = path.find_last_of('/');
+    return slash == std::string_view::npos ? path : path.substr(slash + 1);
+  };
+
+  // Matching implies an identical final path component, so indexing the scanned paths by that
+  // component finds every candidate without comparing against all of them. Comparing each key
+  // against every file would be O(keys × files) — quadratic in the number of data files, on the
+  // planning thread — and would re-strip both paths on every one of those comparisons.
+  std::vector<std::string> stripped;  // owns the views held by the index below
+  stripped.reserve(resolved_file_paths.size());
+  for (auto const& resolved : resolved_file_paths) {
+    stripped.push_back(sirius::io::strip_file_scheme(resolved));
+  }
+  std::unordered_map<std::string_view, std::vector<std::size_t>> scanned_by_basename;
+  for (std::size_t i = 0; i < stripped.size(); ++i) {
+    scanned_by_basename[basename(stripped[i])].push_back(i);
+  }
 
   // Both manifest-keyed maps need translating: a table with only equality deletes has no
   // positional entries, so positional_deletes alone would leave this empty.
@@ -193,17 +208,21 @@ void iceberg_gpu_ingestible::build_delete_key_map(
   for (auto const* delete_key_ptr : manifest_keys) {
     auto const& delete_key = *delete_key_ptr;
 
+    auto const key_stripped  = sirius::io::strip_file_scheme(delete_key);
     std::string const* match = nullptr;
-    for (auto const& resolved : resolved_file_paths) {
-      if (!same_file(delete_key, resolved)) { continue; }
-      if (match != nullptr) {
-        throw duckdb::NotImplementedException(
-          "iceberg table '{}': delete file entry '{}' matches more than one scanned data file, so "
-          "its deleted rows cannot be attributed",
-          _table_path,
-          delete_key);
+    if (auto const bucket = scanned_by_basename.find(basename(key_stripped));
+        bucket != scanned_by_basename.end()) {
+      for (auto const index : bucket->second) {
+        if (!same_file(key_stripped, stripped[index])) { continue; }
+        if (match != nullptr) {
+          throw duckdb::NotImplementedException(
+            "iceberg table '{}': delete file entry '{}' matches more than one scanned data file, "
+            "so its deleted rows cannot be attributed",
+            _table_path,
+            delete_key);
+        }
+        match = &resolved_file_paths[index];
       }
-      match = &resolved;
     }
 
     if (match == nullptr) {
