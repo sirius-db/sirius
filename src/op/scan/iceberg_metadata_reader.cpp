@@ -47,17 +47,7 @@ namespace sirius::op::scan {
 
 namespace {
 
-// =========================================================================
-// Path discovery (from Avro manifests)
-// =========================================================================
-
-/**
- * @brief One file entry from an Iceberg manifest.
- *
- * Covers equality-delete files (content=2) and V3 deletion vectors
- * (file_format="puffin" with offset info). Local to this translation unit:
- * nothing outside it names this type.
- */
+/// One file entry from an Iceberg manifest: equality-delete files and V3 deletion vectors.
 struct IcebergDeleteFileEntry {
   std::string file_path;
   int content{0};                     // 0=DATA, 1=POSITION_DELETES, 2=EQUALITY_DELETES
@@ -67,9 +57,7 @@ struct IcebergDeleteFileEntry {
   int64_t content_size_in_bytes{-1};  // byte length of DV blob (V3, -1 if absent)
   int64_t sequence_number{0};         // manifest entry sequence number (for eq delete filtering)
 
-  /// True if this entry is a V3 deletion vector (Puffin format with offset info).
-  /// file_format must already be lowercased by whoever read it — see
-  /// read_deletion_vectors_from_manifest, which does so in SQL.
+  /// Requires file_format already lowercased by the reader.
   [[nodiscard]] bool is_deletion_vector() const
   {
     return file_format == "puffin" && content_offset >= 0 && content_size_in_bytes > 0;
@@ -85,7 +73,6 @@ struct IcebergManifestDiscovery {
   std::unordered_map<std::string, int64_t> data_file_sequence_numbers;
 };
 
-/// Escape single quotes for safe SQL interpolation.
 std::string escape_sql_string(std::string const& s)
 {
   std::string out = s;
@@ -95,19 +82,9 @@ std::string escape_sql_string(std::string const& s)
   return out;
 }
 
-/**
- * @brief Read the POSITION_DELETES entries of one manifest via DuckDB's avro reader.
- *
- * Only reached for manifests iceberg_metadata() has already reported a PUFFIN entry in, so the
- * V3 fields are present; a manifest without them is a malformed pairing and the binder error
- * propagates. @p conn must already be bracketed as an internal query.
- *
- * `lower(file_format)` is load-bearing: Iceberg writes "PUFFIN" uppercase and
- * is_deletion_vector() compares against "puffin", so without the fold every entry fails the
- * test and the table reads as having no deletes — silently wrong rather than an error. The
- * COALESCEs reproduce the struct's defaults (-1/-1/"") so a NULL never reaches
- * GetValue<int64_t>().
- */
+/// Reads one manifest's POSITION_DELETES entries. @p conn must already be bracketed as an
+/// internal query. `lower()` is load-bearing: Iceberg writes "PUFFIN" but is_deletion_vector()
+/// tests "puffin", and without the fold the table reads as having no deletes.
 std::vector<IcebergDeleteFileEntry> read_deletion_vectors_from_manifest(
   duckdb::Connection& conn, std::string const& manifest_path)
 {
@@ -122,10 +99,7 @@ std::vector<IcebergDeleteFileEntry> read_deletion_vectors_from_manifest(
     "WHERE data_file.content = 1");
 
   if (!result || result->HasError()) {
-    // Same rule as discover_from_manifests: an unreadable manifest must not degrade into an
-    // empty entry list, because empty means "no deletion vectors here" and the scan would then
-    // return rows the table deleted. A null result is folded in here rather than dereferenced,
-    // for the same reason: it must not read as an absence of deletes.
+    // Never degrade to an empty list: that means "no deletion vectors" and returns deleted rows.
     throw std::runtime_error("[iceberg] Failed to read manifest '" + manifest_path +
                              "': " + (result ? result->GetError() : "null result"));
   }
@@ -149,11 +123,9 @@ std::vector<IcebergDeleteFileEntry> read_deletion_vectors_from_manifest(
   return entries;
 }
 
-/// Discover all delete files and data file metadata using DuckDB's iceberg_metadata().
-/// Delegates ALL Avro/manifest parsing to DuckDB's iceberg extension — handles all
-/// manifest versions, codecs, catalog types, and snapshot selection automatically.
-/// V3 deletion vectors need a second look at the manifest via read_avro, because
-/// iceberg_metadata() doesn't expose content_offset/size/referenced_data_file.
+/// Discovers delete files and data-file metadata via iceberg_metadata(), which handles every
+/// manifest version, codec and catalog type. V3 deletion vectors need a second pass through
+/// read_avro: iceberg_metadata() does not expose content_offset/size/referenced_data_file.
 IcebergManifestDiscovery discover_from_manifests(duckdb::ClientContext& context,
                                                  std::string const& table_path,
                                                  std::optional<uint64_t> snapshot_id)
@@ -161,9 +133,8 @@ IcebergManifestDiscovery discover_from_manifests(duckdb::ClientContext& context,
   IcebergManifestDiscovery result;
 
   duckdb::Connection conn(*context.db);
-  // The internal-query bracket is per-connection, so the caller's guard does not cover this one.
-  // Unbracketed, these queries run the full transparent path, whose plan-generation window
-  // contends for the instance-wide slot the query being planned already holds.
+  // Per-connection bracket: the caller's guard does not cover this one, and unbracketed these
+  // queries contend for the instance-wide plan slot the query being planned already holds.
   duckdb::SiriusContext::InternalQueryGuard conn_guard(*conn.context);
   conn.Query("SET unsafe_enable_version_guessing = true");
 
@@ -178,10 +149,7 @@ IcebergManifestDiscovery discover_from_manifests(duckdb::ClientContext& context,
 
   auto meta_result = conn.Query(query);
   if (!meta_result || meta_result->HasError()) {
-    // Must throw, not return an empty discovery: an empty result reads as "this table has no
-    // delete files", so swallowing the error here turns "could not list the deletes" into
-    // "there are none" and the scan silently returns deleted rows. A null result is the same
-    // failure and takes the same exit.
+    // Empty would read as "this table has no delete files" and return deleted rows.
     throw std::runtime_error("[iceberg] iceberg_metadata() failed for '" + table_path +
                              "': " + (meta_result ? meta_result->GetError() : "null result"));
   }
@@ -191,8 +159,7 @@ IcebergManifestDiscovery discover_from_manifests(duckdb::ClientContext& context,
   static constexpr auto kExisting        = "EXISTING";
   static constexpr auto kFormatPuffin    = "PUFFIN";
 
-  // Cache manifest reads by path to avoid N+1 re-reads for multiple DVs
-  // in the same manifest (iceberg_metadata() doesn't expose DV-specific fields).
+  // Cached by path: several DVs can share one manifest, and each would otherwise re-read it.
   std::unordered_map<std::string, std::vector<IcebergDeleteFileEntry>> dv_manifest_cache;
 
   while (true) {
@@ -207,9 +174,7 @@ IcebergManifestDiscovery discover_from_manifests(duckdb::ClientContext& context,
       if (content == kPositionDeletes) {
         auto file_format = chunk->GetValue(3, i).ToString();
         if (file_format == kFormatPuffin) {
-          // V3 deletion vector: iceberg_metadata() doesn't expose content_offset,
-          // content_size, or referenced_data_file, so we read the containing
-          // manifest directly through read_avro to pick them up.
+          // iceberg_metadata() omits the V3 fields, so re-read the manifest via read_avro.
           auto manifest_path = chunk->GetValue(4, i).ToString();
           auto& cached       = dv_manifest_cache[manifest_path];
           if (cached.empty()) { cached = read_deletion_vectors_from_manifest(conn, manifest_path); }
@@ -243,31 +208,19 @@ IcebergManifestDiscovery discover_from_manifests(duckdb::ClientContext& context,
   return result;
 }
 
-// =========================================================================
-// Content readers
-// =========================================================================
-
-/**
- * @brief Read a positional-delete parquet file and append its records to @p out_map.
- *
- * Uses DuckDB's CPU-based read_parquet to avoid a wasteful GPU round-trip
- * (delete files are tiny metadata — no reason to allocate GPU memory).
- * The file must have schema: { file_path VARCHAR, pos BIGINT }.
- */
+/// Appends one positional-delete file's records to @p out_map. Schema must be
+/// { file_path VARCHAR, pos BIGINT }. CPU read: these files are tiny metadata.
 void read_positional_delete_file(duckdb::DatabaseInstance& db,
                                  std::string const& delete_file_path,
                                  std::unordered_map<std::string, std::vector<int64_t>>& out_map)
 {
   duckdb::Connection conn(db);
-  // Bracketed for the reason given in discover_from_manifests.
   duckdb::SiriusContext::InternalQueryGuard conn_guard(*conn.context);
 
   auto result = conn.Query("SELECT file_path, pos FROM read_parquet('" +
                            escape_sql_string(delete_file_path) + "')");
 
   if (!result || result->HasError()) {
-    // Throws for the reason given in discover_from_manifests: unread deletes must never become
-    // no deletes. A null result is that same failure.
     throw std::runtime_error("[iceberg] Failed to read positional-delete file '" +
                              delete_file_path +
                              "': " + (result ? result->GetError() : "null result"));
@@ -292,31 +245,15 @@ struct equality_delete_read_result {
   std::vector<std::optional<int32_t>> field_ids;
 };
 
-/**
- * @brief Read an equality-delete parquet file and return table, column names, and field IDs.
- *
- * Uses GPU-accelerated cudf::io::read_parquet because equality-delete tables
- * can be large and columnar, and the result feeds directly into a GPU-side
- * cudf::distinct_hash_join — so keeping data on device avoids a round-trip.
- *
- * Also reads the parquet footer to extract Iceberg field IDs for each key
- * column, enabling schema-evolution-safe matching against data files.
- *
- * Routes both cudf::io::read_parquet (table) and cudf::io::read_parquet_footers
- * (field-id extraction) through the supplied single-GPU sirius_ioctx. The
- * caller MUST provide a non-null ioctx — this entry point does not implement
- * a kvikio bypass (callers that want the bundled cudf datasource use it
- * directly outside this helper; multi-GPU mode requires sirius_datasource and
- * is enforced by sirius_config::enforce_sirius_datasource_for_multi_gpu()).
- */
+/// Reads an equality-delete file into a GPU table, plus its column names and Iceberg field ids.
+/// Stays on device because the result feeds a cudf::distinct_hash_join directly. @p ioctx must
+/// be non-null: this entry point has no kvikio bypass.
 equality_delete_read_result read_equality_delete_file(std::string const& delete_file_path,
                                                       sirius::io::sirius_ioctx& ioctx)
 {
   auto stream = cudf::get_default_stream();
 
-  // Both the read_parquet (table data) AND the read_parquet_footers (field-id
-  // extraction) share the same sirius_datasource — its io_object opens 2 fds
-  // (O_RDONLY + O_RDONLY|O_DIRECT) so reusing avoids reopening for the footer pass.
+  // One datasource for both passes: its io_object opens 2 fds, so reusing avoids a reopen.
   auto datasource = ioctx.open_datasource(delete_file_path);
 
   auto opts =
@@ -335,10 +272,7 @@ equality_delete_read_result read_equality_delete_file(std::string const& delete_
 
   std::vector<std::optional<int32_t>> field_ids;
   try {
-    // Hand the same datasource to the footer pass. The table read above has already
-    // completed, so transferring ownership here is safe; `sources` then keeps it alive for the
-    // duration of read_parquet_footers. The function returns by value (result.tbl, col_names,
-    // field_ids) and retains no handle to it.
+    // The table read has completed, so moving ownership to the footer pass is safe.
     std::vector<std::unique_ptr<cudf::io::datasource>> sources;
     sources.push_back(std::move(datasource));
     auto footers = cudf::io::read_parquet_footers(sources);
@@ -365,16 +299,11 @@ equality_delete_read_result read_equality_delete_file(std::string const& delete_
   return {std::move(result.tbl), std::move(col_names), std::move(field_ids)};
 }
 
-// =========================================================================
-// Materialization helpers
-// =========================================================================
-
 /// Read all positional deletes + deletion vectors into a single map.
 void materialize_positional_deletes(duckdb::DatabaseInstance& db,
                                     IcebergManifestDiscovery const& files,
                                     std::unordered_map<std::string, std::vector<int64_t>>& out_map)
 {
-  // V2 positional-delete parquet files (CPU read via DuckDB).
   if (!files.positional_delete_files.empty()) {
     SIRIUS_LOG_INFO("[iceberg] Loading {} positional-delete file(s).",
                     files.positional_delete_files.size());
@@ -384,8 +313,7 @@ void materialize_positional_deletes(duckdb::DatabaseInstance& db,
     }
   }
 
-  // V3 deletion vectors from Puffin files.
-  // Per iceberg spec, deletion vectors supersede positional deletes for the same data file.
+  // Per spec, deletion vectors supersede positional deletes for the same data file.
   if (!files.deletion_vector_entries.empty()) {
     SIRIUS_LOG_INFO("[iceberg] Loading {} deletion vector(s).",
                     files.deletion_vector_entries.size());
@@ -395,7 +323,6 @@ void materialize_positional_deletes(duckdb::DatabaseInstance& db,
                        dv_entry.file_path);
       auto positions = read_deletion_vector(
         dv_entry.file_path, dv_entry.content_offset, dv_entry.content_size_in_bytes);
-      // DVs supersede V2 positional deletes for the same data file — overwrite.
       out_map[dv_entry.referenced_data_file] = std::move(positions);
     }
   }
@@ -451,9 +378,8 @@ EqualityDeleteGroup build_equality_group(std::vector<std::string> key_names,
   return group;
 }
 
-/// Read equality deletes, group by (schema + sequence number), build per-group hash joins.
-/// This matches DuckDB's approach: each group has exactly one sequence number,
-/// so the scan-time check is a simple CPU comparison (no extra GPU work).
+/// Groups equality deletes by (schema, sequence number) so the scan-time applicability check is
+/// one CPU comparison per group.
 void materialize_equality_deletes(std::vector<IcebergDeleteFileEntry> const& eq_entries,
                                   sirius::io::sirius_ioctx& ioctx,
                                   IcebergDeleteData& data)
@@ -462,7 +388,6 @@ void materialize_equality_deletes(std::vector<IcebergDeleteFileEntry> const& eq_
 
   SIRIUS_LOG_INFO("[iceberg] Loading {} equality-delete file(s).", eq_entries.size());
 
-  // Group delete files by (column names + sequence number).
   struct FileGroup {
     std::vector<std::string> key_names;
     std::vector<std::optional<int32_t>> key_field_ids;
@@ -478,7 +403,6 @@ void materialize_equality_deletes(std::vector<IcebergDeleteFileEntry> const& eq_
                      eq_entry.sequence_number);
     auto read_result = read_equality_delete_file(eq_entry.file_path, ioctx);
 
-    // Find existing group with same column names AND same sequence number.
     FileGroup* target = nullptr;
     for (auto& g : groups) {
       if (g.key_names == read_result.col_names && g.sequence_number == eq_entry.sequence_number) {
@@ -496,7 +420,6 @@ void materialize_equality_deletes(std::vector<IcebergDeleteFileEntry> const& eq_
     target->owned.push_back(std::move(read_result.tbl));
   }
 
-  // Build one EqualityDeleteGroup per (schema, sequence_number).
   for (auto& g : groups) {
     if (g.views.empty()) continue;
     auto group = build_equality_group(std::move(g.key_names), std::move(g.key_field_ids), g.views);
@@ -509,10 +432,6 @@ void materialize_equality_deletes(std::vector<IcebergDeleteFileEntry> const& eq_
 }
 
 }  // anonymous namespace
-
-// =========================================================================
-// Public API
-// =========================================================================
 
 namespace {
 
@@ -555,14 +474,11 @@ std::shared_ptr<const IcebergDeleteData> read_iceberg_delete_data_uncached(
       "sirius_ioctx (this entry point does not implement a kvikio fallback).");
   }
 
-  // Errors propagate. This function used to swallow every exception and return empty delete
-  // data described as "treating as V1" — but an empty result is indistinguishable from a table
-  // that genuinely has no deletes, so a failure to READ the deletes became a silent decision to
-  // IGNORE them, and the scan returned rows the table had deleted. Its caller must decide what
-  // an unreadable manifest means; for the planner that means declining the GPU scan and letting
-  // DuckDB read the table.
-  //
-  // Single-pass discovery: reads manifest list once, each manifest once.
+  // Errors propagate rather than degrading to empty delete data: empty is indistinguishable
+  // from a table that genuinely has no deletes, so swallowing here would turn a failure to READ
+  // the deletes into a decision to IGNORE them, and the scan would return deleted rows. The
+  // caller decides what an unreadable manifest means; for the planner that is declining the GPU
+  // scan and letting DuckDB read the table.
   auto discovery = discover_from_manifests(context, table_path, snapshot_id);
 
   bool has_pos_deletes =
@@ -593,33 +509,17 @@ std::shared_ptr<const IcebergDeleteData> read_iceberg_delete_data(
   sirius::io::sirius_ioctx* metadata_ioctx,
   std::optional<uint64_t> snapshot_id)
 {
-  // One query reads this three times: the planner generates the plan twice (iceberg_scan is
-  // not serializable, so validation is followed by a replan at execute), and the delete gate
-  // probes the same manifests before either. Each pass walks the manifest list, every
-  // manifest, and every positional-delete file a row at a time — on the planning thread.
+  // One query reads this three times: iceberg_scan is not serializable, so the plan is generated
+  // twice, and the delete gate probes the manifests before either.
   //
-  // SCOPE IS PER QUERY, deliberately, and is NOT an arbitrary limitation:
+  // Per query, deliberately. EqualityDeleteGroups hold a GPU key table and a prebuilt hash join,
+  // so a longer-lived entry would pin GPU memory; and within one query the three passes read the
+  // same snapshot by construction, so a hit is always right.
   //
-  //   - IcebergDeleteData owns EqualityDeleteGroups, which hold a GPU key table and a
-  //     prebuilt hash join. A cache that outlived the query would pin GPU memory and fight
-  //     QueryEnd's repository teardown. That alone rules out a cross-query cache.
-  //   - Within one query the three passes read the same snapshot by construction: same table
-  //     path, same snapshot argument, same instant. So a hit inside a query is always right.
-  //
-  // Do NOT "improve" this by resolving the latest snapshot id and keying on that to survive
-  // across queries. When snapshot_id is nullopt, discover_from_manifests calls
-  // iceberg_metadata() with no snapshot argument, which reads current-snapshot-id from the
-  // table metadata. Resolving "latest" independently (e.g. MAX(sequence_number) from
-  // iceberg_snapshots) disagrees with that after a rollback, and would file one snapshot's
-  // deletes under another snapshot's key — a worse failure than the cost it saves.
-  //
-  // The transaction id in the key is a belt, not the braces: the QueryBegin/QueryEnd hooks
-  // are what bound the lifetime, and this only narrows the blast radius if one of them does
-  // not fire. Residual, documented rather than papered over: two statements inside one
-  // explicit BEGIN/COMMIT share a transaction id, so if a hook were missed AND another writer
-  // committed to the table between them, the second could see the first's delete data.
-  // QueryEnd fires per statement, including inside a transaction, so this needs a hook
-  // failure to reach.
+  // Do NOT widen this by resolving "latest" and keying on the resolved id: with snapshot_id
+  // unset, iceberg_metadata() reads current-snapshot-id from the table metadata, and resolving
+  // latest independently disagrees with that after a rollback — filing one snapshot's deletes
+  // under another's key.
   std::string key;
   try {
     key = std::to_string(context.ActiveTransaction().global_transaction_id) + "|" + table_path +

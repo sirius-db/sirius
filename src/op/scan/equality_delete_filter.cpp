@@ -45,21 +45,13 @@ std::unique_ptr<cudf::table> equality_delete_filter::apply(std::unique_ptr<cudf:
   auto const n_rows = tbl->num_rows();
   if (n_rows == 0) { return tbl; }
 
-  // Sequence number filtering: per Iceberg spec, equality deletes only apply
-  // to data files whose sequence number is strictly LOWER than the delete's.
-  // Each group has exactly one sequence number (grouped by schema + seq).
-  //
-  // Applicability is per data file, but the mask below is per batch, so a batch mixing files
-  // that disagree cannot be served by one mask. Rather than silently applying one file's
-  // answer to another's rows, that case is refused — the caller's job is to keep such files
-  // out of the same batch. It is unreachable while the planner routes equality deletes to CPU.
+  // Per spec, equality deletes apply only to data files with a strictly lower sequence number.
+  // That is a per-file answer, but the mask below is per batch, so a batch mixing files that
+  // disagree is refused: keeping them apart is the caller's job.
   auto const& group = _delete_data->equality_delete_groups[_group_index];
 
-  // A data file whose sequence number we cannot find is REFUSED, not assumed deletable. The
-  // lookup is keyed on the path the manifest recorded, and the caller translates each run to
-  // that form; a miss therefore means the translation did not cover this file, and answering
-  // "the deletes apply" would remove rows whose data file may well post-date the delete. That
-  // is the silent-wrong direction, so it throws and takes the runtime fallback instead.
+  // An unknown file is refused rather than assumed deletable: answering "applies" would delete
+  // rows from a data file that may post-date the delete.
   auto applies_to = [&](std::string const& path) {
     if (group.sequence_number <= 0) { return true; }
     auto seq_it = _delete_data->data_file_sequence_numbers.find(path);
@@ -92,13 +84,8 @@ std::unique_ptr<cudf::table> equality_delete_filter::apply(std::unique_ptr<cudf:
     return tbl;
   }
 
-  // Verify all key columns are present in this chunk.
-  //
-  // Returning the batch unchanged here would drop the group's deletes and hand back rows the
-  // table deleted — the silent-wrong failure this path exists to prevent. A key column absent
-  // from the decoded batch means the planner's projection widening did not reach the scan, so
-  // it is a defect in this code, not a table we can serve; throwing turns it into a runtime
-  // fallback with correct rows.
+  // Missing key column means projection widening never reached the scan. Returning the batch
+  // unchanged would drop this group's deletes and hand back deleted rows.
   for (auto idx : _data_key_indices) {
     if (idx >= static_cast<cudf::size_type>(tbl->num_columns())) {
       throw std::invalid_argument("[equality_delete_filter] equality-delete key column index " +
@@ -108,12 +95,10 @@ std::unique_ptr<cudf::table> equality_delete_filter::apply(std::unique_ptr<cudf:
     }
   }
 
-  // Project data chunk to the equality key columns.
   auto data_key_view = tbl->select(_data_key_indices);
 
   auto build_indices = group.hash_join->left_join(data_key_view, stream);
 
-  // Anti-join mask entirely on GPU — no host roundtrip.
   auto bool_col = make_anti_join_mask(*build_indices, n_rows, stream);
 
   return cudf::apply_boolean_mask(tbl->view(), bool_col->view(), stream, mr);

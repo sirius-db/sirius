@@ -57,8 +57,7 @@ namespace sirius::planner {
 
 namespace {
 
-/// Collect every Iceberg field id in the bound schema, descending into nested children so a
-/// struct's fields count toward the id space they actually occupy.
+/// Descends into children so a struct's fields count toward the id space they occupy.
 void collect_field_ids(std::vector<duckdb::MultiFileColumnDefinition> const& columns,
                        std::vector<int32_t>& out)
 {
@@ -72,28 +71,26 @@ void collect_field_ids(std::vector<duckdb::MultiFileColumnDefinition> const& col
 }
 
 /**
- * @brief Refuse tables whose Iceberg field-id space has a gap, which means a column was dropped.
+ * @brief Refuse tables whose Iceberg field-id space has a gap, meaning a column was dropped.
  *
  * Iceberg never reuses a field id, so a column dropped and re-added under the same name gets a
- * NEW id and is absent from older data files — it must read NULL there. This path resolves
- * projected columns by NAME, so it finds the dropped column instead and returns data the table
- * removed, with no error and no fallback.
+ * NEW id and must read NULL in older data files. This path resolves columns by NAME, so it finds
+ * the dropped column and returns data the table removed, with no error and no fallback.
  *
- * With no drops, N fields occupy ids 1..N, so `max > count` means an id was retired. The ids are
- * already in the bind data; this opens no files.
+ * With no drops N fields occupy ids 1..N, so `max > count` means an id was retired. Reads only
+ * bind data, opens no files.
  *
- * A pre-filter, not the whole test: a plain ADDED column keeps the space contiguous and slips
- * through, but that case fails loudly rather than returning wrong rows. The real fix is resolving
- * by field id, which DuckDB's MultiFileColumnMapper already implements.
+ * A PRE-FILTER, not the whole test: a plain ADDED column keeps the space contiguous and slips
+ * through, but that case fails loudly instead of returning wrong rows. Resolving by field id is
+ * the complete fix; DuckDB's MultiFileColumnMapper already implements it.
  */
 std::optional<std::string> iceberg_retired_field_id_decline_reason(duckdb::LogicalGet& op)
 {
   auto const* bind_data = dynamic_cast<duckdb::MultiFileBindData const*>(op.bind_data.get());
   if (bind_data == nullptr) { return std::nullopt; }
 
-  // `reader_bind.schema` is the schema the multi-file reader itself set — for iceberg that is
-  // the Iceberg schema, and the only one carrying field ids. `columns` is the generic column
-  // list and may leave `identifier` null, so it is the fallback, not the source of truth.
+  // `reader_bind.schema` is the Iceberg schema and the only one carrying field ids; the generic
+  // `columns` list may leave `identifier` null, so it is a fallback only.
   std::vector<int32_t> field_ids;
   collect_field_ids(
     bind_data->reader_bind.schema.empty() ? bind_data->columns : bind_data->reader_bind.schema,
@@ -109,23 +106,17 @@ std::optional<std::string> iceberg_retired_field_id_decline_reason(duckdb::Logic
          "read a dropped column's data in place of the re-added one";
 }
 
-// Why an `iceberg_scan` table must decline the GPU scan path, or nullopt when it may run there.
+// Why an `iceberg_scan` table must decline the GPU path, or nullopt when it may run there.
 //
-// The GPU path now applies V2 positional deletes and V3 deletion vectors (which
-// `iceberg_metadata()` reports as content='POSITION_DELETES' with file_format='PUFFIN', and
-// which merge into the same per-file position map). Equality deletes are not applied: they
-// match on key VALUES, so the scan must force-project the key columns even when the query does
-// not select them, which is not wired. Those tables still go to DuckDB.
+// V2 positional deletes and V3 deletion vectors are applied on GPU. Equality deletes are not:
+// they match on key VALUES, so the scan must force-project the key columns even when the query
+// does not select them, which is not wired.
 //
-// Conservative by construction: any failure to PROVE the table free of equality deletes —
-// absent path, failed query, unexpected result shape — declines to DuckDB CPU. A false positive
-// costs performance; a false negative would silently drop deletes and corrupt results, so the
-// asymmetry is deliberate.
+// Conservative by construction: any failure to PROVE the table free of equality deletes declines
+// to CPU. A false positive costs performance; a false negative would drop deletes silently.
 //
-// The conservatism is right; the DIAGNOSTIC used to lie. Every decline reported itself as
-// "this table has equality-delete files", including declines that never managed to look. On a
-// table with no version hint the probe's own query errored, so a table with ZERO delete files
-// was reported as having unsupported ones. Each decline now carries the reason it actually hit.
+// Each decline returns the reason it actually hit — a probe that never managed to look is not
+// the same as a table that really carries equality deletes.
 std::optional<std::string> iceberg_gpu_scan_decline_reason(duckdb::LogicalGet& op,
                                                            duckdb::ClientContext& context)
 {
@@ -143,23 +134,14 @@ std::optional<std::string> iceberg_gpu_scan_decline_reason(duckdb::LogicalGet& o
     return "iceberg_scan table path is empty, so its delete files cannot be inspected";
   }
 
-  // iceberg_scan offers THREE ways to pick a snapshot: snapshot_from_id, snapshot_from_timestamp
-  // and version. The delete path honours only the first — build_iceberg_table_info reads
-  // snapshot_from_id and passes nullopt otherwise, so discover_from_manifests resolves deletes
-  // against the table's CURRENT snapshot while the scan reads the time-travelled one. Data from
-  // snapshot A filtered by snapshot B's deletes returns rows A had removed, or removes rows it
-  // had not: silently wrong, in the same family as resolving columns by name.
+  // iceberg_scan has three snapshot selectors; the delete path honours only snapshot_from_id,
+  // so the others would resolve deletes against the CURRENT snapshot while the scan reads the
+  // time-travelled one — filtering snapshot A's data by snapshot B's deletes.
   //
-  // Declining is conservative: a table with no deletes time-travels perfectly well, and this
-  // sends it to DuckDB anyway. Narrowing it requires knowing whether deletes exist AT THE
-  // SELECTED snapshot, which needs the very selector resolution that is missing — and probing
-  // the current snapshot does not answer it, since a table can carry deletes at an older
-  // snapshot and none at HEAD.
-  //
-  // To lift this: thread the full snapshot selector (not just snapshot_from_id) through
-  // build_iceberg_table_info into read_iceberg_delete_data AND into its cache key. The cache
-  // key matters as much as the read — it currently records snapshot_from_id or "current", so
-  // two different timestamps against one table would otherwise collide on one entry.
+  // Deliberately coarse: narrowing it to tables that actually have deletes at the SELECTED
+  // snapshot needs the very selector resolution that is missing. To lift it, thread the full
+  // selector into read_iceberg_delete_data AND into its cache key — the key currently records
+  // snapshot_from_id or "current", so two timestamps against one table would collide.
   for (auto const& selector : {"snapshot_from_timestamp", "version"}) {
     auto it = op.named_parameters.find(selector);
     if (it != op.named_parameters.end() && !it->second.IsNull()) {
@@ -171,7 +153,6 @@ std::optional<std::string> iceberg_gpu_scan_decline_reason(duckdb::LogicalGet& o
 
   if (auto reason = iceberg_retired_field_id_decline_reason(op)) { return reason; }
 
-  // Escape single quotes for SQL string embedding.
   std::string escaped;
   escaped.reserve(table_path.size());
   for (char c : table_path) {

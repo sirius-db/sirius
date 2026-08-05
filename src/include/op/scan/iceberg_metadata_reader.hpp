@@ -41,45 +41,32 @@ namespace sirius::op::scan {
 struct EqualityDeleteGroup {
   /// GPU-resident deduplicated key table.
   std::unique_ptr<cudf::table> delete_table;
-  /// Column names (parallel to table columns).
   std::vector<std::string> key_names;
-  /// Iceberg field IDs for each key column (populated when available).
+  /// Populated when the delete file's footer carries them.
   std::vector<std::optional<int32_t>> key_field_ids;
-  /// Pre-built GPU hash join (build side = delete_table).
+  /// Build side = delete_table.
   std::unique_ptr<cudf::distinct_hash_join> hash_join;
-  /// Sequence number of the delete file(s) in this group.
-  /// Per Iceberg spec, this group only applies to data files with
-  /// data_file_sequence_number < this value (strictly lower).
+  /// Applies only to data files with a STRICTLY lower sequence number.
   int64_t sequence_number{0};
 };
 
 /**
  * @brief Fully materialized Iceberg delete data for one table.
  *
- * All I/O (positional deletes, deletion vectors, equality deletes) happens at PLAN time, in
- * read_iceberg_delete_data() via build_iceberg_table_info(), on internal connections that are
- * each bracketed by their own InternalQueryGuard. Planning is also why the per-query memo is
- * cleared on the QueryEnd hook and not inside the execution window — see
- * clear_iceberg_delete_data_cache().
- *
- * Immutable after construction and shared (via shared_ptr<const>) across the operator, task
- * creator, and delete filters.
+ * All delete I/O happens at PLAN time, on internal connections each bracketed by their own
+ * InternalQueryGuard — which is also why the memo is cleared on QueryEnd rather than inside the
+ * execution window; see clear_iceberg_delete_data_cache(). Immutable after construction.
  */
 struct IcebergDeleteData {
-  /// V2 positional deletes + V3 deletion vectors (merged, sorted).
-  /// Key: data_file_path, Value: sorted deleted row positions.
-  /// Stored on CPU (tiny metadata).
+  /// V2 positional deletes and V3 deletion vectors merged: data_file_path -> sorted positions.
   std::unordered_map<std::string, std::vector<int64_t>> positional_deletes;
 
-  /// V2 equality-delete groups (one per unique key-column schema).
-  /// Supports heterogeneous delete files (e.g., delete by "name" vs "name+bir").
+  /// One per unique (key-column schema, sequence number).
   std::vector<EqualityDeleteGroup> equality_delete_groups;
 
-  /// Per-data-file sequence numbers (for equality delete seq filtering).
-  /// Key: data_file_path, Value: sequence number from manifest entry.
+  /// data_file_path -> manifest sequence number, keyed as the MANIFEST wrote the path.
   std::unordered_map<std::string, int64_t> data_file_sequence_numbers;
 
-  /// True if there are no deletes to apply (V1 table or empty manifests).
   [[nodiscard]] bool empty() const
   {
     return positional_deletes.empty() && equality_delete_groups.empty();
@@ -87,35 +74,17 @@ struct IcebergDeleteData {
 };
 
 /**
- * @brief Read and fully materialize Iceberg delete data for the given table.
+ * @brief Read and fully materialize every kind of delete for one table.
  *
- * Consolidates all delete-related I/O into one call:
- *   1. Discovers delete file paths via iceberg_metadata(), plus a read_avro pass
- *      over a manifest when a V3 deletion vector needs its Puffin offsets.
- *   2. Reads V2 positional-delete parquet files (CPU via DuckDB).
- *   3. Reads V3 deletion vectors from Puffin files (CPU).
- *   4. Reads V2 equality-delete parquet files (GPU via cuDF).
- *   5. Deduplicates equality deletes and builds the GPU hash join.
+ * Caller must suppress DuckDB side-effects (InternalQueryGuard).
  *
- * Caller must ensure DuckDB side-effects are suppressed (InternalQueryGuard).
+ * THROWS on any failure to read the manifests or delete files, so an empty result means "this
+ * table has no deletes" and never "the deletes could not be read" — treating the second as the
+ * first drops deletes silently and returns rows the table removed.
  *
- * THROWS on any failure to read the manifests or delete files. An empty result therefore
- * means "this table has no deletes", never "the deletes could not be read" — the two must not
- * be confused, because acting on the second as if it were the first drops deletes silently and
- * returns rows the table logically removed.
- *
- * @param context        DuckDB client context for running iceberg_metadata()
- *                       and reading positional-delete parquet files.
- * @param table_path     The Iceberg table path passed to iceberg_scan().
- * @param metadata_ioctx Non-owning sirius_ioctx for routing parquet reads
- *                       (V2 equality-delete files + footer extraction). A
- *                       single GPU's ioctx is sufficient — these are
- *                       planning-time reads, not on the multi-GPU column-
- *                       chunk hot path. Multi-GPU residency for iceberg
- *                       metadata is deferred. Must outlive the call and be
- *                       non-null; nullptr throws.
- * @param snapshot_id    Optional Iceberg snapshot id (latest if omitted).
- * @return Shared pointer to immutable delete data.
+ * @param metadata_ioctx Routes the equality-delete parquet and footer reads. Single-GPU is
+ *                       sufficient (planning-time reads). Must outlive the call; nullptr throws.
+ * @param snapshot_id    Latest if omitted.
  */
 std::shared_ptr<const IcebergDeleteData> read_iceberg_delete_data(
   duckdb::ClientContext& context,
@@ -126,32 +95,16 @@ std::shared_ptr<const IcebergDeleteData> read_iceberg_delete_data(
 /**
  * @brief Drop everything the per-query delete-data cache is holding.
  *
- * MUST be called from the QueryEnd hook. Not from the execution window: this scan path
- * declines unsupported iceberg tables at PLAN time, after planning has filled the memo, and
- * such a query never opens an execution window — so a window-scoped clear would miss exactly
- * the entries most likely to go stale. Two reasons it must happen at all, and the second is
- * not optional:
- *
- * 1. Correctness. The cache exists only to collapse the repeated reads WITHIN one query
- *    (see read_iceberg_delete_data). An entry that outlives its query could answer for a
- *    table that has since been committed to, and returning a previous snapshot's deletes
- *    means returning rows the table has removed.
- * 2. Resources. IcebergDeleteData owns EqualityDeleteGroups, and those hold a GPU key table
- *    and a prebuilt hash join. Holding them past the query pins GPU memory.
+ * MUST be called from the QueryEnd hook, not the execution window: a table declined at plan
+ * time never opens one, and those entries are exactly the ones that would go stale. An entry
+ * outliving its query could serve a previous snapshot's deletes; it also pins the GPU key table
+ * and hash join its EqualityDeleteGroups own.
  */
 void clear_iceberg_delete_data_cache();
 
-/**
- * @brief Count of delete-data reads that actually walked the manifests (cache MISSES).
- *
- * The point of the cache is that one query performs this work once rather than repeatedly.
- * Release builds compile INFO/DEBUG logging out, so a log line cannot demonstrate that, and
- * a passing test only shows the memo did not corrupt results — not that it eliminated any
- * work. This counter makes the claim measurable, and turns "the memo silently stopped
- * hitting" into a test failure instead of a cost that quietly returns.
- *
- * Monotonic for the process lifetime; tests take a delta around a query.
- */
+/// Cache MISSES: reads that actually walked the manifests. Release builds compile the logging
+/// out, so this is what lets a test assert the memo still collapses the repeat reads rather than
+/// merely not corrupting them. Monotonic; tests take a delta around a query.
 uint64_t iceberg_delete_data_uncached_read_count();
 
 /**

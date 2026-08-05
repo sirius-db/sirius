@@ -90,9 +90,9 @@ TEST_CASE("puffin reader rejects a non-Puffin file", "[scan][iceberg]")
 {
   // A parquet data file is not a Puffin container. Pointing the reader at one must fail rather
   // than return an empty position list, which would read as "this data file has no deletes".
-  auto const not_puffin =
-    std::string("test/cpp/integration/data/iceberg_v3_deletion_vector/data/"
-                "00000-0-d7e8f9a0-0007-0007-0007-000000000001-00001.parquet");
+  auto const not_puffin = std::string(
+    "test/cpp/integration/data/iceberg_v3_deletion_vector/data/"
+    "00000-0-d7e8f9a0-0007-0007-0007-000000000001-00001.parquet");
   if (!fs::exists(not_puffin)) {
     FAIL("fixture not found; these tests must run with the repo root as cwd, cwd is "
          << fs::current_path().string());

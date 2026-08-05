@@ -37,18 +37,9 @@ namespace sirius::op::scan {
 
 namespace {
 
-//===----------------------------------------------------------------------===//
-// iceberg_batch_coalescer
-//===----------------------------------------------------------------------===//
-/**
- * @brief Wraps the parquet coalescer and suppresses reader-side filter pushdown.
- *
- * Batching is entirely the parquet coalescer's job; the only iceberg-specific decision is
- * that a split whose rows will be position-matched against a delete list must come back from
- * the reader with its rows intact. `disable_filter_pushdown` is the flag the parquet
- * materialize path already honours for that (it exists for FLBA-decimal files), and setting
- * it here also disables the dynamic-filter merge, which would drop rows for the same reason.
- */
+/// Wraps the parquet coalescer and suppresses reader-side filter pushdown: a split whose rows
+/// get position-matched against a delete list must come back with its rows intact. The flag also
+/// disables the dynamic-filter merge, which would drop rows for the same reason.
 class iceberg_batch_coalescer : public batch_coalescer {
  public:
   explicit iceberg_batch_coalescer(std::unique_ptr<batch_coalescer> inner)
@@ -87,9 +78,6 @@ class iceberg_batch_coalescer : public batch_coalescer {
 
 }  // namespace
 
-//===----------------------------------------------------------------------===//
-// build_batch_layout
-//===----------------------------------------------------------------------===//
 std::vector<batch_row_run> build_batch_layout(parquet_split_info const& split)
 {
   std::vector<batch_row_run> runs;
@@ -127,9 +115,6 @@ std::vector<batch_row_run> build_batch_layout(parquet_split_info const& split)
   return runs;
 }
 
-//===----------------------------------------------------------------------===//
-// iceberg_gpu_ingestible
-//===----------------------------------------------------------------------===//
 std::shared_ptr<iceberg_gpu_ingestible> make_ingestible(
   std::unique_ptr<iceberg_ingestible_table_info> info)
 {
@@ -139,7 +124,6 @@ std::shared_ptr<iceberg_gpu_ingestible> make_ingestible(
 iceberg_gpu_ingestible::iceberg_gpu_ingestible(std::unique_ptr<iceberg_ingestible_table_info> info)
   : parquet_gpu_ingestible(std::move(info))
 {
-  // The base owns the bind data now; read it back typed, the same way it does.
   auto const& bind = static_cast<iceberg_ingestible_table_info const&>(table_info());
   _delete_data     = bind.delete_data;
   _table_path      = bind.table_path;
@@ -150,10 +134,8 @@ iceberg_gpu_ingestible::iceberg_gpu_ingestible(std::unique_ptr<iceberg_ingestibl
       "'; the planner must resolve it (or decline the scan) before building the ingestible");
   }
 
-  // Hive-partition assembly happens inline in the parquet materialize step, and on that path
-  // the reader's predicate is applied before this class sees the table — which would break the
-  // row-position mapping deletes depend on. Iceberg tables do not travel with hive partition
-  // indices, so this is a guard on an unreachable shape rather than a limitation in practice.
+  // On the hive-partition path the reader's predicate is applied before this class sees the
+  // table, breaking the row-position mapping. Unreachable for iceberg; guarded anyway.
   if (!bind.partition_indices.empty() && !_delete_data->positional_deletes.empty()) {
     throw duckdb::NotImplementedException(
       "iceberg table '{}' combines hive partition columns with positional deletes, which the "
@@ -169,8 +151,6 @@ iceberg_gpu_ingestible::iceberg_gpu_ingestible(std::unique_ptr<iceberg_ingestibl
                      _delete_data->positional_deletes.size());
   }
 
-  // Equality deletes need their key columns force-projected into the scan; until that is
-  // wired, a table carrying them must not reach this class.
   if (!_delete_data->equality_delete_groups.empty()) {
     throw duckdb::NotImplementedException(
       "iceberg table '{}' carries equality deletes, which the GPU scan path does not apply yet",
@@ -181,16 +161,10 @@ iceberg_gpu_ingestible::iceberg_gpu_ingestible(std::unique_ptr<iceberg_ingestibl
 void iceberg_gpu_ingestible::build_delete_key_map(
   std::vector<std::string> const& resolved_file_paths)
 {
-  // The delete map is keyed on the data file path as the Iceberg manifest wrote it; the scan
-  // reads files at the paths DuckDB's multi-file binder resolved. Those are usually the same
-  // string, but "usually" is not good enough here: a key that fails to match simply finds no
-  // deletes for that file, and the scan returns deleted rows while looking healthy. So the
-  // correspondence is established once, explicitly, and a file whose deletes cannot be
-  // attributed to exactly one scanned file declines the whole scan to CPU.
-  // One is a suffix of the other on a path-component boundary — the relative/absolute case.
-  // Scheme stripping uses the shared helper so delete-key matching and the I/O layer agree on
-  // what "the same file" means; the local lambda this replaced was case-SENSITIVE, so a manifest
-  // written with `FILE://` would have failed to match and silently found no deletes for that file.
+  // The delete map is keyed on the path the manifest wrote; the scan reads the path DuckDB's
+  // binder resolved. A key that fails to match finds no deletes and returns deleted rows while
+  // looking healthy, so the correspondence is established once here and ambiguity declines the
+  // scan. Two paths name one file when one is a suffix of the other on a component boundary.
   auto same_file = [&](std::string_view a_in, std::string_view b_in) {
     auto const a_str = sirius::io::strip_file_scheme(a_in);
     auto const b_str = sirius::io::strip_file_scheme(b_in);
@@ -203,11 +177,8 @@ void iceberg_gpu_ingestible::build_delete_key_map(
     return longer[longer.size() - shorter.size() - 1] == '/';
   };
 
-  // Every manifest-side key the scan will look up has to be translated, not just the positional
-  // ones. equality_delete_filter resolves each run's path in data_file_sequence_numbers, which is
-  // keyed the same way — and a table carrying ONLY equality deletes has no positional entries at
-  // all, so building the map from those alone would leave it empty and every sequence lookup
-  // would miss.
+  // Both manifest-keyed maps need translating: a table with only equality deletes has no
+  // positional entries, so positional_deletes alone would leave this empty.
   std::vector<std::string const*> manifest_keys;
   manifest_keys.reserve(_delete_data->positional_deletes.size() +
                         _delete_data->data_file_sequence_numbers.size());
@@ -236,8 +207,7 @@ void iceberg_gpu_ingestible::build_delete_key_map(
     }
 
     if (match == nullptr) {
-      // The file may simply not be in this scan's file list (a snapshot that no longer
-      // references it). That is fine — deletes for unscanned files are irrelevant.
+      // Not in this scan's file list — deletes for unscanned files are irrelevant.
       SIRIUS_LOG_DEBUG(
         "[iceberg_gpu_ingestible] '{}': delete entry '{}' names a file this scan does not read",
         _table_path,
@@ -245,10 +215,8 @@ void iceberg_gpu_ingestible::build_delete_key_map(
       continue;
     }
     if (*match == delete_key) { continue; }
-    // The two key sources describe the same files and are both written by iceberg_metadata(), so
-    // they agree. If they ever did not, emplace would silently keep whichever was seen first and
-    // the other's lookups would miss — the failure this map exists to prevent — so disagreement
-    // is refused rather than resolved arbitrarily.
+    // Both key sources come from iceberg_metadata() and agree; were that untrue, emplace would
+    // keep whichever arrived first and the other's lookups would miss.
     auto const [it, inserted] = _delete_key_by_scan_path.emplace(*match, delete_key);
     if (!inserted && it->second != delete_key) {
       throw duckdb::NotImplementedException(
@@ -271,9 +239,7 @@ std::string const& iceberg_gpu_ingestible::delete_key_for(std::string const& sca
 std::unique_ptr<batch_coalescer> iceberg_gpu_ingestible::create_batch_coalescer() const
 {
   auto inner = parquet_gpu_ingestible::create_batch_coalescer();
-  // Only a table with deletes pays for pushdown suppression. An append-only iceberg table is a
-  // parquet scan in every respect, and taking reader-side row filtering away from it would be a
-  // pure loss — there are no positions to preserve.
+  // An append-only table has no positions to preserve, so it keeps reader-side filtering.
   if (_pipeline.empty()) { return inner; }
   return std::make_unique<iceberg_batch_coalescer>(std::move(inner));
 }
@@ -287,9 +253,8 @@ filtered_table iceberg_gpu_ingestible::materialize_metadata_to_table(
 
   if (_pipeline.empty()) { return base; }
 
-  // Deletes are position-matched, so they are only valid against a table whose rows are
-  // exactly the decoded rows in file order. Anything else means the reader filtered or the
-  // partition path assembled, and the mapping below would silently delete the wrong rows.
+  // Position-matched deletes require the decoded rows in file order; anything else means the
+  // reader filtered, and the mapping below would delete the wrong rows.
   if (base.state != filter_state::UNFILTERED) {
     throw sirius::internal_exception(
       "[iceberg_gpu_ingestible] '" + _table_path +
@@ -299,8 +264,7 @@ filtered_table iceberg_gpu_ingestible::materialize_metadata_to_table(
 
   auto const& split = static_cast<parquet_split_info const&>(info);
   auto layout       = build_batch_layout(split);
-  // Runs are keyed on the path the scan reads; the delete map is keyed on the path the manifest
-  // recorded. Translate once, here, using the correspondence established at construction.
+  // Runs carry the scan's path; the delete map is keyed on the manifest's.
   for (auto& run : layout) {
     run.data_file_path = delete_key_for(run.data_file_path);
   }
@@ -316,7 +280,7 @@ filtered_table iceberg_gpu_ingestible::materialize_metadata_to_table(
       std::to_string(expected_rows) + "; iceberg delete positions cannot be mapped");
   }
 
-  // Nothing to delete from, and release() on an empty handle would hand back a null table.
+  // release() on an empty handle would hand back a null table.
   if (expected_rows == 0) { return base; }
 
   rmm::device_async_resource_ref mr_ref(mem_space.get_default_allocator());
@@ -328,9 +292,8 @@ filtered_table iceberg_gpu_ingestible::materialize_metadata_to_table(
   }
 
   auto filtered = _pipeline.apply(std::move(table), layout, stream, mr_ref);
-  // The state is unchanged: deletes are not the scan's row filter, and
-  // post_filter_and_project must still apply the query predicate — after the deletes, which
-  // is the order Iceberg requires.
+  // State is unchanged: deletes are not the query predicate, which post_filter_and_project must
+  // still apply — after the deletes, as Iceberg requires.
   return filtered_table{owning_table_view{std::move(filtered)}, filter_state::UNFILTERED};
 }
 

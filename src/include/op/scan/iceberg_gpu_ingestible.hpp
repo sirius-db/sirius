@@ -27,50 +27,36 @@
 
 namespace sirius::op::scan {
 
-//===----------------------------------------------------------------------===//
-// iceberg_ingestible_table_info
-//===----------------------------------------------------------------------===//
 /**
  * @brief Parquet bind data plus the table's materialized Iceberg delete data.
  *
- * An Iceberg table's data files ARE parquet, and @c iceberg_scan resolves its manifests at
- * bind time into the same @c MultiFileBindData @c read_parquet produces — so everything the
- * parquet path needs is already carried by the base. The only thing iceberg adds is deletes.
+ * Iceberg data files ARE parquet, and @c iceberg_scan binds to the same @c MultiFileBindData
+ * @c read_parquet produces, so the base already carries everything but the deletes.
  */
 class iceberg_ingestible_table_info : public parquet_ingestible_table_info {
  public:
-  /// The table path passed to @c iceberg_scan; identity for logging and delete discovery.
+  /// As passed to @c iceberg_scan.
   std::string table_path;
 
-  /// Delete data resolved at plan time. Never null on this path: an unreadable manifest must
-  /// fail planning (CPU fallback), never arrive as "no deletes" — silently empty delete data
-  /// is how a V2 table returns rows it logically deleted while looking like a success.
+  /// Resolved at plan time, never null: an unreadable manifest must fail planning rather than
+  /// arrive as "no deletes", which is how a V2 table returns rows it deleted while looking fine.
   std::shared_ptr<const IcebergDeleteData> delete_data;
 };
 
-//===----------------------------------------------------------------------===//
-// iceberg_gpu_ingestible
-//===----------------------------------------------------------------------===//
 /**
  * @brief Parquet ingestible that applies Iceberg deletes to each decoded batch.
  *
- * Extends @c parquet_gpu_ingestible rather than reimplementing it: reading the data files is
- * identical, and only two things change.
+ * Only two things differ from the base:
  *
- * 1. @ref create_batch_coalescer wraps the parquet coalescer to force reader-side filter
- *    pushdown off for every emitted split. Positional deletes and deletion vectors are keyed
- *    on a row's position within its data file; if the reader drops rows during decode, the
- *    decoded rows no longer line up with file positions and the mapping cannot be recovered.
- *    The scan's predicate is still applied — @c post_filter_and_project applies it after
- *    deletes, which is also the required order.
+ * 1. @ref create_batch_coalescer forces reader-side pushdown off for every split. Positional
+ *    deletes are keyed on a row's position within its file, so rows dropped during decode make
+ *    the mapping unrecoverable. The predicate still runs, in @c post_filter_and_project, after
+ *    the deletes — the order Iceberg requires. Row-group PRUNING stays on: it only removes rows
+ *    the predicate could not match, and the footer still gives the survivors' offsets.
  *
- * 2. @ref materialize_metadata_to_table decodes through the base, then applies the delete
- *    pipeline to the result. Row-group pruning stays enabled: it only removes rows the
- *    predicate could not have matched, and the surviving row groups' file offsets are known
- *    from the footer.
+ * 2. @ref materialize_metadata_to_table decodes through the base, then applies the pipeline.
  *
- * Equality deletes are NOT applied here yet — they need the key columns force-projected into
- * the scan, which the planner does not do. The planner declines tables carrying them.
+ * Equality deletes are declined by the planner: they need their key columns force-projected.
  */
 class iceberg_gpu_ingestible : public parquet_gpu_ingestible {
  public:
@@ -83,17 +69,15 @@ class iceberg_gpu_ingestible : public parquet_gpu_ingestible {
                                                rmm::cuda_stream_view stream) override;
 
  private:
-  /// Establish which scanned data file each delete-map key refers to. Manifest paths and the
-  /// paths DuckDB resolved are usually identical strings, and a mismatch would silently find no
-  /// deletes for that file, so the correspondence is resolved once and ambiguity is refused.
+  /// Resolves which scanned file each manifest-side key refers to, once. A mismatch would
+  /// silently find no deletes for that file, so ambiguity is refused.
   void build_delete_key_map(std::vector<std::string> const& resolved_file_paths);
 
   /// The delete-map key for a path the scan reads; the path itself when they already agree.
   [[nodiscard]] std::string const& delete_key_for(std::string const& scan_path) const;
 
   std::shared_ptr<const IcebergDeleteData> _delete_data;
-  /// Delete stages to run, in order. Empty when the table has no deletes, in which case this
-  /// behaves exactly like the parquet ingestible apart from the pushdown suppression.
+  /// Empty when the table has no deletes, which also leaves pushdown enabled.
   iceberg_delete_pipeline _pipeline;
   std::string _table_path;
   /// Scan path -> delete-map key, only for the paths where the two spellings differ.

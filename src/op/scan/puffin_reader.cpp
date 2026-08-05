@@ -27,18 +27,13 @@
 #include <string>
 #include <vector>
 
-// The integer readers below memcpy straight into the target type, so they are only correct on a
-// little-endian host. Iceberg fixes these fields as little-endian on the wire.
+// The readers below memcpy into the target type, so a big-endian host would decode garbage.
 static_assert(__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__,
               "puffin_reader decodes little-endian fields by direct memcpy");
 
 namespace sirius::op::scan {
 
 namespace {
-
-//===----------------------------------------------------------------------===//
-// Endian helpers
-//===----------------------------------------------------------------------===//
 
 static uint32_t read_u32_le(const uint8_t* p)
 {
@@ -81,10 +76,7 @@ static uint64_t read_u64_le(const uint8_t* p)
   return v;
 }
 
-//===----------------------------------------------------------------------===//
-// CRC-32 (same polynomial as DuckDB's iceberg extension)
-//===----------------------------------------------------------------------===//
-
+// CRC-32, same polynomial as DuckDB's iceberg extension.
 static uint32_t crc32_table[256];
 static std::once_flag crc32_init_flag;
 
@@ -109,23 +101,13 @@ static uint32_t compute_crc32(const uint8_t* data, size_t length)
   return crc ^ 0xFFFFFFFFu;
 }
 
-//===----------------------------------------------------------------------===//
-// Roaring portable format deserializer (32-bit)
-//
-// Reference: https://github.com/RoaringBitmap/RoaringFormatSpec
-//
-// Produces a list of set uint32 values from a single serialized Roaring bitmap.
-// Returns the number of bytes consumed from the input.
-//===----------------------------------------------------------------------===//
-
-// Cookie values that identify the serialization format.
+// Roaring portable format, 32-bit: https://github.com/RoaringBitmap/RoaringFormatSpec
+// Appends the set values to @p out and returns the bytes consumed.
 static constexpr uint32_t SERIAL_COOKIE_NO_RUNCONTAINER = 12346;
 static constexpr uint32_t SERIAL_COOKIE                 = 12347;
 
-/// Bytes still readable at @p p. Bounds checks below are written as
-/// `remaining(p, p_end) < need` rather than `p + need > p_end`: forming a pointer past the end
-/// of the buffer is undefined behaviour even when the result is only compared, and `need` here
-/// comes from the file.
+/// Checks read as `remaining(...) < need` rather than `p + need > p_end` because `need` comes
+/// from the file, and forming a pointer past the end is UB even if only compared.
 static size_t remaining(const uint8_t* p, const uint8_t* p_end)
 {
   return static_cast<size_t>(p_end - p);
@@ -272,10 +254,6 @@ static size_t deserialize_roaring32(const uint8_t* data,
 
 }  // anonymous namespace
 
-//===----------------------------------------------------------------------===//
-// Public API
-//===----------------------------------------------------------------------===//
-
 std::vector<int64_t> read_deletion_vector(std::string const& puffin_path,
                                           int64_t content_offset,
                                           int64_t content_size_in_bytes)
@@ -286,12 +264,7 @@ std::vector<int64_t> read_deletion_vector(std::string const& puffin_path,
       " size=" + std::to_string(content_size_in_bytes));
   }
 
-  // Manifests written by Apache tooling carry URIs, and this reader opens the file directly
-  // rather than through sirius_ioctx — so the scheme stripping done at the datasource boundary
-  // (io_context.cpp) does not reach it. Without this, every deletion vector on a real Iceberg
-  // table fails to open and the table declines to CPU: the V3 path would appear simply never to
-  // engage, rather than to fail. Uses the shared helper so this agrees with the I/O layer and
-  // with delete-key matching on what a path means.
+  // Apache manifests record URIs; this reader bypasses sirius_ioctx, so nothing else strips them.
   auto const local_path = sirius::io::strip_file_scheme(puffin_path);
 
   std::ifstream f(local_path, std::ios::binary);
@@ -300,10 +273,8 @@ std::vector<int64_t> read_deletion_vector(std::string const& puffin_path,
                              (local_path == puffin_path ? "" : " (from '" + puffin_path + "')"));
   }
 
-  // Validate the container before trusting an offset into it. The blob's own magic and CRC
-  // (below) are not enough: a bare deletion-vector blob written with no container passes all of
-  // them, because none of them look at the file as a whole. Reading a blob at an offset into a
-  // file whose framing was never checked turns a wrong offset into wrong deletes, not an error.
+  // The blob's own magic and CRC below cannot catch a bare blob written with no container, so a
+  // wrong offset would silently yield wrong deletes. Check the framing first.
   static constexpr char kPuffinMagic[4] = {'P', 'F', 'A', '1'};
   char magic[4];
   f.read(magic, 4);
@@ -329,8 +300,7 @@ std::vector<int64_t> read_deletion_vector(std::string const& puffin_path,
                              " bytes from " + puffin_path);
   }
 
-  // Parse deletion-vector-v1 blob format.
-  // Layout: [4B BE combined_length] [4B magic] [roaring_vector] [4B BE CRC-32]
+  // deletion-vector-v1: [4B BE combined_length][4B magic][roaring_vector][4B BE CRC-32]
   auto const blob_size = blob.size();
   if (blob_size < 12) {
     throw std::runtime_error("[puffin] Blob too small (" + std::to_string(blob_size) +
@@ -342,7 +312,6 @@ std::vector<int64_t> read_deletion_vector(std::string const& puffin_path,
   uint32_t combined_length = read_u32_be(p);
   p += 4;
 
-  // Verify magic: 0xD1D33964
   static constexpr uint8_t DV_MAGIC[4] = {0xD1, 0xD3, 0x39, 0x64};
   if (std::memcmp(p, DV_MAGIC, 4) != 0) {
     throw std::runtime_error("[puffin] Deletion vector magic mismatch in " + puffin_path);
@@ -351,8 +320,7 @@ std::vector<int64_t> read_deletion_vector(std::string const& puffin_path,
   const uint8_t* checksummed_start = p;
   p += 4;  // skip magic
 
-  // CRC-32 covers magic + roaring_vector (combined_length bytes total).
-  // After the checksummed region: 4-byte BE CRC-32.
+  // combined_length covers magic + roaring_vector; the CRC follows it.
   size_t checksummed_len = combined_length;
   if (4 + checksummed_len + 4 > blob_size) {
     throw std::runtime_error(
@@ -360,7 +328,6 @@ std::vector<int64_t> read_deletion_vector(std::string const& puffin_path,
       " blob_size=" + std::to_string(blob_size));
   }
 
-  // Verify CRC-32
   const uint8_t* crc_ptr = checksummed_start + checksummed_len;
   uint32_t stored_crc    = read_u32_be(crc_ptr);
   uint32_t computed_crc  = compute_crc32(checksummed_start, checksummed_len);
@@ -379,10 +346,8 @@ std::vector<int64_t> read_deletion_vector(std::string const& puffin_path,
   p += 8;
   roaring_len -= 8;
 
-  // A negative count would skip the loop entirely and return an EMPTY position list, which reads
-  // as "this data file has no deleted rows" — the scan would then return rows the table deleted.
-  // The CRC above already covers this field, so reaching here means a writer emitted a valid
-  // checksum over a nonsensical count; refuse it rather than turn it into an absence of deletes.
+  // Negative would skip the loop and return an empty list, i.e. "no deleted rows". CRC-covered
+  // already, so this is defence in depth.
   if (num_bitmaps < 0) {
     throw std::runtime_error("[puffin] Negative bitmap count (" + std::to_string(num_bitmaps) +
                              ") in " + puffin_path);

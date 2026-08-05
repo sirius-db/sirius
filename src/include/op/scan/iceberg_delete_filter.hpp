@@ -33,21 +33,15 @@
 namespace sirius::op::scan {
 
 //===----------------------------------------------------------------------===//
-// batch_row_run — where a batch's rows came from
-//===----------------------------------------------------------------------===//
 /**
  * @brief One contiguous run of decoded rows, mapped back to its source file rows.
  *
- * Positional deletes and deletion vectors are keyed on
- * @c (data_file_path, row_position_within_that_file), so applying them requires knowing which
- * file row each decoded row is. A decoded batch is the concatenation of the selected row
- * groups of the split's files, in source order, so that mapping is a list of runs rather than
- * the single @c (path, first_row) pair the pre-removal hook assumed: one split can span
- * several files, and row-group pruning leaves gaps between the row groups of each file.
+ * Positional deletes are keyed on @c (data_file_path, row_position_within_that_file). A batch is
+ * the concatenation of the selected row groups of the split's files, so the mapping is a LIST of
+ * runs, not one @c (path, first_row) pair: a split can span files, and pruning leaves gaps.
  *
- * A run is only valid when nothing dropped rows between decode and here — which is why the
- * iceberg path disables reader-side filter pushdown. Rows removed inside the reader would
- * shift every subsequent row's position with no way to recover the mapping.
+ * Only valid while nothing drops rows between decode and here — which is why the iceberg path
+ * disables reader-side pushdown. A row removed in the reader shifts every later position.
  */
 struct batch_row_run {
   /// Data file these rows came from; the key into IcebergDeleteData::positional_deletes.
@@ -63,60 +57,26 @@ struct batch_row_run {
 /// The row provenance of one decoded batch, in batch row order.
 using batch_layout = std::span<batch_row_run const>;
 
-//===----------------------------------------------------------------------===//
-// Abstract delete filter interface
-//===----------------------------------------------------------------------===//
-
-/**
- * @brief Abstract interface for a single Iceberg delete filter stage.
- *
- * Concrete implementations handle V2 positional deletes (which V3 deletion vectors merge
- * into) and V2 equality deletes. Each filter is applied to one decoded batch at a time by
- * @ref iceberg_delete_pipeline, from the scan's materialize step.
- */
+/// One delete filter stage: V2 positional deletes (which V3 deletion vectors merge into) or V2
+/// equality deletes. Applied per decoded batch by @ref iceberg_delete_pipeline.
 class iceberg_delete_filter {
  public:
   virtual ~iceberg_delete_filter() = default;
 
-  /**
-   * @brief Apply this filter to a decoded batch.
-   *
-   * Called on a GPU worker thread on the task-local stream.
-   *
-   * @param tbl     The GPU table to filter.
-   * @param layout  Row provenance of @p tbl. Position-keyed filters use it; equality deletes
-   *                match on key values and ignore it.
-   * @param stream  CUDA stream for GPU operations.
-   * @param mr      Allocator for any result the filter allocates. Passing the scan's memory
-   *                space keeps the filtered table inside the engine's memory accounting.
-   * @return Filtered table (may be the same pointer if nothing was deleted).
-   */
+  /// Called on a GPU worker thread on the task-local stream. @p layout is used by position-keyed
+  /// filters and ignored by equality deletes. Returns @p tbl unchanged if nothing was deleted.
   virtual std::unique_ptr<cudf::table> apply(std::unique_ptr<cudf::table> tbl,
                                              batch_layout layout,
                                              rmm::cuda_stream_view stream,
                                              rmm::device_async_resource_ref mr) = 0;
 };
 
-// Forward declaration — full definition in iceberg_metadata_reader.hpp.
-struct IcebergDeleteData;
+struct IcebergDeleteData;  // iceberg_metadata_reader.hpp
 
-//===----------------------------------------------------------------------===//
-// Positional delete filter
-//===----------------------------------------------------------------------===//
-
-/**
- * @brief Applies Iceberg V2 positional deletes to each data batch.
- *
- * Holds a per-data-file map of sorted row positions to delete.  For each
- * batch the hook does a binary search to find positions in range, builds
- * a boolean mask, and applies cudf::apply_boolean_mask.
- */
+/// Applies V2 positional deletes: binary-searches the batch's range in a per-file map of sorted
+/// row positions, then applies a boolean mask.
 class positional_delete_filter : public iceberg_delete_filter {
  public:
-  /**
-   * @param delete_data  Shared ownership of the materialized delete data
-   *                     (keeps positional delete map alive for query lifetime).
-   */
   explicit positional_delete_filter(std::shared_ptr<const IcebergDeleteData> delete_data);
 
   std::unique_ptr<cudf::table> apply(std::unique_ptr<cudf::table> tbl,
@@ -132,29 +92,11 @@ class positional_delete_filter : public iceberg_delete_filter {
   std::shared_ptr<const IcebergDeleteData> _delete_data;
 };
 
-//===----------------------------------------------------------------------===//
-// Equality delete filter
-//===----------------------------------------------------------------------===//
-
-/**
- * @brief Applies Iceberg V2 equality deletes to each data batch.
- *
- * Holds a shared reference to the pre-materialized IcebergDeleteData
- * (which owns the GPU hash join and delete key table).  For each batch,
- * probes the hash join with the data chunk's key columns, builds a
- * boolean anti-join mask entirely on GPU via thrust::transform, and
- * applies cudf::apply_boolean_mask.
- *
- * No GPU-to-host data transfer is required.
- */
+/// Applies V2 equality deletes: probes the group's prebuilt hash join with the batch's key
+/// columns and applies an anti-join mask. Entirely on device.
 class equality_delete_filter : public iceberg_delete_filter {
  public:
-  /**
-   * @param delete_data      Shared ownership of the materialized delete data
-   *                         (keeps GPU table + hash join alive for query lifetime).
-   * @param data_key_indices Indices into the data-chunk columns that correspond
-   *                         to the equality key columns.
-   */
+  /// @param data_key_indices Batch column indices of the group's equality key columns.
   equality_delete_filter(std::shared_ptr<const IcebergDeleteData> delete_data,
                          size_t group_index,
                          std::vector<cudf::size_type> data_key_indices);
@@ -170,35 +112,21 @@ class equality_delete_filter : public iceberg_delete_filter {
   std::vector<cudf::size_type> _data_key_indices;
 };
 
-//===----------------------------------------------------------------------===//
-// Delete pipeline — composes filters + strips extra columns
-//===----------------------------------------------------------------------===//
-
 /**
- * @brief Owns an ordered list of iceberg_delete_filters and applies them all to a batch,
- * then strips any force-projected extra columns from the result.
+ * @brief Applies an ordered list of delete filters to a batch, then strips extra columns.
  *
- * The "extra columns" mechanism exists because equality-delete key columns
- * may not be in the user's query projection.  The scan is widened to include
- * them (appended at the end), and after all filters run, the pipeline strips
- * those trailing columns so downstream operators see only what was requested.
- *
- * Before iceberg was removed from the build this was a @c post_convert_fn_t handed to the
- * host parquet representation. That type went away with it, and its two extra arguments —
- * a single data file path and a single first-row offset — could not describe a split
- * spanning several files or pruned row groups anyway. @ref apply takes a @ref batch_layout
- * instead, and is called from the scan's materialize step.
+ * Equality-delete key columns may not be in the query's projection, so the scan is widened to
+ * append them; once every filter has run they are stripped again. Order matters — they are
+ * appended at the tail, and stripping cuts from the tail.
  */
 class iceberg_delete_pipeline {
  public:
-  /// Add a filter stage.  Filters are applied in insertion order.
+  /// Applied in insertion order.
   void add_filter(std::shared_ptr<iceberg_delete_filter> filter);
 
-  /// Set the number of extra columns appended to the scan for delete-key
-  /// projection.  These will be stripped after all filters run.
+  /// Extra columns appended for delete-key projection, stripped after all filters run.
   void set_extra_column_count(size_t n) { _extra_column_count = n; }
 
-  /// Return the number of extra columns that were force-projected.
   [[nodiscard]] size_t extra_column_count() const { return _extra_column_count; }
 
   /// True if no filters have been added.
