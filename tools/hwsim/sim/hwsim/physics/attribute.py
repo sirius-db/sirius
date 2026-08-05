@@ -200,14 +200,72 @@ def _memcpy_split(
     return only, shares
 
 
-def _host_ns(spans: List[HostSpanRow], gtid: int, lo: int, hi: int, kind: str) -> float:
+class _HostSpanIndex:
+    """Per-(thread, kind) sorted host-API spans with bisect window queries.
+
+    A thread is inside one runtime API call at a time, so the per-key
+    interval lists are non-overlapping and sorted-by-start == sorted-by-end —
+    the leftward walk below can stop at the first span ending before the
+    window. (The previous per-op linear scans over ALL host spans were
+    quadratic in capture size.)"""
+
+    def __init__(self, spans: List[HostSpanRow]) -> None:
+        self._ivals: Dict[Tuple[int, str], List[Tuple[int, int]]] = {}
+        for s in spans:
+            self._ivals.setdefault((s.global_tid, s.kind), []).append(
+                (s.start, s.end)
+            )
+        self._starts: Dict[Tuple[int, str], List[int]] = {}
+        for key, ivl in self._ivals.items():
+            ivl.sort()
+            self._starts[key] = [a for a, _ in ivl]
+
+    def window(
+        self, gtid: int, kind: str, lo: int, hi: int
+    ) -> List[Tuple[int, int]]:
+        """Spans of (gtid, kind) overlapping [lo, hi), sorted by start."""
+        key = (gtid, kind)
+        ivl = self._ivals.get(key)
+        if not ivl:
+            return []
+        out = []
+        j = bisect_right(self._starts[key], hi) - 1  # last span starting < hi
+        while j >= 0:
+            a, b = ivl[j]
+            if b <= lo:
+                break
+            if a < hi:
+                out.append((a, b))
+            j -= 1
+        out.reverse()
+        return out
+
+
+def _host_ns(hidx: "_HostSpanIndex", gtid: int, lo: int, hi: int, kind: str) -> float:
     return sum(
-        min(s.end, hi) - max(s.start, lo)
-        for s in spans
-        if s.kind == kind
-        and s.global_tid == gtid
-        and min(s.end, hi) > max(s.start, lo)
+        min(e, hi) - max(s, lo) for s, e in hidx.window(gtid, kind, lo, hi)
     )
+
+
+def _kernel_overlap_frac(
+    k_union: List[Tuple[float, float]],
+    hidx: "_HostSpanIndex",
+    gtid: int,
+    lo: int,
+    hi: int,
+) -> float:
+    """Share of the window's kernel-busy union NOT covered by a same-thread
+    synchronization API span (WS20): kernel time the launching thread ran
+    PAST (hidden under concurrent host work) instead of waiting on. Feeds the
+    per-span overlap cap in integrate.py — on spans whose kernels co-run
+    entirely under host work, stretching the kernels does not stretch the
+    span (the RTX PRO 6000 q17/q20 pessimistic outliers, real x ~ 1.0)."""
+    total = iv.total(k_union)
+    if total <= 0.0:
+        return 0.0
+    sync = iv.merge(iv.clip(hidx.window(gtid, "sync", lo, hi), lo, hi))
+    hidden = iv.total(iv.subtract(k_union, sync))
+    return max(0.0, min(1.0, hidden / total))
 
 
 def attribute_and_decompose(
@@ -291,6 +349,7 @@ def attribute_and_decompose(
             att.prep_memcpys.append(m)
 
     # ---- decompose each attempt into TaskPhysics --------------------------
+    hidx = _HostSpanIndex(data.host_spans)
     windows = data.query_windows or [
         (
             min((r.start for r in data.task_ranges), default=0),
@@ -319,14 +378,14 @@ def attribute_and_decompose(
         )
         # prep window: task start -> first op start (whole range when no ops)
         prep_end = att.ops[0].start if att.ops else rng.end
-        tp.prep = _decompose_prep(att, rng.start, prep_end, classifier, stats)
+        tp.prep = _decompose_prep(att, rng.start, prep_end, classifier, stats, hidx)
         for op in att.ops:
             tp.ops.append(
                 _decompose_op(
                     op,
                     att.kernels_by_op.get(id(op), []),
                     att.memcpys_by_op.get(id(op), []),
-                    data.host_spans,
+                    hidx,
                     classifier,
                     stats,
                 )
@@ -337,7 +396,12 @@ def attribute_and_decompose(
 
 
 def _decompose_prep(
-    att: _TaskAttempt, lo: int, hi: int, classifier: Classifier, stats: AttributionStats
+    att: _TaskAttempt,
+    lo: int,
+    hi: int,
+    classifier: Classifier,
+    stats: AttributionStats,
+    hidx: Optional[_HostSpanIndex] = None,
 ) -> Optional[PrepPhysics]:
     span = hi - lo
     if span <= 0:
@@ -365,6 +429,13 @@ def _decompose_prep(
         f_membw=shares[CLASS_MEMBW] / span,
         f_unknown=shares["unknown"] / span,
         f_host=host / span,
+        f_kernel_overlap=_kernel_overlap_frac(
+            k_union_merged,
+            hidx if hidx is not None else _HostSpanIndex([]),
+            att.rng.global_tid,
+            lo,
+            hi,
+        ),
         xfer_bytes=xfer_bytes,
         dominant_channel=dominant,
         copies=copies,
@@ -375,7 +446,7 @@ def _decompose_op(
     op: OpRangeRow,
     kernels: List[KernelRow],
     memcpys: List[MemcpyRow],
-    host_spans: List[HostSpanRow],
+    hidx: _HostSpanIndex,
     classifier: Classifier,
     stats: AttributionStats,
 ) -> OpPhysics:
@@ -397,8 +468,11 @@ def _decompose_op(
         f_d2h=dir_shares["d2h"] / span,
         f_d2d=dir_shares["d2d"] / span,
         f_host=host / span,
+        f_kernel_overlap=_kernel_overlap_frac(
+            k_union_merged, hidx, op.global_tid, lo, hi
+        ),
         kernel_ns=union,
         memcpy_ns=mc_only,
-        launch_ns=_host_ns(host_spans, op.global_tid, lo, hi, "launch"),
-        sync_ns=_host_ns(host_spans, op.global_tid, lo, hi, "sync"),
+        launch_ns=_host_ns(hidx, op.global_tid, lo, hi, "launch"),
+        sync_ns=_host_ns(hidx, op.global_tid, lo, hi, "sync"),
     )

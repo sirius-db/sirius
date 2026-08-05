@@ -119,6 +119,20 @@ class RetimeStats:
         return {k: getattr(self, k) for k in self.__dataclass_fields__}
 
 
+# Minimum per-span overlap fraction for the WS20 cap to engage. The
+# hypothesis (external-validation-rtx-pro-6000.md, q17/q20) is about spans
+# whose kernel time co-runs ENTIRELY under host work; at low overlap the
+# uncovered sliver is usually just launch-side latency before the thread hits
+# its sync, and the kernel stretch lands squarely in that sync wait — so
+# low-overlap spans must keep the full charge. Measured on the GB300 R1
+# capture, kernel time clusters at ov < 0.5 with a small ov >= 0.9 tail; an
+# ungated linear discount moved the validated section-7.2 medians 1-3.5 pp
+# more optimistic, the 0.9-gated cap leaves them within 0.5 pp. The decisive
+# validation datum (q17/q20, real x ~ 1.0) lives on the RTX box — re-score
+# there before tuning this.
+OVERLAP_CAP_MIN = 0.9
+
+
 def _capped_kernel_share(
     kern: float, kern_scaled: float, f_host: float, overlap: float
 ) -> float:
@@ -126,19 +140,20 @@ def _capped_kernel_share(
 
     ``overlap`` is the measured share of the span's kernel-busy time hidden
     under concurrent host work (not covered by a same-thread sync wait,
-    attribute.py). The hidden part co-runs with host work, so its stretch is
-    absorbed until it exhausts the hiding capacity — the original hidden
-    window plus the span's host-only residue ``f_host`` (paid once; the span
-    charges max(host, kernels) there, not their sum):
+    attribute.py). For spans above ``OVERLAP_CAP_MIN`` the hidden part
+    co-runs with host work, so its stretch is absorbed until it exhausts the
+    hiding capacity — the original hidden window plus the span's host-only
+    residue ``f_host`` (paid once; the span charges max(host, kernels) there,
+    not their sum):
 
         charged = (1-ov)*kern_scaled + max(ov*kern, ov*kern_scaled - f_host)
 
-    Identity at knobs=1 (kern_scaled == kern); exact old behavior at ov=0;
-    shrinking hidden kernels (kern_scaled < kern) floors at ov*kern — the
-    co-running host work does not get faster. Motivated by the RTX PRO 6000
-    q17/q20 outliers: real x ~ 1.0 at MPS-50 while the uncapped split
-    charged +15.6/+19.7%."""
-    if overlap <= 0.0 or kern <= 0.0:
+    Identity at knobs=1 (kern_scaled == kern); exact old behavior at
+    ov < OVERLAP_CAP_MIN; shrinking hidden kernels (kern_scaled < kern)
+    floors at ov*kern — the co-running host work does not get faster.
+    Motivated by the RTX PRO 6000 q17/q20 outliers: real x ~ 1.0 at MPS-50
+    while the uncapped split charged +15.6/+19.7%."""
+    if overlap < OVERLAP_CAP_MIN or kern <= 0.0:
         return kern_scaled
     ov = min(1.0, overlap)
     hidden = ov * kern
@@ -291,11 +306,11 @@ def retime_graph(
                     * task.prep_ns
                 )
             stats.class_ns["xfer"] += prep_ann.f_xfer * task.prep_ns
-            stats.overlap_hidden_kernel_ns += (
-                getattr(prep_ann, "f_kernel_overlap", 0.0)
-                * _prep_kernel_frac(prep_ann)
-                * task.prep_ns
-            )
+            prep_ov = getattr(prep_ann, "f_kernel_overlap", 0.0)
+            if prep_ov >= OVERLAP_CAP_MIN:
+                stats.overlap_hidden_kernel_ns += (
+                    prep_ov * _prep_kernel_frac(prep_ann) * task.prep_ns
+                )
             nonxfer_scaled = task.prep_ns * _prep_nonxfer_factor(
                 prep_ann, knobs, overlap_cap=overlap_cap
             )
@@ -343,11 +358,11 @@ def retime_graph(
                     op_ann.f_h2d + op_ann.f_d2h + op_ann.f_d2d
                 ) * dur
                 stats.class_ns["host"] += op_ann.f_host * dur
-                stats.overlap_hidden_kernel_ns += (
-                    getattr(op_ann, "f_kernel_overlap", 0.0)
-                    * _op_kernel_frac(op_ann)
-                    * dur
-                )
+                op_ov = getattr(op_ann, "f_kernel_overlap", 0.0)
+                if op_ov >= OVERLAP_CAP_MIN:
+                    stats.overlap_hidden_kernel_ns += (
+                        op_ov * _op_kernel_frac(op_ann) * dur
+                    )
                 scaled = dur * _op_inv_factor(op_ann, knobs, overlap_cap=overlap_cap)
                 base_kernel_ns += _op_kernel_frac(op_ann) * dur
                 scaled_kernel_ns += _op_kernel_inv_factor(op_ann, knobs) * dur

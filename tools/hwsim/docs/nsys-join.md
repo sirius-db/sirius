@@ -164,6 +164,56 @@ Downgraded/re-executed tasks appear as separate attempts (same nsys task id,
 increasing `attempt`), matching Quent's convention of one TaskSpec per
 attempt.
 
+### 5.1 Per-span kernel-overlap fraction (WS20; the RTX q17/q20 cap)
+
+Each `prep`/`ops` entry also carries **`f_kernel_overlap`**: the share of the
+span's kernel-busy union NOT covered by a same-thread synchronization API
+span — kernel time the launching thread ran *past* (hidden under concurrent
+host work) instead of waiting on. Motivation: the RTX PRO 6000 external
+validation's two pessimistic outliers (q17/q20: real ×≈1.0 at MPS-50, but
+the split charged +15.6/+19.7%) are queries whose kernel time co-runs
+entirely under host work — stretching those kernels does not stretch the
+span.
+
+At simulate time (`integrate.py`), spans whose overlap is **≥
+`OVERLAP_CAP_MIN` (0.9)** charge the hidden kernel share as
+`max(hidden_base, hidden_scaled − f_host)` instead of `hidden_scaled` — the
+span pays max(host, kernels) in the hidden window, with the host residue as
+absorbing headroom (deep throttles still pay the excess). Gates and
+guarantees:
+
+- **knobs=1 identity** and bit-identical behavior on pre-WS20 profiles
+  (missing field ⇒ 0 ⇒ no capping) — B1 selfcheck + a stored E1-50P
+  prediction reproduce exactly.
+- **Section-7 split path only**: when the G4b fluid device engages
+  (kernel-serialization ≥ 0.9) the cap stands down — serialized kernels are
+  not hidden. Verified on the LN lane: re-ingested profiles predict
+  identically to the stored ones (gate engages first).
+- **Below the gate the full charge is kept**: on the GB300 R1 capture,
+  kernel time clusters at overlap < 0.5 (the uncovered sliver is launch-side
+  latency; the stretch lands in the sync wait). The gated cap re-scores the
+  whole §7.2 E1/E4 grid within **0.70 pp** of the stored errors (24/25
+  within ±15%, same sole exception q21@E1-25); an ungated linear discount
+  moved the medians 1–3.5 pp more optimistic and was rejected.
+
+**Validation status:** the GB300 captures contain no query where the cap
+changes predictions materially (max 0.7 pp) — the decisive datum (q17/q20,
+real ×≈1.0) lives on the RTX PRO 6000 box. To validate there (worktree
+`.claude/worktrees/simulator-timing-output-prediction-e02735`), re-ingest the
+paired baseline so the profile carries the new field, then re-score the
+MPS-50 what-if exactly as in `hwsim_run/RESULTS.md`:
+
+```bash
+python -m hwsim ingest-nsys hwsim_run/telemetry_data/019fd246-a2e5-* \
+    hwsim_run/nsys/paired_base.sqlite -o hwsim_run/physics_paired_ws20.json
+python -m hwsim simulate hwsim_run/telemetry_data/019fd246-a2e5-* \
+    --query-label <q17/q20 labels> --physics hwsim_run/physics_paired_ws20.json \
+    --knob gpu_compute=0.5
+```
+
+Expected if the hypothesis holds: q17/q20 drop from +15.6/+19.7% toward 0
+while the other 20 queries stay within their ±10% band.
+
 ## 6. Fixture methodology (how this is tested without a GPU)
 
 `tests/nsys_fixture.py` builds sqlite files conforming to the documented

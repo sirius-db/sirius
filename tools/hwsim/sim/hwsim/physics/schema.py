@@ -37,6 +37,14 @@ class OpPhysics:
     f_d2h: float = 0.0
     f_d2d: float = 0.0
     f_host: float = 1.0
+    # Share of this span's kernel-busy time (union) NOT covered by a
+    # same-thread synchronization API span — kernel time the host thread ran
+    # PAST instead of waiting on, i.e. hidden under concurrent host work.
+    # Stretching hidden kernel time does not stretch the span until it
+    # exhausts the span's host headroom (the RTX q17/q20 outliers: real x~1.0
+    # but the uncapped split charged +15-20%). 0.0 = not measured (pre-WS20
+    # profile) -> no capping, bit-identical to the old behavior.
+    f_kernel_overlap: float = 0.0
     # absolute diagnostics (ns within the nsys op window)
     kernel_ns: float = 0.0
     memcpy_ns: float = 0.0
@@ -61,6 +69,9 @@ class PrepPhysics:
     f_membw: float = 0.0
     f_unknown: float = 0.0
     f_host: float = 1.0
+    # same semantics as OpPhysics.f_kernel_overlap, over the prep window's
+    # kernel share (decompress etc.); 0.0 = not measured.
+    f_kernel_overlap: float = 0.0
     xfer_bytes: int = 0
     dominant_channel: str = ""  # e.g. "Host-to-Device|Pinned|Device"
     copies: List[Tuple[int, float]] = field(default_factory=list)  # (bytes, ns)
