@@ -1,8 +1,9 @@
 # The definitive cross-machine experiment — GB300 trace → RTX PRO 6000 prediction
 
-**Status: designed + packaged 2026-08-05 (WS19); NOT executed** — the grading half needs
-the RTX PRO 6000 box, which this session has no access to. Everything below is scripted;
-the owner runs one command per side.
+**Status: GB300 side EXECUTED + predictions frozen 2026-08-05 (WS21)** — see
+[cross-machine-predictions-README.md](cross-machine-predictions-README.md) for the frozen
+CSVs, capture provenance, and the exact grading command. Only the grading half remains,
+on the RTX PRO 6000 box (one command, the owner runs it).
 
 **Claim under test:** spec-sheet target mode ([spec-sheet-mode.md](spec-sheet-mode.md))
 can predict the *absolute per-query walls of a machine we never measured against*, from a
