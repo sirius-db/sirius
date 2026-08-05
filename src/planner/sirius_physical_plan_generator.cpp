@@ -84,7 +84,12 @@ std::vector<std::string> resolve_parquet_scan_file_paths(
     if (parameters.empty() || parameters.front().IsNull()) { return {}; }
     return {parameters.front().GetValue<std::string>()};
   }
-  if (function_name == "parquet_scan" || function_name == "read_parquet") {
+  if (function_name == "parquet_scan" || function_name == "read_parquet" ||
+      function_name == "iceberg_scan") {
+    // iceberg_scan belongs here: the iceberg extension resolves its manifests into the same
+    // MultiFileBindData file list read_parquet produces, which is what lets the parquet
+    // ingestible read an iceberg table's data files unchanged.
+    //
     // dynamic_cast (never Cast<>, which asserts/throws): an unresolvable
     // identity must degrade to empty, not fail the caller.
     auto const* multi_file_bind = dynamic_cast<duckdb::MultiFileBindData const*>(bind_data);

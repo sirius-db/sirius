@@ -32,6 +32,7 @@
 #include <log/logging.hpp>
 #include <op/scan/iceberg_metadata_reader.hpp>
 #include <op/scan/puffin_reader.hpp>
+#include <sirius_context.hpp>
 
 #include <algorithm>
 #include <atomic>
@@ -164,6 +165,10 @@ IcebergManifestDiscovery discover_from_manifests(duckdb::ClientContext& context,
   IcebergManifestDiscovery result;
 
   duckdb::Connection conn(*context.db);
+  // The internal-query bracket is per-connection, so the caller's guard does not cover this
+  // one. Unbracketed, these metadata queries run the full transparent path and their
+  // plan-generation window contends for the instance-wide slot held by the query being planned.
+  duckdb::SiriusContext::InternalQueryGuard conn_guard(*conn.context);
   conn.Query("SET unsafe_enable_version_guessing = true");
 
   std::string query =
@@ -257,6 +262,9 @@ void read_positional_delete_file(duckdb::DatabaseInstance& db,
                                  std::unordered_map<std::string, std::vector<int64_t>>& out_map)
 {
   duckdb::Connection conn(db);
+  // Same reason as discover_from_manifests: bracket this connection so the delete-file read
+  // does not re-enter the transparent path underneath the query being planned.
+  duckdb::SiriusContext::InternalQueryGuard conn_guard(*conn.context);
 
   auto result = conn.Query("SELECT file_path, pos FROM read_parquet('" +
                            escape_sql_string(delete_file_path) + "')");

@@ -152,6 +152,11 @@ std::optional<std::string> iceberg_gpu_scan_decline_reason(duckdb::LogicalGet& o
     duckdb::SiriusContext::InternalQueryGuard guard(context);
 
     duckdb::Connection conn(*context.db);
+    // The bracket is per-connection, so guarding `context` above does not cover this fresh
+    // connection. Without its own guard the probe query runs the full transparent path, whose
+    // plan-generation window contends for the instance-wide slot the query being planned is
+    // already holding; the probe then fails and "any failure declines" refuses every table.
+    duckdb::SiriusContext::InternalQueryGuard conn_guard(*conn.context);
     // The probe runs on a FRESH connection, which does not inherit the session's settings. Without
     // this, a table whose metadata carries no version hint fails the probe outright — and because
     // any failure declines, a table with ZERO delete files was refused and told it had equality
