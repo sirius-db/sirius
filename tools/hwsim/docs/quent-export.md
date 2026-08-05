@@ -155,3 +155,31 @@ thread-time is not representable as task states.
 WS18 owns the schema validator, analyzer-ingest test rig and the full
 viewing workflow doc; this file records only the format decisions of the
 exporter side.
+
+## Follow-up: pre-WS9 REAL traces vs the current analyzer
+
+WS18's flip-side finding (quent-export-verification.md): every pre-WS9 real
+capture (the 654 MB sample, B1, all E1/E2/E3 campaign traces, model commit
+`b77aa438`) is silently truncated by the **current** branch's Rust analyzer
+for the same no-serde-defaults reason this exporter was fixed for.
+
+The obvious remedy — `#[serde(default)]` on the four WS9-extended states
+(`task.rs` Computing/Finalizing, `data_batch.rs` Constructed, `batch.rs`
+BatchRegistered in `rust/crates/telemetry/model`) — is currently **blocked
+by the pinned quent macro** (rev `2a5ca834`): `state!` expands user
+attributes *before* its own `#[derive(Serialize, Deserialize)]`, so a
+container-level `#[serde(default)]` trips the deny-by-default
+`legacy_derive_helpers` future-incompat lint (rust-lang/rust#79202,
+verified: 8 compile errors), and the macro's inline attribute grammar
+accepts no per-field attributes. The alternative external-struct
+`attributes:` form would mean hand-implementing `EventMetadata` /
+`Extract*` for four states with a codegen-drift risk in the cxx bridge.
+
+Proper fix (follow-up, not done here): patch quent's `state!` to emit user
+attributes after its derive (or accept per-field attrs), then add
+`#[derive(Default)] #[serde(default)]` to those four states and verify the
+generated cxx bridge sources are byte-identical (they should be — codegen
+reads `StateDef` field metadata, not serde attrs). Until then, view
+pre-WS9 traces with an analyzer built at the matching model commit, and
+use `export-verify/validate_quent_session.py --allow-legacy` to
+distinguish legacy-shape warnings from real corruption.
