@@ -258,6 +258,25 @@ std::vector<int64_t> read_deletion_vector(std::string const& puffin_path,
   std::ifstream f(puffin_path, std::ios::binary);
   if (!f) { throw std::runtime_error("[puffin] Cannot open file: " + puffin_path); }
 
+  // Validate the Puffin CONTAINER before trusting an offset into it. Checking only the blob's
+  // own magic and CRC (below) is not enough: a bare deletion-vector blob written without a
+  // container passes every one of those checks, because they never look at the file as a whole.
+  // A fixture in exactly that shape was read as valid here for months while not being a Puffin
+  // file at all — DuckDB's reader rejected it as soon as it started checking trailing magic.
+  // Reading a blob at an offset into a file whose framing was never verified is how a wrong
+  // offset becomes wrong deletes rather than an error.
+  static constexpr char kPuffinMagic[4] = {'P', 'F', 'A', '1'};
+  char magic[4];
+  f.read(magic, 4);
+  if (!f || std::memcmp(magic, kPuffinMagic, 4) != 0) {
+    throw std::runtime_error("[puffin] Not a Puffin file (bad leading magic): " + puffin_path);
+  }
+  f.seekg(-4, std::ios::end);
+  f.read(magic, 4);
+  if (!f || std::memcmp(magic, kPuffinMagic, 4) != 0) {
+    throw std::runtime_error("[puffin] Not a Puffin file (bad trailing magic): " + puffin_path);
+  }
+
   f.seekg(content_offset);
   if (!f) {
     throw std::runtime_error("[puffin] Cannot seek to offset " + std::to_string(content_offset) +
