@@ -28,10 +28,30 @@ docs/super-sirius/pipeline-execution.md):
 Nothing is hand-coded per knob beyond event durations/rates: back-pressure,
 queueing and saturation emerge from admission and capacity.
 
+Spill / downgrade layer (gap G5, see docs/spill-model.md). Three modes,
+resolved from ``spill_mode="auto"``:
+
+- ``"off"`` (unpressured trace, gpu_mem_capacity == 1): v0 semantics,
+  byte-identical — a memory-blocked head waits; a complete stall force-admits.
+- ``"replay"`` (the trace itself contains Downgrading / OOM-rescheduled
+  tasks): pure bookkeeping. When the head is memory-blocked, idle resident
+  batches are evicted at ZERO time cost — every real cost is already inside
+  the traced spans (the downgrade wait sits in grant_ns, the re-upgrade H2D
+  sits in the retry tasks' Preparing spans, and the recompute waste IS the
+  traced failed task attempts, replayed like any other task).
+- ``"model"`` (capacity knob moved on an unpressured trace): the engine
+  mirrors the real admission/downgrade policy: it demotes idle resident
+  batches to the HOST pool (capacity-bounded) at a calibrated rate while the
+  manager loop stalls; consumers of demoted batches pay the re-upgrade
+  transfer in their prep; and a head whose reservation still cannot be
+  granted does what the real engine does — it is dispatched anyway, OOMs,
+  and is rescheduled: modeled as a "spin" that burns a thread slot for one
+  calibrated OOM-reschedule cycle and re-queues at the tail (capped at the
+  engine's retry budget, then force-admitted).
+
 Progress guarantee: if the simulation stalls completely (no pending event can
-free memory) a memory-blocked queue head is force-admitted — the real engine
-would spill / downgrade at that point, whose cost v0 cannot price (the sample
-trace has zero Downgrading events); occurrences are counted and reported.
+free memory) a memory-blocked queue head is force-admitted — occurrences are
+counted and reported.
 """
 
 from __future__ import annotations
@@ -46,6 +66,53 @@ from .model import BatchSpec, QueryGraph, TaskSpec
 ChannelKey = Tuple[str, str, int]  # (origin_tier, target_tier, device)
 
 _BYTES_EPS = 0.5
+_TIME_EPS = 1e-6
+
+SPILL_MODES = ("auto", "off", "replay", "model")
+
+
+@dataclass
+class SpillParams:
+    """Costs of the downgrade / OOM-reschedule mechanism (docs/spill-model.md).
+
+    Rates are bytes/ns (== GB/s). ``downgrade_rate``/``upgrade_rate`` and
+    ``oom_cycle_ns`` are MEASURED from the E2 pressure captures (D2H convert
+    ~30 GB/s from data_batch InTransit; re-materialization ~29 GB/s effective
+    from retry Preparing spans; median failed attempt = admit ->
+    partial-progress compute -> OOM unwind -> requeue ~= 47-50 ms on both
+    E2-mid q21 and E2-lo q9). ``min_progress`` — the floor fraction of a
+    task's work that one OOM-rescheduled attempt banks via its
+    reschedule_intermediate outputs when almost no memory is grantable — is
+    the CALIBRATED parameter (fit on one pressured point, validated on the
+    other held out). Each attempt banks
+    ``f = clamp(available / (need + rematerialize), min_progress, 1)``,
+    so attempts-per-task and hence the thrash cost scale with pressure depth
+    emergently.
+    """
+
+    downgrade_rate: float = 30.0  # GB/s: demoting idle batches GPU -> HOST
+    upgrade_rate: float = 29.0  # GB/s: re-materializing demoted inputs
+    downgrade_base_ns: float = 250_000.0  # fixed manager cost per downgrade
+    oom_cycle_ns: float = 50_000_000.0  # one admit->OOM->reschedule cycle
+    # Off-thread delay between an OOM unwind and the retry re-entering the
+    # queue (the executor's reschedule backoff, ~50 ms/retry) — paces retries
+    # without burning a thread slot.
+    retry_backoff_ns: float = 50_000_000.0
+    min_progress: float = 0.02  # progress floor per attempt (measured: ~50
+    # attempts per thrashed logical task on both E2 pressure captures)
+    # Fraction of a rescheduled attempt's intermediate output that
+    # materializes on the HOST tier (born downgraded) instead of occupying
+    # the GPU pool. CALIBRATED — this is the dial that sets how fast the
+    # pool drains under thrash and hence the depth of the spill cliff.
+    # Default 0.47 = joint fit of the two E2 pressure points (q21@0.25x
+    # +38.8%, q9@0.15x -20.4%); see docs/spill-model.md for the held-out
+    # protocol results and the bistability caveat.
+    spin_output_host_fraction: float = 0.47
+    # A downgrade sweep frees down to this fraction of the pool (the engine's
+    # downgrade_stop_fraction, memory-management.md), not just enough for the
+    # blocked head — this hysteresis opens admission windows.
+    downgrade_stop_fraction: float = 0.7
+    max_oom_retries: int = 100  # engine MAX_RETRIES, then force-admit
 
 
 @dataclass
@@ -58,6 +125,8 @@ class TaskTimes:
     finish: float = -1.0
     mem_wait_ns: float = 0.0  # time this task spent head-of-queue blocked on memory
     forced_admission: bool = False
+    oom_spins: int = 0  # modeled OOM-reschedule cycles before admission
+    spin_ns: float = 0.0  # thread time burnt in those cycles
 
     @property
     def queue_wait_ns(self) -> float:
@@ -93,11 +162,19 @@ class SimResult:
     forced_admissions: int = 0
     dep_cycle_breaks: int = 0
     orphan_gpu_batches: int = 0
+    # spill / downgrade layer (docs/spill-model.md)
+    spill_mode: str = "off"
+    downgrade_events: int = 0
+    downgraded_bytes: float = 0.0
+    reupgraded_bytes: float = 0.0
+    oom_retries: int = 0
+    spin_ns: float = 0.0
+    retry_cap_forced: int = 0
 
     def binding_constraint(self, device: int = 0) -> str:
         bt = self.block_totals.get(device, {})
         threads = bt.get("threads", 0.0)
-        memory = bt.get("memory", 0.0)
+        memory = bt.get("memory", 0.0) + bt.get("spill", 0.0)
         chan = sum(c.throttled_ns for c in self.channel_stats.values())
         best = max(threads, memory, chan)
         if best <= 0:
@@ -154,6 +231,9 @@ class Engine:
         pool_capacity: Dict[int, int],
         channel_capacity: Dict[ChannelKey, float],
         queue_order: str = "traced",
+        spill_mode: str = "auto",
+        spill: Optional[SpillParams] = None,
+        host_capacity: Optional[float] = None,
     ) -> None:
         self.graph = graph
         self.knobs = knobs
@@ -164,6 +244,22 @@ class Engine:
         self.queue_order = queue_order
         self.tasks: Dict[int, TaskSpec] = graph.tasks
         self.batches: Dict[int, BatchSpec] = graph.batches
+
+        if spill_mode not in SPILL_MODES:
+            raise ValueError(
+                f"spill_mode must be one of {SPILL_MODES}, got {spill_mode!r}"
+            )
+        if spill_mode == "auto":
+            if any(
+                t.t_downgrading >= 0 or not t.success for t in self.tasks.values()
+            ):
+                spill_mode = "replay"
+            elif knobs.gpu_mem_capacity != 1.0:
+                spill_mode = "model"
+            else:
+                spill_mode = "off"
+        self.spill_mode = spill_mode
+        self.spill = spill if spill is not None else SpillParams()
 
         self._heap: List[Tuple[float, int, Callable, tuple]] = []
         self._seq = 0
@@ -211,6 +307,30 @@ class Engine:
         self.dep_cycle_breaks = 0
         self.orphan_gpu_batches = 0
 
+        # spill / downgrade state
+        for d in devices:
+            self.block_totals[d]["spill"] = 0.0
+        self._host_cap = (
+            float(host_capacity) * knobs.cpu_mem_capacity
+            if host_capacity
+            else float("inf")
+        )
+        self._host_used = 0.0
+        # dev -> {bid: bytes} in publish order (LRU eviction candidates)
+        self._lru: Dict[int, Dict[int, float]] = {d: {} for d in devices}
+        self._evicted: Dict[int, float] = {}  # bid -> bytes now on HOST
+        self._pins: Dict[int, int] = {}  # bid -> running consumers
+        self._mgr_busy_until: Dict[int, float] = {d: 0.0 for d in devices}
+        self._max_prio: Dict[int, float] = {d: 0.0 for d in devices}
+        self._banked: Dict[int, float] = {}  # tid -> work fraction banked
+        self._prepub: Dict[int, float] = {}  # bid -> bytes published early
+        self.downgrade_events = 0
+        self.downgraded_bytes = 0.0
+        self.reupgraded_bytes = 0.0
+        self.oom_retries = 0
+        self.spin_ns_total = 0.0
+        self.retry_cap_forced = 0
+
         # dependency bookkeeping
         self._pending_deps: Dict[int, int] = {}
         self._rdeps: Dict[int, Set[int]] = {tid: set() for tid in self.tasks}
@@ -229,9 +349,9 @@ class Engine:
             ):
                 # No producing task in the replay -> resident from t=0.
                 self.orphan_gpu_batches += 1
-                self._resident[
-                    b.device if b.device in devices else next(iter(devices))
-                ] += b.nbytes
+                dev = b.device if b.device in devices else next(iter(devices))
+                self._resident[dev] += b.nbytes
+                self._lru[dev][bid] = float(b.nbytes)
 
         self._unfinished = set(self.tasks)
         self._released: Set[int] = set()
@@ -304,6 +424,8 @@ class Engine:
         else:
             prio = self.now
         heapq.heappush(self._fifo[task.device], (prio, task.tid))
+        if prio > self._max_prio[task.device]:
+            self._max_prio[task.device] = prio
         self._pump(task.device)
 
     def _pump(self, dev: int) -> None:
@@ -312,6 +434,14 @@ class Engine:
             if not fifo:
                 self._set_block(dev, None, None)
                 return
+            if (
+                self.spill_mode == "model"
+                and self.now < self._mgr_busy_until[dev] - _TIME_EPS
+            ):
+                # Manager loop is blocked inside request_downgrade(): no
+                # admissions until the downgrade completes.
+                self._set_block(dev, "memory", fifo[0][1])
+                return
             if self._slots_free[dev] == 0:
                 self._set_block(dev, "threads", fifo[0][1])
                 return
@@ -319,7 +449,23 @@ class Engine:
             task = self.tasks[tid]
             cap = self.pool_capacity[dev]
             need = min(float(task.reservation_bytes), cap)
-            if self._reserved[dev] + self._resident[dev] + need > cap + _BYTES_EPS:
+            extra = 0.0
+            if self.spill_mode == "model":
+                # Demoted inputs must be re-materialized on admission; the
+                # engine clamps the total ask to what the space can grant.
+                extra = min(
+                    self._evicted_input_bytes(task), max(0.0, cap - need)
+                )
+            if (
+                self._reserved[dev] + self._resident[dev] + need + extra
+                > cap + _BYTES_EPS
+            ):
+                if self.spill_mode != "off":
+                    action = self._spill_head(dev, tid, task, need, extra)
+                    if action == "continue":
+                        continue
+                    if action == "wait":
+                        return
                 self._set_block(dev, "memory", tid)
                 return
             self._admit(dev)
@@ -338,9 +484,222 @@ class Engine:
         self._reserved[dev] += need
         self._granted[tid] = need
         self.rec[tid].admit = self.now
+        extra_prep_ns = 0.0
+        if self.spill_mode != "off":
+            for bid in task.input_batches:
+                self._pins[bid] = self._pins.get(bid, 0) + 1
+            if self.spill_mode == "model":
+                extra_prep_ns = self._reupgrade_inputs(dev, task)
         self._sample_threads(dev)
         self._sample_pool(dev)
-        self.schedule(self.now + task.grant_ns, self._prep_start, tid)
+        self.schedule(self.now + task.grant_ns + extra_prep_ns, self._prep_start, tid)
+
+    # ------------------------------------------------------- spill mechanics
+
+    def _evicted_input_bytes(self, task: TaskSpec) -> float:
+        if not self._evicted:
+            return 0.0
+        return sum(self._evicted.get(bid, 0.0) for bid in set(task.input_batches))
+
+    def _reupgrade_inputs(self, dev: int, task: TaskSpec) -> float:
+        """Bring demoted input batches back to the GPU: bytes rejoin the pool,
+        HOST frees, and the task pays the transfer in its prep. Returns the
+        extra prep ns."""
+        moved = 0.0
+        for bid in set(task.input_batches):
+            nb = self._evicted.pop(bid, 0.0)
+            if nb <= 0.0:
+                continue
+            self._host_used -= nb
+            self._resident[dev] += nb
+            self._lru[dev][bid] = self._lru[dev].get(bid, 0.0) + nb
+            moved += nb
+        if moved <= 0.0:
+            return 0.0
+        self.reupgraded_bytes += moved
+        return moved / self.spill.upgrade_rate
+
+    def _spill_head(
+        self, dev: int, tid: int, task: TaskSpec, need: float, extra: float
+    ) -> str:
+        """Memory-blocked head under an active spill mode. Returns:
+        "continue" (head admitted or spinning; keep pumping),
+        "wait" (manager stalled on a downgrade; a pump is scheduled),
+        "block" (waiting suffices / nothing to evict; v0 blocking)."""
+        cap = self.pool_capacity[dev]
+        # Deficit that waiting for active reservations can NEVER free: the
+        # resident-data overshoot. When it is <= 0, the real make_reservation
+        # simply blocks until running tasks release their reservations — the
+        # traces confirm no Downgrading is emitted in that regime (e.g. the
+        # marginal q9 point: pool 99.6% peaked, 0 Downgrading events).
+        deficit = self._resident[dev] + need + extra - cap
+        if deficit <= _BYTES_EPS:
+            return "block"
+        # A real downgrade sweep frees down to downgrade_stop_fraction of the
+        # pool (hysteresis), not just enough for the head.
+        evict_target = deficit
+        if self.spill_mode == "model":
+            evict_target = max(
+                deficit,
+                self._resident[dev]
+                + need
+                + extra
+                - self.spill.downgrade_stop_fraction * cap,
+            )
+        own_inputs = set(task.input_batches)
+        lru = self._lru[dev]
+        evicted = 0.0
+        for bid in list(lru):
+            if evicted >= evict_target - _BYTES_EPS:
+                break
+            if self._pins.get(bid):
+                continue
+            if bid in own_inputs:
+                continue
+            nb = lru[bid]
+            if (
+                self.spill_mode == "model"
+                and self._host_used + nb > self._host_cap + _BYTES_EPS
+            ):
+                continue  # HOST pool cannot take this batch
+            self._host_used += nb
+            del lru[bid]
+            self._resident[dev] -= nb
+            self._evicted[bid] = nb
+            evicted += nb
+
+        if evicted > 0.0:
+            self.downgrade_events += 1
+            self.downgraded_bytes += evicted
+            self._sample_pool(dev)
+            if self.spill_mode == "replay":
+                # Zero-cost bookkeeping: the traced spans already carry every
+                # real downgrade cost. Admit if the head now fits.
+                if (
+                    self._reserved[dev] + self._resident[dev] + need
+                    <= cap + _BYTES_EPS
+                ):
+                    self._admit(dev)
+                    return "continue"
+                return "block"
+            stall = self.spill.downgrade_base_ns + evicted / self.spill.downgrade_rate
+            self._mgr_busy_until[dev] = max(
+                self._mgr_busy_until[dev], self.now + stall
+            )
+            self._set_block(dev, "memory", tid)
+            self.schedule(self._mgr_busy_until[dev], self._pump, dev)
+            return "wait"
+
+        if self.spill_mode == "replay":
+            return "block"
+
+        # Model mode, nothing (more) evictable: the real engine dispatches
+        # anyway with whatever reservation it got; the task OOMs at the point
+        # its allocations outgrow the grant and is RESCHEDULED — its
+        # reschedule_intermediate outputs preserve partial progress, so each
+        # attempt banks a fraction of the work (resume-at-operator).
+        rec = self.rec[tid]
+        if rec.oom_spins >= self.spill.max_oom_retries:
+            self.retry_cap_forced += 1
+            self._admit(dev, forced=True)
+            return "continue"
+        heapq.heappop(self._fifo[dev])
+        avail = max(0.0, cap - self._reserved[dev] - self._resident[dev])
+        denom = max(need + extra, 1.0)
+        f = min(1.0, max(self.spill.min_progress, avail / denom))
+        banked = self._banked.get(tid, 0.0)
+        f = min(f, 1.0 - banked)
+        self._banked[tid] = banked + f
+        # Partial progress consumes inputs incrementally: the attempt's
+        # processed input batches are freed (the real engine's rescheduled
+        # tasks keep reschedule_intermediate outputs and release consumed
+        # inputs) — this drains residency and re-opens admission windows.
+        if f > 0.0:
+            touched = False
+            for bid in set(task.input_batches):
+                nb = lru.get(bid)
+                if not nb:
+                    continue
+                delta = min(nb, f * float(self.batches[bid].nbytes))
+                lru[bid] = nb - delta
+                self._resident[dev] -= delta
+                touched = True
+            # ... and publishes its intermediate (reschedule_intermediate)
+            # outputs incrementally. Under pressure a calibrated fraction of
+            # them is BORN DOWNGRADED — materialized on the HOST tier
+            # directly (the E2-mid capture shows 1153 GB of H2D
+            # re-materialization against only 23 GB of D2H conversions), so
+            # that share does not occupy the GPU pool; consumers pay the
+            # re-upgrade transfer instead. The rest stays GPU-resident.
+            beta = self.spill.spin_output_host_fraction
+            for bid in set(task.output_batches):
+                b = self.batches[bid]
+                if not b.gpu_resident:
+                    continue
+                delta = f * float(b.nbytes)
+                self._prepub[bid] = self._prepub.get(bid, 0.0) + delta
+                if beta > 0.0:
+                    self._evicted[bid] = self._evicted.get(bid, 0.0) + beta * delta
+                    self._host_used += beta * delta
+                if beta < 1.0:
+                    lru[bid] = lru.get(bid, 0.0) + (1.0 - beta) * delta
+                    self._resident[dev] += (1.0 - beta) * delta
+                touched = True
+            if touched:
+                self._sample_pool(dev)
+        compute = sum(
+            base / self.knobs.op_scale(name) for (name, _oid, base, _b) in task.ops
+        )
+        cycle = self.spill.oom_cycle_ns + f * compute
+        rec.oom_spins += 1
+        rec.spin_ns += cycle
+        self.oom_retries += 1
+        self.spin_ns_total += cycle
+        self.block_totals[dev]["spill"] += cycle
+        self._set_block(dev, None, None)
+        self._slots_free[dev] -= 1
+        self._sample_threads(dev)
+        self.schedule(self.now + cycle, self._spin_done, tid)
+        return "continue"
+
+    def _spin_done(self, tid: int) -> None:
+        task = self.tasks[tid]
+        dev = task.device
+        if self._banked.get(tid, 0.0) >= 1.0 - 1e-9:
+            # Final attempt completed the work: keep the thread slot and
+            # transition straight to prep/finish (ops already banked). Grant
+            # whatever the pool can give — the big allocations already
+            # happened inside the banked attempts.
+            cap = self.pool_capacity[dev]
+            need = min(float(task.reservation_bytes), cap)
+            grant = min(need, max(0.0, cap - self._reserved[dev] - self._resident[dev]))
+            self._n_res[dev] += 1
+            self._reserved[dev] += grant
+            self._granted[tid] = grant
+            self.rec[tid].admit = self.now
+            extra_prep_ns = 0.0
+            for bid in task.input_batches:
+                self._pins[bid] = self._pins.get(bid, 0) + 1
+            extra_prep_ns = self._reupgrade_inputs(dev, task)
+            self._sample_pool(dev)
+            self.schedule(
+                self.now + task.grant_ns + extra_prep_ns, self._prep_start, tid
+            )
+            return
+        self._slots_free[dev] += 1
+        self._sample_threads(dev)
+        if self.spill.retry_backoff_ns > 0:
+            self.schedule(self.now + self.spill.retry_backoff_ns, self._requeue, tid)
+        else:
+            self._requeue(tid)
+        self._pump(dev)
+
+    def _requeue(self, tid: int) -> None:
+        dev = self.tasks[tid].device
+        prio = max(self.now, self._max_prio[dev] + 1.0)
+        self._max_prio[dev] = prio
+        heapq.heappush(self._fifo[dev], (prio, tid))
+        self._pump(dev)
 
     def _prep_start(self, tid: int) -> None:
         task = self.tasks[tid]
@@ -377,8 +736,15 @@ class Engine:
         task = self.tasks[tid]
         self.rec[tid].prep_end = self.now
         dur = task.tail_ns
-        for name, _oid, base, _b in task.ops:
-            dur += base / self.knobs.op_scale(name)
+        if self._banked:
+            # Work already banked by OOM-rescheduled attempts (model mode)
+            # is not re-done: only the remaining fraction runs here.
+            remaining = max(0.0, 1.0 - self._banked.get(tid, 0.0))
+            for name, _oid, base, _b in task.ops:
+                dur += base / self.knobs.op_scale(name) * remaining
+        else:
+            for name, _oid, base, _b in task.ops:
+                dur += base / self.knobs.op_scale(name)
         self.schedule(self.now + dur, self._finish, tid)
 
     def _finish(self, tid: int) -> None:
@@ -390,21 +756,44 @@ class Engine:
         self._n_res[dev] -= 1
         self._reserved[dev] -= self._granted.pop(tid, 0.0)
         devs_to_pump = {dev}
+        spill_on = self.spill_mode != "off"
         # publish outputs
         for bid in task.output_batches:
             b = self.batches[bid]
             if b.gpu_resident:
-                self._resident[
-                    b.device if b.device in self._resident else dev
-                ] += b.nbytes
+                d = b.device if b.device in self._resident else dev
+                if spill_on:
+                    rest = max(0.0, float(b.nbytes) - self._prepub.pop(bid, 0.0))
+                    self._resident[d] += rest
+                    self._lru[d][bid] = self._lru[d].get(bid, 0.0) + rest
+                else:
+                    self._resident[d] += b.nbytes
+        # unpin inputs
+        if spill_on:
+            for bid in task.input_batches:
+                n = self._pins.get(bid, 0) - 1
+                if n > 0:
+                    self._pins[bid] = n
+                else:
+                    self._pins.pop(bid, None)
         # consume inputs
         for bid in task.input_batches:
             self._batch_pending[bid] -= 1
             if self._batch_pending[bid] == 0:
                 b = self.batches[bid]
+                host_part = self._evicted.pop(bid, None)
+                if host_part is not None:
+                    # demoted / born-downgraded part consumed from HOST
+                    # (replay: its re-read cost sits in the traced spans)
+                    self._host_used -= host_part
                 if b.gpu_resident:
                     d = b.device if b.device in self._resident else dev
-                    self._resident[d] -= b.nbytes
+                    if spill_on:
+                        # remaining accounted GPU bytes (spins may have
+                        # consumed or demoted part of this batch already)
+                        self._resident[d] -= self._lru[d].pop(bid, 0.0)
+                    else:
+                        self._resident[d] -= b.nbytes
                     devs_to_pump.add(d)
         self._sample_threads(dev)
         self._sample_pool(dev)
@@ -482,19 +871,36 @@ class Engine:
             forced_admissions=self.forced_admissions,
             dep_cycle_breaks=self.dep_cycle_breaks,
             orphan_gpu_batches=self.orphan_gpu_batches,
+            spill_mode=self.spill_mode,
+            downgrade_events=self.downgrade_events,
+            downgraded_bytes=self.downgraded_bytes,
+            reupgraded_bytes=self.reupgraded_bytes,
+            oom_retries=self.oom_retries,
+            spin_ns=self.spin_ns_total,
+            retry_cap_forced=self.retry_cap_forced,
         )
 
 
-def simulate_query(model, graph: QueryGraph, knobs: Knobs) -> SimResult:
+def simulate_query(
+    model,
+    graph: QueryGraph,
+    knobs: Knobs,
+    spill_mode: str = "auto",
+    spill: Optional[SpillParams] = None,
+) -> SimResult:
     """Convenience wrapper wiring session-level resource facts into the engine."""
     pool = {}
     for ms in model.memory_spaces.values():
         if ms.tier == "GPU":
             pool[ms.device_id] = ms.capacity_bytes
+    host = getattr(model, "host_pool_capacity", 0)
     return Engine(
         graph,
         knobs,
         n_threads=model.n_executor_threads,
         pool_capacity=pool,
         channel_capacity=dict(model.channel_peak_rate),
+        spill_mode=spill_mode,
+        spill=spill,
+        host_capacity=host if host else None,
     ).run()

@@ -284,6 +284,7 @@ def simulate_with_physics(
     caps = physics_channel_capacity(
         graph, annotations, knobs, session_peak=dict(model.channel_peak_rate)
     )
+    host = getattr(model, "host_pool_capacity", 0)
     result = Engine(
         g2,
         _engine_knobs(knobs),
@@ -291,6 +292,7 @@ def simulate_with_physics(
         pool_capacity=pool,
         channel_capacity=caps,
         queue_order=queue_order,
+        host_capacity=host if host else None,
     ).run()
     return result, jstats, rstats
 
@@ -306,8 +308,9 @@ def physics_knob_warnings(knobs: Knobs, jstats: JoinStats) -> List[str]:
         )
     if knobs.gpu_mem_capacity != 1.0:
         w.append(
-            "gpu_mem_capacity: back-pressure-only approximation (real engine "
-            "would spill; forced_admissions marks would-be spills)."
+            "gpu_mem_capacity: engine-level calibrated downgrade model "
+            "(docs/spill-model.md) — sub-knee predictions are "
+            "order-of-magnitude with ~±40% bands."
         )
     if knobs.gpu_compute != 1.0 or knobs.gpu_mem_bandwidth is not None:
         w.append(

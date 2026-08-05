@@ -98,11 +98,15 @@ class Knobs:
             )
         if self.gpu_mem_capacity != 1.0:
             w.append(
-                "gpu_mem_capacity: shrinking capacity makes tasks WAIT for "
-                "reservation admission. The real engine would instead spill "
-                "(downgrade) — the sample trace has zero Downgrading events, so "
-                "spill cost cannot be calibrated yet; simulated slowdowns are a "
-                "back-pressure-only approximation (see v1 roadmap)."
+                "gpu_mem_capacity: below the spill knee the engine now runs "
+                "the CALIBRATED downgrade model (docs/spill-model.md): idle "
+                "resident batches are demoted to the HOST pool at measured "
+                "rates and un-grantable reservations pay measured "
+                "OOM-reschedule cycles with partial progress. Jointly fit on "
+                "two SF1000 pressure points (q21@0.25x +39%, q9@0.15x -20%); "
+                "strict held-out transfer is one-sided (-20% / +179%), so "
+                "treat sub-knee predictions as order-of-magnitude with ~±40% "
+                "bands at best — and expect over-warning at shallow pressure."
             )
         for name in ("cpu_mem_capacity", "cpu_mem_bandwidth", "cpu_compute"):
             if getattr(self, name) != 1.0:

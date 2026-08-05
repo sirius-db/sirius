@@ -16,7 +16,9 @@ import statistics
 import sys
 from typing import Any, Dict, List, Optional
 
-from .engine import simulate_query
+from dataclasses import fields as dc_fields
+
+from .engine import SPILL_MODES, SpillParams, simulate_query
 from .knobs import Knobs, parse_knob_args
 from .model import QueryGraph, SessionModel
 from .report import (
@@ -31,10 +33,35 @@ from .trace import load_session_model
 
 
 def _load(args) -> SessionModel:
-    cache_dir = None if getattr(args, "no_cache", False) else args.cache_dir
+    # load_session_model treats None as "use the default cache dir" and ""
+    # as "disable caching" — map --no-cache to the latter.
+    cache_dir = "" if getattr(args, "no_cache", False) else args.cache_dir
     return load_session_model(
         args.session_dir, cache_dir=cache_dir, verbose=args.verbose
     )
+
+
+def _parse_spill_params(pairs: List[str]) -> Optional[SpillParams]:
+    if not pairs:
+        return None
+    sp = SpillParams()
+    known = {f.name for f in dc_fields(SpillParams)}
+    for pair in pairs:
+        name, _, val = pair.partition("=")
+        name = name.strip()
+        if name not in known:
+            raise SystemExit(
+                f"unknown --spill-param {name!r}; known: {', '.join(sorted(known))}"
+            )
+        setattr(sp, name, int(float(val)) if name == "max_oom_retries" else float(val))
+    return sp
+
+
+def _spill_kwargs(args) -> dict:
+    return {
+        "spill_mode": getattr(args, "spill_mode", "auto"),
+        "spill": _parse_spill_params(getattr(args, "spill_param", None) or []),
+    }
 
 
 def _select_graph(model: SessionModel, args) -> QueryGraph:
@@ -85,10 +112,11 @@ def cmd_simulate(args) -> int:
     knobs = parse_knob_args(args.knob or [])
     for w in knobs.warnings():
         print(f"WARNING: {w}", file=sys.stderr)
+    sk = _spill_kwargs(args)
     baseline = None
     if not knobs.is_baseline():
-        baseline = simulate_query(model, graph, Knobs())
-    result = simulate_query(model, graph, knobs)
+        baseline = simulate_query(model, graph, Knobs(), **sk)
+    result = simulate_query(model, graph, knobs, **sk)
     rep = query_report(model, graph, knobs, result, baseline_result=baseline)
     print(render_text(rep))
     if args.json:
@@ -100,10 +128,11 @@ def cmd_simulate(args) -> int:
 def cmd_selfcheck(args) -> int:
     model = _load(args)
     knobs = Knobs()
+    sk = _spill_kwargs(args)
     rows: List[Dict[str, Any]] = []
     for q in model.queries:
         graph = model.graphs[q.uuid]
-        result = simulate_query(model, graph, knobs)
+        result = simulate_query(model, graph, knobs, **sk)
         traced = graph.traced_exec_wall_ns
         err = 100.0 * (result.wall_ns - traced) / traced if traced else 0.0
         rows.append(
@@ -117,6 +146,7 @@ def cmd_selfcheck(args) -> int:
                 "binding": result.binding_constraint(min(result.n_threads)),
                 "forced_admissions": result.forced_admissions,
                 "dep_cycle_breaks": result.dep_cycle_breaks,
+                "spill_mode": result.spill_mode,
             }
         )
     errs = [abs(r["err_pct"]) for r in rows]
@@ -168,7 +198,8 @@ def cmd_sweep(args) -> int:
     if not sweeps:
         raise SystemExit("provide at least one --sweep name=v1,v2,...")
     base_knobs = parse_knob_args(args.knob or [])
-    baseline = simulate_query(model, graph, Knobs())
+    sk = _spill_kwargs(args)
+    baseline = simulate_query(model, graph, Knobs(), **sk)
 
     names = list(sweeps.keys())
     rows: List[Dict[str, Any]] = []
@@ -181,7 +212,7 @@ def cmd_sweep(args) -> int:
             if w not in warned:
                 warned.add(w)
                 print(f"WARNING: {w}", file=sys.stderr)
-        result = simulate_query(model, graph, knobs)
+        result = simulate_query(model, graph, knobs, **sk)
         dev0 = min(result.n_threads)
         row: Dict[str, Any] = {n: v for n, v in zip(names, values)}
         row.update(
@@ -209,6 +240,11 @@ def cmd_sweep(args) -> int:
                 ),
                 "mem_blocked_ms": round(result.block_totals[dev0]["memory"] / 1e6, 1),
                 "forced_admissions": result.forced_admissions,
+                "spill_mode": result.spill_mode,
+                "downgrade_events": result.downgrade_events,
+                "downgraded_gb": round(result.downgraded_bytes / 1e9, 2),
+                "oom_retries": result.oom_retries,
+                "spin_s": round(result.spin_ns / 1e9, 2),
             }
         )
         rows.append(row)
@@ -227,6 +263,11 @@ def cmd_sweep(args) -> int:
         "chan_throttled_ms",
         "mem_blocked_ms",
         "forced_admissions",
+        "spill_mode",
+        "downgrade_events",
+        "downgraded_gb",
+        "oom_retries",
+        "spin_s",
     ]
     print(_table(headers, [[str(r[h]) for h in headers] for r in rows]))
     if args.csv:
@@ -252,6 +293,21 @@ def build_parser() -> argparse.ArgumentParser:
         )
         sp.add_argument("--no-cache", action="store_true")
         sp.add_argument("--verbose", "-v", action="store_true")
+        sp.add_argument(
+            "--spill-mode",
+            choices=SPILL_MODES,
+            default="auto",
+            help="downgrade/spill layer: auto (replay a pressured trace's "
+            "bookkeeping / model predictive downgrades under a capacity "
+            "knob), off (v0 blocking), replay, model",
+        )
+        sp.add_argument(
+            "--spill-param",
+            action="append",
+            metavar="NAME=VALUE",
+            help="override a SpillParams field (e.g. oom_cycle_ns=5e7, "
+            "downgrade_rate=30, upgrade_rate=29, max_oom_retries=100)",
+        )
 
     sp = sub.add_parser("info", help="list queries / session facts")
     common(sp)

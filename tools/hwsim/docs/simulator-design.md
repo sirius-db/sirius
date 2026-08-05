@@ -130,10 +130,35 @@ accounting.
 
 **Progress guarantee:** if the simulation stalls completely (event heap
 empty, a queue head memory-blocked, nothing running that could free bytes)
-the head is force-admitted. This is precisely the point where the real
-engine would issue `request_downgrade()` and spill; v0 cannot price that
-(the sample trace has zero `Downgrading` events), so the occurrence is
-counted (`forced_admissions`) and reported as a fidelity warning.
+the head is force-admitted; occurrences are counted (`forced_admissions`).
+In v0 this was the only stand-in for the engine's `request_downgrade()`
+path. **Since the G5 work this is a last-resort fallback only**: the spill
+layer (§3.2.1) evicts/downgrades before it triggers.
+
+### 3.2.1 Spill / downgrade layer (G5 — see [spill-model.md](spill-model.md))
+
+The pool now has a downgrade mechanism with three modes (`spill_mode="auto"`
+picks per graph/knobs; `off` reproduces v0 byte-identically and is what
+unpressured knobs=1 runs resolve to):
+
+- **replay** (trace contains `Downgrading`/OOM-rescheduled tasks): idle
+  resident batches are evicted at zero time cost when the head is
+  memory-blocked — the traced spans already carry every real cost (downgrade
+  waits inside grant_ns, re-upgrades inside retry Preparing spans, recompute
+  waste = the traced failed attempts). This fixed the +2743% replay error on
+  the E2-mid pressured capture to +0.25…+0.41%.
+- **model** (capacity knob on an unpressured trace): mirrors the real
+  admission/downgrade policy — reservation-dominated deficits block
+  (waiting suffices; the real engine emits no Downgrading there);
+  resident-data overshoot triggers LRU downgrade sweeps to the engine's
+  `downgrade_stop_fraction`, bounded by the HOST pool, stalling the manager
+  at measured rates; still-ungrantable heads dispatch-and-OOM as the real
+  engine does — calibrated 50 ms reschedule cycles that bank partial
+  progress (`reschedule_intermediate` semantics), free consumed inputs and
+  materialize a calibrated fraction of their outputs host-side. Slowdown is
+  emergent. Calibrated on the E2 pressure captures: q21@0.25× +38.8%,
+  q9@0.15× −20.4% (v0: −82%/−58%, inverted); held-out transfer is
+  one-sided — see spill-model.md §5–6 for the full table and caveats.
 
 ### 3.3 Transfer channels (fluid model)
 One channel per `(origin_tier, target_tier, device)`. Each transferring task
@@ -167,7 +192,7 @@ degraded by a known WS1 gap emits a WARNING when moved.
 | knob | mechanics | honest caveat |
 |---|---|---|
 | `c2c_bandwidth` | transfer demand rates and channel capacities scale by k; durations re-derived from bytes | Preparing includes GPU decompression that is **SM-bound** on GB300 (nsys doc §5.1, memory note); scaling the whole span with the link is optimistic for k>1. SM-driven zero-copy C2C traffic inside kernels is invisible (nsys §5.2). |
-| `gpu_mem_capacity` | pool capacity scales; admission waits emerge; forced admissions counted | real engine **spills** (downgrade executor) instead of waiting; v0 shows pure back-pressure, i.e. a *pessimistic* cliff. Needs a memory-pressured trace + G5 downgrade events to calibrate. |
+| `gpu_mem_capacity` | pool capacity scales; admission waits emerge; below the spill knee the **calibrated downgrade model** runs (§3.2.1, [spill-model.md](spill-model.md)) | calibrated on two SF1000 pressure points (q21@0.25× +39%, q9@0.15× −20%; v0 was −82%/−58% *in the dangerous direction*). Held-out transfer one-sided; treat sub-knee predictions as order-of-magnitude ±40% and expect over-warning at shallow pressure. |
 | `gpu_compute` | all `Computing` spans ÷ k | conflates SM throughput, HBM bandwidth, launch overhead and host glue (G4). Launch overhead does not scale with clocks ⇒ optimistic for k>1. |
 | `gpu_mem_bandwidth` | placeholder: spans ÷ min(gpu_compute, gpu_mem_bandwidth) | pessimistic roofline stand-in until the nsys physics join supplies a per-kernel compute/HBM split (G4). |
 | `io_bandwidth` | `GPU_SCAN` Computing spans ÷ k | **G1: no I/O events exist.** Scan read time is fused with GPU decode in one span; the knob scales both, and the flagship "faster I/O → scan blocks on memory" scenario cannot be reproduced until G1 instrumentation lands. On the sample trace the run was host-cached, so disk I/O is doubly invisible. |
@@ -300,11 +325,12 @@ Stdlib only.
    q09_iter3 experiment (+24% if ignored); under aggressive knobs the real
    creator could genuinely reorder. → needs G5-style creator telemetry or a
    task-creator model in v1.
-2. **Spill/downgrade is not priced** — `gpu_mem_capacity` cliffs are upper
-   bounds on slowdown shape, not calibrated predictions (`forced_admissions`
-   marks every would-be spill). → needs a memory-pressured capture (the
-   engine's pool YAML knob makes this easy — WS7 matrix should include one)
-   plus G5 downgrade-executor events.
+2. **Spill/downgrade** — ~~not priced~~ **addressed 2026-08-05** with the
+   G5 spill layer (§3.2.1, [spill-model.md](spill-model.md)), calibrated on
+   the WS8 E2 pressure captures. Remaining gap: a single global
+   `spin_output_host_fraction` cannot express reality's per-stage split
+   (partition stage pegged, downstream clean) — the born-tier telemetry ask
+   in spill-model.md §7 would close it.
 3. **Manager-loop / creator serialization (~10–20 µs/admission) not
    modeled** → the −0.2% median bias and the −1.2% q04 worst case.
 4. **Preparing is treated as pure link transfer** though it contains
@@ -326,6 +352,6 @@ Stdlib only.
 | G2 (no producer-task id) | switch attribution to the emitted `producer_task_uuid`; drop the time-window heuristic (98% ambiguous today) | exact task DAG; removes the dep-cycle guard; enables per-edge volumes |
 | G3 (no rows/output bytes) | use `rows_in/rows_out/output_bytes` per (task, operator) | volume-aware re-timing (operator cost models), plan-change what-ifs |
 | G4 (no GPU-busy split) | join the paired nsys capture by structural key (query, pipeline, operator, task ordinal — WS2 §4.4); split spans into kernel-busy / launch / sync / memcpy; per-kernel compute-vs-HBM classification (WS2 §5.1) | separate `gpu_compute` from `gpu_mem_bandwidth`; stop scaling launch overhead; split Preparing into decompress (SM) + copy (link) |
-| G5 (wait reasons, downgrade events) | model the downgrade executor as a resource once its FSM exists; model the manager loop as a serial server; consume split-connector queue telemetry | calibrated spill costs (replaces forced-admission warnings); closes the −0.2% bias; scan starvation becomes visible |
+| G5 (wait reasons, downgrade events) | **spill model shipped 2026-08-05** ([spill-model.md](spill-model.md)): downgrade sweeps + OOM-reschedule cycles calibrated on the E2 pressure captures. Still wanted: born-tier batch telemetry, retry linkage, downgrade-executor FSM (spill-model.md §7); manager loop as a serial server; split-connector queue telemetry | replaces forced-admission warnings with calibrated spill predictions; the remaining asks would replace the calibrated β with measured per-stage truth; closes the −0.2% bias; scan starvation becomes visible |
 | G6 (config snapshot) | read thread counts / pool config / hardware from `engine.Init.custom_attributes` when populated | drop the count-resources heuristics; portable across boxes |
 | — (validation) | capture a **memory-pressured trace** (shrunk pool YAML) and a **cold-I/O trace** (cache disabled); WS7/WS8 then compare simulator predictions against the physically throttled runs (WS3–WS5) | closes the loop on knob fidelity |

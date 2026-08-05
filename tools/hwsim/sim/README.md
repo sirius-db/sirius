@@ -49,7 +49,7 @@ Continuous multipliers, default 1.0 (= traced hardware); pass repeated
 | knob | v0 effect | fidelity |
 |---|---|---|
 | `c2c_bandwidth` | re-times HOST→GPU/GPU→HOST Preparing materializations from bytes at scaled rate through a shared fluid channel | span includes SM-bound decompression (warned) |
-| `gpu_mem_capacity` | scales the GPU pool; reservation admission waits **emerge** | real engine would spill instead of waiting (warned; sample trace has no Downgrading events to calibrate spills) |
+| `gpu_mem_capacity` | scales the GPU pool; reservation admission waits **emerge**; below the spill knee the calibrated downgrade model runs (`../docs/spill-model.md`) | calibrated on two SF1000 pressure points (+39%/−20%); held-out transfer one-sided — order-of-magnitude with ~±40% bands (warned) |
 | `gpu_compute` | scales operator Computing spans | conflates SM + HBM + launch overhead until the nsys join (gap G4, warned) |
 | `gpu_mem_bandwidth` | placeholder: spans scale by `1/min(gpu_compute, gpu_mem_bandwidth)` | pessimistic roofline stand-in (warned) |
 | `io_bandwidth` | scales `GPU_SCAN` Computing spans | **loud caveat**: no I/O events in the trace (gap G1); scales decode too |
@@ -66,8 +66,15 @@ machine-readable report including thread-busy and pool-occupancy timelines.
 `selfcheck`/`sweep` print tables and write CSV with `--csv`.
 
 Diagnostic counters to watch in reports:
-- `forced_admissions` — the sim force-admitted a memory-blocked task to make
-  progress (the real engine would downgrade/spill there; v0 cannot price it),
+- `spill` block (`mode`, `downgrade_events`, `downgraded_gb`,
+  `reupgraded_gb`, `oom_retries`, `spin_s`, `retry_cap_forced`) — the G5
+  downgrade/spill layer (`../docs/spill-model.md`): pressured traces replay
+  via zero-cost eviction bookkeeping (`replay`), capacity what-ifs run the
+  calibrated downgrade + OOM-reschedule mechanism (`model`). Override with
+  `--spill-mode` / `--spill-param name=value`,
+- `forced_admissions` — last-resort force-admission of a memory-blocked task
+  (with the spill layer this should stay ~0; `retry_cap_forced` counts the
+  retry-budget safety valve),
 - `dep_cycle_breaks` — batch→producer attribution produced a cycle (never
   observed on the sample trace),
 - `ambiguous_producer_batches` — batches whose producing task was inferred
@@ -85,11 +92,15 @@ hwsim/
   model.py    dataclasses (SessionModel / QueryGraph / TaskSpec / BatchSpec)
   knobs.py    knob definitions, scaling rules, fidelity warnings
   engine.py   discrete-event core: thread slots, head-of-line memory
-              admission, fluid transfer channels, deadlock resolution
+              admission, fluid transfer channels, deadlock resolution,
+              spill/downgrade layer (SpillParams; replay + model modes)
   report.py   text/JSON/CSV reports, breakdowns, timelines
   cli.py      info / simulate / selfcheck / sweep
 tests/
   test_engine.py  19 analytic toy-graph tests (pool serialization, channel
                   sharing, head-of-line, knob scaling, cross-dependency
                   saturation, queue-order semantics)
+  test_spill.py   analytic spill-layer tests (mode gating, zero-cost replay
+                  eviction, downgrade stalls, re-upgrade charges, OOM-spin
+                  progress banking, retry cap, host-bound eviction)
 ```

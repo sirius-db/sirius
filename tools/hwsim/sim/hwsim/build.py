@@ -82,8 +82,10 @@ def _build_task_spec(rt: RawTask, t0: int) -> Optional[TaskSpec]:
                     )
                 )
         elif name == "Downgrading":
-            # Not present in the sample trace; recorded via diagnostics upstream.
-            pass
+            spec.t_downgrading = ts
+            if payload:
+                spec.dg_shortfall_bytes = int(payload.get("shortfall_bytes", 0) or 0)
+                spec.dg_partial_bytes = int(payload.get("partial_bytes", 0) or 0)
         elif name == "Finalizing":
             spec.t_finalizing = ts
             if payload is not None:
@@ -146,8 +148,116 @@ def _label_queries(queries: List[QueryInfo], graphs: Dict[str, QueryGraph]) -> N
         q.label = f"query{q.index:02d}"
 
 
+def _synthesize_queries(raw: RawSession, verbose: bool = False) -> None:
+    """Fallback for truncated sessions (process killed before the buffered
+    query/plan ndjson was flushed — e.g. the E2-lo-q9 capacity capture):
+    rebuild QueryInfo records from task event extents. Pipelines are grouped
+    into queries via plan declarations when present; otherwise they are
+    clustered temporally (queries execute sequentially, so a pipeline whose
+    first task is created after every task of the current cluster exited
+    starts a new query). t_executing/t_exit become first-task-Created /
+    last-task-Exit, so the 'traced wall' of a synthesized query excludes the
+    (small) planning and result-collection tails."""
+    # per-pipeline task extents
+    extents: Dict[str, List[int]] = {}
+    for rt in raw.tasks.values():
+        for _seq, ts, name, _payload in rt.events:
+            if name == "Created" or name == "Exit":
+                b = extents.get(rt.pipeline_uuid)
+                if b is None:
+                    extents[rt.pipeline_uuid] = [ts, ts]
+                else:
+                    if ts < b[0]:
+                        b[0] = ts
+                    if ts > b[1]:
+                        b[1] = ts
+
+    have_plan_map = any(p.query_uuid for p in raw.pipelines.values())
+    if not have_plan_map:
+        # Group pipelines into queries: temporal clusters (queries execute
+        # sequentially) merged by batch dataflow (pipelines of one query
+        # exchange batches; distinct queries never do — sequential pipelines
+        # of a single query would otherwise over-split).
+        ordered = sorted(
+            (uid for uid in extents if uid in raw.pipelines),
+            key=lambda uid: extents[uid][0],
+        )
+        cluster_of: Dict[str, int] = {}
+        cluster_end = None
+        cluster_id = -1
+        for uid in ordered:
+            t0, t1 = extents[uid]
+            if cluster_end is None or t0 > cluster_end:
+                cluster_id += 1
+                cluster_end = t1
+            else:
+                cluster_end = max(cluster_end, t1)
+            cluster_of[uid] = cluster_id
+
+        parent = list(range(cluster_id + 1))
+
+        def find(x: int) -> int:
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def union(a: int, b: int) -> None:
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[max(ra, rb)] = min(ra, rb)
+
+        batch_producer_cluster: Dict[int, int] = {}
+        for bid, (producer_pipe, _ts) in raw.batch_constructed.items():
+            c = cluster_of.get(producer_pipe)
+            if c is not None:
+                batch_producer_cluster[bid] = c
+        for pl in raw.placements:
+            cc = cluster_of.get(pl.pipeline_uuid)
+            cp = batch_producer_cluster.get(pl.batch_id)
+            if cc is not None and cp is not None:
+                union(cc, cp)
+
+        for uid, c in cluster_of.items():
+            raw.pipelines[uid].query_uuid = f"synth-query-{find(c)}"
+
+    bounds: Dict[str, List[int]] = {}
+    for uid, (t0, t1) in extents.items():
+        p = raw.pipelines.get(uid)
+        if p is None or not p.query_uuid:
+            continue
+        b = bounds.get(p.query_uuid)
+        if b is None:
+            bounds[p.query_uuid] = [t0, t1]
+        else:
+            b[0] = min(b[0], t0)
+            b[1] = max(b[1], t1)
+    recs = sorted((t0, t1, q) for q, (t0, t1) in bounds.items())
+    for idx, (t0, t1, quuid) in enumerate(recs):
+        raw.queries.append(
+            QueryInfo(
+                uuid=quuid,
+                index=idx,
+                label=f"query{idx:02d}",
+                raw_name="",
+                t_init=t0,
+                t_planning=t0,
+                t_executing=t0,
+                t_exit=t1,
+            )
+        )
+    if verbose and recs:
+        print(
+            f"[hwsim] query events missing; synthesized {len(recs)} queries "
+            "from task extents (walls exclude planning/collection tails)",
+            file=sys.stderr,
+        )
+
+
 def build_session_model(raw: RawSession, verbose: bool = False) -> SessionModel:
     tier_name = {uid: t.name for uid, t in raw.memory_tiers.items()}
+    if not raw.queries and raw.pipelines:
+        _synthesize_queries(raw, verbose=verbose)
 
     # ---- group tasks / placements / batches by query --------------------
     pipe_to_query = {uid: p.query_uuid for uid, p in raw.pipelines.items()}
@@ -355,6 +465,11 @@ def build_session_model(raw: RawSession, verbose: bool = False) -> SessionModel:
             peak = max(peak, cur)
         channel_peak[key] = peak
 
+    host_pool = 0
+    for ms in raw.memory_spaces.values():
+        if ms.tier == "HOST":
+            host_pool = max(host_pool, ms.capacity_bytes)
+
     model = SessionModel(
         session_dir=raw.session_dir,
         session_uuid=raw.session_uuid,
@@ -365,6 +480,7 @@ def build_session_model(raw: RawSession, verbose: bool = False) -> SessionModel:
         queries=[q for q in raw.queries if q.uuid in graphs],
         graphs=graphs,
         channel_peak_rate=channel_peak,
+        host_pool_capacity=host_pool,
     )
     _label_queries(model.queries, model.graphs)
     if verbose:

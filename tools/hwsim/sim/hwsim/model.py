@@ -99,6 +99,13 @@ class TaskSpec:
     reservation_bytes: int = 0
     requested_bytes: int = 0
 
+    # Traced downgrade activity (gap G5). t_downgrading >= 0 means the traced
+    # reservation attempt fell short and the engine issued request_downgrade();
+    # the Downgrading -> Preparing span (inside grant_ns) is the downgrade wait.
+    t_downgrading: int = -1
+    dg_shortfall_bytes: int = 0
+    dg_partial_bytes: int = 0
+
     # Preparing phase (input materialization).
     prep_origin: str = ""
     prep_target: str = ""
@@ -168,6 +175,14 @@ class QueryGraph:
     def traced_exec_wall_ns(self) -> int:
         return self.info.exec_wall_ns or 0
 
+    @property
+    def has_traced_spill(self) -> bool:
+        """True when the traced execution ran under memory pressure: any task
+        hit the Downgrading state or was OOM-rescheduled (success=false)."""
+        return any(
+            t.t_downgrading >= 0 or not t.success for t in self.tasks.values()
+        )
+
 
 @dataclass
 class SessionModel:
@@ -182,6 +197,9 @@ class SessionModel:
     # (origin_tier, target_tier, device) -> observed peak aggregate rate
     # over concurrent Preparing transfers, bytes/ns (== GB/s).
     channel_peak_rate: Dict[Tuple[str, str, int], float] = field(default_factory=dict)
+    # HOST memory-space capacity (bytes) — bounds how much the spill model can
+    # downgrade out of the GPU pool (0 = unknown -> treated as unbounded).
+    host_pool_capacity: int = 0
 
     def graph_by_label(self, label: str) -> QueryGraph:
         for q in self.queries:

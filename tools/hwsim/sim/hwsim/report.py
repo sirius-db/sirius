@@ -151,6 +151,15 @@ def query_report(
                 for (o, t, d), cs in sorted(result.channel_stats.items())
             },
         },
+        "spill": {
+            "mode": result.spill_mode,
+            "downgrade_events": result.downgrade_events,
+            "downgraded_gb": result.downgraded_bytes / 1e9,
+            "reupgraded_gb": result.reupgraded_bytes / 1e9,
+            "oom_retries": result.oom_retries,
+            "spin_s": result.spin_ns / 1e9,
+            "retry_cap_forced": result.retry_cap_forced,
+        },
         "warn_counters": {
             "forced_admissions": result.forced_admissions,
             "dep_cycle_breaks": result.dep_cycle_breaks,
@@ -237,6 +246,17 @@ def render_text(rep: Dict[str, Any]) -> str:
             f"busy {c['busy_ms']:.1f} ms, throttled {c['throttled_ms']:.1f} ms, "
             f"achieved {c['achieved_gbps']:.1f} GB/s, "
             f"peak {c['peak_concurrent']} concurrent",
+            file=out,
+        )
+    sp = rep.get("spill", {})
+    if sp and sp.get("mode", "off") != "off":
+        print(
+            f"spill ({sp['mode']}): downgrades {sp['downgrade_events']} "
+            f"({sp['downgraded_gb']:.2f} GB demoted, "
+            f"{sp['reupgraded_gb']:.2f} GB re-upgraded), "
+            f"oom retries {sp['oom_retries']} "
+            f"({sp['spin_s']:.2f} s thread time), "
+            f"retry-cap forced {sp['retry_cap_forced']}",
             file=out,
         )
     warn = {k: v for k, v in rep["warn_counters"].items() if v}
