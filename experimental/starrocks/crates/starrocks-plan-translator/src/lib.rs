@@ -91,6 +91,7 @@ use substrait::proto::{Plan, PlanRel, RelRoot, plan_rel};
 // commits to is intentionally small: `PlanTranslator`, `translate_fragment`,
 // `TranslatedPlan`, `TranslateError`, and the extension registry. Widen a module
 // to `pub` only when a real consumer needs it.
+pub(crate) mod agg_phase;
 pub(crate) mod descriptor_table;
 pub mod error;
 mod expr_translator;

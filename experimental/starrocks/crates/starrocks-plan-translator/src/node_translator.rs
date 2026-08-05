@@ -12,6 +12,7 @@ use substrait::proto::{
     rel_common, sort_field,
 };
 
+use crate::agg_phase::{self, AggPhase};
 use crate::descriptor_table::DescriptorTable;
 use crate::error::{Result, TranslateError};
 use crate::expr_translator::{self, ExprContext, TranslateExpr};
@@ -418,12 +419,12 @@ fn translate_exchange(
     apply_conjuncts(translated, node, ctx)
 }
 
-/// Translates a one-phase `AGGREGATION_NODE` into a Substrait aggregate relation.
+/// Translates an `AGGREGATION_NODE` into a Substrait aggregate relation.
 ///
-/// Only finalized single-phase aggregation is supported (run StarRocks with
-/// `new_planner_agg_stage = 1`); merge/update phases would require modeling partial aggregate
-/// states. The output row layout is the aggregation output tuple, whose materialized slots are
-/// the grouping keys followed by the aggregate results (StarRocks allocates them in that order).
+/// The node's phase (one-shot / partial / merge, see [`agg_phase::classify`]) decides how the
+/// measures are emitted. The output row layout is the aggregation output tuple, whose
+/// materialized slots are the grouping keys followed by the aggregate results (StarRocks
+/// allocates them in that order).
 fn translate_aggregation(
     node: &TPlanNode,
     children: Vec<TranslatedRel>,
@@ -435,12 +436,36 @@ fn translate_aggregation(
         context: "AGGREGATION_NODE",
         field: "agg_node",
     })?;
-    if !agg.need_finalize || agg.intermediate_tuple_id != agg.output_tuple_id {
+    let phase = agg_phase::classify(node.node_id, node.node_type, agg)?;
+    // Never observed in new-optimizer plans (the FE sets the two ids equal in every phase);
+    // kept as its own loud error so a plan shape that does split them cannot slip through the
+    // slot-layout assumptions below.
+    if agg.intermediate_tuple_id != agg.output_tuple_id {
         return Err(TranslateError::UnsupportedPlanNode {
             node_id: node.node_id,
             node_type: node.node_type,
-            reason: "only finalized one-phase aggregation is supported (new_planner_agg_stage=1)",
+            reason: "aggregation node has distinct intermediate and output tuples \
+                     (SET new_planner_agg_stage = 1)",
         });
+    }
+    match phase {
+        AggPhase::OneShot => {}
+        AggPhase::Partial => {
+            return Err(TranslateError::UnsupportedPlanNode {
+                node_id: node.node_id,
+                node_type: node.node_type,
+                reason: "partial (update-serialize) aggregation is not translated yet \
+                         (SET new_planner_agg_stage = 1)",
+            });
+        }
+        AggPhase::Merge => {
+            return Err(TranslateError::UnsupportedPlanNode {
+                node_id: node.node_id,
+                node_type: node.node_type,
+                reason: "merge (finalize) aggregation is not translated yet \
+                         (SET new_planner_agg_stage = 1)",
+            });
+        }
     }
     let output_tuple = agg.output_tuple_id;
 

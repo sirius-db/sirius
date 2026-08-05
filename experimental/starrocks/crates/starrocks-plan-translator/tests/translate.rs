@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
 
 use starrocks_plan_translator::{
-    ExchangeInput, ExtensionRegistry, PlanTranslator, TranslateError, URN_BOOLEAN, URN_COMPARISON,
-    translate_fragment,
+    ExchangeInput, ExtensionRegistry, PlanTranslator, TranslateError, TranslatedPlan, URN_BOOLEAN,
+    URN_COMPARISON, translate_fragment,
 };
 use starrocks_thrift::descriptors::{
     TDescriptorTable, TSlotDescriptor, TTableDescriptor, TTupleDescriptor,
@@ -2240,33 +2240,87 @@ fn multi_distinct_count_translates_to_distinct_count() {
     assert!(names.contains(&"count".to_string()), "{names:?}");
 }
 
-/// Verifies a merge-phase aggregate (two-phase aggregation) is rejected.
-#[test]
-fn merge_aggregation_is_rejected() {
-    let mut aggregate = aggregate_expr(
-        "sum",
-        scalar_type(TPrimitiveType::BIGINT),
-        Some(slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT))),
-    );
-    aggregate.nodes[0].agg_expr = Some(TAggregateExpr::new(true));
-    let agg = aggregation_node(1, 1, Vec::new(), vec![aggregate]);
-    // Output tuple 1 has two slots but no grouping keys, so use a dedicated descriptor with a
-    // single aggregate output slot.
-    let desc = desc_table(
+/// Descriptor for the phase-classification tests: scan tuple 0 and an aggregation output
+/// tuple 1 with a single ungrouped aggregate slot.
+fn scalar_agg_desc() -> TDescriptorTable {
+    desc_table(
         vec![(0, Some(100)), (1, None)],
         vec![
             slot(1, 0, 0, "id", scalar_type(TPrimitiveType::BIGINT)),
             slot(2, 0, 1, "name", scalar_type(TPrimitiveType::VARCHAR)),
             slot(1, 1, 0, "total", scalar_type(TPrimitiveType::BIGINT)),
         ],
-    );
-    let err = translate_fragment(&params(
-        Some(TPlan::new(vec![agg, scan_node(0, 0)])),
-        Some(desc),
+    )
+}
+
+/// A scalar `sum(id)` aggregation node with per-measure merge flags and the node's
+/// `need_finalize`, for driving the phase classifier from tests.
+fn phase_aggregation_node(merge_flags: &[bool], need_finalize: bool) -> TPlanNode {
+    let aggregates = merge_flags
+        .iter()
+        .map(|&is_merge| {
+            let mut aggregate = aggregate_expr(
+                "sum",
+                scalar_type(TPrimitiveType::BIGINT),
+                Some(slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT))),
+            );
+            aggregate.nodes[0].agg_expr = Some(TAggregateExpr::new(is_merge));
+            aggregate
+        })
+        .collect();
+    let mut node = aggregation_node(1, 1, Vec::new(), aggregates);
+    node.agg_node.as_mut().unwrap().need_finalize = need_finalize;
+    node
+}
+
+fn translate_phase_case(node: TPlanNode) -> Result<TranslatedPlan, TranslateError> {
+    translate_fragment(&params(
+        Some(TPlan::new(vec![node, scan_node(0, 0)])),
+        Some(scalar_agg_desc()),
         None,
     ))
-    .unwrap_err();
-    assert!(matches!(err, TranslateError::UnsupportedExpression { .. }));
+}
+
+/// Verifies a merge-phase ("merge finalize") aggregation is rejected at the node level, with a
+/// message naming the phase — not mistranslated as a one-shot aggregate, which would
+/// double-aggregate silently.
+#[test]
+fn merge_aggregation_is_rejected() {
+    let err = translate_phase_case(phase_aggregation_node(&[true], true)).unwrap_err();
+    assert!(matches!(err, TranslateError::UnsupportedPlanNode { .. }));
+    let message = err.to_string();
+    assert!(message.contains("merge"), "{message}");
+    assert!(message.contains("new_planner_agg_stage"), "{message}");
+}
+
+/// Verifies a partial-phase ("update serialize") aggregation is rejected with a message naming
+/// the phase and the session-variable workaround.
+#[test]
+fn partial_aggregation_is_rejected() {
+    let err = translate_phase_case(phase_aggregation_node(&[false], false)).unwrap_err();
+    assert!(matches!(err, TranslateError::UnsupportedPlanNode { .. }));
+    let message = err.to_string();
+    assert!(message.contains("partial"), "{message}");
+    assert!(message.contains("new_planner_agg_stage"), "{message}");
+}
+
+/// Verifies the "merge serialize" combination (a 3/4-phase DISTINCT plan's middle stage) is
+/// rejected as such.
+#[test]
+fn merge_serialize_aggregation_is_rejected() {
+    let err = translate_phase_case(phase_aggregation_node(&[true], false)).unwrap_err();
+    assert!(matches!(err, TranslateError::UnsupportedPlanNode { .. }));
+    let message = err.to_string();
+    assert!(message.contains("merge-serialize"), "{message}");
+}
+
+/// Verifies a node mixing merge and update measures cannot be phase-classified and is rejected.
+#[test]
+fn mixed_phase_aggregation_is_rejected() {
+    let err = translate_phase_case(phase_aggregation_node(&[true, false], true)).unwrap_err();
+    assert!(matches!(err, TranslateError::UnsupportedPlanNode { .. }));
+    let message = err.to_string();
+    assert!(message.contains("mixes merge and update"), "{message}");
 }
 
 /// Verifies a top-N sort becomes project (sort tuple) + sort + fetch with the node limit.
