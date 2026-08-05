@@ -30,7 +30,7 @@ from .model import (
     QueryInfo,
 )
 
-CACHE_FORMAT_VERSION = 9  # bump when RawSession/build outputs change shape
+CACHE_FORMAT_VERSION = 10  # bump when RawSession/build outputs change shape
 
 
 # ---------------------------------------------------------------------------

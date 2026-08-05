@@ -698,10 +698,10 @@ def export_session(
     def _dispatch_prio(t: int) -> float:
         # mirror engine._enqueue exactly (incl. re-exports of exports)
         task = graph.tasks[t]
-        qp = getattr(task, "queue_prio", None)
-        if qp is not None:
-            return float(qp)
-        return float(task.t_queued if task.t_queued >= 0 else task.t_created)
+        try:
+            return task.dispatch_prio
+        except AttributeError:  # pickled models predating the field
+            return float(task.t_queued if task.t_queued >= 0 else task.t_created)
 
     qprio_rank: Dict[int, int] = {
         tid: rank

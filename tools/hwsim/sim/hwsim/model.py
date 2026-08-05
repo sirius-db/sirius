@@ -86,6 +86,11 @@ class TaskSpec:
     # Traced FSM timestamps, ns relative to query exec start. -1 = absent.
     t_created: int = -1
     t_queued: int = -1
+    # Executor-queue entry: the LAST Queued before the first Reserving (the
+    # scheduler's routing step can reorder a burst between the scheduler
+    # queue and the per-GPU executor queue — the q11 replay defect: real
+    # admission follows the executor queue). -1 = single-queue trace.
+    t_queued_exec: int = -1
     t_routing: int = -1
     t_reserving: int = -1
     t_preparing: int = -1
@@ -146,6 +151,18 @@ class TaskSpec:
     @property
     def is_transfer_prep(self) -> bool:
         return bool(self.prep_origin) and self.prep_origin != self.prep_target
+
+    @property
+    def dispatch_prio(self) -> float:
+        """Priority for traced-order dispatch (engine + quent exporter must
+        agree). Precedence: explicit ``qprio`` marker (hwsim-sim exports) >
+        executor-queue entry (real admission order; the routing step can
+        reorder a burst — q11 defect) > scheduler-queue entry > creation."""
+        if self.queue_prio is not None:
+            return float(self.queue_prio)
+        if self.t_queued_exec >= 0:
+            return float(self.t_queued_exec)
+        return float(self.t_queued if self.t_queued >= 0 else self.t_created)
 
     @property
     def compute_ns(self) -> int:

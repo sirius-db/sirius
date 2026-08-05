@@ -96,17 +96,33 @@ queries).
 
 ### 2.2 Queue discipline (a measured decision)
 
-Among *released* tasks, the device queue dispatches in **traced queue-entry
-order** (`task.t_queued`), not simulated arrival order. Rationale: the traced
-order encodes task-creator/scheduler decisions (hint-chain recursion,
-CONCAT byte-threshold batching, build-side priority) that v0 does not model.
-With arrival order, a 5 ms upstream drift on `tpch_q09_iter3` flipped the
-queue position of 16 tiny PARTITION tasks against a 470-task scan burst
-(~3 s of service) and produced a **+24.2% wall error**; with traced order the
-same query reproduces at **+0.11%**. Admission *timing* remains fully
-emergent — only relative order is anchored. `queue_order="arrival"` is kept
-for experiments and unit tests, and the anchoring is an explicit v0
-limitation for extreme knob settings (the real creator could reorder).
+Among *released* tasks, the device queue dispatches in **traced
+executor-queue-entry order** (`TaskSpec.dispatch_prio`), not simulated
+arrival order. Rationale: the traced order encodes task-creator/scheduler
+decisions (hint-chain recursion, CONCAT byte-threshold batching, build-side
+priority) that v0 does not model. With arrival order, a 5 ms upstream drift
+on `tpch_q09_iter3` flipped the queue position of 16 tiny PARTITION tasks
+against a 470-task scan burst (~3 s of service) and produced a **+24.2%
+wall error**; with traced order the same query reproduces at **+0.11%**.
+Admission *timing* remains fully emergent — only relative order is
+anchored. `queue_order="arrival"` is kept for experiments and unit tests,
+and the anchoring is an explicit v0 limitation for extreme knob settings
+(the real creator could reorder).
+
+**Which queue-entry timestamp (the q11 replay defect, WS20):** a task
+passes TWO queues (scheduler queue → `Routing` on the manager thread →
+per-GPU executor queue), and the routing step can reorder a burst — real
+admission follows the **executor** queue. Using the first `Queued`
+timestamp (scheduler entry) replayed `q11` at **+17.88%** on one XM-BASE
+iteration (and 2-of-3 iterations +10–15% on the RTX PRO 6000 box): four
+100–180 ms root tasks queued within 30 µs were routed out of order, the
+engine admitted the wrong one first, and the swap cascaded on the 340 ms
+query. The parser now also keeps the **last `Queued` before the first
+`Reserving`** (`t_queued_exec`), and the engine/exporter dispatch by it
+(precedence: explicit `qprio` export marker > executor entry > scheduler
+entry > creation). q11 replays at −0.05% after the fix; suite-wide effect
+elsewhere ≤ 0.05 pp (B1 selfcheck median 0.05 → 0.08, worst 0.12 → 0.17;
+LB unchanged; §7.2 physics cells move ≤ 0.11 pp).
 
 ## 3. Resource model
 

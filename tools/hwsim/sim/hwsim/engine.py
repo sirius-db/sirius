@@ -464,14 +464,14 @@ class Engine:
         task = self.tasks[tid]
         self.rec[tid].enqueue = self.now
         if self.queue_order == "traced":
-            # hwsim-sim exports carry the dispatch order explicitly (the
-            # simulated enqueue timestamps do not encode it); real traces
-            # anchor on queue-entry time as before. getattr: cached models
-            # may predate the field.
-            qprio = getattr(task, "queue_prio", None)
-            if qprio is not None:
-                prio = float(qprio)
-            else:
+            # TaskSpec.dispatch_prio: explicit qprio marker (hwsim-sim
+            # exports) > executor-queue entry (real admission order; the
+            # scheduler routing step can reorder a burst -- the q11 replay
+            # defect) > scheduler-queue entry > creation. try/except:
+            # cached/pickled models may predate the fields.
+            try:
+                prio = task.dispatch_prio
+            except AttributeError:
                 prio = float(task.t_queued if task.t_queued >= 0 else task.t_created)
         else:
             prio = self.now

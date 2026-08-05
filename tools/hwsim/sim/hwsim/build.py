@@ -52,6 +52,7 @@ def _build_task_spec(rt: RawTask, t0: int) -> Optional[TaskSpec]:
     spec = TaskSpec(tid=rt.tid, uuid=rt.uuid, pipeline_uuid=rt.pipeline_uuid, device=0)
     computing: List[Tuple[int, str, int, int]] = []  # (ts, name, op_id, input_bytes)
     seen_first_queue = False
+    seen_reserving = False
     for seq, ts_abs, name, payload in rt.events:
         ts = ts_abs - t0
         if name == "Created":
@@ -60,6 +61,11 @@ def _build_task_spec(rt: RawTask, t0: int) -> Optional[TaskSpec]:
             if not seen_first_queue:
                 spec.t_queued = ts
                 seen_first_queue = True
+            if not seen_reserving:
+                # last Queued before the first Reserving = executor-queue
+                # entry; the dispatch priority the real admission followed
+                # (routing can reorder a burst -- the q11 replay defect).
+                spec.t_queued_exec = ts
         elif name == "Routing":
             spec.t_routing = ts
             spec.device = int(payload.get("preferred_device_id", 0)) if payload else 0
@@ -68,6 +74,7 @@ def _build_task_spec(rt: RawTask, t0: int) -> Optional[TaskSpec]:
                 if m:
                     spec.queue_prio = int(m.group(1))
         elif name == "Reserving":
+            seen_reserving = True
             spec.t_reserving = ts
             if payload:
                 spec.requested_bytes = int(payload.get("requested_bytes", 0) or 0)
