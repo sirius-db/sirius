@@ -554,6 +554,10 @@ class GPUExecutionIcebergFixture : public MultiFormatFixtureBase {
     auto root = get_project_root();
     v1_path   = (root / "test/cpp/integration/data/iceberg_v1").string();
     v2_path   = (root / "test/cpp/integration/data/iceberg_v2_delete").string();
+
+    auto const conf = root / "test/cpp/integration/data/iceberg_conformance";
+    conf_append_only_path = (conf / "append_only/conf/append_only").string();
+    conf_drop_readd_path  = (conf / "drop_readd/conf/drop_readd").string();
   }
 
   /**
@@ -678,9 +682,89 @@ class GPUExecutionIcebergFixture : public MultiFormatFixtureBase {
     REQUIRE(gpu_rows == expected);
   }
 
+  /**
+   * @brief Enable version guessing with SESSION scope, deliberately not GLOBAL.
+   *
+   * pyiceberg's SqlCatalog writes no version-hint, so reading these tables needs this. The
+   * scope is the point: a plain SET applies to THIS connection only. The delete gate's probe
+   * opens its own fresh Connection, which does not inherit it — so if the probe does not set
+   * the flag itself, the probe errors, the conservative "any failure => decline" fires, and
+   * the case below routes plan_fallback instead of gpu.
+   *
+   * That makes `SET` + a gpu route assertion the direct test for the probe fix. Using SET
+   * GLOBAL here would reach the probe's connection too and silently destroy that coverage.
+   */
+  void enable_version_guessing_session_scope()
+  {
+    auto r = con->Query("SET unsafe_enable_version_guessing = true;");
+    REQUIRE(r);
+    REQUIRE_FALSE(r->HasError());
+  }
+
   std::string v1_path;
   std::string v2_path;
+  std::string conf_append_only_path;
+  std::string conf_drop_readd_path;
 };
+
+//===----------------------------------------------------------------------===//
+// Conformance — tables written by pyiceberg, expectations recorded from pyiceberg's own
+// scan (see test/cpp/integration/data/iceberg_conformance/README.md).
+//
+// Why these exist: every fixture above was hand-built, and the whole set was green at
+// 27 cases / 580 assertions while the GPU scan path returned silently WRONG rows for a
+// dropped-and-re-added column. A hand-built fixture cannot catch that, because it encodes
+// the same assumption the implementation makes — that Iceberg columns resolve by NAME.
+// They resolve by field ID.
+//
+// Two further cases exist in the corpus but are deliberately NOT wired up here:
+// `rename_col` and `add_column` currently DEADLOCK. Name resolution fails at runtime, the
+// query takes the runtime fallback, and the next GPU query on that connection hangs
+// forever. Catch2 has no per-case timeout, so a hang stalls the entire suite rather than
+// failing it — no tag can express "expected to hang". They are covered meanwhile by
+// run_conformance.py, which isolates each case in its own process behind a timeout.
+// Wire them up here once the scan declines at PLAN time instead of failing at runtime.
+//===----------------------------------------------------------------------===//
+
+TEST_CASE_METHOD(GPUExecutionIcebergFixture,
+                 "gpu_execution iceberg - conformance append-only matches pyiceberg",
+                 "[integration][gpu_execution][iceberg]")
+{
+  // The baseline. No evolution, no deletes — so if this ever declines, the gate has begun
+  // over-refusing. It is also the case that proves the delete-gate probe can read a table
+  // with no version hint: pyiceberg's SqlCatalog writes none, and before the probe set
+  // unsafe_enable_version_guessing on its own connection this table was refused with the
+  // message that it had equality-delete files, having zero delete files.
+  enable_version_guessing_session_scope();
+  REQUIRE(delete_file_count(conf_append_only_path) == 0);
+  expect_iceberg_rows("SELECT id, name FROM iceberg_scan('" + conf_append_only_path +
+                        "') ORDER BY id;",
+                      gpu_route::gpu,
+                      {{"1", "a"}, {"2", "b"}, {"3", "c"}});
+}
+
+// EXPECTED TO FAIL until columns resolve by field ID.
+//
+// `y` was dropped and re-added under the same name, so it is a NEW field id (4). The one
+// data file holds the ORIGINAL `y` at field id 3. Per the Iceberg spec the re-added column
+// is absent from that file and must read NULL; pyiceberg and DuckDB both return NULL.
+// Resolving by name finds the old column and returns 111/222 — with no error and no
+// fallback, which is the worst failure mode available.
+//
+// [!shouldfail] keeps the suite honest rather than green-by-omission: the case runs, and
+// the tag records that we know it is broken. When field-ID resolution lands this case
+// starts passing, [!shouldfail] then reports it as a failure, and the tag comes off — so
+// the fix cannot land without someone deleting this comment deliberately.
+TEST_CASE_METHOD(GPUExecutionIcebergFixture,
+                 "gpu_execution iceberg - conformance dropped-and-re-added column reads NULL",
+                 "[integration][gpu_execution][iceberg][!shouldfail]")
+{
+  enable_version_guessing_session_scope();
+  expect_iceberg_rows("SELECT id, x, y FROM iceberg_scan('" + conf_drop_readd_path +
+                        "') ORDER BY id;",
+                      gpu_route::gpu,
+                      {{"1", "10", "NULL"}, {"2", "20", "NULL"}});
+}
 
 //===----------------------------------------------------------------------===//
 // V1 — append-only. Runs on the GPU: iceberg data files are parquet, and iceberg_scan binds
