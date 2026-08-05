@@ -249,13 +249,13 @@ export SIRIUS_CONFIG_FILE=$(pwd)/test/cpp/integration/integration.yaml
 
 ### Thread configuration sweep
 
-`sweep_threads.sh` runs Sirius-only across multiple thread configurations (pipeline, scan, task_creator threads) to find optimal settings. Modifies `integration.yaml` during the run and restores baseline when done.
+`sweep_threads.sh` runs Sirius-only across multiple thread configurations (pipeline, scan, task_creator threads) to find optimal settings. It writes each configuration to a temporary file exported through `SIRIUS_CONFIG_FILE`; the tracked `integration.yaml` is never modified.
 
 ```bash
 bash test/tpch_performance/sweep_threads.sh
 ```
 
-Results are saved to `benchmark_results_thread_sweep/` as CSV files per configuration.
+Results are saved as one CSV per configuration under a unique timestamped directory in `benchmark_results_thread_sweep/`. Set `SWEEP_OUTPUT_DIR` to use an explicit run directory.
 
 ### Legacy shell runners
 
