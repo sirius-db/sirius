@@ -96,6 +96,7 @@ pub(crate) mod descriptor_table;
 pub mod error;
 mod expr_translator;
 mod node_translator;
+pub(crate) mod partial_state;
 mod scan_paths;
 pub(crate) mod type_mapper;
 

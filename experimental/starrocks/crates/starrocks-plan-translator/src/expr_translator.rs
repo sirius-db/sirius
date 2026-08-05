@@ -407,7 +407,7 @@ fn translate_arithmetic(
 }
 
 /// Returns whether a StarRocks type descriptor is any decimal flavour.
-fn is_decimal(type_desc: &starrocks_thrift::types::TTypeDesc) -> Result<bool> {
+pub(crate) fn is_decimal(type_desc: &starrocks_thrift::types::TTypeDesc) -> Result<bool> {
     Ok(matches!(
         type_mapper::scalar_primitive(type_desc)?,
         TPrimitiveType::DECIMAL

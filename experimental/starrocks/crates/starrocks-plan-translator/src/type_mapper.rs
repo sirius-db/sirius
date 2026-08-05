@@ -33,6 +33,16 @@ pub(crate) fn fp64_type(nullable: bool) -> Type {
     }
 }
 
+/// Builds an I64 (BIGINT) type, the partial-state width of integer sums and counts.
+pub(crate) fn i64_type(nullable: bool) -> Type {
+    Type {
+        kind: Some(r#type::Kind::I64(r#type::I64 {
+            type_variation_reference: 0,
+            nullability: nullability(nullable),
+        })),
+    }
+}
+
 /// Renders a Substrait type as the DuckDB type name the engine parses when a fragment declares
 /// an input stream's schema.
 ///
