@@ -19,6 +19,8 @@ src/include/common/                 @sirius-db/sirius-core
 src/include/cudf/                   @sirius-db/sirius-core
 src/**/cuda/                        @sirius-db/sirius-core
 src/**/expression*/                 @sirius-db/sirius-core
+src/*.cpp                           @sirius-db/sirius-core
+src/include/*.hpp                   @sirius-db/sirius-core
 src/**/op/                          @sirius-db/sirius-core
 test/**/op/                         @sirius-db/sirius-core
 test/**/exec/                       @sirius-db/sirius-core
