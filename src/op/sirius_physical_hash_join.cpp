@@ -29,7 +29,6 @@
 #include "cudf/table/table_view.hpp"
 #include "cudf/transform.hpp"
 #include "cudf/types.hpp"
-#include "cudf/unary.hpp"
 #include "cudf/utilities/memory_resource.hpp"
 #include "cudf/version_config.hpp"
 #include "data/data_batch_utils.hpp"
@@ -39,6 +38,7 @@
 #include "duckdb/planner/expression_iterator.hpp"
 #include "expression/ast/to_duckdb.hpp"
 #include "expression_evaluator/gpu_expression_translator_internal.hpp"
+#include "helper/numeric_narrowing.hpp"
 #include "helper/type_conversions.hpp"
 #include "log/logging.hpp"
 #include "op/dynamic_filter_publisher.hpp"
@@ -1278,7 +1278,7 @@ static join_side_keys_result prepare_join_keys(
       is_left_side ? cast_info.left_target_type : cast_info.right_target_type;
 
     if (needs_cast) {
-      auto cast_col = cudf::cast(col, target_type, stream);
+      auto cast_col = sirius::cast_through_rep(col, target_type, stream);
       result.key_views.push_back(cast_col->view());
       result.owned_cast_columns.push_back(std::move(cast_col));
     } else {

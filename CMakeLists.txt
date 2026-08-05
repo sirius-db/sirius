@@ -656,6 +656,7 @@ set(TEST_SOURCES
     test/cpp/integration/test_gpu_execution_multi_format.cpp
     test/cpp/integration/test_gpu_execution_null_safe_join.cpp
     test/cpp/integration/test_gpu_execution_order_nulls.cpp
+    test/cpp/integration/test_gpu_execution_semantic_cast_fallback.cpp
     test/cpp/integration/test_query_lifecycle_slot.cpp
     test/cpp/integration/test_gpu_execution_tpcds_nulls.cpp
     test/cpp/integration/test_gpu_execution_tpch.cpp
@@ -666,6 +667,7 @@ set(TEST_SOURCES
     test/cpp/integration/test_pin_table_mvcc_delete.cpp
     test/cpp/integration/test_pin_table_mvcc_foundation.cpp
     test/cpp/integration/test_pin_table_mvcc_insert.cpp
+    test/cpp/integration/test_pin_table_type_drift.cpp
     test/cpp/integration/test_pin_table_zone_map_pruning.cpp
     test/cpp/integration/test_table_gpu_cache_warm_mgpu.cpp
     test/cpp/integration/test_transparent_runtime_fallback.cpp
