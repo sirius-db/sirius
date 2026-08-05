@@ -23,7 +23,6 @@
 #include <cudf/table/table.hpp>
 
 #include <duckdb/main/client_context.hpp>
-#include <op/scan/iceberg_avro_reader.hpp>
 
 #include <memory>
 #include <optional>

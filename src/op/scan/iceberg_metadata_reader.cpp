@@ -30,7 +30,6 @@
 #include <duckdb/transaction/meta_transaction.hpp>
 #include <io/sirius_datasource.hpp>
 #include <log/logging.hpp>
-#include <op/scan/iceberg_avro_reader.hpp>
 #include <op/scan/iceberg_metadata_reader.hpp>
 #include <op/scan/puffin_reader.hpp>
 
@@ -51,6 +50,31 @@ namespace {
 // Path discovery (from Avro manifests)
 // =========================================================================
 
+/**
+ * @brief One file entry from an Iceberg manifest.
+ *
+ * Covers equality-delete files (content=2) and V3 deletion vectors
+ * (file_format="puffin" with offset info). Local to this translation unit:
+ * nothing outside it names this type.
+ */
+struct IcebergDeleteFileEntry {
+  std::string file_path;
+  int content{0};                     // 0=DATA, 1=POSITION_DELETES, 2=EQUALITY_DELETES
+  std::string file_format;            // "parquet" or "puffin" (always lowercase)
+  std::string referenced_data_file;   // data file this DV applies to (V3, empty if absent)
+  int64_t content_offset{-1};         // byte offset in Puffin file (V3, -1 if absent)
+  int64_t content_size_in_bytes{-1};  // byte length of DV blob (V3, -1 if absent)
+  int64_t sequence_number{0};         // manifest entry sequence number (for eq delete filtering)
+
+  /// True if this entry is a V3 deletion vector (Puffin format with offset info).
+  /// file_format must already be lowercased by whoever read it — see
+  /// read_deletion_vectors_from_manifest, which does so in SQL.
+  [[nodiscard]] bool is_deletion_vector() const
+  {
+    return file_format == "puffin" && content_offset >= 0 && content_size_in_bytes > 0;
+  }
+};
+
 /// Everything discovered from a single manifest-list scan.
 struct IcebergManifestDiscovery {
   std::vector<std::string> positional_delete_files;
@@ -68,6 +92,64 @@ std::string escape_sql_string(std::string const& s)
     out.replace(pos, 1, "''");
   }
   return out;
+}
+
+/**
+ * @brief Read the POSITION_DELETES entries of one manifest via DuckDB's avro reader.
+ *
+ * Only reached for manifests that iceberg_metadata() has already reported a PUFFIN entry in,
+ * so the V3 fields are guaranteed present in the manifest schema; a manifest without them is a
+ * malformed pairing and the binder error it raises is allowed to propagate.
+ *
+ * Two details are load-bearing:
+ *  - `lower(file_format)`: Iceberg writes "PUFFIN" uppercase, is_deletion_vector() compares
+ *    against "puffin". Without the fold, every entry fails the test and the table reads as
+ *    having no deletes — a silent wrong answer rather than an error.
+ *  - The COALESCEs reproduce the struct's defaults for absent optional fields (-1/-1/"") so a
+ *    NULL never reaches GetValue<int64_t>().
+ *
+ * @param conn           Connection already running under the caller's InternalQueryGuard.
+ * @param manifest_path  Filesystem path to the manifest .avro file.
+ * @throws std::runtime_error if the manifest cannot be read.
+ */
+std::vector<IcebergDeleteFileEntry> read_deletion_vectors_from_manifest(
+  duckdb::Connection& conn, std::string const& manifest_path)
+{
+  auto result = conn.Query(
+    "SELECT data_file.file_path, lower(data_file.file_format), "
+    "COALESCE(data_file.referenced_data_file, ''), "
+    "COALESCE(data_file.content_offset, -1), "
+    "COALESCE(data_file.content_size_in_bytes, -1) "
+    "FROM read_avro('" +
+    escape_sql_string(manifest_path) +
+    "') "
+    "WHERE data_file.content = 1");
+
+  if (result->HasError()) {
+    // Same rule as discover_from_manifests: an unreadable manifest must not degrade into an
+    // empty entry list, because empty means "no deletion vectors here" and the scan would then
+    // return rows the table deleted.
+    throw std::runtime_error("[iceberg] Failed to read manifest '" + manifest_path +
+                             "': " + result->GetError());
+  }
+
+  std::vector<IcebergDeleteFileEntry> entries;
+  while (true) {
+    auto chunk = result->Fetch();
+    if (!chunk || chunk->size() == 0) break;
+
+    for (duckdb::idx_t i = 0; i < chunk->size(); ++i) {
+      IcebergDeleteFileEntry entry;
+      entry.content               = 1;
+      entry.file_path             = chunk->GetValue(0, i).ToString();
+      entry.file_format           = chunk->GetValue(1, i).ToString();
+      entry.referenced_data_file  = chunk->GetValue(2, i).ToString();
+      entry.content_offset        = chunk->GetValue(3, i).GetValue<int64_t>();
+      entry.content_size_in_bytes = chunk->GetValue(4, i).GetValue<int64_t>();
+      entries.push_back(std::move(entry));
+    }
+  }
+  return entries;
 }
 
 /// Discover all delete files and data file metadata using DuckDB's iceberg_metadata().
@@ -125,11 +207,11 @@ IcebergManifestDiscovery discover_from_manifests(duckdb::ClientContext& context,
         auto file_format = chunk->GetValue(3, i).ToString();
         if (file_format == kFormatPuffin) {
           // V3 deletion vector: iceberg_metadata() doesn't expose content_offset,
-          // content_size, or referenced_data_file, so we fall back to our custom
-          // Avro reader for the containing manifest.
+          // content_size, or referenced_data_file, so we read the containing
+          // manifest directly through read_avro to pick them up.
           auto manifest_path = chunk->GetValue(4, i).ToString();
           auto& cached       = dv_manifest_cache[manifest_path];
-          if (cached.empty()) { cached = read_iceberg_manifest_entries(manifest_path, 1); }
+          if (cached.empty()) { cached = read_deletion_vectors_from_manifest(conn, manifest_path); }
           for (auto& dv : cached) {
             if (dv.is_deletion_vector()) { result.deletion_vector_entries.push_back(dv); }
           }

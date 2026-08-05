@@ -283,7 +283,6 @@ set(EXTENSION_SOURCES
     src/op/scan/gpu_ingestible.cpp
     src/op/scan/parquet_gpu_ingestible.cpp
     src/op/scan/duckdb_native_gpu_ingestible.cpp
-    src/op/scan/iceberg_avro_reader.cpp
     src/op/scan/iceberg_metadata_reader.cpp
     src/op/scan/puffin_reader.cpp
     src/op/scan/positional_delete_filter.cpp
