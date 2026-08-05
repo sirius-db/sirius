@@ -1,9 +1,13 @@
 # WS9 — New telemetry fields & events (parser handoff)
 
-**Status:** implemented 2026-08-04, code-complete, **not yet built/trace-verified** (build gated
-behind WS8's GPU campaign). Field names below are authoritative (they come from the model source
-`rust/crates/telemetry/model/src/`); confirm exact serialized shapes against the demo trace WS9
-will generate in its build phase before locking parser code.
+**Status:** implemented 2026-08-04; **built and trace-verified 2026-08-05** on the post-merge
+binary (pr-1409 late-mat merge). Demo trace: TPC-H q6/q10 ×2 at SF10, fresh reads, gates dark —
+22/22 io_request FSMs closed with non-nil task uuids and sane bytes/rows; 72/72
+`Constructed` events carried the new fields (16 `num_rows==0` from the documented unknown
+producers); 64/64 `BatchRegistered` with `producer_task_uuid`; 68/68 successful `Finalizing`
+with `output_rows>0`; all 37 Init custom_attribute keys present. `python -m hwsim info`
+parses the new traces (io_request dir ignored, as designed). Field names come from the model
+source `rust/crates/telemetry/model/src/`; serialized shapes below are demo-trace-verified.
 
 **Compatibility contract:** everything is additive. Old traces lack the new fields/entity and
 must keep parsing (treat every new field as optional with the stated default). New traces add
@@ -69,9 +73,20 @@ the task produced no batch output, or old traces.
 
 ## 4. `engine` — `Init.implementation.custom_attributes` now populated (G6)
 
-Previously `{"string_attrs":[],"i64_attrs":[],"f64_attrs":[]}` (or equivalent empty encoding) —
-**parse defensively**: keys may be absent (unit-test contexts still emit empty), and the key set
-may grow. Encoding is quent `DynamicAttributes`: three parallel arrays of `{key, value}`.
+Previously empty — **parse defensively**: keys may be absent (unit-test contexts still emit
+empty), and the key set may grow. **Serialized ndjson shape (verified against the 2026-08-05
+demo trace, session `019fcfff-48d4-...`):** ONE flat array of tagged values, not the model
+source's three parallel arrays:
+
+```json
+{"data":{"Init":{"implementation":{"name":"siriusDB","version":null,"custom_attributes":[
+  {"key":"host.name","value":{"String":"pmgb300ws-0163"}},
+  {"key":"hw.num_gpus","value":{"I64":1}},
+  {"key":"scan_manager.cache.eviction_threshold_fraction","value":{"F64":0.6}}]}}}}
+```
+
+Note the engine `Init` event also has no `seq`/`state` wrapper — `Init` sits directly under
+`data` (pre-existing engine-event shape, unchanged by WS9).
 
 Keys emitted (one-time, per session):
 
