@@ -103,7 +103,9 @@ DuckDB base tables remain writable while pinned. Deletes and committed inserts a
 per query. If an `UPDATE` changes a column used by a query, Sirius does not serve stale cached
 values: with the default `enable_duckdb_fallback = true` the query runs on DuckDB CPU in the same
 transaction; with fallback disabled it returns a clear error. To resume GPU cache serving, run
-`CALL unpin_table(...)`, then `CHECKPOINT`, then pin the table again.
+`CALL unpin_table(...)`, then `CHECKPOINT`, then pin the table again. An explicit
+`CHECKPOINT` while a pin is live also makes that pin ineligible to serve: subsequent queries
+fall back or error until the table is unpinned and pinned again.
 
 ## Configuration
 
