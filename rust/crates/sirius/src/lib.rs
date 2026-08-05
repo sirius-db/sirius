@@ -684,4 +684,143 @@ mod tests {
         // SAFETY: the GPU lock is still held.
         unsafe { std::env::remove_var("SIRIUS_EXCHANGE_STAGING_BYTES") };
     }
+
+    /// Like [`stream_read_plan`] but declaring `id` as FP64 — for the schema-mismatch
+    /// negatives, whose receiver deliberately declares a type the sender does not produce.
+    fn stream_read_plan_f64(stream_id: u64) -> Vec<u8> {
+        use substrait::proto::read_rel::{NamedTable, ReadType};
+        use substrait::proto::{
+            NamedStruct, Plan, PlanRel, ReadRel, Rel, RelRoot, Type, plan_rel, r#type, rel,
+        };
+
+        let names = vec!["id".to_string(), "name".to_string()];
+        let types = vec![
+            Type {
+                kind: Some(r#type::Kind::Fp64(r#type::Fp64 {
+                    type_variation_reference: 0,
+                    nullability: r#type::Nullability::Nullable as i32,
+                })),
+            },
+            Type {
+                kind: Some(r#type::Kind::String(r#type::String {
+                    type_variation_reference: 0,
+                    nullability: r#type::Nullability::Nullable as i32,
+                })),
+            },
+        ];
+        let read = Rel {
+            rel_type: Some(rel::RelType::Read(Box::new(ReadRel {
+                base_schema: Some(NamedStruct {
+                    names: names.clone(),
+                    r#struct: Some(r#type::Struct {
+                        types,
+                        type_variation_reference: 0,
+                        nullability: r#type::Nullability::Required as i32,
+                    }),
+                }),
+                read_type: Some(ReadType::NamedTable(NamedTable {
+                    names: vec![super::stream_view_name(stream_id)],
+                    ..Default::default()
+                })),
+                ..Default::default()
+            }))),
+        };
+        Plan {
+            relations: vec![PlanRel {
+                rel_type: Some(plan_rel::RelType::Root(RelRoot {
+                    input: Some(read),
+                    names,
+                })),
+            }],
+            ..Default::default()
+        }
+        .encode_to_vec()
+    }
+
+    /// The declared input schema is what the receiver's plan binds against; a source whose sink
+    /// produces different column types must fail at the hop, before any batch moves, instead of
+    /// having its columns reinterpreted downstream. Requires a GPU.
+    #[test]
+    fn relay_from_rejects_a_mismatched_schema() {
+        let _guard = GPU_CONTEXT_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        ensure_parquet_extension_env();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("users.parquet");
+        write_users_parquet(&path);
+        let sender_plan = local_files_plan(
+            path.to_str().unwrap(),
+            vec!["id".to_string(), "name".to_string()],
+        );
+
+        let ctx = SiriusContext::new().expect("bring up sirius context");
+        let mut sender = ctx.fragment().unwrap();
+        sender.declare_output(0).unwrap();
+        sender.build(&sender_plan).unwrap();
+        sender.run().unwrap();
+
+        // The sender's sink produces (BIGINT, VARCHAR); the receiver declares id as DOUBLE.
+        let mut receiver = ctx.fragment().unwrap();
+        receiver.declare_input_column(0, "id", "DOUBLE").unwrap();
+        receiver.declare_input_column(0, "name", "VARCHAR").unwrap();
+        receiver.build(&stream_read_plan_f64(0)).unwrap();
+
+        let err = receiver.relay_from(&mut sender, 0, 0, 0).unwrap_err();
+        let what = err.what().to_string();
+        assert!(what.contains("column 0"), "unexpected error: {what}");
+        assert!(
+            what.contains("DOUBLE") && what.contains("BIGINT"),
+            "the error must name the declared and the produced type: {what}"
+        );
+    }
+
+    /// The packed leg of the same guard: a packed batch whose unpacked cudf types disagree with
+    /// the receiver's declared stream schema must be refused by `push_packed`. Requires a GPU.
+    #[test]
+    fn push_packed_rejects_a_mismatched_schema() {
+        let _guard = GPU_CONTEXT_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        ensure_parquet_extension_env();
+        // SAFETY: the GPU lock is held, so no other thread touches the environment here.
+        unsafe { std::env::set_var("SIRIUS_EXCHANGE_STAGING_BYTES", "64MiB") };
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("users.parquet");
+        write_users_parquet(&path);
+        let sender_plan = local_files_plan(
+            path.to_str().unwrap(),
+            vec!["id".to_string(), "name".to_string()],
+        );
+
+        let ctx = SiriusContext::new().expect("bring up sirius context");
+        let mut sender = ctx.fragment().unwrap();
+        sender.declare_output(0).unwrap();
+        sender.build(&sender_plan).unwrap();
+        sender.run().unwrap();
+
+        let batch = sender
+            .export_packed(0)
+            .unwrap()
+            .expect("the sender parked a batch to export");
+
+        let mut receiver = ctx.fragment().unwrap();
+        receiver.declare_input_column(0, "id", "DOUBLE").unwrap();
+        receiver.declare_input_column(0, "name", "VARCHAR").unwrap();
+        receiver.build(&stream_read_plan_f64(0)).unwrap();
+
+        let err = receiver.push_packed(0, &batch).unwrap_err();
+        let what = err.what().to_string();
+        assert!(what.contains("column 0"), "unexpected error: {what}");
+        assert!(
+            what.contains("declared DOUBLE"),
+            "the error must name the declared type: {what}"
+        );
+
+        ctx.staging_release(batch.offset).unwrap();
+        // SAFETY: the GPU lock is still held.
+        unsafe { std::env::remove_var("SIRIUS_EXCHANGE_STAGING_BYTES") };
+    }
 }

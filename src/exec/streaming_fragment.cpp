@@ -113,6 +113,7 @@ void streaming_fragment::build(sirius::query_id_t query_id)
   // RESULT_COLLECTOR, which keeps its child outside and needs special descent in the generator.
   auto types       = subtree->types;
   auto cardinality = subtree->estimated_cardinality;
+  _sink_types      = types;
 
   std::vector<std::shared_ptr<cucascade::shared_data_repository>> sink_repos;
   sink_repos.reserve(_spec.outputs.size());

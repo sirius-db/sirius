@@ -20,6 +20,7 @@
 
 #include "sirius_ffi.hpp"
 
+#include "cudf/cudf_utils.hpp"                             // sirius::get_cudf_type
 #include "data/data_batch_utils.hpp"                       // sirius::make_data_batch
 #include "data/sirius_converter_registry.hpp"              // sirius::converter_registry
 #include "duckdb/common/arrow/result_arrow_wrapper.hpp"    // duckdb::ResultArrowArrayStreamWrapper
@@ -46,10 +47,11 @@
 #include "sirius_context.hpp"                          // duckdb::SiriusContext
 #include "sirius_interface.hpp"  // sirius::sirius_interface, sirius::sirius_prepared_statement_data
 
-#include <cudf/contiguous_split.hpp>          // cudf::chunked_pack, cudf::unpack
-#include <cudf/table/table.hpp>               // cudf::table
-#include <cudf/utilities/default_stream.hpp>  // cudf::get_default_stream
-#include <cudf/utilities/span.hpp>            // cudf::device_span
+#include <cudf/contiguous_split.hpp>           // cudf::chunked_pack, cudf::unpack
+#include <cudf/table/table.hpp>                // cudf::table
+#include <cudf/utilities/default_stream.hpp>   // cudf::get_default_stream
+#include <cudf/utilities/span.hpp>             // cudf::device_span
+#include <cudf/utilities/type_dispatcher.hpp>  // cudf::type_to_name
 
 #include <cuda_runtime_api.h>  // cudaStreamWaitEvent
 
@@ -314,6 +316,11 @@ struct Fragment::Impl {
   std::map<sirius::exec::stream_id_t, declared_input> inputs;
   std::vector<sirius::exec::stream_id_t> outputs;
 
+  //! `inputs` as build() resolved them. Kept so the hop entry points (`relay_from`,
+  //! `push_packed`) can validate an arriving batch against the schema the plan was bound
+  //! against — a disagreement there would otherwise reinterpret cudf columns silently.
+  std::map<sirius::exec::stream_id_t, sirius::exec::stream_input_spec> resolved_inputs;
+
   //! Intermediate fragment: a streaming sink root, owning its own repositories and session.
   std::unique_ptr<sirius::exec::streaming_fragment> fragment;
 
@@ -468,7 +475,8 @@ void Fragment::build(const std::string& substrait_plan)
   impl_->transaction_open = true;
   std::map<sirius::exec::stream_id_t, sirius::exec::stream_input_spec> resolved;
   try {
-    resolved = impl_->resolve_inputs();
+    resolved               = impl_->resolve_inputs();
+    impl_->resolved_inputs = resolved;
     impl_->declare_streams(resolved);
     impl_->create_stream_views();
     impl_->ctx.conn->Commit();
@@ -525,6 +533,35 @@ std::size_t Fragment::relay_from(Fragment& source,
 {
   if (!impl_->built) {
     throw sirius::invalid_input_exception("Fragment: build() must run before relay_from()");
+  }
+  // Metadata-only schema agreement check: the declared input schema is what this fragment's
+  // plan binds against, so a source that produces different columns must fail here, before a
+  // single batch moves, instead of being reinterpreted downstream.
+  if (source.impl_->fragment != nullptr) {
+    if (auto it = impl_->resolved_inputs.find(input_stream_id);
+        it != impl_->resolved_inputs.end()) {
+      const auto& declared = it->second.types;
+      const auto& produced = source.impl_->fragment->sink_types();
+      if (produced.size() != declared.size()) {
+        throw sirius::invalid_input_exception(
+          "Fragment: relay into stream {} expects {} declared columns but the source sink "
+          "produces {}",
+          input_stream_id,
+          declared.size(),
+          produced.size());
+      }
+      for (std::size_t i = 0; i < declared.size(); ++i) {
+        if (produced[i] != declared[i]) {
+          throw sirius::invalid_input_exception(
+            "Fragment: relay into stream {} column {} is declared {} but the source sink "
+            "produces {}",
+            input_stream_id,
+            i,
+            declared[i].to_string(),
+            produced[i].to_string());
+        }
+      }
+    }
   }
   std::size_t moved = 0;
   while (auto batch = source.impl_->session().pull(source_stream_id)) {
@@ -641,6 +678,35 @@ void Fragment::push_packed(std::uint64_t stream_id,
   const auto* payload  = reinterpret_cast<const std::uint8_t*>(arena.base()) + offset;
   // Allocates no device memory: the view aliases the lease until the deep copy below.
   auto unpacked = cudf::unpack(metadata, payload);
+
+  // The engine reads these columns through the schema the stream was declared with; a
+  // declaration/payload disagreement must be a loud error here, not reinterpreted bits
+  // downstream. Checked before the deep copy so a bad batch costs no pool memory.
+  if (auto it = impl_->resolved_inputs.find(stream_id); it != impl_->resolved_inputs.end()) {
+    const auto& declared = it->second;
+    if (static_cast<std::size_t>(unpacked.num_columns()) != declared.types.size()) {
+      throw sirius::invalid_input_exception(
+        "Fragment: packed batch for stream {} carries {} columns but the stream declares {}",
+        stream_id,
+        unpacked.num_columns(),
+        declared.types.size());
+    }
+    for (std::size_t i = 0; i < declared.types.size(); ++i) {
+      const auto expected = sirius::get_cudf_type(declared.types[i]);
+      const auto actual   = unpacked.column(static_cast<cudf::size_type>(i)).type();
+      if (actual != expected) {
+        throw sirius::invalid_input_exception(
+          "Fragment: packed batch for stream {} column {} ({}) is declared {} ({}) but "
+          "carries {}",
+          stream_id,
+          i,
+          declared.names[i],
+          declared.types[i].to_string(),
+          cudf::type_to_name(expected),
+          cudf::type_to_name(actual));
+      }
+    }
+  }
 
   auto* gpu_space = impl_->ctx.context->get_memory_manager().get_memory_space(
     cucascade::memory::Tier::GPU, /*device_id=*/0);
