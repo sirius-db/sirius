@@ -73,4 +73,5 @@ src/**/telemetry/                   @sirius-db/sirius-telemetry
 
 # ── Language overlays (last-match-wins — these take precedence) ───────────────
 **/*.rs                             @sirius-db/sirius-rust
+**/Cargo.lock                       @sirius-db/sirius-rust
 **/*.py                             @sirius-db/sirius-python
