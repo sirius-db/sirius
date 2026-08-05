@@ -353,6 +353,48 @@ class TestFields(ExportBase):
         self.assertEqual(len(orphan_cons), 1)
         self.assertLess(orphan_cons[0][0], t0)
         self.assertEqual(orphan_cons[0][1]["producer_pipeline_uuid"], NIL_UUID)
+        self.assertEqual(orphan_cons[0][1]["producer_task_uuid"], NIL_UUID)
+
+    def test_ws9_fields_present_with_unknown_markers(self):
+        # The Rust analyzer's serde types have NO defaults: every field of the
+        # current model must be present on every line (WS18 defect 1). The
+        # sim emits the documented unknown markers (0 / nil) and real
+        # producer task uuids where the graph carries them.
+        _, _, _, root = self.export_toy()
+        events = read_session(root)
+        task_uuids = set()
+        for ev in events["task"]:
+            st = ev["data"]["state"]
+            if not isinstance(st, dict):
+                continue
+            task_uuids.add(ev["id"])
+            if "Computing" in st:
+                self.assertEqual(st["Computing"]["input_rows"], 0)
+            if "Finalizing" in st:
+                self.assertEqual(st["Finalizing"]["output_rows"], 0)
+                self.assertEqual(st["Finalizing"]["output_bytes"], 0)
+        cons = [
+            ev["data"]["state"]["Constructed"]
+            for ev in events["data_batch"]
+            if isinstance(ev["data"]["state"], dict)
+            and "Constructed" in ev["data"]["state"]
+        ]
+        self.assertTrue(cons)
+        for c in cons:
+            self.assertEqual(c["num_rows"], 0)
+            self.assertEqual(c["num_columns"], 0)
+            # batch 7 is produced by task 0 -> a real (exported) task uuid
+            self.assertIn(c["producer_task_uuid"], task_uuids)
+        regs = [
+            ev["data"]["state"]["BatchRegistered"]
+            for ev in events["batch_placement"]
+            if isinstance(ev["data"]["state"], dict)
+            and "BatchRegistered" in ev["data"]["state"]
+        ]
+        self.assertTrue(regs)
+        for r in regs:
+            self.assertIn("producer_task_uuid", r)
+            self.assertIn(r["producer_task_uuid"], task_uuids | {NIL_UUID})
 
 
 class TestRoundTrip(ExportBase):

@@ -16,6 +16,12 @@ Contract highlights (see tools/hwsim/docs/quent-export.md):
   ones, never copied through from the source trace. Event types the sim has
   no data for (io_request, Downgrading, InTransit, tier-change
   self-transitions, OOM-attempt task FSMs) are OMITTED, not fabricated.
+  Schema-required scalar fields the sim does not track are emitted with the
+  schema's documented unknown markers (0 / nil uuid) — the Rust analyzer's
+  serde types have no field defaults, so the current-model WS9 fields
+  (input_rows, output_rows/bytes, num_rows/columns, producer_task_uuid) must
+  be present on every line or the importer silently truncates the stream
+  (WS18 defect 1, tools/hwsim/docs/quent-export-verification.md).
 - uuids are deterministic uuid7-style ids given a seed (stable tests); every
   FSM entity gets a contiguous per-entity ``seq`` from 0 with monotone
   timestamps; timestamps are unix-epoch ns with sim t=0 anchored at the source
@@ -729,13 +735,23 @@ def export_session(
                         "current_operator_id": int(op_id),
                         "input_bytes": int(in_bytes),
                         "peak_allocated_bytes": 0,
+                        "input_rows": 0,  # WS9 field; 0 = unknown (not tracked)
                         "executor_thread": thread_usage,
                         "reservation": reservation_usage,
                     }
                 },
             )
         fsm.state(
-            fin_ts, {"Finalizing": {"instance_name": "", "success": bool(task.success)}}
+            fin_ts,
+            {
+                "Finalizing": {
+                    "instance_name": "",
+                    "success": bool(task.success),
+                    # WS9 fields; 0 = unknown (the sim tracks no row counts)
+                    "output_rows": 0,
+                    "output_bytes": 0,
+                }
+            },
         )
         fsm.exit(rel(rec.finish))
 
@@ -747,9 +763,11 @@ def export_session(
         if producer_tid is not None:
             t_pub = rel(result.task_times[producer_tid].finish)
             producer_pipe = graph.tasks[producer_tid].pipeline_uuid
+            producer_task_uuid = task_uuid_of[producer_tid]
         else:
             t_pub = t0 - _ORPHAN_PAD_NS
             producer_pipe = None
+            producer_task_uuid = NIL_UUID
         consumers = sorted(t for t in b.consumer_tids if t in task_uuid_of)
         t_done = (
             max(rel(result.task_times[t].finish) for t in consumers)
@@ -768,6 +786,11 @@ def export_session(
                     "instance_name": "batch",
                     "data_batch_id": int(bid),
                     "producer_pipeline_uuid": op_ids.get(producer_pipe, NIL_UUID),
+                    # WS9 fields: producer task known from the sim graph;
+                    # rows/columns not tracked (0 = unknown).
+                    "producer_task_uuid": producer_task_uuid,
+                    "num_rows": 0,
+                    "num_columns": 0,
                 }
             },
         )
@@ -791,6 +814,7 @@ def export_session(
                             "pipeline_uuid": op_ids.get(cpipe, NIL_UUID),
                             "port_uuid": recv_port.get(cpipe, NIL_UUID),
                             "origin": "operator_output",
+                            "producer_task_uuid": producer_task_uuid,  # WS9
                             "tier": tier_usage,
                         }
                     },
@@ -833,6 +857,7 @@ def export_session(
                         "pipeline_uuid": op_ids.get(anchor_pipe, NIL_UUID),
                         "port_uuid": recv_port.get(anchor_pipe, NIL_UUID),
                         "origin": "operator_output",
+                        "producer_task_uuid": producer_task_uuid,  # WS9
                         "tier": tier_usage,
                     }
                 },

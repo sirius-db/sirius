@@ -104,10 +104,18 @@ for are omitted, not fabricated.
   `Finalizing.success=false` like any other replayed task.
 - **`Computing.peak_allocated_bytes`** is emitted as 0 (schema-required
   field; the sim does not track per-op allocator peaks).
-- **WS9 extension fields** (`input_rows`, `Finalizing.output_rows`,
-  `data_batch` rows/columns, `producer_task_uuid`) — no row/shape data in the
-  sim; the classic (pre-WS9) shapes are emitted, which older traces (e.g. B1)
-  also use.
+- **WS9 fields are EMITTED with the schema's unknown markers** (revised
+  after WS18's verification, defect 1 in
+  [quent-export-verification.md](quent-export-verification.md)): the Rust
+  analyzer's serde types have **no field defaults** — a line missing any
+  current-model field silently truncates that entity's whole stream. So the
+  exporter emits `Computing.input_rows=0`, `Finalizing.output_rows=0` /
+  `output_bytes=0`, `data_batch.Constructed.num_rows=0` / `num_columns=0`
+  (0 = unknown, the engine's own convention), and
+  `producer_task_uuid` on `Constructed` + `BatchRegistered` — the **real
+  exported producer-task uuid** where the sim graph knows it, nil otherwise.
+  Only `io_request` remains omitted as a whole entity (a missing entity
+  subdir is legal; required fields bite per-line).
 - `Reserving.input_basis` = the task's input bytes, `peak_estimate` =
   requested bytes, `bytes_to_materialize` = transfer bytes (all sim-held
   quantities; the source estimator internals are not copied).
@@ -126,6 +134,8 @@ wall. Verified on B1 q21 (2339 tasks, 6849 batches):
 | re-sim @ knobs=1 of the `@baseline` export | +0.06% vs exported wall |
 | re-sim @ knobs=1 of the `@gpu_compute=0.5` export | +0.05% vs exported wall |
 | exported task spans (prep/compute/tail/pre-queue) vs the sim replay and vs the source traced spans | 0 mismatches > 2 ns over 2339 tasks |
+| WS18 rig: `export-verify/validate_quent_session.py --simulated` (no `--allow-legacy`) | 0 errors, 0 warnings on both exports |
+| WS18 rig: `export-verify/ingest_check.sh` (Rust analyzer) | PASS — 22,294/22,294 task, 27,396/27,396 data_batch, 41,874/41,874 batch_placement lines ingested; 180-node resource tree |
 
 Caveat: a `gpu_mem_capacity`-knobbed export re-simulated at knobs=1 keeps the
 scaled pool (the exported memory spaces ARE the what-if hardware) but cannot
