@@ -50,17 +50,8 @@ src/**/telemetry/                   @sirius-db/sirius-telemetry-codeowners
 **/*.cmake                          @sirius-db/sirius-cmake-codeowners
 **/CMakeLists.txt                   @sirius-db/sirius-cmake-codeowners
 
-# ── CI & Build ────────────────────────────────────────────────────────────────
-/.*                                 @sirius-db/sirius-ci-build-codeowners
-/Cargo.*                            @sirius-db/sirius-ci-build-codeowners
-/Makefile                           @sirius-db/sirius-ci-build-codeowners
-/pixi.*                             @sirius-db/sirius-ci-build-codeowners
-/vcpkg*                             @sirius-db/sirius-ci-build-codeowners
-/docker/                            @sirius-db/sirius-ci-build-codeowners
-/duckdb-python/                     @sirius-db/sirius-ci-build-codeowners
-/extension-ci-tools/                @sirius-db/sirius-ci-build-codeowners
-/scripts/                           @sirius-db/sirius-ci-build-codeowners
-/third_party/                       @sirius-db/sirius-ci-build-codeowners
+# ── Ops  ──────────────────────────────────────────────────────────────────────
+/.github                            @sirius-db/sirius-ops-codeowners
 
 # ── Testing & Benchmarks & Skills ─────────────────────────────────────────────
 **/CLAUDE.md                        @sirius-db/sirius-testing-codeowners
