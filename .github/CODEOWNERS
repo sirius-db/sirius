@@ -8,13 +8,13 @@
 # Teams follow the pattern: @sirius-db/sirius-<component|language>-codeowners
 
 # ── Planner ───────────────────────────────────────────────────────────────────
-src/pipeline/                       @sirius-db/sirius-planner-codeowners
 src/include/pipeline/               @sirius-db/sirius-planner-codeowners
 src/planner/                        @sirius-db/sirius-planner-codeowners
 src/include/planner/                @sirius-db/sirius-planner-codeowners
 
 # ── Executors ─────────────────────────────────────────────────────────────────
 src/creator/                        @sirius-db/sirius-executors-codeowners
+src/pipeline/                       @sirius-db/sirius-executors-codeowners
 src/**/exec/                        @sirius-db/sirius-executors-codeowners
 src/**/parallel/                    @sirius-db/sirius-executors-codeowners
 
@@ -32,10 +32,12 @@ src/**/util/                        @sirius-db/sirius-operators-codeowners @siri
 src/**/io/                          @sirius-db/sirius-scan-io-codeowners
 src/**/scan*/                       @sirius-db/sirius-scan-io-codeowners
 
-# ── Memory & Compression ──────────────────────────────────────────────────────
-src/compression/                    @sirius-db/sirius-memory-compression-codeowners
-src/**/downgrade/                   @sirius-db/sirius-memory-compression-codeowners
-src/**/memory/                      @sirius-db/sirius-memory-compression-codeowners
+# ── Compression ───────────────────────────────────────────────────────────────
+src/compression/                    @sirius-db/sirius-compression-codeowners
+
+# ── Memory ────────────────────────────────────────────────────────────────────
+src/**/downgrade/                   @sirius-db/sirius-memory-codeowners
+src/**/memory/                      @sirius-db/sirius-memory-codeowners
 
 # ── Integrations ──────────────────────────────────────────────────────────────
 /cucascade/                         @sirius-db/sirius-integrations-codeowners
