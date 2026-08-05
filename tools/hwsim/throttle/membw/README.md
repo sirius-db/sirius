@@ -16,6 +16,9 @@ cross-talk matrix live in [`../../docs/membw-throttle.md`](../../docs/membw-thro
 
 ```bash
 make                 # nvcc (found on PATH or /usr/local/cuda/bin), -arch=sm_100
+                     # (sm_100 SASS + compute_100 PTX; the PTX JIT covers newer
+                     # parts, e.g. sm_120 workstation Blackwell)
+make ARCH=native     # compile for the GPU actually in this box
 make ARCH=sm_103a    # override arch — GB300 is CC 10.3; keep one arch for all comparisons
 make nocuda          # g++-only fallback: membw_{eater,victim}_nocuda, dram domain only
 ```
@@ -82,3 +85,10 @@ SECTIONS="baseline xtalk" ./run_calibration.sh
   numbers.
 - An `h2d` C2C copy also reads host DRAM and writes HBM at the same rate — cross-talk
   onto the other two domains is physics, not a tool artifact (quantified in the doc).
+- **Workstation-class GPUs (big L2): the CE number is authoritative for HBM.**
+  On parts like the RTX PRO 6000 Blackwell (128 MB L2) the `hbm --engine sm`
+  streaming victim measured absurd cache-resident rates (external-validation
+  defect 3). The victim now sizes its default buffer off the device's L2
+  (`max(1 GiB, 8x l2CacheSize)`), but when in doubt trust
+  `--domain hbm --engine ce` (copy-engine memcpy cannot be L2-satisfied at
+  those sizes) and treat the SM number as a cross-check only.

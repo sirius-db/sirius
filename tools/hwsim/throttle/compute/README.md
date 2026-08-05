@@ -11,7 +11,12 @@ contexts).
 ## Build
 
 ```bash
-make            # uses /usr/local/cuda/bin/nvcc, targets sm_100 (+PTX fallback)
+make                # nvcc from PATH or /usr/local/cuda/bin; targets sm_100
+                    # (+compute_100 PTX — the JIT fallback covers newer parts,
+                    # e.g. cc 10.3 GB300 and sm_120 workstation Blackwell)
+make ARCH=native    # compile for the GPU actually in this box
+make ARCH=sm_103a   # explicit arch — keep ONE arch across every binary whose
+                    # numbers you compare (arch changes codegen)
 ```
 
 ## Binaries

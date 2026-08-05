@@ -87,8 +87,11 @@ Plus:
 
 - **Config:** `bench/sf1000-repro/sirius-sf1000.yaml` (GB300-tuned:
   `scan_task_batch_size: 8GB` is the one knob that mattered). For the hwsim lane, flip
-  `telemetry.enable_quent: true` — the kit ships it `false` — and keep the ndjson
-  exporter default.
+  `telemetry.enable_quent: true` — the kit ships it `false` — and **set
+  `telemetry.exporter: ndjson` explicitly**: hwsim parses ONLY ndjson, and other
+  bundled configs (`test/tpch_performance/tpch_telemetry_sirius.yaml`) ship
+  `exporter: postcard`, which parses as an empty session (`hwsim info` now errors
+  on such directories — RTX validation defect 4).
 - **Patched libcudf** via `LD_PRELOAD` (`bench/sf1000-repro/build-libcudf.sh`;
   `run.sh` hard-fails without it). It carries the `strings::like` backtrack fix
   (q13 −36.5%) and the memcpy-flag threshold (q9 −5.8%). The gates work on stock

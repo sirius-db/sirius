@@ -392,6 +392,58 @@ def default_cache_dir() -> str:
     return os.path.join(base, "hwsim")
 
 
+def check_ndjson_exports(session_dir: str) -> None:
+    """Postcard-trap check (RTX validation defect 4): the bundled
+    tpch_telemetry_sirius.yaml ships ``exporter: postcard``, and hwsim parses
+    ONLY ndjson — ``_ndjson_lines`` silently skips everything else, yielding
+    an empty/near-empty model with no hint why. Warn loudly (error-grade when
+    NO ndjson exists at all) before parsing."""
+    nd = other = 0
+    sample: List[str] = []
+    try:
+        entries = sorted(os.listdir(session_dir))
+    except OSError:
+        return
+    for d in entries:
+        sub = os.path.join(session_dir, d)
+        if not os.path.isdir(sub):
+            continue
+        try:
+            files = sorted(os.listdir(sub))
+        except OSError:
+            continue
+        for f in files:
+            if not os.path.isfile(os.path.join(sub, f)):
+                continue
+            if f.endswith(".ndjson"):
+                nd += 1
+            else:
+                other += 1
+                if len(sample) < 3:
+                    sample.append(f"{d}/{f}")
+    if not other:
+        return
+    hint = (
+        "hwsim parses ONLY the ndjson exporter format — capture with "
+        "`sirius.telemetry.exporter: ndjson` (the bundled "
+        "tpch_telemetry_sirius.yaml ships `exporter: postcard`, which hwsim "
+        "cannot read)."
+    )
+    if nd == 0:
+        print(
+            f"ERROR: {session_dir}: {other} telemetry file(s) but NONE in "
+            f"ndjson format (e.g. {', '.join(sample)}) — this session will "
+            f"parse as EMPTY. {hint}",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            f"WARNING: {session_dir}: {other} non-ndjson telemetry file(s) "
+            f"(e.g. {', '.join(sample)}) will be silently ignored. {hint}",
+            file=sys.stderr,
+        )
+
+
 def load_session_model(
     session_dir: str, cache_dir: Optional[str] = None, verbose: bool = False
 ):
@@ -402,6 +454,7 @@ def load_session_model(
     from .build import build_session_model
 
     session_dir = os.path.normpath(session_dir)
+    check_ndjson_exports(session_dir)  # postcard trap: warn before parsing
     cache_dir = cache_dir if cache_dir is not None else default_cache_dir()
     cache_path = None
     if cache_dir:

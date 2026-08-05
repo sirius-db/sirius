@@ -57,7 +57,8 @@ static void Usage() {
 	        "  --threads N    dram: memcpy threads (default 8)\n"
 	        "  --cpu-start N  dram: first CPU to pin to (default 0)\n"
 	        "  --chunk-mb N   bytes per iteration (default: hbm/c2c 256, dram 16)\n"
-	        "  --buf-mb N     buffer size (default: hbm 1024, c2c 512, dram 64/thread)\n"
+	        "  --buf-mb N     buffer size (default: hbm max(1024, 8x L2), c2c 512,\n"
+	        "                 dram 64/thread)\n"
 	        "  --interval S   per-interval CSV cadence (default 0.5)\n"
 	        "  --quiet        only print the final RESULT line\n"
 	        "  --device N     CUDA device (default 0)\n");
@@ -132,7 +133,25 @@ __global__ void CopyKernelStream(const uint4 *__restrict__ src, uint4 *__restric
 
 static int RunGpu(Opts &o) {
 	CUDA_CHECK(cudaSetDevice(o.device));
-	size_t buf_bytes = (o.buf_mb ? o.buf_mb : (o.domain_hbm() ? 1024 : 512)) << 20;
+	size_t buf_bytes;
+	if (o.buf_mb) {
+		buf_bytes = o.buf_mb << 20;
+	} else if (o.domain_hbm()) {
+		// Size the copy buffer off the device's L2 (>= 8x, floor 1 GiB) so the
+		// SM streaming victim measures DRAM, not cache: on big-L2 workstation
+		// parts (128 MB on RTX PRO 6000 Blackwell) a fixed default measured
+		// absurd cache-resident rates (external-validation defect 3). On such
+		// GPUs the CE engine (`--engine ce`) is the authoritative HBM number.
+		int l2_bytes = 0;
+		CUDA_CHECK(cudaDeviceGetAttribute(&l2_bytes, cudaDevAttrL2CacheSize, o.device));
+		buf_bytes = (size_t)1024 << 20;
+		size_t min_bytes = 8ull * (size_t)l2_bytes;
+		if (min_bytes > buf_bytes) {
+			buf_bytes = min_bytes;
+		}
+	} else {
+		buf_bytes = (size_t)512 << 20;
+	}
 	size_t chunk = (o.chunk_mb ? o.chunk_mb : 256) << 20;
 	if (chunk > buf_bytes) {
 		chunk = buf_bytes;
@@ -161,6 +180,7 @@ static int RunGpu(Opts &o) {
 			if (o.engine == "sm") {
 				CopyKernelStream<<<blocks, tpb, 0, stream>>>((const uint4 *)(src + off), (uint4 *)(dst + off),
 				                                             chunk / sizeof(uint4));
+				CUDA_CHECK(cudaGetLastError()); // a silently failed launch reads as absurd GB/s
 			} else {
 				CUDA_CHECK(cudaMemcpyAsync(dst + off, src + off, chunk, cudaMemcpyDeviceToDevice, stream));
 			}

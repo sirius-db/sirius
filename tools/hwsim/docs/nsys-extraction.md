@@ -37,6 +37,11 @@ Sirius / quent source trees. Column lists marked *(verify)* should be sanity-che
   (`src/sirius_extension.cpp:1632`, mapping to `cudaProfilerStart/Stop` at
   `src/sirius_extension.cpp:1527`), so the capture range brackets exactly the iterations of
   interest and excludes pool-priming init.
+- **Quent side of a paired capture: `exporter: ndjson` is REQUIRED.** hwsim parses only
+  the ndjson exporter format; the bundled `test/tpch_performance/tpch_telemetry_sirius.yaml`
+  ships **`exporter: postcard`**, which hwsim silently cannot read (the session parses as
+  empty — `python -m hwsim info` now errors on such directories, RTX validation defect 4).
+  Set `sirius.telemetry.exporter: ndjson` in the capture config before the first run.
 
 ---
 
