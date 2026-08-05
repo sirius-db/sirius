@@ -16,6 +16,7 @@
 
 #include "cudf/cudf_utils.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
+#include "duckdb/common/multi_file/multi_file_states.hpp"
 #include "duckdb/function/table/table_scan.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -45,14 +46,68 @@
 #include "scan_manager/sirius_scan_manager.hpp"
 #include "sirius_context.hpp"
 
+#include <algorithm>
 #include <memory>
 #include <optional>
 #include <string>
 #include <unordered_set>
+#include <vector>
 
 namespace sirius::planner {
 
 namespace {
+
+/// Collect every Iceberg field id in the bound schema, descending into nested children so a
+/// struct's fields count toward the id space they actually occupy.
+void collect_field_ids(std::vector<duckdb::MultiFileColumnDefinition> const& columns,
+                       std::vector<int32_t>& out)
+{
+  for (auto const& column : columns) {
+    if (!column.identifier.IsNull() &&
+        column.identifier.type().id() == duckdb::LogicalTypeId::INTEGER) {
+      out.push_back(column.identifier.GetValue<int32_t>());
+    }
+    collect_field_ids(column.children, out);
+  }
+}
+
+/**
+ * @brief Refuse tables whose Iceberg field-id space has a gap, which means a column was dropped.
+ *
+ * Iceberg never reuses a field id, so a column dropped and re-added under the same name gets a
+ * NEW id and is absent from older data files — it must read NULL there. This path resolves
+ * projected columns by NAME, so it finds the dropped column instead and returns data the table
+ * removed, with no error and no fallback.
+ *
+ * With no drops, N fields occupy ids 1..N, so `max > count` means an id was retired. The ids are
+ * already in the bind data; this opens no files.
+ *
+ * A pre-filter, not the whole test: a plain ADDED column keeps the space contiguous and slips
+ * through, but that case fails loudly rather than returning wrong rows. The real fix is resolving
+ * by field id, which DuckDB's MultiFileColumnMapper already implements.
+ */
+std::optional<std::string> iceberg_retired_field_id_decline_reason(duckdb::LogicalGet& op)
+{
+  auto const* bind_data = dynamic_cast<duckdb::MultiFileBindData const*>(op.bind_data.get());
+  if (bind_data == nullptr) { return std::nullopt; }
+
+  // `reader_bind.schema` is the schema the multi-file reader itself set — for iceberg that is
+  // the Iceberg schema, and the only one carrying field ids. `columns` is the generic column
+  // list and may leave `identifier` null, so it is the fallback, not the source of truth.
+  std::vector<int32_t> field_ids;
+  collect_field_ids(
+    bind_data->reader_bind.schema.empty() ? bind_data->columns : bind_data->reader_bind.schema,
+    field_ids);
+  if (field_ids.empty()) { return std::nullopt; }
+
+  auto const max_field_id = *std::max_element(field_ids.begin(), field_ids.end());
+  if (max_field_id <= static_cast<int32_t>(field_ids.size())) { return std::nullopt; }
+
+  return "iceberg_scan table has a gap in its Iceberg field ids (highest is " +
+         std::to_string(max_field_id) + " across " + std::to_string(field_ids.size()) +
+         " fields), so a column was dropped; this scan path resolves columns by name and would "
+         "read a dropped column's data in place of the re-added one";
+}
 
 // Why an `iceberg_scan` table must decline the GPU scan path, or nullopt when it may run there.
 //
@@ -114,6 +169,8 @@ std::optional<std::string> iceberg_gpu_scan_decline_reason(duckdb::LogicalGet& o
     }
   }
 
+  if (auto reason = iceberg_retired_field_id_decline_reason(op)) { return reason; }
+
   // Escape single quotes for SQL string embedding.
   std::string escaped;
   escaped.reserve(table_path.size());
@@ -152,10 +209,9 @@ std::optional<std::string> iceberg_gpu_scan_decline_reason(duckdb::LogicalGet& o
     duckdb::SiriusContext::InternalQueryGuard guard(context);
 
     duckdb::Connection conn(*context.db);
-    // The bracket is per-connection, so guarding `context` above does not cover this fresh
-    // connection. Without its own guard the probe query runs the full transparent path, whose
-    // plan-generation window contends for the instance-wide slot the query being planned is
-    // already holding; the probe then fails and "any failure declines" refuses every table.
+    // Per-connection bracket: guarding `context` above does not cover this fresh connection.
+    // Without it the probe contends for the plan-generation slot the outer query holds, fails,
+    // and "any failure declines" then refuses every table.
     duckdb::SiriusContext::InternalQueryGuard conn_guard(*conn.context);
     // The probe runs on a FRESH connection, which does not inherit the session's settings. Without
     // this, a table whose metadata carries no version hint fails the probe outright — and because

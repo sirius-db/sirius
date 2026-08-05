@@ -98,20 +98,15 @@ std::string escape_sql_string(std::string const& s)
 /**
  * @brief Read the POSITION_DELETES entries of one manifest via DuckDB's avro reader.
  *
- * Only reached for manifests that iceberg_metadata() has already reported a PUFFIN entry in,
- * so the V3 fields are guaranteed present in the manifest schema; a manifest without them is a
- * malformed pairing and the binder error it raises is allowed to propagate.
+ * Only reached for manifests iceberg_metadata() has already reported a PUFFIN entry in, so the
+ * V3 fields are present; a manifest without them is a malformed pairing and the binder error
+ * propagates. @p conn must already be bracketed as an internal query.
  *
- * Two details are load-bearing:
- *  - `lower(file_format)`: Iceberg writes "PUFFIN" uppercase, is_deletion_vector() compares
- *    against "puffin". Without the fold, every entry fails the test and the table reads as
- *    having no deletes — a silent wrong answer rather than an error.
- *  - The COALESCEs reproduce the struct's defaults for absent optional fields (-1/-1/"") so a
- *    NULL never reaches GetValue<int64_t>().
- *
- * @param conn           Connection already running under the caller's InternalQueryGuard.
- * @param manifest_path  Filesystem path to the manifest .avro file.
- * @throws std::runtime_error if the manifest cannot be read.
+ * `lower(file_format)` is load-bearing: Iceberg writes "PUFFIN" uppercase and
+ * is_deletion_vector() compares against "puffin", so without the fold every entry fails the
+ * test and the table reads as having no deletes — silently wrong rather than an error. The
+ * COALESCEs reproduce the struct's defaults (-1/-1/"") so a NULL never reaches
+ * GetValue<int64_t>().
  */
 std::vector<IcebergDeleteFileEntry> read_deletion_vectors_from_manifest(
   duckdb::Connection& conn, std::string const& manifest_path)
@@ -165,9 +160,9 @@ IcebergManifestDiscovery discover_from_manifests(duckdb::ClientContext& context,
   IcebergManifestDiscovery result;
 
   duckdb::Connection conn(*context.db);
-  // The internal-query bracket is per-connection, so the caller's guard does not cover this
-  // one. Unbracketed, these metadata queries run the full transparent path and their
-  // plan-generation window contends for the instance-wide slot held by the query being planned.
+  // The internal-query bracket is per-connection, so the caller's guard does not cover this one.
+  // Unbracketed, these queries run the full transparent path, whose plan-generation window
+  // contends for the instance-wide slot the query being planned already holds.
   duckdb::SiriusContext::InternalQueryGuard conn_guard(*conn.context);
   conn.Query("SET unsafe_enable_version_guessing = true");
 
@@ -262,8 +257,7 @@ void read_positional_delete_file(duckdb::DatabaseInstance& db,
                                  std::unordered_map<std::string, std::vector<int64_t>>& out_map)
 {
   duckdb::Connection conn(db);
-  // Same reason as discover_from_manifests: bracket this connection so the delete-file read
-  // does not re-enter the transparent path underneath the query being planned.
+  // Bracketed for the reason given in discover_from_manifests.
   duckdb::SiriusContext::InternalQueryGuard conn_guard(*conn.context);
 
   auto result = conn.Query("SELECT file_path, pos FROM read_parquet('" +

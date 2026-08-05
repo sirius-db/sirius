@@ -27,10 +27,10 @@
 
 #include <catch.hpp>
 #include <duckdb.hpp>
+#include <op/scan/iceberg_metadata_reader.hpp>
 #include <signal.h>
 #include <sys/wait.h>
 #include <unistd.h>
-#include <op/scan/iceberg_metadata_reader.hpp>
 #include <utils/sirius_test_env.hpp>
 #include <utils/transparent_execution_test_utils.hpp>
 
@@ -556,7 +556,7 @@ class GPUExecutionIcebergFixture : public MultiFormatFixtureBase {
     v1_path   = (root / "test/cpp/integration/data/iceberg_v1").string();
     v2_path   = (root / "test/cpp/integration/data/iceberg_v2_delete").string();
 
-    auto const conf = root / "test/cpp/integration/data/iceberg_conformance";
+    auto const conf       = root / "test/cpp/integration/data/iceberg_conformance";
     conf_append_only_path = (conf / "append_only/conf/append_only").string();
     conf_drop_readd_path  = (conf / "drop_readd/conf/drop_readd").string();
   }
@@ -763,33 +763,31 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
   // message that it had equality-delete files, having zero delete files.
   enable_version_guessing_session_scope();
   REQUIRE(delete_file_count(conf_append_only_path) == 0);
-  expect_iceberg_rows("SELECT id, name FROM iceberg_scan('" + conf_append_only_path +
-                        "') ORDER BY id;",
-                      gpu_route::gpu,
-                      {{"1", "a"}, {"2", "b"}, {"3", "c"}});
+  expect_iceberg_rows(
+    "SELECT id, name FROM iceberg_scan('" + conf_append_only_path + "') ORDER BY id;",
+    gpu_route::gpu,
+    {{"1", "a"}, {"2", "b"}, {"3", "c"}});
 }
 
-// EXPECTED TO FAIL until columns resolve by field ID.
-//
 // `y` was dropped and re-added under the same name, so it is a NEW field id (4). The one
 // data file holds the ORIGINAL `y` at field id 3. Per the Iceberg spec the re-added column
 // is absent from that file and must read NULL; pyiceberg and DuckDB both return NULL.
 // Resolving by name finds the old column and returns 111/222 — with no error and no
 // fallback, which is the worst failure mode available.
 //
-// [!shouldfail] keeps the suite honest rather than green-by-omission: the case runs, and
-// the tag records that we know it is broken. When field-ID resolution lands this case
-// starts passing, [!shouldfail] then reports it as a failure, and the tag comes off — so
-// the fix cannot land without someone deleting this comment deliberately.
+// The route is the assertion that matters here. Correct rows alone would also be produced by
+// a GPU scan that had silently read the dropped column and happened to agree, so this pins
+// that the table was REFUSED at plan time and DuckDB answered. When field-ID resolution
+// lands, the expected route flips back to `gpu` and the rows stay exactly as written.
 TEST_CASE_METHOD(GPUExecutionIcebergFixture,
                  "gpu_execution iceberg - conformance dropped-and-re-added column reads NULL",
-                 "[integration][gpu_execution][iceberg][!shouldfail]")
+                 "[integration][gpu_execution][iceberg]")
 {
   enable_version_guessing_session_scope();
-  expect_iceberg_rows("SELECT id, x, y FROM iceberg_scan('" + conf_drop_readd_path +
-                        "') ORDER BY id;",
-                      gpu_route::gpu,
-                      {{"1", "10", "NULL"}, {"2", "20", "NULL"}});
+  expect_iceberg_rows(
+    "SELECT id, x, y FROM iceberg_scan('" + conf_drop_readd_path + "') ORDER BY id;",
+    gpu_route::plan_fallback,
+    {{"1", "10", "NULL"}, {"2", "20", "NULL"}});
 }
 
 //===----------------------------------------------------------------------===//
