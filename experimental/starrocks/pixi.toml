@@ -40,6 +40,38 @@ wait -n "${fe_pid}" "${cn_pid}"
 '
 """,cwd = ".",depends-on = ["fe-check","cn-build"],description = "Run the local StarRocks FE and Rust CN in the foreground with logs",env = {LD_LIBRARY_PATH = "../../build/release/extension/sirius"}}
 
+# Two CNs share one GPU: each carves out an 8GiB slice (reservation == usage limit in the
+# derived config), so neither primes the default ~0.95x of device memory. CN2 shifts every
+# listener port by +2 and keeps its engine artifacts in .cn2.
+cluster2 = {cmd = """
+bash -lc 'set -euo pipefail
+
+cleanup() {
+    status=$?
+    trap - EXIT INT TERM
+    kill "${fe_pid:-}" "${cn1_pid:-}" "${cn2_pid:-}" 2>/dev/null || true
+    wait "${fe_pid:-}" "${cn1_pid:-}" "${cn2_pid:-}" 2>/dev/null || true
+    exit "${status}"
+}
+trap cleanup EXIT INT TERM
+
+starrocks/output/fe/bin/start_fe.sh --logconsole &
+fe_pid="$!"
+
+target/release/sirius-starrocks-cn \
+    --gpu-memory-limit 8GiB --host-memory-limit 12GiB --engine-dir .cn1 &
+cn1_pid="$!"
+
+target/release/sirius-starrocks-cn \
+    --heartbeat-port 9052 --thrift-port 9062 --brpc-port 8062 --http-port 8042 \
+    --starlet-port 9072 \
+    --gpu-memory-limit 8GiB --host-memory-limit 12GiB --engine-dir .cn2 &
+cn2_pid="$!"
+
+wait -n "${fe_pid}" "${cn1_pid}" "${cn2_pid}"
+'
+""",cwd = ".",depends-on = ["fe-check","cn-build"],description = "Run the FE and two 8GiB-carve-out CNs sharing one GPU",env = {LD_LIBRARY_PATH = "../../build/release/extension/sirius"}}
+
 # This demo project ships the StarRocks FE pre-packaged under starrocks/output/fe, so `cluster`
 # does not depend on `fe-build` (a multi-hour Maven build of the whole front end). Assert the
 # package is there and point at `fe-build` if it is not.

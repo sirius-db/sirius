@@ -23,8 +23,9 @@ use std::thread::JoinHandle;
 use arrow_array::RecordBatch;
 use sirius::SiriusContext;
 use starrocks_plan_translator::StreamInputSchema;
-use tracing::info;
+use tracing::{info, warn};
 
+use crate::engine_settings::EngineSettings;
 use crate::fragment_executor::{FragmentExecutor, FragmentResult, FragmentRun, SenderSlot};
 
 /// Output stream id an intermediate fragment sinks into. One per fragment: a gather exchange has
@@ -67,15 +68,17 @@ impl SiriusEngine {
     /// Brings up the engine on a dedicated thread (fail-fast) and returns a handle.
     ///
     /// Blocks until the context is initialized — or bring-up fails — so a bad config or GPU
-    /// failure surfaces here, before any RPC is served. `config` is the optional Sirius YAML path
-    /// (built-in defaults when `None`).
-    pub fn start(config: Option<PathBuf>) -> Result<Self, String> {
+    /// failure surfaces here, before any RPC is served. `settings` carries the resolved Sirius
+    /// YAML path (built-in defaults when `None`), the engine artifact directory, and the CUDA
+    /// device pin.
+    pub fn start(settings: EngineSettings) -> Result<Self, String> {
         Self::configure_duckdb_extensions()?;
+        Self::configure_engine_environment(&settings)?;
         let (request_tx, request_rx) = channel::<ExecuteRequest>();
         let (ready_tx, ready_rx) = channel::<Result<(), String>>();
         let thread = std::thread::Builder::new()
             .name("sirius-engine".to_string())
-            .spawn(move || engine_thread(config, request_rx, ready_tx))
+            .spawn(move || engine_thread(settings.config, request_rx, ready_tx))
             .map_err(|err| format!("failed to spawn sirius-engine thread: {err}"))?;
         match ready_rx.recv() {
             Ok(Ok(())) => Ok(Self {
@@ -119,6 +122,38 @@ impl SiriusEngine {
             // SAFETY: this runs before the engine thread and RPC servers start, so no concurrent
             // code reads or writes these process environment variables.
             unsafe { std::env::set_var(variable, &path) };
+        }
+        Ok(())
+    }
+
+    /// Points the engine's log directory at `<engine_dir>/log` and pins the CUDA device when
+    /// requested. Environment already set by the operator wins (matching the extension-path
+    /// precedent above), but an ignored `--gpu-device` is called out rather than dropped silently.
+    fn configure_engine_environment(settings: &EngineSettings) -> Result<(), String> {
+        if std::env::var_os("SIRIUS_LOG_DIR").is_none() {
+            let log_dir = settings.engine_dir.join("log");
+            std::fs::create_dir_all(&log_dir).map_err(|err| {
+                format!(
+                    "failed to create engine log directory {}: {err}",
+                    log_dir.display()
+                )
+            })?;
+            // SAFETY: this runs before the engine thread and RPC servers start, so no concurrent
+            // code reads or writes these process environment variables.
+            unsafe { std::env::set_var("SIRIUS_LOG_DIR", &log_dir) };
+        }
+        if let Some(device) = settings.gpu_device {
+            if let Some(existing) = std::env::var_os("CUDA_VISIBLE_DEVICES") {
+                warn!(
+                    existing = %existing.to_string_lossy(),
+                    requested = device,
+                    "CUDA_VISIBLE_DEVICES is already set; ignoring --gpu-device"
+                );
+            } else {
+                // SAFETY: same pre-thread-spawn window as above; nothing else touches the
+                // environment yet.
+                unsafe { std::env::set_var("CUDA_VISIBLE_DEVICES", device.to_string()) };
+            }
         }
         Ok(())
     }
@@ -345,6 +380,15 @@ mod tests {
     use super::*;
     use crate::result_store::FragmentInstanceId;
 
+    /// Default-config engine settings pointing engine artifacts at a scratch directory.
+    fn test_settings() -> EngineSettings {
+        EngineSettings {
+            config: None,
+            engine_dir: std::env::temp_dir().join("sirius-engine-test"),
+            gpu_device: None,
+        }
+    }
+
     /// Builds a single-file `local_files` parquet read plan with `names` as the root output
     /// names — the shape DuckDB's Substrait reader resolves to `parquet_scan(<path>)`.
     fn local_files_plan(path: &str, names: Vec<String>) -> TranslatedPlan {
@@ -543,7 +587,7 @@ mod tests {
     fn engine_replays_dumped_substrait_plan() {
         let path = std::env::var("SIRIUS_SUBSTRAIT_PLAN").expect("SIRIUS_SUBSTRAIT_PLAN not set");
         let plan = std::fs::read(&path).expect("read dumped substrait plan");
-        let engine = SiriusEngine::start(None).expect("bring up sirius engine");
+        let engine = SiriusEngine::start(test_settings()).expect("bring up sirius engine");
         let (respond_tx, respond_rx) = channel();
         engine
             .requests
@@ -610,7 +654,7 @@ mod tests {
             vec!["id".to_string(), "name".to_string()],
         );
 
-        let engine = SiriusEngine::start(None).expect("bring up sirius engine");
+        let engine = SiriusEngine::start(test_settings()).expect("bring up sirius engine");
         let result = run_result(&engine, &plan);
         let total_rows: usize = result.batches.iter().map(RecordBatch::num_rows).sum();
         assert_eq!(total_rows, 3, "expected 3 rows from the parquet fixture");
