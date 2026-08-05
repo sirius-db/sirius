@@ -42,7 +42,9 @@ if args.case:
     cases = [c for c in cases if c["name"] == args.case]
 
 env = dict(os.environ)
-env["LD_LIBRARY_PATH"] = f"{os.getcwd()}/.pixi/envs/default/lib:" + env.get("LD_LIBRARY_PATH", "")
+env["LD_LIBRARY_PATH"] = f"{os.getcwd()}/.pixi/envs/default/lib:" + env.get(
+    "LD_LIBRARY_PATH", ""
+)
 
 
 def norm(rows):
@@ -65,14 +67,22 @@ def run_case(case):
     try:
         p = subprocess.run(
             [args.duckdb, "-unsigned", "-json", "-c", sql],
-            capture_output=True, text=True, timeout=args.timeout, env=env,
+            capture_output=True,
+            text=True,
+            timeout=args.timeout,
+            env=env,
         )
     except subprocess.TimeoutExpired:
-        return "DEADLOCK", f"no answer in {args.timeout}s (runtime fallback poisoned the connection)"
+        return (
+            "DEADLOCK",
+            f"no answer in {args.timeout}s (runtime fallback poisoned the connection)",
+        )
 
     if "LIVENESS_OK" not in p.stdout:
         err = (p.stderr or p.stdout).strip().splitlines()
-        return "NO_LIVENESS", "second query never answered: " + (err[-1] if err else "no output")
+        return "NO_LIVENESS", "second query never answered: " + (
+            err[-1] if err else "no output"
+        )
 
     # -json emits one JSON array per statement; the scan is the first non-empty one.
     blocks = []
@@ -85,7 +95,7 @@ def run_case(case):
         elif ch == "]":
             depth -= 1
             if depth == 0 and start is not None:
-                blocks.append(p.stdout[start:i + 1])
+                blocks.append(p.stdout[start : i + 1])
                 start = None
     if not blocks:
         return "NO_ROWS", "scan produced no parseable result"
@@ -97,7 +107,10 @@ def run_case(case):
 
     got_rows = [[row.get(c) for c in case["columns"]] for row in got]
     if norm(got_rows) != norm(case["expected_rows"]):
-        return "WRONG_ROWS", f"pyiceberg={norm(case['expected_rows'])} sirius={norm(got_rows)}"
+        return (
+            "WRONG_ROWS",
+            f"pyiceberg={norm(case['expected_rows'])} sirius={norm(got_rows)}",
+        )
     return "OK", f"{len(got_rows)} rows match the reference"
 
 
