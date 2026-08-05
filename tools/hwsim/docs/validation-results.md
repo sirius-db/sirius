@@ -12,7 +12,7 @@ CSVs/metrics; `traces/`, `throttle_logs/`, `env/` gitignored). ~150 min GPU-busy
 
 | Knob | Rows | Validated? | Slowdown-ratio error (E_ratio) | Recommendation |
 |---|---|---|---|---|
-| `gpu_compute` (MPS pct 75/50/25) | E1-75/50/25 | **NO — fails at every factor** (v0). **FIXED by the physics join — see §7**: median −1.5/−3.7/−6.4% | median **+26% / +71% / +188%**, uniformly pessimistic; structure (binding, pipeline shares ≤1.2 pp, monotonicity, per-query rank ρ=1.0) intact | Use `--physics` (§7) for quantitative what-ifs; the v0 path stays for structure-only questions |
+| `gpu_compute` (MPS pct 75/50/25) | E1-75/50/25 | **NO — fails at every factor** (v0). **FIXED by the physics join — see §7**: median −1.5/−3.7/−6.4%. **CAVEAT: the physics fix is lane-specific — on the compute-bound late-mat lane BOTH paths fail optimistic (§8): v0 −11/−26/−41%, physics −14/−30/−47%** | median **+26% / +71% / +188%**, uniformly pessimistic; structure (binding, pipeline shares ≤1.2 pp, monotonicity, per-query rank ρ=1.0) intact | Use `--physics` (§7) for quantitative what-ifs **on host-dominated lanes only**; on device-saturated lanes (device GPU-busy >70% of wall) treat predictions as lower bounds until G4b (§8.6) |
 | `gpu_mem_capacity` (pool YAML 0.50/0.25/0.15) | E2-hi/mid/lo | **YES above the spill threshold; NO below it — and in the *opposite* direction to design assumptions** | unpressured queries: ≤0.5% (12/12 null matches); pressured: **−82%** (q21@mid, real ×11.2 vs sim ×2.0), **−58%** (q9@lo, real ×55.2 vs sim ×23.1) — sim *under*-prices spill 2.4–5.6× | Capacity knob is trustworthy for "does it still fit" questions; forbid/flag predictions past the spill knee until a G5 spill model is calibrated (captures now exist) |
 | `io_bandwidth` (O_DIRECT injector, cold) | B2, E3-84/60/36 | **YES (best knob in the matrix)** | scan-bound q6/q19: **±5% at every depth**; decode-heavy q1: +19–20% pessimistic at deep throttle | G1 instrumentation **deprioritized** per §7.4 rule (errors ≪ the 50% promotion trigger); optional cheap fix for decode-heavy queries (§5 #4) |
 | `gpu_mem_bandwidth` (HBM CE eater) | E4-73/45 | **NO (quantify-G4 row)** (v0). **FIXED by the physics join — see §7**: median −2.8/−5.3% | median **+24% @0.76, +74% @0.48**, all-pessimistic; rank ρ = 0.9–1.0 | Same root cause and same fix as `gpu_compute` (they share the v0 scaling law) |
@@ -455,3 +455,204 @@ a stored E1-50 v0 prediction reproduce bit-identically):
   ranges; harmless here (trivial absolute time) but a candidate for a
   scan-manager-thread attribution pass if a lane ever stages large volumes
   outside tasks.
+
+## 8. Compute-bound lane (late-mat) — WS14, 2026-08-05
+
+**Status: COMPLETE.** PR #1409 (late materialization + fused scan-filter) was
+merged into this branch to give the `gpu_compute` knob a genuinely
+compute-bound engine for the first time. Fresh baselines, MPS-throttled real
+runs at 75/50/25%, a paired nsys capture, and physics-join predictions —
+all on THIS worktree's binary (sha `522fdfa6…`, includes the e2191e91 null-
+ingestible guard; patched libcudf `f9bde093…` LD_PRELOADed identically in
+every arm). Rows `L*` in `runs.csv`; artifacts `analysis/L*`. Queries:
+flagships q10/q12/q19 + q9/q21 for continuity. ~10 min GPU total.
+
+**Verdict up front: the simulator does NOT track a compute-bound engine under
+compute throttling — and the failure direction is INVERTED vs §3.1.** Real
+slowdowns sit at 79–96% of the ideal `1/f` line; the v0 path under-predicts
+by −11/−26/−41% (median E_ratio at f=0.75/0.50/0.25) and the §7 physics path
+under-predicts *more* (−14/−30/−47%). The §7 physics fix is
+**lane-specific, not general**: it repaired the host-dominated NVMe lane by
+refusing to scale host time, and that same refusal is exactly what breaks it
+here, because this lane's "host" span time is mostly *waiting for a saturated
+GPU*, which does scale with the throttle.
+
+### 8.1 Lane configuration and the engagement gauntlet
+
+Config: the sf1000-repro kit (all-8-tables GPU-tier pins, per-query grouped
+pin/unpin, simpatico plans for lineitem+orders, `ast_jit`, GB300-tuned YAML)
++ quent ndjson on + **`SET enable_compressed_materialization = false`**. Two
+traps found on the way in, both documented for reuse:
+
+1. **Union pin-once OOMs by design** (kit NEXT-STEPS: pinned memory is not
+   evictable) — the first engagement attempt died in the 8th pin at
+   251.9 GB peak. The lane runner (`bin/run_latemat_row.sh`) now reproduces
+   the kit's grouped mode exactly: pin the query's columns, run its
+   iterations, unpin.
+2. **The q10 GBR flagship does not engage under ship defaults** (engagement
+   check caught it; wall 0.48 s ≈ the banked v1-only 0.464 s). Root cause
+   chain: `enable_compressed_materialization` defaults true
+   (`sirius_config.hpp:138`, upstream #1260) → pin narrows `c_acctbal`
+   decimal64→decimal32 → the PR's own final fail-closed guard (188e0c5a,
+   added AFTER the −42.8% bank) rejects the narrowed column
+   (`candidate REJECTED (narrow-stored)`) → the 5-column customer bundle
+   drops to 4 and `try_extend_group_ride` refuses silently → stop-port v1
+   fallback. With the SET off, the banked shape returns verbatim
+   (`group-by-rowid ride: scan op 13 -> MERGE_TOP_N, 5 column(s),
+   9 boundary(ies), 158.9 B/row, unique key 'c_custkey'`) and q10 drops
+   0.48 → 0.252 s. Filed as a fix-me to the engine owner; the lane runs with
+   the SET in **every** arm.
+
+Engagement evidence (in-trace + logs): `Init.custom_attributes` records
+`late_mat.enabled/v2/v3=1, fused_scan_filter.enabled=1`; fused-diag shows
+`directives ENABLED` with range masks (q12: 3 range-mask columns,
+covers_whole_filter=true) and decode-time dynamic-membership attaches;
+late-mat shows the GBR ride (q10) and deferral installs. Dark-vs-lit
+(identical config, gates off, back-to-back): **q10 −52%, q12 −52%,
+q19 −38%, q9 −6%, q21 −10%** — the PR's flagship speedups reproduce
+(cumulative gate effect ≥ the per-feature banked claims). Lit baseline LB
+(med iters 2–3): q9 0.879 s, q10 0.252, q12 0.179, q19 0.201, q21 0.651 —
+iteration spread ≤0.6%, and none of the feared 13–28% SF1000 swing appears
+on the pinned lane. LP3 (MPS pct=100 anchor): walls within −1.5%…0% of LB —
+daemon overhead ≈0 here (vs +2.9% worst in §2.1).
+
+### 8.2 Two GPU-busy numbers that both matter
+
+The PR's "GPU-busy is 91–97% of wall" claim and this campaign's "spans are
+85–93% host" (§7.1) turn out to be *both true at once* on this lane, and the
+distinction is the entire story (LN capture, steady-state windows):
+
+| q | device-level GPU-busy (kernel ns ÷ wall) | span-level GPU-busy (Σspan×(1−f_host) ÷ Σspan) |
+|---|---|---|
+| 9 | 97.3% | 29.1% |
+| 10 | 92.7% | 24.0% |
+| 12 | 100.3% (saturated) | 16.6% |
+| 19 | 82.4% | 14.6% |
+| 21 | 98.4% | 24.6% |
+
+Eight executor threads submit overlapping task spans to one GPU; the device
+runs kernels 82–100% of the wall while each individual span spends 71–86% of
+its time queue-waiting for its turn. The old lane's spans were host-bound for
+*real* (NVMe decode, CPU glue — invariant under SM throttle); this lane's
+"host" share is mostly GPU wait — it inflates with `1/f`. Direct trace
+evidence at pct=25: q12 traced Computing span-sum ×3.57, Preparing span-sum
+×3.73, wall ×3.57 (q9: ×4.07/×3.47/×3.41) — whole spans scale like kernels.
+Explicit launch+sync API time explains only 10–43% of the host share (the
+rest is inter-op queueing inside spans), so no per-span host split can fix
+this: **the wait is emergent device contention, not a span property.**
+
+### 8.3 Real MPS sensitivity — the lane the knob was waiting for
+
+`f_ach` from in-session fma probes: 0.7492 / 0.5000 / 0.2500 (exactly
+linear again); saxpy co-points 0.8457 / 0.6122 / 0.3576. Real baseline = LP3
+(P3-equivalent). 3 iterations (1 warmup + 2 measured; σ ≤0.6% makes that
+sufficient). Traced walls, med iters 2–3:
+
+| q | ×@0.75 (old §3.1) | ×@0.50 (old) | ×@0.25 (old) |
+|---|---|---|---|
+| 9 | **1.243** (1.036) | **1.796** (1.106) | **3.475** (1.272) |
+| 10 | 1.248 (—) | 1.777 (—) | 3.395 (—) |
+| 12 | 1.279 (—) | 1.850 (—) | 3.562 (—) |
+| 19 | 1.222 (1.025) | 1.682 (1.083) | 3.147 (1.321) |
+| 21 | 1.242 (1.057) | 1.780 (1.168) | 3.422 (1.480) |
+
+Real slowdown is 92–96% / 84–92% / 79–89% of ideal `1/f` at the three
+factors — the SM ceiling finally *binds*. The old lane's 2.5–7.7% @0.75 band
+is now 22–28%. Walls perfectly monotone in f, 5/5 queries. Selfchecks on all
+three degraded traces: median ≤0.05%, worst 1.51% — replay stays exact under
+MPS on this engine too.
+
+### 8.4 Error table — v0 and physics both fail, now optimistic
+
+Same method as §3/§7 (LP3-anchored real ratios; sims on the LB trace;
+physics = per-query profiles from the paired LN capture, join coverage
+100.0% of span everywhere). E_ratio = sim×/real× − 1:
+
+| q | @0.75 v0 | @0.75 phys | @0.50 v0 | @0.50 phys | @0.25 v0 | @0.25 phys |
+|---|---|---|---|---|---|---|
+| 9 | −5.1% | −13.6% | −13.2% | −30.4% | −25.9% | −47.4% |
+| 10 | −11.4% | −13.4% | −25.9% | −27.8% | −41.4% | −39.1% |
+| 12 | −17.4% | −19.3% | −32.9% | −37.5% | −50.3% | −56.8% |
+| 19 | −9.5% | −13.9% | −22.9% | −28.3% | −44.7% | −55.5% |
+| 21 | −14.2% | −15.5% | −31.7% | −33.8% | −39.4% | −45.6% |
+| **median** | **−11.4%** | **−13.9%** | **−25.9%** | **−30.5%** | **−41.4%** | **−47.3%** |
+
+**FAIL at every factor for both paths** (floors 10/10/15%), uniformly
+optimistic — the dangerous direction for capacity planning ("give me 25% of
+the SMs" answered ×1.4–2.6 when reality is ×3.1–3.6). Why each fails:
+
+- **v0** scales only Computing spans; on this lane Preparing spans (pinned-
+  cache decompress + waits) carry MORE span time than Computing (q12:
+  771 ms vs 245 ms) and inflate ×3.7 in reality, untouched by the knob.
+- **physics** scales only the kernel share (14–29%) of spans and holds the
+  host remainder invariant — the exact repair that fixed the NVMe lane
+  (§7.2) *under*-scales here because the host share is queue-wait.
+- Cross-query rank correlation collapses (ρ(real, sim) −0.5…+0.4 vs 0.9–1.0
+  in §3.1) — though real cross-query spread is only ~13%, so ranks carry
+  little signal on this lane.
+
+The kernel-classification weakness is immaterial again, but for the opposite
+reason as §7.2: priors classify only 3.5–20% of kernel time here, the rest
+scales by the conflated rule — yet even scaling 100% of kernel time by `1/f`
+cannot reach the real slowdown when kernels are only ~a quarter of span time.
+
+### 8.5 First-capture checklist on the new binary (nsys-join.md §7)
+
+1. **Ingest clean** — `reader_notes: []` on all 5 captures (new binary, new
+   kernels, schema still nsys 2025.6.3-stable).
+2. **Attribution** — **100.0% of kernels by count AND time, 100.0% of memcpy
+   time, 0 ns outside op windows, on all 5 captures** (vs R1's 41% memcpy:
+   the pinned lane launches every copy inside task ranges).
+3. **GPU_METRICS** — still `ERR_NVGPUCTRPERM` (admin-locked); priors-only
+   classification: 3.5–20% of kernel time classified. Immaterial here (8.4).
+4. **Curve sanity** — H2D/D2H volumes are ~zero (all 8 tables GPU-pinned;
+   the §"io_request near-absent" prediction of the lane doc holds); D2D peak
+   aggregates 0.9–7.5 TB/s (HBM-internal). No unphysical host-link capacity
+   warnings expected or seen — the c2c knob was not exercised on this lane.
+5. **Clock fit** — iteration-1 windows: same_run, slope 1±3e-5, rms
+   1.4–9.9 µs. (Iteration-2 windows tie structurally with iter-1 and match
+   its label — expected artifact of identical per-iteration structure; their
+   skewed fits are the tell, fractions unaffected.)
+6. **knobs=1 identity** — physics vs traced wall on the paired LN trace:
+   within ±0.3% on all 10 windows (envelope ±1.2%).
+7. **Split divergence** — physics diverges from v0 exactly as the mix
+   dictates (8.4): smaller kernel share ⇒ shallower predicted degradation.
+   nsys Tier A overhead on this lane: ≈0–2% (LN walls vs LB).
+
+### 8.6 What this means for the roadmap
+
+1. **G4b (new, top priority): model the GPU as a shared fluid resource.**
+   The engine already does this for channels; SM time needs the same:
+   per-span kernel demand (from the physics join) served by a device with
+   capacity `f × C`, with span host shares re-derived from queueing, not
+   frozen. The data to calibrate is in `traces/L{75,50,25}` +
+   `nsys/LN/physics_LN*.json`. A device-saturation model would also close
+   §7.5's q21@E1-25 residual (−16.5%) — same physics, milder regime.
+2. **v0's `gpu_compute` must also scale Preparing kernel shares** on pinned
+   lanes (decompress is SM-bound, per laws.py §3) — its miss is why even
+   whole-span scaling under-predicts q12 by 50%.
+3. **Sanity rule (§7.4 addition candidate):** when device-level GPU-busy of
+   the baseline trace exceeds ~70% of wall, both paths should WARN that
+   `gpu_compute` predictions are lower bounds. Device-level busy is
+   computable from any paired capture (kernel ns ÷ window).
+4. The §7 physics path remains validated *on host-dominated lanes*; use the
+   device-busy diagnostic to pick the honest error bar per lane.
+
+### 8.7 Deviations (lane)
+
+1. 3 iterations per MPS row (1 warmup + 2 measured) vs the plan's 4 —
+   justified by σ ≤0.6% on this lane (same rule as §4.1).
+2. Per-query grouped pins (kit ship mode), not a session union pin — the
+   union is a documented OOM (8.1). Pins run inside the throttled process on
+   MPS rows (unavoidable; pin walls excluded from all metrics).
+3. `SET enable_compressed_materialization = false` in every arm — deviates
+   from engine ship default to restore the PR's banked flagship behavior;
+   without it the lane is only *half* lit (v1+fused, no GBR). Regression
+   filed separately.
+4. nsys row used `--capture-range-end=repeat` (5 per-query reports) so pins
+   stay out of every capture; `LD_PRELOAD` passed via `--env-var` because
+   preloading the patched libcudf into the nsys *launcher* kills it (foreign
+   pixi libcurl vs nsys's bundled libssl).
+5. First engagement attempt (L-ENG row 1) aborted on the union-pin OOM;
+   harness restart mid-campaign (coordinator-confirmed) cost no data — the
+   L-ENG diag session completed and is the one reported.

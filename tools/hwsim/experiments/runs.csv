@@ -24,3 +24,12 @@ R1,done,2026-08-05T03:42:49Z,2026-08-05T03:44:59Z,019fd004-7262-7b52-a6e2-cebaaf
 R2,done,2026-08-05T03:48:45Z,2026-08-05T03:49:20Z,019fd009-de8a-70c3-9f2f-d5cb9e41e18a,1.0,1.0,"6 14",35,hostpin_lane_baseline_pin_lineitem5cols+part2cols_host_tier_pipeline8
 R2n,done,2026-08-05T03:49:30Z,2026-08-05T03:50:43Z,019fd00b-13de-7311-b643-7f3901ce49fa,1.0,1.0,"6 14",40,paired_quent+nsys_hostpin_lane_link_335-339GBs_sustained_56-85pct_of_wall
 R3,done,2026-08-05T03:52:54Z,2026-08-05T03:54:01Z,019fd00e-1258-7e83-bf99-6714b7f41e33,0.49,0.5038,"6 14",65,c2c_eater_floor_256mb_cosets_c2c0.504_dram0.538_hbm0.892_eater_achieved_271GBs
+L-ENG,done,2026-08-05T04:49:30Z,2026-08-05T04:51:10Z,019fd042-2ad9-79b3-a40d-32f8f1106067,1.0,1.0,"10 12 19",60,latemat_lane_engagement_diag_2iters_first_attempt_OOM_union_pin_then_grouped_pins_GBR_not_firing_shipdefault_narrowing
+L-GBRDBG,done,2026-08-05T04:58:30Z,2026-08-05T05:06:00Z,none,1.0,1.0,"10",60,quent_off_debug_row_root_caused_GBR:pin_narrowing_x_narrow-stored_guard;SET_enable_compressed_materialization=false_restores_banked_5col_MERGE_TOP_N_ride
+LB,done,2026-08-05T05:07:44Z,2026-08-05T05:08:51Z,019fd052-29d6-7f30-bc37-614f7afda3a4,1.0,1.0,"9 10 12 19 21",40,latemat_lane_lit_baseline_3iters_narrowing_off_selfcheck_med0.07_worst0.27
+L-DARK,done,2026-08-05T05:08:51Z,2026-08-05T05:09:50Z,019fd053-2e7a-7753-909a-e12e4ffd968a,1.0,1.0,"9 10 12 19 21",30,gates_dark_same_config_2iters_dark_vs_lit:q10-52pct_q12-52pct_q19-38pct_q9-6pct_q21-10pct
+LP3,done,2026-08-05T05:09:50Z,2026-08-05T05:11:01Z,019fd054-1f89-7320-ac45-b3b5064f3ad5,1.0,1.0,"9 10 12 19 21",45,mps_pct100_anchor_fma52156_saxpy4851_daemon_overhead~0
+LN,done,2026-08-05T05:13:00Z,2026-08-05T05:16:18Z,019fd058-ea73-7b20-b036-a7e34581a833,1.0,1.0,"9 10 12 19 21",120,paired_quent+nsys_tierA_repeat_ranges_5_reports_first_attempt_killed_by_LD_PRELOAD_into_nsys_launcher_retry_env-var;attribution_100/100_identity<=0.3pct
+L75,done,2026-08-05T05:17:59Z,2026-08-05T05:19:13Z,019fd05b-9419-70c0-9553-b8326a3029b5,0.75,0.7492,"9 10 12 19 21",60,mps_pct75_3iters_fma0.7492_saxpy0.8457_real_x1.22-1.28
+L50,done,2026-08-05T05:19:14Z,2026-08-05T05:20:38Z,019fd05c-b873-71f1-b07e-a4987f739e53,0.50,0.5000,"9 10 12 19 21",70,mps_pct50_3iters_fma0.5000_saxpy0.6122_real_x1.68-1.85
+L25,done,2026-08-05T05:20:38Z,2026-08-05T05:22:33Z,019fd05e-03b0-7812-9cfc-a3630da262f6,0.25,0.2500,"9 10 12 19 21",90,mps_pct25_3iters_fma0.2500_saxpy0.3576_real_x3.15-3.56
