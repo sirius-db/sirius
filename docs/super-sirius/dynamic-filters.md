@@ -7,7 +7,9 @@ This is a category, not a single feature. It spans:
 - **Dynamic table-filter pushdown** — an eligible hash-join build pushes runtime membership filters into a downstream GPU scan (parquet or duckdb-native); an optional zone-map can additionally prune parquet row groups against the actual build-side key range. It is a pure optimization — redundant with the join, so it never changes results. Membership pushdown is **on by default**; zone maps are off by default.
 - **Sideways information passing (SIP)** — a hash-join build applies its membership filter inside its own probe subtree, as deep as the key stays a faithful pass-through, so intervening operators also skip rows the join would discard. Controlled by `enable_dynamic_filter`.
 - **Aggregation-driven pushdown** — a `GROUP BY` or `DISTINCT` exposes its distinct-value set to downstream consumers.
-- **Sort- or top-N-driven pruning** — a post-sort min/max is exact and free; a top-N's current threshold tightens upstream filters.
+- **Sort- or top-N-driven pruning** — a post-sort min/max is exact and free; a top-N's current
+  threshold tightens upstream filters. The concrete refinement proposal is documented in
+  [Dynamic Filters — Top-N Threshold Refinement](dynamic-filters-top-n.md).
 - **Adaptive runtime predicates** — operators that observe data and refine filters over the lifetime of a pipeline.
 
 Phases 1 and 2 are implemented under `enable_dynamic_filter`; zone maps remain opt-in. Phases 3 and 4 are design only.
@@ -18,12 +20,16 @@ The framework has four axes of generality. Each phase opens one axis:
 
 | Axis | Phase 1 | Phase 2 | Phase 3 | Phase 4 |
 |------|---------|---------|---------|---------|
-| Filter kind | zone map + Bloom + IN-list | (reuses Phase 1's filter zoo) | (reuses) | (reuses) |
-| Consumer kind | parquet reader + post-decode scan operator (parquet + duckdb-native) | + membership endpoint spliced into the producer's own probe subtree | + any operator with a column input | (unchanged) |
-| Producer kind | hash-join build (any join mode) whose build arrives whole | (unchanged) | + agg, sort, filter | (unchanged) |
+| Filter kind | zone map + Bloom + IN-list | (reuses Phase 1's filter zoo) | (reuses for single-shot producers) | + one-sided RANGE and lexicographic LEX_RANGE |
+| Consumer kind | parquet reader + post-decode scan operator (parquet + duckdb-native) | + membership endpoint spliced into the producer's own probe subtree | + any operator with a column input | same endpoints + coherent generation refresh |
+| Producer kind | hash-join build (any join mode) whose build arrives whole | (unchanged) | + agg, sort, filter, top-N | (reuses Phase 3 producers) |
 | Coordination | single-shot build-port publication; direct probes ordered, transitive scan targets opportunistic | deterministic under the active task strategy; opportunistic under lookahead | (unchanged) | streaming / incremental refinement |
 
-Anything implemented in Phase 1 is reused unchanged by later phases. We do not replace DuckDB's static table-filter pushdown — static filters continue to flow through the existing translator path and are AND-merged with dynamic filters at the consumer.
+Phase 1 filter classes, append-only publication, and consumer capabilities remain available unchanged.
+Static DuckDB filters continue through the existing translator and AND-merge with dynamic filters.
+Single-shot Phase 3 producers reuse those mechanics. Top-N is the first combined Phase 3/4 proposal:
+it adds the layered RANGE/LEX_RANGE filters plus versioned replacement, coherent snapshots, and
+generation-aware refresh without changing the existing join-filter path.
 
 ## Generalized architecture
 
@@ -564,17 +570,34 @@ Under the default `active` task strategy, publication completes on build-batch a
 
 - **Aggregation / DISTINCT.** A `GROUP BY` exposes its distinct-key set; this is an exact IN-list (or large hash-set) for downstream consumers.
 - **Sort.** Post-sort, the min/max of the sort key is exact and available for free — strictly cheaper than the `cudf::reduce` path used by hash-join build.
+- **Top-N.** A local result containing `LIMIT + OFFSET` candidates proves a one-sided ordering
+  threshold. Unlike the single-shot producers above, progressively tightening that threshold also
+  requires Phase 4 coordination; see
+  [Dynamic Filters — Top-N Threshold Refinement](dynamic-filters-top-n.md).
 - **Filter (narrowed).** A filter operator that has been further narrowed at runtime (e.g., by an upstream agg pushing an exact set) can republish the narrowed predicate downstream.
 
-Each new producer type carries its own `probe_target`-shaped struct and its own way of pairing with consumers it does not own. The filter zoo, the channel, and the consumer side are unchanged.
+Single-shot producer types carry their own `probe_target`-shaped struct and their own way of
+pairing with consumers they do not own. Top-N additionally needs a generic one-sided range filter
+and the Phase 4 replacement protocol; both extensions preserve the existing append-only join path
+and consumer capability model.
 
 This phase is opportunistic — its value depends on where bottlenecks land after Phases 1 and 2. It is in the design so the producer side is not silently locked to "hash-join only" by Phase 1's choices.
 
-## Phase 4 — Dynamic refinement (speculative)
+## Phase 4 — Dynamic refinement (proposed)
 
 **Goal:** generalize the *coordination* axis — producers update filters incrementally as they observe more data; consumers wait for finalization or apply progressively-tightening filters as they arrive. Use cases: streaming refinement, cross-pipeline channels with no implicit edge, adaptive runtime predicates.
 
-An incrementally refined producer/consumer pair, or a consumer that requires a filter for correctness, would need an explicit lifecycle protocol (for example, versioned snapshots plus readiness/finalization). Nothing implemented needs one: publication is single-shot, immediate probes and join-edge endpoints under the default task strategy are externally ordered after it, and transitive scan targets treat whatever immutable filters are visible as optional pruning. No Phase 4 work is planned until a concrete use case justifies it.
+An incrementally refined producer/consumer pair, or a consumer that requires a filter for
+correctness, needs an explicit lifecycle protocol (for example, versioned snapshots plus
+readiness/finalization). Nothing implemented needs one: publication is single-shot, immediate
+probes and join-edge endpoints under the default task strategy are externally ordered after it,
+and transitive scan targets treat whatever immutable filters are visible as optional pruning.
+
+Top-N threshold refinement is now the concrete proposed Phase 4 use case. It keeps consumers
+nonblocking while adding a stable replacement slot, producer revisions, coherent channel
+generations, and progressively tighter immutable range snapshots. The complete design and staged
+rollout are in [Dynamic Filters — Top-N Threshold Refinement](dynamic-filters-top-n.md); the feature
+remains unimplemented.
 
 ---
 
