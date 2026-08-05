@@ -64,8 +64,11 @@ src/**/telemetry/                   @sirius-db/sirius-telemetry
 **/*.cmake                          @sirius-db/sirius-cmake
 **/CMakeLists.txt                   @sirius-db/sirius-cmake
 
-# ── Ops  ──────────────────────────────────────────────────────────────────────
-/.github                            @sirius-db/sirius-ops
+# ── Build  ────────────────────────────────────────────────────────────────────
+/.github                            @sirius-db/sirius-build
+/pixi.*                             @sirius-db/sirius-build
+/Makefile                           @sirius-db/sirius-build
+/scripts/pixi*                      @sirius-db/sirius-build
 
 # ── Documentation──────────────────────────────────────────────────────────────
 **/CLAUDE.md                        @sirius-db/sirius-docs
