@@ -6,6 +6,11 @@ platforms = ["linux-64", "linux-aarch64"]
 [dependencies]
 python = "3.12.*"
 rust = ">=1.89"
-duckdb = "*"
+# MUST match the `duckdb` pin in the workspace-root pixi.toml. The Sirius
+# extension is built against that exact DuckDB, and `LOAD` hard-rejects any
+# other version. Leaving this unpinned lets this environment drift: it resolved
+# to duckdb 1.5.2 against a 1.5.5 build, so every run from this directory died
+# with "The file was built specifically for DuckDB version 'v1.5.5'".
+duckdb = "=1.5.5"
 fastavro = "*"
 pyarrow = ">=14"
