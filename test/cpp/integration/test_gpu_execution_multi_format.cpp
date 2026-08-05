@@ -529,13 +529,17 @@ class MultiFormatFixtureBase {
  */
 class GPUExecutionIcebergFixture : public MultiFormatFixtureBase {
  public:
-  // Community-extension builds these expectations were verified against. A different build is
-  // not automatically wrong, so a mismatch warns rather than fails — but it is recorded, so a
+  // Iceberg-extension build these expectations were verified against. A different build is not
+  // automatically wrong, so a mismatch warns rather than fails — but it is recorded, so a
   // behaviour change arriving with an extension upgrade is attributable instead of mysterious.
-  // (Under 75726455 the reader applies equality deletes; under the older 1.4.4-era build it
-  // silently ignored them, which is why the pre-removal versions of these tests avoided
-  // comparing against it.)
-  static constexpr const char* kVerifiedIcebergVersion = "75726455";
+  //
+  // What the pin is really protecting is the CPU oracle for EQUALITY deletes: the 1.4.4-era
+  // build ignored them silently, so an oracle on that build would agree with a GPU path that
+  // dropped them too. 45163a28 (the build INSTALL resolves for DuckDB v1.5.5) was checked by
+  // hand against test/cpp/integration/data/iceberg_v2_equality_delete and returns the 3
+  // surviving rows, not all 5. Re-run that check when bumping this, rather than assuming a
+  // newer build only improves.
+  static constexpr const char* kVerifiedIcebergVersion = "45163a28";
 
   // Which delete kinds the GPU scan path applies itself. Positional deletes and V3 deletion
   // vectors are applied by iceberg_gpu_ingestible (they share one per-file position map), so
