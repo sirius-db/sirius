@@ -1,0 +1,6 @@
+row,query,knobs,median_sim_wall_ms,median_sim_baseline_ms,binding,forced_admissions,n,pct_span_matched
+L50Pf,9,gpu_compute=0.5000,1688.6,854.3,gpu_device,0,2,100.0
+L50Pf,10,gpu_compute=0.5000,429.2,233.8,gpu_device,0,2,100.0
+L50Pf,12,gpu_compute=0.5000,313.4,164.9,gpu_device,0,2,100.0
+L50Pf,19,gpu_compute=0.5000,328.3,183.9,executor_threads,0,2,100.0
+L50Pf,21,gpu_compute=0.5000,1146.3,617.7,gpu_device,0,2,100.0

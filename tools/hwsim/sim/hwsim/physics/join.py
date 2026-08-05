@@ -31,6 +31,10 @@ class TaskAnnotation:
 class JoinStats:
     matched_query_label: str = ""
     structure_score: float = 0.0
+    # G4b: measured kernel-serialization fraction (union/sum of kernel time
+    # on the device timeline) of the matched capture window; None when the
+    # profile predates the diagnostic. Gates the fluid device-compute model.
+    kernel_serial_frac: Optional[float] = None
     tasks_total: int = 0
     tasks_matched: int = 0
     ops_total: int = 0
@@ -105,6 +109,7 @@ def join_graph(
     stats.structure_score = score
     if qp is not None:
         stats.matched_query_label = qp.matched_trace_label
+        stats.kernel_serial_frac = qp.kernel_serial_frac
 
     # graph tasks per pipeline ordinal, sorted by traced execution start
     by_ord: Dict[int, List] = {}

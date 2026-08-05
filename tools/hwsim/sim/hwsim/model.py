@@ -128,6 +128,13 @@ class TaskSpec:
     input_batches: List[int] = field(default_factory=list)
     output_batches: List[int] = field(default_factory=list)
 
+    # GPU device-compute work of this task's compute phase (gap G4b), in
+    # knob-scaled kernel-ns. Set by the physics retime layer when a GPU knob
+    # moves; 0 = no device-resource service (fixed-duration replay). The
+    # engine serves it through the per-device fluid compute resource so
+    # queue-wait under device saturation EMERGES instead of being replayed.
+    dev_work_ns: float = 0.0
+
     @property
     def is_transfer_prep(self) -> bool:
         return bool(self.prep_origin) and self.prep_origin != self.prep_target
@@ -179,9 +186,7 @@ class QueryGraph:
     def has_traced_spill(self) -> bool:
         """True when the traced execution ran under memory pressure: any task
         hit the Downgrading state or was OOM-rescheduled (success=false)."""
-        return any(
-            t.t_downgrading >= 0 or not t.success for t in self.tasks.values()
-        )
+        return any(t.t_downgrading >= 0 or not t.success for t in self.tasks.values())
 
 
 @dataclass

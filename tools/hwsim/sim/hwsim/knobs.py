@@ -82,10 +82,16 @@ class Knobs:
             )
         if self.gpu_compute != 1.0:
             w.append(
-                "gpu_compute: v0 scales whole operator Computing spans — this "
-                "conflates SM throughput, HBM bandwidth, kernel-launch overhead "
-                "and host-side glue (gap G4). Fixed per-launch overhead does "
-                "not really scale with clocks, so speedups are optimistic."
+                "gpu_compute: v0 scales whole operator Computing spans and "
+                "same-tier Preparing spans (pinned-lane decompress is GPU "
+                "work, validation-results.md section 8.6) — this conflates SM "
+                "throughput, HBM bandwidth, kernel-launch overhead and "
+                "host-side glue (gap G4). Fixed per-launch overhead does not "
+                "really scale with clocks, so speedups are optimistic. v0 "
+                "cannot model device contention (gap G4b): on a "
+                "device-saturated baseline (device-busy > ~70% of wall in a "
+                "paired nsys capture) slowdown predictions are LOWER BOUNDS — "
+                "use --physics for the fluid device model."
             )
         if self.c2c_bandwidth != 1.0:
             w.append(

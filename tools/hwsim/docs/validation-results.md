@@ -622,6 +622,7 @@ cannot reach the real slowdown when kernels are only ~a quarter of span time.
 ### 8.6 What this means for the roadmap
 
 1. **G4b (new, top priority): model the GPU as a shared fluid resource.**
+   *(DONE — WS15, see 8.7.)*
    The engine already does this for channels; SM time needs the same:
    per-span kernel demand (from the physics join) served by a device with
    capacity `f × C`, with span host shares re-derived from queueing, not
@@ -630,15 +631,94 @@ cannot reach the real slowdown when kernels are only ~a quarter of span time.
    §7.5's q21@E1-25 residual (−16.5%) — same physics, milder regime.
 2. **v0's `gpu_compute` must also scale Preparing kernel shares** on pinned
    lanes (decompress is SM-bound, per laws.py §3) — its miss is why even
-   whole-span scaling under-predicts q12 by 50%.
+   whole-span scaling under-predicts q12 by 50%. *(DONE — WS15: v0 scales
+   same-tier Preparing spans by gpu_speed; see 8.7.)*
 3. **Sanity rule (§7.4 addition candidate):** when device-level GPU-busy of
    the baseline trace exceeds ~70% of wall, both paths should WARN that
    `gpu_compute` predictions are lower bounds. Device-level busy is
-   computable from any paired capture (kernel ns ÷ window).
+   computable from any paired capture (kernel ns ÷ window). *(DONE — WS15:
+   the physics path warns only where the G4b model cannot engage — low
+   kernel-serialization lanes or missing annotations; the v0 gpu_compute
+   warning points to --physics. See 8.7.)*
 4. The §7 physics path remains validated *on host-dominated lanes*; use the
    device-busy diagnostic to pick the honest error bar per lane.
 
-### 8.7 Deviations (lane)
+### 8.7 G4b result — the shared-device fluid model (WS15, 2026-08-05)
+
+**Status: CLOSED for serialized-kernel lanes.** §8.6 item 1 implemented
+(simulator-design.md §3.4): the GPU device is now a fluid compute resource —
+per-task kernel demand (from the physics join) served against capacity
+`max(1.0, baseline device-busy fraction)`; queue-wait emerges in the DES
+from demand vs capacity instead of being held invariant inside span "host"
+time. Items 2 (v0 scales same-tier Preparing) and 3 (the >70%-device-busy
+warning, now emitted only where the model *cannot* engage) shipped with it.
+No degraded-run data was used to derive anything: capacity comes from the
+baseline capture, and L50/L25 were held out entirely (L75 was not consulted
+either — the first fit-free run produced the table below).
+
+**L-lane before/after (E_ratio, same LP3-anchored method as 8.4):**
+
+| q | @0.75 old→new phys | @0.50 old→new phys | @0.25 old→new phys | @0.25 v0→v0-new |
+|---|---|---|---|---|
+| 9 | −13.6 → **+8.4%** | −30.4 → **+10.1%** | −47.4 → **+13.0%** | −25.9 → −5.4% |
+| 10 | −13.4 → **+0.3%** | −27.8 → **+3.3%** | −39.1 → **+6.8%** | −41.4 → +4.7% |
+| 12 | −19.3 → **+2.8%** | −37.5 → **+2.8%** | −56.8 → **+3.3%** | −50.3 → +7.2% |
+| 19 | −13.9 → **−2.3%** | −28.3 → **+6.1%** | −55.5 → **+4.1%** | −44.7 → +17.6% |
+| 21 | −15.5 → **+3.6%** | −33.8 → **+4.3%** | −45.6 → **+6.9%** | −39.4 → −12.7% |
+| **median** | **−13.9 → +3.6** | **−30.5 → +4.3** | **−47.3 → +6.8** | **−41.4 → +4.7** |
+
+Physics-fluid: **15/15 cells within ±15%** (worst q9@0.25 +13.0%), direction
+flipped from dangerously optimistic to mildly pessimistic — consistent with
+the one un-modeled effect, MPS partition co-residency (real device-busy sums
+reach ~1.05–1.15 under throttle as two ≤25% partitions co-run; the model's
+capacity stays at the baseline value). v0 with the same-tier-Preparing fix
+(sim CSVs `L*v0f`): medians −11/−26/−41% → +0.2/+0.1/+4.7%, 13/15 within
+±15% (q19 +15.2/+17.6% at 0.50/0.25 — v0's whole-span conflation
+over-scales the one query whose kernel share is smallest). Binding
+constraint reports `gpu_device` on 13/15 physics cells — the model knows
+*why* it predicts what it predicts.
+
+**The validity gate that the old lane forced (measured, honest):** the
+capacity premise — kernels fill the machine, serialize, and slow ~1/f under
+an SM partition — is FALSE on the NVMe lane: its device-timeline
+kernel-serialization fraction (union/sum, now stored per window at ingest)
+is 0.60–0.86 vs 0.91–0.99 on this lane, i.e. its low-occupancy kernels
+co-ran at baseline (and an SM partition neither serializes nor 4×-slows
+them). Engaging the device model there anyway measured q1@E1-25 **+56.5%**
+and q13@E1-25 **+95.6%** (their kernel-time *sums* are 0.60–0.68 of wall —
+the "5–15%" in 8.6 was the span-level share, not the device sum). Below
+serialization 0.9 the model therefore stands down (spans keep §7 semantics)
+and, if the lane is device-saturated, warns that predictions are lower
+bounds. With the gate, the §7.2 E1/E4 re-score reproduces **exactly**
+(24/25 within ±15%, sole exception q21@E1-25 −16.5% unchanged) — the §7.5
+hope that a device-saturation model would close that residual does not
+survive the gate: q21's serialization is 0.86, honestly outside the model's
+demonstrated validity.
+
+Identity and regression checks: physics knobs=1 on the 10 paired LB/LN
+windows −0.02…−0.27% (envelope ±0.3%, 8.5); v0 selfchecks on LB and B1
+byte-identical to the stored campaign CSVs; the 66-query sample-trace
+selfcheck unchanged (median 0.17%, worst 1.20%); hwsim suite 122 → 145
+tests with this change, all green (23 new: fluid-device analytics — N·d/C
+makespan, saturation onset, staggered sharing — v0 prep scaling, gating,
+warnings). Artifacts:
+`analysis/L{75,50,25}{v0f,Pf}_{sim.csv,metrics.txt}`,
+`analysis/E{1-75,1-50,1-25,4-73,4-45}Pf_*`; profiles re-ingested with the
+serialization diagnostic (`kernel_sum_ns`/`kernel_union_ns` per window).
+
+Honest limitations: (1) partition co-residency unmodeled ⇒ +3…+13%
+pessimism at deep throttle (safe direction); (2) the serialization gate is
+a cliff at 0.9 between two well-separated measured populations — a future
+lane in the 0.86–0.91 gap needs its own validation; (3) for `gpu_compute`>1
+emergent waits cannot shrink below traced demand rates ⇒ speedup
+predictions stay conservative; (4) co-running lanes (gate closed) keep the
+§7 error bars and the lower-bound warning is the only protection there;
+(5) the unknown-kernel-class share still scales by the conflated rule — on
+this lane that is 80–96% of kernel time, and the residual +7% median at
+f=0.25 likely hides some membw-class time that should scale by
+min(1, 1.27f).
+
+### 8.8 Deviations (lane)
 
 1. 3 iterations per MPS row (1 warmup + 2 measured) vs the plan's 4 —
    justified by σ ≤0.6% on this lane (same rule as §4.1).

@@ -119,14 +119,32 @@ class QueryPhysics:
     # pipeline_id -> tasks ordered by nsys range start (the join ordinal)
     pipelines: Dict[int, List[TaskPhysics]] = field(default_factory=dict)
     matched_trace_label: str = ""  # best structural match in the paired trace
+    # Device-timeline kernel occupancy over the window (gap G4b): the SUM of
+    # kernel durations vs their interval UNION (per device, summed). Their
+    # ratio is the measured kernel-serialization fraction: ~1 on lanes whose
+    # kernels fill the machine and serialize (the fluid-device capacity model
+    # is valid there); << 1 when low-occupancy kernels co-run (the model's
+    # premise fails and it must stand down). 0.0 = not measured (pre-G4b
+    # profile; re-ingest).
+    kernel_sum_ns: float = 0.0
+    kernel_union_ns: float = 0.0
 
     def n_tasks(self) -> int:
         return sum(len(v) for v in self.pipelines.values())
+
+    @property
+    def kernel_serial_frac(self) -> Optional[float]:
+        """union/sum in (0, 1]; None when the diagnostic is absent."""
+        if self.kernel_sum_ns <= 0.0 or self.kernel_union_ns <= 0.0:
+            return None
+        return min(1.0, self.kernel_union_ns / self.kernel_sum_ns)
 
     def to_dict(self) -> dict:
         return {
             "window": list(self.window),
             "matched_trace_label": self.matched_trace_label,
+            "kernel_sum_ns": self.kernel_sum_ns,
+            "kernel_union_ns": self.kernel_union_ns,
             "pipelines": {
                 str(pid): [t.to_dict() for t in tasks]
                 for pid, tasks in self.pipelines.items()
@@ -138,6 +156,8 @@ class QueryPhysics:
         qp = QueryPhysics(
             window=(float(d["window"][0]), float(d["window"][1])),
             matched_trace_label=d.get("matched_trace_label", ""),
+            kernel_sum_ns=float(d.get("kernel_sum_ns", 0.0)),
+            kernel_union_ns=float(d.get("kernel_union_ns", 0.0)),
         )
         qp.pipelines = {
             int(pid): [TaskPhysics.from_dict(t) for t in tasks]

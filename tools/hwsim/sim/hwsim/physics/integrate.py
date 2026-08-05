@@ -22,6 +22,29 @@ Integration contract with the engine (no engine changes):
 Fallback rule: any task/op without a physics annotation keeps exactly the v0
 conflated scaling (spans / min(gpu_compute, gpu_mem_bandwidth); transfers /
 link multiplier) and is counted + warned about — degraded, never dropped.
+
+Device contention model (gap G4b, validation-results.md §8): when a GPU
+kernel knob moves (gpu_compute != 1 or gpu_mem_bandwidth set) AND the
+capture's measured kernel-serialization fraction (union/sum of kernel time
+on the device timeline) shows the lane's kernels serialize (>= 0.9 — the
+capacity premise; low-occupancy co-running lanes keep §7 semantics), each
+task's knob-scaled kernel time additionally flows through a per-device fluid
+compute resource in the engine:
+
+- demand: task compute-phase kernel work ``W`` (kernel shares × spans ×
+  per-class multipliers) at natural rate ``W / D`` (D = the phase's scaled
+  duration) — at baseline this is exactly the traced achieved kernel rate;
+- capacity: ``max(1.0, baseline device-busy fraction)`` kernel-ns per
+  wall-ns, derived from the BASELINE trace + profile only (one GPU serializes
+  kernel time at ~1 s/s; a busy fraction > 1 is measured multi-stream
+  overlap). No degraded-run data is used.
+
+Uncontended, every phase runs at its natural duration (the §7 behavior, which
+is what the old host-dominated lane needs); on a device-saturated lane the
+aggregate demand exceeds capacity and queue-wait EMERGES, re-deriving the
+span "host" time that is really device wait (the §8 failure: both paths
+under-predicted MPS throttling by up to −57% because that wait was held
+invariant).
 """
 
 from __future__ import annotations
@@ -45,6 +68,24 @@ MIN_XFER_FRAC = 0.005
 
 PREP_PSEUDO_OP = "PHYS::PREP"
 
+# Baseline device-busy fraction above which a lane is considered
+# device-saturated: gpu_compute predictions from a model that cannot
+# represent device contention are lower bounds there (validation-results.md
+# §8.6 item 3; the L-lane measured 82-100% busy with -41/-47% median
+# under-prediction before G4b).
+DEVICE_SATURATION_WARN = 0.7
+
+# Minimum measured kernel-serialization fraction (device-timeline union/sum
+# of kernel time in the matched capture window) for the fluid device model
+# to engage. The capacity model's premise is that kernels fill the machine
+# and serialize, so aggregate throughput scales with the SM fraction; the
+# L-lane measures 0.91-0.99 (valid), the NVMe lane 0.60-0.86 (low-occupancy
+# kernels co-run: neither the 1/f per-kernel stretch nor the f-scaled
+# capacity holds, and imposing them measured +56/+96% errors at f=0.25).
+# Between the two measured populations, with headroom for the L-lane's ~10%
+# stream-overlap slack.
+DEVICE_SERIAL_MIN = 0.9
+
 
 @dataclass
 class RetimeStats:
@@ -65,6 +106,10 @@ class RetimeStats:
     )
     effective_multipliers: Dict[str, float] = field(default_factory=dict)
     warnings: List[str] = field(default_factory=list)
+    # G4b device contention model (per GPU device id)
+    device_model_active: bool = False
+    device_busy_frac: Dict[int, float] = field(default_factory=dict)
+    device_capacity: Dict[int, float] = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {k: getattr(self, k) for k in self.__dataclass_fields__}
@@ -113,11 +158,46 @@ def _curve_factor(
     return 1.0 / mult
 
 
+def _op_kernel_frac(op: OpPhysics) -> float:
+    """Kernel share of one operator span (device work, not memcpy/host)."""
+    return op.f_comp + op.f_membw + op.f_unknown
+
+
+def _op_kernel_inv_factor(op: OpPhysics, knobs: Knobs) -> float:
+    """scaled_kernel_time / traced_span for one operator span."""
+    return (
+        op.f_comp / knobs.gpu_compute
+        + op.f_membw / laws.effective_membw_mult(knobs)
+        + op.f_unknown / laws.conflated_mult(knobs)
+    )
+
+
+def _prep_kernel_frac(prep: PrepPhysics) -> float:
+    return prep.f_comp + prep.f_membw + prep.f_unknown
+
+
+def _prep_kernel_inv_factor(prep: PrepPhysics, knobs: Knobs) -> float:
+    return (
+        prep.f_comp / knobs.gpu_compute
+        + prep.f_membw / laws.effective_membw_mult(knobs)
+        + prep.f_unknown / laws.conflated_mult(knobs)
+    )
+
+
+def _device_model_requested(knobs: Knobs) -> bool:
+    """The G4b device resource engages when a GPU kernel knob moves. At
+    knobs=1 it is a guaranteed no-op (demands equal traced achieved rates,
+    which never exceed the derived capacity), so gating it keeps baseline
+    runs byte-identical to the pre-G4b code path."""
+    return knobs.gpu_compute != 1.0 or knobs.gpu_mem_bandwidth is not None
+
+
 def retime_graph(
     graph: QueryGraph,
     annotations: Dict[int, TaskAnnotation],
     knobs: Knobs,
     curves: Dict[str, BandwidthCurve],
+    serial_frac: Optional[float] = None,
 ) -> Tuple[QueryGraph, RetimeStats]:
     stats = RetimeStats()
     stats.effective_multipliers = {
@@ -128,16 +208,32 @@ def retime_graph(
         "transfer_d2d": laws.transfer_mult("d2d", knobs),
         "host": laws.host_mult(knobs),
     }
+    device_requested = _device_model_requested(knobs)
+    serial_ok = serial_frac is None or serial_frac >= DEVICE_SERIAL_MIN
+    device_on = device_requested and serial_ok
+    stats.device_model_active = device_on
+    if device_requested and serial_frac is None:
+        stats.warnings.append(
+            "G4b: the physics profile carries no kernel-serialization "
+            "diagnostic (pre-G4b ingest) -- assuming serialized kernels and "
+            "engaging the fluid device model; re-run ingest-nsys to verify "
+            "the capacity premise on this lane."
+        )
+    dev_base_kernel: Dict[int, float] = {}  # device -> baseline kernel ns
     g = copy.deepcopy(graph)
     for tid, task in g.tasks.items():
         stats.tasks_total += 1
         ann = annotations.get(tid)
         new_ops: List[Tuple[str, int, int, int]] = []
         prepend: List[Tuple[str, int, int, int]] = []
+        base_kernel_ns = 0.0  # traced kernel time of this task's compute phase
+        scaled_kernel_ns = 0.0  # same, after the per-class knob multipliers
 
         # ---- Preparing phase ------------------------------------------
         prep_ann = ann.prep if ann is not None else None
         if prep_ann is not None and task.prep_ns > 0:
+            base_kernel_ns += _prep_kernel_frac(prep_ann) * task.prep_ns
+            scaled_kernel_ns += _prep_kernel_inv_factor(prep_ann, knobs) * task.prep_ns
             for cls in ("compute", "membw", "unknown", "host"):
                 stats.class_ns[cls] += (
                     getattr(prep_ann, f"f_{cls}" if cls != "compute" else "f_comp")
@@ -190,6 +286,8 @@ def retime_graph(
                 ) * dur
                 stats.class_ns["host"] += op_ann.f_host * dur
                 scaled = dur * _op_inv_factor(op_ann, knobs)
+                base_kernel_ns += _op_kernel_frac(op_ann) * dur
+                scaled_kernel_ns += _op_kernel_inv_factor(op_ann, knobs) * dur
             else:
                 stats.conflated_op_ns += dur
                 scaled = dur / laws.conflated_mult(knobs)
@@ -197,6 +295,14 @@ def retime_graph(
         task.ops = prepend + new_ops
         if ann is not None:
             stats.tasks_annotated += 1
+        if base_kernel_ns > 0.0:
+            dev_base_kernel[task.device] = (
+                dev_base_kernel.get(task.device, 0.0) + base_kernel_ns
+            )
+            if device_on:
+                # Kernel work of the compute phase, in knob-scaled ns; the
+                # engine serves it through the fluid device resource.
+                task.dev_work_ns = scaled_kernel_ns
 
     conflated = stats.conflated_op_ns + stats.conflated_prep_ns
     total = conflated + sum(stats.class_ns.values())
@@ -205,6 +311,66 @@ def retime_graph(
             f"{100.0 * conflated / total:.1f}% of traced busy time "
             f"({conflated / 1e6:.1f} ms) had no physics annotation and was "
             "re-timed with the v0 conflated rule."
+        )
+
+    # ---- G4b device contention model: capacity from BASELINE observables --
+    wall = float(graph.traced_exec_wall_ns)
+    if wall > 0:
+        for dev, kern in sorted(dev_base_kernel.items()):
+            busy = kern / wall
+            stats.device_busy_frac[dev] = busy
+            if device_on:
+                # One GPU serializes kernel time at ~1 kernel-ns per wall-ns;
+                # a measured busy fraction > 1 is real multi-stream overlap
+                # and raises the demonstrated capacity. Derived from the
+                # baseline capture only -- never fit to degraded runs.
+                stats.device_capacity[dev] = max(1.0, busy)
+    if device_on:
+        for dev, busy in sorted(stats.device_busy_frac.items()):
+            if busy > DEVICE_SATURATION_WARN:
+                stats.warnings.append(
+                    f"gpu{dev}: baseline device-busy {100.0 * busy:.0f}% of "
+                    "wall (device-saturated lane) -- G4b fluid device model "
+                    f"ACTIVE, capacity {stats.device_capacity[dev]:.3f} "
+                    "kernel-ns/ns; emergent queue-wait replaces the invariant"
+                    "-host assumption. Partition co-residency under deep SM "
+                    "throttling is not modeled, so predictions are mildly "
+                    "pessimistic (measured +5-15% at 25% SM)."
+                )
+        if total > 0 and conflated > total * 0.5:
+            stats.warnings.append(
+                "G4b device model is blind on the conflated (unannotated) "
+                f"share ({100.0 * conflated / total:.1f}% of busy time): that "
+                "time carries no kernel demand, so device contention is "
+                "under-represented; on saturated lanes predictions are "
+                "lower bounds."
+            )
+    elif device_requested and not serial_ok:
+        busy = max(stats.device_busy_frac.values(), default=0.0)
+        msg = (
+            f"G4b device model DISENGAGED: measured kernel serialization "
+            f"{serial_frac:.2f} < {DEVICE_SERIAL_MIN} -- this lane's kernels "
+            "co-run (low occupancy), so the f-scaled capacity premise does "
+            "not hold; spans keep the section-7 split scaling."
+        )
+        if busy > DEVICE_SATURATION_WARN:
+            msg += (
+                f" Baseline device-busy is {100.0 * busy:.0f}% of wall: "
+                "device contention cannot be represented on this lane and "
+                "gpu_compute predictions are LOWER BOUNDS."
+            )
+        stats.warnings.append(msg)
+    elif (
+        not knobs.is_baseline()
+        and stats.device_busy_frac
+        and max(stats.device_busy_frac.values()) > DEVICE_SATURATION_WARN
+    ):
+        stats.warnings.append(
+            "baseline device-busy exceeds "
+            f"{100 * DEVICE_SATURATION_WARN:.0f}% of wall but no GPU kernel "
+            "knob moved: any knob that changes span overlap on this "
+            "device-saturated lane may contend for the device in ways this "
+            "run does not model."
         )
     return g, stats
 
@@ -283,7 +449,13 @@ def simulate_with_physics(
     queue_order: str = "traced",
 ) -> Tuple[SimResult, JoinStats, RetimeStats]:
     annotations, jstats = join_graph(profile, graph)
-    g2, rstats = retime_graph(graph, annotations, knobs, profile.curves)
+    g2, rstats = retime_graph(
+        graph,
+        annotations,
+        knobs,
+        profile.curves,
+        serial_frac=jstats.kernel_serial_frac,
+    )
     rstats.warnings = jstats.warnings() + rstats.warnings
     pool = {
         ms.device_id: ms.capacity_bytes
@@ -309,6 +481,7 @@ def simulate_with_physics(
         channel_capacity=caps,
         queue_order=queue_order,
         host_capacity=host if host else None,
+        device_capacity=rstats.device_capacity or None,
     ).run()
     return result, jstats, rstats
 
@@ -335,7 +508,9 @@ def physics_knob_warnings(knobs: Knobs, jstats: JoinStats) -> List[str]:
             "time, coupled as min(gpu_mem_bandwidth, gpu_compute x "
             f"{laws.SM_BW_HEADROOM}) per the measured SM-issue cap "
             "(compute-throttle.md). Unclassified/unmatched time uses the v0 "
-            "conflated rule."
+            "conflated rule. Scaled kernel time also flows through the G4b "
+            "fluid device resource, so queue-wait on a saturated device "
+            "emerges instead of holding span host time invariant."
         )
     if knobs.c2c_bandwidth != 1.0 or knobs.cpu_mem_bandwidth != 1.0:
         w.append(

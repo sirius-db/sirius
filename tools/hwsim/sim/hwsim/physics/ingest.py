@@ -65,6 +65,34 @@ def _channel_peaks(memcpys) -> Dict[str, float]:
     return peaks
 
 
+def _window_kernel_occupancy(kernels, w0: float, w1: float) -> Tuple[float, float]:
+    """(sum, union) of kernel durations clipped to [w0, w1), per device then
+    summed — the G4b serialization diagnostic. sum/union ~= 1 means the
+    window's kernels serialize on the device (full-machine kernels: the fluid
+    device-capacity model is valid); sum >> union means low-occupancy kernels
+    co-ran and the model must stand down."""
+    by_dev: Dict[int, List[Tuple[float, float]]] = {}
+    for k in kernels:
+        if k.end <= w0 or k.start >= w1:
+            continue
+        s, e = max(float(k.start), w0), min(float(k.end), w1)
+        if e > s:
+            by_dev.setdefault(k.device, []).append((s, e))
+    total_sum = total_union = 0.0
+    for ivals in by_dev.values():
+        ivals.sort()
+        cs, ce = ivals[0]
+        for s, e in ivals:
+            total_sum += e - s
+            if s <= ce:
+                ce = max(ce, e)
+            else:
+                total_union += ce - cs
+                cs, ce = s, e
+        total_union += ce - cs
+    return total_sum, total_union
+
+
 def _pipeline_signature(qp: QueryPhysics) -> Dict[int, int]:
     return {pid: len(tasks) for pid, tasks in qp.pipelines.items()}
 
@@ -93,7 +121,7 @@ def _op_starts(task) -> List[Tuple[int, int]]:
     t = task.t_first_computing
     if t < 0:
         return out
-    for (_name, op_id, dur, _b) in task.ops:
+    for _name, op_id, dur, _b in task.ops:
         out.append((op_id, t))
         t += dur
     return out
@@ -136,6 +164,7 @@ def _match_trace(profile: PhysicsProfile, trace_model, utc_epoch_ns) -> None:
             "tasks": qp.n_tasks(),
             "best_trace_label": best_label,
             "structure_score": round(best_score, 4),
+            "kernel_serial_frac": qp.kernel_serial_frac,
             "clock": None,
         }
         if best_graph is not None and utc_epoch_ns is not None:
@@ -173,6 +202,10 @@ def ingest_nsys(
 
     profile = PhysicsProfile()
     profile.queries = queries
+    for qp in queries:
+        qp.kernel_sum_ns, qp.kernel_union_ns = _window_kernel_occupancy(
+            data.kernels, qp.window[0], qp.window[1]
+        )
     profile.curves = fit_curves(data.memcpys)
     profile.source = {
         "nsys_sqlite": os.path.abspath(nsys_path),
@@ -222,8 +255,7 @@ def summarize(profile: PhysicsProfile) -> str:
         f"{att.get('kernels_attributed', 0)}/{att.get('kernels_total', 0)} "
         f"({att.get('pct_kernels_attributed', 0.0):.1f}% count, "
         f"{att.get('pct_kernel_ns_attributed', 0.0):.1f}% of kernel time)",
-        "memcpy time attrib : "
-        f"{att.get('pct_memcpy_ns_attributed', 0.0):.1f}%",
+        "memcpy time attrib : " f"{att.get('pct_memcpy_ns_attributed', 0.0):.1f}%",
         "kernel time classed: "
         f"{d.get('pct_kernel_time_classified', 0.0):.1f}% "
         "(unclassified time falls back to v0 conflated scaling)",
@@ -251,10 +283,16 @@ def summarize(profile: PhysicsProfile) -> str:
                 )
             else:
                 cdesc = "different run (structural join only)"
+        serial = entry.get("kernel_serial_frac")
+        sdesc = (
+            f"; kernel serialization {serial:.2f}"
+            if serial is not None
+            else "; kernel serialization n/a"
+        )
         lines.append(
             f"window {entry['window'][0] / 1e6:.0f}..{entry['window'][1] / 1e6:.0f} ms: "
             f"{entry['tasks']} tasks, best trace match "
             f"{entry['best_trace_label'] or '?'} "
-            f"(structure score {entry['structure_score']:.2f}); {cdesc}"
+            f"(structure score {entry['structure_score']:.2f}); {cdesc}{sdesc}"
         )
     return "\n".join(lines)

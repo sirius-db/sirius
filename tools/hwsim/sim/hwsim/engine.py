@@ -24,6 +24,16 @@ docs/super-sirius/pipeline-execution.md):
   demands its traced achieved rate x c2c knob; when aggregate demand exceeds
   channel capacity (traced peak aggregate x c2c knob) all active transfers are
   throttled proportionally.
+- a fluid GPU device-compute resource (gap G4b, docs/simulator-design.md):
+  when ``device_capacity`` is configured and tasks carry ``dev_work_ns``
+  (kernel work, set by the physics retime layer), the compute phase of a task
+  becomes a fluid job -- work ``W`` served at natural demand rate ``W / D``
+  (``D`` = the phase's natural, knob-scaled duration) against a shared
+  per-device capacity in kernel-ns per wall-ns. When concurrent tasks'
+  aggregate kernel demand exceeds capacity all phases stretch proportionally,
+  so queue-wait on a saturated device EMERGES from demand vs capacity instead
+  of being replayed from the trace (the measured L-lane failure mode:
+  span-level "host" time that is really device wait).
 
 Nothing is hand-coded per knob beyond event durations/rates: back-pressure,
 queueing and saturation emerge from admission and capacity.
@@ -67,6 +77,7 @@ ChannelKey = Tuple[str, str, int]  # (origin_tier, target_tier, device)
 
 _BYTES_EPS = 0.5
 _TIME_EPS = 1e-6
+_WORK_EPS = 0.5  # ns of device kernel work (float-accumulation slack)
 
 SPILL_MODES = ("auto", "off", "replay", "model")
 
@@ -162,6 +173,10 @@ class SimResult:
     forced_admissions: int = 0
     dep_cycle_breaks: int = 0
     orphan_gpu_batches: int = 0
+    # fluid GPU device-compute resource (gap G4b); key = device id.
+    # ChannelStats reused with work-ns in place of bytes: capacity is
+    # kernel-ns per wall-ns, moved_bytes is served kernel work (ns).
+    device_stats: Dict[int, ChannelStats] = field(default_factory=dict)
     # spill / downgrade layer (docs/spill-model.md)
     spill_mode: str = "off"
     downgrade_events: int = 0
@@ -176,9 +191,12 @@ class SimResult:
         threads = bt.get("threads", 0.0)
         memory = bt.get("memory", 0.0) + bt.get("spill", 0.0)
         chan = sum(c.throttled_ns for c in self.channel_stats.values())
-        best = max(threads, memory, chan)
+        dev = sum(d.throttled_ns for d in self.device_stats.values())
+        best = max(threads, memory, chan, dev)
         if best <= 0:
             return "dependencies"
+        if best == dev:
+            return "gpu_device"
         if best == memory:
             return "gpu_memory"
         if best == chan:
@@ -222,6 +240,25 @@ class _FluidChannel:
         return min(now + max(0.0, v[0]) / (v[1] * f) for v in self.active.values())
 
 
+class _FluidDevice(_FluidChannel):
+    """Shared GPU device-compute resource (gap G4b).
+
+    Same fluid mechanics as a transfer channel, different units: a job is a
+    task compute phase with ``work`` = knob-scaled kernel-ns and ``demand`` =
+    work / natural-phase-duration (<= 1 by construction: the kernel share of
+    a span cannot exceed the span). Capacity is kernel-ns servable per
+    wall-ns (~1.0 for one GPU whose kernels serialize; > 1 only when the
+    baseline capture shows multi-stream overlap). When Sum(demand) exceeds
+    capacity every active phase stretches proportionally -- emergent
+    queue-wait; when it does not, phases run at their natural durations,
+    which collapses to the section-7 physics behavior on uncontended lanes.
+    """
+
+    def __init__(self, device: int, capacity: float) -> None:
+        super().__init__(("GPU-DEVICE", "compute", device), capacity)
+        self.device = device
+
+
 class Engine:
     def __init__(
         self,
@@ -234,6 +271,7 @@ class Engine:
         spill_mode: str = "auto",
         spill: Optional[SpillParams] = None,
         host_capacity: Optional[float] = None,
+        device_capacity: Optional[Dict[int, float]] = None,
     ) -> None:
         self.graph = graph
         self.knobs = knobs
@@ -250,9 +288,7 @@ class Engine:
                 f"spill_mode must be one of {SPILL_MODES}, got {spill_mode!r}"
             )
         if spill_mode == "auto":
-            if any(
-                t.t_downgrading >= 0 or not t.success for t in self.tasks.values()
-            ):
+            if any(t.t_downgrading >= 0 or not t.success for t in self.tasks.values()):
                 spill_mode = "replay"
             elif knobs.gpu_mem_capacity != 1.0:
                 spill_mode = "model"
@@ -301,6 +337,14 @@ class Engine:
 
         self.channels: Dict[ChannelKey, _FluidChannel] = {}
         self._channel_capacity_cfg = channel_capacity
+
+        # fluid GPU device-compute resource (gap G4b): only devices with a
+        # configured capacity get one; tasks without dev_work_ns bypass it.
+        self.devices: Dict[int, _FluidDevice] = {}
+        if device_capacity:
+            for d, cap in device_capacity.items():
+                if d in devices and cap and cap > 0:
+                    self.devices[d] = _FluidDevice(d, float(cap))
 
         self.rec: Dict[int, TaskTimes] = {tid: TaskTimes() for tid in self.tasks}
         self.forced_admissions = 0
@@ -453,9 +497,7 @@ class Engine:
             if self.spill_mode == "model":
                 # Demoted inputs must be re-materialized on admission; the
                 # engine clamps the total ask to what the space can grant.
-                extra = min(
-                    self._evicted_input_bytes(task), max(0.0, cap - need)
-                )
+                extra = min(self._evicted_input_bytes(task), max(0.0, cap - need))
             if (
                 self._reserved[dev] + self._resident[dev] + need + extra
                 > cap + _BYTES_EPS
@@ -575,17 +617,12 @@ class Engine:
             if self.spill_mode == "replay":
                 # Zero-cost bookkeeping: the traced spans already carry every
                 # real downgrade cost. Admit if the head now fits.
-                if (
-                    self._reserved[dev] + self._resident[dev] + need
-                    <= cap + _BYTES_EPS
-                ):
+                if self._reserved[dev] + self._resident[dev] + need <= cap + _BYTES_EPS:
                     self._admit(dev)
                     return "continue"
                 return "block"
             stall = self.spill.downgrade_base_ns + evicted / self.spill.downgrade_rate
-            self._mgr_busy_until[dev] = max(
-                self._mgr_busy_until[dev], self.now + stall
-            )
+            self._mgr_busy_until[dev] = max(self._mgr_busy_until[dev], self.now + stall)
             self._set_block(dev, "memory", tid)
             self.schedule(self._mgr_busy_until[dev], self._pump, dev)
             return "wait"
@@ -712,7 +749,17 @@ class Engine:
             ch.stats.peak_active = max(ch.stats.peak_active, len(ch.active))
             self._reschedule_channel(ch)
         else:
-            self.schedule(self.now + task.prep_ns, self._prep_done, tid)
+            prep_ns = task.prep_ns
+            if prep_ns > 0 and not task.is_transfer_prep:
+                # Same-tier Preparing (pinned-cache decompress etc.) is GPU
+                # work in the v0 conflated sense -- scale it with gpu_speed
+                # like Computing spans (roadmap item, validation-results.md
+                # section 8.6: v0 missed x3.7 Preparing inflation on the
+                # pinned late-mat lane). Identity at knobs=1 is unchanged.
+                # The physics path pre-splits Preparing and neutralizes the
+                # engine GPU knobs, so nothing is scaled twice there.
+                prep_ns = prep_ns / self.knobs.gpu_speed
+            self.schedule(self.now + prep_ns, self._prep_done, tid)
 
     def _reschedule_channel(self, ch: _FluidChannel) -> None:
         ch.token += 1
@@ -735,17 +782,45 @@ class Engine:
     def _prep_done(self, tid: int) -> None:
         task = self.tasks[tid]
         self.rec[tid].prep_end = self.now
-        dur = task.tail_ns
+        remaining = 1.0
         if self._banked:
             # Work already banked by OOM-rescheduled attempts (model mode)
             # is not re-done: only the remaining fraction runs here.
             remaining = max(0.0, 1.0 - self._banked.get(tid, 0.0))
-            for name, _oid, base, _b in task.ops:
-                dur += base / self.knobs.op_scale(name) * remaining
+        comp = remaining * sum(
+            base / self.knobs.op_scale(name) for (name, _oid, base, _b) in task.ops
+        )
+        dev = self.devices.get(task.device)
+        work = remaining * float(getattr(task, "dev_work_ns", 0.0) or 0.0)
+        if dev is not None and work > _TIME_EPS and comp > _TIME_EPS:
+            # G4b: the compute phase is a fluid job on the shared device.
+            # Natural duration = comp (already knob-scaled); demand = work /
+            # comp; unthrottled it completes in exactly comp, and it stretches
+            # proportionally when aggregate demand exceeds device capacity.
+            dev._advance(self.now)
+            dev.active[tid] = [work, work / comp]
+            dev.stats.peak_active = max(dev.stats.peak_active, len(dev.active))
+            self._reschedule_device(dev)
         else:
-            for name, _oid, base, _b in task.ops:
-                dur += base / self.knobs.op_scale(name)
-        self.schedule(self.now + dur, self._finish, tid)
+            self.schedule(self.now + comp + task.tail_ns, self._finish, tid)
+
+    def _reschedule_device(self, dev: _FluidDevice) -> None:
+        dev.token += 1
+        nxt = dev._next_finish(self.now)
+        if nxt is not None:
+            self.schedule(nxt, self._device_event, dev.device, dev.token)
+
+    def _device_event(self, device: int, token: int) -> None:
+        dev = self.devices[device]
+        if token != dev.token:
+            return
+        dev._advance(self.now)
+        done = [tid for tid, v in dev.active.items() if v[0] <= _WORK_EPS]
+        for tid in done:
+            del dev.active[tid]
+        self._reschedule_device(dev)
+        for tid in done:
+            self.schedule(self.now + self.tasks[tid].tail_ns, self._finish, tid)
 
     def _finish(self, tid: int) -> None:
         task = self.tasks[tid]
@@ -852,6 +927,8 @@ class Engine:
             self._sample_threads(dev)
         for ch in self.channels.values():
             ch._advance(self.now)
+        for fd in self.devices.values():
+            fd._advance(self.now)
 
         wall = (
             max((r.finish for r in self.rec.values()), default=0.0)
@@ -862,6 +939,7 @@ class Engine:
             task_times=self.rec,
             block_totals=self.block_totals,
             channel_stats={k: ch.stats for k, ch in self.channels.items()},
+            device_stats={d: fd.stats for d, fd in self.devices.items()},
             thread_timeline=self.thread_timeline,
             pool_timeline=self.pool_timeline,
             peak_pool=self.peak_pool,

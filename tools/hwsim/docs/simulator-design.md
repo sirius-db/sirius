@@ -177,7 +177,55 @@ every transfer start/finish). Properties:
 - the capacity is a *lower bound* on the real link (the trace may never have
   saturated it) — documented, and overridable in code.
 
-### 3.4 What deliberately stays replayed (v0 omissions)
+### 3.4 GPU device-compute resource (fluid, gap G4b — WS15, 2026-08-05)
+
+The WS14 compute-bound lane (validation-results.md §8) measured a failure
+mode no span-local model can fix: on a device-saturated lane (8 executor
+threads, thousands of sub-ms kernels, device-level kernel-busy 82–100% of
+wall) each span's "host" time is mostly **emergent queue-wait for the shared
+device**, and it scales with the SM throttle. Both v0 and the §7 physics
+split held that time invariant and under-predicted MPS slowdowns by up to
+−57%. The fix extends the fluid-channel concept to device compute:
+
+- **Work**: each task compute phase carries `dev_work_ns` = its kernel time
+  (from the physics join), knob-scaled per class by the laws (compute ÷
+  `gpu_compute`, membw ÷ the SM-cap-coupled multiplier, unknown ÷ the
+  conflated rule).
+- **Demand**: the phase demands the device at `work / D` where `D` is its
+  natural (knob-scaled) duration — at knobs=1 this is exactly the traced
+  achieved kernel rate, so nothing throttles and replay is identity.
+- **Capacity**: `max(1.0, baseline device-busy fraction)` kernel-ns per
+  wall-ns — one GPU serializes kernel time at ~1 s/s; a busy fraction > 1 is
+  measured multi-stream overlap. Derived from the baseline capture only,
+  never fit to degraded runs.
+- **Contention**: when concurrent phases' aggregate demand exceeds capacity,
+  all stretch proportionally (same fluid solver as channels). On a saturated
+  lane this makes the makespan work-conserving —
+  `max(critical path, Σwork/capacity)` — which is where the missing ×3.5
+  Preparing/Computing inflation comes from. Uncontended, every phase runs at
+  its natural duration, i.e. the model **collapses to the §7 behavior**.
+
+**Validity gate (measured, not assumed):** the capacity premise — kernels
+fill the machine and serialize, so aggregate throughput scales with the SM
+fraction — is checked against the capture's **kernel-serialization
+fraction** (device-timeline union/sum of kernel time, stored per window at
+ingest). The late-mat lane measures 0.91–0.99 (model engages); the NVMe lane
+0.60–0.86 (low-occupancy kernels co-run; each kernel neither fills the
+machine nor slows ~1/f under an SM partition — forcing the model there
+measured +56/+96% errors at f=0.25). Below 0.9 the device model stands down,
+spans keep §7 semantics, and if the lane is also device-saturated the run
+warns that predictions are lower bounds. The model engages only when
+`gpu_compute` ≠ 1 or `gpu_mem_bandwidth` is set, keeping knobs=1 runs
+byte-identical.
+
+Known optimism/pessimism: MPS partition co-residency (two ≤25% partitions
+co-running under deep throttle) is not modeled — measured as reality beating
+the work-conserving floor by 5–15% at pct=25, so deep-throttle predictions
+run mildly pessimistic (the safe direction; see validation-results.md §8.7).
+For k > 1 (faster GPU) the emergent waits cannot shrink below the traced
+demand rates, so speedups stay conservative.
+
+### 3.5 What deliberately stays replayed (v0 omissions)
 Manager-loop serialization (~10–20 µs/admission), task-creator thread
 contention, Routing hop latency, and the scan manager/IO subsystem
 (invisible per G1) are not modeled as resources; the first three appear only
@@ -193,7 +241,7 @@ degraded by a known WS1 gap emits a WARNING when moved.
 |---|---|---|
 | `c2c_bandwidth` | transfer demand rates and channel capacities scale by k; durations re-derived from bytes | Preparing includes GPU decompression that is **SM-bound** on GB300 (nsys doc §5.1, memory note); scaling the whole span with the link is optimistic for k>1. SM-driven zero-copy C2C traffic inside kernels is invisible (nsys §5.2). |
 | `gpu_mem_capacity` | pool capacity scales; admission waits emerge; below the spill knee the **calibrated downgrade model** runs (§3.2.1, [spill-model.md](spill-model.md)) | calibrated on two SF1000 pressure points (q21@0.25× +39%, q9@0.15× −20%; v0 was −82%/−58% *in the dangerous direction*). Held-out transfer one-sided; treat sub-knee predictions as order-of-magnitude ±40% and expect over-warning at shallow pressure. |
-| `gpu_compute` | all `Computing` spans ÷ k | conflates SM throughput, HBM bandwidth, launch overhead and host glue (G4). Launch overhead does not scale with clocks ⇒ optimistic for k>1. |
+| `gpu_compute` | all `Computing` spans ÷ k, **and same-tier `Preparing` spans ÷ k** (pinned-lane decompress is GPU work — added for G4b, validation-results.md §8.6; transfer Preparing keeps channel semantics) | conflates SM throughput, HBM bandwidth, launch overhead and host glue (G4). Launch overhead does not scale with clocks ⇒ optimistic for k>1. v0 cannot model device contention (G4b): on device-saturated baselines (device-busy > ~70% of wall) slowdown predictions are lower bounds — use `--physics` (§3.4). |
 | `gpu_mem_bandwidth` | placeholder: spans ÷ min(gpu_compute, gpu_mem_bandwidth) | pessimistic roofline stand-in until the nsys physics join supplies a per-kernel compute/HBM split (G4). |
 | `io_bandwidth` | `GPU_SCAN` Computing spans ÷ k | **G1: no I/O events exist.** Scan read time is fused with GPU decode in one span; the knob scales both, and the flagship "faster I/O → scan blocks on memory" scenario cannot be reproduced until G1 instrumentation lands. On the sample trace the run was host-cached, so disk I/O is doubly invisible. |
 | `cpu_mem_capacity` / `cpu_mem_bandwidth` / `cpu_compute` | accepted, no-op | no host-pool admission or host-bandwidth telemetry in v0. |

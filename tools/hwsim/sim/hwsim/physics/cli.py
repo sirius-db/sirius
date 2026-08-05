@@ -186,6 +186,16 @@ def _physics_report(
         ),
         "binding_constraint": result.binding_constraint(dev0),
         "forced_admissions": result.forced_admissions,
+        "device": {
+            str(d): {
+                "busy_frac_baseline": rstats.device_busy_frac.get(d),
+                "capacity_kns_per_ns": rstats.device_capacity.get(d),
+                "served_work_ms": ds.moved_bytes / 1e6,
+                "throttled_ms": ds.throttled_ns / 1e6,
+                "peak_active": ds.peak_active,
+            }
+            for d, ds in sorted(result.device_stats.items())
+        },
         "channels": {
             f"{o}->{t}@gpu{d}": {
                 "capacity_gbps": cs.capacity,
@@ -237,6 +247,17 @@ def cmd_simulate_physics(args) -> int:
         f"({rep['sim_vs_baseline_pct']:+.1f}% vs physics baseline)"
     )
     print(f"binding constraint   : {rep['binding_constraint']}")
+    for d, ds in sorted(result.device_stats.items()):
+        busy = rstats.device_busy_frac.get(d)
+        print(
+            f"device gpu{d} (G4b)    : baseline busy "
+            f"{100.0 * busy:.0f}% of wall, capacity "
+            f"{rstats.device_capacity.get(d, 0.0):.3f} kernel-ns/ns, "
+            f"served {ds.moved_bytes / 1e6:.1f} ms work, "
+            f"contended {ds.throttled_ns / 1e6:.1f} ms"
+            if busy is not None
+            else f"device gpu{d} (G4b)    : active"
+        )
     if result.forced_admissions:
         print(f"forced_admissions    : {result.forced_admissions}")
     if args.json:

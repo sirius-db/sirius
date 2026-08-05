@@ -35,6 +35,24 @@ trace: **scheduling from Quent, physics from nsys, joined by structural key**
 (query structure, pipeline id, task ordinal, operator position + op-id check)
 — never by timestamp.
 
+**Knob-semantics note (G4b, WS15 2026-08-05):** the "host remainder scales
+with `cpu_compute` only" rule above is *per-span*; it is NOT a promise that
+span host time is invariant under GPU knobs. On device-saturated lanes
+(late-mat: device-level kernel-busy 82–100% of wall) most of the span "host"
+remainder is emergent queue-wait for the shared device, and it is re-derived
+by the engine's fluid device-compute resource: each task's knob-scaled
+kernel time flows through a per-device capacity `max(1.0, baseline
+device-busy fraction)`, so contention delay emerges from demand vs capacity
+(simulator-design.md §3.4). The model engages when `gpu_compute` ≠ 1 or
+`gpu_mem_bandwidth` is set AND the capture's **kernel-serialization
+fraction** (device-timeline union/sum of kernel time, stored per query
+window at ingest: `kernel_sum_ns` / `kernel_union_ns`) is ≥ 0.9 — i.e. the
+lane's kernels demonstrably serialize. Lanes whose kernels co-run
+(NVMe lane: 0.60–0.86) keep the per-span split semantics unchanged, and the
+run warns that predictions are lower bounds if such a lane is also
+device-saturated. Profiles ingested before G4b lack the diagnostic: the
+model engages with a re-ingest warning.
+
 ## 2. Pipeline
 
 ```
@@ -49,7 +67,8 @@ attribute.py: kernel/memcpy → correlationId → RUNTIME launch row →
      ▼
 ingest.py: + curves.py (per-channel, per-log2-bucket α+β fits) + clock.py
   (utcEpochNs anchor + robust linear fit when trace and capture are the same
-  run) + structure matching diagnostics  ──▶  physics.json (schema.py)
+  run) + structure matching diagnostics + per-window kernel sum/union
+  (the G4b serialization diagnostic)  ──▶  physics.json (schema.py)
      ▼
 join.py: profile × QueryGraph → per-tid annotations (+ match-rate stats)
      ▼
@@ -96,11 +115,13 @@ Without `--physics`, simulate/sweep delegate to the v0 code paths unchanged.
 
 ## 4. Engine integration (what changed, what didn't)
 
-The v0 engine (`engine.py`) is untouched. `integrate.py` produces a
-transformed copy of the QueryGraph and runs the engine with *neutralized*
-GPU knobs (`gpu_compute=1`, `gpu_mem_bandwidth=None`, `c2c=1`), so nothing is
-scaled twice; `gpu_mem_capacity` (pool admission) and `io_bandwidth` (G1)
-keep their v0 engine-level meaning:
+`integrate.py` produces a transformed copy of the QueryGraph and runs the
+engine with *neutralized* GPU knobs (`gpu_compute=1`,
+`gpu_mem_bandwidth=None`, `c2c=1`), so nothing is scaled twice;
+`gpu_mem_capacity` (pool admission) and `io_bandwidth` (G1) keep their v0
+engine-level meaning. Since G4b the engine additionally hosts a fluid
+device-compute resource (all knob logic stays in the physics layer: tasks
+carry pre-scaled `dev_work_ns` and the derived capacity is knob-free):
 
 - **Computing spans**: replaced by `span × Σ shareᵢ / multiplierᵢ` per §1.
 - **Preparing spans** (the roadmap's "split Preparing into decompress (SM) +
