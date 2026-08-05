@@ -483,7 +483,8 @@ foreach(_target sirius_extension sirius_loadable_extension)
   # consumers (tests/benchmarks) with --expt-extended-lambda.
   target_compile_options(
     ${_target}
-    PRIVATE $<$<COMPILE_LANG_AND_ID:CUDA,NVIDIA>:--expt-extended-lambda>)
+    PRIVATE $<$<COMPILE_LANG_AND_ID:CUDA,NVIDIA>:--expt-extended-lambda>
+            $<$<COMPILE_LANG_AND_ID:CXX,Clang,AppleClang>:-Wunreachable-code>)
 
   if(VCPKG_BUILD)
     set_target_properties(${_target} PROPERTIES CUDA_RUNTIME_LIBRARY Static)
