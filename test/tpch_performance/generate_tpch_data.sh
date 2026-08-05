@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Generate TPC-H datasets using tpchgen-rs (parquet) or DuckDB's dbgen (duckdb).
+# Generate TPC-H datasets with the reference generators: tpchgen-rs writing
+# parquet directly, or tpchgen-rs/.tbl staged into a native DuckDB database
+# (classic dbgen is the fallback when tpchgen-rs cannot be built).
 #
 # Usage:
 #   ./generate_tpch_data.sh <scale_factor> [--format duckdb|parquet] [--output <path>] [--jobs N]
@@ -20,7 +22,10 @@
 #                     Default: "lineitem:l_shipdate,orders:o_orderdate". Implies --cluster.
 #
 # Parquet format uses tpchgen-rs for optimized row groups and compression.
-# DuckDB format uses DuckDB's built-in dbgen() extension.
+# DuckDB format stages reference .tbl output (tpchgen-rs, byte-identical to
+# classic dbgen; dbgen itself as fallback) and copies it in one table at a
+# time, largest first — NOT DuckDB's built-in dbgen() extension, whose
+# different comment pool changes q13/q16 results vs the reference data.
 #
 # --cluster is duckdb-only on purpose: tpchgen-rs writes Arrow Decimal128 as
 # FIXED_LEN_BYTE_ARRAY, which trips Sirius's `skip_pushdown_due_to_flba` and
