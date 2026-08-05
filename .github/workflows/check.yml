@@ -115,7 +115,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Init build submodules
-        run: git submodule update --init --depth=1 --jobs 3 duckdb substrait cucascade
+        run: ./scripts/init_build_submodules.sh
 
       - name: Init vcpkg with full history for version overrides
         if: matrix.build.environment == 'vcpkg'

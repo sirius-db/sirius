@@ -56,7 +56,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Init build submodules
-        run: git submodule update --init --depth=1 --jobs 3 duckdb substrait cucascade
+        run: ./scripts/init_build_submodules.sh
 
       - uses: prefix-dev/setup-pixi@a09b6247153796b190642a2b53fac4241043cf6f # v0.10.0
         with:
@@ -140,6 +140,18 @@ jobs:
 
       - name: Extract build artifacts
         run: tar -xf build.tar
+
+      - name: Provision DuckDB extensions the tests load
+        # The iceberg cases LOAD without INSTALL on purpose: a test must not reach the network,
+        # and an INSTALL inside the test would silently paper over an unprovisioned runner
+        # instead of failing with the install command. So provisioning happens here, out of
+        # band. avro comes in as an iceberg dependency but is named explicitly so a failure
+        # says which extension is missing.
+        #
+        # This resolves only because the build carries a real DuckDB version — see
+        # scripts/init_build_submodules.sh. Against a v0.0.1 build there is no extension
+        # repository to install from.
+        run: ./build/release/duckdb -c "INSTALL avro; INSTALL iceberg;"
 
       - name: Run C++ unit tests
         run: |
