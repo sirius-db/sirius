@@ -59,6 +59,11 @@ struct PlanContext<'a> {
     /// Schema of every exchange lowered to a stream read, in translation order. The caller has to
     /// declare these on the engine before the plan can bind.
     stream_inputs: Vec<StreamInputSchema>,
+    /// Positional wire-type overrides, keyed by exchange node id, for exchanges that feed merge
+    /// aggregations: the FE declares those columns with intermediate slot types that lie about
+    /// what the sender ships (see `partial_state`). Computed by [`merge_exchange_overrides`]
+    /// before translation starts.
+    exchange_state_overrides: std::collections::HashMap<i32, Vec<(usize, substrait::proto::Type)>>,
 }
 
 impl<'a> PlanContext<'a> {
@@ -75,6 +80,7 @@ impl<'a> PlanContext<'a> {
             exchange_inputs,
             registry,
             stream_inputs: Vec::new(),
+            exchange_state_overrides: std::collections::HashMap::new(),
         }
     }
 
@@ -326,8 +332,64 @@ pub(crate) fn translate_plan(
     registry: &mut ExtensionRegistry,
 ) -> Result<(TranslatedRel, Vec<StreamInputSchema>)> {
     let mut ctx = PlanContext::new(desc, scan_paths, exchange_inputs, registry);
+    ctx.exchange_state_overrides = merge_exchange_overrides(plan)?;
     let translated = plan.translate(&mut ctx)?;
     Ok((translated, std::mem::take(&mut ctx.stream_inputs)))
+}
+
+/// Computes the positional wire-type overrides for exchanges that feed merge aggregations.
+///
+/// Runs over the flat preorder node list before translation, because the exchange is
+/// translated before its parent aggregation and must already declare the stream with the
+/// modeled partial-state types. In preorder a merge aggregation's single child is simply the
+/// next node; anything but an exchange there means the plan reads partial states from a shape
+/// this translator cannot type, so it is refused.
+fn merge_exchange_overrides(
+    plan: &TPlan,
+) -> Result<std::collections::HashMap<i32, Vec<(usize, substrait::proto::Type)>>> {
+    let mut overrides = std::collections::HashMap::new();
+    for (index, node) in plan.nodes.iter().enumerate() {
+        if node.node_type != TPlanNodeType::AGGREGATION_NODE {
+            continue;
+        }
+        // A node without agg_node fails in translate_aggregation with its own error.
+        let Some(agg) = node.agg_node.as_ref() else {
+            continue;
+        };
+        if agg_phase::classify(node.node_id, node.node_type, agg)? != AggPhase::Merge {
+            continue;
+        }
+        let child = plan
+            .nodes
+            .get(index + 1)
+            .filter(|child| child.node_type == TPlanNodeType::EXCHANGE_NODE);
+        if child.is_none() {
+            return Err(TranslateError::UnsupportedPlanNode {
+                node_id: node.node_id,
+                node_type: node.node_type,
+                reason: "a merge aggregation must read its partial states directly from an \
+                         exchange (SET new_planner_agg_stage = 1)",
+            });
+        }
+        let keys = agg.grouping_exprs.as_deref().unwrap_or_default().len();
+        let mut columns = Vec::with_capacity(agg.aggregate_functions.len());
+        for (position, measure) in agg.aggregate_functions.iter().enumerate() {
+            let function = measure
+                .nodes
+                .first()
+                .and_then(|root| root.fn_.as_ref())
+                .ok_or(TranslateError::MissingField {
+                    context: "aggregate expression",
+                    field: "fn",
+                })?;
+            // The exchange row is the intermediate tuple's materialized slots: grouping keys
+            // first, then one state column per measure -- the same layout invariant the
+            // aggregation's output tuple uses.
+            columns.push((keys + position, partial_state::wire_type(function)?));
+        }
+        overrides.insert(child.unwrap().node_id, columns);
+    }
+    Ok(overrides)
 }
 
 /// Replaces a receiver exchange boundary with a read of the sender's output **stream**.
@@ -364,9 +426,30 @@ fn translate_exchange(
                 node_type: node.node_type,
                 reason: "exchange node requires a bound same-node input stream",
             })?;
-    let schema = ctx
+    let mut schema = ctx
         .desc
         .named_struct_for_tuples(&exchange.input_row_tuples, Some(&input.names))?;
+    // An exchange feeding a merge aggregation carries partial-state columns; rewrite their
+    // FE-declared slot types to the modeled wire types. One `Type`, two consumers: the ReadRel
+    // base_schema below and the engine's stream declaration derive from the same rewritten
+    // entry, so the plan's view of the column and the engine's cannot drift apart.
+    if let Some(state_overrides) = ctx.exchange_state_overrides.get(&node.node_id) {
+        let types = schema
+            .r#struct
+            .as_mut()
+            .map(|structure| &mut structure.types)
+            .ok_or_else(|| TranslateError::malformed("exchange schema has no struct"))?;
+        let width = types.len();
+        for (position, ty) in state_overrides {
+            let slot = types.get_mut(*position).ok_or_else(|| {
+                TranslateError::malformed(format!(
+                    "merge aggregation state column {position} is outside the exchange row \
+                     ({width} columns)"
+                ))
+            })?;
+            *slot = ty.clone();
+        }
+    }
     let output_width = schema
         .r#struct
         .as_ref()
@@ -449,17 +532,6 @@ fn translate_aggregation(
                      (SET new_planner_agg_stage = 1)",
         });
     }
-    match phase {
-        AggPhase::OneShot | AggPhase::Partial => {}
-        AggPhase::Merge => {
-            return Err(TranslateError::UnsupportedPlanNode {
-                node_id: node.node_id,
-                node_type: node.node_type,
-                reason: "merge (finalize) aggregation is not translated yet \
-                         (SET new_planner_agg_stage = 1)",
-            });
-        }
-    }
     // Grouped two-phase needs the hash-partitioned shuffle that partitioned streaming output
     // (#838) will provide. Multi-CN plans would also be stopped by the destination guard, but
     // on a single CN the merge fragment has one instance -- one destination -- and grouped
@@ -503,7 +575,7 @@ fn translate_aggregation(
         .zip(&output_slots[grouping_expressions.len()..])
     {
         let mut expr_ctx = ctx.expr_context(&child.row_tuples);
-        let call = expr_translator::aggregate_call(expr, &mut expr_ctx)?;
+        let call = expr_translator::aggregate_call(expr, &mut expr_ctx, phase == AggPhase::Merge)?;
         // The GPU ungrouped-aggregate operator rejects every distinct aggregate, so a
         // grouping-free DISTINCT measure would translate fine and then fail at execution.
         if call.distinct && grouping_expressions.is_empty() {
@@ -513,20 +585,41 @@ fn translate_aggregation(
                 reason: "distinct aggregates without grouping keys are not supported",
             });
         }
+        if phase != AggPhase::OneShot && call.distinct {
+            return Err(TranslateError::UnsupportedPlanNode {
+                node_id: node.node_id,
+                node_type: node.node_type,
+                reason: "DISTINCT aggregates are not supported in two-phase plans \
+                         (SET new_planner_agg_stage = 1)",
+            });
+        }
+        // Merge functions over partial states -- the engine's own internal merge table:
+        // sum->sum, min->min, max->max, and count->SUM. Merging counts must sum the partial
+        // counts; merging them with count would count rows and be silently wrong. This
+        // substitution is the mechanism that makes the plan phase-correct for the engine,
+        // which executes exactly what the function names say.
+        let function_name = if phase == AggPhase::Merge {
+            match call.name.as_str() {
+                "sum" | "min" | "max" => call.name.clone(),
+                "count" => "sum".to_string(),
+                _ => {
+                    return Err(TranslateError::UnsupportedPlanNode {
+                        node_id: node.node_id,
+                        node_type: node.node_type,
+                        reason: "merging this aggregate function is not supported \
+                                 (SET new_planner_agg_stage = 1)",
+                    });
+                }
+            }
+        } else {
+            call.name.clone()
+        };
         // A partial measure's output is its partial state, whose wire type is modeled: the
         // FE's intermediate slot type lies about what Sirius emits (see partial_state). The
         // engine ignores measure output types either way; carrying the modeled type keeps
         // dumped plans honest about what is actually on the wire.
         let output_type = match phase {
             AggPhase::Partial => {
-                if call.distinct {
-                    return Err(TranslateError::UnsupportedPlanNode {
-                        node_id: node.node_id,
-                        node_type: node.node_type,
-                        reason: "DISTINCT aggregates are not supported in two-phase plans \
-                                 (SET new_planner_agg_stage = 1)",
-                    });
-                }
                 let function = expr
                     .nodes
                     .first()
@@ -548,13 +641,14 @@ fn translate_aggregation(
                 })?,
         };
         // `count` lives in the generic aggregate extension; sum/avg/min/max are declared by
-        // the arithmetic extension.
-        let urn = if call.name == "count" {
+        // the arithmetic extension. Keyed on the substituted name, so a merged count
+        // registers as the arithmetic `sum` it became.
+        let urn = if function_name == "count" {
             URN_AGGREGATE
         } else {
             URN_ARITHMETIC
         };
-        let anchor = ctx.registry.register_function(urn, &call.name);
+        let anchor = ctx.registry.register_function(urn, &function_name);
         measures.push(aggregate_rel::Measure {
             measure: Some(AggregateFunction {
                 function_reference: anchor,

@@ -649,7 +649,14 @@ pub(crate) struct AggregateCall {
 
 /// Decomposes a StarRocks aggregate-function expression (the root of a
 /// `TAggregationNode::aggregate_functions` entry) into name, arguments, and distinct-ness.
-pub(crate) fn aggregate_call(expr: &TExpr, ctx: &mut ExprContext<'_>) -> Result<AggregateCall> {
+///
+/// `merge` marks a measure of a merge-phase aggregation, whose arguments are references to
+/// partial-state columns rather than raw rows.
+pub(crate) fn aggregate_call(
+    expr: &TExpr,
+    ctx: &mut ExprContext<'_>,
+    merge: bool,
+) -> Result<AggregateCall> {
     let root = expr
         .nodes
         .first()
@@ -709,7 +716,10 @@ pub(crate) fn aggregate_call(expr: &TExpr, ctx: &mut ExprContext<'_>) -> Result<
         .map(|_| cursor.translate_next(ctx))
         .collect::<Result<Vec<_>>>()?;
     cursor.ensure_consumed()?;
-    if decimal_result && matches!(name, "sum" | "avg") {
+    // Not on the merge side: a merge measure's argument is already the FP64 partial-state
+    // column; the decimal `ret_type` that drives this condition describes the original input,
+    // not the child the measure actually reads.
+    if decimal_result && matches!(name, "sum" | "avg") && !merge {
         arguments = arguments
             .into_iter()
             .map(|input| Expression {
