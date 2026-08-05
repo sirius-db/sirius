@@ -120,6 +120,7 @@ extern "C" int cudaProfilerStop();
 
 #include <cstdint>
 #include <cstdlib>
+#include <string_view>
 #include <unordered_map>
 
 namespace duckdb {
@@ -132,6 +133,12 @@ bool SiriusExtension::buffer_is_initialized = false;
 constexpr std::string QUERY_LABEL_PARAM_KEY = "query_label";
 
 namespace {
+
+bool test_options_enabled() noexcept
+{
+  auto const* value = std::getenv("SIRIUS_ENABLE_TEST_OPTIONS");
+  return value != nullptr && std::string_view{value} == "1";
+}
 
 std::uint64_t count_narrowed_columns(
   sirius::pinned_column_storage_matrix const& column_storage) noexcept
@@ -2183,14 +2190,15 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::operator
                            // fallback policy into every freshly-created database).
     SetEnableDuckdbFallback);
 
-  // TEST ONLY: when non-empty, transparent GPU execution fails at runtime with that
-  // message after plan generation succeeds, to exercise the CPU fallback path. No
-  // setter — the value is read via TryGetCurrentSetting in PhysicalSiriusExecution.
-  config.AddExtensionOption(
-    "sirius_test_inject_transparent_gpu_error",
-    "TEST ONLY: force transparent GPU execution to fail at runtime with this message",
-    LogicalType::VARCHAR,
-    Value(""));
+  // Test hooks are absent from normal duckdb_settings(). The unittest harness opts in before
+  // constructing any database so fallback tests can still inject a deterministic runtime error.
+  if (test_options_enabled()) {
+    config.AddExtensionOption(
+      "sirius_test_inject_transparent_gpu_error",
+      "TEST ONLY: force transparent GPU execution to fail at runtime with this message",
+      LogicalType::VARCHAR,
+      Value(""));
+  }
 
   // Add in config options for special JIT implementation for regex
   config.AddExtensionOption(

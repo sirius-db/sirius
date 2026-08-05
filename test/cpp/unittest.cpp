@@ -100,6 +100,10 @@ CATCH_REGISTER_LISTENER(shared_env_listener)
 
 int main(int argc, char* argv[])
 {
+  // Keep test-only DuckDB options out of normal Sirius builds and sessions. This process opts in
+  // before constructing the shared databases used by the runtime-fallback integration tests.
+  setenv("SIRIUS_ENABLE_TEST_OPTIONS", "1", 1);
+
   // Install the crash backtrace handler up front so it covers the whole test
   // run, independent of when (or whether) the extension's LoadInternal runs.
   sirius::util::install_segfault_backtrace_handler();
