@@ -8,13 +8,13 @@
 # Teams follow the pattern: @sirius-db/sirius-<component|language>-codeowners
 
 # ── Planner ───────────────────────────────────────────────────────────────────
-src/include/pipeline/               @sirius-db/sirius-planner-codeowners
 src/planner/                        @sirius-db/sirius-planner-codeowners
 src/include/planner/                @sirius-db/sirius-planner-codeowners
 
 # ── Executors ─────────────────────────────────────────────────────────────────
 src/creator/                        @sirius-db/sirius-executors-codeowners
 src/pipeline/                       @sirius-db/sirius-executors-codeowners
+src/include/pipeline/               @sirius-db/sirius-executors-codeowners
 src/**/exec/                        @sirius-db/sirius-executors-codeowners
 src/**/parallel/                    @sirius-db/sirius-executors-codeowners
 
