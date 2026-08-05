@@ -56,6 +56,37 @@ relative paths. Generate it with an absolute output path (`gen_corpus.py /var/tm
 which adds the case. The underlying normalization rule is covered in-tree by the
 `strip_file_scheme` unit tests.
 
+## Limitation: this corpus cannot cover delete files
+
+**pyiceberg 0.11.1 cannot write delete files.** Asking it to delete rows — even on a
+format-version-2 table with `write.delete.mode=merge-on-read` — emits:
+
+```
+UserWarning: Merge on read is not yet supported, falling back to copy-on-write
+```
+
+and it rewrites the data file instead. So every merge-on-read construct — V2 positional
+deletes, V2 equality deletes, V3 deletion vectors — is **out of reach of this generator**.
+
+What that means in practice:
+
+- This corpus protects **schema evolution, field-ID resolution, and path handling**. That is
+  where the three silent failures were, so it is worth having.
+- The delete fixtures elsewhere under `test/cpp/integration/data/` must stay **hand-built**,
+  and they therefore keep the weakness this corpus exists to remove: they were built by the
+  same people who wrote the implementation, so they encode its assumptions. Treat a green
+  delete test as weaker evidence than a green conformance test.
+- One known bug currently has **no faithful regression test** for this reason: `iceberg_scan`
+  honours three snapshot selectors (`snapshot_from_id`, `snapshot_from_timestamp`, `version`)
+  but the delete path resolves only the first, so a time-travel query reads one snapshot's
+  data and another snapshot's deletes. Reproducing it requires the current snapshot to carry
+  delete files. The GPU path declines those queries instead (see `sirius_plan_get.cpp`), which
+  is conservative and safe, but the decline rests on reasoning rather than a red-then-green
+  test.
+
+Closing that gap needs reference-written delete files from Spark + `iceberg-runtime` or the
+Java Iceberg API — a JVM dependency, not a `pip install`. Worth doing; not free.
+
 ## Adding a case
 
 Add it to `gen_corpus.py` so the table and its expectation are produced together. Do not

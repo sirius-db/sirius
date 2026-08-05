@@ -86,6 +86,32 @@ std::optional<std::string> iceberg_gpu_scan_decline_reason(duckdb::LogicalGet& o
     return "iceberg_scan table path is empty, so its delete files cannot be inspected";
   }
 
+  // iceberg_scan offers THREE ways to pick a snapshot: snapshot_from_id, snapshot_from_timestamp
+  // and version. The delete path honours only the first — build_iceberg_table_info reads
+  // snapshot_from_id and passes nullopt otherwise, so discover_from_manifests resolves deletes
+  // against the table's CURRENT snapshot while the scan reads the time-travelled one. Data from
+  // snapshot A filtered by snapshot B's deletes returns rows A had removed, or removes rows it
+  // had not: silently wrong, in the same family as resolving columns by name.
+  //
+  // Declining is conservative: a table with no deletes time-travels perfectly well, and this
+  // sends it to DuckDB anyway. Narrowing it requires knowing whether deletes exist AT THE
+  // SELECTED snapshot, which needs the very selector resolution that is missing — and probing
+  // the current snapshot does not answer it, since a table can carry deletes at an older
+  // snapshot and none at HEAD.
+  //
+  // To lift this: thread the full snapshot selector (not just snapshot_from_id) through
+  // build_iceberg_table_info into read_iceberg_delete_data AND into its cache key. The cache
+  // key matters as much as the read — it currently records snapshot_from_id or "current", so
+  // two different timestamps against one table would otherwise collide on one entry.
+  for (auto const& selector : {"snapshot_from_timestamp", "version"}) {
+    auto it = op.named_parameters.find(selector);
+    if (it != op.named_parameters.end() && !it->second.IsNull()) {
+      return std::string("iceberg_scan was given '") + selector +
+             "', but the GPU scan path resolves delete files only by snapshot_from_id, so its "
+             "deletes would be read from the wrong snapshot";
+    }
+  }
+
   // Escape single quotes for SQL string embedding.
   std::string escaped;
   escaped.reserve(table_path.size());
