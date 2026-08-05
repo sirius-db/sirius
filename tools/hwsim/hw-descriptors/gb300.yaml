@@ -1,0 +1,42 @@
+# GB300 (Grace + Blackwell Ultra) — pmgb300ws-0163, the primary hwsim
+# calibration box. Advertised values from NVIDIA Blackwell Ultra / Grace
+# public specs; measured values from the WS3-5 throttle-kit campaigns
+# (docs/{compute,membw,io}-throttle.md) and nvidia-smi on this box.
+# Schema: docs/spec-sheet-mode.md.
+name: gb300
+
+gpu:
+  name: "NVIDIA GB300"                # nvidia-smi / trace G6 gpu.0.name
+  sm_count: 152                       # CUDA attr (trace G6); full B300 die pair is 160
+  boost_clock_mhz: 2070               # nvidia-smi clocks.max.sm / CUDA clockRate
+  fp32_tflops_peak: 80.6              # THEORETICAL 152 SMs x 128 x 2 x 2.07 GHz;
+                                      # NVIDIA publishes no dense-FP32 spec for B300
+  mem_class: hbm3e
+  mem_bandwidth_gbs_peak: 8000        # NVIDIA: 8 TB/s HBM3e per Blackwell Ultra GPU
+                                      # (CUDA-derived 2 x 3996 MHz x 7168 bit = 7161)
+  vram_gb: 288                        # advertised HBM3e capacity per GPU
+
+link:
+  type: c2c                           # NVLink-C2C (Grace <-> GPU), coherent
+  gbs_peak_per_dir: 450               # NVIDIA: 900 GB/s bidirectional
+
+cpu:
+  arch: aarch64-neoverse-v2
+  cores: 72                           # Grace, 1 socket (lscpu on this box)
+  base_clock_ghz: 3.1
+  boost_clock_ghz: 3.393              # lscpu "CPU max MHz" on this box
+  dram_gbs_peak: 512                  # NVIDIA Grace: up to 512 GB/s LPDDR5X
+
+storage:
+  seq_read_gbs: 7.2                   # measured QD32 device ceiling (io-throttle.md);
+                                      # OEM KIOXIA XG10d has no public spec sheet
+
+measured:                             # throttle-kit conventions (spec-sheet-mode.md)
+  fp32_tflops: 52.16                  # fma victim (compute-throttle.md, 52,163 GFLOP/s)
+  gpu_mem_gbs: 5619                   # HBM CE eater max, 2x-bytes traffic
+                                      # (membw-throttle.md; SM-copy victim 5033)
+  link_h2d_gbs: 383                   # pinned H2D loop (membw-throttle.md sec 3c)
+  link_d2h_gbs: 373
+  cpu_dram_gbs: 196                   # 8-thread memcpy, 2x bytes (membw-throttle.md 3b)
+  storage_seq_read_gbs: 6.525         # 8-stream O_DIRECT victim baseline (io-throttle.md)
+  vram_usable_gb: 269.2               # nvidia-smi memory.total 256703 MiB

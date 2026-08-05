@@ -1,0 +1,20 @@
+# NVIDIA L40S — advertised-only. Sources: NVIDIA L40S datasheet (FP32 91.6
+# TFLOPS, GDDR6 864 GB/s, 48 GB) and the Ada AD102 whitepaper (142 SMs,
+# 18,176 FP32 cores, 2520 MHz boost). cpu/storage are box-dependent.
+# Schema: docs/spec-sheet-mode.md.
+name: l40s
+
+gpu:
+  name: "NVIDIA L40S"
+  sm_count: 142
+  boost_clock_mhz: 2520
+  fp32_tflops_peak: 91.6              # dense FP32, datasheet
+  mem_class: gddr6                    # unanchored class -> derate range [0.70, 0.82]
+  mem_bandwidth_gbs_peak: 864
+  vram_gb: 48
+  l2_mb: 96
+
+link:
+  type: pcie
+  gen: 4
+  lanes: 16

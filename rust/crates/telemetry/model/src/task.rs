@@ -92,11 +92,16 @@ state! {
 state! {
     // peak_allocated_bytes: allocator peak on this task's stream at the moment
     // this operator started (i.e. after the previous operator finished).
+    // input_rows: total rows across the operator's input batches; 0 when the
+    // input carries no row-counted batches (e.g. a scan split before decode).
+    // Since op i's input is op i-1's output, this is also the previous
+    // operator's output row count.
     Computing {
         attributes: {
             current_operator_id: u32,
             input_bytes: u64,
             peak_allocated_bytes: u64,
+            input_rows: u64,
         },
         usages: {
             executor_thread: ExecutorThread,
@@ -106,9 +111,14 @@ state! {
 }
 
 state! {
+    // output_rows/output_bytes: the task's final output volume (the last
+    // operator's output, before publish); 0 on failure paths or when the task
+    // produced no batch output.
     Finalizing {
         attributes: {
             success: bool,
+            output_rows: u64,
+            output_bytes: u64,
         },
     }
 }

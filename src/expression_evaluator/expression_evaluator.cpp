@@ -310,7 +310,7 @@ std::unique_ptr<cudf::table> expression_evaluator::evaluate(cudf::table_view inp
     post_process(*ast_expr, std::move(result));
   }
 
-  return std::make_unique<cudf::table>(std::move(_output_columns), _stream, _mr);
+  return std::make_unique<cudf::table>(std::move(_output_columns));
 }
 
 std::unique_ptr<cudf::column> expression_evaluator::compute_mask(cudf::table_view input)

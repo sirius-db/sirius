@@ -1,0 +1,6 @@
+row,query,knobs,median_sim_wall_ms,median_sim_baseline_ms,binding,forced_admissions,n
+E5-70,1,c2c_bandwidth=0.7105;gpu_mem_bandwidth=0.961,8161.1,7842.7,executor_threads,0,3
+E5-70,9,c2c_bandwidth=0.7105;gpu_mem_bandwidth=0.961,12979.5,12494.7,executor_threads,0,3
+E5-70,13,c2c_bandwidth=0.7105;gpu_mem_bandwidth=0.961,5664.4,5452.1,executor_threads,0,3
+E5-70,19,c2c_bandwidth=0.7105;gpu_mem_bandwidth=0.961,8763.4,8440.9,executor_threads,0,3
+E5-70,21,c2c_bandwidth=0.7105;gpu_mem_bandwidth=0.961,18125.8,17447.0,executor_threads,0,3

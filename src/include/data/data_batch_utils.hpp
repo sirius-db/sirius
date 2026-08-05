@@ -66,6 +66,25 @@ inline cudf::table_view get_cudf_table_view(const cucascade::read_only_data_batc
 }
 
 /**
+ * @brief Peak device bytes needed to materialize @p data on the GPU.
+ *
+ * For uncompressed data the source lives in host memory; only the destination
+ * lands on device, so the peak equals the uncompressed size. For compressed
+ * data the encoded payload must first be staged on device before decompression
+ * produces the output, so both are alive simultaneously:
+ * peak = compressed_bytes + uncompressed_bytes. When a column projection is
+ * applied (compressed_host/device_representation::select_columns), both byte
+ * fields are scaled pro-rata, so the estimate naturally covers only the
+ * projected columns.
+ */
+inline std::size_t peak_materialization_bytes(const cucascade::idata_representation* data)
+{
+  auto const compressed   = data->get_size_in_bytes();
+  auto const uncompressed = data->get_uncompressed_data_size_in_bytes();
+  return compressed < uncompressed ? compressed + uncompressed : uncompressed;
+}
+
+/**
  * @brief Get a cudf::table_view from an idle data_batch (convenience overload).
  *
  * Acquires a temporary read-only lock, extracts the table_view, then releases the lock.
@@ -116,13 +135,15 @@ inline std::shared_ptr<cucascade::data_batch> make_data_batch(
   rmm::cuda_stream_view writer_stream,
   const telemetry::batch_telemetry_info& telemetry_info)
 {
-  auto gpu_repr = std::make_unique<cucascade::gpu_table_representation>(
+  const auto num_rows    = static_cast<uint64_t>(table.num_rows());
+  const auto num_columns = static_cast<uint64_t>(table.num_columns());
+  auto gpu_repr          = std::make_unique<cucascade::gpu_table_representation>(
     std::make_unique<cudf::table>(std::move(table)), memory_space, writer_stream);
   const auto batch_id = get_next_batch_id();
   return cucascade::data_batch::make(
     batch_id,
     std::move(gpu_repr),
-    telemetry::quent_data_batch_probe::create(telemetry_info, batch_id));
+    telemetry::quent_data_batch_probe::create(telemetry_info, batch_id, num_rows, num_columns));
 }
 
 /**
@@ -138,13 +159,15 @@ inline std::shared_ptr<cucascade::data_batch> make_data_batch(
   rmm::cuda_stream_view writer_stream,
   const telemetry::batch_telemetry_info& telemetry_info)
 {
-  auto gpu_repr = std::make_unique<cucascade::gpu_table_representation>(
+  const auto num_rows    = table ? static_cast<uint64_t>(table->num_rows()) : 0;
+  const auto num_columns = table ? static_cast<uint64_t>(table->num_columns()) : 0;
+  auto gpu_repr          = std::make_unique<cucascade::gpu_table_representation>(
     std::move(table), memory_space, writer_stream);
   const auto batch_id = get_next_batch_id();
   return cucascade::data_batch::make(
     batch_id,
     std::move(gpu_repr),
-    telemetry::quent_data_batch_probe::create(telemetry_info, batch_id));
+    telemetry::quent_data_batch_probe::create(telemetry_info, batch_id, num_rows, num_columns));
 }
 
 /**
@@ -180,13 +203,15 @@ inline std::shared_ptr<cucascade::data_batch> make_data_batch_from_view(
   rmm::cuda_stream_view writer_stream,
   const telemetry::batch_telemetry_info& telemetry_info)
 {
-  auto gpu_repr = std::make_unique<cucascade::gpu_table_representation>(
+  const auto num_rows    = static_cast<uint64_t>(view.num_rows());
+  const auto num_columns = static_cast<uint64_t>(view.num_columns());
+  auto gpu_repr          = std::make_unique<cucascade::gpu_table_representation>(
     view, std::forward<Owner>(owner), alloc_size, memory_space, writer_stream);
   const auto batch_id = get_next_batch_id();
   return cucascade::data_batch::make(
     batch_id,
     std::move(gpu_repr),
-    telemetry::quent_data_batch_probe::create(telemetry_info, batch_id));
+    telemetry::quent_data_batch_probe::create(telemetry_info, batch_id, num_rows, num_columns));
 }
 
 }  // namespace sirius

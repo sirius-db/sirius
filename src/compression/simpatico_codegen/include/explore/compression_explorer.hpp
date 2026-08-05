@@ -57,11 +57,43 @@ struct exploration_config {
   /// bigger than this is trimmed to a representative row-prefix so no codec
   /// allocates buffers larger than device memory. Default 2 GiB; 0 = unlimited.
   size_t max_explore_bytes = 2ull << 30;
+
+  /// Untimed warmup round-trips per finalist in the rerank pass. The first
+  /// warmup absorbs the NVRTC cold compile of that plan's fused kernels (plus
+  /// allocator / cache first-touch), so it never pollutes the reported rates.
+  /// Minimum meaningful value is 2 (one compile absorb + one steady warm).
+  size_t rerank_warmup = 2;
+
+  /// Timed iterations per finalist in the rerank pass; the reported throughput
+  /// is the median of these (each one event-bracketed around the actual
+  /// compress/decompress call on the measurement stream).
+  size_t rerank_iters = 5;
+
+  /// Pareto-mode final pick: when > 0, select the max-ratio frontier point
+  /// whose measured decompress throughput is >= this floor (GB/s). If no
+  /// frontier point meets the floor, the fastest-decompress point wins.
+  /// 0 = legacy behavior (max ratio on the frontier, ignoring speed).
+  double pareto_decomp_floor_gbps = 0.0;
 };
 
 // ---------------------------------------------------------------------------
 // Result
 // ---------------------------------------------------------------------------
+
+/// One measured point of the (ratio, comp GB/s, decomp GB/s) Pareto frontier.
+/// The `*_gbps` rates are warmed median-of-N (see exploration_config); the
+/// `old_wall_*` rates re-express the legacy metric — a single event-bracketed
+/// one-shot including NVRTC cold compile and first-touch overhead — kept so new
+/// numbers can be compared against plan files produced before the timing fix.
+struct pareto_point {
+  std::string plan_dsl;
+  double compression_ratio        = 1.0;
+  size_t compressed_size_bytes    = 0;
+  double compress_gbps            = 0.0;
+  double decompress_gbps          = 0.0;
+  double old_wall_compress_gbps   = 0.0;
+  double old_wall_decompress_gbps = 0.0;
+};
 
 struct exploration_result {
   std::string plan_dsl;
@@ -69,9 +101,17 @@ struct exploration_result {
   size_t original_size_bytes        = 0;
   size_t compressed_size_bytes      = 0;
   size_t cascade_depth              = 0;
-  double compress_throughput_gbps   = 0.0;
-  double decompress_throughput_gbps = 0.0;
+  double compress_throughput_gbps   = 0.0;  ///< warmed median-of-N (see config)
+  double decompress_throughput_gbps = 0.0;  ///< warmed median-of-N (see config)
+  /// Legacy one-shot wall rates for the chosen plan (compile-polluted on cache
+  /// miss) — emitted alongside the fixed metric for continuity with old plans.
+  double old_wall_compress_gbps   = 0.0;
+  double old_wall_decompress_gbps = 0.0;
   std::string pareto_alternates_summary;
+  /// Full measured frontier (Pareto rerank mode only), including the chosen
+  /// plan — lets a caller re-pick with a different decompress floor without
+  /// re-measuring anything.
+  std::vector<pareto_point> pareto_frontier;
 };
 
 // ---------------------------------------------------------------------------

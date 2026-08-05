@@ -37,29 +37,6 @@
 
 namespace sirius::io {
 
-namespace {
-
-// Bridge a semi_future into a real (promise-backed) std::future.  The result is
-// pushed in via install_callback when the IO settles, so the std::future
-// reports readiness normally (wait_for never returns `deferred`) and the
-// completion bookkeeping runs on the IO callback thread rather than being
-// pulled onto the caller's thread the way std::async(deferred) would.
-std::future<size_t> bridge_semi_to_std(exec::semi_future<size_t>&& sf)
-{
-  auto p   = std::make_shared<std::promise<size_t>>();
-  auto fut = p->get_future();
-  std::move(sf).install_callback([p = std::move(p)](exec::try_t<size_t>&& t) mutable {
-    if (t.has_exception()) {
-      p->set_exception(std::move(t).exception());
-    } else {
-      p->set_value(std::move(t).value());
-    }
-  });
-  return fut;
-}
-
-}  // namespace
-
 sirius_datasource::sirius_datasource(std::shared_ptr<sirius_ioctx> io_ctx,
                                      std::shared_ptr<sirius_io_object> io_object)
   : _io_ctx(std::move(io_ctx)), _io_object(std::move(io_object))
@@ -98,13 +75,46 @@ bool sirius_datasource::is_device_read_preferred(size_t) const
   return _io_ctx->supports_device_read();
 }
 
+// Bridge a semi_future into a real (promise-backed) std::future.  The result is
+// pushed in via install_callback when the IO settles, so the std::future
+// reports readiness normally (wait_for never returns `deferred`) and the
+// completion bookkeeping runs on the IO callback thread rather than being
+// pulled onto the caller's thread the way std::async(deferred) would.
+//
+// Records the issue→settle span and bytes into this datasource's read
+// counters; the counter block is captured as a shared_ptr so a completion
+// that outlives the datasource stays safe.
+std::future<size_t> sirius_datasource::bridge_and_record(exec::semi_future<size_t>&& sf)
+{
+  auto p     = std::make_shared<std::promise<size_t>>();
+  auto fut   = p->get_future();
+  auto start = std::chrono::steady_clock::now();
+  std::move(sf).install_callback(
+    [p = std::move(p), counters = _read_stats, start](exec::try_t<size_t>&& t) mutable {
+      if (t.has_exception()) {
+        counters->record(start, 0);
+        p->set_exception(std::move(t).exception());
+      } else {
+        auto n = std::move(t).value();
+        counters->record(start, n);
+        p->set_value(n);
+      }
+    });
+  return fut;
+}
+
 size_t sirius_datasource::host_read(size_t offset, size_t size, uint8_t* dst)
 {
+  const auto start = std::chrono::steady_clock::now();
+  size_t n         = 0;
   if (uses_prefetching_cache()) {
     auto* cache = _io_ctx->cache();
-    return cache->host_read(*_io_object, offset, size, dst, &_prefetch_handle);
+    n           = cache->host_read(*_io_object, offset, size, dst, &_prefetch_handle);
+  } else {
+    n = _io_ctx->host_read_io(*_io_object, offset, size, dst);
   }
-  return _io_ctx->host_read_io(*_io_object, offset, size, dst);
+  _read_stats->record(start, n);
+  return n;
 }
 
 std::unique_ptr<cudf::io::datasource::buffer> sirius_datasource::host_read(size_t offset,
@@ -125,7 +135,7 @@ std::future<size_t> sirius_datasource::host_read_async(size_t offset, size_t siz
   } else {
     semi = _io_ctx->host_read_async_io(*_io_object, offset, size, dst);
   }
-  return bridge_semi_to_std(std::move(semi));
+  return bridge_and_record(std::move(semi));
 }
 
 std::future<std::unique_ptr<cudf::io::datasource::buffer>> sirius_datasource::host_read_async(
@@ -175,7 +185,7 @@ std::future<size_t> sirius_datasource::device_read_async(size_t offset,
   } else {
     semi = _io_ctx->device_read_async_io(*_io_object, offset, size, dst, stream);
   }
-  return bridge_semi_to_std(std::move(semi));
+  return bridge_and_record(std::move(semi));
 }
 
 std::unique_ptr<sirius_datasource> sirius_datasource::duplicate() const

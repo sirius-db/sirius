@@ -22,9 +22,35 @@
 #include <cudf/io/datasource.hpp>
 #include <cudf/io/text/byte_range_info.hpp>
 
+#include <atomic>
+#include <chrono>
 #include <span>
 
 namespace sirius::io {
+
+/// Lifetime read totals of one @c sirius_datasource, for scan telemetry.
+/// `read_time_ns` sums per-call spans (issue→completion for async reads), so
+/// concurrent reads can make it exceed the critical-path read wall time.
+struct io_read_stats {
+  uint64_t bytes_read{0};
+  uint64_t read_time_ns{0};
+  uint64_t read_calls{0};
+
+  io_read_stats operator-(const io_read_stats& other) const noexcept
+  {
+    return {bytes_read - other.bytes_read,
+            read_time_ns - other.read_time_ns,
+            read_calls - other.read_calls};
+  }
+
+  io_read_stats& operator+=(const io_read_stats& other) noexcept
+  {
+    bytes_read += other.bytes_read;
+    read_time_ns += other.read_time_ns;
+    read_calls += other.read_calls;
+    return *this;
+  }
+};
 
 // ---------------------------------------------------------------------------
 // sirius_datasource
@@ -138,13 +164,60 @@ class sirius_datasource : public cudf::io::datasource {
 
   [[nodiscard]] bool uses_prefetching_cache() const noexcept;
 
+  /// Snapshot of this datasource's lifetime read totals. Datasources are
+  /// per-scan (see the ownership note above), so callers that snapshot before
+  /// and after a read burst get that burst's exact totals. Cache-served reads
+  /// count at cache-copy speed — this measures what the reader waited for,
+  /// not raw device time.
+  [[nodiscard]] io_read_stats read_stats() const noexcept
+  {
+    return {_read_stats->bytes.load(std::memory_order_relaxed),
+            _read_stats->time_ns.load(std::memory_order_relaxed),
+            _read_stats->calls.load(std::memory_order_relaxed)};
+  }
+
+  /// Record a read that was issued directly against this datasource's
+  /// io_object/ioctx (bypassing the read methods above — e.g. the
+  /// duckdb-native decoder's coalesced ranged batch read) so it shows up in
+  /// @ref read_stats. Const: the counters are telemetry bookkeeping, not
+  /// datasource state, and decode paths only hold const references.
+  void record_external_read(std::chrono::steady_clock::time_point start,
+                            size_t bytes) const noexcept
+  {
+    _read_stats->record(start, bytes);
+  }
+
  private:
+  /// Shared with in-flight async completion callbacks so a late completion
+  /// can never touch a destroyed datasource.
+  struct read_counters {
+    std::atomic<uint64_t> bytes{0};
+    std::atomic<uint64_t> time_ns{0};
+    std::atomic<uint64_t> calls{0};
+
+    void record(std::chrono::steady_clock::time_point start, size_t bytes_read) noexcept
+    {
+      const auto elapsed = std::chrono::steady_clock::now() - start;
+      bytes.fetch_add(bytes_read, std::memory_order_relaxed);
+      time_ns.fetch_add(
+        static_cast<uint64_t>(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count()),
+        std::memory_order_relaxed);
+      calls.fetch_add(1, std::memory_order_relaxed);
+    }
+  };
+
+  /// Bridge a semi_future into a std::future, recording bytes + span into
+  /// this datasource's counters when the IO settles.
+  std::future<size_t> bridge_and_record(exec::semi_future<size_t>&& sf);
+
   std::shared_ptr<sirius_ioctx> _io_ctx;
   std::shared_ptr<sirius_io_object> _io_object;
   /// Handle of the most recent speculative/immediate insert into the
   /// prefetching cache, or empty if none was made.  fadvise(disposable)
   /// uses this to cancel still-pending work.
   cache::prefetching_handle _prefetch_handle;
+  std::shared_ptr<read_counters> _read_stats = std::make_shared<read_counters>();
 };
 
 }  // namespace sirius::io

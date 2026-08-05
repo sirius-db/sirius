@@ -1,0 +1,62 @@
+# Arm D surgical plans — projected/filter-aware selection (2026-08-03).
+# Rule (per filter census + engine A/B): dict->bitpack DEPTH-3 (keys_offsets AND
+# indices bitpacked — pin-scale-proven shape, W3 MAX_INDICES fix) on pure-filter
+# dict-code columns; IDENTITY on projected/large string payloads (raw serve is
+# decode-free; arm C's tax came from compressing these); bitpack on numerics
+# unless a frontier point beats it at >= 1 TB/s measured decode.
+# Rates: GB300 warmed median-of-5 from plans-gb300/frontier/part.tsv.
+# column: p_partkey  dtype: i32  ratio: 170.665x  depth: 2
+# comp: 758.2 GB/s  decomp: 1099.5 GB/s  (frontier pick: beats bitpack 3.18x @ 1769 GB/s under the >=1 TB/s rule)
+input -> delta -> differences
+delta.differences -> rle -> runs, values
+
+---
+# column: p_name  dtype: str  ratio: 1.000x  depth: 1
+# comp: 2962 GB/s  decomp: 3097 GB/s
+# identity: filter-only via EXPRESSION refusals (q9 contains, q20 string range) => classic full decode; raw serve is decode-free
+input -> identity
+
+---
+# column: p_mfgr  dtype: str  ratio: 1.000x  depth: 1
+# comp: 2926 GB/s  decomp: 3075 GB/s
+# identity: projected payload (q2)
+input -> identity
+
+---
+# column: p_brand  dtype: str  ratio: ~18.9x  depth: 3
+# depth-2 dict measured: comp 212.7 GB/s  decomp 1527.9 GB/s (K=25; keys_offsets bitpack adds ~nothing, depth-3 is the pin-scale-proven shape)
+# pure-filter dict-code: q17 p_brand='Brand#13' (BOOL8 substitution), q16 != refusal
+input -> dictionary -> keys_offsets, keys_chars, indices
+dictionary.keys_offsets -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+dictionary.indices -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+
+---
+# column: p_type  dtype: str  ratio: 1.000x  depth: 1
+# role-conflict resolution (measured): q8 filters it (dict win -1.7%) but q14 PROJECTS it
+# (dict materialization tax +17.3%) -> identity wins net. See NEXT-STEPS selection rule.
+input -> identity
+
+---
+# column: p_size  dtype: i32  ratio: 5.272x  depth: 1
+# comp: 907.1 GB/s  decomp: 1765.8 GB/s
+# q2 p_size=41 range mask; only true numeric-mask column on these 6 tables
+input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+
+---
+# column: p_container  dtype: str  ratio: ~15x  depth: 3
+# depth-2 dict measured: decomp 3010 GB/s identity baseline; depth-2 dict fails encode at pin scale (MAX_INDICES) — depth-3 proven
+# pure-filter dict-code: q17 p_container='JUMBO CAN' (K=40)
+input -> dictionary -> keys_offsets, keys_chars, indices
+dictionary.keys_offsets -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+dictionary.indices -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+
+---
+# column: p_retailprice  dtype: t26  ratio: 3.742x  depth: 1
+# comp: 1286.9 GB/s  decomp: 2745.4 GB/s  (delta->lz4 90.3x rejected: 627.8 GB/s < 1 TB/s)
+input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+
+---
+# column: p_comment  dtype: str  ratio: 1.000x  depth: 1
+# comp: 2921 GB/s  decomp: 3064 GB/s
+# identity: no TPC-H query filters or projects it at part scans worth a decode
+input -> identity

@@ -2,6 +2,7 @@
 #pragma once
 
 #include "codegen/plan/plan_interpreter.hpp"
+#include "codegen/selection/selection.hpp"
 #include "codegen/util/stream_pool.hpp"
 
 #include <cudf/table/table.hpp>
@@ -187,6 +188,78 @@ std::unique_ptr<cudf::table> decompress(
 std::unique_ptr<cudf::table> decompress(
   const compressed_table& table,
   std::span<const std::size_t> selected_columns,
+  simpatico::stream_pool& pool,
+  rmm::device_async_resource_ref mr = rmm::mr::get_current_device_resource_ref());
+
+// ── Predicate-pushdown decompression ─────────────────────────────────────────
+
+/// Decompress a column subset, answering a set-membership predicate on selected
+/// columns instead of reconstructing them.
+///
+/// @p predicates is parallel to @p selected_columns; an entry with an empty
+/// @c equals_any reconstructs that column normally. A column with an active
+/// directive comes back as BOOL8 of the same row count (`value ∈ equals_any`,
+/// nulls propagated) — never its declared dtype — so the caller must be prepared
+/// for the type change.
+///
+/// The point is to skip the decode entirely for dictionary-compressed columns
+/// consumed only by an equality / IN filter: the predicate is resolved against
+/// the key set and mapped over the indices, so the key chars are never gathered
+/// into a full-width column. Use @c column_supports_predicate_decode to check
+/// that a column's plan can actually do this before pushing a predicate into it.
+///
+/// @throws std::runtime_error if @p predicates and @p selected_columns differ in
+///         size, or on the usual decompression failures.
+std::unique_ptr<cudf::table> decompress(
+  const compressed_table& table,
+  std::span<const std::size_t> selected_columns,
+  std::span<const decode_predicate> predicates,
+  simpatico::stream_pool& pool,
+  rmm::device_async_resource_ref mr = rmm::mr::get_current_device_resource_ref());
+
+/// True iff column @p column_index of @p table resolves a predicate without
+/// materialising the column (i.e. its plan is dictionary-rooted). False for an
+/// out-of-range index or a column with no plan tree.
+bool column_supports_predicate_decode(const compressed_table& table, std::size_t column_index);
+
+/// Fused scan-filter decompress (experimental, env gate
+/// SIRIUS_EXP_FUSED_SCAN_FILTER=1). @p request carries the scan's
+/// decode-resolvable range conjuncts plus the TierA/TierB tag per selected
+/// output column (built by the scan-side extraction; see
+/// codegen/selection/selection.hpp).
+///
+/// When the gate is on and every precondition holds, columns are decoded with
+/// the two-wave mask pipeline: wave 1 runs the K1 mask variants for the filter
+/// columns, the masks are AND-combined and counted (one host sync for the
+/// survivor count), then wave 2 decodes TierA columns directly to compacted
+/// survivor_count-row columns and TierB columns full-width as today.
+/// @p result comes back with applied=true, the selection mask/offsets, and the
+/// TierB gather map (row_indices) — the caller gathers TierB survivors
+/// scan-side and skips its post-decompress filter pass.
+///
+/// When the gate is off, @p request is empty, or any precondition fails
+/// (non-bitpack filter column, nulls, ...), this is EXACTLY the classic
+/// decompress(table, selected_columns, pool, mr) — same kernels, same
+/// allocations — returned as released columns, and result.applied is false.
+/// result.status refines the applied=false cases: `refused` (no device work),
+/// `bailed_high_selectivity` (RULE-2 post-CNT bail — the scan side should
+/// memoize this per operator and strip the range pushdown from the scan's
+/// remaining batches), or `failed` (mid-flight fallback, exceptional).
+///
+/// Dict-code equality/IN conjuncts ride INSIDE the request
+/// (scan_filter_request::bool8_filters, iteration 3): wave 1 resolves them via
+/// the shipped decode_predicate pushdown, packs the BOOL8 result to mask words
+/// and ANDs it into the batch mask. On ANY non-applied outcome
+/// (refused/bailed/failed) with bool8_filters present, the classic rerun is
+/// the PREDICATED decompress — those columns come back as BOOL8 substitution
+/// columns exactly like the classic pushdown, never a plain decode (the dict
+/// win survives every fallback). Callers must therefore be ready for BOOL8 at
+/// bool8_filter columns whenever result.applied is false.
+std::vector<std::unique_ptr<cudf::column>> decompress_scan_filter(
+  const compressed_table& table,
+  std::span<const std::size_t> selected_columns,
+  sirius::codegen::scan_filter_request const& request,
+  sirius::codegen::scan_filter_result& result,
   simpatico::stream_pool& pool,
   rmm::device_async_resource_ref mr = rmm::mr::get_current_device_resource_ref());
 

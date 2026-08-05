@@ -118,14 +118,6 @@ struct bfs_candidate {
   std::unordered_map<std::string, size_t> path_size;
 };
 
-struct ranked_candidate {
-  std::string plan_dsl;
-  double compression_ratio;
-  size_t compressed_size_bytes;
-  double compress_throughput_gbps;
-  double decompress_throughput_gbps;
-};
-
 // ---------------------------------------------------------------------------
 // Round-trip timing for the rerank pass
 // ---------------------------------------------------------------------------
@@ -177,6 +169,11 @@ bool measure_compressed_bytes(cudf::column_view input,
   return true;
 }
 
+// Legacy one-shot round trip: a single event-bracketed compress + decompress,
+// cold — on a JIT-cache miss the NVRTC compile is inside the bracket, and even
+// warm it carries first-touch allocator overhead. This WAS the rerank metric;
+// it survives only as (a) warmup pass #1 and (b) the `old_wall_*` continuity
+// rates in round_trip_time_stats below. Do not use it as a throughput measure.
 bool round_trip_time_rr(cudf::column_view input,
                         std::string_view plan_dsl,
                         rmm::cuda_stream_view stream,
@@ -203,6 +200,113 @@ bool round_trip_time_rr(cudf::column_view input,
     if (err_out) *err_out = "decompress_column: " + err;
     return false;
   }
+  return true;
+}
+
+double median_of(std::vector<double> v)
+{
+  if (v.empty()) return 0.0;
+  std::sort(v.begin(), v.end());
+  size_t const n = v.size();
+  return (n % 2 == 1) ? v[n / 2] : 0.5 * (v[n / 2 - 1] + v[n / 2]);
+}
+
+struct rt_stats {
+  double comp_ms_median   = 0.0;  // warmed, event-bracketed, median of `iters`
+  double decomp_ms_median = 0.0;
+  double comp_ms_first    = 0.0;  // legacy one-shot (cold; includes NVRTC compile
+  double decomp_ms_first  = 0.0;  // on cache miss) — old_wall continuity metric
+  size_t compressed_bytes = 0;
+};
+
+// Measured round-trip timing for the rerank pass, fixed for the two flaws the
+// GB300 decoder audit found in the one-shot metric: (1) an NVRTC cold compile
+// landing inside the timing bracket, and (2) one-shot wall clock carrying
+// launch/sync + first-touch overhead worth ~2x on fast kernels.
+//
+//   pass 1                — legacy one-shot round trip, kept as comp/decomp
+//                           `*_ms_first` (the old metric, for continuity);
+//                           also warmup #1, absorbing the NVRTC compile.
+//   passes 2..warmup      — untimed round trips (steady-state warm).
+//   then `iters` timed compress calls (median), keeping the last PlanTree,
+//   then `iters` timed decompress calls of that tree (median).
+//
+// Each timed call is still event-bracketed around the whole compress_column /
+// decompress_column call on `stream` — that is the production decode path, so
+// per-launch overhead that survives a warm cache is real cost and stays in.
+bool round_trip_time_stats(cudf::column_view input,
+                           std::string_view plan_dsl,
+                           rmm::cuda_stream_view stream,
+                           rmm::device_async_resource_ref mr,
+                           size_t warmup,
+                           size_t iters,
+                           rt_stats& out,
+                           std::string* err_out)
+{
+  warmup = std::max<size_t>(warmup, 1);
+  iters  = std::max<size_t>(iters, 1);
+
+  // Pass 1: legacy one-shot (also absorbs the plan's NVRTC compile).
+  if (!round_trip_time_rr(input,
+                          plan_dsl,
+                          stream,
+                          mr,
+                          out.comp_ms_first,
+                          out.decomp_ms_first,
+                          out.compressed_bytes,
+                          err_out)) {
+    return false;
+  }
+
+  std::string err;
+  std::unique_ptr<PlanTree> plan_tree;
+
+  // Remaining warmups: full round trips, untimed.
+  for (size_t w = 1; w < warmup; ++w) {
+    plan_tree = compress_column(input, plan_dsl, stream, mr, &err);
+    if (!plan_tree) {
+      if (err_out) *err_out = "compress_column (warmup): " + err;
+      return false;
+    }
+    auto decompressed = decompress_column(*plan_tree, stream, mr, &err);
+    if (!decompressed) {
+      if (err_out) *err_out = "decompress_column (warmup): " + err;
+      return false;
+    }
+  }
+
+  // Timed compress iterations. Reassigning plan_tree frees the previous one.
+  std::vector<double> comp_ms;
+  comp_ms.reserve(iters);
+  for (size_t i = 0; i < iters; ++i) {
+    cudaStreamSynchronize(stream.value());  // drain, so the bracket sees only this call
+    double ms = time_cuda_ms(
+      stream.value(), [&] { plan_tree = compress_column(input, plan_dsl, stream, mr, &err); });
+    if (!plan_tree) {
+      if (err_out) *err_out = "compress_column: " + err;
+      return false;
+    }
+    comp_ms.push_back(ms);
+  }
+  out.compressed_bytes = plan_tree_compressed_bytes(*plan_tree, stream);
+
+  // Timed decompress iterations over the final tree.
+  std::vector<double> decomp_ms;
+  decomp_ms.reserve(iters);
+  for (size_t i = 0; i < iters; ++i) {
+    cudaStreamSynchronize(stream.value());
+    std::unique_ptr<cudf::column> decompressed;
+    double ms = time_cuda_ms(
+      stream.value(), [&] { decompressed = decompress_column(*plan_tree, stream, mr, &err); });
+    if (!decompressed) {
+      if (err_out) *err_out = "decompress_column: " + err;
+      return false;
+    }
+    decomp_ms.push_back(ms);
+  }
+
+  out.comp_ms_median   = median_of(std::move(comp_ms));
+  out.decomp_ms_median = median_of(std::move(decomp_ms));
   return true;
 }
 
@@ -681,9 +785,11 @@ exploration_result explore_column_compression(cudf::column_view input,
     std::string plan_dsl;
     double compression_ratio;
     size_t compressed_size_bytes;
-    double compress_throughput_gbps;
-    double decompress_throughput_gbps;
+    double compress_throughput_gbps;    // warmed median-of-N
+    double decompress_throughput_gbps;  // warmed median-of-N
     double decode_cost = 0.0;  // proxy for pareto_beam finalist selection
+    double old_wall_compress_gbps   = 0.0;  // legacy one-shot rates (continuity)
+    double old_wall_decompress_gbps = 0.0;
   };
   std::vector<ranked_candidate> finalists;
   auto add_finalist = [&](std::string dsl, double ratio, size_t bytes, double dc) {
@@ -803,6 +909,10 @@ exploration_result explore_column_compression(cudf::column_view input,
     cudaDeviceSynchronize();
     if (!sized.empty()) finalists = std::move(sized);
   } else if (!finalists.empty()) {
+    // Global warm call: grows nvcomp Manager scratch / RMM pool to their
+    // high-water marks once, so the first finalist's own measurement (and its
+    // old_wall continuity rates) is not uniquely penalized. Mirrors the single
+    // warmup the pre-fix harness did.
     {
       double a, b;
       size_t c2;
@@ -810,46 +920,24 @@ exploration_result explore_column_compression(cudf::column_view input,
       cudaDeviceSynchronize();
     }
 
-    static constexpr size_t kPasses = 3;
-    struct acc_t {
-      std::string plan_dsl;
-      double best_comp_ms   = std::numeric_limits<double>::infinity();
-      double best_decomp_ms = std::numeric_limits<double>::infinity();
-      size_t bytes          = 0;
-      bool any_ok           = false;
-    };
-    std::vector<acc_t> accs;
-    for (auto const& f : finalists)
-      accs.push_back({f.plan_dsl,
-                      std::numeric_limits<double>::infinity(),
-                      std::numeric_limits<double>::infinity(),
-                      f.compressed_size_bytes,
-                      false});
-
-    for (size_t pass = 0; pass < kPasses; ++pass) {
-      for (size_t i = 0; i < finalists.size(); ++i) {
-        double comp_ms = 0, decomp_ms = 0;
-        size_t bytes = accs[i].bytes;
-        std::string err;
-        bool ok = round_trip_time_rr(
-          measure_col, finalists[i].plan_dsl, stream, mr, comp_ms, decomp_ms, bytes, &err);
-        cudaDeviceSynchronize();
-        if (!ok) continue;
-        accs[i].any_ok = true;
-        accs[i].bytes  = bytes;
-        if (comp_ms < accs[i].best_comp_ms) accs[i].best_comp_ms = comp_ms;
-        if (decomp_ms < accs[i].best_decomp_ms) accs[i].best_decomp_ms = decomp_ms;
-      }
-    }
     double const orig = (double)measure_size;
+    auto to_gbps      = [orig](double ms) { return ms > 0 ? orig / ms / 1.0e6 : 0.0; };
     std::vector<ranked_candidate> timed;
-    for (auto const& a : accs) {
-      if (!a.any_ok) continue;
-      timed.push_back({a.plan_dsl,
-                       orig / std::max<size_t>(a.bytes, 1),
-                       a.bytes,
-                       a.best_comp_ms > 0 ? orig / a.best_comp_ms / 1.0e6 : 0.0,
-                       a.best_decomp_ms > 0 ? orig / a.best_decomp_ms / 1.0e6 : 0.0});
+    for (auto const& f : finalists) {
+      rt_stats st;
+      std::string err;
+      bool ok = round_trip_time_stats(
+        measure_col, f.plan_dsl, stream, mr, config.rerank_warmup, config.rerank_iters, st, &err);
+      cudaDeviceSynchronize();
+      if (!ok) continue;
+      timed.push_back({f.plan_dsl,
+                       orig / std::max<size_t>(st.compressed_bytes, 1),
+                       st.compressed_bytes,
+                       to_gbps(st.comp_ms_median),
+                       to_gbps(st.decomp_ms_median),
+                       0.0,
+                       to_gbps(st.comp_ms_first),
+                       to_gbps(st.decomp_ms_first)});
     }
     if (!timed.empty()) finalists = std::move(timed);
   }
@@ -866,15 +954,26 @@ exploration_result explore_column_compression(cudf::column_view input,
     auto measure_dsl = [&](std::string const& dsl, ranked_candidate& out) -> bool {
       size_t bytes      = 0;
       double const orig = (double)measure_size;
+      auto to_gbps      = [orig](double ms) { return ms > 0 ? orig / ms / 1.0e6 : 0.0; };
       if (need_throughput) {
-        double cms = 0, dms = 0;
-        if (!round_trip_time_rr(measure_col, dsl, stream, mr, cms, dms, bytes, nullptr))
+        rt_stats st;
+        if (!round_trip_time_stats(measure_col,
+                                   dsl,
+                                   stream,
+                                   mr,
+                                   config.rerank_warmup,
+                                   config.rerank_iters,
+                                   st,
+                                   nullptr))
           return false;
         out = {dsl,
-               orig / std::max<size_t>(bytes, 1),
-               bytes,
-               cms > 0 ? orig / cms / 1.0e6 : 0.0,
-               dms > 0 ? orig / dms / 1.0e6 : 0.0};
+               orig / std::max<size_t>(st.compressed_bytes, 1),
+               st.compressed_bytes,
+               to_gbps(st.comp_ms_median),
+               to_gbps(st.decomp_ms_median),
+               0.0,
+               to_gbps(st.comp_ms_first),
+               to_gbps(st.decomp_ms_first)};
       } else {
         if (!measure_compressed_bytes(measure_col, dsl, stream, mr, bytes, nullptr)) return false;
         out = {dsl, orig / std::max<size_t>(bytes, 1), bytes, 0.0, 0.0};
@@ -1043,16 +1142,47 @@ exploration_result explore_column_compression(cudf::column_view input,
       pool.begin(), pool.end(), [&](ranked_candidate const& a, ranked_candidate const& b) {
         return pick_score(a) < pick_score(b);
       });
+    // Pareto pick with a decompress floor: max ratio among frontier points at
+    // or above the floor; if nothing clears it, the fastest-decompress point.
+    if (use_pareto && need_throughput && config.pareto_decomp_floor_gbps > 0.0) {
+      auto floor_it = pool.end();
+      for (auto it = pool.begin(); it != pool.end(); ++it) {
+        if (it->decompress_throughput_gbps < config.pareto_decomp_floor_gbps) continue;
+        if (floor_it == pool.end() || it->compression_ratio > floor_it->compression_ratio)
+          floor_it = it;
+      }
+      if (floor_it == pool.end()) {
+        floor_it = std::max_element(
+          pool.begin(), pool.end(), [](ranked_candidate const& a, ranked_candidate const& b) {
+            return a.decompress_throughput_gbps < b.decompress_throughput_gbps;
+          });
+      }
+      best_it = floor_it;
+    }
     result.plan_dsl                   = best_it->plan_dsl;
     result.compression_ratio          = best_it->compression_ratio;
     result.compressed_size_bytes      = best_it->compressed_size_bytes;
     result.compress_throughput_gbps   = best_it->compress_throughput_gbps;
     result.decompress_throughput_gbps = best_it->decompress_throughput_gbps;
+    result.old_wall_compress_gbps     = best_it->old_wall_compress_gbps;
+    result.old_wall_decompress_gbps   = best_it->old_wall_decompress_gbps;
     // Derive depth from the actual winning plan's line count, not from the
     // BFS ratio-tracking variable (which reflects when the beam last improved).
     result.cascade_depth =
       static_cast<size_t>(std::count(result.plan_dsl.begin(), result.plan_dsl.end(), '\n') + 1);
     if (use_pareto && need_throughput) {
+      // Machine-readable frontier (chosen plan included): lets the caller
+      // re-pick under a different decompress floor without re-measuring.
+      result.pareto_frontier.reserve(frontier.size());
+      for (auto const& c2 : frontier) {
+        result.pareto_frontier.push_back({c2.plan_dsl,
+                                          c2.compression_ratio,
+                                          c2.compressed_size_bytes,
+                                          c2.compress_throughput_gbps,
+                                          c2.decompress_throughput_gbps,
+                                          c2.old_wall_compress_gbps,
+                                          c2.old_wall_decompress_gbps});
+      }
       std::ostringstream os;
       size_t alt_n = 0;
       for (auto const& c2 : frontier)

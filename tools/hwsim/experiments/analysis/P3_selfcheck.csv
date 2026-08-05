@@ -1,0 +1,16 @@
+index,label,traced_ms,sim_ms,err_pct,tasks,binding,forced_admissions,dep_cycle_breaks
+0,P3_tpch_q1_iter1_iter1,8245.532,8236.41,-0.11,1132,executor_threads,0,0
+1,P3_tpch_q1_iter2_iter1,7853.721,7845.214,-0.11,1132,executor_threads,0,0
+2,P3_tpch_q1_iter3_iter1,7864.956,7857.674,-0.09,1132,executor_threads,0,0
+3,P3_tpch_q9_iter1_iter1,12513.406,12503.089,-0.08,1648,executor_threads,0,0
+4,P3_tpch_q9_iter2_iter1,12656.491,12651.051,-0.04,1663,executor_threads,0,0
+5,P3_tpch_q9_iter3_iter1,12526.979,12525.943,-0.01,1675,executor_threads,0,0
+6,P3_tpch_q13_iter1_iter1,5813.168,5811.75,-0.02,532,executor_threads,0,0
+7,P3_tpch_q13_iter2_iter1,5674.914,5674.875,-0.0,532,executor_threads,0,0
+8,P3_tpch_q13_iter3_iter1,5542.997,5538.53,-0.08,532,executor_threads,0,0
+9,P3_tpch_q19_iter1_iter1,8414.109,8413.847,-0.0,1316,executor_threads,0,0
+10,P3_tpch_q19_iter2_iter1,8371.477,8371.193,-0.0,1316,executor_threads,0,0
+11,P3_tpch_q19_iter3_iter1,8435.94,8435.336,-0.01,1316,executor_threads,0,0
+12,P3_tpch_q21_iter1_iter1,17372.515,17365.488,-0.04,2336,executor_threads,0,0
+13,P3_tpch_q21_iter2_iter1,17503.376,17499.906,-0.02,2357,executor_threads,0,0
+14,P3_tpch_q21_iter3_iter1,17657.897,17654.307,-0.02,2414,executor_threads,0,0

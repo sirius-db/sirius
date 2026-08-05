@@ -1,0 +1,79 @@
+# Pareto-picked plans: max ratio with decompress >= 250 GB/s per column.
+# Provenance: GB300 re-measure 2026-08-03T11:09Z, input=/localhome/local-faramburu/tpch_parquet_sf1000/part/part.0.parquet,
+#   simpatico explore --score pareto --decomp-floor 250 --beam-width 100 --max-depth 10 \
+#     --rerank-warmup 2 --rerank-iters 5
+# Rates: comp/decomp = warmed median-of-5 (event-bracketed);
+#   old_wall_* = legacy one-shot metric of the pre-fix harness, for continuity.
+# column: p_partkey  dtype: i32  ratio: 254.428x  depth: 5
+# comp: 297.81 GB/s  decomp: 505.25 GB/s
+# old_wall_comp: 279.80 GB/s  old_wall_decomp: 491.53 GB/s
+input -> zigzag -> zigzag
+zigzag.zigzag -> delta -> differences
+zigzag.zigzag.differences -> rle -> runs, values
+zigzag.zigzag.differences.runs -> bitcomp
+zigzag.zigzag.differences.values -> deflate
+
+---
+# column: p_name  dtype: str  ratio: 2.890x  depth: 4
+# comp: 20.07 GB/s  decomp: 254.73 GB/s
+# old_wall_comp: 20.05 GB/s  old_wall_decomp: 253.56 GB/s
+input -> str_split -> offsets, chars
+str_split.chars -> snappy
+str_split.offsets -> delta -> differences
+str_split.offsets.differences -> ans
+
+---
+# column: p_mfgr  dtype: str  ratio: 46.901x  depth: 2
+# comp: 280.64 GB/s  decomp: 722.09 GB/s
+# old_wall_comp: 279.89 GB/s  old_wall_decomp: 717.19 GB/s
+input -> dictionary -> keys_offsets, keys_chars, indices
+dictionary.indices -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+
+---
+# column: p_brand  dtype: str  ratio: 18.934x  depth: 2
+# comp: 212.68 GB/s  decomp: 1527.87 GB/s
+# old_wall_comp: 210.80 GB/s  old_wall_decomp: 1529.49 GB/s
+input -> dictionary -> keys_offsets, keys_chars, indices
+dictionary.indices -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+
+---
+# column: p_type  dtype: str  ratio: 24.385x  depth: 2
+# comp: 264.61 GB/s  decomp: 338.11 GB/s
+# old_wall_comp: 263.69 GB/s  old_wall_decomp: 338.71 GB/s
+input -> dictionary -> keys_offsets, keys_chars, indices
+dictionary.indices -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+
+---
+# column: p_size  dtype: i32  ratio: 5.272x  depth: 1
+# comp: 907.11 GB/s  decomp: 1765.79 GB/s
+# old_wall_comp: 899.54 GB/s  old_wall_decomp: 1760.07 GB/s
+input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+
+---
+# column: p_container  dtype: str  ratio: ~15x  depth: 3
+# hand-patched: depth-3 dict (keys_offsets bitpacked) — depth-2 dict fails encode at pin scale
+input -> dictionary -> keys_offsets, keys_chars, indices
+dictionary.keys_offsets -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+dictionary.indices -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+
+---
+# column: p_retailprice  dtype: t26  ratio: 90.312x  depth: 2
+# comp: 273.15 GB/s  decomp: 627.76 GB/s
+# old_wall_comp: 271.31 GB/s  old_wall_decomp: 170.76 GB/s
+input -> delta -> differences
+delta.differences -> lz4
+
+---
+# column: p_comment  dtype: str  ratio: 1.913x  depth: 10
+# comp: 322.12 GB/s  decomp: 564.85 GB/s
+# old_wall_comp: 322.28 GB/s  old_wall_decomp: 558.58 GB/s
+input -> str_split -> offsets, chars
+str_split.offsets -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+str_split.offsets.chunk_bits -> rle -> runs, values
+str_split.offsets.chunk_count -> rle -> runs, values
+str_split.offsets.chunk_min -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+str_split.offsets.chunk_count.values -> rle -> runs, values
+str_split.offsets.chunk_min.chunk_count -> rle -> runs, values
+str_split.offsets.chunk_bits.runs -> rle -> runs, values
+str_split.offsets.chunk_count.runs -> rle -> runs, values
+str_split.chars -> ans

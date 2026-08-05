@@ -1,0 +1,6 @@
+row,query,knobs,median_sim_wall_ms,median_sim_baseline_ms,binding,forced_admissions,n,pct_span_matched
+L75Pf,9,gpu_compute=0.7492,1151.1,854.3,gpu_device,0,2,100.0
+L75Pf,10,gpu_compute=0.7492,292.6,233.8,gpu_device,0,2,100.0
+L75Pf,12,gpu_compute=0.7492,216.9,164.9,gpu_device,0,2,100.0
+L75Pf,19,gpu_compute=0.7492,219.5,183.9,executor_threads,0,2,100.0
+L75Pf,21,gpu_compute=0.7492,794.6,617.7,gpu_device,0,2,100.0

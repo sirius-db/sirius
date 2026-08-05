@@ -1,0 +1,6 @@
+row,query,knobs,median_sim_wall_ms,median_sim_baseline_ms,binding,forced_admissions,n
+E2-lo,1,gpu_mem_capacity=0.1493,7842.7,7842.7,executor_threads,0,3
+E2-lo,9,gpu_mem_capacity=0.1493,288881.3,12494.7,gpu_memory,1355,3
+E2-lo,13,gpu_mem_capacity=0.1493,5452.1,5452.1,executor_threads,0,3
+E2-lo,19,gpu_mem_capacity=0.1493,8440.9,8440.9,executor_threads,0,3
+E2-lo,21,gpu_mem_capacity=0.1493,52882.3,17447.0,gpu_memory,1157,3

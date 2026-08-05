@@ -851,6 +851,17 @@ void usage_explore()
     "  --weight-comp W           Compress-throughput exponent (default: 1.0)\n"
     "  --weight-decomp W         Decompress-throughput exponent (default: 1.0)\n"
     "  --rerank-top N            Number of finalists to time, selected by ratio (default: 8)\n"
+    "  --rerank-warmup N         Untimed warmup round-trips per finalist; warmup #1\n"
+    "                            absorbs the NVRTC cold compile (default: 2, min 2)\n"
+    "  --rerank-iters N          Timed iterations per finalist; the reported rate is\n"
+    "                            the median (default: 5, min 5)\n"
+    "  --decomp-floor GBPS       Pareto pick: max ratio among frontier points with\n"
+    "                            decompress >= GBPS; if none qualify, the fastest\n"
+    "                            point wins. 0 = legacy max-ratio pick (default: 0)\n"
+    "  --frontier-out PATH       Append every measured Pareto-frontier point (TSV:\n"
+    "                            column, dtype, picked, ratio, comp/decomp GB/s,\n"
+    "                            old-wall GB/s, bytes, plan) for floor re-picks\n"
+    "                            without re-measuring\n"
     "  --simplicity-slots N      Top-N completed plans per cascade-depth level\n"
     "                            injected into the rerank pool, giving lighter-weight\n"
     "                            plans a fair shot against deep cascades (default: 4)\n"
@@ -869,8 +880,29 @@ struct explore_cfg {
   std::optional<input_format> format;
   std::optional<std::string> dtype;
   int col = -1;  // -1 = all
+  std::string frontier_out;
   simpatico::exploration_config ecfg;
 };
+
+/// One frontier TSV row. The plan DSL is single-line encoded with "; " joining
+/// its lines — ';' cannot appear in the DSL grammar, so decoding is lossless.
+void write_frontier_row(std::ostream& os,
+                        std::string const& col_name,
+                        std::string const& dtype,
+                        bool picked,
+                        simpatico::pareto_point const& p)
+{
+  std::string flat = p.plan_dsl;
+  std::size_t pos  = 0;
+  while ((pos = flat.find('\n', pos)) != std::string::npos) {
+    flat.replace(pos, 1, "; ");
+    pos += 2;
+  }
+  os << col_name << '\t' << dtype << '\t' << (picked ? 1 : 0) << '\t' << std::fixed
+     << std::setprecision(4) << p.compression_ratio << '\t' << std::setprecision(2)
+     << p.compress_gbps << '\t' << p.decompress_gbps << '\t' << p.old_wall_compress_gbps << '\t'
+     << p.old_wall_decompress_gbps << '\t' << p.compressed_size_bytes << '\t' << flat << '\n';
+}
 
 int run_explore(int argc, char** argv)
 {
@@ -909,6 +941,16 @@ int run_explore(int argc, char** argv)
       cfg.ecfg.rerank_weights[2] = std::stod(need("--weight-decomp"));
     } else if (arg == "--rerank-top") {
       cfg.ecfg.rerank_top = static_cast<std::size_t>(std::stoul(need("--rerank-top")));
+    } else if (arg == "--rerank-warmup") {
+      cfg.ecfg.rerank_warmup =
+        std::max<std::size_t>(2, static_cast<std::size_t>(std::stoul(need("--rerank-warmup"))));
+    } else if (arg == "--rerank-iters") {
+      cfg.ecfg.rerank_iters =
+        std::max<std::size_t>(5, static_cast<std::size_t>(std::stoul(need("--rerank-iters"))));
+    } else if (arg == "--decomp-floor") {
+      cfg.ecfg.pareto_decomp_floor_gbps = std::stod(need("--decomp-floor"));
+    } else if (arg == "--frontier-out") {
+      cfg.frontier_out = need("--frontier-out");
     } else if (arg == "--simplicity-slots") {
       cfg.ecfg.simplicity_slots = static_cast<std::size_t>(std::stoul(need("--simplicity-slots")));
     } else if (arg == "--sample-rows") {
@@ -947,6 +989,21 @@ int run_explore(int argc, char** argv)
   // Keep the table_view alive for the entire loop — column() may return a
   // const-ref into it and the temporary would be destroyed otherwise.
   auto const tv = loaded.table->view();
+
+  // Frontier TSV sink (append across invocations so one file can accumulate a
+  // whole table); header only when starting fresh.
+  std::ofstream frontier_os;
+  if (!cfg.frontier_out.empty()) {
+    bool const fresh = [&] {
+      std::ifstream probe(cfg.frontier_out);
+      return !probe.good() || probe.peek() == std::ifstream::traits_type::eof();
+    }();
+    frontier_os.open(cfg.frontier_out, std::ios::app);
+    if (!frontier_os) die("explore: cannot write --frontier-out: " + cfg.frontier_out);
+    if (fresh)
+      frontier_os << "column\tdtype\tpicked\tratio\tcomp_gbps\tdecomp_gbps\t"
+                     "old_wall_comp_gbps\told_wall_decomp_gbps\tcompressed_bytes\tplan\n";
+  }
 
   // Multi-column output: emit one block per column separated by ---
   bool first = true;
@@ -996,7 +1053,23 @@ int run_explore(int argc, char** argv)
       std::printf("# comp: %.2f GB/s  decomp: %.2f GB/s\n",
                   result.compress_throughput_gbps,
                   result.decompress_throughput_gbps);
+    // Legacy one-shot rates (cold, event-bracketed once — the pre-fix metric),
+    // kept alongside so new plan files stay comparable with old ones.
+    if (result.old_wall_compress_gbps > 0.0 || result.old_wall_decompress_gbps > 0.0)
+      std::printf("# old_wall_comp: %.2f GB/s  old_wall_decomp: %.2f GB/s\n",
+                  result.old_wall_compress_gbps,
+                  result.old_wall_decompress_gbps);
     std::printf("%s\n", result.plan_dsl.c_str());
+
+    if (frontier_os.is_open()) {
+      for (auto const& p : result.pareto_frontier)
+        write_frontier_row(frontier_os,
+                           col_name,
+                           dtype_name(col_view.type()),
+                           p.plan_dsl == result.plan_dsl,
+                           p);
+      frontier_os.flush();
+    }
 
     if (!result.pareto_alternates_summary.empty())
       std::fprintf(stderr, "%s\n", result.pareto_alternates_summary.c_str());

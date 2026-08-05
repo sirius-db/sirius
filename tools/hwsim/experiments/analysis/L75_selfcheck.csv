@@ -1,0 +1,16 @@
+index,label,traced_ms,sim_ms,err_pct,tasks,binding,forced_admissions,dep_cycle_breaks,spill_mode
+0,L75_tpch_q9_iter1_iter1,1112.654,1128.019,1.38,134,executor_threads,0,0,off
+1,L75_tpch_q9_iter2_iter1,1044.129,1043.984,-0.01,137,executor_threads,0,0,off
+2,L75_tpch_q9_iter3_iter1,1048.541,1048.34,-0.02,134,executor_threads,0,0,off
+3,L75_tpch_q10_iter1_iter1,308.211,308.052,-0.05,78,executor_threads,0,0,off
+4,L75_tpch_q10_iter2_iter1,291.77,291.614,-0.05,78,executor_threads,0,0,off
+5,L75_tpch_q10_iter3_iter1,291.946,291.801,-0.05,78,executor_threads,0,0,off
+6,L75_tpch_q12_iter1_iter1,247.162,247.024,-0.06,60,executor_threads,0,0,off
+7,L75_tpch_q12_iter2_iter1,210.679,210.521,-0.07,60,executor_threads,0,0,off
+8,L75_tpch_q12_iter3_iter1,212.574,212.434,-0.07,60,executor_threads,0,0,off
+9,L75_tpch_q19_iter1_iter1,258.139,257.904,-0.09,87,executor_threads,0,0,off
+10,L75_tpch_q19_iter2_iter1,224.764,224.274,-0.22,87,executor_threads,0,0,off
+11,L75_tpch_q19_iter3_iter1,223.853,223.452,-0.18,87,executor_threads,0,0,off
+12,L75_tpch_q21_iter1_iter1,766.56,766.392,-0.02,146,executor_threads,0,0,off
+13,L75_tpch_q21_iter2_iter1,764.512,764.344,-0.02,146,executor_threads,0,0,off
+14,L75_tpch_q21_iter3_iter1,767.253,767.075,-0.02,146,executor_threads,0,0,off

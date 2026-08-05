@@ -3,6 +3,7 @@ use quent_model::{instrumentation, model};
 pub mod batch;
 pub mod data_batch;
 pub mod gpu_device;
+pub mod io_request;
 pub mod task;
 pub mod thread_group;
 
@@ -27,6 +28,7 @@ model! {
         task::ExecutorThread,
         batch::BatchPlacement,
         batch::MemoryTier,
+        io_request::IoRequest,
     },
     analyzer: "sirius-telemetry-analyzer",
 }

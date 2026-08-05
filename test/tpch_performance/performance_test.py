@@ -295,6 +295,10 @@ def open_connection(source, gpu_execution=False, data_source="parquet"):
         log(f"Loading Sirius extension from {EXTENSION_PATH}")
         con.execute(f"LOAD '{EXTENSION_PATH}'")
         log("Sirius extension loaded")
+        pre_sql = os.environ.get("SIRIUS_PRE_SQL", "")
+        if pre_sql:
+            log(f"Executing SIRIUS_PRE_SQL: {pre_sql}")
+            _execute_multi(con, pre_sql)
     return con
 
 
@@ -390,6 +394,13 @@ def run_grouped(
                 try:
                     for it in range(iterations):
                         log(f"--- q{qnum} iter{it} engine={name} ---")
+                        if use_gpu:
+                            try:
+                                con.execute(
+                                    f"CALL sirius_set_query_label('q{qnum}_iter{it}')"
+                                ).fetchall()
+                            except Exception as e:
+                                log(f"  query label failed (non-fatal): {e}")
                         _run_one(
                             writer,
                             con,
@@ -534,6 +545,10 @@ def _build_nsys_temp_sql(qnum, source, iterations, pin, qdir, data_source="parqu
     if data_source != "duckdb":
         parts.append(_build_views_sql(source).rstrip("\n"))
     parts.append("INSERT INTO _timings VALUES (1, 'views', current_timestamp);")
+
+    pre_sql = os.environ.get("SIRIUS_PRE_SQL", "").strip()
+    if pre_sql:
+        parts.append(pre_sql.rstrip(";") + ";")
 
     if pin != "none":
         parts.append(emit_pin(qnum, source, data_source))

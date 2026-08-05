@@ -1,0 +1,516 @@
+# exploring column 0 (c_custkey, dtype=i32, rows=74999925)
+[explore] Input size: 299999700 bytes, max_candidates=100, max_depth=10
+[explore] Depth 0: 1 candidates, best=1
+[explore]   delta: 300003328/299999700 (1.000x)
+[explore]   rle: 599999400/299999700 (0.500x)
+[explore]   bitpack: 94409063/299999700 (3.178x)
+[explore]   for: 300296300/299999700 (0.999x)
+[explore]   zigzag: 300003328/299999700 (1.000x)
+[explore]   ans: 201012556/299999700 (1.492x)
+[explore]   bitcomp: 148541716/299999700 (2.020x)
+[explore]   snappy: 303542555/299999700 (0.988x)
+[explore]   deflate: 199096188/299999700 (1.507x)
+[explore]   lz4: 302344312/299999700 (0.992x)
+[explore] Depth 1: 8 candidates, best=3.178
+[explore] Depth 2: 90 candidates, best=254.423
+[explore] Depth 3: 100 candidates, best=506.671
+[explore] Depth 4: 100 candidates, best=828.362
+[explore] Depth 5: 100 candidates, best=828.362
+[explore] Depth 6: 100 candidates, best=829.038
+[explore] Depth 7: 100 candidates, best=830.323
+[explore] Depth 8: 100 candidates, best=830.642
+[explore] Depth 9: 100 candidates, best=830.642
+[explore] Rerank pool (18 candidates):
+[explore]   ratio=830.642  steps=8  input -> delta -> differences
+[explore]   ratio=830.642  steps=8  input -> delta -> differences
+[explore]   ratio=830.642  steps=8  input -> delta -> differences
+[explore]   ratio=830.642  steps=8  input -> delta -> differences
+[explore]   ratio=830.642  steps=8  input -> delta -> differences
+[explore]   ratio=1.000  steps=1  input -> identity
+[explore]   ratio=3.180  steps=3  input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+[explore]   ratio=830.642  steps=8  input -> delta -> differences
+[explore]   ratio=3.178  steps=1  input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+[explore]   ratio=2.020  steps=1  input -> bitcomp
+[explore]   ratio=1.507  steps=1  input -> deflate
+[explore]   ratio=1.492  steps=1  input -> ans
+[explore]   ratio=254.423  steps=2  input -> delta -> differences
+[explore]   ratio=115.761  steps=2  input -> delta -> differences
+[explore]   ratio=92.741  steps=2  input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+[explore]   ratio=85.308  steps=2  input -> delta -> differences
+[explore]   ratio=254.368  steps=3  input -> delta -> differences
+[explore]   ratio=170.314  steps=3  input -> delta -> differences
+[explore] Final: ratio=193.716 depth=8
+DSL:
+input -> delta -> differences
+delta.differences -> rle -> runs, values
+delta.differences.runs -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+delta.differences.values -> deflate
+delta.differences.runs.chunk_min -> rle -> runs, values
+delta.differences.runs.packed -> lz4
+delta.differences.runs.chunk_count -> rle -> runs, values
+delta.differences.runs.chunk_bits -> rle -> runs, values
+
+=== Pareto alternates (3) ===
+--- alt 0 ---
+  ratio=1.00x comp=2536.52 GB/s decomp=2614.33 GB/s
+  input -> identity
+--- alt 1 ---
+  ratio=3.18x comp=796.85 GB/s decomp=1637.27 GB/s
+  input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+--- alt 2 ---
+  ratio=170.66x comp=708.51 GB/s decomp=1069.47 GB/s
+  input -> delta -> differences
+  delta.differences -> rle -> runs, values
+
+# exploring column 1 (c_name, dtype=str, rows=74999925)
+[explore] Input size: 1649998354 bytes, max_candidates=100, max_depth=10
+[explore] Depth 0: 1 candidates, best=1.000
+[explore]   str_split: 1649998354/1649998354 (1.000x)
+[explore] Depth 1: 1 candidates, best=1.000
+[explore] Depth 2: 18 candidates, best=3.010
+[explore] Depth 3: 100 candidates, best=4.237
+[explore] Depth 4: 100 candidates, best=6.617
+[explore] Depth 5: 100 candidates, best=6.633
+[explore] Depth 6: 100 candidates, best=6.646
+[explore] Depth 7: 100 candidates, best=6.646
+[explore] Depth 8: 100 candidates, best=6.646
+[explore] Depth 9: 100 candidates, best=6.646
+[explore] Rerank pool (17 candidates):
+[explore]   ratio=6.646  steps=10  input -> str_split -> offsets, chars
+[explore]   ratio=6.646  steps=10  input -> str_split -> offsets, chars
+[explore]   ratio=6.646  steps=10  input -> str_split -> offsets, chars
+[explore]   ratio=6.646  steps=10  input -> str_split -> offsets, chars
+[explore]   ratio=6.646  steps=10  input -> str_split -> offsets, chars
+[explore]   ratio=1.000  steps=1  input -> identity
+[explore]   ratio=1.106  steps=4  input -> str_split -> offsets, chars
+[explore]   ratio=6.646  steps=10  input -> str_split -> offsets, chars
+[explore]   ratio=1.000  steps=1  input -> str_split -> offsets, chars
+[explore]   ratio=3.010  steps=2  input -> str_split -> offsets, chars
+[explore]   ratio=2.441  steps=2  input -> str_split -> offsets, chars
+[explore]   ratio=2.425  steps=2  input -> str_split -> offsets, chars
+[explore]   ratio=1.647  steps=2  input -> str_split -> offsets, chars
+[explore]   ratio=4.237  steps=3  input -> str_split -> offsets, chars
+[explore]   ratio=3.509  steps=3  input -> str_split -> offsets, chars
+[explore]   ratio=3.492  steps=3  input -> str_split -> offsets, chars
+[explore]   ratio=3.478  steps=3  input -> str_split -> offsets, chars
+[explore] Final: ratio=3.189 depth=5
+DSL:
+input -> str_split -> offsets, chars
+str_split.offsets -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+str_split.offsets.chunk_bits -> rle -> runs, values
+str_split.offsets.chunk_bits.values -> rle -> runs, values
+str_split.chars -> snappy
+
+=== Pareto alternates (7) ===
+--- alt 0 ---
+  ratio=6.61x comp=46.62 GB/s decomp=206.49 GB/s
+  input -> str_split -> offsets, chars
+  str_split.offsets -> delta -> differences
+  str_split.offsets.differences -> rle -> runs, values
+  str_split.offsets.differences.runs -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+  str_split.offsets.differences.runs.packed -> lz4
+  str_split.chars -> deflate
+  str_split.offsets.differences.values -> deflate
+  str_split.offsets.differences.runs.chunk_count -> rle -> runs, values
+  str_split.offsets.differences.runs.chunk_min -> rle -> runs, values
+  str_split.offsets.differences.runs.chunk_bits -> rle -> runs, values
+--- alt 1 ---
+  ratio=1.00x comp=2864.90 GB/s decomp=3063.36 GB/s
+  input -> identity
+--- alt 2 ---
+  ratio=1.11x comp=1025.04 GB/s decomp=1381.78 GB/s
+  input -> str_split -> offsets, chars
+  str_split.offsets -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+  str_split.offsets.chunk_bits -> rle -> runs, values
+  str_split.offsets.chunk_bits.values -> rle -> runs, values
+--- alt 3 ---
+  ratio=2.44x comp=59.69 GB/s decomp=327.40 GB/s
+  input -> str_split -> offsets, chars
+  str_split.chars -> snappy
+--- alt 4 ---
+  ratio=1.65x comp=371.62 GB/s decomp=604.84 GB/s
+  input -> str_split -> offsets, chars
+  str_split.chars -> ans
+--- alt 5 ---
+  ratio=4.24x comp=48.28 GB/s decomp=220.14 GB/s
+  input -> str_split -> offsets, chars
+  str_split.chars -> deflate
+  str_split.offsets -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+--- alt 6 ---
+  ratio=1.96x comp=335.38 GB/s decomp=575.13 GB/s
+  input -> str_split -> offsets, chars
+  str_split.offsets -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+  str_split.offsets.chunk_bits -> rle -> runs, values
+  str_split.offsets.chunk_bits.values -> rle -> runs, values
+  str_split.chars -> ans
+
+# exploring column 2 (c_address, dtype=str, rows=74999925)
+[explore] Input size: 2147486852 bytes, max_candidates=100, max_depth=10
+[explore] Depth 0: 1 candidates, best=1.000
+[explore]   str_split: 2147486852/2147486852 (1.000x)
+[explore] Depth 1: 1 candidates, best=1.000
+[explore] Depth 2: 16 candidates, best=1.264
+[explore] Depth 3: 100 candidates, best=1.392
+[explore] Depth 4: 100 candidates, best=1.447
+[explore] Depth 5: 100 candidates, best=1.447
+[explore] Depth 6: 100 candidates, best=1.447
+[explore] Depth 7: 100 candidates, best=1.447
+[explore] Depth 8: 100 candidates, best=1.447
+[explore] Depth 9: 100 candidates, best=1.447
+[explore] Rerank pool (17 candidates):
+[explore]   ratio=1.447  steps=4  input -> str_split -> offsets, chars
+[explore]   ratio=1.392  steps=10  input -> str_split -> offsets, chars
+[explore]   ratio=1.392  steps=10  input -> str_split -> offsets, chars
+[explore]   ratio=1.392  steps=10  input -> str_split -> offsets, chars
+[explore]   ratio=1.000  steps=1  input -> identity
+[explore]   ratio=1.392  steps=5  input -> str_split -> offsets, chars
+[explore]   ratio=1.079  steps=4  input -> str_split -> offsets, chars
+[explore]   ratio=1.392  steps=10  input -> str_split -> offsets, chars
+[explore]   ratio=1.000  steps=1  input -> str_split -> offsets, chars
+[explore]   ratio=1.264  steps=2  input -> str_split -> offsets, chars
+[explore]   ratio=1.258  steps=2  input -> str_split -> offsets, chars
+[explore]   ratio=1.116  steps=2  input -> str_split -> offsets, chars
+[explore]   ratio=1.114  steps=2  input -> str_split -> offsets, chars
+[explore]   ratio=1.392  steps=3  input -> str_split -> offsets, chars
+[explore]   ratio=1.392  steps=3  input -> str_split -> offsets, chars
+[explore]   ratio=1.386  steps=3  input -> str_split -> offsets, chars
+[explore]   ratio=1.386  steps=3  input -> str_split -> offsets, chars
+[explore] Final: ratio=1.437 depth=4
+DSL:
+input -> str_split -> offsets, chars
+str_split.offsets -> delta -> differences
+str_split.chars -> ans
+str_split.offsets.differences -> ans
+
+=== Pareto alternates (7) ===
+--- alt 0 ---
+  ratio=1.00x comp=2894.37 GB/s decomp=3102.59 GB/s
+  input -> identity
+--- alt 1 ---
+  ratio=1.08x comp=1115.01 GB/s decomp=1428.91 GB/s
+  input -> str_split -> offsets, chars
+  str_split.offsets -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+  str_split.offsets.chunk_bits -> rle -> runs, values
+  str_split.offsets.chunk_bits.values -> rle -> runs, values
+--- alt 2 ---
+  ratio=1.26x comp=301.19 GB/s decomp=641.92 GB/s
+  input -> str_split -> offsets, chars
+  str_split.chars -> ans
+--- alt 3 ---
+  ratio=1.12x comp=354.28 GB/s decomp=360.37 GB/s
+  input -> str_split -> offsets, chars
+  str_split.chars -> bitcomp
+--- alt 4 ---
+  ratio=1.39x comp=289.46 GB/s decomp=623.21 GB/s
+  input -> str_split -> offsets, chars
+  str_split.chars -> ans
+  str_split.offsets -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+--- alt 5 ---
+  ratio=1.26x comp=317.38 GB/s decomp=332.01 GB/s
+  input -> str_split -> offsets, chars
+  str_split.offsets -> delta -> differences
+  str_split.chars -> bitcomp
+  str_split.offsets.differences -> ans
+--- alt 6 ---
+  ratio=1.22x comp=327.36 GB/s decomp=352.10 GB/s
+  input -> str_split -> offsets, chars
+  str_split.offsets -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+  str_split.offsets.chunk_bits -> rle -> runs, values
+  str_split.offsets.chunk_bits.values -> rle -> runs, values
+  str_split.chars -> bitcomp
+
+# exploring column 3 (c_nationkey, dtype=i32, rows=74999925)
+[explore] Input size: 299999700 bytes, max_candidates=100, max_depth=10
+[explore] Depth 0: 1 candidates, best=1.000
+[explore]   delta: 300003328/299999700 (1.000x)
+[explore]   rle: 576030496/299999700 (0.521x)
+[explore]   bitpack: 47534155/299999700 (6.311x)
+[explore]   for: 300296300/299999700 (0.999x)
+[explore]   zigzag: 300003328/299999700 (1.000x)
+[explore]   ans: 73864946/299999700 (4.061x)
+[explore]   bitcomp: 180450264/299999700 (1.663x)
+[explore]   snappy: 145056738/299999700 (2.068x)
+[explore]   deflate: 146434344/299999700 (2.049x)
+[explore]   lz4: 216704948/299999700 (1.384x)
+[explore] Depth 1: 10 candidates, best=6.311
+[explore] Depth 2: 95 candidates, best=6.359
+[explore] Depth 3: 100 candidates, best=6.399
+[explore] Depth 4: 100 candidates, best=6.439
+[explore] Depth 5: 100 candidates, best=6.449
+[explore] Depth 6: 100 candidates, best=6.449
+[explore] Depth 7: 100 candidates, best=6.449
+[explore] Depth 8: 100 candidates, best=6.449
+[explore] Depth 9: 100 candidates, best=6.449
+[explore] Rerank pool (16 candidates):
+[explore]   ratio=6.450  steps=10  input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+[explore]   ratio=6.450  steps=10  input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+[explore]   ratio=6.450  steps=10  input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+[explore]   ratio=6.450  steps=10  input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+[explore]   ratio=1.000  steps=1  input -> identity
+[explore]   ratio=6.450  steps=10  input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+[explore]   ratio=6.450  steps=10  input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+[explore]   ratio=6.409  steps=8  input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+[explore]   ratio=6.311  steps=1  input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+[explore]   ratio=4.061  steps=1  input -> ans
+[explore]   ratio=2.068  steps=1  input -> snappy
+[explore]   ratio=2.049  steps=1  input -> deflate
+[explore]   ratio=6.359  steps=2  input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+[explore]   ratio=6.350  steps=2  input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+[explore]   ratio=6.350  steps=2  input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+[explore]   ratio=6.350  steps=2  input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+[explore] Final: ratio=6.311 depth=1
+DSL:
+input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+
+=== Pareto alternates (1) ===
+--- alt 0 ---
+  ratio=1.00x comp=2629.73 GB/s decomp=2715.81 GB/s
+  input -> identity
+
+# exploring column 4 (c_phone, dtype=str, rows=74999925)
+[explore] Input size: 1424998579 bytes, max_candidates=100, max_depth=10
+[explore] Depth 0: 1 candidates, best=1.000
+[explore]   str_split: 1424998579/1424998579 (1.000x)
+[explore] Depth 1: 1 candidates, best=1.000
+[explore] Depth 2: 18 candidates, best=1.819
+[explore] Depth 3: 100 candidates, best=2.315
+[explore] Depth 4: 100 candidates, best=2.940
+[explore] Depth 5: 100 candidates, best=2.968
+[explore] Depth 6: 100 candidates, best=2.995
+[explore] Depth 7: 100 candidates, best=3.002
+[explore] Depth 8: 100 candidates, best=3.009
+[explore] Depth 9: 100 candidates, best=3.013
+[explore] Rerank pool (17 candidates):
+[explore]   ratio=3.015  steps=10  input -> str_split -> offsets, chars
+[explore]   ratio=3.015  steps=10  input -> str_split -> offsets, chars
+[explore]   ratio=3.015  steps=10  input -> str_split -> offsets, chars
+[explore]   ratio=3.015  steps=10  input -> str_split -> offsets, chars
+[explore]   ratio=3.015  steps=10  input -> str_split -> offsets, chars
+[explore]   ratio=1.000  steps=1  input -> identity
+[explore]   ratio=1.134  steps=4  input -> str_split -> offsets, chars
+[explore]   ratio=3.014  steps=10  input -> str_split -> offsets, chars
+[explore]   ratio=1.000  steps=1  input -> str_split -> offsets, chars
+[explore]   ratio=1.819  steps=2  input -> str_split -> offsets, chars
+[explore]   ratio=1.640  steps=2  input -> str_split -> offsets, chars
+[explore]   ratio=1.619  steps=2  input -> str_split -> offsets, chars
+[explore]   ratio=1.414  steps=2  input -> str_split -> offsets, chars
+[explore]   ratio=2.315  steps=3  input -> str_split -> offsets, chars
+[explore]   ratio=2.033  steps=3  input -> str_split -> offsets, chars
+[explore]   ratio=2.010  steps=3  input -> str_split -> offsets, chars
+[explore]   ratio=2.003  steps=3  input -> str_split -> offsets, chars
+[explore] Final: ratio=2.315 depth=3
+DSL:
+input -> str_split -> offsets, chars
+str_split.chars -> ans
+str_split.offsets -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+
+=== Pareto alternates (6) ===
+--- alt 0 ---
+  ratio=1.00x comp=2853.47 GB/s decomp=3025.22 GB/s
+  input -> identity
+--- alt 1 ---
+  ratio=1.13x comp=982.73 GB/s decomp=1365.74 GB/s
+  input -> str_split -> offsets, chars
+  str_split.offsets -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+  str_split.offsets.chunk_bits -> rle -> runs, values
+  str_split.offsets.chunk_bits.values -> rle -> runs, values
+--- alt 2 ---
+  ratio=1.82x comp=425.33 GB/s decomp=621.40 GB/s
+  input -> str_split -> offsets, chars
+  str_split.chars -> ans
+--- alt 3 ---
+  ratio=1.64x comp=361.60 GB/s decomp=644.51 GB/s
+  input -> str_split -> offsets, chars
+  str_split.chars -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+--- alt 4 ---
+  ratio=1.41x comp=439.55 GB/s decomp=439.91 GB/s
+  input -> str_split -> offsets, chars
+  str_split.chars -> bitcomp
+--- alt 5 ---
+  ratio=2.03x comp=338.66 GB/s decomp=620.47 GB/s
+  input -> str_split -> offsets, chars
+  str_split.chars -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+  str_split.offsets -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+
+# exploring column 5 (c_acctbal, dtype=t26, rows=74999925)
+[explore] Input size: 599999400 bytes, max_candidates=100, max_depth=10
+[explore] Depth 0: 1 candidates, best=1.000
+[explore]   delta: 600006656/599999400 (1.000x)
+[explore]   rle: 899998284/599999400 (0.667x)
+[explore]   bitpack: 197826975/599999400 (3.033x)
+[explore]   for: 600592600/599999400 (0.999x)
+[explore]   zigzag: 600006656/599999400 (1.000x)
+[explore]   ans: 303178492/599999400 (1.979x)
+[explore]   bitcomp: 600072392/599999400 (1.000x)
+[explore]   snappy: 372727541/599999400 (1.610x)
+[explore]   deflate: 301828028/599999400 (1.988x)
+[explore]   lz4: 341236804/599999400 (1.758x)
+[explore] Depth 1: 9 candidates, best=3.033
+[explore] Depth 2: 92 candidates, best=3.040
+[explore] Depth 3: 100 candidates, best=3.045
+[explore] Depth 4: 100 candidates, best=3.046
+[explore] Depth 5: 100 candidates, best=3.046
+[explore] Depth 6: 100 candidates, best=3.046
+[explore] Depth 7: 100 candidates, best=3.046
+[explore] Depth 8: 100 candidates, best=3.046
+[explore] Depth 9: 100 candidates, best=3.046
+[explore] Rerank pool (16 candidates):
+[explore]   ratio=3.046  steps=10  input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+[explore]   ratio=3.046  steps=10  input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+[explore]   ratio=3.046  steps=10  input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+[explore]   ratio=3.046  steps=10  input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+[explore]   ratio=1.000  steps=1  input -> identity
+[explore]   ratio=3.046  steps=10  input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+[explore]   ratio=3.046  steps=10  input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+[explore]   ratio=3.045  steps=4  input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+[explore]   ratio=3.033  steps=1  input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+[explore]   ratio=1.988  steps=1  input -> deflate
+[explore]   ratio=1.979  steps=1  input -> ans
+[explore]   ratio=1.758  steps=1  input -> lz4
+[explore]   ratio=3.040  steps=2  input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+[explore]   ratio=3.039  steps=2  input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+[explore]   ratio=3.038  steps=2  input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+[explore]   ratio=3.038  steps=2  input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+[explore] Final: ratio=3.033 depth=1
+DSL:
+input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+
+=== Pareto alternates (1) ===
+--- alt 0 ---
+  ratio=1.00x comp=2883.28 GB/s decomp=2984.24 GB/s
+  input -> identity
+
+# exploring column 6 (c_mktsegment, dtype=str, rows=74999925)
+[explore] Input size: 975002340 bytes, max_candidates=100, max_depth=10
+[explore] Depth 0: 1 candidates, best=1.000
+[explore]   dictionary: 299999769/975002340 (3.250x)
+[explore]   str_split: 975002340/975002340 (1.000x)
+[explore] Depth 1: 2 candidates, best=3.250
+[explore] Depth 2: 36 candidates, best=33.873
+[explore] Depth 3: 100 candidates, best=37.759
+[explore] Depth 4: 100 candidates, best=41.985
+[explore] Depth 5: 100 candidates, best=42.520
+[explore] Depth 6: 100 candidates, best=43.070
+[explore] Depth 7: 100 candidates, best=43.209
+[explore] Depth 8: 100 candidates, best=43.209
+[explore] Depth 9: 100 candidates, best=43.210
+[explore] Rerank pool (18 candidates):
+[explore]   ratio=43.210  steps=10  input -> dictionary -> keys_offsets, keys_chars, indices
+[explore]   ratio=43.210  steps=10  input -> dictionary -> keys_offsets, keys_chars, indices
+[explore]   ratio=43.210  steps=10  input -> dictionary -> keys_offsets, keys_chars, indices
+[explore]   ratio=43.210  steps=10  input -> dictionary -> keys_offsets, keys_chars, indices
+[explore]   ratio=1.000  steps=1  input -> identity
+[explore]   ratio=43.210  steps=10  input -> dictionary -> keys_offsets, keys_chars, indices
+[explore]   ratio=43.210  steps=10  input -> dictionary -> keys_offsets, keys_chars, indices
+[explore]   ratio=33.873  steps=2  input -> dictionary -> keys_offsets, keys_chars, indices
+[explore]   ratio=3.250  steps=1  input -> dictionary -> keys_offsets, keys_chars, indices
+[explore]   ratio=1.000  steps=1  input -> str_split -> offsets, chars
+[explore]   ratio=21.621  steps=2  input -> dictionary -> keys_offsets, keys_chars, indices
+[explore]   ratio=9.768  steps=2  input -> dictionary -> keys_offsets, keys_chars, indices
+[explore]   ratio=7.922  steps=2  input -> dictionary -> keys_offsets, keys_chars, indices
+[explore]   ratio=7.853  steps=2  input -> dictionary -> keys_offsets, keys_chars, indices
+[explore]   ratio=37.759  steps=3  input -> dictionary -> keys_offsets, keys_chars, indices
+[explore]   ratio=36.122  steps=3  input -> dictionary -> keys_offsets, keys_chars, indices
+[explore]   ratio=34.220  steps=3  input -> dictionary -> keys_offsets, keys_chars, indices
+[explore]   ratio=34.220  steps=3  input -> dictionary -> keys_offsets, keys_chars, indices
+[explore] Final: ratio=33.873 depth=2
+DSL:
+input -> dictionary -> keys_offsets, keys_chars, indices
+dictionary.indices -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+
+=== Pareto alternates (2) ===
+--- alt 0 ---
+  ratio=1.00x comp=2719.94 GB/s decomp=2995.07 GB/s
+  input -> identity
+--- alt 1 ---
+  ratio=3.25x comp=222.57 GB/s decomp=255.54 GB/s
+  input -> dictionary -> keys_offsets, keys_chars, indices
+
+# exploring column 7 (c_comment, dtype=str, rows=74999925)
+[explore] Input size: 2147388292 bytes, max_candidates=100, max_depth=10
+[explore] Depth 0: 1 candidates, best=1.000
+[explore]   str_split: 2147388292/2147388292 (1.000x)
+[explore] Depth 1: 1 candidates, best=1.000
+[explore] Depth 2: 18 candidates, best=2.723
+[explore] Depth 3: 100 candidates, best=2.916
+[explore] Depth 4: 100 candidates, best=3.009
+[explore] Depth 5: 100 candidates, best=3.009
+[explore] Depth 6: 100 candidates, best=3.009
+[explore] Depth 7: 100 candidates, best=3.009
+[explore] Depth 8: 100 candidates, best=3.009
+[explore] Depth 9: 100 candidates, best=3.009
+[explore] Rerank pool (17 candidates):
+[explore]   ratio=3.009  steps=4  input -> str_split -> offsets, chars
+[explore]   ratio=2.917  steps=10  input -> str_split -> offsets, chars
+[explore]   ratio=2.917  steps=10  input -> str_split -> offsets, chars
+[explore]   ratio=2.917  steps=10  input -> str_split -> offsets, chars
+[explore]   ratio=1.000  steps=1  input -> identity
+[explore]   ratio=2.917  steps=10  input -> str_split -> offsets, chars
+[explore]   ratio=2.917  steps=10  input -> str_split -> offsets, chars
+[explore]   ratio=1.831  steps=10  input -> str_split -> offsets, chars
+[explore]   ratio=1.000  steps=1  input -> str_split -> offsets, chars
+[explore]   ratio=2.723  steps=2  input -> str_split -> offsets, chars
+[explore]   ratio=2.599  steps=2  input -> str_split -> offsets, chars
+[explore]   ratio=2.274  steps=2  input -> str_split -> offsets, chars
+[explore]   ratio=1.752  steps=2  input -> str_split -> offsets, chars
+[explore]   ratio=2.916  steps=3  input -> str_split -> offsets, chars
+[explore]   ratio=2.800  steps=3  input -> str_split -> offsets, chars
+[explore]   ratio=2.794  steps=3  input -> str_split -> offsets, chars
+[explore]   ratio=2.775  steps=3  input -> str_split -> offsets, chars
+[explore] Final: ratio=2.861 depth=4
+DSL:
+input -> str_split -> offsets, chars
+str_split.chars -> snappy
+str_split.offsets -> delta -> differences
+str_split.offsets.differences -> ans
+
+=== Pareto alternates (7) ===
+--- alt 0 ---
+  ratio=3.01x comp=19.70 GB/s decomp=187.69 GB/s
+  input -> str_split -> offsets, chars
+  str_split.chars -> deflate
+  str_split.offsets -> delta -> differences
+  str_split.offsets.differences -> ans
+--- alt 1 ---
+  ratio=1.00x comp=2971.00 GB/s decomp=3085.33 GB/s
+  input -> identity
+--- alt 2 ---
+  ratio=2.92x comp=19.60 GB/s decomp=189.74 GB/s
+  input -> str_split -> offsets, chars
+  str_split.offsets -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+  str_split.offsets.chunk_count -> rle -> runs, values
+  str_split.offsets.chunk_bits -> rle -> runs, values
+  str_split.chars -> deflate
+  str_split.offsets.chunk_min -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+  str_split.offsets.chunk_min.chunk_count -> rle -> runs, values
+  str_split.offsets.chunk_count.values -> rle -> runs, values
+  str_split.offsets.chunk_bits.runs -> rle -> runs, values
+  str_split.offsets.chunk_count.runs -> rle -> runs, values
+--- alt 3 ---
+  ratio=1.83x comp=303.88 GB/s decomp=518.59 GB/s
+  input -> str_split -> offsets, chars
+  str_split.offsets -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+  str_split.offsets.chunk_bits -> rle -> runs, values
+  str_split.offsets.chunk_count -> rle -> runs, values
+  str_split.offsets.chunk_min -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+  str_split.offsets.chunk_count.values -> rle -> runs, values
+  str_split.offsets.chunk_min.chunk_count -> rle -> runs, values
+  str_split.offsets.chunk_bits.runs -> rle -> runs, values
+  str_split.chars -> ans
+  str_split.offsets.chunk_count.runs -> rle -> runs, values
+--- alt 4 ---
+  ratio=1.75x comp=342.77 GB/s decomp=540.73 GB/s
+  input -> str_split -> offsets, chars
+  str_split.chars -> ans
+--- alt 5 ---
+  ratio=2.77x comp=22.43 GB/s decomp=258.01 GB/s
+  input -> str_split -> offsets, chars
+  str_split.chars -> snappy
+  str_split.offsets -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+--- alt 6 ---
+  ratio=1.87x comp=323.60 GB/s decomp=506.88 GB/s
+  input -> str_split -> offsets, chars
+  str_split.chars -> ans
+  str_split.offsets -> delta -> differences
+  str_split.offsets.differences -> ans
+

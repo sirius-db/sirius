@@ -110,6 +110,17 @@ class sirius_pipeline_itask : public parallel::itask {
   [[nodiscard]] quent::task::TaskHandle& telemetry_handle() noexcept;
   void set_telemetry_finalized() noexcept { _telemetry_finalized = true; }
 
+  /// Task-output volume for telemetry: stamped by the derived execute() after
+  /// compute, read by the executor when it emits the Finalizing transition
+  /// (the output data has been published/moved by then). Both 0 until stamped.
+  void set_telemetry_output(uint64_t rows, uint64_t bytes) noexcept
+  {
+    _telemetry_output_rows  = rows;
+    _telemetry_output_bytes = bytes;
+  }
+  [[nodiscard]] uint64_t telemetry_output_rows() const noexcept { return _telemetry_output_rows; }
+  [[nodiscard]] uint64_t telemetry_output_bytes() const noexcept { return _telemetry_output_bytes; }
+
  protected:
   /**
    * @brief Protected constructor for derived classes.
@@ -125,6 +136,8 @@ class sirius_pipeline_itask : public parallel::itask {
  private:
   rust::Box<quent::task::TaskHandle> _telemetry_task_handle;
   bool _telemetry_finalized{false};
+  uint64_t _telemetry_output_rows{0};
+  uint64_t _telemetry_output_bytes{0};
 };
 
 }  // namespace pipeline

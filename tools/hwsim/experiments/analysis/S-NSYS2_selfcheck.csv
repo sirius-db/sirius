@@ -1,0 +1,7 @@
+index,label,traced_ms,sim_ms,err_pct,tasks,binding,forced_admissions,dep_cycle_breaks,spill_mode
+0,S-NSYS2_tpch_q20_iter1_iter1,218.537,218.368,-0.08,73,executor_threads,0,0,off
+1,S-NSYS2_tpch_q20_iter2_iter1,136.29,136.129,-0.12,73,executor_threads,0,0,off
+2,S-NSYS2_tpch_q21_iter1_iter1,637.593,637.42,-0.03,146,executor_threads,0,0,off
+3,S-NSYS2_tpch_q21_iter2_iter1,621.4,621.158,-0.04,146,executor_threads,0,0,off
+4,S-NSYS2_tpch_q22_iter1_iter1,139.463,139.288,-0.13,31,dependencies,0,0,off
+5,S-NSYS2_tpch_q22_iter2_iter1,110.01,109.836,-0.16,31,dependencies,0,0,off

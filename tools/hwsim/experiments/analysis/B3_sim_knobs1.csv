@@ -1,0 +1,3 @@
+row,query,knobs,median_sim_wall_ms,median_sim_baseline_ms,binding,forced_admissions,n
+B3-knobs1,13,none,5399.7,5399.7,executor_threads,0,3
+B3-knobs1,21,none,17343.6,17343.6,executor_threads,0,3

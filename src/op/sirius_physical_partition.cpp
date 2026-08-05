@@ -229,10 +229,15 @@ std::unique_ptr<operator_data> sirius_physical_partition::execute(const operator
       break;
     case PartitionType::NONE: {
       const auto clone_batch_id = sirius::get_next_batch_id();
+      const auto clone_view     = get_cudf_table_view(input_batch_ro);
       partitioned_results       = {input_batch_ro.clone(
         clone_batch_id,
         stream,
-        telemetry::quent_data_batch_probe::create(batch_telemetry(), clone_batch_id))};
+        telemetry::quent_data_batch_probe::create(
+          batch_telemetry(),
+          clone_batch_id,
+          static_cast<uint64_t>(clone_view.num_rows()),
+          static_cast<uint64_t>(clone_view.num_columns())))};
       break;
     }
     case PartitionType::CUSTOM:
@@ -444,11 +449,14 @@ std::unique_ptr<operator_data> sirius_physical_partition::get_next_task_input_da
         }
         build_arrives_whole = strategy.num_partitions == 1 || strategy.broadcast;
       } else if (in.is_build_side && strategy.num_partitions == 1 && hash_join != nullptr &&
-                 hash_join->publishes_dynamic_filters()) {
+                 hash_join->publishes_dynamic_filters() &&
+                 in.total_bytes < hash_join->max_build_hash_table_bytes()) {
         // Not BUILD_PROBE, but the build lands in one partition and this join publishes a filter
         // from a single build batch, so folding it only moves a batch boundary. Best-effort: no
         // build-side CONCAT means no publication. Build-side sizing is required — right-family
         // joins size from the probe, where one partition says nothing about the build's size.
+        // The byte bound matters when hash_partition_bytes exceeds the build budget: a build
+        // refused BUILD_PROBE for being too large must not be folded whole for a filter either.
         bool const found_this    = enable_build_concat_all(*this);
         bool const found_sibling = enable_build_concat_all(sibling);
         build_arrives_whole      = found_this || found_sibling;

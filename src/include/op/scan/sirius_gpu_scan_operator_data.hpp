@@ -17,6 +17,8 @@
 #pragma once
 
 // sirius
+#include "compression/decode_pushdown.hpp"
+
 #include <op/scan/gpu_ingestible.hpp>
 #include <op/sirius_physical_operator.hpp>
 #include <scan_manager/mvcc_chunk_mask.hpp>
@@ -29,11 +31,49 @@
 #include <rmm/cuda_stream_view.hpp>
 
 // standard library
+#include <atomic>
 #include <cstddef>
 #include <memory>
 #include <variant>
 
+namespace sirius::op {
+class sirius_dynamic_filter_set;  // membership channel (op/sirius_dynamic_filter.hpp)
+}
+
+namespace sirius::late_mat {
+struct scan_batch_origin;  // late_mat/column_origin.hpp
+struct row_selection;      // late_mat/column_origin.hpp
+}
+
 namespace sirius::op::scan {
+
+//===----------------------------------------------------------------------===//
+// membership snapshot (fused scan-filter Phase A)
+//===----------------------------------------------------------------------===//
+/// One snapshot of a scan's dynamic-filter channel, shaped for decode.
+struct membership_snapshot {
+  sirius::decode_membership_pushdown pushdown;  ///< parallel to the selected slots
+  std::uint64_t generation    = 0;              ///< set->filter_count(), read BEFORE the walk
+  std::size_t attached_probes = 0;
+  std::size_t skipped_non_mask = 0;  ///< filters without the mask-applicable mixin (zone maps)
+};
+
+/// Build a membership pushdown over @p n_slots provider/representation slots.
+///
+/// THE MAPPING INVARIANT (single source of truth — both the scan-manager
+/// drain attach and the decode-time refresh call this): slot order ==
+/// materialized_column_order == output columns FIRST, IN OUTPUT ORDER, then
+/// pure-filter columns, while the filter set keys by the consumer's
+/// OUTPUT-COLUMN position (parquet installs set_consumer_column_remap with
+/// scan_plan::output_position_by_column_id). Slot i therefore maps to output
+/// position i for every output column, so slot i's probes are exactly
+/// filters_for_column(i); trailing pure-filter slots query keys the set can
+/// never hold (push_filter rejects non-output columns) and come back empty by
+/// construction. generation is read BEFORE the walk so it never claims probes
+/// the walk did not capture (a racing publish only ADDS an uncounted probe —
+/// the safe direction for the converter's generation echo).
+[[nodiscard]] membership_snapshot snapshot_membership_pushdown(
+  sirius::op::sirius_dynamic_filter_set const& set, std::size_t n_slots);
 
 //===----------------------------------------------------------------------===//
 // scan_operator_input
@@ -146,6 +186,61 @@ class scan_operator_input : public op::operator_data {
   /// copy). Stamped by drain_cached_provider on resident splits; scan_info
   /// splits fold filter costs into their own estimates instead.
   bool row_filter_pending{false};
+  /// True when prepare_for_processing's conversion came back as a
+  /// row_filtered_gpu_table_representation: the fused scan-filter decode
+  /// (SIRIUS_EXP_FUSED_SCAN_FILTER) already applied the split's whole
+  /// table-filter conjunction and every column is compacted to the survivor
+  /// rows. materialize_table then returns filter_state::ROW_FILTERED so
+  /// post_filter_and_project skips filter evaluation and only projects. Never
+  /// set while the gate is off — the converters then always produce the plain
+  /// representation.
+  bool decode_row_filtered{false};
+  /// The operator's dynamic-filter channel (may be null), stamped by
+  /// sirius_gpu_scan_operator::get_next_task_input_data. prepare_for_processing
+  /// snapshots it at DECODE time — the scan-manager drain runs at query
+  /// prepare, before any join build has published, so only a decode-time
+  /// snapshot can see membership filters (the iteration-7 zero-member() root
+  /// cause).
+  std::shared_ptr<sirius::op::sirius_dynamic_filter_set> dynamic_filters;
+  /// Operator-shared RULE-2 bail latch, stamped by
+  /// sirius_gpu_scan_operator::get_next_task_input_data on every split it
+  /// hands out. Selectivity is uniform across a scan's batches (unclustered
+  /// chunks), so one post-CNT bail predicts the rest: prepare_for_processing
+  /// latches it on seeing a rule2_bailed_gpu_table_representation, and later
+  /// splits strip the attached range pushdown before conversion (and the
+  /// working-set estimator keeps the classic 2x envelope). Per-operator by
+  /// construction — another query's scan decides fresh. May be null (splits
+  /// not routed through the operator, e.g. tests): all reads null-check.
+  std::shared_ptr<std::atomic<bool>> fused_bail_flag;
+  /// Per-query table taken out of the cached wrapper batch right after
+  /// prepare_for_processing's conversion produced it (decompressed or
+  /// uploaded fresh for this split) — never raw GPU pin storage, which is
+  /// served as a plain gpu_table_representation and never converted.
+  /// Consumed at most once by materialize_table, which moves it into the
+  /// scan output instead of deep-copying the batch. Mutable: the operator
+  /// only sees its input as const during execute.
+  mutable std::unique_ptr<cudf::table> stolen_table;
+  /// Size of the stolen table, kept past consumption so OOM-retry size
+  /// estimates stay accurate while the wrapper batch holds only an empty
+  /// placeholder.
+  std::size_t stolen_table_bytes{0};
+  /// Set when materialize_table consumes the stolen table. A re-entry after
+  /// consumption (scan-internal OOM retry) must fail loudly rather than
+  /// serve the emptied wrapper batch as zero rows.
+  mutable bool stolen_table_consumed{false};
+  /// Late-mat origin stamp (SIRIUS_EXP_LATE_MAT), copied from the provider
+  /// batch by drain_cached_provider: the served pinned chunk's per-column
+  /// origins + its global row span in pin order. The scan's execute() attaches
+  /// it to the output batch (dense selection) when the output demonstrably
+  /// still covers the whole chunk (row-count guard). Always empty when the
+  /// gate is off — one inert shared_ptr, no behavior change.
+  std::shared_ptr<const late_mat::scan_batch_origin> late_mat_origin;
+  /// Late-mat wave-seam capture harvest (SIRIUS_EXP_LATE_MAT): the fused
+  /// decode's survivor selection (kind=mask, range filled from
+  /// late_mat_origin), moved off the row_filtered representation by
+  /// prepare_for_processing. Non-null only for decode_row_filtered splits of
+  /// an origin-stamped scan whose converter ran the capture.
+  std::shared_ptr<const late_mat::row_selection> late_mat_selection;
   /// True when scan normalization will cast at least one selected column of this resident cached
   /// split. Stamped by drain_cached_provider from databatch_provider::batch, which owns the
   /// definition.

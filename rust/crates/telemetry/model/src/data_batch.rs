@@ -2,10 +2,17 @@ use quent_model::{fsm, state};
 use uuid::Uuid;
 
 state! {
+    // producer_task_uuid: the task whose execution constructed this batch;
+    // nil for batches created outside a task (scan-manager staging, tests).
+    // num_rows/num_columns: 0 when unknown at construction (e.g. host-tier
+    // staging batches that have not been decoded).
     Constructed {
         attributes: {
             data_batch_id: u64,
             producer_pipeline_uuid: Uuid,
+            producer_task_uuid: Uuid,
+            num_rows: u64,
+            num_columns: u64,
         },
     }
 }

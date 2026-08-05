@@ -18,12 +18,16 @@ state! {
     // pipeline_uuid: the consumer pipeline (== quent Operator id).
     // port_uuid: the consumer's receiving port.
     // origin: a C++ `batch_origin` value (batch_telemetry.hpp).
+    // producer_task_uuid: the task that produced (published) the batch; nil
+    // for lazily-registered placements (reschedule_intermediate) and batches
+    // published outside a task.
     BatchRegistered {
         attributes: {
             batch_id: u64,
             pipeline_uuid: Uuid,
             port_uuid: Uuid,
             origin: String,
+            producer_task_uuid: Uuid,
         },
         usages: {
             tier: MemoryTier,

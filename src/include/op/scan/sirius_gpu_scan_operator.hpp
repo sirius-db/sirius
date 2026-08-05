@@ -25,6 +25,7 @@
 #include <cudf/types.hpp>
 
 // standard library
+#include <atomic>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -33,6 +34,16 @@ namespace sirius::scan_manager {
 class split_connector;
 class sirius_scan_manager;
 }  // namespace sirius::scan_manager
+
+namespace sirius::late_mat {
+struct deferred_scan_output;  // late_mat/defer_directive.hpp
+struct planned_deferral;      // late_mat/plan_deferral.hpp
+struct planned_fd_graph;      // late_mat/plan_deferral.hpp
+}  // namespace sirius::late_mat
+
+namespace sirius::op {
+class sirius_dynamic_filter_set;  // membership channel (op/sirius_dynamic_filter.hpp)
+}
 
 namespace duckdb {
 class SiriusContext;
@@ -146,9 +157,46 @@ class sirius_gpu_scan_operator : public sirius_physical_operator {
 
   scan_manager::split_connector& get_split_connector();
 
+  /// Shared handle to the connector, for components (e.g. the memory
+  /// prefetcher) that must outlive-safely reference it from a background
+  /// thread.
+  [[nodiscard]] std::shared_ptr<scan_manager::split_connector> get_shared_split_connector() const
+  {
+    return _split_connector;
+  }
+
+  /// Late-mat deferral directive (SIRIUS_EXP_LATE_MAT): installed by the
+  /// defer policy at query prepare, always in a pair with the consuming
+  /// operator's late_mat_port_directive. execute() substitutes the listed
+  /// output positions with a UINT64 pin-order rowid column (first position)
+  /// and INT8 placeholders (the rest). Empty when the gate is off.
+  std::shared_ptr<const late_mat::deferred_scan_output> late_mat_defer;
+
+  /// v2 planner annotation (SIRIUS_EXP_LATE_MAT_V2): per-output-column
+  /// lifetime facts from the plan-time pass. Read by the lowering backend at
+  /// query prepare; empty when the sub-gate is off.
+  std::shared_ptr<const late_mat::planned_deferral> late_mat_plan;
+
+  /// v3 raw FD graph (SIRIUS_EXP_LATE_MAT_V3): ONE query-wide graph shared by
+  /// every scan (equality edges + aggregate key provenances). The lowering
+  /// runs the determination closure against the pinned entries' uniqueness
+  /// facts. Empty below the v3 gate.
+  std::shared_ptr<const late_mat::planned_fd_graph> late_mat_fd_graph;
+
  private:
   std::shared_ptr<gpu_ingestible> _ingestible;
   std::shared_ptr<scan_manager::split_connector> _split_connector;
+  /// RULE-2 bail latch for the fused scan-filter pipeline, shared with every
+  /// split this operator hands out (see scan_operator_input::fused_bail_flag).
+  /// Per-operator so another query's scan of the same pinned entry decides
+  /// fresh.
+  std::shared_ptr<std::atomic<bool>> _fused_rule2_bailed =
+    std::make_shared<std::atomic<bool>>(false);
+  /// The scan's dynamic-filter channel (null for non-parquet ingestibles),
+  /// resolved once at construction and stamped onto every split so
+  /// prepare_for_processing can snapshot membership filters at DECODE time
+  /// (see scan_operator_input::dynamic_filters).
+  std::shared_ptr<sirius::op::sirius_dynamic_filter_set> _dynamic_filters_channel;
   /// Non-owning observer. The registered-state shared_ptr owns the context for
   /// at least as long as the query plan; unit-test operators may leave it null.
   duckdb::SiriusContext* _compressed_materialization_observer;

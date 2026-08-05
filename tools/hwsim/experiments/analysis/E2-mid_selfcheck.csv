@@ -1,0 +1,16 @@
+index,label,traced_ms,sim_ms,err_pct,tasks,binding,forced_admissions,dep_cycle_breaks
+0,E2-mid_tpch_q1_iter1_iter1,7982.538,7972.186,-0.13,1132,executor_threads,0,0
+1,E2-mid_tpch_q1_iter2_iter1,7878.574,7869.94,-0.11,1132,executor_threads,0,0
+2,E2-mid_tpch_q1_iter3_iter1,7903.864,7896.466,-0.09,1132,executor_threads,0,0
+3,E2-mid_tpch_q9_iter1_iter1,12506.927,12494.423,-0.1,1639,executor_threads,0,0
+4,E2-mid_tpch_q9_iter2_iter1,12528.477,12532.285,0.03,1663,executor_threads,0,0
+5,E2-mid_tpch_q9_iter3_iter1,12507.575,12511.961,0.04,1693,executor_threads,0,0
+6,E2-mid_tpch_q13_iter1_iter1,5602.617,5598.923,-0.07,532,executor_threads,0,0
+7,E2-mid_tpch_q13_iter2_iter1,5499.998,5506.419,0.12,532,executor_threads,0,0
+8,E2-mid_tpch_q13_iter3_iter1,5401.583,5396.106,-0.1,532,executor_threads,0,0
+9,E2-mid_tpch_q19_iter1_iter1,8455.828,8455.542,-0.0,1316,executor_threads,0,0
+10,E2-mid_tpch_q19_iter2_iter1,8408.627,8408.344,-0.0,1316,executor_threads,0,0
+11,E2-mid_tpch_q19_iter3_iter1,8429.465,8429.195,-0.0,1316,executor_threads,0,0
+12,E2-mid_tpch_q21_iter1_iter1,195312.073,5464985.582,2698.08,14390,gpu_memory,13542,0
+13,E2-mid_tpch_q21_iter2_iter1,195564.508,5595551.988,2761.23,14715,gpu_memory,13863,0
+14,E2-mid_tpch_q21_iter3_iter1,196781.783,5594298.733,2742.89,14703,gpu_memory,13863,0
