@@ -71,7 +71,5 @@ src/**/telemetry/                   @sirius-db/sirius-telemetry-codeowners
 /utils/                             @sirius-db/sirius-testing-codeowners
 
 # ── Language overlays (last-match-wins — these take precedence) ───────────────
-**/*.cu                             @sirius-db/sirius-cuda-codeowners
-**/*.cuh                            @sirius-db/sirius-cuda-codeowners
 **/*.rs                             @sirius-db/sirius-rust-codeowners
 **/*.py                             @sirius-db/sirius-python-codeowners
