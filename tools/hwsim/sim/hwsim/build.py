@@ -38,6 +38,11 @@ FALSE_DEP_SLACK_NS = 1_000_000  # 1 ms
 # producer-task execution window.
 ATTRIB_SLACK_NS = 5_000_000  # 5 ms
 
+# hwsim-sim exports carry the engine's dispatch order in the Routing state's
+# free-form instance_name ("qprio=<rank>"): simulated enqueue timestamps do
+# not encode the queue priority the run dispatched by (docs/quent-export.md).
+_QPRIO_RE = re.compile(r"\bqprio=(\d+)\b")
+
 
 def _tier_is_gpu(tier_name: str) -> bool:
     return tier_name.startswith("GPU")
@@ -58,6 +63,10 @@ def _build_task_spec(rt: RawTask, t0: int) -> Optional[TaskSpec]:
         elif name == "Routing":
             spec.t_routing = ts
             spec.device = int(payload.get("preferred_device_id", 0)) if payload else 0
+            if payload:
+                m = _QPRIO_RE.search(payload.get("instance_name", "") or "")
+                if m:
+                    spec.queue_prio = int(m.group(1))
         elif name == "Reserving":
             spec.t_reserving = ts
             if payload:

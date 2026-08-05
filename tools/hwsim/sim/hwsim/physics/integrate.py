@@ -447,7 +447,16 @@ def simulate_with_physics(
     knobs: Knobs,
     profile: PhysicsProfile,
     queue_order: str = "traced",
-) -> Tuple[SimResult, JoinStats, RetimeStats]:
+    return_graph: bool = False,
+):
+    """Run the physics-retimed simulation.
+
+    Returns ``(result, jstats, rstats)``; with ``return_graph=True`` also
+    returns the retimed graph the engine actually executed as a 4th element —
+    span durations there are the knob-scaled ones (the engine ran with
+    neutralized GPU knobs), which is what the quent exporter needs to lay out
+    per-operator boundaries of a physics run.
+    """
     annotations, jstats = join_graph(profile, graph)
     g2, rstats = retime_graph(
         graph,
@@ -483,6 +492,8 @@ def simulate_with_physics(
         host_capacity=host if host else None,
         device_capacity=rstats.device_capacity or None,
     ).run()
+    if return_graph:
+        return result, jstats, rstats, g2
     return result, jstats, rstats
 
 

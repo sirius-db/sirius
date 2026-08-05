@@ -129,6 +129,14 @@ silently dropped.
 | 7. greedy interval-colouring thread bindings | OK — every executor-thread/manager-thread usage resolves; per-thread intervals are non-overlapping by construction and nothing in the contract requires matching real bindings |
 | 8. synthetic Init/Planning pads (t0−1 ms/−0.5 ms), `worker-hwsim` | OK — legal query FSM; verified Executing lands exactly on the traced t0 |
 
+### WS20 additions (physics-retimed export) — cross-checked
+
+| decision | verdict |
+|---|---|
+| 9. `Routing.instance_name` carries `qprio=<rank>` (dispatch order; sim enqueue timestamps do not encode the traced queue priority the engine dispatched by) | OK — free-form String; analyzer ingests; validator clean. REQUIRED for round-trip fidelity: without it a re-sim of B1 q9's physics export repacked +67% (order-sensitive schedule); with it 0.00% |
+| 10. `PHYS::PREP` pseudo-operator exports `current_operator_id = u32::MAX` (no plan operator) | OK — `current_operator_id` is `u32` in the analyzer model (`task.rs`); `-1` was rejected by serde and silently truncated the whole task stream (16,976 → 6 lines ingested), u32::MAX ingests 16,976/16,976 |
+| 11. physics label token `...@<knobs>,physics` / `@baseline,physics` + `hwsim.physics*` engine attrs | OK — validator's sim-label heuristic taught the `,physics` token; attrs are plain String/F64/I64 custom_attributes |
+
 Only the WS9-field omission (in the coordinator's "deliberate omissions"
 list, cross-checked above) breaks the analyzer; `io_request` /
 `InTransit` / `Downgrading` omissions and `peak_allocated_bytes=0` are all

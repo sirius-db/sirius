@@ -337,7 +337,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--export-quent",
         metavar="OUTDIR",
         help="export the simulated execution as a Quent ndjson session under "
-        "OUTDIR (docs/quent-export.md; ignored with --physics)",
+        "OUTDIR (docs/quent-export.md; with --physics the export carries the "
+        "physics-retimed schedule)",
     )
     sp.set_defaults(fn=cmd_simulate)
 
@@ -369,7 +370,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--export-quent",
         metavar="OUTDIR",
         help="export one Quent ndjson session per sweep point under OUTDIR "
-        "(docs/quent-export.md; ignored with --physics)",
+        "(docs/quent-export.md; with --physics the exports carry the "
+        "physics-retimed schedules)",
     )
     sp.set_defaults(fn=cmd_sweep)
 
