@@ -653,6 +653,7 @@ class GPUExecutionIcebergFixture : public MultiFormatFixtureBase {
     REQUIRE_FALSE(gpu_result->HasError());
     require_route(before, sirius::test::get_transparent_execution_stats(*con), route);
 
+    auto const before_cpu = sirius::test::get_transparent_execution_stats(*con);
     con->Query("SET gpu_execution = false;");
     auto cpu_result = con->Query(query);
     con->Query("SET gpu_execution = true;");
@@ -661,6 +662,13 @@ class GPUExecutionIcebergFixture : public MultiFormatFixtureBase {
       UNSCOPED_INFO("DuckDB reader error: " << cpu_result->GetError());
     }
     REQUIRE_FALSE(cpu_result->HasError());
+    // Prove the oracle is actually DuckDB. `gpu_execution=false` disables transparent
+    // interception but does NOT unload Sirius (only SIRIUS_DISABLE=1 does), so "we set the flag"
+    // is not evidence — zero rebinds, zero fallbacks and zero GPU executions is. Without this,
+    // a comparison against an oracle that had quietly stayed on the GPU would be the engine
+    // agreeing with itself.
+    sirius::test::require_transparent_execution_delta(
+      before_cpu, sirius::test::get_transparent_execution_stats(*con), 0, 0, 0);
 
     auto gpu_rows = collect_rows(gpu_result->Cast<duckdb::MaterializedQueryResult>());
     auto cpu_rows = collect_rows(cpu_result->Cast<duckdb::MaterializedQueryResult>());
@@ -937,28 +945,62 @@ TEST_CASE_METHOD(GPUExecutionIcebergDVFixture,
 // Schema evolution, snapshot selection, and sequence numbers.
 //===----------------------------------------------------------------------===//
 
+//===----------------------------------------------------------------------===//
+// Schema evolution: CPU-only on purpose. Read this before "fixing" it to run on the GPU.
+//
+// File 1 holds {fruit, count}; a later snapshot added `color`, so file 2 holds
+// {fruit, count, color} and file 1's rows must read back with color NULL. DuckDB's reader does
+// that; the GPU scan cannot synthesize a column absent from a data file, so it accepts the plan
+// and then throws "Projected column 'color' not found in parquet file" at execute time.
+//
+// That is a RUNTIME fallback, and running one here would poison the whole suite. Any GPU query
+// issued after a runtime fallback deadlocks in that connection — a pre-existing engine bug with
+// nothing to do with iceberg. It reproduces in two statements and no iceberg at all:
+//
+//   SELECT * FROM read_parquet([file_without_color, file_with_color], union_by_name=true);
+//   SELECT count(*) FROM read_parquet('nation.parquet');   -- hangs forever
+//
+// The engine's six runtime-fallback tests miss it because their fault injector
+// (sirius_test_inject_transparent_gpu_error) throws one line BEFORE sirius_execute_query, so no
+// pipeline or task is ever built and there is no dirty state to leave behind.
+//
+// So this case asserts what is actually dependable today: DuckDB returns the right rows for a
+// schema-evolved iceberg table. It deliberately does NOT exercise the GPU path, because that
+// path's observable behaviour right now is "correct answer, then a dead session" — not something
+// worth pinning a test to.
+//
+// When the engine deadlock is fixed, run this through expect_iceberg_rows with
+// gpu_route::runtime_fallback. When the GPU learns to inject typed NULLs for missing columns
+// (the MISSING entry kind in scan_plan), it becomes gpu_route::gpu.
+//===----------------------------------------------------------------------===//
+
 TEST_CASE_METHOD(GPUExecutionIcebergFixture,
                  "gpu_execution iceberg - schema evolution added column",
                  "[integration][gpu_execution][iceberg]")
 {
   auto path = (get_project_root() / "test/cpp/integration/data/iceberg_schema_evolution").string();
-  REQUIRE(delete_file_count(path) == 0);  // append-only — the gate lets this through
+  REQUIRE(delete_file_count(path) == 0);  // append-only — deletes are not what this covers
 
-  // File 1 holds {fruit, count}; a later snapshot added `color`, so file 2 holds
-  // {fruit, count, color} and file 1's rows must read back with color NULL.
-  //
-  // The GPU scan has no way to synthesize a column that is absent from a data file, so the
-  // plan is accepted and then fails at execute time with "Projected column 'color' not found
-  // in parquet file", and the stashed CPU plan returns the correct rows. Asserting
-  // runtime_fallback (not gpu) records that this is unsupported-but-correct; the fix is the
-  // MISSING-column entry kind in scan_plan, at which point this becomes gpu_route::gpu.
-  expect_iceberg_rows("SELECT * FROM iceberg_scan('" + path + "') ORDER BY count;",
-                      gpu_route::runtime_fallback,
-                      {{"apple", "1", "NULL"},
-                       {"banana", "2", "NULL"},
-                       {"cherry", "3", "NULL"},
-                       {"date", "4", "brown"},
-                       {"elderberry", "5", "purple"}});
+  auto const before = sirius::test::get_transparent_execution_stats(*con);
+  con->Query("SET gpu_execution = false;");
+  auto result = con->Query("SELECT * FROM iceberg_scan('" + path + "') ORDER BY count;");
+  con->Query("SET gpu_execution = true;");
+  REQUIRE(result);
+  if (result->HasError()) { UNSCOPED_INFO("iceberg_scan error: " << result->GetError()); }
+  REQUIRE_FALSE(result->HasError());
+
+  // No rebind, no fallback, no GPU execution: proves this really stayed off the GPU path, and
+  // therefore that no runtime fallback happened to poison the cases that follow.
+  sirius::test::require_transparent_execution_delta(
+    before, sirius::test::get_transparent_execution_stats(*con), 0, 0, 0);
+
+  std::vector<std::vector<std::string>> expected{{"apple", "1", "NULL"},
+                                                 {"banana", "2", "NULL"},
+                                                 {"cherry", "3", "NULL"},
+                                                 {"date", "4", "brown"},
+                                                 {"elderberry", "5", "purple"}};
+  std::sort(expected.begin(), expected.end());
+  REQUIRE(collect_rows(result->Cast<duckdb::MaterializedQueryResult>()) == expected);
 }
 
 TEST_CASE_METHOD(GPUExecutionIcebergFixture,
