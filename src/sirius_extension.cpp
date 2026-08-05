@@ -1374,6 +1374,15 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
     }
   }
 
+  auto attach_duckdb_mvcc_metadata = [&](std::vector<std::size_t> base_row_count_per_chunk) {
+    if (data.args.format != "duckdb") { return; }
+    sirius::scan_manager::duckdb_mvcc_metadata mvcc;
+    mvcc.v_base                   = duckdb_pin_v_base;
+    mvcc.base_row_count_per_chunk = std::move(base_row_count_per_chunk);
+    mvcc.checkpoint_iteration     = duckdb_pin_checkpoint_iteration;
+    scan_mgr.attach_mvcc_metadata(data.args.name, std::move(mvcc));
+  };
+
   if (data.args.tier == "host") {
     // Stream each batch GPU->host: materialize one batch on its round-robin GPU, convert it
     // to a pinned host representation (compressed when it qualifies) on that GPU's NUMA-local
@@ -1404,13 +1413,7 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
                                       std::move(pinned_column_types),
                                       std::move(host_result.chunk_stats),
                                       std::move(host_result.column_storage));
-    if (data.args.format == "duckdb") {
-      sirius::scan_manager::duckdb_mvcc_metadata mvcc;
-      mvcc.v_base                   = duckdb_pin_v_base;
-      mvcc.base_row_count_per_chunk = std::move(host_result.base_row_count_per_chunk);
-      mvcc.checkpoint_iteration     = duckdb_pin_checkpoint_iteration;
-      scan_mgr.attach_mvcc_metadata(data.args.name, std::move(mvcc));
-    }
+    attach_duckdb_mvcc_metadata(std::move(host_result.base_row_count_per_chunk));
   } else if (pin_comp.enabled) {
     // GPU tier, compression enabled: narrow each materialized batch (when narrowing is
     // on), then compress it when it qualifies, keeping the compressed payload in device
@@ -1431,13 +1434,7 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
                                         std::move(dev_result.chunks),
                                         *gpu_spaces_mut[0],
                                         std::move(dev_result.column_storage));
-    if (data.args.format == "duckdb") {
-      sirius::scan_manager::duckdb_mvcc_metadata mvcc;
-      mvcc.v_base                   = duckdb_pin_v_base;
-      mvcc.base_row_count_per_chunk = std::move(dev_result.base_row_count_per_chunk);
-      mvcc.checkpoint_iteration     = duckdb_pin_checkpoint_iteration;
-      scan_mgr.attach_mvcc_metadata(data.args.name, std::move(mvcc));
-    }
+    attach_duckdb_mvcc_metadata(std::move(dev_result.base_row_count_per_chunk));
   } else {
     // GPU tier, uncompressed: materialize every batch as a GPU-resident cudf::table
     // (with its GPU placement) and pin them in place.
@@ -1458,13 +1455,7 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
                                  std::move(pinned_column_types),
                                  std::move(mat.chunk_stats),
                                  std::move(mat.column_storage));
-    if (data.args.format == "duckdb") {
-      sirius::scan_manager::duckdb_mvcc_metadata mvcc;
-      mvcc.v_base                   = duckdb_pin_v_base;
-      mvcc.base_row_count_per_chunk = std::move(base_row_count_per_chunk);
-      mvcc.checkpoint_iteration     = duckdb_pin_checkpoint_iteration;
-      scan_mgr.attach_mvcc_metadata(data.args.name, std::move(mvcc));
-    }
+    attach_duckdb_mvcc_metadata(std::move(base_row_count_per_chunk));
   }
 
   output.SetCardinality(1);
