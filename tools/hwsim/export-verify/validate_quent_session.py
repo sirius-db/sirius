@@ -963,10 +963,7 @@ class Validator:
                                f"query label {label!r} missing '@knob=value' suffix")
             else:
                 suffix = label.split("@", 1)[1]
-                # "@baseline" is WS17's documented all-knobs-default marker; a
-                # physics-retimed export appends a ",physics" token (WS20).
-                if suffix.endswith(",physics"):
-                    suffix = suffix[: -len(",physics")]
+                # "@baseline" is WS17's documented all-knobs-default marker.
                 if suffix != "baseline" and "=" not in suffix:
                     self.rep.warn("sim-query-label", lwhere,
                                   f"query label {label!r} has '@' but no 'knob=value' "

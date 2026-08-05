@@ -1,0 +1,24 @@
+# NVIDIA H100 SXM5 80 GB — advertised-only (no measured: block; we have never
+# run the throttle kit on one). Sources: NVIDIA H100 datasheet (FP32 67
+# TFLOPS, HBM3 3.35 TB/s, 80 GB) and the H100 whitepaper (132 SMs, 16,896
+# FP32 cores, 1980 MHz boost). Host link is PCIe Gen5 x16 — the 900 GB/s
+# NVLink4 fabric is GPU<->GPU/NVSwitch, not the host channel Sirius H2D uses
+# (on Grace Hopper it would be C2C instead: make a separate gh200 descriptor).
+# cpu/storage are box-dependent — copy this file and fill them in for a
+# concrete target box. Schema: docs/spec-sheet-mode.md.
+name: h100-sxm5
+
+gpu:
+  name: "NVIDIA H100 SXM5 80GB"
+  sm_count: 132
+  boost_clock_mhz: 1980
+  fp32_tflops_peak: 67                # dense FP32, datasheet
+  mem_class: hbm3                     # unanchored class -> derate range [0.70, 0.82]
+  mem_bandwidth_gbs_peak: 3350
+  vram_gb: 80
+  l2_mb: 50
+
+link:
+  type: pcie
+  gen: 5
+  lanes: 16

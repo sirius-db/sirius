@@ -14,7 +14,11 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from nsys_fixture import simple_capture  # noqa: E402
 
 from hwsim.cli import build_parser  # noqa: E402
-from hwsim.physics.cli import _dispatch_simulate, _dispatch_sweep  # noqa: E402
+from hwsim.physics.cli import _dispatch_simulate  # noqa: E402
+from hwsim.target_cli import (  # noqa: E402
+    _dispatch_simulate_target,
+    _dispatch_sweep_target,
+)
 
 
 class TestParserWiring(unittest.TestCase):
@@ -31,7 +35,9 @@ class TestParserWiring(unittest.TestCase):
             ["simulate", "/trace", "--query-label", "q", "--physics", "p.json"]
         )
         self.assertEqual(args.physics, "p.json")
-        self.assertIs(args.fn, _dispatch_simulate)
+        # WS19 target mode wraps the dispatch chain; without --target it
+        # delegates to _dispatch_simulate unchanged.
+        self.assertIs(args.fn, _dispatch_simulate_target)
 
     def test_sweep_accepts_physics_flag(self):
         p = build_parser()
@@ -39,7 +45,7 @@ class TestParserWiring(unittest.TestCase):
             ["sweep", "/trace", "--sweep", "gpu_compute=1,2", "--physics", "p.json"]
         )
         self.assertEqual(args.physics, "p.json")
-        self.assertIs(args.fn, _dispatch_sweep)
+        self.assertIs(args.fn, _dispatch_sweep_target)
 
     def test_default_physics_is_none(self):
         p = build_parser()
@@ -65,6 +71,7 @@ class TestParserWiring(unittest.TestCase):
         orig = cli.cmd_simulate
         cli.cmd_simulate = fake
         try:
+
             class A:
                 physics = None
 

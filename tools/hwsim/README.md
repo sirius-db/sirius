@@ -65,6 +65,7 @@ degradation factor) predicts the degraded run's behavior:
 | 6 | Discrete-event simulator over the task graph | `docs/simulator-design.md`, `sim/` |
 | 7 | Validation experiment matrix | `docs/validation-plan.md` |
 | 8 | Run experiments, quantify simulator accuracy | `docs/validation-results.md` |
+| 19 | Spec-sheet target mode: `--target <descriptor.yaml>` derives the full knob vector for hardware we don't have, from advertised specs + a derating table | `docs/spec-sheet-mode.md`, `hw-descriptors/`, `docs/cross-machine-experiment.md` |
 
 ## Ground rules
 

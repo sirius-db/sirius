@@ -1,0 +1,38 @@
+# NVIDIA RTX PRO 6000 Blackwell Workstation Edition — the external-validation
+# box (x86/PCIe; docs/external-validation-rtx-pro-6000.md). Advertised values
+# from the NVIDIA datasheet
+# (nvidia.com .../rtx-pro-6000-blackwell-workstation-edition datasheet:
+# 96 GB GDDR7 ECC, 1792 GB/s, 126 TFLOPS FP32, 24,064 CUDA cores, PCIe Gen5);
+# measured values from that report's Environment section (same throttle kit,
+# zero recalibration). Schema: docs/spec-sheet-mode.md.
+name: rtx-pro-6000-blackwell
+
+gpu:
+  name: "NVIDIA RTX PRO 6000 Blackwell Workstation Edition"
+  sm_count: 188                       # sm_120, external-validation report
+  boost_clock_mhz: 2617               # 126 TFLOPS / (24,064 cores x 2 FLOP) = 2.617 GHz
+  fp32_tflops_peak: 126               # NVIDIA datasheet (dense FP32)
+  mem_class: gddr7
+  mem_bandwidth_gbs_peak: 1792        # NVIDIA datasheet (512-bit GDDR7)
+  vram_gb: 96                         # advertised (ECC)
+  l2_mb: 128                          # external report: "128 MB-L2 parts"
+
+link:
+  type: pcie
+  gen: 5
+  lanes: 16                           # 64 GB/s per direction
+
+cpu:
+  arch: x86_64
+  cores: 48                           # external report; model/clocks not recorded
+
+# storage: advertised spec of that box's NVMe unknown — measured only.
+
+measured:                             # external-validation report, Environment
+  fp32_tflops: 87.2                   # fma victim
+  gpu_mem_gbs: 1471                   # HBM-CE (2x bytes; saxpy victim 1401)
+  link_h2d_gbs: 57.7                  # PCIe pinned H2D
+  link_d2h_gbs: 57.3
+  cpu_dram_gbs: 77.8                  # 8-thread memcpy
+  storage_seq_read_gbs: 14.6          # O_DIRECT sequential
+  vram_usable_gb: 97.9                # driver-reported on that box

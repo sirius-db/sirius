@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import itertools
 import statistics
 import sys
@@ -39,6 +40,17 @@ def _load(args) -> SessionModel:
     return load_session_model(
         args.session_dir, cache_dir=cache_dir, verbose=args.verbose
     )
+
+
+def _knobs_from_args(args) -> Knobs:
+    """Knobs for this invocation. A pre-derived vector installed by target
+    mode (``hwsim.target_cli`` sets ``args._knobs_obj``) wins over the
+    ``--knob`` strings; it is copied so per-sweep-point mutation is safe
+    (``copy.copy`` also preserves dynamic attrs like ``grace_colimit``)."""
+    ko = getattr(args, "_knobs_obj", None)
+    if ko is not None:
+        return copy.copy(ko)
+    return parse_knob_args(getattr(args, "knob", None) or [])
 
 
 def _parse_spill_params(pairs: List[str]) -> Optional[SpillParams]:
@@ -109,7 +121,7 @@ def cmd_info(args) -> int:
 def cmd_simulate(args) -> int:
     model = _load(args)
     graph = _select_graph(model, args)
-    knobs = parse_knob_args(args.knob or [])
+    knobs = _knobs_from_args(args)
     for w in knobs.warnings():
         print(f"WARNING: {w}", file=sys.stderr)
     sk = _spill_kwargs(args)
@@ -202,7 +214,7 @@ def cmd_sweep(args) -> int:
     sweeps = _parse_sweeps(args.sweep or [])
     if not sweeps:
         raise SystemExit("provide at least one --sweep name=v1,v2,...")
-    base_knobs = parse_knob_args(args.knob or [])
+    base_knobs = _knobs_from_args(args)
     sk = _spill_kwargs(args)
     baseline = simulate_query(model, graph, Knobs(), **sk)
 
@@ -211,7 +223,7 @@ def cmd_sweep(args) -> int:
     warned = set()
     exported: List[str] = []
     for values in itertools.product(*(sweeps[n] for n in names)):
-        knobs = parse_knob_args(args.knob or [])
+        knobs = _knobs_from_args(args)
         for n, v in zip(names, values):
             setattr(knobs, n, v)
         for w in knobs.warnings():
@@ -337,8 +349,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--export-quent",
         metavar="OUTDIR",
         help="export the simulated execution as a Quent ndjson session under "
-        "OUTDIR (docs/quent-export.md; with --physics the export carries the "
-        "physics-retimed schedule)",
+        "OUTDIR (docs/quent-export.md; ignored with --physics)",
     )
     sp.set_defaults(fn=cmd_simulate)
 
@@ -370,8 +381,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--export-quent",
         metavar="OUTDIR",
         help="export one Quent ndjson session per sweep point under OUTDIR "
-        "(docs/quent-export.md; with --physics the exports carry the "
-        "physics-retimed schedules)",
+        "(docs/quent-export.md; ignored with --physics)",
     )
     sp.set_defaults(fn=cmd_sweep)
 
@@ -381,6 +391,13 @@ def build_parser() -> argparse.ArgumentParser:
     from .physics.cli import register_physics_cli
 
     register_physics_cli(sub, common)
+
+    # Spec-sheet target mode (WS19): adds --target/--source to simulate and
+    # sweep; without --target they delegate to the physics dispatchers
+    # unchanged. See docs/spec-sheet-mode.md.
+    from .target_cli import register_target_cli
+
+    register_target_cli(sub)
     return p
 
 

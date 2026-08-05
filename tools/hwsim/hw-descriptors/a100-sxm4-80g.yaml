@@ -1,0 +1,23 @@
+# NVIDIA A100 SXM4 80 GB — advertised-only. Sources: NVIDIA A100 datasheet
+# (FP32 19.5 TFLOPS, HBM2e 2039 GB/s, 80 GB) and the A100 whitepaper (108
+# SMs, 6,912 FP32 cores, 1410 MHz boost). NOTE the arch-IPC trap this card
+# exists to catch: Ampere A100 has 64 FP32 lanes/SM (not 128), so the
+# SMs x clock cross-check disagrees with the FP32 ratio by ~2x — target mode
+# warns and follows the FP32 ratio. cpu/storage are box-dependent.
+# Schema: docs/spec-sheet-mode.md.
+name: a100-sxm4-80g
+
+gpu:
+  name: "NVIDIA A100 SXM4 80GB"
+  sm_count: 108
+  boost_clock_mhz: 1410
+  fp32_tflops_peak: 19.5              # dense FP32, datasheet (64 lanes/SM!)
+  mem_class: hbm2e                    # unanchored class -> derate range [0.70, 0.82]
+  mem_bandwidth_gbs_peak: 2039
+  vram_gb: 80
+  l2_mb: 40
+
+link:
+  type: pcie
+  gen: 4
+  lanes: 16

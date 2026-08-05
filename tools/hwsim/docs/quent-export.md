@@ -29,25 +29,9 @@ existing one (remove it first). Programmatic API:
 `hwsim.export_quent.export_session(model, graph, knobs, result, out_dir,
 seed=None)`.
 
-`--export-quent` works on **both the v0 and the `--physics` paths** (WS20;
-the RTX PRO 6000 external validation showed v0-only export makes every
-compute-what-if timeline ~2x wrong on host-dominated lanes while the correct
-physics number existed but could not be exported). With `--physics`, the
-export carries the physics-retimed schedule — the exported wall IS the
-physics-predicted wall:
-
-```bash
-python -m hwsim simulate <trace_dir> --query-label <L> \
-    --physics physics.json --knob gpu_compute=0.5 --export-quent /path/to/outdir
-```
-
-A physics export differs from a v0 export in three visible ways: the query
-label carries a trailing `,physics` token (`...@gpu_compute=0.5,physics`;
-`@baseline,physics` at knobs=1), the engine Init grows `hwsim.physics=1` plus
-profile provenance (see below), and per-task Computing spans are the
-physics-split re-timed ones (including the synthesized `PHYS::PREP`
-pseudo-operator carrying the non-transfer share of split Preparing phases,
-exported with the `u32::MAX` no-operator-id placeholder).
+`--export-quent` is wired on the v0 simulate/sweep paths; it is **ignored
+when `--physics` is passed** (the physics pipeline reports through its own
+command functions — exporting a physics-retimed run is a follow-up).
 
 ## Session identity and alignment
 
@@ -59,23 +43,14 @@ exported with the `u32::MAX` no-operator-id placeholder).
   - `hwsim.source_query` = source query label (String)
   - `hwsim.knob.<name>` = value (F64), one per non-default knob
   - plus `hwsim.spill_mode` (String) and `hwsim.seed` (String)
-  - physics-retimed exports additionally carry `hwsim.physics` = 1 (I64) and
-    the profile provenance: `hwsim.physics_profile` /
-    `hwsim.physics_nsys_sqlite` / `hwsim.physics_profile_created_utc`
-    (String) and `hwsim.physics_pct_span_matched` /
-    `hwsim.physics_kernel_serial_frac` (F64) and
-    `hwsim.physics_device_model` (I64: G4b fluid device engaged?)
 - The exported query label is `<source label>@<knob suffix>`, e.g.
-  `tpch_q21_iter1@gpu_compute=0.5` (`@baseline` when all knobs are 1.0);
-  physics-retimed exports append a `,physics` token
-  (`@gpu_compute=0.5,physics`, `@baseline,physics`).
+  `tpch_q21_iter1@gpu_compute=0.5` (`@baseline` when all knobs are 1.0).
 - Timestamps are unix-epoch ns. Sim `t=0` is anchored at the **source query's
   traced `Executing` timestamp**, so the real and simulated sessions align on
   the UI time axis; query `Exit` lands at `t0 + simulated wall`.
 - `model.qmi` copies the source session's quent/model provenance (when
   available) and adds an `hwsim` block (generator, source, knobs, seed,
-  `sim_wall_ns`; physics exports add an `hwsim.physics` sub-block mirroring
-  the provenance attributes).
+  `sim_wall_ns`).
 
 ## What is emitted
 
@@ -105,18 +80,7 @@ Mechanical details:
   slot *counts*, not identities).
 - Per-operator Computing boundaries are laid out proportionally to the
   knob-scaled base durations inside the simulated compute window (exact at
-  knobs=1; proportional when the fluid device stretched the phase). On the
-  physics path the retimed graph's spans are ALREADY knob-scaled (the engine
-  ran with neutralized GPU knobs), so the layout weights are engine-neutral
-  (only the G1 `io_bandwidth` divisor applies).
-- The `Routing` state's free-form `instance_name` carries a
-  **`qprio=<rank>` dispatch-order marker**: the engine dispatches released
-  tasks in the source trace's queue-entry order (`queue_order="traced"`),
-  which the simulated enqueue timestamps do NOT encode — without the marker,
-  re-simulating an export repacks order-sensitive schedules (measured **+67%
-  wall drift** on B1 q9's physics export). `build.py` parses it back into
-  `TaskSpec.queue_prio`, which the engine prefers over `t_queued`; real
-  traces have no marker and keep the old behavior.
+  knobs=1; proportional when the fluid device stretched the phase).
 - Producer-less batches (scan-manager staging / orphans) are Constructed at
   `t0 − 10 ms` with a nil producer uuid, so a re-parse classifies them as
   externally available — exactly how the engine treated them (resident from
@@ -172,16 +136,6 @@ wall. Verified on B1 q21 (2339 tasks, 6849 batches):
 | exported task spans (prep/compute/tail/pre-queue) vs the sim replay and vs the source traced spans | 0 mismatches > 2 ns over 2339 tasks |
 | WS18 rig: `export-verify/validate_quent_session.py --simulated` (no `--allow-legacy`) | 0 errors, 0 warnings on both exports |
 | WS18 rig: `export-verify/ingest_check.sh` (Rust analyzer) | PASS — 22,294/22,294 task, 27,396/27,396 data_batch, 41,874/41,874 batch_placement lines ingested; 180-node resource tree |
-
-Physics-retimed exports (WS20), verified on B1 q9 (1642 tasks, 6433 batches)
-against `experiments/nsys/R1/physics_R1.json`:
-
-| check | result |
-|---|---|
-| exported wall vs the physics-predicted wall (`sim_wall_ms`) | **identical to the ns** (13383.207038 ms at `gpu_compute=0.5`; 12612.606657 ms at baseline) |
-| `export-verify/validate_quent_session.py --simulated` | 0 errors, 0 warnings on both exports |
-| `export-verify/ingest_check.sh` (Rust analyzer) | PASS — 16,976/16,976 task lines, 132-node resource tree |
-| re-sim @ knobs=1 of both exports | **0.00%** vs exported wall (requires the `qprio` marker; without it this query repacks +67%) |
 
 Caveat: a `gpu_mem_capacity`-knobbed export re-simulated at knobs=1 keeps the
 scaled pool (the exported memory spaces ARE the what-if hardware) but cannot

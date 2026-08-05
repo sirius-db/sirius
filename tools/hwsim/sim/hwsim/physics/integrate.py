@@ -447,16 +447,7 @@ def simulate_with_physics(
     knobs: Knobs,
     profile: PhysicsProfile,
     queue_order: str = "traced",
-    return_graph: bool = False,
-):
-    """Run the physics-retimed simulation.
-
-    Returns ``(result, jstats, rstats)``; with ``return_graph=True`` also
-    returns the retimed graph the engine actually executed as a 4th element —
-    span durations there are the knob-scaled ones (the engine ran with
-    neutralized GPU knobs), which is what the quent exporter needs to lay out
-    per-operator boundaries of a physics run.
-    """
+) -> Tuple[SimResult, JoinStats, RetimeStats]:
     annotations, jstats = join_graph(profile, graph)
     g2, rstats = retime_graph(
         graph,
@@ -492,8 +483,6 @@ def simulate_with_physics(
         host_capacity=host if host else None,
         device_capacity=rstats.device_capacity or None,
     ).run()
-    if return_graph:
-        return result, jstats, rstats, g2
     return result, jstats, rstats
 
 
@@ -524,12 +513,22 @@ def physics_knob_warnings(knobs: Knobs, jstats: JoinStats) -> List[str]:
             "emerges instead of holding span host time invariant."
         )
     if knobs.c2c_bandwidth != 1.0 or knobs.cpu_mem_bandwidth != 1.0:
-        w.append(
-            "transfers: effective link multiplier is min(c2c_bandwidth, "
-            "cpu_mem_bandwidth) — on Grace, C2C H2D reads host DRAM at line "
-            "rate (membw-throttle.md section 5); per-size alpha+beta curve "
-            "keeps small copies from speeding up with the link."
-        )
+        if getattr(knobs, "grace_colimit", True):
+            w.append(
+                "transfers: effective link multiplier is min(c2c_bandwidth, "
+                "cpu_mem_bandwidth) — on Grace, C2C H2D reads host DRAM at "
+                "line rate (membw-throttle.md section 5); per-size "
+                "alpha+beta curve keeps small copies from speeding up with "
+                "the link."
+            )
+        else:
+            w.append(
+                "transfers: non-C2C platform law (descriptor-driven, WS19) "
+                "— link multiplier is c2c_bandwidth alone; "
+                "cpu_mem_bandwidth does not co-limit the link. The mild "
+                "PCIe<->DRAM coupling measured on the RTX box is NOT "
+                "modeled (external-validation report)."
+            )
     if knobs.cpu_compute != 1.0:
         w.append(
             "cpu_compute: scales only host-side (non-GPU-busy) shares of "

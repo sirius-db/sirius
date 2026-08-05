@@ -14,7 +14,6 @@ unchanged (byte-identical output).
 from __future__ import annotations
 
 import itertools
-import os
 import sys
 from typing import Any, Dict, List
 
@@ -66,7 +65,9 @@ def register_physics_cli(sub, common) -> None:
 
 def _transfer_knobs_requested(args) -> bool:
     """True when the invocation moves c2c_bandwidth / cpu_mem_bandwidth."""
-    knobs = parse_knob_args(getattr(args, "knob", None) or [])
+    from ..cli import _knobs_from_args
+
+    knobs = _knobs_from_args(args)
     if knobs.c2c_bandwidth != 1.0 or knobs.cpu_mem_bandwidth != 1.0:
         return True
     for spec in getattr(args, "sweep", None) or []:
@@ -213,40 +214,15 @@ def _print_physics_header(knobs, jstats, rstats) -> None:
         print(f"WARNING: {w}", file=sys.stderr)
 
 
-def _physics_export_meta(profile_path, profile, jstats, rstats) -> Dict[str, Any]:
-    """Provenance dict for a physics-retimed quent export (export_quent.py:
-    engine custom_attributes + the model.qmi hwsim.physics block)."""
-    src = profile.source or {}
-    return {
-        "profile_path": os.path.abspath(profile_path),
-        "nsys_sqlite": src.get("nsys_sqlite"),
-        "created_utc": src.get("created_utc"),
-        "pct_span_matched": jstats.pct_span_matched,
-        "kernel_serial_frac": jstats.kernel_serial_frac,
-        "device_model_active": rstats.device_model_active,
-    }
-
-
-def _export_physics_session(model, g2, knobs, result, args, profile, jstats, rstats):
-    from ..export_quent import export_session
-
-    meta = _physics_export_meta(args.physics, profile, jstats, rstats)
-    path = export_session(
-        model, g2, knobs, result, args.export_quent, physics=meta
-    )
-    print(f"exported quent session (physics-retimed) -> {path}")
-    return path
-
-
 def cmd_simulate_physics(args) -> int:
     model = _load_model(args)
     graph = _select_graph(model, args)
-    knobs = parse_knob_args(args.knob or [])
+    from ..cli import _knobs_from_args
+
+    knobs = _knobs_from_args(args)
     profile = PhysicsProfile.load(args.physics)
     baseline, _jb, _rb = simulate_with_physics(model, graph, Knobs(), profile)
-    result, jstats, rstats, g2 = simulate_with_physics(
-        model, graph, knobs, profile, return_graph=True
-    )
+    result, jstats, rstats = simulate_with_physics(model, graph, knobs, profile)
     _print_physics_header(knobs, jstats, rstats)
 
     rep = _physics_report(graph, knobs, result, baseline, jstats, rstats, args.physics)
@@ -291,10 +267,6 @@ def cmd_simulate_physics(args) -> int:
     if args.json:
         write_json(rep, args.json)
         print(f"wrote {args.json}")
-    if getattr(args, "export_quent", None):
-        _export_physics_session(
-            model, g2, knobs, result, args, profile, jstats, rstats
-        )
     return 0
 
 
@@ -319,13 +291,13 @@ def cmd_sweep_physics(args) -> int:
     names = list(sweeps.keys())
     rows: List[Dict[str, Any]] = []
     warned = set()
+    from ..cli import _knobs_from_args
+
     for values in itertools.product(*(sweeps[n] for n in names)):
-        knobs = parse_knob_args(args.knob or [])
+        knobs = _knobs_from_args(args)
         for n, v in zip(names, values):
             setattr(knobs, n, v)
-        result, js, rs, g2 = simulate_with_physics(
-            model, graph, knobs, profile, return_graph=True
-        )
+        result, js, rs = simulate_with_physics(model, graph, knobs, profile)
         for w in physics_knob_warnings(knobs, js):
             if w not in warned:
                 warned.add(w)
@@ -354,10 +326,6 @@ def cmd_sweep_physics(args) -> int:
             }
         )
         rows.append(row)
-        if getattr(args, "export_quent", None):
-            _export_physics_session(
-                model, g2, knobs, result, args, profile, js, rs
-            )
 
     print(
         f"query {graph.info.label} (physics: {jstats.tasks_matched}/"

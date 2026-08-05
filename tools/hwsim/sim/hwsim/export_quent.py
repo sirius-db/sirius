@@ -44,10 +44,6 @@ from .model import QueryGraph, SessionModel
 
 ENGINE_NAME = "hwsim-sim"
 NIL_UUID = "00000000-0000-0000-0000-000000000000"
-# current_operator_id is u32 in the analyzer model (task.rs); pseudo-operators
-# the sim synthesizes (physics PHYS::PREP, op_id -1) export the u32::MAX
-# placeholder — real plan operator ids are small.
-NO_OPERATOR_ID = (1 << 32) - 1
 
 # Synthetic-timeline pads (ns). Static/session entities are declared inside
 # [t0 - _SETUP_PAD, t0); the query Init/Planning pair sits inside
@@ -160,20 +156,14 @@ def _resource_fsm(
 # ---------------------------------------------------------------------------
 
 
-def knob_suffix(knobs: Knobs, physics: bool = False) -> str:
-    """Encode the non-default knobs for the exported query label. A
-    physics-retimed run carries a trailing ``physics`` marker so a v0 and a
-    physics export of the same knob point are distinguishable in the UI."""
+def knob_suffix(knobs: Knobs) -> str:
+    """Encode the non-default knobs for the exported query label."""
     parts = []
     for f in dc_fields(knobs):
         v = getattr(knobs, f.name)
         if v is not None and v != 1.0:
             parts.append(f"{f.name}={v:g}")
-    if not parts:
-        parts = ["baseline"]
-    if physics:
-        parts.append("physics")
-    return ",".join(parts)
+    return ",".join(parts) if parts else "baseline"
 
 
 def _usage(resource_id: str, nbytes: Optional[int]) -> dict:
@@ -221,31 +211,17 @@ def export_session(
     result: SimResult,
     out_dir: str,
     seed: Optional[str] = None,
-    physics: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Write one Quent ndjson session for one simulated query.
 
     Returns the created session directory path
     (``<out_dir>/<session-uuid>/``). Raises FileExistsError if the
     deterministic session directory already exists.
-
-    ``physics`` (a provenance dict, see ``physics/cli.py``) marks a
-    physics-retimed run: ``graph`` must then be the RETIMED graph from
-    ``simulate_with_physics(..., return_graph=True)`` — its span durations are
-    already knob-scaled (the engine ran with neutralized GPU knobs), so
-    per-operator Computing boundaries are laid out with engine-neutral weights
-    instead of dividing by the v0 ``op_scale``. The engine Init grows
-    ``hwsim.physics=1`` plus profile-provenance attributes and the query label
-    carries a ``physics`` marker.
     """
-    label = f"{graph.info.label}@{knob_suffix(knobs, physics=physics is not None)}"
+    label = f"{graph.info.label}@{knob_suffix(knobs)}"
     if seed is None:
         seed = f"{model.session_uuid}|{label}"
     gen = _UuidGen(seed)
-    # Weight divisor for laying out per-op Computing boundaries: the physics
-    # path pre-scales span durations, and the engine keeps only the G1 io
-    # knob at the op level (integrate._engine_knobs).
-    layout_knobs = Knobs(io_bandwidth=knobs.io_bandwidth) if physics else knobs
 
     # ---- time anchors (absolute unix ns) ---------------------------------
     t0 = int(graph.info.t_executing or 0)
@@ -288,32 +264,6 @@ def export_session(
             attrs.append({"key": f"hwsim.knob.{f.name}", "value": {"F64": float(v)}})
     attrs.append({"key": "hwsim.spill_mode", "value": {"String": result.spill_mode}})
     attrs.append({"key": "hwsim.seed", "value": {"String": seed}})
-    if physics is not None:
-        # Physics-retimed run: mark it and carry the profile provenance so a
-        # consumer can tell which capture re-timed this prediction.
-        attrs.append({"key": "hwsim.physics", "value": {"I64": 1}})
-        for key, akey in (
-            ("profile_path", "hwsim.physics_profile"),
-            ("nsys_sqlite", "hwsim.physics_nsys_sqlite"),
-            ("created_utc", "hwsim.physics_profile_created_utc"),
-        ):
-            v = physics.get(key)
-            if v:
-                attrs.append({"key": akey, "value": {"String": str(v)}})
-        for key, akey in (
-            ("pct_span_matched", "hwsim.physics_pct_span_matched"),
-            ("kernel_serial_frac", "hwsim.physics_kernel_serial_frac"),
-        ):
-            v = physics.get(key)
-            if v is not None:
-                attrs.append({"key": akey, "value": {"F64": float(v)}})
-        if physics.get("device_model_active") is not None:
-            attrs.append(
-                {
-                    "key": "hwsim.physics_device_model",
-                    "value": {"I64": int(bool(physics["device_model_active"]))},
-                }
-            )
     w.emit(
         "engine",
         engine_id,
@@ -690,26 +640,6 @@ def export_session(
         for tid, k in binding.items():
             thread_of[tid] = pool[k % len(pool)]
 
-    # Dispatch-priority ranks: the engine dispatched released tasks by the
-    # source trace's queue-entry order (queue_order="traced"), which the
-    # simulated enqueue timestamps do NOT encode — export it explicitly so a
-    # re-simulation of this session reproduces the schedule instead of
-    # repacking it (measured +67% wall drift on q9 without this).
-    def _dispatch_prio(t: int) -> float:
-        # mirror engine._enqueue exactly (incl. re-exports of exports)
-        task = graph.tasks[t]
-        qp = getattr(task, "queue_prio", None)
-        if qp is not None:
-            return float(qp)
-        return float(task.t_queued if task.t_queued >= 0 else task.t_created)
-
-    qprio_rank: Dict[int, int] = {
-        tid: rank
-        for rank, tid in enumerate(
-            sorted(graph.tasks, key=lambda t: (_dispatch_prio(t), t))
-        )
-    }
-
     task_uuid_of: Dict[int, str] = {}
     for tid in sorted(graph.tasks):
         task = graph.tasks[tid]
@@ -735,9 +665,7 @@ def export_session(
             enq,
             {
                 "Routing": {
-                    # dispatch-order marker, parsed back by build.py (the
-                    # schema's instance_name is free-form)
-                    "instance_name": f"qprio={qprio_rank[tid]}",
+                    "instance_name": "",
                     "preferred_device_id": d,
                     "manager_thread": _usage(sched_thread_id, None),
                 }
@@ -792,9 +720,7 @@ def export_session(
         # fluid device stretched the phase).
         prep_end = rel(rec.prep_end)
         fin_ts = max(prep_end, rel(rec.finish) - int(task.tail_ns))
-        weights = [
-            dur / layout_knobs.op_scale(name) for (name, _oid, dur, _b) in task.ops
-        ]
+        weights = [dur / knobs.op_scale(name) for (name, _oid, dur, _b) in task.ops]
         total_w = sum(weights)
         cum = 0.0
         for (name, op_id, _dur, in_bytes), wgt in zip(task.ops, weights):
@@ -806,9 +732,7 @@ def export_session(
                 {
                     "Computing": {
                         "instance_name": name,
-                        "current_operator_id": (
-                            int(op_id) if op_id >= 0 else NO_OPERATOR_ID
-                        ),
+                        "current_operator_id": int(op_id),
                         "input_bytes": int(in_bytes),
                         "peak_allocated_bytes": 0,
                         "input_rows": 0,  # WS9 field; 0 = unknown (not tracked)
@@ -973,8 +897,6 @@ def export_session(
         "sim_wall_ns": wall,
         "seed": seed,
     }
-    if physics is not None:
-        qmi["hwsim"]["physics"] = dict(physics)
     with open(os.path.join(root, "model.qmi"), "w") as f:
         json.dump(qmi, f, indent=2)
     return root

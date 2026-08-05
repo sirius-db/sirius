@@ -120,14 +120,6 @@ class TaskSpec:
     grant_ns: int = 0  # Reserving -> Preparing (reservation-grant overhead)
     tail_ns: int = 0  # Finalizing -> Exit
 
-    # Explicit dispatch priority (hwsim-sim exports only: parsed from the
-    # Routing state's ``qprio=<rank>`` marker). A simulated schedule's enqueue
-    # timestamps do NOT encode the queue priority the engine dispatched by
-    # (the source trace's queue-entry order), so re-simulating an export by
-    # enqueue order can repack the schedule (+67% measured on q9); this field
-    # restores the exact order. None on real traces (t_queued order applies).
-    queue_prio: Optional[int] = None
-
     # Dependency structure (filled by build).
     deps: Set[int] = field(default_factory=set)
     creation_lag_ns: int = 0  # Created - max(dep exit), clamped >= 0

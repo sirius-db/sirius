@@ -58,13 +58,22 @@ def transfer_mult(direction: str, knobs: Knobs) -> float:
     """Multiplier for explicit-transfer (memcpy) time by direction (law 2).
 
     direction: "h2d" | "d2h" | "d2d".
+
+    Law 2 is a *Grace* platform law. Target mode (WS19) makes the selection
+    descriptor-driven via the dynamic ``knobs.grace_colimit`` attribute
+    (set by hwsim.target from the target descriptor's link.type): on a
+    non-C2C target (e.g. PCIe) the co-limit is OFF and the link multiplier
+    is ``c2c_bandwidth`` alone. Default (attribute absent) keeps the
+    measured GB300 behavior.
     """
     if direction == "d2d":
         # Device-to-device copies contend for HBM (CE path; the memcpy-flag
         # cap is part of the traced rate already).
         return resolved_gpu_mem_bandwidth(knobs)
-    # C2C link co-limited by host DRAM on Grace.
-    return min(knobs.c2c_bandwidth, knobs.cpu_mem_bandwidth)
+    if getattr(knobs, "grace_colimit", True):
+        # C2C link co-limited by host DRAM on Grace.
+        return min(knobs.c2c_bandwidth, knobs.cpu_mem_bandwidth)
+    return knobs.c2c_bandwidth
 
 
 def channel_transfer_mult(origin_tier: str, target_tier: str, knobs: Knobs) -> float:

@@ -57,6 +57,23 @@ Continuous multipliers, default 1.0 (= traced hardware); pass repeated
 
 Every degraded-fidelity knob prints a WARNING when moved off 1.0.
 
+## Target mode (spec-sheet, WS19)
+
+Instead of hand-computing knob ratios, name the machine to predict — the full
+vector is derived from advertised spec-sheet values via a measured derating
+table, with per-knob provenance/confidence and a [nominal, optimistic]
+prediction band:
+
+```bash
+pixi run python -m hwsim simulate $TRACE --query-label tpch_q09_iter2 \
+    --physics physics.json \
+    --target ../hw-descriptors/rtx-pro-6000-blackwell.yaml \
+    --source ../hw-descriptors/gb300.yaml   # only needed for pre-WS9 traces
+```
+
+Descriptors live in `../hw-descriptors/`; schema, derating anchors and limits:
+[`../docs/spec-sheet-mode.md`](../docs/spec-sheet-mode.md).
+
 ## Output
 
 `simulate` prints a human-readable report (wall time vs traced and vs the
