@@ -53,13 +53,9 @@ src/**/telemetry/                   @sirius-db/sirius-telemetry-codeowners
 # ── Ops  ──────────────────────────────────────────────────────────────────────
 /.github                            @sirius-db/sirius-ops-codeowners
 
-# ── Testing & Benchmarks & Skills ─────────────────────────────────────────────
-**/CLAUDE.md                        @sirius-db/sirius-testing-codeowners
-/setup_test_datasets.sh             @sirius-db/sirius-testing-codeowners
-/.claude/                           @sirius-db/sirius-testing-codeowners
-/test/                              @sirius-db/sirius-testing-codeowners
-/test_datasets/                     @sirius-db/sirius-testing-codeowners
-/utils/                             @sirius-db/sirius-testing-codeowners
+# ── Documentation──────────────────────────────────────────────────────────────
+**/CLAUDE.md                        @sirius-db/sirius-docs-codeowners
+**/*.md                             @sirius-db/sirius-docs-codeowners
 
 # ── Language overlays (last-match-wins — these take precedence) ───────────────
 **/*.rs                             @sirius-db/sirius-rust-codeowners
