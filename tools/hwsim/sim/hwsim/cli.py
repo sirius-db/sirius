@@ -122,6 +122,11 @@ def cmd_simulate(args) -> int:
     if args.json:
         write_json(rep, args.json)
         print(f"wrote {args.json}")
+    if getattr(args, "export_quent", None):
+        from .export_quent import export_session
+
+        path = export_session(model, graph, knobs, result, args.export_quent)
+        print(f"exported quent session -> {path}")
     return 0
 
 
@@ -204,6 +209,7 @@ def cmd_sweep(args) -> int:
     names = list(sweeps.keys())
     rows: List[Dict[str, Any]] = []
     warned = set()
+    exported: List[str] = []
     for values in itertools.product(*(sweeps[n] for n in names)):
         knobs = parse_knob_args(args.knob or [])
         for n, v in zip(names, values):
@@ -248,6 +254,12 @@ def cmd_sweep(args) -> int:
             }
         )
         rows.append(row)
+        if getattr(args, "export_quent", None):
+            from .export_quent import export_session
+
+            exported.append(
+                export_session(model, graph, knobs, result, args.export_quent)
+            )
 
     print(
         f"query {graph.info.label}: traced "
@@ -270,6 +282,8 @@ def cmd_sweep(args) -> int:
         "spin_s",
     ]
     print(_table(headers, [[str(r[h]) for h in headers] for r in rows]))
+    for p in exported:
+        print(f"exported quent session -> {p}")
     if args.csv:
         write_sweep_csv(rows, args.csv)
         print(f"wrote {args.csv}")
@@ -319,6 +333,12 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--query-index", type=int)
     sp.add_argument("--knob", action="append", metavar="NAME=VALUE")
     sp.add_argument("--json", help="write full report JSON here")
+    sp.add_argument(
+        "--export-quent",
+        metavar="OUTDIR",
+        help="export the simulated execution as a Quent ndjson session under "
+        "OUTDIR (docs/quent-export.md; ignored with --physics)",
+    )
     sp.set_defaults(fn=cmd_simulate)
 
     sp = sub.add_parser(
@@ -345,6 +365,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="knob to sweep (repeat for a cartesian product)",
     )
     sp.add_argument("--csv", help="write sweep table CSV here")
+    sp.add_argument(
+        "--export-quent",
+        metavar="OUTDIR",
+        help="export one Quent ndjson session per sweep point under OUTDIR "
+        "(docs/quent-export.md; ignored with --physics)",
+    )
     sp.set_defaults(fn=cmd_sweep)
 
     # nsys physics join (WS10): registers `ingest-nsys` and adds `--physics`
