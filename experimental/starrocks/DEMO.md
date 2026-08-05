@@ -104,6 +104,55 @@ SELECT l_returnflag, count(*) AS n, sum(l_quantity) AS qty
 FROM lineitem GROUP BY l_returnflag ORDER BY l_returnflag;
 ```
 
+## Two compute nodes, one GPU: the exchange hop over nixl
+
+`pixi run cluster2` starts the FE plus TWO CN processes on one host, each with an 8 GiB engine
+carve-out (`--gpu-memory-limit 8GiB`) and a 512 MiB `cudaMalloc` exchange staging arena
+(`SIRIUS_EXCHANGE_STAGING_BYTES`; the arena sits *outside* the engine limit). When a sender's
+destination lives in the other process, its parked output is packed with `cudf::chunked_pack`
+into a staging lease and moved **GPU-to-GPU through nixl over UCX `cuda_ipc`** — no Arrow, no
+host serialization of data; only control frames (agent metadata, lease grants, per-batch
+signaling, EOS) cross on brpc.
+
+The deterministic cross-node shape needs the scan split across both CNs, which
+`lineitem_multi/` provides: two **byte-identical** parquet files, so the FE's min-load selector
+places one whole file per CN and can never byte-split them.
+
+```sql
+SET new_planner_agg_stage = 1;
+WITH lineitem AS (SELECT * FROM FILES(
+  "path"="file:///home/ubuntu/git/sirius/scratch/tpch_sf1/lineitem_multi/*.parquet",
+  "format"="parquet"))
+SELECT sum(l_extendedprice * l_discount) AS revenue
+FROM lineitem
+WHERE l_shipdate >= date '1997-01-01' AND l_shipdate < date '1998-01-01'
+  AND l_discount BETWEEN 0.03 - 0.01 AND 0.03 + 0.01 AND l_quantity < 24;
+```
+
+returns `61567694.95020001` — the exact decimal is `61567694.9502`; the last-ulp difference vs
+the single-node `61567694.95019999` is double-precision summation order across the distributed
+scan. Read the logs, not just the answer:
+
+```
+nixl bandwidth canary peer=127.0.0.1:8060 gbps="67.3" bytes=16777216          <- first contact
+transmitted batches via nixl stream_id=2 sender_id=1 dest=127.0.0.1:8060 batches=1 bytes=457856
+relayed native batches across a fragment boundary stream_id=2 sender_id=0 batches=1
+received remote batches stream_id=2 sender_id=1 batches=1
+```
+
+The receiver aggregates a **cross-node fan-in**: sender 0 relayed in-process, sender 1 arrived
+over nixl. `batches=0` anywhere would mean the boundary carried nothing. The canary is the guard
+against the one failure nothing else reports: `cudaMallocAsync` pool memory over `cuda_ipc`
+does not error — it silently degrades ~220× — so a first-contact transfer below 2 GB/s refuses
+the tier loudly. (`nvidia-smi`: two CNs at ~8.9 GiB each — pool + arena + context — on the
+23 GiB L4.)
+
+**What this topology cannot run:** any plan whose sender has more than one destination — on two
+CNs that includes `GROUP BY` even at `agg_stage=1` (the aggregate gets an instance per CN, i.e.
+a hash shuffle). It fails loudly: `a data stream sink with 2 destinations needs partitioned
+streaming`. The two-CN surface today is Q6-class scalar aggregation; partitioned output is the
+recorded next step.
+
 ## The pre-packaged front end
 
 `cluster` depends on `fe-check`, not `fe-build`: this demo ships the front end already packaged
