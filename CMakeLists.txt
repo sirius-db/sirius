@@ -469,6 +469,9 @@ build_loadable_extension(sirius CPP ${EXTENSION_SOURCES} ${CUDA_SOURCES})
 set_target_properties(sirius_loadable_extension PROPERTIES LINKER_TYPE BFD)
 
 # Shared configuration for both extension targets
+set(SIRIUS_CLANG_CXX_WARNING_OPTIONS -Wunreachable-code -Wimplicit-fallthrough
+                                     -Wrange-loop-analysis -Wnull-dereference)
+
 foreach(_target sirius_extension sirius_loadable_extension)
   set_target_properties(
     ${_target}
@@ -483,8 +486,10 @@ foreach(_target sirius_extension sirius_loadable_extension)
   # consumers (tests/benchmarks) with --expt-extended-lambda.
   target_compile_options(
     ${_target}
-    PRIVATE $<$<COMPILE_LANG_AND_ID:CUDA,NVIDIA>:--expt-extended-lambda>
-            $<$<COMPILE_LANG_AND_ID:CXX,Clang,AppleClang>:-Wunreachable-code>)
+    PRIVATE
+      $<$<COMPILE_LANG_AND_ID:CUDA,NVIDIA>:--expt-extended-lambda>
+      "$<$<COMPILE_LANG_AND_ID:CXX,Clang,AppleClang>:${SIRIUS_CLANG_CXX_WARNING_OPTIONS}>"
+  )
 
   if(VCPKG_BUILD)
     set_target_properties(${_target} PROPERTIES CUDA_RUNTIME_LIBRARY Static)
