@@ -45,7 +45,9 @@ load_balancing_scan_batch_coalescer::register_pipeline(op::scan::sirius_gpu_scan
 }
 
 void load_balancing_scan_batch_coalescer::use_cached_entries_for_pipeline(
-  op::scan::sirius_gpu_scan_operator* scan_op, std::unique_ptr<databatch_provider> provider)
+  op::scan::sirius_gpu_scan_operator* scan_op,
+  std::unique_ptr<databatch_provider> provider,
+  bool serve_side_filtering_enabled)
 {
   if (!scan_op) return;
   auto uid = scan_op->get_operator_id();
@@ -56,6 +58,9 @@ void load_balancing_scan_batch_coalescer::use_cached_entries_for_pipeline(
   // op's row filter (when present) runs against every drained split — record
   // that so each split's working-set estimate covers the filter-by-copy peak.
   state.row_filter_pending = scan_op->get_ingestible().has_row_filter();
+  if (serve_side_filtering_enabled) {
+    state.serve_filter_channel = scan_op->get_ingestible().table_info().dynamic_filters();
+  }
   state.attach_batch_provider(std::move(provider));
 }
 
@@ -165,13 +170,19 @@ void load_balancing_scan_batch_coalescer::process_provider_inputs(metadata_proce
 void load_balancing_scan_batch_coalescer::process_cached_entries(metadata_processing_state& state,
                                                                  std::stop_token const& stop)
 {
-  drain_cached_provider(*state.batch_provider, *state.connector, stop, state.row_filter_pending);
+  drain_cached_provider(*state.batch_provider,
+                        *state.connector,
+                        stop,
+                        state.row_filter_pending,
+                        state.serve_filter_channel);
 }
 
-void load_balancing_scan_batch_coalescer::drain_cached_provider(databatch_provider& provider,
-                                                                split_connector& connector,
-                                                                std::stop_token const& stop,
-                                                                bool row_filter_pending)
+void load_balancing_scan_batch_coalescer::drain_cached_provider(
+  databatch_provider& provider,
+  split_connector& connector,
+  std::stop_token const& stop,
+  bool row_filter_pending,
+  std::shared_ptr<op::sirius_dynamic_filter_set> serve_filter_channel)
 {
   try {
     while (!stop.stop_requested()) {
@@ -182,6 +193,7 @@ void load_balancing_scan_batch_coalescer::drain_cached_provider(databatch_provid
         split->needs_carrier_conversion     = next.needs_carrier_conversion;
         split->conversion_destination_bytes = next.conversion_destination_bytes;
         split->row_filter_pending           = row_filter_pending;
+        split->serve_filters                = serve_filter_channel;
         connector.push_split(std::move(split));
         continue;
       }

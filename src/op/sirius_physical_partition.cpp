@@ -193,7 +193,7 @@ std::unique_ptr<operator_data> sirius_physical_partition::execute(const operator
 
   std::vector<std::shared_ptr<cucascade::data_batch>> partitioned_results;
   switch (_partition_type) {
-    case PartitionType::HASH:
+    case PartitionType::HASH: {
       // Narrow-passthrough observability: count input columns whose actual carrier is narrower
       // than the native mapping of this operator's logical schema. The counter reads actual batch
       // types, so a regression anywhere in the narrow-carrier chain drops it to zero.
@@ -213,14 +213,44 @@ std::unique_ptr<operator_data> sirius_physical_partition::execute(const operator
             ->record_compressed_materialization_partition_narrow_columns(narrow_columns);
         }
       }
-      partitioned_results = gpu_partition_impl::hash_partition(input_batch_ro,
-                                                               _partition_keys,
-                                                               _partition_key_cast_types,
-                                                               _num_partitions.value(),
+      // Multi-batch dynamic-filter accumulation: feed this build batch's keys to the join before
+      // scattering. The batch is this task's input (GPU-resident, stream-ordered), so no extra
+      // claim or event wait is needed here; cross-stream ordering to the publication point is the
+      // accumulator's job.
+      if (_is_build && _accumulate_dynamic_filters.load(std::memory_order_acquire)) {
+        if (auto* hash_join = dynamic_cast<sirius_physical_hash_join*>(_downstream_consumer_op)) {
+          hash_join->accumulate_dynamic_filters(get_cudf_table_view(input_batch_ro), stream);
+        }
+      }
+      // Probe-side checkpoint: drop rows the join's published filters prove unmatchable before
+      // paying to scatter them. `prefiltered` must outlive the hash_partition call — the scatter
+      // reads it on `stream`, and its buffers free stream-ordered on the same stream.
+      std::unique_ptr<cudf::table> prefiltered;
+      if (!_is_build) {
+        if (auto* hash_join = dynamic_cast<sirius_physical_hash_join*>(_downstream_consumer_op)) {
+          prefiltered = hash_join->apply_probe_dynamic_filters(get_cudf_table_view(input_batch_ro),
+                                                               space->get_device_id(),
                                                                stream,
-                                                               *space,
-                                                               batch_telemetry());
+                                                               space->get_default_allocator());
+        }
+      }
+      partitioned_results = prefiltered
+                              ? gpu_partition_impl::hash_partition(prefiltered->view(),
+                                                                   _partition_keys,
+                                                                   _partition_key_cast_types,
+                                                                   _num_partitions.value(),
+                                                                   stream,
+                                                                   *space,
+                                                                   batch_telemetry())
+                              : gpu_partition_impl::hash_partition(input_batch_ro,
+                                                                   _partition_keys,
+                                                                   _partition_key_cast_types,
+                                                                   _num_partitions.value(),
+                                                                   stream,
+                                                                   *space,
+                                                                   batch_telemetry());
       break;
+    }
     case PartitionType::RANGE:
       throw std::runtime_error("Range partitioning is not implemented yet");
     case PartitionType::EVENLY:
@@ -313,6 +343,43 @@ uint64_t sirius_physical_partition::compute_total_bytes()
     }
   }
   return total_bytes;
+}
+
+sirius_physical_partition::input_totals sirius_physical_partition::compute_input_totals()
+{
+  if (ports.find("default") == ports.end()) {
+    throw std::runtime_error(
+      "sirius_physical_partition::compute_input_totals() did not find default repo for id " +
+      std::to_string(this->get_operator_id()));
+  }
+  auto& repo     = ports.at("default")->repo;
+  auto batch_ids = repo->get_batch_ids(0);
+
+  input_totals totals;
+  totals.num_batches   = batch_ids.size();
+  std::size_t gpu_rows = 0, gpu_bytes = 0, other_bytes = 0;
+  for (auto batch_id : batch_ids) {
+    auto batch = repo->get_data_batch_by_id(batch_id, 0);
+    if (!batch) { continue; }
+    auto ro = batch->to_read_only();
+    if (!ro.get_data()) { continue; }
+    if (ro.get_current_tier() == cucascade::memory::Tier::GPU) {
+      gpu_rows += static_cast<std::size_t>(sirius::get_cudf_table_view(ro).num_rows());
+      gpu_bytes += ro.get_data()->get_size_in_bytes();
+    } else {
+      other_bytes += ro.get_data()->get_size_in_bytes();
+    }
+  }
+  totals.rows = gpu_rows;
+  if (other_bytes > 0) {
+    // Extrapolate non-GPU-resident batches from the observed GPU bytes-per-row; with no GPU batch
+    // at all, assume 8-byte rows (an overestimate for real schemas, which for the Bloom capacity
+    // this feeds only widens the filter).
+    auto const bytes_per_row =
+      gpu_rows > 0 ? std::max<std::size_t>(gpu_bytes / gpu_rows, 1) : std::size_t{8};
+    totals.rows += other_bytes / bytes_per_row;
+  }
+  return totals;
 }
 
 void sirius_physical_partition::set_num_partitions(int num_partitions)
@@ -454,6 +521,18 @@ std::unique_ptr<operator_data> sirius_physical_partition::get_next_task_input_da
         build_arrives_whole      = found_this || found_sibling;
       }
       if (hash_join != nullptr) { hash_join->set_build_arrives_whole(build_arrives_whole); }
+      if (!build_arrives_whole && in.is_build_side && strategy.num_partitions > 1 &&
+          !strategy.broadcast && hash_join != nullptr && hash_join->publishes_dynamic_filters()) {
+        // The build will never arrive as one batch, so the one-shot publisher can never claim it.
+        // Arm incremental accumulation instead: the FULL input barrier guarantees the whole build
+        // is resident right now, so the expected batch count is final and the row total is
+        // exact/cheap. Every build partition task then feeds its batch to the join before
+        // scattering (see execute()).
+        auto const totals = sizing_partition.compute_input_totals();
+        if (hash_join->arm_dynamic_filter_accumulator(totals.rows, totals.num_batches)) {
+          sizing_partition._accumulate_dynamic_filters.store(true, std::memory_order_release);
+        }
+      }
       _broadcast              = strategy.broadcast;
       sibling._broadcast      = strategy.broadcast;
       _num_partitions         = strategy.num_partitions;

@@ -17,6 +17,8 @@
 // sirius
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <data/sirius_converter_registry.hpp>
+#include <log/logging.hpp>
+#include <op/scan/pinned_serve_filter.hpp>
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
 
 #include <algorithm>
@@ -47,10 +49,29 @@ void scan_operator_input::prepare_for_processing(
                      (ro.get_current_tier() != ::cucascade::memory::Tier::GPU || !is_gpu_table);
     }
     if (needs_upload) {
-      auto& registry = ::sirius::converter_registry::get();
-      auto mut       = batch->to_mutable();
-      mut.convert_to<::cucascade::gpu_table_representation>(
-        registry, requested_memory_space, stream);
+      // Serve-side pre-transfer filtering: probe the scan's published membership filter against
+      // the key column and move only surviving rows across the link. Narrowed pinned carriers are
+      // fine — the gather copies raw carrier bytes and scan normalization widens them after, on
+      // fewer rows; filter target columns are kept native by the planner. Falls through to the
+      // bulk conversion whenever the fast path does not apply (see try_serve_filtered_upload).
+      bool served_filtered = false;
+      if (serve_filters && !mvcc_keep_mask.has_mask()) {
+        served_filtered =
+          scan::try_serve_filtered_upload(*batch, *serve_filters, requested_memory_space, stream)
+            .applied;
+      } else if (serve_filters) {
+        SIRIUS_LOG_DEBUG("[pinned_serve_filter] upload not eligible: split carries an MVCC mask.");
+      }
+      if (!served_filtered) {
+        auto& registry = ::sirius::converter_registry::get();
+        auto mut       = batch->to_mutable();
+        mut.convert_to<::cucascade::gpu_table_representation>(
+          registry, requested_memory_space, stream);
+      }
+    } else if (serve_filters) {
+      // The split reached the GPU without an upload step (already-resident representation);
+      // serve-side filtering has nothing to intercept.
+      SIRIUS_LOG_DEBUG("[pinned_serve_filter] split already GPU-resident; nothing to intercept.");
     }
   }
 

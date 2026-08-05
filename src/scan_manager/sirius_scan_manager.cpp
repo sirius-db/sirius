@@ -517,9 +517,11 @@ parquet_bind_result sirius_scan_manager::describe_parquet(std::string const& uri
 }
 
 void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
-                                            bool enable_pinned_zone_map_pruning)
+                                            bool enable_pinned_zone_map_pruning,
+                                            bool enable_serve_side_dynamic_filtering)
 {
-  _pruning_enabled = enable_pinned_zone_map_pruning;
+  _pruning_enabled         = enable_pinned_zone_map_pruning;
+  _serve_filtering_enabled = enable_serve_side_dynamic_filtering;
   reset();
 
   if (_io_ctx && _io_ctx->cache()) {
@@ -675,7 +677,8 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
                                                    std::move(delta_splits),
                                                    assignment.op->normalization_targets(),
                                                    assignment.op->has_physical_overrides());
-    _metadata_processor->use_cached_entries_for_pipeline(assignment.op, std::move(provider));
+    _metadata_processor->use_cached_entries_for_pipeline(
+      assignment.op, std::move(provider), _serve_filtering_enabled);
   }
   _pending_mvcc_mask_jobs.clear();
   _pending_insert_delta_jobs.clear();

@@ -120,6 +120,28 @@ struct operator_params {
   /// drop non-matching rows before the join. On by default; the master switch for the feature.
   bool enable_dynamic_filter_pushdown = true;
 
+  /// Extend dynamic-filter publication to multi-partition (non-broadcast) builds: the build-side
+  /// PARTITION accumulates every build batch's keys into a Bloom filter sized from the resident
+  /// input totals and publishes once the final batch is inserted. Requires
+  /// enable_dynamic_filter_pushdown; single-GPU plans only (multi-GPU arms nothing). Without it,
+  /// a build that needs more than one partition silently publishes no filter at all.
+  bool enable_dynamic_filter_multi_batch = true;
+
+  /// Serve-side pre-transfer dynamic filtering of host-pinned cached scans: at upload time, move
+  /// only the filter's key column to the GPU, probe the published membership filter there, and
+  /// gather only surviving rows of the remaining columns straight out of the mapped pinned host
+  /// blocks — instead of bulk-copying the whole split and dropping rows post-decode. Falls back to
+  /// the bulk upload per split whenever inapplicable (strings/nulls in the split, no published
+  /// filter yet, keep ratio above the serve threshold). Requires enable_dynamic_filter_pushdown.
+  bool enable_dynamic_filter_pinned_serve = true;
+
+  /// Re-apply this join's published membership filters to probe batches at the probe-side
+  /// PARTITION, before the scatter. A second checkpoint behind the probe scan's: it catches probe
+  /// rows that were scanned before publication (the scan checkpoint is opportunistic). Only fires
+  /// for join types whose unmatched probe rows produce no output (INNER/SEMI/right-family) and only
+  /// when filters were published multi-batch. Requires enable_dynamic_filter_multi_batch.
+  bool enable_dynamic_filter_probe_partition = true;
+
   /// Additionally emit a runtime zone-map (build-key [min,max]) alongside the membership filter,
   /// for READ-time row-group pruning on parquet scans; duckdb-native scans apply it row-wise
   /// post-decode instead. Off by default and requires enable_dynamic_filter_pushdown: on

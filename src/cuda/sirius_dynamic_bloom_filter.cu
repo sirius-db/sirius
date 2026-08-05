@@ -180,6 +180,20 @@ std::unique_ptr<bloom_replica> build_bloom_replica(int device_id,
   return std::make_unique<bloom_replica>(
     device_id, build_bloom<standard_bloom<KeyT>>(keys, num_blocks, mr, stream));
 }
+
+template <class KeyT>
+std::unique_ptr<bloom_replica> make_empty_bloom_replica(int device_id,
+                                                        std::size_t num_blocks,
+                                                        rmm::device_async_resource_ref mr,
+                                                        cuda::stream_ref stream)
+{
+  if (num_blocks <= arrow_policy<KeyT>::max_filter_blocks) {
+    return std::make_unique<bloom_replica>(device_id,
+                                           make_bloom<arrow_bloom<KeyT>>(num_blocks, mr, stream));
+  }
+  return std::make_unique<bloom_replica>(device_id,
+                                         make_bloom<standard_bloom<KeyT>>(num_blocks, mr, stream));
+}
 }  // namespace
 
 // Owns the complete set of ready device-local Bloom replicas.
@@ -237,6 +251,65 @@ sirius_dynamic_bloom_filter::sirius_dynamic_bloom_filter(cudf::column_view const
         "[sirius_dynamic_bloom_filter] supported key type changed during construction.");
   }
   _impl->replicas.push_back(std::move(source));
+}
+
+sirius_dynamic_bloom_filter::sirius_dynamic_bloom_filter(cudf::data_type key_type,
+                                                         std::size_t estimated_num_keys,
+                                                         rmm::cuda_stream_view stream,
+                                                         rmm::device_async_resource_ref mr)
+{
+  if (!supports(key_type)) {
+    throw std::invalid_argument(
+      "[sirius_dynamic_bloom_filter] unsupported key type (INT32 or INT64).");
+  }
+  cuda::stream_ref const s{stream.value()};
+  auto const num_blocks = blocks_for(estimated_num_keys);
+  _impl                 = std::make_unique<impl>();
+  if (cudaGetDevice(&_impl->source_device) != cudaSuccess) {
+    throw std::runtime_error("[sirius_dynamic_bloom_filter] failed to identify source device.");
+  }
+
+  std::unique_ptr<bloom_replica> source;
+  switch (key_type.id()) {
+    case cudf::type_id::INT32:
+      source = make_empty_bloom_replica<std::int32_t>(_impl->source_device, num_blocks, mr, s);
+      break;
+    case cudf::type_id::INT64:
+      source = make_empty_bloom_replica<std::int64_t>(_impl->source_device, num_blocks, mr, s);
+      break;
+    default:
+      throw std::logic_error(
+        "[sirius_dynamic_bloom_filter] supported key type changed during construction.");
+  }
+  _impl->replicas.push_back(std::move(source));
+}
+
+void sirius_dynamic_bloom_filter::add_keys(cudf::column_view const& keys,
+                                           rmm::cuda_stream_view stream)
+{
+  if (!_impl || _impl->replicas.empty()) {
+    throw std::logic_error("[sirius_dynamic_bloom_filter] add_keys on an uninitialized filter.");
+  }
+  auto* const source = _impl->find(_impl->source_device);
+  if (source == nullptr || !source->has_bloom()) {
+    throw std::logic_error("[sirius_dynamic_bloom_filter] add_keys found no source replica.");
+  }
+  if (keys.size() == 0) { return; }
+
+  rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{_impl->source_device}};
+  cuda::stream_ref const s{stream.value()};
+  std::visit(
+    [&](auto const& bloom) {
+      using owner_type = std::decay_t<decltype(bloom)>;
+      using key_type   = typename owner_type::element_type::key_type;
+      if (keys.type().id() != key_type_id<key_type>()) {
+        throw std::invalid_argument(
+          "[sirius_dynamic_bloom_filter] add_keys key type does not match construction type.");
+      }
+      auto const* d = keys.data<key_type>();
+      bloom->add_async(d, d + keys.size(), s);
+    },
+    source->bloom);
 }
 
 sirius_dynamic_bloom_filter::~sirius_dynamic_bloom_filter() = default;

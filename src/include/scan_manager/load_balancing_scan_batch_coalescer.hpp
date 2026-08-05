@@ -34,6 +34,10 @@
 #include <memory>
 #include <stop_token>
 
+namespace sirius::op {
+class sirius_dynamic_filter_set;
+}  // namespace sirius::op
+
 namespace sirius::scan_manager {
 
 struct databatch_provider {
@@ -125,6 +129,9 @@ class load_balancing_scan_batch_coalescer {
     /// batches; stamped onto each drained split so its working-set estimate
     /// covers the filter-by-copy peak.
     bool row_filter_pending{false};
+    /// The op's dynamic-filter channel when serve-side pre-transfer filtering is enabled (null
+    /// otherwise); stamped onto each drained split for the upload-time checkpoint.
+    std::shared_ptr<op::sirius_dynamic_filter_set> serve_filter_channel;
   };
 
   load_balancing_scan_batch_coalescer()                                           = default;
@@ -140,7 +147,8 @@ class load_balancing_scan_batch_coalescer {
                                                std::shared_ptr<balancing_strategy> balancer);
 
   void use_cached_entries_for_pipeline(op::scan::sirius_gpu_scan_operator* scan_op,
-                                       std::unique_ptr<databatch_provider> provider);
+                                       std::unique_ptr<databatch_provider> provider,
+                                       bool serve_side_filtering_enabled = false);
 
   std::function<void(exec::try_t<std::unique_ptr<op::scan::scan_info>>&&)>
   get_split_provider_bridge(op::scan::sirius_gpu_scan_operator* scan_op);
@@ -154,10 +162,12 @@ class load_balancing_scan_batch_coalescer {
   /// an unclosed connector is a silent query hang). Static and public so the
   /// drain behavior is unit-testable against a fake provider; production use
   /// is the sequencer's cached-slot path.
-  static void drain_cached_provider(databatch_provider& provider,
-                                    split_connector& connector,
-                                    std::stop_token const& stop,
-                                    bool row_filter_pending);
+  static void drain_cached_provider(
+    databatch_provider& provider,
+    split_connector& connector,
+    std::stop_token const& stop,
+    bool row_filter_pending,
+    std::shared_ptr<op::sirius_dynamic_filter_set> serve_filter_channel = nullptr);
 
   /// Spawn the sequencer task on @p dispatcher.  The dispatcher must
   /// expose @c enqueue(callable) and inject a @c std::stop_token when

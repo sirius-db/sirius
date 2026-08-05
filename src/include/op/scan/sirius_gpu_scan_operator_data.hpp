@@ -33,6 +33,10 @@
 #include <memory>
 #include <variant>
 
+namespace sirius::op {
+class sirius_dynamic_filter_set;
+}  // namespace sirius::op
+
 namespace sirius::op::scan {
 
 //===----------------------------------------------------------------------===//
@@ -154,6 +158,11 @@ class scan_operator_input : public op::operator_data {
   /// which owns the definition. Zero means unknown; the scan memory estimate then keeps its
   /// conservative maximum-expansion bound.
   std::size_t conversion_destination_bytes{0};
+  /// The scan's dynamic-filter channel, stamped by drain_cached_provider when serve-side
+  /// pre-transfer filtering is enabled (null otherwise). prepare_for_processing snapshots it at
+  /// upload time — after publication in the common schedule — and attempts a filtered upload
+  /// before falling back to the bulk host→GPU conversion.
+  std::shared_ptr<sirius::op::sirius_dynamic_filter_set> serve_filters;
 };
 
 }  // namespace sirius::op::scan

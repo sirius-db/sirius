@@ -67,6 +67,18 @@ class gpu_partition_impl {
     cucascade::memory::memory_space& memory_space,
     const telemetry::batch_telemetry_info& telemetry_info = {});
 
+  /// Overload over a raw table view, for callers that pre-transformed the batch (e.g. the
+  /// probe-side dynamic-filter checkpoint) — the view's backing memory must be stream-ordered
+  /// valid on @p stream in @p memory_space.
+  static std::vector<std::shared_ptr<cucascade::data_batch>> hash_partition(
+    const cudf::table_view& input_table,
+    const std::vector<int>& partition_key_idx,
+    const std::vector<cudf::data_type>& partition_key_cast_types,
+    int num_partitions,
+    rmm::cuda_stream_view stream,
+    cucascade::memory::memory_space& memory_space,
+    const telemetry::batch_telemetry_info& telemetry_info = {});
+
   /// Overload without cast types (all keys hashed as-is). Kept for backward compatibility.
   static std::vector<std::shared_ptr<cucascade::data_batch>> hash_partition(
     const cucascade::read_only_data_batch& input,

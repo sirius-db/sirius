@@ -307,6 +307,7 @@ set(EXTENSION_SOURCES
     src/op/scan/duckdb_native_metadata.cpp
     src/op/scan/duckdb_native_decoder.cpp
     src/op/scan/dynamic_filter_merge.cpp
+    src/op/scan/pinned_serve_filter.cpp
     src/op/scan/sirius_physical_dynamic_filter.cpp
     src/op/scan/host_keep_mask.cpp
     src/op/scan/owning_table_view.cpp
@@ -416,6 +417,7 @@ set(CUDA_SOURCES
     src/cuda/sirius_dynamic_bloom_filter.cu
     src/cuda/sirius_dynamic_in_list_filter.cu
     src/cuda/sirius_dynamic_small_in_list_filter.cu
+    src/cuda/scan/pinned_block_gather.cu
     src/cuda/scan/gpu_decode_alp.cu
     src/cuda/scan/gpu_decode_bitpacking.cu
     src/cuda/scan/gpu_decode_rle.cu

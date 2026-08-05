@@ -56,7 +56,9 @@ class dynamic_filter_publish_plan final {
     bool emit_zone_map_filters,
     std::vector<std::size_t> build_key_domain_cardinalities,
     std::vector<dynamic_filter_replica_space> replica_spaces,
-    double domain_coverage_threshold = k_default_domain_coverage_threshold);
+    double domain_coverage_threshold = k_default_domain_coverage_threshold,
+    bool multi_batch_enabled         = true,
+    bool probe_partition_enabled     = true);
 
   [[nodiscard]] bool enabled() const noexcept { return !_probe_targets.empty(); }
   [[nodiscard]] std::vector<probe_target> const& probe_targets() const noexcept
@@ -78,10 +80,18 @@ class dynamic_filter_publish_plan final {
   {
     return _domain_coverage_threshold;
   }
+  /// Whether a multi-partition (non-broadcast) build may publish via incremental accumulation at
+  /// the build-side PARTITION instead of the one-shot folded-batch path.
+  [[nodiscard]] bool multi_batch_enabled() const noexcept { return _multi_batch_enabled; }
+  /// Whether the probe-side PARTITION may re-apply this join's published filters to probe batches
+  /// before scattering (a second checkpoint behind the opportunistic scan checkpoint).
+  [[nodiscard]] bool probe_partition_enabled() const noexcept { return _probe_partition_enabled; }
 
  private:
   std::vector<probe_target> _probe_targets;
-  bool _emit_zone_map_filters = false;
+  bool _emit_zone_map_filters   = false;
+  bool _multi_batch_enabled     = true;
+  bool _probe_partition_enabled = true;
   std::vector<std::size_t> _build_key_domain_cardinalities;
   double _domain_coverage_threshold = k_default_domain_coverage_threshold;
   /// Non-owning GPU/HOST placements. See @ref dynamic_filter_replica_space for the lifetime

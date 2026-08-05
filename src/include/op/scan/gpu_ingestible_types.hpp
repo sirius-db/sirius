@@ -25,6 +25,10 @@
 
 #pragma once
 
+namespace sirius::op {
+class sirius_dynamic_filter_set;
+}  // namespace sirius::op
+
 namespace sirius::op::scan {
 
 //===----------------------------------------------------------------------===//
@@ -46,6 +50,14 @@ class ingestible_table_info {
   ingestible_table_info& operator=(ingestible_table_info const&) = delete;
 
   [[nodiscard]] virtual std::span<std::string const> column_names() const = 0;
+
+  /// The scan's wired dynamic-filter channel, or null when none. Exposed on the base so
+  /// format-agnostic serve paths (the pinned-cache pre-transfer filter) can reach it.
+  [[nodiscard]] virtual std::shared_ptr<sirius::op::sirius_dynamic_filter_set> dynamic_filters()
+    const
+  {
+    return nullptr;
+  }
 
   /**
    * @brief Resolved file paths captured at bind time.
