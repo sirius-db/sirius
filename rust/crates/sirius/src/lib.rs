@@ -114,6 +114,33 @@ impl SiriusContext {
         // Drain fully while `self` is alive (conversion dereferences the context).
         collect_arrow_stream(stream)
     }
+
+    /// Lease `len` bytes of the exchange staging arena, returning the lease's byte offset from
+    /// [`staging_base`](Self::staging_base).
+    ///
+    /// The arena exists only when `SIRIUS_EXCHANGE_STAGING_BYTES` was set at context bring-up;
+    /// without one, every staging call is an error rather than a silent slow path. Exhaustion is
+    /// an error naming the requested/free/capacity byte counts.
+    pub fn staging_lease(&self, len: u64) -> Result<u64, Exception> {
+        self.inner.borrow_mut().pin_mut().staging_lease(len)
+    }
+
+    /// Return the staging lease at `offset`. Leases are short-lived by design
+    /// (copy-out-on-arrival); when the last outstanding lease is released the arena's bump head
+    /// resets.
+    pub fn staging_release(&self, offset: u64) -> Result<(), Exception> {
+        self.inner.borrow_mut().pin_mut().staging_release(offset)
+    }
+
+    /// Device base address of the staging arena, for transport memory registration.
+    pub fn staging_base(&self) -> Result<usize, Exception> {
+        self.inner.borrow().staging_base()
+    }
+
+    /// Capacity of the staging arena in bytes.
+    pub fn staging_capacity(&self) -> Result<u64, Exception> {
+        self.inner.borrow().staging_capacity()
+    }
 }
 
 /// Drains a filled Arrow C Data Interface stream into owned batches, retaining the schema.
@@ -230,6 +257,76 @@ impl Fragment<'_> {
     pub fn output_batch_count(&self, stream_id: u64) -> Result<usize, Exception> {
         self.inner.output_batch_count(stream_id)
     }
+
+    /// Pack the next batch parked on output stream `stream_id` into a fresh staging-arena lease,
+    /// as cudf packed bytes.
+    ///
+    /// `Ok(None)` means nothing is parked right now — for a fragment that finished
+    /// [`run`](Fragment::run), the stream is drained. The packed device bytes are complete when
+    /// this returns, so a transport may transmit from
+    /// `[staging_base() + offset, + len)` immediately; the lease stays live until the caller
+    /// hands it back with [`SiriusContext::staging_release`] after the transmit completes.
+    pub fn export_packed(&mut self, stream_id: u64) -> Result<Option<PackedBatch>, Exception> {
+        let mut offset = 0u64;
+        let mut len = 0u64;
+        let metadata = self
+            .inner
+            .pin_mut()
+            .export_packed(stream_id, &mut offset, &mut len)?;
+        if metadata.is_null() {
+            return Ok(None);
+        }
+        Ok(Some(PackedBatch {
+            metadata: metadata.as_slice().to_vec(),
+            offset,
+            len,
+        }))
+    }
+
+    /// Push a packed batch sitting in the staging arena into input stream `stream_id`: the
+    /// receive-side mirror of [`export_packed`](Fragment::export_packed).
+    ///
+    /// The table is deep-copied out of the lease into ordinary pool memory before this returns
+    /// (copy-out-on-arrival), so the lease is immediately reusable — and releasable. Legal
+    /// between [`build`](Fragment::build) and [`run`](Fragment::run), like
+    /// [`relay_from`](Fragment::relay_from); pushing after the stream ended is an error, never a
+    /// silent drop.
+    pub fn push_packed(&mut self, stream_id: u64, batch: &PackedBatch) -> Result<(), Exception> {
+        // SAFETY: the metadata pointer/length name `batch.metadata`'s buffer, which this borrow
+        // keeps alive and readable for the duration of the call.
+        unsafe {
+            self.inner.pin_mut().push_packed(
+                stream_id,
+                batch.metadata.as_ptr() as usize,
+                batch.metadata.len(),
+                batch.offset,
+                batch.len,
+            )
+        }
+    }
+
+    /// Record that `sender_id` finished producing into input stream `stream_id` — the EOS mirror
+    /// of [`push_packed`](Fragment::push_packed) for remote senders
+    /// ([`relay_from`](Fragment::relay_from) closes its own sender). The stream ends once every
+    /// expected sender has closed.
+    pub fn close_input(&mut self, stream_id: u64, sender_id: u32) -> Result<(), Exception> {
+        self.inner.pin_mut().close_input(stream_id, sender_id)
+    }
+}
+
+/// One batch exported into the exchange staging arena as cudf packed bytes.
+///
+/// `metadata` is the host-side cudf pack metadata (it travels with the payload on the wire);
+/// `offset`/`len` locate the packed device payload inside the staging arena of the context that
+/// exported it. The exporter's lease at `offset` stays outstanding until
+/// [`SiriusContext::staging_release`] is called with it.
+pub struct PackedBatch {
+    /// cudf pack metadata bytes (host memory).
+    pub metadata: Vec<u8>,
+    /// Byte offset of the packed payload from the arena base.
+    pub offset: u64,
+    /// Length of the packed payload in bytes.
+    pub len: u64,
 }
 
 /// Error returned by [`SiriusContext::execute_substrait`].
@@ -322,18 +419,11 @@ mod tests {
         .encode_to_vec()
     }
 
-    /// End-to-end: execute a `local_files` parquet plan on the GPU and read the
-    /// result rows back over the Arrow C Data Interface. Requires a GPU.
-    #[test]
-    fn executes_local_files_plan_on_gpu() {
-        let _guard = GPU_CONTEXT_LOCK
-            .lock()
-            .unwrap_or_else(|err| err.into_inner());
-
-        // Point the embedded DuckDB at the locally-built parquet extension (the
-        // SIRIUS_BUILD_DIR default mirrors sirius-sys's build.rs) so it can bind
-        // `parquet_scan`. Set under the GPU lock so no other context bring-up
-        // reads the environment concurrently.
+    /// Points the embedded DuckDB at the locally-built parquet extension (the
+    /// SIRIUS_BUILD_DIR default mirrors sirius-sys's build.rs) so it can bind
+    /// `parquet_scan`. Call under the GPU lock so no other context bring-up
+    /// reads the environment concurrently.
+    fn ensure_parquet_extension_env() {
         if std::env::var_os("SIRIUS_DUCKDB_PARQUET_EXTENSION").is_none() {
             let manifest = env!("CARGO_MANIFEST_DIR");
             let build_dir = std::env::var("SIRIUS_BUILD_DIR")
@@ -342,10 +432,11 @@ mod tests {
             // SAFETY: the GPU lock is held, so no other thread touches the environment here.
             unsafe { std::env::set_var("SIRIUS_DUCKDB_PARQUET_EXTENSION", parquet) };
         }
+    }
 
-        // Write a tiny parquet fixture.
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("users.parquet");
+    /// Writes the tiny `(id BIGINT, name VARCHAR)` parquet fixture at `path`:
+    /// rows (1, "a"), (2, "b"), (3, "c").
+    fn write_users_parquet(path: &Path) {
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
             Field::new("name", DataType::Utf8, false),
@@ -353,12 +444,24 @@ mod tests {
         let ids: ArrayRef = Arc::new(Int64Array::from(vec![1, 2, 3]));
         let names: ArrayRef = Arc::new(StringArray::from(vec!["a", "b", "c"]));
         let batch = RecordBatch::try_new(schema.clone(), vec![ids, names]).unwrap();
-        {
-            let file = std::fs::File::create(&path).unwrap();
-            let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
-            writer.write(&batch).unwrap();
-            writer.close().unwrap();
-        }
+        let file = std::fs::File::create(path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+    }
+
+    /// End-to-end: execute a `local_files` parquet plan on the GPU and read the
+    /// result rows back over the Arrow C Data Interface. Requires a GPU.
+    #[test]
+    fn executes_local_files_plan_on_gpu() {
+        let _guard = GPU_CONTEXT_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        ensure_parquet_extension_env();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("users.parquet");
+        write_users_parquet(&path);
 
         let plan = local_files_plan(
             path.to_str().unwrap(),
@@ -368,7 +471,7 @@ mod tests {
         // Execute twice on one context to verify standalone query state is reset,
         // then drop it before inspecting the returned owned results.
         let results = {
-            let mut ctx = SiriusContext::new().expect("bring up sirius context");
+            let ctx = SiriusContext::new().expect("bring up sirius context");
             vec![
                 ctx.execute_substrait_result(&plan)
                     .expect("execute first substrait plan"),
@@ -395,5 +498,190 @@ mod tests {
             "/nonexistent/sirius-config-does-not-exist.yaml",
         ));
         assert!(result.is_err(), "missing config file should fail bring-up");
+    }
+
+    /// A plan whose only read is the engine's stream view for input stream `stream_id`,
+    /// projecting the users fixture's `(id BIGINT, name VARCHAR)` schema — the shape a front
+    /// end emits where it would otherwise emit a file scan.
+    fn stream_read_plan(stream_id: u64) -> Vec<u8> {
+        use substrait::proto::read_rel::{NamedTable, ReadType};
+        use substrait::proto::{
+            NamedStruct, Plan, PlanRel, ReadRel, Rel, RelRoot, Type, plan_rel, r#type, rel,
+        };
+
+        let names = vec!["id".to_string(), "name".to_string()];
+        let types = vec![
+            Type {
+                kind: Some(r#type::Kind::I64(r#type::I64 {
+                    type_variation_reference: 0,
+                    nullability: r#type::Nullability::Nullable as i32,
+                })),
+            },
+            Type {
+                kind: Some(r#type::Kind::String(r#type::String {
+                    type_variation_reference: 0,
+                    nullability: r#type::Nullability::Nullable as i32,
+                })),
+            },
+        ];
+        let read = Rel {
+            rel_type: Some(rel::RelType::Read(Box::new(ReadRel {
+                base_schema: Some(NamedStruct {
+                    names: names.clone(),
+                    r#struct: Some(r#type::Struct {
+                        types,
+                        type_variation_reference: 0,
+                        nullability: r#type::Nullability::Required as i32,
+                    }),
+                }),
+                read_type: Some(ReadType::NamedTable(NamedTable {
+                    names: vec![super::stream_view_name(stream_id)],
+                    ..Default::default()
+                })),
+                ..Default::default()
+            }))),
+        };
+        Plan {
+            relations: vec![PlanRel {
+                rel_type: Some(plan_rel::RelType::Root(RelRoot {
+                    input: Some(read),
+                    names,
+                })),
+            }],
+            ..Default::default()
+        }
+        .encode_to_vec()
+    }
+
+    /// Flattens a result into sorted `(id, name)` rows, so comparisons are by value and
+    /// independent of batch boundaries.
+    fn rows(result: &super::SubstraitResult) -> Vec<(i64, String)> {
+        let mut rows = Vec::new();
+        for batch in &result.batches {
+            let ids = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("id column");
+            let names = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("name column");
+            for i in 0..batch.num_rows() {
+                rows.push((ids.value(i), names.value(i).to_string()));
+            }
+        }
+        rows.sort();
+        rows
+    }
+
+    /// The decisive equivalence for the packed FFI pair: a fragment hop carried by the staging
+    /// arena (`export_packed` → transmit-from-lease → `push_packed`) must deliver exactly the
+    /// values the proven in-process `relay_from` hop delivers for the identical plan pair.
+    /// Also pins the surrounding contracts: drained-stream export is `None`, push after EOS is
+    /// a loud error, and leases release (and the bump head resets) before the receiver runs —
+    /// which only works if push really copied the data out of the lease. Requires a GPU.
+    #[test]
+    fn packed_hop_matches_relay_hop() {
+        let _guard = GPU_CONTEXT_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        ensure_parquet_extension_env();
+        // The arena is constructed at context bring-up, only when this is set.
+        // SAFETY: the GPU lock is held, so no other thread touches the environment here.
+        unsafe { std::env::set_var("SIRIUS_EXCHANGE_STAGING_BYTES", "64MiB") };
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("users.parquet");
+        write_users_parquet(&path);
+        let sender_plan = local_files_plan(
+            path.to_str().unwrap(),
+            vec!["id".to_string(), "name".to_string()],
+        );
+        let receiver_plan = stream_read_plan(0);
+
+        let ctx = SiriusContext::new().expect("bring up sirius context");
+        assert_eq!(ctx.staging_capacity().unwrap(), 64 << 20);
+        assert_ne!(ctx.staging_base().unwrap(), 0);
+
+        // Declares `(id, name)` on input stream 0 and builds the stream-view read.
+        let make_receiver = || {
+            let mut receiver = ctx.fragment().unwrap();
+            receiver.declare_input_column(0, "id", "BIGINT").unwrap();
+            receiver.declare_input_column(0, "name", "VARCHAR").unwrap();
+            receiver.build(&receiver_plan).unwrap();
+            receiver
+        };
+
+        // Reference: the proven in-process native relay.
+        let relay_result = {
+            let mut sender = ctx.fragment().unwrap();
+            sender.declare_output(0).unwrap();
+            sender.build(&sender_plan).unwrap();
+            sender.run().unwrap();
+
+            let mut receiver = make_receiver();
+            let moved = receiver.relay_from(&mut sender, 0, 0, 0).unwrap();
+            assert!(moved > 0, "the relay hop must carry batches");
+            receiver.run().unwrap();
+            receiver.into_arrow().unwrap()
+        };
+
+        // The same hop through the staging arena as packed bytes.
+        let packed_result = {
+            let mut sender = ctx.fragment().unwrap();
+            sender.declare_output(0).unwrap();
+            sender.build(&sender_plan).unwrap();
+            sender.run().unwrap();
+
+            let mut staged = Vec::new();
+            while let Some(batch) = sender.export_packed(0).unwrap() {
+                assert!(batch.len > 0, "a packed batch carries payload bytes");
+                assert!(!batch.metadata.is_empty(), "pack metadata is never empty");
+                staged.push(batch);
+            }
+            assert!(!staged.is_empty(), "the sender parked batches to export");
+            // A drained stream is `None`, not an error.
+            assert!(sender.export_packed(0).unwrap().is_none());
+
+            let mut receiver = make_receiver();
+            for batch in &staged {
+                receiver.push_packed(0, batch).unwrap();
+            }
+            receiver.close_input(0, 0).unwrap();
+
+            // A push after EOS must refuse loudly, never vanish.
+            let refused = receiver.push_packed(0, &staged[0]);
+            assert!(refused.is_err(), "push_packed after close_input must error");
+            assert!(refused.unwrap_err().what().contains("already ended"));
+
+            // Copy-out-on-arrival: the data left the leases at push time, so they can all go
+            // back before the receiver runs...
+            for batch in &staged {
+                ctx.staging_release(batch.offset).unwrap();
+            }
+            // ...and with nothing outstanding the bump head reset to the base.
+            let probe = ctx.staging_lease(1024).unwrap();
+            assert_eq!(probe, 0);
+            ctx.staging_release(probe).unwrap();
+
+            receiver.run().unwrap();
+            receiver.into_arrow().unwrap()
+        };
+
+        assert_eq!(rows(&relay_result), rows(&packed_result));
+        assert_eq!(
+            rows(&packed_result),
+            vec![
+                (1, "a".to_string()),
+                (2, "b".to_string()),
+                (3, "c".to_string()),
+            ]
+        );
+
+        // Keep the arena out of the other tests' context bring-ups.
+        // SAFETY: the GPU lock is still held.
+        unsafe { std::env::remove_var("SIRIUS_EXCHANGE_STAGING_BYTES") };
     }
 }

@@ -56,6 +56,23 @@ mod ffi {
             out_stream_addr: usize,
         ) -> Result<()>;
 
+        /// Lease `len` bytes of the exchange staging arena, returning the
+        /// lease's byte offset from `staging_base()`. Fallible: no configured
+        /// arena (`SIRIUS_EXCHANGE_STAGING_BYTES` unset) and exhaustion both
+        /// surface as `Err`.
+        fn staging_lease(self: Pin<&mut Context>, len: u64) -> Result<u64>;
+
+        /// Return the staging lease at `offset`; the arena's bump head resets
+        /// when the last outstanding lease is released.
+        fn staging_release(self: Pin<&mut Context>, offset: u64) -> Result<()>;
+
+        /// Device base address of the staging arena, for transport memory
+        /// registration.
+        fn staging_base(self: &Context) -> Result<usize>;
+
+        /// Capacity of the staging arena in bytes.
+        fn staging_capacity(self: &Context) -> Result<u64>;
+
         /// One plan fragment of a multi-fragment query. Either declares output
         /// streams (an intermediate fragment, whose results park as native GPU
         /// batches that outlive its own query) or none (a result fragment,
@@ -103,6 +120,44 @@ mod ffi {
             input_stream_id: u64,
             sender_id: u32,
         ) -> Result<usize>;
+
+        /// Pack the next batch parked on an output stream into a fresh
+        /// staging-arena lease. Returns the cudf pack metadata (a null
+        /// `UniquePtr` when nothing is parked right now) and writes the lease
+        /// offset and packed payload length; the device bytes are complete on
+        /// return (the packing stream is synchronized). Releasing the lease —
+        /// via `staging_release(offset)`, after the transmit completes — is
+        /// the caller's job.
+        fn export_packed(
+            self: Pin<&mut Fragment>,
+            stream_id: u64,
+            offset: &mut u64,
+            length: &mut u64,
+        ) -> Result<UniquePtr<CxxVector<u8>>>;
+
+        /// Unpack `length` packed bytes at staging offset `offset` with the
+        /// cudf pack metadata at `metadata_addr` (`metadata_len` bytes of host
+        /// memory), deep-copy the table out of the lease into pool memory, and
+        /// push it into an input stream. Legal between `build()` and `run()`;
+        /// the lease is reusable on return. A push after the stream ended is
+        /// an `Err`, never a silent drop.
+        ///
+        /// # Safety
+        /// `metadata_addr` must point at `metadata_len` readable bytes of pack
+        /// metadata that outlive this call. The safe
+        /// [`sirius`](https://docs.rs/sirius) wrapper upholds this.
+        unsafe fn push_packed(
+            self: Pin<&mut Fragment>,
+            stream_id: u64,
+            metadata_addr: usize,
+            metadata_len: usize,
+            offset: u64,
+            length: u64,
+        ) -> Result<()>;
+
+        /// Record that `sender_id` finished producing into an input stream —
+        /// the EOS mirror of `push_packed` for remote senders.
+        fn close_input(self: Pin<&mut Fragment>, stream_id: u64, sender_id: u32) -> Result<()>;
 
         /// Execute the fragment and close its query lifecycle.
         fn run(self: Pin<&mut Fragment>) -> Result<()>;
