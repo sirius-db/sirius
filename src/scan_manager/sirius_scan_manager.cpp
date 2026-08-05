@@ -197,7 +197,10 @@ struct cached_databatch_provider : public databatch_provider {
       return ::cucascade::data_batch::make(
         batch_id,
         std::move(gpu_repr),
-        telemetry::quent_data_batch_probe::create(_telemetry_info, batch_id));
+        telemetry::quent_data_batch_probe::create(_telemetry_info,
+                                                  batch_id,
+                                                  static_cast<uint64_t>(view.num_rows()),
+                                                  static_cast<uint64_t>(view.num_columns())));
     }
     if (index >= _entry.chunk_memory_spaces.size()) { return nullptr; }
     std::vector<std::shared_ptr<cudf::column>> columns;
@@ -219,7 +222,10 @@ struct cached_databatch_provider : public databatch_provider {
     return ::cucascade::data_batch::make(
       batch_id,
       std::move(gpu_repr),
-      telemetry::quent_data_batch_probe::create(_telemetry_info, batch_id));
+      telemetry::quent_data_batch_probe::create(_telemetry_info,
+                                                batch_id,
+                                                static_cast<uint64_t>(view.num_rows()),
+                                                static_cast<uint64_t>(view.num_columns())));
   }
 
   // True when scan normalization will cast the recorded stored @p carrier to @p target: the same

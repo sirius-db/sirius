@@ -434,6 +434,8 @@ void gpu_pipeline_executor::manager_loop()
           pipeline_task->telemetry_handle().finalizing({
             .instance_name = "",
             .success       = true,
+            .output_rows   = pipeline_task->telemetry_output_rows(),
+            .output_bytes  = pipeline_task->telemetry_output_bytes(),
           });
           pipeline_task->telemetry_handle().exit();
           pipeline_task->set_telemetry_finalized();

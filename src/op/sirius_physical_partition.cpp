@@ -229,10 +229,15 @@ std::unique_ptr<operator_data> sirius_physical_partition::execute(const operator
       break;
     case PartitionType::NONE: {
       const auto clone_batch_id = sirius::get_next_batch_id();
+      const auto clone_view     = get_cudf_table_view(input_batch_ro);
       partitioned_results       = {input_batch_ro.clone(
         clone_batch_id,
         stream,
-        telemetry::quent_data_batch_probe::create(batch_telemetry(), clone_batch_id))};
+        telemetry::quent_data_batch_probe::create(
+          batch_telemetry(),
+          clone_batch_id,
+          static_cast<uint64_t>(clone_view.num_rows()),
+          static_cast<uint64_t>(clone_view.num_columns())))};
       break;
     }
     case PartitionType::CUSTOM:

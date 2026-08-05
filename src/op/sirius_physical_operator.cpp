@@ -388,7 +388,11 @@ void sirius_physical_operator::set_pipeline(duckdb::shared_ptr<pipeline::sirius_
 telemetry::batch_telemetry_info sirius_physical_operator::batch_telemetry() const
 {
   if (not _pipeline) { return {nullptr, uuid::UUID{}}; }
-  return {_pipeline->get_telemetry_context(), _pipeline->pipeline_uuid()};
+  // Producer-task attribution comes from the executor thread's task scope
+  // (nil outside task execution) — operators never see the task handle.
+  return {_pipeline->get_telemetry_context(),
+          _pipeline->pipeline_uuid(),
+          telemetry::current_task_telemetry_uuid};
 }
 
 // implement get_all_ports

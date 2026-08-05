@@ -45,6 +45,7 @@ class sirius_pipeline;
 
 namespace sirius {
 struct telemetry_config;
+struct sirius_config;
 }  // namespace sirius
 
 namespace sirius::telemetry {
@@ -54,10 +55,15 @@ class telemetry_context {
  public:
   /// `gpu_device_ids` declares one per-GPU resource group (plus per-thread-type
   /// child buckets) under the engine, so thread telemetry can nest per device.
+  /// `full_config`, when given, is snapshotted into the engine Init event's
+  /// custom_attributes (thread counts, memory-space limits, scan/cache/IO
+  /// settings, GPU hardware info) so traces are self-describing; null leaves
+  /// them empty (unit tests).
   [[nodiscard]] static std::shared_ptr<const telemetry_context> create(
     const sirius::telemetry_config& config,
     const cucascade::memory::memory_reservation_manager* manager = nullptr,
-    const std::vector<int>& gpu_device_ids                       = {});
+    const std::vector<int>& gpu_device_ids                       = {},
+    const sirius::sirius_config* full_config                     = nullptr);
 
   ~telemetry_context();
 
@@ -89,7 +95,8 @@ class telemetry_context {
  private:
   telemetry_context(const sirius::telemetry_config& config,
                     const cucascade::memory::memory_reservation_manager* manager,
-                    const std::vector<int>& gpu_device_ids);
+                    const std::vector<int>& gpu_device_ids,
+                    const sirius::sirius_config* full_config);
 
   /// Telemetry group ids for one GPU: the `gpu-N` group and its per-thread-type
   /// child buckets.
@@ -214,6 +221,28 @@ struct TaskQueueHandleWrapper {
 // header-only shared thread-local storage handle: one per thread, shared across translation units
 inline thread_local std::optional<ExecutorThreadHandleWrapper> executor_thread_telemetry_handle{
   std::nullopt};
+
+// The telemetry uuid of the task currently executing on this thread (nil
+// outside task execution). Set by gpu_pipeline_task::execute so batch
+// construction and publication deep inside operator code can attribute their
+// producer task without plumbing the task handle through every operator; read
+// by sirius_physical_operator::batch_telemetry() and the batch registry.
+inline thread_local uuid::UUID current_task_telemetry_uuid{};
+
+/// RAII scope stamping @ref current_task_telemetry_uuid for one task execution.
+struct scoped_current_task_uuid {
+  explicit scoped_current_task_uuid(const uuid::UUID& task_uuid)
+  {
+    current_task_telemetry_uuid = task_uuid;
+  }
+
+  scoped_current_task_uuid(const scoped_current_task_uuid&)            = delete;
+  scoped_current_task_uuid& operator=(const scoped_current_task_uuid&) = delete;
+  scoped_current_task_uuid(scoped_current_task_uuid&&)                 = delete;
+  scoped_current_task_uuid& operator=(scoped_current_task_uuid&&)      = delete;
+
+  ~scoped_current_task_uuid() { current_task_telemetry_uuid = uuid::UUID{}; }
+};
 
 // Initialize the thread local ExecutorThreadHandleWrapper for this worker thread.
 inline void thread_local_executor_thread_telemtry_init(const telemetry_context& context,

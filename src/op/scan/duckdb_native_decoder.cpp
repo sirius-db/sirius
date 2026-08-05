@@ -64,6 +64,7 @@
 #include <duckdb/storage/table/column_segment.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -817,9 +818,11 @@ void submit_and_await(rmm::device_buffer& device_buf,
   // Issue the coalesced reads as one batch and await completion.
   {
     nvtx3::scoped_range nvtx_reads{"native_reads"};
+    auto const read_start = std::chrono::steady_clock::now();
     auto io_ctx           = datasource.io_ctx();
     auto fut              = io_ctx->host_read_ranges_async_io(datasource.io_object(), ranges);
     std::size_t const got = std::move(fut).get();
+    datasource.record_external_read(read_start, got);
     if (got != total_read) {
       throw std::runtime_error(std::string(kTag) + " short coalesced host read: got " +
                                std::to_string(got) + " expected " + std::to_string(total_read));

@@ -567,7 +567,7 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
     }
   }
   telemetry_context_ = sirius::telemetry::telemetry_context::create(
-    config_.get_telemetry_config(), memory_manager_.get(), telemetry_gpu_ids);
+    config_.get_telemetry_config(), memory_manager_.get(), telemetry_gpu_ids, &config_);
 
   if (config_.get_telemetry_config().enable_quent &&
       config_.get_telemetry_config().enable_batch_events) {

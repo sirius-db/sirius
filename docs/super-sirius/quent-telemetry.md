@@ -131,3 +131,25 @@ timeline, so you can see exactly when and where it ran across the resources.
 duration), grouped and sortable, to, for example, quickly find the most expensive operators in the query.
 
 ![Quent operator stats view](quent-screenshots/operator-stats-view.png)
+
+## Schema additions (experimental)
+
+Additions made for the hardware what-if simulator (all additive; older traces simply lack the
+fields/entity). Model source: `rust/crates/telemetry/model/src/`. Full field-level spec with
+example lines: `tools/hwsim/docs/ws9-new-fields.md`.
+
+- **`engine.Init.implementation.custom_attributes`** is now populated with a config/hardware
+  snapshot (thread counts, memory-space capacities, scan/cache/IO settings, per-GPU SM count and
+  clocks) so traces are self-describing. Emitted once per session from
+  `src/telemetry/telemetry_context.cpp`.
+- **`data_batch.Constructed`** gains `producer_task_uuid` (nil outside task execution),
+  `num_rows`, and `num_columns` (0 when unknown, e.g. undecoded host staging batches).
+- **`batch_placement.BatchRegistered`** gains `producer_task_uuid` (nil for lazily-registered
+  `reschedule_intermediate` placements).
+- **`task.Computing`** gains `input_rows`; **`task.Finalizing`** gains `output_rows` and
+  `output_bytes` (the task's final output volume; 0 on failure paths).
+- **New `io_request` FSM** (`Issued` → `Completed` → `Exit`): one instance per fresh-read scan
+  split materialization, carrying the owning task/pipeline uuids, expected compressed/decoded
+  bytes, and the measured `bytes_read` / `read_time_ns` / `read_calls` from the split's
+  `sirius_datasource`s — this separates disk read time from GPU decode inside `GPU_SCAN`.
+  Resident (cached) splits emit no `io_request`.

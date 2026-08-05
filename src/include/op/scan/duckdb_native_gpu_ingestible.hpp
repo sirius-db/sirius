@@ -148,6 +148,16 @@ class duckdb_native_scan_info : public op::scan::scan_info {
     }
     return total;
   }
+
+  [[nodiscard]] std::size_t datasource_count() const noexcept override
+  {
+    return datasource ? 1 : 0;
+  }
+
+  [[nodiscard]] sirius::io::io_read_stats io_totals() const noexcept override
+  {
+    return datasource ? datasource->read_stats() : sirius::io::io_read_stats{};
+  }
 };
 
 //===----------------------------------------------------------------------===//

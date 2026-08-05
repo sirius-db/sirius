@@ -16,6 +16,8 @@
 
 // sirius
 #include "io/cache/types.hpp"
+#include "telemetry-bridge/gen/io_request.rs.h"
+#include "telemetry/telemetry_context.hpp"
 
 #include <data/data_batch_utils.hpp>
 #include <data/sirius_converter_registry.hpp>
@@ -226,7 +228,52 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::execute(
 
   ::cucascade::memory::memory_space* mem_space = scan_input->gpu_memory_space;
   std::unique_ptr<cudf::table> output_table;
-  auto materialized_table = _ingestible->materialize_table(*scan_input, stream);
+
+  // Scan-split I/O telemetry (io_request FSM): bracket the fresh-read
+  // materialization so its wall time and measured read portion are separable
+  // from the rest of this GPU_SCAN Computing span. Resident (cached) splits
+  // read nothing and emit nothing.
+  auto telemetry_info = batch_telemetry();
+  std::optional<rust::Box<quent::io_request::IoRequestHandle>> io_request_handle;
+  sirius::io::io_read_stats io_before{};
+  if (telemetry_info.context != nullptr && scan_input->has_scan_metadata()) {
+    const auto& info = scan_input->get_scan_info();
+    io_before        = info.io_totals();
+    io_request_handle.emplace(quent::io_request::create(
+      telemetry_info.context->context(),
+      {
+        .instance_name              = "scan_split",
+        .task_uuid                  = telemetry_info.producer_task_uuid,
+        .pipeline_uuid              = telemetry_info.producer_pipeline_uuid,
+        .file_count                 = static_cast<uint64_t>(info.datasource_count()),
+        .estimated_compressed_bytes = static_cast<uint64_t>(info.estimated_compressed_bytes()),
+        .estimated_decoded_bytes    = static_cast<uint64_t>(info.estimated_bytes()),
+      }));
+  }
+  auto complete_io_request = [&](uint64_t rows) {
+    if (!io_request_handle) { return; }
+    const auto delta = scan_input->get_scan_info().io_totals() - io_before;
+    (*io_request_handle)
+      ->completed({
+        .instance_name = "",
+        .bytes_read    = delta.bytes_read,
+        .read_time_ns  = delta.read_time_ns,
+        .read_calls    = delta.read_calls,
+        .rows          = rows,
+      });
+    (*io_request_handle)->exit();
+    io_request_handle.reset();
+  };
+
+  filtered_table materialized_table;
+  try {
+    materialized_table = _ingestible->materialize_table(*scan_input, stream);
+  } catch (...) {
+    complete_io_request(/*rows=*/0);
+    throw;
+  }
+  complete_io_request(static_cast<uint64_t>(materialized_table.table.num_rows()));
+
   if (materialized_table.state != filter_state::ROW_FILTERED_AND_PROJECTED) {
     output_table =
       _ingestible->post_filter_and_project(std::move(materialized_table), *mem_space, stream);

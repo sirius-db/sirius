@@ -290,6 +290,7 @@ void batch_telemetry_registry::on_published(const std::shared_ptr<cucascade::dat
                                      .pipeline_uuid       = port.pipeline_uuid,
                                      .port_uuid           = port.port_uuid,
                                      .origin              = std::string(to_string_view(origin)),
+                                     .producer_task_uuid  = current_task_telemetry_uuid,
                                      .tier_resource_id    = tier_resource_id,
                                      .tier_capacity_bytes = snap->bytes,
                                    });
@@ -347,6 +348,7 @@ void batch_telemetry_registry::on_packaged(const std::shared_ptr<cucascade::data
         .pipeline_uuid       = consumer_pipeline_uuid,
         .port_uuid           = uuid::new_nil(),
         .origin              = std::string(to_string_view(batch_origin::reschedule_intermediate)),
+        .producer_task_uuid  = uuid::new_nil(),  // producer unknown at lazy registration
         .tier_resource_id    = tier_resource_id,
         .tier_capacity_bytes = snap->bytes,
       });

@@ -389,6 +389,9 @@ impl SiriusModelBuilder {
                 Ok(())
             }
             SiriusEvent::MemoryTier(e) => self.push_memory_tier(id, timestamp, e),
+            // Scan-split I/O spans are not surfaced in the analyzer UI yet;
+            // accepted so mixed sessions load.
+            SiriusEvent::IoRequest(_) => Ok(()),
         }
     }
 

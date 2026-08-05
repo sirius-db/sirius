@@ -104,6 +104,22 @@ void validate_operator_output_types(const op::operator_data* data,
   }
 }
 
+// Total rows across a pipelineable input's batches; 0 for non-pipelineable
+// data (e.g. a scan split before decode). Metadata-only walk over the batch
+// table views — same access pattern log_operator_data already performs.
+uint64_t count_rows(const op::operator_data& data)
+{
+  const auto* p_data = dynamic_cast<const op::pipelineable_operator_data*>(&data);
+  if (p_data == nullptr) { return 0; }
+  uint64_t rows = 0;
+  for (const auto& batch : p_data->get_read_only_batches()) {
+    if (batch.get_data()) {
+      rows += static_cast<uint64_t>(get_cudf_table_view(batch).num_rows());
+    }
+  }
+  return rows;
+}
+
 // Authoritative source for the GPU id used by per-task log lines: the
 // executor's _per_thread_init runs cudaSetDevice(executor_gpu) on every
 // worker thread, and compute_task wraps the per-task work in
@@ -377,6 +393,7 @@ std::unique_ptr<op::operator_data> gpu_pipeline_task::compute_task(rmm::cuda_str
           op.get_operator_id()),  // TODO(dhruv9vats): look into possible overflow
         .input_bytes          = operator_input_output_data->get_estimated_size_in_bytes(),
         .peak_allocated_bytes = _allocator ? _allocator->get_peak_allocated_bytes(stream) : 0,
+        .input_rows           = count_rows(*operator_input_output_data),
         .executor_thread_resource_id = executor_thread_resource_id,
         .reservation_resource_id     = _reservation_tier_resource_id,
         .reservation_capacity_bytes  = _reservation_bytes,
@@ -496,6 +513,11 @@ void gpu_pipeline_task::publish_output(op::operator_data& output_data, rmm::cuda
 
 void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
 {
+  // Attribute every batch this task constructs/publishes (deep inside
+  // operator code) to this task's telemetry uuid; cleared on scope exit,
+  // including the reschedule unwind paths.
+  telemetry::scoped_current_task_uuid task_uuid_scope{telemetry_handle().uuid()};
+
   auto& local_state = _local_state->cast<gpu_pipeline_task_local_state>();
   auto pipeline     = _global_state->cast<gpu_pipeline_task_global_state>().get_pipeline();
   auto operators    = pipeline->get_operators();
@@ -627,13 +649,16 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
       peak_bytes = 0;
     }
     std::size_t output_bytes = 0;
+    uint64_t output_rows     = 0;
     auto* pipelineable_output =
       dynamic_cast<const op::pipelineable_operator_data*>(output_data.get());
     if (pipelineable_output) {
       for (const auto& batch : pipelineable_output->get_read_only_batches(false)) {
         output_bytes += batch.get_data()->get_size_in_bytes();
+        output_rows += static_cast<uint64_t>(get_cudf_table_view(batch).num_rows());
       }
     }
+    set_telemetry_output(output_rows, output_bytes);
     auto& global = _global_state->cast<gpu_pipeline_task_global_state>();
     global.get_memory_history().record({input_basis, peak_bytes, output_bytes});
     SIRIUS_LOG_TRACE(

@@ -116,13 +116,15 @@ inline std::shared_ptr<cucascade::data_batch> make_data_batch(
   rmm::cuda_stream_view writer_stream,
   const telemetry::batch_telemetry_info& telemetry_info)
 {
-  auto gpu_repr = std::make_unique<cucascade::gpu_table_representation>(
+  const auto num_rows    = static_cast<uint64_t>(table.num_rows());
+  const auto num_columns = static_cast<uint64_t>(table.num_columns());
+  auto gpu_repr          = std::make_unique<cucascade::gpu_table_representation>(
     std::make_unique<cudf::table>(std::move(table)), memory_space, writer_stream);
   const auto batch_id = get_next_batch_id();
   return cucascade::data_batch::make(
     batch_id,
     std::move(gpu_repr),
-    telemetry::quent_data_batch_probe::create(telemetry_info, batch_id));
+    telemetry::quent_data_batch_probe::create(telemetry_info, batch_id, num_rows, num_columns));
 }
 
 /**
@@ -138,13 +140,15 @@ inline std::shared_ptr<cucascade::data_batch> make_data_batch(
   rmm::cuda_stream_view writer_stream,
   const telemetry::batch_telemetry_info& telemetry_info)
 {
-  auto gpu_repr = std::make_unique<cucascade::gpu_table_representation>(
+  const auto num_rows    = table ? static_cast<uint64_t>(table->num_rows()) : 0;
+  const auto num_columns = table ? static_cast<uint64_t>(table->num_columns()) : 0;
+  auto gpu_repr          = std::make_unique<cucascade::gpu_table_representation>(
     std::move(table), memory_space, writer_stream);
   const auto batch_id = get_next_batch_id();
   return cucascade::data_batch::make(
     batch_id,
     std::move(gpu_repr),
-    telemetry::quent_data_batch_probe::create(telemetry_info, batch_id));
+    telemetry::quent_data_batch_probe::create(telemetry_info, batch_id, num_rows, num_columns));
 }
 
 /**
@@ -180,13 +184,15 @@ inline std::shared_ptr<cucascade::data_batch> make_data_batch_from_view(
   rmm::cuda_stream_view writer_stream,
   const telemetry::batch_telemetry_info& telemetry_info)
 {
-  auto gpu_repr = std::make_unique<cucascade::gpu_table_representation>(
+  const auto num_rows    = static_cast<uint64_t>(view.num_rows());
+  const auto num_columns = static_cast<uint64_t>(view.num_columns());
+  auto gpu_repr          = std::make_unique<cucascade::gpu_table_representation>(
     view, std::forward<Owner>(owner), alloc_size, memory_space, writer_stream);
   const auto batch_id = get_next_batch_id();
   return cucascade::data_batch::make(
     batch_id,
     std::move(gpu_repr),
-    telemetry::quent_data_batch_probe::create(telemetry_info, batch_id));
+    telemetry::quent_data_batch_probe::create(telemetry_info, batch_id, num_rows, num_columns));
 }
 
 }  // namespace sirius

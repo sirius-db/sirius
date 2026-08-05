@@ -32,13 +32,16 @@
 namespace sirius::telemetry {
 
 //! Telemetry attribution for a newly-created data_batch: the telemetry context
-//! to emit events into and the pipeline that produced the batch. Passed to the
-//! data_batch factories / quent_data_batch_probe::create. A null @ref context
-//! yields the no-op base probe, so batch construction stays telemetry-free (e.g.
-//! in unit tests, or when pipelines are built without an engine).
+//! to emit events into and the pipeline/task that produced the batch. Passed to
+//! the data_batch factories / quent_data_batch_probe::create. A null @ref
+//! context yields the no-op base probe, so batch construction stays
+//! telemetry-free (e.g. in unit tests, or when pipelines are built without an
+//! engine). @ref producer_task_uuid is nil for batches created outside a task
+//! (scan-manager staging batches).
 struct batch_telemetry_info {
   const telemetry_context* context = nullptr;
   uuid::UUID producer_pipeline_uuid{};
+  uuid::UUID producer_task_uuid{};
 };
 
 /**
@@ -61,8 +64,11 @@ class quent_data_batch_probe : public cucascade::idata_batch_probe {
    * The memory resource UUID for idle events is resolved at runtime based on the
    * data's current memory tier.
    *
-   * @param telemetry_info Telemetry attribution (context + producing pipeline).
+   * @param telemetry_info Telemetry attribution (context + producing pipeline/task).
    * @param batch_id The unique id of the data_batch this probe is attached to.
+   * @param num_rows Row count of the batch's table, or 0 when unknown at
+   *                 construction (e.g. undecoded host staging batches).
+   * @param num_columns Column count of the batch's table, or 0 when unknown.
    *
    * @note When @p telemetry_info.context is non-null, returns a
    * quent_data_batch_probe that forwards the batch's lifecycle to telemetry. When
@@ -70,13 +76,21 @@ class quent_data_batch_probe : public cucascade::idata_batch_probe {
    * no-op base probe so batch construction stays telemetry-free.
    */
   static std::unique_ptr<cucascade::idata_batch_probe> create(
-    const batch_telemetry_info& telemetry_info, const uint64_t batch_id)
+    const batch_telemetry_info& telemetry_info,
+    const uint64_t batch_id,
+    const uint64_t num_rows    = 0,
+    const uint64_t num_columns = 0)
   {
     if (telemetry_info.context == nullptr) {
       return std::make_unique<cucascade::idata_batch_probe>();
     }
-    return std::unique_ptr<quent_data_batch_probe>(new quent_data_batch_probe(
-      *(telemetry_info.context), batch_id, telemetry_info.producer_pipeline_uuid));
+    return std::unique_ptr<quent_data_batch_probe>(
+      new quent_data_batch_probe(*(telemetry_info.context),
+                                 batch_id,
+                                 telemetry_info.producer_pipeline_uuid,
+                                 telemetry_info.producer_task_uuid,
+                                 num_rows,
+                                 num_columns));
   }
 
   ~quent_data_batch_probe() override
@@ -195,15 +209,23 @@ class quent_data_batch_probe : public cucascade::idata_batch_probe {
    *
    * @param ctx The telemetry context providing instrumentation and memory UUIDs.
    * @param producer_pipeline_uuid UUID of the pipeline that produced this batch.
+   * @param producer_task_uuid UUID of the task that produced this batch (nil
+   *        when constructed outside a task).
    */
   quent_data_batch_probe(const telemetry_context& ctx,
                          const uint64_t batch_id,
-                         uuid::UUID producer_pipeline_uuid)
+                         uuid::UUID producer_pipeline_uuid,
+                         uuid::UUID producer_task_uuid,
+                         uint64_t num_rows,
+                         uint64_t num_columns)
     : handle_(quent::data_batch::create(ctx.context(),
                                         {
                                           .instance_name          = "batch",
                                           .data_batch_id          = batch_id,
                                           .producer_pipeline_uuid = producer_pipeline_uuid,
+                                          .producer_task_uuid     = producer_task_uuid,
+                                          .num_rows               = num_rows,
+                                          .num_columns            = num_columns,
                                         })),
       memory_context_(ctx.get_memory_context())
   {

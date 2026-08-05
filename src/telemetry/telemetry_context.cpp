@@ -26,6 +26,7 @@
 #include "telemetry-bridge/gen/port.rs.h"
 #include "telemetry/batch_telemetry.hpp"
 
+#include <cuda_runtime_api.h>
 #include <unistd.h>
 
 #include <format>
@@ -33,20 +34,119 @@
 #include <ranges>
 #include <stdexcept>
 #include <string>
+#include <thread>
+#include <variant>
 
 namespace sirius::telemetry {
+
+namespace {
+
+/// Snapshot the resolved engine config + hardware info into the engine Init
+/// event so traces are self-describing (thread counts, memory-space limits,
+/// scan/cache/IO settings, GPU SM/clock info). One-time emission at engine
+/// init; steady-state cost is zero.
+quent::DynamicAttributes build_engine_custom_attributes(const sirius::sirius_config& config)
+{
+  quent::DynamicAttributes attrs;
+  auto add_str = [&attrs](std::string key, std::string value) {
+    attrs.string_attrs.push_back({std::move(key), std::move(value)});
+  };
+  auto add_i64 = [&attrs](std::string key, int64_t value) {
+    attrs.i64_attrs.push_back({std::move(key), value});
+  };
+  auto add_f64 = [&attrs](std::string key, double value) {
+    attrs.f64_attrs.push_back({std::move(key), value});
+  };
+
+  const auto& topo = config.get_hw_topology();
+  add_str("host.name", topo.hostname);
+  add_i64("hw.num_gpus", static_cast<int64_t>(topo.num_gpus));
+  add_i64("hw.num_numa_nodes", topo.num_numa_nodes);
+  add_i64("hw.host_cores", static_cast<int64_t>(std::thread::hardware_concurrency()));
+
+  for (const auto& gpu : topo.gpus) {
+    const auto prefix = std::format("gpu.{}", gpu.id);
+    add_str(std::format("{}.name", prefix), gpu.name);
+    add_i64(std::format("{}.numa_node", prefix), gpu.numa_node);
+    // cudaDeviceGetAttribute rather than cudaDeviceProp fields: the clock-rate
+    // prop members are deprecated/removed on newer CUDA toolkits.
+    auto add_device_attr = [&](const char* name, cudaDeviceAttr attr) {
+      int value = 0;
+      if (::cudaDeviceGetAttribute(&value, attr, static_cast<int>(gpu.id)) == cudaSuccess) {
+        add_i64(std::format("{}.{}", prefix, name), value);
+      }
+    };
+    add_device_attr("sm_count", cudaDevAttrMultiProcessorCount);
+    add_device_attr("sm_clock_khz", cudaDevAttrClockRate);
+    add_device_attr("mem_clock_khz", cudaDevAttrMemoryClockRate);
+    add_device_attr("mem_bus_width_bits", cudaDevAttrGlobalMemoryBusWidth);
+  }
+
+  for (const auto& space_config : config.get_memory_space_configs()) {
+    if (const auto* gpu = std::get_if<cucascade::memory::gpu_memory_space_config>(&space_config)) {
+      const auto prefix = std::format("memory.gpu{}", gpu->device_id);
+      add_i64(std::format("{}.capacity_bytes", prefix),
+              static_cast<int64_t>(gpu->memory_capacity));
+      add_i64(std::format("{}.reservation_limit_bytes", prefix),
+              static_cast<int64_t>(gpu->reservation_limit()));
+    } else if (const auto* host =
+                 std::get_if<cucascade::memory::host_memory_space_config>(&space_config)) {
+      const auto prefix = std::format("memory.host{}", host->numa_id);
+      add_i64(std::format("{}.capacity_bytes", prefix),
+              static_cast<int64_t>(host->memory_capacity));
+      add_i64(std::format("{}.reservation_limit_bytes", prefix),
+              static_cast<int64_t>(host->reservation_limit()));
+    } else if (const auto* disk =
+                 std::get_if<cucascade::memory::disk_memory_space_config>(&space_config)) {
+      add_i64(std::format("memory.disk{}.capacity_bytes", disk->disk_id),
+              static_cast<int64_t>(disk->memory_capacity));
+    }
+  }
+
+  add_i64("executor.num_threads", config.get_gpu_pipeline_executor_config().num_threads);
+  add_i64("task_creator.num_threads", config.get_task_creator_config().thread_pool.num_threads);
+  add_i64("downgrade.num_threads", config.get_downgrade_executor_config().thread_pool.num_threads);
+  add_i64("downgrade.monitor_period_ms",
+          config.get_downgrade_executor_config().monitor_period.count());
+
+  const auto& scan = config.get_scan_manager_config();
+  add_i64("scan_manager.num_threads", scan.thread_pool.num_threads);
+  add_str("scan_manager.io_backend", scan.use_sirius_datasource ? "uring" : "kvikio");
+  add_i64("scan_manager.uring_n_reactors", static_cast<int64_t>(scan.uring_n_reactors));
+  add_i64("scan_manager.rest_n_reactors", static_cast<int64_t>(scan.rest_n_reactors));
+  add_i64("scan_manager.prefetch_cache_enabled", scan.enable_prefetch_cache ? 1 : 0);
+  add_i64("scan_manager.cache.inflight_io_chunk_budget",
+          static_cast<int64_t>(scan.cache.inflight_io_chunk_budget));
+  add_f64("scan_manager.cache.min_prefetching_budget_fraction",
+          scan.cache.min_prefetching_budget_fraction);
+  add_f64("scan_manager.cache.eviction_threshold_fraction",
+          scan.cache.eviction_threshold_fraction);
+
+  const auto& params = config.get_operator_params();
+  add_i64("operator.scan_task_batch_size", static_cast<int64_t>(params.scan_task_batch_size));
+  add_i64("operator.hash_partition_bytes", static_cast<int64_t>(params.hash_partition_bytes));
+
+  add_i64("telemetry.batch_events", config.get_telemetry_config().enable_batch_events ? 1 : 0);
+
+  return attrs;
+}
+
+}  // namespace
 
 std::shared_ptr<const telemetry_context> telemetry_context::create(
   const sirius::telemetry_config& config,
   const cucascade::memory::memory_reservation_manager* manager,
-  const std::vector<int>& gpu_device_ids)
+  const std::vector<int>& gpu_device_ids,
+  const sirius::sirius_config* full_config)
 {
-  return std::shared_ptr<telemetry_context>(new telemetry_context(config, manager, gpu_device_ids));
+  return std::shared_ptr<telemetry_context>(
+    new telemetry_context(config, manager, gpu_device_ids, full_config));
 }
 
 telemetry_context::telemetry_context(const sirius::telemetry_config& config,
                                      const cucascade::memory::memory_reservation_manager* manager,
-                                     const std::vector<int>& gpu_device_ids)
+                                     const std::vector<int>& gpu_device_ids,
+                                     const sirius::sirius_config* full_config)
   : engine_uuid_(uuid::now_v7()),
     worker_uuid_(uuid::now_v7()),
     query_group_uuid_(uuid::now_v7()),
@@ -72,9 +172,11 @@ telemetry_context::telemetry_context(const sirius::telemetry_config& config,
                          quent::engine::Init{
                            .implementation =
                              quent::engine::Implementation{
-                               .name              = config.engine_name,
-                               .version           = "",
-                               .custom_attributes = {},
+                               .name    = config.engine_name,
+                               .version = "",
+                               .custom_attributes = full_config != nullptr
+                                                      ? build_engine_custom_attributes(*full_config)
+                                                      : quent::DynamicAttributes{},
                              },
                            .instance_name = config.engine_name,
                          });

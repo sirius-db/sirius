@@ -163,6 +163,26 @@ class parquet_split_info : public scan_info {
     return total;
   }
 
+  [[nodiscard]] std::size_t estimated_compressed_bytes() const noexcept override
+  {
+    std::size_t total = 0;
+    for (auto const& s : rg_slices) {
+      total += s.reserved_compressed_bytes;
+    }
+    return total;
+  }
+
+  [[nodiscard]] std::size_t datasource_count() const noexcept override { return rg_slices.size(); }
+
+  [[nodiscard]] sirius::io::io_read_stats io_totals() const noexcept override
+  {
+    sirius::io::io_read_stats total{};
+    for (auto const& s : rg_slices) {
+      if (s.datasource) { total += s.datasource->read_stats(); }
+    }
+    return total;
+  }
+
   /// One fadvise_entry per row-group slice: the slice's datasource paired with
   /// the column-chunk byte ranges the read will fetch for that file's row groups
   /// (computed via @c hybrid_scan_reader::all_column_chunks_byte_ranges, honoring

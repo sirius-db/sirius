@@ -108,6 +108,30 @@ class scan_info : public std::enable_shared_from_this<scan_info> {
     return estimated_bytes();
   }
 
+  /**
+   * @brief Estimated on-disk (compressed) bytes this split will read, from
+   *        scan metadata. 0 when the format tracks no compressed estimate.
+   *
+   * For scan I/O telemetry (io_request Issued events); the measured
+   * counterpart is @ref io_totals.
+   */
+  [[nodiscard]] virtual std::size_t estimated_compressed_bytes() const noexcept { return 0; }
+
+  /**
+   * @brief Number of file read handles (datasources) this split reads through.
+   */
+  [[nodiscard]] virtual std::size_t datasource_count() const noexcept { return 0; }
+
+  /**
+   * @brief Summed lifetime read totals of this split's sirius datasources.
+   *
+   * Split datasources are per-split exclusive (parquet slices duplicate() the
+   * file datasource, duckdb-native opens one per split), so callers that
+   * snapshot before and after the materialize read get exactly that read's
+   * totals. Zeros when the split reads through non-sirius datasources.
+   */
+  [[nodiscard]] virtual sirius::io::io_read_stats io_totals() const noexcept { return {}; }
+
  protected:
   template <typename RangeFactory>
   static void append_fadvise_entry(std::vector<fadvise_entry>& entries,
