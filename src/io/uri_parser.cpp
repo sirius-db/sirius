@@ -229,4 +229,21 @@ parsed_uri parse(std::string_view uri)
   return out;
 }
 
+std::string strip_file_scheme(std::string_view path)
+{
+  // Deliberately NOT implemented via parse(): this runs on every datasource open,
+  // must not throw on inputs parse() rejects (relative paths, empty keys), and
+  // must return the ORIGINAL bytes for everything it does not strip — no
+  // percent-decoding, no normalization of any other scheme.
+  constexpr std::string_view kFileSchemePrefix = "file://";
+  if (path.size() <= kFileSchemePrefix.size()) { return std::string{path}; }
+  for (std::size_t i = 0; i < kFileSchemePrefix.size(); ++i) {
+    if (std::tolower(static_cast<unsigned char>(path[i])) !=
+        static_cast<unsigned char>(kFileSchemePrefix[i])) {
+      return std::string{path};
+    }
+  }
+  return std::string{path.substr(kFileSchemePrefix.size())};
+}
+
 }  // namespace sirius::io

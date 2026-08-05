@@ -20,6 +20,7 @@
 
 #include <cucascade/memory/memory_space.hpp>
 #include <duckdb/common/exception.hpp>
+#include <io/uri_parser.hpp>
 #include <log/logging.hpp>
 #include <op/scan/iceberg_gpu_ingestible.hpp>
 
@@ -184,15 +185,15 @@ void iceberg_gpu_ingestible::build_delete_key_map(
   // deletes for that file, and the scan returns deleted rows while looking healthy. So the
   // correspondence is established once, explicitly, and a file whose deletes cannot be
   // attributed to exactly one scanned file declines the whole scan to CPU.
-  auto strip_scheme = [](std::string_view path) -> std::string_view {
-    constexpr std::string_view kFileScheme = "file://";
-    return path.starts_with(kFileScheme) ? path.substr(kFileScheme.size()) : path;
-  };
-
   // One is a suffix of the other on a path-component boundary — the relative/absolute case.
-  auto same_file = [&](std::string_view a, std::string_view b) {
-    a = strip_scheme(a);
-    b = strip_scheme(b);
+  // Scheme stripping uses the shared helper so delete-key matching and the I/O layer agree on
+  // what "the same file" means; the local lambda this replaced was case-SENSITIVE, so a manifest
+  // written with `FILE://` would have failed to match and silently found no deletes for that file.
+  auto same_file = [&](std::string_view a_in, std::string_view b_in) {
+    auto const a_str = sirius::io::strip_file_scheme(a_in);
+    auto const b_str = sirius::io::strip_file_scheme(b_in);
+    std::string_view a{a_str};
+    std::string_view b{b_str};
     if (a == b) { return true; }
     std::string_view longer  = a.size() >= b.size() ? a : b;
     std::string_view shorter = a.size() >= b.size() ? b : a;

@@ -19,6 +19,7 @@
 #include "io/cache/config.hpp"
 #include "io/cache/prefetching_cache.hpp"
 #include "io/sirius_datasource.hpp"
+#include "io/uri_parser.hpp"
 
 #include <cassert>
 #include <cmath>
@@ -69,20 +70,29 @@ std::unique_ptr<sirius_datasource> sirius_ioctx::open_datasource(std::string pat
   // ...) and wrap it in a sirius_datasource bound to this ioctx.  Datasource
   // construction is uniform across backends, so it lives here rather than in a
   // per-backend hook.
-  return std::make_unique<sirius_datasource>(shared_from_this(), create_io_object(std::move(path)));
+  //
+  // `file://` is stripped HERE, at the single funnel above the create_io_object
+  // virtual, rather than at each call site: sirius_scan_manager normalizes on the
+  // paths it owns, but callers that hold an ioctx and open directly
+  // (parquet_gpu_ingestible::build_file_scan_info, iceberg_metadata_reader's
+  // delete-file reads, duckdb_native_gpu_ingestible) bypassed it entirely. An
+  // un-stripped URI reaches the local reactor's "unsupported path" throw, which
+  // becomes a RUNTIME fallback rather than a clean plan-time decline.
+  return std::make_unique<sirius_datasource>(shared_from_this(),
+                                             create_io_object(strip_file_scheme(path)));
 }
 
 std::unique_ptr<sirius_datasource> sirius_ioctx::open_datasource(std::string path, open_hint hint)
 {
   return std::make_unique<sirius_datasource>(shared_from_this(),
-                                             create_io_object(std::move(path), hint));
+                                             create_io_object(strip_file_scheme(path), hint));
 }
 
 std::unique_ptr<sirius_datasource> sirius_ioctx::open_datasource(std::string path,
                                                                  std::uint64_t known_size)
 {
-  return std::make_unique<sirius_datasource>(shared_from_this(),
-                                             create_io_object(std::move(path), known_size));
+  return std::make_unique<sirius_datasource>(
+    shared_from_this(), create_io_object(strip_file_scheme(path), known_size));
 }
 
 std::shared_ptr<sirius_io_object> sirius_ioctx::create_io_object(std::string path,
