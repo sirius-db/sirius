@@ -52,7 +52,9 @@ def catalog_for(name, uri_style=False):
     root = os.path.join(OUT, name)
     os.makedirs(root, exist_ok=True)
     warehouse = f"file://{root}" if uri_style else root
-    cat = SqlCatalog(name, **{"uri": f"sqlite:///{root}/catalog.db", "warehouse": warehouse})
+    cat = SqlCatalog(
+        name, **{"uri": f"sqlite:///{root}/catalog.db", "warehouse": warehouse}
+    )
     cat.create_namespace("conf")
     return cat, root
 
@@ -66,9 +68,11 @@ def record(name, table, root, expect_gpu, why):
     cases.append(
         {
             "name": name,
-            "table_dir": os.path.join(root, "conf.db", name)
-            if os.path.isdir(os.path.join(root, "conf.db", name))
-            else os.path.join(root, "conf", name),
+            "table_dir": (
+                os.path.join(root, "conf.db", name)
+                if os.path.isdir(os.path.join(root, "conf.db", name))
+                else os.path.join(root, "conf", name)
+            ),
             "columns": cols,
             "field_ids": {f.name: f.field_id for f in table.schema().fields},
             "expected_rows": rows,
@@ -76,7 +80,9 @@ def record(name, table, root, expect_gpu, why):
             "why": why,
         }
     )
-    print(f"  {name}: {len(rows)} rows, fields={ {f.name: f.field_id for f in table.schema().fields} }")
+    print(
+        f"  {name}: {len(rows)} rows, fields={ {f.name: f.field_id for f in table.schema().fields} }"
+    )
 
 
 # ---------------------------------------------------------------- append_only
@@ -86,8 +92,13 @@ cat, root = catalog_for("append_only")
 s = pa.schema([("id", pa.int32()), ("name", pa.string())])
 t = cat.create_table("conf.append_only", schema=s)
 t.append(pa.table({"id": [1, 2, 3], "name": ["a", "b", "c"]}, schema=s))
-record("append_only", cat.load_table("conf.append_only"), root, True,
-       "no schema evolution, no deletes - the GPU path's happy case")
+record(
+    "append_only",
+    cat.load_table("conf.append_only"),
+    root,
+    True,
+    "no schema evolution, no deletes - the GPU path's happy case",
+)
 
 # ---------------------------------------------------------------- drop_readd
 # The silent-wrong-results case. `y` is dropped and re-added under the SAME name,
@@ -102,8 +113,13 @@ with t.update_schema() as u:
     u.delete_column("y")
 with t.update_schema() as u:
     u.add_column("y", IntegerType())
-record("drop_readd", cat.load_table("conf.drop_readd"), root, False,
-       "dropped and re-added column: old file's y is a DIFFERENT field id, must read NULL")
+record(
+    "drop_readd",
+    cat.load_table("conf.drop_readd"),
+    root,
+    False,
+    "dropped and re-added column: old file's y is a DIFFERENT field id, must read NULL",
+)
 
 # ---------------------------------------------------------------- rename_col
 # Renaming keeps the field id and changes the name. The old data file carries the
@@ -117,8 +133,13 @@ with t.update_schema() as u:
     u.rename_column("val", "value")
 s2 = pa.schema([("id", pa.int32()), ("value", pa.string())])
 t.append(pa.table({"id": [3, 4], "value": ["new_c", "new_d"]}, schema=s2))
-record("rename_col", cat.load_table("conf.rename_col"), root, False,
-       "renamed column: same field id, old file carries the original name")
+record(
+    "rename_col",
+    cat.load_table("conf.rename_col"),
+    root,
+    False,
+    "renamed column: same field id, old file carries the original name",
+)
 
 # ---------------------------------------------------------------- add_column
 # The case a max(field_id) > column_count pre-filter MISSES. A column added after
@@ -131,8 +152,13 @@ with t.update_schema() as u:
     u.add_column("b", IntegerType())
 s2 = pa.schema([("id", pa.int32()), ("a", pa.int32()), ("b", pa.int32())])
 t.append(pa.table({"id": [3, 4], "a": [30, 40], "b": [300, 400]}, schema=s2))
-record("add_column", cat.load_table("conf.add_column"), root, False,
-       "column added after the first data file: absent from that file, must read NULL")
+record(
+    "add_column",
+    cat.load_table("conf.add_column"),
+    root,
+    False,
+    "column added after the first data file: absent from that file, must read NULL",
+)
 
 # ---------------------------------------------------------------- file_uri
 # Warehouse configured as a URI, so manifests record `file:///...` data-file paths -
@@ -144,11 +170,18 @@ if not IN_TREE:
     s = pa.schema([("id", pa.int32()), ("name", pa.string())])
     t = cat.create_table("conf.file_uri", schema=s)
     t.append(pa.table({"id": [1, 2, 3], "name": ["a", "b", "c"]}, schema=s))
-    record("file_uri", cat.load_table("conf.file_uri"), root, True,
-           "manifests carry file:// URIs (Java/Spark shape); must run on GPU, not fall back")
+    record(
+        "file_uri",
+        cat.load_table("conf.file_uri"),
+        root,
+        True,
+        "manifests carry file:// URIs (Java/Spark shape); must run on GPU, not fall back",
+    )
 else:
-    print("  file_uri: SKIPPED for in-tree generation (needs an absolute file:// URI;"
-          " covered in-tree by the strip_file_scheme unit tests)")
+    print(
+        "  file_uri: SKIPPED for in-tree generation (needs an absolute file:// URI;"
+        " covered in-tree by the strip_file_scheme unit tests)"
+    )
 
 with open(os.path.join(OUT, "expectations.json"), "w") as f:
     json.dump({"cases": cases}, f, indent=2)

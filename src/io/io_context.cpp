@@ -91,8 +91,8 @@ std::unique_ptr<sirius_datasource> sirius_ioctx::open_datasource(std::string pat
 std::unique_ptr<sirius_datasource> sirius_ioctx::open_datasource(std::string path,
                                                                  std::uint64_t known_size)
 {
-  return std::make_unique<sirius_datasource>(
-    shared_from_this(), create_io_object(strip_file_scheme(path), known_size));
+  return std::make_unique<sirius_datasource>(shared_from_this(),
+                                             create_io_object(strip_file_scheme(path), known_size));
 }
 
 std::shared_ptr<sirius_io_object> sirius_ioctx::create_io_object(std::string path,
