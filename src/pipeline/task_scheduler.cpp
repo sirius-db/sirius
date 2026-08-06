@@ -195,12 +195,6 @@ void task_scheduler::prepare_for_query(duckdb::shared_ptr<planner::query> query)
   for (auto& [device_id, gpu_exec] : _gpu_executors) {
     gpu_exec->set_completion_handler(_completion_handler.get());
   }
-
-  // Reset the round-robin counter so the walk is reproducible across
-  // iterations of the same query (cache=table_gpu warm path keys cache
-  // entries by device_id; without this reset the second iteration's source
-  // tasks would assign to a different GPU and miss the cache entries).
-  _no_pref_rr_counter.store(0, std::memory_order_relaxed);
 }
 
 std::future<void> task_scheduler::start_query()
@@ -368,7 +362,7 @@ void task_scheduler::management_eventloop()
       // (lowest value) task preferring exactly this device.
       task = _task_queue.try_pop_from(exec::gpu_index{device_id}).value_or(nullptr);
       if (!task) {
-        // pick a task with no preference (any device will do). The round-robin counter
+        // Pick a task with no preference; any ready device may claim it.
         task =
           _task_queue.try_pop_from(exec::gpu_index{exec::no_preferred_device}).value_or(nullptr);
       }

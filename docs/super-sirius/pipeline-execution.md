@@ -220,52 +220,33 @@ If the batch is already on `target_space`, it is locked in place. If it is on a 
 
 **Postcondition.** When `prepare_for_processing` returns successfully, every batch in `_input_data->_data_batches` lives on `requested_memory_space`. Therefore the per-operator expression `batches[0]->get_memory_space() == target_space` holds at every audited read site. Operators that walk every batch and adopt the first non-null batch's space (e.g. `sirius_physical_sort_sample.cpp:112`, `sirius_physical_merge_sort.cpp:92`, `sirius_physical_table_scan.cpp:129`) are safe by the same postcondition.
 
-### The SCHED-RR distribution policy
+### Ready-device matching policy
 
-The contract above is necessary because the scheduler distributes preference-less tasks across multiple GPUs. The distribution policy itself lives in three places.
+The contract above is necessary because a preference-less task may execute on any ready GPU. The scheduler uses pull signals so tasks remain in its downgrade-visible queue until an executor has reserved a worker thread.
 
-**Storage: deterministic ordering.** `src/include/pipeline/task_scheduler.hpp:224-228`:
-
-```cpp
-/// device_id -> GPU executor. std::map (not unordered_map) so iteration
-/// order is deterministic (ascending by device_id) — keeps preference-less
-/// task dispatch reproducible across runs.
-std::map<int, std::unique_ptr<gpu_pipeline_executor>> _gpu_executors;
-std::atomic<size_t> _no_pref_rr_counter{0};
-```
-
-`std::map` gives an ascending-by-`device_id` iteration order, which makes `_gpu_executors.begin()` deterministic instead of hash-bucket-dependent and makes `std::advance(it, idx)` walk a fixed sequence.
-
-**Per-query reset.** `src/pipeline/task_scheduler.cpp:156-160`, inside `task_scheduler::prepare_for_query`:
+**Ready-device tracking.** Each `gpu_pipeline_executor` publishes `device_ready` only after reserving a worker slot. The management thread records those device IDs and removes one after dispatching a task to it.
 
 ```cpp
-// Reset SCHED-RR counter so the round-robin walk is reproducible across
-// iterations of the same query (cache=table_gpu warm path keys cache
-// entries by device_id; without this reset the second iteration's source
-// tasks would assign to a different GPU and miss the cache entries).
-_no_pref_rr_counter.store(0, std::memory_order_relaxed);
-```
-
-The reset is mandatory for `cache=table_gpu` warm-path correctness. Without it, iteration `N+1` of the same query would dispatch preference-less source tasks to a different starting GPU than iteration `N`, missing the per-device cache populated on iteration `N`. Phase 13 follow-up #17 scale-up test is the regression gate that locks this behavior in.
-
-**Per-task round-robin walk.** `src/pipeline/task_scheduler.cpp:259-265`, inside `management_eventloop`:
-
-```cpp
-if (!have_pref && _gpu_executors.size() > 1) {
-  auto idx = _no_pref_rr_counter.fetch_add(1, std::memory_order_relaxed) %
-             _gpu_executors.size();
-  auto it = _gpu_executors.begin();
-  std::advance(it, idx);
-  target_device_id = it->first;
+if (evt->kind == task_request_kind::device_ready && !evt->is_scan) {
+  _ready_devices.emplace_back(evt->device_id);
 }
 ```
 
-The walk is gated on `!have_pref && _gpu_executors.size() > 1` so two configurations stay untouched:
+`schedule()` publishes `task_available`, which wakes the matcher when a task arrives after a device has become ready.
 
-- **1-GPU configurations.** The single executor is always picked by the line just above this block (`int target_device_id = _gpu_executors.begin()->first;`).
-- **Preference-bearing tasks.** `SCHED-01/02/04` tasks (data-locality-bearing, e.g. downstream pipeline tasks consuming a specific repository) keep their `preferred_device_id` and skip the round-robin walk entirely. Locality is preserved.
+**Per-device match.** For each ready device, the scheduler first pops a task with that exact preferred device. If none exists, it pops a task with no preference.
 
-Only *preference-less* source-pipeline tasks (metadata scans, parquet scans with no upstream locality) round-robin across GPUs.
+```cpp
+task = _task_queue.try_pop_from(exec::gpu_index{device_id}).value_or(nullptr);
+if (!task) {
+  task =
+    _task_queue.try_pop_from(exec::gpu_index{exec::no_preferred_device}).value_or(nullptr);
+}
+```
+
+A preference is binding: another ready GPU cannot claim that task. A preference-less task may be claimed by whichever ready device the management thread considers. With multiple ready devices, each independently searches for an exact-preference task before falling back to the shared no-preference bucket. There is no counter, offset, or round-robin ordering guarantee in this matcher.
+
+`test/cpp/operator/test_mgpu_stress.cpp` covers these routing invariants with a task pinned to each available test GPU plus one preference-less task, without relying on scheduling order or timing.
 
 ### Migration note (Phase 14)
 
@@ -275,11 +256,10 @@ If you are reading older operator code that says "all batches are expected to sh
 
 ### Empirical evidence
 
-Three pieces of evidence corroborate that the contract holds for every currently-shipping operator:
+Two pieces of evidence corroborate that the contract holds for every currently-shipping operator:
 
 - **Phase 14 ship-validation** — `[mgpu]` 12/13 PASS, `[TPC-H][parquet]` 22/22 PASS, `[integration][TPC-H]` 48/48 PASS (71608 assertions). The single `[mgpu]` fail is the Phase-12-territory `physical_order - small sort stays single-GPU` `vector::_M_range_check`, fixed on `fix/order-small-sort-rangecheck` and unrelated to operator colocation.
 - **Phase 15 Wave 1 audit** — All 11 operator sites that read `valid_batches[0]->get_memory_space()` (or equivalent) are classified `SAFE` based on upstream-trace through `gpu_pipeline_task::execute -> pipelineable_operator_data::prepare_for_processing -> lock_or_prepare_batch`. The per-site classification table and justification were recorded in the Phase 15 audit log.
-- **Phase 15 Wave 2 stress test** — `test/cpp/operator/test_mgpu_stress.cpp` exercises five representative `[mgpu]` queries under 100 distinct `_no_pref_rr_counter` starting offsets (500 inner runs, 77053 assertions), each asserting CPU baseline match via `require_gpu_matches_cpu`. PASS in 86.6s on `2 × RTX 6000 Ada`. Catches hash-bucket-order-dependent bugs and any latent off-by-one that a counter-always-starts-at-0 test would mask.
 
 ### For new operator authors
 
