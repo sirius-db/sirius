@@ -109,7 +109,11 @@ namespace sirius::scan_manager {
 /// owns the match logic that @ref sirius_scan_manager::try_match_cached_entry consults.
 class cache_entry_info {
  public:
-  std::vector<std::string> resolved_file_paths;    ///< parquet identity (file set)
+  std::vector<std::string> resolved_file_paths;  ///< parquet identity (file set)
+  /// True when the parquet scan behind this entry read byte-range subsets of its files. A
+  /// ranged scan holds a fraction of each file's rows, so it neither serves nor is served by
+  /// the cache — matching on the file set alone would silently return extra or missing rows.
+  bool has_byte_ranges = false;
   std::string catalog_name;                        ///< duckdb identity: catalog (attach alias)
   std::string schema_name;                         ///< duckdb identity: schema
   std::string table_name;                          ///< duckdb identity: table

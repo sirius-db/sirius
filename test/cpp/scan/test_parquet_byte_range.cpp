@@ -18,14 +18,23 @@
 #include <catch.hpp>
 
 // sirius
+#include <io/kvikio/kvikio_context.hpp>
 #include <op/scan/parquet_byte_range.hpp>
+#include <op/scan/parquet_gpu_ingestible.hpp>
 #include <sirius/exception.hpp>
 
 // cudf
+#include <cudf/column/column_factories.hpp>
 #include <cudf/io/datasource.hpp>
 #include <cudf/io/experimental/hybrid_scan.hpp>
+#include <cudf/io/parquet.hpp>
 #include <cudf/io/parquet_io_utils.hpp>
 #include <cudf/io/parquet_schema.hpp>
+#include <cudf/table/table_view.hpp>
+#include <cudf/utilities/default_stream.hpp>
+
+// rmm
+#include <rmm/device_buffer.hpp>
 
 // standard library
 #include <algorithm>
@@ -225,4 +234,137 @@ TEST_CASE("real footer: rule agrees with cudf's byte-range filter on the test li
     WARN("cudf filter_row_groups_with_byte_range diverges from the StarRocks rule: cudf="
          << cudf_left.size() << " ours=" << left.size());
   }
+}
+
+namespace {
+
+/// Writes a one-column (a BIGINT, values 0..rows-1) parquet with `rows / rows_per_group` row
+/// groups, and returns its path. Deterministic row-group layout for the split-scan tests.
+fs::path write_multi_row_group_parquet(fs::path const& dir,
+                                       std::int64_t rows,
+                                       std::int64_t rows_per_group)
+{
+  auto const path = dir / "byte_range_scan.parquet";
+  auto stream     = cudf::get_default_stream();
+  std::vector<std::int64_t> host(rows);
+  std::iota(host.begin(), host.end(), 0);
+  rmm::device_buffer data(host.data(), rows * sizeof(std::int64_t), stream);
+  auto column = std::make_unique<cudf::column>(cudf::data_type{cudf::type_id::INT64},
+                                               static_cast<cudf::size_type>(rows),
+                                               std::move(data),
+                                               rmm::device_buffer{},
+                                               0);
+  cudf::table_view table({column->view()});
+  cudf::io::table_input_metadata metadata(table);
+  metadata.column_metadata[0].set_name("a");
+  auto options =
+    cudf::io::parquet_writer_options::builder(cudf::io::sink_info(path.string()), table)
+      .metadata(std::move(metadata))
+      .row_group_size_rows(rows_per_group)
+      .build();
+  cudf::io::write_parquet(options);
+  return path;
+}
+
+/// Table info for a byte-range scan of `path` projecting the single BIGINT column.
+std::unique_ptr<sirius::op::scan::parquet_ingestible_table_info> ranged_info(fs::path const& path,
+                                                                             std::uint64_t start,
+                                                                             std::uint64_t length)
+{
+  auto info                  = std::make_unique<sirius::op::scan::parquet_ingestible_table_info>();
+  info->resolved_file_paths  = {path.string()};
+  info->resolved_file_ranges = {{start, length}};
+  info->names                = {"a"};
+  info->returned_types.push_back(sirius::logical_type::make(sirius::type_id::BIGINT));
+  info->column_ids.push_back(duckdb::ColumnIndex(0));
+  info->scan_output_arity      = 1;
+  info->approximate_batch_size = std::size_t{1} << 30;
+  return info;
+}
+
+/// Drives the ingestible for one range and returns the selected row-group indices plus the
+/// number of rows they hold (from the footer metadata — no decode needed).
+std::pair<std::vector<cudf::size_type>, std::int64_t> scan_selection(
+  std::unique_ptr<sirius::op::scan::parquet_ingestible_table_info> info)
+{
+  auto ingestible = sirius::op::scan::make_ingestible(std::move(info));
+  auto ioctx      = std::make_shared<sirius::io::kvikio_context>();
+  auto task       = ingestible->next_split_provider(
+    [ioctx](std::string_view) -> std::shared_ptr<sirius::io::sirius_ioctx> { return ioctx; });
+  REQUIRE(task);
+  auto file = task();
+  REQUIRE(file);
+
+  // Splits materialize downstream of the coalescer, exactly as in production.
+  auto coalescer = ingestible->create_batch_coalescer();
+  auto batches   = coalescer->push(std::move(file));
+  for (auto& batch : coalescer->flush()) {
+    batches.push_back(std::move(batch));
+  }
+
+  std::vector<cudf::size_type> indices;
+  std::int64_t rows = 0;
+  for (auto const& batch : batches) {
+    auto* split = dynamic_cast<sirius::op::scan::parquet_split_info*>(batch.get());
+    REQUIRE(split);
+    for (auto const& slice : split->rg_slices) {
+      for (auto const idx : slice.row_group_indices) {
+        indices.push_back(idx);
+        rows += slice.file_metadata->row_groups.at(idx).num_rows;
+      }
+    }
+  }
+  std::sort(indices.begin(), indices.end());
+  return {indices, rows};
+}
+
+}  // namespace
+
+TEST_CASE("a two-way split scan selects disjoint, complete row groups",
+          "[parquet_byte_range][scan]")
+{
+  auto const dir = fs::temp_directory_path() / "sirius_byte_range_test";
+  fs::create_directories(dir);
+  // cudf clamps row_group_size_rows to a 5000-row floor; 50k rows -> 10 real row groups of
+  // sequential int64s, large enough that both halves of the file hold data pages.
+  constexpr std::int64_t kRows = 50000;
+  auto const path              = write_multi_row_group_parquet(dir, kRows, 5000);
+  auto const file_size         = std::uint64_t(fs::file_size(path));
+  auto const half              = file_size / 2;
+
+  auto [left_rgs, left_rows]   = scan_selection(ranged_info(path, 0, half));
+  auto [right_rgs, right_rows] = scan_selection(ranged_info(path, half, file_size - half));
+
+  INFO("left row groups: " << left_rgs.size() << ", right: " << right_rgs.size());
+  REQUIRE(!left_rgs.empty());
+  REQUIRE(!right_rgs.empty());
+  for (auto const idx : left_rgs) {
+    REQUIRE(std::find(right_rgs.begin(), right_rgs.end(), idx) == right_rgs.end());
+  }
+  REQUIRE(left_rows + right_rows == kRows);
+
+  // A whole-file scan ((0,0) range) is byte-identical to no range at all.
+  auto [all_rgs, all_rows] = scan_selection(ranged_info(path, 0, 0));
+  REQUIRE(all_rows == kRows);
+  REQUIRE(std::int64_t(left_rgs.size() + right_rgs.size()) == std::int64_t(all_rgs.size()));
+
+  // A range inside one row group is a valid empty scan.
+  auto [none_rgs, none_rows] = scan_selection(ranged_info(path, 10, 5));
+  REQUIRE(none_rgs.empty());
+  REQUIRE(none_rows == 0);
+
+  fs::remove_all(dir);
+}
+
+TEST_CASE("mismatched range/path pairing is refused at construction", "[parquet_byte_range][scan]")
+{
+  auto info                  = std::make_unique<sirius::op::scan::parquet_ingestible_table_info>();
+  info->resolved_file_paths  = {"a.parquet", "b.parquet"};
+  info->resolved_file_ranges = {{0, 10}};
+  info->names                = {"a"};
+  info->returned_types.push_back(sirius::logical_type::make(sirius::type_id::BIGINT));
+  info->column_ids.push_back(duckdb::ColumnIndex(0));
+  info->scan_output_arity = 1;
+  REQUIRE_THROWS_AS(sirius::op::scan::make_ingestible(std::move(info)),
+                    sirius::invalid_input_exception);
 }
