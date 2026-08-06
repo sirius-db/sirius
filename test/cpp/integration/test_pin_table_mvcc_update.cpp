@@ -21,9 +21,13 @@
 
 #include <catch.hpp>
 #include <duckdb.hpp>
+#include <duckdb/main/database_manager.hpp>
+#include <duckdb/transaction/duck_transaction_manager.hpp>
 #include <utils/gpu_execution_fixture.hpp>
 #include <utils/transparent_execution_test_utils.hpp>
 
+#include <chrono>
+#include <future>
 #include <string>
 
 using PinMvccUpdateFixture = sirius::test::GpuExecutionFixture;
@@ -147,6 +151,33 @@ TEST_CASE_METHOD(PinMvccUpdateFixture,
   REQUIRE_THAT(result->GetError(), Catch::Contains("CALL unpin_table('t')"));
 
   run_ok("SET enable_duckdb_fallback = true;");
+  run_ok("CALL unpin_table('t');");
+}
+
+TEST_CASE_METHOD(PinMvccUpdateFixture,
+                 "mvcc update guard: query validation waits for an active checkpoint fence",
+                 "[integration][gpu_execution][pin_table_mvcc_update]")
+{
+  run_ok("CREATE TABLE t AS SELECT range::INTEGER AS k, range::INTEGER AS v FROM range(1000);");
+  run_ok("CHECKPOINT;");
+  run_ok("CALL pin_table(format='duckdb', name='t', tier='gpu');");
+  run_ok("UPDATE t SET v = 99 WHERE k = 1;");
+
+  auto attached = duckdb::DatabaseManager::Get(*con->context).GetDatabase(attach_alias);
+  REQUIRE(attached);
+  auto checkpoint_lock = duckdb::DuckTransactionManager::Get(*attached).TryGetCheckpointLock();
+  REQUIRE(checkpoint_lock);
+
+  auto query =
+    std::async(std::launch::async, [&] { return con->Query("SELECT v FROM t WHERE k = 1;"); });
+  auto const wait_status = query.wait_for(std::chrono::milliseconds(100));
+  checkpoint_lock.reset();
+  REQUIRE(wait_status == std::future_status::timeout);
+
+  auto result = query.get();
+  REQUIRE(result);
+  REQUIRE_FALSE(result->HasError());
+  REQUIRE(result->GetValue(0, 0) == duckdb::Value::INTEGER(99));
   run_ok("CALL unpin_table('t');");
 }
 
