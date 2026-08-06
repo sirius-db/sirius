@@ -23,8 +23,16 @@
 #include <rmm/cuda_stream_view.hpp>
 
 #include <cstddef>
+#include <cstdint>
+#include <functional>
+#include <memory>
+#include <optional>
+#include <span>
+#include <vector>
 
 namespace sirius::op {
+
+class sirius_dynamic_bloom_filter;
 
 //===----------------------------------------------------------------------===//
 // publish_dynamic_filters
@@ -83,5 +91,66 @@ struct dynamic_filter_publication_outcome {
   dynamic_filter_publish_plan const& plan,
   cudf::table_view const& build_view,
   rmm::cuda_stream_view stream);
+
+/**
+ * @brief Result of one exact-ID multi-partition contribution
+ */
+struct dynamic_filter_accumulation_result {
+  enum class status : std::uint8_t { pending, duplicate, published, aborted };
+
+  status state = status::pending;
+  dynamic_filter_publication_outcome publication;
+};
+
+namespace detail {
+/**
+ * @brief Internal deterministic seams for accumulator concurrency and failure tests
+ *
+ * Empty callbacks preserve production behavior. This is not a runtime extension point.
+ */
+struct dynamic_filter_accumulator_test_hooks {
+  std::function<void(std::uint64_t)> after_id_claim;     ///< After an ID becomes in flight
+  std::function<void(std::uint64_t)> after_insert_sync;  ///< After insertion, before completion
+  std::function<void(sirius_dynamic_bloom_filter&,
+                     std::span<dynamic_filter_replica_space const>)>
+    strict_replicate;  ///< Replaces strict replication at the pre-fan-out boundary
+};
+}  // namespace detail
+
+/**
+ * @brief Exact-ID accumulator for one globally complete multi-partition Bloom snapshot
+ *
+ * The expected original pre-scatter batch IDs and global row count are frozen at the build sizing
+ * barrier. Contributions are idempotent by batch ID. No filter is replicated or exposed until
+ * every expected ID has completed insertion.
+ */
+class dynamic_filter_accumulator final {
+ public:
+  dynamic_filter_accumulator(dynamic_filter_publish_plan const& plan,
+                             std::size_t build_rows,
+                             std::vector<std::uint64_t> expected_batch_ids);
+  dynamic_filter_accumulator(dynamic_filter_publish_plan const& plan,
+                             std::size_t build_rows,
+                             std::vector<std::uint64_t> expected_batch_ids,
+                             detail::dynamic_filter_accumulator_test_hooks test_hooks);
+  ~dynamic_filter_accumulator();
+
+  dynamic_filter_accumulator(dynamic_filter_accumulator const&)            = delete;
+  dynamic_filter_accumulator& operator=(dynamic_filter_accumulator const&) = delete;
+
+  [[nodiscard]] dynamic_filter_accumulation_result contribute(std::uint64_t batch_id,
+                                                              cudf::table_view const& build_view,
+                                                              rmm::cuda_stream_view stream);
+
+  /// Atomically abort an incomplete accumulator and return its outcome only to the closing caller.
+  [[nodiscard]] std::optional<dynamic_filter_publication_outcome> abort_if_incomplete() noexcept;
+
+  [[nodiscard]] bool complete() const noexcept;
+  [[nodiscard]] bool aborted() const noexcept;
+
+ private:
+  struct impl;
+  std::unique_ptr<impl> _impl;
+};
 
 }  // namespace sirius::op

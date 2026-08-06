@@ -24,6 +24,7 @@
  * claim condition itself rather than any partitioning decision that leads to it.
  */
 
+#include "data/data_batch_utils.hpp"
 #include "expression/join_condition.hpp"
 #include "helper/type_conversions.hpp"
 #include "op/dynamic_filter/dynamic_filter_stats.hpp"
@@ -76,7 +77,8 @@ struct claim_fixture {
   duckdb::unique_ptr<duckdb::LogicalComparisonJoin> logical_join;
   duckdb::unique_ptr<sirius_physical_hash_join> hash_join;
 
-  explicit claim_fixture(duckdb::JoinType join_type = duckdb::JoinType::INNER)
+  explicit claim_fixture(duckdb::JoinType join_type  = duckdb::JoinType::INNER,
+                         bool enable_multi_partition = false)
   {
     channel->register_producer();
 
@@ -139,7 +141,8 @@ struct claim_fixture {
       std::move(plan),
       sirius::config::DEFAULT_HASH_PARTITION_BYTES,
       sirius::config::DEFAULT_MAX_BROADCAST_JOIN_SIZE,
-      &stats);
+      &stats,
+      enable_multi_partition);
 
     // This is a bare operator tree with no pipelines, so the converter's assign_operator_ids never
     // runs over it; operator code rejects the unassigned sentinel.
@@ -163,15 +166,25 @@ struct claim_fixture {
     REQUIRE(stats.producers_enabled.load() == 1);
   }
 
+  template <typename T>
+  [[nodiscard]] std::shared_ptr<cucascade::data_batch> make_typed_build_batch(cudf::type_id type_id)
+  {
+    std::vector<T> keys(kBuildRows);
+    for (std::size_t i = 0; i < keys.size(); ++i) {
+      keys[i] = static_cast<T>(i);
+    }
+    return sirius::test::operator_utils::make_numeric_batch<T>(*gpu_space, keys, type_id);
+  }
+
   /// A GPU-resident single-column build batch of distinct INT64 keys.
   [[nodiscard]] std::shared_ptr<cucascade::data_batch> make_build_batch()
   {
-    std::vector<std::int64_t> keys(kBuildRows);
-    for (std::size_t i = 0; i < keys.size(); ++i) {
-      keys[i] = static_cast<std::int64_t>(i);
-    }
-    return sirius::test::operator_utils::make_numeric_batch<std::int64_t>(
-      *gpu_space, keys, cudf::type_id::INT64);
+    return make_typed_build_batch<std::int64_t>(cudf::type_id::INT64);
+  }
+
+  [[nodiscard]] std::shared_ptr<cucascade::data_batch> make_int32_build_batch()
+  {
+    return make_typed_build_batch<std::int32_t>(cudf::type_id::INT32);
   }
 
   void push_build_batch()
@@ -235,4 +248,59 @@ TEST_CASE("a wired join whose build is not whole reports the skip exactly once",
 
   CHECK(fixture.stats.publication_attempts.load() == 0);
   CHECK(fixture.channel->filters_for_column(kProbeColumnIndex).empty());
+}
+
+TEST_CASE("hash join arms a multi-partition snapshot exactly once and closes it incomplete",
+          "[dynamic_filter][publication_claim][accumulator]")
+{
+  claim_fixture fixture(duckdb::JoinType::INNER, true);
+  REQUIRE(fixture.hash_join->wants_multi_partition_dynamic_filters());
+
+  REQUIRE(fixture.hash_join->arm_multi_partition_dynamic_filters(2 * kBuildRows, {101, 202}, 2));
+  REQUIRE_FALSE(
+    fixture.hash_join->arm_multi_partition_dynamic_filters(2 * kBuildRows, {101, 202}, 2));
+  REQUIRE(fixture.stats.publication_attempts.load() == 1);
+
+  fixture.hash_join->finalize_operator();
+  REQUIRE(fixture.stats.publications_failed.load() == 1);
+  REQUIRE(fixture.stats.publications_finished.load() == 0);
+  REQUIRE(fixture.channel->empty());
+}
+
+TEST_CASE("an aborted accumulator folds policy counters into hash-join stats exactly once",
+          "[dynamic_filter][publication_claim][accumulator]")
+{
+  claim_fixture fixture(duckdb::JoinType::INNER, true);
+  auto first_batch    = fixture.make_build_batch();
+  auto mismatch_batch = fixture.make_int32_build_batch();
+  REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+
+  auto const first_id    = first_batch->get_batch_id();
+  auto const mismatch_id = mismatch_batch->get_batch_id();
+  REQUIRE(fixture.hash_join->arm_multi_partition_dynamic_filters(
+    2 * kBuildRows, {first_id, mismatch_id}, 2));
+
+  auto const stream = fixture.gpu_space->acquire_stream();
+  auto first_ro     = first_batch->to_read_only();
+  fixture.hash_join->contribute_dynamic_filter_build_batch(
+    first_id, sirius::get_cudf_table_view(first_ro), stream);
+  REQUIRE(fixture.stats.keys_considered.load() == 0);
+  REQUIRE(fixture.stats.keys_skipped_type_mismatch.load() == 0);
+
+  auto mismatch_ro = mismatch_batch->to_read_only();
+  fixture.hash_join->contribute_dynamic_filter_build_batch(
+    mismatch_id, sirius::get_cudf_table_view(mismatch_ro), stream);
+
+  REQUIRE(fixture.stats.keys_considered.load() == 1);
+  REQUIRE(fixture.stats.keys_skipped_type_mismatch.load() == 1);
+  REQUIRE(fixture.stats.membership_filters_built.load() == 0);
+  REQUIRE(fixture.stats.publications_finished.load() == 0);
+  REQUIRE(fixture.stats.publications_failed.load() == 1);
+  REQUIRE(fixture.stats.filters_pushed.load() == 0);
+  REQUIRE(fixture.channel->empty());
+
+  fixture.hash_join->contribute_dynamic_filter_build_batch(
+    mismatch_id, sirius::get_cudf_table_view(mismatch_ro), stream);
+  REQUIRE(fixture.stats.keys_skipped_type_mismatch.load() == 1);
+  REQUIRE(fixture.stats.publications_failed.load() == 1);
 }

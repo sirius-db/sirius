@@ -489,6 +489,17 @@ class sirius_dynamic_bloom_filter final : public sirius_dynamic_filter,
   sirius_dynamic_bloom_filter(cudf::column_view const& keys,
                               rmm::cuda_stream_view stream,
                               rmm::device_async_resource_ref mr);
+
+  /**
+   * @brief Create an empty Bloom with geometry sized for the complete build
+   *
+   * Later @ref add calls are idempotent and may insert disjoint build batches. The filter must not
+   * be published until every expected batch has completed.
+   */
+  sirius_dynamic_bloom_filter(cudf::data_type key_type,
+                              std::size_t expected_num_keys,
+                              rmm::cuda_stream_view stream,
+                              rmm::device_async_resource_ref mr);
   ~sirius_dynamic_bloom_filter() override;
 
   sirius_dynamic_bloom_filter(sirius_dynamic_bloom_filter const&)            = delete;
@@ -506,6 +517,30 @@ class sirius_dynamic_bloom_filter final : public sirius_dynamic_filter,
     rmm::device_async_resource_ref mr) const override;
 
   void replicate_to_devices(std::span<dynamic_filter_replica_space const> spaces) override;
+
+  /**
+   * @brief Replicate to every planned device or fail before publication
+   */
+  void replicate_to_devices_strict(std::span<dynamic_filter_replica_space const> spaces);
+
+  /**
+   * @brief Insert another build-key batch into this filter's source replica
+   */
+  void add(cudf::column_view const& keys, rmm::cuda_stream_view stream);
+
+  /**
+   * @brief OR another equal-geometry source replica into this filter on the deterministic root GPU
+   *
+   * The method uses at most one root-device scratch buffer and reuses it across calls.
+   */
+  void merge_from(sirius_dynamic_bloom_filter const& source,
+                  dynamic_filter_replica_space const& source_space,
+                  dynamic_filter_replica_space const& root_space,
+                  rmm::cuda_stream_view root_stream);
+
+  /// Release the bounded root-reduction scratch after its stream has synchronized.
+  void release_reduction_scratch();
+
   [[nodiscard]] bool is_available_on_device(int device_id) const noexcept override;
 
   /**

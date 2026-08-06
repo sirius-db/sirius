@@ -91,6 +91,7 @@ sirius:
     concat_batch_bytes:         805306368   # 768 MiB
     max_build_hash_table_bytes: 805306368   # 768 MiB
     enable_dynamic_filter: true    # scan and join-edge runtime filters
+    enable_dynamic_filter_multi_partition: false  # global Bloom for partitioned builds
     enable_dynamic_zone_map_filter: false  # optional parquet-read/native-post-decode min/max
     dynamic_filter_domain_coverage_threshold: 0.9  # skip keys the build's domain coverage exceeds
     dynamic_filter_keep_threshold: 0.9  # disable a scan's filtering when a split keeps > this fraction
@@ -359,7 +360,8 @@ batch default**. Each can still be overridden individually.
 | `max_broadcast_join_size` | 256 MiB | Max build-side size eligible for a broadcast join. A build below this size is replicated to every GPU (instead of hash-partitioned) when it is tiny, or when the DuckDB-estimated probe-to-build row ratio is at least `num_gpus * 1.25`. |
 | `max_sort_partition_memory_fraction` | 0.33 | Fraction of GPU memory per sort partition when `max_sort_partition_bytes` is 0 |
 | `mark_join_build_switch_ratio` | 8.0 | For STANDARD MARK joins, build on the smaller (left) side when `right_rows >= ratio * left_rows` (0 disables) |
-| `enable_dynamic_filter` | true | Enable runtime filters for eligible `BUILD_PROBE` joins. Targets may be probe scans or join-edge endpoints. |
+| `enable_dynamic_filter` | true | Enable runtime filters for eligible joins. Targets may be probe scans or join-edge endpoints. |
+| `enable_dynamic_filter_multi_partition` | false | Accumulate a global Bloom for eligible non-broadcast hash-partitioned builds with more than one partition. Requires `enable_dynamic_filter`. |
 | `enable_dynamic_zone_map_filter` | false | Publish build-key min/max filters in addition to membership filters. Parquet scans use them for row-group pruning; duckdb-native scans apply them post-decode. Requires `enable_dynamic_filter`. |
 | `dynamic_filter_domain_coverage_threshold` | 0.9 | Skip publishing a key's membership filter when the build covers at least this fraction of the key's unfiltered base-table row bound. Fires only for build keys proven unique in their base relation, with evidence from DuckDB-native scans; the zone-map range gate receives no domain and stays inactive. A value above 1.0 is the explicit disabled state (the rollback lever: setting it above 1.0 restores pre-gate publication behavior without disabling dynamic filtering); exactly 1.0 fires only at full coverage. |
 | `dynamic_filter_keep_threshold` | 0.9 | Disable a probe scan's post-decode dynamic filtering once a measured split keeps more than this fraction of its rows; in [0, 1], 1.0 keeps filtering always on. |
@@ -561,13 +563,15 @@ rejected as unknown, and the old `SET` variables no longer exist.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `enable_dynamic_filter` | true | Enable runtime filters for eligible `BUILD_PROBE` joins. Targets may be probe scans or join-edge endpoints. |
+| `enable_dynamic_filter` | true | Enable runtime filters for eligible joins. Targets may be probe scans or join-edge endpoints. |
+| `enable_dynamic_filter_multi_partition` | false | Accumulate a global Bloom for eligible non-broadcast hash-partitioned builds with more than one partition. Requires `enable_dynamic_filter`. |
 | `enable_dynamic_zone_map_filter` | false | Publish build-key min/max filters in addition to membership filters. Parquet scans use them for row-group pruning; duckdb-native scans apply them post-decode. Requires `enable_dynamic_filter`. |
 | `dynamic_filter_domain_coverage_threshold` | 0.9 | Skip publishing a key's membership filter when the build covers at least this fraction of the key's unfiltered base-table row bound. Fires only for build keys proven unique in their base relation, with evidence from DuckDB-native scans; the zone-map range gate receives no domain and stays inactive. A value above 1.0 is the explicit disabled state (the rollback lever: setting it above 1.0 restores pre-gate publication behavior without disabling dynamic filtering); exactly 1.0 fires only at full coverage. |
 | `dynamic_filter_keep_threshold` | 0.9 | Disable a probe scan's post-decode dynamic filtering once a measured split keeps more than this fraction of its rows; in [0, 1], 1.0 keeps filtering always on. |
 
 ```sql
 SET enable_dynamic_filter = true;
+SET enable_dynamic_filter_multi_partition = false;
 SET enable_dynamic_zone_map_filter = false;
 ```
 

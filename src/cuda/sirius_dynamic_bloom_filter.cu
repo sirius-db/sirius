@@ -19,6 +19,7 @@
 
 // cucascade
 #include <rmm/cuda_device.hpp>
+#include <rmm/device_buffer.hpp>
 
 #include <cuco/bloom_filter.cuh>
 #include <cuco/bloom_filter_policies.cuh>
@@ -39,6 +40,7 @@
 #include <memory>
 #include <new>
 #include <stdexcept>
+#include <string>
 #include <type_traits>
 #include <utility>
 #include <variant>
@@ -48,8 +50,9 @@ namespace sirius::op {
 
 namespace {
 // ~16 bits/key → num_blocks ≈ keys/16
-constexpr std::size_t kBitsPerBlock     = 256;
-constexpr std::size_t kTargetBitsPerKey = 16;
+constexpr std::size_t kBitsPerBlock                 = 256;
+constexpr std::size_t kTargetBitsPerKey             = 16;
+constexpr std::size_t kMaximumReductionScratchBytes = 4U * 1024U * 1024U;
 
 std::size_t blocks_for(std::size_t num_keys)
 {
@@ -116,6 +119,13 @@ void copy_filter_storage(Filter const& source,
                                host_staging_space);
 }
 
+template <class Word>
+__global__ void or_bloom_words(Word* destination, Word const* source, std::size_t count)
+{
+  auto const index = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (index < count) { destination[index] |= source[index]; }
+}
+
 template <class Filter>
 bloom_owner<Filter> build_bloom(cudf::column_view const& keys,
                                 std::size_t num_blocks,
@@ -167,6 +177,20 @@ struct bloom_replica {
 
 namespace {
 template <class KeyT>
+std::unique_ptr<bloom_replica> make_empty_bloom_replica(int device_id,
+                                                        std::size_t num_blocks,
+                                                        rmm::device_async_resource_ref mr,
+                                                        cuda::stream_ref stream)
+{
+  if (num_blocks <= arrow_policy<KeyT>::max_filter_blocks) {
+    return std::make_unique<bloom_replica>(device_id,
+                                           make_bloom<arrow_bloom<KeyT>>(num_blocks, mr, stream));
+  }
+  return std::make_unique<bloom_replica>(device_id,
+                                         make_bloom<standard_bloom<KeyT>>(num_blocks, mr, stream));
+}
+
+template <class KeyT>
 std::unique_ptr<bloom_replica> build_bloom_replica(int device_id,
                                                    cudf::column_view const& keys,
                                                    std::size_t num_blocks,
@@ -186,6 +210,23 @@ std::unique_ptr<bloom_replica> build_bloom_replica(int device_id,
 struct sirius_dynamic_bloom_filter::impl {
   int source_device = -1;
   std::vector<std::unique_ptr<bloom_replica>> replicas;
+  std::unique_ptr<rmm::device_buffer> reduction_scratch;
+
+  ~impl()
+  {
+    if (source_device < 0) { return; }
+    rmm::cuda_set_device_raii guard{rmm::cuda_device_id{source_device}};
+    reduction_scratch.reset();
+  }
+
+  [[nodiscard]] bloom_replica* find(int device_id) noexcept
+  {
+    auto const it =
+      std::find_if(replicas.begin(), replicas.end(), [device_id](auto const& replica) {
+        return replica->device_id == device_id;
+      });
+    return it == replicas.end() ? nullptr : it->get();
+  }
 
   [[nodiscard]] bloom_replica const* find(int device_id) const noexcept
   {
@@ -211,32 +252,67 @@ std::size_t sirius_dynamic_bloom_filter::estimated_bytes(std::size_t num_keys) n
 sirius_dynamic_bloom_filter::sirius_dynamic_bloom_filter(cudf::column_view const& keys,
                                                          rmm::cuda_stream_view stream,
                                                          rmm::device_async_resource_ref mr)
+  : sirius_dynamic_bloom_filter(keys.type(), static_cast<std::size_t>(keys.size()), stream, mr)
 {
-  if (!supports(keys.type())) {
+  add(keys, stream);
+}
+
+sirius_dynamic_bloom_filter::sirius_dynamic_bloom_filter(cudf::data_type key_type,
+                                                         std::size_t expected_num_keys,
+                                                         rmm::cuda_stream_view stream,
+                                                         rmm::device_async_resource_ref mr)
+{
+  if (!supports(key_type)) {
     throw std::invalid_argument(
       "[sirius_dynamic_bloom_filter] unsupported key type (INT32 or INT64).");
   }
-  auto const n = keys.size();
   cuda::stream_ref const s{stream.value()};
-  auto const num_blocks = blocks_for(n);
+  auto const num_blocks = blocks_for(expected_num_keys);
   _impl                 = std::make_unique<impl>();
   if (cudaGetDevice(&_impl->source_device) != cudaSuccess) {
     throw std::runtime_error("[sirius_dynamic_bloom_filter] failed to identify source device.");
   }
 
   std::unique_ptr<bloom_replica> source;
-  switch (keys.type().id()) {
+  switch (key_type.id()) {
     case cudf::type_id::INT32:
-      source = build_bloom_replica<std::int32_t>(_impl->source_device, keys, num_blocks, mr, s);
+      source = make_empty_bloom_replica<std::int32_t>(_impl->source_device, num_blocks, mr, s);
       break;
     case cudf::type_id::INT64:
-      source = build_bloom_replica<std::int64_t>(_impl->source_device, keys, num_blocks, mr, s);
+      source = make_empty_bloom_replica<std::int64_t>(_impl->source_device, num_blocks, mr, s);
       break;
     default:
       throw std::logic_error(
         "[sirius_dynamic_bloom_filter] supported key type changed during construction.");
   }
   _impl->replicas.push_back(std::move(source));
+}
+
+void sirius_dynamic_bloom_filter::add(cudf::column_view const& keys, rmm::cuda_stream_view stream)
+{
+  if (!_impl || !supports(keys.type())) {
+    throw std::invalid_argument("[sirius_dynamic_bloom_filter::add] unsupported key type.");
+  }
+  int device_id = -1;
+  if (cudaGetDevice(&device_id) != cudaSuccess || device_id != _impl->source_device) {
+    throw std::logic_error("[sirius_dynamic_bloom_filter::add] source device mismatch.");
+  }
+  auto* source = _impl->find(_impl->source_device);
+  if (source == nullptr) {
+    throw std::logic_error("[sirius_dynamic_bloom_filter::add] source replica is missing.");
+  }
+  cuda::stream_ref const cuda_stream{stream.value()};
+  std::visit(
+    [&](auto& bloom) {
+      using filter_type = typename std::decay_t<decltype(bloom)>::element_type;
+      using key_type    = typename filter_type::key_type;
+      if (keys.type().id() != key_type_id<key_type>()) {
+        throw std::invalid_argument("[sirius_dynamic_bloom_filter::add] key type mismatch.");
+      }
+      auto const* data = keys.data<key_type>();
+      bloom->add_async(data, data + keys.size(), cuda_stream);
+    },
+    source->bloom);
 }
 
 sirius_dynamic_bloom_filter::~sirius_dynamic_bloom_filter() = default;
@@ -343,6 +419,94 @@ void sirius_dynamic_bloom_filter::replicate_to_devices(
         e.what());
     }
   }
+}
+
+void sirius_dynamic_bloom_filter::replicate_to_devices_strict(
+  std::span<dynamic_filter_replica_space const> spaces)
+{
+  replicate_to_devices(spaces);
+  for (auto const& space : spaces) {
+    if (!is_available_on_device(space.get_gpu_space().get_device_id())) {
+      throw std::runtime_error(
+        "[sirius_dynamic_bloom_filter] required device replica is unavailable.");
+    }
+  }
+}
+
+void sirius_dynamic_bloom_filter::merge_from(sirius_dynamic_bloom_filter const& source_filter,
+                                             dynamic_filter_replica_space const& source_space,
+                                             dynamic_filter_replica_space const& root_space,
+                                             rmm::cuda_stream_view root_stream)
+{
+  if (!_impl || !source_filter._impl) {
+    throw std::logic_error("[sirius_dynamic_bloom_filter::merge_from] missing implementation.");
+  }
+  auto const root_device = root_space.get_gpu_space().get_device_id();
+  if (_impl->source_device != root_device ||
+      source_filter._impl->source_device != source_space.get_gpu_space().get_device_id()) {
+    throw std::logic_error("[sirius_dynamic_bloom_filter::merge_from] plan/device mismatch.");
+  }
+  auto* destination  = _impl->find(root_device);
+  auto const* source = source_filter._impl->find(source_filter._impl->source_device);
+  if (destination == nullptr || source == nullptr ||
+      destination->bloom.index() != source->bloom.index()) {
+    throw std::logic_error("[sirius_dynamic_bloom_filter::merge_from] geometry mismatch.");
+  }
+
+  rmm::cuda_set_device_raii guard{rmm::cuda_device_id{root_device}};
+  std::visit(
+    [&](auto& destination_bloom) {
+      using owner_type         = std::decay_t<decltype(destination_bloom)>;
+      using filter_type        = typename owner_type::element_type;
+      auto const& source_bloom = std::get<bloom_owner<filter_type>>(source->bloom);
+      if (!destination_bloom || !source_bloom ||
+          destination_bloom->block_extent() != source_bloom->block_extent()) {
+        throw std::logic_error("[sirius_dynamic_bloom_filter::merge_from] geometry mismatch.");
+      }
+      using word_type       = typename filter_type::word_type;
+      auto const word_count = destination_bloom->block_extent() * filter_type::words_per_block;
+      auto const maximum_words_per_chunk =
+        std::max<std::size_t>(kMaximumReductionScratchBytes / sizeof(word_type), 1);
+      auto const scratch_words = std::min(word_count, maximum_words_per_chunk);
+      auto const scratch_bytes = scratch_words * sizeof(word_type);
+      if (!_impl->reduction_scratch || _impl->reduction_scratch->size() < scratch_bytes) {
+        _impl->reduction_scratch = std::make_unique<rmm::device_buffer>(
+          scratch_bytes, root_stream, root_space.get_gpu_space().get_default_allocator());
+      }
+
+      constexpr int threads = 256;
+      for (std::size_t word_offset = 0; word_offset < word_count;
+           word_offset += maximum_words_per_chunk) {
+        auto const chunk_words = std::min(maximum_words_per_chunk, word_count - word_offset);
+        auto const chunk_bytes = chunk_words * sizeof(word_type);
+        detail::enqueue_replica_copy(_impl->reduction_scratch->data(),
+                                     rmm::cuda_device_id{root_device},
+                                     source_bloom->data() + word_offset,
+                                     source_space.get_gpu_space(),
+                                     chunk_bytes,
+                                     root_stream,
+                                     root_space.get_host_staging_space());
+        auto const blocks = static_cast<int>((chunk_words + threads - 1) / threads);
+        or_bloom_words<<<blocks, threads, 0, root_stream.value()>>>(
+          destination_bloom->data() + word_offset,
+          static_cast<word_type const*>(_impl->reduction_scratch->data()),
+          chunk_words);
+        auto const status = cudaPeekAtLastError();
+        if (status != cudaSuccess) {
+          throw std::runtime_error(
+            std::string("[sirius_dynamic_bloom_filter::merge_from] OR launch failed: ") +
+            cudaGetErrorString(status));
+        }
+      }
+    },
+    destination->bloom);
+}
+
+void sirius_dynamic_bloom_filter::release_reduction_scratch()
+{
+  if (!_impl || _impl->source_device < 0) { return; }
+  rmm::cuda_set_device_raii guard{rmm::cuda_device_id{_impl->source_device}};
+  _impl->reduction_scratch.reset();
 }
 
 bool sirius_dynamic_bloom_filter::is_available_on_device(int device_id) const noexcept

@@ -252,7 +252,19 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
     dynamic_filter_publish_plan dynamic_filter_plan = {},
     uint64_t hash_partition_bytes                   = config::DEFAULT_HASH_PARTITION_BYTES,
     uint64_t max_broadcast_join_size                = config::DEFAULT_MAX_BROADCAST_JOIN_SIZE,
-    dynamic_filter_stats* dynamic_filter_stats_sink = {});
+    dynamic_filter_stats* dynamic_filter_stats_sink = {},
+    bool enable_dynamic_filter_multi_partition      = false);
+
+  sirius_physical_hash_join(
+    duckdb::LogicalOperator& op,
+    duckdb::unique_ptr<sirius_physical_operator> left,
+    duckdb::unique_ptr<sirius_physical_operator> right,
+    duckdb::vector<sirius::join_condition> cond,
+    duckdb::JoinType join_type,
+    std::size_t estimated_cardinality,
+    uint64_t max_build_hash_table_bytes = config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES,
+    uint64_t hash_partition_bytes       = config::DEFAULT_HASH_PARTITION_BYTES,
+    uint64_t max_broadcast_join_size    = config::DEFAULT_MAX_BROADCAST_JOIN_SIZE);
 
   duckdb::vector<sirius::join_condition> conditions;
   //! The types of the join keys
@@ -317,6 +329,22 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   /// targets). The upstream PARTITION folds a single-partition build to one batch for such a join
   /// so the one-shot publisher sees the whole key set.
   [[nodiscard]] bool publishes_dynamic_filters() const;
+
+  /// True when the subordinate multi-partition extension is enabled for this wired producer.
+  [[nodiscard]] bool wants_multi_partition_dynamic_filters() const noexcept
+  {
+    return _enable_dynamic_filter_multi_partition && _dynamic_filter_plan.enabled();
+  }
+
+  /// Freeze the complete pre-scatter build snapshot and claim multi-partition publication once.
+  [[nodiscard]] bool arm_multi_partition_dynamic_filters(uint64_t build_rows,
+                                                         std::vector<uint64_t> build_batch_ids,
+                                                         int num_partitions);
+
+  /// Add one original build batch to the global Bloom accumulator before hash scatter.
+  void contribute_dynamic_filter_build_batch(uint64_t batch_id,
+                                             cudf::table_view const& build_view,
+                                             rmm::cuda_stream_view stream);
 
   /// Reported by the upstream PARTITION at sizing time: the build port will deliver one
   /// concat-folded batch covering the entire build side (single-partition or broadcast build).
@@ -455,23 +483,26 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   /// The caller that changes @c OPEN to @c PUBLISHING owns construction, device replication,
   /// and channel fan-out. GPU work runs without holding @ref op_state_mutex. A successful attempt
   /// ends in @c FINISHED even when selectivity gates or drained targets cause it to emit no
-  /// filters. @ref on_finalize_operator never publishes; it only changes an unclaimed @c OPEN
-  /// window to @c CLOSED before releasing BUILD_PROBE state.
+  /// filters. @ref on_finalize_operator never publishes; it closes an unclaimed @c OPEN window or
+  /// aborts an incomplete @c ACCUMULATING window before releasing BUILD_PROBE state.
   ///
   /// @param build_view The build side to reduce / build membership over.
   /// @param stream     Durable build-memory-space stream used for filter construction.
   void publish_dynamic_filters(cudf::table_view const& build_view, rmm::cuda_stream_view stream);
 
   enum class dynamic_filter_publication_state : std::uint8_t {
-    OPEN,        ///< The publication hook has not claimed the build table.
-    PUBLISHING,  ///< The claiming caller owns construction, replication, and fan-out.
-    FINISHED,    ///< The one publication attempt completed successfully (possibly emitting none).
-    FAILED,      ///< The claimed attempt threw; the uncertain state must not be retried.
-    CLOSED       ///< Finalization closed the window before the hook claimed it.
+    OPEN,          ///< No publication path has claimed the build.
+    ACCUMULATING,  ///< Exact-ID multi-partition contributions are private and incomplete.
+    PUBLISHING,    ///< The one-shot caller owns construction, replication, and fan-out.
+    FINISHED,      ///< The one publication attempt completed successfully (possibly emitting none).
+    FAILED,        ///< A claimed attempt failed or was closed incomplete.
+    CLOSED         ///< Finalization closed the window before either path claimed it.
   };
 
   /// Plan-time routing, policy, and replica placement; not mutated after construction.
   dynamic_filter_publish_plan _dynamic_filter_plan;
+  bool _enable_dynamic_filter_multi_partition = false;
+  std::shared_ptr<class dynamic_filter_accumulator> _dynamic_filter_accumulator;
   // Optional non-owning counter sink. SiriusContext owns it and outlives the plan.
   dynamic_filter_stats* _dynamic_filter_stats = nullptr;
   /// Exactly-once arbitration between the publication hook and finalization.

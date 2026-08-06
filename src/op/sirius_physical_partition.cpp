@@ -34,6 +34,7 @@
 #include <nvtx3/nvtx3.hpp>
 
 #include <algorithm>
+#include <limits>
 #include <mutex>
 
 namespace sirius {
@@ -184,6 +185,17 @@ std::unique_ptr<operator_data> sirius_physical_partition::execute(const operator
   auto const& input_batch_ro = input_batches[0];
   auto* space                = input_batch_ro.get_memory_space();
 
+  // The original batch ID is the stable contribution identity. Insert admitted build-key ordinals
+  // before hash scatter; retries of this same ID are idempotent in the accumulator.
+  if (_is_build && !_broadcast && _num_partitions.value() > 1 &&
+      _partition_type == PartitionType::HASH) {
+    auto* hash_join = dynamic_cast<sirius_physical_hash_join*>(_downstream_consumer_op);
+    if (hash_join != nullptr && hash_join->wants_multi_partition_dynamic_filters()) {
+      hash_join->contribute_dynamic_filter_build_batch(
+        input_batch_ro.get_batch_id(), get_cudf_table_view(input_batch_ro), stream);
+    }
+  }
+
   // Broadcast mode never hash-partitions: the build side replicates its (small) batch to every
   // slot and the probe side streams through unpartitioned. In both cases execute() just forwards
   // the input batches; the fan-out to slots happens in sink().
@@ -295,7 +307,9 @@ void sirius_physical_partition::sink(const operator_data& input_data, rmm::cuda_
   }
 }
 
-uint64_t sirius_physical_partition::compute_total_bytes()
+uint64_t sirius_physical_partition::compute_total_bytes(std::vector<uint64_t>* batch_ids_out,
+                                                        uint64_t* total_rows,
+                                                        bool* exact_rows)
 {
   if (ports.find("default") == ports.end()) {
     throw std::runtime_error(
@@ -305,12 +319,48 @@ uint64_t sirius_physical_partition::compute_total_bytes()
   auto& repo           = ports.at("default")->repo;
   auto batch_ids       = repo->get_batch_ids(0);
   uint64_t total_bytes = 0;
+  bool exact           = true;
+  if (batch_ids_out != nullptr) {
+    batch_ids_out->clear();
+    batch_ids_out->reserve(batch_ids.size());
+  }
+  if (total_rows != nullptr) { *total_rows = 0; }
+
   for (auto batch_id : batch_ids) {
     auto batch = repo->get_data_batch_by_id(batch_id, 0);
-    if (batch) {
-      auto ro = batch->to_read_only();
-      if (ro.get_data()) { total_bytes += ro.get_data()->get_size_in_bytes(); }
+    if (!batch) {
+      exact = false;
+      continue;
     }
+    auto ro          = batch->to_read_only();
+    auto const* data = ro.get_data();
+    if (data == nullptr) {
+      exact = false;
+      continue;
+    }
+    total_bytes += data->get_size_in_bytes();
+    if (batch_ids_out == nullptr || total_rows == nullptr) { continue; }
+
+    auto const* gpu = dynamic_cast<cucascade::gpu_table_representation const*>(data);
+    if (gpu == nullptr) {
+      exact = false;
+      continue;
+    }
+    auto const rows = static_cast<uint64_t>(gpu->get_table_view().num_rows());
+    if (*total_rows > std::numeric_limits<uint64_t>::max() - rows) {
+      exact = false;
+      continue;
+    }
+    *total_rows += rows;
+    batch_ids_out->push_back(batch_id);
+  }
+
+  if (batch_ids_out != nullptr && (!exact || batch_ids_out->size() != batch_ids.size())) {
+    batch_ids_out->clear();
+    if (total_rows != nullptr) { *total_rows = 0; }
+  }
+  if (exact_rows != nullptr) {
+    *exact_rows = exact && batch_ids_out != nullptr && batch_ids_out->size() == batch_ids.size();
   }
   return total_bytes;
 }
@@ -422,13 +472,14 @@ std::unique_ptr<operator_data> sirius_physical_partition::get_next_task_input_da
     std::scoped_lock guard(lock, sibling.lock);
     if (!_num_partitions.has_value()) {
       auto& sizing_partition = _drives_partition_count ? *this : sibling;
+      auto* hash_join        = dynamic_cast<sirius_physical_hash_join*>(consumer);
       partition_sizing_input const in{sizing_partition.compute_total_bytes(),
                                       sizing_partition._is_build,
                                       has_build_concat(*this) || has_build_concat(sibling)};
+
       // The consumer owns the decision: it computes the count / broadcast flag, updates its own
       // execution state (e.g. hash-join BUILD_PROBE mode), and pre-sizes its own input repos.
       auto const strategy      = consumer->get_partition_strategy(in);
-      auto* hash_join          = dynamic_cast<sirius_physical_hash_join*>(consumer);
       bool build_arrives_whole = false;
       if (strategy.build_probe) {
         // Configure both siblings' build-side CONCAT (do not short-circuit) and require that at
@@ -479,6 +530,40 @@ std::unique_ptr<operator_data> sirius_physical_partition::get_next_task_input_da
       SIRIUS_LOG_DEBUG("sirius_physical_partition id {} sized {} partitions",
                        this->get_operator_id(),
                        strategy.num_partitions);
+    }
+  }
+
+  if (_is_build && _partition_type == PartitionType::HASH) {
+    auto* hash_join = dynamic_cast<sirius_physical_hash_join*>(consumer);
+    if (hash_join != nullptr && hash_join->wants_multi_partition_dynamic_filters()) {
+      std::lock_guard<std::mutex> guard(lock);
+      if (_num_partitions.has_value() && *_num_partitions > 1 && !_broadcast &&
+          !_dynamic_filter_snapshot_attempted) {
+        auto const port_it         = ports.find("default");
+        bool const source_finished = port_it != ports.end() &&
+                                     port_it->second->src_pipeline != nullptr &&
+                                     port_it->second->src_pipeline->is_pipeline_finished();
+        if (!source_finished && port_it != ports.end() &&
+            port_it->second->src_pipeline != nullptr) {
+          return nullptr;
+        }
+
+        _dynamic_filter_snapshot_attempted = true;
+        std::vector<uint64_t> build_batch_ids;
+        uint64_t build_rows = 0;
+        bool exact_snapshot = false;
+        compute_total_bytes(&build_batch_ids, &build_rows, &exact_snapshot);
+        if (source_finished && exact_snapshot && !build_batch_ids.empty()) {
+          static_cast<void>(hash_join->arm_multi_partition_dynamic_filters(
+            build_rows, std::move(build_batch_ids), *_num_partitions));
+        } else if (!source_finished || !exact_snapshot) {
+          SIRIUS_LOG_WARN(
+            "sirius_physical_partition id {} could not freeze an exact build snapshot; global "
+            "dynamic Bloom publication is disabled for this join.",
+            this->get_operator_id());
+        }
+      }
+      return sirius_physical_operator::get_next_task_input_data();
     }
   }
   return sirius_physical_operator::get_next_task_input_data();

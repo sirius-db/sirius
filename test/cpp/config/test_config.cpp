@@ -593,15 +593,18 @@ TEST_CASE("the dynamic-filter switch is consumed from the operator_params YAML s
     std::ofstream out(path);
     out << "sirius:\n"
            "  operator_params:\n"
-           "    enable_dynamic_filter: false\n";
+           "    enable_dynamic_filter: false\n"
+           "    enable_dynamic_filter_multi_partition: true\n";
   }
 
-  // Parsing false is the non-vacuous direction because the default is true.
+  // Exercise the non-default direction for both the master and subordinate switches.
   CHECK(operator_params{}.enable_dynamic_filter);
+  CHECK_FALSE(operator_params{}.enable_dynamic_filter_multi_partition);
 
   sirius_config cfg;
   cfg.load_from_file(path);
   CHECK_FALSE(cfg.get_operator_params().enable_dynamic_filter);
+  CHECK(cfg.get_operator_params().enable_dynamic_filter_multi_partition);
 
   std::error_code ec;
   std::filesystem::remove(path, ec);

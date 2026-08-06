@@ -1,11 +1,10 @@
 # Dynamic Filters — Multi-GPU Publication
 
-> **Status: implemented.** Dynamic-filter consumers remain nonblocking and safe
-> on multiple GPUs. The producer builds each filter once and attempts to
-> materialize its compact representation on every active probe GPU (copying raw
-> needles, finalized hash-set slots, or Bloom words, or reconstructing exact
-> zone scalars), and publishes one immutable logical filter only after every
-> successful device-local replica is ready.
+> **Status:** PR #1277's device-local replica publication is implemented. The
+> global multi-partition Bloom accumulator is also implemented behind
+> `enable_dynamic_filter_multi_partition` (default `false`). Single-GPU build
+> and focused validation are complete; physical multi-GPU runtime and
+> performance evaluation are deferred to a multi-GPU machine.
 > See [dynamic-filters.md](dynamic-filters.md) for the general feature.
 
 ## Summary
@@ -28,9 +27,12 @@ filter; failures outside that policy propagate.
 
 The publication and application contracts are distinct:
 
-- For the producing join's immediate probe input, build-side CONCAT
-  synchronously completes the publication attempt before its probe data-scan
-  execution begins.
+- For a whole-build one-shot filter, the producing join's build-side CONCAT
+  synchronously completes the publication attempt before its immediate probe
+  data-scan execution begins.
+- For a multi-partition Bloom, no partition-local filter is exposed. Publication
+  happens only after every frozen original batch ID contributes and strict
+  replication succeeds on every planned probe GPU.
 - A base scan reached transitively through an intervening join can execute
   earlier. It snapshots whatever fully ready filters are visible at its
   reader and post-decode checkpoints under normal scheduler order.
@@ -38,11 +40,11 @@ The publication and application contracts are distinct:
 - An empty or policy-gated publication and an allocation-unavailable local
   replica are safe pass-through cases; the authoritative join guarantees
   correctness.
-- Every concrete filter treats a per-target reservation denial, construction
+- One-shot filters treat a per-target reservation denial, construction
   exception, transfer failure, or completion failure as optional replica
-  unavailability: it catches and logs the failure and omits that target. Source
-  construction failures and publisher invariants outside a target replication
-  attempt still propagate and fail the producing task/query.
+  unavailability: they catch and log the failure and omit that target. The
+  accumulated Bloom instead fails closed as an optimization: any planned-target
+  failure aborts publication before channel fan-out.
 
 Probe metadata parsing and prefetch preparation are independent of publication.
 For an immediate probe, the actual `read_parquet`/decode task starts after the
@@ -136,42 +138,50 @@ first queried `cudaDevAttrL2CacheSize`.
 
 `dynamic_filter_publisher` is declared in
 `src/include/op/dynamic_filter/dynamic_filter_publisher.hpp` and implemented in
-`src/op/dynamic_filter/dynamic_filter_publisher.cpp`; the physical hash join owns and invokes
-it. It consumes the immutable plan, the join's key metadata, and one materialized
-build view; it is not a shared scheduler service or a mutable routing registry.
+`src/op/dynamic_filter/dynamic_filter_publisher.cpp`; the physical hash join owns both its
+whole-build one-shot invocation and the exact-ID accumulator used for partitioned builds. Neither
+path is a shared scheduler service or a mutable routing registry.
 
-The build-port hook offers that view as soon as a concat-folded `BUILD_PROBE`
-build batch arrives, acquiring the batch's read-only accessor before routing it
-so the GPU representation stays pinned against downgrade until publication
-completes. In a single-partition join exactly one build batch arrives. In a
-**broadcast** join every partition holds the *full* replicated build, so each
-partition's concat_all-folded batch is a complete build side and races this hook
-on its own GPU; the `OPEN -> PUBLISHING` compare-exchange lets exactly one win
-(the first to arrive publishes and replicates; the others fall out at the CAS
-before doing any filter work). A genuinely hash-partitioned (non-broadcast)
-multi-partition build still disables pushdown — each partition holds only a
-slice, so no single batch could emit a complete filter. The hook and
-finalization arbitrate through a publication state machine independent of the
-hash-table build state:
+The build-port hook retains PR #1277's one-shot behavior for a concat-folded complete build. A
+single-partition join has one whole batch; under broadcast, each candidate batch represents the
+full build and the shared `OPEN -> PUBLISHING` claim lets exactly one caller construct and
+replicate filters.
+
+When `enable_dynamic_filter_multi_partition` is true, a non-broadcast build with more than one
+partition instead claims `OPEN -> ACCUMULATING`. The build PARTITION freezes the exact original
+batch-ID set and global row count at its FULL barrier before popping the first batch. Each original
+batch inserts its admitted INT32/INT64 keys before scatter into a full-global-geometry partial on
+its producing GPU. Per-device locks allow different GPUs to insert concurrently; in-flight and
+completed ID sets prevent retries from advancing completion twice.
+
+After all expected IDs complete, the last contribution OR-reduces non-root partials on the lowest
+planned GPU. It transfers at most 4 MiB per chunk through PR #1277's peer-DMA/host-staging helper,
+runs the OR kernels on one root stream, drains that stream on success or failure, drops non-root
+partials and scratch, and strictly completes every planned replica before channel fan-out. An
+unknown, missing, incompatible, or failed contribution publishes no filter.
 
 ```text
-OPEN --claim--> PUBLISHING --success--> FINISHED
-                         `--exception--> FAILED
-OPEN --finalize without a claim-------> CLOSED
+                         +-> PUBLISHING -> FINISHED
+                         |                `-> FAILED
+OPEN --one-shot claim---+
+  |
+  +--accumulator claim----> ACCUMULATING -> FINISHED
+  |                                         `-> FAILED
+  |
+  `--finalize unclaimed--------------------> CLOSED
 ```
 
-Only an `OPEN -> PUBLISHING` compare/exchange may claim the work. Finalization
-only closes an unclaimed window; it never manufactures a filter from released
-state. `op_state_mutex` protects the short eligibility/finalization checks, but
-is never held while reducing keys, building filters, copying replicas, or
-synchronizing CUDA work.
+`op_state_mutex` protects only claim, pointer, and terminal-state coordination; GPU insertion,
+reduction, replication, and synchronization do not hold it. Finalization closes an unclaimed
+window or atomically aborts an incomplete accumulator, but never manufactures a filter.
 
-At the early build-port site, a stream borrowed from the build memory space
-first waits on the build representation's writer event. Persistent
-cuDF/cuCO/RMM filter storage may retain that durable pooled stream for eventual
-asynchronous deallocation, so it must not retain a worker stream whose executor
-can be torn down earlier. Publication remains independent of a probe batch and
-preserves the existing join task state machine.
+At the early build-port site, a stream borrowed from the build memory space first waits on the
+build representation's writer event. Persistent cuDF/cuCO/RMM filter storage is constructed on a
+durable pooled stream owned by its GPU memory space rather than on a worker stream whose executor
+can be torn down earlier. Its asynchronous initialization completes before the first insertion.
+Accumulated contributions then use their task stream and synchronize before their ID becomes
+complete, preserving both the input lifetime and the deleter's retained-stream lifetime without
+exposing mutable storage.
 
 ### 3. Expose replication as a producer-only capability
 
@@ -185,12 +195,13 @@ of routing policy. A missing capability is an invariant failure rather than a
 silent cross-device publication. Scan consumers never invoke it or know how a
 representation is copied.
 
-The publisher synchronizes the construction stream, invokes the capability for
-each built filter, and only then calls `push_filter`. Every filter kind treats
-a per-target failure — reservation denial, cloning, the copy itself, or the
-completion synchronize — as best-effort replica unavailability: it is logged
-and that target's replica is omitted. Successful replicas are published without
-weakening the authoritative join.
+The one-shot publisher synchronizes the construction stream, invokes the capability, and only then
+calls `push_filter`. Its filter kinds retain best-effort per-target behavior: reservation denial,
+cloning, copy, or completion failure is logged and that target's replica is omitted.
+The accumulated path instead calls strict Bloom replication only after global OR reduction. If any
+planned replica is unavailable, the entire optional accumulator publication aborts before fan-out;
+no target can observe a filter unless every device named by the immutable plan has a complete
+replica.
 
 ### 4. Build once, copy finalized storage
 
@@ -398,6 +409,16 @@ masking afterward, checks reservation/allocation growth, and checks teardown.
 The reservation-denial suite also covers the raw small IN-list. These multi-GPU
 cases skip automatically when fewer than two devices are visible, so a passing
 two-device run is still required before the raw path can be called revalidated.
+
+The multi-partition accumulator's exact-ID accounting, OR reduction, failure
+handling, flag gates, and result equivalence are covered by focused tests on
+this single-GPU host. Deterministic synchronization hooks additionally cover an
+in-flight duplicate, competing final contributions with exactly one publisher,
+strict-replication failure before fan-out, and destruction after a short-lived
+task stream. The hooks replace no behavior unless explicitly supplied by a
+test. Physical multi-GPU execution and performance have not been evaluated
+here. That validation is intentionally deferred to a machine with at least two
+visible GPUs and representative peer and staged-copy routes.
 
 ## Code map
 

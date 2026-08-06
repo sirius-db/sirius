@@ -567,7 +567,7 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
           policy,
           [&site_channels, &op_params](sirius::op::sirius_physical_operator const& site)
             -> duckdb::unique_ptr<sirius::op::sirius_physical_operator> {
-            auto channel = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
+            auto channel  = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
             auto endpoint = duckdb::make_uniq<sirius::op::scan::sirius_physical_dynamic_filter>(
               site.types,
               site.estimated_cardinality,
@@ -672,7 +672,8 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
       std::move(filter_plan),
       op_params.hash_partition_bytes,
       op_params.max_broadcast_join_size,
-      &sirius_context->get_dynamic_filter_stats());
+      &sirius_context->get_dynamic_filter_stats(),
+      dynamic_filter_enabled && op_params.enable_dynamic_filter_multi_partition);
     auto& hj                        = join->Cast<sirius::op::sirius_physical_hash_join>();
     hj.join_stats                   = std::move(op.join_stats);
     hj.mark_join_build_switch_ratio = op_params.mark_join_build_switch_ratio;

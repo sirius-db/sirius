@@ -136,6 +136,11 @@ struct operator_params {
   /// probe-side scans or join-edge endpoints. When disabled, discovery does not run.
   bool enable_dynamic_filter = true;
 
+  /// Build one globally complete Bloom filter across a hash-partitioned build. The one-shot
+  /// whole-build path is unchanged when disabled. Effective only when enable_dynamic_filter is
+  /// enabled.
+  bool enable_dynamic_filter_multi_partition = false;
+
   /// Emit build-key min/max filters in addition to membership filters. Parquet scans use them for
   /// row-group pruning; duckdb-native scans apply them post-decode. Effective only when
   /// `enable_dynamic_filter` is enabled.

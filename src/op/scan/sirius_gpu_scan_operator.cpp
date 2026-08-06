@@ -204,6 +204,11 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::get_next_task_input
 //===----------------------------------------------------------------------===//
 // scan_manager wiring
 //===----------------------------------------------------------------------===//
+ingestible_table_info const& sirius_gpu_scan_operator::peek_table_info() const
+{
+  return _ingestible->table_info();
+}
+
 gpu_ingestible& sirius_gpu_scan_operator::get_ingestible() const { return *_ingestible; }
 
 scan_manager::split_connector& sirius_gpu_scan_operator::get_split_connector()

@@ -130,7 +130,9 @@ class sirius_physical_partition : public sirius_physical_operator {
 
   /// Sum the bytes of all batches waiting on this partition's input port. Fed to the downstream
   /// consumer's get_partition_strategy, which turns it into a partition count.
-  uint64_t compute_total_bytes();
+  uint64_t compute_total_bytes(std::vector<uint64_t>* batch_ids = nullptr,
+                               uint64_t* total_rows             = nullptr,
+                               bool* exact_rows                 = nullptr);
 
   /// The partition slot for a batch residing on `device_id`: its index in `_active_gpu_ids`
   /// (so task_creator routes that slot back to the same GPU). Returns 0 if not found (a
@@ -158,6 +160,8 @@ class sirius_physical_partition : public sirius_physical_operator {
   /// num_gpus partitions. Build side deposits its batch into every slot; probe side deposits each
   /// batch into the slot matching its current GPU. See get_next_task_input_data / sink.
   bool _broadcast{false};
+  /// Protected by lock; set before the first build input is popped, whether arming succeeds or not.
+  bool _dynamic_filter_snapshot_attempted{false};
   /// Non-owning observer for the narrow-passthrough counter. The registered-state shared_ptr owns
   /// the context for at least as long as the query plan; unit-test operators may leave it null.
   duckdb::SiriusContext* _compressed_materialization_observer = nullptr;

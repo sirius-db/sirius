@@ -2031,6 +2031,18 @@ static void SetEnableDynamicFilter(ClientContext& context, SetScope scope, Value
   SIRIUS_LOG_DEBUG("Updated config ENABLE_DYNAMIC_FILTER to {}", params->enable_dynamic_filter);
 }
 
+static void SetEnableDynamicFilterMultiPartition(ClientContext& context,
+                                                 SetScope scope,
+                                                 Value& parameter)
+{
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  auto slot                                     = lock_operator_params_slot(context);
+  params->enable_dynamic_filter_multi_partition = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config ENABLE_DYNAMIC_FILTER_MULTI_PARTITION to {}",
+                   params->enable_dynamic_filter_multi_partition);
+}
+
 static void SetEnableDynamicZoneMapFilter(ClientContext& context, SetScope scope, Value& parameter)
 {
   auto* params = get_operator_params(context);
@@ -2343,6 +2355,14 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::operator
     LogicalType::BOOLEAN,
     Value::BOOLEAN(sirius::operator_params{}.enable_dynamic_filter),
     SetEnableDynamicFilter);
+
+  config.AddExtensionOption(
+    "enable_dynamic_filter_multi_partition",
+    "Build a global Bloom filter across a non-broadcast hash-partitioned join build; requires "
+    "enable_dynamic_filter (off by default)",
+    LogicalType::BOOLEAN,
+    Value::BOOLEAN(defaults.enable_dynamic_filter_multi_partition),
+    SetEnableDynamicFilterMultiPartition);
 
   config.AddExtensionOption(
     "enable_dynamic_zone_map_filter",

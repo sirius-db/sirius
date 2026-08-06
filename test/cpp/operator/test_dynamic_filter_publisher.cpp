@@ -25,6 +25,7 @@
 #include <cudf/utilities/memory_resource.hpp>
 
 #include <rmm/cuda_device.hpp>
+#include <rmm/cuda_stream.hpp>
 
 #include <cuda_runtime_api.h>
 
@@ -33,8 +34,11 @@
 #include <cucascade/memory/memory_space.hpp>
 
 #include <algorithm>
+#include <barrier>
 #include <cstddef>
 #include <cstdint>
+#include <future>
+#include <latch>
 #include <memory>
 #include <stdexcept>
 #include <type_traits>
@@ -294,6 +298,25 @@ void require_domain_gate_skips_only(std::size_t gated_key_index)
   auto const expected =
     gated_key_index == 0 ? std::vector<std::uint8_t>{0, 1} : std::vector<std::uint8_t>{1, 0};
   REQUIRE(membership_mask(*surviving.front(), probe->view(), fixture) == expected);
+}
+
+dynamic_filter_publish_plan make_accumulator_plan(
+  publisher_fixture& fixture, std::shared_ptr<sirius::op::sirius_dynamic_filter_set> const& channel)
+{
+  std::vector<dynamic_filter_publish_plan::probe_target> targets;
+  targets.push_back({.filter_set               = channel,
+                     .route_class              = dynamic_filter_route_class::scan,
+                     .accepts_zone_map_filters = false,
+                     .key_bindings             = {{.admitted_key_index   = 0,
+                                                   .channel_push_ordinal = kProbeColumnIndex,
+                                                   .probe_storage_type   = kInt64}}});
+  return dynamic_filter_publish_plan{
+    {make_int64_key(0, 0)}, std::move(targets), std::move(fixture.replica_spaces)};
+}
+
+cudf::table_view one_column_view(cudf::column const& column)
+{
+  return cudf::table_view{std::vector<cudf::column_view>{column.view()}};
 }
 
 }  // namespace
@@ -838,4 +861,265 @@ TEST_CASE("dynamic-filter publish plan rejects unusable replica placements",
       dynamic_filter_publish_plan({make_int64_key(0, 0)}, make_targets(), std::move(spaces)),
       std::invalid_argument);
   }
+}
+
+TEST_CASE("multi-partition accumulator publishes only after every exact build ID",
+          "[dynamic_filter][publisher][accumulator]")
+{
+  publisher_fixture fixture;
+  fixture.add_key_column(3, 0);
+  fixture.add_key_column(3, 3);
+  auto channel = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
+  auto plan    = make_accumulator_plan(fixture, channel);
+  sirius::op::dynamic_filter_accumulator accumulator(plan, 6, {101, 202});
+
+  auto const first =
+    accumulator.contribute(101, one_column_view(*fixture.columns[0]), fixture.stream);
+  REQUIRE(first.state == sirius::op::dynamic_filter_accumulation_result::status::pending);
+  REQUIRE(channel->empty());
+
+  auto const duplicate =
+    accumulator.contribute(101, one_column_view(*fixture.columns[0]), fixture.stream);
+  REQUIRE(duplicate.state == sirius::op::dynamic_filter_accumulation_result::status::duplicate);
+  REQUIRE(channel->empty());
+
+  auto const last =
+    accumulator.contribute(202, one_column_view(*fixture.columns[1]), fixture.stream);
+  REQUIRE(last.state == sirius::op::dynamic_filter_accumulation_result::status::published);
+  REQUIRE(accumulator.complete());
+  REQUIRE_FALSE(accumulator.aborted());
+  REQUIRE_FALSE(accumulator.abort_if_incomplete());
+
+  auto const published = channel->filters_for_column(kProbeColumnIndex);
+  REQUIRE(published.size() == 1);
+  REQUIRE(dynamic_cast<sirius::op::sirius_dynamic_bloom_filter const*>(published.front().get()) !=
+          nullptr);
+  auto const probe = make_int64_values(fixture, {0, 1, 2, 3, 4, 5});
+  REQUIRE(membership_mask(*published.front(), probe->view(), fixture) ==
+          std::vector<std::uint8_t>{1, 1, 1, 1, 1, 1});
+
+  auto const unknown =
+    accumulator.contribute(999, one_column_view(*fixture.columns[0]), fixture.stream);
+  REQUIRE(unknown.state == sirius::op::dynamic_filter_accumulation_result::status::aborted);
+}
+
+TEST_CASE("multi-partition accumulator close prevents publication with a missing ID",
+          "[dynamic_filter][publisher][accumulator]")
+{
+  publisher_fixture fixture;
+  fixture.add_key_column(3, 0);
+  fixture.add_key_column(3, 3);
+  auto channel = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
+  auto plan    = make_accumulator_plan(fixture, channel);
+  sirius::op::dynamic_filter_accumulator accumulator(plan, 6, {11, 22});
+
+  auto const first =
+    accumulator.contribute(11, one_column_view(*fixture.columns[0]), fixture.stream);
+  REQUIRE(first.state == sirius::op::dynamic_filter_accumulation_result::status::pending);
+  REQUIRE(accumulator.abort_if_incomplete());
+  REQUIRE(accumulator.aborted());
+
+  auto const late =
+    accumulator.contribute(22, one_column_view(*fixture.columns[1]), fixture.stream);
+  REQUIRE(late.state == sirius::op::dynamic_filter_accumulation_result::status::aborted);
+  REQUIRE(channel->empty());
+}
+
+TEST_CASE("multi-partition accumulator fails closed on a contribution type mismatch",
+          "[dynamic_filter][publisher][accumulator]")
+{
+  publisher_fixture fixture;
+  fixture.add_key_column(3, 0);
+  auto wrong_type = cudf::sequence(3,
+                                   cudf::numeric_scalar<std::int32_t>(3, true, fixture.stream),
+                                   cudf::numeric_scalar<std::int32_t>(1, true, fixture.stream),
+                                   fixture.stream,
+                                   cudf::get_current_device_resource_ref());
+  fixture.stream.synchronize();
+
+  auto channel = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
+  auto plan    = make_accumulator_plan(fixture, channel);
+  sirius::op::dynamic_filter_accumulator accumulator(plan, 6, {31, 32});
+  REQUIRE(accumulator.contribute(31, one_column_view(*fixture.columns[0]), fixture.stream).state ==
+          sirius::op::dynamic_filter_accumulation_result::status::pending);
+
+  auto const mismatch = accumulator.contribute(32, one_column_view(*wrong_type), fixture.stream);
+  REQUIRE(mismatch.state == sirius::op::dynamic_filter_accumulation_result::status::aborted);
+  REQUIRE(mismatch.publication.keys_skipped_type_mismatch == 1);
+  REQUIRE(accumulator.aborted());
+  REQUIRE(channel->empty());
+}
+
+TEST_CASE("accumulated Bloom storage outlives a task-owned contribution stream",
+          "[dynamic_filter][publisher][accumulator][lifetime]")
+{
+  publisher_fixture fixture;
+  fixture.add_key_column(3, 0);
+  fixture.add_key_column(3, 3);
+  fixture.stream.synchronize();
+
+  auto channel = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
+  {
+    auto plan = make_accumulator_plan(fixture, channel);
+    sirius::op::dynamic_filter_accumulator accumulator(plan, 6, {101, 202});
+    {
+      rmm::cuda_stream task_stream{rmm::cuda_stream::flags::non_blocking};
+      auto const first =
+        accumulator.contribute(101, one_column_view(*fixture.columns[0]), task_stream.view());
+      REQUIRE(first.state == sirius::op::dynamic_filter_accumulation_result::status::pending);
+      auto const last =
+        accumulator.contribute(202, one_column_view(*fixture.columns[1]), task_stream.view());
+      REQUIRE(last.state == sirius::op::dynamic_filter_accumulation_result::status::published);
+    }
+    REQUIRE(channel->filter_count() == 1);
+  }
+
+  // The CUCO owner is released only after the task stream above has been destroyed. Its deleter
+  // must use the longer-lived memory-space stream captured during partial construction.
+  channel.reset();
+  REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+}
+
+TEST_CASE("an in-flight duplicate cannot insert or advance accumulator completion",
+          "[dynamic_filter][publisher][accumulator][concurrency]")
+{
+  publisher_fixture fixture;
+  fixture.add_key_column(3, 0);
+  fixture.add_key_column(3, 3);
+  fixture.stream.synchronize();
+
+  std::latch id_claimed{1};
+  std::latch release_claim{1};
+  sirius::op::detail::dynamic_filter_accumulator_test_hooks hooks;
+  hooks.after_id_claim = [&](std::uint64_t batch_id) {
+    if (batch_id != 101) { return; }
+    id_claimed.count_down();
+    release_claim.wait();
+  };
+
+  auto channel = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
+  auto plan    = make_accumulator_plan(fixture, channel);
+  sirius::op::dynamic_filter_accumulator accumulator(plan, 6, {101, 202}, std::move(hooks));
+  rmm::cuda_stream task_stream{rmm::cuda_stream::flags::non_blocking};
+
+  auto first_future = std::async(std::launch::async, [&] {
+    rmm::cuda_set_device_raii device{rmm::cuda_device_id{kDeviceId}};
+    return accumulator.contribute(101, one_column_view(*fixture.columns[0]), task_stream.view());
+  });
+  id_claimed.wait();
+  auto const duplicate =
+    accumulator.contribute(101, one_column_view(*fixture.columns[0]), fixture.stream);
+  release_claim.count_down();
+  auto const first = first_future.get();
+
+  REQUIRE(duplicate.state == sirius::op::dynamic_filter_accumulation_result::status::duplicate);
+  REQUIRE(first.state == sirius::op::dynamic_filter_accumulation_result::status::pending);
+  REQUIRE(channel->empty());
+
+  auto const last =
+    accumulator.contribute(202, one_column_view(*fixture.columns[1]), fixture.stream);
+  REQUIRE(last.state == sirius::op::dynamic_filter_accumulation_result::status::published);
+  REQUIRE(channel->filter_count() == 1);
+}
+
+TEST_CASE("different final contributions race to exactly one publication",
+          "[dynamic_filter][publisher][accumulator][concurrency]")
+{
+  publisher_fixture fixture;
+  fixture.add_key_column(3, 0);
+  fixture.add_key_column(3, 3);
+  fixture.stream.synchronize();
+
+  std::barrier insertions_complete{2};
+  sirius::op::detail::dynamic_filter_accumulator_test_hooks hooks;
+  hooks.after_insert_sync = [&](std::uint64_t) { insertions_complete.arrive_and_wait(); };
+
+  auto channel = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
+  auto plan    = make_accumulator_plan(fixture, channel);
+  sirius::op::dynamic_filter_accumulator accumulator(plan, 6, {101, 202}, std::move(hooks));
+  rmm::cuda_stream first_stream{rmm::cuda_stream::flags::non_blocking};
+  rmm::cuda_stream second_stream{rmm::cuda_stream::flags::non_blocking};
+
+  auto contribute =
+    [&](std::uint64_t batch_id, cudf::column const& column, rmm::cuda_stream_view stream) {
+      rmm::cuda_set_device_raii device{rmm::cuda_device_id{kDeviceId}};
+      return accumulator.contribute(batch_id, one_column_view(column), stream);
+    };
+  auto first_future = std::async(
+    std::launch::async, contribute, 101, std::cref(*fixture.columns[0]), first_stream.view());
+  auto second_future = std::async(
+    std::launch::async, contribute, 202, std::cref(*fixture.columns[1]), second_stream.view());
+  auto const first  = first_future.get();
+  auto const second = second_future.get();
+
+  auto const published =
+    static_cast<int>(first.state ==
+                     sirius::op::dynamic_filter_accumulation_result::status::published) +
+    static_cast<int>(second.state ==
+                     sirius::op::dynamic_filter_accumulation_result::status::published);
+  auto const pending =
+    static_cast<int>(first.state ==
+                     sirius::op::dynamic_filter_accumulation_result::status::pending) +
+    static_cast<int>(second.state ==
+                     sirius::op::dynamic_filter_accumulation_result::status::pending);
+  REQUIRE(published == 1);
+  REQUIRE(pending == 1);
+  REQUIRE(accumulator.complete());
+  REQUIRE(channel->filter_count() == 1);
+}
+
+TEST_CASE("strict replica failure aborts before any accumulator fan-out",
+          "[dynamic_filter][publisher][accumulator][replication_failure]")
+{
+  publisher_fixture fixture;
+  fixture.add_key_column(3, 0);
+  fixture.add_key_column(3, 3);
+
+  std::size_t replication_calls = 0;
+  sirius::op::detail::dynamic_filter_accumulator_test_hooks hooks;
+  hooks.strict_replicate = [&](auto&, auto) {
+    ++replication_calls;
+    throw std::runtime_error("injected required-replica failure");
+  };
+
+  auto channel = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
+  auto plan    = make_accumulator_plan(fixture, channel);
+  sirius::op::dynamic_filter_accumulator accumulator(plan, 6, {101, 202}, std::move(hooks));
+
+  REQUIRE(accumulator.contribute(101, one_column_view(*fixture.columns[0]), fixture.stream).state ==
+          sirius::op::dynamic_filter_accumulation_result::status::pending);
+  auto const failed =
+    accumulator.contribute(202, one_column_view(*fixture.columns[1]), fixture.stream);
+
+  REQUIRE(failed.state == sirius::op::dynamic_filter_accumulation_result::status::aborted);
+  REQUIRE(replication_calls == 1);
+  REQUIRE(failed.publication.membership_filters_built == 0);
+  REQUIRE(failed.publication.filters_pushed == 0);
+  REQUIRE(accumulator.aborted());
+  REQUIRE(channel->empty());
+}
+
+TEST_CASE("equal-geometry Bloom partials OR into the root without false negatives",
+          "[dynamic_filter][publisher][bloom_reduction]")
+{
+  publisher_fixture fixture;
+  fixture.add_key_column(3, 0);
+  fixture.add_key_column(3, 3);
+  auto const& root_space = fixture.replica_spaces.front();
+
+  sirius::op::sirius_dynamic_bloom_filter root(
+    kInt64, 6, fixture.stream, root_space.get_gpu_space().get_default_allocator());
+  sirius::op::sirius_dynamic_bloom_filter partial(
+    kInt64, 6, fixture.stream, root_space.get_gpu_space().get_default_allocator());
+  root.add(fixture.columns[0]->view(), fixture.stream);
+  partial.add(fixture.columns[1]->view(), fixture.stream);
+  fixture.stream.synchronize();
+
+  root.merge_from(partial, root_space, root_space, fixture.stream);
+  fixture.stream.synchronize();
+  root.release_reduction_scratch();
+
+  auto const probe = make_int64_values(fixture, {0, 1, 2, 3, 4, 5});
+  REQUIRE(membership_mask(root, probe->view(), fixture) ==
+          std::vector<std::uint8_t>{1, 1, 1, 1, 1, 1});
 }
