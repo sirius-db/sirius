@@ -391,10 +391,10 @@ static bool build_side_is_derived(const duckdb::LogicalOperator* op)
 }
 
 /// True when this join will hand its null-safe (IS NOT DISTINCT FROM) keys to the hash join's
-/// mixed-join AST predicate instead of the hash-key path. Mirrors has_mixed_null_safe_keys() /
-/// the routing gate in the sirius_physical_hash_join ctor: routing happens only when a null-safe
-/// key is mixed with a plain `=` key (one cuDF null_equality flag can't serve both), and never
-/// for MARK joins (which cannot run in MIXED_JOIN mode).
+/// mixed-join AST predicate instead of the hash-key path. Mirrors wants_null_safe_routing() in
+/// sirius_physical_hash_join.cpp, over DuckDB's pre-wrap condition types: routing happens only
+/// when a null-safe key is mixed with a plain `=` key (one cuDF null_equality flag can't serve
+/// both), and never for MARK joins (which cannot run in MIXED_JOIN mode).
 static bool routes_null_safe_keys_to_predicate(const duckdb::LogicalComparisonJoin& op)
 {
   if (op.join_type == duckdb::JoinType::MARK) { return false; }

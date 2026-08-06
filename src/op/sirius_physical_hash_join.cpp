@@ -83,10 +83,19 @@ static void collect_bound_ref_indices(const duckdb::Expression& expr,
     expr, [&](const duckdb::Expression& child) { collect_bound_ref_indices(child, indices); });
 }
 
-// True when the join mixes a plain `=` key with a null-safe (IS NOT DISTINCT FROM)
-// one -- the case that must be split into a mixed join (see the ctor for why).
-static bool has_mixed_null_safe_keys(duckdb::vector<sirius::join_condition> const& conditions)
+// Whether this join wants its null-safe (IS NOT DISTINCT FROM) key(s) routed out of the hash
+// key and into the mixed-join conditional predicate. Only when mixed with a plain `=` -- cuDF's
+// single null_equality flag can't give `=` UNEQUAL and null-safe EQUAL at once (see the ctor) --
+// and never for MARK, which can't run in MIXED_JOIN mode.
+//
+// Whether it *can* be routed is a separate question: null_safe_keys_are_ast_routable() below.
+// are_conditions_supported() and the ctor must agree on this, so both call this one function:
+// classifying a key as conditional subjects it to cuDF's mixed_join disjoint-column
+// requirement, which a key that stays in the hash key never has to satisfy.
+static bool wants_null_safe_routing(duckdb::vector<sirius::join_condition> const& conditions,
+                                    duckdb::JoinType join_type)
 {
+  if (join_type == duckdb::JoinType::MARK) { return false; }
   bool has_plain_equal = false;
   bool has_null_safe   = false;
   for (auto const& c : conditions) {
@@ -190,13 +199,13 @@ static cudf::mark_join make_left_mark_join(cudf::table_view const& left_keys,
 bool sirius_physical_hash_join::are_conditions_supported(
   duckdb::vector<sirius::join_condition>& conditions, duckdb::JoinType join_type)
 {
-  // When a plain `=` key is mixed with a null-safe (IS NOT DISTINCT FROM) key, the
-  // null-safe key is treated as conditional (not a hash key), matching the ctor's
-  // runtime split. Unlike the ctor this has no `!= MARK` gate: a MARK join never
-  // actually routes, but classifying its null-safe key as conditional here is still
-  // safe -- disjoint columns run as a regular UNEQUAL hash join (the null-safe MARK
-  // limitation), overlapping columns fall back to CPU; neither crashes.
-  bool const route_null_safe = has_mixed_null_safe_keys(conditions);
+  // A routed null-safe key is classified as conditional (not a hash key) below, exactly as
+  // the ctor will split it at runtime. Both call wants_null_safe_routing() so the two cannot
+  // drift: the classification decides whether the key is held to cuDF's mixed_join
+  // disjoint-column requirement, and a key that stays in the hash key -- e.g. every MARK
+  // join's -- must not be, or an overlapping-column join that runs fine as a plain UNEQUAL
+  // hash join gets rejected for a constraint it never has to satisfy.
+  bool const route_null_safe = wants_null_safe_routing(conditions, join_type);
 
   // Routing moves a null-safe key out of the hash-key path (prepare_join_keys, which casts
   // with cudf::cast) and into the cuDF AST predicate, which can only cast to INT64 / UINT64 /
@@ -207,14 +216,8 @@ bool sirius_physical_hash_join::are_conditions_supported(
   //
   // The planner materializes such a cast into a real column below the join
   // (materialize_expression_join_keys), so this normally does not fire; it is the backstop
-  // for key expressions materialization cannot rewrite. Unlike route_null_safe above this
-  // does gate on MARK, mirroring the ctor: a MARK join never routes, so its null-safe key
-  // still goes through prepare_join_keys/cudf::cast and needs no AST support -- rejecting
-  // it here would only demote a working hash join to a quadratic nested-loop join.
-  if (route_null_safe && join_type != duckdb::JoinType::MARK &&
-      !null_safe_keys_are_ast_routable(conditions)) {
-    return false;
-  }
+  // for key expressions materialization cannot rewrite.
+  if (route_null_safe && !null_safe_keys_are_ast_routable(conditions)) { return false; }
 
   // Must have at least one hash-equality condition for a hash-based join.
   bool has_equality = false;
@@ -332,16 +335,14 @@ sirius_physical_hash_join::sirius_physical_hash_join(
   // predicate (as NULL_EQUAL) when mixed with a plain `=`: cuDF's single null_equality
   // flag can't give `=` UNEQUAL and null-safe EQUAL at once. MARK joins can't run in
   // MIXED_JOIN mode, so they are never routed.
-  bool const wants_null_safe_routing =
-    has_mixed_null_safe_keys(conditions) && join_type != duckdb::JoinType::MARK;
-  bool const route_null_safe =
-    wants_null_safe_routing && null_safe_keys_are_ast_routable(conditions);
+  bool const wants_routing   = wants_null_safe_routing(conditions, join_type);
+  bool const route_null_safe = wants_routing && null_safe_keys_are_ast_routable(conditions);
 
   // are_conditions_supported() rejects this join, so the planner never builds it -- but
   // failing loudly here (at plan time, where the exception becomes a clean CPU fallback)
   // beats silently demoting the null-safe key back to an UNEQUAL hash key, which would
   // resurrect the NULL-to-NULL undercount this routing exists to fix.
-  if (wants_null_safe_routing && !route_null_safe) {
+  if (wants_routing && !route_null_safe) {
     throw std::runtime_error(
       "sirius_physical_hash_join: a null-safe (IS NOT DISTINCT FROM) key mixed with a plain `=` "
       "key carries an expression the cuDF AST cannot express (it only casts to INT64/UINT64/"
