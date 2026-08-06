@@ -356,6 +356,19 @@ compressed_table compress_columns(cudf::table_view table,
   return compress_columns_parallel(table, column_plans, lp.pool, mr, column_names);
 }
 
+compressed_table compress_columns(cudf::table_view table,
+                                  std::vector<std::string> const& column_plans,
+                                  simpatico::stream_pool& pool,
+                                  rmm::device_async_resource_ref mr,
+                                  std::vector<std::string> column_names)
+{
+  nvtx3::scoped_range nvtx_range{"simpatico::compress_columns[pool]"};
+  validate_plan_count(column_plans.size(), table.num_columns());
+  validate_column_names(column_names, column_plans.size());
+  reject_sliced_columns(table);
+  return compress_columns_parallel(table, column_plans, pool, mr, column_names);
+}
+
 compressed_table compress_with_plan(cudf::table_view table,
                                     std::string_view plan_dsl,
                                     rmm::cuda_stream_view stream,

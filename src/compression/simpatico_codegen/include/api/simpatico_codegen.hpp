@@ -150,6 +150,31 @@ compressed_table compress_columns(
   rmm::device_async_resource_ref mr     = rmm::mr::get_current_device_resource_ref(),
   std::vector<std::string> column_names = {});
 
+/// Compress each column with its OWN plan DSL across a caller-supplied stream pool.
+///
+/// The mirror image of `decompress(table, pool, mr)`. Prefer this over the
+/// `column_threads` overload when the caller already owns a pool: it skips the
+/// lease/return round-trip through the process-lifetime stream cache.
+///
+/// Like every pool overload, work is submitted from the *calling* thread, so
+/// cuCascade's thread_local memory-reservation accounting sees every allocation.
+///
+/// The caller must order its own work before the call (the pool streams do not
+/// observe the caller's stream): synchronize the stream that produced @p table.
+///
+/// @param table        Source table; sliced/offset columns are rejected.
+/// @param column_plans One plan DSL per column of @p table.
+/// @param pool         Caller-supplied stream pool.
+/// @param mr           Device memory resource.
+/// @param column_names Optional per-column names.
+/// @throws std::runtime_error  plan/table column count mismatch or GPU error.
+compressed_table compress_columns(
+  cudf::table_view table,
+  std::vector<std::string> const& column_plans,
+  simpatico::stream_pool& pool,
+  rmm::device_async_resource_ref mr     = rmm::mr::get_current_device_resource_ref(),
+  std::vector<std::string> column_names = {});
+
 // ── Decompression ─────────────────────────────────────────────────────────────
 
 /// Decompress all columns of @p table sequentially on a single CUDA stream.
