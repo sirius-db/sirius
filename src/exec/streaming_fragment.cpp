@@ -16,6 +16,7 @@
 
 #include "exec/streaming_fragment.hpp"
 
+#include "cudf/cudf_utils.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "sirius/exception.hpp"
 #include "sirius_context.hpp"
@@ -123,8 +124,45 @@ void streaming_fragment::build(sirius::query_id_t query_id)
 
   duckdb::unique_ptr<op::sirius_physical_streaming_sink> sink;
   if (_spec.partitioning.has_value()) {
+    auto partitioning = *_spec.partitioning;
+    // Derive the per-key hash casts from the sink's own output types: every integral key
+    // hashes as INT64 so senders whose plans bind different integer widths for the same key
+    // still co-locate equal values; boolean and string keys hash as-is. Anything else is
+    // refused — a float/decimal/temporal key hashed bitwise across independently planned
+    // senders is the silent-wrong-groups failure shape.
+    if (partitioning.mode == op::partition_spec::partition_mode::hash &&
+        partitioning.key_cast_types.empty()) {
+      partitioning.key_cast_types.reserve(partitioning.key_columns.size());
+      for (auto const key : partitioning.key_columns) {
+        if (key < 0 || static_cast<std::size_t>(key) >= types.size()) {
+          throw sirius::invalid_input_exception(
+            "streaming_fragment: hash partition key column {} is outside the sink row ({} "
+            "columns)",
+            key,
+            types.size());
+        }
+        auto const& key_type = types[static_cast<std::size_t>(key)];
+        switch (key_type.id()) {
+          case sirius::type_id::TINYINT:
+          case sirius::type_id::SMALLINT:
+          case sirius::type_id::INTEGER:
+          case sirius::type_id::BIGINT:
+            partitioning.key_cast_types.push_back(cudf::data_type(cudf::type_id::INT64));
+            break;
+          case sirius::type_id::BOOLEAN:
+          case sirius::type_id::VARCHAR:
+            partitioning.key_cast_types.push_back(sirius::get_cudf_type(key_type));
+            break;
+          default:
+            throw sirius::invalid_input_exception(
+              "streaming_fragment: hash partition key type {} is not supported (integral, "
+              "boolean and string keys only)",
+              key_type.to_string());
+        }
+      }
+    }
     sink = duckdb::make_uniq<op::sirius_physical_streaming_sink>(
-      std::move(types), cardinality, std::move(sink_repos), *_spec.partitioning);
+      std::move(types), cardinality, std::move(sink_repos), std::move(partitioning));
   } else {
     sink = duckdb::make_uniq<op::sirius_physical_streaming_sink>(
       std::move(types), cardinality, sink_repos.front());

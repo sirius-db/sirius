@@ -106,6 +106,7 @@ mod ffi {
         /// Declare an output stream. A fragment with none is a result fragment.
         fn declare_output(self: Pin<&mut Fragment>, stream_id: u64) -> Result<()>;
         fn declare_output_broadcast(self: Pin<&mut Fragment>) -> Result<()>;
+        fn declare_output_hash_key(self: Pin<&mut Fragment>, column_index: u32) -> Result<()>;
 
         /// Plan `substrait_plan` against the declared streams and open the
         /// fragment's query lifecycle.

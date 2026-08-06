@@ -214,6 +214,13 @@ impl Fragment<'_> {
         self.inner.pin_mut().declare_output_broadcast()
     }
 
+    /// Declares one hash-partition key (an output column index): rows hash-route by the
+    /// declared keys, output stream i taking partition i. Call once per key, in the exchange's
+    /// shared partition-expression order.
+    pub fn declare_output_hash_key(&mut self, column_index: u32) -> Result<(), Exception> {
+        self.inner.pin_mut().declare_output_hash_key(column_index)
+    }
+
     /// Plan `substrait_plan` against the declared streams and open the fragment's query lifecycle.
     pub fn build(&mut self, substrait_plan: &[u8]) -> Result<(), Exception> {
         let_cxx_string!(plan = substrait_plan);
@@ -570,6 +577,66 @@ mod tests {
             let result = receiver.into_arrow().unwrap();
             assert_eq!(rows(&result), expected, "stream {output_stream}");
         }
+    }
+
+    /// Hash-partitioned fan-out: two output streams partition the rows by key -- disjoint,
+    /// union == whole -- and two INDEPENDENTLY built senders over the same keys (different
+    /// row-group boundaries) assign every key to the SAME stream. That determinism is the
+    /// cross-sender hash-parity contract a distributed shuffle join rests on. Requires a GPU.
+    #[test]
+    fn hash_partitioned_fragment_routes_keys_deterministically() {
+        let _guard = GPU_CONTEXT_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        ensure_parquet_extension_env();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path_a = dir.path().join("keys_a.parquet");
+        let path_b = dir.path().join("keys_b.parquet");
+        // Same 20k rows, different row-group boundaries: the assignment must not depend on
+        // how batches slice the data.
+        write_multi_row_group_parquet(&path_a, 20000, 5000);
+        write_multi_row_group_parquet(&path_b, 20000, 7000);
+
+        let ctx = SiriusContext::new().expect("bring up sirius context");
+        let mut assignments: Vec<std::collections::HashMap<i64, u64>> = Vec::new();
+        for path in [&path_a, &path_b] {
+            let mut sender = ctx.fragment().unwrap();
+            sender.declare_output(0).unwrap();
+            sender.declare_output(1).unwrap();
+            sender.declare_output_hash_key(0).unwrap();
+            sender
+                .build(&local_files_plan(
+                    path.to_str().unwrap(),
+                    vec!["id".to_string(), "name".to_string()],
+                ))
+                .unwrap();
+            sender.run().unwrap();
+
+            let mut map = std::collections::HashMap::new();
+            let mut total = 0usize;
+            for stream in [0u64, 1u64] {
+                let mut receiver = ctx.fragment().unwrap();
+                receiver.declare_input_column(0, "id", "BIGINT").unwrap();
+                receiver.declare_input_column(0, "name", "VARCHAR").unwrap();
+                receiver.build(&stream_read_plan(0)).unwrap();
+                receiver.relay_from(&mut sender, stream, 0, 0).unwrap();
+                receiver.run().unwrap();
+                let result = receiver.into_arrow().unwrap();
+                let partition = rows(&result);
+                assert!(!partition.is_empty(), "stream {stream} owns no keys");
+                total += partition.len();
+                for (id, _) in partition {
+                    assert!(map.insert(id, stream).is_none(), "key {id} in two streams");
+                }
+            }
+            assert_eq!(total, 20000, "partitions must union to the whole input");
+            assignments.push(map);
+        }
+        assert_eq!(
+            assignments[0], assignments[1],
+            "independently built senders must route every key identically"
+        );
     }
 
     /// Byte-range splits of one parquet file must read every row exactly once: each split

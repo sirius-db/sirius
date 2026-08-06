@@ -160,6 +160,13 @@ class SIRIUS_FFI_EXPORT Fragment {
   /// @throws after `build()`.
   void declare_output_broadcast();
 
+  /// Declare one hash-partition key (an output column index) for a multi-output sink: rows
+  /// hash-route by the declared keys, output stream i taking partition i. Call once per key,
+  /// in the partition-expression order every sender of the exchange shares. Integral keys hash
+  /// as INT64; unsupported key types are refused at build().
+  /// @throws after `build()`, or combined with `declare_output_broadcast`.
+  void declare_output_hash_key(std::uint32_t column_index);
+
   /// Plan `substrait_plan` against the declared streams and open this fragment's query lifecycle.
   /// Reads of a declared input stream must name the view `sirius_stream_<id>`, which this call
   /// creates.

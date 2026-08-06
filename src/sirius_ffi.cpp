@@ -330,6 +330,8 @@ struct Fragment::Impl {
   //! Every declared output receives the full fragment output (broadcast sink). Consumed by
   //! build() into the fragment spec's partitioning.
   bool broadcast_outputs{false};
+  //! Hash-partition key columns (output column indices, in exchange partition-expr order).
+  std::vector<int> hash_key_columns;
 
   //! `inputs` as build() resolved them. Kept so the hop entry points (`relay_from`,
   //! `push_packed`) can validate an arriving batch against the schema the plan was bound
@@ -482,7 +484,21 @@ void Fragment::declare_output(std::uint64_t stream_id)
 void Fragment::declare_output_broadcast()
 {
   impl_->require_not_built("declare_output_broadcast");
+  if (!impl_->hash_key_columns.empty()) {
+    throw sirius::invalid_input_exception(
+      "Fragment: broadcast and hash-partitioned output are mutually exclusive");
+  }
   impl_->broadcast_outputs = true;
+}
+
+void Fragment::declare_output_hash_key(std::uint32_t column_index)
+{
+  impl_->require_not_built("declare_output_hash_key");
+  if (impl_->broadcast_outputs) {
+    throw sirius::invalid_input_exception(
+      "Fragment: broadcast and hash-partitioned output are mutually exclusive");
+  }
+  impl_->hash_key_columns.push_back(static_cast<int>(column_index));
 }
 
 void Fragment::build(const std::string& substrait_plan)
@@ -539,6 +555,14 @@ void Fragment::build(const std::string& substrait_plan)
         sirius::op::partition_spec broadcast;
         broadcast.mode    = sirius::op::partition_spec::partition_mode::broadcast;
         spec.partitioning = std::move(broadcast);
+      } else if (!impl_->hash_key_columns.empty() && impl_->outputs.size() > 1) {
+        // key_cast_types stay empty here; streaming_fragment::build() derives them from the
+        // sink's own output types (integral keys hash as INT64), so no type names cross the
+        // FFI and the two ends cannot disagree on a key's width.
+        sirius::op::partition_spec hash;
+        hash.mode         = sirius::op::partition_spec::partition_mode::hash;
+        hash.key_columns  = impl_->hash_key_columns;
+        spec.partitioning = std::move(hash);
       }
       impl_->fragment = std::make_unique<sirius::exec::streaming_fragment>(client, std::move(spec));
       // streaming_fragment declares its own inputs on the catalog from the spec; the views
