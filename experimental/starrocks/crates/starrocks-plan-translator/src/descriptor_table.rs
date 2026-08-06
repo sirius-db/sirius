@@ -245,25 +245,21 @@ impl DescriptorTable {
 
     /// Builds the Substrait schema for a StarRocks tuple.
     pub fn named_struct(&self, tuple_id: i32) -> Result<NamedStruct> {
-        self.named_struct_for_tuples(&[tuple_id], None)
+        self.named_struct_for_tuples(&[tuple_id])
     }
 
     /// Builds the Substrait schema for a row layout spanning one or more tuples.
     ///
-    /// `names` overrides descriptor names when an exchange input was materialized with the
-    /// sender fragment's output names. Types and field order always come from the receiver's
-    /// descriptor table.
-    pub(crate) fn named_struct_for_tuples(
-        &self,
-        tuple_ids: &[i32],
-        names: Option<&[String]>,
-    ) -> Result<NamedStruct> {
-        let mut descriptor_names = Vec::new();
+    /// Names and types both come from the descriptor table. An exchange read rewrites both
+    /// afterwards — its columns are the sender's, which a partial-state expansion can make
+    /// wider than the receiver's tuple (see `node_translator::translate_exchange`).
+    pub(crate) fn named_struct_for_tuples(&self, tuple_ids: &[i32]) -> Result<NamedStruct> {
+        let mut names = Vec::new();
         let mut types = Vec::new();
         for &tuple_id in tuple_ids {
             for slot_id in self.materialized_slot_ids(tuple_id)? {
                 let slot = self.slot(tuple_id, slot_id)?;
-                descriptor_names.push(slot.output_name());
+                names.push(slot.output_name());
                 types.push(
                     slot.substrait_type
                         .clone()
@@ -273,14 +269,6 @@ impl DescriptorTable {
                         })?,
                 );
             }
-        }
-        let names = names.map_or(descriptor_names, <[String]>::to_vec);
-        if names.len() != types.len() {
-            return Err(TranslateError::descriptor(format!(
-                "row layout {tuple_ids:?} has {} fields but exchange input has {} names",
-                types.len(),
-                names.len()
-            )));
         }
 
         Ok(NamedStruct {

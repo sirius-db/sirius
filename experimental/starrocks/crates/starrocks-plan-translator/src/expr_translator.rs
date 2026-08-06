@@ -643,6 +643,12 @@ pub(crate) struct AggregateCall {
     pub name: String,
     /// Translated argument expressions over the aggregation input row.
     pub arguments: Vec<Expression>,
+    /// The same arguments before the decimal-to-FP64 lowering.
+    ///
+    /// A caller that expands one StarRocks measure into several Sirius measures needs the
+    /// argument without a cast that only fits one of them: a two-phase avg counts the raw
+    /// values and sums the cast ones.
+    pub raw_arguments: Vec<Expression>,
     /// Whether the aggregate applies to distinct inputs.
     pub distinct: bool,
 }
@@ -712,29 +718,23 @@ pub(crate) fn aggregate_call(
     let mut cursor = ExprNodeCursor::new(&expr.nodes);
     // Consume the root marker; its children are the aggregate arguments.
     cursor.idx = 1;
-    let mut arguments = (0..root.num_children)
+    let raw_arguments = (0..root.num_children)
         .map(|_| cursor.translate_next(ctx))
         .collect::<Result<Vec<_>>>()?;
     cursor.ensure_consumed()?;
     // Not on the merge side: a merge measure's argument is already the FP64 partial-state
     // column; the decimal `ret_type` that drives this condition describes the original input,
     // not the child the measure actually reads.
-    if decimal_result && matches!(name, "sum" | "avg") && !merge {
-        arguments = arguments
-            .into_iter()
-            .map(|input| Expression {
-                rex_type: Some(expression::RexType::Cast(Box::new(expression::Cast {
-                    r#type: Some(type_mapper::fp64_type(true)),
-                    input: Some(Box::new(input)),
-                    failure_behavior: expression::cast::FailureBehavior::ThrowException as i32,
-                }))),
-            })
-            .collect();
-    }
+    let arguments = if decimal_result && matches!(name, "sum" | "avg") && !merge {
+        raw_arguments.iter().cloned().map(cast_to_fp64).collect()
+    } else {
+        raw_arguments.clone()
+    };
 
     Ok(AggregateCall {
         name: name.to_string(),
         arguments,
+        raw_arguments,
         distinct,
     })
 }
@@ -892,6 +892,26 @@ fn integer_literal_type(
             node_type: Some(starrocks_thrift::types::TTypeNodeType::SCALAR),
             reason: "INT_LITERAL has non-integer scalar type",
         }),
+    }
+}
+
+/// Wraps an expression in the throwing FP64 cast that lowers values Sirius cannot aggregate
+/// or divide in their declared type (decimals, and the inputs of a two-phase avg).
+pub(crate) fn cast_to_fp64(input: Expression) -> Expression {
+    cast_to(input, type_mapper::fp64_type(true))
+}
+
+/// Wraps an expression in a throwing cast to `ty`.
+///
+/// A cast to the type the expression already has is a no-op the consumer's binder elides, so
+/// this is safe to emit wherever the type has to be stated rather than inferred.
+pub(crate) fn cast_to(input: Expression, ty: Type) -> Expression {
+    Expression {
+        rex_type: Some(expression::RexType::Cast(Box::new(expression::Cast {
+            r#type: Some(ty),
+            input: Some(Box::new(input)),
+            failure_behavior: expression::cast::FailureBehavior::ThrowException as i32,
+        }))),
     }
 }
 

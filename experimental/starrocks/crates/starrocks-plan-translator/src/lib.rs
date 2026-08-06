@@ -30,7 +30,7 @@
 //! | `HDFS_SCAN_NODE`     | `ReadRel` (named table) |
 //! | `SELECT_NODE`        | `FilterRel`        |
 //! | `PROJECT_NODE`       | `ProjectRel`       |
-//! | `AGGREGATION_NODE`   | `AggregateRel` (finalized one-phase only, `new_planner_agg_stage=1`) |
+//! | `AGGREGATION_NODE`   | `AggregateRel` (one-phase, or either half of a two-phase plan) |
 //! | `SORT_NODE`          | `ProjectRel` (sort tuple) + `SortRel` (global row-number top-N only) |
 //! | `HASH_JOIN_NODE`     | `JoinRel` (inner/outer/left-semi; anti joins are rejected) |
 //! | `NESTLOOP_JOIN_NODE` | `CrossRel` (+ `FilterRel`), inner/cross only |
@@ -57,7 +57,10 @@
 //!
 //! Aggregate functions (`sum`, `count`, `min`, `max`, `avg`, and the
 //! `multi_distinct_*` distinct forms) are decomposed by `expr_translator::aggregate_call` for
-//! `AggregateRel` measures; only non-merge (one-phase) aggregates are accepted.
+//! `AggregateRel` measures. A two-phase plan's partial and merge halves are translated per
+//! phase (`agg_phase`), with the partial state each measure ships modeled by `partial_state` —
+//! avg is the one whose state is two columns, so it costs a measure expansion on the partial
+//! side and a finalizing division on the merge side.
 //!
 //! Type mapping lives in `type_mapper`. Intentional v1 omissions return
 //! [`TranslateError::UnsupportedType`]: `LARGEINT` (128-bit), `DECIMAL256` and
@@ -272,7 +275,11 @@ impl PlanTranslator {
             .map(|input| (input.node_id, input))
             .collect::<HashMap<_, _>>();
         let mut registry = ExtensionRegistry::new();
-        let (mut translated, stream_inputs) = node_translator::translate_plan(
+        let node_translator::TranslatedFragment {
+            root: mut translated,
+            stream_inputs,
+            partial_expansion,
+        } = node_translator::translate_plan(
             plan,
             &desc,
             &scan_paths,
@@ -285,6 +292,13 @@ impl PlanTranslator {
             .as_ref()
             .filter(|output_exprs| !output_exprs.is_empty())
         {
+            if partial_expansion.is_some() {
+                return Err(TranslateError::malformed(
+                    "a partial aggregation with an avg state cannot be reprojected by fragment \
+                     output expressions, which read the aggregate's columns at the positions \
+                     the state moved (SET new_planner_agg_stage = 1)",
+                ));
+            }
             let names = output_exprs
                 .iter()
                 .enumerate()
@@ -295,6 +309,11 @@ impl PlanTranslator {
             translated =
                 node_translator::project_exprs(translated, output_exprs, &desc, &mut registry)?;
             names
+        } else if let Some(expansion) = &partial_expansion {
+            // A partial avg ships more columns than the FE's output tuple has slots, so the
+            // descriptor table cannot name the row. These names are what the receiver reads
+            // the stream's columns by.
+            expansion.names.clone()
         } else {
             desc.output_names_for_tuples(&translated.row_tuples)?
         };
@@ -311,7 +330,8 @@ impl PlanTranslator {
             .map(|stream_sink| &stream_sink.output_partition)
         {
             Some(partition)
-                if partition.type_ == starrocks_thrift::partitions::TPartitionType::HASH_PARTITIONED =>
+                if partition.type_
+                    == starrocks_thrift::partitions::TPartitionType::HASH_PARTITIONED =>
             {
                 if fragment
                     .output_exprs
@@ -343,11 +363,25 @@ impl PlanTranslator {
                              transformed key would silently split equal keys across senders",
                         ));
                     };
-                    columns.push(desc.slot_global_index(
+                    let column = desc.slot_global_index(
                         slot_ref.tuple_id,
                         slot_ref.slot_id,
                         &translated.row_tuples,
-                    )?);
+                    )?;
+                    // Slot indices come from the FE's tuple, where an expanded avg state
+                    // occupies one column and the real row has it occupying two. Grouping
+                    // keys sit ahead of every measure and so keep their index; a partition
+                    // key that is not one would hash the wrong column.
+                    if let Some(expansion) = &partial_expansion
+                        && column >= expansion.keys
+                    {
+                        return Err(TranslateError::malformed(
+                            "a hash-partition key references an aggregate column whose position \
+                             moved when the avg state expanded \
+                             (SET new_planner_agg_stage = 1)",
+                        ));
+                    }
+                    columns.push(column);
                 }
                 Some(columns)
             }

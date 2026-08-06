@@ -2691,10 +2691,60 @@ fn partial_aggregation_translates_with_the_modeled_state_type() {
     assert!(names.contains(&"sum".to_string()), "{names:?}");
 }
 
-/// Verifies a partial avg is rejected: its Sirius partial state is two columns where the FE
-/// allocates one VARBINARY slot, which a type override cannot express.
+/// Extracts a measure's argument expressions.
+fn measure_arguments(
+    measure: &substrait::proto::aggregate_rel::Measure,
+) -> Vec<&substrait::proto::Expression> {
+    measure
+        .measure
+        .as_ref()
+        .unwrap()
+        .arguments
+        .iter()
+        .map(|argument| match argument.arg_type.as_ref().unwrap() {
+            substrait::proto::function_argument::ArgType::Value(expr) => expr,
+            other => panic!("expected a value argument, got {other:?}"),
+        })
+        .collect()
+}
+
+/// Names a measure's declared output type the way the engine declares a stream column.
+fn measure_output_type(measure: &substrait::proto::aggregate_rel::Measure) -> &'static str {
+    match measure
+        .measure
+        .as_ref()
+        .unwrap()
+        .output_type
+        .as_ref()
+        .unwrap()
+        .kind
+        .as_ref()
+        .unwrap()
+    {
+        substrait::proto::r#type::Kind::Fp64(_) => "DOUBLE",
+        substrait::proto::r#type::Kind::I64(_) => "BIGINT",
+        substrait::proto::r#type::Kind::Varchar(_) => "VARCHAR",
+        other => panic!("unexpected measure output type {other:?}"),
+    }
+}
+
+/// Extracts the aggregate relation a plan roots at, through an optional finalizing project.
+fn root_aggregate(plan: &substrait::proto::Plan) -> &substrait::proto::AggregateRel {
+    let mut input = root(plan).input.as_ref().unwrap();
+    if let rel::RelType::Project(project) = input.rel_type.as_ref().unwrap() {
+        input = project.input.as_ref().unwrap();
+    }
+    let rel::RelType::Aggregate(aggregate) = input.rel_type.as_ref().unwrap() else {
+        panic!("expected an aggregate relation, got {input:?}");
+    };
+    aggregate
+}
+
+/// Verifies a partial avg expands into the two measures its Sirius state really is: a summed
+/// FP64 and a count, named so the receiver can tell the two columns apart. The FE allocates a
+/// single opaque slot for that state, so the emitted row is one column wider than its tuple.
 #[test]
-fn partial_avg_is_rejected_with_the_agg_stage_workaround() {
+fn partial_avg_expands_to_sum_and_count() {
     let mut aggregate = aggregate_expr(
         "avg",
         scalar_type(TPrimitiveType::DOUBLE),
@@ -2703,10 +2753,311 @@ fn partial_avg_is_rejected_with_the_agg_stage_workaround() {
     aggregate.nodes[0].agg_expr = Some(TAggregateExpr::new(false));
     let mut node = aggregation_node(1, 1, Vec::new(), vec![aggregate]);
     node.agg_node.as_mut().unwrap().need_finalize = false;
-    let err = translate_phase_case(node).unwrap_err();
-    let message = err.to_string();
-    assert!(message.contains("VARBINARY"), "{message}");
-    assert!(message.contains("new_planner_agg_stage"), "{message}");
+    let translated = translate_phase_case(node).unwrap();
+
+    // The FE's output tuple has one slot, "total"; the sender ships two columns.
+    assert_eq!(root(&translated.plan).names, vec!["total", "total__count"]);
+    let aggregate = root_aggregate(&translated.plan);
+    assert_eq!(aggregate.measures.len(), 2);
+    for measure in &aggregate.measures {
+        assert_eq!(
+            measure.measure.as_ref().unwrap().phase,
+            substrait::proto::AggregationPhase::InitialToIntermediate as i32
+        );
+    }
+    assert_eq!(
+        aggregate
+            .measures
+            .iter()
+            .map(measure_output_type)
+            .collect::<Vec<_>>(),
+        vec!["DOUBLE", "BIGINT"]
+    );
+    let names = extension_function_names(&translated.plan);
+    assert!(names.contains(&"sum".to_string()), "{names:?}");
+    assert!(names.contains(&"count".to_string()), "{names:?}");
+
+    // The sum's argument is cast so the modeled DOUBLE wire column holds for an integer avg
+    // too; the count is over the raw values.
+    let sum_argument = measure_arguments(&aggregate.measures[0])[0];
+    assert!(
+        matches!(
+            sum_argument.rex_type.as_ref().unwrap(),
+            expression::RexType::Cast(_)
+        ),
+        "{sum_argument:?}"
+    );
+    let count_argument = measure_arguments(&aggregate.measures[1])[0];
+    assert_eq!(field_index(count_argument), 0);
+}
+
+/// Builds the merge fragment of a two-phase `avg(price), count(id) GROUP BY name` query: a
+/// merge aggregation (node 8, output tuple 3) over an exchange (node 7) whose intermediate
+/// tuple 2 carries the grouping key, the FE's single opaque slot for avg's state, and the
+/// partial count.
+fn merge_avg_fragment_params() -> TExecPlanFragmentParams {
+    let mut exchange = base_plan_node(7, TPlanNodeType::EXCHANGE_NODE, 0, vec![2]);
+    exchange.exchange_node = Some(TExchangeNode::new(
+        vec![2],
+        None,
+        None,
+        Some(TPartitionType::HASH_PARTITIONED),
+        Some(true),
+        None,
+    ));
+    let mut avg = aggregate_expr(
+        "avg",
+        scalar_type(TPrimitiveType::DOUBLE),
+        Some(slot_ref(11, 2, scalar_type(TPrimitiveType::DOUBLE))),
+    );
+    avg.nodes[0].agg_expr = Some(TAggregateExpr::new(true));
+    let mut count = aggregate_expr(
+        "count",
+        scalar_type(TPrimitiveType::BIGINT),
+        Some(slot_ref(12, 2, scalar_type(TPrimitiveType::BIGINT))),
+    );
+    count.nodes[0].agg_expr = Some(TAggregateExpr::new(true));
+    let aggregate = aggregation_node(
+        8,
+        3,
+        vec![slot_ref(10, 2, scalar_type(TPrimitiveType::VARCHAR))],
+        vec![avg, count],
+    );
+
+    let desc = desc_table(
+        vec![(2, None), (3, None)],
+        vec![
+            slot(10, 2, 0, "name", scalar_type(TPrimitiveType::VARCHAR)),
+            // The FE allocates one opaque VARBINARY slot for avg's state; the sender really
+            // shipped the sum and the count side by side.
+            slot(11, 2, 1, "a", scalar_type(TPrimitiveType::VARBINARY)),
+            slot(12, 2, 2, "c", scalar_type(TPrimitiveType::BIGINT)),
+            slot(20, 3, 0, "name", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(21, 3, 1, "avg_price", scalar_type(TPrimitiveType::DOUBLE)),
+            slot(22, 3, 2, "cnt", scalar_type(TPrimitiveType::BIGINT)),
+        ],
+    );
+    params(
+        Some(TPlan::new(vec![aggregate, exchange])),
+        Some(desc),
+        None,
+    )
+}
+
+/// The sender's output names for [`merge_avg_fragment_params`], as the partial fragment of the
+/// same query emits them.
+fn merge_avg_exchange_names() -> Vec<String> {
+    ["name", "a", "a__count", "c"]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+}
+
+/// Splits a throwing cast into its target-type kind and input expression.
+fn cast_parts(
+    expr: &substrait::proto::Expression,
+) -> (
+    &substrait::proto::r#type::Kind,
+    &substrait::proto::Expression,
+) {
+    let expression::RexType::Cast(cast) = expr.rex_type.as_ref().unwrap() else {
+        panic!("expected cast, got {expr:?}");
+    };
+    assert_eq!(
+        cast.failure_behavior,
+        expression::cast::FailureBehavior::ThrowException as i32
+    );
+    (
+        cast.r#type.as_ref().unwrap().kind.as_ref().unwrap(),
+        cast.input.as_ref().unwrap(),
+    )
+}
+
+/// Verifies the merge fragment of a two-phase avg reads both state columns and divides them
+/// back into an average: the exchange declares the extra count column the sender shipped, both
+/// halves merge with sum, and a projection on top restores the FE's output row.
+#[test]
+fn merge_avg_divides_the_summed_state() {
+    let translated = PlanTranslator::new()
+        .translate_fragment_with_exchange_inputs(
+            &merge_avg_fragment_params(),
+            &[ExchangeInput {
+                node_id: 7,
+                stream_view: "sirius_stream_7".to_string(),
+                names: merge_avg_exchange_names(),
+            }],
+        )
+        .unwrap();
+
+    // The declared stream is the sender's row, one column wider than the FE's tuple.
+    assert_eq!(
+        translated.stream_inputs[0]
+            .columns
+            .iter()
+            .map(|column| (column.name.as_str(), column.ty.as_str()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("name", "VARCHAR"),
+            ("a", "DOUBLE"),
+            ("a__count", "BIGINT"),
+            ("c", "BIGINT")
+        ]
+    );
+
+    let root = root(&translated.plan);
+    assert_eq!(root.names, vec!["name", "avg_price", "cnt"]);
+    let rel::RelType::Project(project) = root.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected the finalizing project over the aggregate");
+    };
+    // The FE's output row is three columns wide, whatever the aggregate below emitted.
+    let emit = match project.common.as_ref().unwrap().emit_kind.as_ref().unwrap() {
+        substrait::proto::rel_common::EmitKind::Emit(emit) => emit,
+        other => panic!("expected emit, got {other:?}"),
+    };
+    assert_eq!(emit.output_mapping, vec![4, 5, 6]);
+
+    // Three merged measures for two StarRocks ones, all summing: a count here would count
+    // arriving rows instead of summing the partial counts.
+    let aggregate = root_aggregate(&translated.plan);
+    assert_eq!(aggregate.measures.len(), 3);
+    let names = extension_function_names(&translated.plan);
+    assert!(!names.contains(&"count".to_string()), "{names:?}");
+    assert!(!names.contains(&"avg".to_string()), "{names:?}");
+    assert_eq!(
+        aggregate
+            .measures
+            .iter()
+            .map(|measure| field_index(measure_arguments(measure)[0]))
+            .collect::<Vec<_>>(),
+        vec![1, 2, 3]
+    );
+
+    // Key passthrough, the divided avg, then the merged count. Every measure leaves through a
+    // throwing cast to its FE-declared output type: the merged count is otherwise DuckDB's
+    // widened sum(BIGINT) = HUGEINT, which the next hop's declared BIGINT stream refuses.
+    assert_eq!(project.expressions.len(), 3);
+    assert_eq!(field_index(&project.expressions[0]), 0);
+    let (count_type, count_input) = cast_parts(&project.expressions[2]);
+    assert!(
+        matches!(count_type, substrait::proto::r#type::Kind::I64(_)),
+        "{count_type:?}"
+    );
+    assert_eq!(field_index(count_input), 3);
+    let (avg_type, avg_input) = cast_parts(&project.expressions[1]);
+    assert!(
+        matches!(avg_type, substrait::proto::r#type::Kind::Fp64(_)),
+        "{avg_type:?}"
+    );
+    let expression::RexType::IfThen(if_then) = avg_input.rex_type.as_ref().unwrap() else {
+        panic!("expected the zero-count guard around the division");
+    };
+    // A group whose values were all NULL arrives with a zero count: SQL's average of no
+    // values is NULL, not a division by zero.
+    let condition = if_then.ifs[0].r#if.as_ref().unwrap();
+    assert_eq!(
+        resolved_function(&translated.plan, scalar_fn(condition).function_reference).1,
+        "equal"
+    );
+    assert_eq!(field_index(scalar_arg(condition, 0)), 2);
+    assert!(matches!(
+        literal_type(scalar_arg(condition, 1)),
+        expression::literal::LiteralType::I64(0)
+    ));
+    assert!(matches!(
+        literal_type(if_then.ifs[0].then.as_ref().unwrap()),
+        expression::literal::LiteralType::Null(_)
+    ));
+    let quotient = if_then.r#else.as_ref().unwrap();
+    assert_eq!(
+        resolved_function(&translated.plan, scalar_fn(quotient).function_reference).1,
+        "divide"
+    );
+    assert_eq!(field_index(scalar_arg(quotient, 0)), 1);
+    assert!(
+        matches!(
+            scalar_arg(quotient, 1).rex_type.as_ref().unwrap(),
+            expression::RexType::Cast(_)
+        ),
+        "the count is divided as a double, not by an integer rule"
+    );
+}
+
+/// Verifies both fragments of a two-phase avg query describe the same wire row: the partial
+/// fragment's output names and measure types match the merge fragment's declared stream
+/// column-for-column, including the count column neither FE tuple has a slot for.
+#[test]
+fn two_phase_avg_columns_agree_end_to_end() {
+    // Partial fragment: avg(price), count(id) GROUP BY name over a scan, need_finalize=false.
+    let mut avg = aggregate_expr(
+        "avg",
+        scalar_type(TPrimitiveType::DOUBLE),
+        Some(slot_ref(1, 0, scalar_type(TPrimitiveType::DOUBLE))),
+    );
+    avg.nodes[0].agg_expr = Some(TAggregateExpr::new(false));
+    let mut count = aggregate_expr(
+        "count",
+        scalar_type(TPrimitiveType::BIGINT),
+        Some(slot_ref(3, 0, scalar_type(TPrimitiveType::BIGINT))),
+    );
+    count.nodes[0].agg_expr = Some(TAggregateExpr::new(false));
+    let mut node = aggregation_node(
+        1,
+        1,
+        vec![slot_ref(2, 0, scalar_type(TPrimitiveType::VARCHAR))],
+        vec![avg, count],
+    );
+    node.agg_node.as_mut().unwrap().need_finalize = false;
+    let desc = desc_table(
+        vec![(0, Some(100)), (1, None)],
+        vec![
+            slot(1, 0, 0, "price", scalar_type(TPrimitiveType::DOUBLE)),
+            slot(2, 0, 1, "name", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(3, 0, 2, "id", scalar_type(TPrimitiveType::BIGINT)),
+            slot(10, 1, 0, "name", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(11, 1, 1, "a", scalar_type(TPrimitiveType::VARBINARY)),
+            slot(12, 1, 2, "c", scalar_type(TPrimitiveType::BIGINT)),
+        ],
+    );
+    let partial = translate_fragment(&params(
+        Some(TPlan::new(vec![node, scan_node(0, 0)])),
+        Some(desc),
+        None,
+    ))
+    .unwrap();
+
+    // The sender's row: the grouping key (typed by its slot) then one column per emitted
+    // measure, named the way the partial fragment names them.
+    let partial_columns = std::iter::once("VARCHAR")
+        .chain(
+            root_aggregate(&partial.plan)
+                .measures
+                .iter()
+                .map(measure_output_type),
+        )
+        .zip(&partial.output_names)
+        .map(|(ty, name)| (name.as_str(), ty))
+        .collect::<Vec<_>>();
+
+    let merge = PlanTranslator::new()
+        .translate_fragment_with_exchange_inputs(
+            &merge_avg_fragment_params(),
+            &[ExchangeInput {
+                node_id: 7,
+                stream_view: "sirius_stream_7".to_string(),
+                names: partial.output_names.clone(),
+            }],
+        )
+        .unwrap();
+
+    assert_eq!(
+        partial_columns,
+        merge.stream_inputs[0]
+            .columns
+            .iter()
+            .map(|column| (column.name.as_str(), column.ty.as_str()))
+            .collect::<Vec<_>>()
+    );
 }
 
 /// Verifies grouped two-phase aggregation translates now that partitioned streaming output
