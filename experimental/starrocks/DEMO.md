@@ -116,13 +116,15 @@ into a staging lease and moved **GPU-to-GPU through nixl over UCX `cuda_ipc`** �
 host serialization of data; only control frames (agent metadata, lease grants, per-batch
 signaling, EOS) cross on brpc.
 
-The deterministic cross-node shape needs the scan split across both CNs, which
-`lineitem_multi/` provides: two **byte-identical** parquet files, so the FE's min-load selector
-places one whole file per CN and can never byte-split them.
+A single large parquet file works directly: the FE byte-splits it across the CNs, and each CN
+reads exactly the row groups whose start offset falls inside its split (start-offset ownership,
+the StarRocks reader convention), so N splits read every row exactly once. The
+`lineitem_multi/` two-file layout still works too, but the byte-identical-file gymnastics are
+no longer required.
 
 ```sql
 WITH lineitem AS (SELECT * FROM FILES(
-  "path"="file:///home/ubuntu/git/sirius/scratch/tpch_sf1/lineitem_multi/*.parquet",
+  "path"="file:///home/ubuntu/git/sirius/scratch/tpch_sf1/lineitem/*.parquet",
   "format"="parquet"))
 SELECT sum(l_extendedprice * l_discount) AS revenue
 FROM lineitem
@@ -130,9 +132,10 @@ WHERE l_shipdate >= date '1997-01-01' AND l_shipdate < date '1998-01-01'
   AND l_discount BETWEEN 0.03 - 0.01 AND 0.03 + 0.01 AND l_quantity < 24;
 ```
 
-returns `61567694.95020001` — the exact decimal is `61567694.9502`; the last-ulp difference vs
-the single-node `61567694.95019999` is double-precision summation order across the distributed
-scan. Read the logs, not just the answer:
+returns `61567694.9502` over the single split file (`count(*)` over it is `6001215` — the
+exactly-once check; a duplicated or lost split shifts it). Exact low digits vary with
+double-precision summation order across the distributed scan (`61567694.95020001` on the
+two-file layout, `61567694.95019999` single-node). Read the logs, not just the answer:
 
 ```
 nixl bandwidth canary peer=127.0.0.1:8062 gbps="145.3" bytes=16777216         <- first contact
