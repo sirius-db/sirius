@@ -146,12 +146,14 @@ void streaming_fragment::build(sirius::query_id_t query_id)
           case sirius::type_id::TINYINT:
           case sirius::type_id::SMALLINT:
           case sirius::type_id::INTEGER:
-          case sirius::type_id::BIGINT:
             partitioning.key_cast_types.push_back(cudf::data_type(cudf::type_id::INT64));
             break;
+          // Already the canonical width / not castable: EMPTY is the kernel's hash-as-is
+          // sentinel (cudf::cast refuses non-fixed-width types like strings).
+          case sirius::type_id::BIGINT:
           case sirius::type_id::BOOLEAN:
           case sirius::type_id::VARCHAR:
-            partitioning.key_cast_types.push_back(sirius::get_cudf_type(key_type));
+            partitioning.key_cast_types.push_back(cudf::data_type(cudf::type_id::EMPTY));
             break;
           default:
             throw sirius::invalid_input_exception(

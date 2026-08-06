@@ -36,8 +36,6 @@ INFO sirius_starrocks_cn::engine: relayed native batches across a fragment bound
 
 ### What it does not exercise yet
 
-- **One destination per sender.** A gather exchange only. Fan-out needs the partitioned sink
-  (#838); a sender with several destinations is refused rather than silently under-delivering.
 - **Sequential fragments.** The engine serializes queries, so a sender runs to completion before
   its receiver starts. Concurrency needs per-query lifecycle isolation.
 - **A pre-filled stream.** Senders finish before the receiver is built, so the live producer path
@@ -92,13 +90,12 @@ revenue
 
 which matches DuckDB on CPU over the same file (`61567694.9502`).
 
-A `GROUP BY` is worth running too — it plans two exchanges rather than one, so the CN logs two
-boundary crossings for a single query. Grouped queries are the one place the session variable
-is still required: grouped *two-phase* aggregation needs the hash-partitioned sink (#838), so
-the default plan is refused and `agg_stage = 1` forces the supported one-phase shape:
+A `GROUP BY` is worth running too — grouped two-phase aggregation runs at the FE's default
+settings now that the hash-partitioned sink exists (#838): the partial fragment shuffles each
+group-key partition to its merge instance, so the CN logs several boundary crossings for one
+query:
 
 ```sql
-SET new_planner_agg_stage = 1;
 WITH lineitem AS (SELECT * FROM FILES(
   "path"="file:///home/ubuntu/git/sirius/scratch/tpch_sf1/lineitem/part.0.parquet",
   "format"="parquet"))
@@ -153,14 +150,15 @@ reports: `cudaMallocAsync` pool memory over `cuda_ipc` does not error — it sil
 ~220× — so a first-contact transfer below 2 GB/s refuses the tier loudly. (`nvidia-smi`: two
 CNs at ~8.9 GiB each — pool + arena + context — on the 23 GiB L4.)
 
-**What this topology cannot run:** any plan whose sender has more than one destination. On two
-CNs that includes `GROUP BY` at any agg stage — grouped two-phase is refused in the translator
-(`grouped two-phase aggregation needs partitioned streaming output (#838)`), and at
-`agg_stage=1` the aggregate gets an instance per CN, i.e. a hash shuffle, refused at the sink
-(`a data stream sink with 2 destinations needs partitioned streaming output (#838)`). `avg` in
-a two-phase plan is also refused (StarRocks serializes its partial state as an opaque
-VARBINARY). The two-CN surface today is scalar `sum`/`count`/`min`/`max` aggregation — with the
-FE's **default** plan, no session variable; partitioned output is the recorded next step.
+**Multi-destination output (#838) is live in both shapes.** A sender fans out to N
+destinations: UNPARTITIONED broadcasts the full output (dest 0 zero-copy, the rest deep
+copies), HASH_PARTITIONED routes rows by the FE's partition keys through the GPU MURMUR3
+kernel (integral keys canonicalized to INT64; string/bool hashed as-is; anything else refused)
+— so broadcast joins, shuffle joins, and **grouped two-phase GROUP BY** all run at the FE's
+default settings across both CNs, verified against DuckDB (`GROUP BY l_returnflag` over the
+split lineitem: counts 1478493/3043852/1478870, summing to the exactly-once 6001215).
+Still refused loudly: `avg` in a two-phase plan (opaque VARBINARY partial state),
+DISTINCT/3-phase plans, RANDOM/BUCKET/RANGE sink types, and non-bare partition keys.
 
 ## The pre-packaged front end
 
