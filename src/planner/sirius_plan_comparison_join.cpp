@@ -36,6 +36,7 @@
 #include "expression/ast/reference.hpp"
 #include "expression/ast/to_duckdb.hpp"
 #include "expression/join_condition.hpp"
+#include "expression_evaluator/ast_supported_types.hpp"
 #include "helper/type_conversions.hpp"
 #include "log/logging.hpp"
 #include "op/sirius_dynamic_filter.hpp"
@@ -389,15 +390,47 @@ static bool build_side_is_derived(const duckdb::LogicalOperator* op)
   return false;
 }
 
+/// True when this join will hand its null-safe (IS NOT DISTINCT FROM) keys to the hash join's
+/// mixed-join AST predicate instead of the hash-key path. Mirrors has_mixed_null_safe_keys() /
+/// the routing gate in the sirius_physical_hash_join ctor: routing happens only when a null-safe
+/// key is mixed with a plain `=` key (one cuDF null_equality flag can't serve both), and never
+/// for MARK joins (which cannot run in MIXED_JOIN mode).
+static bool routes_null_safe_keys_to_predicate(const duckdb::LogicalComparisonJoin& op)
+{
+  if (op.join_type == duckdb::JoinType::MARK) { return false; }
+  bool has_plain_equal = false;
+  bool has_null_safe   = false;
+  for (auto const& cond : op.conditions) {
+    if (cond.comparison == duckdb::ExpressionType::COMPARE_EQUAL) {
+      has_plain_equal = true;
+    } else if (cond.comparison == duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
+      has_null_safe = true;
+    }
+  }
+  return has_plain_equal && has_null_safe;
+}
+
 /// A join equality-condition side that is a plain column reference (BOUND_REF) or a cast of one
 /// (BOUND_CAST(BOUND_REF)) is already handled directly by the hash-join key extraction and by the
 /// PARTITION operator's cast-alignment logic, so it needs no materialization.
-static bool is_trivial_key_side(const duckdb::Expression& expr)
+///
+/// `evaluated_as_ast_predicate` marks a side that will instead be evaluated by the mixed join's
+/// cuDF AST predicate (a routed null-safe key). That path never reaches the hash-join key
+/// extraction, so it gets no cudf::cast; a cuDF AST can only cast to INT64 / UINT64 / FLOAT64,
+/// so any other implicit cast -- e.g. the INTEGER cast DuckDB inserts for a SMALLINT/INTEGER
+/// `IS NOT DISTINCT FROM` -- must be materialized into a real column here instead.
+static bool is_trivial_key_side(const duckdb::Expression& expr, bool evaluated_as_ast_predicate)
 {
   if (expr.GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) { return true; }
   if (expr.GetExpressionClass() == duckdb::ExpressionClass::BOUND_CAST) {
-    return expr.Cast<duckdb::BoundCastExpression>().child->GetExpressionClass() ==
-           duckdb::ExpressionClass::BOUND_REF;
+    if (expr.Cast<duckdb::BoundCastExpression>().child->GetExpressionClass() !=
+        duckdb::ExpressionClass::BOUND_REF) {
+      return false;
+    }
+    if (!evaluated_as_ast_predicate) { return true; }
+    return std::find(sirius::supported_ast_cast_types.begin(),
+                     sirius::supported_ast_cast_types.end(),
+                     expr.return_type.id()) != sirius::supported_ast_cast_types.end();
   }
   return false;
 }
@@ -423,6 +456,8 @@ static void materialize_expression_join_keys(
   duckdb::unique_ptr<sirius::op::sirius_physical_operator>& left,
   duckdb::unique_ptr<sirius::op::sirius_physical_operator>& right)
 {
+  const bool routes_null_safe = routes_null_safe_keys_to_predicate(op);
+
   auto materialize_side = [&](duckdb::unique_ptr<sirius::op::sirius_physical_operator>& child,
                               duckdb::vector<duckdb::idx_t>& projection_map,
                               bool is_left) {
@@ -439,7 +474,9 @@ static void materialize_expression_join_keys(
         continue;  // inequality sides are evaluated inline as the mixed-join predicate
       }
       auto& side_expr = is_left ? cond.left : cond.right;
-      if (is_trivial_key_side(*side_expr)) { continue; }
+      const bool as_ast_predicate =
+        routes_null_safe && cond.comparison == duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM;
+      if (is_trivial_key_side(*side_expr, as_ast_predicate)) { continue; }
       auto node = sirius::ast::from_duckdb(*side_expr);
       if (!node) { continue; }  // untranslatable: leave for the existing downstream throw
       cond_indices.push_back(i);
@@ -560,7 +597,7 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
     sirius::wrap_join_conditions(std::move(op.conditions));
 
   bool is_supported_by_hash_join =
-    sirius::op::sirius_physical_hash_join::are_conditions_supported(conditions);
+    sirius::op::sirius_physical_hash_join::are_conditions_supported(conditions, op.join_type);
   if (is_supported_by_hash_join && !prefer_range_joins) {
     auto sirius_context   = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
     const auto& op_params = sirius_context->get_config().get_operator_params();

@@ -37,7 +37,9 @@
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
+#include "expression/ast/node.hpp"
 #include "expression/ast/to_duckdb.hpp"
+#include "expression_evaluator/ast_supported_types.hpp"
 #include "expression_evaluator/gpu_expression_translator_internal.hpp"
 #include "helper/type_conversions.hpp"
 #include "log/logging.hpp"
@@ -106,6 +108,49 @@ static bool is_hash_equality_key(sirius::comparison_type c, bool route_null_safe
   return false;
 }
 
+// Whether a routed key side survives translation into the mixed-join cuDF AST predicate.
+//
+// A routed null-safe key is no longer prepared by the hash-key path (prepare_join_keys ->
+// cudf::cast, which casts to any type); it is evaluated by the AST predicate instead, and a
+// cuDF AST can only cast to INT64 / UINT64 / FLOAT64. DuckDB binds both sides of a comparison
+// to a common type, so `l.b IS NOT DISTINCT FROM r.b` over SMALLINT/INTEGER columns arrives
+// carrying a cast to INTEGER, which does not translate.
+//
+// This covers translation only -- a bare column reference is accepted whatever its type, so
+// it does not speak to cuDF's own AST evaluation limits (e.g. decimal), which routed and
+// inequality conditions are equally exposed to.
+//
+// Everything other than a reference (or an AST-castable reference) is rejected conservatively:
+// the planner's materialize_expression_join_keys turns complex key sides into plain columns
+// before they reach here, so in practice only reference / cast-of-reference sides occur, and
+// a false negative only costs the mixed-join fast path (see are_conditions_supported).
+static bool is_ast_translatable_key_side(sirius::ast::node const& side)
+{
+  if (side.holds<sirius::ast::reference>()) { return true; }
+  if (side.holds<sirius::ast::cast>()) {
+    auto const& c         = side.get<sirius::ast::cast>();
+    auto const& supported = sirius::supported_ast_cast_types_native;
+    return std::find(supported.begin(), supported.end(), c.target_type.id()) != supported.end() &&
+           is_ast_translatable_key_side(*c.child);
+  }
+  return false;
+}
+
+// Whether every null-safe key can be routed into the conditional predicate. Checked before
+// routing so a key the AST cannot express is never promised to the mixed join.
+static bool null_safe_keys_are_ast_routable(
+  duckdb::vector<sirius::join_condition> const& conditions)
+{
+  for (auto const& c : conditions) {
+    if (c.comparison != sirius::comparison_type::not_distinct_from) { continue; }
+    if (!c.left || !c.right) { return false; }
+    if (!is_ast_translatable_key_side(*c.left) || !is_ast_translatable_key_side(*c.right)) {
+      return false;
+    }
+  }
+  return true;
+}
+
 static cudf::filtered_join make_right_filtered_join(cudf::table_view const& right_keys,
                                                     cudf::null_equality compare_nulls,
                                                     rmm::cuda_stream_view stream)
@@ -143,7 +188,7 @@ static cudf::mark_join make_left_mark_join(cudf::table_view const& left_keys,
 }
 
 bool sirius_physical_hash_join::are_conditions_supported(
-  duckdb::vector<sirius::join_condition>& conditions)
+  duckdb::vector<sirius::join_condition>& conditions, duckdb::JoinType join_type)
 {
   // When a plain `=` key is mixed with a null-safe (IS NOT DISTINCT FROM) key, the
   // null-safe key is treated as conditional (not a hash key), matching the ctor's
@@ -152,6 +197,24 @@ bool sirius_physical_hash_join::are_conditions_supported(
   // safe -- disjoint columns run as a regular UNEQUAL hash join (the null-safe MARK
   // limitation), overlapping columns fall back to CPU; neither crashes.
   bool const route_null_safe = has_mixed_null_safe_keys(conditions);
+
+  // Routing moves a null-safe key out of the hash-key path (prepare_join_keys, which casts
+  // with cudf::cast) and into the cuDF AST predicate, which can only cast to INT64 / UINT64 /
+  // FLOAT64. If any routed key would not translate, reject the join here so the planner picks
+  // an operator that can evaluate it (the nested-loop join, which materializes casts itself,
+  // or a CPU fallback) rather than promising a mixed join that throws at execute time --
+  // aborting the whole GPU pipeline mid-query.
+  //
+  // The planner materializes such a cast into a real column below the join
+  // (materialize_expression_join_keys), so this normally does not fire; it is the backstop
+  // for key expressions materialization cannot rewrite. Unlike route_null_safe above this
+  // does gate on MARK, mirroring the ctor: a MARK join never routes, so its null-safe key
+  // still goes through prepare_join_keys/cudf::cast and needs no AST support -- rejecting
+  // it here would only demote a working hash join to a quadratic nested-loop join.
+  if (route_null_safe && join_type != duckdb::JoinType::MARK &&
+      !null_safe_keys_are_ast_routable(conditions)) {
+    return false;
+  }
 
   // Must have at least one hash-equality condition for a hash-based join.
   bool has_equality = false;
@@ -269,8 +332,21 @@ sirius_physical_hash_join::sirius_physical_hash_join(
   // predicate (as NULL_EQUAL) when mixed with a plain `=`: cuDF's single null_equality
   // flag can't give `=` UNEQUAL and null-safe EQUAL at once. MARK joins can't run in
   // MIXED_JOIN mode, so they are never routed.
-  bool const route_null_safe =
+  bool const wants_null_safe_routing =
     has_mixed_null_safe_keys(conditions) && join_type != duckdb::JoinType::MARK;
+  bool const route_null_safe =
+    wants_null_safe_routing && null_safe_keys_are_ast_routable(conditions);
+
+  // are_conditions_supported() rejects this join, so the planner never builds it -- but
+  // failing loudly here (at plan time, where the exception becomes a clean CPU fallback)
+  // beats silently demoting the null-safe key back to an UNEQUAL hash key, which would
+  // resurrect the NULL-to-NULL undercount this routing exists to fix.
+  if (wants_null_safe_routing && !route_null_safe) {
+    throw std::runtime_error(
+      "sirius_physical_hash_join: a null-safe (IS NOT DISTINCT FROM) key mixed with a plain `=` "
+      "key carries an expression the cuDF AST cannot express (it only casts to INT64/UINT64/"
+      "FLOAT64), so it cannot be routed into the mixed-join predicate");
+  }
   reorder_join_conditions(conditions, route_null_safe);
 
   // Cache the null-matching flag for the hash-equality keys (conditions and join_type

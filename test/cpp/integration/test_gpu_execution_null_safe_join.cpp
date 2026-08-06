@@ -232,6 +232,84 @@ TEST_CASE_METHOD(
     "ON mnl.a = mnr.a AND mnl.b IS NOT DISTINCT FROM mnr.b");
 }
 
+// A mixed '=' + null-safe join whose null-safe key needs an implicit cast. Routing that key
+// into the mixed-join predicate takes it off the hash-key path (prepare_join_keys ->
+// cudf::cast, which casts to anything) and onto the cuDF AST, which can only cast to
+// INT64 / UINT64 / FLOAT64. `b` is SMALLINT vs INTEGER, so DuckDB binds the comparison at
+// INTEGER and inserts a cast the AST cannot express; the planner has to materialize it into
+// a real column below the join. `c` is SMALLINT vs BIGINT -- a cast the AST *can* express --
+// so it covers the inline path that needs no materialization.
+class MixedTypeNullSafeJoinFixture : public sirius::test::GpuExecutionFixture {
+ public:
+  MixedTypeNullSafeJoinFixture()
+  {
+    run_ok("CREATE TABLE mtl (id INTEGER, a INTEGER, b SMALLINT, c SMALLINT);");
+    run_ok("CREATE TABLE mtr (id INTEGER, a INTEGER, b INTEGER, c BIGINT);");
+    // Same shape as MixedKeyNullSafeJoinFixture: a matching non-NULL pair, two NULL-to-NULL
+    // pairs (which plain '=' would drop), a non-matching pair, a row with no `a` partner, and
+    // a row matching on the null-safe key but NULL in the plain '=' key (which must not match).
+    run_ok(
+      "INSERT INTO mtl VALUES (1, 10, 100, 100), (2, 10, NULL, NULL), (3, 20, NULL, NULL), "
+      "(4, 30, 300, 300), (5, 40, NULL, NULL), (6, NULL, 500, 500);");
+    run_ok(
+      "INSERT INTO mtr VALUES (100, 10, 100, 100), (101, 10, NULL, NULL), (102, 20, NULL, NULL), "
+      "(103, 30, 999, 999), (104, NULL, 500, 500);");
+    run_ok("CHECKPOINT;");
+  }
+};
+
+TEST_CASE_METHOD(MixedTypeNullSafeJoinFixture,
+                 "gpu_execution mixed '=' + null-safe join with an AST-untranslatable cast",
+                 "[integration][gpu_execution][join][nulls]")
+{
+  // SMALLINT vs INTEGER on the null-safe key. compare_gpu_vs_cpu requires exactly one GPU
+  // execution and no fallback, so this fails if the join throws at execute time (the mixed
+  // join promising a predicate the AST can't build) as well as if it returns wrong rows.
+  // Matches: (a=10,b=100), (a=10,b=NULL), (a=20,b=NULL) = 3 rows.
+  compare_gpu_vs_cpu(
+    "SELECT mtl.id, mtr.id FROM mtl JOIN mtr "
+    "ON mtl.a = mtr.a AND mtl.b IS NOT DISTINCT FROM mtr.b");
+  compare_gpu_vs_cpu(
+    "SELECT count(*) FROM mtl JOIN mtr "
+    "ON mtl.a = mtr.a AND mtl.b IS NOT DISTINCT FROM mtr.b");
+}
+
+TEST_CASE_METHOD(MixedTypeNullSafeJoinFixture,
+                 "gpu_execution mixed '=' + null-safe join with a cast and no NULLs",
+                 "[integration][gpu_execution][join][nulls]")
+{
+  // The rows with NULL keys are filtered out, so the result is independent of null semantics.
+  // This is the case that worked before null-safe keys were routed into the AST predicate:
+  // it must keep working, not throw on a cast the AST cannot express.
+  compare_gpu_vs_cpu(
+    "SELECT mtl.id, mtr.id FROM mtl JOIN mtr "
+    "ON mtl.a = mtr.a AND mtl.b IS NOT DISTINCT FROM mtr.b "
+    "WHERE mtl.b IS NOT NULL AND mtr.b IS NOT NULL");
+}
+
+TEST_CASE_METHOD(MixedTypeNullSafeJoinFixture,
+                 "gpu_execution mixed '=' + null-safe join with an AST-translatable cast",
+                 "[integration][gpu_execution][join][nulls]")
+{
+  // SMALLINT vs BIGINT binds at BIGINT, which the cuDF AST can cast to, so this key stays
+  // inline in the predicate rather than being materialized. Same 3 expected matches.
+  compare_gpu_vs_cpu(
+    "SELECT mtl.id, mtr.id FROM mtl JOIN mtr "
+    "ON mtl.a = mtr.a AND mtl.c IS NOT DISTINCT FROM mtr.c");
+}
+
+TEST_CASE_METHOD(MixedTypeNullSafeJoinFixture,
+                 "gpu_execution mixed-type null-safe join does not leak the materialized key",
+                 "[integration][gpu_execution][join][nulls]")
+{
+  // Materializing the cast appends a synthetic key column to the join's child. SELECT *
+  // pins the join's output width and column order, so a leaked key column fails here.
+  compare_gpu_vs_cpu(
+    "SELECT * FROM mtl JOIN mtr ON mtl.a = mtr.a AND mtl.b IS NOT DISTINCT FROM mtr.b");
+  compare_gpu_vs_cpu(
+    "SELECT * FROM mtl LEFT JOIN mtr ON mtl.a = mtr.a AND mtl.b IS NOT DISTINCT FROM mtr.b");
+}
+
 // Documents the remaining null-safe limitation. A MARK-family join (here a projected
 // correlated EXISTS) can't run in MIXED_JOIN mode, so its null-safe key is NOT routed
 // to a NULL_EQUAL predicate -- it stays a UNEQUAL hash key and NULL-to-NULL matches can
