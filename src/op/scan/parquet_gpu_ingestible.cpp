@@ -805,6 +805,8 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
       auto const primary_idx = _plan->data_columns[batch_index].primary_idx;
       if (primary_idx >= _info->returned_types.size()) { continue; }
       auto const& column_type = _info->returned_types[primary_idx];
+      // MAP is normalized to Sirius LIST by from_duckdb(). DuckDB UNION is not
+      // supported by that conversion, so it cannot reach this scan path.
       if (column_type.id() == sirius::type_id::LIST || column_type.id() == sirius::type_id::ARRAY ||
           column_type.id() == sirius::type_id::STRUCT) {
         continue;

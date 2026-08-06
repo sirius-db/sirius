@@ -32,51 +32,22 @@
 #include <io/kvikio/kvikio_context.hpp>
 #include <op/scan/parquet_gpu_ingestible.hpp>
 #include <op/scan/scan_plan.hpp>
+#include <utils/parquet_fixture_utils.hpp>
 
 // duckdb
 #include <duckdb.hpp>
 #include <duckdb/planner/filter/null_filter.hpp>
 
 // standard library
-#include <unistd.h>
-
-#include <atomic>
 #include <cstdint>
-#include <cstdlib>
-#include <filesystem>
 #include <memory>
 #include <optional>
 #include <string>
-#include <system_error>
 #include <vector>
 
-namespace fs   = std::filesystem;
 namespace scan = sirius::op::scan;
 
 namespace {
-
-/// Sets SIRIUS_DISABLE=1 for a scope and restores the prior value, so a failing
-/// REQUIRE cannot leak a changed global into later tests.
-struct scoped_sirius_disable_set {
-  scoped_sirius_disable_set()
-  {
-    if (char const* val = ::getenv("SIRIUS_DISABLE")) { _saved = val; }
-    ::setenv("SIRIUS_DISABLE", "1", 1);
-  }
-  ~scoped_sirius_disable_set()
-  {
-    if (_saved) {
-      ::setenv("SIRIUS_DISABLE", _saved->c_str(), 1);
-    } else {
-      ::unsetenv("SIRIUS_DISABLE");
-    }
-  }
-  scoped_sirius_disable_set(scoped_sirius_disable_set const&)            = delete;
-  scoped_sirius_disable_set& operator=(scoped_sirius_disable_set const&) = delete;
-
- private:
-  std::optional<std::string> _saved;
-};
 
 /// Three row groups of 2048 rows, each with a different null shape in `v`:
 ///
@@ -93,18 +64,9 @@ class NullCountFixture {
  public:
   NullCountFixture()
   {
-    static std::atomic<unsigned> ctr{0};
-    dir_ = fs::temp_directory_path() / ("sirius_null_count_" + std::to_string(::getpid()) + "_" +
-                                        std::to_string(ctr.fetch_add(1)));
-    // PID + a process-local counter repeats once PIDs are reused, and
-    // create_directories accepts an existing directory — a previous run's file
-    // would then be read instead of the one about to be written.
-    std::error_code rm_ec;
-    fs::remove_all(dir_, rm_ec);
-    fs::create_directories(dir_);
-    path_ = (dir_ / "null_count.parquet").string();
+    path_ = dir_.file("null_count.parquet");
 
-    scoped_sirius_disable_set disable_guard;
+    sirius::test::scoped_sirius_disable disable_guard;
     duckdb::DuckDB db(nullptr);
     duckdb::Connection con(db);
     for (auto const& sql : std::vector<std::string>{
@@ -118,8 +80,8 @@ class NullCountFixture {
            // group is the entire point of this fixture, and DuckDB is
            // explicitly allowed to reorder a query that does not ask for an
            // order (preserve_insertion_order is a global setting).
-           "COPY (SELECT * FROM nc ORDER BY id) TO '" + path_ +
-             "' (FORMAT PARQUET, ROW_GROUP_SIZE 2048)",
+           "COPY (SELECT * FROM nc ORDER BY id) TO " + sirius::test::sql_literal(path_) +
+             " (FORMAT PARQUET, ROW_GROUP_SIZE 2048)",
          }) {
       auto r = con.Query(sql);
       REQUIRE(r);
@@ -134,8 +96,9 @@ class NullCountFixture {
     //   rg 0  ids     1..2048  all NULL      -> 2048
     //   rg 1  ids  2049..4096  none NULL     ->    0
     //   rg 2  ids  4097..6144  odd ids NULL  -> 1024
-    auto layout = con.Query("SELECT row_group_num_rows, stats_null_count FROM parquet_metadata('" +
-                            path_ + "') WHERE path_in_schema = 'v' ORDER BY row_group_id");
+    auto layout = con.Query("SELECT row_group_num_rows, stats_null_count FROM parquet_metadata(" +
+                            sirius::test::sql_literal(path_) +
+                            ") WHERE path_in_schema = 'v' ORDER BY row_group_id");
     REQUIRE(layout);
     REQUIRE_FALSE(layout->HasError());
     REQUIRE(layout->RowCount() == 3);
@@ -157,14 +120,6 @@ class NullCountFixture {
         REQUIRE(nulls == expected_nulls[i]);
       }
     }
-  }
-
-  ~NullCountFixture()
-  {
-    // Best-effort: a destructor is noexcept, so a leftover temp dir must not
-    // become a std::terminate.
-    std::error_code ec;
-    fs::remove_all(dir_, ec);
   }
 
   /// Scan info projecting (id, v), optionally with a null filter on `v`.
@@ -210,7 +165,7 @@ class NullCountFixture {
   }
 
  protected:
-  fs::path dir_;
+  sirius::test::scratch_dir dir_{"null_count"};
   std::string path_;
 };
 
@@ -230,7 +185,7 @@ TEST_CASE_METHOD(NullCountFixture,
                  "null_count pruning - IS NULL drops row groups with no nulls",
                  "[scan][parquet][pruning][null_count]")
 {
-  CHECK(surviving_row_groups(/*filter_expects_null=*/true) == 2);
+  REQUIRE(surviving_row_groups(/*filter_expects_null=*/true) == 2);
 }
 
 // `v IS NOT NULL` cannot match the wholly-NULL row group
@@ -243,5 +198,5 @@ TEST_CASE_METHOD(NullCountFixture,
                  "null_count pruning - IS NOT NULL drops wholly-null row groups",
                  "[scan][parquet][pruning][null_count]")
 {
-  CHECK(surviving_row_groups(/*filter_expects_null=*/false) == 2);
+  REQUIRE(surviving_row_groups(/*filter_expects_null=*/false) == 2);
 }
