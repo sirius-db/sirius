@@ -80,7 +80,7 @@ void downgrade_executor::start()
 
   _request_queue.reactivate();
 
-  absl::AnyInvocable<void() noexcept> per_thread_init = nullptr;
+  sirius::exec::invocable<void() noexcept> per_thread_init = nullptr;
   if (_memory_space && _space_id.tier == cucascade::memory::Tier::GPU) {
     auto device_id  = _memory_space->get_device_id();
     per_thread_init = [device_id]() noexcept {

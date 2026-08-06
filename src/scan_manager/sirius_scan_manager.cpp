@@ -403,8 +403,8 @@ sirius_scan_manager::sirius_scan_manager(
   // scan_manager always owns an io_ctx: sirius_datasource (uring) on the
   // fast path, kvikio_context as the universal fallback so the rest of the
   // scan path (split_provider, scan tasks) always has an ioctx to
-  // talk to.  kvikio_context wraps cudf::io::datasource so the read path
-  // is identical from the caller's point of view.  Both are built by the
+  // talk to.  kvikio_context drives kvikio::FileHandle directly so the read
+  // path is identical from the caller's point of view.  Both are built by the
   // ioctx registry, which sources the reactor staging resource from the
   // reservation manager it was constructed with.
   if (_config.use_sirius_datasource) {
@@ -524,7 +524,7 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
 
   if (_io_ctx && _io_ctx->cache()) {
     SIRIUS_LOG_INFO("[sirius_scan_manager] cache summary: {}", _io_ctx->cache()->summary());
-    _io_ctx->cache()->prepare_for_query(query);
+    _io_ctx->cache()->prepare_for_query();
   }
 
   // Routed ioctxs (e.g. the restful context serving s3://) are built lazily and
@@ -534,7 +534,7 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
   {
     std::lock_guard lk{_routed_io_ctxs_mtx};
     for (auto& [type, io_ctx] : _routed_io_ctxs) {
-      if (io_ctx && io_ctx->cache()) { io_ctx->cache()->prepare_for_query(query); }
+      if (io_ctx && io_ctx->cache()) { io_ctx->cache()->prepare_for_query(); }
     }
   }
 
@@ -561,8 +561,7 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
       continue;
     }
     auto provider = std::make_unique<split_provider>(
-      op->get_ingestible(),
-      [this](std::string_view file_path) -> std::shared_ptr<io::sirius_ioctx> {
+      op->get_ingestible(), [this](std::string_view file_path) -> std::shared_ptr<io::ioctx> {
         auto io_ctx = ioctx_for_path(file_path);
         if (!io_ctx) {
           throw std::runtime_error("scan_manager: no backend supports path: " +
@@ -707,7 +706,7 @@ std::shared_ptr<sirius::io::sirius_datasource> sirius_scan_manager::create_datas
 void sirius_scan_manager::list_objects_paged(
   std::string const& s3_prefix_uri,
   std::size_t page_size,
-  std::function<bool(sirius::io::s3::list_objects_v2_page const&)> const& sink,
+  std::function<bool(sirius::io::rest::s3::list_objects_v2_page const&)> const& sink,
   std::optional<std::size_t> max_scanned)
 {
   // Hand-split rather than uri_parser::parse — a LIST prefix URI legitimately
@@ -767,7 +766,7 @@ std::size_t sirius_scan_manager::s3_list_max_matches(std::string const& s3_uri)
   return rest->list_max_matches();
 }
 
-std::shared_ptr<sirius::io::sirius_ioctx> sirius_scan_manager::ioctx_for_path(std::string_view path)
+std::shared_ptr<sirius::io::ioctx> sirius_scan_manager::ioctx_for_path(std::string_view path)
 {
   // Normalize here so every caller (incl. the scan resolver, which forwards raw
   // ingestible paths) routes `file://` the same way create_datasource does.

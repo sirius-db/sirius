@@ -15,7 +15,7 @@
  */
 
 #include "catch.hpp"
-#include "io/s3/sigv4.hpp"
+#include "io/rest/s3/sigv4.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -24,11 +24,11 @@
 #include <string>
 #include <string_view>
 
-using sirius::io::s3::presign_url;
-using sirius::io::s3::sha256_hex;
-using sirius::io::s3::sign_request;
-using sirius::io::s3::sigv4_signer_config;
-using sirius::io::s3::uri_encode;
+using sirius::io::rest::s3::presign_url;
+using sirius::io::rest::s3::sha256_hex;
+using sirius::io::rest::s3::sign_request;
+using sirius::io::rest::s3::sigv4_signer_config;
+using sirius::io::rest::s3::uri_encode;
 
 namespace {
 
@@ -42,7 +42,7 @@ sigv4_signer_config aws_example_creds()
   return creds;
 }
 
-std::string authorization_header(sirius::io::s3::sigv4_signed_request const& req)
+std::string authorization_header(sirius::io::rest::s3::sigv4_signed_request const& req)
 {
   for (auto const& [key, value] : req.headers) {
     if (key == "Authorization") { return value; }
@@ -50,7 +50,8 @@ std::string authorization_header(sirius::io::s3::sigv4_signed_request const& req
   return {};
 }
 
-std::string header_value(sirius::io::s3::sigv4_signed_request const& req, std::string_view wanted)
+std::string header_value(sirius::io::rest::s3::sigv4_signed_request const& req,
+                         std::string_view wanted)
 {
   for (auto const& [key, value] : req.headers) {
     if (key == wanted) { return value; }

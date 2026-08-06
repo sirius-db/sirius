@@ -19,6 +19,7 @@
 #include "exec/try.hpp"
 #include "log/logging.hpp"
 #include "op/scan/sirius_gpu_scan_operator_data.hpp"
+#include "pipeline/sirius_pipeline.hpp"
 
 #include <stop_token>
 #include <utility>

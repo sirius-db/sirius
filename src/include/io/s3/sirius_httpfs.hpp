@@ -16,7 +16,7 @@
 
 #pragma once
 
-#include "io/s3/s3_list_parser.hpp"
+#include "io/rest/s3/list_parser.hpp"
 
 #include <duckdb/common/file_system.hpp>
 #include <duckdb/common/open_file_info.hpp>

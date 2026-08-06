@@ -61,7 +61,7 @@ gpu_pipeline_executor::gpu_pipeline_executor(
 
 gpu_pipeline_executor::~gpu_pipeline_executor() { stop(); }
 
-absl::AnyInvocable<void() noexcept> gpu_pipeline_executor::get_per_thread_init()
+sirius::exec::invocable<void() noexcept> gpu_pipeline_executor::get_per_thread_init()
 {
   int device_id          = _memory_space->get_device_id();
   auto thread_id_counter = std::make_shared<std::atomic<uint32_t>>(0);

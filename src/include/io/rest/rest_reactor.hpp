@@ -17,10 +17,9 @@
 #pragma once
 
 #include "io/cache/types.hpp"
+#include "io/rest/authorizer.hpp"
 #include "io/rest/config.hpp"
 #include "io/rest/types.hpp"
-#include "io/s3/s3_object_ref.hpp"
-#include "io/s3/s3_request_authorizer.hpp"
 #include "io/types.hpp"
 
 #include <rmm/cuda_stream_view.hpp>
@@ -47,7 +46,50 @@ namespace sirius::io::rest {
 /// "bytes <first>-<last>/<total>".  Returns nullopt when the unit is not
 /// "bytes", the range is unsatisfied ("bytes */..."), or the total is unknown
 /// ("*") — i.e. any response the footer probe cannot trust.
-[[nodiscard]] std::optional<std::size_t> content_range_total(std::string const& content_range);
+[[nodiscard]] std::optional<std::size_t> content_range_total(std::string_view content_range);
+
+// ---------------------------------------------------------------------------
+// shared_byte_span
+// ---------------------------------------------------------------------------
+
+namespace detail {
+
+/// Owns a byte buffer plus a span over it.  Exists so @ref make_shared_byte_span
+/// can hand out a shared_ptr to the *span* (via the aliasing constructor) while
+/// the shared_ptr's control block keeps the *buffer* alive.  Never held
+/// directly by callers.
+struct byte_storage {
+  std::vector<std::uint8_t> bytes;
+  std::span<const std::uint8_t> view;
+
+  // `bytes` is declared first, so it is already initialised when `view` binds
+  // to it — the span never sees a moved-from buffer.
+  explicit byte_storage(std::vector<std::uint8_t> b) : bytes(std::move(b)), view(bytes) {}
+
+  // Non-copyable, non-movable: `view` points into `bytes`, so copying would
+  // deep-copy the buffer and leave the copy's span aimed at the original's
+  // allocation.  Only ever built in place by make_shared, so neither is needed.
+  byte_storage(byte_storage const&)            = delete;
+  byte_storage& operator=(byte_storage const&) = delete;
+  byte_storage(byte_storage&&)                 = delete;
+  byte_storage& operator=(byte_storage&&)      = delete;
+};
+
+}  // namespace detail
+
+/// A shared, immutable view over a byte buffer.
+///
+/// Deliberately a span rather than a @c vector: consumers only ever read
+/// through it (@c data / @c size / @c subspan), so exposing the container type —
+/// and with it its allocator, growth policy and mutation API — would leak an
+/// implementation detail into the interface.  Ownership still rides along: the
+/// shared_ptr is built with the aliasing constructor, so the control block
+/// retains the underlying buffer while the pointer itself refers to the span.
+using shared_byte_span = std::shared_ptr<const std::span<const std::uint8_t>>;
+
+/// Take ownership of @p bytes and return a @ref shared_byte_span over it.
+/// A single allocation: the buffer and its span live in one control block.
+[[nodiscard]] shared_byte_span make_shared_byte_span(std::vector<std::uint8_t> bytes);
 
 // ---------------------------------------------------------------------------
 // footer_probe
@@ -61,7 +103,7 @@ namespace sirius::io::rest {
 struct footer_probe {
   std::size_t object_size{0};
   std::size_t window_lo{0};
-  std::shared_ptr<const std::vector<std::uint8_t>> bytes;
+  shared_byte_span bytes;
   // ETag from the verified 206, quotes preserved; empty otherwise.
   std::string etag;
 };
@@ -78,13 +120,13 @@ struct head_object_result {
 // ---------------------------------------------------------------------------
 
 /**
- * @brief Concrete @c sirius_io_object backed by a RESTful object-store key.
+ * @brief Concrete @c io_object backed by a RESTful object-store key.
  *
  * Passive bag of identity: the original URL/path (also the cache id), the
  * bucket + key the reactor authorizes against, and the object size discovered
  * by a one-time HEAD at construction.  Does no I/O of its own.
  */
-class rest_io_object : public sirius_io_object {
+class rest_io_object : public io_object {
  public:
   rest_io_object(
     std::string path, std::string bucket, std::string key, size_t size, std::string etag = {})
@@ -104,7 +146,7 @@ class rest_io_object : public sirius_io_object {
                  std::string key,
                  size_t object_size,
                  size_t window_lo,
-                 std::shared_ptr<const std::vector<std::uint8_t>> stash,
+                 shared_byte_span stash,
                  std::string etag = {})
     : _path(std::move(path)),
       _bucket(std::move(bucket)),
@@ -119,19 +161,16 @@ class rest_io_object : public sirius_io_object {
   [[nodiscard]] const std::string& raw_file_cache_id() const noexcept override { return _path; }
   [[nodiscard]] const std::string& object_path() const noexcept override { return _path; }
   [[nodiscard]] size_t size() const noexcept override { return _file_size; }
-  [[nodiscard]] std::string_view validation_etag() const noexcept override { return _etag; }
+  [[nodiscard]] std::string_view validation_tag() const noexcept override { return _etag; }
 
   [[nodiscard]] const std::string& bucket() const noexcept { return _bucket; }
   [[nodiscard]] const std::string& key() const noexcept { return _key; }
-  [[nodiscard]] s3::s3_object_ref object_ref() const { return s3::s3_object_ref{_bucket, _key}; }
+  [[nodiscard]] object_ref get_object_ref() const { return object_ref{_bucket, _key}; }
 
   /// Trailing bytes prefetched at open (a suffix-range footer probe), or null
   /// when the object was opened without one.  A read fully inside
   /// [stash_window_lo, size) is served from here by @c host_read.
-  [[nodiscard]] const std::shared_ptr<const std::vector<std::uint8_t>>& stash() const noexcept
-  {
-    return _stash;
-  }
+  [[nodiscard]] shared_byte_span const& stash() const noexcept { return _stash; }
   [[nodiscard]] size_t stash_window_lo() const noexcept { return _window_lo; }
 
  private:
@@ -140,7 +179,7 @@ class rest_io_object : public sirius_io_object {
   std::string _key;
   size_t _file_size{0};
   size_t _window_lo{0};
-  std::shared_ptr<const std::vector<std::uint8_t>> _stash;
+  shared_byte_span _stash;
   std::string _etag;
 };
 
@@ -177,6 +216,11 @@ struct rest_perf_snapshot {
   std::uint64_t blocking_host_get_wall_ns_max{0};
 };
 
+/// How @c prep_host_rx_request attributes the resulting GETs in the perf
+/// snapshot: a @c blocking read (synchronous host_read) is counted in
+/// blocking_host_get_* in addition to chunk_get_*.
+enum class host_read_attribution : std::uint8_t { async_chunk, blocking };
+
 // ---------------------------------------------------------------------------
 // rest_reactor
 // ---------------------------------------------------------------------------
@@ -189,7 +233,7 @@ struct rest_perf_snapshot {
  * pinned bounce slots for device staging, a timerfd + min-heap retry
  * scheduler, and an MPSC request queue.  Models the reactor concept consumed
  * by @c templated_ioctx.  Presigned GET/HEAD URLs come from a
- * @c s3_request_authorizer, re-issued on every attempt.
+ * @c request_authorizer, re-issued on every attempt.
  */
 class rest_reactor {
  public:
@@ -203,14 +247,14 @@ class rest_reactor {
   class reactor_context {
    public:
     reactor_context(config cfg,
-                    std::shared_ptr<s3::s3_request_authorizer> authorizer,
+                    std::shared_ptr<request_authorizer> authorizer,
                     cucascade::memory::fixed_size_host_memory_resource* host_mr = nullptr)
       : _config(std::move(cfg)), _authorizer(std::move(authorizer)), _host_mr(host_mr)
     {
     }
 
     [[nodiscard]] const config& cfg() const noexcept { return _config; }
-    [[nodiscard]] const std::shared_ptr<s3::s3_request_authorizer>& authorizer() const noexcept
+    [[nodiscard]] const std::shared_ptr<request_authorizer>& authorizer() const noexcept
     {
       return _authorizer;
     }
@@ -222,7 +266,7 @@ class rest_reactor {
 
    private:
     config _config;
-    std::shared_ptr<s3::s3_request_authorizer> _authorizer;
+    std::shared_ptr<request_authorizer> _authorizer;
     cucascade::memory::fixed_size_host_memory_resource* _host_mr{nullptr};
   };
 
@@ -249,8 +293,11 @@ class rest_reactor {
 
   static request_type_ptr prep_host_rx_request(const reactor_config_type& cfg,
                                                const io_object_type& file,
+                                               const io_object_segment& segment);
+  static request_type_ptr prep_host_rx_request(const reactor_config_type& cfg,
+                                               const io_object_type& file,
                                                const io_object_segment& segment,
-                                               bool perf_blocking_host_get = false);
+                                               host_read_attribution attribution);
 
   static request_type_ptr prep_host_rxv_request(const reactor_config_type& cfg,
                                                 const io_object_type& file,
@@ -278,7 +325,7 @@ class rest_reactor {
   /// Allocate the pinned bounce slots and launch the worker thread.  Split out
   /// of the constructor so a reactor can be built cheaply (it only copies its
   /// config and creates its wakeup fd) and parked until it is actually needed —
-  /// see @c sirius_ioctx::start.  Idempotent: a second call (while the worker is
+  /// see @c ioctx::start.  Idempotent: a second call (while the worker is
   /// already running) is a no-op.
   void start();
 
@@ -291,7 +338,10 @@ class rest_reactor {
 
   /// Blocking HEAD to discover an object's size and ETag.  Used by the ioctx to
   /// build an @c rest_io_object.  @p bucket / @p key identify the object.
-  head_object_result head_object_size(std::string_view bucket, std::string_view key);
+  head_object_result head_object(std::string_view bucket, std::string_view key);
+
+  /// Size-only convenience wrapper around @c head_object.
+  size_t head_object_size(std::string_view bucket, std::string_view key);
 
   /// Blocking suffix-range GET of the last @p n bytes of an object, resolving
   /// the size and stashing the parquet footer in a single round-trip.  On a

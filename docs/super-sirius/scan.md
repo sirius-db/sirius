@@ -417,12 +417,12 @@ S3 has no direct-to-device transport in this backend. Reads into arbitrary devic
 
 Pages are processed as they arrive, so listing memory is bounded by one page plus the matches retained for DuckDB. `list_max_scanned` limits inspected objects and `list_max_matches` limits retained matches. Reaching either limit raises an error instead of returning an incomplete file list. Results are sorted by URI, and LIST metadata lets globbed parquet files use the footer-probe open without a separate HEAD.
 
-**Authorization.** `s3_request_authorizer` signs each request attempt and returns the request URL and headers. LIST uses the separate `authorize_list` entry point, which custom authorizers must implement if they support glob expansion.
+**Authorization.** `request_authorizer` signs each request attempt and returns the request URL and headers. LIST uses the separate `authorize_list` entry point, which custom authorizers must implement if they support glob expansion.
 
 | Authorizer | Mechanism |
 |------------|-----------|
-| `sirius_sigv4_presigned_authorizer` | SigV4 credentials in the query string. This is the default. |
-| `sirius_sigv4_header_authorizer` | A plain URL with signed `Authorization` and `x-amz-*` headers. |
+| `sigv4_presigned_authorizer` | SigV4 credentials in the query string. This is the default. |
+| `sigv4_header_authorizer` | A plain URL with signed `Authorization` and `x-amz-*` headers. |
 
 Both authorizers use path-style URLs and support temporary credentials. The session token is signed as a header in header mode and as a query parameter in presigned mode. Custom authorizers can use another credential source or return broker-issued URLs.
 

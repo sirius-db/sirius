@@ -123,7 +123,7 @@ class gpu_pipeline_executor : public sirius::parallel::itask_executor {
  protected:
   void manager_loop() override;
 
-  absl::AnyInvocable<void() noexcept> get_per_thread_init() override;
+  sirius::exec::invocable<void() noexcept> get_per_thread_init() override;
 
  private:
   /**

@@ -7,10 +7,10 @@
 
 #include "catch.hpp"
 #include "io/io_context.hpp"
+#include "io/rest/authorizer.hpp"
 #include "io/rest/rest_ioctx.hpp"
-#include "io/s3/s3_object_ref.hpp"
+#include "io/rest/s3/sigv4_authorizer.hpp"
 #include "io/s3/sirius_httpfs.hpp"
-#include "io/s3/sirius_sigv4_authorizer.hpp"
 #include "sirius_context.hpp"
 #include "sirius_extension.hpp"
 #include "utils/s3_container.hpp"
@@ -1982,17 +1982,17 @@ TEST_CASE("S3 SQL config guard writes nested object_store options only when conf
 TEST_CASE("S3 bench STS session token reaches presigned URLs",
           "[s3][authorizer][credential_provider]")
 {
-  sirius::io::s3::static_credentials creds;
+  sirius::io::rest::s3::static_credentials creds;
   creds.access_key_id     = "AKIAFAKEBENCHKEY";
   creds.secret_access_key = "fake-secret-key";
   creds.session_token     = "fake-session-token";
 
-  sirius::io::s3::sirius_sigv4_presigned_authorizer authorizer{
+  sirius::io::rest::s3::sigv4_presigned_authorizer authorizer{
     std::move(creds), "us-east-2", "https://s3.us-east-2.amazonaws.com"};
-  auto request = authorizer.authorize(
-    sirius::io::s3::s3_object_ref{"sirius-bench", "tpch/lineitem_sf10.parquet"},
-    sirius::io::s3::s3_request_method::GET,
-    std::chrono::seconds{60});
+  auto request =
+    authorizer.authorize(sirius::io::rest::object_ref{"sirius-bench", "tpch/lineitem_sf10.parquet"},
+                         sirius::io::rest::request_method::GET,
+                         std::chrono::seconds{60});
 
   CHECK(request.headers.empty());
   CHECK(request.url.find("X-Amz-Security-Token=") != std::string::npos);
@@ -2663,10 +2663,11 @@ TEST_CASE("S3 direct and glob routes share the literal object cache identity",
   REQUIRE(glob_datasource != nullptr);
 
   CHECK(glob_files.front().path == direct_uri);
-  CHECK(glob_datasource->io_object().object_path() == direct_datasource->io_object().object_path());
-  CHECK(glob_datasource->io_object().raw_file_cache_id() ==
-        direct_datasource->io_object().raw_file_cache_id());
-  CHECK(glob_datasource->io_object().size() == direct_datasource->io_object().size());
+  CHECK(glob_datasource->get_io_object().object_path() ==
+        direct_datasource->get_io_object().object_path());
+  CHECK(glob_datasource->get_io_object().raw_file_cache_id() ==
+        direct_datasource->get_io_object().raw_file_cache_id());
+  CHECK(glob_datasource->get_io_object().size() == direct_datasource->get_io_object().size());
 }
 
 TEST_CASE("transparent S3 non-glob reads distinguish literal percent keys from spaces",

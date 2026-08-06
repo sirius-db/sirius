@@ -125,7 +125,7 @@ insert_delta_workset prepare_insert_delta_tasks(
         range_works.push_back(std::move(work));
       }
     }
-    std::vector<absl::AnyInvocable<void()>> range_tasks;
+    std::vector<sirius::exec::invocable<void()>> range_tasks;
     range_tasks.reserve(range_works.size());
     for (auto& work : range_works) {
       range_tasks.push_back([work_ptr = work.get()] {

@@ -18,18 +18,39 @@
 
 #include "io/types.hpp"
 
+#include <cstddef>
+#include <functional>
 #include <memory>
 #include <shared_mutex>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 
 namespace sirius::io::cache {
+
+namespace detail {
+
+/// Transparent hasher so the store can be looked up by @c std::string_view (or
+/// @c const char*) without materialising a @c std::string.  Paired with
+/// @c std::equal_to<> below, this enables C++20 heterogeneous lookup on the
+/// underlying @c unordered_map — without both, a string_view-taking getter
+/// would just construct a temporary key on every call and be strictly worse
+/// than taking @c std::string const&.
+struct string_hash {
+  using is_transparent = void;
+  [[nodiscard]] std::size_t operator()(std::string_view sv) const noexcept
+  {
+    return std::hash<std::string_view>{}(sv);
+  }
+};
+
+}  // namespace detail
 
 /**
  * @brief Thread-safe per-file metadata cache, keyed by an io_object's
  *        raw_file_cache_id().
  *
- * Owned by @c sirius_ioctx and always present, independent of the
+ * Owned by @c ioctx and always present, independent of the
  * @c prefetching_cache.  Callers that have parsed file metadata (e.g.
  * a parquet footer) park it here so a later scan of the same path can
  * skip the parse — without depending on whether the prefetching cache
@@ -50,22 +71,25 @@ class metadata_store {
   /// @p metadata is silently ignored — symmetric with the older
   /// @c prefetching_cache::register_metadata contract so callers that
   /// pass through pre-parsed metadata don't have to null-check.
-  void register_metadata(sirius_io_object const& obj,
-                         std::shared_ptr<sirius_io_object_metadata> metadata);
+  void register_metadata(io_object const& obj, std::shared_ptr<io_object_metadata> metadata);
 
   /// Look up the metadata for @p obj's cache key.  Returns nullptr on
   /// miss.
-  [[nodiscard]] std::shared_ptr<sirius_io_object_metadata> get_metadata(
-    sirius_io_object const& obj) const;
+  [[nodiscard]] std::shared_ptr<io_object_metadata> get_metadata(io_object const& obj) const;
 
   /// As above but keyed directly by @c raw_file_cache_id() — for callers that
   /// know the path but have not built an io_object yet.  Returns nullptr on miss.
-  [[nodiscard]] std::shared_ptr<sirius_io_object_metadata> get_metadata(
-    std::string const& cache_key) const;
+  /// Looked up heterogeneously, so passing a @c string_view or a string literal
+  /// allocates nothing.
+  [[nodiscard]] std::shared_ptr<io_object_metadata> get_metadata(std::string_view cache_key) const;
 
  private:
   mutable std::shared_mutex _mtx;
-  std::unordered_map<std::string, std::shared_ptr<sirius_io_object_metadata>> _by_key;
+  std::unordered_map<std::string,
+                     std::shared_ptr<io_object_metadata>,
+                     detail::string_hash,
+                     std::equal_to<>>
+    _by_key;
 };
 
 }  // namespace sirius::io::cache

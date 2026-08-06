@@ -26,7 +26,7 @@
 
 namespace sirius::op::scan {
 
-/// Parquet-flavored @c sirius_io_object_metadata stored in the ioctx metadata
+/// Parquet-flavored @c io_object_metadata stored in the ioctx metadata
 /// store alongside an io_object.  Holds the parsed @c FileMetaData so future
 /// scans of the same file can skip the footer fetch + parse and construct a
 /// @c hybrid_scan_reader directly from the cached struct.  @c footer_byte_len
@@ -37,7 +37,7 @@ namespace sirius::op::scan {
 /// Lives with the parquet ingestible (its only producer/consumer): the bind
 /// path (@c sirius_scan_manager::describe_parquet) parses and parks it, and the
 /// metadata scan (@c parquet_gpu_ingestible::build_file_scan_info) reuses it.
-class parquet_metadata final : public sirius::io::sirius_io_object_metadata {
+class parquet_metadata final : public sirius::io::io_object_metadata {
  public:
   parquet_metadata(std::shared_ptr<cudf::io::parquet::FileMetaData const> file_metadata,
                    std::size_t footer_byte_len)

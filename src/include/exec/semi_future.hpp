@@ -37,14 +37,13 @@
 #include <unistd.h>
 #endif
 
+#include "exec/invocable.hpp"
 #include "exec/try.hpp"
-
-#include <absl/functional/any_invocable.h>
 
 namespace sirius::exec {
 
 // Task type submitted to an executor.
-using executor_func = absl::AnyInvocable<void() &&>;
+using executor_func = sirius::exec::invocable<void() &&>;
 
 // Concept: any type with a void enqueue(executor_func) member.
 template <class exec_t>
@@ -264,7 +263,7 @@ inline void raw_futex_wake(std::atomic<std::uint32_t>& atom) noexcept
 template <class value_t>
 class core {
  public:
-  using callback = absl::AnyInvocable<void(try_t<value_t>&&) &&>;
+  using callback = sirius::exec::invocable<void(try_t<value_t>&&) &&>;
 
   core()                       = default;
   core(core const&)            = delete;
@@ -410,7 +409,7 @@ class core {
 
 template <class value_t>
 struct state {
-  using callback = absl::AnyInvocable<void(try_t<value_t>&&) &&>;
+  using callback = sirius::exec::invocable<void(try_t<value_t>&&) &&>;
 
   virtual ~state()                                                         = default;
   virtual void await()                                                     = 0;

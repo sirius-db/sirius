@@ -170,6 +170,33 @@ static void from_yaml(const YAML::Node& node, sirius::io::uring::config& opt)
   r.reject_unknown();
 }
 
+static void from_yaml(const YAML::Node& node, sirius::io::kvikio_config& opt)
+{
+  yaml::reader r(node, "kvikio");
+  r.optional("nthreads", opt.nthreads);
+  r.optional("task_size", yaml::bytes(opt.task_size));
+  r.optional("gds_threshold", yaml::bytes(opt.gds_threshold));
+  r.optional("bounce_buffer_size", yaml::bytes(opt.bounce_buffer_size));
+  r.optional("auto_direct_io_read", opt.auto_direct_io_read);
+  r.optional("auto_direct_io_read_overread", opt.auto_direct_io_read_overread);
+  r.optional("thread_pool_per_block_device", opt.thread_pool_per_block_device);
+  std::string compat;
+  r.optional("compat_mode", compat);
+  if (!compat.empty()) {
+    if (compat == "auto") {
+      opt.compat_mode = kvikio::CompatMode::AUTO;
+    } else if (compat == "on") {
+      opt.compat_mode = kvikio::CompatMode::ON;
+    } else if (compat == "off") {
+      opt.compat_mode = kvikio::CompatMode::OFF;
+    } else {
+      throw std::runtime_error("'kvikio.compat_mode': invalid enum value '" + compat +
+                               "' (expected auto, on or off)");
+    }
+  }
+  r.reject_unknown();
+}
+
 static void from_yaml(const YAML::Node& node, sirius::io::cache::config& opt)
 {
   yaml::reader r(node, "cache");
@@ -196,6 +223,7 @@ static void from_yaml(const YAML::Node& node, scan_manager::scan_manager_config&
   r.optional("enable_prefetch_cache", opt.enable_prefetch_cache);
   if (auto n = r.optional_node("local")) sirius::from_yaml(*n, opt.local);
   if (auto n = r.optional_node("rest")) sirius::from_yaml(*n, opt.rest);
+  if (auto n = r.optional_node("kvikio")) sirius::from_yaml(*n, opt.kvikio);
   if (auto n = r.optional_node("cache")) sirius::from_yaml(*n, opt.cache);
   if (auto n = r.optional_node("object_store")) sirius::from_yaml(*n, opt.object_store);
   r.reject_unknown();

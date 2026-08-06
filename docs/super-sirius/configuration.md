@@ -282,7 +282,7 @@ The `sirius.executor.scan_manager` block configures the scan-metadata thread poo
 | `rest_n_reactors` | int (**> 0**) | 2 | Number of REST reactor threads for object-store (`s3://`) reads. |
 | `enable_prefetch_cache` | bool | false | Attach the pinned-memory prefetching cache in front of the backend. |
 
-Four optional nested sub-configs tune the individual backends and caches:
+Five optional nested sub-configs tune the individual backends and caches:
 
 ### `scan_manager.local` — io_uring backend (`io/uring/config.hpp`)
 
@@ -314,6 +314,30 @@ Four optional nested sub-configs tune the individual backends and caches:
 | `footer_probe_bytes` | bytes | 512Ki | Suffix-range window for the parquet footer probe. Must cover the footer, so err large. |
 | `list_max_matches` | int | 100000 | Cap on files a glob/listing may accumulate (throws "narrow the glob prefix", never truncates). |
 | `list_max_scanned` | int | 1000000 | Cap on objects a LIST sweep may scan across pages (throws, never truncates). |
+
+### `scan_manager.kvikio` — kvikIO local-file backend (`io/kvikio/config.hpp`)
+
+Used only when `use_sirius_datasource: false` routes local files to the kvikIO
+fallback. **Every key is optional and unset means "leave kvikIO's own default
+alone"** — kvikIO seeds each setting from an environment variable at first use, so
+omitting a key preserves that value and setting one overrides it.
+
+**These are process-global.** Every key except `compat_mode` maps to a setter on
+kvikIO's `defaults` singleton, so the last context constructed wins and the
+setting is shared with every other kvikIO user in the process. Treat it as
+startup configuration. `compat_mode` is the exception: it rides the file-handle
+constructor, so it scopes to files this backend opens.
+
+| Key | Type | Env default | Description |
+|-----|------|-------------|-------------|
+| `nthreads` | int (**> 0**) | `KVIKIO_NTHREADS` (1) | Threads in kvikIO's task pool — the parallelism bound for a single read. |
+| `task_size` | bytes (**> 0**) | `KVIKIO_TASK_SIZE` (4Mi) | Chunk size a parallel read is split into. Keep it a page multiple when `auto_direct_io_read` is on. |
+| `gds_threshold` | bytes | `KVIKIO_GDS_THRESHOLD` (1Mi) | Minimum read size routed through GDS + the thread pool; smaller reads take a direct POSIX shortcut. 0 is legal. |
+| `bounce_buffer_size` | bytes (**> 0**) | `KVIKIO_BOUNCE_BUFFER_SIZE` (16Mi) | Host staging buffer for device reads that cannot go straight to GPU memory. |
+| `auto_direct_io_read` | bool | `KVIKIO_AUTO_DIRECT_IO_READ` | Use `O_DIRECT` for POSIX reads. POSIX path only — the cuFile/GDS path manages its own I/O mode. |
+| `auto_direct_io_read_overread` | bool | `KVIKIO_AUTO_DIRECT_IO_READ_OVERREAD` (false) | Align device-read offsets down and sizes up to pages so the whole transfer is pure Direct I/O, at the cost of extra bytes. Requires `auto_direct_io_read`. |
+| `thread_pool_per_block_device` | bool | `KVIKIO_THREAD_POOL_PER_BLOCK_DEVICE` (false) | Give each block device its own pool instead of sharing one global pool. |
+| `compat_mode` | enum: `auto`, `on`, `off` | `KVIKIO_COMPAT_MODE` | cuFile vs POSIX selection, per file handle. `off` enforces cuFile/GDS, `on` enforces POSIX, `auto` tries cuFile and falls back. Values are lowercase. |
 
 ### `scan_manager.cache` — prefetching cache (`io/cache/config.hpp`)
 

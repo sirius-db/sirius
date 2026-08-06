@@ -29,6 +29,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cassert>
 #include <cctype>
 #include <cerrno>
 #include <chrono>
@@ -165,7 +166,10 @@ size_t head_header_cb(char* buffer, size_t size, size_t nitems, void* userdata)
   auto* hc           = static_cast<head_capture*>(userdata);
   size_t const bytes = size * nitems;
   std::string_view const line(buffer, bytes);
-  if (is_http_status_line(line)) { hc->etag.clear(); }
+  if (is_http_status_line(line)) {
+    hc->etag.clear();
+    hc->retry_after.clear();
+  }
   if (auto v = match_header(line, "etag"); !v.empty()) { hc->etag = std::move(v); }
   if (auto v = match_header(line, "retry-after"); !v.empty()) { hc->retry_after = std::move(v); }
   return bytes;
@@ -197,6 +201,8 @@ size_t suffix_header_cb(char* buffer, size_t size, size_t nitems, void* userdata
   std::string_view const line(buffer, bytes);
   if (is_http_status_line(line)) {
     s->etag.clear();
+    s->content_range.clear();
+    s->retry_after.clear();
     if (auto const sp = line.find(' '); sp != std::string_view::npos) {
       long code = 0;
       for (size_t i = sp + 1; i < line.size() && line[i] >= '0' && line[i] <= '9'; ++i) {
@@ -313,7 +319,7 @@ std::string suffix_range_header(size_t n) { return std::format("Range: bytes=-{}
 /// "bytes <first>-<last>/<total>" (the trimmed value captured by the header
 /// callback).  Returns nullopt for any value that does not start with a
 /// well-formed "bytes <first>-" so the caller can reject an unverifiable 206.
-std::optional<size_t> content_range_start(std::string const& cr)
+std::optional<size_t> content_range_start(std::string_view cr)
 {
   constexpr std::string_view kUnit = "bytes";
   std::string_view sv{cr};
@@ -427,7 +433,15 @@ std::vector<io_object_segment> chunk_host_segments(std::span<const io_object_seg
 
 }  // namespace
 
-std::optional<size_t> content_range_total(std::string const& cr)
+shared_byte_span make_shared_byte_span(std::vector<std::uint8_t> bytes)
+{
+  auto owner = std::make_shared<detail::byte_storage>(std::move(bytes));
+  // Aliasing constructor: shares `owner`'s control block (keeping the buffer
+  // alive) while the pointer itself refers to the span member inside it.
+  return shared_byte_span{owner, &owner->view};
+}
+
+std::optional<size_t> content_range_total(std::string_view cr)
 {
   constexpr std::string_view kUnit = "bytes";
   std::string_view sv{cr};
@@ -551,10 +565,24 @@ void rest_reactor::enqueue_chunks(std::span<std::unique_ptr<rest_chunked_rx_requ
 
 rest_reactor::request_type_ptr rest_reactor::prep_host_rx_request(const reactor_config_type& cfg,
                                                                   const io_object_type& file,
+                                                                  const io_object_segment& segment)
+{
+  return prep_host_rx_request(cfg, file, segment, host_read_attribution::async_chunk);
+}
+
+rest_reactor::request_type_ptr rest_reactor::prep_host_rx_request(const reactor_config_type& cfg,
+                                                                  const io_object_type& file,
                                                                   const io_object_segment& segment,
-                                                                  bool perf_blocking_host_get)
+                                                                  host_read_attribution attribution)
 {
   if (segment.size == 0) { return rest_rx_request::create({}); }
+
+  // A host read must carry the caller's destination buffer.  A null buffer means
+  // "reactor-staged" (internal bounce slot), which only makes sense for device
+  // reads: a host read staged through the bounce would report success while the
+  // bytes sit unreachable in a reactor-private buffer.
+  assert(segment.is_buffer_allocated() &&
+         "rest_reactor::prep_host_rx_request: host read requires a non-null destination buffer");
 
   // Break a contiguous host read into N parallel single-buffer ranged GETs so
   // the connection pool fetches them concurrently.  N is the largest count
@@ -578,7 +606,7 @@ rest_reactor::request_type_ptr rest_reactor::prep_host_rx_request(const reactor_
   n_chunks = std::max<size_t>(n_chunks, (segment.size + max_piece_bytes - 1) / max_piece_bytes);
 
   auto manager       = std::make_shared<request_manager>(segment.size, n_chunks);
-  auto const obj     = file.object_ref();
+  auto const obj     = file.get_object_ref();
   size_t const fsize = file.size();
   uint8_t* const dst = segment.data();
 
@@ -595,7 +623,7 @@ rest_reactor::request_type_ptr rest_reactor::prep_host_rx_request(const reactor_
     req->chunk                  = io_object_segment{segment.offset + pos, piece, dst + pos};
     req->file_size              = fsize;
     req->manager                = manager;
-    req->perf_blocking_host_get = perf_blocking_host_get;
+    req->perf_blocking_host_get = (attribution == host_read_attribution::blocking);
     chunks.push_back(std::move(req));
     pos += piece;
   }
@@ -615,6 +643,12 @@ rest_reactor::request_type_ptr rest_reactor::prep_host_rxv_request(
   clamped.reserve(segments.size());
   size_t bytes_requested = 0;
   for (auto const& s : segments) {
+    // See prep_host_rx_request: host reads must carry caller buffers; a
+    // null-buffer segment here would be silently staged through an internal
+    // bounce slot and its bytes lost to the caller.
+    assert(s.is_buffer_allocated() &&
+           "rest_reactor::prep_host_rxv_request: host read requires non-null "
+           "destination buffers");
     size_t const c = s.offset < fsize ? std::min(s.size, fsize - s.offset) : 0;
     if (c == 0) { continue; }
     clamped.emplace_back(s.offset, c, s.data());
@@ -630,7 +664,7 @@ rest_reactor::request_type_ptr rest_reactor::prep_host_rxv_request(
                         cfg.max_n_chunks);
 
   auto manager   = std::make_shared<request_manager>(bytes_requested, groups.size());
-  auto const obj = file.object_ref();
+  auto const obj = file.get_object_ref();
 
   std::vector<std::unique_ptr<rest_chunked_rx_request>> chunks;
   chunks.reserve(groups.size());
@@ -672,7 +706,7 @@ rest_reactor::request_type_ptr rest_reactor::prep_device_rx_request(const reacto
   size_t const n_win  = (wanted + bounce - 1) / bounce;
 
   auto manager   = std::make_shared<request_manager>(wanted, n_win);
-  auto const obj = file.object_ref();
+  auto const obj = file.get_object_ref();
 
   std::vector<std::unique_ptr<rest_chunked_rx_request>> chunks;
   chunks.reserve(n_win);
@@ -715,7 +749,7 @@ rest_reactor::request_type_ptr rest_reactor::prep_host_to_device_rx_request(
 
   size_t const fsize   = file.size();
   size_t const req_end = offset + size;
-  auto const obj       = file.object_ref();
+  auto const obj       = file.get_object_ref();
 
   // Validate overlap, total the device-buffer bytes each segment fills (the
   // value reported to the caller — not the host read size, which over-reads to
@@ -820,7 +854,7 @@ size_t rest_reactor::host_read(const io_object_type& file, size_t offset, size_t
   // request, grab its future BEFORE enqueue (which moves the chunks out), then
   // block: get() rethrows the first reported error or returns the byte count.
   auto req = prep_host_rx_request(
-    _config, file, io_object_segment{offset, size, dst}, /*perf_blocking_host_get=*/true);
+    _config, file, io_object_segment{offset, size, dst}, host_read_attribution::blocking);
   auto fut = req->get_future();
   enqueue(std::move(req));
   return std::move(fut).get();
@@ -850,17 +884,17 @@ rest_perf_snapshot rest_reactor::perf_snapshot() const noexcept
   return s;
 }
 
-head_object_result rest_reactor::head_object_size(std::string_view bucket, std::string_view key)
+head_object_result rest_reactor::head_object(std::string_view bucket, std::string_view key)
 {
-  s3::s3_object_ref const obj{std::string(bucket), std::string(key)};
+  object_ref const obj{std::string(bucket), std::string(key)};
   std::string last_error;
   for (std::size_t attempt = 0; attempt < _config.max_retry_attempts; ++attempt) {
     head_capture hc;
     auto const authd =
-      _ctx->authorizer()->authorize(obj, s3::s3_request_method::HEAD, presign_ttl(_config));
+      _ctx->authorizer()->authorize(obj, request_method::HEAD, presign_ttl(_config));
 
     curl_easy_ptr h{curl_easy_init()};
-    if (!h) { throw std::runtime_error("rest_reactor::head_object_size: curl_easy_init failed"); }
+    if (!h) { throw std::runtime_error("rest_reactor::head_object: curl_easy_init failed"); }
     configure_easy_handle(h.get(), global_curl_context::instance().share_handle());
     apply_request_opts(h.get(), _config);
 
@@ -881,7 +915,7 @@ head_object_result rest_reactor::head_object_size(std::string_view bucket, std::
       curl_easy_getinfo(h.get(), CURLINFO_CONTENT_LENGTH_DOWNLOAD_T, &cl);
       if (cl < 0) {
         _perf.terminal_failures_total.fetch_add(1, std::memory_order_relaxed);
-        throw std::runtime_error("rest_reactor::head_object_size: missing Content-Length for " +
+        throw std::runtime_error("rest_reactor::head_object: missing Content-Length for " +
                                  obj.bucket + "/" + obj.key);
       }
       return head_object_result{static_cast<size_t>(cl), std::move(hc.etag)};
@@ -893,12 +927,12 @@ head_object_result rest_reactor::head_object_size(std::string_view bucket, std::
       (rc != CURLE_OK && is_retriable_curl(rc)) || (rc == CURLE_OK && is_retriable_status(status));
     if (!retriable) {
       _perf.terminal_failures_total.fetch_add(1, std::memory_order_relaxed);
-      throw std::runtime_error("rest_reactor::head_object_size: " + last_error + " for " +
-                               obj.bucket + "/" + obj.key);
+      throw std::runtime_error("rest_reactor::head_object: " + last_error + " for " + obj.bucket +
+                               "/" + obj.key);
     }
     if (attempt + 1 < _config.max_retry_attempts) {
       _perf.retries_total.fetch_add(1, std::memory_order_relaxed);
-      SIRIUS_LOG_WARN("rest_reactor::head_object_size: retrying {}/{} after {} (attempt {}/{})",
+      SIRIUS_LOG_WARN("rest_reactor::head_object: retrying {}/{} after {} (attempt {}/{})",
                       obj.bucket,
                       obj.key,
                       last_error,
@@ -908,8 +942,13 @@ head_object_result rest_reactor::head_object_size(std::string_view bucket, std::
     }
   }
   _perf.terminal_failures_total.fetch_add(1, std::memory_order_relaxed);
-  throw std::runtime_error("rest_reactor::head_object_size: exhausted retries (" + last_error +
+  throw std::runtime_error("rest_reactor::head_object: exhausted retries (" + last_error +
                            ") for " + obj.bucket + "/" + obj.key);
+}
+
+size_t rest_reactor::head_object_size(std::string_view bucket, std::string_view key)
+{
+  return head_object(bucket, key).object_size;
 }
 
 std::string rest_reactor::list_page(std::string_view bucket,
@@ -979,13 +1018,13 @@ footer_probe rest_reactor::fetch_footer_suffix(std::string_view bucket,
   footer_probe probe;
   if (n == 0) { return probe; }
 
-  s3::s3_object_ref const obj{std::string(bucket), std::string(key)};
+  object_ref const obj{std::string(bucket), std::string(key)};
   std::string last_error;
   for (std::size_t attempt = 0; attempt < _config.max_retry_attempts; ++attempt) {
     suffix_sink sink;
     sink.cap = n;
     auto const authd =
-      _ctx->authorizer()->authorize(obj, s3::s3_request_method::GET, presign_ttl(_config));
+      _ctx->authorizer()->authorize(obj, request_method::GET, presign_ttl(_config));
 
     curl_easy_ptr h{curl_easy_init()};
     if (!h) {
@@ -1046,7 +1085,7 @@ footer_probe rest_reactor::fetch_footer_suffix(std::string_view bucket,
         }
         probe.object_size = *total;
         probe.window_lo   = *start;
-        probe.bytes       = std::make_shared<const std::vector<std::uint8_t>>(std::move(sink.data));
+        probe.bytes       = make_shared_byte_span(std::move(sink.data));
         probe.etag        = std::move(sink.etag);
       }
       return probe;
@@ -1455,8 +1494,8 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
 
     auto setup_easy = [&](io_slot& s) {
       CURL* const h = s.easy.get();
-      auto authd    = _ctx->authorizer()->authorize(
-        s.req->object, s3::s3_request_method::GET, presign_ttl(_config));
+      auto authd =
+        _ctx->authorizer()->authorize(s.req->object, request_method::GET, presign_ttl(_config));
       s.url           = std::move(authd.url);
       s.sink.buffers  = std::span<iovec>(s.req->chunk.buffers);
       s.sink.capacity = s.req->chunk.size;

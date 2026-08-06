@@ -818,7 +818,7 @@ void submit_and_await(rmm::device_buffer& device_buf,
   {
     nvtx3::scoped_range nvtx_reads{"native_reads"};
     auto io_ctx           = datasource.io_ctx();
-    auto fut              = io_ctx->host_read_ranges_async_io(datasource.io_object(), ranges);
+    auto fut              = io_ctx->host_read_ranges_async_io(datasource.get_io_object(), ranges);
     std::size_t const got = std::move(fut).get();
     if (got != total_read) {
       throw std::runtime_error(std::string(kTag) + " short coalesced host read: got " +

@@ -250,40 +250,6 @@ TEST_CASE("prep_host_rxv_request caps each group at max_n_chunks", "[uring_readv
   complete(chunks);
 }
 
-TEST_CASE("prep_host_rxv_request keeps a null-buffer segment standalone between vectored runs",
-          "[uring_readv]")
-{
-  temp_file tf(1 << 20);
-  sirius::io::uring::config cfg;
-  cfg.use_odirect  = false;
-  cfg.max_n_chunks = 16;
-
-  // Five contiguous segments; the middle one has no buffer (it must read through
-  // an internal bounce slot, so it cannot join a readv).
-  std::vector<io_object_segment> segs{{0, 4096, fake_ptr(0x1000)},
-                                      {4096, 4096, fake_ptr(0x2000)},
-                                      {8192, 4096},  // null buffer
-                                      {12288, 4096, fake_ptr(0x4000)},
-                                      {16384, 4096, fake_ptr(0x5000)}};
-  auto req    = uring_reactor::prep_host_rxv_request(cfg, *tf.obj, segs);
-  auto chunks = req->get_all_chunks();
-
-  // => vectored head [0,8k), the null segment alone, vectored tail [12k,20k).
-  REQUIRE(chunks.size() == 3);
-  CHECK(chunks[0]->is_vectored());
-  CHECK(chunks[0]->chunk.n_chunks() == 2);
-  CHECK(chunks[0]->chunk.offset == 0);
-  CHECK_FALSE(chunks[1]->is_vectored());
-  CHECK(chunks[1]->chunk.offset == 8192);
-  CHECK_FALSE(chunks[1]->chunk.is_buffer_allocated());
-  CHECK(chunks[2]->is_vectored());
-  CHECK(chunks[2]->chunk.n_chunks() == 2);
-  CHECK(chunks[2]->chunk.offset == 12288);
-  CHECK(chunks[0]->manager->total_chunks == 3);
-
-  complete(chunks);
-}
-
 TEST_CASE("prep_host_rxv_request does not fuse segments with different fds", "[uring_readv]")
 {
   temp_file tf(1 << 20);
@@ -445,6 +411,53 @@ TEST_CASE("prep_host_to_device fuses contiguous bounce buffers into one readv wi
   CHECK(copies[1].src == fake_ptr(0x20000));
   CHECK(copies[2].dst == dst + 8192);
   CHECK(copies[2].src == fake_ptr(0x30000));
+
+  complete(chunks);
+}
+
+TEST_CASE("prep_host_to_device keeps a null-buffer segment standalone between vectored runs",
+          "[uring_readv]")
+{
+  temp_file tf(1 << 20);
+  sirius::io::uring::config cfg;
+  cfg.use_odirect  = false;
+  cfg.max_n_chunks = 16;
+
+  // Five contiguous segments; the middle one has no buffer, so it must read
+  // through an internal bounce slot and cannot join a readv.
+  std::vector<io_object_segment> segs{{0, 4096, fake_ptr(0x1000)},
+                                      {4096, 4096, fake_ptr(0x2000)},
+                                      {8192, 4096},  // null buffer
+                                      {12288, 4096, fake_ptr(0x4000)},
+                                      {16384, 4096, fake_ptr(0x5000)}};
+  auto* dst = fake_ptr(0x40000000);
+  auto req  = uring_reactor::prep_host_to_device_rx_request(
+    cfg, *tf.obj, segs, dst, /*offset=*/0, /*size=*/5 * 4096, rmm::cuda_stream_view{}, 0);
+  auto fut    = req->get_future();
+  auto chunks = req->get_all_chunks();
+
+  // => vectored head [0,8k), the null segment alone, vectored tail [12k,20k).
+  REQUIRE(chunks.size() == 3);
+  CHECK(chunks[0]->is_vectored());
+  CHECK(chunks[0]->chunk.n_chunks() == 2);
+  CHECK(chunks[0]->chunk.offset == 0);
+  CHECK_FALSE(chunks[1]->is_vectored());
+  CHECK(chunks[1]->chunk.offset == 8192);
+  CHECK_FALSE(chunks[1]->chunk.is_buffer_allocated());
+  CHECK(chunks[2]->is_vectored());
+  CHECK(chunks[2]->chunk.n_chunks() == 2);
+  CHECK(chunks[2]->chunk.offset == 12288);
+  CHECK(chunks[0]->manager->total_chunks == 3);
+
+  // The bounce-slot chunk defers its source: null src, offset carried in
+  // src_off so copy_async can resolve it against the late-assigned slot.
+  REQUIRE(chunks[1]->cpy_req != nullptr);
+  auto const& bounce_copies = chunks[1]->cpy_req->copies;
+  REQUIRE(bounce_copies.size() == 1);
+  CHECK(bounce_copies[0].src == nullptr);
+  CHECK(bounce_copies[0].src_off == 0);
+  CHECK(bounce_copies[0].dst == dst + 8192);
+  CHECK(chunks[1]->needs_event_for_synchronization());
 
   complete(chunks);
 }

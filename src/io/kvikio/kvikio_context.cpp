@@ -16,19 +16,21 @@
 
 #include "io/kvikio/kvikio_context.hpp"
 
+#include <kvikio/defaults.hpp>
+
+#include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <exception>
 #include <memory>
-#include <mutex>
 #include <stdexcept>
 #include <utility>
 
 namespace sirius::io {
 
 namespace {
-// -- Protected placeholders --------------------------------------------------
 
-const kvikio_io_object& as_kvikio(const sirius_io_object& obj)
+const kvikio_io_object& as_kvikio(const io_object& obj)
 {
   // Concrete type is enforced by create_io_object below; a mismatch is a
   // programmer error (e.g. mixing io_objects across backends), not user
@@ -36,28 +38,82 @@ const kvikio_io_object& as_kvikio(const sirius_io_object& obj)
   return static_cast<const kvikio_io_object&>(obj);
 }
 
+/// Bytes actually available at @p offset.  kvikIO reads are unclamped, unlike
+/// the @c cudf::io::datasource this backend used to wrap, so callers past EOF
+/// would otherwise depend on kvikIO's short-read behaviour.
+[[nodiscard]] size_t clamp_to_object(const io_object& obj, size_t offset, size_t size) noexcept
+{
+  return obj.size() > offset ? std::min(size, obj.size() - offset) : 0;
+}
+
 }  // namespace
 
-std::shared_ptr<sirius_io_object> kvikio_context::create_io_object(std::string path)
+void apply_kvikio_defaults(kvikio_config const& cfg)
 {
-  // cudf::io::datasource::create returns a unique_ptr; promote to shared_ptr
-  // so the kvikio_io_object can expose access without transferring
-  // ownership (the io_object outlives any single sirius_datasource we hand
-  // back from open_datasource).
-  std::shared_ptr<cudf::io::datasource> ds = cudf::io::datasource::create(path);
-  auto const file_size                     = ds->size();
-  return std::make_shared<kvikio_io_object>(std::move(path), std::move(ds), file_size);
+  // Validate before touching anything so a bad config leaves kvikIO's globals
+  // untouched rather than half-applied.
+  if (cfg.nthreads && *cfg.nthreads == 0) {
+    throw std::invalid_argument("kvikio_config: nthreads must be non-zero");
+  }
+  if (cfg.task_size && *cfg.task_size == 0) {
+    throw std::invalid_argument("kvikio_config: task_size must be non-zero");
+  }
+  if (cfg.bounce_buffer_size && *cfg.bounce_buffer_size == 0) {
+    throw std::invalid_argument("kvikio_config: bounce_buffer_size must be non-zero");
+  }
+
+  // Only engaged fields are pushed, so an unset field keeps whatever kvikIO
+  // seeded from its environment variable.
+  //
+  // Order matters for the two thread-pool knobs: set the per-block-device flag
+  // first so that pools created afterwards are sized by the nthreads below,
+  // rather than rebuilding a global pool we are about to replace anyway.
+  if (cfg.thread_pool_per_block_device) {
+    kvikio::defaults::set_thread_pool_per_block_device(*cfg.thread_pool_per_block_device);
+  }
+  if (cfg.nthreads) { kvikio::defaults::set_thread_pool_nthreads(*cfg.nthreads); }
+  if (cfg.task_size) { kvikio::defaults::set_task_size(*cfg.task_size); }
+  if (cfg.gds_threshold) { kvikio::defaults::set_gds_threshold(*cfg.gds_threshold); }
+  if (cfg.bounce_buffer_size) { kvikio::defaults::set_bounce_buffer_size(*cfg.bounce_buffer_size); }
+  if (cfg.auto_direct_io_read) {
+    kvikio::defaults::set_auto_direct_io_read(*cfg.auto_direct_io_read);
+  }
+  if (cfg.auto_direct_io_read_overread) {
+    kvikio::defaults::set_auto_direct_io_read_overread(*cfg.auto_direct_io_read_overread);
+  }
+  // compat_mode is deliberately NOT set globally — it rides the FileHandle
+  // constructor in create_io_object so it scopes to this ioctx's files.
+}
+
+kvikio_context::kvikio_context(kvikio_config cfg) : _config(std::move(cfg))
+{
+  apply_kvikio_defaults(_config);
+}
+
+std::shared_ptr<io_object> kvikio_context::create_io_object(std::string path)
+{
+  // Read-only: this ioctx serves the scan path only.  The handle owns the fd
+  // (and any cuFile registration) for the io_object's lifetime, and the
+  // io_object outlives any single datasource wrapping it.
+  //
+  // compat_mode is passed per handle (rather than through kvikio::defaults) so
+  // it applies only to files this ioctx opens; unset falls back to kvikIO's own
+  // default, which honours KVIKIO_COMPAT_MODE.
+  kvikio::FileHandle handle =
+    _config.compat_mode
+      ? kvikio::FileHandle{path, "r", kvikio::FileHandle::m644, *_config.compat_mode}
+      : kvikio::FileHandle{path, "r"};
+  auto const file_size = handle.nbytes();
+  return std::make_shared<kvikio_io_object>(std::move(path), std::move(handle), file_size);
 }
 
 bool kvikio_context::supports(std::string_view /*path*/) const noexcept
 {
-  // cudf::io::datasource::create handles file paths, URIs, and registered
-  // protocol handlers; the actual feasibility check happens at
-  // create_io_object time, where opening the file may throw.
+  // Universal fallback: kvikIO handles local paths, and the actual feasibility
+  // check happens at create_io_object time, where opening the file may throw.
+  // The registry consults this last, so an explicit backend always wins.
   return true;
 }
-
-// -- Public read API ---------------------------------------------------------
 
 std::vector<cudf::io::text::byte_range_info> kvikio_context::align_and_coalesce(
   std::span<const cudf::io::text::byte_range_info> ranges,
@@ -66,43 +122,59 @@ std::vector<cudf::io::text::byte_range_info> kvikio_context::align_and_coalesce(
   return {ranges.begin(), ranges.end()};
 }
 
-size_t kvikio_context::host_read_io(const sirius_io_object& obj,
-                                    size_t offset,
-                                    size_t size,
-                                    uint8_t* dst)
+size_t kvikio_context::host_read_io(const io_object& obj, size_t offset, size_t size, uint8_t* dst)
 {
-  return as_kvikio(obj).datasource().host_read(offset, size, reinterpret_cast<uint8_t*>(dst));
+  // pread dispatches on the destination pointer type, so the same call serves
+  // host and device buffers; here it is always host memory.
+  size = clamp_to_object(obj, offset, size);
+  if (size == 0) { return 0; }
+  return as_kvikio(obj).handle().pread(dst, size, offset).get();
 }
 
-exec::semi_future<size_t> kvikio_context::host_read_async_io(const sirius_io_object& obj,
+exec::semi_future<size_t> kvikio_context::host_read_async_io(const io_object& obj,
                                                              size_t offset,
                                                              size_t size,
                                                              uint8_t* dst) noexcept
 {
-  auto fut =
-    as_kvikio(obj).datasource().host_read_async(offset, size, reinterpret_cast<uint8_t*>(dst));
-  return exec::make_semi_future_with([fut = std::move(fut)]() mutable { return fut.get(); });
+  // make_semi_future_with invokes eagerly, so the kvikIO future is consumed
+  // here and the returned semi_future is already satisfied.  Callers that need
+  // true overlap use the uring backend.
+  size = clamp_to_object(obj, offset, size);
+  return exec::make_semi_future_with([&obj, offset, size, dst]() -> size_t {
+    if (size == 0) { return 0; }
+    return as_kvikio(obj).handle().pread(dst, size, offset).get();
+  });
 }
 
 exec::semi_future<size_t> kvikio_context::device_read_async_io(
-  const sirius_io_object& obj,
+  const io_object& obj,
   size_t offset,
   size_t size,
   uint8_t* dst,
   rmm::cuda_stream_view stream) noexcept
 {
-  auto fut = as_kvikio(obj).datasource().device_read_async(
-    offset, size, reinterpret_cast<uint8_t*>(dst), stream);
-  return exec::make_semi_future_with([fut = std::move(fut)]() mutable { return fut.get(); });
+  size = clamp_to_object(obj, offset, size);
+  return exec::make_semi_future_with([&obj, offset, size, dst, stream]() -> size_t {
+    // read_async enqueues the transfer on `stream` (so it is ordered against
+    // the caller's other stream work, unlike pread); check_bytes_done then
+    // synchronizes that stream and yields the byte count.
+    if (size == 0) { return 0; }
+    auto fut = as_kvikio(obj).handle().read_async(dst,
+                                                  size,
+                                                  static_cast<off_t>(offset),
+                                                  /*devPtr_offset=*/0,
+                                                  stream.value());
+    return fut.check_bytes_done();
+  });
 }
 
 exec::semi_future<size_t> kvikio_context::host_to_device_read_async_io(
-  const sirius_io_object& obj,
-  std::span<io_object_segment> slices,
-  size_t offset,
-  size_t size,
-  uint8_t* device_dst,
-  rmm::cuda_stream_view stream) noexcept
+  const io_object& /*obj*/,
+  std::span<io_object_segment> /*slices*/,
+  size_t /*offset*/,
+  size_t /*size*/,
+  uint8_t* /*device_dst*/,
+  rmm::cuda_stream_view /*stream*/) noexcept
 {
   return exec::make_semi_future<size_t>(std::make_exception_ptr(
     std::runtime_error("kvikio_context does not support host_to_device_read_async_io; use "
@@ -110,7 +182,7 @@ exec::semi_future<size_t> kvikio_context::host_to_device_read_async_io(
 }
 
 exec::semi_future<size_t> kvikio_context::host_read_ranges_async_io(
-  const sirius_io_object& obj, std::span<io_object_segment> segments) noexcept
+  const io_object& /*obj*/, std::span<io_object_segment> /*segments*/) noexcept
 {
   return exec::make_semi_future<size_t>(std::make_exception_ptr(
     std::runtime_error("kvikio_context does not support host_read_ranges_async_io")));

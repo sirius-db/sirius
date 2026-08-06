@@ -18,14 +18,18 @@
 
 #include "exec/semi_future.hpp"
 #include "io/io_context.hpp"
+#include "io/kvikio/config.hpp"
 
-#include <cudf/io/datasource.hpp>
+#include <kvikio/file_handle.hpp>
 
+#include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace sirius::io {
@@ -35,18 +39,17 @@ namespace sirius::io {
 // ---------------------------------------------------------------------------
 
 /**
- * @brief @c sirius_io_object that holds a cudf::io::datasource (kvikio-backed
- *        on the default cudf build).
+ * @brief @c io_object that owns a kvikIO file handle.
  *
- * Owns the datasource for the file's lifetime; @c kvikio_context's read
- * overrides forward straight to this datasource so we don't have to
- * translate cudf's future-returning API into the push/callback shape that
- * the base class's protected @c _io primitives expect.
+ * Owns the handle for the file's lifetime; @c kvikio_context's read primitives
+ * forward straight to it.  kvikIO picks GDS or a POSIX/compat path per call
+ * based on the pointer type and its own compatibility mode, so this backend
+ * serves both host and device destinations from the same handle.
  */
-class kvikio_io_object final : public sirius_io_object {
+class kvikio_io_object final : public io_object {
  public:
-  kvikio_io_object(std::string path, std::shared_ptr<cudf::io::datasource> ds, size_t file_size)
-    : _path(std::move(path)), _datasource(std::move(ds)), _file_size(file_size)
+  kvikio_io_object(std::string path, kvikio::FileHandle handle, size_t file_size)
+    : _path(std::move(path)), _handle(std::move(handle)), _file_size(file_size)
   {
   }
 
@@ -54,11 +57,13 @@ class kvikio_io_object final : public sirius_io_object {
   [[nodiscard]] const std::string& object_path() const noexcept final { return _path; }
   [[nodiscard]] size_t size() const noexcept final { return _file_size; }
 
-  [[nodiscard]] cudf::io::datasource& datasource() const noexcept { return *_datasource; }
+  /// Mutable: kvikIO's read entry points are non-const, and the reads issued
+  /// through them do not mutate observable file state.
+  [[nodiscard]] kvikio::FileHandle& handle() const noexcept { return _handle; }
 
  private:
   std::string _path;
-  std::shared_ptr<cudf::io::datasource> _datasource;
+  mutable kvikio::FileHandle _handle;
   size_t _file_size{0};
 };
 
@@ -67,30 +72,41 @@ class kvikio_io_object final : public sirius_io_object {
 // ---------------------------------------------------------------------------
 
 /**
- * @brief Fallback @c sirius_ioctx that defers to cudf's default datasource
- *        (kvikio-backed for file paths on a stock cudf build).
+ * @brief Fallback @c ioctx backed directly by kvikIO
+ *        (@c kvikio::FileHandle).
  *
- * Why override the public read API directly instead of the protected
- * @c _io primitives?  cudf's async path returns @c std::future<size_t>,
- * and the protected @c host_read_async_io / @c device_read_async_io
- * contract returns @c exec::semi_future<size_t>.  Bridging the cudf
- * future into a semi_future per call requires a detached waiter
- * thread; instead, kvikio overrides the public read API so the cudf
- * future flows through unchanged.  The protected @c _io primitives
- * become unreachable placeholders.
+ * The universal local-file backend: it claims any path, so the registry uses it
+ * only after the explicit backends (uring / rest) decline.  Unlike those, it
+ * owns no reactors and no bounce staging — every read goes straight to a
+ * kvikIO handle, which internally chooses GDS or a POSIX/compat path.
+ *
+ * It implements the protected @c _io primitives (not the public read API); the
+ * base class's public reads route through them.
  *
  * Capabilities:
- *   - @c supports_device_read: true (cudf's datasource supports it where the
- *     platform allows, e.g. GDS).
+ *   - @c supports_device_read: true (kvikIO reads into device memory, via GDS
+ *     where the platform allows).
  *   - @c supports_vector_host_read: false — no batched dispatch path.
+ *   - @c supports_host_to_device_read: false — no bounce-staging path.
  *   - @c preferred_prefetching_stage: @c none.
  */
-class kvikio_context final : public sirius_ioctx {
+class kvikio_context final : public ioctx {
  public:
+  /// Construct with kvikIO left at its own (env-var-seeded) defaults.
   kvikio_context() = default;
+
+  /// Construct and apply @p cfg.  Every field except @c compat_mode is pushed
+  /// into kvikIO's PROCESS-GLOBAL defaults — see @ref kvikio_config for the
+  /// sharing and ordering caveats.  @c compat_mode is retained and applied per
+  /// file handle at open time instead.
+  ///
+  /// @throw std::invalid_argument on a zero @c nthreads, @c task_size, or
+  ///        @c bounce_buffer_size.
+  explicit kvikio_context(kvikio_config cfg);
+
   ~kvikio_context() override
   {
-    // See sirius_ioctx::pre_destroy — drains the cache (if any) while
+    // See ioctx::pre_destroy — drains the cache (if any) while
     // this derived part of the object is still alive.  No reactors to
     // tear down for kvikio_context, but the contract still applies.
     this->pre_destroy();
@@ -109,47 +125,55 @@ class kvikio_context final : public sirius_ioctx {
     return cache::prefetching_stage::none;
   }
 
-  std::vector<cudf::io::text::byte_range_info> align_and_coalesce(
+  /// kvikIO applies no physical block alignment of its own, so ranges pass
+  /// through unchanged.
+  [[nodiscard]] std::vector<cudf::io::text::byte_range_info> align_and_coalesce(
     std::span<const cudf::io::text::byte_range_info> ranges,
     std::optional<size_t> /*alignment*/) const noexcept override;
 
-  // -- Protected _io primitives -------------------------------------------
-  //
-  // The base class's default read implementations route through these on a
-  // cache miss, but kvikio_context overrides the public read API and never
-  // attaches a cache (supports_vector_host_read == false), so these are
-  // unreachable from the documented code paths.  They remain pure-virtual
-  // on the base, so we provide throwing placeholders to keep the class
-  // instantiable; any future caller that bypasses the public API will see
-  // a clear failure rather than silent misbehaviour.
+  // -- Backend primitives ---------------------------------------------------
 
-  size_t host_read_io(const sirius_io_object& obj, size_t offset, size_t size, uint8_t* dst) final;
+  size_t host_read_io(const io_object& obj, size_t offset, size_t size, uint8_t* dst) final;
 
-  exec::semi_future<size_t> host_read_async_io(const sirius_io_object& obj,
+  exec::semi_future<size_t> host_read_async_io(const io_object& obj,
                                                size_t offset,
                                                size_t size,
                                                uint8_t* dst) noexcept final;
 
-  exec::semi_future<size_t> device_read_async_io(const sirius_io_object& obj,
+  exec::semi_future<size_t> device_read_async_io(const io_object& obj,
                                                  size_t offset,
                                                  size_t size,
                                                  uint8_t* dst,
                                                  rmm::cuda_stream_view stream) noexcept final;
 
+  /// Unsupported: kvikIO has no bounce-staged host->device path here.  Returns
+  /// a failed future rather than misbehaving silently.
   exec::semi_future<size_t> host_to_device_read_async_io(
-    const sirius_io_object& obj,
+    const io_object& obj,
     std::span<io_object_segment> slices,
     size_t offset,
     size_t size,
     uint8_t* device_dst,
     rmm::cuda_stream_view stream) noexcept final;
 
+  /// Unsupported: no batched dispatch (hence @c supports_vector_host_read()
+  /// is false and the prefetching cache stays unarmed).
   exec::semi_future<size_t> host_read_ranges_async_io(
-    const sirius_io_object& obj, std::span<io_object_segment> segments) noexcept final;
+    const io_object& obj, std::span<io_object_segment> segments) noexcept final;
+
+  /// The config this context was built with (default-constructed when none was
+  /// supplied).  Only @c compat_mode is still consulted after construction; the
+  /// rest already went into kvikIO's globals.
+  [[nodiscard]] kvikio_config const& config() const noexcept { return _config; }
 
  protected:
-  /// Backend hook invoked by @c sirius_ioctx::open_datasource.
-  std::shared_ptr<sirius_io_object> create_io_object(std::string path) override;
+  /// Backend hook invoked by @c ioctx::open_datasource: open @p path
+  /// with kvikIO and record its size.  Applies @c config().compat_mode to the
+  /// handle when set.  Throws when the file cannot be opened.
+  std::shared_ptr<io_object> create_io_object(std::string path) override;
+
+ private:
+  kvikio_config _config;
 };
 
 }  // namespace sirius::io

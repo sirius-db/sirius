@@ -344,7 +344,9 @@ struct merged_segment {
 /// is always emitted as a standalone group and never fused into or onto a
 /// neighbor.  A run of contiguous segments split by a null-buffer segment in the
 /// middle therefore yields three groups: a vectored head, the single null
-/// segment, and a vectored tail.
+/// segment, and a vectored tail.  Only @c prep_host_to_device_rx_request passes
+/// such segments — @c make_device_chunk_vectored resolves them against the
+/// late-assigned bounce slot; host reads assert every segment carries a buffer.
 template <typename FdFor>
 [[nodiscard]] std::vector<merged_segment> merge_contiguous(std::span<io_object_segment> segments,
                                                            size_t max_n_chunks,
@@ -549,6 +551,13 @@ request_type_ptr uring_reactor::prep_host_rx_request(const reactor_config_type& 
 {
   if (segment.size == 0) { return rx_request::create({}); }
 
+  // A host read must carry the caller's destination buffer.  A null buffer means
+  // "reactor-staged" (internal bounce slot), which only makes sense for device
+  // reads: a host read staged through the bounce would report success while the
+  // bytes sit unreachable in a reactor-private buffer.
+  assert(segment.is_buffer_allocated() &&
+         "uring_reactor::prep_host_rx_request: host read requires a non-null destination buffer");
+
   int const fd = (cfg.use_odirect && segment.is_odirect_compatible()) ? file.odirect_handle()
                                                                       : file.buffered_handle();
 
@@ -707,6 +716,12 @@ request_type_ptr uring_reactor::prep_host_rxv_request(const reactor_config_type&
   // future returns, never the over-read amount.  Merging does not change it.
   size_t bytes_requested = 0;
   for (auto const& s : segments) {
+    // See prep_host_rx_request: every segment of a host read must carry the
+    // caller's destination buffer.  A null-buffer segment would be staged
+    // through an internal bounce slot and its bytes lost to the caller.
+    assert(s.is_buffer_allocated() &&
+           "uring_reactor::prep_host_rxv_request: host read requires non-null "
+           "destination buffers");
     bytes_requested += s.offset < fsize ? std::min(s.size, fsize - s.offset) : 0;
   }
 

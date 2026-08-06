@@ -20,7 +20,7 @@
 #include "exec/scoped_dispatcher.hpp"
 #include "exec/thread_pool.hpp"
 #include "io/datasource_factory.hpp"
-#include "io/s3/s3_list_parser.hpp"
+#include "io/rest/s3/list_parser.hpp"
 #include "io/sirius_datasource.hpp"
 #include "op/scan/gpu_ingestible_types.hpp"
 #include "pin_table.hpp"
@@ -70,7 +70,7 @@ class topology_index;
 }  // namespace sirius::memory
 
 namespace sirius::io {
-class sirius_ioctx;
+class ioctx;
 namespace cache {
 class buffer_pool;
 }  // namespace cache
@@ -580,7 +580,7 @@ class sirius_scan_manager {
   /// \brief Process-wide ioctx used to mint @c sirius_datasource instances.
   ///        Holds a @c uring_ioctx, or a @c kvikio_context when the manager
   ///        was configured with @c use_sirius_datasource=false.
-  [[nodiscard]] sirius::io::sirius_ioctx* io_ctx() const noexcept { return _io_ctx.get(); }
+  [[nodiscard]] sirius::io::ioctx* io_ctx() const noexcept { return _io_ctx.get(); }
 
   [[nodiscard]] std::shared_ptr<sirius::io::sirius_datasource> create_datasource(
     std::string_view path, sirius::io::open_hint hint = sirius::io::open_hint::generic);
@@ -595,7 +595,7 @@ class sirius_scan_manager {
   void list_objects_paged(
     std::string const& s3_prefix_uri,
     std::size_t page_size,
-    std::function<bool(sirius::io::s3::list_objects_v2_page const&)> const& sink,
+    std::function<bool(sirius::io::rest::s3::list_objects_v2_page const&)> const& sink,
     std::optional<std::size_t> max_scanned = std::nullopt);
 
   /// \brief The configured glob-match cap (@c rest.list_max_matches) for the
@@ -634,7 +634,7 @@ class sirius_scan_manager {
   /// building it once per backend on first use.  Routes by path through the registry
   /// so an `s3://` URI reaches the rest_ioctx even when the local default `_io_ctx`
   /// is uring/kvikio.  Returns nullptr when no backend supports the path.
-  std::shared_ptr<sirius::io::sirius_ioctx> ioctx_for_path(std::string_view path);
+  std::shared_ptr<sirius::io::ioctx> ioctx_for_path(std::string_view path);
 
   scan_manager_config _config;
   cucascade::memory::memory_reservation_manager& _reservation_manager;
@@ -643,7 +643,7 @@ class sirius_scan_manager {
   std::shared_ptr<const sirius::memory::topology_index> _topology_index;
   exec::static_thread_pool _thread_pool;
   std::unique_ptr<exec::scoped_dispatcher> _dispatcher;
-  std::shared_ptr<sirius::io::sirius_ioctx> _io_ctx;
+  std::shared_ptr<sirius::io::ioctx> _io_ctx;
   /// Lazily-built per-backend ioctxs for path-routed datasources (e.g. an s3://
   /// rest_ioctx alongside the local uring/kvikio `_io_ctx`).  Built exactly once
   /// per type: `_routed_io_ctxs_build_mtx` serializes construction (reactor
@@ -652,7 +652,7 @@ class sirius_scan_manager {
   /// in the dtor.
   std::mutex _routed_io_ctxs_build_mtx;
   std::mutex _routed_io_ctxs_mtx;
-  std::unordered_map<sirius::io::io_context_type, std::shared_ptr<sirius::io::sirius_ioctx>>
+  std::unordered_map<sirius::io::io_context_type, std::shared_ptr<sirius::io::ioctx>>
     _routed_io_ctxs;
   std::unordered_map<op::scan::sirius_gpu_scan_operator*, std::unique_ptr<split_provider>>
     _providers_by_op;

@@ -15,9 +15,9 @@
  */
 
 #include "catch.hpp"
+#include "io/rest/authorizer.hpp"
 #include "io/rest/rest_ioctx.hpp"
-#include "io/s3/s3_list_parser.hpp"
-#include "io/s3/s3_request_authorizer.hpp"
+#include "io/rest/s3/list_parser.hpp"
 #include "io/sirius_datasource.hpp"
 #include "io/types.hpp"
 #include "memory/topology_index.hpp"
@@ -277,20 +277,20 @@ enum class scripted_list_mode {
   truncated_empty_without_token
 };
 
-class fixed_url_authorizer final : public sirius::io::s3::s3_request_authorizer {
+class fixed_url_authorizer final : public sirius::io::rest::request_authorizer {
  public:
   explicit fixed_url_authorizer(std::string endpoint) : _endpoint(std::move(endpoint)) {}
 
-  sirius::io::s3::s3_authorized_request authorize(sirius::io::s3::s3_object_ref const& obj,
-                                                  sirius::io::s3::s3_request_method /*method*/,
-                                                  std::chrono::seconds /*timeout*/) override
+  sirius::io::rest::authorized_request authorize(sirius::io::rest::object_ref const& obj,
+                                                 sirius::io::rest::request_method /*method*/,
+                                                 std::chrono::seconds /*timeout*/) override
   {
     return {_endpoint + "/" + obj.bucket + "/" + obj.key, {}};
   }
 
-  sirius::io::s3::s3_authorized_request authorize_list(std::string_view bucket,
-                                                       std::string_view canonical_query,
-                                                       std::chrono::seconds /*timeout*/) override
+  sirius::io::rest::authorized_request authorize_list(std::string_view bucket,
+                                                      std::string_view canonical_query,
+                                                      std::chrono::seconds /*timeout*/) override
   {
     return {_endpoint + "/" + std::string{bucket} + "?" + std::string{canonical_query}, {}};
   }
@@ -1097,7 +1097,7 @@ TEST_CASE("rest perf snapshot attributes blocking host reads separately from chu
 
     auto const before = ioctx->perf_snapshot();
     auto got =
-      std::move(ioctx->host_read_ranges_async_io(datasource->io_object(), segments)).get(5s);
+      std::move(ioctx->host_read_ranges_async_io(datasource->get_io_object(), segments)).get(5s);
     auto const after = ioctx->perf_snapshot();
 
     REQUIRE(got == a.size() + b.size());
@@ -1146,7 +1146,7 @@ TEST_CASE("rest_ioctx paged LIST supports early stop and explicit safety caps",
     ctx->list_objects_paged("bucket",
                             "data/",
                             /*page_size=*/1,
-                            [&](sirius::io::s3::list_objects_v2_page const& page) {
+                            [&](sirius::io::rest::s3::list_objects_v2_page const& page) {
                               ++pages;
                               REQUIRE(page.entries.size() == 1);
                               CHECK(page.entries[0].key == "data/a.parquet");
@@ -1178,7 +1178,7 @@ TEST_CASE("rest_ioctx paged LIST supports early stop and explicit safety caps",
                         "bucket",
                         "data/",
                         /*page_size=*/1,
-                        [](sirius::io::s3::list_objects_v2_page const&) { return true; },
+                        [](sirius::io::rest::s3::list_objects_v2_page const&) { return true; },
                         /*max_scanned=*/2),
                       Catch::Contains("narrow the glob prefix"));
   }
@@ -1195,7 +1195,7 @@ TEST_CASE("rest_ioctx paged LIST supports early stop and explicit safety caps",
                         "bucket",
                         "data/",
                         /*page_size=*/1,
-                        [](sirius::io::s3::list_objects_v2_page const&) { return true; }),
+                        [](sirius::io::rest::s3::list_objects_v2_page const&) { return true; }),
                       Catch::Contains("narrow the glob prefix"));
 
     range_http_server override_server(deterministic_payload(16), {}, objects);
@@ -1206,7 +1206,7 @@ TEST_CASE("rest_ioctx paged LIST supports early stop and explicit safety caps",
       "bucket",
       "data/",
       /*page_size=*/1,
-      [&](sirius::io::s3::list_objects_v2_page const& page) {
+      [&](sirius::io::rest::s3::list_objects_v2_page const& page) {
         ++pages;
         REQUIRE(page.entries.size() == 1);
         return true;
@@ -1264,7 +1264,7 @@ TEST_CASE("rest_ioctx generated LIST scale obeys configured caps without accumul
       ctx->list_objects_paged("bucket",
                               "big/",
                               /*page_size=*/1000,
-                              [&](sirius::io::s3::list_objects_v2_page const& page) {
+                              [&](sirius::io::rest::s3::list_objects_v2_page const& page) {
                                 max_seen = std::max(max_seen, page.entries.size());
                                 ++sink_calls;
                                 return true;
@@ -1330,7 +1330,7 @@ TEST_CASE("rest_ioctx generated LIST scale obeys configured caps without accumul
     ctx->list_objects_paged("bucket",
                             "big/",
                             /*page_size=*/1000,
-                            [&](sirius::io::s3::list_objects_v2_page const& page) {
+                            [&](sirius::io::rest::s3::list_objects_v2_page const& page) {
                               max_seen = std::max(max_seen, page.entries.size());
                               ++sink_calls;
                               return false;
@@ -1358,7 +1358,7 @@ TEST_CASE("rest_ioctx generated LIST scale obeys the default safety caps",
       ctx->list_objects_paged("bucket",
                               "big/",
                               /*page_size=*/1000,
-                              [&](sirius::io::s3::list_objects_v2_page const& page) {
+                              [&](sirius::io::rest::s3::list_objects_v2_page const& page) {
                                 max_seen = std::max(max_seen, page.entries.size());
                                 ++sink_calls;
                                 return true;
@@ -1464,7 +1464,7 @@ TEST_CASE("rest_ioctx opens LIST-sized objects without a HEAD round trip",
   auto datasource =
     ctx->open_datasource("s3://bucket/list-sized.bin", static_cast<std::uint64_t>(payload.size()));
   REQUIRE(datasource != nullptr);
-  CHECK(datasource->io_object().size() == payload.size());
+  CHECK(datasource->get_io_object().size() == payload.size());
   CHECK(server.head_count() == 0);
 
   std::vector<std::uint8_t> out(payload.size());
@@ -1559,7 +1559,7 @@ TEST_CASE("footer probe open uses the configured suffix window",
     auto datasource        = ioctx->open_datasource("s3://footer-bucket/nation.parquet",
                                              sirius::io::open_hint::parquet_footer_probe);
     auto const* rest_object =
-      dynamic_cast<sirius::io::rest::rest_io_object const*>(&datasource->io_object());
+      dynamic_cast<sirius::io::rest::rest_io_object const*>(&datasource->get_io_object());
 
     REQUIRE(rest_object != nullptr);
     CHECK(rest_object->stash_window_lo() == parquet.size() - suffix_bytes);
@@ -1587,7 +1587,7 @@ TEST_CASE("footer probe open uses the configured suffix window",
     auto datasource        = ioctx->open_datasource("s3://footer-bucket/nation.parquet",
                                              sirius::io::open_hint::parquet_footer_probe);
     auto const* rest_object =
-      dynamic_cast<sirius::io::rest::rest_io_object const*>(&datasource->io_object());
+      dynamic_cast<sirius::io::rest::rest_io_object const*>(&datasource->get_io_object());
 
     REQUIRE(rest_object != nullptr);
     CHECK(rest_object->stash_window_lo() == parquet.size() - suffix_bytes);
@@ -1724,7 +1724,7 @@ TEST_CASE("footer suffix probe falls back safely on unusable suffix responses",
                                              sirius::io::open_hint::parquet_footer_probe);
     REQUIRE(datasource != nullptr);
     CHECK(datasource->size() == parquet.size());
-    CHECK(datasource->io_object().validation_etag().empty());
+    CHECK(datasource->get_io_object().validation_tag().empty());
     CHECK(server.head_count() == 1);
     CHECK(server.get_count() == 1);
   }
@@ -1933,7 +1933,7 @@ TEST_CASE("HEAD object-size retries update REST perf counters",
       cfg, std::move(authorizer), nullptr);
     sirius::io::rest::rest_reactor reactor(ctx, "head-retry-success");
 
-    auto const result = reactor.head_object_size("head-bucket", "head-success.bin");
+    auto const result = reactor.head_object("head-bucket", "head-success.bin");
     CHECK(result.object_size == payload.size());
     CHECK(result.etag == "\"head-v2\"");
     CHECK(server.head_count() == 3);
@@ -1958,8 +1958,8 @@ TEST_CASE("HEAD object-size retries update REST perf counters",
     sirius::io::rest::rest_reactor reactor(ctx, "head-retry-exhausted");
 
     try {
-      (void)reactor.head_object_size("head-bucket", "head-exhausted.bin");
-      FAIL("head_object_size should throw after exhausting transient retries");
+      (void)reactor.head_object("head-bucket", "head-exhausted.bin");
+      FAIL("head_object should throw after exhausting transient retries");
     } catch (std::runtime_error const& e) {
       auto const message = std::string{e.what()};
       CHECK(message.find("exhausted retries") != std::string::npos);
@@ -1987,8 +1987,8 @@ TEST_CASE("HEAD object-size retries update REST perf counters",
     sirius::io::rest::rest_reactor reactor(ctx, "head-hard-failure");
 
     try {
-      (void)reactor.head_object_size("head-bucket", "head-forbidden.bin");
-      FAIL("head_object_size should throw on a hard non-retriable HTTP error");
+      (void)reactor.head_object("head-bucket", "head-forbidden.bin");
+      FAIL("head_object should throw on a hard non-retriable HTTP error");
     } catch (std::runtime_error const& e) {
       auto const message = std::string{e.what()};
       CHECK(message.find("HTTP 403") != std::string::npos);
@@ -2011,7 +2011,7 @@ TEST_CASE("HEAD object-size retries update REST perf counters",
       cfg, std::move(authorizer), nullptr);
     sirius::io::rest::rest_reactor reactor(ctx, "head-clean");
 
-    auto const result = reactor.head_object_size("head-bucket", "head-clean.bin");
+    auto const result = reactor.head_object("head-bucket", "head-clean.bin");
     CHECK(result.object_size == payload.size());
     CHECK(result.etag.empty());
     CHECK(server.head_count() == 1);
@@ -2067,7 +2067,7 @@ TEST_CASE("REST retry logging includes object keys and stays quiet on clean requ
     scoped_log_capture logs;
     auto probe = reactor.fetch_footer_suffix("log-bucket", "clean.parquet", 1024);
     REQUIRE(probe.bytes != nullptr);
-    CHECK(reactor.head_object_size("log-bucket", "clean.parquet").object_size == payload.size());
+    CHECK(reactor.head_object_size("log-bucket", "clean.parquet") == payload.size());
 
     auto const records        = logs.records();
     auto const warning_or_bad = std::any_of(records.begin(), records.end(), [](auto const& r) {
@@ -2222,7 +2222,7 @@ TEST_CASE("rest_ioctx fans out host_read_ranges against the MinIO medium fixture
 
   auto got =
     std::move(datasource->io_ctx()->host_read_ranges_async_io(
-                datasource->io_object(), std::span<sirius::io::io_object_segment>(segments)))
+                datasource->get_io_object(), std::span<sirius::io::io_object_segment>(segments)))
       .get(5s);
   REQUIRE(got == total);
   for (std::size_t i = 0; i < ranges.size(); ++i) {
@@ -2351,7 +2351,7 @@ TEST_CASE("rest_ioctx honors max_connections under concurrent fake range reads",
 
   auto got =
     std::move(datasource->io_ctx()->host_read_ranges_async_io(
-                datasource->io_object(), std::span<sirius::io::io_object_segment>(segments)))
+                datasource->get_io_object(), std::span<sirius::io::io_object_segment>(segments)))
       .get(10s);
   REQUIRE(got == 8 * 512);
   CHECK(server.peak_active_gets() <= 2);

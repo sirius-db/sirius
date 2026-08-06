@@ -17,7 +17,7 @@
 #pragma once
 
 #include "io/io_request.hpp"
-#include "io/s3/s3_object_ref.hpp"
+#include "io/rest/authorizer.hpp"
 #include "io/types.hpp"
 
 #include <cuda_runtime.h>
@@ -81,7 +81,7 @@ struct header_capture {
 /// non-null only for device-bound reads.  @c attempt persists across retries
 /// (the chunk is re-enqueued by the retry engine) so backoff can grow.
 struct rest_chunked_rx_request {
-  s3::s3_object_ref object;
+  object_ref object;
   io_object_segment chunk;
   std::size_t file_size{0};
   std::size_t attempt{0};       // transient (5xx / curl / short-read) retries

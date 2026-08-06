@@ -265,7 +265,7 @@ std::vector<cached_chunk*> prefetching_cache::file_entry::fetch_chunks(std::size
 
 prefetching_cache::prefetching_cache(
   cucascade::memory::memory_reservation_manager& reservation_manager,
-  sirius_ioctx* io_ctx,
+  ioctx* io_ctx,
   const config& cfg,
   std::shared_ptr<const sirius::memory::topology_index> topology_index)
   : _cfg(cfg),
@@ -302,8 +302,7 @@ prefetching_cache::~prefetching_cache()
 // insert
 // ===========================================================================
 
-prefetching_cache::file_entry& prefetching_cache::get_or_create_file_entry(
-  const sirius_io_object& obj)
+prefetching_cache::file_entry& prefetching_cache::get_or_create_file_entry(const io_object& obj)
 {
   const auto& key = obj.raw_file_cache_id();
   std::shared_lock lk(_map_mtx);
@@ -322,7 +321,7 @@ prefetching_cache::file_entry& prefetching_cache::get_or_create_file_entry(
   return *it->second;
 }
 
-prefetching_handle prefetching_cache::insert(const sirius_io_object& obj,
+prefetching_handle prefetching_cache::insert(const io_object& obj,
                                              std::span<const byte_range> ranges,
                                              std::optional<int> gpu_id)
 {
@@ -367,11 +366,8 @@ prefetching_handle prefetching_cache::insert(const sirius_io_object& obj,
   return handle;
 }
 
-bool prefetching_cache::host_read_from_cache_only(const sirius_io_object& obj,
-                                                  size_t offset,
-                                                  size_t size,
-                                                  uint8_t* dst,
-                                                  prefetching_handle* out_handle)
+bool prefetching_cache::host_read_from_cache_only(
+  const io_object& obj, size_t offset, size_t size, uint8_t* dst, prefetching_handle* out_handle)
 {
   if (size == 0) return true;
 
@@ -418,11 +414,8 @@ bool prefetching_cache::host_read_from_cache_only(const sirius_io_object& obj,
   return false;
 }
 
-exec::semi_future<std::size_t> prefetching_cache::host_read_async(const sirius_io_object& obj,
-                                                                  size_t offset,
-                                                                  size_t size,
-                                                                  uint8_t* dst,
-                                                                  prefetching_handle* out_handle)
+exec::semi_future<std::size_t> prefetching_cache::host_read_async(
+  const io_object& obj, size_t offset, size_t size, uint8_t* dst, prefetching_handle* out_handle)
 {
   bool status = host_read_from_cache_only(obj, offset, size, dst, out_handle);
   if (status) { return exec::make_semi_future<std::size_t>(size); }
@@ -431,11 +424,8 @@ exec::semi_future<std::size_t> prefetching_cache::host_read_async(const sirius_i
   return _io_ctx->host_read_async_io(obj, offset, size, dst);
 }
 
-std::size_t prefetching_cache::host_read(const sirius_io_object& obj,
-                                         size_t offset,
-                                         size_t size,
-                                         uint8_t* dst,
-                                         prefetching_handle* out_handle)
+std::size_t prefetching_cache::host_read(
+  const io_object& obj, size_t offset, size_t size, uint8_t* dst, prefetching_handle* out_handle)
 {
   bool status = host_read_from_cache_only(obj, offset, size, dst, out_handle);
   if (status) { return size; }
@@ -444,7 +434,7 @@ std::size_t prefetching_cache::host_read(const sirius_io_object& obj,
   return _io_ctx->host_read_io(obj, offset, size, dst);
 }
 
-exec::semi_future<std::size_t> prefetching_cache::device_read_async(const sirius_io_object& obj,
+exec::semi_future<std::size_t> prefetching_cache::device_read_async(const io_object& obj,
                                                                     size_t offset,
                                                                     size_t size,
                                                                     uint8_t* dst,
@@ -652,7 +642,7 @@ std::string prefetching_cache::summary() const
     evict - _last_reported.evictions);
 }
 
-void prefetching_cache::prepare_for_query(const sirius::planner::query& query) noexcept
+void prefetching_cache::prepare_for_query() noexcept
 {
   SIRIUS_LOG_TRACE("prefetching_cache: summary of cache performance {}", summary());
 

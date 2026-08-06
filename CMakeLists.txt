@@ -88,6 +88,24 @@ endforeach()
 
 # Dependencies
 find_package(cudf REQUIRED CONFIG)
+find_package(kvikio REQUIRED CONFIG)
+
+# kvikio::kvikio's interface pulls in BS::thread_pool, whose
+# INTERFACE_COMPILE_FEATURES include `cuda_std_17`. That requirement propagates
+# through sirius_extension into duckdb_static, whose project() scope enables
+# only C/CXX, and CMake then fails to generate with "No known features for CUDA
+# compiler". Sirius only uses kvikIO's host-side API, so drop the CUDA feature
+# from the imported target.
+if(TARGET BS::thread_pool)
+  get_target_property(_bs_thread_pool_features BS::thread_pool
+                      INTERFACE_COMPILE_FEATURES)
+  if(_bs_thread_pool_features)
+    list(REMOVE_ITEM _bs_thread_pool_features cuda_std_17)
+    set_target_properties(
+      BS::thread_pool PROPERTIES INTERFACE_COMPILE_FEATURES
+                                 "${_bs_thread_pool_features}")
+  endif()
+endif()
 find_package(spdlog REQUIRED CONFIG)
 find_package(yaml-cpp REQUIRED CONFIG)
 find_package(absl REQUIRED CONFIG)
@@ -282,10 +300,10 @@ set(EXTENSION_SOURCES
     src/io/rest/curl_handle.cpp
     src/io/rest/rest_ioctx.cpp
     src/io/rest/rest_reactor.cpp
-    src/io/s3/s3_list_parser.cpp
-    src/io/s3/sigv4.cpp
+    src/io/rest/s3/list_parser.cpp
+    src/io/rest/s3/sigv4.cpp
+    src/io/rest/s3/sigv4_authorizer.cpp
     src/io/s3/sirius_httpfs.cpp
-    src/io/s3/sirius_sigv4_authorizer.cpp
     src/io/uring/uring_ioctx.cpp
     src/io/uring/uring_reactor.cpp
     src/log/duckdb_sink.cpp
@@ -540,11 +558,18 @@ foreach(_target sirius_extension sirius_loadable_extension)
 endforeach()
 
 # Additional libraries only needed by the static extension
-target_link_libraries(sirius_extension PkgConfig::NUMA PkgConfig::LIBURING
-                      PkgConfig::CURL OpenSSL::Crypto absl::any_invocable)
+target_link_libraries(
+  sirius_extension
+  PkgConfig::NUMA
+  PkgConfig::LIBURING
+  PkgConfig::CURL
+  OpenSSL::Crypto
+  absl::any_invocable
+  kvikio::kvikio)
 
-target_link_libraries(sirius_loadable_extension PkgConfig::LIBURING
-                      PkgConfig::CURL OpenSSL::Crypto)
+target_link_libraries(
+  sirius_loadable_extension PkgConfig::LIBURING PkgConfig::CURL OpenSSL::Crypto
+  absl::any_invocable kvikio::kvikio)
 
 # The sirius-sys + sirius Rust crates are built by cargo, not CMake (unlike the
 # telemetry bridge above, which CMake drives via Corrosion). Their build.rs

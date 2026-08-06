@@ -19,8 +19,6 @@
 #include "io/io_context.hpp"
 #include "sirius_config.hpp"
 
-#include <absl/functional/any_invocable.h>
-
 #include <functional>
 #include <memory>
 #include <shared_mutex>
@@ -42,7 +40,7 @@ namespace sirius::io {
 // ---------------------------------------------------------------------------
 
 /**
- * @brief Thread-safe registry of @c sirius_ioctx backends, resolved by full path.
+ * @brief Thread-safe registry of @c ioctx backends, resolved by full path.
  *
  * The engine constructs a registry at startup and registers one entry per backend
  * (kvikio / uring / restful), each carrying a path-capability checker.  At
@@ -72,7 +70,7 @@ class io_context_registry {
   io_context_registry& operator=(io_context_registry const&) = delete;
 
   using scheme_checker_type = std::function<bool(std::string_view)>;
-  using factory_type        = std::function<std::shared_ptr<io::sirius_ioctx>(const config_type&)>;
+  using factory_type        = std::function<std::shared_ptr<io::ioctx>(const config_type&)>;
 
   /**
    * @brief Register an ioctx backend. Replaces any prior registration for the
@@ -93,7 +91,7 @@ class io_context_registry {
   /// files fall through to kvikio.  std::nullopt when nothing matches.
   std::optional<io_context_type> lookup_path(std::string_view path) const noexcept;
 
-  std::shared_ptr<sirius_ioctx> make_ioctx(io_context_type type) const noexcept;
+  std::shared_ptr<ioctx> make_ioctx(io_context_type type) const noexcept;
 
   /**
    * @brief Drop all registered ioctxs. Callers are responsible for shutting
@@ -126,8 +124,8 @@ class io_context_registry {
 // unconfigured credentials, …) is logged and reported as a null ioctx rather
 // than thrown, matching @c io_context_registry::make_ioctx.
 
-/// kvikio fallback backend (cudf default datasource).  Takes no reservation
-/// manager — kvikio owns no reactor staging.
+/// kvikio fallback backend (drives @c kvikio::FileHandle directly).  Takes no
+/// reservation manager — kvikio owns no reactor staging.
 io_context_registry::factory_type make_kvikio_ioctx_factory();
 
 /// io_uring local-disk backend.  Builds a @c uring_reactor::reactor_context from
