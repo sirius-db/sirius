@@ -193,6 +193,7 @@ mod tests {
 
     fn plan_with_outputs(names: &[&str]) -> TranslatedPlan {
         TranslatedPlan {
+            output_partition_columns: None,
             plan: Default::default(),
             output_names: names.iter().map(|name| name.to_string()).collect(),
             stream_inputs: Vec::new(),

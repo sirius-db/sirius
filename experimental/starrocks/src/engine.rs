@@ -705,6 +705,7 @@ mod tests {
             ..Default::default()
         };
         TranslatedPlan {
+            output_partition_columns: None,
             plan,
             output_names: names,
             stream_inputs: Vec::new(),
@@ -757,6 +758,7 @@ mod tests {
             }))),
         };
         TranslatedPlan {
+            output_partition_columns: None,
             plan: Plan {
                 relations: vec![PlanRel {
                     rel_type: Some(plan_rel::RelType::Root(RelRoot {
@@ -858,6 +860,7 @@ mod tests {
             ..Default::default()
         };
         TranslatedPlan {
+            output_partition_columns: None,
             plan,
             output_names: names,
             stream_inputs: Vec::new(),

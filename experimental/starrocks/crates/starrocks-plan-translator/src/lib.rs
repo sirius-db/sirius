@@ -124,6 +124,12 @@ pub struct TranslatedPlan {
     pub plan: Plan,
     /// Root output names as emitted in the Substrait plan.
     pub output_names: Vec<String>,
+    /// For a fragment whose data-stream sink is HASH_PARTITIONED: the output column index of
+    /// each partition key, in the sink's partition-expression order. Every sender instance of
+    /// one exchange derives the same indices from the same FE thrift, which is one leg of the
+    /// cross-sender hash-parity contract (the others are one hash function and one destination
+    /// count). `None` for UNPARTITIONED / result sinks.
+    pub output_partition_columns: Option<Vec<usize>>,
     /// One entry per exchange node lowered to a stream read. The caller declares these on the
     /// engine before handing it the plan — a stream has no file to infer a schema from.
     pub stream_inputs: Vec<StreamInputSchema>,
@@ -294,6 +300,60 @@ impl PlanTranslator {
         };
 
         let output_names = unique_names(output_names).collect::<Vec<_>>();
+
+        // Resolve a hash-partitioned sink's keys to output column indices while the row layout
+        // is still in hand. Bare SLOT_REFs only: any transform would make this sender hash a
+        // value its peers do not, silently splitting equal keys across destinations.
+        let output_partition_columns = match fragment
+            .output_sink
+            .as_ref()
+            .and_then(|sink| sink.stream_sink.as_ref())
+            .map(|stream_sink| &stream_sink.output_partition)
+        {
+            Some(partition)
+                if partition.type_ == starrocks_thrift::partitions::TPartitionType::HASH_PARTITIONED =>
+            {
+                if fragment
+                    .output_exprs
+                    .as_ref()
+                    .is_some_and(|exprs| !exprs.is_empty())
+                {
+                    return Err(TranslateError::malformed(
+                        "a hash-partitioned stream sink with output_exprs cannot map its \
+                         partition keys onto the sink row (never emitted by the FE)",
+                    ));
+                }
+                let exprs = partition.partition_exprs.as_deref().unwrap_or_default();
+                if exprs.is_empty() {
+                    return Err(TranslateError::malformed(
+                        "a hash-partitioned stream sink carries no partition expressions",
+                    ));
+                }
+                let mut columns = Vec::with_capacity(exprs.len());
+                for expr in exprs {
+                    let slot_ref = match expr.nodes.as_slice() {
+                        [node] if node.node_type == TExprNodeType::SLOT_REF => {
+                            node.slot_ref.as_ref()
+                        }
+                        _ => None,
+                    };
+                    let Some(slot_ref) = slot_ref else {
+                        return Err(TranslateError::malformed(
+                            "a hash-partition key is not a bare slot reference; hashing a \
+                             transformed key would silently split equal keys across senders",
+                        ));
+                    };
+                    columns.push(desc.slot_global_index(
+                        slot_ref.tuple_id,
+                        slot_ref.slot_id,
+                        &translated.row_tuples,
+                    )?);
+                }
+                Some(columns)
+            }
+            _ => None,
+        };
+
         let (extension_urns, extensions) = registry.into_extensions();
         let substrait_plan = Plan {
             // Source the spec version from the `substrait` crate so it tracks the
@@ -316,6 +376,7 @@ impl PlanTranslator {
         Ok(TranslatedPlan {
             plan: substrait_plan,
             output_names,
+            output_partition_columns,
             stream_inputs,
         })
     }
