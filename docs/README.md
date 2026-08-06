@@ -44,9 +44,10 @@ For full build instructions, alternate build types, pre-commit setup, and testin
 Quick start:
 
 ```bash
-git clone --recurse-submodules https://github.com/sirius-db/sirius.git
+git clone --no-recurse-submodules https://github.com/sirius-db/sirius.git
 cd sirius
-pixi run make
+git submodule update --init --depth=1 --jobs 3 duckdb substrait cucascade
+pixi run make TEST_BUILD_TARGET=
 ./build/release/duckdb
 ```
 

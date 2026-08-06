@@ -875,11 +875,8 @@ int main()
     }
 
     {
-      // Sliced STRING views. A head slice has offset 0, so it compresses like a
-      // normal (truncated) column and must roundtrip. A non-zero-offset slice is
-      // rejected up front by the API guard — leaf operators read through
-      // column_view::head() (offset-unaware), so an offset view would compress
-      // the wrong elements; the caller must compact first.
+      // Sliced STRING views. Both head (offset=0) and tail (offset>0) slices must
+      // roundtrip: leaf operators now read through data() which accounts for offset.
       auto stream = cudf::get_default_stream();
       auto full   = make_strings_column({"aa", "bb", "cc", "dd", "ee", "ff", "gg", "hh"},
                                         {true, false, true, true, true, true, true, false},
@@ -887,17 +884,9 @@ int main()
       auto head   = cudf::slice(full->view(), {0, 5});
       roundtrip_once(
         cudf::table_view({head[0]}), "input -> str_split\n", 1, "str_split_head_slice");
-      auto tail  = cudf::slice(full->view(), {3, 8});
-      bool threw = false;
-      try {
-        compress_with_plan(cudf::table_view({tail[0]}),
-                           "input -> str_split\n",
-                           stream,
-                           rmm::mr::get_current_device_resource_ref());
-      } catch (std::exception const&) {
-        threw = true;
-      }
-      expect(threw, "non-zero-offset slice must be rejected by the API guard");
+      auto tail = cudf::slice(full->view(), {3, 8});
+      roundtrip_once(
+        cudf::table_view({tail[0]}), "input -> str_split\n", 1, "str_split_tail_slice");
     }
 
     {

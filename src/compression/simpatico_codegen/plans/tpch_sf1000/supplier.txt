@@ -37,10 +37,9 @@ str_split.chars.chunk_min -> rle -> runs, values
 str_split.chars.chunk_min.values -> rle -> runs, values
 
 ---
-# column: s_acctbal  dtype: t26  ratio: 1.950x  depth: 1
-# comp: 237.62 GB/s  decomp: 377.07 GB/s
-input -> ans
-
+# column: s_acctbal  dtype: t26  ratio: 3.033x  depth: 1
+# comp: 12.02 GB/s  decomp: 25.20 GB/s
+input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
 ---
 # column: s_comment  dtype: str  ratio: 2.730x  depth: 3
 # comp: 21.09 GB/s  decomp: 253.02 GB/s

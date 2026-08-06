@@ -35,6 +35,7 @@
 
 #include <api/compressed_table_io.hpp>
 #include <api/simpatico_codegen.hpp>
+#include <codegen/util/stream_pool.hpp>
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/data/representation_converter.hpp>
 #include <cucascade/memory/memory_space.hpp>
@@ -42,7 +43,6 @@
 #include <log/logging.hpp>
 
 #include <algorithm>
-#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <filesystem>
@@ -57,25 +57,25 @@
 namespace sirius {
 
 namespace {
-std::atomic<int> g_compression_column_threads{1};
-}  // namespace
 
-void set_compression_column_threads(int n) noexcept
+// Thread-local pool of 4 CUDA streams for cross-column decode parallelism.
+// Work is submitted from the calling thread so cuCascade memory-reservation
+// tracking (attached to the calling thread) sees all allocations.
+// 4 is not a configuration parameter — it matches the typical SM occupancy
+// sweet spot for column-parallel decode without thread-spawn overhead.
+simpatico::stream_pool& decode_pool()
 {
-  g_compression_column_threads.store(n, std::memory_order_relaxed);
-}
-int compression_column_threads() noexcept
-{
-  return g_compression_column_threads.load(std::memory_order_relaxed);
+  thread_local simpatico::stream_pool pool;
+  if (pool.streams.empty()) {
+    if (!pool.init(4)) throw std::runtime_error("[compression_converters] stream_pool init failed");
+  }
+  return pool;
 }
 
-namespace {
-
-// Rebind a column's buffers (recursively) to `s` for their eventual async free.
-// The parallel decompress overload allocates on cache-leased internal streams
-// (kept alive process-wide, so this is no longer needed for safety); re-pointing
-// the free stream onto the pipeline stream keeps buffer teardown ordered with the
-// rest of the pipeline's work on `s`, which helps the async pool recycle memory.
+// Rebind a column's buffers (recursively) to `s` for ordered teardown.
+// Pool streams are long-lived (thread-local), but the caller's pipeline stream
+// `s` is what orders the rest of the work downstream — re-pointing frees here
+// ensures deallocation is not racing concurrent pipeline operations on `s`.
 std::unique_ptr<cudf::column> rebind_column_stream(std::unique_ptr<cudf::column> col,
                                                    rmm::cuda_stream_view s)
 {
@@ -129,38 +129,18 @@ std::unique_ptr<cucascade::idata_representation> reconstruct_and_decompress_to_g
     throw std::runtime_error("[compression_converters] reconstruct failed: " + read_error);
   }
 
-  // Parallel per-column decode when >1 (capped at the column count); the
-  // parallel overload owns and syncs its own stream pool, so the result is
-  // resident before it is wrapped against `stream` below.
-  const int n_threads =
-    std::min(compression_column_threads(), static_cast<int>(subset.columns.size()));
-  std::unique_ptr<cudf::table> decompressed;
-  if (n_threads > 1) {
-    // The reconstruct above fetched every compressed leaf buffer to device on
-    // `stream`. The parallel decode runs each column on its own pool stream, so
-    // those reads are NOT ordered after the fetch on `stream`. Without a barrier
-    // a worker's D2H read of a codec frame header (e.g. nvcomp's num_chunks)
-    // races the still-in-flight H2D fetch and reads a garbage size — which then
-    // sizes a std::vector and throws length_error/bad_alloc. Order the fetch
-    // before the pool-stream reads. (The serial path below already runs on
-    // `stream`, so it is stream-ordered and needs no barrier.)
-    stream.synchronize();
-    decompressed =
-      simpatico::decompress(subset, n_threads, rmm::mr::get_current_device_resource_ref());
-  } else {
-    decompressed =
-      simpatico::decompress(subset, stream, rmm::mr::get_current_device_resource_ref());
-  }
-
-  if (n_threads > 1) {
-    // Re-point the parallel result's buffers off the internal cache streams onto
-    // `stream` so teardown is ordered with the rest of the pipeline's work.
-    auto cols = decompressed->release();
-    for (auto& c : cols) {
-      c = rebind_column_stream(std::move(c), stream);
-    }
-    decompressed = std::make_unique<cudf::table>(std::move(cols));
-  }
+  // Decode across 4 pool streams, submitted from the calling thread — no worker
+  // threads are spawned. The H2D fetch above ran on `stream`; sync it first so
+  // pool-stream reads are ordered after all fetched bytes are resident.
+  stream.synchronize();
+  auto& pool = decode_pool();
+  auto decompressed =
+    simpatico::decompress(subset, pool, rmm::mr::get_current_device_resource_ref());
+  // Re-point decoded buffers onto `stream` so pipeline teardown is ordered.
+  auto cols = decompressed->release();
+  for (auto& c : cols)
+    c = rebind_column_stream(std::move(c), stream);
+  decompressed = std::make_unique<cudf::table>(std::move(cols));
 
   const cucascade::memory::memory_space* space =
     (target_memory_space != nullptr) ? target_memory_space : &source.get_memory_space();
@@ -211,21 +191,14 @@ std::unique_ptr<cucascade::idata_representation> decompress_device_to_gpu(
   auto const mr       = rmm::mr::get_current_device_resource_ref();
   // Reconstructs here for a blob staged by the output/downgrade tiers, which defer it;
   // for a pinned chunk the table is already built and this is a plain lookup.
-  auto const& ct      = rep.table(stream, mr);
-  const int n_threads = std::min(compression_column_threads(),
-                                 static_cast<int>(indices ? indices->size() : ct.num_columns()));
-  std::unique_ptr<cudf::table> decompressed;
-  if (n_threads > 1) {
-    decompressed = indices.has_value() ? simpatico::decompress(ct, *indices, n_threads, mr)
-                                       : simpatico::decompress(ct, n_threads, mr);
-    auto cols    = decompressed->release();
-    for (auto& c : cols)
-      c = rebind_column_stream(std::move(c), stream);
-    decompressed = std::make_unique<cudf::table>(std::move(cols));
-  } else {
-    decompressed = indices.has_value() ? simpatico::decompress(ct, *indices, stream, mr)
-                                       : simpatico::decompress(ct, stream, mr);
-  }
+  auto const& ct    = rep.table(stream, mr);
+  auto& pool        = decode_pool();
+  auto decompressed = indices.has_value() ? simpatico::decompress(ct, *indices, pool, mr)
+                                          : simpatico::decompress(ct, pool, mr);
+  auto cols         = decompressed->release();
+  for (auto& c : cols)
+    c = rebind_column_stream(std::move(c), stream);
+  decompressed = std::make_unique<cudf::table>(std::move(cols));
 
   const cucascade::memory::memory_space* space =
     (target_memory_space != nullptr) ? target_memory_space : &source.get_memory_space();
@@ -293,15 +266,10 @@ std::string default_plan_for(cudf::data_type type)
 }
 
 // Compress every column of `view`, each with its own plan, and return the
-// compressed_table. Above one thread this fans the columns across a stream pool
-// exactly as the decompress converters do — one column per worker stream — so a
-// batch's columns encode concurrently instead of queueing behind each other's
-// per-plan-node stream syncs (simpatico's `compress_column` is single-stream by
-// construction and syncs inside every variable-output codec, so cross-column
-// overlap is the only overlap available).
-//
-// Like the parallel decode path, the pool streams do not observe `stream`, so the
-// caller's work that produced `view` has to be ordered before the workers read it.
+// compressed_table. Columns encode one at a time on the caller's `stream`;
+// simpatico's `compress_column` is single-stream by construction and syncs inside
+// every variable-output codec, so cross-column overlap is the only overlap
+// available — but see the note in the body for why it cannot be taken here yet.
 simpatico::compressed_table compress_columns_with_plans(cudf::table_view view,
                                                         std::vector<std::string> plans,
                                                         std::vector<std::string> names,
@@ -309,11 +277,20 @@ simpatico::compressed_table compress_columns_with_plans(cudf::table_view view,
                                                         rmm::device_async_resource_ref mr)
 {
   const auto num_columns = static_cast<std::size_t>(view.num_columns());
-  const int n_threads    = std::min(compression_column_threads(), static_cast<int>(num_columns));
-  if (n_threads > 1) {
-    stream.synchronize();
-    return simpatico::compress_columns(view, plans, n_threads, mr, std::move(names));
-  }
+
+  // Serial, on the caller's stream — deliberately NOT simpatico::compress_columns'
+  // worker-thread overload. cuCascade's reservation state is thread_local
+  // (reservation_aware_resource_adaptor: "Per-thread, per-instance reservation
+  // state"), so a worker thread carries no reservation: its encode buffers bypass
+  // the reservation's headroom and are checked against the raw pool capacity,
+  // throwing LIMIT_EXCEEDED ("not enough capacity to allocate memory") regardless
+  // of how much GPU memory is actually free. Measured on S3/SF300: 36-39 such
+  // failures per run, flat across downgrade triggers 0.8/0.6/0.5.
+  //
+  // The decode paths avoid this via simpatico::stream_pool, whose work is
+  // submitted from the calling thread. There is no equivalent pool overload for
+  // per-column plans (compress_with_plan takes a single whole-table DSL), so
+  // column-parallel compression needs a pool-based compress_columns first.
 
   simpatico::compressed_table out;
   out.columns.reserve(num_columns);
@@ -1155,25 +1132,17 @@ std::unique_ptr<cucascade::idata_representation> decompress_disk_to_gpu(
   }
 
   auto const& indices = rep.selected_indices();
-  const int n_threads = std::min(compression_column_threads(),
-                                 static_cast<int>(indices ? indices->size() : ct.num_columns()));
-  std::unique_ptr<cudf::table> decompressed;
-  if (n_threads > 1) {
-    // The read above filled device buffers on `stream`; the parallel decode runs
-    // on its own pool streams, which are not ordered after it. Barrier first
-    // (mirrors reconstruct_and_decompress_to_gpu).
-    stream.synchronize();
-    decompressed = indices.has_value() ? simpatico::decompress(ct, *indices, n_threads, mr)
-                                       : simpatico::decompress(ct, n_threads, mr);
-    auto cols    = decompressed->release();
-    for (auto& c : cols) {
-      c = rebind_column_stream(std::move(c), stream);
-    }
-    decompressed = std::make_unique<cudf::table>(std::move(cols));
-  } else {
-    decompressed = indices.has_value() ? simpatico::decompress(ct, *indices, stream, mr)
-                                       : simpatico::decompress(ct, stream, mr);
+  // The read above filled device buffers on `stream`; the pool streams are not
+  // ordered after it, so barrier first (mirrors reconstruct_and_decompress_to_gpu).
+  stream.synchronize();
+  auto& pool        = decode_pool();
+  auto decompressed = indices.has_value() ? simpatico::decompress(ct, *indices, pool, mr)
+                                          : simpatico::decompress(ct, pool, mr);
+  auto cols         = decompressed->release();
+  for (auto& c : cols) {
+    c = rebind_column_stream(std::move(c), stream);
   }
+  decompressed = std::make_unique<cudf::table>(std::move(cols));
 
   const cucascade::memory::memory_space* space =
     (target_memory_space != nullptr) ? target_memory_space : &source.get_memory_space();

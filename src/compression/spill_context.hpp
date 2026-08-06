@@ -149,8 +149,7 @@ class scoped_output_compression_context {
 //
 // The spill path runs inside cuCascade converters, which have no access to a
 // SiriusContext, so the relevant compression_config fields are mirrored into
-// process-global state at context initialization (same pattern as
-// set_compression_column_threads).
+// process-global state at context initialization.
 
 /// Mirror the spill-compression fields of compression_config into global state.
 void set_spill_compression_settings(bool enabled,

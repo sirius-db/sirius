@@ -40,8 +40,10 @@ namespace {
 // memory. Issuing the D2H on the same `stream` orders it after the producer.
 inline void d2h_sync(void* dst, const void* src, size_t bytes, rmm::cuda_stream_view stream)
 {
-  cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToHost, stream.value());
-  cudaStreamSynchronize(stream.value());
+  cudaError_t e = cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToHost, stream.value());
+  if (e == cudaSuccess) e = cudaStreamSynchronize(stream.value());
+  if (e != cudaSuccess)
+    throw std::runtime_error(std::string("d2h_sync failed: ") + cudaGetErrorString(e));
 }
 
 // Shared validation for the common case: an exact, ordered set of channel

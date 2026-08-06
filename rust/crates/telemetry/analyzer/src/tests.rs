@@ -639,7 +639,9 @@ fn single_timeline_request(
             entity_filter: EntityFilter {
                 entity_type_name: entity_type_name.map(|name| name.to_string()),
             },
-            application: OperatorFilter { operator_id: None },
+            application: OperatorFilter {
+                operator_ids: vec![],
+            },
             config: TimelineConfig {
                 num_bins: 10,
                 start: 0.0,
@@ -758,7 +760,9 @@ fn list_entities_scoped_to_memory_tier_resource_is_empty() {
                     dir: SortDir::Desc,
                 },
                 page: None,
-                application: OperatorFilter { operator_id: None },
+                application: OperatorFilter {
+                    operator_ids: vec![],
+                },
             },
             app_params: QueryFilter {
                 query_id: fixture.query_id,

@@ -105,9 +105,9 @@ struct spill_test_env {
     builder.set_number_of_gpus(1)
       .set_gpu_usage_limit(512ull << 20)
       .set_reservation_fraction_per_gpu(0.75)
-      .set_per_host_capacity(512ull << 20)
-      .use_host_per_gpu()
-      .set_reservation_fraction_per_host(0.75)
+      .set_per_numa_region_capacity(512ull << 20)
+      .use_gpu_id_as_host_id()
+      .set_reservation_fraction_per_numa_region(0.75)
       .set_disk_mounting_point(0, 2ull << 30, tmp_dir.string());
 
     auto space_configs = builder.build();

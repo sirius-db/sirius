@@ -41,6 +41,7 @@
 #include "telemetry/batch_telemetry.hpp"
 #include "transparent/physical_sirius_execution.hpp"
 #include "transparent/sirius_optimizer_extension.hpp"
+#include "util/duckdb_error_message.hpp"
 
 #include <cudf/utilities/pinned_memory.hpp>
 
@@ -591,7 +592,6 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
       comp.max_compressed_fraction,
       comp.output_compression_min_batch_bytes,
       comp.enable_device_compression_downgrade);
-    sirius::set_compression_column_threads(comp.column_threads);
 
     // Load every offline table plan up front. These used to be read lazily inside
     // pin_table()'s bind, one table at a time — so a query that never pinned
@@ -666,7 +666,7 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
       SIRIUS_LOG_WARN(
         "SiriusContext: host space count ({}) != NUMA node count ({}) — "
         "expected one host space per NUMA domain. Check "
-        "sirius_config apply_defaults (.use_host_per_numa()) or YAML host "
+        "sirius_config apply_defaults (.use_numa_id_as_host_id()) or YAML host "
         "configuration.",
         mgpu05_host_spaces.size(),
         topo.num_numa_nodes);
@@ -1092,6 +1092,63 @@ void SiriusContext::record_transparent_runtime_fallback() noexcept
   transparent_runtime_fallback_count_.fetch_add(1, std::memory_order_relaxed);
 }
 
+SiriusContext::compressed_materialization_stats
+SiriusContext::get_compressed_materialization_stats() const noexcept
+{
+  return compressed_materialization_stats{
+    .scan_columns_narrowed =
+      compressed_materialization_scan_columns_narrowed_count_.load(std::memory_order_relaxed),
+    .scan_columns_restored =
+      compressed_materialization_scan_columns_restored_count_.load(std::memory_order_relaxed),
+    .pin_columns_narrowed =
+      compressed_materialization_pin_columns_narrowed_count_.load(std::memory_order_relaxed),
+    .scan_sidecars_installed =
+      compressed_materialization_scan_sidecars_installed_count_.load(std::memory_order_relaxed),
+    .partition_narrow_columns =
+      compressed_materialization_partition_narrow_columns_count_.load(std::memory_order_relaxed),
+    .scan_narrow_targets_retracted =
+      compressed_materialization_scan_narrow_targets_retracted_count_.load(
+        std::memory_order_relaxed),
+  };
+}
+
+void SiriusContext::record_compressed_materialization_scan_columns_narrowed(uint64_t count) noexcept
+{
+  compressed_materialization_scan_columns_narrowed_count_.fetch_add(count,
+                                                                    std::memory_order_relaxed);
+}
+
+void SiriusContext::record_compressed_materialization_scan_columns_restored(uint64_t count) noexcept
+{
+  compressed_materialization_scan_columns_restored_count_.fetch_add(count,
+                                                                    std::memory_order_relaxed);
+}
+
+void SiriusContext::record_compressed_materialization_pin_columns_narrowed(uint64_t count) noexcept
+{
+  compressed_materialization_pin_columns_narrowed_count_.fetch_add(count,
+                                                                   std::memory_order_relaxed);
+}
+
+void SiriusContext::record_compressed_materialization_scan_sidecar_installed() noexcept
+{
+  compressed_materialization_scan_sidecars_installed_count_.fetch_add(1, std::memory_order_relaxed);
+}
+
+void SiriusContext::record_compressed_materialization_partition_narrow_columns(
+  uint64_t count) noexcept
+{
+  compressed_materialization_partition_narrow_columns_count_.fetch_add(count,
+                                                                       std::memory_order_relaxed);
+}
+
+void SiriusContext::record_compressed_materialization_scan_narrow_targets_retracted(
+  uint64_t count) noexcept
+{
+  compressed_materialization_scan_narrow_targets_retracted_count_.fetch_add(
+    count, std::memory_order_relaxed);
+}
+
 namespace {
 
 bool logical_plan_reads_s3(duckdb::LogicalOperator const& op)
@@ -1157,6 +1214,18 @@ bool duckdb_fallback_enabled(ClientContext& context)
     return setting.GetValue<bool>();
   }
   return true;
+}
+
+bool compressed_materialization_enabled(ClientContext& context)
+{
+  Value setting;
+  if (context.TryGetCurrentSetting("enable_compressed_materialization", setting) &&
+      !setting.IsNull()) {
+    return setting.GetValue<bool>();
+  }
+  // Reached only when the extension option is not registered, which is every caller that runs
+  // without a loaded Sirius extension.
+  return sirius::operator_params{}.enable_compressed_materialization;
 }
 
 void print_cpu_fallback_banner()
@@ -1244,25 +1313,28 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
       if (sirius::references_sirius_owned_s3_parquet(current_query_sql)) { throw; }
       if (!duckdb_fallback_enabled(context)) { throw; }
       record_transparent_fallback();
-      SIRIUS_LOG_INFO("Transparent execution fallback (runtime unavailable): {}", e.what());
+      SIRIUS_LOG_INFO("Transparent execution fallback (runtime unavailable): {}",
+                      sirius::sanitized_message(e));
       return RebindQueryInfo::DO_NOT_REBIND;
     } catch (NotImplementedException& e) {
       // No captured plan to inspect on the replan path; guard on the SQL text so
       // a direct read_parquet('s3://') that fails to re-plan does not CPU-fall-back.
-      throw_if_s3_no_cpu_fallback(false, current_query_sql, e.what());
+      throw_if_s3_no_cpu_fallback(false, current_query_sql, sirius::sanitized_message(e));
       if (!duckdb_fallback_enabled(context)) {
         rethrow_gpu_error_no_fallback(e, "GPU plan generation failed: ");
       }
       record_transparent_fallback();
-      SIRIUS_LOG_INFO("Transparent execution fallback (replan unsupported): {}", e.what());
+      SIRIUS_LOG_INFO("Transparent execution fallback (replan unsupported): {}",
+                      sirius::sanitized_message(e));
       return RebindQueryInfo::DO_NOT_REBIND;
     } catch (std::exception& e) {
-      throw_if_s3_no_cpu_fallback(false, current_query_sql, e.what());
+      throw_if_s3_no_cpu_fallback(false, current_query_sql, sirius::sanitized_message(e));
       if (!duckdb_fallback_enabled(context)) {
         rethrow_gpu_error_no_fallback(e, "GPU plan generation failed: ");
       }
       record_transparent_fallback();
-      SIRIUS_LOG_INFO("Transparent execution fallback (replan failed): {}", e.what());
+      SIRIUS_LOG_INFO("Transparent execution fallback (replan failed): {}",
+                      sirius::sanitized_message(e));
       return RebindQueryInfo::DO_NOT_REBIND;
     }
     if (!logical_plan) { return RebindQueryInfo::DO_NOT_REBIND; }
@@ -1348,22 +1420,24 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
     if (plan_reads_s3) { throw; }
     if (!duckdb_fallback_enabled(context)) { throw; }
     record_transparent_fallback();
-    SIRIUS_LOG_INFO("Transparent execution fallback (runtime unavailable): {}", e.what());
+    SIRIUS_LOG_INFO("Transparent execution fallback (runtime unavailable): {}",
+                    sirius::sanitized_message(e));
     return RebindQueryInfo::DO_NOT_REBIND;
   } catch (NotImplementedException& e) {
-    throw_if_s3_no_cpu_fallback(plan_reads_s3, current_query_sql, e.what());
+    throw_if_s3_no_cpu_fallback(plan_reads_s3, current_query_sql, sirius::sanitized_message(e));
     if (!duckdb_fallback_enabled(context)) {
       rethrow_gpu_error_no_fallback(e, "GPU plan generation failed: ");
     }
     record_transparent_fallback();
-    SIRIUS_LOG_INFO("Transparent execution fallback (unsupported): {}", e.what());
+    SIRIUS_LOG_INFO("Transparent execution fallback (unsupported): {}",
+                    sirius::sanitized_message(e));
   } catch (std::exception& e) {
-    throw_if_s3_no_cpu_fallback(plan_reads_s3, current_query_sql, e.what());
+    throw_if_s3_no_cpu_fallback(plan_reads_s3, current_query_sql, sirius::sanitized_message(e));
     if (!duckdb_fallback_enabled(context)) {
       rethrow_gpu_error_no_fallback(e, "GPU plan generation failed: ");
     }
     record_transparent_fallback();
-    SIRIUS_LOG_INFO("Transparent execution fallback: {}", e.what());
+    SIRIUS_LOG_INFO("Transparent execution fallback: {}", sirius::sanitized_message(e));
   }
 
   return RebindQueryInfo::DO_NOT_REBIND;

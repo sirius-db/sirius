@@ -82,6 +82,12 @@ repos:
           [--line-width  220, --disabled-codes=C0307, --suppress-decorations]
   - repo: local
     hooks:
+      - id: rumdl
+        name: rumdl check --fix
+        entry: pixi run --locked rumdl check --fix
+        language: system
+        types: [markdown]
+        require_serial: true
       - id: check-orphan-tests
         name: check for orphaned test files
         entry: python3 scripts/check_orphan_tests.py

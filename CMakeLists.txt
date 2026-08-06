@@ -205,6 +205,19 @@ if(VCPKG_BUILD AND TARGET CUDA::cudart_static)
       sirius_prefer_static_cudart("${_target}")
     endif()
   endforeach()
+
+  # cucascade's topology discovery gained rmm includes (NUMA capacity
+  # detection), so it needs the same vcpkg-over-toolkit include priority as
+  # sirius's own rapids consumers: without it GCC drops the duplicated vcpkg -I
+  # in favor of the later -isystem, the CUDA toolkit's CCCL wins the search
+  # order, and CUDA 12's bundled CCCL (< 3.3) trips rmm's version check. Only
+  # the object target compiles TUs; the static wrapper just links the objects.
+  if(TARGET cucascade_topology_discovery_objects)
+    set_target_properties(cucascade_topology_discovery_objects
+                          PROPERTIES NO_SYSTEM_FROM_IMPORTED ON)
+    target_include_directories(cucascade_topology_discovery_objects BEFORE
+                               PRIVATE ${_VCPKG_INC})
+  endif()
 endif()
 
 # Rust telemetry instrumentation (C++ FFI via Corrosion)
@@ -231,11 +244,13 @@ set(EXTENSION_SOURCES
     src/compression/spill_context.cpp
     src/planner/column_origin.cpp
     src/config.cpp
+    src/helper/numeric_narrowing.cpp
     src/helper/type_conversions.cpp
     src/debug_utils.cpp
     src/creator/task_creator.cpp
     src/downgrade/downgrade_executor.cpp
     src/expression/aggregate_id.cpp
+    src/expression/ast/constant_range.cpp
     src/expression/ast/node.cpp
     src/expression/ast/utils.cpp
     src/expression/from_duckdb.cpp
@@ -255,6 +270,7 @@ set(EXTENSION_SOURCES
     src/expression_evaluator/specializations/conjunction.cpp
     src/expression_evaluator/specializations/constant.cpp
     src/expression_evaluator/specializations/function.cpp
+    src/expression_evaluator/specializations/narrow_domain.cpp
     src/expression_evaluator/specializations/operator.cpp
     src/expression_evaluator/specializations/reference.cpp
     # Execution primitives (slot-based backpressure / completion tracking)
@@ -356,6 +372,7 @@ set(EXTENSION_SOURCES
     src/planner/sirius_plan_aggregate.cpp
     src/planner/sirius_plan_column_data_get.cpp
     src/planner/sirius_plan_comparison_join.cpp
+    src/planner/sirius_plan_compressed_schema.cpp
     src/planner/sirius_plan_cte.cpp
     src/planner/sirius_plan_delim_get.cpp
     src/planner/sirius_plan_delim_join.cpp
@@ -365,6 +382,7 @@ set(EXTENSION_SOURCES
     src/planner/sirius_plan_filter.cpp
     src/planner/sirius_plan_get.cpp
     src/planner/sirius_plan_limit.cpp
+    src/planner/sirius_plan_narrowing_policy.cpp
     src/planner/sirius_plan_order.cpp
     src/planner/sirius_plan_projection.cpp
     src/planner/sirius_plan_projection_utils.cpp
@@ -631,7 +649,10 @@ set(TEST_SOURCES
     test/cpp/expression_evaluator/test_nonduckdb_frontend_proof.cpp
     test/cpp/helper/test_cudf_utils.cpp
     test/cpp/helper/test_logical_type.cpp
+    test/cpp/helper/test_numeric_narrowing.cpp
     test/cpp/helper/test_transaction_utils.cpp
+    test/cpp/integration/test_compressed_materialization_gate.cpp
+    test/cpp/integration/test_compressed_materialization_partition.cpp
     test/cpp/integration/test_gpu_execution_aggregate_nulls.cpp
     test/cpp/integration/test_gpu_execution_allnull_scan.cpp
     test/cpp/integration/test_gpu_execution_array.cpp
@@ -642,6 +663,7 @@ set(TEST_SOURCES
     test/cpp/integration/test_gpu_execution_multi_format.cpp
     test/cpp/integration/test_gpu_execution_null_safe_join.cpp
     test/cpp/integration/test_gpu_execution_order_nulls.cpp
+    test/cpp/integration/test_parquet_null_predicate_pushdown.cpp
     test/cpp/integration/test_query_lifecycle_slot.cpp
     test/cpp/integration/test_gpu_execution_tpcds_nulls.cpp
     test/cpp/integration/test_gpu_execution_tpch.cpp
@@ -706,6 +728,7 @@ set(TEST_SOURCES
     test/cpp/operator/test_dynamic_filter_publisher.cpp
     test/cpp/operator/test_sirius_dynamic_filter_mgpu.cpp
     test/cpp/parallel/test_task_executor.cpp
+    test/cpp/planner/test_compressed_schema_propagation.cpp
     test/cpp/planner/test_distinct_hash_join_detection.cpp
     test/cpp/planner/test_duckdb_join_filter_candidate_adapter.cpp
     test/cpp/planner/test_dynamic_filter_router.cpp
@@ -715,6 +738,7 @@ set(TEST_SOURCES
     test/cpp/planner/test_sirius_read_parquet_scan.cpp
     test/cpp/planner/test_query_id.cpp
     test/cpp/planner/test_query_index.cpp
+    test/cpp/planner/test_tier_narrowing_policy.cpp
     test/cpp/pipeline/test_batch_lock_utils.cpp
     test/cpp/pipeline/test_gpu_pipeline_executor.cpp
     test/cpp/pipeline/test_oom_reschedule.cpp
@@ -748,6 +772,7 @@ set(TEST_SOURCES
     test/cpp/scan/test_owning_table_view.cpp
     test/cpp/scan/test_parquet_schema_mapping.cpp
     test/cpp/scan/test_parquet_scan_sizing.cpp
+    test/cpp/scan/test_scan_schema_normalization.cpp
     test/cpp/sirius_extension/test_sirius_read_parquet_cardinality.cpp
     test/cpp/sql/test_sirius_sql_rewrite.cpp
     test/cpp/telemetry/test_telemetry_context.cpp

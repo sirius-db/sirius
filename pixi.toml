@@ -39,24 +39,32 @@ libprotobuf = "*"
 rust = "*"
 cuda-nvrtc-dev = "*"
 
+[pypi-dependencies]
+rumdl = "==0.2.44"
+
 [feature.dev-libs.dependencies]
 librmm = "*"
 libcurand-dev = "*"
 yaml-cpp = "*"
 libabseil = "*"
-duckdb = "=1.5.4"
+duckdb = "=1.5.5"
 spdlog = "1.8.*"
 sqlite = "3.*"
 rust-src = "*"
 liburing = "*"
 openssl = "*"
 libcurl = "*"
+pnpm = "*"
 # Go toolchain (with cgo) to build the patched testcontainers-native bridge used
 # by the C++ S3 integration tests (fetched at configure time; see
 # cmake/testcontainers_native.cmake). Upstream go.mod requires >=1.25.
 go-cgo = ">=1.25"
 
 [tasks]
+
+[tasks.clion-env]
+description = "Generate the Pixi environment file used by CLion."
+cmd = "mkdir -p build && pixi shell-hook -s bash > build/sirius_pixi_env_for_clion.sh"
 
 [tasks.quent]
 description = "Run the Quent telemetry UI server."
