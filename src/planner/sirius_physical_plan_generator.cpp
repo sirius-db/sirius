@@ -61,12 +61,15 @@
 #include "op/sirius_physical_ungrouped_aggregate_merge.hpp"
 #include "planner/sirius_plan_compressed_schema.hpp"
 #include "planner/sirius_plan_projection_utils.hpp"
+#include "planner/substrait_scan_ranges.hpp"
+#include "sirius/exception.hpp"
 #include "sirius_config.hpp"
 #include "sirius_context.hpp"
 
 #include <cudf/cudf_utils.hpp>
 
 #include <numeric>
+#include <set>
 #include <utility>
 
 namespace sirius::planner {
@@ -139,10 +142,39 @@ void wrap_above(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot,
   slot          = std::forward<WrapperFactory>(factory)(std::move(original));
 }
 
+//! Attach the plan-carried byte ranges to the scan's files. Consumes (claims) each file's
+//! ranges from the per-plan registry; a file with N ranges expands to N entries whether the
+//! bind deduplicated the repeated path or kept every occurrence — the ranges are disjoint, so
+//! only their union per file matters, not which occurrence carries which range.
+void attach_byte_ranges(sirius::op::scan::parquet_ingestible_table_info& info,
+                        sirius::planner::scan_byte_ranges_state& ranges)
+{
+  std::vector<std::string> paths;
+  std::vector<std::pair<std::uint64_t, std::uint64_t>> file_ranges;
+  std::set<std::string> expanded;
+  for (auto const& path : info.resolved_file_paths) {
+    if (!ranges.has(path)) {
+      paths.push_back(path);
+      file_ranges.emplace_back(0, 0);
+      continue;
+    }
+    // Repeated occurrences of a ranged path collapse into the one expansion below.
+    if (!expanded.insert(path).second) { continue; }
+    for (auto const& range : ranges.claim(path)) {
+      paths.push_back(path);
+      file_ranges.push_back(range);
+    }
+  }
+  info.resolved_file_paths  = std::move(paths);
+  info.resolved_file_ranges = std::move(file_ranges);
+}
+
 //! Build a `parquet_ingestible_table_info` from a TABLE_SCAN. Destructive: `table_filters`
 //! is moved out of the scan.
 std::unique_ptr<sirius::op::scan::parquet_ingestible_table_info> build_parquet_table_info(
-  sirius::op::sirius_physical_table_scan& scan_op, const sirius::operator_params& op_params)
+  sirius::op::sirius_physical_table_scan& scan_op,
+  const sirius::operator_params& op_params,
+  duckdb::ClientContext& context)
 {
   auto info                = std::make_unique<sirius::op::scan::parquet_ingestible_table_info>();
   info->returned_types     = scan_op.returned_types;
@@ -152,6 +184,8 @@ std::unique_ptr<sirius::op::scan::parquet_ingestible_table_info> build_parquet_t
   info->table_filters      = std::move(scan_op.table_filters);
   auto resolved_file_paths = resolve_parquet_scan_file_paths(
     scan_op.function.name, scan_op.bind_data.get(), scan_op.parameters);
+  auto byte_ranges = context.registered_state->Get<sirius::planner::scan_byte_ranges_state>(
+    sirius::planner::scan_byte_ranges_state::kStateKey);
   if (scan_op.function.name == "sirius_read_parquet") {
     if (resolved_file_paths.empty()) {
       throw std::runtime_error(
@@ -159,6 +193,12 @@ std::unique_ptr<sirius::op::scan::parquet_ingestible_table_info> build_parquet_t
         "has no URI parameter");
     }
     info->resolved_file_paths = std::move(resolved_file_paths);
+    // The S3 read path has its own footer/prefetch lifecycle that byte ranges were never
+    // tested against; refuse rather than risk a quiet whole-file read.
+    if (byte_ranges && byte_ranges->has(info->resolved_file_paths.front())) {
+      throw sirius::invalid_input_exception(
+        "byte-range splits are not supported on the sirius_read_parquet (S3) path");
+    }
   } else {
     if (resolved_file_paths.empty()) {
       throw std::runtime_error(
@@ -167,6 +207,7 @@ std::unique_ptr<sirius::op::scan::parquet_ingestible_table_info> build_parquet_t
     info->resolved_file_paths = std::move(resolved_file_paths);
     auto const& bind_data     = scan_op.bind_data->Cast<duckdb::MultiFileBindData>();
     info->partition_indices   = bind_data.reader_bind.hive_partitioning_indexes;
+    if (byte_ranges) { attach_byte_ranges(*info, *byte_ranges); }
   }
   // `scan_output_arity` drives the provider's expected column count — without it the runtime
   // task skips the hive-partition columns it should inject post-read, mis-sizing the output.
@@ -359,7 +400,7 @@ void wrap_table_scan_source(
   } else if (fn == "parquet_scan" || fn == "read_parquet" || fn == "sirius_read_parquet") {
     // The parquet ingestible consumes AST filters for read-time row-group pruning, so its wrapped
     // DYNAMIC_FILTER applies membership masks only.
-    leaf = make_gpu_scan_leaf(build_parquet_table_info(scan, op_params),
+    leaf = make_gpu_scan_leaf(build_parquet_table_info(scan, op_params, context),
                               scan,
                               op_params,
                               sirius::op::scan::dynamic_filter_apply_mode::membership_masks_only,
@@ -1043,6 +1084,13 @@ sirius_physical_plan_generator::create_plan(duckdb::unique_ptr<duckdb::LogicalOp
   // `_parent_op` from the final tree for the tree-parent-lookup wiring.
   insert_gpu_pipeline_operators(plan);
   set_parent_ops(*plan, /*parent=*/nullptr);
+
+  // A plan-carried byte range that no scan consumed would degrade to a whole-file read and
+  // duplicate rows across splits — fail here, before anything executes.
+  if (auto byte_ranges = context.registered_state->Get<sirius::planner::scan_byte_ranges_state>(
+        sirius::planner::scan_byte_ranges_state::kStateKey)) {
+    byte_ranges->assert_all_consumed();
+  }
 
   return plan;
 }
