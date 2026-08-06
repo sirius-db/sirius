@@ -349,6 +349,20 @@ class parquet_gpu_ingestible : public gpu_ingestible {
   // What decode_predicate_candidates() advertises: primary index → constant set.
   std::unordered_map<std::size_t, std::vector<std::string>> _decode_predicate_candidates;
 
+  // The part of _duckdb_filter_expression safe to push into the reader: the
+  // full predicate minus any top-level AND conjunct that cuDF's row-group
+  // stats filter cannot handle (a null test, or a bare column reference used
+  // as the predicate). Surviving conjuncts still prune, so
+  // `v IS NULL AND id > 3000` keeps pruning on `id`. Shares the full
+  // expression when nothing needs stripping; null when none survive.
+  //
+  // Separate from disable_filter_pushdown, which also suppresses dynamic join
+  // filters — those carry no null predicate and stay safe to push down.
+  std::shared_ptr<duckdb::Expression> _static_pushdown_expression;
+  // False when the above is a strict subset: the reader has then only
+  // partially filtered, so the scan must NOT be reported ROW_FILTERED or the
+  // dropped conjuncts would never be applied.
+  bool _static_pushdown_is_complete = true;
   std::vector<std::string> _file_paths;
 
   // Per-file metadata-scan cursor. next_split_provider hands out one file index

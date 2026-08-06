@@ -20,15 +20,45 @@
 #include "log/logging.hpp"
 #include "yaml_reader.hpp"
 
+#include <cuda_runtime_api.h>
+
 #include <cucascade/memory/config.hpp>
 #include <cucascade/memory/reservation_manager_configurator.hpp>
 #include <yaml-cpp/yaml.h>
 
+#include <algorithm>
 #include <exception>
 #include <variant>
 #include <vector>
 
 namespace sirius {
+
+namespace config {
+
+uint64_t derived_default_batch_size()
+{
+  // cudaGetDeviceCount/Properties honor CUDA_VISIBLE_DEVICES and do not create a context.
+  static uint64_t const value = [] {
+    int device_count = 0;
+    if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count <= 0) {
+      return DEFAULT_BATCH_SIZE;
+    }
+    uint64_t min_total = 0;
+    for (int id = 0; id < device_count; ++id) {
+      cudaDeviceProp prop{};
+      if (cudaGetDeviceProperties(&prop, id) != cudaSuccess) { continue; }
+      auto const total = static_cast<uint64_t>(prop.totalGlobalMem);
+      min_total        = min_total == 0 ? total : std::min(min_total, total);
+    }
+    if (min_total == 0) { return DEFAULT_BATCH_SIZE; }
+    constexpr uint64_t min_batch = 512ULL * 1024 * 1024;       // 512 MiB floor
+    constexpr uint64_t max_batch = 5ULL * 1024 * 1024 * 1024;  // 5 GiB ceiling
+    return std::clamp(min_total / 40, min_batch, max_batch);   // 2.5%
+  }();
+  return value;
+}
+
+}  // namespace config
 
 // ================ from_yaml for external types ================= //
 
@@ -241,7 +271,8 @@ static void from_yaml(const YAML::Node& node, exec::downgrade_executor_config& o
 namespace {
 
 struct topology {
-  std::variant<size_t, std::vector<int>> num_gpus_or_gpu_ids{size_t{1}};
+  /// 0 = auto: use every GPU visible to topology discovery (CUDA_VISIBLE_DEVICES-aware).
+  std::variant<size_t, std::vector<int>> num_gpus_or_gpu_ids{size_t{0}};
 
   static void from_yaml(const YAML::Node& node, topology& opt)
   {
@@ -252,7 +283,7 @@ struct topology {
     if (!ids.empty()) {
       opt.num_gpus_or_gpu_ids = std::move(ids);
     } else {
-      size_t n = 1;
+      size_t n = 0;
       r.optional("num_gpus", n);
       opt.num_gpus_or_gpu_ids = n;
     }
@@ -260,11 +291,19 @@ struct topology {
   }
 };
 
+/// Resolve the configured GPU count: explicit values pass through; 0 (auto) means every
+/// discovered GPU, or 1 when discovery found none (it leaves the ctor default in place).
+size_t resolve_num_gpus(size_t requested, const cucascade::memory::system_topology_info& hw)
+{
+  if (requested > 0) { return requested; }
+  return hw.num_gpus > 0 ? static_cast<size_t>(hw.num_gpus) : size_t{1};
+}
+
 struct gpu_mem_config {
   std::variant<double, std::uint64_t> usage_limit{0.95};
-  std::variant<double, std::uint64_t> reservation_limit{0.9};
-  double downgrade_trigger_fraction{1.0};
-  double downgrade_stop_fraction{0.7};
+  std::variant<double, std::uint64_t> reservation_limit{1.0};
+  double downgrade_trigger_fraction{0.8};
+  double downgrade_stop_fraction{0.6};
   bool track_per_stream_reservation{false};
 
   static void from_yaml(const YAML::Node& node, gpu_mem_config& opt)
@@ -280,7 +319,7 @@ struct gpu_mem_config {
                                   : std::variant<double, std::uint64_t>{usage_frac};
     // reservation_limit: fraction or absolute bytes
     std::optional<std::uint64_t> res_bytes;
-    double res_frac = 0.9;
+    double res_frac = 1.0;
     r.optional("reservation_limit_bytes", yaml::bytes(res_bytes));
     r.optional("reservation_limit_fraction", res_frac, yaml::fraction<double>{});
     opt.reservation_limit = res_bytes ? std::variant<double, std::uint64_t>{*res_bytes}
@@ -310,10 +349,13 @@ struct gpu_mem_config {
 };
 
 struct host_mem_config {
-  std::uint64_t numa_region_capacity_bytes = 8UL << 30;  // 8GB per NUMA node
-  std::variant<double, std::uint64_t> reservation_limit{0.9};
-  double downgrade_trigger_fraction{0.8};
-  double downgrade_stop_fraction{0.7};
+  // fraction of each backing NUMA node's total RAM, or absolute bytes per NUMA node
+  std::variant<double, std::uint64_t> capacity{0.9};
+  std::variant<double, std::uint64_t> reservation_limit{1.0};
+  // stop < trigger < reservation_limit, like the GPU tier. Host->disk eviction still
+  // needs a configured downgrade_root_dirs; without one the executor warns and skips.
+  double downgrade_trigger_fraction{0.9};
+  double downgrade_stop_fraction{0.8};
   std::size_t block_size{cucascade::memory::default_block_size};
   std::size_t pool_size{cucascade::memory::default_pool_size};
   std::size_t initial_number_pools{cucascade::memory::default_initial_number_pools};
@@ -321,9 +363,22 @@ struct host_mem_config {
   static void from_yaml(const YAML::Node& node, host_mem_config& opt)
   {
     yaml::reader r(node, "memory.host");
-    r.optional("capacity_bytes", yaml::bytes(opt.numa_region_capacity_bytes));
+    // capacity: fraction of node RAM (double) or absolute bytes per node — mutually exclusive keys
+    std::optional<std::uint64_t> cap_bytes;
+    std::optional<double> cap_frac;
+    r.optional("capacity_bytes", yaml::bytes(cap_bytes));
+    r.optional("capacity_fraction", cap_frac);
+    if (cap_frac && !(*cap_frac > 0.0 && *cap_frac <= 1.0)) {
+      throw std::runtime_error("memory.host.capacity_fraction: must be in (0.0, 1.0], got " +
+                               std::to_string(*cap_frac));
+    }
+    if (cap_bytes) {
+      opt.capacity = *cap_bytes;
+    } else if (cap_frac) {
+      opt.capacity = *cap_frac;
+    }
     std::optional<std::uint64_t> res_bytes;
-    double res_frac = 0.9;
+    double res_frac = 1.0;
     r.optional("reservation_limit_bytes", yaml::bytes(res_bytes));
     r.optional("reservation_limit_fraction", res_frac, yaml::fraction<double>{});
     opt.reservation_limit = res_bytes ? std::variant<double, std::uint64_t>{*res_bytes}
@@ -344,14 +399,19 @@ struct host_mem_config {
     // SiriusContext::initialize() which asserts host_spaces.size() ==
     // topology.num_numa_nodes on the default path. YAML configs may override
     // by explicitly setting per-space numa_id.
-    builder.use_host_per_numa();
+    builder.use_numa_id_as_host_id();
     if (std::holds_alternative<double>(reservation_limit)) {
-      builder.set_reservation_fraction_per_host(std::get<double>(reservation_limit));
+      builder.set_reservation_fraction_per_numa_region(std::get<double>(reservation_limit));
     } else {
-      builder.set_reservation_limit_per_host(std::get<std::uint64_t>(reservation_limit));
+      builder.set_reservation_limit_per_numa_region(std::get<std::uint64_t>(reservation_limit));
     }
-    builder.set_downgrade_fractions_per_host(downgrade_trigger_fraction, downgrade_stop_fraction);
-    builder.set_per_host_capacity(numa_region_capacity_bytes);
+    builder.set_downgrade_fractions_per_numa_region(downgrade_trigger_fraction,
+                                                    downgrade_stop_fraction);
+    if (std::holds_alternative<double>(capacity)) {
+      builder.set_usage_limit_ratio_per_numa_region(std::get<double>(capacity));
+    } else {
+      builder.set_per_numa_region_capacity(std::get<std::uint64_t>(capacity));
+    }
     // NOTE on argument order: cucascade's set_host_pool_features has confusingly-named
     // parameters (chunk_size, block_size, initial_block_count) that it internally remaps onto
     // host_memory_space_config::{block_size, pool_size, initial_number_pools} (see
@@ -415,7 +475,8 @@ void sirius_config::apply_defaults()
   disk_mem_config disk_cfg;
 
   cucascade::memory::reservation_manager_configurator builder;
-  builder.set_number_of_gpus(std::get<size_t>(topo.num_gpus_or_gpu_ids));
+  builder.set_number_of_gpus(
+    resolve_num_gpus(std::get<size_t>(topo.num_gpus_or_gpu_ids), _hw_topology));
   gpu_cfg.setup_configurator(builder);
   host_cfg.setup_configurator(builder);
   disk_cfg.setup_configurator(builder);
@@ -508,7 +569,8 @@ void sirius_config::load_from_file(const std::filesystem::path& config_path)
     if (using_configurator) {
       cucascade::memory::reservation_manager_configurator builder;
       if (std::holds_alternative<size_t>(topo.num_gpus_or_gpu_ids)) {
-        builder.set_number_of_gpus(std::get<size_t>(topo.num_gpus_or_gpu_ids));
+        builder.set_number_of_gpus(
+          resolve_num_gpus(std::get<size_t>(topo.num_gpus_or_gpu_ids), _hw_topology));
       } else {
         const auto& gpu_ids = std::get<std::vector<int>>(topo.num_gpus_or_gpu_ids);
         builder.set_gpu_ids(gpu_ids);

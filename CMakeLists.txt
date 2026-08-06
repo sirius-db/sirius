@@ -205,6 +205,19 @@ if(VCPKG_BUILD AND TARGET CUDA::cudart_static)
       sirius_prefer_static_cudart("${_target}")
     endif()
   endforeach()
+
+  # cucascade's topology discovery gained rmm includes (NUMA capacity
+  # detection), so it needs the same vcpkg-over-toolkit include priority as
+  # sirius's own rapids consumers: without it GCC drops the duplicated vcpkg -I
+  # in favor of the later -isystem, the CUDA toolkit's CCCL wins the search
+  # order, and CUDA 12's bundled CCCL (< 3.3) trips rmm's version check. Only
+  # the object target compiles TUs; the static wrapper just links the objects.
+  if(TARGET cucascade_topology_discovery_objects)
+    set_target_properties(cucascade_topology_discovery_objects
+                          PROPERTIES NO_SYSTEM_FROM_IMPORTED ON)
+    target_include_directories(cucascade_topology_discovery_objects BEFORE
+                               PRIVATE ${_VCPKG_INC})
+  endif()
 endif()
 
 # Rust telemetry instrumentation (C++ FFI via Corrosion)
@@ -645,6 +658,7 @@ set(TEST_SOURCES
     test/cpp/integration/test_gpu_execution_multi_format.cpp
     test/cpp/integration/test_gpu_execution_null_safe_join.cpp
     test/cpp/integration/test_gpu_execution_order_nulls.cpp
+    test/cpp/integration/test_parquet_null_predicate_pushdown.cpp
     test/cpp/integration/test_query_lifecycle_slot.cpp
     test/cpp/integration/test_gpu_execution_tpcds_nulls.cpp
     test/cpp/integration/test_gpu_execution_tpch.cpp
