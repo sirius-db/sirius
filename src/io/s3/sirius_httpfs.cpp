@@ -57,13 +57,16 @@ class sirius_httpfs_file_handle : public duckdb::FileHandle {
                             std::string path,
                             duckdb::FileOpenFlags flags,
                             std::shared_ptr<cucascade::io::datasource> datasource)
-    : duckdb::FileHandle(fs, std::move(path), flags), datasource_(std::move(datasource))
+    : duckdb::FileHandle(fs, std::move(path), flags),
+      datasource_(std::move(datasource)),
+      version_tag_(datasource_->get_io_object().validation_tag())
   {
   }
 
   void Close() override {}
 
   std::shared_ptr<cucascade::io::datasource> datasource_;
+  std::string version_tag_;
   duckdb::idx_t cursor_{0};
 };
 
@@ -323,6 +326,11 @@ int64_t sirius_httpfs::GetFileSize(duckdb::FileHandle& handle)
 duckdb::timestamp_t sirius_httpfs::GetLastModifiedTime(duckdb::FileHandle& /*handle*/)
 {
   return duckdb::timestamp_t(0);
+}
+
+std::string sirius_httpfs::GetVersionTag(duckdb::FileHandle& handle)
+{
+  return as_httpfs_handle(handle).version_tag_;
 }
 
 duckdb::vector<duckdb::OpenFileInfo> sirius_httpfs::Glob(const std::string& path,

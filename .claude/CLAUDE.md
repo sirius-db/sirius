@@ -40,7 +40,7 @@ pixi run -e duckdb-python build-duckdb-python
 **Super Sirius** is the live engine: namespace `sirius`, source under `src/op/` (operators),
 `src/planner/` (plan builders + `sirius_physical_plan_generator.cpp`), `src/pipeline/`,
 `src/cuda/` (GPU kernels). **Read `docs/super-sirius/` before modifying Super Sirius code** —
-see its [README](docs/super-sirius/README.md) for reading order.
+see its [README](../docs/super-sirius/README.md) for reading order.
 
 **Everything under `src/legacy/` is the dead `gpu_processing` path — do not modify it.** All new
 work targets Super Sirius. Memory spilling / CPU fallback is handled by the downgrade executor

@@ -16,10 +16,9 @@ delta.differences -> deflate
 input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
 
 ---
-# column: ps_supplycost  dtype: t26  ratio: 2.532x  depth: 1
-# comp: 423.53 GB/s  decomp: 587.18 GB/s
-input -> ans
-
+# column: ps_supplycost  dtype: t26  ratio: 3.742x  depth: 1
+# comp: 100.00 GB/s  decomp: 267.09 GB/s
+input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
 ---
 # column: ps_comment  dtype: str  ratio: 1.019x  depth: 3
 # note: chars stay raw — its ~12GB buffer compresses to >INT32_MAX bytes, which

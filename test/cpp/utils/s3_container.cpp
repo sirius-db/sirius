@@ -61,8 +61,10 @@ extern "C" {
 #include <ctime>
 #include <filesystem>
 #include <iostream>
+#include <memory>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <thread>
 #include <utility>
@@ -740,6 +742,46 @@ bool ensure_s3_container_env()
     g_state = 2;  // best-effort: skip
     return false;
   }
+}
+
+bool put_s3_container_object(std::string_view key, std::span<std::uint8_t const> bytes)
+{
+  if (g_state != 1) { return false; }
+
+  auto endpoint         = env_or("SIRIUS_TEST_S3_ENDPOINT");
+  auto const scheme_end = endpoint.find("://");
+  if (scheme_end == std::string::npos) {
+    throw std::runtime_error("managed MinIO endpoint has no URI scheme");
+  }
+  auto const scheme = endpoint.substr(0, scheme_end);
+  auto authority    = endpoint.substr(scheme_end + 3);
+  if (scheme != "http" || authority.empty() || authority.find('/') != std::string::npos) {
+    throw std::runtime_error("managed MinIO object PUT requires the HTTP endpoint");
+  }
+
+  std::unique_ptr<std::FILE, decltype(&std::fclose)> body(std::tmpfile(), &std::fclose);
+  if (!body) { throw std::runtime_error("cannot create temporary S3 upload body"); }
+  auto const written = std::fwrite(bytes.data(), 1, bytes.size(), body.get());
+  if (written != bytes.size()) {
+    throw std::runtime_error("cannot write temporary S3 upload body");
+  }
+  std::rewind(body.get());
+
+  minio_instance instance;
+  instance.endpoint  = std::move(endpoint);
+  instance.authority = std::move(authority);
+  auto const bucket  = env_or("SIRIUS_TEST_S3_BUCKET", kBucket);
+  auto const code    = s3_put(instance,
+                           scheme,
+                           uri_path_for(bucket, std::string{key}),
+                           body.get(),
+                           static_cast<std::int64_t>(bytes.size()),
+                           std::nullopt);
+  if (!(code == 200 || code == 204)) {
+    throw std::runtime_error("managed MinIO object PUT failed for '" + std::string{key} +
+                             "' (HTTP " + std::to_string(code) + ")");
+  }
+  return true;
 }
 
 void shutdown_s3_container_env()

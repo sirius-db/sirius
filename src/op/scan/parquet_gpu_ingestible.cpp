@@ -49,6 +49,8 @@
 
 // duckdb
 #include <duckdb/common/hive_partitioning.hpp>
+#include <duckdb/planner/expression/bound_conjunction_expression.hpp>
+#include <duckdb/planner/expression_iterator.hpp>
 
 // uring_reactor MUST be included last among sirius headers: liburing.h,
 // pulled in transitively, defines a BLOCK_SIZE macro that collides with the
@@ -71,6 +73,82 @@
 namespace sirius::op::scan {
 
 namespace {
+
+/// True when @p expr contains an IS NULL / IS NOT NULL predicate anywhere.
+///
+/// cuDF's row-group statistics filter rewrites every column reference into that
+/// row group's (min, max) pair. A null test has no min/max analogue — only
+/// null_count answers it — and handing one to filter_row_groups_with_stats
+/// faults rather than merely mis-pruning.
+///
+/// IS NOT NULL counts: it lowers to IS_NULL + NOT in the cuDF AST, and
+/// convert_table_filters_to_expression only drops it when it is a column's
+/// top-level filter, so one nested in a conjunction still reaches here.
+bool expression_has_null_predicate(duckdb::Expression const& expr)
+{
+  auto const expr_type = expr.GetExpressionType();
+  if (expr_type == duckdb::ExpressionType::OPERATOR_IS_NULL ||
+      expr_type == duckdb::ExpressionType::OPERATOR_IS_NOT_NULL) {
+    return true;
+  }
+  bool found = false;
+  duckdb::ExpressionIterator::EnumerateChildren(expr, [&found](duckdb::Expression const& child) {
+    if (!found) { found = expression_has_null_predicate(child); }
+  });
+  return found;
+}
+
+/// True when @p expr cannot be handed to cuDF's row-group statistics filter as
+/// a predicate in its own right.
+///
+/// Two shapes fault there, both because the stats rewrite replaces each column
+/// reference with that row group's (min, max) pair:
+///
+///   - a null test, which has no min/max analogue (only null_count answers it);
+///   - a BARE column reference used directly as the predicate, e.g.
+///     `WHERE flag` on a BOOLEAN column, where the rewrite leaves a pair of
+///     stats columns with no comparison to evaluate over them.
+///
+/// The bare-reference case is only unsafe when the reference IS the predicate.
+/// `WHERE flag AND v > 5000` prunes fine, as do `NOT flag`, IN and BETWEEN, so
+/// this deliberately does not recurse — over-rejecting would forfeit pruning
+/// that demonstrably works.
+bool is_unsafe_for_stats_filter(duckdb::Expression const& expr)
+{
+  return expr.GetExpressionType() == duckdb::ExpressionType::BOUND_REF ||
+         expression_has_null_predicate(expr);
+}
+
+/// @p expr minus every top-level AND conjunct the stats filter cannot handle;
+/// nullptr when none survive. Only meaningful when @p expr is itself unsafe —
+/// callers check that first.
+///
+/// Sound because pruning on part of a conjunction can only keep extra row
+/// groups, never drop wanted ones: nothing failing `id > 3000` can satisfy
+/// `v IS NULL AND id > 3000`. The caller must still apply the full predicate
+/// post-decode.
+///
+/// Only the top level is split: a compound conjunct (an OR, or a nested AND)
+/// containing anything unsafe is dropped whole. Conservative, not wrong.
+duckdb::unique_ptr<duckdb::Expression> stats_safe_conjuncts(duckdb::Expression const& expr)
+{
+  if (expr.GetExpressionType() != duckdb::ExpressionType::CONJUNCTION_AND) { return nullptr; }
+
+  auto const& conjunction = expr.Cast<duckdb::BoundConjunctionExpression>();
+  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> kept;
+  for (auto const& child : conjunction.children) {
+    if (!is_unsafe_for_stats_filter(*child)) { kept.push_back(child->Copy()); }
+  }
+  if (kept.empty()) { return nullptr; }
+  if (kept.size() == 1) { return std::move(kept[0]); }
+
+  auto out =
+    duckdb::make_uniq<duckdb::BoundConjunctionExpression>(duckdb::ExpressionType::CONJUNCTION_AND);
+  for (auto& child : kept) {
+    out->children.push_back(std::move(child));
+  }
+  return out;
+}
 
 bool has_uri_scheme(std::string const& p) { return p.find("://") != std::string::npos; }
 
@@ -384,6 +462,23 @@ parquet_gpu_ingestible::parquet_gpu_ingestible(std::unique_ptr<parquet_ingestibl
           duckdb_expression->ToString());
       }
       _duckdb_filter_expression = std::move(duckdb_expression);
+
+      if (!is_unsafe_for_stats_filter(*_duckdb_filter_expression)) {
+        // Nothing to strip — push the whole predicate, sharing it rather than
+        // copying.
+        _static_pushdown_expression = _duckdb_filter_expression;
+      } else {
+        _static_pushdown_is_complete = false;
+        _static_pushdown_expression  = stats_safe_conjuncts(*_duckdb_filter_expression);
+        // Whatever survives must itself be safe, or the crash returns.
+        D_ASSERT(!_static_pushdown_expression ||
+                 !is_unsafe_for_stats_filter(*_static_pushdown_expression));
+        SIRIUS_LOG_DEBUG(
+          "[parquet_gpu_ingestible] Predicate is unsupported by the row-group stats filter; "
+          "pushing only the safe conjuncts ({}), full predicate applied post-decode: {}",
+          _static_pushdown_expression ? _static_pushdown_expression->ToString() : "none",
+          _duckdb_filter_expression->ToString());
+      }
     }
   }
 
@@ -536,13 +631,14 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
 
   // Translate the filter for reader-side row-group pruning unless disabled. The
   // translated cuDF AST must outlive filter_row_groups_with_stats below.
+  // Pushes _static_pushdown_expression, not the full predicate.
   std::optional<gpu_expression_translator::translated_expression> ast_expression = std::nullopt;
-  if (_duckdb_filter_expression && !disable_filter_pushdown) {
+  if (_static_pushdown_expression && !disable_filter_pushdown) {
     auto name_resolver = [this](duckdb::idx_t ref_index) -> std::string {
       return _plan->batch_column_name(ref_index);
     };
     gpu_expression_translator translator(stream, cudf::get_current_device_resource_ref());
-    auto sirius_filter_ast = sirius::ast::from_duckdb(*_duckdb_filter_expression);
+    auto sirius_filter_ast = sirius::ast::from_duckdb(*_static_pushdown_expression);
     D_ASSERT(sirius_filter_ast != nullptr);
     ast_expression = translator.translate_expression_with_names(*sirius_filter_ast, name_resolver);
     if (ast_expression) { opts.set_filter(ast_expression->back()); }
@@ -779,8 +875,9 @@ filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
     std::nullopt;
   cudf::ast::expression const* reader_filter_root = nullptr;
 
-  if (_duckdb_filter_expression && !split.disable_filter_pushdown && !all_slices_pruned) {
-    auto sirius_filter_ast = sirius::ast::from_duckdb(*_duckdb_filter_expression);
+  // Null-free conjuncts only; the dynamic-filter block below is unaffected.
+  if (_static_pushdown_expression && !split.disable_filter_pushdown && !all_slices_pruned) {
+    auto sirius_filter_ast = sirius::ast::from_duckdb(*_static_pushdown_expression);
     D_ASSERT(sirius_filter_ast != nullptr);
     auto name_resolver = [plan = split.plan](duckdb::idx_t ref_index) -> std::string {
       return plan->batch_column_name(ref_index);
@@ -821,9 +918,15 @@ filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
   // inject the partition columns and project to the output layout, so the
   // result is fully ROW_FILTERED_AND_PROJECTED and post_filter_and_project is
   // skipped. `sirius_filter_ast` must outlive `exec` — the evaluator borrows it.
+
+  // The reader discharged the row filter only if it pushed the WHOLE predicate.
+  // After a partial push the dropped conjuncts still have to be applied below.
+  bool const reader_applied_full_filter =
+    ast_expression.has_value() && _static_pushdown_is_complete;
+
   if (_plan->has_partitions()) {
     owning_table_view view{std::move(table)};
-    if (!ast_expression.has_value() && _duckdb_filter_expression) {
+    if (!reader_applied_full_filter && _duckdb_filter_expression) {
       auto sirius_filter_ast = sirius::ast::from_duckdb(*_duckdb_filter_expression);
       sirius::expression_evaluator exec(sirius_filter_ast.get(), mr_ref, stream);
       auto const data_positions = output_data_positions(*_plan);
@@ -835,7 +938,7 @@ filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
                                     op::scan::filter_state::ROW_FILTERED_AND_PROJECTED};
   }
 
-  auto const state = ast_expression.has_value() ? op::scan::filter_state::ROW_FILTERED
+  auto const state = reader_applied_full_filter ? op::scan::filter_state::ROW_FILTERED
                                                 : op::scan::filter_state::UNFILTERED;
   return op::scan::filtered_table{owning_table_view{std::move(table)}, state};
 }
