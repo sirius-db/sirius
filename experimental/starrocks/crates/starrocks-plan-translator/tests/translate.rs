@@ -2709,11 +2709,11 @@ fn partial_avg_is_rejected_with_the_agg_stage_workaround() {
     assert!(message.contains("new_planner_agg_stage"), "{message}");
 }
 
-/// Verifies grouped two-phase aggregation is rejected in the translator. The multi-CN case is
-/// also stopped by the destination guard, but a single-CN merge fragment has one destination,
-/// so without this guard grouped two-phase would be reachable yet untested.
+/// Verifies grouped two-phase aggregation translates now that partitioned streaming output
+/// exists: the partial node keeps its grouping keys and emits modeled state types for the
+/// measures (the grouped merge semantics are pinned on GPU by FRAG-7).
 #[test]
-fn grouped_two_phase_is_rejected() {
+fn grouped_two_phase_translates() {
     let mut aggregate = aggregate_expr(
         "sum",
         scalar_type(TPrimitiveType::BIGINT),
@@ -2727,15 +2727,23 @@ fn grouped_two_phase_is_rejected() {
         vec![aggregate],
     );
     node.agg_node.as_mut().unwrap().need_finalize = false;
-    let err = translate_fragment(&params(
+    let translated = translate_fragment(&params(
         Some(TPlan::new(vec![node, scan_node(0, 0)])),
         Some(agg_desc()),
         None,
     ))
-    .unwrap_err();
-    let message = err.to_string();
-    assert!(message.contains("partitioned streaming"), "{message}");
-    assert!(message.contains("new_planner_agg_stage"), "{message}");
+    .unwrap();
+    let root = root(&translated.plan);
+    let rel::RelType::Aggregate(aggregate) =
+        root.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected aggregate relation");
+    };
+    assert_eq!(aggregate.grouping_expressions.len(), 1);
+    assert_eq!(
+        aggregate.measures[0].measure.as_ref().unwrap().phase,
+        substrait::proto::AggregationPhase::InitialToIntermediate as i32
+    );
 }
 
 /// Verifies the one-shot path labels its measures InitialToResult (advisory; the engine

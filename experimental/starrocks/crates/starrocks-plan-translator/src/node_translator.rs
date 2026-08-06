@@ -532,18 +532,6 @@ fn translate_aggregation(
                      (SET new_planner_agg_stage = 1)",
         });
     }
-    // Grouped two-phase needs the hash-partitioned shuffle that partitioned streaming output
-    // (#838) will provide. Multi-CN plans would also be stopped by the destination guard, but
-    // on a single CN the merge fragment has one instance -- one destination -- and grouped
-    // two-phase would become reachable yet untested; reject it in the translator instead.
-    if phase != AggPhase::OneShot && !agg.grouping_exprs.as_deref().unwrap_or_default().is_empty() {
-        return Err(TranslateError::UnsupportedPlanNode {
-            node_id: node.node_id,
-            node_type: node.node_type,
-            reason: "grouped two-phase aggregation needs partitioned streaming output (#838) \
-                     (SET new_planner_agg_stage = 1)",
-        });
-    }
     let output_tuple = agg.output_tuple_id;
 
     let grouping_exprs = agg.grouping_exprs.as_deref().unwrap_or_default();
