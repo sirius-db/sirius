@@ -24,8 +24,8 @@
 // the {1, 0, 1} signature compare_gpu_vs_cpu asserts.
 //
 // Walk-based guards for unpinned tables (#1143) remain disabled in the
-// planner. Post-pin UPDATE chains are rejected during scan-manager query
-// preparation, before cached rows can be served (partial #1160).
+// planner. UPDATE statements on pinned tables are rejected before execution
+// (partial #1160).
 
 #include <catch.hpp>
 #include <duckdb.hpp>

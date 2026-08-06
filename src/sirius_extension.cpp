@@ -1185,6 +1185,8 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
     throw InvalidInputException("pin_table requires the Sirius context to be initialized");
   }
 
+  auto pin_registry_guard = sirius_ctx->lock_pinned_table_registry();
+
   // Pin materialization mutates the shared scan-manager registry and drives
   // the shared GPU runtime, so it runs inside its own execution window.
   // finish() at the end of this body quiesces any transient per-query state
@@ -1497,6 +1499,7 @@ void SiriusExtension::UnpinTableFunction(ClientContext& context,
   if (!sirius_ctx) {
     throw InvalidInputException("unpin_table requires the Sirius context to be initialized");
   }
+  auto pin_registry_guard = sirius_ctx->lock_pinned_table_registry();
   {
     // Registry removal must be serialized against execution windows (plan
     // generation reads pinned entries); a lock-only guard suffices — unpin

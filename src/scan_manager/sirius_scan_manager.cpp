@@ -27,7 +27,6 @@
 #include "io/sirius_datasource.hpp"
 #include "log/logging.hpp"
 #include "memory/topology_index.hpp"
-#include "op/scan/duckdb_mvcc_visibility.hpp"
 #include "op/scan/duckdb_native_gpu_ingestible.hpp"
 #include "op/scan/gpu_ingestible.hpp"
 #include "op/scan/parquet_gpu_ingestible.hpp"
@@ -602,29 +601,6 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
         "': its database was checkpointed after pin_table, so the pinned cache may be stale. "
         "Run CALL unpin_table('" +
         request.entry_name + "'), then pin_table again");
-    }
-  }
-
-  // DuckDB UPDATE chains version column values in place. The cached base and
-  // insert-delta decoders read the underlying pre-update values, while the
-  // visibility masks below can only keep or discard whole rows. Refuse before
-  // any cached provider starts serving so transparent execution can replay the
-  // retained DuckDB plan in the same transaction (or surface this error when
-  // fallback is disabled).
-  //
-  // The insert-delta requests are also our per-entry, per-query union of every
-  // materialized storage column: self-joins share one request and filter-only
-  // columns are included. Check the whole live physical range, not just the
-  // cached prefix, because rows inserted after pinning can be updated too.
-  for (auto const& request : _pending_insert_delta_jobs) {
-    auto const total_rows = static_cast<std::size_t>(request.storage->GetTotalRows());
-    if (op::scan::any_update_chains(*request.storage, request.union_cols, total_rows)) {
-      throw std::runtime_error(
-        "Sirius cannot safely scan pinned DuckDB table '" + request.entry_name +
-        "': a scanned column was updated after pin_table, and updated values cannot be "
-        "served from the pinned cache. Run CALL unpin_table('" +
-        request.entry_name +
-        "'), CHECKPOINT, then pin_table again, or SET enable_duckdb_fallback = true");
     }
   }
 
