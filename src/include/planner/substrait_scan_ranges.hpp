@@ -54,7 +54,7 @@ class scan_byte_ranges_state : public duckdb::ClientContextState {
   {
   }
 
-  [[nodiscard]] bool has(const std::string& path) const { return _ranges.count(path) > 0; }
+  [[nodiscard]] bool has(const std::string& path) const;
 
   /// Claims every range registered for `path`. Single-shot per file.
   /// @throws sirius::invalid_input_exception on a second claim of the same file.

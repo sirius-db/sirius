@@ -21,11 +21,38 @@
 
 namespace sirius::planner {
 
+namespace {
+
+/// `file:` scheme variants (`file:/p`, `file:///p`, `file://localhost/p`) all name the local
+/// filesystem; the plan may carry one form (the FE's) while DuckDB's bind reports another (or
+/// the plain path). One canonical form — the plain path — keyed at insert AND lookup is what
+/// keeps a registered range from being silently unclaimed over a spelling difference.
+std::string canonical_scan_path(const std::string& path)
+{
+  constexpr std::string_view kScheme = "file:";
+  if (path.rfind(kScheme, 0) != 0) { return path; }
+  auto rest = path.substr(kScheme.size());
+  if (rest.rfind("//", 0) == 0) {
+    // Drop the authority (empty or localhost — anything else never reaches this planner).
+    auto const slash = rest.find('/', 2);
+    if (slash == std::string::npos) { return path; }
+    rest = rest.substr(slash);
+  }
+  return rest;
+}
+
+}  // namespace
+
+bool scan_byte_ranges_state::has(const std::string& path) const
+{
+  return _ranges.count(canonical_scan_path(path)) > 0;
+}
+
 std::vector<scan_byte_range> scan_byte_ranges_state::claim(const std::string& path)
 {
-  auto it = _ranges.find(path);
+  auto it = _ranges.find(canonical_scan_path(path));
   if (it == _ranges.end()) { return {}; }
-  if (!_claimed.insert(path).second) {
+  if (!_claimed.insert(it->first).second) {
     throw sirius::invalid_input_exception(
       "two scans in one plan read byte ranges of '{}'; the ranges cannot be attributed to "
       "either without double-reading",
@@ -63,7 +90,7 @@ void collect_from_read(const substrait::ReadRel& read,
         "a byte-ranged LocalFiles item uses a path type other than uri_file; its range "
         "cannot be attributed to a file");
     }
-    out[item.uri_file()].emplace_back(item.start(), item.length());
+    out[canonical_scan_path(item.uri_file())].emplace_back(item.start(), item.length());
   }
 }
 
