@@ -354,6 +354,18 @@ impl ScanFilePaths {
                 "path-derived columns (columns_from_path) are not supported",
             ));
         }
+        // Parquet compression is per-page inside the file; an outer compression_type on the
+        // range describes a compressed *container* the reader would have to unwrap first.
+        // The FE leaves it unset (or NO_COMPRESSION) for plain parquet files.
+        if desc.compression_type.is_some_and(|compression| {
+            compression != starrocks_thrift::types::TCompressionType::NO_COMPRESSION
+                && compression != starrocks_thrift::types::TCompressionType::UNKNOWN_COMPRESSION
+        }) {
+            return Err(Self::unsupported(
+                node_id,
+                "an outer compression_type on a parquet scan range is not supported",
+            ));
+        }
         Self::check_local_path(node_id, &desc.path)
     }
 

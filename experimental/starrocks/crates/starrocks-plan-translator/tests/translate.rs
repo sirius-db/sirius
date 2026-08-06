@@ -774,6 +774,30 @@ fn split_past_the_end_of_the_file_is_refused() {
     assert!(err.to_string().contains("past the end"), "{err}");
 }
 
+/// Verifies an outer compression_type on a parquet range is refused — it describes a
+/// compressed container the reader would have to unwrap, not parquet's per-page compression.
+#[test]
+fn compressed_container_scan_range_is_refused() {
+    let mut range = broker_scan_range(
+        "file:///data/users.parquet",
+        TFileFormatType::FORMAT_PARQUET,
+        0,
+        -1,
+        Some(1024),
+    );
+    range.broker_scan_range.as_mut().unwrap().ranges[0].compression_type =
+        Some(starrocks_thrift::types::TCompressionType::GZIP);
+    let err = PlanTranslator::new()
+        .translate_fragment(&params_with_scan_range(
+            TPlan::new(vec![scan_node(0, 0)]),
+            base_desc(),
+            0,
+            range,
+        ))
+        .unwrap_err();
+    assert!(err.to_string().contains("compression"), "{err}");
+}
+
 /// Verifies incremental scan-range delivery is refused: this CN never receives the rest, so
 /// accepting the prefix would silently read a subset of the data.
 #[test]
