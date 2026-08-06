@@ -407,7 +407,7 @@ sirius_scan_manager::sirius_scan_manager(
   // path is identical from the caller's point of view.  Both are built by the
   // ioctx registry, which sources the reactor staging resource from the
   // reservation manager it was constructed with.
-  if (_config.use_sirius_datasource) {
+  if (_config.backend == scan_manager::io_backend::sirius) {
     _io_ctx = _ioctx_registry.make_ioctx(sirius::io::io_context_type::uring);
     if (!_io_ctx) {
       throw std::runtime_error("[sirius_scan_manager] failed to create uring io_context");
@@ -417,10 +417,10 @@ sirius_scan_manager::sirius_scan_manager(
   } else {
     if (_topology_index->gpu_ids().size() > 1) {
       throw std::runtime_error(
-        "[sirius_scan_manager] kvikio_context fallback (use_sirius_datasource=false) "
+        "[sirius_scan_manager] kvikio_context fallback (backend=kvikio) "
         "does not support multi-GPU; topology reports " +
         std::to_string(_topology_index->gpu_ids().size()) +
-        " GPUs.  Enable use_sirius_datasource for multi-GPU runs.");
+        " GPUs.  Set backend=sirius for multi-GPU runs.");
     }
     _io_ctx = _ioctx_registry.make_ioctx(sirius::io::io_context_type::kvikio);
     if (!_io_ctx) {
@@ -727,13 +727,7 @@ void sirius_scan_manager::list_objects_paged(
     throw std::runtime_error("sirius_scan_manager::list_objects_paged: malformed prefix URI '" +
                              s3_prefix_uri + "'");
   }
-  // Routing probe only (scheme dispatch, never touches the network): the
-  // backend checkers parse() their input and reject an empty object key, so a
-  // bucket-root prefix routes via a placeholder key.
-  auto const route_probe =
-    "s3://" + std::string(bucket) + "/" + (prefix.empty() ? "_" : std::string(prefix));
-  auto io_ctx = ioctx_for_path(route_probe);
-  auto* rest  = dynamic_cast<sirius::io::rest::rest_ioctx*>(io_ctx.get());
+  auto* rest = rest_ioctx_for_list();
   if (rest == nullptr) {
     throw std::runtime_error("sirius_scan_manager::list_objects_paged: '" + s3_prefix_uri +
                              "' does not route to an object-store backend that supports LIST");
@@ -743,22 +737,12 @@ void sirius_scan_manager::list_objects_paged(
 
 std::size_t sirius_scan_manager::s3_list_max_matches(std::string const& s3_uri)
 {
-  // Route by scheme only (no LIST call) to read the backend's configured cap.
-  // Same bucket-root-safe placeholder-key probe as list_objects_paged.
   constexpr std::string_view k_scheme = "s3://";
   if (s3_uri.size() <= k_scheme.size() || s3_uri.compare(0, k_scheme.size(), k_scheme) != 0) {
     throw std::runtime_error("sirius_scan_manager::s3_list_max_matches: malformed URI '" + s3_uri +
                              "'");
   }
-  auto const rest_uri     = std::string_view{s3_uri}.substr(k_scheme.size());
-  auto const bucket_slash = rest_uri.find('/');
-  auto const bucket       = rest_uri.substr(0, bucket_slash);
-  auto const prefix =
-    bucket_slash == std::string_view::npos ? std::string_view{} : rest_uri.substr(bucket_slash + 1);
-  auto const route_probe =
-    "s3://" + std::string(bucket) + "/" + (prefix.empty() ? "_" : std::string(prefix));
-  auto io_ctx = ioctx_for_path(route_probe);
-  auto* rest  = dynamic_cast<sirius::io::rest::rest_ioctx*>(io_ctx.get());
+  auto* rest = rest_ioctx_for_list();
   if (rest == nullptr) {
     throw std::runtime_error("sirius_scan_manager::s3_list_max_matches: '" + s3_uri +
                              "' does not route to an object-store backend that supports LIST");
@@ -773,13 +757,19 @@ std::shared_ptr<sirius::io::ioctx> sirius_scan_manager::ioctx_for_path(std::stri
   auto file_path = normalize_path(std::string(path));
   auto type      = _ioctx_registry.lookup_path(file_path);
   if (!type) { return nullptr; }
+  return ioctx_for_type(*type);
+}
+
+std::shared_ptr<sirius::io::ioctx> sirius_scan_manager::ioctx_for_type(
+  sirius::io::io_context_type type)
+{
   // The local default `_io_ctx` already serves uring/kvikio; only an off-default
   // backend (e.g. s3:// -> restful) needs a separate, lazily-built context.
-  if (_io_ctx && _io_ctx->type() == *type) { return _io_ctx; }
+  if (_io_ctx && _io_ctx->type() == type) { return _io_ctx; }
 
   {
     std::lock_guard lk{_routed_io_ctxs_mtx};
-    if (auto it = _routed_io_ctxs.find(*type); it != _routed_io_ctxs.end()) { return it->second; }
+    if (auto it = _routed_io_ctxs.find(type); it != _routed_io_ctxs.end()) { return it->second; }
   }
   // Build outside the map mutex: make_ioctx/start spawn reactor threads and
   // initialize_cache allocates, so holding _routed_io_ctxs_mtx across them would
@@ -789,17 +779,23 @@ std::shared_ptr<sirius::io::ioctx> sirius_scan_manager::ioctx_for_path(std::stri
   std::lock_guard build_lk{_routed_io_ctxs_build_mtx};
   {
     std::lock_guard lk{_routed_io_ctxs_mtx};
-    if (auto it = _routed_io_ctxs.find(*type); it != _routed_io_ctxs.end()) { return it->second; }
+    if (auto it = _routed_io_ctxs.find(type); it != _routed_io_ctxs.end()) { return it->second; }
   }
-  auto io_ctx = _ioctx_registry.make_ioctx(*type);
+  auto io_ctx = _ioctx_registry.make_ioctx(type);
   if (!io_ctx) { return nullptr; }
   io_ctx->start();
   if (_config.enable_prefetch_cache && io_ctx->can_use_prefetching_cache()) {
     io_ctx->initialize_cache(_reservation_manager, _config.prefetch_cache, _topology_index);
   }
   std::lock_guard lk{_routed_io_ctxs_mtx};
-  auto [it, inserted] = _routed_io_ctxs.emplace(*type, std::move(io_ctx));
+  auto [it, inserted] = _routed_io_ctxs.emplace(type, std::move(io_ctx));
   return it->second;
+}
+
+sirius::io::rest::rest_ioctx* sirius_scan_manager::rest_ioctx_for_list()
+{
+  auto io_ctx = ioctx_for_type(sirius::io::io_context_type::restful);
+  return dynamic_cast<sirius::io::rest::rest_ioctx*>(io_ctx.get());
 }
 
 void sirius_scan_manager::reset()

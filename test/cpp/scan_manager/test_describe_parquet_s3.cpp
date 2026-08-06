@@ -86,7 +86,7 @@ struct scan_manager_fixture {
 scan_manager_config make_minio_rest_config(bool perf_instrumentation = false)
 {
   scan_manager_config cfg{};
-  cfg.use_sirius_datasource     = true;
+  cfg.backend                   = sirius::scan_manager::io_backend::sirius;
   cfg.object_store.endpoint     = require_env("SIRIUS_TEST_S3_ENDPOINT");
   cfg.object_store.region       = env_or("SIRIUS_TEST_S3_REGION", "us-east-1");
   cfg.object_store.access_key   = require_env("SIRIUS_TEST_S3_ACCESS_KEY");
@@ -263,7 +263,7 @@ TEST_CASE("describe_parquet maps nested local parquet bind shape like DuckDB CPU
 {
   scan_manager_fixture fixture;
   scan_manager_config cfg{};
-  cfg.use_sirius_datasource = true;
+  cfg.backend = sirius::scan_manager::io_backend::sirius;
   sirius_scan_manager manager{std::move(cfg), *fixture.memory, fixture.topology};
 
   for (auto const fixture_name : {"nested_struct.parquet",

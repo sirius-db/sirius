@@ -239,7 +239,7 @@ TEST_CASE("sirius_config defaults chunk prewarm to enabled when YAML omits the k
     out << "sirius:\n"
            "  executor:\n"
            "    scan_manager:\n"
-           "      use_sirius_datasource: true\n";
+           "      backend: sirius\n";
     REQUIRE(out);
   }
 

@@ -17,25 +17,40 @@
 #include "io/kvikio/kvikio_context.hpp"
 
 #include <kvikio/defaults.hpp>
+#include <kvikio/remote_handle.hpp>
 
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
 #include <memory>
+#include <optional>
 #include <stdexcept>
+#include <string>
+#include <string_view>
 #include <utility>
 
 namespace sirius::io {
 
 namespace {
 
-const kvikio_io_object& as_kvikio(const io_object& obj)
+constexpr std::string_view k_s3_scheme = "s3://";
+
+[[nodiscard]] bool is_s3_uri(std::string_view path) noexcept
 {
-  // Concrete type is enforced by create_io_object below; a mismatch is a
-  // programmer error (e.g. mixing io_objects across backends), not user
-  // input, so a static_cast is appropriate.
-  return static_cast<const kvikio_io_object&>(obj);
+  return path.size() > k_s3_scheme.size() && path.compare(0, k_s3_scheme.size(), k_s3_scheme) == 0;
+}
+
+const kvikio_object& as_kvikio(const io_object& obj)
+{
+  // A mismatch is a programmer error (mixing io_objects across backends), but
+  // the cast is checked so it surfaces as a clear error instead of UB.
+  const auto* typed = dynamic_cast<const kvikio_object*>(&obj);
+  if (typed == nullptr) {
+    throw std::invalid_argument("kvikio_context: io_object '" + obj.object_path() +
+                                "' was not created by this backend");
+  }
+  return *typed;
 }
 
 /// Bytes actually available at @p offset.  kvikIO reads are unclamped, unlike
@@ -46,7 +61,29 @@ const kvikio_io_object& as_kvikio(const io_object& obj)
   return obj.size() > offset ? std::min(size, obj.size() - offset) : 0;
 }
 
+/// kvikIO falls back to the AWS_* environment when an argument is nullopt, so
+/// every credential is passed engaged — an unconfigured store is rejected in
+/// create_io_object before we get here.
+[[nodiscard]] std::optional<std::string> engaged(std::string const& value)
+{
+  return std::optional<std::string>{value};
+}
+
 }  // namespace
+
+std::size_t kvikio_io_object::read_at(void* dst, std::size_t size, std::size_t offset) const
+{
+  size = clamp_to_object(*this, offset, size);
+  if (size == 0) { return 0; }
+  return handle().pread(dst, size, offset).get();
+}
+
+std::size_t kvikio_remote_io_object::read_at(void* dst, std::size_t size, std::size_t offset) const
+{
+  size = clamp_to_object(*this, offset, size);
+  if (size == 0) { return 0; }
+  return handle().pread(dst, size, offset).get();
+}
 
 void apply_kvikio_defaults(kvikio_config const& cfg)
 {
@@ -85,13 +122,33 @@ void apply_kvikio_defaults(kvikio_config const& cfg)
   // constructor in create_io_object so it scopes to this ioctx's files.
 }
 
-kvikio_context::kvikio_context(kvikio_config cfg) : _config(std::move(cfg))
+kvikio_context::kvikio_context(kvikio_config cfg, object_store_config os)
+  : _config(std::move(cfg)), _object_store(std::move(os))
 {
   apply_kvikio_defaults(_config);
 }
 
 std::shared_ptr<io_object> kvikio_context::create_io_object(std::string path)
 {
+  if (is_s3_uri(path)) {
+    if (_object_store.endpoint.empty() || _object_store.region.empty() ||
+        _object_store.access_key.empty() || _object_store.secret_key.empty()) {
+      throw std::runtime_error(
+        "kvikio_context: cannot open '" + path +
+        "': object store not configured (endpoint / region / credentials missing)");
+    }
+    auto bucket_and_object = kvikio::S3Endpoint::parse_s3_url(path);
+    auto endpoint          = std::make_unique<kvikio::S3Endpoint>(std::move(bucket_and_object),
+                                                         engaged(_object_store.region),
+                                                         engaged(_object_store.access_key),
+                                                         engaged(_object_store.secret_key),
+                                                         engaged(_object_store.endpoint),
+                                                         engaged(_object_store.session_token));
+    kvikio::RemoteHandle handle{std::move(endpoint)};
+    auto const object_size = handle.nbytes();
+    return std::make_shared<kvikio_remote_io_object>(
+      std::move(path), std::move(handle), object_size);
+  }
   // Read-only: this ioctx serves the scan path only.  The handle owns the fd
   // (and any cuFile registration) for the io_object's lifetime, and the
   // io_object outlives any single datasource wrapping it.
@@ -124,11 +181,9 @@ std::vector<cudf::io::text::byte_range_info> kvikio_context::align_and_coalesce(
 
 size_t kvikio_context::host_read_io(const io_object& obj, size_t offset, size_t size, uint8_t* dst)
 {
-  // pread dispatches on the destination pointer type, so the same call serves
+  // read_at dispatches on the destination pointer type, so the same call serves
   // host and device buffers; here it is always host memory.
-  size = clamp_to_object(obj, offset, size);
-  if (size == 0) { return 0; }
-  return as_kvikio(obj).handle().pread(dst, size, offset).get();
+  return as_kvikio(obj).read_at(dst, size, offset);
 }
 
 exec::semi_future<size_t> kvikio_context::host_read_async_io(const io_object& obj,
@@ -139,11 +194,8 @@ exec::semi_future<size_t> kvikio_context::host_read_async_io(const io_object& ob
   // make_semi_future_with invokes eagerly, so the kvikIO future is consumed
   // here and the returned semi_future is already satisfied.  Callers that need
   // true overlap use the uring backend.
-  size = clamp_to_object(obj, offset, size);
-  return exec::make_semi_future_with([&obj, offset, size, dst]() -> size_t {
-    if (size == 0) { return 0; }
-    return as_kvikio(obj).handle().pread(dst, size, offset).get();
-  });
+  return exec::make_semi_future_with(
+    [&obj, offset, size, dst]() -> size_t { return as_kvikio(obj).read_at(dst, size, offset); });
 }
 
 exec::semi_future<size_t> kvikio_context::device_read_async_io(
@@ -155,15 +207,14 @@ exec::semi_future<size_t> kvikio_context::device_read_async_io(
 {
   size = clamp_to_object(obj, offset, size);
   return exec::make_semi_future_with([&obj, offset, size, dst, stream]() -> size_t {
-    // read_async enqueues the transfer on `stream` (so it is ordered against
-    // the caller's other stream work, unlike pread); check_bytes_done then
-    // synchronizes that stream and yields the byte count.
     if (size == 0) { return 0; }
-    auto fut = as_kvikio(obj).handle().read_async(dst,
-                                                  size,
-                                                  static_cast<off_t>(offset),
-                                                  /*devPtr_offset=*/0,
-                                                  stream.value());
+    const auto* local = dynamic_cast<const kvikio_io_object*>(&obj);
+    if (local == nullptr) { return as_kvikio(obj).read_at(dst, size, offset); }
+    auto fut = local->handle().read_async(dst,
+                                          size,
+                                          static_cast<off_t>(offset),
+                                          /*devPtr_offset=*/0,
+                                          stream.value());
     return fut.check_bytes_done();
   });
 }

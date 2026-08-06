@@ -104,8 +104,8 @@ extern "C" int cudaProfilerStop();
 // PinTableFunction routes parquet reads through the scan manager's ioctx
 // instead of cudf's bundled file_source factory (which uses kvikio internally
 // and binds to a single CUDA context). This is mandatory in multi-GPU
-// configurations (enforced by sirius_config::enforce_sirius_datasource_for_multi_gpu()).
-// Single-GPU users may still opt out via use_sirius_datasource=false; the
+// configurations (enforced by sirius_config::enforce_sirius_backend_for_multi_gpu()).
+// Single-GPU users may still opt out via backend=kvikio; the
 // pin pipeline always routes through ioctx when one is available.
 //
 // Ordering rule: include uring_reactor LAST among sirius headers — liburing.h

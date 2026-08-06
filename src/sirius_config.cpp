@@ -164,7 +164,7 @@ static void from_yaml(const YAML::Node& node, sirius::io::rest::config& opt)
 
 static void from_yaml(const YAML::Node& node, sirius::io::uring::config& opt)
 {
-  yaml::reader r(node, "local");
+  yaml::reader r(node, "uring");
   r.optional("max_n_chunks", opt.max_n_chunks);
   r.reject_unknown();
 }
@@ -215,11 +215,11 @@ static void from_yaml(const YAML::Node& node, scan_manager::scan_manager_config&
   r.optional("num_threads", opt.thread_pool.num_threads, yaml::greater_than<int>{2});
   r.optional("thread_name_prefix", opt.thread_pool.thread_name_prefix);
   r.optional("cpu_affinity", opt.thread_pool.cpu_affinity_list);
-  r.optional("use_sirius_datasource", opt.use_sirius_datasource);
+  r.optional("backend", opt.backend);
   r.optional("uring_n_reactors", opt.uring_n_reactors, yaml::greater_than<std::size_t>{0});
   r.optional("rest_n_reactors", opt.rest_n_reactors, yaml::greater_than<std::size_t>{0});
   r.optional("cache", opt.cache);
-  if (auto n = r.optional_node("local")) sirius::from_yaml(*n, opt.local);
+  if (auto n = r.optional_node("uring")) sirius::from_yaml(*n, opt.uring);
   if (auto n = r.optional_node("rest")) sirius::from_yaml(*n, opt.rest);
   if (auto n = r.optional_node("kvikio")) sirius::from_yaml(*n, opt.kvikio);
   if (auto n = r.optional_node("prefetch_cache")) sirius::from_yaml(*n, opt.prefetch_cache);
@@ -596,7 +596,7 @@ void sirius_config::load_from_file(const std::filesystem::path& config_path)
       _memory_space_configs = builder.build(_hw_topology);
     }
 
-    enforce_sirius_datasource_for_multi_gpu();
+    enforce_sirius_backend_for_multi_gpu();
 
   } catch (const std::exception& e) {
     throw std::runtime_error("Failed to load config from " + config_path.string() + ": " +
@@ -604,18 +604,18 @@ void sirius_config::load_from_file(const std::filesystem::path& config_path)
   }
 }
 
-void sirius_config::enforce_sirius_datasource_for_multi_gpu()
+void sirius_config::enforce_sirius_backend_for_multi_gpu()
 {
   size_t num_gpus = std::ranges::count_if(_memory_space_configs, [](auto const& space) {
     return std::holds_alternative<cucascade::memory::gpu_memory_space_config>(space);
   });
-  if (num_gpus > 1 && !_scan_manager_config.use_sirius_datasource) {
+  if (num_gpus > 1 && _scan_manager_config.backend != scan_manager::io_backend::sirius) {
     SIRIUS_LOG_WARN(
-      "sirius_config: use_sirius_datasource was false but {} GPUs are configured; "
-      "the sirius datasource is required for multi-GPU IO routing. Overriding "
-      "use_sirius_datasource to true.",
+      "sirius_config: backend was not 'sirius' but {} GPUs are configured; "
+      "the sirius backend is required for multi-GPU IO routing. Overriding "
+      "backend to 'sirius'.",
       num_gpus);
-    _scan_manager_config.use_sirius_datasource = true;
+    _scan_manager_config.backend = scan_manager::io_backend::sirius;
   }
 }
 

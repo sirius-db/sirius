@@ -242,10 +242,10 @@ struct sirius_config {
 
  private:
   /// When @c _memory_space_configs contains more than one GPU memory space,
-  /// force @c _scan_manager_config.use_sirius_datasource to true (sirius
-  /// datasource is required for multi-GPU IO routing). Emits a WARNING when
+  /// force @c _scan_manager_config.backend to @c io_backend::sirius (the
+  /// sirius backend is required for multi-GPU IO routing). Emits a WARNING when
   /// the override takes effect. Called from the end of @ref load_from_file.
-  void enforce_sirius_datasource_for_multi_gpu();
+  void enforce_sirius_backend_for_multi_gpu();
 
   cucascade::memory::system_topology_info _hw_topology{.num_gpus = 1};
   std::vector<cucascade::memory::memory_space_config> _memory_space_configs;

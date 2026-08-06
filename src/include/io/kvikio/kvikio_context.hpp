@@ -19,8 +19,10 @@
 #include "exec/semi_future.hpp"
 #include "io/io_context.hpp"
 #include "io/kvikio/config.hpp"
+#include "io/object_store_config.hpp"
 
 #include <kvikio/file_handle.hpp>
+#include <kvikio/remote_handle.hpp>
 
 #include <cstddef>
 #include <cstdint>
@@ -35,18 +37,39 @@
 namespace sirius::io {
 
 // ---------------------------------------------------------------------------
+// kvikio_object
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief Common base for the @c io_object flavours this backend serves.
+ *
+ * kvikIO reaches local files through a @c kvikio::FileHandle and object-store
+ * URIs through a @c kvikio::RemoteHandle; the two handle types share no base,
+ * so this class carries the one operation @c kvikio_context needs from both.
+ */
+class kvikio_object : public io_object {
+ public:
+  /// Read up to @p size bytes at @p offset into @p dst (host OR device memory;
+  /// kvikIO dispatches on the pointer type).  Blocking; returns the byte count.
+  /// Implementations clamp @p size to the object's size.
+  [[nodiscard]] virtual std::size_t read_at(void* dst,
+                                            std::size_t size,
+                                            std::size_t offset) const = 0;
+};
+
+// ---------------------------------------------------------------------------
 // kvikio_io_object
 // ---------------------------------------------------------------------------
 
 /**
- * @brief @c io_object that owns a kvikIO file handle.
+ * @brief @c kvikio_object that owns a kvikIO file handle (local paths).
  *
  * Owns the handle for the file's lifetime; @c kvikio_context's read primitives
  * forward straight to it.  kvikIO picks GDS or a POSIX/compat path per call
  * based on the pointer type and its own compatibility mode, so this backend
  * serves both host and device destinations from the same handle.
  */
-class kvikio_io_object final : public io_object {
+class kvikio_io_object final : public kvikio_object {
  public:
   kvikio_io_object(std::string path, kvikio::FileHandle handle, size_t file_size)
     : _path(std::move(path)), _handle(std::move(handle)), _file_size(file_size)
@@ -61,10 +84,48 @@ class kvikio_io_object final : public io_object {
   /// through them do not mutate observable file state.
   [[nodiscard]] kvikio::FileHandle& handle() const noexcept { return _handle; }
 
+  [[nodiscard]] std::size_t read_at(void* dst, std::size_t size, std::size_t offset) const final;
+
  private:
   std::string _path;
   mutable kvikio::FileHandle _handle;
   size_t _file_size{0};
+};
+
+// ---------------------------------------------------------------------------
+// kvikio_remote_io_object
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief @c kvikio_object that owns a kvikIO remote handle (@c s3:// URIs).
+ *
+ * The handle performs a HEAD at construction to learn the object size, then
+ * serves ranged GETs over libcurl.  Device destinations are supported, but
+ * kvikIO bounces them through a host buffer internally — there is no
+ * stream-ordered read on a remote handle.
+ */
+class kvikio_remote_io_object final : public kvikio_object {
+ public:
+  /// @param uri The original @c s3://bucket/key URI — kept verbatim so cache
+  ///            keys stay stable regardless of the signed URL kvikIO builds.
+  kvikio_remote_io_object(std::string uri, kvikio::RemoteHandle handle, size_t object_size)
+    : _uri(std::move(uri)), _handle(std::move(handle)), _object_size(object_size)
+  {
+  }
+
+  [[nodiscard]] const std::string& raw_file_cache_id() const noexcept final { return _uri; }
+  [[nodiscard]] const std::string& object_path() const noexcept final { return _uri; }
+  [[nodiscard]] size_t size() const noexcept final { return _object_size; }
+
+  /// Mutable for the same reason as @ref kvikio_io_object::handle.
+  [[nodiscard]] kvikio::RemoteHandle& handle() const noexcept { return _handle; }
+
+  [[nodiscard]] std::size_t read_at(void* dst, std::size_t size, std::size_t offset) const final;
+
+ private:
+  std::string _uri;
+  mutable kvikio::RemoteHandle _handle;
+  size_t _object_size{0};
 };
 
 // ---------------------------------------------------------------------------
@@ -75,10 +136,14 @@ class kvikio_io_object final : public io_object {
  * @brief Fallback @c ioctx backed directly by kvikIO
  *        (@c kvikio::FileHandle).
  *
- * The universal local-file backend: it claims any path, so the registry uses it
- * only after the explicit backends (uring / rest) decline.  Unlike those, it
- * owns no reactors and no bounce staging — every read goes straight to a
- * kvikIO handle, which internally chooses GDS or a POSIX/compat path.
+ * The universal backend: it claims any path, so the registry uses it only after
+ * the explicit backends (uring / rest) decline — or, when @c backend=kvikio is
+ * configured, for local files AND @c s3:// URIs.  Unlike those backends it owns
+ * no reactors and no bounce staging — every read goes straight to a kvikIO
+ * handle (a @c FileHandle locally, a @c RemoteHandle for @c s3://), which
+ * internally chooses GDS or a POSIX/compat path.
+ *
+ * LIST / glob is NOT served here: it stays on the REST backend.
  *
  * It implements the protected @c _io primitives (not the public read API); the
  * base class's public reads route through them.
@@ -100,9 +165,14 @@ class kvikio_context final : public ioctx {
   /// sharing and ordering caveats.  @c compat_mode is retained and applied per
   /// file handle at open time instead.
   ///
+  /// @p os supplies the credentials used for @c s3:// objects; every value is
+  /// handed to kvikIO explicitly so remote reads never depend on @c AWS_* env
+  /// vars.  A default-constructed @p os disables the remote path (opening an
+  /// @c s3:// URI then throws).
+  ///
   /// @throw std::invalid_argument on a zero @c nthreads, @c task_size, or
   ///        @c bounce_buffer_size.
-  explicit kvikio_context(kvikio_config cfg);
+  explicit kvikio_context(kvikio_config cfg, object_store_config os = {});
 
   ~kvikio_context() override
   {
@@ -140,6 +210,9 @@ class kvikio_context final : public ioctx {
                                                size_t size,
                                                uint8_t* dst) noexcept final;
 
+  /// @note Stream ordering holds only for LOCAL objects (@c FileHandle
+  ///       @c read_async on @p stream); a remote object falls back to a
+  ///       blocking host-bounced read, so @p stream is unused there.
   exec::semi_future<size_t> device_read_async_io(const io_object& obj,
                                                  size_t offset,
                                                  size_t size,
@@ -166,14 +239,21 @@ class kvikio_context final : public ioctx {
   /// rest already went into kvikIO's globals.
   [[nodiscard]] kvikio_config const& config() const noexcept { return _config; }
 
+  /// Object-store credentials used for @c s3:// objects.
+  [[nodiscard]] object_store_config const& object_store() const noexcept { return _object_store; }
+
  protected:
-  /// Backend hook invoked by @c ioctx::open_datasource: open @p path
-  /// with kvikIO and record its size.  Applies @c config().compat_mode to the
-  /// handle when set.  Throws when the file cannot be opened.
+  /// Backend hook invoked by @c ioctx::open_datasource: open @p path with
+  /// kvikIO and record its size.  An @c s3:// path builds a signed
+  /// @c RemoteHandle from @ref object_store (throwing when the store is not
+  /// configured); anything else opens a @c FileHandle, applying
+  /// @c config().compat_mode when set.  Throws when the object cannot be
+  /// opened.
   std::shared_ptr<io_object> create_io_object(std::string path) override;
 
  private:
   kvikio_config _config;
+  object_store_config _object_store;
 };
 
 }  // namespace sirius::io

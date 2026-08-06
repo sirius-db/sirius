@@ -11,6 +11,7 @@
 #include "io/rest/rest_ioctx.hpp"
 #include "io/rest/s3/sigv4_authorizer.hpp"
 #include "io/s3/sirius_httpfs.hpp"
+#include "scan_manager/config.hpp"
 #include "sirius_context.hpp"
 #include "sirius_extension.hpp"
 #include "utils/s3_container.hpp"
@@ -303,7 +304,7 @@ struct sirius_memory_limits {
   std::optional<bool> enable_prefetch_cache;
   std::optional<std::size_t> rest_n_reactors;
   std::optional<std::size_t> rest_max_connections;
-  std::optional<bool> use_sirius_datasource;
+  std::optional<sirius::scan_manager::io_backend> backend;
   std::optional<std::string> rest_footer_probe_bytes;
   std::optional<std::size_t> rest_list_max_matches;
   std::optional<std::size_t> rest_list_max_scanned;
@@ -380,9 +381,10 @@ class sirius_config_env_guard {
     if (limits.enable_prefetch_cache.has_value()) {
       out << "      cache: " << (*limits.enable_prefetch_cache ? "persistent" : "none") << "\n";
     }
-    if (limits.use_sirius_datasource.has_value()) {
-      out << "      use_sirius_datasource: " << (*limits.use_sirius_datasource ? "true" : "false")
-          << "\n";
+    if (limits.backend.has_value()) {
+      std::string backend_name;
+      REQUIRE(sirius::scan_manager::enum_to_string(*limits.backend, backend_name));
+      out << "      backend: " << backend_name << "\n";
     }
     if (limits.rest_n_reactors.has_value()) {
       out << "      rest_n_reactors: " << *limits.rest_n_reactors << "\n";
@@ -2523,7 +2525,7 @@ TEST_CASE("transparent read_parquet over S3 keeps REST routing when local Sirius
   if (should_skip_s3_env(env)) { return; }
 
   sirius_memory_limits limits;
-  limits.use_sirius_datasource = false;
+  limits.backend = sirius::scan_manager::io_backend::kvikio;
   s3_sql_fixture fixture(*env, limits);
   set_gpu_execution(fixture.con, true);
 

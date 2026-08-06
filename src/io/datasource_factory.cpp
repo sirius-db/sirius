@@ -98,7 +98,7 @@ factory_type make_kvikio_ioctx_factory()
 {
   return [](const scan_manager::scan_manager_config& config) -> std::shared_ptr<ioctx> {
     try {
-      return std::make_shared<kvikio_context>(config.kvikio);
+      return std::make_shared<kvikio_context>(config.kvikio, config.object_store);
     } catch (const std::exception& e) {
       SIRIUS_LOG_ERROR("make_kvikio_ioctx_factory: construction failed: {}", e.what());
       return nullptr;
@@ -121,7 +121,7 @@ factory_type make_uring_ioctx_factory(
       // One reactor_context shared by the whole pool: it carries the per-reactor
       // config (bounce-slot size taken from the staging resource's block size)
       // and the pinned bounce-staging resource itself.
-      auto uring_cfg        = config.local;
+      auto uring_cfg        = config.uring;
       uring_cfg.bounce_size = host_mr->get_block_size();
       auto ctx = std::make_shared<uring::uring_reactor::reactor_context>(uring_cfg, host_mr);
       return std::make_shared<uring::uring_ioctx>(config.uring_n_reactors, std::move(ctx));
@@ -173,7 +173,7 @@ io_context_registry::io_context_registry(
   config_type config, cucascade::memory::memory_reservation_manager& reservation_manager)
   : _config(std::move(config)),
     _reservation_manager(reservation_manager),
-    _prefer_kvikio_for_file_scheme(!_config.use_sirius_datasource)
+    _prefer_kvikio(_config.backend == scan_manager::io_backend::kvikio)
 {
   // uring / rest claim paths via their reactor's static supports() (local
   // files and s3:// URLs respectively).  kvikio is the universal fallback —
@@ -215,9 +215,12 @@ std::optional<io_context_type> io_context_registry::lookup_path(
       fallback = type;
       continue;
     }
-    // use_sirius_datasource=false disables the uring local datasource: let local
-    // files fall through to the kvikio catch-all instead of letting uring claim them.
-    if (type == io_context_type::uring && _prefer_kvikio_for_file_scheme) { continue; }
+    // backend=kvikio takes over reads from BOTH explicit backends: local files
+    // from uring, s3:// objects from rest (kvikIO's RemoteHandle serves them).
+    // LIST still needs the rest ioctx, which callers fetch by type instead.
+    if (_prefer_kvikio && (type == io_context_type::uring || type == io_context_type::restful)) {
+      continue;
+    }
     return type;
   }
   return fallback;

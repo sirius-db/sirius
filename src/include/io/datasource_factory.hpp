@@ -87,7 +87,7 @@ class io_context_registry {
   /// (uring / restful) take precedence over the kvikio catch-all, so `s3://`
   /// never resolves to kvikio and a local file routes to uring before the
   /// universal fallback.  When the registry was built with
-  /// `use_sirius_datasource=false`, the uring local backend is suppressed so local
+  /// `backend: kvikio`, the uring local backend is suppressed so local
   /// files fall through to kvikio.  std::nullopt when nothing matches.
   std::optional<io_context_type> lookup_path(std::string_view path) const noexcept;
 
@@ -107,7 +107,10 @@ class io_context_registry {
   };
   const config_type _config;
   cucascade::memory::memory_reservation_manager& _reservation_manager;
-  bool _prefer_kvikio_for_file_scheme{false};
+  /// Set when @c backend=kvikio: kvikIO then serves BOTH local files (instead
+  /// of uring) and @c s3:// objects (instead of rest) for reads.  LIST / glob
+  /// still goes to the REST backend, which the scan manager obtains by type.
+  bool _prefer_kvikio{false};
   mutable std::shared_mutex _mtx;
   std::unordered_map<io_context_type, entry> _entries;
 };
@@ -129,7 +132,7 @@ class io_context_registry {
 io_context_registry::factory_type make_kvikio_ioctx_factory();
 
 /// io_uring local-disk backend.  Builds a @c uring_reactor::reactor_context from
-/// @c config.local (bounce-slot size taken from the HOST-tier resource's block
+/// @c config.uring (bounce-slot size taken from the HOST-tier resource's block
 /// size) and @c config.uring_n_reactors.
 io_context_registry::factory_type make_uring_ioctx_factory(
   cucascade::memory::memory_reservation_manager& reservation_manager);

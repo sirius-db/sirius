@@ -46,7 +46,7 @@ inline constexpr std::size_t default_uring_n_reactors = 1;
   return std::max(4, static_cast<int>(std::thread::hardware_concurrency()) - reserved);
 }
 
-/// Read-path caching strategy. Single knob that derives @c local.use_odirect,
+/// Read-path caching strategy. Single knob that derives @c uring.use_odirect,
 /// @c enable_prefetch_cache and @c prefetch_cache.dispose_on_idle.
 enum class cache_mode {
   /// O_DIRECT reads, no cache anywhere.
@@ -88,21 +88,55 @@ inline bool enum_to_string(cache_mode mode, std::string& s)
   return false;
 }
 
+/// IO backend that serves managed reads.
+enum class io_backend {
+  /// Sirius's own IO stack: uring for local paths, REST for @c s3:// URLs.
+  sirius,
+  /// The kvikIO backend (drives @c kvikio::FileHandle directly).
+  kvikio,
+};
+
+/// Parse a @ref io_backend from its lowercase YAML spelling.
+inline bool string_to_enum(std::string_view sv, io_backend& out)
+{
+  static const std::unordered_map<std::string_view, io_backend> map = {
+    {"sirius", io_backend::sirius},
+    {"kvikio", io_backend::kvikio},
+  };
+  auto it = map.find(sv);
+  if (it != map.end()) {
+    out = it->second;
+    return true;
+  }
+  return false;
+}
+
+/// Render a @ref io_backend as its canonical lowercase name.
+inline bool enum_to_string(io_backend b, std::string& s)
+{
+  switch (b) {
+    case io_backend::sirius: s = "sirius"; return true;
+    case io_backend::kvikio: s = "kvikio"; return true;
+  }
+  return false;
+}
+
 /**
  * @brief Configuration for the scan_manager.
  *
- * @c use_sirius_datasource selects the backend for local paths: @c uring_ioctx
- * when true, @c kvikio_context when false. Reads go through
+ * @c backend selects the IO stack: @ref io_backend::sirius routes local paths
+ * to @c uring_ioctx and @c s3:// URLs to the REST backend, @ref io_backend::kvikio
+ * routes local paths to @c kvikio_context. Reads go through
  * @c sirius_datasource either way; the kvikio backend drives
- * @c kvikio::FileHandle directly. Multi-GPU forces this to true.
+ * @c kvikio::FileHandle directly. Multi-GPU forces @ref io_backend::sirius.
  *
  * @c cache picks the read-path caching strategy; @ref apply_cache_mode derives
- * @c local.use_odirect, @c enable_prefetch_cache and
+ * @c uring.use_odirect, @c enable_prefetch_cache and
  * @c prefetch_cache.dispose_on_idle from it, so those three are not settable
  * on their own.
  *
  * Sub-configs:
- *  - @c local   — uring reactor tunables (local-disk IO path).
+ *  - @c uring   — uring reactor tunables (local-disk IO path).
  *  - @c rest    — REST reactor tunables (S3/object-store IO path).
  *  - @c kvikio  — kvikIO backend tunables (local-file fallback path).
  *  - @c prefetch_cache — prefetching cache tunables.
@@ -111,7 +145,8 @@ inline bool enum_to_string(cache_mode mode, std::string& s)
 struct scan_manager_config {
   exec::thread_pool_config thread_pool{.num_threads        = default_scan_manager_num_threads(),
                                        .thread_name_prefix = "scan_manager"};
-  bool use_sirius_datasource{true};
+  /// IO backend that serves managed reads.
+  io_backend backend{io_backend::sirius};
 
   /// Read-path caching strategy; the source of truth for the derived knobs.
   cache_mode cache{cache_mode::none};
@@ -129,7 +164,7 @@ struct scan_manager_config {
 
   /// Local (uring) reactor configuration — bounce-slot size, O_DIRECT,
   /// ring depth, etc.  @c use_odirect is derived from @ref cache.
-  io::uring::config local{};
+  io::uring::config uring{};
 
   /// REST (S3/object-store) reactor configuration — timeouts, TLS, chunking,
   /// retry policy, etc.
@@ -152,20 +187,20 @@ struct scan_manager_config {
   {
     switch (cache) {
       case cache_mode::none:
-        local.use_odirect     = true;
+        uring.use_odirect     = true;
         enable_prefetch_cache = false;
         break;
       case cache_mode::os:
-        local.use_odirect     = false;
+        uring.use_odirect     = false;
         enable_prefetch_cache = false;
         break;
       case cache_mode::persistent:
-        local.use_odirect              = true;
+        uring.use_odirect              = true;
         enable_prefetch_cache          = true;
         prefetch_cache.dispose_on_idle = false;
         break;
       case cache_mode::prefetch:
-        local.use_odirect              = true;
+        uring.use_odirect              = true;
         enable_prefetch_cache          = true;
         prefetch_cache.dispose_on_idle = true;
         break;

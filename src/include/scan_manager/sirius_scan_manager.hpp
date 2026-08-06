@@ -74,6 +74,9 @@ class ioctx;
 namespace cache {
 class buffer_pool;
 }  // namespace cache
+namespace rest {
+class rest_ioctx;
+}  // namespace rest
 }  // namespace sirius::io
 
 namespace sirius::op::scan {
@@ -579,7 +582,7 @@ class sirius_scan_manager {
 
   /// \brief Process-wide ioctx used to mint @c sirius_datasource instances.
   ///        Holds a @c uring_ioctx, or a @c kvikio_context when the manager
-  ///        was configured with @c use_sirius_datasource=false.
+  ///        was configured with @c backend=kvikio.
   [[nodiscard]] sirius::io::ioctx* io_ctx() const noexcept { return _io_ctx.get(); }
 
   [[nodiscard]] std::shared_ptr<sirius::io::sirius_datasource> create_datasource(
@@ -587,8 +590,8 @@ class sirius_scan_manager {
 
   /// \brief Stream ListObjectsV2 pages for @p s3_prefix_uri ("s3://bucket/prefix")
   ///        to @p sink, one call per page; @p sink returns false to stop early.
-  ///        Routes via @ref ioctx_for_path to the object-store backend (throws a
-  ///        clear error when the path does not resolve to one). page_size /
+  ///        Uses @ref rest_ioctx_for_list (throws a clear error when the REST
+  ///        backend is not configured). page_size /
   ///        early-stop semantics are the backend's (@c rest_ioctx::list_objects_paged).
   ///        @p max_scanned unset → the backend's configured cap
   ///        (@c rest.list_max_scanned); a value overrides it.
@@ -635,6 +638,17 @@ class sirius_scan_manager {
   /// so an `s3://` URI reaches the rest_ioctx even when the local default `_io_ctx`
   /// is uring/kvikio.  Returns nullptr when no backend supports the path.
   std::shared_ptr<sirius::io::ioctx> ioctx_for_path(std::string_view path);
+
+  /// Resolve the ioctx of @p type, building and caching it on first use (the
+  /// by-path routing above resolves to a type and then lands here).  Returns
+  /// nullptr when the registry cannot build that backend.
+  std::shared_ptr<sirius::io::ioctx> ioctx_for_type(sirius::io::io_context_type type);
+
+  /// The REST ioctx, which owns LIST / glob regardless of which backend serves
+  /// object READS (with @c backend=kvikio, `s3://` reads route to kvikIO).
+  /// Returns nullptr when the object store is not configured, i.e. the REST
+  /// backend cannot be built.  The returned ioctx stays owned by this manager.
+  sirius::io::rest::rest_ioctx* rest_ioctx_for_list();
 
   scan_manager_config _config;
   cucascade::memory::memory_reservation_manager& _reservation_manager;

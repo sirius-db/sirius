@@ -168,10 +168,11 @@ std::shared_ptr<const sirius::memory::topology_index> single_gpu_index()
                                                           std::vector<int>{0});
 }
 
-scan_manager_config make_s3_scan_config(std::string endpoint, bool use_sirius_datasource)
+scan_manager_config make_s3_scan_config(std::string endpoint,
+                                        sirius::scan_manager::io_backend backend)
 {
   scan_manager_config cfg{};
-  cfg.use_sirius_datasource        = use_sirius_datasource;
+  cfg.backend                      = backend;
   cfg.object_store.endpoint        = std::move(endpoint);
   cfg.object_store.region          = "us-east-1";
   cfg.object_store.access_key      = "routing-test-access-key";
@@ -478,7 +479,7 @@ void read_one_device_range(sirius::io::sirius_datasource& ds)
 TEST_CASE("io_context_registry routes full paths before the kvikio catch-all", "[s3][routing]")
 {
   scan_manager_fixture fixture;
-  auto cfg              = make_s3_scan_config("http://127.0.0.1:1", true);
+  auto cfg = make_s3_scan_config("http://127.0.0.1:1", sirius::scan_manager::io_backend::sirius);
   auto const local_path = make_regular_file();
 
   io_context_registry registry{cfg, *fixture.memory};
@@ -500,14 +501,19 @@ TEST_CASE(
   auto const local_path = make_regular_file();
 
   io_context_registry sirius_registry{
-    make_s3_scan_config("http://127.0.0.1:1", /*use_sirius_datasource=*/true), *fixture.memory};
+    make_s3_scan_config("http://127.0.0.1:1", sirius::scan_manager::io_backend::sirius),
+    *fixture.memory};
   CHECK(sirius_registry.lookup_path(local_path.string()) == io_context_type::uring);
 
   io_context_registry fallback_registry{
-    make_s3_scan_config("http://127.0.0.1:1", /*use_sirius_datasource=*/false), *fixture.memory};
+    make_s3_scan_config("http://127.0.0.1:1", sirius::scan_manager::io_backend::kvikio),
+    *fixture.memory};
   CHECK(fallback_registry.lookup_path(local_path.string()) == io_context_type::kvikio);
   CHECK(fallback_registry.lookup_path(local_path.string()) != io_context_type::uring);
-  CHECK(fallback_registry.lookup_path("s3://bucket/key.parquet") == io_context_type::restful);
+  // backend=kvikio also takes s3:// READS off the REST backend — kvikIO's
+  // RemoteHandle serves them; LIST/glob still uses the REST ioctx, obtained by
+  // type rather than by path.
+  CHECK(fallback_registry.lookup_path("s3://bucket/key.parquet") == io_context_type::kvikio);
 }
 
 TEST_CASE("scan_manager create_datasource resolves s3 paths to restful ioctx",
@@ -516,7 +522,9 @@ TEST_CASE("scan_manager create_datasource resolves s3 paths to restful ioctx",
   range_s3_server server(std::vector<std::uint8_t>(4096, std::uint8_t{0}));
   scan_manager_fixture fixture;
   sirius_scan_manager manager{
-    make_s3_scan_config(server.endpoint(), true), *fixture.memory, fixture.topology};
+    make_s3_scan_config(server.endpoint(), sirius::scan_manager::io_backend::sirius),
+    *fixture.memory,
+    fixture.topology};
 
   auto datasource = manager.create_datasource("s3://routing-bucket/data.parquet");
 
@@ -531,7 +539,9 @@ TEST_CASE("scan_manager concurrent first-touch reuses one routed S3 ioctx",
   range_s3_server server(std::vector<std::uint8_t>(4096, std::uint8_t{0}));
   scan_manager_fixture fixture;
   sirius_scan_manager manager{
-    make_s3_scan_config(server.endpoint(), true), *fixture.memory, fixture.topology};
+    make_s3_scan_config(server.endpoint(), sirius::scan_manager::io_backend::sirius),
+    *fixture.memory,
+    fixture.topology};
 
   auto constexpr kThreads = std::size_t{16};
   auto const uri          = std::string{"s3://routing-bucket/data.parquet"};
@@ -597,7 +607,7 @@ TEST_CASE("scan_manager create_datasource normalizes file URI paths before routi
   range_s3_server server(std::vector<std::uint8_t>(4096, std::uint8_t{0}));
   scan_manager_fixture fixture;
   sirius_scan_manager manager{
-    make_s3_scan_config(server.endpoint(), /*use_sirius_datasource=*/true),
+    make_s3_scan_config(server.endpoint(), sirius::scan_manager::io_backend::sirius),
     *fixture.memory,
     fixture.topology};
 
@@ -609,20 +619,25 @@ TEST_CASE("scan_manager create_datasource normalizes file URI paths before routi
   CHECK(datasource->io_ctx()->type() == io_context_type::uring);
 }
 
-TEST_CASE("scan_manager preserves S3 routing when local Sirius datasource fallback is disabled",
+TEST_CASE("scan_manager serves S3 reads from kvikio when backend=kvikio",
           "[s3][routing][scan_manager]")
 {
   range_s3_server server(std::vector<std::uint8_t>(4096, std::uint8_t{0}));
   scan_manager_fixture fixture;
   sirius_scan_manager manager{
-    make_s3_scan_config(server.endpoint(), false), *fixture.memory, fixture.topology};
+    make_s3_scan_config(server.endpoint(), sirius::scan_manager::io_backend::kvikio),
+    *fixture.memory,
+    fixture.topology};
 
   auto datasource = manager.create_datasource("s3://routing-bucket/data.parquet");
 
   REQUIRE(datasource != nullptr);
   REQUIRE(datasource->io_ctx() != nullptr);
-  CHECK(datasource->io_ctx()->type() == io_context_type::restful);
-  CHECK(datasource->io_ctx()->type() != io_context_type::kvikio);
+  CHECK(datasource->io_ctx()->type() == io_context_type::kvikio);
+  CHECK(datasource->size() == 4096);
+
+  std::vector<std::uint8_t> buffer(128, std::uint8_t{0xAB});
+  CHECK(datasource->host_read(0, buffer.size(), buffer.data()) == buffer.size());
 }
 
 TEST_CASE("scan_manager re-primes routed S3 cache on every query",
@@ -630,7 +645,7 @@ TEST_CASE("scan_manager re-primes routed S3 cache on every query",
 {
   range_s3_server server(std::vector<std::uint8_t>(4096, std::uint8_t{0}));
   scan_manager_fixture fixture;
-  auto cfg = make_s3_scan_config(server.endpoint(), /*use_sirius_datasource=*/true);
+  auto cfg = make_s3_scan_config(server.endpoint(), sirius::scan_manager::io_backend::sirius);
   cfg.enable_prefetch_cache = true;
   sirius_scan_manager manager{cfg, *fixture.memory, fixture.topology};
 
@@ -662,7 +677,7 @@ TEST_CASE("scan_manager tolerates routed S3 ioctx without a prefetch cache",
 {
   range_s3_server server(std::vector<std::uint8_t>(4096, std::uint8_t{0}));
   scan_manager_fixture fixture;
-  auto cfg = make_s3_scan_config(server.endpoint(), /*use_sirius_datasource=*/true);
+  auto cfg = make_s3_scan_config(server.endpoint(), sirius::scan_manager::io_backend::sirius);
   REQUIRE_FALSE(cfg.enable_prefetch_cache);
   sirius_scan_manager manager{cfg, *fixture.memory, fixture.topology};
 
@@ -682,7 +697,7 @@ TEST_CASE("rest perf instrumentation flag gates micro counters", "[s3][rest][per
 
   SECTION("flag off leaves latency micro-counters at zero while safety counters are readable")
   {
-    auto cfg                      = make_s3_scan_config(server.endpoint(), true);
+    auto cfg = make_s3_scan_config(server.endpoint(), sirius::scan_manager::io_backend::sirius);
     cfg.rest.perf_instrumentation = false;
     sirius_scan_manager manager{cfg, *fixture.memory, fixture.topology};
 
@@ -708,7 +723,7 @@ TEST_CASE("rest perf instrumentation flag gates micro counters", "[s3][rest][per
 
   SECTION("flag on records GET, queue, H2D, and TTFB timings")
   {
-    auto cfg                      = make_s3_scan_config(server.endpoint(), true);
+    auto cfg = make_s3_scan_config(server.endpoint(), sirius::scan_manager::io_backend::sirius);
     cfg.rest.perf_instrumentation = true;
     sirius_scan_manager manager{cfg, *fixture.memory, fixture.topology};
 
@@ -746,7 +761,7 @@ TEST_CASE("rest perf safety counters track retries and terminal failures", "[s3]
     fault.fail_status     = 503;
     range_s3_server server(std::vector<std::uint8_t>(4096, std::uint8_t{8}), fault);
 
-    auto cfg                      = make_s3_scan_config(server.endpoint(), true);
+    auto cfg = make_s3_scan_config(server.endpoint(), sirius::scan_manager::io_backend::sirius);
     cfg.rest.max_retry_attempts   = 4;
     cfg.rest.perf_instrumentation = false;
     sirius_scan_manager manager{cfg, *fixture.memory, fixture.topology};
@@ -771,7 +786,7 @@ TEST_CASE("rest perf safety counters track retries and terminal failures", "[s3]
     fault.fail_status   = 503;
     range_s3_server server(std::vector<std::uint8_t>(4096, std::uint8_t{9}), fault);
 
-    auto cfg                      = make_s3_scan_config(server.endpoint(), true);
+    auto cfg = make_s3_scan_config(server.endpoint(), sirius::scan_manager::io_backend::sirius);
     cfg.rest.max_retry_attempts   = 2;
     cfg.rest.perf_instrumentation = false;
     sirius_scan_manager manager{cfg, *fixture.memory, fixture.topology};
@@ -797,7 +812,7 @@ TEST_CASE("rest perf queue wait counts original requests rather than retry attem
   fault.fail_status     = 503;
   range_s3_server server(std::vector<std::uint8_t>(4096, std::uint8_t{10}), fault);
   scan_manager_fixture fixture;
-  auto cfg                      = make_s3_scan_config(server.endpoint(), true);
+  auto cfg = make_s3_scan_config(server.endpoint(), sirius::scan_manager::io_backend::sirius);
   cfg.rest.max_retry_attempts   = 4;
   cfg.rest.perf_instrumentation = true;
   sirius_scan_manager manager{cfg, *fixture.memory, fixture.topology};
@@ -818,7 +833,7 @@ TEST_CASE("rest perf snapshot aggregates counters across the reactor pool", "[s3
 {
   range_s3_server server(std::vector<std::uint8_t>(4096, std::uint8_t{11}));
   scan_manager_fixture fixture;
-  auto cfg                      = make_s3_scan_config(server.endpoint(), true);
+  auto cfg = make_s3_scan_config(server.endpoint(), sirius::scan_manager::io_backend::sirius);
   cfg.rest.perf_instrumentation = true;
   cfg.rest_n_reactors           = 2;
   sirius_scan_manager manager{cfg, *fixture.memory, fixture.topology};
@@ -851,7 +866,9 @@ TEST_CASE("parquet_gpu_ingestible resolver routes each parquet file independentl
   range_s3_server server(std::move(parquet_bytes));
   scan_manager_fixture fixture;
   sirius_scan_manager manager{
-    make_s3_scan_config(server.endpoint(), true), *fixture.memory, fixture.topology};
+    make_s3_scan_config(server.endpoint(), sirius::scan_manager::io_backend::sirius),
+    *fixture.memory,
+    fixture.topology};
 
   std::string const s3_uri     = "s3://routing-bucket/nation.parquet";
   std::string const local_path = fixture_path.string();
@@ -890,7 +907,9 @@ TEST_CASE("split_provider resolver routes mixed parquet files independently",
   range_s3_server server(std::move(parquet_bytes));
   scan_manager_fixture fixture;
   sirius_scan_manager manager{
-    make_s3_scan_config(server.endpoint(), true), *fixture.memory, fixture.topology};
+    make_s3_scan_config(server.endpoint(), sirius::scan_manager::io_backend::sirius),
+    *fixture.memory,
+    fixture.topology};
 
   std::string const s3_uri     = "s3://routing-bucket/nation.parquet";
   std::string const local_path = fixture_path.string();

@@ -80,7 +80,7 @@ sirius:
     host: { capacity_bytes: 25GB, initial_number_pools: 50, pool_size: 512, block_size: 1048576 }
     disk: { disk_id: 0, capacity_bytes: 1000000000000, downgrade_root_dirs: "/tmp/sirius_disk_memory" }
   executor:
-    scan_manager: { num_threads: 4, use_sirius_datasource: true, uring_n_reactors: 1, cache: none }
+    scan_manager: { num_threads: 4, backend: sirius, uring_n_reactors: 1, cache: none }
     pipeline:     { num_threads: 4 }
     downgrade:    { num_threads: 1 }
     task_creator: { num_threads: 1 }
@@ -277,7 +277,7 @@ The `sirius.executor.scan_manager` block configures the scan-metadata thread poo
 | `num_threads` | int (**> 2**) | remaining cores (min 4) | Threads in the scan-manager pool that run metadata tasks. Defaults to every core left after the other default pools (1 downgrade + 1 task_creator + 4 pipeline + 1 uring reactor), with a floor of 4. Rejected unless strictly greater than 2 (i.e. minimum 3). |
 | `thread_name_prefix` | string | `scan_manager` | Thread name prefix for logs. |
 | `cpu_affinity` | list of int | — | Cores to pin scan-manager threads to. |
-| `use_sirius_datasource` | bool | true | Route reads through the Sirius `io_uring` datasource. When false, the kvikio fallback is used (single-GPU only; multi-GPU requires the Sirius datasource). |
+| `backend` | enum: `sirius`, `kvikio` | `sirius` | IO backend for reads. `sirius` uses the Sirius IO stack (`io_uring` for local paths, REST for `s3://`); `kvikio` routes local files to the kvikIO fallback (single-GPU only; multi-GPU requires `sirius`). Values are lowercase. |
 | `uring_n_reactors` | int (**> 0**) | 1 | Number of io_uring reactor threads for local-disk reads. |
 | `rest_n_reactors` | int (**> 0**) | 2 | Number of REST reactor threads for object-store (`s3://`) reads. |
 | `cache` | enum: `none`, `os`, `persistent`, `prefetch` | `none` | Read-path caching strategy (see below). Values are lowercase. |
@@ -285,7 +285,7 @@ The `sirius.executor.scan_manager` block configures the scan-metadata thread poo
 `cache` is the single knob for the read path; it derives three settings that are
 therefore **not** individually settable from YAML:
 
-| `cache` | `local.use_odirect` | `enable_prefetch_cache` | `prefetch_cache.dispose_on_idle` |
+| `cache` | `uring.use_odirect` | `enable_prefetch_cache` | `prefetch_cache.dispose_on_idle` |
 |---------|---------------------|-------------------------|----------------------------------|
 | `none` | true | false | — |
 | `os` | false | false | — |
@@ -298,7 +298,7 @@ chunks for reuse; `prefetch` uses the same cache but drops each chunk once it go
 
 Five optional nested sub-configs tune the individual backends and caches:
 
-### `scan_manager.local` — io_uring backend (`io/uring/config.hpp`)
+### `scan_manager.uring` — io_uring backend (`io/uring/config.hpp`)
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
@@ -330,7 +330,7 @@ Five optional nested sub-configs tune the individual backends and caches:
 
 ### `scan_manager.kvikio` — kvikIO local-file backend (`io/kvikio/config.hpp`)
 
-Used only when `use_sirius_datasource: false` routes local files to the kvikIO
+Used only when `backend: kvikio` routes local files to the kvikIO
 fallback. **Every key is optional and unset means "leave kvikIO's own default
 alone"** — kvikIO seeds each setting from an environment variable at first use, so
 omitting a key preserves that value and setting one overrides it.
