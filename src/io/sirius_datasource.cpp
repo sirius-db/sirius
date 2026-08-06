@@ -193,10 +193,10 @@ void sirius_datasource::fadvise(std::span<const cudf::io::text::byte_range_info>
   auto* cache = _io_ctx->cache();
   if (cache == nullptr || !_io_ctx->can_use_prefetching_cache()) { return; }
 
-  // The contract is "one scan, one datasource": a second
-  // speculative/immediate fadvise on a datasource that already carries a
-  // handle is a caller bug.  Warn loudly; cancel the stale handle so the
-  // worker drops the old request and we don't leak both into the cache.
+  // The contract is "one scan, one datasource": a second fadvise on a
+  // datasource that already carries a handle is a caller bug.  Warn loudly;
+  // cancel the stale handle so the worker drops the old request and we don't
+  // leak both into the cache.
   if (_prefetch_handle) {
     if (_prefetch_handle.is_active()) {
       SIRIUS_LOG_WARN(
@@ -218,7 +218,7 @@ void sirius_datasource::fadvise(std::span<const cudf::io::text::byte_range_info>
 
 void sirius_datasource::prefetch(cache::prefetching_stage site)
 {
-  auto const preferred = _io_ctx->preferred_prefetching_stage();
+  auto const preferred = _io_ctx->prefetching_activation_stage();
   if (preferred == cache::prefetching_stage::none) { return; }
   if (_prefetch_handle) {
     if (site == cache::prefetching_stage::disposable) {
@@ -232,6 +232,28 @@ void sirius_datasource::prefetch(cache::prefetching_stage site)
 bool sirius_datasource::uses_prefetching_cache() const noexcept
 {
   return _io_ctx->uses_prefetching_cache();
+}
+
+cache::prefetching_stage sirius_datasource::activation_stage() const noexcept
+{
+  // _io_ctx is set at construction and never reassigned; the null guard mirrors metadata()'s and
+  // keeps this accessor honestly noexcept for a defensively-constructed datasource.
+  if (!_io_ctx) { return cache::prefetching_stage::none; }
+  return _io_ctx->prefetching_activation_stage();
+}
+
+cache::prefetch_progress sirius_datasource::prefetch_state() const noexcept
+{
+  // No handle at all is the normal state on every shipped local backend: fadvise returns without
+  // storing one when the ioctx has no prefetching cache.
+  if (!_prefetch_handle) { return cache::prefetch_progress::empty; }
+  // get_context() returns the shared_ptr BY VALUE, so this is a shared_ptr copy (two atomic RMWs)
+  // plus the two lock-free single-word loads below -- not two loads on their own.
+  auto const ctx = _prefetch_handle.get_context();
+  if (!ctx || !ctx->state) { return cache::prefetch_progress::empty; }
+  // ctx->chunks is NOT read here, and must never be: prefetching_cache::prefetch_loop erases from
+  // that vector with no lock held, so walking it from a consumer thread is a data race.
+  return cache::progress_from(ctx->state->get_state(), ctx->is_cancelled());
 }
 
 }  // namespace sirius::io

@@ -24,8 +24,10 @@
 #include <deque>
 #include <memory>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 using sirius::op::MemoryBarrierType;
@@ -37,7 +39,9 @@ using sirius::pipeline::sirius_pipeline_build_state;
 using sirius::planner::barrier_order;
 using sirius::planner::build_index_options;
 using sirius::planner::build_probe;
+using sirius::planner::order_type;
 using sirius::planner::pipeline_order;
+using sirius::planner::prefetch_step;
 using sirius::planner::query_index;
 
 namespace {
@@ -114,6 +118,20 @@ class dag_builder {
         ids.push_back(_ids.at(p));
       }
       out.push_back(std::move(ids));
+    }
+    return out;
+  }
+
+  // Convert prefetch steps to (id, order) pairs for readable assertions. A step names the branch
+  // head's source operator, and every operator here owns exactly one pipeline, so the pipeline it
+  // was added under is its label.
+  std::vector<std::pair<int, order_type>> label(std::span<const prefetch_step> steps) const
+  {
+    std::vector<std::pair<int, order_type>> out;
+    out.reserve(steps.size());
+    for (const auto& step : steps) {
+      out.emplace_back(step.scan == nullptr ? 0 : _ids.at(step.scan->get_pipeline().get()),
+                       step.order);
     }
     return out;
   }
@@ -255,4 +273,249 @@ TEST_CASE("query_index barrier_order does not pipeline the hash-join probe side"
   REQUIRE(contains(got, {1}));
   REQUIRE(contains(got, {3}));
   REQUIRE(contains(got, {2, 4}));
+}
+
+//===----------------------------------------------------------------------===//
+// prefetching_order / get_branch_order_type
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+using scan_steps = std::vector<std::pair<int, order_type>>;
+
+// make_example()'s DAG with the two source pipelines typed as scans:
+//   1 -> 2 -> 3 --[FULL]--> 4 ;  5 -> 6 --[PIPELINE]--> 4 ;  4 -> 7 -> 8
+// Pipeline 4 also heads a branch under pipeline_order, but it is a PROJECTION, so it must not
+// appear in the prefetch order.
+dag_builder make_scan_example()
+{
+  dag_builder b;
+  auto p1 = b.add(1, SiriusPhysicalOperatorType::GPU_SCAN);
+  auto p2 = b.add(2);
+  auto p3 = b.add(3);
+  auto p4 = b.add(4);
+  auto p5 = b.add(5, SiriusPhysicalOperatorType::GPU_SCAN);
+  auto p6 = b.add(6);
+  auto p7 = b.add(7);
+  auto p8 = b.add(8);
+
+  b.connect(p1, p2, MemoryBarrierType::PIPELINE);
+  b.connect(p2, p3, MemoryBarrierType::PIPELINE);
+  b.connect(p3, p4, MemoryBarrierType::FULL);
+  b.connect(p5, p6, MemoryBarrierType::PIPELINE);
+  b.connect(p6, p4, MemoryBarrierType::PIPELINE);
+  b.connect(p4, p7, MemoryBarrierType::PIPELINE);
+  b.connect(p7, p8, MemoryBarrierType::PIPELINE);
+  return b;
+}
+
+// join_dag with both sides typed as scans, so the prefetch order has something to order:
+//   probe(1) --[FULL,"default"]--> join(2) ;  build(3) --[FULL,"build"]--> join(2) ;  join -> 4
+// Note the probe pipeline is added first, so plan order alone would put it first.
+struct scan_join_dag {
+  dag_builder b;
+  duckdb::shared_ptr<sirius_pipeline> probe, build, join, tail;
+  scan_join_dag()
+  {
+    probe = b.add(1, SiriusPhysicalOperatorType::GPU_SCAN);
+    build = b.add(3, SiriusPhysicalOperatorType::GPU_SCAN);
+    join  = b.add(2, SiriusPhysicalOperatorType::HASH_JOIN);
+    tail  = b.add(4);
+    b.connect(probe, join, MemoryBarrierType::FULL, "default");
+    b.connect(build, join, MemoryBarrierType::FULL, "build");
+    b.connect(join, tail, MemoryBarrierType::PIPELINE);
+  }
+};
+
+}  // namespace
+
+TEST_CASE("prefetching_order lists only GPU scan branch heads",
+          "[query_index][prefetch_api][prefetching_order]")
+{
+  auto b     = make_scan_example();
+  auto index = query_index::build_index(b.pipelines(), build_index_options{pipeline_order{}});
+
+  // Three branches ([1,2,3], [4,7,8], [5,6]) but only two scan-headed ones: pipeline 4 heads a
+  // branch and is excluded because its source is a PROJECTION, not a GPU_SCAN.
+  REQUIRE(index->get_branches().size() == 3);
+  CHECK(b.label(index->prefetching_order()) ==
+        scan_steps{{1, order_type::full_barrier}, {5, order_type::streaming}});
+}
+
+TEST_CASE("prefetching_order classifies a branch by its terminating barrier",
+          "[query_index][prefetch_api][prefetching_order]")
+{
+  SECTION("a branch cut by a full barrier is a full_barrier step")
+  {
+    auto b     = make_scan_example();
+    auto index = query_index::build_index(b.pipelines(), build_index_options{pipeline_order{}});
+    auto steps = b.label(index->prefetching_order());
+
+    // The 1->2->3 branch is cut by the FULL edge leaving its tail into pipeline 4.
+    REQUIRE_FALSE(steps.empty());
+    CHECK(steps.front() == std::pair{1, order_type::full_barrier});
+  }
+
+  SECTION("a branch cut by a partial barrier is a serial_barrier step")
+  {
+    // The DAG shape of "barrier_order with a partial barrier also extends", with both feeding
+    // pipelines typed as scans and read under pipeline_order so each keeps its own branch.
+    dag_builder b;
+    auto full    = b.add(1, SiriusPhysicalOperatorType::GPU_SCAN);
+    auto partial = b.add(2, SiriusPhysicalOperatorType::GPU_SCAN);
+    auto join    = b.add(3);
+    auto tail    = b.add(4);
+
+    b.connect(full, join, MemoryBarrierType::FULL);
+    b.connect(partial, join, MemoryBarrierType::PARTIAL);
+    b.connect(join, tail, MemoryBarrierType::PIPELINE);
+
+    auto index = query_index::build_index(b.pipelines());
+    CHECK(b.label(index->prefetching_order()) ==
+          scan_steps{{1, order_type::full_barrier}, {2, order_type::serial_barrier}});
+  }
+
+  SECTION("a branch feeding nothing is a streaming step")
+  {
+    // The plan's final sink: nothing waits on it, so no barrier class applies and it streams.
+    dag_builder b;
+    b.add(1, SiriusPhysicalOperatorType::GPU_SCAN);
+
+    auto index = query_index::build_index(b.pipelines());
+    CHECK(b.label(index->prefetching_order()) == scan_steps{{1, order_type::streaming}});
+  }
+}
+
+TEST_CASE("prefetching_order puts a hash join's build side before its probe side",
+          "[query_index][prefetch_api][prefetching_order]")
+{
+  // The scheduler wants the blocking side warm first: nothing downstream of the join runs until
+  // the build completes. Here the join's own output is NOT cut, so the probe branch (which always
+  // absorbs the join under build_probe) is classified streaming by that uncut output while the
+  // build branch keeps its FULL barrier — and the sort by barrier class overrides plan order, in
+  // which the probe comes first. The next case shows what happens when the join's output IS cut.
+  scan_join_dag d;
+  auto index = query_index::build_index(d.b.pipelines(), build_index_options{build_probe{}});
+
+  CHECK(d.b.label(index->prefetching_order()) ==
+        scan_steps{{3, order_type::full_barrier}, {1, order_type::streaming}});
+}
+
+TEST_CASE("prefetching_order does not order build before probe when the join output is cut",
+          "[query_index][prefetch_api][prefetching_order]")
+{
+  // The counter-example to the guarantee, and a shape TPC-H produces routinely: a join feeding
+  // another join's build side.
+  //
+  //   probe(1) --[FULL,"default"]--> join(2) ;  build(3) --[FULL,"build"]--> join(2)
+  //   join(2)  --[FULL]-----------> agg(4, multiport)
+  //
+  // build_probe rewrites the probe edge to PIPELINE, which never cuts (pipeline_dag::cuts requires
+  // FULL), so the probe branch ALWAYS absorbs the join and is classified by what is downstream of
+  // it — here a FULL edge into a multiport consumer. Both branches therefore classify
+  // full_barrier, the stable sort preserves plan order, and the probe (added first) is emitted
+  // first. The rewritten probe edge is never the operative mechanism.
+  //
+  // This case pins current behaviour on purpose. Making build-before-probe unconditional needs a
+  // rank ("how soon does this branch block") rather than a three-valued barrier class — the
+  // deferred blocking_distance rule documented on query_index::prefetching_order. When that lands,
+  // this expectation flips to {3, ...} then {1, ...} and this comment goes with it.
+  dag_builder b;
+  auto probe = b.add(1, SiriusPhysicalOperatorType::GPU_SCAN);
+  auto build = b.add(3, SiriusPhysicalOperatorType::GPU_SCAN);
+  auto join  = b.add(2, SiriusPhysicalOperatorType::HASH_JOIN);
+  auto other = b.add(5);  // second input to the multiport consumer, so agg really is multiport
+  auto agg   = b.add(4);
+
+  b.connect(probe, join, MemoryBarrierType::FULL, "default");
+  b.connect(build, join, MemoryBarrierType::FULL, "build");
+  b.connect(join, agg, MemoryBarrierType::FULL);
+  b.connect(other, agg, MemoryBarrierType::FULL);
+
+  auto index = query_index::build_index(b.pipelines(), build_index_options{build_probe{}});
+  auto steps = b.label(index->prefetching_order());
+
+  REQUIRE(steps.size() == 2);
+  CHECK(steps[0].second == order_type::full_barrier);
+  CHECK(steps[1].second == order_type::full_barrier);
+  // Plan order, not build-first: the probe was added first and nothing reorders it.
+  CHECK(steps == scan_steps{{1, order_type::full_barrier}, {3, order_type::full_barrier}});
+}
+
+TEST_CASE("prefetching_order preserves plan order within a barrier class",
+          "[query_index][prefetch_api][prefetching_order]")
+{
+  // Three independent scans all cut by a FULL edge into one multiport consumer. The sort is
+  // stable, so nothing reorders them and they come out in the order they were added — which is
+  // plan order, which is the scheduling priority order.
+  dag_builder b;
+  auto first  = b.add(1, SiriusPhysicalOperatorType::GPU_SCAN);
+  auto second = b.add(2, SiriusPhysicalOperatorType::GPU_SCAN);
+  auto third  = b.add(3, SiriusPhysicalOperatorType::GPU_SCAN);
+  auto sink   = b.add(4);
+
+  b.connect(first, sink, MemoryBarrierType::FULL);
+  b.connect(second, sink, MemoryBarrierType::FULL);
+  b.connect(third, sink, MemoryBarrierType::FULL);
+
+  auto index = query_index::build_index(b.pipelines());
+  CHECK(b.label(index->prefetching_order()) == scan_steps{{1, order_type::full_barrier},
+                                                          {2, order_type::full_barrier},
+                                                          {3, order_type::full_barrier}});
+}
+
+// NOTE: there is deliberately no case for prefetching_order's `seen` dedup set. Every branch head
+// it could deduplicate is a distinct source operator -- dag_builder, like the real plan converter,
+// gives each pipeline its own -- so no input this harness can build reaches the second insert.
+// Extending the harness to fabricate two pipelines sharing one source operator would be testing a
+// state the engine does not produce. The set is commented as defensive at its definition instead.
+
+TEST_CASE("prefetching_order terminates on a cyclic dag",
+          "[query_index][prefetch_api][prefetching_order]")
+{
+  // Delim-join distribution edges make genuine cycles reachable, so the ordering must not be a
+  // graph search that can loop: 2 and 3 feed each other. The assertion is that the call returns
+  // at all; the ids are a sanity check that it returned the two branch heads and not garbage.
+  dag_builder b;
+  auto entry = b.add(1, SiriusPhysicalOperatorType::GPU_SCAN);
+  auto left  = b.add(2, SiriusPhysicalOperatorType::GPU_SCAN);
+  auto right = b.add(3, SiriusPhysicalOperatorType::GPU_SCAN);
+
+  b.connect(entry, left, MemoryBarrierType::PIPELINE);
+  b.connect(left, right, MemoryBarrierType::PIPELINE);
+  b.connect(right, left, MemoryBarrierType::PIPELINE);
+
+  auto index = query_index::build_index(b.pipelines());
+  std::vector<prefetch_step> steps;
+  REQUIRE_NOTHROW(steps = index->prefetching_order());
+  CHECK(b.label(steps) == scan_steps{{1, order_type::streaming}, {2, order_type::streaming}});
+}
+
+TEST_CASE("prefetching_order is empty for a query with no GPU scan",
+          "[query_index][prefetch_api][prefetching_order]")
+{
+  auto b     = make_example();  // every pipeline is a PROJECTION
+  auto index = query_index::build_index(b.pipelines());
+
+  CHECK(index->prefetching_order().empty());
+}
+
+TEST_CASE("get_branch_order_type is parallel to get_branches",
+          "[query_index][prefetch_api][prefetching_order]")
+{
+  auto b     = make_scan_example();
+  auto index = query_index::build_index(b.pipelines(), build_index_options{pipeline_order{}});
+  auto got   = b.label(index->get_branches());
+
+  // Branches in plan order: [1,2,3] cut by its FULL edge into 4; [4,7,8] feeding nothing;
+  // [5,6] cut by a PIPELINE edge into 4.
+  REQUIRE(got.size() == 3);
+  REQUIRE(got[0] == std::vector<int>{1, 2, 3});
+  REQUIRE(got[1] == std::vector<int>{4, 7, 8});
+  REQUIRE(got[2] == std::vector<int>{5, 6});
+
+  CHECK(index->get_branch_order_type(0) == order_type::full_barrier);
+  CHECK(index->get_branch_order_type(1) == order_type::streaming);
+  CHECK(index->get_branch_order_type(2) == order_type::streaming);
+  CHECK_THROWS_AS(index->get_branch_order_type(got.size()), std::out_of_range);
 }

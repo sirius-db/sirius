@@ -169,6 +169,14 @@ class parquet_split_info : public scan_info {
   /// the reader_options column projection). Drives prefetch for the materialize
   /// read across every file in the batch.
   [[nodiscard]] std::vector<fadvise_entry> fadvise_entries() const override;
+
+  /// Visits the datasource of each @ref rg_slices entry that carries one, in slice
+  /// order. Computes no byte ranges — see @ref scan_info::for_each_datasource.
+  void for_each_datasource(
+    const std::function<void(sirius::io::sirius_datasource&)>& visit) const override;
+
+  /// Number of @ref rg_slices entries carrying a non-null datasource.
+  [[nodiscard]] std::size_t datasource_count() const noexcept override;
 };
 
 //===----------------------------------------------------------------------===//
@@ -248,6 +256,14 @@ class parquet_file_scan_info : public scan_info {
   /// @c hybrid_scan_reader::all_column_chunks_byte_ranges, honoring the
   /// reader_options column projection).
   [[nodiscard]] std::vector<fadvise_entry> fadvise_entries() const override;
+
+  /// Visits @ref datasource when it is non-null. Computes no byte ranges — see
+  /// @ref scan_info::for_each_datasource.
+  void for_each_datasource(
+    const std::function<void(sirius::io::sirius_datasource&)>& visit) const override;
+
+  /// 1 when @ref datasource is non-null, 0 otherwise.
+  [[nodiscard]] std::size_t datasource_count() const noexcept override;
 };
 
 //===----------------------------------------------------------------------===//

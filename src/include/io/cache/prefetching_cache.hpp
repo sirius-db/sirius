@@ -126,9 +126,8 @@ class prefetching_handle {
 class prefetching_cache {
   // The cache only accepts new prefetch requests through
   // sirius_datasource::fadvise — that's the single entry point for the
-  // fadvise(speculative/immediate/disposable) protocol.  Friending the
-  // datasource keeps insert() out of the public API while still letting
-  // fadvise dispatch through it.
+  // fadvise/prefetch protocol.  Friending the datasource keeps insert() out of
+  // the public API while still letting fadvise dispatch through it.
   friend class sirius::io::sirius_datasource;
   // prefetching_handle calls notify_disposed() on cancel — needs access to
   // the private method.

@@ -35,6 +35,7 @@
 #include "op/scan/sirius_gpu_scan_operator_data.hpp"
 #include "op/sirius_physical_operator_type.hpp"
 #include "planner/query.hpp"
+#include "scan_manager/prefetching_state_manager.hpp"
 #include "scan_manager/round_robin_strategy.hpp"
 
 #include <cudf/column/column_view.hpp>
@@ -542,6 +543,17 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
   auto round_robin =
     std::make_shared<round_robin_strategy>(std::vector<int>(gpu_ids.begin(), gpu_ids.end()));
 
+  // A FRESH instance every query, never a reset of a surviving one. ~split_connector runs at
+  // query_.reset() (sirius_context.cpp:305), which is *before* scan_manager_->reset() (:350), and a
+  // task can still be in flight on a GPU executor thread at that point — so a straggler split from
+  // query N must decrement query N's counters, not this query's. The shared_ptr each split holds is
+  // what keeps the old instance alive for exactly that long.
+  _prefetching_state =
+    std::make_shared<prefetching_state_manager>(prefetching_state_manager::config{
+      .memory_threshold          = _config.prefetch_memory_threshold,
+      .prefetch_lookahead_window = _config.prefetch_lookahead_window});
+  _prefetching_state->prepare_for_query(query);
+
   _metadata_processor = std::make_unique<load_balancing_scan_batch_coalescer>();
 
   std::vector<cached_assignment> cached_assignments;
@@ -549,7 +561,7 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
     if (scan_op->type != ::sirius::op::SiriusPhysicalOperatorType::GPU_SCAN) { continue; }
     auto* op = &scan_op->Cast<op::scan::sirius_gpu_scan_operator>();
     if (_providers_by_op.find(op) != _providers_by_op.end()) { continue; }
-    _metadata_processor->register_pipeline(op, round_robin);
+    _metadata_processor->register_pipeline(op, round_robin, _prefetching_state);
     // On a pinned-cache hit the coalescer serves this operator from a cached
     // batch_provider (process_cached_entries); skip the disk-reading
     // split_provider entirely so no read is issued for the cached scan. The
@@ -812,6 +824,11 @@ void sirius_scan_manager::reset()
   _pending_mvcc_mask_jobs.clear();
   _pending_insert_delta_jobs.clear();
   _metadata_processor.reset();
+  // Log the ladder summary and detach, then drop our reference. Splits still alive elsewhere keep
+  // the instance itself alive through their own shared_ptr and go on decrementing it harmlessly —
+  // nobody reads those counters again.
+  if (_prefetching_state) { _prefetching_state->clean_up(); }
+  _prefetching_state.reset();
   _dispatcher = std::make_unique<exec::scoped_dispatcher>(_thread_pool, _thread_pool.num_threads());
 }
 

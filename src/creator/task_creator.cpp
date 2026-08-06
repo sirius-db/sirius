@@ -36,6 +36,7 @@
 #include <limits>
 #include <mutex>
 #include <optional>
+#include <stdexcept>
 #include <unordered_map>
 #include <utility>
 
@@ -232,6 +233,18 @@ void task_creator::drain_pending_tasks()
 
 void task_creator::reset()
 {
+  // The hooks are per-query — SiriusContext::create_query installs them with that query's state
+  // manager captured — so one left installed by query N would keep firing into query N+1.
+  //
+  // Cleared before _global_state_mutex is taken, not under it, so the callables (and therefore
+  // anything they captured) are destroyed with no task_creator lock held. The exchanges below
+  // hold the last reference unless a fire is running concurrently, in which case that fire's
+  // snapshot keeps the callable alive until it returns.
+  {
+    auto const depleted    = _on_task_queue_depleted.exchange(nullptr);
+    auto const not_created = _on_task_not_created.exchange(nullptr);
+  }
+
   std::lock_guard<std::mutex> lock(_global_state_mutex);
   _gpu_operator_global_state_map.clear();
   _thread_context.reset();
@@ -314,6 +327,16 @@ void task_creator::schedule(op::sirius_physical_operator* node)
 
 void task_creator::schedule_lookahead(std::optional<int> device_id_hint)
 {
+  // Anchor A. First statement on purpose, and both halves of that matter:
+  //   * before the strategy gate, because look-ahead is off by default (config.hpp's
+  //     strategy{request_type::active}) and a hook anchored below the gate would be dead in the
+  //     configuration almost every query runs in;
+  //   * before _lookahead_mutex, because _lookahead_mutex is a non-recursive std::mutex and a hook
+  //     that re-enters schedule_lookahead would self-deadlock on it.
+  // This is also the true depletion predicate: the only caller (task_scheduler) reaches here under
+  // `if (_task_queue.empty())`.
+  fire_task_queue_depleted();
+
   if (_config.strategy != request_type::lookahead) { return; }
   std::lock_guard lock(_lookahead_mutex);
   for (; _index_of_next_lookahead < _lookahead_queue.size(); ++_index_of_next_lookahead) {
@@ -338,6 +361,52 @@ void task_creator::schedule_lookahead(std::optional<int> device_id_hint)
   }
 }
 
+void task_creator::set_on_task_queue_depleted(task_queue_depleted_hook hook)
+{
+  // Sink parameter moved onto the heap exactly once, here. This is the only allocation in the
+  // hook's whole life: every later fire copies the shared_ptr, not the std::function.
+  // An empty callable clears the slot, so set(nullptr) still means "no hook".
+  _on_task_queue_depleted.store(
+    hook ? std::make_shared<const task_queue_depleted_hook>(std::move(hook)) : nullptr);
+}
+
+void task_creator::set_on_task_not_created(task_not_created_hook hook)
+{
+  _on_task_not_created.store(hook ? std::make_shared<const task_not_created_hook>(std::move(hook))
+                                  : nullptr);
+}
+
+void task_creator::fire_task_queue_depleted() noexcept
+{
+  // The whole body is guarded, not just the invocation, so a throw from anywhere in here skips
+  // one prefetch nudge rather than terminating the scheduler's management thread.
+  try {
+    // A shared_ptr copy: one atomic refcount bump, no allocation, no lock. The snapshot keeps the
+    // callable alive across the call, so a concurrent set_* or reset() cannot destroy it
+    // mid-invocation, and the hook never runs with a task_creator lock held.
+    auto const hook = _on_task_queue_depleted.load();
+    if (!hook || !*hook) { return; }
+    (*hook)();
+  } catch (...) {
+    SIRIUS_LOG_WARN("Task Creator: on_task_queue_depleted hook threw; ignoring");
+  }
+}
+
+void task_creator::fire_task_not_created(const op::sirius_physical_operator* requested,
+                                         request_type kind) noexcept
+{
+  // Same lock-free snapshot-then-fire discipline. The backstop matters more here: the production
+  // call site sits outside the dispatch lambda's try block on the engine's single task-creation
+  // thread, so an escaping exception would end all task creation silently.
+  try {
+    auto const hook = _on_task_not_created.load();
+    if (!hook || !*hook) { return; }
+    (*hook)(requested, kind);
+  } catch (...) {
+    SIRIUS_LOG_WARN("Task Creator: on_task_not_created hook threw; ignoring");
+  }
+}
+
 void task_creator::manager_loop()
 {
   while (_running.load()) {
@@ -356,9 +425,20 @@ void task_creator::manager_loop()
     auto request_kind = request->type;
     if (node == nullptr) { continue; }
 
-    node = get_operator_for_next_task(node);
+    // Keep the operator the request started from: get_operator_for_next_task walks upstream and
+    // overwrites `node`, and the hook reports what was *asked* for, not where the walk stopped.
+    auto* const requested = node;
+    node                  = get_operator_for_next_task(node);
 
-    if (node == nullptr) { continue; }
+    if (node == nullptr) {
+      // Anchor B. The reserved pool slot is dropped un-dispatched here — that is precisely the
+      // "creation attempt produced no task" signal — and it is the only point in this loop where
+      // no lock is held: the task_creation_lock window lives inside the dispatch lambda below,
+      // holds sirius_pipeline::_status_mutex, and then blocks in get_next_split(). A hook fired in
+      // there could reach the scan manager and wait on split production, closing the cycle.
+      fire_task_not_created(requested, request_kind);
+      continue;
+    }
 
     // Dispatch the task creation work to the pool
     _bounded_pool->dispatch(std::move(slot), [this, node, request_kind]() mutable {

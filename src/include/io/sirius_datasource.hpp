@@ -116,34 +116,74 @@ class sirius_datasource : public cudf::io::datasource {
   /// \brief Hint the IO layer about @p ranges that this scan will (or might) read
   /// soon.
   ///
-  /// The behaviour depends on @p site and the io_ctx's
-  /// @c preferred_prefetching_stage:
-  ///   - @c speculative / @c immediate: only honored when @p site matches
-  ///     the ioctx's preferred mode.  Hands @p ranges to the prefetching
-  ///     cache and stashes the returned @c prefetching_handle on this
-  ///     datasource so a later @c fadvise(disposable) can cancel.
-  ///   - @c disposable: always honored.  If a handle is stored (i.e. a
-  ///     prior speculative/immediate call enqueued work), cancel it so the
-  ///     cache worker drops still-pending entries.
-  ///   - @c none: no-op (either the call site asked for nothing, or the
-  ///     backend opted out of prefetching).
+  /// Hands @p ranges to the prefetching cache and stashes the returned
+  /// @c prefetching_handle on this datasource so a later @c prefetch call can
+  /// activate or cancel the request.  No-op when the ioctx has no prefetching
+  /// cache or cannot use one.
   ///
-  /// Calling @c fadvise with a non-disposable @p site while a handle is
-  /// already stored emits a warning: the datasource lifecycle expects one
-  /// speculative-or-immediate insert per scan, with a single
-  /// @c disposable call at consume time.
+  /// Calling @c fadvise while a handle is already stored emits a warning: the
+  /// datasource lifecycle expects one insert per scan, with a single
+  /// @c prefetch(disposable) call at consume time.
   void fadvise(std::span<const cudf::io::text::byte_range_info> ranges, std::optional<int> dev_id);
 
+  /// \brief Drive the stored @c prefetching_handle for ladder rung @p site.
+  ///
+  /// A rung is honored only when a handle is stored (i.e. an earlier @c fadvise enqueued work)
+  /// **and** the io_ctx's @c prefetching_activation_stage is not @c prefetching_stage::none.
+  /// Under those two preconditions:
+  ///   - @p site == the ioctx's activation stage: activate the stored handle so
+  ///     the cache worker starts the IO.
+  ///   - @c prefetching_stage::disposable: cancel the handle so the cache worker
+  ///     drops still-pending entries.
+  ///   - any other rung: no-op.
+  ///
+  /// The @c none check comes first, so a backend that opted out of the ladder does not cancel
+  /// either — even if some other route armed a cache and stored a handle on it. That ordering is
+  /// deliberate but arguably wrong for @c disposable; changing it is a behaviour change to the IO
+  /// path and is tracked as a follow-up rather than fixed here.
   void prefetch(cache::prefetching_stage site);
 
   [[nodiscard]] bool uses_prefetching_cache() const noexcept;
 
+  /**
+   * @brief The ladder rung at which this datasource's backend activates a prefetch.
+   *
+   * Forwards to @c sirius_ioctx::prefetching_activation_stage without copying the ioctx
+   * @c shared_ptr — @ref io_ctx returns it **by value**, so routing through that accessor would
+   * cost a refcount round trip per call on a path that runs per datasource under a mutex.
+   *
+   * @return @c cache::prefetching_stage::none when the backend never activates (both shipped
+   *         local backends), and also when this datasource carries no ioctx.
+   */
+  [[nodiscard]] cache::prefetching_stage activation_stage() const noexcept;
+
+  /**
+   * @brief Advisory progress of this datasource's stored prefetch request.
+   *
+   * Reads only lock-free atomics reachable from the stored @c prefetching_handle:
+   * @c prefetch_request_context::state and @c ::user_state. It never touches
+   * @c prefetch_request_context::chunks, which is mutated without a lock by the cache's
+   * prefetch thread.
+   *
+   * @return @c prefetch_progress::empty when no @c fadvise has stored a handle (the normal
+   *         state for a datasource on a backend with no prefetching cache), otherwise the
+   *         fused intent/entry-state view. See @ref cache::prefetch_progress for its
+   *         documented inaccuracies — advisory only.
+   *
+   * @warning **Precondition:** the caller must be ordered after this datasource's last
+   *          @c fadvise call. @c _prefetch_handle is move-assigned by @c fadvise with no
+   *          lock; production satisfies this because every @c fadvise runs on the single
+   *          coalescer sequencer thread strictly before @c split_connector::push_split, whose
+   *          mutex publishes the write to every later reader.
+   */
+  [[nodiscard]] cache::prefetch_progress prefetch_state() const noexcept;
+
  private:
   std::shared_ptr<sirius_ioctx> _io_ctx;
   std::shared_ptr<sirius_io_object> _io_object;
-  /// Handle of the most recent speculative/immediate insert into the
-  /// prefetching cache, or empty if none was made.  fadvise(disposable)
-  /// uses this to cancel still-pending work.
+  /// Handle of the most recent insert into the prefetching cache, or empty if
+  /// none was made.  @c prefetch(disposable) uses this to cancel still-pending
+  /// work.
   cache::prefetching_handle _prefetch_handle;
 };
 

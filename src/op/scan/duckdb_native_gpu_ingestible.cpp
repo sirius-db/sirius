@@ -161,6 +161,23 @@ class duckdb_native_batch_coalescer : public batch_coalescer {
 }  // namespace
 
 //===----------------------------------------------------------------------===//
+// duckdb_native_scan_info — datasource access
+//===----------------------------------------------------------------------===//
+void duckdb_native_scan_info::for_each_datasource(
+  const std::function<void(sirius::io::sirius_datasource&)>& visit) const
+{
+  // Deliberately not gated on block_manager (which fadvise_entries needs to derive byte ranges)
+  // or on host_backed_only: a datasource that is present is a live object the caller may hint,
+  // and no ranges are computed here.
+  if (datasource) { visit(*datasource); }
+}
+
+std::size_t duckdb_native_scan_info::datasource_count() const noexcept
+{
+  return datasource ? 1U : 0U;
+}
+
+//===----------------------------------------------------------------------===//
 // duckdb_native_gpu_ingestible — construction
 //===----------------------------------------------------------------------===//
 duckdb_native_gpu_ingestible::duckdb_native_gpu_ingestible(

@@ -407,6 +407,38 @@ std::vector<scan_info::fadvise_entry> parquet_split_info::fadvise_entries() cons
   return entries;
 }
 
+void parquet_file_scan_info::for_each_datasource(
+  const std::function<void(sirius::io::sirius_datasource&)>& visit) const
+{
+  // Unlike fadvise_entries above, nothing here consults file_metadata or reader_options: the
+  // datasource is what the caller asked for, and computing the byte ranges to reach it is the
+  // cost this method exists to avoid.
+  if (datasource) { visit(*datasource); }
+}
+
+std::size_t parquet_file_scan_info::datasource_count() const noexcept
+{
+  return datasource ? 1U : 0U;
+}
+
+void parquet_split_info::for_each_datasource(
+  const std::function<void(sirius::io::sirius_datasource&)>& visit) const
+{
+  // One datasource per row-group slice: splits that span several parquet files carry one per
+  // file, each with its own prefetch handle (io_objects are shareable, handles are not).
+  for (auto const& slice : rg_slices) {
+    if (slice.datasource) { visit(*slice.datasource); }
+  }
+}
+
+std::size_t parquet_split_info::datasource_count() const noexcept
+{
+  return static_cast<std::size_t>(
+    std::count_if(rg_slices.begin(), rg_slices.end(), [](auto const& slice) {
+      return slice.datasource != nullptr;
+    }));
+}
+
 //===----------------------------------------------------------------------===//
 // parquet_ingestible_table_info::make_ingestible
 //===----------------------------------------------------------------------===//

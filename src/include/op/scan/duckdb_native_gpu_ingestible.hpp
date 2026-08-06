@@ -35,6 +35,7 @@
 // standard library
 #include <atomic>
 #include <cstddef>
+#include <functional>
 #include <memory>
 #include <span>
 #include <string>
@@ -138,6 +139,14 @@ class duckdb_native_scan_info : public op::scan::scan_info {
     });
     return entries;
   }
+
+  /// Visits @ref datasource when it is non-null. Computes no byte ranges — see
+  /// @ref scan_info::for_each_datasource.
+  void for_each_datasource(
+    const std::function<void(sirius::io::sirius_datasource&)>& visit) const override;
+
+  /// 1 when @ref datasource is non-null, 0 otherwise.
+  [[nodiscard]] std::size_t datasource_count() const noexcept override;
 
   /// Decoded (GPU) byte budget for this unit; drives memory reservation.
   [[nodiscard]] std::size_t estimated_bytes() const noexcept override

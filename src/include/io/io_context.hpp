@@ -137,12 +137,17 @@ class sirius_ioctx : public std::enable_shared_from_this<sirius_ioctx> {
   /// @c prefetching_stage::none.
   [[nodiscard]] virtual bool supports_vector_host_read() const noexcept = 0;
 
-  /// Prefetching strategy the prefetching layer should use against this
-  /// backend.  Returns @c prefetching_stage::none whenever
-  /// @c supports_vector_host_read() is false; otherwise the backend picks
-  /// between eager prefill and on-demand read-ahead based on its IO
-  /// characteristics.
-  [[nodiscard]] virtual cache::prefetching_stage preferred_prefetching_stage() const noexcept = 0;
+  /**
+   * @brief The ladder rung at which this backend wants a prefetch activated.
+   *
+   * @c prefetching_stage::none means the backend opts out entirely and
+   * @c sirius_datasource::prefetch is a no-op for it. Compared against the @p site
+   * argument of @c sirius_datasource::prefetch: the hint activates only on a match.
+   *
+   * Renamed from @c preferred_prefetching_stage: the old name read as a preference over
+   * phases, but the value is a backend capability/policy declaration.
+   */
+  [[nodiscard]] virtual cache::prefetching_stage prefetching_activation_stage() const noexcept = 0;
 
   /// Build the prefetching cache.  One-shot — calling twice is a no-op
   /// after the first successful build.  The cache holds a raw

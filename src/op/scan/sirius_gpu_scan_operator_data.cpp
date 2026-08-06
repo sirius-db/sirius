@@ -18,17 +18,183 @@
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <data/sirius_converter_registry.hpp>
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
+#include <scan_manager/prefetching_state_manager.hpp>
 
 #include <algorithm>
+#include <array>
+#include <cstdint>
+#include <span>
+#include <stdexcept>
 
 namespace sirius::op::scan {
+
+bool batch_needs_gpu_upload(const ::cucascade::read_only_data_batch& ro) noexcept
+{
+  auto const* data = ro.get_data();
+  if (data == nullptr) { return false; }
+  // A compressed_device_representation sits on Tier::GPU but still has to be decompressed in
+  // place, so the tier alone is not the test -- the representation type is the other half of it.
+  const bool is_gpu_table =
+    dynamic_cast<const ::cucascade::gpu_table_representation*>(data) != nullptr;
+  return ro.get_current_tier() != ::cucascade::memory::Tier::GPU || !is_gpu_table;
+}
+
+// The three lifecycle members are out-of-line so scan_manager::prefetching_state_manager only has
+// to be forward-declared in the header.
+scan_operator_input::scan_operator_input(
+  std::unique_ptr<scan_info> metadata,
+  std::shared_ptr<scan_manager::prefetching_state_manager> prefetch_state)
+  : materialization_info(std::move(metadata)), _prefetch_state(std::move(prefetch_state))
+{
+  if (_prefetch_state) { _prefetch_state->on_input_created(); }
+}
+
+scan_operator_input::scan_operator_input(
+  std::shared_ptr<cucascade::data_batch> cached_batch,
+  std::shared_ptr<scan_manager::prefetching_state_manager> prefetch_state)
+  : materialization_info(std::move(cached_batch)), _prefetch_state(std::move(prefetch_state))
+{
+  if (_prefetch_state) { _prefetch_state->on_input_created(); }
+}
+
+scan_operator_input::~scan_operator_input()
+{
+  // Move CONSTRUCTION leaves the moved-from object's _prefetch_state null, so a split that was
+  // moved on its way down the chain reports exactly one creation and one disposal. Move
+  // *assignment* would not balance -- it would drop the target's _prefetch_state without
+  // reporting its disposal -- which is why it is deleted rather than defaulted.
+  if (_prefetch_state) { _prefetch_state->on_input_disposed(); }
+}
+
+bool scan_operator_input::prefetch(io::cache::prefetching_stage site) const
+{
+  // The ladder is monotone per split: the counters see each rung once however many times a site
+  // fires it. prefetch_if hints a still-queued split and re-walks from the queue front on every
+  // invocation, and get_next_task_input_data fires task_queued again after the dequeue, so an
+  // unconditional bump would grow n_task_queued without bound. prefetching_stage's enumerators
+  // are declared in ladder order (none = 0), so the underlying value is the rung index and
+  // `none` -- which is not a rung -- can never advance.
+  const bool advanced = _highest_rung.advance_to(static_cast<std::uint8_t>(site));
+  // Above the metadata check on purpose (D11): a resident pinned-cache split has no scan metadata
+  // and no datasource, but it climbs the same ladder. Recording the rung below the check reported
+  // 0/0/0/0 for a fully-pinned query.
+  if (advanced && _prefetch_state) { _prefetch_state->update(site); }
+  // The hint itself is unconditional: sirius_datasource::prefetch is idempotent for activate and
+  // must still observe a later disposable even if this split already reported that rung.
+  //
+  // for_each_datasource, not get_fadvise_hints(): the latter walks the parquet footer once per
+  // row-group slice to rebuild byte ranges this method does not use.
+  for_each_datasource([site](io::sirius_datasource& datasource) { datasource.prefetch(site); });
+  return advanced;
+}
+
+bool scan_operator_input::can_land_while_queued() const noexcept
+{
+  // One bool by pointer, so the visitor fits libstdc++'s std::function small-object buffer and
+  // cannot heap-allocate on this noexcept boundary -- the same discipline prefetch_state() uses.
+  bool can_land = false;
+  for_each_datasource([&can_land](io::sirius_datasource& datasource) {
+    auto const stage = datasource.activation_stage();
+    // The only two rungs that fire before split_connector hands the split out. task_preprocessing
+    // (REST) runs in prepare_for_processing, after the dequeue; none never activates.
+    if (stage == io::cache::prefetching_stage::metadata_created ||
+        stage == io::cache::prefetching_stage::task_queued) {
+      can_land = true;
+    }
+  });
+  return can_land;
+}
+
+void scan_operator_input::for_each_datasource(
+  const std::function<void(io::sirius_datasource&)>& visit) const
+{
+  if (!has_scan_metadata()) { return; }
+  std::get<std::unique_ptr<scan_info>>(materialization_info)->for_each_datasource(visit);
+}
+
+std::size_t scan_operator_input::datasource_count() const noexcept
+{
+  if (!has_scan_metadata()) { return 0; }
+  return std::get<std::unique_ptr<scan_info>>(materialization_info)->datasource_count();
+}
+
+io::cache::prefetch_progress scan_operator_input::prefetch_state() const noexcept
+{
+  using io::cache::prefetch_progress;
+
+  // Folded one datasource at a time through combine_prefetch_progress rather than gathered into a
+  // vector first: this method is noexcept and is reached from split_connector::get_next_split with
+  // the connector mutex held, so it must neither allocate nor throw.
+  //
+  // The running fold equals the batch fold. combine_prefetch_progress reduces its input to four
+  // order-independent predicates -- any loading / all ready / any prepared / any cancelled -- and
+  // each intermediate result carries every predicate that can still affect the outcome. The one
+  // lossy case is `prepared` absorbing a `cancelled`, which cannot change the answer because
+  // `prepared` already outranks `cancelled` and, once set, stays set.
+  //
+  // The visitor state is one struct so the lambda captures a single pointer: the visit API takes a
+  // std::function, and a capture too wide for its small-object buffer would heap-allocate, putting
+  // a possible std::bad_alloc on this non-throwing boundary.
+  struct fold_state {
+    prefetch_progress value{prefetch_progress::empty};
+    bool seen{false};
+  } state;
+
+  for_each_datasource([&state](io::sirius_datasource& datasource) {
+    std::array<prefetch_progress, 2> const pair{state.value, datasource.prefetch_state()};
+    // The first datasource folds alone: seeding the accumulator with `empty` would drag an
+    // otherwise-cached split down, because `empty` breaks the all-ready rule.
+    auto const parts = state.seen ? std::span<const prefetch_progress>{pair}
+                                  : std::span<const prefetch_progress>{pair.data() + 1, 1};
+    state.value      = io::cache::combine_prefetch_progress(parts);
+    state.seen       = true;
+  });
+
+  // No datasource at all (a resident split, or a metadata split whose datasources are null) folds
+  // to `empty`, which is what state.value still holds.
+  return state.value;
+}
+
+bool scan_operator_input::is_io_prefetchable() const noexcept { return datasource_count() > 0; }
+
+std::optional<bool> scan_operator_input::is_memory_prefetchable() const noexcept
+{
+  if (!is_resident()) { return false; }
+  auto const& batch = std::get<std::shared_ptr<::cucascade::data_batch>>(materialization_info);
+  if (!batch) { return false; }
+  try {
+    // try_to_read_only, never the blocking to_read_only: this runs under split_connector's mutex
+    // and a concurrent prepare_for_processing holds the batch exclusively while it converts.
+    auto ro = batch->try_to_read_only();
+    if (!ro) { return std::nullopt; }
+    return batch_needs_gpu_upload(*ro);
+  } catch (...) {
+    // The lock accessor is library code; contain anything it throws rather than terminate on a
+    // noexcept boundary. "Could not read the tier" is exactly what nullopt already means.
+    return std::nullopt;
+  }
+}
+
+std::optional<bool> scan_operator_input::is_prefetched() const noexcept
+{
+  // A metadata split is where the task wants it once every datasource reported its request
+  // complete. Note this is not the negation of is_memory_prefetchable on this path: both are
+  // false for a metadata split whose IO has not landed.
+  if (!is_resident()) { return prefetch_state() == io::cache::prefetch_progress::cached; }
+  auto const needs_upload = is_memory_prefetchable();
+  if (!needs_upload.has_value()) { return std::nullopt; }
+  return !*needs_upload;
+}
 
 void scan_operator_input::prepare_for_processing(
   const ::cucascade::memory::memory_space* requested_memory_space, rmm::cuda_stream_view stream)
 {
   gpu_memory_space = const_cast<::cucascade::memory::memory_space*>(requested_memory_space);
+  // Hoisted above the resident early-return: both split kinds reach task_preprocessing, and only
+  // the metadata kind has datasources to hint. Left inside the branch, a fully-pinned query records
+  // zero on this rung despite every one of its splits climbing it.
+  prefetch(io::cache::prefetching_stage::task_preprocessing);
   if (!std::holds_alternative<std::shared_ptr<cucascade::data_batch>>(materialization_info)) {
-    prefetch(io::cache::prefetching_stage::just_in_time);
     return;
   }
   auto batch = std::get<std::shared_ptr<cucascade::data_batch>>(materialization_info);
@@ -36,15 +202,10 @@ void scan_operator_input::prepare_for_processing(
   if (batch && requested_memory_space) {
     bool needs_upload = false;
     {
-      auto ro          = batch->to_read_only();
-      auto const* data = ro.get_data();
-      // Convert when the data is not on the GPU tier, OR when it is on the GPU
-      // tier but not already a plain gpu_table_representation (e.g. a
-      // compressed_device_representation, which must be decompressed in place).
-      const bool is_gpu_table =
-        dynamic_cast<const ::cucascade::gpu_table_representation*>(data) != nullptr;
-      needs_upload = data != nullptr &&
-                     (ro.get_current_tier() != ::cucascade::memory::Tier::GPU || !is_gpu_table);
+      // Shared with is_memory_prefetchable, so what the scheduler was told about this split and
+      // what actually happens to it cannot drift. The read lock is released before converting.
+      auto ro      = batch->to_read_only();
+      needs_upload = batch_needs_gpu_upload(ro);
     }
     if (needs_upload) {
       auto& registry = ::sirius::converter_registry::get();

@@ -58,6 +58,9 @@
 #include <cucascade/memory/memory_space.hpp>
 #include <data/data_batch_utils.hpp>
 #include <data/sirius_converter_registry.hpp>
+#include <io/cache/types.hpp>
+#include <io/kvikio/kvikio_context.hpp>
+#include <io/sirius_datasource.hpp>
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
 #include <scan_manager/load_balancing_scan_batch_coalescer.hpp>
 #include <scan_manager/mvcc_chunk_mask.hpp>
@@ -67,6 +70,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -1251,4 +1255,145 @@ TEST_CASE("validate_recorded_column_storage cross-checks recorded carriers again
     REQUIRE_NOTHROW(sirius::scan_manager::validate_recorded_column_storage(
       sirius::pinned_column_storage_matrix{}, 0, 2, kContext, stored));
   }
+}
+
+//===----------------------------------------------------------------------===//
+// prefetch predicates over the resident (pinned-cache) split
+//===----------------------------------------------------------------------===//
+//
+// The resident half of scan_operator_input's prefetch predicates: it needs a real GPU batch, which
+// is why it lives here rather than next to the metadata half in
+// test/cpp/scan/test_scan_input_prefetchability.cpp. Also here: the one datasource-level state
+// case, which is the only sirius_datasource::prefetch_state answer reachable without a live armed
+// prefetching cache — and it is the answer every local-disk query gets, since both shipped local
+// backends opt out of the prefetch ladder.
+
+namespace {
+
+std::string nation_parquet()
+{
+#ifdef SIRIUS_PROJECT_ROOT
+  std::filesystem::path root{SIRIUS_PROJECT_ROOT};
+#else
+  std::filesystem::path root = std::filesystem::current_path();
+#endif
+  return (root / "test/cpp/integration/data/parquet/nation.parquet").string();
+}
+
+/// The resident batch demoted to the HOST tier, i.e. a split whose data still has to be uploaded
+/// before the task can run. Mirrors how the downgrade path produces one.
+std::shared_ptr<cucascade::data_batch> make_host_tier_batch(test_env& e, std::size_t rows)
+{
+  auto batch = make_test_batch(e, rows);
+  auto mut   = batch->to_mutable();
+  mut.convert_to<cucascade::host_data_representation>(
+    sirius::converter_registry::get(), e.host_space, e.stream());
+  return batch;
+}
+
+}  // namespace
+
+TEST_CASE("a datasource with no fadvise reports an empty prefetch state",
+          "[cached_serving][scan_manager][prefetch_api][datasource]")
+{
+  // No mock ioctx anywhere in this repo: this is a real kvikio-backed datasource over a real file.
+  // kvikio's activation stage is `none` and enable_prefetch_cache defaults off, so fadvise never
+  // stores a handle and the state stays empty — the shipped local-disk shape, in test form.
+  auto ioctx = std::make_shared<sirius::io::kvikio_context>();
+  auto ds    = ioctx->open_datasource(nation_parquet());
+  REQUIRE(ds != nullptr);
+
+  CHECK(ds->prefetch_state() == sirius::io::cache::prefetch_progress::empty);
+  CHECK_FALSE(ds->uses_prefetching_cache());
+}
+
+TEST_CASE("a resident split reports its upload need through is_memory_prefetchable",
+          "[cached_serving][scan_manager][prefetch_api][scan_input]")
+{
+  auto& e = env();
+
+  SECTION("a host-tier batch still needs an upload")
+  {
+    sirius::op::scan::scan_operator_input input(make_host_tier_batch(e, 64));
+
+    CHECK(input.is_memory_prefetchable() == std::optional<bool>{true});
+    // On the resident path the two predicates are exact negations of each other: "needs an
+    // upload" and "already where the task wants it" are the same question.
+    CHECK(input.is_prefetched() == std::optional<bool>{false});
+    // A resident split has no IO request at all, whatever its tier.
+    CHECK_FALSE(input.is_io_prefetchable());
+    CHECK(input.datasource_count() == 0);
+    CHECK(input.prefetch_state() == sirius::io::cache::prefetch_progress::empty);
+  }
+
+  SECTION("a gpu-tier batch does not")
+  {
+    sirius::op::scan::scan_operator_input input(make_test_batch(e, 64));
+
+    CHECK(input.is_memory_prefetchable() == std::optional<bool>{false});
+    CHECK(input.is_prefetched() == std::optional<bool>{true});
+    CHECK_FALSE(input.is_io_prefetchable());
+  }
+}
+
+TEST_CASE("prefetch_if reports the resident splits an early upload could promote",
+          "[cached_serving][scan_manager][prefetch_api][split_connector]")
+{
+  // The only coverage prefetch_kind::memory has, and the only route to it: drain_cached_provider
+  // is the one producer of resident splits and it needs a real GPU batch, so this cannot live in
+  // the GPU-free split_connector file.
+  using sirius::op::operator_data;
+  using sirius::scan_manager::prefetch_kind;
+
+  auto& e = env();
+  scripted_provider provider;
+  // Two off the GPU tier (an upload would help) and one already on it (it would not).
+  provider.batches = {
+    make_host_tier_batch(e, 4), make_test_batch(e, 4), make_host_tier_batch(e, 4)};
+
+  split_connector connector;
+  std::stop_source stop;
+  load_balancing_scan_batch_coalescer::drain_cached_provider(
+    provider, connector, stop.get_token(), /*row_filter_pending=*/false);
+
+  auto const always = [](const operator_data&) { return true; };
+
+  // Structural counts: a resident split carries a batch, never a datasource, so it is a memory
+  // candidate and never an io one.
+  CHECK(connector.n_prefetchable(prefetch_kind::memory) == 3);
+  CHECK(connector.n_prefetchable(prefetch_kind::io) == 0);
+
+  // The dynamic test on top of that structural count: only the two that still need an upload.
+  CHECK(connector.prefetch_if(3, prefetch_kind::memory, always) == 2);
+  // Unlike the io kind, this issues no hint and advances no ladder, so the value is a candidate
+  // count and repeating the call reports the same thing rather than converging to zero.
+  CHECK(connector.prefetch_if(3, prefetch_kind::memory, always) == 2);
+  // The window bounds this kind too.
+  CHECK(connector.prefetch_if(1, prefetch_kind::memory, always) == 1);
+  CHECK(connector.prefetch_if(0, prefetch_kind::memory, always) == 0);
+  // And the io kind finds nothing to do over a resident queue.
+  CHECK(connector.prefetch_if(3, prefetch_kind::io, always) == 0);
+
+  // Non-extracting for this kind as well: every split is still queued, in push order.
+  for (int i = 0; i < 3; ++i) {
+    INFO("split " << i);
+    REQUIRE(connector.get_next_split().has_value());
+  }
+  REQUIRE_FALSE(connector.get_next_split().has_value());
+}
+
+TEST_CASE("is_memory_prefetchable agrees with prepare_for_processing",
+          "[cached_serving][scan_manager][prefetch_api][scan_input]")
+{
+  // The anti-drift gate, and the whole reason batch_needs_gpu_upload exists as a shared
+  // definition: the scheduling view and the execution behaviour read the same predicate, so a
+  // split the scheduler said needed an upload is exactly a split prepare_for_processing converts.
+  auto& e = env();
+  sirius::op::scan::scan_operator_input input(make_host_tier_batch(e, 64));
+  REQUIRE(input.is_memory_prefetchable() == std::optional<bool>{true});
+
+  input.prepare_for_processing(e.gpu_space, e.stream());
+
+  CHECK(input.is_memory_prefetchable() == std::optional<bool>{false});
+  CHECK(input.is_prefetched() == std::optional<bool>{true});
 }

@@ -32,6 +32,7 @@
 #include <cucascade/data/data_repository.hpp>
 
 #include <atomic>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -147,6 +148,61 @@ class task_creator {
   void schedule_lookahead(std::optional<int> device_id_hint = std::nullopt);
 
   /**
+   * @brief Notification that the scheduler found its task queue empty.
+   *
+   * Plain @c std::function rather than @c std::function<void() noexcept>: the latter is not
+   * usable with libstdc++/libc++, so the no-throw requirement lives in this contract and is
+   * backstopped by a @c try/catch(...) at the fire site.
+   *
+   * @warning Fired on the @c task_scheduler management thread with **no lock held**. The
+   *          callback must be non-blocking, must not throw (a throw is caught and logged, but
+   *          the hook is then useless), and must not re-enter @c task_creator.
+   */
+  using task_queue_depleted_hook = std::function<void()>;
+
+  /**
+   * @brief Notification that a task-creation request produced no task.
+   *
+   * Plain @c std::function for the same reason as @ref task_queue_depleted_hook; the no-throw
+   * requirement below is a contract, backstopped by a @c try/catch(...) at the fire site.
+   *
+   * @param requested The operator the request started from (never null). Borrowed, valid only
+   *                  for the duration of the call.
+   * @param kind      Whether the request was active or speculative look-ahead.
+   *
+   * @warning Fired on the task_creator's **single** manager thread with **no lock held**, from
+   *          a code path that is *outside* the dispatch lambda's @c try block. The callback must
+   *          be non-blocking and must not throw: the manager thread is the only task-creation
+   *          thread in the engine, so blocking it stalls task creation engine-wide and an escaping
+   *          exception would end all task creation silently. The implementation wraps the call in
+   *          @c try/catch(...) as a backstop, but the contract is still "do not throw".
+   */
+  using task_not_created_hook =
+    std::function<void(const op::sirius_physical_operator* requested, request_type kind)>;
+
+  /**
+   * @brief Install the queue-depleted hook. Single slot — the last setter wins.
+   *
+   * The callable is moved onto the heap once, here, and the fire path only ever copies the
+   * owning @c shared_ptr. That is deliberate: the installed lambdas capture a @c std::weak_ptr,
+   * which is not trivially copyable, so libstdc++'s @c std::function small-object optimisation
+   * does not apply and copying the @c std::function itself would @c malloc on **every** fire —
+   * once per matcher iteration on the single thread that dispatches every GPU task.
+   *
+   * The slot is snapshotted atomically and invoked on the copy, so replacing a callback does not
+   * synchronize with an in-flight invocation (a fire already in progress runs to completion
+   * against the old callable). Callbacks must not capture raw pointers to objects the
+   * task_creator can outlive — capture a @c std::weak_ptr. In particular a hook must **never**
+   * reach the scan manager through @c duckdb::SiriusContext::get_scan_manager(): that accessor
+   * throws once the context has been terminated, and the not-created hook fires from outside any
+   * @c try block. Cleared by @ref reset.
+   */
+  void set_on_task_queue_depleted(task_queue_depleted_hook hook);
+
+  /// @copydoc set_on_task_queue_depleted
+  void set_on_task_not_created(task_not_created_hook hook);
+
+  /**
    * @brief Get the next task id.
    *
    * @return uint64_t The next task id.
@@ -196,6 +252,34 @@ class task_creator {
    */
   void manager_loop();
 
+  /**
+   * @brief Invoke the queue-depleted hook, if one is installed.
+   *
+   * Snapshot the slot, then invoke the snapshot, so a hook never runs with a task_creator lock
+   * held and replacing a hook does not synchronize with an in-flight call. The snapshot is a
+   * @c shared_ptr copy — one refcount bump, **no allocation** — which is why this fire path takes
+   * no task_creator lock at all. The invocation is wrapped in @c try/catch(...) and the exception
+   * logged and dropped, which is what makes this @c noexcept honest.
+   *
+   * Protected rather than private so the hook plumbing is drivable from a test subclass without
+   * having to reach the anchor that calls it.
+   */
+  void fire_task_queue_depleted() noexcept;
+
+  /**
+   * @brief Invoke the not-created hook, if one is installed.
+   *
+   * Same lock-free snapshot-then-fire discipline and the same @c try/catch(...) backstop as
+   * @ref fire_task_queue_depleted. The backstop is load-bearing here: the call site sits outside
+   * the dispatch lambda's @c try block on the single manager thread, so an escaping exception
+   * would silently end all task creation.
+   *
+   * @param requested The operator the failed request started from. Borrowed for the call only.
+   * @param kind      Whether the request was active or speculative look-ahead.
+   */
+  void fire_task_not_created(const op::sirius_physical_operator* requested,
+                             request_type kind) noexcept;
+
   std::atomic<bool> _running;
   task_creator_config _config;
   std::unique_ptr<exec::bounded_thread_pool> _bounded_pool;
@@ -208,6 +292,23 @@ class task_creator {
   std::mutex _lookahead_mutex;              // Protect concurrent access to the lookahead scheduling
   std::size_t _index_of_next_lookahead{0};  // Index of the next operator to lookahead for
   std::vector<op::sirius_physical_operator*> _lookahead_queue;
+
+  /// The two single-slot hooks. Held by @c shared_ptr so a fire is a refcount bump rather than a
+  /// @c std::function copy: the installed lambdas capture a @c std::weak_ptr, which defeats
+  /// libstdc++'s small-object optimisation, so copying the @c std::function would allocate on
+  /// **every** fire — once per matcher iteration on the single thread that dispatches every GPU
+  /// task.
+  ///
+  /// @c std::atomic so the slot is readable with no task_creator lock at all. (libstdc++ backs
+  /// this with an internal spinlock rather than a lock-free CAS, but that spinlock is a strict
+  /// leaf — held only across a pointer copy, never while calling out — so it cannot participate in
+  /// any cycle with _lookahead_mutex -> sirius_pipeline::_status_mutex ->
+  /// split_connector::_mutex, and it never allocates.)
+  ///
+  /// @c const because a snapshot is shared with an in-flight invocation: the callable itself must
+  /// not be mutated behind a running hook's back, only the slot repointed.
+  std::atomic<std::shared_ptr<const task_queue_depleted_hook>> _on_task_queue_depleted;
+  std::atomic<std::shared_ptr<const task_not_created_hook>> _on_task_not_created;
 
   // Queue for creating tasks based on operators. The operator is the starting point to start
   // looking which task should be created, not necessarily the operator for whose pipeline the task

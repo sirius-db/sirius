@@ -348,7 +348,15 @@ void task_scheduler::management_eventloop()
     }
 
     if (_task_queue.empty()) {
-      if (_task_creator) { _task_creator->schedule_lookahead(*_ready_devices.begin()); }
+      // _ready_devices is routinely empty here -- a task_available event with no device waiting
+      // reaches this branch -- so begin() must not be dereferenced unconditionally. The hint is
+      // advisory and schedule_lookahead ignores it today; nullopt is the honest "no ready device"
+      // value and keeps the depleted-hook anchor firing on every depletion, which is the point of
+      // anchoring it at the top of schedule_lookahead.
+      if (_task_creator) {
+        _task_creator->schedule_lookahead(
+          _ready_devices.empty() ? std::nullopt : std::optional<int>{_ready_devices.front()});
+      }
     }
 
     // Matcher: for each ready device, try to find a dispatchable task.
