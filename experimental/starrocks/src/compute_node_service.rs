@@ -197,11 +197,12 @@ impl SiriusComputeNodeService {
 /// handle (and with it the executor), keeping engine teardown ordered.
 fn dispatch_worker(core: Arc<ServiceCore>, inbox: mpsc::Receiver<ReadyFragment>) {
     while let Ok(ready) = inbox.recv() {
-        // A receiver can itself be a sender whose completion readies the next receiver (a
-        // middle fragment); chase that chain inline — this thread is already off the RPC path.
-        let mut next = Some(ready);
-        while let Some(ready) = next.take() {
-            next = core.run_ready_fragment(ready);
+        // A receiver can itself be a sender whose completion readies further receivers (a
+        // middle fragment, possibly fanning out); chase the whole set inline — this thread is
+        // already off the RPC path.
+        let mut queue = vec![ready];
+        while let Some(ready) = queue.pop() {
+            queue.extend(core.run_ready_fragment(ready));
         }
     }
 }
@@ -458,7 +459,7 @@ impl SiriusComputeNodeService {
         Self::ensure_binary_protocol(protocol)?;
         let params = Self::deserialize_binary::<TExecPlanFragmentParams>(attachment)
             .map_err(|err| format!("failed to deserialize TExecPlanFragmentParams: {err}"))?;
-        if let Some(ready) = self.core.process_fragment(&params)? {
+        for ready in self.core.process_fragment(&params)? {
             self.dispatch(ready)?;
         }
         Ok(())
@@ -538,7 +539,7 @@ impl SiriusComputeNodeService {
 impl ServiceCore {
     /// Runs one dispatched receiver, parking a failure where `fetch_data` can see it. Returns
     /// the next receiver when this fragment's own sink completed another sender set.
-    fn run_ready_fragment(&self, ready: ReadyFragment) -> Option<ReadyFragment> {
+    fn run_ready_fragment(&self, ready: ReadyFragment) -> Vec<ReadyFragment> {
         let id = Self::fragment_instance_id(&ready.params);
         let is_result_fragment = matches!(Self::is_mysql_result_sink(&ready.params), Ok(true));
         match self.execute_ready_fragment(ready) {
@@ -568,7 +569,7 @@ impl ServiceCore {
                         tracing::error!(error = %error, "dispatched receiver fragment without a fragment_instance_id failed");
                     }
                 }
-                None
+                Vec::new()
             }
         }
     }
@@ -581,7 +582,7 @@ impl ServiceCore {
     fn process_fragment(
         &self,
         params: &TExecPlanFragmentParams,
-    ) -> std::result::Result<Option<ReadyFragment>, String> {
+    ) -> std::result::Result<Vec<ReadyFragment>, String> {
         let params = self.resolve_descriptor_table(params)?;
         Self::dump_fragment(&params);
         // Survey mode: accept every fragment so the FE dispatches (and we dump) the whole
@@ -590,7 +591,7 @@ impl ServiceCore {
             if let Err(err) = self.translate_fragment_logged(&params) {
                 tracing::warn!(error = %err, "translate-only mode: accepting untranslatable fragment");
             }
-            return Ok(None);
+            return Ok(Vec::new());
         }
         let expected_senders = Self::receiver_exchanges(&params)?;
         if !expected_senders.is_empty() {
@@ -599,11 +600,11 @@ impl ServiceCore {
             if Self::is_mysql_result_sink(&params)? {
                 self.results.reserve(fragment_instance_id);
             }
-            return self.exchanges.register_receiver(
-                fragment_instance_id,
-                expected_senders,
-                params,
-            );
+            return Ok(self
+                .exchanges
+                .register_receiver(fragment_instance_id, expected_senders, params)?
+                .into_iter()
+                .collect());
         }
 
         let translated = self.translate_fragment_logged(&params)?;
@@ -667,7 +668,7 @@ impl ServiceCore {
         &self,
         params: &TExecPlanFragmentParams,
         translated: TranslatedPlan,
-    ) -> std::result::Result<Option<ReadyFragment>, String> {
+    ) -> std::result::Result<Vec<ReadyFragment>, String> {
         self.execute_fragment_with_inputs(params, translated, Vec::new(), Vec::new())
     }
 
@@ -682,7 +683,7 @@ impl ServiceCore {
         translated: TranslatedPlan,
         inputs: Vec<(i32, Vec<SenderSlot>)>,
         remote_inputs: Vec<(i32, i32, Vec<StagedBatch>)>,
-    ) -> std::result::Result<Option<ReadyFragment>, String> {
+    ) -> std::result::Result<Vec<ReadyFragment>, String> {
         if Self::is_mysql_result_sink(params)? {
             let id = Self::fragment_instance_id(params).ok_or_else(|| {
                 "RESULT_SINK fragment is missing a fragment_instance_id".to_string()
@@ -699,7 +700,7 @@ impl ServiceCore {
                 .ok_or_else(|| "result fragment returned no rows".to_string())?;
             let batch = result_encoder::MysqlResultEncoder::encode(&result.batches, 0)?;
             self.results.insert(id, batch);
-            return Ok(None);
+            return Ok(Vec::new());
         }
 
         let Some(stream_sink) = params
@@ -709,7 +710,7 @@ impl ServiceCore {
             .filter(|sink| sink.type_ == TDataSinkType::DATA_STREAM_SINK)
             .and_then(|sink| sink.stream_sink.as_ref())
         else {
-            return Ok(None);
+            return Ok(Vec::new());
         };
         if stream_sink.limit.is_some_and(|limit| limit >= 0) {
             return Err("data stream sink limits are not supported".to_string());
@@ -737,83 +738,111 @@ impl ServiceCore {
             .filter(|destinations| !destinations.is_empty())
             .ok_or_else(|| "DATA_STREAM_SINK fragment has no destinations".to_string())?;
         let sender_id = exec.sender_id.unwrap_or(0);
-        // One destination only: relaying a stream to N receivers means each batch is claimed by
-        // one of them, so a broadcast needs the partitioned sink (#838), not a loop here. Refusing
-        // is the honest answer — the alternative silently gives every receiver but one no rows.
+        // Fan-out shape: one destination is a gather regardless of the partition label;
+        // UNPARTITIONED with N destinations broadcasts the full output to every receiver
+        // (each destination drains its own copy from its own output stream). Hash-partitioned
+        // fan-out is the second half of #838 and still refuses.
         if destinations.len() > 1 {
-            return Err(format!(
-                "a data stream sink with {} destinations needs partitioned streaming output \
-                 (#838); grouped two-phase aggregation across compute nodes is not supported \
-                 yet (SET new_planner_agg_stage = 1)",
-                destinations.len()
-            ));
+            use starrocks_thrift::partitions::TPartitionType;
+            match stream_sink.output_partition.type_ {
+                TPartitionType::UNPARTITIONED => {}
+                TPartitionType::HASH_PARTITIONED => {
+                    return Err(format!(
+                        "a data stream sink with {} hash-partitioned destinations is not wired \
+                         yet (#838 v2); grouped two-phase aggregation and shuffle joins across \
+                         compute nodes need it (SET new_planner_agg_stage = 1)",
+                        destinations.len()
+                    ));
+                }
+                other => {
+                    return Err(format!(
+                        "a data stream sink with {} destinations carries partition type {:?}, \
+                         which this CN does not support",
+                        destinations.len(),
+                        other
+                    ));
+                }
+            }
         }
-        let destination = &destinations[0];
-        let slot = SenderSlot {
-            fragment_instance_id: FragmentInstanceId::from(&destination.fragment_instance_id),
-            node_id: stream_sink.dest_node_id,
-            sender_id,
-        };
+        let broadcast = destinations.len() > 1;
 
-        // Route before running: a remote destination without a transport must fail before any
-        // GPU work happens.
-        match self.route_destination(destination)? {
-            DestinationRoute::Local => {
-                // The sender's rows stay on the GPU, parked under `slot` as native batches; only
-                // the rendezvous bookkeeping — which sender produced, and its output names —
-                // comes back here.
-                self.executor.run(FragmentRun {
-                    plan: &translated,
-                    inputs,
-                    remote_inputs,
-                    outputs: vec![slot],
-                    broadcast: false,
-                })?;
+        // Route every destination BEFORE running: a remote destination without a transport (or
+        // a duplicate) must fail before any GPU work happens. Destination i then drains the
+        // sender's output stream i -- the FE's destination order, positionally.
+        let mut slots: Vec<SenderSlot> = Vec::with_capacity(destinations.len());
+        let mut routes = Vec::with_capacity(destinations.len());
+        for destination in destinations {
+            let slot = SenderSlot {
+                fragment_instance_id: FragmentInstanceId::from(&destination.fragment_instance_id),
+                node_id: stream_sink.dest_node_id,
+                sender_id,
+            };
+            if slots.contains(&slot) {
+                return Err(format!(
+                    "duplicate destination {slot:?} in one data stream sink; two claims would \
+                     race over one output stream"
+                ));
+            }
+            let route = self.route_destination(destination)?;
+            if let DestinationRoute::Remote { host, brpc_port } = &route {
+                if self.transport.is_none() {
+                    return Err(format!(
+                        "cross-node exchange to {host}:{brpc_port} needs the nixl transport \
+                         tier, which is not active: build the CN with the `nixl-transport` \
+                         feature (default) and set SIRIUS_EXCHANGE_STAGING_BYTES so the \
+                         exchange staging arena exists"
+                    ));
+                }
+            }
+            slots.push(slot);
+            routes.push(route);
+        }
 
-                self.exchanges.push_sender(
+        // The sender's rows stay on the GPU, parked once with one output stream per
+        // destination; only rendezvous bookkeeping and packed exports leave the engine thread.
+        self.executor.run(FragmentRun {
+            plan: &translated,
+            inputs,
+            remote_inputs,
+            outputs: slots.clone(),
+            broadcast,
+        })?;
+
+        // Local destinations first: their rendezvous is immediate bookkeeping and fails fast.
+        let mut ready_receivers = Vec::new();
+        for (slot, route) in slots.iter().zip(&routes) {
+            if matches!(route, DestinationRoute::Local) {
+                let ready = self.exchanges.push_sender(
                     ExchangeKey {
                         fragment_instance_id: slot.fragment_instance_id,
                         node_id: slot.node_id,
                     },
                     sender_id,
                     SenderSource::LocalParked {
-                        names: translated.output_names,
-                        slot,
+                        names: translated.output_names.clone(),
+                        slot: *slot,
                     },
-                )
-            }
-            DestinationRoute::Remote { host, brpc_port } => {
-                let Some(transport) = self.transport.as_ref() else {
-                    return Err(format!(
-                        "cross-node exchange to {host}:{brpc_port} needs the nixl transport \
-                         tier, which is not active: build the CN with the `nixl-transport` \
-                         feature (default) and set SIRIUS_EXCHANGE_STAGING_BYTES so the exchange \
-                         staging arena exists"
-                    ));
-                };
-                let brpc_port = u16::try_from(brpc_port).map_err(|_| {
-                    format!("destination brpc port {brpc_port} is not a valid TCP port")
-                })?;
-                // Park exactly like the local path — the packed export drains the parked
-                // output — then block this (already-blocking) RPC thread until the whole
-                // fragment has crossed the wire. Any failure fails the sender's dispatch, so
-                // the FE sees it.
-                self.executor.run(FragmentRun {
-                    plan: &translated,
-                    inputs,
-                    remote_inputs,
-                    outputs: vec![slot],
-                    broadcast: false,
-                })?;
-                transport.send_fragment(RemoteSendSpec {
-                    host,
-                    brpc_port,
-                    slot,
-                    names: translated.output_names,
-                })?;
-                Ok(None)
+                )?;
+                ready_receivers.extend(ready);
             }
         }
+        // Remote destinations second: each send drains its own output stream and blocks this
+        // (already-blocking) RPC thread until that destination's copy crossed the wire.
+        for (slot, route) in slots.iter().zip(&routes) {
+            if let DestinationRoute::Remote { host, brpc_port } = route {
+                let transport = self.transport.as_ref().expect("routed before running");
+                let brpc_port = u16::try_from(*brpc_port).map_err(|_| {
+                    format!("destination brpc port {brpc_port} is not a valid TCP port")
+                })?;
+                transport.send_fragment(RemoteSendSpec {
+                    host: host.clone(),
+                    brpc_port,
+                    slot: *slot,
+                    names: translated.output_names.clone(),
+                })?;
+            }
+        }
+        Ok(ready_receivers)
     }
 
     /// Classifies a data-stream sink destination against this CN's advertised exchange
@@ -891,7 +920,7 @@ impl ServiceCore {
     fn execute_ready_fragment(
         &self,
         ready: ReadyFragment,
-    ) -> std::result::Result<Option<ReadyFragment>, String> {
+    ) -> std::result::Result<Vec<ReadyFragment>, String> {
         let exchange_inputs = ready
             .inputs
             .iter()
@@ -1114,7 +1143,7 @@ impl SiriusComputeNodeService {
                 params.resource_info = common.resource_info.clone();
             }
 
-            if let Some(ready) = self
+            for ready in self
                 .core
                 .process_fragment(&params)
                 .map_err(|err| format!("fragment {idx}: {err}"))?
