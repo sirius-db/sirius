@@ -52,6 +52,61 @@ The pipeline converter rewrites a DuckDB parquet or DuckDB-native table scan int
 
 See [Scan](scan.md) for the full scan subsystem (scan manager, `gpu_ingestible`, pinned-table caching, and the IO layer).
 
+### `sirius_physical_streaming_source` — `STREAMING_SOURCE`
+**File:** `src/include/op/sirius_physical_streaming_source.hpp`
+
+Source operator that marks the bottom boundary of an intermediate pipeline fragment. Producers
+call `push(batch)` / `close_input(sender_id)`; the operator publishes each queued
+`cucascade::data_batch` into the pipeline as a `pipelineable_operator_data`, one per task. Used
+only when a fragment's input arrives from another node over exchange; a leaf fragment keeps its
+normal `GPU_SCAN` source.
+
+Unlike a `GPU_SCAN` it does not own its input — batches arrive at runtime — so an empty queue means
+*wait*, not *exhausted*. It holds one `exec::batch_stream`: a borrowed
+`cucascade::shared_data_repository` (**the queue** — batches sit there until a task claims one,
+spill-visible to the downgrade executor when the caller registered that repository with the memory
+manager) bound to the stream state (sender-aware end-of-stream, the availability classification,
+the `on_data` notification, and the producer-error plane).
+
+Key design invariants (S1–S5 are the named stream contracts defined in `exec/batch_stream.hpp`):
+- Batches cross natively, in their current tier — no Arrow, no forced GPU upgrade.
+- EOS is **sender-aware**: `close_input(sender)` is idempotent per sender, and the stream ends
+  only once every *expected* sender has closed. An unexpected sender id is a defined error.
+- **S1** — every batch lands in the repository before `on_data` announces it; `push()` returns
+  false once the stream is terminal, so no batch can arrive after a consumer has seen EOS.
+- **S2–S3** — a producer failure (`fail_input(error)`) fires `on_data` so a parked consumer
+  wakes to collect the rethrow; the stream never reports `END_OF_STREAM` or `drained()` while an
+  error is pending (the only exit is the rethrow).
+- `execute()` is a pure pass-through (COLUMN_DATA_SCAN shape — no GPU work).
+- `no_history_peak_memory_estimate()` returns `stats.bytes` (no extra allocation).
+
+Hint table:
+
+| Stream state | `get_next_task_hint()` |
+|---|---|
+| `HAS_DATA` (queued or errored, open or ended) | `READY{this}` |
+| `WAITING` (open, empty) | `WAITING{nullptr}` — the next `push()` re-nominates the head |
+| `END_OF_STREAM` | `std::nullopt` |
+
+`all_ports_empty()` is `stream.drained()` — a clean end only: every sender closed, queue empty, no
+pending error. It drives both the task-creation loop guard and the port-less source
+pipeline-finish predicate. Emptiness is evaluated under the stream's own lock — otherwise a batch
+admitted between the check and the lock could be reported as end-of-stream and dropped.
+
+**The live wake-up.** The head is scheduled once by `start_query()` and task completion only
+nominates downstream consumers, so `on_data` — fired by every successful `push()` — is the only
+thing that brings a dropped source back. It is deliberately not one-shot; `batch_stream::set_on_data`
+explains why.
+
+End-of-stream separately notifies the pipeline (`update_pipeline_status(false)`, via a weak
+pipeline reference wired in `set_pipeline`), so an empty or late-closed stream still finishes its
+pipeline — and re-arms downstream consumers — even when no task is left in flight.
+
+**No channel-level backpressure.** Producers push into the repository and the downgrade executor
+relieves memory pressure. Sirius has no upward "stop producing" signal today (hints are only
+`READY` / `WAITING` / nothing), so the intended lever is per-fragment priority, not a bounded
+queue.
+
 ### `sirius_physical_dummy_scan` — `DUMMY_SCAN`
 **File:** `src/include/op/sirius_physical_dummy_scan.hpp`
 
@@ -327,6 +382,7 @@ After pipeline finalization, `source` and `sink` are just aliases for the first 
 | Operator | Category | GPU Method |
 |----------|----------|-----------|
 | GPU_SCAN | Scan | Unified GPU scan source served by `sirius_scan_manager` via a per-format `gpu_ingestible` |
+| STREAMING_SOURCE | Scan | Exchange-input source; drains an `exec::batch_stream` (repository fed by `push()`, sender-aware EOS, producer-error plane) |
 | DUMMY_SCAN | Scan | Generates 1 row |
 | COLUMN_DATA_SCAN | Scan | Reads ColumnDataCollection |
 | FILTER | Relational | `expression_evaluator::select()` |

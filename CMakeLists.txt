@@ -253,6 +253,7 @@ set(EXTENSION_SOURCES
     src/expression_evaluator/specializations/reference.cpp
     # Execution primitives (slot-based backpressure / completion tracking)
     src/exec/admission_control.cpp
+    src/exec/batch_stream.cpp
     # I/O adapters (Phase 19 — io_uring + sirius_datasource)
     src/io/datasource_factory.cpp
     src/io/io_context.cpp
@@ -306,6 +307,7 @@ set(EXTENSION_SOURCES
     src/op/dynamic_filter_publisher.cpp
     src/op/sirius_dynamic_filter.cpp
     src/op/sirius_physical_column_data_scan.cpp
+    src/op/sirius_physical_streaming_source.cpp
     src/op/sirius_physical_concat.cpp
     src/op/sirius_physical_cte.cpp
     src/op/sirius_physical_delim_join.cpp
@@ -602,6 +604,7 @@ set(TEST_SOURCES
     test/cpp/downgrade/test_downgrade_disk.cpp
     test/cpp/downgrade/test_downgrade_executor.cpp
     test/cpp/downgrade/test_downgrade_lifecycle.cpp
+    test/cpp/exec/test_batch_stream.cpp
     test/cpp/exec/test_bounded_thread_pool.cpp
     test/cpp/exec/test_inspectable_mpsc.cpp
     test/cpp/exec/test_interruptible_mpmc.cpp
@@ -688,6 +691,7 @@ set(TEST_SOURCES
     test/cpp/operator/test_physical_partition.cpp
     test/cpp/operator/test_physical_projection.cpp
     test/cpp/operator/test_physical_result_collector.cpp
+    test/cpp/operator/test_physical_streaming_source.cpp
     test/cpp/operator/test_physical_table_scan.cpp
     test/cpp/operator/test_no_history_peak_memory_estimate.cpp
     test/cpp/operator/test_physical_top_n.cpp
