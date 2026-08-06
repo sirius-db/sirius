@@ -58,6 +58,8 @@ struct ExecuteRequest {
     outputs: Vec<SenderSlot>,
     /// Every destination receives the full output (broadcast sink).
     broadcast: bool,
+    /// Hash-partition key columns for a hash fan-out (empty otherwise).
+    hash_keys: Vec<usize>,
     /// Channel the engine thread sends the result (or a flattened error) back on.
     respond: Sender<Result<Option<FragmentResult>, String>>,
 }
@@ -440,6 +442,13 @@ fn run_fragment_inner<'ctx>(
         fragment
             .declare_output_broadcast()
             .map_err(|err| format!("failed to declare the broadcast output mode: {err}"))?;
+    } else if !request.hash_keys.is_empty() && request.outputs.len() > 1 {
+        for &key in &request.hash_keys {
+            let key = u32::try_from(key).map_err(|_| format!("hash key column {key} overflows"))?;
+            fragment
+                .declare_output_hash_key(key)
+                .map_err(|err| format!("failed to declare hash key column {key}: {err}"))?;
+        }
     }
 
     fragment
@@ -604,6 +613,7 @@ impl FragmentExecutor for SiriusEngine {
                 remote_inputs: run.remote_inputs,
                 outputs: run.outputs,
                 broadcast: run.broadcast,
+                hash_keys: run.hash_keys,
                 respond,
             })
         })
@@ -792,6 +802,7 @@ mod tests {
                 remote_inputs: Vec::new(),
                 outputs: Vec::new(),
                 broadcast: false,
+                hash_keys: Vec::new(),
             })
             .expect("execute fragment on GPU")
             .expect("a result fragment returns rows")
@@ -890,6 +901,7 @@ mod tests {
                 remote_inputs: Vec::new(),
                 outputs: Vec::new(),
                 broadcast: false,
+                hash_keys: Vec::new(),
                 respond: respond_tx,
             }))
             .unwrap();
@@ -980,6 +992,7 @@ mod tests {
                 remote_inputs: Vec::new(),
                 outputs: vec![slot],
                 broadcast: false,
+                hash_keys: Vec::new(),
             })
             .expect("run the sender fragment");
 
@@ -1004,6 +1017,7 @@ mod tests {
                 remote_inputs: vec![(EXCHANGE_NODE, 0, staged)],
                 outputs: Vec::new(),
                 broadcast: false,
+                hash_keys: Vec::new(),
             })
             .expect("execute the remote-fed receiver on GPU")
             .expect("a result fragment returns rows");
@@ -1071,6 +1085,7 @@ mod tests {
                     remote_inputs: Vec::new(),
                     outputs: vec![slot],
                 broadcast: false,
+                hash_keys: Vec::new(),
                 })
                 .expect("run the sender fragment")
                 .is_none(),
@@ -1085,6 +1100,7 @@ mod tests {
                 remote_inputs: Vec::new(),
                 outputs: Vec::new(),
                 broadcast: false,
+                hash_keys: Vec::new(),
             })
             .expect("execute exchange receiver on GPU")
             .expect("a result fragment returns rows");

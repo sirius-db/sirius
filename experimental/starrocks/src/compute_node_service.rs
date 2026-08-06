@@ -696,6 +696,7 @@ impl ServiceCore {
                     remote_inputs,
                     outputs: Vec::new(),
                     broadcast: false,
+                    hash_keys: Vec::new(),
                 })?
                 .ok_or_else(|| "result fragment returned no rows".to_string())?;
             let batch = result_encoder::MysqlResultEncoder::encode(&result.batches, 0)?;
@@ -747,12 +748,13 @@ impl ServiceCore {
             match stream_sink.output_partition.type_ {
                 TPartitionType::UNPARTITIONED => {}
                 TPartitionType::HASH_PARTITIONED => {
-                    return Err(format!(
-                        "a data stream sink with {} hash-partitioned destinations is not wired \
-                         yet (#838 v2); grouped two-phase aggregation and shuffle joins across \
-                         compute nodes need it (SET new_planner_agg_stage = 1)",
-                        destinations.len()
-                    ));
+                    if translated.output_partition_columns.is_none() {
+                        return Err(
+                            "a hash-partitioned data stream sink translated without partition \
+                             key columns"
+                                .to_string(),
+                        );
+                    }
                 }
                 other => {
                     return Err(format!(
@@ -764,7 +766,12 @@ impl ServiceCore {
                 }
             }
         }
-        let broadcast = destinations.len() > 1;
+        let hash_keys = if destinations.len() > 1 {
+            translated.output_partition_columns.clone().unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let broadcast = destinations.len() > 1 && hash_keys.is_empty();
 
         // Route every destination BEFORE running: a remote destination without a transport (or
         // a duplicate) must fail before any GPU work happens. Destination i then drains the
@@ -806,6 +813,7 @@ impl ServiceCore {
             remote_inputs,
             outputs: slots.clone(),
             broadcast,
+            hash_keys,
         })?;
 
         // Local destinations first: their rendezvous is immediate bookkeeping and fails fast.

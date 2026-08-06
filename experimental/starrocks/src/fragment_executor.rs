@@ -80,8 +80,11 @@ pub struct FragmentRun<'a> {
     /// stream; the parked fragment drops when the last destination releases it.
     pub outputs: Vec<SenderSlot>,
     /// Every destination receives the full output (a broadcast sink). With `outputs.len() > 1`
-    /// and `broadcast == false`, the sink hash-partitions (v2; refused upstream until then).
+    /// and `broadcast == false`, `hash_keys` routes rows instead.
     pub broadcast: bool,
+    /// Hash-partition key columns (output column indices, in the exchange's shared
+    /// partition-expression order). Non-empty exactly for a hash-partitioned fan-out.
+    pub hash_keys: Vec<usize>,
 }
 
 /// Runs a translated fragment, either parking its output for a downstream fragment or returning
