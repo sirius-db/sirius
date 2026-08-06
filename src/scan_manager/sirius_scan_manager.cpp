@@ -1085,8 +1085,9 @@ cache_entry_info cache_entry_info::from(const op::scan::ingestible_table_info& i
     // resolved) path.
     ci.resolved_file_paths = p->resolved_file_paths;
     op::scan::canonicalize_scan_file_paths(ci.resolved_file_paths);
-    ci.column_ids = p->column_ids;
-    ci.names      = aligned_column_names(p->names, p->column_ids);
+    ci.has_byte_ranges = p->has_byte_ranges();
+    ci.column_ids      = p->column_ids;
+    ci.names           = aligned_column_names(p->names, p->column_ids);
   } else if (auto const* d =
                dynamic_cast<op::scan::duckdb_native_ingestible_table_info const*>(&info)) {
     ci.catalog_name = d->catalog_name;
@@ -1106,6 +1107,9 @@ std::vector<std::size_t> cache_entry_info::can_serve_with_columns(
   // never serves a scan of the other — the identity check below falls through (a
   // duckdb cache has empty resolved_file_paths; a parquet cache has an empty table_name).
   if (auto const* p = dynamic_cast<op::scan::parquet_ingestible_table_info const*>(&other)) {
+    // A byte-range split scan reads a subset of each file's row groups, so it can neither be
+    // served by a whole-file pin (extra rows) nor produce a pin that serves anyone else.
+    if (has_byte_ranges || p->has_byte_ranges()) { return {}; }
     if (!matches_parquet_files(p->resolved_file_paths)) { return {}; }
     return column_projection_for(p->column_ids);
   }
