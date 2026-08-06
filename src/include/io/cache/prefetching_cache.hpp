@@ -256,7 +256,7 @@ class prefetching_cache {
   std::jthread _evictor_thread;
   request_queue_type _eviction_queue;
   std::stop_source _evictor_stop_source;
-  bool _dispose_after_use{false};
+  bool _dispose_on_idle{false};
 
   mutable std::shared_mutex _map_mtx;
   std::unordered_map<std::string, std::unique_ptr<file_entry>> _file_cache;

@@ -826,11 +826,11 @@ void prefetching_cache::evict_loop(const std::stop_token& st)
     // pressure is scored as outstanding (handed-out) chunks against the pool's
     // aggregate reserved capacity.
     bool const should_evict =
-      _cfg.dispose_after_use || eviction_requested || _pool->should_start_evicting();
+      _cfg.dispose_on_idle || eviction_requested || _pool->should_start_evicting();
     if (!should_evict) { continue; }
 
-    size_t const need = _cfg.dispose_after_use ? std::numeric_limits<size_t>::max()
-                                               : _pool->total_allocated_chunks() * 0.25;
+    size_t const need = _cfg.dispose_on_idle ? std::numeric_limits<size_t>::max()
+                                             : _pool->total_allocated_chunks() * 0.25;
 
     auto const query_tick = static_cast<uint32_t>(_ticker.load(std::memory_order_relaxed));
 

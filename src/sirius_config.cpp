@@ -165,7 +165,6 @@ static void from_yaml(const YAML::Node& node, sirius::io::rest::config& opt)
 static void from_yaml(const YAML::Node& node, sirius::io::uring::config& opt)
 {
   yaml::reader r(node, "local");
-  r.optional("use_odirect", opt.use_odirect);
   r.optional("max_n_chunks", opt.max_n_chunks);
   r.reject_unknown();
 }
@@ -199,10 +198,9 @@ static void from_yaml(const YAML::Node& node, sirius::io::kvikio_config& opt)
 
 static void from_yaml(const YAML::Node& node, sirius::io::cache::config& opt)
 {
-  yaml::reader r(node, "cache");
+  yaml::reader r(node, "prefetch_cache");
   r.optional(
     "inflight_io_chunk_budget", opt.inflight_io_chunk_budget, yaml::greater_than<std::size_t>{0});
-  r.optional("dispose_after_use", opt.dispose_after_use);
   r.optional("min_prefetching_budget_fraction",
              opt.min_prefetching_budget_fraction,
              yaml::fraction<double>{});
@@ -220,13 +218,14 @@ static void from_yaml(const YAML::Node& node, scan_manager::scan_manager_config&
   r.optional("use_sirius_datasource", opt.use_sirius_datasource);
   r.optional("uring_n_reactors", opt.uring_n_reactors, yaml::greater_than<std::size_t>{0});
   r.optional("rest_n_reactors", opt.rest_n_reactors, yaml::greater_than<std::size_t>{0});
-  r.optional("enable_prefetch_cache", opt.enable_prefetch_cache);
+  r.optional("cache", opt.cache);
   if (auto n = r.optional_node("local")) sirius::from_yaml(*n, opt.local);
   if (auto n = r.optional_node("rest")) sirius::from_yaml(*n, opt.rest);
   if (auto n = r.optional_node("kvikio")) sirius::from_yaml(*n, opt.kvikio);
-  if (auto n = r.optional_node("cache")) sirius::from_yaml(*n, opt.cache);
+  if (auto n = r.optional_node("prefetch_cache")) sirius::from_yaml(*n, opt.prefetch_cache);
   if (auto n = r.optional_node("object_store")) sirius::from_yaml(*n, opt.object_store);
   r.reject_unknown();
+  opt.apply_cache_mode();
 }
 
 static void from_yaml(const YAML::Node& node, operator_params& opt)

@@ -80,7 +80,7 @@ sirius:
     host: { capacity_bytes: 25GB, initial_number_pools: 50, pool_size: 512, block_size: 1048576 }
     disk: { disk_id: 0, capacity_bytes: 1000000000000, downgrade_root_dirs: "/tmp/sirius_disk_memory" }
   executor:
-    scan_manager: { num_threads: 4, use_sirius_datasource: true, uring_n_reactors: 1, enable_prefetch_cache: false }
+    scan_manager: { num_threads: 4, use_sirius_datasource: true, uring_n_reactors: 1, cache: none }
     pipeline:     { num_threads: 4 }
     downgrade:    { num_threads: 1 }
     task_creator: { num_threads: 1 }
@@ -280,7 +280,21 @@ The `sirius.executor.scan_manager` block configures the scan-metadata thread poo
 | `use_sirius_datasource` | bool | true | Route reads through the Sirius `io_uring` datasource. When false, the kvikio fallback is used (single-GPU only; multi-GPU requires the Sirius datasource). |
 | `uring_n_reactors` | int (**> 0**) | 1 | Number of io_uring reactor threads for local-disk reads. |
 | `rest_n_reactors` | int (**> 0**) | 2 | Number of REST reactor threads for object-store (`s3://`) reads. |
-| `enable_prefetch_cache` | bool | false | Attach the pinned-memory prefetching cache in front of the backend. |
+| `cache` | enum: `none`, `os`, `persistent`, `prefetch` | `none` | Read-path caching strategy (see below). Values are lowercase. |
+
+`cache` is the single knob for the read path; it derives three settings that are
+therefore **not** individually settable from YAML:
+
+| `cache` | `local.use_odirect` | `enable_prefetch_cache` | `prefetch_cache.dispose_on_idle` |
+|---------|---------------------|-------------------------|----------------------------------|
+| `none` | true | false | — |
+| `os` | false | false | — |
+| `persistent` | true | true | false |
+| `prefetch` | true | true | true |
+
+`none` bypasses every cache (`O_DIRECT`, no prefetching cache). `os` reads through the
+kernel page cache instead. `persistent` adds the pinned-memory prefetching cache and retains
+chunks for reuse; `prefetch` uses the same cache but drops each chunk once it goes idle.
 
 Five optional nested sub-configs tune the individual backends and caches:
 
@@ -288,7 +302,6 @@ Five optional nested sub-configs tune the individual backends and caches:
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `use_odirect` | bool | true | Use `O_DIRECT` for local-disk reads. |
 | `max_n_chunks` | int | 1 | Max contiguous file segments fused into one vectored read. |
 
 ### `scan_manager.rest` — REST / S3 backend (`io/rest/config.hpp`)
@@ -339,14 +352,13 @@ constructor, so it scopes to files this backend opens.
 | `thread_pool_per_block_device` | bool | `KVIKIO_THREAD_POOL_PER_BLOCK_DEVICE` (false) | Give each block device its own pool instead of sharing one global pool. |
 | `compat_mode` | enum: `auto`, `on`, `off` | `KVIKIO_COMPAT_MODE` | cuFile vs POSIX selection, per file handle. `off` enforces cuFile/GDS, `on` enforces POSIX, `auto` tries cuFile and falls back. Values are lowercase. |
 
-### `scan_manager.cache` — prefetching cache (`io/cache/config.hpp`)
+### `scan_manager.prefetch_cache` — prefetching cache (`io/cache/config.hpp`)
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `inflight_io_chunk_budget` | int (**> 0**) | 2048 | Max in-flight IO chunks (enforced by admission control). |
 | `eviction_threshold_fraction` | double [0,1] | 0.6 | Start evicting when the pool fills to this fraction. |
 | `min_prefetching_budget_fraction` | double [0,1] | 0.05 | Floor of the budget reserved for prefetching. |
-| `dispose_after_use` | bool | false | Discard chunks immediately after use. |
 
 ### `scan_manager.object_store` — S3 credentials & endpoint (`io/object_store_config.hpp`)
 

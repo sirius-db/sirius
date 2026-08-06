@@ -26,7 +26,10 @@
 #include "io/uring/config.hpp"
 
 #include <algorithm>
+#include <string>
+#include <string_view>
 #include <thread>
+#include <unordered_map>
 
 namespace sirius::scan_manager {
 
@@ -43,6 +46,48 @@ inline constexpr std::size_t default_uring_n_reactors = 1;
   return std::max(4, static_cast<int>(std::thread::hardware_concurrency()) - reserved);
 }
 
+/// Read-path caching strategy. Single knob that derives @c local.use_odirect,
+/// @c enable_prefetch_cache and @c prefetch_cache.dispose_on_idle.
+enum class cache_mode {
+  /// O_DIRECT reads, no cache anywhere.
+  none,
+  /// Buffered reads through the OS page cache, no prefetching cache.
+  os,
+  /// O_DIRECT reads into the pinned prefetching cache, chunks retained for reuse.
+  persistent,
+  /// O_DIRECT reads into the pinned prefetching cache, chunks dropped once idle.
+  prefetch,
+};
+
+/// Parse a @ref cache_mode from its lowercase YAML spelling.
+inline bool string_to_enum(std::string_view sv, cache_mode& out)
+{
+  static const std::unordered_map<std::string_view, cache_mode> map = {
+    {"none", cache_mode::none},
+    {"os", cache_mode::os},
+    {"persistent", cache_mode::persistent},
+    {"prefetch", cache_mode::prefetch},
+  };
+  auto it = map.find(sv);
+  if (it != map.end()) {
+    out = it->second;
+    return true;
+  }
+  return false;
+}
+
+/// Render a @ref cache_mode as its canonical lowercase name.
+inline bool enum_to_string(cache_mode mode, std::string& s)
+{
+  switch (mode) {
+    case cache_mode::none: s = "none"; return true;
+    case cache_mode::os: s = "os"; return true;
+    case cache_mode::persistent: s = "persistent"; return true;
+    case cache_mode::prefetch: s = "prefetch"; return true;
+  }
+  return false;
+}
+
 /**
  * @brief Configuration for the scan_manager.
  *
@@ -51,16 +96,25 @@ inline constexpr std::size_t default_uring_n_reactors = 1;
  * @c sirius_datasource either way; the kvikio backend drives
  * @c kvikio::FileHandle directly. Multi-GPU forces this to true.
  *
+ * @c cache picks the read-path caching strategy; @ref apply_cache_mode derives
+ * @c local.use_odirect, @c enable_prefetch_cache and
+ * @c prefetch_cache.dispose_on_idle from it, so those three are not settable
+ * on their own.
+ *
  * Sub-configs:
  *  - @c local   — uring reactor tunables (local-disk IO path).
  *  - @c rest    — REST reactor tunables (S3/object-store IO path).
- *  - @c cache   — prefetching cache tunables.
+ *  - @c kvikio  — kvikIO backend tunables (local-file fallback path).
+ *  - @c prefetch_cache — prefetching cache tunables.
  *  - @c object_store — object-store credentials and endpoint.
  */
 struct scan_manager_config {
   exec::thread_pool_config thread_pool{.num_threads        = default_scan_manager_num_threads(),
                                        .thread_name_prefix = "scan_manager"};
   bool use_sirius_datasource{true};
+
+  /// Read-path caching strategy; the source of truth for the derived knobs.
+  cache_mode cache{cache_mode::none};
 
   /// Number of uring reactor worker threads for the local-disk IO path.
   std::size_t uring_n_reactors{default_uring_n_reactors};
@@ -70,11 +124,11 @@ struct scan_manager_config {
   std::size_t rest_n_reactors{2};
 
   /// Enable the prefetching cache on the ioctx.  When false the cache is
-  /// constructed but unarmed (no background IO threads).
+  /// constructed but unarmed (no background IO threads).  Derived from @ref cache.
   bool enable_prefetch_cache{false};
 
   /// Local (uring) reactor configuration — bounce-slot size, O_DIRECT,
-  /// ring depth, etc.
+  /// ring depth, etc.  @c use_odirect is derived from @ref cache.
   io::uring::config local{};
 
   /// REST (S3/object-store) reactor configuration — timeouts, TLS, chunking,
@@ -86,12 +140,37 @@ struct scan_manager_config {
   io::kvikio_config kvikio{};
 
   /// Prefetching cache configuration — in-flight budget, pool sizing,
-  /// dispose-after-use policy.
-  io::cache::config cache{};
+  /// dispose-on-idle policy.  @c dispose_on_idle is derived from @ref cache.
+  io::cache::config prefetch_cache{};
 
   /// Object-store credentials and endpoint consumed by the REST reactor.
   /// Empty fields disable the S3/REST backend.
   io::object_store_config object_store{};
+
+  /// Overwrite the knobs derived from @ref cache.
+  void apply_cache_mode() noexcept
+  {
+    switch (cache) {
+      case cache_mode::none:
+        local.use_odirect     = true;
+        enable_prefetch_cache = false;
+        break;
+      case cache_mode::os:
+        local.use_odirect     = false;
+        enable_prefetch_cache = false;
+        break;
+      case cache_mode::persistent:
+        local.use_odirect              = true;
+        enable_prefetch_cache          = true;
+        prefetch_cache.dispose_on_idle = false;
+        break;
+      case cache_mode::prefetch:
+        local.use_odirect              = true;
+        enable_prefetch_cache          = true;
+        prefetch_cache.dispose_on_idle = true;
+        break;
+    }
+  }
 };
 
 }  // namespace sirius::scan_manager

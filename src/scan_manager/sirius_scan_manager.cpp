@@ -436,7 +436,7 @@ sirius_scan_manager::sirius_scan_manager(
   // unconditional and there's no "is the cache present" branch to
   // worry about in callers.
   if (_config.enable_prefetch_cache && _io_ctx->can_use_prefetching_cache()) {
-    _io_ctx->initialize_cache(reservation_manager, _config.cache, _topology_index);
+    _io_ctx->initialize_cache(reservation_manager, _config.prefetch_cache, _topology_index);
   }
 
   // Reactors are built parked; start() launches their worker threads and
@@ -795,7 +795,7 @@ std::shared_ptr<sirius::io::ioctx> sirius_scan_manager::ioctx_for_path(std::stri
   if (!io_ctx) { return nullptr; }
   io_ctx->start();
   if (_config.enable_prefetch_cache && io_ctx->can_use_prefetching_cache()) {
-    io_ctx->initialize_cache(_reservation_manager, _config.cache, _topology_index);
+    io_ctx->initialize_cache(_reservation_manager, _config.prefetch_cache, _topology_index);
   }
   std::lock_guard lk{_routed_io_ctxs_mtx};
   auto [it, inserted] = _routed_io_ctxs.emplace(*type, std::move(io_ctx));

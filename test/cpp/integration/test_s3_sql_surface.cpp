@@ -378,8 +378,7 @@ class sirius_config_env_guard {
            "  executor:\n"
            "    scan_manager:\n";
     if (limits.enable_prefetch_cache.has_value()) {
-      out << "      enable_prefetch_cache: " << (*limits.enable_prefetch_cache ? "true" : "false")
-          << "\n";
+      out << "      cache: " << (*limits.enable_prefetch_cache ? "persistent" : "none") << "\n";
     }
     if (limits.use_sirius_datasource.has_value()) {
       out << "      use_sirius_datasource: " << (*limits.use_sirius_datasource ? "true" : "false")
