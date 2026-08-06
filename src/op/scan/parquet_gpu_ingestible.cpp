@@ -50,7 +50,11 @@
 // duckdb
 #include <duckdb/common/hive_partitioning.hpp>
 #include <duckdb/planner/expression/bound_conjunction_expression.hpp>
+#include <duckdb/planner/expression/bound_operator_expression.hpp>
+#include <duckdb/planner/expression/bound_reference_expression.hpp>
 #include <duckdb/planner/expression_iterator.hpp>
+#include <duckdb/planner/filter/conjunction_filter.hpp>
+#include <duckdb/planner/filter/null_filter.hpp>
 
 // uring_reactor MUST be included last among sirius headers: liburing.h,
 // pulled in transitively, defines a BLOCK_SIZE macro that collides with the
@@ -67,6 +71,7 @@
 #include <stdexcept>
 #include <string>
 #include <system_error>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -146,6 +151,55 @@ duckdb::unique_ptr<duckdb::Expression> stats_safe_conjuncts(duckdb::Expression c
     duckdb::make_uniq<duckdb::BoundConjunctionExpression>(duckdb::ExpressionType::CONJUNCTION_AND);
   for (auto& child : kept) {
     out->children.push_back(std::move(child));
+  }
+  return out;
+}
+
+/// Every `<col> IS [NOT] NULL` filter usable for null_count row-group pruning.
+///
+/// Read from the TableFilterSet rather than from the converted expression,
+/// because convert_table_filters_to_expression DROPS a column's top-level
+/// IS_NOT_NULL before building the expression. Collecting downstream of that
+/// would leave the ordinary `WHERE v IS NOT NULL` with no pruning at all, which
+/// is the common form of the predicate.
+///
+/// Both a top-level filter and one nested in a conjunction qualify. A
+/// conjunction is an AND of per-column filters, so each null test in it must
+/// hold independently -- unlike an OR, where the other branch could still
+/// match, so those are not collected.
+std::vector<null_prune_predicate> collect_null_prune_predicates(
+  duckdb::TableFilterSet const& filters,
+  duckdb::vector<duckdb::ColumnIndex> const& column_ids,
+  std::vector<std::optional<std::size_t>> const& batch_position_by_column_id,
+  std::unordered_set<std::size_t> const& skip_primary_indices)
+{
+  std::vector<null_prune_predicate> out;
+
+  auto classify = [](duckdb::TableFilterType type) -> std::optional<bool> {
+    if (type == duckdb::TableFilterType::IS_NULL) { return true; }
+    if (type == duckdb::TableFilterType::IS_NOT_NULL) { return false; }
+    return std::nullopt;
+  };
+
+  for (auto const& [column_index, filter] : filters.filters) {
+    // Hive-partition columns are not in the parquet file, so they have no
+    // statistics to prune on.
+    if (column_index >= column_ids.size()) { continue; }
+    if (skip_primary_indices.count(column_ids[column_index].GetPrimaryIndex()) != 0) { continue; }
+    if (column_index >= batch_position_by_column_id.size()) { continue; }
+    auto const& batch_pos = batch_position_by_column_id[column_index];
+    if (!batch_pos.has_value()) { continue; }
+    auto const index = static_cast<duckdb::idx_t>(*batch_pos);
+
+    if (auto expects_null = classify(filter->filter_type)) {
+      out.push_back(null_prune_predicate{index, *expects_null});
+    } else if (filter->filter_type == duckdb::TableFilterType::CONJUNCTION_AND) {
+      for (auto const& child : filter->Cast<duckdb::ConjunctionAndFilter>().child_filters) {
+        if (auto nested = classify(child->filter_type)) {
+          out.push_back(null_prune_predicate{index, *nested});
+        }
+      }
+    }
   }
   return out;
 }
@@ -448,6 +502,14 @@ parquet_gpu_ingestible::parquet_gpu_ingestible(std::unique_ptr<parquet_ingestibl
   // Filters on hive-partition columns are dropped — those columns aren't in the
   // parquet file (DuckDB prunes them at the file-list level already).
   if (bind.table_filters && !bind.table_filters->filters.empty()) {
+    // Collected from the filters themselves, not the expression built below --
+    // see collect_null_prune_predicates. Independent of whether any part of the
+    // predicate survives into reader-side pushdown.
+    _null_prune_predicates = collect_null_prune_predicates(*bind.table_filters,
+                                                           bind.column_ids,
+                                                           _plan->batch_position_by_column_id,
+                                                           _plan->partition_primary_indices);
+
     auto duckdb_expression =
       sirius::op::convert_table_filters_to_expression(*bind.table_filters,
                                                       bind.column_ids,
@@ -712,6 +774,84 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
                      file_path,
                      rgs_before,
                      row_group_indices.size());
+  }
+
+  // Prune from null_count for the conjuncts cuDF could not take. `IS NULL`
+  // excludes a row group whose column has no nulls; `IS NOT NULL` excludes one
+  // that is entirely null. Both are exact, so this loses no matching rows.
+  //
+  // null_count is optional in the parquet spec — an absent value means unknown,
+  // never zero, so the row group is kept.
+  if (!_null_prune_predicates.empty() && !row_group_indices.empty()) {
+    struct resolved_predicate {
+      std::size_t chunk_index;
+      bool expects_null;
+    };
+    std::vector<resolved_predicate> resolved;
+    resolved.reserve(_null_prune_predicates.size());
+    for (auto const& pred : _null_prune_predicates) {
+      // Only a scalar top-level column qualifies. For anything nested, the leaf
+      // statistic counts repeated values or leaf-level nulls, neither of which
+      // is the top-level column's nullness -- pruning on it can drop row groups
+      // that do contain matching rows.
+      //
+      // The DECLARED type is what decides this, not the parquet encoding. A
+      // single leaf does not imply scalar (a one-field struct has one), and
+      // neither does a one-component path: legacy parquet allows a top-level
+      // REPEATED primitive, whose path is just the column name, and DuckDB
+      // surfaces that as a LIST.
+      auto const batch_index = static_cast<std::size_t>(pred.batch_index);
+      if (batch_index >= _plan->data_columns.size()) { continue; }
+      auto const primary_idx = _plan->data_columns[batch_index].primary_idx;
+      if (primary_idx >= _info->returned_types.size()) { continue; }
+      auto const& column_type = _info->returned_types[primary_idx];
+      if (column_type.id() == sirius::type_id::LIST || column_type.id() == sirius::type_id::ARRAY ||
+          column_type.id() == sirius::type_id::STRUCT) {
+        continue;
+      }
+
+      auto const leaves =
+        detail::leaf_indices_for_column(metadata, _plan->batch_column_name(pred.batch_index));
+      if (leaves.size() != 1) { continue; }
+      auto const chunk_index = leaves.front();
+      auto const& first_rg   = metadata.row_groups.front();
+      if (chunk_index >= first_rg.columns.size() ||
+          first_rg.columns[chunk_index].meta_data.path_in_schema.size() != 1) {
+        continue;
+      }
+      resolved.push_back({chunk_index, pred.expects_null});
+    }
+
+    if (!resolved.empty()) {
+      auto const rgs_before = row_group_indices.size();
+      auto kept             = decltype(row_group_indices){};
+      kept.reserve(row_group_indices.size());
+      for (auto const rg_idx : row_group_indices) {
+        auto const& rg_meta = metadata.row_groups[static_cast<std::size_t>(rg_idx)];
+        bool keep           = true;
+        for (auto const& pred : resolved) {
+          if (pred.chunk_index >= rg_meta.columns.size()) { continue; }
+          auto const& null_count =
+            rg_meta.columns[pred.chunk_index].meta_data.statistics.null_count;
+          if (!null_count.has_value()) { continue; }
+          bool const provably_empty =
+            pred.expects_null ? (*null_count == 0) : (*null_count == rg_meta.num_rows);
+          if (provably_empty) {
+            keep = false;
+            break;
+          }
+        }
+        if (keep) { kept.push_back(rg_idx); }
+      }
+      row_group_indices = std::move(kept);
+      if (row_group_indices.size() != rgs_before) {
+        SIRIUS_LOG_DEBUG(
+          "[parquet_gpu_ingestible] null_count row group pruning {}: {} -> {} row group(s)",
+          file_path,
+          rgs_before,
+          row_group_indices.size());
+      }
+    }
   }
 
   struct row_group_size_estimate {
