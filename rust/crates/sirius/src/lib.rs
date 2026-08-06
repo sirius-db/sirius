@@ -208,6 +208,12 @@ impl Fragment<'_> {
         self.inner.pin_mut().declare_output(stream_id)
     }
 
+    /// Every declared output stream receives the full fragment output (a broadcast sink);
+    /// output 0 keeps the original batches, the rest carry independent deep copies.
+    pub fn declare_output_broadcast(&mut self) -> Result<(), Exception> {
+        self.inner.pin_mut().declare_output_broadcast()
+    }
+
     /// Plan `substrait_plan` against the declared streams and open the fragment's query lifecycle.
     pub fn build(&mut self, substrait_plan: &[u8]) -> Result<(), Exception> {
         let_cxx_string!(plan = substrait_plan);
@@ -519,6 +525,50 @@ mod tests {
             assert_eq!(result.schema.field(1).name(), "name");
             let total_rows: usize = result.batches.iter().map(RecordBatch::num_rows).sum();
             assert_eq!(total_rows, 3, "expected 3 rows from the parquet fixture");
+        }
+    }
+
+    /// The first multi-output fragment end to end: a broadcast sender's two output streams
+    /// each deliver the FULL result to their own receiver — the build side of a broadcast
+    /// join once the compute node fans destinations out. Requires a GPU.
+    #[test]
+    fn broadcast_fragment_feeds_every_destination() {
+        let _guard = GPU_CONTEXT_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        ensure_parquet_extension_env();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("users.parquet");
+        write_users_parquet(&path);
+        let sender_plan = local_files_plan(
+            path.to_str().unwrap(),
+            vec!["id".to_string(), "name".to_string()],
+        );
+
+        let ctx = SiriusContext::new().expect("bring up sirius context");
+        let mut sender = ctx.fragment().unwrap();
+        sender.declare_output(0).unwrap();
+        sender.declare_output(1).unwrap();
+        sender.declare_output_broadcast().unwrap();
+        sender.build(&sender_plan).unwrap();
+        sender.run().unwrap();
+
+        let expected = vec![
+            (1, "a".to_string()),
+            (2, "b".to_string()),
+            (3, "c".to_string()),
+        ];
+        for output_stream in [0u64, 1u64] {
+            let mut receiver = ctx.fragment().unwrap();
+            receiver.declare_input_column(0, "id", "BIGINT").unwrap();
+            receiver.declare_input_column(0, "name", "VARCHAR").unwrap();
+            receiver.build(&stream_read_plan(0)).unwrap();
+            let moved = receiver.relay_from(&mut sender, output_stream, 0, 0).unwrap();
+            assert!(moved > 0, "stream {output_stream} must carry the broadcast");
+            receiver.run().unwrap();
+            let result = receiver.into_arrow().unwrap();
+            assert_eq!(rows(&result), expected, "stream {output_stream}");
         }
     }
 

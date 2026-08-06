@@ -327,6 +327,9 @@ struct Fragment::Impl {
   //! Declared before build(); the map is what the bind catalog is populated from.
   std::map<sirius::exec::stream_id_t, declared_input> inputs;
   std::vector<sirius::exec::stream_id_t> outputs;
+  //! Every declared output receives the full fragment output (broadcast sink). Consumed by
+  //! build() into the fragment spec's partitioning.
+  bool broadcast_outputs{false};
 
   //! `inputs` as build() resolved them. Kept so the hop entry points (`relay_from`,
   //! `push_packed`) can validate an arriving batch against the schema the plan was bound
@@ -476,6 +479,12 @@ void Fragment::declare_output(std::uint64_t stream_id)
   outputs.push_back(stream_id);
 }
 
+void Fragment::declare_output_broadcast()
+{
+  impl_->require_not_built("declare_output_broadcast");
+  impl_->broadcast_outputs = true;
+}
+
 void Fragment::build(const std::string& substrait_plan)
 {
   impl_->require_not_built("build");
@@ -524,8 +533,13 @@ void Fragment::build(const std::string& substrait_plan)
       sirius::exec::fragment_spec spec;
       spec.plan_source = [plan = substrait_plan, conn = impl_->ctx.conn.get()](
                            duckdb::ClientContext&) { return lower_substrait(*conn, plan).plan; };
-      spec.inputs     = std::move(resolved);
-      spec.outputs    = impl_->outputs;
+      spec.inputs  = std::move(resolved);
+      spec.outputs = impl_->outputs;
+      if (impl_->broadcast_outputs && impl_->outputs.size() > 1) {
+        sirius::op::partition_spec broadcast;
+        broadcast.mode    = sirius::op::partition_spec::partition_mode::broadcast;
+        spec.partitioning = std::move(broadcast);
+      }
       impl_->fragment = std::make_unique<sirius::exec::streaming_fragment>(client, std::move(spec));
       // streaming_fragment declares its own inputs on the catalog from the spec; the views
       // created above are what the plan reads them through.

@@ -154,6 +154,12 @@ class SIRIUS_FFI_EXPORT Fragment {
   /// @throws after `build()`, or on a duplicate id.
   void declare_output(std::uint64_t stream_id);
 
+  /// Declare that every output stream receives the FULL fragment output (a broadcast sink):
+  /// output 0 keeps the original batches, the rest get independent deep copies. With a single
+  /// declared output this is a no-op — one destination is a gather either way.
+  /// @throws after `build()`.
+  void declare_output_broadcast();
+
   /// Plan `substrait_plan` against the declared streams and open this fragment's query lifecycle.
   /// Reads of a declared input stream must name the view `sirius_stream_<id>`, which this call
   /// creates.
