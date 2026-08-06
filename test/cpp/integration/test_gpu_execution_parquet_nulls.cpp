@@ -64,61 +64,26 @@
 
 #include <catch.hpp>
 #include <duckdb.hpp>
-#include <unistd.h>
 #include <utils/gpu_execution_fixture.hpp>
+#include <utils/parquet_fixture_utils.hpp>
 
-#include <atomic>
-#include <cstdlib>
-#include <filesystem>
 #include <memory>
 #include <optional>
 #include <string>
-#include <system_error>
 #include <vector>
 
-namespace fs = std::filesystem;
-
 namespace {
+
+using sirius::test::scoped_sirius_disable;
+using sirius::test::sql_literal;
 
 // ---------------------------------------------------------------------------
 // Helper: generate a parquet file with a plain DuckDB (Sirius disabled).
 // ---------------------------------------------------------------------------
 
-/// Sets SIRIUS_DISABLE=1 for the duration of a scope, then restores whatever
-/// was there before -- including the harness's own "1".
-///
-/// A bare setenv/unsetenv pair is wrong twice over: the harness deliberately
-/// keeps SIRIUS_DISABLE=1 so untagged tests' DuckDB instances do not
-/// auto-initialize a SiriusContext (see scoped_sirius_disable_clear in
-/// test_plan_printer.cpp), so unsetting it leaks a changed global into later
-/// tests; and the REQUIREs below throw on failure, which would skip the unset
-/// entirely. Restoring in a destructor fixes both.
-struct scoped_sirius_disable_set {
-  scoped_sirius_disable_set()
-  {
-    if (char const* val = ::getenv("SIRIUS_DISABLE")) { _saved = val; }
-    ::setenv("SIRIUS_DISABLE", "1", 1);
-  }
-  ~scoped_sirius_disable_set()
-  {
-    if (_saved) {
-      ::setenv("SIRIUS_DISABLE", _saved->c_str(), 1);
-    } else {
-      ::unsetenv("SIRIUS_DISABLE");
-    }
-  }
-  scoped_sirius_disable_set(scoped_sirius_disable_set const&)            = delete;
-  scoped_sirius_disable_set& operator=(scoped_sirius_disable_set const&) = delete;
-
- private:
-  std::optional<std::string> _saved;
-};
-
 struct ParquetFileGuard {
-  fs::path dir;
-
-  /// Creates the scratch directory and ONE Sirius-disabled DuckDB for the
-  /// fixture's lifetime.
+  /// Owns a scratch directory and ONE Sirius-disabled DuckDB for the fixture's
+  /// lifetime.
   ///
   /// Catch2 rebuilds a fixture for every TEST_CASE_METHOD that uses it, and the
   /// constructors here run ~20 metadata assertions each. Opening a database per
@@ -128,29 +93,11 @@ struct ParquetFileGuard {
   /// SIRIUS_DISABLE only matters while the instance is being created — that is
   /// when the extension callback would attach a SiriusContext — so the guard
   /// does not need to outlive the constructor.
-  explicit ParquetFileGuard(std::string tag)
+  explicit ParquetFileGuard(std::string const& tag) : dir_(tag)
   {
-    static std::atomic<unsigned> ctr{0};
-    dir = fs::temp_directory_path() / ("sirius_pq_nulls_" + tag + "_" + std::to_string(::getpid()) +
-                                       "_" + std::to_string(ctr.fetch_add(1)));
-    // PID + a process-local counter repeats once PIDs are reused (PID 1 in a
-    // container makes that likely), and create_directories accepts an existing
-    // directory — leaving a previous run's parquet files in place to be read
-    // instead of the ones about to be written. Clear it first.
-    std::error_code ec;
-    fs::remove_all(dir, ec);
-    fs::create_directories(dir);
-
-    scoped_sirius_disable_set disable_guard;
+    scoped_sirius_disable disable_guard;
     db_  = std::make_unique<duckdb::DuckDB>(nullptr);
     con_ = std::make_unique<duckdb::Connection>(*db_);
-  }
-  ~ParquetFileGuard()
-  {
-    // Best-effort: a destructor is noexcept, so a leftover temp dir must not
-    // become a std::terminate.
-    std::error_code ec;
-    fs::remove_all(dir, ec);
   }
 
   // Run one or more SQL statements in a SIRIUS_DISABLE=1 DuckDB connection.
@@ -170,21 +117,7 @@ struct ParquetFileGuard {
   // Convenience overload for a single statement.
   void write(const std::string& stmt) const { write(std::vector<std::string>{stmt}); }
 
-  std::string path(const std::string& name) const { return (dir / name).string(); }
-
-  /// A single-quoted SQL literal with embedded quotes doubled. TMPDIR may
-  /// legally contain one, which would otherwise terminate the literal early and
-  /// break every generated statement.
-  static std::string sql_literal(std::string const& value)
-  {
-    std::string out = "'";
-    for (char const c : value) {
-      if (c == '\'') { out.push_back('\''); }
-      out.push_back(c);
-    }
-    out.push_back('\'');
-    return out;
-  }
+  std::string path(const std::string& name) const { return dir_.file(name); }
 
   // Return a read_parquet(...) SQL expression for a single file.
   std::string scan(const std::string& name) const
@@ -238,29 +171,6 @@ struct ParquetFileGuard {
       UNSCOPED_INFO("column '" << col_name << "' encodings '" << encodings_str
                                << "' do not contain '" << encoding_substr << "'");
       REQUIRE(encodings_str.find(encoding_substr) != std::string::npos);
-    }
-  }
-
-  // Assert the file contains at least @p expected row groups.
-  //
-  // DuckDB's ROW_GROUP_SIZE is NOT a hard cut: ParquetWriteSink appends whole
-  // DataChunks (up to STANDARD_VECTOR_SIZE = 2048 rows) to a buffer and only
-  // then checks `buffer.Count() >= row_group_size`, and Flush writes the entire
-  // buffer as ONE row group. So the effective minimum row group is the arriving
-  // chunk size (2048) regardless of how small ROW_GROUP_SIZE is set -- asking
-  // for 50 on a 203-row table yields a single 203-row row group. Multi-row-group
-  // fixtures must therefore write well over 2048 rows AND assert the result.
-  void assert_min_row_groups(const std::string& pq_path, std::size_t expected) const
-  {
-    auto r = con_->Query("SELECT COUNT(DISTINCT row_group_id) FROM parquet_metadata(" +
-                         sql_literal(pq_path) + ")");
-    REQUIRE(r);
-    REQUIRE_FALSE(r->HasError());
-    REQUIRE(r->RowCount() == 1);
-    auto const actual = r->GetValue(0, 0).GetValue<std::int64_t>();
-    if (actual < static_cast<std::int64_t>(expected)) {
-      UNSCOPED_INFO("file has " << actual << " row group(s), expected at least " << expected);
-      REQUIRE(actual >= static_cast<std::int64_t>(expected));
     }
   }
 
@@ -441,6 +351,7 @@ struct ParquetFileGuard {
   }
 
  private:
+  sirius::test::scratch_dir dir_;
   // Reused by every helper; see the constructor.
   std::unique_ptr<duckdb::DuckDB> db_;
   std::unique_ptr<duckdb::Connection> con_;
@@ -519,7 +430,7 @@ class ParquetNullFixture : public sirius::test::GpuExecutionFixture {
       "  CASE WHEN i % 2 = 0 THEN 'v' || CAST(i AS VARCHAR) END"
       "  FROM range(1, 17) AS t(i)",
 
-      "COPY nt TO " + pq_.sql_literal(pq_path) + " (FORMAT PARQUET)",
+      "COPY nt TO " + sql_literal(pq_path) + " (FORMAT PARQUET)",
     });
 
     // Pin every physical encoding this fixture claims to exercise, so a change
@@ -610,7 +521,7 @@ class ParquetDictNullFixture : public sirius::test::GpuExecutionFixture {
       "    CASE WHEN i % 5 = 0 THEN NULL ELSE i * 10 END AS val"
       "  FROM range(1, 31) AS t(i)"
       ") TO " +
-      pq_.sql_literal(pq_path) + " (FORMAT PARQUET);");
+      sql_literal(pq_path) + " (FORMAT PARQUET);");
 
     // Assert that `cat` was actually written with dictionary encoding.
     // parquet_metadata().encodings is a list; cast to VARCHAR and check for
@@ -636,7 +547,7 @@ class ParquetDictNullFixture : public sirius::test::GpuExecutionFixture {
 // The row count must exceed DuckDB's effective row-group granularity for this
 // fixture to mean anything: ROW_GROUP_SIZE is not a hard cut, and the writer's
 // real granularity is the arriving DataChunk size (STANDARD_VECTOR_SIZE, 2048).
-// See assert_min_row_groups for the mechanism.
+// See assert_row_group_sizes for the mechanism.
 //
 // 4 * 2048 + 203 = 8395 rows with ROW_GROUP_SIZE 2048 therefore yields 4 full
 // 2048-row row groups plus a ragged 203-row tail. 203 is deliberately not a
@@ -664,7 +575,7 @@ class ParquetMultiRowGroupFixture : public sirius::test::GpuExecutionFixture {
       // on the order. Matches test_pin_table_zone_map_pruning.cpp.
       "  ORDER BY i"
       ") TO " +
-      pq_.sql_literal(pq_path) + " (FORMAT PARQUET, ROW_GROUP_SIZE 2048);");
+      sql_literal(pq_path) + " (FORMAT PARQUET, ROW_GROUP_SIZE 2048);");
 
     // 8395 rows / 2048 == 4 full row groups + a 203-row tail.
     // The exact layout, not just a count: the ragged-tail test below targets
@@ -717,7 +628,7 @@ class ParquetDenseColFixture : public sirius::test::GpuExecutionFixture {
     pq_.write({
       "CREATE TABLE dense (id INTEGER, val INTEGER, s VARCHAR)",
       "INSERT INTO dense SELECT i, i * 2, 'str_' || CAST(i AS VARCHAR) FROM range(1, 33) AS t(i)",
-      "COPY dense TO " + pq_.sql_literal(pq_path) + " (FORMAT PARQUET)",
+      "COPY dense TO " + sql_literal(pq_path) + " (FORMAT PARQUET)",
     });
 
     // Pin what DuckDB actually emits: OPTIONAL, with zero nulls present.
@@ -767,7 +678,7 @@ class ParquetNullRunFixture : public sirius::test::GpuExecutionFixture {
       // multi-row-group fixture.
       "  ORDER BY i"
       ") TO " +
-      pq_.sql_literal(pq_.path("runs.parquet")) + " (FORMAT PARQUET);");
+      sql_literal(pq_.path("runs.parquet")) + " (FORMAT PARQUET);");
     // 8000 rows (ids 0..7999): c_run valid on the first 500, c_pre on the last
     // 1000. Pinned because a run-shaped column is exactly where a generation
     // slip would leave both GPU and CPU agreeing on the wrong data.
@@ -792,8 +703,8 @@ class ParquetNullRunFixture : public sirius::test::GpuExecutionFixture {
 // fixed_point_scalar literal against those stats -- the filter is instead
 // applied post-decode (parquet_gpu_ingestible.cpp).
 //
-// Every other fixture here uses DECIMAL(10,2), which lands on INT32/INT64 and
-// therefore never reaches that branch. DECIMAL(38,4) forces FLBA; the fixture
+// Every other decimal here is DECIMAL(9,2) or DECIMAL(18,2), which land on
+// INT32/INT64 and never reach that branch. DECIMAL(38,4) forces FLBA; the fixture
 // asserts the physical type so this does not silently regress into testing the
 // INT64 path. Filters over the FLBA decimal exercise the post-decode path with
 // NULLs present.
@@ -813,7 +724,7 @@ class ParquetFlbaDecimalNullFixture : public sirius::test::GpuExecutionFixture {
       "    CAST(NULL AS DECIMAL(38,4)) AS n_big_dec"
       "  FROM range(1, 41) AS t(i)"
       ") TO " +
-      pq_.sql_literal(pq_path) + " (FORMAT PARQUET);");
+      sql_literal(pq_path) + " (FORMAT PARQUET);");
 
     // Pin the physical type -- the whole point of this fixture is the FLBA
     // decode + disabled-pushdown path, not decimals in general.
