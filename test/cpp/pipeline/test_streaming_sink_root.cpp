@@ -14,9 +14,11 @@
  * limitations under the License.
  */
 
+#include "data/data_batch_utils.hpp"
 #include "op/sirius_physical_operator_type.hpp"
 #include "op/sirius_physical_streaming_sink.hpp"
 #include "pipeline/sirius_pipeline.hpp"
+#include "sirius/exception.hpp"
 #include "sirius_engine.hpp"
 
 #include <catch.hpp>
@@ -25,8 +27,10 @@
 #include <utils/pipeline_conversion_test_utils.hpp>
 #include <utils/sirius_test_env.hpp>
 
+#include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <set>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -184,6 +188,68 @@ TEST_CASE_METHOD(streaming_sink_root_fixture,
         REQUIRE_FALSE(sink.drained(i));
       }
     });
+}
+
+// ============================================================================
+// SINKROOT-5: a broadcast sink delivers the FULL output to every destination
+// ============================================================================
+//
+// The multi-destination contract for broadcast joins: destination 0 keeps the
+// original batch handles (the zero-copy single-output push), every other
+// destination gets independent deep copies -- so all N consumers see the same
+// rows and none shares a handle with another.
+
+TEST_CASE_METHOD(streaming_sink_root_fixture,
+                 "SINKROOT-5: a broadcast sink replicates its output to every destination",
+                 "[integration][pipeline][streaming_sink_root_exec]")
+{
+  auto repos = make_repos(3);
+
+  sirius::op::partition_spec broadcast;
+  broadcast.mode = sirius::op::partition_spec::partition_mode::broadcast;
+
+  sirius::test::with_initialized_streaming_fragment(
+    *con,
+    "SELECT a FROM (VALUES (1), (2), (3), (4), (5)) t(a)",
+    repos,
+    broadcast,
+    [&](sirius::sirius_engine& engine, sirius_physical_streaming_sink& sink) {
+      REQUIRE(sink.num_output_streams() == 3);
+      engine.execute();
+
+      // Every destination holds the full output: same total bytes, same rows, and the copies
+      // are distinct batches (destinations must not share handles they could race over).
+      REQUIRE(repos[0]->total_size() > 0);
+      auto const expected_size = repos[0]->total_size();
+      std::set<std::uint64_t> batch_ids;
+      for (std::size_t i = 0; i < repos.size(); ++i) {
+        REQUIRE(repos[i]->total_size() == expected_size);
+        std::size_t rows = 0;
+        for (auto batch = repos[i]->pop_next_data_batch(); batch;
+             batch      = repos[i]->pop_next_data_batch()) {
+          rows += static_cast<std::size_t>(sirius::get_cudf_table_view(*batch).num_rows());
+          REQUIRE(batch_ids.insert(batch->get_batch_id()).second);
+        }
+        REQUIRE(rows == 5);
+      }
+    });
+}
+
+// ============================================================================
+// SINKROOT-6: a broadcast sink refuses key columns
+// ============================================================================
+
+TEST_CASE_METHOD(streaming_sink_root_fixture,
+                 "SINKROOT-6: a broadcast sink refuses key columns",
+                 "[integration][pipeline][streaming_sink_root]")
+{
+  sirius::op::partition_spec bad;
+  bad.mode        = sirius::op::partition_spec::partition_mode::broadcast;
+  bad.key_columns = {0};
+  REQUIRE_THROWS_AS(
+    sirius_physical_streaming_sink(
+      {sirius::logical_type::make(sirius::type_id::INTEGER)}, 1, make_repos(2), bad),
+    sirius::invalid_input_exception);
 }
 
 // ============================================================================

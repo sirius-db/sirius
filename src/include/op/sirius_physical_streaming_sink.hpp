@@ -30,17 +30,30 @@
 
 namespace sirius::op {
 
-/// How a partitioned sink routes rows across its output streams.
+/// How a multi-output sink routes rows across its output streams.
 ///
-/// Only the *function* lives here. Which compute node each partition ships to is the wrapper's
+/// Only the *function* lives here. Which compute node each output ships to is the wrapper's
 /// routing table, and N is `output_repositories.size()` — the sink stays oblivious to both.
 struct partition_spec {
-  /// Column indices hashed to pick a destination. Must be non-empty for a partitioned sink.
+  enum class partition_mode {
+    /// Rows are hash-routed by `key_columns`: output i gets partition i.
+    hash,
+    /// Every output gets the FULL input: output 0 keeps the original batch handle (zero copy,
+    /// same as the single-output push), outputs 1..N-1 get independent deep copies so each
+    /// destination's consumer owns its batches outright — a broadcast join's build side.
+    broadcast,
+  };
+
+  /// Column indices hashed to pick a destination. Must be non-empty for a hash sink; must be
+  /// empty for a broadcast sink (there is nothing to route by).
   std::vector<int> key_columns;
 
   /// Per-key cast applied before hashing, so keys that differ only in representation (INT32 vs
   /// INT64) still land together. Empty means "hash every key as-is".
   std::vector<cudf::data_type> key_cast_types;
+
+  /// Last member so existing `{keys, casts}` aggregate initializers keep meaning hash.
+  partition_mode mode = partition_mode::hash;
 };
 
 /// Terminal operator of a streaming fragment: every batch its pipeline produces is pushed into

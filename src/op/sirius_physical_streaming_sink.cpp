@@ -21,6 +21,7 @@
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "sirius/exception.hpp"
+#include "telemetry/data_batch_probe.hpp"
 
 #include <cucascade/data/data_batch.hpp>
 #include <log/logging.hpp>
@@ -66,10 +67,16 @@ sirius_physical_streaming_sink::sirius_physical_streaming_sink(
                                             std::to_string(i) + " must not be null");
     }
   }
-  if (_output_repositories.size() > 1 && _spec.key_columns.empty()) {
+  if (_spec.mode == partition_spec::partition_mode::hash && _output_repositories.size() > 1 &&
+      _spec.key_columns.empty()) {
     throw sirius::invalid_input_exception("sirius_physical_streaming_sink: a sink with " +
                                           std::to_string(_output_repositories.size()) +
                                           " destinations needs partition key columns to route by");
+  }
+  if (_spec.mode == partition_spec::partition_mode::broadcast && !_spec.key_columns.empty()) {
+    throw sirius::invalid_input_exception(
+      "sirius_physical_streaming_sink: a broadcast sink routes nothing by key; key columns "
+      "would be silently ignored");
   }
 }
 
@@ -97,6 +104,33 @@ void sirius_physical_streaming_sink::sink(const operator_data& input_data,
       if (!_lifecycle.admit([&] { _output_repositories[0]->add_data_batch(batch); })) {
         SIRIUS_LOG_WARN(
           "sirius_physical_streaming_sink: batch refused after end-of-stream and dropped");
+      }
+    }
+    return;
+  }
+
+  if (_spec.mode == partition_spec::partition_mode::broadcast) {
+    // Output 0 keeps the original handle (same zero-copy push as the single-output path);
+    // every other output gets an independent deep copy in the batch's current memory space, so
+    // each destination's consumer owns its batches outright and the destinations cannot race
+    // over one handle's residency.
+    const auto& batches  = input.get_data_batches();
+    const auto read_only = input.get_read_only_batches();
+    for (std::size_t b = 0; b < batches.size(); ++b) {
+      for (std::size_t i = 1; i < _output_repositories.size(); ++i) {
+        const auto clone_batch_id = sirius::get_next_batch_id();
+        auto copy                 = read_only[b].clone(
+          clone_batch_id,
+          stream,
+          telemetry::quent_data_batch_probe::create(batch_telemetry(), clone_batch_id));
+        if (!_lifecycle.admit([&] { _output_repositories[i]->add_data_batch(copy); })) {
+          SIRIUS_LOG_WARN(
+            "sirius_physical_streaming_sink: broadcast batch refused after end-of-stream");
+        }
+      }
+      if (!_lifecycle.admit([&] { _output_repositories[0]->add_data_batch(batches[b]); })) {
+        SIRIUS_LOG_WARN(
+          "sirius_physical_streaming_sink: broadcast batch refused after end-of-stream");
       }
     }
     return;
