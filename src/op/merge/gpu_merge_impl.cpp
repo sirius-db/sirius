@@ -18,6 +18,7 @@
 
 #include "data/data_batch_utils.hpp"
 #include "log/logging.hpp"
+#include "op/aggregate/aggregate_op_util.hpp"
 
 #include <cudf/aggregation.hpp>
 #include <cudf/concatenate.hpp>
@@ -115,6 +116,9 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::merge_ungrouped_aggregate
           }
           default: break;
         }
+        // The HUGEINT->BIGINT downcast guard: refuse a 64-bit integer sum that could wrap.
+        throw_if_int64_sum_could_overflow(
+          concatenated->get_column(c), stream, memory_space.get_default_allocator());
         reduce_aggregation = cudf::make_sum_aggregation<cudf::reduce_aggregation>();
         break;
       }
@@ -259,6 +263,11 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::merge_grouped_aggregate(
       case cudf::aggregation::Kind::SUM:
       case cudf::aggregation::Kind::COUNT_ALL:
       case cudf::aggregation::Kind::COUNT_VALID: {
+        if (aggregates[i] == cudf::aggregation::Kind::SUM) {
+          // The HUGEINT->BIGINT downcast guard: refuse a 64-bit integer sum that could wrap.
+          // COUNT states are exempt: they sum row counts, which stay far below int64.
+          throw_if_int64_sum_could_overflow(request.values, stream, mr);
+        }
         request.aggregations.push_back(cudf::make_sum_aggregation<cudf::groupby_aggregation>());
         break;
       }

@@ -18,6 +18,7 @@
 
 #include "data/data_batch_utils.hpp"
 #include "log/logging.hpp"
+#include "op/aggregate/aggregate_op_util.hpp"
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/copying.hpp>
@@ -316,6 +317,10 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
   std::vector<int> input_col_order;
   for (size_t i = 0; i < aggregates.size(); ++i) {
     const auto& aggregate_kind = aggregates[i];
+    if (aggregate_kind == cudf::aggregation::Kind::SUM) {
+      // The HUGEINT->BIGINT downcast guard: refuse a 64-bit integer sum that could wrap.
+      throw_if_int64_sum_could_overflow(input_table.column(aggregate_idx[i]), stream, mr);
+    }
     int aggregate_col_id;
     if (has_struct_col_indices && !aggregate_struct_col_indices[i].empty()) {
       // Multi-column COLLECT_SET: use a unique synthetic negative key for this slot.

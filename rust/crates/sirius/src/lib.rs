@@ -2042,6 +2042,69 @@ mod tests {
         );
     }
 
+    /// A `name, n BIGINT` parquet whose values are large enough that a 64-bit sum could wrap.
+    fn write_big_values_parquet(path: &Path) {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("n", DataType::Int64, true),
+        ]));
+        let names: ArrayRef = Arc::new(StringArray::from(vec!["a", "a", "b", "b"]));
+        let values: ArrayRef = Arc::new(Int64Array::from(vec![i64::MAX / 2; 4]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![names, values]).unwrap();
+        let file = std::fs::File::create(path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+    }
+
+    /// Builds `sum(n) GROUP BY name` over an int64 column — the sum DuckDB models as HUGEINT
+    /// but the engine runs in an int64 accumulator (the HUGEINT-to-BIGINT downcast path).
+    fn int64_sum_plan(path: &str) -> Vec<u8> {
+        use prost::Message as _;
+        use substrait::proto::{Plan, rel};
+
+        let mut plan = Plan::decode(partial_avg_plan(path).as_slice()).unwrap();
+        let root = match plan.relations[0].rel_type.as_mut().unwrap() {
+            substrait::proto::plan_rel::RelType::Root(root) => root,
+            other => panic!("expected a root relation, got {other:?}"),
+        };
+        let rel::RelType::Aggregate(aggregate) =
+            root.input.as_mut().unwrap().rel_type.as_mut().unwrap()
+        else {
+            panic!("expected an aggregate relation");
+        };
+        // Keep only the count measure and repoint it at the arithmetic sum: sum($1) AS BIGINT.
+        aggregate.measures.remove(0);
+        aggregate.measures[0]
+            .measure
+            .as_mut()
+            .unwrap()
+            .function_reference = 1;
+        root.names = ["name", "s"].into_iter().map(str::to_string).collect();
+        plan.encode_to_vec()
+    }
+
+    /// A 64-bit integer sum whose values could wrap the int64 accumulator fails loudly: cuDF
+    /// has no INT128 to widen into, so the engine refuses instead of wrapping silently.
+    /// Requires a GPU.
+    #[test]
+    fn int64_sum_that_could_overflow_fails_loudly() {
+        let _guard = GPU_CONTEXT_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let message = under_watchdog("overflowing int64 sum".to_string(), move || {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("big.parquet");
+            write_big_values_parquet(&path);
+            let plan = int64_sum_plan(path.to_str().unwrap());
+            let ctx = SiriusContext::new().expect("bring up sirius context");
+            match ctx.execute_substrait_result(&plan) {
+                Ok(_) => Err("a sum that could overflow int64 was allowed to run".to_string()),
+                Err(err) => Ok(err.to_string()),
+            }
+        });
+        assert!(message.contains("could overflow int64"), "{message}");
+    }
 
     /// Like [`stream_read_plan`] but declaring `id` as FP64 — for the schema-mismatch
     /// negatives, whose receiver deliberately declares a type the sender does not produce.

@@ -21,6 +21,10 @@
 #include "expression/ast/node.hpp"
 
 #include <cudf/aggregation.hpp>
+#include <cudf/column/column_view.hpp>
+
+#include <rmm/cuda_stream_view.hpp>
+#include <rmm/resource_ref.hpp>
 
 #include <memory>
 #include <optional>
@@ -92,6 +96,23 @@ struct CudfAggregateDefinitions {
 CudfAggregateDefinitions convert_duckdb_aggregates_to_cudf(
   const duckdb::vector<std::unique_ptr<sirius::ast::node>>& groups_p,
   const duckdb::vector<std::unique_ptr<sirius::ast::node>>& expressions);
+
+/**
+ * @brief Throw if a SUM over `input` could overflow its 64-bit accumulator.
+ *
+ * DuckDB models integer sums as HUGEINT, but cuDF has no INT128, so the plan generator
+ * downcasts them to BIGINT (`downcast_hugeint_types`) and the reduction runs in a 64-bit
+ * accumulator that wraps silently on overflow. This is the loud guard on that downcast path:
+ * a cheap min/max pre-check that refuses any 64-bit integer sum whose
+ * `valid_rows * max(|min|, |max|)` bound exceeds the accumulator range. Conservative — it can
+ * refuse a sum that would have fit — but it never lets one wrap.
+ *
+ * No-op for other input types: narrower integers cannot overflow an int64 accumulator within
+ * one column (2^31 rows * 2^31 max < 2^63), and float/decimal sums do not take this path.
+ */
+void throw_if_int64_sum_could_overflow(const cudf::column_view& input,
+                                       rmm::cuda_stream_view stream,
+                                       rmm::device_async_resource_ref mr);
 
 }  // namespace op
 }  // namespace sirius
