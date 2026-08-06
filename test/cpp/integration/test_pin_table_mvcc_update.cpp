@@ -85,6 +85,32 @@ TEST_CASE_METHOD(PinMvccUpdateFixture,
 }
 
 TEST_CASE_METHOD(PinMvccUpdateFixture,
+                 "mvcc update guard: rebound prepared UPDATE validates its current target",
+                 "[integration][gpu_execution][pin_table_mvcc_update]")
+{
+  run_ok("CREATE TABLE t AS SELECT 1::INTEGER AS k, 10::INTEGER AS v;");
+  auto prepared = con->Prepare("UPDATE t SET v = ? WHERE k = 1;");
+  REQUIRE(prepared);
+  REQUIRE_FALSE(prepared->HasError());
+
+  run_ok("ALTER TABLE t RENAME TO old_t;");
+  run_ok("CREATE TABLE t AS SELECT 1::INTEGER AS k, 20::INTEGER AS v;");
+  run_ok("CHECKPOINT;");
+  run_ok("CALL pin_table(format='duckdb', name='t', tier='gpu');");
+
+  auto result = prepared->Execute(99);
+  REQUIRE(result);
+  require_pinned_update_error(*result, "t", "t");
+
+  run_ok("SET gpu_execution = false;");
+  auto unchanged = con->Query("SELECT v FROM t;");
+  REQUIRE(unchanged);
+  REQUIRE_FALSE(unchanged->HasError());
+  REQUIRE(unchanged->GetValue(0, 0) == duckdb::Value::INTEGER(20));
+  run_ok("CALL unpin_table('t');");
+}
+
+TEST_CASE_METHOD(PinMvccUpdateFixture,
                  "mvcc update guard: another connection cannot update a pinned table",
                  "[integration][gpu_execution][pin_table_mvcc_update]")
 {

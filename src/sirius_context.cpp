@@ -142,12 +142,14 @@ void reject_update_to_pinned_table(SiriusContext& sirius_context,
   if (!target) { return; }
 
   auto connection_state = get_sirius_connection_state(context);
-  if (connection_state && connection_state->has_pinned_update_guard()) { return; }
   if (!connection_state) {
     throw InternalException("Sirius connection state is unavailable while guarding UPDATE");
   }
 
-  auto update_guard = sirius_context.lock_pinned_table_updates();
+  std::shared_lock<std::shared_mutex> update_guard;
+  if (!connection_state->has_pinned_update_guard()) {
+    update_guard = sirius_context.lock_pinned_table_updates();
+  }
   {
     SiriusContext::SlotGuard pin_registry_guard(sirius_context, context);
     auto pinned_name = pinned_name_for_table(sirius_context.get_scan_manager(), *target);
@@ -160,7 +162,9 @@ void reject_update_to_pinned_table(SiriusContext& sirius_context,
     }
   }
 
-  connection_state->set_pinned_update_guard(std::move(update_guard));
+  if (update_guard.owns_lock()) {
+    connection_state->set_pinned_update_guard(std::move(update_guard));
+  }
 }
 
 /// Resolve the config file path. Search order:
