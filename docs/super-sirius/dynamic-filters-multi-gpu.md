@@ -1,17 +1,11 @@
 # Dynamic Filters — Multi-GPU Publication
 
-> **Status: implemented.** The hash-IN-list, Bloom, and zone-map replica paths
-> were revalidated on 2026-07-06. Dynamic-filter consumers remain nonblocking
-> and safe on multiple GPUs. The producer builds each filter once and attempts
-> to materialize its compact representation on every active probe GPU (copying
-> raw needles, finalized hash-set slots, or Bloom words, or reconstructing exact zone
-> scalars), and publishes one immutable logical filter only after every
-> successful device-local replica is ready. TPC-H Q2 passed on physical GPUs 1
-> and 2. In the recorded pinned-host SF300 Q1-Q22 A/B, the sum of warm per-query
-> medians fell from **13.7013505 s to 8.2939465 s: 39.466212% faster
-> (1.651970x)**. All 22 result files were byte-identical. That measurement and
-> the two-GPU revalidation predate the raw-needle representation; its focused
-> two-GPU regression is described in [Validation](#validation).
+> **Status: implemented.** Dynamic-filter consumers remain nonblocking and safe
+> on multiple GPUs. The producer builds each filter once and attempts to
+> materialize its compact representation on every active probe GPU (copying raw
+> needles, finalized hash-set slots, or Bloom words, or reconstructing exact
+> zone scalars), and publishes one immutable logical filter only after every
+> successful device-local replica is ready.
 > See [dynamic-filters.md](dynamic-filters.md) for the general feature.
 
 ## Summary
@@ -61,20 +55,11 @@ operator, which has no reader filter to ride and therefore selects zone maps
 (evaluated row-wise as AST masks) and membership filters together. See
 [Transitive scan targets and publication timing](dynamic-filters.md#transitive-scan-targets-and-publication-timing).
 
-## Reproduction and diagnosis
+## Failure mode and diagnosis
 
-The original integration reproducer was run with physical GPUs 1 and 2:
-
-```bash
-CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1,2 \
-  build/release/extension/sirius/test/cpp/sirius_unittest \
-  "gpu_execution - TPC-H Query 2 parquet"
-```
-
-Before the fix, the two-GPU section failed with `cudaErrorIllegalAddress`; the
-single-GPU section passed. Q2 is a reliable trigger because its selective join
-publishes membership filters consumed by probe scan tasks on both logical
-devices.
+The ownership bug appears when a probe consumer runs on a different GPU from
+the producer and dereferences the producer's device-local storage. A
+single-device execution cannot expose that cross-device access.
 
 The unsafe ownership was:
 
@@ -150,8 +135,8 @@ first queried `cudaDevAttrL2CacheSize`.
 ### 2. Keep publication local and exactly once
 
 `dynamic_filter_publisher` is declared in
-`src/include/op/dynamic_filter_publisher.hpp` and implemented in
-`src/op/dynamic_filter_publisher.cpp`; the physical hash join owns and invokes
+`src/include/op/dynamic_filter/dynamic_filter_publisher.hpp` and implemented in
+`src/op/dynamic_filter/dynamic_filter_publisher.cpp`; the physical hash join owns and invokes
 it. It consumes the immutable plan, the join's key metadata, and one materialized
 build view; it is not a shared scheduler service or a mutable routing registry.
 
@@ -356,7 +341,7 @@ re-reading its state. This makes `ACTIVE` terminal: a stale unselective task
 from an older filter generation cannot race a selective task on another GPU and
 disable a filter already proven useful.
 
-## Why this is performant
+## Cost and scheduling model
 
 Publication adds `O(filter_size * (GPU_count - 1))` transfer work per join, not
 one rehash/rebuild per GPU. A verified pair uses one direct peer-DMA leg; only an
@@ -364,9 +349,9 @@ unusable pair pays the HOST-staged D2H/H2D fallback. The steady-state probe
 remains entirely device-local: the 1–12-row first tier scans raw needles, the
 hash IN-list is selected to fit the smallest active L2 where possible, and the
 Bloom remains the compact fallback. The raw tier's probe work is
-`O(probe_rows * num_keys)`; its row-count gate bounds that work, but no
-raw-versus-hash performance result is claimed here. No key column is retained,
-no scan is pinned to the build GPU, and scan parallelism is unchanged.
+`O(probe_rows * num_keys)`; its row-count gate bounds that work. No key column
+is retained, no scan is pinned to the build GPU, and scan parallelism is
+unchanged.
 
 The copy happens on the producer's publication path. Direct copies to all
 peer-capable targets are enqueued before the completion pass, allowing their DMA
@@ -384,22 +369,16 @@ work queued, so the publication wait can occasionally include earlier work on
 that stream. This is a cold-path head-of-line tradeoff: it can delay publication
 and therefore the ordered immediate-probe start or the coverage of a transitive
 target, while the managed pool avoids per-filter stream creation/destruction. It
-is not a consumer-side wait or a correctness hazard. The end-to-end A/B below
-includes this behavior.
+is not a consumer-side wait or a correctness hazard and does not alter the
+ownership or readiness contracts.
 
-## Validation
+## Correctness coverage
 
 ### Correctness and device ownership
 
-The recorded 2026-07-06 baseline on physical NVIDIA GB200 GPUs 1 and 2
-(`CUDA_VISIBLE_DEVICES=1,2`, exposed as logical devices 0 and 1) predates the
-raw-needle representation:
-
-- Full dynamic-filter suite: **242 assertions in 67 test cases, all passed**.
-  This includes IN-list, Bloom, and zone-map remote replicas, the forced
-  fixed-HOST-pool route, and the concurrent sticky-ACTIVE gate regression.
-- Original TPC-H Q2 integration reproducer: **831 assertions, all passed**.
-- The release loadable extension and unit-test targets build successfully.
+The focused tests cover IN-list, Bloom, and zone-map remote replicas, the
+fixed-HOST-pool fallback route, concurrent gate updates, and end-to-end
+multi-device consumption.
 
 One focused low-level test verifies that a filter object without a replica for a
 requested device returns no mask; this exercises API safety and is not a model
@@ -420,70 +399,20 @@ The reservation-denial suite also covers the raw small IN-list. These multi-GPU
 cases skip automatically when fewer than two devices are visible, so a passing
 two-device run is still required before the raw path can be called revalidated.
 
-### Performance
-
-The recorded measurement used SF300 parquet, grouped mode, physical GPUs 1 and
-2, five iterations per query, and `--pin host`. Host pinning occurs outside the
-timed region. Zone maps were disabled, so this isolates the then-current
-hash-IN-list/Bloom publication and application. It predates the raw-needle tier
-and is not evidence for that tier or its cutoff. The OFF and ON configurations
-differ materially only in `enable_dynamic_filter_pushdown` and their output
-paths.
-
-For each query, iteration 0 was discarded and the median of iterations 1-4 was
-taken. The global TPC-H metric is the sum of those 22 medians:
-
-| Two-GPU pinned-host SF300 | Dynamic filters off | Dynamic filters on | Improvement | Speedup |
-|---|---:|---:|---:|---:|
-| Sum of Q1-Q22 warm medians | 13.7013505 s | 8.2939465 s | **39.466212%** | **1.651970x** |
-
-Per-query medians:
-
-| Query | Off (s) | On (s) | Improvement |
-|---|---:|---:|---:|
-| Q1 | 0.5032265 | 0.4830505 | +4.009% |
-| Q2 | 0.3523525 | 0.1512455 | +57.076% |
-| Q3 | 0.6793430 | 0.5083335 | +25.173% |
-| Q4 | 0.3422540 | 0.2919185 | +14.707% |
-| Q5 | 0.7750700 | 0.4428915 | +42.858% |
-| Q6 | 0.2415565 | 0.2214595 | +8.320% |
-| Q7 | 0.8857810 | 0.4226995 | +52.279% |
-| Q8 | 0.9209665 | 0.5385575 | +41.523% |
-| Q9 | 1.6049180 | 0.5737445 | +64.251% |
-| Q10 | 0.8152175 | 0.5586015 | +31.478% |
-| Q11 | 0.2668315 | 0.1410555 | +47.137% |
-| Q12 | 0.4276590 | 0.3572310 | +16.468% |
-| Q13 | 0.3523750 | 0.3220650 | +8.602% |
-| Q14 | 0.2516855 | 0.2315255 | +8.010% |
-| Q15 | 0.2416645 | 0.2215090 | +8.340% |
-| Q16 | 0.2728810 | 0.2426490 | +11.079% |
-| Q17 | 1.4642370 | 0.4680155 | +68.037% |
-| Q18 | 0.9712030 | 0.4177245 | +56.989% |
-| Q19 | 0.5283170 | 0.5334245 | -0.967% |
-| Q20 | 0.3545820 | 0.2753625 | +22.342% |
-| Q21 | 1.2680195 | 0.7196875 | +43.243% |
-| Q22 | 0.1812100 | 0.1711950 | +5.527% |
-
-Both runs contain exactly 110 timing rows, and every ON/OFF `result.txt` pair is
-byte-identical. The requested global multi-GPU `>=10%` gate is exceeded by
-29.47 percentage points. This is an ON-vs-OFF result at a fixed two-GPU count in
-the warm pinned-host regime; it is not a one-to-two-GPU scaling or cold-storage
-claim. Q19 regresses 1.0%, so the gain is global rather than universal per query.
-
 ## Code map
 
 - Filter API and device-aware ownership:
-  `src/include/op/sirius_dynamic_filter.hpp`
+  `src/include/op/dynamic_filter/sirius_dynamic_filter.hpp`
 - Membership storage replication:
   `src/cuda/sirius_dynamic_small_in_list_filter.cu`,
   `src/cuda/sirius_dynamic_in_list_filter.cu`,
   `src/cuda/sirius_dynamic_bloom_filter.cu`
 - Exact typed zone-map replication:
-  `src/op/sirius_dynamic_filter.cpp`
+  `src/op/dynamic_filter/sirius_dynamic_filter.cpp`
 - Producer device discovery and publication:
   `src/planner/sirius_plan_comparison_join.cpp`,
-  `src/include/op/dynamic_filter_publisher.hpp`,
-  `src/op/dynamic_filter_publisher.cpp`,
+  `src/include/op/dynamic_filter/dynamic_filter_publisher.hpp`,
+  `src/op/dynamic_filter/dynamic_filter_publisher.cpp`,
   `src/op/sirius_physical_hash_join.cpp`
 - Consumer device selection:
   `src/include/op/scan/dynamic_filter_gate.hpp`,
@@ -491,8 +420,8 @@ claim. Q19 regresses 1.0%, so the gain is global rather than universal per query
   `src/op/scan/parquet_gpu_ingestible.cpp`,
   `src/op/scan/sirius_physical_dynamic_filter.cpp`
 - Sirius-owned replica-transfer policy:
-  `src/include/op/dynamic_filter_replica_reservation.hpp`,
-  `src/include/op/dynamic_filter_replica_transfer.hpp`,
+  `src/include/op/dynamic_filter/dynamic_filter_replica_reservation.hpp`,
+  `src/include/op/dynamic_filter/dynamic_filter_replica_transfer.hpp`,
   `src/cuda/dynamic_filter_replica_transfer.cu`
 - Focused regressions:
   `test/cpp/operator/test_dynamic_filter_publisher.cpp`,

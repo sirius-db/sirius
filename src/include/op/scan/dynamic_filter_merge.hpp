@@ -21,9 +21,9 @@
 
 #include <rmm/cuda_stream_view.hpp>
 
+#include <op/dynamic_filter/sirius_dynamic_filter.hpp>
 #include <op/scan/dynamic_filter_gate.hpp>
 #include <op/scan/scan_plan.hpp>
-#include <op/sirius_dynamic_filter.hpp>
 
 #include <memory>
 
@@ -64,17 +64,14 @@ enum class dynamic_filter_apply_mode { membership_masks_only, include_ast_row_ma
 /// @p input must be in the scan's output layout: a filtered column index is its position in
 /// @p input directly. Returns nullptr when no filter contributed a mask.
 ///
-/// Two filter kinds combine into one keep-mask: AST-lowerable zone-maps (via @c
-/// cudf::compute_column, only in @ref dynamic_filter_apply_mode::include_ast_row_masks) and
-/// mask-applicable membership filters (IN-list / bloom). Membership filters apply as a
-/// most-selective-first CASCADE: each filter's mask is computed only over the rows surviving the
-/// filters before it. When @p gate is non-null it supplies per-filter marginal keep ratios:
-/// measured-useless filters are dropped from the cascade, and each filter's first ratio is recorded
-/// back. Pass null (tests, gate-less callers) to apply everything in channel insertion order.
+/// AST-lowerable zone maps contribute one combined row mask in
+/// @ref dynamic_filter_apply_mode::include_ast_row_masks. Membership filters then apply
+/// sequentially, with each mask computed over the surviving rows. When @p gate is non-null,
+/// recorded marginal keep ratios order the membership filters and suppress filters that prune too
+/// little. A null gate applies every membership filter without selectivity-based ordering.
 /// @p device_id selects device-local filter storage; -1 resolves to the current CUDA device.
-/// @note Should not be used by callers -- useful for testing. Callers should use
-/// apply_dynamic_filters_gated_view instead, which wraps this with a gate early-out and keep-ratio
-/// recording.
+/// Most scan callers should use @ref apply_dynamic_filters_gated_view, which adds the scan-level
+/// early-out and records the combined keep ratio.
 [[nodiscard]] std::unique_ptr<cudf::table> apply_dynamic_filters_to_view(
   cudf::table_view const& input,
   sirius::op::sirius_dynamic_filter_set const& filters,

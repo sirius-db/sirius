@@ -106,8 +106,7 @@ mark_join_fixture create_mark_join()
     duckdb::vector<duckdb::idx_t>{},  // left_projection_map (empty = all)
     duckdb::vector<duckdb::idx_t>{},  // right_projection_map (not used by MARK)
     sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{}),  // delim_types
-    1000,
-    nullptr);
+    1000);
 
   // No pipelines exist in this fixture, so the converter's assign_operator_ids never runs.
   // Number the tree here — operator code reads get_operator_id(), which rejects the sentinel.
@@ -569,8 +568,7 @@ TEST_CASE("sirius_physical_hash_join mark join - mixed conditions are unsupporte
                       duckdb::vector<duckdb::idx_t>{},
                       duckdb::vector<duckdb::idx_t>{},
                       sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{}),
-                      1000,
-                      nullptr),
+                      1000),
                     std::runtime_error);
 }
 

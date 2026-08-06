@@ -22,7 +22,7 @@
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/memory_space.hpp>
-#include <op/dynamic_filter_replica_transfer.hpp>
+#include <op/dynamic_filter/dynamic_filter_replica_transfer.hpp>
 
 #include <algorithm>
 #include <cstddef>

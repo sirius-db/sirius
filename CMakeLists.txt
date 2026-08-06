@@ -318,9 +318,9 @@ set(EXTENSION_SOURCES
     src/op/scan/gpu_ingestible.cpp
     src/op/scan/parquet_gpu_ingestible.cpp
     src/op/scan/duckdb_native_gpu_ingestible.cpp
-    src/op/dynamic_filter_publish_plan.cpp
-    src/op/dynamic_filter_publisher.cpp
-    src/op/sirius_dynamic_filter.cpp
+    src/op/dynamic_filter/dynamic_filter_publish_plan.cpp
+    src/op/dynamic_filter/dynamic_filter_publisher.cpp
+    src/op/dynamic_filter/sirius_dynamic_filter.cpp
     src/op/sirius_physical_column_data_scan.cpp
     src/op/sirius_physical_streaming_source.cpp
     src/op/sirius_physical_concat.cpp
@@ -359,7 +359,10 @@ set(EXTENSION_SOURCES
     src/pipeline/repository_wiring_materializer.cpp
     src/pipeline/sirius_plan_printer.cpp
     src/pipeline/task_request.cpp
-    src/planner/duckdb_join_filter_candidate_adapter.cpp
+    src/planner/dynamic_filter/build_filter_evidence.cpp
+    src/planner/dynamic_filter/build_key_domain.cpp
+    src/planner/dynamic_filter/dynamic_filter_key_admission.cpp
+    src/planner/dynamic_filter/dynamic_filter_target_discovery.cpp
     src/planner/query.cpp
     src/planner/query_index.cpp
     src/planner/sirius_physical_plan_generator.cpp
@@ -650,6 +653,7 @@ set(TEST_SOURCES
     test/cpp/integration/test_gpu_execution_allnull_scan.cpp
     test/cpp/integration/test_gpu_execution_array.cpp
     test/cpp/integration/test_gpu_execution_dynamic_filter_native.cpp
+    test/cpp/integration/test_gpu_execution_dynamic_filter_sip.cpp
     test/cpp/integration/test_gpu_execution_filter_nulls.cpp
     test/cpp/integration/test_gpu_execution_join_nulls.cpp
     test/cpp/integration/test_gpu_execution_locality.cpp
@@ -717,13 +721,20 @@ set(TEST_SOURCES
     test/cpp/operator/test_physical_top_n.cpp
     test/cpp/operator/test_physical_ungrouped_aggregate.cpp
     test/cpp/operator/test_sirius_dynamic_filter.cpp
+    test/cpp/operator/test_dynamic_filter_publication_claim.cpp
     test/cpp/operator/test_dynamic_filter_publisher.cpp
+    test/cpp/operator/test_dynamic_filter_source_policy.cpp
     test/cpp/operator/test_sirius_dynamic_filter_mgpu.cpp
     test/cpp/parallel/test_task_executor.cpp
     test/cpp/planner/test_compressed_schema_propagation.cpp
+    src/planner/dynamic_filter/duckdb_join_filter_candidate_adapter.cpp
     test/cpp/planner/test_distinct_hash_join_detection.cpp
     test/cpp/planner/test_duckdb_join_filter_candidate_adapter.cpp
-    test/cpp/planner/test_dynamic_filter_router.cpp
+    test/cpp/planner/test_build_filter_evidence.cpp
+    test/cpp/planner/test_build_key_domain.cpp
+    test/cpp/planner/test_dynamic_filter_discovery_parity.cpp
+    test/cpp/planner/test_dynamic_filter_key_admission.cpp
+    test/cpp/planner/test_dynamic_filter_target_discovery.cpp
     test/cpp/planner/test_join_expression_key.cpp
     test/cpp/planner/test_plan_tree_shape.cpp
     test/cpp/planner/test_projection_fold.cpp
@@ -751,7 +762,6 @@ set(TEST_SOURCES
     test/cpp/scan/test_duckdb_insert_delta.cpp
     test/cpp/scan/test_duckdb_mvcc_visibility.cpp
     test/cpp/scan/test_duckdb_native_batch_coalescer.cpp
-    test/cpp/scan/test_duckdb_native_dynamic_filter_remap.cpp
     test/cpp/scan/test_duckdb_native_host_backed_decode.cpp
     test/cpp/scan/test_duckdb_native_walker.cpp
     test/cpp/scan/test_dynamic_filter_merge.cpp
@@ -768,7 +778,6 @@ set(TEST_SOURCES
     test/cpp/sirius_extension/test_sirius_read_parquet_cardinality.cpp
     test/cpp/sql/test_sirius_sql_rewrite.cpp
     test/cpp/telemetry/test_telemetry_context.cpp
-    test/cpp/transparent/test_preserve_dynamic_filter_metadata.cpp
     test/cpp/unittest.cpp
     test/cpp/utils/pipeline_conversion_test_utils.cpp
     test/cpp/utils/sirius_test_env.cpp

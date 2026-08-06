@@ -48,6 +48,26 @@
 
 namespace sirius::test {
 
+/// Collects stringified result rows, sorted by default for order-insensitive comparison.
+/// @param result Materialized result to read.
+/// @param sort Whether to sort the rows; pass false to preserve emitted order.
+/// @return Collected rows.
+inline std::vector<std::vector<std::string>> collect_rows(duckdb::MaterializedQueryResult& result,
+                                                          bool sort = true)
+{
+  std::vector<std::vector<std::string>> rows;
+  for (duckdb::idx_t r = 0; r < result.RowCount(); r++) {
+    std::vector<std::string> row;
+    row.reserve(result.ColumnCount());
+    for (duckdb::idx_t c = 0; c < result.ColumnCount(); c++) {
+      row.push_back(result.GetValue(c, r).ToString());
+    }
+    rows.push_back(std::move(row));
+  }
+  if (sort) { std::sort(rows.begin(), rows.end()); }
+  return rows;
+}
+
 /// RAII guard that points Sirius at a config file for the lifetime of a fixture
 /// that spins up its own (non-shared) host database.
 struct sirius_config_env_guard {
@@ -128,23 +148,11 @@ class GpuExecutionFixture {
     REQUIRE_FALSE(result->HasError());
   }
 
-  /// Collect all rows as vectors of stringified values. When `sort` is true the
-  /// rows are sorted for order-insensitive multiset comparison; pass false to
-  /// preserve emitted order (e.g. to verify ORDER BY / NULLS FIRST|LAST).
+  /// @copydoc sirius::test::collect_rows
   static std::vector<std::vector<std::string>> collect_rows(duckdb::MaterializedQueryResult& result,
                                                             bool sort = true)
   {
-    std::vector<std::vector<std::string>> rows;
-    for (duckdb::idx_t r = 0; r < result.RowCount(); r++) {
-      std::vector<std::string> row;
-      row.reserve(result.ColumnCount());
-      for (duckdb::idx_t c = 0; c < result.ColumnCount(); c++) {
-        row.push_back(result.GetValue(c, r).ToString());
-      }
-      rows.push_back(std::move(row));
-    }
-    if (sort) { std::sort(rows.begin(), rows.end()); }
-    return rows;
+    return sirius::test::collect_rows(result, sort);
   }
 
   /// Cell equality used by the comparator. Exact string match by default; when

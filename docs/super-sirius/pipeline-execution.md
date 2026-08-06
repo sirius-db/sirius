@@ -351,8 +351,8 @@ such edge and samples whatever complete filters are visible at its reader and po
 checkpoints.
 
 Issue [#1124](https://github.com/sirius-db/sirius/issues/1124) measured the former build-subtree
-preference at SF300. It provided no coverage benefit; disabling it cut wall time by 9–25% and
-substantially reduced run-to-run variance, so it was removed. See
+preference. It provided no coverage benefit while costing wall time and run-to-run variance, so it
+was removed. See
 [Transitive scan targets and publication timing](dynamic-filters.md#transitive-scan-targets-and-publication-timing)
 for the consumer semantics.
 

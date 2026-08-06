@@ -2022,14 +2022,13 @@ static void SetPinTableCompressionMaxCompressedFraction(ClientContext& context,
   SIRIUS_LOG_DEBUG("Updated pin_table_compression_max_compressed_fraction");
 }
 
-static void SetEnableDynamicFilterPushdown(ClientContext& context, SetScope scope, Value& parameter)
+static void SetEnableDynamicFilter(ClientContext& context, SetScope scope, Value& parameter)
 {
   auto* params = get_operator_params(context);
   if (!params) { return; }
-  auto slot                              = lock_operator_params_slot(context);
-  params->enable_dynamic_filter_pushdown = BooleanValue::Get(parameter);
-  SIRIUS_LOG_DEBUG("Updated config ENABLE_DYNAMIC_FILTER_PUSHDOWN to {}",
-                   params->enable_dynamic_filter_pushdown);
+  auto slot                     = lock_operator_params_slot(context);
+  params->enable_dynamic_filter = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config ENABLE_DYNAMIC_FILTER to {}", params->enable_dynamic_filter);
 }
 
 static void SetEnableDynamicZoneMapFilter(ClientContext& context, SetScope scope, Value& parameter)
@@ -2050,8 +2049,9 @@ static void SetDynamicFilterDomainCoverageThreshold(ClientContext& context,
   if (!params) { return; }
   auto slot              = lock_operator_params_slot(context);
   const double threshold = parameter.GetValue<double>();
-  if (threshold <= 0.0) {
-    throw InvalidInputException("dynamic_filter_domain_coverage_threshold must be > 0.0, got %f",
+  if (!sirius::config::valid_domain_coverage_threshold{}(threshold)) {
+    throw InvalidInputException("dynamic_filter_domain_coverage_threshold %s, got %f",
+                                sirius::config::valid_domain_coverage_threshold::description(),
                                 threshold);
   }
   params->dynamic_filter_domain_coverage_threshold = threshold;
@@ -2337,20 +2337,17 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::operator
     SetPinTableCompressionMaxCompressedFraction);
 
   config.AddExtensionOption(
-    "enable_dynamic_filter_pushdown",
-    "Wire dynamic table-filter pushdown: an eligible BUILD_PROBE hash-join build publishes a "
-    "runtime membership filter (raw IN-list for 1-12 supported build rows; otherwise a hash "
-    "IN-list if it fits the smallest probe-GPU L2, or a Bloom) into the probe-side scan to drop "
-    "non-matching rows before the join (on by default)",
+    "enable_dynamic_filter",
+    "Enable runtime dynamic-filter discovery for eligible BUILD_PROBE hash joins; targets may be "
+    "probe-side scans or join-edge endpoints (on by default)",
     LogicalType::BOOLEAN,
-    Value::BOOLEAN(sirius::operator_params{}.enable_dynamic_filter_pushdown),
-    SetEnableDynamicFilterPushdown);
+    Value::BOOLEAN(sirius::operator_params{}.enable_dynamic_filter),
+    SetEnableDynamicFilter);
 
   config.AddExtensionOption(
     "enable_dynamic_zone_map_filter",
-    "Additionally emit a runtime zone-map (build-key min/max) at the probe scan: parquet scans use "
-    "it for read-time row-group pruning, while duckdb-native scans apply it row-wise post-decode; "
-    "requires enable_dynamic_filter_pushdown (off by default)",
+    "Additionally emit build-key min/max filters: parquet scans use them for row-group pruning; "
+    "duckdb-native scans apply them post-decode; requires enable_dynamic_filter (off by default)",
     LogicalType::BOOLEAN,
     Value::BOOLEAN(sirius::operator_params{}.enable_dynamic_zone_map_filter),
     SetEnableDynamicZoneMapFilter);

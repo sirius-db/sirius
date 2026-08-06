@@ -34,9 +34,9 @@
 #include <cuda_runtime.h>
 
 #include <catch.hpp>
+#include <op/dynamic_filter/sirius_dynamic_filter.hpp>
 #include <op/scan/dynamic_filter_merge.hpp>
 #include <op/scan/scan_plan.hpp>
-#include <op/sirius_dynamic_filter.hpp>
 
 #include <barrier>
 #include <cstddef>
@@ -791,6 +791,40 @@ std::shared_ptr<sirius::op::sirius_dynamic_in_list_filter> make_in_list_prefix(
   return std::make_shared<sirius::op::sirius_dynamic_in_list_filter>(
     keys->view(), stream, cudf::get_current_device_resource_ref());
 }
+
+/// Membership filter that counts compute_mask calls and delegates to a wrapped IN-list filter.
+/// Makes "the gate did not re-run this filter" directly observable.
+class counting_in_list_filter final : public sirius_dynamic_filter,
+                                      public sirius::op::sirius_mask_applicable {
+ public:
+  explicit counting_in_list_filter(std::shared_ptr<sirius::op::sirius_dynamic_in_list_filter> inner)
+    : _inner(std::move(inner))
+  {
+  }
+
+  [[nodiscard]] sirius_dynamic_filter_kind kind() const override { return _inner->kind(); }
+
+  [[nodiscard]] bool is_available_on_device(int device_id) const noexcept override
+  {
+    return _inner->is_available_on_device(device_id);
+  }
+
+  [[nodiscard]] std::unique_ptr<cudf::column> compute_mask(
+    cudf::column_view const& probe,
+    int device_id,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) const override
+  {
+    ++_mask_calls;
+    return _inner->compute_mask(probe, device_id, stream, mr);
+  }
+
+  [[nodiscard]] int mask_calls() const noexcept { return _mask_calls; }
+
+ private:
+  std::shared_ptr<sirius::op::sirius_dynamic_in_list_filter> _inner;
+  mutable int _mask_calls = 0;
+};
 }  // namespace
 
 TEST_CASE("apply_dynamic_filters_to_view returns nullptr when no filter contributes",
@@ -1037,10 +1071,10 @@ TEST_CASE("per-filter gate measures marginal keep and skips a useless filter on 
 
   // First split measured both marginals: the domain-covering filter is now skippable, the
   // selective one is not.
-  auto useless_kept = gate.filter_keep_ratio(useless.get());
+  auto useless_kept = gate.filter_keep_ratio(useless.get(), filters.filter_count());
   REQUIRE(useless_kept.has_value());
   REQUIRE(sirius::op::scan::dynamic_filter_gate::filter_skippable(*useless_kept));
-  auto selective_kept = gate.filter_keep_ratio(selective.get());
+  auto selective_kept = gate.filter_keep_ratio(selective.get(), filters.filter_count());
   REQUIRE(selective_kept.has_value());
   REQUIRE_FALSE(sirius::op::scan::dynamic_filter_gate::filter_skippable(*selective_kept));
 
@@ -1050,4 +1084,113 @@ TEST_CASE("per-filter gate measures marginal keep and skips a useless filter on 
   stream.synchronize();
   REQUIRE(out2 != nullptr);
   REQUIRE(out2->num_rows() == 2);
+}
+
+TEST_CASE("per-filter gate keeps a dead verdict when the channel grows",
+          "[dynamic_filter][scan_merge]")
+{
+  auto stream = cudf::get_default_stream();
+  sirius::op::scan::dynamic_filter_gate gate;
+
+  auto useless = make_in_list_prefix(10, stream);  // covers the whole domain -- keep 1.0
+  sirius_dynamic_filter_set filters;
+  filters.push_filter(0, useless);
+
+  auto table = make_int64_sequence_table(10, stream);
+  auto out   = sirius::op::scan::apply_dynamic_filters_gated_view(
+    table->view(), filters, gate, stream, dynamic_filter_apply_mode::include_ast_row_masks);
+  stream.synchronize();
+  REQUIRE(out != nullptr);
+
+  // Measured against a one-filter cascade and found skippable.
+  auto const measured = gate.filter_keep_ratio(useless.get(), filters.filter_count());
+  REQUIRE(measured.has_value());
+  REQUIRE(sirius::op::scan::dynamic_filter_gate::filter_skippable(*measured));
+
+  // Growth re-opens the scan-level gate, not this verdict: the dead filter stays dead.
+  filters.push_filter(0, make_in_list_prefix(2, stream));
+  auto const after_growth = gate.filter_keep_ratio(useless.get(), filters.filter_count());
+  REQUIRE(after_growth.has_value());
+  REQUIRE(sirius::op::scan::dynamic_filter_gate::filter_skippable(*after_growth));
+  REQUIRE(after_growth == measured);  // the stored verdict, not a remeasure trigger
+}
+
+TEST_CASE("per-filter gate excludes a dead filter from the re-armed apply without re-running it",
+          "[dynamic_filter][scan_merge]")
+{
+  auto stream = cudf::get_default_stream();
+  sirius::op::scan::dynamic_filter_gate gate;
+
+  // The only filter covers the whole domain: the first split disables the scan-level gate and
+  // records the filter's dead marginal verdict.
+  auto useless = std::make_shared<counting_in_list_filter>(make_in_list_prefix(10, stream));
+  sirius_dynamic_filter_set filters;
+  filters.push_filter(0, useless);
+
+  auto table = make_int64_sequence_table(10, stream);
+  auto out   = sirius::op::scan::apply_dynamic_filters_gated_view(
+    table->view(), filters, gate, stream, dynamic_filter_apply_mode::include_ast_row_masks);
+  stream.synchronize();
+  REQUIRE(out != nullptr);
+  REQUIRE(out->num_rows() == 10);
+  REQUIRE(useless->mask_calls() == 1);
+  REQUIRE_FALSE(gate.applicable(filters));
+
+  // A selective filter lands later: growth re-arms the scan-level gate for one measurement...
+  auto selective = make_in_list_prefix(2, stream);
+  filters.push_filter(0, selective);
+  REQUIRE(gate.applicable(filters));
+
+  // ...and the re-armed apply runs only the newcomer — the dead filter's verdict is permanent,
+  // so its mask kernel never runs again.
+  auto out2 = sirius::op::scan::apply_dynamic_filters_gated_view(
+    table->view(), filters, gate, stream, dynamic_filter_apply_mode::include_ast_row_masks);
+  stream.synchronize();
+  REQUIRE(out2 != nullptr);
+  REQUIRE(out2->num_rows() == 2);
+  REQUIRE(useless->mask_calls() == 1);
+
+  // The dead verdict survives at the larger channel size; the newcomer measured selective.
+  auto const useless_kept = gate.filter_keep_ratio(useless.get(), filters.filter_count());
+  REQUIRE(useless_kept.has_value());
+  REQUIRE(sirius::op::scan::dynamic_filter_gate::filter_skippable(*useless_kept));
+  auto const selective_kept = gate.filter_keep_ratio(selective.get(), filters.filter_count());
+  REQUIRE(selective_kept.has_value());
+  REQUIRE_FALSE(sirius::op::scan::dynamic_filter_gate::filter_skippable(*selective_kept));
+  REQUIRE(gate.applicable(filters));  // the re-arm measured 0.2 -> ACTIVE
+}
+
+TEST_CASE("per-filter gate stales a selective verdict when the channel grows",
+          "[dynamic_filter][scan_merge]")
+{
+  auto stream = cudf::get_default_stream();
+  sirius::op::scan::dynamic_filter_gate gate;
+
+  auto selective = make_in_list_prefix(2, stream);  // keeps 20%
+  sirius_dynamic_filter_set filters;
+  filters.push_filter(0, selective);
+
+  auto table = make_int64_sequence_table(10, stream);
+  auto out   = sirius::op::scan::apply_dynamic_filters_gated_view(
+    table->view(), filters, gate, stream, dynamic_filter_apply_mode::include_ast_row_masks);
+  stream.synchronize();
+  REQUIRE(out != nullptr);
+  REQUIRE(out->num_rows() == 2);
+
+  // Measured against a one-filter cascade and found selective: the verdict is live at this size.
+  auto const measured = gate.filter_keep_ratio(selective.get(), filters.filter_count());
+  REQUIRE(measured.has_value());
+  REQUIRE_FALSE(sirius::op::scan::dynamic_filter_gate::filter_skippable(*measured));
+
+  // Growth stales a selective reading: new arrivals change the rows reaching the filter.
+  filters.push_filter(0, make_in_list_prefix(4, stream));
+  REQUIRE_FALSE(gate.filter_keep_ratio(selective.get(), filters.filter_count()).has_value());
+
+  // The next apply remeasures it against the larger cascade.
+  auto out2 = sirius::op::scan::apply_dynamic_filters_gated_view(
+    table->view(), filters, gate, stream, dynamic_filter_apply_mode::include_ast_row_masks);
+  stream.synchronize();
+  REQUIRE(out2 != nullptr);
+  REQUIRE(out2->num_rows() == 2);
+  REQUIRE(gate.filter_keep_ratio(selective.get(), filters.filter_count()).has_value());
 }

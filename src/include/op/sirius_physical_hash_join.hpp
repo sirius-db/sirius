@@ -28,8 +28,8 @@
 #include "duckdb/planner/operator/logical_join.hpp"
 #include "expression/ast/node.hpp"  // complete sirius::ast::node for join_condition's destructor
 #include "expression/join_condition.hpp"
-#include "op/dynamic_filter_publish_plan.hpp"
-#include "op/dynamic_filter_replica_space.hpp"
+#include "op/dynamic_filter/dynamic_filter_publish_plan.hpp"
+#include "op/dynamic_filter/dynamic_filter_stats.hpp"
 #include "op/sirius_physical_partition_consumer_operator.hpp"
 #include "sirius_config.hpp"
 #include "utils.hpp"
@@ -248,27 +248,13 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
     const duckdb::vector<std::size_t>& right_projection_map,
     duckdb::vector<sirius::logical_type> delim_types,
     std::size_t estimated_cardinality,
-    duckdb::unique_ptr<duckdb::JoinFilterPushdownInfo> pushdown_info,
     uint64_t max_build_hash_table_bytes             = config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES,
     dynamic_filter_publish_plan dynamic_filter_plan = {},
     uint64_t hash_partition_bytes                   = config::DEFAULT_HASH_PARTITION_BYTES,
-    uint64_t max_broadcast_join_size                = config::DEFAULT_MAX_BROADCAST_JOIN_SIZE);
-
-  sirius_physical_hash_join(
-    duckdb::LogicalOperator& op,
-    duckdb::unique_ptr<sirius_physical_operator> left,
-    duckdb::unique_ptr<sirius_physical_operator> right,
-    duckdb::vector<sirius::join_condition> cond,
-    duckdb::JoinType join_type,
-    std::size_t estimated_cardinality,
-    uint64_t max_build_hash_table_bytes = config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES,
-    uint64_t hash_partition_bytes       = config::DEFAULT_HASH_PARTITION_BYTES,
-    uint64_t max_broadcast_join_size    = config::DEFAULT_MAX_BROADCAST_JOIN_SIZE);
+    uint64_t max_broadcast_join_size                = config::DEFAULT_MAX_BROADCAST_JOIN_SIZE,
+    dynamic_filter_stats* dynamic_filter_stats_sink = {});
 
   duckdb::vector<sirius::join_condition> conditions;
-  //! Scans where we should push generated filters into (if any)
-  duckdb::unique_ptr<duckdb::JoinFilterPushdownInfo> filter_pushdown;
-
   //! The types of the join keys
   duckdb::vector<sirius::logical_type> condition_types;
   //! The type of the join
@@ -327,7 +313,7 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   /// decision so the partition can finish its own wiring (e.g. enabling build-side concat_all).
   partition_strategy get_partition_strategy(const partition_sizing_input& in) override;
 
-  /// True when this join publishes dynamic filters (a filter-pushdown plan with wired probe
+  /// True when this join publishes dynamic filters (an enabled publication plan, i.e. wired probe
   /// targets). The upstream PARTITION folds a single-partition build to one batch for such a join
   /// so the one-shot publisher sees the whole key set.
   [[nodiscard]] bool publishes_dynamic_filters() const;
@@ -395,6 +381,11 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   // upstream PARTITION at sizing time; the one-shot dynamic-filter publisher only claims a build
   // batch when this holds. Guarded by op_state_mutex.
   bool _build_arrives_whole = false;
+
+  // One-shot latch for the "dynamic filter NOT published" diagnostic and its stats counter: a
+  // wired join whose build cannot arrive whole reports that once, not once per build batch.
+  // Guarded by op_state_mutex.
+  bool _build_not_whole_reported = false;
 
   // Whether any build-side join key column contains a NULL. Used exclusively for MARK join
   // three-valued logic. Sentinel -1 = unset, 0 = false, 1 = true. Join-wide (not per-partition)
@@ -479,8 +470,10 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
     CLOSED       ///< Finalization closed the window before the hook claimed it.
   };
 
-  /// Complete plan-time routing, policy, and replica-space description; immutable at runtime.
-  dynamic_filter_publish_plan const _dynamic_filter_plan;
+  /// Plan-time routing, policy, and replica placement; not mutated after construction.
+  dynamic_filter_publish_plan _dynamic_filter_plan;
+  // Optional non-owning counter sink. SiriusContext owns it and outlives the plan.
+  dynamic_filter_stats* _dynamic_filter_stats = nullptr;
   /// Exactly-once arbitration between the publication hook and finalization.
   std::atomic<dynamic_filter_publication_state> _dynamic_filter_publication_state{
     dynamic_filter_publication_state::OPEN};
@@ -502,6 +495,16 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   void push_data_batch_partitioned(std::string_view port_id,
                                    std::shared_ptr<::cucascade::data_batch> batch,
                                    std::size_t partition_idx) override;
+
+  /**
+   * @brief Return this join's dynamic-filter publication plan
+   *
+   * @return The plan, which is not mutated after construction
+   */
+  [[nodiscard]] dynamic_filter_publish_plan const& dynamic_filter_plan() const noexcept
+  {
+    return _dynamic_filter_plan;
+  }
 
  public:
   //! True when this HJ is the internal `delim.join` of a RIGHT_DELIM_JOIN (set in its

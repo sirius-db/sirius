@@ -24,6 +24,7 @@
 #include <cucascade/memory/config.hpp>
 #include <cucascade/memory/topology_discovery.hpp>
 
+#include <cmath>
 #include <filesystem>
 #include <string>
 
@@ -72,6 +73,23 @@ constexpr double DEFAULT_MAX_SORT_PARTITION_MEMORY_FRACTION = 0.33;
 /// disable (always use filtered_join).
 constexpr double DEFAULT_MARK_JOIN_BUILD_SWITCH_RATIO = 8.0;
 
+/**
+ * @brief Accepted range for `dynamic_filter_domain_coverage_threshold`
+ *
+ * The YAML reader and SQL `SET` handler use this predicate to reject non-finite and non-positive
+ * values at configuration ingress.
+ */
+struct valid_domain_coverage_threshold {
+  [[nodiscard]] bool operator()(double value) const noexcept
+  {
+    return std::isfinite(value) && value > 0.0;
+  }
+  [[nodiscard]] static constexpr char const* description() noexcept
+  {
+    return "must be finite and greater than 0.0";
+  }
+};
+
 }  // namespace config
 
 /// Parameters controlling operator-level resource sizing.
@@ -114,22 +132,19 @@ struct operator_params {
   /// disable (always use filtered_join).
   double mark_join_build_switch_ratio = config::DEFAULT_MARK_JOIN_BUILD_SWITCH_RATIO;
 
-  /// Wire dynamic table-filter pushdown: an eligible BUILD_PROBE hash-join build publishes a raw
-  /// exact IN-list for 1..12 supported build rows, otherwise a hash IN-list if it fits the smallest
-  /// probe-GPU L2, or a Bloom, into the probe-side scan. The scan applies membership post-decode to
-  /// drop non-matching rows before the join. On by default; the master switch for the feature.
-  bool enable_dynamic_filter_pushdown = true;
+  /// Enable runtime dynamic-filter discovery for eligible BUILD_PROBE hash joins. Targets may be
+  /// probe-side scans or join-edge endpoints. When disabled, discovery does not run.
+  bool enable_dynamic_filter = true;
 
-  /// Additionally emit a runtime zone-map (build-key [min,max]) alongside the membership filter,
-  /// for READ-time row-group pruning on parquet scans; duckdb-native scans apply it row-wise
-  /// post-decode instead. Off by default and requires enable_dynamic_filter_pushdown: on
-  /// TPC-H-shaped joins DuckDB's static transitive-predicate pushdown already prunes
-  /// range-derivable builds, and scattered keys prune nothing, so the zone-map only pays off on
-  /// clustered-keyset joins whose narrow key range is runtime-determined.
+  /// Emit build-key min/max filters in addition to membership filters. Parquet scans use them for
+  /// row-group pruning; duckdb-native scans apply them post-decode. Effective only when
+  /// `enable_dynamic_filter` is enabled.
   bool enable_dynamic_zone_map_filter = false;
 
-  /// Skip publishing a key's dynamic filters when the build covers at least this fraction of the
-  /// key's domain (rows gate and zone-map range gate). Values >= 1.0 effectively disable the gate.
+  /// Skip all publication for a key when the build covers at least this fraction of its unfiltered
+  /// base-table row bound. The gate applies only to proven-unique keys with DuckDB-native
+  /// cardinality evidence. Values above 1.0 disable it; 1.0 skips full coverage. The separate
+  /// zone-map range gate remains inactive because no base-column value range is available.
   double dynamic_filter_domain_coverage_threshold = 0.9;
 
   /// Consumer-side scan gate: disable a scan's post-decode dynamic filtering once a measured split

@@ -19,7 +19,7 @@
 #include "duckdb/common/assert.hpp"
 #include "expression/ast/node.hpp"
 #include "expression/ast/utils.hpp"
-#include "op/sirius_dynamic_filter.hpp"
+#include "op/dynamic_filter/sirius_dynamic_filter.hpp"
 #include "op/sirius_physical_delim_join.hpp"
 #include "op/sirius_physical_filter.hpp"
 #include "op/sirius_physical_grouped_aggregate.hpp"

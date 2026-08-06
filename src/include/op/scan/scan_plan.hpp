@@ -96,21 +96,6 @@ struct scan_plan {
   /// (either a hive partition, a virtual column, or not projected).
   std::vector<std::optional<std::size_t>> batch_position_by_column_id;
 
-  /// Sentinel for @ref output_position_by_column_id: the column_ids entry produces no output
-  /// column (pure-filter, virtual, or duplicate).
-  static constexpr std::size_t no_output_position = static_cast<std::size_t>(-1);
-
-  /// C → output-position map: column_ids index → its position in @c output_layout (and thus in
-  /// the assembled output table), or @ref no_output_position when that column is not emitted.
-  ///
-  /// DuckDB hands Sirius dynamic-filter column references in column_ids space (a
-  /// @c LogicalGet binding's @c column_index — see @c JoinFilterPushdownColumn). Whenever
-  /// @c projection_ids reorders or prunes the output (or a virtual/duplicate column is skipped),
-  /// that index differs from the output-column position the post-decode filter and AST merge
-  /// operate on. This map translates the former to the latter; @c sirius_dynamic_filter_set
-  /// applies it on push so every consumer keys filters by output position.
-  std::vector<std::size_t> output_position_by_column_id;
-
   /// Primary indices of hive-partition columns. Supplied to
   /// @c convert_table_filters_to_expression so those filters are dropped
   /// from pushdown (they aren't in the parquet file).

@@ -18,21 +18,21 @@
 
 /**
  * @file
- * @brief The encapsulation boundary between DuckDB's internal dynamic-filter representation and
- * Sirius.
+ * @brief Test-only parity oracle over DuckDB's join-filter pushdown metadata
  *
- * The normal data flow is:
+ * Parity tests snapshot DuckDB optimizer metadata and compare it with Sirius-owned target
+ * discovery. Production code does not consume these values, and the adapter translation unit is
+ * linked only into the test target.
  *
- *   DuckDB logical join                         Sirius-owned planning data
+ * The oracle data flow is:
+ *
+ *   DuckDB logical join                         Sirius-owned test data
  *   +---------------------------+               +-----------------------------+
  *   | filter_pushdown           |   extract()   | kind                        |
  *   |   join_condition[]        | ------------> | condition indexes/types     |
  *   |   probe_info[]            |               | probe columns               |
  *   |   DynamicTableFilterSet * |               | opaque shared channel key   |
  *   +---------------------------+               +-----------------------------+
- *                                                          |
- *                                                          v
- *                                              downstream Sirius planning
  *
  * DuckDB's JoinFilterPushdownInfo (join_filter_pushdown.hpp) is the DuckDB planner's internal
  * representation of dynamic-filter metadata. 2 of its member vectors are:
@@ -142,8 +142,8 @@ class duckdb_probe_target_candidate final {
  *
  * (Runtime mirrors this: one filter is built per ordinal j and pushed to every target.)
  *
- * Later planning wraps these raw adapter values in strong ordinal types and may compact admitted
- * equality keys into a third space, the Sirius key ordinal.
+ * Parity tests use this dense filter ordinal only while aligning DuckDB metadata. The stored
+ * condition index and per-target scan-column position remain distinct coordinate spaces.
  */
 class duckdb_join_filter_candidate final {
  public:
@@ -194,41 +194,10 @@ class duckdb_join_filter_candidate final {
  *
  * Consumers receive Sirius-owned structural values and do not retain or dereference DuckDB's
  * `JoinFilterPushdownInfo`. The opaque channel handle is the deliberate exception: it keeps the
- * shared route identity alive without exposing mutation. Planner code that still reads
- * `filter_pushdown` / `dynamic_filters` directly predates the adapter; follow-up units route those
- * reads through it.
+ * shared identity alive without exposing mutation, so the oracle can observe DuckDB's
+ * producer/consumer pairing.
  */
 namespace duckdb_join_filter_candidate_adapter {
-
-namespace detail {
-
-/**
- * @brief Clone the subset of metadata consumed by Sirius, exposed only for unit tests.
- *
- * Shares each `DynamicTableFilterSet` to preserve route identity and intentionally omits
- * `min_max_aggregates`. The result is only for Sirius planning and must not be handed to DuckDB's
- * physical join execution; the untouched original retains the complete CPU-fallback metadata.
- */
-[[nodiscard]] duckdb::unique_ptr<duckdb::JoinFilterPushdownInfo> clone_sirius_filter_pushdown_info(
-  duckdb::JoinFilterPushdownInfo const& src);
-
-}  // namespace detail
-
-/**
- * @brief Re-attach dynamic-filter metadata from @p original onto @p copy while a logical plan is
- * deep-copied for Sirius's transparent execution path.
- *
- * `LogicalOperator::Copy` round-trips through serialize/deserialize, and neither
- * `LogicalComparisonJoin::filter_pushdown` nor `LogicalGet::dynamic_filters` is in DuckDB's
- * serialization schema, so a plain `Copy` strips them. The copy is expected to have the same tree
- * shape; a whole-tree preflight leaves a mismatched copy unchanged in every build.
- *
- * @param original  Read-only source plan. Its `filter_pushdown` / `dynamic_filters` stay put so
- *                  DuckDB's CPU fallback still sees them; only shared_ptrs are copied out.
- * @param copy      The freshly-`Copy`-produced plan that receives the metadata.
- */
-void preserve_dynamic_filter_metadata(duckdb::LogicalOperator const& original,
-                                      duckdb::LogicalOperator& copy);
 
 /**
  * @brief Classify and snapshot one comparison join's dynamic-filter metadata into Sirius values.

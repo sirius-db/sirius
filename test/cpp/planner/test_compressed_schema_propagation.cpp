@@ -34,7 +34,7 @@
 #include "expression/join_condition.hpp"
 #include "expression/value.hpp"
 #include "helper/logical_type.hpp"
-#include "op/sirius_dynamic_filter.hpp"
+#include "op/dynamic_filter/sirius_dynamic_filter.hpp"
 #include "op/sirius_physical_delim_join.hpp"
 #include "op/sirius_physical_filter.hpp"
 #include "op/sirius_physical_grouped_aggregate.hpp"
