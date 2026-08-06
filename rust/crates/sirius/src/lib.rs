@@ -159,7 +159,9 @@ fn collect_arrow_stream(stream: FFI_ArrowArrayStream) -> Result<SubstraitResult,
 /// creates the view when the fragment is built. Both sides call this, so the convention has one
 /// definition.
 pub fn stream_view_name(stream_id: u64) -> String {
-    sirius_sys::stream_view_name(stream_id).to_string_lossy().into_owned()
+    sirius_sys::stream_view_name(stream_id)
+        .to_string_lossy()
+        .into_owned()
 }
 
 /// One plan fragment of a multi-fragment query.
@@ -190,7 +192,9 @@ impl Fragment<'_> {
     ) -> Result<(), Exception> {
         let_cxx_string!(name = name);
         let_cxx_string!(ty = ty);
-        self.inner.pin_mut().declare_input_column(stream_id, &name, &ty)
+        self.inner
+            .pin_mut()
+            .declare_input_column(stream_id, &name, &ty)
     }
 
     /// Declare a sender that must close input stream `stream_id` before it ends. With none
@@ -200,7 +204,9 @@ impl Fragment<'_> {
         stream_id: u64,
         sender_id: u32,
     ) -> Result<(), Exception> {
-        self.inner.pin_mut().declare_input_sender(stream_id, sender_id)
+        self.inner
+            .pin_mut()
+            .declare_input_sender(stream_id, sender_id)
     }
 
     /// Declare an output stream. A fragment with no output stream is a result fragment.
@@ -456,6 +462,17 @@ mod tests {
             // SAFETY: the GPU lock is held, so no other thread touches the environment here.
             unsafe { std::env::set_var("SIRIUS_DUCKDB_PARQUET_EXTENSION", parquet) };
         }
+        // Aggregates (`sum`, `min`, ...) live in core_functions, which the embedded DuckDB
+        // does not autoload; a plan with measures cannot bind without it.
+        if std::env::var_os("SIRIUS_DUCKDB_CORE_FUNCTIONS_EXTENSION").is_none() {
+            let manifest = env!("CARGO_MANIFEST_DIR");
+            let build_dir = std::env::var("SIRIUS_BUILD_DIR")
+                .unwrap_or_else(|_| format!("{manifest}/../../../build/release"));
+            let core =
+                format!("{build_dir}/extension/core_functions/core_functions.duckdb_extension");
+            // SAFETY: the GPU lock is held, so no other thread touches the environment here.
+            unsafe { std::env::set_var("SIRIUS_DUCKDB_CORE_FUNCTIONS_EXTENSION", core) };
+        }
     }
 
     /// Writes the tiny `(id BIGINT, name VARCHAR)` parquet fixture at `path`:
@@ -571,7 +588,9 @@ mod tests {
             receiver.declare_input_column(0, "id", "BIGINT").unwrap();
             receiver.declare_input_column(0, "name", "VARCHAR").unwrap();
             receiver.build(&stream_read_plan(0)).unwrap();
-            let moved = receiver.relay_from(&mut sender, output_stream, 0, 0).unwrap();
+            let moved = receiver
+                .relay_from(&mut sender, output_stream, 0, 0)
+                .unwrap();
             assert!(moved > 0, "stream {output_stream} must carry the broadcast");
             receiver.run().unwrap();
             let result = receiver.into_arrow().unwrap();
@@ -721,7 +740,7 @@ mod tests {
     fn stream_read_plan(stream_id: u64) -> Vec<u8> {
         use substrait::proto::read_rel::{NamedTable, ReadType};
         use substrait::proto::{
-            NamedStruct, Plan, PlanRel, ReadRel, Rel, RelRoot, Type, plan_rel, r#type, rel,
+            NamedStruct, Plan, PlanRel, ReadRel, Rel, RelRoot, Type, plan_rel, rel, r#type,
         };
 
         let names = vec!["id".to_string(), "name".to_string()];
@@ -900,12 +919,1136 @@ mod tests {
         unsafe { std::env::remove_var("SIRIUS_EXCHANGE_STAGING_BYTES") };
     }
 
+    /// Writes the row a two-phase merge fragment reads off the exchange for
+    /// `sum(q), avg(q), count(*) GROUP BY rf, ls`: the grouping keys, then one column per
+    /// partial-state column the partial fragment ships — avg's state being the sum/count pair.
+    /// Two rows per group stand for two partial senders.
+    fn write_merge_states_parquet(path: &Path) {
+        write_merge_states(path, States::Normal);
+    }
+
+    /// Which partial states arrive at the merge fragment.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum States {
+        /// Two senders per group, every group with values.
+        Normal,
+        /// No rows at all: the partition a hash fan-out left empty on one compute node.
+        Empty,
+        /// A group whose avg argument was NULL in every row: a zero count with a NULL sum,
+        /// which is the case the finalizing division guards against.
+        ZeroCount,
+    }
+
+    /// Writes the exchange row a merge fragment reads, in one of the [`States`] shapes.
+    fn write_merge_states(path: &Path, states: States) {
+        use arrow_array::Float64Array;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("rf", DataType::Utf8, true),
+            Field::new("ls", DataType::Utf8, true),
+            Field::new("q_sum", DataType::Float64, true),
+            Field::new("a_sum", DataType::Float64, true),
+            Field::new("a_cnt", DataType::Int64, true),
+            Field::new("c_cnt", DataType::Int64, true),
+        ]));
+        let (rf, ls, q_sum, a_sum, a_cnt, c_cnt): (
+            Vec<&str>,
+            Vec<&str>,
+            Vec<Option<f64>>,
+            Vec<Option<f64>>,
+            Vec<i64>,
+            Vec<i64>,
+        ) = match states {
+            States::Normal => (
+                vec!["A", "A", "N", "N", "R", "R"],
+                vec!["F", "F", "O", "O", "F", "F"],
+                vec![
+                    Some(10.0),
+                    Some(20.0),
+                    Some(3.0),
+                    Some(7.0),
+                    Some(5.0),
+                    Some(5.0),
+                ],
+                vec![
+                    Some(10.0),
+                    Some(20.0),
+                    Some(3.0),
+                    Some(7.0),
+                    Some(5.0),
+                    Some(5.0),
+                ],
+                vec![2, 4, 1, 1, 2, 3],
+                vec![2, 4, 1, 1, 2, 3],
+            ),
+            // The rows exist but never reach the merge fragment: an empty partition is an
+            // input stream that ends without a batch, not a zero-row file.
+            States::Empty => (
+                vec!["A"],
+                vec!["F"],
+                vec![Some(1.0)],
+                vec![Some(1.0)],
+                vec![1],
+                vec![1],
+            ),
+            // Group ("A","F") saw only NULL values: no sum, nothing counted.
+            States::ZeroCount => (
+                vec!["A", "A", "N", "N"],
+                vec!["F", "F", "O", "O"],
+                vec![None, None, Some(3.0), Some(7.0)],
+                vec![None, None, Some(3.0), Some(7.0)],
+                vec![0, 0, 1, 1],
+                vec![2, 4, 1, 1],
+            ),
+        };
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(StringArray::from(rf)),
+            Arc::new(StringArray::from(ls)),
+            Arc::new(Float64Array::from(q_sum)),
+            Arc::new(Float64Array::from(a_sum)),
+            Arc::new(Int64Array::from(a_cnt)),
+            Arc::new(Int64Array::from(c_cnt)),
+        ];
+        let batch = RecordBatch::try_new(schema.clone(), columns).unwrap();
+        let file = std::fs::File::create(path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+    }
+
+    /// The exchange row a two-phase merge fragment reads, as `(name, DuckDB type)` — the
+    /// declaration the CN derives from the translator's `stream_inputs`.
+    const MERGE_STATE_COLUMNS: [(&str, &str); 6] = [
+        ("rf", "VARCHAR"),
+        ("ls", "VARCHAR"),
+        ("q_sum", "DOUBLE"),
+        ("a_sum", "DOUBLE"),
+        ("a_cnt", "BIGINT"),
+        ("c_cnt", "BIGINT"),
+    ];
+
+    /// Where a merge shape reads its partial states from.
+    #[derive(Clone, Copy, Debug)]
+    enum Source<'a> {
+        /// A parquet file standing in for the exchange row.
+        Parquet(&'a str),
+        /// The engine's view of input stream 0 — what a real merge fragment reads.
+        Stream,
+    }
+
+    /// Builds the merge fragment's plan shape over the partial-state fixture:
+    /// `Aggregate(sum × 4) -> Project(finalize) [-> Project(sort tuple) -> Sort]`, which is what
+    /// the StarRocks translator emits for a grouped two-phase avg (with an ORDER BY above it).
+    fn merge_shape_plan(source: Source<'_>, with_sort: bool) -> Vec<u8> {
+        use substrait::proto::expression::field_reference::{ReferenceType as RefType, RootType};
+        use substrait::proto::expression::reference_segment::ReferenceType as SegmentType;
+        use substrait::proto::expression::{
+            FieldReference, IfThen, Literal, ReferenceSegment, RexType, ScalarFunction,
+            field_reference, if_then, literal, reference_segment,
+        };
+        use substrait::proto::extensions::{
+            SimpleExtensionDeclaration, SimpleExtensionUrn, simple_extension_declaration,
+        };
+        use substrait::proto::function_argument::ArgType;
+        use substrait::proto::read_rel::local_files::FileOrFiles;
+        use substrait::proto::read_rel::local_files::file_or_files::{
+            FileFormat, ParquetReadOptions, PathType,
+        };
+        use substrait::proto::read_rel::{LocalFiles, ReadType};
+        use substrait::proto::rel_common::{Emit, EmitKind};
+        use substrait::proto::{
+            AggregateFunction, AggregateRel, Expression, FunctionArgument, Plan, PlanRel,
+            ProjectRel, ReadRel, Rel, RelCommon, RelRoot, SortField, SortRel, Type,
+            aggregate_function, aggregate_rel, plan_rel, rel, sort_field, r#type,
+        };
+
+        // Anchors: 1 = arithmetic sum, 2 = arithmetic divide, 3 = comparison equal.
+        let extension_urns = vec![
+            SimpleExtensionUrn {
+                extension_urn_anchor: 1,
+                urn: "extension:io.substrait:functions_arithmetic".to_string(),
+            },
+            SimpleExtensionUrn {
+                extension_urn_anchor: 2,
+                urn: "extension:io.substrait:functions_comparison".to_string(),
+            },
+        ];
+        let declare = |urn_anchor: u32, anchor: u32, name: &str| SimpleExtensionDeclaration {
+            mapping_type: Some(
+                simple_extension_declaration::MappingType::ExtensionFunction(
+                    simple_extension_declaration::ExtensionFunction {
+                        extension_urn_reference: urn_anchor,
+                        function_anchor: anchor,
+                        name: name.to_string(),
+                    },
+                ),
+            ),
+        };
+        let extensions = vec![
+            declare(1, 1, "sum"),
+            declare(1, 2, "divide"),
+            declare(2, 3, "equal"),
+        ];
+
+        let fp64 = || Type {
+            kind: Some(r#type::Kind::Fp64(r#type::Fp64 {
+                type_variation_reference: 0,
+                nullability: r#type::Nullability::Nullable as i32,
+            })),
+        };
+        let i64_ty = || Type {
+            kind: Some(r#type::Kind::I64(r#type::I64 {
+                type_variation_reference: 0,
+                nullability: r#type::Nullability::Nullable as i32,
+            })),
+        };
+        let bool_ty = || Type {
+            kind: Some(r#type::Kind::Bool(r#type::Boolean {
+                type_variation_reference: 0,
+                nullability: r#type::Nullability::Nullable as i32,
+            })),
+        };
+        let field = |index: i32| Expression {
+            rex_type: Some(RexType::Selection(Box::new(FieldReference {
+                reference_type: Some(RefType::DirectReference(ReferenceSegment {
+                    reference_type: Some(SegmentType::StructField(Box::new(
+                        reference_segment::StructField {
+                            field: index,
+                            child: None,
+                        },
+                    ))),
+                })),
+                root_type: Some(RootType::RootReference(field_reference::RootReference {})),
+            }))),
+        };
+        let call = |anchor: u32, args: Vec<Expression>, ty: Type| Expression {
+            rex_type: Some(RexType::ScalarFunction(ScalarFunction {
+                function_reference: anchor,
+                arguments: args
+                    .into_iter()
+                    .map(|expr| FunctionArgument {
+                        arg_type: Some(ArgType::Value(expr)),
+                    })
+                    .collect(),
+                output_type: Some(ty),
+                ..Default::default()
+            })),
+        };
+        let cast_fp64 = |input: Expression| Expression {
+            rex_type: Some(RexType::Cast(Box::new(
+                substrait::proto::expression::Cast {
+                    r#type: Some(fp64()),
+                    input: Some(Box::new(input)),
+                    failure_behavior:
+                        substrait::proto::expression::cast::FailureBehavior::ThrowException as i32,
+                },
+            ))),
+        };
+
+        let read = match source {
+            Source::Parquet(path) => Rel {
+                rel_type: Some(rel::RelType::Read(Box::new(ReadRel {
+                    read_type: Some(ReadType::LocalFiles(LocalFiles {
+                        items: vec![FileOrFiles {
+                            path_type: Some(PathType::UriFile(path.to_string())),
+                            file_format: Some(FileFormat::Parquet(ParquetReadOptions {})),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                }))),
+            },
+            Source::Stream => {
+                let varchar = || Type {
+                    kind: Some(r#type::Kind::Varchar(r#type::VarChar {
+                        length: 65535,
+                        type_variation_reference: 0,
+                        nullability: r#type::Nullability::Nullable as i32,
+                    })),
+                };
+                Rel {
+                    rel_type: Some(rel::RelType::Read(Box::new(ReadRel {
+                        base_schema: Some(substrait::proto::NamedStruct {
+                            names: MERGE_STATE_COLUMNS
+                                .iter()
+                                .map(|(name, _)| name.to_string())
+                                .collect(),
+                            r#struct: Some(r#type::Struct {
+                                types: vec![
+                                    varchar(),
+                                    varchar(),
+                                    fp64(),
+                                    fp64(),
+                                    i64_ty(),
+                                    i64_ty(),
+                                ],
+                                type_variation_reference: 0,
+                                nullability: r#type::Nullability::Required as i32,
+                            }),
+                        }),
+                        read_type: Some(ReadType::NamedTable(
+                            substrait::proto::read_rel::NamedTable {
+                                names: vec![super::stream_view_name(0)],
+                                ..Default::default()
+                            },
+                        )),
+                        ..Default::default()
+                    }))),
+                }
+            }
+        };
+
+        // One sum per state column: the summed sum, avg's summed sum and summed count, and the
+        // merged count.
+        let measure = |field_index: i32, ty: Type| aggregate_rel::Measure {
+            measure: Some(AggregateFunction {
+                function_reference: 1,
+                arguments: vec![FunctionArgument {
+                    arg_type: Some(ArgType::Value(field(field_index))),
+                }],
+                output_type: Some(ty),
+                invocation: aggregate_function::AggregationInvocation::All as i32,
+                phase: substrait::proto::AggregationPhase::IntermediateToResult as i32,
+                ..Default::default()
+            }),
+            filter: None,
+        };
+        #[allow(deprecated)]
+        let grouping = aggregate_rel::Grouping {
+            grouping_expressions: Vec::new(),
+            expression_references: vec![0, 1],
+        };
+        let aggregate = Rel {
+            rel_type: Some(rel::RelType::Aggregate(Box::new(AggregateRel {
+                input: Some(Box::new(read)),
+                groupings: vec![grouping],
+                grouping_expressions: vec![field(0), field(1)],
+                measures: vec![
+                    measure(2, fp64()),
+                    measure(3, fp64()),
+                    measure(4, i64_ty()),
+                    measure(5, i64_ty()),
+                ],
+                ..Default::default()
+            }))),
+        };
+
+        // Aggregate output: [rf, ls, sum(q), sum(a_sum), sum(a_cnt), sum(c_cnt)]. The average
+        // is the state divided, with SQL's empty-input NULL guarding the zero count.
+        let average = Expression {
+            rex_type: Some(RexType::IfThen(Box::new(IfThen {
+                ifs: vec![if_then::IfClause {
+                    r#if: Some(call(
+                        3,
+                        vec![
+                            field(4),
+                            Expression {
+                                rex_type: Some(RexType::Literal(Literal {
+                                    literal_type: Some(literal::LiteralType::I64(0)),
+                                    ..Default::default()
+                                })),
+                            },
+                        ],
+                        bool_ty(),
+                    )),
+                    then: Some(Expression {
+                        rex_type: Some(RexType::Literal(Literal {
+                            literal_type: Some(literal::LiteralType::Null(fp64())),
+                            ..Default::default()
+                        })),
+                    }),
+                }],
+                r#else: Some(Box::new(call(
+                    2,
+                    vec![field(3), cast_fp64(field(4))],
+                    fp64(),
+                ))),
+            }))),
+        };
+        let project = |input: Rel, expressions: Vec<Expression>, input_width: i32| Rel {
+            rel_type: Some(rel::RelType::Project(Box::new(ProjectRel {
+                common: Some(RelCommon {
+                    emit_kind: Some(EmitKind::Emit(Emit {
+                        output_mapping: (input_width..input_width + expressions.len() as i32)
+                            .collect(),
+                    })),
+                    ..Default::default()
+                }),
+                input: Some(Box::new(input)),
+                expressions,
+                ..Default::default()
+            }))),
+        };
+        // The finalizing projection: keys, the merged sum, the divided average, the count.
+        let finalized = project(
+            aggregate,
+            vec![field(0), field(1), field(2), average, field(5)],
+            6,
+        );
+
+        let root_input = if with_sort {
+            // A StarRocks SORT node materializes its sort tuple first, then orders it.
+            let sort_tuple = project(
+                finalized,
+                vec![field(0), field(1), field(2), field(3), field(4)],
+                5,
+            );
+            let ascending = |index: i32| SortField {
+                expr: Some(field(index)),
+                sort_kind: Some(sort_field::SortKind::Direction(
+                    sort_field::SortDirection::AscNullsLast as i32,
+                )),
+            };
+            Rel {
+                rel_type: Some(rel::RelType::Sort(Box::new(SortRel {
+                    input: Some(Box::new(sort_tuple)),
+                    sorts: vec![ascending(0), ascending(1)],
+                    ..Default::default()
+                }))),
+            }
+        } else {
+            finalized
+        };
+
+        Plan {
+            extension_urns,
+            extensions,
+            relations: vec![PlanRel {
+                rel_type: Some(plan_rel::RelType::Root(RelRoot {
+                    input: Some(root_input),
+                    names: ["rf", "ls", "q", "a", "c"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                })),
+            }],
+            ..Default::default()
+        }
+        .encode_to_vec()
+    }
+
+    /// Reads a merged-count column as integers, whichever width the engine returned it in:
+    /// `sum(BIGINT)` binds to DuckDB HUGEINT, which arrives as a 38-digit decimal.
+    fn count_values(column: &ArrayRef) -> Vec<i64> {
+        use arrow_array::Decimal128Array;
+
+        if let Some(values) = column.as_any().downcast_ref::<Int64Array>() {
+            return (0..values.len()).map(|i| values.value(i)).collect();
+        }
+        let values = column
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .unwrap_or_else(|| panic!("count column has type {:?}", column.data_type()));
+        (0..values.len())
+            .map(|i| i64::try_from(values.value(i)).expect("count fits in i64"))
+            .collect()
+    }
+
+    /// Runs one merge shape on the GPU under a watchdog, returning its `(rf, ls, q, a, c)` rows.
+    ///
+    /// A plan the engine never finishes is the one outcome that must not reach a human as
+    /// silence, so the watchdog turns it into a failure with a name attached. The engine call
+    /// cannot be cancelled once it is stuck, so the process is torn down with it.
+    fn run_merge_shape(with_sort: bool) -> Vec<MergeRow> {
+        under_watchdog(format!("sort={with_sort}"), move || {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("states.parquet");
+            write_merge_states_parquet(&path);
+            let plan = merge_shape_plan(Source::Parquet(path.to_str().unwrap()), with_sort);
+            let ctx = SiriusContext::new().expect("bring up sirius context");
+            ctx.execute_substrait_result(&plan)
+                .map(|result| merge_rows(&result))
+                .map_err(|err| err.to_string())
+        })
+    }
+
+    /// Runs the merge shape the way a compute node runs it: a sender fragment parks the partial
+    /// states as native GPU batches, and the merge fragment reads them through the engine's
+    /// stream view — with its own output stream, since a merge fragment feeding an ORDER BY
+    /// result fragment is a sender too.
+    fn run_merge_fragment(with_sort: bool, to_stream: bool) -> Vec<MergeRow> {
+        run_merge_fragment_over(with_sort, to_stream, States::Normal)
+    }
+
+    /// [`run_merge_fragment`] over a chosen partial-state shape.
+    fn run_merge_fragment_over(with_sort: bool, to_stream: bool, states: States) -> Vec<MergeRow> {
+        let label = format!("merge fragment sort={with_sort}/stream={to_stream}/{states:?}");
+        under_watchdog(label, move || {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("states.parquet");
+            write_merge_states(&path, states);
+            let sender_plan = local_files_plan(
+                path.to_str().unwrap(),
+                MERGE_STATE_COLUMNS
+                    .iter()
+                    .map(|(name, _)| name.to_string())
+                    .collect(),
+            );
+            let merge_plan = merge_shape_plan(Source::Stream, with_sort);
+
+            let ctx = SiriusContext::new().expect("bring up sirius context");
+            let mut partial = ctx.fragment().map_err(|err| err.to_string())?;
+            partial.declare_output(0).map_err(|err| err.to_string())?;
+            partial.build(&sender_plan).map_err(|err| err.to_string())?;
+            partial.run().map_err(|err| err.to_string())?;
+
+            let mut merge = ctx.fragment().map_err(|err| err.to_string())?;
+            for (name, ty) in MERGE_STATE_COLUMNS {
+                merge
+                    .declare_input_column(0, name, ty)
+                    .map_err(|err| err.to_string())?;
+            }
+            if to_stream {
+                merge.declare_output(0).map_err(|err| err.to_string())?;
+            }
+            merge.build(&merge_plan).map_err(|err| err.to_string())?;
+            if states == States::Empty {
+                // The sender had nothing for this partition: the stream just ends.
+                merge.close_input(0, 0).map_err(|err| err.to_string())?;
+            } else {
+                let moved = merge
+                    .relay_from(&mut partial, 0, 0, 0)
+                    .map_err(|err| err.to_string())?;
+                assert!(moved > 0, "the partial fragment parked no batches");
+            }
+            merge.run().map_err(|err| err.to_string())?;
+
+            if !to_stream {
+                return merge
+                    .into_arrow()
+                    .map(|result| merge_rows(&result))
+                    .map_err(|err| err.to_string());
+            }
+            // Drain the merge fragment's own output stream through a result fragment, which is
+            // what the ORDER BY result fragment does on the cluster.
+            let mut result_fragment = ctx.fragment().map_err(|err| err.to_string())?;
+            for (name, ty) in merge_output_columns() {
+                result_fragment
+                    .declare_input_column(0, name, ty)
+                    .map_err(|err| err.to_string())?;
+            }
+            result_fragment
+                .build(&merge_output_read_plan())
+                .map_err(|err| err.to_string())?;
+            result_fragment
+                .relay_from(&mut merge, 0, 0, 0)
+                .map_err(|err| err.to_string())?;
+            result_fragment.run().map_err(|err| err.to_string())?;
+            result_fragment
+                .into_arrow()
+                .map(|result| merge_rows(&result))
+                .map_err(|err| err.to_string())
+        })
+    }
+
+    /// The columns a merge fragment emits: the keys, the merged sum, the finalized average, and
+    /// the merged count (`sum(BIGINT)`, which the engine produces as HUGEINT).
+    fn merge_output_columns() -> [(&'static str, &'static str); 5] {
+        [
+            ("rf", "VARCHAR"),
+            ("ls", "VARCHAR"),
+            ("q", "DOUBLE"),
+            ("a", "DOUBLE"),
+            ("c", "HUGEINT"),
+        ]
+    }
+
+    /// A plain read of the merge fragment's output stream, for draining it into Arrow.
+    fn merge_output_read_plan() -> Vec<u8> {
+        use substrait::proto::read_rel::{NamedTable, ReadType};
+        use substrait::proto::{
+            NamedStruct, Plan, PlanRel, ReadRel, Rel, RelRoot, Type, plan_rel, rel, r#type,
+        };
+
+        let nullable = r#type::Nullability::Nullable as i32;
+        let types = vec![
+            Type {
+                kind: Some(r#type::Kind::Varchar(r#type::VarChar {
+                    length: 65535,
+                    type_variation_reference: 0,
+                    nullability: nullable,
+                })),
+            },
+            Type {
+                kind: Some(r#type::Kind::Varchar(r#type::VarChar {
+                    length: 65535,
+                    type_variation_reference: 0,
+                    nullability: nullable,
+                })),
+            },
+            Type {
+                kind: Some(r#type::Kind::Fp64(r#type::Fp64 {
+                    type_variation_reference: 0,
+                    nullability: nullable,
+                })),
+            },
+            Type {
+                kind: Some(r#type::Kind::Fp64(r#type::Fp64 {
+                    type_variation_reference: 0,
+                    nullability: nullable,
+                })),
+            },
+            Type {
+                kind: Some(r#type::Kind::Decimal(r#type::Decimal {
+                    precision: 38,
+                    scale: 0,
+                    type_variation_reference: 0,
+                    nullability: nullable,
+                })),
+            },
+        ];
+        let names: Vec<String> = merge_output_columns()
+            .iter()
+            .map(|(name, _)| name.to_string())
+            .collect();
+        let read = Rel {
+            rel_type: Some(rel::RelType::Read(Box::new(ReadRel {
+                base_schema: Some(NamedStruct {
+                    names: names.clone(),
+                    r#struct: Some(r#type::Struct {
+                        types,
+                        type_variation_reference: 0,
+                        nullability: r#type::Nullability::Required as i32,
+                    }),
+                }),
+                read_type: Some(ReadType::NamedTable(NamedTable {
+                    names: vec![super::stream_view_name(0)],
+                    ..Default::default()
+                })),
+                ..Default::default()
+            }))),
+        };
+        Plan {
+            relations: vec![PlanRel {
+                rel_type: Some(plan_rel::RelType::Root(RelRoot {
+                    input: Some(read),
+                    names,
+                })),
+            }],
+            ..Default::default()
+        }
+        .encode_to_vec()
+    }
+
+    /// One finalized merge row: the two keys, the merged sum, the average, the merged count.
+    type MergeRow = (String, String, f64, f64, i64);
+
+    /// Flattens a merge result into key-sorted rows, reading a NULL measure as NaN so the
+    /// average of no values stays distinguishable from a zero.
+    fn merge_rows(result: &super::SubstraitResult) -> Vec<MergeRow> {
+        use arrow_array::{Array, Float64Array};
+
+        let mut rows = Vec::new();
+        for batch in &result.batches {
+            let rf = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let ls = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let q = batch
+                .column(2)
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap();
+            let a = batch
+                .column(3)
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap();
+            // A merged count is `sum(BIGINT)`, which DuckDB binds to HUGEINT and hands back as
+            // a 38-digit decimal.
+            let c = count_values(batch.column(4));
+            for i in 0..batch.num_rows() {
+                let measure = |values: &Float64Array, index: usize| {
+                    if values.is_null(index) {
+                        f64::NAN
+                    } else {
+                        values.value(index)
+                    }
+                };
+                rows.push((
+                    rf.value(i).to_string(),
+                    ls.value(i).to_string(),
+                    measure(q, i),
+                    measure(a, i),
+                    c[i],
+                ));
+            }
+        }
+        // Keys only: the measures are floats, and one NaN would make the ordering partial and
+        // panic the comparison instead of failing the assertion.
+        rows.sort_by(|left, right| (&left.0, &left.1).cmp(&(&right.0, &right.1)));
+        rows
+    }
+
+    /// Runs `work` on its own engine thread and fails the test if it does not finish.
+    ///
+    /// A plan the engine never finishes is the one outcome that must not reach a human as
+    /// silence, so the watchdog turns it into a failure with a name attached. The engine call
+    /// cannot be cancelled once it is stuck, so the process is torn down with it.
+    fn under_watchdog<T: Send + 'static>(
+        label: String,
+        work: impl FnOnce() -> Result<T, String> + Send + 'static,
+    ) -> T {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let engine = std::thread::spawn(move || {
+            ensure_parquet_extension_env();
+            let _ = sender.send(work());
+        });
+
+        match receiver.recv_timeout(std::time::Duration::from_secs(120)) {
+            Ok(Ok(value)) => {
+                // Join before returning: the engine context is dropped on that thread, and a
+                // teardown racing the process exit is not what these tests are measuring.
+                engine.join().expect("engine thread");
+                value
+            }
+            Ok(Err(message)) => panic!("{label} failed: {message}"),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("{label}: the engine thread panicked (see the panic above)")
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                // The engine thread is wedged inside a GPU call and cannot be joined or
+                // cancelled; report loudly and take the process down rather than hang the suite.
+                eprintln!("{label} did not finish within 120s: the engine hung");
+                std::process::exit(101);
+            }
+        }
+    }
+
+    /// The rows every merge shape must produce, with the average already divided.
+    fn expected_merge_rows() -> Vec<MergeRow> {
+        let average = |sum: f64, count: i64| sum / count as f64;
+        vec![
+            ("A".to_string(), "F".to_string(), 30.0, average(30.0, 6), 6),
+            ("N".to_string(), "O".to_string(), 10.0, average(10.0, 2), 2),
+            ("R".to_string(), "F".to_string(), 10.0, average(10.0, 5), 5),
+        ]
+    }
+
+    /// The merge shape the translator emits for a two-phase avg, executed standalone: the
+    /// summed state divided back into an average. Requires a GPU.
+    #[test]
+    fn merge_shape_finalizes_avg() {
+        let _guard = GPU_CONTEXT_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        assert_eq!(run_merge_shape(false), expected_merge_rows());
+    }
+
+    /// The whole merge fragment of an ORDER BY query: the finalizing projection with a sort
+    /// above it. Requires a GPU.
+    #[test]
+    fn merge_shape_finalizes_avg_with_sort() {
+        let _guard = GPU_CONTEXT_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        assert_eq!(run_merge_shape(true), expected_merge_rows());
+    }
+
+    /// An input stream that ends without ever carrying a batch is what a hash fan-out hands the
+    /// compute node that owns no keys. Reading it must finish with no rows: a fragment that
+    /// waits forever for data that is never coming takes the whole query down with it, and does
+    /// it silently. Requires a GPU.
+    #[test]
+    fn fragment_over_an_empty_input_stream_terminates() {
+        let _guard = GPU_CONTEXT_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let rows = under_watchdog("empty input stream".to_string(), || {
+            let ctx = SiriusContext::new().expect("bring up sirius context");
+            let mut receiver = ctx.fragment().map_err(|err| err.to_string())?;
+            receiver
+                .declare_input_column(0, "id", "BIGINT")
+                .map_err(|err| err.to_string())?;
+            receiver
+                .declare_input_column(0, "name", "VARCHAR")
+                .map_err(|err| err.to_string())?;
+            receiver
+                .build(&stream_read_plan(0))
+                .map_err(|err| err.to_string())?;
+            // No sender ever parked a batch for this partition; the stream just ends.
+            receiver.close_input(0, 0).map_err(|err| err.to_string())?;
+            receiver.run().map_err(|err| err.to_string())?;
+            receiver
+                .into_arrow()
+                .map(|result| rows(&result))
+                .map_err(|err| err.to_string())
+        });
+        assert!(rows.is_empty(), "an empty stream yields no rows: {rows:?}");
+    }
+
+    /// A hash fan-out can leave one compute node's partition empty; the merge fragment there
+    /// must still finish, with no rows. Requires a GPU.
+    #[test]
+    fn merge_fragment_over_an_empty_partition() {
+        let _guard = GPU_CONTEXT_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        assert_eq!(
+            run_merge_fragment_over(true, false, States::Empty),
+            Vec::new()
+        );
+    }
+
+    /// A group whose avg argument was NULL in every row arrives with a zero count: the average
+    /// of no values is NULL, and dividing by that count must not be a division by zero.
+    /// Requires a GPU.
+    #[test]
+    fn merge_fragment_zero_count_group_is_null() {
+        let _guard = GPU_CONTEXT_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let rows = run_merge_fragment_over(false, false, States::ZeroCount);
+        assert_eq!(rows.len(), 2);
+        // ("A","F") counted nothing: SQL's average of no values is NULL, which arrives as a
+        // null the reader surfaces as NaN — never a division by zero, and never 0.
+        assert_eq!(rows[0].0, "A");
+        assert!(
+            rows[0].3.is_nan(),
+            "a zero-count group must average to NULL, got {}",
+            rows[0].3
+        );
+        assert_eq!(rows[0].4, 6, "its count still merges");
+        assert_eq!(rows[1].3, 5.0, "the group with values keeps its average");
+    }
+
+    /// The merge fragment as a compute node runs it: partial states arriving as native GPU
+    /// batches on an input stream, finalized, and parked on its own output stream. Requires a
+    /// GPU.
+    #[test]
+    fn merge_fragment_over_a_stream_finalizes_avg() {
+        let _guard = GPU_CONTEXT_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        assert_eq!(run_merge_fragment(false, false), expected_merge_rows());
+    }
+
+    /// The same fragment with the ORDER BY sort above it and a downstream result fragment
+    /// draining its output stream — the exact shape the two-CN demo runs. Requires a GPU.
+    #[test]
+    fn merge_fragment_with_sort_feeds_its_output_stream() {
+        let _guard = GPU_CONTEXT_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        assert_eq!(run_merge_fragment(true, true), expected_merge_rows());
+    }
+
+    /// Writes `(name VARCHAR, price DECIMAL(15,2))`, the shape a TPC-H measure column has
+    /// before a two-phase aggregation lowers it.
+    fn write_prices_parquet(path: &Path) {
+        use arrow_array::Decimal128Array;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("price", DataType::Decimal128(15, 2), true),
+        ]));
+        let names: ArrayRef = Arc::new(StringArray::from(vec!["a", "a", "b", "b"]));
+        let prices: ArrayRef = Arc::new(
+            Decimal128Array::from(vec![100, 200, 300, 400])
+                .with_precision_and_scale(15, 2)
+                .unwrap(),
+        );
+        let batch = RecordBatch::try_new(schema.clone(), vec![names, prices]).unwrap();
+        let file = std::fs::File::create(path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+    }
+
+    /// Builds the partial half of a two-phase avg over a decimal column:
+    /// `Aggregate[$0 => sum(cast($1 AS DOUBLE)), count($1)]` — the expansion the translator
+    /// emits, summing the lowered value and counting the raw one.
+    fn partial_avg_plan(path: &str) -> Vec<u8> {
+        use substrait::proto::expression::field_reference::{ReferenceType as RefType, RootType};
+        use substrait::proto::expression::reference_segment::ReferenceType as SegmentType;
+        use substrait::proto::expression::{
+            FieldReference, ReferenceSegment, RexType, field_reference, reference_segment,
+        };
+        use substrait::proto::extensions::{
+            SimpleExtensionDeclaration, SimpleExtensionUrn, simple_extension_declaration,
+        };
+        use substrait::proto::function_argument::ArgType;
+        use substrait::proto::read_rel::local_files::FileOrFiles;
+        use substrait::proto::read_rel::local_files::file_or_files::{
+            FileFormat, ParquetReadOptions, PathType,
+        };
+        use substrait::proto::read_rel::{LocalFiles, ReadType};
+        use substrait::proto::{
+            AggregateFunction, AggregateRel, Expression, FunctionArgument, Plan, PlanRel, ReadRel,
+            Rel, RelRoot, Type, aggregate_function, aggregate_rel, plan_rel, rel, r#type,
+        };
+
+        let extension_urns = vec![
+            SimpleExtensionUrn {
+                extension_urn_anchor: 1,
+                urn: "extension:io.substrait:functions_arithmetic".to_string(),
+            },
+            SimpleExtensionUrn {
+                extension_urn_anchor: 2,
+                urn: "extension:io.substrait:functions_aggregate_generic".to_string(),
+            },
+        ];
+        let declare = |urn_anchor: u32, anchor: u32, name: &str| SimpleExtensionDeclaration {
+            mapping_type: Some(
+                simple_extension_declaration::MappingType::ExtensionFunction(
+                    simple_extension_declaration::ExtensionFunction {
+                        extension_urn_reference: urn_anchor,
+                        function_anchor: anchor,
+                        name: name.to_string(),
+                    },
+                ),
+            ),
+        };
+        let extensions = vec![declare(1, 1, "sum"), declare(2, 2, "count")];
+
+        let fp64 = || Type {
+            kind: Some(r#type::Kind::Fp64(r#type::Fp64 {
+                type_variation_reference: 0,
+                nullability: r#type::Nullability::Nullable as i32,
+            })),
+        };
+        let i64_ty = || Type {
+            kind: Some(r#type::Kind::I64(r#type::I64 {
+                type_variation_reference: 0,
+                nullability: r#type::Nullability::Nullable as i32,
+            })),
+        };
+        let field = |index: i32| Expression {
+            rex_type: Some(RexType::Selection(Box::new(FieldReference {
+                reference_type: Some(RefType::DirectReference(ReferenceSegment {
+                    reference_type: Some(SegmentType::StructField(Box::new(
+                        reference_segment::StructField {
+                            field: index,
+                            child: None,
+                        },
+                    ))),
+                })),
+                root_type: Some(RootType::RootReference(field_reference::RootReference {})),
+            }))),
+        };
+        let cast_fp64 = |input: Expression| Expression {
+            rex_type: Some(RexType::Cast(Box::new(
+                substrait::proto::expression::Cast {
+                    r#type: Some(fp64()),
+                    input: Some(Box::new(input)),
+                    failure_behavior:
+                        substrait::proto::expression::cast::FailureBehavior::ThrowException as i32,
+                },
+            ))),
+        };
+        let measure = |anchor: u32, argument: Expression, ty: Type| aggregate_rel::Measure {
+            measure: Some(AggregateFunction {
+                function_reference: anchor,
+                arguments: vec![FunctionArgument {
+                    arg_type: Some(ArgType::Value(argument)),
+                }],
+                output_type: Some(ty),
+                invocation: aggregate_function::AggregationInvocation::All as i32,
+                phase: substrait::proto::AggregationPhase::InitialToIntermediate as i32,
+                ..Default::default()
+            }),
+            filter: None,
+        };
+
+        let read = Rel {
+            rel_type: Some(rel::RelType::Read(Box::new(ReadRel {
+                read_type: Some(ReadType::LocalFiles(LocalFiles {
+                    items: vec![FileOrFiles {
+                        path_type: Some(PathType::UriFile(path.to_string())),
+                        file_format: Some(FileFormat::Parquet(ParquetReadOptions {})),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                })),
+                ..Default::default()
+            }))),
+        };
+        #[allow(deprecated)]
+        let grouping = aggregate_rel::Grouping {
+            grouping_expressions: Vec::new(),
+            expression_references: vec![0],
+        };
+        let aggregate = Rel {
+            rel_type: Some(rel::RelType::Aggregate(Box::new(AggregateRel {
+                input: Some(Box::new(read)),
+                groupings: vec![grouping],
+                grouping_expressions: vec![field(0)],
+                measures: vec![
+                    measure(1, cast_fp64(field(1)), fp64()),
+                    measure(2, field(1), i64_ty()),
+                ],
+                ..Default::default()
+            }))),
+        };
+        Plan {
+            extension_urns,
+            extensions,
+            relations: vec![PlanRel {
+                rel_type: Some(plan_rel::RelType::Root(RelRoot {
+                    input: Some(aggregate),
+                    names: ["name", "a", "a__count"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                })),
+            }],
+            ..Default::default()
+        }
+        .encode_to_vec()
+    }
+
+    /// Builds the partial half of `sum(price), avg(price) GROUP BY name`: the plain sum and
+    /// avg's sum half are the *same* measure over the same argument, which is the shape the
+    /// avg expansion creates whenever a query sums and averages one column.
+    fn partial_duplicate_sum_plan(path: &str) -> Vec<u8> {
+        use prost::Message as _;
+        use substrait::proto::{Plan, rel};
+
+        let mut plan = Plan::decode(partial_avg_plan(path).as_slice()).unwrap();
+        let root = match plan.relations[0].rel_type.as_mut().unwrap() {
+            substrait::proto::plan_rel::RelType::Root(root) => root,
+            other => panic!("expected a root relation, got {other:?}"),
+        };
+        let rel::RelType::Aggregate(aggregate) =
+            root.input.as_mut().unwrap().rel_type.as_mut().unwrap()
+        else {
+            panic!("expected an aggregate relation");
+        };
+        // sum, sum (avg's half), count — the plain sum duplicating avg's sum exactly.
+        aggregate.measures.insert(0, aggregate.measures[0].clone());
+        root.names = ["name", "s", "a", "a__count"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        plan.encode_to_vec()
+    }
+
+    /// Runs the partial half of `sum(price), avg(price)`, returning `(name, sum, sum, count)`.
+    fn run_partial_duplicate_sum() -> Vec<(String, f64, f64, i64)> {
+        use arrow_array::Float64Array;
+
+        under_watchdog("partial duplicate sum".to_string(), move || {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("prices.parquet");
+            write_prices_parquet(&path);
+            let plan = partial_duplicate_sum_plan(path.to_str().unwrap());
+            let ctx = SiriusContext::new().expect("bring up sirius context");
+            ctx.execute_substrait_result(&plan)
+                .map(|result| {
+                    let mut rows = Vec::new();
+                    for batch in &result.batches {
+                        let name = batch
+                            .column(0)
+                            .as_any()
+                            .downcast_ref::<StringArray>()
+                            .unwrap();
+                        let sum = batch
+                            .column(1)
+                            .as_any()
+                            .downcast_ref::<Float64Array>()
+                            .unwrap();
+                        let avg_sum = batch
+                            .column(2)
+                            .as_any()
+                            .downcast_ref::<Float64Array>()
+                            .unwrap();
+                        let count = count_values(batch.column(3));
+                        for i in 0..batch.num_rows() {
+                            rows.push((
+                                name.value(i).to_string(),
+                                sum.value(i),
+                                avg_sum.value(i),
+                                count[i],
+                            ));
+                        }
+                    }
+                    rows.sort_by(|left, right| left.0.cmp(&right.0));
+                    rows
+                })
+                .map_err(|err| err.to_string())
+        })
+    }
+
+    /// A query that both sums and averages one column makes the partial fragment emit the same
+    /// measure twice. Requires a GPU.
+    #[test]
+    fn partial_sum_and_avg_of_one_column() {
+        let _guard = GPU_CONTEXT_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        assert_eq!(
+            run_partial_duplicate_sum(),
+            vec![
+                ("a".to_string(), 3.0, 3.0, 2),
+                ("b".to_string(), 7.0, 7.0, 2)
+            ]
+        );
+    }
+
+    /// Runs the partial half of a two-phase avg over a decimal column, returning
+    /// `(name, sum, count)` rows.
+    fn run_partial_avg() -> Vec<(String, f64, i64)> {
+        use arrow_array::Float64Array;
+
+        under_watchdog("partial avg".to_string(), move || {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("prices.parquet");
+            write_prices_parquet(&path);
+            let plan = partial_avg_plan(path.to_str().unwrap());
+            let ctx = SiriusContext::new().expect("bring up sirius context");
+            ctx.execute_substrait_result(&plan)
+                .map(|result| {
+                    let mut rows = Vec::new();
+                    for batch in &result.batches {
+                        let name = batch
+                            .column(0)
+                            .as_any()
+                            .downcast_ref::<StringArray>()
+                            .unwrap();
+                        let sum = batch
+                            .column(1)
+                            .as_any()
+                            .downcast_ref::<Float64Array>()
+                            .unwrap();
+                        let count = count_values(batch.column(2));
+                        for i in 0..batch.num_rows() {
+                            rows.push((name.value(i).to_string(), sum.value(i), count[i]));
+                        }
+                    }
+                    rows.sort_by(|left, right| left.0.cmp(&right.0));
+                    rows
+                })
+                .map_err(|err| err.to_string())
+        })
+    }
+
+    /// The partial half of a two-phase avg counts the values it sums. Counting the raw decimal
+    /// column is the shape the expansion emits by default. Requires a GPU.
+    #[test]
+    fn partial_avg_counts_a_decimal_column() {
+        let _guard = GPU_CONTEXT_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        assert_eq!(
+            run_partial_avg(),
+            vec![("a".to_string(), 3.0, 2), ("b".to_string(), 7.0, 2)]
+        );
+    }
+
+
     /// Like [`stream_read_plan`] but declaring `id` as FP64 — for the schema-mismatch
     /// negatives, whose receiver deliberately declares a type the sender does not produce.
     fn stream_read_plan_f64(stream_id: u64) -> Vec<u8> {
         use substrait::proto::read_rel::{NamedTable, ReadType};
         use substrait::proto::{
-            NamedStruct, Plan, PlanRel, ReadRel, Rel, RelRoot, Type, plan_rel, r#type, rel,
+            NamedStruct, Plan, PlanRel, ReadRel, Rel, RelRoot, Type, plan_rel, rel, r#type,
         };
 
         let names = vec!["id".to_string(), "name".to_string()];
