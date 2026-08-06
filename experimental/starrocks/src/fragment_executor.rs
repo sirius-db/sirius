@@ -75,8 +75,13 @@ pub struct FragmentRun<'a> {
     /// `(exchange node id, sender id, batches)`: pushed via `push_packed` + `close_input`
     /// before the fragment runs, with each lease released the moment its push returns.
     pub remote_inputs: Vec<(i32, i32, Vec<StagedBatch>)>,
-    /// Set for a sender fragment: its output parks under this slot instead of returning rows.
-    pub output: Option<SenderSlot>,
+    /// Non-empty for a sender fragment: the fragment parks ONCE and output stream i belongs to
+    /// destination `outputs[i]` (the FE's destination order). Each destination drains its own
+    /// stream; the parked fragment drops when the last destination releases it.
+    pub outputs: Vec<SenderSlot>,
+    /// Every destination receives the full output (a broadcast sink). With `outputs.len() > 1`
+    /// and `broadcast == false`, the sink hash-partitions (v2; refused upstream until then).
+    pub broadcast: bool,
 }
 
 /// Runs a translated fragment, either parking its output for a downstream fragment or returning
@@ -144,7 +149,7 @@ pub struct StubExecutor;
 impl FragmentExecutor for StubExecutor {
     fn run(&self, run: FragmentRun<'_>) -> Result<Option<FragmentResult>, String> {
         // A stub sender parks nothing; the rendezvous only needs it to succeed.
-        if run.output.is_some() {
+        if !run.outputs.is_empty() {
             return Ok(None);
         }
         self.execute(run.plan).map(Some)

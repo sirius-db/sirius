@@ -30,9 +30,13 @@ use crate::fragment_executor::{
     FragmentExecutor, FragmentResult, FragmentRun, SenderSlot, StagedBatch,
 };
 
-/// Output stream id an intermediate fragment sinks into. One per fragment: a gather exchange has
-/// a single destination, and fan-out needs the partitioned sink (#838), not more ids here.
-const SENDER_OUTPUT_STREAM: u64 = 0;
+/// A sender fragment's parked output, shared by its destinations: stream i belongs to
+/// destination i. `outstanding` counts destinations that have not yet released their stream
+/// (drained + dropped); the fragment -- and its GPU batches -- drop when it reaches zero.
+struct ParkedOutput<'ctx> {
+    fragment: sirius::Fragment<'ctx>,
+    outstanding: usize,
+}
 
 /// One fragment execution handed to the engine thread.
 ///
@@ -50,8 +54,10 @@ struct ExecuteRequest {
     /// pushed via `push_packed` + `close_input` before `run()`, each lease released the moment
     /// its push returns (copy-out-on-arrival makes that safe).
     remote_inputs: Vec<(i32, i32, Vec<StagedBatch>)>,
-    /// Set for a sender fragment: park the output under this slot instead of returning rows.
-    output: Option<SenderSlot>,
+    /// Non-empty for a sender fragment: park once, output stream i belongs to `outputs[i]`.
+    outputs: Vec<SenderSlot>,
+    /// Every destination receives the full output (broadcast sink).
+    broadcast: bool,
     /// Channel the engine thread sends the result (or a flattened error) back on.
     respond: Sender<Result<Option<FragmentResult>, String>>,
 }
@@ -218,10 +224,14 @@ fn engine_thread(
         }
     };
 
-    // Sender fragments whose output is parked on the GPU, waiting for their receiver to be
-    // dispatched. Declared after `context` so it is dropped *first*: a fragment borrows the
-    // engine it runs on, and the borrow checker enforces the order the C++ side depends on.
-    let mut parked: HashMap<SenderSlot, sirius::Fragment<'_>> = HashMap::new();
+    // Sender fragments whose output is parked on the GPU, waiting for their receivers to be
+    // dispatched. Parked ONCE per fragment; `parked_slots` maps each destination's SenderSlot to
+    // (park id, its output stream). Declared after `context` so the fragments drop *first*: a
+    // fragment borrows the engine it runs on, and the borrow checker enforces the order the C++
+    // side depends on.
+    let mut parked: HashMap<u64, ParkedOutput<'_>> = HashMap::new();
+    let mut parked_slots: HashMap<SenderSlot, (u64, u64)> = HashMap::new();
+    let mut next_park_id: u64 = 0;
 
     info!("sirius-engine thread ready");
     // One request at a time until the handle (and its sender) is dropped. Every respond-send
@@ -229,13 +239,20 @@ fn engine_thread(
     while let Ok(request) = requests.recv() {
         match request {
             EngineRequest::Run(request) => {
-                let result = run_fragment(&context, &mut parked, &request);
+                let result = run_fragment(
+                    &context,
+                    &mut parked,
+                    &mut parked_slots,
+                    &mut next_park_id,
+                    &request,
+                );
                 if result.is_err() {
                     // A failed query leaves its parked senders unreachable — the receiver that
                     // would have consumed them is the thing that just failed. Dropping them
                     // releases the GPU memory their batches hold rather than leaking it for the
                     // process's lifetime.
                     parked.clear();
+                    parked_slots.clear();
                 }
                 let _ = request.respond.send(result);
             }
@@ -259,32 +276,37 @@ fn engine_thread(
                 let _ = respond.send(result);
             }
             EngineRequest::ExportNext { slot, respond } => {
-                let result = export_next(&mut parked, slot);
+                let result = export_next(&mut parked, &parked_slots, slot);
                 let _ = respond.send(result);
             }
             EngineRequest::DropParked { slot, respond } => {
-                let result = parked.remove(&slot).map(drop).ok_or_else(|| {
-                    format!("no parked sender output to drop for {slot:?}")
-                });
+                let result = release_slot(&mut parked, &mut parked_slots, &slot);
                 let _ = respond.send(result);
             }
         }
     }
     // Fragments must be gone before the context they borrow.
+    drop(parked_slots);
     drop(parked);
     info!("sirius-engine thread shutting down");
 }
 
 /// Packs the next batch parked under `slot` into a fresh staging lease.
 fn export_next(
-    parked: &mut HashMap<SenderSlot, sirius::Fragment<'_>>,
+    parked: &mut HashMap<u64, ParkedOutput<'_>>,
+    parked_slots: &HashMap<SenderSlot, (u64, u64)>,
     slot: SenderSlot,
 ) -> Result<Option<StagedBatch>, String> {
-    let fragment = parked
-        .get_mut(&slot)
+    let (park_id, stream) = parked_slots
+        .get(&slot)
+        .copied()
         .ok_or_else(|| format!("no parked sender output to export for {slot:?}"))?;
-    let batch = fragment
-        .export_packed(SENDER_OUTPUT_STREAM)
+    let entry = parked
+        .get_mut(&park_id)
+        .ok_or_else(|| format!("parked fragment vanished under {slot:?}"))?;
+    let batch = entry
+        .fragment
+        .export_packed(stream)
         .map_err(|err| format!("failed to export a packed batch for {slot:?}: {err}"))?;
     Ok(batch.map(|batch| StagedBatch {
         metadata: batch.metadata,
@@ -293,16 +315,40 @@ fn export_next(
     }))
 }
 
+/// Releases one destination's claim on a parked fragment; the fragment (and the GPU memory its
+/// remaining batches hold) drops when the LAST destination releases. Exactly-once per slot: a
+/// second release of the same slot is a loud error, never a silent double-drop.
+fn release_slot(
+    parked: &mut HashMap<u64, ParkedOutput<'_>>,
+    parked_slots: &mut HashMap<SenderSlot, (u64, u64)>,
+    slot: &SenderSlot,
+) -> Result<(), String> {
+    let (park_id, _) = parked_slots
+        .remove(slot)
+        .ok_or_else(|| format!("no parked sender output to drop for {slot:?}"))?;
+    let entry = parked
+        .get_mut(&park_id)
+        .ok_or_else(|| format!("parked fragment vanished under {slot:?}"))?;
+    entry.outstanding -= 1;
+    if entry.outstanding == 0 {
+        parked.remove(&park_id);
+    }
+    Ok(())
+}
+
 /// Runs one fragment on the engine thread, guaranteeing that the staging leases its remote
 /// inputs sit in are released exactly once — immediately after each successful push, or in a
 /// sweep when the run fails partway (a leaked lease would pin the arena for later queries).
 fn run_fragment<'ctx>(
     context: &'ctx SiriusContext,
-    parked: &mut HashMap<SenderSlot, sirius::Fragment<'ctx>>,
+    parked: &mut HashMap<u64, ParkedOutput<'ctx>>,
+    parked_slots: &mut HashMap<SenderSlot, (u64, u64)>,
+    next_park_id: &mut u64,
     request: &ExecuteRequest,
 ) -> Result<Option<FragmentResult>, String> {
     let mut released = std::collections::HashSet::new();
-    let result = run_fragment_inner(context, parked, request, &mut released);
+    let result =
+        run_fragment_inner(context, parked, parked_slots, next_park_id, request, &mut released);
     if result.is_err() {
         for (_, _, batches) in &request.remote_inputs {
             for batch in batches {
@@ -329,7 +375,9 @@ fn run_fragment<'ctx>(
 /// the rows. Records each released remote-input lease offset in `released`.
 fn run_fragment_inner<'ctx>(
     context: &'ctx SiriusContext,
-    parked: &mut HashMap<SenderSlot, sirius::Fragment<'ctx>>,
+    parked: &mut HashMap<u64, ParkedOutput<'ctx>>,
+    parked_slots: &mut HashMap<SenderSlot, (u64, u64)>,
+    next_park_id: &mut u64,
     request: &ExecuteRequest,
     released: &mut std::collections::HashSet<u64>,
 ) -> Result<Option<FragmentResult>, String> {
@@ -381,12 +429,17 @@ fn run_fragment_inner<'ctx>(
         }
     }
 
-    // An intermediate fragment sinks into its own output stream 0; a result fragment declares no
-    // output stream at all and produces Arrow instead.
-    if request.output.is_some() {
+    // An intermediate fragment sinks into one output stream per destination (stream i belongs
+    // to destination outputs[i]); a result fragment declares none and produces Arrow instead.
+    for stream in 0..request.outputs.len() as u64 {
         fragment
-            .declare_output(SENDER_OUTPUT_STREAM)
-            .map_err(|err| format!("failed to declare the fragment output stream: {err}"))?;
+            .declare_output(stream)
+            .map_err(|err| format!("failed to declare fragment output stream {stream}: {err}"))?;
+    }
+    if request.broadcast && request.outputs.len() > 1 {
+        fragment
+            .declare_output_broadcast()
+            .map_err(|err| format!("failed to declare the broadcast output mode: {err}"))?;
     }
 
     fragment
@@ -404,14 +457,21 @@ fn run_fragment_inner<'ctx>(
             .map(|(_, senders)| senders.as_slice())
             .unwrap_or_default();
         for slot in senders {
-            let mut sender = parked
-                .remove(slot)
+            let (park_id, sender_stream) = parked_slots
+                .get(slot)
+                .copied()
                 .ok_or_else(|| format!("no parked sender output for {slot:?}"))?;
+            let sender = parked
+                .get_mut(&park_id)
+                .ok_or_else(|| format!("parked fragment vanished under {slot:?}"))?;
             let sender_id = u32::try_from(slot.sender_id)
                 .map_err(|_| format!("negative sender id {}", slot.sender_id))?;
             let moved = fragment
-                .relay_from(&mut sender, SENDER_OUTPUT_STREAM, stream_id, sender_id)
+                .relay_from(&mut sender.fragment, sender_stream, stream_id, sender_id)
                 .map_err(|err| format!("failed to relay sender {sender_id}: {err}"))?;
+            // This destination's stream is drained; release its claim (the fragment drops with
+            // the last claim, freeing the GPU batches).
+            release_slot(parked, parked_slots, slot)?;
             info!(
                 stream_id,
                 sender_id,
@@ -465,19 +525,35 @@ fn run_fragment_inner<'ctx>(
         .run()
         .map_err(|err| format!("failed to execute fragment: {err}"))?;
 
-    match request.output {
-        Some(slot) => {
-            parked.insert(slot, fragment);
-            Ok(None)
+    if !request.outputs.is_empty() {
+        // Park ONCE; each destination claims (park id, its stream). A duplicate slot would let
+        // two claims race over one stream -- refuse before inserting anything.
+        let park_id = *next_park_id;
+        *next_park_id += 1;
+        for (stream, slot) in request.outputs.iter().enumerate() {
+            if parked_slots.contains_key(slot) {
+                return Err(format!("duplicate destination slot {slot:?} in one sender fan-out"));
+            }
+            parked_slots.insert(slot.clone(), (park_id, stream as u64));
         }
+        parked.insert(
+            park_id,
+            ParkedOutput {
+                fragment,
+                outstanding: request.outputs.len(),
+            },
+        );
+        return Ok(None);
+    }
+    {
         // `into_arrow` drains the stream and drops the context-referencing wrapper here, on the
         // engine thread, returning owned batches whose buffers are released via their own Arrow C
         // release callbacks — independent of the context. So they are safe to send to, and drop
         // on, the caller's thread.
-        None => fragment
+        fragment
             .into_arrow()
             .map(|result| Some(FragmentResult::new(result.batches)))
-            .map_err(|err| err.to_string()),
+            .map_err(|err| err.to_string())
     }
 }
 
@@ -526,7 +602,8 @@ impl FragmentExecutor for SiriusEngine {
                 stream_inputs: run.plan.stream_inputs.clone(),
                 inputs: run.inputs,
                 remote_inputs: run.remote_inputs,
-                output: run.output,
+                outputs: run.outputs,
+                broadcast: run.broadcast,
                 respond,
             })
         })
@@ -711,7 +788,8 @@ mod tests {
                 plan,
                 inputs: Vec::new(),
                 remote_inputs: Vec::new(),
-                output: None,
+                outputs: Vec::new(),
+                broadcast: false,
             })
             .expect("execute fragment on GPU")
             .expect("a result fragment returns rows")
@@ -807,7 +885,8 @@ mod tests {
                 stream_inputs: Vec::new(),
                 inputs: Vec::new(),
                 remote_inputs: Vec::new(),
-                output: None,
+                outputs: Vec::new(),
+                broadcast: false,
                 respond: respond_tx,
             }))
             .unwrap();
@@ -896,7 +975,8 @@ mod tests {
                 plan: &plan,
                 inputs: Vec::new(),
                 remote_inputs: Vec::new(),
-                output: Some(slot),
+                outputs: vec![slot],
+                broadcast: false,
             })
             .expect("run the sender fragment");
 
@@ -919,7 +999,8 @@ mod tests {
                 plan: &receiver,
                 inputs: Vec::new(),
                 remote_inputs: vec![(EXCHANGE_NODE, 0, staged)],
-                output: None,
+                outputs: Vec::new(),
+                broadcast: false,
             })
             .expect("execute the remote-fed receiver on GPU")
             .expect("a result fragment returns rows");
@@ -985,7 +1066,8 @@ mod tests {
                     plan: &plan,
                     inputs: Vec::new(),
                     remote_inputs: Vec::new(),
-                    output: Some(slot),
+                    outputs: vec![slot],
+                broadcast: false,
                 })
                 .expect("run the sender fragment")
                 .is_none(),
@@ -998,7 +1080,8 @@ mod tests {
                 plan: &receiver,
                 inputs: vec![(EXCHANGE_NODE, vec![slot])],
                 remote_inputs: Vec::new(),
-                output: None,
+                outputs: Vec::new(),
+                broadcast: false,
             })
             .expect("execute exchange receiver on GPU")
             .expect("a result fragment returns rows");

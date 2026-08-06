@@ -693,7 +693,8 @@ impl ServiceCore {
                     plan: &translated,
                     inputs: inputs.clone(),
                     remote_inputs,
-                    output: None,
+                    outputs: Vec::new(),
+                    broadcast: false,
                 })?
                 .ok_or_else(|| "result fragment returned no rows".to_string())?;
             let batch = result_encoder::MysqlResultEncoder::encode(&result.batches, 0)?;
@@ -765,7 +766,8 @@ impl ServiceCore {
                     plan: &translated,
                     inputs,
                     remote_inputs,
-                    output: Some(slot),
+                    outputs: vec![slot],
+                    broadcast: false,
                 })?;
 
                 self.exchanges.push_sender(
@@ -800,7 +802,8 @@ impl ServiceCore {
                     plan: &translated,
                     inputs,
                     remote_inputs,
-                    output: Some(slot),
+                    outputs: vec![slot],
+                    broadcast: false,
                 })?;
                 transport.send_fragment(RemoteSendSpec {
                     host,
@@ -1266,7 +1269,7 @@ mod tests {
     /// Recognizes the run the dispatch worker performs: a receiver consumes exchange inputs and
     /// returns rows instead of parking output.
     fn is_receiver_run(run: &FragmentRun<'_>) -> bool {
-        run.output.is_none() && !run.inputs.is_empty()
+        run.outputs.is_empty() && !run.inputs.is_empty()
     }
 
     /// Blocks receiver execution until the test releases it, proving the sender's RPC thread
