@@ -73,6 +73,33 @@ mod ffi {
         /// Capacity of the staging arena in bytes.
         fn staging_capacity(self: &Context) -> Result<u64>;
 
+        /// Thread-safe handle to the context's exchange staging arena, sharing
+        /// ownership of the ONE allocator with the context (whose
+        /// `export_packed` leases from the same arena). Unlike the `staging_*`
+        /// methods on [`Context`] — reachable only through the context's owning
+        /// thread — every method here may be called from any thread: the C++
+        /// side serializes on the arena's internal mutex and makes no CUDA
+        /// calls.
+        type StagingArena;
+
+        /// The context's staging arena handle, or a null `UniquePtr` when no
+        /// arena is configured (`SIRIUS_EXCHANGE_STAGING_BYTES` unset).
+        fn staging_arena_handle(self: &Context) -> UniquePtr<StagingArena>;
+
+        /// Lease `len` bytes of the arena, returning the lease's byte offset
+        /// from `base()`. Fallible on exhaustion (the arena never blocks).
+        fn lease(self: &StagingArena, len: u64) -> Result<u64>;
+
+        /// Return the lease at `offset`; the arena's bump head resets when the
+        /// last outstanding lease is released.
+        fn release(self: &StagingArena, offset: u64) -> Result<()>;
+
+        /// Device base address of the arena, for transport memory registration.
+        fn base(self: &StagingArena) -> usize;
+
+        /// Capacity of the arena in bytes.
+        fn capacity(self: &StagingArena) -> u64;
+
         /// One plan fragment of a multi-fragment query. Either declares output
         /// streams (an intermediate fragment, whose results park as native GPU
         /// batches that outlive its own query) or none (a result fragment,
@@ -188,5 +215,7 @@ mod ffi {
     }
 }
 
-pub use ffi::{Context, Fragment, make_context, make_context_from_config, make_fragment,
-              stream_view_name};
+pub use ffi::{
+    Context, Fragment, StagingArena, make_context, make_context_from_config, make_fragment,
+    stream_view_name,
+};

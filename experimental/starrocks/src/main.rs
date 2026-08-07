@@ -25,6 +25,10 @@ const REGISTRATION_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 const HEARTBEAT_STALE_AFTER: Duration = Duration::from_secs(30);
 // StarRocks BEs/CNs regularly report inventory; this skeleton reports empty state.
 const FRONTEND_REPORT_INTERVAL: Duration = Duration::from_secs(10);
+// How long graceful shutdown may take before the process force-exits. Teardown normally
+// finishes in a couple of seconds; the bound exists because it can also block forever (the
+// engine drop joins a thread that may be wedged inside a fragment run).
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Parser)]
 struct Args {
@@ -606,6 +610,30 @@ impl RunningComputeNode {
                 Err(anyhow!("FE report task exited unexpectedly"))
             }
         };
+
+        // Escalation: the graceful path below can block forever — after the servers drain,
+        // `run()` drops the executor, which joins the engine thread; a fragment wedged inside
+        // `run()` never returns, and tokio's signal handling replaces the default SIGTERM
+        // disposition, so without this task every later SIGTERM would be swallowed and only
+        // SIGKILL would end the process. A second signal or the grace deadline force-exits
+        // instead: GPU memory, the staging arena, and UCX resources are reclaimed by the
+        // driver at process death, and the FE notices CN death via heartbeat loss. Detached on
+        // purpose; on a healthy shutdown the process exits before (or regardless of) it firing.
+        drop(tokio::spawn(async move {
+            let trigger = tokio::select! {
+                _ = tokio::signal::ctrl_c() => "second shutdown signal",
+                _ = terminate.recv() => "second shutdown signal",
+                _ = tokio::time::sleep(SHUTDOWN_GRACE) => "shutdown grace period expired",
+            };
+            error!(
+                trigger,
+                grace_secs = SHUTDOWN_GRACE.as_secs(),
+                "forcing process exit: graceful shutdown did not finish — most likely the \
+                 engine thread is wedged inside a fragment run and its teardown join can \
+                 never return"
+            );
+            std::process::exit(1);
+        }));
 
         // Stop the background tasks and every server (all idempotent), then drain the servers
         // that have not exited yet, keeping the first failure as the reported error.

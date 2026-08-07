@@ -12,6 +12,13 @@
 //! shutdown cancellation while a query runs. Each fragment result is fully materialized, and the
 //! single process-global context serializes fragment execution — both lifted by the streaming
 //! evolution.
+//!
+//! Staging-arena calls deliberately BYPASS the request channel: bring-up hands back a
+//! `Send + Sync` [`sirius::StagingArena`] handle and every `staging_*` call is served from it on
+//! the caller's own thread. Funneling leases through the engine thread turns any engine stall
+//! into a peer's exchange stall — a fragment wedged inside `run()` starved the peer CN's
+//! `request_staging_lease` for the PRPC timeout and failed the whole query (the q02 wedge's
+//! second act) — so leases must never wait behind engine work.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -66,23 +73,17 @@ struct ExecuteRequest {
 
 /// One message to the engine thread — the only caller of `SiriusContext`, which is `!Send`.
 /// Every variant carries its own respond channel, so callers block for exactly their answer.
+///
+/// Staging lease/release/info are deliberately NOT variants here: they are served from the
+/// thread-safe arena handle on the caller's thread (see the module doc), because a request
+/// queued here waits for whatever fragment the engine thread is running.
 enum EngineRequest {
     /// Run one fragment (the original request shape).
     Run(ExecuteRequest),
-    /// Staging arena `(device base address, capacity)`, captured once for nixl registration.
-    StagingInfo {
-        respond: Sender<Result<(u64, u64), String>>,
-    },
-    /// Lease `len` bytes of the staging arena.
-    StagingLease {
-        len: u64,
-        respond: Sender<Result<u64, String>>,
-    },
-    /// Return the staging lease at `offset`.
-    StagingRelease {
-        offset: u64,
-        respond: Sender<Result<(), String>>,
-    },
+    /// Test-only: occupy the engine thread for the duration — a stand-in for a long (or
+    /// wedged) fragment run, so a test can prove staging leases do not queue behind it.
+    #[cfg(test)]
+    Sleep(std::time::Duration),
     /// Pack the next batch parked under `slot` into a fresh staging lease (`None` when drained).
     ExportNext {
         slot: SenderSlot,
@@ -108,6 +109,16 @@ pub struct SiriusEngine {
     requests: Mutex<Option<Sender<EngineRequest>>>,
     /// Engine thread handle, taken and joined on drop.
     thread: Mutex<Option<JoinHandle<()>>>,
+    /// Thread-safe staging-arena handle (`None` when `SIRIUS_EXCHANGE_STAGING_BYTES` is unset),
+    /// serving every `staging_*` call directly on the caller's thread.
+    ///
+    /// INVARIANT: staging leases must never funnel through `requests` — a fragment wedged
+    /// inside `run()` would starve every peer's `request_staging_lease` and stall their
+    /// cross-CN exchanges. Off-thread service is safe because lease/release/base/capacity only
+    /// take the arena's internal mutex and make no CUDA calls; the engine thread keeps its own
+    /// direct arena access (`Context::staging_release` for remote-input leases, and
+    /// `export_packed` leasing internally) — one shared C++ allocator, two entry points.
+    staging: Option<sirius::StagingArena>,
 }
 
 impl SiriusEngine {
@@ -121,15 +132,19 @@ impl SiriusEngine {
         Self::configure_duckdb_extensions()?;
         Self::configure_engine_environment(&settings)?;
         let (request_tx, request_rx) = channel::<EngineRequest>();
-        let (ready_tx, ready_rx) = channel::<Result<(), String>>();
+        // Readiness carries the staging-arena handle out of the engine thread: the context
+        // itself never leaves that thread, but the handle is `Send + Sync` by design so
+        // staging calls can bypass the request channel (see the module doc).
+        let (ready_tx, ready_rx) = channel::<Result<Option<sirius::StagingArena>, String>>();
         let thread = std::thread::Builder::new()
             .name("sirius-engine".to_string())
             .spawn(move || engine_thread(settings.config, request_rx, ready_tx))
             .map_err(|err| format!("failed to spawn sirius-engine thread: {err}"))?;
         match ready_rx.recv() {
-            Ok(Ok(())) => Ok(Self {
+            Ok(Ok(staging)) => Ok(Self {
                 requests: Mutex::new(Some(request_tx)),
                 thread: Mutex::new(Some(thread)),
+                staging,
             }),
             Ok(Err(err)) => Err(err),
             Err(_) => Err("sirius-engine thread exited during bring-up".to_string()),
@@ -210,12 +225,13 @@ impl SiriusEngine {
 fn engine_thread(
     config: Option<PathBuf>,
     requests: Receiver<EngineRequest>,
-    ready: Sender<Result<(), String>>,
+    ready: Sender<Result<Option<sirius::StagingArena>, String>>,
 ) {
     let context = match build_context(config) {
         Ok(context) => {
-            // A send error means the caller is already gone; nothing to serve.
-            if ready.send(Ok(())).is_err() {
+            // A send error means the caller is already gone; nothing to serve. The staging
+            // handle crosses to the caller so leases are served off this thread.
+            if ready.send(Ok(context.staging_arena())).is_err() {
                 return;
             }
             context
@@ -258,25 +274,8 @@ fn engine_thread(
                 }
                 let _ = request.respond.send(result);
             }
-            EngineRequest::StagingInfo { respond } => {
-                let result = context
-                    .staging_base()
-                    .and_then(|base| context.staging_capacity().map(|cap| (base as u64, cap)))
-                    .map_err(|err| format!("staging arena info unavailable: {err}"));
-                let _ = respond.send(result);
-            }
-            EngineRequest::StagingLease { len, respond } => {
-                let result = context
-                    .staging_lease(len)
-                    .map_err(|err| format!("staging lease of {len} bytes failed: {err}"));
-                let _ = respond.send(result);
-            }
-            EngineRequest::StagingRelease { offset, respond } => {
-                let result = context
-                    .staging_release(offset)
-                    .map_err(|err| format!("staging release of offset {offset} failed: {err}"));
-                let _ = respond.send(result);
-            }
+            #[cfg(test)]
+            EngineRequest::Sleep(duration) => std::thread::sleep(duration),
             EngineRequest::ExportNext { slot, respond } => {
                 let result = export_next(&mut parked, &parked_slots, slot);
                 let _ = respond.send(result);
@@ -609,6 +608,14 @@ impl SiriusEngine {
             .recv()
             .map_err(|_| "sirius-engine thread dropped the response".to_string())?
     }
+
+    /// The staging-arena handle, or the loud not-configured error (the exact message the C++
+    /// arena raises, so operators see one spelling either way).
+    fn staging_arena(&self) -> Result<&sirius::StagingArena, String> {
+        self.staging.as_ref().ok_or_else(|| {
+            "exchange staging arena not configured (set SIRIUS_EXCHANGE_STAGING_BYTES)".to_string()
+        })
+    }
 }
 
 impl FragmentExecutor for SiriusEngine {
@@ -627,16 +634,24 @@ impl FragmentExecutor for SiriusEngine {
         })
     }
 
+    // The three staging calls below run on the CALLER's thread, never the engine thread: a
+    // peer's lease request must succeed even while the engine is deep inside a fragment run.
+
     fn staging_info(&self) -> Result<(u64, u64), String> {
-        self.engine_call(|respond| EngineRequest::StagingInfo { respond })
+        let arena = self.staging_arena()?;
+        Ok((arena.base() as u64, arena.capacity()))
     }
 
     fn staging_lease(&self, len: u64) -> Result<u64, String> {
-        self.engine_call(|respond| EngineRequest::StagingLease { len, respond })
+        self.staging_arena()?
+            .lease(len)
+            .map_err(|err| format!("staging lease of {len} bytes failed: {err}"))
     }
 
     fn staging_release(&self, offset: u64) -> Result<(), String> {
-        self.engine_call(|respond| EngineRequest::StagingRelease { offset, respond })
+        self.staging_arena()?
+            .release(offset)
+            .map_err(|err| format!("staging release of offset {offset} failed: {err}"))
     }
 
     fn export_packed_next(&self, slot: SenderSlot) -> Result<Option<StagedBatch>, String> {
@@ -961,9 +976,10 @@ mod tests {
 
     /// The engine-actor mirror of the sirius crate's `packed_hop_matches_relay_hop`: a sender
     /// parks its output, `export_packed_next` drains it into staging leases, and a receiver run
-    /// with `remote_inputs` delivers exactly the fixture rows — proving the StagingInfo/Lease/
-    /// Release/ExportNext/DropParked plumbing and the push-then-release contract, GPU-side,
-    /// without any network. Requires a GPU and `SIRIUS_EXCHANGE_STAGING_BYTES` support.
+    /// with `remote_inputs` delivers exactly the fixture rows — proving the staging info/lease/
+    /// release handle path, the ExportNext/DropParked plumbing, and the push-then-release
+    /// contract, GPU-side, without any network. Requires a GPU and
+    /// `SIRIUS_EXCHANGE_STAGING_BYTES` support.
     #[test]
     fn engine_pushes_staged_remote_batches() {
         let _guard = crate::GPU_ENGINE_TEST_LOCK
@@ -1038,6 +1054,57 @@ mod tests {
         engine.staging_release(probe).unwrap();
 
         // Keep the arena out of the other tests' context bring-ups.
+        // SAFETY: the GPU lock is still held.
+        unsafe { std::env::remove_var("SIRIUS_EXCHANGE_STAGING_BYTES") };
+    }
+
+    /// The regression guard for the q02 lease starvation: a peer's `request_staging_lease`
+    /// lands while this CN's engine thread is busy running a fragment, and the old
+    /// engine-channel funnel made that lease wait for the whole run (forever, for a wedged
+    /// one). With the arena handle serving leases on the caller's thread, a lease taken while
+    /// the engine thread is occupied must return immediately. Requires a GPU.
+    #[test]
+    fn staging_lease_does_not_queue_behind_engine_work() {
+        let _guard = crate::GPU_ENGINE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        ensure_parquet_extension_env();
+        // The arena is constructed at context bring-up, only when this is set.
+        // SAFETY: the GPU lock is held, so no other thread touches the environment here.
+        unsafe { std::env::set_var("SIRIUS_EXCHANGE_STAGING_BYTES", "64MiB") };
+
+        let engine = SiriusEngine::start(test_settings()).expect("bring up sirius engine");
+        // Occupy the engine thread the way a long fragment run would (the raw-request door the
+        // dumped-plan harness also uses); anything funneled through the channel now waits.
+        let busy_for = std::time::Duration::from_secs(3);
+        engine
+            .requests
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .send(EngineRequest::Sleep(busy_for))
+            .unwrap();
+
+        let started = std::time::Instant::now();
+        let offset = engine
+            .staging_lease(4096)
+            .expect("lease while the engine thread is busy");
+        engine
+            .staging_release(offset)
+            .expect("release while the engine thread is busy");
+        let (base, capacity) = engine.staging_info().expect("info while busy");
+        assert_ne!(base, 0);
+        assert_eq!(capacity, 64 << 20);
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "staging calls queued behind engine work: served in {elapsed:?} while the engine \
+             thread was held for {busy_for:?}"
+        );
+
+        // Keep the arena out of the other tests' context bring-ups. Dropping `engine` below
+        // joins the engine thread, which finishes its sleep first — ordered teardown holds.
         // SAFETY: the GPU lock is still held.
         unsafe { std::env::remove_var("SIRIUS_EXCHANGE_STAGING_BYTES") };
     }

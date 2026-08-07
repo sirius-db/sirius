@@ -141,6 +141,20 @@ impl SiriusContext {
     pub fn staging_capacity(&self) -> Result<u64, Exception> {
         self.inner.borrow().staging_capacity()
     }
+
+    /// Thread-safe handle to the exchange staging arena, or `None` when no arena is configured
+    /// (`SIRIUS_EXCHANGE_STAGING_BYTES` unset at bring-up).
+    ///
+    /// Unlike the `staging_*` methods above — which go through this `!Sync` context and
+    /// therefore its owning thread — the handle is `Send + Sync` and serves leases from any
+    /// thread, concurrently with the context thread's own staging traffic. It shares ownership
+    /// of the ONE C++ allocator ([`Fragment::export_packed`] leases from the same arena), so
+    /// the two sides can never double-book a region, and the handle stays valid even if this
+    /// context is dropped first.
+    pub fn staging_arena(&self) -> Option<StagingArena> {
+        let handle = self.inner.borrow().staging_arena_handle();
+        (!handle.is_null()).then(|| StagingArena { inner: handle })
+    }
 }
 
 /// Drains a filled Arrow C Data Interface stream into owned batches, retaining the schema.
@@ -359,6 +373,58 @@ pub struct PackedBatch {
     pub offset: u64,
     /// Length of the packed payload in bytes.
     pub len: u64,
+}
+
+/// Thread-safe handle to a context's exchange staging arena, from
+/// [`SiriusContext::staging_arena`].
+///
+/// This is what lets a transport/RPC thread serve `lease`/`release` while the context's owning
+/// thread is busy running a fragment: the two contend on nothing but the arena's own mutex, so
+/// an engine stall can never starve a peer's staging lease.
+pub struct StagingArena {
+    inner: UniquePtr<sirius_sys::StagingArena>,
+}
+
+// SAFETY: the C++ `StagingArena` is a `shared_ptr` to the one `exchange_staging_arena`. Every
+// method (`lease`, `release`, and the immutable `base`/`capacity` reads) serializes on the
+// arena's internal `std::mutex` and makes NO CUDA calls — the region is a single `cudaMalloc`
+// made at arena construction — so there is no thread-affine state behind any operation. The
+// `shared_ptr` keeps the device region alive independently of the `SiriusContext`, so the
+// handle cannot dangle if the context is torn down first.
+unsafe impl Send for StagingArena {}
+unsafe impl Sync for StagingArena {}
+
+impl StagingArena {
+    /// Lease `len` bytes, returning the lease's byte offset from [`base`](Self::base). Errors
+    /// on exhaustion or a zero-length request — the arena never blocks.
+    pub fn lease(&self, len: u64) -> Result<u64, Exception> {
+        self.inner.lease(len)
+    }
+
+    /// Return the lease at `offset`; the arena's bump head resets when the last outstanding
+    /// lease is released.
+    pub fn release(&self, offset: u64) -> Result<(), Exception> {
+        self.inner.release(offset)
+    }
+
+    /// Device base address of the arena, for transport memory registration.
+    pub fn base(&self) -> usize {
+        self.inner.base()
+    }
+
+    /// Capacity of the arena in bytes.
+    pub fn capacity(&self) -> u64 {
+        self.inner.capacity()
+    }
+}
+
+impl std::fmt::Debug for StagingArena {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StagingArena")
+            .field("base", &self.base())
+            .field("capacity", &self.capacity())
+            .finish()
+    }
 }
 
 /// Error returned by [`SiriusContext::execute_substrait`].

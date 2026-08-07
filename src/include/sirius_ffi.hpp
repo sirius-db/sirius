@@ -38,9 +38,14 @@
 #define SIRIUS_FFI_EXPORT __attribute__((visibility("default")))
 #endif
 
+namespace sirius::exec {
+class exchange_staging_arena;
+}  // namespace sirius::exec
+
 namespace sirius::ffi {
 
 class Fragment;
+class StagingArena;
 
 namespace detail {
 /// Engine handle + embedded DuckDB behind a [`Context`]. Defined in the .cpp so this public
@@ -106,12 +111,58 @@ class SIRIUS_FFI_EXPORT Context {
   /// @throws when no arena is configured.
   std::uint64_t staging_capacity() const;
 
+  /// Thread-safe handle to the staging arena, sharing ownership with this context — or null
+  /// when no arena is configured (`SIRIUS_EXCHANGE_STAGING_BYTES` unset). A caller that must
+  /// serve leases off the context's owning thread (e.g. an RPC handler answering a peer's
+  /// lease request) holds this instead of funneling through the `staging_*` methods above.
+  std::unique_ptr<StagingArena> staging_arena_handle() const;
+
  private:
   // PIMPL: see detail::context_state.
   std::unique_ptr<detail::context_state> impl_;
 
   friend class Fragment;
   friend SIRIUS_FFI_EXPORT std::unique_ptr<Fragment> make_fragment(Context& context);
+};
+
+/// Thread-safe handle to a [`Context`]'s exchange staging arena.
+///
+/// Why this exists: the `Context` is single-threaded by contract, so its `staging_*` methods can
+/// only be served by the thread that owns it — in an embedding that thread also runs fragments,
+/// so a long (or wedged) `Fragment::run` starves every lease request arriving from transport/RPC
+/// threads and stalls the peers' cross-node exchanges with it. The arena itself needs no such
+/// funnel: `lease`/`release` serialize on the arena's internal mutex and make **no CUDA calls**
+/// (the region is one `cudaMalloc` owned for the arena's lifetime), so any thread may call any
+/// method here, concurrently with the context thread's own staging traffic.
+///
+/// This handle shares ownership of the ONE allocator the context uses — `Fragment::export_packed`
+/// leases from the same arena on the context's thread — so the two sides can never double-book a
+/// region, and the handle stays valid even if the `Context` is torn down first.
+class SIRIUS_FFI_EXPORT StagingArena {
+ public:
+  explicit StagingArena(std::shared_ptr<sirius::exec::exchange_staging_arena> arena);
+  ~StagingArena();
+
+  StagingArena(const StagingArena&)            = delete;
+  StagingArena& operator=(const StagingArena&) = delete;
+
+  /// Lease `len` bytes; returns the lease's byte offset from `base()`. Same contract as
+  /// `Context::staging_lease`, callable from any thread.
+  /// @throws on a zero-length request or on exhaustion — it never blocks.
+  std::uint64_t lease(std::uint64_t len) const;
+
+  /// Return the lease at `offset`. Same contract as `Context::staging_release`.
+  /// @throws on an offset that is not an outstanding lease.
+  void release(std::uint64_t offset) const;
+
+  /// Device base address of the arena, for transport memory registration.
+  std::uintptr_t base() const noexcept;
+
+  /// Capacity of the arena in bytes.
+  std::uint64_t capacity() const noexcept;
+
+ private:
+  std::shared_ptr<sirius::exec::exchange_staging_arena> arena_;
 };
 
 /// One plan fragment of a multi-fragment query, executed on this process's [`Context`].

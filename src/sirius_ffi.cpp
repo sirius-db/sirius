@@ -132,7 +132,10 @@ struct detail::context_state {
   duckdb::shared_ptr<sirius::exec::stream_bind_catalog> stream_catalog;
   //! Cross-node exchange staging (opt-in via SIRIUS_EXCHANGE_STAGING_BYTES; null otherwise, and
   //! every staging call errors loudly). Plain cudaMalloc by contract — see the arena's header.
-  std::unique_ptr<sirius::exec::exchange_staging_arena> staging_arena;
+  //! `shared_ptr` so a `StagingArena` handle can serve leases from other threads (the arena's
+  //! internal mutex makes that safe) and outlive this context; there is still exactly ONE
+  //! allocator — the handle shares it, never mirrors it.
+  std::shared_ptr<sirius::exec::exchange_staging_arena> staging_arena;
 
   void bring_up(sirius::sirius_config& config)
   {
@@ -284,6 +287,35 @@ std::uint64_t Context::staging_capacity() const
 {
   return sirius::exec::exchange_staging_arena::require(impl_->staging_arena.get()).capacity();
 }
+
+std::unique_ptr<StagingArena> Context::staging_arena_handle() const
+{
+  if (impl_->staging_arena == nullptr) { return nullptr; }
+  return std::make_unique<StagingArena>(impl_->staging_arena);
+}
+
+// ---------------------------------------------------------------------------
+// StagingArena
+// ---------------------------------------------------------------------------
+
+// Thread-safety contract (documented on the class): every method below only touches the arena,
+// whose lease/release serialize on its internal std::mutex and make no CUDA calls — so unlike
+// the Context methods above, these are callable from any thread.
+
+StagingArena::StagingArena(std::shared_ptr<sirius::exec::exchange_staging_arena> arena)
+  : arena_(std::move(arena))
+{
+}
+
+StagingArena::~StagingArena() = default;
+
+std::uint64_t StagingArena::lease(std::uint64_t len) const { return arena_->lease(len); }
+
+void StagingArena::release(std::uint64_t offset) const { arena_->release(offset); }
+
+std::uintptr_t StagingArena::base() const noexcept { return arena_->base(); }
+
+std::uint64_t StagingArena::capacity() const noexcept { return arena_->capacity(); }
 
 namespace {
 std::string stream_view_name_of(std::uint64_t stream_id)

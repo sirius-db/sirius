@@ -123,8 +123,9 @@ struct ServiceCore {
     /// The nixl transport tier for remote destinations. `None` keeps every remote destination a
     /// loud error naming how to enable it.
     transport: Option<NixlTransport>,
-    /// Staging arena `(base, capacity)`, fetched from the engine once (it never moves) so lease
-    /// requests cost one engine round-trip, not two.
+    /// Staging arena `(base, capacity)`, cached after the first lookup (the arena never moves).
+    /// The executor serves every staging call from a thread-safe arena handle, never from the
+    /// engine's request queue, so a lease request costs a mutex — not an engine wait.
     staging_info: Mutex<Option<(u64, u64)>>,
 }
 
@@ -400,8 +401,9 @@ impl PInternalService for SiriusComputeNodeService {
         Ok(result.into())
     }
 
-    /// Leases bytes of this CN's staging arena for a peer's nixl WRITE. The lease request queues
-    /// behind whatever the engine thread is running; the peer's client timeout bounds the wait.
+    /// Leases bytes of this CN's staging arena for a peer's nixl WRITE. Served directly from
+    /// the executor's arena handle — never the engine's request queue — so a peer's exchange
+    /// survives this CN running a long (or wedged) fragment.
     #[instrument(skip_all)]
     async fn request_staging_lease(
         &self,
