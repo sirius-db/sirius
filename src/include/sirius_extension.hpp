@@ -25,7 +25,7 @@
 #include <utility>
 
 namespace sirius {
-struct operator_params;
+struct sirius_config;
 }  // namespace sirius
 
 namespace duckdb {
@@ -73,7 +73,7 @@ class SiriusExtension : public Extension {
   /// Register Sirius's extension options. @p defaults supplies the registered default for every
   /// option DuckDB stores per connection, so a sirius.yaml value reaches those connections as
   /// their inherited starting point instead of being shadowed by the compiled default.
-  static void InitialGPUConfigs(DBConfig& db, const sirius::operator_params& defaults);
+  static void InitialGPUConfigs(DBConfig& db, const sirius::sirius_config& defaults);
   static void RegisterGPUFunctions(DatabaseInstance& catalog);
 #ifdef SIRIUS_ENABLE_LEGACY
   static void GPUProcessingSubstraitFunction(ClientContext& context,

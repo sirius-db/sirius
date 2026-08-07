@@ -1873,10 +1873,12 @@ static void SetMaxSortPartitionMemoryFraction(ClientContext& context,
 
 static void SetHashPartitionBytes(ClientContext& context, SetScope scope, Value& parameter)
 {
+  auto const bytes = UBigIntValue::Get(parameter);
+  if (bytes == 0) { throw InvalidInputException("hash_partition_bytes must be greater than zero"); }
   auto* params = get_operator_params(context);
   if (!params) { return; }
   auto slot                    = lock_operator_params_slot(context);
-  params->hash_partition_bytes = UBigIntValue::Get(parameter);
+  params->hash_partition_bytes = bytes;
   SIRIUS_LOG_DEBUG("Updated config HASH_PARTITION_BYTES to {}", params->hash_partition_bytes);
 }
 
@@ -2096,8 +2098,11 @@ static void SetEnableCompressedMaterialization(ClientContext& /*context*/,
   // current_setting still reported the old value.
 }
 
-void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::operator_params& defaults)
+void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_config& defaults)
 {
+  auto const& operator_defaults    = defaults.get_operator_params();
+  auto const& compression_defaults = defaults.get_compression_config();
+
   // Add in config option for gpu buffer manager
   config.AddExtensionOption("use_pin_memory",
                             "Whether or not the buffer manager is initialized with pinned memory",
@@ -2218,7 +2223,7 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::operator
   config.AddExtensionOption("scan_task_batch_size",
                             "The default batch size for a duckdb scan task",
                             LogicalType::UBIGINT,
-                            Value::UBIGINT(sirius::operator_params{}.scan_task_batch_size),
+                            Value::UBIGINT(operator_defaults.scan_task_batch_size),
                             SetDefaultScanTaskBatchSize);
 
   // Add in config option for sort partition size
@@ -2226,13 +2231,13 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::operator
                             "Maximum bytes per sort partition (0 = auto based on "
                             "max_sort_partition_memory_fraction of GPU memory)",
                             LogicalType::UBIGINT,
-                            Value::UBIGINT(sirius::operator_params{}.max_sort_partition_bytes),
+                            Value::UBIGINT(operator_defaults.max_sort_partition_bytes),
                             SetMaxSortPartitionBytes);
   config.AddExtensionOption(
     "max_sort_partition_memory_fraction",
     "Fraction of available GPU memory per sort partition when max_sort_partition_bytes is 0",
     LogicalType::DOUBLE,
-    Value::DOUBLE(sirius::operator_params{}.max_sort_partition_memory_fraction),
+    Value::DOUBLE(operator_defaults.max_sort_partition_memory_fraction),
     SetMaxSortPartitionMemoryFraction);
 
   // Logging configuration
@@ -2260,26 +2265,26 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::operator
   config.AddExtensionOption("hash_partition_bytes",
                             "Target size in bytes per hash partition",
                             LogicalType::UBIGINT,
-                            Value::UBIGINT(sirius::operator_params{}.hash_partition_bytes),
+                            Value::UBIGINT(operator_defaults.hash_partition_bytes),
                             SetHashPartitionBytes);
 
   config.AddExtensionOption("concat_batch_bytes",
                             "Target size for concat operator",
                             LogicalType::UBIGINT,
-                            Value::UBIGINT(sirius::operator_params{}.concat_batch_bytes),
+                            Value::UBIGINT(operator_defaults.concat_batch_bytes),
                             SetConcatBatchBytes);
 
   config.AddExtensionOption("sort_sample_bytes",
                             "Target bytes to sample before computing sort partition boundaries",
                             LogicalType::UBIGINT,
-                            Value::UBIGINT(sirius::operator_params{}.sort_sample_bytes),
+                            Value::UBIGINT(operator_defaults.sort_sample_bytes),
                             SetSortSampleBytes);
 
   config.AddExtensionOption("max_build_hash_table_bytes",
                             "Maximum size a build-side table can be where it will create a "
                             "reusable hash table for hash joins (i.e. BUILD_PROBE mode)",
                             LogicalType::UBIGINT,
-                            Value::UBIGINT(sirius::operator_params{}.max_build_hash_table_bytes),
+                            Value::UBIGINT(operator_defaults.max_build_hash_table_bytes),
                             SetMaxBuildHashTableBytes);
 
   config.AddExtensionOption("max_broadcast_join_size",
@@ -2287,7 +2292,7 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::operator
                             "(small) build table is replicated to every GPU instead of "
                             "hash-partitioned across GPUs",
                             LogicalType::UBIGINT,
-                            Value::UBIGINT(sirius::operator_params{}.max_broadcast_join_size),
+                            Value::UBIGINT(operator_defaults.max_broadcast_join_size),
                             SetMaxBroadcastJoinSize);
 
   config.AddExtensionOption(
@@ -2296,7 +2301,7 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::operator
     "right (probe) side has at least this many times more rows than the left side (0 disables). "
     "Hardware-dependent — recalibrate per GPU.",
     LogicalType::DOUBLE,
-    Value::DOUBLE(sirius::operator_params{}.mark_join_build_switch_ratio),
+    Value::DOUBLE(operator_defaults.mark_join_build_switch_ratio),
     SetMarkJoinBuildSwitchRatio);
 
   config.AddExtensionOption(
@@ -2309,7 +2314,7 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::operator
   config.AddExtensionOption("pin_table_compression",
                             "Enable Simpatico compression for pin_table(tier=>'host') chunks",
                             LogicalType::BOOLEAN,
-                            Value::BOOLEAN(false),
+                            Value::BOOLEAN(compression_defaults.enable_pin_table_compression),
                             SetEnablePinTableCompression);
 
   config.AddExtensionOption(
@@ -2318,14 +2323,14 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::operator
     "Files are named '<table_name>.<ext>'; their contents are the multi-column plan DSL. "
     "Tables with no matching file are pinned uncompressed. No effect on spill compression.",
     LogicalType::VARCHAR,
-    Value(std::string{}),
+    Value(compression_defaults.input_plan_dir),
     SetPinTableInputCompressionPlanDir);
 
   config.AddExtensionOption(
     "pin_table_compression_min_batch_size_bytes",
     "Minimum uncompressed batch size in bytes below which pin_table compression is skipped",
     LogicalType::UBIGINT,
-    Value::UBIGINT(1ULL * 1024 * 1024),
+    Value::UBIGINT(compression_defaults.min_batch_size_bytes),
     SetPinTableCompressionMinBatchSizeBytes);
 
   config.AddExtensionOption(
@@ -2333,7 +2338,7 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::operator
     "Discard the compressed form and pin uncompressed when the compressed size exceeds this "
     "fraction of the batch's original size (i.e. compression saved too little)",
     LogicalType::DOUBLE,
-    Value::DOUBLE(0.95),
+    Value::DOUBLE(compression_defaults.max_compressed_fraction),
     SetPinTableCompressionMaxCompressedFraction);
 
   config.AddExtensionOption(
@@ -2343,7 +2348,7 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::operator
     "IN-list if it fits the smallest probe-GPU L2, or a Bloom) into the probe-side scan to drop "
     "non-matching rows before the join (on by default)",
     LogicalType::BOOLEAN,
-    Value::BOOLEAN(sirius::operator_params{}.enable_dynamic_filter_pushdown),
+    Value::BOOLEAN(operator_defaults.enable_dynamic_filter_pushdown),
     SetEnableDynamicFilterPushdown);
 
   config.AddExtensionOption(
@@ -2352,7 +2357,7 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::operator
     "it for read-time row-group pruning, while duckdb-native scans apply it row-wise post-decode; "
     "requires enable_dynamic_filter_pushdown (off by default)",
     LogicalType::BOOLEAN,
-    Value::BOOLEAN(sirius::operator_params{}.enable_dynamic_zone_map_filter),
+    Value::BOOLEAN(operator_defaults.enable_dynamic_zone_map_filter),
     SetEnableDynamicZoneMapFilter);
 
   config.AddExtensionOption(
@@ -2360,7 +2365,7 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::operator
     "Skip publishing a key's dynamic filters when the hash-join build covers at least this "
     "fraction of the key's domain; >= 1.0 effectively disables the gate",
     LogicalType::DOUBLE,
-    Value::DOUBLE(sirius::operator_params{}.dynamic_filter_domain_coverage_threshold),
+    Value::DOUBLE(operator_defaults.dynamic_filter_domain_coverage_threshold),
     SetDynamicFilterDomainCoverageThreshold);
 
   config.AddExtensionOption(
@@ -2369,7 +2374,7 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::operator
     "this fraction of its rows (too unselective to repay the mask kernel); in [0.0, 1.0], 1.0 "
     "keeps filtering always on",
     LogicalType::DOUBLE,
-    Value::DOUBLE(sirius::operator_params{}.dynamic_filter_keep_threshold),
+    Value::DOUBLE(operator_defaults.dynamic_filter_keep_threshold),
     SetDynamicFilterKeepThreshold);
 
   config.AddExtensionOption(
@@ -2378,7 +2383,7 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::operator
     "filter matches no rows; also gates the statistics capture during CALL pin_table, so a table "
     "pinned while off carries no zone maps until re-pinned with the flag on",
     LogicalType::BOOLEAN,
-    Value::BOOLEAN(sirius::operator_params{}.enable_pinned_zone_map_pruning),
+    Value::BOOLEAN(operator_defaults.enable_pinned_zone_map_pruning),
     SetEnablePinnedZoneMapPruning);
 
   // Default from the YAML-loaded params, so a sirius.yaml value is what connections inherit.
@@ -2388,7 +2393,7 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::operator
     "carriers selected from exact pin-time bounds; restore native carriers at type-sensitive "
     "boundaries (on by default)",
     LogicalType::BOOLEAN,
-    Value::BOOLEAN(defaults.enable_compressed_materialization),
+    Value::BOOLEAN(operator_defaults.enable_compressed_materialization),
     SetEnableCompressedMaterialization);
 }
 
@@ -2443,8 +2448,7 @@ static void LoadInternal(ExtensionLoader& loader)
   sirius::converter_registry::initialize();
   // The callback constructor above already read sirius.yaml, so its params are the defaults the
   // per-connection options register with.
-  SiriusExtension::InitialGPUConfigs(config,
-                                     callback_ptr->get_loaded_config().get_operator_params());
+  SiriusExtension::InitialGPUConfigs(config, callback_ptr->get_loaded_config());
   SiriusExtension::RegisterGPUFunctions(db);
 
   // Register the s3:// FileSystem so DuckDB's native read_parquet('s3://') binds
