@@ -35,7 +35,9 @@ namespace sirius::exec {
 /// Leases are bump-allocated under a mutex and freed explicitly (`lease` / `release` cross an
 /// FFI, so RAII cannot carry them). They are short-lived by design — a send lease is released
 /// after the transmit, a receive lease after the copy-out-on-arrival — so there is no free
-/// list: when the last outstanding lease is released the bump head resets to the base.
+/// list: each release drops the bump head back to the end of the highest lease still
+/// outstanding (to the base when none remain), so trailing space is reclaimed immediately and
+/// a long-lived lease pins at most the region up to its own end.
 class exchange_staging_arena {
  public:
   /// Every lease offset is a multiple of this, so any lease is a valid aligned transfer target.
@@ -73,8 +75,9 @@ class exchange_staging_arena {
   ///         naming the requested, free, and capacity byte counts.
   std::uint64_t lease(std::uint64_t len);
 
-  /// Return the lease at `offset`. When it was the last one outstanding the bump head resets
-  /// to the base — the reclamation model, relying on leases being short-lived.
+  /// Return the lease at `offset`. The bump head drops back to the end of the highest lease
+  /// still outstanding (to the base when none remain) — trailing reclamation, relying on
+  /// leases being short-lived.
   /// @throws sirius::invalid_input_exception when `offset` is not an outstanding lease
   ///         (double release, or a corrupted offset).
   void release(std::uint64_t offset);

@@ -109,9 +109,18 @@ void exchange_staging_arena::release(std::uint64_t offset)
       offset);
   }
   leases_.erase(it);
-  // Leases are short-lived by design, so reclamation is a wholesale reset rather than a free
-  // list: the moment nothing is outstanding, the whole arena is free again.
-  if (leases_.empty()) { head_ = 0; }
+  // Trailing reclamation, no free list: the bump head drops back to the end of the highest
+  // lease still outstanding (to the base when none remain). Gaps below the head are only
+  // reusable once everything above them goes back — but a lease that outlives its neighbours
+  // now pins at most the region up to its own end, never the whole arena, so steady-state
+  // traffic keeps reusing the same space above it instead of burning arena for the process
+  // lifetime.
+  if (leases_.empty()) {
+    head_ = 0;
+  } else {
+    const auto& highest = *leases_.rbegin();
+    head_               = highest.first + highest.second;
+  }
 }
 
 std::size_t exchange_staging_arena::outstanding() const

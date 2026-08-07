@@ -502,40 +502,57 @@ mod agent_tier {
             let mut batches: u64 = 0;
             let mut bytes: u64 = 0;
 
-            while let Some(batch) = self.executor.export_packed_next(spec.slot)? {
+            while let Some(mut batch) = self.executor.export_packed_next(spec.slot)? {
                 // A metadata-only empty batch carries no payload: no peer lease, no WRITE, and
                 // the receiver knows `len == 0` means nothing to release.
-                let (remote_offset, length) = if batch.len > 0 {
-                    let lease = rpc_request_lease(&mut session.client, batch.len)?;
-                    write_and_wait(
-                        &self.agent,
-                        &session.remote_agent,
-                        self.staging_base + batch.offset,
-                        lease.remote_addr,
-                        batch.len,
-                    )?;
-                    (lease.offset, batch.len)
-                } else {
-                    (0, 0)
-                };
-                rpc_transmit(
-                    &mut session.client,
-                    PTransmitPackedParams {
-                        finst_id: Some(finst_id),
-                        node_id: Some(spec.slot.node_id),
-                        sender_id: Some(spec.slot.sender_id),
-                        eos: Some(false),
-                        seq: Some(seq),
-                        offset: Some(remote_offset),
-                        length: Some(length),
-                        column_names: spec.names.clone(),
-                        canary: None,
-                    },
-                    batch.metadata,
-                )?;
+                let metadata = std::mem::take(&mut batch.metadata);
+                let sent = (|| {
+                    let (remote_offset, length) = if batch.len > 0 {
+                        let lease = rpc_request_lease(&mut session.client, batch.len)?;
+                        write_and_wait(
+                            &self.agent,
+                            &session.remote_agent,
+                            self.staging_base + batch.offset,
+                            lease.remote_addr,
+                            batch.len,
+                        )?;
+                        (lease.offset, batch.len)
+                    } else {
+                        (0, 0)
+                    };
+                    rpc_transmit(
+                        &mut session.client,
+                        PTransmitPackedParams {
+                            finst_id: Some(finst_id),
+                            node_id: Some(spec.slot.node_id),
+                            sender_id: Some(spec.slot.sender_id),
+                            eos: Some(false),
+                            seq: Some(seq),
+                            offset: Some(remote_offset),
+                            length: Some(length),
+                            column_names: spec.names.clone(),
+                            canary: None,
+                        },
+                        metadata,
+                    )
+                })();
+                // The local lease goes back whether the send succeeded or not: a lease left
+                // outstanding on an error path pins the arena for every later query.
                 if batch.len > 0 {
-                    self.executor.staging_release(batch.offset)?;
+                    if let Err(release_err) = self.executor.staging_release(batch.offset) {
+                        match sent {
+                            Ok(_) => return Err(release_err),
+                            // The send error is the root cause; the release failure rides along
+                            // as a log line rather than masking it.
+                            Err(_) => warn!(
+                                offset = batch.offset,
+                                error = %release_err,
+                                "failed to release the local staging lease after a send error"
+                            ),
+                        }
+                    }
                 }
+                sent?;
                 seq += 1;
                 batches += 1;
                 bytes += batch.len;

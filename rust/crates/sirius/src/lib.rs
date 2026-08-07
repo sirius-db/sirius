@@ -312,6 +312,9 @@ impl Fragment<'_> {
     /// this returns, so a transport may transmit from
     /// `[staging_base() + offset, + len)` immediately; the lease stays live until the caller
     /// hands it back with [`SiriusContext::staging_release`] after the transmit completes.
+    ///
+    /// A zero-row batch comes back metadata-only: `offset == 0` with `len == 0` means NO lease
+    /// exists for it, and the caller must not release anything.
     pub fn export_packed(&mut self, stream_id: u64) -> Result<Option<PackedBatch>, Exception> {
         let mut offset = 0u64;
         let mut len = 0u64;
@@ -365,7 +368,8 @@ impl Fragment<'_> {
 /// `metadata` is the host-side cudf pack metadata (it travels with the payload on the wire);
 /// `offset`/`len` locate the packed device payload inside the staging arena of the context that
 /// exported it. The exporter's lease at `offset` stays outstanding until
-/// [`SiriusContext::staging_release`] is called with it.
+/// [`SiriusContext::staging_release`] is called with it — except for a metadata-only zero-row
+/// batch (`offset == 0`, `len == 0`), which holds no lease and must not be released.
 pub struct PackedBatch {
     /// cudf pack metadata bytes (host memory).
     pub metadata: Vec<u8>,
@@ -401,8 +405,8 @@ impl StagingArena {
         self.inner.lease(len)
     }
 
-    /// Return the lease at `offset`; the arena's bump head resets when the last outstanding
-    /// lease is released.
+    /// Return the lease at `offset`; the arena's bump head drops back to the end of the
+    /// highest lease still outstanding (to the base when none remain).
     pub fn release(&self, offset: u64) -> Result<(), Exception> {
         self.inner.release(offset)
     }
@@ -1162,6 +1166,88 @@ mod tests {
                 (3, "c".to_string()),
             ]
         );
+
+        // Keep the arena out of the other tests' context bring-ups.
+        // SAFETY: the GPU lock is still held.
+        unsafe { std::env::remove_var("SIRIUS_EXCHANGE_STAGING_BYTES") };
+    }
+
+    /// The zero-row export contract: a zero-row batch leaves `export_packed` as a metadata-only
+    /// frame (`offset == 0`, `len == 0`) holding NO staging lease, and the frame round-trips
+    /// through `push_packed` into an empty result. Pins the q15 leak: `export_packed` used to
+    /// lease `total + slack` even for `total == 0`, while the transport contract says `len == 0`
+    /// means nothing to release — every empty cross-CN batch orphaned a >= 8 MiB lease that
+    /// pinned the arena's bump head for the process lifetime, exhausting it after ~20 passing
+    /// queries. The zero-row batch comes from an empty byte-range split (a range inside one row
+    /// group scans zero row groups and emits exactly one empty batch). Requires a GPU.
+    #[test]
+    fn zero_row_export_is_metadata_only_and_holds_no_lease() {
+        let _guard = GPU_CONTEXT_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        ensure_parquet_extension_env();
+        // The arena is constructed at context bring-up, only when this is set.
+        // SAFETY: the GPU lock is held, so no other thread touches the environment here.
+        unsafe { std::env::set_var("SIRIUS_EXCHANGE_STAGING_BYTES", "64MiB") };
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("users.parquet");
+        write_users_parquet(&path);
+        let names = vec!["id".to_string(), "name".to_string()];
+        // A byte range strictly inside the file's single row group owns no row groups: the
+        // zero-row sender instance of a distributed scan (q15's leaking shape).
+        let empty_split_plan =
+            local_files_plan_ranged(&[(path.to_str().unwrap(), 10, 5)], names.clone());
+
+        let ctx = SiriusContext::new().expect("bring up sirius context");
+        let capacity = ctx.staging_capacity().unwrap();
+
+        let mut sender = ctx.fragment().unwrap();
+        sender.declare_output(0).unwrap();
+        sender.build(&empty_split_plan).unwrap();
+        sender.run().unwrap();
+
+        let mut staged = Vec::new();
+        while let Some(batch) = sender.export_packed(0).unwrap() {
+            assert!(!batch.metadata.is_empty(), "pack metadata is never empty");
+            staged.push(batch);
+        }
+        assert!(
+            staged.iter().any(|batch| batch.len == 0),
+            "the empty split must park a zero-row batch to export"
+        );
+        for batch in &staged {
+            if batch.len == 0 {
+                assert_eq!(batch.offset, 0, "a metadata-only frame names no lease");
+            } else {
+                ctx.staging_release(batch.offset).unwrap();
+            }
+        }
+
+        // The reclaim guarantee: with only `len > 0` leases released (a metadata-only frame has
+        // nothing to release), zero leases are outstanding and the bump head is back at the
+        // base, so the ENTIRE arena is grantable as one lease. Under the leak this throws
+        // exhaustion — the orphaned slack lease still pins the head.
+        let probe = ctx.staging_lease(capacity).expect(
+            "the whole arena must be grantable again after a zero-row export cycle \
+             (an outstanding lease here is the q15 leak)",
+        );
+        assert_eq!(probe, 0);
+        ctx.staging_release(probe).unwrap();
+
+        // The frame is a legitimate wire citizen: pushing it delivers an empty stream, not an
+        // error, and the receiver terminates with zero rows.
+        let mut receiver = ctx.fragment().unwrap();
+        receiver.declare_input_column(0, "id", "BIGINT").unwrap();
+        receiver.declare_input_column(0, "name", "VARCHAR").unwrap();
+        receiver.build(&stream_read_plan(0)).unwrap();
+        for batch in &staged {
+            receiver.push_packed(0, batch).unwrap();
+        }
+        receiver.close_input(0, 0).unwrap();
+        receiver.run().unwrap();
+        let result = receiver.into_arrow().unwrap();
+        assert_eq!(rows(&result), Vec::new(), "an empty split carries no rows");
 
         // Keep the arena out of the other tests' context bring-ups.
         // SAFETY: the GPU lock is still held.

@@ -48,8 +48,9 @@ TEST_CASE("ARENA-1: lease/release bookkeeping and reset-at-zero", "[staging_aren
   REQUIRE(c == 256 + 4096);
   REQUIRE(arena.outstanding() == 3);
 
-  // Releasing SOME leases must not move the head: earlier offsets stay claimed by design (bump
-  // allocator, no free list), so the next lease lands past everything ever handed out.
+  // Releasing a NON-trailing lease must not move the head: the gap it leaves is unreachable
+  // in a bump allocator until everything above it goes back, so the next lease lands past
+  // everything still outstanding.
   arena.release(b);
   auto d = arena.lease(1);
   REQUIRE(d == c + 256);
@@ -163,4 +164,51 @@ TEST_CASE("ARENA-6: from_env honours the byte-suffix parser", "[staging_arena]")
   REQUIRE_THROWS_AS(exchange_staging_arena::from_env(), sirius::invalid_input_exception);
 
   unsetenv(var);
+}
+
+// ============================================================================
+// ARENA-7: trailing release reclaims the head — a stuck lease pins only the
+// region up to its own end
+// ============================================================================
+
+// The regression this pins: reclamation used to happen only at zero outstanding, so ONE lease
+// that was never released turned the arena into a monotonic bump allocator — every later
+// query's staging traffic burned arena permanently and exhausted it within ~20 passing
+// queries. With trailing reclamation, steady-state lease/release cycles above a stuck lease
+// reuse the same region forever.
+TEST_CASE("ARENA-7: trailing reclamation survives a stuck lease", "[staging_arena]")
+{
+  exchange_staging_arena arena(4096);
+  auto stuck = arena.lease(256);
+  REQUIRE(stuck == 0);
+
+  // Steady-state traffic: each lease is released after its transmit. Every cycle must land on
+  // the same offset; without trailing reclamation the second iteration already exhausts.
+  for (int i = 0; i < 100; ++i) {
+    auto t = arena.lease(2048);
+    REQUIRE(t == 256);
+    arena.release(t);
+  }
+  REQUIRE(arena.outstanding() == 1);
+
+  // Free bytes are back to baseline: everything above the stuck lease is grantable at once.
+  auto big = arena.lease(4096 - 256);
+  REQUIRE(big == 256);
+  arena.release(big);
+
+  // Out-of-order releases reclaim transitively down to the highest survivor.
+  auto x = arena.lease(256);
+  auto y = arena.lease(256);
+  auto z = arena.lease(256);
+  REQUIRE(z == 256 * 3);
+  arena.release(z);
+  arena.release(y);
+  REQUIRE(arena.lease(256) == y);  // the head fell back past both, to x's end
+  arena.release(y);
+  arena.release(x);
+
+  arena.release(stuck);
+  REQUIRE(arena.outstanding() == 0);
+  REQUIRE(arena.lease(4096) == 0);
+  arena.release(0);
 }

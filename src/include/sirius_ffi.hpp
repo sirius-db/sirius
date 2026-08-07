@@ -98,8 +98,9 @@ class SIRIUS_FFI_EXPORT Context {
   /// exhaustion — the error names the requested/free/capacity byte counts.
   std::uint64_t staging_lease(std::uint64_t len);
 
-  /// Return the staging lease at `offset`. When it was the last one outstanding the arena's
-  /// bump head resets — leases are short-lived by design (copy-out-on-arrival).
+  /// Return the staging lease at `offset`. The arena's bump head drops back to the end of the
+  /// highest lease still outstanding (to the base when none remain) — leases are short-lived
+  /// by design (copy-out-on-arrival).
   /// @throws on an offset that is not an outstanding lease, or when no arena is configured.
   void staging_release(std::uint64_t offset);
 
@@ -247,6 +248,10 @@ class SIRIUS_FFI_EXPORT Fragment {
   /// `[staging_base()+offset, +length)` immediately. The lease outlives this call by design:
   /// releasing it — via `Context::staging_release(offset)`, after the transmit completes — is
   /// the caller's responsibility.
+  ///
+  /// A zero-row batch is metadata-only: it returns the pack metadata with `offset == 0` and
+  /// `length == 0` and holds NO lease — the caller must not release anything for it. This is
+  /// the same `length == 0` frame the transports already pass end-to-end.
   /// @throws before `build()`, on an unknown output stream, when no arena is configured, on
   /// lease exhaustion, or on a parked batch that is not GPU-resident.
   std::unique_ptr<std::vector<std::uint8_t>> export_packed(std::uint64_t stream_id,

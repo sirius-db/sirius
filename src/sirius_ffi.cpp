@@ -722,6 +722,12 @@ std::unique_ptr<std::vector<std::uint8_t>> Fragment::export_packed(std::uint64_t
     cudf::chunked_pack::create(view, kPackChunkBytes, stream, space->get_default_allocator());
   const std::uint64_t total = packer->get_total_contiguous_size();
 
+  // A zero-row batch packs to a metadata-only frame: no payload, no lease. The wire contract
+  // says offset==0 with length==0 means "no lease exists for this batch", so the receiver never
+  // releases it — leasing here would orphan kPackChunkBytes of arena per empty batch, and one
+  // orphaned lease pins staging space for the process lifetime.
+  if (total == 0) { return packer->build_metadata(); }
+
   // Each next() span is a full chunk long and starts where the previous copy ended, so the
   // final span can reach up to one chunk past the payload — hence the slack.
   const auto lease_offset = arena.lease(total + kPackChunkBytes);
