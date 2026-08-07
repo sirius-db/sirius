@@ -23,6 +23,7 @@
 #include "memory/topology_index.hpp"
 #include "scan/test_utils.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
+#include "utils/child_runner.hpp"
 #include "utils/s3_container.hpp"
 #include "utils/sirius_test_env.hpp"
 
@@ -824,6 +825,7 @@ list_watchdog_result run_list_watchdog(range_http_server const& server,
   auto const pid = ::fork();
   REQUIRE(pid >= 0);
   if (pid == 0) {
+    if (!sirius::test::mark_child_runner()) { ::_exit(127); }
     ::execl("/proc/self/exe",
             "sirius_unittest",
             "rest LIST loop watchdog child runner",
@@ -888,6 +890,10 @@ TEST_CASE("rest_ioctx lists S3 objects with sizes and follows encoded continuati
 
 TEST_CASE("rest LIST loop watchdog child runner", "[.][rest][list][watchdog_child]")
 {
+  REQUIRE(sirius::test::g_shared_env == nullptr);
+  REQUIRE(sirius::test::g_integration_env == nullptr);
+  REQUIRE(sirius::test::g_integration_env_2gpu == nullptr);
+
   auto const* endpoint = std::getenv("SIRIUS_TEST_REST_LIST_WATCHDOG_ENDPOINT");
   if (endpoint == nullptr) { return; }
 

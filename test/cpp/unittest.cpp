@@ -21,6 +21,7 @@
 #include "log/logging.hpp"
 #include "log/spdlog_owning_sink.hpp"
 #include "util/segfault_backtrace.hpp"
+#include "utils/child_runner.hpp"
 #include "utils/s3_container.hpp"
 #include "utils/sirius_test_env.hpp"
 
@@ -120,31 +121,38 @@ int main(int argc, char* argv[])
   // by the listener for tests with the matching tag. This avoids GPU memory
   // conflicts with operator tests that use their own memory managers.
   // Only one environment can be active at a time.
-  auto scan_config_path =
-    std::filesystem::path(SIRIUS_PROJECT_ROOT) / "test" / "cpp" / "scan" / "memory.yaml";
-  sirius::test::shared_test_env scan_env(scan_config_path);
-  scan_env.pause();
-  sirius::test::g_shared_env = &scan_env;
-
-  auto integration_config_path = std::filesystem::path(SIRIUS_PROJECT_ROOT) / "test" / "cpp" /
-                                 "integration" / "integration.yaml";
-  sirius::test::shared_test_env integration_env(integration_config_path);
-  integration_env.pause();
-  sirius::test::g_integration_env = &integration_env;
-
-  // 2-GPU integration env (TEST-01/02 v1.2). Starts paused; TEST_CASE bodies
-  // that parameterize on num_gpus via GENERATE(1, 2) pick this env up via
-  // sirius::test::acquire_integration_env_for(2) and call resume()/pause()
-  // around each call to compare_gpu_vs_cpu.
-  auto integration_config_2gpu_path = std::filesystem::path(SIRIUS_PROJECT_ROOT) / "test" / "cpp" /
-                                      "integration" / "integration-2gpu.yaml";
-  int _dev_count = 0;
-  cudaGetDeviceCount(&_dev_count);
+  // Re-executed watchdog children create their own state and leave these holders empty.
+  std::optional<sirius::test::shared_test_env> scan_env_holder;
+  std::optional<sirius::test::shared_test_env> integration_env_holder;
   std::optional<sirius::test::shared_test_env> integration_env_2gpu_holder;
-  if (_dev_count >= 2) {
-    integration_env_2gpu_holder.emplace(integration_config_2gpu_path);
-    integration_env_2gpu_holder->pause();
-    sirius::test::g_integration_env_2gpu = &(*integration_env_2gpu_holder);
+  if (sirius::test::is_child_runner()) {
+    ::unsetenv("SIRIUS_DISABLE");
+  } else {
+    auto scan_config_path =
+      std::filesystem::path(SIRIUS_PROJECT_ROOT) / "test" / "cpp" / "scan" / "memory.yaml";
+    scan_env_holder.emplace(scan_config_path);
+    scan_env_holder->pause();
+    sirius::test::g_shared_env = &(*scan_env_holder);
+
+    auto integration_config_path = std::filesystem::path(SIRIUS_PROJECT_ROOT) / "test" / "cpp" /
+                                   "integration" / "integration.yaml";
+    integration_env_holder.emplace(integration_config_path);
+    integration_env_holder->pause();
+    sirius::test::g_integration_env = &(*integration_env_holder);
+
+    // 2-GPU integration env (TEST-01/02 v1.2). Starts paused; TEST_CASE bodies
+    // that parameterize on num_gpus via GENERATE(1, 2) pick this env up via
+    // sirius::test::acquire_integration_env_for(2) and call resume()/pause()
+    // around each call to compare_gpu_vs_cpu.
+    auto integration_config_2gpu_path = std::filesystem::path(SIRIUS_PROJECT_ROOT) / "test" /
+                                        "cpp" / "integration" / "integration-2gpu.yaml";
+    int _dev_count = 0;
+    cudaGetDeviceCount(&_dev_count);
+    if (_dev_count >= 2) {
+      integration_env_2gpu_holder.emplace(integration_config_2gpu_path);
+      integration_env_2gpu_holder->pause();
+      sirius::test::g_integration_env_2gpu = &(*integration_env_2gpu_holder);
+    }
   }
 
   // Bring up the S3 test backend (MinIO via testcontainers) once, when the [s3]

@@ -41,6 +41,8 @@
 #include <signal.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <utils/child_runner.hpp>
+#include <utils/sirius_test_env.hpp>
 #include <utils/transparent_execution_test_utils.hpp>
 
 #include <algorithm>
@@ -2098,6 +2100,10 @@ slot_watchdog_result run_scenario(std::string const& variant,
 // standard gate; runs only when selected by its exact name.
 TEST_CASE(kChildRunnerCase, "[.][query_lifecycle][watchdog_child]")
 {
+  REQUIRE(sirius::test::g_shared_env == nullptr);
+  REQUIRE(sirius::test::g_integration_env == nullptr);
+  REQUIRE(sirius::test::g_integration_env_2gpu == nullptr);
+
   auto const* variant_raw = std::getenv(kEnvVariant);
   auto const* output_raw  = std::getenv(kEnvOutput);
   auto const* config_raw  = std::getenv(kEnvConfig);
@@ -2108,7 +2114,6 @@ TEST_CASE(kChildRunnerCase, "[.][query_lifecycle][watchdog_child]")
     out.error = "watchdog child missing config path";
   } else {
     ::setenv("SIRIUS_CONFIG_FILE", config_raw, 1);
-    ::unsetenv("SIRIUS_DISABLE");
     auto const output_path = fs::path(output_raw);
     auto const database_path =
       output_path.parent_path() / ("scenario_" + std::string(variant_raw) + ".duckdb");
@@ -2155,6 +2160,7 @@ class QueryLifecycleSlotFixture {
         ::setenv("SIRIUS_LOG_DIR", log_dir.string().c_str(), 1);
         ::setenv("SIRIUS_LOG_LEVEL", "debug", 1);
       }
+      if (!sirius::test::mark_child_runner()) { ::_exit(127); }
       // A child that inherited a live CUDA context must re-exec before running an
       // engine query, so re-invoke the unit-test binary for the child-runner case.
       ::execl("/proc/self/exe", "sirius_unittest", kChildRunnerCase, static_cast<char*>(nullptr));

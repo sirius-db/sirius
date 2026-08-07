@@ -28,6 +28,7 @@
 #include <sys/wait.h>
 #include <unistd.h>  // getpid
 #include <util/duckdb_error_message.hpp>
+#include <utils/child_runner.hpp>
 #include <utils/gpu_execution_fixture.hpp>
 #include <utils/sirius_test_env.hpp>
 #include <utils/transparent_execution_test_utils.hpp>
@@ -565,13 +566,17 @@ child_result run_s3mix_child(std::string const& scenario, std::chrono::seconds t
   }
   child_argv.push_back(nullptr);
 
-  auto const scenario_prefix = std::string{kS3MixScenarioEnv} + "=";
+  auto const scenario_prefix     = std::string{kS3MixScenarioEnv} + "=";
+  auto const child_runner_prefix = std::string{sirius::test::child_runner_env} + "=";
   std::vector<std::string> child_environment;
   for (auto entry = environ; entry != nullptr && *entry != nullptr; ++entry) {
     std::string value{*entry};
-    if (value.rfind(scenario_prefix, 0) != 0) { child_environment.push_back(std::move(value)); }
+    if (value.rfind(scenario_prefix, 0) != 0 && value.rfind(child_runner_prefix, 0) != 0) {
+      child_environment.push_back(std::move(value));
+    }
   }
   child_environment.push_back(scenario_prefix + scenario);
+  child_environment.push_back(child_runner_prefix + sirius::test::child_runner_env_value);
 
   std::vector<char*> child_envp;
   child_envp.reserve(child_environment.size() + 1);
@@ -650,6 +655,10 @@ void require_s3mix_child_survives(std::string const& scenario,
 
 TEST_CASE("S3 mix fallback child runner", "[.][transparent][integration][s3mix_child]")
 {
+  REQUIRE(sirius::test::g_shared_env == nullptr);
+  REQUIRE(sirius::test::g_integration_env == nullptr);
+  REQUIRE(sirius::test::g_integration_env_2gpu == nullptr);
+
   auto const* scenario = std::getenv(kS3MixScenarioEnv);
   if (scenario == nullptr) { return; }
   run_s3mix_scenario(scenario);

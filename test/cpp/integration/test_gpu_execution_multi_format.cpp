@@ -30,6 +30,7 @@
 #include <signal.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <utils/child_runner.hpp>
 #include <utils/sirius_test_env.hpp>
 #include <utils/transparent_execution_test_utils.hpp>
 
@@ -642,6 +643,7 @@ class HivePartitionDataset {
       ::setenv("SIRIUS_HIVE_WATCHDOG_OUTPUT", output_path.string().c_str(), 1);
       ::setenv("SIRIUS_HIVE_WATCHDOG_CONFIG", config_path.string().c_str(), 1);
       ::setenv("SIRIUS_CONFIG_FILE", config_path.string().c_str(), 1);
+      if (!sirius::test::mark_child_runner()) { ::_exit(127); }
       ::execl("/proc/self/exe",
               "sirius_unittest",
               "gpu_execution hive partition watchdog child runner",
@@ -743,6 +745,10 @@ class GPUExecutionEscapedHivePartitionFixture : public MultiFormatFixtureBase,
 TEST_CASE("gpu_execution hive partition watchdog child runner",
           "[.][gpu_execution][hive_partition][watchdog_child]")
 {
+  REQUIRE(sirius::test::g_shared_env == nullptr);
+  REQUIRE(sirius::test::g_integration_env == nullptr);
+  REQUIRE(sirius::test::g_integration_env_2gpu == nullptr);
+
   auto const* query      = std::getenv("SIRIUS_HIVE_WATCHDOG_QUERY");
   auto const* output_raw = std::getenv("SIRIUS_HIVE_WATCHDOG_OUTPUT");
   if (query == nullptr || output_raw == nullptr) { return; }
@@ -757,9 +763,8 @@ TEST_CASE("gpu_execution hive partition watchdog child runner",
     std::unique_ptr<duckdb::Connection> con;
     if (out.error.empty()) {
       config_guard = std::make_unique<sirius_config_env_guard>(config_raw);
-      unsetenv("SIRIUS_DISABLE");
-      db  = std::make_unique<duckdb::DuckDB>(nullptr);
-      con = std::make_unique<duckdb::Connection>(*db);
+      db           = std::make_unique<duckdb::DuckDB>(nullptr);
+      con          = std::make_unique<duckdb::Connection>(*db);
     }
 
     auto set_gpu = out.error.empty() ? con->Query("SET gpu_execution = true;") : nullptr;
