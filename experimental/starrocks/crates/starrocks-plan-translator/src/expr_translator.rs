@@ -147,6 +147,7 @@ fn translate_expr_node(
         TExprNodeType::ARITHMETIC_EXPR => translate_arithmetic(node, children, ctx),
         TExprNodeType::IN_PRED => translate_in_pred(node, children, ctx),
         TExprNodeType::CASE_EXPR => translate_case(node, children),
+        TExprNodeType::CLONE_EXPR => translate_clone(node, children),
         TExprNodeType::FUNCTION_CALL => translate_function_call(node, children, ctx),
         _ => Err(TranslateError::UnsupportedExpression {
             node_type: node.node_type,
@@ -514,6 +515,20 @@ fn translate_case(node: &TExprNode, children: Vec<Expression>) -> Result<Express
             r#else,
         }))),
     })
+}
+
+/// Unwraps a StarRocks `CLONE_EXPR`, which carries no value semantics.
+///
+/// The frontend's `CloneDuplicateColRefRule` inserts it when a projection maps two output
+/// slots to the same input column, because the backend has no copy-on-write and would
+/// otherwise write the shared column twice; the backend's `CloneExpr` evaluates its child and
+/// hands back a uniquely-owned copy of the same values. The node's type and nullability are
+/// its child's by construction, so the child is returned as-is — restating the declared type
+/// with a cast would re-narrow a child the arithmetic path deliberately lowered to FP64, and
+/// make a cloned column differ from the uncloned one the frontend says it equals.
+fn translate_clone(node: &TExprNode, children: Vec<Expression>) -> Result<Expression> {
+    expect_child_count(node, &children, 1)?;
+    Ok(children.into_iter().next().unwrap())
 }
 
 /// Converts a StarRocks `FUNCTION_CALL` into a Substrait expression.

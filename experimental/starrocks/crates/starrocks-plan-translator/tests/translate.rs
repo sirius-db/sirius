@@ -1713,6 +1713,15 @@ fn cast_expr(target: TTypeDesc, child: TExpr) -> TExpr {
     TExpr::new(nodes)
 }
 
+/// Builds a `CLONE_EXPR` around `child`, carrying the child's declared type as the frontend
+/// emits it (`CloneExpr.getType()` delegates to its child).
+fn clone_expr(child: TExpr) -> TExpr {
+    let node = base_expr_node(TExprNodeType::CLONE_EXPR, child.nodes[0].type_.clone(), 1);
+    let mut nodes = vec![node];
+    nodes.extend(child.nodes);
+    TExpr::new(nodes)
+}
+
 /// Builds a typed NULL literal expression.
 fn null_literal(primitive: TPrimitiveType) -> TExpr {
     TExpr::new(vec![base_expr_node(
@@ -4403,6 +4412,118 @@ fn case_expression_translates_to_if_then() {
         if_then.r#else.is_some(),
         "CASE without else defaults to null"
     );
+}
+
+/// Verifies `CLONE_EXPR` unwraps to its child, so a cloned projection slot translates
+/// identically to the slot it clones.
+#[test]
+fn clone_expr_is_transparent() {
+    let mut common_slot_map = BTreeMap::new();
+    common_slot_map.insert(5, slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT)));
+    let mut slot_map = BTreeMap::new();
+    slot_map.insert(3, slot_ref(5, 1, scalar_type(TPrimitiveType::BIGINT)));
+    slot_map.insert(
+        4,
+        clone_expr(slot_ref(5, 1, scalar_type(TPrimitiveType::BIGINT))),
+    );
+
+    let mut project = base_plan_node(1, TPlanNodeType::PROJECT_NODE, 1, vec![1]);
+    project.project_node = Some(TProjectNode::new(Some(slot_map), Some(common_slot_map)));
+    let desc = desc_table(
+        vec![(0, Some(100)), (1, None)],
+        vec![
+            slot(1, 0, 0, "id", scalar_type(TPrimitiveType::BIGINT)),
+            slot(2, 0, 1, "name", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(3, 1, 0, "value", scalar_type(TPrimitiveType::BIGINT)),
+            slot(4, 1, 1, "value_clone", scalar_type(TPrimitiveType::BIGINT)),
+        ],
+    );
+
+    let translated = translate_fragment(&params(
+        Some(TPlan::new(vec![project, scan_node(0, 0)])),
+        Some(desc),
+        None,
+    ))
+    .unwrap();
+    let rel::RelType::Project(visible) = root(&translated.plan)
+        .input
+        .as_ref()
+        .unwrap()
+        .rel_type
+        .as_ref()
+        .unwrap()
+    else {
+        panic!("expected visible project");
+    };
+    assert_eq!(visible.expressions.len(), 2);
+    assert_eq!(
+        visible.expressions[0], visible.expressions[1],
+        "a cloned column must translate identically to the column it clones"
+    );
+}
+
+/// Verifies `CLONE_EXPR` returns its child uncast, preserving the FP64 lowering the
+/// arithmetic path applied instead of re-narrowing to the declared decimal type.
+#[test]
+fn clone_expr_keeps_the_child_lowering() {
+    let decimal = scalar_type_with(TPrimitiveType::DECIMAL128, None, Some(31), Some(4));
+    let mut arith = base_expr_node(TExprNodeType::ARITHMETIC_EXPR, decimal.clone(), 2);
+    arith.opcode = Some(TExprOpcode::MULTIPLY);
+    let mut nodes = vec![arith];
+    nodes.extend(slot_ref(1, 0, decimal.clone()).nodes);
+    nodes.extend(slot_ref(1, 0, decimal).nodes);
+
+    let translated = translate_fragment(&params(
+        Some(TPlan::new(vec![scan_node(0, 0)])),
+        Some(base_desc()),
+        Some(vec![clone_expr(TExpr::new(nodes))]),
+    ))
+    .unwrap();
+    let rel::RelType::Project(project) = root(&translated.plan)
+        .input
+        .as_ref()
+        .unwrap()
+        .rel_type
+        .as_ref()
+        .unwrap()
+    else {
+        panic!("expected output project");
+    };
+    let expression::RexType::ScalarFunction(function) =
+        project.expressions[0].rex_type.as_ref().unwrap()
+    else {
+        panic!("expected the multiply itself, not a cast around it");
+    };
+    assert!(matches!(
+        function
+            .output_type
+            .as_ref()
+            .unwrap()
+            .kind
+            .as_ref()
+            .unwrap(),
+        substrait::proto::r#type::Kind::Fp64(_)
+    ));
+}
+
+/// Verifies a childless `CLONE_EXPR` is reported as a malformed plan.
+#[test]
+fn clone_expr_requires_exactly_one_child() {
+    let mut select = base_plan_node(1, TPlanNodeType::SELECT_NODE, 1, vec![0]);
+    select.select_node = Some(TSelectNode::new(None));
+    select.conjuncts = Some(vec![TExpr::new(vec![base_expr_node(
+        TExprNodeType::CLONE_EXPR,
+        scalar_type(TPrimitiveType::BOOLEAN),
+        0,
+    )])]);
+
+    let err = translate_fragment(&params(
+        Some(TPlan::new(vec![select, scan_node(0, 0)])),
+        Some(base_desc()),
+        None,
+    ))
+    .unwrap_err();
+    assert!(matches!(err, TranslateError::MalformedPlan(_)));
 }
 
 /// Verifies aggregation-node conjuncts (HAVING) become a filter over the aggregate output.
