@@ -45,8 +45,9 @@ wait -n "${fe_pid}" "${cn_pid}"
 # listener port by +2 and keeps its engine artifacts in .cn2.
 #
 # Cross-node exchange rides the nixl tier: SIRIUS_EXCHANGE_STAGING_BYTES gives each CN a
-# 512MiB cudaMalloc exchange staging arena. NOTE: the arena sits OUTSIDE --gpu-memory-limit
-# (PLAN-PATH-B D-B4) — each CN really occupies ~8GiB + 512MiB + CUDA context overhead, sized
+# 1280MiB cudaMalloc exchange staging arena (512MiB starved TPC-H q09: one packed-table lease
+# of 648MB exceeded the whole arena). NOTE: the arena sits OUTSIDE --gpu-memory-limit
+# (PLAN-PATH-B D-B4) — each CN really occupies ~8GiB + 1.25GiB + CUDA context overhead, sized
 # below to still fit two CNs on the 23GiB L4. UCX_TLS must include cuda_copy (VRAM detection;
 # registration fails without it) and cuda_ipc (the fast same-host path the bandwidth canary
 # demands).
@@ -77,7 +78,7 @@ cn2_pid="$!"
 
 wait -n "${fe_pid}" "${cn1_pid}" "${cn2_pid}"
 '
-""",cwd = ".",depends-on = ["fe-check","cn-build"],description = "Run the FE and two 8GiB-carve-out CNs sharing one GPU, cross-node exchange over nixl",env = {LD_LIBRARY_PATH = "../../build/release/extension/sirius:/home/ubuntu/git/sirius-db/sirius-worktrees/tools/nvda_nixl/lib/x86_64-linux-gnu:/home/ubuntu/git/sirius-db/sirius-worktrees/tools/ucx-install/lib",NIXL_PLUGIN_DIR = "/home/ubuntu/git/sirius-db/sirius-worktrees/tools/nvda_nixl/lib/x86_64-linux-gnu/plugins",UCX_TLS = "cuda_copy,cuda_ipc,tcp,self",SIRIUS_EXCHANGE_STAGING_BYTES = "512MiB"}}
+""",cwd = ".",depends-on = ["fe-check","cn-build"],description = "Run the FE and two 8GiB-carve-out CNs sharing one GPU, cross-node exchange over nixl",env = {LD_LIBRARY_PATH = "../../build/release/extension/sirius:/home/ubuntu/git/sirius-db/sirius-worktrees/tools/nvda_nixl/lib/x86_64-linux-gnu:/home/ubuntu/git/sirius-db/sirius-worktrees/tools/ucx-install/lib",NIXL_PLUGIN_DIR = "/home/ubuntu/git/sirius-db/sirius-worktrees/tools/nvda_nixl/lib/x86_64-linux-gnu/plugins",UCX_TLS = "cuda_copy,cuda_ipc,tcp,self",SIRIUS_EXCHANGE_STAGING_BYTES = "1280MiB"}}
 
 # This demo project ships the StarRocks FE pre-packaged under starrocks/output/fe, so `cluster`
 # does not depend on `fe-build` (a multi-hour Maven build of the whole front end). Assert the
