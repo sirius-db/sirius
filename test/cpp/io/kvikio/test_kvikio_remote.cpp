@@ -18,7 +18,6 @@
 #include <io/kvikio/kvikio_context.hpp>
 #include <io/object_store_config.hpp>
 #include <io/sirius_datasource.hpp>
-
 #include <unistd.h>  // getpid
 
 #include <cstdint>
@@ -44,7 +43,11 @@ class scoped_temp_file {
     out.write(contents.data(), static_cast<std::streamsize>(contents.size()));
   }
 
-  ~scoped_temp_file() { std::error_code ec; std::filesystem::remove(_path, ec); }
+  ~scoped_temp_file()
+  {
+    std::error_code ec;
+    std::filesystem::remove(_path, ec);
+  }
 
   scoped_temp_file(scoped_temp_file const&)            = delete;
   scoped_temp_file& operator=(scoped_temp_file const&) = delete;

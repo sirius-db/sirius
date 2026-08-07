@@ -32,7 +32,7 @@ filtered_table gpu_ingestible::materialize_table(const op::scan::scan_operator_i
 {
   auto* mem_space = split.gpu_memory_space;
   if (split.has_scan_metadata()) [[likely]] {
-    split.prefetch(io::cache::prefetching_stage::disposable);
+    split.prefetch(io::cache::scan_stage::reading);
     auto materialized = materialize_metadata_to_table(split.get_scan_info(), *mem_space, stream);
     if (split.mvcc_keep_mask.has_mask()) {
       // Only insert-delta splits carry a visibility mask here; disk-walk

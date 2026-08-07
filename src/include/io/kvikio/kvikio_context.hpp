@@ -190,9 +190,9 @@ class kvikio_context final : public ioctx {
   [[nodiscard]] bool supports_device_read() const noexcept override { return true; }
   [[nodiscard]] bool supports_vector_host_read() const noexcept override { return false; }
   [[nodiscard]] bool supports_host_to_device_read() const noexcept override { return false; }
-  [[nodiscard]] cache::prefetching_stage preferred_prefetching_stage() const noexcept override
+  [[nodiscard]] cache::scan_stage preferred_prefetching_stage() const noexcept override
   {
-    return cache::prefetching_stage::none;
+    return cache::scan_stage::none;
   }
 
   /// kvikIO applies no physical block alignment of its own, so ranges pass

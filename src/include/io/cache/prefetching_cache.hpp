@@ -50,35 +50,50 @@ class memory_reservation_manager;
 
 namespace sirius::io::cache {
 
-enum class prefetching_handle_state { idle, active, cancelled };
+/// True when every chunk of @p chunks owns a staging buffer, i.e. its
+/// @c entry_state has reached @c allocated and has not been reclaimed since.
+/// This is the precondition of the producer's @c prepared stage.
+[[nodiscard]] inline bool all_chunks_have_buffers(const std::vector<cached_chunk*>& chunks) noexcept
+{
+  return std::ranges::all_of(chunks, [](const cached_chunk* c) {
+    auto const s = c->state.get_state();
+    return s >= entry_state::allocated && s != entry_state::evicting;
+  });
+}
 
 struct prefetch_request_context {
-  explicit prefetch_request_context(const io_object& file, std::uint32_t ts) noexcept
+  /// @p consumer_state is the consumer-side machine the owning handle drives;
+  /// the request only observes it.
+  explicit prefetch_request_context(const io_object& file,
+                                    std::uint32_t ts,
+                                    std::shared_ptr<const consumer_stage> consumer_state) noexcept
     : timestamp(ts),
       obj(file.shared_from_this()),
-      state(std::make_shared<entry_state>()),
-      user_state(
-        std::make_shared<std::atomic<prefetching_handle_state>>(prefetching_handle_state::idle))
+      producer(std::make_shared<producer_stage>()),
+      consumer(std::move(consumer_state))
   {
   }
 
+  /// True once the consumer has queued the scan (or moved past it) and has not
+  /// been disposed.
   [[nodiscard]] bool is_active() const noexcept
   {
-    return user_state &&
-           user_state->load(std::memory_order_acquire) == prefetching_handle_state::active;
+    if (!consumer) { return false; }
+    auto const s = consumer->get();
+    return s >= consumer_stage::queued && s != consumer_stage::disposed;
   }
 
+  /// True once the consumer is gone: no consumer machine, or it is disposed.
   [[nodiscard]] bool is_cancelled() const noexcept
   {
-    return !user_state ||
-           user_state->load(std::memory_order_acquire) == prefetching_handle_state::cancelled;
+    return !consumer || consumer->get() == consumer_stage::disposed;
   }
 
   const std::uint32_t timestamp;
   const std::shared_ptr<const io_object> obj;
-  std::shared_ptr<entry_state> state;
-  std::shared_ptr<std::atomic<prefetching_handle_state>> user_state;
-  std::vector<cached_chunk*> chunks;
+  std::shared_ptr<producer_stage> producer;
+  std::shared_ptr<const consumer_stage> consumer;
+  std::shared_ptr<const std::vector<cached_chunk*>> chunks;
   /// Preferred NUMA node for the staging buffers, derived from the requesting
   /// GPU's topology.  -1 means "no preference" (allocate from any arena).
   int preferred_numa{-1};
@@ -100,6 +115,13 @@ class prefetching_handle {
 
   [[nodiscard]] bool is_active() const noexcept;
 
+  /// The consumer-side state machine of the scan.  Mutable: the scan drives it.
+  [[nodiscard]] std::shared_ptr<consumer_stage> consumer() const noexcept;
+
+  /// The chunks of the underlying request.  Immutable and shared with the
+  /// cache's worker threads.  Null when the handle is empty.
+  [[nodiscard]] std::shared_ptr<const std::vector<cached_chunk*>> chunks() const noexcept;
+
   [[nodiscard]] std::shared_ptr<prefetch_request_context> get_context() const noexcept;
 
   explicit operator bool() const noexcept;
@@ -107,6 +129,10 @@ class prefetching_handle {
  private:
   friend class prefetching_cache;
   class prefetch_lifecycle_manager;
+
+  /// The producer-side state machine of the scan.  Const: the handle only
+  /// observes the progress the cache's worker threads make.
+  [[nodiscard]] std::shared_ptr<const producer_stage> producer() const noexcept;
 
   prefetching_handle(std::unique_ptr<prefetch_lifecycle_manager> mgr) noexcept;
 
@@ -125,7 +151,7 @@ class prefetching_handle {
 class prefetching_cache {
   // The cache only accepts new prefetch requests through
   // sirius_datasource::fadvise — that's the single entry point for the
-  // fadvise(speculative/immediate/disposable) protocol.  Friending the
+  // fadvise(scan_stage) protocol.  Friending the
   // datasource keeps insert() out of the public API while still letting
   // fadvise dispatch through it.
   friend class sirius::io::sirius_datasource;
@@ -200,6 +226,11 @@ class prefetching_cache {
     std::vector<std::unique_ptr<cached_chunk>> chunks;
     size_t file_size{0};
   };
+
+  /// Pop every request still sitting in @p queue and retire its producer on
+  /// @c producer_stage::abandoned, so a shutdown never leaves a request parked
+  /// in a transient stage with waiters asleep on it.
+  static void drain_and_abandon(request_queue_type& queue) noexcept;
 
   void prepare_loop(const std::stop_token& st);
   void prefetch_loop(const std::stop_token& st);

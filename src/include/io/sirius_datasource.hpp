@@ -117,32 +117,31 @@ class sirius_datasource : public cudf::io::datasource {
   ///
   /// The behaviour depends on @p site and the io_ctx's
   /// @c preferred_prefetching_stage:
-  ///   - @c speculative / @c immediate: only honored when @p site matches
-  ///     the ioctx's preferred mode.  Hands @p ranges to the prefetching
-  ///     cache and stashes the returned @c prefetching_handle on this
-  ///     datasource so a later @c fadvise(disposable) can cancel.
-  ///   - @c disposable: always honored.  If a handle is stored (i.e. a
-  ///     prior speculative/immediate call enqueued work), cancel it so the
-  ///     cache worker drops still-pending entries.
+  ///   - @c initialized / @c queued / @c preparing: only honored when @p site
+  ///     matches the ioctx's preferred stage.  Hands @p ranges to the
+  ///     prefetching cache and stashes the returned @c prefetching_handle on
+  ///     this datasource so a later @c fadvise(reading) can cancel.
+  ///   - @c reading: always honored.  If a handle is stored (i.e. a prior
+  ///     insert enqueued work), cancel it so the cache worker drops
+  ///     still-pending entries.
   ///   - @c none: no-op (either the call site asked for nothing, or the
   ///     backend opted out of prefetching).
   ///
-  /// Calling @c fadvise with a non-disposable @p site while a handle is
-  /// already stored emits a warning: the datasource lifecycle expects one
-  /// speculative-or-immediate insert per scan, with a single
-  /// @c disposable call at consume time.
+  /// Calling @c fadvise with a @p site other than @c reading while a handle
+  /// is already stored emits a warning: the datasource lifecycle expects one
+  /// insert per scan, with a single @c reading call at consume time.
   void fadvise(std::span<const cudf::io::text::byte_range_info> ranges, std::optional<int> dev_id);
 
-  void prefetch(cache::prefetching_stage site);
+  void prefetch(cache::scan_stage site);
 
   [[nodiscard]] bool uses_prefetching_cache() const noexcept;
 
  private:
   std::shared_ptr<ioctx> _io_ctx;
   std::shared_ptr<io_object> _io_object;
-  /// Handle of the most recent speculative/immediate insert into the
-  /// prefetching cache, or empty if none was made.  fadvise(disposable)
-  /// uses this to cancel still-pending work.
+  /// Handle of the most recent insert into the prefetching cache, or empty
+  /// if none was made.  fadvise(reading) uses this to cancel still-pending
+  /// work.
   cache::prefetching_handle _prefetch_handle;
 };
 

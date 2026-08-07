@@ -85,7 +85,7 @@ class scan_operator_input : public op::operator_data {
     return std::get<std::unique_ptr<scan_info>>(materialization_info)->fadvise_entries();
   }
 
-  void prefetch(io::cache::prefetching_stage site) const
+  void prefetch(io::cache::scan_stage site) const
   {
     if (!has_scan_metadata()) { return; }
     auto hints = get_fadvise_hints();

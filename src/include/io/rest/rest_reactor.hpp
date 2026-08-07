@@ -375,11 +375,11 @@ class rest_reactor {
   /// @c rest_ioctx::create_io_object.  Always throws.
   static std::unique_ptr<io_object_type> create_io_object(std::string path);
 
-  static constexpr cache::prefetching_stage preferred_prefetching_stage() noexcept
+  static constexpr cache::scan_stage preferred_prefetching_stage() noexcept
   {
     // Network round-trips are high-latency; read ahead on demand rather than
     // eagerly prefilling the whole working set.
-    return cache::prefetching_stage::just_in_time;
+    return cache::scan_stage::preparing;
   }
 
   /// REST has no physical block alignment, so this only coalesces overlapping /

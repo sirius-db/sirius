@@ -134,15 +134,15 @@ class ioctx : public std::enable_shared_from_this<ioctx> {
   /// Whether the backend can serve a batch of host reads in a single dispatch
   /// (cf. @c host_read_ranges_async_io).  When false, the prefetching layer
   /// cannot amortise per-request overhead and must fall back to
-  /// @c prefetching_stage::none.
+  /// @c scan_stage::none.
   [[nodiscard]] virtual bool supports_vector_host_read() const noexcept = 0;
 
   /// Prefetching strategy the prefetching layer should use against this
-  /// backend.  Returns @c prefetching_stage::none whenever
+  /// backend.  Returns @c scan_stage::none whenever
   /// @c supports_vector_host_read() is false; otherwise the backend picks
   /// between eager prefill and on-demand read-ahead based on its IO
   /// characteristics.
-  [[nodiscard]] virtual cache::prefetching_stage preferred_prefetching_stage() const noexcept = 0;
+  [[nodiscard]] virtual cache::scan_stage preferred_prefetching_stage() const noexcept = 0;
 
   /// Build the prefetching cache.  One-shot — calling twice is a no-op
   /// after the first successful build.  The cache holds a raw

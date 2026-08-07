@@ -192,10 +192,10 @@ void sirius_datasource::fadvise(std::span<const cudf::io::text::byte_range_info>
   auto* cache = _io_ctx->cache();
   if (cache == nullptr || !_io_ctx->can_use_prefetching_cache()) { return; }
 
-  // The contract is "one scan, one datasource": a second
-  // speculative/immediate fadvise on a datasource that already carries a
-  // handle is a caller bug.  Warn loudly; cancel the stale handle so the
-  // worker drops the old request and we don't leak both into the cache.
+  // The contract is "one scan, one datasource": a second inserting fadvise on
+  // a datasource that already carries a handle is a caller bug.  Warn loudly;
+  // cancel the stale handle so the worker drops the old request and we don't
+  // leak both into the cache.
   if (_prefetch_handle) {
     if (_prefetch_handle.is_active()) {
       SIRIUS_LOG_WARN(
@@ -215,16 +215,26 @@ void sirius_datasource::fadvise(std::span<const cudf::io::text::byte_range_info>
   if (handle) { _prefetch_handle = std::move(handle); }
 }
 
-void sirius_datasource::prefetch(cache::prefetching_stage site)
+void sirius_datasource::prefetch(cache::scan_stage site)
 {
   auto const preferred = _io_ctx->preferred_prefetching_stage();
-  if (preferred == cache::prefetching_stage::none) { return; }
-  if (_prefetch_handle) {
-    if (site == cache::prefetching_stage::disposable) {
-      _prefetch_handle.cancel();
-    } else if (site == preferred) {
-      _prefetch_handle.activate();
+  if (preferred == cache::scan_stage::none) { return; }
+  if (!_prefetch_handle) { return; }
+
+  auto consumer = _prefetch_handle.consumer();
+  if (consumer) {
+    switch (site) {
+      case cache::scan_stage::queued: std::ignore = consumer->mark_queued(); break;
+      case cache::scan_stage::preparing: std::ignore = consumer->mark_preparing(); break;
+      case cache::scan_stage::reading: std::ignore = consumer->mark_reading(); break;
+      default: break;
     }
+  }
+
+  if (site == cache::scan_stage::reading) {
+    _prefetch_handle.cancel();
+  } else if (site == preferred) {
+    _prefetch_handle.activate();
   }
 }
 

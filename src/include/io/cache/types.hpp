@@ -48,17 +48,16 @@
 namespace sirius::io::cache {
 
 /**
- * @brief How the prefetching layer should behave on top of a given backend.
+ * @brief Stage of a scan's consumer-visible lifecycle.
  *
- * - @c none: no prefetching.  Either the backend does not support vector host
- *   reads (so the prefetcher cannot batch range requests cheaply) or the
- *   backend explicitly opted out.
- * - @c immediate: prefill the cache ahead of consumer demand.
- * - @c opportunistic: read-ahead on demand — issue extra IO only when triggered by a
- *   consumer read.
- * - @c disposable: prefetching is temporary and can be discarded when no longer needed.
+ * - @c none: the backend opted out of prefetching.
+ * - @c initialized: the scan's ranges are known but no work is queued yet.
+ * - @c queued: the ranges are queued with the prefetching layer.
+ * - @c preparing: the IO for the ranges is being prepared.
+ * - @c reading: the consumer is reading the ranges.
+ * - @c disposed: the scan is cancelled or finished; its work can be dropped.
  */
-enum class prefetching_stage { none, opportunistic, immediate, just_in_time, disposable };
+enum class scan_stage { none, initialized, queued, preparing, reading, disposed };
 
 // ---------------------------------------------------------------------------
 // buffer_pool — growable pool of pinned chunks
@@ -339,6 +338,201 @@ class entry_state {
   static constexpr uint32_t unpack_pins(uint32_t v) noexcept { return v >> PIN_SHIFT; }
 
   std::atomic<uint32_t> _packed{pack(empty, 0)};
+};
+
+// ---------------------------------------------------------------------------
+// producer_stage — atomic state of the producer side of a scan
+// ---------------------------------------------------------------------------
+//
+// Single atomic uint32_t holding the current state.  Forward transitions are
+// *monotone-max*: `mark_x()` succeeds iff the current state is strictly earlier
+// than x, and then CASes straight to x — intermediate stages may be skipped.
+// It returns false when the state already is at or past x, so the state can
+// never move backwards and a skipped stage cannot wedge the machine.
+//
+//   < queued    ──mark_queued()──►      queued
+//   < preparing ──mark_preparing()──►   preparing
+//   < prepared  ──mark_prepared()──►    prepared
+//   < loading   ──mark_loading()──►     loading
+//   < ready     ──mark_ready()──►       ready
+//   any         ──mark_abandoned()──►   abandoned       (request dropped)
+//
+// The one exception is the backward IO-failure revert, which stays an exact
+// precondition CAS:
+//
+//   loading     ──mark_load_failed()──► prepared        (IO failure revert)
+//
+// `preparing` and `loading` are the two wait points: waiters park in
+// wait_for_prepared() / wait_for_ready() until the state moves on, and each
+// reports whether its target was actually reached.  `abandoned` is terminal and
+// exists so that every path which drops a request can leave the producer in a
+// non-transient, notified state instead of stranding waiters.
+
+class producer_stage {
+ public:
+  enum value : uint32_t {
+    initialized = 0,
+    queued      = 1,
+    preparing   = 2,
+    prepared    = 3,
+    loading     = 4,
+    ready       = 5,
+    abandoned   = 6,  ///< terminal: the request was dropped before completing
+  };
+
+  producer_stage() noexcept = default;
+
+  /// Current state.
+  [[nodiscard]] value get() const noexcept
+  {
+    return static_cast<value>(_packed.load(std::memory_order_acquire));
+  }
+
+  /// → queued.  Returns false if the state is already at or past @c queued.
+  [[nodiscard]] bool mark_queued() noexcept { return advance(queued); }
+
+  /// → preparing.  Returns false if the state is already at or past @c preparing.
+  [[nodiscard]] bool mark_preparing() noexcept { return advance(preparing); }
+
+  /// → prepared.  Wakes threads parked in @c wait_for_prepared().  Returns
+  /// false if the state is already at or past @c prepared.
+  [[nodiscard]] bool mark_prepared() noexcept { return advance_and_notify(prepared); }
+
+  /// → loading.  Returns false if the state is already at or past @c loading.
+  [[nodiscard]] bool mark_loading() noexcept { return advance(loading); }
+
+  /// → ready.  Wakes threads parked in @c wait_for_ready().  Returns false if
+  /// the state is already at or past @c ready.
+  [[nodiscard]] bool mark_ready() noexcept { return advance_and_notify(ready); }
+
+  /// loading → prepared (IO-failure revert).  The only backward transition, so
+  /// it keeps an exact precondition CAS and returns false from any other state.
+  /// Wakes threads parked in @c wait_for_ready().
+  [[nodiscard]] bool mark_load_failed() noexcept
+  {
+    auto expected = static_cast<uint32_t>(loading);
+    bool ok       = _packed.compare_exchange_strong(
+      expected, static_cast<uint32_t>(prepared), std::memory_order_acq_rel);
+    if (ok) { _packed.notify_all(); }
+    return ok;
+  }
+
+  /// any → abandoned (the request was dropped).  Always succeeds and always
+  /// wakes threads parked in @c wait_for_prepared() / @c wait_for_ready().
+  void mark_abandoned() noexcept
+  {
+    _packed.exchange(static_cast<uint32_t>(abandoned), std::memory_order_acq_rel);
+    _packed.notify_all();
+  }
+
+  /// Block while the state is @c preparing.  Returns true iff the request
+  /// reached @c prepared (or beyond), false if it was abandoned.
+  [[nodiscard]] bool wait_for_prepared() noexcept
+  {
+    auto const st = wait_while(preparing);
+    return st >= prepared && st != abandoned;
+  }
+
+  /// Block while the state is @c loading.  Returns true iff the load succeeded
+  /// (@c ready), false if it failed back to @c prepared or was abandoned.
+  [[nodiscard]] bool wait_for_ready() noexcept { return wait_while(loading) == ready; }
+
+ private:
+  bool advance(value to) noexcept
+  {
+    uint32_t cur = _packed.load(std::memory_order_acquire);
+    while (cur < static_cast<uint32_t>(to)) {
+      if (_packed.compare_exchange_weak(
+            cur, static_cast<uint32_t>(to), std::memory_order_acq_rel, std::memory_order_acquire)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  bool advance_and_notify(value to) noexcept
+  {
+    bool ok = advance(to);
+    if (ok) { _packed.notify_all(); }
+    return ok;
+  }
+
+  value wait_while(value st) noexcept
+  {
+    uint32_t cur = _packed.load(std::memory_order_acquire);
+    while (cur == static_cast<uint32_t>(st)) {
+      _packed.wait(cur, std::memory_order_relaxed);
+      cur = _packed.load(std::memory_order_acquire);
+    }
+    return static_cast<value>(cur);
+  }
+
+  std::atomic<uint32_t> _packed{static_cast<uint32_t>(initialized)};
+};
+
+// ---------------------------------------------------------------------------
+// consumer_stage — atomic state of the consumer side of a scan
+// ---------------------------------------------------------------------------
+//
+// Mirrors the consumer-visible values of @c scan_stage.  Forward transitions
+// are *monotone-max*, exactly as in @c producer_stage: `mark_x()` succeeds iff
+// the current state is strictly earlier than x and then CASes straight to x, so
+// stages may be skipped but the state never moves backwards.  `disposed` is the
+// last value, hence reachable from every state — cancellation can happen at any
+// time.
+//
+//   < queued    ──mark_queued()──►     queued
+//   < preparing ──mark_preparing()──►  preparing
+//   < reading   ──mark_reading()──►    reading
+//   any         ──mark_disposed()──►   disposed
+
+class consumer_stage {
+ public:
+  enum value : uint32_t {
+    initialized = 0,
+    queued      = 1,
+    preparing   = 2,
+    reading     = 3,
+    disposed    = 4,
+  };
+
+  consumer_stage() noexcept = default;
+
+  /// Current state.
+  [[nodiscard]] value get() const noexcept
+  {
+    return static_cast<value>(_packed.load(std::memory_order_acquire));
+  }
+
+  /// → queued.  Returns false if the state is already at or past @c queued.
+  [[nodiscard]] bool mark_queued() noexcept { return advance(queued); }
+
+  /// → preparing.  Returns false if the state is already at or past @c preparing.
+  [[nodiscard]] bool mark_preparing() noexcept { return advance(preparing); }
+
+  /// → reading.  Returns false if the state is already at or past @c reading.
+  [[nodiscard]] bool mark_reading() noexcept { return advance(reading); }
+
+  /// any → disposed (cancellation).  Always succeeds.
+  void mark_disposed() noexcept
+  {
+    _packed.exchange(static_cast<uint32_t>(disposed), std::memory_order_acq_rel);
+  }
+
+ private:
+  bool advance(value to) noexcept
+  {
+    uint32_t cur = _packed.load(std::memory_order_acquire);
+    while (cur < static_cast<uint32_t>(to)) {
+      if (_packed.compare_exchange_weak(
+            cur, static_cast<uint32_t>(to), std::memory_order_acq_rel, std::memory_order_acquire)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  std::atomic<uint32_t> _packed{static_cast<uint32_t>(initialized)};
 };
 
 struct alignas(64) chunk_lifecycle {

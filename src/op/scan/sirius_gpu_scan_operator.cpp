@@ -196,7 +196,7 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::get_next_task_input
   auto next = _split_connector->get_next_split();
   if (!next.has_value()) { return nullptr; }
   if (auto* scan_input = dynamic_cast<scan_operator_input*>(next->get()); scan_input) {
-    scan_input->prefetch(io::cache::prefetching_stage::immediate);
+    scan_input->prefetch(io::cache::scan_stage::queued);
   }
   return std::move(*next);
 }

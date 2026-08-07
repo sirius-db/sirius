@@ -108,7 +108,7 @@ void load_balancing_scan_batch_coalescer::process_provider_inputs(metadata_proce
         }
       }
     }
-    op_data->prefetch(io::cache::prefetching_stage::opportunistic);
+    op_data->prefetch(io::cache::scan_stage::initialized);
     state.connector->push_split(std::move(op_data));
   };
 
@@ -204,7 +204,7 @@ void load_balancing_scan_batch_coalescer::drain_cached_provider(databatch_provid
             hint.datasource->fadvise(hint.ranges, device);
           }
         }
-        split->prefetch(io::cache::prefetching_stage::opportunistic);
+        split->prefetch(io::cache::scan_stage::initialized);
         connector.push_split(std::move(split));
         continue;
       }
