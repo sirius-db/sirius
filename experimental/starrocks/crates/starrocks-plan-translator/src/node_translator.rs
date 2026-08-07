@@ -1217,21 +1217,46 @@ fn translate_sort(
         .as_ref()
         .or(sort.sort_tuple_slot_exprs.as_ref());
     let input = if let Some(slot_exprs) = sort_tuple_slot_exprs.filter(|exprs| !exprs.is_empty()) {
-        let expected = ctx.desc.materialized_slot_ids(sort_tuple)?.len();
-        if slot_exprs.len() != expected {
+        let materialized = ctx.desc.materialized_slot_ids(sort_tuple)?;
+        if slot_exprs.len() != materialized.len() {
             return Err(TranslateError::descriptor(format!(
                 "SORT_NODE {} materializes {} exprs for sort tuple {} with {} slots",
                 node.node_id,
                 slot_exprs.len(),
                 sort_tuple,
-                expected
+                materialized.len()
             )));
         }
-        let mut expressions = Vec::with_capacity(slot_exprs.len());
-        for expr in slot_exprs {
+        // The FE lists the materialization expressions with the ordering keys first, but every
+        // consumer of the sort tuple resolves its columns through the descriptor's materialized
+        // slot order: the ordering slot refs below, this fragment's output names and sink row,
+        // and the receiving fragment's exchange schema on the other side of the wire. So the
+        // projection is emitted in materialized-slot order -- the sender is reordered to the
+        // one order all consumers already use. The alternative (overriding the receiver's
+        // declared stream schema to the FE list order) would satisfy the wire-schema guard and
+        // then feed every downstream slot reference, which still resolves through the
+        // descriptor order, the wrong column -- silently.
+        let fe_slot_order = sort_materialization_order(
+            node,
+            &sort.sort_info.ordering_exprs,
+            sort_tuple,
+            &materialized,
+        )?;
+        let mut translated_by_slot = std::collections::HashMap::with_capacity(slot_exprs.len());
+        for (slot_id, expr) in fe_slot_order.iter().zip(slot_exprs) {
             let mut expr_ctx = ctx.expr_context(&child.row_tuples);
-            expressions.push(expr.translate(&mut expr_ctx)?);
+            translated_by_slot.insert(*slot_id, expr.translate(&mut expr_ctx)?);
         }
+        let expressions = materialized
+            .iter()
+            .map(|slot_id| {
+                translated_by_slot.remove(slot_id).ok_or_else(|| {
+                    TranslateError::descriptor(format!(
+                        "sort tuple {sort_tuple} slot {slot_id} has no materialization expression"
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
         project_rel(child, expressions, vec![sort_tuple])
     } else {
         child
@@ -1252,6 +1277,65 @@ fn translate_sort(
         output_width,
     };
     apply_conjuncts(sorted, node, ctx)
+}
+
+/// Pairs each `sort_tuple_slot_exprs` entry with the sort-tuple slot it materializes,
+/// returning the slot ids in the FE's expression-list order.
+///
+/// The FE builds the sort tuple in two passes (`PlanFragmentBuilder.buildPartialTopNFragment`):
+/// one slot per ordering key first, then one slot per remaining output column in ascending
+/// slot-id order; `sort_tuple_slot_exprs` is appended in the same two passes. Each ordering
+/// expression is a bare slot ref naming the sort-tuple slot its key fills, and the payload
+/// slots are exactly the materialized slots left over -- which `materialized` already lists in
+/// ascending slot-id order, because the FE serializes every sort-tuple slot with column_pos -1.
+fn sort_materialization_order(
+    node: &TPlanNode,
+    ordering_exprs: &[TExpr],
+    sort_tuple: i32,
+    materialized: &[i32],
+) -> Result<Vec<i32>> {
+    let mut order = Vec::with_capacity(materialized.len());
+    for expr in ordering_exprs {
+        let slot_id =
+            sort_tuple_slot_id(expr, sort_tuple).ok_or(TranslateError::UnsupportedPlanNode {
+                node_id: node.node_id,
+                node_type: node.node_type,
+                reason: "a sort ordering expression that is not a slot ref into the sort tuple \
+                         leaves the materialized column order unrecoverable",
+            })?;
+        order.push(slot_id);
+    }
+    let payload_slots = materialized
+        .iter()
+        .copied()
+        .filter(|slot_id| !order.contains(slot_id))
+        .collect::<Vec<_>>();
+    order.extend(payload_slots);
+    // Equal lengths make `order` a permutation of `materialized`: a duplicate ordering key or a
+    // key outside the tuple both inflate it. Anything but a permutation means the FE laid the
+    // tuple out differently than the two-pass model above, and reordering on a wrong model
+    // would ship wrong columns.
+    if order.len() != materialized.len() {
+        return Err(TranslateError::descriptor(format!(
+            "SORT_NODE {} ordering keys pair with slots {order:?}, but sort tuple {sort_tuple} \
+             materializes slots {materialized:?}",
+            node.node_id
+        )));
+    }
+    Ok(order)
+}
+
+/// Returns the sort-tuple slot a sort ordering expression names, if it is a bare slot ref into
+/// that tuple.
+fn sort_tuple_slot_id(expr: &TExpr, sort_tuple: i32) -> Option<i32> {
+    let [node] = expr.nodes.as_slice() else {
+        return None;
+    };
+    if node.node_type != starrocks_thrift::exprs::TExprNodeType::SLOT_REF {
+        return None;
+    }
+    let slot_ref = node.slot_ref.as_ref()?;
+    (slot_ref.tuple_id == sort_tuple).then_some(slot_ref.slot_id)
 }
 
 /// Builds Substrait sort fields from a StarRocks sort-info payload against `input`'s row layout.

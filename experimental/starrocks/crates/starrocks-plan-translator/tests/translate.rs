@@ -3236,6 +3236,161 @@ fn sort_with_limit_becomes_project_sort_fetch() {
     };
 }
 
+/// Descriptor for the cross-fragment sort-order tests: scan tuple 0 = {o_orderdate DATE,
+/// revenue DOUBLE}; sort tuple 1 re-materializes both with column_pos -1 (as the FE always
+/// serializes sort-tuple slots), so its materialized order is ascending slot id:
+/// [3 o_orderdate, 5 revenue].
+fn sort_wire_desc() -> TDescriptorTable {
+    desc_table(
+        vec![(0, Some(100)), (1, None)],
+        vec![
+            slot(1, 0, 0, "o_orderdate", scalar_type(TPrimitiveType::DATE)),
+            slot(2, 0, 1, "revenue", scalar_type(TPrimitiveType::DOUBLE)),
+            slot(3, 1, -1, "o_orderdate", scalar_type(TPrimitiveType::DATE)),
+            slot(5, 1, -1, "revenue", scalar_type(TPrimitiveType::DOUBLE)),
+        ],
+    )
+}
+
+/// Builds a SORT_NODE over sort tuple 1 with the given ordering and materialization exprs.
+fn sort_node_over_tuple_1(ordering: Vec<TExpr>, slot_exprs: Vec<TExpr>) -> TPlanNode {
+    let directions = vec![false; ordering.len()];
+    let sort_info = TSortInfo::new(ordering, directions.clone(), directions, Some(slot_exprs));
+    let mut sort = base_plan_node(1, TPlanNodeType::SORT_NODE, 1, vec![1]);
+    sort.sort_node = Some(TSortNode::new(
+        sort_info, false, None, None, None, None, None, None, None, None, None, None, None, None,
+        None, None, None, None, None, None, None, None, None, None, None,
+    ));
+    sort
+}
+
+/// The projected field indices of the sort-tuple materialization, in output order.
+fn sort_projection_fields(translated: &TranslatedPlan) -> Vec<i32> {
+    let root = root(&translated.plan);
+    let rel::RelType::Sort(sort) = root.input.as_ref().unwrap().rel_type.as_ref().unwrap() else {
+        panic!("expected sort relation");
+    };
+    let rel::RelType::Project(project) = sort.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected sort-tuple projection under sort");
+    };
+    project.expressions.iter().map(field_index).collect()
+}
+
+/// An ORDER BY whose key (`revenue`, a measure) is not the sort tuple's leading slot: the FE
+/// lists the key's materialization first, but the wire row must ship in the tuple's
+/// materialized slot order, because that is the order the receiving fragment declares its
+/// stream with. This is the q03/q05 shape ("stream N column 0 is declared DATE but the source
+/// sink produces DOUBLE").
+#[test]
+fn order_by_on_a_non_leading_sort_slot_ships_tuple_slot_order() {
+    // FE list order: the ordering key `revenue` (child field 1) first, then `o_orderdate`.
+    let sort = sort_node_over_tuple_1(
+        vec![slot_ref(5, 1, scalar_type(TPrimitiveType::DOUBLE))],
+        vec![
+            slot_ref(2, 0, scalar_type(TPrimitiveType::DOUBLE)),
+            slot_ref(1, 0, scalar_type(TPrimitiveType::DATE)),
+        ],
+    );
+    let sender = translate_fragment(&params(
+        Some(TPlan::new(vec![sort, scan_node(0, 0)])),
+        Some(sort_wire_desc()),
+        None,
+    ))
+    .unwrap();
+
+    // The sender ships materialized-slot order: o_orderdate (child field 0) leads.
+    assert_eq!(sort_projection_fields(&sender), vec![0, 1]);
+    assert_eq!(sender.output_names, vec!["o_orderdate", "revenue"]);
+    // The ORDER BY key still resolves to `revenue`, now at column 1 of the shipped row.
+    let root = root(&sender.plan);
+    let rel::RelType::Sort(sort) = root.input.as_ref().unwrap().rel_type.as_ref().unwrap() else {
+        panic!("expected sort relation");
+    };
+    assert_eq!(sort.sorts.len(), 1);
+    assert_eq!(field_index(sort.sorts[0].expr.as_ref().unwrap()), 1);
+    assert_eq!(
+        sort.sorts[0].sort_kind,
+        Some(substrait::proto::sort_field::SortKind::Direction(
+            substrait::proto::sort_field::SortDirection::DescNullsLast as i32
+        ))
+    );
+
+    // The receiving fragment reads the same sort tuple through an exchange.
+    let mut exchange = base_plan_node(14, TPlanNodeType::EXCHANGE_NODE, 0, vec![1]);
+    exchange.exchange_node = Some(TExchangeNode::new(
+        vec![1],
+        None,
+        None,
+        Some(TPartitionType::UNPARTITIONED),
+        Some(true),
+        None,
+    ));
+    let receiver = PlanTranslator::new()
+        .translate_fragment_with_exchange_inputs(
+            &params(
+                Some(TPlan::new(vec![exchange])),
+                Some(sort_wire_desc()),
+                None,
+            ),
+            &[ExchangeInput {
+                node_id: 14,
+                stream_view: "sirius_stream_14".to_string(),
+                names: sender.output_names.clone(),
+            }],
+        )
+        .unwrap();
+
+    // Column-for-column: what the sender produces is what the receiver declares.
+    // Sender column types come from mapping each projected field into the scan row
+    // (field 0 = o_orderdate DATE, field 1 = revenue DOUBLE).
+    let scan_types = ["DATE", "DOUBLE"];
+    let produced = sort_projection_fields(&sender)
+        .into_iter()
+        .zip(&sender.output_names)
+        .map(|(field, name)| (name.as_str(), scan_types[field as usize]))
+        .collect::<Vec<_>>();
+    let declared = receiver.stream_inputs[0]
+        .columns
+        .iter()
+        .map(|column| (column.name.as_str(), column.ty.as_str()))
+        .collect::<Vec<_>>();
+    assert_eq!(produced, declared);
+    assert_eq!(
+        declared,
+        vec![("o_orderdate", "DATE"), ("revenue", "DOUBLE")]
+    );
+}
+
+/// Control: an ORDER BY on the leading sort-tuple slot already lists the materialization in
+/// slot order, so the projection is the identity mapping and nothing moves.
+#[test]
+fn order_by_on_the_leading_sort_slot_keeps_slot_order() {
+    // FE list order: the ordering key `o_orderdate` (child field 0) first -- which is also the
+    // sort tuple's leading materialized slot.
+    let sort = sort_node_over_tuple_1(
+        vec![slot_ref(3, 1, scalar_type(TPrimitiveType::DATE))],
+        vec![
+            slot_ref(1, 0, scalar_type(TPrimitiveType::DATE)),
+            slot_ref(2, 0, scalar_type(TPrimitiveType::DOUBLE)),
+        ],
+    );
+    let sender = translate_fragment(&params(
+        Some(TPlan::new(vec![sort, scan_node(0, 0)])),
+        Some(sort_wire_desc()),
+        None,
+    ))
+    .unwrap();
+
+    assert_eq!(sort_projection_fields(&sender), vec![0, 1]);
+    assert_eq!(sender.output_names, vec!["o_orderdate", "revenue"]);
+    let root = root(&sender.plan);
+    let rel::RelType::Sort(sort) = root.input.as_ref().unwrap().rel_type.as_ref().unwrap() else {
+        panic!("expected sort relation");
+    };
+    assert_eq!(field_index(sort.sorts[0].expr.as_ref().unwrap()), 0);
+}
+
 /// Two-table descriptor for join tests: tuple 0 = users(`a`), tuple 1 = orders(`b`).
 fn join_desc() -> TDescriptorTable {
     desc_table(
