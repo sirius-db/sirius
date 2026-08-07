@@ -185,6 +185,19 @@ class task_scheduler {
   void complete_query_if_finished();
 
   /**
+   * @brief Fail the running query as stalled.
+   *
+   * Reports an error through the completion handler (first-call-wins: a query that completes
+   * concurrently keeps its real outcome) WITHOUT stopping the scheduler or draining executors —
+   * draining after an error belongs to the engine's execute() catch path, which observes the
+   * failed future. Called from the engine thread by the opt-in query watchdog (see
+   * sirius_engine::execute); never from the task creator's manager thread.
+   *
+   * @param stalled_secs How long the watchdog observed no scheduling progress, for the message.
+   */
+  void fail_stalled_query(uint64_t stalled_secs);
+
+  /**
    * @brief Drain all in-flight tasks after a query error.
    *
    * Drains the top-level task queue and waits for each GPU executor to finish

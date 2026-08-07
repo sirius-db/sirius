@@ -40,6 +40,7 @@ using sirius::op::build_probe_action;
 using sirius::op::build_probe_slot_view;
 using sirius::op::compute_hash_join_partition_strategy;
 using sirius::op::HASH_JOIN_MODE;
+using sirius::op::never_buildable_slots;
 using sirius::op::partition_strategy;
 using sirius::op::select_build_probe_action;
 
@@ -581,5 +582,54 @@ TEST_CASE("broadcast_slots_to_discard - a DESTROYED slot is not rediscarded", "[
       slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, true, false),
     },
     /*probe_finished=*/true);
+  REQUIRE(d == std::vector<std::size_t>{1});
+}
+
+//===----------------------------------------------------------------------===//
+// never_buildable_slots
+//===----------------------------------------------------------------------===//
+
+TEST_CASE("never_buildable_slots - nothing is unbuildable until the build side finishes",
+          "[build_probe]")
+{
+  // The build batch simply hasn't arrived yet; the slot must keep waiting.
+  auto const d = never_buildable_slots(
+    {
+      slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, false, true),
+      slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, false, false),
+    },
+    /*build_finished=*/false);
+  REQUIRE(d.empty());
+}
+
+TEST_CASE("never_buildable_slots - a finished-and-empty build side flags every waiting slot",
+          "[build_probe]")
+{
+  // The exchange wedge: the build pipeline finished with ZERO batches (every build row hashed to
+  // another instance), so a NOT_BUILT slot with no build batch can never be built — with or
+  // without probe data parked.
+  auto const d = never_buildable_slots(
+    {
+      slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, false, true),
+      slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, false, false),
+    },
+    /*build_finished=*/true);
+  REQUIRE(d == std::vector<std::size_t>{0, 1});
+}
+
+TEST_CASE("never_buildable_slots - slots with a build batch or past NOT_BUILT are untouched",
+          "[build_probe]")
+{
+  // p0: has its build batch -> will be built normally.  p1: never-buildable.  p2: build in
+  // flight.  p3: already built.  p4: already torn down.
+  auto const d = never_buildable_slots(
+    {
+      slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, true, true),
+      slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, false, true),
+      slot(BUILD_HASH_TABLE_STATE::SCHEDULED, false, false),
+      slot(BUILD_HASH_TABLE_STATE::BUILT, false, true),
+      slot(BUILD_HASH_TABLE_STATE::DESTROYED, false, false),
+    },
+    /*build_finished=*/true);
   REQUIRE(d == std::vector<std::size_t>{1});
 }

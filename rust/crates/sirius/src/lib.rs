@@ -1933,6 +1933,191 @@ mod tests {
         assert!(rows.is_empty(), "an empty stream yields no rows: {rows:?}");
     }
 
+    /// An inner join of two input streams, the shape the CN builds for a shuffle join:
+    /// `Join[Inner, equal($0, $2)]` over `Read stream_0` (probe) and `Read stream_1` (build).
+    fn inner_join_streams_plan() -> Vec<u8> {
+        use substrait::proto::expression::field_reference::{ReferenceType as RefType, RootType};
+        use substrait::proto::expression::reference_segment::ReferenceType as SegmentType;
+        use substrait::proto::expression::{
+            FieldReference, ReferenceSegment, RexType, ScalarFunction, field_reference,
+            reference_segment,
+        };
+        use substrait::proto::extensions::{
+            SimpleExtensionDeclaration, SimpleExtensionUrn, simple_extension_declaration,
+        };
+        use substrait::proto::function_argument::ArgType;
+        use substrait::proto::read_rel::{NamedTable, ReadType};
+        use substrait::proto::{
+            Expression, FunctionArgument, JoinRel, NamedStruct, Plan, PlanRel, ReadRel, Rel,
+            RelRoot, Type, join_rel, plan_rel, rel, r#type,
+        };
+
+        let i64_ty = || Type {
+            kind: Some(r#type::Kind::I64(r#type::I64 {
+                type_variation_reference: 0,
+                nullability: r#type::Nullability::Nullable as i32,
+            })),
+        };
+        let varchar = || Type {
+            kind: Some(r#type::Kind::String(r#type::String {
+                type_variation_reference: 0,
+                nullability: r#type::Nullability::Nullable as i32,
+            })),
+        };
+        let stream_read = |stream_id: u64, names: [&str; 2]| Rel {
+            rel_type: Some(rel::RelType::Read(Box::new(ReadRel {
+                base_schema: Some(NamedStruct {
+                    names: names.iter().map(|name| name.to_string()).collect(),
+                    r#struct: Some(r#type::Struct {
+                        types: vec![i64_ty(), varchar()],
+                        type_variation_reference: 0,
+                        nullability: r#type::Nullability::Required as i32,
+                    }),
+                }),
+                read_type: Some(ReadType::NamedTable(NamedTable {
+                    names: vec![super::stream_view_name(stream_id)],
+                    ..Default::default()
+                })),
+                ..Default::default()
+            }))),
+        };
+        let field = |index: i32| Expression {
+            rex_type: Some(RexType::Selection(Box::new(FieldReference {
+                reference_type: Some(RefType::DirectReference(ReferenceSegment {
+                    reference_type: Some(SegmentType::StructField(Box::new(
+                        reference_segment::StructField {
+                            field: index,
+                            child: None,
+                        },
+                    ))),
+                })),
+                root_type: Some(RootType::RootReference(field_reference::RootReference {})),
+            }))),
+        };
+        // The equality condition over the combined row: probe key $0 = build key $2.
+        let condition = Expression {
+            rex_type: Some(RexType::ScalarFunction(ScalarFunction {
+                function_reference: 1,
+                arguments: [field(0), field(2)]
+                    .into_iter()
+                    .map(|expr| FunctionArgument {
+                        arg_type: Some(ArgType::Value(expr)),
+                    })
+                    .collect(),
+                output_type: Some(Type {
+                    kind: Some(r#type::Kind::Bool(r#type::Boolean {
+                        type_variation_reference: 0,
+                        nullability: r#type::Nullability::Nullable as i32,
+                    })),
+                }),
+                ..Default::default()
+            })),
+        };
+        let join = Rel {
+            rel_type: Some(rel::RelType::Join(Box::new(JoinRel {
+                left: Some(Box::new(stream_read(0, ["id", "name"]))),
+                right: Some(Box::new(stream_read(1, ["rid", "rname"]))),
+                expression: Some(Box::new(condition)),
+                r#type: join_rel::JoinType::Inner as i32,
+                ..Default::default()
+            }))),
+        };
+        Plan {
+            extension_urns: vec![SimpleExtensionUrn {
+                extension_urn_anchor: 1,
+                urn: "extension:io.substrait:functions_comparison".to_string(),
+            }],
+            extensions: vec![SimpleExtensionDeclaration {
+                mapping_type: Some(
+                    simple_extension_declaration::MappingType::ExtensionFunction(
+                        simple_extension_declaration::ExtensionFunction {
+                            extension_urn_reference: 1,
+                            function_anchor: 1,
+                            name: "equal".to_string(),
+                        },
+                    ),
+                ),
+            }],
+            relations: vec![PlanRel {
+                rel_type: Some(plan_rel::RelType::Root(RelRoot {
+                    input: Some(join),
+                    names: ["id", "name", "rid", "rname"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                })),
+            }],
+            ..Default::default()
+        }
+        .encode_to_vec()
+    }
+
+    /// A shuffle join's build stream can end with ZERO batches on one instance — every build row
+    /// hashed to the other compute node (TPC-H q02's one-row region build does exactly this).
+    /// The join must return no rows and, crucially, must TERMINATE: before the never-buildable
+    /// fix the BUILD_PROBE state machine answered wait_for_build forever and the engine thread
+    /// wedged in run(), silently, holding the query lifecycle. Running a second fragment on the
+    /// same context proves the lifecycle closed and the engine is not head-of-line blocked.
+    /// Requires a GPU.
+    #[test]
+    fn inner_join_over_an_empty_build_stream_terminates() {
+        let _guard = GPU_CONTEXT_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let joined = under_watchdog("empty build stream inner join".to_string(), || {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("users.parquet");
+            write_users_parquet(&path);
+            let probe_plan = local_files_plan(
+                path.to_str().unwrap(),
+                vec!["id".to_string(), "name".to_string()],
+            );
+
+            let ctx = SiriusContext::new().expect("bring up sirius context");
+            let run_join = |ctx: &SiriusContext| -> Result<usize, String> {
+                let mut probe_sender = ctx.fragment().map_err(|err| err.to_string())?;
+                probe_sender
+                    .declare_output(0)
+                    .map_err(|err| err.to_string())?;
+                probe_sender
+                    .build(&probe_plan)
+                    .map_err(|err| err.to_string())?;
+                probe_sender.run().map_err(|err| err.to_string())?;
+
+                let mut join = ctx.fragment().map_err(|err| err.to_string())?;
+                for (stream, id, name) in [(0, "id", "name"), (1, "rid", "rname")] {
+                    join.declare_input_column(stream, id, "BIGINT")
+                        .map_err(|err| err.to_string())?;
+                    join.declare_input_column(stream, name, "VARCHAR")
+                        .map_err(|err| err.to_string())?;
+                }
+                join.build(&inner_join_streams_plan())
+                    .map_err(|err| err.to_string())?;
+                let moved = join
+                    .relay_from(&mut probe_sender, 0, 0, 0)
+                    .map_err(|err| err.to_string())?;
+                assert!(moved > 0, "the probe fragment parked no batches");
+                // The build side ends without ever carrying a batch.
+                join.close_input(1, 0).map_err(|err| err.to_string())?;
+                join.run().map_err(|err| err.to_string())?;
+                join.into_arrow()
+                    .map(|result| {
+                        result
+                            .batches
+                            .iter()
+                            .map(arrow_array::RecordBatch::num_rows)
+                            .sum()
+                    })
+                    .map_err(|err| err.to_string())
+            };
+            let first = run_join(&ctx)?;
+            // The lifecycle must have closed: a second query on the same engine must not block.
+            let second = run_join(&ctx)?;
+            Ok((first, second))
+        });
+        assert_eq!(joined, (0, 0), "an empty build side joins to no rows");
+    }
+
     /// A hash fan-out can leave one compute node's partition empty; the merge fragment there
     /// must still finish, with no rows. Requires a GPU.
     #[test]

@@ -38,7 +38,7 @@ cn_pid="$!"
 
 wait -n "${fe_pid}" "${cn_pid}"
 '
-""",cwd = ".",depends-on = ["fe-check","cn-build"],description = "Run the local StarRocks FE and Rust CN in the foreground with logs",env = {LD_LIBRARY_PATH = "../../build/release/extension/sirius:/home/ubuntu/git/sirius-db/sirius-worktrees/tools/nvda_nixl/lib/x86_64-linux-gnu:/home/ubuntu/git/sirius-db/sirius-worktrees/tools/ucx-install/lib"}}
+""",cwd = ".",depends-on = ["fe-check","cn-build"],description = "Run the local StarRocks FE and Rust CN in the foreground with logs",env = {LD_LIBRARY_PATH = "../../build/release/extension/sirius:/home/ubuntu/git/sirius-db/sirius-worktrees/tools/nvda_nixl/lib/x86_64-linux-gnu:/home/ubuntu/git/sirius-db/sirius-worktrees/tools/ucx-install/lib",SIRIUS_QUERY_WATCHDOG_SECS = "60"}}
 
 # Two CNs share one GPU: each carves out an 8GiB slice (reservation == usage limit in the
 # derived config), so neither primes the default ~0.95x of device memory. CN2 shifts every
@@ -51,6 +51,11 @@ wait -n "${fe_pid}" "${cn_pid}"
 # below to still fit two CNs on the 23GiB L4. UCX_TLS must include cuda_copy (VRAM detection;
 # registration fails without it) and cuda_ipc (the fast same-host path the bandwidth canary
 # demands).
+#
+# SIRIUS_QUERY_WATCHDOG_SECS turns an engine-side scheduling stall into a loud query failure
+# after 60s of zero progress instead of a silent, SIGTERM-resistant head-of-line CN wedge.
+# Opt-in here because a single kernel legitimately running longer than the threshold would
+# be misread as a stall; TPC-H SF100 operator runtimes sit far below it.
 cluster2 = {cmd = """
 bash -lc 'set -euo pipefail
 
@@ -78,7 +83,7 @@ cn2_pid="$!"
 
 wait -n "${fe_pid}" "${cn1_pid}" "${cn2_pid}"
 '
-""",cwd = ".",depends-on = ["fe-check","cn-build"],description = "Run the FE and two 8GiB-carve-out CNs sharing one GPU, cross-node exchange over nixl",env = {LD_LIBRARY_PATH = "../../build/release/extension/sirius:/home/ubuntu/git/sirius-db/sirius-worktrees/tools/nvda_nixl/lib/x86_64-linux-gnu:/home/ubuntu/git/sirius-db/sirius-worktrees/tools/ucx-install/lib",NIXL_PLUGIN_DIR = "/home/ubuntu/git/sirius-db/sirius-worktrees/tools/nvda_nixl/lib/x86_64-linux-gnu/plugins",UCX_TLS = "cuda_copy,cuda_ipc,tcp,self",SIRIUS_EXCHANGE_STAGING_BYTES = "1280MiB"}}
+""",cwd = ".",depends-on = ["fe-check","cn-build"],description = "Run the FE and two 8GiB-carve-out CNs sharing one GPU, cross-node exchange over nixl",env = {LD_LIBRARY_PATH = "../../build/release/extension/sirius:/home/ubuntu/git/sirius-db/sirius-worktrees/tools/nvda_nixl/lib/x86_64-linux-gnu:/home/ubuntu/git/sirius-db/sirius-worktrees/tools/ucx-install/lib",NIXL_PLUGIN_DIR = "/home/ubuntu/git/sirius-db/sirius-worktrees/tools/nvda_nixl/lib/x86_64-linux-gnu/plugins",UCX_TLS = "cuda_copy,cuda_ipc,tcp,self",SIRIUS_EXCHANGE_STAGING_BYTES = "1280MiB",SIRIUS_QUERY_WATCHDOG_SECS = "60"}}
 
 # This demo project ships the StarRocks FE pre-packaged under starrocks/output/fe, so `cluster`
 # does not depend on `fe-build` (a multi-hour Maven build of the whole front end). Assert the

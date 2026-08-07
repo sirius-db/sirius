@@ -20,6 +20,7 @@
 
 #include "sirius_ffi.hpp"
 
+#include "config.hpp"                                      // duckdb::Config (LOG_* knobs)
 #include "cudf/cudf_utils.hpp"                             // sirius::get_cudf_type
 #include "data/data_batch_utils.hpp"                       // sirius::make_data_batch
 #include "data/sirius_converter_registry.hpp"              // sirius::converter_registry
@@ -139,6 +140,21 @@ struct detail::context_state {
 
   void bring_up(sirius::sirius_config& config)
   {
+    // The extension path installs the engine log sink from SiriusContextExtensionCallback's
+    // ctor, which this FFI path never constructs — leaving SIRIUS_LOG_* dead and every
+    // engine-side stall invisible on a compute node. Honor the env here, but only when
+    // explicitly configured, so embedders without SIRIUS_LOG_* keep today's behavior (no
+    // surprise ./log directory).
+    const char* log_backend = std::getenv("SIRIUS_LOG_BACKEND");
+    const char* log_dir     = std::getenv("SIRIUS_LOG_DIR");
+    const char* log_level   = std::getenv("SIRIUS_LOG_LEVEL");
+    if (log_backend != nullptr || log_dir != nullptr || log_level != nullptr) {
+      if (log_backend != nullptr) { duckdb::Config::LOG_BACKEND = log_backend; }
+      if (log_dir != nullptr) { duckdb::Config::LOG_DIR = log_dir; }
+      if (log_level != nullptr) { duckdb::Config::LOG_LEVEL = log_level; }
+      duckdb::install_configured_log_sink(nullptr);
+    }
+
     context = duckdb::make_shared_ptr<duckdb::SiriusContext>();
     context->initialize(config);
     // Register the builtin + parquet representation converters the GPU scan/result
