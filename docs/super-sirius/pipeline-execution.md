@@ -115,6 +115,8 @@ The **destructor** calls `pipeline->mark_task_completed()` to update pipeline co
 
 This section is the authoritative per-task-device contract every operator MUST honor when reading a memory space from one of its input batches under multi-GPU execution.
 
+`SCHED-RR` is retained as the established name of this per-task-device contract. It no longer names the scheduler's matching algorithm; current task dispatch uses the [ready-device matching policy](#ready-device-matching-policy) described below.
+
 ### Why this contract exists
 
 **Pre-Phase-14 history.** Before Phase 14 (`feat/sched-rr-distribution`) landed, the task scheduler stored its per-GPU executors in a `std::unordered_map<int, std::unique_ptr<gpu_pipeline_executor>>`. The code path in `task_scheduler::management_eventloop` that picked a default GPU for a preference-less task did so via:
@@ -125,9 +127,9 @@ int target_device_id = _gpu_executors.begin()->first;
 
 That `begin()` is hash-bucket-ordered — but for any single process it returns the *same* GPU on every call. Every preference-less source-pipeline task (metadata scan, parquet scan with no locality hint) piled onto whichever GPU happened to live in the first hash bucket. The implicit-and-undocumented contract was: "default GPU is `_gpu_executors.begin()->first`."
 
-**Phase 14 SCHED-RR change.** Phase 14 replaced the `unordered_map` with a `std::map<int, std::unique_ptr<gpu_pipeline_executor>>` (deterministic ascending-by-`device_id` iteration), added `std::atomic<size_t> _no_pref_rr_counter{0}`, and inserted a round-robin walk in `management_eventloop` that distributes preference-less tasks across all configured GPUs. Source-pipeline tasks now genuinely land on multiple GPUs within a single query — exactly what an N-GPU configuration is supposed to deliver.
+**Phase 14 change (superseded).** Phase 14 briefly replaced the `unordered_map` with a `std::map` and drove preference-less dispatch from an atomic round-robin counter. Both are gone: the scheduler again stores executors in an `unordered_map` and distributes preference-less tasks by pull signal, not by counter. See [Ready-device matching policy](#ready-device-matching-policy) for current behavior. What matters for the contract is unchanged — preference-less source-pipeline tasks can land on more than one GPU within a single query.
 
-**The hazard this exposes.** Several operators read `valid_batches[0]->get_memory_space()` (or an equivalent expression on a single input batch) as the authoritative target memory space, then perform their concat/merge/sort directly on that space. Pre-Phase-14, this was *accidentally* safe — every batch in the input vector was already on the implicit "default GPU" because every upstream task was dispatched to that same default. Under SCHED-RR, that accident is gone. If an operator reads `batches[0]->get_memory_space()` without a guarantee that *all* batches in the input vector are colocated on that space, it can silently produce wrong results, mis-allocate, or skip data on the other GPU.
+**The hazard this exposes.** Several operators read `valid_batches[0]->get_memory_space()` (or an equivalent expression on a single input batch) as the authoritative target memory space, then perform their concat/merge/sort directly on that space. Before multi-GPU distribution, this was *accidentally* safe — every batch in the input vector was already on the implicit "default GPU" because every upstream task was dispatched to that same default. With preference-less tasks claimable by multiple ready GPUs, that accident is gone. If an operator reads `batches[0]->get_memory_space()` without a guarantee that *all* batches in the input vector are colocated on that space, it can silently produce wrong results, mis-allocate, or skip data on the other GPU.
 
 The fix is not to patch every read site to detect cross-GPU input. The fix is the upstream contract below: every operator's input batches are colocated by the task scheduler **before** the operator's `execute()` runs, so reading `batches[0]->get_memory_space()` is a SAFE alias for the task's reservation device.
 
@@ -151,7 +153,7 @@ const auto* requested_memory_space =
   reservation != nullptr ? &reservation->get_memory_space() : nullptr;
 ```
 
-The reservation was attached by the GPU executor's manager loop (see [GPU Pipeline Executor](#gpu-pipeline-executor) above) on the SCHED-RR-chosen device. `requested_memory_space` is the authoritative target for every input batch this task will touch.
+The reservation was attached by the GPU executor's manager loop (see [GPU Pipeline Executor](#gpu-pipeline-executor) above) on the scheduler-selected device. `requested_memory_space` is the authoritative target for every input batch this task will touch.
 
 **Layer 2 — `gpu_pipeline_task::execute` calls `prepare_for_processing` on the operator-data input.**
 
@@ -246,11 +248,11 @@ if (!task) {
 
 A preference is binding: another ready GPU cannot claim that task. A preference-less task may be claimed by whichever ready device the management thread considers. With multiple ready devices, each independently searches for an exact-preference task before falling back to the shared no-preference bucket. There is no counter, offset, or round-robin ordering guarantee in this matcher.
 
-`test/cpp/operator/test_mgpu_stress.cpp` covers these routing invariants with a task pinned to each available test GPU plus one preference-less task, without relying on scheduling order or timing.
+`test/cpp/operator/test_task_scheduler_routing.cpp` covers these routing invariants with a task pinned to each available test GPU plus one preference-less task, without relying on scheduling order or timing.
 
 ### Migration note (Phase 14)
 
-> **The pre-Phase-14 "default GPU is `_gpu_executors.begin()->first`" behavior is gone.** Any operator that hardcodes single-GPU assumptions, defaults to GPU 0, or uses `batches[0]->get_memory_space()` without going through the lock protocol upstream is now WRONG under SCHED-RR distribution. Phase 15 (cross-GPU operator-colocation audit) verified all 11 known sites; new operators MUST follow the same pattern.
+> **The pre-Phase-14 "default GPU is `_gpu_executors.begin()->first`" behavior is gone.** Any operator that hardcodes single-GPU assumptions, defaults to GPU 0, or uses `batches[0]->get_memory_space()` without going through the lock protocol upstream is now WRONG under multi-GPU distribution. Phase 15 (cross-GPU operator-colocation audit) verified all 11 known sites; new operators MUST follow the same pattern.
 
 If you are reading older operator code that says "all batches are expected to share the same space in practice" or similar unverified-assumption phrasing, that comment predates the contract and should be replaced with the verified `INVARIANT (SCHED-RR contract)` comment shown below — the original phrasing is exactly the wording the Phase 15 audit removed from `top_n.cpp` (see [empirical evidence](#empirical-evidence) below).
 

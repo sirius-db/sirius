@@ -49,7 +49,7 @@ class routing_test_global_state : public sirius::pipeline::gpu_pipeline_task_glo
   void record_execution(uint64_t task_id, cudaError_t status, int device_id)
   {
     std::lock_guard lock(_mutex);
-    _executions.emplace(task_id, execution{status, device_id});
+    _executions.insert_or_assign(task_id, execution{status, device_id});
     _completed.notify_one();
   }
 
@@ -128,6 +128,9 @@ TEST_CASE("task_scheduler matches tasks to ready devices", "[task_scheduler][mgp
     WARN("Task scheduler routing test requires a GPU; skipping");
     return;
   }
+  if (device_count == 1) {
+    WARN("Only one GPU is visible; multi-GPU routing assertions will not run");
+  }
 
   auto const tested_device_count = std::min(device_count, 2);
   auto manager                   = initialize_memory_manager(tested_device_count);
@@ -151,6 +154,7 @@ TEST_CASE("task_scheduler matches tasks to ready devices", "[task_scheduler][mgp
   REQUIRE(status_0 == cudaSuccess);
   REQUIRE(status_1 == cudaSuccess);
   REQUIRE(device_0 == 0);
+  // A preference-less task must execute on some ready configured device without stalling.
   REQUIRE(device_1 >= 0);
   REQUIRE(device_1 < tested_device_count);
 
