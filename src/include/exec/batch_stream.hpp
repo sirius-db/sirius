@@ -120,7 +120,8 @@ class batch_stream {
   /// - **P4 — poison is data.** A pending error classifies as `HAS_DATA` even over an empty
   ///   queue, and is never `END_OF_STREAM` or `drained()`: an errored stream ends by rethrow at
   ///   the consumer, not by a quiet clean finish. Fires `on_data` to bring a parked consumer
-  ///   back for it, as well as `on_end_of_stream`.
+  ///   back for it, and `on_end_of_stream` too — but only if the stream was not already
+  ///   terminal, since that hook has already fired in that case.
   ///
   /// @throws sirius::invalid_input_exception when `error` is null — a null failure is a bug at
   ///         the call site, not a clean close.

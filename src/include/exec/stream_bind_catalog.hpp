@@ -65,6 +65,10 @@ class stream_bind_catalog : public duckdb::ClientContextState {
 
   /// Declare input stream `id`. Overwrites any previous declaration for the same id, so a reused
   /// connection cannot serve a stale schema.
+  /// @throws sirius::invalid_input_exception when `binding.repository` is null, when `names` and
+  ///         `types` differ in size, or when `names` is empty. All three are caught here rather
+  ///         than at bind time, where they would surface as a mis-shaped scan schema far from the
+  ///         declaration that caused them.
   void declare(stream_id_t id, stream_input_binding binding);
 
   /// Drop every declaration. Called when a fragment finishes.

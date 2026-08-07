@@ -51,8 +51,8 @@ struct partition_spec {
 /// materialized or converted to Arrow on the way out, and a queued batch stays spillable by the
 /// downgrade executor until it is pulled.
 ///
-/// Unlike the source, the sink arms no re-arm waker: its consumer is an external thread blocking
-/// in `wait()`, not an engine task that needs re-nominating.
+/// Unlike the source, the sink wires no `on_data` hook: its consumer is an external thread
+/// blocking in `wait()`, not an engine task that needs re-nominating.
 class sirius_physical_streaming_sink : public sirius_physical_operator {
  public:
   static constexpr SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::STREAMING_SINK;
@@ -132,16 +132,23 @@ class sirius_physical_streaming_sink : public sirius_physical_operator {
   /// @return nullopt when nothing is available right now — which is *not* the same as EOS; ask
   ///         `drained(index)` to tell the two apart.
   /// @throws sirius::invalid_input_exception when `index` is out of range.
+  /// @throws the producer's error, if `fail_output()` poisoned this stream — ahead of anything
+  ///         still queued, so a failed fragment can never be collected as a short clean result.
   std::optional<std::shared_ptr<cucascade::data_batch>> pull(std::size_t index = 0);
 
-  /// Block until output stream `index` has a batch to pull or the stream has ended.
-  /// External threads only.
+  /// Block until output stream `index` has a batch to pull or the stream has ended (cleanly or
+  /// by `fail_output()`). External threads only.
+  /// @throws sirius::invalid_input_exception when `index` is out of range.
   void wait(std::size_t index = 0);
 
-  /// True when the pipeline has finished AND output stream `index` is empty.
+  /// True only at a clean end: the pipeline has finished, output stream `index` is empty, and no
+  /// producer error is pending (S3). A poisoned stream never reports drained — it ends by the
+  /// rethrow from `pull()`, never by looking finished.
+  /// @throws sirius::invalid_input_exception when `index` is out of range.
   [[nodiscard]] bool drained(std::size_t index = 0) const;
 
   /// Non-blocking classification of output stream `index`: HAS_DATA / WAITING / END_OF_STREAM.
+  /// @throws sirius::invalid_input_exception when `index` is out of range.
   [[nodiscard]] exec::batch_stream::availability availability(std::size_t index = 0) const;
 
   /// The query died: poison every output stream. External consumers unblock from wait() and

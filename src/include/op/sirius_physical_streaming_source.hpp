@@ -59,8 +59,15 @@ class sirius_physical_streaming_source : public sirius_physical_operator {
   ///
   /// - end-of-stream → `update_pipeline_status(false)`, so a stream that ends with no task in
   ///   flight still finishes the pipeline *and* re-arms its downstream consumers;
-  /// - on-data → `task_creator::schedule(head)`, the self-nomination described above. Without it
-  ///   a batch that arrives after the source has been dropped is never looked at.
+  /// - on-data → `task_creator::schedule(head)`, this source's **self-nomination**.
+  ///
+  /// The self-nomination is what makes a stream-fed source work at all. The engine is
+  /// pull-scheduled: a source that answers `WAITING_FOR_INPUT_DATA` is dropped, and the only
+  /// built-in re-nomination is task completion — which a starved source never gets, because it
+  /// has no task in flight to complete. The `on_data` hook *is* that missing re-nomination.
+  /// Without it, a batch that arrives after the source was dropped is never looked at and the
+  /// fragment hangs with data sitting in the repository. Firing from a producer thread is safe
+  /// because `schedule()` only enqueues onto a thread-safe queue; it runs nothing inline.
   ///
   /// A stream that has *already* ended fires the first hook inside this call.
   void set_pipeline(duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline) override;
@@ -93,9 +100,15 @@ class sirius_physical_streaming_source : public sirius_physical_operator {
 
   bool is_source() const override { return true; }
 
-  /// `READY{this}` when a batch is queued (open or ended); `WAITING{nullptr}` when open and empty;
-  /// `nullopt` at end-of-stream. The `nullptr` producer is deliberate — there is no upstream
-  /// operator for `task_creator` to redirect the request to.
+  /// `READY{this}` whenever the stream classifies as `HAS_DATA`: a batch is queued (open or
+  /// ended), *or* a producer error is pending even over an empty queue (P4). That second case is
+  /// the only route a failure has to the consumer — the source is nominated once more so the
+  /// rethrow comes out of `get_next_task_input_data()` rather than the stream retiring quietly.
+  /// `WAITING_FOR_INPUT_DATA{nullptr}` while the stream is open and empty; `nullopt` only at a
+  /// *clean* end-of-stream.
+  ///
+  /// The `nullptr` producer is deliberate — there is no upstream operator for `task_creator` to
+  /// redirect the request to.
   [[nodiscard]] std::optional<task_creation_hint> get_next_task_hint() override;
 
   /// True only at a clean end-of-stream: every expected sender closed, queue empty, no producer

@@ -125,7 +125,7 @@ Key design facts:
   `exec::batch_stream`, which is what makes it terminal. Without `build_pipelines` placing the sink in
   `operators`, `on_finalize_operator()` is never called and every consumer blocked in `wait()`
   hangs forever with no error visible.
-- **No re-arm waker.** Unlike the source, the sink does not wire an `on_data` hook: its consumer
+- **No self-nomination.** Unlike the source, the sink does not wire an `on_data` hook: its consumer
   is an external thread blocking in `wait()`, not an engine task needing re-nomination.
 - **Native tier.** Batches are pushed in whatever tier they arrived — no Arrow, no forced GPU
   upgrade. A queued batch stays spillable in the repository until pulled.
@@ -416,8 +416,7 @@ After pipeline finalization, `source` and `sink` are just aliases for the first 
 | Operator | Category | GPU Method |
 |----------|----------|-----------|
 | GPU_SCAN | Scan | Unified GPU scan source served by `sirius_scan_manager` via a per-format `gpu_ingestible` |
-| STREAMING_SOURCE | Scan | Exchange-input source; drains an `exec::batch_stream` (repository fed by `push()`, sender-aware EOS, producer-error plane) |
-| STREAMING_SINK | Exchange output | Terminal operator of a streaming fragment; pushes each batch into an `exec::batch_stream`; `on_finalize_operator()` closes the stream |
+| STREAMING_SOURCE | Scan | Exchange-input source; drains an `exec::batch_stream` |
 | DUMMY_SCAN | Scan | Generates 1 row |
 | COLUMN_DATA_SCAN | Scan | Reads ColumnDataCollection |
 | FILTER | Relational | `expression_evaluator::select()` |
@@ -442,3 +441,4 @@ After pipeline finalization, `source` and `sink` are just aliases for the first 
 | CTE | CTE | Materialize to ColumnDataCollection |
 | RESULT_COLLECTOR | Result | Final result materialization |
 | EMPTY_RESULT | Result | Empty result set |
+| STREAMING_SINK | Result | Terminal operator of a streaming fragment |

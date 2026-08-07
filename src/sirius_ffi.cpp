@@ -106,7 +106,7 @@ struct Context::Impl {
     client.registered_state->Insert("sirius_connection_state",
                                     duckdb::make_shared_ptr<duckdb::SiriusConnectionState>());
 
-    // A fragment reads each of its exchange inputs through sirius_stream_source(id). The
+    // A fragment reads each of its input streams through sirius_stream_source(id). The
     // function has to exist on this DuckDB before any fragment plan binds, and its bind needs
     // somewhere to look up a schema for a stream that has no file behind it — the catalog,
     // reached the same way the engine reaches its SiriusContext.

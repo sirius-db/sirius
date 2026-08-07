@@ -59,8 +59,10 @@ void sirius_physical_streaming_source::set_pipeline(
     if (auto p = weak_pipeline.lock()) { p->update_pipeline_status(false); }
   });
 
-  // Self-nomination — see the class comment for why nothing else will ask this source again.
-  // schedule() just enqueues, so firing it from a producer thread is safe.
+  // Self-nomination: a source that answered WAITING is dropped, and task completion — the only
+  // built-in re-nomination — never comes for a source with no task in flight. See the
+  // declaration of set_pipeline() for the full story. schedule() only enqueues, so firing it
+  // from a producer thread is safe.
   _input->set_on_data([weak_pipeline] {
     auto p = weak_pipeline.lock();
     if (!p) { return; }

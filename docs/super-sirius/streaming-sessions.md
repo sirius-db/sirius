@@ -114,8 +114,13 @@ hint mirrors the stream state:
 | Stream state | `get_next_task_hint()` |
 |---|---|
 | `HAS_DATA` | `READY{this}` |
-| `WAITING` | `WAITING{nullptr}` |
+| `WAITING` | `WAITING_FOR_INPUT_DATA{nullptr}` |
 | `END_OF_STREAM` | `std::nullopt` |
+
+A pending producer error classifies as `HAS_DATA` even over an empty queue, so a failed stream
+answers `READY{this}` with nothing queued. That is deliberate: it is the one nomination that
+carries the failure out through `get_next_task_input_data()`'s rethrow, instead of the source
+retiring on `nullopt` and the query finishing as if it had worked.
 
 Each task pulls one batch, zero-copy, rethrowing any pending error; `execute()` is a
 pass-through.
@@ -189,8 +194,13 @@ drained(stream_id) -> bool          // → sink.drained(partition)
 - A **leaf**-fragment session registers only sink ids (a session with no input streams is
   legitimate); a **root**-fragment session registers a source id plus sink ids.
 
-> **Gotcha for plan-launcher work.** The sink is the pipeline **tail**, and it lands in
-> `operators[0]` so that finishing the pipeline reaches it and fires end-of-stream. A plan
+> **Gotcha for plan-launcher work.** The sink is the pipeline **tail**, and it must be a member of
+> that pipeline's `operators` vector — being the pipeline's `sink` member is not enough. Pipeline
+> finish calls `finalize_operator()` on `get_operators()`, which returns `operators` and excludes
+> the `source`/`sink` members, so *membership* is what fires end-of-stream, not position. A sink
+> reachable only through the `sink` member never sees `on_finalize_operator()`, the streams never
+> close, and every consumer blocks in `wait()` forever with no error anywhere. The sink is
+> appended first and lands at `operators.back()` once `is_ready()` reverses the vector. A plan
 > launcher must key on that structure rather than on `is_source()`.
 
 ## Worked example: distributed GROUP BY
@@ -263,13 +273,15 @@ re-reads the catalog at plan time to build each `STREAMING_SOURCE`.
 | File | Catch2 tags |
 |---|---|
 | `test/cpp/exec/test_batch_stream.cpp` | `[batch_stream]` |
-| `test/cpp/operator/test_physical_streaming_source.cpp` | `[streaming_source]` |
+| `test/cpp/operator/test_physical_streaming_source.cpp` | `[streaming_source]`, `[streaming_source][pipeline_completion]` |
 | `test/cpp/operator/test_physical_streaming_sink.cpp` | `[streaming_sink]` |
 | `test/cpp/exec/test_stream_session.cpp` | `[stream_session]` |
 | `test/cpp/exec/test_stream_bind_catalog.cpp` | `[stream_bind_catalog]` |
-| `test/cpp/exec/test_streaming_fragment.cpp` | `[streaming_fragment]`, `[streaming_fragment_control]` |
-| `test/cpp/pipeline/test_streaming_sink_root.cpp` | `[streaming_sink_root]`, `[streaming_sink_root_exec]` |
+| `test/cpp/exec/test_streaming_fragment.cpp` | `[integration][streaming_fragment]`, `[integration][streaming_fragment_control]` |
+| `test/cpp/pipeline/test_streaming_sink_root.cpp` | `[integration][pipeline][streaming_sink_root]`, `[integration][pipeline][streaming_sink_root_exec]` |
 
 A `recording_task_creator` stands in for the scheduler, so the live re-arm and the `on_data`
-hook path are proven without a live executor. `test_streaming_fragment.cpp` requires a GPU and
-a real DuckDB integration database (`[integration]` tag).
+hook path are proven without a live executor. The `[pipeline_completion]` cases drive the real
+`sirius_pipeline` completion predicate rather than the operator in isolation, because the bugs
+they cover live in what *calls* `update_pipeline_status()`. Everything tagged `[integration]`
+needs a GPU and the real DuckDB integration database.

@@ -71,7 +71,9 @@ class stream_session {
   /// sink's partition `i`, which is its output repository `i`. A single-destination sink takes
   /// exactly one id. The session does not take ownership; `sink` must outlive it.
   /// @throws sirius::invalid_input_exception on a duplicate output id, or an `ids` size that
-  ///         does not match the sink's output stream count.
+  ///         does not match the sink's output stream count. A duplicate is detected mid-loop, so
+  ///         the ids before it stay registered — the session is not rolled back. Build time is
+  ///         the only caller and it aborts the fragment, so nobody observes the partial state.
   void add_sink(std::vector<stream_id_t> ids, op::sirius_physical_streaming_sink& sink);
 
   /// Registered input stream ids, ascending. Empty for a leaf fragment, which produces but
@@ -103,6 +105,8 @@ class stream_session {
   /// Non-blocking pull from output stream `id`. `nullopt` means "nothing right now", which is
   /// not the same as end-of-stream — `drained(id)` distinguishes them.
   /// @throws sirius::invalid_input_exception when `id` is not a registered output stream.
+  /// @throws the fragment's error, if the sink's stream was poisoned — the wrapper's outermost
+  ///         call is where a failed fragment surfaces, rather than as a short clean result.
   std::optional<std::shared_ptr<cucascade::data_batch>> pull(stream_id_t id);
 
   /// Block until output stream `id` has a batch or has ended. External threads only.

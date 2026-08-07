@@ -76,12 +76,14 @@ void register_stream_source_function(duckdb::DatabaseInstance& instance)
   auto transaction = duckdb::CatalogTransaction::GetSystemTransaction(instance);
   auto& catalog    = duckdb::Catalog::GetSystemCatalog(instance);
 
+  // No projection/filter pushdown is enabled (DuckDB leaves them off unless asked): a streaming
+  // source hands over whole batches in the tier they already sit in, so there is no per-column
+  // read to prune, and the scan is replaced by a STREAMING_SOURCE before it could honour one.
   duckdb::TableFunction stream_source(kStreamSourceFunctionName,
                                       {duckdb::LogicalType::BIGINT},
                                       stream_source_function,
                                       stream_source_bind);
-  // Projection pushdown is deliberately off: a streaming source hands over whole batches in the
-  // tier they already sit in, so there is no per-column read to prune.
+
   duckdb::CreateTableFunctionInfo info(stream_source);
   // Idempotent: the extension callback registers Sirius functions on every DuckDB instance in
   // the process, and a caller (the FFI, a test) may also register explicitly. A duplicate is

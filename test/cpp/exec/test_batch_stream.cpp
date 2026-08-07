@@ -490,8 +490,8 @@ TEST_CASE("batch_stream BSTR-15: push registers before it wakes", "[batch_stream
   bool seen_registered = false;
   stream->set_on_data([&, repo = repo] { seen_registered = repo->total_size() > 0; });
 
-  // Register-then-announce. A waker that ran first would schedule a task for a batch not yet
-  // in the repository, and the task's pop would come back empty.
+  // S1 — register-then-announce. An on_data hook that ran first would schedule a task for a
+  // batch not yet in the repository, and the task's pop would come back empty.
   REQUIRE(stream->push(make_numeric_batch<int32_t>(*gpu_space, {1}, cudf::type_id::INT32)));
   REQUIRE(seen_registered);
 }

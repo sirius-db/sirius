@@ -62,7 +62,7 @@ constexpr sender_id_t SOLE_SENDER = 0;
 // ============================================================================
 
 /// Producer contract: the batch goes in through the operator's own push(), so admission and the
-/// waker behave exactly as they do in production.
+/// on_data self-nomination behave exactly as they do in production.
 static void push_batch(sirius_physical_streaming_source& op,
                        std::shared_ptr<cucascade::data_batch> batch)
 {
@@ -1073,9 +1073,9 @@ TEST_CASE("streaming_source REARM-2: a push after a drained drain loop re-schedu
 // ============================================================================
 // REARM-3: a push racing the WAITING hint is not lost.
 //
-// The arm predicate re-checks emptiness under the same lock push() holds while
-// it inserts, so a batch that lands between classify() and the arm turns the
-// hint into READY instead of parking on a waker that will never fire again.
+// classify() re-checks emptiness under the same lock push() holds while it
+// inserts (S1), so a batch that lands between the two turns the hint into READY
+// instead of parking the source on a notification that already fired.
 // ============================================================================
 
 TEST_CASE("streaming_source REARM-3: a batch already queued turns the hint into READY",
@@ -1100,8 +1100,8 @@ TEST_CASE("streaming_source REARM-3: a batch already queued turns the hint into 
 
 // ============================================================================
 // REARM-4: a source with no task_creator wired parks without crashing. The
-// waker resolves the creator through the pipeline at fire time, so a pipeline
-// built before the executor attached is a no-op, not a null dereference.
+// on_data hook resolves the creator through the pipeline at fire time, so a
+// pipeline built before the executor attached is a no-op, not a null dereference.
 // ============================================================================
 
 TEST_CASE("streaming_source REARM-4: a push with no task_creator wired is harmless",
@@ -1122,8 +1122,9 @@ TEST_CASE("streaming_source REARM-4: a push with no task_creator wired is harmle
 // ============================================================================
 // SRC-26: a producer error reaches the puller as data, then as a throw.
 //
-// The failure travels the same waker → hint → pull path a batch does, because that is the only
-// path a source has: nothing else nominates a starved streaming source.
+// P4/S2 — the failure travels the same on_data → hint → pull path a batch does, because that is
+// the only path a source has: nothing else nominates a starved streaming source. The disaster it
+// guards against is the quiet success that would let a failed fragment finish as if it had worked.
 //
 // SRC-26 and SRC-27 sit after the REARM block rather than with the other SRC cases because they
 // build on the re-nomination wiring those tests establish.

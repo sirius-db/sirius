@@ -50,7 +50,7 @@ struct stream_source_bind_data : public duckdb::FunctionData {
 ///
 /// A stream has no file to probe, so DuckDB's parquet binder cannot resolve a schema for it — a
 /// fake `local_files` URI would fail to bind. A table function carries its schema explicitly,
-/// which is why the exchange input is lowered to one. The bind reads the declared schema from the
+/// which is why an input stream is lowered to one. The bind reads the declared schema from the
 /// connection's `stream_bind_catalog`; the function body is never executed, because the Sirius
 /// plan generator replaces the scan with a `STREAMING_SOURCE`.
 void register_stream_source_function(duckdb::DatabaseInstance& instance);

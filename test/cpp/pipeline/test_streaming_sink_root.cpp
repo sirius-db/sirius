@@ -187,8 +187,10 @@ TEST_CASE_METHOD(streaming_sink_root_fixture,
 }
 
 // ============================================================================
-// SINKROOT-4: the A/B against the result collector. Same extraction, same plan
-// generator, same connection -- only the terminal operator differs. If this
+// SINKROOT-4: the A/B against the result collector. FRAG-CONTROL (in
+// test_streaming_fragment.cpp, on its own fixture) drives the same integration
+// database through the same plan generator, differing only in the plan's
+// terminal operator -- RESULT_COLLECTOR there, STREAMING_SINK here. If this
 // fails while FRAG-CONTROL passes, the sink is at fault, not the harness.
 // ============================================================================
 

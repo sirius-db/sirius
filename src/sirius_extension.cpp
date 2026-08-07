@@ -1593,7 +1593,7 @@ static void SiriusSetQueryLabelFunction(ClientContext& context,
 
 void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
 {
-  // A fragment plan reads each of its exchange inputs through sirius_stream_source(id). Register
+  // A fragment plan reads each of its input streams through sirius_stream_source(id). Register
   // it wherever Sirius is loaded, not just on the FFI's embedded DuckDB, so a fragment plan binds
   // on the transparent path too.
   sirius::exec::register_stream_source_function(instance);

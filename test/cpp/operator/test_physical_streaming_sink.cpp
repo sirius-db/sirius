@@ -380,7 +380,10 @@ TEST_CASE("streaming_sink SNK-10: source to filter to sink round-trips native ba
 }
 
 // ============================================================================
-// SINK-ERR-1: fail_output() unblocks a consumer blocked in wait() and rethrows
+// SINK-ERR-1: fail_output() unblocks a consumer blocked in wait() and rethrows.
+//
+// S2 — poison dominates. Without the wake, an external consumer parked in wait() on a fragment
+// that just died would block forever with no error anywhere.
 // ============================================================================
 
 TEST_CASE("streaming_sink SINK-ERR-1: fail_output unblocks wait and rethrows in pull",
@@ -407,7 +410,10 @@ TEST_CASE("streaming_sink SINK-ERR-1: fail_output unblocks wait and rethrows in 
 }
 
 // ============================================================================
-// SINK-ERR-2: availability never reports EOS and drained stays false under error
+// SINK-ERR-2: availability never reports EOS and drained stays false under error.
+//
+// S3 — errored is never clean. The disaster is the quiet success: a consumer that saw drained()
+// would stop pulling and report a failed fragment as a short but complete result.
 // ============================================================================
 
 TEST_CASE("streaming_sink SINK-ERR-2: errored stream never reports clean end", "[streaming_sink]")
