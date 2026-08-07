@@ -2518,7 +2518,11 @@ fn merge_fragment_params() -> TExecPlanFragmentParams {
 /// Verifies the merge fragment of a two-phase aggregation translates to a plain aggregate
 /// with the substituted merge functions (count merges as SUM of partial counts) over an
 /// exchange whose declared stream types are the modeled wire types, not the FE's
-/// DECIMAL128 intermediate slot type.
+/// DECIMAL128 intermediate slot type — and that even without an avg expansion the fragment
+/// leaves through the finalizing projection that casts every measure to its FE-declared
+/// output-slot type. The engine binds the merged count (a sum over BIGINT) as HUGEINT, so
+/// without the cast this fragment's output feeding a further downstream fragment would be
+/// refused by the hop's schema guard.
 #[test]
 fn merge_aggregation_translates_with_substituted_functions() {
     let translated = PlanTranslator::new()
@@ -2534,11 +2538,29 @@ fn merge_aggregation_translates_with_substituted_functions() {
 
     let root = root(&translated.plan);
     assert_eq!(root.names, vec!["revenue", "cnt"]);
-    let rel::RelType::Aggregate(aggregate) =
-        root.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    let rel::RelType::Project(project) = root.input.as_ref().unwrap().rel_type.as_ref().unwrap()
     else {
-        panic!("expected aggregate relation");
+        panic!("expected the finalizing project over the merge aggregate");
     };
+    // One throwing cast per measure, to the FE's output-slot types as the type mapper declares
+    // them: the DECIMAL128(38,2) sum slot lowers to FP64 (precision > 18) — the same lowering a
+    // downstream exchange applies when it derives its stream schema from this very slot — and
+    // the count leaves as the BIGINT its slot declares (the engine binds it as HUGEINT).
+    assert_eq!(project.expressions.len(), 2);
+    let (sum_type, sum_input) = cast_parts(&project.expressions[0]);
+    assert!(
+        matches!(sum_type, substrait::proto::r#type::Kind::Fp64(_)),
+        "{sum_type:?}"
+    );
+    assert_eq!(field_index(sum_input), 0);
+    let (count_type, count_input) = cast_parts(&project.expressions[1]);
+    assert!(
+        matches!(count_type, substrait::proto::r#type::Kind::I64(_)),
+        "{count_type:?}"
+    );
+    assert_eq!(field_index(count_input), 1);
+
+    let aggregate = root_aggregate(&translated.plan);
     assert_eq!(aggregate.measures.len(), 2);
     for measure in &aggregate.measures {
         assert_eq!(

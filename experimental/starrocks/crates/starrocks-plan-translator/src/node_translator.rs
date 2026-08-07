@@ -786,10 +786,14 @@ fn translate_aggregation(
     };
 
     let aggregated = match phase {
-        // The FE's output row has one column per measure, so the extra state columns are
-        // consumed here -- everything above this node sees the row the descriptor describes,
-        // types included.
-        AggPhase::Merge if expanded => {
+        // Every merge node leaves through the finalizing projection, not only the avg-expanded
+        // ones: the engine binds a merged integer count/sum as HUGEINT (the plan-level downcast
+        // relabels the aggregate node, not a fragment sink above it), so without the projection's
+        // throwing casts the fragment's wire row carries a type its FE-declared slot never
+        // announced and the next hop's schema guard refuses it. Where a state expanded, the
+        // projection also folds the extra columns back to one column per FE measure -- everything
+        // above this node sees the row the descriptor describes, types included.
+        AggPhase::Merge => {
             let measure_types =
                 declared_measure_types(ctx.desc, output_tuple, &output_slots[keys..])?;
             merge_projection(
