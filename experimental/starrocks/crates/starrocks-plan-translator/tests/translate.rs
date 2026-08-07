@@ -4082,6 +4082,111 @@ fn bound_exchange_feeds_aggregate_from_a_stream() {
     );
 }
 
+/// A multi-stage DISTINCT reallocates its columns into a fresh tuple at every stage, but the
+/// FE's `buildAggregateTuple` never rebinds `colRefToExpr` for grouping columns, so every ref
+/// above the first aggregation keeps naming the tuple from below it (TPC-H q16's
+/// `count(distinct ps_suppkey)` reaches its final stage still naming the scan-side tuple). The
+/// BE resolves slot refs by slot id alone, so those stale refs must resolve the same way here.
+#[test]
+fn stale_tuple_ids_from_a_multi_stage_distinct_resolve_by_slot_id() {
+    // Four tuples reallocating the same two columns: suppkey keeps slot 2 and brand slot 9
+    // through tuple 0 (below the aggregation), tuple 1 (the exchange input), and tuple 2 (the
+    // dedup output); tuple 3 is the counting output (brand key, count slot 23).
+    let desc = desc_table(
+        vec![(0, Some(100)), (1, None), (2, None), (3, None)],
+        vec![
+            slot(2, 0, 0, "ps_suppkey", scalar_type(TPrimitiveType::BIGINT)),
+            slot(9, 0, 1, "p_brand", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(2, 1, 0, "ps_suppkey", scalar_type(TPrimitiveType::BIGINT)),
+            slot(9, 1, 1, "p_brand", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(2, 2, 0, "ps_suppkey", scalar_type(TPrimitiveType::BIGINT)),
+            slot(9, 2, 1, "p_brand", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(9, 3, 0, "p_brand", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(
+                23,
+                3,
+                1,
+                "supplier_cnt",
+                scalar_type(TPrimitiveType::BIGINT),
+            ),
+        ],
+    );
+
+    let mut exchange = base_plan_node(4, TPlanNodeType::EXCHANGE_NODE, 0, vec![1]);
+    exchange.exchange_node = Some(TExchangeNode::new(
+        vec![1],
+        None,
+        None,
+        Some(TPartitionType::HASH_PARTITIONED),
+        Some(true),
+        None,
+    ));
+    // The dedup stage: grouping-only and unfinalized, its refs stale-bound to tuple 0.
+    let mut dedup = aggregation_node(
+        5,
+        2,
+        vec![
+            slot_ref(2, 0, scalar_type(TPrimitiveType::BIGINT)),
+            slot_ref(9, 0, scalar_type(TPrimitiveType::VARCHAR)),
+        ],
+        Vec::new(),
+    );
+    dedup.agg_node.as_mut().unwrap().need_finalize = false;
+    // The counting stage: its count argument names tuple 0 too.
+    let count = aggregation_node(
+        6,
+        3,
+        vec![slot_ref(9, 0, scalar_type(TPrimitiveType::VARCHAR))],
+        vec![aggregate_expr(
+            "count",
+            scalar_type(TPrimitiveType::BIGINT),
+            Some(slot_ref(2, 0, scalar_type(TPrimitiveType::BIGINT))),
+        )],
+    );
+    let translated = PlanTranslator::new()
+        .translate_fragment_with_exchange_inputs(
+            &params(
+                Some(TPlan::new(vec![count, dedup, exchange])),
+                Some(desc),
+                None,
+            ),
+            &[ExchangeInput {
+                node_id: 4,
+                stream_view: "sirius_stream_4".to_string(),
+                names: vec!["ps_suppkey".to_string(), "p_brand".to_string()],
+            }],
+        )
+        .unwrap();
+
+    let root = root(&translated.plan);
+    assert_eq!(root.names, vec!["p_brand", "supplier_cnt"]);
+    let rel::RelType::Aggregate(counting) = root.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected counting aggregate");
+    };
+    // The deduped row is [ps_suppkey, p_brand]: the count groups on brand and counts suppkey.
+    assert_eq!(counting.grouping_expressions.len(), 1);
+    assert_eq!(field_index(&counting.grouping_expressions[0]), 1);
+    assert_eq!(counting.measures.len(), 1);
+    let measure = counting.measures[0].measure.as_ref().unwrap();
+    assert_eq!(measure.arguments.len(), 1);
+    let substrait::proto::function_argument::ArgType::Value(argument) =
+        measure.arguments[0].arg_type.as_ref().unwrap()
+    else {
+        panic!("expected value argument");
+    };
+    assert_eq!(field_index(argument), 0);
+
+    let rel::RelType::Aggregate(dedup) =
+        counting.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected dedup aggregate under the count");
+    };
+    let keys: Vec<_> = dedup.grouping_expressions.iter().map(field_index).collect();
+    assert_eq!(keys, vec![0, 1]);
+    assert!(dedup.measures.is_empty());
+}
+
 /// Verifies a merging exchange globally sorts the local sender output it streams in.
 #[test]
 fn merging_exchange_becomes_sort_over_stream_read() {
