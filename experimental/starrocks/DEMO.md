@@ -169,6 +169,8 @@ what to run if it is not:
 
 ```bash
 git submodule update --init --recursive experimental/starrocks/starrocks
+# Sirius-only nixl RPCs (not upstream): re-apply after every clean submodule checkout
+experimental/starrocks/scripts/apply-starrocks-patches.sh
 pixi run fe-build    # long
 ```
 

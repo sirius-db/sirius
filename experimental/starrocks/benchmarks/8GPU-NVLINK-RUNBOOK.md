@@ -122,29 +122,19 @@ ninja -C build install
 
 `--enable-mt` on UCX is not optional: the transport touches the agent from a dedicated thread.
 
-### 3.1 The environment file
+### 3.1 The environment — derived, not written by hand
 
-Every build and every run needs the same four variables. Write them once:
+Nothing to author: `scripts/cn-env.sh` derives every build-time and run-time variable
+(`NIXL_PREFIX`, `NIXL_PLUGIN_DIR`, `LD_LIBRARY_PATH`, bindgen/libclang settings, system
+toolchain overrides) from its own location in the repo plus `TOOLS_DIR` — defaulting to a
+`tools/` directory next to the repo root. The `cn-*`/`cluster*` pixi tasks and the launch
+scripts all source it themselves; export `TOOLS_DIR` only if your installs live elsewhere.
 
-```bash
-cat > $REPO/../tools/nvda_nixl/ENV.sh <<'EOF'
-# Environment for building/running against the local nixl + UCX install.
-# Source this before `cargo build` on anything using nixl-sys, and at runtime.
-export NIXL_PREFIX=<abs-path>/sirius-worktrees/tools/nvda_nixl
-# nixl looks in NIXL_PLUGIN_DIR first, else <dir of libnixl.so>/plugins.
-export NIXL_PLUGIN_DIR="$NIXL_PREFIX/lib/x86_64-linux-gnu/plugins"
-export LD_LIBRARY_PATH="$NIXL_PREFIX/lib/x86_64-linux-gnu:<abs-path>/sirius-worktrees/tools/ucx-install/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-# Build-time only: nixl-sys uses bindgen; the system libclang has no builtin headers
-# installed, so point it at the pixi env's clang resource headers. Harmless at runtime.
-export BINDGEN_EXTRA_CLANG_ARGS="-isystem <abs-path>/sirius-worktrees/integration/.pixi/envs/default/lib/clang/21/include"
-EOF
-```
-
-Substitute the absolute paths. Then verify the plugin actually exists — a missing UCX plugin
-is the single most common bring-up failure:
+Verify the plugin actually exists — a missing UCX plugin is the single most common bring-up
+failure:
 
 ```bash
-source $REPO/../tools/nvda_nixl/ENV.sh
+source $REPO/experimental/starrocks/scripts/cn-env.sh
 ls $NIXL_PLUGIN_DIR/          # must contain libplugin_UCX.so (or similar)
 ```
 
@@ -278,7 +268,7 @@ to `--registration-max-attempts`, default 120). You do not run `ALTER SYSTEM` by
 Environment, set once for all CNs:
 
 ```
-NIXL_PLUGIN_DIR             from ENV.sh
+NIXL_PLUGIN_DIR             derived by scripts/cn-env.sh from $TOOLS_DIR
 LD_LIBRARY_PATH             engine .so + nixl + UCX
 UCX_TLS=cuda_copy,cuda_ipc,tcp,self
 SIRIUS_EXCHANGE_STAGING_BYTES=8GiB
@@ -519,7 +509,7 @@ If q09-style queries fail with a staging-arena error, raise
 
 | Symptom | Cause / fix |
 |---|---|
-| Agent creation fails at CN startup | libnixl not found or the stub was linked. Source `ENV.sh`; rebuild with `NIXL_NO_STUBS_FALLBACK=1`; check `NIXL_PLUGIN_DIR` really contains the UCX plugin |
+| Agent creation fails at CN startup | libnixl not found or the stub was linked. Check `TOOLS_DIR` (`source scripts/cn-env.sh` shows the derived paths); rebuild with `NIXL_NO_STUBS_FALLBACK=1`; check `NIXL_PLUGIN_DIR` really contains the UCX plugin |
 | nixl registration fails, `NIXL_ERR_BACKEND` | `UCX_TLS` is missing `cuda_copy` — UCX cannot detect VRAM pointers |
 | Everything works but is ~200× slow | `UCX_TLS` is missing `cuda_ipc`, or the arena is not `cudaMalloc`-backed. The bandwidth canary should have refused the tier; see §8 |
 | "No available backends" for every query | A wedged query stranded its fragments. Restart the cluster — this is why `RESTART_CMD` exists |

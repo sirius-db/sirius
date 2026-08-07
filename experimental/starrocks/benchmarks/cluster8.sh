@@ -36,16 +36,12 @@ FE_BIN=$SR_DIR/starrocks/output/fe/bin/start_fe.sh
 [ -x "$CN_BIN" ] || { echo "no CN binary at $CN_BIN -- run: pixi run cn-build" >&2; exit 1; }
 [ -x "$FE_BIN" ] || { echo "no packaged FE at $FE_BIN -- run: pixi run fe-check" >&2; exit 1; }
 
-# NIXL_PREFIX / NIXL_PLUGIN_DIR / LD_LIBRARY_PATH / BINDGEN_EXTRA_CLANG_ARGS.
-# shellcheck source=/dev/null
-[ -f "$TOOLS_DIR/nvda_nixl/ENV.sh" ] && source "$TOOLS_DIR/nvda_nixl/ENV.sh"
+# NIXL_PREFIX / NIXL_PLUGIN_DIR / LD_LIBRARY_PATH (engine .so + pixi env lib + nixl + UCX) /
+# UCX_TLS, all derived from the repo and $TOOLS_DIR locations; fails loudly when nixl is
+# absent rather than continuing misconfigured.
+# shellcheck source=../scripts/cn-env.sh
+source "$SR_DIR/scripts/cn-env.sh"
 
-# The engine .so must precede the nixl/UCX paths ENV.sh already exported.
-export LD_LIBRARY_PATH="$REPO_ROOT/build/release/extension/sirius${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-# cuda_copy is what lets UCX recognize a VRAM pointer at all (registration fails without it);
-# cuda_ipc is the fast same-host GPU->GPU path -- omit it and transfers still deliver correct
-# bytes, ~200x slower, which is what the transport's bandwidth canary exists to catch.
-export UCX_TLS=${UCX_TLS:-cuda_copy,cuda_ipc,tcp,self}
 export SIRIUS_EXCHANGE_STAGING_BYTES=${SIRIUS_EXCHANGE_STAGING_BYTES:-$STAGING}
 
 avail=$(nvidia-smi --query-gpu=index --format=csv,noheader | wc -l)
