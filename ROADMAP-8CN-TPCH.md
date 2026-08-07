@@ -290,14 +290,14 @@ milestone if queries stay sequential.
 | # | Feature | Depends on | Unlocks | Size | Dominant risk |
 |---|---------|-----------|---------|------|---------------|
 | 0 | Translate-only plan survey of Q1–Q22 (`SIRIUS_CN_TRANSLATE_ONLY`) | — | ground truth for everything below | S | none |
-| 1 | **Partitioned/multi-destination output** (FFI partition_spec + CN `output_partition` wiring: HASH via existing MURMUR3 sink, UNPARTITIONED broadcast, RANDOM) | 0 | distributed GROUP BY + shuffle/broadcast joins at `agg_stage=1`: **Q3, Q4, Q5, Q7, Q9, Q10, Q12, Q13, Q14, Q18, Q19, Q21** (+ Q1 via shuffle) | **L** | parked-fragment ownership across mixed local/remote destination sets; N× unspillable backlog |
+| 1 | **Partitioned/multi-destination output** — **DONE 2026-08-07** (`6c7217aa..5b4cfc7a`: hash-partitioned fan-out wired through the CN + broadcast sink mode; DECIMAL partition keys hash through a FLOAT64 cast, `8c23e7e7`) | 0 | ~~distributed GROUP BY + shuffle/broadcast joins~~ **cleared** — every shuffle/broadcast TPC-H shape executes live | done | residual: N× parked/staged backlog is still unspillable (§7, #6) |
 | 2 | **Byte-range parquet splits** — **DONE 2026-08-06** (`a5c25f76..8c2ebea5`, 7 commits; see BYTE-RANGE-SPLITS-PLAN.md): ranges ride `FileOrFiles.start/length`, a per-plan registry closes the consumer gap in-repo, the engine selects row groups by start-offset ownership (StarRocks reader convention) before stats pruning, the CN emits splits with loud refusals (overlap/past-EOF/has_more). Verified exactly-once live: count(*) = 6001215 over the single split 155 MB lineitem on 2 CNs | 0 | ~~gates 18/22 queries~~ **cleared**; byte-identical-file gymnastics retired | done | residual: S3 ranges refused; FE cross-CN tiling remains the trust boundary |
 | 3 | **ASSERT_NUM_ROWS_NODE + RIGHT_SEMI join** | 0 | **Q2, Q11, Q15, Q17, Q20, Q22** (scalar subqueries); robustness for Q4/Q18/Q21 side-swaps | **S-M** | assert needs a real runtime check, not a limit |
 | 4 | **Two-phase aggregation** — **scalar DONE 2026-08-05** (`64977ebb..11625add`: translator-resolved phases, no FFI marker; wire-type model + engine hop validation; substituted-function merge). Remaining: grouped (gated by #1), avg (sum+count expansion follow-up), DISTINCT (→ #9) | 1 (grouped part) | ~~FE-default `agg_stage` plans~~ done for scalar; Q1 at scale + grouped perf still gated by #1 | remaining: **M** (avg) / **XL** (distinct) | LIST pack round-trip UNVERIFIED (distinct only) |
-| 5 | **cancel_plan_fragment + per-query GC** | — (parallel) | reliable 22-query runs; no restart-after-failure | **M** | GC sweep vs in-flight fragments |
+| 5 | **cancel_plan_fragment + per-query GC** — loud-failure half DONE (`c858e79a`: query-wide failure propagation + cancel stub; no more silent hangs or cluster cascade); real abort/GC still open — a stalled fragment holds the engine thread + GPU until SIGKILL (q02, task #26) | — (parallel) | reliable 22-query runs; no restart-after-failure | remaining: **M-L** (engine-side abort) | GC sweep vs in-flight fragments |
 | 6 | **Spillability of parked/staged batches** (new-exchange-design §8, option 1 or 2) | 1 | SF>1 at 8 CNs without OOM | **M-L** | ownership vs `clear_all_repositories()` |
 | 7 | **Merging exchange** (k-way merge receiver; engine MERGE_SORT exists) | 1 | perf for ORDER BY-heavy Q3/Q10/Q18 (already correct via SortRel re-sort) | **M** | per-sender run separation at the stream boundary |
-| 8 | **Timeout config + transmit retry + lease path off engine thread** | — | long fragments (>60 s) don't false-fail transmits | **S-M** | none (idempotency in place) |
+| 8 | **Timeout config + transmit retry + lease path off engine thread** — lease path DONE (`a94e8660`, plus SIGTERM→SIGKILL shutdown escalation); timeout config + transmit retry open | — | long fragments (>60 s) don't false-fail transmits | remaining: **S** | none (idempotency in place) |
 | 9 | Multi-phase DISTINCT agg | 4 | **Q16** at FE-auto stages | **XL** | 3/4-phase plan shapes |
 | 10 | Runtime filters (opt), CRC32 bucket-shuffle parity (opt), concurrent queries per CN | 1, 4 | perf / mixed-vendor / multi-tenant — not needed for a sequential pass | M–XL | engine-wide lifecycle rework |
 
@@ -311,6 +311,82 @@ critical path** — it needs BOTH broadcast and hash-partitioned shapes (survey
 F2), six queries raise the bucket-shuffle question (survey F3), and the avg
 expansion (Q1/Q17/Q22 leaves) queues behind it. Join-type work (RIGHT_SEMI in
 #3) stays off the TPC-H path (survey F5); ASSERT_NUM_ROWS remains #3's content.
+
+**Status 2026-08-07 (measured, not projected): 19/22 TPC-H queries run to
+completion on the live 2-CN cluster; 17/22 additionally hold every value inside
+a 0.25 % tolerance** (per-query table: TPCH-SURVEY.md addendum 3; per-fix
+detail: QUERY-TIMEOUT-ANALYSIS.md "Final status"). #1 DONE
+(`6c7217aa..5b4cfc7a`, decimal keys `8c23e7e7`); the avg expansion landed
+(`bd232c40`) and grouped two-phase landed with #1; #8's lease half DONE
+(`a94e8660`); #5's loud-failure half landed (`c858e79a`), its abort/GC half is
+now the top engine ask. #3 turned out to be a non-blocker: the FE elided
+ASSERT_NUM_ROWS in every captured plan and RIGHT_SEMI never appeared. Between
+19 and 22 stand: real cancellation/abort (q02 engine-thread stall, task #26),
+the FP64 equality race (q15 empty-result flake, task #29), and the q14
+common_slot_map descriptor gap; the #24 decimal deficit additionally gates
+value-exactness on q03/q10.
+
+## What integrating Sirius as a StarRocks CN actually required
+
+Every line is something that actually broke on the way from the Q6 demo to the
+19/22 sweep, with its fix commit or open task.
+
+**Engine gaps — what Sirius itself still needs (or needed):**
+
+- **Real cancellation/abort + a per-fragment watchdog.** A stalled fragment
+  cannot be aborted: q02 wedges the engine thread and its GPU memory until
+  SIGKILL, invisibly to the FE. Cancel is stubbed (`c858e79a`), shutdown
+  escalates (`a94e8660`); engine-side abort + watchdog remain OPEN (task #26,
+  roadmap #5).
+- **Single-engine-thread lease coupling.** Staging-lease RPCs funnelled through
+  the one `!Send` engine thread, so a peer's lease queued behind a running
+  fragment → cross-CN deadlock (the original q02 hang class). FIXED: leases
+  served off the engine thread (`a94e8660`).
+- **No INT128.** DuckDB-side sums produce HUGEINT with no wire type; partial
+  states must leave through a throwing downcast to the FE-declared slot type,
+  so overflow fails loudly instead of wrapping (`bb066e90`).
+- **Decimal literal/scale path.** Decimals lower to FP64; every
+  `sum(x*(1-l_discount))`-shaped value lands deterministically low — 0.1–0.2 %
+  on most queries, up to 0.4 % on q03/q10 rows. OPEN (task #24).
+- **FP64 distributed-sum determinism.** Two independently reduced FP64 sums are
+  not bit-equal, so q15's `total_revenue = max(total_revenue)` equality flakes
+  empty (3/6 on a warm cluster). OPEN (task #29).
+- **Exchange staging arena sizing.** The bump arena reclaims only at full
+  quiescence and sits outside the cuCascade budget; q09 requested 648 MB
+  against 512 MB. Grown to 1280 MiB per CN (`1d4428da`); a real sizing/GC story
+  is roadmap #5/#6.
+
+**Translation gaps — what StarRocks→Substrait was missing:**
+
+- **Two-phase aggregation semantics.** The FE encodes phase in thrift
+  (`need_finalize` × per-measure merge) and its intermediate tuple types don't
+  match the engine's partial-state bindings; needed a phase classifier, a
+  partial-state wire-type model, and an engine-checked conformance gate
+  (`64977ebb..11625add`, gate `830380f4`).
+- **avg expansion.** avg's partial state is sum+count — two columns where the
+  FE allocates one slot; expanded into `sum(x), count(x)` measures plus a
+  finalize division (`bd232c40`).
+- **FE-narrowed builtin return types.** `year()` is SMALLINT to the FE, BIGINT
+  to the engine — a silent hang at the hop guard; every projection output is
+  now cast to its FE-declared slot type (`4beca977`).
+- **Materialized-slot order is load-bearing and undocumented.** The FE's list
+  order is NOT the wire order: sort tuples (`4323197d`) and aggregation
+  grouping keys (`7bdcd312`) must be shipped in materialized-slot order.
+- **CLONE_EXPR.** `TExprNodeType(29)` (the FE's common-subexpression reuse
+  marker) was refused outright, blocking q14/q16; translated as a pass-through
+  of its child (pending commit).
+- **Slot-id resolution / stale tuple ids.** The FE references slots through
+  tuples absent from `row_tuples`; a unique-slot-id fallback resolves them
+  (pending commit). Still OPEN: q14's `common_slot_map` slot is defined in one
+  Project node and referenced by a sibling AGGREGATE node — common-expr
+  registrations must become fragment-visible.
+- **Intermediate-fragment failure reporting.** A failing non-root fragment had
+  no FE-visible channel: silent 300 s hangs that cascaded into a 20-query
+  wipe-out; a failure now fails its whole query loudly (`c858e79a`).
+- **cancel_plan_fragment.** The unimplemented method returned a transport-level
+  error that poisoned the FE's shared brpc channel and misattributed errors
+  across queries; stubbed to OK (`c858e79a`); real cancellation is the engine
+  ask above.
 
 ---
 

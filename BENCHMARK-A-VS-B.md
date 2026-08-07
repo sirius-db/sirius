@@ -47,6 +47,18 @@
   full post-fix table). A sweep now: 15 pass / 6 loud refusals / 1 wedge, zero cascade
   (was 3 pass / wipe-out). CSV: /tmp/sirius-tpch-bench/bench/A2/timings.csv. Caveat before
   publishing a table: revenue-shaped sums carry a ~0.1 % deficit (see analysis doc).
+- 2026-08-07 (final): third fix wave landed (7bdcd312 grouping-key slot order, a94e8660
+  lease decoupling + SIGTERM escalation, 8c23e7e7 decimal hash keys, 1d4428da 1280 MiB
+  staging arena, 90750142 harness; CLONE_EXPR + slot-id-fallback translator patches pending
+  commit). Full A sweep, 3 timed runs/query: **19/22 run to completion with exact keys,
+  counts, and self-consistent ordering; 17/22 additionally hold all values inside the 0.25 %
+  tolerance** — q03/q10 revenue values deterministically low beyond the band (task #24).
+  Non-pass rows, each reproduced solo with a characterized cause: q02 wedge (engine-thread
+  stall, #26), q14 loud refusal (common_slot_map descriptor error — new translator blocker),
+  q15 empty-result flake (FP64 equality race, #29; 3/6 empty on a warm cluster). Zero
+  cascade, clean teardown (0 leftover processes, 0 MiB GPU). CSV:
+  /tmp/sirius-tpch-bench/bench/A4/timings.csv; per-query table + open-issue detail in
+  QUERY-TIMEOUT-ANALYSIS.md "Final status".
 
 ## Results
 

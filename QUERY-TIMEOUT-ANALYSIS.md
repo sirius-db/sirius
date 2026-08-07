@@ -374,4 +374,83 @@ New correctness finding (pre-existing, highest-priority follow-up): every
 sum(l_extendedprice*(1-l_discount)) lands ~0.1 % low while counts/base sums/avgs on the
 same rows are exact; a DuckDB simulation of "rows with l_discount=0.10 compute (1-d) 0.01
 low" reproduces q01 A|F to 3.6 ppm. Decimal literal/scale suspect in the multi-fragment
-expression path.
+expression path. (Tracked as task #24.)
+
+## Final status (2026-08-07)
+
+Second fix wave, one commit per remaining refusal class from the table above:
+
+- `4323197d` fixed sort tuples; `7bdcd312` applies the same materialized-slot-order rule to
+  aggregation grouping keys — clears the q03 refusal (DATE vs BIGINT hop).
+- `a94e8660` serves staging leases off the engine thread (fix d4) and adds SIGTERM→SIGKILL
+  escalation — a wedged CN no longer survives teardown holding 9.4 GiB of GPU memory.
+- `8c23e7e7` hashes DECIMAL partition keys through a FLOAT64 cast — clears the q10 refusal.
+- `1d4428da` grows the exchange staging arena to 1280 MiB per CN — clears the q09 exhaustion
+  (648 MB requested vs 512 MB capacity).
+- `90750142` — harness waits for both backends and kills the right CN binary (no more phantom
+  wedges from a half-started cluster).
+- **Pending commit** (working tree: `descriptor_table.rs`, `expr_translator.rs`,
+  `tests/translate.rs`): CLONE_EXPR (TExprNodeType 29) translation plus a unique-slot-id
+  fallback for slot refs whose tuple is not in `row_tuples` — clears q16 (the earlier
+  "descriptor slot 2 (tuple 8)" refusal); q14 hits a new blocker behind it (below).
+
+Full sweep (22 queries × 3 timed runs, harness `90750142`, 30 s ceiling; CSV
+`/tmp/sirius-tpch-bench/bench/A4/timings.csv`):
+
+| Q | result | ms (3 runs) | rows | notes |
+|---|---|---|---|---|
+| q01 | pass | 347/337/368 | 4 | max value drift 0.096 % (#24, in band) |
+| q02 | **wedge** | 30004 (run0) | 0 | #26 engine-thread stall (below) |
+| q03 | pass* | 596/569/498 | 10 | values out of #24 band (below) |
+| q04 | pass | 357/580/519 | 5 | exact |
+| q05 | pass | 1145/843/884 | 5 | max drift 0.111 % (#24, in band) |
+| q06 | pass | 257/288/296 | 1 | exact |
+| q07 | pass | 913/923/913 | 4 | |
+| q08 | pass | 1095/1056/1056 | 2 | |
+| q09 | pass | 1043/954/1012 | 175 | arena fix 1d4428da |
+| q10 | pass* | 581/580/580 | 20 | values out of #24 band (below) |
+| q11 | pass | 965/959/879 | 1048 | |
+| q12 | pass | 499/499/500 | 2 | |
+| q13 | pass | 478/459/459 | 42 | |
+| q14 | **refused** | 250 (run0) | — | NEW descriptor blocker (below) |
+| q15 | **wedge** | 1712 (run0) | 0 | #29 empty-result flake; bench.sh records empty as wedge |
+| q16 | pass | 518/488/489 | 18314 | byte-identical to DuckDB; CLONE_EXPR patch |
+| q17 | pass | 953/953/1064 | 1 | |
+| q18 | pass | 752/701/682 | 57 | exact |
+| q19 | pass | 408/409/397 | 1 | |
+| q20 | pass | 742/812/832 | 186 | |
+| q21 | pass | 944/934/912 | 100 | |
+| q22 | pass | 523/524/545 | 7 | |
+
+**19/22 run to completion with exact key sets, counts, and self-consistent ordering; 17/22
+additionally hold every value inside the 0.25 % tolerance** (q03/q10 are the pass* rows).
+Zero cascade: every non-pass row reproduces solo with a characterized cause, and every query
+after each restart ran clean. Teardown verified: 0 leftover CN/FE processes, nvidia-smi 0 MiB.
+
+Remaining open, in priority order:
+
+- **#26 — q02 wedge (primary).** Deterministic engine-thread stall; times out at 30 s with
+  0 rows. Note the lease decoupling (`a94e8660`) did NOT clear it — d4 landed, so q02's stall
+  is deeper than the staging-lease cycle; needs real engine-side abort (b2) plus the
+  per-fragment watchdog (d3) to even localize it.
+- **q14 — NEW loud refusal**: `descriptor error: slot 35 (tuple 5) is not part of
+  row_tuples [5]`, raised translating intermediate fragment F04; deterministic, reproduced on
+  two healthy clusters. Per EXPLAIN VERBOSE, slot 35 = `[31:cast]*[34:cast]` (the
+  `l_extendedprice*(1-l_discount)` multiply) lives in Project node 6's `common_slot_map`; the
+  update-serialize AGGREGATE node 7 references it directly inside
+  `if(p_type LIKE 'PROMO%', [35], 0)`, but slot 35 is not among tuple 5's materialized slots
+  and common-expr slot registrations are local to the project node's translation — resolution
+  finds zero candidates (the unique-slot-id fallback also finds none). Fix direction: make
+  `common_slot_map` registrations visible to sibling nodes in the same fragment. The
+  CLONE_EXPR translation itself is proven by q16.
+- **#29 — q15 flake.** FP64 equality race (`total_revenue = max(total_revenue)` over two
+  independently reduced FP64 sums): 3/6 correct on a warm cluster (correct runs return
+  supplier 8449, total_revenue drift 0.043 % — in band), 3/6 empty. Worse than the ~1/3
+  previously documented.
+- **#24 — revenue-sum deficit, now out of band on two queries.** q03 and q10: key sets,
+  counts, and Sirius self-ordering all exact, values deterministically LOW (stable across 3
+  reruns), 2 rows each beyond 0.25 %: q03 orderkeys 2435712 (−0.300 %) and 2456423 (−0.390 %);
+  q10 custkeys 143347 (−0.291 %) and 146149 (−0.397 %). q10 also shows a non-adjacent 3-rank
+  rotation (custkey 6226 drops two ranks) — legal under "ordering per Sirius's own values" but
+  beyond the documented adjacent-swap behavior. Same low-bias signature as #24, larger than
+  the documented 0.1–0.2 %.

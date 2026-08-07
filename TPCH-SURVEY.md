@@ -15,6 +15,10 @@
 > Also: the 390-dump capture contains ZERO `assert_num_rows_node: Some` instances — the FE may
 > elide the assert for provably-scalar subqueries; the Q2-class blocker needs re-diagnosis from
 > a clean sweep (see SCALAR-SUBQUERY-PLAN.md).
+>
+> **Addendum 3 (2026-08-07): measured execution state supersedes this survey's per-query
+> guesses** — see the table at the end of this document. 19/22 queries now run to completion
+> live on 2 CNs.
 
 Ran against the live two-CN cluster (`cluster2`, post two-phase stack `64977ebb..11625add`),
 FE default settings and `new_planner_agg_stage = 1`, data = single-file SF1 parquet per table at
@@ -117,3 +121,41 @@ At `agg_stage=1` the picture is identical minus the avg errors (Q1/Q17/Q22 leave
 4. Join-type work (RIGHT_SEMI etc.) drops off the TPC-H path entirely (F5); ASSERT_NUM_ROWS
    remains untested by this harness (scalar-subquery shapes are exchange-fed — recheck once
    splits land and fragments execute for real).
+
+## Addendum 3 (2026-08-07) — measured execution state, Q1–Q22
+
+Full live sweep on `cluster2` (SF1, 2 CNs, 3 timed runs per query, 30 s ceiling, harness
+`90750142`; CSV `/tmp/sirius-tpch-bench/bench/A4/timings.csv`). Every non-pass row was
+re-run solo on a healthy cluster and reproduces with the cause listed — no harness artifacts,
+no cascade. This table replaces the translate-only guesses above with execution truth.
+
+| Q | state | ms (3 runs) | rows | cause / notes |
+|---|---|---|---|---|
+| 1 | pass | 347/337/368 | 4 | max value drift 0.096 % (#24, in band) |
+| 2 | wedge | 30004 (run0) | 0 | engine-thread stall, deterministic (#26) — NOT the predicted ASSERT_NUM_ROWS blocker |
+| 3 | pass | 596/569/498 | 10 | keys/counts/order exact; 2 revenue values low beyond 0.25 % (#24) |
+| 4 | pass | 357/580/519 | 5 | exact |
+| 5 | pass | 1145/843/884 | 5 | max drift 0.111 % (#24, in band) |
+| 6 | pass | 257/288/296 | 1 | exact |
+| 7 | pass | 913/923/913 | 4 | |
+| 8 | pass | 1095/1056/1056 | 2 | |
+| 9 | pass | 1043/954/1012 | 175 | needed the 1280 MiB staging arena (1d4428da) |
+| 10 | pass | 581/580/580 | 20 | keys/counts exact; 2 values low beyond 0.25 % + a 3-rank rotation (#24) |
+| 11 | pass | 965/959/879 | 1048 | |
+| 12 | pass | 499/499/500 | 2 | |
+| 13 | pass | 478/459/459 | 42 | |
+| 14 | refused | 250 (run0) | — | `slot 35 (tuple 5) not in row_tuples [5]`: a `common_slot_map` expr from Project node 6 referenced by the sibling AGGREGATE node — cross-node common-expr registration missing (loud, deterministic) |
+| 15 | wedge | 1712 (run0) | 0 | empty-result flake (#29, FP64 equality race): 3/6 correct on a warm cluster, correct value drift 0.043 % |
+| 16 | pass | 518/488/489 | 18314 | byte-identical to DuckDB; needed CLONE_EXPR + slot-id fallback (pending commit) |
+| 17 | pass | 953/953/1064 | 1 | |
+| 18 | pass | 752/701/682 | 57 | exact |
+| 19 | pass | 408/409/397 | 1 | |
+| 20 | pass | 742/812/832 | 186 | |
+| 21 | pass | 944/934/912 | 100 | |
+| 22 | pass | 523/524/545 | 7 | |
+
+Net: **19/22 complete (exact key sets, counts, self-consistent ordering); 17/22 also inside
+the 0.25 % value tolerance.** The survey-era blockers (splits, avg, partitioned output,
+bucket shuffle, CLONE_EXPR/TExprNodeType 29) are all cleared; what remains is one engine
+stall (#26), one FP64 determinism race (#29), one decimal-path value deficit (#24), and one
+translator descriptor gap (q14). Detail: QUERY-TIMEOUT-ANALYSIS.md "Final status".
