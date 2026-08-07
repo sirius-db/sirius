@@ -281,6 +281,7 @@ impl PlanTranslator {
             partial_expansion,
         } = node_translator::translate_plan(
             plan,
+            fragment.output_exprs.as_deref().unwrap_or_default(),
             &desc,
             &scan_paths,
             &exchange_inputs,
@@ -309,16 +310,36 @@ impl PlanTranslator {
             translated =
                 node_translator::project_exprs(translated, output_exprs, &desc, &mut registry)?;
             names
-        } else if let Some(expansion) = &partial_expansion {
-            // A partial avg ships more columns than the FE's output tuple has slots, so the
-            // descriptor table cannot name the row. These names are what the receiver reads
-            // the stream's columns by.
-            expansion.names.clone()
         } else {
-            desc.output_names_for_tuples(&translated.row_tuples)?
+            // Carried common-expr columns are a fragment-internal mechanism and never leave
+            // the fragment. Narrow back to the descriptor row BEFORE deriving names: a
+            // width-preserving root (a SELECT conjunct above the carrying project, say) would
+            // otherwise ship columns the sender's names and the receiver's declared stream
+            // schema do not describe. (The output_exprs branch above narrows naturally — its
+            // root projection emits only the output expressions.)
+            translated = node_translator::confine_carried(translated);
+            if let Some(expansion) = &partial_expansion {
+                // A partial avg ships more columns than the FE's output tuple has slots, so
+                // the descriptor table cannot name the row. These names are what the receiver
+                // reads the stream's columns by.
+                expansion.names.clone()
+            } else {
+                desc.output_names_for_tuples(&translated.row_tuples)?
+            }
         };
 
         let output_names = unique_names(output_names).collect::<Vec<_>>();
+
+        // One loud guard against any width/name drift at the root: the names are what the
+        // receiver (or the client) reads the row by, so a mismatch is a wrong column read
+        // waiting to happen — never ship it.
+        if output_names.len() != translated.output_width {
+            return Err(TranslateError::malformed(format!(
+                "fragment root emits {} columns but derived {} output names",
+                translated.output_width,
+                output_names.len()
+            )));
+        }
 
         // Resolve a hash-partitioned sink's keys to output column indices while the row layout
         // is still in hand. Bare SLOT_REFs only: any transform would make this sender hash a

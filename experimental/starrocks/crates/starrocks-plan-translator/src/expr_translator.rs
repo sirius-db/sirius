@@ -13,6 +13,22 @@ use crate::{
     ExtensionRegistry, URN_ARITHMETIC, URN_BOOLEAN, URN_COMPARISON, URN_DATETIME, URN_STRING,
 };
 
+/// A common-expr slot a project physically emits past its descriptor row because an ancestor
+/// node consumes it (see `node_translator::translate_project_node`).
+///
+/// StarRocks' BE outputs a project's common slots when a node above references them even
+/// though no output tuple materializes them; carrying the `(tuple, slot) -> column` binding
+/// upward is how this translator reproduces that.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CarriedSlot {
+    /// Output tuple of the project that carries the slot.
+    pub tuple_id: i32,
+    /// StarRocks slot id (query-global in new-optimizer plans).
+    pub slot_id: i32,
+    /// Physical column of the carried value in the project's output row.
+    pub column: usize,
+}
+
 /// Mutable state needed while translating one StarRocks expression tree.
 pub(crate) struct ExprContext<'a> {
     /// Descriptor lookups for slot references and row layouts.
@@ -23,6 +39,8 @@ pub(crate) struct ExprContext<'a> {
     row_tuples: &'a [i32],
     /// Synthetic StarRocks slots appended while evaluating common project expressions.
     slot_overrides: Option<&'a std::collections::HashMap<(i32, i32), usize>>,
+    /// Common-expr columns the input row carries past its descriptor width.
+    carried: Option<&'a [CarriedSlot]>,
 }
 
 impl<'a> ExprContext<'a> {
@@ -37,6 +55,7 @@ impl<'a> ExprContext<'a> {
             registry,
             row_tuples,
             slot_overrides: None,
+            carried: None,
         }
     }
 
@@ -53,7 +72,16 @@ impl<'a> ExprContext<'a> {
             registry,
             row_tuples,
             slot_overrides: Some(slot_overrides),
+            carried: None,
         }
+    }
+
+    /// Makes the input row's carried common-expr columns visible to slot resolution.
+    pub(crate) fn with_carried(mut self, carried: &'a [CarriedSlot]) -> Self {
+        if !carried.is_empty() {
+            self.carried = Some(carried);
+        }
+        self
     }
 }
 
@@ -157,6 +185,11 @@ fn translate_expr_node(
 }
 
 /// Converts a StarRocks `SLOT_REF` into a Substrait field selection.
+///
+/// Resolution order: exact `(tuple, slot)` synthetic override, exact `(tuple, slot)` carried
+/// column, descriptor row (`slot_global_index`), and — only when the descriptor fails — a
+/// carried column matched by slot id alone (BE semantics: the tuple id of a ref can be stale,
+/// see `DescriptorTable::slot_global_index`). Every ambiguity is refused, never guessed.
 fn translate_slot_ref(
     node: &TExprNode,
     children: Vec<Expression>,
@@ -167,18 +200,59 @@ fn translate_slot_ref(
         context: "SLOT_REF",
         field: "slot_ref",
     })?;
-    let field = ctx
+    let key = (slot_ref.tuple_id, slot_ref.slot_id);
+    let exact_override = ctx
         .slot_overrides
-        .and_then(|overrides| {
-            overrides
-                .get(&(slot_ref.tuple_id, slot_ref.slot_id))
-                .copied()
-        })
-        .map(Ok)
-        .unwrap_or_else(|| {
-            ctx.desc
+        .and_then(|overrides| overrides.get(&key).copied());
+    let exact_carried = ctx.carried.and_then(|carried| {
+        carried
+            .iter()
+            .find(|slot| (slot.tuple_id, slot.slot_id) == key)
+            .map(|slot| slot.column)
+    });
+    if exact_override.is_some() && exact_carried.is_some() {
+        return Err(TranslateError::descriptor(format!(
+            "slot {} (tuple {}) resolves through both a synthetic slot override and a carried \
+             common column; refusing to guess between the two",
+            key.1, key.0
+        )));
+    }
+    let field = match exact_override.or(exact_carried) {
+        Some(column) => column,
+        None => {
+            match ctx
+                .desc
                 .slot_global_index(slot_ref.tuple_id, slot_ref.slot_id, ctx.row_tuples)
-        })? as i32;
+            {
+                Ok(index) => index,
+                Err(descriptor_error) => {
+                    let candidates = ctx
+                        .carried
+                        .map(|carried| {
+                            carried
+                                .iter()
+                                .filter(|slot| slot.slot_id == key.1)
+                                .map(|slot| slot.column)
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    match candidates.as_slice() {
+                        [column] => *column,
+                        [] => return Err(descriptor_error),
+                        _ => {
+                            return Err(TranslateError::descriptor(format!(
+                                "slot {} (tuple {}) matches {} carried common columns by slot id \
+                             alone; an ambiguous fallback is a guess, not a resolution",
+                                key.1,
+                                key.0,
+                                candidates.len()
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+    } as i32;
     Ok(Expression {
         rex_type: Some(expression::RexType::Selection(Box::new(FieldReference {
             reference_type: Some(field_reference::ReferenceType::DirectReference(
@@ -1018,4 +1092,187 @@ fn encode_decimal(value: &str, scale: i32) -> Result<[u8; 16]> {
         unscaled = -unscaled;
     }
     Ok(unscaled.to_le_bytes())
+}
+
+#[cfg(test)]
+mod tests {
+    use starrocks_thrift::descriptors::{TDescriptorTable, TSlotDescriptor, TTupleDescriptor};
+    use starrocks_thrift::exprs::TSlotRef;
+    use starrocks_thrift::types::{TScalarType, TTypeDesc, TTypeNode, TTypeNodeType};
+
+    use super::*;
+
+    /// Builds a descriptor with one tuple 0 carrying one BIGINT slot 1.
+    fn one_slot_desc() -> DescriptorTable {
+        let ty = TTypeDesc::new(Some(vec![TTypeNode::new(
+            TTypeNodeType::SCALAR,
+            Some(TScalarType::new(TPrimitiveType::BIGINT, None, None, None)),
+            None,
+            None,
+        )]));
+        let desc_tbl = TDescriptorTable::new(
+            Some(vec![TSlotDescriptor::new(
+                Some(1),
+                Some(0),
+                Some(ty),
+                Some(0),
+                None,
+                None,
+                None,
+                Some("a".to_string()),
+                None,
+                Some(true),
+                Some(true),
+                Some(true),
+                None,
+                None,
+            )]),
+            vec![TTupleDescriptor::new(Some(0), None, None, None, None)],
+            None,
+            None,
+        );
+        DescriptorTable::try_from(&desc_tbl).unwrap()
+    }
+
+    /// Builds a bare slot-reference expression node.
+    fn slot_ref_node(tuple_id: i32, slot_id: i32) -> TExprNode {
+        let ty = TTypeDesc::new(Some(vec![TTypeNode::new(
+            TTypeNodeType::SCALAR,
+            Some(TScalarType::new(TPrimitiveType::BIGINT, None, None, None)),
+            None,
+            None,
+        )]));
+        TExprNode {
+            node_type: TExprNodeType::SLOT_REF,
+            type_: ty,
+            opcode: None,
+            num_children: 0,
+            agg_expr: None,
+            bool_literal: None,
+            case_expr: None,
+            date_literal: None,
+            float_literal: None,
+            int_literal: None,
+            in_predicate: None,
+            is_null_pred: None,
+            like_pred: None,
+            literal_pred: None,
+            slot_ref: Some(TSlotRef::new(slot_id, tuple_id)),
+            string_literal: None,
+            tuple_is_null_pred: None,
+            info_func: None,
+            decimal_literal: None,
+            output_scale: -1,
+            fn_call_expr: None,
+            large_int_literal: None,
+            output_column: None,
+            output_type: None,
+            vector_opcode: None,
+            fn_: None,
+            vararg_start_idx: None,
+            child_type: None,
+            vslot_ref: None,
+            used_subfield_names: None,
+            binary_literal: None,
+            copy_flag: None,
+            check_is_out_of_bounds: None,
+            use_vectorized: None,
+            has_nullable_child: None,
+            is_nullable: None,
+            child_type_desc: None,
+            is_monotonic: None,
+            dict_query_expr: None,
+            dictionary_get_expr: None,
+            is_index_only_filter: None,
+            is_nondeterministic: None,
+            cast_struct_by_name: None,
+        }
+    }
+
+    /// Returns the field index of a direct struct-field selection.
+    fn field_of(expr: &Expression) -> i32 {
+        let expression::RexType::Selection(selection) = expr.rex_type.as_ref().unwrap() else {
+            panic!("expected field selection");
+        };
+        let field_reference::ReferenceType::DirectReference(segment) =
+            selection.reference_type.as_ref().unwrap()
+        else {
+            panic!("expected direct reference");
+        };
+        let reference_segment::ReferenceType::StructField(field) =
+            segment.reference_type.as_ref().unwrap()
+        else {
+            panic!("expected struct field");
+        };
+        field.field
+    }
+
+    /// A stale-tuple ref that misses the descriptor resolves through the single carried column
+    /// matching its slot id — the BE's by-slot-id semantics extended to carried commons.
+    #[test]
+    fn carried_by_slot_id_fallback_resolves_a_single_candidate() {
+        let desc = one_slot_desc();
+        let mut registry = ExtensionRegistry::new();
+        let row = [0];
+        let carried = [CarriedSlot {
+            tuple_id: 7,
+            slot_id: 99,
+            column: 4,
+        }];
+        let mut ctx = ExprContext::new(&desc, &mut registry, &row).with_carried(&carried);
+        let node = slot_ref_node(3, 99);
+        let translated = translate_slot_ref(&node, Vec::new(), &mut ctx).unwrap();
+        assert_eq!(field_of(&translated), 4);
+    }
+
+    /// Two carried columns sharing a slot id make the by-slot-id fallback a guess; refuse it.
+    #[test]
+    fn ambiguous_carried_by_slot_id_fallback_is_refused() {
+        let desc = one_slot_desc();
+        let mut registry = ExtensionRegistry::new();
+        let row = [0];
+        let carried = [
+            CarriedSlot {
+                tuple_id: 7,
+                slot_id: 99,
+                column: 4,
+            },
+            CarriedSlot {
+                tuple_id: 8,
+                slot_id: 99,
+                column: 5,
+            },
+        ];
+        let mut ctx = ExprContext::new(&desc, &mut registry, &row).with_carried(&carried);
+        let node = slot_ref_node(3, 99);
+        let err = translate_slot_ref(&node, Vec::new(), &mut ctx).unwrap_err();
+        assert!(
+            matches!(&err, TranslateError::Descriptor(message) if message.contains("carried")),
+            "{err:?}"
+        );
+    }
+
+    /// A `(tuple, slot)` key present in both the synthetic overrides and the carried columns
+    /// has two competing sources; never guess between them.
+    #[test]
+    fn duplicate_override_and_carried_key_is_refused() {
+        let desc = one_slot_desc();
+        let mut registry = ExtensionRegistry::new();
+        let row = [0];
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert((7, 99), 1usize);
+        let carried = [CarriedSlot {
+            tuple_id: 7,
+            slot_id: 99,
+            column: 4,
+        }];
+        let mut ctx = ExprContext::with_slot_overrides(&desc, &mut registry, &row, &overrides)
+            .with_carried(&carried);
+        let node = slot_ref_node(7, 99);
+        let err = translate_slot_ref(&node, Vec::new(), &mut ctx).unwrap_err();
+        assert!(
+            matches!(&err, TranslateError::Descriptor(message) if message.contains("both")),
+            "{err:?}"
+        );
+    }
 }

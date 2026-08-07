@@ -4942,3 +4942,504 @@ fn gpu_unsupported_shapes_are_rejected() {
         "{err:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Common-expr slots consumed above their project (the TPC-H q14 shape)
+// ---------------------------------------------------------------------------
+
+/// Builds a two-operand arithmetic expression in flat preorder form.
+fn arithmetic_expr(opcode: TExprOpcode, ty: TTypeDesc, left: TExpr, right: TExpr) -> TExpr {
+    let mut node = base_expr_node(TExprNodeType::ARITHMETIC_EXPR, ty, 2);
+    node.opcode = Some(opcode);
+    let mut nodes = vec![node];
+    nodes.extend(left.nodes);
+    nodes.extend(right.nodes);
+    TExpr::new(nodes)
+}
+
+/// Descriptor for the q14 shape: scan tuple 0 (`p_type`, `l_extendedprice`, `l_discount`),
+/// project tuple 1 materializing {21: p_type, 27: disc_price} plus a NON-materialized common
+/// slot 35, and an aggregation output tuple 2 (promo_revenue, total_revenue).
+fn consumed_common_desc() -> TDescriptorTable {
+    let mut hidden = slot(35, 1, 2, "expr_35", scalar_type(TPrimitiveType::DOUBLE));
+    hidden.is_materialized = Some(false);
+    desc_table(
+        vec![(0, Some(100)), (1, None), (2, None)],
+        vec![
+            slot(21, 0, 0, "p_type", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(
+                22,
+                0,
+                1,
+                "l_extendedprice",
+                scalar_type(TPrimitiveType::DOUBLE),
+            ),
+            slot(23, 0, 2, "l_discount", scalar_type(TPrimitiveType::DOUBLE)),
+            slot(21, 1, 0, "p_type", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(27, 1, 1, "disc_price", scalar_type(TPrimitiveType::DOUBLE)),
+            hidden,
+            slot(
+                36,
+                2,
+                0,
+                "promo_revenue",
+                scalar_type(TPrimitiveType::DOUBLE),
+            ),
+            slot(
+                37,
+                2,
+                1,
+                "total_revenue",
+                scalar_type(TPrimitiveType::DOUBLE),
+            ),
+        ],
+    )
+}
+
+/// Builds the q14-shaped project: common chain `31 <- l_extendedprice`,
+/// `34 <- 1.0 - l_discount`, `35 <- [31] * [34]`; the slot_map materializes 21 (p_type) and
+/// 27 (a clone of `[35]`), plus — mirroring the FE — a `35 <-> ref 35` entry for the
+/// non-materialized slot a consumer above reads.
+fn consumed_common_project(node_id: i32, with_consumed_slot_map_entry: bool) -> TPlanNode {
+    let double = || scalar_type(TPrimitiveType::DOUBLE);
+    let mut common_slot_map = BTreeMap::new();
+    common_slot_map.insert(31, slot_ref(22, 0, double()));
+    common_slot_map.insert(
+        34,
+        arithmetic_expr(
+            TExprOpcode::SUBTRACT,
+            double(),
+            float_literal_typed(1.0, TPrimitiveType::DOUBLE),
+            slot_ref(23, 0, double()),
+        ),
+    );
+    common_slot_map.insert(
+        35,
+        arithmetic_expr(
+            TExprOpcode::MULTIPLY,
+            double(),
+            slot_ref(31, 1, double()),
+            slot_ref(34, 1, double()),
+        ),
+    );
+    let mut slot_map = BTreeMap::new();
+    slot_map.insert(21, slot_ref(21, 0, scalar_type(TPrimitiveType::VARCHAR)));
+    slot_map.insert(27, clone_expr(slot_ref(35, 1, double())));
+    if with_consumed_slot_map_entry {
+        slot_map.insert(35, slot_ref(35, 1, double()));
+    }
+    let mut project = base_plan_node(node_id, TPlanNodeType::PROJECT_NODE, 1, vec![1]);
+    project.project_node = Some(TProjectNode::new(Some(slot_map), Some(common_slot_map)));
+    project
+}
+
+/// Builds the q14 update-serialize measure: `sum(if(p_type LIKE 'PROMO%', [35], 0.0))`.
+fn promo_measure() -> TExpr {
+    let double = scalar_type(TPrimitiveType::DOUBLE);
+    let mut sum = base_expr_node(TExprNodeType::AGG_EXPR, double.clone(), 1);
+    sum.agg_expr = Some(TAggregateExpr::new(false));
+    sum.fn_ = Some(builtin_function("sum", double.clone()));
+    let mut if_call = base_expr_node(TExprNodeType::FUNCTION_CALL, double.clone(), 3);
+    if_call.fn_ = Some(builtin_function("if", double.clone()));
+    let mut like_call = base_expr_node(
+        TExprNodeType::FUNCTION_CALL,
+        scalar_type(TPrimitiveType::BOOLEAN),
+        2,
+    );
+    like_call.fn_ = Some(builtin_function(
+        "like",
+        scalar_type(TPrimitiveType::BOOLEAN),
+    ));
+    let mut nodes = vec![sum, if_call, like_call];
+    nodes.extend(slot_ref(21, 1, scalar_type(TPrimitiveType::VARCHAR)).nodes);
+    nodes.extend(string_literal("PROMO%").nodes);
+    nodes.extend(slot_ref(35, 1, double).nodes);
+    nodes.extend(float_literal_typed(0.0, TPrimitiveType::DOUBLE).nodes);
+    TExpr::new(nodes)
+}
+
+/// Builds the q14-shaped aggregation over the project output: the promo measure (which reads
+/// the non-materialized common slot 35) plus `sum(disc_price)`.
+fn consumed_common_agg(node_id: i32) -> TPlanNode {
+    aggregation_node(
+        node_id,
+        2,
+        Vec::new(),
+        vec![
+            promo_measure(),
+            aggregate_expr(
+                "sum",
+                scalar_type(TPrimitiveType::DOUBLE),
+                Some(slot_ref(27, 1, scalar_type(TPrimitiveType::DOUBLE))),
+            ),
+        ],
+    )
+}
+
+/// The q14 shape: a project's non-materialized common slot (the last of a chain of dependent
+/// commons) is consumed by the aggregation above. The project physically carries it as a
+/// trailing column, and the measure's reference resolves to that column.
+#[test]
+fn consumed_common_slot_is_carried_to_the_aggregate() {
+    let translated = translate_fragment(&params(
+        Some(TPlan::new(vec![
+            consumed_common_agg(7),
+            consumed_common_project(6, true),
+            scan_node(0, 0),
+        ])),
+        Some(consumed_common_desc()),
+        None,
+    ))
+    .unwrap();
+
+    let root = root(&translated.plan);
+    // The fragment output (the aggregate row) is unchanged by the carrying.
+    assert_eq!(root.names, vec!["promo_revenue", "total_revenue"]);
+    let rel::RelType::Aggregate(aggregate) =
+        root.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected the aggregate over the carrying project");
+    };
+    assert_eq!(aggregate.measures.len(), 2);
+
+    // The project emits its two materialized slots plus the carried slot 35; both the clone
+    // (27) and the carried entry read the appended common column of 35.
+    let rel::RelType::Project(project) =
+        aggregate.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected the carrying project under the aggregate");
+    };
+    assert_eq!(project.expressions.len(), 3);
+    assert_eq!(field_index(&project.expressions[1]), 5);
+    assert_eq!(field_index(&project.expressions[2]), 5);
+
+    // The measure argument if(p_type LIKE 'PROMO%', [35], 0.0) reads the carried column 2.
+    let measure = aggregate.measures[0].measure.as_ref().unwrap();
+    let substrait::proto::function_argument::ArgType::Value(argument) =
+        measure.arguments[0].arg_type.as_ref().unwrap()
+    else {
+        panic!("expected a value argument");
+    };
+    let expression::RexType::IfThen(if_then) = argument.rex_type.as_ref().unwrap() else {
+        panic!("expected the if() around the carried slot");
+    };
+    assert_eq!(field_index(if_then.ifs[0].then.as_ref().unwrap()), 2);
+    assert_eq!(
+        field_index(scalar_arg(if_then.ifs[0].r#if.as_ref().unwrap(), 0)),
+        0
+    );
+}
+
+/// Without the FE's slot_map entry for the consumed slot, the project falls back to its own
+/// common binding and still carries the column.
+#[test]
+fn consumed_common_slot_without_slot_map_entry_falls_back_to_the_common_binding() {
+    let translated = translate_fragment(&params(
+        Some(TPlan::new(vec![
+            consumed_common_agg(7),
+            consumed_common_project(6, false),
+            scan_node(0, 0),
+        ])),
+        Some(consumed_common_desc()),
+        None,
+    ))
+    .unwrap();
+
+    let root = root(&translated.plan);
+    let rel::RelType::Aggregate(aggregate) =
+        root.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected the aggregate over the carrying project");
+    };
+    let rel::RelType::Project(project) =
+        aggregate.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected the carrying project under the aggregate");
+    };
+    assert_eq!(project.expressions.len(), 3);
+    // The carried expression is a direct selection of the appended common column.
+    assert_eq!(field_index(&project.expressions[2]), 5);
+}
+
+/// A common slot consumed only inside the project keeps today's behavior: nothing is carried
+/// and the project emits exactly its materialized slots.
+#[test]
+fn common_slot_consumed_only_inside_the_project_is_not_carried() {
+    let mut select = base_plan_node(7, TPlanNodeType::SELECT_NODE, 1, vec![1]);
+    select.select_node = Some(TSelectNode::new(None));
+    select.conjuncts = Some(vec![binary_pred(
+        TExprOpcode::GT,
+        slot_ref(27, 1, scalar_type(TPrimitiveType::DOUBLE)),
+        float_literal_typed(0.0, TPrimitiveType::DOUBLE),
+    )]);
+    let translated = translate_fragment(&params(
+        Some(TPlan::new(vec![
+            select,
+            consumed_common_project(6, false),
+            scan_node(0, 0),
+        ])),
+        Some(consumed_common_desc()),
+        None,
+    ))
+    .unwrap();
+
+    assert_eq!(translated.output_names, vec!["p_type", "disc_price"]);
+    let root = root(&translated.plan);
+    let rel::RelType::Filter(filter) = root.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected the root filter (no narrowing projection without carried columns)");
+    };
+    let rel::RelType::Project(project) = filter.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected the project under the filter");
+    };
+    assert_eq!(project.expressions.len(), 2);
+}
+
+/// A carried common slot cannot cross a join: the extra physical column would shift the
+/// join's combined descriptor row, so the join refuses the carrying child loudly.
+#[test]
+fn carried_common_slot_entering_a_join_is_refused() {
+    let mut common_slot_map = BTreeMap::new();
+    common_slot_map.insert(9, slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT)));
+    let mut slot_map = BTreeMap::new();
+    slot_map.insert(3, slot_ref(2, 0, scalar_type(TPrimitiveType::BIGINT)));
+    let mut project = base_plan_node(2, TPlanNodeType::PROJECT_NODE, 1, vec![1]);
+    project.project_node = Some(TProjectNode::new(Some(slot_map), Some(common_slot_map)));
+
+    // The join's non-equality conjunct consumes the project's common slot 9 from above.
+    let mut join = base_plan_node(3, TPlanNodeType::HASH_JOIN_NODE, 2, vec![1, 4]);
+    join.hash_join_node = Some(THashJoinNode::new(
+        TJoinOp::INNER_JOIN,
+        vec![TEqJoinCondition::new(
+            slot_ref(3, 1, scalar_type(TPrimitiveType::BIGINT)),
+            slot_ref(4, 4, scalar_type(TPrimitiveType::BIGINT)),
+            Some(TExprOpcode::EQ),
+        )],
+        Some(vec![binary_pred(
+            TExprOpcode::GT,
+            slot_ref(9, 1, scalar_type(TPrimitiveType::BIGINT)),
+            int_literal(0),
+        )]),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    ));
+
+    let desc = desc_table(
+        vec![(0, Some(100)), (1, None), (4, Some(100))],
+        vec![
+            slot(1, 0, 0, "a", scalar_type(TPrimitiveType::BIGINT)),
+            slot(2, 0, 1, "b", scalar_type(TPrimitiveType::BIGINT)),
+            slot(3, 1, 0, "b2", scalar_type(TPrimitiveType::BIGINT)),
+            slot(4, 4, 0, "c", scalar_type(TPrimitiveType::BIGINT)),
+        ],
+    );
+    let err = translate_fragment(&params(
+        Some(TPlan::new(vec![
+            join,
+            project,
+            scan_node(0, 0),
+            scan_node(1, 4),
+        ])),
+        Some(desc),
+        None,
+    ))
+    .unwrap_err();
+    assert!(
+        matches!(&err, TranslateError::Descriptor(message)
+            if message.contains("carries common-expr columns") && message.contains("[9]")),
+        "{err:?}"
+    );
+}
+
+/// A consumer of the common slot beyond the aggregate (which re-materializes the row) still
+/// hits the loud zero-candidate descriptor error — never a silent wrong column.
+#[test]
+fn common_slot_consumed_beyond_the_aggregate_fails_loudly() {
+    // Upper project (tuple 3) references slot 35 above the aggregation.
+    let mut upper_map = BTreeMap::new();
+    upper_map.insert(40, slot_ref(35, 1, scalar_type(TPrimitiveType::DOUBLE)));
+    let mut upper = base_plan_node(8, TPlanNodeType::PROJECT_NODE, 1, vec![3]);
+    upper.project_node = Some(TProjectNode::new(Some(upper_map), None));
+
+    let agg = aggregation_node(
+        7,
+        2,
+        Vec::new(),
+        vec![aggregate_expr(
+            "sum",
+            scalar_type(TPrimitiveType::DOUBLE),
+            Some(slot_ref(27, 1, scalar_type(TPrimitiveType::DOUBLE))),
+        )],
+    );
+
+    let mut hidden = slot(35, 1, 2, "expr_35", scalar_type(TPrimitiveType::DOUBLE));
+    hidden.is_materialized = Some(false);
+    let desc = desc_table(
+        vec![(0, Some(100)), (1, None), (2, None), (3, None)],
+        vec![
+            slot(21, 0, 0, "p_type", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(
+                22,
+                0,
+                1,
+                "l_extendedprice",
+                scalar_type(TPrimitiveType::DOUBLE),
+            ),
+            slot(23, 0, 2, "l_discount", scalar_type(TPrimitiveType::DOUBLE)),
+            slot(21, 1, 0, "p_type", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(27, 1, 1, "disc_price", scalar_type(TPrimitiveType::DOUBLE)),
+            hidden,
+            slot(
+                36,
+                2,
+                0,
+                "total_revenue",
+                scalar_type(TPrimitiveType::DOUBLE),
+            ),
+            slot(40, 3, 0, "promo", scalar_type(TPrimitiveType::DOUBLE)),
+        ],
+    );
+    let err = translate_fragment(&params(
+        Some(TPlan::new(vec![
+            upper,
+            agg,
+            consumed_common_project(6, true),
+            scan_node(0, 0),
+        ])),
+        Some(desc),
+        None,
+    ))
+    .unwrap_err();
+    assert!(
+        matches!(&err, TranslateError::Descriptor(message) if message.contains("slot 35")),
+        "{err:?}"
+    );
+}
+
+/// A width-preserving fragment root (a SELECT over the carrying project) is narrowed back to
+/// the descriptor row before names are derived: the carried column never leaves the fragment.
+#[test]
+fn root_filter_over_a_carried_common_slot_is_narrowed_at_the_root() {
+    let mut select = base_plan_node(7, TPlanNodeType::SELECT_NODE, 1, vec![1]);
+    select.select_node = Some(TSelectNode::new(None));
+    select.conjuncts = Some(vec![binary_pred(
+        TExprOpcode::GT,
+        slot_ref(35, 1, scalar_type(TPrimitiveType::DOUBLE)),
+        float_literal_typed(0.0, TPrimitiveType::DOUBLE),
+    )]);
+    let translated = translate_fragment(&params(
+        Some(TPlan::new(vec![
+            select,
+            consumed_common_project(6, true),
+            scan_node(0, 0),
+        ])),
+        Some(consumed_common_desc()),
+        None,
+    ))
+    .unwrap();
+
+    assert_eq!(translated.output_names, vec!["p_type", "disc_price"]);
+    let root = root(&translated.plan);
+    let rel::RelType::Project(narrow) = root.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected the narrowing projection at the root");
+    };
+    assert!(narrow.expressions.is_empty());
+    let substrait::proto::rel_common::EmitKind::Emit(emit) =
+        narrow.common.as_ref().unwrap().emit_kind.as_ref().unwrap()
+    else {
+        panic!("expected an emit mapping on the narrowing projection");
+    };
+    assert_eq!(emit.output_mapping, vec![0, 1]);
+    // The filter's condition reads the carried column 2 under the narrowing projection.
+    let rel::RelType::Filter(filter) = narrow.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected the root filter under the narrowing projection");
+    };
+    assert_eq!(
+        field_index(scalar_arg(filter.condition.as_deref().unwrap(), 0)),
+        2
+    );
+}
+
+/// Fragment output expressions count as consumers above the root: a root-project fragment
+/// whose output_exprs read the common slot resolves it through the carried column, and the
+/// output projection narrows naturally.
+#[test]
+fn fragment_output_exprs_consume_a_common_slot() {
+    let translated = translate_fragment(&params(
+        Some(TPlan::new(vec![
+            consumed_common_project(6, true),
+            scan_node(0, 0),
+        ])),
+        Some(consumed_common_desc()),
+        Some(vec![
+            slot_ref(21, 1, scalar_type(TPrimitiveType::VARCHAR)),
+            slot_ref(35, 1, scalar_type(TPrimitiveType::DOUBLE)),
+        ]),
+    ))
+    .unwrap();
+
+    assert_eq!(translated.output_names, vec!["p_type", "expr_35"]);
+    let root = root(&translated.plan);
+    let rel::RelType::Project(project) = root.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected the root output projection");
+    };
+    assert_eq!(project.expressions.len(), 2);
+    assert_eq!(field_index(&project.expressions[1]), 2);
+}
+
+/// A sort ordering over the carried slot resolves to the carried column, the column survives
+/// the width-preserving sort, and the root narrows it away.
+#[test]
+fn sort_over_a_carried_common_slot_resolves_and_narrows() {
+    let sort_info = TSortInfo::new(
+        vec![slot_ref(35, 1, scalar_type(TPrimitiveType::DOUBLE))],
+        vec![true],
+        vec![false],
+        None,
+    );
+    let mut sort = base_plan_node(7, TPlanNodeType::SORT_NODE, 1, vec![1]);
+    sort.sort_node = Some(TSortNode::new(
+        sort_info, false, None, None, None, None, None, None, None, None, None, None, None, None,
+        None, None, None, None, None, None, None, None, None, None, None,
+    ));
+    let translated = translate_fragment(&params(
+        Some(TPlan::new(vec![
+            sort,
+            consumed_common_project(6, true),
+            scan_node(0, 0),
+        ])),
+        Some(consumed_common_desc()),
+        None,
+    ))
+    .unwrap();
+
+    assert_eq!(translated.output_names, vec!["p_type", "disc_price"]);
+    let root = root(&translated.plan);
+    let rel::RelType::Project(narrow) = root.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected the narrowing projection at the root");
+    };
+    let rel::RelType::Sort(sorted) = narrow.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected the sort under the narrowing projection");
+    };
+    assert_eq!(field_index(sorted.sorts[0].expr.as_ref().unwrap()), 2);
+}
