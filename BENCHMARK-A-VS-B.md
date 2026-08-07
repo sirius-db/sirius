@@ -60,6 +60,10 @@
   /tmp/sirius-tpch-bench/bench/A4/timings.csv; per-query table + open-issue detail in
   QUERY-TIMEOUT-ANALYSIS.md "Final status".
 
+- 2026-08-07 (final): **20/22 pass** after fe236e8b (q14 common slots). A5 sweep CSV:
+  /tmp/sirius-tpch-bench/bench/A5/timings.csv. Warm medians 288 ms (q01) to 1.2 s (q08).
+  Outstanding: q02 (#26), q15 flake (#29), and the deferred #24 value deficit.
+
 ## Results
 
 (pending — table + plot land here; partial A data preserved at /tmp/sirius-tpch-bench/bench/)

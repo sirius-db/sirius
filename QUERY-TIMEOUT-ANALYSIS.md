@@ -454,3 +454,18 @@ Remaining open, in priority order:
   rotation (custkey 6226 drops two ranks) — legal under "ordering per Sirius's own values" but
   beyond the documented adjacent-swap behavior. Same low-bias signature as #24, larger than
   the documented 0.1–0.2 %.
+
+## 20/22 (2026-08-07, commit fe236e8b)
+
+The q14 common-slot materialization landed (fe236e8b: a project's `common_slot_map` slots
+consumed by ancestor nodes are appended as carried trailing columns, dropped at every
+re-materializing node, refused at joins). Final sweep (A5, 3 timed runs, 30 s ceiling,
+restart-on-failure): **20 of 22 pass** — every query except:
+
+- q02: the engine-thread wedge (#26) — hard hang, needs engine-side abort/watchdog.
+- q15: the empty-result flake (#29) — intermittent 0-row result (~1 in 4), FP64
+  exact-equality race; passes with in-band values otherwise.
+
+q14 = 16.381152163162234 vs DuckDB 16.380778626395543 (+0.0023%). q03/q10 pass with exact
+key sets and internally-exact ordering; individual revenue values run up to 0.40% low (the
+deferred #24 deficit). CSV: /tmp/sirius-tpch-bench/bench/A5/timings.csv.
