@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "exec/invocable.hpp"
 #include "io/cache/prefetching_cache.hpp"
 #include "io/io_context.hpp"
 
@@ -115,24 +116,21 @@ class sirius_datasource : public cudf::io::datasource {
   /// \brief Hint the IO layer about @p ranges that this scan will (or might) read
   /// soon.
   ///
-  /// The behaviour depends on @p site and the io_ctx's
-  /// @c preferred_prefetching_stage:
-  ///   - @c initialized / @c queued / @c preparing: only honored when @p site
-  ///     matches the ioctx's preferred stage.  Hands @p ranges to the
-  ///     prefetching cache and stashes the returned @c prefetching_handle on
-  ///     this datasource so a later @c fadvise(reading) can cancel.
-  ///   - @c reading: always honored.  If a handle is stored (i.e. a prior
-  ///     insert enqueued work), cancel it so the cache worker drops
-  ///     still-pending entries.
-  ///   - @c none: no-op (either the call site asked for nothing, or the
-  ///     backend opted out of prefetching).
-  ///
-  /// Calling @c fadvise with a @p site other than @c reading while a handle
-  /// is already stored emits a warning: the datasource lifecycle expects one
-  /// insert per scan, with a single @c reading call at consume time.
+  /// Hands @p ranges to the prefetching cache, stashes the returned
+  /// @c prefetching_handle on this datasource (which disposes the request when
+  /// it goes away) and drives it to @c scan_stage::initialized.  No-op when the
+  /// cache is unavailable.  A second inserting call while an active handle is
+  /// already stored is a caller bug and only logs a warning: the datasource
+  /// lifecycle expects one insert per scan.
   void fadvise(std::span<const cudf::io::text::byte_range_info> ranges, std::optional<int> dev_id);
 
-  void prefetch(cache::scan_stage site);
+  /// Drive the stashed handle's consumer stage to @p site.
+  void update(cache::scan_stage site);
+
+  /// Issue prefetch IO for the stashed handle.  @p on_done fires exactly once
+  /// with the outcome — inline when no IO is issued, otherwise from the IO
+  /// completion.  Returns whether IO was issued.
+  bool prefetch_async(exec::invocable<void(bool) noexcept> on_done);
 
   [[nodiscard]] bool uses_prefetching_cache() const noexcept;
 
@@ -140,8 +138,7 @@ class sirius_datasource : public cudf::io::datasource {
   std::shared_ptr<ioctx> _io_ctx;
   std::shared_ptr<io_object> _io_object;
   /// Handle of the most recent insert into the prefetching cache, or empty
-  /// if none was made.  fadvise(reading) uses this to cancel still-pending
-  /// work.
+  /// if none was made.  Disposing it lets the cache reclaim the request.
   cache::prefetching_handle _prefetch_handle;
 };
 

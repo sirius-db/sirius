@@ -18,6 +18,7 @@
 
 #include "blockingconcurrentqueue.h"
 #include "exec/admission_control.hpp"
+#include "exec/invocable.hpp"
 #include "exec/scoped_dispatcher.hpp"
 #include "exec/semi_future.hpp"
 #include "exec/thread_pool.hpp"
@@ -61,21 +62,23 @@ namespace sirius::io::cache {
   });
 }
 
-struct prefetch_request_context {
-  /// @p consumer_state is the consumer-side machine the owning handle drives;
-  /// the request only observes it.
-  explicit prefetch_request_context(const io_object& file,
-                                    std::uint32_t ts,
-                                    std::shared_ptr<const consumer_stage> consumer_state) noexcept
-    : timestamp(ts),
-      obj(file.shared_from_this()),
-      producer(std::make_shared<producer_stage>()),
-      consumer(std::move(consumer_state))
-  {
-  }
+/// One prefetch request: the two stage machines plus the chunk set they cover.
+/// Held by value — the cache's queues and the owning @ref prefetching_handle
+/// each carry a copy, so the stages outlive whichever side finishes first.
+struct prefetch_request {
+  std::shared_ptr<const io_object> obj;
+  std::shared_ptr<producer_stage> producer;
+  std::shared_ptr<consumer_stage> consumer;
+  std::shared_ptr<const std::vector<cached_chunk*>> chunks;
+  std::uint32_t timestamp{0};
+  /// Preferred NUMA node for the staging buffers, derived from the requesting
+  /// GPU's topology.  -1 means "no preference" (allocate from any arena).
+  int preferred_numa{-1};
 
-  /// True once the consumer has queued the scan (or moved past it) and has not
-  /// been disposed.
+  /// False for the empty request the queues use as a wakeup sentinel.
+  [[nodiscard]] explicit operator bool() const noexcept { return producer != nullptr; }
+
+  /// True once the consumer has queued the scan and has not been disposed.
   [[nodiscard]] bool is_active() const noexcept
   {
     if (!consumer) { return false; }
@@ -88,20 +91,14 @@ struct prefetch_request_context {
   {
     return !consumer || consumer->get() == consumer_stage::disposed;
   }
-
-  const std::uint32_t timestamp;
-  const std::shared_ptr<const io_object> obj;
-  std::shared_ptr<producer_stage> producer;
-  std::shared_ptr<const consumer_stage> consumer;
-  std::shared_ptr<const std::vector<cached_chunk*>> chunks;
-  /// Preferred NUMA node for the staging buffers, derived from the requesting
-  /// GPU's topology.  -1 means "no preference" (allocate from any arena).
-  int preferred_numa{-1};
 };
+
+using request_queue_type = duckdb_moodycamel::BlockingConcurrentQueue<prefetch_request>;
 
 class prefetching_handle {
  public:
-  prefetching_handle() noexcept;
+  prefetching_handle() noexcept = default;
+  /// Marks the consumer disposed so the evictor can reclaim the request.
   ~prefetching_handle();
   prefetching_handle(prefetching_handle const&)            = delete;
   prefetching_handle& operator=(prefetching_handle const&) = delete;
@@ -109,34 +106,22 @@ class prefetching_handle {
   prefetching_handle(prefetching_handle&& o) noexcept;
   prefetching_handle& operator=(prefetching_handle&& o) noexcept;
 
-  void activate() noexcept;
-
-  void cancel() noexcept;
+  /// Drive the consumer-side stage machine.
+  void update(scan_stage stage) noexcept;
 
   [[nodiscard]] bool is_active() const noexcept;
 
-  /// The consumer-side state machine of the scan.  Mutable: the scan drives it.
-  [[nodiscard]] std::shared_ptr<consumer_stage> consumer() const noexcept;
-
-  /// The chunks of the underlying request.  Immutable and shared with the
-  /// cache's worker threads.  Null when the handle is empty.
+  /// The chunks of the underlying request.  Null when the handle is empty.
   [[nodiscard]] std::shared_ptr<const std::vector<cached_chunk*>> chunks() const noexcept;
-
-  [[nodiscard]] std::shared_ptr<prefetch_request_context> get_context() const noexcept;
 
   explicit operator bool() const noexcept;
 
  private:
   friend class prefetching_cache;
-  class prefetch_lifecycle_manager;
 
-  /// The producer-side state machine of the scan.  Const: the handle only
-  /// observes the progress the cache's worker threads make.
-  [[nodiscard]] std::shared_ptr<const producer_stage> producer() const noexcept;
+  explicit prefetching_handle(prefetch_request req) noexcept;
 
-  prefetching_handle(std::unique_ptr<prefetch_lifecycle_manager> mgr) noexcept;
-
-  std::unique_ptr<prefetch_lifecycle_manager> _state;
+  prefetch_request _req;
 };
 
 // ---------------------------------------------------------------------------
@@ -155,14 +140,10 @@ class prefetching_cache {
   // datasource keeps insert() out of the public API while still letting
   // fadvise dispatch through it.
   friend class sirius::io::sirius_datasource;
-  // prefetching_handle calls notify_disposed() on cancel — needs access to
-  // the private method.
   friend class prefetching_handle;
 
  public:
-  using byte_range         = cudf::io::text::byte_range_info;
-  using prefetch_request   = std::shared_ptr<prefetch_request_context>;
-  using request_queue_type = duckdb_moodycamel::BlockingConcurrentQueue<prefetch_request>;
+  using byte_range = cudf::io::text::byte_range_info;
 
   prefetching_cache(cucascade::memory::memory_reservation_manager& reservation_manager,
                     ioctx* io_ctx,
@@ -195,6 +176,11 @@ class prefetching_cache {
     uint8_t* device_ptr,
     rmm::cuda_stream_view stream,
     prefetching_handle* out_handle = nullptr);
+
+  /// Issue prefetch IO for @p handle's request.  @p on_done fires exactly once
+  /// with the outcome — inline when no IO is issued, otherwise from the IO
+  /// completion.  Returns whether IO was issued.
+  bool prefetch(prefetching_handle& handle, exec::invocable<void(bool) noexcept> on_done);
 
   [[nodiscard]] std::string summary() const;
 
@@ -233,7 +219,6 @@ class prefetching_cache {
   static void drain_and_abandon(request_queue_type& queue) noexcept;
 
   void prepare_loop(const std::stop_token& st);
-  void prefetch_loop(const std::stop_token& st);
   void evict_loop(const std::stop_token& st);
 
   file_entry& get_or_create_file_entry(const io_object& obj);
@@ -279,10 +264,7 @@ class prefetching_cache {
   request_queue_type _preparation_queue;
   std::stop_source _preparation_stop_source;
 
-  std::jthread _prefetch_thread;
   exec::admission_control _rate_limiter;
-  request_queue_type _prefetch_queue;
-  std::stop_source _prefetch_stop_source;
 
   std::jthread _evictor_thread;
   request_queue_type _eviction_queue;

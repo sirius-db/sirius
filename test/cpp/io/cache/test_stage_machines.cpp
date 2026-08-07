@@ -19,12 +19,12 @@
 #include "io/cache/types.hpp"
 
 #include <chrono>
+#include <future>
 #include <memory>
 #include <string>
+#include <thread>
 #include <tuple>
 #include <vector>
-#include <future>
-#include <thread>
 
 using sirius::io::cache::consumer_stage;
 using sirius::io::cache::producer_stage;
@@ -333,63 +333,66 @@ class fake_io_object : public sirius::io::io_object {
   std::string _path{"memory://stage-machines"};
 };
 
-std::shared_ptr<sirius::io::cache::prefetch_request_context> make_request(
-  const std::shared_ptr<sirius::io::io_object>& obj,
-  const std::shared_ptr<const consumer_stage>& consumer)
+sirius::io::cache::prefetch_request make_request(const std::shared_ptr<sirius::io::io_object>& obj,
+                                                 const std::shared_ptr<consumer_stage>& consumer)
 {
-  return std::make_shared<sirius::io::cache::prefetch_request_context>(*obj, 0U, consumer);
+  sirius::io::cache::prefetch_request req;
+  req.obj      = obj;
+  req.producer = std::make_shared<sirius::io::cache::producer_stage>();
+  req.consumer = consumer;
+  return req;
 }
 
 }  // namespace
 
-TEST_CASE("prefetch_request_context predicates follow the consumer stage", "[stage][cache]")
+TEST_CASE("prefetch_request predicates follow the consumer stage", "[stage][cache]")
 {
   auto obj      = std::make_shared<fake_io_object>();
   auto consumer = std::make_shared<consumer_stage>();
   auto req      = make_request(obj, consumer);
 
-  CHECK_FALSE(req->is_active());
-  CHECK_FALSE(req->is_cancelled());
+  CHECK_FALSE(req.is_active());
+  CHECK_FALSE(req.is_cancelled());
 
   REQUIRE(consumer->mark_queued());
-  CHECK(req->is_active());
-  CHECK_FALSE(req->is_cancelled());
+  CHECK(req.is_active());
+  CHECK_FALSE(req.is_cancelled());
 
   REQUIRE(consumer->mark_preparing());
-  CHECK(req->is_active());
+  CHECK(req.is_active());
 
   REQUIRE(consumer->mark_reading());
-  CHECK(req->is_active());
+  CHECK(req.is_active());
 
   consumer->mark_disposed();
-  CHECK_FALSE(req->is_active());
-  CHECK(req->is_cancelled());
+  CHECK_FALSE(req.is_active());
+  CHECK(req.is_cancelled());
 }
 
-TEST_CASE("prefetch_request_context predicates hold when stages are skipped", "[stage][cache]")
+TEST_CASE("prefetch_request predicates hold when stages are skipped", "[stage][cache]")
 {
   auto obj      = std::make_shared<fake_io_object>();
   auto consumer = std::make_shared<consumer_stage>();
   auto req      = make_request(obj, consumer);
 
-  CHECK_FALSE(req->is_active());
+  CHECK_FALSE(req.is_active());
 
   REQUIRE(consumer->mark_reading());
-  CHECK(req->is_active());
-  CHECK_FALSE(req->is_cancelled());
+  CHECK(req.is_active());
+  CHECK_FALSE(req.is_cancelled());
 
   consumer->mark_disposed();
-  CHECK_FALSE(req->is_active());
-  CHECK(req->is_cancelled());
+  CHECK_FALSE(req.is_active());
+  CHECK(req.is_cancelled());
 }
 
-TEST_CASE("prefetch_request_context without a consumer is cancelled", "[stage][cache]")
+TEST_CASE("prefetch_request without a consumer is cancelled", "[stage][cache]")
 {
   auto obj = std::make_shared<fake_io_object>();
   auto req = make_request(obj, nullptr);
 
-  CHECK_FALSE(req->is_active());
-  CHECK(req->is_cancelled());
+  CHECK_FALSE(req.is_active());
+  CHECK(req.is_cancelled());
 }
 
 TEST_CASE("prepared requires every chunk to own a buffer", "[stage][cache]")
@@ -453,4 +456,30 @@ TEST_CASE("prepared fires once the chunks are backed", "[stage][cache]")
   CHECK(producer.mark_prepared());
   CHECK(producer.get() == producer_stage::prepared);
   CHECK(producer.mark_loading());
+}
+
+TEST_CASE("to_consumer_stage maps every scan_stage", "[stage][cache]")
+{
+  using sirius::io::cache::scan_stage;
+  using sirius::io::cache::to_consumer_stage;
+
+  CHECK_FALSE(to_consumer_stage(scan_stage::none).has_value());
+  CHECK(to_consumer_stage(scan_stage::initialized) == consumer_stage::initialized);
+  CHECK(to_consumer_stage(scan_stage::queued) == consumer_stage::queued);
+  CHECK(to_consumer_stage(scan_stage::preparing) == consumer_stage::preparing);
+  CHECK(to_consumer_stage(scan_stage::reading) == consumer_stage::reading);
+  CHECK(to_consumer_stage(scan_stage::disposed) == consumer_stage::disposed);
+}
+
+TEST_CASE("to_consumer_stage results drive the consumer machine forward", "[stage][cache]")
+{
+  using sirius::io::cache::scan_stage;
+  using sirius::io::cache::to_consumer_stage;
+
+  consumer_stage consumer;
+  CHECK(consumer.mark(*to_consumer_stage(scan_stage::queued)));
+  CHECK(consumer.get() == consumer_stage::queued);
+  CHECK_FALSE(consumer.mark(*to_consumer_stage(scan_stage::initialized)));
+  CHECK(consumer.mark(*to_consumer_stage(scan_stage::disposed)));
+  CHECK(consumer.get() == consumer_stage::disposed);
 }

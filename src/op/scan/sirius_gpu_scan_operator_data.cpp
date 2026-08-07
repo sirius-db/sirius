@@ -18,17 +18,52 @@
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <data/sirius_converter_registry.hpp>
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
+#include <scan_manager/readahead_scan_manager.hpp>
 
 #include <algorithm>
 
 namespace sirius::op::scan {
+
+scan_operator_input::scan_operator_input(
+  std::shared_ptr<scan_info> metadata,
+  std::shared_ptr<scan_manager::readahead_scan_manager> readahead,
+  std::size_t operator_id)
+  : materialization_info(std::move(metadata)),
+    _readahead(std::move(readahead)),
+    _operator_id(operator_id)
+{
+  auto const& stored = std::get<std::shared_ptr<scan_info>>(materialization_info);
+  if (_readahead && stored) {
+    _readahead->register_scan_task(std::weak_ptr<scan_info>(stored), _operator_id);
+  }
+}
+
+scan_operator_input::scan_operator_input(
+  std::shared_ptr<cucascade::data_batch> cached_batch,
+  std::shared_ptr<scan_manager::readahead_scan_manager> readahead,
+  std::size_t operator_id)
+  : materialization_info(std::move(cached_batch)),
+    _readahead(std::move(readahead)),
+    _operator_id(operator_id)
+{
+}
+
+void scan_operator_input::update(io::cache::scan_stage site) const
+{
+  if (_readahead) { _readahead->update(_operator_id, site); }
+  if (!has_scan_metadata()) { return; }
+  auto hints = get_fadvise_hints();
+  for (auto& hint : hints) {
+    hint.datasource->update(site);
+  }
+}
 
 void scan_operator_input::prepare_for_processing(
   const ::cucascade::memory::memory_space* requested_memory_space, rmm::cuda_stream_view stream)
 {
   gpu_memory_space = const_cast<::cucascade::memory::memory_space*>(requested_memory_space);
   if (!std::holds_alternative<std::shared_ptr<cucascade::data_batch>>(materialization_info)) {
-    prefetch(io::cache::scan_stage::preparing);
+    update(io::cache::scan_stage::preparing);
     return;
   }
   auto batch = std::get<std::shared_ptr<cucascade::data_batch>>(materialization_info);
@@ -62,8 +97,8 @@ void scan_operator_input::prepare_for_processing(
 
 std::size_t scan_operator_input::get_estimated_size_in_bytes() const
 {
-  if (std::holds_alternative<std::unique_ptr<scan_info>>(materialization_info)) {
-    return std::get<std::unique_ptr<scan_info>>(materialization_info)->estimated_bytes();
+  if (std::holds_alternative<std::shared_ptr<scan_info>>(materialization_info)) {
+    return std::get<std::shared_ptr<scan_info>>(materialization_info)->estimated_bytes();
   }
   if (std::holds_alternative<std::shared_ptr<cucascade::data_batch>>(materialization_info)) {
     auto batch = std::get<std::shared_ptr<cucascade::data_batch>>(materialization_info);
@@ -85,9 +120,9 @@ std::size_t scan_operator_input::get_estimated_size_in_bytes() const
 
 std::size_t scan_operator_input::get_estimated_working_set_size_in_bytes() const
 {
-  if (std::holds_alternative<std::unique_ptr<scan_info>>(materialization_info)) {
+  if (std::holds_alternative<std::shared_ptr<scan_info>>(materialization_info)) {
     auto const decode_bytes =
-      std::get<std::unique_ptr<scan_info>>(materialization_info)->estimated_working_set_bytes();
+      std::get<std::shared_ptr<scan_info>>(materialization_info)->estimated_working_set_bytes();
     if (mvcc_keep_mask.has_mask()) {
       // A partially visible insert-delta split is mask-filtered right after
       // decode: the decoded input and the compacted output (up to input-sized)

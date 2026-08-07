@@ -27,8 +27,10 @@
 namespace sirius::scan_manager {
 
 load_balancing_scan_batch_coalescer::metadata_processing_state*
-load_balancing_scan_batch_coalescer::register_pipeline(op::scan::sirius_gpu_scan_operator* scan_op,
-                                                       std::shared_ptr<balancing_strategy> balancer)
+load_balancing_scan_batch_coalescer::register_pipeline(
+  op::scan::sirius_gpu_scan_operator* scan_op,
+  std::shared_ptr<balancing_strategy> balancer,
+  std::shared_ptr<readahead_scan_manager> readahead)
 {
   if (!scan_op) return nullptr;
 
@@ -37,8 +39,12 @@ load_balancing_scan_batch_coalescer::register_pipeline(op::scan::sirius_gpu_scan
   auto coalescer   = ingestible->create_batch_coalescer();
   auto uid         = scan_op->get_operator_id();
   auto pipeline_id = scan_op->get_pipeline()->get_pipeline_id();
-  auto state       = std::make_unique<metadata_processing_state>(
-    uid, pipeline_id, std::move(coalescer), std::move(connector), std::move(balancer));
+  auto state       = std::make_unique<metadata_processing_state>(uid,
+                                                           pipeline_id,
+                                                           std::move(coalescer),
+                                                           std::move(connector),
+                                                           std::move(balancer),
+                                                           std::move(readahead));
   _pipeline_order.push_back(uid);
   auto state_ptr = state.get();
   _slots[uid]    = std::move(state);
@@ -96,8 +102,9 @@ void load_balancing_scan_batch_coalescer::process_provider_inputs(metadata_proce
 
   // Balance one coalesced batch onto a GPU and hand it to the connector.
   auto emit = [&state](std::unique_ptr<op::scan::scan_info> batch) {
-    auto op_data = std::make_unique<op::scan::scan_operator_input>(std::move(batch));
-    auto dev_id  = state.balancer->get_next_gpu(state.pipeline_id, op_data.get());
+    auto op_data = std::make_unique<op::scan::scan_operator_input>(
+      std::move(batch), state.readahead, state.op_id);
+    auto dev_id = state.balancer->get_next_gpu(state.pipeline_id, op_data.get());
     if (dev_id.has_value() && *dev_id >= 0) { op_data->set_preferred_device_id(dev_id.value()); }
 
     auto fadvise_hints = op_data->get_fadvise_hints();
@@ -108,7 +115,6 @@ void load_balancing_scan_batch_coalescer::process_provider_inputs(metadata_proce
         }
       }
     }
-    op_data->prefetch(io::cache::scan_stage::initialized);
     state.connector->push_split(std::move(op_data));
   };
 
@@ -166,19 +172,28 @@ void load_balancing_scan_batch_coalescer::process_provider_inputs(metadata_proce
 void load_balancing_scan_batch_coalescer::process_cached_entries(metadata_processing_state& state,
                                                                  std::stop_token const& stop)
 {
-  drain_cached_provider(*state.batch_provider, *state.connector, stop, state.row_filter_pending);
+  drain_cached_provider(*state.batch_provider,
+                        *state.connector,
+                        stop,
+                        state.row_filter_pending,
+                        state.readahead,
+                        state.op_id);
 }
 
-void load_balancing_scan_batch_coalescer::drain_cached_provider(databatch_provider& provider,
-                                                                split_connector& connector,
-                                                                std::stop_token const& stop,
-                                                                bool row_filter_pending)
+void load_balancing_scan_batch_coalescer::drain_cached_provider(
+  databatch_provider& provider,
+  split_connector& connector,
+  std::stop_token const& stop,
+  bool row_filter_pending,
+  std::shared_ptr<readahead_scan_manager> readahead,
+  std::size_t operator_id)
 {
   try {
     while (!stop.stop_requested()) {
       auto next = provider.get_next_batch();
       if (next.data) {
-        auto split = std::make_unique<op::scan::scan_operator_input>(std::move(next.data));
+        auto split = std::make_unique<op::scan::scan_operator_input>(
+          std::move(next.data), readahead, operator_id);
         split->mvcc_keep_mask               = std::move(next.mvcc_keep_mask);
         split->needs_carrier_conversion     = next.needs_carrier_conversion;
         split->conversion_destination_bytes = next.conversion_destination_bytes;
@@ -191,7 +206,8 @@ void load_balancing_scan_batch_coalescer::drain_cached_provider(databatch_provid
         // splits fold filter costs into their own estimates. Same fadvise +
         // opportunistic prefetch as the walk path; host-backed splits have
         // no file ranges, so the hints no-op.
-        auto split = std::make_unique<op::scan::scan_operator_input>(std::move(next.scan_info));
+        auto split = std::make_unique<op::scan::scan_operator_input>(
+          std::move(next.scan_info), readahead, operator_id);
         split->mvcc_keep_mask = std::move(next.mvcc_keep_mask);
         std::optional<int> device;
         if (next.preferred_device >= 0) {
@@ -204,7 +220,6 @@ void load_balancing_scan_batch_coalescer::drain_cached_provider(databatch_provid
             hint.datasource->fadvise(hint.ranges, device);
           }
         }
-        split->prefetch(io::cache::scan_stage::initialized);
         connector.push_split(std::move(split));
         continue;
       }

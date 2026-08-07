@@ -375,13 +375,6 @@ class rest_reactor {
   /// @c rest_ioctx::create_io_object.  Always throws.
   static std::unique_ptr<io_object_type> create_io_object(std::string path);
 
-  static constexpr cache::scan_stage preferred_prefetching_stage() noexcept
-  {
-    // Network round-trips are high-latency; read ahead on demand rather than
-    // eagerly prefilling the whole working set.
-    return cache::scan_stage::preparing;
-  }
-
   /// REST has no physical block alignment, so this only coalesces overlapping /
   /// adjacent ranges (honoring a caller-supplied alignment >= 1 as a lower
   /// bound) into a minimal sorted set — fewer ranges means fewer GETs.

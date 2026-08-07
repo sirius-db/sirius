@@ -193,19 +193,16 @@ void sirius_datasource::fadvise(std::span<const cudf::io::text::byte_range_info>
   if (cache == nullptr || !_io_ctx->can_use_prefetching_cache()) { return; }
 
   // The contract is "one scan, one datasource": a second inserting fadvise on
-  // a datasource that already carries a handle is a caller bug.  Warn loudly;
-  // cancel the stale handle so the worker drops the old request and we don't
-  // leak both into the cache.
-  if (_prefetch_handle) {
-    if (_prefetch_handle.is_active()) {
-      SIRIUS_LOG_WARN(
-        "sirius_datasource::fadvise: a prefetching_handle was already stored on "
-        "this datasource (path={}); cancelling the stale request.  Each scan "
-        "should own a unique datasource.",
-        _io_object->object_path());
-      return;
-    }
-    _prefetch_handle.cancel();
+  // a datasource that already carries an active handle is a caller bug.  Warn
+  // loudly and keep the in-flight request.  An inactive stale handle is
+  // disposed by the move-assignment below.
+  if (_prefetch_handle && _prefetch_handle.is_active()) {
+    SIRIUS_LOG_WARN(
+      "sirius_datasource::fadvise: a prefetching_handle was already stored on "
+      "this datasource (path={}); cancelling the stale request.  Each scan "
+      "should own a unique datasource.",
+      _io_object->object_path());
+    return;
   }
 
   // Hand the ranges to the cache.  insert() returns an empty handle when
@@ -215,27 +212,19 @@ void sirius_datasource::fadvise(std::span<const cudf::io::text::byte_range_info>
   if (handle) { _prefetch_handle = std::move(handle); }
 }
 
-void sirius_datasource::prefetch(cache::scan_stage site)
+void sirius_datasource::update(cache::scan_stage site)
 {
-  auto const preferred = _io_ctx->preferred_prefetching_stage();
-  if (preferred == cache::scan_stage::none) { return; }
   if (!_prefetch_handle) { return; }
+  _prefetch_handle.update(site);
+}
 
-  auto consumer = _prefetch_handle.consumer();
-  if (consumer) {
-    switch (site) {
-      case cache::scan_stage::queued: std::ignore = consumer->mark_queued(); break;
-      case cache::scan_stage::preparing: std::ignore = consumer->mark_preparing(); break;
-      case cache::scan_stage::reading: std::ignore = consumer->mark_reading(); break;
-      default: break;
-    }
+bool sirius_datasource::prefetch_async(exec::invocable<void(bool) noexcept> on_done)
+{
+  if (!_prefetch_handle || !uses_prefetching_cache()) {
+    on_done(false);
+    return false;
   }
-
-  if (site == cache::scan_stage::reading) {
-    _prefetch_handle.cancel();
-  } else if (site == preferred) {
-    _prefetch_handle.activate();
-  }
+  return _io_ctx->cache()->prefetch(_prefetch_handle, std::move(on_done));
 }
 
 bool sirius_datasource::uses_prefetching_cache() const noexcept

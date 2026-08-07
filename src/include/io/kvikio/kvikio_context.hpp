@@ -153,7 +153,6 @@ class kvikio_remote_io_object final : public kvikio_object {
  *     where the platform allows).
  *   - @c supports_vector_host_read: false — no batched dispatch path.
  *   - @c supports_host_to_device_read: false — no bounce-staging path.
- *   - @c preferred_prefetching_stage: @c none.
  */
 class kvikio_context final : public ioctx {
  public:
@@ -190,10 +189,6 @@ class kvikio_context final : public ioctx {
   [[nodiscard]] bool supports_device_read() const noexcept override { return true; }
   [[nodiscard]] bool supports_vector_host_read() const noexcept override { return false; }
   [[nodiscard]] bool supports_host_to_device_read() const noexcept override { return false; }
-  [[nodiscard]] cache::scan_stage preferred_prefetching_stage() const noexcept override
-  {
-    return cache::scan_stage::none;
-  }
 
   /// kvikIO applies no physical block alignment of its own, so ranges pass
   /// through unchanged.

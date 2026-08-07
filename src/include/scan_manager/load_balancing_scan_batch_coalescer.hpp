@@ -24,6 +24,7 @@
 #include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "scan_manager/balancing_strategy.hpp"
 #include "scan_manager/mvcc_chunk_mask.hpp"
+#include "scan_manager/readahead_scan_manager.hpp"
 #include "scan_manager/split_connector.hpp"
 
 #include <cudf/io/text/byte_range_info.hpp>
@@ -96,12 +97,14 @@ class load_balancing_scan_batch_coalescer {
                                        std::size_t pipeline_id,
                                        std::shared_ptr<op::scan::batch_coalescer> coalescer,
                                        std::shared_ptr<split_connector> connector,
-                                       std::shared_ptr<balancing_strategy> balancer)
+                                       std::shared_ptr<balancing_strategy> balancer,
+                                       std::shared_ptr<readahead_scan_manager> readahead = nullptr)
       : op_id(op_id),
         pipeline_id(pipeline_id),
         coalescer(std::move(coalescer)),
         balancer(std::move(balancer)),
-        connector(std::move(connector))
+        connector(std::move(connector)),
+        readahead(std::move(readahead))
     {
       assert(this->coalescer);
       assert(this->connector);
@@ -121,6 +124,9 @@ class load_balancing_scan_batch_coalescer {
     std::shared_ptr<balancing_strategy> balancer;
     std::shared_ptr<split_connector> connector;
     std::unique_ptr<databatch_provider> batch_provider;
+    /// Per-query readahead bookkeeping this slot's splits report into; null
+    /// when the caller does not track readahead (e.g. unit tests).
+    std::shared_ptr<readahead_scan_manager> readahead;
     /// Whether the op's ingestible applies a row-filter expression to cached
     /// batches; stamped onto each drained split so its working-set estimate
     /// covers the filter-by-copy peak.
@@ -136,8 +142,10 @@ class load_balancing_scan_batch_coalescer {
   /// sequencer task in the order they were added — typically scan_manager
   /// adds them in pipeline-id order so the head-of-line pipeline drains
   /// first.  The returned pointer is valid for the manager's lifetime.
-  metadata_processing_state* register_pipeline(op::scan::sirius_gpu_scan_operator* scan_op,
-                                               std::shared_ptr<balancing_strategy> balancer);
+  metadata_processing_state* register_pipeline(
+    op::scan::sirius_gpu_scan_operator* scan_op,
+    std::shared_ptr<balancing_strategy> balancer,
+    std::shared_ptr<readahead_scan_manager> readahead = nullptr);
 
   void use_cached_entries_for_pipeline(op::scan::sirius_gpu_scan_operator* scan_op,
                                        std::unique_ptr<databatch_provider> provider);
@@ -157,7 +165,9 @@ class load_balancing_scan_batch_coalescer {
   static void drain_cached_provider(databatch_provider& provider,
                                     split_connector& connector,
                                     std::stop_token const& stop,
-                                    bool row_filter_pending);
+                                    bool row_filter_pending,
+                                    std::shared_ptr<readahead_scan_manager> readahead = nullptr,
+                                    std::size_t operator_id                           = 0);
 
   /// Spawn the sequencer task on @p dispatcher.  The dispatcher must
   /// expose @c enqueue(callable) and inject a @c std::stop_token when

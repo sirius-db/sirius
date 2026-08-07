@@ -253,11 +253,6 @@ class uring_reactor {
   // the corresponding create_*_rx_request overloads (both of which this
   // reactor provides).
 
-  static constexpr cache::scan_stage preferred_prefetching_stage() noexcept
-  {
-    return cache::scan_stage::none;
-  }
-
  private:
   /// Enqueue a whole batch of device read chunks with a single wake
   /// notification.  Preferred over single-op enqueues when a caller

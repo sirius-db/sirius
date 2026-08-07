@@ -543,13 +543,15 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
     std::make_shared<round_robin_strategy>(std::vector<int>(gpu_ids.begin(), gpu_ids.end()));
 
   _metadata_processor = std::make_unique<load_balancing_scan_batch_coalescer>();
+  _readahead          = std::make_shared<readahead_scan_manager>();
+  _readahead->prepare_for_query(query);
 
   std::vector<cached_assignment> cached_assignments;
   for (auto const& scan_op : query.get_scan_operators()) {
     if (scan_op->type != ::sirius::op::SiriusPhysicalOperatorType::GPU_SCAN) { continue; }
     auto* op = &scan_op->Cast<op::scan::sirius_gpu_scan_operator>();
     if (_providers_by_op.find(op) != _providers_by_op.end()) { continue; }
-    _metadata_processor->register_pipeline(op, round_robin);
+    _metadata_processor->register_pipeline(op, round_robin, _readahead);
     // On a pinned-cache hit the coalescer serves this operator from a cached
     // batch_provider (process_cached_entries); skip the disk-reading
     // split_provider entirely so no read is issued for the cached scan. The
@@ -807,6 +809,7 @@ void sirius_scan_manager::reset()
   _pending_mvcc_mask_jobs.clear();
   _pending_insert_delta_jobs.clear();
   _metadata_processor.reset();
+  _readahead.reset();
   _dispatcher = std::make_unique<exec::scoped_dispatcher>(_thread_pool, _thread_pool.num_threads());
 }
 

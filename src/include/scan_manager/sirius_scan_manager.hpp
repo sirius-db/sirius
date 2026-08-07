@@ -30,6 +30,7 @@
 #include "scan_manager/load_balancing_scan_batch_coalescer.hpp"
 #include "scan_manager/mvcc_mask_job.hpp"
 #include "scan_manager/pinned_chunk_stats.hpp"
+#include "scan_manager/readahead_scan_manager.hpp"
 #include "scan_manager/split_provider.hpp"
 
 #include <cudf/column/column.hpp>
@@ -695,6 +696,9 @@ class sirius_scan_manager {
   /// dispatcher's @c request_stop() in @ref reset() therefore tears the
   /// sequencer down without an extra side-channel.
   std::unique_ptr<load_balancing_scan_batch_coalescer> _metadata_processor;
+  /// Per-query readahead bookkeeping, seeded from the query's prefetching
+  /// order and shared with every scan split this query emits.
+  std::shared_ptr<readahead_scan_manager> _readahead;
   io::io_context_registry _ioctx_registry;
 };
 

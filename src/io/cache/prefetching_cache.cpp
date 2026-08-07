@@ -90,113 +90,44 @@ chunk_iter gallop_lower_bound(chunk_iter first, chunk_iter last, size_t off)
 
 }  // namespace
 
-class prefetching_handle::prefetch_lifecycle_manager {
- public:
-  explicit prefetch_lifecycle_manager(
-    prefetching_cache::prefetch_request ctx,
-    std::shared_ptr<consumer_stage> consumer,
-    prefetching_cache::request_queue_type& eviction_queue,
-    prefetching_cache::request_queue_type& prefetch_queue) noexcept
-    : _consumer(std::move(consumer)),
-      _eviction_queue(eviction_queue),
-      _prefetch_queue(prefetch_queue)
-  {
-    if (ctx) {
-      _producer = ctx->producer;
-      _ctx      = std::move(ctx);
-    }
-  }
+prefetching_handle::prefetching_handle(prefetch_request req) noexcept : _req(std::move(req)) {}
 
-  ~prefetch_lifecycle_manager() noexcept { evict(); }
-
-  void activate() noexcept
-  {
-    if (!_ctx || !_producer) { return; }
-    if (_producer->mark_loading()) { _prefetch_queue.enqueue(_ctx); }
-  }
-
-  void cancel() noexcept
-  {
-    if (_consumer) { _consumer->mark_disposed(); }
-  }
-
-  [[nodiscard]] bool is_active() const noexcept { return _ctx && _ctx->is_active(); }
-
-  [[nodiscard]] std::shared_ptr<consumer_stage> consumer() const noexcept { return _consumer; }
-
-  [[nodiscard]] std::shared_ptr<const producer_stage> producer() const noexcept
-  {
-    return _producer;
-  }
-
-  [[nodiscard]] std::shared_ptr<const std::vector<cached_chunk*>> chunks() const noexcept
-  {
-    return _ctx ? _ctx->chunks : nullptr;
-  }
-
-  [[nodiscard]] std::shared_ptr<prefetch_request_context> get_context() const noexcept
-  {
-    return _ctx;
-  }
-
-  void evict() noexcept
-  {
-    cancel();
-    if (_ctx) { _eviction_queue.enqueue(std::move(_ctx)); }
-  }
-
- private:
-  std::shared_ptr<prefetch_request_context> _ctx;
-  std::shared_ptr<consumer_stage> _consumer;
-  std::shared_ptr<producer_stage> _producer;
-  prefetching_cache::request_queue_type& _eviction_queue;
-  prefetching_cache::request_queue_type& _prefetch_queue;
-};
-
-prefetching_handle::prefetching_handle() noexcept = default;
-prefetching_handle::~prefetching_handle()         = default;
-
-prefetching_handle::prefetching_handle(prefetching_handle&& o) noexcept            = default;
-prefetching_handle& prefetching_handle::operator=(prefetching_handle&& o) noexcept = default;
-
-void prefetching_handle::activate() noexcept
+prefetching_handle::~prefetching_handle()
 {
-  if (_state) { _state->activate(); }
+  if (_req.consumer) { _req.consumer->mark_disposed(); }
 }
 
-void prefetching_handle::cancel() noexcept
+prefetching_handle::prefetching_handle(prefetching_handle&& o) noexcept : _req(std::move(o._req))
 {
-  if (_state) { _state->cancel(); }
+  o._req = {};
 }
 
-bool prefetching_handle::is_active() const noexcept { return _state && _state->is_active(); }
-
-std::shared_ptr<consumer_stage> prefetching_handle::consumer() const noexcept
+prefetching_handle& prefetching_handle::operator=(prefetching_handle&& o) noexcept
 {
-  return _state ? _state->consumer() : nullptr;
+  if (this != &o) {
+    if (_req.consumer) { _req.consumer->mark_disposed(); }
+    _req   = std::move(o._req);
+    o._req = {};
+  }
+  return *this;
 }
 
-std::shared_ptr<const producer_stage> prefetching_handle::producer() const noexcept
+void prefetching_handle::update(scan_stage stage) noexcept
 {
-  return _state ? _state->producer() : nullptr;
+  if (!_req.consumer) { return; }
+  auto const mapped = to_consumer_stage(stage);
+  if (!mapped) { return; }
+  std::ignore = _req.consumer->mark(*mapped);
 }
+
+bool prefetching_handle::is_active() const noexcept { return _req.is_active(); }
 
 std::shared_ptr<const std::vector<cached_chunk*>> prefetching_handle::chunks() const noexcept
 {
-  return _state ? _state->chunks() : nullptr;
+  return _req.chunks;
 }
 
-std::shared_ptr<prefetch_request_context> prefetching_handle::get_context() const noexcept
-{
-  return _state ? _state->get_context() : nullptr;
-}
-
-prefetching_handle::prefetching_handle(std::unique_ptr<prefetch_lifecycle_manager> mgr) noexcept
-  : _state(std::move(mgr))
-{
-}
-
-prefetching_handle::operator bool() const noexcept { return _state != nullptr; }
+prefetching_handle::operator bool() const noexcept { return static_cast<bool>(_req); }
 
 std::vector<cached_chunk*> prefetching_cache::file_entry::update_and_get_chunks(
   std::span<size_t> incoming, uint32_t ticker)
@@ -304,8 +235,6 @@ prefetching_cache::prefetching_cache(
 {
   _preparation_thread = std::jthread([this](const std::stop_token& st) { prepare_loop(st); },
                                      _preparation_stop_source.get_token());
-  _prefetch_thread    = std::jthread([this](const std::stop_token& st) { prefetch_loop(st); },
-                                  _prefetch_stop_source.get_token());
   _evictor_thread     = std::jthread([this](const std::stop_token& st) { evict_loop(st); },
                                  _evictor_stop_source.get_token());
   _chunk_size         = _pool->chunk_size();
@@ -315,12 +244,10 @@ prefetching_cache::~prefetching_cache()
 {
   _shutting_down.store(true, std::memory_order_release);
   _preparation_stop_source.request_stop();
-  _prefetch_stop_source.request_stop();
   _evictor_stop_source.request_stop();
 
   _rate_limiter.wait_for_all();
   _preparation_thread.join();
-  _prefetch_thread.join();
   _evictor_thread.join();
 }
 
@@ -351,7 +278,7 @@ prefetching_handle prefetching_cache::insert(const io_object& obj,
                                              std::span<const byte_range> ranges,
                                              std::optional<int> gpu_id)
 {
-  if (!_armed) { return prefetching_handle(nullptr); }
+  if (!_armed) { return prefetching_handle(); }
 
   auto& file = get_or_create_file_entry(obj);
 
@@ -379,19 +306,20 @@ prefetching_handle prefetching_cache::insert(const io_object& obj,
   auto chunks_to_fetch =
     file.update_and_get_chunks(chunk_offsets, _ticker.load(std::memory_order_relaxed));
 
-  auto consumer = std::make_shared<consumer_stage>();
-  auto work     = std::make_shared<prefetch_request_context>(obj, _ticker.load(), consumer);
-  work->chunks  = std::make_shared<const std::vector<cached_chunk*>>(std::move(chunks_to_fetch));
+  prefetch_request req;
+  req.obj       = obj.shared_from_this();
+  req.producer  = std::make_shared<producer_stage>();
+  req.consumer  = std::make_shared<consumer_stage>();
+  req.chunks    = std::make_shared<const std::vector<cached_chunk*>>(std::move(chunks_to_fetch));
+  req.timestamp = _ticker.load(std::memory_order_relaxed);
   // Resolve the preferred NUMA node for staging buffers from the target GPU's
   // topology; -1 (no preference) when no GPU hint or the GPU is out of scope.
-  if (gpu_id && _topology_index) { work->preferred_numa = _topology_index->numa_node_of(*gpu_id); }
+  if (gpu_id && _topology_index) { req.preferred_numa = _topology_index->numa_node_of(*gpu_id); }
 
-  prefetching_handle handle(std::make_unique<prefetching_handle::prefetch_lifecycle_manager>(
-    work, std::move(consumer), _eviction_queue, _prefetch_queue));
-  std::ignore = work->producer->mark_queued();
-  _preparation_queue.enqueue(std::move(work));
+  std::ignore = req.producer->mark_queued();
+  _preparation_queue.enqueue(req);
 
-  return handle;
+  return prefetching_handle(std::move(req));
 }
 
 bool prefetching_cache::host_read_from_cache_only(
@@ -690,10 +618,10 @@ void prefetching_cache::prepare_for_query() noexcept
 
 void prefetching_cache::drain_and_abandon(request_queue_type& queue) noexcept
 {
-  prefetch_request req = nullptr;
+  prefetch_request req;
   while (queue.try_dequeue(req)) {
-    if (req != nullptr) { req->producer->mark_abandoned(); }
-    req = nullptr;
+    if (req) { req.producer->mark_abandoned(); }
+    req = {};
   }
 }
 
@@ -701,22 +629,23 @@ void prefetching_cache::prepare_loop(const std::stop_token& st)
 {
   std::stop_callback cb(st, [this]() {
     SIRIUS_LOG_TRACE("prefetching_cache: prepare_loop received stop request, unblocking queue");
-    _preparation_queue.enqueue(nullptr);  // unblock the worker if it's waiting on an empty queueue
+    // unblock the worker if it's waiting on an empty queueue
+    _preparation_queue.enqueue(prefetch_request{});
   });
 
   while (!_shutting_down && !st.stop_requested()) {
-    prefetch_request req = nullptr;
+    prefetch_request req;
     _preparation_queue.wait_dequeue(req);
-    if (req == nullptr) { continue; }  // spurious wakeup or shutdown
+    if (!req) { continue; }  // spurious wakeup or shutdown
 
-    if (req->is_cancelled() || !req->chunks) {
-      req->producer->mark_abandoned();
+    if (req.is_cancelled() || !req.chunks) {
+      req.producer->mark_abandoned();
       continue;
     }
 
-    std::ignore = req->producer->mark_preparing();
+    std::ignore = req.producer->mark_preparing();
 
-    auto const& chunks = *req->chunks;
+    auto const& chunks = *req.chunks;
 
     // how many buffers we need to allocate from the pool to prepare this request?
     std::size_t n_chunks_needed = std::ranges::count_if(
@@ -726,15 +655,15 @@ void prefetching_cache::prepare_loop(const std::stop_token& st)
     // back to any other arena (allocate_bulk wraps around).  numa_allocated is
     // updated to the arena we actually drew from — the whole batch comes from a
     // single arena, so all chunks share that NUMA node.
-    int numa_allocated = req->preferred_numa;
+    int numa_allocated = req.preferred_numa;
     auto buffers       = _pool->allocate_bulk(n_chunks_needed, numa_allocated);
     if (buffers.size() != n_chunks_needed) {
       // No single arena could satisfy the request.  Return whatever we got, ask
       // the evictor to free some, and retire this request on `abandoned` so no
       // waiter is left parked on the transient `preparing` stage.
       if (!buffers.empty()) { _pool->deallocate_bulk(std::move(buffers), numa_allocated); }
-      _eviction_queue.enqueue(nullptr);
-      req->producer->mark_abandoned();
+      _eviction_queue.enqueue(prefetch_request{});
+      req.producer->mark_abandoned();
       continue;
     }
 
@@ -758,86 +687,81 @@ void prefetching_cache::prepare_loop(const std::stop_token& st)
     if (!buffers.empty()) { _pool->deallocate_bulk(std::move(buffers), numa_allocated); }
 
     if (!all_chunks_have_buffers(chunks)) {
-      req->producer->mark_abandoned();
+      // Buffers were already attached above, so the request still has to reach
+      // the evictor or those chunks are never reclaimed.
+      _eviction_queue.enqueue(req);
+      req.producer->mark_abandoned();
       continue;
     }
-    std::ignore = req->producer->mark_prepared();
+    std::ignore = req.producer->mark_prepared();
 
-    if (!_io_ctx->supports_vector_host_read() ||
-        _io_ctx->preferred_prefetching_stage() == scan_stage::preparing ||
-        _io_ctx->preferred_prefetching_stage() == scan_stage::none) {
-      // either the backend doesn't support scatter-gather reads or it prefers not to reuse
-      // buffers for multiple reads.  In either case, we can skip the prefetching step and let the
-      // read() path handle the IO directly into the caller's buffer.
-      continue;
-    }
-
-    if (req->is_active() && !st.stop_requested() && req->producer->mark_loading()) {
-      _prefetch_queue.enqueue(std::move(req));
-    }
+    // Register with the evictor eagerly; the evictor skips the request until
+    // its consumer is disposed.
+    _eviction_queue.enqueue(req);
   }
 
   drain_and_abandon(_preparation_queue);
 }
 
-void prefetching_cache::prefetch_loop(const std::stop_token& st)
+bool prefetching_cache::prefetch(prefetching_handle& handle,
+                                 exec::invocable<void(bool) noexcept> on_done)
 {
-  std::stop_callback cb(st, [this]() {
-    SIRIUS_LOG_TRACE("prefetching_cache: prefetch_loop received stop request, unblocking queue");
-    _prefetch_queue.enqueue(nullptr);  // unblock the worker if it's waiting on an empty queueue
-  });
-  while (!_shutting_down && !st.stop_requested()) {
-    prefetch_request req = nullptr;
-    _prefetch_queue.wait_dequeue(req);
-    if (req == nullptr) { continue; }
-    if (req->is_cancelled() || !req->chunks) {
-      req->producer->mark_abandoned();
-      continue;
+  auto& req   = handle._req;
+  auto settle = [&on_done](bool ok) {
+    on_done(ok);
+    return false;
+  };
+
+  if (!req || req.is_cancelled() || !req.chunks) { return settle(false); }
+  if (!_io_ctx->supports_vector_host_read()) { return settle(false); }
+  if (!req.producer->mark_loading()) { return settle(false); }
+
+  std::vector<io::io_object_segment> segments;
+  std::vector<cached_chunk*> claimed_chunks;
+  segments.reserve(req.chunks->size());
+  claimed_chunks.reserve(req.chunks->size());
+  for (cached_chunk* c : *req.chunks) {
+    if (c->state.mark_loading()) {
+      claimed_chunks.push_back(c);
+      segments.emplace_back(c->offset, _chunk_size, c->data);
     }
-
-    auto& io_obj = req->obj;
-    std::vector<io::io_object_segment> segments;
-    std::vector<cached_chunk*> claimed_chunks;
-
-    segments.reserve(req->chunks->size());
-    claimed_chunks.reserve(req->chunks->size());
-    for (cached_chunk* c : *req->chunks) {
-      if (c->state.mark_loading()) {
-        claimed_chunks.push_back(c);
-        segments.emplace_back(c->offset, _chunk_size, c->data);
-      }
-    }
-
-    auto token = _rate_limiter.acquire(segments.size());
-
-    if (req->is_cancelled() || st.stop_requested()) {
-      std::ranges::for_each(claimed_chunks,
-                            [](cached_chunk* c) { std::ignore = c->state.mark_load_failed(); });
-      std::ignore = req->producer->mark_load_failed();
-      continue;
-    }
-
-    _io_ctx->host_read_ranges_async_io(*io_obj, segments)
-      .via(&_io_cb_dispatcher)
-      .then_try([req, chunks = std::move(claimed_chunks), _ = std::move(token)](
-                  exec::try_t<size_t>&& res) mutable {
-        auto transition =
-          res.has_value() ? &entry_state::mark_cached : &entry_state::mark_load_failed;
-        std::ignore =
-          res.has_value() ? req->producer->mark_ready() : req->producer->mark_load_failed();
-        std::ranges::for_each(
-          chunks, [transition](cached_chunk* c) { std::ignore = (c->state.*transition)(); });
-      });
+  }
+  if (segments.empty()) {
+    std::ignore = req.producer->mark_ready();
+    return settle(true);
   }
 
-  drain_and_abandon(_prefetch_queue);
+  auto token = _rate_limiter.acquire(segments.size());
+
+  if (req.is_cancelled()) {
+    std::ranges::for_each(claimed_chunks,
+                          [](cached_chunk* c) { std::ignore = c->state.mark_load_failed(); });
+    std::ignore = req.producer->mark_load_failed();
+    return settle(false);
+  }
+
+  _io_ctx->host_read_ranges_async_io(*req.obj, segments)
+    .via(&_io_cb_dispatcher)
+    .then_try([req,
+               chunks = std::move(claimed_chunks),
+               done   = std::move(on_done),
+               _      = std::move(token)](exec::try_t<size_t>&& res) mutable {
+      auto transition =
+        res.has_value() ? &entry_state::mark_cached : &entry_state::mark_load_failed;
+      std::ignore = res.has_value() ? req.producer->mark_ready() : req.producer->mark_load_failed();
+      std::ranges::for_each(
+        chunks, [transition](cached_chunk* c) { std::ignore = (c->state.*transition)(); });
+      done(res.has_value());
+    });
+  return true;
 }
 
 void prefetching_cache::evict_loop(const std::stop_token& st)
 {
   std::stop_callback cb(st, [this]() {
     SIRIUS_LOG_TRACE("prefetching_cache: evict_loop received stop request, unblocking queue");
-    _eviction_queue.enqueue(nullptr);  // unblock the worker if it's waiting on an empty queueue
+    // unblock the worker if it's waiting on an empty queueue
+    _eviction_queue.enqueue(prefetch_request{});
   });
 
   // One queued prefetch request plus how many of its chunks have been reclaimed
@@ -852,10 +776,10 @@ void prefetching_cache::evict_loop(const std::stop_token& st)
   // returned to the arena it came from.
   std::unordered_map<int, std::vector<std::byte*>> reclaim_by_numa;
   while (!_shutting_down && !st.stop_requested()) {
-    prefetch_request req    = nullptr;
+    prefetch_request req;
     bool eviction_requested = false;
     _eviction_queue.wait_dequeue(req);
-    if (req == nullptr) {
+    if (!req) {
       if (!_shutting_down && !st.stop_requested()) {  // spurious wakeup
         eviction_requested = true;
       }
@@ -869,7 +793,7 @@ void prefetching_cache::evict_loop(const std::stop_token& st)
     // of being lost forever.
     eviction_batch.push_back({std::move(req), 0});
     while (_eviction_queue.try_dequeue(req)) {
-      if (req != nullptr) { eviction_batch.push_back({std::move(req), 0}); }
+      if (req) { eviction_batch.push_back({std::move(req), 0}); }
     }
 
     // When disposing after use we reclaim everything; otherwise we only evict
@@ -890,8 +814,8 @@ void prefetching_cache::evict_loop(const std::stop_token& st)
     // exact tier bar up-front instead of re-sweeping the batch once per tier.
     std::array<size_t, chunk_lifecycle::FRESH_SCORE + 1> tier_count{};
     for (auto const& er : eviction_batch) {
-      if (er.req == nullptr || !er.req->chunks) { continue; }
-      for (cached_chunk* c : *er.req->chunks) {
+      if (!er.req || !er.req.chunks || !er.req.is_cancelled()) { continue; }
+      for (cached_chunk* c : *er.req.chunks) {
         auto const s = c->state.get_state();
         if (s != entry_state::cached && s != entry_state::allocated) { continue; }
         ++tier_count[c->lifecycle.load().eviction_tier(query_tick)];
@@ -920,8 +844,8 @@ void prefetching_cache::evict_loop(const std::stop_token& st)
     }
     size_t reclaimed = 0;
     for (auto& er : eviction_batch) {
-      if (er.req == nullptr || !er.req->chunks) { continue; }
-      for (cached_chunk* c : *er.req->chunks) {
+      if (!er.req || !er.req.chunks || !er.req.is_cancelled()) { continue; }
+      for (cached_chunk* c : *er.req.chunks) {
         uint16_t const tier = c->lifecycle.load().eviction_tier(query_tick);
         if (tier > cutoff) { continue; }
         if (tier == cutoff && reclaimed >= need) { continue; }  // top bar satisfied
@@ -946,7 +870,7 @@ void prefetching_cache::evict_loop(const std::stop_token& st)
     // Drop requests whose chunks have all been evicted; keep the rest for a
     // later round.
     std::erase_if(eviction_batch, [](eviction_request const& er) {
-      return er.req == nullptr || !er.req->chunks || er.n_evicted >= er.req->chunks->size();
+      return !er.req || !er.req.chunks || er.n_evicted >= er.req.chunks->size();
     });
   }
 }

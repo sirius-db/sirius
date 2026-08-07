@@ -137,13 +137,6 @@ class ioctx : public std::enable_shared_from_this<ioctx> {
   /// @c scan_stage::none.
   [[nodiscard]] virtual bool supports_vector_host_read() const noexcept = 0;
 
-  /// Prefetching strategy the prefetching layer should use against this
-  /// backend.  Returns @c scan_stage::none whenever
-  /// @c supports_vector_host_read() is false; otherwise the backend picks
-  /// between eager prefill and on-demand read-ahead based on its IO
-  /// characteristics.
-  [[nodiscard]] virtual cache::scan_stage preferred_prefetching_stage() const noexcept = 0;
-
   /// Build the prefetching cache.  One-shot — calling twice is a no-op
   /// after the first successful build.  The cache holds a raw
   /// back-pointer to this ioctx and stays alive until @ref

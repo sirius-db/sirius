@@ -33,6 +33,10 @@
 #include <memory>
 #include <variant>
 
+namespace sirius::scan_manager {
+class readahead_scan_manager;
+}  // namespace sirius::scan_manager
+
 namespace sirius::op::scan {
 
 //===----------------------------------------------------------------------===//
@@ -53,15 +57,18 @@ namespace sirius::op::scan {
  */
 class scan_operator_input : public op::operator_data {
  public:
-  explicit scan_operator_input(std::unique_ptr<scan_info> metadata)
-    : materialization_info(std::move(metadata))
-  {
-  }
+  explicit scan_operator_input(
+    std::shared_ptr<scan_info> metadata,
+    std::shared_ptr<scan_manager::readahead_scan_manager> readahead = nullptr,
+    std::size_t operator_id                                         = 0);
 
-  explicit scan_operator_input(std::shared_ptr<cucascade::data_batch> cached_batch)
-    : materialization_info(std::move(cached_batch))
-  {
-  }
+  explicit scan_operator_input(
+    std::shared_ptr<cucascade::data_batch> cached_batch,
+    std::shared_ptr<scan_manager::readahead_scan_manager> readahead = nullptr,
+    std::size_t operator_id                                         = 0);
+
+  scan_operator_input(scan_operator_input const&)            = delete;
+  scan_operator_input& operator=(scan_operator_input const&) = delete;
 
   [[nodiscard]] op::operator_data_type get_type() const override
   {
@@ -75,24 +82,18 @@ class scan_operator_input : public op::operator_data {
 
   [[nodiscard]] bool has_scan_metadata() const noexcept
   {
-    return std::holds_alternative<std::unique_ptr<scan_info>>(materialization_info) &&
-           std::get<std::unique_ptr<scan_info>>(materialization_info) != nullptr;
+    return std::holds_alternative<std::shared_ptr<scan_info>>(materialization_info) &&
+           std::get<std::shared_ptr<scan_info>>(materialization_info) != nullptr;
   }
 
   [[nodiscard]] std::vector<op::scan::scan_info::fadvise_entry> get_fadvise_hints() const
   {
     if (!has_scan_metadata()) { return {}; }
-    return std::get<std::unique_ptr<scan_info>>(materialization_info)->fadvise_entries();
+    return std::get<std::shared_ptr<scan_info>>(materialization_info)->fadvise_entries();
   }
 
-  void prefetch(io::cache::scan_stage site) const
-  {
-    if (!has_scan_metadata()) { return; }
-    auto hints = get_fadvise_hints();
-    for (auto& hint : hints) {
-      hint.datasource->prefetch(site);
-    }
-  }
+  /// Report @p site to the readahead manager and to every hinted datasource.
+  void update(io::cache::scan_stage site) const;
 
   void prepare_for_processing(const ::cucascade::memory::memory_space* requested_memory_space,
                               rmm::cuda_stream_view /*stream*/) override;
@@ -108,7 +109,7 @@ class scan_operator_input : public op::operator_data {
         "[scan_operator_input::get_scan_info] no scan metadata present; check has_scan_metadata() "
         "first.");
     }
-    return *std::get<std::unique_ptr<scan_info>>(materialization_info);
+    return *std::get<std::shared_ptr<scan_info>>(materialization_info);
   }
 
   [[nodiscard]] std::string get_origin_tiers() const override
@@ -133,7 +134,7 @@ class scan_operator_input : public op::operator_data {
   }
 
   cucascade::memory::memory_space* gpu_memory_space = nullptr;
-  std::variant<std::monostate, std::unique_ptr<scan_info>, std::shared_ptr<::cucascade::data_batch>>
+  std::variant<std::monostate, std::shared_ptr<scan_info>, std::shared_ptr<::cucascade::data_batch>>
     materialization_info;
   /// Per-query MVCC keep-mask for a resident cached chunk; a default mask =
   /// every row visible (no upload, no kernel). Attached by
@@ -154,6 +155,13 @@ class scan_operator_input : public op::operator_data {
   /// which owns the definition. Zero means unknown; the scan memory estimate then keeps its
   /// conservative maximum-expansion bound.
   std::size_t conversion_destination_bytes{0};
+
+ private:
+  /// Per-query readahead bookkeeping this split reports into; null when the
+  /// producer does not track readahead.
+  std::shared_ptr<scan_manager::readahead_scan_manager> _readahead;
+  /// Operator id this split was emitted under, the key @ref _readahead uses.
+  std::size_t _operator_id{0};
 };
 
 }  // namespace sirius::op::scan

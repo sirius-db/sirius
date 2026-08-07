@@ -519,6 +519,17 @@ class consumer_stage {
     _packed.exchange(static_cast<uint32_t>(disposed), std::memory_order_acq_rel);
   }
 
+  /// Advance to @p to.  Routes @c disposed to @ref mark_disposed (which always
+  /// succeeds); otherwise monotone-max, returning false if already at or past.
+  [[nodiscard]] bool mark(value to) noexcept
+  {
+    if (to == disposed) {
+      mark_disposed();
+      return true;
+    }
+    return advance(to);
+  }
+
  private:
   bool advance(value to) noexcept
   {
@@ -534,6 +545,21 @@ class consumer_stage {
 
   std::atomic<uint32_t> _packed{static_cast<uint32_t>(initialized)};
 };
+
+/// Map a @ref scan_stage onto its @ref consumer_stage counterpart.
+/// @c none has no counterpart and yields nullopt.
+[[nodiscard]] inline std::optional<consumer_stage::value> to_consumer_stage(scan_stage s) noexcept
+{
+  switch (s) {
+    case scan_stage::none: return std::nullopt;
+    case scan_stage::initialized: return consumer_stage::initialized;
+    case scan_stage::queued: return consumer_stage::queued;
+    case scan_stage::preparing: return consumer_stage::preparing;
+    case scan_stage::reading: return consumer_stage::reading;
+    case scan_stage::disposed: return consumer_stage::disposed;
+  }
+  return std::nullopt;
+}
 
 struct alignas(64) chunk_lifecycle {
   std::atomic<uint64_t> packed{0};
