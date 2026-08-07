@@ -32,7 +32,9 @@
 #include <algorithm>
 #include <cstdint>
 #include <filesystem>
+#include <map>
 #include <memory>
+#include <string>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -880,6 +882,89 @@ TEST_CASE_METHOD(fragment_fixture,
     auto rows = drain_rows_as_i64(receiver, 1);
     REQUIRE(rows.size() == 1);
     REQUIRE(rows[0] == std::vector<std::int64_t>{75, 999});
+
+    con->Rollback();
+  } catch (...) {
+    con->Rollback();
+    throw;
+  }
+}
+
+// ============================================================================
+// FRAG-9: a DECIMAL hash key routes equal values together, deterministically
+// ============================================================================
+//
+// build() derives a FLOAT64 hash cast for DECIMAL keys. The two invariants that
+// make that safe are pinned here: equal decimal values land on the SAME output
+// stream — within one fragment and across two independently built ones, the
+// cross-sender parity a distributed shuffle rests on — and the streams union to
+// the whole input (a lossy cast may skew the split, never drop or misroute).
+
+TEST_CASE_METHOD(fragment_fixture,
+                 "FRAG-9: a DECIMAL hash key routes equal values together, deterministically",
+                 "[integration][streaming_fragment]")
+{
+  // Every key value appears twice, so co-location of equal decimals is asserted directly
+  // rather than inferred from key uniqueness.
+  const std::vector<std::string> keys{
+    "1.10", "7.25", "3.50", "0.75", "9.99", "12.00", "845.31", "2.00", "5.55", "100.10"};
+  std::string leaf = "(VALUES ";
+  bool first_value = true;
+  for (const auto& key : keys) {
+    for (int repeat = 0; repeat < 2; ++repeat) {
+      if (!first_value) { leaf += ", "; }
+      first_value = false;
+      leaf += "(CAST('" + key + "' AS DECIMAL(15,2)))";
+    }
+  }
+  leaf += ") t(d)";
+  const std::size_t expected_rows = keys.size() * 2;
+
+  auto sirius_ctx = con->context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  REQUIRE(sirius_ctx != nullptr);
+
+  con->BeginTransaction();
+  try {
+    auto route_keys = [&](const std::string& label) {
+      fragment_spec spec;
+      spec.plan_source = sirius::test::sql_plan_source("SELECT d FROM " + leaf);
+      spec.outputs     = {0, 1};
+      // key_cast_types left empty: build() must derive the FLOAT64 cast for the DECIMAL key.
+      spec.partitioning = sirius::op::partition_spec{{0}, {}};
+      streaming_fragment fragment(*con->context, std::move(spec));
+      {
+        query_lifecycle lifecycle(*sirius_ctx, *con->context, label);
+        fragment.build();
+        fragment.run();
+      }
+
+      std::map<std::int64_t, stream_id_t> destination_of;
+      std::size_t rows = 0;
+      for (auto id : {stream_id_t{0}, stream_id_t{1}}) {
+        while (auto batch = fragment.session().pull(id)) {
+          auto view = sirius::get_cudf_table_view(**batch);
+          // The partition output keeps the original schema; the FLOAT64 cast is transient.
+          REQUIRE(view.column(0).type().id() == cudf::type_id::DECIMAL64);
+          auto host =
+            sirius::test::operator_utils::copy_column_to_host<std::int64_t>(view.column(0));
+          rows += host.size();
+          for (auto scaled : host) {
+            auto [it, inserted] = destination_of.emplace(scaled, id);
+            // One key on two streams would hand a downstream merge a partial group.
+            REQUIRE(it->second == id);
+          }
+        }
+      }
+      // Nothing dropped, nothing duplicated: the streams union to the whole input.
+      REQUIRE(rows == expected_rows);
+      REQUIRE(destination_of.size() == keys.size());
+      return destination_of;
+    };
+
+    auto first  = route_keys("frag9_first");
+    auto second = route_keys("frag9_second");
+    // Independently built fragments must agree on every key's destination.
+    REQUIRE(first == second);
 
     con->Rollback();
   } catch (...) {

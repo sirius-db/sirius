@@ -459,7 +459,7 @@ mod tests {
     use std::path::Path;
     use std::sync::{Arc, Mutex};
 
-    use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringArray};
+    use arrow_array::{ArrayRef, Decimal128Array, Int64Array, RecordBatch, StringArray};
     use arrow_schema::{DataType, Field, Schema};
     use parquet::arrow::ArrowWriter;
     use prost::Message;
@@ -583,6 +583,34 @@ mod tests {
             (0..rows).map(|i| format!("n{i}")).collect::<Vec<_>>(),
         ));
         let batch = RecordBatch::try_new(schema.clone(), vec![ids, names]).unwrap();
+        let props = WriterProperties::builder()
+            .set_max_row_group_size(rows_per_group)
+            .build();
+        let file = std::fs::File::create(path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, schema, Some(props)).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+    }
+
+    /// Writes a `(price DECIMAL(15,2), name VARCHAR)` parquet with `rows` distinct prices
+    /// (row i carries the scaled value i, i.e. i/100) split into row groups of
+    /// `rows_per_group`. Precision 15 keeps the parquet physical type INT64 — the TPC-H
+    /// money shape, and exactly what q10's shuffle key looks like on the wire.
+    fn write_multi_row_group_decimal_parquet(path: &Path, rows: i64, rows_per_group: usize) {
+        use parquet::file::properties::WriterProperties;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("price", DataType::Decimal128(15, 2), false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        let prices: ArrayRef = Arc::new(
+            Decimal128Array::from_iter_values((0..rows).map(i128::from))
+                .with_precision_and_scale(15, 2)
+                .unwrap(),
+        );
+        let names: ArrayRef = Arc::new(StringArray::from(
+            (0..rows).map(|i| format!("n{i}")).collect::<Vec<_>>(),
+        ));
+        let batch = RecordBatch::try_new(schema.clone(), vec![prices, names]).unwrap();
         let props = WriterProperties::builder()
             .set_max_row_group_size(rows_per_group)
             .build();
@@ -737,6 +765,71 @@ mod tests {
         );
     }
 
+    /// The same determinism contract for a DECIMAL(15,2) key — TPC-H q10's shuffle-key shape.
+    /// The engine hashes decimal keys through a FLOAT64 cast; what a shuffle needs from that
+    /// cast is determinism (equal values -> equal buckets on every sender), not injectivity,
+    /// so the assertions are the same as for INT64 keys: two independently built senders over
+    /// the same keys (different row-group boundaries) agree on every key's stream, and the
+    /// partitions union to the whole input. Requires a GPU.
+    #[test]
+    fn hash_partitioned_fragment_routes_decimal_keys_deterministically() {
+        let _guard = GPU_CONTEXT_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        ensure_parquet_extension_env();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path_a = dir.path().join("decimal_keys_a.parquet");
+        let path_b = dir.path().join("decimal_keys_b.parquet");
+        write_multi_row_group_decimal_parquet(&path_a, 20000, 5000);
+        write_multi_row_group_decimal_parquet(&path_b, 20000, 7000);
+
+        let ctx = SiriusContext::new().expect("bring up sirius context");
+        let mut assignments: Vec<std::collections::HashMap<i128, u64>> = Vec::new();
+        for path in [&path_a, &path_b] {
+            let mut sender = ctx.fragment().unwrap();
+            sender.declare_output(0).unwrap();
+            sender.declare_output(1).unwrap();
+            sender.declare_output_hash_key(0).unwrap();
+            sender
+                .build(&local_files_plan(
+                    path.to_str().unwrap(),
+                    vec!["price".to_string(), "name".to_string()],
+                ))
+                .unwrap();
+            sender.run().unwrap();
+
+            let mut map = std::collections::HashMap::new();
+            let mut total = 0usize;
+            for stream in [0u64, 1u64] {
+                let mut receiver = ctx.fragment().unwrap();
+                receiver
+                    .declare_input_column(0, "price", "DECIMAL(15,2)")
+                    .unwrap();
+                receiver.declare_input_column(0, "name", "VARCHAR").unwrap();
+                receiver.build(&decimal_stream_read_plan(0)).unwrap();
+                receiver.relay_from(&mut sender, stream, 0, 0).unwrap();
+                receiver.run().unwrap();
+                let result = receiver.into_arrow().unwrap();
+                let partition = decimal_rows(&result);
+                assert!(!partition.is_empty(), "stream {stream} owns no keys");
+                total += partition.len();
+                for (price, _) in partition {
+                    assert!(
+                        map.insert(price, stream).is_none(),
+                        "key {price} in two streams"
+                    );
+                }
+            }
+            assert_eq!(total, 20000, "partitions must union to the whole input");
+            assignments.push(map);
+        }
+        assert_eq!(
+            assignments[0], assignments[1],
+            "independently built senders must route every decimal key identically"
+        );
+    }
+
     /// Byte-range splits of one parquet file must read every row exactly once: each split
     /// yields a disjoint subset, their union is the whole file, and one plan carrying both
     /// splits as separate LocalFiles items equals the whole-file plan. Requires a GPU.
@@ -864,6 +957,83 @@ mod tests {
             ..Default::default()
         }
         .encode_to_vec()
+    }
+
+    /// `stream_read_plan` for the decimal fixture's `(price DECIMAL(15,2), name VARCHAR)`
+    /// schema.
+    fn decimal_stream_read_plan(stream_id: u64) -> Vec<u8> {
+        use substrait::proto::read_rel::{NamedTable, ReadType};
+        use substrait::proto::{
+            NamedStruct, Plan, PlanRel, ReadRel, Rel, RelRoot, Type, plan_rel, rel, r#type,
+        };
+
+        let names = vec!["price".to_string(), "name".to_string()];
+        let types = vec![
+            Type {
+                kind: Some(r#type::Kind::Decimal(r#type::Decimal {
+                    precision: 15,
+                    scale: 2,
+                    type_variation_reference: 0,
+                    nullability: r#type::Nullability::Nullable as i32,
+                })),
+            },
+            Type {
+                kind: Some(r#type::Kind::String(r#type::String {
+                    type_variation_reference: 0,
+                    nullability: r#type::Nullability::Nullable as i32,
+                })),
+            },
+        ];
+        let read = Rel {
+            rel_type: Some(rel::RelType::Read(Box::new(ReadRel {
+                base_schema: Some(NamedStruct {
+                    names: names.clone(),
+                    r#struct: Some(r#type::Struct {
+                        types,
+                        type_variation_reference: 0,
+                        nullability: r#type::Nullability::Required as i32,
+                    }),
+                }),
+                read_type: Some(ReadType::NamedTable(NamedTable {
+                    names: vec![super::stream_view_name(stream_id)],
+                    ..Default::default()
+                })),
+                ..Default::default()
+            }))),
+        };
+        Plan {
+            relations: vec![PlanRel {
+                rel_type: Some(plan_rel::RelType::Root(RelRoot {
+                    input: Some(read),
+                    names,
+                })),
+            }],
+            ..Default::default()
+        }
+        .encode_to_vec()
+    }
+
+    /// Flattens a result into sorted `(scaled price, name)` rows. DECIMAL(15,2) arrives as
+    /// Decimal128, so the price is its scaled integer (1.50 -> 150).
+    fn decimal_rows(result: &super::SubstraitResult) -> Vec<(i128, String)> {
+        let mut rows = Vec::new();
+        for batch in &result.batches {
+            let prices = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .expect("price column");
+            let names = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("name column");
+            for i in 0..batch.num_rows() {
+                rows.push((prices.value(i), names.value(i).to_string()));
+            }
+        }
+        rows.sort();
+        rows
     }
 
     /// Flattens a result into sorted `(id, name)` rows, so comparisons are by value and

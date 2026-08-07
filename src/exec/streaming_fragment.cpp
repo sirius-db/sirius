@@ -126,10 +126,10 @@ void streaming_fragment::build(sirius::query_id_t query_id)
   if (_spec.partitioning.has_value()) {
     auto partitioning = *_spec.partitioning;
     // Derive the per-key hash casts from the sink's own output types: every integral key
-    // hashes as INT64 so senders whose plans bind different integer widths for the same key
-    // still co-locate equal values; boolean and string keys hash as-is. Anything else is
-    // refused — a float/decimal/temporal key hashed bitwise across independently planned
-    // senders is the silent-wrong-groups failure shape.
+    // hashes as INT64 and every decimal key as FLOAT64, so senders whose plans bind
+    // different widths for the same key still co-locate equal values; boolean and string
+    // keys hash as-is. Anything else is refused — a float/temporal key hashed bitwise
+    // across independently planned senders is the silent-wrong-groups failure shape.
     if (partitioning.mode == op::partition_spec::partition_mode::hash &&
         partitioning.key_cast_types.empty()) {
       partitioning.key_cast_types.reserve(partitioning.key_columns.size());
@@ -155,10 +155,21 @@ void streaming_fragment::build(sirius::query_id_t query_id)
           case sirius::type_id::VARCHAR:
             partitioning.key_cast_types.push_back(cudf::data_type(cudf::type_id::EMPTY));
             break;
+          // DECIMAL keys (any width) hash through FLOAT64. Hash partitioning needs
+          // DETERMINISM — equal values must pick equal buckets on every sender — not
+          // injectivity: cudf's decimal→double cast is one exact kernel (the correctly
+          // rounded double of the true value, so equal values agree even across scales),
+          // and its murmur3 normalizes signed zeros and NaNs before hashing — neither of
+          // which a decimal cast can produce anyway. A collision from the lossy cast
+          // merely co-locates distinct keys (skew); it can never split equal keys across
+          // destinations.
+          case sirius::type_id::DECIMAL:
+            partitioning.key_cast_types.push_back(cudf::data_type(cudf::type_id::FLOAT64));
+            break;
           default:
             throw sirius::invalid_input_exception(
               "streaming_fragment: hash partition key type {} is not supported (integral, "
-              "boolean and string keys only)",
+              "boolean, string and decimal keys only)",
               key_type.to_string());
         }
       }
