@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use starrocks_plan_translator::{
     ExchangeInput, ExtensionRegistry, PlanTranslator, TranslateError, TranslatedPlan, URN_BOOLEAN,
-    URN_COMPARISON, translate_fragment,
+    URN_COMPARISON, URN_DATETIME, URN_STRING, translate_fragment,
 };
 use starrocks_thrift::descriptors::{
     TDescriptorTable, TSlotDescriptor, TTableDescriptor, TTupleDescriptor,
@@ -3682,6 +3682,108 @@ fn function_calls_use_allowlist() {
     ))
     .unwrap_err();
     assert!(matches!(err, TranslateError::MalformedPlan(_)));
+}
+
+/// Builds a one-argument builtin function call declaring `ret` as the FE return type.
+fn unary_fn_call(name: &str, ret: TPrimitiveType, child: TExpr) -> TExpr {
+    let mut call = base_expr_node(TExprNodeType::FUNCTION_CALL, scalar_type(ret), 1);
+    call.fn_ = Some(builtin_function(name, scalar_type(ret)));
+    let mut nodes = vec![call];
+    nodes.extend(child.nodes);
+    TExpr::new(nodes)
+}
+
+/// Descriptor table with a DATE slot and a VARCHAR slot for scalar-function tests.
+fn date_and_string_desc() -> TDescriptorTable {
+    desc_table(
+        vec![(0, Some(100))],
+        vec![
+            slot(1, 0, 0, "d", scalar_type(TPrimitiveType::DATE)),
+            slot(2, 0, 1, "s", scalar_type(TPrimitiveType::VARCHAR)),
+        ],
+    )
+}
+
+/// Verifies FE-narrowed builtins are wrapped in a throwing cast back to the declared return
+/// type: the engine's year/month/day and octet_length/char_length return BIGINT, while the FE
+/// slots the next fragment derives its stream schema from declare SMALLINT/TINYINT/INT.
+#[test]
+fn fe_narrowed_functions_cast_to_declared_return_type() {
+    use substrait::proto::r#type::Kind;
+    let cases = [
+        ("year", TPrimitiveType::SMALLINT, URN_DATETIME, "year"),
+        ("month", TPrimitiveType::TINYINT, URN_DATETIME, "month"),
+        ("day", TPrimitiveType::TINYINT, URN_DATETIME, "day"),
+        ("length", TPrimitiveType::INT, URN_STRING, "octet_length"),
+        (
+            "char_length",
+            TPrimitiveType::INT,
+            URN_STRING,
+            "char_length",
+        ),
+    ];
+    for (name, declared, expected_urn, mapped) in cases {
+        let (child_slot, child_ty) = if expected_urn == URN_STRING {
+            (2, TPrimitiveType::VARCHAR)
+        } else {
+            (1, TPrimitiveType::DATE)
+        };
+        let call = unary_fn_call(
+            name,
+            declared,
+            slot_ref(child_slot, 0, scalar_type(child_ty)),
+        );
+        let translated = translate_fragment(&params(
+            Some(filtered_scan(binary_pred(
+                TExprOpcode::EQ,
+                call,
+                int_literal_typed(1, declared),
+            ))),
+            Some(date_and_string_desc()),
+            None,
+        ))
+        .unwrap();
+        let (kind, input) = cast_parts(scalar_arg(filter_condition(&translated.plan), 0));
+        match declared {
+            TPrimitiveType::SMALLINT => assert!(matches!(kind, Kind::I16(_)), "{name}: {kind:?}"),
+            TPrimitiveType::TINYINT => assert!(matches!(kind, Kind::I8(_)), "{name}: {kind:?}"),
+            _ => assert!(matches!(kind, Kind::I32(_)), "{name}: {kind:?}"),
+        }
+        let inner = scalar_fn(input);
+        assert!(
+            matches!(
+                inner.output_type.as_ref().unwrap().kind.as_ref().unwrap(),
+                Kind::I64(_)
+            ),
+            "{name} should state the BIGINT the engine produces before the cast"
+        );
+        let (urn, resolved) = resolved_function(&translated.plan, inner.function_reference);
+        assert_eq!(resolved, mapped, "{name}");
+        assert_eq!(urn, expected_urn, "{name}");
+    }
+}
+
+/// Pins that a builtin whose engine return type already matches the FE declaration
+/// (BOOLEAN `like`) is not wrapped in a cast.
+#[test]
+fn matching_return_type_function_stays_cast_free() {
+    let mut call = base_expr_node(
+        TExprNodeType::FUNCTION_CALL,
+        scalar_type(TPrimitiveType::BOOLEAN),
+        2,
+    );
+    call.fn_ = Some(builtin_function(
+        "like",
+        scalar_type(TPrimitiveType::BOOLEAN),
+    ));
+    let mut nodes = vec![call];
+    nodes.extend(slot_ref(2, 0, scalar_type(TPrimitiveType::VARCHAR)).nodes);
+    nodes.extend(string_literal("%x%").nodes);
+    let plan = filter_with_conjunct(TExpr::new(nodes));
+    // `scalar_fn` panics if the conjunct got wrapped in a cast.
+    let scalar = scalar_fn(filter_condition(&plan));
+    let (_, resolved) = resolved_function(&plan, scalar.function_reference);
+    assert_eq!(resolved, "like");
 }
 
 /// Verifies CASE WHEN chains become Substrait if-then expressions with a null default.

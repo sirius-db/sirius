@@ -607,6 +607,18 @@ fn translate_function_call(
         }
     };
     let anchor = ctx.registry.register_function(urn, mapped);
+    // The engine binds these names through DuckDB's catalog, where year/month/day and
+    // octet_length/char_length all return BIGINT, while the FE declares narrower slots
+    // (year SMALLINT, month/day TINYINT, length/char_length INT). A downstream fragment
+    // derives its stream schema from the FE slots, so without a cast back to the declared
+    // type the produced BIGINT column is refused at the next hop's schema guard.
+    if matches!(name, "year" | "month" | "day" | "length" | "char_length") {
+        let produced = type_mapper::i64_type(node.is_nullable.unwrap_or(true));
+        return Ok(cast_to(
+            scalar_function(anchor, children, produced),
+            output_type,
+        ));
+    }
     Ok(scalar_function(anchor, children, output_type))
 }
 
