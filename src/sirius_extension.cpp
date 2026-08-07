@@ -1010,7 +1010,7 @@ std::unique_ptr<sirius::op::scan::duckdb_native_ingestible_table_info> build_duc
   auto schema_names   = columns.GetColumnNames();  // logical order
   auto schema_types   = columns.GetColumnTypes();  // logical order
 
-  auto keep = resolve_pin_kept_indices(schema_names, cols);
+  auto keep            = resolve_pin_kept_indices(schema_names, cols);
   auto const canonical = storage.GetAttached().GetStorageManager().GetDBPath();
 
   // Update chains version values in place, invisibly to the DELETE
