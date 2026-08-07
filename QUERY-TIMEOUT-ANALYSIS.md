@@ -469,3 +469,27 @@ restart-on-failure): **20 of 22 pass** — every query except:
 q14 = 16.381152163162234 vs DuckDB 16.380778626395543 (+0.0023%). q03/q10 pass with exact
 key sets and internally-exact ordering; individual revenue values run up to 0.40% low (the
 deferred #24 deficit). CSV: /tmp/sirius-tpch-bench/bench/A5/timings.csv.
+
+## 22/22 (2026-08-07, commits 59ce6662 + 312e4535)
+
+Both stragglers root-caused and fixed:
+
+- **q02** (59ce6662): the wedge was a hash join whose build side finishes with ZERO batches
+  (the build stream hashed entirely to the other CN) — BUILD_PROBE had no terminal transition
+  for it, and a masking election defect kept empty-build joins out of BUILD_PROBE entirely.
+  Passes 3/3 (~1.0-1.3 s, 100 rows). The per-query watchdog landed alongside as defense in
+  depth and never triggers.
+- **q15** (312e4535): the empty result was cuDF's FP64 atomicAdd nondeterminism against the
+  FE's exact-DECIMAL contract — the plan's two CTE evaluations diverged on ~21% of groups by
+  >=1 ulp, so the exact-equality join sometimes matched nothing. Float grouped sums now run
+  through the canonical-order sort-based groupby (atomics-free): 8/8 runs, bit-identical.
+
+**A6 sweep: 22/22 pass**, all values DuckDB-validated (0.5% band; q03/q10 order-diff only —
+the deferred #24 drift). Two transient loud arena refusals mid-sweep (q05 r2, q21 r0) passed
+solo 3/3 — staging-arena headroom under back-to-back load is worth a look if it recurs.
+CSV: /tmp/sirius-tpch-bench/bench/A6/timings.csv.
+
+Open loud-failure items found during the q15 diagnosis (not yet fixed): a fragment with an
+unhandled sink type (e.g. MULTI_CAST_DATA_STREAM_SINK) returns Ok(empty) and hangs its
+consumers silently (compute_node_service.rs let-else must be an error); a parked-sender
+export defect surfaced by CAST(sum AS VARCHAR) probes ("no parked sender output to export").

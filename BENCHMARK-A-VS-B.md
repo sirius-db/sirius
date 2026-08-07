@@ -64,6 +64,9 @@
   /tmp/sirius-tpch-bench/bench/A5/timings.csv. Warm medians 288 ms (q01) to 1.2 s (q08).
   Outstanding: q02 (#26), q15 flake (#29), and the deferred #24 value deficit.
 
+- 2026-08-07 (v2 final): **22/22 pass** (A6 sweep) after 59ce6662 (q02: empty-build-side
+  join) + 312e4535 (q15: bit-stable float sums). CSV: /tmp/sirius-tpch-bench/bench/A6/.
+
 ## Results
 
 (pending — table + plot land here; partial A data preserved at /tmp/sirius-tpch-bench/bench/)
