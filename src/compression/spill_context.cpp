@@ -24,6 +24,12 @@ namespace {
 thread_local const spill_context* t_current_spill_context = nullptr;
 
 std::atomic<bool> g_spill_enabled{false};
+
+// Set when an allocation OOMs, cleared when the downgrade monitor sees pressure
+// fall below downgrade_stop_fraction. Compressing costs device memory at exactly
+// the moment there is none: the encode allocates working buffers while a spill is
+// under way, so under pressure it competes with the query's own allocations.
+std::atomic<bool> g_spill_suppressed{false};
 std::atomic<std::uint32_t> g_explore_beam_width{20};
 std::atomic<std::size_t> g_explore_max_bytes{256ULL * 1024 * 1024};
 std::atomic<double> g_max_compressed_fraction{0.75};
@@ -56,7 +62,18 @@ void set_spill_compression_settings(bool enabled,
 
 bool spill_compression_enabled() noexcept
 {
-  return g_spill_enabled.load(std::memory_order_relaxed);
+  return g_spill_enabled.load(std::memory_order_relaxed) &&
+         !g_spill_suppressed.load(std::memory_order_relaxed);
+}
+
+void set_spill_compression_suppressed(bool suppressed) noexcept
+{
+  g_spill_suppressed.store(suppressed, std::memory_order_relaxed);
+}
+
+bool spill_compression_suppressed() noexcept
+{
+  return g_spill_suppressed.load(std::memory_order_relaxed);
 }
 
 spill_context make_spill_context(const cucascade::shared_data_repository* repo) noexcept

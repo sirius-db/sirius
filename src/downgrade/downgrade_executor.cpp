@@ -17,6 +17,7 @@
 #include "downgrade/downgrade_executor.hpp"
 
 #include "compression/output_compression.hpp"
+#include "compression/spill_context.hpp"
 #include "data/convertible_data.hpp"
 #include "data/convertible_data_batch.hpp"
 #include "data/convertible_gpu_pipeline_task.hpp"
@@ -623,6 +624,15 @@ void downgrade_executor::monitor_loop()
     } else {
       // Pressure gone -- reset so the next stall episode warns again.
       backed_off = false;
+      // Release the OOM policy's compression suppression here rather than on a
+      // successful retry: should_downgrade_memory() is debounced by the
+      // trigger/stop fractions, so it reports recovery once the space has real
+      // headroom again instead of after a single allocation squeaks through.
+      if (compression::spill_compression_suppressed()) {
+        compression::set_spill_compression_suppressed(false);
+        SIRIUS_LOG_DEBUG("[downgrade] [{}] memory pressure resolved; re-enabling spill compression",
+                         _source_label);
+      }
     }
     // Wait for the monitor period, but wake immediately on shutdown.
     std::unique_lock<std::mutex> lock(_monitor_cv_mutex);

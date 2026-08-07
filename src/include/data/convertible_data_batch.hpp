@@ -27,6 +27,7 @@
 #include "telemetry/batch_telemetry.hpp"
 
 #include <rmm/cuda_stream_view.hpp>
+#include <rmm/error.hpp>
 
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/cudf/host_data_representation.hpp>
@@ -278,6 +279,21 @@ class convertible_data_batch : public convertible_data {
       mut.convert_to<CompressedRep>(converter_registry, reservation, stream);
       return true;
     } catch (const std::exception& e) {
+      // An OOM here is compression's own doing: the encode wanted device memory
+      // during a spill, which is exactly when there is none. Suppress further
+      // attempts for the rest of this pressure episode so the remaining batches
+      // spill raw instead of each paying a failed encode first. The downgrade
+      // monitor lifts it once the space is back under its trigger.
+      //
+      // This is the latch point rather than the OOM policy because
+      // oom_handling_policy::handle_oom is the ordinary allocation-retry path --
+      // it fires on every failed allocation under pressure, not just on the ones
+      // compression caused, so latching there toggles far too often to hold for
+      // an episode. Only out-of-memory declines latch; a plan that merely
+      // compressed too little is a verdict about the data, not memory pressure.
+      if (dynamic_cast<const rmm::out_of_memory*>(&e) != nullptr) {
+        compression::set_spill_compression_suppressed(true);
+      }
       SIRIUS_LOG_DEBUG(
         "[convertible_data_batch] compressed spill declined ({}); "
         "falling back to uncompressed",

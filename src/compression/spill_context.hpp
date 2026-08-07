@@ -161,8 +161,27 @@ void set_spill_compression_settings(bool enabled,
                                     double replan_change_threshold,
                                     std::size_t explore_sample_rows) noexcept;
 
-/// Whether spill compression is enabled process-wide.
+/// Whether spill compression is enabled process-wide *and* not currently
+/// suppressed. This is the predicate the spill path consults.
 [[nodiscard]] bool spill_compression_enabled() noexcept;
+
+/**
+ * @brief Suppress spill compression without changing the configured setting.
+ *
+ * Compression needs device memory to encode, and a spill happens precisely when
+ * there is none left, so under pressure the encode competes with the query's own
+ * allocations. Suppressing it lets the spill proceed raw and frees memory sooner.
+ *
+ * Set by the OOM policy when an allocation fails; cleared by the downgrade
+ * monitor once the space is no longer above its downgrade trigger. The
+ * trigger/stop hysteresis is what keeps this from flapping — suppression holds
+ * for the whole pressure episode rather than toggling per allocation. Per-query
+ * state is dropped independently by plan_register::clear_spill_state().
+ */
+void set_spill_compression_suppressed(bool suppressed) noexcept;
+
+/// Whether compression is currently suppressed by memory pressure.
+[[nodiscard]] bool spill_compression_suppressed() noexcept;
 
 /// Build a spill_context for @p repo from the process-global settings.
 [[nodiscard]] spill_context make_spill_context(
