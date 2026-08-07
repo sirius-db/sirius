@@ -62,6 +62,7 @@
 #include <duckdb/storage/data_table.hpp>
 #include <duckdb/storage/single_file_block_manager.hpp>
 #include <duckdb/storage/storage_manager.hpp>
+#include <duckdb/transaction/duck_transaction_manager.hpp>
 
 #include <algorithm>
 #include <cstdint>
@@ -580,12 +581,35 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
     return;
   }
 
+  _checkpoint_locks.reserve(_pending_mvcc_mask_jobs.size());
+  for (auto const& request : _pending_mvcc_mask_jobs) {
+    _checkpoint_locks.push_back(
+      duckdb::DuckTransactionManager::Get(request.storage->GetAttached()).SharedCheckpointLock());
+  }
+
+  // A manual CHECKPOINT can replace DuckDB's on-disk base while the pinned
+  // cache still holds the preceding image. Auto-checkpoint is suppressed for
+  // pins, but explicit checkpoints remain possible; reject a changed database
+  // generation before serving any cached rows.
+  for (auto const& request : _pending_mvcc_mask_jobs) {
+    auto const* block_manager = dynamic_cast<duckdb::SingleFileBlockManager const*>(
+      &request.storage->GetAttached().GetStorageManager().GetBlockManager());
+    if (block_manager == nullptr ||
+        block_manager->GetCheckpointIteration() != request.metadata.checkpoint_iteration) {
+      throw std::runtime_error(
+        "Sirius cannot safely scan pinned DuckDB table '" + request.entry_name +
+        "': its database was checkpointed after pin_table, so the pinned cache may be stale. "
+        "Run CALL unpin_table('" +
+        request.entry_name + "'), then pin_table again");
+    }
+  }
+
   // Compute this query's duckdb MVCC keep-masks BEFORE serving starts, so
   // masks are finished plain buffers when the sequencer runs (it walks all
   // ops' slots serially; a wait there would be head-of-line blocking across
   // every scan op). The dispatcher is fresh and otherwise idle here. Errors
-  // are loud: past the plan-time gate there is no CPU fallback, and the
-  // alternative to failing is serving rows a concurrent DELETE removed.
+  // are loud: transparent execution can replay its retained CPU plan, while
+  // fallback-disabled callers receive the error instead of stale results.
   if (!_pending_mvcc_mask_jobs.empty()) {
     run_mvcc_mask_jobs(
       _pending_mvcc_mask_jobs, *_dispatcher, _reservation_manager, *_topology_index);
@@ -812,6 +836,7 @@ void sirius_scan_manager::reset()
   _pending_mvcc_mask_jobs.clear();
   _pending_insert_delta_jobs.clear();
   _metadata_processor.reset();
+  _checkpoint_locks.clear();
   _dispatcher = std::make_unique<exec::scoped_dispatcher>(_thread_pool, _thread_pool.num_threads());
 }
 
