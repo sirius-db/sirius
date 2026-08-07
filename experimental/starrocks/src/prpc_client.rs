@@ -83,7 +83,10 @@ impl PrpcClient {
                     Ok(response) => Ok(response),
                     Err(CallError::Rpc(err)) | Err(CallError::Transport(err)) => {
                         self.connection = None;
-                        Err(format!("{method_name} to {} (after reconnect): {err}", self.peer))
+                        Err(format!(
+                            "{method_name} to {} (after reconnect): {err}",
+                            self.peer
+                        ))
                     }
                 }
             }
@@ -134,9 +137,9 @@ impl PrpcClient {
                 reply.correlation_id()
             )));
         }
-        reply
-            .into_response()
-            .map_err(|err| CallError::Rpc(format!("peer returned brpc error {}: {err}", err.code())))
+        reply.into_response().map_err(|err| {
+            CallError::Rpc(format!("peer returned brpc error {}: {err}", err.code()))
+        })
     }
 
     /// The cached connection, dialing the peer when there is none.
@@ -150,12 +153,16 @@ impl PrpcClient {
                 .map_err(|err| CallError::Transport(format!("failed to connect: {err}")))?;
             // Bound every read/write: a wedged peer must fail the query, not hang the transport
             // thread forever. NODELAY because request frames are small and latency-sensitive.
-            stream.set_read_timeout(Some(REPLY_TIMEOUT)).map_err(|err| {
-                CallError::Transport(format!("failed to set read timeout: {err}"))
-            })?;
-            stream.set_write_timeout(Some(REPLY_TIMEOUT)).map_err(|err| {
-                CallError::Transport(format!("failed to set write timeout: {err}"))
-            })?;
+            stream
+                .set_read_timeout(Some(REPLY_TIMEOUT))
+                .map_err(|err| {
+                    CallError::Transport(format!("failed to set read timeout: {err}"))
+                })?;
+            stream
+                .set_write_timeout(Some(REPLY_TIMEOUT))
+                .map_err(|err| {
+                    CallError::Transport(format!("failed to set write timeout: {err}"))
+                })?;
             stream
                 .set_nodelay(true)
                 .map_err(|err| CallError::Transport(format!("failed to set nodelay: {err}")))?;
@@ -217,7 +224,13 @@ mod tests {
                 .serve_with_listener_shutdown(listener, server_shutdown.cancelled_owned()),
             )
         });
-        Some((port, ServerGuard { shutdown, join: Some(join) }))
+        Some((
+            port,
+            ServerGuard {
+                shutdown,
+                join: Some(join),
+            },
+        ))
     }
 
     struct ServerGuard {
@@ -284,7 +297,10 @@ mod tests {
             .call("no_such_method", Vec::new(), Vec::new())
             .expect_err("unknown method must be a brpc error");
         assert!(err.contains("not found"), "{err}");
-        assert!(err.contains("1002"), "brpc ENOMETHOD code should surface: {err}");
+        assert!(
+            err.contains("1002"),
+            "brpc ENOMETHOD code should surface: {err}"
+        );
     }
 
     /// A connection the peer closed between calls is re-dialed transparently.

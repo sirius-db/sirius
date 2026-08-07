@@ -325,9 +325,9 @@ mod agent_tier {
         let (_mem_types, params) = agent
             .get_plugin_params("UCX")
             .map_err(|err| format!("nixl UCX plugin unavailable: {err} — {ENV_HINT}"))?;
-        let backend = agent.create_backend("UCX", &params).map_err(|err| {
-            format!("failed to create the nixl UCX backend: {err} — {ENV_HINT}")
-        })?;
+        let backend = agent
+            .create_backend("UCX", &params)
+            .map_err(|err| format!("failed to create the nixl UCX backend: {err} — {ENV_HINT}"))?;
         let mut opt_args =
             OptArgs::new().map_err(|err| format!("failed to create nixl opt args: {err}"))?;
         opt_args
@@ -354,9 +354,9 @@ mod agent_tier {
             executor: Arc<dyn FragmentExecutor>,
             agent_name: String,
         ) -> Result<Self, String> {
-            let (staging_base, staging_capacity) = executor.staging_info().map_err(|err| {
-                format!("nixl transport needs the exchange staging arena: {err}")
-            })?;
+            let (staging_base, staging_capacity) = executor
+                .staging_info()
+                .map_err(|err| format!("nixl transport needs the exchange staging arena: {err}"))?;
             let (agent, arena_registration, local_md) =
                 bring_up_agent(&agent_name, staging_base, staging_capacity)?;
             info!(
@@ -377,7 +377,11 @@ mod agent_tier {
         }
 
         /// Receiver side of first contact: load the peer's metadata, reply with ours.
-        fn exchange_md(&mut self, peer_agent_name: &str, peer_metadata: &[u8]) -> Result<MdReply, String> {
+        fn exchange_md(
+            &mut self,
+            peer_agent_name: &str,
+            peer_metadata: &[u8],
+        ) -> Result<MdReply, String> {
             let loaded = self.agent.load_remote_md(peer_metadata).map_err(|err| {
                 format!("failed to load nixl metadata of peer '{peer_agent_name}': {err}")
             })?;
@@ -402,9 +406,10 @@ mod agent_tier {
             }
             let mut client = PrpcClient::new(host, brpc_port);
             let reply = rpc_exchange_md(&mut client, &self.agent_name, &self.local_md)?;
-            let loaded = self.agent.load_remote_md(&reply.metadata).map_err(|err| {
-                format!("failed to load nixl metadata of peer {key}: {err}")
-            })?;
+            let loaded = self
+                .agent
+                .load_remote_md(&reply.metadata)
+                .map_err(|err| format!("failed to load nixl metadata of peer {key}: {err}"))?;
             if loaded != reply.agent_name {
                 return Err(format!(
                     "peer {key} announced agent name '{}' but its metadata decodes to '{loaded}'",
@@ -425,15 +430,26 @@ mod agent_tier {
         /// F1's silent-degradation guard: nothing in nixl/UCX flags the ~220x staged-copy path
         /// (wrongly-allocated memory still transfers correct bytes), so the first contact WRITEs
         /// a 16 MiB lease→lease probe and refuses the tier below the floor.
-        fn bandwidth_canary(&mut self, client: &mut PrpcClient, remote_agent: &str) -> Result<(), String> {
-            let local_offset = self.executor.staging_lease(CANARY_BYTES).map_err(|err| {
-                format!("failed to lease canary staging bytes locally: {err}")
-            })?;
+        fn bandwidth_canary(
+            &mut self,
+            client: &mut PrpcClient,
+            remote_agent: &str,
+        ) -> Result<(), String> {
+            let local_offset = self
+                .executor
+                .staging_lease(CANARY_BYTES)
+                .map_err(|err| format!("failed to lease canary staging bytes locally: {err}"))?;
             let result = (|| {
                 let lease = rpc_request_lease(client, CANARY_BYTES)?;
                 let local_addr = self.staging_base + local_offset;
                 // Warmup settles connection wireup; the timed WRITE measures the steady link.
-                write_and_wait(&self.agent, remote_agent, local_addr, lease.remote_addr, WARMUP_BYTES)?;
+                write_and_wait(
+                    &self.agent,
+                    remote_agent,
+                    local_addr,
+                    lease.remote_addr,
+                    WARMUP_BYTES,
+                )?;
                 let elapsed = write_and_wait(
                     &self.agent,
                     remote_agent,
@@ -728,8 +744,14 @@ mod agent_tier {
             let target = executor.staging_lease(CANARY_BYTES).unwrap();
             assert_ne!(source, target, "two live leases must not alias");
 
-            write_and_wait(&sender_agent, &receiver_name, base + source, base + target, WARMUP_BYTES)
-                .expect("warmup cross-agent WRITE");
+            write_and_wait(
+                &sender_agent,
+                &receiver_name,
+                base + source,
+                base + target,
+                WARMUP_BYTES,
+            )
+            .expect("warmup cross-agent WRITE");
             let elapsed = write_and_wait(
                 &sender_agent,
                 &receiver_name,
@@ -739,7 +761,9 @@ mod agent_tier {
             )
             .expect("timed cross-agent WRITE");
             let gbps = CANARY_BYTES as f64 / elapsed.as_secs_f64() / 1e9;
-            eprintln!("nixl cross-agent WRITE: {CANARY_BYTES} bytes in {elapsed:?} = {gbps:.1} GB/s");
+            eprintln!(
+                "nixl cross-agent WRITE: {CANARY_BYTES} bytes in {elapsed:?} = {gbps:.1} GB/s"
+            );
             assert!(
                 gbps >= CANARY_FLOOR_GBPS,
                 "cross-agent WRITE measured {gbps:.2} GB/s, below the {CANARY_FLOOR_GBPS} GB/s \

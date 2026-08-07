@@ -349,8 +349,14 @@ fn run_fragment<'ctx>(
     request: &ExecuteRequest,
 ) -> Result<Option<FragmentResult>, String> {
     let mut released = std::collections::HashSet::new();
-    let result =
-        run_fragment_inner(context, parked, parked_slots, next_park_id, request, &mut released);
+    let result = run_fragment_inner(
+        context,
+        parked,
+        parked_slots,
+        next_park_id,
+        request,
+        &mut released,
+    );
     if result.is_err() {
         for (_, _, batches) in &request.remote_inputs {
             for batch in batches {
@@ -423,8 +429,8 @@ fn run_fragment_inner<'ctx>(
             .map(|slot| slot.sender_id)
             .chain(remote_senders)
         {
-            let sender_id = u32::try_from(sender_id)
-                .map_err(|_| format!("negative sender id {sender_id}"))?;
+            let sender_id =
+                u32::try_from(sender_id).map_err(|_| format!("negative sender id {sender_id}"))?;
             fragment
                 .declare_input_sender(stream_id, sender_id)
                 .map_err(|err| format!("failed to declare sender on stream {stream_id}: {err}"))?;
@@ -541,7 +547,9 @@ fn run_fragment_inner<'ctx>(
         *next_park_id += 1;
         for (stream, slot) in request.outputs.iter().enumerate() {
             if parked_slots.contains_key(slot) {
-                return Err(format!("duplicate destination slot {slot:?} in one sender fan-out"));
+                return Err(format!(
+                    "duplicate destination slot {slot:?} in one sender fan-out"
+                ));
             }
             parked_slots.insert(slot.clone(), (park_id, stream as u64));
         }
@@ -1084,8 +1092,8 @@ mod tests {
                     inputs: Vec::new(),
                     remote_inputs: Vec::new(),
                     outputs: vec![slot],
-                broadcast: false,
-                hash_keys: Vec::new(),
+                    broadcast: false,
+                    hash_keys: Vec::new(),
                 })
                 .expect("run the sender fragment")
                 .is_none(),

@@ -83,8 +83,7 @@ mod tests {
     /// `parse_bytes` is the authoritative parser.
     #[test]
     fn gpu_limit_passes_through_verbatim() {
-        let yaml =
-            derive_sirius_config_yaml(Some("8GiB"), None, None, Path::new(".cn1")).unwrap();
+        let yaml = derive_sirius_config_yaml(Some("8GiB"), None, None, Path::new(".cn1")).unwrap();
         assert!(yaml.contains("usage_limit_bytes: \"8GiB\"\n"), "{yaml}");
         assert!(!yaml.contains("usage_limit_fraction"), "{yaml}");
     }
@@ -122,18 +121,14 @@ mod tests {
             derive_sirius_config_yaml(Some("8GiB"), None, None, Path::new(".cn1")).unwrap(),
             derive_sirius_config_yaml(None, Some(0.25), None, Path::new(".cn1")).unwrap(),
         ] {
-            assert!(
-                yaml.contains("reservation_limit_fraction: 1.0\n"),
-                "{yaml}"
-            );
+            assert!(yaml.contains("reservation_limit_fraction: 1.0\n"), "{yaml}");
         }
     }
 
     /// Telemetry lands under the engine directory.
     #[test]
     fn telemetry_directory_is_under_engine_dir() {
-        let yaml =
-            derive_sirius_config_yaml(Some("8GiB"), None, None, Path::new(".cn2")).unwrap();
+        let yaml = derive_sirius_config_yaml(Some("8GiB"), None, None, Path::new(".cn2")).unwrap();
         assert!(
             yaml.contains("output_directory: \".cn2/telemetry\"\n"),
             "{yaml}"
@@ -153,8 +148,7 @@ mod tests {
     /// usage limit would claim the whole device).
     #[test]
     fn host_only_omits_gpu_mapping() {
-        let yaml =
-            derive_sirius_config_yaml(None, None, Some("12GiB"), Path::new(".cn1")).unwrap();
+        let yaml = derive_sirius_config_yaml(None, None, Some("12GiB"), Path::new(".cn1")).unwrap();
         assert!(!yaml.contains("gpu:"), "{yaml}");
         assert!(yaml.contains("capacity_bytes: \"12GiB\"\n"), "{yaml}");
     }
@@ -163,9 +157,8 @@ mod tests {
     /// (`sirius_config.cpp` rejects unknown keys).
     #[test]
     fn full_document_snapshot() {
-        let yaml =
-            derive_sirius_config_yaml(Some("8GiB"), None, Some("12GiB"), Path::new(".cn1"))
-                .unwrap();
+        let yaml = derive_sirius_config_yaml(Some("8GiB"), None, Some("12GiB"), Path::new(".cn1"))
+            .unwrap();
         assert_eq!(
             yaml,
             concat!(

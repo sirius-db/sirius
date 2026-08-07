@@ -104,8 +104,10 @@ fn parse_byte_size(value: &str) -> Result<String, String> {
     }
     let mut rest = &value[digits..];
     if let Some(fraction) = rest.strip_prefix('.') {
-        let fraction_digits =
-            fraction.len() - fraction.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+        let fraction_digits = fraction.len()
+            - fraction
+                .trim_start_matches(|c: char| c.is_ascii_digit())
+                .len();
         if fraction_digits == 0 {
             return Err(invalid());
         }
@@ -265,7 +267,10 @@ impl EngineConfig {
             return Ok(());
         }
         let mut command = std::process::Command::new("nvidia-smi");
-        command.args(["--query-compute-apps=pid,used_memory", "--format=csv,noheader"]);
+        command.args([
+            "--query-compute-apps=pid,used_memory",
+            "--format=csv,noheader",
+        ]);
         if let Some(device) = self.gpu_device {
             command.args(["-i", &device.to_string()]);
         }
@@ -478,10 +483,7 @@ fn build_nixl_transport(
     }
     // The agent is named by this CN's exchange identity, so two CNs on one host get distinct
     // agents and the FE-routed destination address doubles as the peer's agent name.
-    let agent_name = format!(
-        "{}:{}",
-        compute_node.advertise_host, compute_node.brpc_port
-    );
+    let agent_name = format!("{}:{}", compute_node.advertise_host, compute_node.brpc_port);
     NixlTransport::start(executor, agent_name)
         .map(Some)
         .map_err(|err| anyhow!("failed to bring up the nixl exchange transport: {err}"))

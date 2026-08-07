@@ -199,12 +199,14 @@ impl LocalExchange {
         *expected_seq += 1;
 
         let senders = state.sources.entry(key).or_default();
-        let source = senders.entry(sender_id).or_insert_with(|| SenderSource::Remote {
-            names: names.clone(),
-            sender_id,
-            batches: Vec::new(),
-            closed: false,
-        });
+        let source = senders
+            .entry(sender_id)
+            .or_insert_with(|| SenderSource::Remote {
+                names: names.clone(),
+                sender_id,
+                batches: Vec::new(),
+                closed: false,
+            });
         let SenderSource::Remote {
             names: known_names,
             batches,
@@ -265,7 +267,12 @@ impl LocalExchange {
             // A remote sender counts only once its eos arrived; a local parked one is done by
             // construction.
             let complete = sources
-                .map(|senders| senders.values().filter(|source| source.is_complete()).count())
+                .map(|senders| {
+                    senders
+                        .values()
+                        .filter(|source| source.is_complete())
+                        .count()
+                })
                 .unwrap_or(0);
             if complete != expected {
                 return Ok(None);
@@ -499,14 +506,7 @@ mod tests {
             .push_remote_frame(key, 0, 0, false, names(), Some(staged(1)))
             .unwrap();
         let err = exchange
-            .push_remote_frame(
-                key,
-                0,
-                1,
-                false,
-                vec!["other".to_string()],
-                Some(staged(2)),
-            )
+            .push_remote_frame(key, 0, 1, false, vec!["other".to_string()], Some(staged(2)))
             .unwrap_err();
         assert!(err.contains("changed its column names"), "{err}");
     }
