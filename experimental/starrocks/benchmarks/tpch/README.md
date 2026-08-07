@@ -11,7 +11,7 @@ in both cases.
   with `$TPCH_DATA` at run time (a directory holding `<table>/*.parquet`).
 - `bench.sh` — per-query sweep: 1 discarded warm-up + N timed runs, wall-clock ms
   around `mysql -e`, medians taken later. Refusals (ERROR) are recorded once; hangs
-  are cut at `$QUERY_TIMEOUT` (default 120 s) and recorded as wedges. After either,
+  are cut at `$QUERY_TIMEOUT` (default 60 s) and recorded as wedges. After either,
   `$RESTART_CMD` runs — required for engine A (see caveat below).
 - `analyze.py` — merges two result CSVs into a markdown table + log-scale bar plot
   (median ms per query, geometric-mean speedup over the comparable set).

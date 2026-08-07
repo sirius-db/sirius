@@ -10,7 +10,7 @@
 #   TPCH_DATA          directory holding <table>/*.parquet (substituted into the
 #                      queries' FILES() paths; required)
 #   FE_PORT            FE MySQL port (default 9030)
-#   QUERY_TIMEOUT      per-run client timeout in seconds (default 120; SF1 passes
+#   QUERY_TIMEOUT      per-run client timeout in seconds (default 60; SF1 passes
 #                      finish in well under 2s, so anything near this is a hang)
 #   RESTART_CMD        command that fully restarts the cluster. The CN has no
 #                      cancel_plan_fragment yet, so a hung or failed query strands
@@ -31,7 +31,7 @@ QUERIES=("$@")
 
 TPCH_DATA=${TPCH_DATA:?set TPCH_DATA to the directory holding <table>/*.parquet}
 FE_PORT=${FE_PORT:-9030}
-QUERY_TIMEOUT=${QUERY_TIMEOUT:-120}
+QUERY_TIMEOUT=${QUERY_TIMEOUT:-60}
 RESTART_CMD=${RESTART_CMD:-}
 MYSQL="mysql --host 127.0.0.1 --port $FE_PORT --user root --batch --connect-timeout=5"
 OUT=$(dirname "$OUT_CSV")
