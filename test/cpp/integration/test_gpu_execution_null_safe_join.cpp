@@ -130,32 +130,21 @@ TEST_CASE_METHOD(MixedKeyJoinFixture,
                  "gpu_execution mixed '=' and IS NOT DISTINCT FROM join runs on GPU",
                  "[integration][gpu_execution][join][nulls]")
 {
-  // Regression guard: a join mixing '=' with IS NOT DISTINCT FROM must stay on the
-  // GPU and must NOT be rejected -- rejecting it routed delim joins to the
-  // unsupported nested-loop path. `b` has no NULLs, so the result is the same under
-  // either null semantics; this only asserts the mixed-key join runs on the GPU.
+  // Keep null-free mixed keys on GPU; rejecting them breaks delim joins.
   compare_gpu_vs_cpu(
     "SELECT ml.a, ml.b FROM ml JOIN mr ON ml.a = mr.a AND ml.b IS NOT DISTINCT FROM mr.b");
   compare_gpu_vs_cpu(
     "SELECT count(*) FROM ml JOIN mr ON ml.a = mr.a AND ml.b IS NOT DISTINCT FROM mr.b");
 }
 
-// A join mixing a plain '=' key with a null-safe (IS NOT DISTINCT FROM) key where the
-// null-safe column carries NULLs on both sides. A single cuDF null_equality flag can't
-// serve both keys at once -- the '=' key needs UNEQUAL (NULL != NULL) while the null-safe
-// key needs EQUAL (NULL == NULL) -- so the old single-flag path forced UNEQUAL and
-// silently dropped the NULL-to-NULL matches on `b`. The fix keeps '=' as the (UNEQUAL)
-// hash key and moves the null-safe key into a NULL_EQUAL predicate on a cuDF mixed join.
+// Mixed plain and null-safe keys require UNEQUAL hashing plus a NULL_EQUAL predicate.
 class MixedKeyNullSafeJoinFixture : public sirius::test::GpuExecutionFixture {
  public:
   MixedKeyNullSafeJoinFixture()
   {
     run_ok("CREATE TABLE mnl (id INTEGER, a INTEGER, b INTEGER);");
     run_ok("CREATE TABLE mnr (id INTEGER, a INTEGER, b INTEGER);");
-    // For non-NULL `a`, `b` mixes a matching non-NULL pair, two NULL-to-NULL
-    // pairs (which plain '=' would drop), and a non-matching (300 vs 999) pair.
-    // Row mnl(5) has no `a` partner. The final pair has matching b=500 but NULL
-    // in the plain '=' key `a`; it must not match because NULL = NULL is unknown.
+    // Includes null-safe NULL matches and a NULL pair in the plain key that must not match.
     run_ok(
       "INSERT INTO mnl VALUES (1, 10, 100), (2, 10, NULL), (3, 20, NULL), (4, 30, 300), "
       "(5, 40, NULL), (6, NULL, 500);");
@@ -170,9 +159,7 @@ TEST_CASE_METHOD(MixedKeyNullSafeJoinFixture,
                  "gpu_execution mixed '=' + null-safe INNER join matches NULL to NULL",
                  "[integration][gpu_execution][join][nulls]")
 {
-  // Matches: (a=10,b=100), (a=10,b=NULL), (a=20,b=NULL) = 3 rows. A plain '=' on `b`
-  // would drop the two NULL-to-NULL pairs and return only 1; NULL_EQUAL on the hash key
-  // would incorrectly add the (a=NULL,b=500) pair and return 4.
+  // Expected matches: one non-NULL pair and two null-safe NULL pairs.
   compare_gpu_vs_cpu(
     "SELECT mnl.id, mnr.id FROM mnl JOIN mnr "
     "ON mnl.a = mnr.a AND mnl.b IS NOT DISTINCT FROM mnr.b");
@@ -195,9 +182,7 @@ TEST_CASE_METHOD(MixedKeyNullSafeJoinFixture,
                  "gpu_execution mixed '=' + null-safe SEMI and ANTI joins",
                  "[integration][gpu_execution][join][nulls]")
 {
-  // Keep the output side on the left so these queries exercise mixed_left_semi_join
-  // and mixed_left_anti_join. SEMI returns rows 1-3; ANTI returns rows 4-6,
-  // including row 6 because NULL must not match in the plain '=' key.
+  // Preserve left SEMI/ANTI planning; row 6 must not match on its plain NULL key.
   disabled_optimizer_guard guard(*con->context, duckdb::OptimizerType::BUILD_SIDE_PROBE_SIDE);
   compare_gpu_vs_cpu(
     "SELECT mnl.id FROM mnl SEMI JOIN mnr "
@@ -211,8 +196,7 @@ TEST_CASE_METHOD(MixedKeyNullSafeJoinFixture,
                  "gpu_execution mixed '=' + null-safe FULL OUTER join matches NULL to NULL",
                  "[integration][gpu_execution][join][nulls]")
 {
-  // FULL OUTER is symmetric, so DuckDB can't rewrite it away -- it exercises the
-  // mixed full-outer path with a null-safe key.
+  // FULL OUTER cannot be rewritten to a swapped join.
   compare_gpu_vs_cpu(
     "SELECT mnl.id, mnr.id FROM mnl FULL OUTER JOIN mnr "
     "ON mnl.a = mnr.a AND mnl.b IS NOT DISTINCT FROM mnr.b");
@@ -223,31 +207,22 @@ TEST_CASE_METHOD(
   "gpu_execution mixed '=' + null-safe RIGHT join hits the right-family path (no swap)",
   "[integration][gpu_execution][join][nulls]")
 {
-  // Disable the build-side/probe-side optimizer so DuckDB preserves the RIGHT join
-  // type instead of lowering it to a swapped LEFT join, forcing the mixed right-family
-  // path with a null-safe key.
+  // Preserve RIGHT instead of lowering it to a swapped LEFT join.
   disabled_optimizer_guard guard(*con->context, duckdb::OptimizerType::BUILD_SIDE_PROBE_SIDE);
   compare_gpu_vs_cpu(
     "SELECT mnl.id, mnr.id FROM mnl RIGHT JOIN mnr "
     "ON mnl.a = mnr.a AND mnl.b IS NOT DISTINCT FROM mnr.b");
 }
 
-// A mixed '=' + null-safe join whose null-safe key needs an implicit cast. Routing that key
-// into the mixed-join predicate takes it off the hash-key path (prepare_join_keys ->
-// cudf::cast, which casts to anything) and onto the cuDF AST, which can only cast to
-// INT64 / UINT64 / FLOAT64. `b` is SMALLINT vs INTEGER, so DuckDB binds the comparison at
-// INTEGER and inserts a cast the AST cannot express; the planner has to materialize it into
-// a real column below the join. `c` is SMALLINT vs BIGINT -- a cast the AST *can* express --
-// so it covers the inline path that needs no materialization.
+// `b` requires materializing an AST-unsupported SMALLINT-to-INTEGER cast; `c` exercises
+// the inline SMALLINT-to-BIGINT cast supported by cuDF AST.
 class MixedTypeNullSafeJoinFixture : public sirius::test::GpuExecutionFixture {
  public:
   MixedTypeNullSafeJoinFixture()
   {
     run_ok("CREATE TABLE mtl (id INTEGER, a INTEGER, b SMALLINT, c SMALLINT);");
     run_ok("CREATE TABLE mtr (id INTEGER, a INTEGER, b INTEGER, c BIGINT);");
-    // Same shape as MixedKeyNullSafeJoinFixture: a matching non-NULL pair, two NULL-to-NULL
-    // pairs (which plain '=' would drop), a non-matching pair, a row with no `a` partner, and
-    // a row matching on the null-safe key but NULL in the plain '=' key (which must not match).
+    // Same null-matching cases as MixedKeyNullSafeJoinFixture, with mixed key types.
     run_ok(
       "INSERT INTO mtl VALUES (1, 10, 100, 100), (2, 10, NULL, NULL), (3, 20, NULL, NULL), "
       "(4, 30, 300, 300), (5, 40, NULL, NULL), (6, NULL, 500, 500);");
@@ -262,10 +237,7 @@ TEST_CASE_METHOD(MixedTypeNullSafeJoinFixture,
                  "gpu_execution mixed '=' + null-safe join with an AST-untranslatable cast",
                  "[integration][gpu_execution][join][nulls]")
 {
-  // SMALLINT vs INTEGER on the null-safe key. compare_gpu_vs_cpu requires exactly one GPU
-  // execution and no fallback, so this fails if the join throws at execute time (the mixed
-  // join promising a predicate the AST can't build) as well as if it returns wrong rows.
-  // Matches: (a=10,b=100), (a=10,b=NULL), (a=20,b=NULL) = 3 rows.
+  // SMALLINT-to-INTEGER must be materialized while preserving three expected matches.
   compare_gpu_vs_cpu(
     "SELECT mtl.id, mtr.id FROM mtl JOIN mtr "
     "ON mtl.a = mtr.a AND mtl.b IS NOT DISTINCT FROM mtr.b");
@@ -278,9 +250,7 @@ TEST_CASE_METHOD(MixedTypeNullSafeJoinFixture,
                  "gpu_execution mixed '=' + null-safe join with a cast and no NULLs",
                  "[integration][gpu_execution][join][nulls]")
 {
-  // The rows with NULL keys are filtered out, so the result is independent of null semantics.
-  // This is the case that worked before null-safe keys were routed into the AST predicate:
-  // it must keep working, not throw on a cast the AST cannot express.
+  // The pre-routing, null-free case must continue to run without fallback.
   compare_gpu_vs_cpu(
     "SELECT mtl.id, mtr.id FROM mtl JOIN mtr "
     "ON mtl.a = mtr.a AND mtl.b IS NOT DISTINCT FROM mtr.b "
@@ -291,8 +261,7 @@ TEST_CASE_METHOD(MixedTypeNullSafeJoinFixture,
                  "gpu_execution mixed '=' + null-safe join with an AST-translatable cast",
                  "[integration][gpu_execution][join][nulls]")
 {
-  // SMALLINT vs BIGINT binds at BIGINT, which the cuDF AST can cast to, so this key stays
-  // inline in the predicate rather than being materialized. Same 3 expected matches.
+  // SMALLINT-to-BIGINT remains inline because cuDF AST supports the target type.
   compare_gpu_vs_cpu(
     "SELECT mtl.id, mtr.id FROM mtl JOIN mtr "
     "ON mtl.a = mtr.a AND mtl.c IS NOT DISTINCT FROM mtr.c");
@@ -302,21 +271,15 @@ TEST_CASE_METHOD(MixedTypeNullSafeJoinFixture,
                  "gpu_execution mixed-type null-safe join does not leak the materialized key",
                  "[integration][gpu_execution][join][nulls]")
 {
-  // Materializing the cast appends a synthetic key column to the join's child. SELECT *
-  // pins the join's output width and column order, so a leaked key column fails here.
+  // SELECT * catches synthetic key columns leaking into join output.
   compare_gpu_vs_cpu(
     "SELECT * FROM mtl JOIN mtr ON mtl.a = mtr.a AND mtl.b IS NOT DISTINCT FROM mtr.b");
   compare_gpu_vs_cpu(
     "SELECT * FROM mtl LEFT JOIN mtr ON mtl.a = mtr.a AND mtl.b IS NOT DISTINCT FROM mtr.b");
 }
 
-// Documents the remaining null-safe limitation. A MARK-family join (here a projected
-// correlated EXISTS) can't run in MIXED_JOIN mode, so its null-safe key is NOT routed
-// to a NULL_EQUAL predicate -- it stays a UNEQUAL hash key and NULL-to-NULL matches can
-// be dropped on the GPU (see the compare_nulls_ note in the sirius_physical_hash_join
-// ctor). Tagged [!mayfail] because the observable behavior (silent GPU/CPU divergence
-// vs. CPU fallback) depends on the delim-join plan shape; tighten to a hard assertion
-// (or expect_gpu_fallback) once null-safe MARK joins are supported.
+// MARK cannot use MIXED_JOIN, so null-safe keys remain a known [!mayfail] limitation.
+// Replace with a hard comparison or fallback assertion once supported.
 TEST_CASE_METHOD(MixedKeyNullSafeJoinFixture,
                  "gpu_execution null-safe MARK join (projected EXISTS) is a known limitation",
                  "[integration][gpu_execution][join][nulls][!mayfail]")

@@ -26,11 +26,8 @@
 // standard library
 #include <array>
 
-// Internal header shared by .cpp files that need to consult the static allow-lists of
-// AST-compatible CAST target types and BOUND_FUNCTION names -- the expression executor and
-// translator, plus the planner and hash join, which must know at plan time whether an
-// expression they are about to route into a cuDF AST predicate will actually translate.
-// Keeps DuckDB includes out of the public expression_evaluator.hpp surface.
+// Internal AST capability lists shared by the evaluator, translator, and planning code.
+// Keeping them here avoids exposing DuckDB types through expression_evaluator.hpp.
 
 namespace sirius {
 

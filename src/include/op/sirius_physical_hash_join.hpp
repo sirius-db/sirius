@@ -308,8 +308,7 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
    * condition on the same side — cuDF's mixed_join API requires disjoint equality and
    * conditional table columns.
    *
-   * @param join_type Needed only to mirror the ctor's null-safe routing gate, which never
-   * routes a MARK join into the mixed join.
+   * @param join_type Used to exclude MARK joins from null-safe routing.
    */
   static bool are_conditions_supported(duckdb::vector<sirius::join_condition>& conditions,
                                        duckdb::JoinType join_type);

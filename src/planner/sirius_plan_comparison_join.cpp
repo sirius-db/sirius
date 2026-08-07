@@ -390,11 +390,7 @@ static bool build_side_is_derived(const duckdb::LogicalOperator* op)
   return false;
 }
 
-/// True when this join will hand its null-safe (IS NOT DISTINCT FROM) keys to the hash join's
-/// mixed-join AST predicate instead of the hash-key path. Mirrors wants_null_safe_routing() in
-/// sirius_physical_hash_join.cpp, over DuckDB's pre-wrap condition types: routing happens only
-/// when a null-safe key is mixed with a plain `=` key (one cuDF null_equality flag can't serve
-/// both), and never for MARK joins (which cannot run in MIXED_JOIN mode).
+/// Mirror the hash join's rule for routing mixed null-safe keys into the AST predicate.
 static bool routes_null_safe_keys_to_predicate(const duckdb::LogicalComparisonJoin& op)
 {
   if (op.join_type == duckdb::JoinType::MARK) { return false; }
@@ -410,15 +406,8 @@ static bool routes_null_safe_keys_to_predicate(const duckdb::LogicalComparisonJo
   return has_plain_equal && has_null_safe;
 }
 
-/// A join equality-condition side that is a plain column reference (BOUND_REF) or a cast of one
-/// (BOUND_CAST(BOUND_REF)) is already handled directly by the hash-join key extraction and by the
-/// PARTITION operator's cast-alignment logic, so it needs no materialization.
-///
-/// `evaluated_as_ast_predicate` marks a side that will instead be evaluated by the mixed join's
-/// cuDF AST predicate (a routed null-safe key). That path never reaches the hash-join key
-/// extraction, so it gets no cudf::cast; a cuDF AST can only cast to INT64 / UINT64 / FLOAT64,
-/// so any other implicit cast -- e.g. the INTEGER cast DuckDB inserts for a SMALLINT/INTEGER
-/// `IS NOT DISTINCT FROM` -- must be materialized into a real column here instead.
+/// References and hash-key casts need no materialization. Routed predicate casts are trivial
+/// only when cuDF AST supports their target type.
 static bool is_trivial_key_side(const duckdb::Expression& expr, bool evaluated_as_ast_predicate)
 {
   if (expr.GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) { return true; }
@@ -435,22 +424,9 @@ static bool is_trivial_key_side(const duckdb::Expression& expr, bool evaluated_a
   return false;
 }
 
-/// Materialize complex expressions appearing in equality join conditions into real columns.
-///
-/// Sirius always feeds a hash join through a PARTITION -> CONCAT chain, and the PARTITION operator
-/// - the first consumer of the join key - hashes columns by index and cannot evaluate expressions.
-/// To support keys like `n_nationkey * 10`, we push a projection below the join that appends the
-/// expression as a new column on that side's child, then rewrite the condition side to a plain
-/// BoundReferenceExpression pointing at the appended column. PARTITION, CONCAT, and the hash join
-/// then all see an ordinary column reference; the partitioning invariant (both sides hash the
-/// identical materialized value) holds because DuckDB binds both sides of a comparison to a common
-/// type, so the materialized column matches the type the other side hashes.
-///
-/// Only genuinely complex sides of equality (or IS-NOT-DISTINCT-FROM) conditions are materialized;
-/// plain/cast-of-reference sides keep the existing fast path, and inequality-condition sides are
-/// left untouched (they are evaluated inline as the mixed-join predicate). A side whose expression
-/// cannot be translated to a Sirius AST node is left unchanged, preserving the existing
-/// "unsupported join condition expression" behavior downstream.
+/// Materialize complex equality-key expressions into projected columns, then rewrite each
+/// condition to reference the appended column. This lets PARTITION and hash join consume a
+/// column index. Routed null-safe casts unsupported by cuDF AST use the same path.
 static void materialize_expression_join_keys(
   duckdb::LogicalComparisonJoin& op,
   duckdb::unique_ptr<sirius::op::sirius_physical_operator>& left,
@@ -514,10 +490,7 @@ static void materialize_expression_join_keys(
         duckdb::make_uniq<duckdb::BoundReferenceExpression>(side_expr->return_type, new_index);
     }
 
-    // Exclude the synthetic key column(s) from the join output. An empty projection map means
-    // "all columns"; make it explicit over just the original columns so the appended key does
-    // not leak into the join result or shift downstream column indices. A non-empty map already
-    // lists only original indices (< old_width) and needs no change.
+    // Convert "all columns" into the original range so synthetic keys do not leak.
     if (projection_map.empty()) {
       projection_map.reserve(old_width);
       for (std::size_t c = 0; c < old_width; c++) {
