@@ -348,3 +348,30 @@ cluster lifetime, cluster fully restarted between runs.
 | 4 | q02 solo | rc=124 at 120 s; CN: `request_staging_lease to …:8060 (after reconnect)` — byte-identical to the sweep |
 | 5 | `GROUP BY EXTRACT(year …)` minimal | rc=124 at 90 s; relay **and** packed guards both fire |
 | 6 | `GROUP BY o_orderstatus` control | correct counts, 2 s |
+
+## Post-fix status (2026-08-07, commits c858e79a / 4beca977 / 4323197d)
+
+Sweep after the b1+a1+c2+c1 fixes (3 warm runs, 30 s ceiling, restart-on-failure):
+**15 pass / 6 loud refusals / 1 wedge — zero cascade** (every query after a failure passed).
+
+Pass (warm median ms): q01 338, q04 400, q05 1175, q06 327, q07 974, q08 1236, q11 851,
+q12 408, q13 499, q15 741, q17 1033, q19 831, q20 892, q21 1507, q22 645.
+
+Remaining failures:
+- q02 wedge: the staging-lease deadlock (d4) stands; the propagation fix does deliver its
+  error to the FE, but only after ~124 s (2× PRPC reply timeout) — invisible at a 30 s
+  client gate — and the CN afterwards holds 9.4 GiB GPU and ignores SIGTERM (needs b2,
+  engine-side abort).
+- q03 refused 1.6 s: the sort fix cleared the q05 shape; q03's two-key sort still
+  misdeclares the hop (now DATE vs BIGINT, was DATE vs DOUBLE).
+- q09 refused: exchange staging arena exhausted (648 MB requested vs 512 MB capacity).
+- q10 refused: hash partition key DECIMAL(15,2) unsupported.
+- q14 refused: unsupported TExprNodeType(29).
+- q16 refused: descriptor slot 2 (tuple 8) not in row_tuples [9].
+- q18 refused: stream declared INTEGER, source produces VARCHAR.
+
+New correctness finding (pre-existing, highest-priority follow-up): every
+sum(l_extendedprice*(1-l_discount)) lands ~0.1 % low while counts/base sums/avgs on the
+same rows are exact; a DuckDB simulation of "rows with l_discount=0.10 compute (1-d) 0.01
+low" reproduces q01 A|F to 3.6 ppm. Decimal literal/scale suspect in the multi-fragment
+expression path.

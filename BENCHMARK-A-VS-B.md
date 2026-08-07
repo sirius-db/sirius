@@ -42,6 +42,11 @@
   investigation (see QUERY-TIMEOUT-ANALYSIS.md when it lands); q09–q22 invalidated by the
   hang cascade (no cancel_plan_fragment → stranded fragments → "No available backends").
   Full A-vs-B table + plot deferred until the hang classes are fixed.
+- 2026-08-07 (later): timeout fixes landed (c858e79a failure propagation + cancel stubs,
+  4beca977 date-fn casts, 4323197d sort-tuple order; QUERY-TIMEOUT-ANALYSIS.md has the
+  full post-fix table). A sweep now: 15 pass / 6 loud refusals / 1 wedge, zero cascade
+  (was 3 pass / wipe-out). CSV: /tmp/sirius-tpch-bench/bench/A2/timings.csv. Caveat before
+  publishing a table: revenue-shaped sums carry a ~0.1 % deficit (see analysis doc).
 
 ## Results
 
