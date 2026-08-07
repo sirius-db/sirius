@@ -26,6 +26,7 @@
 #include <cudf/dictionary/encode.hpp>
 #include <cudf/merge.hpp>
 #include <cudf/reduction/approx_distinct_count.hpp>
+#include <cudf/sorting.hpp>
 #include <cudf/strings/strings_column_view.hpp>
 
 namespace sirius {
@@ -90,7 +91,9 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::merge_ungrouped_aggregate
   std::vector<std::unique_ptr<cudf::column>> output_cudf_cols;
   for (size_t c = 0; c < aggregates.size(); ++c) {
     std::unique_ptr<cudf::reduce_aggregation> reduce_aggregation = nullptr;
-    cudf::data_type output_type = concatenated->get_column(c).type();
+    cudf::column_view reduce_input = concatenated->get_column(c).view();
+    std::unique_ptr<cudf::table> sorted_owner;
+    cudf::data_type output_type = reduce_input.type();
     switch (aggregates[c]) {
       case cudf::aggregation::Kind::MIN: {
         reduce_aggregation = cudf::make_min_aggregation<cudf::reduce_aggregation>();
@@ -118,7 +121,17 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::merge_ungrouped_aggregate
         }
         // The HUGEINT->BIGINT downcast guard: refuse a 64-bit integer sum that could wrap.
         throw_if_int64_sum_could_overflow(
-          concatenated->get_column(c), stream, memory_space.get_default_allocator());
+          reduce_input, stream, memory_space.get_default_allocator());
+        if (is_order_sensitive_sum(aggregates[c], reduce_input.type())) {
+          // FP addition is not associative and the concatenation order is exchange arrival
+          // order: sort the partials so the scalar sum is bit-stable across runs.
+          sorted_owner = cudf::sort(cudf::table_view({reduce_input}),
+                                    {cudf::order::ASCENDING},
+                                    {cudf::null_order::AFTER},
+                                    stream,
+                                    memory_space.get_default_allocator());
+          reduce_input = sorted_owner->get_column(0).view();
+        }
         reduce_aggregation = cudf::make_sum_aggregation<cudf::reduce_aggregation>();
         break;
       }
@@ -143,11 +156,8 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::merge_ungrouped_aggregate
           "Unsupported cudf aggregate kind in `merge_ungrouped_aggregate()`: " +
           std::to_string(static_cast<int>(aggregates[c])));
     }
-    auto output_scalar = cudf::reduce(concatenated->get_column(c),
-                                      *reduce_aggregation,
-                                      output_type,
-                                      stream,
-                                      memory_space.get_default_allocator());
+    auto output_scalar = cudf::reduce(
+      reduce_input, *reduce_aggregation, output_type, stream, memory_space.get_default_allocator());
     output_cudf_cols.push_back(cudf::make_column_from_scalar(
       *output_scalar, 1, stream, memory_space.get_default_allocator()));
   }
@@ -187,6 +197,29 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::merge_grouped_aggregate(
 
   auto mr = memory_space.get_default_allocator();
 
+  // Bit-stable float sums during merge: partial batches arrive in nondeterministic exchange
+  // order, and cuDF's hash groupby combines them via atomicAdd. Gather the concatenated
+  // partials into a canonical (group keys, float partial values) order and reduce through the
+  // sort-based groupby, so the merged sum depends only on the multiset of partial values —
+  // not on sender arrival order or atomic scheduling. See local_grouped_aggregate for the
+  // full rationale (TPC-H q15 compares these sums for exact equality).
+  std::vector<cudf::size_type> canonical_sort_cols;
+  canonical_sort_cols.reserve(num_group_cols + aggregates.size());
+  for (int c = 0; c < num_group_cols; ++c) {
+    canonical_sort_cols.push_back(c);
+  }
+  bool use_canonical_sorted_groupby = false;
+  for (size_t i = 0; i < aggregates.size(); ++i) {
+    auto col_idx = num_group_cols + static_cast<cudf::size_type>(i);
+    if (is_order_sensitive_sum(aggregates[i], concatenated->get_column(col_idx).type())) {
+      canonical_sort_cols.push_back(col_idx);
+      use_canonical_sorted_groupby = true;
+    }
+  }
+  if (use_canonical_sorted_groupby) {
+    concatenated = canonicalize_row_order(concatenated->view(), canonical_sort_cols, stream, mr);
+  }
+
   // Dictionary-encode STRING group keys when:
   //  1. Average string length >= 4 bytes (short strings hash nearly as fast as
   //     int32, so the encode/decode overhead is not worthwhile), AND
@@ -201,7 +234,10 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::merge_grouped_aggregate(
   group_cols.reserve(num_group_cols);
   for (int c = 0; c < num_group_cols; ++c) {
     auto col = concatenated->get_column(c).view();
-    if (col.type().id() == cudf::type_id::STRING && col.size() > 0) {
+    // Dict-encoding is a hash-groupby optimization; the canonical path must hand the
+    // presorted raw keys to the sort-based groupby unchanged.
+    if (!use_canonical_sorted_groupby && col.type().id() == cudf::type_id::STRING &&
+        col.size() > 0) {
       cudf::strings_column_view scv(col);
       auto avg_len = static_cast<double>(scv.chars_size(stream)) / col.size();
       if (avg_len >= dict_encode_min_avg_len) {
@@ -245,7 +281,16 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::merge_grouped_aggregate(
       group_cols.push_back(col);
     }
   }
-  cudf::groupby::groupby grpby_obj(cudf::table_view(group_cols), cudf::null_policy::INCLUDE);
+  // Presorted keys force cuDF's deterministic sort-based aggregation (hash groupby would
+  // reintroduce atomicAdd). The declared order must match canonicalize_row_order's.
+  cudf::groupby::groupby grpby_obj(
+    cudf::table_view(group_cols),
+    cudf::null_policy::INCLUDE,
+    use_canonical_sorted_groupby ? cudf::sorted::YES : cudf::sorted::NO,
+    std::vector<cudf::order>(use_canonical_sorted_groupby ? group_cols.size() : 0,
+                             cudf::order::ASCENDING),
+    std::vector<cudf::null_order>(use_canonical_sorted_groupby ? group_cols.size() : 0,
+                                  cudf::null_order::AFTER));
   std::vector<cudf::groupby::aggregation_request> requests;
   for (size_t i = 0; i < aggregates.size(); ++i) {
     int aggregate_col_id = num_group_cols + static_cast<int>(i);

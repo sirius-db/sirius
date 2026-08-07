@@ -21,8 +21,10 @@
 #include "expression/aggregate_id.hpp"
 #include "expression/ast/node.hpp"
 
+#include <cudf/copying.hpp>
 #include <cudf/reduction.hpp>
 #include <cudf/scalar/scalar.hpp>
+#include <cudf/sorting.hpp>
 
 #include <sirius/exception.hpp>
 
@@ -218,6 +220,33 @@ void throw_if_int64_sum_could_overflow(const cudf::column_view& input,
         hi);
     }
   }
+}
+
+bool is_order_sensitive_sum(cudf::aggregation::Kind kind, cudf::data_type values_type)
+{
+  return kind == cudf::aggregation::Kind::SUM &&
+         (values_type.id() == cudf::type_id::FLOAT32 || values_type.id() == cudf::type_id::FLOAT64);
+}
+
+std::unique_ptr<cudf::table> canonicalize_row_order(
+  const cudf::table_view& input,
+  const std::vector<cudf::size_type>& sort_col_indices,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr)
+{
+  std::vector<cudf::column_view> sort_cols;
+  sort_cols.reserve(sort_col_indices.size());
+  for (auto col_idx : sort_col_indices) {
+    sort_cols.push_back(input.column(col_idx));
+  }
+  auto sort_order =
+    cudf::sorted_order(cudf::table_view(sort_cols),
+                       std::vector<cudf::order>(sort_cols.size(), cudf::order::ASCENDING),
+                       std::vector<cudf::null_order>(sort_cols.size(), cudf::null_order::AFTER),
+                       stream,
+                       mr);
+  return cudf::gather(
+    input, sort_order->view(), cudf::out_of_bounds_policy::DONT_CHECK, stream, mr);
 }
 
 }  // namespace op
