@@ -7,11 +7,12 @@ use crate::fragment_executor::{FragmentExecutor, FragmentRun, SenderSlot, Staged
 use crate::local_exchange::{ExchangeKey, LocalExchange, ReadyFragment, SenderSource};
 use crate::nixl_transport::{NixlTransport, RemoteSendSpec};
 use crate::proto::starrocks::{
-    PExchangeNixlMd, PExchangeNixlMdResult, PExecBatchPlanFragmentsRequest,
-    PExecBatchPlanFragmentsResult, PExecPlanFragmentRequest, PExecPlanFragmentResult,
-    PFetchDataRequest, PFetchDataResult, PGetFileSchemaRequest, PGetFileSchemaResult,
-    PSlotDescriptor, PStagingLeaseRequest, PStagingLeaseResult, PTransmitPackedParams,
-    PTransmitPackedResult, StatusPb, p_internal_service_brpc::PInternalService,
+    PCancelPlanFragmentRequest, PCancelPlanFragmentResult, PExchangeNixlMd, PExchangeNixlMdResult,
+    PExecBatchPlanFragmentsRequest, PExecBatchPlanFragmentsResult, PExecPlanFragmentRequest,
+    PExecPlanFragmentResult, PFetchDataRequest, PFetchDataResult, PGetFileSchemaRequest,
+    PGetFileSchemaResult, PSlotDescriptor, PStagingLeaseRequest, PStagingLeaseResult,
+    PTransmitPackedParams, PTransmitPackedResult, StatusPb,
+    p_internal_service_brpc::PInternalService,
 };
 use crate::result_encoder::{self, ThriftBinary};
 use crate::result_store::{FetchOutcome, FragmentInstanceId, ResultStore};
@@ -265,6 +266,37 @@ impl PInternalService for SiriusComputeNodeService {
         .into())
     }
 
+    /// Best-effort cancellation stub: acknowledges the FE with OK so its shared jprotobuf
+    /// channel stays healthy — the default unrouted reply is a PRPC-level error frame, and the
+    /// FE reaps the timed-out future in a way that misattributes later replies on the channel.
+    /// A still-waiting result entry is failed so a `fetch_data` long-poll returns immediately.
+    /// Real teardown (aborting the engine run, freeing GPU buffers, dropping parked exchange
+    /// state) is a separate work item.
+    #[instrument(skip_all)]
+    async fn cancel_plan_fragment(
+        &self,
+        request: PCancelPlanFragmentRequest,
+        _attachment: Vec<u8>,
+    ) -> Result<crate::prpc::Reply<PCancelPlanFragmentResult>, crate::prpc::Error> {
+        let id = FragmentInstanceId::from(&request.finst_id);
+        info!(
+            fragment_instance_id = %id,
+            query_id = ?request.query_id.as_ref().map(FragmentInstanceId::from),
+            cancel_reason = request.cancel_reason,
+            error_message = ?request.error_message,
+            "acknowledging cancel_plan_fragment (best-effort: no engine-side abort yet)"
+        );
+        let mut reason = format!("fragment instance {id} was cancelled by the FE");
+        if let Some(message) = request.error_message.as_ref().filter(|msg| !msg.is_empty()) {
+            reason = format!("{reason}: {message}");
+        }
+        self.core.results.cancel(id, reason);
+        Ok(PCancelPlanFragmentResult {
+            status: Self::ok_status(),
+        }
+        .into())
+    }
+
     /// Returns buffered fragment results to the FE, which polls this until end-of-stream. The
     /// serialized `TResultBatch` rows ride in the BRPC response attachment.
     #[instrument(skip_all)]
@@ -475,9 +507,9 @@ impl SiriusComputeNodeService {
         if params.canary() {
             // The bandwidth canary writes into a lease nothing will consume; release it without
             // touching the rendezvous or the engine's input streams.
-            let offset = params
-                .offset
-                .ok_or_else(|| "canary transmit_packed frame carries no lease offset".to_string())?;
+            let offset = params.offset.ok_or_else(|| {
+                "canary transmit_packed frame carries no lease offset".to_string()
+            })?;
             return self.core.executor.staging_release(offset);
         }
         let finst_id = params
@@ -505,9 +537,9 @@ impl SiriusComputeNodeService {
             let length = params.length.ok_or_else(|| {
                 "transmit_packed batch frame carries no payload length".to_string()
             })?;
-            let offset = params.offset.ok_or_else(|| {
-                "transmit_packed batch frame carries no lease offset".to_string()
-            })?;
+            let offset = params
+                .offset
+                .ok_or_else(|| "transmit_packed batch frame carries no lease offset".to_string())?;
             Some(StagedBatch {
                 metadata: attachment,
                 offset,
@@ -541,31 +573,40 @@ impl ServiceCore {
     /// the next receiver when this fragment's own sink completed another sender set.
     fn run_ready_fragment(&self, ready: ReadyFragment) -> Vec<ReadyFragment> {
         let id = Self::fragment_instance_id(&ready.params);
+        let query_id = Self::query_id(&ready.params);
         let is_result_fragment = matches!(Self::is_mysql_result_sink(&ready.params), Ok(true));
         match self.execute_ready_fragment(ready) {
             Ok(next) => next,
             Err(error) => {
-                match id {
-                    Some(id) if is_result_fragment => {
-                        // The FE polls fetch_data on this id; its reserved entry becomes the
-                        // error instead of waiting forever.
-                        tracing::error!(fragment_instance_id = %id, error = %error, "dispatched result fragment failed");
+                match (id, query_id) {
+                    (Some(id), Some(query_id)) => {
+                        if is_result_fragment {
+                            // The FE polls fetch_data on this id; its reserved entry becomes
+                            // the error instead of waiting forever.
+                            tracing::error!(fragment_instance_id = %id, error = %error, "dispatched result fragment failed");
+                        } else {
+                            // An intermediate receiver has no FE-polled entry of its own, so
+                            // its failure must reach the query's result-fragment instances —
+                            // otherwise the FE polls until its timeout and the stalled
+                            // fetch_data wedges this CN's whole frame loop.
+                            tracing::error!(
+                                fragment_instance_id = %id,
+                                error = %error,
+                                "dispatched intermediate receiver fragment failed; failing the query's result fragments"
+                            );
+                        }
+                        // Fails this id, every reserved result instance of the query, and
+                        // records the failure so a result fragment arriving later fails on
+                        // registration instead of waiting on senders that never deliver.
+                        self.results.fail_query(query_id, id, error);
+                    }
+                    (Some(id), None) => {
+                        // Defensive: exec params carry both ids or neither, so this arm should
+                        // be unreachable. Park the error under the instance id at least.
+                        tracing::error!(fragment_instance_id = %id, error = %error, "dispatched receiver fragment without a query_id failed");
                         self.results.fail(id, error);
                     }
-                    Some(id) => {
-                        // An intermediate receiver has no reserved result entry, and the result
-                        // fragment downstream of it keeps reporting not-ready until the FE times
-                        // out — full cancellation propagation is out of scope for this branch
-                        // (PLAN-PATH-B cuts M4). Park the error under this id anyway so any poll
-                        // against it fails loudly instead of reading as unknown.
-                        tracing::error!(
-                            fragment_instance_id = %id,
-                            error = %error,
-                            "dispatched intermediate receiver fragment failed; its downstream result fragment will wait until the FE times out"
-                        );
-                        self.results.fail(id, error);
-                    }
-                    None => {
+                    (None, _) => {
                         tracing::error!(error = %error, "dispatched receiver fragment without a fragment_instance_id failed");
                     }
                 }
@@ -598,7 +639,9 @@ impl ServiceCore {
             let fragment_instance_id = Self::fragment_instance_id(&params)
                 .ok_or_else(|| "exchange receiver is missing a fragment_instance_id".to_string())?;
             if Self::is_mysql_result_sink(&params)? {
-                self.results.reserve(fragment_instance_id);
+                let query_id = Self::query_id(&params)
+                    .ok_or_else(|| "exchange receiver is missing a query_id".to_string())?;
+                self.results.reserve(fragment_instance_id, query_id);
             }
             return Ok(self
                 .exchanges
@@ -767,7 +810,10 @@ impl ServiceCore {
             }
         }
         let hash_keys = if destinations.len() > 1 {
-            translated.output_partition_columns.clone().unwrap_or_default()
+            translated
+                .output_partition_columns
+                .clone()
+                .unwrap_or_default()
         } else {
             Vec::new()
         };
@@ -1109,6 +1155,15 @@ impl ServiceCore {
             .as_ref()
             .map(|exec| FragmentInstanceId::from(&exec.fragment_instance_id))
     }
+
+    /// Extracts the query id shared by every fragment instance of one query, the scope a
+    /// failure propagates across (`ResultStore::fail_query`).
+    fn query_id(params: &TExecPlanFragmentParams) -> Option<FragmentInstanceId> {
+        params
+            .params
+            .as_ref()
+            .map(|exec| FragmentInstanceId::from(&exec.query_id))
+    }
 }
 
 impl SiriusComputeNodeService {
@@ -1340,6 +1395,20 @@ mod tests {
         fn run(&self, run: FragmentRun<'_>) -> Result<Option<FragmentResult>, String> {
             if is_receiver_run(&run) {
                 return Err("receiver exploded on the GPU".to_string());
+            }
+            StubExecutor.run(run)
+        }
+    }
+
+    /// Fails only an intermediate fragment's run — the one that both consumes exchange input and
+    /// parks sender output — so tests can watch a non-result failure reach the FE-polled result id.
+    #[derive(Debug)]
+    struct FailingIntermediateExecutor;
+
+    impl FragmentExecutor for FailingIntermediateExecutor {
+        fn run(&self, run: FragmentRun<'_>) -> Result<Option<FragmentResult>, String> {
+            if !run.inputs.is_empty() && !run.outputs.is_empty() {
+                return Err("intermediate receiver exploded on the GPU".to_string());
             }
             StubExecutor.run(run)
         }
@@ -1819,7 +1888,10 @@ mod tests {
     fn data_stream_sink_to_remote_destination_hands_the_parked_output_to_the_transport() {
         let (requests_tx, requests_rx) = mpsc::channel();
         let fake_transport = std::thread::spawn(move || {
-            match requests_rx.recv().expect("the sender flow sends one request") {
+            match requests_rx
+                .recv()
+                .expect("the sender flow sends one request")
+            {
                 crate::nixl_transport::TransportRequest::SendFragment { spec, respond } => {
                     respond.send(Ok(())).unwrap();
                     spec
@@ -2263,6 +2335,195 @@ mod tests {
             result.status.error_msgs
         );
         assert_eq!(result.eos, Some(true));
+    }
+
+    /// Builds the three-fragment chain used by the failure-propagation tests: a result-sink root
+    /// reading exchange 9, a middle receiver reading exchange 7 and sinking into 9, and a leaf
+    /// scan sinking into 7. All three share `query_id`.
+    fn propagation_chain(
+        query_id: &TUniqueId,
+        root_id: &TUniqueId,
+        middle_id: &TUniqueId,
+        leaf_id: &TUniqueId,
+    ) -> (
+        TExecPlanFragmentParams,
+        TExecPlanFragmentParams,
+        TExecPlanFragmentParams,
+    ) {
+        let mut root = fragment_params(Some(exchange_plan(9, 0)), Some(desc_table()));
+        root.fragment.as_mut().unwrap().output_sink = Some(result_sink());
+        let mut root_exec = exec_params(query_id.clone(), root_id.clone());
+        root_exec.per_exch_num_senders.insert(9, 1);
+        root.params = Some(root_exec);
+
+        let mut middle = fragment_params(Some(exchange_plan(7, 0)), Some(desc_table()));
+        middle.fragment.as_mut().unwrap().output_sink = Some(data_stream_sink(9));
+        let mut middle_exec = exec_params(query_id.clone(), middle_id.clone());
+        middle_exec.per_exch_num_senders.insert(7, 1);
+        middle_exec.sender_id = Some(0);
+        middle_exec.destinations = Some(vec![local_destination(root_id.clone())]);
+        middle.params = Some(middle_exec);
+
+        let mut leaf = fragment_params(Some(scan_plan(0, 0)), Some(desc_table()));
+        leaf.fragment.as_mut().unwrap().output_sink = Some(data_stream_sink(7));
+        let mut leaf_exec = exec_params(query_id.clone(), leaf_id.clone());
+        leaf_exec.sender_id = Some(0);
+        leaf_exec.destinations = Some(vec![local_destination(middle_id.clone())]);
+        leaf.params = Some(leaf_exec);
+
+        (root, middle, leaf)
+    }
+
+    #[test]
+    fn intermediate_fragment_failure_fails_the_fe_polled_result_id() {
+        // The middle fragment fails on the dispatch worker. Its own instance id is not polled by
+        // anyone; the failure must land on the query's result-fragment id — the one the FE's
+        // fetch_data long-poll is blocked on — carrying the original error.
+        let service = SiriusComputeNodeService::with_executor(
+            Arc::new(FailingIntermediateExecutor),
+            test_identity(),
+        );
+        let query_id = TUniqueId::new(70, 1);
+        let root_id = TUniqueId::new(70, 2);
+        let middle_id = TUniqueId::new(70, 3);
+        let (root, middle, leaf) =
+            propagation_chain(&query_id, &root_id, &middle_id, &TUniqueId::new(70, 4));
+
+        assert_exec_ok(&service, &root);
+        assert_exec_ok(&service, &middle);
+        assert_exec_ok(&service, &leaf);
+
+        let result = fetch_error_eventually(&service, root_id.hi, root_id.lo);
+        assert_eq!(result.status.status_code, TStatusCode::INTERNAL_ERROR.0);
+        let message = &result.status.error_msgs[0];
+        assert!(
+            message.contains(&FragmentInstanceId::from(&middle_id).to_string())
+                && message.contains("intermediate receiver exploded on the GPU"),
+            "{message}"
+        );
+        assert_eq!(result.eos, Some(true));
+    }
+
+    #[test]
+    fn intermediate_failure_before_result_registration_still_fails_the_result_poll() {
+        // The ordering race: the middle fragment fails before the FE's result fragment ever
+        // registers on this CN. The failure must be recorded at query level so the result
+        // fragment fails on arrival instead of waiting on a sender that will never deliver.
+        let service = SiriusComputeNodeService::with_executor(
+            Arc::new(FailingIntermediateExecutor),
+            test_identity(),
+        );
+        let query_id = TUniqueId::new(71, 1);
+        let root_id = TUniqueId::new(71, 2);
+        let middle_id = TUniqueId::new(71, 3);
+        let (root, middle, leaf) =
+            propagation_chain(&query_id, &root_id, &middle_id, &TUniqueId::new(71, 4));
+
+        // Middle and leaf only: the middle fails on the dispatch worker while the result
+        // fragment is still undelivered. Its parked error doubles as the "failure landed" gate.
+        assert_exec_ok(&service, &middle);
+        assert_exec_ok(&service, &leaf);
+        let parked = fetch_error_eventually(&service, middle_id.hi, middle_id.lo);
+        assert!(
+            parked.status.error_msgs[0].contains("intermediate receiver exploded on the GPU"),
+            "{:?}",
+            parked.status.error_msgs
+        );
+
+        // The result fragment arrives after the failure; its very first poll must report it.
+        assert_exec_ok(&service, &root);
+        let result = fetch_error_eventually(&service, root_id.hi, root_id.lo);
+        assert_eq!(result.status.status_code, TStatusCode::INTERNAL_ERROR.0);
+        let message = &result.status.error_msgs[0];
+        assert!(
+            message.contains(&FragmentInstanceId::from(&middle_id).to_string())
+                && message.contains("intermediate receiver exploded on the GPU"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn cancel_plan_fragment_returns_ok_and_unblocks_a_waiting_result_poll() {
+        // The route must exist (an unrouted method returns a PRPC-level error frame that poisons
+        // the FE's shared channel) and, best-effort, fail the waiting entry so a fetch_data
+        // long-poll returns instead of running out its timeout.
+        let service = SiriusComputeNodeService::new();
+        let query_id = TUniqueId::new(80, 1);
+        let receiver_id = TUniqueId::new(80, 2);
+
+        let mut receiver = fragment_params(Some(exchange_plan(7, 0)), Some(desc_table()));
+        receiver.fragment.as_mut().unwrap().output_sink = Some(result_sink());
+        let mut receiver_exec = exec_params(query_id, receiver_id.clone());
+        receiver_exec.per_exch_num_senders.insert(7, 1);
+        receiver.params = Some(receiver_exec);
+        assert_exec_ok(&service, &receiver);
+
+        let response = route(
+            &service,
+            methods::CANCEL_PLAN_FRAGMENT,
+            PCancelPlanFragmentRequest {
+                finst_id: PUniqueId {
+                    hi: receiver_id.hi,
+                    lo: receiver_id.lo,
+                },
+                cancel_reason: None,
+                is_pipeline: None,
+                query_id: None,
+                error_message: Some("exceed big query cpu limit".to_string()),
+            }
+            .encode_to_vec(),
+            Vec::new(),
+        );
+        let cancel = PCancelPlanFragmentResult::decode(response.body.as_slice()).unwrap();
+        assert_eq!(
+            cancel.status.status_code,
+            TStatusCode::OK.0,
+            "{:?}",
+            cancel.status.error_msgs
+        );
+
+        let result = fetch_error_eventually(&service, receiver_id.hi, receiver_id.lo);
+        assert!(
+            result.status.error_msgs[0].contains("cancelled by the FE")
+                && result.status.error_msgs[0].contains("exceed big query cpu limit"),
+            "{:?}",
+            result.status.error_msgs
+        );
+    }
+
+    #[test]
+    fn cancel_plan_fragment_for_an_unknown_instance_is_ok_and_fabricates_nothing() {
+        let service = SiriusComputeNodeService::new();
+        let response = route(
+            &service,
+            methods::CANCEL_PLAN_FRAGMENT,
+            PCancelPlanFragmentRequest {
+                finst_id: PUniqueId { hi: 81, lo: 1 },
+                cancel_reason: None,
+                is_pipeline: None,
+                query_id: None,
+                error_message: None,
+            }
+            .encode_to_vec(),
+            Vec::new(),
+        );
+        let cancel = PCancelPlanFragmentResult::decode(response.body.as_slice()).unwrap();
+        assert_eq!(cancel.status.status_code, TStatusCode::OK.0);
+
+        // The id stays unknown: a later poll reports "no buffered result", not a cancel error.
+        let fetched = route(
+            &service,
+            methods::FETCH_DATA,
+            fetch_request(81, 1),
+            Vec::new(),
+        );
+        let fetched = PFetchDataResult::decode(fetched.body.as_slice()).unwrap();
+        assert_eq!(fetched.status.status_code, TStatusCode::INTERNAL_ERROR.0);
+        assert!(
+            fetched.status.error_msgs[0].contains("no buffered result"),
+            "{:?}",
+            fetched.status.error_msgs
+        );
     }
 
     #[test]
