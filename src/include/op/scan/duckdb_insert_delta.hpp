@@ -77,8 +77,11 @@ struct insert_delta_segment {
 struct insert_delta_column {
   duckdb::idx_t column_id{0};
   bool is_varchar{false};
+  bool is_array{false};
   std::vector<insert_delta_segment> data_segments;
   std::vector<insert_delta_segment> validity_segments;
+  std::vector<insert_delta_segment> array_child_data_segments;
+  std::vector<insert_delta_segment> array_child_validity_segments;
 };
 
 /// One row group's slice of the insert delta.
