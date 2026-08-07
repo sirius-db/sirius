@@ -25,7 +25,7 @@ in both cases.
 pixi run cluster2   # keep it in its own terminal / background task
 
 TPCH_DATA=/path/to/tpch_sf1 \
-RESTART_CMD='pkill -f "[s]tarrocks-compute-node"; pkill -f "[S]tarRocksFE"; sleep 5; \
+RESTART_CMD='pkill -f "[s]irius-starrocks-cn"; pkill -f "[S]tarRocksFE"; sleep 5; \
   (cd <repo>/experimental/starrocks && nohup pixi run cluster2 >/tmp/cluster2.log 2>&1 &)' \
   ./bench.sh /tmp/bench/A/timings.csv 3
 ```

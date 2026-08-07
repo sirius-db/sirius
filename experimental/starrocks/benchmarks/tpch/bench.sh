@@ -12,6 +12,9 @@
 #   FE_PORT            FE MySQL port (default 9030)
 #   QUERY_TIMEOUT      per-run client timeout in seconds (default 30; SF1 passes
 #                      finish in well under 2s, so anything near this is a hang)
+#   MIN_BACKENDS       alive backends wait_alive requires before proceeding (default 2 --
+#                      a 2-CN cluster answering with 1 alive node is still booting, and a
+#                      sweep started then records phantom wedges)
 #   RESTART_CMD        command that fully restarts the cluster. The CN has no
 #                      cancel_plan_fragment yet, so a hung or failed query strands
 #                      its fragments and eventually starves the CNs ("No available
@@ -33,6 +36,7 @@ TPCH_DATA=${TPCH_DATA:?set TPCH_DATA to the directory holding <table>/*.parquet}
 FE_PORT=${FE_PORT:-9030}
 QUERY_TIMEOUT=${QUERY_TIMEOUT:-30}
 RESTART_CMD=${RESTART_CMD:-}
+MIN_BACKENDS=${MIN_BACKENDS:-2}
 MYSQL="mysql --host 127.0.0.1 --port $FE_PORT --user root --batch --connect-timeout=5"
 OUT=$(dirname "$OUT_CSV")
 mkdir -p "$OUT"
@@ -41,7 +45,7 @@ wait_alive() {
   for _ in $(seq 1 150); do
     n=$($MYSQL -N -e "SHOW COMPUTE NODES;" 2>/dev/null | grep -c true)
     b=$($MYSQL -N -e "SHOW BACKENDS;" 2>/dev/null | grep -c true)
-    [ $((${n:-0} + ${b:-0})) -ge 1 ] && return 0
+    [ $((${n:-0} + ${b:-0})) -ge "$MIN_BACKENDS" ] && return 0
     sleep 2
   done
   return 1
