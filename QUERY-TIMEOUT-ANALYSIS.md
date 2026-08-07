@@ -493,3 +493,22 @@ Open loud-failure items found during the q15 diagnosis (not yet fixed): a fragme
 unhandled sink type (e.g. MULTI_CAST_DATA_STREAM_SINK) returns Ok(empty) and hangs its
 consumers silently (compute_node_service.rs let-else must be an error); a parked-sender
 export defect surfaced by CAST(sum AS VARCHAR) probes ("no parked sender output to export").
+
+## The arena leak (2026-08-07, commit 7039665c)
+
+The last operational defect: consecutive queries on one cluster capped at ~20 before a loud
+"exchange staging arena exhausted" (q21/q05 as the late-sweep victims). Root cause: a
+zero-row exported batch (q15's UNPARTITIONED gather instance on the no-match CN) held an
+8 MiB lease the len==0 wire contract says cannot exist, and the arena's reset-when-empty
+reclamation amplified that one orphan into monotonic burn (~60 MB/query, live-measured:
+1 lease outstanding, 1.23 GiB unusable). Fixed three ways (contract, trailing reclamation,
+error-path release). Endurance evidence: three consecutive full sweeps, zero restarts,
+same CN PIDs, 22/22 each, the 648 MB canary lease granted after every sweep; independent
+q01..q21 no-restart reproduction 63/63.
+
+RESTART_CMD in the harness is now genuinely optional for engine A; kept as a safety net.
+
+Residual failure-mode note (folded into the open loud-failure task): when a sender-side
+export fails mid-query, the client can see a silent timeout rather than the loud error,
+and the wedged statement blocks the next one until restart — same missing engine-abort
+surface as the cancel work item.
