@@ -352,7 +352,7 @@ batch default**. Each can still be overridden individually.
 | `scan_task_batch_size` | 2.5% of GPU mem (512 MiB – 5 GiB) | Target batch size for DuckDB scan tasks |
 | `enable_compressed_materialization` | true | Store eligible integer and fixed-point DECIMAL values in value-preserving narrower carriers when exact pin-time bounds permit it; restore native carriers at type-sensitive boundaries. |
 | `max_sort_partition_bytes` | 0 (auto) | Max bytes per sort partition. Auto = 33% of GPU memory. |
-| `hash_partition_bytes` | 2.5% of GPU mem (512 MiB – 5 GiB) | Target partition size for hash joins and group-bys |
+| `hash_partition_bytes` | 2.5% of GPU mem (512 MiB – 5 GiB) | Target partition size for hash joins and group-bys; must be greater than zero |
 | `concat_batch_bytes` | 2.5% of GPU mem (512 MiB – 5 GiB) | Target output batch size for CONCAT operator |
 | `sort_sample_bytes` | 2.5% of GPU mem (512 MiB – 5 GiB) | Bytes sampled before computing sort partition boundaries |
 | `max_build_hash_table_bytes` | 2× batch default | Max build-side size for BUILD_PROBE join mode |
@@ -531,7 +531,7 @@ SET enable_compressed_materialization = false;
 | `fuse_merge_pipelines` | true | Fuse eligible GROUP BY / TOP_N merges into their downstream pipeline instead of cutting a boundary (see [physical-plan-generation.md](physical-plan-generation.md) → Merge fusion) |
 | `max_sort_partition_bytes` | 0 (auto) | Max sort partition bytes |
 | `max_sort_partition_memory_fraction` | 0.33 | Auto sort-partition fraction when `max_sort_partition_bytes` is 0 |
-| `hash_partition_bytes` | 2.5% of GPU mem (512 MiB – 5 GiB) | Hash partition target size |
+| `hash_partition_bytes` | 2.5% of GPU mem (512 MiB – 5 GiB) | Hash partition target size; must be greater than zero |
 | `concat_batch_bytes` | 2.5% of GPU mem (512 MiB – 5 GiB) | CONCAT output batch size |
 | `sort_sample_bytes` | 2.5% of GPU mem (512 MiB – 5 GiB) | Bytes sampled before computing sort boundaries |
 | `max_build_hash_table_bytes` | 2× batch default | Max build-side hash table bytes |
