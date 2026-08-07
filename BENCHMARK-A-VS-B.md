@@ -67,6 +67,42 @@
 - 2026-08-07 (v2 final): **22/22 pass** (A6 sweep) after 59ce6662 (q02: empty-build-side
   join) + 312e4535 (q15: bit-stable float sums). CSV: /tmp/sirius-tpch-bench/bench/A6/.
 
-## Results
+## Results (SF1, 2026-08-07, engine A @ 312e4535)
 
-(pending — table + plot land here; partial A data preserved at /tmp/sirius-tpch-bench/bench/)
+| Query | A (Sirius GPU) median ms | B (StarRocks) median ms | A/B speedup |
+|---|---|---|---|
+| Q01 | 418 | 522 | 1.25x (A faster) |
+| Q02 | 1138 | 229 | 0.20x (B faster) |
+| Q03 | 500 | 295 | 0.59x (B faster) |
+| Q04 | 428 | 252 | 0.59x (B faster) |
+| Q05 | 1026 | 320 | 0.31x (B faster) |
+| Q06 | 308 | 220 | 0.71x (B faster) |
+| Q07 | 934 | 328 | 0.35x (B faster) |
+| Q08 | 1236 | 472 | 0.38x (B faster) |
+| Q09 | 1104 | 1181 | 1.07x (A faster) |
+| Q10 | 634 | 323 | 0.51x (B faster) |
+| Q11 | 830 | 147 | 0.18x (B faster) |
+| Q12 | 469 | 394 | 0.84x (B faster) |
+| Q13 | 450 | 349 | 0.78x (B faster) |
+| Q14 | 428 | 220 | 0.51x (B faster) |
+| Q15 | 681 | 250 | 0.37x (B faster) |
+| Q16 | 458 | 150 | 0.33x (B faster) |
+| Q17 | 469 | 274 | 0.58x (B faster) |
+| Q18 | 621 | 278 | 0.45x (B faster) |
+| Q19 | 398 | 478 | 1.20x (A faster) |
+| Q20 | 782 | 242 | 0.31x (B faster) |
+| Q21 | 987 | 441 | 0.45x (B faster) |
+| Q22 | 485 | 118 | 0.24x (B faster) |
+
+**Summary**: A passes 22/22, B passes 22/22, 22 comparable. Geometric-mean speedup on comparable queries: **0.48x** (B faster).
+
+Engine A wins where the query is scan/aggregate-heavy enough to amortize dispatch (Q1, Q9,
+Q19); engine B's mature CPU engine wins the short queries, where fixed per-query overheads
+(fragment dispatch, GPU first-touch, exchange staging) dominate at this tiny scale factor —
+the expected shape for SF1 (388 MB total). Q21's engine-A median comes from a solo retest
+after a transient in-sweep timeout (the staging-arena class); everything else is 3/3
+in-sweep. Correctness caveat: engine A's revenue-shaped sums carry the deferred decimal
+deficit (up to ~0.4% on a few rows).
+
+Plot + CSVs: `experimental/starrocks/benchmarks/tpch/results/sf1-2026-08-07*`.
+Reproduce: `experimental/starrocks/benchmarks/tpch/REPRODUCE.md` or `run-comparison.sh`.
