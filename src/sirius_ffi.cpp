@@ -837,6 +837,23 @@ std::size_t Fragment::output_batch_count(std::uint64_t stream_id) const
   return impl_->fragment->output_repository(stream_id)->total_size();
 }
 
+std::unique_ptr<std::vector<std::string>> Fragment::output_types() const
+{
+  if (!impl_->built) {
+    throw sirius::invalid_input_exception("Fragment: build() must run before output_types()");
+  }
+  if (impl_->fragment == nullptr) {
+    throw sirius::invalid_input_exception(
+      "Fragment: output_types() reads a streaming sink; a result fragment has none");
+  }
+  auto types = std::make_unique<std::vector<std::string>>();
+  types->reserve(impl_->fragment->sink_types().size());
+  for (const auto& type : impl_->fragment->sink_types()) {
+    types->push_back(type.to_string());
+  }
+  return types;
+}
+
 std::unique_ptr<Context> make_context() { return std::make_unique<Context>(); }
 
 std::unique_ptr<Context> make_context_from_config(const std::string& config_path)

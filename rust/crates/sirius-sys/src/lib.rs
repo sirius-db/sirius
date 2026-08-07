@@ -178,6 +178,13 @@ mod ffi {
         /// Batches currently parked on an output stream — the evidence that a
         /// fragment boundary carried native batches rather than nothing.
         fn output_batch_count(self: &Fragment, stream_id: u64) -> Result<usize>;
+
+        /// DuckDB type names of a built fragment's output (sink) columns — the
+        /// types every batch leaving the fragment actually carries, exactly
+        /// what `relay_from`'s schema guard compares against a receiver's
+        /// declared input columns. Fallible: unbuilt and result fragments both
+        /// surface as `Err`.
+        fn output_types(self: &Fragment) -> Result<UniquePtr<CxxVector<CxxString>>>;
     }
 }
 

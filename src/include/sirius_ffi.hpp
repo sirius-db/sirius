@@ -238,6 +238,15 @@ class SIRIUS_FFI_EXPORT Fragment {
   /// confirms a fragment boundary carried native batches rather than nothing.
   [[nodiscard]] std::size_t output_batch_count(std::uint64_t stream_id) const;
 
+  /// Type names of this built fragment's output (sink) columns — the types every batch leaving
+  /// through an output stream actually carries, exactly what `relay_from`'s schema guard
+  /// compares against a receiver's declared input columns. The spellings match the DuckDB type
+  /// names `declare_input_column` accepts (`BIGINT`, `DECIMAL(15,2)`, ...). Read-only; a
+  /// conformance surface for callers that predict the wire schema (e.g. a plan translator's
+  /// partial-state model).
+  /// @throws before `build()`, or on a result fragment (which has no streaming sink).
+  [[nodiscard]] std::unique_ptr<std::vector<std::string>> output_types() const;
+
  private:
   struct Impl;
   explicit Fragment(std::unique_ptr<Impl> impl);

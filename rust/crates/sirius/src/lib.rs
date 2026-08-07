@@ -277,6 +277,19 @@ impl Fragment<'_> {
         self.inner.output_batch_count(stream_id)
     }
 
+    /// DuckDB type names of this built fragment's output (sink) columns — the types every batch
+    /// leaving the fragment actually carries, exactly what the receiving hop's schema guard
+    /// compares against the receiver's declared input columns. Errs before
+    /// [`build`](Fragment::build) and on a result fragment (which has no streaming sink).
+    pub fn output_types(&self) -> Result<Vec<String>, Exception> {
+        Ok(self
+            .inner
+            .output_types()?
+            .iter()
+            .map(|ty| ty.to_string_lossy().into_owned())
+            .collect())
+    }
+
     /// Pack the next batch parked on output stream `stream_id` into a fresh staging-arena lease,
     /// as cudf packed bytes.
     ///
@@ -2179,7 +2192,11 @@ mod tests {
         let ctx = SiriusContext::new().expect("bring up sirius context");
         let mut sender = ctx.fragment().unwrap();
         sender.declare_output(0).unwrap();
+        // Before build() there is no bound sink to describe — loudly, not as an empty vec.
+        assert!(sender.output_types().is_err());
         sender.build(&sender_plan).unwrap();
+        // What the guard below compares against: the sink's actual column types, by name.
+        assert_eq!(sender.output_types().unwrap(), vec!["BIGINT", "VARCHAR"]);
         sender.run().unwrap();
 
         // The sender's sink produces (BIGINT, VARCHAR); the receiver declares id as DOUBLE.
