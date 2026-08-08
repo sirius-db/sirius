@@ -542,8 +542,10 @@ void sirius_config::load_from_file(const std::filesystem::path& config_path)
     if (auto mem_node = r.optional_node("memory")) {
       yaml::reader mr(*mem_node, "sirius.memory");
       if (auto n = mr.optional_node("gpu")) {
-        explicit_high_level_gpu_capacity = (*n)["usage_limit_bytes"].IsDefined() ||
-                                           (*n)["usage_limit_fraction"].IsDefined();
+        yaml::reader gpu_reader(*n, "sirius.memory.gpu");
+        explicit_high_level_gpu_capacity =
+          gpu_reader.has_value("usage_limit_bytes") ||
+          gpu_reader.has_value("usage_limit_fraction");
         gpu_mem_config::from_yaml(*n, gpu_cfg);
       }
       if (auto n = mr.optional_node("host")) host_mem_config::from_yaml(*n, host_cfg);

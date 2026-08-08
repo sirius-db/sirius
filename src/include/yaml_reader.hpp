@@ -403,6 +403,13 @@ class reader {
   /// Check whether a key exists in the map.
   [[nodiscard]] bool has(const std::string& key) const { return find(key).IsDefined(); }
 
+  /// Check whether a key exists in the map and has a non-null value.
+  [[nodiscard]] bool has_value(const std::string& key) const
+  {
+    auto child = find(key);
+    return child.IsDefined() && !child.IsNull();
+  }
+
   /// Throw if the map contains keys that were not consumed by optional/required calls.
   void reject_unknown() const
   {

@@ -540,6 +540,35 @@ TEST_CASE("yaml reader optional_node", "[config_opt][optional_node]")
   REQUIRE_FALSE(missing.has_value());
 }
 
+TEST_CASE("yaml reader has_value distinguishes null from scalar values",
+          "[config_opt][has_value]")
+{
+  struct test_case {
+    const char* yaml;
+    bool expected;
+  };
+
+  const test_case cases[] = {
+    {"{}", false},
+    {"usage_limit_bytes: null", false},
+    {"usage_limit_fraction: null", false},
+    {"usage_limit_bytes: null\nusage_limit_fraction: null", false},
+    {"usage_limit_bytes: 0", true},
+    {"usage_limit_fraction: 0.5", true},
+    {"usage_limit_bytes: 0\nusage_limit_fraction: null", true},
+    {"usage_limit_bytes: null\nusage_limit_fraction: 0.5", true},
+  };
+
+  for (auto const& test : cases) {
+    INFO("yaml=" << test.yaml);
+    auto node = YAML::Load(test.yaml);
+    yaml::reader r(node);
+    auto const has_explicit_gpu_limit =
+      r.has_value("usage_limit_bytes") || r.has_value("usage_limit_fraction");
+    REQUIRE(has_explicit_gpu_limit == test.expected);
+  }
+}
+
 // ================ error context ================= //
 
 TEST_CASE("yaml reader error messages include context", "[config_opt][errors]")
