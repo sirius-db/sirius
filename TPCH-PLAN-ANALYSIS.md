@@ -788,10 +788,11 @@ are in the `tpch-bench` skill.
 
 - **SF1 only.** The ~300ms dispatch floor is 25–75% of most queries here; at SF10+
   (M3) data-proportional costs (q09's arena lease, q03/q05/q08/q18/q21 shuffle
-  volumes, broadcast clones) grow linearly while the floor does not — category
-  priorities will reorder toward joins/aggregation and away from pure floor work.
-  Conversely, several "medium" items (top-k, limit-aware merge, dictionary encoding)
-  only become measurable at SF10.
+  volumes, broadcast clones) grow linearly while the floor does not — §8 quantifies
+  the reorder for SF100/SF1000 on the 4× GB200 target: arena and join-shape become
+  feasibility gates, floor work drops out of the top five. Conversely, several
+  "medium" items (top-k, limit-aware merge, dictionary encoding) only become
+  measurable at SF10+.
 - **2 CNs only.** Skew conclusions (q02, q07, q08 low-cardinality keys) and
   broadcast-clone costs (q04, q16, q22: ×(N−1)) are extrapolated to 8 CNs, not
   measured.
@@ -814,3 +815,228 @@ are in the `tpch-bench` skill.
   not measured operator output (see the runtime-profile gap above).
 - **Single-file parquet per table** limits FE byte-range split balance; multi-file
   layout at SF10 (per M3) changes scan distribution.
+
+## 8. Scale projection: SF100 / SF1000 on a 4× GB200 node
+
+Projection, not measurement: this section scales the §2–§5 numbers (SF1, 2 CNs sharing
+one 23 GiB L4) onto the target box and flags what breaks first. All timings are
+order-of-magnitude. Companion updates: OPEN-ISSUES M0–M3.
+
+### 8.1 Hardware profile
+
+One node (`presto-gb200-gcn-18`): 4× NVIDIA GB200 (Blackwell), 189,471 MiB ≈ 185 GiB
+HBM each, 740 GiB total; all-to-all NVLink5 NV18 between every GPU pair
+(~900 GB/s/direction per GPU — GPU↔GPU traffic never touches PCIe; UCX `cuda_ipc` peer
+copies land at ~750 GB/s effective); 2× Grace CPUs — **aarch64** — 144 cores in 2 NUMA
+domains (GPU0/1 affine to cores 0–71 / socket 0, GPU2/3 to cores 72–143 / socket 1;
+each GPU's HBM is additionally exposed as a host NUMA node: 2/10/18/26); Grace↔GPU C2C
+~900 GB/s; CUDA 13.0, driver 580.105.08; 8× mlx5 NICs idle for this work (single-node —
+the multi-node RDMA tier stays a separate project, OPEN-ISSUES M1). Host LPDDR assumed
+2× 480 GB = 960 GB — **verify with `free -g` at bring-up**; a 480 GB config breaks the
+SF1000 page-cache budget in 8.5. The aarch64 caveat is a hard gate: every prebuilt in
+the demo's transport stack is x86-64 ELF (verified with `file`:
+`tools/ucx-install/lib/*.so`, `tools/nvda_nixl/lib/x86_64-linux-gnu/*` in the tree
+beside the worktrees), and no CN starts until they are rebuilt — port list in 8.5 and
+OPEN-ISSUES M0.
+
+### 8.2 Capacity
+
+Dataset (TPC-H row formulas × parquet; SF100 measured from a DuckDB snappy export,
+SF1000 linear from it — compression settings swing per-table sizes ±30–45%, but totals
+land in the expected bands either way):
+
+| | lineitem rows | parquet total | lineitem parquet | per-CN share (4 CNs) |
+|---|---|---|---|---|
+| SF100 | 600.0M | **35.7 GB** (measured: li 22.8, o 6.5, ps 4.4, c 1.2, p 0.6, s 0.08) | 22.8 GB | 150M li rows / ~9 GB all tables |
+| SF1000 | 6.00B | **~355–390 GB** | ~228 GB | 1.5B li rows / ~90–97 GB all tables |
+
+Other tables scale by the dbgen formulas: orders 1.5M×SF, partsupp 800k×SF, part
+200k×SF, customer 150k×SF, supplier 10k×SF. Full-width decompressed lineitem ≈
+141 B/row → SF1000 whole-table ≈ 846 GB cluster-wide > 740 GiB total HBM: live-column
+projection is mandatory at SF1000 (the scan already does it).
+
+**Working-set verdicts per CN (185 GiB HBM)** — FITS / TIGHT / CHUNK (needs a 2^31 or
+lease guard) / SPILL / BREAKS:
+
+| query class | per-CN peak, SF100 → SF1000 | SF100 | SF1000 |
+|---|---|---|---|
+| streaming full-lineitem agg (q01, q06, q19) | one 512 MB scan batch + partials — the partial agg runs per batch, never concats the partition | FITS | FITS |
+| grouped-agg merge + raw-lineitem build (q17, q18, q20) | q17 merge concat 3.4 → 34 GB, canonical-sort peak ~2.5× → ~9 → **85 GB**; q18 build+hash 8 → **60–84 GB** | FITS | TIGHT — #24 (sort removal) + build flip convert to FITS |
+| lineitem shuffles + big builds (q03, q05, q07, q21) | staged inbound 1.9–6 GB → 19–51 GB; q05 build ~80 GB + 48 GB staged; q21 peak **100–150 GB** | FITS after arena resize (all four stage > the 1280 MiB slab) | TIGHT — needs eager arena reclaim (8.3, M2 phase 2); no spill backstop today |
+| broadcast builds ×3 clones (q04, q16, q22, q07) | builds do not divide by N: q04 380M → **3.8B keys**; q16 payload 1.28 → 12.8 GB (+3 clones sender-side) | FITS after arena resize (q16's single lease ≈ the whole slab) | q04 **CHUNK** — 3.8B rows > 2^31: dedup (→ ~1.27B) or partitioned BUILD_PROBE; rest TIGHT |
+| wide-string paths (q13 o_comment; q10 merge) | q13 1.8B → **18.2B chars/CN**; q10 merge concat of c_comment ≈ **2.1B chars** at SF1000 | q13 CHUNK — 85% of the char cap, scan guard holds | CHUNK — q13 8.5× the cap (must stay projected out post-filter, as planned); q10's merge needs a chars guard (unguarded today) |
+| cross-join plans (q08, q09) | O(SF²) pairs: q09 1.07e12 ≈ **13 TB** packed / q08 1.3e11 ≈ **2.1 TB** at SF100 | **BREAKS** | **BREAKS** (1.3 PB / 208 TB) — only a plan-shape fix helps (5.3.3) |
+
+SPILL verdict: no query strictly needs spill at SF1000 *if* arena reclaim lands — but
+staged/parked exchange state is structurally invisible to the downgrade sweep
+(streaming repos live outside the manager), so the fastest-growing components have no
+OOM backstop; roadmap #6 spillability (target: the ~240 GB/CN Grace host pools) is the
+skew insurance.
+
+**cuDF hard limits** (2^31 rows/column; 2^31 chars per string column):
+
+- Per-CN lineitem at SF1000 = 1.5B rows = **70% of the row cap**: legal, with only 43%
+  headroom for FE byte-range split skew. 2 CNs (3B rows) cannot run SF1000 at all — 4
+  CNs is the floor topology.
+- Broadcast builds don't divide by N: q04's 3.8B-key build crosses the cap in any
+  single-column materialization (STANDARD hash-join mode). Fixes: sender-side dedup or
+  partitioned BUILD_PROBE with ≥2 partitions and no full concat.
+- The scan side is already guarded (a bundle closes before a varchar column would cross
+  the int32 chars threshold — `insert_delta_job.hpp`), and the 512 MB
+  `scan_task_batch_size` keeps every scan batch ~2 orders of magnitude under both caps.
+  The **unguarded path is the merge**: `gpu_merge_impl` concatenates the full fan-in
+  with no rows/chars check (q10 is the concrete SF1000 breaker), and the table-scan
+  coalescer caps at the compile-time default rather than the configured batch size —
+  fix both together.
+
+### 8.3 Exchange economics: NVLink vs the two-copy staging path
+
+Model: all-to-all shuffle of total packed volume V over 4 CNs — each GPU sends V/4, of
+which 3/4 is remote, so wire bytes/GPU = 3V/16 ≈ **0.25 ms per GB of V** at ~750 GB/s
+effective NVLink; each byte also pays 3 D2D copies (pack → staging-arena → unpack) at
+~4 TB/s effective HBM ≈ **0.19 ms per GB of V**, of which the two staging-path extras
+are ~0.125 ms/GB. Both terms scale linearly with SF, so the ratio is SF-invariant: **the
+two extra copies are a constant ~50% tax on wire time and never dominate on this box**
+(contrast the L4 baseline, where same-GPU IPC ~80 GB/s vs D2D ~150 GB/s made the copies
+the bigger term — hidden under RPC latency).
+
+| shuffle | total packed V (SF100 / SF1000) | per-GPU wire, SF1000 | + copies |
+|---|---|---|---|
+| q03 lineitem | 7.7 / 77 GB | 19 ms | +14 ms |
+| q05 full lineitem | 19.2 / 192 GB | 48 ms | +36 ms |
+| q21 F4 fan-in | ~24 / ~240 GB (≈51 GB/CN inbound at SF1000) | ~60 ms | +45 ms |
+
+What actually dominates at scale is the **protocol**, not the copies: one blocking
+transport thread per CN (per-batch lease RPC → sync poll-to-DONE WRITE → blocking
+transmit, destinations sequential — ROADMAP-8CN 4a). At even 20 GB/s effective (10× the
+2 GB/s canary floor), q05@SF1000 exchange = 2.4 s/CN vs the 48 ms wire bound — a ~50×
+gap. Async per-peer senders close that gap and are the 4-CN robustness precondition
+(first-contact MD deadlock, 8.5).
+
+The **staging arena** problem on this box is capacity, not bandwidth. Bump-reset only
+at quiescence makes demand cumulative per query epoch: ~10–12 GB/CN at SF100 and
+**~105–125 GB/CN at SF1000** (q05/q18/q21) — a size bump (16–32 GiB is trivial in
+185 GiB) plus chunked multi-lease export (single leases already exceed the slab: q16
+1.28 GB, q04 3.0 GB; q09's 648 MB SF1-lease class scales linearly) covers SF100, but
+**no fixed slab coexists with 80–150 GB operator peaks in 185 GiB** — SF1000 requires
+eager per-lease reclamation (free on receiver-push / post-WRITE), turning demand from
+cumulative-per-epoch into in-flight (senders × chunk × pipeline depth ≈ low GB). That
+is the M2 redesign conclusion (OPEN-ISSUES M2).
+
+**When peer-direct pays**: registering cuDF/rmm buffers with UCX (the vendored UCX 1.21
+has the CUDA fabric-handle path; rmm exposes `export_handle_type`) deletes the two
+staged copies (~30–40% of exchange wall once the protocol is async), halves exchange
+HBM traffic, and structurally retires the arena — but needs scatter-gather
+XferDescLists, a new wire format, and receiver landing-buffer lifetime signaling
+(ROADMAP-8CN Part 2 §2). Do it after the protocol fix and M2 phase 2; it is an
+optimization at both SFs, never a prerequisite.
+
+### 8.4 Re-ranked roadmap (diffs vs §5)
+
+§5's SF1 reading ranks: #24 aggregation → runtime filters → floor/pipelining →
+build/probe election → MULTI_CAST → arena (5.4 item 5, last).
+
+**SF100** (goal: 22/22, then win the A/B):
+1. **Bring-up + arena**: M0 aarch64 port + M1 cluster4 + M2 sizing/chunked leases.
+2. **Join shape**: cross-join re-association (5.3.3) for q08/q09; build/probe election
+   + semi/anti dedup (5.3.1/5.3.2) — also the SF1000 q04 fix landed early.
+3. **Runtime filters** (5.4.1) — ~90–95 GB/sweep of scan+shuffle volume removed; also
+   pulls q08/q12/q17/q18/q20 staged-arena demand below the exhaustion line.
+4. **#24 decimal-native aggregation** — ~0.3–0.8 s/sweep at SF100; rank it by
+   correctness (a published SF100 result cannot carry 0.1–0.4% drift), not seconds.
+5. **Floor/pipelining** (5.4.2) — residual; q02/q11 keep a 20–30% orchestration share.
+6. MULTI_CAST / top-k / dictionary encoding — now measurable, still last.
+
+**SF1000** (adds a memory tier on top):
+1. **Memory**: M2 phase 2 eager reclaim + spillability of parked/staged batches
+   (roadmap #6) + the 2^31 audit / chars-guarded merge (8.2).
+2. **Join shape** — q04 is now feasibility (3.8B > 2^31), not perf.
+3. **Runtime filters** — ~0.9–1.0 TB/sweep removed; at 10–30 GB/s effective transport
+   ≈ 30–60 s/sweep, the largest legitimate throughput item.
+4. **#24** — ~3–8 s/sweep (canonical-sort removal at 1.5B rows/CN) + the q17-class
+   85 GB sort peaks back to 34 GB; largest single-kernel item, still #4 overall.
+5. **Pipelining + per-peer async senders** — GPU duty cycle ~50–65% without it;
+   ~1.4–1.8× suite multiplier on whatever remains after 1–4.
+6. MULTI_CAST / shared scan (q15/q17's double ~39 GB/CN scans = seconds each) → top-k.
+
+**What moved and why, quantified**:
+- **Arena: last → first at both SFs.** At SF1 it was a canary (one q21 refusal); at
+  SF100 staged inbound per CN is 1.9–6 GB vs the 1280 MiB slab — ≥7 queries fail on
+  day one; at SF1000 the reclaim *semantics*, not the size, are the limit (105–125
+  GB/CN cumulative demand).
+- **Cross-join (5.3.3): perf-medium → feasibility gate.** Both sides scale with SF, so
+  the intermediate is O(SF²): q09 1.3 GB at SF1 → 13 TB at SF100 (17× per-CN HBM,
+  125× the row cap). No memory or spill work rescues a quadratic plan; without it, plan
+  for 20/22.
+- **#24: #1 → #4 in perf terms** (0.3–0.8 s vs RF's multi-second/30–60 s savings);
+  correctness rank unchanged — it still gates the benchmark claim itself.
+- **Floor work: #3 → #5/#6.** 17/22 queries flip data-bound at SF100 (the 308 ms floor
+  is <30% of wall); at SF1000 nothing is floor-bound — only q02/q11 keep a
+  fragment-count × dispatch share.
+- **Async senders/pipelining: reappears at SF1000 as #5** — the 50× protocol gap of
+  8.3 plus the single engine thread serializing 0.5–5 s fragments.
+- **q16/q04 election: medium → high.** q16's mis-sided broadcast costs 3–5× of the
+  query at SF100; q04 crosses 2^31 at SF1000.
+
+### 8.5 Port / bring-up checklist deltas (vs M1's 2-CN text)
+
+- **aarch64 artifacts** (OPEN-ISSUES M0): rebuild UCX 1.21 from the vendored
+  `tools/ucx-1.21.0.tar.gz` / `tools/ucx-src` (`--with-cuda`, `--enable-mt`);
+  meson-rebuild nixl 1.3 from `tools/nixl-src` against it (install lands in
+  `lib/aarch64-linux-gnu/` — the path *name* changes); patch the pixi.toml env lines
+  (`LD_LIBRARY_PATH`/`NIXL_PLUGIN_DIR` embed `x86_64-linux-gnu` and absolute
+  `/home/ubuntu/...` prefixes; add `CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER`).
+  Both pixi.tomls already declare `linux-aarch64-cuda13` with a solved lock; full
+  engine + CN rebuild (`build/release/**`, `.pixi/**` are x86 by construction).
+  Engine B needs nothing: `starrocks/artifacts-ubuntu:3.5.20` is multi-arch (arm64
+  manifest verified); the vendored FE is jars-only; Sirius C++/CUDA has no x86
+  intrinsics.
+- **cluster4 shape**: one CN per GPU via `--gpu-device i` (mandatory — the nixl
+  descriptor hardcodes device 0, so exactly one GPU may be visible per CN); the +2
+  port ladder (heartbeat 9050/2/4/6, thrift 9060/2/4/6, brpc 8060/2/4/6, http
+  8040/2/4/6, starlet 9070/2/4/6); `--engine-dir .cn1–.cn4`; `MIN_BACKENDS=4`.
+  **Pre-establish all 12 directed nixl sessions before the first query** — the
+  first-contact transport-thread MD deadlock (ROADMAP-8CN 4b-1) is near-certain under
+  4-way bidirectional shuffle; mutual 60 s timeout otherwise.
+- **NUMA pinning**: CN0/1 `numactl --physcpubind=0-71 --membind=0`, CN2/3
+  `--physcpubind=72-143 --membind=1`; never membind the HBM NUMA nodes (2/10/18/26).
+  The CN's derived YAML emits only a flat host `capacity_bytes` (no `numa_id`) — rely
+  on membind (ROADMAP-8CN 4c).
+- **Memory config**: `--gpu-memory-limit` ~140–150 GiB (SF100) / ~128 GiB (SF1000),
+  leaving room for the arena (outside the limit) + CUDA context;
+  `SIRIUS_EXCHANGE_STAGING_BYTES` ~16 GiB (SF100) / ~40 GiB (SF1000) until M2 phase 2;
+  `--host-memory-limit` ~160–200 GiB/CN, deliberately leaving ≥400 GB of LPDDR for
+  page cache. Raise `SIRIUS_QUERY_WATCHDOG_SECS` (≥180 at SF1000) and make the 60 s
+  CN↔CN REPLY_TIMEOUT configurable — a >60 s receiving fragment currently fails every
+  waiting sender.
+- **Transport env**: `UCX_TLS=cuda_copy,cuda_ipc,tcp,self` suffices — `cuda_ipc` rides
+  NVLink P2P automatically on an all-to-all NV18 box; keep the 2 GB/s bandwidth canary
+  to catch silent fallback.
+- **IO layout**: regenerate parquet as multiple files per table (a multiple of 4:
+  SF100 8–16 files; SF1000 lineitem 32–64 files of ~2.5–5 GB), row groups 128–256 MB,
+  on local NVMe (cold SF1000 ≈ 90–97 GB/CN). One warm pass page-caches the whole
+  dataset in 960 GB; report cold vs warm separately.
+
+### 8.6 Validation at scale
+
+| gate | queries | pass signal |
+|---|---|---|
+| arena resize + chunked leases (M2 ph.1) | q16 (single 1.28 GB lease — the unit test), q03/q05/q18/q21 | SF100 sweep green with no hand-tuned `SIRIUS_EXCHANGE_STAGING_BYTES`; endurance 2–3 sweeps |
+| arena eager reclaim (M2 ph.2) | q05/q18/q21 at SF1000 | high_water ≪ cumulative epoch bytes; no exhaustion |
+| cross-join re-association | q08, q09 | the queries run at all at SF100 (est. seconds post-fix) |
+| 2^31 guards / chunked merge | q13 (SF100 canary — 85% of the char cap), q04 + q10 (SF1000) | no int32 overflow; q04 build ≤ 2^31 via dedup or BUILD_PROBE |
+| 4-CN transport | first bidirectional shuffle (q03) after session pre-warm | no 60 s MD timeout; canary ≥ 2 GB/s |
+| runtime filters | q12 (cleanest signal), then q17/q18/q20/q03/q08 | exchanged bytes from CN logs ~50× down on q12 |
+| #24 | q01/q06/q14/q19 bit-exact (unchanged from §6) | correctness first; q17 merge peak 85 → 34 GB |
+| timeouts/watchdog | q09, q21 wall at SF1000 | no watchdog kill, no sender REPLY_TIMEOUT |
+
+**Expected A-vs-B shape at SF100**: per-CN rows grow 50× vs the SF1 slice while HBM
+bandwidth grows ~27× (L4 share → GB200), so bandwidth-bound GPU work lands at ~1.9× the
+SF1 marginal (sum of SF1 marginals ≈ 8 s) → A sweep ≈ **22–35 s unoptimized for 20/22**
+(q08/q09 out until the join-shape fix), ≈ 13–18 s with RF + election + #24; SF1000
+≈ 2.5–4 min unoptimized, 60–100 s optimized. The 308 ms floor drops to a few percent of
+every data-bound query — expect the geo-mean to invert (at SF1 A won only
+q01/q09/q19; at SF100 A should win the data-bound majority, with q02/q11 and partially
+q22 remaining B-leaning orchestration shapes). Re-baseline B on the 144 Grace cores
+(`mem_limit` in `setup-engine-b.sh`) rather than reusing L4-host numbers, and publish
+cold and warm medians separately.
