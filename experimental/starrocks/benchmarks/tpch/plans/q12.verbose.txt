@@ -1,0 +1,106 @@
+RESOURCE GROUP: default_wg
+
+PLAN COST
+  CPU: 250.2
+  Memory: 123.2
+
+PLAN FRAGMENT 0(F06)
+  Fragment Cost: 127.99999999999994
+  Output Exprs:24: l_shipmode | 28: sum | 29: sum
+  Input Partition: UNPARTITIONED
+  RESULT SINK
+
+  11:MERGING-EXCHANGE
+     distribution type: GATHER
+     cardinality: 1
+
+PLAN FRAGMENT 1(F05)
+  Fragment Cost: 214.4
+
+  Input Partition: HASH_PARTITIONED: 24: l_shipmode
+  OutPut Partition: UNPARTITIONED
+  OutPut Exchange Id: 11
+
+  10:SORT
+  |  order by: [24, VARCHAR(1048576), true] ASC
+  |  offset: 0
+  |  cardinality: 1
+  |  
+  9:AGGREGATE (merge finalize)
+  |  aggregate: sum[([28: sum, BIGINT, true]); args: TINYINT; result: BIGINT; args nullable: true; result nullable: true], sum[([29: sum, BIGINT, true]); args: TINYINT; result: BIGINT; args nullable: true; result nullable: true]
+  |  group by: [24: l_shipmode, VARCHAR(1048576), true]
+  |  cardinality: 1
+  |  
+  8:EXCHANGE
+     distribution type: SHUFFLE
+     partition exprs: [24: l_shipmode, VARCHAR(1048576), true]
+     cardinality: 1
+
+PLAN FRAGMENT 2(F04)
+  Fragment Cost: 191.4
+
+  Input Partition: HASH_PARTITIONED: 1: o_orderkey
+  OutPut Partition: HASH_PARTITIONED: 24: l_shipmode
+  OutPut Exchange Id: 08
+
+  7:AGGREGATE (update serialize)
+  |  STREAMING
+  |  aggregate: sum[([26: case, TINYINT, true]); args: TINYINT; result: BIGINT; args nullable: true; result nullable: true], sum[([27: case, TINYINT, true]); args: TINYINT; result: BIGINT; args nullable: true; result nullable: true]
+  |  group by: [24: l_shipmode, VARCHAR(1048576), true]
+  |  cardinality: 1
+  |  
+  6:Project
+  |  output columns:
+  |  24 <-> [24: l_shipmode, VARCHAR(1048576), true]
+  |  26 <-> if[(([6: o_orderpriority, VARCHAR(1048576), true] = '1-URGENT') OR ([6: o_orderpriority, VARCHAR(1048576), true] = '2-HIGH'), 1, 0); args: BOOLEAN,TINYINT,TINYINT; result: TINYINT; args nullable: true; result nullable: true]
+  |  27 <-> if[(([6: o_orderpriority, VARCHAR(1048576), true] != '1-URGENT') AND ([6: o_orderpriority, VARCHAR(1048576), true] != '2-HIGH'), 1, 0); args: BOOLEAN,TINYINT,TINYINT; result: TINYINT; args nullable: true; result nullable: true]
+  |  cardinality: 1
+  |  
+  5:HASH JOIN
+  |  join op: INNER JOIN (PARTITIONED)
+  |  equal join conjunct: [1: o_orderkey, BIGINT, true] = [10: l_orderkey, BIGINT, true]
+  |  build runtime filters:
+  |  - filter_id = 0, build_expr = (10: l_orderkey), remote = true
+  |  output columns: 6, 24
+  |  can local shuffle: true
+  |  cardinality: 1
+  |  
+  |----4:EXCHANGE
+  |       distribution type: SHUFFLE
+  |       partition exprs: [10: l_orderkey, BIGINT, true]
+  |       cardinality: 1
+  |    
+  1:EXCHANGE
+     distribution type: SHUFFLE
+     partition exprs: [1: o_orderkey, BIGINT, true]
+     cardinality: 1
+
+PLAN FRAGMENT 3(F02)
+  Fragment Cost: 0.0
+
+  Input Partition: RANDOM
+  OutPut Partition: HASH_PARTITIONED: 10: l_orderkey
+  OutPut Exchange Id: 04
+
+  3:Project
+  |  output columns:
+  |  10 <-> [10: l_orderkey, BIGINT, true]
+  |  24 <-> [24: l_shipmode, VARCHAR(1048576), true]
+  |  cardinality: 1
+  |  
+  2:FileScanNode
+     BROKER: 
+     cardinality: 1
+
+PLAN FRAGMENT 4(F00)
+  Fragment Cost: 0.0
+
+  Input Partition: RANDOM
+  OutPut Partition: HASH_PARTITIONED: 1: o_orderkey
+  OutPut Exchange Id: 01
+
+  0:FileScanNode
+     BROKER: 
+     cardinality: 1
+     probe runtime filters:
+     - filter_id = 0, probe_expr = (1: o_orderkey)

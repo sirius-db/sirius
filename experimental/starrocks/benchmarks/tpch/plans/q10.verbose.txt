@@ -1,0 +1,176 @@
+RESOURCE GROUP: default_wg
+
+PLAN COST
+  CPU: 859.5999999999999
+  Memory: 438.8
+
+PLAN FRAGMENT 0(F08)
+  Fragment Cost: 432.0
+  Output Exprs:1: c_custkey | 2: c_name | 39: sum | 6: c_acctbal | 35: n_name | 3: c_address | 5: c_phone | 8: c_comment
+  Input Partition: UNPARTITIONED
+  RESULT SINK
+
+  19:MERGING-EXCHANGE
+     distribution type: GATHER
+     limit: 20
+     cardinality: 1
+
+PLAN FRAGMENT 1(F07)
+  Fragment Cost: 723.5999999999999
+
+  Input Partition: HASH_PARTITIONED: 1: c_custkey, 2: c_name, 6: c_acctbal, 5: c_phone, 35: n_name, 3: c_address, 8: c_comment
+  OutPut Partition: UNPARTITIONED
+  OutPut Exchange Id: 19
+
+  18:TOP-N
+  |  order by: [39, DECIMAL128(38,4), true] DESC
+  |  offset: 0
+  |  limit: 20
+  |  cardinality: 1
+  |  
+  17:AGGREGATE (merge finalize)
+  |  aggregate: sum[([39: sum, DECIMAL128(38,4), true]); args: DECIMAL128; result: DECIMAL128(38,4); args nullable: true; result nullable: true]
+  |  group by: [1: c_custkey, INT, true], [2: c_name, VARCHAR(1048576), true], [6: c_acctbal, DECIMAL64(15,2), true], [5: c_phone, VARCHAR(1048576), true], [35: n_name, VARCHAR(1048576), true], [3: c_address, VARCHAR(1048576), true], [8: c_comment, VARCHAR(1048576), true]
+  |  cardinality: 1
+  |  
+  16:EXCHANGE
+     distribution type: SHUFFLE
+     partition exprs: [1: c_custkey, INT, true], [2: c_name, VARCHAR(1048576), true], [6: c_acctbal, DECIMAL64(15,2), true], [5: c_phone, VARCHAR(1048576), true], [35: n_name, VARCHAR(1048576), true], [3: c_address, VARCHAR(1048576), true], [8: c_comment, VARCHAR(1048576), true]
+     cardinality: 1
+
+PLAN FRAGMENT 2(F00)
+  Fragment Cost: 674.0
+
+  Input Partition: RANDOM
+  OutPut Partition: HASH_PARTITIONED: 1: c_custkey, 2: c_name, 6: c_acctbal, 5: c_phone, 35: n_name, 3: c_address, 8: c_comment
+  OutPut Exchange Id: 16
+
+  15:AGGREGATE (update serialize)
+  |  STREAMING
+  |  aggregate: sum[([38: expr, DECIMAL128(31,4), true]); args: DECIMAL128; result: DECIMAL128(38,4); args nullable: true; result nullable: true]
+  |  group by: [1: c_custkey, INT, true], [2: c_name, VARCHAR(1048576), true], [6: c_acctbal, DECIMAL64(15,2), true], [5: c_phone, VARCHAR(1048576), true], [35: n_name, VARCHAR(1048576), true], [3: c_address, VARCHAR(1048576), true], [8: c_comment, VARCHAR(1048576), true]
+  |  cardinality: 1
+  |  
+  14:Project
+  |  output columns:
+  |  1 <-> [1: c_custkey, INT, true]
+  |  2 <-> [2: c_name, VARCHAR(1048576), true]
+  |  3 <-> [3: c_address, VARCHAR(1048576), true]
+  |  5 <-> [5: c_phone, VARCHAR(1048576), true]
+  |  6 <-> [6: c_acctbal, DECIMAL64(15,2), true]
+  |  8 <-> [8: c_comment, VARCHAR(1048576), true]
+  |  35 <-> [35: n_name, VARCHAR(1048576), true]
+  |  38 <-> cast([23: l_extendedprice, DECIMAL64(15,2), true] as DECIMAL128(15,2)) * cast(1 - [24: l_discount, DECIMAL64(15,2), true] as DECIMAL128(16,2))
+  |  cardinality: 1
+  |  
+  13:HASH JOIN
+  |  join op: INNER JOIN (BROADCAST)
+  |  equal join conjunct: [1: c_custkey, INT, true] = [10: o_custkey, INT, true]
+  |  build runtime filters:
+  |  - filter_id = 2, build_expr = (10: o_custkey), remote = false
+  |  output columns: 1, 2, 3, 5, 6, 8, 23, 24, 35
+  |  can local shuffle: true
+  |  cardinality: 1
+  |  
+  |----12:EXCHANGE
+  |       distribution type: BROADCAST
+  |       cardinality: 1
+  |    
+  4:Project
+  |  output columns:
+  |  1 <-> [1: c_custkey, INT, true]
+  |  2 <-> [2: c_name, VARCHAR(1048576), true]
+  |  3 <-> [3: c_address, VARCHAR(1048576), true]
+  |  5 <-> [5: c_phone, VARCHAR(1048576), true]
+  |  6 <-> [6: c_acctbal, DECIMAL64(15,2), true]
+  |  8 <-> [8: c_comment, VARCHAR(1048576), true]
+  |  35 <-> [35: n_name, VARCHAR(1048576), true]
+  |  cardinality: 1
+  |  
+  3:HASH JOIN
+  |  join op: INNER JOIN (BROADCAST)
+  |  equal join conjunct: [4: c_nationkey, INT, true] = [34: n_nationkey, INT, true]
+  |  build runtime filters:
+  |  - filter_id = 0, build_expr = (34: n_nationkey), remote = false
+  |  output columns: 1, 2, 3, 5, 6, 8, 35
+  |  can local shuffle: false
+  |  cardinality: 1
+  |  
+  |----2:EXCHANGE
+  |       distribution type: BROADCAST
+  |       cardinality: 1
+  |    
+  0:FileScanNode
+     BROKER: 
+     cardinality: 1
+     probe runtime filters:
+     - filter_id = 0, probe_expr = (4: c_nationkey)
+     - filter_id = 2, probe_expr = (1: c_custkey)
+
+PLAN FRAGMENT 3(F03)
+  Fragment Cost: 126.0
+
+  Input Partition: RANDOM
+  OutPut Partition: UNPARTITIONED
+  OutPut Exchange Id: 12
+
+  11:Project
+  |  output columns:
+  |  10 <-> [10: o_custkey, INT, true]
+  |  23 <-> [23: l_extendedprice, DECIMAL64(15,2), true]
+  |  24 <-> [24: l_discount, DECIMAL64(15,2), true]
+  |  cardinality: 1
+  |  
+  10:HASH JOIN
+  |  join op: INNER JOIN (BROADCAST)
+  |  equal join conjunct: [18: l_orderkey, BIGINT, true] = [9: o_orderkey, BIGINT, true]
+  |  build runtime filters:
+  |  - filter_id = 1, build_expr = (9: o_orderkey), remote = false
+  |  output columns: 10, 23, 24
+  |  can local shuffle: true
+  |  cardinality: 1
+  |  
+  |----9:EXCHANGE
+  |       distribution type: BROADCAST
+  |       cardinality: 1
+  |    
+  6:Project
+  |  output columns:
+  |  18 <-> [18: l_orderkey, BIGINT, true]
+  |  23 <-> [23: l_extendedprice, DECIMAL64(15,2), true]
+  |  24 <-> [24: l_discount, DECIMAL64(15,2), true]
+  |  cardinality: 1
+  |  
+  5:FileScanNode
+     BROKER: 
+     cardinality: 1
+     probe runtime filters:
+     - filter_id = 1, probe_expr = (18: l_orderkey)
+
+PLAN FRAGMENT 4(F04)
+  Fragment Cost: 0.0
+
+  Input Partition: RANDOM
+  OutPut Partition: UNPARTITIONED
+  OutPut Exchange Id: 09
+
+  8:Project
+  |  output columns:
+  |  9 <-> [9: o_orderkey, BIGINT, true]
+  |  10 <-> [10: o_custkey, INT, true]
+  |  cardinality: 1
+  |  
+  7:FileScanNode
+     BROKER: 
+     cardinality: 1
+
+PLAN FRAGMENT 5(F01)
+  Fragment Cost: 0.0
+
+  Input Partition: RANDOM
+  OutPut Partition: UNPARTITIONED
+  OutPut Exchange Id: 02
+
+  1:FileScanNode
+     BROKER: 
+     cardinality: 1

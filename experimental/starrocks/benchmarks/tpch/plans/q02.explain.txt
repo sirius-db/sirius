@@ -1,0 +1,287 @@
+PLAN FRAGMENT 0
+ OUTPUT EXPRS:34: s_acctbal | 30: s_name | 42: n_name | 20: p_partkey | 22: p_mfgr | 31: s_address | 33: s_phone | 35: s_comment
+  PARTITION: UNPARTITIONED
+
+  RESULT SINK
+
+  41:MERGING-EXCHANGE
+     limit: 100
+
+PLAN FRAGMENT 1
+ OUTPUT EXPRS:
+  PARTITION: HASH_PARTITIONED: 37: ps_suppkey
+
+  STREAM DATA SINK
+    EXCHANGE ID: 41
+    UNPARTITIONED
+
+  40:TOP-N
+  |  order by: <slot 34> 34: s_acctbal DESC, <slot 42> 42: n_name ASC, <slot 30> 30: s_name ASC, <slot 20> 20: p_partkey ASC
+  |  offset: 0
+  |  limit: 100
+  |  
+  39:Project
+  |  <slot 20> : 20: p_partkey
+  |  <slot 22> : 22: p_mfgr
+  |  <slot 30> : 30: s_name
+  |  <slot 31> : 31: s_address
+  |  <slot 33> : 33: s_phone
+  |  <slot 34> : 34: s_acctbal
+  |  <slot 35> : 35: s_comment
+  |  <slot 42> : 42: n_name
+  |  
+  38:HASH JOIN
+  |  join op: INNER JOIN (BROADCAST)
+  |  colocate: false, reason: 
+  |  equal join conjunct: 20: p_partkey = 48: ps_partkey
+  |  equal join conjunct: 39: ps_supplycost = 67: min
+  |  
+  |----37:EXCHANGE
+  |    
+  19:Project
+  |  <slot 20> : 20: p_partkey
+  |  <slot 22> : 22: p_mfgr
+  |  <slot 30> : 30: s_name
+  |  <slot 31> : 31: s_address
+  |  <slot 33> : 33: s_phone
+  |  <slot 34> : 34: s_acctbal
+  |  <slot 35> : 35: s_comment
+  |  <slot 39> : 39: ps_supplycost
+  |  <slot 42> : 42: n_name
+  |  
+  18:HASH JOIN
+  |  join op: INNER JOIN (BROADCAST)
+  |  colocate: false, reason: 
+  |  equal join conjunct: 43: n_regionkey = 45: r_regionkey
+  |  
+  |----17:EXCHANGE
+  |    
+  15:Project
+  |  <slot 20> : 20: p_partkey
+  |  <slot 22> : 22: p_mfgr
+  |  <slot 30> : 30: s_name
+  |  <slot 31> : 31: s_address
+  |  <slot 33> : 33: s_phone
+  |  <slot 34> : 34: s_acctbal
+  |  <slot 35> : 35: s_comment
+  |  <slot 39> : 39: ps_supplycost
+  |  <slot 42> : 42: n_name
+  |  <slot 43> : 43: n_regionkey
+  |  
+  14:HASH JOIN
+  |  join op: INNER JOIN (BROADCAST)
+  |  colocate: false, reason: 
+  |  equal join conjunct: 32: s_nationkey = 41: n_nationkey
+  |  
+  |----13:EXCHANGE
+  |    
+  11:Project
+  |  <slot 20> : 20: p_partkey
+  |  <slot 22> : 22: p_mfgr
+  |  <slot 30> : 30: s_name
+  |  <slot 31> : 31: s_address
+  |  <slot 32> : 32: s_nationkey
+  |  <slot 33> : 33: s_phone
+  |  <slot 34> : 34: s_acctbal
+  |  <slot 35> : 35: s_comment
+  |  <slot 39> : 39: ps_supplycost
+  |  
+  10:HASH JOIN
+  |  join op: INNER JOIN (PARTITIONED)
+  |  colocate: false, reason: 
+  |  equal join conjunct: 37: ps_suppkey = 29: s_suppkey
+  |  
+  |----9:EXCHANGE
+  |    
+  7:EXCHANGE
+
+PLAN FRAGMENT 2
+ OUTPUT EXPRS:
+  PARTITION: HASH_PARTITIONED: 48: ps_partkey
+
+  STREAM DATA SINK
+    EXCHANGE ID: 37
+    UNPARTITIONED
+
+  36:AGGREGATE (merge finalize)
+  |  output: min(67: min)
+  |  group by: 48: ps_partkey
+  |  having: 67: min IS NOT NULL
+  |  
+  35:EXCHANGE
+
+PLAN FRAGMENT 3
+ OUTPUT EXPRS:
+  PARTITION: HASH_PARTITIONED: 62: n_regionkey
+
+  STREAM DATA SINK
+    EXCHANGE ID: 35
+    HASH_PARTITIONED: 48: ps_partkey
+
+  34:AGGREGATE (update serialize)
+  |  STREAMING
+  |  output: min(51: ps_supplycost)
+  |  group by: 48: ps_partkey
+  |  
+  33:Project
+  |  <slot 48> : 48: ps_partkey
+  |  <slot 51> : 51: ps_supplycost
+  |  
+  32:HASH JOIN
+  |  join op: INNER JOIN (PARTITIONED)
+  |  colocate: false, reason: 
+  |  equal join conjunct: 62: n_regionkey = 64: r_regionkey
+  |  
+  |----31:EXCHANGE
+  |    
+  29:EXCHANGE
+
+PLAN FRAGMENT 4
+ OUTPUT EXPRS:
+  PARTITION: RANDOM
+
+  STREAM DATA SINK
+    EXCHANGE ID: 31
+    HASH_PARTITIONED: 64: r_regionkey
+
+  30:FileScanNode
+     BROKER: 
+
+PLAN FRAGMENT 5
+ OUTPUT EXPRS:
+  PARTITION: RANDOM
+
+  STREAM DATA SINK
+    EXCHANGE ID: 29
+    HASH_PARTITIONED: 62: n_regionkey
+
+  28:Project
+  |  <slot 48> : 48: ps_partkey
+  |  <slot 51> : 51: ps_supplycost
+  |  <slot 62> : 62: n_regionkey
+  |  
+  27:HASH JOIN
+  |  join op: INNER JOIN (BROADCAST)
+  |  colocate: false, reason: 
+  |  equal join conjunct: 56: s_nationkey = 60: n_nationkey
+  |  
+  |----26:EXCHANGE
+  |    
+  24:Project
+  |  <slot 48> : 48: ps_partkey
+  |  <slot 51> : 51: ps_supplycost
+  |  <slot 56> : 56: s_nationkey
+  |  
+  23:HASH JOIN
+  |  join op: INNER JOIN (BROADCAST)
+  |  colocate: false, reason: 
+  |  equal join conjunct: 49: ps_suppkey = 53: s_suppkey
+  |  
+  |----22:EXCHANGE
+  |    
+  20:FileScanNode
+     BROKER: 
+
+PLAN FRAGMENT 6
+ OUTPUT EXPRS:
+  PARTITION: RANDOM
+
+  STREAM DATA SINK
+    EXCHANGE ID: 26
+    UNPARTITIONED
+
+  25:FileScanNode
+     BROKER: 
+
+PLAN FRAGMENT 7
+ OUTPUT EXPRS:
+  PARTITION: RANDOM
+
+  STREAM DATA SINK
+    EXCHANGE ID: 22
+    UNPARTITIONED
+
+  21:FileScanNode
+     BROKER: 
+
+PLAN FRAGMENT 8
+ OUTPUT EXPRS:
+  PARTITION: RANDOM
+
+  STREAM DATA SINK
+    EXCHANGE ID: 17
+    UNPARTITIONED
+
+  16:FileScanNode
+     BROKER: 
+
+PLAN FRAGMENT 9
+ OUTPUT EXPRS:
+  PARTITION: RANDOM
+
+  STREAM DATA SINK
+    EXCHANGE ID: 13
+    UNPARTITIONED
+
+  12:FileScanNode
+     BROKER: 
+
+PLAN FRAGMENT 10
+ OUTPUT EXPRS:
+  PARTITION: RANDOM
+
+  STREAM DATA SINK
+    EXCHANGE ID: 09
+    HASH_PARTITIONED: 29: s_suppkey
+
+  8:FileScanNode
+     BROKER: 
+
+PLAN FRAGMENT 11
+ OUTPUT EXPRS:
+  PARTITION: HASH_PARTITIONED: 20: p_partkey
+
+  STREAM DATA SINK
+    EXCHANGE ID: 07
+    HASH_PARTITIONED: 37: ps_suppkey
+
+  6:Project
+  |  <slot 20> : 20: p_partkey
+  |  <slot 22> : 22: p_mfgr
+  |  <slot 37> : 37: ps_suppkey
+  |  <slot 39> : 39: ps_supplycost
+  |  
+  5:HASH JOIN
+  |  join op: INNER JOIN (PARTITIONED)
+  |  colocate: false, reason: 
+  |  equal join conjunct: 20: p_partkey = 36: ps_partkey
+  |  
+  |----4:EXCHANGE
+  |    
+  2:EXCHANGE
+
+PLAN FRAGMENT 12
+ OUTPUT EXPRS:
+  PARTITION: RANDOM
+
+  STREAM DATA SINK
+    EXCHANGE ID: 04
+    HASH_PARTITIONED: 36: ps_partkey
+
+  3:FileScanNode
+     BROKER: 
+
+PLAN FRAGMENT 13
+ OUTPUT EXPRS:
+  PARTITION: RANDOM
+
+  STREAM DATA SINK
+    EXCHANGE ID: 02
+    HASH_PARTITIONED: 20: p_partkey
+
+  1:Project
+  |  <slot 20> : 20: p_partkey
+  |  <slot 22> : 22: p_mfgr
+  |  
+  0:FileScanNode
+     BROKER: 

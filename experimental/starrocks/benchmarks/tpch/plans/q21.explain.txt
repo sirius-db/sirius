@@ -1,0 +1,169 @@
+PLAN FRAGMENT 0
+ OUTPUT EXPRS:18: s_name | 87: count
+  PARTITION: UNPARTITIONED
+
+  RESULT SINK
+
+  28:MERGING-EXCHANGE
+     limit: 100
+
+PLAN FRAGMENT 1
+ OUTPUT EXPRS:
+  PARTITION: HASH_PARTITIONED: 18: s_name
+
+  STREAM DATA SINK
+    EXCHANGE ID: 28
+    UNPARTITIONED
+
+  27:TOP-N
+  |  order by: <slot 87> 87: count DESC, <slot 18> 18: s_name ASC
+  |  offset: 0
+  |  limit: 100
+  |  
+  26:AGGREGATE (merge finalize)
+  |  output: count(87: count)
+  |  group by: 18: s_name
+  |  
+  25:EXCHANGE
+
+PLAN FRAGMENT 2
+ OUTPUT EXPRS:
+  PARTITION: RANDOM
+
+  STREAM DATA SINK
+    EXCHANGE ID: 25
+    HASH_PARTITIONED: 18: s_name
+
+  24:AGGREGATE (update serialize)
+  |  STREAMING
+  |  output: count(*)
+  |  group by: 18: s_name
+  |  
+  23:Project
+  |  <slot 18> : 18: s_name
+  |  
+  22:HASH JOIN
+  |  join op: INNER JOIN (BROADCAST)
+  |  colocate: false, reason: 
+  |  equal join conjunct: 20: s_nationkey = 49: n_nationkey
+  |  
+  |----21:EXCHANGE
+  |    
+  18:Project
+  |  <slot 18> : 18: s_name
+  |  <slot 20> : 20: s_nationkey
+  |  
+  17:HASH JOIN
+  |  join op: INNER JOIN (BROADCAST)
+  |  colocate: false, reason: 
+  |  equal join conjunct: 17: s_suppkey = 26: l_suppkey
+  |  
+  |----16:EXCHANGE
+  |    
+  0:FileScanNode
+     BROKER: 
+
+PLAN FRAGMENT 3
+ OUTPUT EXPRS:
+  PARTITION: RANDOM
+
+  STREAM DATA SINK
+    EXCHANGE ID: 21
+    UNPARTITIONED
+
+  20:Project
+  |  <slot 49> : 49: n_nationkey
+  |  
+  19:FileScanNode
+     BROKER: 
+
+PLAN FRAGMENT 4
+ OUTPUT EXPRS:
+  PARTITION: HASH_PARTITIONED: 24: l_orderkey
+
+  STREAM DATA SINK
+    EXCHANGE ID: 16
+    UNPARTITIONED
+
+  15:Project
+  |  <slot 26> : 26: l_suppkey
+  |  
+  14:HASH JOIN
+  |  join op: LEFT SEMI JOIN (BUCKET_SHUFFLE(S))
+  |  colocate: false, reason: 
+  |  equal join conjunct: 24: l_orderkey = 53: l_orderkey
+  |  other join predicates: 55: l_suppkey != 26: l_suppkey
+  |  
+  |----13:EXCHANGE
+  |    
+  11:Project
+  |  <slot 24> : 24: l_orderkey
+  |  <slot 26> : 26: l_suppkey
+  |  
+  10:HASH JOIN
+  |  join op: RIGHT ANTI JOIN (BUCKET_SHUFFLE(S))
+  |  colocate: false, reason: 
+  |  equal join conjunct: 70: l_orderkey = 24: l_orderkey
+  |  other join predicates: 72: l_suppkey != 26: l_suppkey
+  |  
+  |----9:Project
+  |    |  <slot 24> : 24: l_orderkey
+  |    |  <slot 26> : 26: l_suppkey
+  |    |  
+  |    8:HASH JOIN
+  |    |  join op: INNER JOIN (PARTITIONED)
+  |    |  colocate: false, reason: 
+  |    |  equal join conjunct: 24: l_orderkey = 40: o_orderkey
+  |    |  
+  |    |----7:EXCHANGE
+  |    |    
+  |    4:EXCHANGE
+  |    
+  2:EXCHANGE
+
+PLAN FRAGMENT 5
+ OUTPUT EXPRS:
+  PARTITION: RANDOM
+
+  STREAM DATA SINK
+    EXCHANGE ID: 13
+    HASH_PARTITIONED: 53: l_orderkey
+
+  12:FileScanNode
+     BROKER: 
+
+PLAN FRAGMENT 6
+ OUTPUT EXPRS:
+  PARTITION: RANDOM
+
+  STREAM DATA SINK
+    EXCHANGE ID: 07
+    HASH_PARTITIONED: 40: o_orderkey
+
+  6:Project
+  |  <slot 40> : 40: o_orderkey
+  |  
+  5:FileScanNode
+     BROKER: 
+
+PLAN FRAGMENT 7
+ OUTPUT EXPRS:
+  PARTITION: RANDOM
+
+  STREAM DATA SINK
+    EXCHANGE ID: 04
+    HASH_PARTITIONED: 24: l_orderkey
+
+  3:FileScanNode
+     BROKER: 
+
+PLAN FRAGMENT 8
+ OUTPUT EXPRS:
+  PARTITION: RANDOM
+
+  STREAM DATA SINK
+    EXCHANGE ID: 02
+    HASH_PARTITIONED: 70: l_orderkey
+
+  1:FileScanNode
+     BROKER: 

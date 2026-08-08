@@ -1,0 +1,78 @@
+PLAN FRAGMENT 0
+ OUTPUT EXPRS:24: l_shipmode | 28: sum | 29: sum
+  PARTITION: UNPARTITIONED
+
+  RESULT SINK
+
+  11:MERGING-EXCHANGE
+
+PLAN FRAGMENT 1
+ OUTPUT EXPRS:
+  PARTITION: HASH_PARTITIONED: 24: l_shipmode
+
+  STREAM DATA SINK
+    EXCHANGE ID: 11
+    UNPARTITIONED
+
+  10:SORT
+  |  order by: <slot 24> 24: l_shipmode ASC
+  |  offset: 0
+  |  
+  9:AGGREGATE (merge finalize)
+  |  output: sum(28: sum), sum(29: sum)
+  |  group by: 24: l_shipmode
+  |  
+  8:EXCHANGE
+
+PLAN FRAGMENT 2
+ OUTPUT EXPRS:
+  PARTITION: HASH_PARTITIONED: 1: o_orderkey
+
+  STREAM DATA SINK
+    EXCHANGE ID: 08
+    HASH_PARTITIONED: 24: l_shipmode
+
+  7:AGGREGATE (update serialize)
+  |  STREAMING
+  |  output: sum(26: case), sum(27: case)
+  |  group by: 24: l_shipmode
+  |  
+  6:Project
+  |  <slot 24> : 24: l_shipmode
+  |  <slot 26> : if((6: o_orderpriority = '1-URGENT') OR (6: o_orderpriority = '2-HIGH'), 1, 0)
+  |  <slot 27> : if((6: o_orderpriority != '1-URGENT') AND (6: o_orderpriority != '2-HIGH'), 1, 0)
+  |  
+  5:HASH JOIN
+  |  join op: INNER JOIN (PARTITIONED)
+  |  colocate: false, reason: 
+  |  equal join conjunct: 1: o_orderkey = 10: l_orderkey
+  |  
+  |----4:EXCHANGE
+  |    
+  1:EXCHANGE
+
+PLAN FRAGMENT 3
+ OUTPUT EXPRS:
+  PARTITION: RANDOM
+
+  STREAM DATA SINK
+    EXCHANGE ID: 04
+    HASH_PARTITIONED: 10: l_orderkey
+
+  3:Project
+  |  <slot 10> : 10: l_orderkey
+  |  <slot 24> : 24: l_shipmode
+  |  
+  2:FileScanNode
+     BROKER: 
+
+PLAN FRAGMENT 4
+ OUTPUT EXPRS:
+  PARTITION: RANDOM
+
+  STREAM DATA SINK
+    EXCHANGE ID: 01
+    HASH_PARTITIONED: 1: o_orderkey
+
+  0:FileScanNode
+     BROKER: 

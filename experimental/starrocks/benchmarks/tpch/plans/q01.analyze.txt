@@ -1,0 +1,88 @@
+[0mSummary[0m
+    [0mQueryId: 019fe1c9-c963-7902-b1f6-8c9317185c6f[0m
+    [0mVersion: 4.1.1-14b7e3f[0m
+    [0mState: Finished[0m
+    [0mTotalTime: 10s605ms[0m
+        [0mExecutionTime: 0ns [Scan: 0ns (NaN%), Network: 0ns (NaN%), ResultDeliverTime: 0ns (NaN%), ScheduleTime: 0ns (NaN%)][0m
+        [0mCollectProfileTime: 10s2ms[0m
+        [0mFrontendProfileMergeTime: 4.406ms[0m
+    [0mQueryPeakMemoryUsage: ?, QueryAllocatedMemoryUsage: 0.000 B[0m
+    [0mTop Most Time-consuming Nodes:[0m
+        [0m1. RESULT_SINK: 0ns (NaN%)[0m
+        [0m2. FILE_SCAN (id=0) : 0ns (NaN%)[0m
+        [0m3. PROJECT (id=1) : 0ns (NaN%)[0m
+        [0m4. AGGREGATION (id=2) [serialize, update]: 0ns (NaN%)[0m
+        [0m5. EXCHANGE (id=3) [SHUFFLE]: 0ns (NaN%)[0m
+        [0m6. AGGREGATION (id=4) [finalize, merge]: 0ns (NaN%)[0m
+        [0m7. SORT (id=5) [ROW_NUMBER, SORT]: 0ns (NaN%)[0m
+        [0m8. MERGE_EXCHANGE (id=6) [GATHER]: 0ns (NaN%)[0m
+    [0mTop Most Memory-consuming Nodes:[0m
+    [0mNonDefaultVariables:[0m
+        [0menable_adaptive_sink_dop: false -> true[0m
+        [0menable_async_profile: true -> false[0m
+        [0menable_profile: false -> true[0m
+[0mFragment 0[0m
+│   [0mBackendNum: 1[0m
+│   [0mInstancePeakMemoryUsage: ?, InstanceAllocatedMemoryUsage: ?[0m
+│   [0mPrepareTime: ?[0m
+│   [0mMissingInstanceIds: 019fe1c9-c963-7902-b1f6-8c9317185c70[0m
+└──[0mRESULT_SINK[0m
+   │   [0mSinkType: MYSQL_PROTOCAL[0m
+   └──[0mMERGE_EXCHANGE (id=6) [GATHER][0m
+          [0mEstimates: [row: 1, cpu: 152.00, memory: 152.00, network: 152.00, cost: 1661.80][0m
+          [0mTotalTime: 0ns (NaN%) [CPUTime: ?][0m
+          [0mOutputRows: ?[0m
+          [0mPeakMemory: ?, AllocatedMemory: ?[0m
+[0m
+[0mFragment 1[0m
+│   [0mBackendNum: 2[0m
+│   [0mInstancePeakMemoryUsage: ?, InstanceAllocatedMemoryUsage: ?[0m
+│   [0mPrepareTime: ?[0m
+│   [0mMissingInstanceIds: 019fe1c9-c963-7902-b1f6-8c9317185c71,019fe1c9-c963-7902-b1f6-8c9317185c72[0m
+└──[0mDATA_STREAM_SINK (id=6)[0m
+   │   [0mPartitionType: UNPARTITIONED[0m
+   └──[0mSORT (id=5) [ROW_NUMBER, SORT][0m
+      │   [0mEstimates: [row: 1, cpu: 152.00, memory: 152.00, network: 152.00, cost: 1053.80][0m
+      │   [0mTotalTime: 0ns (NaN%) [CPUTime: ?][0m
+      │   [0mOutputRows: ?[0m
+      │   [0mPeakMemory: ?, AllocatedMemory: ?[0m
+      │   [0mOrderByExprs: [<slot 9> 9: l_returnflag, <slot 10> 10: l_linestatus][0m
+      └──[0mAGGREGATION (id=4) [finalize, merge][0m
+         │   [0mEstimates: [row: 1, cpu: 152.00, memory: 152.00, network: 0.00, cost: 445.80][0m
+         │   [0mTotalTime: 0ns (NaN%) [CPUTime: ?][0m
+         │   [0mOutputRows: ?[0m
+         │   [0mPeakMemory: ?, AllocatedMemory: ?[0m
+         │   [0mAggExprs: [sum(19: sum), sum(20: sum), sum(21: sum), sum(22: sum), avg(23: avg), ...][0m
+         │   [0mGroupingExprs: [9: l_returnflag, 10: l_linestatus][0m
+         └──[0mEXCHANGE (id=3) [SHUFFLE][0m
+                [0mEstimates: [row: 1, cpu: 15.20, memory: 0.00, network: 15.20, cost: 65.80][0m
+                [0mTotalTime: 0ns (NaN%) [CPUTime: ?][0m
+                [0mOutputRows: ?[0m
+                [0mPeakMemory: ?, AllocatedMemory: ?[0m
+[0m
+[0mFragment 2[0m
+│   [0mBackendNum: 2[0m
+│   [0mInstancePeakMemoryUsage: ?, InstanceAllocatedMemoryUsage: ?[0m
+│   [0mPrepareTime: ?[0m
+│   [0mMissingInstanceIds: 019fe1c9-c963-7902-b1f6-8c9317185c73,019fe1c9-c963-7902-b1f6-8c9317185c74[0m
+└──[0mDATA_STREAM_SINK (id=3)[0m
+   │   [0mPartitionType: HASH_PARTITIONED[0m
+   │   [0mPartitionExprs: [9: l_returnflag, 10: l_linestatus][0m
+   └──[0mAGGREGATION (id=2) [serialize, update][0m
+      │   [0mEstimates: [row: 1, cpu: 10.00, memory: 15.20, network: 0.00, cost: 35.40][0m
+      │   [0mTotalTime: 0ns (NaN%) [CPUTime: ?][0m
+      │   [0mOutputRows: ?[0m
+      │   [0mPeakMemory: ?, AllocatedMemory: ?[0m
+      │   [0mAggExprs: [sum(5: l_quantity), sum(6: l_extendedprice), sum(17: expr), ...][0m
+      │   [0mGroupingExprs: [9: l_returnflag, 10: l_linestatus][0m
+      └──[0mPROJECT (id=1) [0m
+         │   [0mEstimates: [row: ?, cpu: ?, memory: ?, network: ?, cost: ?][0m
+         │   [0mTotalTime: 0ns (NaN%) [CPUTime: ?][0m
+         │   [0mOutputRows: ?[0m
+         │   [0mExpression: [5: l_quantity, 6: l_extendedprice, 7: l_discount, 9: l_returnflag, ...][0m
+         │   [0mCommonExpression: [CAST(6: l_extendedprice AS DECIMAL128(15,2)), ...][0m
+         └──[0mFILE_SCAN (id=0) [0m
+                [0mEstimates: [row: 1, cpu: ?, memory: ?, network: ?, cost: 0.0][0m
+                [0mTotalTime: 0ns (NaN%) [CPUTime: ?][0m
+                [0mOutputRows: ?[0m
+[0m

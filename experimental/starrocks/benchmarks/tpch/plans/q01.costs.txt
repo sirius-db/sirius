@@ -1,0 +1,128 @@
+PLAN COST
+  CPU: 481.2
+  Memory: 471.2
+
+PLAN FRAGMENT 0(F02)
+  Output Exprs:9: l_returnflag | 10: l_linestatus | 19: sum | 20: sum | 21: sum | 22: sum | 23: avg | 24: avg | 25: avg | 26: count
+  Input Partition: UNPARTITIONED
+  RESULT SINK
+
+  6:MERGING-EXCHANGE
+     distribution type: GATHER
+     cardinality: 1
+     column statistics: 
+     * l_returnflag-->[-Infinity, Infinity, 0.0, 1.0, 1.0] UNKNOWN
+     * l_linestatus-->[-Infinity, Infinity, 0.0, 1.0, 1.0] UNKNOWN
+     * sum-->[-Infinity, Infinity, 0.0, 1.0, 1.0] UNKNOWN
+     * sum-->[-Infinity, Infinity, 0.0, 1.0, 1.0] UNKNOWN
+     * sum-->[-Infinity, Infinity, 0.0, 1.0, 1.0] UNKNOWN
+     * sum-->[-Infinity, Infinity, 0.0, 1.0, 1.0] UNKNOWN
+     * avg-->[-Infinity, Infinity, 0.0, 1.0, 1.0] UNKNOWN
+     * avg-->[-Infinity, Infinity, 0.0, 1.0, 1.0] UNKNOWN
+     * avg-->[-Infinity, Infinity, 0.0, 1.0, 1.0] UNKNOWN
+     * count-->[-Infinity, Infinity, 0.0, 8.0, 1.0] ESTIMATE
+
+PLAN FRAGMENT 1(F01)
+
+  Input Partition: HASH_PARTITIONED: 9: l_returnflag, 10: l_linestatus
+  OutPut Partition: UNPARTITIONED
+  OutPut Exchange Id: 06
+
+  5:SORT
+  |  order by: [9, VARCHAR(1048576), true] ASC, [10, VARCHAR(1048576), true] ASC
+  |  offset: 0
+  |  cardinality: 1
+  |  column statistics: 
+  |  * l_returnflag-->[-Infinity, Infinity, 0.0, 1.0, 1.0] UNKNOWN
+  |  * l_linestatus-->[-Infinity, Infinity, 0.0, 1.0, 1.0] UNKNOWN
+  |  * sum-->[-Infinity, Infinity, 0.0, 1.0, 1.0] UNKNOWN
+  |  * sum-->[-Infinity, Infinity, 0.0, 1.0, 1.0] UNKNOWN
+  |  * sum-->[-Infinity, Infinity, 0.0, 1.0, 1.0] UNKNOWN
+  |  * sum-->[-Infinity, Infinity, 0.0, 1.0, 1.0] UNKNOWN
+  |  * avg-->[-Infinity, Infinity, 0.0, 1.0, 1.0] UNKNOWN
+  |  * avg-->[-Infinity, Infinity, 0.0, 1.0, 1.0] UNKNOWN
+  |  * avg-->[-Infinity, Infinity, 0.0, 1.0, 1.0] UNKNOWN
+  |  * count-->[-Infinity, Infinity, 0.0, 8.0, 1.0] ESTIMATE
+  |  
+  4:AGGREGATE (merge finalize)
+  |  aggregate: sum[([19: sum, DECIMAL128(38,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([20: sum, DECIMAL128(38,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([21: sum, DECIMAL128(38,4), true]); args: DECIMAL128; result: DECIMAL128(38,4); args nullable: true; result nullable: true], sum[([22: sum, DECIMAL128(38,6), true]); args: DECIMAL128; result: DECIMAL128(38,6); args nullable: true; result nullable: true], avg[([23: avg, VARBINARY, true]); args: DECIMAL64; result: DECIMAL128(38,8); args nullable: true; result nullable: true], avg[([24: avg, VARBINARY, true]); args: DECIMAL64; result: DECIMAL128(38,8); args nullable: true; result nullable: true], avg[([25: avg, VARBINARY, true]); args: DECIMAL64; result: DECIMAL128(38,8); args nullable: true; result nullable: true], count[([26: count, BIGINT, false]); args: ; result: BIGINT; args nullable: true; result nullable: false]
+  |  group by: [9: l_returnflag, VARCHAR(1048576), true], [10: l_linestatus, VARCHAR(1048576), true]
+  |  cardinality: 1
+  |  column statistics: 
+  |  * l_returnflag-->[-Infinity, Infinity, 0.0, 1.0, 1.0] UNKNOWN
+  |  * l_linestatus-->[-Infinity, Infinity, 0.0, 1.0, 1.0] UNKNOWN
+  |  * sum-->[-Infinity, Infinity, 0.0, 1.0, 1.0] UNKNOWN
+  |  * sum-->[-Infinity, Infinity, 0.0, 1.0, 1.0] UNKNOWN
+  |  * sum-->[-Infinity, Infinity, 0.0, 1.0, 1.0] UNKNOWN
+  |  * sum-->[-Infinity, Infinity, 0.0, 1.0, 1.0] UNKNOWN
+  |  * avg-->[-Infinity, Infinity, 0.0, 1.0, 1.0] UNKNOWN
+  |  * avg-->[-Infinity, Infinity, 0.0, 1.0, 1.0] UNKNOWN
+  |  * avg-->[-Infinity, Infinity, 0.0, 1.0, 1.0] UNKNOWN
+  |  * count-->[-Infinity, Infinity, 0.0, 8.0, 1.0] ESTIMATE
+  |  
+  3:EXCHANGE
+     distribution type: SHUFFLE
+     partition exprs: [9: l_returnflag, VARCHAR(1048576), true], [10: l_linestatus, VARCHAR(1048576), true]
+     cardinality: 1
+
+PLAN FRAGMENT 2(F00)
+
+  Input Partition: RANDOM
+  OutPut Partition: HASH_PARTITIONED: 9: l_returnflag, 10: l_linestatus
+  OutPut Exchange Id: 03
+
+  2:AGGREGATE (update serialize)
+  |  STREAMING
+  |  aggregate: sum[([5: l_quantity, DECIMAL64(15,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([6: l_extendedprice, DECIMAL64(15,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([17: expr, DECIMAL128(31,4), true]); args: DECIMAL128; result: DECIMAL128(38,4); args nullable: true; result nullable: true], sum[([18: expr, DECIMAL128(38,6), true]); args: DECIMAL128; result: DECIMAL128(38,6); args nullable: true; result nullable: true], avg[([5: l_quantity, DECIMAL64(15,2), true]); args: DECIMAL64; result: VARBINARY; args nullable: true; result nullable: true], avg[([6: l_extendedprice, DECIMAL64(15,2), true]); args: DECIMAL64; result: VARBINARY; args nullable: true; result nullable: true], avg[([7: l_discount, DECIMAL64(15,2), true]); args: DECIMAL64; result: VARBINARY; args nullable: true; result nullable: true], count[(*); args: ; result: BIGINT; args nullable: false; result nullable: false]
+  |  group by: [9: l_returnflag, VARCHAR(1048576), true], [10: l_linestatus, VARCHAR(1048576), true]
+  |  cardinality: 1
+  |  column statistics: 
+  |  * l_returnflag-->[-Infinity, Infinity, 0.0, 1.0, 1.0] UNKNOWN
+  |  * l_linestatus-->[-Infinity, Infinity, 0.0, 1.0, 1.0] UNKNOWN
+  |  * sum-->[-Infinity, Infinity, 0.0, 1.0, 1.0] UNKNOWN
+  |  * sum-->[-Infinity, Infinity, 0.0, 1.0, 1.0] UNKNOWN
+  |  * sum-->[-Infinity, Infinity, 0.0, 1.0, 1.0] UNKNOWN
+  |  * sum-->[-Infinity, Infinity, 0.0, 1.0, 1.0] UNKNOWN
+  |  * avg-->[-Infinity, Infinity, 0.0, 1.0, 1.0] UNKNOWN
+  |  * avg-->[-Infinity, Infinity, 0.0, 1.0, 1.0] UNKNOWN
+  |  * avg-->[-Infinity, Infinity, 0.0, 1.0, 1.0] UNKNOWN
+  |  * count-->[-Infinity, Infinity, 0.0, 8.0, 1.0] ESTIMATE
+  |  
+  1:Project
+  |  output columns:
+  |  5 <-> [5: l_quantity, DECIMAL64(15,2), true]
+  |  6 <-> [6: l_extendedprice, DECIMAL64(15,2), true]
+  |  7 <-> [7: l_discount, DECIMAL64(15,2), true]
+  |  9 <-> [9: l_returnflag, VARCHAR(1048576), true]
+  |  10 <-> [10: l_linestatus, VARCHAR(1048576), true]
+  |  17 <-> [31: multiply, DECIMAL128(31,4), true]
+  |  18 <-> [31: multiply, DECIMAL128(31,4), true] * cast(1 + [8: l_tax, DECIMAL64(15,2), true] as DECIMAL128(16,2))
+  |  common expressions:
+  |  27 <-> cast([6: l_extendedprice, DECIMAL64(15,2), true] as DECIMAL128(15,2))
+  |  28 <-> [7: l_discount, DECIMAL64(15,2), true]
+  |  29 <-> 1 - [28: cast, DECIMAL64(16,2), true]
+  |  30 <-> cast([29: subtract, DECIMAL64(16,2), true] as DECIMAL128(16,2))
+  |  31 <-> [27: cast, DECIMAL128(15,2), true] * [30: cast, DECIMAL128(16,2), true]
+  |  cardinality: 1
+  |  column statistics: 
+  |  * l_quantity-->[-Infinity, Infinity, 0.0, 1.0, 1.0] UNKNOWN
+  |  * l_extendedprice-->[-Infinity, Infinity, 0.0, 1.0, 1.0] UNKNOWN
+  |  * l_discount-->[-Infinity, Infinity, 0.0, 1.0, 1.0] UNKNOWN
+  |  * l_returnflag-->[-Infinity, Infinity, 0.0, 1.0, 1.0] UNKNOWN
+  |  * l_linestatus-->[-Infinity, Infinity, 0.0, 1.0, 1.0] UNKNOWN
+  |  * expr-->[-Infinity, Infinity, 0.0, 1.0, 1.0] UNKNOWN
+  |  * expr-->[-Infinity, Infinity, 0.0, 1.0, 1.0] UNKNOWN
+  |  
+  0:FileScanNode
+     BROKER: 
+     cardinality: 1
+     column statistics: 
+     * l_quantity-->[-Infinity, Infinity, 0.0, 1.0, 1.0] UNKNOWN
+     * l_extendedprice-->[-Infinity, Infinity, 0.0, 1.0, 1.0] UNKNOWN
+     * l_discount-->[-Infinity, Infinity, 0.0, 1.0, 1.0] UNKNOWN
+     * l_tax-->[-Infinity, Infinity, 0.0, 1.0, 1.0] UNKNOWN
+     * l_returnflag-->[-Infinity, Infinity, 0.0, 1.0, 1.0] UNKNOWN
+     * l_linestatus-->[-Infinity, Infinity, 0.0, 1.0, 1.0] UNKNOWN
+     * l_shipdate-->[-Infinity, 9.046944E8, 0.0, 1.0, 1.0] UNKNOWN
+     * expr-->[-Infinity, Infinity, 0.0, 1.0, 1.0] UNKNOWN
+     * expr-->[-Infinity, Infinity, 0.0, 1.0, 1.0] UNKNOWN

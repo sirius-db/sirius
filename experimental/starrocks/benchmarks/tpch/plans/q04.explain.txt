@@ -1,0 +1,69 @@
+PLAN FRAGMENT 0
+ OUTPUT EXPRS:6: o_orderpriority | 27: count
+  PARTITION: UNPARTITIONED
+
+  RESULT SINK
+
+  11:MERGING-EXCHANGE
+
+PLAN FRAGMENT 1
+ OUTPUT EXPRS:
+  PARTITION: HASH_PARTITIONED: 6: o_orderpriority
+
+  STREAM DATA SINK
+    EXCHANGE ID: 11
+    UNPARTITIONED
+
+  10:SORT
+  |  order by: <slot 6> 6: o_orderpriority ASC
+  |  offset: 0
+  |  
+  9:AGGREGATE (merge finalize)
+  |  output: count(27: count)
+  |  group by: 6: o_orderpriority
+  |  
+  8:EXCHANGE
+
+PLAN FRAGMENT 2
+ OUTPUT EXPRS:
+  PARTITION: RANDOM
+
+  STREAM DATA SINK
+    EXCHANGE ID: 08
+    HASH_PARTITIONED: 6: o_orderpriority
+
+  7:AGGREGATE (update serialize)
+  |  STREAMING
+  |  output: count(*)
+  |  group by: 6: o_orderpriority
+  |  
+  6:Project
+  |  <slot 6> : 6: o_orderpriority
+  |  
+  5:HASH JOIN
+  |  join op: LEFT SEMI JOIN (BROADCAST)
+  |  colocate: false, reason: 
+  |  equal join conjunct: 1: o_orderkey = 10: l_orderkey
+  |  
+  |----4:EXCHANGE
+  |    
+  1:Project
+  |  <slot 1> : 1: o_orderkey
+  |  <slot 6> : 6: o_orderpriority
+  |  
+  0:FileScanNode
+     BROKER: 
+
+PLAN FRAGMENT 3
+ OUTPUT EXPRS:
+  PARTITION: RANDOM
+
+  STREAM DATA SINK
+    EXCHANGE ID: 04
+    UNPARTITIONED
+
+  3:Project
+  |  <slot 10> : 10: l_orderkey
+  |  
+  2:FileScanNode
+     BROKER: 
