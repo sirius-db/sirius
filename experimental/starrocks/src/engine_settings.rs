@@ -62,6 +62,17 @@ pub fn derive_sirius_config_yaml(
             yaml_escape(capacity)
         ));
     }
+    // Scan datasource backend. The engine defaults to `true` (the uring sirius_datasource);
+    // setting SIRIUS_CN_USE_SIRIUS_DATASOURCE=false selects the kvikio/cudf datasource instead.
+    // That path is rejected for multi-GPU topologies (sirius_scan_manager.cpp), but each CN pins
+    // exactly one device via CUDA_VISIBLE_DEVICES and this YAML declares num_gpus: 1, so the
+    // guard does not apply per-CN. Measured on Q06/SF100 standalone: uring ~4.9 s vs cudf ~0.23 s.
+    if let Some(v) = std::env::var_os("SIRIUS_CN_USE_SIRIUS_DATASOURCE") {
+        let v = v.to_string_lossy().to_ascii_lowercase();
+        let use_sirius = !matches!(v.as_str(), "false" | "0" | "no" | "off");
+        yaml.push_str("  executor:\n    scan_manager:\n");
+        yaml.push_str(&format!("      use_sirius_datasource: {use_sirius}\n"));
+    }
     yaml.push_str("  telemetry:\n");
     yaml.push_str(&format!(
         "    output_directory: \"{}\"\n",

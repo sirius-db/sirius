@@ -798,3 +798,9 @@ mod agent_tier {
         }
     }
 }
+
+/// Two-process NVLink benchmark of this module's primitives, mirroring the `nixl-nvlink-repro`
+/// Python harness. Declared here, not at the crate root, because it drives `agent_tier`'s
+/// `pub(super)` `TransportState`/`write_and_wait` — the same calls production uses.
+#[cfg(all(test, feature = "nixl-transport"))]
+mod nixl_bench;

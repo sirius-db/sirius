@@ -103,7 +103,10 @@ rsync -av <devbox>:/home/ubuntu/sirius/tools/ucx-install/ $REPO/../tools/ucx-ins
 
 **Option B — build from source:**
 
+
+
 ```bash
+export REPO="$PWD"
 mkdir -p $REPO/../tools && cd $REPO/../tools
 
 # UCX first — nixl's UCX plugin links it.
@@ -134,6 +137,8 @@ Verify the plugin actually exists — a missing UCX plugin is the single most co
 failure:
 
 ```bash
+export REPO=/home/prestouser/aocsa/sirius
+export TOOL_DIR=$REPO/../tools
 source $REPO/experimental/starrocks/scripts/cn-env.sh
 ls $NIXL_PLUGIN_DIR/          # must contain libplugin_UCX.so (or similar)
 ```
