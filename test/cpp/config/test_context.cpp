@@ -37,11 +37,13 @@
 #include <memory/sirius_memory_reservation_manager.hpp>
 #include <utils/utils.hpp>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdlib>  // for setenv/putenv
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <optional>
 #include <set>
 #include <source_location>
 #include <string>
@@ -167,6 +169,168 @@ TEST_CASE("Sirius configuration rejects zero hash partition bytes", "[sirius][co
   REQUIRE_THROWS_WITH(
     config.load_from_file(cfg),
     Catch::Contains("hash_partition_bytes") && Catch::Contains("greater than zero"));
+}
+
+namespace {
+
+void require_shared_operator_defaults(const sirius::operator_params& params, uint64_t batch)
+{
+  REQUIRE(params.scan_task_batch_size == batch);
+  REQUIRE(params.hash_partition_bytes == batch);
+  REQUIRE(params.concat_batch_bytes == batch);
+  REQUIRE(params.sort_sample_bytes == batch);
+  REQUIRE(params.max_build_hash_table_bytes == 2 * batch);
+}
+
+fs::path config_fixture(std::string const& name)
+{
+  std::source_location loc = std::source_location::current();
+  return fs::path(loc.file_name()).parent_path() / "data" / name;
+}
+
+uint64_t expected_effective_batch(const sirius::sirius_config& config)
+{
+  std::optional<uint64_t> min_capacity;
+  for (auto const& space : config.get_memory_space_configs()) {
+    auto const* gpu = std::get_if<cucascade::memory::gpu_memory_space_config>(&space);
+    if (gpu == nullptr || gpu->memory_capacity == 0) { continue; }
+    auto const capacity = static_cast<uint64_t>(gpu->memory_capacity);
+    min_capacity        = min_capacity ? std::min(*min_capacity, capacity) : capacity;
+  }
+  REQUIRE(min_capacity.has_value());
+  return std::min(sirius::config::derived_default_batch_size(),
+                  std::max<uint64_t>(1, *min_capacity / 40));
+}
+
+}  // namespace
+
+TEST_CASE("operator batch defaults use the smallest low-level GPU capacity",
+          "[sirius][config][operator_defaults]")
+{
+  sirius::sirius_config config;
+  config.load_from_file(config_fixture("effective_operator_defaults_low_level.yaml"));
+
+  constexpr uint64_t effective_capacity = 256ULL * 1024 * 1024;
+  constexpr uint64_t expected_batch     = effective_capacity / 40;
+  require_shared_operator_defaults(config.get_operator_params(), expected_batch);
+}
+
+TEST_CASE("operator batch defaults use the high-level GPU usage limit",
+          "[sirius][config][operator_defaults]")
+{
+  sirius::sirius_config config;
+  config.load_from_file(config_fixture("effective_operator_defaults_high_level.yaml"));
+
+  constexpr uint64_t effective_capacity = 256ULL * 1024 * 1024;
+  constexpr uint64_t expected_batch     = effective_capacity / 40;
+  require_shared_operator_defaults(config.get_operator_params(), expected_batch);
+}
+
+TEST_CASE("operator batch defaults use an explicit high-level GPU usage fraction",
+          "[sirius][config][operator_defaults]")
+{
+  sirius::sirius_config config;
+  config.load_from_file(config_fixture("minimal.yaml"));
+
+  require_shared_operator_defaults(config.get_operator_params(),
+                                   expected_effective_batch(config));
+}
+
+TEST_CASE("explicit operator batch values override effective-capacity defaults",
+          "[sirius][config][operator_defaults]")
+{
+  sirius::sirius_config config;
+  config.load_from_file(config_fixture("effective_operator_defaults_explicit.yaml"));
+
+  constexpr uint64_t mib = 1024ULL * 1024;
+  auto const& params      = config.get_operator_params();
+  REQUIRE(params.scan_task_batch_size == 1 * mib);
+  REQUIRE(params.hash_partition_bytes == 2 * mib);
+  REQUIRE(params.concat_batch_bytes == 3 * mib);
+  REQUIRE(params.sort_sample_bytes == 4 * mib);
+  REQUIRE(params.max_build_hash_table_bytes == 5 * mib);
+}
+
+TEST_CASE("ordinary defaults stay physical-memory-derived without an explicit GPU cap",
+          "[sirius][config][operator_defaults]")
+{
+  sirius::sirius_config config;
+  auto const before = config.get_operator_params();
+  config.load_from_file(config_fixture("effective_operator_defaults_high_level.yaml"));
+  config.apply_defaults();
+
+  require_shared_operator_defaults(config.get_operator_params(), before.scan_task_batch_size);
+}
+
+TEST_CASE("repeated loads clear explicit and cap-derived operator values",
+          "[sirius][config][operator_defaults]")
+{
+  sirius::sirius_config config;
+  auto const physical_default = config.get_operator_params().scan_task_batch_size;
+
+  config.load_from_file(config_fixture("effective_operator_defaults_explicit.yaml"));
+  REQUIRE(config.get_operator_params().scan_task_batch_size == 1ULL * 1024 * 1024);
+
+  config.load_from_file(config_fixture("effective_operator_defaults_high_level.yaml"));
+  constexpr uint64_t capped_default = (256ULL * 1024 * 1024) / 40;
+  require_shared_operator_defaults(config.get_operator_params(), capped_default);
+
+  config.load_from_file(config_fixture("effective_operator_defaults_uncapped.yaml"));
+  require_shared_operator_defaults(config.get_operator_params(), physical_default);
+}
+
+TEST_CASE("effective-capacity defaults seed DuckDB SET and RESET",
+          "[sirius][context][config][operator_defaults][isolated_context]")
+{
+  finally cleanup_env{[]() {
+    unsetenv("SIRIUS_CONFIG_FILE");
+    setenv("SIRIUS_DISABLE", "1", 1);
+  }};
+
+  auto const cfg = config_fixture("effective_operator_defaults_high_level.yaml");
+  unsetenv("SIRIUS_DISABLE");
+  setenv("SIRIUS_CONFIG_FILE", cfg.string().c_str(), 1);
+
+  duckdb::DuckDB db(nullptr);
+  duckdb::Connection con(db);
+  constexpr uint64_t expected_batch = (256ULL * 1024 * 1024) / 40;
+
+  auto settings = con.Query(R"(
+    SELECT current_setting('scan_task_batch_size')::UBIGINT,
+           current_setting('hash_partition_bytes')::UBIGINT,
+           current_setting('concat_batch_bytes')::UBIGINT,
+           current_setting('sort_sample_bytes')::UBIGINT,
+           current_setting('max_build_hash_table_bytes')::UBIGINT
+  )");
+  REQUIRE(settings != nullptr);
+  REQUIRE_FALSE(settings->HasError());
+  REQUIRE(settings->GetValue(0, 0).GetValue<uint64_t>() == expected_batch);
+  REQUIRE(settings->GetValue(1, 0).GetValue<uint64_t>() == expected_batch);
+  REQUIRE(settings->GetValue(2, 0).GetValue<uint64_t>() == expected_batch);
+  REQUIRE(settings->GetValue(3, 0).GetValue<uint64_t>() == expected_batch);
+  REQUIRE(settings->GetValue(4, 0).GetValue<uint64_t>() == 2 * expected_batch);
+
+  auto sirius_ctx = con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  REQUIRE(sirius_ctx != nullptr);
+  require_shared_operator_defaults(sirius_ctx->get_config().get_operator_params(), expected_batch);
+
+  auto set = con.Query("SET scan_task_batch_size = 99");
+  REQUIRE(set != nullptr);
+  REQUIRE_FALSE(set->HasError());
+  auto set_readback = con.Query("SELECT current_setting('scan_task_batch_size')::UBIGINT");
+  REQUIRE(set_readback != nullptr);
+  REQUIRE_FALSE(set_readback->HasError());
+  REQUIRE(set_readback->GetValue(0, 0).GetValue<uint64_t>() == 99);
+  REQUIRE(sirius_ctx->get_config().get_operator_params().scan_task_batch_size == 99);
+
+  auto reset_setting = con.Query("RESET scan_task_batch_size");
+  REQUIRE(reset_setting != nullptr);
+  REQUIRE_FALSE(reset_setting->HasError());
+  auto reset = con.Query("SELECT current_setting('scan_task_batch_size')::UBIGINT");
+  REQUIRE(reset != nullptr);
+  REQUIRE_FALSE(reset->HasError());
+  REQUIRE(reset->GetValue(0, 0).GetValue<uint64_t>() == expected_batch);
+  REQUIRE(sirius_ctx->get_config().get_operator_params().scan_task_batch_size == expected_batch);
 }
 
 TEST_CASE("DuckDB setting rejects zero hash partition bytes without a Sirius context",
