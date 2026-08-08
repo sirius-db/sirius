@@ -37,6 +37,7 @@
 #include <memory/sirius_memory_reservation_manager.hpp>
 #include <utils/utils.hpp>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdlib>  // for setenv/putenv
 #include <filesystem>
@@ -326,6 +327,52 @@ TEST_CASE("Sirius configuration loading from file with spaces",
   REQUIRE(manager.get_memory_spaces_for_tier(cucascade::memory::Tier::HOST).size() == 1);
   REQUIRE(manager.get_memory_spaces_for_tier(cucascade::memory::Tier::DISK).size() == 2);
   REQUIRE(manager.get_all_memory_spaces().size() == 4);
+}
+
+TEST_CASE("Sirius configuration rejects competing memory configuration paths",
+          "[sirius][config]")
+{
+  std::source_location loc = std::source_location::current();
+  auto const data_dir      = fs::path(loc.file_name()).parent_path() / "data";
+
+  const char* fixtures[] = {"invalid_memory_and_space.yaml",
+                            "invalid_memory_cross_tier_and_space.yaml",
+                            "invalid_memory_empty_subblock_and_space.yaml",
+                            "invalid_memory_null_leaf_and_space.yaml"};
+
+  for (auto const* fixture : fixtures) {
+    INFO("fixture=" << fixture);
+    sirius::sirius_config config;
+    REQUIRE_THROWS_WITH(
+      config.load_from_file(data_dir / fixture),
+      Catch::Contains("sirius.memory") && Catch::Contains("sirius.space") &&
+        Catch::Contains("mutually exclusive"));
+  }
+}
+
+TEST_CASE("Sirius configuration keeps absent memory paths out of mutual-exclusion checks",
+          "[sirius][config]")
+{
+  std::source_location loc = std::source_location::current();
+  auto const data_dir      = fs::path(loc.file_name()).parent_path() / "data";
+  constexpr std::size_t mib = 1024ULL * 1024;
+
+  for (auto const& [fixture, expected_capacity] :
+       std::vector<std::pair<const char*, std::size_t>>{
+         {"valid_space_with_null_memory_subblock.yaml", 128 * mib},
+         {"valid_memory_with_empty_space.yaml", 256 * mib}}) {
+    INFO("fixture=" << fixture);
+    sirius::sirius_config config;
+    REQUIRE_NOTHROW(config.load_from_file(data_dir / fixture));
+
+    auto const& spaces = config.get_memory_space_configs();
+    auto const gpu     = std::ranges::find_if(spaces, [](auto const& space) {
+      return std::holds_alternative<cucascade::memory::gpu_memory_space_config>(space);
+    });
+    REQUIRE(gpu != spaces.end());
+    REQUIRE(std::get<cucascade::memory::gpu_memory_space_config>(*gpu).memory_capacity ==
+            expected_capacity);
+  }
 }
 
 // ============================================================================
