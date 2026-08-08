@@ -28,6 +28,8 @@
 
 #include <algorithm>
 #include <exception>
+#include <stdexcept>
+#include <string_view>
 #include <variant>
 #include <vector>
 
@@ -62,6 +64,15 @@ uint64_t derived_default_batch_size()
 
 // ================ from_yaml for external types ================= //
 
+static void validate_downgrade_fractions(std::string_view scope, double trigger, double stop)
+{
+  if (stop <= 0.0 || stop >= trigger) {
+    throw std::runtime_error(std::string(scope) +
+                             ": downgrade_stop_fraction must be greater than zero and less than "
+                             "downgrade_trigger_fraction");
+  }
+}
+
 static void from_yaml(const YAML::Node& node, cucascade::memory::gpu_memory_space_config& opt)
 {
   opt.per_stream_reservation = false;  // default to false for sirius
@@ -75,6 +86,8 @@ static void from_yaml(const YAML::Node& node, cucascade::memory::gpu_memory_spac
   r.optional("downgrade_stop_fraction", opt.downgrade_stop_fraction, yaml::fraction<double>{});
   r.optional("memory_capacity", yaml::bytes(opt.memory_capacity));
   r.reject_unknown();
+  validate_downgrade_fractions(
+    "sirius.space.gpu", opt.downgrade_trigger_fraction, opt.downgrade_stop_fraction);
 }
 
 static void from_yaml(const YAML::Node& node, cucascade::memory::host_memory_space_config& opt)
@@ -91,6 +104,8 @@ static void from_yaml(const YAML::Node& node, cucascade::memory::host_memory_spa
   r.optional("pool_size", opt.pool_size);
   r.optional("initial_number_pools", opt.initial_number_pools);
   r.reject_unknown();
+  validate_downgrade_fractions(
+    "sirius.space.host", opt.downgrade_trigger_fraction, opt.downgrade_stop_fraction);
 }
 
 static void from_yaml(const YAML::Node& node, cucascade::memory::disk_memory_space_config& opt)
@@ -320,6 +335,8 @@ struct gpu_mem_config {
     r.optional("downgrade_stop_fraction", opt.downgrade_stop_fraction, yaml::fraction<double>{});
     r.optional("track_per_stream_reservation", opt.track_per_stream_reservation);
     r.reject_unknown();
+    validate_downgrade_fractions(
+      "sirius.memory.gpu", opt.downgrade_trigger_fraction, opt.downgrade_stop_fraction);
   }
 
   void setup_configurator(cucascade::memory::reservation_manager_configurator& builder) const
@@ -381,6 +398,8 @@ struct host_mem_config {
     r.optional("pool_size", opt.pool_size);
     r.optional("initial_number_pools", opt.initial_number_pools);
     r.reject_unknown();
+    validate_downgrade_fractions(
+      "sirius.memory.host", opt.downgrade_trigger_fraction, opt.downgrade_stop_fraction);
   }
 
   void setup_configurator(cucascade::memory::reservation_manager_configurator& builder) const
