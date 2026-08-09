@@ -83,6 +83,29 @@ std::unique_ptr<cudf::column> make_list_with_null_parent_row(std::vector<float> 
   return cudf::make_lists_column(n_rows, std::move(offsets), std::move(child), 1, std::move(mask));
 }
 
+// Same layout as make_fixed_size_float_list, but with a single *element*
+// (child value at flat index `null_element`) marked invalid.
+std::unique_ptr<cudf::column> make_list_with_null_child_element(std::vector<float> const& values,
+                                                                cudf::size_type n_rows,
+                                                                cudf::size_type dim,
+                                                                cudf::size_type null_element)
+{
+  auto contents = make_fixed_size_float_list(values, n_rows, dim)->release();
+  auto offsets  = std::move(contents.children[0]);
+  auto child    = std::move(contents.children[1]);
+
+  auto child_mask = cudf::create_null_mask(child->size(), cudf::mask_state::ALL_VALID);
+  cudf::set_null_mask(static_cast<cudf::bitmask_type*>(child_mask.data()),
+                      null_element,
+                      null_element + 1,
+                      false);
+  child->set_null_mask(std::move(child_mask), 1);
+
+  // Parent rows all valid (null_count 0); the null lives in the values child.
+  return cudf::make_lists_column(
+    n_rows, std::move(offsets), std::move(child), 0, rmm::device_buffer{});
+}
+
 }  // namespace
 
 TEST_CASE("list_column_as_dataset_view wraps a FLOAT[dim] column zero-copy", "[vss]")
@@ -146,6 +169,17 @@ TEST_CASE("list_column_as_dataset_view rejects malformed input", "[vss]")
   {
     auto with_null = make_list_with_null_parent_row(values, n_rows, dim, /*null_row=*/1);
     REQUIRE(with_null->null_count() == 1);
+    REQUIRE_THROWS(sirius::vss::list_column_as_dataset_view(with_null->view(), dim));
+  }
+
+  SECTION("null vector elements throw (element-level nulls rejected)")
+  {
+    // Parent rows are all valid, so this survives the row-level compaction in
+    // compute_enn_top_k; the null hides in the values child and must be caught
+    // here (RAFT reads the buffer as a raw blob and can't skip null slots).
+    auto with_null = make_list_with_null_child_element(values, n_rows, dim, /*null_element=*/3);
+    REQUIRE(with_null->null_count() == 0);
+    REQUIRE(with_null->view().child(1).null_count() == 1);
     REQUIRE_THROWS(sirius::vss::list_column_as_dataset_view(with_null->view(), dim));
   }
 
