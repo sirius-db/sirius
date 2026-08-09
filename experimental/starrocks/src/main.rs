@@ -6,12 +6,15 @@ use clap::Parser;
 #[cfg(not(feature = "sirius-engine"))]
 use sirius_starrocks_cn::StubExecutor;
 use sirius_starrocks_cn::{
-    BackendServer, BrpcServer, ComputeNodeConfig, ExchangeIdentity, FeConfig, FragmentExecutor,
-    HeartbeatServer, NixlTransport, SharedHeartbeatState, register_node, report_to_frontend_once,
-    start_backend_server, start_heartbeat_server,
+    BackendServer, BrpcServer, ComputeNodeConfig, EngineReadiness, ExchangeIdentity, FeConfig,
+    FragmentExecutor, HeartbeatServer, HttpServer, NixlTransport, SharedHeartbeatState,
+    register_node, report_to_frontend_once, start_backend_server, start_heartbeat_server,
+    start_http_server,
 };
 #[cfg(feature = "sirius-engine")]
-use sirius_starrocks_cn::{EngineSettings, SiriusEngine, derive_sirius_config_yaml};
+use sirius_starrocks_cn::{
+    EngineSettings, SiriusEngine, cpu_affinity_for_gpu, derive_sirius_config_yaml,
+};
 use tokio::task::{JoinError, JoinSet};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
@@ -151,10 +154,38 @@ impl Args {
     /// Starts the CN listeners, registers with FE, and waits for shutdown.
     #[instrument(name = "compute_node", skip_all)]
     async fn run(self) -> Result<()> {
-        // Build the fragment executor before serving any RPC. Compiled with the engine, this brings
-        // up the GPU engine on its dedicated thread (fail-fast: a bad config or GPU failure exits
-        // before FE can route work here); otherwise it is a stub. The handle is held for the
-        // process lifetime and torn down after the servers stop, below.
+        let state = SharedHeartbeatState::new();
+        // Closed until the engine is up. Binding the listeners first (below) is what closes the
+        // ~7 s window in which this process existed but answered nothing; this gate is what stops
+        // that from turning into "answers, therefore gets scheduled, therefore fails a fragment".
+        let readiness = EngineReadiness::warming();
+
+        // LISTENERS FIRST, ENGINE SECOND. Engine start-up reserves the entire RMM pool and takes
+        // ~7 s on a GB200, while the FE is up in ~4 s and immediately heartbeats every compute node
+        // it remembers from its persisted metadata. Building the engine first left every port
+        // refusing connections for that whole window, and the FE auto-blacklisted the nodes it
+        // could not reach. Ordering it this way means the probe finds a listener; the readiness
+        // gate above is what keeps the answer honest until the engine can actually run work.
+        //
+        // HeartbeatService tells FE this process is alive and captures FE identity. The configured
+        // FE host pins the report target so a hostile heartbeat cannot redirect outbound reports.
+        let heartbeat_server = start_heartbeat_server(
+            self.compute_node.clone(),
+            state.clone(),
+            Some(self.fe.host.clone()),
+            readiness.clone(),
+        )?;
+        // BackendService exposes the shallow CN RPC skeleton on the normal thrift port.
+        let backend_server = start_backend_server(&self.compute_node)?;
+        // The HTTP port is advertised in every heartbeat, and the FE refuses to lift a node's
+        // blacklist entry until it can open a TCP connection to it.
+        let http_server = start_http_server(&self.compute_node)?;
+
+        // Now the expensive part. Compiled with the engine, this brings up the GPU engine on its
+        // dedicated thread (fail-fast: a bad config or GPU failure exits before FE can route work
+        // here); otherwise it is a stub. The handle is held for the process lifetime and torn down
+        // after the servers stop, below. Failing here exits the process, which releases the ports
+        // bound above — the FE sees the node go away rather than being told it is healthy.
         #[cfg(feature = "sirius-engine")]
         let executor: Arc<dyn FragmentExecutor> = {
             let settings = self.engine.resolve(&self.compute_node)?;
@@ -166,23 +197,18 @@ impl Args {
             warn_engine_disabled(&self.engine);
             Arc::new(StubExecutor)
         };
-
-        let state = SharedHeartbeatState::new();
-
-        // HeartbeatService tells FE this process is alive and captures FE identity. The configured
-        // FE host pins the report target so a hostile heartbeat cannot redirect outbound reports.
-        let heartbeat_server = start_heartbeat_server(
-            self.compute_node.clone(),
-            state.clone(),
-            Some(self.fe.host.clone()),
-        )?;
-        // BackendService exposes the shallow CN RPC skeleton on the normal thrift port.
-        let backend_server = start_backend_server(&self.compute_node)?;
         // The cross-node exchange tier, when this build carries nixl and the staging arena is
         // configured; a remote exchange destination stays a loud error otherwise.
-        let transport = build_nixl_transport(&self.compute_node, executor.clone())?;
+        let transport = build_nixl_transport(&self.fe, &self.compute_node, executor.clone())?;
         // BRPC PInternalService dispatches plan fragments on the brpc port.
         let brpc_runtime = BrpcRuntime::start(&self.compute_node, executor.clone(), transport)?;
+
+        // Everything that can execute a fragment is now up, so start answering heartbeats OK and
+        // let the FE schedule onto this node. Opening the gate before brpc bound would advertise a
+        // node whose fragment endpoint is still refusing connections.
+        readiness.mark_ready();
+        info!("compute node is READY: engine, exchange and BRPC are up");
+
         self.registration
             .register_node_with_retries(&self.fe, &self.compute_node)
             .await?;
@@ -199,6 +225,7 @@ impl Args {
         let result = RunningComputeNode {
             heartbeat_server,
             backend_server,
+            http_server,
             brpc_runtime,
             registration_task,
             report_task,
@@ -226,11 +253,16 @@ impl EngineConfig {
             .engine_dir
             .clone()
             .unwrap_or_else(|| PathBuf::from(format!("sirius-cn-{}", compute_node.brpc_port)));
+        // Confine the engine's otherwise-unpinned thread pools to the socket that owns both this
+        // CN's GPU and its `numa_alloc_onnode` host arena. `None` (undiscoverable, or switched
+        // off with SIRIUS_CN_CPU_AFFINITY) leaves them free-floating, as before.
+        let cpu_affinity = cpu_affinity_for_gpu(self.gpu_device);
         let config = match derive_sirius_config_yaml(
             self.gpu_memory_limit.as_deref(),
             self.gpu_memory_fraction,
             self.host_memory_limit.as_deref(),
             &engine_dir,
+            cpu_affinity.as_deref(),
         ) {
             Some(yaml) => {
                 std::fs::create_dir_all(&engine_dir).map_err(|err| {
@@ -474,6 +506,7 @@ async fn maintain_frontend_report(compute_node: ComputeNodeConfig, state: Shared
 /// and its absence must be discoverable, not deduced from a later query failure.
 #[cfg(feature = "nixl-transport")]
 fn build_nixl_transport(
+    fe: &FeConfig,
     compute_node: &ComputeNodeConfig,
     executor: Arc<dyn FragmentExecutor>,
 ) -> Result<Option<NixlTransport>> {
@@ -488,7 +521,9 @@ fn build_nixl_transport(
     // The agent is named by this CN's exchange identity, so two CNs on one host get distinct
     // agents and the FE-routed destination address doubles as the peer's agent name.
     let agent_name = format!("{}:{}", compute_node.advertise_host, compute_node.brpc_port);
-    NixlTransport::start(executor, agent_name)
+    // The FE settings come along because the transport's session warmup discovers this CN's
+    // peers from the FE's compute-node list — they are not knowable here, at bring-up.
+    NixlTransport::start(executor, agent_name, fe.clone())
         .map(Some)
         .map_err(|err| anyhow!("failed to bring up the nixl exchange transport: {err}"))
 }
@@ -497,6 +532,7 @@ fn build_nixl_transport(
 /// destinations fail loudly with the build-time remedy in the message.
 #[cfg(not(feature = "nixl-transport"))]
 fn build_nixl_transport(
+    _fe: &FeConfig,
     _compute_node: &ComputeNodeConfig,
     _executor: Arc<dyn FragmentExecutor>,
 ) -> Result<Option<NixlTransport>> {
@@ -552,6 +588,9 @@ struct RunningComputeNode {
     heartbeat_server: HeartbeatServer,
     /// Blocking thrift backend service server handle.
     backend_server: BackendServer,
+    /// Blocking HTTP health listener on the advertised `--http-port`. Serves no CN traffic; it
+    /// exists so the FE's blacklist-eviction reachability probe can succeed.
+    http_server: HttpServer,
     /// BRPC runtime task and shutdown token.
     brpc_runtime: BrpcRuntime,
     /// Background task that refreshes FE registration when heartbeats are stale.
@@ -566,6 +605,7 @@ impl RunningComputeNode {
     async fn wait_until_shutdown(self) -> Result<()> {
         let heartbeat_shutdown = self.heartbeat_server.shutdown_handle();
         let backend_shutdown = self.backend_server.shutdown_handle();
+        let http_shutdown = self.http_server.shutdown_handle();
         let brpc_shutdown = self.brpc_runtime.shutdown.clone();
 
         // Drive every server's join as a labelled task so the first exit can be observed in the
@@ -575,6 +615,8 @@ impl RunningComputeNode {
         servers.spawn_blocking(move || ("heartbeat", heartbeat_server.join()));
         let backend_server = self.backend_server;
         servers.spawn_blocking(move || ("backend", backend_server.join()));
+        let http_server = self.http_server;
+        servers.spawn_blocking(move || ("http", http_server.join()));
         let brpc_join = self.brpc_runtime.join;
         servers.spawn(async move {
             let result = brpc_join
@@ -641,6 +683,7 @@ impl RunningComputeNode {
         report_task.abort();
         heartbeat_shutdown.shutdown();
         backend_shutdown.shutdown();
+        http_shutdown.shutdown();
         brpc_shutdown.cancel();
 
         let mut result = outcome;

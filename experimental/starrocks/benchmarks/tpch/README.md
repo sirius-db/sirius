@@ -13,8 +13,17 @@ in both cases.
   around `mysql -e`, medians taken later. Refusals (ERROR) are recorded once; hangs
   are cut at `$QUERY_TIMEOUT` (default 30 s) and recorded as wedges. After either,
   `$RESTART_CMD` runs — required for engine A (see caveat below).
+  **`--cold`** records the warm-up (run 0) instead of discarding it, tagged
+  `phase=cold` and cut at `$COLD_TIMEOUT` (default 180 s) — run 0 is the only run
+  that exercises first contact (lazy nixl session setup, plan-cache misses).
+  `--cold-restart` additionally restarts before each query so every run 0 is a true
+  cold cluster.
 - `analyze.py` — merges two result CSVs into a markdown table + log-scale bar plot
-  (median ms per query, geometric-mean speedup over the comparable set).
+  (median ms per query, geometric-mean speedup over the comparable set). It compares
+  the two engines' **row counts** as well as their times: a query where they
+  disagree is reported at the top of the markdown, dropped from the geomean, hatched
+  in the plot, and exits the script 1 (`--allow-mismatch` to report only). Cold rows
+  are kept out of the warm medians and listed separately.
 - `setup-engine-b.sh` — lays out stock StarRocks (1 FE + 2 BEs) from the prebuilt
   artifacts Docker image.
 
@@ -59,7 +68,10 @@ and the host CPUs. Take A fully down before measuring B and vice versa.
 CNs across GPUs, replicate the `cluster2` task pattern in `pixi.toml` with one CN per
 GPU and `CUDA_VISIBLE_DEVICES=<i>` per CN process, and register each CN's heartbeat
 port on the FE. The harness itself is topology-agnostic — it only talks to the FE;
-`wait_alive` accepts any mix of alive compute nodes/backends.
+`wait_alive` accepts any mix of alive compute nodes/backends. Set `MIN_BACKENDS` to
+the real node count: it is the expected size, not a floor, and the sweep aborts if
+more nodes are alive than you declared (a threshold below the real topology can be
+satisfied mid-boot, and the sweep then measures a half-started cluster).
 
 ## Fairness notes
 

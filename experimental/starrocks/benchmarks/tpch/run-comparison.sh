@@ -19,11 +19,18 @@ RUNS=${2:-3}
 B=${B_DIR:-$HOME/starrocks-bench}
 mkdir -p "$OUT"
 
+alive_count() {  # rows whose Alive column is exactly "true" (see bench.sh for why)
+  mysql --host 127.0.0.1 --port 9030 --user root --batch -e "$1" 2>/dev/null | awk -F'\t' '
+    NR == 1 { for (i = 1; i <= NF; i++) if ($i == "Alive") c = i; next }
+    c && $c == "true" { n++ }
+    END { print n + 0 }'
+}
+
 alive() {  # wait until N backends answer on 9030
   for _ in $(seq 1 150); do
-    n=$(mysql --host 127.0.0.1 --port 9030 --user root -N -e "SHOW COMPUTE NODES;" 2>/dev/null | grep -c true)
-    b=$(mysql --host 127.0.0.1 --port 9030 --user root -N -e "SHOW BACKENDS;" 2>/dev/null | grep -c true)
-    [ $((${n:-0} + ${b:-0})) -ge "$1" ] && return 0
+    n=$(alive_count "SHOW COMPUTE NODES;")
+    b=$(alive_count "SHOW BACKENDS;")
+    [ $((n + b)) -ge "$1" ] && return 0
     sleep 2
   done
   echo "cluster did not come up" >&2

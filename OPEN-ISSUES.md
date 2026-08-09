@@ -34,11 +34,134 @@ math behind M1–M3 is `TPCH-PLAN-ANALYSIS.md` §8.
 
 ---
 
+> ## ⚠️ AUDIT 2026-08-09 — a measurement-integrity defect invalidated earlier numbers
+>
+> **Every Engine A number taken before 04:20 UTC on 2026-08-09 may have been measured on a
+> cluster silently running at half capacity.** See **M6** below. Two of four CNs were
+> auto-blacklisted ~2 s after *every* cluster start, before any query ran, and never came back.
+> Re-take any Engine A result you intend to quote.
+>
+> **Six claims in this document's own history are RETRACTED** (details in M6 and in
+> `/home/prestouser/aocsa/benchmark-results/cn-distribution-and-numa.md`):
+>
+> | Retracted claim | Reality |
+> |---|---|
+> | Fragments are distributed *unevenly* (~13× imbalance) | Distribution is **even — 1.02–1.06× spread**. It was *exclusion*, not imbalance. |
+> | `FILES()` → `FileTableScanNode`, one scan range per file | Wrong node. `FILES()` SELECT builds a **`FileScanNode`** (`PlanFragmentBuilder.java:4254`) which emits real sub-file **byte ranges**. |
+> | `parallelInstanceNum` is hardcoded to 1 | Overridden at `PlanFragmentBuilder.java:4270` with `pipeline_dop`; real default ≈ 9–18 per node. |
+> | `prefer_compute_node=false` blocks fan-out | FE runs `shared_data`, so `isPreferComputeNode()` returns a literal **`true`**. The LOCALITY branch is unreachable here. |
+> | NUMA host-memory tier is dormant | **ACTIVE.** `use_host_per_numa()` runs unconditionally; `numa_id` comes from NVML. |
+> | The `host space count (1) != NUMA node count (34)` warning proves misconfiguration | **False alarm** — it counts raw `/sys` node dirs. 1 is correct for a 1-GPU CN. |
+>
+> **Also note:** `Mems_allowed_list` **cannot** see `numactl --membind` (it reflects the cpuset
+> controller; `--membind` sets an `MPOL_BIND` policy visible only in `/proc/<pid>/numa_maps`).
+> `cluster4-numa.sh:354-356` tells operators to verify exactly this wrong way — fix it.
+
+---
 
 
-## M4. The scan datasource default is a 5–21× performance regression 🔴 **NEW — biggest single win found**
 
-**What**: `scan_manager.use_sirius_datasource` defaults to **`true`**
+## M6. CNs silently excluded by a permanent FE blacklist ✅ **FIXED 2026-08-09 — but read this**
+
+**This is the most consequential defect found so far, because it did not fail loudly — it made a
+4-GPU cluster quietly behave like a 2-GPU one while reporting `Alive = true` on all four.**
+
+### Symptom
+`SHOW COMPUTE NODE BLACKLIST` on a *freshly started* FE, before any query:
+
+```
+| ComputeNodeId | AddBlackListType | LostConnectionTime  |
+| 10001         | AUTO             | 2026-08-09 04:06:59 |
+| 10003         | AUTO             | 2026-08-09 04:06:59 |
+```
+
+Still blacklisted 1 m 42 s later against a nominal 500 ms penalty. Reproduced on consecutive
+launches, deterministically the same two node IDs. q14 then ran **48.9 / 0 / 0 / 51.1 %** across the
+four CNs — the two survivors split the work almost perfectly; the other two did *nothing*
+(zero operators, tasks, plans, ports).
+
+### Root cause — two independent defects, both required
+1. **Trigger — a start-up ordering race.** The CN built the GPU engine *before* binding any socket.
+   Engine start reserves the whole RMM pool: **~6.9 s on a GB200** (measured 04:20:18.70 → 25.61)
+   during which every port refused. The FE is up in ~4 s and immediately heartbeats every compute
+   node it remembers from **persisted metadata** (`ComputeNodeId` 10001–10004 were byte-identical
+   across restarts), so it always probed into that window.
+2. **Why it was permanent.** `HostBlacklist.remove()` (`HostBlacklist.java:208-214`) only evicts
+   once `NetUtils.checkAccessibleForAllPorts(host, [bePort, brpcPort, httpPort])` connects to **all
+   three**. The CN **advertised `http_port` (`src/lib.rs:462`) and never bound it** — no HTTP server
+   exists in `Cargo.toml`. The probe always refused, so eviction never ran. `black_host_penalty_min_ms`
+   and friends are irrelevant; the port gate sits upstream of all of them.
+
+### Fix (both landed, both verified live)
+* **`start_http_server`** (`src/lib.rs`) — bind the advertised port. Minimal listener, fixed 200,
+  read/write timeouts. Verified: the FE now auto-evicts in ~1 s
+  (`remove nodeID 10003 from blacklist` at 04:20:27.882).
+* **Listeners before engine init + `EngineReadiness` gate** (`src/lib.rs`, `src/main.rs`) — bind
+  heartbeat/backend/http *first*, build the engine second, open the gate only once BRPC is up.
+  While warming, the heartbeat is **answered** (so the node is reachable, not blacklistable) with a
+  **non-OK status** (so the FE holds it not-alive and never schedules onto a cold engine). A failed
+  *heartbeat* marks a node dead; only a failed *fragment RPC* blacklists it — that asymmetry is what
+  makes the gate safe.
+  Verified 05:10: ports bound at t+0, engine ready at t+6.9 s, **zero `HostBlacklist` lines**.
+  The race no longer produces an entry at all rather than producing one that heals.
+
+### Consequences you must act on
+* **Re-take any Engine A measurement from before 2026-08-09 04:20 UTC**, including the CN-scaling
+  CSVs. They may be half-capacity runs.
+* **The harness must assert an empty blacklist** as a pre- and post-condition of every measured run.
+  Being `Alive` is not sufficient and never was.
+
+### Still open here
+The blacklist adds were emitted by thread `starrocks-mysql-nio-pool-0` (a **client** thread) 1.3 s
+*after* the ports bound — not by `heartbeat-mgr-pool`. The exact call site is **not identified**, and
+the determinism (same two IDs every time) suggests something structural rather than a timing
+coin-flip. The fix removes the symptom; the mechanism deserves one more look.
+
+---
+
+## M4. `use_odirect` is media-blind — O_DIRECT on NFS costs 20× 🔴 **NEW**
+
+> ### ⚠️ CORRECTED 2026-08-09 — the original claim in this section was WRONG
+> This section first read *"the scan datasource default is a 5–21× regression; switch to the cudf
+> datasource."* **That finding was an artifact and the recommendation was wrong.** A controlled
+> sweep (`benchmark-results/scan-defaults-sweep.md`) established:
+>
+> - The SF100 dataset lives on **NFS, `rsize=32768`**. `io::uring::config::use_odirect` defaults to
+>   **`true`** (`src/include/io/uring/config.hpp:27`), so the uring path bypasses page cache and
+>   pays the NFS wire cost on *every* read. The cudf/kvikio path does **buffered** reads and is
+>   served from a 448 GB page cache after first touch. **That is the entire 5–21×.**
+> - Measured ceilings: **NFS+O_DIRECT is flat at ~0.78 GB/s** at any concurrency (1 thr 0.64 →
+>   64 thr 0.78). Sirius's uring path reached 0.69–0.72 GB/s — **~90% of the achievable ceiling.
+>   The reader was never the bottleneck.**
+> - **Both on local NVMe, stock defaults: cudf is only 1.08× faster — no real gap.**
+> - **Tuned uring beats cudf: 1.50× on NFS; with O_DIRECT off, 21.7 vs 14.5 GB/s.**
+>
+> **Do NOT flip `use_sirius_datasource`.** Flipping it also forfeits multi-GPU, which
+> force-enables it anyway (`sirius_config.cpp:507-513`). Fix `use_odirect` instead.
+>
+> ⚠️ Every benchmark number collected on 2026-08-08 used `use_sirius_datasource=false` on
+> NFS-resident SF100. The timings are real; the *attribution* to "cudf's reader is better" is not.
+
+**What**: `io::uring::config::use_odirect{true}` is applied regardless of the underlying media.
+O_DIRECT is correct on local NVMe and catastrophic on a network mount. Related undersized
+defaults in `src/include/scan_manager/config.hpp`: `uring_n_reactors{1}` (:47),
+`thread_pool.num_threads{8}` on a 144-core box (:43), `enable_prefetch_cache{false}` (:55).
+
+**Do**:
+1. **Make `use_odirect` media-aware** — probe the filesystem (`statfs` / `findmnt`) and disable
+   O_DIRECT on network mounts. This is the whole finding.
+2. **Derive `uring_n_reactors` from core count.** On NVMe+O_DIRECT throughput scales
+   **2.34 → 25.29 GB/s from 1 to 64 threads**, so `1` is a genuine ~10× bottleneck *on local
+   disk* — invisible on NFS only because the mount capped everything. This matters at SF1000,
+   where cold scans read ~95 GB/node. Suggested:
+   `uring_n_reactors{std::clamp(hardware_concurrency()/16, 4u, 16u)}`.
+3. Derive `num_threads` from core count (small measured effect). Keep `enable_prefetch_cache`
+   false. `max_n_chunks{1}` showed no measured effect.
+4. ⚠️ **Reactor threads are not NUMA-pinned.** `uring_reactor.cpp:31` includes `<numa.h>` but
+   makes **no `numa_*` calls**; `cpu_affinity_list` pins only the scan_manager pool, not reactors.
+   On this two-domain box CN0/CN1's reactors belong on node 0 and CN2/CN3's on node 1. See M1.2.
+
+**Superseded original text follows.** `scan_manager.use_sirius_datasource` defaults to **`true`**
 (`src/include/scan_manager/config.hpp:44`), selecting Sirius's own io_uring reader. Setting it
 **`false`** selects the kvikio/cudf datasource and is **5–21× faster** on every query measured.
 
@@ -437,7 +560,42 @@ engine's staging arena), GPU0→GPU1, 10 timed + 3 warm-up per size:
   **773.8 GB/s** on the same box (~16% headroom above nixl at ≥256 MiB). NV18 line rate is
   956 GB/s, so the reference report's "exceeds the unidirectional spec" caveat does not apply.
 
-## 🎯 What to focus on now (audit 2026-08-08, live 4× GB200 + SF100)
+## 🎯 What to focus on now (audit 2026-08-09 — supersedes the 2026-08-08 list below)
+
+> **The distribution question is CLOSED.** Fragments are distributed evenly (1.02–1.06× spread) once
+> the CNs are actually schedulable; see **M6**. NUMA layers 1 and 2 are ACTIVE. What remains is a
+> *performance* question, and it is now sharply posed:
+>
+> ### The central open puzzle
+> **At SF100, four GB200s lose to one GB200 on every query — with distribution provably even.**
+>
+> | | Q01 | Q04 | Q06 | Q14 |
+> |---|---|---|---|---|
+> | Engine A, 4 CN (all 4 verified) | 913 | 617 | 376 | 569 |
+> | Engine D, 1 GPU, no FE | **554** | **222** | **241** | **271** |
+>
+> FE+client overhead is ~107 ms and does not close the gap. At **SF500** scale-out finally works,
+> but unevenly: Q01 reaches **3.5×** on 4 CNs while Q04/Q06/Q14 manage only **1.4–1.6×**, and Q06 is
+> *slower* on 2 CNs (1538 ms) than on 1 (1227 ms). Read together: a large **per-query fixed cost**
+> that is independent of data size, plus a shuffle that eats most of the parallel gain.
+> Attributing that fixed cost is the highest-value work available.
+>
+> | # | Item | Why | Effort |
+> |---|---|---|---|
+> | **0** | **Attribute the per-query fixed cost** | Q06 costs 376 ms distributed vs 241 ms on one GPU. Account for that 135 ms — planning, fragment delivery, exchange setup, result assembly. Everything else is guesswork until this is known. | days |
+> | **1** | **#32 — harness must assert an empty blacklist** | M6 proved `Alive=true` is not enough. Without this gate the same class of defect silently returns. | hours |
+> | **2** | **The exchange fixed cost** | Q01 (no shuffle) 3.5×; shuffling queries 1.4–1.6×. That delta is the shuffle, and at these payload sizes it is setup, not bytes — the transport does 628 GB/s. | days |
+> | **3** | **Re-take pre-2026-08-09 Engine A numbers** | They may be half-capacity runs (M6). | hours |
+> | **4** | **A/B the `cpu_affinity` change** | It landed in the same binary as the M6 fix, so **no latency delta measured on 2026-08-09 can be attributed to either change alone.** Unpick it. | hours |
+> | **5** | **M4 — sweep `uring_n_reactors` / `num_threads`** | Still unswept; `uring_n_reactors{1}` on a box reading ~33 GB/CN at SF500. | hours |
+>
+> **Measured and settled — do not re-investigate:** nixl/UCX healthy at 628 GB/s (#34) · GDS
+> unreachable (M5) · fragment distribution even (M6) · row-group stats pruning useless on this data
+> (564/564 lineitem row groups survive q14's predicate) · NUMA L1/L2 active.
+
+---
+
+## 🎯 What to focus on now (audit 2026-08-08, live 4× GB200 + SF100) — SUPERSEDED
 
 > **REVISED after the 2026-08-08 live session.** The list below was written before M4 (the scan
 > datasource, 5–21×), M1.5 firing for real, and #32 (the harness masking it). New order:

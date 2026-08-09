@@ -546,11 +546,15 @@ fn bring_up(config: &Config) -> (Arc<dyn FragmentExecutor>, TransportState) {
 
     // Cap the engine's GPU budget: the benchmark needs the arena, not an RMM pool over the whole
     // 185 GiB device, and a small pool keeps bring-up quick and the device quiet.
+    // No `cpu_affinity`: this harness measures the GPU-to-GPU transport, so thread placement is
+    // left to whatever pins the process (`numactl`, a cpuset) and its numbers stay comparable
+    // with runs recorded before the CN started emitting affinity.
     let yaml = derive_sirius_config_yaml(
         Some(&config.gpu_memory_limit),
         None,
         None,
         &config.engine_dir,
+        None,
     )
     .expect("a gpu memory limit yields a derived config");
     let config_path = config.engine_dir.join("sirius-bench.yaml");

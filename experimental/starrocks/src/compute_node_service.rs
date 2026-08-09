@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex, mpsc};
 use crate::fragment_executor::StubExecutor;
 use crate::fragment_executor::{FragmentExecutor, FragmentRun, SenderSlot, StagedBatch};
 use crate::local_exchange::{ExchangeKey, LocalExchange, ReadyFragment, SenderSource};
-use crate::nixl_transport::{NixlTransport, RemoteSendSpec};
+use crate::nixl_transport::{DrainTicket, NixlTransport, RemoteSendSpec};
 use crate::proto::starrocks::{
     PCancelPlanFragmentRequest, PCancelPlanFragmentResult, PExchangeNixlMd, PExchangeNixlMdResult,
     PExecBatchPlanFragmentsRequest, PExecBatchPlanFragmentsResult, PExecPlanFragmentRequest,
@@ -82,8 +82,76 @@ impl ExchangeIdentity {
 enum DestinationRoute {
     /// The receiver is this process: park output on the GPU and rendezvous in-memory.
     Local,
-    /// The receiver is another CN, reached via its advertised brpc endpoint.
-    Remote { host: String, brpc_port: i32 },
+    /// The receiver is another CN, reached via its advertised brpc endpoint. The port is
+    /// validated here, at routing time, because routing is the last point at which a remote
+    /// destination may still fail with `?`: once the first drain has been posted to the
+    /// transport thread, an early return would drop that drain's ticket and lose its outcome.
+    Remote { host: String, brpc_port: u16 },
+}
+
+/// The remote drains one sender fragment posted to the transport thread, not yet joined.
+#[must_use = "unjoined drains discard the failures the FE has to see"]
+#[derive(Debug, Default)]
+struct SenderDrains(Vec<DrainTicket>);
+
+impl SenderDrains {
+    fn push(&mut self, ticket: DrainTicket) {
+        self.0.push(ticket);
+    }
+
+    /// Joins EVERY drain and returns the first failure.
+    ///
+    /// Never short-circuits on the first error, for two reasons. (1) A posted drain runs to
+    /// completion on the transport thread whatever this thread does, and it is that drain — not
+    /// this code — that performs the exactly-once `drop_parked` releasing its destination's
+    /// claim on the parked fragment (nixl_transport.rs:669 on success, :306-317 on failure);
+    /// abandoning a sibling would only lose its outcome, never cancel it. (2) The FE must see a
+    /// failure whichever destination produced it. Every failure is logged; the first is returned.
+    fn join(self) -> std::result::Result<(), String> {
+        let mut first = None;
+        for ticket in self.0 {
+            if let Err(err) = ticket.join() {
+                tracing::error!(error = %err, "a remote destination's drain failed");
+                first.get_or_insert(err);
+            }
+        }
+        first.map_or(Ok(()), Err)
+    }
+}
+
+/// What processing one fragment produced: the receivers whose sender sets it completed, and the
+/// remote drains it posted. The two are deliberately separate so a caller can dispatch the
+/// receivers *before* it joins the drains.
+#[must_use]
+#[derive(Debug, Default)]
+struct FragmentOutcome {
+    ready: Vec<ReadyFragment>,
+    drains: SenderDrains,
+}
+
+impl FragmentOutcome {
+    /// A fragment that readied receivers but posted no remote drain.
+    fn from_ready(ready: Vec<ReadyFragment>) -> Self {
+        Self {
+            ready,
+            drains: SenderDrains::default(),
+        }
+    }
+
+    /// Joins the drains first, then yields the ready receivers — the shape the dispatch worker
+    /// needs.
+    ///
+    /// The worker is single-threaded and is itself the thread that would run those receivers, so
+    /// deferring the join there would buy no overlap; it would only move a drain failure out of
+    /// `run_ready_fragment`, which is where a fragment failure gets attributed to its query. The
+    /// overlap lives on the RPC path (`dispatch_then_join`), where the receiver runs on a
+    /// different thread from the one that joins. Dropping `ready` when a drain failed matches
+    /// the blocking loop this replaces: a sender that could not reach a remote destination has
+    /// already failed the query.
+    fn join_into_ready(self) -> std::result::Result<Vec<ReadyFragment>, String> {
+        self.drains.join()?;
+        Ok(self.ready)
+    }
 }
 
 /// Sirius compute-node implementation of StarRocks PInternalService.
@@ -190,6 +258,42 @@ impl SiriusComputeNodeService {
         self.ready_fragments.send(ready).map_err(|_| {
             "fragment dispatch worker has exited; cannot execute receiver fragment".to_string()
         })
+    }
+
+    /// Dispatches every receiver this fragment readied, THEN joins its remote drains.
+    ///
+    /// The order is the whole change: dispatch puts the receiver on the worker thread while the
+    /// transport thread is still draining this sender's remote destinations, instead of the
+    /// receiver waiting out the full (N-1)-destination drain first. The RPC still does not
+    /// return until every drain has been joined — the FE may only be told the sender succeeded
+    /// once each destination's copy is actually across the wire.
+    ///
+    /// A receiver dispatched here can now run concurrently with its own query's drains. That
+    /// costs nothing in correctness (its sender set was already complete, so it reads no data
+    /// the drains produce) but it does mean the parked batches of the not-yet-drained
+    /// destinations stay resident while it computes — the deliberate memory-for-latency trade.
+    fn dispatch_then_join(&self, outcome: FragmentOutcome) -> std::result::Result<(), String> {
+        let mut dispatch_error = None;
+        for ready in outcome.ready {
+            if let Err(err) = self.dispatch(ready) {
+                dispatch_error.get_or_insert(err);
+            }
+        }
+        // Joined unconditionally, even when dispatch failed: the drains are already in flight.
+        let drain_result = outcome.drains.join();
+        match (drain_result, dispatch_error) {
+            (Ok(()), None) => Ok(()),
+            (Ok(()), Some(dispatch)) => Err(dispatch),
+            // A drain failure names the destination and the transport fault, so it is the more
+            // useful cause to hand the FE; a dispatch failure only ever means "this CN is
+            // shutting down". Report the drain error, keep the other in the log.
+            (Err(drain), dispatch) => {
+                if let Some(dispatch) = dispatch {
+                    tracing::error!(error = %dispatch, "receiver dispatch also failed");
+                }
+                Err(drain)
+            }
+        }
     }
 }
 
@@ -493,10 +597,7 @@ impl SiriusComputeNodeService {
         Self::ensure_binary_protocol(protocol)?;
         let params = Self::deserialize_binary::<TExecPlanFragmentParams>(attachment)
             .map_err(|err| format!("failed to deserialize TExecPlanFragmentParams: {err}"))?;
-        for ready in self.core.process_fragment(&params)? {
-            self.dispatch(ready)?;
-        }
-        Ok(())
+        self.dispatch_then_join(self.core.process_fragment(&params)?)
     }
 
     /// Records one remote exchange frame in the rendezvous (or releases a canary lease), handing
@@ -577,7 +678,12 @@ impl ServiceCore {
         let id = Self::fragment_instance_id(&ready.params);
         let query_id = Self::query_id(&ready.params);
         let is_result_fragment = matches!(Self::is_mysql_result_sink(&ready.params), Ok(true));
-        match self.execute_ready_fragment(ready) {
+        // `join_into_ready` keeps this fragment's own remote drains inside this call, so a drain
+        // failure is attributed to the same query as any other failure of this fragment.
+        match self
+            .execute_ready_fragment(ready)
+            .and_then(FragmentOutcome::join_into_ready)
+        {
             Ok(next) => next,
             Err(error) => {
                 match (id, query_id) {
@@ -625,7 +731,7 @@ impl ServiceCore {
     fn process_fragment(
         &self,
         params: &TExecPlanFragmentParams,
-    ) -> std::result::Result<Vec<ReadyFragment>, String> {
+    ) -> std::result::Result<FragmentOutcome, String> {
         let params = self.resolve_descriptor_table(params)?;
         Self::dump_fragment(&params);
         // Survey mode: accept every fragment so the FE dispatches (and we dump) the whole
@@ -634,7 +740,7 @@ impl ServiceCore {
             if let Err(err) = self.translate_fragment_logged(&params) {
                 tracing::warn!(error = %err, "translate-only mode: accepting untranslatable fragment");
             }
-            return Ok(Vec::new());
+            return Ok(FragmentOutcome::default());
         }
         let expected_senders = Self::receiver_exchanges(&params)?;
         if !expected_senders.is_empty() {
@@ -645,11 +751,12 @@ impl ServiceCore {
                     .ok_or_else(|| "exchange receiver is missing a query_id".to_string())?;
                 self.results.reserve(fragment_instance_id, query_id);
             }
-            return Ok(self
-                .exchanges
-                .register_receiver(fragment_instance_id, expected_senders, params)?
-                .into_iter()
-                .collect());
+            return Ok(FragmentOutcome::from_ready(
+                self.exchanges
+                    .register_receiver(fragment_instance_id, expected_senders, params)?
+                    .into_iter()
+                    .collect(),
+            ));
         }
 
         let translated = self.translate_fragment_logged(&params)?;
@@ -713,7 +820,7 @@ impl ServiceCore {
         &self,
         params: &TExecPlanFragmentParams,
         translated: TranslatedPlan,
-    ) -> std::result::Result<Vec<ReadyFragment>, String> {
+    ) -> std::result::Result<FragmentOutcome, String> {
         self.execute_fragment_with_inputs(params, translated, Vec::new(), Vec::new())
     }
 
@@ -721,14 +828,14 @@ impl ServiceCore {
     /// for its local receiver (transmitting it when the receiver is remote). `inputs` names the
     /// parked sender outputs this fragment consumes; `remote_inputs` the staged remote batches.
     /// A sender that completes its receiver's sender set returns that receiver for the caller
-    /// to run or dispatch.
+    /// to run or dispatch, alongside the remote drains the caller must join.
     fn execute_fragment_with_inputs(
         &self,
         params: &TExecPlanFragmentParams,
         translated: TranslatedPlan,
         inputs: Vec<(i32, Vec<SenderSlot>)>,
         remote_inputs: Vec<(i32, i32, Vec<StagedBatch>)>,
-    ) -> std::result::Result<Vec<ReadyFragment>, String> {
+    ) -> std::result::Result<FragmentOutcome, String> {
         if Self::is_mysql_result_sink(params)? {
             let id = Self::fragment_instance_id(params).ok_or_else(|| {
                 "RESULT_SINK fragment is missing a fragment_instance_id".to_string()
@@ -746,18 +853,38 @@ impl ServiceCore {
                 .ok_or_else(|| "result fragment returned no rows".to_string())?;
             let batch = result_encoder::MysqlResultEncoder::encode(&result.batches, 0)?;
             self.results.insert(id, batch);
-            return Ok(Vec::new());
+            return Ok(FragmentOutcome::default());
         }
 
-        let Some(stream_sink) = params
+        let Some(sink) = params
             .fragment
             .as_ref()
             .and_then(|fragment| fragment.output_sink.as_ref())
-            .filter(|sink| sink.type_ == TDataSinkType::DATA_STREAM_SINK)
-            .and_then(|sink| sink.stream_sink.as_ref())
         else {
-            return Ok(Vec::new());
+            // The FE attaches a sink to every fragment it dispatches (PlanFragment.toThrift),
+            // so a sinkless fragment only reaches here from a translate-only fixture.
+            tracing::warn!(
+                fragment = %Self::fragment_context(params),
+                "fragment carries no output sink; nothing consumes its output"
+            );
+            return Ok(FragmentOutcome::default());
         };
+        // Accepting an unhandled sink discards the fragment's whole output: its consumers wait
+        // forever, the FE's fetch_data long-poll times out, and its serial channel wedges
+        // cluster-wide. Refuse by name so the FE error says which plan shape is unsupported.
+        if sink.type_ != TDataSinkType::DATA_STREAM_SINK {
+            return Err(format!(
+                "{} carries a {} output sink, which this CN does not support",
+                Self::fragment_context(params),
+                Self::data_sink_type_name(sink.type_)
+            ));
+        }
+        let stream_sink = sink.stream_sink.as_ref().ok_or_else(|| {
+            format!(
+                "{} carries a DATA_STREAM_SINK with no stream_sink payload",
+                Self::fragment_context(params)
+            )
+        })?;
         if stream_sink.limit.is_some_and(|limit| limit >= 0) {
             return Err("data stream sink limits are not supported".to_string());
         }
@@ -882,23 +1009,44 @@ impl ServiceCore {
                 ready_receivers.extend(ready);
             }
         }
-        // Remote destinations second: each send drains its own output stream and blocks this
-        // (already-blocking) RPC thread until that destination's copy crossed the wire.
+        // Remote destinations second: POST each drain and keep its ticket instead of blocking
+        // here. The caller dispatches `ready_receivers` first and joins the tickets after, so a
+        // local receiver whose sender set this push just completed starts while the transport
+        // thread is still draining this CN's remote destinations — measured, that wait was
+        // 3 x 30 ms per CN on q14 SF500's 948 MB/destination stage.
+        //
+        // ORDER IS UNCHANGED, and deliberately so: one FIFO request channel into ONE transport
+        // thread that still handles `SendFragment` inline means the drains still run one at a
+        // time, in the FE's destination order, with every frame of a destination issued by that
+        // single thread. `seq`, eos, and the exactly-once `drop_parked` all stay inside the
+        // transport thread's own drain loop, so the receiver's per-(exchange, sender) gap check
+        // (local_exchange.rs:180-197) sees exactly the byte sequence it sees today.
+        let mut drains = SenderDrains::default();
         for (slot, route) in slots.iter().zip(&routes) {
             if let DestinationRoute::Remote { host, brpc_port } = route {
                 let transport = self.transport.as_ref().expect("routed before running");
-                let brpc_port = u16::try_from(*brpc_port).map_err(|_| {
-                    format!("destination brpc port {brpc_port} is not a valid TCP port")
-                })?;
-                transport.send_fragment(RemoteSendSpec {
+                let spec = RemoteSendSpec {
                     host: host.clone(),
-                    brpc_port,
+                    brpc_port: *brpc_port,
                     slot: *slot,
                     names: translated.output_names.clone(),
-                })?;
+                };
+                match transport.start_fragment(spec) {
+                    Ok(ticket) => drains.push(ticket),
+                    // Posting failed (the transport is shutting down). Join what is already in
+                    // flight before unwinding: a ticket dropped un-joined discards a real drain
+                    // failure, and this is the one path where tickets exist and `?` could fire.
+                    Err(err) => {
+                        let _ = drains.join();
+                        return Err(err);
+                    }
+                }
             }
         }
-        Ok(ready_receivers)
+        Ok(FragmentOutcome {
+            ready: ready_receivers,
+            drains,
+        })
     }
 
     /// Classifies a data-stream sink destination against this CN's advertised exchange
@@ -919,7 +1067,12 @@ impl ServiceCore {
         } else {
             Ok(DestinationRoute::Remote {
                 host: brpc_server.hostname.clone(),
-                brpc_port: brpc_server.port,
+                brpc_port: u16::try_from(brpc_server.port).map_err(|_| {
+                    format!(
+                        "destination brpc port {} is not a valid TCP port",
+                        brpc_server.port
+                    )
+                })?,
             })
         }
     }
@@ -976,7 +1129,7 @@ impl ServiceCore {
     fn execute_ready_fragment(
         &self,
         ready: ReadyFragment,
-    ) -> std::result::Result<Vec<ReadyFragment>, String> {
+    ) -> std::result::Result<FragmentOutcome, String> {
         let exchange_inputs = ready
             .inputs
             .iter()
@@ -1150,6 +1303,45 @@ impl ServiceCore {
         }
     }
 
+    /// Names a thrift sink type for an operator. The generated type is a newtype over the wire
+    /// number, so its `Debug` prints `TDataSinkType(7)` — useless in an FE error message.
+    fn data_sink_type_name(sink_type: TDataSinkType) -> String {
+        let name = match sink_type {
+            TDataSinkType::DATA_STREAM_SINK => "DATA_STREAM_SINK",
+            TDataSinkType::RESULT_SINK => "RESULT_SINK",
+            TDataSinkType::DATA_SPLIT_SINK => "DATA_SPLIT_SINK",
+            TDataSinkType::MYSQL_TABLE_SINK => "MYSQL_TABLE_SINK",
+            TDataSinkType::EXPORT_SINK => "EXPORT_SINK",
+            TDataSinkType::OLAP_TABLE_SINK => "OLAP_TABLE_SINK",
+            TDataSinkType::MEMORY_SCRATCH_SINK => "MEMORY_SCRATCH_SINK",
+            TDataSinkType::MULTI_CAST_DATA_STREAM_SINK => "MULTI_CAST_DATA_STREAM_SINK",
+            TDataSinkType::SCHEMA_TABLE_SINK => "SCHEMA_TABLE_SINK",
+            TDataSinkType::ICEBERG_TABLE_SINK => "ICEBERG_TABLE_SINK",
+            TDataSinkType::HIVE_TABLE_SINK => "HIVE_TABLE_SINK",
+            TDataSinkType::TABLE_FUNCTION_TABLE_SINK => "TABLE_FUNCTION_TABLE_SINK",
+            TDataSinkType::BLACKHOLE_TABLE_SINK => "BLACKHOLE_TABLE_SINK",
+            TDataSinkType::DICTIONARY_CACHE_SINK => "DICTIONARY_CACHE_SINK",
+            TDataSinkType::MULTI_OLAP_TABLE_SINK => "MULTI_OLAP_TABLE_SINK",
+            TDataSinkType::SPLIT_DATA_STREAM_SINK => "SPLIT_DATA_STREAM_SINK",
+            TDataSinkType::NOOP_SINK => "NOOP_SINK",
+            TDataSinkType::ICEBERG_DELETE_SINK => "ICEBERG_DELETE_SINK",
+            other => return format!("unknown (wire value {})", other.0),
+        };
+        name.to_string()
+    }
+
+    /// Renders the ids that let an operator tie an error back to one FE-dispatched fragment.
+    fn fragment_context(params: &TExecPlanFragmentParams) -> String {
+        match (Self::fragment_instance_id(params), Self::query_id(params)) {
+            (Some(instance), Some(query)) => {
+                format!("fragment instance {instance} of query {query}")
+            }
+            (Some(instance), _) => format!("fragment instance {instance}"),
+            (None, Some(query)) => format!("an unidentified instance of query {query}"),
+            (None, None) => "an unidentified fragment instance".to_string(),
+        }
+    }
+
     /// Extracts the fragment instance id the FE later passes to `fetch_data`.
     fn fragment_instance_id(params: &TExecPlanFragmentParams) -> Option<FragmentInstanceId> {
         params
@@ -1208,13 +1400,15 @@ impl SiriusComputeNodeService {
                 params.resource_info = common.resource_info.clone();
             }
 
-            for ready in self
+            let outcome = self
                 .core
                 .process_fragment(&params)
-                .map_err(|err| format!("fragment {idx}: {err}"))?
-            {
-                self.dispatch(ready)?;
-            }
+                .map_err(|err| format!("fragment {idx}: {err}"))?;
+            // Per instance, exactly like the single-attachment path: a batch instance's drains
+            // are joined before the next instance is processed, so instance ordering — and the
+            // `fragment {idx}` attribution of a failure — is unchanged.
+            self.dispatch_then_join(outcome)
+                .map_err(|err| format!("fragment {idx}: {err}"))?;
         }
 
         Ok(())
@@ -1898,7 +2092,8 @@ mod tests {
                     respond.send(Ok(())).unwrap();
                     spec
                 }
-                crate::nixl_transport::TransportRequest::ExchangeMd { .. } => {
+                crate::nixl_transport::TransportRequest::ExchangeMd { .. }
+                | crate::nixl_transport::TransportRequest::WarmSession { .. } => {
                     panic!("the sender flow never exchanges metadata itself")
                 }
             }
@@ -1985,6 +2180,335 @@ mod tests {
             "{:?}",
             result.status.error_msgs
         );
+    }
+
+    /// A destination on another CN: same host, a different brpc port.
+    fn remote_destination(receiver_id: TUniqueId, brpc_port: i32) -> TPlanFragmentDestination {
+        TPlanFragmentDestination::new(
+            receiver_id,
+            None,
+            Some(TNetworkAddress::new("127.0.0.1".to_string(), brpc_port)),
+            None,
+        )
+    }
+
+    /// Flips a flag when a *receiver* run happens, so a fake transport can observe whether the
+    /// receiver got to run while a drain was still in flight.
+    #[derive(Debug)]
+    struct ReceiverSignalExecutor {
+        receiver_ran: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl FragmentExecutor for ReceiverSignalExecutor {
+        fn run(&self, run: FragmentRun<'_>) -> Result<Option<FragmentResult>, String> {
+            if is_receiver_run(&run) {
+                self.receiver_ran.store(true, Ordering::SeqCst);
+            }
+            StubExecutor.run(run)
+        }
+    }
+
+    /// Collects the specs a fake transport was handed, answering each with `outcome`.
+    ///
+    /// `recv_timeout` rather than `recv`: a regression that stops posting a drain must fail the
+    /// test, never hang the suite.
+    fn drain_specs(
+        requests: mpsc::Receiver<crate::nixl_transport::TransportRequest>,
+        mut outcome: impl FnMut(usize) -> Result<(), String>,
+    ) -> Vec<RemoteSendSpec> {
+        let mut specs = Vec::new();
+        while let Ok(request) =
+            requests.recv_timeout(std::time::Duration::from_millis(if specs.is_empty() {
+                10_000
+            } else {
+                1_000
+            }))
+        {
+            match request {
+                crate::nixl_transport::TransportRequest::SendFragment { spec, respond } => {
+                    let _ = respond.send(outcome(specs.len()));
+                    specs.push(spec);
+                }
+                _ => panic!("the sender flow only posts drains"),
+            }
+        }
+        specs
+    }
+
+    #[test]
+    fn local_receiver_is_dispatched_before_the_remote_drains_complete() {
+        // B3: a local receiver whose sender set this CN's own push just completed used to wait
+        // out this CN's entire sequential remote drain before it could start. The fake transport
+        // holds its drain open until the receiver has run — which can only happen if the sender's
+        // RPC thread dispatched the receiver BEFORE joining the drain. Against the blocking loop
+        // this deadlocks until the bounded wait fires and the RPC reports the timeout.
+        let receiver_ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (requests_tx, requests_rx) = mpsc::channel();
+        let observed = Arc::clone(&receiver_ran);
+        let fake_transport = std::thread::spawn(move || {
+            let request = requests_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("the sender posts one remote drain");
+            let crate::nixl_transport::TransportRequest::SendFragment { respond, .. } = request
+            else {
+                panic!("the sender flow only posts drains");
+            };
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !observed.load(Ordering::SeqCst) {
+                if std::time::Instant::now() >= deadline {
+                    let _ = respond.send(Err(
+                        "the local receiver never ran while the drain was in flight".to_string(),
+                    ));
+                    return false;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            respond.send(Ok(())).unwrap();
+            true
+        });
+        let service = SiriusComputeNodeService::with_transport(
+            Arc::new(ReceiverSignalExecutor {
+                receiver_ran: Arc::clone(&receiver_ran),
+            }),
+            test_identity(),
+            Some(crate::nixl_transport::NixlTransport::for_test(requests_tx)),
+        );
+
+        let query_id = TUniqueId::new(60, 1);
+        let local_receiver_id = TUniqueId::new(60, 2);
+        let mut receiver = fragment_params(Some(exchange_plan(7, 0)), Some(desc_table()));
+        receiver.fragment.as_mut().unwrap().output_sink = Some(result_sink());
+        let mut receiver_exec = exec_params(query_id.clone(), local_receiver_id.clone());
+        receiver_exec.per_exch_num_senders.insert(7, 1);
+        receiver.params = Some(receiver_exec);
+        assert_exec_ok(&service, &receiver);
+
+        // One local destination (the registered receiver above) and one remote destination.
+        let mut sender = fragment_params(Some(scan_plan(0, 0)), Some(desc_table()));
+        sender.fragment.as_mut().unwrap().output_sink = Some(data_stream_sink(7));
+        let mut sender_exec = exec_params(query_id, TUniqueId::new(60, 3));
+        sender_exec.sender_id = Some(0);
+        sender_exec.destinations = Some(vec![
+            local_destination(local_receiver_id),
+            remote_destination(TUniqueId::new(60, 4), 8061),
+        ]);
+        sender.params = Some(sender_exec);
+        assert_exec_ok(&service, &sender);
+
+        assert!(
+            fake_transport.join().unwrap(),
+            "the drain never saw the local receiver run: the RPC thread joined it first"
+        );
+    }
+
+    #[test]
+    fn every_remote_destination_is_drained_even_after_one_fails() {
+        // The drains are posted up front and joined afterwards, so a failure on the first
+        // destination must not orphan the rest: each posted drain still owns the exactly-once
+        // drop_parked that releases its claim on the parked fragment. The blocking loop returned
+        // on the first error and never posted the second destination at all.
+        let (requests_tx, requests_rx) = mpsc::channel();
+        let fake_transport = std::thread::spawn(move || {
+            drain_specs(requests_rx, |index| {
+                if index == 0 {
+                    Err("nixl WRITE timed out".to_string())
+                } else {
+                    Ok(())
+                }
+            })
+        });
+        let service = SiriusComputeNodeService::with_transport(
+            Arc::new(CountingExecutor::default()),
+            test_identity(),
+            Some(crate::nixl_transport::NixlTransport::for_test(requests_tx)),
+        );
+
+        let mut sender = fragment_params(Some(scan_plan(0, 0)), Some(desc_table()));
+        sender.fragment.as_mut().unwrap().output_sink = Some(data_stream_sink(7));
+        let mut sender_exec = exec_params(TUniqueId::new(61, 1), TUniqueId::new(61, 2));
+        sender_exec.sender_id = Some(0);
+        sender_exec.destinations = Some(vec![
+            remote_destination(TUniqueId::new(61, 3), 8061),
+            remote_destination(TUniqueId::new(61, 4), 8062),
+        ]);
+        sender.params = Some(sender_exec);
+
+        let response = route(
+            &service,
+            methods::EXEC_PLAN_FRAGMENT,
+            PExecPlanFragmentRequest {
+                attachment_protocol: Some("binary".to_string()),
+            }
+            .encode_to_vec(),
+            serialize_binary(&sender),
+        );
+        let result = PExecPlanFragmentResult::decode(response.body.as_slice()).unwrap();
+        // The first destination's failure is what the FE sees.
+        assert_eq!(result.status.status_code, TStatusCode::INTERNAL_ERROR.0);
+        assert!(
+            result.status.error_msgs[0].contains("nixl WRITE timed out"),
+            "{:?}",
+            result.status.error_msgs
+        );
+        let specs = fake_transport.join().unwrap();
+        assert_eq!(
+            specs.len(),
+            2,
+            "the second destination's drain was never posted: {specs:?}"
+        );
+    }
+
+    #[test]
+    fn remote_drains_are_posted_once_per_destination_in_the_fes_order() {
+        // Per-destination frame ordering is the invariant the receiver enforces
+        // (local_exchange.rs:180-197 fails a query on a seq gap per exchange+sender). It holds
+        // because each destination is drained exactly once, by one thread, and the drains are
+        // posted to a FIFO channel in the FE's destination order. Pin all three properties.
+        let (requests_tx, requests_rx) = mpsc::channel();
+        let fake_transport = std::thread::spawn(move || drain_specs(requests_rx, |_| Ok(())));
+        let service = SiriusComputeNodeService::with_transport(
+            Arc::new(CountingExecutor::default()),
+            test_identity(),
+            Some(crate::nixl_transport::NixlTransport::for_test(requests_tx)),
+        );
+
+        let receivers = [
+            TUniqueId::new(62, 3),
+            TUniqueId::new(62, 4),
+            TUniqueId::new(62, 5),
+        ];
+        let mut sender = fragment_params(Some(scan_plan(0, 0)), Some(desc_table()));
+        sender.fragment.as_mut().unwrap().output_sink = Some(data_stream_sink(7));
+        let mut sender_exec = exec_params(TUniqueId::new(62, 1), TUniqueId::new(62, 2));
+        sender_exec.sender_id = Some(0);
+        sender_exec.destinations = Some(
+            receivers
+                .iter()
+                .enumerate()
+                .map(|(index, id)| remote_destination(id.clone(), 8061 + index as i32))
+                .collect(),
+        );
+        sender.params = Some(sender_exec);
+        assert_exec_ok(&service, &sender);
+
+        let specs = fake_transport.join().unwrap();
+        assert_eq!(specs.len(), 3, "one drain per destination: {specs:?}");
+        for (index, (spec, receiver)) in specs.iter().zip(&receivers).enumerate() {
+            assert_eq!(
+                spec.slot.fragment_instance_id,
+                FragmentInstanceId::from(receiver),
+                "destination {index} drained out of order: {specs:?}"
+            );
+            assert_eq!(spec.brpc_port, 8061 + index as u16);
+            assert_eq!(spec.slot.node_id, 7);
+            assert_eq!(spec.slot.sender_id, 0);
+        }
+    }
+
+    #[test]
+    fn the_sender_rpc_reports_ok_only_after_every_drain_has_finished() {
+        // Posting a drain is not sending it. "OK" to the FE still means every destination's copy
+        // — batches AND the eos frame that completes this sender in the peer's rendezvous — is
+        // across the wire, so every ticket must be joined before the RPC returns.
+        let (requests_tx, requests_rx) = mpsc::channel();
+        let all_drained = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = Arc::clone(&all_drained);
+        let fake_transport = std::thread::spawn(move || {
+            let mut pending = Vec::new();
+            while pending.len() < 2 {
+                let request = requests_rx
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .expect("both drains are posted");
+                let crate::nixl_transport::TransportRequest::SendFragment { respond, .. } = request
+                else {
+                    panic!("the sender flow only posts drains");
+                };
+                pending.push(respond);
+            }
+            // Answer the first at once and stall the second: a ticket that was dropped instead
+            // of joined would let the RPC return during this window.
+            let _ = pending.remove(0).send(Ok(()));
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            flag.store(true, Ordering::SeqCst);
+            let _ = pending.remove(0).send(Ok(()));
+        });
+        let service = SiriusComputeNodeService::with_transport(
+            Arc::new(CountingExecutor::default()),
+            test_identity(),
+            Some(crate::nixl_transport::NixlTransport::for_test(requests_tx)),
+        );
+
+        let mut sender = fragment_params(Some(scan_plan(0, 0)), Some(desc_table()));
+        sender.fragment.as_mut().unwrap().output_sink = Some(data_stream_sink(7));
+        let mut sender_exec = exec_params(TUniqueId::new(63, 1), TUniqueId::new(63, 2));
+        sender_exec.sender_id = Some(0);
+        sender_exec.destinations = Some(vec![
+            remote_destination(TUniqueId::new(63, 3), 8061),
+            remote_destination(TUniqueId::new(63, 4), 8062),
+        ]);
+        sender.params = Some(sender_exec);
+        assert_exec_ok(&service, &sender);
+
+        assert!(
+            all_drained.load(Ordering::SeqCst),
+            "the sender RPC returned OK while a drain was still in flight"
+        );
+        fake_transport.join().unwrap();
+    }
+
+    #[test]
+    fn joining_drains_waits_for_every_ticket_and_reports_the_first_failure() {
+        let slot = |sender_id| SenderSlot {
+            fragment_instance_id: FragmentInstanceId::from(&TUniqueId::new(64, 1)),
+            node_id: 7,
+            sender_id,
+        };
+        let (first_tx, first_rx) = mpsc::channel();
+        let (second_tx, second_rx) = mpsc::channel();
+        let (third_tx, third_rx) = mpsc::channel();
+        let mut drains = SenderDrains::default();
+        drains.push(crate::nixl_transport::DrainTicket::for_test(
+            "127.0.0.1:8061",
+            slot(0),
+            first_rx,
+        ));
+        drains.push(crate::nixl_transport::DrainTicket::for_test(
+            "127.0.0.1:8062",
+            slot(1),
+            second_rx,
+        ));
+        drains.push(crate::nixl_transport::DrainTicket::for_test(
+            "127.0.0.1:8063",
+            slot(2),
+            third_rx,
+        ));
+        first_tx.send(Ok(())).unwrap();
+        second_tx
+            .send(Err("nixl WRITE timed out".to_string()))
+            .unwrap();
+
+        // The last ticket answers late: if join short-circuited on the second ticket's failure it
+        // would return before this fires, leaving a sibling drain's outcome unread.
+        let reached_last = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = Arc::clone(&reached_last);
+        let late = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            flag.store(true, Ordering::SeqCst);
+            third_tx
+                .send(Err("peer refused the lease".to_string()))
+                .unwrap();
+        });
+
+        let error = drains.join().expect_err("two of three drains failed");
+        assert!(
+            reached_last.load(Ordering::SeqCst),
+            "join returned before the last ticket was joined"
+        );
+        assert!(
+            error.contains("nixl WRITE timed out"),
+            "the first failure is the one reported: {error}"
+        );
+        late.join().unwrap();
     }
 
     /// Records what the executor was asked to do on the remote-ingest path.
@@ -2596,6 +3120,64 @@ mod tests {
         );
     }
 
+    #[test]
+    fn exec_plan_fragment_rejects_unhandled_output_sink() {
+        // Accepting a sink this CN does not implement would discard the fragment's output and
+        // hang every consumer; the dispatch must fail and name the sink. MULTI_CAST_DATA_STREAM_
+        // SINK is the real case (CTE reuse), so it stands in for the whole class here.
+        let service = SiriusComputeNodeService::new();
+        let mut params = supported_fragment();
+        params.fragment.as_mut().unwrap().output_sink =
+            Some(sink_of_type(TDataSinkType::MULTI_CAST_DATA_STREAM_SINK));
+        params.params = Some(exec_params(TUniqueId::new(0, 11), TUniqueId::new(0, 12)));
+
+        let response = route(
+            &service,
+            methods::EXEC_PLAN_FRAGMENT,
+            PExecPlanFragmentRequest {
+                attachment_protocol: Some("binary".to_string()),
+            }
+            .encode_to_vec(),
+            serialize_binary(&params),
+        );
+        let result = PExecPlanFragmentResult::decode(response.body.as_slice()).unwrap();
+        assert_eq!(result.status.status_code, TStatusCode::INTERNAL_ERROR.0);
+        assert!(
+            result.status.error_msgs[0].contains("MULTI_CAST_DATA_STREAM_SINK")
+                && result.status.error_msgs[0].contains("does not support"),
+            "{:?}",
+            result.status.error_msgs
+        );
+    }
+
+    #[test]
+    fn exec_plan_fragment_rejects_data_stream_sink_without_payload() {
+        // A DATA_STREAM_SINK with no stream_sink payload has no destinations to route to; it is
+        // a malformed dispatch, not a fragment whose output may be dropped.
+        let service = SiriusComputeNodeService::new();
+        let mut params = supported_fragment();
+        params.fragment.as_mut().unwrap().output_sink =
+            Some(sink_of_type(TDataSinkType::DATA_STREAM_SINK));
+        params.params = Some(exec_params(TUniqueId::new(0, 13), TUniqueId::new(0, 14)));
+
+        let response = route(
+            &service,
+            methods::EXEC_PLAN_FRAGMENT,
+            PExecPlanFragmentRequest {
+                attachment_protocol: Some("binary".to_string()),
+            }
+            .encode_to_vec(),
+            serialize_binary(&params),
+        );
+        let result = PExecPlanFragmentResult::decode(response.body.as_slice()).unwrap();
+        assert_eq!(result.status.status_code, TStatusCode::INTERNAL_ERROR.0);
+        assert!(
+            result.status.error_msgs[0].contains("no stream_sink payload"),
+            "{:?}",
+            result.status.error_msgs
+        );
+    }
+
     #[tokio::test]
     async fn get_file_schema_attachment_infers_across_multiple_ranges() {
         let message = "message m { optional int64 a; optional binary b (UTF8); }";
@@ -2768,23 +3350,14 @@ mod tests {
 
     fn result_sink() -> TDataSink {
         // Only the sink type is read today (is_result_sink); the per-sink payloads stay None.
+        sink_of_type(TDataSinkType::RESULT_SINK)
+    }
+
+    /// A sink carrying nothing but its type, for the paths that only classify the type.
+    fn sink_of_type(sink_type: TDataSinkType) -> TDataSink {
         TDataSink::new(
-            TDataSinkType::RESULT_SINK,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
+            sink_type, None, None, None, None, None, None, None, None, None, None, None, None,
+            None, None, None,
         )
     }
 

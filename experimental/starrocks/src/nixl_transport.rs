@@ -12,11 +12,17 @@
 //! `transmit_packed{eos}` closes the sender on the peer's rendezvous. EOS and sender-set
 //! completion stay on brpc — one source of truth.
 
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Sender, channel};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use crate::fragment_executor::SenderSlot;
+use crate::prpc_client::PrpcClient;
+
+/// Bring-up pre-establishment of the peer sessions; see the module for why it exists.
+#[cfg(feature = "nixl-transport")]
+mod warmup;
 
 /// A bare `nixl_capi_is_stub()` build would dlopen-fail at agent creation; every startup error
 /// message points here so the fix is discoverable.
@@ -57,12 +63,104 @@ pub(crate) enum TransportRequest {
         peer_metadata: Vec<u8>,
         respond: Sender<Result<MdReply, String>>,
     },
-    /// Drain one parked sender output to a remote receiver (blocking the requesting RPC thread
-    /// until every batch and the eos have been transmitted, exactly like the engine pattern).
+    /// Drain one parked sender output to a remote receiver. Handled inline on the transport
+    /// thread, one drain at a time; `respond` fires once every batch and the eos have been
+    /// transmitted, and the requester decides when to wait for it (see [`DrainTicket`]).
     SendFragment {
         spec: RemoteSendSpec,
         respond: Sender<Result<(), String>>,
     },
+    /// Install one peer session whose metadata handshake the [`warmup`] thread already ran off
+    /// this thread; only the agent-local load and the bandwidth canary happen here. Idempotent.
+    WarmSession {
+        host: String,
+        brpc_port: u16,
+        client: PrpcClient,
+        peer: MdReply,
+        respond: Sender<Result<(), String>>,
+    },
+}
+
+/// The bring-up session warmup thread and its stop flag; see the [`warmup`] module.
+#[cfg_attr(not(feature = "nixl-transport"), allow(dead_code))]
+#[derive(Debug)]
+pub(crate) struct SessionWarmup {
+    stop: Arc<AtomicBool>,
+    thread: JoinHandle<()>,
+}
+
+impl SessionWarmup {
+    /// Asks the warmup thread to stop and joins it. An attempt already in flight still has to
+    /// finish its brpc call (bounded by `PrpcClient`'s reply timeout); `main`'s shutdown grace
+    /// timer is the backstop.
+    fn stop_and_join(self) {
+        self.stop.store(true, Ordering::Relaxed);
+        let _ = self.thread.join();
+    }
+}
+
+/// One posted remote drain, and the channel its outcome arrives on.
+///
+/// The transport thread owns the whole drain once the request is queued — every batch frame, the
+/// eos frame, and the exactly-once `drop_parked` that releases that destination's claim on the
+/// parked fragment. So dropping a ticket cancels nothing; it only throws away the one error the
+/// FE would have seen. [`join`](Self::join) is the sanctioned consumer and `Drop` shouts if
+/// anything else gets there first.
+#[must_use = "an unjoined drain ticket silently discards the drain's failure"]
+#[derive(Debug)]
+#[cfg_attr(not(feature = "nixl-transport"), allow(dead_code))]
+pub(crate) struct DrainTicket {
+    /// Peer `host:port`, for the message when a drain fails or a ticket leaks.
+    destination: String,
+    /// Destination this drain serves; identifies it in logs.
+    slot: SenderSlot,
+    /// `None` once joined, which is how `Drop` tells a leak from a normal consume.
+    outcome: Option<std::sync::mpsc::Receiver<Result<(), String>>>,
+}
+
+impl DrainTicket {
+    /// Blocks until this destination's drain has transmitted every batch and its eos frame.
+    pub(crate) fn join(mut self) -> Result<(), String> {
+        self.outcome
+            .take()
+            .expect("a drain ticket is joined exactly once")
+            .recv()
+            .map_err(|_| {
+                format!(
+                    "nixl transport thread dropped the response for the drain to {} ({:?})",
+                    self.destination, self.slot
+                )
+            })?
+    }
+
+    /// Test seam: a ticket whose outcome the test drives directly.
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        destination: &str,
+        slot: SenderSlot,
+        outcome: std::sync::mpsc::Receiver<Result<(), String>>,
+    ) -> Self {
+        Self {
+            destination: destination.to_string(),
+            slot,
+            outcome: Some(outcome),
+        }
+    }
+}
+
+impl Drop for DrainTicket {
+    fn drop(&mut self) {
+        if self.outcome.is_some() {
+            // Not fatal — the transport thread still finishes the drain and still releases the
+            // slot — but a failure that never reaches the FE would look like a hung query, so
+            // make the leak loud rather than let it hide.
+            tracing::error!(
+                destination = %self.destination,
+                slot = ?self.slot,
+                "a remote drain ticket was dropped without being joined; its outcome is lost"
+            );
+        }
+    }
 }
 
 /// Handle to the transport thread. Constructible only with the `nixl-transport` feature (via
@@ -75,6 +173,8 @@ pub struct NixlTransport {
     requests: Mutex<Option<Sender<TransportRequest>>>,
     /// Transport thread handle, taken and joined on drop.
     thread: Mutex<Option<JoinHandle<()>>>,
+    /// Bring-up peer-session warmup; `None` when it is disabled or this build has no nixl.
+    warmup: Mutex<Option<SessionWarmup>>,
 }
 
 impl NixlTransport {
@@ -109,10 +209,35 @@ impl NixlTransport {
         })
     }
 
-    /// Transmits one parked sender output to a remote receiver, blocking until the eos frame is
-    /// acknowledged (or failing loudly — the caller propagates the error to the FE).
-    pub(crate) fn send_fragment(&self, spec: RemoteSendSpec) -> Result<(), String> {
-        self.transport_call(|respond| TransportRequest::SendFragment { spec, respond })
+    /// Queues one parked sender output for transmission to a remote receiver and returns at
+    /// once, handing back the [`DrainTicket`] its outcome arrives on.
+    ///
+    /// The drain itself is unchanged: ONE transport thread still services `SendFragment`
+    /// inline, so the drains it is handed run one at a time, in the order they were posted, and
+    /// every frame of a destination is still issued by that single thread. What changes is who
+    /// waits — the caller can dispatch a ready local receiver before joining, instead of the
+    /// receiver waiting out this CN's whole (N-1)-destination drain.
+    ///
+    /// ORDERING (the invariant the receiver enforces): `local_exchange.rs:180-197` fails a query
+    /// on a `seq` gap per (exchange key, sender ordinal). Both the counter and the eos frame live
+    /// inside the transport thread's `send_fragment`, which this does not touch, and the request
+    /// channel is FIFO — so the wire sequence is byte-identical to the blocking loop's.
+    pub(crate) fn start_fragment(&self, spec: RemoteSendSpec) -> Result<DrainTicket, String> {
+        let (respond, outcome) = channel();
+        let destination = format!("{}:{}", spec.host, spec.brpc_port);
+        let slot = spec.slot;
+        self.requests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .ok_or_else(|| "nixl transport is shutting down".to_string())?
+            .send(TransportRequest::SendFragment { spec, respond })
+            .map_err(|_| "nixl transport thread is not running".to_string())?;
+        Ok(DrainTicket {
+            destination,
+            slot,
+            outcome: Some(outcome),
+        })
     }
 
     /// Test seam: a handle whose requests land on `requests` instead of a real transport thread.
@@ -121,12 +246,23 @@ impl NixlTransport {
         Self {
             requests: Mutex::new(Some(requests)),
             thread: Mutex::new(None),
+            warmup: Mutex::new(None),
         }
     }
 }
 
 impl Drop for NixlTransport {
     fn drop(&mut self) {
+        // Stop the warmup first: it holds its own clone of the request sender, and the transport
+        // thread's `recv()` only returns once every sender is gone.
+        if let Some(warmup) = self
+            .warmup
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        {
+            warmup.stop_and_join();
+        }
         // Close the request channel so the thread's `recv()` returns, then join for an ordered
         // teardown (the thread holds an executor handle that must release before the engine).
         self.requests
@@ -162,13 +298,13 @@ mod agent_tier {
     use tracing::{info, warn};
 
     use super::*;
+    use crate::FeConfig;
     use crate::fragment_executor::FragmentExecutor;
     use crate::proto::starrocks::p_internal_service_brpc::methods;
     use crate::proto::starrocks::{
         PExchangeNixlMd, PExchangeNixlMdResult, PStagingLeaseRequest, PStagingLeaseResult,
         PTransmitPackedParams, PTransmitPackedResult, PUniqueId, StatusPb,
     };
-    use crate::prpc_client::PrpcClient;
 
     /// Bytes of the mandatory first-contact bandwidth canary (finding F1): pool memory over
     /// cuda_ipc silently degrades ~220x with correct bytes, so a slow link must be refused, not
@@ -188,21 +324,34 @@ mod agent_tier {
         /// `agent_name`, UCX backend, and the executor's staging arena registered as VRAM.
         /// Blocks until the agent is ready — or bring-up fails — so a missing libnixl, plugin
         /// dir, or arena surfaces here, before any cross-node query is accepted.
+        ///
+        /// Then starts the [`warmup`](super::warmup) thread, which discovers this CN's peers
+        /// through `fe` and pre-establishes every directed session off the query path. That is
+        /// best-effort: a warmup failure is loud but never fails bring-up, because a cold peer
+        /// still works (slowly) through [`TransportState::ensure_session`].
         pub fn start(
             executor: Arc<dyn FragmentExecutor>,
             agent_name: String,
+            fe: FeConfig,
         ) -> Result<Self, String> {
             let (request_tx, request_rx) = channel::<TransportRequest>();
-            let (ready_tx, ready_rx) = channel::<Result<(), String>>();
+            // The agent's serialized metadata comes back out of bring-up because the warmup
+            // thread sends it to peers itself, without borrowing the transport thread.
+            let (ready_tx, ready_rx) = channel::<Result<Vec<u8>, String>>();
+            let thread_agent_name = agent_name.clone();
             let thread = std::thread::Builder::new()
                 .name("nixl-transport".to_string())
-                .spawn(move || transport_thread(executor, agent_name, request_rx, ready_tx))
+                .spawn(move || transport_thread(executor, thread_agent_name, request_rx, ready_tx))
                 .map_err(|err| format!("failed to spawn nixl-transport thread: {err}"))?;
             match ready_rx.recv() {
-                Ok(Ok(())) => Ok(Self {
-                    requests: Mutex::new(Some(request_tx)),
-                    thread: Mutex::new(Some(thread)),
-                }),
+                Ok(Ok(local_md)) => {
+                    let warmup = warmup::spawn(agent_name, local_md, request_tx.clone(), fe);
+                    Ok(Self {
+                        requests: Mutex::new(Some(request_tx)),
+                        thread: Mutex::new(Some(thread)),
+                        warmup: Mutex::new(warmup),
+                    })
+                }
                 Ok(Err(err)) => {
                     let _ = thread.join();
                     Err(err)
@@ -218,12 +367,12 @@ mod agent_tier {
         executor: Arc<dyn FragmentExecutor>,
         agent_name: String,
         requests: Receiver<TransportRequest>,
-        ready: Sender<Result<(), String>>,
+        ready: Sender<Result<Vec<u8>, String>>,
     ) {
         let mut state = match TransportState::bring_up(executor, agent_name) {
             Ok(state) => {
                 // A send error means the caller is already gone; nothing to serve.
-                if ready.send(Ok(())).is_err() {
+                if ready.send(Ok(state.local_md.clone())).is_err() {
                     return;
                 }
                 state
@@ -258,6 +407,16 @@ mod agent_tier {
                         }
                     }
                     let _ = respond.send(result);
+                }
+                TransportRequest::WarmSession {
+                    host,
+                    brpc_port,
+                    client,
+                    peer,
+                    respond,
+                } => {
+                    let key = format!("{host}:{brpc_port}");
+                    let _ = respond.send(state.install_session(key, client, peer));
                 }
             }
         }
@@ -399,32 +558,56 @@ mod agent_tier {
 
         /// Establishes the peer session on first contact: metadata exchange over brpc, then the
         /// mandatory bandwidth canary. Returns the session key.
+        ///
+        /// This is the LAZY path, and it is the one that hangs a cold cluster: the outbound
+        /// `exchange_nixl_md` below blocks this thread on the peer's transport thread, which may
+        /// itself be blocked calling back here (see the [`warmup`](super::warmup) module). It
+        /// survives as the fallback for peers the warmup never reached; the warmup is what keeps
+        /// queries off it.
         fn ensure_session(&mut self, host: &str, brpc_port: u16) -> Result<String, String> {
             let key = format!("{host}:{brpc_port}");
             if self.peers.contains_key(&key) {
                 return Ok(key);
             }
             let mut client = PrpcClient::new(host, brpc_port);
-            let reply = rpc_exchange_md(&mut client, &self.agent_name, &self.local_md)?;
+            let peer = rpc_exchange_md(&mut client, &self.agent_name, &self.local_md)?;
+            self.install_session(key.clone(), client, peer)?;
+            Ok(key)
+        }
+
+        /// Second half of session set-up, once the peer's metadata is in hand: load it into this
+        /// agent and clear the bandwidth canary. Split out so the warmup can run the metadata
+        /// handshake on its own thread and hand the result in here — none of this blocks on the
+        /// peer's transport thread (`request_staging_lease`/`transmit_packed` are served from the
+        /// peer's blocking pool), so it cannot take part in the first-contact cycle.
+        fn install_session(
+            &mut self,
+            key: String,
+            mut client: PrpcClient,
+            peer: MdReply,
+        ) -> Result<(), String> {
+            if self.peers.contains_key(&key) {
+                return Ok(());
+            }
             let loaded = self
                 .agent
-                .load_remote_md(&reply.metadata)
+                .load_remote_md(&peer.metadata)
                 .map_err(|err| format!("failed to load nixl metadata of peer {key}: {err}"))?;
-            if loaded != reply.agent_name {
+            if loaded != peer.agent_name {
                 return Err(format!(
                     "peer {key} announced agent name '{}' but its metadata decodes to '{loaded}'",
-                    reply.agent_name
+                    peer.agent_name
                 ));
             }
             self.bandwidth_canary(&mut client, &loaded)?;
             self.peers.insert(
-                key.clone(),
+                key,
                 PeerSession {
                     client,
                     remote_agent: loaded,
                 },
             );
-            Ok(key)
+            Ok(())
         }
 
         /// F1's silent-degradation guard: nothing in nixl/UCX flags the ~220x staged-copy path
@@ -640,8 +823,10 @@ mod agent_tier {
         ))
     }
 
-    /// `exchange_nixl_md` over brpc: our identity out, the peer's identity back.
-    fn rpc_exchange_md(
+    /// `exchange_nixl_md` over brpc: our identity out, the peer's identity back. Reachable from
+    /// the [`warmup`](super::warmup) thread on purpose — this is the one call that must NOT run
+    /// on the transport thread.
+    pub(super) fn rpc_exchange_md(
         client: &mut PrpcClient,
         agent_name: &str,
         local_md: &[u8],

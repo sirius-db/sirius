@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
+    io::{Read, Write},
     net::{
         IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs,
     },
@@ -51,6 +52,7 @@ mod engine;
 mod engine_settings;
 mod file_schema;
 mod fragment_executor;
+mod gpu_affinity;
 mod local_exchange;
 mod nixl_transport;
 mod proto;
@@ -67,6 +69,7 @@ pub use compute_node_service::ExchangeIdentity;
 pub use engine::SiriusEngine;
 pub use engine_settings::{EngineSettings, derive_sirius_config_yaml};
 pub use fragment_executor::{FragmentExecutor, FragmentResult, StubExecutor};
+pub use gpu_affinity::{GpuSocket, cpu_affinity_for_gpu, gpu_socket};
 pub use nixl_transport::NixlTransport;
 
 /// Serializes tests that bring up a GPU engine context: the engine keeps process-global GPU
@@ -331,10 +334,55 @@ impl Default for SharedHeartbeatState {
     }
 }
 
+/// Whether the GPU engine has finished initializing and this CN can actually execute a fragment.
+///
+/// The CN binds its listeners BEFORE building the engine, because engine start-up reserves the
+/// whole RMM pool and takes ~7 s on a GB200 — and for that entire window the process existed but
+/// answered nothing. An FE that boots faster (~4 s) and remembers this node from its persisted
+/// metadata probes into that gap, the probe fails, and the node is auto-blacklisted.
+///
+/// Binding early closes the gap, but it introduces the opposite hazard: a node that answers is a
+/// node the FE will schedule work onto, and an engine that is still warming cannot run it. This
+/// flag is the interlock. Until it flips, the heartbeat is answered with an ERROR status, which
+/// leaves the FE holding the node as not-alive — so it is never scheduled, and (unlike a failed
+/// fragment RPC) a failed heartbeat does NOT add a blacklist entry.
+#[derive(Clone, Debug)]
+pub struct EngineReadiness(Arc<AtomicBool>);
+
+impl EngineReadiness {
+    /// Starts closed: the engine is not up yet. Use this in real bring-up.
+    pub fn warming() -> Self {
+        Self(Arc::new(AtomicBool::new(false)))
+    }
+
+    /// Starts open. For tests and for builds with no engine to wait for.
+    pub fn ready() -> Self {
+        Self(Arc::new(AtomicBool::new(true)))
+    }
+
+    /// Opens the gate. Idempotent; call once the engine can execute fragments.
+    pub fn mark_ready(&self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether the engine can execute fragments.
+    pub fn is_ready(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
+impl Default for EngineReadiness {
+    fn default() -> Self {
+        Self::ready()
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ComputeNodeHeartbeatHandler {
     config: ComputeNodeConfig,
     state: SharedHeartbeatState,
+    /// Gate that keeps the FE from scheduling onto a still-warming engine. See [`EngineReadiness`].
+    readiness: EngineReadiness,
     reboot_time_secs: i64,
     hardware_cores: i32,
     // Operator-configured FE host used to validate the FE-advertised report target. The CN
@@ -349,10 +397,12 @@ impl ComputeNodeHeartbeatHandler {
         config: ComputeNodeConfig,
         state: SharedHeartbeatState,
         expected_frontend_host: Option<Host>,
+        readiness: EngineReadiness,
     ) -> Self {
         Self {
             config,
             state,
+            readiness,
             reboot_time_secs: unix_time_secs(),
             hardware_cores: std::thread::available_parallelism()
                 .map(|parallelism| parallelism.get().min(i32::MAX as usize) as i32)
@@ -509,7 +559,16 @@ impl HeartbeatServiceSyncHandler for ComputeNodeHeartbeatHandler {
             "received FE heartbeat"
         );
 
+        // Record FE identity first even while warming: the epoch/token/backend-id this carries is
+        // what later reports are addressed with, and dropping it would just move the problem.
         let status = match self.handle_master_info(&master_info) {
+            Ok(()) if !self.readiness.is_ready() => {
+                // Answer honestly rather than claiming health. An OK here would make the FE mark
+                // this node alive and schedule a fragment onto an engine that cannot run it — and
+                // THAT failure is a query-path failure, which is what auto-blacklists a node.
+                debug!("heartbeat answered NOT READY: GPU engine is still initializing");
+                error_status("compute node is still initializing its GPU engine".to_string())
+            }
             Ok(()) => ok_status(),
             Err(err) => {
                 warn!(error = %err, "rejecting FE heartbeat");
@@ -768,6 +827,9 @@ pub struct ThriftServer {
 pub type HeartbeatServer = ThriftServer;
 /// Backend service server handle.
 pub type BackendServer = ThriftServer;
+/// HTTP health listener handle. Not a thrift service, but it has the same lifecycle
+/// (bind, blocking accept loop on its own thread, wake-and-join shutdown).
+pub type HttpServer = ThriftServer;
 
 impl ThriftServer {
     /// Clones the shutdown handle so async orchestration can stop the blocking thread.
@@ -907,6 +969,7 @@ pub fn start_heartbeat_server(
     config: ComputeNodeConfig,
     state: SharedHeartbeatState,
     expected_frontend_host: Option<Host>,
+    readiness: EngineReadiness,
 ) -> Result<HeartbeatServer> {
     let listen_addr = format!("{}:{}", config.bind_host, config.heartbeat_port);
     let listener = TcpListener::bind(&listen_addr)
@@ -920,7 +983,7 @@ pub fn start_heartbeat_server(
     info!(address = %local_addr, "starting heartbeat Thrift server");
     // The generated processor owns the handler and is shared across sequential connections.
     let processor = Arc::new(HeartbeatServiceSyncProcessor::new(
-        ComputeNodeHeartbeatHandler::new(config, state, expected_frontend_host),
+        ComputeNodeHeartbeatHandler::new(config, state, expected_frontend_host, readiness),
     ));
     let join_handle =
         thread::spawn(move || run_thrift_server("heartbeat", listener, processor, server_shutdown));
@@ -962,6 +1025,81 @@ pub fn start_backend_server(config: &ComputeNodeConfig) -> Result<BackendServer>
         local_addr,
         name: "backend",
     })
+}
+
+/// Starts the HTTP listener on `--http-port`.
+///
+/// This exists because the CN ADVERTISES `http_port` in its heartbeat `TBackendInfo` but, until
+/// this listener, never bound it — and that gap is not cosmetic. The FE's blacklist eviction path
+/// (`HostBlacklist.remove` -> `NetUtils.checkAccessibleForAllPorts(host, [bePort, brpcPort,
+/// httpPort])`) opens a raw TCP connection to ALL THREE advertised ports and un-blacklists a node
+/// only when every one of them accepts. With `http_port` unbound that check could never pass, so a
+/// CN auto-blacklisted by a single transient RPC failure — including the FE-heartbeat-before-CN-ready
+/// race during cluster start-up — stayed blacklisted for the FE's entire process lifetime and
+/// silently did zero work, while still reporting `Alive = true`.
+///
+/// Measured on the 4x GB200 box before this fix: 2 of 4 CNs were auto-blacklisted ~2 s after every
+/// cluster start, and q14/SF100 ran 48.9% / 0% / 0% / 51.1% across the four CNs. With the blacklist
+/// manually cleared, the same query ran 25.6% / 24.6% / 24.7% / 25.1%.
+///
+/// The FE only needs the port to ACCEPT, so this is deliberately not a real HTTP stack: it answers
+/// anything with a fixed 200 and closes. Read/write timeouts stop one slow client from stalling the
+/// single-threaded accept loop.
+pub fn start_http_server(config: &ComputeNodeConfig) -> Result<HttpServer> {
+    let listen_addr = format!("{}:{}", config.bind_host, config.http_port);
+    let listener = TcpListener::bind(&listen_addr)
+        .with_context(|| format!("failed to bind HTTP server at {listen_addr}"))?;
+    let local_addr = listener
+        .local_addr()
+        .context("failed to read HTTP server address")?;
+    let shutdown = ThriftServerShutdown::new(listener_wake_addr(local_addr));
+    let server_shutdown = shutdown.clone();
+
+    info!(address = %local_addr, "starting HTTP health listener");
+    let join_handle = thread::spawn(move || run_http_server(listener, server_shutdown));
+
+    Ok(ThriftServer {
+        join_handle: Some(join_handle),
+        shutdown,
+        local_addr,
+        name: "http",
+    })
+}
+
+/// Accept loop for the health listener: at most one fixed response per connection, then close.
+fn run_http_server(listener: TcpListener, shutdown: ThriftServerShutdown) -> Result<()> {
+    const RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 3\r\nConnection: close\r\n\r\nOK\n";
+    const IO_TIMEOUT: Duration = Duration::from_secs(2);
+
+    for stream in listener.incoming() {
+        if shutdown.is_requested() {
+            break;
+        }
+
+        match stream {
+            Ok(mut stream) => {
+                if shutdown.is_requested() {
+                    break;
+                }
+                // The FE's reachability probe connects and closes without sending a byte, so every
+                // step here is best-effort: a client that vanishes mid-exchange is the normal case
+                // and must never take the listener down.
+                let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
+                let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
+                let mut scratch = [0_u8; 1024];
+                let _ = stream.read(&mut scratch);
+                if let Err(err) = stream.write_all(RESPONSE) {
+                    debug!(error = %err, "HTTP health client went away before the response");
+                }
+                let _ = stream.flush();
+                let _ = stream.shutdown(Shutdown::Both);
+            }
+            Err(_) if shutdown.is_requested() => break,
+            Err(err) => warn!(error = %err, "failed to accept HTTP connection"),
+        }
+    }
+
+    Ok(())
 }
 
 /// Runs one generated thrift processor behind a blocking TCP listener.
@@ -1291,6 +1429,62 @@ async fn node_is_registered(
     Ok(false)
 }
 
+/// Every compute node the FE currently reports as alive, as `(advertised host, brpc port)` —
+/// which is exactly the nixl agent name (`{advertise_host}:{brpc_port}`) of each peer, so the
+/// caller can tell itself apart from its peers by string comparison.
+///
+/// The FE only learns a node's `BrpcPort` from its heartbeat reply (`TBackendInfo`), and that is
+/// the same event that flips `Alive` to true — so filtering on `Alive` is what makes the port
+/// trustworthy. Column fallbacks mirror [`node_is_registered`]: `ComputeNodeProcDir.java` orders
+/// the row `ComputeNodeId, IP, HeartbeatPort, BePort, HttpPort, BrpcPort, LastStartTime,
+/// LastHeartbeat, Alive, ...`.
+pub async fn list_alive_compute_nodes(fe: &FeConfig) -> Result<Vec<(String, u16)>> {
+    let opts = OptsBuilder::default()
+        .ip_or_hostname(fe.host.to_string())
+        .tcp_port(fe.query_port)
+        .prefer_socket(false)
+        .user(Some(fe.user.clone()))
+        .pass(Some(fe.password.expose_secret().to_string()));
+    let pool = Pool::new(opts);
+    let mut conn = pool
+        .get_conn()
+        .await
+        .with_context(|| format!("failed to connect to FE at {}:{}", fe.host, fe.query_port))?;
+    let rows: Vec<Row> = conn
+        .query(format!("SHOW PROC '{COMPUTE_NODE_PROC_PATH}'"))
+        .await
+        .context("failed to query FE compute node list")?;
+    drop(conn);
+    pool.disconnect()
+        .await
+        .context("failed to disconnect FE MySQL pool")?;
+
+    let mut nodes = Vec::with_capacity(rows.len());
+    for row in rows {
+        let alive = row
+            .get::<String, _>("Alive")
+            .or_else(|| row.get::<String, _>(8));
+        if alive.as_deref() != Some("true") {
+            continue;
+        }
+        let (Some(host), Some(port)) = (
+            row.get::<String, _>("IP")
+                .or_else(|| row.get::<String, _>(1)),
+            row.get::<String, _>("BrpcPort")
+                .or_else(|| row.get::<String, _>(5)),
+        ) else {
+            continue;
+        };
+        // A node whose brpc port is still unknown (or nonsense) is simply not warmable yet.
+        if let Ok(port) = port.parse::<u16>()
+            && port != 0
+        {
+            nodes.push((host, port));
+        }
+    }
+    Ok(nodes)
+}
+
 /// StarRocks success status helper.
 fn ok_status() -> TStatus {
     TStatus::new(TStatusCode::OK, None)
@@ -1372,7 +1566,12 @@ mod tests {
     fn handler() -> (ComputeNodeHeartbeatHandler, SharedHeartbeatState) {
         let state = SharedHeartbeatState::new();
         (
-            ComputeNodeHeartbeatHandler::new(test_config(), state.clone(), None),
+            ComputeNodeHeartbeatHandler::new(
+                test_config(),
+                state.clone(),
+                None,
+                EngineReadiness::ready(),
+            ),
             state,
         )
     }
@@ -1692,7 +1891,7 @@ mod tests {
         let mut config = test_config();
         config.bind_host = Host::local();
         config.heartbeat_port = 0;
-        let server = match start_heartbeat_server(config, SharedHeartbeatState::new(), None) {
+        let server = match start_heartbeat_server(config, SharedHeartbeatState::new(), None, EngineReadiness::ready()) {
             Ok(server) => server,
             Err(err) if is_permission_denied(&err) => return,
             Err(err) => panic!("{err:?}"),
@@ -1704,6 +1903,123 @@ mod tests {
         drop(stream);
     }
 
+    /// The advertised `http_port` must actually accept a connection, because the FE only lifts a
+    /// node's blacklist entry once `NetUtils.checkAccessibleForAllPorts` can reach EVERY advertised
+    /// port. While this listener did not exist, a CN auto-blacklisted by one transient RPC failure
+    /// stayed blacklisted for the FE's whole lifetime and silently did zero work.
+    #[test]
+    fn http_server_accepts_and_answers_the_reachability_probe() {
+        let mut config = test_config();
+        config.bind_host = Host::local();
+        config.http_port = 0;
+        let server = match start_http_server(&config) {
+            Ok(server) => server,
+            Err(err) if is_permission_denied(&err) => return,
+            Err(err) => panic!("{err:?}"),
+        };
+
+        // The FE's probe connects and closes without writing a byte; answer it anyway so the port
+        // is useful to a human with curl. Reading to EOF also proves the server closes the socket.
+        let mut stream = TcpStream::connect(server.local_addr()).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        stream.write_all(b"GET / HTTP/1.1\r\n\r\n").unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        assert!(
+            response.starts_with("HTTP/1.1 200 OK"),
+            "expected a 200 status line, got {response:?}"
+        );
+
+        server.shutdown();
+        server.join().unwrap();
+    }
+
+    /// The readiness gate is the interlock that makes binding-before-engine-init safe: while the
+    /// engine is warming the port must ANSWER (so the FE does not blacklist an unreachable node)
+    /// but must NOT claim health (so the FE does not schedule a fragment onto an engine that
+    /// cannot run it). Flipping the gate must switch the answer without restarting anything.
+    #[test]
+    fn warming_heartbeat_is_answered_but_not_ok_until_the_engine_is_ready() {
+        let state = SharedHeartbeatState::new();
+        let readiness = EngineReadiness::warming();
+        let handler = ComputeNodeHeartbeatHandler::new(
+            test_config(),
+            state.clone(),
+            None,
+            readiness.clone(),
+        );
+
+        // Warming: answered (not a connection failure) but explicitly not OK.
+        let warming = handler.handle_heartbeat(master(7)).unwrap();
+        assert_ne!(
+            warming.status.status_code,
+            TStatusCode::OK,
+            "a warming CN must not report OK -- the FE would schedule work onto it"
+        );
+        // FE identity is still captured while warming, so the first post-ready report is addressed
+        // correctly instead of waiting for another heartbeat round trip.
+        assert_eq!(state.snapshot().epoch, Some(7));
+        assert_eq!(state.snapshot().compute_node_id, Some(10001));
+
+        readiness.mark_ready();
+
+        let ready = handler.handle_heartbeat(master(7)).unwrap();
+        assert_eq!(
+            ready.status.status_code,
+            TStatusCode::OK,
+            "once the engine is up the same handler must report OK"
+        );
+        // Same advertised ports either way -- readiness changes the STATUS, not the identity.
+        assert_eq!(ready.backend_info.be_port, warming.backend_info.be_port);
+    }
+
+    /// `mark_ready` is idempotent and `ready()` starts open, so non-engine builds and tests are
+    /// unaffected by the gate.
+    #[test]
+    fn readiness_defaults_are_open_and_marking_is_idempotent() {
+        let r = EngineReadiness::ready();
+        assert!(r.is_ready());
+        r.mark_ready();
+        assert!(r.is_ready());
+
+        let w = EngineReadiness::warming();
+        assert!(!w.is_ready());
+        let clone = w.clone();
+        w.mark_ready();
+        assert!(clone.is_ready(), "clones must share one gate, not copy it");
+    }
+
+    /// A bare connect-then-close -- exactly what the FE reachability probe does -- must not take
+    /// the accept loop down, so a later probe still succeeds.
+    #[test]
+    fn http_server_survives_a_client_that_never_reads() {
+        let mut config = test_config();
+        config.bind_host = Host::local();
+        config.http_port = 0;
+        let server = match start_http_server(&config) {
+            Ok(server) => server,
+            Err(err) if is_permission_denied(&err) => return,
+            Err(err) => panic!("{err:?}"),
+        };
+        let addr = server.local_addr();
+
+        drop(TcpStream::connect(addr).unwrap());
+        // The second probe is the assertion: it can only connect if the first one left the
+        // listener alive.
+        let mut stream = TcpStream::connect(addr).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response:?}");
+
+        server.shutdown();
+        server.join().unwrap();
+    }
+
     /// Regression for the shutdown TOCTOU race: a client that connects but never sends a
     /// request leaves the server blocked in `processor.process()`; shutdown must still close
     /// that tracked connection and let `join()` return promptly rather than hang forever.
@@ -1712,7 +2028,7 @@ mod tests {
         let mut config = test_config();
         config.bind_host = Host::local();
         config.heartbeat_port = 0;
-        let server = match start_heartbeat_server(config, SharedHeartbeatState::new(), None) {
+        let server = match start_heartbeat_server(config, SharedHeartbeatState::new(), None, EngineReadiness::ready()) {
             Ok(server) => server,
             Err(err) if is_permission_denied(&err) => return,
             Err(err) => panic!("{err:?}"),
@@ -1750,7 +2066,7 @@ mod tests {
         config.bind_host = Host::local();
         config.heartbeat_port = 0;
         let state = SharedHeartbeatState::new();
-        let server = match start_heartbeat_server(config, state.clone(), None) {
+        let server = match start_heartbeat_server(config, state.clone(), None, EngineReadiness::ready()) {
             Ok(server) => server,
             Err(err) if is_permission_denied(&err) => return,
             Err(err) => panic!("{err:?}"),
@@ -1787,6 +2103,7 @@ mod tests {
             test_config(),
             state.clone(),
             Some(Host::new("127.0.0.1").unwrap()),
+            EngineReadiness::ready(),
         );
         // master(7) advertises a network_address of 127.0.0.1:9020 (matches) — flip the host.
         let mut hostile = master(7);
@@ -1809,6 +2126,7 @@ mod tests {
             test_config(),
             state.clone(),
             Some(Host::new("127.0.0.1").unwrap()),
+            EngineReadiness::ready(),
         );
 
         let result = handler.handle_heartbeat(master(7)).unwrap();
