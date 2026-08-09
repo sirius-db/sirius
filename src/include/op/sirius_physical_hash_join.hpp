@@ -330,18 +330,34 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   /// so the one-shot publisher sees the whole key set.
   [[nodiscard]] bool publishes_dynamic_filters() const;
 
-  /// True when the subordinate multi-partition extension is enabled for this wired producer.
   [[nodiscard]] bool wants_multi_partition_dynamic_filters() const noexcept
   {
     return _enable_dynamic_filter_multi_partition && _dynamic_filter_plan.enabled();
   }
 
-  /// Freeze the complete pre-scatter build snapshot and claim multi-partition publication once.
+  /**
+   * @brief Attempt to arm accumulation from a complete pre-scatter build snapshot
+   *
+   * @param[in] build_rows Complete build row count
+   * @param[in] build_batch_ids Complete set of original batch IDs
+   * @param[in] num_partitions Planned build partition count
+   * @return True if this call armed the accumulator; false if ineligible, already claimed, or
+   * initialization failed
+   */
   [[nodiscard]] bool arm_multi_partition_dynamic_filters(uint64_t build_rows,
                                                          std::vector<uint64_t> build_batch_ids,
                                                          int num_partitions);
 
-  /// Add one original build batch to the global Bloom accumulator before hash scatter.
+  /**
+   * @brief Contribute one original build batch before hash scatter
+   *
+   * Ignored unless accumulation is active. A newly accepted contribution synchronizes @p stream
+   * before returning; an invalid contribution fails accumulation closed.
+   *
+   * @param[in] batch_id Original pre-scatter batch ID
+   * @param[in] build_view Batch containing the admitted build-key ordinals
+   * @param[in] stream Stream used for insertion
+   */
   void contribute_dynamic_filter_build_batch(uint64_t batch_id,
                                              cudf::table_view const& build_view,
                                              rmm::cuda_stream_view stream);

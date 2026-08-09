@@ -185,8 +185,7 @@ std::unique_ptr<operator_data> sirius_physical_partition::execute(const operator
   auto const& input_batch_ro = input_batches[0];
   auto* space                = input_batch_ro.get_memory_space();
 
-  // The original batch ID is the stable contribution identity. Insert admitted build-key ordinals
-  // before hash scatter; retries of this same ID are idempotent in the accumulator.
+  // Contribute before scatter so each snapshot ID covers its original batch; retries deduplicate.
   if (_is_build && !_broadcast && _num_partitions.value() > 1 &&
       _partition_type == PartitionType::HASH) {
     auto* hash_join = dynamic_cast<sirius_physical_hash_join*>(_downstream_consumer_op);

@@ -176,7 +176,6 @@ struct claim_fixture {
     return sirius::test::operator_utils::make_numeric_batch<T>(*gpu_space, keys, type_id);
   }
 
-  /// A GPU-resident single-column build batch of distinct INT64 keys.
   [[nodiscard]] std::shared_ptr<cucascade::data_batch> make_build_batch()
   {
     return make_typed_build_batch<std::int64_t>(cudf::type_id::INT64);

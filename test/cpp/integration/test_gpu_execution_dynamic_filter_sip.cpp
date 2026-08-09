@@ -53,7 +53,6 @@ struct dynamic_filter_switch_guard {
   bool original;
 };
 
-// Set the subordinate multi-partition switch for one scope and restore it on exit.
 struct dynamic_filter_multi_partition_switch_guard {
   dynamic_filter_multi_partition_switch_guard(duckdb::Connection& c, bool enabled)
     : con(c),
@@ -293,9 +292,6 @@ TEST_CASE("gpu_execution - derived-build and build-block routes preserve results
 
   SECTION("a multi-partition build obeys the subordinate switch")
   {
-    // Force a non-broadcast STANDARD join with more than one build partition. The default-off path
-    // preserves PR 1277 behavior; the enabled path publishes only after every original build batch
-    // contributes to the global Bloom.
     sirius::test::disabled_optimizers_guard shape(
       con, "statistics_propagation,join_order,build_side_probe_side");
     sirius::test::coverage_gate_disable_guard gate_off(con);

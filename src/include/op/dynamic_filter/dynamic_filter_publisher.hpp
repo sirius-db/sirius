@@ -93,24 +93,24 @@ struct dynamic_filter_publication_outcome {
   rmm::cuda_stream_view stream);
 
 /**
- * @brief Result of one exact-ID multi-partition contribution
+ * @brief Outcome of one exact build-batch contribution
  */
 struct dynamic_filter_accumulation_result {
-  enum class status : std::uint8_t { pending, duplicate, published, aborted };
+  enum class status : std::uint8_t {
+    pending,    ///< Accepted; expected IDs remain
+    duplicate,  ///< Expected ID is already in flight or complete
+    published,  ///< This call completed publication
+    aborted     ///< Publication cannot proceed for this contribution
+  };
 
   status state = status::pending;
-  dynamic_filter_publication_outcome publication;
+  dynamic_filter_publication_outcome publication;  ///< Current outcome counters
 };
 
 namespace detail {
-/**
- * @brief Internal deterministic seams for accumulator concurrency and failure tests
- *
- * Empty callbacks preserve production behavior. This is not a runtime extension point.
- */
 struct dynamic_filter_accumulator_test_hooks {
-  std::function<void(std::uint64_t)> after_id_claim;     ///< After an ID becomes in flight
-  std::function<void(std::uint64_t)> after_insert_sync;  ///< After insertion, before completion
+  std::function<void(std::uint64_t)> after_id_claim;
+  std::function<void(std::uint64_t)> after_insert_sync;
   std::function<void(sirius_dynamic_bloom_filter&,
                      std::span<dynamic_filter_replica_space const>)>
     strict_replicate;  ///< Replaces strict replication at the pre-fan-out boundary
@@ -118,14 +118,23 @@ struct dynamic_filter_accumulator_test_hooks {
 }  // namespace detail
 
 /**
- * @brief Exact-ID accumulator for one globally complete multi-partition Bloom snapshot
+ * @brief Accumulates expected pre-scatter batches into one global Bloom snapshot
  *
- * The expected original pre-scatter batch IDs and global row count are frozen at the build sizing
- * barrier. Contributions are idempotent by batch ID. No filter is replicated or exposed until
- * every expected ID has completed insertion.
+ * `contribute()` is thread-safe and accepts each expected ID at most once. Nothing is exposed until
+ * all expected IDs finish. The retained plan reference must outlive this object.
  */
 class dynamic_filter_accumulator final {
  public:
+  /**
+   * @brief Create an accumulator for a complete build snapshot
+   *
+   * @throw std::invalid_argument if @p plan is disabled or @p expected_batch_ids is empty or
+   * non-unique
+   *
+   * @param[in] plan Enabled plan that outlives this accumulator
+   * @param[in] build_rows Complete build row count used for Bloom sizing
+   * @param[in] expected_batch_ids Complete set of pre-scatter batch IDs
+   */
   dynamic_filter_accumulator(dynamic_filter_publish_plan const& plan,
                              std::size_t build_rows,
                              std::vector<std::uint64_t> expected_batch_ids);
@@ -138,11 +147,26 @@ class dynamic_filter_accumulator final {
   dynamic_filter_accumulator(dynamic_filter_accumulator const&)            = delete;
   dynamic_filter_accumulator& operator=(dynamic_filter_accumulator const&) = delete;
 
+  /**
+   * @brief Contribute one expected build batch
+   *
+   * A newly accepted batch is consumed on the current GPU, and @p stream is synchronized before
+   * return. Invalid IDs, devices, or columns produce an `aborted` result.
+   *
+   * @param[in] batch_id Original pre-scatter batch ID
+   * @param[in] build_view Batch containing the admitted build-key ordinals
+   * @param[in] stream Stream used for insertion
+   * @return Current accumulation state and publication counters
+   */
   [[nodiscard]] dynamic_filter_accumulation_result contribute(std::uint64_t batch_id,
                                                               cudf::table_view const& build_view,
                                                               rmm::cuda_stream_view stream);
 
-  /// Atomically abort an incomplete accumulator and return its outcome only to the closing caller.
+  /**
+   * @brief Atomically abort an incomplete accumulator
+   *
+   * @return The outcome when this call performs the abort, otherwise `std::nullopt`
+   */
   [[nodiscard]] std::optional<dynamic_filter_publication_outcome> abort_if_incomplete() noexcept;
 
   [[nodiscard]] bool complete() const noexcept;

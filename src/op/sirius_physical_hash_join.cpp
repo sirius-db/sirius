@@ -2067,7 +2067,7 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
 void sirius_physical_hash_join::publish_dynamic_filters(cudf::table_view const& build_view,
                                                         rmm::cuda_stream_view stream)
 {
-  // The one-shot and multi-partition paths share one publication claim.
+  // Serialize with accumulator arming so exactly one path can claim OPEN.
   {
     std::scoped_lock lock(op_state_mutex);
     if (_dynamic_filter_publication_state.load(std::memory_order_acquire) !=
@@ -2252,7 +2252,7 @@ void sirius_physical_hash_join::on_finalize_operator()
 
   std::scoped_lock lock(op_state_mutex);
   if (_join_mode == HASH_JOIN_MODE::BUILD_PROBE) {
-    // Each partition hash table lives on its producing GPU. Free every slot under that device.
+    // Destroy each partition's GPU allocations under its owning device.
     for (auto& slot : _partition_build_states) {
       std::optional<rmm::cuda_set_device_raii> device_guard;
       if (slot.device_id >= 0) { device_guard.emplace(rmm::cuda_device_id{slot.device_id}); }

@@ -604,9 +604,8 @@ struct dynamic_filter_accumulator::impl {
               build_rows,
               durable_stream,
               space.get_gpu_space().get_default_allocator());
-            // CUCO retains its construction stream for eventual deallocation. The memory-space
-            // stream outlives the published filter, and its asynchronous clear must finish before
-            // this contribution inserts on a task-owned stream.
+            // CUCO retains the construction stream for deallocation; finish its initial clear on
+            // this durable stream before inserting on the task stream.
             durable_stream.synchronize();
             partial->filters[key_index] = std::move(filter);
           }

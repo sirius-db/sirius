@@ -974,8 +974,7 @@ TEST_CASE("accumulated Bloom storage outlives a task-owned contribution stream",
     REQUIRE(channel->filter_count() == 1);
   }
 
-  // The CUCO owner is released only after the task stream above has been destroyed. Its deleter
-  // must use the longer-lived memory-space stream captured during partial construction.
+  // Destroy the CUCO owner after task_stream to exercise its captured memory-space stream.
   channel.reset();
   REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
 }

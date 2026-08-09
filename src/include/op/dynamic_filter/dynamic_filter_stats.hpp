@@ -96,16 +96,13 @@ struct dynamic_filter_stats {
 
   // Opportunistic delivery
   std::atomic<std::uint64_t> publication_attempts{
-    0};  ///< Successful one-shot or accumulator claims
+    0};  ///< OPEN to PUBLISHING or ACCUMULATING transitions
   std::atomic<std::uint64_t> publications_finished{0};
   std::atomic<std::uint64_t> publications_failed{0};
   /// Build batch was not GPU-resident at delivery; publication skipped without claiming
   std::atomic<std::uint64_t> publications_skipped_source_not_resident{0};
-  /// Wired join the upstream PARTITION never reported a whole build for, so its one-shot
-  /// publication window can never claim: probe-driven sizing, a hash-partitioned multi-partition
-  /// build when accumulation is disabled (a broadcast build is whole on every partition), or no
-  /// build-side CONCAT to fold.
-  /// Counted once per join, at the first build delivery that observes the condition.
+  /// First build delivery for a wired join that is still OPEN but lacks a whole-build batch;
+  /// counted once per join.
   std::atomic<std::uint64_t> publications_skipped_build_not_whole{0};
   /// Attempt hit the all-targets-drained early return; no deterministic counter moved for it
   std::atomic<std::uint64_t> publications_skipped_targets_drained{0};

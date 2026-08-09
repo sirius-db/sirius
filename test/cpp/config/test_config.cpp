@@ -597,7 +597,6 @@ TEST_CASE("the dynamic-filter switch is consumed from the operator_params YAML s
            "    enable_dynamic_filter_multi_partition: true\n";
   }
 
-  // Exercise the non-default direction for both the master and subordinate switches.
   CHECK(operator_params{}.enable_dynamic_filter);
   CHECK_FALSE(operator_params{}.enable_dynamic_filter_multi_partition);
 

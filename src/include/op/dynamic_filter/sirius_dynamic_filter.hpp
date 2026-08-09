@@ -465,7 +465,9 @@ class sirius_dynamic_small_in_list_filter final : public sirius_dynamic_filter,
  * @brief Probabilistic set-membership filter backed by a GPU blocked Bloom filter
  *
  * False positives pass extra rows to the authoritative join; the filter must not produce false
- * negatives. The `cuco::bloom_filter` implementation is hidden in the CUDA translation unit.
+ * negatives. The `cuco::bloom_filter` implementation is hidden in the CUDA translation unit. Its
+ * construction stream and memory resource are retained for deallocation and must outlive the
+ * filter.
  */
 class sirius_dynamic_bloom_filter final : public sirius_dynamic_filter,
                                           public sirius_mask_applicable,
@@ -475,8 +477,7 @@ class sirius_dynamic_bloom_filter final : public sirius_dynamic_filter,
    * @brief Build a Bloom filter over the build's join keys
    *
    * @pre @p keys has a type accepted by @ref supports and its backing storage remains valid until
-   * work enqueued on @p stream completes. `dynamic_filter_publisher` retains the build batch and
-   * synchronizes before replication.
+   * work enqueued on @p stream completes
    *
    * @throw std::invalid_argument if `keys.type()` is unsupported
    * @throw std::runtime_error if the current CUDA device cannot be identified
@@ -491,10 +492,18 @@ class sirius_dynamic_bloom_filter final : public sirius_dynamic_filter,
                               rmm::device_async_resource_ref mr);
 
   /**
-   * @brief Create an empty Bloom with geometry sized for the complete build
+   * @brief Construct an empty Bloom filter sized for @p expected_num_keys
    *
-   * Later @ref add calls are idempotent and may insert disjoint build batches. The filter must not
-   * be published until every expected batch has completed.
+   * Initialization is enqueued on @p stream; work submitted on another stream must wait for it.
+   *
+   * @throw std::invalid_argument if @p key_type is unsupported
+   * @throw std::runtime_error if the current CUDA device cannot be identified
+   * @throw std::logic_error if the validated key type changes during construction
+   *
+   * @param[in] key_type INT32 or INT64 key type
+   * @param[in] expected_num_keys Key count used to size the filter
+   * @param[in] stream Stream used for initialization
+   * @param[in] mr Device memory resource backing the filter
    */
   sirius_dynamic_bloom_filter(cudf::data_type key_type,
                               std::size_t expected_num_keys,
@@ -519,26 +528,54 @@ class sirius_dynamic_bloom_filter final : public sirius_dynamic_filter,
   void replicate_to_devices(std::span<dynamic_filter_replica_space const> spaces) override;
 
   /**
-   * @brief Replicate to every planned device or fail before publication
+   * @brief Replicate to every supplied device
+   *
+   * Successful replicas remain installed if a later requested replica is unavailable.
+   *
+   * @throw std::runtime_error if any requested replica is unavailable
+   *
+   * @param[in] spaces Required device placements
    */
   void replicate_to_devices_strict(std::span<dynamic_filter_replica_space const> spaces);
 
   /**
-   * @brief Insert another build-key batch into this filter's source replica
+   * @brief Enqueue another build-key batch into the source replica
+   *
+   * @pre The current device and @p keys type match the source replica, and key storage remains
+   * valid until @p stream completes
+   * @throw std::invalid_argument if @p keys is unsupported or differs from the construction type
+   * @throw std::logic_error if the current device is not the source device or its replica is absent
+   *
+   * @param[in] keys Build keys to insert
+   * @param[in] stream Stream used for insertion
    */
   void add(cudf::column_view const& keys, rmm::cuda_stream_view stream);
 
   /**
-   * @brief OR another equal-geometry source replica into this filter on the deterministic root GPU
+   * @brief Enqueue an OR of @p source into this filter's source replica
    *
-   * The method uses at most one root-device scratch buffer and reuses it across calls.
+   * @pre Both filters have equal geometry, match their device spaces, and remain alive until
+   * @p root_stream completes
+   * @pre @p root_stream belongs to @p root_space; calls on the same destination are stream-ordered
+   * or externally synchronized
+   * @throw std::logic_error if the filters, geometry, or device spaces do not match
+   * @throw std::runtime_error if an OR kernel cannot be launched
+   *
+   * @param[in] source Source partial
+   * @param[in] source_space Source device and transfer placement
+   * @param[in] root_space Root device and host-staging placement
+   * @param[in] root_stream Stream used for transfer and reduction
    */
   void merge_from(sirius_dynamic_bloom_filter const& source,
                   dynamic_filter_replica_space const& source_space,
                   dynamic_filter_replica_space const& root_space,
                   rmm::cuda_stream_view root_stream);
 
-  /// Release the bounded root-reduction scratch after its stream has synchronized.
+  /**
+   * @brief Release reduction scratch
+   *
+   * @pre All work enqueued by `merge_from()` has completed
+   */
   void release_reduction_scratch();
 
   [[nodiscard]] bool is_available_on_device(int device_id) const noexcept override;

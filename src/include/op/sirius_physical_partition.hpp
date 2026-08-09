@@ -128,8 +128,9 @@ class sirius_physical_partition : public sirius_physical_operator {
  private:
   void get_partition_keys_and_type(sirius_physical_operator* op, bool is_build = false);
 
-  /// Sum the bytes of all batches waiting on this partition's input port. Fed to the downstream
-  /// consumer's get_partition_strategy, which turns it into a partition count.
+  /// Return the bytes of waiting batches. When both snapshot outputs are supplied, return IDs and
+  /// total rows only if every batch has a GPU table and the row total is representable; otherwise
+  /// clear them. `exact_rows` reports whether that snapshot is complete.
   uint64_t compute_total_bytes(std::vector<uint64_t>* batch_ids = nullptr,
                                uint64_t* total_rows             = nullptr,
                                bool* exact_rows                 = nullptr);
@@ -160,7 +161,7 @@ class sirius_physical_partition : public sirius_physical_operator {
   /// num_gpus partitions. Build side deposits its batch into every slot; probe side deposits each
   /// batch into the slot matching its current GPU. See get_next_task_input_data / sink.
   bool _broadcast{false};
-  /// Protected by lock; set before the first build input is popped, whether arming succeeds or not.
+  /// Guarded by `lock`; set before the first build input is popped whether arming succeeds or not.
   bool _dynamic_filter_snapshot_attempted{false};
   /// Non-owning observer for the narrow-passthrough counter. The registered-state shared_ptr owns
   /// the context for at least as long as the query plan; unit-test operators may leave it null.
