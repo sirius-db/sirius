@@ -57,7 +57,10 @@ import csv
 import json
 import math
 import os
+import pickle
 import shutil
+import subprocess
+import sys
 import threading
 import time
 from datetime import datetime
@@ -268,6 +271,118 @@ def validate_pass(cpu, gpu_rows_by_q, plan, label, timeout_s):
             failures[f"q{q}"] = msg
             log(f"  [{label}] q{q}: MISMATCH — {msg}")
     return failures
+
+
+def _gpu_rows_path(run_dir, label):
+    return os.path.join(run_dir, f"_gpu_rows_{label}.pickle")
+
+
+def stash_gpu_rows(run_dir, label, rows_by_q):
+    """Persist a GPU pass's rows for the deferred CPU comparison."""
+    with open(_gpu_rows_path(run_dir, label), "wb") as f:
+        pickle.dump(rows_by_q, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+
+def deferred_validation(args, run_dir):
+    """Diff the stored GPU rows against pure DuckDB, in a fresh process.
+
+    Validation cannot share a process with the pinned run. Sirius's host pool
+    is a growing pool allocator, so unpinning returns blocks to the pool rather
+    than to the OS, and DuckDB sizes its own memory_limit from total system RAM
+    with no knowledge of what Sirius holds. At SF1000 that means a CPU-side q9
+    allocates into a machine that is already 320 GB spoken for and gets
+    OOM-killed. A fresh interpreter that never loads the extension starts with
+    the machine to itself.
+
+    The cost of leaving the process is that the refreshed state goes with it:
+    RF1/RF2 are committed but never checkpointed, so a new process reading the
+    same file would see the pre-refresh image. The worker therefore replays the
+    refresh functions on its own copy of the base database, reproducing the
+    post-RF1 and post-RF2 states the GPU was measured against. It runs after
+    the pinned phases have deleted their scratch copy, so peak disk is
+    unchanged.
+    """
+    spec = {
+        "input": args.input,
+        "refresh_dir": args.refresh_dir,
+        "run_dir": run_dir,
+        "scratch": os.path.join(run_dir, "bench_validate.duckdb"),
+        "sf": args.sf,
+        "vary_predicates": args.vary_predicates,
+        "query_dir": args.query_dir,
+        "query_timeout": args.query_timeout,
+        "keep_scratch_db": args.keep_scratch_db,
+    }
+    spec_path = os.path.join(run_dir, "_validate_spec.json")
+    with open(spec_path, "w") as f:
+        json.dump(spec, f)
+
+    log("=== Validation: pure DuckDB, refresh functions replayed (untimed) ===")
+    env = dict(os.environ)
+    env.pop("SIRIUS_CONFIG_FILE", None)  # nothing here should load the extension
+    proc = subprocess.run(
+        [
+            sys.executable,
+            os.path.abspath(__file__),
+            "--validate-worker",
+            spec_path,
+            "--sf",  # required by the parser; the worker reads the spec instead
+            str(args.sf),
+        ],
+        env=env,
+    )
+    verdict_path = os.path.join(run_dir, "_validate_verdict.json")
+    if not os.path.exists(verdict_path):
+        return {
+            "after_rf1": {"worker": f"no verdict (exit {proc.returncode})"},
+            "after_rf2": {},
+        }
+    with open(verdict_path) as f:
+        return json.load(f)
+
+
+def validation_worker(spec_path):
+    """Child-process entry point: replay the refreshes, diff GPU rows vs CPU."""
+    with open(spec_path) as f:
+        spec = json.load(f)
+    run_dir = spec["run_dir"]
+    plan = stream_queries(
+        0,
+        argparse.Namespace(
+            vary_predicates=spec["vary_predicates"],
+            query_dir=spec["query_dir"],
+            sf=spec["sf"],
+        ),
+    )
+    scratch = spec["scratch"]
+    copy_database(spec["input"], scratch)
+    verdict = {}
+    con = duckdb.connect(scratch)
+    try:
+        cur = con.cursor()
+        limit = cur.execute("SELECT current_setting('memory_limit')").fetchone()[0]
+        log(f"  DuckDB memory_limit: {limit} (whole machine; no pinned pool held)")
+        for label, refresh in (
+            ("after_rf1", rf1_statements(spec["refresh_dir"], 1)),
+            ("after_rf2", rf2_statements(spec["refresh_dir"], 1)),
+        ):
+            run_refresh(cur, refresh, label.upper().replace("AFTER_", ""))
+            rows_path = _gpu_rows_path(run_dir, label)
+            if not os.path.exists(rows_path):
+                continue
+            with open(rows_path, "rb") as f:
+                gpu_rows = pickle.load(f)
+            verdict[label] = validate_pass(
+                cur, gpu_rows, plan, label.replace("_", " "), spec["query_timeout"]
+            )
+    finally:
+        con.close()
+        if not spec["keep_scratch_db"]:
+            for f in (scratch, scratch + ".wal"):
+                if os.path.exists(f):
+                    os.remove(f)
+    with open(os.path.join(run_dir, "_validate_verdict.json"), "w") as f:
+        json.dump(verdict, f)
 
 
 def table_counts(cpu):
@@ -495,10 +610,7 @@ def power_run(con, args, run_dir, writer):
 
         validation = {"counts_after_rf1_ok": counts_ok}
         if args.validation:
-            log("=== Power: validating post-RF1 state vs DuckDB CPU (untimed) ===")
-            validation["after_rf1"] = validate_pass(
-                cpu, rows_p0, plan, "after RF1", args.query_timeout
-            )
+            stash_gpu_rows(run_dir, "after_rf1", rows_p0)
 
         log("=== Power: RF2 (delete update set 1) ===")
         t_rf2 = run_refresh(rf, rf2_statements(args.refresh_dir, 1), "RF2")
@@ -518,9 +630,10 @@ def power_run(con, args, run_dir, writer):
         t_p2, rows_p2 = timed_pass("power_postrf2", "result_postrf2.txt")
 
         if args.validation:
-            log("=== Power: validating post-RF2 state vs DuckDB CPU (untimed) ===")
-            validation["after_rf2"] = validate_pass(
-                cpu, rows_p2, plan, "after RF2", args.query_timeout
+            stash_gpu_rows(run_dir, "after_rf2", rows_p2)
+            log(
+                "Validation deferred to a pure-DuckDB pass after the pinned "
+                "phases release the GPU and host pools"
             )
 
         metric_times, clamped = clamp_query_times(t_p0)
@@ -861,6 +974,7 @@ def parse_args():
         "set — there is no built-in default path)",
     )
     p.add_argument("--output", type=str, default=None, help="Output root directory")
+    p.add_argument("--validate-worker", type=str, default=None, help=argparse.SUPPRESS)
     p.add_argument(
         "--query-timeout",
         type=float,
@@ -890,6 +1004,12 @@ def parse_args():
 
 def main():
     args = parse_args()
+
+    # Re-entry as the validation child: no Sirius, no config, no pinning.
+    if args.validate_worker:
+        validation_worker(args.validate_worker)
+        return
+
     sf_label = f"{args.sf:g}"
 
     if args.input is None:
@@ -1006,6 +1126,12 @@ def main():
         elif args.mode == "throughput":
             with benchmark_db(args, run_dir, "bench_throughput.duckdb") as con:
                 throughput = throughput_run(con, args, run_dir, writer, streams)
+
+    # Deliberately outside the benchmark_db blocks above: the tables are
+    # unpinned, the connection is closed and the pinned scratch copy is gone,
+    # so the child process gets the machine to itself.
+    if power and args.validation:
+        power["validation"].update(deferred_validation(args, run_dir))
 
     qphh = None
     if power and throughput:

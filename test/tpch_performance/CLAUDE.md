@@ -354,11 +354,19 @@ sqrt(Power · Throughput)`.
 - The summary reports per-query `clean`, `post-RF1`, and `post-RF2` times, plus `delta overhead`
   (post-RF1 − clean) and `mask overhead` (post-RF2 − post-RF1). Power@Size itself uses only the
   post-RF1 stream.
-- Validation (default on with fixed predicates, power run only): after RF1 and after RF2, each
-  refresh-affected query's GPU rows are diffed against a DuckDB CPU cursor in the same process. A separate process would
-  read the stale pre-refresh disk image, since refreshes are committed but not checkpointed.
-  q2/q11/q16 touch neither table and are skipped. Row-count movement across RF1/RF2 is also
-  checked. Any mismatch exits non-zero.
+- Validation (default on with fixed predicates, power run only): the post-RF1 and post-RF2 GPU
+  rows are stashed during the timed passes, then diffed against pure DuckDB **after every pinned
+  phase has finished** — in a child process that never loads the extension. It cannot share the
+  benchmark process: the host pool is a growing pool allocator, so unpinning returns blocks to the
+  pool rather than to the OS, and DuckDB sizes `memory_limit` from total system RAM with no
+  knowledge of what Sirius holds. At SF1000 an in-process CPU q9 therefore allocates into a
+  machine already 320 GB spoken for and is OOM-killed. Leaving the process costs the refreshed
+  state, since RF1/RF2 are committed but never checkpointed, so the child **replays the refresh
+  functions** on its own copy of the base database to reproduce the states the GPU was measured
+  against. It runs after the pinned phases delete their scratch copy, so peak disk is unchanged;
+  the cost is one extra copy of the base DB and an untimed CPU pass. q2/q11/q16 touch neither
+  table and are skipped. Row-count movement across RF1/RF2 is also checked. Any mismatch exits
+  non-zero.
 - Concurrency caveat: the engine serializes queries across all connections on one query-lifecycle
   lock, so the throughput run measures throughput of concurrent submission on one GPU, not
   overlapped execution. Every result is fetched fully before the next query; an open cursor would

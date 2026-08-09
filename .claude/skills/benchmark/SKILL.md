@@ -245,8 +245,11 @@ pixi run python test/tpch_performance/tpch_power_throughput.py \
 (Simpatico-compressed pins; plan dir defaults to the shipped TPC-H plans),
 `--compression-plan-dir <dir>`, `--vary-predicates/--no-vary-predicates` (default fixed;
 varied runs per-stream qgen parameters and rejects `--validation`), `--query-dir <dir>`,
-`--validation/--no-validation` (fixed predicates only, default on; the power run diffs GPU vs a
-same-process DuckDB CPU cursor after RF1 and after RF2), `--baseline-pass/--no-baseline-pass`
+`--validation/--no-validation` (fixed predicates only, default on; the power run's post-RF1 and
+post-RF2 GPU rows are diffed against pure DuckDB in a child process after every pinned phase
+completes, with the refresh functions replayed on a fresh copy — it cannot share the benchmark
+process, since the host pool does not return memory to the OS on unpin),
+`--baseline-pass/--no-baseline-pass`
 (default on; adds the clean pre-refresh timing pass so delta/mask overhead is attributable),
 `--query-timeout`, `--output`, `--keep-scratch-db`.
 
@@ -332,9 +335,11 @@ option) and ask for the rest. Mark sensible defaults "(Recommended)".
    without confirming it.
 5. **Streams** (`--streams`): throughput query-stream count (default: TPC-H spec minimum for the
    SF). Ensure the refresh dir has `streams + 1` sets.
-6. **Validation** (`--validation`): only ask with fixed predicates (default on there): after RF1
-   and RF2, diff GPU vs a same-process DuckDB CPU cursor. With varied predicates skip the
-   question — the runner rejects `--validation` — and tell the user the run is timing-only.
+6. **Validation** (`--validation`): only ask with fixed predicates (default on there): the
+   post-RF1/post-RF2 GPU rows are diffed against pure DuckDB in a child process once the pinned
+   phases finish, with the refreshes replayed on a fresh copy. It adds one base-DB copy and an
+   untimed CPU pass, but does not compete with the pin for memory. With varied predicates skip
+   the question — the runner rejects `--validation` — and tell the user the run is timing-only.
 
 `--baseline-pass` (clean pre-refresh pass, default on) and `--query-timeout` can take defaults
 unless the user asks otherwise.
