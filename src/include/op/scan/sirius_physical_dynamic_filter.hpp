@@ -26,12 +26,15 @@
 
 namespace sirius::op::scan {
 
+/// @brief Why the planner installed this operator -- exposed for plan-shape tests and telemetry.
+enum class dynamic_filter_endpoint_provenance { scan_route, join_edge, top_n_endpoint };
+
 //===----------------------------------------------------------------------===//
 // sirius_physical_dynamic_filter
 //===----------------------------------------------------------------------===//
 /// @brief Applies dynamic filters to the batches flowing through one point in the plan.
 ///
-/// The planner installs this operator in two roles.
+/// The planner installs this operator in three roles; @ref provenance reports which.
 ///
 /// On a scan route it sits directly above `sirius_gpu_scan_operator`. Parquet has already applied
 /// AST-capable filters through the reader, so the endpoint uses @c membership_masks_only. A
@@ -40,6 +43,10 @@ namespace sirius::op::scan {
 /// On a direct route, `planner::place_endpoint()` inserts it in the producing join's probe
 /// subtree. A @c dynamic_filter_route_class::direct target accepts membership filters, and the
 /// operator uses @c membership_masks_only.
+///
+/// As a Top-N sited endpoint it sits at a trace stop point that material work separates from the
+/// Top-N sink. Top-N boundary filters apply through @ref sirius::op::sirius_compaction_applicable
+/// (one fused kernel pass); join zone maps keep the AST row-mask path.
 ///
 /// Each execution snapshots the currently visible filters. The batch passes through unchanged when
 /// the channel has no applicable filter, the current device has no replica, or
@@ -54,7 +61,21 @@ class sirius_physical_dynamic_filter : public sirius_physical_operator {
     std::size_t estimated_cardinality,
     std::shared_ptr<sirius::op::sirius_dynamic_filter_set> filters,
     double gate_keep_threshold     = dynamic_filter_gate::k_default_keep_threshold,
-    dynamic_filter_apply_mode mode = dynamic_filter_apply_mode::membership_masks_only);
+    dynamic_filter_apply_mode mode = dynamic_filter_apply_mode::membership_masks_only,
+    dynamic_filter_endpoint_provenance provenance = dynamic_filter_endpoint_provenance::scan_route);
+
+  /// Why the planner installed this operator; plan-shape tests and telemetry read it.
+  [[nodiscard]] dynamic_filter_endpoint_provenance provenance() const noexcept
+  {
+    return _provenance;
+  }
+
+  /// The channel this operator consumes, for plan-shape assertions on registered routing.
+  [[nodiscard]] std::shared_ptr<sirius::op::sirius_dynamic_filter_set const> filters()
+    const noexcept
+  {
+    return _filters;
+  }
 
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          rmm::cuda_stream_view stream) override;
@@ -77,6 +98,8 @@ class sirius_physical_dynamic_filter : public sirius_physical_operator {
   /// read time (parquet), AST row masks too when the scan has no read-time dynamic phase
   /// (duckdb-native).
   dynamic_filter_apply_mode _mode;
+  /// Which planner role installed this operator.
+  dynamic_filter_endpoint_provenance _provenance;
 };
 
 }  // namespace sirius::op::scan

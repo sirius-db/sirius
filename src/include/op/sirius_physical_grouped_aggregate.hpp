@@ -35,6 +35,8 @@
 namespace sirius {
 namespace op {
 
+class top_n_group_key_producer;
+
 class sirius_physical_grouped_aggregate : public sirius_physical_operator {
  public:
   static constexpr const SiriusPhysicalOperatorType TYPE =
@@ -45,6 +47,8 @@ class sirius_physical_grouped_aggregate : public sirius_physical_operator {
                                     duckdb::vector<std::unique_ptr<sirius::ast::node>> expressions,
                                     duckdb::vector<std::unique_ptr<sirius::ast::node>> groups,
                                     std::size_t estimated_cardinality);
+
+  ~sirius_physical_grouped_aggregate() override;
 
   sirius_physical_grouped_aggregate(
     duckdb::vector<sirius::logical_type> types,
@@ -86,6 +90,16 @@ class sirius_physical_grouped_aggregate : public sirius_physical_operator {
   bool has_avg            = false;
   bool has_count_distinct = false;
 
+  /**
+   * @brief Top-N group-key producer seam, or null when this aggregate feeds no eligible Top-N
+   *
+   * Installed by `sirius::planner::sirius_physical_plan_generator` when a `LogicalTopN` above this
+   * aggregate orders only by grouping keys. @ref execute lets it prefilter and witness every input
+   * batch before the local aggregation, and @ref on_finalize_operator drains its coordinator. It
+   * changes no aggregate result: both operations are pure optimizations.
+   */
+  std::unique_ptr<top_n_group_key_producer> top_n_producer;
+
  public:
   std::vector<int> get_output_grouping_indices() const
   {
@@ -109,6 +123,9 @@ class sirius_physical_grouped_aggregate : public sirius_physical_operator {
 
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          rmm::cuda_stream_view stream) override;
+
+ protected:
+  void on_finalize_operator() override;
 };
 
 }  // namespace op

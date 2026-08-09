@@ -46,6 +46,36 @@ struct dynamic_filter_stats_snapshot {
   std::uint64_t publications_skipped_build_not_whole     = 0;
   std::uint64_t publications_skipped_targets_drained     = 0;
   std::uint64_t filters_pushed                           = 0;
+
+  std::uint64_t top_n_producers_eligible       = 0;
+  std::uint64_t top_n_producers_rejected       = 0;
+  std::uint64_t top_n_producers_first_key_only = 0;
+  std::uint64_t top_n_offers                   = 0;
+  std::uint64_t top_n_offers_not_tighter       = 0;
+  std::uint64_t top_n_offers_unsupported       = 0;
+  std::uint64_t top_n_prefilter_rows_in        = 0;
+  std::uint64_t top_n_prefilter_rows_out       = 0;
+  std::uint64_t top_n_prefilter_disabled       = 0;
+
+  std::uint64_t top_n_first_key_scan_targets      = 0;
+  std::uint64_t top_n_lex_scan_targets            = 0;
+  std::uint64_t top_n_endpoint_sites_placed       = 0;
+  std::uint64_t top_n_endpoint_sites_skipped      = 0;
+  std::uint64_t top_n_lex_endpoint_sites_deferred = 0;
+  std::uint64_t top_n_first_key_subsumed_by_lex   = 0;
+  std::uint64_t top_n_revisions_published         = 0;
+  std::uint64_t top_n_lex_filters_pushed          = 0;
+  std::uint64_t top_n_first_key_filters_pushed    = 0;
+  std::uint64_t top_n_revisions_failed            = 0;
+  std::uint64_t top_n_revisions_stale             = 0;
+  std::uint64_t top_n_revisions_ignored           = 0;
+
+  std::uint64_t top_n_group_producers_eligible = 0;
+  std::uint64_t top_n_group_producers_rejected = 0;
+  std::uint64_t top_n_group_offers             = 0;
+  std::uint64_t top_n_group_witness_set_full   = 0;
+  std::uint64_t top_n_group_prefilter_rows_in  = 0;
+  std::uint64_t top_n_group_prefilter_rows_out = 0;
 };
 
 /**
@@ -109,6 +139,56 @@ struct dynamic_filter_stats {
   std::atomic<std::uint64_t> publications_skipped_targets_drained{0};
   std::atomic<std::uint64_t> filters_pushed{0};  ///< Accepted pushes; drain-dependent
 
+  // --- Top-N refinement (Stage 1) ---
+  // The producer counters are plan-time facts like producers_enabled (the transparent path
+  // constructs the plan twice per query); the offer and prefilter counters are delivery-time and
+  // batch-arrival dependent, so tests assert them as deltas or directions only.
+  std::atomic<std::uint64_t> top_n_producers_eligible{0};  ///< Plan-time fact, like
+                                                           ///< producers_enabled
+  std::atomic<std::uint64_t> top_n_producers_rejected{0};  ///< Failed eligibility (keys/shape/K)
+  std::atomic<std::uint64_t> top_n_producers_first_key_only{0};  ///< Tail key type degraded LEX
+                                                                 ///< away
+  std::atomic<std::uint64_t> top_n_offers{0};                    ///< Witness offers reaching the
+                                                                 ///< coordinator
+  std::atomic<std::uint64_t> top_n_offers_not_tighter{0};        ///< Lost the lexicographic compare
+  std::atomic<std::uint64_t> top_n_offers_unsupported{0};        ///< Null first boundary component
+  std::atomic<std::uint64_t> top_n_prefilter_rows_in{0};   ///< Rows entering measured prefilters
+  std::atomic<std::uint64_t> top_n_prefilter_rows_out{0};  ///< Rows surviving measured prefilters
+  std::atomic<std::uint64_t> top_n_prefilter_disabled{0};  ///< Keep-ratio disable observations;
+                                                           ///< concurrent measurements may record
+                                                           ///< one decision more than once
+
+  // --- Top-N publication and endpoints (Stage 4); per layer where meaningful ---
+  // The scan-target, endpoint-site, and subsumption counters are plan-time facts like
+  // producers_enabled; the revision and push counters are delivery-time and race scan starts by
+  // design, so tests assert them as deltas or directions only.
+  std::atomic<std::uint64_t> top_n_first_key_scan_targets{0};  ///< Plan-time
+  std::atomic<std::uint64_t> top_n_lex_scan_targets{0};        ///< Plan-time; all keys one scan
+  std::atomic<std::uint64_t> top_n_endpoint_sites_placed{0};   ///< Plan-time; either layer
+  std::atomic<std::uint64_t> top_n_endpoint_sites_skipped{0};  ///< Plan-time; cost gate said no
+  /// Plan-time; a material LEX site this stage cannot splice (multi-ordinal placement is Stage 7).
+  /// Kept apart from the skip counter so a staged gap never reads as a cost-gate decision.
+  std::atomic<std::uint64_t> top_n_lex_endpoint_sites_deferred{0};
+  std::atomic<std::uint64_t> top_n_first_key_subsumed_by_lex{0};  ///< Plan-time; dedup fired
+  std::atomic<std::uint64_t> top_n_revisions_published{0};        ///< Boundary updates fanned out
+  std::atomic<std::uint64_t> top_n_lex_filters_pushed{0};
+  std::atomic<std::uint64_t> top_n_first_key_filters_pushed{0};
+  std::atomic<std::uint64_t> top_n_revisions_failed{0};  ///< Replica failure; old revision retained
+  std::atomic<std::uint64_t> top_n_revisions_stale{0};
+  /// Publishes refused because the slot's primary or a referenced ordinal is ignored
+  std::atomic<std::uint64_t> top_n_revisions_ignored{0};
+
+  // --- Top-N group-key producer (Stage 5) ---
+  // The producer counters are plan-time facts; the offer, witness-set, and prefilter counters are
+  // delivery-time and batch-arrival dependent, so tests assert them as deltas or directions only.
+  std::atomic<std::uint64_t> top_n_group_producers_eligible{0};  ///< Plan-time fact
+  std::atomic<std::uint64_t> top_n_group_producers_rejected{0};  ///< Aggregate-output key, filter,
+                                                                 ///< or K/shape refusal
+  std::atomic<std::uint64_t> top_n_group_offers{0};              ///< Distinct-key offers merged
+  std::atomic<std::uint64_t> top_n_group_witness_set_full{0};    ///< Boundary first became defined
+  std::atomic<std::uint64_t> top_n_group_prefilter_rows_in{0};
+  std::atomic<std::uint64_t> top_n_group_prefilter_rows_out{0};
+
   /**
    * @brief Read every counter with relaxed ordering
    *
@@ -134,7 +214,42 @@ struct dynamic_filter_stats {
         publications_skipped_build_not_whole.load(std::memory_order_relaxed),
       .publications_skipped_targets_drained =
         publications_skipped_targets_drained.load(std::memory_order_relaxed),
-      .filters_pushed = filters_pushed.load(std::memory_order_relaxed)};
+      .filters_pushed           = filters_pushed.load(std::memory_order_relaxed),
+      .top_n_producers_eligible = top_n_producers_eligible.load(std::memory_order_relaxed),
+      .top_n_producers_rejected = top_n_producers_rejected.load(std::memory_order_relaxed),
+      .top_n_producers_first_key_only =
+        top_n_producers_first_key_only.load(std::memory_order_relaxed),
+      .top_n_offers                 = top_n_offers.load(std::memory_order_relaxed),
+      .top_n_offers_not_tighter     = top_n_offers_not_tighter.load(std::memory_order_relaxed),
+      .top_n_offers_unsupported     = top_n_offers_unsupported.load(std::memory_order_relaxed),
+      .top_n_prefilter_rows_in      = top_n_prefilter_rows_in.load(std::memory_order_relaxed),
+      .top_n_prefilter_rows_out     = top_n_prefilter_rows_out.load(std::memory_order_relaxed),
+      .top_n_prefilter_disabled     = top_n_prefilter_disabled.load(std::memory_order_relaxed),
+      .top_n_first_key_scan_targets = top_n_first_key_scan_targets.load(std::memory_order_relaxed),
+      .top_n_lex_scan_targets       = top_n_lex_scan_targets.load(std::memory_order_relaxed),
+      .top_n_endpoint_sites_placed  = top_n_endpoint_sites_placed.load(std::memory_order_relaxed),
+      .top_n_endpoint_sites_skipped = top_n_endpoint_sites_skipped.load(std::memory_order_relaxed),
+      .top_n_lex_endpoint_sites_deferred =
+        top_n_lex_endpoint_sites_deferred.load(std::memory_order_relaxed),
+      .top_n_first_key_subsumed_by_lex =
+        top_n_first_key_subsumed_by_lex.load(std::memory_order_relaxed),
+      .top_n_revisions_published = top_n_revisions_published.load(std::memory_order_relaxed),
+      .top_n_lex_filters_pushed  = top_n_lex_filters_pushed.load(std::memory_order_relaxed),
+      .top_n_first_key_filters_pushed =
+        top_n_first_key_filters_pushed.load(std::memory_order_relaxed),
+      .top_n_revisions_failed  = top_n_revisions_failed.load(std::memory_order_relaxed),
+      .top_n_revisions_stale   = top_n_revisions_stale.load(std::memory_order_relaxed),
+      .top_n_revisions_ignored = top_n_revisions_ignored.load(std::memory_order_relaxed),
+      .top_n_group_producers_eligible =
+        top_n_group_producers_eligible.load(std::memory_order_relaxed),
+      .top_n_group_producers_rejected =
+        top_n_group_producers_rejected.load(std::memory_order_relaxed),
+      .top_n_group_offers           = top_n_group_offers.load(std::memory_order_relaxed),
+      .top_n_group_witness_set_full = top_n_group_witness_set_full.load(std::memory_order_relaxed),
+      .top_n_group_prefilter_rows_in =
+        top_n_group_prefilter_rows_in.load(std::memory_order_relaxed),
+      .top_n_group_prefilter_rows_out =
+        top_n_group_prefilter_rows_out.load(std::memory_order_relaxed)};
   }
 };
 

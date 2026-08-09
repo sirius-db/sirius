@@ -140,6 +140,11 @@ struct operator_params {
   /// [0, 1]; 1.0 keeps filtering always on.
   double dynamic_filter_keep_threshold = 0.9;
 
+  /// Enable Top-N threshold refinement: the Top-N sink prefilters its own input from a shared
+  /// boundary and publishes that boundary into scan and endpoint dynamic-filter channels.
+  /// Independent of `enable_dynamic_filter` (the join path); both may be toggled in tests.
+  bool enable_top_n_dynamic_filter = false;
+
   /// Zone-map pruning of pinned-table chunks at cache-serve time: skip cached chunks whose pin-time
   /// min/max statistics prove the scan's pushed-down filter matches no rows. Gates BOTH the
   /// pin-time statistics capture and the serve-side survivor plan: a table pinned while the flag is

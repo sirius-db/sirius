@@ -17,6 +17,7 @@
 #pragma once
 
 #include "duckdb/planner/bound_query_node.hpp"
+#include "op/scan/dynamic_filter_gate.hpp"
 #include "op/sirius_physical_operator.hpp"
 
 #include <cudf/table/table.hpp>
@@ -30,6 +31,8 @@ struct DynamicFilterData;
 namespace sirius {
 namespace op {
 
+class top_n_threshold_coordinator;
+
 //! Represents a physical ordering of the data. Note that this will not change
 //! the data but only add a selection vector.
 class sirius_physical_top_n : public sirius_physical_operator {
@@ -37,12 +40,14 @@ class sirius_physical_top_n : public sirius_physical_operator {
   static constexpr const SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::TOP_N;
 
  public:
-  sirius_physical_top_n(duckdb::vector<sirius::logical_type> types_p,
-                        duckdb::vector<duckdb::BoundOrderByNode> orders,
-                        std::size_t limit,
-                        std::size_t offset,
-                        duckdb::shared_ptr<duckdb::DynamicFilterData> dynamic_filter,
-                        std::size_t estimated_cardinality);
+  sirius_physical_top_n(
+    duckdb::vector<sirius::logical_type> types_p,
+    duckdb::vector<duckdb::BoundOrderByNode> orders,
+    std::size_t limit,
+    std::size_t offset,
+    duckdb::shared_ptr<duckdb::DynamicFilterData> dynamic_filter,
+    std::size_t estimated_cardinality,
+    double gate_keep_threshold = scan::dynamic_filter_gate::k_default_keep_threshold);
   ~sirius_physical_top_n() override;
 
   duckdb::vector<duckdb::BoundOrderByNode> orders;
@@ -50,6 +55,23 @@ class sirius_physical_top_n : public sirius_physical_operator {
   std::size_t offset;
   //! Dynamic table filter (if any)
   duckdb::shared_ptr<duckdb::DynamicFilterData> dynamic_filter;
+
+  /**
+   * @brief Execution coordinator for threshold refinement; null when the producer is ineligible
+   *
+   * Set by the planner after eligibility validation. Shared with `sirius_physical_top_n_merge`,
+   * which calls `finish()` after its child barrier.
+   */
+  std::shared_ptr<top_n_threshold_coordinator> threshold_coordinator;
+
+  /**
+   * @brief Per-execution keep-ratio state for the sink prefilter
+   *
+   * Reuses `scan::dynamic_filter_gate`: the prefilter records rows before/after each measured
+   * batch and stops prefiltering when unselective. A tightened boundary re-arms one measurement
+   * through the gate's growth rule (Stage 2 makes that rule generation-based).
+   */
+  scan::dynamic_filter_gate prefilter_gate;
 
  public:
   bool is_source() const override { return true; }

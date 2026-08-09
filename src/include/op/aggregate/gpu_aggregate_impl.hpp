@@ -91,6 +91,25 @@ class gpu_aggregate_impl {
     rmm::cuda_stream_view stream,
     cucascade::memory::memory_space& memory_space,
     const telemetry::batch_telemetry_info& telemetry_info = {});
+
+  /**
+   * @brief Perform local grouped aggregate over an already-resolved table view.
+   *
+   * Identical to the `read_only_data_batch` overload, which forwards to this one. It exists for
+   * callers holding a view that is not the batch's own table -- the Top-N group-key producer
+   * aggregates the survivors of its boundary prefilter rather than the whole input batch.
+   *
+   * @param input_table The rows to aggregate; must outlive the call.
+   */
+  static std::shared_ptr<cucascade::data_batch> local_grouped_aggregate(
+    const cudf::table_view& input_table,
+    const std::vector<int>& group_idx,
+    const std::vector<cudf::aggregation::Kind>& aggregates,
+    const std::vector<int>& aggregate_idx,
+    const std::vector<std::vector<int>>& aggregate_struct_col_indices,
+    rmm::cuda_stream_view stream,
+    cucascade::memory::memory_space& memory_space,
+    const telemetry::batch_telemetry_info& telemetry_info = {});
 };
 
 }  // namespace op

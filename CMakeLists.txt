@@ -304,7 +304,10 @@ set(EXTENSION_SOURCES
     src/op/scan/duckdb_native_gpu_ingestible.cpp
     src/op/dynamic_filter/dynamic_filter_publish_plan.cpp
     src/op/dynamic_filter/dynamic_filter_publisher.cpp
+    src/op/dynamic_filter/exact_host_scalar.cpp
     src/op/dynamic_filter/sirius_dynamic_filter.cpp
+    src/op/dynamic_filter/top_n_group_key_producer.cpp
+    src/op/dynamic_filter/top_n_threshold_coordinator.cpp
     src/op/sirius_physical_column_data_scan.cpp
     src/op/sirius_physical_streaming_source.cpp
     src/op/sirius_physical_concat.cpp
@@ -401,6 +404,7 @@ set(CUDA_SOURCES
     src/cuda/sirius_dynamic_bloom_filter.cu
     src/cuda/sirius_dynamic_in_list_filter.cu
     src/cuda/sirius_dynamic_small_in_list_filter.cu
+    src/cuda/top_n_boundary_filter.cu
     src/cuda/scan/gpu_decode_alp.cu
     src/cuda/scan/gpu_decode_bitpacking.cu
     src/cuda/scan/gpu_decode_rle.cu
@@ -633,6 +637,7 @@ set(TEST_SOURCES
     test/cpp/integration/test_gpu_execution_array.cpp
     test/cpp/integration/test_gpu_execution_dynamic_filter_native.cpp
     test/cpp/integration/test_gpu_execution_dynamic_filter_sip.cpp
+    test/cpp/integration/test_gpu_execution_top_n_dynamic_filter.cpp
     test/cpp/integration/test_gpu_execution_filter_nulls.cpp
     test/cpp/integration/test_gpu_execution_join_nulls.cpp
     test/cpp/integration/test_gpu_execution_locality.cpp
@@ -697,9 +702,17 @@ set(TEST_SOURCES
     test/cpp/operator/test_physical_streaming_source.cpp
     test/cpp/operator/test_physical_table_scan.cpp
     test/cpp/operator/test_no_history_peak_memory_estimate.cpp
+    test/cpp/operator/test_exact_host_key_tuple.cpp
+    test/cpp/operator/aggregate/test_grouped_aggregate_top_n_producer.cpp
     test/cpp/operator/test_physical_top_n.cpp
+    test/cpp/operator/test_physical_top_n_prefilter.cpp
     test/cpp/operator/test_physical_ungrouped_aggregate.cpp
+    test/cpp/operator/test_dynamic_filter_refinement_slots.cpp
     test/cpp/operator/test_sirius_dynamic_filter.cpp
+    test/cpp/operator/test_sirius_dynamic_range_filters.cpp
+    test/cpp/operator/test_top_n_boundary_filter.cpp
+    test/cpp/operator/test_top_n_publication.cpp
+    test/cpp/operator/test_top_n_threshold_coordinator.cpp
     test/cpp/operator/test_dynamic_filter_publication_claim.cpp
     test/cpp/operator/test_dynamic_filter_publisher.cpp
     test/cpp/operator/test_dynamic_filter_source_policy.cpp
@@ -717,6 +730,9 @@ set(TEST_SOURCES
     test/cpp/planner/test_plan_tree_shape.cpp
     test/cpp/planner/test_projection_fold.cpp
     test/cpp/planner/test_sirius_read_parquet_scan.cpp
+    test/cpp/planner/test_top_n_checked_k.cpp
+    test/cpp/planner/test_top_n_key_types.cpp
+    test/cpp/planner/test_top_n_dynamic_filter_plan_shape.cpp
     test/cpp/planner/test_query_id.cpp
     test/cpp/planner/test_query_index.cpp
     test/cpp/pipeline/test_batch_lock_utils.cpp
@@ -742,6 +758,7 @@ set(TEST_SOURCES
     test/cpp/scan/test_duckdb_native_host_backed_decode.cpp
     test/cpp/scan/test_duckdb_native_walker.cpp
     test/cpp/scan/test_dynamic_filter_merge.cpp
+    test/cpp/scan/test_dynamic_filter_merge_snapshot.cpp
     test/cpp/scan/test_gpu_decode_alp.cpp
     test/cpp/scan/test_gpu_decode_bitpacking.cpp
     test/cpp/scan/test_gpu_decode_rle.cpp

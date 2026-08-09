@@ -1,0 +1,258 @@
+# =============================================================================
+# Copyright 2026, Sirius Contributors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
+# in compliance with the License. You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software distributed under the License
+# is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
+# or implied. See the License for the specific language governing permissions and limitations under
+# the License.
+# =============================================================================
+
+# name: test/sql/top-n-dynamic-filter.test
+# description: Regression floor for Top-N threshold refinement: every query must return identical
+#              results across enable_top_n_dynamic_filter x gpu_execution; the gpu_execution=false
+#              pass pins the CPU baseline. Runnable (with the filter inert) from Stage 1 onward.
+# group: [sirius]
+
+# The Sirius duckdb-native scan requires a file-backed database (single-file block manager);
+# in-memory tables would fall every query back to DuckDB and leave the GPU path unexercised.
+load __TEST_DIR__/top_n_dynamic_filter.db
+
+require sirius
+
+# Deterministic tables: v = (7*i) mod 41 is a permutation of 0..40 (41 prime), so ORDER BY v is
+# tie-free; w and pay carry duplicates for multi-key and unsupported-type shapes.
+statement ok
+CREATE OR REPLACE TABLE topn_facts AS
+SELECT CAST(i AS INTEGER) AS id,
+       CAST((i * 7) % 41 AS INTEGER) AS v,
+       CAST(i % 5 AS INTEGER) AS w,
+       'p' || CAST(i % 4 AS VARCHAR) AS pay
+FROM range(41) t(i);
+
+statement ok
+CREATE OR REPLACE TABLE topn_nulls AS
+SELECT CAST(i AS INTEGER) AS id,
+       CASE WHEN i % 3 = 0 THEN NULL ELSE CAST(i AS INTEGER) END AS v
+FROM range(12) t(i);
+
+statement ok
+CREATE OR REPLACE TABLE topn_dates AS
+SELECT CAST(i AS INTEGER) AS id,
+       DATE '2020-01-01' + CAST((i * 13) % 29 AS INTEGER) AS d
+FROM range(29) t(i);
+
+# Grouped shape for the group-key producer: every ORDER BY key is a grouping key, so the producer
+# roots below the aggregate. Each group's sum is distinct, so ordering by an aggregate output is
+# deterministic too, and (grp, sub) gives the multi-key shape. At 41 rows this is one scan batch,
+# so the group prefilter never faces a boundary here: these queries are a result-equivalence floor,
+# not evidence of pruning. Pruning behaviour is asserted in the Catch2 layers.
+statement ok
+CREATE OR REPLACE TABLE topn_groups AS
+SELECT CAST(i AS INTEGER) AS id,
+       CAST(i % 7 AS INTEGER) AS grp,
+       CAST((i / 7) % 3 AS INTEGER) AS sub,
+       CAST((i * 7) % 41 AS INTEGER) AS v
+FROM range(41) t(i);
+
+# Flush the fresh tables out of the WAL: the native decoder reads checkpointed segments.
+statement ok
+CHECKPOINT;
+
+foreach topn_flag false true
+
+foreach gpu true false
+
+statement ok
+SET enable_top_n_dynamic_filter = ${topn_flag};
+
+statement ok
+SET gpu_execution = ${gpu};
+
+# Single admitted key
+query I
+SELECT v FROM topn_facts ORDER BY v LIMIT 5;
+----
+0
+1
+2
+3
+4
+
+# Multi-key with direction mix
+query II
+SELECT v, w FROM topn_facts ORDER BY v DESC, w LIMIT 5;
+----
+40	0
+39	4
+38	3
+37	2
+36	1
+
+# Offset participates in K
+query I
+SELECT v FROM topn_facts ORDER BY v LIMIT 4 OFFSET 3;
+----
+3
+4
+5
+6
+
+# Multi-key over two admitted keys with head duplicates
+query II
+SELECT v, w FROM topn_facts ORDER BY w, v LIMIT 5;
+----
+0	0
+5	0
+11	0
+17	0
+23	0
+
+# Unsupported VARCHAR tail: producer degrades, results unchanged
+query IT
+SELECT v, pay FROM topn_facts ORDER BY v, pay LIMIT 3;
+----
+0	p0
+1	p2
+2	p0
+
+# Unsupported VARCHAR head: no producer, results unchanged
+query TI
+SELECT pay, v FROM topn_facts ORDER BY pay, v LIMIT 3;
+----
+p0	0
+p0	2
+p0	4
+
+# DATE key rides its exact physical representation
+query T
+SELECT d FROM topn_dates ORDER BY d LIMIT 3;
+----
+2020-01-01
+2020-01-02
+2020-01-03
+
+# LIMIT 0: no producer, empty result
+query I
+SELECT v FROM topn_facts ORDER BY v LIMIT 0;
+----
+
+# Tie-preserving rank shapes never reach the plain Top-N producer
+query I
+SELECT w FROM (SELECT w, RANK() OVER (ORDER BY w) AS r FROM topn_facts) WHERE r <= 6 ORDER BY w;
+----
+0
+0
+0
+0
+0
+0
+0
+0
+0
+
+# Null keys under both placements
+query I
+SELECT v FROM topn_nulls ORDER BY v NULLS FIRST LIMIT 6;
+----
+NULL
+NULL
+NULL
+NULL
+1
+2
+
+query I
+SELECT v FROM topn_nulls ORDER BY v NULLS LAST LIMIT 6;
+----
+1
+2
+4
+5
+7
+8
+
+query I
+SELECT v FROM topn_nulls ORDER BY v DESC NULLS LAST LIMIT 6;
+----
+11
+10
+8
+7
+5
+4
+
+# Table smaller than K publishes nothing
+query I
+SELECT v FROM topn_nulls ORDER BY v NULLS LAST LIMIT 50;
+----
+1
+2
+4
+5
+7
+8
+10
+11
+NULL
+NULL
+NULL
+NULL
+
+# Grouping-key order over an aggregate: the group-key producer is admitted here.
+query II
+SELECT grp, min(v) FROM topn_groups GROUP BY grp ORDER BY grp LIMIT 3;
+----
+0	0
+1	6
+2	5
+
+# The same shape with a sum: a boundary one comparison too strict would drop rows tied with the
+# boundary group and lower its sum, which shows up here and nowhere else.
+query II
+SELECT grp, sum(v) FROM topn_groups GROUP BY grp ORDER BY grp LIMIT 3;
+----
+0	120
+1	121
+2	122
+
+# Two grouping keys: the producer publishes the inclusive full-tuple predicate, which must keep
+# rows tying the whole boundary tuple.
+query III
+SELECT grp, sub, sum(v) FROM topn_groups GROUP BY grp, sub ORDER BY grp, sub LIMIT 4;
+----
+0	0	24
+0	1	40
+0	2	56
+1	0	38
+
+# Ordering by an aggregate output: no group-key producer, results unchanged.
+query II
+SELECT grp, sum(v) AS s FROM topn_groups GROUP BY grp ORDER BY s LIMIT 3;
+----
+6	85
+0	120
+1	121
+
+# HAVING between the aggregate and the Top-N: no group-key producer, results unchanged.
+query II
+SELECT grp, min(v) AS m FROM topn_groups GROUP BY grp HAVING min(v) > 0 ORDER BY grp LIMIT 3;
+----
+1	6
+2	5
+3	4
+
+endloop
+
+endloop
+
+# Restore defaults for any later file sharing the database
+statement ok
+SET enable_top_n_dynamic_filter = false;
+
+statement ok
+SET gpu_execution = true;

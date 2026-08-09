@@ -18,10 +18,17 @@
 
 #include "config.hpp"
 #include "data/data_batch_utils.hpp"
+#include "log/logging.hpp"
 #include "op/aggregate/aggregate_op_util.hpp"
 #include "op/aggregate/gpu_aggregate_impl.hpp"
+#include "op/dynamic_filter/top_n_group_key_producer.hpp"
 
 #include <nvtx3/nvtx3.hpp>
+
+#include <exception>
+#include <memory>
+#include <utility>
+#include <vector>
 
 namespace sirius {
 namespace op {
@@ -72,6 +79,8 @@ sirius_physical_grouped_aggregate::sirius_physical_grouped_aggregate(
   has_count_distinct                = cudf_defs.has_count_distinct;
 }
 
+sirius_physical_grouped_aggregate::~sirius_physical_grouped_aggregate() = default;
+
 std::unique_ptr<operator_data> sirius_physical_grouped_aggregate::execute(
   const operator_data& input_data, rmm::cuda_stream_view stream)
 {
@@ -82,17 +91,71 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate::execute(
   for (auto const& input_batch : input_batches) {
     auto* space = input_batch.get_memory_space();
     if (!space) { continue; }
-    auto result = gpu_aggregate_impl::local_grouped_aggregate(input_batch,
-                                                              group_idx,
-                                                              cudf_aggregates,
-                                                              cudf_aggregate_idx,
-                                                              cudf_aggregate_struct_col_indices,
-                                                              stream,
-                                                              *space,
-                                                              batch_telemetry());
-    results.push_back(std::move(result));
+    if (!top_n_producer) {
+      results.push_back(
+        gpu_aggregate_impl::local_grouped_aggregate(input_batch,
+                                                    group_idx,
+                                                    cudf_aggregates,
+                                                    cudf_aggregate_idx,
+                                                    cudf_aggregate_struct_col_indices,
+                                                    stream,
+                                                    *space,
+                                                    batch_telemetry()));
+      continue;
+    }
+
+    // Top-N group-key producer seam. Rows the boundary excludes belong to groups that cannot reach
+    // the final K, so dropping them before the hash insert changes no surviving group's value; the
+    // survivors' best distinct grouping keys are then the evidence that tightens the boundary
+    // further. Both steps are optional work, so a failure degrades to a plain aggregation.
+    auto const memory_resource = space->get_default_allocator();
+    auto input_table           = get_cudf_table_view(input_batch);
+    std::unique_ptr<cudf::table> prefiltered;  // backs input_table when rows were dropped
+    try {
+      auto result = top_n_producer->prefilter(input_table, stream, memory_resource);
+      // A null result is the all-pass fast path: keep the original view, copy-free.
+      if (result.filtered) {
+        prefiltered = std::move(result.filtered);
+        input_table = prefiltered->view();
+      }
+    } catch (std::exception const& e) {
+      SIRIUS_LOG_WARN(
+        "[sirius_physical_grouped_aggregate] Top-N group-key prefilter skipped one batch: {}. "
+        "Aggregation continues over the whole batch.",
+        e.what());
+      prefiltered.reset();
+      input_table = get_cudf_table_view(input_batch);
+    }
+    // Witnessing is a separate failure domain from prefiltering. A prefilter that already
+    // succeeded stays in force: its survivors are exactly the rows that can matter, and keeping
+    // them also keeps the row counters agreeing with what reached the hash table.
+    try {
+      top_n_producer->witness(input_table, stream, memory_resource);
+    } catch (std::exception const& e) {
+      SIRIUS_LOG_WARN(
+        "[sirius_physical_grouped_aggregate] Top-N group-key witness skipped one batch: {}. "
+        "The boundary simply stops tightening from this batch.",
+        e.what());
+    }
+
+    results.push_back(gpu_aggregate_impl::local_grouped_aggregate(input_table,
+                                                                  group_idx,
+                                                                  cudf_aggregates,
+                                                                  cudf_aggregate_idx,
+                                                                  cudf_aggregate_struct_col_indices,
+                                                                  stream,
+                                                                  *space,
+                                                                  batch_telemetry()));
   }
   return std::make_unique<pipelineable_operator_data>(results);
+}
+
+void sirius_physical_grouped_aggregate::on_finalize_operator()
+{
+  // Producer-side drain once this aggregate's input pipeline has completed: no further batch can
+  // arrive, so no further distinct key can be witnessed. Idempotent, and it blocks only this
+  // finalization task, never a scan consumer.
+  if (top_n_producer) { top_n_producer->coordinator().finish(); }
 }
 }  // namespace op
 }  // namespace sirius

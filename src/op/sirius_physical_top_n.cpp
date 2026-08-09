@@ -20,6 +20,8 @@
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/filter/dynamic_filter.hpp"
 #include "op/cudf_sort_order.hpp"
+#include "op/dynamic_filter/top_n_boundary_filter.hpp"
+#include "op/dynamic_filter/top_n_threshold_coordinator.hpp"
 #include "op/sirius_physical_order.hpp"
 #include "op/sirius_physical_top_n_merge.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
@@ -29,7 +31,9 @@
 #include <cudf/concatenate.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/cudf_utils.hpp>
+#include <cudf/scalar/scalar.hpp>
 #include <cudf/sorting.hpp>
+#include <cudf/wrappers/timestamps.hpp>
 
 #include <rmm/resource_ref.hpp>
 
@@ -39,6 +43,11 @@
 
 #include <algorithm>
 #include <memory>
+#include <optional>
+#include <span>
+#include <utility>
+#include <variant>
+#include <vector>
 
 namespace sirius {
 namespace op {
@@ -137,6 +146,117 @@ std::unique_ptr<cudf::table> compute_top_n_table(
   return kept;
 }
 
+//===----------------------------------------------------------------------===//
+// Sink self-consumption seam (Stage-1 Top-N threshold refinement)
+//===----------------------------------------------------------------------===//
+// These helpers run only when the planner attached a threshold coordinator, which guarantees
+// every ORDER BY key is a bound reference and checked K fits cudf::size_type.
+
+/// The ORDER BY keys' input-column indices, in key order. The prefilter consumes the indices
+/// before compute_top_n_table's own checks run, so range-validate here with the same diagnostic.
+std::vector<cudf::size_type> key_column_indices(
+  duckdb::vector<duckdb::BoundOrderByNode> const& orders, cudf::size_type num_columns)
+{
+  std::vector<cudf::size_type> indices;
+  indices.reserve(orders.size());
+  for (auto const& ord : orders) {
+    auto const idx =
+      static_cast<cudf::size_type>(ord.expression->Cast<duckdb::BoundReferenceExpression>().index);
+    if (idx < 0 || idx >= num_columns) {
+      throw internal_exception("TopN order index out of range");
+    }
+    indices.push_back(idx);
+  }
+  return indices;
+}
+
+/// Marshal the shared boundary into by-value kernel launch parameters through the shared detail
+/// marshaller: the full tuple as the strict form when every key is admitted, only component 0 as
+/// the inclusive first-key form otherwise (the marshaller itself degrades an over-wide boundary
+/// to the inclusive prefix form).
+detail::boundary_filter_params make_boundary_filter_params(
+  exact_host_key_tuple const& boundary,
+  std::span<top_n_key_semantics const> keys,
+  bool lex_admitted)
+{
+  return detail::make_boundary_filter_params(
+    boundary, keys, lex_admitted ? keys.size() : std::size_t{1}, lex_admitted);
+}
+
+/// Read row @p row of @p col to an exact host value. The typed `is_valid`/`value` reads
+/// synchronize @p stream, so the returned value is the completed host copy the witness-handoff
+/// contract requires. A null element, a column whose type is not exactly @p storage_type, or a
+/// storage type outside the allowlist yields a disengaged component.
+std::optional<exact_host_scalar> extract_boundary_component(cudf::column_view const& col,
+                                                            cudf::size_type row,
+                                                            cudf::data_type storage_type,
+                                                            rmm::cuda_stream_view stream,
+                                                            rmm::device_async_resource_ref mr)
+{
+  // Full `data_type` equality, not just the id: the rep this reads is labelled with
+  // @p storage_type everywhere downstream -- the published fixed-point literal, the kernel's
+  // component width, and the sink prefilter -- so reading it from a column of a different type
+  // would attach the wrong label. Before fixed-point keys that could only happen across differing
+  // ids, where the `static_cast` below is already undefined; now the ids can agree while the
+  // scales differ, which is well-defined and silently wrong. Refusing yields a disengaged
+  // component, which only ever loosens the boundary.
+  if (col.type() != storage_type) { return std::nullopt; }
+
+  auto const read_numeric = [&]<typename T>() -> std::optional<exact_host_scalar> {
+    auto const element = cudf::get_element(col, row, stream, mr);
+    auto const& typed  = static_cast<cudf::numeric_scalar<T> const&>(*element);
+    if (!typed.is_valid(stream)) { return std::nullopt; }
+    return exact_host_scalar{typed.value(stream), storage_type};
+  };
+  switch (storage_type.id()) {
+    case cudf::type_id::INT8: return read_numeric.template operator()<std::int8_t>();
+    case cudf::type_id::INT16: return read_numeric.template operator()<std::int16_t>();
+    case cudf::type_id::INT32: return read_numeric.template operator()<std::int32_t>();
+    case cudf::type_id::INT64: return read_numeric.template operator()<std::int64_t>();
+    case cudf::type_id::TIMESTAMP_DAYS: {
+      auto const element = cudf::get_element(col, row, stream, mr);
+      auto const& typed  = static_cast<cudf::timestamp_scalar<cudf::timestamp_D> const&>(*element);
+      if (!typed.is_valid(stream)) { return std::nullopt; }
+      return exact_host_scalar{
+        static_cast<std::int32_t>(typed.value(stream).time_since_epoch().count()), storage_type};
+    }
+    // A fixed-point key is recorded as its scaled integer; `storage_type` carries the scale, so
+    // the pair is exactly the value and nothing is rescaled.
+    case cudf::type_id::DECIMAL32: {
+      auto const element = cudf::get_element(col, row, stream, mr);
+      auto const& typed =
+        static_cast<cudf::fixed_point_scalar<numeric::decimal32> const&>(*element);
+      if (!typed.is_valid(stream)) { return std::nullopt; }
+      return exact_host_scalar{typed.value(stream), storage_type};
+    }
+    case cudf::type_id::DECIMAL64: {
+      auto const element = cudf::get_element(col, row, stream, mr);
+      auto const& typed =
+        static_cast<cudf::fixed_point_scalar<numeric::decimal64> const&>(*element);
+      if (!typed.is_valid(stream)) { return std::nullopt; }
+      return exact_host_scalar{typed.value(stream), storage_type};
+    }
+    default: return std::nullopt;
+  }
+}
+
+/// Exact host key tuple of row `K - 1` of a K-row local result, one component per ORDER BY key.
+exact_host_key_tuple extract_boundary_tuple(cudf::table_view const& output,
+                                            std::span<top_n_key_semantics const> keys,
+                                            std::span<cudf::size_type const> key_columns,
+                                            cudf::size_type boundary_row,
+                                            rmm::cuda_stream_view stream,
+                                            rmm::device_async_resource_ref mr)
+{
+  std::vector<std::optional<exact_host_scalar>> components;
+  components.reserve(keys.size());
+  for (std::size_t i = 0; i < keys.size(); ++i) {
+    components.push_back(extract_boundary_component(
+      output.column(key_columns[i]), boundary_row, keys[i].storage_type, stream, mr));
+  }
+  return exact_host_key_tuple{std::move(components)};
+}
+
 }  // namespace
 
 sirius_physical_top_n::sirius_physical_top_n(
@@ -145,13 +265,15 @@ sirius_physical_top_n::sirius_physical_top_n(
   std::size_t limit,
   std::size_t offset,
   duckdb::shared_ptr<duckdb::DynamicFilterData> dynamic_filter_p,
-  std::size_t estimated_cardinality)
+  std::size_t estimated_cardinality,
+  double gate_keep_threshold)
   : sirius_physical_operator(
       SiriusPhysicalOperatorType::TOP_N, std::move(types_p), estimated_cardinality),
     orders(std::move(orders)),
     limit(limit),
     offset(offset),
-    dynamic_filter(std::move(dynamic_filter_p))
+    dynamic_filter(std::move(dynamic_filter_p)),
+    prefilter_gate(gate_keep_threshold)
 {
 }
 
@@ -183,9 +305,57 @@ std::unique_ptr<operator_data> sirius_physical_top_n::execute(const operator_dat
 
   auto input_table_view =
     input_batch.get_data()->cast<cucascade::gpu_table_representation>().get_table_view();
-  auto output_table = compute_top_n_table(
-    input_table_view, orders, limit, offset, stream, space->get_default_allocator());
+  auto const memory_resource = space->get_default_allocator();
+
+  std::vector<cudf::size_type> key_columns;
+  if (threshold_coordinator) {
+    key_columns = key_column_indices(orders, input_table_view.num_columns());
+  }
+
+  // Sink self-consumption: drop rows the shared boundary already excludes before the local sort,
+  // in one fused kernel pass. A stale boundary prunes less, never more; the keep-ratio gate
+  // stops unselective prefilters and one boundary tightening re-arms one measurement.
+  std::unique_ptr<cudf::table> prefiltered;  // backs input_table_view when rows were dropped
+  if (threshold_coordinator && input_table_view.num_rows() > 0) {
+    auto const observed_updates = threshold_coordinator->boundary_update_count();
+    if (prefilter_gate.applicable(observed_updates)) {
+      if (auto const boundary = threshold_coordinator->tightest_boundary()) {
+        auto const params = make_boundary_filter_params(
+          *boundary, threshold_coordinator->keys(), threshold_coordinator->lex_admitted());
+        auto result = detail::apply_boundary_filter(
+          input_table_view, key_columns, params, stream, memory_resource);
+        auto const rows_in  = static_cast<std::size_t>(input_table_view.num_rows());
+        auto const rows_out = static_cast<std::size_t>(result.rows_kept);
+        threshold_coordinator->record_prefilter(rows_in, rows_out);
+        prefilter_gate.record_keep_ratio(rows_in, rows_out, observed_updates);
+        if (!prefilter_gate.applicable(observed_updates)) {
+          threshold_coordinator->record_prefilter_disabled();
+        }
+        // A null result is the all-pass fast path: keep the original view, copy-free.
+        if (result.filtered) {
+          prefiltered      = std::move(result.filtered);
+          input_table_view = prefiltered->view();
+        }
+      }
+    }
+  }
+
+  auto output_table =
+    compute_top_n_table(input_table_view, orders, limit, offset, stream, memory_resource);
   // ro released at end of function
+
+  // Witness extraction: a local result owning exactly K rows proves row K-1's key tuple is a
+  // legal boundary; sub-K results publish nothing.
+  std::optional<exact_host_key_tuple> boundary_tuple;
+  if (threshold_coordinator &&
+      static_cast<std::size_t>(output_table->num_rows()) == threshold_coordinator->k()) {
+    boundary_tuple = extract_boundary_tuple(output_table->view(),
+                                            threshold_coordinator->keys(),
+                                            key_columns,
+                                            output_table->num_rows() - 1,
+                                            stream,
+                                            memory_resource);
+  }
 
   std::vector<std::shared_ptr<cucascade::data_batch>> outputs;
   // STREAM-LINEAGE: compute_top_n_table writes the output table on `stream`;
@@ -199,7 +369,22 @@ std::unique_ptr<operator_data> sirius_physical_top_n::execute(const operator_dat
     batch_id,
     std::move(output_data),
     telemetry::quent_data_batch_probe::create(batch_telemetry(), batch_id)));
+
+  if (boundary_tuple) {
+    // The host reads completed inside the extraction, and the witness co-owns the K-row result
+    // batch. The offer's own result needs no handling here: publication, coalescing, and
+    // rejection are all the coordinator's business and are recorded in its counters.
+    (void)threshold_coordinator->offer({std::move(*boundary_tuple), outputs.back()});
+  }
   return std::make_unique<pipelineable_operator_data>(outputs);
+}
+
+void sirius_physical_top_n_merge::on_finalize_operator()
+{
+  // Producer-side drain after the merge's pipeline completes -- after the last merge execute in
+  // both the fused and the standalone pipeline shapes. Idempotent. It blocks this finalization
+  // task until the publisher is quiescent, never a scan consumer.
+  if (threshold_coordinator) { threshold_coordinator->finish(); }
 }
 
 void sirius_physical_top_n_merge::build_pipelines(pipeline::sirius_pipeline& current,
@@ -225,6 +410,9 @@ sirius_physical_top_n_merge::sirius_physical_top_n_merge(sirius_physical_top_n* 
       top_n->estimated_cardinality)
 {
   child_op = top_n;
+  // shared_ptr - shares the execution coordinator so on_finalize_operator can drain it. The
+  // prefilter gate stays per-operator: the merge never prefilters.
+  threshold_coordinator = top_n->threshold_coordinator;
 }
 
 sirius_physical_top_n_merge::sirius_physical_top_n_merge(

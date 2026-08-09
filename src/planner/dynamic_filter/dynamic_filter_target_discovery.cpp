@@ -15,6 +15,8 @@
  */
 
 // sirius
+#include <cudf/utilities/traits.hpp>
+
 #include <expression/ast/node.hpp>
 #include <op/sirius_physical_filter.hpp>
 #include <op/sirius_physical_grouped_aggregate.hpp>
@@ -92,7 +94,19 @@ std::optional<std::size_t> group_by_key_input(std::vector<int> const& group_idx,
 {
   if (grouping_set_count > 1) { return std::nullopt; }
   if (output_ordinal >= group_idx.size()) { return std::nullopt; }
+  // A negative entry would wrap into an enormous ordinal that no caller could detect as invalid.
+  if (group_idx[output_ordinal] < 0) { return std::nullopt; }
   return static_cast<std::size_t>(group_idx[output_ordinal]);
+}
+
+bool boundary_key_matches_site_type(cudf::data_type key_storage_type,
+                                    cudf::data_type site_column_type) noexcept
+{
+  // Plain equality, for every key type. The traced hops are all value- and type-preserving
+  // (reference-only projections, filter gathers, row masks, positional group-key maps), so an
+  // admitted key and the column it binds always agree; requiring that rather than assuming it
+  // costs nothing and removes the question of which types carry a scale.
+  return key_storage_type == site_column_type;
 }
 
 std::optional<descent_step> join_block_descent(
@@ -132,6 +146,9 @@ std::vector<descent_step> descent_steps(sirius::op::sirius_physical_operator con
       return {descent_step{.child_index = 0, .child_ordinal = *input}};
     }
     case SiriusPhysicalOperatorType::HASH_GROUP_BY: {
+      // The Top-N self-trace refuses aggregates: an aggregate is a FULL barrier that also
+      // destroys key lineage, so no threshold can reach below it.
+      if (policy.top_n_self_trace) { return {}; }
       auto const& aggregate = node.Cast<sirius::op::sirius_physical_grouped_aggregate>();
       auto const input =
         group_by_key_input(aggregate.group_idx, aggregate.grouping_sets.size(), output_ordinal);
@@ -139,6 +156,8 @@ std::vector<descent_step> descent_steps(sirius::op::sirius_physical_operator con
       return {descent_step{.child_index = 0, .child_ordinal = *input}};
     }
     case SiriusPhysicalOperatorType::HASH_JOIN: {
+      // Join hops are the Stage-7 widening, not the minimal self-trace set.
+      if (policy.top_n_self_trace) { return {}; }
       auto const& join = node.Cast<sirius::op::sirius_physical_hash_join>();
       return as_steps(join_block_descent(join.join_type,
                                          join.lhs_output_columns.col_idxs,
@@ -161,6 +180,12 @@ std::vector<descent_step> descent_steps(sirius::op::sirius_physical_operator con
     // A physical union's output is positionally aligned with every child by construction, so the
     // trace fans out into each child at the same ordinal.
     case SiriusPhysicalOperatorType::UNION: {
+      // The Top-N self-trace stops here. Set operations are rejected during planning today, so a
+      // physical UNION is never constructed and this hop could not be exercised; carrying an
+      // untestable multi-branch path (and the guards it would need) is worse than terminating,
+      // which is always sound. The hop returns with set-operation support, together with a test
+      // that can run. The join policy keeps the fan-out unchanged.
+      if (policy.top_n_self_trace) { return {}; }
       std::vector<descent_step> steps;
       steps.reserve(node.children.size());
       for (std::size_t child_index = 0; child_index < node.children.size(); ++child_index) {
@@ -304,6 +329,123 @@ std::vector<route_terminal> trace_probe_key(sirius::op::sirius_physical_operator
   std::vector<route_terminal> terminals;
   trace_probe_key_into(root, a0, policy, terminals);
   return terminals;
+}
+
+bool hop_is_material(sirius::op::sirius_physical_operator const& node) noexcept
+{
+  // Only per-row work an endpoint below the node would save counts. A FILTER evaluates its
+  // predicate per row; projections that merely forward references, UNION fan-out, and existing
+  // endpoints move no work.
+  return node.type == sirius::op::SiriusPhysicalOperatorType::FILTER;
+}
+
+namespace {
+
+/// One accepted all-keys hop: the shared child shape plus each key's remapped ordinal.
+struct all_keys_step {
+  std::size_t child_index = 0;
+  std::vector<std::size_t> child_ordinals;
+};
+
+/**
+ * @brief The hops every traced ordinal survives together, or empty when any ordinal stops here
+ *
+ * Each ordinal is remapped independently by @ref descent_steps, but the hop is accepted only when
+ * every ordinal produces the same child shape -- otherwise the keys would part company and no
+ * single site could carry the full tuple.
+ */
+std::vector<all_keys_step> all_keys_steps(sirius::op::sirius_physical_operator const& node,
+                                          std::vector<std::size_t> const& ordinals,
+                                          descent_policy policy)
+{
+  std::vector<std::vector<descent_step>> per_ordinal;
+  per_ordinal.reserve(ordinals.size());
+  for (auto const ordinal : ordinals) {
+    auto steps = descent_steps(node, ordinal, policy);
+    if (!steps_are_followable(node, steps)) { return {}; }
+    per_ordinal.push_back(std::move(steps));
+  }
+  if (per_ordinal.empty()) { return {}; }
+
+  auto const& shape = per_ordinal.front();
+  for (auto const& steps : per_ordinal) {
+    if (steps.size() != shape.size()) { return {}; }
+    for (std::size_t i = 0; i < shape.size(); ++i) {
+      if (steps[i].child_index != shape[i].child_index) { return {}; }
+    }
+  }
+
+  std::vector<all_keys_step> accepted;
+  accepted.reserve(shape.size());
+  for (std::size_t i = 0; i < shape.size(); ++i) {
+    all_keys_step step{.child_index = shape[i].child_index, .child_ordinals = {}};
+    step.child_ordinals.reserve(ordinals.size());
+    for (auto const& steps : per_ordinal) {
+      step.child_ordinals.push_back(steps[i].child_ordinal);
+    }
+    accepted.push_back(std::move(step));
+  }
+  return accepted;
+}
+
+void trace_top_n_all_keys_into(sirius::op::sirius_physical_operator& node,
+                               std::vector<std::size_t> ordinals,
+                               descent_policy policy,
+                               std::size_t material_hops,
+                               std::vector<multi_key_route_terminal>& terminals)
+{
+  auto const steps = all_keys_steps(node, ordinals, policy);
+  if (steps.empty()) {
+    terminals.push_back(multi_key_route_terminal{
+      .node = &node, .ordinals = std::move(ordinals), .material_hops = material_hops});
+    return;
+  }
+  auto const hops = material_hops + (hop_is_material(node) ? 1 : 0);
+  for (auto const& step : steps) {
+    trace_top_n_all_keys_into(
+      *node.children[step.child_index], step.child_ordinals, policy, hops, terminals);
+  }
+}
+
+}  // namespace
+
+std::vector<multi_key_route_terminal> trace_top_n_all_keys(
+  sirius::op::sirius_physical_operator& root,
+  std::span<std::size_t const> key_ordinals,
+  descent_policy policy)
+{
+  std::vector<multi_key_route_terminal> terminals;
+  if (key_ordinals.empty()) { return terminals; }
+  trace_top_n_all_keys_into(
+    root, std::vector<std::size_t>{key_ordinals.begin(), key_ordinals.end()}, policy, 0, terminals);
+  return terminals;
+}
+
+top_n_target_kind classify_top_n_terminal(route_terminal const& terminal,
+                                          sirius::op::top_n_filter_layer layer,
+                                          std::size_t material_hops_above,
+                                          bool coincides_with_lex_site)
+{
+  // The LEX predicate implies the inclusive first-key bound, so a site already receiving LEX must
+  // not also receive FIRST_KEY.
+  if (layer == sirius::op::top_n_filter_layer::FIRST_KEY && coincides_with_lex_site) {
+    return top_n_target_kind::SUBSUMED_BY_LEX;
+  }
+  if (terminal.node != nullptr &&
+      terminal.node->type == sirius::op::SiriusPhysicalOperatorType::TABLE_SCAN) {
+    return top_n_target_kind::SCAN_BIND;
+  }
+  // Only pass-through hops separate this site from the sink, so the sink prefilter already
+  // applies the same predicate over the same rows -- an endpoint here would buy nothing. This is
+  // a cost-gate decision, and stays distinct from the staged gap below.
+  if (material_hops_above == 0) { return top_n_target_kind::ENDPOINT_SKIPPED_IMMATERIAL; }
+  // A LEX site is worth having, but splicing it needs placement addressing every component
+  // ordinal; that generalization lands in Stage 7. Reported distinctly so a staged gap is never
+  // mistaken for the cost gate declining.
+  if (layer == sirius::op::top_n_filter_layer::LEX) {
+    return top_n_target_kind::LEX_ENDPOINT_DEFERRED;
+  }
+  return top_n_target_kind::ENDPOINT_SITE;
 }
 
 endpoint_placement place_endpoint(duckdb::unique_ptr<sirius::op::sirius_physical_operator> subtree,

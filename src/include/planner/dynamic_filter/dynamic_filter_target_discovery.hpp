@@ -33,10 +33,14 @@
 // cudf
 #include <cudf/types.hpp>
 
+// sirius
+#include <op/dynamic_filter/top_n_dynamic_filter_publish_plan.hpp>
+
 // stdlib
 #include <cstddef>
 #include <functional>
 #include <optional>
+#include <span>
 #include <vector>
 
 namespace sirius::ast {
@@ -50,11 +54,29 @@ class sirius_physical_operator;
 namespace sirius::planner {
 
 /**
- * @brief Controls whether a dynamic-filter trace may enter join build blocks
+ * @brief Controls which hops a dynamic-filter trace may take
  */
 struct descent_policy {
   /// Whether the trace may enter an intervening join's build block
   bool descend_build_blocks = false;
+
+  /**
+   * @brief Restrict hops to the Top-N self-trace set
+   *
+   * Accepts plain-reference projections, `FILTER` pass-through/gather, and existing endpoints;
+   * refuses joins, aggregates, set operations, and every other operator, so each Top-N trace
+   * yields exactly one terminal. Positional `UNION` stays a fan-out hop for the join policy but
+   * is refused here: Sirius rejects set operations at planning, so the fan-out branch and the
+   * multi-branch guards it needs are unreachable and untestable. Restoring it is part of
+   * supporting set operations, together with those guards and a runnable test. Stage 7 widens
+   * this set per proven hop, not by flipping the bit off. Default false, so join callers keep
+   * their existing hop set exactly.
+   *
+   * The aggregate refusal is keyed to this bit, not to the producer kind: the Stage-5 group-key
+   * producer needs its own admission path with inclusive-only predicates, not a relaxation of
+   * this one.
+   */
+  bool top_n_self_trace = false;
 };
 
 /**
@@ -165,6 +187,101 @@ struct endpoint_placement {
  */
 [[nodiscard]] std::vector<route_terminal> trace_probe_key(
   sirius::op::sirius_physical_operator& root, std::size_t a0, descent_policy policy);
+
+/**
+ * @brief Where one branch of an all-keys trace bottomed out
+ *
+ * The multi-key counterpart of @ref route_terminal: every traced ordinal survives to @p node,
+ * remapped independently, with key zero's ordinal first.
+ */
+struct multi_key_route_terminal {
+  sirius::op::sirius_physical_operator* node = nullptr;  ///< Borrowed from the walked subtree
+  std::vector<std::size_t> ordinals;  ///< In @c node's output space, primary (key zero) first
+  std::size_t material_hops = 0;      ///< Accepted hops over per-row work between the Top-N input
+                                      ///< and @c node (see @ref hop_is_material)
+};
+
+/**
+ * @brief Whether an accepted hop crosses per-row work a sited endpoint would save
+ *
+ * Material today means `FILTER`: an endpoint below it prunes rows the filter would otherwise
+ * evaluate. Pass-through projections, `UNION` fan-out, and existing endpoints move no work, so a
+ * site separated from the Top-N input by those alone is immaterial -- the sink prefilter already
+ * applies the same predicate over the same rows.
+ */
+[[nodiscard]] bool hop_is_material(sirius::op::sirius_physical_operator const& node) noexcept;
+
+/**
+ * @brief Trace the full ordinal set toward the deepest schema where every key coexists
+ *
+ * The all-keys counterpart of @ref trace_probe_key for the LEX layer: a hop is accepted only when
+ * every ordinal in @p key_ordinals survives it, each remapped independently by the same
+ * @ref descent_steps rules. The terminal carries all remapped ordinals, primary (key zero)
+ * first, and the count of material hops above it. Terminates at worst at @p root itself, which
+ * always exists. A fan-out step yields one terminal per reached branch.
+ *
+ * @param[in] root The Top-N child subtree to trace
+ * @param[in] key_ordinals Every ORDER BY key's ordinal in @p root's output space, key zero first
+ * @param[in] policy Which hops this producer may take
+ * @return The terminal node, remapped ordinals, and material-hop count of every reached branch
+ */
+[[nodiscard]] std::vector<multi_key_route_terminal> trace_top_n_all_keys(
+  sirius::op::sirius_physical_operator& root,
+  std::span<std::size_t const> key_ordinals,
+  descent_policy policy);
+
+/**
+ * @brief How one Top-N trace terminal should be consumed
+ */
+enum class top_n_target_kind {
+  SCAN_BIND,                    ///< Bind into the scan's reader AST
+  ENDPOINT_SITE,                ///< Splice a sited endpoint above the terminal
+  ENDPOINT_SKIPPED_IMMATERIAL,  ///< No material work between site and sink; the prefilter covers it
+  SUBSUMED_BY_LEX,              ///< A LEX target already covers this site, which implies this bound
+  LEX_ENDPOINT_DEFERRED         ///< Worth siting, but multi-ordinal placement lands in Stage 7
+};
+
+/**
+ * @brief Classify one Top-N trace terminal into its target kind
+ *
+ * A supported scan terminal is a scan bind (for the all-keys trace, every component must land on
+ * a supported decoded scan column -- the caller checks that before calling). Any other terminal
+ * is an endpoint site, marked immaterial when only pass-through hops separate it from the Top-N
+ * input, because sink self-consumption applies the same predicate there. A `FIRST_KEY` terminal
+ * coinciding with a planned `LEX` target's site is marked subsumed by the caller, which alone
+ * knows the LEX sites; pass @p coincides_with_lex_site to have it reported here.
+ *
+ * A material `LEX` terminal that is not a scan reports @c LEX_ENDPOINT_DEFERRED rather than
+ * @c ENDPOINT_SITE: siting it needs multi-ordinal placement, which lands in Stage 7. Keeping it
+ * distinct from @c ENDPOINT_SKIPPED_IMMATERIAL is deliberate -- the skip counter must mean "the
+ * cost gate said no", never "this stage cannot express it".
+ *
+ * @param[in] terminal Where the trace bottomed out
+ * @param[in] layer Which layer this terminal would carry
+ * @param[in] material_hops_above Accepted hops over per-row work between the site and the sink
+ * @param[in] coincides_with_lex_site Whether a planned LEX target sits at the same node
+ */
+[[nodiscard]] top_n_target_kind classify_top_n_terminal(route_terminal const& terminal,
+                                                        sirius::op::top_n_filter_layer layer,
+                                                        std::size_t material_hops_above,
+                                                        bool coincides_with_lex_site = false);
+
+/**
+ * @brief Whether a boundary key may be published against a site column of @p site_column_type
+ *
+ * A key is compared as its raw representation everywhere downstream -- the kernel widens it,
+ * `exact_host_scalar::compare` widens it, and neither consults the type. For a fixed-point key
+ * that is correct only when both sides carry the same scale, so any mismatch refuses the site
+ * rather than rescaling: rescaling is where precision is silently lost. The check is stated for
+ * every key type rather than only the scaled ones, because every traced hop is type-preserving and
+ * so the equality holds regardless -- asserting it is free and leaves no type-specific carve-out
+ * for a later widening to overlook.
+ *
+ * @param[in] key_storage_type The key's admitted cuDF storage type, from the planner's allowlist
+ * @param[in] site_column_type The cuDF type of the column this target would bind at
+ */
+[[nodiscard]] bool boundary_key_matches_site_type(cudf::data_type key_storage_type,
+                                                  cudf::data_type site_column_type) noexcept;
 
 /**
  * @brief Whether a producing join of type @p t may bind a key INTO a probe-side scan

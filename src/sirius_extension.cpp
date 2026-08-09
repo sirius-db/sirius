@@ -2042,6 +2042,16 @@ static void SetDynamicFilterKeepThreshold(ClientContext& context, SetScope scope
                    params->dynamic_filter_keep_threshold);
 }
 
+static void SetEnableTopNDynamicFilter(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  auto slot                           = lock_operator_params_slot(context);
+  params->enable_top_n_dynamic_filter = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config ENABLE_TOP_N_DYNAMIC_FILTER to {}",
+                   params->enable_top_n_dynamic_filter);
+}
+
 static void SetEnablePinnedZoneMapPruning(ClientContext& context, SetScope scope, Value& parameter)
 {
   auto* params = get_operator_params(context);
@@ -2333,6 +2343,15 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
     LogicalType::DOUBLE,
     Value::DOUBLE(sirius::operator_params{}.dynamic_filter_keep_threshold),
     SetDynamicFilterKeepThreshold);
+
+  config.AddExtensionOption(
+    "enable_top_n_dynamic_filter",
+    "Enable Top-N threshold refinement: the Top-N sink prefilters its own input from a shared "
+    "boundary and publishes that boundary into scan and endpoint dynamic-filter channels; "
+    "independent of enable_dynamic_filter, the join path (off by default)",
+    LogicalType::BOOLEAN,
+    Value::BOOLEAN(sirius::operator_params{}.enable_top_n_dynamic_filter),
+    SetEnableTopNDynamicFilter);
 
   config.AddExtensionOption(
     "enable_pinned_zone_map_pruning",

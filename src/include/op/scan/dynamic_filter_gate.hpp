@@ -25,7 +25,7 @@
 
 namespace sirius::op {
 class sirius_dynamic_filter;
-class sirius_dynamic_filter_set;
+struct dynamic_filter_snapshot;
 }  // namespace sirius::op
 
 namespace sirius::op::scan {
@@ -37,9 +37,15 @@ namespace sirius::op::scan {
 ///
 /// `apply_dynamic_filters_gated_view()` uses the first applicable non-empty batch to decide whether
 /// post-decode filtering earns its cost. A keep ratio above `keep_threshold` disables filtering;
-/// otherwise the gate becomes permanently active. If an append-only channel grows after a disable
-/// decision, the new filter count permits one new measurement. Decision updates are serialized so
-/// an older concurrent batch cannot overwrite an active decision.
+/// otherwise the gate becomes permanently active. If the change signal grows after a disable
+/// decision, the gate permits one new measurement. Decision updates are serialized so an older
+/// concurrent batch cannot overwrite an active decision.
+///
+/// One monotonic re-arm marker per instance, and one marker domain per instance, fixed by the
+/// instance's owner: a scan or endpoint gate only ever observes channel generations (snapshot
+/// overloads; append-only set callers delegate through them), while the Top-N sink prefilter gate
+/// only ever observes its coordinator's boundary-update count. Mixing domains on one instance is
+/// a programming error enforced by call-site discipline, not runtime tagging.
 class dynamic_filter_gate {
  public:
   /// Default fraction of retained rows above which the scan's post-decode filtering is disabled
@@ -53,18 +59,26 @@ class dynamic_filter_gate {
   {
   }
 
-  /// True when a gated apply would do work now: at least one filter exists, and the gate is active
-  /// or the append-only filter count has grown beyond the snapshot that disabled it.
-  [[nodiscard]] bool applicable(sirius::op::sirius_dynamic_filter_set const& filters) const;
+  /// Channel-free variant of @ref applicable for callers whose growth signal is a monotonic
+  /// update count instead of a filter set -- the Top-N sink prefilter passes its coordinator's
+  /// boundary-update count. Work is due when the count is nonzero and the gate is active or the
+  /// count has grown beyond the measurement that disabled it.
+  [[nodiscard]] bool applicable(std::size_t observed_update_count) const;
 
-  /// Record one split's keep ratio (@p rows_after / @p rows_before) for an apply that observed
-  /// @p observed_filter_count filters (snapshot taken before computing the mask). If a generic
-  /// multi-producer caller extends the channel concurrently, the count change causes at most one
-  /// extra re-measurement. Empty splits are no-ops; an active gate never demotes; a disabled gate
-  /// re-decides only when the apply saw more filters than the disabling one did.
+  /// Generation-aware applicability: work is due when @p snap holds filters and the gate is
+  /// active or the channel generation has advanced past the disabling decision's generation
+  /// (replacement never grows `filter_count`, so generation is the scan-side change signal).
+  [[nodiscard]] bool applicable(sirius::op::dynamic_filter_snapshot const& snap) const;
+
+  /// Record one split's keep ratio (@p rows_after / @p rows_before) against @p observed_marker,
+  /// the instance's change-signal value observed before computing the mask (channel generation
+  /// for scan/endpoint gates, boundary-update count for the prefilter gate; `std::size_t`
+  /// callers convert losslessly). A concurrent grower causes at most one extra re-measurement.
+  /// Empty splits are no-ops; an active gate never demotes; a disabled gate re-decides only when
+  /// the apply observed a newer marker than the disabling one did.
   void record_keep_ratio(std::size_t rows_before,
                          std::size_t rows_after,
-                         std::size_t observed_filter_count);
+                         std::uint64_t observed_marker);
 
   //===--------------------------------------------------------------------===//
   // Per-filter marginal usefulness
@@ -105,9 +119,10 @@ class dynamic_filter_gate {
 
   std::atomic<state> _state{state::unknown};
 
-  /// Filter count observed by the apply whose ratio last decided @c _state. Read together with
-  /// @c _state without joint atomicity: a torn read at worst causes one extra measurement.
-  std::atomic<std::size_t> _decided_filter_count{0};
+  /// Change-signal marker observed by the apply whose ratio last decided @c _state (one domain
+  /// per instance -- see the class comment). Read together with @c _state without joint
+  /// atomicity: a torn read at worst causes one extra measurement.
+  std::atomic<std::uint64_t> _decided_marker{0};
 
   /// Serializes the rare decision update after a mask has already been computed. Applicability
   /// remains lock-free; the lock only makes the state/count transition honor ACTIVE's terminal

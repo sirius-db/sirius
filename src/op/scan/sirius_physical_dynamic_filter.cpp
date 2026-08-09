@@ -33,12 +33,14 @@ sirius_physical_dynamic_filter::sirius_physical_dynamic_filter(
   std::size_t estimated_cardinality,
   std::shared_ptr<sirius::op::sirius_dynamic_filter_set> filters,
   double gate_keep_threshold,
-  dynamic_filter_apply_mode mode)
+  dynamic_filter_apply_mode mode,
+  dynamic_filter_endpoint_provenance provenance)
   : sirius_physical_operator(
       SiriusPhysicalOperatorType::DYNAMIC_FILTER, std::move(types), estimated_cardinality),
     _filters(std::move(filters)),
     _gate(gate_keep_threshold),
-    _mode(mode)
+    _mode(mode),
+    _provenance(provenance)
 {
 }
 
@@ -54,10 +56,15 @@ std::unique_ptr<operator_data> sirius_physical_dynamic_filter::execute(
   auto& input = dynamic_cast<const pipelineable_operator_data&>(input_data);
 
   // An immediate BUILD_PROBE target runs after publication, but a scan reached through an
-  // intervening join can race it. Keep the no-filter fast path for that transitive case and for an
-  // intentionally empty publication. The gate remains filter-count-aware if later splits observe
-  // additional filters.
-  if (!_filters || !_gate.applicable(*_filters)) {
+  // intervening join can race it. Keep the lock-free no-filter fast path for that transitive
+  // case and for an intentionally empty publication, then take one coherent snapshot for every
+  // batch of this call -- strictly before any gate lock (the gate re-arms through the snapshot's
+  // generation if later splits observe channel changes).
+  if (!_filters || !_filters->has_filters()) {
+    return std::make_unique<pipelineable_operator_data>(input.get_data_batches());
+  }
+  auto const filters_snapshot = _filters->snapshot();
+  if (!_gate.applicable(filters_snapshot)) {
     return std::make_unique<pipelineable_operator_data>(input.get_data_batches());
   }
 
@@ -72,7 +79,7 @@ std::unique_ptr<operator_data> sirius_physical_dynamic_filter::execute(
     // A null result means nothing was dropped — the gate declined, or no published filter matched.
     // Forward the batch unchanged (zero-copy; its columns stay co-owned via the idle shared_ptr).
     auto filtered = apply_dynamic_filters_gated_view(sirius::get_cudf_table_view(ro),
-                                                     *_filters,
+                                                     filters_snapshot,
                                                      _gate,
                                                      stream,
                                                      _mode,

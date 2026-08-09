@@ -36,59 +36,62 @@ namespace sirius::op::scan {
 ///   for materialized inputs that had no scan-time pruning phase.
 enum class dynamic_filter_apply_mode { membership_masks_only, include_ast_row_masks };
 
-/// @brief AND-merge AST-capable filters from @p filters into @p tree, AND-ing with @p
-/// existing_root when non-null. Returns the new root, or @p existing_root unchanged when no
-/// fragment contributed (empty set, filters lack the AST capability, or referenced columns are
-/// all hive partitions).
+/// @brief AND-merge AST-capable filters from one coherent @p snapshot into @p tree, AND-ing with
+/// @p existing_root when non-null. Returns the new root, or @p existing_root unchanged when no
+/// fragment contributed (empty snapshot, filters lack the AST capability, or referenced columns
+/// are all hive partitions).
 ///
 /// Column index resolution uses @p plan: hive-partition columns are skipped (their values come
 /// from the file path, not the parquet file itself), DATA columns resolve through
 /// @c plan.output_layout to @c plan.data_columns[i].name. Emitted column references use
 /// @c cudf::ast::column_name_reference so the result is compatible with the parquet reader's
-/// @c set_filter API.
+/// @c set_filter API. A multi-column filter resolves every component ordinal the same way and is
+/// skipped whole when any component is a hive partition.
 ///
-/// The returned pointer (when non-null) points into @p tree and remains valid for the lifetime
-/// of @p tree. Device scalars referenced by filter literals are owned by the filter objects in
-/// @p filters and must outlive any installed AST built from this call.
+/// The returned pointer (when non-null) points into @p tree and remains valid for the lifetime of
+/// @p tree. Filter-owned device scalars must outlive any installed AST, which @p snapshot's shared
+/// ownership guarantees while it is held.
 /// @p device_id selects device-local filter storage; -1 resolves to the current CUDA device.
 [[nodiscard]] cudf::ast::expression const* merge_dynamic_filters_into_ast(
   cudf::ast::tree& tree,
   cudf::ast::expression const* existing_root,
-  sirius::op::sirius_dynamic_filter_set const& filters,
+  sirius::op::dynamic_filter_snapshot const& snapshot,
   scan_plan const& plan,
   int device_id = -1);
 
-/// @brief Drop rows of @p input that fail the dynamic filters in @p filters, returning only the
-/// gathered survivors (the caller keeps @p input).
+/// @brief Drop rows of @p input that fail the dynamic filters in one coherent @p snapshot,
+/// returning only the gathered survivors (the caller keeps @p input).
 ///
 /// @p input must be in the scan's output layout: a filtered column index is its position in
 /// @p input directly. Returns nullptr when no filter contributed a mask.
 ///
-/// AST-lowerable zone maps contribute one combined row mask in
-/// @ref dynamic_filter_apply_mode::include_ast_row_masks. Membership filters then apply
-/// sequentially, with each mask computed over the surviving rows. When @p gate is non-null,
-/// recorded marginal keep ratios order the membership filters and suppress filters that prune too
-/// little. A null gate applies every membership filter without selectivity-based ordering.
+/// In @ref dynamic_filter_apply_mode::include_ast_row_masks, AST-lowerable zone maps contribute
+/// one combined row mask and Top-N boundary filters apply through the fused compaction kernel.
+/// Membership filters then apply sequentially, with each mask computed over the surviving rows.
+/// When @p gate is non-null, recorded marginal keep ratios order the membership filters and
+/// suppress filters that prune too little. A null gate applies every membership filter without
+/// selectivity-based ordering.
 /// @p device_id selects device-local filter storage; -1 resolves to the current CUDA device.
 /// Most scan callers should use @ref apply_dynamic_filters_gated_view, which adds the scan-level
 /// early-out and records the combined keep ratio.
 [[nodiscard]] std::unique_ptr<cudf::table> apply_dynamic_filters_to_view(
   cudf::table_view const& input,
-  sirius::op::sirius_dynamic_filter_set const& filters,
+  sirius::op::dynamic_filter_snapshot const& snapshot,
   rmm::cuda_stream_view stream,
   dynamic_filter_apply_mode mode = dynamic_filter_apply_mode::include_ast_row_masks,
   dynamic_filter_gate* gate      = nullptr,
   int device_id                  = -1);
 
-/// @brief Apply dynamic filters with the scan-level gate.
+/// @brief Apply dynamic filters from one coherent @p snapshot with the scan-level gate.
 ///
 /// Returns nullptr when the gate declines or no compatible device-local filter contributed a mask.
 /// A mask-less apply does not train the gate: a GPU missing a best-effort replica must not disable
-/// useful replicas on other GPUs.
+/// useful replicas on other GPUs. The gate's keep ratio is recorded against @c snapshot.generation,
+/// because a slot replacement never grows @c filter_count.
 /// @p device_id selects device-local filter storage; -1 resolves to the current CUDA device.
 [[nodiscard]] std::unique_ptr<cudf::table> apply_dynamic_filters_gated_view(
   cudf::table_view const& input,
-  sirius::op::sirius_dynamic_filter_set const& filters,
+  sirius::op::dynamic_filter_snapshot const& snapshot,
   dynamic_filter_gate& gate,
   rmm::cuda_stream_view stream,
   dynamic_filter_apply_mode mode,

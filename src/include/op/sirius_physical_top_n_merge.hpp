@@ -30,6 +30,8 @@ class sirius_physical_plan_generator;
 }  // namespace planner
 namespace op {
 
+class top_n_threshold_coordinator;
+
 //! Represents a physical ordering of the data. Note that this will not change
 //! the data but only add a selection vector.
 class sirius_physical_top_n_merge : public sirius_physical_operator {
@@ -51,6 +53,15 @@ class sirius_physical_top_n_merge : public sirius_physical_operator {
   std::size_t offset;
   //! Dynamic table filter (if any)
   duckdb::shared_ptr<duckdb::DynamicFilterData> dynamic_filter;
+
+  /**
+   * @brief Threshold coordinator shared with the local `sirius_physical_top_n`
+   *
+   * Copied by the delegating constructor exactly as `dynamic_filter` is; the merge only calls
+   * `finish()` from `on_finalize_operator()`, never offers a boundary, and runs no prefilter
+   * (its FULL barrier means the child scan pipelines have already drained).
+   */
+  std::shared_ptr<top_n_threshold_coordinator> threshold_coordinator;
 
   sirius_physical_operator* child_op;
   sirius_physical_operator* get_child_op() const { return child_op; }
@@ -75,6 +86,10 @@ class sirius_physical_top_n_merge : public sirius_physical_operator {
                                          rmm::cuda_stream_view stream) override;
 
   std::unique_ptr<operator_data> get_next_task_input_data() override;
+
+ protected:
+  //! Drains the shared threshold coordinator (`finish()`) once this merge's pipeline completes.
+  void on_finalize_operator() override;
 
  private:
   friend class sirius::planner::sirius_physical_plan_generator;

@@ -121,6 +121,26 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
   cucascade::memory::memory_space& memory_space,
   const telemetry::batch_telemetry_info& telemetry_info)
 {
+  return local_grouped_aggregate(get_cudf_table_view(input),
+                                 group_idx,
+                                 aggregates,
+                                 aggregate_idx,
+                                 aggregate_struct_col_indices,
+                                 stream,
+                                 memory_space,
+                                 telemetry_info);
+}
+
+std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggregate(
+  const cudf::table_view& input_table,
+  const std::vector<int>& group_idx,
+  const std::vector<cudf::aggregation::Kind>& aggregates,
+  const std::vector<int>& aggregate_idx,
+  const std::vector<std::vector<int>>& aggregate_struct_col_indices,
+  rmm::cuda_stream_view stream,
+  cucascade::memory::memory_space& memory_space,
+  const telemetry::batch_telemetry_info& telemetry_info)
+{
   // Sanity check
   if (aggregates.size() != aggregate_idx.size()) {
     throw std::runtime_error(
@@ -130,8 +150,7 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
 
   const bool has_struct_col_indices = !aggregate_struct_col_indices.empty();
 
-  auto input_table = get_cudf_table_view(input);
-  auto mr          = memory_space.get_default_allocator();
+  auto mr = memory_space.get_default_allocator();
 
   // Dictionary-encode STRING group keys when:
   //  1. Average string length >= 4 bytes (short strings hash nearly as fast as

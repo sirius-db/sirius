@@ -17,6 +17,8 @@
 #pragma once
 
 #include "op/dynamic_filter/dynamic_filter_replica_space.hpp"
+#include "op/dynamic_filter/exact_host_scalar.hpp"
+#include "op/dynamic_filter/top_n_boundary_filter.hpp"
 
 // cudf
 #include <cudf/ast/ast_operator.hpp>
@@ -33,6 +35,7 @@
 // standard library
 #include <atomic>
 #include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -46,10 +49,11 @@ namespace sirius::op {
 /**
  * @brief Kind tag for @ref sirius_dynamic_filter subtypes
  *
- * Keep this enum in sync with the concrete zone-map, IN-list, and Bloom implementations. See
- * `docs/super-sirius/dynamic-filters.md` for their consumer capabilities.
+ * Keep this enum in sync with the concrete filter implementations; additions are append-at-end so
+ * existing values never renumber. See `docs/super-sirius/dynamic-filters.md` and
+ * `docs/super-sirius/dynamic-filters-top-n.md` for consumer capabilities.
  */
-enum class sirius_dynamic_filter_kind { ZONE_MAP, IN_LIST, BLOOM };
+enum class sirius_dynamic_filter_kind { ZONE_MAP, IN_LIST, BLOOM, RANGE, LEX_RANGE };
 
 //===----------------------------------------------------------------------===//
 // sirius_dynamic_filter
@@ -534,6 +538,333 @@ class sirius_dynamic_bloom_filter final : public sirius_dynamic_filter,
 };
 
 //===----------------------------------------------------------------------===//
+// Top-N boundary filters (RANGE, LEX_RANGE)
+//===----------------------------------------------------------------------===//
+
+/**
+ * @brief Resolves a consumer column index to an AST expression already emplaced in the tree
+ *
+ * The expression is typically a `cudf::ast::column_reference` or a
+ * `cudf::ast::column_name_reference`.
+ */
+using column_ref_resolver_fn = std::function<cudf::ast::expression const&(std::size_t col_idx)>;
+
+/**
+ * @brief Capability mixin: filter applies itself on device by fused predicate + compaction
+ *
+ * The device row-wise sibling of the AST path: one kernel pass, no BOOL8 mask. Implemented by
+ * RANGE and LEX_RANGE over `detail::apply_boundary_filter`; consumers dispatch on the capability
+ * and never see the kernel. AST lowering remains solely for the parquet reader checkpoint.
+ */
+class sirius_compaction_applicable {
+ public:
+  virtual ~sirius_compaction_applicable() = default;
+
+  /**
+   * @brief Filter @p batch in one fused pass
+   *
+   * @param[in] key_columns The filter's component columns in @p batch, primary first; a RANGE
+   * caller passes its single channel column.
+   * @param[in] device_id Device executing the pass, or -1 for the current device.
+   * @return Null `filtered` when nothing was dropped or the filter cannot apply; `rows_kept`
+   * always valid.
+   */
+  [[nodiscard]] virtual detail::boundary_filter_result apply_compact(
+    cudf::table_view const& batch,
+    std::span<cudf::size_type const> key_columns,
+    int device_id,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) const = 0;
+};
+
+/**
+ * @brief Capability mixin: filter lowers itself against several consumer columns
+ *
+ * The multi-column sibling of @ref sirius_ast_lowerable. Instead of one pre-emplaced column
+ * reference, the consumer supplies its existing @ref column_ref_resolver_fn; the filter resolves
+ * each ordinal it references.
+ */
+class sirius_multi_column_ast_lowerable {
+ public:
+  virtual ~sirius_multi_column_ast_lowerable() = default;
+
+  /**
+   * @brief Lower to a BOOL fragment referencing every component column
+   *
+   * Nodes are owned by @p tree; device scalars referenced by literals are owned by the filter.
+   *
+   * @param[in] resolver Maps a consumer output ordinal to an AST column expression already
+   * emplaced in @p tree. Invoked once per referenced ordinal; must stay valid for the call.
+   */
+  [[nodiscard]] virtual cudf::ast::expression const& to_ast(cudf::ast::tree& tree,
+                                                            column_ref_resolver_fn const& resolver,
+                                                            int device_id = -1) const = 0;
+
+  /**
+   * @brief Consumer ordinals this filter references, primary first
+   */
+  [[nodiscard]] virtual std::span<std::size_t const> referenced_ordinals() const noexcept = 0;
+};
+
+enum class range_bound_side { LOWER, UPPER };
+
+/**
+ * @brief What a RANGE predicate does with null probe values
+ */
+enum class dynamic_filter_null_policy { ADMIT, REJECT };
+
+/**
+ * @brief Immutable one-sided range filter: keeps rows on one side of an exact boundary
+ *
+ * Lowers to `col > B` / `col >= B` (LOWER) or `col < B` / `col <= B` (UPPER), wrapped per @ref
+ * dynamic_filter_null_policy (`IS NULL OR pred` to admit, bare comparison to reject). Not a
+ * synthetic zone map: one meaningful side, no sentinel bound (main doc, "Range and lexicographic
+ * filters"). Immutable after construction; the compaction path needs no device replicas (the
+ * boundary rides kernel launch parameters), so @ref is_available_on_device gates only the AST
+ * path's literal scalars.
+ *
+ * @pre The boundary's storage type equals the consumer column's type.
+ */
+class sirius_dynamic_range_filter final : public sirius_dynamic_filter,
+                                          public sirius_ast_lowerable,
+                                          public sirius_compaction_applicable,
+                                          public sirius_device_replicable {
+ public:
+  /**
+   * @throw std::invalid_argument if @p bound's type is outside the admitted allowlist
+   * @throw std::runtime_error if the current CUDA device cannot be identified
+   */
+  sirius_dynamic_range_filter(exact_host_scalar bound,
+                              range_bound_side side,
+                              bool inclusive,
+                              dynamic_filter_null_policy null_policy);
+  ~sirius_dynamic_range_filter() noexcept override;
+
+  sirius_dynamic_range_filter(sirius_dynamic_range_filter const&)            = delete;
+  sirius_dynamic_range_filter& operator=(sirius_dynamic_range_filter const&) = delete;
+
+  [[nodiscard]] sirius_dynamic_filter_kind kind() const override
+  {
+    return sirius_dynamic_filter_kind::RANGE;
+  }
+
+  [[nodiscard]] cudf::ast::expression const& to_ast(cudf::ast::tree& tree,
+                                                    cudf::ast::expression const& column_ref,
+                                                    int device_id = -1) const override;
+
+  [[nodiscard]] detail::boundary_filter_result apply_compact(
+    cudf::table_view const& batch,
+    std::span<cudf::size_type const> key_columns,
+    int device_id,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) const override;
+
+  /**
+   * @brief Materialize the boundary scalar on every planned consumer device
+   *
+   * Unlike the join filters' best-effort per-target policy, RANGE replication is all-or-nothing:
+   * any target failure throws, the caller installs nothing, and the previous revision stays
+   * visible on every device (main doc, "Multi-GPU publication").
+   */
+  void replicate_to_devices(std::span<dynamic_filter_replica_space const> spaces) override;
+  [[nodiscard]] bool is_available_on_device(int device_id) const noexcept override;
+
+  [[nodiscard]] exact_host_scalar const& bound() const noexcept { return _bound; }
+  [[nodiscard]] range_bound_side side() const noexcept { return _side; }
+  [[nodiscard]] bool inclusive() const noexcept { return _inclusive; }
+  [[nodiscard]] dynamic_filter_null_policy null_policy() const noexcept { return _null_policy; }
+
+  /**
+   * @brief Pure mapping of one RANGE boundary onto single-component kernel launch parameters
+   *
+   * `descending = (side == LOWER)` makes "better" the kept side (LOWER keeps rows above the
+   * bound, UPPER keeps rows below); `strict = !inclusive`; ADMIT orders nulls better (kept),
+   * REJECT worse (dropped). Exposed for direct unit testing against the kernel's keep-semantics
+   * contract.
+   */
+  [[nodiscard]] static detail::boundary_filter_params make_boundary_filter_params(
+    exact_host_scalar const& bound,
+    range_bound_side side,
+    bool inclusive,
+    dynamic_filter_null_policy null_policy);
+
+ private:
+  exact_host_scalar _bound;
+  range_bound_side _side;
+  bool _inclusive;
+  dynamic_filter_null_policy _null_policy;
+  detail::boundary_filter_params _compaction_params;
+
+  /**
+   * @brief Per-device AST-literal scalar replicas (the constructing device's included); PIMPL'd
+   * so destruction can select the owning device
+   */
+  struct device_scalars;
+  std::vector<std::unique_ptr<device_scalars>> _replicas;
+};
+
+/**
+ * @brief One LEX component's semantics and its consumer-side column binding
+ */
+struct lex_component_semantics {
+  std::size_t consumer_ordinal;  ///< In the target's output space; component 0 is the primary
+  top_n_key_semantics key;
+};
+
+/**
+ * @brief Immutable lexicographic boundary filter over the full ORDER BY tuple
+ *
+ * Lowers to the prefix-disjunction `T0 OR (E0 AND T1) OR ...` with the per-component null
+ * derivations from the main doc's table; the inclusive form appends the all-equal disjunct
+ * `E0 AND ... AND En` (group-key producer -- boundary-tied rows are never dropped). A null tail
+ * component contributes `IS NULL` / `IS NOT NULL` terms and owns no device scalar; the first
+ * component must be non-null. Never decomposed into per-column filters -- the no-tail lemma at
+ * the representation level. Like RANGE, the compaction path needs no device replicas, so @ref
+ * is_available_on_device gates only the AST path.
+ *
+ * @pre `boundary.size() == components.size() >= 2` (a single-key producer publishes RANGE).
+ * @pre `boundary.component(0)` is engaged.
+ */
+class sirius_dynamic_lex_range_filter final : public sirius_dynamic_filter,
+                                              public sirius_multi_column_ast_lowerable,
+                                              public sirius_compaction_applicable,
+                                              public sirius_device_replicable {
+ public:
+  /**
+   * @throw std::invalid_argument on a violated precondition or a component type outside the
+   * admitted allowlist
+   * @throw std::runtime_error if the current CUDA device cannot be identified
+   */
+  sirius_dynamic_lex_range_filter(exact_host_key_tuple boundary,
+                                  std::vector<lex_component_semantics> components,
+                                  bool inclusive);
+  ~sirius_dynamic_lex_range_filter() noexcept override;
+
+  sirius_dynamic_lex_range_filter(sirius_dynamic_lex_range_filter const&)            = delete;
+  sirius_dynamic_lex_range_filter& operator=(sirius_dynamic_lex_range_filter const&) = delete;
+
+  [[nodiscard]] sirius_dynamic_filter_kind kind() const override
+  {
+    return sirius_dynamic_filter_kind::LEX_RANGE;
+  }
+
+  [[nodiscard]] cudf::ast::expression const& to_ast(cudf::ast::tree& tree,
+                                                    column_ref_resolver_fn const& resolver,
+                                                    int device_id = -1) const override;
+  [[nodiscard]] std::span<std::size_t const> referenced_ordinals() const noexcept override;
+
+  [[nodiscard]] detail::boundary_filter_result apply_compact(
+    cudf::table_view const& batch,
+    std::span<cudf::size_type const> key_columns,
+    int device_id,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) const override;
+
+  /**
+   * @brief All-or-nothing, like RANGE: one scalar per non-null component per planned device, or
+   * throw and install nothing
+   */
+  void replicate_to_devices(std::span<dynamic_filter_replica_space const> spaces) override;
+  [[nodiscard]] bool is_available_on_device(int device_id) const noexcept override;
+
+  [[nodiscard]] exact_host_key_tuple const& boundary() const noexcept { return _boundary; }
+  [[nodiscard]] std::vector<lex_component_semantics> const& components() const noexcept
+  {
+    return _components;
+  }
+  [[nodiscard]] bool inclusive() const noexcept { return _inclusive; }
+
+ private:
+  exact_host_key_tuple _boundary;
+  std::vector<lex_component_semantics> _components;
+  bool _inclusive;
+  std::vector<std::size_t> _referenced_ordinals;    ///< Primary first, from _components
+  std::vector<top_n_key_semantics> _key_semantics;  ///< Per component, for kernel marshalling
+  detail::boundary_filter_params _compaction_params;
+
+  /**
+   * @brief Per-device AST-literal scalar replicas, one entry per engaged component; null
+   * components own no scalar anywhere
+   */
+  struct device_scalars;
+  std::vector<std::unique_ptr<device_scalars>> _replicas;
+};
+
+class sirius_dynamic_filter_set;
+
+/**
+ * @brief One column's visible filters inside a coherent snapshot
+ */
+struct column_filter_snapshot {
+  std::size_t column;  ///< Consumer output ordinal -- the channel's one coordinate
+  std::vector<std::shared_ptr<sirius_dynamic_filter const>> filters;  ///< Insertion order
+};
+
+/**
+ * @brief Coherent view of a channel: generation bound atomically to filter pointers
+ *
+ * The only legal input for predicate construction once refinement is enabled. Owning copies keep
+ * superseded filters alive for in-flight consumers (design doc, "Coherent snapshots").
+ * Generation-to-pointer coherence is the guarantee; `logical_filter_count` may lag `columns` by
+ * an in-flight append, whose count bump lands outside the channel mutex -- never treat count ==
+ * total pointers in `columns` as an invariant.
+ */
+struct dynamic_filter_snapshot {
+  std::uint64_t generation         = 0;
+  std::size_t logical_filter_count = 0;
+  std::vector<column_filter_snapshot> columns;
+};
+
+/**
+ * @brief Publisher result for a refinement-slot replacement
+ */
+enum class refinement_publish_result { ACCEPTED, STALE, CLOSED, IGNORED };
+
+/**
+ * @brief Capability handle for replacing one refinement slot's filter
+ *
+ * Move-only and bound to one (channel, slot); it cannot retarget. Exactly one policy-owning
+ * coordinator holds it -- the slot supplies sequencing, stale-write rejection, and atomic
+ * visibility, never semantic-strengthening checks (design doc, "Versioned refinement slots").
+ * Thread-safe; outlives nothing: the channel is co-owned via `shared_ptr`, so a late publish
+ * after consumer teardown is rejected as CLOSED instead of touching freed state.
+ */
+class dynamic_filter_refinement_publisher final {
+ public:
+  dynamic_filter_refinement_publisher(dynamic_filter_refinement_publisher&&) noexcept = default;
+  dynamic_filter_refinement_publisher& operator=(dynamic_filter_refinement_publisher&&) noexcept =
+    default;
+  dynamic_filter_refinement_publisher(dynamic_filter_refinement_publisher const&) = delete;
+  dynamic_filter_refinement_publisher& operator=(dynamic_filter_refinement_publisher const&) =
+    delete;
+
+  /**
+   * @brief Install @p ready_filter at @p producer_revision; rejects stale/closed/ignored
+   *
+   * An accepted call installs the immutable filter, bumps the channel generation, and counts
+   * `filter_count` only for the slot's first value. Rejections make no visible change: STALE for
+   * a revision not strictly greater than the slot's (a sequencing check, never a
+   * semantic-strengthening check), CLOSED after `close_for_new_filters`, IGNORED when the slot's
+   * primary or any referenced ordinal is ignored -- or when @p ready_filter is null.
+   */
+  refinement_publish_result publish(
+    std::uint64_t producer_revision,
+    std::shared_ptr<sirius_dynamic_filter const> ready_filter) const;
+
+ private:
+  friend class sirius_dynamic_filter_set;
+
+  dynamic_filter_refinement_publisher(std::shared_ptr<sirius_dynamic_filter_set> channel,
+                                      std::size_t slot_index)
+    : _channel(std::move(channel)), _slot_index(slot_index)
+  {
+  }
+
+  std::shared_ptr<sirius_dynamic_filter_set> _channel;
+  std::size_t _slot_index = 0;
+};
+
+//===----------------------------------------------------------------------===//
 // sirius_dynamic_filter_set
 //===----------------------------------------------------------------------===//
 /**
@@ -552,8 +883,12 @@ class sirius_dynamic_bloom_filter final : public sirius_dynamic_filter,
  * `close_for_new_filters()` ends the append lifecycle after the consumer drains. Later pushes are
  * rejected. Missing filters and missing device-local replicas pass data through; the producing join
  * still checks correctness.
+ *
+ * Execution-scoped: a channel is minted during physical-plan construction and is never reused
+ * across executions -- the transparent path constructs a fresh plan (and thus fresh channels) per
+ * execution, so slot contents, revisions, generation, and counts always start empty.
  */
-class sirius_dynamic_filter_set {
+class sirius_dynamic_filter_set : public std::enable_shared_from_this<sirius_dynamic_filter_set> {
  public:
   /**
    * @brief Register a filter for consumer output column @p col_idx
@@ -654,10 +989,90 @@ class sirius_dynamic_filter_set {
     return _filter_count.load(std::memory_order_acquire);
   }
 
+  //===--------------------------------------------------------------------===//
+  // Refinement slots and coherent snapshots
+  //===--------------------------------------------------------------------===//
+
+  /**
+   * @brief Plan-time only: create a stable refinement slot at @p primary_ordinal
+   *
+   * Also registers a producer (see @ref register_producer). Each call mints a distinct slot;
+   * separate producers targeting one channel receive separate slots. @p referenced_ordinals
+   * lists every additional consumer ordinal a multi-column filter in this slot may reference
+   * (empty for single-column slots); a slot whose primary or referenced ordinal is ignored via
+   * @ref ignore_columns rejects publications. Storage and lookup remain keyed by the primary
+   * ordinal -- the join path's single-ordinal contract is untouched.
+   *
+   * @pre The channel is owned by `std::shared_ptr` (every production channel is); the returned
+   * publisher co-owns it. Throws `std::bad_weak_ptr` otherwise.
+   */
+  [[nodiscard]] dynamic_filter_refinement_publisher register_refinement_slot(
+    std::size_t primary_ordinal, std::vector<std::size_t> referenced_ordinals = {});
+
+  /**
+   * @brief One registered refinement slot's declared coordinates
+   */
+  struct refinement_slot_view {
+    std::size_t primary_ordinal = 0;
+    std::vector<std::size_t> referenced_ordinals;
+  };
+
+  /**
+   * @brief Every registered slot's declared ordinals, in registration order
+   *
+   * Read-only view of plan-time routing, so a plan-shape test can assert which key ordinals a
+   * producer bound at this channel without reaching into the publisher. Carries no filter state.
+   */
+  [[nodiscard]] std::vector<refinement_slot_view> refinement_slots() const;
+
+  /**
+   * @brief Coherent snapshot of columns, filter pointers, count, and generation
+   *
+   * One mutex hold binds the generation to the filter pointers. Appended filters and populated
+   * slot values merge per column in insertion order. The snapshot co-owns every filter, so it
+   * stays valid after replacements, `close_for_new_filters`, and even the channel's destruction.
+   */
+  [[nodiscard]] dynamic_filter_snapshot snapshot() const;
+
+  /**
+   * @brief Lock-free advisory change hint; never pair with separate filter reads
+   *
+   * May be compared with a previously observed generation to decide whether to take another
+   * snapshot; only @ref snapshot coherently binds a generation to filter pointers.
+   */
+  [[nodiscard]] std::uint64_t generation() const noexcept
+  {
+    return _generation.load(std::memory_order_acquire);
+  }
+
  private:
+  friend class dynamic_filter_refinement_publisher;
+
+  /**
+   * @brief One refinement slot: stable identity (its index), declared ordinals, the optional
+   * current immutable filter, and the latest accepted producer revision
+   */
+  struct refinement_slot {
+    std::size_t primary_ordinal = 0;
+    std::vector<std::size_t> referenced_ordinals;
+    std::shared_ptr<sirius_dynamic_filter const> filter;
+    std::uint64_t revision = 0;
+  };
   mutable std::mutex _mu;
   std::unordered_map<std::size_t, std::vector<std::shared_ptr<sirius_dynamic_filter const>>>
     _filters;
+
+  /**
+   * @brief Refinement slots in registration order; index is the slot's stable identity. Guarded
+   * by @c _mu beside @c _filters
+   */
+  std::vector<refinement_slot> _slots;
+
+  /**
+   * @brief Bumped under @c _mu for every accepted append or slot publication; backs the lock-free
+   * @ref generation and the coherent @ref snapshot
+   */
+  std::atomic<std::uint64_t> _generation{0};
   /**
    * @brief Consumer columns whose filters are dropped on push (e.g. hive partitions); see @ref
    * ignore_columns
@@ -682,14 +1097,6 @@ class sirius_dynamic_filter_set {
    */
   std::atomic<bool> _accepting_filters{true};
 };
-
-/**
- * @brief Resolves a consumer column index to an AST expression already emplaced in the tree
- *
- * The expression is typically a `cudf::ast::column_reference` or a
- * `cudf::ast::column_name_reference`.
- */
-using column_ref_resolver_fn = std::function<cudf::ast::expression const&(std::size_t col_idx)>;
 
 /**
  * @brief AND-conjoin @p set's AST-lowerable filters with @p existing_root in @p tree

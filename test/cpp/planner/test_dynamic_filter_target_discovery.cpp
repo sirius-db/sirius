@@ -226,6 +226,58 @@ TEST_CASE("group_by_key_input maps a grouping-key output to its input column",
     REQUIRE(group_by_key_input(group_idx, /*grouping_set_count=*/2, /*output_ordinal=*/0) ==
             std::nullopt);
   }
+
+  SECTION("a negative input column refuses instead of wrapping")
+  {
+    // The return type is unsigned, so a negative entry would become an enormous ordinal that no
+    // caller could recognize as invalid -- and the Top-N group-key producer would carry it into
+    // the column index its prefilter compares. Refusing here is what keeps that unrepresentable.
+    std::vector<int> const sentinel{-1, 2};
+    REQUIRE(group_by_key_input(sentinel, /*grouping_set_count=*/1, /*output_ordinal=*/0) ==
+            std::nullopt);
+    auto const valid = group_by_key_input(sentinel, /*grouping_set_count=*/1, /*output_ordinal=*/1);
+    REQUIRE(valid.has_value());
+    REQUIRE(*valid == 2);
+  }
+}
+
+// ---------------------------------------------------------------------------------------------
+// boundary_key_matches_site_type
+// ---------------------------------------------------------------------------------------------
+
+TEST_CASE("boundary_key_matches_site_type refuses a fixed-point key whose scale differs",
+          "[dynamic_filter][placement]")
+{
+  using sirius::planner::boundary_key_matches_site_type;
+  auto const k_dec64_2 = cudf::data_type{cudf::type_id::DECIMAL64, -2};
+  auto const k_dec64_4 = cudf::data_type{cudf::type_id::DECIMAL64, -4};
+  auto const k_dec32_2 = cudf::data_type{cudf::type_id::DECIMAL32, -2};
+  auto const k_int64   = cudf::data_type{cudf::type_id::INT64};
+  auto const k_int32   = cudf::data_type{cudf::type_id::INT32};
+
+  SECTION("a fixed-point key requires the identical type and scale")
+  {
+    REQUIRE(boundary_key_matches_site_type(k_dec64_2, k_dec64_2));
+    // The whole point: raw scaled integers only compare correctly at equal scale. 1234 at scale
+    // -2 is 12.34 and at scale -4 is 0.1234, so comparing the integers prunes the wrong rows and
+    // reports nothing at all.
+    REQUIRE_FALSE(boundary_key_matches_site_type(k_dec64_2, k_dec64_4));
+    // Same scale, different width: the kernel would read the wrong number of bytes per element.
+    REQUIRE_FALSE(boundary_key_matches_site_type(k_dec64_2, k_dec32_2));
+    REQUIRE_FALSE(boundary_key_matches_site_type(k_dec64_2, k_int64));
+  }
+
+  SECTION("scale-free keys are held to the same equality")
+  {
+    // Every traced hop preserves a column's type, so a key and its site always agree and the
+    // stronger rule costs nothing. A carve-out for the scale-free types would be one more thing a
+    // later widening could forget to revisit.
+    REQUIRE(boundary_key_matches_site_type(k_int64, k_int64));
+    REQUIRE_FALSE(boundary_key_matches_site_type(k_int64, k_int32));
+    REQUIRE_FALSE(boundary_key_matches_site_type(k_int32, k_dec64_2));
+    REQUIRE_FALSE(boundary_key_matches_site_type(cudf::data_type{cudf::type_id::TIMESTAMP_DAYS},
+                                                 cudf::data_type{cudf::type_id::INT32}));
+  }
 }
 
 // ---------------------------------------------------------------------------------------------
