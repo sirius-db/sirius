@@ -133,6 +133,7 @@ extern "C" int cudaProfilerStop();
 #include "io/types.hpp"                // sirius::io::sirius_ioctx
 #include "io/uring/uring_reactor.hpp"  // sirius::io::uring_io_object
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -1673,7 +1674,8 @@ static unique_ptr<FunctionData> SiriusVectorSearchBind(ClientContext& context,
   // Optional params' default values
   req.metric              = "l2";
   req.k                   = 10;
-  std::string schema_name = "main";
+  std::string schema_name       = "main";
+  bool output_columns_specified = false;
   for (auto& kv : input.named_parameters) {
     auto const key = StringUtil::Lower(kv.first);
     if (kv.second.IsNull()) {
@@ -1686,6 +1688,7 @@ static unique_ptr<FunctionData> SiriusVectorSearchBind(ClientContext& context,
     } else if (key == "schema_name") {
       schema_name = kv.second.ToString();
     } else if (key == "output_columns") {
+      output_columns_specified = true;
       for (auto const& c : ListValue::GetChildren(kv.second)) {
         req.output_columns.push_back(c.ToString());
       }
@@ -1695,6 +1698,12 @@ static unique_ptr<FunctionData> SiriusVectorSearchBind(ClientContext& context,
   if (req.metric != "l2" && req.metric != "cosine") {
     throw BinderException("sirius_knn_search: metric must be one of 'l2', 'cosine', got '" +
                           req.metric + "'");
+  }
+  // An explicitly-passed empty list is a user error.
+  if (output_columns_specified && req.output_columns.empty()) {
+    throw BinderException(
+      "sirius_knn_search: output_columns cannot be empty; omit it to default to the pinned "
+      "columns");
   }
 
   // Resolve the vector column's dimensionality and each output column's type
@@ -1712,9 +1721,42 @@ static unique_ptr<FunctionData> SiriusVectorSearchBind(ClientContext& context,
   auto const schema_names = columns.GetColumnNames();
   auto const schema_types = columns.GetColumnTypes();
 
-  // Default output_columns to every base-table column (in schema order) when omitted.
+  // The search gathers output columns from the pin.
+  auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  if (!sirius_ctx) {
+    throw InvalidInputException("sirius_knn_search requires the Sirius context to be initialized");
+  }
+  const auto* pin = sirius_ctx->get_scan_manager().find_pinned_entry_for_duckdb_table(
+    req.catalog, req.schema, req.table_name);
+  if (pin == nullptr) {
+    throw BinderException("sirius_knn_search: table '" + req.table_name +
+                          "' must be pinned before it can be searched");
+  }
+  auto const& pinned_names = pin->cache_info.column_names();
+  auto is_pinned           = [&](const std::string& col) {
+    return std::find(pinned_names.begin(), pinned_names.end(), col) != pinned_names.end();
+  };
+
   if (req.output_columns.empty()) {
-    req.output_columns.assign(schema_names.begin(), schema_names.end());
+    // Default to the columns that are pinned and in catalog schema order.
+    for (auto const& name : schema_names) {
+      if (is_pinned(name)) { req.output_columns.push_back(name); }
+    }
+  } else {
+    // Explicitly-pass: every column must exist and be pinned.
+    for (auto const& col : req.output_columns) {
+      bool const in_catalog =
+        std::find(schema_names.begin(), schema_names.end(), col) != schema_names.end();
+      if (!in_catalog) {
+        throw BinderException("sirius_knn_search: column '" + col + "' not found in table '" +
+                              req.table_name + "'");
+      }
+      if (!is_pinned(col)) {
+        throw BinderException("sirius_knn_search: output column '" + col +
+                              "' is not pinned on table '" + req.table_name +
+                              "'; pin it (pin_table cols => [...]) or omit output_columns");
+      }
+    }
   }
 
   auto type_of = [&](const std::string& col) -> const LogicalType& {
