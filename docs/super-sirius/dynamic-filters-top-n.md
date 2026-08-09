@@ -1,8 +1,17 @@
 # Dynamic Filters — Top-N Threshold Refinement
 
-> **Status: proposed (design only).** No proposed API or Top-N runtime behavior is implemented.
-> This document makes Top-N the first concrete Phase 4 dynamic-refinement producer while preserving
-> the implemented, append-only hash-join publication path. See
+> **Status: Stages 1–4 implemented; Stages 5–7 proposed.** Implemented behind
+> `enable_top_n_dynamic_filter` (default false): the multi-key threshold coordinator and sink
+> self-consumption via the fused boundary kernel (Stage 1); channel refinement slots, coherent
+> snapshots, generations, and consumer migration (Stage 2); the `RANGE` and `LEX_RANGE` filter
+> classes with reader-AST lowering, the compaction capability, and all-or-nothing replication
+> (Stage 3); and publication itself (Stage 4) — the immutable publish plan, both discovery
+> traces, planner wiring, the publisher loop allocating real revisions, and the reader-AST and
+> sited-endpoint consumers. Producers publish to channels: scan binds and first-key endpoints are
+> live, LEX endpoints are deferred to Stage 7, and a set operation is a terminal for the Top-N
+> trace. The group-key producer (Stage 5) and everything after it remain proposed. This document
+> makes Top-N the first concrete Phase 4 dynamic-refinement producer while preserving the
+> implemented, append-only hash-join publication path. See
 > [dynamic-filters.md](dynamic-filters.md) for the general framework,
 > [dynamic-filters-multi-gpu.md](dynamic-filters-multi-gpu.md) for current device-replica
 > ownership, and [dynamic-filters-top-n-api.md](dynamic-filters-top-n-api.md) for the
@@ -27,6 +36,14 @@ the first is ever filtered alone. From one producer:
 One coordinator publishes both layers; a site that receives the lexicographic predicate never
 also receives the first-key bound it implies.
 
+A second producer kind moves inside the one barrier that caps the first. For `TOP_N` above a hash
+`GROUP BY` ordering on grouping keys, the aggregate's sink witnesses the K best **distinct**
+grouping-key values and publishes a progressively tightening **inclusive** threshold to the
+consumers of its own input pipeline — the scans and operators the aggregate's FULL input port
+walls off from the row producer — while dropping strictly-worse input rows before hash insert.
+Both producers coexist under one flag: the row producer self-consumes above the barrier, the
+group-key producer prunes below it.
+
 This is an informational feedback loop, not a new pipeline dependency:
 
 - `TOP_N` and `MERGE_TOP_N` remain the sole correctness authority.
@@ -35,11 +52,10 @@ This is an informational feedback loop, not a new pipeline dependency:
 - Every visible Top-N filter is immutable and ready on every planned consumer GPU.
 - A threshold may only become more selective during one execution.
 
-The implementation should use Sirius's native `sirius_dynamic_filter_set`, not DuckDB's
-`DynamicFilterData`. It adds two immutable filter kinds (one-sided `RANGE`, lexicographic
-`LEX_RANGE`), a stable replaceable channel slot, a coherent generation-tagged snapshot, and a
-Top-N-specific coordinator. Existing hash-join filters continue to use `push_filter()` and remain
-append-only.
+The transport is Sirius's native `sirius_dynamic_filter_set`, not DuckDB's `DynamicFilterData`:
+two immutable filter kinds (one-sided `RANGE`, lexicographic `LEX_RANGE`), a stable replaceable
+channel slot, a coherent generation-tagged snapshot, and a Top-N-specific coordinator. Existing
+hash-join filters continue to use `push_filter()` and remain append-only.
 
 In this document **Top-N** is the Sirius/DuckDB operator name. **K** is the number of candidates the
 operator retains:
@@ -56,14 +72,17 @@ K = limit + offset
 | Filter representation | Immutable one-sided `RANGE` (first-key and single-key) and lexicographic `LEX_RANGE` |
 | Channel update | Stable refinement slot replaced by producer revision |
 | Consumer change detection | Monotonic channel generation bound to coherent snapshots |
-| Producer | `TOP_N` whose ORDER BY keys are all bound references |
+| Producer kinds | Row producer: `TOP_N` whose ORDER BY keys are all bound references; group-key producer: the aggregate sink below a `TOP_N` whose keys are all grouping keys |
+| Group-key predicates | Inclusive-only in both layers; a boundary-tied input row is never dropped |
+| Group-key witness | The K best distinct key values, accumulated across offers; boundary = the Kth once the set is full |
 | Sink self-consumption | Always on for eligible producers; lexicographic compare against the shared boundary tuple |
 | Predicate layers | Strict full-tuple lexicographic where all keys coexist; inclusive first-key bound further upstream |
 | Per-key fan-out | Forbidden; no key after the first is ever filtered alone |
 | Consumer placement | Scan route when a trace reaches a scan; otherwise a cost-gated endpoint at the stop point |
 | Reach ceiling | The nearest upstream FULL-barrier port; PARTIAL and PIPELINE ports do not cap reach |
+| Device row filtering | One fused predicate+compaction kernel; cuDF AST only at the parquet reader |
 | First legal boundary | Kth row's key tuple of one retained local result containing K rows |
-| Initial types | Per key: DuckDB `TINYINT`, `SMALLINT`, `INTEGER`, `BIGINT`, `DATE`; key zero admitted enables the first-key layer, all keys admitted adds the LEX layer |
+| Admitted types | Per key: DuckDB `TINYINT`, `SMALLINT`, `INTEGER`, `BIGINT`, `DATE`, `DECIMAL(5–18)`; key zero admitted enables the first-key layer, all keys admitted adds the LEX layer |
 | Null boundary | Null first component publishes nothing; null tail components use DataFusion's shipped derivations |
 | Replica readiness | All planned consumer-device replicas before replacement |
 | Scheduling | Nonblocking and opportunistic |
@@ -109,15 +128,17 @@ and make update cost proportional to query progress.
 1. Publish a sound threshold after local Top-N owns K witnesses.
 2. Apply that threshold inside the operator first: an eligible Top-N prefilters its own later
    input from the shared coordinator boundary, independent of any external consumer.
-3. Tighten the threshold monotonically as better candidates arrive.
-4. Reuse current scan channels, target ordinals, AST lowering, endpoint splicing, and multi-GPU
+3. Move production inside a FULL barrier where the shape allows: the group-key producer prunes
+   the aggregate-input pipeline that the barrier walls off from the row producer.
+4. Tighten the threshold monotonically as better candidates arrive.
+5. Reuse current scan channels, target ordinals, AST lowering, endpoint splicing, and multi-GPU
    ownership.
-5. Preserve append-only hash-join publication without changing its behavior.
-6. Support Parquet reader filtering, DuckDB-native post-decode filtering, and sited endpoint
+6. Preserve append-only hash-join publication without changing its behavior.
+7. Support Parquet reader filtering, DuckDB-native post-decode filtering, and sited endpoint
    filtering where a layer's trace reaches no scan.
-7. Keep producers and consumers nonblocking with respect to filter readiness.
-8. Make plan reuse, cancellation, stale updates, and partial failure explicit.
-9. Instrument whether a threshold arrives before useful scan or endpoint work.
+8. Keep producers and consumers nonblocking with respect to filter readiness.
+9. Make plan reuse, cancellation, stale updates, and partial failure explicit.
+10. Instrument whether a threshold arrives before useful scan or endpoint work.
 
 ## Non-goals for the first release
 
@@ -132,6 +153,14 @@ and make update cost proportional to query progress.
 - Waiting, rescheduling, cancelling, or revisiting scan tasks when a threshold changes, including
   DataFusion-style mid-split early termination; a Sirius split is one `cudf::io::read_parquet` call.
 - A shared cross-batch witness heap when every local result contains fewer than K rows.
+- Any intervening filter between the aggregate and Top-N for the group-key producer; a
+  grouping-key-only `HAVING` is admissible in principle (the sink can witness through the same
+  predicate) and staged later.
+- Early termination via order-preserving streaming aggregation — `LIMIT` over a sort-based
+  group-by stops after K groups, strictly better than filtering where available. Inapplicable:
+  neither Sirius (`sirius_physical_grouped_aggregate` and its merge are the only grouped
+  operators) nor DuckDB v1.5.4 (hash, perfect-hash, partitioned, ungrouped) has a sort-based or
+  streaming group-by operator. Revisit only if Sirius gains one.
 - Replacing DuckDB's CPU-path Top-N filtering.
 
 ## Lessons from other engines
@@ -151,6 +180,15 @@ Both publishing engines gate the first publication on a full heap and restart re
 from explicitly reset filter state. Both default to statistics-level scan pruning: DuckDB's
 optional filter never row-filters, and DataFusion's row-level pushdown is off by default.
 
+The group-key producer's precedent is DataFusion's TopK aggregation
+(`enable_topk_aggregation`, default true): a limit hint on the aggregate plus a bounded priority
+map that drops rows of losing groups during accumulation — exactly one group key, zero
+aggregates or a single direction-matched MIN/MAX (sound because min/max is monotone under row
+discard), and strictly operator-internal: the Kth boundary is never published, and DataFusion's
+only aggregate-produced scan filter is ungrouped min/max. Sirius keeps the internal discard and
+adds the external publication. Neither DuckDB (no comparable rule or operator) nor Velox
+(`TopNRowNumber` is a window operator and produces no runtime filter) has an equivalent.
+
 Primary references:
 
 - DuckDB [Top-N filter construction](https://github.com/duckdb/duckdb/blob/08e34c447bae34eaee3723cac61f2878b6bdf787/src/optimizer/topn_optimizer.cpp#L67-L135),
@@ -164,6 +202,9 @@ Primary references:
   [shared cross-partition threshold](https://github.com/apache/datafusion/blob/3e3a92de29ed3d454e72c7bade6328508b6098c6/datafusion/physical-plan/src/topk/mod.rs#L146-L219),
   [dynamic-expression generation](https://github.com/apache/datafusion/blob/3e3a92de29ed3d454e72c7bade6328508b6098c6/datafusion/physical-expr/src/expressions/dynamic_filters/mod.rs#L310-L359),
   and [file-pruner refresh](https://github.com/apache/datafusion/blob/3e3a92de29ed3d454e72c7bade6328508b6098c6/datafusion/pruning/src/file_pruner.rs#L127-L170).
+- DataFusion [TopK-aggregation rule](https://github.com/apache/datafusion/blob/3e3a92de29ed3d454e72c7bade6328508b6098c6/datafusion/physical-optimizer/src/topk_aggregation.rs#L45-L172),
+  its [bounded priority map](https://github.com/apache/datafusion/blob/3e3a92de29ed3d454e72c7bade6328508b6098c6/datafusion/physical-plan/src/aggregates/topk/priority_map.rs#L62-L117),
+  and the [config default](https://github.com/apache/datafusion/blob/3e3a92de29ed3d454e72c7bade6328508b6098c6/datafusion/common/src/config.rs#L1376-L1378).
 - Velox [TopN](https://github.com/facebookincubator/velox/blob/6dab648023f70009b085b2068fd44f3e9ebbdcde/velox/exec/TopN.cpp)
   and [runtime-filter routing](https://github.com/facebookincubator/velox/blob/6dab648023f70009b085b2068fd44f3e9ebbdcde/velox/exec/Driver.cpp#L1145-L1249);
   a TopN boundary filter exists upstream only as the unimplemented mutable-filter proposal in
@@ -245,17 +286,103 @@ are common in practice and publish through the table above. The first-key layer 
 A single-key producer publishes only the strict LEX predicate — the inclusive layer would be
 strictly weaker at the same sites.
 
+The group-key producer publishes only **inclusive** forms: the first-key bound is inclusive
+already, and the inclusive lexicographic predicate is the strict one extended by the all-equal
+disjunct — `LEX ∨ (E0 AND … AND En)` — with the per-component terms of the table above
+unchanged. Why inclusivity is mandatory there is derived in
+[The group-key producer](#the-group-key-producer).
+
+### The group-key producer
+
+For `TOP_N` above a hash `GROUP BY` whose ORDER BY keys are all grouping keys, a second producer
+sits in the aggregate's sink, inside the FULL input port that is the row producer's reach
+ceiling. Its object is the **Kth-best distinct key value**, not the Kth row: the top K rows may
+span fewer than K groups, so a row-level boundary over-tightens unsoundly.
+
+- **Witness.** K distinct ORDER-BY key values, each observed on an owned input row. A hash
+  group-by maps every input row to exactly one group and eliminates none, and the merge phase
+  only combines same-key partials, so K witnessed distinct values prove at least K final groups
+  no worse than the boundary. Witnessing at the partial sink is therefore sound. The witness
+  co-owns its input batch until the offer completes, the same durability rule as the row
+  producer's.
+- **K-witness rule.** An input row whose key tuple orders strictly after the Kth-best witnessed
+  distinct value belongs to a group strictly worse than K proven groups; that group cannot reach
+  the final K, so the row is droppable — at the sink itself before hash insert, and at every
+  upstream consumer of the aggregate-input pipeline.
+- **Inclusive ties, mandatory.** A row tied with the boundary belongs to a group that may be in
+  the final K — the boundary group itself, or a group tied with it that final Top-N may pick —
+  and dropping the row corrupts that group's aggregate values. This is fundamentally unlike the
+  row producer, where boundary-tied rows are interchangeable whole results. Both layers are
+  therefore inclusive, always.
+- **Accumulation.** Each offer carries a batch's best distinct key values (at most K,
+  host-extracted). The coordinator maintains a bounded ordered **set** — union by key value,
+  truncate to K — so sub-K batches contribute, unlike the row producer's per-batch rule.
+  Coordinator-side union-by-value is what the K-distinct proof rests on: it is the only step that
+  guarantees K *distinct* values across all offers and tasks. Deduplicating on the GPU before the
+  copy is a pruning optimization that shrinks the transfer and the merge; it is not the
+  correctness mechanism and may be changed or dropped without touching the proof. The
+  boundary exists once the set holds K distinct values and is its Kth element; it only tightens
+  as better values arrive.
+- **Null-headed boundary.** `NULL` is a group under `GROUP BY`, so a null key is a legitimate
+  witnessed value and **counts toward K** like any other. Only publication is suppressed: if the
+  Kth-best distinct key's first component is null, the producer publishes nothing for that
+  candidate, inheriting the rule from [Predicate layers and null derivations](#predicate-layers-and-null-derivations).
+  The witness set is unaffected and keeps tightening. This rule is load-bearing, not
+  bookkeeping — a first component that is absent has no value to compare against, so publishing
+  anyway reads an empty optional and emits a garbage bound. That failure is silent: no crash, no
+  exception, just a wrong threshold pruning rows that belonged in the answer.
+
+Eligibility: the Top-N sits above the aggregate through pass-through hops only; every ORDER BY
+key is a bound reference resolving to a grouping-key output — an aggregate-output key can never
+cross; no intervening filter (see non-goals for the `HAVING` staging); exact-count `LIMIT`; the
+per-key type allowlist unchanged; and **K at most 1024**. The producer's trace roots at the
+aggregate's **input** and follows the existing hop rules to that pipeline's scans and endpoint
+sites.
+
+The K cap is a structural refusal, not a tuning knob, and it is justified by **collapsing value,
+not by rising cost**. A larger K means a looser Kth-best boundary, so fewer rows are prunable, and
+as K approaches the distinct-group count the threshold admits nearly everything: measured at 1M
+rows with 5000 distinct groups, rows kept rise from 0.2% at K=10 to 2% at K=100 to 20% at K=1000,
+and with 1200 groups K=1000 keeps 83% — the point where the keep-ratio gate disables the prefilter
+as unselective. Per-batch cost, by contrast, is nearly flat: it rises only about 16–21% from K=10
+to K=1000, because `distinct` and `sort` dominate and are K-independent, while only the slice,
+the device-to-host copy, and the merge scale with K, and the merge stays under 0.03 ms. The cap
+therefore exists because a large-K producer buys almost nothing, not because it costs much.
+
+The bound sits an order of magnitude above the plausibly useful range (TPC-H Q18 asks for 100;
+reporting and dashboard shapes are typically tens to a few hundred), so it turns away only shapes
+where the threshold would have been too loose to matter. A refusal is counted with the producer's
+other eligibility rejections. The row producer needs no cap at all: it extracts one row's key
+tuple per batch regardless of K.
+
+This is a separate admission path, not a relaxed row-producer trace. The row producer's trace
+refuses aggregates on the hop-set bit itself, independent of producer kind, and that refusal must
+stay: it is what keeps a row boundary — which is strict and row-level — from ever crossing an
+aggregate. The group-key producer earns its crossing by rooting below the aggregate and
+publishing inclusive-only predicates over distinct keys. Loosening the row trace to reach the
+same sites would publish a strict row predicate against grouped input and silently corrupt
+aggregate values.
+
+TPC-H applicability at the pinned DuckDB: Q18 is the shape — both keys are grouping keys, the
+`o_orderdate` tail is admitted, and the `o_totalprice` DECIMAL head means Q18 unlocks when
+decimals gain their exactness proof. Q3, Q10, and Q21 order on aggregate outputs (`revenue`,
+`numwait`) and can never qualify; Q2 has no aggregate below its Top-N and is the row producer's
+shape.
+
 ### Ties
 
 For ordinary `LIMIT`, the strict LEX predicate excludes rows tying the full boundary tuple: once
 K witnesses exist, full-tuple peers are interchangeable SQL rows. The inclusive first-key layer
 keeps key-zero ties, which later keys may still order. This matches DuckDB's shipped pair —
 strict single-key, inclusive first-key — and DataFusion's strict full-key policy; all three
-engines' heaps also reject boundary-tied rows.
+engines' heaps also reject boundary-tied rows. The group-key producer is the inclusive
+exception, for the reasons above.
 
-Strict filtering is not eligible for `WITH TIES`, `RANK`, or `DENSE_RANK`. If exact identity of
-otherwise unordered peers becomes a requirement, eligibility must become inclusive; that is a
-Top-N policy change, not a channel redesign.
+Strict filtering is not eligible for `WITH TIES`, `RANK`, or `DENSE_RANK`; at the pinned DuckDB
+(v1.5.4, no `WITH TIES` grammar) tie-preserving demand reaches the planner only as rank-shaped
+window plans, which never form a `LogicalTopN`. If exact identity of otherwise unordered peers
+becomes a requirement, eligibility must become inclusive; that is a Top-N policy change, not a
+channel redesign.
 
 ### Limit and offset
 
@@ -276,7 +403,7 @@ Checked K belongs in the immutable plan and is reused by local and merge operato
 flowchart LR
     subgraph CONSUMER["Future consumer task"]
         SNAP["coherent snapshot<br/>generation G"]
-        APPLY["Parquet reader AST,<br/>native post-decode AST,<br/>or sited endpoint row mask"]
+        APPLY["Parquet reader AST, or<br/>fused boundary kernel<br/>(native post-decode, endpoint)"]
         SNAP --> APPLY
     end
 
@@ -292,9 +419,11 @@ flowchart LR
 This cycle carries information only. There is no graph edge from the channel to scheduling, no
 readiness wait, and no guarantee that a consumer observes the newest generation. The inner
 coordinator-to-sink edge is the free baseline: it exists for every eligible producer and involves
-no channel at all.
+no channel at all. The group-key producer runs the same loop with its sink inside the aggregate's
+input pipeline, offering distinct key values instead of one boundary tuple.
 
-The proposal adds five separable components:
+The design has five separable components (1–4 are implemented; 5 is implemented for the
+live consumers and extends with each later stage):
 
 1. `sirius_dynamic_range_filter` and `sirius_dynamic_lex_range_filter`: immutable one-sided and
    strict-lexicographic predicates — the two publication layers.
@@ -310,7 +439,7 @@ order-statistic producers.
 
 ## Range and lexicographic filters
 
-Proposed behavioral API (full declarations in the companion spec):
+Behavioral API (full declarations in the companion spec):
 
 ```cpp
 enum class sirius_dynamic_filter_kind { ZONE_MAP, IN_LIST, BLOOM, RANGE, LEX_RANGE };
@@ -342,21 +471,42 @@ class sirius_dynamic_lex_range_filter final
 
 RANGE owns an exact typed host boundary, direction, strictness, null policy, and a ready scalar
 replica for each planned consumer device; it carries both the inclusive first-key layer and, as
-its strict form, a single-key producer's whole predicate — `LEX_RANGE` requires at least two
-components. LEX_RANGE owns the boundary tuple, per-component
+its strict form, a single-key row producer's whole predicate — `LEX_RANGE` requires at least two
+components. `LEX_RANGE` carries a strictness flag: strict for the row producer, inclusive — the
+all-equal disjunct added — for the group-key producer. LEX_RANGE owns the boundary tuple, per-component
 direction and null order, the component-to-consumer-ordinal mapping, and per device one ready
 scalar per non-null component (null components lower to `IS NULL`/`IS NOT NULL` terms and need no
-scalar). Both are AST-lowerable — Parquet uses `reader_options::set_filter`, the native
-post-decode operator and endpoints use `cudf::compute_column` — and neither needs
-`sirius_mask_applicable`. LEX_RANGE lowers through the new `sirius_multi_column_ast_lowerable`
-capability, which takes the consumers' existing column-reference resolver instead of a single
-column reference.
+scalar). Application is split by checkpoint kind. AST lowering exists **solely for the Parquet
+reader**: `reader_options::set_filter` is cuDF-internal and buys row-group statistics pruning
+plus decode-time filtering that no Sirius kernel can reach; LEX_RANGE lowers there through the
+new `sirius_multi_column_ast_lowerable` capability, which takes the consumers' existing
+column-reference resolver instead of a single column reference. Every **device row-wise**
+application — the sink prefilter, the native post-decode checkpoint, and sited endpoints — uses
+one dedicated fused CUDA kernel through the `sirius_compaction_applicable` capability: predicate
+evaluation and index compaction in a single pass, no intermediate BOOL8 column, no generic
+expression interpreter. The predicate shape is fixed and tiny at plan time — a per-row
+lexicographic compare against at most a handful of boundary components — so it can be walked
+directly instead of interpreted.
+
+Measured against the AST implementation it replaced (paired within-process, 25 samples,
+survivor counts identical in every configuration): **1.1–1.4x faster single-key — 1.08x once a
+realistic wide payload dominates — and 1.8–3.6x multi-key, growing with key count.** The
+advantage comes from the compare-and-compact half, where the AST's prefix-disjunction grows
+quadratically in nodes while the kernel walks components in one pass; it does *not* come from the
+gather, which is identical work in both. Selectivity did not measurably matter to either. These
+are the kernel's worst case: no measured configuration triggered its all-pass fast path, which
+the AST arm cannot express at all. The gain is therefore shape-dependent rather than uniformly
+large, and the decision rests on the multi-key end plus the removal of an interpreter from the
+hot path. Consumers dispatch on the capability and never see the kernel. Neither filter needs
+`sirius_mask_applicable`.
 
 **Channel coordinate.** The channel keeps its one-ordinal contract: LEX_RANGE registers and is
 stored under a distinguished **primary ordinal** — key zero's exit ordinal at the site — and
-carries the remaining component ordinals internally. `push_filter` and the join path are
-untouched. A slot registration declares every referenced ordinal so `ignore_columns` (hive
-partitions) suppresses the filter if any component is ignored.
+carries the remaining component ordinals internally. Because those ordinals are in the target's
+own output space, a LEX filter is site-specific: the publisher builds one per accepting LEX
+target. Only ordinal-free RANGE fans a single object into every channel. `push_filter` and the
+join path are untouched. A slot registration declares every referenced ordinal so
+`ignore_columns` (hive partitions) suppresses the filter if any component is ignored.
 
 Do not encode either layer as a synthetic zone map, and do not decompose LEX_RANGE into
 AND-conjoined per-column filters — that is the no-tail lemma violated at the representation
@@ -365,11 +515,45 @@ observed closed ranges; Top-N has one meaningful side per component.
 
 A key type is admitted only if DuckDB SQL ordering, cuDF sorting/comparison, exact host
 extraction, device scalar construction, and Parquet statistics ordering agree. The per-key
-allowlist is DuckDB `TINYINT`, `SMALLINT`, `INTEGER`, `BIGINT`, and `DATE`, mapped through exact
-cuDF physical representations. Admission is asymmetric by layer: key zero admitted enables the
+allowlist is DuckDB `TINYINT`, `SMALLINT`, `INTEGER`, `BIGINT`, `DATE`, and `DECIMAL` of
+precision **5–18**, mapped through exact cuDF physical representations.
+
+**Decimals.** Precision 5–9 maps to cuDF `DECIMAL32`, 10–18 to `DECIMAL64`; the scaled integer
+*is* the exact host representation, so the boundary carries the raw `int32_t`/`int64_t` and the
+scale rides in the storage type — no rescale anywhere. Two ranges are refused:
+
+- **p ≤ 4** is INT16-backed and has no cuDF counterpart.
+- **p ≥ 19** would be `DECIMAL128`, and the fused kernel's `load_widened` handles widths 1/2/4/8
+  only: width 16 reaches an `assert(false)` that compiles out in release and returns 0. A
+  decimal128 key would therefore have been *silently wrong* rather than rejected — precisely the
+  failure the allowlist exists to prevent, and the reason the refusal is stated as a type rule
+  rather than left to the kernel.
+
+Comparing decimals as raw integers is only valid at **equal scale**, so scale equality is
+established at admission, at all three target sites. This is load-bearing: `exact_host_scalar`'s
+comparison widens to `int64` and never consults the storage type, so its "operands share one
+storage type" precondition is a real obligation on the caller, not something the type enforces.
+
+The allowlist lives in a pure function with its own unit test rather than only in the planner, so
+the rules are falsifiable in isolation. The p ≥ 19 refusal is **live, not theoretical**: the
+native scan's precision gate does not cover parquet, so a Top-N over a parquet-backed
+`DECIMAL(38,4)` builds a plan, reaches admission, and is refused there with no slot registered —
+confirmed by test. An earlier reading of this doc claimed the refusal was unreachable through any
+built plan; that was wrong, and the type rule is the only thing standing between a decimal128 key
+and a silently-zero comparison.
+
+Defence in depth behind it: `make_boundary_filter_params` throws on any component width outside
+{1, 2, 4, 8}, once per publication, rather than relying on `load_widened`'s assert, which
+compiles out in release.
+
+Not yet proved for decimals: the equivalence suite's fixture is non-null and non-negative, so
+null and negative decimal keys are untested, and the assumption that a decoded GPU column's type
+matches the DuckDB catalog type is relied on without a direct check. The DuckDB→cuDF decimal
+mapping is also expressed in three places that agree only through shared precision constants;
+divergence fails safe — every decimal site is refused — but a single mapping would be better. Admission is asymmetric by layer: key zero admitted enables the
 first-key layer and first-key self-consumption; all keys admitted additionally enables LEX_RANGE
 and the lexicographic prefilter. An unsupported tail type therefore degrades the producer to the
-first-key layer, never disables it. Timestamps, unsigned/huge integers, floats, decimals, and
+first-key layer, never disables it. Timestamps, unsigned/huge integers, floats, `DECIMAL128`, and
 strings need separate proofs. This is deliberately narrower than both references — DuckDB admits
 any physically integral type plus `VARCHAR`, and DataFusion has no producer-side gate at all —
 because their boundary stays host values with engine-uniform comparison, while a Sirius filter
@@ -447,7 +631,8 @@ Consequences:
   paired with separate filter reads to construct a predicate. Only `snapshot()` coherently binds a
   generation to filter pointers.
 - `has_filters()` stays false until an append or first slot value exists.
-- `snapshot()` returns columns, pointers, count, and generation coherently.
+- `snapshot()` binds generation to filter pointers coherently; the logical count may lag an
+  in-flight append (the pre-existing outside-mutex count bump stays, for join byte-equivalence).
 - Old snapshots remain valid through shared ownership.
 - Replacement is atomic within one channel. Cross-channel fan-out need not be atomic.
 - `close_for_new_filters()` rejects later appends and replacements.
@@ -468,7 +653,8 @@ POPULATED(revision 1) -- tighter replacement --> POPULATED(revision N)
                             CLOSED
 ```
 
-A stale revision, null filter, ignored column, or closed channel makes no visible change.
+A stale revision, null filter (reported `IGNORED`), ignored column, or closed channel makes no
+visible change.
 
 ## Immutable Top-N publication plan
 
@@ -514,9 +700,17 @@ Scan reachability is a target-selection outcome, not an admission requirement. A
 producer with no external target still runs sink self-consumption.
 
 Top-N runs **two traces** from its child, one per layer, sharing the same hop rules: a
-plain-reference projection, `FILTER` pass-through/gather, positional `UNION` fan-out, and a
+plain-reference projection, `FILTER` pass-through/gather, and a
 supported table-scan terminal. Every other operator stops descent, including nested `TOP_N`,
 `LIMIT`, window, aggregate, join, unnest, and expression-changing projection nodes.
+
+A set operation is a **terminal** for these traces, not a fan-out hop. The generic discovery walk
+fans out through positional `UNION`, but Sirius rejects set operations during physical planning,
+so no `UNION` node can exist in a plan and a fan-out branch here would be untestable machinery
+whose guards — one branch scan-binding while a sibling sites an endpoint, and per-branch
+materiality — nothing could exercise. Each Top-N trace therefore yields exactly one terminal.
+Restoring the hop is part of supporting set operations, together with those guards and a runnable
+test.
 
 - **Key-zero trace (FIRST_KEY layer, multi-key producers).** Follows key zero's single ordinal —
   the existing single-column mechanics. A supported scan terminal binds the inclusive first-key
@@ -532,7 +726,7 @@ A first-key target whose site coincides with a LEX target is dropped: the LEX pr
 the first-key bound, and at the pinned cuDF the subsumption holds for statistics pruning too (see
 the Parquet notes) — one site never carries both layers. Endpoint sites of either layer use the
 same splice `place_endpoint` uses for join-edge endpoints; they satisfy the K-witness rule's site
-condition because only value-preserving, non-duplicating hops lie between a site and the Top-N
+condition because only value-preserving hops lie between a site and the Top-N
 input. The planner skips a site whose gap to the sink holds no material operator; the cost model
 lives with the sited-endpoint consumer below.
 
@@ -545,7 +739,7 @@ originate on both sides of a join — `ORDER BY l.v, o.w` — the all-keys trace
 output while the key-zero trace continues to `l`'s scan: the first-key bound prunes the scan,
 while the strict predicate falls to the sink prefilter unless material accepted-hop work (an
 expensive `FILTER`) separates the stop point from the sink. Because a trace stops at the first
-refused operator, only Stage 6 hop widening can move a site below an intervening join and make
+refused operator, only Stage 7 hop widening can move a site below an intervening join and make
 that join's probe work the saving.
 
 Existing generic discovery correctly refuses to push external join filters through `TOP_N` and
@@ -573,18 +767,26 @@ channel directly, so no equivalent check applies to it.
 The execution-owned coordinator holds checked K, per-key ordering semantics, the tightest host
 boundary tuple, a monotonic revision, at most one active publication, the tightest pending
 candidate, and metrics. Tightness is lexicographic over the tuple, honoring each key's direction
-and null placement. The coordinator does not discover targets, inspect DuckDB metadata, schedule
-scans, or decide final output.
+and null placement: a tighter boundary orders **earlier** in the sort, and `tightest_seen` never
+loosens — the settled boundary is the sort-order minimum of the accepted offers. The coordinator
+does not discover targets, inspect DuckDB metadata, schedule scans, or decide final output.
+
+For a group-key producer the coordinator runs in distinct-key mode: offers carry a batch's best
+distinct key values (at most K), the coordinator accumulates a bounded ordered set — union by
+value, truncated to K — and the boundary is the set's Kth element once the set is full.
+Everything else — the mutex discipline, monotone tightening, publisher loop, `finish`, and
+`cancel` — is shared with the row mode.
 
 ### Sink self-consumption
 
 The coordinator exposes its tightest host boundary tuple, and every local `TOP_N` task reads it
 once per batch — a mutex-guarded host copy — before `compute_top_n_table`, dropping
-strictly-lexicographically-worse rows with one AST evaluation of the same strict LEX predicate
-the channel would publish (`cudf::compute_column`, task-local scalars). When only key zero is
-admitted, the prefilter degrades to the inclusive first-key comparison. This is the free
-baseline: it needs no channel, slot, generation, or replica, and it runs for every eligible
-producer even when target discovery found nothing.
+strictly-lexicographically-worse rows with one pass of the fused boundary kernel: the boundary
+travels as launch parameters (no device scalars, no allocation), the kernel performs the per-row
+lexicographic compare and compacts passing row indices, and an all-pass batch is forwarded
+unchanged. When only key zero is admitted, the prefilter degrades to the inclusive first-key
+comparison. This is the free baseline: it needs no channel, slot, generation, or replica, and it
+runs for every eligible producer even when target discovery found nothing.
 
 The boundary is shared, not operator-local. A task cannot prune its own input with a boundary it
 has not computed yet, so all pruning value comes from cross-task sharing; the coordinator is the
@@ -630,10 +832,10 @@ void finish();  // synchronously drain producer publication; consumers never cal
 
 The first release does not combine sub-K local results. DuckDB and DataFusion accumulate one heap
 per thread or partition across batches, so they reach K quickly; a Sirius local result is
-per-task-batch, which is what the Stage 5 witness-heap contingency addresses. `MERGE_TOP_N` shares
+per-task-batch, which is what the Stage 6 witness-heap contingency addresses. `MERGE_TOP_N` shares
 the coordinator only to call `finish()` on successful completion. It does not offer a new boundary:
-its FULL barrier means the child scan pipelines have already drained, so a merge-time threshold has
-no pruning value.
+its FULL barrier means the child pipelines have already drained — the reach ceiling applied to its
+own input port — so a merge-time threshold has no pruning value.
 
 ### Concurrent offers
 
@@ -668,8 +870,9 @@ publisher_loop():
           revision = next_revision++
         unlock
 
-        build the immutable layer filters (RANGE, LEX_RANGE) and all planned replicas
-        on success, publish (revision, layer filter) to each accepting target slot
+        build the immutable layer filters -- one RANGE, one LEX_RANGE per accepting LEX
+          target -- and all planned replicas
+        on success, publish (revision, that target's filter) to each accepting target slot
         on failure, retain every target's previous value across both layers
 
 finish():
@@ -708,16 +911,25 @@ Refinement replacement is all-or-nothing across planned consumer devices and acr
 
 1. Complete the stream-ordered device-to-host copies of every key component of row K-1 and obtain
    an exact host boundary tuple whose readiness has been observed.
-2. Construct the immutable logical filters for the planned layers.
+2. Construct the immutable logical filters for the planned layers: one ordinal-free RANGE, which
+   fans into every accepting first-key channel, and **one LEX_RANGE per accepting LEX target** —
+   a LEX filter owns the ordinals it references, and each target's trace remaps them, so it is
+   site-specific by construction.
 3. Materialize each non-null component's scalar on every planned active consumer GPU — one scalar
-   for RANGE, one per non-null component for LEX_RANGE.
-4. Wait for all replicas of both layers before replacing any target slot.
-5. Fan each layer's ready filter into its accepting channels under one revision.
+   for RANGE, one per non-null component for each LEX filter.
+4. Wait for every replica of every filter before replacing any target slot.
+5. Publish each target's filter under one revision.
 
-Any required allocation, construction, copy, or completion failure installs nothing — neither
-layer — and retains the previous revision. This is stricter than best-effort omission for
-single-shot join filters: replacing a universally available old threshold with a new filter
-missing on one device would regress availability there.
+Any required allocation, construction, copy, or completion failure installs nothing — no layer,
+no target — and retains the previous revision. Atomicity therefore spans devices, layers, and
+targets together. This is stricter than best-effort omission for single-shot join filters:
+replacing a universally available old threshold with a new filter missing on one device would
+regress availability there.
+
+A **closed** target is not a failure: a consumer that drained cannot use any revision, so its
+slot is skipped and the revision still installs everywhere else. Closure and replica failure are
+distinct conditions and must not be collapsed — one narrows the fan-out, the other aborts the
+revision.
 
 Only one replication attempt is active. Concurrent offers retain the tightest pending boundary.
 Rate limiting may later use time, batch count, or estimated improvement, but must preserve
@@ -740,6 +952,14 @@ reader AST and `cudf::io::read_parquet`.
 - A split already past AST construction is not revisited.
 - If `disable_filter_pushdown` is set, the first release skips both layers for that split.
 
+**Open question — the FLBA-decimal probe.** A split containing FLBA/BYTE_ARRAY decimals sets
+`disable_filter_pushdown`, which drops every reader-side filter for that split, boundary layers
+included. The rationale for that probe appears obsolete at the pinned cuDF. It matters because
+DuckDB writes `DECIMAL(38,4)` as FLBA and Spark writes all decimals that way, so on the commonest
+decimal layouts the reader path is inert despite decimals being admitted. Removing the probe
+requires reproducing the original failure it guards against rather than inferring obsolescence
+from source reading, and establishing whether its scope is decimals or FLBA generally.
+
 **Statistics pruning of LEX.** At the pinned cuDF (pixi pins libcudf 26.06.*; verified at
 v26.06.01 in `stats_filter_helpers.cpp` and `predicate_pushdown.cpp`), the statistics converter
 translates every operator LEX_RANGE emits — comparisons and equality to per-row-group min/max
@@ -750,7 +970,7 @@ first-key bound: identical whenever a row group's `min(k0) != b0`, strictly stro
 `min(k0) == b0`, where tail statistics can additionally eliminate the group. Carrying the
 first-key bound alongside LEX in one reader AST adds nothing. This guarantee rests on the
 per-subexpression fallback and must be re-checked on cuDF upgrades. Both reference engines
-default to statistics-only pruning here; Stage 5 must confirm the decode-time row evaluation
+default to statistics-only pruning here; Stage 6 must confirm the decode-time row evaluation
 pays, or add the row-group-only path tracked for zone maps in
 [dynamic-filters.md](dynamic-filters.md).
 
@@ -759,20 +979,27 @@ reapply either layer.
 
 ### DuckDB-native
 
-Native decode has no reader hook. Its existing post-decode dynamic-filter operator snapshots in
-`include_ast_row_masks` mode and evaluates RANGE and LEX_RANGE row-wise. This reduces rows
-reaching partitioning, local Top-N, and merge, but initially saves no I/O or decode.
+Native decode has no reader hook. Its existing post-decode dynamic-filter operator snapshots and
+applies RANGE and LEX_RANGE through the fused-kernel capability (join-path zone maps keep their
+AST row-mask mode unchanged). This reduces rows reaching partitioning, local Top-N, and merge,
+but initially saves no I/O or decode.
 
 Native metadata stays static-only; DuckDB's `DYNAMIC_FILTER` node remains ignored there.
 
 ### Sited endpoint
 
-A sited endpoint is the existing post-decode operator constructed in `include_ast_row_masks` mode
-at a trace's stop point — the same operator and splice mechanics as a Phase 2 join-edge endpoint,
-in a new mode. Both layers are AST-lowerable, so the endpoint snapshots per task and evaluates
-its channel's predicate row-wise via `cudf::compute_column`, training its own generation-aware
-gate. A LEX endpoint resolves its component ordinals through the same column-reference resolver
-the consumers already own.
+A sited endpoint is the existing post-decode operator spliced at a trace's stop point — the same
+operator and splice mechanics as a Phase 2 join-edge endpoint. It snapshots per task and applies
+its channel's predicate through the fused-kernel capability — one predicate+compaction pass, no
+mask column — training its own generation-aware gate. A LEX filter carries its component
+ordinals, so the endpoint needs no per-column resolver at apply time.
+
+**First-key endpoints only, for now.** The splice addresses one traced ordinal, which is
+sufficient for the first-key layer but not for an all-keys stop point whose components sit at
+different ordinals. Until the splice takes an ordinal set, a non-scan LEX terminal is recorded as
+a deferred site and nothing is spliced; the sink prefilter applies the identical predicate, so
+only pruning is lost. The deferral is counted separately from cost-gate skips so a staged gap
+never reads as a tuning decision.
 
 Its cost model is the streaming work between the site and the sink on rejected rows. The sink's
 prefilter already covers the local sort, so an endpoint separated from the sink only by
@@ -787,7 +1014,7 @@ grow it, so decisions must record snapshot generation.
 
 - A disabled scan-level gate permits one measurement after generation increases.
 - An active gate remains active; a tighter threshold cannot become less useful.
-- Native RANGE/LEX_RANGE effectiveness uses the scan-level AST gate, not membership pointer
+- Native RANGE/LEX_RANGE effectiveness uses the scan-level gate, not membership pointer
   identity.
 - An older completing measurement cannot overwrite a newer-generation decision.
 - A device with no applicable filter does not train the gate.
@@ -827,19 +1054,48 @@ checkpoints that have not taken their snapshot.
 
 ### Reach ceiling
 
-The threshold's useful domain is the pipelines whose tasks overlap the `TOP_N` sink's tasks. The
-base task hint makes a FULL-barrier port's consumer wait until that port's source pipeline
-finishes, and no threshold exists before a sink task completes, so nothing upstream of a FULL
-port can ever observe one: the nearest upstream FULL barrier is the hard reach ceiling. The
-canonical FULL carriers — aggregates, sorts, windows — also destroy key lineage, so the
-scheduling ceiling and the semantic ceiling coincide there.
+A threshold's useful domain is the pipelines whose tasks overlap the tasks of the pipeline
+containing the **producer's sink**; the ceiling is stated per producer, at that producer's own
+position. A FULL-barrier port forces its source pipeline to accumulate and complete every batch
+before the consumer's first task runs (the base task hint), and no threshold exists before the
+producer's sink has seen data — so by the time a threshold could exist, everything upstream of a
+FULL port that is upstream of the producer has already fully executed and there is no work left
+to prune. Nothing upstream of such a port can ever observe the threshold: the nearest FULL
+barrier upstream of the producer is its hard reach ceiling. This scheduling argument is
+independent of the semantic one — the canonical FULL carriers (aggregates, sorts, windows) also
+destroy key lineage, so both ceilings coincide there.
 
-A PARTIAL or PIPELINE port is not a ceiling: with data available its consumer is READY while the
-source pipeline still runs, so upstream and downstream tasks overlap — the same property that
-lets transitive scans observe join filters. A pass-through PARTIAL break (a probe-side
-`PARTITION` or a join-feeding `CONCAT`) therefore does not cap reach, though a pass-through port
-that is FULL for sizing reasons (a right-family probe `PARTITION`) still does. The ceiling is a
-property of the port, not of an operator class.
+A producer inside a barrier is not crossing it. The group-key producer's sink lives in the
+aggregate's input pipeline, so the aggregate's FULL input port — the row producer's ceiling in
+that shape — is downstream of it and caps nothing; the group-key producer's own ceiling is the
+next FULL port further upstream.
+
+Hash-join build pipelines are the named example: the build side accumulates behind FULL ports
+(the build-side `PARTITION` port; a `concat_all` build fold waits for its whole source), so the
+build pipeline has drained before the probe-side pipeline containing the Top-N sink runs — a
+Top-N threshold can never prune build-side work. The build subtree normally also lies outside
+the key's trace, so the scheduling and lineage reasons apply independently.
+
+Port barrier type is **necessary but not sufficient**. A PARTIAL or PIPELINE port permits overlap
+— with data available its consumer is READY while the source pipeline still runs, the property
+that lets transitive scans observe join filters — but permission to overlap is not evidence that
+overlap happens. The binding constraint is **channel lifetime**: a consumer closes its channel
+when its own pipeline finalizes, so a target is useful only if its pipeline is still running when
+the first threshold exists.
+
+An endpoint sited below a hash join demonstrates the difference. Its ports are PARTIAL exactly as
+documented, yet the probe subtree finalizes — and closes the channel — before the Top-N sink has
+made its first offer, so every publication to it returns `CLOSED`. Measured, not inferred: with
+publication instrumented, `failed`, `stale`, and `ignored` were all zero, leaving `CLOSED` as the
+only observed result, holding across batch sizes 65536/4096 and probe sizes 10k/200k, while the
+same data published normally to an endpoint sited *above* the join. An earlier version of this
+section claimed a pass-through PARTIAL break "does not cap reach"; that was verified per-port and
+falsified by execution. It is a ceiling in effect, reached through pipeline lifetime rather than
+barrier type.
+
+So the ceiling has two independent sources, and either one binds: a FULL port upstream of the
+producer (accumulation, above), and a consumer whose pipeline finalizes before the producer's
+first offer (closure). Neither is a property of an operator class.
 
 ### Execution-scoped state
 
@@ -864,7 +1120,10 @@ Scan consumers do not require producer completion. After its child barrier, `MER
 `finish()` as a synchronous producer-side drain. The coordinator transitions `OPEN -> FINISHING`,
 rejects new offers, starts a publisher if pending work lacks one, joins the active publisher loop,
 and waits until both `pending` is empty and `publisher_active` is false before entering
-`FINISHED`. This can block the merge/finalization task; it never blocks a scan consumer.
+`FINISHED`. This can block the merge/finalization task; it never blocks a scan consumer. Under
+pipeline fusion, `MERGE_TOP_N` finalizes when its parent pipeline finishes — after the last merge
+execute, potentially later — so the Stage 4 drain runs inside the parent pipeline's finish path;
+that remains producer-side blocking only.
 
 When a consumer drains, `close_for_new_filters()` rejects its target updates. If all targets are
 closed, filter construction is skipped while the coordinator keeps tightening its boundary for the
@@ -891,8 +1150,10 @@ quiesced through normal task teardown. No scan waits for cleanup.
 15. Cancellation cannot release state while producer GPU work still references it.
 16. The sink prefilter and every endpoint drop only rows the strict or inclusive layer predicate
     excludes, backed by K witnesses.
-17. An endpoint site has only value-preserving, non-duplicating hops between it and the Top-N
-    input.
+17. An endpoint site has only value-preserving hops between it and the Top-N input. Duplication
+    is permitted: n copies of a key strictly worse than the boundary all still lose to the same
+    K witnesses, so a duplicating hop cannot turn a droppable row into a required one. What a
+    hop may not do is *change* a traced key's value.
 18. Final `MERGE_TOP_N` remains authoritative.
 
 ## Failure handling
@@ -900,6 +1161,10 @@ quiesced through normal task teardown. No scan waits for cleanup.
 | Condition | Required behavior |
 |---|---|
 | Non-bound-reference key, unsupported key-zero type, or rank/ties semantics | Create no producer at all; keep the otherwise-supported GPU Top-N |
+| ORDER BY key is an aggregate output | No group-key producer; the row producer still self-consumes above the barrier |
+| Any filter between the aggregate and Top-N | No group-key producer |
+| LEX terminal that is not a scan | Record a deferred site; publish no LEX there — the sink prefilter covers it |
+| Boundary-tied input row at a group-key consumer | Always kept; group-key predicates are inclusive-only |
 | Unsupported tail key type | Degrade to the first-key layer; plan no LEX targets |
 | No scan target and no material endpoint site | Sink self-consumption only; create no channel or filter |
 | Unselective sink prefilter | Disable the prefilter for the execution; offers continue |
@@ -927,6 +1192,8 @@ Recommended metrics:
 - Rows and time to first K-witness boundary.
 - Sink-prefilter rows before/after, keep ratio, and disable decisions.
 - Per-layer targets bound, revisions published, and tail-type degradations.
+- Group-key producer: distinct-key offers, witness-set fill, aggregate-input prefilter rows
+  before/after, and its eligibility rejections by reason.
 - Endpoint sites considered, sited, skipped as immaterial, and rows before/after.
 - Offers, not-tighter offers, coalesced offers, and final flushes.
 - Revisions attempted, accepted, stale, closed, and failed.
@@ -934,7 +1201,9 @@ Recommended metrics:
 - Splits queued, started, and completed before first publication and per generation.
 - Replica bytes, latency, route, and failure per device.
 - Parquet files/row groups/rows pruned where cuDF exposes them.
-- Native rows before and after the AST row masks.
+- Native rows before and after the fused-kernel application.
+- Fused-kernel time per batch versus the AST mask-then-apply path it replaces, until the
+  expected win is validated by measurement rather than assumed.
 - Gate decisions and generation-triggered remeasurements.
 - Publication overhead versus scan/decode work avoided.
 
@@ -942,57 +1211,75 @@ Telemetry must not extend filter or witness lifetime beyond query execution.
 
 ## Rollout plan
 
-### Stage 1 — Coordinator and sink self-consumption
+### Stage 1 — Coordinator and sink self-consumption *(implemented)*
 
 - Top-N eligibility (K, bound-reference keys, per-key type verdicts) and the execution
   coordinator with its tuple boundary and lexicographic tightness.
-- Sink prefilter evaluating the strict LEX predicate, degrading to the inclusive first-key
-  comparison when only key zero is admitted; keep-ratio disable.
+- Sink prefilter evaluating the strict LEX predicate through the fused boundary kernel,
+  degrading to the inclusive first-key comparison when only key zero is admitted; keep-ratio
+  disable.
 - No channel, filter, replica, or discovery work; experimental flag, disabled by default.
 - This stage alone covers producers whose keys reach no scan, e.g. top-k by an aggregate.
 
-### Stage 2 — Channel foundation
+### Stage 2 — Channel foundation *(implemented)*
 
 - Stable slots, producer revisions, channel generation, and coherent snapshots.
 - Migrate consumers to snapshots and make the gate generation-aware.
 - Preserve append-only join behavior.
 - Define per-execution channel state before plan reuse.
 
-### Stage 3 — Range and lexicographic filters
+### Stage 3 — Range and lexicographic filters *(implemented)*
 
-- Exact one-sided RANGE and strict LEX_RANGE with AST lowering; the multi-column resolver
-  capability and its dispatch in the consumer merge helper.
+- Exact one-sided RANGE and strict LEX_RANGE with reader-only AST lowering plus the fused-kernel
+  apply capability; the multi-column resolver capability and its dispatch in the consumer merge
+  helper.
 - Per-component null derivations for LEX tails; head component must be non-null.
 - All-device replication of every component scalar; all-or-nothing replacement across both
   layers.
 - Per-key allowlist: DuckDB `TINYINT`, `SMALLINT`, `INTEGER`, `BIGINT`, and `DATE` only.
 
-### Stage 4 — External consumers
+### Stage 4 — External consumers *(implemented)*
 
 - Key-zero and all-keys traces with cost-gated endpoint siting and LEX-subsumption dedup.
 - Immutable plan (keys, layered targets), slots, and local witness offers feeding publication.
-- Parquet reader, native post-decode, and sited endpoint consumers for both layers, including
-  the split-keys shape: first-key bound at key zero's scan, strict predicate at the sink
-  prefilter.
+- Parquet reader, native post-decode, and first-key endpoint consumers; LEX reaches scan binds,
+  and a non-scan LEX terminal is a recorded deferred site (multi-ordinal siting is Stage 7).
+  Split-keys shape: first-key bound at key zero's scan, strict predicate at the sink prefilter.
 - The experimental flag continues to cover the whole feature.
 
-### Stage 5 — Performance validation
+### Stage 5 — Aggregate group-key producer
+
+- Eligibility (keys all grouping keys, no intervening filter, exact-count `LIMIT`) and the
+  aggregate-input trace with the existing hop rules.
+- Distinct-key witness seam in the partial aggregate sink: per-batch bounded distinct-key
+  extraction (sort/unique, truncate to K, host copies) and the coordinator's distinct-key mode.
+- Inclusive RANGE/LEX_RANGE publication into the input pipeline's scans and endpoint sites;
+  gated sink self-consumption before hash insert.
+- Coexists with the row producer above the aggregate; same experimental flag.
+
+### Stage 6 — Performance validation
 
 - Measure time-to-first-boundary and splits per generation.
-- Measure sink-prefilter keep ratios and endpoint skip decisions.
+- Measure sink-prefilter keep ratios and endpoint skip decisions, for both producer kinds.
 - Tune coalescing/rate limiting from measured cost.
 - Compare decode-time row filtering with row-group-only pruning for parquet RANGE.
 - Consider primary MIN/MAX row-group prioritization to learn a threshold sooner.
-- Add a shared key-only witness heap only if sub-K batches delay publication.
+- Add a shared key-only witness heap only if sub-K batches delay row-producer publication.
 - Enable by default only after equivalence and overhead criteria are met.
 
-### Stage 6 — Expanded semantics
+### Stage 7 — Expanded semantics
 
 - Widen the traces through proven hops — join probe blocks first — so endpoint sites land below
   material operators and the first-key bound reaches more scans.
+- Multi-ordinal endpoint siting, unlocking LEX endpoints at arrive-together points: the splice
+  must accept an ordinal set, admit a hop only when every component survives it into the same
+  child, remap each independently, and address them all in the sited operator's input schema.
 - Head-component null derivations (`k0 IS NULL` under `NULLS FIRST`, exclusion under
   `NULLS LAST`).
-- More exact types per key, hive partitions, and native metadata pruning.
+- More exact types per key — `DECIMAL(5–18)` landed, unlocking TPC-H Q18's head; `DECIMAL128`
+  awaits kernel width support — plus hive partitions, and native
+  metadata pruning.
+- Grouping-key-only `HAVING` admission by witnessing through the predicate.
 - MIN/MAX producers reusing RANGE and refinement slots.
 
 Rollback disables Top-N producer planning. Generic support stays dormant and join filters continue
@@ -1009,6 +1296,9 @@ should cover:
   duplicate boundaries, and null tail components.
 - Layer decomposition: LEX-implies-first-key subsumption, tail-type degradation, and that no
   later key is ever filtered alone.
+- Group-key producer: distinct-key witness accumulation across sub-K batches, boundary-tie rows
+  provably kept under row-loss-sensitive aggregates (`sum`, `count`), aggregate-output-key and
+  intervening-filter negatives, and coexistence with the row producer above the barrier.
 - Sink-prefilter equivalence (lexicographic and degraded first-key), boundary-staleness safety,
   and keep-ratio disable.
 - Endpoint siting above an aggregate read-out and an expression projection; the split-keys join
@@ -1032,10 +1322,16 @@ should cover:
 7. Can native metadata refresh generations before decode without new coupling?
 8. What update cadence best amortizes multi-GPU scalar construction? Neither reference engine
    throttles beyond monotonic checks, but their update cost is one host value, not replicas.
-9. Which widened trace hops are provable under the K-witness rule — join probe blocks first — and
-   what does each contribute to endpoint materiality?
+9. ~~Which widened trace hops are provable under the K-witness rule, and what does each
+   contribute to endpoint materiality?~~ **Answered, and the second half negatively.** The join
+   probe hop is provable — value-preserving, and duplication is harmless (invariant 17) — but it
+   contributes nothing: a site below the join is closed before the first offer, so widening the
+   trace relocates endpoints to pipelines that have already drained. Provability and materiality
+   are independent, and materiality is the binding one.
 10. Should the sink prefilter cache per-device comparison scalars instead of constructing them
     per task?
+11. Should grouping-key-only `HAVING` be admitted by witnessing through the same predicate in
+    the aggregate sink?
 
 These affect eligibility and performance policy, not the replacement protocol.
 
@@ -1051,6 +1347,7 @@ These affect eligibility and performance policy, not the replacement protocol.
 | Top-N planning | `src/planner/sirius_plan_top_n.cpp` | Eligibility, traces, plan |
 | Target discovery | `src/planner/dynamic_filter/dynamic_filter_target_discovery.cpp` | Preserve external refusal; add separate Top-N trace; site endpoints via `place_endpoint` |
 | Local/merge producer | `src/op/sirius_physical_top_n.cpp` | Sink prefilter, witness offers, and finish |
+| Group-key producer | `src/op/sirius_physical_grouped_aggregate.cpp`, `src/include/op/sirius_physical_grouped_aggregate.hpp` | Distinct-key witness offers, input prefilter |
 | Top-N API | `src/include/op/sirius_physical_top_n.hpp` | Hold plan/coordinator |
 | Parquet checkpoint | `src/op/scan/parquet_gpu_ingestible.cpp` | Snapshot before reader AST |
 | Native consumer | `src/op/scan/sirius_physical_dynamic_filter.cpp` | Apply AST snapshot post-decode and at sited endpoints |

@@ -1,10 +1,14 @@
 # Dynamic Filters — Top-N API and Test Specification
 
-> **Status: proposed (design only).** Companion to
+> **Status: Stages 1–4 implemented; Stages 5–7 proposed.** Companion to
 > [dynamic-filters-top-n.md](dynamic-filters-top-n.md), which owns the design narrative and the
 > normative contract. This document turns that contract into a header-level API surface and an
-> example-driven high-level test plan. Stage numbers refer to the main doc's six-stage rollout.
-> Nothing here is implemented.
+> example-driven high-level test plan. Stage numbers refer to the main doc's seven-stage rollout.
+> The Stage 1–4 surfaces below are implemented and behind `enable_top_n_dynamic_filter` (default
+> false) — producers publish, with scan binds and first-key endpoints live, LEX endpoints
+> deferred to Stage 7, and set operations a trace terminal; the Stage 5–7 surfaces remain
+> proposed. Declarations here stay the authority — where an
+> implemented signature differs, the doc is corrected, not the code.
 
 ## Scope and untouched surface
 
@@ -13,7 +17,7 @@ byte-identical:
 
 | File | Untouched declarations |
 |---|---|
-| `src/include/op/dynamic_filter/sirius_dynamic_filter.hpp` | `sirius_dynamic_filter`, `sirius_device_replicable`, `sirius_ast_lowerable`, `sirius_mask_applicable`, zone-map/IN-list/Bloom classes, `push_filter`, `filters_for_column`, `filtered_columns`, `empty`, `ignore_columns`, `register_producer`, `has_producers`, `close_for_new_filters`, `accepting_filters`, `has_filters`, `filter_count`, `merge_ast_dynamic_filters_into_tree`, `column_ref_resolver_fn` |
+| `src/include/op/dynamic_filter/sirius_dynamic_filter.hpp` | `sirius_dynamic_filter`, `sirius_device_replicable`, `sirius_ast_lowerable`, `sirius_mask_applicable`, zone-map/IN-list/Bloom classes, `push_filter`, `filters_for_column`, `filtered_columns`, `empty`, `ignore_columns`, `register_producer`, `has_producers`, `close_for_new_filters`, `accepting_filters`, `has_filters`, `filter_count`, `merge_ast_dynamic_filters_into_tree`, `column_ref_resolver_fn` (declaration text unchanged; it moved earlier in the header so the Stage-3 capability classes can reference it — no signature or semantic change) |
 | `src/include/op/dynamic_filter/dynamic_filter_publisher.hpp` | Everything — the join publisher is not a refinement producer |
 | `src/include/op/dynamic_filter/dynamic_filter_replica_space.hpp` | Everything — reused as-is by Stage 3 replication |
 | `src/planner/dynamic_filter/*` join admission/evidence/domain | Everything — the Top-N trace is separate |
@@ -28,13 +32,21 @@ existing column-reference resolver.
 
 ## Part 1 — API surface by stage
 
-### Stage 1 — Coordinator and sink self-consumption
+### Stage 1 — Coordinator and sink self-consumption *(implemented)*
 
 #### New file: `src/include/op/dynamic_filter/exact_host_scalar.hpp`
 
 One exact typed host value. Introduced here for the coordinator's boundary; reused verbatim by
 the Stage 3 RANGE filter. `std::variant` keeps exactness explicit — no value ever rounds through
 `double` (the same rule the zone-map replication follows).
+
+**Allowlist rule.** The variant covers the admitted types' **physical representations**, not their
+logical types; `storage_type` is what distinguishes `DECIMAL64` from `INT64` when both ride an
+`int64_t`. Admitting a logical type therefore widens the variant only when its physical
+representation is not already present — `DECIMAL(5–18)` needed no new alternative. The next
+widening, `DECIMAL128`, is not a variant edit alone: `component::value`, the kernel's width
+switch, and the variant must change **together**, because a value the variant can hold but the
+kernel cannot load is the silently-wrong case the allowlist exists to prevent.
 
 ```cpp
 namespace sirius::op {
@@ -43,8 +55,12 @@ namespace sirius::op {
  * @brief Exact host-side scalar for the Top-N type allowlist
  *
  * Carries the value and its cuDF storage type together so comparison and device-scalar
- * construction cannot disagree about representation. The variant covers exactly the admitted
- * types (main doc, "Range and lexicographic filters"); widening the allowlist widens the variant.
+ * construction cannot disagree about representation. The variant holds **physical
+ * representations**, not logical types, so admitting a new logical type widens it only when that
+ * type's physical representation is not already present — `DECIMAL(5-18)` needed no new
+ * alternative, because its scaled integer *is* an `int32_t`/`int64_t` and the scale rides in
+ * `storage_type` (`fixed_point_scalar<T>::value()` returns `rep_type`). `DECIMAL128` would need
+ * one, since no `int128` alternative exists. See the main doc, "Range and lexicographic filters".
  * Immutable after construction; freely copyable; no device state.
  */
 class exact_host_scalar final {
@@ -170,10 +186,12 @@ class top_n_threshold_coordinator final {
    * key
    * @param[in] lex_admitted True when every key's type is admitted — enables the LEX layer and
    * the lexicographic prefilter; false degrades both to the first-key comparison
+   * @param[in] stats Non-owning counter sink owned by `SiriusContext`; may be null
    */
   top_n_threshold_coordinator(std::size_t k,
                               std::vector<top_n_key_semantics> keys,
-                              bool lex_admitted);
+                              bool lex_admitted,
+                              dynamic_filter_stats* stats);
 
   top_n_threshold_coordinator(top_n_threshold_coordinator const&)            = delete;
   top_n_threshold_coordinator& operator=(top_n_threshold_coordinator const&) = delete;
@@ -215,9 +233,10 @@ class top_n_threshold_coordinator final {
 
 #### Modified file: `src/include/op/sirius_physical_top_n.hpp`
 
-Additive members only; the existing public fields and `execute` signature are unchanged. The same
-two members are mirrored on `sirius_physical_top_n_merge` (its delegating constructor already
-copies shared state from the local operator, exactly as it shares `dynamic_filter` today).
+Additive members only; the existing public fields and `execute` signature are unchanged. Only the
+coordinator is mirrored on `sirius_physical_top_n_merge` (its delegating constructor already
+copies shared state from the local operator, exactly as it shares `dynamic_filter` today); the
+gate is non-copyable and per-operator, and the merge never prefilters.
 
 ```cpp
 class sirius_physical_top_n : public sirius_physical_operator {
@@ -244,10 +263,56 @@ class sirius_physical_top_n : public sirius_physical_operator {
 ```
 
 The prefilter itself and the witness extraction are `execute()`-internal (a static helper in
-`sirius_physical_top_n.cpp`), not public API: read `tightest_boundary()`, build the strict LEX
-predicate — or the degraded inclusive first-key comparison — as a task-local AST, evaluate with
-`cudf::compute_column` + `apply_boolean_mask`, then `compute_top_n_table`, then extract every key
-column of row `K - 1` and offer the witness.
+`sirius_physical_top_n.cpp`), not public API: read `tightest_boundary()`, marshal it into the
+boundary kernel's launch parameters, run one fused predicate+compaction pass (below), gather
+unless every row passed, then `compute_top_n_table`, then extract every key column of row `K - 1`
+and offer the witness. No AST, no device scalars, no BOOL8 mask on this path.
+
+#### New files: `src/include/op/dynamic_filter/top_n_boundary_filter.hpp`, `src/cuda/top_n_boundary_filter.cu`
+
+The one device row-filter for Top-N thresholds, shared by the Stage-1 sink prefilter, the
+Stage-4 native/endpoint capability implementations, and the Stage-5 inclusive forms. CUB
+device-algorithm style like the existing `src/cuda` filters; no raw kernel launches.
+
+```cpp
+namespace sirius::op::detail {
+
+/**
+ * @brief Launch-parameter form of one boundary: POD, passed by value, no device state
+ *
+ * Components hold the exact value widened to int64 (sign-extension is exact for the signed
+ * allowlist), an engaged flag (null tail components), and the key's direction, output-order null
+ * placement, and physical width. `strict` selects the row producer's predicate; inclusive covers
+ * the degraded first-key form and the group-key producer. More components than
+ * `k_max_components` degrade to the inclusive prefix form, which is sound standalone.
+ */
+struct boundary_filter_params {
+  static constexpr std::size_t k_max_components = 8;
+  // per-component: int64 value, engaged, descending, nulls_first, width; plus count and
+  // strictness — exact layout is implementation detail.
+};
+
+/**
+ * @brief One fused pass: per-row lexicographic compare against the boundary, compacting passing
+ * row indices
+ *
+ * @return `filtered == nullptr` when every row passed (caller forwards the batch unchanged);
+ * otherwise the gathered surviving table. `rows_kept` is always valid.
+ */
+struct boundary_filter_result {
+  std::unique_ptr<cudf::table> filtered;
+  cudf::size_type rows_kept;
+};
+
+[[nodiscard]] boundary_filter_result apply_boundary_filter(
+  cudf::table_view const& batch,
+  std::span<cudf::size_type const> key_columns,
+  boundary_filter_params const& params,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr);
+
+}  // namespace sirius::op::detail
+```
 
 #### Modified file: `src/include/op/dynamic_filter/dynamic_filter_stats.hpp`
 
@@ -272,6 +337,7 @@ the existing `SiriusContext::get_dynamic_filter_stats_snapshot()`; no new access
   std::atomic<std::uint64_t> top_n_lex_scan_targets{0};           ///< Plan-time; all keys one scan
   std::atomic<std::uint64_t> top_n_endpoint_sites_placed{0};      ///< Plan-time; either layer
   std::atomic<std::uint64_t> top_n_endpoint_sites_skipped{0};     ///< Plan-time; immaterial gap
+  std::atomic<std::uint64_t> top_n_lex_endpoint_sites_deferred{0};///< Plan-time; staged gap, not a cost decision
   std::atomic<std::uint64_t> top_n_first_key_subsumed_by_lex{0};  ///< Plan-time; dedup fired
   std::atomic<std::uint64_t> top_n_revisions_published{0};        ///< Boundary updates fanned out
   std::atomic<std::uint64_t> top_n_lex_filters_pushed{0};
@@ -296,7 +362,7 @@ One flag covers all six stages; stages change what an enabled producer does, not
 
 ---
 
-### Stage 2 — Channel foundation
+### Stage 2 — Channel foundation *(implemented)*
 
 #### Modified file: `src/include/op/dynamic_filter/sirius_dynamic_filter.hpp`
 
@@ -316,6 +382,9 @@ struct column_filter_snapshot {
  *
  * The only legal input for predicate construction once refinement is enabled. Owning copies keep
  * superseded filters alive for in-flight consumers (main doc, "Coherent snapshots").
+ * Generation-to-pointer coherence is the guarantee; `logical_filter_count` may lag `columns` by
+ * an in-flight append — the pre-existing outside-mutex count bump is deliberately untouched for
+ * join byte-equivalence.
  */
 struct dynamic_filter_snapshot {
   std::uint64_t generation = 0;
@@ -345,19 +414,24 @@ class dynamic_filter_refinement_publisher final {
    * @brief Install @p ready_filter at @p producer_revision; rejects stale/closed/ignored
    *
    * An accepted call installs the immutable filter, bumps the channel generation, and counts
-   * `filter_count` only for the slot's first value.
+   * `filter_count` only for the slot's first value. A null @p ready_filter returns `IGNORED`.
    */
   refinement_publish_result publish(
     std::uint64_t producer_revision,
     std::shared_ptr<sirius_dynamic_filter const> ready_filter) const;
 };
 
-class sirius_dynamic_filter_set {
+class sirius_dynamic_filter_set : public std::enable_shared_from_this<sirius_dynamic_filter_set> {
  public:
   // ... existing members unchanged ...
 
   /**
    * @brief Plan-time only: create a stable refinement slot at @p primary_ordinal
+   *
+   * @pre The set is owned by a `shared_ptr` (every production channel is) — the returned
+   * publisher takes shared co-ownership via `shared_from_this`, so a late publish after
+   * consumer teardown reports `CLOSED` instead of touching freed state; a non-shared set throws
+   * `std::bad_weak_ptr`.
    *
    * Also registers a producer (see @ref register_producer). Each call mints a distinct slot;
    * separate producers targeting one channel receive separate slots. @p referenced_ordinals
@@ -383,35 +457,47 @@ class sirius_dynamic_filter_set {
 
 #### Modified file: `src/include/op/scan/dynamic_filter_gate.hpp`
 
-Replacement does not grow `filter_count()`, so the gate's growth rule becomes generation-based.
-The count-based overloads remain during migration and are removed when the last consumer moves.
+Replacement does not grow `filter_count()`, so the gate's growth rule becomes marker-based. On
+LP64 a count-typed and a generation-typed `record_keep_ratio` are the same function type, so
+there is exactly **one** marker-typed recorder; the marker's domain is fixed per gate instance —
+the Top-N prefilter gate only ever receives its coordinator's boundary-update count, scan and
+endpoint gates only ever receive channel generations. Mixing domains on one instance is a
+programming error, enforced by call-site discipline, not runtime tagging.
 
 ```cpp
 class dynamic_filter_gate {
  public:
   // ... existing members unchanged during migration ...
 
-  /// Generation-aware applicability: work is due when filters exist and the gate is active or the
-  /// channel generation has advanced past the disabling decision's generation.
+  /// Snapshot-based applicability: work is due when filters exist and the gate is active or the
+  /// snapshot's generation has advanced past the disabling decision's marker.
   [[nodiscard]] bool applicable(sirius::op::dynamic_filter_snapshot const& snap) const;
 
-  /// Record one split's keep ratio against the snapshot generation it measured. An older
-  /// completing measurement cannot overwrite a newer-generation decision; ACTIVE stays terminal.
+  /// Record one split's keep ratio against the monotonic marker it measured under (channel
+  /// generation, or the prefilter's coordinator update count — one domain per instance). An
+  /// older completing measurement cannot overwrite a newer-marker decision; ACTIVE stays
+  /// terminal.
   void record_keep_ratio(std::size_t rows_before,
                          std::size_t rows_after,
-                         std::uint64_t observed_generation);
+                         std::uint64_t observed_marker);
 ```
+
+The retained set-based `applicable`/gated-view pair is internally generation-domain since Stage
+2 (bit-identical on append-only channels); its full retirement rides the Stage-4 consumer
+cleanup.
 
 #### Modified file: `src/include/op/scan/dynamic_filter_merge.hpp`
 
-Snapshot-consuming overloads of `merge_ast_dynamic_filters_into_tree` and
-`apply_dynamic_filters_gated_view` (same semantics, `dynamic_filter_snapshot const&` in place of
-the live set). Parquet and native consumers switch to one snapshot per checkpoint; the set-based
-overloads then retire.
+Snapshot-consuming overloads of `scan::merge_dynamic_filters_into_ast`,
+`apply_dynamic_filters_to_view`, and `apply_dynamic_filters_gated_view` (same semantics,
+`dynamic_filter_snapshot const&` in place of the live set); the resolver-based
+`merge_ast_dynamic_filters_into_tree` in the channel header is untouched. Parquet and native
+consumers switch to one snapshot per checkpoint; the set-based overloads retire in the Stage-4
+consumer cleanup.
 
 ---
 
-### Stage 3 — Range and lexicographic filters
+### Stage 3 — Range and lexicographic filters *(implemented)*
 
 #### Modified file: `src/include/op/dynamic_filter/sirius_dynamic_filter.hpp`
 
@@ -440,6 +526,7 @@ enum class dynamic_filter_null_policy { ADMIT, REJECT };
  */
 class sirius_dynamic_range_filter final : public sirius_dynamic_filter,
                                           public sirius_ast_lowerable,
+                                          public sirius_compaction_applicable,
                                           public sirius_device_replicable {
  public:
   /**
@@ -466,7 +553,9 @@ class sirius_dynamic_range_filter final : public sirius_dynamic_filter,
    *
    * Unlike the join filters' best-effort per-target policy, RANGE replication is all-or-nothing:
    * any target failure throws, the caller installs nothing, and the previous revision stays
-   * visible on every device (main doc, "Multi-GPU publication").
+   * visible on every device (main doc, "Multi-GPU publication"). Replica construction must go
+   * through reservation admission, so an exhausted target budget is a deterministic failure
+   * injection point.
    */
   void replicate_to_devices(std::span<dynamic_filter_replica_space const> spaces) override;
   [[nodiscard]] bool is_available_on_device(int device_id) const noexcept override;
@@ -475,6 +564,45 @@ class sirius_dynamic_range_filter final : public sirius_dynamic_filter,
   [[nodiscard]] range_bound_side side() const noexcept;
   [[nodiscard]] bool inclusive() const noexcept;
   [[nodiscard]] dynamic_filter_null_policy null_policy() const noexcept;
+};
+
+/**
+ * @brief Capability mixin: filter applies itself on device by fused predicate + compaction
+ *
+ * The device row-wise sibling of the AST path: one kernel pass, no BOOL8 mask. Implemented by
+ * RANGE and LEX_RANGE over `detail::apply_boundary_filter`; consumers dispatch on the capability
+ * and never see the kernel. AST lowering remains solely for the parquet reader checkpoint.
+ *
+ * This path requires **no device replicas**: the boundary rides the kernel's launch parameters,
+ * so compaction works on any device from host state alone. `is_available_on_device` therefore
+ * gates only the AST path's literal scalars.
+ *
+ * **Known gap — the consumer leg of the type contract is open.** The caller must ensure the
+ * batch's key columns carry the same storage types the filter's boundary was built from; the
+ * gated-apply path currently checks only the ordinal range, so a mismatch reads the consumer's
+ * columns at the producer's widths. This is reachable in principle because cuDF derives a
+ * decimal's width from the parquet *physical* type rather than the logical precision: a file
+ * storing `DECIMAL(9,2)` as physical INT64 — legal parquet, though not a DuckDB or Spark
+ * default — decodes as `DECIMAL64` while the catalog maps `DECIMAL32`. The fix is to pass the
+ * batch through unfiltered on any type mismatch, matching the producer-side guard.
+ */
+class sirius_compaction_applicable {
+ public:
+  virtual ~sirius_compaction_applicable() = default;
+
+  /**
+   * @brief Filter @p batch in one fused pass using the device-local replica for @p device_id
+   *
+   * @param[in] key_columns The filter's component columns in @p batch, primary first; a RANGE
+   * caller passes its single channel column.
+   * @return Null `filtered` when nothing was dropped or no replica applies; `rows_kept` valid.
+   */
+  [[nodiscard]] virtual detail::boundary_filter_result apply_compact(
+    cudf::table_view const& batch,
+    std::span<cudf::size_type const> key_columns,
+    int device_id,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) const = 0;
 };
 
 /**
@@ -515,22 +643,26 @@ struct lex_component_semantics {
 };
 
 /**
- * @brief Immutable strict lexicographic boundary filter over the full ORDER BY tuple
+ * @brief Immutable lexicographic boundary filter over the full ORDER BY tuple
  *
  * Lowers to the prefix-disjunction `T0 OR (E0 AND T1) OR ...` with the per-component null
- * derivations from the main doc's table. A null tail component contributes `IS NULL` /
- * `IS NOT NULL` terms and owns no device scalar; the first component must be non-null.
- * Never decomposed into per-column filters — the no-tail lemma at the representation level.
+ * derivations from the main doc's table; the inclusive form appends the all-equal disjunct
+ * `E0 AND ... AND En` (group-key producer — boundary-tied rows are never dropped). A null tail
+ * component contributes `IS NULL` / `IS NOT NULL` terms and owns no device scalar; the first
+ * component must be non-null. Never decomposed into per-column filters — the no-tail lemma at
+ * the representation level.
  *
  * @pre `boundary.size() == components.size() >= 2` (a single-key producer publishes RANGE).
  * @pre `boundary.component(0)` is engaged.
  */
 class sirius_dynamic_lex_range_filter final : public sirius_dynamic_filter,
                                               public sirius_multi_column_ast_lowerable,
+                                              public sirius_compaction_applicable,
                                               public sirius_device_replicable {
  public:
   sirius_dynamic_lex_range_filter(exact_host_key_tuple boundary,
-                                  std::vector<lex_component_semantics> components);
+                                  std::vector<lex_component_semantics> components,
+                                  bool inclusive);
   ~sirius_dynamic_lex_range_filter() noexcept override;
 
   [[nodiscard]] sirius_dynamic_filter_kind kind() const override
@@ -553,12 +685,13 @@ class sirius_dynamic_lex_range_filter final : public sirius_dynamic_filter,
 
   [[nodiscard]] exact_host_key_tuple const& boundary() const noexcept;
   [[nodiscard]] std::vector<lex_component_semantics> const& components() const noexcept;
+  [[nodiscard]] bool inclusive() const noexcept;
 };
 ```
 
 ---
 
-### Stage 4 — External consumers
+### Stage 4 — External consumers *(implemented)*
 
 #### New file: `src/include/op/dynamic_filter/top_n_dynamic_filter_publish_plan.hpp`
 
@@ -589,6 +722,13 @@ class top_n_dynamic_filter_publish_plan final {
   struct target {
     dynamic_filter_refinement_publisher publisher;  ///< Bound to its (primary) consumer ordinal
     top_n_filter_layer layer;
+    /// The key components' ordinals in **this** target's output space, primary first, mirroring
+    /// the slot's declared ordinals. Each target's trace remaps the keys independently, so a LEX
+    /// filter — which owns the ordinals it references — is site-specific and is built per target
+    /// (see "Per-target LEX construction" below). A FIRST_KEY target carries one entry, which
+    /// the publisher's push coordinate already supplies; it is recorded for symmetry and
+    /// plan-shape assertions.
+    std::vector<std::size_t> component_ordinals;
   };
 
   std::size_t k;                      ///< Checked limit + offset
@@ -600,9 +740,74 @@ class top_n_dynamic_filter_publish_plan final {
 }  // namespace sirius::op
 ```
 
-The plan is held `const` by the local operator; the coordinator receives it at construction
-(extending the Stage 1 constructor with an optional plan — the Stage 1 form remains for
-self-consumption-only producers).
+The plan is held `const` by the local operator. The coordinator receives it through a plan-time
+setter, not the constructor:
+
+```cpp
+  /**
+   * @brief Install the frozen publish plan; plan-time only
+   *
+   * @throw std::logic_error if the coordinator has left the open state or has already accepted
+   * an offer — the precondition is load-bearing, not defensive.
+   */
+  void set_publish_plan(top_n_dynamic_filter_publish_plan plan);
+```
+
+**Why the precondition is load-bearing.** The publisher loop reads the plan's targets without
+holding `_mu`, which is sound only because every plan write happens-before every such read.
+`_boundary_updates` is incremented under `_mu` strictly before `_pending` is assigned, so a
+successful plan write completes in a critical section that precedes the first offer's critical
+section, which precedes that offer's `publisher_loop()` in program order; the mutex edge orders
+the write before every unlocked read, and the same edge carries `_target_closed` across
+successive publisher owners. Accepting a plan after an offer would break that chain and make the
+lock-free reads a data race. A future author restoring constructor injection must preserve the
+same ordering guarantee — deleting the throwing precondition without replacing it silently
+removes what makes the reads safe.
+
+A producer with no discovered target simply never receives a plan; the self-consumption-only path
+is unchanged.
+
+**Per-target LEX construction.** The two layers are deliberately asymmetric. A single-column
+`RANGE` is ordinal-free: its consumer ordinal is the channel's push coordinate, so **one
+immutable object is shared across every accepting first-key target** — the same property the join
+path relies on with its per-target `key_binding::channel_push_ordinal`.
+`LEX_RANGE` cannot: only its primary ordinal can be the push coordinate, so the remaining
+components' ordinals live inside the filter (`lex_component_semantics::consumer_ordinal`), and
+each target's trace remaps them differently. One LEX object therefore cannot serve two sites with
+different mappings. The publisher builds **one LEX filter per accepting LEX target**, from the
+same boundary tuple and semantics, differing only in `component_ordinals`.
+
+Any plan pairing a scan bind with an endpoint forces this, as would set-operation fan-out once it
+is supported — each branch binds its own scan at its own ordinals. The design always implied
+site-specific LEX filters; what was under-specified is that this makes construction per-target,
+and that only ordinal-free layers literally "fan the same object".
+
+**LEX endpoints are deferred.** `place_endpoint` traces one ordinal, so it cannot address an
+all-keys stop point that differs from key zero's. Stage 4 therefore delivers LEX **only at scan
+binds**; a non-scan LEX terminal is classified `LEX_ENDPOINT_DEFERRED`, counted separately, and
+nothing is spliced. This is always sound — the sink prefilter applies the identical predicate, so
+only pruning is lost — and it is a staged gap, not a cost decision, which is why it does not fold
+into `top_n_endpoint_sites_skipped`.
+
+Siting one needs a multi-ordinal `place_endpoint` that guarantees three things the single-ordinal
+form never had to: every component ordinal survives the *same* hop into the *same* child (a set
+that splits across a join's two blocks stops at the join output — exactly the arrive-together
+semantics), each ordinal is remapped independently at the splice, and the sited operator's input
+schema addresses all of them. A span-taking form with the current signature as a delegating
+wrapper would keep the join path byte-equivalent, but it generalizes a routine on the join's
+critical path for a narrow near-term win: with the minimal hop set almost everything between an
+all-keys stop point and the sink is pass-through, so the cost gate would skip most such sites
+anyway. The exception is real but uncommon — a residual `FILTER` above the arrive-together point,
+which DuckDB usually pushes below the join. The work therefore belongs with the trace widening
+that makes endpoints broadly material (Stage 7), not with Stage 4.
+
+Cost: N accepting LEX targets means N filters and N replica sets per revision. Each carries one
+host boundary tuple and at most one device scalar per non-null component per device — realistic N
+is one or two (branch count), so this is immaterial against the join filters' hash sets and Bloom
+bitsets. A cheaper formulation exists if N ever grows — make the filter ordinal-free over
+component indices and carry the per-site mapping in the slot, which already declares its
+referenced ordinals — but it would change the implemented Stage-2 snapshot surface for no
+measured benefit and is deliberately not taken now.
 
 #### Modified file: `src/include/planner/dynamic_filter/dynamic_filter_target_discovery.hpp`
 
@@ -616,9 +821,11 @@ struct descent_policy {
   /**
    * @brief Restrict hops to the Top-N self-trace set
    *
-   * Accepts plain-reference projections, FILTER pass-through/gather, positional UNION fan-out,
-   * and endpoints; refuses joins, aggregates, and every other operator. Stage 6 widens this set
-   * per proven hop, not by flipping the bit off.
+   * Accepts plain-reference projections, FILTER pass-through/gather, and endpoints; refuses
+   * joins, aggregates, set operations, and every other operator, so each trace yields exactly
+   * one terminal. Positional UNION stays a fan-out hop for the join policy but is a terminal
+   * here: Sirius rejects set operations at planning, so a fan-out branch would be untestable
+   * machinery. Stage 7 widens this set per proven hop, not by flipping the bit off.
    */
   bool top_n_self_trace = false;
 };
@@ -649,7 +856,12 @@ enum class top_n_target_kind {
   SCAN_BIND,
   ENDPOINT_SITE,
   ENDPOINT_SKIPPED_IMMATERIAL,
-  SUBSUMED_BY_LEX
+  SUBSUMED_BY_LEX,
+  /// A LEX terminal that is not a scan. Siting one requires addressing every component ordinal
+  /// at the splice, which the single-ordinal `place_endpoint` cannot express; deferred to the
+  /// trace-widening stage (see "LEX endpoints are deferred"). Distinct from
+  /// `ENDPOINT_SKIPPED_IMMATERIAL` so a staged gap never hides inside a cost-gate decision.
+  LEX_ENDPOINT_DEFERRED
 };
 
 [[nodiscard]] top_n_target_kind classify_top_n_terminal(route_terminal const& terminal,
@@ -658,7 +870,49 @@ enum class top_n_target_kind {
 ```
 
 Endpoint splicing itself is the existing `place_endpoint` with an `endpoint_factory` that
-constructs `sirius_physical_dynamic_filter` in `include_ast_row_masks` mode.
+constructs `sirius_physical_dynamic_filter`; Top-N layers apply through
+`sirius_compaction_applicable` (join-path zone maps keep the AST row-mask mode).
+
+```cpp
+/**
+ * @brief Whether a boundary key may be compared against a target site's column
+ *
+ * Wired at all three target sites. The rule is plain type identity —
+ * `key_storage_type == site_column_type` — for **every** type, with no fixed-point carve-out: an
+ * `is_fixed_point` exception was written and then deleted during review because no reachable case
+ * needed it, and three assertions that had pinned the weaker behavior became `REQUIRE_FALSE`.
+ *
+ * This is what makes `exact_host_scalar::compare`'s "operands share one storage type"
+ * precondition true in practice. That precondition is otherwise unenforced: the comparison widens
+ * to `int64` and never consults the storage type, so two decimals of different scale would
+ * compare as raw integers and prune wrongly with no error anywhere.
+ */
+[[nodiscard]] bool boundary_key_matches_site_type(cudf::data_type key_storage_type,
+                                                  cudf::data_type site_column_type) noexcept;
+```
+
+#### New file: `src/include/planner/top_n_key_types.hpp`
+
+The per-key type allowlist as a **pure function** with its own unit test, rather than a predicate
+buried in the planner:
+
+```cpp
+/**
+ * @brief Exact cuDF storage type for an admitted ORDER BY key type, or empty when refused
+ *
+ * Admits `TINYINT`/`SMALLINT`/`INTEGER`/`BIGINT`/`DATE` and `DECIMAL` of precision 5–18
+ * (p ≤ 9 → `DECIMAL32`, p ≤ 18 → `DECIMAL64`). Refuses p ≤ 4 (INT16-backed, no cuDF counterpart)
+ * and p ≥ 19 (`DECIMAL128`: the kernel's width switch handles 1/2/4/8 only).
+ */
+[[nodiscard]] std::optional<cudf::data_type> admitted_key_storage_type(
+  duckdb::LogicalType const& type);
+```
+
+It lives here so each rule is falsifiable in isolation. The p ≥ 19 refusal in particular is
+**reachable in production**: the native scan's precision gate does not cover parquet, so a Top-N
+over a parquet-backed `DECIMAL(38,4)` builds a plan, reaches admission, and is refused with no
+slot registered — pinned by test. Without that refusal a decimal128 key would reach a width
+switch that returns 0 in release rather than failing.
 
 #### Modified file: `src/include/op/scan/sirius_physical_dynamic_filter.hpp`
 
@@ -683,8 +937,120 @@ class sirius_physical_dynamic_filter : public sirius_physical_operator {
 };
 ```
 
-A Top-N endpoint is this operator with `include_ast_row_masks` and `top_n_endpoint` — no new
-operator type, matching the Phase 2 precedent.
+A Top-N endpoint is this operator with `top_n_endpoint` provenance, dispatching Top-N filters
+through the fused-kernel capability — no new operator type, matching the Phase 2 precedent.
+
+Stage-4 consumer cleanup: retire the set-based gate `applicable`/gated-view overloads — already
+internally generation-domain since Stage 2 — once the last consumer takes snapshots.
+
+---
+
+### Stage 5 — Aggregate group-key producer
+
+#### Modified file: `src/include/op/dynamic_filter/top_n_threshold_coordinator.hpp`
+
+Distinct-key mode (main doc, "The group-key producer"): the mode is fixed at construction and
+everything downstream of the boundary — tightening, publisher loop, `finish`, `cancel` — is
+shared with row mode.
+
+**Admission cap.** A group-key producer is admitted only for `k <= k_max_group_key`, a structural
+constant of **1024** on the coordinator (a named constant, not a configuration option — the same
+treatment as `boundary_filter_params::k_max_components`). The justification is **collapsing
+pruning value, not rising cost**: measured per-batch cost is nearly flat in K (≈16–21% from K=10
+to K=1000 — `distinct` and `sort` dominate and are K-independent), while rows kept climb from
+0.2% at K=10 to 20% at K=1000 for 5000 distinct groups, and to 83% when groups are scarce. Beyond
+the cap the producer buys almost nothing, so refusing beats optimizing. The row producer takes no
+cap: it extracts one row's key tuple per batch regardless of K. A refusal increments
+`top_n_group_producers_rejected` alongside the other eligibility refusals rather than earning its
+own counter — these are mutually exclusive plan-time verdicts of one kind, and K is visible in
+the query, so a separate name would add no diagnostic power. (Contrast `LEX_ENDPOINT_DEFERRED`,
+which does have its own counter because a *staged capability gap* must not hide inside a
+*tuning decision*; two eligibility refusals are the same kind.)
+
+```cpp
+/**
+ * @brief Which witness discipline the coordinator runs
+ */
+enum class top_n_producer_kind { ROW, GROUP_KEY };
+
+/**
+ * @brief One batch's best distinct ORDER-BY key values, host-extracted
+ *
+ * Sorted best-first, deduplicated, at most K entries.
+ *
+ * The witness owns **completed host values and nothing else**: extraction synchronizes its
+ * stream before construction, and the copies read from a table local to the extraction rather
+ * than from the caller's batch. It therefore holds no device reference, and keeping the input
+ * batch alive is not required — the durability question is moot for this producer, not merely
+ * satisfied by some other mechanism.
+ *
+ * The requirement that still binds any *future* producer: a witness that retains a device
+ * reference must keep it valid until the offer completes, by co-ownership or by a lock the seam
+ * holds across both. Such a producer adds the handle it needs; this one carries none.
+ */
+struct top_n_distinct_key_witness {
+  std::vector<exact_host_key_tuple> best_keys;
+};
+
+class top_n_threshold_coordinator final {
+ public:
+  // Row-mode constructor unchanged; GROUP_KEY mode selects the distinct-key discipline. `stats`
+  // is the Stage-1 non-owning counter sink and keeps its position.
+  top_n_threshold_coordinator(std::size_t k,
+                              std::vector<top_n_key_semantics> keys,
+                              bool lex_admitted,
+                              dynamic_filter_stats* stats,
+                              top_n_producer_kind kind);
+
+  /**
+   * @brief GROUP_KEY mode only: merge a batch's distinct keys into the bounded witness set
+   *
+   * Union by key value under the coordinator mutex, truncated to the K best; the boundary is the
+   * set's Kth element once the set is full and only tightens afterwards. Sub-K batches
+   * contribute, unlike row-mode offers.
+   */
+  threshold_offer_result offer(top_n_distinct_key_witness witness);
+};
+```
+
+#### Modified files: `src/include/op/sirius_physical_grouped_aggregate.hpp`, `src/op/sirius_physical_grouped_aggregate.cpp`
+
+The producer seam in the partial aggregate sink, mirroring the Top-N seam: a
+`threshold_coordinator` shared_ptr (set by the planner; null when ineligible) and a per-operator
+prefilter gate. Per input batch, `execute()`-internal helpers (not public API): gated inclusive
+prefilter against `tightest_boundary()` before hash insert, then bounded distinct-key extraction
+— sort/unique on the ORDER-BY key columns, truncate to K, host copies on the task stream with
+observed completion — and the distinct-key offer. The merge aggregate is untouched; only the
+Top-N's merge calls `finish()`.
+
+#### Modified file: `src/include/op/dynamic_filter/top_n_dynamic_filter_publish_plan.hpp`
+
+`top_n_producer_kind kind;` joins the plan. A `GROUP_KEY` plan roots its traces at the
+aggregate's input, forces both layers inclusive, and is otherwise identical — targets, replica
+spaces, and slots are reused unchanged.
+
+#### Modified file: `src/include/op/dynamic_filter/dynamic_filter_stats.hpp`
+
+```cpp
+  // --- Top-N group-key producer (Stage 5) ---
+  std::atomic<std::uint64_t> top_n_group_producers_eligible{0};  ///< Plan-time fact
+  std::atomic<std::uint64_t> top_n_group_producers_rejected{0};  ///< Aggregate-output key, filter,
+                                                                 ///< K unrepresentable, or K above
+                                                                 ///< the group-key admission cap
+  std::atomic<std::uint64_t> top_n_group_offers{0};              ///< Distinct-key offers merged
+  std::atomic<std::uint64_t> top_n_group_witness_set_full{0};    ///< Boundary became defined
+  std::atomic<std::uint64_t> top_n_group_prefilter_rows_in{0};
+  std::atomic<std::uint64_t> top_n_group_prefilter_rows_out{0};
+```
+
+Three ROW-named counters deliberately have **no** group twin. `top_n_prefilter_disabled` and
+`top_n_offers_unsupported` are shared: both record a condition of the coordinator/gate machinery
+that is identical in either mode, and a producer's kind is already known from the plan, so
+splitting them would add names without adding information. `top_n_producers_first_key_only` has
+no group equivalent and is never bumped by a group-key producer: tail-type degradation is a
+row-producer concept, and a group-key producer whose tail type is unadmitted simply publishes the
+first-key layer under the same eligibility counters. Read a ROW-named counter moving during a
+group-key query as shared accounting, not as a mislabelled bug.
 
 #### Threading and lifetime summary
 
@@ -692,7 +1058,7 @@ operator type, matching the Phase 2 precedent.
 |---|---|---|---|
 | `exact_host_scalar` / `exact_host_key_tuple` | Immutable | None | Value types |
 | `top_n_key_semantics` / `lex_component_semantics` | Immutable | None | Value types, frozen at plan time |
-| `top_n_threshold_witness` | Immutable after creation | None | Until offer/publication completes |
+| `top_n_threshold_witness` / `top_n_distinct_key_witness` | Immutable after creation | None | Until offer/publication completes |
 | `top_n_threshold_coordinator` | Mutable | One internal mutex; single publisher loop | Execution-scoped, shared_ptr from both operators |
 | `top_n_dynamic_filter_publish_plan` | Immutable | None | Owned `const` by the plan |
 | Refinement slot / generation | Mutable | Channel mutex | Channel lifetime (co-owned) |
@@ -718,6 +1084,20 @@ operator type, matching the Phase 2 precedent.
   `[integration][gpu_execution][dynamic_filter]`)** — GPU-vs-CPU equivalence plus pruning-effect
   assertions through before/after `sirius::test::get_dynamic_filter_stats_snapshot(con)` deltas,
   following the existing dynamic-filter integration tests.
+**Standing criterion — a guard needs a test that triggers it.** A guard added because a failure
+was hard to reach is exactly the guard most likely to be unfalsifiable, and this project has now
+caught four: the negative-value guard, the K cap, the boundary-key type check, and the
+component-width guard — each written without a test, each now pinned by one that fails when the
+guard is removed. Treat "I could not easily construct the failing case" as the reason to write
+the test, not the excuse for skipping it; if the case is genuinely unconstructible through a
+built plan, move the rule to a pure function and test it there (the allowlist's home is exactly
+this).
+
+- **Catch2 kernel parity (`test/cpp/operator/test_top_n_boundary_filter.cpp`,
+  `[dynamic_filter][top_n]`)** — `apply_boundary_filter` against a host reference over the full
+  case matrix: per-type × direction × null-order × strict/inclusive × component count, null tail
+  components, and empty / all-pass / all-fail batches. The per-type prefilter equivalence tests
+  are the safety net and must pass unchanged against the kernel.
 
 ### Observability contract used by the assertions
 
@@ -740,21 +1120,27 @@ shape publishes its strict predicate as RANGE, and multi-key shapes publish per 
 | # | Scenario | Query shape | Expected site and layer (stage it becomes real) | Test layers |
 |---|---|---|---|---|
 | 1 | Parquet scan, single key | `SELECT * FROM topn_parquet ORDER BY v LIMIT 10` | Strict RANGE in the scan's reader AST (S4) | plan, integration, sqllogic |
-| 2 | Native scan, single key | Same over the native table | RANGE at the scan's post-decode operator, `include_ast_row_masks` (S4) | plan, integration |
-| 3 | Aggregate disruptor | `SELECT grp, sum(v) s FROM t GROUP BY grp ORDER BY s DESC LIMIT 5` | No endpoint — site immaterial, self-consumption covers (S1/S4 skip assert); endpoint above the aggregate read-out only when material work intervenes, e.g. a dimension join between aggregate and Top-N (S6) | plan, integration |
+| 2 | Native scan, single key | Same over the native table | RANGE at the scan's post-decode operator via the fused-kernel capability (S4) | plan, integration |
+| 3 | Aggregate disruptor | `SELECT grp, sum(v) s FROM t GROUP BY grp ORDER BY s DESC LIMIT 5` | No endpoint — site immaterial, self-consumption covers (S1/S4 skip assert); endpoint above the aggregate read-out only when material work intervenes, e.g. a dimension join between aggregate and Top-N (S7) | plan, integration |
 | 4 | Expression-key projection | `SELECT a + b AS k FROM t2 ORDER BY k LIMIT 10` | Trace stops at the materializing projection; endpoint skipped as immaterial (S4 skip assert); self-consumption covers | plan, integration |
-| 5 | Join disruptor, single key | `SELECT o.*, l.v FROM t l JOIN dim o ON ... ORDER BY l.v LIMIT 10` | Endpoint above the join is immaterial → skipped (S4); widened probe-block hop reaches the scan → scan bind (S6) | plan, integration |
-| 6 | UNION fan-out | `SELECT v, w FROM t1 UNION ALL SELECT v, w FROM t2 ORDER BY v, w LIMIT 10` | Both branches: LEX into each scan; first-key targets subsumed per branch (S4) | plan, integration |
+| 5 | Join disruptor, single key | `SELECT o.*, l.v FROM t l JOIN dim o ON ... ORDER BY l.v LIMIT 10` | Endpoint above the join is immaterial → skipped (S4); widened probe-block hop reaches the scan → scan bind (S7) | plan, integration |
+| 6 | Set-operation terminal | `SELECT v, w FROM t1 UNION ALL SELECT v, w FROM t2 ORDER BY v, w LIMIT 10` | Unreachable while Sirius rejects set operations at planning: the query falls back to CPU, so there is no Sirius plan to assert on. Deferred with set-operation support, when the trace regains the fan-out hop and this becomes "LEX into each branch's scan" | deferred |
 | 7 | Pass-through hops | `SELECT v FROM t WHERE grp <> 3 ORDER BY v LIMIT 10` (filter + plain projection) | Still the scan (S4) | plan, sqllogic |
 | 8 | Self-consumption only | Any eligible shape with the channel stages disabled or no target | No `DYNAMIC_FILTER` node; `top_n_offers` delta > 0, prefilter direction asserts, results unchanged (S1) | integration, sqllogic |
 | 9 | All keys, one scan | `SELECT * FROM topn_parquet ORDER BY v, w LIMIT 10` | LEX in the scan's reader AST; `top_n_first_key_subsumed_by_lex` delta > 0, no separate first-key filter on that channel (S4) | plan, integration, sqllogic |
-| 10 | **Split keys across a join (marquee)** | `SELECT l.v, o.w FROM t l JOIN dim o ON l.id = o.id ORDER BY l.v, o.w LIMIT 10` | First-key inclusive RANGE into `l`'s scan (`top_n_first_key_filters_pushed`); all-keys trace stops at the join output — skipped as immaterial, strict predicate at the sink prefilter (S4); probe-block widening sites the LEX endpoint below a second join above (S6) | plan, integration, sqllogic |
+| 10 | **Split keys across a join** | `SELECT l.v, o.w FROM t l JOIN dim o ON l.id = o.id ORDER BY l.v, o.w LIMIT 10` | Both traces stop at the join with the minimal hop set, so **neither layer reaches `l`'s scan**; the strict predicate is applied by the sink prefilter and the all-keys terminal is `LEX_ENDPOINT_DEFERRED` (assert the deferral counter, not an endpoint). Reaching `l`'s scan needs a hop through the join's probe block, which is provable but publishes to a channel already closed — see the main doc's reach ceiling | plan, integration, sqllogic |
 | 11 | Mixed directions and null orders | `ORDER BY v DESC, w ASC NULLS FIRST LIMIT 10` and the transposed combos | Same sites as 9; per-component `T_i`/`E_i` derivations pinned by equivalence sweep (S4) | sqllogic, integration |
 | 12 | Null tail boundary | Data forcing row K−1's `w` to null under both null orders | Publication proceeds through the derivation table; equivalence exact; `top_n_offers_unsupported` unchanged (S4) | integration, sqllogic |
 | 13 | Unsupported tail type | `ORDER BY v, pay LIMIT 10` (VARCHAR tail) | First-key layer only: `top_n_producers_first_key_only` delta > 0, no LEX target, RANGE still reaches `v`'s scan (S4) | plan, integration |
 | 14 | Negatives | See below | No producer / no publication (S1) | sqllogic + one integration counter case |
+| 15 | **TopN over aggregate, integer keys (marquee)** | `SELECT grp, min(v) FROM topn_parquet GROUP BY grp ORDER BY grp LIMIT 5` | Group-key producer: inclusive RANGE into the scan's reader AST; row producer self-consumes above the barrier; `top_n_group_offers` and `…_witness_set_full` deltas > 0 (S5) | plan, integration, sqllogic |
+| 16 | Aggregate-output key (Q3 shape) | `SELECT grp, sum(v) s FROM t GROUP BY grp ORDER BY s LIMIT 5` | No group-key producer: `top_n_group_producers_rejected` delta; scenario 3's skip asserts unchanged (S5) | plan, integration |
+| 17 | Filter between aggregate and Top-N | Scenario 15 plus `HAVING min(v) > 0` | No group-key producer (S5) | plan, integration |
+| 18 | Boundary-tie preservation | Scenario 15 data with duplicated boundary `grp` values and a `sum` aggregate | Exact equivalence — tied rows provably kept; inclusive predicates asserted via results, not counters (S5) | integration, sqllogic |
 
-Negative sub-cases (14): `LIMIT 10 WITH TIES` (no producer), **first**-key-null boundary — `v`
+Negative sub-cases (14): a tie-preserving rank shape — pinned DuckDB v1.5.4 has no `WITH TIES`
+grammar, so the negative is expressed as `RANK() OVER (ORDER BY …) <= n`, asserting no producer
+counter moves — **first**-key-null boundary — `v`
 nullable under `NULLS LAST` with fewer than K non-null keys (`top_n_offers_unsupported` delta, no
 publication, exact results), table smaller than K (publish nothing), `LIMIT 7 OFFSET 5` (boundary
 is the 12th row's tuple — a single-batch shape pins K arithmetic via offer count and result
@@ -779,9 +1165,9 @@ Stage    : equivalence rows runnable from S1 (filter inert), site/publication as
 
 Scenarios 3–5 and 10 assert the *skip* explicitly at Stage 4 — `top_n_endpoint_sites_skipped`
 delta and absence of a `top_n_endpoint` node — so the cost-gate behavior is pinned, not
-accidental. Their Stage 6 variants (join between aggregate and Top-N; probe-block descent) flip
+accidental. Their Stage 7 variants (join between aggregate and Top-N; probe-block descent) flip
 the same assertions to `top_n_endpoint_sites_placed`/scan-bind and are written up front but
-tagged `[!mayfail]` until Stage 6 lands.
+tagged `[!mayfail]` until Stage 7 lands.
 
 ### Multi-GPU shape
 
@@ -798,11 +1184,18 @@ Two layers, mirroring `test_sirius_dynamic_filter_mgpu.cpp`:
   on two GPUs; bit-identical results against single-GPU and CPU runs;
   `top_n_revisions_failed == 0`.
 
+Every multi-GPU case above skips on a single-GPU host, so none of them is evidence until a
+two-device run reports it green; a stage whose multi-GPU assertions have only been compiled is
+not multi-GPU-verified. See the implementation notes for which runs are outstanding.
+
 ### SQLLogic sketch
 
-`test/sql/top-n-dynamic-filter.test`: load extension; create the native and Parquet tables;
-foreach `enable_top_n_dynamic_filter` in (false, true) run the full query list (scenarios 1, 3,
-4, 5, 6, 7, 9, 10, the scenario 11 direction/null-order sweep, 12, and all negatives) with
-results compared against stored expected output; the `gpu_execution=false` pass pins the CPU
-baseline. This file is runnable — and must pass with the filter inert — from Stage 1 onward,
-which is what makes it the regression floor for every later stage.
+`test/sql/top-n-dynamic-filter.test`: `require sirius` and the transparent path
+(`gpu_buffer_init` is `SIRIUS_ENABLE_LEGACY`-only and must not appear); a file-backed database
+via `load __TEST_DIR__/...` with `CHECKPOINT` after each `CREATE` — the native-scan GPU path
+rejects in-memory tables ("requires a single-file block manager"). Then: create the native and
+Parquet tables; foreach `enable_top_n_dynamic_filter` in (false, true) run the full query list
+(scenarios 1, 3, 4, 5, 7, 9, 10, the scenario 11 direction/null-order sweep, 12, 15, 18, and
+all negatives) with results compared against stored expected output; the `gpu_execution=false`
+pass pins the CPU baseline. This file is runnable — and must pass with the filter inert — from
+Stage 1 onward, which is what makes it the regression floor for every later stage.
