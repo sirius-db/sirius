@@ -1110,6 +1110,11 @@ def main():
         )
 
     power = throughput = None
+    # A failing throughput run must not discard a power run that already
+    # succeeded: its rows are stashed and still worth validating, and its
+    # metrics are still worth writing. The failure is carried to the exit
+    # status at the end instead of aborting here.
+    throughput_error = None
     with open(os.path.join(run_dir, "timings.csv"), "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(["phase", "stream", "element", "seconds"])
@@ -1119,7 +1124,11 @@ def main():
             with benchmark_db(args, run_dir, "bench.duckdb") as con:
                 power = power_run(con, args, run_dir, writer)
                 f.flush()
-                throughput = throughput_run(con, args, run_dir, writer, streams)
+                try:
+                    throughput = throughput_run(con, args, run_dir, writer, streams)
+                except Exception as e:  # noqa: BLE001 - reported at exit
+                    throughput_error = str(e)
+                    log(f"Throughput run failed, continuing to validation: {e}")
         elif args.mode == "power":
             with benchmark_db(args, run_dir, "bench_power.duckdb") as con:
                 power = power_run(con, args, run_dir, writer)
@@ -1156,6 +1165,7 @@ def main():
         "date": datetime.now().isoformat(timespec="seconds"),
         "power": power,
         "throughput": throughput,
+        "throughput_error": throughput_error,
         "qphh_at_size": qphh,
     }
     with open(os.path.join(run_dir, "metrics.json"), "w") as f:
@@ -1165,6 +1175,8 @@ def main():
     log(f"Metrics written to {os.path.join(run_dir, 'metrics.json')}")
 
     failures = []
+    if throughput_error:
+        failures.append(f"throughput run: {throughput_error}")
     if power:
         val = power["validation"]
         if not val.get("counts_after_rf1_ok", True):
