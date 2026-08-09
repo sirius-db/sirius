@@ -216,8 +216,10 @@ run, QphH, refresh functions, or a "TPC-H official"/"spec" benchmark.
   insert-delta/delete-mask path that makes RF1/RF2 visible on the GPU only works on pinned
   duckdb-native tables. `--input` is that `.duckdb` file; the runner copies it and mutates the
   copy, never the original.
-- Always pinned. The runner pins all 8 tables; the user only chooses the tier (`gpu` or `host`).
-  An unpinned run would not show the refreshes on the GPU.
+- Always pinned. The runner pins all 8 tables once up front, each with only the union of the
+  columns the 22 queries reference (not whole tables — `ps_comment`/`l_comment`/`o_clerk`/
+  `p_comment` are never read, and pinning them does not fit at SF1000). The user only chooses the
+  tier (`gpu` or `host`). An unpinned run would not show the refreshes on the GPU.
 - Refresh sets come from `generate_tpch_refresh.sh` (classic dbgen `-U`): `orders.tbl.u*`,
   `lineitem.tbl.u*`, `delete.*` under `test_datasets/tpch_refresh_sf<SF>/`. Need at least
   `streams + 1` sets (set 1 = power run; sets 2..N+1 = throughput streams).

@@ -295,7 +295,7 @@ def emit_unpin(query_num: int) -> str:
     return "\n".join(f"CALL unpin_table('{table}');" for table in cols_by_table) + "\n"
 
 
-def _union_columns_by_table() -> dict[str, list[str]]:
+def union_columns_by_table() -> dict[str, list[str]]:
     """Union of columns each table is referenced with across all queries."""
     by_table: dict[str, set[str]] = {}
     for cols_by_table in QUERY_COLUMNS.values():
@@ -312,16 +312,14 @@ def emit_pin_all(source: str, data_source: str = "parquet") -> str:
     """
     lines = [
         _pin_call(table, cols, source, data_source)
-        for table, cols in _union_columns_by_table().items()
+        for table, cols in union_columns_by_table().items()
     ]
     return "\n".join(lines) + "\n"
 
 
 def emit_unpin_all() -> str:
     return (
-        "\n".join(
-            f"CALL unpin_table('{table}');" for table in _union_columns_by_table()
-        )
+        "\n".join(f"CALL unpin_table('{table}');" for table in union_columns_by_table())
         + "\n"
     )
 

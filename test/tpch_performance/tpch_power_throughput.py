@@ -73,7 +73,7 @@ from performance_test import (
     log,
 )
 from queries import QUERIES
-from tpch_pin_columns import QUERY_COLUMNS
+from tpch_pin_columns import QUERY_COLUMNS, union_columns_by_table
 from tpch_query_streams import load_stream
 from tpch_stream_permutations import default_streams, stream_order
 
@@ -340,9 +340,20 @@ def open_benchmark_db(scratch_db, pin_tier, compression_plan_dir=None):
             f"SET pin_table_input_compression_plan_dir = '{compression_plan_dir}'",
         )
     if pin_tier != "none":
-        for t in TPCH_TABLES:
-            log(f"  Pinning {t} (tier={pin_tier})")
-            sql(con, f"CALL pin_table(format='duckdb', name='{t}', tier='{pin_tier}')")
+        # Pin once up front, with only the columns the 22 queries actually read
+        # (their union). Pinning whole tables also loads columns no TPC-H query
+        # ever references — ps_comment, l_comment, o_clerk, p_comment — and at
+        # SF1000 partsupp alone then needs >76 GB against a 471 GB host pool,
+        # which does not fit. Refreshed rows land in the insert delta / delete
+        # mask over these same columns, so RF1/RF2 stay visible on the GPU.
+        for t, cols in union_columns_by_table().items():
+            col_literals = ",".join(f"'{c}'" for c in cols)
+            log(f"  Pinning {t} ({len(cols)} cols, tier={pin_tier})")
+            sql(
+                con,
+                f"CALL pin_table(format='duckdb', name='{t}', "
+                f"tier='{pin_tier}', cols=[{col_literals}])",
+            )
     return con
 
 

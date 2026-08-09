@@ -338,10 +338,15 @@ sqrt(Power · Throughput)`.
 
 - The input must be a file-backed `.duckdb` with native TPC-H tables (e.g.
   `test_datasets/tpch_sf1.duckdb`). The runner copies it and mutates the copy, never the
-  original. All 8 tables are pinned with `CALL pin_table(format='duckdb', ...)` after a
-  `CHECKPOINT`. Pinning `lineitem`/`orders` activates the MVCC insert-delta/delete-mask path that
-  serves the refreshed rows on the GPU. Parquet inputs are read-only views with no MVCC metadata,
-  so they cannot be used.
+  original. All 8 tables are pinned once up front with `CALL pin_table(format='duckdb', ...,
+  cols=[...])` after a `CHECKPOINT`, each carrying only the union of the columns the 22 queries
+  reference (`union_columns_by_table()` in `tpch_pin_columns.py`). Whole-table pinning would also
+  load columns no TPC-H query reads — `ps_comment`, `l_comment`, `o_clerk`, `p_comment` — and at
+  SF1000 that does not fit: `partsupp` alone needs >76 GB against a 471 GB host pool, where its
+  4-column union is ~20-25 GB. Pinning `lineitem`/`orders` activates the MVCC
+  insert-delta/delete-mask path that serves the refreshed rows on the GPU; the refreshed rows land
+  in the delta/mask over these same columns. Parquet inputs are read-only views with no MVCC
+  metadata, so they cannot be used.
 - RF1/RF2 run as plain DuckDB CPU DML; the GPU does not execute INSERT/DELETE. The GPU serves the
   following queries from `pinned base + insert delta − delete mask`, with no CHECKPOINT between a
   refresh and the queries that observe it. The delta is re-decoded and the mask re-applied per
