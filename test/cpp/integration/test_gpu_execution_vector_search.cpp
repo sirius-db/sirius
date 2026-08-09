@@ -93,6 +93,103 @@ TEST_CASE_METHOD(VectorSearchFixture,
   run_ok("SELECT * FROM unpin_table('vs_enn');");
 }
 
+// sirius_knn_search defaults output_columns to the pinned columns, not every
+// catalog column. The search gathers straight from GPU-resident chunks, so a
+// catalog-wide default is unsatisfiable on any subset pin.
+TEST_CASE_METHOD(VectorSearchFixture,
+                 "sirius_knn_search - default output_columns on a subset-pinned table",
+                 "[integration][gpu_execution][array][vss][vector_search]")
+{
+  run_ok(
+    "CREATE TABLE vs_subset AS SELECT i AS id, [i, i, i]::FLOAT[3] AS vec, "
+    "'row' || i AS payload FROM range(100) t(i);");
+  run_ok("CHECKPOINT;");
+
+  // Pin only [id, vec]: `payload` exists in the catalog but never reaches the GPU.
+  run_ok(
+    "SELECT * FROM pin_table(name => 'vs_subset', tier => 'gpu', format => 'duckdb', "
+    "cols => ['id', 'vec']);");
+
+  const std::string origin = "[0.0, 0.0, 0.0]::FLOAT[3]";
+
+  // Baseline: naming only pinned columns works, so the pin itself is searchable.
+  {
+    auto r = con->Query("SELECT id FROM sirius_knn_search('vs_subset', 'vec', " + origin +
+                        ", k => 5, output_columns => ['id']);");
+    REQUIRE(r);
+    if (r->HasError()) { UNSCOPED_INFO("explicit output_columns error: " << r->GetError()); }
+    REQUIRE_FALSE(r->HasError());
+    REQUIRE(r->Cast<duckdb::MaterializedQueryResult>().RowCount() == 5);
+  }
+
+  // Same query with output_columns omitted: the default expands to the pinned
+  // columns [id, vec] (not the catalog-wide [id, vec, payload]), so it succeeds.
+  {
+    auto r =
+      con->Query("SELECT * FROM sirius_knn_search('vs_subset', 'vec', " + origin + ", k => 5);");
+    REQUIRE(r);
+    if (r->HasError()) { UNSCOPED_INFO("default output_columns error: " << r->GetError()); }
+    REQUIRE_FALSE(r->HasError());
+  }
+
+  run_ok("SELECT * FROM unpin_table('vs_subset');");
+}
+
+// output_columns => [] is stored as an empty vector; it must be rejected as a user
+// error, NOT treated like omitting the parameter (which defaults to the pinned
+// columns). Probed against a fully-pinned table, where "rejected" and "expanded to
+// all" actually differ.
+TEST_CASE_METHOD(VectorSearchFixture,
+                 "sirius_knn_search - explicit empty output_columns is rejected",
+                 "[integration][gpu_execution][array][vss][vector_search]")
+{
+  run_ok(
+    "CREATE TABLE vs_empty_cols AS SELECT i AS id, [i, i, i]::FLOAT[3] AS vec, "
+    "'row' || i AS payload FROM range(20) t(i);");
+  run_ok("CHECKPOINT;");
+  run_ok("SELECT * FROM pin_table(name => 'vs_empty_cols', tier => 'gpu', format => 'duckdb');");
+
+  const std::string origin = "[0.0, 0.0, 0.0]::FLOAT[3]";
+
+  auto empty_list = con->Query("SELECT * FROM sirius_knn_search('vs_empty_cols', 'vec', " +
+                               origin + ", k => 2, output_columns => []);");
+  REQUIRE(empty_list);
+  UNSCOPED_INFO("empty output_columns error: "
+                << (empty_list->HasError() ? empty_list->GetError() : std::string("<none>")));
+  // An explicitly empty list is a user error, not a request for everything: rejected
+  // at bind with a typed BinderException rather than silently expanding to all columns.
+  REQUIRE(empty_list->HasError());
+
+  run_ok("SELECT * FROM unpin_table('vs_empty_cols');");
+}
+
+// An explicitly-requested column that exists in the catalog but was not pinned must
+// fail at bind (typed BinderException), not deep in execution with an untyped
+// internal_exception("VSS: pinned table missing column ...") after the pin is set up.
+TEST_CASE_METHOD(VectorSearchFixture,
+                 "sirius_knn_search - explicit unpinned output column is rejected at bind",
+                 "[integration][gpu_execution][array][vss][vector_search]")
+{
+  run_ok(
+    "CREATE TABLE vs_unpinned_col AS SELECT i AS id, [i, i, i]::FLOAT[3] AS vec, "
+    "'row' || i AS payload FROM range(50) t(i);");
+  run_ok("CHECKPOINT;");
+  // Pin only [id, vec]; 'payload' is catalog-visible but never pinned.
+  run_ok(
+    "SELECT * FROM pin_table(name => 'vs_unpinned_col', tier => 'gpu', format => 'duckdb', "
+    "cols => ['id', 'vec']);");
+
+  const std::string origin = "[0.0, 0.0, 0.0]::FLOAT[3]";
+  auto r = con->Query("SELECT * FROM sirius_knn_search('vs_unpinned_col', 'vec', " + origin +
+                      ", k => 5, output_columns => ['id', 'payload']);");
+  REQUIRE(r);
+  UNSCOPED_INFO("unpinned output column error: "
+                << (r->HasError() ? r->GetError() : std::string("<none>")));
+  REQUIRE(r->HasError());
+
+  run_ok("SELECT * FROM unpin_table('vs_unpinned_col');");
+}
+
 TEST_CASE_METHOD(VectorSearchFixture,
                  "sirius_knn_search - ENN cosine matches exact top-k",
                  "[integration][gpu_execution][array][vss][vector_search]")
