@@ -25,15 +25,13 @@
 
 #include <catch.hpp>
 #include <duckdb.hpp>
-#include <unistd.h>
+#include <utils/parquet_fixture_utils.hpp>
 #include <utils/sirius_test_env.hpp>
 
 #include <cstdint>
-#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <string>
-#include <system_error>
 
 namespace fs = std::filesystem;
 
@@ -45,16 +43,13 @@ constexpr std::int64_t kRows = 100'000;
 // not build a SiriusContext on it.
 void generate_parquet(fs::path const& path)
 {
-  setenv("SIRIUS_DISABLE", "1", 1);
-  {
-    duckdb::DuckDB gen_db(nullptr);
-    duckdb::Connection gen(gen_db);
-    auto r = gen.Query("COPY (SELECT range AS k, range * 2 AS v FROM range(" +
-                       std::to_string(kRows) + ")) TO '" + path.string() + "' (FORMAT PARQUET);");
-    REQUIRE(r);
-    REQUIRE_FALSE(r->HasError());
-  }
-  unsetenv("SIRIUS_DISABLE");
+  sirius::test::scoped_sirius_disable disable_sirius;
+  duckdb::DuckDB gen_db(nullptr);
+  duckdb::Connection gen(gen_db);
+  auto r = gen.Query("COPY (SELECT range AS k, range * 2 AS v FROM range(" + std::to_string(kRows) +
+                     ")) TO " + sirius::test::sql_literal(path.string()) + " (FORMAT PARQUET);");
+  REQUIRE(r);
+  REQUIRE_FALSE(r->HasError());
 }
 
 void write_config(fs::path const& yaml_path)
@@ -105,10 +100,8 @@ TEST_CASE("tree pipeline build plans sirius_read_parquet scans",
     sirius::test::g_integration_env_2gpu->pause();
   }
 
-  auto tmp = fs::temp_directory_path() / ("sirius-srp-tree-" + std::to_string(::getpid()));
-  std::error_code ec;
-  fs::remove_all(tmp, ec);
-  fs::create_directories(tmp);
+  sirius::test::scratch_dir scratch{"srp_tree"};
+  auto const& tmp = scratch.path();
 
   auto parquet_path = tmp / "kv.parquet";
   generate_parquet(parquet_path);
@@ -127,14 +120,12 @@ TEST_CASE("tree pipeline build plans sirius_read_parquet scans",
     REQUIRE(fb);
     REQUIRE_FALSE(fb->HasError());
 
-    auto res = con.Query("SELECT max(k), count(*) FROM sirius_read_parquet('" +
-                         parquet_path.string() + "');");
+    auto res = con.Query("SELECT max(k), count(*) FROM sirius_read_parquet(" +
+                         sirius::test::sql_literal(parquet_path.string()) + ");");
     REQUIRE(res);
     if (res->HasError()) { UNSCOPED_INFO("sirius_read_parquet query error: " << res->GetError()); }
     REQUIRE_FALSE(res->HasError());  // pre-fix: "Unsupported scan function: sirius_read_parquet"
     REQUIRE(res->GetValue(0, 0).GetValue<int64_t>() == kRows - 1);
     REQUIRE(res->GetValue(1, 0).GetValue<int64_t>() == kRows);
   }
-
-  fs::remove_all(tmp, ec);
 }
