@@ -483,6 +483,30 @@ TEST_CASE("mvcc visibility: any_update_chains flags updated columns only",
   exec_ok(*env.con, "ROLLBACK");
 }
 
+TEST_CASE("mvcc visibility: update-chain prefix covers post-pin row groups",
+          "[duckdb_mvcc_visibility][scan]")
+{
+  vis_test_db env;
+  exec_ok(*env.con,
+          "CREATE TABLE t AS SELECT range::INTEGER AS k, range::INTEGER AS v "
+          "FROM range(122880)");
+  exec_ok(*env.con, "CHECKPOINT");
+  auto const n_cache = kRowGroupRows;
+
+  // The checkpointed prefix fills one complete row group. The appended row
+  // therefore lands beyond it, matching an insert-delta row after pin_table.
+  exec_ok(*env.con, "INSERT INTO t VALUES (122880, 1)");
+  exec_ok(*env.con, "UPDATE t SET v = 2 WHERE k = 122880");
+
+  exec_ok(*env.con, "BEGIN TRANSACTION");
+  std::vector<duckdb::storage_t> const col_v{1};
+  auto& storage   = resolve_storage(*env.con, "t");
+  auto const live = static_cast<std::size_t>(storage.GetTotalRows());
+  REQUIRE_FALSE(any_update_chains(storage, col_v, n_cache));
+  REQUIRE(any_update_chains(storage, col_v, live));
+  exec_ok(*env.con, "ROLLBACK");
+}
+
 TEST_CASE("mvcc visibility: any_uncheckpointed_appends flags transient segments only",
           "[duckdb_mvcc_visibility][scan]")
 {
