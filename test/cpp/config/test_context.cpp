@@ -43,6 +43,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <optional>
 #include <set>
 #include <source_location>
 #include <string>
@@ -191,6 +192,60 @@ TEST_CASE("Legacy-only settings follow the build surface",
   for (auto const* name : super_sirius_settings) {
     CAPTURE(name);
     REQUIRE(setting_count(name) == 1);
+  }
+}
+
+TEST_CASE("Test-only settings require explicit process opt-in",
+          "[sirius][config][test-settings][isolated_context]")
+{
+  std::optional<std::string> original_test_options;
+  if (auto const* value = std::getenv("SIRIUS_ENABLE_TEST_OPTIONS")) {
+    original_test_options = value;
+  }
+  finally restore_env{[original_test_options]() {
+    if (original_test_options) {
+      setenv("SIRIUS_ENABLE_TEST_OPTIONS", original_test_options->c_str(), 1);
+    } else {
+      unsetenv("SIRIUS_ENABLE_TEST_OPTIONS");
+    }
+    setenv("SIRIUS_DISABLE", "1", 1);
+  }};
+
+  auto setting_count = [](duckdb::Connection& con) {
+    auto result = con.Query(
+      "SELECT count(*) FROM duckdb_settings() "
+      "WHERE name = 'sirius_test_inject_transparent_gpu_error'");
+    REQUIRE(result != nullptr);
+    REQUIRE_FALSE(result->HasError());
+    return result->GetValue(0, 0).GetValue<int64_t>();
+  };
+
+  setenv("SIRIUS_DISABLE", "1", 1);
+  unsetenv("SIRIUS_ENABLE_TEST_OPTIONS");
+  {
+    duckdb::DuckDB db(nullptr);
+    duckdb::Connection con(db);
+    REQUIRE(setting_count(con) == 0);
+    auto result = con.Query("SET sirius_test_inject_transparent_gpu_error = 'boom'");
+    REQUIRE(result != nullptr);
+    REQUIRE(result->HasError());
+  }
+
+  setenv("SIRIUS_ENABLE_TEST_OPTIONS", "true", 1);
+  {
+    duckdb::DuckDB db(nullptr);
+    duckdb::Connection con(db);
+    REQUIRE(setting_count(con) == 0);
+  }
+
+  setenv("SIRIUS_ENABLE_TEST_OPTIONS", "1", 1);
+  {
+    duckdb::DuckDB db(nullptr);
+    duckdb::Connection con(db);
+    REQUIRE(setting_count(con) == 1);
+    auto result = con.Query("SET sirius_test_inject_transparent_gpu_error = 'boom'");
+    REQUIRE(result != nullptr);
+    REQUIRE_FALSE(result->HasError());
   }
 }
 

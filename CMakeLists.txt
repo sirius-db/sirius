@@ -388,6 +388,7 @@ set(EXTENSION_SOURCES
     src/scan_manager/mvcc_mask_job.cpp
     src/scan_manager/pinned_chunk_stats.cpp
     src/scan_manager/round_robin_strategy.cpp
+    src/scan_manager/memory_prefetcher.cpp
     src/scan_manager/sirius_scan_manager.cpp
     src/scan_manager/split_connector.cpp
     src/scan_manager/split_provider.cpp
@@ -625,6 +626,7 @@ set(TEST_SOURCES
     test/cpp/data/test_data_repository_manager_registry.cpp
     test/cpp/data/test_convertible_gpu_pipeline_task.cpp
     test/cpp/downgrade/test_downgrade_disk.cpp
+    test/cpp/creator/test_task_creator.cpp
     test/cpp/downgrade/test_downgrade_executor.cpp
     test/cpp/downgrade/test_downgrade_lifecycle.cpp
     test/cpp/exec/test_bounded_thread_pool.cpp
@@ -662,6 +664,7 @@ set(TEST_SOURCES
     test/cpp/integration/test_gpu_execution_multi_format.cpp
     test/cpp/integration/test_gpu_execution_null_safe_join.cpp
     test/cpp/integration/test_gpu_execution_order_nulls.cpp
+    test/cpp/integration/test_gpu_execution_parquet_nulls.cpp
     test/cpp/integration/test_parquet_null_predicate_pushdown.cpp
     test/cpp/integration/test_query_lifecycle_slot.cpp
     test/cpp/integration/test_gpu_execution_tpcds_nulls.cpp
@@ -771,6 +774,7 @@ set(TEST_SOURCES
     test/cpp/scan/test_gpu_native_decode.cpp
     test/cpp/scan/test_owning_table_view.cpp
     test/cpp/scan/test_parquet_schema_mapping.cpp
+    test/cpp/scan/test_parquet_null_count_pruning.cpp
     test/cpp/scan/test_parquet_scan_sizing.cpp
     test/cpp/scan/test_scan_schema_normalization.cpp
     test/cpp/sirius_extension/test_sirius_read_parquet_cardinality.cpp

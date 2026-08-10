@@ -1,3 +1,5 @@
+# When changing the duckdb submodule, also update OVERRIDE_GIT_DESCRIBE
+# in cmake/CMakePresets.json to match the new version.
 [submodule "duckdb"]
 	path = duckdb
 	url = https://github.com/duckdb/duckdb

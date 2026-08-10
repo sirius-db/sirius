@@ -121,6 +121,7 @@ extern "C" int cudaProfilerStop();
 
 #include <cstdint>
 #include <cstdlib>
+#include <string_view>
 #include <unordered_map>
 
 namespace duckdb {
@@ -133,6 +134,12 @@ bool SiriusExtension::buffer_is_initialized = false;
 constexpr std::string QUERY_LABEL_PARAM_KEY = "query_label";
 
 namespace {
+
+bool test_options_enabled() noexcept
+{
+  auto const* value = std::getenv("SIRIUS_ENABLE_TEST_OPTIONS");
+  return value != nullptr && std::string_view{value} == "1";
+}
 
 std::uint64_t count_narrowed_columns(
   sirius::pinned_column_storage_matrix const& column_storage) noexcept
@@ -2203,14 +2210,15 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
                            // fallback policy into every freshly-created database).
     SetEnableDuckdbFallback);
 
-  // TEST ONLY: when non-empty, transparent GPU execution fails at runtime with that
-  // message after plan generation succeeds, to exercise the CPU fallback path. No
-  // setter — the value is read via TryGetCurrentSetting in PhysicalSiriusExecution.
-  config.AddExtensionOption(
-    "sirius_test_inject_transparent_gpu_error",
-    "TEST ONLY: force transparent GPU execution to fail at runtime with this message",
-    LogicalType::VARCHAR,
-    Value(""));
+  // Test hooks are absent from normal duckdb_settings(). The unittest harness opts in before
+  // constructing any database so fallback tests can still inject a deterministic runtime error.
+  if (test_options_enabled()) {
+    config.AddExtensionOption(
+      "sirius_test_inject_transparent_gpu_error",
+      "TEST ONLY: force transparent GPU execution to fail at runtime with this message",
+      LogicalType::VARCHAR,
+      Value(""));
+  }
 
   // Add in config options for special JIT implementation for regex
   config.AddExtensionOption(
@@ -2477,13 +2485,15 @@ static void LoadInternal(ExtensionLoader& loader)
   // "S3 CPU fallback is not supported" error; local reads fall back to CPU).
   db.GetFileSystem().RegisterSubSystem(make_uniq<sirius::io::s3::sirius_httpfs>());
 
-  // Register optimizer extension for transparent GPU execution. Only the
-  // post-hook remains (plan capture); the optimizer mask a pre-hook used to
-  // write per query is published once at load (see
-  // publish_transparent_optimizer_mask above), and DuckDB skips a null
-  // pre_optimize_function.
+  // Register optimizer extension for transparent GPU execution. The post-hook
+  // captures the optimized plan; the pre-hook derives the single-table
+  // restrictions implied by OR-ed multi-table filters so DuckDB's own pushdown,
+  // join-order and build/probe-side passes can act on them. (The optimizer mask
+  // an earlier pre-hook used to write per query is published once at load — see
+  // publish_transparent_optimizer_mask above.)
   OptimizerExtension opt_ext;
-  opt_ext.optimize_function = sirius::transparent::sirius_optimizer_hook;
+  opt_ext.pre_optimize_function = sirius::transparent::sirius_pre_optimizer_hook;
+  opt_ext.optimize_function     = sirius::transparent::sirius_optimizer_hook;
   OptimizerExtension::Register(config, std::move(opt_ext));
 
   // Register SiriusContext on connections that were opened before the extension

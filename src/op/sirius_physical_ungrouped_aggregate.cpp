@@ -390,7 +390,7 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate::execute(
       }
     }
 
-    auto out_table = std::make_unique<cudf::table>(std::move(cols), stream);
+    auto out_table = std::make_unique<cudf::table>(std::move(cols));
     // STREAM-LINEAGE: cudf::table ctor + cudf::make_column_from_scalar wrote
     // on `stream`; the constructor records the writer event for downstream
     // cross-device readers.

@@ -15,11 +15,14 @@
  */
 
 // sirius
+#include <cudf/table/table.hpp>
+
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <data/sirius_converter_registry.hpp>
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
 
 #include <algorithm>
+#include <memory>
 
 namespace sirius::op::scan {
 
@@ -33,7 +36,7 @@ void scan_operator_input::prepare_for_processing(
   }
   auto batch = std::get<std::shared_ptr<cucascade::data_batch>>(materialization_info);
 
-  if (batch && requested_memory_space) {
+  if (batch && requested_memory_space && !stolen_table && !stolen_table_consumed) {
     bool needs_upload = false;
     {
       auto ro          = batch->to_read_only();
@@ -51,6 +54,24 @@ void scan_operator_input::prepare_for_processing(
       auto mut       = batch->to_mutable();
       mut.convert_to<::cucascade::gpu_table_representation>(
         registry, requested_memory_space, stream);
+      // The conversion output is a fresh per-query table (raw GPU pins serve a
+      // plain gpu_table_representation and never reach this branch), so an
+      // unmasked, unfiltered scan may take ownership of it here instead of
+      // deep-copying it at materialize. Masked / row-filtered splits keep the
+      // view path: they filter by copy and need the source view alive — and
+      // skipping them means the scan allocates nothing after the take, so an
+      // OOM retry can never re-enter materialize on a consumed split.
+      if (!mvcc_keep_mask.has_mask() && !row_filter_pending) {
+        if (auto* gpu_rep = dynamic_cast<::cucascade::gpu_table_representation*>(mut.get_data())) {
+          auto& space        = gpu_rep->get_memory_space();
+          stolen_table_bytes = gpu_rep->get_size_in_bytes();
+          stolen_table       = gpu_rep->release_table(stream);
+          // The batch cannot hold null data and its size/view queries
+          // dereference the table, so leave a valid empty placeholder.
+          mut.set_data(std::make_unique<::cucascade::gpu_table_representation>(
+            std::make_unique<cudf::table>(), space, rmm::cuda_stream_view{}));
+        }
+      }
     }
   }
 
@@ -66,6 +87,10 @@ std::size_t scan_operator_input::get_estimated_size_in_bytes() const
     return std::get<std::unique_ptr<scan_info>>(materialization_info)->estimated_bytes();
   }
   if (std::holds_alternative<std::shared_ptr<cucascade::data_batch>>(materialization_info)) {
+    // Once prepare_for_processing has taken the wrapper's table the batch only
+    // holds an empty placeholder; answer from the stolen table so OOM-retry
+    // estimates keep covering the live data.
+    if (stolen_table_bytes > 0) { return stolen_table_bytes; }
     auto batch = std::get<std::shared_ptr<cucascade::data_batch>>(materialization_info);
 
     auto ro          = batch->to_read_only();
