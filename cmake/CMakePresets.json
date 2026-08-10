@@ -70,7 +70,7 @@
         "DUCKDB_EXTENSION_CONFIGS": "${sourceDir}/../extension_config.cmake",
         "EXPORT_DYNAMIC_SYMBOLS": "ON",
         "EXTENSION_STATIC_BUILD": "ON",
-        "OVERRIDE_GET_DESCRIBE": "v1.5.5"
+        "OVERRIDE_GIT_DESCRIBE": "v1.5.5"
       },
       "generator": "Ninja",
       "hidden": true,
