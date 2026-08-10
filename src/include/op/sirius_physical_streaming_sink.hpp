@@ -46,6 +46,14 @@ struct partition_spec {
 
   /// Per-key cast before hashing (e.g. INT32 vs INT64). Empty = hash as-is. Ignored in broadcast.
   std::vector<cudf::data_type> key_cast_types;
+
+  partition_spec() = default;
+
+  /// Hash-mode shorthand: partition_spec({col}, {cast}) without naming the mode.
+  partition_spec(std::vector<int> keys, std::vector<cudf::data_type> casts = {})
+    : key_columns(std::move(keys)), key_cast_types(std::move(casts))
+  {
+  }
 };
 
 /// Fragment terminal: push pipeline output into one batch_stream per destination.

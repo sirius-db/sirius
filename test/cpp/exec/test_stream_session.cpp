@@ -81,7 +81,7 @@ sink_fixture make_partitioned_sink(std::size_t n)
   duckdb::vector<duckdb::LogicalType> types{duckdb::LogicalType::BIGINT,
                                             duckdb::LogicalType::INTEGER};
   auto sink = std::make_shared<sirius_physical_streaming_sink>(
-    sirius::from_duckdb_vec(types), 0, repos, partition_spec{{0}, {}});
+    sirius::from_duckdb_vec(types), 0, repos, partition_spec{{0}});
   return {std::move(sink), std::move(repos)};
 }
 

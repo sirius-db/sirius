@@ -282,7 +282,7 @@ TEST_CASE_METHOD(fragment_fixture,
     fragment_spec spec;
     spec.plan_source  = source;
     spec.outputs      = {0, 0};
-    spec.partitioning = sirius::op::partition_spec{{0}, {}};
+    spec.partitioning = sirius::op::partition_spec{{0}};
     REQUIRE_THROWS_AS(streaming_fragment(*con->context, std::move(spec)),
                       sirius::invalid_input_exception);
   }
