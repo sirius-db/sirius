@@ -35,12 +35,28 @@ std::vector<std::shared_ptr<cucascade::data_batch>> gpu_partition_impl::hash_par
   cucascade::memory::memory_space& memory_space,
   const telemetry::batch_telemetry_info& telemetry_info)
 {
+  return hash_partition(get_cudf_table_view(input),
+                        partition_key_idx,
+                        partition_key_cast_types,
+                        num_partitions,
+                        stream,
+                        memory_space,
+                        telemetry_info);
+}
+
+std::vector<std::shared_ptr<cucascade::data_batch>> gpu_partition_impl::hash_partition(
+  const cudf::table_view& input_table,
+  const std::vector<int>& partition_key_idx,
+  const std::vector<cudf::data_type>& partition_key_cast_types,
+  int num_partitions,
+  rmm::cuda_stream_view stream,
+  cucascade::memory::memory_space& memory_space,
+  const telemetry::batch_telemetry_info& telemetry_info)
+{
   // Sanity check.
   if (num_partitions < 2) {
     throw std::runtime_error("`num_partitions` in `hash_partition()` should be at least 2");
   }
-
-  auto input_table = get_cudf_table_view(input);
 
   // When a join condition has mixed key types (e.g. INT32 vs INT64), cuDF's murmur3 hash
   // produces different values for the same integer in different representations. We apply the

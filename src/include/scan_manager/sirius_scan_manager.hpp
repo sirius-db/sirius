@@ -417,7 +417,9 @@ class sirius_scan_manager {
   ///                                        changes must be forwarded per query by the caller).
   ///                                        Consulted by try_assign_cached_entries when building
   ///                                        the survivor plan.
-  void prepare_for_query(const sirius::planner::query& query, bool enable_pinned_zone_map_pruning);
+  void prepare_for_query(const sirius::planner::query& query,
+                         bool enable_pinned_zone_map_pruning,
+                         bool enable_serve_side_dynamic_filtering = false);
 
   /// \brief Clear the providers map and join the driver thread if it is
   ///        still running.
@@ -660,6 +662,9 @@ class sirius_scan_manager {
   std::vector<op::scan::sirius_gpu_scan_operator*> _scan_op_order;
   std::unordered_map<std::string, pinned_entry> _pinned_entries;
   bool _pruning_enabled{true};
+  /// Serve-side pre-transfer dynamic filtering of host-pinned cached splits (see
+  /// pinned_serve_filter.hpp); forwarded per query like _pruning_enabled.
+  bool _serve_filtering_enabled{false};
 
   /// One mask computation per distinct pinned entry matched this query
   /// (recorded by try_match_cached_entry, deduped by entry name); executed

@@ -24,6 +24,7 @@
 #include <cudf/aggregation.hpp>
 #include <cudf/ast/expressions.hpp>
 #include <cudf/column/column_factories.hpp>
+#include <cudf/copying.hpp>
 #include <cudf/filling.hpp>
 #include <cudf/reduction.hpp>
 #include <cudf/scalar/scalar.hpp>
@@ -1050,4 +1051,103 @@ TEST_CASE("per-filter gate measures marginal keep and skips a useless filter on 
   stream.synchronize();
   REQUIRE(out2 != nullptr);
   REQUIRE(out2->num_rows() == 2);
+}
+
+TEST_CASE("sirius_dynamic_bloom_filter incremental add_keys equals one-shot construction",
+          "[dynamic_filter][scan_merge]")
+{
+  auto stream   = cudf::get_default_stream();
+  auto const mr = cudf::get_current_device_resource_ref();
+  int device_id = 0;
+  REQUIRE(cudaGetDevice(&device_id) == cudaSuccess);
+
+  // 10k INT64 keys spread across the probe domain, built (a) in one shot and (b) over four
+  // incremental chunks with the SAME capacity. Same capacity + same policy + unordered
+  // idempotent inserts => bit-identical filters => identical masks.
+  constexpr cudf::size_type n_keys = 10000;
+  auto keys                        = cudf::sequence(n_keys,
+                             cudf::numeric_scalar<int64_t>(0, true, stream),
+                             cudf::numeric_scalar<int64_t>(3, true, stream),
+                             stream);
+
+  auto one_shot =
+    std::make_shared<sirius::op::sirius_dynamic_bloom_filter>(keys->view(), stream, mr);
+
+  auto incremental = std::make_shared<sirius::op::sirius_dynamic_bloom_filter>(
+    cudf::data_type{cudf::type_id::INT64}, static_cast<std::size_t>(n_keys), stream, mr);
+  constexpr cudf::size_type chunk = n_keys / 4;
+  for (cudf::size_type start = 0; start < n_keys; start += chunk) {
+    auto const len = std::min(chunk, n_keys - start);
+    auto slice     = cudf::slice(keys->view(), {start, start + len}, stream).front();
+    incremental->add_keys(slice, stream);
+  }
+
+  auto probe = cudf::sequence(3 * n_keys,
+                              cudf::numeric_scalar<int64_t>(0, true, stream),
+                              cudf::numeric_scalar<int64_t>(1, true, stream),
+                              stream);
+
+  auto mask_one_shot    = one_shot->compute_mask(probe->view(), device_id, stream, mr);
+  auto mask_incremental = incremental->compute_mask(probe->view(), device_id, stream, mr);
+  REQUIRE(mask_one_shot != nullptr);
+  REQUIRE(mask_incremental != nullptr);
+
+  auto to_host_bool8 = [&](cudf::column_view const& col) {
+    std::vector<uint8_t> host(static_cast<std::size_t>(col.size()));
+    cudaMemcpyAsync(
+      host.data(), col.data<bool>(), host.size(), cudaMemcpyDeviceToHost, stream.value());
+    stream.synchronize();
+    return host;
+  };
+  auto const host_one_shot    = to_host_bool8(mask_one_shot->view());
+  auto const host_incremental = to_host_bool8(mask_incremental->view());
+  REQUIRE(host_one_shot == host_incremental);
+  // Every inserted key (multiples of 3) must survive — Bloom has no false negatives.
+  for (cudf::size_type i = 0; i < 3 * n_keys; i += 3) {
+    REQUIRE(host_incremental[static_cast<std::size_t>(i)] != 0);
+  }
+}
+
+TEST_CASE("sirius_dynamic_bloom_filter incremental underestimated capacity keeps no-false-negative",
+          "[dynamic_filter][scan_merge]")
+{
+  auto stream   = cudf::get_default_stream();
+  auto const mr = cudf::get_current_device_resource_ref();
+  int device_id = 0;
+  REQUIRE(cudaGetDevice(&device_id) == cudaSuccess);
+
+  // Capacity estimated at 100 keys, 5000 actually inserted: the FPR degrades but membership of
+  // every inserted key must still hold.
+  constexpr cudf::size_type n_keys = 5000;
+  auto keys                        = cudf::sequence(n_keys,
+                             cudf::numeric_scalar<int64_t>(0, true, stream),
+                             cudf::numeric_scalar<int64_t>(2, true, stream),
+                             stream);
+  auto filter                      = std::make_shared<sirius::op::sirius_dynamic_bloom_filter>(
+    cudf::data_type{cudf::type_id::INT64}, 100, stream, mr);
+  filter->add_keys(keys->view(), stream);
+
+  auto mask = filter->compute_mask(keys->view(), device_id, stream, mr);
+  REQUIRE(mask != nullptr);
+  std::vector<uint8_t> host(static_cast<std::size_t>(n_keys));
+  cudaMemcpyAsync(
+    host.data(), mask->view().data<bool>(), host.size(), cudaMemcpyDeviceToHost, stream.value());
+  stream.synchronize();
+  for (auto const kept : host) {
+    REQUIRE(kept != 0);
+  }
+}
+
+TEST_CASE("sirius_dynamic_bloom_filter add_keys rejects a key-type mismatch",
+          "[dynamic_filter][scan_merge]")
+{
+  auto stream   = cudf::get_default_stream();
+  auto const mr = cudf::get_current_device_resource_ref();
+  auto filter   = std::make_shared<sirius::op::sirius_dynamic_bloom_filter>(
+    cudf::data_type{cudf::type_id::INT64}, 100, stream, mr);
+  auto wrong_keys = cudf::sequence(10,
+                                   cudf::numeric_scalar<int32_t>(0, true, stream),
+                                   cudf::numeric_scalar<int32_t>(1, true, stream),
+                                   stream);
+  REQUIRE_THROWS_AS(filter->add_keys(wrong_keys->view(), stream), std::invalid_argument);
 }

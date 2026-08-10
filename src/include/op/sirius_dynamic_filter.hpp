@@ -430,6 +430,24 @@ class sirius_dynamic_bloom_filter final : public sirius_dynamic_filter,
   sirius_dynamic_bloom_filter(cudf::column_view const& keys,
                               rmm::cuda_stream_view stream,
                               rmm::device_async_resource_ref mr);
+
+  /// Create an *empty* Bloom filter sized for ~@p estimated_num_keys keys of @p key_type, to be
+  /// filled incrementally via @ref add_keys. Sizing is capacity-only: an underestimate degrades the
+  /// false-positive rate but never correctness. The producer must not publish (make the filter
+  /// reachable through a channel) until every contributing key set has been inserted — a partially
+  /// filled Bloom filter would produce false negatives.
+  /// @throws std::invalid_argument if @p key_type is unsupported.
+  sirius_dynamic_bloom_filter(cudf::data_type key_type,
+                              std::size_t estimated_num_keys,
+                              rmm::cuda_stream_view stream,
+                              rmm::device_async_resource_ref mr);
+
+  /// Insert @p keys into the filter (device-atomic bitwise OR; idempotent, so retried batches are
+  /// harmless). Callable multiple times and from different streams, provided each calling stream is
+  /// ordered after construction and @p keys matches the construction key type.
+  /// @throws std::invalid_argument on a key-type mismatch.
+  void add_keys(cudf::column_view const& keys, rmm::cuda_stream_view stream);
+
   ~sirius_dynamic_bloom_filter() override;
 
   sirius_dynamic_bloom_filter(sirius_dynamic_bloom_filter const&)            = delete;

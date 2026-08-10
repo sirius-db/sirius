@@ -77,6 +77,12 @@ class parquet_ingestible_table_info : public ingestible_table_info {
   /// dynamic-filter operator applies membership filters post-decode.
   std::shared_ptr<sirius::op::sirius_dynamic_filter_set> sirius_dynamic_filters;
 
+  [[nodiscard]] std::shared_ptr<sirius::op::sirius_dynamic_filter_set> dynamic_filters()
+    const override
+  {
+    return sirius_dynamic_filters;
+  }
+
   /// Target decoded column-buffer budget for one data-batch split. Consumed
   /// only by parquet_batch_coalescer when it bundles files / chunks row groups —
   /// the ingestible's metadata scan operates one file at a time and does no batching.

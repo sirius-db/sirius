@@ -26,6 +26,7 @@
 #include "cudf/join/mixed_join.hpp"
 #include "cudf/null_mask.hpp"
 #include "cudf/reduction.hpp"
+#include "cudf/stream_compaction.hpp"
 #include "cudf/table/table_view.hpp"
 #include "cudf/transform.hpp"
 #include "cudf/types.hpp"
@@ -2020,6 +2021,124 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
 //===----------------------------------------------------------------------===//
 // Dynamic Filters
 //===----------------------------------------------------------------------===//
+sirius_physical_hash_join::~sirius_physical_hash_join() = default;
+
+bool sirius_physical_hash_join::arm_dynamic_filter_accumulator(std::size_t estimated_build_rows,
+                                                               std::size_t expected_batches)
+{
+  if (!filter_pushdown || !_dynamic_filter_plan.enabled() ||
+      !_dynamic_filter_plan.multi_batch_enabled()) {
+    return false;
+  }
+  if (_dynamic_filter_plan.replica_spaces().size() != 1) {
+    SIRIUS_LOG_DEBUG(
+      "[sirius_physical_hash_join] multi-batch dynamic filter NOT armed (id={}): plan spans {} "
+      "GPUs; per-device partial filters are not implemented.",
+      get_operator_id(),
+      _dynamic_filter_plan.replica_spaces().size());
+    return false;
+  }
+  if (expected_batches == 0 || estimated_build_rows == 0) { return false; }
+
+  auto expected = dynamic_filter_publication_state::OPEN;
+  if (!_dynamic_filter_publication_state.compare_exchange_strong(
+        expected,
+        dynamic_filter_publication_state::PUBLISHING,
+        std::memory_order_acq_rel,
+        std::memory_order_acquire)) {
+    return false;
+  }
+  _dynamic_filter_accumulator = std::make_unique<dynamic_filter_accumulator>(*filter_pushdown,
+                                                                             _dynamic_filter_plan,
+                                                                             key_casts,
+                                                                             right_key_col_indices,
+                                                                             estimated_build_rows,
+                                                                             expected_batches);
+  _dynamic_filter_accumulator_armed.store(true, std::memory_order_release);
+  SIRIUS_LOG_DEBUG(
+    "[sirius_physical_hash_join] multi-batch dynamic filter armed (id={}): ~{} build rows over {} "
+    "expected build batches.",
+    get_operator_id(),
+    estimated_build_rows,
+    expected_batches);
+  return true;
+}
+
+void sirius_physical_hash_join::accumulate_dynamic_filters(cudf::table_view const& build_view,
+                                                           rmm::cuda_stream_view stream)
+{
+  if (!_dynamic_filter_accumulator_armed.load(std::memory_order_acquire)) { return; }
+  try {
+    if (_dynamic_filter_accumulator->add(build_view, stream)) {
+      _dynamic_filter_publication_state.store(dynamic_filter_publication_state::FINISHED,
+                                              std::memory_order_release);
+      register_probe_partition_filters();
+    }
+  } catch (...) {
+    _dynamic_filter_publication_state.store(dynamic_filter_publication_state::FAILED,
+                                            std::memory_order_release);
+    throw;
+  }
+}
+
+void sirius_physical_hash_join::register_probe_partition_filters()
+{
+  if (!_dynamic_filter_plan.probe_partition_enabled()) { return; }
+  // The checkpoint drops probe rows whose key is (provably) absent from the build. That is only
+  // sound when an unmatched probe row contributes nothing to the output: INNER/SEMI, and the
+  // right-family types (they emit from the build side; a probe row that matches no build key
+  // cannot mark, match, or un-match anything). LEFT/OUTER preserve probe rows and ANTI/MARK
+  // *output* the non-matching ones, so they must not register.
+  bool const safe_join_type =
+    join_type == duckdb::JoinType::INNER || join_type == duckdb::JoinType::SEMI ||
+    join_type == duckdb::JoinType::RIGHT || join_type == duckdb::JoinType::RIGHT_SEMI ||
+    join_type == duckdb::JoinType::RIGHT_ANTI;
+  if (!safe_join_type) { return; }
+
+  for (auto const& [key_idx, filter] : _dynamic_filter_accumulator->published_membership()) {
+    auto const cond_idx = filter_pushdown->join_condition[key_idx];
+    if (cond_idx >= left_key_col_indices.size()) { continue; }
+    _probe_partition_filters.push_back(
+      {static_cast<cudf::size_type>(left_key_col_indices[cond_idx]), filter});
+  }
+  if (_probe_partition_filters.empty()) { return; }
+  _probe_partition_filters_ready.store(true, std::memory_order_release);
+  SIRIUS_LOG_DEBUG(
+    "[sirius_physical_hash_join] probe-partition checkpoint armed (id={}): {} filter(s).",
+    get_operator_id(),
+    _probe_partition_filters.size());
+}
+
+std::unique_ptr<cudf::table> sirius_physical_hash_join::apply_probe_dynamic_filters(
+  cudf::table_view const& probe_view,
+  int device_id,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr)
+{
+  if (!_probe_partition_filters_ready.load(std::memory_order_acquire)) { return nullptr; }
+  if (probe_view.num_rows() == 0) { return nullptr; }
+
+  std::unique_ptr<cudf::table> filtered;
+  cudf::table_view current = probe_view;
+  for (auto const& entry : _probe_partition_filters) {
+    if (entry.probe_col_idx >= current.num_columns()) { continue; }
+    auto* mask_capable = dynamic_cast<sirius_mask_applicable*>(entry.filter.get());
+    if (mask_capable == nullptr || !entry.filter->is_available_on_device(device_id)) { continue; }
+    auto const mask =
+      mask_capable->compute_mask(current.column(entry.probe_col_idx), device_id, stream, mr);
+    if (!mask) { continue; }
+    filtered = cudf::apply_boolean_mask(current, mask->view(), stream, mr);
+    current  = filtered->view();
+  }
+  if (!filtered) { return nullptr; }
+
+  _probe_partition_rows_in.fetch_add(static_cast<std::uint64_t>(probe_view.num_rows()),
+                                     std::memory_order_relaxed);
+  _probe_partition_rows_out.fetch_add(static_cast<std::uint64_t>(filtered->num_rows()),
+                                      std::memory_order_relaxed);
+  return filtered;
+}
+
 void sirius_physical_hash_join::publish_dynamic_filters(cudf::table_view const& build_view,
                                                         rmm::cuda_stream_view stream)
 {
@@ -2143,6 +2262,17 @@ void sirius_physical_hash_join::on_finalize_operator()
     dynamic_filter_publication_state::CLOSED,
     std::memory_order_acq_rel,
     std::memory_order_acquire);
+
+  if (auto const rows_in = _probe_partition_rows_in.load(std::memory_order_relaxed); rows_in > 0) {
+    auto const rows_out = _probe_partition_rows_out.load(std::memory_order_relaxed);
+    SIRIUS_LOG_INFO(
+      "[sirius_physical_hash_join] probe-partition checkpoint (id={}): kept {} of {} probe rows "
+      "({:.3f}).",
+      get_operator_id(),
+      rows_out,
+      rows_in,
+      static_cast<double>(rows_out) / static_cast<double>(rows_in));
+  }
 
   if (_join_mode == HASH_JOIN_MODE::BUILD_PROBE) {
     // Each partition's hash table lives on its own GPU (partition_idx % num_gpus). Free every slot

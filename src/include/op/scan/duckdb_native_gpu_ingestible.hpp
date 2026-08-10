@@ -68,6 +68,12 @@ class duckdb_native_ingestible_table_info : public op::scan::ingestible_table_in
   /// dynamic-filter operator applies the filters post-decode (the native scan has no read-time
   /// dynamic path).
   std::shared_ptr<sirius::op::sirius_dynamic_filter_set> sirius_dynamic_filters;
+
+  [[nodiscard]] std::shared_ptr<sirius::op::sirius_dynamic_filter_set> dynamic_filters()
+    const override
+  {
+    return sirius_dynamic_filters;
+  }
   std::size_t approximate_batch_size = sirius::config::DEFAULT_SCAN_TASK_BATCH_SIZE;
 
   duckdb::DataTable* storage     = nullptr;

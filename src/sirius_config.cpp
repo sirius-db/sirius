@@ -219,6 +219,9 @@ static void from_yaml(const YAML::Node& node, operator_params& opt)
   r.optional("max_broadcast_join_size", yaml::bytes(opt.max_broadcast_join_size));
   r.optional("mark_join_build_switch_ratio", opt.mark_join_build_switch_ratio);
   r.optional("enable_dynamic_filter_pushdown", opt.enable_dynamic_filter_pushdown);
+  r.optional("enable_dynamic_filter_multi_batch", opt.enable_dynamic_filter_multi_batch);
+  r.optional("enable_dynamic_filter_probe_partition", opt.enable_dynamic_filter_probe_partition);
+  r.optional("enable_dynamic_filter_pinned_serve", opt.enable_dynamic_filter_pinned_serve);
   r.optional("enable_dynamic_zone_map_filter", opt.enable_dynamic_zone_map_filter);
   r.optional("dynamic_filter_domain_coverage_threshold",
              opt.dynamic_filter_domain_coverage_threshold);

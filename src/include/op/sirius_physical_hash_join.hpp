@@ -36,6 +36,8 @@
 
 #include <cudf/types.hpp>
 
+#include <rmm/resource_ref.hpp>
+
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -54,6 +56,7 @@ class sirius_meta_pipeline;
 
 namespace op {
 
+class sirius_dynamic_filter;
 class sirius_dynamic_filter_set;
 
 // STANDARD uses cudf APIs where the build and probe is a single operation.
@@ -228,6 +231,8 @@ struct cross_schedule_orphan {
 [[nodiscard]] cross_schedule_kind peek_cross_schedule_kind(
   std::vector<partition_cross_schedule> const& cross, bool probe_finished, bool build_finished);
 
+class dynamic_filter_accumulator;  // declared in op/dynamic_filter_publisher.hpp
+
 class sirius_physical_hash_join : public sirius_physical_partition_consumer_operator {
  public:
   static constexpr const SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::HASH_JOIN;
@@ -264,6 +269,10 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
     uint64_t max_build_hash_table_bytes = config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES,
     uint64_t hash_partition_bytes       = config::DEFAULT_HASH_PARTITION_BYTES,
     uint64_t max_broadcast_join_size    = config::DEFAULT_MAX_BROADCAST_JOIN_SIZE);
+
+  // Out-of-line: members hold types that are only forward-declared here
+  // (dynamic_filter_accumulator).
+  ~sirius_physical_hash_join() override;
 
   duckdb::vector<sirius::join_condition> conditions;
   //! Scans where we should push generated filters into (if any)
@@ -339,6 +348,32 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   /// concat-folded batch covering the entire build side (single-partition or broadcast build).
   /// Precondition for claiming a build batch for dynamic-filter publication, in any join mode.
   void set_build_arrives_whole(bool arrives_whole);
+
+  /// @brief Arm incremental (multi-batch) dynamic-filter accumulation for a build side that will
+  /// never arrive as one batch. Called by the build-side PARTITION at sizing time, before any
+  /// partition task runs; claims the publication window (@c OPEN -> @c PUBLISHING) so the one-shot
+  /// hook stands down. @return whether accumulation was armed — refused when publication is not
+  /// wired, disabled by config, the window is already claimed/closed, or the plan spans more than
+  /// one GPU (per-device partial filters are not implemented).
+  bool arm_dynamic_filter_accumulator(std::size_t estimated_build_rows,
+                                      std::size_t expected_batches);
+
+  /// @brief Insert one build batch's keys into the armed accumulator (no-op when unarmed). Called
+  /// by every build-side PARTITION task on its task stream; the call carrying the final expected
+  /// batch publishes before returning. Errors mark the attempt @c FAILED and rethrow, matching the
+  /// one-shot hook's error contract.
+  void accumulate_dynamic_filters(cudf::table_view const& build_view, rmm::cuda_stream_view stream);
+
+  /// @brief Drop probe rows that cannot match any build key, using this join's own published
+  /// membership filters — the probe-side PARTITION's pre-scatter checkpoint behind the probe
+  /// scan's opportunistic one. Returns the filtered table, or null when there is nothing to apply
+  /// (nothing published yet / disabled / no capable filter). Safe only because filters are
+  /// registered solely for join types whose unmatched probe rows produce no output.
+  [[nodiscard]] std::unique_ptr<cudf::table> apply_probe_dynamic_filters(
+    cudf::table_view const& probe_view,
+    int device_id,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr);
 
   /// @brief True when this join runs in build-then-probe mode (see `get_partition_strategy`).
   [[nodiscard]] bool is_build_probe_mode();
@@ -484,9 +519,29 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
 
   /// Complete plan-time routing, policy, and replica-space description; immutable at runtime.
   dynamic_filter_publish_plan const _dynamic_filter_plan;
-  /// Exactly-once arbitration between the publication hook and finalization.
+  /// Exactly-once arbitration between the publication hook, the multi-batch accumulator, and
+  /// finalization.
   std::atomic<dynamic_filter_publication_state> _dynamic_filter_publication_state{
     dynamic_filter_publication_state::OPEN};
+  /// Incremental publisher for multi-partition builds. Installed once by
+  /// @ref arm_dynamic_filter_accumulator before any partition task runs; the armed flag provides
+  /// the release/acquire edge for lock-free reads from task threads.
+  std::unique_ptr<dynamic_filter_accumulator> _dynamic_filter_accumulator;
+  std::atomic<bool> _dynamic_filter_accumulator_armed{false};
+  /// The probe-side PARTITION checkpoint: this join's published membership filters keyed by the
+  /// probe input column they test. Registered once after multi-batch publication (only for join
+  /// types whose unmatched probe rows emit nothing); the ready flag provides the release/acquire
+  /// edge for lock-free reads from probe partition tasks.
+  struct probe_partition_filter {
+    cudf::size_type probe_col_idx = -1;
+    std::shared_ptr<sirius_dynamic_filter> filter;
+  };
+  void register_probe_partition_filters();
+  std::vector<probe_partition_filter> _probe_partition_filters;
+  std::atomic<bool> _probe_partition_filters_ready{false};
+  /// Aggregate probe-partition checkpoint telemetry (rows seen / rows kept), logged at finalize.
+  std::atomic<std::uint64_t> _probe_partition_rows_in{0};
+  std::atomic<std::uint64_t> _probe_partition_rows_out{0};
   //===----------------------------------------------------------------------===//
 
  public:

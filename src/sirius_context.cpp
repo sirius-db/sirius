@@ -1049,8 +1049,10 @@ void SiriusContext::create_query(
     std::move(pipelines), telemetry_context_->context(), query_id, telemetry_info);
   task_scheduler_->prepare_for_query(query_);
   task_creator_->prepare_for_query(*query_);
-  scan_manager_->prepare_for_query(*query_,
-                                   config_.get_operator_params().enable_pinned_zone_map_pruning);
+  scan_manager_->prepare_for_query(
+    *query_,
+    config_.get_operator_params().enable_pinned_zone_map_pruning,
+    config_.get_operator_params().enable_dynamic_filter_pinned_serve);
 }
 
 duckdb::shared_ptr<sirius::planner::query> SiriusContext::get_query()

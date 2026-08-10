@@ -25,6 +25,8 @@
 #include "op/sirius_physical_top_n.hpp"
 #include "sirius_config.hpp"
 
+#include <atomic>
+
 namespace duckdb {
 class SiriusContext;
 }  // namespace duckdb
@@ -132,6 +134,16 @@ class sirius_physical_partition : public sirius_physical_operator {
   /// consumer's get_partition_strategy, which turns it into a partition count.
   uint64_t compute_total_bytes();
 
+  /// Complete-input totals for arming multi-batch dynamic-filter accumulation. Only meaningful on
+  /// the sizing side, whose FULL input barrier guarantees every batch is resident: `rows` is exact
+  /// over GPU-resident batches and extrapolated by bytes for any batch on another tier (a Bloom
+  /// capacity input, where estimation error only moves the false-positive rate).
+  struct input_totals {
+    std::size_t rows        = 0;
+    std::size_t num_batches = 0;
+  };
+  input_totals compute_input_totals();
+
   /// The partition slot for a batch residing on `device_id`: its index in `_active_gpu_ids`
   /// (so task_creator routes that slot back to the same GPU). Returns 0 if not found (a
   /// safe fallback that keeps the batch on some valid slot).
@@ -158,6 +170,10 @@ class sirius_physical_partition : public sirius_physical_operator {
   /// num_gpus partitions. Build side deposits its batch into every slot; probe side deposits each
   /// batch into the slot matching its current GPU. See get_next_task_input_data / sink.
   bool _broadcast{false};
+  /// Build side of a multi-partition (non-broadcast) join whose dynamic-filter accumulator was
+  /// armed at sizing: every execute() feeds its input batch's keys to the join before scattering.
+  /// Written during sizing (before any partition task exists), read lock-free by task threads.
+  std::atomic<bool> _accumulate_dynamic_filters{false};
   /// Non-owning observer for the narrow-passthrough counter. The registered-state shared_ptr owns
   /// the context for at least as long as the query plan; unit-test operators may leave it null.
   duckdb::SiriusContext* _compressed_materialization_observer = nullptr;

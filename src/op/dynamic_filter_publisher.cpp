@@ -23,6 +23,8 @@
 #include "log/logging.hpp"
 #include "op/sirius_dynamic_filter.hpp"
 
+#include <rmm/cuda_device.hpp>
+
 #include <cuda_runtime_api.h>
 #include <nvtx3/nvtx3.hpp>
 
@@ -66,6 +68,78 @@ std::size_t device_l2_cache_bytes(
   }
   return minimum == std::numeric_limits<std::size_t>::max() ? 0 : minimum;
 }
+
+bool target_accepts_filters(dynamic_filter_publish_plan::probe_target const& tgt)
+{
+  return tgt.filter_set && tgt.filter_set->accepting_filters();
+}
+
+// Replicate every built filter to all planned device spaces. The producer stream must already be
+// drained: consumers probe replicas from their own streams the moment push_filter lands, with no
+// event ordering back to the producer.
+void replicate_filters(
+  dynamic_filter_publish_plan const& plan,
+  std::vector<std::shared_ptr<sirius_dynamic_filter>> const& per_key_zone_map,
+  std::vector<std::shared_ptr<sirius_dynamic_filter>> const& per_key_membership)
+{
+  nvtx3::scoped_range replicate_range{"dynfilter::replicate_devices"};
+  auto replicate = [&plan](std::shared_ptr<sirius_dynamic_filter> const& filter) {
+    if (!filter) { return; }
+    auto* replicable = dynamic_cast<sirius_device_replicable*>(filter.get());
+    if (replicable == nullptr) {
+      throw std::logic_error(
+        "[dynamic_filter_publisher] A published device-backed dynamic filter must "
+        "implement sirius_device_replicable");
+    }
+    replicable->replicate_to_devices(plan.replica_spaces());
+  };
+  for (auto const& filter : per_key_zone_map) {
+    replicate(filter);
+  }
+  for (auto const& filter : per_key_membership) {
+    replicate(filter);
+  }
+}
+
+struct fan_out_result {
+  std::size_t total_pushed   = 0;
+  std::size_t active_targets = 0;
+};
+
+// Push every built filter into each still-accepting probe target's channel.
+fan_out_result fan_out_filters(
+  dynamic_filter_publish_plan const& plan,
+  std::vector<std::shared_ptr<sirius_dynamic_filter>> const& per_key_zone_map,
+  std::vector<std::shared_ptr<sirius_dynamic_filter>> const& per_key_membership,
+  std::vector<cudf::data_type> const& per_key_build_type)
+{
+  fan_out_result result;
+  for (auto const& tgt : plan.probe_targets()) {
+    if (!target_accepts_filters(tgt)) { continue; }
+    ++result.active_targets;
+
+    if (tgt.probe_col_idx.size() != per_key_membership.size()) {
+      SIRIUS_LOG_WARN(
+        "[sirius_physical_hash_join] dynamic-filter column mismatch (probe_col_idx={} keys={}); "
+        "skipping target to preserve correctness.",
+        tgt.probe_col_idx.size(),
+        per_key_membership.size());
+      continue;
+    }
+    for (std::size_t k = 0; k < per_key_membership.size(); ++k) {
+      if (per_key_zone_map[k] && k < tgt.probe_col_type.size() &&
+          tgt.probe_col_type[k] == per_key_build_type[k] &&
+          tgt.filter_set->push_filter(tgt.probe_col_idx[k], per_key_zone_map[k])) {
+        ++result.total_pushed;
+      }
+      if (per_key_membership[k] &&
+          tgt.filter_set->push_filter(tgt.probe_col_idx[k], per_key_membership[k])) {
+        ++result.total_pushed;
+      }
+    }
+  }
+  return result;
+}
 }  // namespace
 
 void dynamic_filter_publisher::publish(cudf::table_view const& build_view,
@@ -80,9 +154,6 @@ void dynamic_filter_publisher::publish(cudf::table_view const& build_view,
     return;
   }
 
-  auto target_accepts_filters = [](dynamic_filter_publish_plan::probe_target const& tgt) {
-    return tgt.filter_set && tgt.filter_set->accepting_filters();
-  };
   auto const& probe_targets = _plan.probe_targets();
   if (std::none_of(probe_targets.begin(), probe_targets.end(), target_accepts_filters)) {
     SIRIUS_LOG_DEBUG(
@@ -289,59 +360,243 @@ void dynamic_filter_publisher::publish(cudf::table_view const& build_view,
     // Build each structure only on the producer. Remote GPUs receive raw needles, finished
     // static-set slots, Bloom words, or exact zone bounds. Replication completes before the filter
     // is published, so consumers never wait and never observe a cross-device pointer.
-    nvtx3::scoped_range replicate_range{"dynfilter::replicate_devices"};
-    auto replicate = [this](std::shared_ptr<sirius_dynamic_filter> const& filter) {
-      if (!filter) { return; }
-      auto* replicable = dynamic_cast<sirius_device_replicable*>(filter.get());
-      if (replicable == nullptr) {
-        throw std::logic_error(
-          "[dynamic_filter_publisher::publish] A published device-backed dynamic filter must "
-          "implement sirius_device_replicable");
-      }
-      replicable->replicate_to_devices(_plan.replica_spaces());
-    };
-    for (auto const& filter : per_key_zone_map) {
-      replicate(filter);
-    }
-    for (auto const& filter : per_key_membership) {
-      replicate(filter);
-    }
+    replicate_filters(_plan, per_key_zone_map, per_key_membership);
   }
 
-  // Fan out across probe targets
-  std::size_t total_pushed   = 0;
-  std::size_t active_targets = 0;
-  for (auto const& tgt : probe_targets) {
-    if (!target_accepts_filters(tgt)) { continue; }
-    ++active_targets;
-
-    if (tgt.probe_col_idx.size() != per_key_membership.size()) {
-      SIRIUS_LOG_WARN(
-        "[sirius_physical_hash_join] dynamic-filter column mismatch (probe_col_idx={} keys={}); "
-        "skipping target to preserve correctness.",
-        tgt.probe_col_idx.size(),
-        per_key_membership.size());
-      continue;
-    }
-    for (std::size_t k = 0; k < per_key_membership.size(); ++k) {
-      if (per_key_zone_map[k] && k < tgt.probe_col_type.size() &&
-          tgt.probe_col_type[k] == per_key_build_type[k] &&
-          tgt.filter_set->push_filter(tgt.probe_col_idx[k], per_key_zone_map[k])) {
-        ++total_pushed;
-      }
-      if (per_key_membership[k] &&
-          tgt.filter_set->push_filter(tgt.probe_col_idx[k], per_key_membership[k])) {
-        ++total_pushed;
-      }
-    }
-  }
+  auto const pushed =
+    fan_out_filters(_plan, per_key_zone_map, per_key_membership, per_key_build_type);
   SIRIUS_LOG_INFO(
     "[sirius_physical_hash_join] Pushed {} dynamic filter(s) across {} active target(s) "
     "of {} wired target(s) ({} build rows, {} keys).",
-    total_pushed,
-    active_targets,
+    pushed.total_pushed,
+    pushed.active_targets,
     probe_targets.size(),
     build_view.num_rows(),
+    _filter_pushdown.join_condition.size());
+}
+
+//===----------------------------------------------------------------------===//
+// dynamic_filter_accumulator
+//===----------------------------------------------------------------------===//
+
+dynamic_filter_accumulator::dynamic_filter_accumulator(
+  duckdb::JoinFilterPushdownInfo const& filter_pushdown,
+  dynamic_filter_publish_plan const& plan,
+  std::vector<sirius_physical_hash_join::key_cast_info> const& key_casts,
+  std::vector<cudf::size_type> const& right_key_col_indices,
+  std::size_t estimated_build_rows,
+  std::size_t expected_batches)
+  : _filter_pushdown(filter_pushdown),
+    _plan(plan),
+    _key_casts(key_casts),
+    _right_key_col_indices(right_key_col_indices),
+    _estimated_build_rows(estimated_build_rows),
+    _expected_batches(expected_batches),
+    _source_device(plan.replica_spaces().empty()
+                     ? -1
+                     : plan.replica_spaces().front().get_gpu_space().get_device_id())
+{
+  assert(plan.enabled());
+  if (_source_device < 0) {
+    throw std::logic_error(
+      "[dynamic_filter_accumulator] publish plan has no replica space to source construction");
+  }
+  if (_expected_batches == 0) {
+    throw std::invalid_argument("[dynamic_filter_accumulator] expected_batches must be > 0");
+  }
+  _keys.resize(_filter_pushdown.join_condition.size());
+}
+
+dynamic_filter_accumulator::~dynamic_filter_accumulator()
+{
+  rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{_source_device}};
+  for (auto* event : _events) {
+    (void)cudaEventDestroy(event);
+  }
+}
+
+bool dynamic_filter_accumulator::finished() const noexcept { return _finished; }
+
+void dynamic_filter_accumulator::begin(cudf::table_view const& build_view,
+                                       rmm::cuda_stream_view stream)
+{
+  _begun = true;
+
+  // All targets may already have drained (their scans finished before the build sized) — then
+  // nothing built here could ever be consumed, so leave every key ineligible.
+  auto const& probe_targets = _plan.probe_targets();
+  if (std::none_of(probe_targets.begin(), probe_targets.end(), target_accepts_filters)) {
+    SIRIUS_LOG_DEBUG(
+      "[sirius_physical_hash_join] multi-batch dynamic filter: all target scans drained before "
+      "accumulation began; publishing nothing.");
+    return;
+  }
+
+  auto const& key_domains  = _plan.build_key_domain_cardinalities();
+  auto const allocator_ref = _plan.replica_spaces().front().get_gpu_space().get_default_allocator();
+
+  for (std::size_t k = 0; k < _filter_pushdown.join_condition.size(); ++k) {
+    auto const cond_idx = _filter_pushdown.join_condition[k];
+    // Same gates as the one-shot publisher: cast keys are skipped to keep build/probe key
+    // representations type-equivalent, and domain-covering keys are not worth a filter. The
+    // coverage pre-gate uses the row *estimate*; finish() re-checks with the exact count.
+    if (cond_idx < _key_casts.size() &&
+        (_key_casts[cond_idx].cast_right || _key_casts[cond_idx].cast_left)) {
+      SIRIUS_LOG_DEBUG(
+        "[sirius_physical_hash_join] multi-batch dynamic filter key {}: skipped (cast on build "
+        "key cond_idx={}).",
+        k,
+        cond_idx);
+      continue;
+    }
+    if (cond_idx >= _right_key_col_indices.size()) { continue; }
+    auto const key_domain = k < key_domains.size() ? key_domains[k] : 0;
+    if (key_domain > 0) {
+      auto const covered =
+        static_cast<double>(_estimated_build_rows) / static_cast<double>(key_domain);
+      if (covered >= _plan.domain_coverage_threshold()) {
+        SIRIUS_LOG_DEBUG(
+          "[sirius_physical_hash_join] multi-batch publish gate: key {}: ~{} build rows cover "
+          "{:.2f} of key domain (~{} rows) -> skip key.",
+          k,
+          _estimated_build_rows,
+          covered,
+          key_domain);
+        continue;
+      }
+    }
+
+    auto const build_col_idx = _right_key_col_indices[cond_idx];
+    auto const& col          = build_view.column(build_col_idx);
+    if (!sirius_dynamic_bloom_filter::supports(col.type())) {
+      SIRIUS_LOG_DEBUG(
+        "[sirius_physical_hash_join] multi-batch dynamic filter key {}: skipped (type has no "
+        "Bloom support; incremental construction is Bloom-only).",
+        k);
+      continue;
+    }
+
+    nvtx3::scoped_range vr{"dynfilter::begin_multibatch_bloom"};
+    _keys[k].build_type = col.type();
+    _keys[k].bloom      = std::make_shared<sirius_dynamic_bloom_filter>(
+      col.type(), _estimated_build_rows, stream, allocator_ref);
+    SIRIUS_LOG_DEBUG(
+      "[sirius_physical_hash_join] multi-batch dynamic filter key {}: Bloom sized for ~{} keys "
+      "({}B), fed by {} expected batches.",
+      k,
+      _estimated_build_rows,
+      sirius_dynamic_bloom_filter::estimated_bytes(_estimated_build_rows),
+      _expected_batches);
+  }
+}
+
+void dynamic_filter_accumulator::record_event(rmm::cuda_stream_view stream)
+{
+  cudaEvent_t event = nullptr;
+  if (cudaEventCreateWithFlags(&event, cudaEventDisableTiming) != cudaSuccess) {
+    throw std::runtime_error("[dynamic_filter_accumulator] failed to create ordering event");
+  }
+  if (cudaEventRecord(event, stream.value()) != cudaSuccess) {
+    (void)cudaEventDestroy(event);
+    throw std::runtime_error("[dynamic_filter_accumulator] failed to record ordering event");
+  }
+  _events.push_back(event);
+}
+
+bool dynamic_filter_accumulator::add(cudf::table_view const& build_view,
+                                     rmm::cuda_stream_view stream)
+{
+  std::lock_guard<std::mutex> lock(_mutex);
+  if (_finished) {
+    SIRIUS_LOG_WARN(
+      "[dynamic_filter_accumulator] build batch arrived after publication ({} expected); "
+      "ignoring.",
+      _expected_batches);
+    return false;
+  }
+
+  rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{_source_device}};
+  if (!_begun) { begin(build_view, stream); }
+
+  for (std::size_t k = 0; k < _keys.size(); ++k) {
+    if (!_keys[k].bloom) { continue; }
+    auto const build_col_idx = _right_key_col_indices[_filter_pushdown.join_condition[k]];
+    // add_keys orders nothing across streams itself; each contributing stream is instead captured
+    // in _events below, and finish() orders the publishing stream after all of them.
+    _keys[k].bloom->add_keys(build_view.column(build_col_idx), stream);
+  }
+  _accumulated_rows += static_cast<std::size_t>(build_view.num_rows());
+  record_event(stream);
+  ++_accumulated_batches;
+
+  if (_accumulated_batches < _expected_batches) { return false; }
+  finish(stream);
+  return true;
+}
+
+void dynamic_filter_accumulator::finish(rmm::cuda_stream_view stream)
+{
+  nvtx3::scoped_range nvtx_range{"dynfilter::publish_multibatch"};
+  _finished = true;
+
+  // Order the publishing stream after every contributing add(), then drain it: publication is
+  // cross-stream with no event ordering to consumers (same contract as the one-shot publisher).
+  for (auto* event : _events) {
+    if (cudaStreamWaitEvent(stream.value(), event, 0) != cudaSuccess) {
+      throw std::runtime_error("[dynamic_filter_accumulator] failed to wait on ordering event");
+    }
+  }
+
+  // Exact-row re-check of the domain-coverage gate. The Bloom build cost is already sunk, but a
+  // domain-covering filter keeps ~everything and only costs the probe side — drop it.
+  auto const& key_domains = _plan.build_key_domain_cardinalities();
+  std::vector<std::shared_ptr<sirius_dynamic_filter>> per_key_membership(_keys.size());
+  std::vector<std::shared_ptr<sirius_dynamic_filter>> per_key_zone_map(_keys.size());
+  std::vector<cudf::data_type> per_key_build_type(_keys.size(),
+                                                  cudf::data_type{cudf::type_id::EMPTY});
+  std::size_t built = 0;
+  for (std::size_t k = 0; k < _keys.size(); ++k) {
+    if (!_keys[k].bloom) { continue; }
+    auto const key_domain = k < key_domains.size() ? key_domains[k] : 0;
+    if (key_domain > 0) {
+      auto const covered = static_cast<double>(_accumulated_rows) / static_cast<double>(key_domain);
+      if (covered >= _plan.domain_coverage_threshold()) {
+        SIRIUS_LOG_DEBUG(
+          "[sirius_physical_hash_join] multi-batch publish gate: key {}: {} build rows cover "
+          "{:.2f} of key domain (~{} rows) -> drop built filter.",
+          k,
+          _accumulated_rows,
+          covered,
+          key_domain);
+        continue;
+      }
+    }
+    per_key_membership[k] = _keys[k].bloom;
+    per_key_build_type[k] = _keys[k].build_type;
+    _published_membership.emplace_back(k, per_key_membership[k]);
+    ++built;
+  }
+  if (built == 0) {
+    SIRIUS_LOG_DEBUG(
+      "[sirius_physical_hash_join] multi-batch dynamic filter: no key survived the publication "
+      "gates ({} batches, {} rows).",
+      _accumulated_batches,
+      _accumulated_rows);
+    return;
+  }
+
+  stream.synchronize();
+  replicate_filters(_plan, per_key_zone_map, per_key_membership);
+  auto const pushed =
+    fan_out_filters(_plan, per_key_zone_map, per_key_membership, per_key_build_type);
+  SIRIUS_LOG_INFO(
+    "[sirius_physical_hash_join] Pushed {} dynamic filter(s) across {} active target(s) of {} "
+    "wired target(s) (multi-batch: {} build rows over {} batches, {} keys).",
+    pushed.total_pushed,
+    pushed.active_targets,
+    _plan.probe_targets().size(),
+    _accumulated_rows,
+    _accumulated_batches,
     _filter_pushdown.join_condition.size());
 }
 
