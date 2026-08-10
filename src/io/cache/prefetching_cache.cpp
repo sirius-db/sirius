@@ -80,6 +80,12 @@ void prefetching_handle::update(scan_stage stage) noexcept
 
 bool prefetching_handle::is_active() const noexcept { return _req.is_active(); }
 
+bool prefetching_handle::wait_until_prepared() noexcept
+{
+  if (!_req.producer) { return false; }
+  return _req.producer->wait_until_prepared();
+}
+
 std::shared_ptr<const std::vector<cached_chunk*>> prefetching_handle::chunks() const noexcept
 {
   return _req.chunks;

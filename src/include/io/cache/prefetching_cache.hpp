@@ -112,6 +112,12 @@ class prefetching_handle {
 
   [[nodiscard]] bool is_active() const noexcept;
 
+  /// Block until the prepare_loop has allocated staging buffers for every
+  /// chunk in this request (producer state >= prepared).  Returns true iff
+  /// preparation succeeded; false means the request was abandoned (e.g. the
+  /// pool ran out of memory).  No-op and returns false on an empty handle.
+  [[nodiscard]] bool wait_until_prepared() noexcept;
+
   /// The chunks of the underlying request.  Null when the handle is empty.
   [[nodiscard]] std::shared_ptr<const std::vector<cached_chunk*>> chunks() const noexcept;
 

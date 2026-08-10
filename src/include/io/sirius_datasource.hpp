@@ -132,6 +132,13 @@ class sirius_datasource : public cudf::io::datasource {
   /// completion.  Returns whether IO was issued.
   bool prefetch_async(exec::invocable<void(bool) noexcept> on_done);
 
+  /// Block until the prefetching cache's prepare_loop has allocated staging
+  /// buffers for every chunk in this datasource's handle (producer state >=
+  /// prepared).  Must be called after fadvise() and before prefetch_async()
+  /// to guarantee IO is actually issued.  No-op and returns false when no
+  /// prefetching cache is attached.
+  [[nodiscard]] bool wait_prefetch_prepared() noexcept;
+
   [[nodiscard]] bool uses_prefetching_cache() const noexcept;
 
  private:

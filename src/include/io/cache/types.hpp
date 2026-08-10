@@ -703,6 +703,20 @@ class producer_stage {
     return st >= prepared && st != abandoned;
   }
 
+  /// Block until state >= @c prepared, regardless of which pre-prepared state
+  /// (initialized, queued, preparing) it starts in.  Each intermediate state
+  /// either returns immediately from @c _packed.wait (value already changed)
+  /// or parks until @c mark_prepared / @c mark_abandoned notifies.
+  [[nodiscard]] bool wait_until_prepared() noexcept
+  {
+    uint32_t cur = _packed.load(std::memory_order_acquire);
+    while (cur < static_cast<uint32_t>(prepared)) {
+      _packed.wait(cur, std::memory_order_relaxed);
+      cur = _packed.load(std::memory_order_acquire);
+    }
+    return static_cast<value>(cur) != abandoned;
+  }
+
   /// Block while the state is @c loading.  Returns true iff the load succeeded
   /// (@c ready), false if it failed back to @c prepared or was abandoned.
   [[nodiscard]] bool wait_for_ready() noexcept { return wait_while(loading) == ready; }

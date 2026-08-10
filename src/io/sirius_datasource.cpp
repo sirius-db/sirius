@@ -227,6 +227,12 @@ bool sirius_datasource::prefetch_async(exec::invocable<void(bool) noexcept> on_d
   return _io_ctx->cache()->prefetch(_prefetch_handle, std::move(on_done));
 }
 
+bool sirius_datasource::wait_prefetch_prepared() noexcept
+{
+  if (!_prefetch_handle) { return false; }
+  return _prefetch_handle.wait_until_prepared();
+}
+
 bool sirius_datasource::uses_prefetching_cache() const noexcept
 {
   return _io_ctx->uses_prefetching_cache();
