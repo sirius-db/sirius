@@ -727,7 +727,9 @@ cudf::column const* DecodeWalk::materialize(NodeId nid)
       if (error_out) *error_out = err;
       return nullptr;
     }
-    col = decompress_standalone_representation(rep.get(), stream, mr, error_out);
+    // Freshly reconstructed single-use rep: the consume variant may steal its
+    // channel buffers (str_split skips re-copying chars/offsets).
+    col = decompress_consume_standalone_representation(rep.get(), stream, mr, error_out);
     memo.kept.push_back(std::move(rep));
   }
   if (!col) return nullptr;

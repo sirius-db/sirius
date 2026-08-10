@@ -151,6 +151,14 @@ struct standalone_compressed_representation : compressed_representation {
 
   virtual std::unique_ptr<cudf::column> decompress(rmm::cuda_stream_view stream,
                                                    rmm::device_async_resource_ref mr) const = 0;
+
+  // Like decompress(), but may steal the rep's channel buffers instead of copying them.
+  // Only call on an exclusively-owned, single-use rep (the decode walk's temporaries).
+  virtual std::unique_ptr<cudf::column> decompress_consume(rmm::cuda_stream_view stream,
+                                                           rmm::device_async_resource_ref mr)
+  {
+    return decompress(stream, mr);
+  }
 };
 
 /// Identity / passthrough: stores a column as-is (e.g. keys_chars "stored as-is" in plan).
@@ -381,6 +389,10 @@ struct str_split_compressed_representation : standalone_compressed_representatio
   std::unique_ptr<cudf::column> decompress(rmm::cuda_stream_view stream,
                                            rmm::device_async_resource_ref mr) const override;
 
+  // Moves offsets/chars into the strings column instead of copying them.
+  std::unique_ptr<cudf::column> decompress_consume(rmm::cuda_stream_view stream,
+                                                   rmm::device_async_resource_ref mr) override;
+
   std::vector<std::string> required_channels() const override
   {
     if (channels_.size() > 2 && channels_[2]) return {"null_mask"};
@@ -422,18 +434,41 @@ struct nvcomp_payload_rep : standalone_compressed_representation {
   size_t uncompressed_size = 0;
 
   // Takes ownership of the worst-case-sized device_buffer and wraps it as a
-  // UINT8 column of exactly comp_sz elements (logical size may be < buffer size;
-  // cudf allows that).
+  // single payload channel column. A fixed-width column caps at 2^31 ELEMENTS;
+  // codecs whose payload is self-describing (fsst) pass widen=true and get a
+  // wider element type above the cap (byte codecs must not: their decompress
+  // needs the exact byte count, which a widened column pads to the element
+  // size). The padded tail is written by resize() below, so serialization of a
+  // widened payload never reads past the buffer.
   nvcomp_payload_rep(cudf::data_type t,
                      cudf::size_type n,
                      std::unique_ptr<rmm::device_buffer> data,
                      size_t comp_sz,
-                     size_t uncomp_sz)
-    : standalone_compressed_representation(t, n), uncompressed_size(uncomp_sz)
+                     size_t uncomp_sz,
+                     bool widen = false)
+    : standalone_compressed_representation(t, n),
+      uncompressed_size(uncomp_sz),
+      payload_bytes_(comp_sz)
   {
+    constexpr size_t kElemCap = static_cast<size_t>(std::numeric_limits<cudf::size_type>::max());
+    cudf::type_id tid         = cudf::type_id::UINT8;
+    size_t bpe                = 1;
+    if (comp_sz > kElemCap) {
+      if (!widen) {
+        throw std::runtime_error("payload rep: compressed payload " + std::to_string(comp_sz) +
+                                 "B exceeds the 2^31-element column cap for this codec");
+      }
+      tid = cudf::type_id::UINT32, bpe = 4;
+      if (comp_sz > kElemCap * 4) { tid = cudf::type_id::UINT64, bpe = 8; }
+      if (comp_sz > kElemCap * 8) {
+        throw std::runtime_error("payload rep: compressed payload > 16GB out of scope");
+      }
+    }
+    auto const nelem = (comp_sz + bpe - 1) / bpe;
+    if (data && nelem * bpe > data->size()) { data->resize(nelem * bpe, data->stream()); }
     channels_.push_back(
-      std::make_unique<cudf::column>(cudf::data_type{cudf::type_id::UINT8},
-                                     static_cast<cudf::size_type>(comp_sz),
+      std::make_unique<cudf::column>(cudf::data_type{tid},
+                                     static_cast<cudf::size_type>(nelem),
                                      data ? std::move(*data) : rmm::device_buffer{},
                                      rmm::device_buffer{},
                                      0));
@@ -444,10 +479,10 @@ struct nvcomp_payload_rep : standalone_compressed_representation {
   {
     return (channels_.empty() || !channels_[0]) ? nullptr : channels_[0]->view().head<void>();
   }
-  size_t payload_size() const
-  {
-    return (channels_.empty() || !channels_[0]) ? 0 : static_cast<size_t>(channels_[0]->size());
-  }
+  size_t payload_size() const { return payload_bytes_; }
+
+ private:
+  size_t payload_bytes_ = 0;
 };
 
 // Template base for nvcomp codecs whose leaf metadata is exactly
@@ -645,6 +680,20 @@ struct deflate_compressed_representation
 };
 
 struct snappy_compressor : compressor {
+  std::unique_ptr<compressed_representation> compress(cudf::column_view column_to_compress,
+                                                      rmm::cuda_stream_view stream,
+                                                      rmm::device_async_resource_ref mr) override;
+};
+
+// FSST-GPU (CompactionV5T) string codec. Opaque, self-describing payload — same
+// representation shape as snappy; reconstructed generically via nvcomp_simple_from_outputs.
+struct fsst_compressed_representation : nvcomp_simple_rep_base<OpId::Fsst, leaf_meta::fsst> {
+  using nvcomp_simple_rep_base::nvcomp_simple_rep_base;
+  std::unique_ptr<cudf::column> decompress(rmm::cuda_stream_view stream,
+                                           rmm::device_async_resource_ref mr) const override;
+};
+
+struct fsst_compressor : compressor {
   std::unique_ptr<compressed_representation> compress(cudf::column_view column_to_compress,
                                                       rmm::cuda_stream_view stream,
                                                       rmm::device_async_resource_ref mr) override;
@@ -891,6 +940,14 @@ struct codegen_fused_representation : compressed_representation {
 /// Callers should use this instead of calling rep->decompress() directly.
 std::unique_ptr<cudf::column> decompress_standalone_representation(
   compressed_representation const* rep,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr,
+  std::string* error_out);
+
+/// decompress_consume() variant: may steal the rep's buffers. Only for
+/// exclusively-owned, single-use reps (the decode walk's temporaries).
+std::unique_ptr<cudf::column> decompress_consume_standalone_representation(
+  compressed_representation* rep,
   rmm::cuda_stream_view stream,
   rmm::device_async_resource_ref mr,
   std::string* error_out);

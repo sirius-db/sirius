@@ -100,6 +100,7 @@ enum : std::uint8_t {
   META_SNAPPY   = 5,
   META_LZ4      = 6,
   META_DEFLATE  = 7,
+  META_FSST     = 8,
 };
 
 static void push_meta(std::vector<std::uint8_t>& v, leaf_meta_v const& m)
@@ -151,6 +152,12 @@ static void push_meta(std::vector<std::uint8_t>& v, leaf_meta_v const& m)
       push_le(v, META_DEFLATE);
       push_le(v, d.uncompressed_size);
       push_le(v, d.original_type_id);
+    }
+    void operator()(leaf_meta::fsst const& f)
+    {
+      push_le(v, META_FSST);
+      push_le(v, f.uncompressed_size);
+      push_le(v, f.original_type_id);
     }
   };
   std::visit(Visitor{v}, m);
@@ -210,6 +217,13 @@ static bool read_meta(Reader& r, leaf_meta_v& out)
       std::int32_t ti;
       if (!r.read_le(us) || !r.read_le(ti)) return false;
       out = leaf_meta::deflate{us, ti};
+      return true;
+    }
+    case META_FSST: {
+      std::uint64_t us;
+      std::int32_t ti;
+      if (!r.read_le(us) || !r.read_le(ti)) return false;
+      out = leaf_meta::fsst{us, ti};
       return true;
     }
     default: return false;
@@ -315,15 +329,9 @@ static std::unique_ptr<compressed_representation> rep_from_leaf_desc(
     std::string(cname), names, std::move(cols), stream, mr, err, ld.meta);
 }
 
-// Payload layout identifier. A reader accepts only an exact match (parse_hpln_header),
-// so this must advance whenever the meaning of the serialized bytes changes — including
-// changes that keep every field in place but reinterpret one, which no structural check
-// downstream could catch.
-//
-// 11: a Bitpack "packed" buffer counts its decode gather guard words in num_rows, so the
-//     stored word count is what the reader allocates and the guard needs no read-side
-//     reconstruction (see compact_bitpack_packed).
-static constexpr std::uint8_t kVersion = 11;
+// Payload layout identifier; readers accept only an exact match, so advance it whenever
+// the meaning of the serialized bytes changes.
+static constexpr std::uint8_t kVersion = 12;
 
 // Serialize one node's structure (op, bitjoin params, edges, output names).
 // Other ops carry their params in the op name, so only bitjoin needs attrs.

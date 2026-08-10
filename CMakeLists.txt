@@ -596,10 +596,15 @@ endif()
 # cucascade_static / telemetry_bridge). cucascade upstream PR #126 split
 # topology_discovery into its own static target, and PR #150 split the
 # cudf-coupled code into cucascade_cudf_static — list both here so the export
-# set covers the full dependency chain.
+# set covers the full dependency chain. fsst_gpu is simpatico's PUBLIC dep.
 install(
-  TARGETS sirius_extension cucascade_static cucascade_cudf_static
-          cucascade_topology_discovery_static telemetry_bridge simpatico
+  TARGETS sirius_extension
+          cucascade_static
+          cucascade_cudf_static
+          cucascade_topology_discovery_static
+          telemetry_bridge
+          simpatico
+          fsst_gpu
   EXPORT "${DUCKDB_EXPORT_SET}"
   LIBRARY DESTINATION "${INSTALL_LIB_DIR}"
   ARCHIVE DESTINATION "${INSTALL_LIB_DIR}")

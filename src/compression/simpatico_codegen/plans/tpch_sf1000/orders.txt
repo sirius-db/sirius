@@ -25,11 +25,11 @@ input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
 input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
 
 ---
-# column: o_orderpriority  dtype: str  ratio: 32.310x  depth: 3
-# comp: 181.10 GB/s  decomp: 247.82 GB/s
-input -> dictionary -> keys_offsets, keys_chars, indices
-dictionary.keys_offsets -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
-dictionary.indices -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+# column: o_orderpriority  dtype: str
+# chars -> fsst (FSST-GPU CompactionV5T); offsets -> bitpack
+input -> str_split -> offsets, chars
+str_split.chars -> fsst
+str_split.offsets -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
 
 ---
 # column: o_clerk  dtype: str  ratio: 7.346x  depth: 5

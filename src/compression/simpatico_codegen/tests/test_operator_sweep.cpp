@@ -486,7 +486,8 @@ int run_shard(unsigned shard_idx, unsigned n_shards)
     must_apply("u64", {"delta", "rle", "for", "zigzag", "bitpack", "ans", "bitcomp"});
     must_apply("f32", {"alp", "alp_rd", "for", "bitpack"});
     must_apply("f64", {"alp", "alp_rd", "for", "bitpack"});
-    must_apply("u8_binary", {"delta", "rle", "for", "zigzag", "bitpack"});
+    // fsst takes a byte stream (str_split's chars channel), not a STRING column.
+    must_apply("u8_binary", {"delta", "rle", "for", "zigzag", "bitpack", "fsst"});
     must_apply("date", {"delta", "rle", "for", "zigzag", "bitpack", "ans", "bitcomp"});
   }
 

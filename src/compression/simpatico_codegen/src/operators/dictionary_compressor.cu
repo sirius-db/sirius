@@ -42,8 +42,6 @@ namespace simpatico {
 
 namespace {
 
-constexpr size_t MAX_INDICES = 1 << 28;  // 256M rows (sanity bound)
-
 // cudf::dictionary::encode faults with a context-corrupting illegal access on
 // very large, very-high-cardinality strings — inputs a dictionary can't help
 // anyway. Skip such columns before the full encode, gating on an estimate of
@@ -232,11 +230,11 @@ std::unique_ptr<dictionary_compressed_representation> dictionary_compress_impl(
     throw std::runtime_error("dictionary_compressor: column must be STRING, got '" +
                              type_id_to_name(col.type()) + "'");
   }
+  // No row-count cap beyond size_type's own 2^31-1: the dangerous encode case
+  // (huge, high-cardinality input) is what the sketch guard below rejects. An
+  // earlier 2^28 "sanity bound" made every >256M-row pin batch fall back raw.
   auto const n = col.size();
   if (n < 0) { throw std::runtime_error("dictionary_compressor: column size is negative"); }
-  if (static_cast<size_t>(n) > MAX_INDICES) {
-    throw std::runtime_error("dictionary_compressor: column size exceeds maximum");
-  }
   if (n == 0) {
     auto empty_dict = cudf::make_empty_column(cudf::data_type(cudf::type_id::DICTIONARY32));
     return std::make_unique<dictionary_compressed_representation>(std::move(empty_dict));

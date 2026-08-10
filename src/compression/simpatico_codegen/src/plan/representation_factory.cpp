@@ -28,6 +28,7 @@
 #include <initializer_list>
 #include <memory>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 namespace simpatico {
@@ -100,13 +101,17 @@ std::unique_ptr<rmm::device_buffer> copy_output_payload(
 {
   if (!check_outputs(codec, output_names, outputs, {"output"}, error_out)) return nullptr;
   auto const& payload_col = outputs[0];
-  if (payload_col->type().id() != cudf::type_id::UINT8) {
-    if (error_out) *error_out = std::string(codec) + " 'output' must be UINT8";
+  auto const tid          = payload_col->type().id();
+  // UINT32/UINT64: a widened payload column (see nvcomp_payload_rep) — bytes are
+  // elements x element width.
+  if (tid != cudf::type_id::UINT8 && tid != cudf::type_id::UINT32 && tid != cudf::type_id::UINT64) {
+    if (error_out) *error_out = std::string(codec) + " 'output' must be UINT8/UINT32/UINT64";
     return nullptr;
   }
-  auto const comp = static_cast<std::size_t>(payload_col->size());
-  auto contents   = payload_col->release();
-  auto payload    = std::move(contents.data);
+  auto const comp = static_cast<std::size_t>(payload_col->size()) *
+                    static_cast<std::size_t>(cudf::size_of(payload_col->type()));
+  auto contents = payload_col->release();
+  auto payload  = std::move(contents.data);
   if (out_size) *out_size = comp;
   return payload;
 }
@@ -539,7 +544,10 @@ std::unique_ptr<compressed_representation> nvcomp_simple_from_outputs(
     (uncomp > 0 && cudf::is_fixed_width(orig_type))
       ? static_cast<cudf::size_type>(uncomp / static_cast<size_t>(cudf::size_of(orig_type)))
       : 0;
-  return std::make_unique<RepT>(orig_type, n_rows, std::move(payload), comp, uncomp);
+  // fsst payloads are self-describing, so the padded byte count a widened
+  // (UINT32/UINT64) payload column implies is fine to carry through.
+  constexpr bool widen = std::is_same_v<RepT, fsst_compressed_representation>;
+  return std::make_unique<RepT>(orig_type, n_rows, std::move(payload), comp, uncomp, widen);
 }
 }  // anonymous namespace
 
@@ -600,6 +608,9 @@ std::unique_ptr<compressed_representation> reconstruct_representation(
     case OpId::Snappy:
       return nvcomp_simple_from_outputs<snappy_compressed_representation, leaf_meta::snappy>(
         "snappy", output_names, std::move(outputs), stream, mr, error_out, meta);
+    case OpId::Fsst:
+      return nvcomp_simple_from_outputs<fsst_compressed_representation, leaf_meta::fsst>(
+        "fsst", output_names, std::move(outputs), stream, mr, error_out, meta);
     case OpId::Lz4:
       return nvcomp_simple_from_outputs<lz4_compressed_representation, leaf_meta::lz4>(
         "lz4", output_names, std::move(outputs), stream, mr, error_out, meta);
@@ -643,6 +654,27 @@ std::unique_ptr<cudf::column> decompress_standalone_representation(
     return nullptr;
   }
   return standalone->decompress(stream, mr);
+}
+
+std::unique_ptr<cudf::column> decompress_consume_standalone_representation(
+  compressed_representation* rep,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr,
+  std::string* error_out)
+{
+  if (!rep) {
+    if (error_out) *error_out = "decompress_standalone_representation: null representation";
+    return nullptr;
+  }
+  auto* standalone = dynamic_cast<standalone_compressed_representation*>(rep);
+  if (!standalone) {
+    if (error_out)
+      *error_out = "decompress_standalone_representation: representation of kind " +
+                   std::to_string(static_cast<int>(rep->kind())) +
+                   " is storage-only and requires the PlanTree decode bridge (e.g. DecodeWalk)";
+    return nullptr;
+  }
+  return standalone->decompress_consume(stream, mr);
 }
 
 }  // namespace simpatico

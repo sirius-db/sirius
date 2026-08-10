@@ -66,6 +66,12 @@ struct deflate {
   std::uint64_t uncompressed_size = 0;
   std::int32_t original_type_id   = 0;
 };
+// FSST-GPU: opaque self-describing CompactionV5T payload; only the original type
+// and pre-padding size are needed at decompress time (same shape as snappy).
+struct fsst {
+  std::uint64_t uncompressed_size = 0;
+  std::int32_t original_type_id   = 0;
+};
 
 }  // namespace leaf_meta
 
@@ -76,7 +82,8 @@ using leaf_meta_v = std::variant<leaf_meta::none,
                                  leaf_meta::nvcomp_cascaded,
                                  leaf_meta::snappy,
                                  leaf_meta::lz4,
-                                 leaf_meta::deflate>;
+                                 leaf_meta::deflate,
+                                 leaf_meta::fsst>;
 
 // ---------------------------------------------------------------------------
 // Per-buffer descriptor used by compressed_table::describe() and the IO layer.
