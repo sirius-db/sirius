@@ -71,6 +71,12 @@ struct spill_context {
   /// search's allocation, which otherwise fails under the memory pressure that
   /// caused the spill in the first place.
   std::size_t explore_sample_rows{65536};
+
+  /// Batches smaller than this spill raw. Compression costs a roughly fixed
+  /// amount per batch, so below some size it cannot repay the setup however good
+  /// the ratio. Mirrors output_compression_context::min_batch_bytes; the spill
+  /// path needs its own because it cannot choose its batch sizes.
+  std::size_t min_batch_bytes{64ULL * 1024 * 1024};
 };
 
 /// The calling thread's active spill context, or nullptr when none is installed.
@@ -159,7 +165,8 @@ void set_spill_compression_settings(bool enabled,
                                     std::uint64_t replan_after_uses,
                                     std::uint32_t error_tolerance,
                                     double replan_change_threshold,
-                                    std::size_t explore_sample_rows) noexcept;
+                                    std::size_t explore_sample_rows,
+                                    std::size_t min_batch_bytes) noexcept;
 
 /// Whether spill compression is enabled process-wide *and* not currently
 /// suppressed. This is the predicate the spill path consults.

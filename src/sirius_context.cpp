@@ -583,7 +583,8 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
                                                         comp.spill_replan_after_uses,
                                                         comp.spill_error_tolerance,
                                                         comp.spill_replan_change_threshold,
-                                                        comp.spill_explore_sample_rows);
+                                                        comp.spill_explore_sample_rows,
+                                                        comp.spill_min_batch_bytes);
     sirius::compression::set_output_compression_settings(
       comp.enable_output_compression,
       comp.output_compression_min_ratio,

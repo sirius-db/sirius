@@ -307,6 +307,18 @@ struct compression_config {
   /// two pay different fixed costs and run under different pressure.
   std::size_t output_compression_min_batch_bytes{64ULL * 1024 * 1024};
 
+  /// Smallest batch worth compressing on the spill path.
+  ///
+  /// The same fixed per-batch cost applies here, but the spill path cannot choose
+  /// its batch sizes: they are whatever the operators produced, and shrinking
+  /// operator batch limits to relieve GPU pressure shrinks spill batches with
+  /// them. Measured at SF1000 with 500 MB operator batches, spill batches landed
+  /// around 500 KB and a downgrade request moved 1.06 GB across 79 of them in
+  /// 14.1 s — 71.7 MB/s, against 9,056 MB/s for the same request uncompressed.
+  /// Below this size the setup cost dominates so heavily that compressing is
+  /// worse than spilling raw, however good the ratio.
+  std::size_t spill_min_batch_bytes{64ULL * 1024 * 1024};
+
   /// When true, the downgrade executor may satisfy a request by compressing
   /// batches in place on the device, instead of spilling them to host/disk.
   ///

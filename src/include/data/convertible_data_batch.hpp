@@ -256,6 +256,22 @@ class convertible_data_batch : public convertible_data {
     auto& reg      = compression::plan_register::global();
     const auto ctx = compression::make_spill_context(_source_repo);
 
+    // Too small to repay the encode. The cost per batch is roughly fixed — a
+    // per-column sync to read back data-dependent output sizes, plus staging —
+    // so beneath some size compressing is slower than spilling raw whatever the
+    // ratio. This matters most when operator batch limits are lowered to relieve
+    // GPU pressure, since that shrinks spill batches too: at SF1000 with 500 MB
+    // operator batches, spill batches arrived at ~500 KB and a downgrade request
+    // moved 1.06 GB across 79 of them at 71.7 MB/s, against 9,056 MB/s raw.
+    //
+    // Checked before decide_spill_plan so an undersized batch neither consumes a
+    // plan-register use nor perturbs an edge's verdict: the batch says nothing
+    // about whether that edge's *data* is compressible.
+    if (const auto* data = mut.get_data();
+        data != nullptr && data->get_size_in_bytes() < ctx.min_batch_bytes) {
+      return false;
+    }
+
     // Count this attempt however it turns out. A skipped edge must still
     // accumulate uses, otherwise its entry never expires and the "not worth
     // compressing" verdict would stick for the rest of the query. Runs after

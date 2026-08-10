@@ -2024,7 +2024,8 @@ static void PushSpillCompressionSettings(const sirius::compression_config& cfg)
                                                       cfg.spill_replan_after_uses,
                                                       cfg.spill_error_tolerance,
                                                       cfg.spill_replan_change_threshold,
-                                                      cfg.spill_explore_sample_rows);
+                                                      cfg.spill_explore_sample_rows,
+                                                      cfg.spill_min_batch_bytes);
 }
 
 static void SetCompressionMaxCompressedFraction(ClientContext& context,

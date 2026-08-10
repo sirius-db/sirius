@@ -37,6 +37,7 @@ std::atomic<std::uint64_t> g_replan_after_uses{128};
 std::atomic<std::uint32_t> g_error_tolerance{3};
 std::atomic<double> g_replan_change_threshold{0.20};
 std::atomic<std::size_t> g_explore_sample_rows{65536};
+std::atomic<std::size_t> g_spill_min_batch_bytes{64ULL * 1024 * 1024};
 }  // namespace
 
 const spill_context* current_spill_context() noexcept { return t_current_spill_context; }
@@ -48,7 +49,8 @@ void set_spill_compression_settings(bool enabled,
                                     std::uint64_t replan_after_uses,
                                     std::uint32_t error_tolerance,
                                     double replan_change_threshold,
-                                    std::size_t explore_sample_rows) noexcept
+                                    std::size_t explore_sample_rows,
+                                    std::size_t min_batch_bytes) noexcept
 {
   g_spill_enabled.store(enabled, std::memory_order_relaxed);
   g_explore_beam_width.store(explore_beam_width, std::memory_order_relaxed);
@@ -58,6 +60,7 @@ void set_spill_compression_settings(bool enabled,
   g_error_tolerance.store(error_tolerance, std::memory_order_relaxed);
   g_replan_change_threshold.store(replan_change_threshold, std::memory_order_relaxed);
   g_explore_sample_rows.store(explore_sample_rows, std::memory_order_relaxed);
+  g_spill_min_batch_bytes.store(min_batch_bytes, std::memory_order_relaxed);
 }
 
 bool spill_compression_enabled() noexcept
@@ -87,6 +90,7 @@ spill_context make_spill_context(const cucascade::shared_data_repository* repo) 
     .error_tolerance         = g_error_tolerance.load(std::memory_order_relaxed),
     .replan_change_threshold = g_replan_change_threshold.load(std::memory_order_relaxed),
     .explore_sample_rows     = g_explore_sample_rows.load(std::memory_order_relaxed),
+    .min_batch_bytes         = g_spill_min_batch_bytes.load(std::memory_order_relaxed),
   };
 }
 

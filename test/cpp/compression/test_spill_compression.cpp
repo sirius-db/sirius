@@ -211,6 +211,11 @@ sirius::compression::plan_register::column_plan_state col0_of(
 
 /// Reset spill state: clear every cached plan and enable spill compression with
 /// a small explorer budget (the explore case is the only one that runs it).
+///
+/// min_batch_bytes is 0 so the size gate never fires: these batches are a few KB,
+/// far under the production default, and the cases here exercise the compression
+/// logic rather than the heuristic that decides a batch is too small to bother
+/// with. The gate itself is covered separately.
 void reset_spill_state(bool enabled = true, std::uint64_t replan_after_uses = 0)
 {
   sirius::compression::plan_register::global().clear_all();
@@ -221,7 +226,8 @@ void reset_spill_state(bool enabled = true, std::uint64_t replan_after_uses = 0)
                                                       replan_after_uses,
                                                       /*error_tolerance=*/1,
                                                       /*replan_change_threshold=*/0.20,
-                                                      /*explore_sample_rows=*/0);
+                                                      /*explore_sample_rows=*/0,
+                                                      /*min_batch_bytes=*/0);
 }
 
 /// Create a 1-column INT32 GPU batch with a known pattern [0, 1, 2, ..., n-1].
@@ -556,6 +562,45 @@ TEST_CASE("spill compression: disabled setting spills uncompressed",
   reset_spill_state(false);
 }
 
+TEST_CASE("spill compression: a batch under min_batch_bytes spills uncompressed",
+          "[compression][spill][isolated_context]")
+{
+  if (!has_gpu()) {
+    SUCCEED("No GPU available — skipping spill compression tests");
+    return;
+  }
+
+  auto& e = env();
+  // Everything else is favourable: the feature is on and the edge has a plan that
+  // compresses this data well. Only the size gate should stop it.
+  reset_spill_state();
+  set_plan_1col(&repo_a(), kOneColDsl);
+  sirius::compression::set_spill_compression_settings(/*enabled=*/true,
+                                                      /*explore_beam_width=*/4,
+                                                      /*explore_max_bytes=*/8ull << 20,
+                                                      /*max_compressed_fraction=*/0.95,
+                                                      /*replan_after_uses=*/0,
+                                                      /*error_tolerance=*/1,
+                                                      /*replan_change_threshold=*/0.20,
+                                                      /*explore_sample_rows=*/0,
+                                                      /*min_batch_bytes=*/1ull << 30);
+
+  auto batch = make_int32_gpu_batch(1000);  // ~4 KB, far under the 1 GiB gate
+
+  spill_to(batch, e.host_space, &repo_a());
+  REQUIRE_FALSE(is_compressed_host(*batch));
+  REQUIRE(get_tier(*batch) == cucascade::memory::Tier::HOST);
+
+  // The gate must not be mistaken for a verdict about the edge: an undersized
+  // batch says nothing about whether this edge's data compresses, so the cached
+  // plan has to survive for the larger batches that follow.
+  REQUIRE(sirius::compression::plan_register::global()
+            .decide_spill_plan(&repo_a(), /*replan_after_uses=*/0)
+            .verdict != sirius::compression::plan_register::spill_plan_verdict::skip);
+
+  reset_spill_state(false);
+}
+
 TEST_CASE("spill compression: batch with no source edge spills uncompressed",
           "[compression][spill][isolated_context]")
 {
@@ -658,7 +703,8 @@ TEST_CASE("spill compression: poor compression ratio falls back to uncompressed"
                                                       /*replan_after_uses=*/0,
                                                       /*error_tolerance=*/1,
                                                       /*replan_change_threshold=*/0.20,
-                                                      /*explore_sample_rows=*/0);
+                                                      /*explore_sample_rows=*/0,
+                                                      /*min_batch_bytes=*/0);
   // A plan whose output is the same width as its input cannot reach 0.75.
   set_plan_1col(&repo_a(), kNonCompressingDsl);
 
@@ -691,7 +737,8 @@ TEST_CASE("spill compression: one incompressible column does not disable its nei
                                                       /*replan_after_uses=*/0,
                                                       /*error_tolerance=*/1,
                                                       /*replan_change_threshold=*/0.20,
-                                                      /*explore_sample_rows=*/0);
+                                                      /*explore_sample_rows=*/0,
+                                                      /*min_batch_bytes=*/0);
 
   // Two identical columns: one bitpacks well, the other is given a plan that
   // cannot shrink it. Same data, so the outcome difference is purely the plan.
@@ -743,7 +790,8 @@ TEST_CASE("spill compression: a rejected edge is marked and later batches skip c
                                                       /*replan_after_uses=*/0,
                                                       /*error_tolerance=*/1,
                                                       /*replan_change_threshold=*/0.20,
-                                                      /*explore_sample_rows=*/0);  // never expire
+                                                      /*explore_sample_rows=*/0,
+                                                      /*min_batch_bytes=*/0);  // never expire
   set_plan_1col(&repo_a(), kNonCompressingDsl);
 
   // First batch: compression runs, misses the threshold, and the edge is marked.
@@ -786,7 +834,8 @@ TEST_CASE("spill compression: an unviable edge is re-explored once its entry exp
                                                       /*replan_after_uses=*/1,
                                                       /*error_tolerance=*/1,
                                                       /*replan_change_threshold=*/0.20,
-                                                      /*explore_sample_rows=*/0);
+                                                      /*explore_sample_rows=*/0,
+                                                      /*min_batch_bytes=*/0);
   set_plan_1col(&repo_a(), kNonCompressingDsl);
 
   // First batch: rejected, edge marked unviable, one use recorded.
