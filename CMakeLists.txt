@@ -697,6 +697,7 @@ set(TEST_SOURCES
     test/cpp/integration/test_pin_table_zone_map_pruning.cpp
     test/cpp/integration/test_table_gpu_cache_warm_mgpu.cpp
     test/cpp/integration/test_transparent_runtime_fallback.cpp
+    test/cpp/io/cache/test_chunk_state.cpp
     test/cpp/io/cache/test_stage_machines.cpp
     test/cpp/io/kvikio/test_kvikio_remote.cpp
     test/cpp/io/s3/test_sigv4.cpp
@@ -913,6 +914,81 @@ target_link_options(parquet_benchmark PRIVATE
 
 set_target_properties(
   parquet_benchmark
+  PROPERTIES CXX_STANDARD 20
+             CXX_STANDARD_REQUIRED ON
+             RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/test/io")
+
+# -----------------------------------------------------------------------------
+# test/io/prefetch_benchmark — plain read_parquet vs. prefetch-then-read
+# -----------------------------------------------------------------------------
+add_executable(prefetch_benchmark test/io/prefetch_benchmark.cpp)
+
+if(VCPKG_BUILD)
+  set_target_properties(prefetch_benchmark PROPERTIES NO_SYSTEM_FROM_IMPORTED
+                                                      ON)
+  target_include_directories(prefetch_benchmark BEFORE PRIVATE ${_VCPKG_INC})
+endif()
+
+target_include_directories(
+  prefetch_benchmark
+  PRIVATE $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include>)
+
+target_link_libraries(
+  prefetch_benchmark
+  sirius_extension
+  duckdb_static
+  cudf::cudf
+  rmm::rmm
+  spdlog::spdlog
+  cuCascade::cucascade
+  cuCascade::cucascade_cudf
+  PkgConfig::LIBURING
+  PkgConfig::NUMA)
+link_extension_libraries(prefetch_benchmark "")
+
+target_link_options(prefetch_benchmark PRIVATE
+                    "LINKER:--allow-multiple-definition")
+
+set_target_properties(
+  prefetch_benchmark
+  PROPERTIES CXX_STANDARD 20
+             CXX_STANDARD_REQUIRED ON
+             RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/test/io")
+
+# -----------------------------------------------------------------------------
+# test/io/range_prefetch_benchmark — raw byte-range reads, no parquet decoding
+# -----------------------------------------------------------------------------
+add_executable(range_prefetch_benchmark test/io/range_prefetch_benchmark.cpp)
+
+if(VCPKG_BUILD)
+  set_target_properties(range_prefetch_benchmark
+                        PROPERTIES NO_SYSTEM_FROM_IMPORTED ON)
+  target_include_directories(range_prefetch_benchmark BEFORE
+                             PRIVATE ${_VCPKG_INC})
+endif()
+
+target_include_directories(
+  range_prefetch_benchmark
+  PRIVATE $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include>)
+
+target_link_libraries(
+  range_prefetch_benchmark
+  sirius_extension
+  duckdb_static
+  cudf::cudf
+  rmm::rmm
+  spdlog::spdlog
+  cuCascade::cucascade
+  cuCascade::cucascade_cudf
+  PkgConfig::LIBURING
+  PkgConfig::NUMA)
+link_extension_libraries(range_prefetch_benchmark "")
+
+target_link_options(range_prefetch_benchmark PRIVATE
+                    "LINKER:--allow-multiple-definition")
+
+set_target_properties(
+  range_prefetch_benchmark
   PROPERTIES CXX_STANDARD 20
              CXX_STANDARD_REQUIRED ON
              RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/test/io")

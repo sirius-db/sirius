@@ -399,7 +399,6 @@ TEST_CASE("prepared requires every chunk to own a buffer", "[stage][cache]")
 {
   using sirius::io::cache::all_chunks_have_buffers;
   using sirius::io::cache::cached_chunk;
-  using sirius::io::cache::entry_state;
 
   auto first  = std::make_unique<cached_chunk>(0);
   auto second = std::make_unique<cached_chunk>(4096);

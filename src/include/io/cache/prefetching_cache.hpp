@@ -52,13 +52,14 @@ class memory_reservation_manager;
 namespace sirius::io::cache {
 
 /// True when every chunk of @p chunks owns a staging buffer, i.e. its
-/// @c entry_state has reached @c allocated and has not been reclaimed since.
-/// This is the precondition of the producer's @c prepared stage.
+/// @c chunk_state has reached @c allocated and has not been reclaimed since.
+/// This is the precondition of the producer's @c prepared stage.  One relaxed
+/// load per chunk, so the sweep is cheap enough not to need a summary counter.
 [[nodiscard]] inline bool all_chunks_have_buffers(const std::vector<cached_chunk*>& chunks) noexcept
 {
   return std::ranges::all_of(chunks, [](const cached_chunk* c) {
     auto const s = c->state.get_state();
-    return s >= entry_state::allocated && s != entry_state::evicting;
+    return s >= chunk_state::allocated && s != chunk_state::evicting;
   });
 }
 
@@ -200,17 +201,31 @@ class prefetching_cache {
     const io_object& obj, size_t offset, size_t size, uint8_t* dst, prefetching_handle* out_handle);
 
   struct file_entry {
-    std::vector<cached_chunk*> update_and_get_chunks(std::span<size_t> incoming, uint32_t ticker);
+    /// Materialise a chunk for every offset in @p incoming, fold the matching
+    /// entry of @p desired into its populated extent, and count the calling
+    /// request as a subscriber of each.  Returns the chunks in @p incoming
+    /// order.  @p desired runs index-parallel to @p incoming.
+    std::vector<cached_chunk*> update_and_get_chunks(std::span<const size_t> incoming,
+                                                     std::span<const chunk_fill> desired);
 
     std::vector<cached_chunk*> fetch_chunks(std::size_t offset,
                                             std::size_t size,
-                                            coverage_policy policy,
-                                            std::size_t chunk_size) const;
+                                            coverage_policy policy) const;
+
+    /// Slot index covering byte @p off.  Callers must bounds-check against
+    /// @c slots.size() — a read past EOF has no slot.
+    [[nodiscard]] std::size_t slot_of(std::size_t off) const noexcept { return off / chunk_size; }
 
     mutable std::shared_mutex mtx;
     std::shared_ptr<const io_object> io_obj;
-    std::vector<std::unique_ptr<cached_chunk>> chunks;
+    /// Direct-mapped: slot i covers [i * chunk_size, (i + 1) * chunk_size);
+    /// nullptr means that chunk has never been materialised.  Sized once at
+    /// creation — exactly the capacity the old sorted vector reserved — so a
+    /// lookup is an index instead of a search.
+    std::vector<cached_chunk*> slots;
+    chunk_arena arena;  ///< owns the chunks `slots` points at; append-only
     size_t file_size{0};
+    size_t chunk_size{1};
   };
 
   /// Pop every request still sitting in @p queue and retire its producer on
