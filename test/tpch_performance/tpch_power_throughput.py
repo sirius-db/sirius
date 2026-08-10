@@ -584,6 +584,16 @@ def power_run(con, args, run_dir, writer):
         counts_base = table_counts(cpu)
         log(f"Base counts: {counts_base}")
 
+        if args.warmup_pass:
+            # The clean pass doubles as the first pass over freshly pinned,
+            # freshly decompressed data, so it absorbs first-touch and JIT
+            # costs -- which land on whichever queries happen to run early and
+            # show up as bogus negative delta overhead. Burn one discarded pass
+            # so `clean` is a warm baseline and postRF1 - clean is really RF1.
+            log("=== Power: warm-up pass (discarded; not timed, not in any metric) ===")
+            for _q, statements in plan:
+                timed_query(gpu, statements, args.query_timeout)
+
         t_clean = {}
         if args.baseline_pass:
             log("=== Power: clean pass (pre-refresh baseline; not in Power@Size) ===")
@@ -886,6 +896,8 @@ def write_run_info(run_dir, args, streams):
         f"vary_predicates: {args.vary_predicates}",
         f"query_dir: {args.query_dir if args.vary_predicates else '(fixed)'}",
         f"validation: {args.validation}",
+        f"baseline_pass: {args.baseline_pass}",
+        f"warmup_pass: {args.warmup_pass}",
         f"config: {os.environ.get('SIRIUS_CONFIG_FILE', '(default)')}",
     ]
     with open(os.path.join(run_dir, "run_info.txt"), "w") as f:
@@ -993,6 +1005,13 @@ def parse_args():
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Run a clean pre-RF1 pass (timed, not in metric) to isolate delta/mask cost",
+    )
+    p.add_argument(
+        "--warmup-pass",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Burn one discarded pass before the clean pass so first-touch and "
+        "JIT cost do not land in the clean baseline and corrupt delta overhead",
     )
     p.add_argument(
         "--keep-scratch-db",
