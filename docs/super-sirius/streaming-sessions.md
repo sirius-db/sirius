@@ -112,7 +112,7 @@ headers keep only the tokens.
 ### Error semantics P1–P4 (`fail`)
 
 Failure is stream-wide (no sender identity) and waits for nobody. P1–P4 are the `fail()` details;
-S2 is the stream-level name for “poison wakes / dominates”.
+S2 is the stream-level name for "poison wakes / dominates".
 
 - **P1 — immediate visibility.** `pending_error()` returns it as soon as `fail()` returns.
 - **P2 — first failure wins.** Later failures and clean closes never displace the original cause.

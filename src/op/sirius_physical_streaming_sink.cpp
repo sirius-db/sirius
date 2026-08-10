@@ -141,7 +141,8 @@ void sirius_physical_streaming_sink::sink(const operator_data& input_data,
       }
       if (!_outputs[0]->push(batches[b])) {
         SIRIUS_LOG_WARN(
-          "sirius_physical_streaming_sink: broadcast batch refused after end-of-stream and dropped");
+          "sirius_physical_streaming_sink: broadcast batch refused after end-of-stream and "
+          "dropped");
       }
     }
     return;

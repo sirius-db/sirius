@@ -48,11 +48,11 @@ cudf::data_type derive_key_cast_type(const sirius::logical_type& t)
   switch (t.id()) {
     case sirius::type_id::TINYINT:
     case sirius::type_id::SMALLINT:
-    case sirius::type_id::INTEGER:  return cudf::data_type{cudf::type_id::INT64};
+    case sirius::type_id::INTEGER: return cudf::data_type{cudf::type_id::INT64};
     case sirius::type_id::BIGINT:
     case sirius::type_id::BOOLEAN:
-    case sirius::type_id::VARCHAR:  return cudf::data_type{cudf::type_id::EMPTY};
-    case sirius::type_id::DECIMAL:  return cudf::data_type{cudf::type_id::FLOAT64};
+    case sirius::type_id::VARCHAR: return cudf::data_type{cudf::type_id::EMPTY};
+    case sirius::type_id::DECIMAL: return cudf::data_type{cudf::type_id::FLOAT64};
     default:
       throw sirius::invalid_input_exception(
         "streaming_fragment: unsupported partition key type — only integer, boolean, varchar, and "
@@ -63,7 +63,7 @@ cudf::data_type derive_key_cast_type(const sirius::logical_type& t)
 // Fill partition_spec::key_cast_types when the caller left it empty.
 // No-op when the caller supplied their own cast types.
 void normalize_key_cast_types(op::partition_spec& spec,
-                               const duckdb::vector<sirius::logical_type>& output_types)
+                              const duckdb::vector<sirius::logical_type>& output_types)
 {
   if (!spec.key_cast_types.empty()) { return; }
   spec.key_cast_types.reserve(spec.key_columns.size());
@@ -204,8 +204,7 @@ void streaming_fragment::run()
 const duckdb::vector<sirius::logical_type>& streaming_fragment::sink_types() const
 {
   if (!_built) {
-    throw sirius::invalid_input_exception(
-      "streaming_fragment: sink_types() called before build()");
+    throw sirius::invalid_input_exception("streaming_fragment: sink_types() called before build()");
   }
   return _sink_types;
 }

@@ -35,16 +35,16 @@
 #include "duckdb/parser/statement/relation_statement.hpp"  // duckdb::RelationStatement
 #include "duckdb/planner/planner.hpp"                      // duckdb::Planner
 #include "exec/stream_bind_catalog.hpp"                    // sirius::exec::stream_bind_catalog
-#include "exec/stream_plan_bindings.hpp"   // sirius::exec::register_stream_source_function
-#include "exec/streaming_fragment.hpp"     // sirius::exec::streaming_fragment, fragment_spec
-#include "from_substrait.hpp"              // duckdb::SubstraitToDuckDB
-#include "helper/type_conversions.hpp"     // sirius::from_duckdb
+#include "exec/stream_plan_bindings.hpp"  // sirius::exec::register_stream_source_function
+#include "exec/streaming_fragment.hpp"    // sirius::exec::streaming_fragment, fragment_spec
+#include "from_substrait.hpp"             // duckdb::SubstraitToDuckDB
+#include "helper/type_conversions.hpp"    // sirius::from_duckdb
 #include "planner/sirius_physical_plan_generator.hpp"  // sirius::planner::sirius_physical_plan_generator
 #include "sirius_config.hpp"                           // sirius::sirius_config
 #include "sirius_context.hpp"                          // duckdb::SiriusContext
 #include "sirius_interface.hpp"  // sirius::sirius_interface, sirius::sirius_prepared_statement_data
 
-#include <cstdlib>   // std::getenv
+#include <cstdlib>  // std::getenv
 #include <map>
 #include <set>
 
@@ -52,20 +52,17 @@ namespace sirius::ffi {
 
 namespace {
 
-constexpr const char* kSiriusStateKey  = "sirius_state";
-constexpr const char* kQueryLabel      = "sirius_ffi";
+constexpr const char* kSiriusStateKey   = "sirius_state";
+constexpr const char* kQueryLabel       = "sirius_ffi";
 constexpr duckdb::idx_t kArrowBatchSize = 1u << 20;
 
 // DuckDB view name a plan uses to read input stream `id`.
-std::string stream_view_name_of(std::uint64_t id)
-{
-  return "sirius_stream_" + std::to_string(id);
-}
+std::string stream_view_name_of(std::uint64_t id) { return "sirius_stream_" + std::to_string(id); }
 
 // Lower a Substrait plan to a bound+optimized DuckDB LogicalOperator.
 struct lowered_plan {
   duckdb::shared_ptr<duckdb::PreparedStatementData> prepared;
-  duckdb::unique_ptr<duckdb::LogicalOperator>        plan;
+  duckdb::unique_ptr<duckdb::LogicalOperator> plan;
 };
 
 lowered_plan lower_substrait(duckdb::Connection& conn, const std::string& substrait_plan)
@@ -78,8 +75,8 @@ lowered_plan lower_substrait(duckdb::Connection& conn, const std::string& substr
   duckdb::Planner planner(client);
   planner.CreatePlan(duckdb::make_uniq<duckdb::RelationStatement>(relation));
 
-  auto prepared    = duckdb::make_shared_ptr<duckdb::PreparedStatementData>(
-    duckdb::StatementType::SELECT_STATEMENT);
+  auto prepared =
+    duckdb::make_shared_ptr<duckdb::PreparedStatementData>(duckdb::StatementType::SELECT_STATEMENT);
   prepared->names     = planner.names;
   prepared->types     = planner.types;
   prepared->value_map = std::move(planner.value_map);
@@ -277,9 +274,9 @@ struct Fragment::Impl {
   // Result fragment (no output streams): plan + result stored separately.
   std::map<sirius::exec::stream_id_t, std::shared_ptr<cucascade::shared_data_repository>>
     result_input_repos;
-  sirius::exec::stream_session                                        result_session;
-  duckdb::shared_ptr<sirius::sirius_prepared_statement_data>          result_plan;
-  duckdb::unique_ptr<duckdb::QueryResult>                             result;
+  sirius::exec::stream_session result_session;
+  duckdb::shared_ptr<sirius::sirius_prepared_statement_data> result_plan;
+  duckdb::unique_ptr<duckdb::QueryResult> result;
 
   bool built{false};
   bool ran{false};
@@ -312,8 +309,8 @@ struct Fragment::Impl {
       spec.names = declared.names;
       spec.types.reserve(declared.type_names.size());
       for (const auto& type_name : declared.type_names) {
-        spec.types.push_back(sirius::from_duckdb(
-          duckdb::TransformStringToLogicalType(type_name, *ctx.conn->context)));
+        spec.types.push_back(
+          sirius::from_duckdb(duckdb::TransformStringToLogicalType(type_name, *ctx.conn->context)));
       }
       spec.expected_senders = declared.expected_senders;
       if (spec.expected_senders.empty()) { spec.expected_senders.insert(0); }
@@ -324,7 +321,7 @@ struct Fragment::Impl {
 
   // Populate the bind catalog so DuckDB can bind a view of each declared input stream.
   // Result fragments keep the repositories here; streaming fragments let streaming_fragment
-  // re-declare with its own repos and these are dropped unused.
+  // redeclare with its own repos and these are dropped unused.
   void declare_streams(
     const std::map<sirius::exec::stream_id_t, sirius::exec::stream_input_spec>& resolved)
   {
@@ -333,10 +330,9 @@ struct Fragment::Impl {
     for (const auto& [id, spec] : resolved) {
       auto repository = std::make_shared<cucascade::shared_data_repository>();
       if (is_result()) { result_input_repos[id] = repository; }
-      catalog.declare(
-        id,
-        sirius::exec::stream_input_binding{spec.names, spec.types, repository,
-                                           spec.expected_senders, nullptr});
+      catalog.declare(id,
+                      sirius::exec::stream_input_binding{
+                        spec.names, spec.types, repository, spec.expected_senders, nullptr});
     }
   }
 
@@ -346,7 +342,7 @@ struct Fragment::Impl {
   {
     for (const auto& [id, _] : inputs) {
       const auto view_name = stream_view_name_of(id);
-      const auto sql = "CREATE OR REPLACE VIEW main." + view_name + " AS SELECT * FROM " +
+      const auto sql       = "CREATE OR REPLACE VIEW main." + view_name + " AS SELECT * FROM " +
                        std::string(sirius::exec::kStreamSourceFunctionName) + "(" +
                        std::to_string(id) + ")";
       auto res = ctx.conn->Query(sql);
@@ -434,8 +430,8 @@ void Fragment::build(const std::string& substrait_plan)
   impl_->transaction_open = true;
   std::map<sirius::exec::stream_id_t, sirius::exec::stream_input_spec> resolved;
   try {
-    resolved                  = impl_->resolve_inputs();
-    impl_->resolved_inputs    = resolved;
+    resolved               = impl_->resolve_inputs();
+    impl_->resolved_inputs = resolved;
     impl_->declare_streams(resolved);
     impl_->create_stream_views();
     impl_->ctx.conn->Commit();
@@ -446,7 +442,7 @@ void Fragment::build(const std::string& substrait_plan)
   }
 
   // Open lifecycle (StandaloneQueryScope acquires the slot and begins the window).
-  auto& client = *impl_->ctx.conn->context;
+  auto& client     = *impl_->ctx.conn->context;
   impl_->lifecycle = std::make_unique<duckdb::SiriusContext::StandaloneQueryScope>(
     *impl_->ctx.context, client, kQueryLabel);
 
@@ -482,8 +478,8 @@ void Fragment::build(const std::string& substrait_plan)
       } else if (!impl_->hash_key_columns.empty() && impl_->outputs.size() > 1) {
         // key_cast_types left empty; streaming_fragment::build() derives them from output types.
         sirius::op::partition_spec hash;
-        hash.mode        = sirius::op::partition_mode::hash;
-        hash.key_columns = impl_->hash_key_columns;
+        hash.mode         = sirius::op::partition_mode::hash;
+        hash.key_columns  = impl_->hash_key_columns;
         spec.partitioning = std::move(hash);
       }
 
@@ -532,9 +528,9 @@ std::size_t Fragment::relay_from(Fragment& source,
   std::size_t moved = 0;
   while (auto batch = source.impl_->session().pull(source_stream_id)) {
     if (!impl_->session().push(input_stream_id, *batch)) {
-      throw sirius::invalid_input_exception(
-        "Fragment: input stream " + std::to_string(input_stream_id) +
-        " refused a batch; it had already ended");
+      throw sirius::invalid_input_exception("Fragment: input stream " +
+                                            std::to_string(input_stream_id) +
+                                            " refused a batch; it had already ended");
     }
     ++moved;
   }
@@ -561,9 +557,11 @@ void Fragment::run()
     if (impl_->is_result()) {
       auto& client = *impl_->ctx.conn->context;
       sirius::sirius_interface iface(client, std::optional<std::string>(kQueryLabel));
-      impl_->result = iface.sirius_execute_query(
-        client, kQueryLabel, impl_->result_plan, duckdb::PendingQueryParameters{},
-        impl_->lifecycle->query_id());
+      impl_->result = iface.sirius_execute_query(client,
+                                                 kQueryLabel,
+                                                 impl_->result_plan,
+                                                 duckdb::PendingQueryParameters{},
+                                                 impl_->lifecycle->query_id());
     } else {
       impl_->fragment->run();
     }
@@ -584,8 +582,7 @@ void Fragment::result_to_arrow(std::uintptr_t out_stream_addr)
       "Fragment: result_to_arrow() is only valid on a fragment with no output streams");
   }
   if (!impl_->ran || !impl_->result) {
-    throw sirius::invalid_input_exception(
-      "Fragment: run() must complete before result_to_arrow()");
+    throw sirius::invalid_input_exception("Fragment: run() must complete before result_to_arrow()");
   }
   auto* wrapper =
     new duckdb::ResultArrowArrayStreamWrapper(std::move(impl_->result), kArrowBatchSize);
