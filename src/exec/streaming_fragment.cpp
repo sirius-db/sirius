@@ -148,6 +148,7 @@ void streaming_fragment::build(sirius::query_id_t query_id)
   // STREAMING_SINK is a normal unary: subtree in children[] (unlike RESULT_COLLECTOR).
   auto types       = subtree->types;
   auto cardinality = subtree->estimated_cardinality;
+  _sink_types      = types;  // snapshot before types is moved into the sink constructor
 
   std::vector<std::shared_ptr<cucascade::shared_data_repository>> sink_repos;
   sink_repos.reserve(_spec.outputs.size());
@@ -198,6 +199,15 @@ void streaming_fragment::run()
   // Shared query window (don't open a second StandaloneQueryScope): a new window resets
   // task_creator / scan manager that build() populated → zero tasks, empty output, no error.
   _engine->execute();
+}
+
+const duckdb::vector<sirius::logical_type>& streaming_fragment::sink_types() const
+{
+  if (!_built) {
+    throw sirius::invalid_input_exception(
+      "streaming_fragment: sink_types() called before build()");
+  }
+  return _sink_types;
 }
 
 const std::shared_ptr<cucascade::shared_data_repository>& streaming_fragment::input_repository(

@@ -91,6 +91,11 @@ class streaming_fragment {
 
   [[nodiscard]] sirius::sirius_engine& engine() { return *_engine; }
 
+  /// Physical output column types of the plan root (set during build()).
+  /// Used by relay steps to validate schema agreement before any data moves.
+  /// @throws sirius::invalid_input_exception when build() has not run.
+  [[nodiscard]] const duckdb::vector<sirius::logical_type>& sink_types() const;
+
   /// @throws sirius::invalid_input_exception when `id` is not a declared input stream.
   [[nodiscard]] const std::shared_ptr<cucascade::shared_data_repository>& input_repository(
     stream_id_t id) const;
@@ -112,6 +117,7 @@ class streaming_fragment {
   stream_session _session;
 
   bool _built{false};
+  duckdb::vector<sirius::logical_type> _sink_types;
 };
 
 }  // namespace sirius::exec

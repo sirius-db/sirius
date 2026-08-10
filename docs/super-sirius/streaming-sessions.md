@@ -405,6 +405,11 @@ groups are silently split. Rules:
 
 Callers that supply their own `key_cast_types` bypass normalization.
 
+**`sink_types()` exposes the plan root's output column types** (set during `build()`; throws if
+called before `build()`). Relay steps use this to validate schema agreement — column count and
+type-id must match the target fragment's declared input types — before pulling any batches.
+Without this check, a misrouted relay silently corrupts downstream cuDF operations.
+
 **`stream_bind_catalog` bridges bind time and plan time.** DuckDB's table-function bind runs
 long before physical planning. The catalog is registered as a `ClientContextState` so
 `sirius_stream_source(id)` can resolve a schema at bind time; the physical plan generator
