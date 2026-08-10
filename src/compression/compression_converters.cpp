@@ -33,6 +33,11 @@
 #include <cuda_runtime.h>
 #include <nvtx3/nvtx3.hpp>
 
+#include <fcntl.h>
+#include <sys/uio.h>
+#include <unistd.h>
+
+#include <absl/cleanup/cleanup.h>
 #include <api/compressed_table_io.hpp>
 #include <api/simpatico_codegen.hpp>
 #include <codegen/util/stream_pool.hpp>
@@ -43,8 +48,10 @@
 #include <log/logging.hpp>
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cstddef>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <optional>
@@ -553,19 +560,71 @@ const cucascade::memory::memory_space* resolve_target_space(
   return &source.get_memory_space();
 }
 
+// Drain an iovec batch, tolerating short writes.
+//
+// writev is permitted to write fewer bytes than requested, so the caller cannot
+// treat one call as one batch. Advance past whole entries the kernel consumed and
+// re-issue the remainder, trimming the first partially-written entry in place.
+void writev_all(int fd, iovec* iov, std::size_t count, const std::string& path)
+{
+  while (count > 0) {
+    const ssize_t n = ::writev(fd, iov, static_cast<int>(count));
+    if (n < 0) {
+      if (errno == EINTR) { continue; }
+      throw std::runtime_error("[compression_converters] writev failed on " + path + ": " +
+                               std::strerror(errno));
+    }
+    auto remaining = static_cast<std::size_t>(n);
+    while (count > 0 && remaining >= iov->iov_len) {
+      remaining -= iov->iov_len;
+      ++iov;
+      --count;
+    }
+    if (count > 0 && remaining > 0) {
+      iov->iov_base = static_cast<std::byte*>(iov->iov_base) + remaining;
+      iov->iov_len -= remaining;
+    }
+  }
+}
+
 // Write a .hpln file: the structural header followed by the payload bytes.
 // This is exactly the on-disk layout build_compressed_table_header produces, so
 // a pinned blob (header + payload) can be flushed verbatim with no re-compression.
+//
+// The payload is a list of fixed-size blocks from the pinned host pool, not one
+// contiguous region, so it is gathered with writev rather than a write per block:
+// at a 1 MiB block size a multi-GB batch would otherwise cost thousands of
+// syscalls. Batches are capped at IOV_MAX entries, which writev rejects beyond.
 void write_hpln_file(
   const std::string& path,
   std::span<const std::uint8_t> header,
   const cucascade::memory::fixed_size_host_memory_resource::multiple_blocks_allocation& payload,
   std::uint64_t payload_bytes)
 {
-  std::ofstream out(path, std::ios::binary | std::ios::trunc);
-  if (!out) { throw std::runtime_error("[compression_converters] cannot open for write: " + path); }
-  out.write(reinterpret_cast<const char*>(header.data()),
-            static_cast<std::streamsize>(header.size()));
+  const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  if (fd < 0) {
+    throw std::runtime_error("[compression_converters] cannot open for write: " + path + ": " +
+                             std::strerror(errno));
+  }
+  absl::Cleanup close_fd = [fd] { ::close(fd); };
+
+  static constexpr std::size_t kMaxIov = 1024;  // conservative floor for IOV_MAX
+  std::vector<iovec> iov;
+  iov.reserve(kMaxIov);
+
+  auto flush = [&] {
+    if (!iov.empty()) {
+      writev_all(fd, iov.data(), iov.size(), path);
+      iov.clear();
+    }
+  };
+  auto push = [&](const void* base, std::size_t len) {
+    if (len == 0) { return; }
+    iov.push_back(iovec{const_cast<void*>(base), len});
+    if (iov.size() == kMaxIov) { flush(); }
+  };
+
+  push(header.data(), header.size());
 
   const std::size_t bs  = payload.block_size();
   std::uint64_t written = 0;
@@ -574,12 +633,10 @@ void write_hpln_file(
     const std::size_t off = static_cast<std::size_t>(written % bs);
     const std::size_t chunk =
       static_cast<std::size_t>(std::min<std::uint64_t>(payload_bytes - written, bs - off));
-    out.write(reinterpret_cast<const char*>(payload.at(idx).data() + off),
-              static_cast<std::streamsize>(chunk));
+    push(payload.at(idx).data() + off, chunk);
     written += chunk;
   }
-  out.close();
-  if (!out) { throw std::runtime_error("[compression_converters] write failed: " + path); }
+  flush();
 }
 
 // gpu_table_representation → compressed_host_representation (compress on spill).
