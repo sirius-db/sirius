@@ -194,15 +194,15 @@ TEST_CASE("Sirius configuration rejects invalid downgrade hysteresis", "[sirius]
   for (auto const& invalid : cases) {
     INFO("fixture=" << invalid.fixture << " surface=" << invalid.scope);
     std::source_location loc = std::source_location::current();
-    auto const path = fs::path(loc.file_name()).parent_path() / "data" / invalid.fixture;
+    auto const path          = fs::path(loc.file_name()).parent_path() / "data" / invalid.fixture;
     REQUIRE(fs::is_regular_file(path));
 
     sirius::sirius_config config;
-    REQUIRE_THROWS_WITH(
-      config.load_from_file(path),
-      Catch::Contains(invalid.scope) && Catch::Contains("downgrade_stop_fraction") &&
-        Catch::Contains("greater than zero") &&
-        Catch::Contains("less than downgrade_trigger_fraction"));
+    REQUIRE_THROWS_WITH(config.load_from_file(path),
+                        Catch::Contains(invalid.scope) &&
+                          Catch::Contains("downgrade_stop_fraction") &&
+                          Catch::Contains("greater than zero") &&
+                          Catch::Contains("less than downgrade_trigger_fraction"));
   }
 }
 
@@ -210,11 +210,11 @@ TEST_CASE("Sirius downgrade hysteresis accepts omitted, null, and one-sided defa
           "[sirius][config]")
 {
   std::source_location loc = std::source_location::current();
-  auto const data_dir = fs::path(loc.file_name()).parent_path() / "data";
-  const char* fixtures[] = {"valid_memory_downgrade_omitted.yaml",
-                            "valid_memory_downgrade_partial_defaults.yaml",
-                            "valid_space_downgrade_omitted.yaml",
-                            "valid_space_downgrade_partial_defaults.yaml"};
+  auto const data_dir      = fs::path(loc.file_name()).parent_path() / "data";
+  const char* fixtures[]   = {"valid_memory_downgrade_omitted.yaml",
+                              "valid_memory_downgrade_partial_defaults.yaml",
+                              "valid_space_downgrade_omitted.yaml",
+                              "valid_space_downgrade_partial_defaults.yaml"};
 
   for (auto const* fixture : fixtures) {
     INFO("fixture=" << fixture);
