@@ -540,8 +540,7 @@ TEST_CASE("yaml reader optional_node", "[config_opt][optional_node]")
   REQUIRE_FALSE(missing.has_value());
 }
 
-TEST_CASE("yaml reader has_value distinguishes null from scalar values",
-          "[config_opt][has_value]")
+TEST_CASE("yaml reader has_value distinguishes null from scalar values", "[config_opt][has_value]")
 {
   struct test_case {
     const char* yaml;

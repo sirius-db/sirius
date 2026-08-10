@@ -232,8 +232,7 @@ TEST_CASE("operator batch defaults use an explicit high-level GPU usage fraction
   sirius::sirius_config config;
   config.load_from_file(config_fixture("minimal.yaml"));
 
-  require_shared_operator_defaults(config.get_operator_params(),
-                                   expected_effective_batch(config));
+  require_shared_operator_defaults(config.get_operator_params(), expected_effective_batch(config));
 }
 
 TEST_CASE("explicit operator batch values override effective-capacity defaults",
@@ -243,7 +242,7 @@ TEST_CASE("explicit operator batch values override effective-capacity defaults",
   config.load_from_file(config_fixture("effective_operator_defaults_explicit.yaml"));
 
   constexpr uint64_t mib = 1024ULL * 1024;
-  auto const& params      = config.get_operator_params();
+  auto const& params     = config.get_operator_params();
   REQUIRE(params.scan_task_batch_size == 1 * mib);
   REQUIRE(params.hash_partition_bytes == 2 * mib);
   REQUIRE(params.concat_batch_bytes == 3 * mib);
