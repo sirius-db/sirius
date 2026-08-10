@@ -123,7 +123,9 @@
         "CMAKE_BUILD_TYPE": "Debug",
         "CMAKE_CUDA_FLAGS_DEBUG": "-g -lineinfo -O0",
         "CMAKE_CXX_FLAGS_DEBUG": "-g -O0",
-        "CMAKE_C_FLAGS_DEBUG": "-g -O0"
+        "CMAKE_C_FLAGS_DEBUG": "-g -O0",
+        "ENABLE_SANITIZER": "FALSE",
+        "ENABLE_UBSAN": "0"
       },
       "displayName": "Clang Debug",
       "inherits": "base-clang",
