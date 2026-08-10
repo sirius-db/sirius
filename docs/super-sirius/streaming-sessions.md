@@ -415,6 +415,40 @@ long before physical planning. The catalog is registered as a `ClientContextStat
 `sirius_stream_source(id)` can resolve a schema at bind time; the physical plan generator
 re-reads the catalog at plan time to build each `STREAMING_SOURCE`.
 
+## Fragment FFI (`sirius_ffi.hpp` / `sirius_ffi.cpp`)
+
+**Files:** `src/include/sirius_ffi.hpp`, `src/sirius_ffi.cpp`
+
+A thin PIMPL layer that lets the Rust wrapper (or any C++ caller) drive multi-fragment execution
+without including any DuckDB/cuDF headers. Two public classes:
+
+**`Context`** — RAII handle to one engine instance. `execute_substrait()` runs a single-fragment
+query end-to-end. `make_context()` / `make_context_from_config()` are the factories.
+
+**`Fragment`** — one plan fragment of a multi-fragment query. Usage is strictly ordered:
+
+```
+declare_input_column / declare_input_sender   (schema of each input stream)
+declare_output / declare_output_broadcast / declare_output_hash_key
+build(substrait_plan)      ← opens the query lifecycle
+relay_from(source, ...)    ← move batches from a finished source fragment (or close_input for remote)
+run()                      ← executes; closes the lifecycle
+result_to_arrow(addr)      ← result fragments only: write Arrow stream
+```
+
+A fragment is **intermediate** (has output streams, rooted in a `STREAMING_SINK`) or a **result**
+fragment (no output streams, executes via `sirius_interface` and produces Arrow). Both kinds may
+have input streams declared and fed by other fragments.
+
+`relay_from()` validates column count and type-ids (using `sink_types()`) before moving any
+batches — a schema mismatch throws before data moves rather than reinterpreting columns silently.
+
+`stream_view_name(id)` returns `"sirius_stream_<id>"` — the DuckDB view name a Substrait plan
+must read to consume that input stream. `build()` creates the view on the embedded connection.
+
+**Not yet ported:** `export_packed` / `push_packed` / `StagingArena` — these require the
+exchange staging arena (`exchange_staging_arena`) which is a separate porting item (PRD §6).
+
 ## Tests
 
 | File | Catch2 tags |
