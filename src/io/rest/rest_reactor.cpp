@@ -431,6 +431,22 @@ std::vector<io_object_segment> chunk_host_segments(std::span<const io_object_seg
   return out;
 }
 
+/// One flattened entry of a vectored host-to-device plan: the read span
+/// [offset, offset + size), where it lands (a null @c host_buffer means the
+/// reactor stages it through one of its pinned bounce slots), and the absolute
+/// file window [copy_lo, copy_hi) of that span which is H2D-copied to
+/// @c device_dst (which addresses copy_lo).  Never zero-sized —
+/// @c chunk_host_segments drops empty segments, which would desynchronize the
+/// plan from the buffers it produced.
+struct planned_device_segment {
+  size_t offset;
+  size_t size;
+  uint8_t* host_buffer;
+  uint8_t* device_dst;
+  size_t copy_lo;
+  size_t copy_hi;
+};
+
 }  // namespace
 
 shared_byte_span make_shared_byte_span(std::vector<std::uint8_t> bytes)
@@ -813,6 +829,169 @@ rest_reactor::request_type_ptr rest_reactor::prep_host_to_device_rx_request(
           /*size=*/data_hi - data_lo});
       }
       file_lo = file_hi;
+    }
+
+    auto req       = std::make_unique<rest_chunked_rx_request>();
+    req->object    = obj;
+    req->chunk     = std::move(g);
+    req->file_size = fsize;
+    req->cpy_req   = std::move(cpy);
+    req->manager   = manager;
+    chunks.push_back(std::move(req));
+  }
+  return rest_rx_request::create(std::move(chunks));
+}
+
+rest_reactor::request_type_ptr rest_reactor::prep_device_ranges_rx_request(
+  const reactor_config_type& cfg,
+  const io_object_type& file,
+  std::span<const io_device_range> ranges,
+  rmm::cuda_stream_view stream,
+  int device_id)
+{
+  if (ranges.empty()) { return rest_rx_request::create({}); }
+  if (cfg.bounce_block_size == 0) {
+    throw std::runtime_error(
+      "rest_reactor::prep_device_ranges_rx_request: device reads require a host_memory_resource on "
+      "the reactor_context for bounce staging");
+  }
+
+  size_t const fsize  = file.size();
+  size_t const bounce = cfg.bounce_block_size;
+  auto const obj      = file.get_object_ref();
+
+  size_t bytes_requested = 0;
+  size_t n_win           = 0;
+  for (auto const& r : ranges) {
+    if (r.device_dst == nullptr || r.offset >= fsize) { continue; }
+    size_t const wanted = std::min(r.size, fsize - r.offset);
+    if (wanted == 0) { continue; }
+    bytes_requested += wanted;
+    n_win += (wanted + bounce - 1) / bounce;
+  }
+  if (n_win == 0) { return rest_rx_request::create({}); }
+
+  auto manager = std::make_shared<request_manager>(bytes_requested, n_win);
+
+  std::vector<std::unique_ptr<rest_chunked_rx_request>> chunks;
+  chunks.reserve(n_win);
+  for (auto const& r : ranges) {
+    if (r.device_dst == nullptr || r.offset >= fsize) { continue; }
+    size_t const end = r.offset + std::min(r.size, fsize - r.offset);
+    for (size_t w = r.offset; w < end; w += bounce) {
+      size_t const rs = std::min(bounce, end - w);
+      auto req        = std::make_unique<rest_chunked_rx_request>();
+      req->object     = obj;
+      req->chunk      = io_object_segment{w, rs};
+      req->file_size  = fsize;
+      auto cpy        = std::make_unique<device_cpy_request>();
+      cpy->stream     = stream;
+      cpy->device_id  = device_id;
+      cpy->copies.push_back(device_cpy_request::copy{/*dst=*/r.device_dst + (w - r.offset),
+                                                     /*src=*/nullptr,
+                                                     /*src_off=*/0,
+                                                     /*size=*/rs});
+      req->cpy_req = std::move(cpy);
+      req->manager = manager;
+      chunks.push_back(std::move(req));
+    }
+  }
+  return rest_rx_request::create(std::move(chunks));
+}
+
+rest_reactor::request_type_ptr rest_reactor::prep_host_to_device_ranges_rx_request(
+  const reactor_config_type& cfg,
+  const io_object_type& file,
+  std::span<const io_host_device_range> ranges,
+  rmm::cuda_stream_view stream,
+  int device_id)
+{
+  if (ranges.empty()) { return rest_rx_request::create({}); }
+
+  size_t const fsize  = file.size();
+  size_t const bounce = cfg.bounce_block_size;
+  auto const obj      = file.get_object_ref();
+
+  std::vector<planned_device_segment> plan;
+  plan.reserve(ranges.size());
+  for (auto const& r : ranges) {
+    if (r.size == 0) { continue; }
+    if (r.device_dst == nullptr) {
+      throw std::runtime_error(
+        "rest_reactor::prep_host_to_device_ranges_rx_request: range has no device destination");
+    }
+    if (!r.is_copy_window_valid()) {
+      throw std::runtime_error(
+        "rest_reactor::prep_host_to_device_ranges_rx_request: copy window lies outside the read "
+        "span");
+    }
+    size_t const copy_lo = r.copy_offset;
+    size_t const copy_hi = std::min(r.copy_offset + r.copy_size, fsize);
+    if (copy_lo >= copy_hi) {
+      throw std::runtime_error(
+        "rest_reactor::prep_host_to_device_ranges_rx_request: range does not overlap the requested "
+        "device range");
+    }
+    size_t const read_end = r.offset + std::min(r.size, fsize - r.offset);
+    if (r.host_buffer != nullptr) {
+      plan.push_back(planned_device_segment{
+        r.offset, read_end - r.offset, r.host_buffer, r.device_dst, copy_lo, copy_hi});
+      continue;
+    }
+    if (bounce == 0) {
+      throw std::runtime_error(
+        "rest_reactor::prep_host_to_device_ranges_rx_request: device reads require a "
+        "host_memory_resource on the reactor_context for bounce staging");
+    }
+    for (size_t w = r.offset; w < read_end; w += bounce) {
+      size_t const rs       = std::min(bounce, read_end - w);
+      size_t const piece_lo = std::max(copy_lo, w);
+      size_t const piece_hi = std::min(copy_hi, w + rs);
+      if (piece_lo >= piece_hi) { continue; }
+      plan.push_back(planned_device_segment{
+        w, rs, nullptr, r.device_dst + (piece_lo - copy_lo), piece_lo, piece_hi});
+    }
+  }
+  if (plan.empty()) { return rest_rx_request::create({}); }
+
+  size_t bytes_covered = 0;
+  std::vector<io_object_segment> reads;
+  reads.reserve(plan.size());
+  for (auto const& p : plan) {
+    bytes_covered += p.copy_hi - p.copy_lo;
+    reads.emplace_back(p.offset, p.size, p.host_buffer);
+  }
+
+  auto groups = chunk_host_segments(std::span<const io_object_segment>(reads.data(), reads.size()),
+                                    cfg.chunk_size,
+                                    cfg.max_n_chunks,
+                                    /*allow_split=*/false);
+
+  auto manager = std::make_shared<request_manager>(bytes_covered, groups.size());
+
+  std::vector<std::unique_ptr<rest_chunked_rx_request>> chunks;
+  chunks.reserve(groups.size());
+  size_t si = 0;
+  for (auto& g : groups) {
+    auto cpy       = std::make_unique<device_cpy_request>();
+    cpy->stream    = stream;
+    cpy->device_id = device_id;
+    cpy->copies.reserve(g.n_chunks());
+    for (auto const& b : g.buffers) {
+      assert(si < plan.size() && "merged groups cover more buffers than the plan produced");
+      auto const& p        = plan[si++];
+      size_t const file_lo = p.offset;
+      size_t const file_hi = p.offset + b.iov_len;
+      size_t const data_lo = std::max(p.copy_lo, file_lo);
+      size_t const data_hi = std::min(p.copy_hi, file_hi);
+      if (data_lo < data_hi) {
+        auto* const base = static_cast<uint8_t*>(b.iov_base);
+        cpy->copies.push_back(
+          device_cpy_request::copy{/*dst=*/p.device_dst + (data_lo - p.copy_lo),
+                                   /*src=*/base != nullptr ? base + (data_lo - file_lo) : nullptr,
+                                   /*src_off=*/base != nullptr ? size_t{0} : (data_lo - file_lo),
+                                   /*size=*/data_hi - data_lo});
+      }
     }
 
     auto req       = std::make_unique<rest_chunked_rx_request>();

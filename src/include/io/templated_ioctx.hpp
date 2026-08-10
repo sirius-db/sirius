@@ -151,6 +151,29 @@ concept reactor_has_host_to_device_rx = requires(R r,
 };
 
 template <class R>
+concept reactor_has_device_ranges_rx = requires(R r,
+                                                typename R::io_object_type file,
+                                                typename R::reactor_config_type cfg,
+                                                rmm::cuda_stream_view stream,
+                                                std::span<const io_device_range> ranges) {
+  {
+    r.prep_device_ranges_rx_request(cfg, file, ranges, stream, 1)
+  } -> std::same_as<typename R::request_type_ptr>;
+};
+
+template <class R>
+concept reactor_has_host_to_device_ranges_rx =
+  requires(R r,
+           typename R::io_object_type file,
+           typename R::reactor_config_type cfg,
+           rmm::cuda_stream_view stream,
+           std::span<const io_host_device_range> ranges) {
+    {
+      r.prep_host_to_device_ranges_rx_request(cfg, file, ranges, stream, 1)
+    } -> std::same_as<typename R::request_type_ptr>;
+  };
+
+template <class R>
 concept reactor_has_vector_host_rx =
   requires(R r,
            typename R::io_object_type file,
@@ -175,6 +198,13 @@ struct reactor_traits {
 
   /// Batched (vectored) host reads dispatched in a single call.
   static constexpr bool supports_vector_host_read = reactor_has_vector_host_rx<R>;
+
+  /// Batched device reads, each range to its own device destination.
+  static constexpr bool supports_device_range_read = reactor_has_device_ranges_rx<R>;
+
+  /// Batched device reads staged through caller-supplied pinned host buffers.
+  static constexpr bool supports_host_to_device_range_read =
+    reactor_has_host_to_device_ranges_rx<R>;
 };
 
 // ---------------------------------------------------------------------------
@@ -278,6 +308,11 @@ class templated_ioctx : public ioctx {
   [[nodiscard]] bool supports_vector_host_read() const noexcept final
   {
     return reactor_traits_t::supports_vector_host_read;
+  }
+
+  [[nodiscard]] bool supports_device_range_read() const noexcept final
+  {
+    return reactor_traits_t::supports_device_range_read;
   }
 
   [[nodiscard]] std::vector<cudf::io::text::byte_range_info> align_and_coalesce(
@@ -414,6 +449,43 @@ class templated_ioctx : public ioctx {
         std::runtime_error("host_to_device_read_async_io: unsupported operation")));
     }
   }
+
+  // -- Batch device reads (generic; reactor-backed) -------------------------
+
+  exec::semi_future<size_t> device_read_ranges_async_io(
+    const io_object& obj,
+    std::span<const io_device_range> ranges,
+    rmm::cuda_stream_view stream) noexcept override
+  {
+    if constexpr (reactor_traits_t::supports_device_range_read) {
+      if (ranges.empty()) { return exec::make_semi_future<size_t>(0); }
+      try {
+        auto& tobj    = as_typed(obj);
+        int device_id = rmm::get_current_cuda_device().value();
+        auto reactors = next_reactor(tobj, ranges.size(), io_op_type::device_async, device_id);
+        if (reactors.empty()) {
+          return exec::make_semi_future<size_t>(std::make_exception_ptr(
+            std::runtime_error("device_read_ranges_async_io: no available reactors")));
+        }
+        request_type_ptr req =
+          Reactor::prep_device_ranges_rx_request(_config, tobj, ranges, stream, device_id);
+        auto semi = req->get_future();
+        auto reqs = request_type::splits(std::move(req), reactors.size());
+        assert(reqs.size() <= reactors.size());
+        std::for_each(
+          std::make_move_iterator(reqs.begin()),
+          std::make_move_iterator(reqs.end()),
+          [&reactors, i = 0](auto&& r) mutable { reactors[i++]->enqueue(std::move(r)); });
+        return semi;
+      } catch (...) {
+        return exec::make_semi_future<size_t>(std::current_exception());
+      }
+    } else {
+      return exec::make_semi_future<size_t>(std::make_exception_ptr(
+        std::runtime_error("device_read_ranges_async_io: unsupported operation")));
+    }
+  }
+
   // -- Batch host reads (generic: dispatch to reactor host_read_async) ------
 
   exec::semi_future<size_t> host_read_ranges_async_io(
@@ -448,6 +520,45 @@ class templated_ioctx : public ioctx {
   }
 
  protected:
+  [[nodiscard]] bool supports_host_to_device_range_read() const noexcept final
+  {
+    return reactor_traits_t::supports_host_to_device_range_read;
+  }
+
+  exec::semi_future<size_t> host_to_device_read_ranges_async_io(
+    const io_object& obj,
+    std::span<const io_host_device_range> ranges,
+    rmm::cuda_stream_view stream) noexcept override
+  {
+    if constexpr (reactor_traits_t::supports_host_to_device_range_read) {
+      if (ranges.empty()) { return exec::make_semi_future<size_t>(0); }
+      try {
+        auto& tobj    = as_typed(obj);
+        int device_id = rmm::get_current_cuda_device().value();
+        auto reactors = next_reactor(tobj, ranges.size(), io_op_type::device_async, device_id);
+        if (reactors.empty()) {
+          return exec::make_semi_future<size_t>(std::make_exception_ptr(
+            std::runtime_error("host_to_device_read_ranges_async_io: no available reactors")));
+        }
+        request_type_ptr req =
+          Reactor::prep_host_to_device_ranges_rx_request(_config, tobj, ranges, stream, device_id);
+        auto semi = req->get_future();
+        auto reqs = request_type::splits(std::move(req), reactors.size());
+        assert(reqs.size() <= reactors.size());
+        std::for_each(
+          std::make_move_iterator(reqs.begin()),
+          std::make_move_iterator(reqs.end()),
+          [&reactors, i = 0](auto&& r) mutable { reactors[i++]->enqueue(std::move(r)); });
+        return semi;
+      } catch (...) {
+        return exec::make_semi_future<size_t>(std::current_exception());
+      }
+    } else {
+      return exec::make_semi_future<size_t>(std::make_exception_ptr(
+        std::runtime_error("host_to_device_read_ranges_async_io: unsupported operation")));
+    }
+  }
+
   std::shared_ptr<io_object> create_io_object(std::string path) override
   {
     return std::shared_ptr<io_object>(Reactor::create_io_object(std::move(path)));

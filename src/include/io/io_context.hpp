@@ -75,11 +75,12 @@ namespace sirius::io {
  * threads, ...). Extend this class to provide a concrete I/O backend.
  */
 class ioctx : public std::enable_shared_from_this<ioctx> {
-  // prefetching_cache's worker_loop is the only caller of the protected
-  // host_read_ranges_async_io entry point through a ioctx* base
-  // pointer.  Friending the cache lets that single call site reach in
-  // without forcing the vector-read primitive (which most callers never
-  // touch) into the public API.
+  // prefetching_cache is the only caller of the vector-read entry points
+  // (host_read_ranges_async_io, and the protected
+  // host_to_device_read_ranges_async_io / supports_host_to_device_range_read)
+  // through a ioctx* base pointer.  Friending the cache lets those call sites
+  // reach in without forcing primitives that only make sense to a buffer owner
+  // into the public API.
   friend class cache::prefetching_cache;
 
  public:
@@ -136,6 +137,12 @@ class ioctx : public std::enable_shared_from_this<ioctx> {
   /// cannot amortise per-request overhead and must fall back to
   /// @c scan_stage::none.
   [[nodiscard]] virtual bool supports_vector_host_read() const noexcept = 0;
+
+  /// Whether the backend can serve a batch of device reads in a single dispatch.
+  /// When false, @c device_read_ranges_async_io yields a failed future — callers
+  /// that cannot require a batching backend must check this and issue one
+  /// @c device_read_async_io per range instead.
+  [[nodiscard]] virtual bool supports_device_range_read() const noexcept = 0;
 
   /// Build the prefetching cache.  One-shot — calling twice is a no-op
   /// after the first successful build.  The cache holds a raw
@@ -227,12 +234,41 @@ class ioctx : public std::enable_shared_from_this<ioctx> {
   virtual exec::semi_future<size_t> host_read_ranges_async_io(
     const io_object& obj, std::span<io_object_segment> segments) noexcept = 0;
 
+  /// Vectored device read: every range lands in its own device destination, all
+  /// staged by the backend.  Ranges are taken as given — never coalesced — and
+  /// empty, past-EOF or null-destination entries are dropped.  Reports the bytes
+  /// delivered, each range clamped to the object's end.  Like
+  /// @c device_read_async_io it resolves once the copies are enqueued on
+  /// @p stream, so the destinations must outlive the stream work.
+  virtual exec::semi_future<size_t> device_read_ranges_async_io(
+    const io_object& obj,
+    std::span<const io_device_range> ranges,
+    rmm::cuda_stream_view stream) noexcept = 0;
+
   bool can_use_prefetching_cache() const noexcept
   {
     return supports_vector_host_read() || supports_host_to_device_read();
   }
 
  protected:
+  /// Vectored host-to-device read, staged through buffers the CALLER owns.  Each
+  /// range is read into its own host buffer — or an internal bounce slot when
+  /// null — and only its copy window reaches its device destination, so the
+  /// caller can over-read for O_DIRECT alignment or fill a whole cache chunk and
+  /// still land exactly what was asked for.  Reports the bytes copied to device
+  /// memory, not the bytes read.
+  ///
+  /// Not public: supplying host buffers only makes sense for a caller that owns
+  /// and outlives them (the prefetching cache).  Everyone else uses
+  /// @c device_read_ranges_async_io.
+  virtual exec::semi_future<size_t> host_to_device_read_ranges_async_io(
+    const io_object& obj,
+    std::span<const io_host_device_range> ranges,
+    rmm::cuda_stream_view stream) noexcept = 0;
+
+  /// Whether the backend implements @c host_to_device_read_ranges_async_io.
+  [[nodiscard]] virtual bool supports_host_to_device_range_read() const noexcept = 0;
+
   /// Backend hook: open native handles / resolve metadata for @p path and
   /// return a populated io_object.  Invoked by @c open_datasource; not part of
   /// the public surface (callers receive a ready @c sirius_datasource).  Throws

@@ -320,6 +320,27 @@ class rest_reactor {
                                                          rmm::cuda_stream_view stream,
                                                          int device_id);
 
+  /// Vectored form of @c prep_device_rx_request: every range is clamped to the
+  /// file end, staged through reactor-owned pinned bounce slots and H2D-copied
+  /// into its own device destination.  Ranges with a null destination (or no
+  /// bytes left after clamping) are skipped.
+  static request_type_ptr prep_device_ranges_rx_request(const reactor_config_type& cfg,
+                                                        const io_object_type& file,
+                                                        std::span<const io_device_range> ranges,
+                                                        rmm::cuda_stream_view stream,
+                                                        int device_id);
+
+  /// Vectored host-to-device read: each range is read into its own caller
+  /// buffer (null => an internal bounce slot) and only its copy window is
+  /// H2D-copied to its own device destination.  File-adjacent buffers fuse into
+  /// scatter GETs that batch their copies.
+  static request_type_ptr prep_host_to_device_ranges_rx_request(
+    const reactor_config_type& cfg,
+    const io_object_type& file,
+    std::span<const io_host_device_range> ranges,
+    rmm::cuda_stream_view stream,
+    int device_id);
+
   // -- dispatch / lifecycle ------------------------------------------------
 
   /// Allocate the pinned bounce slots and launch the worker thread.  Split out

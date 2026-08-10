@@ -189,6 +189,7 @@ class kvikio_context final : public ioctx {
   [[nodiscard]] bool supports_device_read() const noexcept override { return true; }
   [[nodiscard]] bool supports_vector_host_read() const noexcept override { return false; }
   [[nodiscard]] bool supports_host_to_device_read() const noexcept override { return false; }
+  [[nodiscard]] bool supports_device_range_read() const noexcept override { return false; }
 
   /// kvikIO applies no physical block alignment of its own, so ranges pass
   /// through unchanged.
@@ -229,6 +230,13 @@ class kvikio_context final : public ioctx {
   exec::semi_future<size_t> host_read_ranges_async_io(
     const io_object& obj, std::span<io_object_segment> segments) noexcept final;
 
+  /// Unsupported: no batched dispatch.  Callers issue one
+  /// @c device_read_async_io per range instead.
+  exec::semi_future<size_t> device_read_ranges_async_io(
+    const io_object& obj,
+    std::span<const io_device_range> ranges,
+    rmm::cuda_stream_view stream) noexcept final;
+
   /// The config this context was built with (default-constructed when none was
   /// supplied).  Only @c compat_mode is still consulted after construction; the
   /// rest already went into kvikIO's globals.
@@ -238,6 +246,14 @@ class kvikio_context final : public ioctx {
   [[nodiscard]] object_store_config const& object_store() const noexcept { return _object_store; }
 
  protected:
+  /// Unsupported: kvikIO has no bounce-staged host->device path here.
+  exec::semi_future<size_t> host_to_device_read_ranges_async_io(
+    const io_object& obj,
+    std::span<const io_host_device_range> ranges,
+    rmm::cuda_stream_view stream) noexcept final;
+
+  [[nodiscard]] bool supports_host_to_device_range_read() const noexcept final { return false; }
+
   /// Backend hook invoked by @c ioctx::open_datasource: open @p path with
   /// kvikIO and record its size.  An @c s3:// path builds a signed
   /// @c RemoteHandle from @ref object_store (throwing when the store is not

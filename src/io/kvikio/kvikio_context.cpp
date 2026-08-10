@@ -239,4 +239,24 @@ exec::semi_future<size_t> kvikio_context::host_read_ranges_async_io(
     std::runtime_error("kvikio_context does not support host_read_ranges_async_io")));
 }
 
+exec::semi_future<size_t> kvikio_context::device_read_ranges_async_io(
+  const io_object& /*obj*/,
+  std::span<const io_device_range> /*ranges*/,
+  rmm::cuda_stream_view /*stream*/) noexcept
+{
+  return exec::make_semi_future<size_t>(
+    std::make_exception_ptr(std::runtime_error("kvikio_context does not support "
+                                               "device_read_ranges_async_io; use "
+                                               "device_read_async_io per range instead")));
+}
+
+exec::semi_future<size_t> kvikio_context::host_to_device_read_ranges_async_io(
+  const io_object& /*obj*/,
+  std::span<const io_host_device_range> /*ranges*/,
+  rmm::cuda_stream_view /*stream*/) noexcept
+{
+  return exec::make_semi_future<size_t>(std::make_exception_ptr(
+    std::runtime_error("kvikio_context does not support host_to_device_read_ranges_async_io")));
+}
+
 }  // namespace sirius::io

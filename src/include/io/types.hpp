@@ -208,4 +208,65 @@ class io_object_segment {
   return a.offset + a.size == b.offset;
 }
 
+/// One entry of a vectored device read: @c [offset, offset + size) of the file
+/// delivered to @c device_dst.  The backend owns the staging and the physical
+/// alignment, so the caller states only what it wants and where.
+struct io_device_range {
+  size_t offset{0};
+  size_t size{0};
+  uint8_t* device_dst{nullptr};
+};
+
+/// One entry of a vectored host-to-device read.  @c [offset, offset + size) —
+/// the caller's own, O_DIRECT-aligned read span — is read into @c host_buffer
+/// (or an internal bounce slot when null), and only
+/// @c [copy_offset, copy_offset + copy_size) of it, in absolute file offsets, is
+/// copied to @c device_dst.  Separating the two is what lets a caller over-read
+/// for alignment, or read a whole cache chunk, and still land exactly the bytes
+/// it asked for on the device.
+struct io_host_device_range {
+  io_host_device_range() = default;
+
+  /// Read and copy the same span: the whole read lands at @p device_dst.
+  io_host_device_range(size_t offset, size_t size, uint8_t* host_buffer, uint8_t* device_dst)
+    : offset(offset),
+      size(size),
+      copy_offset(offset),
+      copy_size(size),
+      host_buffer(host_buffer),
+      device_dst(device_dst)
+  {
+  }
+
+  io_host_device_range(size_t offset,
+                       size_t size,
+                       size_t copy_offset,
+                       size_t copy_size,
+                       uint8_t* host_buffer,
+                       uint8_t* device_dst)
+    : offset(offset),
+      size(size),
+      copy_offset(copy_offset),
+      copy_size(copy_size),
+      host_buffer(host_buffer),
+      device_dst(device_dst)
+  {
+  }
+
+  /// True iff the copy window lies inside the read span.
+  [[nodiscard]] bool is_copy_window_valid() const noexcept
+  {
+    if (copy_offset < offset) { return false; }
+    size_t const head = copy_offset - offset;
+    return head <= size && copy_size <= size - head;
+  }
+
+  size_t offset{0};
+  size_t size{0};
+  size_t copy_offset{0};
+  size_t copy_size{0};
+  uint8_t* host_buffer{nullptr};
+  uint8_t* device_dst{nullptr};
+};
+
 }  // namespace sirius::io

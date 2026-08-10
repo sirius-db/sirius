@@ -27,12 +27,16 @@
 
 #include <array>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <vector>
 
 using cudf::io::text::byte_range_info;
 using sirius::io::device_cpy_request;
+using sirius::io::io_device_range;
+using sirius::io::io_host_device_range;
 using sirius::io::io_object_segment;
 using sirius::io::rest::rest_chunked_rx_request;
 using sirius::io::rest::rest_io_object;
@@ -43,6 +47,16 @@ namespace {
 // Non-null buffer base for segments; the pure prep/coalesce logic never
 // dereferences it.
 uint8_t* fake_ptr(uintptr_t v) { return reinterpret_cast<uint8_t*>(v); }
+
+// Drive a prep result to clean completion so the shared request_manager
+// destructor's invariants (bytes_read >= bytes_requested, chunks_completed ==
+// total_chunks) are satisfied — one chunk_complete per emitted chunk.
+void complete(std::vector<std::unique_ptr<rest_chunked_rx_request>>& chunks)
+{
+  for (auto& c : chunks) {
+    c->manager->chunk_complete(c->chunk.size);
+  }
+}
 
 std::vector<byte_range_info> coalesce(std::vector<byte_range_info> ranges,
                                       std::optional<size_t> alignment = std::nullopt)
@@ -492,6 +506,509 @@ TEST_CASE("prep_host_to_device keeps null-buffer segments as standalone bounce-s
     CHECK(chunks[1]->cpy_req->copies[0].dst == fake_ptr(kDst + 75));
     CHECK(chunks[1]->cpy_req->copies[0].src_off == 0);
     CHECK(chunks[1]->cpy_req->copies[0].size == 75);
+  }
+}
+
+TEST_CASE("prep_device_ranges builds one staged GET per small range", "[rest]")
+{
+  sirius::io::rest::config cfg;
+  cfg.bounce_block_size = 4096;  // reactor-owned pinned staging slots
+  rest_io_object const file("s3://bkt/key", "bkt", "key", /*size=*/1 << 20);
+  constexpr uintptr_t kD0 = 0x100000, kD1 = 0x200000, kD2 = 0x300000;
+
+  // Ranges below the bounce block: one GET and one H2D copy each, and — unlike
+  // the single-range path — every copy targets its own device buffer.
+  std::vector<io_device_range> ranges{
+    {0, 100, fake_ptr(kD0)}, {500, 100, fake_ptr(kD1)}, {9000, 300, fake_ptr(kD2)}};
+  auto req =
+    rest_reactor::prep_device_ranges_rx_request(cfg, file, ranges, rmm::cuda_stream_view{}, 0);
+  REQUIRE(req->size() == 3);
+  auto fut    = req->get_future();
+  auto chunks = req->get_all_chunks();
+
+  REQUIRE(chunks.size() == 3);
+  CHECK(chunks[0]->manager->total_chunks == 3);
+  CHECK(chunks[0]->manager->bytes_requested == 100 + 100 + 300);
+
+  std::array<uintptr_t, 3> const dsts{kD0, kD1, kD2};
+  std::array<size_t, 3> const offsets{0, 500, 9000};
+  std::array<size_t, 3> const sizes{100, 100, 300};
+  for (size_t i = 0; i < 3; ++i) {
+    CHECK(chunks[i]->object.bucket == "bkt");
+    CHECK(chunks[i]->object.key == "key");
+    CHECK(chunks[i]->is_device());
+    CHECK(chunks[i]->chunk.offset == offsets[i]);
+    CHECK(chunks[i]->chunk.size == sizes[i]);   // no alignment: REST reads exactly the range
+    CHECK(chunks[i]->chunk.data() == nullptr);  // staged through a bounce slot later
+    REQUIRE(chunks[i]->cpy_req != nullptr);
+    REQUIRE(chunks[i]->cpy_req->copies.size() == 1);
+    auto const& cp = chunks[i]->cpy_req->copies[0];
+    CHECK(reinterpret_cast<uintptr_t>(cp.dst) == dsts[i]);  // the range's own destination
+    CHECK(cp.src == nullptr);                               // resolved late against the bounce slot
+    CHECK(cp.src_off == 0);
+    CHECK(cp.size == sizes[i]);
+  }
+
+  complete(chunks);
+}
+
+TEST_CASE("prep_device_ranges splits a range across bounce blocks", "[rest]")
+{
+  sirius::io::rest::config cfg;
+  cfg.bounce_block_size = 100;  // force the first range over several blocks
+  rest_io_object const file("s3://bkt/key", "bkt", "key", /*size=*/1 << 20);
+  constexpr uintptr_t kBig = 0x100000, kSmall = 0x200000;
+
+  std::vector<io_device_range> ranges{{0, 250, fake_ptr(kBig)}, {1000, 50, fake_ptr(kSmall)}};
+  auto req =
+    rest_reactor::prep_device_ranges_rx_request(cfg, file, ranges, rmm::cuda_stream_view{}, 0);
+  auto fut    = req->get_future();
+  auto chunks = req->get_all_chunks();
+
+  REQUIRE(chunks.size() == 4);  // ceil(250/100) = 3 blocks, plus 1 for the small range
+  CHECK(chunks[0]->manager->total_chunks == 4);
+  CHECK(chunks[0]->manager->bytes_requested == 250 + 50);
+
+  // The blocks tile the big range: each copy lands at its own offset in its
+  // destination and together they cover the range exactly once.
+  std::array<size_t, 3> const block_sizes{100, 100, 50};  // the tail block is short
+  size_t covered = 0;
+  for (size_t i = 0; i < 3; ++i) {
+    CHECK(chunks[i]->chunk.offset == i * 100);
+    CHECK(chunks[i]->chunk.size == block_sizes[i]);
+    REQUIRE(chunks[i]->cpy_req->copies.size() == 1);
+    auto const& cp = chunks[i]->cpy_req->copies[0];
+    CHECK(reinterpret_cast<uintptr_t>(cp.dst) == kBig + i * 100);  // block_offset - range.offset
+    CHECK(cp.src_off == 0);
+    CHECK(cp.size == block_sizes[i]);
+    covered += cp.size;
+  }
+  CHECK(covered == 250);
+
+  // A sub-block range is unaffected by the split and keeps its own destination.
+  CHECK(chunks[3]->chunk.offset == 1000);
+  REQUIRE(chunks[3]->cpy_req->copies.size() == 1);
+  CHECK(reinterpret_cast<uintptr_t>(chunks[3]->cpy_req->copies[0].dst) == kSmall);
+  CHECK(chunks[3]->cpy_req->copies[0].size == 50);
+
+  complete(chunks);
+}
+
+TEST_CASE("prep_device_ranges clamps a range at the object end and drops ranges past it", "[rest]")
+{
+  sirius::io::rest::config cfg;
+  cfg.bounce_block_size = 4096;
+  rest_io_object const file("s3://bkt/key", "bkt", "key", /*size=*/10000);
+  constexpr uintptr_t kTail = 0x100000;
+
+  std::vector<io_device_range> ranges{
+    {9900, 1000, fake_ptr(kTail)},      // starts in the object, overhangs the end
+    {10000, 100, fake_ptr(0x200000)},   // starts exactly at the end
+    {20000, 100, fake_ptr(0x300000)}};  // starts past the end
+  auto req =
+    rest_reactor::prep_device_ranges_rx_request(cfg, file, ranges, rmm::cuda_stream_view{}, 0);
+  auto fut    = req->get_future();
+  auto chunks = req->get_all_chunks();
+
+  // Only the in-object range survives; the at/past-end ranges emit no chunk and
+  // do not inflate the manager's chunk count (which would strand the future).
+  REQUIRE(chunks.size() == 1);
+  CHECK(chunks[0]->manager->total_chunks == 1);
+  CHECK(chunks[0]->manager->bytes_requested == 100);  // 10000 - 9900, not the requested 1000
+  CHECK(chunks[0]->chunk.offset == 9900);
+  CHECK(chunks[0]->chunk.size == 100);
+  REQUIRE(chunks[0]->cpy_req->copies.size() == 1);
+  CHECK(reinterpret_cast<uintptr_t>(chunks[0]->cpy_req->copies[0].dst) == kTail);
+  CHECK(chunks[0]->cpy_req->copies[0].size == 100);
+
+  complete(chunks);
+}
+
+TEST_CASE("prep_device_ranges drops zero-size ranges and null destinations", "[rest]")
+{
+  sirius::io::rest::config cfg;
+  cfg.bounce_block_size = 4096;
+  rest_io_object const file("s3://bkt/key", "bkt", "key", /*size=*/1 << 20);
+  constexpr uintptr_t kDst = 0x100000;
+
+  SECTION("skipped ranges neither emit chunks nor inflate the counts")
+  {
+    std::vector<io_device_range> ranges{{0, 0, fake_ptr(0x200000)},  // no bytes wanted
+                                        {100, 100, nullptr},         // nowhere to put them
+                                        {200, 100, fake_ptr(kDst)}};
+    auto req =
+      rest_reactor::prep_device_ranges_rx_request(cfg, file, ranges, rmm::cuda_stream_view{}, 0);
+    REQUIRE(req->size() == 1);
+    auto fut    = req->get_future();
+    auto chunks = req->get_all_chunks();
+
+    REQUIRE(chunks.size() == 1);
+    CHECK(chunks[0]->manager->total_chunks == 1);
+    CHECK(chunks[0]->manager->bytes_requested == 100);
+    CHECK(chunks[0]->chunk.offset == 200);
+    REQUIRE(chunks[0]->cpy_req->copies.size() == 1);
+    CHECK(reinterpret_cast<uintptr_t>(chunks[0]->cpy_req->copies[0].dst) == kDst);
+
+    complete(chunks);
+  }
+
+  SECTION("an all-skipped vector degrades to a ready zero-byte request")
+  {
+    std::vector<io_device_range> ranges{{0, 0, fake_ptr(0x200000)}, {100, 100, nullptr}};
+    auto req =
+      rest_reactor::prep_device_ranges_rx_request(cfg, file, ranges, rmm::cuda_stream_view{}, 0);
+    REQUIRE(req != nullptr);
+    CHECK(req->size() == 0);
+    auto fut = req->get_future();
+    CHECK(fut.is_ready());
+    CHECK(std::move(fut).get() == 0);
+  }
+}
+
+TEST_CASE("prep_device_ranges on an empty range list yields a ready zero-byte request", "[rest]")
+{
+  sirius::io::rest::config cfg;
+  cfg.bounce_block_size = 4096;
+  rest_io_object const file("s3://bkt/key", "bkt", "key", /*size=*/1 << 20);
+
+  std::vector<io_device_range> ranges;
+  auto req =
+    rest_reactor::prep_device_ranges_rx_request(cfg, file, ranges, rmm::cuda_stream_view{}, 0);
+  REQUIRE(req != nullptr);
+  CHECK(req->size() == 0);
+  auto fut = req->get_future();
+  CHECK(fut.is_ready());
+  CHECK(std::move(fut).get() == 0);
+}
+
+TEST_CASE("prep_device_ranges reports the clamped byte total through the request future", "[rest]")
+{
+  // 10 KB object.  The caller asks for 1400 bytes across three ranges, but only
+  // 400 of them exist: the future must report what was actually delivered, not
+  // the sum of the input sizes (bytes_requested alone is just a ctor argument —
+  // this drives the manager to completion and reads the value back out).
+  sirius::io::rest::config cfg;
+  cfg.bounce_block_size = 4096;
+  rest_io_object const file("s3://bkt/key", "bkt", "key", /*size=*/10000);
+
+  std::vector<io_device_range> ranges{
+    {0, 300, fake_ptr(0x100000)},       // fully inside         -> 300
+    {9900, 1000, fake_ptr(0x200000)},   // straddles the end    -> 100
+    {20000, 100, fake_ptr(0x300000)}};  // past the end         -> dropped
+
+  auto req =
+    rest_reactor::prep_device_ranges_rx_request(cfg, file, ranges, rmm::cuda_stream_view{}, 0);
+  auto fut    = req->get_future();
+  auto chunks = req->get_all_chunks();
+
+  REQUIRE(chunks.size() == 2);
+  CHECK(chunks[0]->manager->bytes_requested == 300 + 100);
+
+  complete(chunks);
+  chunks.clear();  // drop the last manager reference: its dtor fulfills the future
+  REQUIRE(fut.is_ready());
+  CHECK(std::move(fut).get() == 300 + 100);  // not the 1400 bytes asked for
+}
+
+TEST_CASE("prep_device_ranges throws without a bounce block size", "[rest]")
+{
+  sirius::io::rest::config cfg;  // bounce_block_size defaults to 0
+  rest_io_object const file("s3://bkt/key", "bkt", "key", /*size=*/1 << 20);
+
+  SECTION("a device range needs the bounce resource to stage through")
+  {
+    // REST has no GPU-direct path, so without a staging block size there is no
+    // way to land the bytes — same contract as the single-range prep.
+    std::vector<io_device_range> ranges{{0, 100, fake_ptr(0x100000)}};
+    CHECK_THROWS_AS(
+      rest_reactor::prep_device_ranges_rx_request(cfg, file, ranges, rmm::cuda_stream_view{}, 0),
+      std::runtime_error);
+  }
+
+  SECTION("an empty range list short-circuits before the bounce check")
+  {
+    std::vector<io_device_range> ranges;
+    auto req =
+      rest_reactor::prep_device_ranges_rx_request(cfg, file, ranges, rmm::cuda_stream_view{}, 0);
+    CHECK(req->size() == 0);
+  }
+}
+
+// --- vectored host-to-device ranges (read span vs. copy window per range) ---
+
+TEST_CASE("prep_host_to_device_ranges clips the copy window inside an over-read segment", "[rest]")
+{
+  sirius::io::rest::config cfg;  // default chunk_size (8 MiB) / max_n_chunks (16)
+  rest_io_object const file("s3://bkt/key", "bkt", "key", /*size=*/1 << 20);
+  constexpr uintptr_t kB0 = 0xA000, kB1 = 0xB000;
+  constexpr uintptr_t kD0 = 0x100000, kD1 = 0x200000;
+
+  // Each range GETs a whole cache-sized segment but wants only an interior slice
+  // of it on the device: the read span is what lands in the caller's buffer, the
+  // copy window is what reaches device_dst.
+  std::vector<io_host_device_range> ranges{{/*offset=*/0,
+                                            /*size=*/1000,
+                                            /*copy_offset=*/200,
+                                            /*copy_size=*/300,
+                                            fake_ptr(kB0),
+                                            fake_ptr(kD0)},
+                                           {/*offset=*/5000,
+                                            /*size=*/1000,
+                                            /*copy_offset=*/5000,
+                                            /*copy_size=*/100,
+                                            fake_ptr(kB1),
+                                            fake_ptr(kD1)}};
+
+  auto req = rest_reactor::prep_host_to_device_ranges_rx_request(
+    cfg, file, ranges, rmm::cuda_stream_view{}, 0);
+  auto fut    = req->get_future();
+  auto chunks = req->get_all_chunks();
+
+  REQUIRE(chunks.size() == 2);  // not file-adjacent, so no fusion
+  CHECK(chunks[0]->manager->total_chunks == 2);
+  // The future reports the copy windows (400), never the 2000 bytes fetched.
+  CHECK(chunks[0]->manager->bytes_requested == 300 + 100);
+
+  // The GET still covers the whole segment...
+  CHECK(chunks[0]->chunk.offset == 0);
+  CHECK(chunks[0]->chunk.size == 1000);
+  CHECK(chunks[0]->is_device());
+  // ... while the copy takes only [200, 500) out of it.  device_dst addresses
+  // copy_offset, so the copy lands at its head, not at a read-span offset.
+  REQUIRE(chunks[0]->cpy_req->copies.size() == 1);
+  auto const& c0 = chunks[0]->cpy_req->copies[0];
+  CHECK(reinterpret_cast<uintptr_t>(c0.src) == kB0 + 200);  // absolute src into the caller buffer
+  CHECK(c0.src_off == 0);
+  CHECK(reinterpret_cast<uintptr_t>(c0.dst) == kD0);
+  CHECK(c0.size == 300);  // the copy window, not the 1000-byte read
+
+  CHECK(chunks[1]->chunk.size == 1000);
+  REQUIRE(chunks[1]->cpy_req->copies.size() == 1);
+  auto const& c1 = chunks[1]->cpy_req->copies[0];
+  CHECK(reinterpret_cast<uintptr_t>(c1.src) == kB1);
+  CHECK(reinterpret_cast<uintptr_t>(c1.dst) == kD1);
+  CHECK(c1.size == 100);
+
+  complete(chunks);
+}
+
+TEST_CASE("prep_host_to_device_ranges fuses contiguous caller buffers into one scatter GET",
+          "[rest]")
+{
+  sirius::io::rest::config cfg;
+  rest_io_object const file("s3://bkt/key", "bkt", "key", /*size=*/1 << 20);
+  constexpr uintptr_t kB0 = 0xA000, kB1 = 0xB000, kB2 = 0xC000;
+  constexpr uintptr_t kD0 = 0x100000, kD1 = 0x200000, kD2 = 0x300000;
+
+  // Three file-adjacent ranges (copy window == read span) with unrelated device
+  // destinations: they share one scatter GET, but each buffer keeps its own copy.
+  std::vector<io_host_device_range> ranges{{0, 100, fake_ptr(kB0), fake_ptr(kD0)},
+                                           {100, 100, fake_ptr(kB1), fake_ptr(kD1)},
+                                           {200, 100, fake_ptr(kB2), fake_ptr(kD2)}};
+
+  auto req = rest_reactor::prep_host_to_device_ranges_rx_request(
+    cfg, file, ranges, rmm::cuda_stream_view{}, 0);
+  auto fut    = req->get_future();
+  auto chunks = req->get_all_chunks();
+
+  REQUIRE(chunks.size() == 1);
+  CHECK(chunks[0]->chunk.offset == 0);
+  CHECK(chunks[0]->chunk.size == 300);      // one contiguous range
+  CHECK(chunks[0]->chunk.n_chunks() == 3);  // scattered across 3 buffers
+  CHECK(chunks[0]->chunk.is_vectored());
+  CHECK(chunks[0]->manager->total_chunks == 1);
+  CHECK(chunks[0]->manager->bytes_requested == 300);
+
+  std::array<uintptr_t, 3> const hosts{kB0, kB1, kB2};
+  std::array<uintptr_t, 3> const devs{kD0, kD1, kD2};
+  auto const& copies = chunks[0]->cpy_req->copies;
+  REQUIRE(copies.size() == 3);
+  for (size_t i = 0; i < 3; ++i) {
+    CHECK(reinterpret_cast<uintptr_t>(copies[i].src) == hosts[i]);
+    CHECK(copies[i].src_off == 0);
+    CHECK(reinterpret_cast<uintptr_t>(copies[i].dst) == devs[i]);  // its own destination
+    CHECK(copies[i].size == 100);
+  }
+
+  complete(chunks);
+}
+
+TEST_CASE("prep_host_to_device_ranges keeps a null-buffer range standalone between fused groups",
+          "[rest]")
+{
+  sirius::io::rest::config cfg;
+  cfg.bounce_block_size = 4096;  // the null range still fits one bounce block
+  rest_io_object const file("s3://bkt/key", "bkt", "key", /*size=*/1 << 20);
+  constexpr uintptr_t kB0 = 0xA000, kB1 = 0xB000, kB2 = 0xC000, kB3 = 0xD000;
+  constexpr uintptr_t kD0 = 0x100000, kD1 = 0x200000, kDg = 0x300000, kD2 = 0x400000,
+                      kD3 = 0x500000;
+
+  // Five contiguous ranges; the middle one has no caller buffer (a prefetch-cache
+  // gap), so it stages through a pinned bounce slot and can never be fused.  It
+  // also wants only [325, 375) of its segment, to prove the bounce copy carries
+  // the within-segment offset rather than an absolute src.
+  std::vector<io_host_device_range> ranges{
+    {100, 100, fake_ptr(kB0), fake_ptr(kD0)},
+    {200, 100, fake_ptr(kB1), fake_ptr(kD1)},
+    {300, 100, /*copy_offset=*/325, /*copy_size=*/50, /*host_buffer=*/nullptr, fake_ptr(kDg)},
+    {400, 100, fake_ptr(kB2), fake_ptr(kD2)},
+    {500, 100, fake_ptr(kB3), fake_ptr(kD3)}};
+
+  auto req = rest_reactor::prep_host_to_device_ranges_rx_request(
+    cfg, file, ranges, rmm::cuda_stream_view{}, 0);
+  auto fut    = req->get_future();
+  auto chunks = req->get_all_chunks();
+
+  // => scatter head [100,300), the null range alone, scatter tail [400,600).
+  REQUIRE(chunks.size() == 3);
+  CHECK(chunks[0]->manager->total_chunks == 3);
+  CHECK(chunks[0]->manager->bytes_requested == 4 * 100 + 50);  // copy windows, not read spans
+  CHECK(chunks[0]->chunk.offset == 100);
+  CHECK(chunks[0]->chunk.n_chunks() == 2);
+  CHECK(chunks[2]->chunk.offset == 400);
+  CHECK(chunks[2]->chunk.n_chunks() == 2);
+
+  // The bounce-staged range: null src, the within-segment offset in src_off, and
+  // dst at the head of its own device destination (which addresses copy_offset).
+  CHECK(chunks[1]->chunk.offset == 300);
+  CHECK(chunks[1]->chunk.size == 100);
+  CHECK(chunks[1]->chunk.n_chunks() == 1);
+  CHECK(chunks[1]->chunk.data() == nullptr);
+  REQUIRE(chunks[1]->cpy_req->copies.size() == 1);
+  auto const& gap = chunks[1]->cpy_req->copies[0];
+  CHECK(gap.src == nullptr);
+  CHECK(gap.src_off == 325 - 300);  // data_lo - segment offset
+  CHECK(reinterpret_cast<uintptr_t>(gap.dst) == kDg);
+  CHECK(gap.size == 50);
+
+  complete(chunks);
+}
+
+TEST_CASE("prep_host_to_device_ranges splits an oversized null-buffer range across bounce blocks",
+          "[rest]")
+{
+  sirius::io::rest::config cfg;
+  cfg.bounce_block_size = 100;  // force the 500-byte read span over several slots
+  rest_io_object const file("s3://bkt/key", "bkt", "key", /*size=*/1 << 20);
+  constexpr uintptr_t kDst = 0x100000;
+
+  // Read [0, 500) through bounce slots but copy only [150, 430): the first
+  // slot-sized piece holds none of the copy window and must not be fetched.
+  std::vector<io_host_device_range> ranges{
+    {0, 500, /*copy_offset=*/150, /*copy_size=*/280, /*host_buffer=*/nullptr, fake_ptr(kDst)}};
+
+  auto req = rest_reactor::prep_host_to_device_ranges_rx_request(
+    cfg, file, ranges, rmm::cuda_stream_view{}, 0);
+  auto fut    = req->get_future();
+  auto chunks = req->get_all_chunks();
+
+  REQUIRE(chunks.size() == 4);  // the [0,100) piece is dropped, not emitted
+  CHECK(chunks[0]->manager->total_chunks == 4);
+  CHECK(chunks[0]->manager->bytes_requested == 280);  // exactly the copy window
+
+  // Every piece is standalone (a bounce slot each) and carries a clipped copy
+  // whose dst is biased by how far into the copy window that piece starts.
+  size_t copied = 0;
+  for (auto const& c : chunks) {
+    CHECK(c->chunk.n_chunks() == 1);
+    CHECK(c->chunk.data() == nullptr);
+    REQUIRE(c->cpy_req->copies.size() == 1);
+    CHECK(c->cpy_req->copies[0].src == nullptr);
+    copied += c->cpy_req->copies[0].size;
+  }
+  CHECK(copied == 280);
+
+  CHECK(chunks[0]->chunk.offset == 100);
+  CHECK(chunks[0]->cpy_req->copies[0].src_off == 150 - 100);  // head of the copy window
+  CHECK(reinterpret_cast<uintptr_t>(chunks[0]->cpy_req->copies[0].dst) == kDst);
+  CHECK(chunks[0]->cpy_req->copies[0].size == 50);
+  CHECK(chunks[1]->chunk.offset == 200);
+  CHECK(chunks[1]->cpy_req->copies[0].src_off == 0);
+  CHECK(reinterpret_cast<uintptr_t>(chunks[1]->cpy_req->copies[0].dst) == kDst + 50);
+  CHECK(chunks[1]->cpy_req->copies[0].size == 100);
+  CHECK(chunks[3]->chunk.offset == 400);
+  CHECK(reinterpret_cast<uintptr_t>(chunks[3]->cpy_req->copies[0].dst) == kDst + 250);
+  CHECK(chunks[3]->cpy_req->copies[0].size == 30);  // clipped by the copy window end
+
+  complete(chunks);
+}
+
+TEST_CASE("prep_host_to_device_ranges rejects an invalid or out-of-file copy window", "[rest]")
+{
+  sirius::io::rest::config cfg;
+  rest_io_object const file("s3://bkt/key", "bkt", "key", /*size=*/10000);
+  constexpr uintptr_t kB = 0xA000, kD = 0x100000;
+
+  // A copy window outside its read span would copy bytes the GET never fetched;
+  // one entirely past the object end would copy bytes that do not exist.
+  SECTION("copy window starting before the read span")
+  {
+    std::vector<io_host_device_range> ranges{
+      {100, 100, /*copy_offset=*/50, 20, fake_ptr(kB), fake_ptr(kD)}};
+    CHECK_THROWS_AS(rest_reactor::prep_host_to_device_ranges_rx_request(
+                      cfg, file, ranges, rmm::cuda_stream_view{}, 0),
+                    std::runtime_error);
+  }
+
+  SECTION("copy window running past the read span")
+  {
+    std::vector<io_host_device_range> ranges{
+      {100, 100, /*copy_offset=*/150, 100, fake_ptr(kB), fake_ptr(kD)}};
+    CHECK_THROWS_AS(rest_reactor::prep_host_to_device_ranges_rx_request(
+                      cfg, file, ranges, rmm::cuda_stream_view{}, 0),
+                    std::runtime_error);
+  }
+
+  SECTION("copy window entirely past the end of the object")
+  {
+    std::vector<io_host_device_range> ranges{
+      {10000, 100, /*copy_offset=*/10000, 100, fake_ptr(kB), fake_ptr(kD)}};
+    CHECK_THROWS_AS(rest_reactor::prep_host_to_device_ranges_rx_request(
+                      cfg, file, ranges, rmm::cuda_stream_view{}, 0),
+                    std::runtime_error);
+  }
+
+  SECTION("a null-buffer range without a bounce block size")
+  {
+    // REST has no GPU-direct path: with no staging block size there is nowhere
+    // for a caller-bufferless range to land.
+    std::vector<io_host_device_range> ranges{
+      {100, 100, /*host_buffer=*/nullptr, fake_ptr(kD)}};  // cfg.bounce_block_size == 0
+    CHECK_THROWS_AS(rest_reactor::prep_host_to_device_ranges_rx_request(
+                      cfg, file, ranges, rmm::cuda_stream_view{}, 0),
+                    std::runtime_error);
+  }
+}
+
+TEST_CASE("prep_host_to_device_ranges on an empty range list yields a ready zero-byte request",
+          "[rest]")
+{
+  sirius::io::rest::config cfg;
+  cfg.bounce_block_size = 4096;
+  rest_io_object const file("s3://bkt/key", "bkt", "key", /*size=*/1 << 20);
+
+  SECTION("no ranges at all")
+  {
+    std::vector<io_host_device_range> ranges;
+    auto req = rest_reactor::prep_host_to_device_ranges_rx_request(
+      cfg, file, ranges, rmm::cuda_stream_view{}, 0);
+    REQUIRE(req != nullptr);
+    CHECK(req->size() == 0);
+    auto fut = req->get_future();
+    CHECK(fut.is_ready());
+    CHECK(std::move(fut).get() == 0);
+  }
+
+  SECTION("only zero-length read spans")
+  {
+    std::vector<io_host_device_range> ranges{{0, 0, fake_ptr(0xA000), fake_ptr(0x100000)}};
+    auto req = rest_reactor::prep_host_to_device_ranges_rx_request(
+      cfg, file, ranges, rmm::cuda_stream_view{}, 0);
+    REQUIRE(req != nullptr);
+    CHECK(req->size() == 0);
+    auto fut = req->get_future();
+    CHECK(fut.is_ready());
+    CHECK(std::move(fut).get() == 0);
   }
 }
 

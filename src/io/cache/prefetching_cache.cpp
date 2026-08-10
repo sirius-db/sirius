@@ -559,6 +559,247 @@ exec::semi_future<std::size_t> prefetching_cache::device_read_async(const io_obj
   return _io_ctx->device_read_async_io(obj, offset, size, dst, stream);
 }
 
+bool prefetching_cache::copy_range_from_cache(std::span<cached_chunk* const> chunks,
+                                              const io::io_device_range& range,
+                                              rmm::cuda_stream_view stream,
+                                              std::vector<cached_chunk*>& pinned)
+{
+  size_t const end_offset = range.offset + range.size;
+  size_t const n_before   = pinned.size();
+
+  for (cached_chunk* c : chunks) {
+    size_t const lo = std::max(range.offset, c->offset);
+    size_t const hi = std::min(end_offset, c->offset + _chunk_size);
+    if (c->state.try_pin_covering(c->offset, _chunk_size, lo, hi)) {
+      pinned.push_back(c);
+      continue;
+    }
+    std::for_each(pinned.begin() + static_cast<std::ptrdiff_t>(n_before),
+                  pinned.end(),
+                  [](cached_chunk* p) { p->state.release_read(); });
+    pinned.resize(n_before);
+    return false;
+  }
+
+  bool ok = true;
+  for (cached_chunk* c : chunks) {
+    size_t const lo = std::max(range.offset, c->offset);
+    size_t const hi = std::min(end_offset, c->offset + _chunk_size);
+    cudaError_t err = cudaMemcpyAsync(range.device_dst + (lo - range.offset),
+                                      c->data + (lo - c->offset),
+                                      hi - lo,
+                                      cudaMemcpyHostToDevice,
+                                      stream);
+    if (err != cudaSuccess) {
+      SIRIUS_LOG_ERROR("prefetching_cache: cached chunk at offset {} failed to copy to device: {}",
+                       c->offset,
+                       cudaGetErrorString(err));
+      ok = false;
+      break;
+    }
+  }
+  return ok;
+}
+
+void prefetching_cache::plan_device_range(std::span<cached_chunk* const> chunks,
+                                          const io::io_device_range& range,
+                                          rmm::cuda_stream_view stream,
+                                          device_read_plan& plan)
+{
+  size_t const chunk_bytes     = _chunk_size;
+  size_t const req_end         = range.offset + range.size;
+  size_t const first_chunk_off = (range.offset / chunk_bytes) * chunk_bytes;
+  size_t const last_chunk_off  = ((req_end - 1) / chunk_bytes) * chunk_bytes;
+
+  size_t ci = 0;
+  for (size_t off = first_chunk_off; off <= last_chunk_off; off += chunk_bytes) {
+    while (ci < chunks.size() && chunks[ci]->offset < off) {
+      ++ci;
+    }
+    cached_chunk* c = (ci < chunks.size() && chunks[ci]->offset == off) ? chunks[ci] : nullptr;
+
+    size_t const need_lo = std::max(off, range.offset);
+    size_t const need_hi = std::min(off + chunk_bytes, req_end);
+    uint8_t* const dev   = range.device_dst + (need_lo - range.offset);
+
+    if (c != nullptr && c->state.try_pin_covering(off, chunk_bytes, need_lo, need_hi)) {
+      plan.pinned.push_back(c);
+      cudaError_t err = cudaMemcpyAsync(
+        dev, c->data + (need_lo - off), need_hi - need_lo, cudaMemcpyHostToDevice, stream);
+      if (err != cudaSuccess) {
+        throw std::runtime_error("prefetching_cache: cached chunk at offset " +
+                                 std::to_string(off) +
+                                 " failed to copy to device: " + cudaGetErrorString(err));
+      }
+      plan.served += need_hi - need_lo;
+      plan.hits++;
+      continue;
+    }
+
+    chunk_fill fill;
+    if (c != nullptr &&
+        c->state.take_loading_merging(needed_fill(off, chunk_bytes, need_lo, need_hi), fill)) {
+      assert(c->data != nullptr);
+      auto const [seg_lo, seg_hi] = fill_span(fill, off, chunk_bytes);
+      plan.loading.push_back(c);
+      plan.io_ranges.emplace_back(
+        seg_lo, seg_hi - seg_lo, need_lo, need_hi - need_lo, c->data + (seg_lo - off), dev);
+      plan.h2d++;
+      continue;
+    }
+
+    size_t const seg_lo = align_down(need_lo, io::IO_BLOCK_SIZE);
+    size_t const seg_hi = std::min(off + chunk_bytes, align_up(need_hi, io::IO_BLOCK_SIZE));
+    plan.io_ranges.emplace_back(seg_lo, seg_hi - seg_lo, need_lo, need_hi - need_lo, nullptr, dev);
+    plan.misses++;
+  }
+}
+
+exec::semi_future<std::size_t> prefetching_cache::device_read_ranges_async(
+  const io_object& obj,
+  std::span<const io::io_device_range> ranges,
+  rmm::cuda_stream_view stream,
+  prefetching_handle* out_handle)
+{
+  if (ranges.empty()) { return exec::make_semi_future<std::size_t>(0); }
+
+  bool const cache_while_reading = _io_ctx->supports_host_to_device_range_read();
+  if (!cache_while_reading && !_io_ctx->supports_device_range_read()) {
+    return _io_ctx->device_read_ranges_async_io(obj, ranges, stream);
+  }
+  coverage_policy const policy =
+    cache_while_reading ? coverage_policy::partial : coverage_policy::full;
+
+  std::shared_ptr<const std::vector<cached_chunk*>> requested;
+  if (out_handle && *out_handle) { requested = out_handle->chunks(); }
+
+  file_entry* file = nullptr;
+  {
+    std::shared_lock lk(_map_mtx);
+    auto it = _file_cache.find(obj.raw_file_cache_id());
+    if (it != _file_cache.end()) { file = it->second.get(); }
+  }
+
+  size_t const fsize = obj.size();
+
+  device_read_plan plan;
+  std::vector<io::io_device_range> uncached;
+  size_t reads = 0;
+  try {
+    for (auto const& r : ranges) {
+      if (r.size == 0 || r.device_dst == nullptr || r.offset >= fsize) { continue; }
+      ++reads;
+
+      // Clamped before planning, not after: an unclamped position past EOF would
+      // reach the backend as a copy window outside the file, which is a hard
+      // error there and would fail every other range in the batch with it.
+      io::io_device_range const range{r.offset, std::min(r.size, fsize - r.offset), r.device_dst};
+
+      std::vector<cached_chunk*> chunks;
+      if (requested) {
+        chunks = find_entry(*requested, range.offset, range.size, policy, _chunk_size);
+      }
+      if (chunks.empty() && file != nullptr) {
+        chunks = file->fetch_chunks(range.offset, range.size, policy);
+      }
+
+      if (cache_while_reading) {
+        plan_device_range(chunks, range, stream, plan);
+        continue;
+      }
+      if (!chunks.empty() && copy_range_from_cache(chunks, range, stream, plan.pinned)) {
+        plan.hits += chunks.size();
+        plan.served += range.size;
+        continue;
+      }
+      plan.misses += (range.size + _chunk_size - 1) / _chunk_size;
+      uncached.push_back(range);
+    }
+  } catch (...) {
+    if (!plan.pinned.empty()) {
+      SIRIUS_TRY_AND_LOG_EXCEPTION(
+        stream.synchronize(),
+        "prefetching_cache: failed to synchronize CUDA stream while unwinding cached range copies");
+      std::ranges::for_each(plan.pinned, [](cached_chunk* c) { c->state.release_read(); });
+    }
+    std::ranges::for_each(plan.loading,
+                          [](cached_chunk* c) { std::ignore = c->state.mark_load_failed(); });
+    return exec::make_semi_future<std::size_t>(std::current_exception());
+  }
+
+  _counters.n_reads.fetch_add(reads, std::memory_order_relaxed);
+  _counters.hits.fetch_add(plan.hits, std::memory_order_relaxed);
+  _counters.h2d.fetch_add(plan.h2d, std::memory_order_relaxed);
+  _counters.misses.fetch_add(plan.misses, std::memory_order_relaxed);
+
+  exec::semi_future<size_t> io_fut = exec::make_semi_future<size_t>(0);
+  if (cache_while_reading) {
+    if (!plan.io_ranges.empty()) {
+      io_fut = _io_ctx->host_to_device_read_ranges_async_io(obj, plan.io_ranges, stream);
+    }
+  } else if (!uncached.empty()) {
+    io_fut = _io_ctx->device_read_ranges_async_io(obj, uncached, stream);
+  }
+
+  size_t const served = plan.served;
+  if (plan.pinned.empty() && plan.loading.empty()) {
+    return std::move(io_fut)
+      .via(exec::inline_executor::instance())
+      .then_try([served](exec::try_t<size_t>&& res) -> size_t {
+        if (res.has_exception()) { std::rethrow_exception(std::move(res).exception()); }
+        return served + res.value();
+      })
+      .semi();
+  }
+
+  auto device_id = rmm::get_current_cuda_device();
+
+  return std::move(io_fut)
+    .via(exec::inline_executor::instance())
+    .then_try([this,
+               stream,
+               device_id,
+               served,
+               read_pinned = std::move(plan.pinned),
+               loading     = std::move(plan.loading)](exec::try_t<size_t>&& res) mutable -> size_t {
+      bool const ok = !res.has_exception();
+
+      rmm::cuda_set_device_raii guard(device_id);
+      // The deferred task must not outlive-capture `stream` — only the caller
+      // knows its lifetime.  When the event cannot be recorded, wait here
+      // instead, so the pins below still drop after the copies have drained.
+      std::unique_ptr<cucascade::cuda::cuda_event> event;
+      try {
+        event = std::make_unique<cucascade::cuda::cuda_event>();
+        event->record(stream);
+      } catch (...) {
+        event.reset();
+        SIRIUS_TRY_AND_LOG_EXCEPTION(
+          stream.synchronize(),
+          "prefetching_cache: failed to synchronize CUDA stream after cached range copies");
+      }
+
+      _io_cb_dispatcher.enqueue([read_pinned = std::move(read_pinned),
+                                 loading     = std::move(loading),
+                                 event       = std::move(event),
+                                 ok]() mutable {
+        if (event) {
+          SIRIUS_TRY_AND_LOG_EXCEPTION(
+            event->synchronize(),
+            "prefetching_cache: failed to synchronize CUDA event after cached range copies");
+        }
+        std::ranges::for_each(read_pinned, [](cached_chunk* c) { c->state.release_read(); });
+        auto transition = ok ? &chunk_state::mark_cached : &chunk_state::mark_load_failed;
+        std::ranges::for_each(
+          loading, [transition](cached_chunk* c) { std::ignore = (c->state.*transition)(); });
+      });
+
+      if (res.has_exception()) { std::rethrow_exception(std::move(res).exception()); }
+      return served + res.value();
+    })
+    .semi();
+}
+
 std::string prefetching_cache::summary() const
 {
   // Global totals plus the deltas since the last refresh (the most recent

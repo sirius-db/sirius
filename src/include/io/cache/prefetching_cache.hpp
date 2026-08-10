@@ -184,6 +184,19 @@ class prefetching_cache {
     rmm::cuda_stream_view stream,
     prefetching_handle* out_handle = nullptr);
 
+  /// Vectored form of @ref device_read_async: each range is served from the
+  /// cache where it is populated, loaded through the cache where it can be, and
+  /// bounced through the backend otherwise — all in one dispatch.  Requires a
+  /// backend with one of the two batch capabilities (both reactors have them);
+  /// on any other it returns the backend's failed future without touching the
+  /// cache.  Reports the bytes delivered, each range clamped to the object's
+  /// end, resolving once the copies are enqueued on @p stream.
+  [[nodiscard]] exec::semi_future<std::size_t> device_read_ranges_async(
+    const io_object& obj,
+    std::span<const io::io_device_range> ranges,
+    rmm::cuda_stream_view stream,
+    prefetching_handle* out_handle = nullptr);
+
   /// Issue prefetch IO for @p handle's request.  @p on_done fires exactly once
   /// with the outcome — inline when no IO is issued, otherwise from the IO
   /// completion.  Returns whether IO was issued.
@@ -233,6 +246,40 @@ class prefetching_cache {
     size_t file_size{0};
     size_t chunk_size{1};
   };
+
+  /// Pin every chunk of @p chunks over the part of @p range it covers and copy
+  /// it to the range's device destination on @p stream, appending the pins to
+  /// @p pinned — which the caller must release only after draining @p stream,
+  /// since a released pin makes its chunk evictable mid-copy.  Returns false if
+  /// the range went unserved: a chunk populated too little releases its own pins
+  /// and issues nothing, a failed copy leaves its pins for the caller.
+  [[nodiscard]] bool copy_range_from_cache(std::span<cached_chunk* const> chunks,
+                                           const io::io_device_range& range,
+                                           rmm::cuda_stream_view stream,
+                                           std::vector<cached_chunk*>& pinned);
+
+  /// How a batch of ranges resolves against the cache: chunks pinned for a
+  /// direct copy, chunks claimed for loading, and the IO ranges covering
+  /// everything that still has to be read.  Both chunk lists stay held until the
+  /// caller retires them once the IO and the copies have drained.
+  struct device_read_plan {
+    std::vector<cached_chunk*> pinned;
+    std::vector<cached_chunk*> loading;
+    std::vector<io::io_host_device_range> io_ranges;
+    std::size_t served{0};
+    std::size_t hits{0};
+    std::size_t h2d{0};
+    std::size_t misses{0};
+  };
+
+  /// Classify every chunk position of @p range into @p plan: copy what is
+  /// already populated to the device on @p stream, claim what can be loaded and
+  /// read it through the chunk's own buffer, and bounce the rest through the
+  /// backend.  Throws if a copy fails to enqueue.
+  void plan_device_range(std::span<cached_chunk* const> chunks,
+                         const io::io_device_range& range,
+                         rmm::cuda_stream_view stream,
+                         device_read_plan& plan);
 
   /// Pop every request still sitting in @p queue and retire its producer on
   /// @c producer_stage::abandoned, so a shutdown never leaves a request parked
