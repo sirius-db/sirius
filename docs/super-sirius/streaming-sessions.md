@@ -261,23 +261,35 @@ blocks forever (see the gotcha in [exec::stream_session](#execstream_session--th
 ### Partition fan-out
 
 A sink can expose **N output streams**, one per destination, each backed by its own repository.
-`sink()` GPU-hash-partitions each batch by the `partition_spec` key columns (the same
-`hash_partition` kernel the `PARTITION` operator uses) and pushes slice *i* into stream *i*;
-empty slices are skipped. A slow receiver's backlog accumulates in its own repository — spillable
-by the downgrade executor — without head-of-line-blocking the others. The single-destination sink
-is the N = 1 case and skips partitioning entirely.
+The routing mode is set by `partition_spec::mode`:
 
 ```cpp
+enum class partition_mode { hash, broadcast };
+
 struct partition_spec {
-  std::vector<int> key_columns;                 // hashed to pick a destination
-  std::vector<cudf::data_type> key_cast_types;  // per-key cast so INT32/INT64 keys agree
+  partition_mode mode = partition_mode::hash;
+  std::vector<int> key_columns;                 // hashed to pick a destination (hash mode only)
+  std::vector<cudf::data_type> key_cast_types;  // per-key cast so INT32/INT64 keys agree; ignored in broadcast
 };
 ```
 
-Rules:
+**Hash mode** — `sink()` GPU-hash-partitions each batch by the key columns (same `hash_partition`
+kernel as `PARTITION`) and pushes slice *i* into stream *i*; empty slices are skipped. A slow
+receiver's backlog accumulates in its own repository — spillable by the downgrade executor —
+without head-of-line-blocking the others.
 
-- N > 1 with no key columns is a **construction error** — silently routing every row to
+**Broadcast mode** — `sink()` replicates every batch to all N outputs. Output 0 receives the
+original handle (zero-copy); outputs 1..N−1 each receive an independent deep copy (`clone()` in
+the batch's current memory space, with a fresh `batch_id`). Clones are made before the output 0
+push so the terminal state cannot advance before copies are complete.
+
+The single-destination sink is the N = 1 case and skips both modes entirely (native push).
+
+Construction invariants:
+
+- **Hash mode, N > 1**: `key_columns` must be non-empty — silently routing every row to
   destination 0 would corrupt a downstream shuffle rather than fail loudly.
+- **Broadcast mode**: `key_columns` must be empty — broadcast routes by replication, not hashing.
 - Output stream id, partition index, and repository correspond **positionally**; `drained(i)` and
   `wait(i)` are independent per stream, so a slow receiver stays distinguishable from EOS.
 - All partitions share one sender (`PIPELINE_SENDER`), so pipeline finish drives all N streams to

@@ -65,10 +65,16 @@ sirius_physical_streaming_sink::sirius_physical_streaming_sink(
                                             std::to_string(i) + " must not be null");
     }
   }
-  if (output_repositories.size() > 1 && _spec.key_columns.empty()) {
-    throw sirius::invalid_input_exception("sirius_physical_streaming_sink: a sink with " +
+  if (_spec.mode == partition_mode::hash && output_repositories.size() > 1 &&
+      _spec.key_columns.empty()) {
+    throw sirius::invalid_input_exception("sirius_physical_streaming_sink: hash mode with " +
                                           std::to_string(output_repositories.size()) +
-                                          " destinations needs partition key columns to route by");
+                                          " destinations requires at least one key column");
+  }
+  if (_spec.mode == partition_mode::broadcast && !_spec.key_columns.empty()) {
+    throw sirius::invalid_input_exception(
+      "sirius_physical_streaming_sink: broadcast mode must have no key columns (routing is "
+      "replication, not hashing)");
   }
   // Fail here: bad cast list / key index is device-side UB in hash_partition.
   if (!_spec.key_cast_types.empty() && _spec.key_cast_types.size() != _spec.key_columns.size()) {
@@ -111,6 +117,31 @@ void sirius_physical_streaming_sink::sink(const operator_data& input_data,
       if (!_outputs[0]->push(batch)) {
         SIRIUS_LOG_WARN(
           "sirius_physical_streaming_sink: batch refused after end-of-stream and dropped");
+      }
+    }
+    return;
+  }
+
+  if (_spec.mode == partition_mode::broadcast) {
+    // Output 0 gets the original handle (zero-copy); outputs 1..N-1 each get an independent
+    // deep copy in the batch's current memory space so destinations cannot race over one handle's
+    // residency. Clones first so output 0's push does not advance the stream's terminal state
+    // before the copies are made.
+    const auto& batches  = input.get_data_batches();
+    const auto read_only = input.get_read_only_batches();
+    for (std::size_t b = 0; b < batches.size(); ++b) {
+      for (std::size_t i = 1; i < _outputs.size(); ++i) {
+        auto copy = read_only[b].clone(sirius::get_next_batch_id(), stream);
+        if (!_outputs[i]->push(std::move(copy))) {
+          SIRIUS_LOG_WARN(
+            "sirius_physical_streaming_sink: broadcast clone {} refused after end-of-stream and "
+            "dropped",
+            i);
+        }
+      }
+      if (!_outputs[0]->push(batches[b])) {
+        SIRIUS_LOG_WARN(
+          "sirius_physical_streaming_sink: broadcast batch refused after end-of-stream and dropped");
       }
     }
     return;

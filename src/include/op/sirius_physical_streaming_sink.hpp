@@ -33,11 +33,18 @@ namespace sirius::op {
 
 /// How a partitioned sink routes rows across its output streams. Destination nodes are the
 /// wrapper's routing table — the sink stays oblivious.
+enum class partition_mode {
+  hash,       ///< GPU-hash-partition by key_columns; key_columns must be non-empty.
+  broadcast,  ///< Replicate every batch to all N outputs; key_columns must be empty.
+};
+
 struct partition_spec {
-  /// Hashed to pick a destination. Must be non-empty when N > 1.
+  partition_mode mode = partition_mode::hash;
+
+  /// Hashed to pick a destination. Must be non-empty for hash mode; must be empty for broadcast.
   std::vector<int> key_columns;
 
-  /// Per-key cast before hashing (e.g. INT32 vs INT64). Empty = hash as-is.
+  /// Per-key cast before hashing (e.g. INT32 vs INT64). Empty = hash as-is. Ignored in broadcast.
   std::vector<cudf::data_type> key_cast_types;
 };
 
