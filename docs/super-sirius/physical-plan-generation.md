@@ -43,10 +43,12 @@ The `sirius_physical_plan_generator::create_plan()` method is the entry point. I
 
 The `plan_comparison_join()` method selects the join implementation:
 
-1. **Hash Join** — chosen when at least one equality condition exists. Checks `are_conditions_supported()` for mixed joins (equality + inequality on disjoint columns). Created with `max_build_hash_table_bytes` limit.
+1. **Hash Join** — chosen when at least one equality condition exists. Checks `are_conditions_supported()` for mixed joins (equality plus an inequality, or a null-safe `IS NOT DISTINCT FROM` key mixed with a plain `=`, on disjoint columns). Created with `max_build_hash_table_bytes` limit.
 2. **Nested Loop Join** — fallback for pure inequality joins where `PhysicalNestedLoopJoin::IsSupported()` returns true.
 
 Left side = probe (streamed), right side = build (materialized).
+
+Before either is chosen, `materialize_expression_join_keys()` pushes a projection below the join that turns complex equality-key expressions into real columns, rewriting the condition side to a plain reference so `PARTITION` (which hashes by column index) can consume it. It also materializes the *cast* on a null-safe key that will be routed to the mixed join's cuDF AST predicate: a routed key skips the hash-key path's `cudf::cast`, and a cuDF AST can only cast to INT64 / UINT64 / FLOAT64, so e.g. the INTEGER cast DuckDB inserts for a SMALLINT/INTEGER `IS NOT DISTINCT FROM` has to become a column. `are_conditions_supported()` rejects any routed null-safe key still carrying an untranslatable expression, so the join lands on the nested loop join (or CPU) instead of throwing mid-query.
 
 ### Aggregate Planning
 

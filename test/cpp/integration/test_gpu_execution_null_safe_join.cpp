@@ -60,8 +60,9 @@ class NullSafeJoinFixture : public sirius::test::GpuExecutionFixture {
 };
 
 // A join mixing plain '=' with IS NOT DISTINCT FROM (as delim joins for correlated
-// subqueries do). `b` has no NULLs, so IS NOT DISTINCT FROM behaves like '=' and
-// the single-flag GPU join matches CPU.
+// subqueries do). `b` has no NULLs, so the result is independent of null semantics;
+// this fixture guards that the mixed-key join stays on the GPU. NULL-to-NULL matching
+// on the null-safe key is covered by MixedKeyNullSafeJoinFixture below.
 class MixedKeyJoinFixture : public sirius::test::GpuExecutionFixture {
  public:
   MixedKeyJoinFixture()
@@ -129,12 +130,162 @@ TEST_CASE_METHOD(MixedKeyJoinFixture,
                  "gpu_execution mixed '=' and IS NOT DISTINCT FROM join runs on GPU",
                  "[integration][gpu_execution][join][nulls]")
 {
-  // Regression guard: a join mixing '=' with IS NOT DISTINCT FROM must stay on the
-  // GPU and must NOT be rejected -- rejecting it routed delim joins to the
-  // unsupported nested-loop path. cuDF applies one null_equality flag to all keys,
-  // so this uses UNEQUAL; `b` has no NULLs, so that matches CPU here.
+  // Keep null-free mixed keys on GPU; rejecting them breaks delim joins.
   compare_gpu_vs_cpu(
     "SELECT ml.a, ml.b FROM ml JOIN mr ON ml.a = mr.a AND ml.b IS NOT DISTINCT FROM mr.b");
   compare_gpu_vs_cpu(
     "SELECT count(*) FROM ml JOIN mr ON ml.a = mr.a AND ml.b IS NOT DISTINCT FROM mr.b");
+}
+
+// Mixed plain and null-safe keys require UNEQUAL hashing plus a NULL_EQUAL predicate.
+class MixedKeyNullSafeJoinFixture : public sirius::test::GpuExecutionFixture {
+ public:
+  MixedKeyNullSafeJoinFixture()
+  {
+    run_ok("CREATE TABLE mnl (id INTEGER, a INTEGER, b INTEGER);");
+    run_ok("CREATE TABLE mnr (id INTEGER, a INTEGER, b INTEGER);");
+    // Includes null-safe NULL matches and a NULL pair in the plain key that must not match.
+    run_ok(
+      "INSERT INTO mnl VALUES (1, 10, 100), (2, 10, NULL), (3, 20, NULL), (4, 30, 300), "
+      "(5, 40, NULL), (6, NULL, 500);");
+    run_ok(
+      "INSERT INTO mnr VALUES (100, 10, 100), (101, 10, NULL), (102, 20, NULL), "
+      "(103, 30, 999), (104, NULL, 500);");
+    run_ok("CHECKPOINT;");
+  }
+};
+
+TEST_CASE_METHOD(MixedKeyNullSafeJoinFixture,
+                 "gpu_execution mixed '=' + null-safe INNER join matches NULL to NULL",
+                 "[integration][gpu_execution][join][nulls]")
+{
+  // Expected matches: one non-NULL pair and two null-safe NULL pairs.
+  compare_gpu_vs_cpu(
+    "SELECT mnl.id, mnr.id FROM mnl JOIN mnr "
+    "ON mnl.a = mnr.a AND mnl.b IS NOT DISTINCT FROM mnr.b");
+  compare_gpu_vs_cpu(
+    "SELECT count(*) FROM mnl JOIN mnr "
+    "ON mnl.a = mnr.a AND mnl.b IS NOT DISTINCT FROM mnr.b");
+}
+
+TEST_CASE_METHOD(MixedKeyNullSafeJoinFixture,
+                 "gpu_execution mixed '=' + null-safe LEFT join matches NULL and pads unmatched",
+                 "[integration][gpu_execution][join][nulls]")
+{
+  // All six left rows are emitted; rows 4, 5, and 6 are NULL-padded on the right.
+  compare_gpu_vs_cpu(
+    "SELECT mnl.id, mnr.id FROM mnl LEFT JOIN mnr "
+    "ON mnl.a = mnr.a AND mnl.b IS NOT DISTINCT FROM mnr.b");
+}
+
+TEST_CASE_METHOD(MixedKeyNullSafeJoinFixture,
+                 "gpu_execution mixed '=' + null-safe SEMI and ANTI joins",
+                 "[integration][gpu_execution][join][nulls]")
+{
+  // Preserve left SEMI/ANTI planning; row 6 must not match on its plain NULL key.
+  disabled_optimizer_guard guard(*con->context, duckdb::OptimizerType::BUILD_SIDE_PROBE_SIDE);
+  compare_gpu_vs_cpu(
+    "SELECT mnl.id FROM mnl SEMI JOIN mnr "
+    "ON mnl.a = mnr.a AND mnl.b IS NOT DISTINCT FROM mnr.b");
+  compare_gpu_vs_cpu(
+    "SELECT mnl.id FROM mnl ANTI JOIN mnr "
+    "ON mnl.a = mnr.a AND mnl.b IS NOT DISTINCT FROM mnr.b");
+}
+
+TEST_CASE_METHOD(MixedKeyNullSafeJoinFixture,
+                 "gpu_execution mixed '=' + null-safe FULL OUTER join matches NULL to NULL",
+                 "[integration][gpu_execution][join][nulls]")
+{
+  // FULL OUTER cannot be rewritten to a swapped join.
+  compare_gpu_vs_cpu(
+    "SELECT mnl.id, mnr.id FROM mnl FULL OUTER JOIN mnr "
+    "ON mnl.a = mnr.a AND mnl.b IS NOT DISTINCT FROM mnr.b");
+}
+
+TEST_CASE_METHOD(
+  MixedKeyNullSafeJoinFixture,
+  "gpu_execution mixed '=' + null-safe RIGHT join hits the right-family path (no swap)",
+  "[integration][gpu_execution][join][nulls]")
+{
+  // Preserve RIGHT instead of lowering it to a swapped LEFT join.
+  disabled_optimizer_guard guard(*con->context, duckdb::OptimizerType::BUILD_SIDE_PROBE_SIDE);
+  compare_gpu_vs_cpu(
+    "SELECT mnl.id, mnr.id FROM mnl RIGHT JOIN mnr "
+    "ON mnl.a = mnr.a AND mnl.b IS NOT DISTINCT FROM mnr.b");
+}
+
+// `b` requires materializing an AST-unsupported SMALLINT-to-INTEGER cast; `c` exercises
+// the inline SMALLINT-to-BIGINT cast supported by cuDF AST.
+class MixedTypeNullSafeJoinFixture : public sirius::test::GpuExecutionFixture {
+ public:
+  MixedTypeNullSafeJoinFixture()
+  {
+    run_ok("CREATE TABLE mtl (id INTEGER, a INTEGER, b SMALLINT, c SMALLINT);");
+    run_ok("CREATE TABLE mtr (id INTEGER, a INTEGER, b INTEGER, c BIGINT);");
+    // Same null-matching cases as MixedKeyNullSafeJoinFixture, with mixed key types.
+    run_ok(
+      "INSERT INTO mtl VALUES (1, 10, 100, 100), (2, 10, NULL, NULL), (3, 20, NULL, NULL), "
+      "(4, 30, 300, 300), (5, 40, NULL, NULL), (6, NULL, 500, 500);");
+    run_ok(
+      "INSERT INTO mtr VALUES (100, 10, 100, 100), (101, 10, NULL, NULL), (102, 20, NULL, NULL), "
+      "(103, 30, 999, 999), (104, NULL, 500, 500);");
+    run_ok("CHECKPOINT;");
+  }
+};
+
+TEST_CASE_METHOD(MixedTypeNullSafeJoinFixture,
+                 "gpu_execution mixed '=' + null-safe join with an AST-untranslatable cast",
+                 "[integration][gpu_execution][join][nulls]")
+{
+  // SMALLINT-to-INTEGER must be materialized while preserving three expected matches.
+  compare_gpu_vs_cpu(
+    "SELECT mtl.id, mtr.id FROM mtl JOIN mtr "
+    "ON mtl.a = mtr.a AND mtl.b IS NOT DISTINCT FROM mtr.b");
+  compare_gpu_vs_cpu(
+    "SELECT count(*) FROM mtl JOIN mtr "
+    "ON mtl.a = mtr.a AND mtl.b IS NOT DISTINCT FROM mtr.b");
+}
+
+TEST_CASE_METHOD(MixedTypeNullSafeJoinFixture,
+                 "gpu_execution mixed '=' + null-safe join with a cast and no NULLs",
+                 "[integration][gpu_execution][join][nulls]")
+{
+  // The pre-routing, null-free case must continue to run without fallback.
+  compare_gpu_vs_cpu(
+    "SELECT mtl.id, mtr.id FROM mtl JOIN mtr "
+    "ON mtl.a = mtr.a AND mtl.b IS NOT DISTINCT FROM mtr.b "
+    "WHERE mtl.b IS NOT NULL AND mtr.b IS NOT NULL");
+}
+
+TEST_CASE_METHOD(MixedTypeNullSafeJoinFixture,
+                 "gpu_execution mixed '=' + null-safe join with an AST-translatable cast",
+                 "[integration][gpu_execution][join][nulls]")
+{
+  // SMALLINT-to-BIGINT remains inline because cuDF AST supports the target type.
+  compare_gpu_vs_cpu(
+    "SELECT mtl.id, mtr.id FROM mtl JOIN mtr "
+    "ON mtl.a = mtr.a AND mtl.c IS NOT DISTINCT FROM mtr.c");
+}
+
+TEST_CASE_METHOD(MixedTypeNullSafeJoinFixture,
+                 "gpu_execution mixed-type null-safe join does not leak the materialized key",
+                 "[integration][gpu_execution][join][nulls]")
+{
+  // SELECT * catches synthetic key columns leaking into join output.
+  compare_gpu_vs_cpu(
+    "SELECT * FROM mtl JOIN mtr ON mtl.a = mtr.a AND mtl.b IS NOT DISTINCT FROM mtr.b");
+  compare_gpu_vs_cpu(
+    "SELECT * FROM mtl LEFT JOIN mtr ON mtl.a = mtr.a AND mtl.b IS NOT DISTINCT FROM mtr.b");
+}
+
+// MARK cannot use MIXED_JOIN, so null-safe keys remain a known [!mayfail] limitation.
+// Replace with a hard comparison or fallback assertion once supported.
+TEST_CASE_METHOD(MixedKeyNullSafeJoinFixture,
+                 "gpu_execution null-safe MARK join (projected EXISTS) is a known limitation",
+                 "[integration][gpu_execution][join][nulls][!mayfail]")
+{
+  compare_gpu_vs_cpu(
+    "SELECT mnl.id, EXISTS (SELECT 1 FROM mnr "
+    "WHERE mnr.a = mnl.a AND mnr.b IS NOT DISTINCT FROM mnl.b) AS has_match "
+    "FROM mnl");
 }
