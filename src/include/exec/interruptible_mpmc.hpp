@@ -20,8 +20,10 @@
 
 #include <atomic>
 #include <concepts>
+#include <cstdint>
 #include <memory>
 #include <optional>
+#include <vector>
 
 namespace sirius::exec {
 
@@ -54,6 +56,12 @@ class interruptible_mpmc {
 
   // Atomic flag to manage the shutdown state
   std::atomic<bool> _is_active{true};
+
+  // Backstop poll interval (us) for wait_dequeue_timed. interrupt() wakes consumers directly, so
+  // this only bounds the (not expected) case of a missed sentinel.
+  static constexpr std::int64_t kPollBackstopUs = 10000;
+  // Number of null sentinels enqueued per interrupt, one per potential blocked consumer.
+  static constexpr int kWakeSentinels = 4;
 
  public:
   interruptible_mpmc() = default;
@@ -91,7 +99,12 @@ class interruptible_mpmc {
   {
     pointer_type item = nullptr;
     while (_is_active.load(std::memory_order_relaxed)) {
-      if (queue.wait_dequeue_timed(item, 10000)) { return std::move(item); }
+      // A null item is the interrupt sentinel enqueued by interrupt(); treat it as "interrupted"
+      // rather than as work. The timeout remains as a backstop for any missed wake-up.
+      if (queue.wait_dequeue_timed(item, kPollBackstopUs)) {
+        if (item == nullptr) { return nullptr; }
+        return std::move(item);
+      }
     }
     return nullptr;
   }
@@ -99,20 +112,35 @@ class interruptible_mpmc {
   /**
    * \brief Attempts to pop without blocking.
    * \return Returns nullptr if the queue is empty.
+   *
+   * Interrupt sentinels are skipped, not returned: try_pop reports work or
+   * emptiness, never interruption — otherwise a real item queued behind a
+   * sentinel would be unreachable to drain/cancel loops.
    */
   pointer_type try_pop()
   {
     pointer_type item = nullptr;
-    if (queue.try_dequeue(item)) { return std::move(item); }
+    while (queue.try_dequeue(item)) {
+      if (item != nullptr) { return std::move(item); }
+    }
     return nullptr;
   }
 
   /**
-   * Interrupts the queue.
-   * \brief Sets the active flag to false.
-   * Consumer threads will see this flag on their next loop cycle (max 10ms delay).
+   * \brief Clears the active flag AND wakes any blocked consumer immediately.
+   *
+   * A consumer blocked in wait_dequeue_timed would otherwise not notice the interrupt until its
+   * poll interval elapsed, a stall paid on the teardown path of every query. Enqueuing null
+   * sentinels wakes the waiter at once; pop() maps a null item to its existing "interrupted"
+   * return. kWakeSentinels covers multiple consumers.
    */
-  void interrupt() { _is_active.store(false); }
+  void interrupt()
+  {
+    _is_active.store(false);
+    for (int i = 0; i < kWakeSentinels; ++i) {
+      queue.enqueue(pointer_type{});
+    }
+  }
 
   void drain()
   {
@@ -132,7 +160,22 @@ class interruptible_mpmc {
   /**
    * Resets the queue state to active (useful for restarting workers).
    */
-  void reactivate() { _is_active.store(true, std::memory_order_relaxed); }
+  void reactivate()
+  {
+    // Discard every unconsumed interrupt sentinel so it cannot be mistaken for an interrupt
+    // after the queue is live again. try_dequeue does not honor FIFO across producer
+    // sub-queues, so a single scan that stops at the first real item can leave sentinels
+    // behind it — drain to exhaustion, then re-enqueue the surviving real items.
+    std::vector<pointer_type> kept;
+    pointer_type item = nullptr;
+    while (queue.try_dequeue(item)) {
+      if (item != nullptr) { kept.push_back(std::move(item)); }
+    }
+    for (auto& survivor : kept) {
+      queue.enqueue(std::move(survivor));
+    }
+    _is_active.store(true, std::memory_order_relaxed);
+  }
 };
 
 }  // namespace sirius::exec

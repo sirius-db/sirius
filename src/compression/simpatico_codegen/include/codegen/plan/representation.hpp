@@ -77,6 +77,28 @@ struct compressible_output {
   cudf::column_view view;
 };
 
+/// A set-membership predicate evaluated *during* decode instead of after it.
+///
+/// When a column is decoded with a non-empty directive, decompression yields a
+/// BOOL8 column of the original row count — row @c i is true iff the value that
+/// would have been reconstructed at @c i equals one of @c equals_any — rather
+/// than the reconstructed column itself. Nulls propagate as nulls, matching
+/// @c cudf::binary_operation(col, scalar, EQUAL).
+///
+/// This exists so a dictionary-compressed column consumed only by an equality /
+/// IN predicate never pays the decode gather: the predicate is resolved against
+/// the (tiny) key set and mapped over the indices. See
+/// @c dictionary_compressed_representation::decompress_predicate. Every other
+/// representation falls back to "decode, then compare", which is correct but
+/// buys nothing — so callers should gate the pushdown on
+/// @c plan_supports_predicate_decode.
+struct decode_predicate {
+  /// String values to test membership against. Empty ⇒ no directive.
+  std::vector<std::string> equals_any;
+
+  [[nodiscard]] bool active() const noexcept { return !equals_any.empty(); }
+};
+
 /// Storage/metadata base for all compressed representations.
 ///
 /// Every rep stored in a PlanNode carries type, row count, serializable channel
@@ -238,6 +260,19 @@ struct dictionary_compressed_representation : standalone_compressed_representati
 
   std::unique_ptr<cudf::column> decompress(rmm::cuda_stream_view stream,
                                            rmm::device_async_resource_ref mr) const override;
+
+  /// Evaluate @p pred against the dictionary *keys* and map the result over the
+  /// indices, returning a BOOL8 column of @c num_rows without ever gathering the
+  /// key chars into a decoded STRING column.
+  ///
+  /// The keys column is the distinct-value set (four entries for
+  /// `l_shipinstruct`), so the comparison is effectively free; the only
+  /// full-length pass is a 1-byte-per-row lookup over the already-materialised
+  /// INT32 indices. Nulls propagate from the dictionary column, matching the
+  /// semantics of comparing the decoded STRING column against the same values.
+  std::unique_ptr<cudf::column> decompress_predicate(decode_predicate const& pred,
+                                                     rmm::cuda_stream_view stream,
+                                                     rmm::device_async_resource_ref mr) const;
 
   std::vector<compressible_output> named_channels(rmm::cuda_stream_view stream) const override
   {

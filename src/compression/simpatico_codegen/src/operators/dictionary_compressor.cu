@@ -5,6 +5,7 @@
 
 #include "codegen/plan/representation.hpp"
 
+#include <cudf/binaryop.hpp>
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/column/column_view.hpp>
@@ -13,6 +14,7 @@
 #include <cudf/dictionary/dictionary_column_view.hpp>
 #include <cudf/dictionary/dictionary_factories.hpp>
 #include <cudf/dictionary/encode.hpp>
+#include <cudf/null_mask.hpp>
 #include <cudf/reduction/approx_distinct_count.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/strings/strings_column_view.hpp>
@@ -30,6 +32,7 @@
 #include <thrust/iterator/counting_iterator.h>
 #include <thrust/logical.h>
 #include <thrust/tabulate.h>
+#include <thrust/transform.h>
 
 #include <algorithm>
 #include <cstdio>
@@ -283,6 +286,79 @@ std::unique_ptr<cudf::column> dictionary_compressed_representation::decompress(
       return fast;
   }
   return cudf::dictionary::decode(dict_column->view(), stream, mr);
+}
+
+std::unique_ptr<cudf::column> dictionary_compressed_representation::decompress_predicate(
+  decode_predicate const& pred,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr) const
+{
+  nvtx3::scoped_range r{"dictionary_decompress_predicate"};
+  if (dict_column == nullptr || !pred.active()) { return nullptr; }
+
+  auto const n_rows = dict_column->size();
+  auto const bool_t = cudf::data_type{cudf::type_id::BOOL8};
+  if (n_rows == 0) { return cudf::make_empty_column(bool_t); }
+
+  cudf::dictionary_column_view const dv(dict_column->view());
+  auto const keys    = dv.keys();
+  auto const n_keys  = keys.size();
+  auto const indices = dv.indices();
+
+  // Zero keys with rows present: encode drops null rows from the key set, so
+  // every row is null and the comparison is null throughout.
+  if (n_keys == 0) {
+    auto out =
+      cudf::make_fixed_width_column(bool_t, n_rows, cudf::mask_state::ALL_NULL, stream, mr);
+    out->set_null_count(n_rows);
+    return out;
+  }
+  // The index lookup below reads indices[i] unconditionally, so anything other
+  // than the INT32 index type encode produces is left to the generic path.
+  if (indices.type().id() != cudf::type_id::INT32) { return nullptr; }
+  if (keys.type().id() != cudf::type_id::STRING) { return nullptr; }
+  // A null key would make the per-key comparison null rather than false, and the
+  // OR-accumulate below would then propagate it. cudf::dictionary::encode never
+  // produces one (nulls live on the parent's mask, not in the key set), so leave
+  // the shape to the generic path instead of carrying a tri-state accumulate.
+  if (keys.null_count() > 0) { return nullptr; }
+
+  // One bool per distinct value: keys ∈ equals_any. The key set is the column's
+  // whole distinct-value population (four entries for l_shipinstruct), so these
+  // kernels are noise next to the row-length pass below — which is the entire
+  // point: this is the work that replaces the decode gather.
+  std::unique_ptr<cudf::column> lut;
+  for (auto const& value : pred.equals_any) {
+    cudf::string_scalar const needle(value, true, stream);
+    auto hit =
+      cudf::binary_operation(keys, needle, cudf::binary_operator::EQUAL, bool_t, stream, mr);
+    lut = lut ? cudf::binary_operation(
+                  lut->view(), hit->view(), cudf::binary_operator::LOGICAL_OR, bool_t, stream, mr)
+              : std::move(hit);
+  }
+  if (!lut || lut->size() != n_keys) { return nullptr; }
+
+  // Only the *row* validity needs carrying: the keys are non-null (checked
+  // above), so a matching code is unambiguously true.
+  auto const null_count = dict_column->null_count();
+  rmm::device_buffer null_mask =
+    null_count > 0 ? cudf::copy_bitmask(dict_column->view(), stream, mr) : rmm::device_buffer{};
+  auto out =
+    cudf::make_fixed_width_column(bool_t, n_rows, std::move(null_mask), null_count, stream, mr);
+
+  auto* d_out       = out->mutable_view().data<bool>();
+  auto const* d_lut = lut->view().data<bool>();
+  auto const* d_idx = indices.data<int32_t>();
+  // Null rows carry an unspecified index (encode does not promise 0), so clamp
+  // rather than trust it — the value is masked off either way.
+  thrust::transform(rmm::exec_policy(stream),
+                    d_idx,
+                    d_idx + n_rows,
+                    d_out,
+                    [d_lut, n_keys] __device__(int32_t code) {
+                      return code >= 0 && code < n_keys ? d_lut[code] : false;
+                    });
+  return out;
 }
 
 std::unique_ptr<compressed_representation> dictionary_compressor::compress(
