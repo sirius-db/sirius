@@ -18,12 +18,20 @@
 
 #include "op/sirius_physical_operator.hpp"
 
+#include <atomic>
 #include <condition_variable>
+#include <cstddef>
+#include <cstdint>
 #include <deque>
 #include <exception>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <vector>
+
+namespace cucascade {
+class data_batch;
+}  // namespace cucascade
 
 namespace sirius::scan_manager {
 
@@ -79,6 +87,26 @@ class split_connector : public std::enable_shared_from_this<split_connector> {
 
   [[nodiscard]] bool has_more_splits() const;
 
+  /// \brief Snapshot the data batches of pending RESIDENT splits (pinned-cache hits),
+  ///        in queue (consumption) order, without popping anything.
+  ///
+  /// Used by the memory prefetcher to upgrade queued host-resident batches to GPU
+  /// tier ahead of task creation. Fresh-read splits (scan metadata) are skipped.
+  /// The returned shared_ptrs are copies; the batch state machine arbitrates any
+  /// race with a consumer that pops the split concurrently.
+  [[nodiscard]] std::vector<std::shared_ptr<::cucascade::data_batch>> peek_resident_batches() const;
+
+  /// \brief True while the connector counts as actively draining: a consumer
+  ///        popped a split within the last @p quiet_ms milliseconds.
+  ///
+  /// The connector timestamps every get_next_split() pop; there is no explicit
+  /// end-of-drain signal from the scan (its tasks just stop popping when the
+  /// scan moves on), so "no pop for quiet_ms" is the drain-over condition. The
+  /// memory prefetcher skips draining connectors: the scan's own tasks convert
+  /// their batches concurrently (one stream per pipeline thread), and
+  /// prefetch threads grabbing exclusive locks would serialize them.
+  [[nodiscard]] bool is_draining(std::size_t quiet_ms) const;
+
  private:
   friend class load_balancing_scan_batch_coalescer;
 
@@ -92,6 +120,8 @@ class split_connector : public std::enable_shared_from_this<split_connector> {
   std::deque<std::unique_ptr<op::operator_data>> _splits;
   bool _closed{false};
   std::exception_ptr _exception;
+  /// steady_clock ms timestamp of the last get_next_split() pop (0 = never).
+  std::atomic<std::int64_t> _last_pop_ms{0};
 };
 
 }  // namespace sirius::scan_manager

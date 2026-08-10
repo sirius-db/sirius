@@ -30,6 +30,7 @@
 #include <cub/device/device_for.cuh>
 #include <cuco/operator.hpp>
 #include <cuco/static_set.cuh>
+#include <cuco/storage.cuh>
 #include <cuda/sirius_rmm_cuco_allocator.cuh>
 #include <cuda/std/functional>
 #include <cuda/std/limits>
@@ -54,13 +55,39 @@
 namespace sirius::op {
 
 namespace {
-// Match estimated_set_bytes' 0.5 load factor: capacity = 2 × keys.
+// Baseline load factor: capacity = 2 × keys.
 constexpr std::size_t kCapacityFactor = 2;
 constexpr double kLoadFactor          = 1.0 / kCapacityFactor;
 
 // Threads per key probe.
 constexpr std::size_t kCgSize = 1;
 static_assert(kCgSize == 1, "cuco::static_set requires kCgSize==1 for device_for bulk iteration");
+
+// Keys per bucket. Sized for a double-hashed probe, where each step is a random fetch and a
+// wider bucket retires several dependent fetches in one; the right value depends on the probing
+// scheme, not on the key type.
+constexpr std::int32_t kBucketSize = 4;
+
+// Largest capacity multiplier whose table still fits `budget`, else the baseline. Growth only
+// makes an already-chosen set sparser: estimated_set_bytes (and so IN-list vs Bloom selection)
+// is always evaluated at the baseline factor.
+constexpr std::size_t kGrowthCandidates[] = {4, 3};
+
+[[nodiscard]] std::size_t capacity_factor_for(std::size_t num_keys, std::size_t key_bytes) noexcept
+{
+  int l2     = 0;
+  int device = -1;
+  if (cudaGetDevice(&device) != cudaSuccess ||
+      cudaDeviceGetAttribute(&l2, cudaDevAttrL2CacheSize, device) != cudaSuccess || l2 <= 0) {
+    return kCapacityFactor;
+  }
+  auto const budget = static_cast<std::size_t>(l2) / 2;
+  for (auto const factor : kGrowthCandidates) {
+    // num_keys * key_bytes is bounded by the build column's own size, so this cannot overflow.
+    if (num_keys * key_bytes * factor <= budget) { return factor; }
+  }
+  return kCapacityFactor;
+}
 
 // Minimum set capacity.
 constexpr std::size_t kMinCapacity = 8;
@@ -74,7 +101,8 @@ using set_type = cuco::static_set<KeyT,
                                   cuda::thread_scope_device,
                                   cuda::std::equal_to<KeyT>,
                                   cuco::double_hashing<kCgSize, cuco::default_hash_function<KeyT>>,
-                                  set_alloc<KeyT>>;
+                                  set_alloc<KeyT>,
+                                  cuco::storage<kBucketSize>>;
 
 template <class KeyT>
 using set_owner = std::unique_ptr<set_type<KeyT>>;
@@ -182,7 +210,9 @@ sirius_dynamic_in_list_filter::sirius_dynamic_in_list_filter(cudf::column_view c
   }
 
   cuda::stream_ref const s{stream.value()};
-  auto const capacity = std::max<std::size_t>(kCapacityFactor * _num_keys, kMinCapacity);
+  auto const factor =
+    capacity_factor_for(_num_keys, static_cast<std::size_t>(cudf::size_of(_key_type)));
+  auto const capacity = std::max<std::size_t>(factor * _num_keys, kMinCapacity);
   _set                = std::make_unique<set_impl>();
   if (cudaGetDevice(&_set->source_device) != cudaSuccess) {
     throw std::runtime_error("[sirius_dynamic_in_list_filter] failed to identify source device.");
@@ -201,6 +231,14 @@ sirius_dynamic_in_list_filter::sirius_dynamic_in_list_filter(cudf::column_view c
       throw std::logic_error(
         "[sirius_dynamic_in_list_filter] supported key type changed during construction.");
   }
+  SIRIUS_LOG_DEBUG(
+    "[sirius_dynamic_in_list_filter] built set: {} keys, bucket_size={}, capacity_factor={}, "
+    "capacity={} slots ({} bytes).",
+    _num_keys,
+    kBucketSize,
+    factor,
+    capacity,
+    capacity * static_cast<std::size_t>(cudf::size_of(_key_type)));
   _set->replicas.push_back(std::move(source));
 }
 
@@ -372,6 +410,8 @@ std::unique_ptr<cudf::column> sirius_dynamic_in_list_filter::compute_mask(
 
 std::size_t sirius_dynamic_in_list_filter::size() const noexcept { return _num_keys; }
 
+// Reports the *baseline* (kCapacityFactor) footprint — a lower bound on the real allocation
+// rather than an exact size, keeping the IN-list/Bloom choice independent of probe-side tuning.
 std::size_t sirius_dynamic_in_list_filter::estimated_set_bytes(std::size_t num_keys,
                                                                cudf::data_type key_type) noexcept
 {
