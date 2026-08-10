@@ -22,6 +22,8 @@
 #include "sirius_engine.hpp"
 #include "sirius_interface.hpp"
 
+#include <cudf/types.hpp>
+
 #include <string>
 #include <utility>
 
@@ -30,6 +32,45 @@ namespace sirius::exec {
 namespace {
 
 constexpr const char* kFragmentQueryLabel = "sirius_streaming_fragment";
+
+// Derive a per-key cuDF cast type so independently-planned senders always hash identically.
+// Different planners may bind the same logical column to different native widths (e.g. INT32 vs
+// INT64). cuDF's murmur3 hashes bytes, not values, so without normalization matching keys land in
+// different partitions and groups are silently split.
+//
+// Rules (mirror integration::streaming_fragment::build):
+//   TINYINT / SMALLINT / INTEGER → INT64   (all sub-64-bit integers → canonical 64-bit)
+//   BIGINT / BOOLEAN / VARCHAR   → EMPTY   (already canonical; hash as-is)
+//   DECIMAL (any precision/scale) → FLOAT64 (normalized floating representation)
+//   anything else                → throw
+cudf::data_type derive_key_cast_type(const sirius::logical_type& t)
+{
+  switch (t.id()) {
+    case sirius::type_id::TINYINT:
+    case sirius::type_id::SMALLINT:
+    case sirius::type_id::INTEGER:  return cudf::data_type{cudf::type_id::INT64};
+    case sirius::type_id::BIGINT:
+    case sirius::type_id::BOOLEAN:
+    case sirius::type_id::VARCHAR:  return cudf::data_type{cudf::type_id::EMPTY};
+    case sirius::type_id::DECIMAL:  return cudf::data_type{cudf::type_id::FLOAT64};
+    default:
+      throw sirius::invalid_input_exception(
+        "streaming_fragment: unsupported partition key type — only integer, boolean, varchar, and "
+        "decimal columns may be used as hash partition keys");
+  }
+}
+
+// Fill partition_spec::key_cast_types when the caller left it empty.
+// No-op when the caller supplied their own cast types.
+void normalize_key_cast_types(op::partition_spec& spec,
+                               const duckdb::vector<sirius::logical_type>& output_types)
+{
+  if (!spec.key_cast_types.empty()) { return; }
+  spec.key_cast_types.reserve(spec.key_columns.size());
+  for (int key : spec.key_columns) {
+    spec.key_cast_types.push_back(derive_key_cast_type(output_types[key]));
+  }
+}
 
 duckdb::shared_ptr<stream_bind_catalog> catalog_for(duckdb::ClientContext& context)
 {
@@ -116,6 +157,7 @@ void streaming_fragment::build(sirius::query_id_t query_id)
 
   duckdb::unique_ptr<op::sirius_physical_streaming_sink> sink;
   if (_spec.partitioning.has_value()) {
+    normalize_key_cast_types(*_spec.partitioning, types);
     sink = duckdb::make_uniq<op::sirius_physical_streaming_sink>(
       std::move(types), cardinality, std::move(sink_repos), *_spec.partitioning);
   } else {

@@ -21,6 +21,7 @@
 #include "op/sirius_physical_streaming_source.hpp"
 
 #include <cstdint>
+#include <exception>
 #include <map>
 #include <memory>
 #include <optional>
@@ -69,6 +70,10 @@ class stream_session {
   /// Sender-set EOS. @throws on unknown input id or unexpected sender.
   void close_input(stream_id_t id, sender_id_t sender);
 
+  /// Poison an input stream (S2/P1–P4). Rethrown from the engine's next pull on that stream.
+  /// @throws on unknown input id.
+  void fail_input(stream_id_t id, std::exception_ptr error);
+
   // -----------------------------------------------------------------------
   // Consumer side — output streams
   // -----------------------------------------------------------------------
@@ -81,6 +86,11 @@ class stream_session {
 
   /// @throws on unknown output id.
   [[nodiscard]] bool drained(stream_id_t id) const;
+
+  /// Poison an output stream (S2/P1–P4). Wakes consumers blocked in wait(); rethrown from pull().
+  /// Poisons all partitions of the sink that owns the given id.
+  /// @throws on unknown output id.
+  void fail_output(stream_id_t id, std::exception_ptr error);
 
  private:
   struct sink_output {

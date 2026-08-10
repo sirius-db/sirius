@@ -292,9 +292,11 @@ Rules:
 ```
 push(stream_id, batch)              // → source.push
 close_input(stream_id, sender_id)   // → source.close_input(sender)
+fail_input(stream_id, error)        // → source.fail_input(error)   — poison an input stream
 pull(stream_id) -> optional         // → sink.pull(partition)
 wait(stream_id)                     // → sink.wait(partition)
 drained(stream_id) -> bool          // → sink.drained(partition)
+fail_output(stream_id, error)       // → sink.fail_output(error)    — poison all sink partitions
 ```
 
 - Stream ids are **session-local** and **direction-separated** — two independent namespaces:
@@ -375,6 +377,21 @@ work without copying.
 opening its own. A second scope resets the task creator and scan manager that `build()` populated;
 the fragment would then run zero tasks and return silently empty. The caller brackets `build()`
 and `run()` in one window (as `Context::execute_substrait` does for ordinary queries).
+
+**Hash key cast normalization.** When the spec carries a `partition_spec` with `key_cast_types`
+left empty, `build()` derives a cast type per key column so independently-planned senders always
+produce the same hash for the same logical value. cuDF's murmur3 hashes raw bytes, so without
+normalization an INT32 sender and an INT64 sender assign the same key to different partitions and
+groups are silently split. Rules:
+
+| Column type | Normalized cast |
+|---|---|
+| `TINYINT`, `SMALLINT`, `INTEGER` | `INT64` (canonical 64-bit) |
+| `BIGINT`, `BOOLEAN`, `VARCHAR` | `EMPTY` (hash as-is — already canonical) |
+| `DECIMAL` (any precision/scale) | `FLOAT64` |
+| anything else | throws at build time |
+
+Callers that supply their own `key_cast_types` bypass normalization.
 
 **`stream_bind_catalog` bridges bind time and plan time.** DuckDB's table-function bind runs
 long before physical planning. The catalog is registered as a `ClientContextState` so

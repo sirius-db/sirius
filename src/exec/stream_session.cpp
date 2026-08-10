@@ -100,6 +100,11 @@ void stream_session::close_input(stream_id_t id, sender_id_t sender)
   resolve_source(id).close_input(sender);
 }
 
+void stream_session::fail_input(stream_id_t id, std::exception_ptr error)
+{
+  resolve_source(id).fail_input(std::move(error));
+}
+
 std::optional<std::shared_ptr<cucascade::data_batch>> stream_session::pull(stream_id_t id)
 {
   const auto& out = resolve_sink(id);
@@ -116,6 +121,12 @@ bool stream_session::drained(stream_id_t id) const
 {
   const auto& out = resolve_sink(id);
   return out.sink->drained(out.partition);
+}
+
+void stream_session::fail_output(stream_id_t id, std::exception_ptr error)
+{
+  // fail_output poisons all partitions of the sink (one pipeline = one sender).
+  resolve_sink(id).sink->fail_output(std::move(error));
 }
 
 }  // namespace sirius::exec
