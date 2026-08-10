@@ -264,32 +264,60 @@ TEST_CASE_METHOD(partition_build_fixture,
   });
 }
 
-TEST_CASE_METHOD(partition_build_fixture,
-                 "PARTITION build_pipelines - aggregate fanout partition uses a FULL barrier",
-                 "[integration][pipeline][partition_build]")
+TEST_CASE_METHOD(
+  partition_build_fixture,
+  "PARTITION build_pipelines - aggregate fanout ingress follows runtime size estimation",
+  "[integration][pipeline][partition_build]")
 {
   const std::string query = "SELECT n_regionkey, count(*) FROM nation GROUP BY n_regionkey";
 
-  sirius::test::with_conversion_result(*con, query, [&](pipeline_conversion_result& result) {
-    auto partitions = partition_pipelines(result);
-    // The MERGE_GROUP_BY fanout partition from wrap_hash_group_by.
-    REQUIRE(partitions.size() == 1);
-    const auto& pipeline = partitions[0];
+  // The ingress barrier of an aggregate-fanout PARTITION is the one thing
+  // enable_runtime_size_estimation changes at plan-conversion time, so assert it under both
+  // settings rather than only the one the feature ships in. Everything else about the shape —
+  // and the FULL egress into the merge — must be identical either way.
+  auto check_ingress = [&](bool estimation_on, sirius::op::MemoryBarrierType expected) {
+    auto set = con->Query(std::string("SET enable_runtime_size_estimation = ") +
+                          (estimation_on ? "true;" : "false;"));
+    REQUIRE(set);
+    REQUIRE_FALSE(set->HasError());
 
-    require_partition_pipeline_shape(result, pipeline);
+    sirius::test::with_conversion_result(*con, query, [&](pipeline_conversion_result& result) {
+      INFO("enable_runtime_size_estimation = " << estimation_on);
+      auto partitions = partition_pipelines(result);
+      // The MERGE_GROUP_BY fanout partition from wrap_hash_group_by.
+      REQUIRE(partitions.size() == 1);
+      const auto& pipeline = partitions[0];
 
-    // The per-thread HASH_GROUP_BY output must be complete before partitioning for the
-    // merge: FULL barrier, and the promoted child is the HASH_GROUP_BY itself.
-    auto inputs = wirings_into(result, pipeline.get());
-    CHECK(inputs[0]->barrier_type == sirius::op::MemoryBarrierType::FULL);
-    CHECK(inputs[0]->source_pipeline->get_sink()->type ==
-          SiriusPhysicalOperatorType::HASH_GROUP_BY);
+      require_partition_pipeline_shape(result, pipeline);
 
-    // Downstream, the merge consumes the partition output.
-    auto outputs = wirings_out_of(result, pipeline.get());
-    REQUIRE(outputs.size() == 1);
-    auto* partition = pipeline->get_sink().get();
-    CHECK(outputs[0]->dest_pipeline->get_source().get() == partition->get_parent_op());
-    CHECK(partition->get_parent_op()->type == SiriusPhysicalOperatorType::MERGE_GROUP_BY);
-  });
+      auto inputs = wirings_into(result, pipeline.get());
+      REQUIRE(inputs.size() == 1);
+      CHECK(inputs[0]->barrier_type == expected);
+      CHECK(inputs[0]->source_pipeline->get_sink()->type ==
+            SiriusPhysicalOperatorType::HASH_GROUP_BY);
+
+      // Downstream, the merge consumes the partition output — a FULL barrier under either
+      // setting, because the merge needs every per-thread bucket before it can combine a
+      // partition.
+      auto outputs = wirings_out_of(result, pipeline.get());
+      REQUIRE(outputs.size() == 1);
+      CHECK(outputs[0]->barrier_type == sirius::op::MemoryBarrierType::FULL);
+      auto* partition = pipeline->get_sink().get();
+      CHECK(outputs[0]->dest_pipeline->get_source().get() == partition->get_parent_op());
+      CHECK(partition->get_parent_op()->type == SiriusPhysicalOperatorType::MERGE_GROUP_BY);
+    });
+  };
+
+  // Off (the shipped default): the edge is never relaxed, so this is the pre-feature plan
+  // exactly — not an emulation of it maintained by the operator's task hint.
+  check_ingress(/*estimation_on=*/false, sirius::op::MemoryBarrierType::FULL);
+
+  // On: the per-thread HASH_GROUP_BY output may stream into the partition, because a projected
+  // total lets it fix its count from the first batches instead of the whole input.
+  // sirius_physical_partition::get_next_task_hint still withholds tasks until a count is
+  // pinned, so this is safe even when the estimate never materializes.
+  check_ingress(/*estimation_on=*/true, sirius::op::MemoryBarrierType::PARTIAL);
+
+  // Leave the setting as found; the connection's operator_params outlive this scope.
+  con->Query("SET enable_runtime_size_estimation = false;");
 }

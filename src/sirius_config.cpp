@@ -310,6 +310,8 @@ static void from_yaml(const YAML::Node& node, operator_params& opt)
     throw std::runtime_error(
       "'operator_params.avg_variable_column_bytes': must be greater than zero");
   }
+  r.optional("enable_runtime_size_estimation", opt.enable_runtime_size_estimation);
+  r.optional("size_estimate_safety_factor", opt.size_estimate_safety_factor);
   r.reject_unknown();
 }
 
