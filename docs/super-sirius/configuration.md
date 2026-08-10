@@ -108,6 +108,8 @@ sirius:
     dynamic_filter_inlist_max_l2_fraction: 0.125  # hash-IN-list fraction of known probe-GPU L2 (0 = Bloom for non-small keys; 1.0 = full L2)
     dynamic_filter_keep_threshold: 0.9  # disable a scan's filtering when a split keeps > this fraction
     enable_pinned_zone_map_pruning: true  # capture and use per-chunk stats for pinned tables
+    enable_runtime_size_estimation: false # project total port input from upstream in/out ratios (off by default)
+    size_estimate_safety_factor: 1.0      # pad a projected total before sizing partitions
   telemetry:
     enable_quent: true
     output_directory: telemetry_data
@@ -432,6 +434,8 @@ individually.
 | `enable_pinned_zone_map_pruning` | true | Capture per-chunk min/max statistics while pinning and use them to skip cached chunks that cannot match a scan filter. |
 | `admission_bytes_per_gpu` | 0 (off) | Target projected scan-output bytes per GPU. At admission the engine estimates a query's total scan output and takes the smallest GPU subset that keeps each GPU under this figure, bounded by `topology.gpus_per_query`. `0` disables the estimate, leaving the allocation to `topology.gpus_per_query` alone. |
 | `avg_variable_column_bytes` | 32 | Per-row width assumed for variable-width columns (VARCHAR, LIST, STRUCT, ARRAY) when estimating scan output. Fixed-width columns use their real carrier width. Only consulted when `admission_bytes_per_gpu` is non-zero. |
+| `enable_runtime_size_estimation` | false | Let operators project how many bytes will ultimately reach an input port by chaining upstream pipelines' measured input/output ratios. Lets a grouped aggregation's PARTITION fix its count from the first batch instead of its whole input, turning that hard barrier into a partial one. Off restores the previous wait-for-everything behavior. |
+| `size_estimate_safety_factor` | 1.0 | Multiplier applied to a *projected* total before it sizes partitions; raise above 1.0 to bias toward more (smaller) partitions when projections undershoot. Measured totals are used as-is. |
 
 **Note:** `admission_bytes_per_gpu` is a parallelism dial, not a memory budget. Peak GPU residency is bounded by partition sizing (`hash_partition_bytes` and the batch settings), not by the admitted GPU count — a query on fewer GPUs processes more partitions sequentially at roughly unchanged peak memory, trading wall-clock for freed devices. Tune it against how much of the fleet a query should occupy, not against VRAM.
 
@@ -717,6 +721,43 @@ still an experimental optimization, not a normal session choice.
 Five further `SIRIUS_EXP_LATE_MAT_*` knobs tune the deferral floors and the count-on-deferred
 path; see [Late Materialization](late-materialization.md#turning-it-on-experimental) for the full
 gate table, the mechanism, and results.
+
+### Runtime Data Size Estimation
+
+Both settings are accepted as DuckDB `SET` variables and in YAML under
+`sirius.operator_params`.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `enable_runtime_size_estimation` | false | Project the total bytes that will reach an operator's input port by chaining upstream pipelines' measured input/output ratios back to the first finished pipeline (or a scan that knows its total). |
+| `size_estimate_safety_factor` | 1.0 | Multiplier applied to a projected total before it sizes partitions. Must be > 0. Measured totals are not scaled. |
+
+Today the sole consumer is the grouped aggregation's PARTITION: with a projection it fixes its
+partition count from the first batches, so its ingress runs as a `PARTIAL` rather than a `FULL`
+barrier and partitioning overlaps with the upstream aggregation. With the setting off (the
+default) that ingress is never relaxed in the first place — the pre-feature code path, not an
+emulation of it. With it on but no projection yet available, the operator withholds tasks until
+its producing pipeline finishes, which reproduces the same wait. See
+[Data Size Estimation](data-size-estimation.md), which also records what has and has not been
+measured.
+
+Each partition operator logs its projected-vs-actual total at INFO when it finalizes, which is
+how the projection's accuracy is checked after a query:
+
+```
+sirius_physical_partition id 7 size estimate: sized from projected 268435456 bytes
+(exact=false, hops=1, samples=12), actual 259788800 bytes, error +3.3%, partitions 4
+```
+
+`sized from` is the field that matters: `projected` means a prediction chose the count,
+`upstream-complete` means the producer had already finished (correct, but too late to relax
+anything), and `measured` means no projection was used at all. When the count was not chosen from
+a projection the line says so instead of reporting a meaningless error figure.
+
+```sql
+SET enable_runtime_size_estimation = true;   -- off by default
+SET size_estimate_safety_factor = 1.25;
+```
 
 ### Transparent Execution
 

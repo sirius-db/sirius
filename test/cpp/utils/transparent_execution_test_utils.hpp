@@ -43,6 +43,12 @@ inline duckdb::SiriusContext::compressed_materialization_stats get_compressed_ma
   return get_registered_sirius_context(con)->get_compressed_materialization_stats();
 }
 
+inline duckdb::SiriusContext::size_estimation_stats get_size_estimation_stats(
+  duckdb::Connection& con)
+{
+  return get_registered_sirius_context(con)->get_size_estimation_stats();
+}
+
 inline void require_transparent_execution_delta(
   const duckdb::SiriusContext::transparent_execution_stats& before,
   const duckdb::SiriusContext::transparent_execution_stats& after,
