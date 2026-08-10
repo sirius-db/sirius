@@ -48,7 +48,7 @@ jobs:
         exclude:
           # On PRs, drop CUDA variants marked merge/dev-only; on merge_group/dev, match nothing.
           - cuda:
-              run-on-pr: ${{ fromJSON(github.event_name == 'pull_request' && 'false' || 'null') }}
+              run-on-pr: ${{ case(github.event_name == 'pull_request', false, 'no-match') }}
       fail-fast: false
     runs-on: ${{ fromJSON(format('["self-hosted", "{0}", "cpu-xl"]', matrix.cuda.runner)) }}
     timeout-minutes: 60
@@ -118,7 +118,7 @@ jobs:
         exclude:
           # On PRs, drop CUDA variants marked merge/dev-only; on merge_group/dev, match nothing.
           - cuda:
-              run-on-pr: ${{ fromJSON(github.event_name == 'pull_request' && 'false' || 'null') }}
+              run-on-pr: ${{ case(github.event_name == 'pull_request', false, 'no-match') }}
       fail-fast: false
     runs-on: ${{ fromJSON(format('["self-hosted", "{0}", "gpu-2xt4"]', matrix.cuda.runner)) }}
     timeout-minutes: 60
