@@ -52,7 +52,8 @@ void query::build_indices()
       // on_data hook wired in set_pipeline() re-schedules it when the first push lands.
       if (source->type == op::SiriusPhysicalOperatorType::GPU_SCAN ||
           source->type == op::SiriusPhysicalOperatorType::GPU_VALUES ||
-          source->type == op::SiriusPhysicalOperatorType::STREAMING_SOURCE) {
+          source->type == op::SiriusPhysicalOperatorType::STREAMING_SOURCE ||
+          source->type == op::SiriusPhysicalOperatorType::VECTOR_JOIN) {
         _scan_operators.push_back(source.get());
       }
     }

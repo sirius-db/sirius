@@ -41,6 +41,8 @@
 #include "planner/sirius_plan_projection_utils.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
 #include "sirius_context.hpp"
+#include "vss/sirius_physical_vector_join.hpp"
+#include "vss/vector_join.hpp"
 
 #include <memory>
 #include <optional>
@@ -198,6 +200,10 @@ duckdb::unique_ptr<duckdb::TableFilterSet> create_table_filter_set(
 duckdb::unique_ptr<sirius::op::sirius_physical_operator>
 sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
 {
+  // sirius_knn_join produces its join result from two pinned tables, so it gets its own leaf
+  // builder rather than being routed through the scan path.
+  if (op.function.name == "sirius_knn_join") { return create_plan_knn_join(op); }
+
   auto column_ids = op.GetColumnIds();
 
   // Only GPU-route known table scan functions; all others (pragma, system catalog
@@ -639,6 +645,48 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
     return filter;
   }
   return std::move(node);
+}
+
+duckdb::unique_ptr<sirius::op::sirius_physical_operator>
+sirius_physical_plan_generator::create_plan_knn_join(duckdb::LogicalGet& op)
+{
+  if (!op.children.empty()) {
+    throw duckdb::NotImplementedException("sirius_knn_join does not take table inputs");
+  }
+  op.ResolveOperatorTypes();
+
+  auto const& bind_data = op.bind_data->Cast<sirius::vss::SiriusVectorJoinBindData>();
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator> node =
+    duckdb::make_uniq<sirius::op::sirius_physical_vector_join>(
+      sirius::from_duckdb_vec(op.returned_types), op.estimated_cardinality, bind_data.req);
+
+  // The op emits its full return schema (corpus cols, probe cols, distance) at
+  // positions 0..N-1 by column index. When column_ids just requests those columns
+  // in order we hand the op back directly; otherwise a projection reorders/subsets.
+  auto column_ids  = op.GetColumnIds();
+  bool is_identity = column_ids.size() == op.returned_types.size();
+  for (std::size_t i = 0; is_identity && i < column_ids.size(); ++i) {
+    if (!column_ids[i].HasPrimaryIndex() || column_ids[i].GetPrimaryIndex() != i) {
+      is_identity = false;
+    }
+  }
+  if (is_identity) { return node; }
+
+  duckdb::vector<duckdb::LogicalType> types;
+  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> expressions;
+  for (auto const& column_id : column_ids) {
+    if (!column_id.HasPrimaryIndex()) {
+      throw duckdb::NotImplementedException("sirius_knn_join: virtual/rowid columns unsupported");
+    }
+    auto const col_id = column_id.GetPrimaryIndex();
+    auto const type   = op.returned_types[col_id];
+    types.push_back(type);
+    expressions.push_back(duckdb::make_uniq<duckdb::BoundReferenceExpression>(type, col_id));
+  }
+  return push_projection(std::move(node),
+                         sirius::from_duckdb_vec(types),
+                         translate_expressions(std::move(expressions)),
+                         op.estimated_cardinality);
 }
 
 }  // namespace sirius::planner

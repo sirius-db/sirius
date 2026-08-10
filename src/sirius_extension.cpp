@@ -112,6 +112,7 @@ extern "C" int cudaProfilerStop();
 #include "vss/distance_metric.hpp"
 #include "vss/ivf_flat_index.hpp"
 #include "vss/pinned_column.hpp"
+#include "vss/vector_join_binding.hpp"
 #include "vss/vector_search.hpp"
 
 #include <cudf/utilities/default_stream.hpp>
@@ -2031,6 +2032,144 @@ static void SiriusVectorSearchFunction(ClientContext& context,
   state.reader->get_next_chunk(output);
 }
 
+using sirius::vss::parse_output_columns;
+using sirius::vss::resolve_vector_join_side;
+using sirius::vss::SiriusVectorJoinBindData;
+using sirius::vss::vector_join_mode;
+
+static unique_ptr<FunctionData> SiriusVectorJoinBind(ClientContext& context,
+                                                     TableFunctionBindInput& input,
+                                                     vector<LogicalType>& return_types,
+                                                     vector<string>& names)
+{
+  auto result = make_uniq<SiriusVectorJoinBindData>();
+  auto& req   = result->req;
+
+  // Required positional params
+  if (input.inputs.size() < 4 || input.inputs[0].IsNull() || input.inputs[1].IsNull() ||
+      input.inputs[2].IsNull() || input.inputs[3].IsNull()) {
+    throw BinderException(
+      "sirius_knn_join requires four non-NULL positional arguments: "
+      "left_table, left_column, right_table, right_column");
+  }
+  auto const left_table   = input.inputs[0].ToString();
+  auto const left_column  = input.inputs[1].ToString();
+  auto const right_table  = input.inputs[2].ToString();
+  auto const right_column = input.inputs[3].ToString();
+
+  // Optional params' default values
+  req.metric               = "l2";
+  req.k                    = 10;
+  req.use_index            = false;
+  req.n_clusters           = 0;
+  req.n_probes             = 1;
+  req.eps                  = 0.0;
+  bool join_mode_set       = false;
+  std::string left_schema  = "main";
+  std::string right_schema = "main";
+  std::vector<std::string> left_out_cols;
+  std::vector<std::string> right_out_cols;
+  for (auto& kv : input.named_parameters) {
+    auto const key = StringUtil::Lower(kv.first);
+    if (kv.second.IsNull()) {
+      throw BinderException("sirius_knn_join: named parameter '" + kv.first + "' cannot be NULL");
+    }
+    if (key == "k") {
+      req.k = kv.second.GetValue<int64_t>();
+    } else if (key == "n_clusters") {
+      req.n_clusters = kv.second.GetValue<int64_t>();
+    } else if (key == "n_probes") {
+      req.n_probes = kv.second.GetValue<int64_t>();
+    } else if (key == "eps") {
+      req.eps = kv.second.GetValue<double>();
+    } else if (key == "metric") {
+      req.metric = StringUtil::Lower(kv.second.ToString());
+    } else if (key == "search_mode") {
+      auto const mode = StringUtil::Lower(kv.second.ToString());
+      if (mode != "exact" && mode != "approx") {
+        throw BinderException("sirius_knn_join: search_mode must be 'exact' or 'approx'");
+      }
+      req.use_index = (mode == "approx");
+    } else if (key == "join_mode") {
+      auto const jm = StringUtil::Lower(kv.second.ToString());
+      if (jm == "global") {
+        req.mode = vector_join_mode::global_top_k;
+      } else if (jm == "per-row") {
+        req.mode = vector_join_mode::per_row_top_k;
+      } else if (jm == "threshold") {
+        req.mode = vector_join_mode::threshold;
+      } else {
+        throw BinderException(
+          "sirius_knn_join: join_mode must be one of 'global', 'per-row', 'threshold'");
+      }
+      join_mode_set = true;
+    } else if (key == "left_schema_name") {
+      left_schema = kv.second.ToString();
+    } else if (key == "right_schema_name") {
+      right_schema = kv.second.ToString();
+    } else if (key == "left_output_columns") {
+      left_out_cols = parse_output_columns(kv.second, "left_output_columns");
+    } else if (key == "right_output_columns") {
+      right_out_cols = parse_output_columns(kv.second, "right_output_columns");
+    }
+  }
+  if (req.k < 0) { throw BinderException("sirius_knn_join: k must be >= 0"); }
+  if (req.n_clusters < 0) { throw BinderException("sirius_knn_join: n_clusters must be >= 0"); }
+  if (req.n_probes < 1) { throw BinderException("sirius_knn_join: n_probes must be >= 1"); }
+  if (req.eps < 0.0) { throw BinderException("sirius_knn_join: eps must be >= 0"); }
+  if (req.metric != "l2" && req.metric != "cosine") {
+    throw BinderException("sirius_knn_join: metric must be one of 'l2', 'cosine', got '" +
+                          req.metric + "'");
+  }
+  // Default the mode when join_mode isn't given
+  if (!join_mode_set) {
+    req.mode = (req.eps > 0.0) ? vector_join_mode::threshold : vector_join_mode::per_row_top_k;
+  }
+
+  auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  if (!sirius_ctx) {
+    throw InvalidInputException("sirius_knn_join requires the Sirius context to be initialized");
+  }
+
+  auto const left_dim  = resolve_vector_join_side(context,
+                                                 *sirius_ctx,
+                                                 "left",
+                                                 left_table,
+                                                 left_column,
+                                                 left_schema,
+                                                 left_out_cols,
+                                                 req.left,
+                                                 return_types,
+                                                 names);
+  auto const right_dim = resolve_vector_join_side(context,
+                                                  *sirius_ctx,
+                                                  "right",
+                                                  right_table,
+                                                  right_column,
+                                                  right_schema,
+                                                  right_out_cols,
+                                                  req.right,
+                                                  return_types,
+                                                  names);
+  if (left_dim != right_dim) {
+    throw BinderException("sirius_knn_join: left is FLOAT[" + std::to_string(left_dim) +
+                          "] but right is FLOAT[" + std::to_string(right_dim) +
+                          "]; both sides must share the same vector dimensionality");
+  }
+  req.dim = left_dim;
+
+  return_types.push_back(LogicalType::FLOAT);
+  names.push_back("distance");
+  return std::move(result);
+}
+
+// Execute callback
+static void SiriusVectorJoinFunction(ClientContext&, TableFunctionInput&, DataChunk&)
+{
+  throw std::runtime_error(
+    "sirius_knn_join is an internal rewrite target executed on the GPU; it cannot run on the CPU");
+}
+
 void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
 {
   auto transaction = CatalogTransaction::GetSystemTransaction(instance);
@@ -2144,6 +2283,30 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
   vector_search.named_parameters["schema_name"]    = LogicalType::VARCHAR;
   CreateTableFunctionInfo vector_search_info(vector_search);
   catalog.CreateTableFunction(transaction, vector_search_info);
+
+  // sirius_knn_join(left_table, left_column, right_table, right_column,
+  //   k =>, metric =>, search_mode =>, join_mode =>, n_clusters =>, n_probes =>, eps =>,
+  //   left_schema_name =>, right_schema_name =>,
+  //   left_output_columns =>, right_output_columns =>)
+  // join_mode is one of 'global' | 'per-row' | 'threshold'.
+  TableFunction vector_join(
+    "sirius_knn_join",
+    {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
+    SiriusVectorJoinFunction,
+    SiriusVectorJoinBind);
+  vector_join.named_parameters["k"]                    = LogicalType::BIGINT;
+  vector_join.named_parameters["metric"]               = LogicalType::VARCHAR;
+  vector_join.named_parameters["search_mode"]          = LogicalType::VARCHAR;
+  vector_join.named_parameters["join_mode"]            = LogicalType::VARCHAR;
+  vector_join.named_parameters["n_clusters"]           = LogicalType::BIGINT;
+  vector_join.named_parameters["n_probes"]             = LogicalType::BIGINT;
+  vector_join.named_parameters["eps"]                  = LogicalType::DOUBLE;
+  vector_join.named_parameters["left_schema_name"]     = LogicalType::VARCHAR;
+  vector_join.named_parameters["right_schema_name"]    = LogicalType::VARCHAR;
+  vector_join.named_parameters["left_output_columns"]  = LogicalType::LIST(LogicalType::VARCHAR);
+  vector_join.named_parameters["right_output_columns"] = LogicalType::LIST(LogicalType::VARCHAR);
+  CreateTableFunctionInfo vector_join_info(vector_join);
+  catalog.CreateTableFunction(transaction, vector_join_info);
 }
 
 // Process-global Config writes are refused once the Sirius runtime is

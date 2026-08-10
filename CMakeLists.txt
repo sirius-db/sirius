@@ -331,6 +331,7 @@ set(EXTENSION_SOURCES
     src/op/sirius_physical_cte.cpp
     src/op/sirius_physical_delim_join.cpp
     src/op/sirius_physical_dummy_scan.cpp
+    src/op/sirius_physical_vector_join.cpp
     src/op/sirius_physical_empty_result.cpp
     src/op/sirius_physical_filter.cpp
     src/op/sirius_physical_gpu_values.cpp
@@ -415,6 +416,7 @@ set(EXTENSION_SOURCES
     src/vss/distance_metric.cpp
     src/vss/enn_top_k.cpp
     src/vss/pinned_column.cpp
+    src/vss/vector_join_binding.cpp
     src/vss/vector_search.cpp
     src/vss/vector_search_ann.cpp
     src/vss/vector_search_enn.cpp)
