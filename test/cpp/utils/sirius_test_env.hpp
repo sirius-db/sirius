@@ -92,8 +92,9 @@ class shared_test_env {
 /**
  * @brief Non-owning pointer to the shared test environment.
  *
- * Managed by main() in unittest.cpp. Non-null for the entire test run.
- * Check is_active() before using — it may be temporarily paused for isolated tests.
+ * Managed by main() in unittest.cpp. Non-null during ordinary test runs and null
+ * for marked child runners. Check is_active() before using — it may be temporarily
+ * paused for isolated tests.
  */
 extern shared_test_env* g_shared_env;
 extern shared_test_env* g_integration_env;
