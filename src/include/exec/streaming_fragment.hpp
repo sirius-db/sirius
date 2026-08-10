@@ -38,93 +38,63 @@ class sirius_interface;
 
 namespace sirius::exec {
 
-/// Schema + provenance of one input stream, as the front end declares it.
 struct stream_input_spec {
   std::vector<std::string> names;
   duckdb::vector<sirius::logical_type> types;
-  /// Every sender expected to close this stream. The stream ends only once all of them have.
+  /// Sender-set EOS: stream ends only once all have closed.
   std::set<sender_id_t> expected_senders;
 };
 
-/// Produces the fragment's bound, optimized DuckDB logical plan.
-///
-/// A function because callers differ: Substrait bytes from a compute node, SQL from tests. Both
-/// end at a `LogicalOperator` the plan generator can lower.
+/// Bound, optimized DuckDB logical plan (Substrait bytes, SQL, …).
 using logical_plan_source =
   std::function<duckdb::unique_ptr<duckdb::LogicalOperator>(duckdb::ClientContext&)>;
 
 struct fragment_spec {
   logical_plan_source plan_source;
-  /// One entry per input stream. Ids are session-local.
   std::map<stream_id_t, stream_input_spec> inputs;
-  /// One id per sink destination, positional: `outputs[i]` addresses partition i.
+  /// Positional: outputs[i] addresses partition i.
   std::vector<stream_id_t> outputs;
-  /// Absent means gather (a single destination, no partitioning).
+  /// Absent = gather (single destination, no partitioning).
   std::optional<op::partition_spec> partitioning;
 };
 
-/// One plan fragment, owning everything that must outlive a single query.
-///
-/// The repositories are plain `shared_ptr`s, never registered with `data_repository_manager_`,
-/// so the query window's mandatory cleanup (`StandaloneQueryScope::finish()`) cannot touch them.
-/// A sender's output therefore survives its own fragment and is still there when the receiver
-/// runs — the one fact that makes sequential streaming work.
-///
-/// The fragment owns the engine and the engine owns the plan, which keeps the sink pullable after
-/// `run()` while still taking the ordinary `initialize()` path.
+/// Owns repos/engine/session for one fragment.
+/// Repositories escape data_repository_manager_ cleanup (survive the query window).
+/// Engine owns the plan so the sink stays pullable after run().
 class streaming_fragment {
  public:
-  /// Validates the spec and creates one repository per declared stream. Nothing is planned yet.
-  /// @throws sirius::invalid_input_exception when `spec.plan_source` is unset; when
-  ///         `spec.outputs` is empty (a fragment with no output has nowhere to publish); when
-  ///         `spec.outputs` holds more than one id without `spec.partitioning` (silently routing
-  ///         every row to destination 0 would corrupt a shuffle instead of failing loudly); or on
-  ///         a duplicate output id, which would leave two session addresses fighting over one
-  ///         repository.
+  /// Validates the spec and creates one repository per declared stream.
+  /// @throws sirius::invalid_input_exception when plan_source is unset, outputs empty, N>1
+  ///         without partitioning, or on a duplicate output id.
   streaming_fragment(duckdb::ClientContext& context, fragment_spec spec);
 
-  /// Clears this fragment's declarations out of the connection's `stream_bind_catalog`, so the
-  /// next fragment on the same connection cannot bind against a stale schema.
+  /// Clears this fragment's declarations from the connection's stream_bind_catalog.
   ~streaming_fragment();
 
   streaming_fragment(const streaming_fragment&)            = delete;
   streaming_fragment& operator=(const streaming_fragment&) = delete;
 
-  /// Build the plan: declare the inputs, lower them to STREAMING_SOURCEs, root the tree in a
-  /// STREAMING_SINK, and register both ends with the session. Separate from `run()` so a caller
-  /// can push into the inputs before execution starts.
-  /// @param query_id The caller's execution window (`SiriusContext::StandaloneQueryScope`); the
-  ///        engine wires this fragment's operators into that window's repository manager.
-  /// @throws sirius::invalid_input_exception when `build()` has already run; when the connection
-  ///         carries no `stream_bind_catalog`; when `plan_source` returns a null plan; or when an
-  ///         input stream was declared but the plan never reads it — that last one would leave
-  ///         its senders with nowhere to push and the fragment waiting on a stream nothing
-  ///         drains, so it is a defined error rather than a silently ignored declaration.
-  /// @throws whatever the plan source, the DuckDB binder, or the plan generator raises.
+  /// Declare inputs, lower to STREAMING_SOURCE/SINK, register with session. Separate from
+  /// run() so callers can push first.
+  /// @throws sirius::invalid_input_exception when already built, no catalog, null plan, or a
+  ///         declared input the plan never reads.
+  /// @throws whatever the plan source, binder, or plan generator raises.
   void build(sirius::query_id_t query_id);
 
-  /// Submit and block until the fragment's pipelines finish.
-  ///
-  /// The caller owns the query window and must bracket `build()` and `run()` in one
-  /// `SiriusContext::StandaloneQueryScope`. A window opened between them resets the task
-  /// creator and scan manager `build()` populated, and the fragment then runs zero tasks and
-  /// returns an empty output with no error.
-  /// @throws sirius::invalid_input_exception when `build()` has not run.
-  /// @throws whatever the engine's execution raises; a fragment that failed must never look like
-  ///         one that finished with no rows.
+  /// Submit and block. Shared query window (don't open a second StandaloneQueryScope between
+  /// build and run).
+  /// @throws sirius::invalid_input_exception when build() has not run.
+  /// @throws whatever the engine's execution raises.
   void run();
 
   [[nodiscard]] stream_session& session() { return _session; }
 
-  /// The engine backing this fragment, for tests that need to inspect pipeline state.
   [[nodiscard]] sirius::sirius_engine& engine() { return *_engine; }
 
-  /// The repository behind input stream `id`, for a caller that wants to inspect what it pushed.
   /// @throws sirius::invalid_input_exception when `id` is not a declared input stream.
   [[nodiscard]] const std::shared_ptr<cucascade::shared_data_repository>& input_repository(
     stream_id_t id) const;
 
-  /// The repository behind output stream `id`. This is what a downstream fragment consumes.
   /// @throws sirius::invalid_input_exception when `id` is not a declared output stream.
   [[nodiscard]] const std::shared_ptr<cucascade::shared_data_repository>& output_repository(
     stream_id_t id) const;
@@ -133,9 +103,8 @@ class streaming_fragment {
   duckdb::ClientContext& _context;
   fragment_spec _spec;
 
-  // Declaration order IS the lifetime contract (members are destroyed in reverse): the
-  // repositories outlive the engine, the engine owns the plan, and the session -- which only
-  // borrows operators out of that plan -- is torn down first.
+  // Declaration order IS the lifetime contract (destroyed in reverse): repositories outlive
+  // the engine, the engine owns the plan, and the session (borrowing operators) is torn down first.
   std::map<stream_id_t, std::shared_ptr<cucascade::shared_data_repository>> _input_repos;
   std::map<stream_id_t, std::shared_ptr<cucascade::shared_data_repository>> _output_repos;
   std::unique_ptr<sirius::sirius_interface> _iface;

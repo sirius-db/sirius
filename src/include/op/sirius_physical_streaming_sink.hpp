@@ -31,54 +31,35 @@
 
 namespace sirius::op {
 
-/// How a partitioned sink routes rows across its output streams.
-///
-/// Only the *function* lives here. Which compute node each partition ships to is the wrapper's
-/// routing table, and N is `output_repositories.size()` — the sink stays oblivious to both.
+/// How a partitioned sink routes rows across its output streams. Destination nodes are the
+/// wrapper's routing table — the sink stays oblivious.
 struct partition_spec {
-  /// Column indices hashed to pick a destination. Must be non-empty for a partitioned sink.
+  /// Hashed to pick a destination. Must be non-empty when N > 1.
   std::vector<int> key_columns;
 
-  /// Per-key cast applied before hashing, so keys that differ only in representation (INT32 vs
-  /// INT64) still land together. Empty means "hash every key as-is".
+  /// Per-key cast before hashing (e.g. INT32 vs INT64). Empty = hash as-is.
   std::vector<cudf::data_type> key_cast_types;
 };
 
-/// Terminal operator of a streaming fragment: every batch its pipeline produces is pushed into
-/// one `exec::batch_stream` per destination, where an external consumer pulls it.
-///
-/// Batches are exposed natively — in whatever tier they currently sit — so nothing is
-/// materialized or converted to Arrow on the way out, and a queued batch stays spillable by the
-/// downgrade executor until it is pulled.
-///
-/// Unlike the source, the sink wires no `on_data` hook: its consumer is an external thread
-/// blocking in `wait()`, not an engine task that needs re-nominating.
+/// Fragment terminal: push pipeline output into one batch_stream per destination.
+/// No on_data — consumer blocks in wait(); no channel-level backpressure.
 class sirius_physical_streaming_sink : public sirius_physical_operator {
  public:
   static constexpr SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::STREAMING_SINK;
 
-  /// The pipeline feeding this sink is its one and only sender.
+  /// The pipeline feeding this sink is its only sender.
   static constexpr exec::sender_id_t PIPELINE_SENDER = 0;
 
-  /// Single-destination sink: one output stream, no partitioning. The N = 1 case of the
-  /// constructor below.
-  ///
+  /// Single-destination sink (N = 1): identity push, no partitioning.
   /// @throws sirius::invalid_input_exception when `output_repository` is null.
   sirius_physical_streaming_sink(
     duckdb::vector<sirius::logical_type> types,
     std::size_t estimated_cardinality,
     std::shared_ptr<cucascade::shared_data_repository> output_repository);
 
-  /// Partitioned sink: N output streams, one per destination, each with its own repository.
-  /// Every batch is GPU-hash-partitioned by `spec` and slice *i* is pushed into
-  /// `output_repositories[i]`.
-  ///
-  /// @throws sirius::invalid_input_exception when `output_repositories` is empty or contains a
-  ///         null entry; when N > 1 and `spec.key_columns` is empty (nothing to route by); when
-  ///         `spec.key_cast_types` is non-empty but does not have exactly one entry per key
-  ///         column; or when a key column is negative or past the last input column. The last two
-  ///         would otherwise read past the end of the cast list or the input table inside
-  ///         `hash_partition`.
+  /// N destinations: GPU-hash-partition each batch; slice i → output_repositories[i].
+  /// @throws sirius::invalid_input_exception on empty/null repos, N>1 with no keys, cast/key
+  ///         mismatch, or out-of-range key column.
   sirius_physical_streaming_sink(
     duckdb::vector<sirius::logical_type> types,
     std::size_t estimated_cardinality,
@@ -87,9 +68,8 @@ class sirius_physical_streaming_sink : public sirius_physical_operator {
 
   bool is_sink() const override { return true; }
 
-  //! The sink is appended to `current` (landing at `operators.back()` after the reverse) and set
-  //! as the sink of its own child meta pipeline. The base sink path skips the append, which leaves
-  //! the terminal operator out of the root pipeline and the source with nothing driving it.
+  //! Append into operators[] (base sink path skips this). Membership required for finalize/EOS;
+  //! lands at operators.back() after is_ready() reverses.
   void build_pipelines(pipeline::sirius_pipeline& current,
                        pipeline::sirius_meta_pipeline& meta_pipeline) override;
 
@@ -97,27 +77,14 @@ class sirius_physical_streaming_sink : public sirius_physical_operator {
   // Producer side (engine)
   // -----------------------------------------------------------------------
 
-  /// Pass-through. The executor runs every operator in the chain, terminal sink included, and
-  /// feeds the chain's result back into sink(). The base implementation returns an empty batch
-  /// list, so without this override the sink receives nothing and the pipeline "succeeds" with
-  /// an empty output stream.
+  /// Pass-through so sink() sees the batches; base returns empty.
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          rmm::cuda_stream_view stream) override;
 
-  /// Publish this task's output batches.
-  ///
-  /// With one destination the batches go into the output stream natively — no Arrow, no GPU
-  /// upgrade, no copy. With N > 1 each batch is GPU-hash-partitioned by the partition spec and
-  /// slice *i* is pushed into `_outputs[i]`; empty slices are skipped. A push after
-  /// end-of-stream is refused by the stream rather than landing behind a consumer that already
-  /// saw EOS.
+  /// N=1: native push. N>1: hash-partition; skip empty slices. Refused push = silent drop.
   void sink(const operator_data& input_data, rmm::cuda_stream_view stream) override;
 
-  /// 0 with one destination — the push allocates nothing on top of the input this task already
-  /// materialized — and 2× the input bytes when partitioning, because hash_partition() holds a
-  /// full reordered copy and the per-partition copies at the same time. The caller maxes this
-  /// across the pipeline's operators, so an inflated single-destination answer would raise every
-  /// cold-start reservation.
+  /// 0 if N==1; ~2× when partitioned (hash_partition holds reorder + slices).
   [[nodiscard]] std::size_t no_history_peak_memory_estimate(
     const input_stats& stats) const override;
 
@@ -125,38 +92,30 @@ class sirius_physical_streaming_sink : public sirius_physical_operator {
   // Consumer side (external wrapper / session, never an engine task)
   // -----------------------------------------------------------------------
 
-  /// Number of output streams this sink exposes. One per destination.
   [[nodiscard]] std::size_t num_output_streams() const { return _outputs.size(); }
 
-  /// Non-blocking pull of the next batch of output stream `index`.
-  /// @return nullopt when nothing is available right now — which is *not* the same as EOS; ask
-  ///         `drained(index)` to tell the two apart.
+  /// @return nullopt means nothing now, not EOS — use drained(index).
   /// @throws sirius::invalid_input_exception when `index` is out of range.
-  /// @throws the producer's error, if `fail_output()` poisoned this stream — ahead of anything
-  ///         still queued, so a failed fragment can never be collected as a short clean result.
+  /// @throws pending producer error ahead of queued batches (S4).
   std::optional<std::shared_ptr<cucascade::data_batch>> pull(std::size_t index = 0);
 
-  /// Block until output stream `index` has a batch to pull or the stream has ended (cleanly or
-  /// by `fail_output()`). External threads only.
+  /// Block until HAS_DATA or ended (S5 with pull: re-check after wake). External threads only.
   /// @throws sirius::invalid_input_exception when `index` is out of range.
   void wait(std::size_t index = 0);
 
-  /// True only at a clean end: the pipeline has finished, output stream `index` is empty, and no
-  /// producer error is pending (S3). A poisoned stream never reports drained — it ends by the
-  /// rethrow from `pull()`, never by looking finished.
+  /// Clean end only (S3). Poisoned streams end by rethrow from pull().
   /// @throws sirius::invalid_input_exception when `index` is out of range.
   [[nodiscard]] bool drained(std::size_t index = 0) const;
 
-  /// Non-blocking classification of output stream `index`: HAS_DATA / WAITING / END_OF_STREAM.
   /// @throws sirius::invalid_input_exception when `index` is out of range.
   [[nodiscard]] exec::batch_stream::availability availability(std::size_t index = 0) const;
 
-  /// The query died: poison every output stream. External consumers unblock from wait() and
-  /// collect the rethrow from pull() — never a clean end. First failure wins.
+  /// Poison every output stream (S2 / P1–P4). First failure wins. Sink has no on_data — wait()
+  /// wakes via the stream CV.
   void fail_output(std::exception_ptr error);
 
  protected:
-  /// The pipeline finishing is this stream's end-of-stream: it is the single expected sender.
+  /// Pipeline completion = sender-set EOS (PIPELINE_SENDER).
   void on_finalize_operator() override;
 
   /// @throws sirius::invalid_input_exception when `index` is out of range.
@@ -165,9 +124,7 @@ class sirius_physical_streaming_sink : public sirius_physical_operator {
   /// One stream per destination; positional with the caller's repository list.
   std::vector<std::shared_ptr<exec::batch_stream>> _outputs;
 
-  /// Routing spec. Empty `key_columns` is valid only when `_outputs.size() == 1`, in which
-  /// case `sink()` short-circuits to a single native push without invoking the hash-partition
-  /// kernel at all — the spec is irrelevant, and there is nothing to route.
+  /// Empty key_columns is valid only for N==1 (native push, no hash_partition).
   partition_spec _spec;
 };
 

@@ -147,16 +147,14 @@ TEST_CASE_METHOD(fragment_fixture,
   try {
     streaming_fragment fragment(*con->context, std::move(spec));
 
-    // One window spanning build + run: opening it resets the task creator, so opening it after
-    // build() would discard the plan-time registrations.
+    // One window spanning build + run (shared query window).
     query_window window(*sirius_ctx, *con->context, "frag_1");
     fragment.build(window.query_id());
-    // The pipeline completion gate is what makes this return: without it run() blocks forever.
+    // Pipeline completion gate: without it run() blocks forever.
     fragment.run();
     window.finish();
 
-    // Diagnostic: separate "the source never produced a task" from "tasks ran but the sink got
-    // nothing". Without this the empty-output failure has two very different causes.
+    // Separate "source never produced" from "tasks ran but sink empty".
     std::size_t created = 0, completed = 0;
     for (const auto& p : fragment.engine().sirius_pipelines) {
       created += p->get_tasks_created();
@@ -167,9 +165,7 @@ TEST_CASE_METHOD(fragment_fixture,
                       << " tasks_created=" << created << " tasks_completed=" << completed);
     REQUIRE(created > 0);
 
-    // The repository-outlives-the-window invariant -- the output repository is session-owned,
-    // outside data_repository_manager_, so the window's mandatory cleanup cannot touch it. The
-    // batches are still here.
+    // Repositories escape data_repository_manager_ cleanup — batches survive the window.
     REQUIRE(fragment.output_repository(0)->total_size() > 0);
     REQUIRE(drain_row_count(fragment, 0) == kLeafRows);
 
@@ -273,8 +269,7 @@ TEST_CASE_METHOD(fragment_fixture,
 
   SECTION("fan-out without a partition spec")
   {
-    // Two destinations and no partitioning would leave the sink unable to decide where a row
-    // goes, so it is refused rather than silently broadcasting.
+    // Two destinations without partitioning would silently broadcast; refuse instead.
     fragment_spec spec;
     spec.plan_source = source;
     spec.outputs     = {0, 1};
@@ -314,17 +309,15 @@ TEST_CASE_METHOD(fragment_fixture,
 }
 
 // ============================================================================
-// FRAG-CONTROL: does a RESULT_COLLECTOR-rooted plan execute when the engine is
-// driven directly? Isolates "streaming sink is broken" from "this harness is".
+// FRAG-CONTROL: RESULT_COLLECTOR-rooted plan on the direct engine path.
+// Isolates harness failures from sink failures (pair with SINKROOT-4).
 // ============================================================================
 
 TEST_CASE_METHOD(fragment_fixture,
                  "FRAG-CONTROL: which queries actually materialize rows on the direct path",
                  "[integration][streaming_fragment_control]")
 {
-  // Assert the ROW COUNT, not merely that execute() did not error. A plan that runs cleanly and
-  // produces nothing looks identical to a working one unless the rows are counted. Knowing whether
-  // the source emits anything here isolates a harness failure from a sink failure.
+  // Assert row count, not merely that execute() succeeded.
   auto row_count_of = [&](const std::string& query) -> std::size_t {
     std::size_t rows = 0;
     // with_initialized_engine synthesizes its own query id, but execute() still needs a real
@@ -362,9 +355,7 @@ TEST_CASE_METHOD(fragment_fixture,
 }
 
 // ============================================================================
-// FRAG-4: the production shape -- a parquet GPU scan across a fragment
-// boundary. VALUES is self-contained; a parquet scan exercises the path an
-// external compute node drives, at real batch counts.
+// FRAG-4: parquet GPU scan across a fragment boundary (real batch counts).
 // ============================================================================
 
 TEST_CASE_METHOD(fragment_fixture,
@@ -374,13 +365,8 @@ TEST_CASE_METHOD(fragment_fixture,
   auto const parquet = lineitem_parquet_path();
   REQUIRE(fs::exists(parquet));
 
-  // A filtered projection, the shape TPC-H Q6 has: scan, filter, then exchange. The filter is on
-  // l_quantity deliberately: the file's five row groups are ordered by l_orderkey, so an
-  // l_orderkey range predicate prunes to a single row group and the scan would read a fraction
-  // of the file. l_quantity's statistics span every row group, so all five are read.
-  //
-  // This is still a ONE-batch hop -- the GPU scan emits a single batch per file regardless of
-  // row-group count. FRAG-5 is what covers a multi-batch stream.
+  // Filter on l_quantity so row-group pruning does not collapse the scan. Still one batch
+  // per file; FRAG-5 covers multi-batch streams.
   auto const leaf =
     "SELECT l_orderkey FROM read_parquet('" + parquet.string() + "') WHERE l_quantity < 2";
 
@@ -445,15 +431,7 @@ TEST_CASE_METHOD(fragment_fixture,
 }
 
 // ============================================================================
-// FRAG-5: a MULTI-BATCH stream drains completely.
-//
-// FRAG-2 and FRAG-4 both hop a single batch, which one task consumes in one
-// go. Whether a queue holding several batches drains is a separate question:
-// it is the task creator's per-batch loop and the pipeline's completion gate
-// that have to agree, and neither is exercised by a one-batch stream. Two
-// sender fragments fill the queue, because a GPU scan emits one batch per
-// file and a VALUES leaf one batch per fragment -- the batch count comes from
-// the number of senders, not from the leaf.
+// FRAG-5: multi-batch drain. FRAG-2/4 hop one batch; two senders fill the queue here.
 // ============================================================================
 
 TEST_CASE_METHOD(fragment_fixture,
@@ -463,8 +441,7 @@ TEST_CASE_METHOD(fragment_fixture,
   auto sirius_ctx = con->context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
   REQUIRE(sirius_ctx != nullptr);
 
-  // Disjoint halves, so the receiver's output identifies which batches arrived, not merely how
-  // many rows did.
+  // Disjoint halves so the output identifies which batches arrived.
   constexpr const char* kFirstHalf  = "SELECT a FROM (VALUES (1), (2), (3)) t(a)";
   constexpr const char* kSecondHalf = "SELECT a FROM (VALUES (4), (5), (6)) t(a)";
 
@@ -507,18 +484,14 @@ TEST_CASE_METHOD(fragment_fixture,
         ++relayed_batches;
       }
     }
-    // The premise of this test. If a sender ever starts emitting one batch per fragment run
-    // *and* the other stops emitting at all, the test would silently degrade to FRAG-2.
+    // Multi-batch premise: if only one batch arrives this degrades to FRAG-2.
     REQUIRE(relayed_batches > 1);
     receiver.session().close_input(0, 0);
 
     receiver.run();
     receiver_window.finish();
 
-    // Diagnostic, not a contract: the source hands out one batch per task, so a healthy drain of
-    // N batches runs N tasks. Reported rather than asserted because coalescing batches into one
-    // task is a live design option -- if that lands, this number changes and the value assertion
-    // below is still the thing that must hold.
+    // INFO only: one batch per task today; coalescing would change the count.
     std::size_t created = 0, completed = 0;
     for (const auto& p : receiver.engine().sirius_pipelines) {
       created += p->get_tasks_created();
@@ -527,8 +500,6 @@ TEST_CASE_METHOD(fragment_fixture,
     INFO("relayed_batches=" << relayed_batches << " receiver tasks_created=" << created
                             << " tasks_completed=" << completed);
 
-    // Every value from every batch: a receiver that ran one task and stopped would return the
-    // first batch's rows and look like a plausible partial success.
     REQUIRE(drain_values(receiver, 1) == std::vector<std::int32_t>{1, 2, 3, 4, 5, 6});
 
     con->Rollback();

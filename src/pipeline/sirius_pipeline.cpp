@@ -349,9 +349,7 @@ void sirius_pipeline::set_task_creator(sirius::creator::task_creator* tc) { _tas
 
 void sirius_pipeline::notify_downstream_pipelines(bool original_pipeline)
 {
-  // A query-terminal sink ends the query — there is no downstream consumer to schedule and
-  // no parent pipeline whose status needs updating. Returning early avoids racing with engine
-  // teardown after mark_completed() signals the future.
+  // Query-terminal: no downstream; early return avoids teardown race after mark_completed().
   if (is_query_terminal()) { return; }
 
   // Schedule output consumers via the task_creator so downstream pipelines

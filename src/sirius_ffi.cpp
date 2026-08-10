@@ -60,9 +60,7 @@ struct Context::Impl {
   duckdb::shared_ptr<duckdb::SiriusContext> context;
   duckdb::unique_ptr<duckdb::DuckDB> db;
   duckdb::unique_ptr<duckdb::Connection> conn;
-  //! Input streams declared for the fragment currently being planned. Dual ownership: also
-  //! inserted into registered_state (where the bind and the plan generator look it up). Held here
-  //! so the catalog outlives any registered_state reset.
+  //! stream_bind_catalog: also in registered_state; held here past registered_state resets.
   duckdb::shared_ptr<sirius::exec::stream_bind_catalog> stream_catalog;
 
   void bring_up(sirius::sirius_config& config)
@@ -106,10 +104,7 @@ struct Context::Impl {
     client.registered_state->Insert("sirius_connection_state",
                                     duckdb::make_shared_ptr<duckdb::SiriusConnectionState>());
 
-    // A fragment reads each of its input streams through sirius_stream_source(id). The
-    // function has to exist on this DuckDB before any fragment plan binds, and its bind needs
-    // somewhere to look up a schema for a stream that has no file behind it — the catalog,
-    // reached the same way the engine reaches its SiriusContext.
+    // Fragment bind path: register catalog + sirius_stream_source before any plan binds.
     stream_catalog = duckdb::make_shared_ptr<sirius::exec::stream_bind_catalog>();
     client.registered_state->Insert(sirius::exec::stream_bind_catalog::kStateKey, stream_catalog);
     sirius::exec::register_stream_source_function(*db->instance);

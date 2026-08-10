@@ -49,20 +49,16 @@ void sirius_physical_streaming_source::set_pipeline(
 {
   sirius_physical_operator::set_pipeline(pipeline);
 
-  // Weak, because `_pipeline` already owns it for this operator's lifetime and both callbacks
-  // fire on producer threads.
+  // Weak: callbacks run on producer threads.
   duckdb::weak_ptr<pipeline::sirius_pipeline> weak_pipeline = pipeline;
 
-  // An empty or late-closed stream finishes the pipeline with no task in flight to do it.
-  // `original_pipeline=false` so downstream consumers are re-armed as well.
+  // Empty/late-closed stream finishes with no task in flight; original_pipeline=false re-arms
+  // downstream consumers.
   _input->set_on_end_of_stream([weak_pipeline] {
     if (auto p = weak_pipeline.lock()) { p->update_pipeline_status(false); }
   });
 
-  // Self-nomination: a source that answered WAITING is dropped, and task completion — the only
-  // built-in re-nomination — never comes for a source with no task in flight. See the
-  // declaration of set_pipeline() for the full story. schedule() only enqueues, so firing it
-  // from a producer thread is safe.
+  // Self-nomination (on_data → schedule(head)); schedule() only enqueues.
   _input->set_on_data([weak_pipeline] {
     auto p = weak_pipeline.lock();
     if (!p) { return; }
@@ -102,7 +98,6 @@ bool sirius_physical_streaming_source::all_ports_empty() { return _input->draine
 
 std::unique_ptr<operator_data> sirius_physical_streaming_source::get_next_task_input_data()
 {
-  // Rethrows a producer error: the task that asked for work carries the failure out.
   auto batch = _input->try_pull();
   if (!batch) return nullptr;
 
@@ -120,7 +115,7 @@ std::unique_ptr<operator_data> sirius_physical_streaming_source::execute(
 std::size_t sirius_physical_streaming_source::no_history_peak_memory_estimate(
   const input_stats& stats) const
 {
-  // Nothing new is allocated, so the default 2x would over-reserve under memory pressure.
+  // Pass-through: avoid default 2× reserve.
   return stats.bytes;
 }
 

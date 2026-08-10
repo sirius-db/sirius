@@ -95,15 +95,11 @@ void with_initialized_engine(duckdb::Connection& con,
                              const std::string& query,
                              const std::function<void(sirius_engine&)>& consume);
 
-//! A `logical_plan_source` that binds and optimizes `query`, applying the same optimizer disables
-//! the production path uses. Lets a test drive `streaming_fragment` from SQL where the compute
-//! node would hand over Substrait bytes. The caller must have a transaction open.
+//! SQL → bound LogicalOperator (tests stand in for Substrait). Caller must have a transaction.
 exec::logical_plan_source sql_plan_source(const std::string& query);
 
-//! Like `with_initialized_engine`, but roots the plan in a STREAMING_SINK over `output_repos`
-//! instead of a RESULT_COLLECTOR — the shape a streaming fragment runs. The caller (standing in
-//! for the fragment) owns the plan tree, so the engine borrows it via `initialize_internal`.
-//! `consume` runs while both are alive.
+//! Like with_initialized_engine, but roots the plan in a STREAMING_SINK over output_repos.
+//! Caller owns the plan tree; engine borrows via initialize_internal.
 void with_initialized_streaming_fragment(
   duckdb::Connection& con,
   const std::string& query,

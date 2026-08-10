@@ -176,8 +176,7 @@ sirius_physical_plan_generator::create_streaming_source_plan(duckdb::LogicalGet&
   }
   auto const& binding = catalog->get(bind->stream_id);
 
-  // The source emits the whole declared schema. Projection pushdown is off for this function, so
-  // DuckDB projects above the scan; a narrowed column list here would mean the two disagree.
+  // Projection pushdown is off; a narrowed column list here would disagree with the binder.
   auto column_ids = op.GetColumnIds();
   if (column_ids.size() != binding.types.size()) {
     throw duckdb::NotImplementedException(
@@ -190,8 +189,7 @@ sirius_physical_plan_generator::create_streaming_source_plan(duckdb::LogicalGet&
   auto source = duckdb::make_uniq<sirius::op::sirius_physical_streaming_source>(
     binding.types, op.EstimateCardinality(context), binding.repository, binding.expected_senders);
 
-  // The plan tree owns the operator from here; this back-pointer is how the fragment finds it
-  // again to register it with its stream_session.
+  // Plan owns op; catalog.built back-pointer for session registration.
   catalog->set_built(bind->stream_id, source.get());
   return source;
 }
@@ -266,9 +264,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
       "LogicalGet::project_input can only be set for table-in-out functions");
   }
 
-  // A stream read is not a scan: there is no file, no metadata and nothing to push filters into.
-  // Swap it for the STREAMING_SOURCE the fragment already declared, wired to the repository its
-  // senders push into. Everything above it in the plan is bound exactly as for a real scan.
+  // STREAMING_SOURCE leaf: fragment-declared repo + senders, not a file scan.
   if (op.function.name == sirius::exec::kStreamSourceFunctionName) {
     return create_streaming_source_plan(op);
   }

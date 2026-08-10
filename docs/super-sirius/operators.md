@@ -68,19 +68,34 @@ spill-visible to the downgrade executor when the caller registered that reposito
 manager) bound to the stream state (sender-aware end-of-stream, the availability classification,
 the `on_data` notification, and the producer-error plane).
 
-Key design invariants (S1–S5 are the named stream contracts defined in `exec/batch_stream.hpp`):
+Key design invariants (full S1–S5 / P1–P4 in [Streaming Sessions](streaming-sessions.md#contracts-s1-s5)):
 - Batches cross natively, in their current tier — no Arrow, no forced GPU upgrade.
 - EOS is **sender-aware**: `close_input(sender)` is idempotent per sender, and the stream ends
   only once every *expected* sender has closed. An unexpected sender id is a defined error.
 - **S1** — every batch lands in the repository before `on_data` announces it; `push()` returns
-  false once the stream is terminal, so no batch can arrive after a consumer has seen EOS.
-- **S2–S3** — a producer failure (`fail_input(error)`) fires `on_data` so a parked consumer
-  wakes to collect the rethrow; the stream never reports `END_OF_STREAM` or `drained()` while an
-  error is pending (the only exit is the rethrow).
+  false once the stream is terminal.
+- **S2** — `fail_input` wakes a parked consumer (on_data / P4 for the engine path) for the rethrow.
+- **S3** — an errored stream never reports `END_OF_STREAM` / `drained()`; exit is the rethrow.
+- **S4** — `try_pull` / task input rethrows before popping queued batches.
+- **S5** — `wait` then pull is not atomic; blocking loops must re-check.
 - `execute()` is a pure pass-through (COLUMN_DATA_SCAN shape — no GPU work).
 - `no_history_peak_memory_estimate()` returns `stats.bytes` (no extra allocation).
 
-Hint table:
+Hint state machine (contrast with `GPU_SCAN`: `READY{this} → drain blocking condvar → nullopt`):
+
+```
+WAITING{nullptr} ◄──── classify()=WAITING (open, empty)
+      │                      ▲
+      │ request dropped       │ try_pull() drains; stream still open
+      │                      │
+      └──► push() fires on_data ──► creator->schedule(head) ──► READY{this}
+                                                                      │
+                                              classify()=HAS_DATA ───┘
+                                              get_next_task_input_data() pops one batch
+                                              (or rethrows on error — S4)
+
+classify()=END_OF_STREAM ──► nullopt ──► on_end_of_stream ──► pipeline finishes
+```
 
 | Stream state | `get_next_task_hint()` |
 |---|---|
@@ -118,6 +133,18 @@ repository rather than into a query result. It is shaped
 like `RESULT_COLLECTOR` (appended to `current` in `build_pipelines`, set as the meta-pipeline sink)
 so the executor places it at `operators[last]` and drives its `on_finalize_operator()` — which is
 the only route to end-of-stream for the output stream.
+
+Lifecycle:
+
+```
+sink(batch) ──► batch_stream[i].push(batch)     (per task, per destination partition)
+      │
+on_finalize_operator()                           (pipeline finish — the only EOS path)
+      │
+batch_stream[i].close(PIPELINE_SENDER)           (for every output stream i)
+      │
+consumers see END_OF_STREAM via wait(i) / drained(i)
+```
 
 Key design facts:
 - **One sender, one finalize.** The pipeline feeding this sink is its single expected sender

@@ -284,11 +284,7 @@ void sirius_pipeline_converter::compute_repository_wiring(sirius_pipeline_build_
 
     using T = op::SiriusPhysicalOperatorType;
 
-    // A query-terminal sink has no downstream pipeline — nothing to emit. A STREAMING_SINK root
-    // would also fall through to the `!parent_op` check below, but only while it stays the plan
-    // root; skip it explicitly. The predicate lives on the pipeline so the terminal-sink set is
-    // defined once for all three readers: here, `sirius_pipeline::notify_downstream_pipelines`,
-    // and the executor's completion check.
+    // Query-terminal: no wiring. is_query_terminal() shared with notify_downstream / executor.
     if (pipeline->is_query_terminal()) { continue; }
 
     // CTE fans out to its sibling `cte_scans` (parent_op alone doesn't encode them).

@@ -30,48 +30,28 @@
 
 namespace sirius::exec {
 
-/// Everything needed to bind and then build one input stream.
-///
-/// The schema is supplied by the caller, never inferred: a stream has no file to probe, and the
-/// front end already knows the column types from its descriptor table. `sirius_stream_source`'s
-/// DuckDB bind reads `names` / `types` from here, and the physical plan generator reads
-/// `repository` / `expected_senders` to construct the operator.
+/// Schema + provenance for one input stream. Caller-supplied; never inferred.
 struct stream_input_binding {
   std::vector<std::string> names;
   duckdb::vector<sirius::logical_type> types;
   std::shared_ptr<cucascade::shared_data_repository> repository;
   std::set<sender_id_t> expected_senders;
 
-  /// Back-pointer to the operator the plan generator built for this id, filled in during
-  /// planning. The plan tree owns the operator; this is how the fragment finds it afterwards to
-  /// register it with its `stream_session`. Null until `create_plan(LogicalGet&)` has run.
+  /// Back-pointer into the engine-owned plan; filled during planning for session registration.
   op::sirius_physical_streaming_source* built = nullptr;
 };
 
-/// Per-connection registry of declared input streams, keyed by stream id.
-///
-/// It exists because a DuckDB table-function bind runs long before physical planning and has no
-/// route back to the fragment being built — only a `ClientContext`. Registering the catalog as a
-/// `ClientContextState` (exactly as the engine registers `SiriusContext` under `sirius_state`)
-/// gives the bind a lookup path, so `sirius_stream_source(id)` can resolve a schema with no file
-/// and no scan behind it.
-///
-/// One connection executes one fragment at a time, so a fragment declares its inputs before
-/// planning and clears them afterwards.
+/// Per-connection declared input streams. ClientContextState so DuckDB bind can resolve schema
+/// before physical planning. One fragment per connection at a time.
 class stream_bind_catalog : public duckdb::ClientContextState {
  public:
-  /// ClientContextState key this catalog is registered under.
   static constexpr const char* kStateKey = "sirius_stream_catalog";
 
-  /// Declare input stream `id`. Overwrites any previous declaration for the same id, so a reused
-  /// connection cannot serve a stale schema.
-  /// @throws sirius::invalid_input_exception when `binding.repository` is null, when `names` and
-  ///         `types` differ in size, or when `names` is empty. All three are caught here rather
-  ///         than at bind time, where they would surface as a mis-shaped scan schema far from the
-  ///         declaration that caused them.
+  /// Overwrites any previous declaration for the same id.
+  /// @throws sirius::invalid_input_exception on null repository, names/types size mismatch, or
+  ///         empty names.
   void declare(stream_id_t id, stream_input_binding binding);
 
-  /// Drop every declaration. Called when a fragment finishes.
   void clear();
 
   [[nodiscard]] bool contains(stream_id_t id) const;
@@ -79,11 +59,9 @@ class stream_bind_catalog : public duckdb::ClientContextState {
   /// @throws sirius::invalid_input_exception when `id` was never declared.
   [[nodiscard]] const stream_input_binding& get(stream_id_t id) const;
 
-  /// Record the operator the plan generator built for `id`.
   /// @throws sirius::invalid_input_exception when `id` was never declared.
   void set_built(stream_id_t id, op::sirius_physical_streaming_source* built);
 
-  /// Declared stream ids, ascending.
   [[nodiscard]] std::vector<stream_id_t> declared_streams() const;
 
  private:

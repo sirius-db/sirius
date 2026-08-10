@@ -91,6 +91,35 @@ Three behaviors are load-bearing:
   over an empty queue — the only way out is the rethrow from `try_pull()`, never a clean finish
   that would let a failed query succeed silently.
 
+### Contracts S1-S5
+
+Named observable contracts cited by call sites and tests. This section is the source of truth;
+headers keep only the tokens.
+
+- **S1 — admission ordering.** `push()` puts the batch in the repository before firing `on_data`,
+  and returns false once the stream is terminal. A consumer that saw EOS can never be raced by a
+  batch that was not yet visible when `on_data` fired.
+- **S2 — poison dominates.** `fail()` ends the stream and wakes a consumer parked on `WAITING`:
+  engine paths via `on_data` (P4); external `wait()` via the condition variable. Either way the
+  only exit is the rethrow from `try_pull()`, never a quiet finish.
+- **S3 — errored is never clean.** A stream with a pending error never returns `END_OF_STREAM` or
+  `drained()`. The only exit is the rethrow from `try_pull()`.
+- **S4 — rethrow beats pop.** `try_pull()` checks the pending error before popping; batches queued
+  behind a failure are never handed to the consumer. The error is never cleared.
+- **S5 — wait-then-pop is not atomic.** `wait()` and the following `try_pull()` are two separate
+  critical sections; a blocking consumer loop must re-check after waking.
+
+### Error semantics P1–P4 (`fail`)
+
+Failure is stream-wide (no sender identity) and waits for nobody. P1–P4 are the `fail()` details;
+S2 is the stream-level name for “poison wakes / dominates”.
+
+- **P1 — immediate visibility.** `pending_error()` returns it as soon as `fail()` returns.
+- **P2 — first failure wins.** Later failures and clean closes never displace the original cause.
+- **P3 — fail-fast terminal.** The stream ends at once rather than waiting for remaining senders.
+- **P4 — poison is data.** A pending error classifies as `HAS_DATA` even over an empty queue, and
+  fires `on_data` so a parked engine consumer comes back for the rethrow.
+
 | terminal? | error? | repo empty? | `classify()` |
 |---|---|---|---|
 | no | no | no | `HAS_DATA` |
@@ -101,6 +130,30 @@ Three behaviors are load-bearing:
 
 `wait()` blocks until `classify() != WAITING`. Engine workers never call it — it is for the
 wrapper's external threads.
+
+### Availability state machine
+
+Transitions are driven by producers (`push`, `close`, `fail`) and consumers (`try_pull`):
+
+```
+                  push()                       close(last sender) + repo empty
+WAITING ───────────────────────► HAS_DATA ──────────────────────────────────► END_OF_STREAM
+  ▲                                  │
+  └──────────────────────────────────┘
+        try_pull() drains repo; stream still open
+
+fail() (any state) ──► HAS_DATA  ──try_pull()──► rethrow
+                       ^^^^^^^^
+                       error is invisible to classify(); it is only revealed by try_pull()'s rethrow.
+                       The stream stays in HAS_DATA — never reaches END_OF_STREAM (S3).
+```
+
+Reading S1–S5 against the diagram:
+- **S1** — `push()` deposits the batch in the repo *before* the `WAITING → HAS_DATA` transition fires; a consumer that wakes on `HAS_DATA` is guaranteed to find the batch.
+- **S2 / P4** — `fail()` drives a transition to `HAS_DATA` and fires `on_data`, so a parked engine consumer comes back and exits via the rethrow in `try_pull()`.
+- **S3** — `fail()` has no arc to `END_OF_STREAM`; the `HAS_DATA → END_OF_STREAM` arc requires no pending error.
+- **S4** — `try_pull()` checks `pending_error()` before popping; batches queued behind a failure are never handed out.
+- **S5** — `wait()` and the following `try_pull()` are separate critical sections; another consumer may traverse `HAS_DATA → WAITING` between the two calls.
 
 ## `STREAMING_SOURCE` — the input boundary
 
@@ -125,6 +178,42 @@ retiring on `nullopt` and the query finishing as if it had worked.
 Each task pulls one batch, zero-copy, rethrowing any pending error; `execute()` is a
 pass-through.
 
+### Task-hint lifecycle
+
+Unlike `GPU_SCAN` — whose state machine is `READY{this} → drain (blocking condvar) → nullopt`
+and whose producer (`load_balancing_scan_batch_coalescer`) runs on a disjoint thread pool that
+never needs a `task_creator` slot — `STREAMING_SOURCE`'s producer is a sink task on a
+**remote fragment** (possibly a different compute node). Blocking in `get_next_task_input_data()`
+would deadlock: the 2-slot `task_creator` pool would be occupied waiting for data that can only
+arrive once the pool creates the sender's task. The source therefore never blocks; it drops the
+request and relies on `on_data` to re-nominate itself:
+
+```
+start_query() → schedule(head) once
+                      │
+                      ▼
+           ┌── classify() ──────────────────────────────────────┐
+           │                                                    │
+      WAITING                                              HAS_DATA / error
+           │                                                    │
+    WAITING{nullptr}                                      READY{this}
+    request dropped                                            │
+           │                                       get_next_task_input_data()
+           │                                       pulls one batch (or rethrows — S4)
+    push() fires on_data                                       │
+    creator->schedule(head)  ◄──── task completes ────────────┘
+    (re-enters from step ①)         (schedules consumers, not source)
+
+           │ classify() = END_OF_STREAM
+           ▼
+        nullopt → on_end_of_stream → update_pipeline_status → pipeline finishes
+```
+
+Key consequences:
+- `on_data` is **persistent** (not one-shot) — a push between fire and re-arm would otherwise be lost.
+- `schedule()` is pure enqueue (lock-free, safe from any thread) — the hook never occupies a pool slot.
+- `on_end_of_stream` is the symmetric edge for an empty or late-closed stream: `nullopt` hits the same "request dropped" path, so without this hook the pipeline would never finish.
+
 **The live re-arm.** The engine is pull-scheduled: a source that answers `WAITING` is dropped,
 and the only built-in re-nomination is task completion — so a starved stream-fed source has no
 completing task to wake it. The source therefore wires `set_on_data` (persistent, fires on every
@@ -144,6 +233,30 @@ the pipeline-finish hook (`on_finalize_operator()`) closes every stream, which i
 `END_OF_STREAM` observable. Consumers use `pull(i)` / `wait(i)` / `drained(i)` /
 `availability(i)`. Unlike the source it registers no `on_data` hook: its consumer is an external
 thread blocking in `wait()`, not an engine task that needs re-nominating.
+
+### Lifecycle
+
+```
+pipeline executing
+    │  execute() is a pass-through; publish_output() calls sink()
+    ▼
+sink(batch) ──► batch_stream[i].push(batch)     (one per destination partition)
+    │
+    │  (repeat per task)
+    ▼
+on_finalize_operator()                          (pipeline finish — the only EOS path)
+    │
+    ▼
+batch_stream[i].close(PIPELINE_SENDER)          (for every output stream i)
+    │
+    ▼
+consumers see END_OF_STREAM via wait(i) / drained(i)
+```
+
+The sink has exactly **one sender** (`PIPELINE_SENDER`). `on_finalize_operator()` is called only
+when the sink is in the pipeline's `operators` vector — if it is reachable only through the
+`sink` member, `finalize_operator()` skips it, the streams never close, and every `wait()` caller
+blocks forever (see the gotcha in [exec::stream_session](#execstream_session--the-id-addressed-router)).
 
 ### Partition fan-out
 

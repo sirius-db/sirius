@@ -27,7 +27,7 @@ namespace sirius::exec {
 
 namespace {
 
-/// Resolve the catalog registered on this connection, or explain why the fragment is not set up.
+/// Resolve the per-connection stream_bind_catalog, or explain why the fragment is not set up.
 duckdb::shared_ptr<stream_bind_catalog> catalog_for(duckdb::ClientContext& context)
 {
   auto catalog = context.registered_state->Get<stream_bind_catalog>(stream_bind_catalog::kStateKey);
@@ -50,9 +50,7 @@ duckdb::unique_ptr<duckdb::FunctionData> stream_source_bind(
   }
   auto const stream_id = static_cast<stream_id_t>(input.inputs[0].GetValue<std::int64_t>());
 
-  // An unregistered id is a defined bind-time error, not a silent empty scan: it means the
-  // fragment's plan references a stream nobody declared, which would otherwise surface much
-  // later as a plan with no source.
+  // Undeclared id = bind error (not a silent empty scan).
   auto const& binding = catalog_for(context)->get(stream_id);
 
   names        = duckdb::vector<std::string>(binding.names.begin(), binding.names.end());
@@ -60,8 +58,7 @@ duckdb::unique_ptr<duckdb::FunctionData> stream_source_bind(
   return duckdb::make_uniq<stream_source_bind_data>(stream_id);
 }
 
-/// Never runs. The Sirius plan generator replaces this scan with a STREAMING_SOURCE, and this
-/// path has no CPU fallback — a stream's batches only exist on the GPU side of the fragment.
+/// Never runs: plan generator replaces this scan with STREAMING_SOURCE.
 void stream_source_function(duckdb::ClientContext&, duckdb::TableFunctionInput&, duckdb::DataChunk&)
 {
   throw std::runtime_error(
@@ -76,18 +73,13 @@ void register_stream_source_function(duckdb::DatabaseInstance& instance)
   auto transaction = duckdb::CatalogTransaction::GetSystemTransaction(instance);
   auto& catalog    = duckdb::Catalog::GetSystemCatalog(instance);
 
-  // No projection/filter pushdown is enabled (DuckDB leaves them off unless asked): a streaming
-  // source hands over whole batches in the tier they already sit in, so there is no per-column
-  // read to prune, and the scan is replaced by a STREAMING_SOURCE before it could honour one.
   duckdb::TableFunction stream_source(kStreamSourceFunctionName,
                                       {duckdb::LogicalType::BIGINT},
                                       stream_source_function,
                                       stream_source_bind);
 
   duckdb::CreateTableFunctionInfo info(stream_source);
-  // Idempotent: the extension callback registers Sirius functions on every DuckDB instance in
-  // the process, and a caller (the FFI, a test) may also register explicitly. A duplicate is
-  // not an error.
+  // Idempotent: extension callback and explicit callers may both register.
   info.on_conflict = duckdb::OnCreateConflict::IGNORE_ON_CONFLICT;
   catalog.CreateTableFunction(transaction, info);
 }

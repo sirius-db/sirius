@@ -310,10 +310,7 @@ TEST_CASE("streaming_sink SNK-9: memory estimate reports no additional peak", "[
 }
 
 // ============================================================================
-// SNK-10: source → filter → sink round-trip over native batches only
-//
-// The end-to-end check for the data path: a batch pushed into a streaming source comes back out
-// of a streaming sink, filtered, with no channel and no Arrow anywhere in between.
+// SNK-10: source → filter → sink round-trip over native batches.
 // ============================================================================
 
 TEST_CASE("streaming_sink SNK-10: source to filter to sink round-trips native batches",
@@ -380,10 +377,7 @@ TEST_CASE("streaming_sink SNK-10: source to filter to sink round-trips native ba
 }
 
 // ============================================================================
-// SINK-ERR-1: fail_output() unblocks a consumer blocked in wait() and rethrows.
-//
-// S2 — poison dominates. Without the wake, an external consumer parked in wait() on a fragment
-// that just died would block forever with no error anywhere.
+// SINK-ERR-1: fail_output() unblocks wait() and rethrows (S2 via CV; sink has no on_data).
 // ============================================================================
 
 TEST_CASE("streaming_sink SINK-ERR-1: fail_output unblocks wait and rethrows in pull",
@@ -410,10 +404,7 @@ TEST_CASE("streaming_sink SINK-ERR-1: fail_output unblocks wait and rethrows in 
 }
 
 // ============================================================================
-// SINK-ERR-2: availability never reports EOS and drained stays false under error.
-//
-// S3 — errored is never clean. The disaster is the quiet success: a consumer that saw drained()
-// would stop pulling and report a failed fragment as a short but complete result.
+// SINK-ERR-2: errored stream never reports clean end (S3).
 // ============================================================================
 
 TEST_CASE("streaming_sink SINK-ERR-2: errored stream never reports clean end", "[streaming_sink]")
@@ -507,10 +498,8 @@ TEST_CASE("streaming_sink PART-2: rows with the same key land on the same destin
 }
 
 // ============================================================================
-// PART-3: a slow destination cannot head-of-line-block the others
-//
-// This is the whole point of per-destination repositories: one destination that received rows is
-// never drained, and the remaining destinations must still drain and reach EOS.
+// PART-3: a slow destination cannot head-of-line-block the others.
+// One destination that received rows stays undrained; siblings must still reach EOS.
 // ============================================================================
 
 TEST_CASE("streaming_sink PART-3: an undrained destination does not block its siblings",

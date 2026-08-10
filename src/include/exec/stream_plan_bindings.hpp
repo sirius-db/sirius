@@ -23,12 +23,9 @@
 
 namespace sirius::exec {
 
-/// Name of the table function a fragment plan uses to read an input stream.
 inline constexpr const char* kStreamSourceFunctionName = "sirius_stream_source";
 
-/// Bind data for `sirius_stream_source(stream_id)`. Carries only the id — the schema is resolved
-/// at bind time from the connection's `stream_bind_catalog`, and the physical plan generator
-/// re-reads the catalog to build the operator.
+/// Bind data for sirius_stream_source(stream_id). Schema comes from stream_bind_catalog.
 struct stream_source_bind_data : public duckdb::FunctionData {
   explicit stream_source_bind_data(stream_id_t stream_id) : stream_id(stream_id) {}
 
@@ -46,13 +43,8 @@ struct stream_source_bind_data : public duckdb::FunctionData {
   }
 };
 
-/// Register `sirius_stream_source(stream_id BIGINT)` on `instance`'s system catalog.
-///
-/// A stream has no file to probe, so DuckDB's parquet binder cannot resolve a schema for it — a
-/// fake `local_files` URI would fail to bind. A table function carries its schema explicitly,
-/// which is why an input stream is lowered to one. The bind reads the declared schema from the
-/// connection's `stream_bind_catalog`; the function body is never executed, because the Sirius
-/// plan generator replaces the scan with a `STREAMING_SOURCE`.
+/// Register sirius_stream_source(id). Bind reads stream_bind_catalog; body never runs
+/// (replaced by STREAMING_SOURCE).
 void register_stream_source_function(duckdb::DatabaseInstance& instance);
 
 }  // namespace sirius::exec

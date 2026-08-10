@@ -327,11 +327,7 @@ TEST_CASE("stream_session SESS-8: a fragment round-trips native batches by id", 
 }
 
 // ============================================================================
-// SESS-9: leaf-fragment shape — a partitioned sink and NO source.
-//
-// The leaf of a distributed GROUP BY: scan → partial aggregate → partitioned
-// STREAMING_SINK. Its EOS is driven by the scan finishing, not by any
-// close_input, so a session with zero input streams must be legitimate.
+// SESS-9: leaf-fragment shape — partitioned sink, no source. EOS from scan finish.
 // ============================================================================
 
 TEST_CASE("stream_session SESS-9: a leaf fragment registers only output streams",
@@ -378,11 +374,7 @@ TEST_CASE("stream_session SESS-9: a leaf fragment registers only output streams"
 }
 
 // ============================================================================
-// SESS-10: root-fragment shape — one fan-in source fed by N remote senders.
-//
-// The root of a distributed GROUP BY: STREAMING_SOURCE → final merge →
-// STREAMING_SINK. EOS must wait for all N *distinct* senders; a duplicate
-// close from one sender must not advance it.
+// SESS-10: root-fragment shape — fan-in source, N senders. Sender-set EOS.
 // ============================================================================
 
 TEST_CASE("stream_session SESS-10: a root fragment ends only after every sender closes",

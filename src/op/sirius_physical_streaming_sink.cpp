@@ -70,9 +70,7 @@ sirius_physical_streaming_sink::sirius_physical_streaming_sink(
                                           std::to_string(output_repositories.size()) +
                                           " destinations needs partition key columns to route by");
   }
-  // hash_partition() reads partition_key_idx[i] for every cast type it is given, and indexes the
-  // input table by that value: a longer cast list or an out-of-range column reads past the end of
-  // one or the other. Both are wiring bugs, so they fail here rather than as device-side UB.
+  // Fail here: bad cast list / key index is device-side UB in hash_partition.
   if (!_spec.key_cast_types.empty() && _spec.key_cast_types.size() != _spec.key_columns.size()) {
     throw sirius::invalid_input_exception(
       "sirius_physical_streaming_sink: partition_spec has " +
@@ -97,8 +95,7 @@ sirius_physical_streaming_sink::sirius_physical_streaming_sink(
 std::unique_ptr<operator_data> sirius_physical_streaming_sink::execute(
   const operator_data& input_data, rmm::cuda_stream_view /*stream*/)
 {
-  // As sirius_physical_result_collector does: hand the batches back so publish_output() can
-  // deliver them to sink(). The base implementation would drop them.
+  // Match RESULT_COLLECTOR: return batches for sink().
   return std::make_unique<pipelineable_operator_data>(
     dynamic_cast<const pipelineable_operator_data&>(input_data).get_read_only_batches());
 }
@@ -109,11 +106,8 @@ void sirius_physical_streaming_sink::sink(const operator_data& input_data,
   const auto& input = dynamic_cast<const pipelineable_operator_data&>(input_data);
 
   if (_outputs.size() == 1) {
-    // Pushed in their current tier: no Arrow, no forced GPU upgrade, no copy. The batch stays
-    // spillable in the repository until a consumer pulls it.
     for (const auto& batch : input.get_data_batches()) {
-      // push() refuses once the stream is terminal. Ignoring that return silently drops the
-      // batch, which surfaces as a fragment that "succeeds" with an empty output.
+      // Refused push = silent data loss.
       if (!_outputs[0]->push(batch)) {
         SIRIUS_LOG_WARN(
           "sirius_physical_streaming_sink: batch refused after end-of-stream and dropped");
@@ -130,9 +124,7 @@ void sirius_physical_streaming_sink::sink(const operator_data& input_data,
         "sirius_physical_streaming_sink: partitioned sink requires a resident input batch");
     }
 
-    // Same kernel as the PARTITION operator; only the routing (slice i -> stream i) is new.
-    // Any consistent hash co-locates equal keys, which is all a local cut needs — matching a
-    // front end's exact partition function is translation's job.
+    // Same kernel as PARTITION; routing only.
     auto slices = gpu_partition_impl::hash_partition(input_batch,
                                                      _spec.key_columns,
                                                      _spec.key_cast_types,
@@ -142,11 +134,9 @@ void sirius_physical_streaming_sink::sink(const operator_data& input_data,
                                                      batch_telemetry());
 
     for (std::size_t i = 0; i < slices.size(); ++i) {
-      // An empty partition stays WAITING until the pipeline finishes, rather than publishing a
-      // zero-row batch a consumer would have to pull and discard.
+      // Empty partition stays WAITING until finalize.
       if (sirius::get_cudf_table_view(*slices[i]).num_rows() == 0) { continue; }
-      // Same contract as the single-destination path: a refused slice must be warned about, or
-      // a partition that went terminal early turns into rows that silently never arrive.
+      // Refused push = silent data loss.
       if (!_outputs[i]->push(slices[i])) {
         SIRIUS_LOG_WARN(
           "sirius_physical_streaming_sink: partition {} batch refused after end-of-stream and "
@@ -160,14 +150,7 @@ void sirius_physical_streaming_sink::sink(const operator_data& input_data,
 std::size_t sirius_physical_streaming_sink::no_history_peak_memory_estimate(
   const input_stats& stats) const
 {
-  // Measured against the input this task already materialized, which the caller subtracts before
-  // recording a real peak — so this is what the operator allocates on top of it.
-  //
-  // Single destination: nothing. The batch is handed over as it stands.
-  //
-  // Partitioned: hash_partition() materializes a full reordered copy of the table and then copies
-  // each slice out of it, and both are live at once, so ~2× the input. Same value
-  // sirius_physical_partition reports for the same kernel.
+  // 0 if N==1; ~2× when partitioned (hash_partition holds reorder + slices).
   if (_outputs.size() == 1) { return 0; }
   return stats.bytes * 2;
 }
@@ -180,8 +163,7 @@ void sirius_physical_streaming_sink::build_pipelines(pipeline::sirius_pipeline& 
       "sirius_physical_streaming_sink: expects exactly one child subtree");
   }
 
-  // Append to `current` so the terminal operator is part of the root pipeline, then start the
-  // real pipeline from the child. Same shape as RESULT_COLLECTOR.
+  // operators[] membership required for finalize/EOS (like RESULT_COLLECTOR).
   auto& state = meta_pipeline.get_state();
   state.add_pipeline_operator(current, *this);
 
@@ -191,7 +173,7 @@ void sirius_physical_streaming_sink::build_pipelines(pipeline::sirius_pipeline& 
 
 void sirius_physical_streaming_sink::on_finalize_operator()
 {
-  // The pipeline is the single sender, so its completion is end-of-stream for all outputs.
+  // Pipeline completion = sender-set EOS (PIPELINE_SENDER).
   for (auto& s : _outputs) {
     s->close(PIPELINE_SENDER);
   }

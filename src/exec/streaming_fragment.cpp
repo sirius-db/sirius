@@ -59,9 +59,7 @@ streaming_fragment::streaming_fragment(duckdb::ClientContext& context, fragment_
       " output streams need a partition spec; a gather fragment has exactly one");
   }
 
-  // Created here, outside data_repository_manager_, so the window's mandatory cleanup
-  // (StandaloneQueryScope::finish()) cannot destroy them. This is what lets a sender's output
-  // outlive its own fragment.
+  // Repositories escape data_repository_manager_ cleanup so sender output outlives this fragment.
   for (const auto& [id, _] : _spec.inputs) {
     _input_repos[id] = std::make_shared<cucascade::shared_data_repository>();
   }
@@ -76,8 +74,7 @@ streaming_fragment::streaming_fragment(duckdb::ClientContext& context, fragment_
 
 streaming_fragment::~streaming_fragment()
 {
-  // The catalog is per-connection and this fragment's declarations must not be visible to the
-  // next one. Swallow, because a throwing destructor during stack unwinding would terminate.
+  // Clear per-connection catalog; swallow in dtor.
   try {
     catalog_for(_context)->clear();
   } catch (...) {  // NOLINT(bugprone-empty-catch)
@@ -91,8 +88,7 @@ void streaming_fragment::build(sirius::query_id_t query_id)
   auto catalog = catalog_for(_context);
   catalog->clear();
 
-  // Declare every input before planning: sirius_stream_source's DuckDB bind resolves its schema
-  // from here, and create_plan(LogicalGet&) reads the repository and sender set back out.
+  // Declare before planning: bind resolves schema; create_plan reads repo + senders.
   for (const auto& [id, input] : _spec.inputs) {
     catalog->declare(
       id,
@@ -108,8 +104,7 @@ void streaming_fragment::build(sirius::query_id_t query_id)
   sirius::planner::sirius_physical_plan_generator generator(_context);
   auto subtree = generator.create_plan(std::move(logical_plan));
 
-  // A STREAMING_SINK is a normal unary operator: the subtree goes in children[], unlike the
-  // RESULT_COLLECTOR, which keeps its child outside and needs special descent in the generator.
+  // STREAMING_SINK is a normal unary: subtree in children[] (unlike RESULT_COLLECTOR).
   auto types       = subtree->types;
   auto cardinality = subtree->estimated_cardinality;
 
@@ -129,8 +124,7 @@ void streaming_fragment::build(sirius::query_id_t query_id)
   }
   sink->children.push_back(std::move(subtree));
 
-  // Hand the plan to the engine and let it own the tree, which is the path a normal query
-  // takes. The fragment owns the engine, so the sink still outlives run() and stays pullable.
+  // Engine owns the plan; fragment owns the engine so the sink stays pullable after run().
   _iface = std::make_unique<sirius::sirius_interface>(
     _context, std::optional<std::string>(kFragmentQueryLabel));
   _engine = std::make_unique<sirius::sirius_engine>(_context, *_iface, query_id);
@@ -138,13 +132,11 @@ void streaming_fragment::build(sirius::query_id_t query_id)
 
   auto& sink_ref = _engine->sirius_physical_plan->Cast<op::sirius_physical_streaming_sink>();
 
-  // Register both ends with the session. The engine owns the operators; the session borrows.
   _session.add_sink(_spec.outputs, sink_ref);
   for (const auto& [id, _] : _spec.inputs) {
     auto* built = catalog->get(id).built;
     if (built == nullptr) {
-      // The plan never read this stream. Silently ignoring it would leave its senders with
-      // nowhere to push and the fragment waiting on a stream nothing drains.
+      // Declared but unread = hang; fail loudly.
       throw sirius::invalid_input_exception("streaming_fragment: input stream " +
                                             std::to_string(id) +
                                             " was declared but the plan does not read it");
@@ -161,12 +153,8 @@ void streaming_fragment::run()
     throw sirius::invalid_input_exception("streaming_fragment: build() must run before run()");
   }
 
-  // The query window is the CALLER's, not the fragment's. Opening a StandaloneQueryScope resets
-  // the task creator and the operator-id counter, and its finish() resets the scan manager --
-  // all of which build() has already populated. Taking the slot here would discard those
-  // plan-time registrations, and the fragment would run zero tasks and return an empty output
-  // silently. The caller brackets build() and run() in one window, as Context::execute_substrait
-  // does.
+  // Shared query window (don't open a second StandaloneQueryScope): a new window resets
+  // task_creator / scan manager that build() populated → zero tasks, empty output, no error.
   _engine->execute();
 }
 

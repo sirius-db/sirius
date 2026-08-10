@@ -86,7 +86,7 @@ void batch_stream::fail(std::exception_ptr error)
     std::unique_lock<std::mutex> lock(_mutex);
     if (_error) { return; }  // P2 — the first failure is the cause the consumer sees
     _error = std::move(error);
-    // P4 — announced like a batch, or a consumer parked on WAITING never comes back for it.
+    // S2 / P4 — announce like a batch (on_data); wait() wakes via notify_all below.
     data_hook = _on_data;
     if (!_terminal) {
       _terminal = true;  // P3 — the stream ends now, waiting for nobody

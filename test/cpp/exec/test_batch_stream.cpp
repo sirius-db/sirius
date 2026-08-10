@@ -261,7 +261,7 @@ TEST_CASE("batch_stream BSTR-6: wait unblocks on a push and on the final close",
 }
 
 // ============================================================================
-// BSTR-7: fail() is immediate, fail-fast terminal, and first-wins (S2 / P1–P3)
+// BSTR-7: fail() is immediate, fail-fast terminal, and first-wins (P1–P3)
 // ============================================================================
 
 TEST_CASE("batch_stream BSTR-7: fail() poisons the stream at once", "[batch_stream]")
@@ -315,7 +315,7 @@ TEST_CASE("batch_stream BSTR-8: try_pull rethrows ahead of queued batches", "[ba
 }
 
 // ============================================================================
-// BSTR-9: the poison announces itself like data (S2 / P4)
+// BSTR-9: the poison announces itself like data (S2 / P4 — on_data + HAS_DATA)
 // ============================================================================
 
 TEST_CASE("batch_stream BSTR-9: fail() wakes the consumer and reads as HAS_DATA", "[batch_stream]")
