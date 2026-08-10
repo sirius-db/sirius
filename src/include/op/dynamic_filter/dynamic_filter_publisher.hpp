@@ -51,11 +51,12 @@ struct dynamic_filter_publication_outcome {
   std::size_t keys_build_exceeded_domain = 0;  ///< Build rows exceeded the domain bound
   std::size_t skipped_targets_drained    = 0;  ///< 1 when the attempt hit the all-drained return
   std::size_t keys_skipped_domain_gate   = 0;  ///< Skipped: build too dense a sample of the domain
-  std::size_t keys_skipped_type_mismatch = 0;  ///< Skipped: plan type disagreed with the column
-  std::size_t membership_filters_built   = 0;
-  std::size_t zone_map_filters_built     = 0;
-  std::size_t active_targets             = 0;  ///< Targets still accepting filters
-  std::size_t filters_pushed             = 0;  ///< Accepted pushes across every target
+  std::size_t keys_skipped_bloom_size_gate = 0;  ///< Skipped: aggregate Bloom budget exceeded
+  std::size_t keys_skipped_type_mismatch   = 0;  ///< Skipped: plan type disagreed with the column
+  std::size_t membership_filters_built     = 0;
+  std::size_t zone_map_filters_built       = 0;
+  std::size_t active_targets               = 0;  ///< Targets still accepting filters
+  std::size_t filters_pushed               = 0;  ///< Accepted pushes across every target
 };
 
 /**

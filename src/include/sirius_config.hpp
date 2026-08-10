@@ -49,6 +49,8 @@ constexpr uint64_t DEFAULT_CONCAT_BATCH_BYTES         = DEFAULT_BATCH_SIZE;
 constexpr uint64_t DEFAULT_SORT_SAMPLE_BYTES          = DEFAULT_BATCH_SIZE;
 constexpr uint64_t DEFAULT_MAX_BUILD_HASH_TABLE_BYTES = 2 * DEFAULT_BATCH_SIZE;
 constexpr uint64_t DEFAULT_MAX_BROADCAST_JOIN_SIZE    = 256ULL * 1024 * 1024;  // 256 MiB
+constexpr uint64_t DEFAULT_MAX_DYNAMIC_FILTER_BLOOM_BYTES_PER_GPU =
+  256ULL * 1024 * 1024;  // 256 MiB
 
 /// Multi-GPU small-table threshold, charged per GPU. A partition-sizing consumer (hash join,
 /// merge_group_by) keeps inputs below `num_gpus * this` on a single GPU (one partition) to avoid
@@ -140,6 +142,12 @@ struct operator_params {
   /// whole-build path is unchanged when disabled. Effective only when enable_dynamic_filter is
   /// enabled.
   bool enable_dynamic_filter_multi_partition = false;
+
+  /// Maximum allocator-accounted Bloom bit-array bytes produced by one join on each GPU, summed
+  /// across its Bloom keys. 0 disables Bloom construction without disabling exact membership or
+  /// zone-map filters.
+  uint64_t max_dynamic_filter_bloom_bytes_per_gpu =
+    config::DEFAULT_MAX_DYNAMIC_FILTER_BLOOM_BYTES_PER_GPU;
 
   /// Emit build-key min/max filters in addition to membership filters. Parquet scans use them for
   /// row-group pruning; duckdb-native scans apply them post-decode. Effective only when

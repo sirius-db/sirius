@@ -22,6 +22,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <vector>
 
@@ -88,6 +89,8 @@ struct dynamic_filter_publication_policy {
   bool emit_zone_map_filters = false;
   /// Coverage fraction at or above which publication skips a key
   double domain_coverage_threshold = 0.9;
+  /// Allocator-accounted Bloom bit-array budget for one join on each GPU
+  std::uint64_t max_bloom_bytes_per_gpu = std::numeric_limits<std::uint64_t>::max();
 };
 
 /**
@@ -325,6 +328,18 @@ class dynamic_filter_publish_plan final {
   [[nodiscard]] double domain_coverage_threshold() const noexcept
   {
     return _policy.domain_coverage_threshold;
+  }
+  /**
+   * @brief Allocator-accounted Bloom bit-array budget for this join on each GPU
+   *
+   * The budget is shared by every Bloom key but is not multiplied by replica count. A value of 0
+   * disables Bloom construction while leaving exact membership and zone-map filters eligible.
+   *
+   * @return Maximum bytes per GPU
+   */
+  [[nodiscard]] std::uint64_t max_bloom_bytes_per_gpu() const noexcept
+  {
+    return _policy.max_bloom_bytes_per_gpu;
   }
 
  private:

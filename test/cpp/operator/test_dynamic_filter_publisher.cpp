@@ -39,6 +39,7 @@
 #include <cstdint>
 #include <future>
 #include <latch>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <type_traits>
@@ -174,7 +175,8 @@ std::size_t count_filters_of_kind(
 }
 
 template <typename ExpectedFilter>
-void require_published_membership(std::size_t rows)
+void require_published_membership(std::size_t rows,
+                                  sirius::op::dynamic_filter_publication_policy policy = {})
 {
   publisher_fixture fixture;
   fixture.add_key_column(rows);
@@ -188,7 +190,7 @@ void require_published_membership(std::size_t rows)
                                                    .channel_push_ordinal = kProbeColumnIndex,
                                                    .probe_storage_type   = kInt64}}});
   dynamic_filter_publish_plan plan{
-    {make_int64_key(0, 0)}, std::move(targets), std::move(fixture.replica_spaces)};
+    {make_int64_key(0, 0)}, std::move(targets), std::move(fixture.replica_spaces), policy};
 
   auto const& keys = *fixture.columns.front();
   if constexpr (std::is_same_v<ExpectedFilter, sirius::op::sirius_dynamic_small_in_list_filter>) {
@@ -301,7 +303,9 @@ void require_domain_gate_skips_only(std::size_t gated_key_index)
 }
 
 dynamic_filter_publish_plan make_accumulator_plan(
-  publisher_fixture& fixture, std::shared_ptr<sirius::op::sirius_dynamic_filter_set> const& channel)
+  publisher_fixture& fixture,
+  std::shared_ptr<sirius::op::sirius_dynamic_filter_set> const& channel,
+  sirius::op::dynamic_filter_publication_policy policy = {})
 {
   std::vector<dynamic_filter_publish_plan::probe_target> targets;
   targets.push_back({.filter_set               = channel,
@@ -311,7 +315,7 @@ dynamic_filter_publish_plan make_accumulator_plan(
                                                    .channel_push_ordinal = kProbeColumnIndex,
                                                    .probe_storage_type   = kInt64}}});
   return dynamic_filter_publish_plan{
-    {make_int64_key(0, 0)}, std::move(targets), std::move(fixture.replica_spaces)};
+    {make_int64_key(0, 0)}, std::move(targets), std::move(fixture.replica_spaces), policy};
 }
 
 cudf::table_view one_column_view(cudf::column const& column)
@@ -326,11 +330,65 @@ TEST_CASE("dynamic-filter publisher selects the raw small IN-list", "[dynamic_fi
   require_published_membership<sirius::op::sirius_dynamic_small_in_list_filter>(3);
 }
 
+TEST_CASE("the Bloom cap leaves exact membership filters eligible",
+          "[dynamic_filter][publisher][bloom_budget]")
+{
+  require_published_membership<sirius::op::sirius_dynamic_small_in_list_filter>(
+    3, {.max_bloom_bytes_per_gpu = 0});
+}
+
 TEST_CASE("dynamic-filter publisher falls through to the hash IN-list above the small-list gate",
           "[dynamic_filter][publisher]")
 {
   require_published_membership<sirius::op::sirius_dynamic_in_list_filter>(
     sirius::op::sirius_dynamic_small_in_list_filter::k_max_keys + 1);
+}
+
+TEST_CASE("the Bloom cap skips a one-shot Bloom candidate before allocation",
+          "[dynamic_filter][publisher][bloom_budget]")
+{
+  publisher_fixture fixture;
+  auto& source_space = fixture.replica_spaces.front().get_gpu_space();
+  fixture.columns.push_back(cudf::make_fixed_width_column(
+    kInt64, 1, cudf::mask_state::ALL_NULL, fixture.stream, source_space.get_default_allocator()));
+
+  auto channel = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
+  std::vector<dynamic_filter_publish_plan::probe_target> targets;
+  targets.push_back({.filter_set               = channel,
+                     .route_class              = dynamic_filter_route_class::scan,
+                     .accepts_zone_map_filters = false,
+                     .key_bindings             = {{.admitted_key_index   = 0,
+                                                   .channel_push_ordinal = kProbeColumnIndex,
+                                                   .probe_storage_type   = kInt64}}});
+  dynamic_filter_publish_plan plan{{make_int64_key(0, 0)},
+                                   std::move(targets),
+                                   std::move(fixture.replica_spaces),
+                                   {.max_bloom_bytes_per_gpu = 0}};
+
+  auto const outcome =
+    sirius::op::publish_dynamic_filters(plan, fixture.build_view(), fixture.stream);
+
+  REQUIRE(outcome.keys_considered == 1);
+  REQUIRE(outcome.keys_skipped_bloom_size_gate == 1);
+  REQUIRE(outcome.membership_filters_built == 0);
+  REQUIRE(outcome.filters_pushed == 0);
+  REQUIRE(channel->empty());
+}
+
+TEST_CASE("Bloom construction rejects a footprint whose allocator alignment would overflow",
+          "[dynamic_filter][publisher][bloom_budget]")
+{
+  publisher_fixture fixture;
+  auto& source_space  = fixture.replica_spaces.front().get_gpu_space();
+  auto const size_max = std::numeric_limits<std::size_t>::max();
+  // Produces SIZE_MAX/32 blocks: raw bytes fit at SIZE_MAX-31, but CUDA alignment overflows.
+  auto const expected_num_keys = size_max / 2 - 15;
+
+  REQUIRE(sirius::op::sirius_dynamic_bloom_filter::estimated_bytes(expected_num_keys) == size_max);
+  REQUIRE_THROWS_AS(
+    sirius::op::sirius_dynamic_bloom_filter(
+      kInt64, expected_num_keys, fixture.stream, source_space.get_default_allocator()),
+    std::length_error);
 }
 
 TEST_CASE("dynamic-filter publisher fans out sparsely: each target receives only its bound keys",
@@ -870,7 +928,10 @@ TEST_CASE("multi-partition accumulator publishes only after every exact build ID
   fixture.add_key_column(3, 0);
   fixture.add_key_column(3, 3);
   auto channel = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
-  auto plan    = make_accumulator_plan(fixture, channel);
+  auto plan    = make_accumulator_plan(
+    fixture,
+    channel,
+    {.max_bloom_bytes_per_gpu = sirius::op::sirius_dynamic_bloom_filter::estimated_bytes(6)});
   sirius::op::dynamic_filter_accumulator accumulator(plan, 6, {101, 202});
 
   auto const first =
@@ -886,6 +947,7 @@ TEST_CASE("multi-partition accumulator publishes only after every exact build ID
   auto const last =
     accumulator.contribute(202, one_column_view(*fixture.columns[1]), fixture.stream);
   REQUIRE(last.state == sirius::op::dynamic_filter_accumulation_result::status::published);
+  REQUIRE(last.publication.keys_skipped_bloom_size_gate == 0);
   REQUIRE(accumulator.complete());
   REQUIRE_FALSE(accumulator.aborted());
   REQUIRE_FALSE(accumulator.abort_if_incomplete());
@@ -901,6 +963,41 @@ TEST_CASE("multi-partition accumulator publishes only after every exact build ID
   auto const unknown =
     accumulator.contribute(999, one_column_view(*fixture.columns[0]), fixture.stream);
   REQUIRE(unknown.state == sirius::op::dynamic_filter_accumulation_result::status::aborted);
+}
+
+TEST_CASE("multi-partition Bloom admission accounts for every key on one GPU",
+          "[dynamic_filter][publisher][accumulator][bloom_budget]")
+{
+  publisher_fixture fixture;
+  fixture.add_key_column(3, 0);
+  fixture.add_key_column(3, 100);
+  auto channel = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
+  std::vector<dynamic_filter_publish_plan::probe_target> targets;
+  targets.push_back({.filter_set               = channel,
+                     .route_class              = dynamic_filter_route_class::scan,
+                     .accepts_zone_map_filters = false,
+                     .key_bindings             = {{.admitted_key_index   = 0,
+                                                   .channel_push_ordinal = kProbeColumnIndex,
+                                                   .probe_storage_type   = kInt64},
+                                                  {.admitted_key_index   = 1,
+                                                   .channel_push_ordinal = kProbeColumnIndex + 1,
+                                                   .probe_storage_type   = kInt64}}});
+  dynamic_filter_publish_plan plan{
+    {make_int64_key(0, 0), make_int64_key(1, 1)},
+    std::move(targets),
+    std::move(fixture.replica_spaces),
+    {.max_bloom_bytes_per_gpu = sirius::op::sirius_dynamic_bloom_filter::estimated_bytes(3)}};
+  sirius::op::dynamic_filter_accumulator accumulator(plan, 3, {101});
+
+  auto const result = accumulator.contribute(101, fixture.build_view(), fixture.stream);
+  REQUIRE(result.state == sirius::op::dynamic_filter_accumulation_result::status::published);
+  REQUIRE(result.publication.keys_considered == 2);
+  REQUIRE(result.publication.keys_skipped_bloom_size_gate == 2);
+  REQUIRE(result.publication.membership_filters_built == 0);
+  REQUIRE(result.publication.filters_pushed == 0);
+  REQUIRE(accumulator.complete());
+  REQUIRE_FALSE(accumulator.aborted());
+  REQUIRE(channel->empty());
 }
 
 TEST_CASE("multi-partition accumulator close prevents publication with a missing ID",

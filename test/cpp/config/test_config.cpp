@@ -594,16 +594,20 @@ TEST_CASE("the dynamic-filter switch is consumed from the operator_params YAML s
     out << "sirius:\n"
            "  operator_params:\n"
            "    enable_dynamic_filter: false\n"
-           "    enable_dynamic_filter_multi_partition: true\n";
+           "    enable_dynamic_filter_multi_partition: true\n"
+           "    max_dynamic_filter_bloom_bytes_per_gpu: 64MiB\n";
   }
 
   CHECK(operator_params{}.enable_dynamic_filter);
   CHECK_FALSE(operator_params{}.enable_dynamic_filter_multi_partition);
+  CHECK(operator_params{}.max_dynamic_filter_bloom_bytes_per_gpu ==
+        config::DEFAULT_MAX_DYNAMIC_FILTER_BLOOM_BYTES_PER_GPU);
 
   sirius_config cfg;
   cfg.load_from_file(path);
   CHECK_FALSE(cfg.get_operator_params().enable_dynamic_filter);
   CHECK(cfg.get_operator_params().enable_dynamic_filter_multi_partition);
+  CHECK(cfg.get_operator_params().max_dynamic_filter_bloom_bytes_per_gpu == 64ULL * 1024 * 1024);
 
   std::error_code ec;
   std::filesystem::remove(path, ec);

@@ -93,6 +93,7 @@ static void fold_dynamic_filter_outcome(dynamic_filter_stats& stats,
   stats.keys_considered.fetch_add(outcome.keys_considered, relaxed);
   stats.keys_with_known_domain.fetch_add(outcome.keys_with_known_domain, relaxed);
   stats.keys_skipped_domain_gate.fetch_add(outcome.keys_skipped_domain_gate, relaxed);
+  stats.keys_skipped_bloom_size_gate.fetch_add(outcome.keys_skipped_bloom_size_gate, relaxed);
   stats.keys_skipped_type_mismatch.fetch_add(outcome.keys_skipped_type_mismatch, relaxed);
   stats.keys_build_exceeded_domain.fetch_add(outcome.keys_build_exceeded_domain, relaxed);
   stats.membership_filters_built.fetch_add(outcome.membership_filters_built, relaxed);
@@ -2087,11 +2088,13 @@ void sirius_physical_hash_join::publish_dynamic_filters(cudf::table_view const& 
         sirius::op::publish_dynamic_filters(_dynamic_filter_plan, build_view, stream);
       SIRIUS_LOG_DEBUG(
         "[sirius_physical_hash_join] dynamic-filter publication: {} key(s) considered, {} skipped "
-        "(domain gate), {} skipped (type mismatch), {} membership + {} zone-map built, {} "
+        "(domain gate), {} skipped (Bloom size gate), {} skipped (type mismatch), {} membership + "
+        "{} zone-map built, {} "
         "filter(s) "
         "pushed across {} active target(s).",
         outcome.keys_considered,
         outcome.keys_skipped_domain_gate,
+        outcome.keys_skipped_bloom_size_gate,
         outcome.keys_skipped_type_mismatch,
         outcome.membership_filters_built,
         outcome.zone_map_filters_built,

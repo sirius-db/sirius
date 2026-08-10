@@ -37,6 +37,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <new>
 #include <stdexcept>
@@ -53,12 +54,13 @@ namespace {
 constexpr std::size_t kBitsPerBlock                 = 256;
 constexpr std::size_t kTargetBitsPerKey             = 16;
 constexpr std::size_t kMaximumReductionScratchBytes = 4U * 1024U * 1024U;
+constexpr std::size_t kBytesPerBlock                = kBitsPerBlock / 8;
 
 std::size_t blocks_for(std::size_t num_keys)
 {
-  auto const bits   = std::max<std::size_t>(num_keys, 1) * kTargetBitsPerKey;
-  auto const blocks = cuda::ceil_div(bits, kBitsPerBlock);
-  return std::max<std::size_t>(blocks, 1);
+  static_assert(kBitsPerBlock % kTargetBitsPerKey == 0);
+  constexpr auto keys_per_block = kBitsPerBlock / kTargetBitsPerKey;
+  return num_keys == 0 ? 1 : 1 + (num_keys - 1) / keys_per_block;
 }
 
 using bloom_alloc = sirius::rmm_cuco_allocator<cuda::std::byte>;
@@ -245,8 +247,12 @@ bool sirius_dynamic_bloom_filter::supports(cudf::data_type t) noexcept
 
 std::size_t sirius_dynamic_bloom_filter::estimated_bytes(std::size_t num_keys) noexcept
 {
-  // Mirrors blocks_for(): each block is kBitsPerBlock bits = kBitsPerBlock/8 bytes.
-  return blocks_for(num_keys) * (kBitsPerBlock / 8);
+  auto const blocks  = blocks_for(num_keys);
+  auto const maximum = std::numeric_limits<std::size_t>::max();
+  if (blocks > maximum / kBytesPerBlock) { return maximum; }
+  auto const raw_bytes = blocks * kBytesPerBlock;
+  if (raw_bytes > maximum - (rmm::CUDA_ALLOCATION_ALIGNMENT - 1)) { return maximum; }
+  return detail::tracked_replica_allocation_bytes(raw_bytes);
 }
 
 sirius_dynamic_bloom_filter::sirius_dynamic_bloom_filter(cudf::column_view const& keys,
@@ -268,7 +274,15 @@ sirius_dynamic_bloom_filter::sirius_dynamic_bloom_filter(cudf::data_type key_typ
   }
   cuda::stream_ref const s{stream.value()};
   auto const num_blocks = blocks_for(expected_num_keys);
-  _impl                 = std::make_unique<impl>();
+  auto const maximum    = std::numeric_limits<std::size_t>::max();
+  if (num_blocks > maximum / kBytesPerBlock) {
+    throw std::length_error("[sirius_dynamic_bloom_filter] requested geometry is too large.");
+  }
+  auto const raw_bytes = num_blocks * kBytesPerBlock;
+  if (raw_bytes > maximum - (rmm::CUDA_ALLOCATION_ALIGNMENT - 1)) {
+    throw std::length_error("[sirius_dynamic_bloom_filter] requested geometry is too large.");
+  }
+  _impl = std::make_unique<impl>();
   if (cudaGetDevice(&_impl->source_device) != cudaSuccess) {
     throw std::runtime_error("[sirius_dynamic_bloom_filter] failed to identify source device.");
   }

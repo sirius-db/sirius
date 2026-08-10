@@ -2043,6 +2043,18 @@ static void SetEnableDynamicFilterMultiPartition(ClientContext& context,
                    params->enable_dynamic_filter_multi_partition);
 }
 
+static void SetMaxDynamicFilterBloomBytesPerGpu(ClientContext& context,
+                                                SetScope scope,
+                                                Value& parameter)
+{
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  auto slot                                      = lock_operator_params_slot(context);
+  params->max_dynamic_filter_bloom_bytes_per_gpu = UBigIntValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config MAX_DYNAMIC_FILTER_BLOOM_BYTES_PER_GPU to {}",
+                   params->max_dynamic_filter_bloom_bytes_per_gpu);
+}
+
 static void SetEnableDynamicZoneMapFilter(ClientContext& context, SetScope scope, Value& parameter)
 {
   auto* params = get_operator_params(context);
@@ -2363,6 +2375,14 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::operator
     LogicalType::BOOLEAN,
     Value::BOOLEAN(defaults.enable_dynamic_filter_multi_partition),
     SetEnableDynamicFilterMultiPartition);
+
+  config.AddExtensionOption(
+    "max_dynamic_filter_bloom_bytes_per_gpu",
+    "Maximum allocator-accounted Bloom bit-array bytes produced by one join on each GPU; shared "
+    "across Bloom keys, with 0 disabling Bloom construction",
+    LogicalType::UBIGINT,
+    Value::UBIGINT(defaults.max_dynamic_filter_bloom_bytes_per_gpu),
+    SetMaxDynamicFilterBloomBytesPerGpu);
 
   config.AddExtensionOption(
     "enable_dynamic_zone_map_filter",

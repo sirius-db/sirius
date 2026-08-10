@@ -1,7 +1,7 @@
 # Multi-partition dynamic filters: implemented design and engineering handoff
 
-**Date:** 2026-08-06
-**Status:** Implemented behind a default-off switch; single-GPU build and focused validation complete; multi-GPU runtime validation deferred
+**Date:** 2026-08-10
+**Status:** Implemented behind a default-off switch with a per-GPU Bloom policy cap; single-GPU build and focused validation complete; multi-GPU runtime validation deferred
 **Base:** PR #1277 head `49de08e8`, integrated by merge commit `bdeaa56b`
 **Audience:** Engineers and reviewers extending, validating, or enabling the feature
 
@@ -9,7 +9,7 @@
 
 Sirius should use one globally complete Bloom filter per eligible join key for a hash-partitioned build. The filter is built incrementally from the original build batches before hash scatter. On multiple GPUs, each producing GPU builds an equal-geometry partial, the partials are bitwise-OR reduced on a deterministic root GPU, and the complete result is replicated before it is published through the existing dynamic-filter channels.
 
-This is implemented as an extension of PR #1277. It is controlled by `enable_dynamic_filter_multi_partition`, which defaults to `false` and is subordinate to the existing `enable_dynamic_filter` master switch. The default remains off because the measured TPC-H benefit on the current single-GPU system is zero and multi-GPU runtime testing belongs on another machine.
+This is implemented as an extension of PR #1277. It is controlled by `enable_dynamic_filter_multi_partition`, which defaults to `false` and is subordinate to the existing `enable_dynamic_filter` master switch. Bloom construction is additionally bounded by `max_dynamic_filter_bloom_bytes_per_gpu`, default 256 MiB per producing join on each GPU. The default multi-partition switch remains off because the measured TPC-H benefit on the current single-GPU system is zero and multi-GPU runtime testing belongs on another machine.
 
 Partition-specific filters delivered to `CONCAT` are not the primary architecture. They would become available after probe partitioning and scatter, require the consumer to reproduce or carry the exact partition identity, and would not fit the current global channel semantics without a new filter kind and routing contract. The global Bloom reuses the existing post-scan consumer, preserves one membership predicate for the whole join key, and keeps the exact hash join authoritative.
 
@@ -18,6 +18,7 @@ Partition-specific filters delivered to `CONCAT` are not the primary architectur
 | Area | Implemented behavior | Validation status |
 |---|---|---|
 | Feature control | Master switch plus default-off multi-partition subordinate switch in YAML and SQL | Unit and SQL tests pass |
+| Bloom admission | Per-join, per-GPU allocator-accounted bit-array cap across all Bloom keys; fail-open all-or-none skip | Boundary, one-shot, accumulator, and planned-policy tests pass |
 | Build snapshot | Exact pre-scatter batch IDs and row count frozen at the build `PARTITION` FULL barrier | Unit/integration coverage and static review |
 | Single GPU | Incremental global Bloom with one `add` per exact build contribution | Focused GPU tests pass |
 | Multiple GPUs | One full-geometry partial per producing GPU, deterministic-root OR, strict replication, then fan-out | Compiles; runtime evaluation deferred |
@@ -57,7 +58,9 @@ enable_dynamic_filter_multi_partition
 | true | false | PR #1277 one-shot publication only; hash-partitioned multi-partition builds remain skipped |
 | true | true | One-shot behavior plus global Bloom accumulation for eligible non-broadcast builds with more than one partition |
 
-Both options are accepted under `sirius.operator_params` and as DuckDB SQL settings. The new switch defaults to false in `operator_params`, the YAML reader, and the registered SQL extension option.
+All three controls are accepted under `sirius.operator_params` and as DuckDB SQL settings. The multi-partition switch defaults to false; `max_dynamic_filter_bloom_bytes_per_gpu` defaults to 256 MiB. A value of 0 disables Bloom construction without disabling exact IN-lists, zone maps, discovery, or the authoritative join.
+
+The cap applies to both the whole-build one-shot path and multi-partition accumulation. For one join it sums the allocator-aligned bit-array footprint of every Bloom candidate on one GPU, using the exact global build row count and overflow-safe arithmetic. It is not multiplied by GPU count or divided by partition count. Equality is admitted for representable footprints; if the complete candidate set exceeds the cap or its aligned footprint is not representable, every Bloom candidate is skipped before allocation so admitted-key order cannot determine which predicate survives.
 
 ## 5. Build snapshot and contribution identity
 
@@ -161,7 +164,7 @@ A CUDA failure that also makes ordinary query execution unusable can still surfa
 
 ## 11. Memory and lifetime
 
-For a Bloom of `m` bytes, `D` producing GPUs, `S` planned consumer GPUs, and `K` active keys:
+For an allocator-accounted Bloom bit array of `m` bytes, `D` producing GPUs, `S` planned consumer GPUs, and `K` active keys:
 
 - private producer memory is at most approximately `D * K * m`;
 - final replica memory is approximately `S * K * m`;
@@ -171,7 +174,9 @@ For a Bloom of `m` bytes, `D` producing GPUs, `S` planned consumer GPUs, and `K`
 
 All allocations use the GPU allocators and replica/staging spaces captured by the immutable publish plan. Device guards make destruction and reduction device-correct. In particular, cuCO filter storage is constructed on a durable memory-space stream rather than an executor task stream, because its deleter retains the construction stream. Initialization is synchronized before the first task-stream insertion; contribution and failure paths drain task or reduction streams before private storage can be released.
 
-There is no dedicated admission budget for producer partials or reduction scratch in this version. Allocation or reservation failure aborts the optional publication, but repeated large concurrent joins can still create allocator pressure before that fallback occurs. Explicit dynamic-filter construction admission is a recommended follow-up before default enablement.
+Before Bloom construction, the producer requires `K * m <= max_dynamic_filter_bloom_bytes_per_gpu` on each GPU. The check uses division rather than overflowing multiplication and skips all `K` Bloom candidates when it fails. Destination replicas additionally acquire explicit scoped reservations. The one-shot source Bloom and per-device accumulator partials allocate through CuCascade's reservation-aware default GPU allocator without a separate up-front reservation; they remain allocator-accounted and hard-limit checked.
+
+The policy cap is not a query-wide reservation ledger. Concurrent joins each receive the full per-join allowance, and transient root-reduction scratch (up to `K * 4 MiB`) is outside the cap. A future global admission service or shared scratch buffer may be warranted if concurrent publication pressure is measured.
 
 ## 12. Consumer behavior and placement
 
@@ -260,7 +265,7 @@ The current implementation intentionally has these limits:
 - root selection is deterministic lowest device ID rather than topology- or load-aware;
 - reduction is a linear root gather, not a tree or collective;
 - strict all-device replication can abandon a filter when only one target device fails;
-- producer partials and scratch have no separate admission budget;
+- the Bloom cap is per join rather than query-wide, excludes reduction scratch, and does not explicitly pre-reserve source partials;
 - the current counters do not break out per-device insert, reduction, and replication time;
 - no performance benefit was measured for TPC-H on the current box.
 

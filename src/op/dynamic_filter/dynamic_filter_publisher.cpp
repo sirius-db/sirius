@@ -130,6 +130,7 @@ dynamic_filter_publication_outcome publish_dynamic_filters(dynamic_filter_publis
   auto const allocator_ref = source_space->get_gpu_space().get_default_allocator();
   auto const build_rows    = static_cast<std::size_t>(build_view.num_rows());
   auto const l2_bytes      = device_l2_cache_bytes(plan.replica_spaces());
+  auto const bloom_bytes   = sirius_dynamic_bloom_filter::estimated_bytes(build_rows);
 
   // Build up to two complementary filters per admitted key:
   //  1) a zone-map (read-time ROW-GROUP pruning, the only path that cuts scan I/O)
@@ -139,6 +140,7 @@ dynamic_filter_publication_outcome publish_dynamic_filters(dynamic_filter_publis
   // vectors are indexed by admitted-key index.
   std::vector<std::shared_ptr<sirius_dynamic_filter>> per_key_zone_map(admitted_keys.size());
   std::vector<std::shared_ptr<sirius_dynamic_filter>> per_key_membership(admitted_keys.size());
+  std::vector<char> per_key_bloom_candidate(admitted_keys.size(), 0);
   std::vector<cudf::data_type> per_key_build_type(admitted_keys.size(),
                                                   cudf::data_type{cudf::type_id::EMPTY});
 
@@ -224,7 +226,6 @@ dynamic_filter_publication_outcome publish_dynamic_filters(dynamic_filter_publis
     // remaining supported keys. It returns none when no representation supports the key.
     auto const set_bytes =
       sirius::op::sirius_dynamic_in_list_filter::estimated_set_bytes(build_rows, col.type());
-    auto const bloom_bytes = sirius::op::sirius_dynamic_bloom_filter::estimated_bytes(build_rows);
 
     auto const chosen = choose_membership_filter(
       {.build_rows               = build_rows,
@@ -252,10 +253,8 @@ dynamic_filter_publication_outcome publish_dynamic_filters(dynamic_filter_publis
         break;
       }
       case membership_filter_kind::bloom: {
-        nvtx3::scoped_range vr{"dynfilter::build_bloom"};
-        per_key_membership[admitted_key_index] =
-          std::make_shared<sirius::op::sirius_dynamic_bloom_filter>(col, stream, allocator_ref);
-        choice = "bloom";
+        per_key_bloom_candidate[admitted_key_index] = 1;
+        choice                                      = "bloom";
         break;
       }
       case membership_filter_kind::none: break;
@@ -272,6 +271,27 @@ dynamic_filter_publication_outcome publish_dynamic_filters(dynamic_filter_publis
       bloom_bytes,
       l2_bytes,
       choice);
+  }
+
+  auto const bloom_candidate_count = static_cast<std::size_t>(
+    std::count(per_key_bloom_candidate.begin(), per_key_bloom_candidate.end(), 1));
+  if (bloom_budget_allows(bloom_bytes, bloom_candidate_count, plan.max_bloom_bytes_per_gpu())) {
+    nvtx3::scoped_range vr{"dynfilter::build_bloom"};
+    for (std::size_t key_index = 0; key_index < per_key_bloom_candidate.size(); ++key_index) {
+      if (per_key_bloom_candidate[key_index] == 0) { continue; }
+      auto const& column = build_view.column(admitted_keys[key_index].build_key_ordinal);
+      per_key_membership[key_index] =
+        std::make_shared<sirius_dynamic_bloom_filter>(column, stream, allocator_ref);
+      ++outcome.membership_filters_built;
+    }
+  } else {
+    outcome.keys_skipped_bloom_size_gate += bloom_candidate_count;
+    SIRIUS_LOG_INFO(
+      "[sirius_physical_hash_join] Skipping {} Bloom filter candidate(s): each would use {} "
+      "allocator-accounted bytes against the {}-byte aggregate per-GPU budget.",
+      bloom_candidate_count,
+      bloom_bytes,
+      plan.max_bloom_bytes_per_gpu());
   }
 
   // Publish is cross-stream: consumers probe these structures from their own task streams the
@@ -411,6 +431,21 @@ struct dynamic_filter_accumulator::impl {
       if (!sirius_dynamic_bloom_filter::supports(key.storage_type)) { continue; }
       active_keys[key_index] = 1;
       build_types[key_index] = key.storage_type;
+    }
+
+    auto const active_bloom_keys =
+      static_cast<std::size_t>(std::count(active_keys.begin(), active_keys.end(), 1));
+    auto const bloom_bytes = sirius_dynamic_bloom_filter::estimated_bytes(build_rows);
+    if (!bloom_budget_allows(bloom_bytes, active_bloom_keys, plan.max_bloom_bytes_per_gpu())) {
+      std::fill(active_keys.begin(), active_keys.end(), 0);
+      std::fill(build_types.begin(), build_types.end(), cudf::data_type{cudf::type_id::EMPTY});
+      outcome.keys_skipped_bloom_size_gate += active_bloom_keys;
+      SIRIUS_LOG_INFO(
+        "[dynamic_filter_accumulator] Skipping {} global Bloom filter candidate(s): each would "
+        "use {} allocator-accounted bytes against the {}-byte aggregate per-GPU budget.",
+        active_bloom_keys,
+        bloom_bytes,
+        plan.max_bloom_bytes_per_gpu());
     }
   }
 

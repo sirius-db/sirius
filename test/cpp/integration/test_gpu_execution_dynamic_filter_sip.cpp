@@ -102,6 +102,7 @@ std::vector<std::vector<std::string>> run_on_gpu(duckdb::Connection& con, const 
 struct publication_deltas {
   std::uint64_t producers_enabled                    = 0;
   std::uint64_t membership_filters_built             = 0;
+  std::uint64_t keys_skipped_bloom_size_gate         = 0;
   std::uint64_t publications_finished                = 0;
   std::uint64_t publications_skipped_build_not_whole = 0;
   std::uint64_t filters_pushed                       = 0;
@@ -122,7 +123,9 @@ publication_deltas run_and_measure(duckdb::Connection& con,
   return publication_deltas{
     .producers_enabled        = after.producers_enabled - before.producers_enabled,
     .membership_filters_built = after.membership_filters_built - before.membership_filters_built,
-    .publications_finished    = after.publications_finished - before.publications_finished,
+    .keys_skipped_bloom_size_gate =
+      after.keys_skipped_bloom_size_gate - before.keys_skipped_bloom_size_gate,
+    .publications_finished = after.publications_finished - before.publications_finished,
     .publications_skipped_build_not_whole =
       after.publications_skipped_build_not_whole - before.publications_skipped_build_not_whole,
     .filters_pushed = after.filters_pushed - before.filters_pushed};
@@ -183,6 +186,38 @@ TEST_CASE("the multi-partition dynamic-filter switch is exposed through SQL",
   REQUIRE(restored);
   REQUIRE_FALSE(restored->HasError());
   REQUIRE(restored->GetValue(0, 0).GetValue<bool>() == original);
+}
+
+TEST_CASE("the dynamic-filter Bloom cap is exposed through SQL",
+          "[integration][config_opt][dynamic_filter][bloom_budget]")
+{
+  REQUIRE(sirius::test::g_integration_env != nullptr);
+  if (!sirius::test::g_integration_env->is_active()) { sirius::test::g_integration_env->resume(); }
+  auto con            = sirius::test::g_integration_env->make_connection();
+  auto const original = sirius::test::get_registered_sirius_context(con)
+                          ->get_config()
+                          .get_operator_params()
+                          .max_dynamic_filter_bloom_bytes_per_gpu;
+
+  constexpr std::uint64_t kCap = 64ULL * 1024;
+  auto set                     = con.Query("SET max_dynamic_filter_bloom_bytes_per_gpu = 65536;");
+  REQUIRE(set);
+  REQUIRE_FALSE(set->HasError());
+
+  auto value =
+    con.Query("SELECT current_setting('max_dynamic_filter_bloom_bytes_per_gpu')::UBIGINT;");
+  REQUIRE(value);
+  REQUIRE_FALSE(value->HasError());
+  REQUIRE(value->GetValue(0, 0).GetValue<std::uint64_t>() == kCap);
+  REQUIRE(sirius::test::get_registered_sirius_context(con)
+            ->get_config()
+            .get_operator_params()
+            .max_dynamic_filter_bloom_bytes_per_gpu == kCap);
+
+  auto restored =
+    con.Query("SET max_dynamic_filter_bloom_bytes_per_gpu = " + std::to_string(original) + ";");
+  REQUIRE(restored);
+  REQUIRE_FALSE(restored->HasError());
 }
 
 // Verify result parity for derived-build and build-block routes; plan-shape tests pin placement.
@@ -325,6 +360,19 @@ TEST_CASE("gpu_execution - derived-build and build-block routes preserve results
       REQUIRE(deltas.on.publications_finished > 0);
       REQUIRE(deltas.on.filters_pushed > 0);
       REQUIRE(deltas.on.publications_skipped_build_not_whole == 0);
+    }
+
+    SECTION("a zero Bloom cap skips Bloom construction through the planned policy")
+    {
+      dynamic_filter_multi_partition_switch_guard multi_partition_on(con, true);
+      sirius::test::scoped_setting zero_bloom_cap(con, "max_dynamic_filter_bloom_bytes_per_gpu", 0);
+      auto const deltas = require_switch_result_equivalence(con, query);
+
+      REQUIRE(deltas.on.producers_enabled > deltas.off.producers_enabled);
+      REQUIRE(deltas.on.keys_skipped_bloom_size_gate > 0);
+      REQUIRE(deltas.on.membership_filters_built == 0);
+      REQUIRE(deltas.on.publications_finished > 0);
+      REQUIRE(deltas.on.filters_pushed == 0);
     }
   }
 

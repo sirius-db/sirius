@@ -31,13 +31,14 @@ namespace sirius::op {
 struct dynamic_filter_stats_snapshot {
   std::uint64_t producers_enabled = 0;
 
-  std::uint64_t keys_considered            = 0;
-  std::uint64_t keys_with_known_domain     = 0;
-  std::uint64_t keys_skipped_domain_gate   = 0;
-  std::uint64_t keys_skipped_type_mismatch = 0;
-  std::uint64_t keys_build_exceeded_domain = 0;
-  std::uint64_t membership_filters_built   = 0;
-  std::uint64_t zone_map_filters_built     = 0;
+  std::uint64_t keys_considered              = 0;
+  std::uint64_t keys_with_known_domain       = 0;
+  std::uint64_t keys_skipped_domain_gate     = 0;
+  std::uint64_t keys_skipped_bloom_size_gate = 0;
+  std::uint64_t keys_skipped_type_mismatch   = 0;
+  std::uint64_t keys_build_exceeded_domain   = 0;
+  std::uint64_t membership_filters_built     = 0;
+  std::uint64_t zone_map_filters_built       = 0;
 
   std::uint64_t publication_attempts                     = 0;
   std::uint64_t publications_finished                    = 0;
@@ -86,13 +87,14 @@ struct dynamic_filter_stats {
   // Deterministic policy decisions
   std::atomic<std::uint64_t> keys_considered{0};  ///< Bound admitted keys walked by publication
                                                   ///< attempts
-  std::atomic<std::uint64_t> keys_with_known_domain{0};      ///< Keys carrying a nonzero domain
-  std::atomic<std::uint64_t> keys_skipped_domain_gate{0};    ///< Coverage gate fired
-  std::atomic<std::uint64_t> keys_skipped_type_mismatch{0};  ///< Plan/runtime type disagreement
-  std::atomic<std::uint64_t> keys_build_exceeded_domain{0};  ///< Build row count exceeded the
-                                                             ///< recorded domain bound
-  std::atomic<std::uint64_t> membership_filters_built{0};    ///< Constructed, before delivery
-  std::atomic<std::uint64_t> zone_map_filters_built{0};      ///< Constructed, before delivery
+  std::atomic<std::uint64_t> keys_with_known_domain{0};        ///< Keys carrying a nonzero domain
+  std::atomic<std::uint64_t> keys_skipped_domain_gate{0};      ///< Coverage gate fired
+  std::atomic<std::uint64_t> keys_skipped_bloom_size_gate{0};  ///< Bloom budget gate fired
+  std::atomic<std::uint64_t> keys_skipped_type_mismatch{0};    ///< Plan/runtime type disagreement
+  std::atomic<std::uint64_t> keys_build_exceeded_domain{0};    ///< Build row count exceeded the
+                                                               ///< recorded domain bound
+  std::atomic<std::uint64_t> membership_filters_built{0};      ///< Constructed, before delivery
+  std::atomic<std::uint64_t> zone_map_filters_built{0};        ///< Constructed, before delivery
 
   // Opportunistic delivery
   std::atomic<std::uint64_t> publication_attempts{
@@ -116,17 +118,18 @@ struct dynamic_filter_stats {
   [[nodiscard]] dynamic_filter_stats_snapshot snapshot() const noexcept
   {
     return dynamic_filter_stats_snapshot{
-      .producers_enabled          = producers_enabled.load(std::memory_order_relaxed),
-      .keys_considered            = keys_considered.load(std::memory_order_relaxed),
-      .keys_with_known_domain     = keys_with_known_domain.load(std::memory_order_relaxed),
-      .keys_skipped_domain_gate   = keys_skipped_domain_gate.load(std::memory_order_relaxed),
-      .keys_skipped_type_mismatch = keys_skipped_type_mismatch.load(std::memory_order_relaxed),
-      .keys_build_exceeded_domain = keys_build_exceeded_domain.load(std::memory_order_relaxed),
-      .membership_filters_built   = membership_filters_built.load(std::memory_order_relaxed),
-      .zone_map_filters_built     = zone_map_filters_built.load(std::memory_order_relaxed),
-      .publication_attempts       = publication_attempts.load(std::memory_order_relaxed),
-      .publications_finished      = publications_finished.load(std::memory_order_relaxed),
-      .publications_failed        = publications_failed.load(std::memory_order_relaxed),
+      .producers_enabled            = producers_enabled.load(std::memory_order_relaxed),
+      .keys_considered              = keys_considered.load(std::memory_order_relaxed),
+      .keys_with_known_domain       = keys_with_known_domain.load(std::memory_order_relaxed),
+      .keys_skipped_domain_gate     = keys_skipped_domain_gate.load(std::memory_order_relaxed),
+      .keys_skipped_bloom_size_gate = keys_skipped_bloom_size_gate.load(std::memory_order_relaxed),
+      .keys_skipped_type_mismatch   = keys_skipped_type_mismatch.load(std::memory_order_relaxed),
+      .keys_build_exceeded_domain   = keys_build_exceeded_domain.load(std::memory_order_relaxed),
+      .membership_filters_built     = membership_filters_built.load(std::memory_order_relaxed),
+      .zone_map_filters_built       = zone_map_filters_built.load(std::memory_order_relaxed),
+      .publication_attempts         = publication_attempts.load(std::memory_order_relaxed),
+      .publications_finished        = publications_finished.load(std::memory_order_relaxed),
+      .publications_failed          = publications_failed.load(std::memory_order_relaxed),
       .publications_skipped_source_not_resident =
         publications_skipped_source_not_resident.load(std::memory_order_relaxed),
       .publications_skipped_build_not_whole =

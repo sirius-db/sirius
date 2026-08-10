@@ -160,6 +160,8 @@ runs the OR kernels on one root stream, drains that stream on success or failure
 partials and scratch, and strictly completes every planned replica before channel fan-out. An
 unknown, missing, incompatible, or failed contribution publishes no filter.
 
+Before any per-device partial is allocated, `max_dynamic_filter_bloom_bytes_per_gpu` admits the complete active-key set against one GPU's allocator-aligned global-geometry footprint. The calculation does not multiply by GPU count: each GPU holds the same steady-state key set. If the aggregate exceeds the cap, every Bloom candidate is skipped and the exact build still completes normally.
+
 ```text
                          +-> PUBLISHING -> FINISHED
                          |                `-> FAILED
@@ -225,6 +227,8 @@ allocation through the target's reservation-aware GPU allocator. Reservation
 denial logs and omits that optional replica. When the scoped reservation
 detaches, unused capacity is returned while the completed allocation remains
 accounted until replica teardown.
+
+That explicit reservation applies to destination replicas. The one-shot source Bloom and accumulator partials allocate through their GPU space's reservation-aware default allocator, so CuCascade accounts and limits them but no capacity is reserved in advance. The per-join Bloom cap is the pre-allocation policy bound for those sources; it does not reserve bytes and does not include transient root-reduction scratch.
 
 For every target, the planner pairs its GPU memory space with a NUMA-local HOST
 memory space (falling back to the first Sirius HOST space when topology is

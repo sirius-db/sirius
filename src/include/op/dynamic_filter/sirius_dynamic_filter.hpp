@@ -497,6 +497,7 @@ class sirius_dynamic_bloom_filter final : public sirius_dynamic_filter,
    * Initialization is enqueued on @p stream; work submitted on another stream must wait for it.
    *
    * @throw std::invalid_argument if @p key_type is unsupported
+   * @throw std::length_error if the aligned bit-array footprint is not representable
    * @throw std::runtime_error if the current CUDA device cannot be identified
    * @throw std::logic_error if the validated key type changes during construction
    *
@@ -591,13 +592,13 @@ class sirius_dynamic_bloom_filter final : public sirius_dynamic_filter,
   [[nodiscard]] static bool supports(cudf::data_type t) noexcept;
 
   /**
-   * @brief Estimated device footprint (bytes) of the Bloom bit array for @p num_keys keys at this
-   * filter's fixed bits-per-key budget
+   * @brief Allocator-accounted device footprint of the Bloom bit array for @p num_keys keys
    *
-   * Consumed by the producer's L2-fit filter-kind policy.
+   * The raw fixed-bits-per-key geometry is rounded to CUDA allocation alignment and overflow
+   * saturates at `std::numeric_limits<std::size_t>::max()`.
    *
    * @param[in] num_keys Number of keys represented by the filter
-   * @return Estimated bit-array size in bytes
+   * @return Estimated allocator-accounted bit-array size in bytes
    */
   [[nodiscard]] static std::size_t estimated_bytes(std::size_t num_keys) noexcept;
 

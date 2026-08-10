@@ -26,6 +26,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 
 namespace sirius::op {
 
@@ -73,6 +74,28 @@ struct membership_choice_inputs {
   }
   if (inputs.supports_bloom) { return membership_filter_kind::bloom; }
   return membership_filter_kind::none;
+}
+
+/**
+ * @brief Whether all candidate Bloom allocations fit one join's per-GPU budget
+ *
+ * @p bytes_per_filter is already allocator-aligned. The division form makes the aggregate check
+ * overflow-safe. Equality is admitted for representable footprints; `SIZE_MAX` is the estimator's
+ * overflow sentinel and is rejected.
+ *
+ * @param[in] bytes_per_filter Allocator-accounted bytes for one Bloom bit array
+ * @param[in] filter_count Number of candidate Bloom keys
+ * @param[in] max_bytes_per_gpu Per-join budget on each GPU
+ * @return True when the complete candidate set fits
+ */
+[[nodiscard]] constexpr bool bloom_budget_allows(std::size_t bytes_per_filter,
+                                                 std::size_t filter_count,
+                                                 std::uint64_t max_bytes_per_gpu) noexcept
+{
+  if (filter_count == 0 || bytes_per_filter == 0) { return true; }
+  if (bytes_per_filter == std::numeric_limits<std::size_t>::max()) { return false; }
+  if (bytes_per_filter > max_bytes_per_gpu) { return false; }
+  return filter_count <= max_bytes_per_gpu / bytes_per_filter;
 }
 
 /**

@@ -42,3 +42,58 @@ Reviewed baseline `bdeaa56b9e63bd5dd67924edfe04454fbabc90bd` plus the complete 2
 ## Verdict
 
 **Accepted.** All three prior remediation gates are resolved and no production correctness blocker remains. The two residual test findings are explicitly non-blocking while the feature remains default-off. Physical multi-GPU validation remains required before claiming production validation or changing the default.
+
+---
+
+# Follow-up QA review: per-GPU Bloom policy cap
+
+Reviewed baseline `4016c598332210ab4e4a38b44f7ccb129c5abd1c` plus the final 20-file uncommitted cap change set (diff SHA-256 `976d682c5b268a44a11fc0bfec3f85f3a9582a890dd09a34fdfca5ec7b06a9a3`). This section is scoped to the Bloom-cap follow-up; the prior review and its two non-blocking residual findings remain unchanged above.
+
+## Findings
+
+No open cap-specific finding remains.
+
+## Findings resolved during this review
+
+### [Medium] Saturated estimates could pass an unlimited cap
+
+**Defect.** `estimated_bytes()` used `SIZE_MAX` as the saturation sentinel when raw multiplication or CUDA allocation alignment was not representable, but the initial helper admitted `bloom_budget_allows(SIZE_MAX, 1, UINT64_MAX)` by equality. The constructor also admitted the alignment-only boundary with raw bytes `SIZE_MAX - 31`; CuCascade's subsequent 256-byte `rmm::align_up` can wrap that accounting charge to zero.
+
+**Required property.** A saturated or otherwise nonrepresentable tracked footprint must be rejected before CUCO allocation, while equality remains admissible for representable footprints.
+
+**Cheapest remedy.** Reject the existing sentinel in the budget helper and mirror the alignment-overflow guard in the public empty-Bloom constructor; no new sizing abstraction is required.
+
+**Resolution.** The estimator now uses overflow-safe geometry and saturation (`src/cuda/sirius_dynamic_bloom_filter.cu:53-64,248-255`), the helper rejects the sentinel (`src/include/op/dynamic_filter/dynamic_filter_source_policy.hpp:79-98`), and the constructor rejects raw and alignment overflow before constructing CUCO storage (`src/cuda/sirius_dynamic_bloom_filter.cu:266-285`). Tests pin both boundaries (`test/cpp/operator/test_dynamic_filter_source_policy.cpp:194-206`; `test/cpp/operator/test_dynamic_filter_publisher.cpp:378-391`).
+
+### [Low] Configuration-to-statistics behavior lacked one crossing test
+
+**Defect.** Initial tests covered SQL setting storage and direct publisher outcomes separately. Omitting planner transport, hash-join folding, or snapshot exposure would have left them green.
+
+**Required property.** A configured rejection must preserve results, complete fail-open, construct and push no Bloom, and increment the cumulative skip counter through the production planning path.
+
+**Cheapest remedy.** Add one zero-cap section to the existing deterministic forced multi-partition integration case.
+
+**Resolution.** The section asserts result parity, an enabled producer, a positive size-gate count, zero membership construction, successful publication, and zero fan-out (`test/cpp/integration/test_gpu_execution_dynamic_filter_sip.cpp:100-131,365-375`). It crosses planner transport (`src/planner/sirius_plan_comparison_join.cpp:654-677`), outcome folding (`src/op/sirius_physical_hash_join.cpp:89-102`), and snapshot exposure (`src/include/op/dynamic_filter/dynamic_filter_stats.hpp:118-132`).
+
+## Acceptance checks
+
+- Units match CUCO's 32-byte Bloom blocks and CuCascade's 256-byte tracking alignment; aggregate admission uses division and rejects the saturation sentinel.
+- One-shot rejection gates the complete Bloom candidate set before construction while exact IN-lists and zone maps remain eligible (`src/op/dynamic_filter/dynamic_filter_publisher.cpp:223-295`).
+- Multi-partition rejection uses the global row count and all active keys before partial allocation, emits no Bloom, and completes fail-open after exact batch accounting (`src/op/dynamic_filter/dynamic_filter_publisher.cpp:410-449`).
+- The cap is per join on each GPU: it is neither multiplied by replicas nor divided by partitions. Source/partial storage remains allocator-accounted; destinations reserve their aligned allocation (`src/cuda/sirius_dynamic_bloom_filter.cu:350-385`). Scratch and host overhead are documented exclusions.
+- The 256 MiB default is consistent across `operator_params`, YAML, SQL UBIGINT registration, planner capture, outcome folding, and the atomic snapshot.
+- No new raw ownership, leak, or data race was found. RAII ownership/reservations, immutable policy, mutex-serialized accumulation, and atomic statistics remain consistent with the reviewed C++ guidance.
+- User, design, report, and Doxygen text consistently cover representable equality, scope, all-or-none rejection, zero-cap behavior, reservation distinctions, excluded scratch, statistics, and deferred physical multi-GPU validation.
+
+## Validation
+
+- Full post-cap release build: 222/222 targets passed; post-review remediation rebuilt 52/52 incremental targets.
+- Final `[bloom_budget]`: 50 assertions in 6 cases passed, including both overflow regressions.
+- Final forced multi-partition parent case, section `a multi-partition build obeys the subordinate switch`: 166 assertions in 1 case passed, including zero-cap config-to-stats fail-open behavior and result parity.
+- Broader publication/accumulator/reduction selection: 143 assertions in 14 cases passed. YAML/multi-partition SQL selection: 19 assertions in 2 cases passed.
+- `git diff --check HEAD` and `clang-format --dry-run --Werror` over all changed C++/CUDA files passed. The temporary test-only GPU-pool reduction was restored exactly; final status contains only the intended 20 modified files and no backup artifacts.
+- Physical multi-GPU execution remains deferred as requested; static placement/reservation review is not a substitute for that hardware matrix.
+
+## Verdict
+
+**Accepted.** The cap is correct for one-shot and multi-partition publication, overflow-safe at policy and constructor boundaries, consistently wired and observable, fail-open on rejection, and covered by focused and end-to-end single-GPU tests. No cap-specific correctness, ownership, race, documentation, style, or test blocker remains. Physical multi-GPU validation is still required before claiming multi-GPU production validation or enabling the multi-partition feature by default.
