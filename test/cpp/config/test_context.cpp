@@ -174,25 +174,43 @@ TEST_CASE("Sirius configuration rejects invalid downgrade hysteresis", "[sirius]
   struct invalid_config {
     const char* fixture;
     const char* scope;
+    const char* constraint;
   };
 
   const invalid_config cases[] = {
-    {"invalid_memory_gpu_downgrade_zero.yaml", "sirius.memory.gpu"},
-    {"invalid_memory_gpu_downgrade_equal.yaml", "sirius.memory.gpu"},
-    {"invalid_memory_gpu_downgrade_reversed.yaml", "sirius.memory.gpu"},
-    {"invalid_memory_host_downgrade_zero.yaml", "sirius.memory.host"},
-    {"invalid_memory_host_downgrade_equal.yaml", "sirius.memory.host"},
-    {"invalid_memory_host_downgrade_reversed.yaml", "sirius.memory.host"},
-    {"invalid_space_gpu_downgrade_zero.yaml", "sirius.space.gpu"},
-    {"invalid_space_gpu_downgrade_equal.yaml", "sirius.space.gpu"},
-    {"invalid_space_gpu_downgrade_reversed.yaml", "sirius.space.gpu"},
-    {"invalid_space_host_downgrade_zero.yaml", "sirius.space.host"},
-    {"invalid_space_host_downgrade_equal.yaml", "sirius.space.host"},
-    {"invalid_space_host_downgrade_reversed.yaml", "sirius.space.host"},
+    {"invalid_memory_gpu_downgrade_zero.yaml", "sirius.memory.gpu", "greater than zero"},
+    {"invalid_memory_gpu_downgrade_equal.yaml",
+     "sirius.memory.gpu",
+     "less than downgrade_trigger_fraction"},
+    {"invalid_memory_gpu_downgrade_reversed.yaml",
+     "sirius.memory.gpu",
+     "less than downgrade_trigger_fraction"},
+    {"invalid_memory_host_downgrade_zero.yaml", "sirius.memory.host", "greater than zero"},
+    {"invalid_memory_host_downgrade_equal.yaml",
+     "sirius.memory.host",
+     "less than downgrade_trigger_fraction"},
+    {"invalid_memory_host_downgrade_reversed.yaml",
+     "sirius.memory.host",
+     "less than downgrade_trigger_fraction"},
+    {"invalid_space_gpu_downgrade_zero.yaml", "sirius.space.gpu", "greater than zero"},
+    {"invalid_space_gpu_downgrade_equal.yaml",
+     "sirius.space.gpu",
+     "less than downgrade_trigger_fraction"},
+    {"invalid_space_gpu_downgrade_reversed.yaml",
+     "sirius.space.gpu",
+     "less than downgrade_trigger_fraction"},
+    {"invalid_space_host_downgrade_zero.yaml", "sirius.space.host", "greater than zero"},
+    {"invalid_space_host_downgrade_equal.yaml",
+     "sirius.space.host",
+     "less than downgrade_trigger_fraction"},
+    {"invalid_space_host_downgrade_reversed.yaml",
+     "sirius.space.host",
+     "less than downgrade_trigger_fraction"},
   };
 
   for (auto const& invalid : cases) {
-    INFO("fixture=" << invalid.fixture << " surface=" << invalid.scope);
+    INFO("fixture=" << invalid.fixture << " surface=" << invalid.scope
+                    << " constraint=" << invalid.constraint);
     std::source_location loc = std::source_location::current();
     auto const path          = fs::path(loc.file_name()).parent_path() / "data" / invalid.fixture;
     REQUIRE(fs::is_regular_file(path));
@@ -201,8 +219,7 @@ TEST_CASE("Sirius configuration rejects invalid downgrade hysteresis", "[sirius]
     REQUIRE_THROWS_WITH(config.load_from_file(path),
                         Catch::Contains(invalid.scope) &&
                           Catch::Contains("downgrade_stop_fraction") &&
-                          Catch::Contains("greater than zero") &&
-                          Catch::Contains("less than downgrade_trigger_fraction"));
+                          Catch::Contains(invalid.constraint));
   }
 }
 

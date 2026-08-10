@@ -66,9 +66,13 @@ uint64_t derived_default_batch_size()
 
 static void validate_downgrade_fractions(std::string_view scope, double trigger, double stop)
 {
-  if (stop <= 0.0 || stop >= trigger) {
+  if (stop <= 0.0) {
     throw std::runtime_error(std::string(scope) +
-                             ": downgrade_stop_fraction must be greater than zero and less than "
+                             ": downgrade_stop_fraction must be greater than zero");
+  }
+  if (stop >= trigger) {
+    throw std::runtime_error(std::string(scope) +
+                             ": downgrade_stop_fraction must be less than "
                              "downgrade_trigger_fraction");
   }
 }
