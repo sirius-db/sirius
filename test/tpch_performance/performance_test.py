@@ -225,21 +225,31 @@ DEFAULT_OUTPUT_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "
 PIN_COMPRESSION_PLAN_DIR = None
 
 
-def drop_os_cache():
-    """Drop OS filesystem cache. Requires passwordless sudo per CLAUDE.md."""
-    proc = subprocess.run(
-        ["sudo", "-n", "/usr/bin/tee", "/proc/sys/vm/drop_caches"],
-        input="3\n",
-        text=True,
-        capture_output=True,
-    )
-    if proc.returncode != 0:
-        raise RuntimeError(
-            "Failed to drop OS cache. Set up passwordless sudo as described "
-            f"in test/tpch_performance/CLAUDE.md (stderr: {proc.stderr.strip()})"
-        )
+def drop_os_cache(source, data_source="parquet"):
+    """Evict input dataset pages from the OS page cache via posix_fadvise(DONTNEED).
+
+    Unlike writing to /proc/sys/vm/drop_caches this requires no root/sudo — it
+    only evicts the pages belonging to the benchmark's own input files.
+    os.sync() is called first so any dirty pages are flushed before eviction.
+    """
+    if data_source == "duckdb":
+        files = [source]
     else:
-        log("OS cache dropped successfully")
+        files = []
+        for table in TPCH_TABLES:
+            files.extend(_resolve_parquet_files(source, table))
+
+    os.sync()
+    evicted = 0
+    for path in files:
+        try:
+            with open(path, "rb") as f:
+                size = os.fstat(f.fileno()).st_size
+                os.posix_fadvise(f.fileno(), 0, size, os.POSIX_FADV_DONTNEED)
+                evicted += 1
+        except OSError as e:
+            log(f"WARNING: fadvise({path}): {e}")
+    log(f"posix_fadvise(DONTNEED) applied to {evicted} file(s)")
 
 
 def _resolve_parquet_files(parquet_dir, table):
@@ -502,7 +512,7 @@ def run_isolated(
                     source, gpu_execution=use_gpu, data_source=data_source
                 )
                 try:
-                    drop_os_cache()
+                    drop_os_cache(source, data_source)
                     if pin_enabled and use_gpu:
                         log(f"  Pinning tables for q{qnum}")
                         _execute_multi(con, emit_pin(qnum, source, data_source))
@@ -1149,7 +1159,7 @@ def main():
     log(f"Runtime CSV:   {runtime_csv}")
     log(f"Log dir:       {log_dir}")
 
-    drop_os_cache()
+    drop_os_cache(source, args.data_source)
     with open(runtime_csv, "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(["engine", "query", "iteration", "runtime_s"])
