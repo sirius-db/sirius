@@ -16,9 +16,9 @@
 
 #pragma once
 
-#include <cucascade/data/representation_converter.hpp>
-
 #include "decode_pushdown.hpp"
+
+#include <cucascade/data/representation_converter.hpp>
 
 #include <cstdint>
 #include <span>
@@ -102,10 +102,10 @@ using decode_pair_pushdown = std::vector<decode_pair_entry>;
 /// @c covers_whole_filter: the mask carries EVERY restricting conjunct of the
 /// scan's pushed-down filter (extraction converted everything AND nothing was
 /// dropped at directive build). Only then may the converter hand out a
-/// @c row_filtered_gpu_table_representation; a partial mask must leave the
+/// batch with @c decode_outcome::row_filtered set; a partial mask must leave the
 /// batch untagged so post_filter_and_project evaluates the residual.
 struct fused_scan_directives {
-  bool enabled            = false;
+  bool enabled             = false;
   bool covers_whole_filter = false;
   decode_range_pushdown ranges;                  ///< parallel to selected columns
   std::vector<decode_output_tier> output_tiers;  ///< parallel to selected columns

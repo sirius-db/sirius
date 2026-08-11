@@ -24,72 +24,70 @@
 namespace sirius {
 
 /**
- * @brief GPU table representation whose rows were already filtered at decode.
+ * @brief What the decode did to a batch, beyond producing its columns.
  *
- * Constructed by the compression converters (decompress_host_to_gpu /
- * decompress_device_to_gpu) INSTEAD of the plain gpu_table_representation when
- * the fused scan-filter pipeline (`SIRIUS_EXP_FUSED_SCAN_FILTER`) applied the
- * scan's ENTIRE table-filter conjunction during decompression. The tag is a
- * hard promise:
- *
- *  - every column of the table is compacted to the same survivor row count;
- *  - every conjunct of the split's pushed-down table filter was applied
- *    (nothing is left for post_filter_and_project to evaluate);
- *  - no decode-time BOOL8 predicate-substitution columns are present — all
- *    columns carry real values in the batch's materialized column order.
- *
- * scan_operator_input::prepare_for_processing detects this type right after
- * convert_to and stamps the split `decode_row_filtered`, which
- * gpu_ingestible::materialize_table translates to filter_state::ROW_FILTERED —
- * post_filter_and_project then skips filter evaluation and only applies the
- * projection/layout assembly.
- *
- * When the feature gate is off the converters always construct the base class,
- * so this type is never observed and the scan path is byte-identical.
- *
- * NOTE: clone() intentionally degrades to the base representation. The tag is
- * only meaningful between the conversion and the scan's capture of the flag,
- * which happen back to back on the same thread in prepare_for_processing.
+ * Facts the converter knows exactly and the scan would otherwise have to infer.
+ * Carried as a value on @ref decoded_batch_representation rather than encoded in
+ * the representation's dynamic type, so it survives copying and can grow a field
+ * without growing a class.
  */
-class row_filtered_gpu_table_representation final
-  : public ::cucascade::gpu_table_representation {
- public:
-  row_filtered_gpu_table_representation(std::unique_ptr<cudf::table> table,
-                                        ::cucascade::memory::memory_space& memory_space,
-                                        rmm::cuda_stream_view writer_stream)
-    : ::cucascade::gpu_table_representation(std::move(table), memory_space, writer_stream)
-  {
-  }
+struct decode_outcome {
+  /// The fused scan-filter decode applied the split's ENTIRE table-filter
+  /// conjunction and every column is compacted to the survivor rows.
+  /// materialize_table maps this to filter_state::ROW_FILTERED, so
+  /// post_filter_and_project skips filter evaluation and only projects.
+  ///
+  /// A partial mask must leave this false: the residual conjuncts still have to
+  /// run, and re-checking already-applied ones on the compacted rows is
+  /// idempotent.
+  bool row_filtered = false;
+
+  /// The fused attempt hit the RULE-2 selectivity bail: the columns are the
+  /// ordinary full-width decode (NOT row-filtered), and the only thing worth
+  /// reporting is that the attempt did not pay off.
+  ///
+  /// Per-batch selectivity is uniform across a scan's batches (unclustered
+  /// chunks), so one bail predicts the rest: the scan latches an operator-shared
+  /// flag and later splits strip the attached range pushdown before conversion,
+  /// dropping the wave-1 + CNT insurance cost from every-batch to once-per-scan.
+  /// Per-operator by construction — another query's scan decides fresh.
+  bool rule2_bailed = false;
+
+  [[nodiscard]] bool any() const noexcept { return row_filtered || rule2_bailed; }
 };
 
 /**
- * @brief Classic full-width decode whose fused scan-filter attempt BAILED on
- *        RULE 2 (post-CNT survivors above SIRIUS_EXP_FUSED_SCAN_MAX_SEL).
+ * @brief A GPU table representation that reports what its decode did.
  *
- * Constructed by the compression converters instead of the plain
- * gpu_table_representation when decompress_scan_filter reports
- * scan_filter_status::bailed_high_selectivity. The table content is exactly
- * the classic decode (NOT row-filtered — post_filter_and_project must still
- * run); the tag only carries the bail signal so the scan can memoize it:
- * per-batch selectivity is uniform across a scan's batches (unclustered
- * chunks), so one bail predicts all remaining batches. On seeing this type,
- * scan_operator_input::prepare_for_processing latches the operator-shared
- * bail flag; later splits of the same scan then strip the attached range
- * pushdown before conversion, skipping the wave-1 + CNT insurance cost. The
- * flag is per-operator: another query's scan of the same pinned entry
- * decides fresh.
+ * Constructed by the compression converters (decompress_host_to_gpu /
+ * decompress_device_to_gpu) in place of the plain gpu_table_representation
+ * whenever the decode has something to report; the plain type is still used
+ * when it does not, so nothing changes on the ordinary path and the feature
+ * gate being off is byte-identical to before.
  *
- * Same clone()/lifetime notes as the row-filtered tag above.
+ * scan_operator_input::prepare_for_processing reads @ref outcome right after
+ * convert_to and stamps the split from it.
+ *
+ * The outcome is a property of THIS decode, so a copy that shares the decoded
+ * columns legitimately shares it too — unlike the dynamic-type encoding this
+ * replaced, where clone() had to decide what the copy "is" and settled for
+ * dropping the information.
  */
-class rule2_bailed_gpu_table_representation final
-  : public ::cucascade::gpu_table_representation {
+class decoded_batch_representation final : public ::cucascade::gpu_table_representation {
  public:
-  rule2_bailed_gpu_table_representation(std::unique_ptr<cudf::table> table,
-                                        ::cucascade::memory::memory_space& memory_space,
-                                        rmm::cuda_stream_view writer_stream)
-    : ::cucascade::gpu_table_representation(std::move(table), memory_space, writer_stream)
+  decoded_batch_representation(std::unique_ptr<cudf::table> table,
+                               ::cucascade::memory::memory_space& memory_space,
+                               rmm::cuda_stream_view writer_stream,
+                               decode_outcome outcome)
+    : ::cucascade::gpu_table_representation(std::move(table), memory_space, writer_stream),
+      _outcome(outcome)
   {
   }
+
+  [[nodiscard]] const decode_outcome& outcome() const noexcept { return _outcome; }
+
+ private:
+  decode_outcome _outcome;
 };
 
 }  // namespace sirius

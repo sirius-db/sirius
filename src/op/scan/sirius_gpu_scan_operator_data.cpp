@@ -222,19 +222,20 @@ void scan_operator_input::prepare_for_processing(
       }
       mut.convert_to<::cucascade::gpu_table_representation>(
         registry, requested_memory_space, stream);
-      // Fused scan-filter: the converter reports decode-time row filtering by
-      // installing the tagged representation subclass (whole table-filter
-      // conjunction applied, all columns compacted to the survivor rows).
-      // Capture it on the split — materialize_table maps it to
-      // filter_state::ROW_FILTERED so the filter is not re-evaluated. Off-gate
-      // the converters always install the base type and this stays false.
-      decode_row_filtered =
-        dynamic_cast<::sirius::row_filtered_gpu_table_representation*>(mut.get_data()) != nullptr;
-      // A RULE-2 bail comes back as classic full-width content under the
-      // bailed tag; latch it so the scan's remaining splits skip the attempt.
-      if (fused_bail_flag && dynamic_cast<::sirius::rule2_bailed_gpu_table_representation*>(
-                               mut.get_data()) != nullptr) {
-        fused_bail_flag->store(true, std::memory_order_relaxed);
+      // Fused scan-filter: the converter reports what the decode did as a value
+      // on the representation. row_filtered means the whole table-filter
+      // conjunction was applied and every column is compacted to the survivor
+      // rows — materialize_table maps it to filter_state::ROW_FILTERED so the
+      // filter is not re-evaluated. rule2_bailed means the attempt did not pay
+      // off, so the scan's remaining splits skip it. Off-gate the converters
+      // install the plain representation and both stay false.
+      if (auto const* decoded =
+            dynamic_cast<::sirius::decoded_batch_representation const*>(mut.get_data())) {
+        auto const& outcome = decoded->outcome();
+        decode_row_filtered = outcome.row_filtered;
+        if (fused_bail_flag && outcome.rule2_bailed) {
+          fused_bail_flag->store(true, std::memory_order_relaxed);
+        }
       }
       if (decode_row_filtered && mvcc_keep_mask.has_mask()) {
         // The keep-mask is positional over the chunk's full row range; a

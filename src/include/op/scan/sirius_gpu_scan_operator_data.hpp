@@ -182,7 +182,7 @@ class scan_operator_input : public op::operator_data {
   /// splits fold filter costs into their own estimates instead.
   bool row_filter_pending{false};
   /// True when prepare_for_processing's conversion came back as a
-  /// row_filtered_gpu_table_representation: the fused scan-filter decode
+  /// decode_outcome::row_filtered: the fused scan-filter decode
   /// (SIRIUS_EXP_FUSED_SCAN_FILTER) already applied the split's whole
   /// table-filter conjunction and every column is compacted to the survivor
   /// rows. materialize_table then returns filter_state::ROW_FILTERED so
@@ -201,7 +201,7 @@ class scan_operator_input : public op::operator_data {
   /// sirius_gpu_scan_operator::get_next_task_input_data on every split it
   /// hands out. Selectivity is uniform across a scan's batches (unclustered
   /// chunks), so one post-CNT bail predicts the rest: prepare_for_processing
-  /// latches it on seeing a rule2_bailed_gpu_table_representation, and later
+  /// latches it on seeing decode_outcome::rule2_bailed, and later
   /// splits strip the attached range pushdown before conversion (and the
   /// working-set estimator keeps the classic 2x envelope). Per-operator by
   /// construction — another query's scan decides fresh. May be null (splits

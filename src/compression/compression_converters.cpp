@@ -225,8 +225,8 @@ std::vector<simpatico::decode_predicate> to_decode_predicates(
 // batch — the scan side keys its behavior off the class alone.
 enum class fused_batch_tag : std::uint8_t {
   none,          ///< plain gpu_table_representation (classic or partial-mask output)
-  row_filtered,  ///< whole conjunction applied ⇒ row_filtered_gpu_table_representation
-  rule2_bailed,  ///< RULE-2 selectivity bail ⇒ rule2_bailed_gpu_table_representation,
+  row_filtered,  ///< whole conjunction applied ⇒ decode_outcome::row_filtered
+  rule2_bailed,  ///< RULE-2 selectivity bail ⇒ decode_outcome::rule2_bailed,
                  ///< letting the scan latch and strip the pushdown for later batches
 };
 
@@ -539,17 +539,20 @@ std::unique_ptr<cucascade::idata_representation> reconstruct_and_decompress_to_g
                    decompressed->num_rows(),
                    space->get_device_id());
 
-  // Tagged subclasses (see row_filtered_table_representation.hpp):
+  // Report what the decode did (see row_filtered_table_representation.hpp):
   // row_filtered ⇔ the fused pipeline applied the whole conjunction;
   // rule2_bailed ⇔ RULE-2 selectivity bail (classic columns inside — the scan
-  // latches on the type and strips the pushdown for its remaining batches).
-  if (tag == fused_batch_tag::row_filtered) {
-    return std::make_unique<row_filtered_gpu_table_representation>(
-      std::move(decompressed), *const_cast<cucascade::memory::memory_space*>(space), stream);
-  }
-  if (tag == fused_batch_tag::rule2_bailed) {
-    return std::make_unique<rule2_bailed_gpu_table_representation>(
-      std::move(decompressed), *const_cast<cucascade::memory::memory_space*>(space), stream);
+  // latches the flag and strips the pushdown for its remaining batches).
+  // Nothing to report ⇒ the plain representation, exactly as before.
+  decode_outcome outcome;
+  outcome.row_filtered = tag == fused_batch_tag::row_filtered;
+  outcome.rule2_bailed = tag == fused_batch_tag::rule2_bailed;
+  if (outcome.any()) {
+    return std::make_unique<decoded_batch_representation>(
+      std::move(decompressed),
+      *const_cast<cucascade::memory::memory_space*>(space),
+      stream,
+      outcome);
   }
   return std::make_unique<cucascade::gpu_table_representation>(
     std::move(decompressed), *const_cast<cucascade::memory::memory_space*>(space), stream);
@@ -671,18 +674,20 @@ std::unique_ptr<cucascade::idata_representation> decompress_device_to_gpu(
                    decompressed->num_rows(),
                    space->get_device_id());
 
-  // Tagged subclasses (see row_filtered_table_representation.hpp):
+  // Report what the decode did (see row_filtered_table_representation.hpp):
   // row_filtered is the scan's hard promise that the WHOLE table-filter
   // conjunction was applied during decode; rule2_bailed carries classic
   // full-width columns but lets the scan latch the per-operator bail flag and
   // strip the range pushdown from its remaining batches.
-  if (tag == fused_batch_tag::row_filtered) {
-    return std::make_unique<row_filtered_gpu_table_representation>(
-      std::move(decompressed), *const_cast<cucascade::memory::memory_space*>(space), stream);
-  }
-  if (tag == fused_batch_tag::rule2_bailed) {
-    return std::make_unique<rule2_bailed_gpu_table_representation>(
-      std::move(decompressed), *const_cast<cucascade::memory::memory_space*>(space), stream);
+  decode_outcome outcome;
+  outcome.row_filtered = tag == fused_batch_tag::row_filtered;
+  outcome.rule2_bailed = tag == fused_batch_tag::rule2_bailed;
+  if (outcome.any()) {
+    return std::make_unique<decoded_batch_representation>(
+      std::move(decompressed),
+      *const_cast<cucascade::memory::memory_space*>(space),
+      stream,
+      outcome);
   }
   return std::make_unique<cucascade::gpu_table_representation>(
     std::move(decompressed), *const_cast<cucascade::memory::memory_space*>(space), stream);
