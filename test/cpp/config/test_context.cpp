@@ -38,6 +38,7 @@
 #include <utils/utils.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstdlib>  // for setenv/putenv
 #include <filesystem>
@@ -122,6 +123,132 @@ struct finally {
     if (func) { func(); }
   }
 };
+
+namespace {
+struct setting_assignment {
+  const char* name;
+  const char* value;
+};
+
+constexpr std::array<setting_assignment, 10> legacy_only_settings{{
+  {"use_pin_memory", "false"},
+  {"use_pin_memory_for_caching", "true"},
+  {"use_cudf_expr", "false"},
+  {"use_custom_top_n", "false"},
+  {"use_opt_table_scan", "false"},
+  {"opt_table_scan_num_streams", "4"},
+  {"opt_table_scan_memcpy_size", "1048576"},
+  {"print_gpu_table_max_rows", "42"},
+  {"enable_fallback_check", "true"},
+  {"modified_pipeline", "true"},
+}};
+
+constexpr std::array<const char*, 5> super_sirius_settings{{
+  "expression_evaluator_strategy",
+  "enable_regex_jit_impl",
+  "enable_duckdb_fallback",
+  "fuse_merge_pipelines",
+  "scan_task_batch_size",
+}};
+}  // namespace
+
+TEST_CASE("Legacy-only settings follow the build surface",
+          "[sirius][config][legacy-settings][isolated_context]")
+{
+  finally cleanup_env{[]() { setenv("SIRIUS_DISABLE", "1", 1); }};
+  setenv("SIRIUS_DISABLE", "1", 1);
+
+  duckdb::DuckDB db(nullptr);
+  duckdb::Connection con(db);
+
+  auto setting_count = [&con](const char* name) {
+    auto result =
+      con.Query("SELECT count(*) FROM duckdb_settings() WHERE name = '" + std::string(name) + "'");
+    REQUIRE(result != nullptr);
+    REQUIRE_FALSE(result->HasError());
+    return result->GetValue(0, 0).GetValue<int64_t>();
+  };
+
+  for (auto const& setting : legacy_only_settings) {
+    CAPTURE(setting.name);
+#ifdef SIRIUS_ENABLE_LEGACY
+    REQUIRE(setting_count(setting.name) == 1);
+
+    auto set_result = con.Query("SET " + std::string(setting.name) + " = " + setting.value);
+    REQUIRE(set_result != nullptr);
+    REQUIRE_FALSE(set_result->HasError());
+
+    auto reset_result = con.Query("RESET " + std::string(setting.name));
+    REQUIRE(reset_result != nullptr);
+    REQUIRE_FALSE(reset_result->HasError());
+#else
+    REQUIRE(setting_count(setting.name) == 0);
+
+    auto set_result = con.Query("SET " + std::string(setting.name) + " = " + setting.value);
+    REQUIRE(set_result != nullptr);
+    REQUIRE(set_result->HasError());
+#endif
+  }
+
+  for (auto const* name : super_sirius_settings) {
+    CAPTURE(name);
+    REQUIRE(setting_count(name) == 1);
+  }
+}
+
+TEST_CASE("Test-only settings require explicit process opt-in",
+          "[sirius][config][test-settings][isolated_context]")
+{
+  std::optional<std::string> original_test_options;
+  if (auto const* value = std::getenv("SIRIUS_ENABLE_TEST_OPTIONS")) {
+    original_test_options = value;
+  }
+  finally restore_env{[original_test_options]() {
+    if (original_test_options) {
+      setenv("SIRIUS_ENABLE_TEST_OPTIONS", original_test_options->c_str(), 1);
+    } else {
+      unsetenv("SIRIUS_ENABLE_TEST_OPTIONS");
+    }
+    setenv("SIRIUS_DISABLE", "1", 1);
+  }};
+
+  auto setting_count = [](duckdb::Connection& con) {
+    auto result = con.Query(
+      "SELECT count(*) FROM duckdb_settings() "
+      "WHERE name = 'sirius_test_inject_transparent_gpu_error'");
+    REQUIRE(result != nullptr);
+    REQUIRE_FALSE(result->HasError());
+    return result->GetValue(0, 0).GetValue<int64_t>();
+  };
+
+  setenv("SIRIUS_DISABLE", "1", 1);
+  unsetenv("SIRIUS_ENABLE_TEST_OPTIONS");
+  {
+    duckdb::DuckDB db(nullptr);
+    duckdb::Connection con(db);
+    REQUIRE(setting_count(con) == 0);
+    auto result = con.Query("SET sirius_test_inject_transparent_gpu_error = 'boom'");
+    REQUIRE(result != nullptr);
+    REQUIRE(result->HasError());
+  }
+
+  setenv("SIRIUS_ENABLE_TEST_OPTIONS", "true", 1);
+  {
+    duckdb::DuckDB db(nullptr);
+    duckdb::Connection con(db);
+    REQUIRE(setting_count(con) == 0);
+  }
+
+  setenv("SIRIUS_ENABLE_TEST_OPTIONS", "1", 1);
+  {
+    duckdb::DuckDB db(nullptr);
+    duckdb::Connection con(db);
+    REQUIRE(setting_count(con) == 1);
+    auto result = con.Query("SET sirius_test_inject_transparent_gpu_error = 'boom'");
+    REQUIRE(result != nullptr);
+    REQUIRE_FALSE(result->HasError());
+  }
+}
 
 TEST_CASE("Sirius configuration loading from file with configurator",
           "[sirius][context][isolated_context]")

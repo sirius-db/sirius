@@ -282,7 +282,23 @@ The `sirius.executor.scan_manager` block configures the scan-metadata thread poo
 | `rest_n_reactors` | int (**> 0**) | 2 | Number of REST reactor threads for object-store (`s3://`) reads. |
 | `enable_prefetch_cache` | bool | false | Attach the pinned-memory prefetching cache in front of the backend. |
 
-Four optional nested sub-configs tune the individual backends and caches:
+Five optional nested sub-configs tune the individual backends, caches, and the memory prefetcher:
+
+### `scan_manager.memory_prefetcher` — background host→GPU upload of pinned-cache scan splits (`scan_manager/config.hpp`)
+
+Overlaps the host→GPU upload of queued pinned-cache scan splits with compute:
+worker threads walk the pending splits in scan execution order and convert
+resident batches to GPU tier ahead of task creation, gated on GPU memory
+headroom (see `scan_manager/memory_prefetcher.hpp`). Disabled by default;
+single-GPU configurations only (logs a warning and disables itself otherwise).
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enable` | bool | false | Master switch for the prefetcher. |
+| `num_threads` | int (**> 0**) | 2 | Prefetch worker threads; each drives one in-flight batch conversion on its own stream. |
+| `min_free_fraction` | double [0,1] | 0.4 | Keep at least this fraction of the GPU space free after each prefetch; conversions (and their reservations) are only attempted above this floor. |
+| `poll_interval_ms` | int (**> 0**) | 2 | Worker sweep interval while waiting for headroom / new splits. |
+| `drain_quiet_ms` | int (ms) | 100 | A connector counts as actively draining (and is skipped) until this long passes since its last pop. Must exceed the scan's inter-pop interval. |
 
 ### `scan_manager.local` — io_uring backend (`io/uring/config.hpp`)
 
@@ -498,22 +514,13 @@ Registered in `src/sirius_extension.cpp`. These can be changed at runtime:
 These can also be set at load via the `SIRIUS_LOG_BACKEND`, `SIRIUS_LOG_DIR`, and
 `SIRIUS_LOG_LEVEL` environment variables.
 
-### Memory
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `use_pin_memory` | true | Use pinned memory for CPU↔GPU transfers |
-| `use_pin_memory_for_caching` | false | Use pinned memory for scan caching |
-
 ### Expression Evaluation
 
 **File:** `src/include/expression_evaluator/expression_evaluator_strategy.hpp`
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `use_cudf_expr` | true | Use cuDF-based expression evaluation |
 | `expression_evaluator_strategy` | `ast_interpret` | Expression evaluator strategy: `materialize`, `ast_interpret`, or `ast_jit` |
-| `use_custom_top_n` | false | Use custom top-N implementation |
 
 `expression_executor_strategy` remains registered as a deprecated compatibility alias for
 `expression_evaluator_strategy`; new configuration should use the evaluator name.
@@ -545,7 +552,6 @@ SET enable_compressed_materialization = false;
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `modified_pipeline` | - | Enable modified pipeline execution |
 | `fuse_merge_pipelines` | true | Fuse eligible GROUP BY / TOP_N merges into their downstream pipeline instead of cutting a boundary (see [physical-plan-generation.md](physical-plan-generation.md) → Merge fusion) |
 | `max_sort_partition_bytes` | 0 (auto) | Max sort partition bytes |
 | `max_sort_partition_memory_fraction` | 0.33 | Auto sort-partition fraction when `max_sort_partition_bytes` is 0 |
@@ -600,13 +606,33 @@ SET enable_pinned_zone_map_pruning = false;
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `print_gpu_table_max_rows` | - | Max rows to print in debug output |
-| `enable_fallback_check` | - | Enable fallback validation |
 | `enable_duckdb_fallback` | true | Fall back to DuckDB CPU execution on Sirius errors. Gates both plan-time fallback (unsupported operator/type) and runtime fallback (GPU execution failure) on the transparent path, plus the legacy `CALL gpu_execution(...)` path. Set to `false` to surface Sirius errors instead of falling back. |
 | `enable_regex_jit_impl` | - | Use JIT regex implementation |
 
 
 ## Legacy Config Flags
+
+### Legacy-release DuckDB settings
+
+The following settings only control the legacy `gpu_processing` path. Sirius registers them
+when built with `ENABLE_LEGACY_SIRIUS=ON`, including the `legacy-release` preset used by
+`make legacy-release`. Normal builds omit them from `duckdb_settings()` and reject attempts to
+`SET` them.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `use_pin_memory` | true | Use pinned memory for legacy CPU↔GPU transfers |
+| `use_pin_memory_for_caching` | false | Use pinned memory for the legacy scan cache |
+| `use_cudf_expr` | true | Use cuDF in the legacy expression executor |
+| `use_custom_top_n` | true | Use the legacy custom top-N kernel |
+| `use_opt_table_scan` | true | Use the legacy optimized table scan |
+| `opt_table_scan_num_streams` | 8 | CUDA streams used by the legacy optimized scan |
+| `opt_table_scan_memcpy_size` | 64 MiB | Copy chunk size used by the legacy optimized scan |
+| `print_gpu_table_max_rows` | 1000 | Maximum rows rendered by the legacy GPU-table printer |
+| `enable_fallback_check` | false | Enable legacy fallback validation |
+| `modified_pipeline` | false | Enable legacy modified-pipeline scheduling |
+
+### Static flags
 
 **File:** `src/include/config.hpp`
 
@@ -633,3 +659,39 @@ These are compile-time defaults. Runtime configuration via `sirius_config` and D
 | `src/sirius_extension.cpp` | SET variable registration |
 | `src/include/scan_manager/config.hpp` | Scan manager config (thread pool, IO reactors, prefetch cache, object store) |
 | `src/include/io/uring/config.hpp`, `io/rest/config.hpp`, `io/cache/config.hpp`, `io/object_store_config.hpp` | Per-backend IO / cache / object-store sub-configs |
+
+## Tuned profile: GB300, TPC-H SF1000 host-pinned
+
+Measured 2026-07-31 (72-core GB300, 256 GB HBM, 3 hot iterations, results
+byte-identical to defaults). Relative to the stock config the following
+deltas are worth **-13% suite hot time** (20.8 s → 18.1 s; q9 -19%):
+
+```yaml
+sirius:
+  memory:
+    host:
+      block_size: 64Mi       # default 1Mi: ~5000 copy segments per 5 GB batch
+      pool_size: 8           # keep block_size x pool_size at 512Mi per pool
+  executor:
+    scan_manager:
+      memory_prefetcher:     # requires the memory prefetcher (PR #1181)
+        enable: true
+        num_threads: 3       # 2 is the swept default; 3 buys q21 ~3% under 8 pipeline threads
+    pipeline:
+      num_threads: 8         # default 4; cliff at 12 (q1/q6 regress)
+```
+
+Attribution: host `block_size` 1 Mi → 64 Mi removes per-segment submission
+overhead in batched host→GPU copies (~11 ms of every 39 ms five-GB
+conversion); sweep 16-64 Mi if small-host-allocation fragmentation is a
+concern. `pipeline.num_threads` 4 → 8 helps task-parallel aggregation
+queries (q1 -16%, q12 -14%). The prefetcher block overlaps pinned-cache
+uploads with compute (see `scan_manager.memory_prefetcher` above). Numbers
+include the cuCascade all-valid null-mask conversion fix; without it,
+expect roughly half the converter-side gain.
+
+The knobs that did NOT help on this hardware, all measured full-suite:
+prefetcher `min_free_fraction` below 0.4, prefetcher threads above 3,
+pipeline threads above 8. The H2D interconnect sustains ~350-380 GB/s
+regardless of stream count; past these settings the link, not scheduling,
+is the bound.

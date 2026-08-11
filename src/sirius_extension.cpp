@@ -121,6 +121,7 @@ extern "C" int cudaProfilerStop();
 
 #include <cstdint>
 #include <cstdlib>
+#include <string_view>
 #include <unordered_map>
 
 namespace duckdb {
@@ -133,6 +134,12 @@ bool SiriusExtension::buffer_is_initialized = false;
 constexpr std::string QUERY_LABEL_PARAM_KEY = "query_label";
 
 namespace {
+
+bool test_options_enabled() noexcept
+{
+  auto const* value = std::getenv("SIRIUS_ENABLE_TEST_OPTIONS");
+  return value != nullptr && std::string_view{value} == "1";
+}
 
 std::uint64_t count_narrowed_columns(
   sirius::pinned_column_storage_matrix const& column_storage) noexcept
@@ -1682,6 +1689,7 @@ static void throw_if_sirius_runtime_unavailable(ClientContext& context)
   }
 }
 
+#ifdef SIRIUS_ENABLE_LEGACY
 static void SetUsePinMemory(ClientContext& context, SetScope scope, Value& parameter)
 {
   throw_if_sirius_runtime_unavailable(context);
@@ -1703,6 +1711,7 @@ static void SetUseCudfExpr(ClientContext& context, SetScope scope, Value& parame
   Config::USE_CUDF_EXPR = BooleanValue::Get(parameter);
   SIRIUS_LOG_DEBUG("Updated config USE_CUDF_EXPR to {}", Config::USE_CUDF_EXPR);
 }
+#endif
 
 static void ApplyExpressionEvaluatorStrategy(const std::string& value)
 {
@@ -1739,6 +1748,7 @@ static void SetExpressionExecutorStrategyDeprecated(ClientContext& context,
   ApplyExpressionEvaluatorStrategy(StringValue::Get(parameter));
 }
 
+#ifdef SIRIUS_ENABLE_LEGACY
 static void SetUseCustomTopN(ClientContext& context, SetScope scope, Value& parameter)
 {
   throw_if_sirius_runtime_unavailable(context);
@@ -1783,6 +1793,7 @@ static void SetEnableFallbackCheck(ClientContext& context, SetScope scope, Value
   Config::ENABLE_FALLBACK_CHECK = BooleanValue::Get(parameter);
   SIRIUS_LOG_DEBUG("Updated config ENABLE_FALLBACK_CHECK to {}", Config::ENABLE_FALLBACK_CHECK);
 }
+#endif
 
 static void SetEnableDuckdbFallback(ClientContext& /*context*/,
                                     SetScope /*scope*/,
@@ -1802,12 +1813,14 @@ static void SetEnableRegexJitImpl(ClientContext& context, SetScope scope, Value&
   SIRIUS_LOG_DEBUG("Updated config ENABLE_REGEX_JIT_IMPL to {}", Config::ENABLE_REGEX_JIT_IMPL);
 }
 
+#ifdef SIRIUS_ENABLE_LEGACY
 static void SetModifiedPipeline(ClientContext& context, SetScope scope, Value& parameter)
 {
   throw_if_sirius_runtime_unavailable(context);
   Config::MODIFIED_PIPELINE = BooleanValue::Get(parameter);
   SIRIUS_LOG_DEBUG("Updated config MODIFIED_PIPELINE to {}", Config::MODIFIED_PIPELINE);
 }
+#endif
 
 static void SetFuseMergePipelines(ClientContext& /*context*/,
                                   SetScope /*scope*/,
@@ -2108,6 +2121,7 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
   auto const& operator_defaults    = defaults.get_operator_params();
   auto const& compression_defaults = defaults.get_compression_config();
 
+#ifdef SIRIUS_ENABLE_LEGACY
   // Add in config option for gpu buffer manager
   config.AddExtensionOption("use_pin_memory",
                             "Whether or not the buffer manager is initialized with pinned memory",
@@ -2128,6 +2142,7 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
                             LogicalType::BOOLEAN,
                             Value::BOOLEAN(Config::USE_CUDF_EXPR),
                             SetUseCudfExpr);
+#endif
 
   config.AddExtensionOption(
     "expression_evaluator_strategy",
@@ -2146,6 +2161,7 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
     Value(std::string(sirius::strategy_to_string(Config::EXPRESSION_EVALUATOR_STRATEGY))),
     SetExpressionExecutorStrategyDeprecated);
 
+#ifdef SIRIUS_ENABLE_LEGACY
   // Add in config option for top-N
   config.AddExtensionOption("use_custom_top_n",
                             "Whether or not custom kernel is used to evalaute top n",
@@ -2183,6 +2199,7 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
                             LogicalType::BOOLEAN,
                             Value::BOOLEAN(Config::ENABLE_FALLBACK_CHECK),
                             SetEnableFallbackCheck);
+#endif
 
   config.AddExtensionOption(
     "enable_duckdb_fallback",
@@ -2193,14 +2210,15 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
                            // fallback policy into every freshly-created database).
     SetEnableDuckdbFallback);
 
-  // TEST ONLY: when non-empty, transparent GPU execution fails at runtime with that
-  // message after plan generation succeeds, to exercise the CPU fallback path. No
-  // setter — the value is read via TryGetCurrentSetting in PhysicalSiriusExecution.
-  config.AddExtensionOption(
-    "sirius_test_inject_transparent_gpu_error",
-    "TEST ONLY: force transparent GPU execution to fail at runtime with this message",
-    LogicalType::VARCHAR,
-    Value(""));
+  // Test hooks are absent from normal duckdb_settings(). The unittest harness opts in before
+  // constructing any database so fallback tests can still inject a deterministic runtime error.
+  if (test_options_enabled()) {
+    config.AddExtensionOption(
+      "sirius_test_inject_transparent_gpu_error",
+      "TEST ONLY: force transparent GPU execution to fail at runtime with this message",
+      LogicalType::VARCHAR,
+      Value(""));
+  }
 
   // Add in config options for special JIT implementation for regex
   config.AddExtensionOption(
@@ -2210,12 +2228,14 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
     Value::BOOLEAN(Config::ENABLE_REGEX_JIT_IMPL),
     SetEnableRegexJitImpl);
 
+#ifdef SIRIUS_ENABLE_LEGACY
   // Add in config options for modified pipeline
   config.AddExtensionOption("modified_pipeline",
                             "Whether to use modified pipeline for GPU execution",
                             LogicalType::BOOLEAN,
                             Value::BOOLEAN(Config::MODIFIED_PIPELINE),
                             SetModifiedPipeline);
+#endif
 
   config.AddExtensionOption("fuse_merge_pipelines",
                             "Fuse eligible GROUP BY and TOP_N merges into downstream pipelines",
@@ -2465,13 +2485,15 @@ static void LoadInternal(ExtensionLoader& loader)
   // "S3 CPU fallback is not supported" error; local reads fall back to CPU).
   db.GetFileSystem().RegisterSubSystem(make_uniq<sirius::io::s3::sirius_httpfs>());
 
-  // Register optimizer extension for transparent GPU execution. Only the
-  // post-hook remains (plan capture); the optimizer mask a pre-hook used to
-  // write per query is published once at load (see
-  // publish_transparent_optimizer_mask above), and DuckDB skips a null
-  // pre_optimize_function.
+  // Register optimizer extension for transparent GPU execution. The post-hook
+  // captures the optimized plan; the pre-hook derives the single-table
+  // restrictions implied by OR-ed multi-table filters so DuckDB's own pushdown,
+  // join-order and build/probe-side passes can act on them. (The optimizer mask
+  // an earlier pre-hook used to write per query is published once at load — see
+  // publish_transparent_optimizer_mask above.)
   OptimizerExtension opt_ext;
-  opt_ext.optimize_function = sirius::transparent::sirius_optimizer_hook;
+  opt_ext.pre_optimize_function = sirius::transparent::sirius_pre_optimizer_hook;
+  opt_ext.optimize_function     = sirius::transparent::sirius_optimizer_hook;
   OptimizerExtension::Register(config, std::move(opt_ext));
 
   // Register SiriusContext on connections that were opened before the extension
