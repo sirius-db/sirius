@@ -633,8 +633,8 @@ TEST_CASE_METHOD(fragment_fixture,
     auto second = make_sender(second_leaf);
 
     for (auto* sender : {first.get(), second.get()}) {
-      query_lifecycle sender_lifecycle(*sirius_ctx, *con->context, "frag6_sender");
-      sender->build();
+      query_window sender_window(*sirius_ctx, *con->context, "frag6_sender");
+      sender->build(sender_window.query_id());
       sender->run();
     }
 
@@ -667,8 +667,8 @@ TEST_CASE_METHOD(fragment_fixture,
     receiver_spec.outputs = {1};
     streaming_fragment receiver(*con->context, std::move(receiver_spec));
 
-    query_lifecycle receiver_lifecycle(*sirius_ctx, *con->context, "frag6_receiver");
-    receiver.build();
+    query_window receiver_window(*sirius_ctx, *con->context, "frag6_receiver");
+    receiver.build(receiver_window.query_id());
 
     std::uint32_t sender_id = 0;
     for (auto* sender : {first.get(), second.get()}) {
@@ -683,7 +683,7 @@ TEST_CASE_METHOD(fragment_fixture,
     }
 
     receiver.run();
-    receiver_lifecycle.end();
+    receiver_window.finish();
 
     auto rows = drain_rows_as_i64(receiver, 1);
     REQUIRE(rows.size() == 1);
@@ -746,8 +746,8 @@ TEST_CASE_METHOD(fragment_fixture,
     auto second = make_sender(kSecondLeaf);
 
     for (auto* sender : {first.get(), second.get()}) {
-      query_lifecycle sender_lifecycle(*sirius_ctx, *con->context, "frag7_sender");
-      sender->build();
+      query_window sender_window(*sirius_ctx, *con->context, "frag7_sender");
+      sender->build(sender_window.query_id());
       sender->run();
     }
 
@@ -778,8 +778,8 @@ TEST_CASE_METHOD(fragment_fixture,
     receiver_spec.outputs = {1};
     streaming_fragment receiver(*con->context, std::move(receiver_spec));
 
-    query_lifecycle receiver_lifecycle(*sirius_ctx, *con->context, "frag7_receiver");
-    receiver.build();
+    query_window receiver_window(*sirius_ctx, *con->context, "frag7_receiver");
+    receiver.build(receiver_window.query_id());
 
     std::uint32_t sender_id = 0;
     for (auto* sender : {first.get(), second.get()}) {
@@ -791,7 +791,7 @@ TEST_CASE_METHOD(fragment_fixture,
     }
 
     receiver.run();
-    receiver_lifecycle.end();
+    receiver_window.finish();
 
     REQUIRE(drain_rows_as_i64(receiver, 1) == oracle);
 
@@ -837,8 +837,8 @@ TEST_CASE_METHOD(fragment_fixture,
     auto second = make_sender(kSecondLeaf);
 
     for (auto* sender : {first.get(), second.get()}) {
-      query_lifecycle sender_lifecycle(*sirius_ctx, *con->context, "frag8_sender");
-      sender->build();
+      query_window sender_window(*sirius_ctx, *con->context, "frag8_sender");
+      sender->build(sender_window.query_id());
       sender->run();
     }
 
@@ -863,8 +863,8 @@ TEST_CASE_METHOD(fragment_fixture,
     receiver_spec.outputs = {1};
     streaming_fragment receiver(*con->context, std::move(receiver_spec));
 
-    query_lifecycle receiver_lifecycle(*sirius_ctx, *con->context, "frag8_receiver");
-    receiver.build();
+    query_window receiver_window(*sirius_ctx, *con->context, "frag8_receiver");
+    receiver.build(receiver_window.query_id());
 
     std::uint32_t sender_id = 0;
     for (auto* sender : {first.get(), second.get()}) {
@@ -876,7 +876,7 @@ TEST_CASE_METHOD(fragment_fixture,
     }
 
     receiver.run();
-    receiver_lifecycle.end();
+    receiver_window.finish();
 
     // Scaled-integer representation of DECIMAL(15,2): 0.75 -> 75, 9.99 -> 999.
     auto rows = drain_rows_as_i64(receiver, 1);
@@ -933,8 +933,8 @@ TEST_CASE_METHOD(fragment_fixture,
       spec.partitioning = sirius::op::partition_spec{{0}, {}};
       streaming_fragment fragment(*con->context, std::move(spec));
       {
-        query_lifecycle lifecycle(*sirius_ctx, *con->context, label);
-        fragment.build();
+        query_window window(*sirius_ctx, *con->context, label);
+        fragment.build(window.query_id());
         fragment.run();
       }
 
