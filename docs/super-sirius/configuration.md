@@ -529,9 +529,6 @@ These can also be set at load via the `SIRIUS_LOG_BACKEND`, `SIRIUS_LOG_DIR`, an
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `use_opt_table_scan` | - | Enable optimized table scan |
-| `opt_table_scan_num_streams` | - | Number of CUDA streams for optimized scan |
-| `opt_table_scan_memcpy_size` | - | Memcpy size for optimized scan |
 | `scan_task_batch_size` | Shared physical/effective GPU batch default | Target scan batch size |
 | `enable_compressed_materialization` | true | Keep eligible integer and fixed-point DECIMAL values in narrower physical carriers until a native semantic boundary. |
 
