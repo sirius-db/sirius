@@ -28,26 +28,27 @@ out-of-band signalling channels. This plan keeps the mechanism and replaces the 
 
 ## 1. Problems, with evidence
 
-**P1 — Four encodings of "how does this column decode."**
-`codegen::output_tier` (5 values, `selection.hpp:112`) → `sirius::decode_output_tier` (5 values,
-`compression_converters.hpp:346`) via `to_shared_tier`, overridden by a parallel
-`vector<uint8_t> compact_capable`, re-expressed downstream as `decode_selection`'s four bools
-(`plan_interpreter.hpp:40-79`). The converter comment at `compression_converters.cpp:319-322`
-("not via `make_scan_filter_request`, whose `column_decode_directive` collapses tiers to a
-boolean") is this fighting itself.
+**P1 — Four encodings of "how does this column decode." CLOSED (`e1442655`, `52cc1b5a`).**
+The sirius-side mirror went with the facade; the rest collapsed into
+`codegen::decode_route` (`full, bitpack_mask, delta_mask, dict_codes, str_split`), which is now
+the only encoding — `request.routes`, `result.routes` and `decode_selection::route` are the same
+value. `full` IS "not compactable", so the parallel capability vector has nothing left to say.
 
-**P2 — Five capability probes** walking the same tree
-(`plan_supports_predicate_decode`, `…selection_decode`, `…dict_selection_decode`,
-`…str_selection_decode`, `plan_selection_tier`), with the invariant "umbrella true ⇔ classifier
-!= tier_b" enforced only by comment.
+**P2 — Five capability probes. CLOSED (`52cc1b5a`).** Six, counting
+`column_supports_predicate_decode`. All are now `simpatico::probe_column(tree)` →
+`column_decode_caps{compact_route, can_answer_equality}`, with `can_produce_mask()` derived. The
+invariant that was comment-enforced is unstateable: one probe cannot disagree with itself.
 
-**P3 — Four parallel conjunct vectors** (`scan_filter_request`, `selection.hpp:199-210`), each
-with its own cap arithmetic, ordering rule and coverage rule, all hand-written in
-`try_decompress_scan_filter` (`compression_converters.cpp:252-439`, ~190 lines).
+**P3 — Four parallel conjunct vectors. CLOSED (`ec38c489`).** Assembly now builds one
+`selection_source` list; its size is the count and the cap, one comparator states the ordering
+(exact conjuncts, which cost no probe launch, ahead of join filters by kind then key count), and
+one switch emits it. `scan_filter_request` still carries four vectors — that is the kernels'
+dispatch shape, not the caller's problem.
 
-**P4 — Ragged two-call protocol.** `decompress_scan_filter` returns
-`vector<unique_ptr<column>>` where TierA columns are survivor-sized and TierB are full-width;
-only `compact_scan_filter_output` reconciles them. Nothing in the types enforces the second call.
+**P4 — Ragged two-call protocol. CLOSED (`7aaf3da8`).** `decompress_scan_filter` returns a
+`cudf::table` that is already uniformly survivor-sized; `compact_scan_filter_output` is internal.
+A refused assembly falls back to the unfiltered decode and reports `status = failed`, so no caller
+can hold a half-filtered batch either.
 
 **P5 — Type sniffing. CLOSED (`11cef624`).** `parquet_gpu_ingestible.cpp:886` infers the BOOL8 substitution from
 `batch.column(pos).type().id() == BOOL8`, then rebuilds the filter expression and throws if the
@@ -63,12 +64,13 @@ indistinguishable.
 representation classes, with `clone()` obliged to copy each (#1380 already had to patch `clone()`
 for one field). Both classes now carry one `shared_ptr<const compressed_scan>`.
 
-**P8 — Policy in three places. PARTLY CLOSED (`e1442655`).** The env gate and the selectivity
+**P8 — Policy in three places. CLOSED (`e1442655`, `660ce427`).** The env gate and the selectivity
 ceiling were copied per TU and had *drifted* — two readers accepted only `"1"` where the decoder
 accepts anything but `"0"` — so `SIRIUS_EXP_FUSED_SCAN_FILTER=true` turned the feature on in one
-layer and off in another. Both now live in `compression/decode_filter_policy.hpp`. The decode-side
-thresholds still sit with the decode implementation, which is the only thing that can act on them;
-Phase 3 decides whether they need a policy object at all.
+layer and off in another. All six knobs now live once, with the decode that acts on them
+(`codegen/selection/decode_policy.hpp`); the sirius-side header re-exports the two the scan uses.
+No `fusion_policy` object was needed — free functions with one parse helper each say the same
+thing without a lifetime to thread.
 
 **P9 — Emitter duplication.** See §5.
 
@@ -333,9 +335,18 @@ respelling is no longer a header-isolation problem: the carrier types are the fa
 exactly one point, inside `compressed_scan.cpp`, where the mechanism is invoked. No shared header,
 no inverted dependency.
 
-**Phase 3 — internals.** One route enum, one `probe_column`, merged analysis pass, one
-`fusion_policy`, `compact_scan_filter_output` folded into the entry point.
-*Accept:* P1–P4, P7, P8 closed; `try_decompress_scan_filter`'s ~190 lines substantially reduced.
+**Phase 3 — internals. DONE** (`52cc1b5a`, `ec38c489`, `7aaf3da8`, `660ce427`).
+P1–P4, P7 and P8 are all closed. The merged analysis pass landed in Phase 2 with the facade.
+
+*Not done, deliberately:* the §2 API's `position` (column elision) and `unapplied` (the residual
+as a predicate). Both need the analysis to speak `sirius::ast` rather than rebuilding a DuckDB
+expression, which is a change to the scan's filter representation, not to the decode's internals.
+
+**No measurement.** Phase 2 and 3 were verified for correctness only — `[compression]` with the
+gate on and off, plus all 14 simpatico tests. This box has no GPU budget for the SF1000 run, so
+the "no measurable delta" clause on both phases is UNVERIFIED. Re-run before merging: the
+mechanism's whole justification is 8.180 s → 6.918 s, and every one of these commits sits on the
+per-batch path.
 
 Phase 2 preceded Phase 3 for a reason: the facade is what buys freedom to change internals
 without touching the scan. That freedom now exists — `decode_compressed_chunk` has exactly one
@@ -349,25 +360,22 @@ up, the ordinary decode. Identifiers followed (`tier_dict_k5` → `tier_dict_gat
 → `tier_str_split`, `bailed_high_selectivity` → `declined_unselective`, `rule2_bailed` →
 `selection_unprofitable`).
 
-## 6b. Starting Phase 3
+## 6b. Where things stand
 
-Entry points, so this can be picked up cold.
+Every problem in §1 is closed. What is left is not cleanup:
 
-**Read first, in order:**
+1. **Measure.** Nothing since Phase D has been timed. This is the blocker for merging.
+2. **`unapplied` / `position`** (§2) — the residual as a predicate and column elision. Needs the
+   analysis to produce `sirius::ast`; `src/include/op/scan/scan_filter_analysis.hpp` is where it
+   would land.
+3. **§7's capability work**, now cheap: a new consumer (`ballot_membership` first — membership is
+   expensive today *because* it cannot work on packed bits) or the two unbuilt points of the
+   enumerator × consumer product, each an emitter plus a `shape_is_supported` entry.
 
-1. `src/compression/compressed_scan.hpp` — the whole scan↔decoder boundary, and the only file a
-   Phase 3 change should have to keep stable.
-2. `src/compression/compressed_scan.cpp` — `plan_decode` (the per-chunk narrowing) and
-   `decode_with_filters` (request assembly). This is where P1's remaining encodings and P3's
-   per-kind cap/order rules now live, in one place, with one caller.
-3. `src/compression/simpatico_codegen/src/simpatico_codegen.cpp` — the orchestrator's static
-   output-shape check and selectivity guard: the rest of P8.
-4. `src/include/op/scan/scan_filter_analysis.hpp` — where `unapplied` and `position` would land.
-
-**What Phase 3 still has to close:** P1 (three encodings survive inside the facade:
-`codegen::output_tier`, the parallel `compacts` vector, `decode_selection`'s four bools), P2 (five
-plan probes), P3 (the per-kind conjunct handling in `decode_with_filters`), P4
-(`compact_scan_filter_output` folded into the decode), the rest of P8.
+**Entry points, cold:** `src/compression/compressed_scan.hpp` is the whole scan↔decoder boundary;
+`compressed_scan.cpp` holds the per-chunk narrowing (`plan_decode`) and request assembly;
+`simpatico_codegen.cpp` holds the wave orchestration; `codegen/selection/decode_policy.hpp` holds
+every threshold.
 
 **Verification that works here:** `sirius_unittest [compression]` (36 cases — cases 9–11 run SQL
 through the equality answer and check the aggregate, so they catch a broken substitution rather
