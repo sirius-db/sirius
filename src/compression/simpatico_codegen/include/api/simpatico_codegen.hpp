@@ -205,8 +205,9 @@ std::unique_ptr<cudf::table> decompress(
 /// The point is to skip the decode entirely for dictionary-compressed columns
 /// consumed only by an equality / IN filter: the predicate is resolved against
 /// the key set and mapped over the indices, so the key chars are never gathered
-/// into a full-width column. Use @c column_supports_predicate_decode to check
-/// that a column's plan can actually do this before pushing a predicate into it.
+/// into a full-width column. Use @c simpatico::probe_column's
+/// @c can_answer_equality to check that a column's plan can actually do this
+/// before pushing a predicate into it.
 ///
 /// @throws std::runtime_error if @p predicates and @p selected_columns differ in
 ///         size, or on the usual decompression failures.
@@ -216,11 +217,6 @@ std::unique_ptr<cudf::table> decompress(
   std::span<const decode_predicate> predicates,
   simpatico::stream_pool& pool,
   rmm::device_async_resource_ref mr = rmm::mr::get_current_device_resource_ref());
-
-/// True iff column @p column_index of @p table resolves a predicate without
-/// materialising the column (i.e. its plan is dictionary-rooted). False for an
-/// out-of-range index or a column with no plan tree.
-bool column_supports_predicate_decode(const compressed_table& table, std::size_t column_index);
 
 /// Decompress a column subset with the caller's row filter applied DURING the
 /// decode (experimental, env gate SIRIUS_EXP_FUSED_SCAN_FILTER=1). @p request

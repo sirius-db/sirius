@@ -333,19 +333,18 @@ std::unique_ptr<cudf::table> decompress_columns_parallel(compressed_table const&
 // path byte-identically (same kernels, same allocations, zero added syncs).
 //
 // Enable policy, in two stages:
-//   Statically, before any device work: a column tagged with a compacted tier
-//           (tier_a / tier_a_delta / tier_dict_gather) must verify against
-//           plan_selection_tier; tier_b outputs are ADMITTED (full decode +
-//           survivor gather) with their economics deferred to the selectivity
-//           check below. Range-filter sources are exempt from the tag check and
-//           forced to tier_a.
+//   Statically, before any device work: a column asking for a compacted route
+//           must be a plan probe_column reports that route for; `full` is
+//           ADMITTED for anything (full decode + survivor gather) with its
+//           economics deferred to the selectivity check below. Range-filter
+//           sources are exempt from the check and forced to bitpack_mask.
 //   Dynamically, once the survivor count is known, in two regimes — each
 //           reported as scan_filter_status::declined_unselective so the caller
 //           can remember it for the rest of the scan:
-//           - any tier_b output: proceed iff survivors/rows <=
+//           - any `full` output: proceed iff survivors/rows <=
 //             SIRIUS_EXP_FUSED_SCAN_TIERB_MAX_SEL (default 0.10);
 //           - otherwise: give compaction up above SIRIUS_EXP_FUSED_SCAN_MAX_SEL
-//             (default 0.35) unless a tier_dict_gather output is present (that
+//             (default 0.35) unless a dict_codes output is present (that
 //             gather wins at all selectivities).
 //           Giving up = masks dropped, ordinary decode, batch not ROW_FILTERED.
 
@@ -376,7 +375,7 @@ double max_selectivity()
   return threshold;
 }
 
-// Tier-B re-admission threshold: when tier_b outputs are present the batch
+// Full-route re-admission threshold: when `full` outputs are present the batch
 // proceeds only at sel <= this (default 0.10) — a full decode + gather costs
 // about the unfiltered path, so the win is the compacted batch (and, when the
 // decode carries the whole filter, the skipped post-filter), which only pays
@@ -396,7 +395,7 @@ double tier_b_max_selectivity()
 
 // Index-walk crossover: at survivors/rows <= this (default 0.15) walking the
 // survivor index list (launch_decode_fused_tree_index_consume) beats walking
-// the mask bits for bitpack tier_a outputs — the microbench crossover sits at
+// the mask bits for bitpack_mask outputs — the microbench crossover sits at
 // 15-50% depending on bit width, so 0.15 is the conservative edge. Bitpack leaf
 // roots only: delta roots always keep the mask walk, a dictionary gather is
 // unaffected.
@@ -462,10 +461,9 @@ bool decode_diag_enabled()
 }
 
 // Wave 1 and the compact-capability probe come from the entry points published
-// in plan/decompress.cpp: plan_supports_selection_decode +
-// decompress_column_selection_mask. Wave 2 calls decompress_column(...,
-// decode_selection const* sel) — compact_capable decodes to survivor width, and
-// everything else decodes full width and is gathered inside the call.
+// in plan/decompress.cpp: probe_column + decompress_column_selection_mask. Wave 2 calls
+// decompress_column(..., decode_selection const* sel) — compact_capable decodes to survivor width,
+// and everything else decodes full width and is gathered inside the call.
 
 // RAII CUDA events for the wave-1 -> combine cross-stream join.
 struct event_set {
@@ -528,8 +526,8 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
   }
   if (k_total == 0) return refuse("no mask directives (no range/pair/bool8/membership)");
   if (k_total > 8) return refuse("more than 8 mask sources (a pair counts once)");
-  if (request.tiers.size() != selected.size())
-    return refuse("request.tiers not parallel to selected");
+  if (request.routes.size() != selected.size())
+    return refuse("request.routes not parallel to selected");
   if (pool.streams.empty()) return refuse("stream pool empty");
   int64_t const num_rows = table.num_rows();
   if (num_rows <= 0) return refuse("num_rows <= 0");
@@ -544,13 +542,10 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
   for (auto const& f : request.filters) {
     if (f.column >= selected.size()) return refuse("filter directive column out of range");
     if (f.pred.lo > f.pred.hi) return refuse("empty predicate range (lo > hi)");
-    // Tier classifier, NOT the umbrella probe: plan_supports_selection_decode
-    // covers bitpack AND dictionary plans, but a range source must be
-    // bitpack-rooted (a dictionary column arriving as a numeric range source
-    // would be a latent wrong-mask gate, even though callers extract numeric
-    // ranges only today).
-    if (plan_selection_tier(*table.columns[selected[f.column]].plan_tree) !=
-        sc::output_tier::tier_a)
+    // can_produce_mask, not merely "decodes compacted": a dictionary column
+    // decodes compacted but cannot ballot a numeric range, and one arriving as
+    // a range source would be a latent wrong-mask gate.
+    if (!probe_column(*table.columns[selected[f.column]].plan_tree).can_produce_mask())
       return refuse("filter column plan is not a bitpack-rooted range source");
   }
   for (auto const& p : request.pair_filters) {
@@ -563,13 +558,12 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
       return refuse("pair directive with an empty range on one side");
     // Both sides must be bitpack roots: over the batch's shared num_rows that
     // fixes both to the identical 1024-row chunk geometry (the ONLY mismatch
-    // vector is a nested/parented bitpack, which classifies != tier_a). The
+    // vector is a nested/parented bitpack, which probes as a different route).
+    // The
     // caller should have dropped such a conjunct (clearing whole-filter
     // coverage); if one leaks through, refusing the batch is never wrong.
-    if (plan_selection_tier(*table.columns[selected[p.column_a]].plan_tree) !=
-          sc::output_tier::tier_a ||
-        plan_selection_tier(*table.columns[selected[p.column_b]].plan_tree) !=
-          sc::output_tier::tier_a)
+    if (!probe_column(*table.columns[selected[p.column_a]].plan_tree).can_produce_mask() ||
+        !probe_column(*table.columns[selected[p.column_b]].plan_tree).can_produce_mask())
       return refuse("pair column not a bitpack root (chunk-geometry mismatch class)");
   }
   for (auto const& b : request.bool8_filters) {
@@ -577,7 +571,7 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
     if (b.equals_any.empty()) return refuse("bool8 directive with empty equals_any");
     // The BOOL8 source rides the shipped dict-code pushdown: dictionary-rooted
     // plans only (the generic fallback would full-decode + compare — no win).
-    if (!plan_supports_predicate_decode(*table.columns[selected[b.column]].plan_tree))
+    if (!probe_column(*table.columns[selected[b.column]].plan_tree).can_answer_equality)
       return refuse("bool8 filter column plan not dictionary-rooted");
   }
   for (size_t mi = 0; mi < k_member; ++mi) {  // only the kept (capped) prefix
@@ -591,7 +585,7 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
   // A column answered off a dictionary delivers gather(bool8_fullwidth,
   // row_indices) — the compacted BOOL8 answer at the slot, no value decode, no
   // string re-compare downstream. These slots bypass the tier check below
-  // (delivery is tier-independent) and are EXCLUDED from the tier_b selectivity
+  // (delivery is route-independent) and are EXCLUDED from the `full` selectivity
   // regime (a 1 B/row gather is cheap, not a full decode plus gather).
   std::vector<char> is_bool8_slot(selected.size(), 0);
   std::vector<int> bool8_of_slot(selected.size(), -1);
@@ -602,65 +596,34 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
     bool8_of_slot[request.bool8_filters[b].column] = static_cast<int>(b);
   }
 
-  // Static check, zero-cost: compacted tags (tier_a / tier_a_delta /
-  // tier_dict_gather) must match the plan classifier; tier_b outputs are
-  // ADMITTED and take the wave-2 full-decode + survivor-gather path, with their
-  // economics enforced once the survivor count is known (a full-width decode
-  // plus gather costs about the unfiltered path, so only low-selectivity
-  // batches pay off; measured losses at high selectivity: q1 +43.5%, q5 +6.2%).
-  // Range-filter source columns are exempt from the tag check (probed
-  // bitpack-rooted above) and forced tier_a; dictionary-answered sources get no
-  // exemption — they carry their own tier.
-  std::vector<sc::output_tier> tiers(request.tiers.begin(), request.tiers.end());
+  // Static check, zero-cost: a requested compacted route must match the plan's
+  // own; `full` is admitted for anything and takes the wave-2 full-decode +
+  // survivor-gather path, with its economics enforced once the survivor count
+  // is known (a full-width decode plus gather costs about the unfiltered path,
+  // so only low-selectivity batches pay off; measured losses at high
+  // selectivity: q1 +43.5%, q5 +6.2%). Range-filter source columns are exempt
+  // from the check (probed bitpack-rooted above) and forced to bitpack_mask;
+  // dictionary-answered sources get no exemption — they carry their own
+  // route.
+  std::vector<sc::decode_route> routes(request.routes.begin(), request.routes.end());
   for (auto const& f : request.filters)
-    tiers[f.column] = sc::output_tier::tier_a;
+    routes[f.column] = sc::decode_route::bitpack_mask;
   for (auto const& p : request.pair_filters) {
-    // Pair-source columns are classifier-verified bitpack roots (above) —
-    // same exemption as range sources.
-    tiers[p.column_a] = sc::output_tier::tier_a;
-    tiers[p.column_b] = sc::output_tier::tier_a;
+    // Pair-source columns are probe-verified bitpack roots (above) — same
+    // exemption as range sources.
+    routes[p.column_a] = sc::decode_route::bitpack_mask;
+    routes[p.column_b] = sc::decode_route::bitpack_mask;
   }
   for (size_t i = 0; i < selected.size(); ++i) {
-    if (is_bool8_slot[i]) continue;  // dual delivery: slot output is the compacted BOOL8
-    switch (tiers[i]) {
-      case sc::output_tier::tier_a:
-        if (plan_selection_tier(*table.columns[selected[i]].plan_tree) != sc::output_tier::tier_a)
-          return refuse("tier_a-tagged output is not bitpack-rooted (would need tier_b)");
-        break;
-      case sc::output_tier::tier_dict_gather:
-        // The codes decode under the mask and only the surviving keys are
-        // gathered, sized from the survivor count. Verify against the
-        // classifier.
-        if (plan_selection_tier(*table.columns[selected[i]].plan_tree) !=
-            sc::output_tier::tier_dict_gather)
-          return refuse(
-            "tier_dict_gather-tagged output is not a dictionary plan with bitpack codes");
-        break;
-      case sc::output_tier::tier_a_delta:
-        // delta->bitpack roots decode compacted through the same launcher
-        // wave 2 already calls.
-        if (plan_selection_tier(*table.columns[selected[i]].plan_tree) !=
-            sc::output_tier::tier_a_delta)
-          return refuse("tier_a_delta-tagged output is not a delta->bitpack root");
-        break;
-      case sc::output_tier::tier_str_split:
-        // The masked str_split route (str_compact). Until the classifier
-        // reports tier_str_split (it flips together with the umbrella probe
-        // when this enum value is consumed end to end), any such tag refuses —
-        // safe.
-        if (plan_selection_tier(*table.columns[selected[i]].plan_tree) !=
-            sc::output_tier::tier_str_split)
-          return refuse("tier_str_split-tagged output is not str_split-decodable");
-        break;
-      case sc::output_tier::tier_b:
-        // tier_b outputs are ADMITTED — they take the wave-2 full-decode +
-        // survivor-gather path (mask->indices + event fence). Economics are
-        // enforced once the count is known: the batch proceeds only at
-        // sel <= SIRIUS_EXP_FUSED_SCAN_TIERB_MAX_SEL, else compaction is given
-        // up. No probe needed: every plan can full-decode (the gather guards
-        // null-masked columns with a loud error, never corruption).
-        break;
-      default: return refuse("unknown output tier");
+    if (is_bool8_slot[i]) continue;  // the slot's output is the compacted BOOL8 answer
+    // `full` is always available — every plan decodes full width, and the
+    // gather guards null-masked columns with a loud error rather than
+    // corrupting. Any other requested route must be the one this plan
+    // supports; one probe answers that, so a route and a capability cannot
+    // disagree.
+    if (routes[i] == sc::decode_route::full) { continue; }
+    if (routes[i] != probe_column(*table.columns[selected[i]].plan_tree).compact_route) {
+      return refuse("requested decode route does not match the column's plan shape");
     }
   }
 
@@ -827,35 +790,35 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
     per_filter.clear();
 
     // Selectivity guard, now that the survivor count is known; two regimes:
-    //  * tier_b outputs present: proceed only at sel <= the tier_b threshold
+    //  * `full` outputs present: proceed only at sel <= the full-route threshold
     //    (default 0.10) — a full decode plus gather costs about the unfiltered
     //    path, so only a near-empty survivor set pays for the compacted batch.
-    //  * no tier_b: the 0.35 write-skip threshold (the mask walk costs about
-    //    the plain decode at sel .5) covering tier_a / tier_a_delta AND
-    //    tier_str_split (whose char-gather savings are dictionary-like in shape
-    //    but weak at ~1-char widths — deliberately NOT exempt until
-    //    measurements say otherwise), with only a tier_dict_gather output
+    //  * no `full`: the 0.35 write-skip threshold (the mask walk costs about
+    //    the plain decode at sel .5) covering bitpack_mask / delta_mask AND
+    //    str_split (whose char-gather savings are dictionary-like in shape but
+    //    weak at ~1-char widths — deliberately NOT exempt until measurements
+    //    say otherwise), with only a dict_codes output
     //    exempting the batch (it wins 2.1-2.6x at ALL selectivities — the
     //    string-materialization savings are survivor-count-independent).
     // Both regimes give up through the mid-flight machinery below, reporting
     // declined_unselective so the caller can remember it for the rest of the
     // scan (sync, drop masks, ordinary decode; batch NOT tagged ROW_FILTERED).
     bool any_dict_gather = false;
-    bool any_tier_b      = false;
-    for (size_t i = 0; i < tiers.size(); ++i) {
+    bool any_full        = false;
+    for (size_t i = 0; i < routes.size(); ++i) {
       if (is_bool8_slot[i])
         continue;  // dictionary-answered slots: a 1 B/row gather, excluded
-                   // from the tier_b regime
-      any_dict_gather |= tiers[i] == sc::output_tier::tier_dict_gather;
-      any_tier_b |= tiers[i] == sc::output_tier::tier_b;
+                   // from the full-route regime
+      any_dict_gather |= routes[i] == sc::decode_route::dict_codes;
+      any_full |= routes[i] == sc::decode_route::full;
     }
     double const sel_frac = static_cast<double>(sel.survivor_count) / static_cast<double>(num_rows);
-    bool const give_up    = any_tier_b ? sel_frac > tier_b_max_selectivity()
-                                       : (sel_frac > max_selectivity() && !any_dict_gather);
+    bool const give_up    = any_full ? sel_frac > tier_b_max_selectivity()
+                                     : (sel_frac > max_selectivity() && !any_dict_gather);
     if (give_up) {
-      double const threshold = any_tier_b ? tier_b_max_selectivity() : max_selectivity();
+      double const threshold = any_full ? tier_b_max_selectivity() : max_selectivity();
       char const* env_name =
-        any_tier_b ? "SIRIUS_EXP_FUSED_SCAN_TIERB_MAX_SEL" : "SIRIUS_EXP_FUSED_SCAN_MAX_SEL";
+        any_full ? "SIRIUS_EXP_FUSED_SCAN_TIERB_MAX_SEL" : "SIRIUS_EXP_FUSED_SCAN_MAX_SEL";
       if (decode_diag_enabled()) {
         std::fprintf(stderr,
                      "simpatico: filtered decode gave compaction up: sel=%.4f > %.4f (%s, "
@@ -871,14 +834,14 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
                        std::to_string(threshold));
     }
 
-    // Per-batch enumeration pick for tier_a bitpack outputs: walk the survivor
-    // index list below the crossover, walk the mask bits above it. tier_a_delta
-    // always walks the mask (the index walk rejects delta roots at render); a
-    // dictionary gather is unchanged.
-    bool any_tier_a = false;
-    for (auto const t : tiers)
-      any_tier_a |= t == sc::output_tier::tier_a;
-    bool const index_walk_pick = any_tier_a && sel_frac <= index_walk_max_selectivity();
+    // Per-batch enumeration pick for bitpack_mask outputs: walk the survivor
+    // index list below the crossover, walk the mask bits above it. delta_mask
+    // always walks the mask (the index walk rejects delta roots at render); the
+    // dictionary route is unchanged.
+    bool any_bitpack_mask = false;
+    for (auto const t : routes)
+      any_bitpack_mask |= t == sc::decode_route::bitpack_mask;
+    bool const index_walk_pick = any_bitpack_mask && sel_frac <= index_walk_max_selectivity();
     if (decode_diag_enabled()) {
       std::fprintf(stderr,
                    "simpatico: filtered decode row enumeration: %s (sel=%.4f, max=%.4f)\n",
@@ -891,11 +854,11 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
     // work serializes behind it on s0; the other streams run free). Built ONCE
     // per batch and SHARED by every consumer: the full-width gathers and the
     // index-list decodes (the same int32 buffer).
-    result.tiers         = tiers;
+    result.routes        = routes;
     bool const any_bool8 = k_bool8 > 0;  // dual-delivery gathers need the indices too
     cudf::column_view survivor_indices{
       cudf::data_type{cudf::type_id::INT32}, 0, nullptr, nullptr, 0};
-    if ((any_tier_b || index_walk_pick || any_bool8) && sel.survivor_count > 0) {
+    if ((any_full || index_walk_pick || any_bool8) && sel.survivor_count > 0) {
       result.row_indices = rmm::device_buffer(
         static_cast<std::size_t>(sel.survivor_count) * sizeof(std::int32_t), s0, mr);
       sc::mask_to_row_indices(sel, static_cast<std::int32_t*>(result.row_indices.data()), s0);
@@ -950,21 +913,19 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
       dsel.mask             = &sel;
       dsel.survivor_count   = sel.survivor_count;
       dsel.survivor_indices = survivor_indices;
-      // Route per tier: compact_capable = in-kernel mask consumption (bitpack
-      // and delta roots alike); dict_compact = the dictionary arm (codes under
-      // the mask + survivor-only key gather). Mutually exclusive by the
-      // decode_selection contract; tier_b keeps both false (gather path).
-      dsel.compact_capable = result.tiers[i] == sc::output_tier::tier_a ||
-                             result.tiers[i] == sc::output_tier::tier_a_delta;
-      dsel.dict_compact = result.tiers[i] == sc::output_tier::tier_dict_gather;
-      dsel.str_compact  = result.tiers[i] == sc::output_tier::tier_str_split;
-      // Below the crossover, tier_a bitpack roots decode from the survivor
+      // One route value, so the modes cannot contradict each other: the
+      // bitpack/delta roots consume the mask in-kernel, the dictionary route
+      // decodes codes under the mask and gathers surviving keys, and `full`
+      // takes the gather path.
+      dsel.route = result.routes[i];
+      // Below the crossover, bitpack roots decode from the survivor
       // index list (populated above whenever index_walk_pick, per the
       // decode_selection contract); the dispatch silently keeps the mask walk
       // on any anomaly, delta roots ignore it, a dictionary gather is
       // unchanged.
-      dsel.prefer_index_decode =
-        index_walk_pick && result.tiers[i] == sc::output_tier::tier_a && sel.survivor_count > 0;
+      dsel.enumerate_by_index = index_walk_pick &&
+                                result.routes[i] == sc::decode_route::bitpack_mask &&
+                                sel.survivor_count > 0;
       std::string err;
       auto out = decompress_column(*col.plan_tree, stream, mr, &err, nullptr, &dsel);
       if (!out) throw plan_error(err.empty() ? "filtered decode: decompress failed" : err);
@@ -1169,13 +1130,6 @@ std::unique_ptr<cudf::table> decompress(const compressed_table& table,
   return decompress_columns_parallel(table, selected_columns, predicates, pool, mr);
 }
 
-bool column_supports_predicate_decode(const compressed_table& table, std::size_t column_index)
-{
-  if (column_index >= table.columns.size()) { return false; }
-  auto const& tree = table.columns[column_index].plan_tree;
-  return tree && plan_supports_predicate_decode(*tree);
-}
-
 std::vector<std::unique_ptr<cudf::column>> decompress_scan_filter(
   const compressed_table& table,
   std::span<const std::size_t> selected_columns,
@@ -1189,17 +1143,17 @@ std::vector<std::unique_ptr<cudf::column>> decompress_scan_filter(
   if (auto cols = try_decompress_fused(table, selected_columns, request, result, pool, mr)) {
     if (decode_diag_enabled()) {
       int n_a = 0, n_delta = 0, n_dict = 0, n_str_split = 0, n_b = 0;
-      for (auto const t : result.tiers) {
-        n_a += t == sirius::codegen::output_tier::tier_a;
-        n_delta += t == sirius::codegen::output_tier::tier_a_delta;
-        n_dict += t == sirius::codegen::output_tier::tier_dict_gather;
-        n_str_split += t == sirius::codegen::output_tier::tier_str_split;
-        n_b += t == sirius::codegen::output_tier::tier_b;
+      for (auto const t : result.routes) {
+        n_a += t == sirius::codegen::decode_route::bitpack_mask;
+        n_delta += t == sirius::codegen::decode_route::delta_mask;
+        n_dict += t == sirius::codegen::decode_route::dict_codes;
+        n_str_split += t == sirius::codegen::decode_route::str_split;
+        n_b += t == sirius::codegen::decode_route::full;
       }
       std::fprintf(
         stderr,
         "simpatico: filtered decode applied: survivors=%lld/%lld "
-        "tiers a=%d delta=%d dict=%d str_split=%d b=%d sources=%zu\n",
+        "routes bitpack=%d delta=%d dict=%d str_split=%d full=%d sources=%zu\n",
         static_cast<long long>(result.survivor_count),
         static_cast<long long>(result.num_rows),
         n_a,

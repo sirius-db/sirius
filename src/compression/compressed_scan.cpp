@@ -69,29 +69,21 @@ simpatico::stream_pool& decode_pool()
 // Per-chunk capability probe
 //===----------------------------------------------------------------------===//
 
-/// What one column of a chunk can contribute to a filtered decode.
-///
-/// @c shape defers to @c simpatico::plan_selection_tier — the classifier that
-/// lives next to the decode implementation — so a newly implemented decode
-/// shape lights up here the moment it lands, with no plan-shape walk of our own
-/// to drift from it.
+/// What one column of a chunk can contribute to a filtered decode: the
+/// decoder's own probe plus the one thing only this layer knows — whether the
+/// dtype is comparable at all.
 struct column_capability {
   /// The dtype decodes into a lane the row-selecting kernels can compare as a
   /// signed 64-bit integer. uint64 is excluded: its upper half would misorder
   /// under a signed compare.
   bool comparable_lane = false;
-  /// This build can decode the column straight into compacted (surviving-rows
-  /// only) output.
-  bool decodes_compacted = false;
-  /// Which decode shape the column's plan falls into.
-  sirius::codegen::output_tier shape = sirius::codegen::output_tier::tier_b;
+  simpatico::column_decode_caps decode;
 
   /// True iff the column can evaluate a range or a column-vs-column comparison
-  /// while it decodes: the row-selecting kernels render bitpack-leaf roots
-  /// only, so a compacted decode is necessary but not sufficient.
+  /// while it decodes.
   [[nodiscard]] bool can_select_rows() const noexcept
   {
-    return comparable_lane && decodes_compacted && shape == sirius::codegen::output_tier::tier_a;
+    return comparable_lane && decode.can_produce_mask();
   }
 };
 
@@ -114,9 +106,7 @@ column_capability probe_column(simpatico::compressed_table const& table, std::si
     default: break;
   }
   auto const* tree = column.plan_tree.get();
-  if (tree == nullptr) { return capability; }
-  capability.shape             = simpatico::plan_selection_tier(*tree);
-  capability.decodes_compacted = simpatico::plan_supports_selection_decode(*tree);
+  if (tree != nullptr) { capability.decode = simpatico::probe_column(*tree); }
   return capability;
 }
 
@@ -142,9 +132,8 @@ struct chunk_decode_plan {
   /// The decode carries EVERY row-restricting conjunct of the scan's filter,
   /// so a batch it compacts needs no further filtering.
   bool covers_whole_filter = false;
-  std::vector<range_slot> ranges;                    ///< parallel to selected columns
-  std::vector<sirius::codegen::output_tier> shapes;  ///< parallel to selected columns
-  std::vector<std::uint8_t> compacts;                ///< parallel to shapes; 0/1
+  std::vector<range_slot> ranges;                     ///< parallel to selected columns
+  std::vector<sirius::codegen::decode_route> routes;  ///< parallel to selected columns
   /// Column-vs-column conjuncts both of whose sides can select rows. A kept
   /// pair CONSUMES its sides' standalone range participation: the pair kernel
   /// folds each side's bounds in, so one kernel does both.
@@ -186,8 +175,7 @@ chunk_decode_plan plan_decode(simpatico::compressed_table const& table,
 
   auto const count = selected_columns.size();
   plan.ranges.resize(count);
-  plan.shapes.assign(count, sirius::codegen::output_tier::tier_b);
-  plan.compacts.assign(count, 0);
+  plan.routes.assign(count, sirius::codegen::decode_route::full);
   for (std::size_t i = 0; i < request.columns.size(); ++i) {
     if (auto const& range = request.columns[i].range) {
       plan.ranges[i].requested = true;
@@ -202,31 +190,28 @@ chunk_decode_plan plan_decode(simpatico::compressed_table const& table,
     auto const capability = probe_column(table, selected_columns[i]);
     auto const physical   = selected_columns[i];
     SIRIUS_DECODE_DIAG(
-      "[decode-filter] plan col[{}] physical={} dtype={} shape={} comparable_lane={} "
-      "compacts={} range_requested={} range=[{}, {}]",
+      "[decode-filter] plan col[{}] physical={} dtype={} route={} comparable_lane={} "
+      "range_requested={} range=[{}, {}]",
       i,
       physical,
       physical < table.columns.size() ? type_id_to_name(table.columns[physical].dtype)
                                       : "OUT-OF-RANGE",
-      static_cast<int>(capability.shape),
+      static_cast<int>(capability.decode.compact_route),
       capability.comparable_lane,
-      capability.decodes_compacted,
       plan.ranges[i].requested,
       plan.ranges[i].bounds.lo,
       plan.ranges[i].bounds.hi);
-    plan.shapes[i]   = capability.shape;
-    plan.compacts[i] = capability.decodes_compacted ? 1 : 0;
-    if (capability.decodes_compacted) { ++compactable; }
+    plan.routes[i] = capability.decode.compact_route;
+    if (capability.decode.compact_route != sirius::codegen::decode_route::full) { ++compactable; }
     if (!plan.ranges[i].requested) { continue; }
     if (!capability.can_select_rows()) {
       SIRIUS_DECODE_DIAG(
         "[decode-filter] plan: DROPPING range conjunct on selected pos {} (physical {}) — the "
-        "column cannot evaluate it while decoding (shape={} comparable_lane={} compacts={})",
+        "column cannot evaluate it while decoding (route={} comparable_lane={})",
         i,
         physical,
-        static_cast<int>(capability.shape),
-        capability.comparable_lane,
-        capability.decodes_compacted);
+        static_cast<int>(capability.decode.compact_route),
+        capability.comparable_lane);
       plan.ranges[i].requested = false;
       dropped_conjunct         = true;
       continue;
@@ -361,14 +346,13 @@ std::unique_ptr<cudf::table> decode_with_filters(simpatico::compressed_table con
   }
 
   sirius::codegen::scan_filter_request wave_request;
-  wave_request.tiers.reserve(selected.size());
+  wave_request.routes.reserve(selected.size());
   for (std::size_t i = 0; i < selected.size(); ++i) {
     auto const& slot = plan.ranges[i];
     if (slot.requested && slot.selects) {
       wave_request.filters.push_back({i, {slot.bounds.lo, slot.bounds.hi}});
     }
-    wave_request.tiers.push_back(plan.compacts[i] != 0 ? plan.shapes[i]
-                                                       : sirius::codegen::output_tier::tier_b);
+    wave_request.routes.push_back(plan.routes[i]);
   }
   // One kernel per pair, with each side's own bounds folded in (a side without
   // bounds stays full-domain). Planning already cleared those sides' standalone
@@ -508,8 +492,7 @@ std::shared_ptr<const compressed_scan> compressed_scan::for_chunk(
   for (std::size_t i = 0; i < narrowed.columns.size(); ++i) {
     auto& column = narrowed.columns[i];
     if (!column.equals_any.empty() &&
-        (i >= selected.size() ||
-         !simpatico::column_supports_predicate_decode(chunk, selected[i]))) {
+        (i >= selected.size() || !probe_column(chunk, selected[i]).decode.can_answer_equality)) {
       column.equals_any.clear();
     }
     any_asked = any_asked || !column.empty();
@@ -539,9 +522,9 @@ compressed_scan::compaction_forecast compressed_scan::forecast_compaction(
     if (index >= chunk.columns.size()) { return forecast; }
     auto const& plan_tree = chunk.columns[index].plan_tree;
     if (!plan_tree) { return forecast; }
-    if (!simpatico::plan_supports_selection_decode(*plan_tree)) { return forecast; }
-    any_unbounded = any_unbounded || simpatico::plan_selection_tier(*plan_tree) ==
-                                       sirius::codegen::output_tier::tier_dict_gather;
+    auto const route = simpatico::probe_column(*plan_tree).compact_route;
+    if (route == sirius::codegen::decode_route::full) { return forecast; }
+    any_unbounded = any_unbounded || route == sirius::codegen::decode_route::dict_codes;
   }
   forecast.compacts          = true;
   forecast.survivors_bounded = !any_unbounded;

@@ -136,7 +136,7 @@ class DecodeWalk {
   [[nodiscard]] bool predicate_applies_to(NodeId nid) const;
 
   /// True when @p nid is THE node whose fused decode consumes the pending
-  /// selection: the (0,0)-producing bitpack region (Tier A), or — for the
+  /// selection: the (0,0)-producing bitpack region, or — for the
   /// dictionary-gather mode — the bitpack region producing the dictionary's `indices`
   /// value. Inner fused subtrees (entropy tails, dictionary keys_offsets, ...)
   /// hold metadata that is NOT row-aligned with the column and must decode
@@ -591,7 +591,7 @@ std::unique_ptr<cudf::column> decode_fused_subtree_impl(PlanTree const& tree,
   auto& built                     = region->built;
   auto& labeled                   = region->labeled;
 
-  // Fused scan-filter Tier A: the combine + CNT wave already fixed the
+  // Compacted route: the combine + CNT wave already fixed the
   // survivor count, so the compacted output is allocated count-first instead
   // of full width (the whole point of the mask-consuming decode).
   const bool masked = sel != nullptr && sel->active();
@@ -632,8 +632,9 @@ std::unique_ptr<cudf::column> decode_fused_subtree_impl(PlanTree const& tree,
     // silently keeps the mask walk — the pick is an optimization and the mask walk is always
     // renderable here.
     bool const use_index_decode =
-      sel->prefer_index_decode && !sel->dict_compact && sel->survivor_count > 0 &&
-      root_nid < tree.nodes.size() && tree.nodes[root_nid].op == "bitpack" &&
+      sel->enumerate_by_index && sel->route == sirius::codegen::decode_route::bitpack_mask &&
+      sel->survivor_count > 0 && root_nid < tree.nodes.size() &&
+      tree.nodes[root_nid].op == "bitpack" &&
       static_cast<std::int64_t>(sel->survivor_indices.size()) == sel->survivor_count;
     bool const masked_ok =
       use_index_decode
@@ -812,7 +813,7 @@ cudf::column const* DecodeWalk::materialize(NodeId nid)
   if (is_codegen_compressor(node.op)) {
     // Fused op (bitpack/delta/rle/for/zigzag): one JIT kernel inverts the whole
     // region; tail slots resolve via materialize. Only the region producing
-    // the column's final value may consume a Tier-A selection.
+    // the column's final value may consume the selection.
     col = materialize_fused_node(nid, selection_applies_to(nid) ? sel : nullptr);
   } else if (node.rep) {
     col = decompress_standalone_representation(node.rep.get(), stream, mr, error_out);
@@ -899,10 +900,10 @@ DecodeWalk::DecodeWalk(PlanTree const& tree,
     for (NodeId nid = 1; nid < tree.nodes.size(); ++nid) {
       auto const& sources = tree.nodes[nid].input_sources;
       if (sources.empty() || !(sources.front() == ValueId{0, 0})) { continue; }
-      if (this->sel->compact_capable) {
-        sel_target = nid;  // Tier A: the bitpack root region itself.
+      if (this->sel->route != sirius::codegen::decode_route::dict_codes) {
+        sel_target = nid;  // the root region itself.
       } else {
-        // the dictionary gather: the consumer is the bitpack region producing the
+        // The dictionary route's consumer is the bitpack region producing the
         // dictionary's `indices` value, never the dictionary node itself.
         for (auto const& e : tree.nodes[nid].children) {
           if (e.channel == "indices") {
@@ -998,8 +999,8 @@ std::unique_ptr<cudf::column> decode_fused_subtree(PlanTree const& tree,
 }
 
 namespace {
-// Defined alongside plan_supports_selection_decode below; used by the
-// compact_capable gate and the dictionary fast path in decompress_column.
+// Defined alongside probe_column below; used by decompress_column's route
+// checks and the dictionary fast path.
 NodeId root_value_producer(PlanTree const& tree);
 bool mask_consume_selection_root(PlanTree const& tree);
 
@@ -1119,7 +1120,7 @@ std::unique_ptr<cudf::column> try_dict_gather_fast_path(PlanTree const& tree,
 
 // Masked str_split decode for `str_split -> {offsets: bitpack, chars: raw}`
 // plans (l_shipmode shape; deep offsets chains and entropy-coded chars stay
-// tier_b via the probe). Variable-width pattern:
+// on the `full` route via the probe). Variable-width pattern:
 //   phase 1 (launch_decode_fused_tree_str_split_meta): masked offsets-
 //     subtree decode emitting per-survivor byte lengths + int64 source char
 //     starts, compacted by rank;
@@ -1275,57 +1276,36 @@ std::unique_ptr<cudf::column> decompress_column(PlanTree const& tree,
     return nullptr;
   }
 
+  namespace sc = sirius::codegen;
+
   bool const selecting    = sel != nullptr && sel->active();
   bool const substituting = pred != nullptr && pred->active();
-  if (selecting && substituting && (sel->compact_capable || sel->str_compact)) {
-    // Dual delivery (a survivor-sized BOOL8 at a mask-source slot) composes
-    // only where the predicate has a compacted meaning: the dict route
-    // (predicate answered over the compacted codes) and the plain Tier-B
-    // route (full-width BOOL8, then the survivor gather). A numeric
-    // mask_consume region or the masked str_split route with a string-equality
-    // directive is a scheduling bug.
+  // The requested route must be the one this plan actually supports: a
+  // mismatch would silently decode full width where the caller sized the
+  // output from the survivor count.
+  if (selecting && sel->route != probe_column(tree).compact_route) {
     if (error_out) {
-      *error_out =
-        "decompress: decode_predicate composes only with dict_compact or Tier-B "
-        "selection";
+      *error_out = "decompress: requested decode route does not match the plan's shape";
     }
     return nullptr;
   }
-  if (selecting && (static_cast<int>(sel->compact_capable) + static_cast<int>(sel->dict_compact) +
-                    static_cast<int>(sel->str_compact)) > 1) {
-    if (error_out) { *error_out = "decompress: compacted selection modes are mutually exclusive"; }
-    return nullptr;
-  }
-  if (selecting && sel->compact_capable && !mask_consume_selection_root(tree)) {
-    // compact_capable means mask_consume on the ROOT region specifically —
-    // bitpack (tier_a) or delta->bitpack (tier_a_delta). The umbrella
-    // plan_supports_selection_decode also admits dictionary plans with bitpack codes, which must be
-    // requested via dict_compact. Anything else would silently decode full
-    // width while the caller expects survivor_count rows — refuse instead
-    // (never corrupt).
+  if (selecting && substituting && sel->route != sc::decode_route::dict_codes &&
+      sel->route != sc::decode_route::full) {
+    // A predicate answer at a mask-source slot composes only where the
+    // predicate has a compacted meaning: the dictionary route answers it over
+    // the compacted codes, and `full` produces full-width BOOL8 that the
+    // survivor gather compacts. A write-skipping route never materializes the
+    // value to compare, so asking for both is a scheduling bug.
     if (error_out) {
-      *error_out =
-        "decompress: plan root renders no mask_consume variant; compacted decode unavailable";
+      *error_out = "decompress: decode_predicate composes only with the dict_codes or full route";
     }
     return nullptr;
   }
-  if (selecting && sel->dict_compact && !plan_supports_dict_selection_decode(tree)) {
-    // Same hazard for the dict route: anything but a non-null dictionary root
-    // with bitpack codes would come back full width.
-    if (error_out) {
-      *error_out = "decompress: plan does not support the dictionary-gather compacted decode";
-    }
-    return nullptr;
-  }
-  if (selecting && sel->str_compact) {
-    if (!plan_supports_str_selection_decode(tree)) {
-      if (error_out) { *error_out = "decompress: plan does not support masked str_split decode"; }
-      return nullptr;
-    }
-    // masked str_split has NO generic fallback: compacted offsets cannot feed the ordinary
-    // str_split reconstruct, so a declined dedicated route must error (the
-    // orchestrator re-runs the batch unfiltered) rather than fall through to a
-    // full-width walk the compacted() belt below would reject anyway.
+  if (selecting && sel->route == sc::decode_route::str_split) {
+    // str_split has NO generic fallback: compacted offsets cannot feed the
+    // ordinary str_split reconstruct, so a declined dedicated route must error
+    // (the orchestrator re-runs the batch unfiltered) rather than fall through
+    // to a full-width walk the compacted() belt below would reject anyway.
     auto col = try_str_split_path(tree, *sel, stream, mr, error_out);
     if (!col) {
       if (error_out && error_out->empty()) {
@@ -1344,7 +1324,7 @@ std::unique_ptr<cudf::column> decompress_column(PlanTree const& tree,
   }
 
   std::unique_ptr<cudf::column> col;
-  if (selecting && sel->dict_compact && !substituting) {
+  if (selecting && sel->route == sc::decode_route::dict_codes && !substituting) {
     // Constant-width fast path: the dictionary char-emit kernel replaces the
     // compacted-codes intermediate + cudf key gather with one launch. A
     // nullptr (not applicable / launch declined) falls through to the general
@@ -1353,17 +1333,17 @@ std::unique_ptr<cudf::column> decompress_column(PlanTree const& tree,
     col = try_dict_gather_fast_path(tree, *sel, stream, mr);
   }
   if (!col) {
-    // Dual delivery composes here without special cases: the dict route
-    // reconstructs its rep over the compacted codes, so the existing
-    // predicate answer (decompress_predicate — or run()'s generic
-    // decode-and-compare fallback) yields a SURVIVOR-SIZED BOOL8; the plain
-    // Tier-B route produces full-width BOOL8 and the gather below compacts it.
+    // A predicate answer composes here without special cases: the dictionary
+    // route reconstructs its rep over the compacted codes, so the existing
+    // answer (decompress_predicate — or run()'s generic decode-and-compare
+    // fallback) is already SURVIVOR-SIZED BOOL8; the `full` route produces
+    // full-width BOOL8 and the gather below compacts it.
     DecodeWalk walk{tree, stream, mr, error_out, pred, sel};
     col = walk.run();
   }
 
   if (col && selecting && substituting && col->type().id() != cudf::type_id::BOOL8) {
-    // Dual-delivery belt: a predicate directive promises "BOOL8 result" to the
+    // Belt: a predicate directive promises "BOOL8 result" to the
     // filter-expression rewrite; anything else must fail loudly here rather
     // than let a strings column meet a bare boolean reference downstream.
     if (error_out) {
@@ -1374,9 +1354,9 @@ std::unique_ptr<cudf::column> decompress_column(PlanTree const& tree,
 
   if (col && selecting && sel->compacted()) {
     // Belt and braces for the same hazard: whatever comes back from a
-    // compacted-mode request must already be survivor-sized (Tier A directly
-    // from the mask walk; the dictionary gather via the key gather over the compacted codes) and —
-    // per the null policy — carry no null mask.
+    // compacted-route request must already be survivor-sized (directly from
+    // the mask or index walk; the dictionary route via the key gather over the
+    // compacted codes) and — per the null policy — carry no null mask.
     if (static_cast<std::int64_t>(col->size()) != sel->survivor_count) {
       if (error_out) {
         *error_out = "decompress: compacted decode returned a non-survivor-sized column";
@@ -1391,9 +1371,10 @@ std::unique_ptr<cudf::column> decompress_column(PlanTree const& tree,
     }
   }
 
-  // Tier B: the walk decoded the column full width exactly as today; compact it to the batch's
-  // survivor rows with one gather over the shared mask→indices buffer. (The compacted modes — Tier
-  // A and the dictionary gather — came back survivor-sized from the masked decode and skip this.)
+  // The `full` route: the walk decoded the column full width exactly as today;
+  // compact it to the batch's survivor rows with one gather over the shared
+  // mask→indices buffer. (Every other route came back survivor-sized from the
+  // masked decode and skips this.)
   if (col && selecting && !sel->compacted()) {
     if (col->null_count() != 0) {
       // Selection targets NOT NULL columns only; refuse rather than risk a
@@ -1424,7 +1405,9 @@ std::unique_ptr<cudf::column> decompress_column(PlanTree const& tree,
   return col;
 }
 
-bool plan_supports_predicate_decode(PlanTree const& tree)
+namespace {
+
+bool dictionary_value_root(PlanTree const& tree)
 {
   if (tree.nodes.empty() || tree.nodes[0].op != "input") { return false; }
   // The producer of the column's final value is whichever node consumes (0,0).
@@ -1437,8 +1420,6 @@ bool plan_supports_predicate_decode(PlanTree const& tree)
   }
   return false;
 }
-
-namespace {
 
 // The node producing the column's final value: whichever consumes (0,0).
 NodeId root_value_producer(PlanTree const& tree)
@@ -1453,16 +1434,15 @@ NodeId root_value_producer(PlanTree const& tree)
   return static_cast<NodeId>(tree.nodes.size());
 }
 
-// The bitpack Tier-A arm of plan_supports_selection_decode: the column's
-// final value is produced by a bitpack region, so the masked ballot / mask-walk render
-// variants apply to the root region directly.
+// The column's final value is produced by a bitpack region, so the masked
+// ballot / mask-walk render variants apply to the root region directly.
 bool bitpack_selection_root(PlanTree const& tree)
 {
   NodeId const nid = root_value_producer(tree);
   return nid < tree.nodes.size() && tree.nodes[nid].op == "bitpack";
 }
 
-// The tier_a_delta arm: a delta root whose `differences` child is bitpack
+// A delta root whose `differences` child is bitpack
 // (o_orderkey / l_orderkey shape). The mask_consume launcher renders this
 // shape too — the per-chunk prefix-sum reconstruction still runs, only the
 // stores are masked/compacted.
@@ -1478,44 +1458,13 @@ bool delta_selection_root(PlanTree const& tree)
   return false;  // raw-passthrough differences: not a rendered mask_consume shape
 }
 
-// Any root region the mask_consume launcher renders — the
-// admission check for the compact_capable decode mode.
+// Any root region the mask_consume launcher renders.
 bool mask_consume_selection_root(PlanTree const& tree)
 {
   return bitpack_selection_root(tree) || delta_selection_root(tree);
 }
 
-}  // namespace
-
-bool plan_supports_selection_decode(PlanTree const& tree)
-{
-  // Survivor-compactable by ANY masked route: bitpack Tier A / delta
-  // tier_a_delta (mask_consume on the root region) or the dictionary gather (the mask walk on the
-  // dictionary codes + survivor-only key gather). The taxonomy layer keys
-  // compact-capability off this one umbrella probe; per-route dispatch asks
-  // plan_selection_tier / plan_supports_dict_selection_decode.
-  // NOTE for wave-1 callers: mask-producing FILTER columns must be
-  // bitpack — gate filters on `plan_selection_tier(...) == tier_a`.
-  return mask_consume_selection_root(tree) || plan_supports_dict_selection_decode(tree) ||
-         plan_supports_str_selection_decode(tree);
-}
-
-sirius::codegen::output_tier plan_selection_tier(PlanTree const& tree)
-{
-  // Per-tier ground truth for the output-shape switch. The
-  // shapes are mutually exclusive (a plan has exactly one (0,0)-producer).
-  if (bitpack_selection_root(tree)) { return sirius::codegen::output_tier::tier_a; }
-  if (delta_selection_root(tree)) { return sirius::codegen::output_tier::tier_a_delta; }
-  if (plan_supports_dict_selection_decode(tree)) {
-    return sirius::codegen::output_tier::tier_dict_gather;
-  }
-  if (plan_supports_str_selection_decode(tree)) {
-    return sirius::codegen::output_tier::tier_str_split;
-  }
-  return sirius::codegen::output_tier::tier_b;
-}
-
-bool plan_supports_str_selection_decode(PlanTree const& tree)
+bool str_split_selection_root(PlanTree const& tree)
 {
   NodeId const nid = root_value_producer(tree);
   if (nid >= tree.nodes.size() || tree.nodes[nid].op != "str_split") { return false; }
@@ -1562,7 +1511,7 @@ bool plan_supports_str_selection_decode(PlanTree const& tree)
   return chars_ok && offsets_ok;
 }
 
-bool plan_supports_dict_selection_decode(PlanTree const& tree)
+bool dict_codes_selection_root(PlanTree const& tree)
 {
   if (tree.nodes.empty() || tree.nodes[0].op != "input") { return false; }
   for (NodeId nid = 1; nid < tree.nodes.size(); ++nid) {
@@ -1585,6 +1534,27 @@ bool plan_supports_dict_selection_decode(PlanTree const& tree)
     return false;  // indices stored inline (identity) — no fused region to mask
   }
   return false;
+}
+
+}  // namespace
+
+column_decode_caps probe_column(PlanTree const& tree)
+{
+  namespace sc = sirius::codegen;
+  column_decode_caps caps;
+  // The shapes are mutually exclusive: a plan has exactly one (0,0)-producer,
+  // so the route is a classification, not a set of overlapping flags.
+  if (bitpack_selection_root(tree)) {
+    caps.compact_route = sc::decode_route::bitpack_mask;
+  } else if (delta_selection_root(tree)) {
+    caps.compact_route = sc::decode_route::delta_mask;
+  } else if (dict_codes_selection_root(tree)) {
+    caps.compact_route = sc::decode_route::dict_codes;
+  } else if (str_split_selection_root(tree)) {
+    caps.compact_route = sc::decode_route::str_split;
+  }
+  caps.can_answer_equality = dictionary_value_root(tree);
+  return caps;
 }
 
 bool decompress_column_selection_mask(PlanTree const& tree,
@@ -1732,18 +1702,10 @@ std::unique_ptr<cudf::column> decompress_column_compacted(
   decode_selection sel{};
   sel.mask           = &mask;
   sel.survivor_count = mask.survivor_count;
-  // Dispatch on plan shape: dictionary root with bitpack codes -> the dictionary gather;
-  // str_split-capable str_split root -> masked strings; everything else is requested
-  // as mask_consume Tier A, and decompress_column refuses unsupported roots
-  // there (the specific probes must run first — the umbrella
-  // plan_supports_selection_decode admits every compactable shape).
-  if (plan_supports_dict_selection_decode(tree)) {
-    sel.dict_compact = true;
-  } else if (plan_supports_str_selection_decode(tree)) {
-    sel.str_compact = true;
-  } else {
-    sel.compact_capable = true;
-  }
+  // The plan's own shape decides the route; decompress_column refuses a route
+  // the plan cannot take, so an unsupported root errors rather than silently
+  // decoding full width.
+  sel.route = probe_column(tree).compact_route;
   return decompress_column(tree, stream, mr, error_out, /*pred=*/nullptr, &sel);
 }
 
@@ -1755,11 +1717,11 @@ std::unique_ptr<cudf::table> compact_scan_filter_output(
   std::string* error_out)
 {
   if (!result.applied) {
-    // Classic decode: every column is full width already; just assemble.
+    // Unfiltered decode: every column is full width already; just assemble.
     return std::make_unique<cudf::table>(std::move(columns));
   }
-  if (result.tiers.size() != columns.size()) {
-    if (error_out) *error_out = "compact_scan_filter_output: tiers/columns arity mismatch";
+  if (result.routes.size() != columns.size()) {
+    if (error_out) *error_out = "compact_scan_filter_output: routes/columns arity mismatch";
     return nullptr;
   }
   if (result.survivor_count < 0) {
@@ -1768,8 +1730,8 @@ std::unique_ptr<cudf::table> compact_scan_filter_output(
   }
   auto const survivors = static_cast<cudf::size_type>(result.survivor_count);
 
-  std::vector<std::size_t> tier_b_positions;
-  std::vector<cudf::column_view> tier_b_views;
+  std::vector<std::size_t> full_positions;
+  std::vector<cudf::column_view> full_views;
   for (std::size_t i = 0; i < columns.size(); ++i) {
     if (!columns[i]) {
       if (error_out) *error_out = "compact_scan_filter_output: null column";
@@ -1785,20 +1747,19 @@ std::unique_ptr<cudf::table> compact_scan_filter_output(
       }
       return nullptr;
     }
-    if (result.tiers[i] != sirius::codegen::output_tier::tier_b) {
-      // Any compacted tier (tier_a, the dictionary gather, future variants): the decode
-      // already emitted survivor rows.
+    if (result.routes[i] != sirius::codegen::decode_route::full) {
+      // Any compacted route: the decode already emitted survivor rows.
       if (columns[i]->size() != survivors) {
         if (error_out) {
-          *error_out = "compact_scan_filter_output: compacted-tier column is not survivor-sized";
+          *error_out = "compact_scan_filter_output: compacted-route column is not survivor-sized";
         }
         return nullptr;
       }
       continue;
     }
-    // Tier B arrives in one of two shapes depending on the wave-2 routing:
-    // already survivor-sized (the in-call decode_selection gather compacted it
-    // per column) — pass through; or full width — collected for the single
+    // A `full`-route column arrives in one of two shapes depending on the
+    // wave-2 routing: already survivor-sized (the in-call decode_selection
+    // gather compacted it per column) — pass through; or full width — collected for the single
     // batch-level gather below. When survivors == num_rows the two are
     // indistinguishable, and the ascending all-rows gather is the identity,
     // so passing through is correct either way.
@@ -1806,17 +1767,17 @@ std::unique_ptr<cudf::table> compact_scan_filter_output(
     if (static_cast<std::int64_t>(columns[i]->size()) != result.num_rows) {
       if (error_out) {
         *error_out =
-          "compact_scan_filter_output: Tier-B column is neither full width nor survivor-sized";
+          "compact_scan_filter_output: full-route column is neither full width nor survivor-sized";
       }
       return nullptr;
     }
-    tier_b_positions.push_back(i);
-    tier_b_views.push_back(columns[i]->view());
+    full_positions.push_back(i);
+    full_views.push_back(columns[i]->view());
   }
 
-  if (!tier_b_positions.empty()) {
+  if (!full_positions.empty()) {
     if (survivors == 0) {
-      for (auto const pos : tier_b_positions) {
+      for (auto const pos : full_positions) {
         columns[pos] = cudf::empty_like(columns[pos]->view());
       }
     } else {
@@ -1828,9 +1789,9 @@ std::unique_ptr<cudf::table> compact_scan_filter_output(
       }
       cudf::column_view const gather_map{
         cudf::data_type{cudf::type_id::INT32}, survivors, result.row_indices.data(), nullptr, 0};
-      // ONE gather compacts every Tier-B column of the batch; the indices come
+      // ONE gather compacts every full-width column of the batch; the indices come
       // from the mask→indices kernel and are in-bounds by construction.
-      auto gathered         = cudf::gather(cudf::table_view{tier_b_views},
+      auto gathered         = cudf::gather(cudf::table_view{full_views},
                                    gather_map,
                                    cudf::out_of_bounds_policy::DONT_CHECK,
                                    stream,
@@ -1839,8 +1800,8 @@ std::unique_ptr<cudf::table> compact_scan_filter_output(
       // The full-width sources are replaced (freed) right below; their
       // stream-ordered deallocation is only safe once the gather has read them.
       cudaStreamSynchronize(stream.value());
-      for (std::size_t k = 0; k < tier_b_positions.size(); ++k) {
-        columns[tier_b_positions[k]] = std::move(gathered_columns[k]);
+      for (std::size_t k = 0; k < full_positions.size(); ++k) {
+        columns[full_positions[k]] = std::move(gathered_columns[k]);
       }
     }
   }

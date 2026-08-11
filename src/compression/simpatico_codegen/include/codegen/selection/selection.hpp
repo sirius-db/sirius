@@ -85,48 +85,47 @@ struct range_predicate {
 
 // ── Converter-boundary contract ─────────────────────────────────────────────
 
-// How wave 2 produces one output column.
-//   tier_a       — a bitpack root decoded straight into a compacted
-//                  survivor_count-row column, skipping the writes for rejected
-//                  rows.
-//   tier_b       — full decode + survivor gather (one mask->indices map shared
-//                  by every tier_b column of the batch). Costs about the
-//                  unfiltered path, so it is admitted only at low selectivity:
-//                  after counting, the batch proceeds iff survivors/rows <=
-//                  SIRIUS_EXP_FUSED_SCAN_TIERB_MAX_SEL (default 0.10), else the
-//                  decode gives compaction up (measured losses at high
-//                  selectivity: q1 +43.5%, q5 +6.2%).
-//   tier_a_delta — the same, for a delta->bitpack root.
-//   tier_dict_gather — dictionary strings: the mask consumer decodes codes and
-//                  gathers only the surviving keys, sizing the output from the
-//                  survivor count. Economics differ from the write-skipping
-//                  tiers: it wins 2.1-2.6x at ALL selectivities (it skips the
-//                  full string materialization round trip), so the selectivity
-//                  ceiling does NOT apply to a batch with such an output.
-//   tier_str_split  — str_split strings: masked offsets reconstruction plus a
-//                  survivor-only chars byte-gather. Shaped like the dictionary
-//                  case (skipped char materialization scales with selectivity)
-//                  but WEAKER at ~1-char average widths, so it stays under the
-//                  ordinary selectivity ceiling rather than taking the
-//                  dictionary exemption — move it only if measurements say so.
-// Values 0/1 are stable (shipped); new entries append.
-enum class output_tier : uint8_t {
-  tier_a           = 0,
-  tier_b           = 1,
-  tier_a_delta     = 2,
-  tier_dict_gather = 3,
-  tier_str_split   = 4,
+// How wave 2 produces one output column — the route its plan shape takes.
+//
+//   full        — decode full width, then compact with one `cudf::gather` over
+//                 the shared survivor index map. Costs about the unfiltered
+//                 path, so it is admitted only at low selectivity: once the
+//                 survivor count is known the batch proceeds iff
+//                 survivors/rows <= SIRIUS_EXP_FUSED_SCAN_TIERB_MAX_SEL
+//                 (default 0.10), else the decode gives compaction up
+//                 (measured losses at high selectivity: q1 +43.5%, q5 +6.2%).
+//   bitpack_mask— a bitpack root decoded straight into a compacted
+//                 survivor_count-row column, skipping the writes for rejected
+//                 rows.
+//   delta_mask  — the same, for a delta->bitpack root.
+//   dict_codes  — dictionary strings: the codes decode under the mask and only
+//                 the surviving keys are gathered, sizing the output from the
+//                 survivor count. Economics differ from the write-skipping
+//                 routes: this wins 2.1-2.6x at ALL selectivities (it skips the
+//                 full string materialization round trip), so the selectivity
+//                 ceiling does NOT apply to a batch with such an output.
+//   str_split   — str_split strings: masked offsets reconstruction plus a
+//                 survivor-only chars byte-gather. Shaped like the dictionary
+//                 case (skipped char materialization scales with selectivity)
+//                 but WEAKER at ~1-char average widths, so it stays under the
+//                 ordinary selectivity ceiling rather than taking the
+//                 dictionary exemption — move it only if measurements say so.
+//
+// `full` IS "not compactable", so there is no separate capability flag to keep
+// consistent with the route: the two cannot disagree. Never serialized — the
+// values live only inside one decompress call.
+enum class decode_route : uint8_t {
+  full = 0,
+  bitpack_mask,
+  delta_mask,
+  dict_codes,
+  str_split,
 };
 
-// True for tiers wave 2 decodes compacted in one pass (in-kernel mask consume,
-// the dictionary gather, or the str_split arm). tier_b is NOT in this set — it
-// is admitted separately through the full-decode + survivor-gather path at low
-// selectivity.
-constexpr bool tier_decodes_compacted(output_tier t)
-{
-  return t == output_tier::tier_a || t == output_tier::tier_a_delta ||
-         t == output_tier::tier_dict_gather || t == output_tier::tier_str_split;
-}
+// True for routes wave 2 decodes compacted in one pass. `full` is NOT in this
+// set — it is admitted separately through the full-decode + survivor-gather
+// path at low selectivity.
+constexpr bool route_decodes_compacted(decode_route r) { return r != decode_route::full; }
 
 // One scan conjunct resolved to a decoded-domain range on a bitpack column.
 struct filter_column_directive {
@@ -201,7 +200,7 @@ struct scan_filter_request {
   std::vector<pair_filter_directive> pair_filters;              // column-vs-column conjuncts
   std::vector<bool8_filter_directive> bool8_filters;            // dictionary-answered equalities
   std::vector<membership_filter_directive> membership_filters;  // dynamic probes
-  std::vector<output_tier> tiers;                               // parallel to `selected`
+  std::vector<decode_route> routes;                             // parallel to `selected`
   // Dynamic-filter-set version at request build (0 = static-only). Echoed on
   // the result so a caller that stopped using the filters can reconsider when a
   // later, tighter set arrives.
@@ -233,8 +232,9 @@ struct scan_filter_result {
   uint64_t source_generation = 0;                            // echo of the request
   int64_t num_rows           = 0;                            // pre-filter batch rows
   int64_t survivor_count     = -1;
-  std::vector<output_tier> tiers;    // EFFECTIVE per-output tier (a requested
-                                     // tier_a is demoted to tier_b on probe fail)
+  std::vector<decode_route> routes;  // EFFECTIVE per-output route (a requested
+                                     // compacted route is demoted to `full` on
+                                     // probe fail)
   rmm::device_buffer mask_words;     // uint32 x WordsFor(num_rows) (full chunk strips)
   rmm::device_buffer chunk_offsets;  // uint32 x (ChunksFor(num_rows)+1)
   rmm::device_buffer row_indices;    // int32 x survivor_count (empty when no
