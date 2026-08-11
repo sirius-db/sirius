@@ -159,18 +159,24 @@ std::unique_ptr<operator_data> sirius_physical_projection::execute(const operato
     }
     cudf::table_view out_view(cols);
 
-    // Materialize the mixed output into an owned table (issue #1452). The previous
-    // composite-owned view ({evaluated shared_ptr + input read lock} behind
-    // make_data_batch_from_view) was the one published batch whose buffers bypass both
-    // stream-safety nets: rebind_stream() is a no-op for the owning_table_view alternative,
-    // and the freshly evaluated columns stay deallocation-bound to this task's pooled stream
-    // for the batch's whole downstream lifetime. Owning the columns restores the same
-    // free-stream discipline as every other operator output. The extra copy covers only the
-    // passthrough columns of mixed projections; all-passthrough and all-evaluated projections
-    // keep their zero-copy paths.
-    auto owned_out = std::make_unique<cudf::table>(out_view, stream, mem.get_default_allocator());
-    output_batches.push_back(
-      sirius::make_data_batch(std::move(owned_out), mem, stream, batch_telemetry()));
+    // Charge the estimated bytes of the referenced passthrough input columns plus the real size of
+    // the freshly-evaluated columns we just allocated.
+    std::size_t const referenced_bytes =
+      sirius::estimate_referenced_column_bytes(
+        input_view, passthrough_indices, input_ro.get_data()->get_size_in_bytes()) +
+      evaluated->alloc_size();
+
+    // Composite owner keeps BOTH lifetimes alive: the freshly-evaluated columns (shared_ptr) and
+    // the input read-only lock (for the passthrough columns). Both members are copy-constructible,
+    // as std::any requires. eval_view's column pointers stay valid because `owner.evaluated` still
+    // owns the columns after the move.
+    struct projection_owner {
+      std::shared_ptr<cudf::table> evaluated;
+      cucascade::read_only_data_batch input_lock;
+    };
+    projection_owner owner{std::move(evaluated), std::move(input_ro)};
+    output_batches.push_back(sirius::make_data_batch_from_view(
+      out_view, std::move(owner), referenced_bytes, mem, stream, batch_telemetry()));
   }
   return std::make_unique<pipelineable_operator_data>(output_batches);
 }
