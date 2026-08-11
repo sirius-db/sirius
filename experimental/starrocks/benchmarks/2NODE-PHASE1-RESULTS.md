@@ -5,16 +5,66 @@
 
 ## Verdict
 
-**The two-machine cluster FORMS. It cannot execute a distributed query.**
+**The two-machine cluster FORMS and StarRocks SCHEDULES across both hosts. No query can run,
+because the cross-host GPU transport is refused.**
 
-Two independent blockers, only one of which is about two machines:
+Clean run 2026-08-11 23:26-23:31 UTC, after the engine bug below was fixed. The causal chain is
+now established end to end, with each link measured separately:
 
-| # | Blocker | Two-node specific? |
+| # | Link | Result |
 |---|---|---|
-| 1 | No viable cross-host GPU transport — canary refuses the peer | **Yes** |
-| 2 | Engine cannot plan any `FILES()` fragment (`TransactionContext::ActiveTransaction`) | **No** — reproduces on one CN, no exchange |
+| 1 | Both CNs register and go alive | **PASS** — `10001`@.53, `10004`@.52, 72 cores each |
+| 2 | Engine plans and executes | **PASS** — single-CN `nation` → 25, `lineitem` → 600,037,902 |
+| 3 | FE schedules fragments on both hosts | **PASS** — F00 and F01 each have instances on `10001` *and* `10004` |
+| 4 | Cross-host exchange carries data | **FAIL** — canary 0.32-0.43 GB/s vs a 2.0 GB/s floor, peer refused |
 
-Fixing #2 will not fix #1.
+Step 4 is the whole of the remaining gap.
+
+### Every query fails, not just shuffles
+
+With **one CN per host there is no same-host peer**, so every exchange in every plan is remote. A
+`count(*)` over `nation` — 2,250 bytes, one file — returned 25 while only one CN was up, and fails
+once the second CN joins:
+
+```
+ERROR 1064: nixl link to 10.87.140.53:9102 measured 0.43 GB/s, below the 2 GB/s floor
+            — Refusing the transport tier    backend [id=10004]
+```
+
+The refusal is **bidirectional**: gcn-18 measures the link to gcn-17 at 0.32-0.43 GB/s and gcn-17
+measures the link to gcn-18 at 0.43 GB/s. Both refuse.
+
+This is worth stating plainly because it inverts the usual intuition: adding the second node makes
+the cluster *strictly less* capable than a single node, until the transport works.
+
+### Blocker 2 (engine) — FIXED, commit `f8360593`
+
+`TransactionContext::ActiveTransaction called without active transaction` on every `FILES()` plan.
+Root cause: `Fragment::build()` commits its view-creation transaction (`sirius_ffi.cpp:565`) before
+opening the `StandaloneQueryScope`, so `lower_substrait()` bound the plan with no transaction open.
+Every catalog lookup goes through `TransactionContext::ActiveTransaction()`, which DuckDB 1.5.5
+throws from and 1.5.4 tolerated — so the regression arrived with the submodule bump in `a3c99f4a`,
+not with any change to `src/` (unchanged since 08-07).
+
+Fixed by opening a transaction in `lower_substrait()` only when the caller has not, using
+`ClientContext::transaction` rather than `Connection::BeginTransaction()` (the latter runs
+`Query("BEGIN TRANSACTION")`, an ordinary statement that would take the lifecycle mutex the
+enclosing scope holds — `duckdb/src/main/connection.cpp:341`).
+
+Verified: `nation` → 25 rows, `lineitem` → 600,037,902 rows / `sum(l_quantity)` 15,300,829,209 —
+byte-identical to stock StarRocks on the same files.
+
+### Unrelated gotcha found while writing the validation query
+
+The plan's shuffle query used `l_orderkey % 4096` as the grouping key. Sirius refuses it:
+
+```
+Unsupported expression in projection (falling back to CPU): mod(l_orderkey, 4096)
+```
+
+Use a plain column (`GROUP BY l_suppkey` — 1M groups at SF100) instead. The engine-B tutorial's
+copy of that query is fine, because stock StarRocks supports `mod()`; only the engine-A variant
+needs changing.
 
 ## What works
 

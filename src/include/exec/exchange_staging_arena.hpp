@@ -48,6 +48,18 @@ class exchange_staging_arena {
   /// call fails loudly instead of silently taking a slow path.
   static constexpr const char* kCapacityEnvVar = "SIRIUS_EXCHANGE_STAGING_BYTES";
 
+  /// Selects how the arena's device memory is allocated. Unset or `cudamalloc` keeps the plain
+  /// `cudaMalloc` contract described above, which is correct for a single host. `fabric` allocates
+  /// through the VMM API with `CU_MEM_HANDLE_TYPE_FABRIC`, which is the only allocation a peer on
+  /// ANOTHER host can map: `cudaMalloc`'s IPC handle is node-local by construction, so a
+  /// multi-host exchange over it degrades to a host bounce (MEASURED 0.32-0.43 GB/s between
+  /// gcn-17 and gcn-18, below the transport's 2 GB/s admission floor). A fabric handle rides the
+  /// MNNVL fabric instead; the standalone harness measured 765 GB/s on that pair.
+  ///
+  /// Requires a live IMEX domain and access to /dev/nvidia-caps-imex-channels; `cuMemCreate`
+  /// fails loudly here rather than degrading silently later.
+  static constexpr const char* kArenaKindEnvVar = "SIRIUS_EXCHANGE_STAGING_ARENA";
+
   /// Allocates the region with `cudaMalloc`.
   /// @throws sirius::invalid_input_exception on a zero capacity.
   /// @throws sirius::internal_exception when the allocation fails, naming the size and the
@@ -99,6 +111,13 @@ class exchange_staging_arena {
  private:
   void* base_             = nullptr;
   std::uint64_t capacity_ = 0;
+
+  //! VMM bookkeeping, set only on the `fabric` path; `fabric_handle_ == 0` means this arena was
+  //! allocated with cudaMalloc and must be released with cudaFree. The VMM path has to unmap,
+  //! free the reserved address range and release the physical handle -- cudaFree cannot do any
+  //! of that and would silently leak the whole arena.
+  unsigned long long fabric_handle_ = 0;
+  std::uint64_t mapped_bytes_       = 0;
 
   mutable std::mutex mutex_;
   std::uint64_t head_       = 0;  // next free offset; always kAlignment-aligned
