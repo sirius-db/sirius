@@ -62,6 +62,19 @@ uint64_t derived_default_batch_size()
 
 }  // namespace config
 
+static void reject_mutually_exclusive(yaml::reader& reader,
+                                      const char* context,
+                                      const char* first,
+                                      const char* second)
+{
+  auto const first_value  = reader.optional_node(first);
+  auto const second_value = reader.optional_node(second);
+  if (first_value && second_value) {
+    throw std::runtime_error(std::string(context) + ": '" + first + "' and '" + second +
+                             "' are mutually exclusive");
+  }
+}
+
 // ================ from_yaml for external types ================= //
 
 static void validate_downgrade_fractions(std::string_view scope, double trigger, double stop)
@@ -203,6 +216,17 @@ static void from_yaml(const YAML::Node& node, sirius::io::cache::config& opt)
   r.reject_unknown();
 }
 
+static void from_yaml(const YAML::Node& node, scan_manager::memory_prefetcher_config& opt)
+{
+  yaml::reader r(node, "memory_prefetcher");
+  r.optional("enable", opt.enable);
+  r.optional("num_threads", opt.num_threads, yaml::greater_than<std::size_t>{0});
+  r.optional("min_free_fraction", opt.min_free_fraction, yaml::fraction<double>{});
+  r.optional("poll_interval_ms", opt.poll_interval_ms, yaml::greater_than<std::size_t>{0});
+  r.optional("drain_quiet_ms", opt.drain_quiet_ms);
+  r.reject_unknown();
+}
+
 static void from_yaml(const YAML::Node& node, scan_manager::scan_manager_config& opt)
 {
   yaml::reader r(node, "scan_manager");
@@ -217,6 +241,7 @@ static void from_yaml(const YAML::Node& node, scan_manager::scan_manager_config&
   if (auto n = r.optional_node("rest")) sirius::from_yaml(*n, opt.rest);
   if (auto n = r.optional_node("cache")) sirius::from_yaml(*n, opt.cache);
   if (auto n = r.optional_node("object_store")) sirius::from_yaml(*n, opt.object_store);
+  if (auto n = r.optional_node("memory_prefetcher")) from_yaml(*n, opt.memory_prefetcher);
   r.reject_unknown();
 }
 
@@ -323,6 +348,7 @@ struct gpu_mem_config {
     // usage_limit: fraction (double) or absolute bytes — mutually exclusive keys
     std::optional<std::uint64_t> usage_bytes;
     double usage_frac = 0.95;
+    reject_mutually_exclusive(r, "memory.gpu", "usage_limit_bytes", "usage_limit_fraction");
     r.optional("usage_limit_bytes", yaml::bytes(usage_bytes));
     r.optional("usage_limit_fraction", usage_frac, yaml::fraction<double>{});
     opt.usage_limit = usage_bytes ? std::variant<double, std::uint64_t>{*usage_bytes}
@@ -330,6 +356,8 @@ struct gpu_mem_config {
     // reservation_limit: fraction or absolute bytes
     std::optional<std::uint64_t> res_bytes;
     double res_frac = 1.0;
+    reject_mutually_exclusive(
+      r, "memory.gpu", "reservation_limit_bytes", "reservation_limit_fraction");
     r.optional("reservation_limit_bytes", yaml::bytes(res_bytes));
     r.optional("reservation_limit_fraction", res_frac, yaml::fraction<double>{});
     opt.reservation_limit = res_bytes ? std::variant<double, std::uint64_t>{*res_bytes}
@@ -378,6 +406,7 @@ struct host_mem_config {
     // capacity: fraction of node RAM (double) or absolute bytes per node — mutually exclusive keys
     std::optional<std::uint64_t> cap_bytes;
     std::optional<double> cap_frac;
+    reject_mutually_exclusive(r, "memory.host", "capacity_bytes", "capacity_fraction");
     r.optional("capacity_bytes", yaml::bytes(cap_bytes));
     r.optional("capacity_fraction", cap_frac);
     if (cap_frac && !(*cap_frac > 0.0 && *cap_frac <= 1.0)) {
@@ -391,6 +420,8 @@ struct host_mem_config {
     }
     std::optional<std::uint64_t> res_bytes;
     double res_frac = 1.0;
+    reject_mutually_exclusive(
+      r, "memory.host", "reservation_limit_bytes", "reservation_limit_fraction");
     r.optional("reservation_limit_bytes", yaml::bytes(res_bytes));
     r.optional("reservation_limit_fraction", res_frac, yaml::fraction<double>{});
     opt.reservation_limit = res_bytes ? std::variant<double, std::uint64_t>{*res_bytes}

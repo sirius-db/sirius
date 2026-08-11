@@ -744,40 +744,30 @@ partition_strategy compute_hash_join_partition_strategy(uint64_t total_bytes,
   bool const is_full_outer = join_type == duckdb::JoinType::OUTER;
   uint64_t const small     = partition_small_table_bytes(num_gpus);
 
-  // Phase 1 — broadcast candidacy and the partition count we propose to the eligibility check.
-  //   MARK multi-GPU: forced broadcast (build_has_null must be globally consistent).
-  //   MARK single-GPU: clamped to one partition (may still enter BUILD_PROBE below).
-  //   Otherwise: a build is a broadcast candidate when it is below the small-table threshold, OR
-  //   below max_broadcast_join_size while the probe side is large relative to the build (so
-  //   replicating the build avoids shuffling a much larger probe across GPUs).
-  bool broadcast_candidate = false;
-  int proposed             = natural;
-  if (is_mark && num_gpus > 1) {
-    broadcast_candidate = true;
-    proposed            = num_gpus;
-  } else if (is_mark) {
-    broadcast_candidate = false;
-    proposed            = 1;
-  } else {
-    broadcast_candidate = total_bytes < small ||
-                          (total_bytes < max_broadcast_join_size &&
-                           estimated_probe_to_build_ratio >= static_cast<double>(num_gpus) * 1.25);
-    proposed = broadcast_candidate ? num_gpus : natural;
-  }
+  // Broadcast candidacy. MARK multi-GPU is forced broadcast (build_has_null must be globally
+  // consistent); otherwise a build is a candidate when it is below the small-table threshold, OR
+  // below max_broadcast_join_size while the probe side is large relative to the build (replicating
+  // the build avoids shuffling a much larger probe across GPUs).
+  bool const broadcast_candidate =
+    is_mark ? num_gpus > 1
+            : (total_bytes < small ||
+               (total_bytes < max_broadcast_join_size &&
+                estimated_probe_to_build_ratio >= static_cast<double>(num_gpus) * 1.25));
 
-  // Phase 2 — BUILD_PROBE eligibility at `proposed`. MARK/SEMI/ANTI are eligible (persistent
-  // filtered_join built on the right, reused across streamed left probe batches). RIGHT_SEMI/
-  // RIGHT_ANTI/RIGHT and full OUTER emit build-side output and would need cross-batch (and, on
-  // multi-GPU, cross-partition/cross-GPU) accumulation of unmatched build rows, so they stay on the
-  // STANDARD path. A broadcast join charges the FULL build to every GPU; a hash-partitioned build
-  // charges the per-partition average.
-  bool build_probe = false;
-  if (proposed <= num_gpus) {
-    uint64_t const per_gpu_build_bytes =
-      broadcast_candidate ? total_bytes : total_bytes / static_cast<uint64_t>(proposed);
-    build_probe = per_gpu_build_bytes < max_build_hash_table_bytes && build_foldable &&
-                  !is_right_family && !is_mixed && !is_full_outer;
-  }
+  // BUILD_PROBE eligibility. MARK/SEMI/ANTI are eligible (persistent filtered_join built on the
+  // right, reused across streamed left probe batches); RIGHT_SEMI/RIGHT_ANTI/RIGHT and full OUTER
+  // emit build-side output and stay on the STANDARD path.
+  //
+  // Evaluated at the count BUILD_PROBE would run with — one build table per GPU, capped at
+  // `natural` — not at the natural count: `hash_partition_bytes` targets a streaming batch size
+  // and must not veto `max_build_hash_table_bytes`, which is what sizes the folded hash table.
+  // A broadcast join charges the FULL build to every GPU; a hash-partitioned build charges the
+  // per-GPU average.
+  int const build_probe_partitions = std::max(1, std::min(natural, num_gpus));
+  uint64_t const per_gpu_build_bytes =
+    broadcast_candidate ? total_bytes : total_bytes / static_cast<uint64_t>(build_probe_partitions);
+  bool build_probe = per_gpu_build_bytes < max_build_hash_table_bytes && build_foldable &&
+                     !is_right_family && !is_mixed && !is_full_outer;
 
   // A MARK join must always run in BUILD_PROBE mode. It needs the entire build side resident to
   // compute the global build_has_null sentinel and the per-probe-row marks, and on multi-GPU it is
@@ -788,9 +778,12 @@ partition_strategy compute_hash_join_partition_strategy(uint64_t total_bytes,
 
   bool const broadcast = broadcast_candidate && build_probe;
 
-  // MARK single-GPU is clamped to one partition regardless of the natural count; every other case
-  // takes num_gpus when broadcasting and the natural count otherwise.
-  int const num_partitions = broadcast ? num_gpus : ((is_mark && num_gpus <= 1) ? 1 : natural);
+  // BUILD_PROBE runs at the count its eligibility was measured at; MARK single-GPU is clamped to
+  // one partition; broadcast takes num_gpus; everything else the natural count.
+  int const num_partitions = broadcast                    ? num_gpus
+                             : build_probe                ? build_probe_partitions
+                             : (is_mark && num_gpus <= 1) ? 1
+                                                          : natural;
   return {num_partitions, broadcast, build_probe};
 }
 
@@ -1415,7 +1408,7 @@ static std::unique_ptr<operator_data> gather_join_output(
     }
   }
 
-  auto output_cudf_table = std::make_unique<cudf::table>(std::move(out_cols), stream);
+  auto output_cudf_table = std::make_unique<cudf::table>(std::move(out_cols));
   return std::make_unique<pipelineable_operator_data>(
     std::vector<std::shared_ptr<::cucascade::data_batch>>{
       make_data_batch(std::move(output_cudf_table), memory_space, stream, telemetry_info)});
@@ -1457,7 +1450,7 @@ static std::unique_ptr<operator_data> gather_distinct_left_join_output(
     out_cols.push_back(std::move(col));
   }
 
-  auto output_cudf_table = std::make_unique<cudf::table>(std::move(out_cols), stream);
+  auto output_cudf_table = std::make_unique<cudf::table>(std::move(out_cols));
   return std::make_unique<pipelineable_operator_data>(
     std::vector<std::shared_ptr<::cucascade::data_batch>>{
       make_data_batch(std::move(output_cudf_table), memory_space, stream, telemetry_info)});
@@ -1581,7 +1574,7 @@ static std::unique_ptr<operator_data> resolve_mark_join_result(
   if (null_count > 0) { mark_column->set_null_mask(std::move(null_mask), null_count); }
 
   mark_out_cols.push_back(std::move(mark_column));
-  auto output_cudf_table = std::make_unique<cudf::table>(std::move(mark_out_cols), stream);
+  auto output_cudf_table = std::make_unique<cudf::table>(std::move(mark_out_cols));
   return std::make_unique<pipelineable_operator_data>(
     std::vector<std::shared_ptr<::cucascade::data_batch>>{make_data_batch(
       std::move(output_cudf_table), *left_batch.get_memory_space(), stream, telemetry_info)});

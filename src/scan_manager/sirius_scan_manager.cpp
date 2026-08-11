@@ -16,6 +16,7 @@
 
 #include "scan_manager/sirius_scan_manager.hpp"
 
+#include "compression/device_compressed_blob.hpp"
 #include "cudf/cudf_utils.hpp"
 #include "data/data_batch_utils.hpp"
 #include "exec/thread_pool.hpp"
@@ -53,6 +54,7 @@
 
 #include <rmm/cuda_device.hpp>
 
+#include <api/simpatico_codegen.hpp>
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/memory/column_metadata.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
@@ -100,14 +102,16 @@ struct cached_databatch_provider : public databatch_provider {
                             mvcc_chunk_mask_set mvcc_masks,
                             std::vector<insert_delta_split> delta_splits,
                             std::vector<cudf::data_type> normalization_targets,
-                            bool has_physical_overrides)
+                            bool has_physical_overrides,
+                            sirius::decode_equality_pushdown equality_pushdown)
     : _plan(std::move(plan)),
       _entry(entry),
       _telemetry_info(telemetry_info),
       _mvcc_masks(std::move(mvcc_masks)),
       _delta_splits(std::move(delta_splits)),
       _normalization_targets(std::move(normalization_targets)),
-      _has_physical_overrides(has_physical_overrides)
+      _has_physical_overrides(has_physical_overrides),
+      _equality_pushdown(std::move(equality_pushdown))
   {
     auto const& entry_column_names = _entry.cache_info.column_names();
     std::ranges::for_each(selected_columns, [this, &entry_column_names](size_t idx) {
@@ -177,6 +181,24 @@ struct cached_databatch_provider : public databatch_provider {
         // Hand out the projected compressed chunk; decompressed on demand by
         // scan_operator_input::prepare_for_processing.
         auto projected = chunk.compressed->select_columns(_column_indices);
+        // Attach the scan's equality pushdown to this projection only — never to
+        // the shared pinned chunk, which other queries filter differently.
+        // Restricted to columns whose plan can answer a predicate off its
+        // compressed form (a dictionary root); pushing into any other plan is
+        // correct but only moves the comparison, so leave those alone and keep
+        // this a strict no-op for them.
+        if (!_equality_pushdown.empty()) {
+          auto const& ct = chunk.compressed->table();
+          sirius::decode_equality_pushdown chunk_pushdown(_column_indices.size());
+          bool any = false;
+          for (std::size_t i = 0; i < _column_indices.size(); ++i) {
+            if (i >= _equality_pushdown.size() || _equality_pushdown[i].empty()) { continue; }
+            if (!simpatico::column_supports_predicate_decode(ct, _column_indices[i])) { continue; }
+            chunk_pushdown[i] = _equality_pushdown[i];
+            any               = true;
+          }
+          if (any) { projected->set_equality_pushdown(std::move(chunk_pushdown)); }
+        }
         return cucascade::data_batch::make(get_next_batch_id(), std::move(projected));
       }
       // Uncompressed chunk: project the requested columns (positions into the
@@ -327,6 +349,11 @@ struct cached_databatch_provider : public databatch_provider {
   cached_scan_plan _plan;
   std::vector<std::string> _column_names;
   std::vector<size_t> _column_indices;
+  /// Parallel to @c _column_indices; empty entries decompress normally. Only the
+  /// GPU-tier compressed path consumes it (the host path would have to parse the
+  /// chunk header to know whether the plan can exploit it, and that tier is not
+  /// where the decode gather costs anything).
+  sirius::decode_equality_pushdown _equality_pushdown;
   const pinned_entry& _entry;
   telemetry::batch_telemetry_info _telemetry_info;
   /// This provider's own copy of the entry's per-chunk keep-masks (empty for
@@ -344,6 +371,31 @@ struct cached_databatch_provider : public databatch_provider {
   bool _has_physical_overrides{false};
   std::atomic<std::size_t> _index{0};
 };
+
+/// Map the scan's decode-predicate candidates (keyed by column primary index)
+/// onto @p selected_columns, which are positions in the pinned entry's column
+/// list. Returns a vector parallel to @p selected_columns, empty when the scan
+/// offers nothing this entry carries.
+sirius::decode_equality_pushdown build_equality_pushdown(
+  pinned_entry const& entry,
+  std::span<std::size_t const> selected_columns,
+  std::unordered_map<std::size_t, std::vector<std::string>> const& candidates)
+{
+  if (candidates.empty()) { return {}; }
+  sirius::decode_equality_pushdown pushdown(selected_columns.size());
+  bool any = false;
+  for (std::size_t i = 0; i < selected_columns.size(); ++i) {
+    auto const entry_pos = selected_columns[i];
+    if (entry_pos >= entry.cache_info.column_ids.size()) { continue; }
+    auto const primary_idx =
+      static_cast<std::size_t>(entry.cache_info.column_ids[entry_pos].GetPrimaryIndex());
+    auto const it = candidates.find(primary_idx);
+    if (it == candidates.end()) { continue; }
+    pushdown[i] = it->second;
+    any         = true;
+  }
+  return any ? pushdown : sirius::decode_equality_pushdown{};
+}
 
 /// Filter view extracted from the scan's ingestible info: the pushed-down TableFilterSet plus the
 /// scan's column_ids its keys index into.
@@ -682,6 +734,12 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
           delta_request->plan.delta_rows());
       }
     }
+    // Columns the scan will only ever test for equality and never project can be
+    // decompressed straight to a BOOL8 mask (see decode_predicate_candidates).
+    auto equality_pushdown =
+      build_equality_pushdown(*assignment.entry,
+                              assignment.columns,
+                              assignment.op->get_ingestible().decode_predicate_candidates());
     // The provider charges a served column only for the cast scan normalization will make, so
     // it needs the scan's carrier targets. They are passed in output order, which is also the
     // order the cached chunks are served in: assignment.columns follows the ingestible's
@@ -698,7 +756,8 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
                                                    std::move(masks),
                                                    std::move(delta_splits),
                                                    assignment.op->normalization_targets(),
-                                                   assignment.op->has_physical_overrides());
+                                                   assignment.op->has_physical_overrides(),
+                                                   std::move(equality_pushdown));
     _metadata_processor->use_cached_entries_for_pipeline(assignment.op, std::move(provider));
   }
   _pending_mvcc_mask_jobs.clear();
@@ -715,6 +774,35 @@ void sirius_scan_manager::start_metadata_processing()
     if (it == _providers_by_op.end()) { continue; }
     it->second->run(*_dispatcher, _metadata_processor->get_split_provider_bridge(op));
   }
+  maybe_start_memory_prefetcher();
+}
+
+void sirius_scan_manager::maybe_start_memory_prefetcher()
+{
+  const auto& cfg = _config.memory_prefetcher;
+  if (!cfg.enable) { return; }
+
+  // Prototype scope: a single GPU space. Multi-GPU needs the task creator's
+  // NUMA-locality derivation to pick the per-batch target device; converting
+  // to the wrong space would strand data cross-device.
+  auto gpu_spaces = _reservation_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
+  if (gpu_spaces.size() != 1) {
+    SIRIUS_LOG_WARN(
+      "[memory_prefetcher] disabled: prototype supports exactly 1 GPU space (found {})",
+      gpu_spaces.size());
+    return;
+  }
+  auto* gpu_space = _reservation_manager.get_memory_space(cucascade::memory::Tier::GPU,
+                                                          gpu_spaces.front()->get_device_id());
+  if (gpu_space == nullptr) { return; }
+
+  std::vector<std::shared_ptr<split_connector>> connectors;
+  connectors.reserve(_scan_op_order.size());
+  for (auto* op : _scan_op_order) {
+    connectors.push_back(op->get_shared_split_connector());
+  }
+
+  _prefetcher = std::make_unique<memory_prefetcher>(cfg, std::move(connectors), gpu_space);
 }
 
 std::shared_ptr<sirius::io::sirius_datasource> sirius_scan_manager::create_datasource(
@@ -829,6 +917,9 @@ std::shared_ptr<sirius::io::sirius_ioctx> sirius_scan_manager::ioctx_for_path(st
 
 void sirius_scan_manager::reset()
 {
+  // Stop the prefetcher first: it holds shared_ptrs to the operators'
+  // connectors and must not convert batches while per-query state is torn down.
+  _prefetcher.reset();
   _dispatcher->request_stop();
   _dispatcher->wait_for_all();
   _scan_op_order.clear();
@@ -1575,7 +1666,8 @@ std::unique_ptr<databatch_provider> make_provider_for_pinned_entry(
   mvcc_chunk_mask_set mvcc_masks,
   std::vector<insert_delta_split> delta_splits,
   std::vector<cudf::data_type> normalization_targets,
-  bool has_physical_overrides)
+  bool has_physical_overrides,
+  sirius::decode_equality_pushdown equality_pushdown)
 {
   return std::make_unique<cached_databatch_provider>(entry,
                                                      selected_columns,
@@ -1584,7 +1676,8 @@ std::unique_ptr<databatch_provider> make_provider_for_pinned_entry(
                                                      std::move(mvcc_masks),
                                                      std::move(delta_splits),
                                                      std::move(normalization_targets),
-                                                     has_physical_overrides);
+                                                     has_physical_overrides,
+                                                     std::move(equality_pushdown));
 }
 
 cached_scan_plan build_cached_scan_plan(pinned_entry const& entry,

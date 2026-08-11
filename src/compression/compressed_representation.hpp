@@ -39,6 +39,25 @@ namespace sirius {
 
 struct compressed_device_blob;  // defined in device_compressed_blob.hpp
 
+/// Per-selected-column equality/IN pushdown for decompression.
+///
+/// Parallel to a representation's selected column list, so entry @c i describes
+/// the @c i-th column the converter will decompress. Entry @c i holds the string
+/// values that column is tested against; an empty entry decompresses normally.
+///
+/// A column with a non-empty entry comes back as a **BOOL8** column
+/// (`value ∈ values`, nulls propagated) rather than its declared type: a
+/// dictionary-compressed column answers the predicate from its key set and never
+/// gathers the decoded chars (see @c simpatico::decode_predicate). Consumers
+/// must therefore expect the type substitution — @c parquet_gpu_ingestible
+/// rewrites its filter expression to a bare boolean reference when it sees one.
+///
+/// Held as plain strings rather than @c simpatico::decode_predicate so this
+/// header stays free of the simpatico API (matching the forward-declared
+/// @c compressed_table above); @c compression_converters.cpp converts at the
+/// call boundary.
+using decode_equality_pushdown = std::vector<std::vector<std::string>>;
+
 /// A Simpatico-compressed chunk resident in pinned host memory.
 ///
 /// The (small) structural header is a flat byte vector; the (large) payload —
@@ -187,6 +206,22 @@ class compressed_host_representation : public cucascade::idata_representation {
     return _selected_indices;
   }
 
+  /// Attach an equality/IN pushdown, parallel to the selected column list.
+  ///
+  /// Call only on a freshly projected representation the caller owns outright
+  /// (as @ref select_columns returns): the pushdown is a property of one scan's
+  /// filter, never of the shared pinned chunk.
+  void set_equality_pushdown(decode_equality_pushdown pushdown)
+  {
+    _equality_pushdown = std::move(pushdown);
+  }
+
+  /// The attached pushdown; empty when the columns decompress normally.
+  [[nodiscard]] const decode_equality_pushdown& equality_pushdown() const noexcept
+  {
+    return _equality_pushdown;
+  }
+
  private:
   /// Construct a projection sharing the same backing blob.
   compressed_host_representation(cucascade::memory::memory_space& memory_space,
@@ -204,6 +239,7 @@ class compressed_host_representation : public cucascade::idata_representation {
   std::size_t _uncompressed_bytes;
   std::int64_t _num_rows;
   std::optional<std::vector<std::size_t>> _selected_indices;
+  decode_equality_pushdown _equality_pushdown;
   std::shared_ptr<const per_column_byte_sizes> _column_sizes;
 };
 
@@ -273,6 +309,22 @@ class compressed_device_representation : public cucascade::idata_representation 
     return _selected_indices;
   }
 
+  /// Attach an equality/IN pushdown, parallel to the selected column list.
+  ///
+  /// Call only on a freshly projected representation the caller owns outright
+  /// (as @ref select_columns returns): the pushdown is a property of one scan's
+  /// filter, never of the shared pinned chunk.
+  void set_equality_pushdown(decode_equality_pushdown pushdown)
+  {
+    _equality_pushdown = std::move(pushdown);
+  }
+
+  /// The attached pushdown; empty when the columns decompress normally.
+  [[nodiscard]] const decode_equality_pushdown& equality_pushdown() const noexcept
+  {
+    return _equality_pushdown;
+  }
+
  private:
   compressed_device_representation(cucascade::memory::memory_space& memory_space,
                                    std::shared_ptr<compressed_device_blob> blob,
@@ -289,6 +341,7 @@ class compressed_device_representation : public cucascade::idata_representation 
   std::size_t _uncompressed_bytes;
   std::int64_t _num_rows;
   std::optional<std::vector<std::size_t>> _selected_indices;
+  decode_equality_pushdown _equality_pushdown;
   std::shared_ptr<const per_column_byte_sizes> _column_sizes;
 };
 
