@@ -22,8 +22,10 @@
 #include <duckdb/planner/filter/conjunction_filter.hpp>
 #include <duckdb/planner/filter/constant_filter.hpp>
 #include <duckdb/planner/filter/in_filter.hpp>
+#include <expression/ast/constant_range.hpp>
 #include <expression/ast/from_duckdb.hpp>
 #include <expression/ast/utils.hpp>
+#include <expression/value.hpp>
 #include <helper/type_conversions.hpp>
 #include <log/logging.hpp>
 #include <op/scan/scan_filter_analysis.hpp>
@@ -110,31 +112,6 @@ bool collect_equality_values(duckdb::TableFilter const& filter, std::vector<std:
 /// intersected as __int128 and clamped once at the end.
 using int128 = __int128;
 
-/// A constant lowered into the decoded integer domain as a (possibly
-/// non-integral) rational, kept as its integer floor and ceil. Equal for a
-/// constant the domain represents exactly; one apart otherwise (a decimal with
-/// more fractional digits than the column's scale).
-struct decoded_bound {
-  int128 floor;
-  int128 ceil;
-};
-
-/// The constant's unscaled integer payload when its physical storage is an
-/// integer this path handles.
-std::optional<std::int64_t> physical_integer_payload(duckdb::Value const& value)
-{
-  switch (value.type().InternalType()) {
-    case duckdb::PhysicalType::INT8: return duckdb::TinyIntValue::Get(value);
-    case duckdb::PhysicalType::INT16: return duckdb::SmallIntValue::Get(value);
-    case duckdb::PhysicalType::INT32: return duckdb::IntegerValue::Get(value);
-    case duckdb::PhysicalType::INT64: return duckdb::BigIntValue::Get(value);
-    case duckdb::PhysicalType::UINT8: return duckdb::UTinyIntValue::Get(value);
-    case duckdb::PhysicalType::UINT16: return duckdb::USmallIntValue::Get(value);
-    case duckdb::PhysicalType::UINT32: return duckdb::UIntegerValue::Get(value);
-    default: return std::nullopt;  // UINT64/INT128/FLOAT/... — not this path
-  }
-}
-
 /// 10^e as int128 (e ≤ 38 fits; callers never exceed decimal precision bounds).
 int128 pow10_128(int e)
 {
@@ -145,68 +122,86 @@ int128 pow10_128(int e)
   return r;
 }
 
-/// Lower @p value into the decoded integer domain of a column of @p col_type:
-/// DATE → stored day count, DECIMAL → unscaled integer at the COLUMN's scale,
-/// integers as-is. nullopt when the constant's type/width has no exact rational
-/// image there (the caller then refuses the whole scan).
-std::optional<decoded_bound> to_decoded_bound(duckdb::Value const& value,
-                                              sirius::logical_type const& col_type)
+/// The constant a conjunct compares against, lowered into the DECODED integer
+/// domain of a column of @p col_type: DATE → stored day count, DECIMAL →
+/// unscaled integer at the COLUMN's scale, integers as-is.
+///
+/// A @c numeric_range rather than a single value because the lowering need not
+/// be exact: a decimal constant with more fractional digits than the column can
+/// store lands strictly BETWEEN two representable values, and which end a
+/// comparison should take depends on its direction. @c minimum is then the
+/// floor and @c maximum the ceil; they are equal whenever the domain represents
+/// the constant exactly.
+///
+/// nullopt when the constant has no exact image in that domain — the caller
+/// then keeps the conjunct for itself.
+std::optional<sirius::numeric_range> to_decoded_bound(duckdb::Value const& value,
+                                                      sirius::logical_type const& col_type)
 {
   if (value.IsNull()) { return std::nullopt; }
-  auto const value_type = value.type().id();
 
+  // DATE decodes to its stored day count, which is not a numeric literal domain
+  // constant_numeric_range covers.
   if (col_type.id() == sirius::type_id::DATE) {
-    if (value_type != duckdb::LogicalTypeId::DATE) { return std::nullopt; }
+    if (value.type().id() != duckdb::LogicalTypeId::DATE) { return std::nullopt; }
     auto const days = static_cast<int128>(duckdb::DateValue::Get(value).days);
-    return decoded_bound{days, days};
+    return sirius::numeric_range{sirius::numeric_range_domain::SIGNED_INTEGER, days, days, 0};
   }
 
-  if (col_type.is_decimal()) {
-    // Wider decimals are int128-backed and never bitpack-planned.
-    if (col_type.decimal_precision() > sirius::logical_type::decimal_max_precision_int64) {
-      return std::nullopt;
-    }
-    int constant_scale = 0;
-    if (value_type == duckdb::LogicalTypeId::DECIMAL) {
-      constant_scale = duckdb::DecimalType::GetScale(value.type());
-    } else if (!value.type().IsIntegral()) {
-      return std::nullopt;  // integral constants are scale-0; anything else refuses
-    }
-    auto const unscaled = physical_integer_payload(value);
-    if (!unscaled.has_value()) { return std::nullopt; }
-
-    auto const scale_diff = static_cast<int>(col_type.decimal_scale()) - constant_scale;
-    if (scale_diff >= 0) {
-      // Column carries at least the constant's fractional digits: exact.
-      auto const v = static_cast<int128>(*unscaled) * pow10_128(scale_diff);
-      return decoded_bound{v, v};
-    }
-    // Constant is finer than the column's scale: floor/ceil of m / 10^-diff.
-    auto const divisor = pow10_128(-scale_diff);
-    auto const m       = static_cast<int128>(*unscaled);
-    int128 quotient    = m / divisor;
-    int128 const rem   = m % divisor;
-    if (rem != 0 && m < 0) { quotient -= 1; }  // truncation → floor
-    return decoded_bound{quotient, quotient + (rem != 0 ? 1 : 0)};
+  if (!col_type.is_decimal() && !col_type.is_integer()) { return std::nullopt; }
+  // Wider decimals are int128-backed and never bitpack-planned.
+  if (col_type.is_decimal() &&
+      col_type.decimal_precision() > sirius::logical_type::decimal_max_precision_int64) {
+    return std::nullopt;
   }
+  // A constant wider than 64 bits is refused outright: the decoded domain is
+  // int64, and rescaling an int128 payload by a power of ten could overflow the
+  // accumulator before the clamp ever sees it.
+  if (value.type().InternalType() == duckdb::PhysicalType::INT128) { return std::nullopt; }
+
+  // The literal's exact value in its OWN domain, via the same lowering the
+  // narrowing machinery uses — it owns which payload alternative a declared
+  // type may carry, and rejects a constant whose payload disagrees.
+  auto const constant_type = sirius::from_duckdb(value.type());
+  auto const exact         = sirius::ast::constant_numeric_range(
+    sirius::ast::constant{sirius::from_duckdb(value, constant_type), constant_type});
+  if (!exact.has_value()) { return std::nullopt; }
 
   if (col_type.is_integer()) {
-    if (!value.type().IsIntegral()) { return std::nullopt; }
-    auto const v = physical_integer_payload(value);
-    if (!v.has_value()) { return std::nullopt; }
-    return decoded_bound{static_cast<int128>(*v), static_cast<int128>(*v)};
+    // An integer column's decoded domain IS the constant's, so a decimal
+    // literal has no exact image in it.
+    if (exact->domain == sirius::numeric_range_domain::DECIMAL) { return std::nullopt; }
+    return *exact;
   }
 
-  return std::nullopt;
+  // Decimal column: restate the constant at the COLUMN's scale. An integral
+  // literal is scale 0.
+  auto const scale_diff = static_cast<int>(col_type.decimal_scale()) - exact->decimal_scale;
+  if (scale_diff >= 0) {
+    // The column carries at least the constant's fractional digits: exact.
+    auto const v = exact->minimum * pow10_128(scale_diff);
+    return sirius::decimal_range(v, v, static_cast<uint8_t>(col_type.decimal_scale()));
+  }
+  // The constant is finer than the column's scale: floor and ceil of
+  // m / 10^-diff, which straddle the constant unless it divides exactly.
+  auto const divisor = pow10_128(-scale_diff);
+  auto const m       = exact->minimum;
+  int128 quotient    = m / divisor;
+  int128 const rem   = m % divisor;
+  if (rem != 0 && m < 0) { quotient -= 1; }  // truncation → floor
+  return sirius::decimal_range(
+    quotient, quotient + (rem != 0 ? 1 : 0), static_cast<uint8_t>(col_type.decimal_scale()));
 }
 
-/// Running intersection of all conjuncts on one column, in int128 so bound
-/// arithmetic cannot wrap. Starts at the full int64 domain (the decoder only
-/// ever produces int64-representable values).
-struct range_accumulator {
-  int128 lo = std::numeric_limits<std::int64_t>::min();
-  int128 hi = std::numeric_limits<std::int64_t>::max();
-};
+/// The running intersection of one column's conjuncts, in the int128 the
+/// numeric_range domain already uses so bound arithmetic cannot wrap. Starts at
+/// the full int64 domain — the decoder only ever produces int64-representable
+/// values.
+sirius::numeric_range full_decoded_domain()
+{
+  return sirius::signed_integer_range(std::numeric_limits<std::int64_t>::min(),
+                                      std::numeric_limits<std::int64_t>::max());
+}
 
 /// Fold @p filter into @p acc, returning true iff at least one bound was
 /// contributed. @p fully_covered is cleared whenever some restricting part of
@@ -222,7 +217,7 @@ struct range_accumulator {
 /// all — decomposing them soundly needs a hull, not an intersection.
 bool fold_numeric_conjunct(duckdb::TableFilter const& filter,
                            sirius::logical_type const& col_type,
-                           range_accumulator& acc,
+                           sirius::numeric_range& acc,
                            bool& fully_covered)
 {
   switch (filter.filter_type) {
@@ -236,20 +231,20 @@ bool fold_numeric_conjunct(duckdb::TableFilter const& filter,
       switch (cmp.comparison_type) {
         case duckdb::ExpressionType::COMPARE_EQUAL:
           // Non-integral constant ⇒ ceil > floor ⇒ lo > hi: provably empty.
-          acc.lo = std::max(acc.lo, bound->ceil);
-          acc.hi = std::min(acc.hi, bound->floor);
+          acc.minimum = std::max(acc.minimum, bound->maximum);
+          acc.maximum = std::min(acc.maximum, bound->minimum);
           return true;
         case duckdb::ExpressionType::COMPARE_GREATERTHANOREQUALTO:
-          acc.lo = std::max(acc.lo, bound->ceil);
+          acc.minimum = std::max(acc.minimum, bound->maximum);
           return true;
         case duckdb::ExpressionType::COMPARE_GREATERTHAN:
-          acc.lo = std::max(acc.lo, bound->floor + 1);
+          acc.minimum = std::max(acc.minimum, bound->minimum + 1);
           return true;
         case duckdb::ExpressionType::COMPARE_LESSTHANOREQUALTO:
-          acc.hi = std::min(acc.hi, bound->floor);
+          acc.maximum = std::min(acc.maximum, bound->minimum);
           return true;
         case duckdb::ExpressionType::COMPARE_LESSTHAN:
-          acc.hi = std::min(acc.hi, bound->ceil - 1);
+          acc.maximum = std::min(acc.maximum, bound->maximum - 1);
           return true;
         default:  // <>, IS DISTINCT FROM, ... — not a range
           fully_covered = false;
@@ -272,15 +267,16 @@ bool fold_numeric_conjunct(duckdb::TableFilter const& filter,
 /// Clamp the int128 intersection back into an inclusive int64 range. A range
 /// lying entirely outside int64 (possible only through rescaled decimal bounds)
 /// is empty for any decodable value, canonically {0, -1}.
-sirius::decode_range clamp_to_decode_range(range_accumulator const& acc)
+sirius::decode_range clamp_to_decode_range(sirius::numeric_range const& acc)
 {
   constexpr auto kMin = std::numeric_limits<std::int64_t>::min();
   constexpr auto kMax = std::numeric_limits<std::int64_t>::max();
-  if (acc.lo > acc.hi || acc.lo > static_cast<int128>(kMax) || acc.hi < static_cast<int128>(kMin)) {
+  if (acc.minimum > acc.maximum || acc.minimum > static_cast<int128>(kMax) ||
+      acc.maximum < static_cast<int128>(kMin)) {
     return {0, -1};
   }
-  return {static_cast<std::int64_t>(std::max<int128>(acc.lo, kMin)),
-          static_cast<std::int64_t>(std::min<int128>(acc.hi, kMax))};
+  return {static_cast<std::int64_t>(std::max<int128>(acc.minimum, kMin)),
+          static_cast<std::int64_t>(std::min<int128>(acc.maximum, kMax))};
 }
 
 //===----------------------------------------------------------------------===//
@@ -394,7 +390,7 @@ scan_filter_analysis analyze_scan_filters(
       }
     }
 
-    range_accumulator acc;
+    auto acc             = full_decoded_domain();
     bool fully_covered   = true;
     bool const any_bound = fold_numeric_conjunct(*filter, col_type, acc, fully_covered);
     if (!fully_covered) {
