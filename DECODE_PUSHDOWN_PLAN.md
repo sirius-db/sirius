@@ -200,299 +200,107 @@ column_decode_caps probe_column(compressed_table const&, std::size_t column);
 
 `compact_route == full` *is* "not compactable", so P2's invariant becomes unstateable.
 
-## 5. Part D — JIT emitter and launcher refactor
+## 5. Part D — JIT emitter and launcher refactor (done)
 
-Renderer and launcher are covered together because they turn out to be **one taxonomy expressed
-twice** — see "The two refactors are one refactor" below. Read that first if you only read one
-part of this section.
+Renderer and launcher had described the same taxonomy twice — a flat
+`DecodeVariant` enum plus a separate pair entry point on one side, seven flat
+launcher functions on the other — so the two enumerations had to be kept in step
+by hand. They are now one two-axis product.
 
-`renderer.cpp` is 1700 lines (+649 in this PR) with seven variant emitters plus a separate pair
-builder. Findings:
-
-**F1 — two emitters are exact duplicates.**
-`value_source` (`renderer.cpp:1587-1590`) routes a Bitpack leaf straight to
-`bitpack_value_source`, so for a Bitpack root the "tuned" and "generic" emitters produce
-character-identical bodies:
-
-- `emit_bitpack_mask_out` (554-578) ≡ `emit_generic_mask_out` (939-959)
-- `emit_bitpack_mask_consume` (614-639) ≡ `emit_generic_mask_consume` (835-856)
-
-Removing them costs 53 lines and no behaviour. Their `RenderError` throws are **unreachable**:
-`emit_bitpack_mask_out` is only called when `tree.op == Bitpack` yet throws if
-`node.op != Bitpack`. The one reachable case (Bitpack *with* children) is rejected by
-`value_source`'s own "Bitpack must be a leaf" anyway; only the message text differs.
-
-The emitted comment text does differ (`Bitpack`→`BITPACK` from `op_kind_name`,
-`(K1)`→`(K1-generic)`), which alters the JIT cache key — a one-time NVRTC recompile per
-(shape, dtype, variant). Making the diff empty would mean hardcoding `Bitpack` in an emitter
-that serves every shape, which would be a lie; the blip is accepted.
-
-The "tuned closed-form path" comments at `build()` lines 150 and 161 are wrong and should go
-with the emitters.
-
-**F2 — one skeleton, four copies.** The mask-consuming emitters share
-`emit_selection_stage()` + the same strided loop + the same rank expression, differing only in a
-2–4 line sink: K3 stores, K5 copies `key_width` key bytes, K6 writes `{src_offset, length}`.
-K4 (`emit_bitpack_index_consume`, 801-824) is the *same sink* as K3 with a different row
-enumerator.
-
-**F3 — the delta emitter duplicates ~100 lines.** `emit_delta_mask_consume` (651-750) copies
-`emit_delta_producer`'s striped branch (1086-1147) — the same striped load, `cub::BlockScan` /
-`BlockExchange` union, three transposes, unsigned-counterpart reconstruction — changing only the
-final store. The header comment states why: *"so the plain rendered source stays byte-identical."*
-
-### Refactor: two axes instead of seven variants
-
-```cpp
-struct Enumerator { /* all_rows | mask_bits | index_list */ };
-struct Consumer   { /* write_column | ballot(pred) | dict_gather | offsets_meta */ };
+```
+Enumerator: all_rows | mask_bits | index_list          (how rows are walked)
+Consumer:   write_column | ballot_range | ballot_pair
+            | dict_gather | offsets_meta                (what happens per row)
 ```
 
-Two axes, not three: the predicate is a **parameter of the `ballot` consumer**, and its arity
-(1 for a range, 2 for a pair) is what fixes `DecodeInputs.trees.size()`. Treating arity as an
-axis — or worse, as a fork — is exactly what produced F4's 165-line duplicate.
+|              | write_column | ballot_range | ballot_pair | dict_gather | offsets_meta |
+|--------------|--------------|--------------|-------------|-------------|--------------|
+| `all_rows`   | plain        | K1           | K1m2        | —           | —            |
+| `mask_bits`  | K3           | —            | —           | K5          | K6·1         |
+| `index_list` | K4           | —            | —           | *unbuilt*   | *unbuilt*    |
 
-| Kernel | Enumerator | Consumer |
-|---|---|---|
-| plain | `all_rows` | `write_column` |
-| K1 / K1-generic | `all_rows` | `ballot(range)` |
-| K1m2 (pair) | `all_rows` | `ballot(pair)` |
-| K3 / K3-delta / K3-generic | `mask_bits` | `write_column` |
-| K4 | `index_list` | `write_column` |
-| K5 | `mask_bits` | `dict_gather` |
-| K6 | `mask_bits` | `offsets_meta` |
+Everything derives from the pair: trailing parameters are
+`enumerator_params ++ consumer_params`, the `out` slot's type follows from the
+consumer alone (ballot consumers repurpose it for mask words), the launcher's
+precondition contract is two switches over the axes, and `Walker::build`
+dispatches on them. `shape_is_supported()` rejects invalid points at render.
 
-Seven small pieces replace seven emitters plus `build_pair`/`finalize_pair`. Estimated ~300
-lines of emitter code → ~120.
+What this replaced:
 
-Cascades:
+- **F1** — `emit_bitpack_mask_out` / `_mask_consume` were byte-identical to their
+  `_generic` counterparts (`value_source` already routes a Bitpack leaf to
+  `bitpack_value_source`). Deleted; their `RenderError` throws were unreachable.
+- **F2** — the K3 / K5 / K6 emitters open-coded one survivor loop, differing only
+  in a 1–4 line sink. Now `emit_mask_survivor_loop(sink)`.
+- **F3** — `emit_delta_mask_consume` duplicated ~100 lines of
+  `emit_delta_producer`'s striped path. Now a `DeltaStore` policy on the
+  producer; delta is no longer a special case.
+- **F4** — the pair launcher open-coded the whole bind/launch sequence and
+  **omitted the per-chunk metadata bounds guard**, risking an out-of-bounds read
+  that faults the CUDA context. Both paths now share `launch_rendered_spec`.
+- **F5** — the renderer emitted trailing parameter DECLARATIONS from one switch
+  while the launcher pushed ARGUMENTS from a second switch in another file, with
+  `cuLaunchKernel`'s untyped `void**` between them: a mismatch was silent
+  argument misalignment, not a compile error. `DecodeKernelSpec::trailing` now
+  carries the list, emitted from the same table as the declaration text.
+- **F6** — five bespoke precondition blocks became `VariantContract` plus one
+  checker; diagnostics now name the specific missing field.
 
-- The trailing-parameter switch (343-387) becomes `enumerator.params() + consumer.params()`.
-- The entry-symbol suffix chain (330-333) becomes the same concatenation.
-- **Delta stops being special**: thread `Consumer` through `emit_delta_producer`; plain passes
-  `write_column`, K3-delta passes `write_column` behind `mask_bits`. F3's copy disappears and
-  future delta work is done once.
-
-### Launcher findings (`codegen_runtime.cpp`, 1903 lines)
-
-`masked_launch.hpp` declares seven entry points; an eighth (`launch_decode_fused_tree`, plain
-decode) lives in `codegen_bridge.hpp`.
-
-| Launcher | Kernel | Does | Body |
-|---|---|---|---|
-| `…_mask_out` (729) | K1 | decode + range compare → mask words, no column out | 34 |
-| `…_mask_consume` (765) | K3 | decode consuming mask+offsets → compacted column | 27 |
-| `…_index_consume` (794) | K4 | decode driven by survivor row-id list → compacted | 28 |
-| `…_mask_dict_gather` (1099) | K5 | decode dict codes, gather fixed-width key bytes → compacted chars | 33 |
-| `…_str_split_meta` (824) | K6·1 | masked offsets → survivor `{src_offset, length}` | 33 |
-| `launch_masked_char_copy` (884) | K6·2 | fixed kernel, byte-gather survivor chars | 46 |
-| `…_pair_mask_out` (932) | K1m2 | two columns, `a OP b` + optional ranges → mask words | 165 |
-
-The launcher layer is **already** factored around a shared core
-(`launch_decode_fused_tree_impl` → `run_rendered_decode`, driven by `VariantLaunchArgs:459-469`).
-Five entry points are thin: of their 27-34 lines, ~12-22 is the precondition block and its
-`fprintf`, ~5-8 fills `VariantLaunchArgs`, one line calls the core. The duplication is elsewhere.
-
-**F4 — the pair launcher reimplements the core.** `launch_decode_fused_tree_pair_mask_out`
-(932-1096) is 165 lines, ~120 of which duplicate the core: the 4-arm try/catch (945, 1083-1095
-vs 699-712), `dtype_to_cxx` + report (962-970 vs 657-663), the elem_size ternary (997-1002 vs
-664-667, a third copy), transients + alloc lambda (990-996 vs 671-677),
-`synthesize_decode_transients` + error (1003-1011 vs 680-685), render + `RenderError` catch
-(1019-1026 vs 490-496), `compile_rendered` (1027-1032 vs 500-505), the buffer bind loop
-(1034-1045 vs 509-519), args assembly (1052-1062 vs 552-586), and
-`maybe_raise_smem` + launch + sync (1064-1081 vs 588-612). It forked because the core assumes
-**one** tree/dtype/`LabeledBuffers`; the pair needs two plus a merge (1014-1017).
-
-> **Safety consequence:** the pair path omits the per-chunk metadata bounds guard at
-> `run_rendered_decode:520-547`, whose comment states it prevents an out-of-bounds read that
-> "would fault the CUDA context". This is a missing check, not just redundancy.
-
-**F5 — two switches over one enum, unchecked.** `run_rendered_decode:568-586` pushes trailing
-kernel *arguments* per variant; `renderer.cpp:343-387` emits the matching trailing
-*parameters*. They must agree exactly across two files, and `cuLaunchKernel` takes `void**` —
-**a mismatch is silent argument misalignment, not a compile error.** Highest-risk duplication
-in this area.
-
-**F6 — five bespoke precondition blocks.** (737-745, 773-785, 803-815, 833-846,
-1109-1123), ~60 lines differing only in which `VariantLaunchArgs` slots must be non-null — a
-property of the variant.
-
-
-### Launcher refactor
-
-**1. Spec carries its trailing parameters** (fixes F5 by construction):
-
-```cpp
-enum class TrailingParam { pred_lo, pred_hi, sel_mask, chunk_offsets,
-                           keys_chars, key_width, row_indices, len_out };
-struct DecodeKernelSpec { ...; std::vector<TrailingParam> trailing; };  // kernel param order
-```
-
-`finalize()` emits the C++ parameter text *and* `trailing` from one list; the launcher becomes
-`for (auto p : spec.trailing) args.push_back(va.slot(p));`. Both switches disappear. Under the
-enumerator × consumer factoring, each piece owns its emitted text *and* its `TrailingParam`
-tags — a new variant is one object, not two coordinated switch arms in two files.
-
-**2. Core takes N trees** (fixes F4):
-
-```cpp
-struct DecodeInputs {
-  std::span<const jit::FusedTree* const> trees;    // 1, or 2 for pair
-  std::span<const char* const>           dtypes;
-  std::span<jit::LabeledBuffers* const>  labeled;  // merged + re-keyed internally
-};
-```
-
-`"0.*" → "k.*"` re-keying moves into the core for `k > 0`. The pair launcher drops to a thin
-wrapper **and inherits the metadata bounds guard it currently lacks.**
-
-**3. Table-driven preconditions** (fixes F6):
-
-```cpp
-struct VariantContract {
-  bool needs_mask_words, needs_chunk_offsets, needs_row_indices,
-       needs_keys, needs_len_out, needs_out;
-  bool rejects_float;                       // ballot variants: integer-domain compare only
-  std::int64_t (*domain)(std::int64_t);     // identity; rows+1 for str_split_meta
-};
-```
-
-One `check_contract(...)` with one uniform diagnostic replaces five blocks; `str_split_meta`'s
-`num_string_rows + 1` domain shift (854-855) becomes declared rather than buried; the thrice-
-written elem_size ternary folds into one helper.
-
-**4. One entry point over per-op structs.** Once F6 removes the validation bodies, the wrappers
-are one line each — so why keep them? They do buy something real: each gives one variant a
-**total signature over a partial struct**. `VariantLaunchArgs` has eight optional, defaulted
-fields; each variant needs a different subset, so calling the core directly and forgetting
-`va.keys_chars` compiles and fails at runtime. But they buy it *badly* — they funnel into the
-same optional bag and the guarantee is then re-established by hand (F6). Keep the totality,
-drop the bag:
-
-```cpp
-namespace decode_op {
-  struct Plain        { void* out; };
-  struct MaskOut      { range_predicate pred;  selection_mask& mask; };
-  struct MaskConsume  { selection_mask const& mask; void* out; };
-  struct IndexConsume { selection_mask const& mask; std::int32_t const* row_indices; void* out; };
-  struct DictGather   { selection_mask const& mask; void const* keys; std::int32_t key_width; void* out; };
-  struct StrMeta      { selection_mask const& mask; std::int64_t* src_offsets; std::int32_t* lengths; };
-  struct PairMaskOut  { pair_cmp op; range_predicate a, b; selection_mask& mask; };
-}
-bool launch_decode(DecodeInputs, std::int64_t num_rows,
-                   std::variant<decode_op::…> const&, rmm::cuda_stream_view);
-```
-
-No defaults ⇒ a missing field is a compile error (what the wrappers were reaching for). The
-runtime table then checks only what types cannot: pointer non-null, `mask.num_rows == num_rows`,
-non-float dtype for ballot ops, chunk-geometry match for pairs.
-
-Optionally keep the seven named functions as trivial inline forwarders — discoverability and
-grep-ability at zero cost, once F6 has emptied their bodies.
-
-Net: the decode section (636-1133, ~500 lines) should land near 250.
-
-**Leave `launch_masked_char_copy` (884-929) alone** — fixed non-JIT source, no tree, no spec;
-forcing it into the framework adds coupling for nothing.
-
-### The two refactors are one refactor
-
-The launcher ops and the renderer variants are **the same taxonomy, enumerated flatly in two
-places with two spellings**. Every existing op is a point in the enumerator × consumer product:
-
-| Launcher op | Enumerator | Consumer |
-|---|---|---|
-| `Plain` | `all_rows` | `write_column` |
-| `MaskOut` | `all_rows` | `ballot(range)` |
-| `PairMaskOut` | `all_rows` | `ballot(pair)` — 2 trees |
-| `MaskConsume` | `mask_bits` | `write_column` |
-| `IndexConsume` | `index_list` | `write_column` |
-| `DictGather` | `mask_bits` | `dict_gather` |
-| `StrMeta` | `mask_bits` | `offsets_meta` |
-
-So the op should be the **product**, not a flat list of its currently-implemented points:
-
-```cpp
-struct decode_op { Enumerator enumerator; Consumer consumer; };
-```
-
-Each axis piece then owns, in one place:
-
-1. its emitted CUDA text (renderer),
-2. its `TrailingParam` tags **and** the matching runtime pointers/scalars (launcher args — F5
-   dissolves, because emission and binding come from the same object),
-3. its precondition contract (F6's table),
-4. its capability requirement (which plan roots support it — §4's `probe_column`).
-
-That is the endgame: **adding a kernel shape touches one descriptor instead of five coordinated
-sites** (`DecodeVariant` enum, emitted params, pushed args, a new wrapper, a `plan_supports_*`
-probe).
-
-Two consequences worth stating:
-
-- **Arity stops being special.** `PairMaskOut` is not a separate path — it is `ballot` with a
-  2-ary predicate, and `DecodeInputs.trees.size()` must match the predicate's arity. F4's
-  165-line fork was the cost of treating arity as a fork rather than a parameter.
-- **The product is bigger than the implemented set** (3 × 4 = 12 points, 7 implemented). Missing
-  combinations become constructible the moment both pieces exist — see §7. Not all 12 are
-  meaningful (`index_list` × `ballot` would re-ballot only survivors), so the product needs a
-  small validity predicate; that predicate is one function, not twelve emitters.
+Method worth reusing: `renderer.cpp` depends only on `fused_tree.hpp` /
+`render_util.hpp` / stdlib — no CUDA, cudf or rmm — so a dump-and-diff of
+`render()` output compiles standalone with `g++ -std=c++20 -I include` in
+seconds and needs no GPU. Every step above was verified byte-identical that way
+before it was committed, which is what made threading a store policy through the
+*plain* decode path safe to attempt.
 
 ### Safety net
 
-Pin the rendered source for the plain variant of each shipped SF1000 plan shape in a golden
-test **first**. Then any perturbation of the plain path is a string diff, not a performance
-mystery — this is what makes threading sinks through the plain producers safe, and it removes
-the constraint that forced F3.
+`tests/test_render_signature_contract.cpp` (CTest: `render_signature_contract`)
+asserts `declared params == buffers + 2 + trailing` for every shape × dtype ×
+tree shape and the pair path, plus tag validity and uniqueness. It parses the
+rendered signature rather than diffing a golden string, so kernel-*body* changes
+do not churn it — only a break in the signature contract does. Mutation-tested:
+injecting one undeclared parameter fails it across every shape. No GPU, no
+NVRTC; milliseconds.
 
-Caveats: deduping F1 changes emitted *comment* text, hence the source string, hence the JIT
-cache key — expect a one-time cold-cache blip. And F1 is verified as textual equivalence, not
-compiled equivalence; diff the rendered source for the shipped plans before deleting.
+Entry-symbol suffixes live in `shape_symbol_suffix()`. They key the JIT cache,
+so changing one forces a recompile of that kernel everywhere.
 
 ## 6. Sequencing
 
 **Phase 0 — land #1391 on its measurements.** ~17k lines with real numbers; do not block it on
 an API refactor.
 
-**Phase 1 — value-carrying results** (small, independently reviewable).
-Replace P5's type sniff and P6's RTTI tags with `decoded_batch_representation` + `scan_read_result`.
+**Phase D — codegen dedup. DONE** (§5). Independent of Parts A–C: it changed no public API and
+no emitted code, so it neither helps nor blocks them. It does make every later kernel-shape
+change cheap, which is the point.
+
+**Phase 1 — value-carrying results.** Replace P5's type sniff and P6's RTTI tags with one
+result type carrying `position` / `rows` / `unapplied`.
 *Accept:* `build_filter_expression_for`, `boolean_substituted_primary_indices`, both marker
 classes and the two `dynamic_cast`s are gone; TPC-H results unchanged.
+**Now the highest-value item**: since #1371 put #1380's pushdown on `dev`, P5's hazard is in
+shipped mainline code, not an unmerged PR.
 
 **Phase 2 — the facade.** Introduce `compressed_scan` over the *existing*
-`build_fused_scan_directives` + `decompress_scan_filter`. No kernel changes. Move the three
-`extract_*` functions behind it.
-*Accept:* every name in §2's delete list is gone from `src/include/` and `src/compression/*.hpp`;
-scan-side call site is the two lines above; no measurable delta.
+`build_fused_scan_directives` + `decompress_scan_filter`, moving the three `extract_*` functions
+behind it. No kernel changes.
+*Accept:* every name in §2's delete list is gone from `src/include/` and
+`src/compression/*.hpp`; the scan-side call site is the two lines in §2; no measurable delta.
 
 **Phase 3 — internals.** One route enum, one `probe_column`, merged analysis pass, one
-`fusion_policy`, `compact_scan_filter_output` folded into `decompress_scan`.
+`fusion_policy`, `compact_scan_filter_output` folded into the entry point.
 *Accept:* P1–P4, P7, P8 closed; `try_decompress_scan_filter`'s ~190 lines substantially reduced.
-
-**Phase 4 — golden-source test**, then the §5 refactor.
-*Accept:* plain rendered source byte-identical for all shipped plans; `test_masked_decode_variants`
-reparameterized over (enumerator, consumer); emitter LOC roughly halved.
-
-**Phase 4a — F5 first, independently of everything else.** Spec-carried `trailing` removes a
-silent-argument-misalignment hazard and is a small, self-contained change; it does not need the
-enumerator/consumer factoring to land. **Phase 4b** — F4 (N-tree core, which also closes the
-pair path's missing bounds guard) and F6.
-
-**Phase 4c — unify the taxonomies.** Only after 4a/4b and the emitter factoring: collapse
-`decode_op` and the renderer variants into the single enumerator × consumer product (§5, "The
-two refactors are one refactor"). Doing this earlier means refactoring both sides at once with
-no golden test in between.
-*Accept:* `DecodeVariant` is gone; adding a kernel shape touches one descriptor; the
-`plan_supports_*` probes are derived from consumer requirements rather than hand-written.
 
 Phase 2 must precede Phase 3: the facade is what buys freedom to change internals without
 touching the scan. Today every internal change is scan-visible.
 
 ## 7. Future directions this unlocks
 
-**Missing kernel combinations become constructible.** Once the op *is* the enumerator × consumer
-product (§5), the 12-point space contains 7 implemented kernels; the rest need no new emitter,
-launcher or probe — only a validity check and a reason to want them:
+**Missing kernel combinations become constructible.** With the op expressed as the enumerator ×
+consumer product (§5), the 15-point space contains 7 implemented kernels; the buildable
+remainder needs an emitter and a `shape_is_supported` entry, not a new variant tag, launcher,
+capability probe and tier:
 
 - **K4 × dict_gather**, **K4 × offsets_meta** (i.e. `index_list` × `dict_gather` / `offsets_meta`)
   — below the ~15% K4 crossover, dictionary and `str_split` strings are stuck on the mask walk
@@ -501,6 +309,54 @@ launcher or probe — only a validity check and a reason to want them:
   today (`plan_supports_dict_selection_decode` requires bitpack codes;
   `plan_supports_str_selection_decode` requires a plain bitpack offsets child). `l_comment`'s
   `delta -> ans` offsets and `c_phone`'s `delta -> rle -> bitpack` are the concrete cases.
+
+### Can the axes grow?
+
+Yes, and that is the main reason to hold the shape open rather than freeze the seven points.
+Growth on either axis is **additive**: a new consumer works under every enumerator that composes
+with it, so one emitter buys several kernels.
+
+**Enumerator — how rows are walked.** Candidates, roughly by expected value:
+
+- **`run_list`** — survivors as `(start, length)` runs rather than individual ids. Sits between
+  `mask_bits` and `index_list`: strictly better than `index_list` when survivors are *clustered*,
+  which is exactly what a range predicate on clustered or sorted data produces. `index_list`
+  pays random access per row; a run keeps coalescing.
+- **`range_slice`** — a contiguous `[lo, hi)` sub-range of the chunk. A chunk is all-or-nothing
+  today, so this is what LIMIT/OFFSET pushdown and split boundaries that cut mid-chunk would
+  need.
+- **`stride`** — every Nth row, for `TABLESAMPLE` / approximate aggregation.
+
+**Consumer — what happens per row.** This axis has more headroom, because the decode already
+holds the value in a register and currently throws that away:
+
+- **`ballot_membership`** — probe a device hash set / Bloom per row and ballot. This directly
+  fixes the asymmetry that makes membership the most expensive conjunct today: it is expensive
+  *because* it cannot work on packed bits, so wave 1 decodes the key column full width and the
+  cap is 1 (q8: 3 probes = +134 ms probe-side vs −48 ms compaction). A consumer sees decoded
+  values in-register and never materialises the column. Probably the highest-value future
+  consumer.
+- **`aggregate`** — accumulate SUM / MIN / MAX during decode instead of writing a column.
+  `SELECT SUM(l_extendedprice) WHERE …` currently materialises a column purely to reduce it.
+- **`count`** — popcount the ballot per block with no mask buffer at all. §7's count-only work is
+  `all_rows × count` once this exists; the mask words become unnecessary rather than merely
+  unused.
+- **`hash`** — compute join hash values at decode time.
+- **`null_ballot`** — `IS [NOT] NULL` masks, once a null model exists.
+
+**Constraints worth recording**, so the product is not mistaken for fully orthogonal:
+
+- **Ballot consumers require a non-compacting enumerator.** The mask layout depends on ballot
+  lanes lining up with mask bits (one `uint32` per 32 *consecutive* rows). Under `mask_bits` or
+  `index_list` the surviving rows are no longer contiguous, so the ballot cannot address the
+  output word. That is why `mask_bits × ballot_*` is unsupported rather than merely unbuilt —
+  refining a mask in a second pass would need a different output layout, not just an emitter.
+- **Arity currently hides inside the consumer** (`ballot_range` = 1 tree, `ballot_pair` = 2).
+  That is fine at 1–2. If a 3-ary consumer ever appears, arity should become explicit rather
+  than spawning `ballot_triple` — treating arity as a fork rather than a parameter is precisely
+  what produced F4's 165-line duplicate.
+- **Some consumers constrain the plan shape, not the axis** — `dict_gather` needs a bitpack code
+  leaf, `offsets_meta` needs a terminal chars channel. Those stay per-consumer render checks.
 
 **Count-only and existence.** Wave 1 + CNT already computes the exact survivor count and
 `run_selection_cnt` already returns it; everything after is waste for `COUNT(*)`. Reads
@@ -548,10 +404,11 @@ per shape.
    filtering may shrink the batch. Unavoidable; keep it a forecast, not a route list.
 4. The membership probe closure must pin its device structure (`shared_ptr` capture) for the
    call's duration — preserve that contract when conjuncts move into the AST.
-5. F5 (two unchecked switches over one enum) is a live correctness hazard — a mismatch is
-   silent argument misalignment through `void**`, not a compile error — and should not wait for
-   the rest of the plan.
-6. F4's fix changes the pair path's behaviour in one respect: it starts enforcing the metadata
-   bounds guard. If any shipped plan currently launches a pair kernel with under-sized per-chunk
-   channels, it will now refuse instead of silently reading OOB. That is the intended outcome,
-   but expect it to surface rather than stay quiet.
+5. F4's fix changed the pair path's behaviour in one respect: it now enforces the metadata
+   bounds guard. If any plan launches a pair kernel with under-sized per-chunk channels it now
+   refuses instead of silently reading OOB. That is the intended outcome, but expect it to
+   surface rather than stay quiet.
+6. Git's auto-merge silently duplicated four definitions when merging `dev` (§0), because both
+   sides had added the same construct at different offsets in one file — one of them in a file
+   with no conflict at all. Only the compiler caught it. Expect this anywhere #1380's content
+   exists on both sides of a future merge.
