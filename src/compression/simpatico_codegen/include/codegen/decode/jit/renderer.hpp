@@ -163,6 +163,36 @@ struct DecodeBufferSpec {
   std::size_t elem_size;  // bytes/elem of the channel's logical dtype
 };
 
+// One trailing kernel parameter — those following the fixed `(out, n)` pair.
+//
+// The renderer emits the parameter DECLARATION TEXT and the matching tag list
+// (DecodeKernelSpec::trailing) from a single table, and the launcher binds
+// arguments by walking that list.  Emission order and binding order therefore
+// cannot drift: previously they were two hand-maintained switches over
+// DecodeVariant in two different files, with cuLaunchKernel's untyped void**
+// between them, so a mismatch was silent argument misalignment rather than a
+// compile error.
+//
+// Values are supplied by the launcher (predicate constants and mask pointers
+// travel as kernel ARGUMENTS, never rendered into the source, so one compile
+// per (shape, dtype, variant) serves every literal).
+enum class TrailingParam : std::uint8_t {
+  pred_lo = 0,    // mask_out: inclusive range low, decoded integer domain
+  pred_hi,        // mask_out: inclusive range high
+  sel_mask,       // mask_consume / dict_gather / str_split_meta: mask words in
+  chunk_offsets,  // consuming variants: per-chunk exclusive survivor bases
+  keys_chars,     // mask_dict_gather: constant-width key pool chars
+  key_width,      // mask_dict_gather: bytes per key
+  row_indices,    // index_consume: ascending global int32 survivor row ids
+  len_out,        // str_split_meta: per-survivor byte lengths (output)
+  cmp_op,         // pair mask: comparison op code (0 '<', 1 '<=', 2 '>', 3 '>=')
+  lo_a,           // pair mask: column A inclusive range
+  hi_a,
+  lo_b,  // pair mask: column B inclusive range
+  hi_b,
+  kCount  // sentinel: size of a tag-indexed table
+};
+
 // Rendering result.  Move-only; cheap (no GPU resources).  Hand
 // `source` + `entry_symbol` to `compile_plain_kernel` (or the kernel
 // cache) to obtain a CompiledKernel.
@@ -172,6 +202,11 @@ struct DecodeKernelSpec {
 
   // Input channels in the kernel's parameter order (before out, n).
   std::vector<DecodeBufferSpec> buffers;
+
+  // Trailing scalar/pointer parameters AFTER (out, n), in kernel parameter
+  // order.  The launcher must push its arguments in exactly this order; it is
+  // emitted alongside the declaration text, so the two cannot disagree.
+  std::vector<TrailingParam> trailing;
 
   // Launch geometry.  grid_x = num_chunks_for(n) (launcher computes).
   int block_x      = 128;  // plain-CUDA block; RLE/Delta primitives assume 128
