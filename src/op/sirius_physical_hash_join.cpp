@@ -1468,9 +1468,14 @@ static constexpr cudf::size_type k_max_distinct_count_rows =
   std::numeric_limits<cudf::size_type>::max() / 2;
 
 /// @brief Largest build the runtime distinctness test is allowed to probe at all. Heuristic
-/// limitation
+/// limitation.
 static constexpr cudf::size_type k_max_distinct_probe_rows = 128 * 1024 * 1024;
 static_assert(k_max_distinct_probe_rows <= k_max_distinct_count_rows);
+
+/// @brief Number of rows with which to sample the keys cheaply for a quick refutation of
+/// non-distinctness. The static set for the sample will fit in the L2 cache for recent
+/// architectures at 16MB.
+static constexpr cudf::size_type k_distinct_refute_sample_rows = 1024 * 1024;
 
 /// @brief Exact runtime test that the build keys hold no duplicate rows.
 /// @note Reads a count back to the host, so it synchronizes the stream.
@@ -1482,6 +1487,13 @@ static bool build_keys_are_distinct(cudf::table_view const& build_keys,
   if (num_rows == 1) { return true; }
   if (build_keys.num_columns() == 0 || num_rows <= 0 || num_rows > k_max_distinct_probe_rows) {
     return false;
+  }
+  // Guard the full uniqueness test on a sample.
+  if (num_rows > 4 * k_distinct_refute_sample_rows) {
+    auto const prefix = cudf::slice(build_keys, {0, k_distinct_refute_sample_rows}, stream).front();
+    if (cudf::distinct_count(prefix, nulls_equal, stream) != k_distinct_refute_sample_rows) {
+      return false;
+    }
   }
   return cudf::distinct_count(build_keys, nulls_equal, stream) == num_rows;
 }
