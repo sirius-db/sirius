@@ -319,86 +319,129 @@ void task_scheduler::management_eventloop()
   telemetry::TaskManagerLoopThreadHandleWrapper manager_thread_telemetry{
     *_telemetry_context, "task-scheduler-thread", _telemetry_context->shared_group_id()};
 
-  // Pull-signal scheduler. The loop blocks on _task_request_channel for two
-  // event kinds:
-  //   - device_ready  : a gpu_pipeline_executor has reserved a worker thread
-  //                     and is ready to accept a task.
-  //   - task_available: schedule() pushed a new task into _task_queue and is
-  //                     asking us to re-run the matcher in case a device was
-  //                     already waiting.
+  // Two-sleep-site pull-signal scheduler. The matcher needs two kinds of news:
+  //   - a task arrived in _task_queue. Most pushes go through schedule(), which
+  //     also emits a task_available channel event — but the downgrade executor
+  //     returns extracted tasks via convertible_gpu_pipeline_task's RAII
+  //     destructor, a direct _task_queue.push() that emits NO event.
+  //   - a device became ready (device_ready on _task_request_channel, sent by a
+  //     gpu_pipeline_executor once it has reserved a worker thread).
+  // A single blocking site can't hear both sources: blocking only on the
+  // channel misses the downgrade's silent returns (queued tasks + parked
+  // devices + no future event = permanent deadlock, seen at SF1000 q18), and
+  // blocking only on the queue misses device_ready. So the loop picks its
+  // sleep site from queue state:
+  //   - queue EMPTY            -> sleep on _task_queue.wait_non_empty(), which
+  //                               hears every push, silent or not. device_ready
+  //                               events meanwhile buffer in the channel and are
+  //                               drained on wake.
+  //   - queue non-empty but no  -> sleep on _task_request_channel.get(); only a
+  //     task dispatchable         device_ready (or a schedule() push that might
+  //                               match a parked device) can change the outcome.
   // Tasks remain in _task_queue (downgrade-visible) until we have a ready
   // device to match them against — this is the property the push model in
-  // PR #732 lost and that this loop restores.
+  // PR #732 lost and that the pull-signal loop restores.
+  //
+  // Known trade-off: while asleep on the channel (non-empty queue, nothing
+  // dispatchable), a silent downgrade return is not noticed until the next
+  // channel event — a dispatch-latency bubble, not a deadlock, since sleeping
+  // there implies at least one device is busy and will post device_ready.
   while (_running.load()) {
-    // Block for the next event.
-    auto evt = _task_request_channel.get();
-    if (evt == nullptr) {
-      SIRIUS_LOG_INFO("Task request channel closed, exiting management event loop.");
-      break;
-    }
-    if (evt->kind == task_request_kind::device_ready && !evt->is_scan) {
-      _ready_devices.emplace_back(evt->device_id);
-    }
-    // Drain any further events that are already queued, so a single matcher
-    // pass handles a burst of ready signals plus task pushes together.
-    while (auto more = _task_request_channel.try_get()) {
-      if (more->kind == task_request_kind::device_ready && !more->is_scan) {
-        _ready_devices.emplace_back(more->device_id);
+    // Collect any pending events without blocking, so the matcher sees the
+    // freshest set of parked devices no matter which site we last slept on.
+    while (auto evt = _task_request_channel.try_get()) {
+      if (evt->kind == task_request_kind::device_ready && !evt->is_scan) {
+        _ready_devices.emplace_back(evt->device_id);
       }
     }
 
     if (_task_queue.empty()) {
-      if (_task_creator) { _task_creator->schedule_lookahead(*_ready_devices.begin()); }
+      // With an empty queue and a waiting device, ask the creator to
+      // pre-create work before sleeping (lookahead strategy only; no-op under
+      // the default `active` strategy). Any task it creates arrives through
+      // schedule() and wakes the queue sleep below.
+      if (_task_creator && !_ready_devices.empty()) {
+        _task_creator->schedule_lookahead(*_ready_devices.begin());
+      }
+      // Sleep site 1: wait for any push into the queue. Returns false only
+      // when the queue is interrupted (stop()).
+      if (!_task_queue.wait_non_empty()) {
+        SIRIUS_LOG_INFO("Task queue interrupted, exiting management event loop.");
+        break;
+      }
+      continue;  // re-drain the channel, then match
     }
 
-    // Matcher: for each ready device, try to find a dispatchable task.
-    // A task is dispatchable to device X if:
-    //   (a) its preferred_device_id == X (exact match), OR
-    //   (b) it has no preferred_device_id (any device will do).
-    // Tasks with a preference for a DIFFERENT device must wait — they may
-    // reference GPU-resident data (cache=table_gpu, partitioned batches) that
-    // is only valid on the preferred device. Step (ii) will introduce an
-    // explicit strict-vs-prefer bit; for now, all preferences are treated as
-    // binding to guarantee correctness.
-    for (auto it = _ready_devices.begin(); it != _ready_devices.end();) {
-      const int device_id = *it;
-      std::unique_ptr<sirius::parallel::itask> task;
+    const size_t dispatched = run_matcher(manager_thread_telemetry);
 
-      // Exact preference match: the device index returns the highest-priority
-      // (lowest value) task preferring exactly this device.
-      task = _task_queue.try_pop_from(exec::gpu_index{device_id}).value_or(nullptr);
-      if (!task) {
-        // pick a task with no preference (any device will do). The round-robin counter
-        task =
-          _task_queue.try_pop_from(exec::gpu_index{exec::no_preferred_device}).value_or(nullptr);
+    if (dispatched == 0) {
+      // Tasks exist but none is dispatchable: every queued task prefers a
+      // device that is not parked. Sleep site 2: only a channel event can
+      // change the outcome — block for it rather than spinning.
+      auto evt = _task_request_channel.get();
+      if (evt == nullptr) {
+        SIRIUS_LOG_INFO("Task request channel closed, exiting management event loop.");
+        break;
       }
-      if (!task) {
-        // No dispatchable task for this device. Leave device in _ready_devices
-        // and move on — it will match when an appropriate task arrives.
-        ++it;
-        continue;
+      if (evt->kind == task_request_kind::device_ready && !evt->is_scan) {
+        _ready_devices.emplace_back(evt->device_id);
       }
-      uint64_t task_id = 0;
-      if (auto* gpu_task = dynamic_cast<pipeline::gpu_pipeline_task*>(task.get())) {
-        task_id = gpu_task->get_task_id();
-      }
-
-      if (auto* pipeline_task = dynamic_cast<sirius_pipeline_itask*>(task.get())) {
-        pipeline_task->telemetry_handle().routing({
-          .instance_name              = "",
-          .preferred_device_id        = device_id,
-          .manager_thread_resource_id = manager_thread_telemetry.handle->uuid(),
-        });
-      }
-
-      // // Log prefix "[mgpu-audit] pipeline_task dispatched to GPU N" is
-      // // load-bearing — verification greps depend on it.
-      // SIRIUS_LOG_INFO(
-      //   "[mgpu-audit] pipeline_task dispatched to GPU {} task_id={}", device_id, task_id);
-      _gpu_executors.at(device_id)->schedule(std::move(task));
-      it = _ready_devices.erase(it);
     }
   }
+}
+
+size_t task_scheduler::run_matcher(
+  telemetry::TaskManagerLoopThreadHandleWrapper& manager_thread_telemetry)
+{
+  size_t dispatched = 0;
+  // Matcher: for each ready device, try to find a dispatchable task.
+  // A task is dispatchable to device X if:
+  //   (a) its preferred_device_id == X (exact match), OR
+  //   (b) it has no preferred_device_id (any device will do).
+  // Tasks with a preference for a DIFFERENT device must wait — they may
+  // reference GPU-resident data (cache=table_gpu, partitioned batches) that
+  // is only valid on the preferred device. Step (ii) will introduce an
+  // explicit strict-vs-prefer bit; for now, all preferences are treated as
+  // binding to guarantee correctness.
+  for (auto it = _ready_devices.begin(); it != _ready_devices.end();) {
+    const int device_id = *it;
+    std::unique_ptr<sirius::parallel::itask> task;
+
+    // Exact preference match: the device index returns the highest-priority
+    // (lowest value) task preferring exactly this device.
+    task = _task_queue.try_pop_from(exec::gpu_index{device_id}).value_or(nullptr);
+    if (!task) {
+      // pick a task with no preference (any device will do). The round-robin counter
+      task = _task_queue.try_pop_from(exec::gpu_index{exec::no_preferred_device}).value_or(nullptr);
+    }
+    if (!task) {
+      // No dispatchable task for this device. Leave device in _ready_devices
+      // and move on — it will match when an appropriate task arrives.
+      ++it;
+      continue;
+    }
+    uint64_t task_id = 0;
+    if (auto* gpu_task = dynamic_cast<pipeline::gpu_pipeline_task*>(task.get())) {
+      task_id = gpu_task->get_task_id();
+    }
+
+    if (auto* pipeline_task = dynamic_cast<sirius_pipeline_itask*>(task.get())) {
+      pipeline_task->telemetry_handle().routing({
+        .instance_name              = "",
+        .preferred_device_id        = device_id,
+        .manager_thread_resource_id = manager_thread_telemetry.handle->uuid(),
+      });
+    }
+
+    // // Log prefix "[mgpu-audit] pipeline_task dispatched to GPU N" is
+    // // load-bearing — verification greps depend on it.
+    // SIRIUS_LOG_INFO(
+    //   "[mgpu-audit] pipeline_task dispatched to GPU {} task_id={}", device_id, task_id);
+    _gpu_executors.at(device_id)->schedule(std::move(task));
+    it = _ready_devices.erase(it);
+    ++dispatched;
+  }
+  return dispatched;
 }
 
 }  // namespace pipeline

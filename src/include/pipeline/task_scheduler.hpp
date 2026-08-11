@@ -41,6 +41,7 @@ class downgrade_executor;
 namespace sirius::telemetry {
 class telemetry_context;
 struct TaskQueueHandleWrapper;
+struct TaskManagerLoopThreadHandleWrapper;
 }  // namespace sirius::telemetry
 
 namespace sirius {
@@ -213,7 +214,31 @@ class task_scheduler {
   }
 
  private:
+  /**
+   * @brief Two-sleep-site management loop (see the .cpp for the full contract).
+   *
+   * Sleeps on _task_queue.wait_non_empty() while the queue is empty — hearing
+   * every push, including the downgrade executor returning extracted tasks via
+   * a direct queue push that bypasses schedule() — and on
+   * _task_request_channel.get() when tasks exist but none is dispatchable
+   * (waiting for a device_ready). Woken from either site by stop(), which
+   * interrupts the queue and closes the channel.
+   */
   void management_eventloop();
+
+  /**
+   * @brief One matcher pass: dispatch queued tasks to parked ready devices.
+   *
+   * For each device in _ready_devices, pops the highest-priority task that
+   * prefers exactly that device, falling back to the highest-priority task
+   * with no device preference; dispatches it to that device's executor and
+   * unparks the device. Devices with no dispatchable task stay parked.
+   *
+   * @param manager_thread_telemetry Telemetry wrapper of the management thread.
+   * @return The number of tasks dispatched (0 means every queued task prefers
+   *         a device that is not parked, or no device is parked).
+   */
+  size_t run_matcher(telemetry::TaskManagerLoopThreadHandleWrapper& manager_thread_telemetry);
 
   std::mutex _query_mutex;
   duckdb::shared_ptr<planner::query> _query;
