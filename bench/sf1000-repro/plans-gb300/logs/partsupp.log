@@ -284,4 +284,3 @@ str_split.offsets.differences -> ans
   str_split.chars -> bitcomp
   str_split.offsets -> delta -> differences
   str_split.offsets.differences -> ans
-

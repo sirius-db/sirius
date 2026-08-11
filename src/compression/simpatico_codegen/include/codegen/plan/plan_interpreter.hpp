@@ -5,9 +5,8 @@
 #include "codegen/plan/plan_dsl.hpp"
 #include "codegen/plan/plan_tree.hpp"
 #include "codegen/plan/representation.hpp"
-#include "codegen/util/stream_pool.hpp"
-
 #include "codegen/selection/selection.hpp"
+#include "codegen/util/stream_pool.hpp"
 
 #include <cudf/table/table.hpp>
 #include <cudf/utilities/default_stream.hpp>

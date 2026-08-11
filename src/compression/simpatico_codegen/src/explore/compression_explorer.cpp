@@ -785,9 +785,9 @@ exploration_result explore_column_compression(cudf::column_view input,
     std::string plan_dsl;
     double compression_ratio;
     size_t compressed_size_bytes;
-    double compress_throughput_gbps;    // warmed median-of-N
-    double decompress_throughput_gbps;  // warmed median-of-N
-    double decode_cost = 0.0;  // proxy for pareto_beam finalist selection
+    double compress_throughput_gbps;        // warmed median-of-N
+    double decompress_throughput_gbps;      // warmed median-of-N
+    double decode_cost              = 0.0;  // proxy for pareto_beam finalist selection
     double old_wall_compress_gbps   = 0.0;  // legacy one-shot rates (continuity)
     double old_wall_decompress_gbps = 0.0;
   };
@@ -957,14 +957,8 @@ exploration_result explore_column_compression(cudf::column_view input,
       auto to_gbps      = [orig](double ms) { return ms > 0 ? orig / ms / 1.0e6 : 0.0; };
       if (need_throughput) {
         rt_stats st;
-        if (!round_trip_time_stats(measure_col,
-                                   dsl,
-                                   stream,
-                                   mr,
-                                   config.rerank_warmup,
-                                   config.rerank_iters,
-                                   st,
-                                   nullptr))
+        if (!round_trip_time_stats(
+              measure_col, dsl, stream, mr, config.rerank_warmup, config.rerank_iters, st, nullptr))
           return false;
         out = {dsl,
                orig / std::max<size_t>(st.compressed_bytes, 1),

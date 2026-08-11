@@ -75,13 +75,13 @@ bool fused_scan_diag_enabled()
 // Routes one [fused-diag] line to INFO when the diag env is set, DEBUG
 // otherwise. A macro (not a function) so the level dispatch keeps the
 // call-site file/line and the lazy formatting of the underlying macros.
-#define SIRIUS_FUSED_DIAG(...)                        \
-  do {                                                \
-    if (::sirius::fused_scan_diag_enabled()) {        \
-      SIRIUS_LOG_INFO(__VA_ARGS__);                   \
-    } else {                                          \
-      SIRIUS_LOG_DEBUG(__VA_ARGS__);                  \
-    }                                                 \
+#define SIRIUS_FUSED_DIAG(...)                 \
+  do {                                         \
+    if (::sirius::fused_scan_diag_enabled()) { \
+      SIRIUS_LOG_INFO(__VA_ARGS__);            \
+    } else {                                   \
+      SIRIUS_LOG_DEBUG(__VA_ARGS__);           \
+    }                                          \
   } while (0)
 
 namespace {
@@ -164,8 +164,8 @@ sirius::codegen::output_tier to_shared_tier(decode_output_tier t)
 // which additionally requires tier_a: K1 renders bitpack-leaf roots only
 // (plan_interpreter.hpp's CAUTION on wave-1 callers).
 struct fused_column_probe {
-  bool lane_ok         = false;
-  bool compact_capable = false;
+  bool lane_ok            = false;
+  bool compact_capable    = false;
   decode_output_tier tier = decode_output_tier::tier_b;
 
   [[nodiscard]] bool range_source_ok() const noexcept
@@ -336,9 +336,9 @@ std::unique_ptr<cudf::table> try_decompress_scan_filter(
   // cleared those sides' standalone K1 participation.
   for (auto const& pair : directives.pairs) {
     sirius::codegen::pair_predicate pred;
-    pred.op          = static_cast<sirius::codegen::pair_compare_op>(pair.op);
-    auto const& ra   = directives.ranges[pair.column_a];
-    auto const& rb   = directives.ranges[pair.column_b];
+    pred.op        = static_cast<sirius::codegen::pair_compare_op>(pair.op);
+    auto const& ra = directives.ranges[pair.column_a];
+    auto const& rb = directives.ranges[pair.column_b];
     if (ra.active) { pred.range_a = {ra.lo, ra.hi}; }
     if (rb.active) { pred.range_b = {rb.lo, rb.hi}; }
     request.pair_filters.push_back({pair.column_a, pair.column_b, pred});
@@ -372,10 +372,10 @@ std::unique_ptr<cudf::table> try_decompress_scan_filter(
         return a.probe->kind_rank < b.probe->kind_rank;
       }
       // 0 = unknown key count: sort after known counts within the same kind.
-      auto const a_keys = a.probe->num_keys == 0 ? std::numeric_limits<std::uint64_t>::max()
-                                                 : a.probe->num_keys;
-      auto const b_keys = b.probe->num_keys == 0 ? std::numeric_limits<std::uint64_t>::max()
-                                                 : b.probe->num_keys;
+      auto const a_keys =
+        a.probe->num_keys == 0 ? std::numeric_limits<std::uint64_t>::max() : a.probe->num_keys;
+      auto const b_keys =
+        b.probe->num_keys == 0 ? std::numeric_limits<std::uint64_t>::max() : b.probe->num_keys;
       return a_keys < b_keys;
     });
     std::string order_echo;
@@ -404,7 +404,7 @@ std::unique_ptr<cudf::table> try_decompress_scan_filter(
   result.set_stream(stream);
   if (!table) {
     SIRIUS_FUSED_DIAG("[fused-diag] assembly REFUSED ({}); falling back to classic decompress",
-                    error);
+                      error);
     return nullptr;
   }
   // row_filtered only when the mask carried EVERY restricting conjunct: a
@@ -502,18 +502,19 @@ std::unique_ptr<cucascade::idata_representation> reconstruct_and_decompress_to_g
     // `subset` holds exactly the projected columns, so selection is identity.
     std::vector<std::size_t> identity_selection(subset.num_columns());
     std::iota(identity_selection.begin(), identity_selection.end(), std::size_t{0});
-    decompressed = try_decompress_scan_filter(subset,
-                                              identity_selection,
-                                              range_pushdown,
-                                              range_conjuncts_convertible,
-                                              equality_pushdown,
-                                              decode_pair_pushdown{},  // carrier pending (STATUS-W2)
-                                              membership_pushdown,
-                                              membership_generation,
-                                              pool,
-                                              stream,
-                                              mr,
-                                              tag);
+    decompressed =
+      try_decompress_scan_filter(subset,
+                                 identity_selection,
+                                 range_pushdown,
+                                 range_conjuncts_convertible,
+                                 equality_pushdown,
+                                 decode_pair_pushdown{},  // carrier pending (STATUS-W2)
+                                 membership_pushdown,
+                                 membership_generation,
+                                 pool,
+                                 stream,
+                                 mr,
+                                 tag);
   }
   if (!decompressed) {
     if (predicates.empty()) {
@@ -622,8 +623,7 @@ std::unique_ptr<cucascade::idata_representation> decompress_device_to_gpu(
     rep.range_pushdown().size(),
     rep.range_conjuncts_convertible());
   std::vector<std::size_t> identity_selection;
-  if (!rep.range_pushdown().empty() || !predicates.empty() ||
-      !rep.membership_pushdown().empty()) {
+  if (!rep.range_pushdown().empty() || !predicates.empty() || !rep.membership_pushdown().empty()) {
     std::span<const std::size_t> selected;
     if (indices.has_value()) {
       selected = *indices;
@@ -632,18 +632,19 @@ std::unique_ptr<cucascade::idata_representation> decompress_device_to_gpu(
       std::iota(identity_selection.begin(), identity_selection.end(), std::size_t{0});
       selected = identity_selection;
     }
-    decompressed = try_decompress_scan_filter(ct,
-                                              selected,
-                                              rep.range_pushdown(),
-                                              rep.range_conjuncts_convertible(),
-                                              rep.equality_pushdown(),
-                                              decode_pair_pushdown{},  // carrier pending (STATUS-W2)
-                                              rep.membership_pushdown(),
-                                              rep.membership_generation(),
-                                              pool,
-                                              stream,
-                                              mr,
-                                              tag);
+    decompressed =
+      try_decompress_scan_filter(ct,
+                                 selected,
+                                 rep.range_pushdown(),
+                                 rep.range_conjuncts_convertible(),
+                                 rep.equality_pushdown(),
+                                 decode_pair_pushdown{},  // carrier pending (STATUS-W2)
+                                 rep.membership_pushdown(),
+                                 rep.membership_generation(),
+                                 pool,
+                                 stream,
+                                 mr,
+                                 tag);
   }
   if (!decompressed) {
     if (predicates.empty()) {
@@ -706,9 +707,10 @@ fused_scan_directives build_fused_scan_directives(const simpatico::compressed_ta
   bool const any_active = std::any_of(
     attached_ranges.begin(), attached_ranges.end(), [](auto const& e) { return e.active; });
   if (!any_active && !has_external_sources && attached_pairs.empty()) {
-    SIRIUS_FUSED_DIAG("[fused-diag] directives: {} attached range entr(ies), NONE active, no "
-                      "bool8/pair/membership sources — classic path",
-                      attached_ranges.size());
+    SIRIUS_FUSED_DIAG(
+      "[fused-diag] directives: {} attached range entr(ies), NONE active, no "
+      "bool8/pair/membership sources — classic path",
+      attached_ranges.size());
     return out;
   }
   if (attached_ranges.size() > selected_columns.size()) {
@@ -778,7 +780,7 @@ fused_scan_directives build_fused_scan_directives(const simpatico::compressed_ta
     if (ok) {
       auto const probe_a = probe_fused_column(table, selected_columns[pair.column_a]);
       auto const probe_b = probe_fused_column(table, selected_columns[pair.column_b]);
-      ok = probe_a.range_source_ok() && probe_b.range_source_ok();
+      ok                 = probe_a.range_source_ok() && probe_b.range_source_ok();
     }
     if (!ok) {
       SIRIUS_FUSED_DIAG(

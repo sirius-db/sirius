@@ -220,7 +220,7 @@ class Walker {
 
  private:
   std::string dtype_;
-  DecodeVariant variant_ = DecodeVariant::plain;
+  DecodeVariant variant_    = DecodeVariant::plain;
   static constexpr int tbs_ = ::codegen::kTBSize;
   std::ostringstream params_;
   std::ostringstream body_;
@@ -614,9 +614,10 @@ static std::string rank_expr(const std::string& pos)
 void Walker::emit_bitpack_mask_consume(const ::codegen::jit::FusedTree& node)
 {
   if (node.op != ::codegen::OpKind::Bitpack || !node.children.empty()) {
-    throw RenderError("decode render: mask_consume variant requires a Bitpack leaf or Delta root "
-                      "(got '" +
-                      std::string(::codegen::jit::op_kind_name(node.op)) + "')");
+    throw RenderError(
+      "decode render: mask_consume variant requires a Bitpack leaf or Delta root "
+      "(got '" +
+      std::string(::codegen::jit::op_kind_name(node.op)) + "')");
   }
   body_ << "    // --- node " << id_of(node)
         << ": Bitpack masked decode -> compacted output (K3) ---\n"
@@ -651,8 +652,9 @@ void Walker::emit_bitpack_mask_consume(const ::codegen::jit::FusedTree& node)
 void Walker::emit_delta_mask_consume(const ::codegen::jit::FusedTree& node)
 {
   if (node.op != ::codegen::OpKind::Delta || node.children.size() != 1) {
-    throw RenderError("decode render: mask_consume Delta root must have exactly one "
-                      "'differences' child");
+    throw RenderError(
+      "decode render: mask_consume Delta root must have exactly one "
+      "'differences' child");
   }
   auto vit = node.children.find("differences");
   if (vit == node.children.end()) {
@@ -669,8 +671,7 @@ void Walker::emit_delta_mask_consume(const ::codegen::jit::FusedTree& node)
   add_param("const " + dtype_ + "* __restrict__", p_first);
   add_buffer(id, "delta_first", esize);
 
-  body_ << "    // --- node " << id
-        << ": Delta masked decode -> compacted output (K3-delta) ---\n";
+  body_ << "    // --- node " << id << ": Delta masked decode -> compacted output (K3-delta) ---\n";
   emit_selection_stage();
 
   const std::string dlen  = "dlen_" + idstr;
@@ -690,9 +691,8 @@ void Walker::emit_delta_mask_consume(const ::codegen::jit::FusedTree& node)
 
   // Child value source (closed-form expr, or a materialised slab read) —
   // same contract as the plain Delta producer.
-  const auto mark = sm_.mark();
-  ValueSource child_vs =
-    value_source(*vit->second, dtype_, "((len) > 0 ? ((len) - 1) : 0)");
+  const auto mark      = sm_.mark();
+  ValueSource child_vs = value_source(*vit->second, dtype_, "((len) > 0 ? ((len) - 1) : 0)");
 
   // Root level: STRIPED loads + BlockExchange transpose, exactly like the
   // plain producer's use_striped branch (masked variants are root-only, so
@@ -728,7 +728,8 @@ void Walker::emit_delta_mask_consume(const ::codegen::jit::FusedTree& node)
   const std::string dutype = unsigned_counterpart(esize);
   body_ << "        const " << dtype_ << " " << first << " = " << p_first << "[chunk_id];\n"
         << "        const int64_t out_base = static_cast<int64_t>(chunk_offsets[chunk_id]);\n"
-        << "        if (tid == 0 && " << dlen << " > 0 && (sel_words[0] & 1u)) (out + out_base)[0] "
+        << "        if (tid == 0 && " << dlen
+        << " > 0 && (sel_words[0] & 1u)) (out + out_base)[0] "
            "= "
         << first << ";\n"
         << "        #pragma unroll\n"
@@ -739,9 +740,8 @@ void Walker::emit_delta_mask_consume(const ::codegen::jit::FusedTree& node)
         << "                const uint32_t w = sel_words[row >> 5];\n"
         << "                if ((w >> (row & 31)) & 1u) {\n"
         << "                    const int32_t rank = " << rank_expr("row") << ";\n"
-        << "                    (out + out_base)[rank] = static_cast<" << dtype_
-        << ">(static_cast<" << dutype << ">(" << first << ") + static_cast<" << dutype << ">("
-        << items << "[j]));\n"
+        << "                    (out + out_base)[rank] = static_cast<" << dtype_ << ">(static_cast<"
+        << dutype << ">(" << first << ") + static_cast<" << dutype << ">(" << items << "[j]));\n"
         << "                }\n"
         << "            }\n"
         << "        }\n"
@@ -760,12 +760,12 @@ void Walker::emit_delta_mask_consume(const ::codegen::jit::FusedTree& node)
 void Walker::emit_bitpack_mask_dict_gather(const ::codegen::jit::FusedTree& node)
 {
   if (node.op != ::codegen::OpKind::Bitpack || !node.children.empty()) {
-    throw RenderError("decode render: mask_dict_gather variant requires a Bitpack code leaf root "
-                      "(got '" +
-                      std::string(::codegen::jit::op_kind_name(node.op)) + "')");
+    throw RenderError(
+      "decode render: mask_dict_gather variant requires a Bitpack code leaf root "
+      "(got '" +
+      std::string(::codegen::jit::op_kind_name(node.op)) + "')");
   }
-  body_ << "    // --- node " << id_of(node)
-        << ": Bitpack code masked dictionary gather (K5) ---\n"
+  body_ << "    // --- node " << id_of(node) << ": Bitpack code masked dictionary gather (K5) ---\n"
         << "    (void)len;  // mask tail bits are zero, so selected rows are always < len\n";
   emit_selection_stage();
 
@@ -801,9 +801,10 @@ void Walker::emit_bitpack_mask_dict_gather(const ::codegen::jit::FusedTree& node
 void Walker::emit_bitpack_index_consume(const ::codegen::jit::FusedTree& node)
 {
   if (node.op != ::codegen::OpKind::Bitpack || !node.children.empty()) {
-    throw RenderError("decode render: index_consume variant requires a Bitpack leaf root "
-                      "(got '" +
-                      std::string(::codegen::jit::op_kind_name(node.op)) + "')");
+    throw RenderError(
+      "decode render: index_consume variant requires a Bitpack leaf root "
+      "(got '" +
+      std::string(::codegen::jit::op_kind_name(node.op)) + "')");
   }
   body_ << "    // --- node " << id_of(node)
         << ": Bitpack index-list decode -> compacted output (K4) ---\n"
@@ -834,8 +835,7 @@ void Walker::emit_bitpack_index_consume(const ::codegen::jit::FusedTree& node)
 // =====================================================================
 void Walker::emit_generic_mask_consume(const ::codegen::jit::FusedTree& node)
 {
-  body_ << "    // --- node " << id_of(node) << ": "
-        << ::codegen::jit::op_kind_name(node.op)
+  body_ << "    // --- node " << id_of(node) << ": " << ::codegen::jit::op_kind_name(node.op)
         << " masked decode -> compacted output (K3-generic) ---\n"
         << "    (void)len;  // mask tail bits are zero, so selected rows are always < len\n";
   emit_selection_stage();
@@ -875,9 +875,10 @@ void Walker::emit_str_split_meta(const ::codegen::jit::FusedTree& node)
   const bool bitpack_root = node.op == ::codegen::OpKind::Bitpack && node.children.empty();
   const bool delta_root   = node.op == ::codegen::OpKind::Delta;
   if (!bitpack_root && !delta_root) {
-    throw RenderError("decode render: str_split_meta requires a Bitpack- or Delta-rooted "
-                      "offsets subtree (got '" +
-                      std::string(::codegen::jit::op_kind_name(node.op)) + "')");
+    throw RenderError(
+      "decode render: str_split_meta requires a Bitpack- or Delta-rooted "
+      "offsets subtree (got '" +
+      std::string(::codegen::jit::op_kind_name(node.op)) + "')");
   }
 
   body_ << "    // --- node " << id_of(node)

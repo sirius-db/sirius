@@ -354,13 +354,13 @@ std::unique_ptr<databatch_provider> make_provider_for_pinned_entry(
   std::span<std::size_t const> selected_columns,
   cached_scan_plan plan,
   const telemetry::batch_telemetry_info& telemetry_info,
-  mvcc_chunk_mask_set mvcc_masks                     = {},
-  std::vector<insert_delta_split> delta_splits       = {},
-  std::vector<cudf::data_type> normalization_targets = {},
-  bool has_physical_overrides                        = false,
-  sirius::decode_equality_pushdown equality_pushdown = {},
-  sirius::decode_range_pushdown range_pushdown       = {},
-  bool range_covers_whole_filter                     = false,
+  mvcc_chunk_mask_set mvcc_masks                                         = {},
+  std::vector<insert_delta_split> delta_splits                           = {},
+  std::vector<cudf::data_type> normalization_targets                     = {},
+  bool has_physical_overrides                                            = false,
+  sirius::decode_equality_pushdown equality_pushdown                     = {},
+  sirius::decode_range_pushdown range_pushdown                           = {},
+  bool range_covers_whole_filter                                         = false,
   std::shared_ptr<sirius::op::sirius_dynamic_filter_set> dynamic_filters = nullptr);
 
 /**

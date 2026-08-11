@@ -1063,11 +1063,8 @@ int run_explore(int argc, char** argv)
 
     if (frontier_os.is_open()) {
       for (auto const& p : result.pareto_frontier)
-        write_frontier_row(frontier_os,
-                           col_name,
-                           dtype_name(col_view.type()),
-                           p.plan_dsl == result.plan_dsl,
-                           p);
+        write_frontier_row(
+          frontier_os, col_name, dtype_name(col_view.type()), p.plan_dsl == result.plan_dsl, p);
       frontier_os.flush();
     }
 

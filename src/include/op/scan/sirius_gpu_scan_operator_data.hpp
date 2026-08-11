@@ -48,8 +48,8 @@ namespace sirius::op::scan {
 /// One snapshot of a scan's dynamic-filter channel, shaped for decode.
 struct membership_snapshot {
   sirius::decode_membership_pushdown pushdown;  ///< parallel to the selected slots
-  std::uint64_t generation    = 0;              ///< set->filter_count(), read BEFORE the walk
-  std::size_t attached_probes = 0;
+  std::uint64_t generation     = 0;             ///< set->filter_count(), read BEFORE the walk
+  std::size_t attached_probes  = 0;
   std::size_t skipped_non_mask = 0;  ///< filters without the mask-applicable mixin (zone maps)
 };
 

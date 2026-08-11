@@ -51,8 +51,7 @@ namespace sirius {
  * only meaningful between the conversion and the scan's capture of the flag,
  * which happen back to back on the same thread in prepare_for_processing.
  */
-class row_filtered_gpu_table_representation final
-  : public ::cucascade::gpu_table_representation {
+class row_filtered_gpu_table_representation final : public ::cucascade::gpu_table_representation {
  public:
   row_filtered_gpu_table_representation(std::unique_ptr<cudf::table> table,
                                         ::cucascade::memory::memory_space& memory_space,
@@ -81,8 +80,7 @@ class row_filtered_gpu_table_representation final
  *
  * Same clone()/lifetime notes as the row-filtered tag above.
  */
-class rule2_bailed_gpu_table_representation final
-  : public ::cucascade::gpu_table_representation {
+class rule2_bailed_gpu_table_representation final : public ::cucascade::gpu_table_representation {
  public:
   rule2_bailed_gpu_table_representation(std::unique_ptr<cudf::table> table,
                                         ::cucascade::memory::memory_space& memory_space,

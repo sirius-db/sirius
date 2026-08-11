@@ -33,9 +33,9 @@
 #include "codegen/selection/selection.hpp"
 #include "gpu_encode.hpp"
 
-#include <cuda_runtime.h>
-
 #include <rmm/cuda_stream_view.hpp>
+
+#include <cuda_runtime.h>
 
 #include <algorithm>
 #include <chrono>
@@ -60,14 +60,14 @@ constexpr int kWordsPerChunk  = static_cast<int>(kChunk / 32);
 
 int g_failures = 0;
 
-#define REQUIRE_MSG(cond, ...)                     \
-  do {                                             \
-    if (!(cond)) {                                 \
-      std::fprintf(stderr, "FAIL: " __VA_ARGS__);  \
-      std::fprintf(stderr, "\n");                  \
-      ++g_failures;                                \
-      return false;                                \
-    }                                              \
+#define REQUIRE_MSG(cond, ...)                    \
+  do {                                            \
+    if (!(cond)) {                                \
+      std::fprintf(stderr, "FAIL: " __VA_ARGS__); \
+      std::fprintf(stderr, "\n");                 \
+      ++g_failures;                               \
+      return false;                               \
+    }                                             \
   } while (0)
 
 std::uint64_t splitmix64(std::uint64_t& s)
@@ -90,7 +90,8 @@ std::vector<Element> gen_data(std::int64_t n, std::int64_t base, std::int64_t ra
   for (std::int64_t i = 0; i < n; ++i) {
     const std::int64_t c = i / kChunk;
     std::uint64_t s      = 0xC0FFEEull ^ (0xD1B54A32D192ED03ull * static_cast<std::uint64_t>(i));
-    const std::int64_t r = static_cast<std::int64_t>(splitmix64(s) % static_cast<std::uint64_t>(range));
+    const std::int64_t r =
+      static_cast<std::int64_t>(splitmix64(s) % static_cast<std::uint64_t>(range));
     std::int64_t val;
     if (c == 2) {
       val = base + range / 3;  // constant chunk, inside the mid predicate
@@ -151,11 +152,10 @@ bool compact_packed_on_host(GpuEncoded& enc, std::int64_t nc, std::int32_t node_
   std::vector<std::uint32_t> dense;
   dense.reserve(total_words + 3);
   for (std::int64_t c = 0; c < nc; ++c) {
-    const std::size_t live =
-      (static_cast<std::size_t>(count[static_cast<std::size_t>(c)]) *
-         bits[static_cast<std::size_t>(c)] +
-       31) /
-      32;
+    const std::size_t live = (static_cast<std::size_t>(count[static_cast<std::size_t>(c)]) *
+                                bits[static_cast<std::size_t>(c)] +
+                              31) /
+                             32;
     const std::uint32_t* src = over.data() + static_cast<std::size_t>(c) * stride;
     dense.insert(dense.end(), src, src + live);
   }
@@ -171,18 +171,14 @@ bool compact_packed_on_host(GpuEncoded& enc, std::int64_t nc, std::int32_t node_
 // e.g. one ANDed together from other columns' K1 outputs): ~keep_pct% bits
 // set, chunk ``zero_chunk`` fully cleared (K3/K5 early-return path), tail
 // bits/words beyond n zero (contract).
-std::vector<std::uint32_t> make_host_mask(std::int64_t n,
-                                          std::int64_t nc,
-                                          unsigned seed,
-                                          unsigned keep_pct,
-                                          std::int64_t zero_chunk)
+std::vector<std::uint32_t> make_host_mask(
+  std::int64_t n, std::int64_t nc, unsigned seed, unsigned keep_pct, std::int64_t zero_chunk)
 {
   std::vector<std::uint32_t> m(static_cast<std::size_t>(nc) * kWordsPerChunk, 0u);
   for (std::int64_t r = 0; r < n; ++r) {
     if (r / kChunk == zero_chunk) continue;
     std::uint64_t s = seed ^ (0x9E3779B97F4A7C15ull * static_cast<std::uint64_t>(r + 1));
-    if (splitmix64(s) % 100ull < keep_pct)
-      m[static_cast<std::size_t>(r) / 32] |= (1u << (r % 32));
+    if (splitmix64(s) % 100ull < keep_pct) m[static_cast<std::size_t>(r) / 32] |= (1u << (r % 32));
   }
   return m;
 }
@@ -250,10 +246,11 @@ bool run_roundtrip(const std::string& dtype, std::int64_t base, std::int64_t ran
 
     // mask_consume before CNT ran (no chunk_offsets) must fail cleanly.
     if (p == 0) {
-      REQUIRE_MSG(!simpatico::launch_decode_fused_tree_mask_consume(
-                    *tree, enc.buffers, dtype.c_str(), n, sm, reinterpret_cast<void*>(d_plain), stream),
-                  "[%s] mask_consume without chunk_offsets should fail",
-                  dtype.c_str());
+      REQUIRE_MSG(
+        !simpatico::launch_decode_fused_tree_mask_consume(
+          *tree, enc.buffers, dtype.c_str(), n, sm, reinterpret_cast<void*>(d_plain), stream),
+        "[%s] mask_consume without chunk_offsets should fail",
+        dtype.c_str());
     }
 
     REQUIRE_MSG(simpatico::launch_decode_fused_tree_mask_out(
@@ -263,8 +260,8 @@ bool run_roundtrip(const std::string& dtype, std::int64_t base, std::int64_t ran
                 pred_names[p]);
 
     std::vector<std::uint32_t> mask_dev(nwords);
-    cudaMemcpy(mask_dev.data(), reinterpret_cast<const void*>(d_mask), nwords * 4,
-               cudaMemcpyDeviceToHost);
+    cudaMemcpy(
+      mask_dev.data(), reinterpret_cast<const void*>(d_mask), nwords * 4, cudaMemcpyDeviceToHost);
     const std::vector<std::uint32_t> mask_ref = host_mask(data, nc, preds[p]);
     REQUIRE_MSG(mask_dev == mask_ref,
                 "[%s/%s] K1 mask mismatch vs host reference",
@@ -289,7 +286,8 @@ bool run_roundtrip(const std::string& dtype, std::int64_t base, std::int64_t ran
 
     CUdeviceptr d_out =
       enc.alloc(static_cast<std::size_t>(survivors > 0 ? survivors : 1) * sizeof(Element));
-    cudaMemset(reinterpret_cast<void*>(d_out), 0xAB,
+    cudaMemset(reinterpret_cast<void*>(d_out),
+               0xAB,
                static_cast<std::size_t>(survivors > 0 ? survivors : 1) * sizeof(Element));
 
     REQUIRE_MSG(simpatico::launch_decode_fused_tree_mask_consume(
@@ -312,8 +310,10 @@ bool run_roundtrip(const std::string& dtype, std::int64_t base, std::int64_t ran
 
     std::vector<Element> got(static_cast<std::size_t>(survivors));
     if (survivors > 0) {
-      cudaMemcpy(got.data(), reinterpret_cast<const void*>(d_out),
-                 got.size() * sizeof(Element), cudaMemcpyDeviceToHost);
+      cudaMemcpy(got.data(),
+                 reinterpret_cast<const void*>(d_out),
+                 got.size() * sizeof(Element),
+                 cudaMemcpyDeviceToHost);
     }
     REQUIRE_MSG(got == expect,
                 "[%s/%s] K3 compacted output != plain decode + host filter (%zu survivors)",
@@ -328,12 +328,13 @@ bool run_roundtrip(const std::string& dtype, std::int64_t base, std::int64_t ran
     for (std::int64_t r = 0; r < n; ++r)
       if ((mask_ref[static_cast<std::size_t>(r) / 32] >> (r % 32)) & 1u)
         row_indices.push_back(static_cast<std::int32_t>(r));
-    CUdeviceptr d_idx = enc.upload_bytes(
-      row_indices.data(), row_indices.size() * sizeof(std::int32_t));
+    CUdeviceptr d_idx =
+      enc.upload_bytes(row_indices.data(), row_indices.size() * sizeof(std::int32_t));
 
     CUdeviceptr d_out4 =
       enc.alloc(static_cast<std::size_t>(survivors > 0 ? survivors : 1) * sizeof(Element));
-    cudaMemset(reinterpret_cast<void*>(d_out4), 0xCD,
+    cudaMemset(reinterpret_cast<void*>(d_out4),
+               0xCD,
                static_cast<std::size_t>(survivors > 0 ? survivors : 1) * sizeof(Element));
     REQUIRE_MSG(simpatico::launch_decode_fused_tree_index_consume(
                   *tree,
@@ -349,8 +350,10 @@ bool run_roundtrip(const std::string& dtype, std::int64_t base, std::int64_t ran
                 pred_names[p]);
     std::vector<Element> got4(static_cast<std::size_t>(survivors));
     if (survivors > 0) {
-      cudaMemcpy(got4.data(), reinterpret_cast<const void*>(d_out4),
-                 got4.size() * sizeof(Element), cudaMemcpyDeviceToHost);
+      cudaMemcpy(got4.data(),
+                 reinterpret_cast<const void*>(d_out4),
+                 got4.size() * sizeof(Element),
+                 cudaMemcpyDeviceToHost);
     }
     REQUIRE_MSG(got4 == expect,
                 "[%s/%s] K4 index-list output != K3/host reference (%zu survivors)",
@@ -375,9 +378,9 @@ bool run_roundtrip(const std::string& dtype, std::int64_t base, std::int64_t ran
     const std::int32_t idx_host = static_cast<std::int32_t>(row);
 
     selection_mask sm1;
-    sm1.words          = reinterpret_cast<std::uint32_t*>(d_plain);  // unused by K4
-    sm1.num_rows       = n;
-    sm1.chunk_offsets  = reinterpret_cast<std::uint32_t*>(
+    sm1.words         = reinterpret_cast<std::uint32_t*>(d_plain);  // unused by K4
+    sm1.num_rows      = n;
+    sm1.chunk_offsets = reinterpret_cast<std::uint32_t*>(
       enc.upload_bytes(chunk_offsets.data(), chunk_offsets.size() * 4));
     sm1.survivor_count = 1;
 
@@ -395,14 +398,12 @@ bool run_roundtrip(const std::string& dtype, std::int64_t base, std::int64_t ran
                 "[%s] K4 singleton launch failed",
                 dtype.c_str());
     Element got1{};
-    cudaMemcpy(&got1, reinterpret_cast<const void*>(d_out1), sizeof(Element),
-               cudaMemcpyDeviceToHost);
+    cudaMemcpy(
+      &got1, reinterpret_cast<const void*>(d_out1), sizeof(Element), cudaMemcpyDeviceToHost);
     REQUIRE_MSG(got1 == data[static_cast<std::size_t>(row)],
                 "[%s] K4 singleton decoded wrong value",
                 dtype.c_str());
-    std::printf("PASS: %s k4-singleton (row=%lld)\n",
-                dtype.c_str(),
-                static_cast<long long>(row));
+    std::printf("PASS: %s k4-singleton (row=%lld)\n", dtype.c_str(), static_cast<long long>(row));
   }
   return true;
 }
@@ -427,8 +428,8 @@ bool run_delta_masked(const std::string& dtype, int arch)
     data[static_cast<std::size_t>(i)] = static_cast<Element>(v);
   }
 
-  auto tree = jit::FusedTree::make(
-    OpKind::Delta, {{"differences", jit::FusedTree::make(OpKind::Bitpack)}});
+  auto tree =
+    jit::FusedTree::make(OpKind::Delta, {{"differences", jit::FusedTree::make(OpKind::Bitpack)}});
 
   GpuEncoded enc = codegen_test::gpu_encode_tree<Element>(*tree, dtype, data.data(), n, arch);
   // Delta root = node 0, bitpack differences child = node 1.
@@ -451,10 +452,9 @@ bool run_delta_masked(const std::string& dtype, int arch)
   const std::int64_t survivors = host_cnt(mask, nc, chunk_offsets);
 
   selection_mask sm;
-  sm.words = reinterpret_cast<std::uint32_t*>(
-    enc.upload_bytes(mask.data(), mask.size() * 4));
-  sm.num_rows       = n;
-  sm.chunk_offsets  = reinterpret_cast<std::uint32_t*>(
+  sm.words    = reinterpret_cast<std::uint32_t*>(enc.upload_bytes(mask.data(), mask.size() * 4));
+  sm.num_rows = n;
+  sm.chunk_offsets = reinterpret_cast<std::uint32_t*>(
     enc.upload_bytes(chunk_offsets.data(), chunk_offsets.size() * 4));
   sm.survivor_count = survivors;
 
@@ -473,8 +473,10 @@ bool run_delta_masked(const std::string& dtype, int arch)
 
   std::vector<Element> got(static_cast<std::size_t>(survivors));
   if (survivors > 0) {
-    cudaMemcpy(got.data(), reinterpret_cast<const void*>(d_out),
-               got.size() * sizeof(Element), cudaMemcpyDeviceToHost);
+    cudaMemcpy(got.data(),
+               reinterpret_cast<const void*>(d_out),
+               got.size() * sizeof(Element),
+               cudaMemcpyDeviceToHost);
   }
   REQUIRE_MSG(got == expect,
               "[delta/%s] K3-delta compacted output != plain decode + host filter (%lld "
@@ -493,13 +495,13 @@ bool run_delta_masked(const std::string& dtype, int arch)
     const std::int64_t v_lo = static_cast<std::int64_t>(data[static_cast<std::size_t>(n / 4)]);
     const std::int64_t v_hi =
       static_cast<std::int64_t>(data[static_cast<std::size_t>((3 * n) / 4)]);
-    const std::int64_t v_max    = static_cast<std::int64_t>(data[static_cast<std::size_t>(n - 1)]);
+    const std::int64_t v_max = static_cast<std::int64_t>(data[static_cast<std::size_t>(n - 1)]);
     const range_predicate preds[] = {
       {v_lo, v_hi},              // mid band
       {0, v_max},                // all pass
       {v_max + 1, v_max + 100},  // none pass
     };
-    const char* names[] = {"mid", "all", "none"};
+    const char* names[]      = {"mid", "all", "none"};
     const std::size_t nwords = static_cast<std::size_t>(nc) * kWordsPerChunk;
     for (int p = 0; p < 3; ++p) {
       CUdeviceptr d_mask1 = enc.alloc(nwords * 4);
@@ -513,7 +515,9 @@ bool run_delta_masked(const std::string& dtype, int arch)
                   dtype.c_str(),
                   names[p]);
       std::vector<std::uint32_t> got_mask(nwords);
-      cudaMemcpy(got_mask.data(), reinterpret_cast<const void*>(d_mask1), nwords * 4,
+      cudaMemcpy(got_mask.data(),
+                 reinterpret_cast<const void*>(d_mask1),
+                 nwords * 4,
                  cudaMemcpyDeviceToHost);
       const std::vector<std::uint32_t> ref_mask = host_mask(data, nc, preds[p]);
       REQUIRE_MSG(got_mask == ref_mask,
@@ -531,8 +535,8 @@ bool run_delta_masked(const std::string& dtype, int arch)
 // copy exactly the survivors' key bytes, compacted, in row order.
 bool run_dict_gather(std::int32_t key_width, int arch)
 {
-  const std::int64_t n  = 3 * kChunk + 511;
-  const std::int64_t nc = codegen::num_chunks_for(n);
+  const std::int64_t n        = 3 * kChunk + 511;
+  const std::int64_t nc       = codegen::num_chunks_for(n);
   const std::int32_t num_keys = 3;
   const rmm::cuda_stream_view stream{};
 
@@ -544,9 +548,9 @@ bool run_dict_gather(std::int32_t key_width, int arch)
       (i / kChunk == 1) ? 2 : static_cast<std::int32_t>(splitmix64(s) % num_keys);
   }
 
-  auto tree      = jit::FusedTree::make(OpKind::Bitpack);
-  GpuEncoded enc = codegen_test::gpu_encode_tree<std::int32_t>(
-    *tree, "int32_t", codes.data(), n, arch);
+  auto tree = jit::FusedTree::make(OpKind::Bitpack);
+  GpuEncoded enc =
+    codegen_test::gpu_encode_tree<std::int32_t>(*tree, "int32_t", codes.data(), n, arch);
   if (!compact_packed_on_host(enc, nc)) return false;
 
   // Key pool: key k = key_width copies of ('A' + k), so any wrong
@@ -562,30 +566,28 @@ bool run_dict_gather(std::int32_t key_width, int arch)
   const std::int64_t survivors = host_cnt(mask, nc, chunk_offsets);
 
   selection_mask sm;
-  sm.words          = reinterpret_cast<std::uint32_t*>(
-    enc.upload_bytes(mask.data(), mask.size() * 4));
-  sm.num_rows       = n;
-  sm.chunk_offsets  = reinterpret_cast<std::uint32_t*>(
+  sm.words    = reinterpret_cast<std::uint32_t*>(enc.upload_bytes(mask.data(), mask.size() * 4));
+  sm.num_rows = n;
+  sm.chunk_offsets = reinterpret_cast<std::uint32_t*>(
     enc.upload_bytes(chunk_offsets.data(), chunk_offsets.size() * 4));
   sm.survivor_count = survivors;
 
-  const std::size_t out_bytes =
-    static_cast<std::size_t>(survivors > 0 ? survivors : 1) * key_width;
-  CUdeviceptr d_out = enc.alloc(out_bytes);
+  const std::size_t out_bytes = static_cast<std::size_t>(survivors > 0 ? survivors : 1) * key_width;
+  CUdeviceptr d_out           = enc.alloc(out_bytes);
   cudaMemset(reinterpret_cast<void*>(d_out), 0xEE, out_bytes);
 
-  REQUIRE_MSG(simpatico::launch_decode_fused_tree_mask_dict_gather(
-                *tree,
-                enc.buffers,
-                "int32_t",
-                n,
-                sm,
-                reinterpret_cast<const void*>(d_keys),
-                key_width,
-                reinterpret_cast<void*>(d_out),
-                stream),
-              "[dict/w%d] mask_dict_gather launch failed",
-              key_width);
+  REQUIRE_MSG(
+    simpatico::launch_decode_fused_tree_mask_dict_gather(*tree,
+                                                         enc.buffers,
+                                                         "int32_t",
+                                                         n,
+                                                         sm,
+                                                         reinterpret_cast<const void*>(d_keys),
+                                                         key_width,
+                                                         reinterpret_cast<void*>(d_out),
+                                                         stream),
+    "[dict/w%d] mask_dict_gather launch failed",
+    key_width);
 
   std::vector<char> expect;
   expect.reserve(static_cast<std::size_t>(survivors) * key_width);
@@ -600,8 +602,8 @@ bool run_dict_gather(std::int32_t key_width, int arch)
 
   std::vector<char> got(static_cast<std::size_t>(survivors) * key_width);
   if (!got.empty()) {
-    cudaMemcpy(got.data(), reinterpret_cast<const void*>(d_out), got.size(),
-               cudaMemcpyDeviceToHost);
+    cudaMemcpy(
+      got.data(), reinterpret_cast<const void*>(d_out), got.size(), cudaMemcpyDeviceToHost);
   }
   REQUIRE_MSG(got == expect,
               "[dict/w%d] K5 gathered chars != host reference (%lld survivors)",
@@ -619,9 +621,9 @@ bool run_dict_gather(std::int32_t key_width, int arch)
 // l_shipmode shape (offsets->bitpack, variable lengths 3..12).
 bool run_str_split_masked(bool deep, int arch)
 {
-  const std::int64_t n     = 4 * kChunk + 300;  // string rows
-  const std::int64_t n_off = n + 1;             // offsets elements
-  const std::int64_t nc    = codegen::num_chunks_for(n);      // row chunks
+  const std::int64_t n     = 4 * kChunk + 300;            // string rows
+  const std::int64_t n_off = n + 1;                       // offsets elements
+  const std::int64_t nc    = codegen::num_chunks_for(n);  // row chunks
   const rmm::cuda_stream_view stream{};
   const char* tag = deep ? "str-deep" : "str-shallow";
 
@@ -629,9 +631,8 @@ bool run_str_split_masked(bool deep, int arch)
   std::vector<std::int32_t> offsets(static_cast<std::size_t>(n_off));
   offsets[0] = 0;
   for (std::int64_t r = 0; r < n; ++r) {
-    std::uint64_t s = 0x57Ull ^ (0x9E3779B97F4A7C15ull * static_cast<std::uint64_t>(r + 1));
-    const std::int32_t len =
-      deep ? 15 : static_cast<std::int32_t>(3 + splitmix64(s) % 10ull);
+    std::uint64_t s        = 0x57Ull ^ (0x9E3779B97F4A7C15ull * static_cast<std::uint64_t>(r + 1));
+    const std::int32_t len = deep ? 15 : static_cast<std::int32_t>(3 + splitmix64(s) % 10ull);
     offsets[static_cast<std::size_t>(r) + 1] = offsets[static_cast<std::size_t>(r)] + len;
   }
   const std::int64_t chars_bytes = offsets[static_cast<std::size_t>(n)];
@@ -683,32 +684,35 @@ bool run_str_split_masked(bool deep, int arch)
   const std::int64_t survivors = host_cnt(mask, nc, chunk_offsets);
 
   selection_mask sm;
-  sm.words          = reinterpret_cast<std::uint32_t*>(
-    enc.upload_bytes(mask.data(), mask.size() * 4));
-  sm.num_rows       = n;
-  sm.chunk_offsets  = reinterpret_cast<std::uint32_t*>(
+  sm.words    = reinterpret_cast<std::uint32_t*>(enc.upload_bytes(mask.data(), mask.size() * 4));
+  sm.num_rows = n;
+  sm.chunk_offsets = reinterpret_cast<std::uint32_t*>(
     enc.upload_bytes(chunk_offsets.data(), chunk_offsets.size() * 4));
   sm.survivor_count = survivors;
 
   CUdeviceptr d_src = enc.alloc(static_cast<std::size_t>(survivors) * sizeof(std::int64_t));
   CUdeviceptr d_len = enc.alloc(static_cast<std::size_t>(survivors) * sizeof(std::int32_t));
-  REQUIRE_MSG(simpatico::launch_decode_fused_tree_str_split_meta(
-                *tree,
-                enc.buffers,
-                "int32_t",
-                n,
-                sm,
-                reinterpret_cast<std::int64_t*>(d_src),
-                reinterpret_cast<std::int32_t*>(d_len),
-                stream),
-              "[%s] str_split_meta launch failed",
-              tag);
+  REQUIRE_MSG(
+    simpatico::launch_decode_fused_tree_str_split_meta(*tree,
+                                                       enc.buffers,
+                                                       "int32_t",
+                                                       n,
+                                                       sm,
+                                                       reinterpret_cast<std::int64_t*>(d_src),
+                                                       reinterpret_cast<std::int32_t*>(d_len),
+                                                       stream),
+    "[%s] str_split_meta launch failed",
+    tag);
 
   std::vector<std::int64_t> src_got(static_cast<std::size_t>(survivors));
   std::vector<std::int32_t> len_got(static_cast<std::size_t>(survivors));
-  cudaMemcpy(src_got.data(), reinterpret_cast<const void*>(d_src), src_got.size() * 8,
+  cudaMemcpy(src_got.data(),
+             reinterpret_cast<const void*>(d_src),
+             src_got.size() * 8,
              cudaMemcpyDeviceToHost);
-  cudaMemcpy(len_got.data(), reinterpret_cast<const void*>(d_len), len_got.size() * 4,
+  cudaMemcpy(len_got.data(),
+             reinterpret_cast<const void*>(d_len),
+             len_got.size() * 4,
              cudaMemcpyDeviceToHost);
 
   std::vector<std::int64_t> src_ref;
@@ -731,8 +735,8 @@ bool run_str_split_masked(bool deep, int arch)
               static_cast<long long>(survivors));
 
   // Phase 2: fixed char copy against the host gather.
-  CUdeviceptr d_chars   = enc.upload_bytes(chars.data(), chars.size());
-  CUdeviceptr d_out_off = enc.upload_bytes(out_off.data(), out_off.size() * 4);
+  CUdeviceptr d_chars         = enc.upload_bytes(chars.data(), chars.size());
+  CUdeviceptr d_out_off       = enc.upload_bytes(out_off.data(), out_off.size() * 4);
   const std::size_t out_bytes = chars_ref.empty() ? 1 : chars_ref.size();
   CUdeviceptr d_out_chars     = enc.alloc(out_bytes);
   cudaMemset(reinterpret_cast<void*>(d_out_chars), 0xEE, out_bytes);
@@ -746,7 +750,9 @@ bool run_str_split_masked(bool deep, int arch)
               tag);
   std::vector<char> chars_got(chars_ref.size());
   if (!chars_got.empty()) {
-    cudaMemcpy(chars_got.data(), reinterpret_cast<const void*>(d_out_chars), chars_got.size(),
+    cudaMemcpy(chars_got.data(),
+               reinterpret_cast<const void*>(d_out_chars),
+               chars_got.size(),
                cudaMemcpyDeviceToHost);
   }
   REQUIRE_MSG(chars_got == chars_ref,
@@ -825,17 +831,17 @@ bool run_pair_mask(int arch)
                 "[pair/%s] launch failed",
                 c.name);
     std::vector<std::uint32_t> got(nwords);
-    cudaMemcpy(got.data(), reinterpret_cast<const void*>(d_mask), nwords * 4,
-               cudaMemcpyDeviceToHost);
+    cudaMemcpy(
+      got.data(), reinterpret_cast<const void*>(d_mask), nwords * 4, cudaMemcpyDeviceToHost);
 
     std::vector<std::uint32_t> ref(nwords, 0u);
     for (std::int64_t r = 0; r < n; ++r) {
       const std::int64_t av = a[static_cast<std::size_t>(r)];
       const std::int64_t bv = b[static_cast<std::size_t>(r)];
-      bool pass = (c.op == simpatico::pair_cmp::lt)   ? (av < bv)
-                  : (c.op == simpatico::pair_cmp::le) ? (av <= bv)
-                  : (c.op == simpatico::pair_cmp::gt) ? (av > bv)
-                                                      : (av >= bv);
+      bool pass             = (c.op == simpatico::pair_cmp::lt)   ? (av < bv)
+                              : (c.op == simpatico::pair_cmp::le) ? (av <= bv)
+                              : (c.op == simpatico::pair_cmp::gt) ? (av > bv)
+                                                                  : (av >= bv);
       if (c.ranged) pass = pass && av >= a_range.lo && av <= a_range.hi;
       if (pass) ref[static_cast<std::size_t>(r) / 32] |= (1u << (r % 32));
     }
@@ -897,8 +903,8 @@ std::int64_t bench_residual(std::int64_t i, int b)
   const std::int64_t p  = i & (kChunk - 1);
   if (p == 0) return static_cast<std::int64_t>(m);
   if (p == 1) return 0;
-  return static_cast<std::int64_t>(
-    (static_cast<std::uint64_t>(i) * 0x9E3779B97F4A7C15ull >> 13) & m);
+  return static_cast<std::int64_t>((static_cast<std::uint64_t>(i) * 0x9E3779B97F4A7C15ull >> 13) &
+                                   m);
 }
 
 template <typename Element>
@@ -921,10 +927,10 @@ bool bench_one(const char* shape, std::int64_t n, int bits, bool delta_shape, in
       data[static_cast<std::size_t>(i)] = static_cast<Element>(base + bench_residual(i, bits));
   }
 
-  auto tree = delta_shape
-                ? jit::FusedTree::make(OpKind::Delta,
-                                       {{"differences", jit::FusedTree::make(OpKind::Bitpack)}})
-                : jit::FusedTree::make(OpKind::Bitpack);
+  auto tree               = delta_shape
+                              ? jit::FusedTree::make(OpKind::Delta,
+                                                     {{"differences", jit::FusedTree::make(OpKind::Bitpack)}})
+                              : jit::FusedTree::make(OpKind::Bitpack);
   const std::string dtype = (sizeof(Element) == 8) ? "int64_t" : "int32_t";
 
   GpuEncoded enc = codegen_test::gpu_encode_tree<Element>(*tree, dtype, data.data(), n, arch);
@@ -1057,12 +1063,11 @@ bool render_checks()
   // 3. Delta root: mask_out AND mask_consume both render (K1-delta via the
   //    generic value_source seam; K3-delta tuned), each with its own symbol
   //    + source.
-  auto delta = jit::FusedTree::make(
-    OpKind::Delta, {{"differences", jit::FusedTree::make(OpKind::Bitpack)}});
+  auto delta =
+    jit::FusedTree::make(OpKind::Delta, {{"differences", jit::FusedTree::make(OpKind::Bitpack)}});
   bool rejected                      = false;
   const cdj::DecodeKernelSpec dplain = cdj::render(*delta, "int64_t", 8);
-  const cdj::DecodeKernelSpec dk1 =
-    cdj::render(*delta, "int64_t", 8, cdj::DecodeVariant::mask_out);
+  const cdj::DecodeKernelSpec dk1 = cdj::render(*delta, "int64_t", 8, cdj::DecodeVariant::mask_out);
   REQUIRE_MSG(dk1.entry_symbol == dplain.entry_symbol + "_mask_out",
               "K1-delta entry symbol suffix wrong: %s",
               dk1.entry_symbol.c_str());
@@ -1080,7 +1085,8 @@ bool render_checks()
 
   // 4. K5 dict gather: bitpack code leaf only; distinct symbol; key pool +
   //    width are kernel params (never literals in the source).
-  const cdj::DecodeKernelSpec k5 = cdj::render(*bp, "int32_t", 8, cdj::DecodeVariant::mask_dict_gather);
+  const cdj::DecodeKernelSpec k5 =
+    cdj::render(*bp, "int32_t", 8, cdj::DecodeVariant::mask_dict_gather);
   const cdj::DecodeKernelSpec p32 = cdj::render(*bp, "int32_t", 8);
   REQUIRE_MSG(k5.entry_symbol == p32.entry_symbol + "_mask_dict",
               "K5 entry symbol suffix wrong: %s",
@@ -1100,7 +1106,8 @@ bool render_checks()
 
   // 5. K4 index_consume: bitpack leaf only; own symbol; index list + offsets
   //    are kernel params; delta roots rejected (fall back to K3-delta).
-  const cdj::DecodeKernelSpec k4 = cdj::render(*bp, "int64_t", 8, cdj::DecodeVariant::index_consume);
+  const cdj::DecodeKernelSpec k4 =
+    cdj::render(*bp, "int64_t", 8, cdj::DecodeVariant::index_consume);
   REQUIRE_MSG(k4.entry_symbol == s3.entry_symbol + "_index_consume",
               "K4 entry symbol suffix wrong: %s",
               k4.entry_symbol.c_str());
@@ -1121,13 +1128,14 @@ bool render_checks()
 
   // 6. K6 str_split_meta: bitpack + delta roots render (with the next-chunk
   //    peek), rle root rejected; params not literals.
-  const cdj::DecodeKernelSpec k6 = cdj::render(*bp, "int32_t", 8, cdj::DecodeVariant::str_split_meta);
+  const cdj::DecodeKernelSpec k6 =
+    cdj::render(*bp, "int32_t", 8, cdj::DecodeVariant::str_split_meta);
   REQUIRE_MSG(k6.entry_symbol == p32.entry_symbol + "_str_meta",
               "K6 entry symbol suffix wrong: %s",
               k6.entry_symbol.c_str());
-  REQUIRE_MSG(k6.source.find("len_out") != std::string::npos &&
-                k6.source.find("next0") != std::string::npos,
-              "K6 source must take len_out and emit the next-chunk peek");
+  REQUIRE_MSG(
+    k6.source.find("len_out") != std::string::npos && k6.source.find("next0") != std::string::npos,
+    "K6 source must take len_out and emit the next-chunk peek");
   auto deep_offsets = jit::FusedTree::make(
     OpKind::Delta,
     {{"differences",
@@ -1151,8 +1159,8 @@ bool render_checks()
 
   // 7. Compositional mask_consume: a FOR-rooted cascade renders through the
   //    generic value_source seam (no hand-written variant needed).
-  auto for_tree = jit::FusedTree::make(
-    OpKind::For, {{"deltas", jit::FusedTree::make(OpKind::Bitpack)}});
+  auto for_tree =
+    jit::FusedTree::make(OpKind::For, {{"deltas", jit::FusedTree::make(OpKind::Bitpack)}});
   const cdj::DecodeKernelSpec kfor =
     cdj::render(*for_tree, "int64_t", 8, cdj::DecodeVariant::mask_consume);
   REQUIRE_MSG(kfor.entry_symbol.find("_mask_consume") != std::string::npos &&
@@ -1161,7 +1169,8 @@ bool render_checks()
 
   // 8. K1m2 pair mask: combined symbol, params-not-constants, both columns'
   //    channels distinct; self-pair and non-bitpack columns rejected.
-  const cdj::DecodeKernelSpec kp = cdj::render_pair_mask(*bp, "int32_t", *for_tree->children.at("deltas"), "int32_t", 8);
+  const cdj::DecodeKernelSpec kp =
+    cdj::render_pair_mask(*bp, "int32_t", *for_tree->children.at("deltas"), "int32_t", 8);
   REQUIRE_MSG(kp.entry_symbol == "simpatico_decode_pair_mask_int32_t_int32_t",
               "pair mask entry symbol wrong: %s",
               kp.entry_symbol.c_str());

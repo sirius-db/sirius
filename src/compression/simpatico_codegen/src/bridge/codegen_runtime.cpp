@@ -688,14 +688,15 @@ bool launch_decode_fused_tree_impl(codegen::jit::FusedTree const& tree,
 
     // run_rendered_decode is an internal helper with a uintptr_t ABI; the public
     // signature is C++-typed, so convert once here.
-    return run_rendered_decode(tree,
-                               cxx_dtype,
-                               labeled,
-                               num_rows,
-                               reinterpret_cast<std::uintptr_t>(out),
-                               reinterpret_cast<std::uintptr_t>(stream.value()),
-                               [&](const char* what) { _lap(what); },
-                               va) == 1;
+    return run_rendered_decode(
+             tree,
+             cxx_dtype,
+             labeled,
+             num_rows,
+             reinterpret_cast<std::uintptr_t>(out),
+             reinterpret_cast<std::uintptr_t>(stream.value()),
+             [&](const char* what) { _lap(what); },
+             va) == 1;
   } catch (const jit::CompileError& e) {
     std::fprintf(
       stderr,
@@ -746,7 +747,8 @@ bool launch_decode_fused_tree_mask_out(codegen::jit::FusedTree const& tree,
   // Floats decode as bit-reinterpreted same-width ints; an integer-domain
   // range compare on them would be meaningless. Predicate extraction must
   // not route float columns here — refuse rather than corrupt.
-  if (dtype != nullptr && (std::strcmp(dtype, "float32") == 0 || std::strcmp(dtype, "float64") == 0)) {
+  if (dtype != nullptr &&
+      (std::strcmp(dtype, "float32") == 0 || std::strcmp(dtype, "float64") == 0)) {
     std::fprintf(stderr,
                  "simpatico::codegen: launch_decode_fused_tree_mask_out: float dtype '%s' not "
                  "supported for range predicates\n",
@@ -830,8 +832,8 @@ bool launch_decode_fused_tree_str_split_meta(codegen::jit::FusedTree const& tree
                                              std::int32_t* lengths_out,
                                              rmm::cuda_stream_view stream)
 {
-  if (mask.words == nullptr || mask.chunk_offsets == nullptr ||
-      mask.num_rows != num_string_rows || src_offsets_out == nullptr || lengths_out == nullptr) {
+  if (mask.words == nullptr || mask.chunk_offsets == nullptr || mask.num_rows != num_string_rows ||
+      src_offsets_out == nullptr || lengths_out == nullptr) {
     std::fprintf(stderr,
                  "simpatico::codegen: launch_decode_fused_tree_str_split_meta: incomplete inputs "
                  "(words=%p chunk_offsets=%p mask.num_rows=%lld num_string_rows=%lld src_out=%p "
@@ -908,8 +910,8 @@ bool launch_masked_char_copy(void const* chars,
   long long n          = static_cast<long long>(n_survivors);
   void* args[]         = {&d_chars, &d_src, &d_offs, &n, &d_out};
   const unsigned block = 256;
-  const unsigned grid  = static_cast<unsigned>(
-    std::min<std::int64_t>(8192, (n_survivors + block - 1) / block));
+  const unsigned grid =
+    static_cast<unsigned>(std::min<std::int64_t>(8192, (n_survivors + block - 1) / block));
   SIMPATICO_CU_CHECK(cuLaunchKernel(kernel->func_for_current_device(),
                                     grid,
                                     1,

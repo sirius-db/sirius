@@ -200,10 +200,10 @@ std::optional<decoded_bound> to_decoded_bound(duckdb::Value const& value,
       return decoded_bound{v, v};
     }
     // Constant is finer than the column's scale: floor/ceil of m / 10^-diff.
-    auto const divisor   = pow10_128(-scale_diff);
-    auto const m         = static_cast<int128>(*unscaled);
-    int128 quotient      = m / divisor;
-    int128 const rem     = m % divisor;
+    auto const divisor = pow10_128(-scale_diff);
+    auto const m       = static_cast<int128>(*unscaled);
+    int128 quotient    = m / divisor;
+    int128 const rem   = m % divisor;
     if (rem != 0 && m < 0) { quotient -= 1; }  // truncation → floor
     return decoded_bound{quotient, quotient + (rem != 0 ? 1 : 0)};
   }
@@ -294,8 +294,7 @@ sirius::codegen::range_predicate clamp_to_range_predicate(range_accumulator cons
 {
   constexpr auto kMin = std::numeric_limits<std::int64_t>::min();
   constexpr auto kMax = std::numeric_limits<std::int64_t>::max();
-  if (acc.lo > acc.hi || acc.lo > static_cast<int128>(kMax) ||
-      acc.hi < static_cast<int128>(kMin)) {
+  if (acc.lo > acc.hi || acc.lo > static_cast<int128>(kMax) || acc.hi < static_cast<int128>(kMin)) {
     return {0, -1};
   }
   return {static_cast<std::int64_t>(std::max<int128>(acc.lo, kMin)),
@@ -385,7 +384,7 @@ numeric_range_extraction extract_numeric_range_pushdown(
     auto const& col_type = returned_types[primary_idx];
 
     range_accumulator acc;
-    bool fully_covered = true;
+    bool fully_covered   = true;
     bool const any_bound = fold_numeric_conjunct(*filter, col_type, acc, fully_covered);
     if (!fully_covered) {
       not_covered(column_index, "is not fully an AND-tree of numeric constant comparisons");
@@ -406,10 +405,11 @@ numeric_range_extraction extract_numeric_range_pushdown(
       it->second.lo > it->second.hi ? " (provably empty)" : "");
   }
 
-  SIRIUS_LOG_DEBUG("TABLE_SCAN range pushdown: extracted {} range predicate(s), "
-                   "all_conjuncts_convertible={}",
-                   result.ranges.size(),
-                   result.all_conjuncts_convertible);
+  SIRIUS_LOG_DEBUG(
+    "TABLE_SCAN range pushdown: extracted {} range predicate(s), "
+    "all_conjuncts_convertible={}",
+    result.ranges.size(),
+    result.all_conjuncts_convertible);
   return result;
 }
 

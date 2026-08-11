@@ -170,8 +170,8 @@ sirius_gpu_scan_operator::sirius_gpu_scan_operator(
   // every split gets it stamped so prepare_for_processing can snapshot
   // membership filters at decode time.
   if (_ingestible) {
-    if (auto const* pq = dynamic_cast<parquet_ingestible_table_info const*>(
-          &_ingestible->table_info())) {
+    if (auto const* pq =
+          dynamic_cast<parquet_ingestible_table_info const*>(&_ingestible->table_info())) {
       _dynamic_filters_channel = pq->sirius_dynamic_filters;
     }
   }

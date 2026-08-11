@@ -37,8 +37,8 @@ namespace sirius::op::scan {
 namespace {
 
 // Env-gate readers, duplicated from the wave orchestrator / scan manager by
-// design (this TU runs before any simpatico call); cached statics, defaults
-// kept in sync.
+// design (this TU runs before any simpatico call); results cached in local
+// static values, defaults kept in sync.
 bool fused_scan_gate_enabled()
 {
   static bool const enabled = [] {
@@ -83,18 +83,17 @@ sirius::compressed_device_representation::fused_scan_reservation_probe fused_dec
   scan_operator_input const& split)
 {
   if (!split.is_resident()) { return {}; }
-  auto batch = split.get_cached_batch();
-  auto ro    = batch->to_read_only();
-  auto const* rep =
-    dynamic_cast<sirius::compressed_device_representation const*>(ro.get_data());
+  auto batch      = split.get_cached_batch();
+  auto ro         = batch->to_read_only();
+  auto const* rep = dynamic_cast<sirius::compressed_device_representation const*>(ro.get_data());
   if (rep == nullptr) { return {}; }
   return rep->probe_fused_scan_reservation();
 }
 
 }  // namespace
 
-membership_snapshot snapshot_membership_pushdown(
-  sirius::op::sirius_dynamic_filter_set const& set, std::size_t n_slots)
+membership_snapshot snapshot_membership_pushdown(sirius::op::sirius_dynamic_filter_set const& set,
+                                                 std::size_t n_slots)
 {
   membership_snapshot snap;
   // generation FIRST: it must never claim probes the walk below did not
@@ -198,7 +197,7 @@ void scan_operator_input::prepare_for_processing(
           std::size_t const n_slots = rep->selected_indices().has_value()
                                         ? rep->selected_indices()->size()
                                         : rep->column_names().size();
-          auto snap = snapshot_membership_pushdown(*dynamic_filters, n_slots);
+          auto snap                 = snapshot_membership_pushdown(*dynamic_filters, n_slots);
           if (fused_scan_diag_enabled()) {
             SIRIUS_LOG_INFO(
               "[fused-diag] membership attach (decode-time) channel={}: has_filters=true "
@@ -233,9 +232,8 @@ void scan_operator_input::prepare_for_processing(
         dynamic_cast<::sirius::row_filtered_gpu_table_representation*>(mut.get_data()) != nullptr;
       // A RULE-2 bail comes back as classic full-width content under the
       // bailed tag; latch it so the scan's remaining splits skip the attempt.
-      if (fused_bail_flag &&
-          dynamic_cast<::sirius::rule2_bailed_gpu_table_representation*>(mut.get_data()) !=
-            nullptr) {
+      if (fused_bail_flag && dynamic_cast<::sirius::rule2_bailed_gpu_table_representation*>(
+                               mut.get_data()) != nullptr) {
         fused_bail_flag->store(true, std::memory_order_relaxed);
       }
       if (decode_row_filtered && mvcc_keep_mask.has_mask()) {
@@ -342,8 +340,7 @@ std::size_t scan_operator_input::get_estimated_working_set_size_in_bytes() const
   if (row_filter_pending) {
     // A latched RULE-2 bail means later batches strip the pushdown and run
     // classic — keep the classic 2x envelope for them.
-    bool const bail_latched =
-      fused_bail_flag && fused_bail_flag->load(std::memory_order_relaxed);
+    bool const bail_latched = fused_bail_flag && fused_bail_flag->load(std::memory_order_relaxed);
     if (auto const probe = fused_decode_probe(*this); probe.planned && !bail_latched) {
       // Fused-planned reservation: wave-1 mask words (1 bit/row per filter
       // column — <= batch/4 across the 8-filter limit at >= 4 B/row columns)
@@ -356,8 +353,7 @@ std::size_t scan_operator_input::get_estimated_working_set_size_in_bytes() const
       // policy that only happens where fusing was mis-planned. Replaces a
       // ~5x over-reservation on q6-class batches.
       auto const cap = probe.rule2_bounded ? fused_scan_max_selectivity() : 1.0;
-      return batch_bytes / 4 +
-             static_cast<std::size_t>(static_cast<double>(batch_bytes) * cap);
+      return batch_bytes / 4 + static_cast<std::size_t>(static_cast<double>(batch_bytes) * cap);
     }
     // post_filter_and_project filters by copy: the materialized input and the
     // compacted output (up to input-sized) coexist at peak. The BOOL8

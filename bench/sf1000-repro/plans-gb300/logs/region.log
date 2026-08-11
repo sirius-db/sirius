@@ -110,4 +110,3 @@ input -> identity
   ratio=1.06x comp=0.00 GB/s decomp=0.01 GB/s
   input -> str_split -> offsets, chars
   str_split.chars -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
-

@@ -51,21 +51,24 @@ inline constexpr int64_t SELECTION_CHUNK_ROWS = 1024;
 // (out-of-range lanes ballot to 0). Sizing by ceil(num_rows/32) is an
 // out-of-bounds write for any num_rows not a multiple of 1024.
 struct selection_mask {
-  uint32_t* words = nullptr;  // device, WordsFor(num_rows) words, 128B-aligned
-  int64_t num_rows = 0;
-  int64_t survivor_count = -1;      // -1 until CNT wave ran
+  uint32_t* words         = nullptr;  // device, WordsFor(num_rows) words, 128B-aligned
+  int64_t num_rows        = 0;
+  int64_t survivor_count  = -1;       // -1 until CNT wave ran
   uint32_t* chunk_offsets = nullptr;  // device, exclusive prefix sum of survivors per
                                       // 1024-row chunk (length = ChunksFor(num_rows)+1);
                                       // null until CNT ran.
 
   // Sizing helpers (host-side).
-  static constexpr int64_t ChunksFor(int64_t num_rows) {
+  static constexpr int64_t ChunksFor(int64_t num_rows)
+  {
     return (num_rows + SELECTION_CHUNK_ROWS - 1) / SELECTION_CHUNK_ROWS;
   }
-  static constexpr int64_t WordsFor(int64_t num_rows) {  // full 32-word chunk strips
+  static constexpr int64_t WordsFor(int64_t num_rows)
+  {  // full 32-word chunk strips
     return ChunksFor(num_rows) * (SELECTION_CHUNK_ROWS / 32);
   }
-  static constexpr int64_t AllocWordsFor(int64_t num_rows) {  // alias of WordsFor
+  static constexpr int64_t AllocWordsFor(int64_t num_rows)
+  {  // alias of WordsFor
     return WordsFor(num_rows);
   }
 };
@@ -129,8 +132,8 @@ constexpr bool tier_is_fused_capable(output_tier t)
 
 // One scan conjunct resolved to a decoded-domain range on a bitpack column.
 struct filter_column_directive {
-  std::size_t column;   // index into the decompress call's `selected` span
-  range_predicate pred; // inclusive [lo,hi] in the decoded integer domain
+  std::size_t column;    // index into the decompress call's `selected` span
+  range_predicate pred;  // inclusive [lo,hi] in the decoded integer domain
   bool dynamic = false;  // provenance: join-produced dynamic min-max (DIAG `range*`)
 };
 
@@ -197,11 +200,11 @@ struct pair_filter_directive {
 // Source-count cap: ranges + pairs + bool8 <= 8, a PAIR counting as ONE source
 // (one kernel, one mask buffer).
 struct scan_filter_request {
-  std::vector<filter_column_directive> filters;      // range conjuncts (K1 sources)
+  std::vector<filter_column_directive> filters;       // range conjuncts (K1 sources)
   std::vector<pair_filter_directive> pair_filters;    // col-vs-col conjuncts (K1m2 sources)
   std::vector<bool8_filter_directive> bool8_filters;  // dict-code conjuncts (BOOL8 sources)
   std::vector<membership_filter_directive> membership_filters;  // dynamic probes
-  std::vector<output_tier> tiers;                     // parallel to `selected`
+  std::vector<output_tier> tiers;                               // parallel to `selected`
   // Dynamic-filter-set version at request build (0 = static-only). Echoed on
   // the result so the scan-side bail latch can clear when a later, tighter
   // filter set arrives (transitive targets; direct probe targets see complete
@@ -214,7 +217,7 @@ struct scan_filter_request {
 struct column_decode_directive {
   bool has_range = false;       // a decode-resolvable range exists on this column
   range_predicate range{0, 0};  // valid iff has_range
-  bool in_scan_mask = false;    // participates in wave-1 mask production (K1)
+  bool in_scan_mask   = false;  // participates in wave-1 mask production (K1)
   bool compact_output = false;  // TierA (K3 compacted) vs TierB (full + gather)
 };
 
@@ -243,9 +246,9 @@ inline scan_filter_request make_scan_filter_request(
 enum class scan_filter_status : uint8_t {
   refused = 0,                  // gate off / no directives / precondition / RULE-1
                                 // (no device work was done)
-  applied = 1,                  // fused pipeline produced the batch
+  applied                 = 1,  // fused pipeline produced the batch
   bailed_high_selectivity = 2,  // RULE-2 post-CNT bail (wave-1 cost paid, classic output)
-  failed = 3,                   // mid-flight failure; classic output (exceptional)
+  failed                  = 3,  // mid-flight failure; classic output (exceptional)
 };
 
 // Selection data surviving the converter call, owned by the batch (freed with
@@ -253,11 +256,11 @@ enum class scan_filter_status : uint8_t {
 // rebinding the batch to the pipeline stream (same discipline as
 // rebind_column_stream in compression_converters.cpp).
 struct scan_filter_result {
-  bool applied = false;      // false => output is the classic full-width decode
-  scan_filter_status status = scan_filter_status::refused;  // always applied ⇔ status==applied
+  bool applied               = false;  // false => output is the classic full-width decode
+  scan_filter_status status  = scan_filter_status::refused;  // always applied ⇔ status==applied
   uint64_t source_generation = 0;  // echo of the request (bail-latch keying)
-  int64_t num_rows = 0;      // pre-filter batch rows
-  int64_t survivor_count = -1;
+  int64_t num_rows           = 0;  // pre-filter batch rows
+  int64_t survivor_count     = -1;
   std::vector<output_tier> tiers;    // EFFECTIVE per-output tier (W4 may demote
                                      // a requested tier_a to tier_b on probe fail)
   rmm::device_buffer mask_words;     // uint32 x WordsFor(num_rows) (full chunk strips)
@@ -265,14 +268,16 @@ struct scan_filter_result {
   rmm::device_buffer row_indices;    // int32 x survivor_count (empty when no
                                      // tier_b output or survivor_count == 0)
 
-  selection_mask view() {
+  selection_mask view()
+  {
     return selection_mask{static_cast<uint32_t*>(mask_words.data()),
                           num_rows,
                           survivor_count,
                           static_cast<uint32_t*>(chunk_offsets.data())};
   }
 
-  void set_stream(rmm::cuda_stream_view stream) {
+  void set_stream(rmm::cuda_stream_view stream)
+  {
     if (mask_words.size() != 0) mask_words.set_stream(stream);
     if (chunk_offsets.size() != 0) chunk_offsets.set_stream(stream);
     if (row_indices.size() != 0) row_indices.set_stream(stream);

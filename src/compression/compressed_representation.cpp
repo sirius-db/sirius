@@ -366,8 +366,8 @@ compressed_device_representation::probe_fused_scan_reservation() const
   // caller must keep the classic envelope. A tier_dict_k5 column also lifts
   // the RULE-2 selectivity bound (dict batches skip the bail). Pure host
   // metadata (plan-tree walks), no device work.
-  auto const& ct     = _blob->table;
-  bool any_unbounded = false;
+  auto const& ct      = _blob->table;
+  bool any_unbounded  = false;
   auto probes_fusable = [&](std::size_t idx) {
     if (idx >= ct.columns.size()) { return false; }
     auto const& plan = ct.columns[idx].plan_tree;

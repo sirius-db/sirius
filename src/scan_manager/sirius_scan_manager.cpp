@@ -31,18 +31,16 @@
 #include "op/scan/duckdb_native_gpu_ingestible.hpp"
 #include "op/scan/gpu_ingestible.hpp"
 #include "op/scan/parquet_gpu_ingestible.hpp"
-#include "op/sirius_dynamic_filter.hpp"
 #include "op/scan/parquet_metadata.hpp"
 #include "op/scan/scan_utils.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "op/scan/sirius_gpu_scan_operator_data.hpp"
+#include "op/sirius_dynamic_filter.hpp"
 #include "op/sirius_physical_operator_type.hpp"
 #include "planner/query.hpp"
 #include "scan_manager/round_robin_strategy.hpp"
 
 #include <cudf/column/column_view.hpp>
-
-#include <cstdlib>
 #include <cudf/io/datasource.hpp>
 #include <cudf/io/experimental/hybrid_scan.hpp>
 #include <cudf/io/parquet.hpp>
@@ -72,6 +70,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <iterator>
 #include <memory>
 #include <optional>
@@ -889,11 +888,10 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
         // hash join publishes into (both resolve through the generator's
         // dynamic_filter_channels map, keyed by duckdb's DynamicTableFilterSet
         // pointer) and the one the decode-time snapshot logs.
-        SIRIUS_LOG_INFO(
-          "[fused-diag] membership capture entry '{}': channel={} has_filters_now={}",
-          assignment.entry_name,
-          static_cast<void const*>(dynamic_filters.get()),
-          dynamic_filters ? dynamic_filters->has_filters() : false);
+        SIRIUS_LOG_INFO("[fused-diag] membership capture entry '{}': channel={} has_filters_now={}",
+                        assignment.entry_name,
+                        static_cast<void const*>(dynamic_filters.get()),
+                        dynamic_filters ? dynamic_filters->has_filters() : false);
       }
       if (fused_scan_diag_enabled()) {
         SIRIUS_LOG_INFO("[fused-diag] scan-mgr entry '{}': cast={} filters={} n={}",

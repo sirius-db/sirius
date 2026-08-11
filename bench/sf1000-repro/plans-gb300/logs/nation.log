@@ -221,4 +221,3 @@ input -> identity
   input -> str_split -> offsets, chars
   str_split.chars -> snappy
   str_split.offsets -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
-

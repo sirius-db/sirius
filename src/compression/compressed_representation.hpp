@@ -16,14 +16,14 @@
 
 #pragma once
 
+#include "decode_pushdown.hpp"
+
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_buffer.hpp>
 
 #include <cucascade/data/common.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/memory_space.hpp>
-
-#include "decode_pushdown.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -253,7 +253,7 @@ class compressed_host_representation : public cucascade::idata_representation {
   /// orchestrator echoes it so bail latches can be generation-keyed.
   void set_membership_pushdown(decode_membership_pushdown pushdown, std::uint64_t generation)
   {
-    _membership_pushdown  = std::move(pushdown);
+    _membership_pushdown   = std::move(pushdown);
     _membership_generation = generation;
   }
 
@@ -266,7 +266,6 @@ class compressed_host_representation : public cucascade::idata_representation {
   {
     return _membership_generation;
   }
-
 
  private:
   /// Construct a projection sharing the same backing blob.
@@ -404,7 +403,7 @@ class compressed_device_representation : public cucascade::idata_representation 
   /// orchestrator echoes it so bail latches can be generation-keyed.
   void set_membership_pushdown(decode_membership_pushdown pushdown, std::uint64_t generation)
   {
-    _membership_pushdown  = std::move(pushdown);
+    _membership_pushdown   = std::move(pushdown);
     _membership_generation = generation;
   }
 
@@ -417,7 +416,6 @@ class compressed_device_representation : public cucascade::idata_representation 
   {
     return _membership_generation;
   }
-
 
   /// Reservation-time fused scan-filter probe (host metadata only — never
   /// touches the device).
