@@ -956,6 +956,46 @@ set_target_properties(
              RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/test/io")
 
 # -----------------------------------------------------------------------------
+# test/io/prefetch_hybrid_scan_benchmark — read_parquet vs. direct-to-device
+# hybrid scan
+# -----------------------------------------------------------------------------
+add_executable(prefetch_hybrid_scan_benchmark
+               test/io/prefetch_hybrid_scan_benchmark.cpp)
+
+if(VCPKG_BUILD)
+  set_target_properties(prefetch_hybrid_scan_benchmark
+                        PROPERTIES NO_SYSTEM_FROM_IMPORTED ON)
+  target_include_directories(prefetch_hybrid_scan_benchmark BEFORE
+                             PRIVATE ${_VCPKG_INC})
+endif()
+
+target_include_directories(
+  prefetch_hybrid_scan_benchmark
+  PRIVATE $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include>)
+
+target_link_libraries(
+  prefetch_hybrid_scan_benchmark
+  sirius_extension
+  duckdb_static
+  cudf::cudf
+  rmm::rmm
+  spdlog::spdlog
+  cuCascade::cucascade
+  cuCascade::cucascade_cudf
+  PkgConfig::LIBURING
+  PkgConfig::NUMA)
+link_extension_libraries(prefetch_hybrid_scan_benchmark "")
+
+target_link_options(prefetch_hybrid_scan_benchmark PRIVATE
+                    "LINKER:--allow-multiple-definition")
+
+set_target_properties(
+  prefetch_hybrid_scan_benchmark
+  PROPERTIES CXX_STANDARD 20
+             CXX_STANDARD_REQUIRED ON
+             RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/test/io")
+
+# -----------------------------------------------------------------------------
 # test/io/range_prefetch_benchmark — raw byte-range reads, no parquet decoding
 # -----------------------------------------------------------------------------
 add_executable(range_prefetch_benchmark test/io/range_prefetch_benchmark.cpp)
