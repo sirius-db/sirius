@@ -21,6 +21,7 @@
 // failure, distinct from a plan-time (create_plan) fallback.
 
 #include <catch.hpp>
+#include <config.hpp>
 #include <duckdb.hpp>
 #include <duckdb/main/client_context.hpp>
 #include <fcntl.h>
@@ -183,6 +184,105 @@ class RuntimeFallbackFixture {
 };
 
 }  // namespace
+
+TEST_CASE_METHOD(RuntimeFallbackFixture,
+                 "transparent execution: specialized regex matches generic implementation",
+                 "[transparent][integration][regex-jit-differential]")
+{
+  struct regex_jit_restore_guard {
+    bool original;
+    ~regex_jit_restore_guard() { duckdb::Config::ENABLE_REGEX_JIT_IMPL = original; }
+  } restore_regex_jit{duckdb::Config::ENABLE_REGEX_JIT_IMPL};
+
+  create_table(R"SQL(
+    CREATE TABLE test_regex_jit_equivalence AS
+    SELECT * FROM (VALUES
+      (1,  'http://www.example.com/a'),
+      (2,  'https://sub.example.org/a/b?x=1'),
+      (3,  'http://www.example.com/'),
+      (4,  'https://www.www.example.com/path'),
+      (5,  'https://münich.example/über'),
+      (6,  'https://example.com'),
+      (7,  'ftp://example.com/path'),
+      (8,  'HTTPS://example.com/path'),
+      (9,  'http:///missing-host'),
+      (10, ''),
+      (11, NULL),
+      (12, 'http://www./x'),
+      (13, 'http://www.//x'),
+      (14, 'https://newline.example/' || chr(10) || 'tail'),
+      (15, 'http://a' || chr(10) || 'b/x')
+    ) AS cases(id, url)
+  )SQL");
+
+  create_table(R"SQL(
+    CREATE TABLE test_regex_jit_final_newline_fallback AS
+    SELECT * FROM (VALUES
+      (1, 'http://a/x' || chr(10))
+    ) AS cases(id, url)
+  )SQL");
+
+  auto run_with_specialized_regex = [this](bool enabled, std::string const& table) {
+    auto setting =
+      con->Query(std::string{"SET enable_regex_jit_impl = "} + (enabled ? "true" : "false"));
+    REQUIRE(setting != nullptr);
+    REQUIRE_FALSE(setting->HasError());
+    REQUIRE(duckdb::Config::ENABLE_REGEX_JIT_IMPL == enabled);
+
+    auto const before = sirius::test::get_transparent_execution_stats(*con);
+    auto query        = std::string{R"SQL(
+      SELECT regexp_replace(url, '^https?://(?:www\.)?([^/]+)/.*$', '\1') AS domain
+      FROM )SQL"} +
+                 table + R"SQL(
+      ORDER BY id
+    )SQL";
+    auto result = con->Query(query);
+    REQUIRE(result != nullptr);
+    if (result->HasError()) {
+      UNSCOPED_INFO("regex differential query failed: " << result->GetError());
+    }
+    REQUIRE_FALSE(result->HasError());
+    auto const after = sirius::test::get_transparent_execution_stats(*con);
+    sirius::test::require_transparent_execution_delta(before, after, 1, 0, 1);
+
+    std::vector<std::string> rows;
+    rows.reserve(result->RowCount());
+    for (duckdb::idx_t row = 0; row < result->RowCount(); ++row) {
+      rows.push_back(result->GetValue(0, row).ToString());
+    }
+    return rows;
+  };
+
+  auto const generic     = run_with_specialized_regex(false, "test_regex_jit_equivalence");
+  auto const specialized = run_with_specialized_regex(true, "test_regex_jit_equivalence");
+  REQUIRE(specialized == generic);
+
+  std::vector<std::string> const expected{
+    "example.com",
+    "sub.example.org",
+    "example.com",
+    "www.example.com",
+    "münich.example",
+    "https://example.com",
+    "ftp://example.com/path",
+    "HTTPS://example.com/path",
+    "http:///missing-host",
+    "",
+    "NULL",
+    "www.",
+    "www.",
+    "https://newline.example/\ntail",
+    "a\nb",
+  };
+  REQUIRE(specialized == expected);
+
+  auto const generic_final_newline =
+    run_with_specialized_regex(false, "test_regex_jit_final_newline_fallback");
+  auto const specialized_final_newline =
+    run_with_specialized_regex(true, "test_regex_jit_final_newline_fallback");
+  REQUIRE(specialized_final_newline == generic_final_newline);
+  REQUIRE(specialized_final_newline == std::vector<std::string>{"a\n"});
+}
 
 // A GPU failure at runtime completes the query on CPU and is counted as a runtime
 // fallback. Without injection the same query runs on the GPU.
