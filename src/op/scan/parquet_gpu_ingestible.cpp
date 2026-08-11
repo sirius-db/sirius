@@ -1146,20 +1146,31 @@ std::unique_ptr<cudf::table> parquet_gpu_ingestible::post_filter_and_project(
   // borrows the AST.
   if (input.state != filter_state::ROW_FILTERED &&
       input.state != filter_state::ROW_FILTERED_AND_PROJECTED && !_residual.empty()) {
-    // The decoder may have answered some pure-filter columns for this batch,
-    // delivering the BOOL8 answer in place of the values; those conjuncts must
-    // reference the answer rather than re-compare it. The residual owns the
-    // per-conjunct forms and assembles the predicate for the batch in hand —
-    // it must outlive `exec`, which only borrows the AST.
-    auto sirius_filter_ast = _residual.against(input.predicate_columns);
-    sirius::expression_evaluator exec(sirius_filter_ast.get(), mr_ref, stream);
-    auto const data_positions = output_data_positions(*_plan);
-    auto filtered             = data_positions.empty() ? exec.select(input.table.view())
-                                                       : exec.select(input.table.view(), data_positions);
-    input = filtered_table{owning_table_view{std::move(filtered)}, filter_state::ROW_FILTERED};
-    SIRIUS_LOG_DEBUG(
-      "[parquet_gpu_ingestible::post_filter_and_project] Applied duckdb filter expression "
-      "post-decode.");
+    // The decoder may have answered some pure-filter columns for this batch.
+    // Where it also APPLIED those answers, the surviving rows already satisfy
+    // the conjunct and it leaves the residual entirely; where it only answered
+    // them, the conjunct becomes a reference to the BOOL8 rather than a
+    // re-comparison. The residual owns the per-conjunct forms and must outlive
+    // `exec`, which only borrows the AST.
+    auto sirius_filter_ast = _residual.against(input.predicate_columns, input.predicates_enforced);
+    if (sirius_filter_ast) {
+      sirius::expression_evaluator exec(sirius_filter_ast.get(), mr_ref, stream);
+      auto const data_positions = output_data_positions(*_plan);
+      auto filtered             = data_positions.empty() ? exec.select(input.table.view())
+                                                         : exec.select(input.table.view(), data_positions);
+      input = filtered_table{owning_table_view{std::move(filtered)}, filter_state::ROW_FILTERED};
+      SIRIUS_LOG_DEBUG(
+        "[parquet_gpu_ingestible::post_filter_and_project] Applied the residual filter "
+        "post-decode.");
+    } else {
+      // Nothing left to evaluate: the decode enforced every conjunct of this
+      // scan's filter, so these rows are already the answer. NOT "no filtering
+      // needed" — the rows were filtered, just not here.
+      input.state = filter_state::ROW_FILTERED;
+      SIRIUS_LOG_DEBUG(
+        "[parquet_gpu_ingestible::post_filter_and_project] The decode applied every conjunct; "
+        "no residual filter to run.");
+    }
   }
 
   // Project / reorder the reader's D-order batch to the plan's output layout

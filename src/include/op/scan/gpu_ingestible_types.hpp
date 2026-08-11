@@ -155,6 +155,10 @@ struct filtered_table {
   /// column instead of re-expressing the comparison. Empty on every path that
   /// substitutes nothing.
   std::vector<std::size_t> predicate_columns;
+  /// The decode also applied those conjuncts to the rows (see
+  /// sirius::decode_outcome::predicates_enforced), so post_filter_and_project
+  /// drops them from the residual instead of referencing the answer.
+  bool predicates_enforced{false};
 };
 
 }  // namespace sirius::op::scan

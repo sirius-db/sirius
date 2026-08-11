@@ -190,6 +190,16 @@ struct decode_outcome {
   /// BOOL8 column becomes indistinguishable from a substituted one.
   std::vector<std::size_t> predicate_columns;
 
+  /// The decode also APPLIED those answers to the rows: every equality it
+  /// answered was folded into the row selection, so the surviving rows already
+  /// satisfy those conjuncts and the scan can drop them from its residual
+  /// rather than AND the answer back in.
+  ///
+  /// False when the filtering declined and the columns came back through the
+  /// plain predicated decode instead — the answers are there, but no row was
+  /// dropped for them, so the scan must still evaluate them.
+  bool predicates_enforced = false;
+
   [[nodiscard]] bool any() const noexcept
   {
     return row_filtered || selection_unprofitable || !predicate_columns.empty();

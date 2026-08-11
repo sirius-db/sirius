@@ -206,9 +206,10 @@ void scan_operator_input::prepare_for_processing(
       // converters install the plain representation and both stay false.
       if (auto const* decoded =
             dynamic_cast<::sirius::decoded_batch_representation const*>(mut.get_data())) {
-        auto const& outcome      = decoded->outcome();
-        decode_row_filtered      = outcome.row_filtered;
-        decode_predicate_columns = outcome.predicate_columns;
+        auto const& outcome        = decoded->outcome();
+        decode_row_filtered        = outcome.row_filtered;
+        decode_predicate_columns   = outcome.predicate_columns;
+        decode_predicates_enforced = outcome.predicates_enforced;
         if (decode_selection_unprofitable && outcome.selection_unprofitable) {
           decode_selection_unprofitable->store(true, std::memory_order_relaxed);
         }

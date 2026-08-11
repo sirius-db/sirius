@@ -196,6 +196,11 @@ class scan_operator_input : public op::operator_data {
   /// post_filter_and_project, which rewrites those columns' filter conjunct to
   /// a bare boolean reference. Empty when nothing was substituted.
   std::vector<std::size_t> decode_predicate_columns;
+  /// The decode also applied those conjuncts to the rows
+  /// (decode_outcome::predicates_enforced), so they need not be evaluated
+  /// again. False whenever the answers came from the plain predicated decode,
+  /// which drops no rows.
+  bool decode_predicates_enforced{false};
   /// The operator's dynamic-filter channel (may be null), stamped by
   /// sirius_gpu_scan_operator::get_next_task_input_data. prepare_for_processing
   /// snapshots it at DECODE time — the scan-manager drain runs at query

@@ -65,9 +65,10 @@ filtered_table gpu_ingestible::materialize_table(const op::scan::scan_operator_i
       // table; move it straight into the scan output — the owned-table
       // owning_table_view releases by moving columns, so no copy is made.
       split.stolen_table_consumed = true;
-      return {.table             = owning_table_view{std::move(split.stolen_table)},
-              .state             = decoded_state,
-              .predicate_columns = split.decode_predicate_columns};
+      return {.table               = owning_table_view{std::move(split.stolen_table)},
+              .state               = decoded_state,
+              .predicate_columns   = split.decode_predicate_columns,
+              .predicates_enforced = split.decode_predicates_enforced};
     }
     if (split.stolen_table_consumed) {
       throw std::runtime_error(
@@ -99,9 +100,10 @@ filtered_table gpu_ingestible::materialize_table(const op::scan::scan_operator_i
       stream.synchronize();
       return {.table = owning_table_view{std::move(masked)}, .state = filter_state::UNFILTERED};
     }
-    return {.table             = owning_table_view{std::move(rbatch), view},
-            .state             = decoded_state,
-            .predicate_columns = split.decode_predicate_columns};
+    return {.table               = owning_table_view{std::move(rbatch), view},
+            .state               = decoded_state,
+            .predicate_columns   = split.decode_predicate_columns,
+            .predicates_enforced = split.decode_predicates_enforced};
   }
 }
 

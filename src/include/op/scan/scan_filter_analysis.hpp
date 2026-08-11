@@ -161,9 +161,17 @@ class residual_filter {
   [[nodiscard]] bool empty() const noexcept { return _conjuncts.empty(); }
 
   /// The predicate to evaluate over a batch in which @p answered_positions
-  /// arrived as BOOL8 answers. Null only when @ref empty.
+  /// arrived as BOOL8 answers.
+  ///
+  /// With @p answers_enforced, the decode did not merely answer those conjuncts
+  /// but applied them — the surviving rows already satisfy them — so they leave
+  /// the residual entirely rather than becoming a reference to the answer.
+  ///
+  /// Null when nothing is left to evaluate: either there was no filter, or the
+  /// decode enforced every conjunct. The caller must treat that as "these rows
+  /// are already filtered", NOT as "no filtering needed".
   [[nodiscard]] std::unique_ptr<sirius::ast::node> against(
-    std::vector<std::size_t> const& answered_positions) const;
+    std::vector<std::size_t> const& answered_positions, bool answers_enforced = false) const;
 
  private:
   struct conjunct {

@@ -498,7 +498,7 @@ residual_filter::residual_filter(std::vector<table_filter_conjunct> conjuncts,
 }
 
 std::unique_ptr<sirius::ast::node> residual_filter::against(
-  std::vector<std::size_t> const& answered_positions) const
+  std::vector<std::size_t> const& answered_positions, bool answers_enforced) const
 {
   if (_conjuncts.empty()) { return nullptr; }
 
@@ -512,9 +512,12 @@ std::unique_ptr<sirius::ast::node> residual_filter::against(
   children.reserve(_conjuncts.size());
   for (auto const& conjunct : _conjuncts) {
     if (answered(conjunct.answered_at)) {
-      // The column IS the answer to this conjunct — a BOOL8 result, not values.
-      // Referencing it is both correct and cheaper than re-comparing; running
-      // the comparison would test a mask against the original constant.
+      // The decode already dropped the rows this conjunct rejects, so asking
+      // again would be redundant work on a condition that cannot be false.
+      if (answers_enforced) { continue; }
+      // Otherwise the column IS the answer — a BOOL8 result, not values — so
+      // reference it. Re-running the comparison would test a mask against the
+      // original constant.
       children.push_back(std::make_unique<sirius::ast::node>(
         sirius::ast::reference{static_cast<std::uint32_t>(*conjunct.answered_at),
                                sirius::logical_type::make(sirius::type_id::BOOLEAN)}));
@@ -523,6 +526,7 @@ std::unique_ptr<sirius::ast::node> residual_filter::against(
     }
   }
 
+  if (children.empty()) { return nullptr; }
   if (children.size() == 1) { return std::move(children[0]); }
   sirius::ast::conjunction all{sirius::ast::conjunction::kind::op_and, std::move(children)};
   return std::make_unique<sirius::ast::node>(std::move(all));

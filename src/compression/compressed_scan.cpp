@@ -454,6 +454,11 @@ std::unique_ptr<cudf::table> decode_with_filters(simpatico::compressed_table con
   } else if (result.applied && plan.covers_whole_filter) {
     outcome.row_filtered = true;
   }
+  // Every equality the request carried was ANDed into the batch mask before
+  // wave 2 ran, so on an applied decode the surviving rows already satisfy
+  // them. On any other outcome the equality answers come from the plain
+  // predicated rerun, which drops no rows.
+  outcome.predicates_enforced = result.applied && !wave_request.bool8_filters.empty();
   SIRIUS_DECODE_DIAG(
     "[decode-filter] decode {} (status={} generation={}): ranges={} pairs={} equalities={} "
     "join_filters={} survivors={}/{} column(s)={} covers_whole_filter={} row_filtered={} "
