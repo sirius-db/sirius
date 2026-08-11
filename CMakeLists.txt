@@ -1000,6 +1000,43 @@ set_target_properties(
              RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/test/io")
 
 # -----------------------------------------------------------------------------
+# test/io/columnar_parquet_poc — per-column IO/decode pipelining
+# -----------------------------------------------------------------------------
+add_executable(columnar_parquet_poc test/io/columnar_parquet_poc.cpp)
+
+if(VCPKG_BUILD)
+  set_target_properties(columnar_parquet_poc PROPERTIES NO_SYSTEM_FROM_IMPORTED
+                                                        ON)
+  target_include_directories(columnar_parquet_poc BEFORE PRIVATE ${_VCPKG_INC})
+endif()
+
+target_include_directories(
+  columnar_parquet_poc
+  PRIVATE $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include>)
+
+target_link_libraries(
+  columnar_parquet_poc
+  sirius_extension
+  duckdb_static
+  cudf::cudf
+  rmm::rmm
+  spdlog::spdlog
+  cuCascade::cucascade
+  cuCascade::cucascade_cudf
+  PkgConfig::LIBURING
+  PkgConfig::NUMA)
+link_extension_libraries(columnar_parquet_poc "")
+
+target_link_options(columnar_parquet_poc PRIVATE
+                    "LINKER:--allow-multiple-definition")
+
+set_target_properties(
+  columnar_parquet_poc
+  PROPERTIES CXX_STANDARD 20
+             CXX_STANDARD_REQUIRED ON
+             RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/test/io")
+
+# -----------------------------------------------------------------------------
 # test/io/range_prefetch_benchmark — raw byte-range reads, no parquet decoding
 # -----------------------------------------------------------------------------
 add_executable(range_prefetch_benchmark test/io/range_prefetch_benchmark.cpp)

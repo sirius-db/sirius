@@ -19,6 +19,7 @@
 //
 // Usage:
 //   ./prefetch_hybrid_scan_benchmark --dir DIR [--n_files N] --mode <b|p> [--nthreads N]
+//                                     [--passes N]
 //
 // Modes:
 //   b  baseline    — enqueue all read_parquet calls directly to the thread pool
@@ -174,7 +175,8 @@ void run_hybrid_scan(std::vector<file_info>& files,
                      stream_pool_t& streams,
                      sirius::io::uring::uring_ioctx& io_ctx,
                      sirius::memory::sirius_memory_reservation_manager& mgr,
-                     std::size_t total_bytes)
+                     std::size_t total_bytes,
+                     std::size_t passes)
 {
   sirius::io::cache::config cache_cfg;
   cache_cfg.inflight_io_chunk_budget        = 16384;
@@ -200,84 +202,93 @@ void run_hybrid_scan(std::vector<file_info>& files,
   auto const mr_ref        = cudf::get_current_device_resource_ref();
   using hybrid_scan_reader = cudf::io::parquet::experimental::hybrid_scan_reader;
 
-  std::atomic<std::size_t> total_rows{0};
-  std::latch done(static_cast<std::ptrdiff_t>(files.size()));
+  // Pass 0 is cold: nothing is resident, so every chunk is claimed for loading
+  // and read through the cache's staging buffers.  Later passes re-read the same
+  // ranges, which are now `cached`, so they exercise the cache-HIT path — the
+  // pin-and-copy side.  Those two paths have very different costs and only the
+  // hit path is sensitive to how the host-to-device copies are issued, so they
+  // are reported separately rather than averaged.
+  for (std::size_t pass = 0; pass < passes; ++pass) {
+    std::atomic<std::size_t> total_rows{0};
+    std::latch done(static_cast<std::ptrdiff_t>(files.size()));
 
-  auto t0 = clock_type::now();
-  for (std::size_t k = 0; k < files.size(); ++k) {
-    auto& fi = files[k];
+    auto t0 = clock_type::now();
+    for (std::size_t k = 0; k < files.size(); ++k) {
+      auto& fi = files[k];
 
-    auto stream = streams.acquire_stream(acquire_pol::GROW);
+      auto stream = streams.acquire_stream(acquire_pol::GROW);
 
-    // One device buffer per column-chunk byte range, allocated on `stream`.
-    std::vector<rmm::device_buffer> buffers;
-    buffers.reserve(fi.ranges.size());
-    for (auto const& range : fi.ranges) {
-      buffers.emplace_back(static_cast<std::size_t>(range.size()), stream.get(), mr_ref);
-    }
-
-    // One batched request for every column chunk this file needs, not one
-    // device_read_async per range: the backend gets the whole batch in a single
-    // dispatch and can fuse and order it as it sees fit.
-    std::vector<sirius::io::io_device_range> reads;
-    reads.reserve(fi.ranges.size());
-    for (std::size_t i = 0; i < fi.ranges.size(); ++i) {
-      reads.push_back(sirius::io::io_device_range{static_cast<std::size_t>(fi.ranges[i].offset()),
-                                                  static_cast<std::size_t>(fi.ranges[i].size()),
-                                                  static_cast<std::uint8_t*>(buffers[i].data())});
-    }
-    fi.ds->device_read_ranges_async(reads, stream.get()).get();
-
-    // Deliberately NO stream synchronize here.  The H2D copies, the buffers'
-    // stream-ordered allocation and deallocation, and the decode below all run
-    // on this one stream, so the decode is already ordered after the copies.
-    // Waiting would serialise IO and decode; instead the buffers and the
-    // borrowed_stream move into the task (which keeps both alive until it
-    // synchronises) and this thread goes straight on to the next file's IO.
-    // `stream` is captured before `buffers` on purpose: captures are destroyed
-    // in reverse declaration order, so the buffers release their (stream-
-    // ordered) allocations before the borrowed_stream goes back to the pool.
-    disp.enqueue([k,
-                  &files,
-                  &total_rows,
-                  &done,
-                  mr_ref,
-                  stream  = std::move(stream),
-                  buffers = std::move(buffers)] {
-      auto const& f = files[k];
-
-      std::vector<cudf::device_span<uint8_t const>> spans;
-      spans.reserve(buffers.size());
-      for (auto const& buf : buffers) {
-        spans.emplace_back(static_cast<uint8_t const*>(buf.data()), buf.size());
+      // One device buffer per column-chunk byte range, allocated on `stream`.
+      std::vector<rmm::device_buffer> buffers;
+      buffers.reserve(fi.ranges.size());
+      for (auto const& range : fi.ranges) {
+        buffers.emplace_back(static_cast<std::size_t>(range.size()), stream.get(), mr_ref);
       }
 
-      auto opts = cudf::io::parquet_reader_options::builder().column_names(COLUMNS).build();
-      hybrid_scan_reader reader(f.metadata, opts);
-      auto result = reader.materialize_all_columns(
-        cudf::host_span<cudf::size_type const>(f.row_groups.data(), f.row_groups.size()),
-        cudf::host_span<cudf::device_span<uint8_t const> const>(spans.data(), spans.size()),
-        opts,
-        stream.get(),
-        mr_ref);
+      // One batched request for every column chunk this file needs, not one
+      // device_read_async per range: the backend gets the whole batch in a single
+      // dispatch and can fuse and order it as it sees fit.
+      std::vector<sirius::io::io_device_range> reads;
+      reads.reserve(fi.ranges.size());
+      for (std::size_t i = 0; i < fi.ranges.size(); ++i) {
+        reads.push_back(sirius::io::io_device_range{static_cast<std::size_t>(fi.ranges[i].offset()),
+                                                    static_cast<std::size_t>(fi.ranges[i].size()),
+                                                    static_cast<std::uint8_t*>(buffers[i].data())});
+      }
+      fi.ds->device_read_ranges_async(reads, stream.get()).get();
 
-      // Buffers die when this lambda does, so drain the stream first.
-      cudaStreamSynchronize(stream.get().value());
-      total_rows.fetch_add(static_cast<std::size_t>(result.tbl->num_rows()),
-                           std::memory_order_relaxed);
-      done.count_down();
-    });
+      // Deliberately NO stream synchronize here.  The H2D copies, the buffers'
+      // stream-ordered allocation and deallocation, and the decode below all run
+      // on this one stream, so the decode is already ordered after the copies.
+      // Waiting would serialise IO and decode; instead the buffers and the
+      // borrowed_stream move into the task (which keeps both alive until it
+      // synchronises) and this thread goes straight on to the next file's IO.
+      // `stream` is captured before `buffers` on purpose: captures are destroyed
+      // in reverse declaration order, so the buffers release their (stream-
+      // ordered) allocations before the borrowed_stream goes back to the pool.
+      disp.enqueue([k,
+                    &files,
+                    &total_rows,
+                    &done,
+                    mr_ref,
+                    stream  = std::move(stream),
+                    buffers = std::move(buffers)] {
+        auto const& f = files[k];
+
+        std::vector<cudf::device_span<uint8_t const>> spans;
+        spans.reserve(buffers.size());
+        for (auto const& buf : buffers) {
+          spans.emplace_back(static_cast<uint8_t const*>(buf.data()), buf.size());
+        }
+
+        auto opts = cudf::io::parquet_reader_options::builder().column_names(COLUMNS).build();
+        hybrid_scan_reader reader(f.metadata, opts);
+        auto result = reader.materialize_all_columns(
+          cudf::host_span<cudf::size_type const>(f.row_groups.data(), f.row_groups.size()),
+          cudf::host_span<cudf::device_span<uint8_t const> const>(spans.data(), spans.size()),
+          opts,
+          stream.get(),
+          mr_ref);
+
+        // Buffers die when this lambda does, so drain the stream first.
+        cudaStreamSynchronize(stream.get().value());
+        total_rows.fetch_add(static_cast<std::size_t>(result.tbl->num_rows()),
+                             std::memory_order_relaxed);
+        done.count_down();
+      });
+    }
+
+    done.wait();
+    double const elapsed = ms_since(t0);
+
+    std::cout << "\n=== hybrid scan results (pass " << pass << (pass == 0 ? ", cold" : ", warm")
+              << ") ===\n"
+              << "  wall      : " << std::fixed << std::setprecision(1) << elapsed << " ms\n"
+              << "  throughput: " << std::setprecision(2)
+              << static_cast<double>(total_bytes) / (1024.0 * 1024.0 * 1024.0) / (elapsed / 1000.0)
+              << " GiB/s\n"
+              << "  rows      : " << total_rows.load() << "\n";
   }
-
-  done.wait();
-  double const elapsed = ms_since(t0);
-
-  std::cout << "\n=== hybrid scan results ===\n"
-            << "  wall      : " << std::fixed << std::setprecision(1) << elapsed << " ms\n"
-            << "  throughput: " << std::setprecision(2)
-            << static_cast<double>(total_bytes) / (1024.0 * 1024.0 * 1024.0) / (elapsed / 1000.0)
-            << " GiB/s\n"
-            << "  rows      : " << total_rows.load() << "\n";
 }
 
 }  // namespace
@@ -290,6 +301,7 @@ int main(int argc, char** argv)
   std::size_t n_files = 0;
   std::string mode;  // "b" or "p"
   std::size_t nthreads = 4;
+  std::size_t passes   = 1;  // >1 re-reads the same ranges, exercising the cache-hit path
 
   for (int i = 1; i < argc; ++i) {
     std::string_view arg(argv[i]);
@@ -301,13 +313,17 @@ int main(int argc, char** argv)
       mode = argv[++i];
     } else if (arg == "--nthreads" && i + 1 < argc) {
       nthreads = std::stoull(argv[++i]);
+    } else if (arg == "--passes" && i + 1 < argc) {
+      passes = std::max<std::size_t>(1, std::stoull(argv[++i]));
     } else {
-      std::cerr << "usage: " << argv[0] << " --dir DIR [--n_files N] --mode <b|p> [--nthreads N]\n";
+      std::cerr << "usage: " << argv[0]
+                << " --dir DIR [--n_files N] --mode <b|p> [--nthreads N] [--passes N]\n";
       return 1;
     }
   }
   if (dir.empty() || (mode != "b" && mode != "p")) {
-    std::cerr << "usage: " << argv[0] << " --dir DIR [--n_files N] --mode <b|p> [--nthreads N]\n";
+    std::cerr << "usage: " << argv[0]
+              << " --dir DIR [--n_files N] --mode <b|p> [--nthreads N] [--passes N]\n";
     return 1;
   }
 
@@ -407,7 +423,7 @@ int main(int argc, char** argv)
   if (mode == "b") {
     run_baseline(files, disp, streams, total_bytes);
   } else {
-    run_hybrid_scan(files, disp, streams, *io_ctx, *mgr, total_bytes);
+    run_hybrid_scan(files, disp, streams, *io_ctx, *mgr, total_bytes, passes);
   }
 
   disp.wait_for_all();
