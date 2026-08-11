@@ -551,9 +551,8 @@ void sirius_config::load_from_file(const std::filesystem::path& config_path)
       sr.reject_unknown();
     }
 
-    bool const explicit_space_configured = !gpu_space_configs.empty() ||
-                                           !host_space_configs.empty() ||
-                                           !disk_space_configs.empty();
+    bool const explicit_space_configured =
+      !gpu_space_configs.empty() || !host_space_configs.empty() || !disk_space_configs.empty();
     if (high_level_memory_configured && explicit_space_configured) {
       throw std::runtime_error(
         "sirius.memory and non-empty sirius.space lists are mutually exclusive");

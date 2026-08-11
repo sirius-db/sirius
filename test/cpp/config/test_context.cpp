@@ -329,8 +329,7 @@ TEST_CASE("Sirius configuration loading from file with spaces",
   REQUIRE(manager.get_all_memory_spaces().size() == 4);
 }
 
-TEST_CASE("Sirius configuration rejects competing memory configuration paths",
-          "[sirius][config]")
+TEST_CASE("Sirius configuration rejects competing memory configuration paths", "[sirius][config]")
 {
   std::source_location loc = std::source_location::current();
   auto const data_dir      = fs::path(loc.file_name()).parent_path() / "data";
@@ -343,22 +342,20 @@ TEST_CASE("Sirius configuration rejects competing memory configuration paths",
   for (auto const* fixture : fixtures) {
     INFO("fixture=" << fixture);
     sirius::sirius_config config;
-    REQUIRE_THROWS_WITH(
-      config.load_from_file(data_dir / fixture),
-      Catch::Contains("sirius.memory") && Catch::Contains("sirius.space") &&
-        Catch::Contains("mutually exclusive"));
+    REQUIRE_THROWS_WITH(config.load_from_file(data_dir / fixture),
+                        Catch::Contains("sirius.memory") && Catch::Contains("sirius.space") &&
+                          Catch::Contains("mutually exclusive"));
   }
 }
 
 TEST_CASE("Sirius configuration keeps absent memory paths out of mutual-exclusion checks",
           "[sirius][config]")
 {
-  std::source_location loc = std::source_location::current();
-  auto const data_dir      = fs::path(loc.file_name()).parent_path() / "data";
+  std::source_location loc  = std::source_location::current();
+  auto const data_dir       = fs::path(loc.file_name()).parent_path() / "data";
   constexpr std::size_t mib = 1024ULL * 1024;
 
-  for (auto const& [fixture, expected_capacity] :
-       std::vector<std::pair<const char*, std::size_t>>{
+  for (auto const& [fixture, expected_capacity] : std::vector<std::pair<const char*, std::size_t>>{
          {"valid_space_with_null_memory_subblock.yaml", 128 * mib},
          {"valid_memory_with_empty_space.yaml", 256 * mib}}) {
     INFO("fixture=" << fixture);
