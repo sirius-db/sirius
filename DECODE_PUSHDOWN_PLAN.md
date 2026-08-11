@@ -338,9 +338,36 @@ no inverted dependency.
 **Phase 3 — internals. DONE** (`52cc1b5a`, `ec38c489`, `7aaf3da8`, `660ce427`).
 P1–P4, P7 and P8 are all closed. The merged analysis pass landed in Phase 2 with the facade.
 
-*Not done, deliberately:* the §2 API's `position` (column elision) and `unapplied` (the residual
-as a predicate). Both need the analysis to speak `sirius::ast` rather than rebuilding a DuckDB
-expression, which is a change to the scan's filter representation, not to the decode's internals.
+**`unapplied` — DONE** (`a2b38ca3`, `175ae6a4`). The residual is a Sirius AST predicate now:
+`decompose_table_filters` splits the filter into conjuncts at bind (and
+`convert_table_filters_to_expression` is reimplemented on top of it, so the two cannot diverge),
+each conjunct is lowered once, and `residual_filter::against` picks a form per conjunct per batch.
+Nothing is rebuilt or converted on the batch path.
+
+Three outcomes per conjunct, which is the rewrite rule §2 asked for:
+
+| the decode | the residual |
+|---|---|
+| did nothing with it | keeps the comparison |
+| ANSWERED it (BOOL8 delivered, no row dropped) | references the answer |
+| APPLIED it (folded into the row selection) | drops it |
+
+The third is new and needed `decode_outcome::predicates_enforced` — an answered equality is ANDed
+into the mask before wave 2, so on an *applied* decode the surviving rows already satisfy it, and
+the scan was re-ANDing a condition that could no longer be false. A scan whose whole filter is one
+dictionary equality now skips the post-decode pass entirely; an empty residual means "already
+filtered", never "no filter".
+
+*Watch out:* the enforced path is unreachable at default thresholds for the sizes the end-to-end
+tests use — they decline at 0.25 selectivity against the 0.10 full-route ceiling — so it is pinned
+by `test/cpp/scan/test_residual_filter.cpp` at the decision, not end to end. Raising
+`SIRIUS_EXP_FUSED_SCAN_TIERB_MAX_SEL` to 0.9 reaches it in the two dictionary pushdown tests and
+their answers are unchanged.
+
+*Not done:* `position` — true column ELISION, where an answered filter-only column is never
+delivered at all. The decode still gathers its BOOL8 to the slot (1 B/row); skipping it means a
+variable output arity, which every downstream position mapping would have to follow. The conjunct
+side of elision — the column being unreferenced by the residual — is what landed here.
 
 **No measurement.** Phase 2 and 3 were verified for correctness only — `[compression]` with the
 gate on and off, plus all 14 simpatico tests. This box has no GPU budget for the SF1000 run, so
