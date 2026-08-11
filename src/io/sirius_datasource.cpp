@@ -177,6 +177,19 @@ std::future<size_t> sirius_datasource::device_read_async(size_t offset,
   return bridge_semi_to_std(std::move(semi));
 }
 
+std::future<size_t> sirius_datasource::device_read_ranges_async(
+  std::span<const io_device_range> ranges, rmm::cuda_stream_view stream)
+{
+  exec::semi_future<size_t> semi;
+  if (uses_prefetching_cache()) {
+    auto* cache = _io_ctx->cache();
+    semi        = cache->device_read_ranges_async(*_io_object, ranges, stream, &_prefetch_handle);
+  } else {
+    semi = _io_ctx->device_read_ranges_async_io(*_io_object, ranges, stream);
+  }
+  return bridge_semi_to_std(std::move(semi));
+}
+
 std::unique_ptr<sirius_datasource> sirius_datasource::duplicate() const
 {
   // Share the io_ctx and io_object — both are shared_ptr-managed and

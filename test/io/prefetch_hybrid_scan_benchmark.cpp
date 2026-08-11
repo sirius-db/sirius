@@ -216,17 +216,17 @@ void run_hybrid_scan(std::vector<file_info>& files,
       buffers.emplace_back(static_cast<std::size_t>(range.size()), stream.get(), mr_ref);
     }
 
-    std::vector<std::future<std::size_t>> futures;
-    futures.reserve(fi.ranges.size());
+    // One batched request for every column chunk this file needs, not one
+    // device_read_async per range: the backend gets the whole batch in a single
+    // dispatch and can fuse and order it as it sees fit.
+    std::vector<sirius::io::io_device_range> reads;
+    reads.reserve(fi.ranges.size());
     for (std::size_t i = 0; i < fi.ranges.size(); ++i) {
-      futures.push_back(fi.ds->device_read_async(static_cast<std::size_t>(fi.ranges[i].offset()),
-                                                 static_cast<std::size_t>(fi.ranges[i].size()),
-                                                 static_cast<std::uint8_t*>(buffers[i].data()),
-                                                 stream.get()));
+      reads.push_back(sirius::io::io_device_range{static_cast<std::size_t>(fi.ranges[i].offset()),
+                                                  static_cast<std::size_t>(fi.ranges[i].size()),
+                                                  static_cast<std::uint8_t*>(buffers[i].data())});
     }
-    for (auto& f : futures) {
-      f.get();
-    }
+    fi.ds->device_read_ranges_async(reads, stream.get()).get();
 
     // Deliberately NO stream synchronize here.  The H2D copies, the buffers'
     // stream-ordered allocation and deallocation, and the decode below all run

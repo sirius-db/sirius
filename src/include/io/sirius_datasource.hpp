@@ -100,6 +100,16 @@ class sirius_datasource : public cudf::io::datasource {
                                         uint8_t* dst,
                                         rmm::cuda_stream_view stream) override;
 
+  /// \brief Vectored form of @c device_read_async: read every range into its own
+  /// device destination in a single dispatch.
+  ///
+  /// \note Not a @c cudf::io::datasource override — cudf has no batched device
+  /// read.  Callers holding many ranges (e.g. a parquet scan's column chunks)
+  /// should prefer this over one @c device_read_async per range: it costs one
+  /// request instead of N, and lets the backend fuse and order the whole batch.
+  std::future<size_t> device_read_ranges_async(std::span<const io_device_range> ranges,
+                                               rmm::cuda_stream_view stream);
+
   // ---- Advisory IO ---------------------------------------------------------
 
   /// \brief Return a fresh datasource that shares this one's @c ioctx and
