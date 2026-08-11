@@ -29,6 +29,9 @@
 #include <cucascade/memory/topology_discovery.hpp>
 
 #include <atomic>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
 #include <future>
 #include <memory>
 #include <optional>
@@ -245,6 +248,23 @@ class task_scheduler {
 
   sirius::creator::task_creator* _task_creator{nullptr};
   std::unique_ptr<completion_handler> _completion_handler;
+
+  /// Stall watchdog. A query that stops making progress currently presents as an
+  /// indefinite hang holding all GPU memory, with no error and nothing in the log
+  /// — every thread parks and engine::execute() waits on a promise that no longer
+  /// has a writer. This thread notices that state and dumps the per-pipeline
+  /// completion inputs (task counters, source exhaustion, finished flag), which is
+  /// what tells apart "the finish condition was never satisfied" from "it was
+  /// satisfied and the signal was lost".
+  void stall_watchdog_loop();
+  void start_stall_watchdog();
+  void stop_stall_watchdog();
+  void log_pipeline_completion_state(const char* reason);
+
+  std::thread _watchdog_thread;
+  std::atomic<bool> _watchdog_running{false};
+  std::mutex _watchdog_cv_mutex;
+  std::condition_variable _watchdog_cv;
   std::shared_ptr<const telemetry::telemetry_context> _telemetry_context;
   std::unique_ptr<telemetry::TaskQueueHandleWrapper> _task_queue_telemetry;
 };

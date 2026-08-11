@@ -22,6 +22,7 @@
 #include "duckdb/parallel/task_scheduler.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_operator_type.hpp"
+#include "pipeline/completion_handler.hpp"
 #include "pipeline/pipeline_build_context.hpp"
 #include "telemetry-bridge/gen/uuid.rs.h"
 
@@ -196,6 +197,10 @@ class sirius_pipeline : public duckdb::enable_shared_from_this<sirius_pipeline> 
   //! Set the task_creator pointer so this pipeline can schedule downstream consumers on finish.
   void set_task_creator(sirius::creator::task_creator* tc);
 
+  //! Set the query's completion handler so a terminal pipeline can signal completion
+  //! from the point that establishes it, rather than relying on a later task to notice.
+  void set_completion_handler(completion_handler* handler);
+
   //! Returns a scoped lock on the pipeline status mutex.
   //! Callers must hold this lock across the operation that consumes pipeline state
   //! (port data pop, partition claim, etc.) and the task constructor that calls
@@ -247,6 +252,14 @@ class sirius_pipeline : public duckdb::enable_shared_from_this<sirius_pipeline> 
 
   //! Task creator pointer for scheduling downstream consumers when this pipeline finishes
   sirius::creator::task_creator* _task_creator{nullptr};
+
+  //! Completion handler for the query this pipeline belongs to; only consulted when
+  //! this pipeline is the terminal one. See signal_query_complete_if_terminal().
+  completion_handler* _completion_handler{nullptr};
+
+  //! Signal query completion when this pipeline has just finished and is terminal.
+  //! MUST be called with _status_mutex released — see the definition.
+  void signal_query_complete_if_terminal();
 
   //! The unique ID of this pipeline (assigned based on new_scheduled order)
   size_t pipeline_id = 0;

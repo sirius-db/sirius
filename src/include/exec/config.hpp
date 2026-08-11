@@ -52,6 +52,18 @@ struct downgrade_executor_config {
   /// unpreferred any_memory_space_in_tier{Tier::HOST} strategy (single-GPU default behavior).
   /// Populated by SiriusContext from config_.get_hw_topology().gpus[device_id].numa_node.
   std::optional<int> preferred_numa_node;
+
+  /// How long a task waits for a downgrade request it issued before giving up and
+  /// failing the query.
+  ///
+  /// The wait was previously unbounded (`request_downgrade(...).get()`), so a
+  /// request that is never satisfied parks the task forever: the query holds all
+  /// GPU memory at 0% utilisation with no error, which is far harder to diagnose
+  /// or survive than a failed query. This is a liveness backstop, NOT a latency
+  /// target — a legitimate request can be slow (a single 9.9 GB compressed
+  /// downgrade was measured at 18.4 s), so the default leaves room above any
+  /// duration observed in practice. Set to 0 to restore the unbounded wait.
+  std::chrono::milliseconds downgrade_wait_timeout{std::chrono::minutes{1}};
 };
 
 }  // namespace sirius::exec

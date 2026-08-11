@@ -375,6 +375,10 @@ std::unique_lock<std::mutex> sirius_pipeline::get_task_creation_lock()
 void sirius_pipeline::update_pipeline_status(bool original_pipeline)
 {
   bool should_notify = false;
+  // Distinct from should_notify, which is also true for an already-finished
+  // pipeline. Only the call that performs the transition may signal completion,
+  // so drain_pending_tasks() is not re-run for every later status update.
+  bool became_finished = false;
   {
     std::lock_guard<std::mutex> lock(_status_mutex);
 
@@ -418,7 +422,8 @@ void sirius_pipeline::update_pipeline_status(bool original_pipeline)
             op.get().finalize_operator();
           }
           end_nvtx_range_if_finished();
-          should_notify = true;
+          should_notify   = true;
+          became_finished = true;
         }
       }
       if (!pipeline_finished.load()) { end_nvtx_range_if_finished(); }
@@ -427,6 +432,50 @@ void sirius_pipeline::update_pipeline_status(bool original_pipeline)
      // to avoid holding the child pipeline mutex while acquiring a parent's
 
   if (should_notify) { notify_downstream_pipelines(original_pipeline); }
+  if (became_finished) { signal_query_complete_if_terminal(); }
+}
+
+void sirius_pipeline::set_completion_handler(completion_handler* handler)
+{
+  _completion_handler = handler;
+}
+
+// Signal query completion from the point that establishes it.
+//
+// The completion promise engine::execute() blocks on had exactly one writer: the
+// block in gpu_pipeline_executor that runs after a task finishes and re-reads
+// is_pipeline_finished(). But the flag is set HERE, by whichever task happens to
+// balance the counters, and this function's caller does not signal. If the task
+// that sets the flag is not itself a terminal-pipeline task running that block,
+// and no further task follows it, nothing ever writes the promise: every thread
+// drains and parks while engine::execute() waits forever, holding all GPU memory.
+//
+// notify_downstream_pipelines() cannot cover this — it returns immediately for a
+// terminal pipeline, precisely because there is no downstream to notify. So the
+// terminal case had no signalling path at all.
+//
+// The executor-side check stays. Both paths are idempotent (mark_completed()
+// guards on compare_exchange_strong, so only the first caller wins), and keeping
+// both means neither has to be proven to be the one that always fires.
+//
+// MUST run with _status_mutex released. mark_completed() releases
+// engine::execute(), which tears down the operators this pipeline refers to;
+// signalling under our own lock would risk a use-after-free on the mutex itself.
+// This mirrors notify_downstream_pipelines(), which is deliberately called
+// outside the lock for the same reason.
+void sirius_pipeline::signal_query_complete_if_terminal()
+{
+  if (_completion_handler == nullptr) { return; }
+  auto s = get_sink();
+  if (!s || s->type != op::SiriusPhysicalOperatorType::RESULT_COLLECTOR) { return; }
+
+  // Same order as the executor's completion block: drain first, because
+  // mark_completed() may return control to a thread that destroys the operators
+  // those pending tasks reference.
+  if (_task_creator != nullptr) { _task_creator->drain_pending_tasks(); }
+  SIRIUS_LOG_DEBUG("Pipeline {}: terminal pipeline finished; signalling query completion",
+                   pipeline_id);
+  _completion_handler->mark_completed();
 }
 
 void sirius_pipeline::mark_task_created()

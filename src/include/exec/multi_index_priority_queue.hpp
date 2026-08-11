@@ -228,7 +228,30 @@ class multi_index_priority_queue {
       }
     }
     _cv.notify_one();
+    // Outside the lock: the callback publishes into the scheduler's request
+    // channel, and holding the queue mutex across that would invert the lock
+    // order against the management loop's matcher.
+    if (_on_push) { _on_push(); }
   }
+
+  /// Install a callback invoked after every successful push, outside the lock.
+  ///
+  /// The queue's own `_cv` only wakes threads blocked in pop()/pop_back(). The
+  /// task_scheduler's management loop does NOT block on the queue — it blocks on
+  /// its request channel and dispatches on `task_available` / `device_ready`
+  /// events — so a push that does not publish such an event is invisible to it.
+  ///
+  /// That asymmetry hung queries. schedule() published a wake-up by hand, but the
+  /// downgrade path returns tasks by calling push() directly
+  /// (~convertible_gpu_pipeline_task), so tasks pulled out of the queue to have
+  /// their batches spilled came back silently. With every device already marked
+  /// ready and matched against an empty queue, no further event was due: the
+  /// tasks sat in the queue forever, their pipeline never balanced its counters,
+  /// and the query waited on a promise nobody would write. Measured on q3/SF1000:
+  /// 9 tasks queued, pipeline 12 at 148 created / 139 completed, every thread idle.
+  ///
+  /// Set once during wiring, before the queue is shared with other threads.
+  void set_on_push(std::function<void()> callback) { _on_push = std::move(callback); }
 
   /// Blocks until the globally-first (lowest-priority-value) task is available and
   /// returns it, or returns nullptr if the queue is interrupted while empty.
@@ -658,6 +681,8 @@ class multi_index_priority_queue {
   mutable std::mutex _mutex;
   std::condition_variable _cv;
   bool _active{true};  ///< false after interrupt(): blocked pops stop waiting.
+  /// Invoked after each successful push, outside the lock. See set_on_push().
+  std::function<void()> _on_push;
 
   level_map _levels;  ///< Spine: priority -> level.
   std::unordered_map<query_key, std::set<queue_priority>> _query_levels;  ///< query -> its levels.

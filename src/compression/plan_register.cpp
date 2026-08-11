@@ -132,14 +132,51 @@ bool differs_materially(double a, double b, double threshold)
   return std::abs(a - b) / scale > threshold;
 }
 
-/// True when @p candidate performs materially differently from @p cached.
+/// True when @p candidate is materially BETTER than @p cached, and so worth
+/// swapping the cached plan for.
+///
+/// This used to ask only whether the two performed *differently*, in either
+/// direction, which meant a re-explore traded a good plan for a worse one as
+/// readily as the reverse — and `adopt()` then marked the replacement viable
+/// regardless. Combined with cached plans carrying placeholder metrics, the
+/// explorer won every comparison: q3/SF1000 decayed from 5.43x on the seeded
+/// plans to 3.83x after the first re-explore.
+///
+/// Ratio decides. Throughput only breaks ties, and can veto: the spill path has
+/// no other speed check anywhere (plan_quality_gate, which does test throughput,
+/// is reached only from the task-output path), so if a materially slower plan is
+/// not refused here it is not refused at all.
 bool worth_adopting(const plan_register::column_plan_state& cached,
                     const plan_register::column_plan_candidate& candidate,
                     double threshold)
 {
-  return differs_materially(cached.compression_ratio, candidate.compression_ratio, threshold) ||
-         differs_materially(cached.compress_gbps, candidate.compress_gbps, threshold) ||
-         differs_materially(cached.decompress_gbps, candidate.decompress_gbps, threshold);
+  // Nothing measured for the plan in use, so there is no claim to defend.
+  if (cached.compression_ratio <= 0.0) { return true; }
+
+  if (differs_materially(cached.compression_ratio, candidate.compression_ratio, threshold)) {
+    // Only ever trade up. Note the asymmetry in how the two numbers were
+    // obtained: the cached ratio is measured on whole spilled batches, while the
+    // candidate's comes from the explorer's row-prefix sample, which the explorer
+    // itself warns is optimistic on ordered columns. Requiring a material
+    // improvement is what keeps a flattering sample from displacing a plan with a
+    // real track record; if the candidate is genuinely better, the next attempt
+    // measures it and the record corrects itself.
+    return candidate.compression_ratio > cached.compression_ratio;
+  }
+
+  // Comparable ratios: take a materially faster plan, refuse a materially slower
+  // one, and otherwise leave the incumbent alone so the cache stops churning.
+  const bool slower =
+    (differs_materially(cached.compress_gbps, candidate.compress_gbps, threshold) &&
+     candidate.compress_gbps < cached.compress_gbps) ||
+    (differs_materially(cached.decompress_gbps, candidate.decompress_gbps, threshold) &&
+     candidate.decompress_gbps < cached.decompress_gbps);
+  if (slower) { return false; }
+
+  return (differs_materially(cached.compress_gbps, candidate.compress_gbps, threshold) &&
+          candidate.compress_gbps > cached.compress_gbps) ||
+         (differs_materially(cached.decompress_gbps, candidate.decompress_gbps, threshold) &&
+          candidate.decompress_gbps > cached.decompress_gbps);
 }
 
 plan_register::column_plan_state adopt(plan_register::column_plan_candidate&& candidate)
@@ -207,7 +244,7 @@ void plan_register::set_spill_plan(const cucascade::shared_data_repository* repo
 }
 
 void plan_register::conclude_spill_attempt(const cucascade::shared_data_repository* repo,
-                                           std::span<const spill_attempt_outcome> per_column,
+                                           std::span<const spill_column_result> per_column,
                                            std::uint64_t base_interval,
                                            std::uint32_t error_tolerance)
 {
@@ -225,17 +262,22 @@ void plan_register::conclude_spill_attempt(const cucascade::shared_data_reposito
   // treat every column as having errored.
   bool any_measured = false;
   for (std::size_t i = 0; i < state.columns.size(); ++i) {
-    auto& col          = state.columns[i];
-    const auto outcome = i < per_column.size() ? per_column[i] : spill_attempt_outcome::failed;
+    auto& col = state.columns[i];
+    const spill_column_result result =
+      i < per_column.size() ? per_column[i] : spill_column_result{};
 
-    if (outcome == spill_attempt_outcome::failed) {
+    if (result.outcome == spill_attempt_outcome::failed) {
       // Not evidence about this column's data — absorb it until it proves durable.
       ++col.consecutive_errors;
       if (col.consecutive_errors < tolerance) { continue; }
       col.viable = false;
     } else {
-      col.viable   = outcome == spill_attempt_outcome::compressed;
+      col.viable   = result.outcome == spill_attempt_outcome::compressed;
       any_measured = true;
+      // Replace the plan's recorded ratio with what it actually delivered on a
+      // whole batch. Until this existed, a seeded plan kept the placeholder 1.0
+      // it was installed with and lost every replan comparison by default.
+      if (result.achieved_ratio > 0.0) { col.compression_ratio = result.achieved_ratio; }
     }
     col.consecutive_errors = 0;
   }

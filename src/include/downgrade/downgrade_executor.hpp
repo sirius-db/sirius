@@ -157,6 +157,11 @@ class downgrade_executor {
   std::future<size_t> request_downgrade(std::function<bool()> predicate);
 
   /**
+   * @brief This executor's configuration (callers read downgrade_wait_timeout).
+   */
+  [[nodiscard]] const exec::downgrade_executor_config& config() const { return _config; }
+
+  /**
    * @brief Whether a DISK tier is configured (an effectively unbounded spill sink).
    *
    * Used by callers (e.g. the GPU pipeline executor) to decide whether an unsatisfiable

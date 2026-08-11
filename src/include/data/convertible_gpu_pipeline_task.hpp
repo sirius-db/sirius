@@ -135,8 +135,10 @@ class convertible_gpu_pipeline_task : public convertible_data {
         if (at_target) { continue; }
       }
 
-      // Delegate to convertible_data_batch which handles to_mutable() internally
-      sirius::convertible_data_batch batch_converter(batch);
+      // Delegate to convertible_data_batch which handles to_mutable() internally.
+      // The edge key is what makes this path eligible for spill compression at
+      // all; see task_edge_key() for what it does and does not stand for.
+      sirius::convertible_data_batch batch_converter(batch, task_edge_key());
       auto result = batch_converter.convert(target_spaces, stream, res_mgr, blocking);
       if (result) {
         any_converted = true;
@@ -206,6 +208,38 @@ class convertible_gpu_pipeline_task : public convertible_data {
   sirius::op::pipelineable_operator_data* get_pipelineable_data() const
   {
     return _task ? get_pipelineable_data(*_task) : nullptr;
+  }
+
+  /**
+   * @brief An edge key for the spill plan register, for batches held by a task.
+   *
+   * The spill path keys compression plans by the repository a batch came from,
+   * and refuses to compress a batch with no such key. Batches reached through
+   * the task queue have none: pipelineable_operator_data carries bare
+   * data_batch pointers, and cucascade::data_batch does not record its owning
+   * repository. That made spill compression unreachable for this entire path —
+   * measured on q3/SF1000, 139 of 145 spilled batches (61.7 GB of 66.5 GB) came
+   * through the task queue and were skipped for want of a key alone.
+   *
+   * This uses the task's own output repository as a stand-in. It is a grouping
+   * key, not a lineage claim: it is stable per operator and that is all the
+   * register needs to cache a plan and judge whether it pays. What it does NOT
+   * give is correct column lineage — seed_plans_from_lineage looks up the base
+   * table's offline plan through this repo, so batches keyed this way fall back
+   * to default per-type plans rather than the tuned ones.
+   *
+   * The real fix is to record the source repository on the batch (or on
+   * pipelineable_operator_data) when a task subscribes to it, which would give
+   * both a correct key and correct lineage.
+   */
+  const cucascade::shared_data_repository* task_edge_key() const
+  {
+    auto* gpt = dynamic_cast<sirius::pipeline::gpu_pipeline_task*>(_task.get());
+    if (!gpt) { return nullptr; }
+    for (auto* repo : gpt->get_data_repos()) {
+      if (repo != nullptr) { return repo; }
+    }
+    return nullptr;
   }
 
   std::unique_ptr<sirius::parallel::itask> _task;

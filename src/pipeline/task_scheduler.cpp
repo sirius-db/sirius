@@ -88,6 +88,16 @@ task_scheduler::task_scheduler(
   // that is already in _ready_devices.
   _self_publisher.emplace(_task_request_channel.make_publisher());
 
+  // Every task entering the queue must wake the management loop, whichever path
+  // put it there. Doing this on the queue rather than in schedule() is what
+  // covers the downgrade executor returning a task it borrowed for spilling.
+  _task_queue.set_on_push([this]() {
+    if (!_self_publisher) { return; }
+    auto wake                 = std::make_unique<task_request>();
+    wake->kind                = task_request_kind::task_available;
+    [[maybe_unused]] auto _ok = _self_publisher->send(std::move(wake));
+  });
+
   auto gpu_spaces = mem_mgr.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
   // Initialize GPU pipeline executors for each available GPU
   for (auto* space : gpu_spaces) {
@@ -134,12 +144,10 @@ void task_scheduler::schedule(std::unique_ptr<sirius::parallel::itask> task)
       .queue_capacity_entries = 1,
     });
   }
+  // The wake-up is published by the queue's on_push callback (installed in the
+  // constructor), not here: every push must wake the management loop, including
+  // the downgrade path's direct push(), which does not come through schedule().
   _task_queue.push(std::move(task));
-  if (_self_publisher) {
-    auto wake                 = std::make_unique<task_request>();
-    wake->kind                = task_request_kind::task_available;
-    [[maybe_unused]] auto _ok = _self_publisher->send(std::move(wake));
-  }
 }
 
 void task_scheduler::start()
@@ -156,6 +164,7 @@ void task_scheduler::stop()
 {
   bool expected = true;
   if (!_running.compare_exchange_strong(expected, false)) { return; }
+  stop_stall_watchdog();
   // Pull-signal model: the management event loop blocks on
   // _task_request_channel.get(), so closing the channel is what wakes it.
   // _task_queue.interrupt() is still useful to reject any concurrent
@@ -196,6 +205,15 @@ void task_scheduler::prepare_for_query(duckdb::shared_ptr<planner::query> query)
     gpu_exec->set_completion_handler(_completion_handler.get());
   }
 
+  // And on the pipelines themselves: the terminal pipeline signals completion
+  // from update_pipeline_status(), where the finished flag is actually set,
+  // rather than depending on a later task reaching the executor's check.
+  if (_query) {
+    for (auto& pipeline : _query->get_pipelines()) {
+      if (pipeline) { pipeline->set_completion_handler(_completion_handler.get()); }
+    }
+  }
+
   // Reset the round-robin counter so the walk is reproducible across
   // iterations of the same query (cache=table_gpu warm path keys cache
   // entries by device_id; without this reset the second iteration's source
@@ -216,7 +234,117 @@ std::future<void> task_scheduler::start_query()
 
   _task_creator->schedule(scans.front());
 
+  start_stall_watchdog();
   return _completion_handler->get_awaitable();
+}
+
+namespace {
+// How long the query must make no progress before the watchdog considers it
+// stalled. Well above any legitimate quiet period: a single downgrade request
+// under compression was measured at ~18 s during which no task completes.
+constexpr auto kStallThreshold = std::chrono::seconds{90};
+constexpr auto kWatchdogPoll   = std::chrono::seconds{5};
+}  // namespace
+
+void task_scheduler::start_stall_watchdog()
+{
+  stop_stall_watchdog();
+  _watchdog_running.store(true);
+  _watchdog_thread = std::thread(&task_scheduler::stall_watchdog_loop, this);
+}
+
+void task_scheduler::stop_stall_watchdog()
+{
+  if (!_watchdog_running.exchange(false)) {
+    if (_watchdog_thread.joinable()) { _watchdog_thread.join(); }
+    return;
+  }
+  _watchdog_cv.notify_all();
+  if (_watchdog_thread.joinable()) { _watchdog_thread.join(); }
+}
+
+// Dump every input to the pipeline-completion decision.
+//
+// update_pipeline_status() finishes a pipeline only when the source is exhausted,
+// the first node's ports are empty, and tasks_created == tasks_completed. When a
+// query hangs, exactly one of those is stuck, and which one points at a different
+// bug: unbalanced counters mean a task was created and never completed (lost or
+// dropped), while a non-exhausted source means the scan never closed its ports.
+void task_scheduler::log_pipeline_completion_state(const char* reason)
+{
+  duckdb::shared_ptr<planner::query> query;
+  {
+    std::scoped_lock lock(_query_mutex);
+    query = _query;
+  }
+  if (!query) { return; }
+
+  SIRIUS_LOG_ERROR("[stall] {} — dumping pipeline completion state ({} task(s) still queued)",
+                   reason,
+                   _task_queue.size());
+  for (const auto& pipeline : query->get_pipelines()) {
+    if (!pipeline) { continue; }
+    auto sink       = pipeline->get_sink();
+    auto source     = pipeline->get_source();
+    const bool term = sink && sink->type == op::SiriusPhysicalOperatorType::RESULT_COLLECTOR;
+    SIRIUS_LOG_ERROR(
+      "[stall]   pipeline {}{}: finished={} tasks_created={} tasks_completed={} "
+      "source={} source_pipeline_finished={} source_ports_empty={}",
+      pipeline->get_pipeline_id(),
+      term ? " (TERMINAL)" : "",
+      pipeline->is_pipeline_finished(),
+      pipeline->get_tasks_created(),
+      pipeline->get_tasks_completed(),
+      source ? source->get_name() : "none",
+      source ? source->is_source_pipeline_finished() : true,
+      source ? source->all_ports_empty() : true);
+  }
+}
+
+void task_scheduler::stall_watchdog_loop()
+{
+  auto progress_marker = [this]() {
+    // Any completed task anywhere, or any change in queue depth, counts as
+    // progress. Cheap and monotonic enough that a live query never looks stalled.
+    std::size_t sum = _task_queue.size();
+    duckdb::shared_ptr<planner::query> query;
+    {
+      std::scoped_lock lock(_query_mutex);
+      query = _query;
+    }
+    if (query) {
+      for (const auto& pipeline : query->get_pipelines()) {
+        if (pipeline) { sum += pipeline->get_tasks_completed() + pipeline->get_tasks_created(); }
+      }
+    }
+    return sum;
+  };
+
+  std::size_t last_marker = progress_marker();
+  auto last_change        = std::chrono::steady_clock::now();
+  bool reported           = false;
+
+  while (_watchdog_running.load()) {
+    {
+      std::unique_lock<std::mutex> lock(_watchdog_cv_mutex);
+      _watchdog_cv.wait_for(
+        lock, kWatchdogPoll, [this]() { return !_watchdog_running.load(); });
+    }
+    if (!_watchdog_running.load()) { break; }
+
+    const std::size_t marker = progress_marker();
+    if (marker != last_marker) {
+      last_marker = marker;
+      last_change = std::chrono::steady_clock::now();
+      reported    = false;
+      continue;
+    }
+    if (reported) { continue; }
+    if (std::chrono::steady_clock::now() - last_change >= kStallThreshold) {
+      log_pipeline_completion_state("query made no progress for 90s");
+      reported = true;
+    }
+  }
 }
 
 void task_scheduler::terminate_query(std::exception_ptr error)
@@ -228,6 +356,7 @@ void task_scheduler::terminate_query(std::exception_ptr error)
 void task_scheduler::drain_after_error()
 {
   SIRIUS_LOG_INFO("task_scheduler: draining after error");
+  stop_stall_watchdog();
   // Teardown ordering is load-bearing. The scan/gpu executor drains below run
   // in-flight tasks to completion, and a completing task schedules its
   // downstream consumers via task_creator::schedule() (gpu_pipeline_executor and
@@ -275,6 +404,7 @@ void task_scheduler::drain_after_error()
 
 void task_scheduler::wait_for_completion()
 {
+  stop_stall_watchdog();
   // Once the query has signaled completion, NOTHING should still be queued. Rather
   // than drain (which would hide the bug), validate that every queue is empty and
   // throw if not — a non-empty queue means tasks were still being scheduled when we
@@ -347,7 +477,12 @@ void task_scheduler::management_eventloop()
       }
     }
 
-    if (_task_queue.empty()) {
+    // Guard the deref: a task_available event can wake this loop with no device
+    // ready yet, and dereferencing begin() on an empty vector is UB. Reachable
+    // whenever a push happens while every executor is busy — which the queue's
+    // on_push callback now makes routine, since the downgrade path returning a
+    // borrowed task also publishes here.
+    if (_task_queue.empty() && !_ready_devices.empty()) {
       if (_task_creator) { _task_creator->schedule_lookahead(*_ready_devices.begin()); }
     }
 

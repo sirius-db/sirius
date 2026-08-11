@@ -318,7 +318,6 @@ struct compression_config {
   /// Below this size the setup cost dominates so heavily that compressing is
   /// worse than spilling raw, however good the ratio.
   std::size_t spill_min_batch_bytes{64ULL * 1024 * 1024};
-
   /// When true, the downgrade executor may satisfy a request by compressing
   /// batches in place on the device, instead of spilling them to host/disk.
   ///

@@ -397,6 +397,23 @@ class plan_register {
     failed,        ///< errored out — possibly transient (e.g. OOM under pressure)
   };
 
+  /// One column's result from a spill attempt: the verdict plus what the plan in
+  /// use actually achieved on real data.
+  ///
+  /// The ratio matters as much as the verdict. Without it a cached plan carries
+  /// only the placeholder its seed was installed with (1.0 for a lineage seed,
+  /// which is not a measurement at all), and the replan comparison then pits a
+  /// placeholder against the explorer's freshly measured candidate — which the
+  /// candidate wins every time, however much worse it really is. Measured on
+  /// q3/SF1000: the seeded plans held 5.43x, and the first re-explore replaced
+  /// them with plans that managed 3.83x.
+  struct spill_column_result {
+    spill_attempt_outcome outcome{spill_attempt_outcome::failed};
+    /// original/compressed measured on this batch; >1 means it shrank. 0 when
+    /// nothing was measured (the column errored, or was stored raw).
+    double achieved_ratio{0.0};
+  };
+
   /**
    * @brief Record how a spill attempt for @p repo turned out, per column.
    *
@@ -432,7 +449,7 @@ class plan_register {
    * skipped edge, which made no attempt to judge).
    */
   void conclude_spill_attempt(const cucascade::shared_data_repository* repo,
-                              std::span<const spill_attempt_outcome> per_column,
+                              std::span<const spill_column_result> per_column,
                               std::uint64_t base_interval,
                               std::uint32_t error_tolerance);
 

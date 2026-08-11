@@ -459,9 +459,10 @@ staged_compression compress_for_spill(cudf::table_view view,
                                       rmm::cuda_stream_view stream)
 {
   using outcome_kind      = compression::plan_register::spill_attempt_outcome;
+  using column_result     = compression::plan_register::spill_column_result;
   const auto column_plans = resolve_or_explore_spill_plan(view, ctx, stream);
   const auto num_columns  = static_cast<std::size_t>(view.num_columns());
-  auto const mr           = rmm::mr::get_current_device_resource_ref();
+  auto const mr = rmm::mr::get_current_device_resource_ref();
 
   // Report per-column outcomes exactly once, on every exit path. Everything
   // defaults to `failed`, so an exception anywhere below is reported as an error
@@ -472,7 +473,7 @@ staged_compression compress_for_spill(cudf::table_view view,
     const cucascade::shared_data_repository* repo;
     std::uint64_t base_interval;
     std::uint32_t error_tolerance;
-    std::vector<outcome_kind> per_column;
+    std::vector<column_result> per_column;
     ~outcome_guard()
     {
       compression::plan_register::global().conclude_spill_attempt(
@@ -481,7 +482,7 @@ staged_compression compress_for_spill(cudf::table_view view,
   } outcome{ctx.repo,
             ctx.replan_after_uses,
             ctx.error_tolerance,
-            std::vector<outcome_kind>(num_columns, outcome_kind::failed)};
+            std::vector<column_result>(num_columns, column_result{})};
 
   // Compress column by column so each can use its own plan. A column already
   // judged not worth compressing is stored raw instead: the compressed table must
@@ -522,7 +523,16 @@ staged_compression compress_for_spill(cudf::table_view view,
     // A measurement, not an error: real evidence about this column's data, so it
     // applies immediately. A column stored raw this time is measured too, and
     // simply stays not-worth-it until the edge is re-explored.
-    outcome.per_column[i] = worth_it ? outcome_kind::compressed : outcome_kind::not_worth_it;
+    //
+    // The achieved ratio travels with the verdict. It is what the plan currently
+    // in use delivered on a whole batch, and it becomes the number a later
+    // re-explore has to beat — without it the comparison is against the seed's
+    // placeholder and any candidate wins.
+    outcome.per_column[i].outcome = worth_it ? outcome_kind::compressed : outcome_kind::not_worth_it;
+    outcome.per_column[i].achieved_ratio =
+      (col_original > 0 && col_compressed > 0)
+        ? static_cast<double>(col_original) / static_cast<double>(col_compressed)
+        : 0.0;
   }
 
   // Final whole-batch check. With non-paying columns stored raw the total is
@@ -662,13 +672,54 @@ std::unique_ptr<cucascade::idata_representation> compress_gpu_to_host(
       "[compression_converters] spill target has no fixed_size_host_memory_resource");
   }
 
+  // Shape is read off `view` now because the source is released below, after
+  // which the view dangles.
+  const auto num_columns = static_cast<std::size_t>(view.num_columns());
+  const auto num_rows    = static_cast<std::int64_t>(view.num_rows());
+
   // Stage the compressed bytes into pinned host blocks. The reservation passed in
   // was sized for the uncompressed batch, so it comfortably covers the (smaller)
   // compressed payload.
+  //
+  // Allocate BEFORE releasing the source. Not because an uncompressed spill could
+  // still succeed if this fails — it could not, it needs strictly more host memory
+  // than the compressed payload — but because of what a failure costs. Throwing
+  // here leaves the batch untouched, so the downgrade just declines it and the
+  // query carries on. Throwing after the release would leave the batch holding an
+  // emptied source, since convert_to installs the new representation only on
+  // success: data loss rather than a decline. That is the hazard the device
+  // converter has to absorb with a bounded retry loop around its staging; keeping
+  // the fallible step ahead of the release avoids needing one here.
   auto blob           = std::make_shared<pinned_compressed_blob>();
   blob->header        = std::move(staged.header);
   blob->payload       = host_mr->allocate_multiple_blocks(staged.payload_bytes, reservation);
   blob->payload_bytes = staged.payload_bytes;
+
+  // NOT released here, despite the device converter doing exactly that with its
+  // own source. Releasing the uncompressed table before staging (rep.release_table
+  // + reset) is an obvious-looking win — it frees a whole batch during a downgrade
+  // — but measured on q3/SF1000 it wedged the query: downgrade requests went from
+  // 65 to 82,661 while per-request yield collapsed from 7.8 GB to 4 MB, i.e. the
+  // pressure the monitor is watching stopped resolving even though conversion
+  // throughput was unchanged (4.5 GB/s either way). Something about emptying the
+  // representation out from under convert_to leaves the space's view of itself
+  // wrong; until that is understood, convert_to is left to retire the source when
+  // it installs the replacement.
+  // Staged in one pass, freeing nothing until the end.
+  //
+  // Releasing each column's compressed tree as its last buffer lands (what the
+  // device converter does) looks like a straight win on peak — it would carry the
+  // largest single column instead of all of them. It is not, here: these buffers
+  // were allocated on the column-pool streams while the copies run on `stream`, so
+  // each early release needs a stream.synchronize() first, and with four downgrade
+  // threads that cost 27% of spill throughput (4.5 -> 3.3 GB/s) and ~13 s of wall
+  // clock on q3/SF1000. The memory it saves is not the memory that is scarce: the
+  // compressed form is a fraction of the batch and lives in the arena, while the
+  // pressure is on the query pool.
+  //
+  // It becomes worth revisiting if the release can be made stream-ordered (freeing
+  // on `stream` rather than syncing), or once arena capacity rather than query
+  // memory is the binding constraint.
   for (auto const& b : staged.buffers) {
     if (b.size_bytes > 0 && b.device_ptr != nullptr) {
       copy_device_to_pinned_blocks(
@@ -676,21 +727,23 @@ std::unique_ptr<cucascade::idata_representation> compress_gpu_to_host(
     }
   }
   // `staged.table` owns the device buffers being read above; sync before it dies.
+  // Still required: the mapping may have been unusable, or a column may hold
+  // buffers past its recorded last one.
   stream.synchronize();
 
   SIRIUS_LOG_DEBUG("[compression_converters] spilled {}B → {}B compressed host (cols={} rows={})",
                    uncompressed_bytes,
                    staged.payload_bytes,
-                   view.num_columns(),
-                   view.num_rows());
+                   num_columns,
+                   num_rows);
 
   return std::make_unique<compressed_host_representation>(
     *space_mut,
     std::move(blob),
-    synthetic_column_names(view.num_columns()),
+    synthetic_column_names(static_cast<cudf::size_type>(num_columns)),
     static_cast<std::size_t>(staged.payload_bytes),
     uncompressed_bytes,
-    static_cast<std::int64_t>(view.num_rows()));
+    num_rows);
 }
 
 // gpu_table_representation → compressed_device_representation (eager task-output

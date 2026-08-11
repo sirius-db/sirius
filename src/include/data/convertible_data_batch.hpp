@@ -251,7 +251,19 @@ class convertible_data_batch : public convertible_data {
                               cucascade::memory::reservation& reservation,
                               rmm::cuda_stream_view stream)
   {
-    if (!compression::spill_compression_enabled() || _source_repo == nullptr) { return false; }
+    // Each early return below is a *silent* skip that no other log line records,
+    // so a run where compression barely fires looks identical to one where it was
+    // never asked. On q3/SF1000 that hid the real limiter: 39 of 42 spilled
+    // batches bypassed the encoder with only one decline logged. Tagged one line
+    // per skip so the reasons can be counted from the log.
+    if (!compression::spill_compression_enabled()) {
+      SIRIUS_LOG_DEBUG("[convertible_data_batch] spill compression skip: suppressed-or-disabled");
+      return false;
+    }
+    if (_source_repo == nullptr) {
+      SIRIUS_LOG_DEBUG("[convertible_data_batch] spill compression skip: no source edge");
+      return false;
+    }
 
     auto& reg      = compression::plan_register::global();
     const auto ctx = compression::make_spill_context(_source_repo);
@@ -269,6 +281,9 @@ class convertible_data_batch : public convertible_data {
     // about whether that edge's *data* is compressible.
     if (const auto* data = mut.get_data();
         data != nullptr && data->get_size_in_bytes() < ctx.min_batch_bytes) {
+      SIRIUS_LOG_DEBUG("[convertible_data_batch] spill compression skip: batch {}B < min {}B",
+                       data->get_size_in_bytes(),
+                       ctx.min_batch_bytes);
       return false;
     }
 
@@ -287,6 +302,8 @@ class convertible_data_batch : public convertible_data {
     if (decision.verdict == compression::plan_register::spill_plan_verdict::skip) {
       // Compression already proved not worth it for this edge: skip the
       // conversion entirely rather than compressing and discarding it again.
+      SIRIUS_LOG_DEBUG("[convertible_data_batch] spill compression skip: repo={} written off",
+                       static_cast<const void*>(_source_repo));
       return false;
     }
 

@@ -189,12 +189,16 @@ void set_plans(const cucascade::shared_data_repository* repo,
     repo, std::move(candidates), kTestChangeThreshold);
 }
 
+/// @param achieved_ratio what the plan in use measured on the batch; 0 leaves the
+///        cached ratio untouched (the pre-existing behaviour of this helper).
 void conclude_1col(const cucascade::shared_data_repository* repo,
                    sirius::compression::plan_register::spill_attempt_outcome outcome,
                    std::uint64_t base_interval,
-                   std::uint32_t error_tolerance)
+                   std::uint32_t error_tolerance,
+                   double achieved_ratio = 0.0)
 {
-  const std::array outcomes{outcome};
+  const std::array outcomes{
+    sirius::compression::plan_register::spill_column_result{outcome, achieved_ratio}};
   sirius::compression::plan_register::global().conclude_spill_attempt(
     repo, outcomes, base_interval, error_tolerance);
 }
