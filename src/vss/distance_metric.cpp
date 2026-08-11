@@ -37,4 +37,14 @@ cuvs::distance::DistanceType ann_distance_type_from_metric(std::string_view metr
                               std::string(metric) + "'");
 }
 
+cuvs::distance::DistanceType join_selection_distance_type_from_metric(std::string_view metric)
+{
+  // Expanded forms so the selection pass runs on the GEMM path; the refine pass
+  // recomputes accurate values Unexpanded on survivors where needed.
+  if (metric == "l2") { return cuvs::distance::DistanceType::L2SqrtExpanded; }
+  if (metric == "cosine") { return cuvs::distance::DistanceType::CosineExpanded; }
+  throw std::invalid_argument("join_selection_distance_type_from_metric: unsupported metric '" +
+                              std::string(metric) + "'");
+}
+
 }  // namespace sirius::vss

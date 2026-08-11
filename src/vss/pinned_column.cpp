@@ -52,4 +52,12 @@ std::vector<cudf::column_view> pinned_column_chunk_views(const scan_manager::pin
   return views;
 }
 
+cucascade::memory::memory_space& pinned_entry_gpu_space(const scan_manager::pinned_entry& pin)
+{
+  for (auto* space : pin.chunk_memory_spaces) {
+    if (space != nullptr) { return *space; }
+  }
+  throw internal_exception("VSS: pinned table has no GPU-resident chunk (host-tier pin?)");
+}
+
 }  // namespace sirius::vss

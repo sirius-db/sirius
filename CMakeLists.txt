@@ -331,7 +331,9 @@ set(EXTENSION_SOURCES
     src/op/sirius_physical_cte.cpp
     src/op/sirius_physical_delim_join.cpp
     src/op/sirius_physical_dummy_scan.cpp
-    src/op/sirius_physical_vector_join.cpp
+    src/op/sirius_physical_vector_join_selection.cpp
+    src/op/sirius_physical_vector_join_local_merge.cpp
+    src/op/sirius_physical_vector_join_materialize.cpp
     src/op/sirius_physical_empty_result.cpp
     src/op/sirius_physical_filter.cpp
     src/op/sirius_physical_gpu_values.cpp
@@ -442,6 +444,8 @@ set(CUDA_SOURCES
     src/cuda/scan/strings/uncompressed.cu
     src/cuda/vss/cudf_raft_interop.cu
     src/cuda/vss/brute_force_search.cu
+    src/cuda/vss/knn_merge.cu
+    src/cuda/vss/vector_join_refine.cu
     src/cuda/vss/ivf_flat_index.cu)
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/legacy/CMakeLists.txt")
   add_subdirectory(src/legacy)

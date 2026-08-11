@@ -48,4 +48,10 @@ namespace sirius::vss {
   const std::string& column_name,
   cucascade::memory::memory_space& space);
 
+/// The GPU memory space a pinned entry's chunks reside on (its first non-null
+/// per-chunk space). The pinned_entry's top-level `memory_space` is not reliably
+/// populated; the per-chunk spaces are. Throws if no chunk is GPU-resident.
+[[nodiscard]] cucascade::memory::memory_space& pinned_entry_gpu_space(
+  const scan_manager::pinned_entry& pin);
+
 }  // namespace sirius::vss

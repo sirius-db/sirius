@@ -33,4 +33,17 @@ cuvs::distance::DistanceType enn_distance_type_from_metric(std::string_view metr
  */
 cuvs::distance::DistanceType ann_distance_type_from_metric(std::string_view metric);
 
+/**
+ * @brief Map a user metric string to the cuVS DistanceType for the exact vector
+ * join's selection pass.
+ *
+ * Uses the Expanded forms so the pairwise distances ride the GEMM/tensor-core
+ * path (`x·y` via matrix multiply + norms). This is the fast first pass; where an
+ * accurate value near zero is needed (any distance output), the refine pass
+ * recomputes it Unexpanded on the selected survivors. Expanded is safe for
+ * *ranking* because a true near-neighbor stays in the top-k despite the
+ * near-zero cancellation.
+ */
+cuvs::distance::DistanceType join_selection_distance_type_from_metric(std::string_view metric);
+
 }  // namespace sirius::vss
