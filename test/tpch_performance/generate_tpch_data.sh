@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Generate TPC-H datasets using tpchgen-rs (parquet) or DuckDB's dbgen (duckdb).
+# Generate TPC-H datasets with the reference generators: tpchgen-rs writing
+# parquet directly, or tpchgen-rs/.tbl staged into a native DuckDB database
+# (classic dbgen is the fallback when tpchgen-rs cannot be built).
 #
 # Usage:
 #   ./generate_tpch_data.sh <scale_factor> [--format duckdb|parquet] [--output <path>] [--jobs N]
@@ -20,7 +22,10 @@
 #                     Default: "lineitem:l_shipdate,orders:o_orderdate". Implies --cluster.
 #
 # Parquet format uses tpchgen-rs for optimized row groups and compression.
-# DuckDB format uses DuckDB's built-in dbgen() extension.
+# DuckDB format stages reference .tbl output (tpchgen-rs, byte-identical to
+# classic dbgen; dbgen itself as fallback) and copies it in one table at a
+# time, largest first — NOT DuckDB's built-in dbgen() extension, whose
+# different comment pool changes q13/q16 results vs the reference data.
 #
 # --cluster is duckdb-only on purpose: tpchgen-rs writes Arrow Decimal128 as
 # FIXED_LEN_BYTE_ARRAY, which trips Sirius's `skip_pushdown_due_to_flba` and
@@ -65,6 +70,86 @@ CLUSTER="false"
 CLUSTER_KEYS="lineitem:l_shipdate,orders:o_orderdate"
 # Fixed TPC-H table set (used by the clustered duckdb build).
 TPCH_TABLES="nation region part supplier partsupp customer orders lineitem"
+
+# shellcheck source=dbgen_bootstrap.sh
+. "$SCRIPT_DIR/dbgen_bootstrap.sh"
+
+# table:dbgen-flag, largest table first. Case matters: -T l is nation/region
+# while -T L is lineitem. Each of these flags writes exactly one .tbl.
+TPCH_TABLE_FLAGS="lineitem:L orders:O partsupp:S customer:c part:P supplier:s nation:n region:r"
+
+# Clone and build tpchgen-cli if it is not already there. Returns non-zero when
+# that is not possible, so callers can fall back to dbgen.
+ensure_tpchgen_cli() {
+    TPCHGEN_DIR="$PROJECT_DIR/test_datasets/tpchgen-rs"
+    TPCHGEN_CLI="$TPCHGEN_DIR/target/release/tpchgen-cli"
+
+    [ -x "$TPCHGEN_CLI" ] && return 0
+    command -v cargo >/dev/null 2>&1 || return 1
+    if [ ! -d "$TPCHGEN_DIR" ]; then
+        echo "Cloning sirius-db/tpchgen-rs..."
+        git clone https://github.com/sirius-db/tpchgen-rs.git "$TPCHGEN_DIR" || return 1
+    fi
+    echo "Building tpchgen-cli with native CPU optimizations..."
+    (cd "$TPCHGEN_DIR" && RUSTFLAGS="-C target-cpu=native" cargo build --release -p tpchgen-cli) || return 1
+    [ -x "$TPCHGEN_CLI" ]
+}
+
+# Build a .duckdb from the same TPC-H data the refresh sets and query streams
+# are built from. tpchgen-rs emits byte-identical .tbl output to the classic
+# dbgen but generates in parallel, so it is preferred and dbgen is the fallback
+# when cargo or the network is unavailable. dbgen writes into DSS_PATH but
+# resolves dists.dss relative to its own directory, hence the subshell.
+#
+# Tables are generated one at a time and each .tbl is deleted once loaded, so
+# peak disk is the largest single table plus the database rather than the whole
+# raw dataset alongside it. Largest first matters: staging lineitem while the
+# database is still empty sets a lower high-water mark than doing it last, when
+# the other seven tables are already there. At SF1000 that is the difference
+# between roughly 890 GiB and 970 GiB.
+#
+# On the dbgen fallback this costs a second pass over the order generator, since
+# -T O and -T L each walk it. tpchgen-rs has no such penalty.
+build_duckdb_dataset() {
+    local out="$1" sf="$2"
+    local dbgen_dir="$PROJECT_DIR/test_datasets/tpch-dbgen"
+    local stage="${out%.duckdb}.tbl_stage"
+
+    local generator="tpchgen-rs"
+    if ! ensure_tpchgen_cli; then
+        generator="dbgen"
+        ensure_tpch_tools "$dbgen_dir" "$PROJECT_DIR" dbgen
+    fi
+    echo "Generating TPC-H SF${sf} with ${generator} ..."
+
+    mkdir -p "$stage"
+    stage="$(cd "$stage" && pwd)"
+    # shellcheck disable=SC2064
+    trap "rm -rf '$stage'" EXIT
+
+    rm -f "$out" "$out".wal
+    # Loading needs no GPU, and a stale Sirius config would otherwise block it.
+    SIRIUS_DISABLE=1 "$DUCKDB" "$out" -c "$(cat "$SCRIPT_DIR/tpch_schema.sql")"
+
+    local spec table flag
+    for spec in $TPCH_TABLE_FLAGS; do
+        table="${spec%%:*}"
+        flag="${spec##*:}"
+        echo "  ${table}: generating ..."
+        if [ "$generator" = "tpchgen-rs" ]; then
+            "$TPCHGEN_CLI" -s "$sf" --format=tbl --tables="$table" --output-dir="$stage"
+        else
+            (cd "$dbgen_dir" && DSS_PATH="$stage" ./dbgen -f -q -s "$sf" -T "$flag")
+        fi
+        echo "  ${table}: loading $(du -h "$stage/$table.tbl" | cut -f1) ..."
+        SIRIUS_DISABLE=1 "$DUCKDB" "$out" \
+            -c "COPY $table FROM '$stage/$table.tbl' (HEADER false, DELIMITER '|');"
+        rm -f "$stage/$table.tbl"
+    done
+
+    rm -rf "$stage"
+    trap - EXIT
+}
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -128,6 +213,24 @@ if [ -z "$OUTPUT" ]; then
     fi
 fi
 
+# The duckdb build deletes its target before writing, and the backward-compatible
+# positional [output] [jobs] arguments accept any string, so a misplaced path
+# lands here as the destination. Refuse to remove anything that is not already a
+# DuckDB database; those start with "DUCK" at byte 8.
+if [ "$FORMAT" = "duckdb" ] && [ -e "$OUTPUT" ]; then
+    if [ -d "$OUTPUT" ]; then
+        echo "ERROR: --format duckdb writes a file, but '$OUTPUT' is a directory."
+        exit 1
+    fi
+    if [ "$(od -An -c -j8 -N4 "$OUTPUT" 2>/dev/null | tr -d ' \n')" != "DUCK" ]; then
+        echo "ERROR: refusing to overwrite '$OUTPUT' - it is not a DuckDB database."
+        echo "       The positional [output] [jobs] arguments take any path, so this is"
+        echo "       usually a stray or mistyped argument. To overwrite it anyway, delete"
+        echo "       it first, or pass an explicit --output <file>.duckdb."
+        exit 1
+    fi
+fi
+
 # --- Generate data ---
 if [ "$FORMAT" = "parquet" ]; then
     # Use tpchgen-rs for optimized parquet output
@@ -184,7 +287,8 @@ elif [ "$FORMAT" = "duckdb" ]; then
         trap 'rm -f "$STAGING" "$STAGING".wal' EXIT
 
         echo "Generating TPC-H SF${SF} (staging) ..."
-        "$DUCKDB" "$STAGING" -c "INSTALL tpch; LOAD tpch; CALL dbgen(sf=${SF}); CHECKPOINT;"
+        build_duckdb_dataset "$STAGING" "$SF"
+        SIRIUS_DISABLE=1 "$DUCKDB" "$STAGING" -c "CHECKPOINT;"
 
         # Parse --cluster-keys "table:col,table:col" into a lookup.
         declare -A SORT_COL
@@ -213,7 +317,7 @@ elif [ "$FORMAT" = "duckdb" ]; then
         BUILD_SQL+=" CHECKPOINT;"
 
         echo "Writing sorted database into $OUTPUT ..."
-        "$DUCKDB" "$OUTPUT" -c "$BUILD_SQL"
+        SIRIUS_DISABLE=1 "$DUCKDB" "$OUTPUT" -c "$BUILD_SQL"
 
         rm -f "$STAGING" "$STAGING".wal
         trap - EXIT
@@ -223,7 +327,7 @@ elif [ "$FORMAT" = "duckdb" ]; then
         fi
 
         echo "Generating TPC-H SF${SF} data into $OUTPUT ..."
-        "$DUCKDB" "$OUTPUT" -c "INSTALL tpch; LOAD tpch; CALL dbgen(sf=${SF});"
+        build_duckdb_dataset "$OUTPUT" "$SF"
     fi
 fi
 

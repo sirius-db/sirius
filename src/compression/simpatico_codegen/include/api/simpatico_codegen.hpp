@@ -190,4 +190,35 @@ std::unique_ptr<cudf::table> decompress(
   simpatico::stream_pool& pool,
   rmm::device_async_resource_ref mr = rmm::mr::get_current_device_resource_ref());
 
+// ── Predicate-pushdown decompression ─────────────────────────────────────────
+
+/// Decompress a column subset, answering a set-membership predicate on selected
+/// columns instead of reconstructing them.
+///
+/// @p predicates is parallel to @p selected_columns; an entry with an empty
+/// @c equals_any reconstructs that column normally. A column with an active
+/// directive comes back as BOOL8 of the same row count (`value ∈ equals_any`,
+/// nulls propagated) — never its declared dtype — so the caller must be prepared
+/// for the type change.
+///
+/// The point is to skip the decode entirely for dictionary-compressed columns
+/// consumed only by an equality / IN filter: the predicate is resolved against
+/// the key set and mapped over the indices, so the key chars are never gathered
+/// into a full-width column. Use @c column_supports_predicate_decode to check
+/// that a column's plan can actually do this before pushing a predicate into it.
+///
+/// @throws std::runtime_error if @p predicates and @p selected_columns differ in
+///         size, or on the usual decompression failures.
+std::unique_ptr<cudf::table> decompress(
+  const compressed_table& table,
+  std::span<const std::size_t> selected_columns,
+  std::span<const decode_predicate> predicates,
+  simpatico::stream_pool& pool,
+  rmm::device_async_resource_ref mr = rmm::mr::get_current_device_resource_ref());
+
+/// True iff column @p column_index of @p table resolves a predicate without
+/// materialising the column (i.e. its plan is dictionary-rooted). False for an
+/// out-of-range index or a column with no plan tree.
+bool column_supports_predicate_decode(const compressed_table& table, std::size_t column_index);
+
 }  // namespace simpatico
