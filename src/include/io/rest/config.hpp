@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "exec/config.hpp"
 #include "io/rest/s3/list_parser.hpp"
 
 #include <chrono>
@@ -24,6 +25,15 @@
 namespace sirius::io::rest {
 
 struct config {
+  /// How many scan tasks the readahead manager may keep in flight against this
+  /// backend at once.  Zero disables readahead for it entirely.
+  ///
+  /// Twice the uring budget: object-store reads are latency-bound rather than
+  /// bandwidth-bound, so more concurrency is needed to cover the round trips
+  /// before the link itself is the limit.
+  std::size_t n_max_concurrent_scans{
+    2 * static_cast<std::size_t>(exec::default_gpu_pipeline_num_threads)};
+
   /// Whole-request timeout (seconds, 0 = no limit) and presigned-URL TTL.
   long request_timeout_s{30};
 

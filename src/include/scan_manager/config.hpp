@@ -162,6 +162,14 @@ struct scan_manager_config {
   /// constructed but unarmed (no background IO threads).  Derived from @ref cache.
   bool enable_prefetch_cache{false};
 
+  /// Run the readahead scan manager, which drives the prefetching scheduler and
+  /// keeps the backend's scan budget occupied.  Derived from @ref cache: any
+  /// mode other than @c none benefits from ordering scans ahead of demand, even
+  /// @c os, where the readahead still warms the page cache.  The per-backend
+  /// budget it schedules against is @c n_max_concurrent_scans on that backend's
+  /// reactor config; a backend that sets it to zero is skipped regardless.
+  bool enable_readahead{false};
+
   /// Local (uring) reactor configuration — bounce-slot size, O_DIRECT,
   /// ring depth, etc.  @c use_odirect is derived from @ref cache.
   io::uring::config uring{};
@@ -185,6 +193,9 @@ struct scan_manager_config {
   /// Overwrite the knobs derived from @ref cache.
   void apply_cache_mode() noexcept
   {
+    // Every mode but `none` wants scans ordered ahead of demand.
+    enable_readahead = cache != cache_mode::none;
+
     switch (cache) {
       case cache_mode::none:
         uring.use_odirect     = true;

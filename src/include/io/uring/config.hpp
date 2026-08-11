@@ -16,11 +16,22 @@
 
 #pragma once
 
+#include "exec/config.hpp"
+
 #include <cstddef>
 
 namespace sirius::io::uring {
 
 struct config {
+  /// How many scan tasks the readahead manager may keep in flight against this
+  /// backend at once.  Zero disables readahead for it entirely.
+  ///
+  /// Local NVMe saturates at modest queue depth and every in-flight scan pins
+  /// staging buffers, so one scan per pipeline executor thread is enough to
+  /// keep the decoders fed without over-committing the pinned pool.
+  std::size_t n_max_concurrent_scans{
+    static_cast<std::size_t>(exec::default_gpu_pipeline_num_threads)};
+
   std::size_t bounce_size{1UL << 20};
   /// When false, every prep path except the BYO-device-buffer read
   /// (prep_device_rx_request) reads through the buffered (page-cache) file

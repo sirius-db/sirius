@@ -33,8 +33,21 @@ scan_operator_input::scan_operator_input(
     _operator_id(operator_id)
 {
   auto const& stored = std::get<std::shared_ptr<scan_info>>(materialization_info);
-  if (_readahead && stored) {
-    _readahead->register_scan_task(std::weak_ptr<scan_info>(stored), _operator_id);
+  if (_readahead && stored) { _readahead->register_scan_task(stored, _operator_id); }
+}
+
+scan_operator_input::~scan_operator_input()
+{
+  // The split is done: its slot is free and the readahead worker should pull
+  // the next scan off the prefetching order.  Nothing else reports `disposed` —
+  // queued/preparing/reading are all reported on the way in — so without this
+  // the scheduler would never retire an operator and the budget would never
+  // refill.
+  try {
+    update(io::cache::scan_stage::disposed);
+  } catch (...) {  // NOLINT(bugprone-empty-catch)
+    // A destructor must not throw; a lost dispose costs a delayed refill, and
+    // the next split's update recomputes the same state anyway.
   }
 }
 
@@ -50,8 +63,14 @@ scan_operator_input::scan_operator_input(
 
 void scan_operator_input::update(io::cache::scan_stage site) const
 {
-  if (_readahead) { _readahead->update(_operator_id, site); }
-  if (!has_scan_metadata()) { return; }
+  // The manager tracks progress per split, not per operator: one operator emits
+  // many splits and they advance independently, so it needs to know which one
+  // moved.  Null for a resident cached batch, which has no scan_info.
+  scan_info const* task = has_scan_metadata()
+                            ? std::get<std::shared_ptr<scan_info>>(materialization_info).get()
+                            : nullptr;
+  if (_readahead) { _readahead->update(_operator_id, task, site); }
+  if (task == nullptr) { return; }
   auto hints = get_fadvise_hints();
   for (auto& hint : hints) {
     hint.datasource->update(site);

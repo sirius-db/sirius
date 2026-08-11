@@ -228,7 +228,7 @@ op::sirius_physical_operator* scan_of(pipeline_ptr p)
 /// case nothing gates the scan, so no branch is named here and the caller substitutes the first
 /// branch of the traversal -- note a branch is only this scan's gate if the scan's own data
 /// passes through its FULL port; a branch with a FULL port on some *other* side does not gate it.
-std::pair<prefetching_mode, std::size_t> classify_scan(const pf_dag& dag, pipeline_ptr scan_pipe)
+std::pair<scheduling_mode, std::size_t> classify_scan(const pf_dag& dag, pipeline_ptr scan_pipe)
 {
   bool at_first_branch = true;
   std::unordered_set<pipeline_ptr> seen;
@@ -243,14 +243,14 @@ std::pair<prefetching_mode, std::size_t> classify_scan(const pf_dag& dag, pipeli
       if (edge.barrier == op::MemoryBarrierType::FULL) {
         auto const branch_id =
           edge.consumer_op != nullptr ? edge.consumer_op->get_operator_id() : 0;
-        return {at_first_branch ? prefetching_mode::barrier_all : prefetching_mode::barrier_serial,
+        return {at_first_branch ? scheduling_mode::barrier_all : scheduling_mode::barrier_serial,
                 branch_id};
       }
       at_first_branch = false;  // passed a branch without a FULL gate; keep looking downstream
     }
     cur = edge.other;
   }
-  return {prefetching_mode::pipeline, 0};
+  return {scheduling_mode::pipeline, 0};
 }
 
 }  // namespace
@@ -341,11 +341,11 @@ std::vector<prefetch_step> query_index::prefetching_orders(std::size_t concat_ba
       if (auto* scan = scan_of(p)) {
         auto [mode, branch_id] = classify_scan(dag, p);
         // Nothing imposes a FULL barrier on this scan, so it is owned by the leading branch.
-        if (mode == prefetching_mode::pipeline) { branch_id = first_branch_id; }
-        auto const count = mode == prefetching_mode::barrier_all
+        if (mode == scheduling_mode::pipeline) { branch_id = first_branch_id; }
+        auto const count = mode == scheduling_mode::barrier_all
                              ? std::numeric_limits<std::size_t>::max()
-                           : mode == prefetching_mode::barrier_serial ? serial_count
-                                                                      : 1;
+                           : mode == scheduling_mode::barrier_serial ? serial_count
+                                                                     : 1;
         steps.push_back({scan, branch_id, mode, count});
       }
       return;

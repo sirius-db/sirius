@@ -152,6 +152,11 @@ class sirius_datasource : public cudf::io::datasource {
   [[nodiscard]] bool uses_prefetching_cache() const noexcept;
 
  private:
+  /// Wait out a prefetch that is already reading this split's bytes, so the
+  /// read below serves from cache instead of issuing the same IO again.
+  /// No-op when nothing is in flight.
+  void await_inflight_prefetch() noexcept;
+
   std::shared_ptr<ioctx> _io_ctx;
   std::shared_ptr<io_object> _io_object;
   /// Handle of the most recent insert into the prefetching cache, or empty

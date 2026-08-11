@@ -53,6 +53,14 @@ namespace sirius::io {
  * read-only, so they would be dead config.
  */
 struct kvikio_config {
+  /// How many scan tasks the readahead manager may keep in flight against this
+  /// backend at once.  Zero — the default — disables readahead for kvikIO:
+  /// kvikIO owns its own process-global task pool and does its own splitting,
+  /// so a second scheduler stacked on top would only fight it for the same
+  /// threads.  Not a kvikIO setting, so unlike the fields below it is a plain
+  /// value rather than an optional override.
+  std::size_t n_max_concurrent_scans{0};
+
   /// Threads in kvikIO's task pool — the parallelism bound for a single
   /// @c pread (it splits the read into @c task_size chunks across this pool).
   /// Env: @c KVIKIO_NTHREADS (default 1).  Must be non-zero.

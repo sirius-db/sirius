@@ -64,7 +64,7 @@ struct build_index_options {
  * - @c pipeline: the scan's data never meets a FULL branch port. Every batch can create a
  *   task, so one split of look-ahead is enough.
  */
-enum class prefetching_mode { barrier_all, barrier_serial, pipeline };
+enum class scheduling_mode { barrier_all, barrier_serial, pipeline };
 
 /// One entry of @ref query_index::prefetching_orders.
 struct prefetch_step {
@@ -77,7 +77,7 @@ struct prefetch_step {
   /// port on some other side does not gate it. For @c pipeline nothing gates the scan, so it
   /// falls back to the first branch the traversal visits.
   std::size_t branch_id{0};
-  prefetching_mode mode{prefetching_mode::pipeline};
+  scheduling_mode mode{scheduling_mode::pipeline};
   /// How many splits are worth prefetching ahead: @c SIZE_MAX for @c barrier_all,
   /// concat-batch/scan-batch for @c barrier_serial, 1 for @c pipeline.
   std::size_t count{0};
@@ -154,7 +154,7 @@ class query_index {
    * task until the FULL side is complete — and only then the other side. When neither or
    * both sides are FULL, the lower pipeline id goes first, so the order is deterministic.
    * Scans are emitted as they are reached, and each is classified by the barrier its data
-   * eventually meets (see @ref prefetching_mode).
+   * eventually meets (see @ref scheduling_mode).
    *
    * @param concat_batch_bytes    operator_params::concat_batch_bytes, for the
    *                              @c barrier_serial count.

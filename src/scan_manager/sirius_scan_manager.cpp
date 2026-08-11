@@ -546,6 +546,13 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
   _readahead          = std::make_shared<readahead_scan_manager>();
   _readahead->prepare_for_query(query);
 
+  // Any cache mode but `none` wants scans ordered ahead of demand.  The budget
+  // is the backend's own: a backend publishing zero (kvikIO by default) opts
+  // out, and start() then does nothing.
+  if (_config.enable_readahead && _io_ctx != nullptr) {
+    _readahead->start(_io_ctx->n_max_concurrent_scans());
+  }
+
   std::vector<cached_assignment> cached_assignments;
   for (auto const& scan_op : query.get_scan_operators()) {
     if (scan_op->type != ::sirius::op::SiriusPhysicalOperatorType::GPU_SCAN) { continue; }
@@ -809,6 +816,10 @@ void sirius_scan_manager::reset()
   _pending_mvcc_mask_jobs.clear();
   _pending_insert_delta_jobs.clear();
   _metadata_processor.reset();
+  // Stop explicitly rather than relying on the destructor: other holders (the
+  // coalescer's slots, in-flight splits) may still own a shared_ptr copy, so
+  // dropping ours would otherwise leave the worker running past query teardown.
+  if (_readahead) { _readahead->stop(); }
   _readahead.reset();
   _dispatcher = std::make_unique<exec::scoped_dispatcher>(_thread_pool, _thread_pool.num_threads());
 }

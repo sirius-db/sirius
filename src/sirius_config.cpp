@@ -140,6 +140,7 @@ static void from_yaml(const YAML::Node& node, sirius::io::object_store_config& o
 static void from_yaml(const YAML::Node& node, sirius::io::rest::config& opt)
 {
   yaml::reader r(node, "rest");
+  r.optional("n_max_concurrent_scans", opt.n_max_concurrent_scans);
   r.optional("request_timeout_s", opt.request_timeout_s);
   r.optional("ca_bundle_path", opt.ca_bundle_path);
   r.optional("tls_verify", opt.tls_verify);
@@ -165,6 +166,7 @@ static void from_yaml(const YAML::Node& node, sirius::io::rest::config& opt)
 static void from_yaml(const YAML::Node& node, sirius::io::uring::config& opt)
 {
   yaml::reader r(node, "uring");
+  r.optional("n_max_concurrent_scans", opt.n_max_concurrent_scans);
   r.optional("max_n_chunks", opt.max_n_chunks);
   r.reject_unknown();
 }
@@ -172,6 +174,7 @@ static void from_yaml(const YAML::Node& node, sirius::io::uring::config& opt)
 static void from_yaml(const YAML::Node& node, sirius::io::kvikio_config& opt)
 {
   yaml::reader r(node, "kvikio");
+  r.optional("n_max_concurrent_scans", opt.n_max_concurrent_scans);
   r.optional("nthreads", opt.nthreads);
   r.optional("task_size", yaml::bytes(opt.task_size));
   r.optional("gds_threshold", yaml::bytes(opt.gds_threshold));

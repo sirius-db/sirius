@@ -67,6 +67,9 @@ class scan_operator_input : public op::operator_data {
     std::shared_ptr<scan_manager::readahead_scan_manager> readahead = nullptr,
     std::size_t operator_id                                         = 0);
 
+  /// Reports @c scan_stage::disposed, freeing this split's readahead slot.
+  ~scan_operator_input() override;
+
   scan_operator_input(scan_operator_input const&)            = delete;
   scan_operator_input& operator=(scan_operator_input const&) = delete;
 

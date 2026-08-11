@@ -144,6 +144,16 @@ class ioctx : public std::enable_shared_from_this<ioctx> {
   /// @c device_read_async_io per range instead.
   [[nodiscard]] virtual bool supports_device_range_read() const noexcept = 0;
 
+  /// How many scan tasks the readahead manager may keep in flight against this
+  /// backend at once, as configured on its reactors.  Zero means this backend
+  /// opts out of readahead scheduling entirely.
+  ///
+  /// The bound is a property of the backend, not of the query: it reflects the
+  /// queue depth the device is worth driving at (see the per-backend defaults
+  /// on each reactor config).  The base returns 0 so a backend that has not
+  /// opted in is never scheduled against.
+  [[nodiscard]] virtual std::size_t n_max_concurrent_scans() const noexcept { return 0; }
+
   /// Build the prefetching cache.  One-shot — calling twice is a no-op
   /// after the first successful build.  The cache holds a raw
   /// back-pointer to this ioctx and stays alive until @ref

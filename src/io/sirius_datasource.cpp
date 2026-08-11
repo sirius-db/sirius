@@ -167,6 +167,7 @@ std::future<size_t> sirius_datasource::device_read_async(size_t offset,
                                                          uint8_t* dst,
                                                          rmm::cuda_stream_view stream)
 {
+  await_inflight_prefetch();
   exec::semi_future<size_t> semi;
   if (uses_prefetching_cache()) {
     auto* cache = _io_ctx->cache();
@@ -180,6 +181,7 @@ std::future<size_t> sirius_datasource::device_read_async(size_t offset,
 std::future<size_t> sirius_datasource::device_read_ranges_async(
   std::span<const io_device_range> ranges, rmm::cuda_stream_view stream)
 {
+  await_inflight_prefetch();
   exec::semi_future<size_t> semi;
   if (uses_prefetching_cache()) {
     auto* cache = _io_ctx->cache();
@@ -231,9 +233,27 @@ void sirius_datasource::update(cache::scan_stage site)
   _prefetch_handle.update(site);
 }
 
+void sirius_datasource::await_inflight_prefetch() noexcept
+{
+  if (!_prefetch_handle || !_prefetch_handle.is_prefetch_in_flight()) { return; }
+  // The readahead already has this split's IO in flight.  Reading now would
+  // find every chunk `loading`, miss, and re-read the same bytes through a
+  // bounce buffer — the one thing the prefetch exists to avoid.  Waiting costs
+  // this thread the remainder of an IO that is already running; the read then
+  // serves from cache.
+  std::ignore = _prefetch_handle.wait_until_ready();
+}
+
 bool sirius_datasource::prefetch_async(exec::invocable<void(bool) noexcept> on_done)
 {
   if (!_prefetch_handle || !uses_prefetching_cache()) {
+    on_done(false);
+    return false;
+  }
+  // The executor already started reading this split, so its own reads are
+  // pulling the bytes through.  Prefetching now would issue the same IO a
+  // second time and race the reader for the same chunks.
+  if (_prefetch_handle.has_started_reading()) {
     on_done(false);
     return false;
   }

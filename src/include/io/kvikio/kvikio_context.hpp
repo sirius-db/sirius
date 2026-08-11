@@ -191,6 +191,11 @@ class kvikio_context final : public ioctx {
   [[nodiscard]] bool supports_host_to_device_read() const noexcept override { return false; }
   [[nodiscard]] bool supports_device_range_read() const noexcept override { return false; }
 
+  [[nodiscard]] std::size_t n_max_concurrent_scans() const noexcept override
+  {
+    return _config.n_max_concurrent_scans;
+  }
+
   /// kvikIO applies no physical block alignment of its own, so ranges pass
   /// through unchanged.
   [[nodiscard]] std::vector<cudf::io::text::byte_range_info> align_and_coalesce(

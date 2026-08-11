@@ -315,6 +315,13 @@ class templated_ioctx : public ioctx {
     return reactor_traits_t::supports_device_range_read;
   }
 
+  /// Every reactor in the pool is built from the same config, so the pool's
+  /// budget is that one value rather than a sum over reactors.
+  [[nodiscard]] std::size_t n_max_concurrent_scans() const noexcept final
+  {
+    return _config.n_max_concurrent_scans;
+  }
+
   [[nodiscard]] std::vector<cudf::io::text::byte_range_info> align_and_coalesce(
     std::span<const cudf::io::text::byte_range_info> ranges,
     std::optional<size_t> alignment = std::nullopt) const noexcept override
