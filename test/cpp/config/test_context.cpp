@@ -475,6 +475,80 @@ TEST_CASE("effective-capacity defaults seed DuckDB SET and RESET",
   REQUIRE(sirius_ctx->get_config().get_operator_params().scan_task_batch_size == expected_batch);
 }
 
+TEST_CASE("Sirius configuration rejects invalid downgrade hysteresis", "[sirius][config]")
+{
+  struct invalid_config {
+    const char* fixture;
+    const char* scope;
+    const char* constraint;
+  };
+
+  const invalid_config cases[] = {
+    {"invalid_memory_gpu_downgrade_zero.yaml", "sirius.memory.gpu", "greater than zero"},
+    {"invalid_memory_gpu_downgrade_equal.yaml",
+     "sirius.memory.gpu",
+     "less than downgrade_trigger_fraction"},
+    {"invalid_memory_gpu_downgrade_reversed.yaml",
+     "sirius.memory.gpu",
+     "less than downgrade_trigger_fraction"},
+    {"invalid_memory_host_downgrade_zero.yaml", "sirius.memory.host", "greater than zero"},
+    {"invalid_memory_host_downgrade_equal.yaml",
+     "sirius.memory.host",
+     "less than downgrade_trigger_fraction"},
+    {"invalid_memory_host_downgrade_reversed.yaml",
+     "sirius.memory.host",
+     "less than downgrade_trigger_fraction"},
+    {"invalid_space_gpu_downgrade_zero.yaml", "sirius.space.gpu", "greater than zero"},
+    {"invalid_space_gpu_downgrade_equal.yaml",
+     "sirius.space.gpu",
+     "less than downgrade_trigger_fraction"},
+    {"invalid_space_gpu_downgrade_reversed.yaml",
+     "sirius.space.gpu",
+     "less than downgrade_trigger_fraction"},
+    {"invalid_space_host_downgrade_zero.yaml", "sirius.space.host", "greater than zero"},
+    {"invalid_space_host_downgrade_equal.yaml",
+     "sirius.space.host",
+     "less than downgrade_trigger_fraction"},
+    {"invalid_space_host_downgrade_reversed.yaml",
+     "sirius.space.host",
+     "less than downgrade_trigger_fraction"},
+  };
+
+  for (auto const& invalid : cases) {
+    INFO("fixture=" << invalid.fixture << " surface=" << invalid.scope
+                    << " constraint=" << invalid.constraint);
+    std::source_location loc = std::source_location::current();
+    auto const path          = fs::path(loc.file_name()).parent_path() / "data" / invalid.fixture;
+    REQUIRE(fs::is_regular_file(path));
+
+    sirius::sirius_config config;
+    REQUIRE_THROWS_WITH(config.load_from_file(path),
+                        Catch::Contains(invalid.scope) &&
+                          Catch::Contains("downgrade_stop_fraction") &&
+                          Catch::Contains(invalid.constraint));
+  }
+}
+
+TEST_CASE("Sirius downgrade hysteresis accepts omitted, null, and one-sided defaults",
+          "[sirius][config]")
+{
+  std::source_location loc = std::source_location::current();
+  auto const data_dir      = fs::path(loc.file_name()).parent_path() / "data";
+  const char* fixtures[]   = {"valid_memory_downgrade_omitted.yaml",
+                              "valid_memory_downgrade_partial_defaults.yaml",
+                              "valid_space_downgrade_omitted.yaml",
+                              "valid_space_downgrade_partial_defaults.yaml"};
+
+  for (auto const* fixture : fixtures) {
+    INFO("fixture=" << fixture);
+    auto const path = data_dir / fixture;
+    REQUIRE(fs::is_regular_file(path));
+
+    sirius::sirius_config config;
+    REQUIRE_NOTHROW(config.load_from_file(path));
+  }
+}
+
 TEST_CASE("Sirius configuration rejects conflicting memory budget forms", "[sirius][config]")
 {
   struct invalid_config {

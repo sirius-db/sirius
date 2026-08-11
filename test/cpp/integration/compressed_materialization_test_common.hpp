@@ -26,11 +26,11 @@
 
 #include <catch.hpp>
 #include <duckdb.hpp>
+#include <utils/parquet_fixture_utils.hpp>
 #include <utils/sirius_test_env.hpp>
 
 #include <algorithm>
 #include <cstddef>
-#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -53,17 +53,13 @@ inline void generate_parquet(std::filesystem::path const& path,
                              std::string const& select_sql,
                              std::size_t row_group_size)
 {
-  setenv("SIRIUS_DISABLE", "1", 1);
-  {
-    duckdb::DuckDB gen_db(nullptr);
-    duckdb::Connection gen(gen_db);
-    auto r =
-      gen.Query("COPY (" + select_sql + ") TO '" + path.string() +
-                "' (FORMAT PARQUET, ROW_GROUP_SIZE " + std::to_string(row_group_size) + ");");
-    REQUIRE(r);
-    REQUIRE_FALSE(r->HasError());
-  }
-  unsetenv("SIRIUS_DISABLE");
+  sirius::test::scoped_sirius_disable disable_sirius;
+  duckdb::DuckDB gen_db(nullptr);
+  duckdb::Connection gen(gen_db);
+  auto r = gen.Query("COPY (" + select_sql + ") TO " + sirius::test::sql_literal(path.string()) +
+                     " (FORMAT PARQUET, ROW_GROUP_SIZE " + std::to_string(row_group_size) + ");");
+  REQUIRE(r);
+  REQUIRE_FALSE(r->HasError());
 }
 
 /// Operator parameters that differ between the compressed-materialization fixtures; every other

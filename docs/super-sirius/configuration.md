@@ -122,8 +122,8 @@ Controls how much GPU VRAM Sirius claims and when it starts evicting data to hos
 | `usage_limit_bytes` | bytes | — | Absolute VRAM limit. Mutually exclusive with `usage_limit_fraction`; configuration loading rejects both when both values are non-null. |
 | `reservation_limit_fraction` | double | 1.0 | Fraction of the GPU capacity (set by `usage_limit_*`) that can be reserved by pipeline tasks. Reservations are acquired before task execution and prevent overcommit. Mutually exclusive with `reservation_limit_bytes`; configuration loading rejects both when both values are non-null. |
 | `reservation_limit_bytes` | bytes | — | Absolute reservation limit. Mutually exclusive with `reservation_limit_fraction`; configuration loading rejects both when both values are non-null. |
-| `downgrade_trigger_fraction` | double | 0.8 | Start evicting GPU-resident data to host when reserved memory exceeds this fraction of capacity. |
-| `downgrade_stop_fraction` | double | 0.6 | Stop evicting when reserved memory drops to this fraction of capacity. The gap between trigger and stop prevents oscillation. |
+| `downgrade_trigger_fraction` | double (0,1] | 0.8 | Start evicting GPU-resident data to host when reserved memory exceeds this fraction of capacity. Must be greater than `downgrade_stop_fraction`. |
+| `downgrade_stop_fraction` | double (0,1] | 0.6 | Stop evicting when reserved memory drops to this fraction of capacity. Must be less than `downgrade_trigger_fraction`; configuration loading rejects an invalid pair. |
 | `track_per_stream_reservation` | bool | false | Track memory reservations per CUDA stream instead of globally. Useful for debugging per-task memory usage. |
 
 ### Host Memory (`sirius.memory.host`)
@@ -136,8 +136,8 @@ Controls pinned host memory pools. One pool group is created per NUMA node (auto
 | `capacity_bytes` | bytes | — | Pinned host memory capacity **per NUMA node** as absolute bytes, allocated with `cudaMallocHost`. Mutually exclusive with `capacity_fraction`; configuration loading rejects both when both values are non-null. |
 | `reservation_limit_fraction` | double | 1.0 | Fraction of host capacity that can be reserved. Mutually exclusive with `reservation_limit_bytes`; configuration loading rejects both when both values are non-null. |
 | `reservation_limit_bytes` | bytes | — | Absolute reservation limit. Mutually exclusive with `reservation_limit_fraction`; configuration loading rejects both when both values are non-null. |
-| `downgrade_trigger_fraction` | double | 0.9 | Start evicting host-resident data to disk when reserved memory exceeds this fraction. Eviction also requires a configured `downgrade_root_dirs`; without one the downgrade executor logs a warning and skips. |
-| `downgrade_stop_fraction` | double | 0.8 | Stop evicting when reserved memory drops to this fraction. |
+| `downgrade_trigger_fraction` | double (0,1] | 0.9 | Start evicting host-resident data to disk when reserved memory exceeds this fraction. Must be greater than `downgrade_stop_fraction`. Eviction also requires a configured `downgrade_root_dirs`; without one the downgrade executor logs a warning and skips. |
+| `downgrade_stop_fraction` | double (0,1] | 0.8 | Stop evicting when reserved memory drops to this fraction. Must be less than `downgrade_trigger_fraction`; configuration loading rejects an invalid pair. |
 | `block_size` | bytes | 1Mi | Size of each allocation block in the pool. Larger blocks reduce allocation overhead but waste memory on small allocations. |
 | `pool_size` | int | 128 | Number of blocks per pool. Total pool capacity = `block_size × pool_size`. |
 | `initial_number_pools` | int | 4 | Number of pools pre-allocated at startup. Additional pools are created on demand. Initial host footprint = `block_size × pool_size × initial_number_pools`. |
@@ -168,6 +168,9 @@ Each memory tier uses a trigger/stop threshold pair to control data eviction:
 - Above `reservation_limit`: new reservations are denied (triggers OOM retry)
 
 The gap between `trigger` and `stop` prevents oscillation — without it, evicting one batch could drop below trigger, then the next allocation re-triggers eviction.
+Configuration loading enforces `0 < downgrade_stop_fraction < downgrade_trigger_fraction <= 1`
+for both the high-level and low-level GPU and host surfaces. Missing or explicit-null
+members retain their surface defaults before the pair is validated.
 
 ### Low-Level Explicit Memory Spaces (`sirius.space`) — advanced
 
@@ -191,8 +194,8 @@ Each tier is a **YAML sequence** of space configs. Byte fields accept suffixes; 
 | `device_id` | int | 0 | CUDA device the space lives on. |
 | `per_stream_reservation` | bool | false | Track reservations per CUDA stream (forced false unless set). |
 | `reservation_limit_fraction` | double [0,1] | space default | Fraction of the space that may be reserved. |
-| `downgrade_trigger_fraction` | double [0,1] | space default | Start evicting above this fraction. |
-| `downgrade_stop_fraction` | double [0,1] | space default | Stop evicting below this fraction. |
+| `downgrade_trigger_fraction` | double (0,1] | space default | Start evicting above this fraction. Must be greater than `downgrade_stop_fraction`. |
+| `downgrade_stop_fraction` | double (0,1] | space default | Stop evicting below this fraction. Must be less than `downgrade_trigger_fraction`. |
 | `memory_capacity` | bytes | space default | Absolute capacity of the space. |
 
 #### `sirius.space.host[]` — one entry per host (pinned) memory space
@@ -201,8 +204,8 @@ Each tier is a **YAML sequence** of space configs. Byte fields accept suffixes; 
 |-----|------|---------|-------------|
 | `numa_id` | int | 0 | NUMA node the pinned pool is bound to. |
 | `reservation_limit_fraction` | double [0,1] | space default | Fraction of the space that may be reserved. |
-| `downgrade_trigger_fraction` | double [0,1] | space default | Start evicting above this fraction. |
-| `downgrade_stop_fraction` | double [0,1] | space default | Stop evicting below this fraction. |
+| `downgrade_trigger_fraction` | double (0,1] | space default | Start evicting above this fraction. Must be greater than `downgrade_stop_fraction`. |
+| `downgrade_stop_fraction` | double (0,1] | space default | Stop evicting below this fraction. Must be less than `downgrade_trigger_fraction`. |
 | `memory_capacity` | bytes | space default | Absolute capacity of the space. |
 | `block_size` | bytes | pool default | Allocation block size. |
 | `pool_size` | int | pool default | Blocks per pool. |
