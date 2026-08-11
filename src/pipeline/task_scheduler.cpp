@@ -372,7 +372,55 @@ void task_scheduler::management_eventloop()
       continue;  // re-drain the channel, then match
     }
 
-    const size_t dispatched = run_matcher(manager_thread_telemetry);
+    // Matcher: for each ready device, try to find a dispatchable task.
+    // A task is dispatchable to device X if:
+    //   (a) its preferred_device_id == X (exact match), OR
+    //   (b) it has no preferred_device_id (any device will do).
+    // Tasks with a preference for a DIFFERENT device must wait — they may
+    // reference GPU-resident data (cache=table_gpu, partitioned batches) that
+    // is only valid on the preferred device. Step (ii) will introduce an
+    // explicit strict-vs-prefer bit; for now, all preferences are treated as
+    // binding to guarantee correctness.
+    size_t dispatched = 0;
+    for (auto it = _ready_devices.begin(); it != _ready_devices.end();) {
+      const int device_id = *it;
+      std::unique_ptr<sirius::parallel::itask> task;
+
+      // Exact preference match: the device index returns the highest-priority
+      // (lowest value) task preferring exactly this device.
+      task = _task_queue.try_pop_from(exec::gpu_index{device_id}).value_or(nullptr);
+      if (!task) {
+        // pick a task with no preference (any device will do). The round-robin counter
+        task =
+          _task_queue.try_pop_from(exec::gpu_index{exec::no_preferred_device}).value_or(nullptr);
+      }
+      if (!task) {
+        // No dispatchable task for this device. Leave device in _ready_devices
+        // and move on — it will match when an appropriate task arrives.
+        ++it;
+        continue;
+      }
+      uint64_t task_id = 0;
+      if (auto* gpu_task = dynamic_cast<pipeline::gpu_pipeline_task*>(task.get())) {
+        task_id = gpu_task->get_task_id();
+      }
+
+      if (auto* pipeline_task = dynamic_cast<sirius_pipeline_itask*>(task.get())) {
+        pipeline_task->telemetry_handle().routing({
+          .instance_name              = "",
+          .preferred_device_id        = device_id,
+          .manager_thread_resource_id = manager_thread_telemetry.handle->uuid(),
+        });
+      }
+
+      // // Log prefix "[mgpu-audit] pipeline_task dispatched to GPU N" is
+      // // load-bearing — verification greps depend on it.
+      // SIRIUS_LOG_INFO(
+      //   "[mgpu-audit] pipeline_task dispatched to GPU {} task_id={}", device_id, task_id);
+      _gpu_executors.at(device_id)->schedule(std::move(task));
+      it = _ready_devices.erase(it);
+      ++dispatched;
+    }
 
     if (dispatched == 0) {
       // Tasks exist but none is dispatchable: every queued task prefers a
@@ -388,60 +436,6 @@ void task_scheduler::management_eventloop()
       }
     }
   }
-}
-
-size_t task_scheduler::run_matcher(
-  telemetry::TaskManagerLoopThreadHandleWrapper& manager_thread_telemetry)
-{
-  size_t dispatched = 0;
-  // Matcher: for each ready device, try to find a dispatchable task.
-  // A task is dispatchable to device X if:
-  //   (a) its preferred_device_id == X (exact match), OR
-  //   (b) it has no preferred_device_id (any device will do).
-  // Tasks with a preference for a DIFFERENT device must wait — they may
-  // reference GPU-resident data (cache=table_gpu, partitioned batches) that
-  // is only valid on the preferred device. Step (ii) will introduce an
-  // explicit strict-vs-prefer bit; for now, all preferences are treated as
-  // binding to guarantee correctness.
-  for (auto it = _ready_devices.begin(); it != _ready_devices.end();) {
-    const int device_id = *it;
-    std::unique_ptr<sirius::parallel::itask> task;
-
-    // Exact preference match: the device index returns the highest-priority
-    // (lowest value) task preferring exactly this device.
-    task = _task_queue.try_pop_from(exec::gpu_index{device_id}).value_or(nullptr);
-    if (!task) {
-      // pick a task with no preference (any device will do). The round-robin counter
-      task = _task_queue.try_pop_from(exec::gpu_index{exec::no_preferred_device}).value_or(nullptr);
-    }
-    if (!task) {
-      // No dispatchable task for this device. Leave device in _ready_devices
-      // and move on — it will match when an appropriate task arrives.
-      ++it;
-      continue;
-    }
-    uint64_t task_id = 0;
-    if (auto* gpu_task = dynamic_cast<pipeline::gpu_pipeline_task*>(task.get())) {
-      task_id = gpu_task->get_task_id();
-    }
-
-    if (auto* pipeline_task = dynamic_cast<sirius_pipeline_itask*>(task.get())) {
-      pipeline_task->telemetry_handle().routing({
-        .instance_name              = "",
-        .preferred_device_id        = device_id,
-        .manager_thread_resource_id = manager_thread_telemetry.handle->uuid(),
-      });
-    }
-
-    // // Log prefix "[mgpu-audit] pipeline_task dispatched to GPU N" is
-    // // load-bearing — verification greps depend on it.
-    // SIRIUS_LOG_INFO(
-    //   "[mgpu-audit] pipeline_task dispatched to GPU {} task_id={}", device_id, task_id);
-    _gpu_executors.at(device_id)->schedule(std::move(task));
-    it = _ready_devices.erase(it);
-    ++dispatched;
-  }
-  return dispatched;
 }
 
 }  // namespace pipeline
