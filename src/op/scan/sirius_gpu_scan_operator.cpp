@@ -206,11 +206,11 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::get_next_task_input
   auto next = _split_connector->get_next_split();
   if (!next.has_value()) { return nullptr; }
   if (auto* scan_input = dynamic_cast<scan_operator_input*>(next->get()); scan_input) {
-    // Share the operator's RULE-2 bail latch with the split BEFORE any
-    // reservation estimate runs: one bail decides the whole scan (uniform
-    // per-batch selectivity), and both the working-set estimator and
-    // prepare_for_processing consult the latch.
-    scan_input->fused_bail_flag = _fused_rule2_bailed;
+    // Share the operator's "compaction is unprofitable" latch with the split
+    // BEFORE any reservation estimate runs: one such batch decides the whole
+    // scan (uniform per-batch selectivity), and both the working-set estimator
+    // and prepare_for_processing consult the latch.
+    scan_input->decode_selection_unprofitable = _decode_selection_unprofitable;
     // Membership channel for the decode-time snapshot (join builds publish
     // during execution — only a snapshot taken at prepare/decode can see them).
     scan_input->dynamic_filters = _dynamic_filters_channel;

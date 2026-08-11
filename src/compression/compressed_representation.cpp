@@ -142,10 +142,8 @@ std::unique_ptr<cucascade::idata_representation> compressed_host_representation:
                                        _num_rows,
                                        _selected_indices,
                                        _column_sizes));
-  // The pushdown is indexed by the selected column list, which the clone shares.
-  copy->set_equality_pushdown(_equality_pushdown);
-  copy->set_range_pushdown(_range_pushdown, _range_conjuncts_convertible);
-  copy->set_membership_pushdown(_membership_pushdown, _membership_generation);
+  // The request is indexed by the selected column list, which the clone shares.
+  copy->set_decode_scan(_decode_scan);
   return copy;
 }
 
@@ -309,10 +307,8 @@ std::unique_ptr<cucascade::idata_representation> compressed_device_representatio
                                          _num_rows,
                                          _selected_indices,
                                          _column_sizes));
-  // The pushdown is indexed by the selected column list, which the clone shares.
-  copy->set_equality_pushdown(_equality_pushdown);
-  copy->set_range_pushdown(_range_pushdown, _range_conjuncts_convertible);
-  copy->set_membership_pushdown(_membership_pushdown, _membership_generation);
+  // The request is indexed by the selected column list, which the clone shares.
+  copy->set_decode_scan(_decode_scan);
   return copy;
 }
 
@@ -336,66 +332,6 @@ std::unique_ptr<compressed_device_representation> compressed_device_representati
     _num_rows,
     std::move(absolute),
     _column_sizes));
-}
-
-compressed_device_representation::fused_scan_reservation_probe
-compressed_device_representation::probe_fused_scan_reservation() const
-{
-  fused_scan_reservation_probe probe{};
-  // Mirrors the env gate read in simpatico's wave orchestrator (the converter
-  // path); duplicated here because the estimator runs before any simpatico
-  // call. Cached — the gate is process-lifetime constant.
-  static bool const gate = [] {
-    char const* v = std::getenv("SIRIUS_EXP_FUSED_SCAN_FILTER");
-    return v != nullptr && std::string_view{v} == "1";
-  }();
-  if (!gate) { return probe; }
-  if (!_range_conjuncts_convertible) { return probe; }
-  bool any_active = false;
-  for (auto const& entry : _range_pushdown) {
-    if (entry.active) {
-      any_active = true;
-      break;
-    }
-  }
-  if (!any_active) { return probe; }
-
-  // Reservation-time mirror of the converter's RULE 1: every column this
-  // projection decodes must come back survivor-compacted (tier_a /
-  // tier_a_delta / tier_dict_k5), else the pipeline runs classic and the
-  // caller must keep the classic envelope. A tier_dict_k5 column also lifts
-  // the RULE-2 selectivity bound (dict batches skip the bail). Pure host
-  // metadata (plan-tree walks), no device work.
-  auto const& ct      = _blob->table;
-  bool any_unbounded  = false;
-  auto probes_fusable = [&](std::size_t idx) {
-    if (idx >= ct.columns.size()) { return false; }
-    auto const& plan = ct.columns[idx].plan_tree;
-    if (!plan) { return false; }
-    if (!simpatico::plan_supports_selection_decode(*plan)) { return false; }
-    // Tiers exempt from the RULE-2 selectivity bail: dict-K5 only (its masked
-    // key gather wins at every selectivity). K6 strings stay on the 0.35
-    // write-skip regime per the declared wave policy — savings are weak at
-    // ~1-char widths — so tier_str_k6 does NOT lift the bound here.
-    any_unbounded = any_unbounded || simpatico::plan_selection_tier(*plan) ==
-                                       sirius::codegen::output_tier::tier_dict_k5;
-    return true;
-  };
-  bool planned = false;
-  if (_selected_indices.has_value()) {
-    planned = !_selected_indices->empty();
-    for (auto const idx : *_selected_indices) {
-      if (!probes_fusable(idx)) { return probe; }
-    }
-  } else {
-    planned = !ct.columns.empty();
-    for (std::size_t i = 0; i < ct.columns.size(); ++i) {
-      if (!probes_fusable(i)) { return probe; }
-    }
-  }
-  probe.planned       = planned;
-  probe.rule2_bounded = planned && !any_unbounded;
-  return probe;
 }
 
 }  // namespace sirius

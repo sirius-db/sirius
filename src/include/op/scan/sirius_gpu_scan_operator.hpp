@@ -162,11 +162,12 @@ class sirius_gpu_scan_operator : public sirius_physical_operator {
  private:
   std::shared_ptr<gpu_ingestible> _ingestible;
   std::shared_ptr<scan_manager::split_connector> _split_connector;
-  /// RULE-2 bail latch for the fused scan-filter pipeline, shared with every
-  /// split this operator hands out (see scan_operator_input::fused_bail_flag).
+  /// Latch for "compacting during decode does not pay off", shared with every
+  /// split this operator hands out (see
+  /// scan_operator_input::decode_selection_unprofitable).
   /// Per-operator so another query's scan of the same pinned entry decides
   /// fresh.
-  std::shared_ptr<std::atomic<bool>> _fused_rule2_bailed =
+  std::shared_ptr<std::atomic<bool>> _decode_selection_unprofitable =
     std::make_shared<std::atomic<bool>>(false);
   /// The scan's dynamic-filter channel (null for non-parquet ingestibles),
   /// resolved once at construction and stamped onto every split so

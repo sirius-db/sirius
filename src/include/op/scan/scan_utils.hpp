@@ -17,7 +17,6 @@
 #pragma once
 
 // sirius
-#include <codegen/selection/selection.hpp>
 #include <expression_evaluator/gpu_expression_translator_internal.hpp>
 #include <helper/logical_type.hpp>
 
@@ -65,11 +64,11 @@ std::vector<std::optional<std::size_t>> build_batch_column_map(
  * here is safe.
  *
  * @p boolean_substituted_primary_indices names columns that arrive already reduced to a BOOL8
- * predicate result (see @ref extract_string_equality_pushdown and
- * @c sirius::decode_equality_pushdown). Their filter is not re-expressed as a comparison; the
- * batch column *is* the answer, so it contributes a bare boolean reference instead. Passing a
- * column here whose batch column is not actually BOOL8 silently mis-types the expression, so
- * callers must confirm the substitution happened for the batch in hand.
+ * predicate result (see @c sirius::scan_filter_analysis::equality_sets). Their filter is not
+ * re-expressed as a comparison; the batch column *is* the answer, so it contributes a bare
+ * boolean reference instead. Passing a column here whose batch column is not actually BOOL8
+ * silently mis-types the expression, so callers must confirm the substitution happened for the
+ * batch in hand — @c sirius::decode_outcome::predicate_columns reports it per batch.
  *
  * Returns nullptr if the filter set is empty or contains only unsupported/skipped filter types.
  */
@@ -80,106 +79,6 @@ duckdb::unique_ptr<duckdb::Expression> convert_table_filters_to_expression(
   const std::vector<std::optional<std::size_t>>& batch_position_by_column_id,
   const std::unordered_set<std::size_t>& skip_primary_indices                = {},
   const std::unordered_set<std::size_t>& boolean_substituted_primary_indices = {});
-
-/**
- * @brief Per-column string constants for filters that are pure equality / IN tests.
- *
- * Returns, keyed by column primary index, the value set a column is compared
- * against when its whole pushed-down filter is an equality, an @c IN, or an OR of
- * those over non-null VARCHAR constants (an ANDed @c IS NOT NULL is absorbed —
- * an equality already rejects nulls). Columns with any other filter shape, or a
- * non-string constant, are absent.
- *
- * This is the decision input for pushing a predicate into decompression: such a
- * column can be answered off a dictionary's key set instead of being decoded
- * (@c simpatico::decode_predicate). The caller must additionally confirm the
- * column is never projected — the pushdown replaces its values with a BOOL8
- * mask — and that its compression plan can actually exploit it.
- */
-std::unordered_map<std::size_t, std::vector<std::string>> extract_string_equality_pushdown(
-  const duckdb::TableFilterSet& filters,
-  const duckdb::vector<duckdb::ColumnIndex>& column_ids,
-  const duckdb::vector<sirius::logical_type>& returned_types);
-
-/**
- * @brief Numeric range predicates extracted from a scan's pushed-down filters
- * (fused scan-filter pipeline, env gate @c SIRIUS_EXP_FUSED_SCAN_FILTER).
- *
- * Bounds live in the DECODED integer domain — the values a bitpack decoder
- * reconstructs: DATE → stored day count, DECIMAL → unscaled integer at the
- * *column's* scale, plain integers as-is. Inclusive both ends; @c lo > @c hi is
- * a provably empty range (e.g. an equality against a constant the column's
- * scale cannot represent) and legitimately selects nothing.
- */
-struct numeric_range_extraction {
-  /// Inclusive [lo,hi] per filtered column, keyed by column primary index.
-  /// Always a sound conjunctive over-approximation of that column's filter:
-  /// every row the range rejects is a row the full filter rejects.
-  std::unordered_map<std::size_t, sirius::codegen::range_predicate> ranges;
-  /// True iff EVERY row-restricting filter in the set was converted into
-  /// @c ranges. When true and the decode mask applies them all, the scan may
-  /// skip its post-decompress filter (batch tagged row-filtered). When false,
-  /// @c ranges may still be non-empty (iteration 3, mixed-mask): they are
-  /// usable as a PARTIAL decode mask — rows dropped by it are sound because
-  /// mask conjuncts are conjunctive — but the post-decompress filter MUST
-  /// still run to evaluate the residual conjuncts.
-  bool all_conjuncts_convertible = false;
-};
-
-/**
- * @brief Extract per-column numeric range predicates from a TableFilterSet.
- *
- * Recognizes CONSTANT_COMPARISON (<, <=, >, >=, =) and CONJUNCTION_AND of
- * those, on DATE / DECIMAL(≤18) / signed- and small-unsigned-integer columns,
- * intersecting all conjuncts into one inclusive [lo,hi] per column. Strict
- * inequalities tighten the bound by one; decimal constants are rescaled to the
- * column's scale exactly (floor/ceil on the correct side when the constant has
- * more fractional digits than the column can store).
- *
- * Top-level OPTIONAL_FILTER and IS_NOT_NULL filters are non-restricting on the
- * scan's post-decompress path — @ref convert_table_filters_to_expression drops
- * them — so they are skipped here without blocking the gate; likewise for
- * filters on @p skip_primary_indices (hive partitions, enforced at file-list
- * level). Any other unconvertible conjunct clears only
- * @c all_conjuncts_convertible; convertible conjuncts elsewhere in the set
- * (including convertible AND-siblings of an unconvertible one) still yield
- * ranges, forming a partial mask.
- *
- * The caller must still confirm, per batch, that every filtered column's
- * compression plan can evaluate its range during decode
- * (@c sirius::build_fused_scan_directives) — this function only speaks for the
- * filter shapes and constant types.
- */
-numeric_range_extraction extract_numeric_range_pushdown(
-  const duckdb::TableFilterSet& filters,
-  const duckdb::vector<duckdb::ColumnIndex>& column_ids,
-  const duckdb::vector<sirius::logical_type>& returned_types,
-  const std::unordered_set<std::size_t>& skip_primary_indices = {});
-
-/// One `colA OP colB` conjunct harvested from a bound filter expression
-/// (fused scan-filter pair predicates, iteration 5). The binding indices are
-/// whatever the expression's BoundReferenceExpressions carry — for a FILTER
-/// operator above a scan these are positions into the scan's output layout;
-/// the harvest wiring owns the mapping onto scan columns and the per-chunk
-/// plan checks (@c sirius::build_fused_scan_directives drops non-bitpack
-/// pairs).
-struct pair_conjunct {
-  duckdb::idx_t left_binding          = 0;
-  duckdb::idx_t right_binding         = 0;
-  sirius::codegen::pair_compare_op op = sirius::codegen::pair_compare_op::lt;
-};
-
-/**
- * @brief Harvest column-vs-column comparison conjuncts from a bound expression.
- *
- * Walks AND conjunctions recursively and collects every
- * `BoundReferenceExpression OP BoundReferenceExpression` comparison with OP in
- * {<, <=, >, >=} (q12-class `l_commitdate < l_receiptdate`). Anything else —
- * OR branches, constants, casts, function calls — is left alone: the caller
- * uses the result as ADDITIONAL mask conjuncts only, so under-harvesting is
- * always sound (the source expression keeps running wherever it runs today).
- */
-std::vector<pair_conjunct> extract_pair_conjuncts(duckdb::Expression const& expr);
 
 /**
  * @brief Bridge a DuckDB filter expression through sirius::ast::from_duckdb into the

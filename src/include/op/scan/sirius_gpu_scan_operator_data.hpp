@@ -17,8 +17,7 @@
 #pragma once
 
 // sirius
-#include "compression/decode_pushdown.hpp"
-
+#include <compression/compressed_scan.hpp>
 #include <op/scan/gpu_ingestible.hpp>
 #include <op/sirius_physical_operator.hpp>
 #include <scan_manager/mvcc_chunk_mask.hpp>
@@ -35,6 +34,7 @@
 #include <cstddef>
 #include <memory>
 #include <variant>
+#include <vector>
 
 namespace sirius::op {
 class sirius_dynamic_filter_set;  // membership channel (op/sirius_dynamic_filter.hpp)
@@ -43,17 +43,18 @@ class sirius_dynamic_filter_set;  // membership channel (op/sirius_dynamic_filte
 namespace sirius::op::scan {
 
 //===----------------------------------------------------------------------===//
-// membership snapshot (fused scan-filter Phase A)
+// Dynamic join filters, snapshotted for a decode
 //===----------------------------------------------------------------------===//
 /// One snapshot of a scan's dynamic-filter channel, shaped for decode.
 struct membership_snapshot {
-  sirius::decode_membership_pushdown pushdown;  ///< parallel to the selected slots
-  std::uint64_t generation     = 0;             ///< set->filter_count(), read BEFORE the walk
+  /// Parallel to the selected slots.
+  std::vector<std::vector<sirius::membership_probe>> probes;
+  std::uint64_t generation     = 0;  ///< set->filter_count(), read BEFORE the walk
   std::size_t attached_probes  = 0;
   std::size_t skipped_non_mask = 0;  ///< filters without the mask-applicable mixin (zone maps)
 };
 
-/// Build a membership pushdown over @p n_slots provider/representation slots.
+/// Snapshot the channel's per-column probes over @p n_slots decoded slots.
 ///
 /// THE MAPPING INVARIANT (single source of truth — both the scan-manager
 /// drain attach and the decode-time refresh call this): slot order ==
@@ -67,7 +68,7 @@ struct membership_snapshot {
 /// construction. generation is read BEFORE the walk so it never claims probes
 /// the walk did not capture (a racing publish only ADDS an uncounted probe —
 /// the safe direction for the converter's generation echo).
-[[nodiscard]] membership_snapshot snapshot_membership_pushdown(
+[[nodiscard]] membership_snapshot snapshot_membership_probes(
   sirius::op::sirius_dynamic_filter_set const& set, std::size_t n_slots);
 
 //===----------------------------------------------------------------------===//
@@ -182,9 +183,8 @@ class scan_operator_input : public op::operator_data {
   /// splits fold filter costs into their own estimates instead.
   bool row_filter_pending{false};
   /// True when prepare_for_processing's conversion came back as a
-  /// decode_outcome::row_filtered: the fused scan-filter decode
-  /// (SIRIUS_EXP_FUSED_SCAN_FILTER) already applied the split's whole
-  /// table-filter conjunction and every column is compacted to the survivor
+  /// decode_outcome::row_filtered: the decode already applied the split's whole
+  /// table-filter conjunction and every column is compacted to the surviving
   /// rows. materialize_table then returns filter_state::ROW_FILTERED so
   /// post_filter_and_project skips filter evaluation and only projects. Never
   /// set while the gate is off — the converters then always produce the plain
@@ -200,19 +200,19 @@ class scan_operator_input : public op::operator_data {
   /// sirius_gpu_scan_operator::get_next_task_input_data. prepare_for_processing
   /// snapshots it at DECODE time — the scan-manager drain runs at query
   /// prepare, before any join build has published, so only a decode-time
-  /// snapshot can see membership filters (the iteration-7 zero-member() root
-  /// cause).
+  /// snapshot can see any join filters at all.
   std::shared_ptr<sirius::op::sirius_dynamic_filter_set> dynamic_filters;
-  /// Operator-shared RULE-2 bail latch, stamped by
-  /// sirius_gpu_scan_operator::get_next_task_input_data on every split it
-  /// hands out. Selectivity is uniform across a scan's batches (unclustered
-  /// chunks), so one post-CNT bail predicts the rest: prepare_for_processing
-  /// latches it on seeing decode_outcome::rule2_bailed, and later
-  /// splits strip the attached range pushdown before conversion (and the
-  /// working-set estimator keeps the classic 2x envelope). Per-operator by
-  /// construction — another query's scan decides fresh. May be null (splits
-  /// not routed through the operator, e.g. tests): all reads null-check.
-  std::shared_ptr<std::atomic<bool>> fused_bail_flag;
+  /// Operator-shared latch for "compacting this scan's batches during decode
+  /// does not pay off", stamped by
+  /// sirius_gpu_scan_operator::get_next_task_input_data on every split it hands
+  /// out. Selectivity is uniform across a scan's batches (unclustered chunks),
+  /// so one such batch predicts the rest: prepare_for_processing latches it on
+  /// seeing decode_outcome::selection_unprofitable, and later splits drop the
+  /// row selection before conversion (and the working-set estimator keeps the
+  /// full-width envelope). Per-operator by construction — another query's scan
+  /// decides fresh. May be null (splits not routed through the operator, e.g.
+  /// tests): all reads null-check.
+  std::shared_ptr<std::atomic<bool>> decode_selection_unprofitable;
   /// Per-query table taken out of the cached wrapper batch right after
   /// prepare_for_processing's conversion produced it (decompressed or
   /// uploaded fresh for this split) — never raw GPU pin storage, which is

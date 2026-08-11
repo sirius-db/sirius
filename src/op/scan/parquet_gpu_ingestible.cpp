@@ -543,45 +543,31 @@ parquet_gpu_ingestible::parquet_gpu_ingestible(std::unique_ptr<parquet_ingestibl
       }
     }
 
-    // Decode-time predicate pushdown: a pure-filter string column whose whole
-    // filter is an equality / IN can be delivered as a BOOL8 mask instead of
-    // values, letting a dictionary-compressed pin answer it off its key set
-    // rather than gathering the decoded chars. Restricted to pure-filter columns
-    // because the mask *replaces* the column — a projected one could not survive
-    // it. This only records what the scan is *willing* to accept; whether any
-    // given batch actually carries masks is decided per batch in
-    // post_filter_and_project.
+    // Digest the pushed-down filter once: which pure-filter string columns a
+    // dictionary-compressed source could answer without decoding them, and
+    // which conjuncts a decoder could use to drop rows. This records only what
+    // the scan is WILLING to accept; whether a given batch actually took the
+    // offer is decided per batch (post_filter_and_project).
+    //
+    // Pure-filter columns only for the equality answers: the answer REPLACES
+    // the column's values, which a projected column could not survive.
     if (_duckdb_filter_expression) {
-      auto candidates = sirius::op::extract_string_equality_pushdown(
-        *bind.table_filters, bind.column_ids, bind.returned_types);
+      std::unordered_set<std::size_t> filter_only;
       for (auto const batch_pos : _plan->pure_filter_batch_positions()) {
         auto const primary_idx = _plan->data_columns.at(batch_pos).primary_idx;
         if (_plan->partition_primary_indices.count(primary_idx)) { continue; }
-        auto const it = candidates.find(primary_idx);
-        if (it == candidates.end()) { continue; }
-        _pushdown_primary_by_batch_position.emplace_back(batch_pos, primary_idx);
-        _decode_predicate_candidates.emplace(primary_idx, it->second);
+        filter_only.insert(primary_idx);
       }
-    }
-
-    // Decode-time predicate pushdown: a pure-filter string column whose whole
-    // filter is an equality / IN can be delivered as a BOOL8 mask instead of
-    // values, letting a dictionary-compressed pin answer it off its key set
-    // rather than gathering the decoded chars. Restricted to pure-filter columns
-    // because the mask *replaces* the column — a projected one could not survive
-    // it. This only records what the scan is *willing* to accept; whether any
-    // given batch actually carries masks is decided per batch in
-    // post_filter_and_project.
-    if (_duckdb_filter_expression) {
-      auto candidates = sirius::op::extract_string_equality_pushdown(
-        *bind.table_filters, bind.column_ids, bind.returned_types);
+      _filter_analysis = sirius::op::analyze_scan_filters(*bind.table_filters,
+                                                          bind.column_ids,
+                                                          bind.returned_types,
+                                                          _plan->partition_primary_indices,
+                                                          filter_only);
       for (auto const batch_pos : _plan->pure_filter_batch_positions()) {
         auto const primary_idx = _plan->data_columns.at(batch_pos).primary_idx;
-        if (_plan->partition_primary_indices.count(primary_idx)) { continue; }
-        auto const it = candidates.find(primary_idx);
-        if (it == candidates.end()) { continue; }
-        _pushdown_primary_by_batch_position.emplace_back(batch_pos, primary_idx);
-        _decode_predicate_candidates.emplace(primary_idx, it->second);
+        if (_filter_analysis.equality_sets.count(primary_idx)) {
+          _pushdown_primary_by_batch_position.emplace_back(batch_pos, primary_idx);
+        }
       }
     }
   }

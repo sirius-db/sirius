@@ -309,10 +309,9 @@ class parquet_gpu_ingestible : public gpu_ingestible {
     return _duckdb_filter_expression != nullptr;
   }
 
-  [[nodiscard]] std::unordered_map<std::size_t, std::vector<std::string>>
-  decode_predicate_candidates() const override
+  [[nodiscard]] scan_filter_analysis const& filter_analysis() const override
   {
-    return _decode_predicate_candidates;
+    return _filter_analysis;
   }
 
  private:
@@ -354,8 +353,9 @@ class parquet_gpu_ingestible : public gpu_ingestible {
   // strings), so build_filter_expression_for reads it off each batch's column
   // types.
   std::vector<std::pair<std::size_t, std::size_t>> _pushdown_primary_by_batch_position;
-  // What decode_predicate_candidates() advertises: primary index → constant set.
-  std::unordered_map<std::size_t, std::vector<std::string>> _decode_predicate_candidates;
+  // This scan's pushed-down filter digested once at bind — what filter_analysis()
+  // advertises. Empty when the scan has no pushed-down filter.
+  scan_filter_analysis _filter_analysis;
 
   // The part of _duckdb_filter_expression safe to push into the reader: the
   // full predicate minus any top-level AND conjunct that cuDF's row-group

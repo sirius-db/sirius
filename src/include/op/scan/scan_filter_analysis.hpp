@@ -1,0 +1,122 @@
+/*
+ * Copyright 2026, Sirius Contributors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#pragma once
+
+// sirius
+#include <compression/compressed_scan.hpp>
+#include <helper/logical_type.hpp>
+
+// duckdb
+#include <duckdb/common/types.hpp>
+#include <duckdb/planner/expression.hpp>
+#include <duckdb/planner/table_filter.hpp>
+
+// standard library
+#include <cstddef>
+#include <span>
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
+
+namespace sirius::op {
+
+/**
+ * @brief One scan's pushed-down filter, digested once into what a decompressor
+ * can evaluate for itself.
+ *
+ * The scan hands over its whole filter and gets back the parts that survive as
+ * decode-time work, keyed by column primary index. What any given chunk can
+ * actually do with them is decided later and elsewhere (see
+ * @c sirius::compressed_scan) — this speaks only for filter shapes and constant
+ * types.
+ */
+struct scan_filter_analysis {
+  /// Columns whose ENTIRE filter is an equality / IN over non-null string
+  /// constants (an ANDed IS NOT NULL is absorbed — an equality already rejects
+  /// nulls), mapped to the value set they are tested against.
+  ///
+  /// Such a column can be answered off a dictionary's key set instead of being
+  /// decoded, which REPLACES its values with the boolean answer — so only
+  /// columns the query never projects are ever listed here.
+  std::unordered_map<std::size_t, std::vector<std::string>> equality_sets;
+
+  /// Inclusive bounds per filtered column. Always a sound conjunctive
+  /// over-approximation of that column's filter: every row the bounds reject is
+  /// a row the full filter rejects.
+  std::unordered_map<std::size_t, sirius::decode_range> ranges;
+
+  /// True iff EVERY row-restricting conjunct of the filter became a range.
+  /// When false, @c ranges may still be non-empty and remains usable — the
+  /// decode then filters only partially and the scan must still evaluate its
+  /// own filter afterwards.
+  bool ranges_cover_whole_filter = false;
+
+  /// Column-vs-column conjuncts harvested from a bound filter expression. The
+  /// indices are whatever that expression's bound references carry — for a
+  /// filter above a scan, positions in the scan's output layout — so the caller
+  /// owns mapping them onto decoded columns.
+  std::vector<sirius::column_pair_conjunct> pairs;
+};
+
+/**
+ * @brief Digest @p filters into the decode-time work it can support.
+ *
+ * Ranges recognize constant comparisons (<, <=, >, >=, =) and AND-trees of
+ * them, on DATE / DECIMAL(≤18) / signed- and small-unsigned-integer columns,
+ * intersecting all conjuncts into one inclusive range per column. Strict
+ * inequalities tighten the bound by one; decimal constants are rescaled to the
+ * column's scale exactly (floor/ceil on the correct side when the constant has
+ * more fractional digits than the column can store).
+ *
+ * Top-level OPTIONAL_FILTER and IS_NOT_NULL filters do not restrict the rows a
+ * scan emits — @ref convert_table_filters_to_expression drops them — so they
+ * are skipped without clearing coverage; likewise filters on
+ * @p skip_primary_indices (hive partitions, enforced at file-list level). Any
+ * other unconvertible conjunct clears only @c ranges_cover_whole_filter:
+ * convertible conjuncts elsewhere in the set still yield ranges.
+ *
+ * Equality sets are collected only for @p filter_only_primary_indices — the
+ * columns the query never projects — because answering one in place replaces
+ * its values.
+ *
+ * @p bound_filter, when given, is additionally walked for `colA OP colB`
+ * comparisons under AND, with OP in {<, <=, >, >=}. Anything else there is left
+ * alone: the pairs are only ever ADDITIONAL restrictions, so under-harvesting
+ * is always sound.
+ */
+scan_filter_analysis analyze_scan_filters(
+  const duckdb::TableFilterSet& filters,
+  const duckdb::vector<duckdb::ColumnIndex>& column_ids,
+  const duckdb::vector<sirius::logical_type>& returned_types,
+  const std::unordered_set<std::size_t>& skip_primary_indices        = {},
+  const std::unordered_set<std::size_t>& filter_only_primary_indices = {},
+  duckdb::Expression const* bound_filter                             = nullptr);
+
+/**
+ * @brief Turn @p analysis into the request one decoder can act on.
+ *
+ * @p primary_index_by_slot maps each column the decode will produce onto the
+ * scan's column primary index, so the request comes out parallel to that
+ * column list. Analysis entries that map to no slot are dropped — a partition
+ * filter, say, which is enforced elsewhere — and the pairs are carried over
+ * only when both sides land on a slot.
+ */
+sirius::scan_decode_request build_scan_decode_request(
+  scan_filter_analysis const& analysis, std::span<const std::size_t> primary_index_by_slot);
+
+}  // namespace sirius::op
