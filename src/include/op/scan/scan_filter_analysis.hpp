@@ -18,7 +18,11 @@
 
 // sirius
 #include <compression/compressed_scan.hpp>
+#include <expression/ast/node.hpp>
 #include <helper/logical_type.hpp>
+
+// sirius (table_filter_conjunct)
+#include <op/scan/scan_utils.hpp>
 
 // duckdb
 #include <duckdb/common/types.hpp>
@@ -27,6 +31,8 @@
 
 // standard library
 #include <cstddef>
+#include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <unordered_map>
@@ -118,5 +124,55 @@ scan_filter_analysis analyze_scan_filters(
  */
 sirius::scan_decode_request build_scan_decode_request(
   scan_filter_analysis const& analysis, std::span<const std::size_t> primary_index_by_slot);
+
+/**
+ * @brief The part of a scan's filter that still has to be evaluated after the
+ * decode, as a predicate.
+ *
+ * Built once at bind from the filter's top-level conjuncts, each pre-lowered to
+ * Sirius AST. A conjunct on a column the decoder can answer for itself also
+ * records WHERE that answer lands, so per batch the residual is assembled by
+ * choosing a form per conjunct — no DuckDB expression is rebuilt and no
+ * conversion runs on the batch path.
+ *
+ * A column answered in place arrives as the BOOL8 answer rather than its
+ * declared type, so its conjunct MUST become a bare reference to it; re-running
+ * the comparison would compare a mask against a string constant. Which columns
+ * that happened to is a per-batch fact the decoder reports
+ * (@c sirius::decode_outcome::predicate_columns).
+ */
+class residual_filter {
+ public:
+  residual_filter() = default;
+
+  /// @p answerable_batch_positions are the columns the scan is willing to
+  /// receive as an answer instead of values; a conjunct on any other column
+  /// always keeps its comparison form.
+  ///
+  /// @throws std::runtime_error if a conjunct cannot be lowered to Sirius AST.
+  /// That is a bind-time failure by design: an unlowerable conjunct cannot be
+  /// evaluated on any batch, and silently dropping it would return unfiltered
+  /// rows.
+  residual_filter(std::vector<table_filter_conjunct> conjuncts,
+                  std::unordered_set<std::size_t> const& answerable_batch_positions);
+
+  /// True when there is nothing to evaluate at all (no filter, or every
+  /// conjunct was skipped as non-restricting).
+  [[nodiscard]] bool empty() const noexcept { return _conjuncts.empty(); }
+
+  /// The predicate to evaluate over a batch in which @p answered_positions
+  /// arrived as BOOL8 answers. Null only when @ref empty.
+  [[nodiscard]] std::unique_ptr<sirius::ast::node> against(
+    std::vector<std::size_t> const& answered_positions) const;
+
+ private:
+  struct conjunct {
+    std::unique_ptr<sirius::ast::node> comparison;
+    /// Set when this conjunct's column can arrive as the answer; the batch
+    /// position that answer occupies.
+    std::optional<std::size_t> answered_at;
+  };
+  std::vector<conjunct> _conjuncts;
+};
 
 }  // namespace sirius::op

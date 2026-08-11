@@ -22,6 +22,8 @@
 #include <duckdb/planner/filter/conjunction_filter.hpp>
 #include <duckdb/planner/filter/constant_filter.hpp>
 #include <duckdb/planner/filter/in_filter.hpp>
+#include <expression/ast/from_duckdb.hpp>
+#include <expression/ast/utils.hpp>
 #include <helper/type_conversions.hpp>
 #include <log/logging.hpp>
 #include <op/scan/scan_filter_analysis.hpp>
@@ -31,6 +33,7 @@
 #include <cstdint>
 #include <limits>
 #include <optional>
+#include <stdexcept>
 #include <utility>
 
 namespace sirius::op {
@@ -458,6 +461,71 @@ sirius::scan_decode_request build_scan_decode_request(
   // space, not by primary index, so mapping them belongs with whoever supplies
   // that expression; no caller wires them onto slots yet.
   return request;
+}
+
+}  // namespace sirius::op
+
+//===----------------------------------------------------------------------===//
+// residual_filter
+//===----------------------------------------------------------------------===//
+
+namespace sirius::op {
+
+residual_filter::residual_filter(std::vector<table_filter_conjunct> conjuncts,
+                                 std::unordered_set<std::size_t> const& answerable_batch_positions)
+{
+  _conjuncts.reserve(conjuncts.size());
+  for (auto& source : conjuncts) {
+    // Lower to Sirius AST once, here, rather than per batch: the comparison
+    // never changes, only whether it is the form we use.
+    auto lowered = sirius::ast::from_duckdb(*source.expr);
+    if (!lowered) {
+      // Fail here rather than per batch. A conjunct that cannot be lowered
+      // cannot be evaluated at all, and an empty residual would read as "this
+      // scan has no filter" — silently returning unfiltered rows. Lowering the
+      // whole conjunction used to be attempted per batch, where the same
+      // failure produced a null AST the evaluator then dereferenced.
+      throw std::runtime_error(
+        "[residual_filter] a pushed-down filter conjunct cannot be lowered to Sirius AST: " +
+        source.expr->ToString());
+    }
+    std::optional<std::size_t> answered_at;
+    if (answerable_batch_positions.count(source.batch_position)) {
+      answered_at = source.batch_position;
+    }
+    _conjuncts.push_back({std::move(lowered), answered_at});
+  }
+}
+
+std::unique_ptr<sirius::ast::node> residual_filter::against(
+  std::vector<std::size_t> const& answered_positions) const
+{
+  if (_conjuncts.empty()) { return nullptr; }
+
+  auto const answered = [&](std::optional<std::size_t> position) {
+    return position.has_value() &&
+           std::find(answered_positions.begin(), answered_positions.end(), *position) !=
+             answered_positions.end();
+  };
+
+  std::vector<std::unique_ptr<sirius::ast::node>> children;
+  children.reserve(_conjuncts.size());
+  for (auto const& conjunct : _conjuncts) {
+    if (answered(conjunct.answered_at)) {
+      // The column IS the answer to this conjunct — a BOOL8 result, not values.
+      // Referencing it is both correct and cheaper than re-comparing; running
+      // the comparison would test a mask against the original constant.
+      children.push_back(std::make_unique<sirius::ast::node>(
+        sirius::ast::reference{static_cast<std::uint32_t>(*conjunct.answered_at),
+                               sirius::logical_type::make(sirius::type_id::BOOLEAN)}));
+    } else {
+      children.push_back(sirius::ast::clone(*conjunct.comparison));
+    }
+  }
+
+  if (children.size() == 1) { return std::move(children[0]); }
+  sirius::ast::conjunction all{sirius::ast::conjunction::kind::op_and, std::move(children)};
+  return std::make_unique<sirius::ast::node>(std::move(all));
 }
 
 }  // namespace sirius::op

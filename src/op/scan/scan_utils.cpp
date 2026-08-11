@@ -61,15 +61,14 @@ std::vector<std::optional<std::size_t>> build_batch_column_map(
   return map;
 }
 
-duckdb::unique_ptr<duckdb::Expression> convert_table_filters_to_expression(
+std::vector<table_filter_conjunct> decompose_table_filters(
   const duckdb::TableFilterSet& filters,
   const duckdb::vector<duckdb::ColumnIndex>& column_ids,
   const duckdb::vector<sirius::logical_type>& returned_types,
   const std::vector<std::optional<std::size_t>>& batch_position_by_column_id,
-  const std::unordered_set<std::size_t>& skip_primary_indices,
-  const std::unordered_set<std::size_t>& boolean_substituted_primary_indices)
+  const std::unordered_set<std::size_t>& skip_primary_indices)
 {
-  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> filter_expressions;
+  std::vector<table_filter_conjunct> conjuncts;
 
   for (auto& [column_index, filter] : filters.filters) {
     // Skip optional and IS_NOT_NULL filters
@@ -102,33 +101,32 @@ duckdb::unique_ptr<duckdb::Expression> convert_table_filters_to_expression(
 
     SIRIUS_LOG_DEBUG("TABLE_SCAN filter: batch_column_index={}", batch_column_index);
 
-    // The column already carries this filter's answer as a BOOL8 mask (the
-    // predicate was resolved during decompression), so the batch column IS the
-    // conjunct — re-expressing the comparison would compare against a mask.
-    if (boolean_substituted_primary_indices.count(primary_idx)) {
-      SIRIUS_LOG_DEBUG(
-        "TABLE_SCAN filter: primary_idx={} substituted by a decode-time BOOL8 mask at batch "
-        "position {}",
-        primary_idx,
-        batch_column_index);
-      filter_expressions.push_back(duckdb::make_uniq<duckdb::BoundReferenceExpression>(
-        duckdb::LogicalType::BOOLEAN, batch_column_index));
-      continue;
-    }
-
     auto column_ref = duckdb::make_uniq<duckdb::BoundReferenceExpression>(
       sirius::to_duckdb(col_type), batch_column_index);
-    auto expr = filter->ToExpression(*column_ref);
-    filter_expressions.push_back(std::move(expr));
+    conjuncts.push_back(
+      {static_cast<std::size_t>(primary_idx), *batch_pos, filter->ToExpression(*column_ref)});
   }
 
-  if (filter_expressions.empty()) { return nullptr; }
-  if (filter_expressions.size() == 1) { return std::move(filter_expressions[0]); }
+  return conjuncts;
+}
+
+duckdb::unique_ptr<duckdb::Expression> convert_table_filters_to_expression(
+  const duckdb::TableFilterSet& filters,
+  const duckdb::vector<duckdb::ColumnIndex>& column_ids,
+  const duckdb::vector<sirius::logical_type>& returned_types,
+  const std::vector<std::optional<std::size_t>>& batch_position_by_column_id,
+  const std::unordered_set<std::size_t>& skip_primary_indices)
+{
+  auto conjuncts = decompose_table_filters(
+    filters, column_ids, returned_types, batch_position_by_column_id, skip_primary_indices);
+
+  if (conjuncts.empty()) { return nullptr; }
+  if (conjuncts.size() == 1) { return std::move(conjuncts[0].expr); }
 
   auto conjunction =
     duckdb::make_uniq<duckdb::BoundConjunctionExpression>(duckdb::ExpressionType::CONJUNCTION_AND);
-  for (auto& expr : filter_expressions) {
-    conjunction->children.push_back(std::move(expr));
+  for (auto& conjunct : conjuncts) {
+    conjunction->children.push_back(std::move(conjunct.expr));
   }
   return conjunction;
 }
