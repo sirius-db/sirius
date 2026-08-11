@@ -1,4 +1,5 @@
-// Masked JIT decode launchers — fused scan-filter pipeline (K1 / K3).
+// Masked JIT decode launchers — the kernels that evaluate a scan's filter
+// while decompressing, and decode only the rows that survive it.
 //
 // Companions to ``simpatico::launch_decode_fused_tree`` (codegen_bridge.hpp):
 // same LabeledBuffers contract (persisted channels keyed
@@ -9,16 +10,17 @@
 // plain decode path.
 //
 // These entry points are dead code unless the wave orchestrator calls them
-// (engine gate SIRIUS_EXP_FUSED_SCAN_FILTER lives there): the plain decode
+// (the engine gate SIRIUS_EXP_FUSED_SCAN_FILTER lives there): the plain decode
 // path is byte-identical whether or not this header is used.
 //
 // Selection-mask contract (see codegen/selection/selection.hpp):
 //   * mask words: 32 uint32 words per 1024-row chunk, i.e.
-//     ``selection_mask::ChunksFor(num_rows) * 32`` words total.  K1 writes
-//     every word of every chunk it covers (tail bits/words are zero).
+//     ``selection_mask::ChunksFor(num_rows) * 32`` words total.  A ballot
+//     kernel writes every word of every chunk it covers (tail bits/words are
+//     zero).
 //   * chunk_offsets: uint32[ChunksFor(num_rows) + 1], exclusive prefix sum
-//     of per-chunk survivor counts (the CNT wave's output).  K3 uses
-//     chunk_offsets[c] as the compacted output base of chunk c.
+//     of per-chunk survivor counts (the CNT wave's output).  A mask-consuming
+//     kernel uses chunk_offsets[c] as the compacted output base of chunk c.
 //
 // Predicate constants and mask/offset pointers travel as KERNEL PARAMETERS,
 // never as rendered source — one NVRTC compile per (tree shape, dtype,
@@ -35,11 +37,11 @@
 
 namespace simpatico {
 
-/// K1: decode fused with the inclusive range predicate ``pred`` (decoded
-/// integer domain, values widened to int64 for the compare), producing
-/// selection-mask words into ``mask.words``.  No column output is written
-/// or allocated.  Supported roots: Bitpack leaf (closed-form), and — the
-/// K1-delta form used for min-max dynamic join filters on orderkey-shaped
+/// Range ballot: decode fused with the inclusive range predicate ``pred``
+/// (decoded integer domain, values widened to int64 for the compare),
+/// producing selection-mask words into ``mask.words``.  No column output is
+/// written or allocated.  Supported roots: Bitpack leaf (closed-form), and —
+/// the delta form used for min-max dynamic join filters on orderkey-shaped
 /// delta->bitpack columns — any value_source-supported root (the chunk is
 /// reconstructed in full in-chunk, then the predicate is balloted; nothing
 /// is stored).  ``mask.num_rows`` must equal ``num_rows`` and
@@ -56,7 +58,7 @@ bool launch_decode_fused_tree_mask_out(codegen::jit::FusedTree const& tree,
                                        ::sirius::codegen::selection_mask& mask,
                                        rmm::cuda_stream_view stream);
 
-/// K3: decode consuming ``mask.words`` + ``mask.chunk_offsets`` (both
+/// Mask walk: decode consuming ``mask.words`` + ``mask.chunk_offsets`` (both
 /// required non-null; chunk_offsets means the CNT wave already ran),
 /// writing compacted output in row order into ``out``.  ``out`` must have
 /// capacity for ``mask.survivor_count`` elements.  Supported tree roots:
@@ -73,9 +75,9 @@ bool launch_decode_fused_tree_mask_consume(codegen::jit::FusedTree const& tree,
                                            void* out,
                                            rmm::cuda_stream_view stream);
 
-/// K4: index-list-consuming compacting decode — the low-selectivity sibling
-/// of K3 (runtime pick by survivor count is the caller's; microbench
-/// crossover ~15% selectivity).  ``row_indices`` is the ascending GLOBAL
+/// Index walk: index-list-consuming compacting decode — the low-selectivity
+/// sibling of the mask walk (the runtime pick by survivor count is the
+/// caller's; microbench crossover ~15% selectivity).  ``row_indices`` is the ascending GLOBAL
 /// int32 row-index list of survivors (the mask->indices wave output,
 /// ``mask.survivor_count`` entries, consistent with ``mask.chunk_offsets``:
 /// chunk c's rows occupy row_indices[chunk_offsets[c] ..
@@ -83,7 +85,7 @@ bool launch_decode_fused_tree_mask_consume(codegen::jit::FusedTree const& tree,
 /// the packed bits); out slot j gets row row_indices[j]'s value.  ``out``
 /// must have capacity for ``mask.survivor_count`` elements.  Bitpack leaf
 /// roots only — Delta roots are rejected at render time (returns false);
-/// fall back to K3-delta.
+/// fall back to the delta mask walk.
 bool launch_decode_fused_tree_index_consume(codegen::jit::FusedTree const& tree,
                                             codegen::jit::LabeledBuffers& labeled,
                                             char const* dtype,
@@ -93,7 +95,7 @@ bool launch_decode_fused_tree_index_consume(codegen::jit::FusedTree const& tree,
                                             void* out,
                                             rmm::cuda_stream_view stream);
 
-/// K5: masked dictionary gather for dictionary->bitpack string columns with
+/// Dictionary gather: masked gather for dictionary->bitpack string columns with
 /// CONSTANT-WIDTH, null-free keys (q1's l_returnflag / l_linestatus).  The
 /// tree is the dictionary INDICES bitpack leaf (codes, int32 domain).  For
 /// survivor rows only, decodes the code and copies the key's
@@ -115,7 +117,7 @@ bool launch_decode_fused_tree_mask_dict_gather(codegen::jit::FusedTree const& tr
                                                void* out_chars,
                                                rmm::cuda_stream_view stream);
 
-/// K6 phase 1: str_split masked survivor metadata.  ``tree``/``labeled``
+/// str_split gather, phase 1: masked survivor metadata.  ``tree``/``labeled``
 /// are the string column's OFFSETS subtree (Bitpack- or Delta-rooted; any
 /// depth below — other roots return false).  ``num_string_rows`` is the
 /// STRING row count n; the offsets column has n+1 elements and the kernel
@@ -127,7 +129,7 @@ bool launch_decode_fused_tree_mask_dict_gather(codegen::jit::FusedTree const& tr
 ///     caller's output-offsets scan / offsets-column rebuild).
 /// Non-survivor chars are never read.  Entropy-coded chars are naturally
 /// out of scope (this touches only the offsets subtree); route those
-/// columns through TierB.
+/// columns through the full-decode-then-gather path.
 bool launch_decode_fused_tree_str_split_meta(codegen::jit::FusedTree const& tree,
                                              codegen::jit::LabeledBuffers& labeled,
                                              char const* dtype,
@@ -137,11 +139,12 @@ bool launch_decode_fused_tree_str_split_meta(codegen::jit::FusedTree const& tree
                                              std::int32_t* lengths_out,
                                              rmm::cuda_stream_view stream);
 
-/// K6 phase 2: fixed (tree-independent, JIT-cached constant source) byte
+/// str_split gather, phase 2: fixed (tree-independent, JIT-cached constant
+/// source) byte
 /// gather from the RAW chars buffer.  For each survivor j in
 /// [0, n_survivors): copies out_offsets[j+1]-out_offsets[j] bytes from
 /// chars[src_offsets[j]] to out_chars[out_offsets[j]].  ``out_offsets`` is
-/// the exclusive scan of K6-phase-1 lengths (n_survivors+1 entries, cudf
+/// the exclusive scan of phase 1's lengths (n_survivors+1 entries, cudf
 /// offsets layout — reuse it directly as the compacted offsets column).
 bool launch_masked_char_copy(void const* chars,
                              std::int64_t const* src_offsets,
@@ -150,10 +153,11 @@ bool launch_masked_char_copy(void const* chars,
                              void* out_chars,
                              rmm::cuda_stream_view stream);
 
-/// K1m2 comparison op codes (kernel parameter, applied as `a OP b`).
+/// Pair-ballot comparison op codes (kernel parameter, applied as `a OP b`).
 enum class pair_cmp : std::int32_t { lt = 0, le = 1, gt = 2, ge = 3 };
 
-/// K1m2: two-column fused pair-predicate mask for two Bitpack-leaf columns
+/// Pair ballot: two-column fused pair-predicate mask for two Bitpack-leaf
+/// columns
 /// of the same table.  Decodes both columns in-chunk and ballots
 /// `a OP b [&& a in range_a && b in range_b]` into ``mask.words`` (same
 /// layout/contract as launch_decode_fused_tree_mask_out).  The columns
@@ -161,8 +165,8 @@ enum class pair_cmp : std::int32_t { lt = 0, le = 1, gt = 2, ge = 3 };
 /// channel lengths; mismatch returns false.  ``labeled_b`` is re-keyed
 /// internally to node 1; both maps get their transients synthesized.  Pass
 /// ``range_a``/``range_b`` = {INT64_MIN, INT64_MAX} when a column has no
-/// constant range (defaulted).  q12-style multi-pair conjunctions = one
-/// launch per pair term, AND-ed by the combine wave.
+/// constant range (defaulted).  A multi-pair conjunction is one launch per
+/// pair term, AND-ed by the combine wave.
 bool launch_decode_fused_tree_pair_mask_out(
   codegen::jit::FusedTree const& tree_a,
   codegen::jit::LabeledBuffers& labeled_a,

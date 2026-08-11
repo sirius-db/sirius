@@ -452,8 +452,8 @@ const char* dtype_to_cxx(const char* dtype)
   return nullptr;
 }
 
-// Trailing kernel arguments for the fused scan-filter decode variants
-// (K1 mask_out / K3 mask_consume).  Defaults = plain decode, no extras.
+// Trailing kernel arguments for the row-selecting decode variants
+// (mask_out / mask_consume).  Defaults = plain decode, no extras.
 // Predicate constants / mask pointers are kernel PARAMETERS so one NVRTC
 // compile per (shape, dtype, variant) covers every literal.
 struct VariantLaunchArgs {
@@ -894,7 +894,7 @@ bool launch_decode_fused_tree(codegen::jit::FusedTree const& tree,
     tree, labeled, dtype, num_rows, out, stream, VariantLaunchArgs{});
 }
 
-// K1: fused decode + range predicate -> selection-mask words (masked_launch.hpp).
+// Range ballot: fused decode + range predicate -> selection-mask words (masked_launch.hpp).
 bool launch_decode_fused_tree_mask_out(codegen::jit::FusedTree const& tree,
                                        codegen::jit::LabeledBuffers& labeled,
                                        char const* dtype,
@@ -916,7 +916,7 @@ bool launch_decode_fused_tree_mask_out(codegen::jit::FusedTree const& tree,
     tree, labeled, dtype, num_rows, /*out=*/mask.words, stream, va);
 }
 
-// K3: masked decode -> compacted output (masked_launch.hpp).
+// Mask walk: masked decode -> compacted output (masked_launch.hpp).
 bool launch_decode_fused_tree_mask_consume(codegen::jit::FusedTree const& tree,
                                            codegen::jit::LabeledBuffers& labeled,
                                            char const* dtype,
@@ -936,7 +936,7 @@ bool launch_decode_fused_tree_mask_consume(codegen::jit::FusedTree const& tree,
   return launch_decode_fused_tree_impl(tree, labeled, dtype, num_rows, out, stream, va);
 }
 
-// K4: index-list-consuming compacting decode (masked_launch.hpp).
+// Index walk: index-list-consuming compacting decode (masked_launch.hpp).
 bool launch_decode_fused_tree_index_consume(codegen::jit::FusedTree const& tree,
                                             codegen::jit::LabeledBuffers& labeled,
                                             char const* dtype,
@@ -957,7 +957,7 @@ bool launch_decode_fused_tree_index_consume(codegen::jit::FusedTree const& tree,
   return launch_decode_fused_tree_impl(tree, labeled, dtype, num_rows, out, stream, va);
 }
 
-// K6 phase 1: str_split masked survivor metadata (masked_launch.hpp).
+// str_split phase 1: masked survivor metadata (masked_launch.hpp).
 bool launch_decode_fused_tree_str_split_meta(codegen::jit::FusedTree const& tree,
                                              codegen::jit::LabeledBuffers& labeled,
                                              char const* dtype,
@@ -988,7 +988,7 @@ bool launch_decode_fused_tree_str_split_meta(codegen::jit::FusedTree const& tree
     tree, labeled, dtype, num_string_rows + 1, src_offsets_out, stream, va);
 }
 
-// K6 phase 2: fixed masked char-range copy (masked_launch.hpp).  Constant
+// str_split phase 2: fixed masked char-range copy (masked_launch.hpp).  Constant
 // source — no tree, no per-column state; compiled once via the shared JIT
 // cache (in-memory + on-disk cubin) like every rendered kernel.
 namespace {
@@ -1061,7 +1061,7 @@ bool launch_masked_char_copy(void const* chars,
   return true;
 }
 
-// K1m2: two-column fused pair-predicate mask (masked_launch.hpp).
+// Pair ballot: two-column pair-predicate mask (masked_launch.hpp).
 bool launch_decode_fused_tree_pair_mask_out(codegen::jit::FusedTree const& tree_a,
                                             codegen::jit::LabeledBuffers& labeled_a,
                                             char const* dtype_a,
@@ -1200,7 +1200,7 @@ bool launch_decode_fused_tree_pair_mask_out(codegen::jit::FusedTree const& tree_
   }
 }
 
-// K5: masked constant-width dictionary gather (masked_launch.hpp).
+// Dictionary gather: masked constant-width gather (masked_launch.hpp).
 bool launch_decode_fused_tree_mask_dict_gather(codegen::jit::FusedTree const& tree,
                                                codegen::jit::LabeledBuffers& labeled,
                                                char const* dtype,

@@ -1,22 +1,22 @@
-// Fused scan-filter decode variants (K1 mask_out / K3 mask_consume) —
+// Row-selecting decode variants (mask_out / mask_consume) —
 // correctness roundtrip against plain decode + host-side filtering.
 //
 // Pipeline under test (production entry points, not test re-implementations):
 //   gpu_encode_tree (real encode kernel, OverAllocate)  ->  host compaction to
 //   the dense Compact ``packed`` layout the production decode contract expects
 //   ->  launch_decode_fused_tree           (plain reference)
-//   ->  launch_decode_fused_tree_mask_out  (K1: decode+range-pred -> mask)
+//   ->  launch_decode_fused_tree_mask_out  (the range ballot: decode+range-pred -> mask)
 //   ->  host CNT-equivalent (per-chunk popcount + exclusive scan)
-//   ->  launch_decode_fused_tree_mask_consume (K3: masked compacting decode)
+//   ->  launch_decode_fused_tree_mask_consume (the mask walk: masked compacting decode)
 //
 // Verified properties:
 //   1. plain render is byte-identical with and without the variant argument,
 //      and the mask variants get distinct entry symbols + sources (their own
 //      JIT-cache entries); non-Bitpack-leaf roots are rejected.
-//   2. K1 mask words match a host-computed mask bit-for-bit, INCLUDING the
+//   2. ballot mask words match a host-computed mask bit-for-bit, INCLUDING the
 //      zeroed tail bits/words of a partial last chunk (buffer is pre-filled
 //      0xFF to prove the kernel writes the zeros).
-//   3. K3 compacted output equals plain-decode + host filter, row order
+//   3. mask-walk compacted output equals plain-decode + host filter, row order
 //      preserved, for mid/all/none selectivities; a zero-survivor chunk
 //      exercises the in-kernel early return; a constant (bits==0) chunk
 //      exercises the chunk_min short-circuit.
@@ -82,7 +82,7 @@ std::uint64_t splitmix64(std::uint64_t& s)
 // Chunk-shaped test data: base + [0, range) pseudo-random, with
 //   chunk 2 = constant (bits==0 short-circuit),
 //   chunk 4 = confined to the top quarter of the domain (zero survivors
-//             under the mid-selectivity predicate -> K3 early return).
+//             under the mid-selectivity predicate -> mask-walk early return).
 template <typename Element>
 std::vector<Element> gen_data(std::int64_t n, std::int64_t base, std::int64_t range)
 {
@@ -168,8 +168,8 @@ bool compact_packed_on_host(GpuEncoded& enc, std::int64_t nc, std::int32_t node_
 }
 
 // Arbitrary host-side selection mask (the consuming variants accept ANY mask,
-// e.g. one ANDed together from other columns' K1 outputs): ~keep_pct% bits
-// set, chunk ``zero_chunk`` fully cleared (K3/K5 early-return path), tail
+// e.g. one ANDed together from other columns' ballot outputs): ~keep_pct% bits
+// set, chunk ``zero_chunk`` fully cleared (mask-walk early-return path), tail
 // bits/words beyond n zero (contract).
 std::vector<std::uint32_t> make_host_mask(
   std::int64_t n, std::int64_t nc, unsigned seed, unsigned keep_pct, std::int64_t zero_chunk)
@@ -227,7 +227,7 @@ bool run_roundtrip(const std::string& dtype, std::int64_t base, std::int64_t ran
              cudaMemcpyDeviceToHost);
   REQUIRE_MSG(plain == data, "[%s] plain decode != original input", dtype.c_str());
 
-  // --- K1 -> host CNT-equivalent -> K3 for three selectivities. ------------
+  // --- Range ballot -> host CNT-equivalent -> mask walk, for three selectivities. ---
   const range_predicate preds[] = {
     {base + range / 4, base + range / 2},  // mid (chunk 4 has zero survivors)
     {base, base + range},                  // all pass
@@ -264,7 +264,7 @@ bool run_roundtrip(const std::string& dtype, std::int64_t base, std::int64_t ran
       mask_dev.data(), reinterpret_cast<const void*>(d_mask), nwords * 4, cudaMemcpyDeviceToHost);
     const std::vector<std::uint32_t> mask_ref = host_mask(data, nc, preds[p]);
     REQUIRE_MSG(mask_dev == mask_ref,
-                "[%s/%s] K1 mask mismatch vs host reference",
+                "[%s/%s] range ballot mask mismatch vs host reference",
                 dtype.c_str(),
                 pred_names[p]);
 
@@ -316,12 +316,12 @@ bool run_roundtrip(const std::string& dtype, std::int64_t base, std::int64_t ran
                  cudaMemcpyDeviceToHost);
     }
     REQUIRE_MSG(got == expect,
-                "[%s/%s] K3 compacted output != plain decode + host filter (%zu survivors)",
+                "[%s/%s] mask-walk compacted output != plain decode + host filter (%zu survivors)",
                 dtype.c_str(),
                 pred_names[p],
                 expect.size());
 
-    // K4 (index_consume) must produce the exact same compacted output from
+    // The index walk (index_consume) must produce the exact same compacted output from
     // the ascending global row-index list (mask->indices wave equivalent).
     std::vector<std::int32_t> row_indices;
     row_indices.reserve(static_cast<std::size_t>(survivors));
@@ -356,7 +356,7 @@ bool run_roundtrip(const std::string& dtype, std::int64_t base, std::int64_t ran
                  cudaMemcpyDeviceToHost);
     }
     REQUIRE_MSG(got4 == expect,
-                "[%s/%s] K4 index-list output != K3/host reference (%zu survivors)",
+                "[%s/%s] index-walk output != the mask-walk/host reference (%zu survivors)",
                 dtype.c_str(),
                 pred_names[p],
                 expect.size());
@@ -368,7 +368,7 @@ bool run_roundtrip(const std::string& dtype, std::int64_t base, std::int64_t ran
                 static_cast<long long>(n));
   }
 
-  // K4 singleton: exactly one listed row (deep in a late chunk) — exercises
+  // Index-walk singleton: exactly one listed row (deep in a late chunk) — exercises
   // the one-survivor block path and all-other-blocks early return.
   {
     const std::int64_t row = 3 * kChunk + 321;
@@ -378,7 +378,7 @@ bool run_roundtrip(const std::string& dtype, std::int64_t base, std::int64_t ran
     const std::int32_t idx_host = static_cast<std::int32_t>(row);
 
     selection_mask sm1;
-    sm1.words         = reinterpret_cast<std::uint32_t*>(d_plain);  // unused by K4
+    sm1.words         = reinterpret_cast<std::uint32_t*>(d_plain);  // unused by the index walk
     sm1.num_rows      = n;
     sm1.chunk_offsets = reinterpret_cast<std::uint32_t*>(
       enc.upload_bytes(chunk_offsets.data(), chunk_offsets.size() * 4));
@@ -395,22 +395,22 @@ bool run_roundtrip(const std::string& dtype, std::int64_t base, std::int64_t ran
                   reinterpret_cast<const std::int32_t*>(d_idx1),
                   reinterpret_cast<void*>(d_out1),
                   stream),
-                "[%s] K4 singleton launch failed",
+                "[%s] index-walk singleton launch failed",
                 dtype.c_str());
     Element got1{};
     cudaMemcpy(
       &got1, reinterpret_cast<const void*>(d_out1), sizeof(Element), cudaMemcpyDeviceToHost);
     REQUIRE_MSG(got1 == data[static_cast<std::size_t>(row)],
-                "[%s] K4 singleton decoded wrong value",
+                "[%s] index-walk singleton decoded wrong value",
                 dtype.c_str());
     std::printf("PASS: %s k4-singleton (row=%lld)\n", dtype.c_str(), static_cast<long long>(row));
   }
   return true;
 }
 
-// K3-delta: masked compacting decode of a delta->bitpack column
+// the delta mask walk: masked compacting decode of a delta->bitpack column
 // (o_orderkey shape).  The mask is host-generated (arbitrary — in
-// production it comes from other columns' K1 wave), CNT-equivalent on
+// production it comes from other columns' ballot wave), CNT-equivalent on
 // host, then mask_consume must equal plain decode + host filter.
 template <typename Element>
 bool run_delta_masked(const std::string& dtype, int arch)
@@ -479,7 +479,7 @@ bool run_delta_masked(const std::string& dtype, int arch)
                cudaMemcpyDeviceToHost);
   }
   REQUIRE_MSG(got == expect,
-              "[delta/%s] K3-delta compacted output != plain decode + host filter (%lld "
+              "[delta/%s] the delta mask walk compacted output != plain decode + host filter (%lld "
               "survivors)",
               dtype.c_str(),
               static_cast<long long>(survivors));
@@ -488,7 +488,7 @@ bool run_delta_masked(const std::string& dtype, int arch)
               static_cast<long long>(survivors),
               static_cast<long long>(n));
 
-  // K1-delta (mask_out on the delta root): fused range predicate over the
+  // Delta ballot (mask_out on the delta root): fused range predicate over the
   // fully reconstructed values -> mask words, no column output.  Data is
   // monotone, so a value band selects a contiguous row band; also all/none.
   {
@@ -521,7 +521,7 @@ bool run_delta_masked(const std::string& dtype, int arch)
                  cudaMemcpyDeviceToHost);
       const std::vector<std::uint32_t> ref_mask = host_mask(data, nc, preds[p]);
       REQUIRE_MSG(got_mask == ref_mask,
-                  "[delta-k1/%s/%s] K1-delta mask != host reference",
+                  "[delta-ballot/%s/%s] delta ballot mask != host reference",
                   dtype.c_str(),
                   names[p]);
       std::printf("PASS: delta-k1/%s/%s\n", dtype.c_str(), names[p]);
@@ -530,7 +530,7 @@ bool run_delta_masked(const std::string& dtype, int arch)
   return true;
 }
 
-// K5: masked constant-width dictionary gather.  Codes are bitpacked int32
+// the dictionary gather: masked constant-width dictionary gather.  Codes are bitpacked int32
 // (q1's l_returnflag/l_linestatus are width-1, 2-3 keys); the kernel must
 // copy exactly the survivors' key bytes, compacted, in row order.
 bool run_dict_gather(std::int32_t key_width, int arch)
@@ -606,7 +606,7 @@ bool run_dict_gather(std::int32_t key_width, int arch)
       got.data(), reinterpret_cast<const void*>(d_out), got.size(), cudaMemcpyDeviceToHost);
   }
   REQUIRE_MSG(got == expect,
-              "[dict/w%d] K5 gathered chars != host reference (%lld survivors)",
+              "[dict/w%d] dictionary-gathered chars != host reference (%lld survivors)",
               key_width,
               static_cast<long long>(survivors));
   std::printf("PASS: dict/w%d (survivors=%lld of %lld)\n",
@@ -616,7 +616,7 @@ bool run_dict_gather(std::int32_t key_width, int arch)
   return true;
 }
 
-// K6: str_split masked survivor meta + fixed char copy.  `deep` = c_phone
+// the str_split gather: str_split masked survivor meta + fixed char copy.  `deep` = c_phone
 // shape (offsets->delta->rle->bitpack, constant length 15); shallow =
 // l_shipmode shape (offsets->bitpack, variable lengths 3..12).
 bool run_str_split_masked(bool deep, int arch)
@@ -730,7 +730,7 @@ bool run_str_split_masked(bool deep, int arch)
     }
   }
   REQUIRE_MSG(src_got == src_ref && len_got == len_ref,
-              "[%s] K6 meta (src offsets / lengths) != host reference (%lld survivors)",
+              "[%s] str_split meta (src offsets / lengths) != host reference (%lld survivors)",
               tag,
               static_cast<long long>(survivors));
 
@@ -756,7 +756,7 @@ bool run_str_split_masked(bool deep, int arch)
                cudaMemcpyDeviceToHost);
   }
   REQUIRE_MSG(chars_got == chars_ref,
-              "[%s] K6 gathered chars != host reference (%zu bytes)",
+              "[%s] str_split gathered chars != host reference (%zu bytes)",
               tag,
               chars_ref.size());
   std::printf("PASS: %s (survivors=%lld of %lld, %zu chars)\n",
@@ -767,7 +767,7 @@ bool run_str_split_masked(bool deep, int arch)
   return true;
 }
 
-// K1m2: two-column pair predicate truth table (diffs in {-1,0,+1} so the
+// the pair ballot: two-column pair predicate truth table (diffs in {-1,0,+1} so the
 // equal-values boundary is dense), plus a constant-range AND and the
 // chunk-geometry-mismatch rejection.
 bool run_pair_mask(int arch)
@@ -845,7 +845,7 @@ bool run_pair_mask(int arch)
       if (c.ranged) pass = pass && av >= a_range.lo && av <= a_range.hi;
       if (pass) ref[static_cast<std::size_t>(r) / 32] |= (1u << (r % 32));
     }
-    REQUIRE_MSG(got == ref, "[pair/%s] K1m2 mask != host truth table", c.name);
+    REQUIRE_MSG(got == ref, "[pair/%s] pair ballot mask != host truth table", c.name);
     std::printf("PASS: pair/%s\n", c.name);
   }
 
@@ -1060,8 +1060,8 @@ bool render_checks()
                 k1.source.find("pred_hi") != std::string::npos,
               "mask_out source must take pred_lo/pred_hi kernel params");
 
-  // 3. Delta root: mask_out AND mask_consume both render (K1-delta via the
-  //    generic value_source seam; K3-delta tuned), each with its own symbol
+  // 3. Delta root: mask_out AND mask_consume both render (the delta ballot via the
+  //    generic value_source seam; the delta mask walk tuned), each with its own symbol
   //    + source.
   auto delta =
     jit::FusedTree::make(OpKind::Delta, {{"differences", jit::FusedTree::make(OpKind::Bitpack)}});
@@ -1069,31 +1069,31 @@ bool render_checks()
   const cdj::DecodeKernelSpec dplain = cdj::render(*delta, "int64_t", 8);
   const cdj::DecodeKernelSpec dk1    = cdj::render(*delta, "int64_t", 8, cdj::kShapeMaskOut);
   REQUIRE_MSG(dk1.entry_symbol == dplain.entry_symbol + "_mask_out",
-              "K1-delta entry symbol suffix wrong: %s",
+              "delta-ballot entry symbol suffix wrong: %s",
               dk1.entry_symbol.c_str());
-  REQUIRE_MSG(dk1.source.find("K1-generic") != std::string::npos &&
+  REQUIRE_MSG(dk1.source.find("selection mask (generic)") != std::string::npos &&
                 dk1.source.find("pred_lo") != std::string::npos &&
                 dk1.buffers.size() == dplain.buffers.size(),
-              "K1-delta must render via the generic seam with pred params, same manifest");
+              "the delta ballot must render via the generic seam with pred params, same manifest");
   const cdj::DecodeKernelSpec dmask = cdj::render(*delta, "int64_t", 8, cdj::kShapeMaskConsume);
   REQUIRE_MSG(dmask.entry_symbol == dplain.entry_symbol + "_mask_consume",
-              "K3-delta entry symbol suffix wrong: %s",
+              "the delta mask walk entry symbol suffix wrong: %s",
               dmask.entry_symbol.c_str());
   REQUIRE_MSG(dmask.source != dplain.source && dmask.buffers.size() == dplain.buffers.size(),
-              "K3-delta must differ in source only, not in the channel manifest");
+              "the delta mask walk must differ in source only, not in the channel manifest");
 
-  // 4. K5 dict gather: bitpack code leaf only; distinct symbol; key pool +
+  // 4. Dictionary gather: bitpack code leaf only; distinct symbol; key pool +
   //    width are kernel params (never literals in the source).
   const cdj::DecodeKernelSpec k5  = cdj::render(*bp, "int32_t", 8, cdj::kShapeDictGather);
   const cdj::DecodeKernelSpec p32 = cdj::render(*bp, "int32_t", 8);
   REQUIRE_MSG(k5.entry_symbol == p32.entry_symbol + "_mask_dict",
-              "K5 entry symbol suffix wrong: %s",
+              "dictionary-gather entry symbol suffix wrong: %s",
               k5.entry_symbol.c_str());
   REQUIRE_MSG(k5.source.find("keys_chars") != std::string::npos &&
                 k5.source.find("key_width") != std::string::npos,
-              "K5 source must take keys_chars/key_width kernel params");
+              "dictionary-gather source must take keys_chars/key_width kernel params");
   REQUIRE_MSG(k5.buffers.size() == p32.buffers.size(),
-              "K5 must not change the input-channel manifest");
+              "dictionary gather must not change the input-channel manifest");
   rejected = false;
   try {
     (void)cdj::render(*delta, "int64_t", 8, cdj::kShapeDictGather);
@@ -1102,19 +1102,19 @@ bool render_checks()
   }
   REQUIRE_MSG(rejected, "mask_dict_gather on a Delta root must throw RenderError");
 
-  // 5. K4 index_consume: bitpack leaf only; own symbol; index list + offsets
-  //    are kernel params; delta roots rejected (fall back to K3-delta).
+  // 5. Index walk (index_consume): bitpack leaf only; own symbol; index list + offsets
+  //    are kernel params; delta roots rejected (fall back to the delta mask walk).
   const cdj::DecodeKernelSpec k4 = cdj::render(*bp, "int64_t", 8, cdj::kShapeIndexConsume);
   REQUIRE_MSG(k4.entry_symbol == s3.entry_symbol + "_index_consume",
-              "K4 entry symbol suffix wrong: %s",
+              "index-walk entry symbol suffix wrong: %s",
               k4.entry_symbol.c_str());
   REQUIRE_MSG(k4.source.find("row_indices") != std::string::npos &&
                 k4.source.find("chunk_offsets") != std::string::npos,
-              "K4 source must take row_indices/chunk_offsets kernel params");
+              "index-walk source must take row_indices/chunk_offsets kernel params");
   REQUIRE_MSG(k4.buffers.size() == s3.buffers.size(),
-              "K4 must not change the input-channel manifest");
+              "index walk must not change the input-channel manifest");
   REQUIRE_MSG(k4.source != k3.source && k4.source != s3.source,
-              "K4 source must be distinct (JIT-cache separation)");
+              "index-walk source must be distinct (JIT-cache separation)");
   rejected = false;
   try {
     (void)cdj::render(*delta, "int64_t", 8, cdj::kShapeIndexConsume);
@@ -1123,15 +1123,15 @@ bool render_checks()
   }
   REQUIRE_MSG(rejected, "index_consume on a Delta root must throw RenderError");
 
-  // 6. K6 str_split_meta: bitpack + delta roots render (with the next-chunk
+  // 6. str_split_meta: bitpack + delta roots render (with the next-chunk
   //    peek), rle root rejected; params not literals.
   const cdj::DecodeKernelSpec k6 = cdj::render(*bp, "int32_t", 8, cdj::kShapeStrSplitMeta);
   REQUIRE_MSG(k6.entry_symbol == p32.entry_symbol + "_str_meta",
-              "K6 entry symbol suffix wrong: %s",
+              "str_split_meta entry symbol suffix wrong: %s",
               k6.entry_symbol.c_str());
   REQUIRE_MSG(
     k6.source.find("len_out") != std::string::npos && k6.source.find("next0") != std::string::npos,
-    "K6 source must take len_out and emit the next-chunk peek");
+    "str_split_meta source must take len_out and emit the next-chunk peek");
   auto deep_offsets = jit::FusedTree::make(
     OpKind::Delta,
     {{"differences",
@@ -1141,7 +1141,7 @@ bool render_checks()
   const cdj::DecodeKernelSpec k6d =
     cdj::render(*deep_offsets, "int32_t", 8, cdj::kShapeStrSplitMeta);
   REQUIRE_MSG(k6d.source.find("delta_first_0[chunk_id + 1]") != std::string::npos,
-              "K6 delta root must peek delta_first[chunk_id+1]");
+              "str_split_meta delta root must peek delta_first[chunk_id+1]");
   rejected = false;
   try {
     auto rle_root = jit::FusedTree::make(OpKind::Rle,
@@ -1159,10 +1159,10 @@ bool render_checks()
     jit::FusedTree::make(OpKind::For, {{"deltas", jit::FusedTree::make(OpKind::Bitpack)}});
   const cdj::DecodeKernelSpec kfor = cdj::render(*for_tree, "int64_t", 8, cdj::kShapeMaskConsume);
   REQUIRE_MSG(kfor.entry_symbol.find("_mask_consume") != std::string::npos &&
-                kfor.source.find("K3-generic") != std::string::npos,
+                kfor.source.find("compacted output (generic)") != std::string::npos,
               "FOR-rooted mask_consume must render via the generic seam");
 
-  // 8. K1m2 pair mask: combined symbol, params-not-constants, both columns'
+  // 8. Pair ballot: combined symbol, params-not-constants, both columns'
   //    channels distinct; self-pair and non-bitpack columns rejected.
   const cdj::DecodeKernelSpec kp =
     cdj::render_pair_mask(*bp, "int32_t", *for_tree->children.at("deltas"), "int32_t", 8);
@@ -1220,13 +1220,13 @@ int main(int argc, char** argv)
     // int64 compare path is exercised on genuinely 64-bit decoded values.
     run_roundtrip<std::int32_t>("int32_t", 8035, 2526, arch);
     run_roundtrip<std::int64_t>("int64_t", 3'000'000'000LL, 5052, arch);
-    // Iteration 3: K3-delta (o_orderkey shape) and K5 dict gather (q1 shape).
+    // The delta mask walk (o_orderkey shape) and the dictionary gather (q1 shape).
     run_delta_masked<std::int64_t>("int64_t", arch);
     run_delta_masked<std::int32_t>("int32_t", arch);
     run_dict_gather(/*key_width=*/1, arch);  // l_returnflag / l_linestatus
     run_dict_gather(/*key_width=*/4, arch);  // constant-width generality
-    // Iteration 5: K6 str_split gather (l_shipmode / c_phone shapes) and
-    // K1m2 pair predicates (q12 shape).
+    // The str_split gather (l_shipmode / c_phone shapes) and
+    // Pair predicates (q12 shape).
     run_str_split_masked(/*deep=*/false, arch);
     run_str_split_masked(/*deep=*/true, arch);
     run_pair_mask(arch);

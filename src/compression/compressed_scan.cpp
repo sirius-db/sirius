@@ -442,7 +442,7 @@ std::unique_ptr<cudf::table> decode_with_filters(simpatico::compressed_table con
   // partially applied request must leave the batch untagged so the scan
   // evaluates the residual (re-checking already-applied conjuncts on the
   // surviving rows is idempotent).
-  if (result.status == sirius::codegen::scan_filter_status::bailed_high_selectivity) {
+  if (result.status == sirius::codegen::scan_filter_status::declined_unselective) {
     outcome.selection_unprofitable = true;
   } else if (result.applied && plan.covers_whole_filter) {
     outcome.row_filtered = true;
@@ -541,7 +541,7 @@ compressed_scan::compaction_forecast compressed_scan::forecast_compaction(
     if (!plan_tree) { return forecast; }
     if (!simpatico::plan_supports_selection_decode(*plan_tree)) { return forecast; }
     any_unbounded = any_unbounded || simpatico::plan_selection_tier(*plan_tree) ==
-                                       sirius::codegen::output_tier::tier_dict_k5;
+                                       sirius::codegen::output_tier::tier_dict_gather;
   }
   forecast.compacts          = true;
   forecast.survivors_bounded = !any_unbounded;

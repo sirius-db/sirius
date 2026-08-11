@@ -222,39 +222,37 @@ std::unique_ptr<cudf::table> decompress(
 /// out-of-range index or a column with no plan tree.
 bool column_supports_predicate_decode(const compressed_table& table, std::size_t column_index);
 
-/// Fused scan-filter decompress (experimental, env gate
-/// SIRIUS_EXP_FUSED_SCAN_FILTER=1). @p request carries the scan's
-/// decode-resolvable range conjuncts plus the TierA/TierB tag per selected
-/// output column (built by the scan-side extraction; see
-/// codegen/selection/selection.hpp).
+/// Decompress a column subset with the caller's row filter applied DURING the
+/// decode (experimental, env gate SIRIUS_EXP_FUSED_SCAN_FILTER=1). @p request
+/// carries the conjuncts a decode can resolve plus the output shape tag per
+/// selected column (see codegen/selection/selection.hpp).
 ///
 /// When the gate is on and every precondition holds, columns are decoded with
-/// the two-wave mask pipeline: wave 1 runs the K1 mask variants for the filter
-/// columns, the masks are AND-combined and counted (one host sync for the
-/// survivor count), then wave 2 decodes TierA columns directly to compacted
-/// survivor_count-row columns and TierB columns full-width as today.
-/// @p result comes back with applied=true, the selection mask/offsets, and the
-/// TierB gather map (row_indices) — the caller gathers TierB survivors
-/// scan-side and skips its post-decompress filter pass.
+/// the two-wave mask pipeline: wave 1 ballots each filter column's rows into
+/// mask words, the masks are AND-combined and counted (one host sync for the
+/// survivor count), then wave 2 decodes the compactable columns straight into
+/// survivor_count-row columns and the rest full width. @p result comes back
+/// with applied=true, the selection mask/offsets, and the gather map
+/// (row_indices) for the full-width columns — the caller compacts those and
+/// skips its own filter pass.
 ///
 /// When the gate is off, @p request is empty, or any precondition fails
-/// (non-bitpack filter column, nulls, ...), this is EXACTLY the classic
+/// (non-bitpack filter column, nulls, ...), this is EXACTLY the unfiltered
 /// decompress(table, selected_columns, pool, mr) — same kernels, same
 /// allocations — returned as released columns, and result.applied is false.
 /// result.status refines the applied=false cases: `refused` (no device work),
-/// `bailed_high_selectivity` (RULE-2 post-CNT bail — the scan side should
-/// memoize this per operator and strip the range pushdown from the scan's
+/// `declined_unselective` (too many rows survived for compaction to pay off —
+/// the caller should remember this per scan and drop the row selection from its
 /// remaining batches), or `failed` (mid-flight fallback, exceptional).
 ///
-/// Dict-code equality/IN conjuncts ride INSIDE the request
-/// (scan_filter_request::bool8_filters, iteration 3): wave 1 resolves them via
-/// the shipped decode_predicate pushdown, packs the BOOL8 result to mask words
-/// and ANDs it into the batch mask. On ANY non-applied outcome
-/// (refused/bailed/failed) with bool8_filters present, the classic rerun is
-/// the PREDICATED decompress — those columns come back as BOOL8 substitution
-/// columns exactly like the classic pushdown, never a plain decode (the dict
-/// win survives every fallback). Callers must therefore be ready for BOOL8 at
-/// bool8_filter columns whenever result.applied is false.
+/// Equality conjuncts answerable off a dictionary ride INSIDE the request
+/// (scan_filter_request::bool8_filters): wave 1 resolves them via the
+/// decode_predicate path, packs the BOOL8 result to mask words and ANDs it into
+/// the batch mask. On ANY non-applied outcome with bool8_filters present, the
+/// rerun is the PREDICATED decompress — those columns come back as BOOL8
+/// substitution columns exactly like the ordinary pushdown, never a plain
+/// decode (the dictionary win survives every fallback). Callers must therefore
+/// be ready for BOOL8 at those columns whenever result.applied is false.
 std::vector<std::unique_ptr<cudf::column>> decompress_scan_filter(
   const compressed_table& table,
   std::span<const std::size_t> selected_columns,

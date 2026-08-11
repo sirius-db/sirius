@@ -56,16 +56,16 @@
 
 namespace codegen::decode::jit {
 
-// Kernel variant for the fused scan-filter pipeline (experimental; engine
-// gate SIRIUS_EXP_FUSED_SCAN_FILTER lives in the wave orchestrator, not
-// here).  The variant changes the rendered source AND the entry symbol, so
+// Kernel variants that evaluate a scan's filter while decoding (experimental;
+// the engine gate SIRIUS_EXP_FUSED_SCAN_FILTER lives in the wave orchestrator,
+// not here).  The variant changes the rendered source AND the entry symbol, so
 // each variant gets its own JIT-cache entry automatically; predicate
 // constants and mask/offset pointers are KERNEL PARAMETERS (appended after
 // `out, n`), never baked into the source — one compile covers all literals.
 //
 //   * plain        — full-column decode, today's behaviour (byte-identical
 //                    source to the pre-variant renderer).
-//   * mask_out     — K1: decode fused with an inclusive [lo,hi] range
+//   * mask_out     — decode fused with an inclusive [lo,hi] range
 //                    predicate on the decoded integer domain, producing
 //                    selection-mask words (row r -> bit r%32 of word r/32;
 //                    32 words per 1024-row chunk, tail bits and tail words
@@ -77,11 +77,12 @@ namespace codegen::decode::jit {
 //                    leaf (closed-form, skips nothing but stores nothing),
 //                    and — for delta->bitpack orderkey shapes, the
 //                    decode-evaluable form of min-max dynamic join
-//                    filters — any value_source-supported root (K1-delta:
+//                    filters — any value_source-supported root (the delta
+//                    form:
 //                    the chunk is reconstructed IN FULL via the existing
 //                    emitters, then the predicate is balloted from the
 //                    staged values, keeping the mask-word alignment).
-//   * mask_consume — K3: decode consuming a selection mask plus per-chunk
+//   * mask_consume — decode consuming a selection mask plus per-chunk
 //                    exclusive survivor offsets (`chunk_offsets[c]` =
 //                    compacted output base of chunk c, length
 //                    num_chunks+1), writing compacted output in row order.
@@ -97,22 +98,22 @@ namespace codegen::decode::jit {
 //                        the downstream compaction pass, not the unpack.
 //                    Extra params: `const uint32_t* sel_mask, const
 //                    uint32_t* chunk_offsets`.
-//   * index_consume — K4: Bitpack-LEAF-root decode consuming an int32 ROW-
+//   * index_consume — Bitpack-LEAF-root decode consuming an int32 ROW-
 //                    INDEX LIST (global row ids, ascending — the
 //                    mask->indices wave output) plus the same per-chunk
-//                    exclusive survivor offsets as K3.  Block c reads its
+//                    exclusive survivor offsets as mask_consume.  Block c reads its
 //                    slice row_indices[chunk_offsets[c] ..
 //                    chunk_offsets[c+1]) and random-access decodes ONLY
 //                    those rows into compacted output — no mask-word
 //                    staging, per-block work scales with the chunk's
-//                    survivor count, so it beats K3 at low selectivity
-//                    (the runtime K3-vs-K4 pick is the caller's).  Delta
+//                    survivor count, so it beats the mask walk at low
+//                    selectivity (the runtime pick is the caller's).  Delta
 //                    roots are rejected (sequential reconstruction cannot
-//                    row-skip — callers fall back to K3-delta).  Extra
+//                    row-skip — callers fall back to the delta mask walk).  Extra
 //                    params: `const int32_t* row_indices, const uint32_t*
 //                    chunk_offsets`.
-//   * mask_dict_gather — K5: Bitpack-LEAF-root decode of DICTIONARY CODES
-//                    consuming the selection mask like K3, but instead of
+//   * mask_dict_gather — Bitpack-LEAF-root decode of DICTIONARY CODES
+//                    consuming the selection mask like mask_consume, but instead of
 //                    storing the code it gathers the key's bytes from a
 //                    CONSTANT-WIDTH, null-free key pool straight into the
 //                    compacted chars output (survivor rank r of chunk c
@@ -125,7 +126,7 @@ namespace codegen::decode::jit {
 // Unsupported (shape, variant) combinations are rejected with RenderError
 // (e.g. RLE cannot row-skip — run expansion; dict gather needs a bitpack
 // code leaf).
-//   * str_split_meta — K6 phase 1: for `input -> str_split -> {offsets
+//   * str_split_meta — for `input -> str_split -> {offsets
 //                    subtree, raw chars}` string columns, the tree passed
 //                    is the OFFSETS subtree (any value_source-decodable
 //                    cascade — bitpack, delta->rle->bitpack, ...; its ROOT
@@ -153,16 +154,16 @@ namespace codegen::decode::jit {
 // edits to a variant enum, two parameter switches, a launcher and a probe.
 enum class Enumerator : std::uint8_t {
   all_rows = 0,  ///< every row of the chunk (full-width decode)
-  mask_bits,     ///< survivors of a selection mask, compacted by rank (K3)
-  index_list,    ///< an ascending survivor row-id list, compacted by slot (K4)
+  mask_bits,     ///< survivors of a selection mask, compacted by rank
+  index_list,    ///< an ascending survivor row-id list, compacted by slot
 };
 
 enum class Consumer : std::uint8_t {
-  write_column = 0,  ///< store the reconstructed value (plain / K3 / K4)
-  ballot_range,      ///< 1 tree: compare against [lo,hi], ballot to mask words (K1)
-  ballot_pair,       ///< 2 trees: `a OP b` + optional per-side ranges (K1m2)
-  dict_gather,       ///< copy the code's fixed-width key bytes to compacted chars (K5)
-  offsets_meta,      ///< emit survivor {source char offset, length} (K6 phase 1)
+  write_column = 0,  ///< store the reconstructed value
+  ballot_range,      ///< 1 tree: compare against [lo,hi], ballot to mask words
+  ballot_pair,       ///< 2 trees: `a OP b` + optional per-side ranges
+  dict_gather,       ///< copy the code's fixed-width key bytes to compacted chars
+  offsets_meta,      ///< emit survivor {source char offset, length}
 };
 
 struct DecodeShape {
@@ -171,8 +172,8 @@ struct DecodeShape {
   friend bool operator==(DecodeShape, DecodeShape) = default;
 };
 
-// The shipped points of the product.  The names map onto the K-numbers used
-// throughout the fused scan-filter code and in masked_launch.hpp.
+// The shipped points of the product; masked_launch.hpp declares one launcher
+// per point.
 inline constexpr DecodeShape kShapePlain{Enumerator::all_rows, Consumer::write_column};
 inline constexpr DecodeShape kShapeMaskOut{Enumerator::all_rows, Consumer::ballot_range};
 inline constexpr DecodeShape kShapePairMask{Enumerator::all_rows, Consumer::ballot_pair};
@@ -273,7 +274,7 @@ DecodeKernelSpec render(const ::codegen::jit::FusedTree& tree,
                         std::int32_t num_chunks,
                         DecodeShape shape = kShapePlain);
 
-// K1m2: two-column fused pair-predicate mask (`a OP b`, optionally AND-ed
+// Pair ballot: two-column pair-predicate mask (`a OP b`, optionally AND-ed
 // with per-column constant ranges) for two Bitpack-LEAF columns of the SAME
 // table (identical chunk geometry — the launcher must verify chunk_count
 // match).  One kernel decodes both columns in-chunk and ballots the

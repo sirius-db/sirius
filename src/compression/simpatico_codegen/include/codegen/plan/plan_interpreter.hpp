@@ -81,7 +81,7 @@ std::unique_ptr<compressed_representation> compress_single_op(std::string const&
                                                               rmm::device_async_resource_ref mr,
                                                               std::string* error_out);
 
-/// Per-column decode-time row selection for the fused scan-filter pipeline
+/// Per-column decode-time row selection
 /// (`SIRIUS_EXP_FUSED_SCAN_FILTER`). Built by the wave-2 orchestrator in
 /// ``decompress_columns_parallel`` AFTER the combine + CNT wave fixed the
 /// survivor count; never active on the default path (gate off ⇒ callers pass
@@ -92,9 +92,9 @@ std::unique_ptr<compressed_representation> compress_single_op(std::string const&
 ///    region decodes with the mask via the mask_consume launcher (bitpack or
 ///    delta->bitpack roots) and writes compacted output directly — the output
 ///    column is allocated count-first with ``survivor_count`` rows.
-///  * ``dict_compact`` (dict-K5): for a ``dictionary``-rooted string plan whose
-///    ``indices`` channel is bitpack-compressed, the CODE region decodes with
-///    the mask (K3 over the dictionary codes), and the key-chars gather runs
+///  * ``dict_compact``: for a ``dictionary``-rooted string plan whose
+///    ``indices`` channel is bitpack-compressed, the CODE region decodes under
+///    the mask, and the key-chars gather runs
 ///    over the compacted codes only — the strings column comes back
 ///    survivor-sized without a full-width chars materialization.
 ///  * neither (Tier B): the column decodes full width exactly as today, then
@@ -112,25 +112,26 @@ struct decode_selection {
   cudf::column_view survivor_indices{};
   /// True when the plan's root region consumes the mask in-kernel (Tier A).
   bool compact_capable = false;
-  /// True for the dict-K5 mode above. Mutually exclusive with
+  /// True for the dictionary-gather mode above. Mutually exclusive with
   /// @c compact_capable; gate on @c plan_supports_dict_selection_decode.
   bool dict_compact = false;
-  /// Track B: prefer the index-list payload decode (K4) over the mask walk
-  /// (K3). Only meaningful with @c compact_capable; bitpack LEAF roots route
-  /// to ``launch_decode_fused_tree_index_consume`` over @c survivor_indices,
-  /// delta roots IGNORE it (K3-delta — K4 rejects them at render), and the
-  /// dict-K5 codes region is unaffected. The orchestrator populates
-  /// @c survivor_indices (int32, survivor_count entries) whenever it sets
-  /// this; any anomaly silently keeps K3 (the pick is an optimization).
+  /// Prefer walking the survivor index list over walking the mask bits — the
+  /// cheaper enumeration once few rows survive. Only meaningful with
+  /// @c compact_capable; bitpack LEAF roots route to
+  /// ``launch_decode_fused_tree_index_consume`` over @c survivor_indices, delta
+  /// roots IGNORE it (the index walk rejects them at render), and a dictionary
+  /// codes region is unaffected. The orchestrator populates
+  /// @c survivor_indices (int32, survivor_count entries) whenever it sets this;
+  /// any anomaly silently keeps the mask walk (the pick is an optimization).
   bool prefer_index_decode = false;
-  /// K6 (str_split masked strings): survivor lengths from the masked offsets
+  /// Masked str_split strings: survivor lengths from the masked offsets
   /// decode, an exclusive-sum scan to destination offsets, and a survivor
   /// char gather into a count-first chars buffer — variable-width strings
   /// never materialize full char width. Mutually exclusive with the other
   /// compacted modes; gate on @c plan_supports_str_selection_decode. There is
   /// NO generic in-walk fallback for this mode (compacted offsets cannot feed
-  /// the classic str_split reconstruct): if the dedicated route declines, the
-  /// call errors and the orchestrator re-runs the batch classic.
+  /// the ordinary str_split reconstruct): if the dedicated route declines, the
+  /// call errors and the orchestrator re-runs the batch unfiltered.
   bool str_compact = false;
 
   [[nodiscard]] bool active() const noexcept { return mask != nullptr && survivor_count >= 0; }
@@ -152,18 +153,18 @@ struct decode_selection {
 ///              against the key set and never gathers the chars; every other
 ///              shape decodes normally and compares afterwards, which is correct
 ///              but no cheaper — gate on @c plan_supports_predicate_decode.
-/// @param sel   Optional fused scan-filter row selection (see
+/// @param sel   Optional decode-time row selection (see
 ///              @c decode_selection). When non-null and active the result holds
 ///              only the mask's survivor rows: a Tier-A plan decodes compacted
 ///              in-kernel, a Tier-B plan decodes full width and is gathered.
 ///              Composition with @p pred (dual delivery — a survivor-sized
 ///              BOOL8 at a mask-source slot): allowed for @c dict_compact (the
-///              predicate is answered over the K3-compacted codes) and for the
+///              predicate is answered over the compacted codes) and for the
 ///              plain Tier-B route (full-width BOOL8, then the survivor
 ///              gather); refused for @c compact_capable / @c str_compact. The
 ///              result is then BOOL8[survivor_count] — enforced by a belt.
-///              Iteration 1 requires non-null columns — a null-masked decode
-///              fails loudly (never corrupts).
+///              Non-null columns are required — a null-masked decode fails
+///              loudly (never corrupts).
 std::unique_ptr<cudf::column> decompress_column(PlanTree const& tree,
                                                 rmm::cuda_stream_view stream,
                                                 rmm::device_async_resource_ref mr,
@@ -180,46 +181,45 @@ bool plan_supports_predicate_decode(PlanTree const& tree);
 /// True iff @p tree can decode SURVIVOR-COMPACTED under a selection mask by
 /// ANY masked route: a `bitpack`-rooted plan (tier_a — mask_consume on the
 /// root region), a delta->bitpack plan (tier_a_delta — mask_consume renders
-/// Delta roots too), or a dict-K5 plan (dictionary root with bitpack codes —
-/// K3 on the codes + survivor-only key gather; see
-/// @c plan_supports_dict_selection_decode). This is the umbrella probe the
-/// taxonomy/RULE-1 layer keys compact-capability off; per-route dispatch uses
-/// @c plan_selection_tier.
+/// Delta roots too), or a dictionary plan with bitpack codes (the codes decode
+/// under the mask and only the surviving keys are gathered; see
+/// @c plan_supports_dict_selection_decode). This is the umbrella probe callers
+/// key compact-capability off; per-route dispatch uses @c plan_selection_tier.
 ///
-/// CAUTION (wave-1 callers): a FILTER column feeding the K1 mask-out decode
-/// must be bitpack-rooted — gate filter candidates on
+/// CAUTION (wave-1 callers): a FILTER column feeding the ballot decode must be
+/// bitpack-rooted — gate filter candidates on
 /// `plan_selection_tier(tree) == output_tier::tier_a`.
 bool plan_supports_selection_decode(PlanTree const& tree);
 
-/// True iff @p tree can decode survivor-compacted through the dict-K5 route:
-/// its root value is produced by a non-null `dictionary` node whose `indices`
-/// channel is bitpack-compressed. The dictionary CODES then decode with the
-/// mask (K3) and the key-chars gather runs over survivors only — the biggest
-/// win for dictionary string payload columns, whose chars gather scales
+/// True iff @p tree can decode survivor-compacted through the dictionary
+/// gather: its root value is produced by a non-null `dictionary` node whose
+/// `indices` channel is bitpack-compressed. The dictionary CODES then decode
+/// under the mask and the key-chars gather runs over survivors only — the
+/// biggest win for dictionary string payload columns, whose chars gather scales
 /// linearly with selectivity. Nullable dictionary plans (a `null_mask` output
-/// channel) are refused: iteration-1 selection has no null model.
+/// channel) are refused: selection has no null model yet.
 bool plan_supports_dict_selection_decode(PlanTree const& tree);
 
-/// True iff @p tree can decode survivor-compacted through the K6 masked
-/// strings route: its root value is produced by a non-null `str_split` node
+/// True iff @p tree can decode survivor-compacted through the masked str_split
+/// route: its root value is produced by a non-null `str_split` node
 /// whose `chars` channel is TERMINAL (raw/identity — entropy-coded chars
 /// cannot be byte-gathered without a full decompress) and whose `offsets`
 /// channel is routed to a plain bitpack child. Deeper offsets chains
 /// (c_phone's delta->rle->bitpack) and widened (>2 GB, non-UINT8) chars stay
-/// tier_b for iteration 5 — widen only in lockstep with the renderer's
-/// masked offsets-reconstruction coverage.
+/// tier_b — widen only in lockstep with the renderer's masked
+/// offsets-reconstruction coverage.
 bool plan_supports_str_selection_decode(PlanTree const& tree);
 
-/// Per-tier ground truth for the wave orchestrator's RULE-1 switch: tier_a
-/// for a bitpack-rooted plan, tier_a_delta for a delta->bitpack root,
-/// tier_dict_k5 for a dict-K5-capable plan, tier_b for everything else
-/// (including K6-capable str_split plans until output_tier grows tier_str_k6
-/// — the classifier and umbrella flip together to preserve the invariant).
+/// Per-tier ground truth for the wave orchestrator's output-shape switch:
+/// tier_a for a bitpack-rooted plan, tier_a_delta for a delta->bitpack root,
+/// tier_dict_gather for a dictionary plan with bitpack codes, tier_b for
+/// everything else (the classifier and the umbrella probe flip together to
+/// preserve the invariant).
 /// Consistent by construction with @c plan_supports_selection_decode:
 /// umbrella true ⇔ classifier != tier_b.
 sirius::codegen::output_tier plan_selection_tier(PlanTree const& tree);
 
-/// Wave 1 / K1: decode @p tree's root bitpack region fused with the inclusive
+/// Wave 1: decode @p tree's root bitpack region fused with the inclusive
 /// decoded-domain range @p pred, writing selection-mask words into
 /// @p mask_words — NO column output is allocated or written. @p mask_words
 /// must hold ``selection_mask::AllocWordsFor(num_rows)`` words; every word of
@@ -233,14 +233,14 @@ bool decompress_column_selection_mask(PlanTree const& tree,
                                       rmm::device_async_resource_ref mr,
                                       std::string* error_out);
 
-/// Wave 1 / K1m2: two-column pair-predicate mask (q12-class col-vs-col
-/// conjuncts). Both plans must be bitpack-rooted over the same row count —
+/// Wave 1: two-column pair-predicate mask (column-vs-column conjuncts). Both
+/// plans must be bitpack-rooted over the same row count —
 /// the launcher additionally verifies matching chunk geometry. Row r's mask
 /// bit is `decoded_a(r) OP decoded_b(r) && decoded_a(r) in pred.range_a &&
 /// decoded_b(r) in pred.range_b` (full-domain range = inactive side). Writes
 /// mask words only (AllocWordsFor sizing, tail-zero), NO column output.
-/// pair_compare_op eq/ne are refused (the K1m2 render covers lt/le/gt/ge) —
-/// the extraction must not emit them. Returns false + @p error_out on any
+/// pair_compare_op eq/ne are refused (the render covers lt/le/gt/ge only) —
+/// the caller must not emit them. Returns false + @p error_out on any
 /// refusal; no device state is corrupted.
 bool decompress_column_pair_selection_mask(PlanTree const& tree_a,
                                            PlanTree const& tree_b,
@@ -251,9 +251,9 @@ bool decompress_column_pair_selection_mask(PlanTree const& tree_a,
                                            std::string* error_out);
 
 /// Wave 2, compacted decode: dispatches on plan shape — a bitpack-rooted plan
-/// runs Tier A / K3 (rows whose mask bit is 0 are never unpacked), a
-/// dictionary-rooted plan with bitpack codes runs the dict-K5 route (K3 over
-/// the codes, key-chars gather over survivors only). Every output column is
+/// walks the mask (rows whose mask bit is 0 are never unpacked), a
+/// dictionary-rooted plan with bitpack codes decodes the codes under the mask
+/// and gathers only the surviving keys. Every output column is
 /// allocated count-first with ``mask.survivor_count`` rows. Requires the CNT
 /// wave to have run (``mask.survivor_count >= 0`` and ``mask.chunk_offsets !=
 /// nullptr``) and a plan passing @c plan_supports_selection_decode or
@@ -266,14 +266,14 @@ std::unique_ptr<cudf::column> decompress_column_compacted(
   rmm::device_async_resource_ref mr,
   std::string* error_out);
 
-/// Assemble the fused scan-filter decode output (see
+/// Assemble the filtered decode's output (see
 /// ``simpatico::decompress_scan_filter``) into one uniformly survivor-sized
 /// table: Tier-A columns pass through (already compacted); ALL Tier-B
 /// (full-width) columns are compacted with ONE ``cudf::gather`` over
 /// ``result.row_indices``. When ``result.applied`` is false the columns are
-/// assembled unchanged (classic full-width decode). Iteration 1 refuses
-/// null-masked columns (returns nullptr + @p error_out; the caller must fall
-/// back to the classic decode — never corrupt). Synchronizes @p stream before
+/// assembled unchanged (the ordinary full-width decode). Null-masked columns
+/// are refused (returns nullptr + @p error_out; the caller must fall back to
+/// the ordinary decode — never corrupt). Synchronizes @p stream before
 /// returning, so the caller may free/rebind the inputs immediately.
 std::unique_ptr<cudf::table> compact_scan_filter_output(
   std::vector<std::unique_ptr<cudf::column>>&& columns,

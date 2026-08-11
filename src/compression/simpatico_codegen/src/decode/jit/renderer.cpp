@@ -279,7 +279,7 @@ class Walker {
     return finalize(tree);
   }
 
-  // K1m2: two-column fused pair-predicate mask (see render_pair_mask).
+  // Pair ballot: two-column pair-predicate mask (see render_pair_mask).
   DecodeKernelSpec build_pair(const ::codegen::jit::FusedTree& tree_a,
                               const ::codegen::jit::FusedTree& tree_b,
                               const std::string& dtype_b)
@@ -299,7 +299,7 @@ class Walker {
     // cmp_op and all four bounds are kernel params — uniform branches, one
     // compiled kernel per (dtype_a, dtype_b) for every op/literal.
     body_ << "    // --- pair predicate: col0 OP col1 (+ optional ranges) -> selection mask "
-             "(K1m2) ---\n"
+             "(pair ballot) ---\n"
           << "    uint32_t* mask_words = sel_mask + (chunk_start >> 5);\n"
           << "    #pragma unroll\n"
           << "    for (int32_t j = 0; j < CHUNK / " << tbs_ << "; ++j) {\n"
@@ -375,8 +375,8 @@ class Walker {
                              const std::string& len,
                              const std::string& elem_type);
 
-  // ---- Fused scan-filter variants (K1 / K3 / K5). ----
-  // K1 emits one __ballot_sync word per 32 consecutive rows; the consuming
+  // ---- Row-selecting variants. ----
+  // The ballot emits one __ballot_sync word per 32 consecutive rows; the consuming
   // variants stage the chunk's mask via a warp scan of per-word popcounts
   // (emit_selection_stage) and write compacted output.
   void emit_selection_stage();
@@ -384,7 +384,7 @@ class Walker {
 
   // How a Delta producer writes its reconstructed chunk.
   //   plain        — every row to dst[row], as the full-column decode does.
-  //   mask_compact — survivors only, compacted to dst[rank] (K3-delta).
+  //   mask_compact — survivors only, compacted to dst[rank].
   //                  Requires emit_selection_stage() to have run.
   // The reconstruction itself (striped load, block scan, transpose) is
   // identical either way, which is why both share emit_delta_producer.
@@ -618,7 +618,7 @@ void Walker::emit_bitpack_producer(const ::codegen::jit::FusedTree& node,
 }
 
 // =====================================================================
-// Mask variants — fused scan-filter epilogues (K1 / K3).
+// Mask variants — the ballot and mask-walk epilogues.
 //
 // Iteration mapping: i = j*128 + tid, so iteration j of warp w covers 32
 // CONSECUTIVE rows [chunk_start + j*128 + w*32, +32) — one __ballot_sync
@@ -668,8 +668,8 @@ static std::string rank_expr(const std::string& pos)
   return "sel_base[" + pos + " >> 5] + __popc(w & ((1u << (" + pos + " & 31)) - 1u))";
 }
 
-// The survivor loop shared by every mask-consuming variant (K3 store, K5 dict
-// gather, K6 offsets meta).  Requires emit_selection_stage() to have run.
+// The survivor loop shared by every mask-consuming variant (the value store,
+// the dictionary gather, the str_split offsets meta).  Requires emit_selection_stage() to have run.
 //
 // Walks the chunk's rows, tests the mask bit, binds `rank` (the row's compacted
 // slot within the chunk) and emits `sink` — the ONE line that differs between
@@ -689,7 +689,7 @@ void Walker::emit_mask_survivor_loop(const std::string& sink)
 }
 
 // =====================================================================
-// Delta mask_consume (K3-delta) — the same reconstruction as the plain Delta
+// Delta mask_consume — the same reconstruction as the plain Delta
 // producer, storing only survivors.  The prefix sum is inherently sequential
 // within a chunk, so ALL rows are still decoded; the mask gates only the
 // global STORE (row idx+1 lands at its compacted survivor slot).  Saves the
@@ -706,15 +706,14 @@ void Walker::emit_delta_mask_consume(const ::codegen::jit::FusedTree& node)
     throw RenderError("decode render: mask_consume Delta root missing 'differences' child");
   }
 
-  body_ << "    // --- node " << id_of(node)
-        << ": Delta masked decode -> compacted output (K3-delta) ---\n";
+  body_ << "    // --- node " << id_of(node) << ": Delta masked decode -> compacted output ---\n";
   emit_selection_stage();
   // out_base is declared by the masked store inside the producer's block.
   emit_delta_producer(node, "(out + out_base)", "len", dtype_, DeltaStore::mask_compact);
 }
 
 // =====================================================================
-// Dictionary-code masked gather (K5) — Bitpack leaf holds the dictionary
+// Dictionary-code masked gather — the Bitpack leaf holds the dictionary
 // CODES; for survivor rows only, decode the code and copy the key's bytes
 // from a constant-width, null-free key pool straight into the compacted
 // chars output.  Skips both the full-width INT32 code materialisation and
@@ -729,7 +728,7 @@ void Walker::emit_bitpack_mask_dict_gather(const ::codegen::jit::FusedTree& node
       "(got '" +
       std::string(::codegen::jit::op_kind_name(node.op)) + "')");
   }
-  body_ << "    // --- node " << id_of(node) << ": Bitpack code masked dictionary gather (K5) ---\n"
+  body_ << "    // --- node " << id_of(node) << ": Bitpack code masked dictionary gather ---\n"
         << "    (void)len;  // mask tail bits are zero, so selected rows are always < len\n";
   emit_selection_stage();
 
@@ -743,14 +742,15 @@ void Walker::emit_bitpack_mask_dict_gather(const ::codegen::jit::FusedTree& node
 }
 
 // =====================================================================
-// Index-list-consuming decode (K4) — the low-selectivity sibling of K3.
+// Index-list-consuming decode — the low-selectivity sibling of the mask walk.
 // Block c reads its slice of the ascending GLOBAL row-index list
 // (row_indices[chunk_offsets[c] .. chunk_offsets[c+1])) and random-access
 // decodes only those rows: out slot chunk_offsets[c]+k gets the value of
 // row row_indices[chunk_offsets[c]+k].  No mask staging, no ballot — the
 // per-block loop runs `cnt` iterations instead of 8 full 128-wide strips,
-// so runtime scales with survivors (microbench: 0.30 vs K3's 0.78
-// ms/payload at 1.9% selectivity; K3 wins again above the ~15% crossover
+// so runtime scales with survivors (microbench: 0.30 vs the mask walk's
+// 0.78 ms/payload at 1.9% selectivity; the mask walk wins again above the
+// ~15% crossover
 // — the caller picks from the survivor count).  Delta roots cannot
 // row-skip and are rejected.
 // =====================================================================
@@ -763,7 +763,7 @@ void Walker::emit_bitpack_index_consume(const ::codegen::jit::FusedTree& node)
       std::string(::codegen::jit::op_kind_name(node.op)) + "')");
   }
   body_ << "    // --- node " << id_of(node)
-        << ": Bitpack index-list decode -> compacted output (K4) ---\n"
+        << ": Bitpack index-list decode -> compacted output ---\n"
         << "    (void)len;  // listed rows are < n by construction (mask tail bits were zero)\n"
         << "    const int64_t out_base = static_cast<int64_t>(chunk_offsets[chunk_id]);\n"
         << "    const int32_t cnt = static_cast<int32_t>(\n"
@@ -792,7 +792,7 @@ void Walker::emit_bitpack_index_consume(const ::codegen::jit::FusedTree& node)
 void Walker::emit_generic_mask_consume(const ::codegen::jit::FusedTree& node)
 {
   body_ << "    // --- node " << id_of(node) << ": " << ::codegen::jit::op_kind_name(node.op)
-        << " masked decode -> compacted output (K3-generic) ---\n"
+        << " masked decode -> compacted output (generic) ---\n"
         << "    (void)len;  // mask tail bits are zero, so selected rows are always < len\n";
   emit_selection_stage();
 
@@ -804,7 +804,7 @@ void Walker::emit_generic_mask_consume(const ::codegen::jit::FusedTree& node)
 }
 
 // =====================================================================
-// str_split meta (K6 phase 1) — masked survivor {source char offset,
+// str_split meta (phase 1) — masked survivor {source char offset,
 // length} extraction from a string column's OFFSETS subtree.  The offsets
 // cascade is reconstructed IN FULL per chunk through value_source (depth
 // is fine: bitpack closed-form, delta->rle->bitpack slab, ...); only the
@@ -829,8 +829,7 @@ void Walker::emit_str_split_meta(const ::codegen::jit::FusedTree& node)
       std::string(::codegen::jit::op_kind_name(node.op)) + "')");
   }
 
-  body_ << "    // --- node " << id_of(node)
-        << ": str_split offsets masked survivor meta (K6) ---\n"
+  body_ << "    // --- node " << id_of(node) << ": str_split offsets masked survivor meta ---\n"
         << "    const int64_t n_rows = n - 1;  // offsets count = string rows + 1\n"
         << "    if (chunk_start >= n_rows) return;  // offsets-tail chunk: no rows\n";
   emit_selection_stage();
@@ -868,7 +867,7 @@ void Walker::emit_str_split_meta(const ::codegen::jit::FusedTree& node)
 }
 
 // =====================================================================
-// Generic mask_out (K1-generic / K1-delta) — the compositional K1 for
+// Generic mask_out — the compositional ballot for
 // non-closed-form roots, primarily delta->bitpack orderkey shapes: the
 // decode-evaluable form of min-max dynamic join filters.  Delta's prefix
 // sum is sequential within a chunk, so the chunk is reconstructed IN FULL
@@ -876,13 +875,13 @@ void Walker::emit_str_split_meta(const ::codegen::jit::FusedTree& node)
 // emitters), then the range predicate is balloted from the staged values.
 // Reading i-aligned positions keeps the one-word-per-32-consecutive-rows
 // mask layout intact (ballot lanes == mask bits).  No column output; same
-// trailing params as the bitpack K1 (sel_mask in the out slot, pred_lo/
+// trailing params as the bitpack ballot (sel_mask in the out slot, pred_lo/
 // pred_hi widened-int64 kernel parameters).
 // =====================================================================
 void Walker::emit_generic_mask_out(const ::codegen::jit::FusedTree& node)
 {
   body_ << "    // --- node " << id_of(node) << ": " << ::codegen::jit::op_kind_name(node.op)
-        << " fused range predicate -> selection mask (K1-generic) ---\n";
+        << " fused range predicate -> selection mask (generic) ---\n";
   const auto mark = sm_.mark();
   ValueSource vs  = value_source(node, dtype_, "len");
   body_ << "    uint32_t* mask_words = sel_mask + (chunk_start >> 5);\n"
@@ -902,7 +901,7 @@ void Walker::emit_generic_mask_out(const ::codegen::jit::FusedTree& node)
 }
 
 // =====================================================================
-// finalize_pair — K1m2 signature: both columns' channels (A = node 0,
+// finalize_pair — pair-ballot signature: both columns' channels (A = node 0,
 // B = node 1, in buffers order), then the mask output and the runtime
 // predicate parameters.  Symbol carries both dtypes (arity+variant is the
 // cache axis; op/bounds are parameters).
@@ -957,7 +956,7 @@ DecodeKernelSpec Walker::finalize_pair(const std::string& dtype_b)
   spec.buffers      = std::move(buffers_);
   spec.block_x      = tbs_;
   spec.shared_bytes = static_cast<int>(sm_.peak_bytes());
-  spec.note         = "decode-walker-rendered pair mask (K1m2)";
+  spec.note         = "decode-walker-rendered pair mask";
   return spec;
 }
 
@@ -1649,7 +1648,7 @@ bool shape_is_supported(DecodeShape shape)
 {
   // Shipped points of the product. The meaningful-but-unbuilt combinations —
   // index_list x dict_gather and index_list x offsets_meta, which would give
-  // K4-speed dictionary and string decode below the K4 crossover — belong here
+  // index-walk-speed dictionary and string decode below the crossover — belong here
   // the moment their emitters land; see DECODE_PUSHDOWN_PLAN.md section 7.
   return shape == kShapePlain || shape == kShapeMaskOut || shape == kShapePairMask ||
          shape == kShapeMaskConsume || shape == kShapeIndexConsume || shape == kShapeDictGather ||
