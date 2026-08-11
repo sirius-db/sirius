@@ -354,6 +354,7 @@ class Walker {
   // variants stage the chunk's mask via a warp scan of per-word popcounts
   // (emit_selection_stage) and write compacted output.
   void emit_selection_stage();
+  void emit_mask_survivor_loop(const std::string& sink);
   void emit_delta_mask_consume(const ::codegen::jit::FusedTree& node);
   void emit_bitpack_mask_dict_gather(const ::codegen::jit::FusedTree& node);
   void emit_bitpack_index_consume(const ::codegen::jit::FusedTree& node);
@@ -636,6 +637,26 @@ static std::string rank_expr(const std::string& pos)
   return "sel_base[" + pos + " >> 5] + __popc(w & ((1u << (" + pos + " & 31)) - 1u))";
 }
 
+// The survivor loop shared by every mask-consuming variant (K3 store, K5 dict
+// gather, K6 offsets meta).  Requires emit_selection_stage() to have run.
+//
+// Walks the chunk's rows, tests the mask bit, binds `rank` (the row's compacted
+// slot within the chunk) and emits `sink` — the ONE line that differs between
+// those variants.  In scope for `sink`: `i` (in-chunk row), `rank`, `out_base`
+// (the chunk's base in the compacted output), `w` (the row's mask word).
+void Walker::emit_mask_survivor_loop(const std::string& sink)
+{
+  body_ << "    const int64_t out_base = static_cast<int64_t>(chunk_offsets[chunk_id]);\n"
+        << "    #pragma unroll\n"
+        << "    for (int32_t j = 0; j < CHUNK / " << tbs_ << "; ++j) {\n"
+        << "        const int32_t i = j * " << tbs_ << " + tid;\n"
+        << "        const uint32_t w = sel_words[i >> 5];\n"
+        << "        if ((w >> (i & 31)) & 1u) {\n"
+        << "            const int32_t rank = " << rank_expr("i") << ";\n"
+        << sink << "        }\n"
+        << "    }\n";
+}
+
 // =====================================================================
 // Delta mask_consume — masked-store variant of emit_delta_producer's
 // root-level (striped) path.  The prefix-sum reconstruction is inherently
@@ -767,20 +788,12 @@ void Walker::emit_bitpack_mask_dict_gather(const ::codegen::jit::FusedTree& node
   emit_selection_stage();
 
   ValueSource vs = bitpack_value_source(node, dtype_);
-  body_ << "    const int64_t out_base = static_cast<int64_t>(chunk_offsets[chunk_id]);\n"
-        << "    #pragma unroll\n"
-        << "    for (int32_t j = 0; j < CHUNK / " << tbs_ << "; ++j) {\n"
-        << "        const int32_t i = j * " << tbs_ << " + tid;\n"
-        << "        const uint32_t w = sel_words[i >> 5];\n"
-        << "        if ((w >> (i & 31)) & 1u) {\n"
-        << "            const int32_t rank = " << rank_expr("i") << ";\n"
-        << "            const int64_t code = static_cast<int64_t>(" << at_pos(vs.read_expr, "i")
-        << ");\n"
-        << "            const char* k = keys_chars + code * key_width;\n"
-        << "            char* o = out + (out_base + rank) * key_width;\n"
-        << "            for (int32_t b = 0; b < key_width; ++b) o[b] = k[b];\n"
-        << "        }\n"
-        << "    }\n";
+  emit_mask_survivor_loop("            const int64_t code = static_cast<int64_t>(" +
+                          at_pos(vs.read_expr, "i") +
+                          ");\n"
+                          "            const char* k = keys_chars + code * key_width;\n"
+                          "            char* o = out + (out_base + rank) * key_width;\n"
+                          "            for (int32_t b = 0; b < key_width; ++b) o[b] = k[b];\n");
 }
 
 // =====================================================================
@@ -839,16 +852,8 @@ void Walker::emit_generic_mask_consume(const ::codegen::jit::FusedTree& node)
 
   const auto mark = sm_.mark();
   ValueSource vs  = value_source(node, dtype_, "len");
-  body_ << "    const int64_t out_base = static_cast<int64_t>(chunk_offsets[chunk_id]);\n"
-        << "    #pragma unroll\n"
-        << "    for (int32_t j = 0; j < CHUNK / " << tbs_ << "; ++j) {\n"
-        << "        const int32_t i = j * " << tbs_ << " + tid;\n"
-        << "        const uint32_t w = sel_words[i >> 5];\n"
-        << "        if ((w >> (i & 31)) & 1u) {\n"
-        << "            const int32_t rank = " << rank_expr("i") << ";\n"
-        << "            (out + out_base)[rank] = " << at_pos(vs.read_expr, "i") << ";\n"
-        << "        }\n"
-        << "    }\n";
+  emit_mask_survivor_loop("            (out + out_base)[rank] = " + at_pos(vs.read_expr, "i") +
+                          ";\n");
   sm_.release_to(mark);
 }
 
@@ -903,22 +908,16 @@ void Walker::emit_str_split_meta(const ::codegen::jit::FusedTree& node)
   }
   body_ << "    }\n";
 
-  body_ << "    const int64_t out_base = static_cast<int64_t>(chunk_offsets[chunk_id]);\n"
-        << "    #pragma unroll\n"
-        << "    for (int32_t j = 0; j < CHUNK / " << tbs_ << "; ++j) {\n"
-        << "        const int32_t i = j * " << tbs_ << " + tid;\n"
-        << "        const uint32_t w = sel_words[i >> 5];\n"
-        << "        if ((w >> (i & 31)) & 1u) {\n"
-        << "            const int32_t rank = " << rank_expr("i") << ";\n"
-        << "            const int64_t off_r = static_cast<int64_t>(" << at_pos(vs.read_expr, "i")
-        << ");\n"
-        << "            const int64_t off_r1 = (i + 1 < len)\n"
-        << "                ? static_cast<int64_t>(" << at_pos(vs.read_expr, "(i + 1)") << ")\n"
-        << "                : static_cast<int64_t>(next0);\n"
-        << "            (out + out_base)[rank] = off_r;\n"
-        << "            len_out[out_base + rank] = static_cast<int32_t>(off_r1 - off_r);\n"
-        << "        }\n"
-        << "    }\n";
+  emit_mask_survivor_loop(
+    "            const int64_t off_r = static_cast<int64_t>(" + at_pos(vs.read_expr, "i") +
+    ");\n"
+    "            const int64_t off_r1 = (i + 1 < len)\n"
+    "                ? static_cast<int64_t>(" +
+    at_pos(vs.read_expr, "(i + 1)") +
+    ")\n"
+    "                : static_cast<int64_t>(next0);\n"
+    "            (out + out_base)[rank] = off_r;\n"
+    "            len_out[out_base + rank] = static_cast<int32_t>(off_r1 - off_r);\n");
   sm_.release_to(mark);
 }
 

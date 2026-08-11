@@ -300,7 +300,7 @@ The launcher layer is **already** factored around a shared core
 Five entry points are thin: of their 27-34 lines, ~12-22 is the precondition block and its
 `fprintf`, ~5-8 fills `VariantLaunchArgs`, one line calls the core. The duplication is elsewhere.
 
-**F4 — the pair launcher reimplements the core.** `launch_decode_fused_tree_pair_mask_out`
+**F4 — the pair launcher reimplements the core. [DONE]** `launch_decode_fused_tree_pair_mask_out`
 (932-1096) is 165 lines, ~120 of which duplicate the core: the 4-arm try/catch (945, 1083-1095
 vs 699-712), `dtype_to_cxx` + report (962-970 vs 657-663), the elem_size ternary (997-1002 vs
 664-667, a third copy), transients + alloc lambda (990-996 vs 671-677),
@@ -314,15 +314,43 @@ vs 699-712), `dtype_to_cxx` + report (962-970 vs 657-663), the elem_size ternary
 > `run_rendered_decode:520-547`, whose comment states it prevents an out-of-bounds read that
 > "would fault the CUDA context". This is a missing check, not just redundancy.
 
-**F5 — two switches over one enum, unchecked.** `run_rendered_decode:568-586` pushes trailing
+**F5 — two switches over one enum, unchecked. [DONE]** `run_rendered_decode:568-586` pushes trailing
 kernel *arguments* per variant; `renderer.cpp:343-387` emits the matching trailing
 *parameters*. They must agree exactly across two files, and `cuLaunchKernel` takes `void**` —
 **a mismatch is silent argument misalignment, not a compile error.** Highest-risk duplication
 in this area.
 
-**F6 — five bespoke precondition blocks** (737-745, 773-785, 803-815, 833-846, 1109-1123),
-~60 lines differing only in which `VariantLaunchArgs` slots must be non-null — a property of
-the variant.
+**F6 — five bespoke precondition blocks. [DONE]** (737-745, 773-785, 803-815, 833-846,
+1109-1123), ~60 lines differing only in which `VariantLaunchArgs` slots must be non-null — a
+property of the variant.
+
+### Status (commit fd9e45ae)
+
+F1, F4, F5 and F6 are implemented and verified; the §5 safety net is in place.
+
+- `TrailingParam` + `DecodeKernelSpec::trailing`: declaration text and tag list come from one
+  table (`trailing_params()` / `pair_trailing_params()`); both launch paths bind via
+  `TrailingArgStorage`, and a tag with no storage is a reported error.
+- `launch_rendered_spec()` is shared by the single-tree and pair paths, so the pair path now
+  enforces the per-chunk metadata bounds guard. **Behaviour change:** a pair launch with
+  under-sized per-chunk channels is refused rather than proceeding into an OOB read.
+- `VariantContract` + `check_variant_contract()` replace the five hand-written precondition
+  blocks; diagnostics now name the specific missing field
+  (`incomplete inputs — chunk_offsets (did the CNT wave run?)`).
+- New `tests/test_render_signature_contract.cpp` (CTest: `render_signature_contract`) asserts
+  `declared params == buffers + 2 + trailing` for every shape × dtype × variant and the pair
+  path, plus tag validity/uniqueness. It parses the signature instead of diffing a golden
+  string, so kernel-body changes do not churn it. **Mutation-tested**: injecting one undeclared
+  parameter fails it across every variant. No GPU, no NVRTC — milliseconds.
+
+Rendered source is byte-identical across F4/F5/F6; only F1 changed emitted text (comments).
+
+Verification harness worth reusing: `renderer.cpp` depends only on `fused_tree.hpp` /
+`render_util.hpp` / stdlib, so a dump-and-diff of `render()` output compiles standalone with
+`g++ -std=c++20 -I include` in seconds and needs no GPU. That is how every claim above was
+checked.
+
+**Remaining in this section: F2 and F3.**
 
 ### Launcher refactor
 
