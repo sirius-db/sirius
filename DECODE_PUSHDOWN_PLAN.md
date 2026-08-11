@@ -59,11 +59,16 @@ indistinguishable.
 `rule2_bailed_gpu_table_representation` each carry one bit via dynamic type;
 `clone()` "intentionally degrades". Safe only because two call sites are adjacent on one thread.
 
-**P7 — Pushdown carriers duplicated.** Five setter/getter pairs on both representation classes,
-with `clone()` obliged to copy each (#1380 already had to patch `clone()` for one field).
+**P7 — Pushdown carriers duplicated. CLOSED (`e1442655`).** Five setter/getter pairs on both
+representation classes, with `clone()` obliged to copy each (#1380 already had to patch `clone()`
+for one field). Both classes now carry one `shared_ptr<const compressed_scan>`.
 
-**P8 — Policy in three places.** RULE 1 in the converter, RULE 2 inside simpatico
-(`simpatico_codegen.cpp:348-430`), re-derived a third time in `probe_fused_scan_reservation`.
+**P8 — Policy in three places. PARTLY CLOSED (`e1442655`).** The env gate and the selectivity
+ceiling were copied per TU and had *drifted* — two readers accepted only `"1"` where the decoder
+accepts anything but `"0"` — so `SIRIUS_EXP_FUSED_SCAN_FILTER=true` turned the feature on in one
+layer and off in another. Both now live in `compression/decode_filter_policy.hpp`. The decode-side
+thresholds still sit with the decode implementation, which is the only thing that can act on them;
+Phase 3 decides whether they need a policy object at all.
 
 **P9 — Emitter duplication.** See §5.
 
@@ -291,50 +296,93 @@ rewrite — safe, but it makes the field a *converter* fact rather than a univer
 generalises it: under `compressed_scan` the outcome is the engine's answer for every source, not
 one converter's.
 
-**Phase 2 — the facade.** Introduce `compressed_scan` over the *existing*
-`build_fused_scan_directives` + `decompress_scan_filter`, moving the three `extract_*` functions
-behind it. No kernel changes.
-*Accept:* every name in §2's delete list is gone from `src/include/` and
-`src/compression/*.hpp`; the scan-side call site is the two lines in §2; no measurable delta.
+**Phase 2 — the facade. DONE** (`e1442655`, `5798182d`).
+
+Delivered:
+
+- `sirius::scan_decode_request` — one `column_entry` per column (equality set, bounds, join
+  filters) replacing four parallel vectors; `sirius::compressed_scan` holds it, immutable, and the
+  per-batch adjustments (`for_chunk`, `with_membership_probes`, `without_row_selection`) return a
+  new one. One `shared_ptr<const compressed_scan>` on each representation (P7).
+- `decode_compressed_chunk()` — the single entry point. It owns request assembly, the two-call
+  compaction protocol and the fallback, so both converters are one call each and the ~190-line
+  `try_decompress_scan_filter` is gone from the converter (P3/P4 hidden, not yet simplified).
+- `op::analyze_scan_filters` — the three `extract_*` functions merged into one pass, run once per
+  scan by the ingestible (`gpu_ingestible::filter_analysis()`) and only *mapped onto slots* by the
+  scan manager, which drops the manager's duplicate range extraction. `scan_utils.hpp` no longer
+  includes `codegen/selection/selection.hpp`.
+- `probe_fused_scan_reservation` → `compressed_scan::forecast_compaction`.
+- Deleted with no callers left: `column_decode_directive`, `make_scan_filter_request`,
+  `decode_output_tier` (the converter's mirror of `codegen::output_tier`), `decode_pushdown.hpp`.
+
+Two behaviour changes, both deliberate:
+
+- whole-filter coverage now also requires every range to reach a decoded slot. A range mapping to
+  no served column was silently dropped while the batch could still be tagged as needing no
+  further filtering.
+- the parquet ingestible's candidate extraction ran **twice** — a merge had duplicated the block
+  (risk 6 below, manifested) — appending every candidate to the position list twice.
+
+Not delivered from §2's design: `position` (column elision) and `unapplied` as an AST residual.
+The residual is still expressed by rebuilding the DuckDB filter expression in the ingestible.
+Both want the analysis to speak `sirius::ast`, which is Phase 3 work, not facade work.
+
+**Open question 1 answered by construction.** The `range_predicate` / `pair_compare_op`
+respelling is no longer a header-isolation problem: the carrier types are the facade's own
+(`sirius::decode_range`, `sirius::column_compare_op`) and the conversion to `codegen::` happens at
+exactly one point, inside `compressed_scan.cpp`, where the mechanism is invoked. No shared header,
+no inverted dependency.
 
 **Phase 3 — internals.** One route enum, one `probe_column`, merged analysis pass, one
 `fusion_policy`, `compact_scan_filter_output` folded into the entry point.
 *Accept:* P1–P4, P7, P8 closed; `try_decompress_scan_filter`'s ~190 lines substantially reduced.
 
-Phase 2 must precede Phase 3: the facade is what buys freedom to change internals without
-touching the scan. Today every internal change is scan-visible.
+Phase 2 preceded Phase 3 for a reason: the facade is what buys freedom to change internals
+without touching the scan. That freedom now exists — `decode_compressed_chunk` has exactly one
+caller shape, and nothing outside `src/compression/` names a tier, a plan probe or a wave.
 
-## 6b. Starting Phase 2
+**Phase N — naming. DONE** (`5798182d`). The branch's shorthand (K1/K1m2/K3/K4/K5/K6, RULE 1 and
+RULE 2, W1-W4, "iteration N", "STATUS-W2", "track A/B", "bail", "classic") is spelled out
+everywhere it appeared: the range/pair ballot, the mask/index walk, the dictionary gather, the
+masked str_split route, the static output-shape check, the selectivity ceiling, giving compaction
+up, the ordinary decode. Identifiers followed (`tier_dict_k5` → `tier_dict_gather`, `tier_str_k6`
+→ `tier_str_split`, `bailed_high_selectivity` → `declined_unselective`, `rule2_bailed` →
+`selection_unprofitable`).
+
+## 6b. Starting Phase 3
 
 Entry points, so this can be picked up cold.
 
 **Read first, in order:**
 
-1. `src/compression/compression_converters.cpp` — `try_decompress_scan_filter` (~190 lines) is
-   the whole request-assembly problem (P3) in one function, and `decompress_host_to_gpu` /
-   `decompress_device_to_gpu` are where the facade will be called from.
-2. `src/op/scan/parquet_gpu_ingestible.cpp` — the scan side: the constructor's candidate
-   extraction, `materialize_table`, `post_filter_and_project`.
-3. `src/op/scan/sirius_gpu_scan_operator_data.cpp::prepare_for_processing` — where pushdowns are
-   attached to the projected representation and the outcome is read back.
-4. `src/include/op/scan/scan_utils.hpp` — the three `extract_*` functions that move behind the
-   facade.
+1. `src/compression/compressed_scan.hpp` — the whole scan↔decoder boundary, and the only file a
+   Phase 3 change should have to keep stable.
+2. `src/compression/compressed_scan.cpp` — `plan_decode` (the per-chunk narrowing) and
+   `decode_with_filters` (request assembly). This is where P1's remaining encodings and P3's
+   per-kind cap/order rules now live, in one place, with one caller.
+3. `src/compression/simpatico_codegen/src/simpatico_codegen.cpp` — the orchestrator's static
+   output-shape check and selectivity guard: the rest of P8.
+4. `src/include/op/scan/scan_filter_analysis.hpp` — where `unapplied` and `position` would land.
 
-**Shape of the change:** `compressed_scan` wraps the existing
-`build_fused_scan_directives` + `decompress_scan_filter` unchanged. No kernel work, no
-measurement risk. The three `extract_*` functions become internal; the scan stops digesting its
-own filter and passes `where` whole.
+**What Phase 3 still has to close:** P1 (three encodings survive inside the facade:
+`codegen::output_tier`, the parallel `compacts` vector, `decode_selection`'s four bools), P2 (five
+plan probes), P3 (the per-kind conjunct handling in `decode_with_filters`), P4
+(`compact_scan_filter_output` folded into the decode), the rest of P8.
 
-**Watch for:** the representation carries five separate pushdown setters today (P7) and `clone()`
-must copy each — the facade replaces all of them with one
-`shared_ptr<const scan_decode_request>`. That is the change that makes Phase 3 possible, so do
-not skip it in favour of going straight at the internals.
+**Verification that works here:** `sirius_unittest [compression]` (36 cases — cases 9–11 run SQL
+through the equality answer and check the aggregate, so they catch a broken substitution rather
+than just a broken build) plus simpatico's own 14 ctest targets, which must be built explicitly:
 
-**Verification that works here:** `sirius_unittest [compression]` (36 cases) and `[scan]`
-(265 cases) both exercise the real paths end to end — in particular cases 9–11 of
-`[compression]` run SQL through the equality pushdown and check the aggregate, so they catch a
-broken substitution rather than just a broken build. `pixi run make` then those two suites is
-the loop.
+```bash
+pixi run ninja -C build/release test_compress_with_plan_roundtrip test_compressed_table_io \
+  test_leaf_describe test_plan_tree test_fused_tree_build test_jit_kernel_cache_plain \
+  test_jit_kernel_cache test_fused_operator_sweep test_operator_sweep \
+  test_representation_contract test_bitpack_layout_contract test_multi_gpu_stream_affinity \
+  test_masked_decode_variants test_render_signature_contract
+cd build/release/simpatico_codegen && pixi run --manifest-path ../../../pixi.toml ctest
+```
+
+`ctest` without that build step reports "Not Run", not a failure.
 
 ## 7. Future directions this unlocks
 
@@ -461,12 +509,10 @@ per shape.
 
 ## 8. Risks / open questions
 
-1. **Where do `range_pred` / comparison ops live?** `decode_pushdown.hpp:50-62` respells `lo`/`hi`
-   to stay simpatico-free, but `src/include/op/scan/scan_utils.hpp` already includes
-   `codegen/selection/selection.hpp` for `range_predicate` and `pair_compare_op`. The isolation
-   is already broken and the duplication buys nothing. Either formalize a single shared header,
-   or invert the dependency with a small `sirius/decode_types.hpp` that simpatico includes.
-   **Needs a decision before Phase 2.**
+1. ~~**Where do `range_pred` / comparison ops live?**~~ **ANSWERED (Phase 2).** The carrier types
+   are the facade's own and the conversion to `codegen::` happens at one point inside
+   `compressed_scan.cpp`. `scan_utils.hpp` no longer includes the codegen header, so the isolation
+   is real rather than aspirational — no shared header, no inverted dependency.
 2. `unapplied` requires an AST node referencing a column by table position (Case C). Confirm
    `sirius::ast` bound references cover this.
 3. cuCascade reservation happens before conversion, so `estimate_scan_read` still leaks *that*
@@ -480,4 +526,7 @@ per shape.
 6. Git's auto-merge silently duplicated four definitions when merging `dev` (§0), because both
    sides had added the same construct at different offsets in one file — one of them in a file
    with no conflict at all. Only the compiler caught it. Expect this anywhere #1380's content
-   exists on both sides of a future merge.
+   exists on both sides of a future merge. **A fifth case was found in Phase 2 that the compiler
+   could NOT catch:** the parquet ingestible's candidate-extraction block existed twice, so every
+   candidate was appended to `_pushdown_primary_by_batch_position` twice. It compiled and behaved
+   (the lookup breaks on the first match). Grep for repeated blocks, do not rely on the build.
