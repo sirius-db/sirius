@@ -140,73 +140,93 @@ struct TrailingParamDecl {
   const char* decl;
 };
 
-const std::vector<TrailingParamDecl>& trailing_params(DecodeVariant v)
+// Trailing parameters contributed by the ENUMERATOR (how rows are walked).
+const std::vector<TrailingParamDecl>& enumerator_params(Enumerator e)
 {
   static const std::vector<TrailingParamDecl> kNone{};
-  // mask_out: `out` carries the selection-mask words; the range travels as
-  // widened int64 kernel params so one compile serves every literal.
-  static const std::vector<TrailingParamDecl> kMaskOut{
-    {TrailingParam::pred_lo, "int64_t pred_lo"},
-    {TrailingParam::pred_hi, "int64_t pred_hi"},
-  };
-  static const std::vector<TrailingParamDecl> kMaskConsume{
+  static const std::vector<TrailingParamDecl> kMaskBits{
     {TrailingParam::sel_mask, "const uint32_t* __restrict__ sel_mask"},
     {TrailingParam::chunk_offsets, "const uint32_t* __restrict__ chunk_offsets"},
   };
-  static const std::vector<TrailingParamDecl> kMaskDictGather{
-    {TrailingParam::sel_mask, "const uint32_t* __restrict__ sel_mask"},
-    {TrailingParam::chunk_offsets, "const uint32_t* __restrict__ chunk_offsets"},
-    {TrailingParam::keys_chars, "const char* __restrict__ keys_chars"},
-    {TrailingParam::key_width, "int32_t key_width"},
-  };
-  static const std::vector<TrailingParamDecl> kIndexConsume{
+  static const std::vector<TrailingParamDecl> kIndexList{
     {TrailingParam::row_indices, "const int32_t* __restrict__ row_indices"},
     {TrailingParam::chunk_offsets, "const uint32_t* __restrict__ chunk_offsets"},
   };
-  // str_split_meta: sel_mask/chunk_offsets stay ROW-space while `n` is the
-  // offsets element count (string rows + 1).
-  static const std::vector<TrailingParamDecl> kStrSplitMeta{
-    {TrailingParam::sel_mask, "const uint32_t* __restrict__ sel_mask"},
-    {TrailingParam::chunk_offsets, "const uint32_t* __restrict__ chunk_offsets"},
-    {TrailingParam::len_out, "int32_t* __restrict__ len_out"},
-  };
-  switch (v) {
-    case DecodeVariant::plain: return kNone;
-    case DecodeVariant::mask_out: return kMaskOut;
-    case DecodeVariant::mask_consume: return kMaskConsume;
-    case DecodeVariant::mask_dict_gather: return kMaskDictGather;
-    case DecodeVariant::index_consume: return kIndexConsume;
-    case DecodeVariant::str_split_meta: return kStrSplitMeta;
+  switch (e) {
+    case Enumerator::all_rows: return kNone;
+    case Enumerator::mask_bits: return kMaskBits;
+    case Enumerator::index_list: return kIndexList;
   }
   return kNone;
 }
 
-// K1m2 pair mask: both columns' channels, then the mask output and the runtime
-// predicate parameters (op code + both inclusive ranges).
-const std::vector<TrailingParamDecl>& pair_trailing_params()
+// Trailing parameters contributed by the CONSUMER (what happens per row).
+// Predicate constants travel here as kernel arguments so one compile serves
+// every literal.
+const std::vector<TrailingParamDecl>& consumer_params(Consumer c)
 {
-  static const std::vector<TrailingParamDecl> kPair{
+  static const std::vector<TrailingParamDecl> kNone{};
+  static const std::vector<TrailingParamDecl> kBallotRange{
+    {TrailingParam::pred_lo, "int64_t pred_lo"},
+    {TrailingParam::pred_hi, "int64_t pred_hi"},
+  };
+  static const std::vector<TrailingParamDecl> kBallotPair{
     {TrailingParam::cmp_op, "int32_t cmp_op"},
     {TrailingParam::lo_a, "int64_t lo_a"},
     {TrailingParam::hi_a, "int64_t hi_a"},
     {TrailingParam::lo_b, "int64_t lo_b"},
     {TrailingParam::hi_b, "int64_t hi_b"},
   };
-  return kPair;
+  static const std::vector<TrailingParamDecl> kDictGather{
+    {TrailingParam::keys_chars, "const char* __restrict__ keys_chars"},
+    {TrailingParam::key_width, "int32_t key_width"},
+  };
+  static const std::vector<TrailingParamDecl> kOffsetsMeta{
+    {TrailingParam::len_out, "int32_t* __restrict__ len_out"},
+  };
+  switch (c) {
+    case Consumer::write_column: return kNone;
+    case Consumer::ballot_range: return kBallotRange;
+    case Consumer::ballot_pair: return kBallotPair;
+    case Consumer::dict_gather: return kDictGather;
+    case Consumer::offsets_meta: return kOffsetsMeta;
+  }
+  return kNone;
+}
+
+// Entry-symbol suffix per shape. The exact strings are load-bearing: they key
+// the JIT cache, so changing one forces a recompile of that kernel everywhere.
+std::string shape_symbol_suffix(DecodeShape shape)
+{
+  if (shape == kShapeMaskOut) return "_mask_out";
+  if (shape == kShapeMaskConsume) return "_mask_consume";
+  if (shape == kShapeDictGather) return "_mask_dict";
+  if (shape == kShapeIndexConsume) return "_index_consume";
+  if (shape == kShapeStrSplitMeta) return "_str_meta";
+  return "";  // kShapePlain (pair has its own symbol builder)
+}
+
+// The kernel's trailing parameter list: enumerator's, then consumer's.
+std::vector<TrailingParamDecl> shape_trailing_params(DecodeShape shape)
+{
+  std::vector<TrailingParamDecl> out = enumerator_params(shape.enumerator);
+  auto const& cp                     = consumer_params(shape.consumer);
+  out.insert(out.end(), cp.begin(), cp.end());
+  return out;
 }
 
 // The `out` slot: type and name vary by variant (mask variants repurpose it for
 // the mask words; dict gather writes chars; str_split_meta writes int64 source
 // offsets).
-std::string out_param_decl(DecodeVariant v, const std::string& dtype)
+std::string out_param_decl(Consumer c, const std::string& dtype)
 {
-  switch (v) {
-    case DecodeVariant::mask_out: return "uint32_t* __restrict__ sel_mask";
-    case DecodeVariant::mask_dict_gather: return "char* __restrict__ out";
-    case DecodeVariant::str_split_meta: return "int64_t* __restrict__ out";
-    case DecodeVariant::plain:
-    case DecodeVariant::mask_consume:
-    case DecodeVariant::index_consume: break;
+  switch (c) {
+    // The ballot consumers write no column: the slot carries the mask words.
+    case Consumer::ballot_range:
+    case Consumer::ballot_pair: return "uint32_t* __restrict__ sel_mask";
+    case Consumer::dict_gather: return "char* __restrict__ out";
+    case Consumer::offsets_meta: return "int64_t* __restrict__ out";
+    case Consumer::write_column: break;
   }
   return dtype + "* __restrict__ out";
 }
@@ -216,39 +236,45 @@ std::string out_param_decl(DecodeVariant v, const std::string& dtype)
 // ---------------------------------------------------------------------
 class Walker {
  public:
-  explicit Walker(std::string root_dtype, DecodeVariant variant = DecodeVariant::plain)
-    : dtype_(std::move(root_dtype)), variant_(variant)
+  explicit Walker(std::string root_dtype, DecodeShape shape = kShapePlain)
+    : dtype_(std::move(root_dtype)), shape_(shape)
   {
   }
 
   DecodeKernelSpec build(const ::codegen::jit::FusedTree& tree)
   {
     assign_ids(tree);
-    switch (variant_) {
-      case DecodeVariant::plain:
-        // Root producer writes the reconstructed chunk straight to global out.
-        emit_producer(tree, "(out + chunk_start)", "len", dtype_);
+    switch (shape_.consumer) {
+      case Consumer::write_column:
+        switch (shape_.enumerator) {
+          case Enumerator::all_rows:
+            // Root producer writes the reconstructed chunk straight to out.
+            emit_producer(tree, "(out + chunk_start)", "len", dtype_);
+            break;
+          case Enumerator::mask_bits:
+            if (tree.op == ::codegen::OpKind::Delta) {
+              emit_delta_mask_consume(tree);  // tuned register path, no slab
+            } else {
+              // Compositional seam: any value_source-supported root (Bitpack
+              // leaf closed-form, FOR, Zigzag, RLE cascades, ...) stages the
+              // chunk via the existing emitters and masked-stores from it.
+              emit_generic_mask_consume(tree);
+            }
+            break;
+          case Enumerator::index_list: emit_bitpack_index_consume(tree); break;
+        }
         break;
-      case DecodeVariant::mask_out:
+      case Consumer::ballot_range:
         // One seam: value_source() routes a Bitpack leaf to the same
         // closed-form bitpack_value_source the dedicated emitter used, so the
         // emitted body is identical for every root shape.
         emit_generic_mask_out(tree);
         break;
-      case DecodeVariant::mask_consume:
-        if (tree.op == ::codegen::OpKind::Delta) {
-          emit_delta_mask_consume(tree);  // tuned register path, no slab
-        } else {
-          // Compositional seam: any value_source-supported root (Bitpack leaf
-          // closed-form, FOR, Zigzag, RLE cascades, ...) stages the chunk via
-          // the existing emitters and masked-stores from it — no per-shape
-          // hand-written variants.
-          emit_generic_mask_consume(tree);
-        }
-        break;
-      case DecodeVariant::mask_dict_gather: emit_bitpack_mask_dict_gather(tree); break;
-      case DecodeVariant::index_consume: emit_bitpack_index_consume(tree); break;
-      case DecodeVariant::str_split_meta: emit_str_split_meta(tree); break;
+      case Consumer::dict_gather: emit_bitpack_mask_dict_gather(tree); break;
+      case Consumer::offsets_meta: emit_str_split_meta(tree); break;
+      case Consumer::ballot_pair:
+        // Two-tree shape; rendered through build_pair, never here.
+        throw RenderError("decode render: ballot_pair requires the two-tree entry point");
     }
     return finalize(tree);
   }
@@ -299,7 +325,7 @@ class Walker {
 
  private:
   std::string dtype_;
-  DecodeVariant variant_    = DecodeVariant::plain;
+  DecodeShape shape_        = kShapePlain;
   static constexpr int tbs_ = ::codegen::kTBSize;
   std::ostringstream params_;
   std::ostringstream body_;
@@ -413,20 +439,16 @@ class Walker {
   {
     DecodeKernelSpec spec;
     spec.entry_symbol = make_entry_symbol(tree, dtype_, "simpatico_decode_");
-    if (variant_ == DecodeVariant::mask_out) spec.entry_symbol += "_mask_out";
-    if (variant_ == DecodeVariant::mask_consume) spec.entry_symbol += "_mask_consume";
-    if (variant_ == DecodeVariant::mask_dict_gather) spec.entry_symbol += "_mask_dict";
-    if (variant_ == DecodeVariant::index_consume) spec.entry_symbol += "_index_consume";
-    if (variant_ == DecodeVariant::str_split_meta) spec.entry_symbol += "_str_meta";
+    spec.entry_symbol += shape_symbol_suffix(shape_);
 
     // The `out` slot's type and meaning vary by variant; everything after
     // (out, n) comes from ONE table that yields both the declaration text and
     // spec.trailing, so what the kernel declares and what the launcher pushes
     // are the same list (see TrailingParam).
     std::vector<std::string> decls;
-    decls.push_back(out_param_decl(variant_, dtype_));
+    decls.push_back(out_param_decl(shape_.consumer, dtype_));
     decls.emplace_back("int64_t n");
-    for (const auto& tp : trailing_params(variant_)) {
+    for (const auto& tp : shape_trailing_params(shape_)) {
       spec.trailing.push_back(tp.tag);
       decls.emplace_back(tp.decl);
     }
@@ -903,7 +925,7 @@ DecodeKernelSpec Walker::finalize_pair(const std::string& dtype_b)
   std::vector<std::string> decls;
   decls.emplace_back("uint32_t* __restrict__ sel_mask");
   decls.emplace_back("int64_t n");
-  for (const auto& tp : pair_trailing_params()) {
+  for (const auto& tp : consumer_params(Consumer::ballot_pair)) {
     spec.trailing.push_back(tp.tag);
     decls.emplace_back(tp.decl);
   }
@@ -1623,20 +1645,34 @@ void Walker::emit_raw_producer(const ::codegen::jit::FusedTree& node,
 // =====================================================================
 // Public entry point.
 // =====================================================================
+bool shape_is_supported(DecodeShape shape)
+{
+  // Shipped points of the product. The meaningful-but-unbuilt combinations —
+  // index_list x dict_gather and index_list x offsets_meta, which would give
+  // K4-speed dictionary and string decode below the K4 crossover — belong here
+  // the moment their emitters land; see DECODE_PUSHDOWN_PLAN.md section 7.
+  return shape == kShapePlain || shape == kShapeMaskOut || shape == kShapePairMask ||
+         shape == kShapeMaskConsume || shape == kShapeIndexConsume || shape == kShapeDictGather ||
+         shape == kShapeStrSplitMeta;
+}
+
 DecodeKernelSpec render(const ::codegen::jit::FusedTree& tree,
                         const std::string& element_dtype,
                         std::int32_t num_chunks,
-                        DecodeVariant variant)
+                        DecodeShape shape)
 {
   if (element_dtype.empty()) {
     throw std::invalid_argument("decode render: element_dtype is empty");
+  }
+  if (!shape_is_supported(shape)) {
+    throw RenderError("decode render: unsupported enumerator/consumer combination");
   }
   if (num_chunks < 1) { throw std::invalid_argument("decode render: num_chunks must be >= 1"); }
   if (dtype_elem_size(element_dtype) == 0) {
     throw RenderError("decode render: unsupported element_dtype '" + element_dtype +
                       "'. Supported: int32_t, int64_t");
   }
-  Walker w(element_dtype, variant);
+  Walker w(element_dtype, shape);
   return w.build(tree);
 }
 

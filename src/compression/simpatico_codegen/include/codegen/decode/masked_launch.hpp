@@ -22,7 +22,7 @@
 //
 // Predicate constants and mask/offset pointers travel as KERNEL PARAMETERS,
 // never as rendered source — one NVRTC compile per (tree shape, dtype,
-// variant) serves every literal (see DecodeVariant in decode/jit/renderer.hpp).
+// shape) serves every literal (see DecodeShape in decode/jit/renderer.hpp).
 
 #pragma once
 

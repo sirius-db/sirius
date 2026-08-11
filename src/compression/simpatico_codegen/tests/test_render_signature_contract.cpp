@@ -76,7 +76,8 @@ struct Shape {
   std::shared_ptr<jit::FusedTree> tree;
 };
 
-bool check_variant(const Shape& shape, const std::string& dtype, cdj::DecodeVariant variant)
+bool check_variant(const Shape& shape, const std::string& dtype, cdj::DecodeShape variant)
+// NOLINTNEXTLINE(readability-function-cognitive-complexity)
 {
   cdj::DecodeKernelSpec spec;
   try {
@@ -88,12 +89,13 @@ bool check_variant(const Shape& shape, const std::string& dtype, cdj::DecodeVari
   const std::size_t declared = count_declared_params(spec.source, spec.entry_symbol);
   const std::size_t expected = spec.buffers.size() + 2 /*out, n*/ + spec.trailing.size();
   CHECK(declared == expected,
-        "[%s/%s/%d] rendered signature declares %zu parameters but the spec describes %zu "
+        "[%s/%s/e%d.c%d] rendered signature declares %zu parameters but the spec describes %zu "
         "(buffers=%zu + out,n + trailing=%zu) — emission and binding have drifted, which "
         "cuLaunchKernel cannot detect",
         shape.name,
         dtype.c_str(),
-        static_cast<int>(variant),
+        static_cast<int>(variant.enumerator),
+        static_cast<int>(variant.consumer),
         declared,
         expected,
         spec.buffers.size(),
@@ -105,18 +107,20 @@ bool check_variant(const Shape& shape, const std::string& dtype, cdj::DecodeVari
   for (const auto tag : spec.trailing) {
     const auto idx = static_cast<std::size_t>(tag);
     CHECK(idx < static_cast<std::size_t>(cdj::TrailingParam::kCount),
-          "[%s/%s/%d] trailing tag %zu out of range",
+          "[%s/%s/e%d.c%d] trailing tag %zu out of range",
           shape.name,
           dtype.c_str(),
-          static_cast<int>(variant),
+          static_cast<int>(variant.enumerator),
+          static_cast<int>(variant.consumer),
           idx);
     if (idx < seen.size()) {
       CHECK(seen[idx] == 0,
-            "[%s/%s/%d] trailing tag %zu appears twice — the launcher would bind the same "
+            "[%s/%s/e%d.c%d] trailing tag %zu appears twice — the launcher would bind the same "
             "storage to two parameters",
             shape.name,
             dtype.c_str(),
-            static_cast<int>(variant),
+            static_cast<int>(variant.enumerator),
+            static_cast<int>(variant.consumer),
             idx);
       seen[idx] = 1;
     }
@@ -129,13 +133,13 @@ bool check_variant(const Shape& shape, const std::string& dtype, cdj::DecodeVari
 int main()
 {
   const std::vector<std::string> dtypes = {"int32_t", "int64_t", "int16_t", "int8_t"};
-  const cdj::DecodeVariant variants[]   = {
-    cdj::DecodeVariant::plain,
-    cdj::DecodeVariant::mask_out,
-    cdj::DecodeVariant::mask_consume,
-    cdj::DecodeVariant::mask_dict_gather,
-    cdj::DecodeVariant::index_consume,
-    cdj::DecodeVariant::str_split_meta,
+  const cdj::DecodeShape variants[]     = {
+    cdj::kShapePlain,
+    cdj::kShapeMaskOut,
+    cdj::kShapeMaskConsume,
+    cdj::kShapeDictGather,
+    cdj::kShapeIndexConsume,
+    cdj::kShapeStrSplitMeta,
   };
 
   const std::vector<Shape> shapes = {

@@ -457,20 +457,20 @@ const char* dtype_to_cxx(const char* dtype)
 // Predicate constants / mask pointers are kernel PARAMETERS so one NVRTC
 // compile per (shape, dtype, variant) covers every literal.
 struct VariantLaunchArgs {
-  cdj::DecodeVariant variant = cdj::DecodeVariant::plain;
-  std::int64_t pred_lo       = 0;  // mask_out: inclusive range, decoded int domain
-  std::int64_t pred_hi       = 0;
-  CUdeviceptr sel_mask       = 0;  // mask_consume/mask_dict_gather: selection-mask words (input)
-  CUdeviceptr chunk_offsets  = 0;  // mask_consume/mask_dict_gather: per-chunk survivor bases
-  CUdeviceptr keys_chars     = 0;  // mask_dict_gather: constant-width key pool chars
-  std::int32_t key_width     = 0;  // mask_dict_gather: bytes per key
-  CUdeviceptr row_indices    = 0;  // index_consume: ascending global int32 row ids
-  CUdeviceptr len_out        = 0;  // str_split_meta: per-survivor byte lengths (output)
-  std::int32_t cmp_op        = 0;  // pair mask: 0 '<', 1 '<=', 2 '>', 3 '>='
-  std::int64_t lo_a          = 0;  // pair mask: column A inclusive range
-  std::int64_t hi_a          = 0;
-  std::int64_t lo_b          = 0;  // pair mask: column B inclusive range
-  std::int64_t hi_b          = 0;
+  cdj::DecodeShape shape    = cdj::kShapePlain;
+  std::int64_t pred_lo      = 0;  // mask_out: inclusive range, decoded int domain
+  std::int64_t pred_hi      = 0;
+  CUdeviceptr sel_mask      = 0;  // mask_consume/mask_dict_gather: selection-mask words (input)
+  CUdeviceptr chunk_offsets = 0;  // mask_consume/mask_dict_gather: per-chunk survivor bases
+  CUdeviceptr keys_chars    = 0;  // mask_dict_gather: constant-width key pool chars
+  std::int32_t key_width    = 0;  // mask_dict_gather: bytes per key
+  CUdeviceptr row_indices   = 0;  // index_consume: ascending global int32 row ids
+  CUdeviceptr len_out       = 0;  // str_split_meta: per-survivor byte lengths (output)
+  std::int32_t cmp_op       = 0;  // pair mask: 0 '<', 1 '<=', 2 '>', 3 '>='
+  std::int64_t lo_a         = 0;  // pair mask: column A inclusive range
+  std::int64_t hi_a         = 0;
+  std::int64_t lo_b         = 0;  // pair mask: column B inclusive range
+  std::int64_t hi_b         = 0;
 };
 
 // Per-variant launch preconditions, checked in ONE place with ONE diagnostic.
@@ -491,23 +491,27 @@ struct VariantContract {
   bool rejects_float = false;
 };
 
-VariantContract variant_contract(cdj::DecodeVariant v)
+VariantContract variant_contract(cdj::DecodeShape shape)
 {
   VariantContract c;
-  switch (v) {
-    case cdj::DecodeVariant::plain: c.out = true; break;
-    case cdj::DecodeVariant::mask_out:
-      c.sel_mask      = true;  // `out` slot IS the mask words
+  // Enumerator: what it needs to walk the chunk's rows.
+  switch (shape.enumerator) {
+    case cdj::Enumerator::all_rows: break;
+    case cdj::Enumerator::mask_bits: c.sel_mask = c.chunk_offsets = true; break;
+    case cdj::Enumerator::index_list: c.row_indices = c.chunk_offsets = true; break;
+  }
+  // Consumer: what it needs to act on a row, and whether `out` is a column.
+  switch (shape.consumer) {
+    case cdj::Consumer::write_column: c.out = true; break;
+    case cdj::Consumer::ballot_range:
+    case cdj::Consumer::ballot_pair:
+      // The `out` slot carries the mask words, so it is checked as sel_mask.
+      // Integer-domain compare only: floats decode bit-reinterpreted.
+      c.sel_mask      = true;
       c.rejects_float = true;
       break;
-    case cdj::DecodeVariant::mask_consume: c.sel_mask = c.chunk_offsets = c.out = true; break;
-    case cdj::DecodeVariant::mask_dict_gather:
-      c.sel_mask = c.chunk_offsets = c.keys_chars = c.out = true;
-      break;
-    case cdj::DecodeVariant::index_consume: c.chunk_offsets = c.row_indices = c.out = true; break;
-    case cdj::DecodeVariant::str_split_meta:
-      c.sel_mask = c.chunk_offsets = c.len_out = c.out = true;
-      break;
+    case cdj::Consumer::dict_gather: c.keys_chars = c.out = true; break;
+    case cdj::Consumer::offsets_meta: c.len_out = c.out = true; break;
   }
   return c;
 }
@@ -522,7 +526,7 @@ bool check_variant_contract(const VariantLaunchArgs& va,
                             const char* dtype,
                             const char* ctx)
 {
-  const VariantContract c = variant_contract(va.variant);
+  const VariantContract c = variant_contract(va.shape);
   const char* missing     = nullptr;
   if (c.sel_mask && va.sel_mask == 0)
     missing = "selection mask words";
@@ -756,7 +760,7 @@ int run_rendered_decode(const jit::FusedTree& tree,
 
   cdj::DecodeKernelSpec spec;
   try {
-    spec = cdj::render(tree, cxx_dtype, num_chunks, va.variant);
+    spec = cdj::render(tree, cxx_dtype, num_chunks, va.shape);
   } catch (const cdj::RenderError& e) {
     std::fprintf(
       stderr, "simpatico::codegen: rendered decode: render rejected shape: %s\n", e.what());
@@ -900,7 +904,7 @@ bool launch_decode_fused_tree_mask_out(codegen::jit::FusedTree const& tree,
                                        rmm::cuda_stream_view stream)
 {
   VariantLaunchArgs va;
-  va.variant  = cdj::DecodeVariant::mask_out;
+  va.shape    = cdj::kShapeMaskOut;
   va.pred_lo  = pred.lo;
   va.pred_hi  = pred.hi;
   va.sel_mask = reinterpret_cast<CUdeviceptr>(mask.words);
@@ -922,7 +926,7 @@ bool launch_decode_fused_tree_mask_consume(codegen::jit::FusedTree const& tree,
                                            rmm::cuda_stream_view stream)
 {
   VariantLaunchArgs va;
-  va.variant       = cdj::DecodeVariant::mask_consume;
+  va.shape         = cdj::kShapeMaskConsume;
   va.sel_mask      = reinterpret_cast<CUdeviceptr>(mask.words);
   va.chunk_offsets = reinterpret_cast<CUdeviceptr>(mask.chunk_offsets);
   if (!check_variant_contract(
@@ -943,7 +947,7 @@ bool launch_decode_fused_tree_index_consume(codegen::jit::FusedTree const& tree,
                                             rmm::cuda_stream_view stream)
 {
   VariantLaunchArgs va;
-  va.variant       = cdj::DecodeVariant::index_consume;
+  va.shape         = cdj::kShapeIndexConsume;
   va.chunk_offsets = reinterpret_cast<CUdeviceptr>(mask.chunk_offsets);
   va.row_indices   = reinterpret_cast<CUdeviceptr>(const_cast<std::int32_t*>(row_indices));
   if (!check_variant_contract(
@@ -964,7 +968,7 @@ bool launch_decode_fused_tree_str_split_meta(codegen::jit::FusedTree const& tree
                                              rmm::cuda_stream_view stream)
 {
   VariantLaunchArgs va;
-  va.variant       = cdj::DecodeVariant::str_split_meta;
+  va.shape         = cdj::kShapeStrSplitMeta;
   va.sel_mask      = reinterpret_cast<CUdeviceptr>(mask.words);
   va.chunk_offsets = reinterpret_cast<CUdeviceptr>(mask.chunk_offsets);
   va.len_out       = reinterpret_cast<CUdeviceptr>(lengths_out);
@@ -1208,7 +1212,7 @@ bool launch_decode_fused_tree_mask_dict_gather(codegen::jit::FusedTree const& tr
                                                rmm::cuda_stream_view stream)
 {
   VariantLaunchArgs va;
-  va.variant       = cdj::DecodeVariant::mask_dict_gather;
+  va.shape         = cdj::kShapeDictGather;
   va.sel_mask      = reinterpret_cast<CUdeviceptr>(mask.words);
   va.chunk_offsets = reinterpret_cast<CUdeviceptr>(mask.chunk_offsets);
   va.keys_chars    = reinterpret_cast<CUdeviceptr>(const_cast<void*>(keys_chars));

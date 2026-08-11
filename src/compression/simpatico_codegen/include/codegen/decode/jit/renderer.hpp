@@ -145,14 +145,49 @@ namespace codegen::decode::jit {
 //                    chars).  Extra params: `const uint32_t* sel_mask,
 //                    const uint32_t* chunk_offsets` (both ROW-space),
 //                    `int32_t* len_out`.
-enum class DecodeVariant : std::uint8_t {
-  plain            = 0,
-  mask_out         = 1,
-  mask_consume     = 2,
-  mask_dict_gather = 3,
-  index_consume    = 4,
-  str_split_meta   = 5,
+// A decode kernel is a point in a two-axis product, not a flat variant list.
+// The axes are independent: HOW rows are enumerated within a chunk, and WHAT
+// happens per enumerated row.  Everything a kernel needs — emitted body, `out`
+// slot type, trailing parameters, entry-symbol suffix, launcher preconditions —
+// derives from the pair, so adding a kernel shape is one descriptor rather than
+// edits to a variant enum, two parameter switches, a launcher and a probe.
+enum class Enumerator : std::uint8_t {
+  all_rows = 0,  ///< every row of the chunk (full-width decode)
+  mask_bits,     ///< survivors of a selection mask, compacted by rank (K3)
+  index_list,    ///< an ascending survivor row-id list, compacted by slot (K4)
 };
+
+enum class Consumer : std::uint8_t {
+  write_column = 0,  ///< store the reconstructed value (plain / K3 / K4)
+  ballot_range,      ///< 1 tree: compare against [lo,hi], ballot to mask words (K1)
+  ballot_pair,       ///< 2 trees: `a OP b` + optional per-side ranges (K1m2)
+  dict_gather,       ///< copy the code's fixed-width key bytes to compacted chars (K5)
+  offsets_meta,      ///< emit survivor {source char offset, length} (K6 phase 1)
+};
+
+struct DecodeShape {
+  Enumerator enumerator                            = Enumerator::all_rows;
+  Consumer consumer                                = Consumer::write_column;
+  friend bool operator==(DecodeShape, DecodeShape) = default;
+};
+
+// The shipped points of the product.  The names map onto the K-numbers used
+// throughout the fused scan-filter code and in masked_launch.hpp.
+inline constexpr DecodeShape kShapePlain{Enumerator::all_rows, Consumer::write_column};
+inline constexpr DecodeShape kShapeMaskOut{Enumerator::all_rows, Consumer::ballot_range};
+inline constexpr DecodeShape kShapePairMask{Enumerator::all_rows, Consumer::ballot_pair};
+inline constexpr DecodeShape kShapeMaskConsume{Enumerator::mask_bits, Consumer::write_column};
+inline constexpr DecodeShape kShapeIndexConsume{Enumerator::index_list, Consumer::write_column};
+inline constexpr DecodeShape kShapeDictGather{Enumerator::mask_bits, Consumer::dict_gather};
+inline constexpr DecodeShape kShapeStrSplitMeta{Enumerator::mask_bits, Consumer::offsets_meta};
+
+/// False for product points with no meaning or no renderer support — e.g.
+/// re-ballotting only the survivors of an existing mask, or a 2-tree predicate
+/// under a compacting enumerator.  Render rejects these rather than emitting
+/// something plausible; the combinations that ARE meaningful but unbuilt
+/// (index_list x dict_gather / offsets_meta) are listed as false here until
+/// their emitters land.
+[[nodiscard]] bool shape_is_supported(DecodeShape shape);
 
 // One decode-input channel the rendered kernel reads.  `field` is the
 // manifest key (`buffer_key(node_id, field)` resolves the device
@@ -169,7 +204,7 @@ struct DecodeBufferSpec {
 // (DecodeKernelSpec::trailing) from a single table, and the launcher binds
 // arguments by walking that list.  Emission order and binding order therefore
 // cannot drift: previously they were two hand-maintained switches over
-// DecodeVariant in two different files, with cuLaunchKernel's untyped void**
+// the shape in two different files, with cuLaunchKernel's untyped void**
 // between them, so a mismatch was silent argument misalignment rather than a
 // compile error.
 //
@@ -230,13 +265,13 @@ using ::codegen::jit::RenderError;
 // leaf store), and Raw (verbatim-passthrough leaf, valid as a
 // delta/rle/for child), composed arbitrarily.
 //
-// `variant` selects the epilogue (see DecodeVariant above); the default
-// renders today's plain full-column decode byte-identically.  mask_out /
-// mask_consume require a Bitpack leaf root.
+// `shape` selects the enumerator + consumer (see DecodeShape above); the
+// default renders the plain full-column decode.  Unsupported points of the
+// product are rejected with RenderError (see shape_is_supported).
 DecodeKernelSpec render(const ::codegen::jit::FusedTree& tree,
                         const std::string& element_dtype,
                         std::int32_t num_chunks,
-                        DecodeVariant variant = DecodeVariant::plain);
+                        DecodeShape shape = kShapePlain);
 
 // K1m2: two-column fused pair-predicate mask (`a OP b`, optionally AND-ed
 // with per-column constant ranges) for two Bitpack-LEAF columns of the SAME
