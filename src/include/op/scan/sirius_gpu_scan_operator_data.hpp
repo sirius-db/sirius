@@ -190,6 +190,12 @@ class scan_operator_input : public op::operator_data {
   /// set while the gate is off — the converters then always produce the plain
   /// representation.
   bool decode_row_filtered{false};
+  /// Positions in the decoded batch delivered as a BOOL8 predicate result
+  /// rather than values (decode_outcome::predicate_columns), stamped by
+  /// prepare_for_processing. materialize_table forwards it to
+  /// post_filter_and_project, which rewrites those columns' filter conjunct to
+  /// a bare boolean reference. Empty when nothing was substituted.
+  std::vector<std::size_t> decode_predicate_columns;
   /// The operator's dynamic-filter channel (may be null), stamped by
   /// sirius_gpu_scan_operator::get_next_task_input_data. prepare_for_processing
   /// snapshots it at DECODE time — the scan-manager drain runs at query

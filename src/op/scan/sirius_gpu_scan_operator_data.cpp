@@ -231,8 +231,9 @@ void scan_operator_input::prepare_for_processing(
       // install the plain representation and both stay false.
       if (auto const* decoded =
             dynamic_cast<::sirius::decoded_batch_representation const*>(mut.get_data())) {
-        auto const& outcome = decoded->outcome();
-        decode_row_filtered = outcome.row_filtered;
+        auto const& outcome      = decoded->outcome();
+        decode_row_filtered      = outcome.row_filtered;
+        decode_predicate_columns = outcome.predicate_columns;
         if (fused_bail_flag && outcome.rule2_bailed) {
           fused_bail_flag->store(true, std::memory_order_relaxed);
         }

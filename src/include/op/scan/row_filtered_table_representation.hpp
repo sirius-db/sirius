@@ -18,8 +18,10 @@
 
 #include <cucascade/cudf/gpu_data_representation.hpp>
 
+#include <cstddef>
 #include <memory>
 #include <utility>
+#include <vector>
 
 namespace sirius {
 
@@ -53,7 +55,22 @@ struct decode_outcome {
   /// Per-operator by construction — another query's scan decides fresh.
   bool rule2_bailed = false;
 
-  [[nodiscard]] bool any() const noexcept { return row_filtered || rule2_bailed; }
+  /// Positions in the decoded table delivered as a BOOL8 predicate RESULT
+  /// rather than the column's declared type: a dictionary-compressed column
+  /// consumed only by an equality / IN filter is answered off its key set
+  /// instead of being reconstructed (see simpatico::decode_predicate).
+  ///
+  /// Declared here because the converter knows it exactly. The alternative --
+  /// the scan re-deriving it per batch by testing each candidate column for
+  /// type_id::BOOL8 -- is only unambiguous while candidates are VARCHAR-only;
+  /// the day the pushdown covers numeric or boolean equality, a genuine BOOL8
+  /// column becomes indistinguishable from a substituted one.
+  std::vector<std::size_t> predicate_columns;
+
+  [[nodiscard]] bool any() const noexcept
+  {
+    return row_filtered || rule2_bailed || !predicate_columns.empty();
+  }
 };
 
 /**

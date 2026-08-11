@@ -322,7 +322,7 @@ class parquet_gpu_ingestible : public gpu_ingestible {
   /// substituted, meaning the caller should use @c _duckdb_filter_expression.
   /// Never called without @c _duckdb_filter_expression.
   [[nodiscard]] duckdb::unique_ptr<duckdb::Expression> build_filter_expression_for(
-    cudf::table_view const& batch) const;
+    std::vector<std::size_t> const& predicate_columns) const;
 
   /// Read one file's footer, prune its row groups against the filter, and record
   /// per-row-group byte accounting. Returns a single @c parquet_file_scan_info.

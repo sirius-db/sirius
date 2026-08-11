@@ -547,6 +547,12 @@ std::unique_ptr<cucascade::idata_representation> reconstruct_and_decompress_to_g
   decode_outcome outcome;
   outcome.row_filtered = tag == fused_batch_tag::row_filtered;
   outcome.rule2_bailed = tag == fused_batch_tag::rule2_bailed;
+  // An active predicate directive yields BOOL8 on EVERY path -- the fused
+  // route's dual delivery and the classic predicated rerun alike -- so the
+  // substituted positions are exactly the active entries.
+  for (std::size_t i = 0; i < predicates.size(); ++i) {
+    if (predicates[i].active()) { outcome.predicate_columns.push_back(i); }
+  }
   if (outcome.any()) {
     return std::make_unique<decoded_batch_representation>(
       std::move(decompressed),
@@ -682,6 +688,12 @@ std::unique_ptr<cucascade::idata_representation> decompress_device_to_gpu(
   decode_outcome outcome;
   outcome.row_filtered = tag == fused_batch_tag::row_filtered;
   outcome.rule2_bailed = tag == fused_batch_tag::rule2_bailed;
+  // An active predicate directive yields BOOL8 on EVERY path -- the fused
+  // route's dual delivery and the classic predicated rerun alike -- so the
+  // substituted positions are exactly the active entries.
+  for (std::size_t i = 0; i < predicates.size(); ++i) {
+    if (predicates[i].active()) { outcome.predicate_columns.push_back(i); }
+  }
   if (outcome.any()) {
     return std::make_unique<decoded_batch_representation>(
       std::move(decompressed),

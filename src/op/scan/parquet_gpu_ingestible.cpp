@@ -1134,26 +1134,37 @@ filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
 // fact: only a source that can exploit the pushdown does it, and only for the
 // columns whose compression plan supports it. A GPU-tier pin answers a
 // dictionary column's equality from its key set but hands back a `str_split`
-// column as strings, and the same scan's disk splits substitute nothing — so the
-// batch's own column types are the only reliable signal. Deciding per column
-// (rather than all-or-nothing) keeps one ineligible candidate from disabling the
-// pushdown for an eligible sibling.
+// column as strings, and the same scan's disk splits substitute nothing.
+//
+// The decode REPORTS which positions it substituted
+// (sirius::decode_outcome::predicate_columns, forwarded through
+// filtered_table), so this reads the fact rather than inferring it from column
+// types. The type test it replaces was only unambiguous while candidates were
+// VARCHAR-only: extend the pushdown to numeric or boolean equality and a
+// genuine BOOL8 column is indistinguishable from a substituted one.
 //
 // Returns the prebuilt expression when nothing was substituted — the common
 // case, and the only one on a scan with no candidates. Otherwise rebuilds; the
 // expression is small, the rebuild is per batch (as `from_duckdb` already is),
 // and building fresh avoids any shared mutable state across pipeline threads.
 duckdb::unique_ptr<duckdb::Expression> parquet_gpu_ingestible::build_filter_expression_for(
-  cudf::table_view const& batch) const
+  std::vector<std::size_t> const& predicate_columns) const
 {
+  if (predicate_columns.empty() || !_info->table_filters) { return nullptr; }
+
+  // Map the reported batch positions onto the primary indices the filter
+  // conversion keys on. A position this scan never nominated as a candidate is
+  // not ours to rewrite.
   std::unordered_set<std::size_t> substituted;
-  for (auto const& [batch_pos, primary_idx] : _pushdown_primary_by_batch_position) {
-    if (batch_pos < static_cast<std::size_t>(batch.num_columns()) &&
-        batch.column(static_cast<cudf::size_type>(batch_pos)).type().id() == cudf::type_id::BOOL8) {
-      substituted.insert(primary_idx);
+  for (auto const batch_pos : predicate_columns) {
+    for (auto const& [candidate_pos, primary_idx] : _pushdown_primary_by_batch_position) {
+      if (candidate_pos == batch_pos) {
+        substituted.insert(primary_idx);
+        break;
+      }
     }
   }
-  if (substituted.empty() || !_info->table_filters) { return nullptr; }
+  if (substituted.empty()) { return nullptr; }
 
   SIRIUS_LOG_DEBUG(
     "[parquet_gpu_ingestible] {} of {} candidate column(s) arrived as a decode-time BOOL8 mask",
@@ -1205,7 +1216,7 @@ std::unique_ptr<cudf::table> parquet_gpu_ingestible::post_filter_and_project(
     // the mask rather than re-compare. `rebuilt` owns the substituted form when
     // one was needed and stays null otherwise. Both it and the prebuilt
     // expression must outlive `exec`, which only borrows the AST.
-    auto rebuilt = build_filter_expression_for(input.table.view());
+    auto rebuilt = build_filter_expression_for(input.predicate_columns);
     auto const& filter_expression =
       rebuilt ? *rebuilt : static_cast<duckdb::Expression const&>(*_duckdb_filter_expression);
     auto sirius_filter_ast = sirius::ast::from_duckdb(filter_expression);
