@@ -99,6 +99,20 @@ class task_scheduler {
   void schedule(std::unique_ptr<sirius::parallel::itask> task);
 
   /**
+   * @brief Wake the management event loop to re-run its task/device matcher.
+   *
+   * Emits a task_available event, exactly as schedule() does after pushing a
+   * task. Required by any path that inserts into the pipeline task queue
+   * WITHOUT going through schedule() — the downgrade executor extracts queued
+   * tasks for conversion and returns them via a direct queue push. If every
+   * executor went idle in the meantime, the ready devices are parked in the
+   * management loop and only a channel event can trigger another matcher pass;
+   * without one, the returned tasks are never dispatched and the query
+   * deadlocks with all workers idle.
+   */
+  void notify_task_available();
+
+  /**
    * @brief Starts the executor and initializes worker threads
    *
    * Initializes the thread pool and begins accepting tasks for execution.

@@ -291,6 +291,7 @@ void downgrade_executor::processing_loop()
     }
 
     // === TIER 2: task_scheduler task queue ===
+    bool pipeline_tasks_extracted = false;
     if (!req->satisfied.load() && _pipeline_task_queue) {
       size_t max_tasks_to_convert = _pipeline_task_queue->size();
       size_t tasks_converted      = 0;
@@ -347,10 +348,23 @@ void downgrade_executor::processing_loop()
             }
           });
       }
+      pipeline_tasks_extracted = tasks_converted > 0;
     }
 
     // Wait for all in-flight work to finish (predicate also checked in workers)
     _pool->wait_all();
+
+    // Every task extracted above has now been pushed back into the scheduler's
+    // queue by convertible_gpu_pipeline_task's destructor (the conversion
+    // lambdas are destroyed once wait_all() returns). That push bypasses
+    // task_scheduler::schedule(), so no task_available event was emitted: if
+    // every executor drained and parked while the tasks were extracted, the
+    // management loop is blocked on its request channel and the returned tasks
+    // would never be dispatched — deadlocking the query with all workers idle.
+    // Wake the matcher explicitly.
+    if (pipeline_tasks_extracted && _pipeline_tasks_returned_notifier) {
+      _pipeline_tasks_returned_notifier();
+    }
 
     // Monitor requests are gated by has_viable_downgrade_target() and warn once per stall episode
     // in monitor_loop(); only warn here for one-shot (external) requests to avoid log spam.
@@ -503,6 +517,11 @@ void downgrade_executor::cancel_pending_requests()
       // Promise may already be fulfilled — safe to ignore
     }
   }
+}
+
+void downgrade_executor::set_pipeline_tasks_returned_notifier(std::function<void()> notifier)
+{
+  _pipeline_tasks_returned_notifier = std::move(notifier);
 }
 
 void downgrade_executor::set_pipeline_task_queue(

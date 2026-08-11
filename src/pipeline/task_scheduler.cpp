@@ -135,6 +135,11 @@ void task_scheduler::schedule(std::unique_ptr<sirius::parallel::itask> task)
     });
   }
   _task_queue.push(std::move(task));
+  notify_task_available();
+}
+
+void task_scheduler::notify_task_available()
+{
   if (_self_publisher) {
     auto wake                 = std::make_unique<task_request>();
     wake->kind                = task_request_kind::task_available;
@@ -347,7 +352,11 @@ void task_scheduler::management_eventloop()
       }
     }
 
-    if (_task_queue.empty()) {
+    // _ready_devices can be empty here: a task_available event whose task was
+    // re-extracted (downgrade) before this pass arrives with no device parked,
+    // and *begin() of an empty list is UB. Lookahead exists to pre-create work
+    // for a waiting device, so skipping it when none is waiting is correct.
+    if (_task_queue.empty() && !_ready_devices.empty()) {
       if (_task_creator) { _task_creator->schedule_lookahead(*_ready_devices.begin()); }
     }
 

@@ -142,6 +142,21 @@ class downgrade_executor {
     sirius::exec::multi_index_priority_queue<sirius::parallel::itask>* pipeline_task_queue);
 
   /**
+   * @brief Set the callback fired after extracted pipeline tasks are returned.
+   *
+   * Tasks taken from the pipeline task queue for conversion are pushed back by
+   * convertible_gpu_pipeline_task's destructor, which bypasses
+   * task_scheduler::schedule() and therefore emits no task_available event.
+   * The scheduler's matcher must be woken explicitly or the returned tasks are
+   * never dispatched (see task_scheduler::notify_task_available()).
+   *
+   * @param notifier Callable invoked once per downgrade pass that extracted
+   *                 at least one pipeline task; must be safe to call from the
+   *                 downgrade thread for the lifetime of this executor.
+   */
+  void set_pipeline_tasks_returned_notifier(std::function<void()> notifier);
+
+  /**
    * @brief Asynchronously request a predicate-driven downgrade.
    *
    * Dispatches batch downgrades until the predicate returns true or candidates
@@ -208,6 +223,10 @@ class downgrade_executor {
   std::string _source_label;
   sirius::memory::sirius_memory_reservation_manager& _reservation_manager;
   sirius::exec::multi_index_priority_queue<sirius::parallel::itask>* _pipeline_task_queue{nullptr};
+  /// Wakes the task_scheduler's matcher after extracted tasks are pushed back
+  /// into _pipeline_task_queue (the push bypasses schedule(), so no
+  /// task_available event is emitted). See set_pipeline_tasks_returned_notifier.
+  std::function<void()> _pipeline_tasks_returned_notifier;
 };
 
 }  // namespace parallel

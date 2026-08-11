@@ -854,9 +854,15 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
     config_.get_scan_manager_config(), *memory_manager_, topology_index_);
 
   // Wire the pipeline task queue into downgrade executors now that task_scheduler_
-  // has been constructed.
+  // has been constructed. Tasks the downgrade extracts from this queue come back
+  // via a direct queue push that bypasses schedule(), so the scheduler's matcher
+  // must be woken explicitly or the returned tasks are never dispatched (query
+  // deadlock with all workers idle). The raw scheduler pointer has the same
+  // lifetime contract as the queue pointer passed alongside it.
   for (auto& executor : downgrade_executors_) {
     executor->set_pipeline_task_queue(task_scheduler_->get_pipeline_task_queue());
+    executor->set_pipeline_tasks_returned_notifier(
+      [scheduler = task_scheduler_.get()] { scheduler->notify_task_available(); });
   }
 
   // Start everything -- downgrade executors deferred until now
