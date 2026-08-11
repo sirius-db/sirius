@@ -299,6 +299,36 @@ std::vector<simpatico::decode_predicate> to_decode_predicates(scan_decode_reques
   return predicates;
 }
 
+/// One row-selecting source: a conjunct the decode evaluates in wave 1 to
+/// produce one mask, whatever kind it is. Collecting all four kinds into one
+/// list means the source count, the cap and the ordering are each computed
+/// once, rather than per kind with rules that can drift apart.
+struct selection_source {
+  enum class kind : std::uint8_t { range, pair, equality, membership };
+
+  kind what                     = kind::range;
+  std::size_t column            = 0;        ///< the source column; @c column_a for a pair
+  std::size_t column_b          = 0;        ///< pairs only
+  membership_probe const* probe = nullptr;  ///< membership only
+  column_compare_op op          = column_compare_op::lt;  ///< pairs only
+
+  /// Ascending EXPECTED keep-rate: the scarce mask slots go to the strongest
+  /// source first, regardless of kind.
+  ///
+  /// Only the join filters carry a real signal (their kind rank, then the
+  /// build-side key count). A range, pair or equality conjunct has no
+  /// statistics behind it, but it is exact and costs no probe launch, so it
+  /// sorts ahead of every join filter and otherwise keeps request order — the
+  /// same order they were emitted in before this list existed.
+  [[nodiscard]] std::pair<int, std::uint64_t> order_key() const noexcept
+  {
+    if (what != kind::membership) { return {-1, 0}; }
+    // 0 = unknown key count: sort after known counts within the same kind.
+    return {probe->selectivity_rank,
+            probe->num_keys == 0 ? std::numeric_limits<std::uint64_t>::max() : probe->num_keys};
+  }
+};
+
 /// The most row-selecting sources one decode can carry. Beyond it the request
 /// is structurally impossible and the round-trip is skipped.
 constexpr std::size_t kMaxSelectionSources = 8;
@@ -319,93 +349,90 @@ std::unique_ptr<cudf::table> decode_with_filters(simpatico::compressed_table con
                                                  rmm::device_async_resource_ref mr,
                                                  decode_outcome& outcome)
 {
-  std::size_t equality_sources   = 0;
-  std::size_t membership_sources = 0;
+  // The conjuncts the chunk's compression plans cannot influence: an equality
+  // answered off a dictionary, and the join filters. Collected first because
+  // planning needs to know they exist — they let a chunk with no usable range
+  // still be worth filtering.
+  std::vector<selection_source> sources;
   for (std::size_t i = 0; i < request.columns.size() && i < selected.size(); ++i) {
-    if (!request.columns[i].equals_any.empty()) { ++equality_sources; }
-    membership_sources += request.columns[i].membership.size();
+    if (!request.columns[i].equals_any.empty()) {
+      sources.push_back({selection_source::kind::equality, i});
+    }
+    for (auto const& probe : request.columns[i].membership) {
+      sources.push_back({selection_source::kind::membership, i, 0, &probe});
+    }
   }
-  auto const plan =
-    plan_decode(chunk, selected, request, equality_sources > 0 || membership_sources > 0);
+
+  auto const plan = plan_decode(chunk, selected, request, !sources.empty());
   if (!plan.enabled) { return nullptr; }
 
-  std::size_t range_sources = 0;
-  for (auto const& slot : plan.ranges) {
-    if (slot.selects) { ++range_sources; }
+  // Then the conjuncts planning just decided this chunk can evaluate. A pair
+  // counts once: one kernel, one mask buffer, both sides' bounds folded in.
+  for (std::size_t i = 0; i < plan.ranges.size(); ++i) {
+    if (plan.ranges[i].selects) { sources.push_back({selection_source::kind::range, i}); }
   }
-  // Every source counts once (a pair once, each membership probe once).
-  auto const total_sources =
-    range_sources + plan.pairs.size() + equality_sources + membership_sources;
-  if (total_sources > kMaxSelectionSources ||
+  for (auto const& pair : plan.pairs) {
+    sources.push_back(
+      {selection_source::kind::pair, pair.column_a, pair.column_b, nullptr, pair.op});
+  }
+
+  if (sources.size() > kMaxSelectionSources ||
       chunk.num_rows() > std::numeric_limits<std::int32_t>::max()) {
     SIRIUS_DECODE_DIAG(
       "[decode-filter] declined on shape ({} row-selecting sources, {} rows) — plain decode",
-      total_sources,
+      sources.size(),
       chunk.num_rows());
     return nullptr;
   }
 
+  // Strongest first. The decode keeps a PREFIX when it cannot carry every
+  // source, so this order decides which ones survive.
+  std::stable_sort(sources.begin(), sources.end(), [](auto const& a, auto const& b) {
+    return a.order_key() < b.order_key();
+  });
+
   sirius::codegen::scan_filter_request wave_request;
   wave_request.routes.reserve(selected.size());
   for (std::size_t i = 0; i < selected.size(); ++i) {
-    auto const& slot = plan.ranges[i];
-    if (slot.requested && slot.selects) {
-      wave_request.filters.push_back({i, {slot.bounds.lo, slot.bounds.hi}});
-    }
     wave_request.routes.push_back(plan.routes[i]);
   }
-  // One kernel per pair, with each side's own bounds folded in (a side without
-  // bounds stays full-domain). Planning already cleared those sides' standalone
-  // participation.
-  for (auto const& pair : plan.pairs) {
-    sirius::codegen::pair_predicate predicate;
-    predicate.op      = static_cast<sirius::codegen::pair_compare_op>(pair.op);
-    auto const& left  = plan.ranges[pair.column_a];
-    auto const& right = plan.ranges[pair.column_b];
-    if (left.requested) { predicate.range_a = {left.bounds.lo, left.bounds.hi}; }
-    if (right.requested) { predicate.range_b = {right.bounds.lo, right.bounds.hi}; }
-    wave_request.pair_filters.push_back({pair.column_a, pair.column_b, predicate});
-  }
-  for (std::size_t i = 0; i < request.columns.size() && i < selected.size(); ++i) {
-    if (request.columns[i].equals_any.empty()) { continue; }
-    wave_request.bool8_filters.push_back({i, request.columns[i].equals_any});
-  }
-  // Join filters, strongest first: the decode keeps a PREFIX of the list when
-  // it cannot carry them all, so the order decides which ones are kept.
-  {
-    struct ordered_probe {
-      std::size_t column;
-      membership_probe const* probe;
-    };
-    std::vector<ordered_probe> ordered;
-    for (std::size_t i = 0; i < request.columns.size() && i < selected.size(); ++i) {
-      for (auto const& probe : request.columns[i].membership) {
-        ordered.push_back({i, &probe});
+  std::string order_echo;
+  for (auto const& source : sources) {
+    switch (source.what) {
+      case selection_source::kind::range: {
+        auto const& slot = plan.ranges[source.column];
+        wave_request.filters.push_back({source.column, {slot.bounds.lo, slot.bounds.hi}});
+        order_echo += " range(c" + std::to_string(source.column) + ")";
+        break;
       }
-    }
-    std::stable_sort(ordered.begin(), ordered.end(), [](auto const& a, auto const& b) {
-      if (a.probe->selectivity_rank != b.probe->selectivity_rank) {
-        return a.probe->selectivity_rank < b.probe->selectivity_rank;
+      case selection_source::kind::pair: {
+        // Each side's own bounds are folded into the one kernel (a side without
+        // bounds stays full-domain); planning already cleared those sides'
+        // standalone participation.
+        sirius::codegen::pair_predicate predicate;
+        predicate.op      = static_cast<sirius::codegen::pair_compare_op>(source.op);
+        auto const& left  = plan.ranges[source.column];
+        auto const& right = plan.ranges[source.column_b];
+        if (left.requested) { predicate.range_a = {left.bounds.lo, left.bounds.hi}; }
+        if (right.requested) { predicate.range_b = {right.bounds.lo, right.bounds.hi}; }
+        wave_request.pair_filters.push_back({source.column, source.column_b, predicate});
+        order_echo +=
+          " pair(c" + std::to_string(source.column) + ",c" + std::to_string(source.column_b) + ")";
+        break;
       }
-      // 0 = unknown key count: sort after known counts within the same kind.
-      auto const a_keys =
-        a.probe->num_keys == 0 ? std::numeric_limits<std::uint64_t>::max() : a.probe->num_keys;
-      auto const b_keys =
-        b.probe->num_keys == 0 ? std::numeric_limits<std::uint64_t>::max() : b.probe->num_keys;
-      return a_keys < b_keys;
-    });
-    std::string order_echo;
-    for (auto const& entry : ordered) {
-      wave_request.membership_filters.push_back({entry.column, entry.probe->probe});
-      order_echo += order_echo.empty() ? "" : ",";
-      order_echo +=
-        std::to_string(entry.probe->selectivity_rank) + ":c" + std::to_string(entry.column);
-    }
-    if (!ordered.empty()) {
-      SIRIUS_DECODE_DIAG("[decode-filter] join filter order (ascending expected keep): [{}]",
-                         order_echo);
+      case selection_source::kind::equality:
+        wave_request.bool8_filters.push_back(
+          {source.column, request.columns[source.column].equals_any});
+        order_echo += " equality(c" + std::to_string(source.column) + ")";
+        break;
+      case selection_source::kind::membership:
+        wave_request.membership_filters.push_back({source.column, source.probe->probe});
+        order_echo += " join(c" + std::to_string(source.column) + ",rank " +
+                      std::to_string(source.probe->selectivity_rank) + ")";
+        break;
     }
   }
+  SIRIUS_DECODE_DIAG("[decode-filter] wave-1 sources, ascending expected keep:{}", order_echo);
   wave_request.source_generation = request.membership_generation;
 
   sirius::codegen::scan_filter_result result;
